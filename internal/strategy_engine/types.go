@@ -1,20 +1,52 @@
+// Package strategy_engine 定义策略引擎相关数据结构：板块热度、个股行情、策略结果等。
 package strategy_engine
 
-import "quant-trading-v2/internal/newsagent"
+import (
+	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/newsagent"
+)
 
+// SectorHot 热点板块信息，包含事件驱动的涨跌幅、涨停家数、资金流向等。
 type SectorHot struct {
-	Name      string   `json:"name"`
-	Direction string   `json:"direction"` // 利好/利空/中性
-	Score     float64  `json:"score"`
-	Reason    string   `json:"reason"`
-	LeadStocks []string `json:"lead_stocks,omitempty"`
+	Name       string   `json:"name"`           // 板块名称
+	Direction  string   `json:"direction"`      // 方向：利好/利空
+	Score      float64  `json:"score"`          // 事件评分
+	ChangePct  float64  `json:"change_pct"`     // 板块涨跌幅
+	LimitupCnt int      `json:"limitup_cnt"`    // 涨停家数
+	NetInflow  float64  `json:"net_inflow"`     // 主力净流入
+	Reason     string   `json:"reason"`         // 上榜原因
+	LeadStocks []string `json:"lead_stocks,omitempty"` // 领涨/领跌股
+	NewsTitles []string `json:"news_titles,omitempty"` // 关联新闻标题
 }
 
+// IndividualStock 个股事件信息，包含方向（利好/利空）。
+type IndividualStock struct {
+	Code      string // 股票代码
+	Name      string // 股票名称
+	Direction string // 方向：利好/利空
+}
+
+// StockMarketData 个股行情数据：实时价、K线、资金流向等。
+type StockMarketData struct {
+	Code      string            `json:"code"`            // 股票代码
+	Name      string            `json:"name"`            // 股票名称
+	Price     float64           `json:"price"`           // 最新价
+	ChangePct float64           `json:"change_pct"`      // 涨跌幅
+	KLines    []data.KLine      `json:"k_lines,omitempty"` // K线数据
+	MoneyFlow *data.CapitalFlow `json:"money_flow,omitempty"` // 资金流向
+	Error     string            `json:"error,omitempty"` // 行情获取错误信息
+}
+
+// StrategyResult 策略引擎评估结果，包含板块、个股、行情数据和 L1 过滤信息。
 type StrategyResult struct {
-	HotSectors  []SectorHot           `json:"hot_sectors"`
-	BearSectors []SectorHot           `json:"bear_sectors,omitempty"`
-	BearStocks  []string              `json:"bear_stocks,omitempty"`
-	L1Score     map[string]float64    `json:"l1_score,omitempty"`   // code → D1评分
-	L1Blocked   map[string]bool       `json:"l1_blocked,omitempty"` // code → 利空阻塞
-	Events      []newsagent.NewsEvent `json:"events,omitempty"`
+	HotSectors  []SectorHot                  `json:"hot_sectors"`             // 利好板块列表
+	BearSectors []SectorHot                  `json:"bear_sectors,omitempty"`  // 利空板块列表
+	BearStocks  []string                     `json:"bear_stocks,omitempty"`   // 利空个股列表
+	LongStocks  []IndividualStock            `json:"-"`                      // 做多个股（内部使用）
+	ShortStocks []IndividualStock            `json:"-"`                      // 做空个股（内部使用）
+	ScoringPool []string                     `json:"-"`                      // 收拢打分池：Stage2 + 持仓 + 自选
+	MarketData  map[string]*StockMarketData  `json:"market_data,omitempty"`  // code → 行情数据
+	L1Score     map[string]float64           `json:"l1_score,omitempty"`     // L1 过滤评分
+	L1Blocked   map[string]bool              `json:"l1_blocked,omitempty"`   // L1 过滤阻断
+	Events      []newsagent.NewsEvent        `json:"events,omitempty"`       // 原始新闻事件
 }

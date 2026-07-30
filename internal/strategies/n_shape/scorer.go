@@ -337,33 +337,22 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 	return res
 }
 
-// calcD1 计算 D1 事件评分。三段式计算：
+// calcD1 计算 D1 事件评分。两段式计算：
 //
 //	Stage 1: YAML 负面阻断（始终执行，硬闸）
-//	  通过 EventMatcher 匹配 YAML 规则，若命中否决规则（Blocked=true）
-//	  则直接返回，该个股不产生交易信号。
+//	  EventMatcher 只做 negative_filter，命中即 blocked。
 //
-//	Stage 2: LLM 协同评分（LLMD1Score > 0 时生效）
+//	Stage 2: LLM 评分（优先于 YAML）
 //	  若 LLM 判定利空（LLMBlocked=true），直接返回 blocked。
 //	  否则以 LLMD1Score × MaxD1 作为 D1 得分。
 //
-//	Stage 3: YAML 正面兜底（无 LLM 结果时）
-//	  走原有 YAML EventMatcher，取匹配规则的得分。
-//
-// 规则配置在 config/rules.json 中，热加载。
+// D1 评分收拢到 combat_agent/d1_scorer，此方法仅在 LLM 结果已传入时调用。
 func (s *LeftSideScorer) calcD1(ctx *Ctx) (float64, []string, bool) {
-	desc := ctx.EventDesc
-
-	// Stage 1: YAML 负面阻断 — 始终执行
-	// 规则中标记为否决（blocked）的规则优先，YAML 规则不可绕过。
-	if desc != "" && desc != "null" && s.matcher != nil {
-		mr := s.matcher.MatchD1(desc)
+	// Stage 1: YAML 负面阻断
+	if ctx.EventDesc != "" && ctx.EventDesc != "null" && s.matcher != nil {
+		mr := s.matcher.MatchD1(ctx.EventDesc)
 		if mr.Blocked {
-			return 0, mr.MatchedRules, true
-		}
-		// YAML 有得分且无 LLM 结果时直接返回（Stage 3 提前）
-		if ctx.LLMD1Score <= 0 && mr.Score > 0 {
-			return float64(mr.Score), mr.MatchedRules, false
+			return 0, []string{mr.BlockReason}, true
 		}
 	}
 
@@ -372,14 +361,7 @@ func (s *LeftSideScorer) calcD1(ctx *Ctx) (float64, []string, bool) {
 		return 0, []string{"llm_blocked"}, true
 	}
 	if ctx.LLMD1Score > 0 {
-		// LLM 评分映射到 [0, MaxD1] 区间
 		return ctx.LLMD1Score * MaxD1, []string{"llm_d1"}, false
-	}
-
-	// Stage 3: YAML 正面兜底
-	if desc != "" && desc != "null" && s.matcher != nil {
-		mr := s.matcher.MatchD1(desc)
-		return float64(mr.Score), mr.MatchedRules, mr.Blocked
 	}
 
 	return 0, nil, false

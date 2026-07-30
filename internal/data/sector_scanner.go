@@ -40,17 +40,15 @@ type SectorScanner struct {
 	hotSectors       []HotSector        // 最新热点板块结果
 	expandedList     []string           // 展开后的自选股列表
 	matcher          *EventMatcher      // D1 事件匹配器
-	eventMap         map[string]string  // 板块代码 → 事件描述
-	sectorAssocScore map[string]float64 // 板块代码 → D1关联度权重 (0-1)
+	eventMap map[string]string // 板块代码 → 事件描述
 }
 
 // NewSectorScanner 创建板块扫描器。
 // matcher 可为 nil（不解 D1 事件评分）。
 func NewSectorScanner(api *MarketAPI, matcher *EventMatcher) *SectorScanner {
 	return &SectorScanner{
-		api:              api,
-		matcher:          matcher,
-		sectorAssocScore: make(map[string]float64),
+		api:     api,
+		matcher: matcher,
 	}
 }
 
@@ -97,29 +95,17 @@ func (ss *SectorScanner) ExpandedStocks() []string {
 	return out
 }
 
-// sectorD1Score 获取板块的 D1 事件评分（含关联度加权）。
-// 返回 (加权分数, 是否被阻断)；
-// 加权分数 = D1事件分 × 新闻-板块关联度权重 (0-1)
-func (ss *SectorScanner) sectorD1Score(code string) (float64, bool) {
+// sectorBlocked 检查板块是否被负面事件阻断。
+func (ss *SectorScanner) sectorBlocked(code string) bool {
 	if ss.matcher == nil || ss.eventMap == nil {
-		return 0, false
+		return false
 	}
 	desc, ok := ss.eventMap[code]
 	if !ok || desc == "" {
-		return 0, false
+		return false
 	}
 	mr := ss.matcher.MatchD1(desc)
-	if mr.Blocked {
-		return 0, true
-	}
-	assoc := ss.sectorAssocScore[code]
-	if assoc <= 0 {
-		assoc = 1.0
-	}
-	if assoc > 1.0 {
-		assoc = 1.0
-	}
-	return float64(mr.Score) * assoc, false
+	return mr.Blocked
 }
 
 // fSeriesScore 计算纯量价 F 系列评分（0-100）。
@@ -185,42 +171,33 @@ func (ss *SectorScanner) scoreSectors(sectors []SectorInfo, limitupBull, limitup
 	scored := make([]HotSector, 0, len(sectors))
 
 	for _, s := range sectors {
-		d1Score, d1Blocked := ss.sectorD1Score(s.Code)
-		if d1Blocked {
+		if ss.sectorBlocked(s.Code) {
 			continue
 		}
 		fScore := fSeriesScore(s, maxLimitup, maxAmt, maxInflow)
+		total := fScore
 
 		reason := ""
-		var total float64
-
-		switch {
-		case d1Score >= 40:
-			total = 100 + d1Score + fScore
-			reason = "事件驱动"
-		case d1Score >= 30:
-			total = 80 + d1Score + fScore
-			reason = "事件关联"
-		default:
-			total = fScore
-		}
-
-		// 构建原因描述
 		if s.LimitupCnt >= limitupBull {
-			reason += " 涨停潮"
+			reason = "涨停潮"
 		} else if s.LimitupCnt >= limitupShock {
-			reason += " 异动"
+			reason = "异动"
 		} else if s.ChangePct > 3 {
-			reason += " 领涨"
-		} else if s.ChangePct < -3 && d1Score < 20 {
+			reason = "领涨"
+		} else if s.ChangePct < -3 {
 			reason = "领跌"
 		}
 		if s.NetInflow > 0 {
-			reason += " 主力流入"
-		} else if s.NetInflow < 0 && d1Score < 20 {
-			reason += " 主力流出"
+			if reason != "" {
+				reason += " "
+			}
+			reason += "主力流入"
+		} else if s.NetInflow < 0 {
+			if reason != "" {
+				reason += " "
+			}
+			reason += "主力流出"
 		}
-		reason = strings.TrimSpace(reason)
 		if reason == "" {
 			reason = "常规"
 		}
@@ -229,7 +206,6 @@ func (ss *SectorScanner) scoreSectors(sectors []SectorInfo, limitupBull, limitup
 			Sector: s,
 			Score:  total,
 			Reason: reason,
-			D1:     d1Score,
 		})
 	}
 
@@ -265,15 +241,14 @@ func (ss *SectorScanner) scoreSectors(sectors []SectorInfo, limitupBull, limitup
 }
 
 // BuildEventMapFromNews 从新闻中构建 板块名称→事件描述 映射。
-// 供 filterEventNews 使用：为 D1 评分和看板展示填充板块事件数据，
-// 同时计算每条新闻与板块的关联度权重（标题命中=1.0，正文命中=0.6）。
+// 为看板展示填充板块事件数据。
 // base 为已有映射（追加而非覆盖）。
 func (ss *SectorScanner) BuildEventMapFromNews(news []NewsItem, base map[string]string) map[string]string {
 	out := make(map[string]string, len(base))
 	for k, v := range base {
 		out[k] = v
 	}
-	if ss.matcher == nil || len(news) == 0 {
+	if len(news) == 0 {
 		return out
 	}
 
@@ -281,18 +256,9 @@ func (ss *SectorScanner) BuildEventMapFromNews(news []NewsItem, base map[string]
 	sectors := ss.cachedSector
 	ss.mu.RUnlock()
 
-	// 清空旧关联度，重新计算
-	newAssoc := make(map[string]float64)
-	assocCount := make(map[string]int)
-
 	for _, n := range news {
-		mr := ss.matcher.MatchD1(n.Title)
-		if mr.Blocked || mr.Score < 30 {
-			continue
-		}
 		text := n.Title + " " + n.Content
 		textLower := strings.ToLower(text)
-		titleLower := strings.ToLower(n.Title)
 
 		for _, s := range sectors {
 			secName := strings.ToLower(s.Name)
@@ -300,30 +266,12 @@ func (ss *SectorScanner) BuildEventMapFromNews(news []NewsItem, base map[string]
 				continue
 			}
 			if strings.Contains(textLower, secName) {
-				// 映射事件描述
 				if _, exists := out[s.Code]; !exists {
 					out[s.Code] = n.Title
 				}
-
-				// 关联度权重：标题命中=1.0，仅正文命中=0.6
-				weight := 0.6
-				if strings.Contains(titleLower, secName) {
-					weight = 1.0
-				}
-				// 多条新闻命中同一板块时取最高权重
-				if weight > newAssoc[s.Code] {
-					newAssoc[s.Code] = weight
-				}
-				assocCount[s.Code]++
 			}
 		}
 	}
-
-	// 存入（有锁保护）
-	ss.mu.Lock()
-	ss.sectorAssocScore = newAssoc
-	ss.mu.Unlock()
-
 	return out
 }
 

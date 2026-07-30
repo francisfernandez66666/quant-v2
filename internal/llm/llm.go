@@ -1,4 +1,4 @@
-// Package llm SiliconFlow NLP 分析与热点标记封装。
+// Package llm 支持 OpenAI 兼容协议的 NLP 分析与热点标记封装。
 package llm
 
 import (
@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -22,26 +21,25 @@ type Client struct {
 	model      string
 }
 
-// New 创建 LLM 客户端。model 参数为空时默认使用 Qwen/Qwen3-8B，但可通过环境变量 LLM_API_URL 中的配置覆盖默认模型。
-func New(apiKey, model string) *Client {
-	apiURL := os.Getenv("LLM_API_URL")
-	if apiURL == "" {
-		apiURL = "https://api.siliconflow.cn/v1/chat/completions"
+// New 创建 LLM 客户端。
+func New(cfg Config) *Client {
+	if cfg.APIURL == "" {
+		cfg.APIURL = "https://api.siliconflow.cn/v1/chat/completions"
 	}
-	if model == "" {
-		model = "Qwen/Qwen3-8B"
+	if cfg.Model == "" {
+		cfg.Model = "Qwen/Qwen3-8B"
 	}
 
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
 				ForceAttemptHTTP2: false,
 			},
 		},
-		apiKey: apiKey,
-		apiURL: apiURL,
-		model:  model,
+		apiKey: cfg.APIKey,
+		apiURL: cfg.APIURL,
+		model:  cfg.Model,
 	}
 }
 
@@ -65,7 +63,7 @@ type ChatResponse struct {
 }
 
 // Chat 向 SiliconFlow API 发送对话请求。先传入 system 提示词（设定角色和输出格式），再传入 user 问题。
-// HTTP 客户端超时时间 120s，超时后会返回错误，调用方应据此做好重试或兜底。
+// HTTP 客户端超时时间 30s，超时后会返回错误，调用方应据此做好重试或兜底。
 func (c *Client) Chat(system, user string) (string, error) {
 	if c.apiKey == "" {
 		return "", fmt.Errorf("LLM_API_KEY not set")
@@ -108,29 +106,41 @@ func (c *Client) Chat(system, user string) (string, error) {
 
 // HotTopic 热点新闻结构化分析结果。
 type HotTopic struct {
-	Title       string   `json:"title"`
-	Sentiment   string   `json:"sentiment"`    // 正面/负面/中性
-	Score       float64  `json:"score"`        // 综合评分 0-1
-	ImpactLevel string   `json:"impact_level"` // 高/中/低
-	EventType   string   `json:"event_type"`   // 政策/财报/行业/公司/宏观/事件驱动
-	Urgency     string   `json:"urgency"`      // 立即/关注/观察
-	Direction   string   `json:"direction"`    // 利好/利空/中性
-	Sectors     []string `json:"sectors"`      // 关联板块
-	Stocks      []string `json:"stocks"`       // 关联个股
-	Strategy    string   `json:"strategy"`     // N形/龙头/双凸/龙回头/无
-	Reason      string   `json:"reason"`       // 分析理由
+	Title             string   `json:"title"`
+	Level             string   `json:"level"`
+	Sentiment         string   `json:"sentiment"`
+	Score             float64  `json:"score"`
+	ImpactLevel       string   `json:"impact_level"`
+	EventType        string   `json:"event_type"`
+	Urgency           string   `json:"urgency"`
+	Direction         string   `json:"direction"`
+	Sectors           []string `json:"sectors"`
+	UpstreamSectors   []string `json:"upstream_sectors"`
+	DownstreamSectors []string `json:"downstream_sectors"`
+	RelatedStocks     []string `json:"related_stocks"`
+	Strategy          string   `json:"strategy"`
+	Reason            string   `json:"reason"`
 }
 
-var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提供的新闻标题进行全方位分析，严格按JSON格式返回，字段如下：
+var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提供的新闻标题进行全方位分析，严格按JSON格式返回。
+
+首先判断事件级别：
+- 个股级别：股东增持/减持/回购/质押/公司公告/个股经营变动等仅影响单一公司的事件 → level="个股", sectors/upstream_sectors/downstream_sectors全部置为[]空数组
+- 板块级别：政策/行业景气/宏观数据/技术突破等影响整个产业链的事件 → level="板块", 正常填写sectors
+
+字段说明：
 {
+  "level": "板块|个股",
   "sentiment": "正面|负面|中性",
   "score": 0.0-1.0,
   "impact_level": "高|中|低",
   "event_type": "政策|财报|行业|公司|宏观|事件驱动",
   "urgency": "立即|关注|观察",
   "direction": "利好|利空|中性",
-  "sectors": ["影响的板块名称"],
-  "stocks": ["关联个股代码或名称"],
+  "sectors": ["直接影响板块"],
+  "upstream_sectors": ["上游产业链受影响板块"],
+  "downstream_sectors": ["下游产业链受影响板块"],
+  "related_stocks": ["关联个股名称或代码"],
   "strategy": "N形|龙头|双凸|龙回头|无",
   "reason": "简要分析理由"
 }
@@ -140,19 +150,26 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
 
 对筛选出的每条事件按JSON格式输出，整体为一个JSON数组。如果无重大事件，只输出[]。
 
+首先判断事件级别：
+- 个股级别：股东增持/减持/回购/质押/公司公告/个股经营变动等仅影响单一公司的事件 → level="个股", sectors/upstream_sectors/downstream_sectors全部置为[]空数组
+- 板块级别：政策/行业景气/宏观数据/技术突破等影响整个产业链的事件 → level="板块", 正常填写sectors
+
 每条新闻的格式: "序号. 标题"
 返回格式:
 [
   {
     "index": 序号,
+    "level": "板块|个股",
     "sentiment": "正面|负面|中性",
     "score": 0.0-1.0,
     "impact_level": "高|中|低",
     "event_type": "政策|财报|行业|公司|宏观|事件驱动",
     "urgency": "立即|关注|观察",
     "direction": "利好|利空|中性",
-    "sectors": ["影响的板块名称"],
-    "stocks": ["关联个股代码或名称"],
+    "sectors": ["直接影响板块"],
+    "upstream_sectors": ["上游产业链受影响板块"],
+    "downstream_sectors": ["下游产业链受影响板块"],
+    "related_stocks": ["关联个股名称或代码"],
     "strategy": "N形|龙头|双凸|龙回头|无",
     "reason": "简要分析理由"
   }
@@ -187,17 +204,20 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
 	resp = cleanJSON(resp)
 
 	var raw []struct {
-		Index       int      `json:"index"`
-		Sentiment   string   `json:"sentiment"`
-		Score       float64  `json:"score"`
-		ImpactLevel string   `json:"impact_level"`
-		EventType   string   `json:"event_type"`
-		Urgency     string   `json:"urgency"`
-		Direction   string   `json:"direction"`
-		Sectors     []string `json:"sectors"`
-		Stocks      []string `json:"stocks"`
-		Strategy    string   `json:"strategy"`
-		Reason      string   `json:"reason"`
+		Index             int      `json:"index"`
+		Level             string   `json:"level"`
+		Sentiment         string   `json:"sentiment"`
+		Score             float64  `json:"score"`
+		ImpactLevel       string   `json:"impact_level"`
+		EventType        string   `json:"event_type"`
+		Urgency           string   `json:"urgency"`
+		Direction         string   `json:"direction"`
+		Sectors           []string `json:"sectors"`
+		UpstreamSectors   []string `json:"upstream_sectors"`
+		DownstreamSectors []string `json:"downstream_sectors"`
+		RelatedStocks     []string `json:"related_stocks"`
+		Strategy          string   `json:"strategy"`
+		Reason            string   `json:"reason"`
 	}
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
 		log.Printf("LLM[%d] JSON解析失败, raw[:%d]=%q, 使用关键词兜底: %v", len(titles), minInt(len(resp), 300), resp[:minInt(len(resp), 300)], err)
@@ -207,7 +227,7 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
 	// 日志：LLM返回了哪些板块和个股
 	for _, r := range raw {
 		sectors := strings.Join(r.Sectors, ",")
-		stocks := strings.Join(r.Stocks, ",")
+		stocks := strings.Join(r.RelatedStocks, ",")
 		idx := r.Index - 1
 		title := ""
 		if idx >= 0 && idx < len(titles) {
@@ -221,6 +241,7 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
 		ht := fallbackAnalysis(title)
 		for _, r := range raw {
 			if r.Index == i+1 {
+				ht.Level = r.Level
 				ht.Sentiment = r.Sentiment
 				ht.Score = r.Score
 				ht.ImpactLevel = r.ImpactLevel
@@ -230,9 +251,15 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
 				if len(r.Sectors) > 0 {
 					ht.Sectors = r.Sectors
 				}
-				if len(r.Stocks) > 0 {
-					ht.Stocks = r.Stocks
-				}
+			if len(r.UpstreamSectors) > 0 {
+				ht.UpstreamSectors = r.UpstreamSectors
+			}
+			if len(r.DownstreamSectors) > 0 {
+				ht.DownstreamSectors = r.DownstreamSectors
+			}
+			if len(r.RelatedStocks) > 0 {
+				ht.RelatedStocks = r.RelatedStocks
+			}
 				if r.Strategy != "" {
 					ht.Strategy = r.Strategy
 				}
@@ -241,6 +268,9 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
 				}
 				break
 			}
+		}
+		if ht.Level == "" {
+			ht.Level = "板块"
 		}
 		if ht.Strategy == "" {
 			ht.Strategy = "无"
@@ -283,6 +313,9 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 		return fallbackAnalysis(title), err
 	}
 
+	if ht.Level == "" {
+		ht.Level = "板块"
+	}
 	if ht.Strategy == "" {
 		ht.Strategy = "无"
 	}
@@ -347,13 +380,41 @@ func cleanJSON(s string) string {
 	}
 	// 移除尾部的非法字符（如句号、逗号）只保留 JSON 部分
 	s = strings.TrimRight(s, ".,; ")
-	return s
+	// 转义字符串值中的换行符（JSON 不允许字符串内未转义的 \n）
+	var buf strings.Builder
+	inStr := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if escaped {
+			buf.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			buf.WriteByte(ch)
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			buf.WriteByte(ch)
+			continue
+		}
+		if inStr && (ch == '\n' || ch == '\r') {
+			buf.WriteString("\\n")
+		} else {
+			buf.WriteByte(ch)
+		}
+	}
+	return buf.String()
 }
 
 // fallbackAnalysis 关键词兜底分析（LLM 解析失败时使用）。
 func fallbackAnalysis(title string) *HotTopic {
 	ht := &HotTopic{
 		Title:       title,
+		Level:       "板块",
 		Sentiment:   "中性",
 		Score:       0.5,
 		ImpactLevel: "中",
@@ -393,12 +454,15 @@ func fallbackAnalysis(title string) *HotTopic {
 		}
 		ht.Sectors = uniq
 	}
+	if len(ht.Sectors) == 0 {
+		ht.Level = "个股"
+	}
 
 	// 板块→个股：通过 StockCodeMap 查找
 	for _, sec := range ht.Sectors {
 		for name, code := range StockCodeMap {
 			if strings.Contains(name, sec) || strings.Contains(sec, name) {
-				ht.Stocks = append(ht.Stocks, code)
+				ht.RelatedStocks = append(ht.RelatedStocks, code)
 			}
 		}
 	}

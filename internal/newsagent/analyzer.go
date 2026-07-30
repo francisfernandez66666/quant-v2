@@ -6,6 +6,7 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
+// analyzeDeep Stage2 全量分析：调用 LLM 对筛选后的新闻深度分析，生成结构化 NewsEvent。
 func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 	if len(items) == 0 {
 		return nil
@@ -24,20 +25,22 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 			continue
 		}
 		event := NewsEvent{
-			Title:       items[i].Title,
-			Content:     items[i].Content,
-			Datetime:    items[i].Datetime,
-			Source:      items[i].Source,
-			IsMaterial:  true,
-			Direction:   ht.Direction,
-			Score:       ht.Score,
-			Sectors:     ht.Sectors,
-			Stocks:      ht.Stocks,
-			ImpactLevel: ht.ImpactLevel,
-			EventType:   ht.EventType,
-			Urgency:     ht.Urgency,
-			Strategy:    ht.Strategy,
-			Reason:      ht.Reason,
+			Title:             items[i].Title,
+			Content:           items[i].Content,
+			Datetime:          items[i].Datetime,
+			Source:            items[i].Source,
+			IsMaterial:        true,
+			Level:             ht.Level,
+			Direction:         ht.Direction,
+			Score:             ht.Score,
+			Sectors:           ht.Sectors,
+			UpstreamSectors:   ht.UpstreamSectors,
+			DownstreamSectors: ht.DownstreamSectors,
+			RelatedStocks:     ht.RelatedStocks,
+			ImpactLevel:       ht.ImpactLevel,
+			EventType:        ht.EventType,
+			Urgency:           ht.Urgency,
+			Reason:            ht.Reason,
 		}
 		events = append(events, event)
 	}

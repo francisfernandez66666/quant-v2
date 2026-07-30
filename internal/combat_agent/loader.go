@@ -1,15 +1,18 @@
 package combat_agent
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"quant-trading-v2/internal/config"
 )
 
-// StartHotReload 启动策略参数热加载（fsnotify）
+// StartHotReload 启动配置文件热加载，监听文件变化自动重载策略参数。
+// 使用 fsnotify 监控文件写入/创建事件，500ms 防抖后执行重载。
 func (a *Agent) StartHotReload(path string) {
 	if path == "" {
 		return
@@ -66,6 +69,7 @@ func (a *Agent) StartHotReload(path string) {
 	log.Printf("[combat_agent] 热加载已启动: %s", absPath)
 }
 
+// reloadConfig 读取并解析 JSON 配置文件，提取策略规则后热更新。
 func (a *Agent) reloadConfig(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -73,9 +77,16 @@ func (a *Agent) reloadConfig(path string) {
 		return
 	}
 
-	// 这里应该解析 strategies.yaml 到 StrategyConfig
-	// 简化：暂时只记录日志，具体解析格式由后续完善
-	log.Printf("[combat_agent] 配置文件已变更 (%d bytes), 等待实现完整解析", len(data))
+	var wrapper struct {
+		Rules *config.Rules `json:"rules"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		log.Printf("[combat_agent] 解析配置失败: %v", err)
+		return
+	}
+	if wrapper.Rules == nil {
+		return
+	}
 
-	_ = data
+	a.HotReload(&wrapper.Rules.Strategy)
 }

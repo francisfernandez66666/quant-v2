@@ -1,100 +1,77 @@
-// Package data — 自选股持久化管理。
-// 自选股列表以 JSON 文件存储于日志目录下，支持运行时增删。
+// Package data — 自选股管理。提供自选股列表的增删查和 JSON 持久化。
 package data
 
 import (
 	"encoding/json"
+	"log"
 	"os"
-	"path/filepath"
 	"sync"
 )
 
-// WatchlistManager 自选股管理器。
-// 线程安全，支持加载/保存/增删；文件格式为 JSON 字符串数组。
+// WatchlistManager 自选股管理器，线程安全，持久化到 watchlist.json。
 type WatchlistManager struct {
-	mu     sync.RWMutex
-	path   string   // 自选股 JSON 文件路径
-	stocks []string // 自选股代码列表
+	mu   sync.RWMutex // 读写锁
+	dir  string       // 数据目录
+	list []string     // 自选股代码列表
 }
 
-// NewWatchlistManager 创建自选股管理器。
-// logDir 为日志目录，自选股文件名为 custom_watchlist.json。
-func NewWatchlistManager(logDir string) *WatchlistManager {
-	return &WatchlistManager{
-		path:   filepath.Join(logDir, "custom_watchlist.json"),
-		stocks: []string{},
-	}
+// NewWatchlistManager 创建自选股管理器并加载已有数据。
+func NewWatchlistManager(dir string) *WatchlistManager {
+	w := &WatchlistManager{dir: dir}
+	w.load()
+	return w
 }
 
-// Load 从磁盘加载自选股列表。文件不存在时返回空列表而非错误。
-func (wm *WatchlistManager) Load() error {
-	wm.mu.Lock()
-	defer wm.mu.Unlock()
-	data, err := os.ReadFile(wm.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			wm.stocks = []string{}
-			return nil
-		}
-		return err
-	}
-	return json.Unmarshal(data, &wm.stocks)
-}
-
-// Save 将当前自选股列表写入磁盘。
-func (wm *WatchlistManager) Save() error {
-	data, err := json.Marshal(wm.stocks)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(wm.path, data, 0644)
-}
-
-// List 返回自选股列表的副本。
-func (wm *WatchlistManager) List() []string {
-	wm.mu.RLock()
-	defer wm.mu.RUnlock()
-	out := make([]string, len(wm.stocks))
-	copy(out, wm.stocks)
+// List 返回自选股列表副本（线程安全）。
+func (w *WatchlistManager) List() []string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make([]string, len(w.list))
+	copy(out, w.list)
 	return out
 }
 
-// Add 添加一只股票到自选股。已存在时直接返回 nil。
-func (wm *WatchlistManager) Add(code string) error {
-	wm.mu.Lock()
-	defer wm.mu.Unlock()
-	for _, c := range wm.stocks {
+// Add 添加股票到自选列表（去重），返回 true 表示新增成功。
+func (w *WatchlistManager) Add(code string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, c := range w.list {
 		if c == code {
-			return nil
+			return false
 		}
 	}
-	wm.stocks = append(wm.stocks, code)
-	return wm.save()
+	w.list = append(w.list, code)
+	w.save()
+	return true
 }
 
-// Remove 从自选股中移除一只股票。不存在时直接返回 nil。
-func (wm *WatchlistManager) Remove(code string) error {
-	wm.mu.Lock()
-	defer wm.mu.Unlock()
-	idx := -1
-	for i, c := range wm.stocks {
+// Remove 从自选列表中移除指定股票，返回 true 表示移除成功。
+func (w *WatchlistManager) Remove(code string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i, c := range w.list {
 		if c == code {
-			idx = i
-			break
+			w.list = append(w.list[:i], w.list[i+1:]...)
+			w.save()
+			return true
 		}
 	}
-	if idx < 0 {
-		return nil
-	}
-	wm.stocks = append(wm.stocks[:idx], wm.stocks[idx+1:]...)
-	return wm.save()
+	return false
 }
 
-// save 内部方法：将 stocks 序列化并写入磁盘文件。
-func (wm *WatchlistManager) save() error {
-	data, err := json.Marshal(wm.stocks)
+// load 从 watchlist.json 读取自选股列表。
+func (w *WatchlistManager) load() {
+	data, err := os.ReadFile(w.dir + "/watchlist.json")
 	if err != nil {
-		return err
+		return
 	}
-	return os.WriteFile(wm.path, data, 0644)
+	json.Unmarshal(data, &w.list)
+}
+
+// save 将自选股列表写入 watchlist.json。
+func (w *WatchlistManager) save() {
+	data, _ := json.MarshalIndent(w.list, "", "  ")
+	if err := os.WriteFile(w.dir+"/watchlist.json", data, 0644); err != nil {
+		log.Printf("[watchlist] 保存失败: %v", err)
+	}
 }

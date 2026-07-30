@@ -83,7 +83,16 @@ func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) 
 
 // secID 将股票代码转换为东方财富 push2 证券ID格式。
 // 沪市（6/5 开头）加 "1." 前缀，深市加 "0." 前缀。
+// stripSuffix 剥离股票代码的交易所后缀（.SH / .SZ / .BJ）
+func stripSuffix(code string) string {
+	if len(code) > 3 && code[len(code)-3:] == ".SH" || len(code) > 3 && code[len(code)-3:] == ".SZ" || len(code) > 3 && code[len(code)-3:] == ".BJ" {
+		return code[:len(code)-3]
+	}
+	return code
+}
+
 func secID(code string) string {
+	code = stripSuffix(code)
 	if strings.HasPrefix(code, "6") || strings.HasPrefix(code, "5") {
 		return "1." + code
 	}
@@ -97,6 +106,7 @@ func secID(code string) string {
 func sinaQuoteURL(codes ...string) string {
 	prefix := ""
 	for _, c := range codes {
+		c = stripSuffix(c)
 		if strings.HasPrefix(c, "6") || strings.HasPrefix(c, "5") {
 			prefix += "sh" + c + ","
 		} else {
@@ -175,11 +185,18 @@ func parseSinaQuote(body []byte, code string) (*StockInfo, error) {
 // stockQuoteFields 东方财富 push2 个股行情字段列表。
 const stockQuoteFields = "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f60,f116,f117,f162,f167,f168,f169,f170,f171,f292"
 
-// GetRealtimeQuote 获取东方财富 push2 实时行情。
+// GetRealtimeQuote 获取实时行情。先尝试东方财富 push2，失败时回退到新浪。
 // 东财 push2 接口返回的价格字段（F43/F44/F45/F46/F60）单位为分，需 ÷100 转换为元。
-// F60（昨收）替代 F47（总市值）作为收盘价基准，确保涨跌幅计算准确。
 // 返回 StockInfo，包含名称、价格、涨跌幅、成交量、换手率、主力净流入等。
 func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
+	info, err := m.getEastMoneyQuote(code)
+	if err == nil {
+		return info, nil
+	}
+	return m.GetSinaQuote(code)
+}
+
+func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=%s", sid, stockQuoteFields)
 	EastMoneyLimiter.Wait()
@@ -296,10 +313,14 @@ func parseSectorList(body []byte) ([]SectorInfo, error) {
 
 // ── 东方财富板块成分股 ──
 
+// getSectorFields 东方财富板块成分股查询字段。
+// 与 parseSectorStocks 使用的解析标签一致：f12/f14/f2/f3/f4/f15/f16/f17/f18/f5/f6/f7。
+const getSectorFields = "f12,f14,f2,f3,f4,f15,f16,f17,f18,f5,f6,f7"
+
 // GetSectorStocks 获取指定板块的成分股列表。
 // sectorCode 为板块代码（如 "BK0477"），topN 限制返回数量。
 func (m *MarketAPI) GetSectorStocks(sectorCode string, topN int) ([]StockInfo, error) {
-	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&np=1&fs=b:%s&fields=%s", topN, sectorCode, stockQuoteFields)
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&np=1&fs=b:%s&fields=%s", topN, sectorCode, getSectorFields)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
@@ -1009,6 +1030,55 @@ func (m *MarketAPI) GetStockIndustry(code string) string {
 		return ""
 	}
 	return raw.Data.F128
+}
+
+// stockListFields 全量股票列表查询字段（代码+名称+PE+市值）。
+const stockListFields = "f12,f14,f9,f20"
+
+// stockRawItem 东方财富全量股票列表的原始 JSON 行。
+type stockRawItem struct {
+	Code string  `json:"f12"`
+	Name string  `json:"f14"`
+	PE   float64 `json:"f9"`
+	MCap float64 `json:"f20"` // 总市值
+}
+
+// GetStockList 获取全量 A 股列表（代码+名称）。
+// 同时查询上海主板、深圳主板、创业板、科创板，合并返回。
+func (m *MarketAPI) GetStockList() (map[string]string, error) {
+	// 同时查询各板块：沪A、深A、创业板、科创板、北交所
+	fs := "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81"
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10000&fs=%s&fields=%s", fs, stockListFields)
+	EastMoneyLimiter.Wait()
+	resp, err := m.getWithHeaders(url, emReferer)
+	if err != nil {
+		return nil, fmt.Errorf("eastmoney stock list http: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("eastmoney stock list read: %v", err)
+	}
+	var raw struct {
+		Data *struct {
+			Total int                    `json:"total"`
+			Diff  map[string]stockRawItem `json:"diff"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("eastmoney stock list json: %v", err)
+	}
+	if raw.Data == nil || len(raw.Data.Diff) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]string, len(raw.Data.Diff))
+	for _, item := range raw.Data.Diff {
+		if item.Code == "" || item.Name == "" {
+			continue
+		}
+		result[item.Name] = item.Code
+	}
+	return result, nil
 }
 
 // filterStocksBySector 按板块代码过滤成分股列表。

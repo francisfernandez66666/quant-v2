@@ -238,3 +238,34 @@ func NextTradeOpen(now time.Time) time.Duration {
 	}
 	return 0
 }
+
+// TradingDayDate 返回当前交易日日期 YYYYMMDD。
+// 周末退回到上一周五，节假日暂不处理（后续可扩展）。
+func TradingDayDate(now time.Time) string {
+	t := now
+	for t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+		t = t.AddDate(0, 0, -1)
+	}
+	return t.Format("20060102")
+}
+
+// AddTradingDays 将日期往后推 n 个交易日，返回 YYYYMMDD。
+func AddTradingDays(td string, n int) string {
+	t, err := time.Parse("20060102", td)
+	if err != nil {
+		return td
+	}
+	added := 0
+	for added < n {
+		t = t.AddDate(0, 0, 1)
+		if t.Weekday() != time.Saturday && t.Weekday() != time.Sunday {
+			added++
+		}
+	}
+	return t.Format("20060102")
+}
+
+// IsTradingDay 判断给定日期是否为交易日（仅检查周末）。
+func IsTradingDay(t time.Time) bool {
+	return t.Weekday() != time.Saturday && t.Weekday() != time.Sunday
+}

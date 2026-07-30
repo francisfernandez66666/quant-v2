@@ -1,7 +1,31 @@
+# 文档/SVG
+*.svg
+*.pdf
+*.md
+PROJECT_DOCUMENT*
+README*
+events_leftside.yaml
+FLOW*
+ARCH*
+SEQUENCE*
+
+# 构建产物
+quant
+dist/
+
+# 前端依赖
+node_modules/
+
+# 运行数据
+.quant-trading-v2/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
-/quant
-auth.json
-config/strategies.yaml
-*.exe
-*.test
-*.out

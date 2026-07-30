@@ -112,7 +112,6 @@ type NewsItem struct {
 }
 
 // IPOEvent 新股日历事件。
-// 来源：Tushare new_share API（首选）、东方财富数据中心（降级）。
 type IPOEvent struct {
 	Code        string  `json:"code"`         // 股票代码（6位）
 	Name        string  `json:"name"`         // 股票名称
@@ -121,19 +120,6 @@ type IPOEvent struct {
 	IssuePrice  float64 `json:"issue_price"`  // 发行价（元）
 	ListStatus  string  `json:"list_status"`  // L=已上市 U=未上市
 	Sector      string  `json:"sector"`       // 所属板块名称（IPO时可能空缺）
-}
-
-// ThsSectorInfo 同花顺板块指数信息（来自 Tushare ths_index）。
-type ThsSectorInfo struct {
-	Code  string // THS 板块代码（如 "TS886001"）
-	Name  string // 板块名称
-	Count int    // 成分股数量
-}
-
-// ThsMemberInfo 同花顺板块成分股信息（来自 Tushare ths_member）。
-type ThsMemberInfo struct {
-	ConCode string // 成分股代码
-	Name    string // 成分股名称
 }
 
 // FinancialInfo 个股基本面指标。
