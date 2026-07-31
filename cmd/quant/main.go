@@ -26,6 +26,7 @@ import (
 	"quant-trading-v2/internal/strategies/n_shape"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/trigger"
 )
 
 // main 系统入口：初始化数据目录、认证、行情 API、LLM、新闻代理、策略引擎等所有组件，
@@ -140,6 +141,15 @@ func main() {
 	go fetcher.Start()
 	defer fetcher.Stop()
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
+
+	// 实时触发引擎（daban式放量急拉检测，SSE 推送）
+	trigCtx, trigCancel := context.WithCancel(context.Background())
+	defer trigCancel()
+	triggerEngine := trigger.New(fetcher, srv.GetSSE(), trigger.DefaultConfig())
+	go triggerEngine.Run(trigCtx)
+
+	// 情绪周期阈值注入（SSE 广播情绪阶段）
+	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
 
 	addr := ":8080"
 	if v := os.Getenv("QUANT_ADDR"); v != "" {

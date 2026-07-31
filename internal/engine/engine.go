@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/llm"
@@ -56,6 +57,14 @@ type Engine struct {
 	hotRecPath string
 
 	sectorEventTimes map[string]time.Time // 板块事件时间戳（重复事件衰减状态）
+	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
+}
+
+// SetEmotionConfig 设置情绪周期阈值（线程安全）。
+func (e *Engine) SetEmotionConfig(cfg *config.EmotionConfig) {
+	e.mu.Lock()
+	e.emotionCfg = cfg
+	e.mu.Unlock()
 }
 
 // stageRecordFile Stage 记录磁盘持久化结构（按交易日分桶）。
@@ -643,6 +652,9 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		}
 		if pool != nil {
 			payload["zt_pool"] = fmt.Sprintf("%d", len(pool))
+		}
+		if e.emotionCfg != nil {
+			payload["emotion"] = data.DetectEmotionPhaseV2(pool, 0, 0, e.emotionCfg)
 		}
 		e.sse.Broadcast(payload)
 	}
