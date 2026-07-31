@@ -50,7 +50,9 @@ run_dev() {
     echo "[*] 后端 PID: $QUANT_PID (日志: $LOGFILE)"
     sleep 1
     # 打印后端的最后几行启动日志
-    tail -5 "$LOGFILE" 2>/dev/null | sed 's/^/  │ /'
+    # 用 awk 而非 sed 前缀多字节字符：macOS BSD sed 在 UTF-8 下处理含 NUL/非法字节的日志行会触发
+    # "Assertion failed: (advance > 0), function substitute" 崩溃，awk 按字节处理不受影响。
+    tail -5 "$LOGFILE" 2>/dev/null | awk '{print "  │ " $0}'
 
     echo "[*] 启动前端 dev server (port 5173)..."
     cd web && npm install --silent && npm run dev &
