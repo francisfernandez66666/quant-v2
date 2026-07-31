@@ -140,63 +140,86 @@ func sinaQuoteURL(codes ...string) string {
 // 返回 StockInfo，包含名称、价格、涨跌幅、成交量等。
 // 当 Price <= 0 时表示数据无效。
 func (m *MarketAPI) GetSinaQuote(code string) (*StockInfo, error) {
-	url := sinaQuoteURL(code)
+	quotes := m.getSinaQuotes([]string{code})
+	if si, ok := quotes[code]; ok {
+		return si, nil
+	}
+	return nil, fmt.Errorf("sina: no quote data for %s", code)
+}
+
+// GetSinaQuotes 批量获取新浪财经实时行情（单次请求批量解析）。
+// 返回 code → StockInfo 映射，仅含解析成功的股票。
+// 内部按 80 只一批分段请求，规避新浪 URL 长度限制。
+func (m *MarketAPI) GetSinaQuotes(codes []string) map[string]*StockInfo {
+	out := make(map[string]*StockInfo, len(codes))
+	if len(codes) == 0 {
+		return out
+	}
+	const batch = 80
+	for i := 0; i < len(codes); i += batch {
+		end := i + batch
+		if end > len(codes) {
+			end = len(codes)
+		}
+		for code, si := range m.getSinaQuotes(codes[i:end]) {
+			out[code] = si
+		}
+	}
+	return out
+}
+
+// sinaQuoteRe 批量解析新浪行情行：var hq_str_sh600519="字段,...";
+var sinaQuoteRe = regexp.MustCompile(`var\s+hq_str_(?:sh|sz|bj)(\d+)\s*=\s*"([^"]*)"`)
+
+// getSinaQuotes 发起单次新浪批量请求并解析全部行。
+func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
+	out := make(map[string]*StockInfo, len(codes))
+	if len(codes) == 0 {
+		return out
+	}
+	url := sinaQuoteURL(codes...)
 	SinaLimiter.Wait()
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("sina request: %v", err)
+		return out
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://finance.sina.com.cn")
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("sina http: %v", err)
+		return out
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("sina read: %v", err)
+		return out
 	}
-	return parseSinaQuote(body, code)
-}
-
-// parseSinaQuote 解析新浪财经 CSV 格式行情数据。
-// 响应格式：var hq_str_sh600519="名称,开盘,昨收,当前,最高,最低,买一价,卖一价,成交量,成交额,...";
-// 字段索引约定：
-//
-//	0: 名称  1: 开盘  2: 昨收  3: 当前  4: 最高
-//	5: 最低  6: 买一价  7: 卖一价  8: 成交量  9: 成交额
-func parseSinaQuote(body []byte, code string) (*StockInfo, error) {
-	// GBK → UTF-8
 	utfBody, _, _ := transform.String(simplifiedchinese.GBK.NewDecoder(), string(body))
-	raw := utfBody
-	eq := strings.IndexByte(raw, '"')
-	if eq < 0 {
-		return nil, fmt.Errorf("sina: no quote data for %s", code)
+	for _, mch := range sinaQuoteRe.FindAllStringSubmatch(utfBody, -1) {
+		if len(mch) < 3 {
+			continue
+		}
+		code := mch[1]
+		fields := strings.Split(mch[2], ",")
+		if len(fields) < 10 {
+			continue
+		}
+		si := &StockInfo{Code: code}
+		si.Name = fields[0]
+		si.Open, _ = strconv.ParseFloat(fields[1], 64)
+		prevClose, _ := strconv.ParseFloat(fields[2], 64)
+		si.Price, _ = strconv.ParseFloat(fields[3], 64)
+		si.High, _ = strconv.ParseFloat(fields[4], 64)
+		si.Low, _ = strconv.ParseFloat(fields[5], 64)
+		si.Volume, _ = strconv.ParseFloat(fields[8], 64)
+		si.Amount, _ = strconv.ParseFloat(fields[9], 64)
+		si.Close = prevClose
+		if prevClose > 0 && si.Price > 0 {
+			si.ChangePct = (si.Price - prevClose) / prevClose * 100
+		}
+		out[code] = si
 	}
-	raw = raw[eq+1:]
-	eq = strings.IndexByte(raw, '"')
-	if eq < 0 {
-		return nil, fmt.Errorf("sina: no closing quote for %s", code)
-	}
-	fields := strings.Split(raw[:eq], ",")
-	if len(fields) < 10 {
-		return nil, fmt.Errorf("sina: too few fields (%d) for %s", len(fields), code)
-	}
-	si := &StockInfo{Code: code}
-	si.Name = fields[0]
-	si.Open, _ = strconv.ParseFloat(fields[1], 64)
-	prevClose, _ := strconv.ParseFloat(fields[2], 64)
-	si.Price, _ = strconv.ParseFloat(fields[3], 64)
-	si.High, _ = strconv.ParseFloat(fields[4], 64)
-	si.Low, _ = strconv.ParseFloat(fields[5], 64)
-	si.Volume, _ = strconv.ParseFloat(fields[8], 64)
-	si.Amount, _ = strconv.ParseFloat(fields[9], 64)
-	si.Close = prevClose
-	if prevClose > 0 && si.Price > 0 {
-		si.ChangePct = (si.Price - prevClose) / prevClose * 100
-	}
-	return si, nil
+	return out
 }
 
 // ── 东方财富 push2 实时行情 ──

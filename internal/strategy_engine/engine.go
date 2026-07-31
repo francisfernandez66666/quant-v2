@@ -124,53 +124,66 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 	}
 }
 
-// fetchMarketData 为打分池所有个股拉取行情数据（KLine + 实时价 + 资金流向）。
+// fetchMarketData 为打分池所有个股拉取行情数据（实时价 + KLine + 资金流向）。
+// 实时行情走新浪批量 CSV（一次网络请求拉全池），K线/资金流并发拉取（每只2次请求）。
 func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string]*StockMarketData {
 	result := make(map[string]*StockMarketData, len(codes))
 	for _, code := range codes {
-		md := &StockMarketData{Code: code}
+		result[code] = &StockMarketData{Code: code}
+	}
 
-		// 实时行情
-		si, err := e.marketAPI.GetSinaQuote(code)
-		if err != nil || si == nil || si.Price <= 0 {
-			si, err = e.marketAPI.GetRealtimeQuote(code)
-		}
-		if err != nil || si == nil {
-			md.Error = "行情获取失败: " + err.Error()
-			log.Printf("[strategy_engine] 行情失败 %s: %v", code, err)
-		} else {
+	// 1. 批量实时行情（新浪 CSV 单次请求）
+	for code, si := range e.marketAPI.GetSinaQuotes(codes) {
+		if md, ok := result[code]; ok && si != nil && si.Price > 0 {
 			md.Name = si.Name
 			md.Price = si.Price
 			md.ChangePct = si.ChangePct
-			log.Printf("[strategy_engine] 行情 %s (%s) 价=%.2f 涨跌=%.2f%%", code, si.Name, si.Price, si.ChangePct)
 		}
+	}
+	// 兜底：批量未命中的个股单查东财实时行情
+	for code, md := range result {
+		if md.Price > 0 {
+			continue
+		}
+		si, err := e.marketAPI.GetRealtimeQuote(code)
+		if err != nil || si == nil || si.Price <= 0 {
+			md.Error = "行情获取失败"
+			log.Printf("[strategy_engine] 行情失败 %s: %v", code, err)
+			continue
+		}
+		md.Name = si.Name
+		md.Price = si.Price
+		md.ChangePct = si.ChangePct
+	}
 
-		// K 线
-		klines, err := e.marketAPI.GetSinaKLine(code, 120)
-		if err == nil && len(klines) > 0 {
-			md.KLines = klines
-		} else {
-			klines, err = e.marketAPI.GetKLine(code, "101", 120)
+	// 2. K线 + 资金流向：并发拉取（限流由 data 层 limiter 保证）
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 6)
+	for code, md := range result {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(code string, md *StockMarketData) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			klines, err := e.marketAPI.GetSinaKLine(code, 120)
 			if err == nil && len(klines) > 0 {
 				md.KLines = klines
+			} else {
+				k2, err2 := e.marketAPI.GetKLine(code, "101", 120)
+				if err2 == nil && len(k2) > 0 {
+					md.KLines = k2
+				}
 			}
-		}
-		if len(md.KLines) == 0 {
-			log.Printf("[strategy_engine] K线失败 %s: %v", code, err)
-		} else {
-			log.Printf("[strategy_engine] K线 %s: %d条", code, len(md.KLines))
-		}
 
-		// 资金流向
-		cf, err := e.marketAPI.GetStockMoneyFlow(code)
-		if err == nil && cf != nil {
-			md.MoneyFlow = cf
-		} else {
-			log.Printf("[strategy_engine] 资金流失败 %s: %v", code, err)
-		}
-
-		result[code] = md
+			cf, err := e.marketAPI.GetStockMoneyFlow(code)
+			if err == nil && cf != nil {
+				md.MoneyFlow = cf
+			}
+		}(code, md)
 	}
+	wg.Wait()
+
 	return result
 }
 

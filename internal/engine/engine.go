@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,6 +54,8 @@ type Engine struct {
 	msgStore   *data.MessageStore // 消息中心持久化存储
 	hotRecords []data.HotRecord   // 当日热点板块轮次记录（固化到磁盘）
 	hotRecPath string
+
+	sectorEventTimes map[string]time.Time // 板块事件时间戳（重复事件衰减状态）
 }
 
 // stageRecordFile Stage 记录磁盘持久化结构（按交易日分桶）。
@@ -113,6 +116,7 @@ func New(
 		msgStore:     data.NewMessageStore(msgPath),
 		hotRecords:   loadHotRecords(hotRecPath),
 		hotRecPath:   hotRecPath,
+		sectorEventTimes: make(map[string]time.Time),
 	}
 	e.syncMessages(nil)
 	return e
@@ -466,6 +470,20 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		return &strategy_engine.StrategyResult{}
 	}
 
+	// 6a. 事件聚簇：同板块/同方向的重复新闻合并为单条（去重避免刷屏）
+	valid = clusterEvents(valid)
+
+	// 6b. 事件衰减：同板块同方向事件在窗口内重复出现时按 0.5^(h/4) 降权
+	e.applyEventDecay(valid)
+
+	// 6c. 衰减后再次阈值过滤（重复事件降权后可掉出 0.5 线）
+	valid = filterThreshold(valid, 0.50)
+	if len(valid) == 0 {
+		log.Printf("[engine] 无有效事件(衰减后), 跳过本轮归因")
+		e.captureDebug(rawNews, st0, events)
+		return &strategy_engine.StrategyResult{}
+	}
+
 	// 6b. 板块验真回填：剔除 LLM 幻觉板块名（命中真实板块名单才保留）
 	e.verifySectorAttribution(valid)
 
@@ -613,9 +631,20 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 15. 调试数据
 	e.captureDebug(rawNews, st0, events)
 
-	// 16. SSE 广播通知前端
+	// 16. SSE 广播通知前端（附信号摘要）
 	if e.sse != nil && e.sse.Len() > 0 {
-		e.sse.Broadcast(map[string]string{"type": "scan", "status": "done"})
+		payload := map[string]string{
+			"type":   "scan",
+			"status": "done",
+			"bull":   fmt.Sprintf("%d", len(bullSignals)),
+			"bear":   fmt.Sprintf("%d", len(bearSignals)),
+			"alert":  fmt.Sprintf("%d", len(alertSignals)),
+			"time":   time.Now().Format("15:04:05"),
+		}
+		if pool != nil {
+			payload["zt_pool"] = fmt.Sprintf("%d", len(pool))
+		}
+		e.sse.Broadcast(payload)
 	}
 
 	log.Printf("[engine] 流水线完成: %d条原始 → %d事件 → %d有效 (%v)",
@@ -893,4 +922,117 @@ func newsBriefsByCode(events []newsagent.NewsEvent) map[string][]combat_agent.Ne
 		}
 	}
 	return m
+}
+
+// clusterEvents 事件聚簇：同方向且共享任一板块的事件合并为单条。
+// 簇内标题用" | "连接（最多保留 3 条），个股/相关股票去重合并，Score 取 |score| 最大者。
+// 防止同一主题的多条快讯在信号流中刷屏。
+func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
+	if len(events) < 2 {
+		return events
+	}
+	// 为每个板块名维护簇索引
+	clusterOf := make(map[string]int)
+	clusters := make([][]int, 0, len(events))
+	assign := func(ev newsagent.NewsEvent) int {
+		if ev.Level == "个股" {
+			return -1
+		}
+		for _, sec := range ev.Sectors {
+			if idx, ok := clusterOf[sec]; ok {
+				return idx
+			}
+		}
+		return -1
+	}
+	for i, ev := range events {
+		idx := assign(ev)
+		if idx < 0 {
+			idx = len(clusters)
+			clusters = append(clusters, nil)
+		}
+		clusters[idx] = append(clusters[idx], i)
+		for _, sec := range ev.Sectors {
+			clusterOf[sec] = idx
+		}
+	}
+
+	out := make([]newsagent.NewsEvent, 0, len(clusters))
+	for _, idxs := range clusters {
+		if len(idxs) == 0 {
+			continue
+		}
+		merged := events[idxs[0]]
+		if len(idxs) == 1 {
+			out = append(out, merged)
+			continue
+		}
+		// 合并标题（最多3条）
+		titles := []string{merged.Title}
+		for _, i := range idxs[1:] {
+			ev := events[i]
+			if len(titles) < 3 && ev.Title != "" && !containsStr(titles, ev.Title) {
+				titles = append(titles, ev.Title)
+			}
+			// 保留 |score| 最大的事件属性
+			if absScore(ev.Score) > absScore(merged.Score) {
+				merged.Score = ev.Score
+				merged.Direction = ev.Direction
+				merged.Reason = ev.Reason
+				merged.EventType = ev.EventType
+				merged.Level = ev.Level
+			}
+			merged.RelatedStocks = mergeStr(merged.RelatedStocks, ev.RelatedStocks)
+			merged.CleanedStocks = mergeStr(merged.CleanedStocks, ev.CleanedStocks)
+		}
+		merged.Title = strings.Join(titles, " | ")
+		out = append(out, merged)
+	}
+	if len(out) != len(events) {
+		log.Printf("[engine] 事件聚簇: %d → %d 条", len(events), len(out))
+	}
+	return out
+}
+
+// applyEventDecay 板块事件衰减：同板块同方向事件在 H 小时内重复出现时，
+// Score 乘以 0.5^(H/4)（1h→0.84, 2h→0.71, 4h→0.50, 8h→0.25），弱化重复消息。
+func (e *Engine) applyEventDecay(events []newsagent.NewsEvent) {
+	now := time.Now()
+	for i := range events {
+		ev := &events[i]
+		if ev.Level == "个股" || len(ev.Sectors) == 0 {
+			continue
+		}
+		key := strings.Join(ev.Sectors, "+") + "|" + ev.Direction
+		if last, ok := e.sectorEventTimes[key]; ok {
+			hours := now.Sub(last).Hours()
+			if hours > 0 && hours < 24 {
+				ev.Score *= math.Pow(0.5, hours/4)
+				log.Printf("[engine] 事件衰减 %s(%s): 距上次%.1fh, score→%.2f", key, ev.Title, hours, ev.Score)
+			}
+		}
+		e.sectorEventTimes[key] = now
+	}
+}
+
+// containsStr 判断字符串切片是否包含目标。
+func containsStr(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeStr 合并两个字符串切片（去重，保留顺序）。
+func mergeStr(a, b []string) []string {
+	out := make([]string, 0, len(a)+len(b))
+	for _, s := range append(a, b...) {
+		if s == "" || containsStr(out, s) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
