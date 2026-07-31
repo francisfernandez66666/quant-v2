@@ -4,9 +4,17 @@ package combat_agent
 import (
 	"time"
 
+	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/strategy_engine"
 )
+
+// NewsBrief 个股关联新闻简报（供预期差检测使用）。
+type NewsBrief struct {
+	Title    string // 新闻标题
+	Positive bool   // 事件方向：true=利好 false=利空
+	Time     string // 新闻时间（YYYY-MM-DD HH:MM:SS）
+}
 
 // ScanInput 战法扫描输入，包含已验证板块、行情数据、D1评分等信息。
 type ScanInput struct {
@@ -16,6 +24,8 @@ type ScanInput struct {
 	IndividualStocks []string                                 // 个股直接输入（跳过板块验证）
 	MarketData       map[string]*strategy_engine.StockMarketData // 行情数据（Engine传过来）
 	D1Scores         map[string]D1Score                       // D1评分结果
+	LimitUpPool      []data.LimitUpStock                      // 当日涨停池（龙头识别/涨停分类）
+	News             map[string][]NewsBrief                    // code → 关联新闻简报（预期差）
 }
 
 // Signal 战法引擎输出的信号，包含方向、操作、置信度等信息。

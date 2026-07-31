@@ -486,6 +486,13 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 	td := data.TradingDayDate(time.Now())
 
+	// 8b. 当日涨停池 + 事件新闻简报（龙头识别 / 涨停分类 / 预期差检测）
+	pool, poolErr := e.marketAPI.GetLimitUpPool("")
+	if poolErr != nil {
+		log.Printf("[engine] 涨停池拉取失败: %v", poolErr)
+	}
+	newsBriefs := newsBriefsByCode(valid)
+
 	// 9. 板块验证（开关控制），结果同时用于战法扫描与看板展示
 	var verifiedBull, verifiedBear []sector_agent.VerifiedSector
 	if e.LongEnabled() {
@@ -499,24 +506,42 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	var bullSignals []combat_agent.Signal
 	if e.LongEnabled() {
 		bullInput := combat_agent.ScanInput{
-			Sectors:    verifiedBull,
-			L1Score:    sr.L1Score,
-			L1Blocked:  sr.L1Blocked,
-			MarketData: sr.MarketData,
-			D1Scores:   d1Scores,
+			Sectors:     verifiedBull,
+			L1Score:     sr.L1Score,
+			L1Blocked:   sr.L1Blocked,
+			MarketData:  sr.MarketData,
+			D1Scores:    d1Scores,
+			LimitUpPool: pool,
+			News:        newsBriefs,
 		}
 		bullSignals = e.combatAgent.ScanLong(bullInput)
 	}
+
+	// 10b. 涨停池增强：龙头识别 + 涨停分类 + 预期差（并入做多信号流）
+	var gapCodes []string
+	for code := range newsBriefs {
+		gapCodes = append(gapCodes, code)
+	}
+	limitSignals := e.combatAgent.ScanLimitUp(combat_agent.ScanInput{
+		LimitUpPool:      pool,
+		IndividualStocks: gapCodes,
+		MarketData:       sr.MarketData,
+		L1Blocked:        sr.L1Blocked,
+		News:             newsBriefs,
+	})
+	bullSignals = append(bullSignals, limitSignals...)
 
 	// 11. 利空开关开 → 做空分支
 	var bearSignals []combat_agent.Signal
 	if e.ShortEnabled() {
 		bearInput := combat_agent.ScanInput{
-			Sectors:    verifiedBear,
-			L1Score:    sr.L1Score,
-			L1Blocked:  sr.L1Blocked,
-			MarketData: sr.MarketData,
-			D1Scores:   d1Scores,
+			Sectors:     verifiedBear,
+			L1Score:     sr.L1Score,
+			L1Blocked:   sr.L1Blocked,
+			MarketData:  sr.MarketData,
+			D1Scores:    d1Scores,
+			LimitUpPool: pool,
+			News:        newsBriefs,
 		}
 		bearSignals = e.combatAgent.ScanShort(bearInput)
 	}
@@ -844,4 +869,28 @@ func mergeCodes(groups ...[]string) []string {
 		}
 	}
 	return out
+}
+
+// newsBriefsByCode 将有效新闻事件转为 code → 新闻简报映射（供预期差检测）。
+// 方向由事件 Score 符号推导（score≥0 视为利好）。
+func newsBriefsByCode(events []newsagent.NewsEvent) map[string][]combat_agent.NewsBrief {
+	m := make(map[string][]combat_agent.NewsBrief)
+	for _, ev := range events {
+		if ev.Title == "" {
+			continue
+		}
+		positive := ev.Score >= 0
+		for _, code := range ev.RelatedStocks {
+			code = strings.TrimSpace(code)
+			if code == "" {
+				continue
+			}
+			m[code] = append(m[code], combat_agent.NewsBrief{
+				Title:    ev.Title,
+				Positive: positive,
+				Time:     ev.Datetime,
+			})
+		}
+	}
+	return m
 }
