@@ -7,36 +7,125 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
+	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 )
 
-type Server struct {
-	auth         *auth.Manager
-	agg          *display.Aggregator
-	cfg          *config.Manager
-	rpt          *report.Report
-	mux          *http.ServeMux
-	shortEnabled bool
-	market       *data.MarketAPI
-	watchlist    *data.WatchlistManager
-	sse          *SSEBroker
-	startTime    time.Time
-	llmRecreate  func(apiKey, apiURL, model string) // 热重建 LLM 客户端
-	newsAgent    *newsagent.Agent
+// EngineController 引擎对外暴露的控制面：利好/利空开关 + 流水线调试数据 + 消息中心 + 热点记录。
+// 由顶层编排引擎实现，server 不直接依赖 engine 包（避免导入环）。
+type EngineController interface {
+	LongEnabled() bool
+	SetLongEnabled(v bool)
+	ShortEnabled() bool
+	SetShortEnabled(v bool)
+	GetDebugInfo() *newsagent.DebugInfo
+	GetStageRecords() []newsagent.DebugInfo
+	GetHotRecords() []data.HotRecord
+	GetMessages() []data.MessageItem
+	ClearMessages()
+	DeleteMessage(id string)
 }
 
-func (s *Server) ShortEnabled() bool { return s.shortEnabled }
-func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string)) { s.llmRecreate = fn }
-func (s *Server) SetNewsAgent(a *newsagent.Agent) { s.newsAgent = a }
+type Server struct {
+	auth        *auth.Manager
+	agg         *display.Aggregator
+	cfg         *config.Manager
+	rpt         *report.Report
+	mux         *http.ServeMux
+	market      *data.MarketAPI
+	ths         *data.THSClient
+	watchlist   *data.WatchlistManager
+	sse         *SSEBroker
+	startTime   time.Time
+	llmRecreate func(apiKey, apiURL, model string) // 热重建 LLM 客户端
+	ctrl        EngineController
 
-func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rpt *report.Report, market *data.MarketAPI, wl *data.WatchlistManager) *Server {
+	llmMu      sync.Mutex
+	runtimeLLM string // 运行时实际使用的 model（与文件配置可能不同）
+	runtimeURL string
+
+	calMu         sync.Mutex
+	macroCache    []data.MacroEvent
+	macroCacheDay string
+	ipoCache      []data.IPOEvent
+	ipoCacheDay   string
+}
+
+func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string)) { s.llmRecreate = fn }
+func (s *Server) SetEngineController(c EngineController)               { s.ctrl = c }
+
+// SetRuntimeLLM 记录启动时实际生效的 LLM 模型与地址（供 /api/config/llm 返回真实值）。
+func (s *Server) SetRuntimeLLM(url, model string) {
+	s.llmMu.Lock()
+	s.runtimeURL = url
+	s.runtimeLLM = model
+	s.llmMu.Unlock()
+}
+
+// runtimeModel 返回运行时 LLM 模型；未记录时回退配置文件中的 model。
+func (s *Server) runtimeModel() string {
+	s.llmMu.Lock()
+	defer s.llmMu.Unlock()
+	if s.runtimeLLM != "" {
+		return s.runtimeLLM
+	}
+	return s.cfg.GetLLMConfig().Model
+}
+
+// macroEvents 返回当日宏观日历事件（按天缓存，每天首次调用时生成）。
+func (s *Server) macroEvents(now time.Time) []data.MacroEvent {
+	s.calMu.Lock()
+	defer s.calMu.Unlock()
+	day := now.Format("2006-01-02")
+	if s.macroCacheDay == day && s.macroCache != nil {
+		return s.macroCache
+	}
+	s.macroCache = data.GenMacroEvents(now.Year(), nil)
+	s.macroCacheDay = day
+	return s.macroCache
+}
+
+// ipoCalendar 返回当日 IPO 日历（按天缓存，每天首次调用时远程拉取）。
+func (s *Server) ipoCalendar(now time.Time) ([]data.IPOEvent, error) {
+	s.calMu.Lock()
+	defer s.calMu.Unlock()
+	day := now.Format("2006-01-02")
+	if s.ipoCacheDay == day && s.ipoCache != nil {
+		return s.ipoCache, nil
+	}
+	list, err := s.market.GetEastMoneyIPOCalendar()
+	if err != nil {
+		return nil, err
+	}
+	s.ipoCache = list
+	s.ipoCacheDay = day
+	return list, nil
+}
+
+// longOn / shortOn 读取引擎开关；未接入引擎时回退默认值（做多开 / 做空关）。
+func (s *Server) longOn() bool {
+	if s.ctrl != nil {
+		return s.ctrl.LongEnabled()
+	}
+	return true
+}
+
+func (s *Server) shortOn() bool {
+	if s.ctrl != nil {
+		return s.ctrl.ShortEnabled()
+	}
+	return false
+}
+
+func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rpt *report.Report, market *data.MarketAPI, wl *data.WatchlistManager, ths *data.THSClient) *Server {
 	s := &Server{
 		auth:      authMgr,
 		agg:       agg,
@@ -44,6 +133,7 @@ func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rp
 		rpt:       rpt,
 		mux:       http.NewServeMux(),
 		market:    market,
+		ths:       ths,
 		watchlist: wl,
 		sse:       NewSSEBroker(),
 		startTime: time.Now(),
@@ -64,6 +154,8 @@ func (s *Server) registerRoutes() {
 
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
+	s.mux.HandleFunc("POST /api/long/toggle", s.authMiddleware(s.handleLongToggle))
+	s.mux.HandleFunc("GET /api/long/status", s.authMiddleware(s.handleLongStatus))
 	s.mux.HandleFunc("POST /api/short/toggle", s.authMiddleware(s.handleShortToggle))
 	s.mux.HandleFunc("GET /api/short/status", s.authMiddleware(s.handleShortStatus))
 	s.mux.HandleFunc("GET /api/config/strategy", s.authMiddleware(s.handleGetStrategyConfig))
@@ -82,9 +174,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/signals", s.authMiddleware(s.handleFixSignals))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
 	s.mux.HandleFunc("GET /api/alerts", s.authMiddleware(s.handleFixAlerts))
+	s.mux.HandleFunc("DELETE /api/alerts", s.authMiddleware(s.handleClearAlerts))
+	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.authMiddleware(s.handleDeleteAlert))
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
 	s.mux.HandleFunc("POST /api/holdings", s.authMiddleware(s.handleFixSetHoldings))
 	s.mux.HandleFunc("GET /api/sector/hot", s.authMiddleware(s.handleFixSectorHot))
+	s.mux.HandleFunc("GET /api/sector/hot/records", s.authMiddleware(s.handleSectorHotRecords))
 	s.mux.HandleFunc("GET /api/snapshot", s.authMiddleware(s.handleFixSnapshot))
 	s.mux.HandleFunc("GET /api/snapshot/hot", s.authMiddleware(s.handleFixHotSnapshot))
 	s.mux.HandleFunc("GET /api/evaluations", s.authMiddleware(s.handleFixEvaluations))
@@ -97,6 +192,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/action", s.authMiddleware(s.handleFixAction))
 	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
+	s.mux.HandleFunc("GET /api/stage-records", s.authMiddleware(s.handleStageRecords))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
 
@@ -118,7 +214,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) GetServeMux() *http.ServeMux  { return s.mux }
+func (s *Server) GetServeMux() *http.ServeMux   { return s.mux }
 func (s *Server) GetAuthManager() *auth.Manager { return s.auth }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -195,9 +291,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"token":    user.Token,
-		"id":       user.ID,
-		"account":  user.Username,
+		"token":   user.Token,
+		"id":      user.ID,
+		"account": user.Username,
 	})
 }
 
@@ -209,10 +305,10 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 type setupReq struct {
-	Username    string `json:"username"`
-	Password    string `json:"password"`
-	LLMApiURL   string `json:"llm_api_url"`
-	LLMApiKey   string `json:"llm_api_key"`
+	Username     string `json:"username"`
+	Password     string `json:"password"`
+	LLMApiURL    string `json:"llm_api_url"`
+	LLMApiKey    string `json:"llm_api_key"`
 	TushareToken string `json:"tushare_token"`
 }
 
@@ -290,32 +386,54 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := map[string]interface{}{
-		"news_events":    data.NewsEvents,
-		"hot_sectors":    data.HotSectors,
-		"bear_sectors":   data.BearSectors,
-		"bear_stocks":    data.BearStocks,
-		"verified_bull":  data.VerifiedBull,
-		"verified_bear":  data.VerifiedBear,
-		"bull_signals":   data.BullSignals,
-		"bear_signals":   data.BearSignals,
-		"final_signals":  data.FinalSignals,
-		"l1_score":       data.L1Score,
-		"l1_blocked":     data.L1Blocked,
-		"short_enabled":  s.shortEnabled,
+		"news_events":   data.NewsEvents,
+		"hot_sectors":   data.HotSectors,
+		"bear_sectors":  data.BearSectors,
+		"bear_stocks":   data.BearStocks,
+		"verified_bull": data.VerifiedBull,
+		"verified_bear": data.VerifiedBear,
+		"bull_signals":  data.BullSignals,
+		"bear_signals":  data.BearSignals,
+		"final_signals": data.FinalSignals,
+		"l1_score":      data.L1Score,
+		"l1_blocked":    data.L1Blocked,
+		"long_enabled":  s.longOn(),
+		"short_enabled": s.shortOn(),
 	}
 	if data.Report != nil {
 		total, holding, win, wr, avgW, avgL := data.Report.Stats()
 		resp["report_stats"] = map[string]interface{}{
-			"total":   total,
-			"holding": holding,
-			"win":     win,
-			"win_rate":       wr,
-			"avg_win_pct":    avgW,
-			"avg_loss_pct":   avgL,
+			"total":        total,
+			"holding":      holding,
+			"win":          win,
+			"win_rate":     wr,
+			"avg_win_pct":  avgW,
+			"avg_loss_pct": avgL,
 		}
 		resp["report_logs"] = data.Report.List()
 	}
 	writeJSON(w, 200, resp)
+}
+
+type longToggleReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+func (s *Server) handleLongToggle(w http.ResponseWriter, r *http.Request) {
+	var req longToggleReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if s.ctrl != nil {
+		s.ctrl.SetLongEnabled(req.Enabled)
+	}
+	log.Printf("[server] 做多开关: %v", req.Enabled)
+	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOn()})
+}
+
+func (s *Server) handleLongStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOn()})
 }
 
 type shortToggleReq struct {
@@ -328,13 +446,15 @@ func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.shortEnabled = req.Enabled
+	if s.ctrl != nil {
+		s.ctrl.SetShortEnabled(req.Enabled)
+	}
 	log.Printf("[server] 做空开关: %v", req.Enabled)
-	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortEnabled})
+	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOn()})
 }
 
 func (s *Server) handleShortStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortEnabled})
+	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOn()})
 }
 
 // ── 持仓管理 ──
@@ -476,7 +596,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.GetLLMConfig()
 	writeJSON(w, 200, map[string]interface{}{
 		"api_url": cfg.APIURL,
-		"model":   cfg.Model,
+		"model":   s.runtimeModel(),
 	})
 }
 
@@ -510,18 +630,41 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		s.llmRecreate(key, req.APIURL, req.Model)
 	}
 
+	// 记录运行时实际生效的 model（空值会被 llm 客户端按默认模型兜底）
+	model := req.Model
+	if model == "" {
+		model = llm.DefaultModel
+	}
+	s.SetRuntimeLLM(req.APIURL, model)
+
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleLLMDebug(w http.ResponseWriter, r *http.Request) {
-	if s.newsAgent == nil {
-		writeJSON(w, 200, map[string]string{"status": "no_agent"})
+	if s.ctrl == nil {
+		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
-	di := s.newsAgent.GetDebugInfo()
+	di := s.ctrl.GetDebugInfo()
 	if di == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_data"})
 		return
 	}
 	writeJSON(w, 200, di)
+}
+
+// handleStageRecords 返回当日全量 Stage 流水线轮次记录（用于复盘/策略引擎实时调取）。
+func (s *Server) handleStageRecords(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeJSON(w, 200, map[string]string{"status": "no_engine"})
+		return
+	}
+	recs := s.ctrl.GetStageRecords()
+	if recs == nil {
+		recs = []newsagent.DebugInfo{}
+	}
+	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
+		recs[i], recs[j] = recs[j], recs[i]
+	}
+	writeJSON(w, 200, recs)
 }

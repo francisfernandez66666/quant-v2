@@ -20,12 +20,10 @@ type Agent struct {
 	cleaner    *data.StockCleaner
 	tracker    *tracker
 	dataDir    string
-	debugInfo  *DebugInfo
 	newsDBPath string
 }
 
 func (a *Agent) SetLLMClient(c *llm.Client) { a.llmClient = c }
-func (a *Agent) GetDebugInfo() *DebugInfo    { return a.debugInfo }
 
 func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCleaner, dataDir string) *Agent {
 	return &Agent{
@@ -47,118 +45,90 @@ func (a *Agent) Stop() error {
 	return a.tracker.save()
 }
 
-// Process 完整处理流程：追回未读新闻 → Stage1 初筛（关键字或 LLM）→ Stage2 LLM 全量分析。
-// 返回分析结果，包含事件列表、原始新闻数、筛选数等信息。
-func (a *Agent) Process(ctx context.Context, since time.Time) (*AnalysisResult, error) {
-	t0 := time.Now()
-
+// Fetch 拉取未读新闻（含去重记账）。记账属 fetch 自身职能，不对外暴露。
+func (a *Agent) Fetch(ctx context.Context, since time.Time) []data.NewsItem {
 	rawNews := a.fetchCatchUp()
-	if len(rawNews) == 0 {
-		log.Printf("[newsagent] 无新新闻 (since=%s)", since.Format("01-02 15:04"))
-		a.debugInfo = &DebugInfo{
-			ProcessTime: time.Now(),
-		}
-		return &AnalysisResult{
-			CatchUpSince: since,
-		}, nil
+	if len(rawNews) > 0 {
+		log.Printf("[newsagent] 追回 %d 条新闻 (since=%s)", len(rawNews), since.Format("01-02 15:04"))
 	}
+	return rawNews
+}
 
-	log.Printf("[newsagent] 追回 %d 条新闻 (%v)", len(rawNews), time.Since(t0))
-
-	titles := make([]string, len(rawNews))
-	for i, n := range rawNews {
-		titles[i] = n.Title
-	}
-
-	stage1t := time.Now()
-	stage1Mode := "keyword"
-	if a.llmClient != nil {
-		stage1Mode = "llm"
-	}
+// Stage1 过滤：判断板块/宏观新闻是否有投资价值，返回有价值的标题索引。
+func (a *Agent) Stage1(titles []string) []int {
 	indices, err := a.classifyMaterial(titles)
 	if err != nil {
-		log.Printf("[newsagent] Stage1失败: %v, 全部视为有价值", err)
-		indices = make([]int, len(titles))
-		for i := range titles {
-			indices[i] = i
-		}
+		log.Printf("[newsagent] Stage1失败: %v", err)
+		return nil
 	}
-	log.Printf("[newsagent] Stage1初筛完成 (%v)", time.Since(stage1t))
+	return indices
+}
 
-	var materialItems []data.NewsItem
-	for _, idx := range indices {
-		materialItems = append(materialItems, rawNews[idx])
-	}
-
-	if a.llmClient == nil || len(materialItems) == 0 {
-		events := make([]NewsEvent, len(materialItems))
-		for i, item := range materialItems {
-			events[i] = NewsEvent{
-				Title:      item.Title,
-				Content:    item.Content,
-				Datetime:   item.Datetime,
-				Source:     item.Source,
-				IsMaterial: true,
-			}
-		}
-
-		a.debugInfo = &DebugInfo{
-			Stage1Mode:    stage1Mode,
-			RawCount:      len(rawNews),
-			SelectedCount: len(materialItems),
-			RawTitles:     titles,
-			SelectedIdx:   indices,
-			Stage2Events:  events,
-			ProcessTime:   time.Now(),
-		}
-
-		return &AnalysisResult{
-			Events:        events,
-			RawCount:      len(rawNews),
-			MaterialCount: len(materialItems),
-			CatchUpSince:  since,
-		}, nil
-	}
-
-	stage2t := time.Now()
-	events := a.analyzeDeep(materialItems)
-	log.Printf("[newsagent] Stage2全量分析完成 (%v)", time.Since(stage2t))
-
+// Stage2 深度分析：LLM 对新闻全量分析，输出带方向/分数/归因的结构化事件。
+// 中性事件照常输出，由引擎按阈值过滤丢弃。
+func (a *Agent) Stage2(items []data.NewsItem) []NewsEvent {
+	events := a.analyzeDeep(items)
 	if a.cleaner != nil {
 		for i := range events {
 			events[i].CleanedStocks = a.cleaner.CleanBatch(events[i].RelatedStocks)
 		}
-		log.Printf("[newsagent] StockCleaner 清洗 %d 个事件", len(events))
 	}
+	return events
+}
 
-	// 注入 IPO 日历事件（直构 NewsEvent，不走 LLM）
-	ipoEvents := a.buildIPOEvents()
-	events = append(events, ipoEvents...)
+// CleanStocks 清洗股票列表（名称或代码 → "名称|代码"），供引擎对增强归因做清理。
+func (a *Agent) CleanStocks(items []string) []string {
+	if a.cleaner == nil {
+		return items
+	}
+	return a.cleaner.CleanBatch(items)
+}
 
-	// 持久化到文件
+// SaveEvents 持久化事件到 newsDB 文件并保存 tracker，供 /api/news 展示。
+func (a *Agent) SaveEvents(events []NewsEvent) {
 	a.saveNewsEvents(events)
-
 	_ = a.tracker.save()
+}
 
-	log.Printf("[newsagent] 流程完成: %d条原始 → %d条初筛 → %d条分析 (%v)",
-		len(rawNews), len(materialItems), len(events), time.Since(t0))
+// BuildIPOEvents 从 IPO 日历构建事件（直构 NewsEvent，不走 LLM）。
+func (a *Agent) BuildIPOEvents() []NewsEvent {
+	return a.buildIPOEvents()
+}
 
-	a.debugInfo = &DebugInfo{
-		Stage1Mode:    stage1Mode,
-		RawCount:      len(rawNews),
-		SelectedCount: len(materialItems),
-		RawTitles:     titles,
-		SelectedIdx:   indices,
-		Stage2Events:  events,
-		ProcessTime:   time.Now(),
+// BuildIPOFeedEvents 从 IPO 新闻流直构事件（新股/申购/上市，Score+0.5 利好，不走 LLM）。
+func (a *Agent) BuildIPOFeedEvents(items []data.NewsItem) []NewsEvent {
+	var out []NewsEvent
+	for _, item := range items {
+		dt := item.Datetime
+		if dt == "" {
+			dt = time.Now().Format("2006-01-02 15:04:05")
+		}
+		event := NewsEvent{
+			Title:         item.Title,
+			Content:       item.Content,
+			Datetime:      dt,
+			Source:        item.Source,
+			Level:         "个股",
+			Direction:     "利好",
+			Score:         0.5,
+			ImpactLevel:   "中",
+			EventType:     "公司",
+			Urgency:       "关注",
+			Reason:        "IPO相关新闻（新股申购/上市），按利好直构",
+			RelatedStocks: nil,
+		}
+		if a.cleaner != nil {
+			if hits := a.cleaner.FindStocksInText(item.Title); len(hits) > 0 {
+				event.RelatedStocks = hits
+				event.CleanedStocks = a.cleaner.CleanBatch(hits)
+			}
+		}
+		out = append(out, event)
 	}
-
-	return &AnalysisResult{
-		Events:        events,
-		RawCount:      len(rawNews),
-		MaterialCount: len(events),
-		CatchUpSince:  since,
-	}, nil
+	if len(out) > 0 {
+		log.Printf("[newsagent] IPO新闻流注入 %d 个事件", len(out))
+	}
+	return out
 }
 
 // newsDB 新闻事件本地持久化结构，按交易日分批存储。
@@ -183,6 +153,13 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 		seen[key] = true
 	}
 	for _, e := range events {
+		s := e.Score
+		if s < 0 {
+			s = -s
+		}
+		if s < 0.25 {
+			continue // 过滤中性/无价值噪音
+		}
 		key := truncTitle(e.Title)
 		if !seen[key] {
 			seen[key] = true
@@ -216,25 +193,6 @@ func (a *Agent) loadNewsDB() *newsDB {
 		return &newsDB{}
 	}
 	return &db
-}
-
-// GetAllNewsEvents 返回当前交易日所有非过期的事件列表（排除已过期的 IPO 事件）。
-func (a *Agent) GetAllNewsEvents() []NewsEvent {
-	db := a.loadNewsDB()
-	td := data.TradingDayDate(time.Now())
-
-	if db.TradingDay != td {
-		return nil
-	}
-
-	var out []NewsEvent
-	for _, e := range db.Events {
-		if e.Source == "IPO日历" && isIPOExpired(e, td) {
-			continue
-		}
-		out = append(out, e)
-	}
-	return out
 }
 
 // buildIPOEvents 从 IPO 日历构建 NewsEvent（新股申购/上市），跳过已存在的事件。
@@ -285,18 +243,18 @@ func (a *Agent) buildIPOEvents() []NewsEvent {
 		expiry := data.AddTradingDays(listing, 1)
 
 		event := NewsEvent{
-			Title:   title,
-			Content: fmt.Sprintf("expiry=%s", expiry),
-			Datetime: listing,
-			Source:  "IPO日历",
-			Level:   "个股",
-			Direction: "利好",
-			Score:   0.5,
+			Title:         title,
+			Content:       fmt.Sprintf("expiry=%s", expiry),
+			Datetime:      listing,
+			Source:        "IPO日历",
+			Level:         "个股",
+			Direction:     "利好",
+			Score:         0.5,
 			RelatedStocks: []string{fmt.Sprintf("%s(%s)", ipo.Name, ipo.Code)},
-			ImpactLevel: "中",
-			EventType: "公司",
-			Urgency:   "关注",
-			Reason:    reason,
+			ImpactLevel:   "中",
+			EventType:     "公司",
+			Urgency:       "关注",
+			Reason:        reason,
 		}
 		if a.cleaner != nil {
 			event.CleanedStocks = a.cleaner.CleanBatch(event.RelatedStocks)

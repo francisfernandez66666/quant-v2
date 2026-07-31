@@ -37,7 +37,7 @@ func (a *Agent) StartHotReload(path string) {
 
 	go func() {
 		defer watcher.Close()
-		var debounce time.Timer
+		var debounce *time.Timer
 		for {
 			select {
 			case event, ok := <-watcher.Events:
@@ -45,17 +45,10 @@ func (a *Agent) StartHotReload(path string) {
 					return
 				}
 				if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-					if debounce.Stop() {
-						select {
-						case <-debounce.C:
-						default:
-						}
+					if debounce != nil {
+						debounce.Stop()
 					}
-					debounce = *time.NewTimer(500 * time.Millisecond)
-					go func() {
-						<-debounce.C
-						a.reloadConfig(absPath)
-					}()
+					debounce = time.AfterFunc(500*time.Millisecond, func() { a.reloadConfig(absPath) })
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {

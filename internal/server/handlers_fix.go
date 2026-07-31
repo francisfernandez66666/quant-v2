@@ -61,21 +61,21 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 	out := make([]fixSignal, 0, len(signals))
 	for _, s := range signals {
 		fs := fixSignal{
-			Code:        s.Code,
-			Name:        s.Name,
-			Strategy:    s.Strategy,
-			TotalScore:  s.Confidence * 100,
-			RemindLevel: scoreToRemindLevel(s.Confidence),
-			Level:       "交易",
-			Action:      s.Action,
-			Price:       s.Price,
-			CanOpen:     s.Confidence >= 0.7 && s.Action == "buy",
-			D1:          s.Confidence * 100,
-			D2:          s.Confidence * 100,
-			D3:          s.Confidence * 100,
-			D4:          s.Confidence * 100,
-			D1Desc:      s.Reason,
-			D2Desc:      s.Sector,
+			Code:         s.Code,
+			Name:         s.Name,
+			Strategy:     s.Strategy,
+			TotalScore:   s.Confidence * 100,
+			RemindLevel:  scoreToRemindLevel(s.Confidence),
+			Level:        "交易",
+			Action:       s.Action,
+			Price:        s.Price,
+			CanOpen:      s.Confidence >= 0.7 && s.Action == "buy",
+			D1:           s.Confidence * 100,
+			D2:           s.Confidence * 100,
+			D3:           s.Confidence * 100,
+			D4:           s.Confidence * 100,
+			D1Desc:       s.Reason,
+			D2Desc:       s.Sector,
 			SignalActive: true,
 		}
 		out = append(out, fs)
@@ -121,10 +121,10 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		session = 2
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"uptime":         uptime,
-		"session":        session,
-		"in_trade_time":  session == 1 || session == 3,
-		"signal_count":   finalCount,
+		"uptime":        uptime,
+		"session":       session,
+		"in_trade_time": session == 1 || session == 3,
+		"signal_count":  finalCount,
 		"scan_stats": map[string]interface{}{
 			"total_stocks":     rawCount,
 			"hot_sector_count": hotCount,
@@ -136,9 +136,34 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFixAlerts 处理 GET /api/alerts 请求，返回系统告警列表。
-// 告警来源：1) AlertSignals（策略触发信号）；2) 持仓日志中的持仓中/已退出记录。
-// 结果按时间倒序排列。
+// 数据来源：消息中心持久化存储（引擎每轮同步 止盈/止损/策略信号/持仓提示）。
+// 未接入引擎时回退到实时看板 + 持仓日志。结果按时间倒序排列。
 func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl != nil {
+		msgs := s.ctrl.GetMessages()
+		if msgs == nil {
+			msgs = []data.MessageItem{}
+		}
+		out := make([]map[string]interface{}, 0, len(msgs))
+		for _, m := range msgs {
+			out = append(out, map[string]interface{}{
+				"id":        m.ID,
+				"code":      m.Code,
+				"name":      m.Name,
+				"type":      m.Level,
+				"level":     m.Level,
+				"action":    m.Action,
+				"strategy":  m.Strategy,
+				"time":      m.Time,
+				"title":     m.Title,
+				"body":      m.Body,
+				"direction": m.Direction,
+			})
+		}
+		writeJSON(w, 200, out)
+		return
+	}
+
 	dash := s.agg.Current()
 	if dash == nil {
 		writeJSON(w, 200, []map[string]interface{}{})
@@ -192,6 +217,47 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		return out[i]["time"].(string) > out[j]["time"].(string)
 	})
 	writeJSON(w, 200, out)
+}
+
+// handleClearAlerts 处理 DELETE /api/alerts 请求：清空消息中心全部消息。
+func (s *Server) handleClearAlerts(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeJSON(w, 200, map[string]string{"status": "no_engine"})
+		return
+	}
+	s.ctrl.ClearMessages()
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleDeleteAlert 处理 DELETE /api/alerts/{id} 请求：手工删除单条消息。
+func (s *Server) handleDeleteAlert(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeJSON(w, 200, map[string]string{"status": "no_engine"})
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing id"})
+		return
+	}
+	s.ctrl.DeleteMessage(id)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleSectorHotRecords 处理 GET /api/sector/hot/records 请求，返回当日热点板块轮次记录。
+func (s *Server) handleSectorHotRecords(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeJSON(w, 200, []data.HotRecord{})
+		return
+	}
+	recs := s.ctrl.GetHotRecords()
+	if recs == nil {
+		recs = []data.HotRecord{}
+	}
+	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
+		recs[i], recs[j] = recs[j], recs[i]
+	}
+	writeJSON(w, 200, recs)
 }
 
 // fixHolding 前端持仓格式的结构体。
@@ -314,46 +380,47 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFixSectorHot 处理 GET /api/sector/hot 请求，返回热门板块列表。
-// 从 Dashboard 获取热点板块数据，并补充东财板块行情信息（涨停家数、资金流入等）。
+// 数据出口：同花顺首屏 top-20 板块表（一级行业+概念），含同花顺涨跌幅/主力净流入。
+// 仅展示能匹配到同花顺 top-20 的板块，匹配不到的丢弃。
 func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 	dash := s.agg.Current()
 	if dash == nil {
 		writeJSON(w, 200, []map[string]interface{}{})
 		return
 	}
-	// 拉取东财板块行情用于补充 limitup_cnt / net_inflow / code
+	// 同花顺板块行情表（首屏 top-20，按涨跌幅排序），按名称精确匹配
 	sectorMap := map[string]data.SectorInfo{}
-	if list, err := s.market.GetSectorList(); err == nil {
-		for _, si := range list {
-			sectorMap[si.Name] = si
+	if s.ths != nil {
+		if list, err := s.ths.GetTopBoards(); err == nil {
+			for _, si := range list {
+				sectorMap[si.Name] = si
+			}
+		} else {
+			log.Printf("[server] 同花顺 top板块获取失败: %v", err)
 		}
 	}
 	out := make([]map[string]interface{}, 0)
 	for _, sec := range dash.HotSectors {
-		code := ""
-		limitupCnt := 0
-		netInflow := 0.0
-		if si, ok := sectorMap[sec.Name]; ok {
-			code = si.Code
-			limitupCnt = si.LimitupCnt
-			netInflow = si.NetInflow
+		si, ok := sectorMap[sec.Name]
+		if !ok {
+			continue
 		}
 		newsTitles := sec.NewsTitles
 		if newsTitles == nil {
 			newsTitles = []string{}
 		}
 		out = append(out, map[string]interface{}{
-			"name":           sec.Name,
-			"code":           code,
-			"score":          sec.Score,
-			"change_pct":     sec.Score,
-			"d1":             sec.Score,
-			"reason":         sec.Reason,
-			"reason_detail":  sec.Reason,
-			"direction":      sec.Direction,
-			"limitup_cnt":    limitupCnt,
-			"net_inflow":     netInflow,
-			"news_titles":    newsTitles,
+			"name":          sec.Name,
+			"code":          si.Code,
+			"score":         sec.Score,
+			"change_pct":    si.ChangePct,
+			"d1":            0,
+			"reason":        sec.Reason,
+			"reason_detail": sec.Reason,
+			"direction":     sec.Direction,
+			"limitup_cnt":   si.LimitupCnt,
+			"net_inflow":    si.NetInflow,
+			"news_titles":   newsTitles,
 		})
 	}
 	writeJSON(w, 200, out)
@@ -414,13 +481,13 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 			chg = info.ChangePct
 		}
 		out = append(out, map[string]interface{}{
-			"code":           sig.Code,
-			"name":           sig.Name,
-			"price":          price,
-			"change_pct":     chg,
-			"sector":         sig.Sector,
-			"sector_reason":  sig.Reason,
-			"reason":         sig.Reason,
+			"code":          sig.Code,
+			"name":          sig.Name,
+			"price":         price,
+			"change_pct":    chg,
+			"sector":        sig.Sector,
+			"sector_reason": sig.Reason,
+			"reason":        sig.Reason,
 		})
 	}
 	writeJSON(w, 200, out)
@@ -469,20 +536,20 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 			chg = info.ChangePct
 		}
 		out = append(out, map[string]interface{}{
-			"code":          code,
-			"name":          name,
-			"price":         price,
-			"change_pct":    chg,
-			"n_score":       nScore,
-			"n_pass":        nScore >= 60,
-			"dragon_score":  dragonScore,
-			"dragon_pass":   dragonScore >= 70,
-			"db_score":      dbScore,
-			"db_pass":       dbScore >= 70,
-			"dr_score":      drScore,
-			"dr_pass":       drScore >= 60,
-			"m_score":       mScore,
-			"m_pass":        mScore >= 50,
+			"code":         code,
+			"name":         name,
+			"price":        price,
+			"change_pct":   chg,
+			"n_score":      nScore,
+			"n_pass":       nScore >= 60,
+			"dragon_score": dragonScore,
+			"dragon_pass":  dragonScore >= 70,
+			"db_score":     dbScore,
+			"db_pass":      dbScore >= 70,
+			"dr_score":     drScore,
+			"dr_pass":      drScore >= 60,
+			"m_score":      mScore,
+			"m_pass":       mScore >= 50,
 		})
 	}
 	if len(out) == 0 {
@@ -493,9 +560,9 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFixIPOCalendar 处理 GET /api/ipo/calendar 请求，返回新股发行/上市日历数据。
-// 数据来源：东方财富 IPO 日历接口。
+// 数据来源：东方财富 IPO 日历接口（按天缓存，每天首次请求才远程拉取）。
 func (s *Server) handleFixIPOCalendar(w http.ResponseWriter, r *http.Request) {
-	list, err := s.market.GetEastMoneyIPOCalendar()
+	list, err := s.ipoCalendar(time.Now())
 	if err != nil {
 		log.Printf("[ipo] 获取失败: %v", err)
 		writeJSON(w, 200, []map[string]interface{}{})
@@ -536,12 +603,12 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFixNews 处理 GET /api/news 请求，返回新闻事件列表（含宏观日历事件）。
-// 数据来源：NewsAgent 的新闻事件 + 自动生成的宏观日历事件（影响级别高/中/低）。
+// 数据来源：引擎持久化的新闻事件（聚合器展示缓存）+ 自动生成的宏观日历事件（影响级别高/中/低）。
 // 宏观日历仅显示近 14 天内的事件，标注剩余天数。
 func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 	var events []newsagent.NewsEvent
-	if s.newsAgent != nil {
-		events = s.newsAgent.GetAllNewsEvents()
+	if cur := s.agg.Current(); cur != nil {
+		events = cur.NewsEvents
 	}
 	out := make([]map[string]interface{}, 0)
 	for _, e := range events {
@@ -560,9 +627,9 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, item)
 	}
-	// 追加宏观日历事件
+	// 追加宏观日历事件（按天缓存）
 	now := time.Now()
-	macroEvents := data.GenMacroEvents(now.Year(), nil)
+	macroEvents := s.macroEvents(now)
 	for _, me := range macroEvents {
 		daysLeft := int(me.Date.Sub(now).Hours() / 24)
 		if daysLeft < -1 || daysLeft > 14 {
@@ -627,14 +694,35 @@ type watchlistReq struct {
 }
 
 // handleFixAddWatchlist 处理 POST /api/watchlist 请求，添加个股到自选股。
+// 返回新增股票的行情数据（名称/现价/涨跌幅），前端可直接追加行，无需整表重载。
 func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 	var req watchlistReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.watchlist.Add(req.Code)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		writeError(w, 400, "code required")
+		return
+	}
+	if !s.watchlist.Add(code) {
+		writeJSON(w, 200, map[string]interface{}{"status": "ok", "duplicate": true})
+		return
+	}
+	info, _ := s.market.GetRealtimeQuote(code)
+	name := code
+	price := 0.0
+	chg := 0.0
+	if info != nil {
+		name = info.Name
+		price = info.Price
+		chg = info.ChangePct
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"status": "ok",
+		"stock":  map[string]interface{}{"code": code, "name": name, "price": price, "change_pct": chg},
+	})
 }
 
 // handleFixRemoveWatchlist 处理 DELETE /api/watchlist 请求，从自选股中移除个股。

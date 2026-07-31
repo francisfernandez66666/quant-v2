@@ -51,5 +51,6 @@ var (
 	SinaLimiter      = NewRateLimiter("sina", 30, 60)    // 30/s，60突发
 	EastMoneyLimiter = NewRateLimiter("eastmoney", 3, 5) // 3/s，5突发
 	THSLimiter       = NewRateLimiter("ths", 8, 12)      // 8/s，12突发
+	CLSLimiter       = NewRateLimiter("cls", 3, 5)       // 3/s，5突发
 	YahooLimiter     = NewRateLimiter("yahoo", 5, 8)
 )

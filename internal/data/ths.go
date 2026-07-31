@@ -3,6 +3,7 @@
 // 提供：
 //   - GetQuote: 个股实时行情（d.10jqka.com.cn）
 //   - GetBoardList: 行业+概念板块列表（q.10jqka.com.cn HTML 解析）
+//   - GetTopBoards: 板块行情表首屏 top-20（含涨跌幅/主力净流入，同花顺出口）
 package data
 
 import (
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -84,29 +86,37 @@ func (tc *THSClient) GetBoardList() ([]SectorInfo, error) {
 	return all, nil
 }
 
-// getBoardPage 解析单个同花顺板块列表页，提取板块代码和名称。
-// url 为页面地址（如 https://q.10jqka.com.cn/gn/）。
-// 页面编码为 GBK，自动解码为 UTF-8 后解析。
-func (tc *THSClient) getBoardPage(url string) ([]SectorInfo, error) {
+// fetchDecoded 发起请求并自动将 GBK 响应解码为 UTF-8 文本。
+func (tc *THSClient) fetchDecoded(url string) (string, error) {
 	THSLimiter.Wait()
 	resp, err := tc.getWithHeaders(url)
 	if err != nil {
-		return nil, fmt.Errorf("http get: %v", err)
+		return "", fmt.Errorf("http get: %v", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %v", err)
+		return "", fmt.Errorf("read body: %v", err)
 	}
 
-	// GBK → UTF-8 解码
 	text := string(body)
 	if !utf8.Valid(body) {
 		decoded, _, err := transform.String(simplifiedchinese.GBK.NewDecoder(), text)
 		if err == nil {
 			text = decoded
 		}
+	}
+	return text, nil
+}
+
+// getBoardPage 解析单个同花顺板块列表页，提取板块代码和名称。
+// url 为页面地址（如 https://q.10jqka.com.cn/gn/）。
+// 页面编码为 GBK，自动解码为 UTF-8 后解析。
+func (tc *THSClient) getBoardPage(url string) ([]SectorInfo, error) {
+	text, err := tc.fetchDecoded(url)
+	if err != nil {
+		return nil, err
 	}
 
 	// 正则提取所有板块链接
@@ -130,6 +140,73 @@ func (tc *THSClient) getBoardPage(url string) ([]SectorInfo, error) {
 		})
 	}
 	return result, nil
+}
+
+// topBoardTableRe 匹配同花顺板块列表页中带行情数据的表格。
+// 首屏表（按涨跌幅排序的前 20 名）为服务端渲染，无分页反爬，可直接解析。
+var (
+	topBoardTbodyRe = regexp.MustCompile(`(?s)<tbody>(.*?)</tbody>`)
+	topBoardTrRe    = regexp.MustCompile(`(?s)<tr>(.*?)</tr>`)
+	topBoardTdRe    = regexp.MustCompile(`(?s)<td[^>]*>(.*?)</td>`)
+	topBoardCodeRe  = regexp.MustCompile(`/detail/code/(\d+)/`)
+	topBoardStripRe = regexp.MustCompile(`<[^>]+>`)
+)
+
+// GetTopBoards 获取同花顺板块行情表（首屏 top-20 按涨跌幅排序）。
+// 一级行业(https://q.10jqka.com.cn/thshy/) + 概念(https://q.10jqka.com.cn/gn/) 各一页。
+// 表格列：序号/板块/涨跌幅(%)/总成交额(亿元)/主力净流入(亿元)/上涨家数/下跌家数/领涨股等。
+// 主力净流入按东财口径转换为元（亿×1e8），供前端 /1e8 还原。
+func (tc *THSClient) GetTopBoards() ([]SectorInfo, error) {
+	ind, indErr := tc.getTopBoardPage("https://q.10jqka.com.cn/thshy/")
+	con, conErr := tc.getTopBoardPage("https://q.10jqka.com.cn/gn/")
+	if indErr != nil && conErr != nil {
+		return nil, fmt.Errorf("ths top boards: industry=%v concept=%v", indErr, conErr)
+	}
+	out := make([]SectorInfo, 0, len(ind)+len(con))
+	out = append(out, ind...)
+	out = append(out, con...)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("ths top boards: 空结果 (industry=%v concept=%v)", indErr, conErr)
+	}
+	return out, nil
+}
+
+// getTopBoardPage 解析单个同花顺板块列表页首屏表格，提取代码/名称/涨跌幅/主力净流入。
+func (tc *THSClient) getTopBoardPage(url string) ([]SectorInfo, error) {
+	text, err := tc.fetchDecoded(url)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []SectorInfo
+	for _, tbody := range topBoardTbodyRe.FindAllStringSubmatch(text, -1) {
+		for _, tr := range topBoardTrRe.FindAllStringSubmatch(tbody[1], -1) {
+			var cells []string
+			for _, td := range topBoardTdRe.FindAllStringSubmatch(tr[1], -1) {
+				c := strings.TrimSpace(topBoardStripRe.ReplaceAllString(td[1], ""))
+				cells = append(cells, c)
+			}
+			if len(cells) < 6 {
+				continue
+			}
+			cm := topBoardCodeRe.FindStringSubmatch(tr[1])
+			if len(cm) != 2 {
+				continue
+			}
+			chg, _ := strconv.ParseFloat(cells[2], 64)
+			inflow, _ := strconv.ParseFloat(cells[5], 64)
+			out = append(out, SectorInfo{
+				Code:      cm[1],
+				Name:      cells[1],
+				ChangePct: chg,
+				NetInflow: inflow * 1e8,
+			})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no board table found in %s", url)
+	}
+	return out, nil
 }
 
 // GetQuote 获取同花顺实时行情。

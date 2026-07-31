@@ -4,26 +4,30 @@
 -->
 <template>
   <div class="msg-page">
-    <!-- 页头：标题 + 等级筛选按钮 -->
+    <!-- 页头：标题 + 等级筛选按钮 + 清空 -->
     <div class="page-header">
       <h2>消息中心</h2>
-      <div class="filter-row">
-        <button v-for="f in filters" :key="f.key"
-          :class="['filter-btn', activeFilter === f.key ? 'active' : '']"
-          @click="activeFilter = f.key">
-          {{ f.label }}
-        </button>
+      <div class="header-actions">
+        <button class="btn-clear" @click="onClearAll">清空全部</button>
       </div>
+    </div>
+    <div class="filter-row">
+      <button v-for="f in filters" :key="f.key"
+        :class="['filter-btn', activeFilter === f.key ? 'active' : '']"
+        @click="activeFilter = f.key">
+        {{ f.label }}
+      </button>
     </div>
 
     <!-- 消息列表 -->
     <div class="msg-list">
-      <div v-for="(a, i) in filteredAlerts" :key="i" :class="['msg-card', alertClass(a)]">
+      <div v-for="(a, i) in filteredAlerts" :key="a.id || i" :class="['msg-card', alertClass(a)]">
         <div class="msg-header">
           <span :class="['badge-level', levelClass(a.level)]">{{ a.level }}</span>
           <span class="msg-stock">{{ a.code }} {{ a.name }}</span>
           <span class="msg-time">{{ a.time }}</span>
           <span :class="['badge-action', actionClass(a)]">{{ actionText(a) }}</span>
+          <button class="btn-del" title="删除该消息" @click="onDeleteOne(a)">✕</button>
         </div>
         <div class="msg-title">{{ a.title }}</div>
         <div class="msg-body">{{ a.body }}</div>
@@ -107,6 +111,24 @@ async function load() {
   } catch (_) {}
 }
 
+/** 手工删除单条消息 */
+async function onDeleteOne(a) {
+  if (!confirm(`删除该消息？\n${a.title || ''}`)) return
+  try {
+    await api.deleteAlert(a.id)
+    load()
+  } catch (_) {}
+}
+
+/** 清空全部消息 */
+async function onClearAll() {
+  if (!confirm('确定清空全部消息？(当日已删除的将不再自动出现)')) return
+  try {
+    await api.clearAlerts()
+    load()
+  } catch (_) {}
+}
+
 onMounted(() => {
   load()
   timer = setInterval(load, 15000)
@@ -123,7 +145,19 @@ onUnmounted(() => {
 .msg-page { max-width: 900px; }
 .page-header { margin-bottom: 16px; }
 .page-header h2 { font-size: 16px; color: #e0e0e0; margin-bottom: 12px; }
-.filter-row { display: flex; gap: 8px; }
+.header-actions { display: flex; align-items: center; }
+.filter-row { display: flex; gap: 8px; margin-bottom: 14px; }
+.btn-clear {
+  padding: 6px 16px; border-radius: 6px; border: 1px solid #FF4D4F;
+  background: transparent; color: #FF4D4F; font-size: 12px; cursor: pointer;
+}
+.btn-clear:hover { background: rgba(255,77,79,0.1); }
+.btn-del {
+  margin-left: auto; width: 20px; height: 20px; border-radius: 4px;
+  border: none; background: transparent; color: #666; font-size: 12px;
+  line-height: 1; cursor: pointer; flex-shrink: 0;
+}
+.btn-del:hover { background: rgba(255,77,79,0.15); color: #FF4D4F; }
 .filter-btn {
   padding: 6px 16px; border-radius: 6px; border: 1px solid #333;
   background: transparent; color: #999; font-size: 12px; cursor: pointer;

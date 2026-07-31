@@ -4,12 +4,19 @@
 -->
 <template>
   <div class="llm-debug-page">
-    <!-- 页头：标题 + 刷新按钮 -->
+    <!-- 页头：标题 + 轮次选择 + 刷新按钮 -->
     <div class="page-header">
       <h2>LLM 分析诊断</h2>
-      <button class="btn-refresh" @click="loadData" :disabled="loading">
-        {{ loading ? '加载中...' : '刷新' }}
-      </button>
+      <div class="header-right">
+        <select class="round-select" v-model="roundIdx" :disabled="records.length < 2" @change="applyRound">
+          <option v-for="(r, i) in records" :key="r.process_time" :value="i">
+            轮次 {{ records.length - i }} · {{ formatTime(r.process_time) }}（{{ r.raw_count }} 条 / 选 {{ r.selected_count }}）
+          </option>
+        </select>
+        <button class="btn-refresh" @click="loadData" :disabled="loading">
+          {{ loading ? '加载中...' : '刷新' }}
+        </button>
+      </div>
     </div>
 
     <!-- 状态判断 -->
@@ -109,7 +116,9 @@ import * as api from '../api/index.js'
 
 // ── 响应式状态 ──
 const loading = ref(false)        // 是否正在加载
-const data = ref(null)            // LLM 诊断数据
+const records = ref([])           // 当日全量轮次记录（持久化）
+const roundIdx = ref(0)           // 当前选中轮次索引（records 下标，默认最新）
+const data = ref(null)            // 当前轮次诊断数据
 const noAgent = ref(false)        // Agent 未就绪
 const noData = ref(false)         // 暂无数据
 
@@ -121,31 +130,41 @@ function isSelected(i) {
   return selectedSet.value.has(i)
 }
 
-/** 格式化时间戳为 HH:mm:ss */
+/** 切换轮次后应用选中记录 */
+function applyRound() {
+  const r = records.value[roundIdx.value]
+  data.value = r || null
+  noAgent.value = false
+  noData.value = !r
+  selectedSet.value = new Set(r ? r.selected_idx || [] : [])
+}
+
+/** 格式化时间为 HH:mm:ss */
 function formatTime(t) {
   if (!t) return '-'
   const d = new Date(t)
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-/** 从后端加载 LLM 诊断调试数据 */
+/** 从后端加载全量 LLM/Stage 轮次记录，默认展示最新一轮 */
 async function loadData() {
   loading.value = true
   try {
-    const res = await api.fetchLLMDebug()
-    if (res.status === 'no_agent') {
+    const res = await api.fetchStageRecords()
+    if (res.status === 'no_engine') {
       noAgent.value = true
       noData.value = false
+      records.value = []
       data.value = null
-    } else if (res.status === 'no_data') {
+    } else if (!Array.isArray(res) || res.length === 0) {
       noData.value = true
       noAgent.value = false
+      records.value = []
       data.value = null
     } else {
-      noAgent.value = false
-      noData.value = false
-      data.value = res
-      selectedSet.value = new Set(res.selected_idx || [])
+      records.value = res
+      roundIdx.value = 0
+      applyRound()
     }
   } catch (e) {
     console.error('LLMDebug 加载失败', e)
@@ -161,6 +180,11 @@ onMounted(loadData)
 .llm-debug-page { max-width: 960px; margin: 0 auto; }
 .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .page-header h2 { font-size: 18px; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+.round-select {
+  padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
+  background: #1a1a2e; color: #ccc; font-size: 12px; cursor: pointer; max-width: 320px;
+}
 .btn-refresh { padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F; background: transparent; color: #FF4D4F; font-size: 13px; cursor: pointer; }
 .btn-refresh:disabled { opacity: 0.5; }
 .btn-refresh:hover { background: rgba(255,77,79,0.1); }

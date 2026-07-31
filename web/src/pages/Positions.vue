@@ -123,7 +123,7 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import * as api from '../api/index.js'
 
 // ── 响应式状态 ──
@@ -131,6 +131,26 @@ const holdings = ref([])                    // 持仓列表
 const availableBalance = ref(0)             // 可用资金
 const showAdd = ref(false)                  // 是否显示新增/编辑弹窗
 const pnlOffset = ref(parseFloat(localStorage.getItem('pnl_offset') || '0'))  // 盈亏清零偏移量
+
+// ── 本地持久化镜像：进 tab 秒开，增删改才变更 ──
+const CACHE_KEY = 'pos_cache_v1'
+const BALANCE_KEY = 'pos_balance_v1'
+function persistCache() {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ holdings: holdings.value, balance: availableBalance.value }))
+  } catch (_) {}
+}
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY)
+    const d = raw ? JSON.parse(raw) : null
+    if (d) {
+      holdings.value = Array.isArray(d.holdings) ? d.holdings : []
+      availableBalance.value = d.balance || 0
+    }
+  } catch (_) {}
+}
+watch([holdings, availableBalance], persistCache, { deep: true })
 
 /** 计算总盈亏 = Σ(现价-成本)*数量 - 偏移量 */
 const totalPnl = computed(() => {
@@ -264,7 +284,6 @@ async function confirmAdd() {
     holdings.value.push(item)
   }
   await saveHoldings()
-  await load()
   showAdd.value = false
   editingIdx.value = -1
   resetForm()
@@ -299,7 +318,7 @@ function resetForm() {
   lookupPrice.value = 0
 }
 
-onMounted(() => { load(); timer = setInterval(load, 3000) })
+onMounted(() => { loadCache(); load(); timer = setInterval(load, 30000) })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 

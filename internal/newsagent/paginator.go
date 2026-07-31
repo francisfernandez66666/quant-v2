@@ -18,6 +18,10 @@ func (a *Agent) fetchCatchUp() []data.NewsItem {
 	thsItems := a.fetchTHSPages(seen)
 	all = append(all, thsItems...)
 
+	// 主源：财联社电报（自带正文，覆盖标题党短板）
+	clsItems := a.fetchCLSOnce(seen)
+	all = append(all, clsItems...)
+
 	// 兜底：新浪（只1页，去重）
 	if len(all) < 20 {
 		sinaItems := a.fetchSinaOnce(seen)
@@ -32,6 +36,9 @@ func (a *Agent) fetchCatchUp() []data.NewsItem {
 		times[i] = n.Datetime
 	}
 	a.tracker.BulkMarkSeen(titles, times)
+
+	// 并发抓取原文正文（失败保留摘要，不阻断流水线）
+	a.EnrichContents(all)
 
 	return all
 }
@@ -88,6 +95,26 @@ func (a *Agent) fetchSinaOnce(seen map[string]bool) []data.NewsItem {
 		seen[key] = true
 		fresh = append(fresh, item)
 	}
+	return fresh
+}
+
+// fetchCLSOnce 拉取一页财联社电报（正文自带），去重后返回。
+func (a *Agent) fetchCLSOnce(seen map[string]bool) []data.NewsItem {
+	items, err := a.marketAPI.GetCLSNews(20)
+	if err != nil {
+		log.Printf("[newsagent] 财联社 err: %v", err)
+		return nil
+	}
+	var fresh []data.NewsItem
+	for _, item := range items {
+		key := truncateStr(item.Title, 60)
+		if seen[key] || a.tracker.IsSeen(item.Title) {
+			continue
+		}
+		seen[key] = true
+		fresh = append(fresh, item)
+	}
+	log.Printf("[newsagent] 财联社追回 %d 条", len(fresh))
 	return fresh
 }
 

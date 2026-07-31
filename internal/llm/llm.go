@@ -21,13 +21,16 @@ type Client struct {
 	model      string
 }
 
+// DefaultModel 未显式指定模型时的默认模型。
+const DefaultModel = "THUDM/GLM-Z1-9B-0414"
+
 // New 创建 LLM 客户端。
 func New(cfg Config) *Client {
 	if cfg.APIURL == "" {
 		cfg.APIURL = "https://api.siliconflow.cn/v1/chat/completions"
 	}
 	if cfg.Model == "" {
-		cfg.Model = "Qwen/Qwen3-8B"
+		cfg.Model = DefaultModel
 	}
 
 	return &Client{
@@ -111,7 +114,7 @@ type HotTopic struct {
 	Sentiment         string   `json:"sentiment"`
 	Score             float64  `json:"score"`
 	ImpactLevel       string   `json:"impact_level"`
-	EventType        string   `json:"event_type"`
+	EventType         string   `json:"event_type"`
 	Urgency           string   `json:"urgency"`
 	Direction         string   `json:"direction"`
 	Sectors           []string `json:"sectors"`
@@ -128,11 +131,29 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
 - 个股级别：股东增持/减持/回购/质押/公司公告/个股经营变动等仅影响单一公司的事件 → level="个股", sectors/upstream_sectors/downstream_sectors全部置为[]空数组
 - 板块级别：政策/行业景气/宏观数据/技术突破等影响整个产业链的事件 → level="板块", 正常填写sectors
 
+评分规则（score 为带符号数值，正=利好 负=利空，表示事件强度）：
+- +0.75 强利好：业绩翻倍/扭亏为盈、龙头大额回购/增持、重磅新药获批、重大政策利好、重组获批
+- +0.50 中利好：业绩小幅增长、普通中标/订单、一般增持、行业景气上行
+- -0.50 中利空：业绩小幅下滑/不及预期、一般减持、行业景气下行、质押
+- -0.75 强利空：业绩巨亏/预亏、被立案调查/处罚、大股东大幅减持、退市风险警示、重大政策利空
+- 0    中性：海外指数波动、常规公告（董事会决议/人事变动）、无个股/板块归因的行情播报、无实质影响的行业新闻
+- 注意：尽量使用 ±0.50 / ±0.75，避免使用 ±0.25 弱档；无明确方向一律输出 0
+
+方向判定（与 score 符号一致）：
+- 利好：业绩增长、中标/订单、增持/回购、新药获批、政策利好、重组/收购
+- 利空：业绩下滑/亏损、减持/质押、被调查/处罚、退市/ST、政策利空
+- 中性：海外指数波动、常规公告、行情播报、无归因的一般新闻
+
+板块/个股归因要求：
+- 必须从标题中识别具体板块名和股票名填入 sectors / related_stocks
+- 例："凯莱英拟增资10.5亿元" → sectors=["医药"], related_stocks=["凯莱英"]
+- 例："SpaceX美股盘前涨超2%" → 无A股板块/个股归因 → score=0 中性
+
 字段说明：
 {
   "level": "板块|个股",
   "sentiment": "正面|负面|中性",
-  "score": 0.0-1.0,
+  "score": 带符号数值(正利好/负利空/0中性),
   "impact_level": "高|中|低",
   "event_type": "政策|财报|行业|公司|宏观|事件驱动",
   "urgency": "立即|关注|观察",
@@ -148,11 +169,34 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
 
 var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下新闻中筛选出对A股有实质性影响的重大事件（如政策、行业景气、公司重大利好/利空、宏观数据、技术突破等），忽略娱乐、社会、体育、影视、名人八卦、灾难事故等无关新闻。
 
+必须忽略以下噪音类型（score一律输出0）：
+- 机构观点/专家评论/券商研报/分析师看市（如"机构观点""专家看市""某券商认为"）
+- 股吧/互动问答/投资者关系/董秘回复
+- 海外市场行情播报（美股/港股/欧股/外汇/黄金/原油盘面，无A股板块/个股归因）
+
 对筛选出的每条事件按JSON格式输出，整体为一个JSON数组。如果无重大事件，只输出[]。
 
 首先判断事件级别：
 - 个股级别：股东增持/减持/回购/质押/公司公告/个股经营变动等仅影响单一公司的事件 → level="个股", sectors/upstream_sectors/downstream_sectors全部置为[]空数组
 - 板块级别：政策/行业景气/宏观数据/技术突破等影响整个产业链的事件 → level="板块", 正常填写sectors
+
+评分规则（score 为带符号数值，正=利好 负=利空，表示事件强度）：
+- +0.75 强利好：业绩翻倍/扭亏为盈、龙头大额回购/增持、重磅新药获批、重大政策利好、重组获批
+- +0.50 中利好：业绩小幅增长、普通中标/订单、一般增持、行业景气上行
+- -0.50 中利空：业绩小幅下滑/不及预期、一般减持、行业景气下行、质押
+- -0.75 强利空：业绩巨亏/预亏、被立案调查/处罚、大股东大幅减持、退市风险警示、重大政策利空
+- 0    中性：海外指数波动、常规公告（董事会决议/人事变动）、无个股/板块归因的行情播报、无实质影响的行业新闻
+- 注意：尽量使用 ±0.50 / ±0.75，避免使用 ±0.25 弱档；无明确方向一律输出 0
+
+方向判定（与 score 符号一致）：
+- 利好：业绩增长、中标/订单、增持/回购、新药获批、政策利好、重组/收购
+- 利空：业绩下滑/亏损、减持/质押、被调查/处罚、退市/ST、政策利空
+- 中性：海外指数波动、常规公告、行情播报、无归因的一般新闻
+
+板块/个股归因要求：
+- 必须从标题中识别具体板块名和股票名填入 sectors / related_stocks
+- 例："凯莱英拟增资10.5亿元" → sectors=["医药"], related_stocks=["凯莱英"]
+- 例："SpaceX美股盘前涨超2%" → 无A股板块/个股归因 → score=0 中性
 
 每条新闻的格式: "序号. 标题"
 返回格式:
@@ -161,7 +205,7 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
     "index": 序号,
     "level": "板块|个股",
     "sentiment": "正面|负面|中性",
-    "score": 0.0-1.0,
+    "score": 带符号数值(正利好/负利空/0中性),
     "impact_level": "高|中|低",
     "event_type": "政策|财报|行业|公司|宏观|事件驱动",
     "urgency": "立即|关注|观察",
@@ -174,11 +218,32 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
     "reason": "简要分析理由"
   }
 ]
-只输出JSON数组，不要多余文字。`
+ 只输出JSON数组，不要多余文字。`
 
-// AnalyzeHotTopicBatch 批量分析多条新闻，一次性返回所有分析结果。
-// 失败时重试2次，仍失败则使用关键词兜底。
+// llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
+const llmBatchSize = 30
+
+// AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批调用并合并结果。
+// 某批失败时重试2次，仍失败则该批使用关键词兜底。
 func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
+	result := make([]*HotTopic, len(titles))
+	if len(titles) == 0 {
+		return result
+	}
+	for start := 0; start < len(titles); start += llmBatchSize {
+		end := start + llmBatchSize
+		if end > len(titles) {
+			end = len(titles)
+		}
+		sub := c.analyzeBatch(titles[start:end])
+		copy(result[start:end], sub)
+	}
+	return result
+}
+
+// analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。
+// 失败时重试2次，仍失败则使用关键词兜底。
+func (c *Client) analyzeBatch(titles []string) []*HotTopic {
 	// 构建批量请求文本
 	var sb strings.Builder
 	for i, t := range titles {
@@ -209,7 +274,7 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
 		Sentiment         string   `json:"sentiment"`
 		Score             float64  `json:"score"`
 		ImpactLevel       string   `json:"impact_level"`
-		EventType        string   `json:"event_type"`
+		EventType         string   `json:"event_type"`
 		Urgency           string   `json:"urgency"`
 		Direction         string   `json:"direction"`
 		Sectors           []string `json:"sectors"`
@@ -251,15 +316,15 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
 				if len(r.Sectors) > 0 {
 					ht.Sectors = r.Sectors
 				}
-			if len(r.UpstreamSectors) > 0 {
-				ht.UpstreamSectors = r.UpstreamSectors
-			}
-			if len(r.DownstreamSectors) > 0 {
-				ht.DownstreamSectors = r.DownstreamSectors
-			}
-			if len(r.RelatedStocks) > 0 {
-				ht.RelatedStocks = r.RelatedStocks
-			}
+				if len(r.UpstreamSectors) > 0 {
+					ht.UpstreamSectors = r.UpstreamSectors
+				}
+				if len(r.DownstreamSectors) > 0 {
+					ht.DownstreamSectors = r.DownstreamSectors
+				}
+				if len(r.RelatedStocks) > 0 {
+					ht.RelatedStocks = r.RelatedStocks
+				}
 				if r.Strategy != "" {
 					ht.Strategy = r.Strategy
 				}
@@ -467,7 +532,7 @@ func fallbackAnalysis(title string) *HotTopic {
 		}
 	}
 
-	// 情感关键词
+	// 情感关键词（带符号评分：利好=+0.75，利空=-0.75）
 	if containsAny(title, []string{"涨停", "大涨", "暴涨", "走强", "反弹", "利好", "突破"}) {
 		ht.Sentiment = "正面"
 		ht.Score = 0.75
@@ -475,7 +540,7 @@ func fallbackAnalysis(title string) *HotTopic {
 	}
 	if containsAny(title, []string{"跌停", "大跌", "暴跌", "走弱", "利空", "立案", "调查", "减持", "处罚"}) {
 		ht.Sentiment = "负面"
-		ht.Score = 0.25
+		ht.Score = -0.75
 		ht.Direction = "利空"
 	}
 

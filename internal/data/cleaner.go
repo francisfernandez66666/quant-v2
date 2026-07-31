@@ -63,6 +63,7 @@ var reDotCode = regexp.MustCompile(`^(\d{6})\.(SH|SZ|BJ)$`)
 //   - "SH600519" / "SZ000001"（带交易所前缀）
 //   - "sh600519" / "sz000001"（小写前缀）
 //   - "600519"（纯数字）
+//
 // 返回值：6 位纯数字代码；无法识别则返回原始输入。
 func normalizeCode(raw string) string {
 	if m := reDotCode.FindStringSubmatch(raw); len(m) == 3 {
@@ -132,9 +133,27 @@ func (c *StockCleaner) Clean(nameOrCode string) (string, string, error) {
 	return raw, "", fmt.Errorf("未匹配到 %q", raw)
 }
 
+// FindStocksInText 在文本中查找出现的股票名称。
+// 遍历名称↔代码映射，文本包含某只股票名称即命中，返回命中名称列表。
+// 用于新闻标题的 Stage0 归因分类。
+func (c *StockCleaner) FindStocksInText(text string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(text) == 0 {
+		return nil
+	}
+	var hit []string
+	for name := range c.nameToCode {
+		if name != "" && strings.Contains(text, name) {
+			hit = append(hit, name)
+		}
+	}
+	return hit
+}
+
 // CleanBatch 批量清洗股票输入列表。
 // items: 股票名称或代码列表。
-// 返回清洗后的字符串列表，格式为 "名称|代码"；清洗失败的项保留原始输入。
+// 返回清洗后的字符串列表，格式为 "名称|代码"；清洗失败的项丢弃（不保留原始输入，杜绝垃圾名透传）。
 // 如果映射表为空，会自动尝试重新拉取。
 func (c *StockCleaner) CleanBatch(items []string) []string {
 	c.mu.RLock()
@@ -151,8 +170,7 @@ func (c *StockCleaner) CleanBatch(items []string) []string {
 	for _, item := range items {
 		name, code, err := c.Clean(item)
 		if err != nil {
-			log.Printf("[cleaner] 清洗失败 %q: %v", item, err)
-			out = append(out, item)
+			log.Printf("[cleaner] 丢弃无法匹配的个股 %q: %v", item, err)
 			continue
 		}
 		out = append(out, fmt.Sprintf("%s|%s", name, code))

@@ -14,10 +14,10 @@ import (
 
 // Engine 策略引擎，负责事件归因、行情数据拉取、评分池收拢、个股板块索引维护。
 type Engine struct {
-	mu             sync.RWMutex             // 读写锁
-	marketAPI      *data.MarketAPI          // 行情 API
-	scanner        *data.SectorScanner      // 板块扫描器
-	stockSectorIdx map[string][]string      // 个股→板块倒排索引
+	mu             sync.RWMutex        // 读写锁
+	marketAPI      *data.MarketAPI     // 行情 API
+	scanner        *data.SectorScanner // 板块扫描器
+	stockSectorIdx map[string][]string // 个股→板块倒排索引
 }
 
 // New 创建策略引擎实例。
@@ -36,31 +36,30 @@ func (e *Engine) SetScanner(scanner *data.SectorScanner) {
 }
 
 // Evaluate 策略评估入口：归因事件→分流个股→收拢评分池→获取行情数据→返回策略结果。
-// positions 为当前持仓，watchlist 为用户自选，均纳入评分池。
-func (e *Engine) Evaluate(ctx context.Context, result *newsagent.AnalysisResult, positions, watchlist []string) *StrategyResult {
+// events 为已通过阈值过滤（|score|≥0.50）的新闻事件；positions 为当前持仓，watchlist 为用户自选。
+func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, positions, watchlist []string) *StrategyResult {
 	t0 := time.Now()
 	log.Printf("[strategy_engine] Evaluate 开始")
 
-	if result == nil || len(result.Events) == 0 {
+	if len(events) == 0 {
 		log.Printf("[strategy_engine] 无事件，返回空结果")
 		return &StrategyResult{}
 	}
 
 	// 1. attribution: 事件 → 板块/个股分流
-	bullSectors, bearSectors := e.attribution(result.Events)
+	bullSectors, bearSectors := e.attribution(events)
 	log.Printf("[strategy_engine] attribution: %d利好板块 %d利空板块", len(bullSectors), len(bearSectors))
 
-	e.rebuildIndex(result.Events)
+	e.rebuildIndex(events)
 
-	// 2. 分流个股事件到 LongStocks / ShortStocks
+	// 2. 分流个股事件到 LongStocks / ShortStocks（按带符号 Score 判定方向）
 	var longStocks, shortStocks []IndividualStock
-	for _, ev := range result.Events {
+	for _, ev := range events {
 		if ev.Level != "个股" || len(ev.CleanedStocks) == 0 {
 			continue
 		}
-		dir := strings.TrimSpace(ev.Direction)
-		isLong := strings.HasPrefix(dir, "利好")
-		isShort := strings.HasPrefix(dir, "利空")
+		isLong := ev.Score > 0
+		isShort := ev.Score < 0
 		if !isLong && !isShort {
 			continue
 		}
@@ -73,7 +72,7 @@ func (e *Engine) Evaluate(ctx context.Context, result *newsagent.AnalysisResult,
 			ist := IndividualStock{
 				Code:      code,
 				Name:      parts[0],
-				Direction: dir,
+				Direction: ev.Direction,
 			}
 			if isLong {
 				longStocks = append(longStocks, ist)
@@ -121,6 +120,7 @@ func (e *Engine) Evaluate(ctx context.Context, result *newsagent.AnalysisResult,
 		MarketData:  marketData,
 		L1Score:     make(map[string]float64),
 		L1Blocked:   make(map[string]bool),
+		Events:      events,
 	}
 }
 
@@ -175,6 +175,7 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 }
 
 // attribution 事件归因：将新闻事件按利好/利空方向分流到板块，合并相同板块的事件。
+// 仅取 ev.Sectors 一级板块（上游/下游不参与热点归因）；板块名须能匹配真实同花顺板块，否则丢弃。
 // 返回利好板块和利空板块列表。
 func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorHot) {
 	bullMap := make(map[string]*SectorHot)
@@ -184,14 +185,10 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 		if ev.Level == "个股" {
 			continue
 		}
-		allSectors := append([]string{}, ev.Sectors...)
-		allSectors = append(allSectors, ev.UpstreamSectors...)
-		allSectors = append(allSectors, ev.DownstreamSectors...)
 
-		dir := strings.TrimSpace(ev.Direction)
-		isBear := strings.HasPrefix(dir, "利空")
+		isBear := ev.Score < 0
 
-		for _, sec := range allSectors {
+		for _, sec := range ev.Sectors {
 			if sec == "" {
 				continue
 			}
@@ -201,6 +198,11 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 			}
 			if existing, ok := m[sec]; ok {
 				existing.NewsTitles = append(existing.NewsTitles, ev.Title)
+				if absScore(ev.Score) > absScore(existing.Score) {
+					existing.Score = ev.Score
+					existing.Direction = ev.Direction
+					existing.Reason = ev.Reason
+				}
 			} else {
 				m[sec] = &SectorHot{
 					Name:       sec,
@@ -224,6 +226,14 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 	return
 }
 
+// absScore 取评分的绝对值。
+func absScore(s float64) float64 {
+	if s < 0 {
+		return -s
+	}
+	return s
+}
+
 // collectBearStocks 从利空板块中收集个股代码，去重后返回。
 func (e *Engine) collectBearStocks(bearSectors []SectorHot) []string {
 	seen := make(map[string]bool)
@@ -240,17 +250,20 @@ func (e *Engine) collectBearStocks(bearSectors []SectorHot) []string {
 }
 
 // enrichSectorData 从 Scanner 查询板块行情数据填充 SectorHot。
+// 板块名无法匹配真实同花顺板块（FindSectorsByNames 查不到）时直接丢弃（LLM 造名板块）。
 func enrichSectorData(sectors map[string]*SectorHot, scanner *data.SectorScanner) {
 	if scanner == nil {
 		return
 	}
 	for name, sh := range sectors {
 		infos := scanner.FindSectorsByNames([]string{name})
-		if len(infos) > 0 {
-			sh.ChangePct = infos[0].ChangePct
-			sh.LimitupCnt = infos[0].LimitupCnt
-			sh.NetInflow = infos[0].NetInflow
+		if len(infos) == 0 {
+			delete(sectors, name)
+			continue
 		}
+		sh.ChangePct = infos[0].ChangePct
+		sh.LimitupCnt = infos[0].LimitupCnt
+		sh.NetInflow = infos[0].NetInflow
 	}
 }
 

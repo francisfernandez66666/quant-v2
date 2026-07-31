@@ -61,7 +61,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import * as api from '../api/index.js'
 
 // ── 响应式状态 ──
@@ -74,6 +74,20 @@ const feedback = ref('')              // 操作反馈文字
 const feedbackType = ref('ok')        // 反馈类型：'ok' | 'err'
 
 let timer = null
+
+// ── 本地持久化镜像：进 tab 秒开，增删改才变更 ──
+const CACHE_KEY = 'wl_cache_v1'
+function persistCache() {
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify(stocks.value)) } catch (_) {}
+}
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr : []
+  } catch (_) { return [] }
+}
+watch(stocks, persistCache, { deep: true })
 
 /**
  * 根据评分值返回 CSS 类名
@@ -185,12 +199,13 @@ async function load() {
           db_score: evMap[c]?.db_score || 0, dr_score: evMap[c]?.dr_score || 0, m_score: evMap[c]?.m_score || 0 })
       }
     }
-  } catch (_) { stocks.value = [] }
+    persistCache()
+  } catch (_) { /* 网络失败时保留旧数据，不置空 */ }
 }
 
 // ── 添加 / 删除 ──
 
-/** 添加自选股 */
+/** 添加自选股：后端同步 + 本地追加，不整表重载 */
 async function add() {
   const code = newCode.value.trim()
   if (!code) return
@@ -198,22 +213,35 @@ async function add() {
   adding.value = true
   feedback.value = ''
   try {
-    await api.addWatchlist(code)
+    const res = await api.addWatchlist(code)
     newCode.value = ''
+    if (res && res.stock) {
+      const row = {
+        code: res.stock.code || code,
+        name: res.stock.name || code,
+        price: res.stock.price || 0,
+        change_pct: res.stock.change_pct || 0,
+        n_score: 0, n_pass: false,
+        dragon_score: 0, dragon_pass: false,
+        db_score: 0, db_pass: false,
+        dr_score: 0, dr_pass: false,
+        m_score: 0, m_pass: false,
+      }
+      stocks.value = [...stocks.value.filter(s => s.code !== row.code), row]
+    } else if (!res || !res.duplicate) {
+      stocks.value.push({ code, name: code, price: 0, change_pct: 0 })
+    }
     showFeedback('已添加 ' + code, 'ok')
-    // 清除缓存以触发强制刷新
-    stocks.value = []
-    await load()
   } catch (e) { showFeedback('添加失败: ' + e.message, 'err') }
   adding.value = false
 }
 
-/** 移除自选股 */
+/** 移除自选股：本地移除 + 后端同步 */
 async function remove(code) {
   try {
     await api.removeWatchlist(code)
+    stocks.value = stocks.value.filter(s => s.code !== code)
     showFeedback('已移除 ' + code, 'ok')
-    await load()
   } catch (e) { showFeedback('删除失败: ' + e.message, 'err') }
 }
 
@@ -224,7 +252,11 @@ function showFeedback(msg, type) {
   setTimeout(() => { feedback.value = '' }, 2500)
 }
 
-onMounted(() => { load(); timer = setInterval(load, 3000) })
+onMounted(() => {
+  stocks.value = loadCache()
+  load()
+  timer = setInterval(load, 30000)
+})
 onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 

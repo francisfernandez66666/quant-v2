@@ -6,12 +6,19 @@
   <div class="hotspot-page">
     <!-- 热点板块卡片网格 -->
     <div class="card">
-      <div class="card-header">🔥 热点板块</div>
+      <div class="card-header">
+        <span>🔥 热点板块</span>
+        <select class="hot-round-select" v-model="hotRoundIdx" :disabled="hotRecords.length < 2" @change="applyHotRound">
+          <option v-for="(r, i) in hotRecords" :key="r.process_time" :value="i">
+            {{ formatHotTime(r.process_time) }}（{{ r.sectors.length }} 板块）
+          </option>
+        </select>
+      </div>
       <div class="sector-grid" v-if="sectors.length">
         <div v-for="s in sectors" :key="s.code" class="sector-card" @click="showReason(s)">
           <div class="sec-name">{{ s.name }}</div>
           <div v-if="s.reason" class="sec-reason">{{ shortReason(s.reason) }}</div>
-          <div class="sec-score">{{ s.score?.toFixed(0) }}分</div>
+          <div class="sec-score">{{ Math.round((s.score || 0) * 100) }}分</div>
           <div :class="['sec-pct', (s.change_pct || 0) >= 0 ? 'up' : 'down']">
             {{ (s.change_pct || 0) > 0 ? '+' : '' }}{{ (s.change_pct || 0).toFixed(2) }}%
           </div>
@@ -198,13 +205,29 @@ function val(e, key) {
 }
 
 // ── 响应式数据 ──
-const sectors = ref([])           // 热点板块
+const sectors = ref([])           // 热点板块（当前选中轮次）
+const hotRecords = ref([])        // 当日热点板块轮次记录（持久化）
+const hotRoundIdx = ref(0)        // 选中轮次索引（默认最新）
 const evals = ref([])             // 全市场个股评分
 const news = ref([])              // 资讯 + 日历事件
 const ipoCalendar = ref([])       // IPO 日历
 const reasonTarget = ref(null)    // 当前查看异动原因的板块
 
 function showReason(s) { reasonTarget.value = s }
+
+/** 切换轮次记录：展示该轮次板块快照 */
+function applyHotRound() {
+  const r = hotRecords.value[hotRoundIdx.value]
+  sectors.value = r ? r.sectors || [] : []
+}
+
+/** 格式化轮次时间为 MM-DD HH:mm:ss */
+function formatHotTime(t) {
+  if (!t) return '-'
+  const d = new Date(t)
+  const p = n => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
 
 let timer = null
 let unsubSSE = null
@@ -274,10 +297,22 @@ async function load() {
       } catch (_) {}
     }
   } catch (_) {}
+  let fromRecords = false
   try {
-    const s = await api.fetchSectorHot()
-    if (s) sectors.value = s
+    const recs = await api.fetchSectorHotRecords()
+    if (Array.isArray(recs) && recs.length) {
+      hotRecords.value = recs
+      hotRoundIdx.value = 0
+      applyHotRound()
+      fromRecords = true
+    }
   } catch (_) {}
+  if (!fromRecords) {
+    try {
+      const s = await api.fetchSectorHot()
+      if (s) sectors.value = s
+    } catch (_) {}
+  }
   try {
     const n = await api.fetchNews(true)
     if (n) news.value = n
@@ -309,6 +344,10 @@ onUnmounted(() => {
 .card { background: #1a1a2e; border-radius: 8px; padding: 14px; }
 .card-header { font-size: 14px; font-weight: 600; color: #ccc; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
 .card-sub { font-size: 11px; color: #666; font-weight: 400; }
+.hot-round-select {
+  padding: 4px 8px; border-radius: 5px; border: 1px solid #333;
+  background: #1a1a2e; color: #ccc; font-size: 11px; cursor: pointer; max-width: 200px;
+}
 
 .sector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
 .sector-card { background: #0f0f23; border-radius: 6px; padding: 12px; cursor: pointer; }

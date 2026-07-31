@@ -10,14 +10,20 @@ import (
 	"io"
 	"log"
 	"net/http"
+	urlpkg "net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 	"time"
 )
+
+// htmlTagRe 匹配 HTML 标签（含属性），用于正文清洗。
+var htmlTagRe = regexp.MustCompile(`(?s)<[^>]+>`)
 
 // roundTripperFunc 将普通函数适配为 http.RoundTripper。
 // 用于在 HTTP 请求中注入自定义逻辑（日志、限流等）。
@@ -45,6 +51,18 @@ type sectorRawItem struct {
 // 内部使用 http.Client 直连 API，不依赖任何第三方库。
 type MarketAPI struct {
 	client *http.Client
+
+	quoteMu    sync.Mutex
+	quoteCache map[string]cachedQuote // 实时行情 TTL 缓存
+}
+
+// quoteTTL 实时行情缓存有效期：同一股票在窗口内只打一次网络，
+// 显著降低前端轮询/多接口下的限流压力（东财 3 req/s）。
+const quoteTTL = 5 * time.Second
+
+type cachedQuote struct {
+	si *StockInfo
+	at time.Time
 }
 
 // emUserAgent 东财请求使用的浏览器 User-Agent。
@@ -63,7 +81,8 @@ const emNewsReferer = "https://np-anotice-stock.eastmoney.com/"
 // 使用带限流功能的 HTTP 客户端，默认超时 10 秒。
 func NewMarketAPI() *MarketAPI {
 	return &MarketAPI{
-		client: &http.Client{Timeout: 10 * time.Second},
+		client:     &http.Client{Timeout: 10 * time.Second},
+		quoteCache: make(map[string]cachedQuote),
 	}
 }
 
@@ -186,14 +205,42 @@ func parseSinaQuote(body []byte, code string) (*StockInfo, error) {
 const stockQuoteFields = "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f60,f116,f117,f162,f167,f168,f169,f170,f171,f292"
 
 // GetRealtimeQuote 获取实时行情。先尝试东方财富 push2，失败时回退到新浪。
+// 结果按 quoteTTL 短期缓存，同一股票在窗口内的重复请求直接命中缓存。
 // 东财 push2 接口返回的价格字段（F43/F44/F45/F46/F60）单位为分，需 ÷100 转换为元。
 // 返回 StockInfo，包含名称、价格、涨跌幅、成交量、换手率、主力净流入等。
 func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
+	code = stripSuffix(code)
+	if c, ok := m.quoteHit(code); ok {
+		return c, nil
+	}
 	info, err := m.getEastMoneyQuote(code)
 	if err == nil {
+		m.quoteStore(code, info)
 		return info, nil
 	}
-	return m.GetSinaQuote(code)
+	sina, serr := m.GetSinaQuote(code)
+	if serr != nil {
+		return nil, serr
+	}
+	m.quoteStore(code, sina)
+	return sina, nil
+}
+
+func (m *MarketAPI) quoteHit(code string) (*StockInfo, bool) {
+	m.quoteMu.Lock()
+	defer m.quoteMu.Unlock()
+	c, ok := m.quoteCache[code]
+	if !ok || time.Since(c.at) > quoteTTL {
+		return nil, false
+	}
+	cp := *c.si
+	return &cp, true
+}
+
+func (m *MarketAPI) quoteStore(code string, si *StockInfo) {
+	m.quoteMu.Lock()
+	m.quoteCache[code] = cachedQuote{si: si, at: time.Now()}
+	m.quoteMu.Unlock()
 }
 
 func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
@@ -572,6 +619,7 @@ func parseSinaNews(body []byte) ([]NewsItem, error) {
 		items = append(items, NewsItem{
 			Title:    r.Title,
 			Content:  r.Content,
+			URL:      r.Url,
 			Datetime: r.ShowTime,
 			Source:   "新浪财经",
 		})
@@ -704,6 +752,7 @@ func parseTonghuashunNews(body []byte) ([]NewsItem, error) {
 				Title  string `json:"title"`
 				Digest string `json:"digest"`
 				Ctime  string `json:"ctime"`
+				Url    string `json:"url"`
 			} `json:"list"`
 		} `json:"data"`
 	}
@@ -721,11 +770,118 @@ func parseTonghuashunNews(body []byte) ([]NewsItem, error) {
 		items = append(items, NewsItem{
 			Title:    r.Title,
 			Content:  r.Digest,
+			URL:      r.Url,
 			Datetime: r.Ctime,
 			Source:   "同花顺",
 		})
 	}
 	return items, nil
+}
+
+// ── 新闻原文抓取 ──
+
+// GetArticle 抓取新闻原文正文。
+// 支持同花顺（news.10jqka.com.cn）与新浪财经（finance.sina.com.cn）两类文章页：
+//   - 同花顺：正文位于 <div class="news-content article-content">，移动 UA + Referer 直接可取。
+//   - 新浪：正文位于 <div id="artibody">，需桌面 UA 且跟随 302 跳转（移动 UA 会被重定向到网关页）。
+//
+// 失败返回空串，调用方应保留原始摘要继续流水线。
+func (m *MarketAPI) GetArticle(url string) (string, error) {
+	u, err := urlpkg.Parse(url)
+	if err != nil {
+		return "", fmt.Errorf("article url parse: %v", err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("article url host empty")
+	}
+
+	var req *http.Request
+	if req, err = http.NewRequest("GET", url, nil); err != nil {
+		return "", fmt.Errorf("article request: %v", err)
+	}
+
+	switch {
+	case strings.Contains(host, "10jqka.com.cn"):
+		THSLimiter.Wait()
+		req.Header.Set("User-Agent", thsUserAgent)
+		req.Header.Set("Referer", "https://www.10jqka.com.cn/")
+	case strings.Contains(host, "sina.com.cn"):
+		SinaLimiter.Wait()
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("Referer", "https://finance.sina.com.cn")
+	default:
+		return "", fmt.Errorf("unsupported article host: %s", host)
+	}
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("article http: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("article status=%d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("article read: %v", err)
+	}
+
+	var content string
+	if strings.Contains(host, "10jqka.com.cn") {
+		content = extractArticleDiv(string(body), `class="news-content article-content"`)
+	} else {
+		content = extractArticleDiv(string(body), `id="artibody"`)
+	}
+	return content, nil
+}
+
+// extractArticleDiv 从文章 HTML 中提取指定起始标记所在的 <div> 块文本。
+// 从标记后的下一个 '>' 开始，按 <div/</div> 深度匹配找到闭合，再去除标签与空白。
+func extractArticleDiv(html, marker string) string {
+	i := strings.Index(html, marker)
+	if i < 0 {
+		return ""
+	}
+	gt := strings.Index(html[i:], ">")
+	if gt < 0 {
+		return ""
+	}
+	start := i + gt + 1
+
+	depth := 1
+	pos := start
+	for depth > 0 && pos < len(html) {
+		o, c := -1, -1
+		if idx := strings.Index(html[pos:], "<div"); idx >= 0 {
+			o = idx
+		}
+		if idx := strings.Index(html[pos:], "</div>"); idx >= 0 {
+			c = idx
+		}
+		if o < 0 && c < 0 {
+			break
+		}
+		if c < 0 || (o >= 0 && o < c) {
+			depth++
+			pos += o + 4
+		} else {
+			depth--
+			pos += c + 6
+		}
+	}
+	if depth > 0 {
+		pos = len(html)
+	}
+	raw := html[start:pos]
+
+	raw = htmlTagRe.ReplaceAllString(raw, " ")
+	raw = strings.ReplaceAll(raw, "&nbsp;", " ")
+	raw = strings.ReplaceAll(raw, "&quot;", "\"")
+	raw = strings.ReplaceAll(raw, "&amp;", "&")
+	raw = strings.ReplaceAll(raw, "&lt;", "<")
+	raw = strings.ReplaceAll(raw, "&gt;", ">")
+	return strings.TrimSpace(strings.Join(strings.Fields(raw), " "))
 }
 
 // ── 新股日历 ──

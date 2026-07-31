@@ -66,6 +66,9 @@ export function setStoredServer(url) {
 
 // ── 通用请求封装 ──
 
+/** 请求超时时间（毫秒），防止慢接口把页面卡在空状态 */
+const REQUEST_TIMEOUT = 10000
+
 /**
  * 统一的 HTTP 请求封装，自动附加认证头、处理 401 过期
  * @param {string} path - API 路径（相对路径）
@@ -78,11 +81,22 @@ async function request(path, opts = {}) {
   const token = getToken()
   if (token) headers['Authorization'] = 'Bearer ' + token
 
-  const res = await fetch(url, {
-    method: opts.method || 'GET',
-    headers,
-    body: opts.data ? JSON.stringify(opts.data) : undefined,
-  })
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT)
+  let res
+  try {
+    res = await fetch(url, {
+      method: opts.method || 'GET',
+      headers,
+      body: opts.data ? JSON.stringify(opts.data) : undefined,
+      signal: ctrl.signal,
+    })
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('请求超时')
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
 
   // 401 表示令牌过期，清除本地登录态
   if (res.status === 401) {
@@ -137,6 +151,16 @@ export async function fetchAlerts() {
   return request('/api/alerts')
 }
 
+/** 清空消息中心全部消息 */
+export async function clearAlerts() {
+  return request('/api/alerts', { method: 'DELETE' })
+}
+
+/** 手工删除单条消息 */
+export async function deleteAlert(id) {
+  return request('/api/alerts/' + encodeURIComponent(id), { method: 'DELETE' })
+}
+
 // ── 持仓管理 ──
 
 /** 获取当前持仓列表及可用资金 */
@@ -154,6 +178,11 @@ export async function updateHoldings(data) {
 /** 获取热门板块数据 */
 export async function fetchSectorHot() {
   return request('/api/sector/hot')
+}
+
+/** 获取当日热点板块轮次记录（历史快照） */
+export async function fetchSectorHotRecords() {
+  return request('/api/sector/hot/records')
 }
 
 // ── 行情快照 ──
@@ -177,9 +206,25 @@ export async function fetchEvaluations() {
 
 // ── IPO 日历 ──
 
-/** 获取 IPO 日历数据 */
+const IPO_CACHE_KEY = 'ipo_calendar_cache_v1'
+
+/**
+ * 获取 IPO 日历数据（按日缓存：同一天内首次调用才请求后端，其余直接读缓存）
+ */
 export async function fetchIPOCalendar() {
-  return request('/api/ipo/calendar')
+  const today = new Date().toISOString().slice(0, 10)
+  try {
+    const raw = localStorage.getItem(IPO_CACHE_KEY)
+    if (raw) {
+      const d = JSON.parse(raw)
+      if (d.date === today && Array.isArray(d.data)) return d.data
+    }
+  } catch (_) {}
+  const data = await request('/api/ipo/calendar')
+  try {
+    localStorage.setItem(IPO_CACHE_KEY, JSON.stringify({ date: today, data }))
+  } catch (_) {}
+  return data
 }
 
 // ── 个股查询 ──
@@ -301,6 +346,11 @@ export async function setLLMConfig(cfg) {
 /** 获取 LLM 诊断调试数据 */
 export async function fetchLLMDebug() {
   return request('/api/llm-debug')
+}
+
+/** 获取当日全量 LLM/Stage 轮次记录（固化到磁盘，供复盘） */
+export async function fetchStageRecords() {
+  return request('/api/stage-records')
 }
 
 // ── 做空开关 ──

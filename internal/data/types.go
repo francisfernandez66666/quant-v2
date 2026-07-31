@@ -97,6 +97,7 @@ type CapitalFlow struct {
 type NewsItem struct {
 	Title          string   `json:"title"`                  // 新闻标题
 	Content        string   `json:"content,omitempty"`      // 正文摘要（可能为空）
+	URL            string   `json:"url,omitempty"`          // 原文链接（用于正文抓取）
 	Datetime       string   `json:"datetime"`               // 发布时间字符串
 	Source         string   `json:"source"`                 // 来源标识（如 "东方财富""新浪财经""上市公司公告"）
 	SentimentScore float64  `json:"sentiment_score"`        // LLM 情感得分(0~1, 0.5=中性), 0表示未分析
