@@ -8,14 +8,37 @@ import (
 	"quant-trading-v2/internal/strategy_engine"
 )
 
-// VerifiedSector 已验证板块，包含方向、评分、RPS 排名和成分股列表。
+// VerifiedSector 已验证板块，包含方向、评分、RPS 排名、成分股与板块状态（加强/持续/退潮/反弹）。
 type VerifiedSector struct {
-	Name      string   `json:"name"`
-	Direction string   `json:"direction"`
-	Score     float64  `json:"score"`
-	RPSRank   int      `json:"rps_rank,omitempty"`
-	Stocks    []string `json:"stocks,omitempty"`
-	Reason    string   `json:"reason,omitempty"`
+	Name       string   `json:"name"`
+	Direction  string   `json:"direction"`
+	Score      float64  `json:"score"`
+	RPSRank    int      `json:"rps_rank,omitempty"`
+	RPS20      float64  `json:"rps20,omitempty"`      // 板块20日RPS（用于龙回头龙性判定）
+	Phase      string   `json:"phase,omitempty"`      // 板块状态：加强/持续/退潮/反弹
+	Flow       float64  `json:"flow,omitempty"`       // 主力净流入(元)
+	ChangePct  float64  `json:"change_pct,omitempty"` // 板块当日涨跌幅(%)
+	LimitupCnt int      `json:"limitup_cnt,omitempty"`// 板块内涨停家数
+	Stocks     []string `json:"stocks,omitempty"`
+	Reason     string   `json:"reason,omitempty"`
+}
+
+// classifyPhase 板块状态机（抄自开源 sector_rotation 规则）：
+//   - changePct>0 且 资金净流入 → 加强
+//   - changePct>0 且 资金净流出 → 持续
+//   - changePct<0 且 资金净流出 → 退潮
+//   - changePct<0 且 资金净流入 → 反弹
+func classifyPhase(changePct, flow float64) string {
+	switch {
+	case changePct > 0 && flow > 0:
+		return "加强"
+	case changePct > 0 && flow <= 0:
+		return "持续"
+	case changePct < 0 && flow < 0:
+		return "退潮"
+	default:
+		return "反弹"
+	}
 }
 
 // Agent 板块验证代理，依赖板块扫描器和 RPS 排名系统。
@@ -29,7 +52,14 @@ func New(scanner *data.SectorScanner, rps *data.RPSManager) *Agent {
 	return &Agent{scanner: scanner, rps: rps}
 }
 
-// Verify 验证事件归因板块：补充 RPS 排名、获取板块成分股评分，返回已验证板块列表。
+// FeedRPS 将板块 RPS 数据喂给内部 RPSManager（engine 每轮刷新板块名单时调用）。
+func (a *Agent) FeedRPS(sectors []data.SectorRPS) {
+	if a.rps != nil && len(sectors) > 0 {
+		a.rps.Update(sectors)
+	}
+}
+
+// Verify 验证事件归因板块：补充 RPS 排名、板块状态与成分股评分，返回已验证板块列表。
 func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 	if len(sectors) == 0 {
 		return nil
@@ -38,10 +68,14 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 	var result []VerifiedSector
 	for _, s := range sectors {
 		vs := VerifiedSector{
-			Name:      s.Name,
-			Direction: s.Direction,
-			Score:     s.Score,
-			Reason:    s.Reason,
+			Name:       s.Name,
+			Direction:  s.Direction,
+			Score:      s.Score,
+			Reason:     s.Reason,
+			ChangePct:  s.ChangePct,
+			Flow:       s.NetInflow,
+			LimitupCnt: s.LimitupCnt,
+			Phase:      classifyPhase(s.ChangePct, s.NetInflow),
 		}
 
 		if a.rps != nil {
@@ -49,6 +83,7 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 			for i, ts := range top {
 				if ts.Name == s.Name {
 					vs.RPSRank = i + 1
+					vs.RPS20 = ts.RPS20
 					break
 				}
 			}

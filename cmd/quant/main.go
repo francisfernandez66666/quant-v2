@@ -134,6 +134,13 @@ func main() {
 		log.Printf("[LLM] 客户端已热重建: model=%s url=%s", model, apiURL)
 	})
 
+	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
+	baseStocks := append(wlMgr.List(), rpt.HeldPositionCodes()...)
+	fetcher := data.NewFetcher(baseStocks, data.NewDataCoordinator(marketAPI, thsClient))
+	go fetcher.Start()
+	defer fetcher.Stop()
+	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
+
 	addr := ":8080"
 	if v := os.Getenv("QUANT_ADDR"); v != "" {
 		addr = v

@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -612,7 +613,45 @@ func (e *Engine) refreshSectors() {
 		return
 	}
 	scanner.Update(boards, 0, 0, 0)
+	e.feedRPS(boards)
 	log.Printf("[engine] 板块名单刷新: %d 个 (一级行业+概念)", len(boards))
+}
+
+// feedRPS 按当日涨跌幅百分位构造 RPS20/RPS60 近似值并喂给板块验证代理。
+// 真实多周期 RPS 需历史K线（后续 Phase F 可升级），当日涨幅近似足以支撑 RPSRank 排序。
+func (e *Engine) feedRPS(boards []data.SectorInfo) {
+	e.mu.RLock()
+	sa := e.sectorAgent
+	e.mu.RUnlock()
+	if sa == nil || len(boards) == 0 {
+		return
+	}
+	type br struct {
+		code, name string
+		pct        float64
+	}
+	rows := make([]br, 0, len(boards))
+	for _, b := range boards {
+		if b.Name == "" {
+			continue
+		}
+		rows = append(rows, br{code: b.Code, name: b.Name, pct: b.ChangePct})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].pct > rows[j].pct })
+	rps := make([]data.SectorRPS, 0, len(rows))
+	for i, r := range rows {
+		rank := 0.0
+		if len(rows) > 1 {
+			rank = 100 * (1 - float64(i)/float64(len(rows)-1))
+		}
+		rps = append(rps, data.SectorRPS{
+			Code:   r.code,
+			Name:   r.name,
+			RPS20:  rank,
+			RPS60:  rank,
+		})
+	}
+	sa.FeedRPS(rps)
 }
 
 // verifySectorAttribution 板块验真回填：对 level=板块 且 |score|≥0.5 的事件，

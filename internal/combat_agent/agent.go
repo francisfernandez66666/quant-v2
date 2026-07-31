@@ -131,7 +131,7 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 				if runner.Strategy == nil {
 					continue
 				}
-				eval, err := runner.Strategy.Evaluate(code, md)
+				eval, err := evalFor(runner, code, md, &sector)
 				if err != nil || eval == nil || !eval.Pass {
 					continue
 				}
@@ -170,7 +170,7 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 			if runner.Strategy == nil {
 				continue
 			}
-			eval, err := runner.Strategy.Evaluate(code, md)
+			eval, err := evalFor(runner, code, md, nil)
 			if err != nil || eval == nil || !eval.Pass {
 				continue
 			}
@@ -239,7 +239,7 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 				if runner.Strategy == nil {
 					continue
 				}
-				eval, err := runner.Strategy.Evaluate(code, md)
+				eval, err := evalFor(runner, code, md, &sector)
 				if err != nil || eval == nil || !eval.Pass {
 					continue
 				}
@@ -278,7 +278,7 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 				if runner.Strategy == nil {
 					continue
 				}
-				eval, err := runner.Strategy.Evaluate(code, md)
+				eval, err := evalFor(runner, code, md, nil)
 				if err != nil || eval == nil || !eval.Pass {
 					continue
 				}
@@ -395,7 +395,7 @@ func (a *Agent) Scan(input ScanInput) []Signal {
 				if runner.Strategy == nil {
 					continue
 				}
-				eval, err := runner.Strategy.Evaluate(code, md)
+				eval, err := evalFor(runner, code, md, &sector)
 				if err != nil || eval == nil || !eval.Pass {
 					continue
 				}
