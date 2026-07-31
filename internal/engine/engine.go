@@ -384,18 +384,21 @@ func (e *Engine) SetLongEnabled(v bool) {
 	e.mu.Unlock()
 }
 
+// LongEnabled 返回做多开关是否开启。
 func (e *Engine) LongEnabled() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.longEnabled
 }
 
+// SetShortEnabled 设置做空开关状态。
 func (e *Engine) SetShortEnabled(v bool) {
 	e.mu.Lock()
 	e.shortEnabled = v
 	e.mu.Unlock()
 }
 
+// ShortEnabled 返回做空开关是否开启。
 func (e *Engine) ShortEnabled() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

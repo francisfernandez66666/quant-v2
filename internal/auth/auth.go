@@ -14,6 +14,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// User 用户账号记录。
 type User struct {
 	ID        string `json:"id"`
 	Username  string `json:"username"`
@@ -23,17 +24,20 @@ type User struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+// ConfigEntry 用户配置键值项。
 type ConfigEntry struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 	UserID string `json:"user_id"`
 }
 
+// DB 认证数据库结构（用户与配置列表）。
 type DB struct {
 	Users   []User         `json:"users"`
 	Configs []ConfigEntry  `json:"configs"`
 }
 
+// Manager 用户与登录认证管理器。
 type Manager struct {
 	mu       sync.RWMutex
 	dataDir  string
@@ -41,6 +45,7 @@ type Manager struct {
 	db       *DB
 }
 
+// NewManager 创建认证管理器实例。
 func NewManager(dataDir string) *Manager {
 	return &Manager{
 		dataDir: dataDir,
@@ -48,6 +53,7 @@ func NewManager(dataDir string) *Manager {
 	}
 }
 
+// Init 初始化认证数据库（不存在时新建）。
 func (m *Manager) Init() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -86,6 +92,7 @@ func generateToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// Register 注册新用户并返回生成的用户记录。
 func (m *Manager) Register(username, password string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -121,6 +128,7 @@ func (m *Manager) Register(username, password string) (*User, error) {
 	return &user, nil
 }
 
+// CreateTemp 创建有效期为 duration 的临时账户。
 func (m *Manager) CreateTemp(duration time.Duration) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,6 +152,7 @@ func (m *Manager) CreateTemp(duration time.Duration) (*User, error) {
 	return &user, nil
 }
 
+// Login 校验用户名密码并返回对应用户。
 func (m *Manager) Login(username, password string) (*User, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -162,6 +171,7 @@ func (m *Manager) Login(username, password string) (*User, error) {
 	return nil, fmt.Errorf("user not found")
 }
 
+// ValidateToken 校验令牌是否有效并返回对应未过期用户。
 func (m *Manager) ValidateToken(token string) *User {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -177,6 +187,7 @@ func (m *Manager) ValidateToken(token string) *User {
 	return nil
 }
 
+// SetConfig 写入用户配置项（键不存在则新增）。
 func (m *Manager) SetConfig(userID, key, value string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -195,6 +206,7 @@ func (m *Manager) SetConfig(userID, key, value string) error {
 	return m.save()
 }
 
+// GetConfig 读取用户配置项，不存在时返回 false。
 func (m *Manager) GetConfig(userID, key string) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -207,6 +219,7 @@ func (m *Manager) GetConfig(userID, key string) (string, bool) {
 	return "", false
 }
 
+// IsInitialized 判断系统是否已完成初始化。
 func (m *Manager) IsInitialized() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -219,6 +232,7 @@ func (m *Manager) IsInitialized() bool {
 	return len(m.db.Users) > 0
 }
 
+// MarkInitialized 标记系统已完成初始化。
 func (m *Manager) MarkInitialized() error {
 	return m.SetConfig("system", "initialized", "true")
 }

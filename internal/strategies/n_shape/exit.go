@@ -7,6 +7,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// CheckExit 判断 N 形策略是否触发退出信号。
 func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
@@ -52,4 +53,5 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.Ex
 	return nil
 }
 
+// NeedUpdateHighest N 形策略无需更新最高价。
 func NeedUpdateHighest() bool { return false }

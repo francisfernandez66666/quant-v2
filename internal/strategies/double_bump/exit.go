@@ -7,6 +7,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// CheckExit 判断双凸策略是否触发退出信号。
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
@@ -81,4 +82,5 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strateg
 	return nil
 }
 
+// NeedUpdateHighest 双凸策略需要更新最高价。
 func NeedUpdateHighest() bool { return true }

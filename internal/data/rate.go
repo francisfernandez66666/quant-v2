@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// RateLimiter 令牌桶限流器。
 type RateLimiter struct {
 	mu     sync.Mutex
 	tokens float64
@@ -15,6 +16,7 @@ type RateLimiter struct {
 	name   string
 }
 
+// NewRateLimiter 创建指定速率的限流器。
 func NewRateLimiter(name string, ratePerSec, burst float64) *RateLimiter {
 	return &RateLimiter{
 		tokens: burst,
@@ -29,6 +31,7 @@ func NewRateLimiter(name string, ratePerSec, burst float64) *RateLimiter {
 // 仅供测试使用（e2e/mock 网络下避免被限流拖慢）。
 var DisableAll bool
 
+// Wait 获取一个令牌，不足时阻塞等待。
 func (rl *RateLimiter) Wait() {
 	if DisableAll {
 		return

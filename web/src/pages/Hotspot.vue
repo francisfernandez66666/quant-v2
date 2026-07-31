@@ -159,6 +159,7 @@ import * as api from '../api/index.js'
 /** 截取板块异动原因的前半段（第一个逗号前或前18字） */
 function shortReason(r) {
   if (!r) return ''
+  // 取第一个中文逗号前的摘要，否则截取前 18 字
   const idx = r.indexOf('，')
   return idx > 0 ? r.slice(0, idx) : r.slice(0, 18)
 }
@@ -166,6 +167,7 @@ function shortReason(r) {
 /** 根据评分阈值返回 CSS 类名 */
 function scoreClass(score, pass, strongMin) {
   if (!score || score <= 0) return 'ev-score'
+  // 达强势阈值标红，过门槛标黄
   if (score >= strongMin) return 'ev-score strong'
   if (pass) return 'ev-score pass'
   return 'ev-score'
@@ -173,6 +175,7 @@ function scoreClass(score, pass, strongMin) {
 
 /** 根据多维度评分判断行样式 */
 function rowClass(e) {
+  // 任一分维度达强势阈值即整行高亮
   const strong = (e.n_score || 0) >= 80 || (e.dragon_score || 0) >= 80 || (e.db_score || 0) >= 80 || (e.dr_score || 0) >= 80 || (e.m_score || 0) >= 70
   if (strong) return 'ev-row strong'
   const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 70 || (e.db_score || 0) >= 70 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
@@ -186,6 +189,7 @@ const sortDir = ref(-1)
 
 function setSort(key) {
   if (sortKey.value === key) {
+    // 同列再次点击时切换升降序
     sortDir.value *= -1
   } else {
     sortKey.value = key
@@ -218,6 +222,7 @@ function showReason(s) { reasonTarget.value = s }
 /** 切换轮次记录：展示该轮次板块快照 */
 function applyHotRound() {
   const r = hotRecords.value[hotRoundIdx.value]
+  // 将选中轮次的板块快照设为当前展示
   sectors.value = r ? r.sectors || [] : []
 }
 
@@ -243,6 +248,7 @@ const calendarEvents = computed(() => news.value.filter(n => n.source === '宏�
 function ipoCountdown(c) {
   const ds = c.listing_date || c.ipo_date
   if (!ds) return c.list_status === 'L' ? '已上市' : '即将上市'
+  // 解析 YYYYMMDD 日期并计算与今天的相差天数
   const t = new Date(+ds.slice(0,4), +ds.slice(4,6)-1, +ds.slice(6,8))
   const diff = Math.ceil((t - Date.now()) / 86400000)
   if (diff > 0) return `${diff}天后`
@@ -253,6 +259,7 @@ function ipoCountdown(c) {
 /** 全市场最高评分（用于缩放显示） */
 const maxScore = computed(() => {
   let m = 0
+  // 遍历所有个股取各维度最高分
   for (const e of evals.value) {
     const t = Math.max(e.n_score || 0, e.dragon_score || 0, e.db_score || 0, e.dr_score || 0, e.m_score || 0)
     if (t > m) m = t
@@ -266,6 +273,7 @@ const sortedEvals = computed(() => {
   const arr = [...evals.value]
   const sk = sortKey.value
   if (!sk) {
+    // 未选排序列时按各维度最高分降序
     return arr.sort((a, b) => {
       const sa = Math.max(a.n_score || 0, a.dragon_score || 0, a.db_score || 0, a.dr_score || 0, a.m_score || 0)
       const sb = Math.max(b.n_score || 0, b.dragon_score || 0, b.db_score || 0, b.dr_score || 0, b.m_score || 0)
@@ -273,6 +281,7 @@ const sortedEvals = computed(() => {
     })
   }
   const dir = sortDir.value
+  // 按指定列排序，字符串用 localeCompare
   return arr.sort((a, b) => {
     const va = val(a, sk)
     const vb = val(b, sk)
@@ -292,6 +301,7 @@ async function load() {
     api.setLastSession(st.session)
     if (api.isTradingSession(st.session) || !evals.value.length) {
       try {
+        // 交易时段内刷新全市场评分
         const e = await api.fetchEvaluations()
         if (e) evals.value = e
       } catch (_) {}
@@ -299,6 +309,7 @@ async function load() {
   } catch (_) {}
   let fromRecords = false
   try {
+    // 优先加载轮次记录，用于切换历史快照
     const recs = await api.fetchSectorHotRecords()
     if (Array.isArray(recs) && recs.length) {
       hotRecords.value = recs
@@ -309,6 +320,7 @@ async function load() {
   } catch (_) {}
   if (!fromRecords) {
     try {
+      // 无轮次记录时直接拉取当前热点板块
       const s = await api.fetchSectorHot()
       if (s) sectors.value = s
     } catch (_) {}
@@ -329,11 +341,14 @@ function handleSSE() { load() }
 
 onMounted(() => {
   load()
+  // 每 3 秒轮询一次热点数据
   timer = setInterval(load, 3000)
+  // 订阅后端 SSE 推送
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
 })
 onUnmounted(() => {
+  // 清理定时器与 SSE 订阅
   if (timer) clearInterval(timer)
   if (unsubSSE) { unsubSSE(); unsubSSE = null }
 })

@@ -179,6 +179,7 @@ const (
 	SessionClosed                              // 非交易日/其他
 )
 
+// String 返回市场时段的名称。
 func (s MarketSession) String() string {
 	switch s {
 	case SessionPreMarket:

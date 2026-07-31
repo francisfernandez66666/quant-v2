@@ -105,6 +105,7 @@ const filters = [
 /** 根据 activeFilter 过滤信号 */
 const filteredSignals = computed(() => {
   if (activeFilter.value === 'all') return signals.value
+  // 按当前选中等级过滤信号
   return signals.value.filter(s => s.remind_level === activeFilter.value)
 })
 
@@ -115,12 +116,14 @@ const filteredSignals = computed(() => {
  */
 function shortDesc(s) {
   if (!s) return ''
+  // 截取逗号前的摘要，无逗号则取前 6 字符
   const idx = s.indexOf(',')
   return idx > 0 ? s.slice(0, idx) : s.slice(0, 6)
 }
 
 /** 打开交易确认弹窗 */
 function confirmTrade(s, action) {
+  // 记录目标信号与操作类型并弹出确认框
   tradeTarget.value = s
   tradeAction.value = action
   showConfirm.value = true
@@ -129,8 +132,10 @@ function confirmTrade(s, action) {
 /** 执行买入/忽略操作，完成后刷新列表 */
 async function doAction(action) {
   try {
+    // 调用后端接口执行买入/忽略操作
     const res = await api.actionSignal(tradeTarget.value.code, action)
     showConfirm.value = false
+    // 操作成功后刷新信号列表
     await load()
   } catch (e) {
     showConfirm.value = false
@@ -145,18 +150,22 @@ async function load() {
 
 /** SSE 消息触发刷新（新信号或扫描完成） */
 function handleSSE(msg) {
+  // 仅新信号或扫描完成事件触发刷新
   if (msg.signal || msg.type === 'scan') load()
 }
 
 /** 挂载时首次加载，启动 3 秒轮询 + SSE */
 onMounted(() => {
   load()
+  // 每 3 秒轮询一次信号列表
   timer = setInterval(load, 3000)
+  // 订阅后端 SSE 推送
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
 })
 /** 卸载时清理 */
 onUnmounted(() => {
+  // 清理定时器与 SSE 订阅
   if (timer) clearInterval(timer)
   if (unsubSSE) unsubSSE()
 })

@@ -315,6 +315,7 @@ func (m *Manager) Save() {
 	log.Printf("[config] 已保存配置文件: %s", m.path)
 }
 
+// CalendarEvent 宏观日历事件条目。
 type CalendarEvent struct {
 	Date        string `json:"date"`
 	Title       string `json:"title"`
@@ -322,9 +323,11 @@ type CalendarEvent struct {
 	DaysAdvance int    `json:"days_advance"`
 }
 
+// CalendarConfig 宏观日历配置。
 type CalendarConfig struct {
 	Enabled bool            `json:"enabled"`
 	Events  []CalendarEvent `json:"events"`
 }
 
+// DefaultRules 默认交易规则实例。
 var DefaultRules = &Rules{}

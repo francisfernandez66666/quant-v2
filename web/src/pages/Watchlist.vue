@@ -98,6 +98,7 @@ watch(stocks, persistCache, { deep: true })
  */
 function scoreClass(score, pass, strongMin) {
   if (!score || score <= 0) return 'ev-score'
+  // 达到强势阈值标红，达标（过门槛）标黄
   if (score >= strongMin) return 'ev-score strong'
   if (pass) return 'ev-score pass'
   return 'ev-score'
@@ -105,6 +106,7 @@ function scoreClass(score, pass, strongMin) {
 
 /** 根据多维度评分判断行样式：强势 / 关注 / 普通 */
 function rowClass(e) {
+  // 任一分维度达到强势阈值即整行高亮
   const strong = (e.n_score || 0) >= 80 || (e.dragon_score || 0) >= 80 || (e.db_score || 0) >= 80 || (e.dr_score || 0) >= 80 || (e.m_score || 0) >= 70
   if (strong) return 'ev-row strong'
   const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 70 || (e.db_score || 0) >= 70 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
@@ -117,6 +119,7 @@ function rowClass(e) {
 /** 设置排序列，再次点击切换升降序 */
 function setSort(key) {
   if (sortKey.value === key) {
+    // 同列再次点击时切换升降序
     sortDir.value *= -1
   } else {
     sortKey.value = key
@@ -142,6 +145,7 @@ const sortedEvals = computed(() => {
   const arr = [...stocks.value]
   const sk = sortKey.value
   if (!sk) {
+    // 未选排序列时按各维度最高分降序
     return arr.sort((a, b) => {
       const sa = Math.max(a.n_score || 0, a.dragon_score || 0, a.db_score || 0, a.dr_score || 0, a.m_score || 0)
       const sb = Math.max(b.n_score || 0, b.dragon_score || 0, b.db_score || 0, b.dr_score || 0, b.m_score || 0)
@@ -149,6 +153,7 @@ const sortedEvals = computed(() => {
     })
   }
   const dir = sortDir.value
+  // 按指定列排序，字符串用 localeCompare
   return arr.sort((a, b) => {
     const va = val(a, sk)
     const vb = val(b, sk)
@@ -163,10 +168,12 @@ const sortedEvals = computed(() => {
 async function load() {
   try {
     const st = await api.fetchStatus()
+    // 非交易时段直接跳过，保留旧数据
     if (!api.isTradingSession(st.session) && stocks.value.length) {
       return
     }
     api.setLastSession(st.session)
+    // 并发拉取快照、自选列表、评分三个接口
     const [snap, wl, ev] = await Promise.all([
       api.fetchSnapshot(), api.fetchWatchlist(), api.fetchEvaluations()
     ])
@@ -213,9 +220,11 @@ async function add() {
   adding.value = true
   feedback.value = ''
   try {
+    // 调用后端接口加入自选
     const res = await api.addWatchlist(code)
     newCode.value = ''
     if (res && res.stock) {
+      // 后端有返回则用返回数据本地追加行，避免整表重载
       const row = {
         code: res.stock.code || code,
         name: res.stock.name || code,
@@ -240,6 +249,7 @@ async function add() {
 async function remove(code) {
   try {
     await api.removeWatchlist(code)
+    // 后端移除成功后从本地列表删除
     stocks.value = stocks.value.filter(s => s.code !== code)
     showFeedback('已移除 ' + code, 'ok')
   } catch (e) { showFeedback('删除失败: ' + e.message, 'err') }
@@ -249,10 +259,12 @@ async function remove(code) {
 function showFeedback(msg, type) {
   feedback.value = msg
   feedbackType.value = type || 'ok'
+  // 2.5 秒后自动清空反馈
   setTimeout(() => { feedback.value = '' }, 2500)
 }
 
 onMounted(() => {
+  // 先读缓存秒开，再拉取最新，并 30s 轮询
   stocks.value = loadCache()
   load()
   timer = setInterval(load, 30000)

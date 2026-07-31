@@ -68,6 +68,7 @@ const filteredAlerts = computed(() => {
   if (activeFilter.value === 'all') return alerts.value
   if (activeFilter.value === 'hit') return alerts.value.filter(a => a.level === '命中提醒')
   if (activeFilter.value === 'strategy') return alerts.value.filter(a => a.level === '策略信号')
+  // 止盈止损合并过滤
   if (activeFilter.value === 'stop') return alerts.value.filter(a => a.level === '止盈' || a.level === '止损')
   if (activeFilter.value === 'hold') return alerts.value.filter(a => a.level === '持仓提示')
   return alerts.value
@@ -106,6 +107,7 @@ function actionClass(a) {
 /** 从 API 加载所有提醒，过滤掉日历类消息 */
 async function load() {
   try {
+    // 拉取全部提醒并过滤日历类消息
     const all = await api.fetchAlerts()
     alerts.value = (all || []).filter(a => a.code !== 'CAL' && !a.level?.startsWith('日历'))
   } catch (_) {}
@@ -113,6 +115,7 @@ async function load() {
 
 /** 手工删除单条消息 */
 async function onDeleteOne(a) {
+  // 先弹出确认框再执行删除
   if (!confirm(`删除该消息？\n${a.title || ''}`)) return
   try {
     await api.deleteAlert(a.id)
@@ -124,18 +127,22 @@ async function onDeleteOne(a) {
 async function onClearAll() {
   if (!confirm('确定清空全部消息？(当日已删除的将不再自动出现)')) return
   try {
+    // 调用后端清空接口并重新加载
     await api.clearAlerts()
     load()
   } catch (_) {}
 }
 
 onMounted(() => {
+  // 首次加载并启动 15s 轮询
   load()
   timer = setInterval(load, 15000)
+  // 订阅后端 SSE 推送，收到事件即刷新
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
 })
 onUnmounted(() => {
+  // 卸载时清理定时器与 SSE 订阅
   if (timer) clearInterval(timer)
   if (unsubSSE) { unsubSSE(); unsubSSE = null }
 })

@@ -34,6 +34,7 @@ type EngineController interface {
 	DeleteMessage(id string)
 }
 
+// Server HTTP 服务端。
 type Server struct {
 	auth        *auth.Manager
 	agg         *display.Aggregator
@@ -59,7 +60,9 @@ type Server struct {
 	ipoCacheDay   string
 }
 
+// SetLLMRecreate 设置 LLM 客户端热重建回调。
 func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string)) { s.llmRecreate = fn }
+// SetEngineController 设置引擎控制器。
 func (s *Server) SetEngineController(c EngineController)               { s.ctrl = c }
 
 // SetRuntimeLLM 记录启动时实际生效的 LLM 模型与地址（供 /api/config/llm 返回真实值）。
@@ -125,6 +128,7 @@ func (s *Server) shortOn() bool {
 	return false
 }
 
+// New 创建 HTTP 服务端实例。
 func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rpt *report.Report, market *data.MarketAPI, wl *data.WatchlistManager, ths *data.THSClient) *Server {
 	s := &Server{
 		auth:      authMgr,
@@ -142,6 +146,7 @@ func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rp
 	return s
 }
 
+// GetSSE 返回 SSE 事件推送器。
 func (s *Server) GetSSE() *SSEBroker { return s.sse }
 
 func (s *Server) registerRoutes() {
@@ -196,6 +201,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
 
+// Serve 启动 HTTP 服务监听指定地址。
 func (s *Server) Serve(addr string) error {
 	log.Printf("HTTP server starting on %s", addr)
 	return http.ListenAndServe(addr, s.corsMiddleware(s.mux))
@@ -214,7 +220,9 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// GetServeMux 返回路由注册表。
 func (s *Server) GetServeMux() *http.ServeMux   { return s.mux }
+// GetAuthManager 返回认证管理器。
 func (s *Server) GetAuthManager() *auth.Manager { return s.auth }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

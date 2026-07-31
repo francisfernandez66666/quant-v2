@@ -32,6 +32,7 @@ type cachedSectorStocks struct {
 	at     time.Time
 }
 
+// NewDataCoordinator 创建数据协调器实例。
 func NewDataCoordinator(api *MarketAPI, ths *THSClient) *DataCoordinator {
 	return &DataCoordinator{
 		eastMoney:        api,

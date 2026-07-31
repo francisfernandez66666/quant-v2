@@ -18,17 +18,20 @@ type EventsConfig struct {
 	NegativeFilter []string            `yaml:"negative_filter"`
 }
 
+// MetaConfig 事件配置元信息。
 type MetaConfig struct {
 	Version    string `yaml:"version"`
 	Maintainer string `yaml:"maintainer"`
 }
 
+// D1Result D1 事件匹配结果。
 type D1Result struct {
 	Blocked     bool   `json:"blocked"`
 	BlockReason string `json:"block_reason,omitempty"`
 	Score       int    `json:"-"` // 保留字段，不再用于本地打分
 }
 
+// EventMatcher D1 事件匹配器（按负面关键词阻断）。
 type EventMatcher struct {
 	cfg        *EventsConfig
 	negRegexps []*regexpRule
@@ -40,6 +43,7 @@ type regexpRule struct {
 	group   string
 }
 
+// LoadEvents 从 YAML 文件加载事件匹配配置。
 func LoadEvents(path string) (*EventsConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -52,6 +56,7 @@ func LoadEvents(path string) (*EventsConfig, error) {
 	return &cfg, nil
 }
 
+// NewEventMatcher 创建事件匹配器并编译负面过滤正则。
 func NewEventMatcher(cfg *EventsConfig) *EventMatcher {
 	m := &EventMatcher{cfg: cfg}
 	for _, kw := range cfg.NegativeFilter {

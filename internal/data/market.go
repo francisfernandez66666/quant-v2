@@ -29,6 +29,7 @@ var htmlTagRe = regexp.MustCompile(`(?s)<[^>]+>`)
 // 用于在 HTTP 请求中注入自定义逻辑（日志、限流等）。
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
+// RoundTrip 执行 RoundTripper 接口调用。
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }

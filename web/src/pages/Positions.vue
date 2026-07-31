@@ -137,11 +137,13 @@ const CACHE_KEY = 'pos_cache_v1'
 const BALANCE_KEY = 'pos_balance_v1'
 function persistCache() {
   try {
+    // 将持仓与资金快照写入 localStorage
     localStorage.setItem(CACHE_KEY, JSON.stringify({ holdings: holdings.value, balance: availableBalance.value }))
   } catch (_) {}
 }
 function loadCache() {
   try {
+    // 从本地缓存恢复持仓与资金，进页面秒开
     const raw = localStorage.getItem(CACHE_KEY)
     const d = raw ? JSON.parse(raw) : null
     if (d) {
@@ -155,6 +157,7 @@ watch([holdings, availableBalance], persistCache, { deep: true })
 /** 计算总盈亏 = Σ(现价-成本)*数量 - 偏移量 */
 const totalPnl = computed(() => {
   let sum = 0
+  // 累加每只持仓的 (现价-成本)*数量
   for (const h of holdings.value) {
     const qty = h.quantity || 1
     const cost = h.cost_price || 0
@@ -167,6 +170,7 @@ const totalPnl = computed(() => {
 /** 清零总盈亏：将当前累计盈亏记录为偏移量 */
 function resetPnl() {
   pnlOffset.value = 0
+  // 将当前累计盈亏累加为偏移量，实现界面清零
   for (const h of holdings.value) {
     const qty = h.quantity || 1
     const cost = h.cost_price || 0
@@ -199,6 +203,7 @@ function editBalanceStart() {
 }
 /** 保存可用资金编辑结果 */
 function editBalanceSave() {
+  // 写入资金并同步保存到后端
   availableBalance.value = balanceInputVal.value
   editingBalance.value = false
   saveHoldings()
@@ -212,6 +217,7 @@ function editBalanceCancel() {
 function rowClass(h) {
   const chg = h.change_pct || 0
   const pnl = h.pnl_pct || 0
+  // 依次判定：信号 / 大涨 / 触达止损 / 异动，返回对应高亮类
   if (h.signal_active) return 'table-row signal'
   if (chg >= 5 || pnl >= 8) return 'table-row strong'
   if (curReachedStop(h)) return 'table-row danger'
@@ -221,12 +227,14 @@ function rowClass(h) {
 /** 判断是否已触达止盈或止损线 */
 function curReachedStop(h) {
   if (!h.cur_price || !h.stop_loss) return false
+  // 现价跌破止损或涨破止盈即视为触达
   return h.cur_price <= h.stop_loss || h.cur_price >= h.take_profit
 }
 
 /** 从 API 加载持仓和可用资金 */
 async function load() {
   try {
+    // 先拉取会话状态，再加载持仓与资金
     const st = await api.fetchStatus()
     api.setLastSession(st.session)
     const data = await api.fetchHoldings()
@@ -249,6 +257,7 @@ async function onCodeInput() {
   const code = formCode.value.trim()
   if (code.length < 5) { lookupName.value = ''; return }
   try {
+    // 按代码查询股票名称与现价
     const data = await api.fetchStockLookup(code)
     if (data && data.name) {
       lookupName.value = data.name
@@ -264,6 +273,7 @@ async function onCodeInput() {
 async function confirmAdd() {
   const code = formCode.value.trim()
   if (!code || !formCost.value || !formQty.value) { alert('请填写完整信息'); return }
+  // 组装持仓对象，默认止盈 +8% / 止损 -5%
   const item = {
     code,
     name: lookupName.value || code,
@@ -283,6 +293,7 @@ async function confirmAdd() {
     // 新增模式：追加到列表
     holdings.value.push(item)
   }
+  // 保存后关闭弹窗并复位表单
   await saveHoldings()
   showAdd.value = false
   editingIdx.value = -1
@@ -291,6 +302,7 @@ async function confirmAdd() {
 
 /** 打开编辑弹窗，回填数据 */
 function editHolding(h) {
+  // 定位索引并回填表单字段
   editingIdx.value = holdings.value.indexOf(h)
   formCode.value = h.code
   formCost.value = h.cost_price
@@ -305,6 +317,7 @@ function editHolding(h) {
 /** 删除持仓 */
 function removeHolding(h) {
   if (!confirm(`确认删除持仓 ${h.code} ${h.name}？`)) return
+  // 从列表移除并持久化保存
   holdings.value = holdings.value.filter(x => x.code !== h.code)
   saveHoldings()
 }
@@ -318,7 +331,9 @@ function resetForm() {
   lookupPrice.value = 0
 }
 
+// 先读本地缓存秒开，再拉取最新数据，并启动 30s 轮询
 onMounted(() => { loadCache(); load(); timer = setInterval(load, 30000) })
+// 卸载时清理定时器
 onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 

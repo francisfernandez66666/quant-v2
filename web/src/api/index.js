@@ -81,6 +81,7 @@ async function request(path, opts = {}) {
   const token = getToken()
   if (token) headers['Authorization'] = 'Bearer ' + token
 
+  // 设置请求超时，超时后中止请求
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT)
   let res
@@ -122,10 +123,12 @@ export async function login(username, password) {
     body: JSON.stringify({ username, password }),
   })
   if (!res.ok) {
+    // 非 2xx 响应时提取后端错误信息并抛出
     const err = await res.json().catch(() => ({}))
     throw new Error(err.error || '登录失败')
   }
   const data = await res.json()
+  // 登录成功后持久化 token 与账号
   storeAuth(data.token, data.account, data.expires_at)
   return data
 }
@@ -217,11 +220,13 @@ export async function fetchIPOCalendar() {
     const raw = localStorage.getItem(IPO_CACHE_KEY)
     if (raw) {
       const d = JSON.parse(raw)
+      // 命中当日缓存则直接返回，避免重复请求
       if (d.date === today && Array.isArray(d.data)) return d.data
     }
   } catch (_) {}
   const data = await request('/api/ipo/calendar')
   try {
+    // 拉取成功后按当天日期写入缓存
     localStorage.setItem(IPO_CACHE_KEY, JSON.stringify({ date: today, data }))
   } catch (_) {}
   return data
@@ -312,6 +317,7 @@ export function onSSE(fn) {
 export function connectSSE() {
   if (sse) return
   const token = getToken()
+  // 未登录时不建立连接
   if (!token) return
   sse = new EventSource(baseUrl() + '/api/events?token=' + encodeURIComponent(token))
   sse.onmessage = (e) => {
@@ -321,6 +327,7 @@ export function connectSSE() {
     } catch (_) {}
   }
   sse.onerror = () => {
+    // 连接断开时先关闭，3 秒后自动重连
     disconnectSSE()
     setTimeout(connectSSE, 3000)
   }

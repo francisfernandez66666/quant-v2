@@ -7,6 +7,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// CheckExit 判断破局龙策略是否触发退出信号。
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
@@ -70,4 +71,5 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 	return nil
 }
 
+// NeedUpdateHighest 破局龙策略无需更新最高价。
 func NeedUpdateHighest() bool { return false }

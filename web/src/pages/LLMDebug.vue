@@ -133,9 +133,11 @@ function isSelected(i) {
 /** 切换轮次后应用选中记录 */
 function applyRound() {
   const r = records.value[roundIdx.value]
+  // 将选中轮次的记录设为当前展示数据
   data.value = r || null
   noAgent.value = false
   noData.value = !r
+  // 回填该轮次通过 Stage1 筛选的新闻索引
   selectedSet.value = new Set(r ? r.selected_idx || [] : [])
 }
 
@@ -152,16 +154,19 @@ async function loadData() {
   try {
     const res = await api.fetchStageRecords()
     if (res.status === 'no_engine') {
+      // 后端未启用分析引擎，提示 Agent 未就绪
       noAgent.value = true
       noData.value = false
       records.value = []
       data.value = null
     } else if (!Array.isArray(res) || res.length === 0) {
+      // 暂无轮次记录，展示空态
       noData.value = true
       noAgent.value = false
       records.value = []
       data.value = null
     } else {
+      // 有记录时默认展示最新一轮
       records.value = res
       roundIdx.value = 0
       applyRound()
@@ -173,6 +178,7 @@ async function loadData() {
   }
 }
 
+// 挂载时加载一次最新轮次数据
 onMounted(loadData)
 </script>
 

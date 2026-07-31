@@ -206,6 +206,7 @@ const calendarEvents = computed(() => newsItems.value.filter(n => n.source === '
 function ipoCountdown(c) {
   const ds = c.listing_date || c.ipo_date
   if (!ds) return c.list_status === 'L' ? '已上市' : '即将上市'
+  // 解析 YYYYMMDD 日期并计算与今天的相差天数
   const t = new Date(+ds.slice(0,4), +ds.slice(4,6)-1, +ds.slice(6,8))
   const diff = Math.ceil((t - Date.now()) / 86400000)
   if (diff > 0) return `${diff}天后`
@@ -225,26 +226,33 @@ function alertLevelClass(level) {
 
 /** 并发加载所有仪表盘数据（6个接口） */
 async function load() {
+  // 并发拉取 6 个数据源，单个失败不阻塞整体
   const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes] = await Promise.allSettled([
     api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(), api.fetchHotSnapshot(), api.fetchIPOCalendar()
   ])
   if (sigRes.status === 'fulfilled' && Array.isArray(sigRes.value)) {
+    // 写入策略信号列表
     signals.value = sigRes.value
   }
   if (stRes.status === 'fulfilled' && stRes.value) {
+    // 写入服务端状态
     status.value = stRes.value
   }
   if (newsRes.status === 'fulfilled' && Array.isArray(newsRes.value)) {
+    // 写入资讯与日历事件
     newsItems.value = newsRes.value
   }
   if (secRes.status === 'fulfilled' && Array.isArray(secRes.value)) {
+    // 写入热门板块
     hotSectors.value = secRes.value
   }
   if (snapRes.status === 'fulfilled' && Array.isArray(snapRes.value) && snapRes.value.length) {
+    // 写入热门个股快照并记录更新时间
     snapshotStocks.value = snapRes.value
     snapshotTime.value = new Date().toLocaleTimeString()
   }
   if (ipoRes.status === 'fulfilled' && Array.isArray(ipoRes.value)) {
+    // 写入 IPO 日历
     ipoCalendar.value = ipoRes.value
   }
 }
@@ -252,6 +260,7 @@ async function load() {
 /** SSE 消息触发重新加载 */
 function handleSSE(msg) {
   if (msg && typeof msg === 'object') {
+    // 收到 SSE 推送即刷新全部数据
     load()
   }
 }
@@ -259,12 +268,15 @@ function handleSSE(msg) {
 /** 挂载时首次加载并启动 2 秒定时轮询 + SSE */
 onMounted(() => {
   load()
+  // 每 2 秒轮询刷新一次行情
   timer = setInterval(load, 2000)
+  // 订阅后端 SSE 事件
   api.connectSSE()
   sseUnsub = api.onSSE(handleSSE)
 })
 /** 卸载时清理定时器和 SSE 订阅 */
 onUnmounted(() => {
+  // 清理定时器与订阅，避免泄漏
   if (timer) clearInterval(timer)
   if (sseUnsub) sseUnsub()
 })

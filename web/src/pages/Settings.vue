@@ -115,6 +115,7 @@ const llmMsgType = ref('ok')
 
 /** 保存服务器地址到 localStorage */
 function saveServer() {
+  // 持久化服务器地址
   api.setStoredServer(serverUrl.value)
   alert('服务器地址已保存')
 }
@@ -124,6 +125,7 @@ function requestNotify() {
   if ('Notification' in window) {
     Notification.requestPermission().then(perm => {
       if (perm === 'granted') {
+        // 授权通过则弹出测试通知
         new Notification('量仔期货', { body: '通知授权成功' })
         alert('通知授权成功')
       } else {
@@ -138,10 +140,12 @@ function requestNotify() {
 /** 播放测试提示音（660Hz 正弦波，200ms） */
 function playTest() {
   try {
+    // 创建音频上下文并组装振荡器/音量链路
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
     const osc = ctx.createOscillator()
     const gain = ctx.createGain()
     osc.connect(gain); gain.connect(ctx.destination)
+    // 设定频率与音量后播放 200ms
     osc.frequency.value = 660; osc.type = 'sine'
     gain.gain.value = 0.1; osc.start(); osc.stop(ctx.currentTime + 0.2)
   } catch (_) {}
@@ -149,14 +153,18 @@ function playTest() {
 
 /** 保存 LLM 配置到后端 */
 async function saveLLM() {
+  // 进入保存中状态并清空上次反馈
   llmSaving.value = true
   llmMsg.value = ''
   try {
+    // 调用后端接口保存 LLM 配置
     await api.setLLMConfig({ api_key: llmApiKey.value, api_url: llmApiUrl.value, model: llmModel.value })
+    // 依据是否填写 Key 判断配置是否生效
     llmConfigured.value = !!llmApiKey.value
     llmMsg.value = 'LLM 配置已保存，重启后端生效'
     llmMsgType.value = 'ok'
   } catch (e) {
+    // 保存失败时展示错误信息
     llmMsg.value = '保存失败: ' + (e.message || '未知错误')
     llmMsgType.value = 'err'
   }
@@ -166,10 +174,12 @@ async function saveLLM() {
 /** 挂载时加载服务连接状态和 LLM 现有配置 */
 onMounted(async () => {
   try {
+    // 探测后端服务是否在线
     const st = await api.fetchStatus()
     serverOnline.value = true
   } catch (_) { serverOnline.value = false }
   try {
+    // 拉取已保存的 LLM 配置并回填表单
     const cfg = await api.fetchLLMConfig()
     if (cfg) {
       llmApiUrl.value = cfg.api_url || ''

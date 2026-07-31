@@ -135,6 +135,7 @@ let unsubSSE = null
 /** 弹出 Toast 消息，3 秒后自动消失 */
 function addToast(msg, type = 'info') {
   toasts.value.push({ msg, type })
+  // 3 秒后从队列移除最旧的消息
   setTimeout(() => { toasts.value.shift() }, 3000)
 }
 
@@ -149,9 +150,11 @@ async function testNotify() {
 /** 切换做空开关，失败时回滚 UI 状态 */
 async function onShortToggle() {
   try {
+    // 调用后端接口切换做空开关
     const res = await api.toggleShort(shortEnabled.value)
     addToast(res.short_enabled ? '做空已开启' : '做空已关闭', 'info')
   } catch (_) {
+    // 失败时回滚开关状态并提示
     shortEnabled.value = !shortEnabled.value
     addToast('做空开关切换失败', 'err')
   }
@@ -160,6 +163,7 @@ async function onShortToggle() {
 /** 检查本地 token 是否存在，恢复登录态 */
 async function checkAuth() {
   if (api.isLoggedIn()) {
+    // 本地已有登录态则直接恢复界面
     loggedIn.value = true
     account.value = api.getAccount()
     api.setStoredServer(serverUrl.value)
@@ -175,9 +179,11 @@ async function handleLogin() {
   loginError.value = ''
   api.setStoredServer(serverUrl.value)
   try {
+    // 提交登录凭据到后端
     await api.login(username.value, password.value)
     account.value = api.getAccount()
     loggedIn.value = true
+    // 登录成功后启动轮询，并顺带请求通知权限
     startPolling()
     addToast('登录成功', 'success')
     if ('Notification' in window && Notification.permission === 'default') {
@@ -192,6 +198,7 @@ async function handleLogin() {
 
 /** 退出登录：清除数据并停止轮询 */
 function logout() {
+  // 清除认证并停止后台任务
   api.clearAuth()
   stopPolling()
   loggedIn.value = false
@@ -202,16 +209,19 @@ function logout() {
 /** 刷新服务端状态、信号数、提醒数和做空状态 */
 async function refreshStatus() {
   try {
+    // 拉取服务状态与信号数
     const st = await api.fetchStatus()
     serverOnline.value = true
     signalCount.value = st.signal_count || 0
     inTradeTime.value = st.in_trade_time
   } catch (_) { serverOnline.value = false }
   try {
+    // 拉取未读提醒数
     const alerts = await api.fetchAlerts()
     alertCount.value = alerts?.length || 0
   } catch (_) {}
   try {
+    // 拉取做空开关状态
     const ss = await api.fetchShortStatus()
     shortEnabled.value = ss.short_enabled || false
   } catch (_) {}
@@ -220,6 +230,7 @@ async function refreshStatus() {
 /** SSE 消息处理器：新信号时弹 Toast 并刷新状态 */
 function handleSSE(msg) {
   if (msg.signal) {
+    // 新信号到来时弹 Toast 并刷新状态栏
     addToast('新信号: ' + (msg.signal.code || ''), 'warning')
     refreshStatus()
   }
@@ -227,14 +238,17 @@ function handleSSE(msg) {
 
 /** 启动定时轮询和 SSE 连接 */
 function startPolling() {
+  // 立即刷新一次，随后每 15 秒轮询
   refreshStatus()
   statusTimer = setInterval(refreshStatus, 15000)
+  // 订阅后端 SSE 推送
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
 }
 
 /** 停止定时轮询并断开 SSE */
 function stopPolling() {
+  // 清除轮询定时器并断开 SSE 连接
   if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
   api.disconnectSSE()
   if (unsubSSE) { unsubSSE(); unsubSSE = null }
@@ -242,6 +256,7 @@ function stopPolling() {
 
 /** 挂载时检查登录态，已登录则开始轮询 */
 onMounted(async () => {
+  // 恢复登录态，成功则启动后台任务
   const ok = await checkAuth()
   if (ok) startPolling()
 })

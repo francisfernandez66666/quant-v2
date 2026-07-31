@@ -7,6 +7,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// CheckExit 判断龙回头策略是否触发退出信号。
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
@@ -76,4 +77,5 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strat
 	return nil
 }
 
+// NeedUpdateHighest 龙回头策略需要更新最高价。
 func NeedUpdateHighest() bool { return true }

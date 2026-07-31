@@ -144,8 +144,18 @@ func (t *fixtureTransport) emClist(req *http.Request) (*http.Response, error) {
 	}
 
 	if strings.Contains(fs, "m:90") {
+		// 东财行业板块行情列表：diff 为 map[string]sectorRawItem（f3 千分位基点）。
+		items := make(map[string]interface{})
+		for i, s := range t.fix.EMBoardList {
+			items[strconv.Itoa(i)] = map[string]interface{}{
+				"f12": s.Code, "f14": s.Name,
+				"f3": s.ChangePct * 100,
+				"f20": s.Amount, "f62": s.NetInflow,
+				"f104": s.VolumeRank, "f105": s.LimitupCnt,
+			}
+		}
 		return t.json(map[string]interface{}{
-			"data": map[string]interface{}{"total": 0, "diff": map[string]interface{}{}},
+			"data": map[string]interface{}{"total": len(items), "diff": items},
 		})
 	}
 
@@ -293,10 +303,17 @@ func (t *fixtureTransport) clsNews(req *http.Request) (*http.Response, error) {
 	})
 }
 
-// sinaNews 新浪滚动新闻：e2e 场景新闻已 ≥20 条，兜底源返回空。
+// sinaNews 新浪滚动新闻：真实格式重放（兜底源解析验证；主场景由 THS+CLS 提供）。
 func (t *fixtureTransport) sinaNews(req *http.Request) (*http.Response, error) {
+	data := make([]map[string]interface{}, 0, len(t.fix.News["sina"]))
+	for _, n := range t.fix.News["sina"] {
+		data = append(data, map[string]interface{}{
+			"title": n.Title, "content": n.Content,
+			"show_time": n.Datetime, "url": n.URL, "ctime": "",
+		})
+	}
 	return t.json(map[string]interface{}{
-		"result": map[string]interface{}{"data": []interface{}{}},
+		"result": map[string]interface{}{"data": data},
 	})
 }
 

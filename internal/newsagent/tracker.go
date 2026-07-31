@@ -58,6 +58,7 @@ func titleHash(title string) string {
 	return fmt.Sprintf("%x", h[:8])
 }
 
+// IsSeen 判断标题是否已处理过。
 func (t *tracker) IsSeen(title string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -65,12 +66,14 @@ func (t *tracker) IsSeen(title string) bool {
 	return ok
 }
 
+// MarkSeen 记录标题已处理及对应时间。
 func (t *tracker) MarkSeen(title, datetime string) {
 	t.mu.Lock()
 	t.data.SeenTitles[titleHash(title)] = datetime
 	t.mu.Unlock()
 }
 
+// BulkMarkSeen 批量记录标题已处理。
 func (t *tracker) BulkMarkSeen(titles []string, datetimes []string) {
 	t.mu.Lock()
 	for i := range titles {
@@ -81,12 +84,14 @@ func (t *tracker) BulkMarkSeen(titles []string, datetimes []string) {
 	t.mu.Unlock()
 }
 
+// LastSync 返回指定来源最近同步时间。
 func (t *tracker) LastSync(source string) string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.data.LastSync[source]
 }
 
+// SetLastSync 记录指定来源的同步时间。
 func (t *tracker) SetLastSync(source, datetime string) {
 	t.mu.Lock()
 	t.data.LastSync[source] = datetime

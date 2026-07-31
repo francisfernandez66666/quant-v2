@@ -14,6 +14,7 @@ import (
 	"quant-trading-v2/internal/llm"
 )
 
+// Agent 新闻智能体：拉取、分析并持久化新闻事件。
 type Agent struct {
 	marketAPI  *data.MarketAPI
 	llmClient  *llm.Client
@@ -23,8 +24,10 @@ type Agent struct {
 	newsDBPath string
 }
 
+// SetLLMClient 设置 LLM 客户端。
 func (a *Agent) SetLLMClient(c *llm.Client) { a.llmClient = c }
 
+// New 创建新闻智能体实例。
 func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCleaner, dataDir string) *Agent {
 	return &Agent{
 		marketAPI:  marketAPI,
@@ -36,11 +39,13 @@ func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCl
 	}
 }
 
+// Start 启动新闻智能体。
 func (a *Agent) Start() error {
 	log.Printf("[newsagent] 已启动, tracker=%s", a.tracker.filePath)
 	return nil
 }
 
+// Stop 停止新闻智能体并保存记账数据。
 func (a *Agent) Stop() error {
 	return a.tracker.save()
 }
