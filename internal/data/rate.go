@@ -25,7 +25,14 @@ func NewRateLimiter(name string, ratePerSec, burst float64) *RateLimiter {
 	}
 }
 
+// DisableAll 置 true 时所有限流器 Wait() 直接返回。
+// 仅供测试使用（e2e/mock 网络下避免被限流拖慢）。
+var DisableAll bool
+
 func (rl *RateLimiter) Wait() {
+	if DisableAll {
+		return
+	}
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 

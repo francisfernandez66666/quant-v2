@@ -86,6 +86,11 @@ func NewMarketAPI() *MarketAPI {
 	}
 }
 
+// SetTransport 替换底层 HTTP Transport（测试注入 mock 网络，不影响限流与缓存逻辑）。
+func (m *MarketAPI) SetTransport(rt http.RoundTripper) {
+	m.client.Transport = rt
+}
+
 // getWithHeaders 发起带浏览器头部模拟的 GET 请求。
 // 解决东财 CDN 对无头请求的 geo-block / anti-crawler 封锁。
 func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) {

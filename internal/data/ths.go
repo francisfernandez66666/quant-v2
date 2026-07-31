@@ -41,6 +41,11 @@ func NewTHSClient() *THSClient {
 	}
 }
 
+// SetTransport 替换底层 HTTP Transport（测试注入 mock 网络）。
+func (tc *THSClient) SetTransport(rt http.RoundTripper) {
+	tc.client.Transport = rt
+}
+
 // getWithHeaders 发起带浏览器头部模拟的 GET 请求。
 func (tc *THSClient) getWithHeaders(url string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", url, nil)
@@ -59,6 +64,22 @@ func (tc *THSClient) getWithHeaders(url string) (*http.Response, error) {
 // 或:   <a href=".../thshy/detail/code/{code}/" target="_blank">{name}</a>
 // code 为纯数字，name 为板块中文名。
 var boardLinkRe = regexp.MustCompile(`/(?:gn|thshy)/detail/code/(\d+)/"\s*target="_blank">([^<]+)`)
+
+// GetBoardListRaw 返回同花顺板块页解码后的原始 HTML（行业+概念），供测试 fixture 抓取。
+func (tc *THSClient) GetBoardListRaw() (map[string]string, error) {
+	ind, err := tc.fetchDecoded("https://q.10jqka.com.cn/thshy/")
+	if err != nil {
+		return nil, err
+	}
+	con, err := tc.fetchDecoded("https://q.10jqka.com.cn/gn/")
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{
+		"https://q.10jqka.com.cn/thshy/": ind,
+		"https://q.10jqka.com.cn/gn/":    con,
+	}, nil
+}
 
 // GetBoardList 获取同花顺行业+概念板块合并列表。
 // 数据来源：
