@@ -1,3 +1,4 @@
+// 实时触发引擎单元测试：覆盖滑动窗口差分计算、触发判定与冷却抑制行为。
 package trigger
 
 import (
@@ -7,6 +8,8 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
+// TestAdvanceWindow 验证窗口推进逻辑：首个 tick 仅初始化，6 秒后应计算出正确的
+// 秒均涨幅（约 0.333%/s）与秒均成交额（约 33.3 万）。
 func TestAdvanceWindow(t *testing.T) {
 	e := New(nil, nil, DefaultConfig())
 	now := time.Now()
@@ -30,6 +33,8 @@ func TestAdvanceWindow(t *testing.T) {
 	}
 }
 
+// TestCheckTriggers 验证 check 全流程：两帧快照（首帧初始化 + 第二帧放量急拉）
+// 应把该股票加入监控状态集。
 func TestCheckTriggers(t *testing.T) {
 	e := New(nil, nil, DefaultConfig())
 	now := time.Now()
@@ -46,6 +51,7 @@ func TestCheckTriggers(t *testing.T) {
 	}
 }
 
+// TestCooldownSuppresses 验证冷却机制：股票触发后处于冷却期内，再次急拉应被跳过（advance 返回 nil）。
 func TestCooldownSuppresses(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Cooldown = 10 * time.Minute

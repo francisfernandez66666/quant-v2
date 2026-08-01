@@ -12,8 +12,8 @@ import (
 // 采用发布-订阅模式管理客户端连接，支持广播消息到所有订阅者。
 // 非阻塞发送：客户端消费不及时不会阻塞其他客户端。
 type SSEBroker struct {
-	mu      sync.RWMutex
-	clients map[chan []byte]struct{}
+	mu      sync.RWMutex             // 保护 clients 映射的读写锁
+	clients map[chan []byte]struct{} // 订阅客户端集合，channel 为每个客户端的数据通道
 }
 
 // NewSSEBroker 创建 SSEBroker 实例，初始化客户端映射表。

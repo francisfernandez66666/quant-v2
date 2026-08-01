@@ -13,38 +13,38 @@ import (
 
 // LimitUpStock 涨停池中的单只股票。
 type LimitUpStock struct {
-	Code       string  `json:"code"`       // 股票代码
-	Name       string  `json:"name"`       // 股票名称
-	Price      float64 `json:"price"`      // 最新价（元）
-	ChangePct  float64 `json:"change_pct"` // 涨跌幅（%）
-	Amount     float64 `json:"amount"`     // 成交额（元）
-	FlowMCap   float64 `json:"flow_mcap"`  // 流通市值（元）
-	Turnover   float64 `json:"turnover"`   // 换手率（%）
-	LianBan    int     `json:"lian_ban"`   // 连板数
-	FirstSeal  string  `json:"first_seal"` // 首次封板时间（HH:MM）
-	SealAmt    float64 `json:"seal_amt"`   // 封单资金（元）
-	SealRatio  float64 `json:"seal_ratio"` // 封单/流通市值（%）
+	Code       string  `json:"code"`        // 股票代码
+	Name       string  `json:"name"`        // 股票名称
+	Price      float64 `json:"price"`       // 最新价（元）
+	ChangePct  float64 `json:"change_pct"`  // 涨跌幅（%）
+	Amount     float64 `json:"amount"`      // 成交额（元）
+	FlowMCap   float64 `json:"flow_mcap"`   // 流通市值（元）
+	Turnover   float64 `json:"turnover"`    // 换手率（%）
+	LianBan    int     `json:"lian_ban"`    // 连板数
+	FirstSeal  string  `json:"first_seal"`  // 首次封板时间（HH:MM）
+	SealAmt    float64 `json:"seal_amt"`    // 封单资金（元）
+	SealRatio  float64 `json:"seal_ratio"`  // 封单/流通市值（%）
 	BreakCount int     `json:"break_count"` // 炸板次数
-	Industry   string  `json:"industry"`   // 所属行业
-	UpDays     int     `json:"up_days"`    // 近期涨停天数
-	LimitType  string  `json:"limit_type"` // 涨停原因分类（由分析层填充）
+	Industry   string  `json:"industry"`    // 所属行业
+	UpDays     int     `json:"up_days"`     // 近期涨停天数
+	LimitType  string  `json:"limit_type"`  // 涨停原因分类（由分析层填充）
 }
 
 // LHBItem 龙虎榜单条记录。
 type LHBItem struct {
-	Code       string  `json:"code"`        // 股票代码
-	Name       string  `json:"name"`        // 股票名称
-	Price      float64 `json:"price"`       // 收盘价
-	ChangePct  float64 `json:"change_pct"`  // 涨跌幅（%）
-	Reason     string  `json:"reason"`      // 上榜原因
-	SeatInfo   string  `json:"seat_info"`   // 席位说明（如"2家机构买入"）
-	NetAmt     float64 `json:"net_amt"`     // 净买入额（元）
-	BuyAmt     float64 `json:"buy_amt"`     // 买入额（元）
-	SellAmt    float64 `json:"sell_amt"`    // 卖出额（元）
-	BuySeat    int     `json:"buy_seat"`    // 买入席位数
-	SellSeat   int     `json:"sell_seat"`   // 卖出席位数
-	Turnover   float64 `json:"turnover"`    // 换手率（%）
-	Institution bool   `json:"institution"` // 是否含机构席位
+	Code        string  `json:"code"`        // 股票代码
+	Name        string  `json:"name"`        // 股票名称
+	Price       float64 `json:"price"`       // 收盘价
+	ChangePct   float64 `json:"change_pct"`  // 涨跌幅（%）
+	Reason      string  `json:"reason"`      // 上榜原因
+	SeatInfo    string  `json:"seat_info"`   // 席位说明（如"2家机构买入"）
+	NetAmt      float64 `json:"net_amt"`     // 净买入额（元）
+	BuyAmt      float64 `json:"buy_amt"`     // 买入额（元）
+	SellAmt     float64 `json:"sell_amt"`    // 卖出额（元）
+	BuySeat     int     `json:"buy_seat"`    // 买入席位数
+	SellSeat    int     `json:"sell_seat"`   // 卖出席位数
+	Turnover    float64 `json:"turnover"`    // 换手率（%）
+	Institution bool    `json:"institution"` // 是否含机构席位
 }
 
 // GetLimitUpPool 获取东财涨停池。date 格式 "2006-01-02"，为空则取当日。
@@ -71,25 +71,28 @@ func (m *MarketAPI) GetLimitUpPool(date string) ([]LimitUpStock, error) {
 type limitUpRaw struct {
 	Data struct {
 		Pool []struct {
-			Code    string  `json:"c"`      // 代码
-			Name    string  `json:"n"`      // 名称
-			Price   float64 `json:"p"`      // 最新价（分）
-			ChangePct float64 `json:"zdp"`  // 涨跌幅（%）
-			Amount  float64 `json:"amount"` // 成交额（元）
-			FlowMCap float64 `json:"ltsz"`  // 流通市值（元）
-			Turnover float64 `json:"hs"`    // 换手率（%）
-			LianBan int     `json:"lbc"`    // 连板数
-			FirstSeal int   `json:"fbt"`    // 首次封板时间 HHMMSS
-			SealAmt float64 `json:"fund"`   // 封单资金（元）
-			BreakCount int `json:"zbc"`     // 炸板次数
-			Industry string `json:"hybk"`   // 行业
-			ZTJ     struct {
+			Code       string  `json:"c"`      // 代码
+			Name       string  `json:"n"`      // 名称
+			Price      float64 `json:"p"`      // 最新价（分）
+			ChangePct  float64 `json:"zdp"`    // 涨跌幅（%）
+			Amount     float64 `json:"amount"` // 成交额（元）
+			FlowMCap   float64 `json:"ltsz"`   // 流通市值（元）
+			Turnover   float64 `json:"hs"`     // 换手率（%）
+			LianBan    int     `json:"lbc"`    // 连板数
+			FirstSeal  int     `json:"fbt"`    // 首次封板时间 HHMMSS
+			SealAmt    float64 `json:"fund"`   // 封单资金（元）
+			BreakCount int     `json:"zbc"`    // 炸板次数
+			Industry   string  `json:"hybk"`   // 行业
+			ZTJ        struct {
 				Days int `json:"days"` // 近期涨停天数
 			} `json:"zttj"`
 		} `json:"pool"`
 	} `json:"data"`
 }
 
+// parseLimitUpPool 解析东财涨停池 JSON。
+// 价格字段 p 单位为分需 ÷100；首次封板时间 fbt 为 HHMMSS 整数转 "HH:MM"。
+// 封单占比 SealRatio 由封单资金与流通市值计算得出。
 func parseLimitUpPool(body []byte) ([]LimitUpStock, error) {
 	var raw limitUpRaw
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -157,23 +160,26 @@ func (m *MarketAPI) GetLHBData(date string) ([]LHBItem, error) {
 	return parseLHB(body)
 }
 
+// parseLHB 解析东财龙虎榜 JSON。
+// 席位字段 BUY_SEAT/SELL_SEAT 为 float64，转换为 int；
+// Institution 通过检查席位说明是否含"机构"关键字标记。
 func parseLHB(body []byte) ([]LHBItem, error) {
 	var raw struct {
 		Success bool `json:"success"`
 		Result  *struct {
 			Data []struct {
-				Code       string  `json:"SECURITY_CODE"`
-				Name       string  `json:"SECURITY_NAME_ABBR"`
-				Price      float64 `json:"CLOSE_PRICE"`
-				ChangePct  float64 `json:"CHANGE_RATE"`
-				Reason     string  `json:"EXPLANATION"`
-				SeatInfo   string  `json:"EXPLAIN"`
-				NetAmt     float64 `json:"BILLBOARD_NET_AMT"`
-				BuyAmt     float64 `json:"BILLBOARD_BUY_AMT"`
-				SellAmt    float64 `json:"BILLBOARD_SELL_AMT"`
-				BuySeat    float64 `json:"BUY_SEAT"`
-				SellSeat   float64 `json:"SELL_SEAT"`
-				Turnover   float64 `json:"TURNOVERRATE"`
+				Code      string  `json:"SECURITY_CODE"`
+				Name      string  `json:"SECURITY_NAME_ABBR"`
+				Price     float64 `json:"CLOSE_PRICE"`
+				ChangePct float64 `json:"CHANGE_RATE"`
+				Reason    string  `json:"EXPLANATION"`
+				SeatInfo  string  `json:"EXPLAIN"`
+				NetAmt    float64 `json:"BILLBOARD_NET_AMT"`
+				BuyAmt    float64 `json:"BILLBOARD_BUY_AMT"`
+				SellAmt   float64 `json:"BILLBOARD_SELL_AMT"`
+				BuySeat   float64 `json:"BUY_SEAT"`
+				SellSeat  float64 `json:"SELL_SEAT"`
+				Turnover  float64 `json:"TURNOVERRATE"`
 			} `json:"data"`
 		} `json:"result"`
 	}

@@ -1,3 +1,5 @@
+// 本文件：事件聚合相关单元测试——事件聚簇去重（clusterEvents）、重复事件时间衰减（applyEventDecay）
+// 与字符串切片合并（mergeStr）的正确性验证。
 package engine
 
 import (
@@ -8,6 +10,7 @@ import (
 	"quant-trading-v2/internal/newsagent"
 )
 
+// TestClusterEvents 验证同板块同方向事件被合并为单条：Score 取 |score| 最大者，RelatedStocks 去重合并。
 func TestClusterEvents(t *testing.T) {
 	events := []newsagent.NewsEvent{
 		{Title: "半导体政策利好1", Sectors: []string{"半导体"}, Score: 0.6, Direction: "利好", RelatedStocks: []string{"600001"}},
@@ -36,6 +39,8 @@ func TestClusterEvents(t *testing.T) {
 	}
 }
 
+// TestApplyEventDecay 验证重复事件衰减规则：首次不衰减；4 小时后同板块同方向事件 score ×0.5；
+// 个股级事件不参与衰减。
 func TestApplyEventDecay(t *testing.T) {
 	e := &Engine{sectorEventTimes: make(map[string]time.Time)}
 	events := []newsagent.NewsEvent{
@@ -62,6 +67,7 @@ func TestApplyEventDecay(t *testing.T) {
 	}
 }
 
+// TestMergeStr 验证字符串切片合并：去重且保持首次出现顺序。
 func TestMergeStr(t *testing.T) {
 	got := mergeStr([]string{"600001", "600002"}, []string{"600002", "600003"})
 	want := []string{"600001", "600002", "600003"}

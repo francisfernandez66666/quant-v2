@@ -1,3 +1,6 @@
+// Package data — 令牌桶限流器。
+// 按数据源分别定义限流速率（东财 3/s、新浪 30/s、同花顺 8/s 等），
+// 所有对外 API 请求前调用 Wait() 阻塞取令牌，防止触发反爬封禁。
 package data
 
 import (
@@ -8,12 +11,12 @@ import (
 
 // RateLimiter 令牌桶限流器。
 type RateLimiter struct {
-	mu     sync.Mutex
-	tokens float64
-	rate   float64
-	burst  float64
-	last   time.Time
-	name   string
+	mu     sync.Mutex // 保护令牌计数
+	tokens float64    // 当前可用令牌数
+	rate   float64    // 每秒补充速率
+	burst  float64    // 桶容量（最大突发）
+	last   time.Time  // 上次补充时间
+	name   string     // 限流器名称（日志标识）
 }
 
 // NewRateLimiter 创建指定速率的限流器。
@@ -42,11 +45,13 @@ func (rl *RateLimiter) Wait() {
 	now := time.Now()
 	elapsed := now.Sub(rl.last).Seconds()
 	rl.last = now
+	// 按流逝时间补充令牌，超过桶容量则截断
 	rl.tokens += elapsed * rl.rate
 	if rl.tokens > rl.burst {
 		rl.tokens = rl.burst
 	}
 	if rl.tokens < 1 {
+		// 令牌不足：计算缺口所需等待时间并阻塞，随后清零
 		wait := time.Duration((1 - rl.tokens) / rl.rate * float64(time.Second))
 		log.Printf("[rate] %s 限流等待 %v", rl.name, wait)
 		time.Sleep(wait)

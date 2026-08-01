@@ -1,3 +1,8 @@
+// Package data — 多数据源调度与熔断协调层。
+// 统一封装东方财富(MarketAPI)与同花顺(THSClient)的调度策略：
+//   - 行情：新浪 → 同花顺 → 东财 三级降级链，同花顺失败自动熔断 60s；
+//   - 板块/IPO：同花顺 → 东财，带 30s/60s TTL 缓存；
+//   - 新闻：同花顺(主) → 新浪(兜底) 去重合并。
 package data
 
 import (
@@ -17,19 +22,20 @@ type DataCoordinator struct {
 
 	mu sync.RWMutex
 
-	thsDeadline time.Time
+	thsDeadline time.Time // 同花顺熔断截止时间（失败后 60s 内不再尝试）
 
-	sectorCache      []SectorInfo
-	sectorCacheAt    time.Time
-	sectorStockCache map[string]cachedSectorStocks
+	sectorCache      []SectorInfo                  // 板块列表缓存
+	sectorCacheAt    time.Time                     // 板块缓存写入时间（30s TTL）
+	sectorStockCache map[string]cachedSectorStocks // 板块成分股缓存（60s TTL）
 
-	ipoCache   []IPOEvent
-	ipoCacheAt time.Time
+	ipoCache   []IPOEvent // 新股日历缓存
+	ipoCacheAt time.Time  // 新股日历缓存写入时间（5min TTL）
 }
 
+// cachedSectorStocks 板块成分股缓存条目。
 type cachedSectorStocks struct {
-	stocks []StockInfo
-	at     time.Time
+	stocks []StockInfo // 缓存的成分股列表
+	at     time.Time   // 缓存写入时间（用于判断是否过期）
 }
 
 // NewDataCoordinator 创建数据协调器实例。
@@ -70,6 +76,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 		log.Printf("东财行情失败 (%s): %v", code, emErr)
 	}
 
+	// 三级源全部失败，兜底返回新浪的错误信息（优先级最高的源）
 	return si, err
 }
 
@@ -117,6 +124,8 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 
 	if len(thsSectors) > 0 {
 		if len(s) > 0 {
+			// 合并策略：同花顺提供板块清单结构，东财提供实时行情数据
+			// 1) 按代码/名称匹配同花顺板块，回填东财的涨跌幅/成交额/净流入/涨停家数
 			emByCode := make(map[string]SectorInfo, len(s))
 			emByName := make(map[string]SectorInfo, len(s))
 			for _, em := range s {
@@ -141,6 +150,7 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 			for _, t := range thsSectors {
 				thsNames[t.Name] = true
 			}
+			// 2) 东财独有的板块（同花顺无此代码且无此名称）追加到末尾，保证板块覆盖面
 			for _, em := range s {
 				if !used[em.Code] && !thsNames[em.Name] {
 					thsSectors = append(thsSectors, em)
@@ -279,6 +289,8 @@ func (dc *DataCoordinator) GetHotNews(pageSize int) []NewsItem {
 	return all
 }
 
+// truncateStr 将字符串按 rune 截断到 maxLen 长度（保留中文字符完整性）。
+// 用于新闻标题去重的归一化 key 生成。
 func truncateStr(s string, maxLen int) string {
 	runes := []rune(s)
 	if len(runes) > maxLen {
@@ -309,6 +321,8 @@ func (dc *DataCoordinator) RefreshIPOCalendar() {
 	}
 }
 
+// enrichIPOSector 为新股日历事件补充所属行业板块。
+// 逐条调用东财行业查询接口（GetStockIndustry），缺失行业的事件保留空值。
 func (dc *DataCoordinator) enrichIPOSector(list []IPOEvent) {
 	if dc.eastMoney == nil {
 		return

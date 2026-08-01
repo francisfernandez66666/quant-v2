@@ -14,10 +14,10 @@ import (
 // 维护名称↔代码的双向映射表，支持各种输入格式（纯代码、带交易所前缀、带点号后缀等）。
 // 线程安全（使用 sync.RWMutex 保护映射表）。
 type StockCleaner struct {
-	nameToCode map[string]string
-	codeToName map[string]string
+	nameToCode map[string]string // 名称 → 代码 映射
+	codeToName map[string]string // 代码 → 名称 映射
 	mu         sync.RWMutex
-	api        *MarketAPI
+	api        *MarketAPI // 行情 API，用于映射表为空时重新拉取
 }
 
 // NewStockCleaner 创建 StockCleaner 实例，并立即从 MarketAPI 拉取全量股票列表初始化映射表。
@@ -52,10 +52,10 @@ func (c *StockCleaner) Refresh(marketAPI *MarketAPI) error {
 	return nil
 }
 
-var rePureCode = regexp.MustCompile(`^\d{6}$`)
-var reSHCode = regexp.MustCompile(`^(SH|sh)(\d{6})$`)
-var reSZCode = regexp.MustCompile(`^(SZ|sz)(\d{6})$`)
-var reDotCode = regexp.MustCompile(`^(\d{6})\.(SH|SZ|BJ)$`)
+var rePureCode = regexp.MustCompile(`^\d{6}$`)              // 纯 6 位数字代码，如 "600519"
+var reSHCode = regexp.MustCompile(`^(SH|sh)(\d{6})$`)       // 带沪市前缀，如 "SH600519"/"sh600519"
+var reSZCode = regexp.MustCompile(`^(SZ|sz)(\d{6})$`)       // 带深市前缀，如 "SZ000001"/"sz000001"
+var reDotCode = regexp.MustCompile(`^(\d{6})\.(SH|SZ|BJ)$`) // 带点号交易所后缀，如 "600519.SH"
 
 // normalizeCode 将各种格式的股票代码统一为纯 6 位数字代码。
 // 支持的格式：

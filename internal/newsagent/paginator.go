@@ -10,11 +10,14 @@ import (
 // maxCatchUpPages 最多追回页数（同花顺20条/页 × 25页 = 500条）
 const maxCatchUpPages = 25
 
+// fetchCatchUp 追回未读新闻：多源拉取（同花顺分页 + 财联社 + 新浪兜底），
+// 统一去重并标记为已见，最后并发抓取正文回填。返回去重后的新闻列表。
 func (a *Agent) fetchCatchUp() []data.NewsItem {
 	var all []data.NewsItem
+	// seen 记录本轮已见过的标题（截断到60字符），跨源去重
 	seen := make(map[string]bool)
 
-	// 主源：同花顺（支持分页）
+	// 主源：同花顺（支持分页，追回量大）
 	thsItems := a.fetchTHSPages(seen)
 	all = append(all, thsItems...)
 
@@ -22,13 +25,13 @@ func (a *Agent) fetchCatchUp() []data.NewsItem {
 	clsItems := a.fetchCLSOnce(seen)
 	all = append(all, clsItems...)
 
-	// 兜底：新浪（只1页，去重）
+	// 兜底：新浪（只1页，去重）；仅当主源数量不足时才补充
 	if len(all) < 20 {
 		sinaItems := a.fetchSinaOnce(seen)
 		all = append(all, sinaItems...)
 	}
 
-	// 标记所有追回的新闻为"已见"
+	// 标记所有追回的新闻为"已见"，防止下次轮询重复拉取
 	titles := make([]string, len(all))
 	times := make([]string, len(all))
 	for i, n := range all {
@@ -43,6 +46,8 @@ func (a *Agent) fetchCatchUp() []data.NewsItem {
 	return all
 }
 
+// fetchTHSPages 从同花顺逐页拉取新闻（每页 20 条），只保留未读条目。
+// 当前页全部已读则停止追页，表示已追到上次已见位置。
 func (a *Agent) fetchTHSPages(seen map[string]bool) []data.NewsItem {
 	var all []data.NewsItem
 
@@ -56,6 +61,7 @@ func (a *Agent) fetchTHSPages(seen map[string]bool) []data.NewsItem {
 			break
 		}
 
+		// 页内去重：跳过本轮已见或历史已处理的标题
 		var fresh []data.NewsItem
 		for _, item := range items {
 			key := truncateStr(item.Title, 60)
@@ -73,6 +79,7 @@ func (a *Agent) fetchTHSPages(seen map[string]bool) []data.NewsItem {
 			break
 		}
 
+		// 页间隔，避免对同花顺造成请求压力
 		time.Sleep(200 * time.Millisecond)
 	}
 
@@ -80,6 +87,7 @@ func (a *Agent) fetchTHSPages(seen map[string]bool) []data.NewsItem {
 	return all
 }
 
+// fetchSinaOnce 拉取一页新浪新闻（20 条），去重后返回。
 func (a *Agent) fetchSinaOnce(seen map[string]bool) []data.NewsItem {
 	items, err := a.marketAPI.GetSinaNews(20)
 	if err != nil {
@@ -118,6 +126,7 @@ func (a *Agent) fetchCLSOnce(seen map[string]bool) []data.NewsItem {
 	return fresh
 }
 
+// truncateStr 按字符数截断字符串（最多 maxLen 个字符），用于标题去重键归一。
 func truncateStr(s string, maxLen int) string {
 	runes := []rune(s)
 	if len(runes) > maxLen {

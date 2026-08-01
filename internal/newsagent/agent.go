@@ -16,12 +16,12 @@ import (
 
 // Agent 新闻智能体：拉取、分析并持久化新闻事件。
 type Agent struct {
-	marketAPI  *data.MarketAPI
-	llmClient  *llm.Client
-	cleaner    *data.StockCleaner
-	tracker    *tracker
-	dataDir    string
-	newsDBPath string
+	marketAPI  *data.MarketAPI    // 行情/新闻数据接口：分页拉取新闻、抓取正文、获取 IPO 日历
+	llmClient  *llm.Client        // LLM 客户端：用于 Stage0/1 分类初筛与 Stage2 深度分析
+	cleaner    *data.StockCleaner // 股票清洗器：股票名称/代码归一化为 "名称|代码"
+	tracker    *tracker           // 去重记账器：记录已见标题与来源同步时间，避免重复处理
+	dataDir    string             // 数据目录：存放 news_events.json / news_tracker.json
+	newsDBPath string             // 新闻事件本地持久化文件路径（news_events.json）
 }
 
 // SetLLMClient 设置 LLM 客户端。
@@ -104,10 +104,12 @@ func (a *Agent) BuildIPOEvents() []NewsEvent {
 func (a *Agent) BuildIPOFeedEvents(items []data.NewsItem) []NewsEvent {
 	var out []NewsEvent
 	for _, item := range items {
+		// 兜底时间：新闻缺失发布时间时使用当前时间
 		dt := item.Datetime
 		if dt == "" {
 			dt = time.Now().Format("2006-01-02 15:04:05")
 		}
+		// 直接按固定模板构建"利好"事件，不走 LLM，保证 IPO 类事件稳定产出
 		event := NewsEvent{
 			Title:         item.Title,
 			Content:       item.Content,
@@ -122,6 +124,7 @@ func (a *Agent) BuildIPOFeedEvents(items []data.NewsItem) []NewsEvent {
 			Reason:        "IPO相关新闻（新股申购/上市），按利好直构",
 			RelatedStocks: nil,
 		}
+		// 从标题中尝试提取涉及的个股并清洗，命中不到则保持空关联
 		if a.cleaner != nil {
 			if hits := a.cleaner.FindStocksInText(item.Title); len(hits) > 0 {
 				event.RelatedStocks = hits
@@ -147,17 +150,20 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 	td := data.TradingDayDate(time.Now())
 	existing := a.loadNewsDB()
 
+	// 跨交易日则清空旧事件，重新按新交易日归档
 	if existing.TradingDay != td {
 		existing.TradingDay = td
 		existing.Events = nil
 	}
 
+	// 先建立"已存在标题"索引，用于后续去重（截断标题对比）
 	seen := make(map[string]bool)
 	for _, e := range existing.Events {
 		key := truncTitle(e.Title)
 		seen[key] = true
 	}
 	for _, e := range events {
+		// 取分数绝对值作为过滤依据：低于 0.25 的中性/无价值噪音直接丢弃
 		s := e.Score
 		if s < 0 {
 			s = -s
@@ -165,6 +171,7 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 		if s < 0.25 {
 			continue // 过滤中性/无价值噪音
 		}
+		// 标题级去重：同标题事件仅保留第一条
 		key := truncTitle(e.Title)
 		if !seen[key] {
 			seen[key] = true
@@ -172,6 +179,7 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 		}
 	}
 
+	// 控制单日事件规模，只保留最新的 200 条
 	if len(existing.Events) > 200 {
 		existing.Events = existing.Events[len(existing.Events)-200:]
 	}
@@ -208,10 +216,12 @@ func (a *Agent) buildIPOEvents() []NewsEvent {
 	now := time.Now()
 	td := data.TradingDayDate(now)
 
+	// 跨交易日重置本地缓存，避免旧事件长期占用去重索引
 	existing := a.loadNewsDB()
 	if existing.TradingDay != td {
 		existing.Events = nil
 	}
+	// 建立已有 IPO 事件标题索引（仅统计来源为"IPO日历"的事件）
 	cache := make(map[string]bool)
 	for _, e := range existing.Events {
 		if e.Source == "IPO日历" {
@@ -227,15 +237,17 @@ func (a *Agent) buildIPOEvents() []NewsEvent {
 
 	var out []NewsEvent
 	for _, ipo := range list {
+		// 按上市状态区分标题：L=新股上市，其余默认新股申购
 		status := "新股申购"
 		if ipo.ListStatus == "L" {
 			status = "新股上市"
 		}
 		title := fmt.Sprintf("%s: %s(%s)", status, ipo.Name, ipo.Code)
 		if cache[title] {
-			continue
+			continue // 已存在的事件跳过，避免重复注入
 		}
 
+		// 取上市日期，缺失时回退到申购日期；两者皆无则跳过
 		listing := ipo.ListingDate
 		if listing == "" {
 			listing = ipo.IPODate
@@ -249,7 +261,7 @@ func (a *Agent) buildIPOEvents() []NewsEvent {
 
 		event := NewsEvent{
 			Title:         title,
-			Content:       fmt.Sprintf("expiry=%s", expiry),
+			Content:       fmt.Sprintf("expiry=%s", expiry), // 过期标记，供引擎判断事件是否已失效
 			Datetime:      listing,
 			Source:        "IPO日历",
 			Level:         "个股",

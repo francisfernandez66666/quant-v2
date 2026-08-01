@@ -111,8 +111,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import * as api from '../api/index.js'
+import { ref, onMounted } from 'vue'   // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子
+import * as api from '../api/index.js' // 后端 API 调用封装（获取轮次记录等）
 
 // ── 响应式状态 ──
 const loading = ref(false)        // 是否正在加载

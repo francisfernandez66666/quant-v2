@@ -14,11 +14,11 @@ type VerifiedSector struct {
 	Direction  string   `json:"direction"`
 	Score      float64  `json:"score"`
 	RPSRank    int      `json:"rps_rank,omitempty"`
-	RPS20      float64  `json:"rps20,omitempty"`      // 板块20日RPS（用于龙回头龙性判定）
-	Phase      string   `json:"phase,omitempty"`      // 板块状态：加强/持续/退潮/反弹
-	Flow       float64  `json:"flow,omitempty"`       // 主力净流入(元)
-	ChangePct  float64  `json:"change_pct,omitempty"` // 板块当日涨跌幅(%)
-	LimitupCnt int      `json:"limitup_cnt,omitempty"`// 板块内涨停家数
+	RPS20      float64  `json:"rps20,omitempty"`       // 板块20日RPS（用于龙回头龙性判定）
+	Phase      string   `json:"phase,omitempty"`       // 板块状态：加强/持续/退潮/反弹
+	Flow       float64  `json:"flow,omitempty"`        // 主力净流入(元)
+	ChangePct  float64  `json:"change_pct,omitempty"`  // 板块当日涨跌幅(%)
+	LimitupCnt int      `json:"limitup_cnt,omitempty"` // 板块内涨停家数
 	Stocks     []string `json:"stocks,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
 }
@@ -67,6 +67,7 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 
 	var result []VerifiedSector
 	for _, s := range sectors {
+		// 组装基础信息：方向/分数/涨跌幅/资金流/涨停数，并按状态机推断板块阶段
 		vs := VerifiedSector{
 			Name:       s.Name,
 			Direction:  s.Direction,
@@ -78,6 +79,7 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 			Phase:      classifyPhase(s.ChangePct, s.NetInflow),
 		}
 
+		// RPS 验证：在 RPS 排名榜中定位该板块，补充排名与 20 日 RPS 强度
 		if a.rps != nil {
 			top := a.rps.GetTopSectors()
 			for i, ts := range top {
@@ -89,6 +91,7 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 			}
 		}
 
+		// 成分股验证：按板块代码评分前 10 只成分股，取其代码作为可操作标的
 		if a.scanner != nil {
 			sectorsInfo := a.scanner.FindSectorsByNames([]string{s.Name})
 			if len(sectorsInfo) > 0 {

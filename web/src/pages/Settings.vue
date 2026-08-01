@@ -77,6 +77,27 @@
       <span v-if="llmMsg" :class="['feedback', llmMsgType]">{{ llmMsg }}</span>
     </div>
 
+    <!-- 战法参数配置 -->
+    <div class="setting-card" v-for="group in strategyGroups" :key="group.key">
+      <div class="setting-header">{{ group.title }}</div>
+      <div class="setting-row" v-for="f in group.fields" :key="f.k">
+        <label :title="f.hint || ''">{{ f.label }}</label>
+        <input v-model.number="strategyCfg[group.key][f.k]"
+               :type="f.type || 'number'"
+               :step="f.type === 'number' ? (f.step || 'any') : undefined"
+               placeholder="0" />
+      </div>
+    </div>
+    <div class="setting-card">
+      <div class="setting-header">战法参数</div>
+      <div class="setting-row">
+        <label>说明</label>
+        <span style="font-size:12px;color:#888">参数保存后重启后端生效；权重请保持各策略合计 ≤ 1</span>
+      </div>
+      <button class="btn-save" @click="saveStrategy" :disabled="strategySaving">{{ strategySaving ? '保存中...' : '保存战法参数' }}</button>
+      <span v-if="strategyMsg" :class="['feedback', strategyMsgType]">{{ strategyMsg }}</span>
+    </div>
+
     <!-- 系统信息 -->
     <div class="setting-card">
       <div class="setting-header">系统</div>
@@ -93,25 +114,133 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import * as api from '../api/index.js'
+import { ref, onMounted } from 'vue'   // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子
+import * as api from '../api/index.js' // 后端 API 调用封装（状态、LLM 配置、战法参数等）
 
 // ── 服务器连接 ──
-const serverUrl = ref(api.getStoredServer() || '')
-const serverOnline = ref(false)
+const serverUrl = ref(api.getStoredServer() || '') // 服务器地址（默认取 localStorage 已存值）
+const serverOnline = ref(false)                    // 后端服务是否在线
 
 // ── 账户信息 ──
-const account = ref(api.getAccount())
-const token = ref(localStorage.getItem('liangzai_token') || '')
+const account = ref(api.getAccount())                                  // 当前登录账号
+const token = ref(localStorage.getItem('liangzai_token') || '')        // 登录令牌（仅展示前 20 位）
 
 // ── LLM 配置 ──
-const llmApiUrl = ref('')
-const llmApiKey = ref('')
-const llmModel = ref('')
-const llmConfigured = ref(false)
-const llmSaving = ref(false)
-const llmMsg = ref('')
-const llmMsgType = ref('ok')
+const llmApiUrl = ref('')          // LLM API 地址
+const llmApiKey = ref('')          // LLM API Key（密码框输入）
+const llmModel = ref('')           // LLM 模型名
+const llmConfigured = ref(false)   // LLM 是否已配置（未配置则降级为关键词过滤）
+const llmSaving = ref(false)       // LLM 配置保存中（禁用按钮防重复提交）
+const llmMsg = ref('')             // LLM 配置保存结果反馈文本
+const llmMsgType = ref('ok')       // LLM 反馈类型：'ok' 成功 / 'err' 失败
+
+// ── 战法参数配置 ──
+const strategyCfg = ref({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} }) // 五大战法参数字典，key 对应后端 config.json 分组
+const strategySaving = ref(false)  // 战法参数保存中（禁用按钮防重复提交）
+const strategyMsg = ref('')        // 战法参数保存结果反馈文本
+const strategyMsgType = ref('ok')  // 战法参数反馈类型：'ok' 成功 / 'err' 失败
+
+/** 四个战法的字段定义（key 对应后端 config.json 的 json tag） */
+const strategyGroups = [
+  {
+    key: 'dragon', title: '龙头战法（权重合计≤1）',
+    fields: [
+      { k: 'f1_seal_weight', label: 'F1 首封权重', step: 0.05 },
+      { k: 'f2_resonance_weight', label: 'F2 共振权重', step: 0.05 },
+      { k: 'f3_premium_weight', label: 'F3 溢价权重', step: 0.05 },
+      { k: 'f4_rs_weight', label: 'F4 强度权重', step: 0.05 },
+      { k: 'f3_one_board_discount', label: '一字板折扣', step: 0.1 },
+      { k: 'pullback_max_pct', label: '最大回撤%', step: 0.01 },
+      { k: 'breaker_sell_half_pct', label: '炸板减半%', step: 0.01 },
+      { k: 'breaker_sell_all_pct', label: '炸板清仓%', step: 0.01 },
+      { k: 'buy_pullback_sell_half_pct', label: '买入回撤减半%', step: 0.01 },
+      { k: 'buy_pullback_sell_all_pct', label: '买入回撤清仓%', step: 0.01 },
+      { k: 'buy_day_close_below', label: '买入日收盘低于%', step: 0.01 },
+      { k: 'next_open_if_below', label: '次日开盘低于%', step: 0.01 },
+    ],
+  },
+  {
+    key: 'double_bump', title: '双响炮战法',
+    fields: [
+      { k: 'first_break_volume_multiple', label: '一突量比', step: 0.1 },
+      { k: 'second_break_volume_multiple', label: '二突量比', step: 0.1 },
+      { k: 'big_candle_threshold', label: '大阳线阈值%', step: 0.5 },
+      { k: 'adjust_vol_ratio_max', label: '调整量比上限', step: 0.5 },
+      { k: 'pullback_to_entity_pct', label: '回调至实体%', step: 1 },
+      { k: 'adjust_days_min', label: '最短调整天数', step: 1 },
+      { k: 'adjust_days_max', label: '最长调整天数', step: 1 },
+      { k: 'position_weight', label: '调整深度权重', step: 0.05 },
+      { k: 'ma_weight', label: '均线权重', step: 0.05 },
+      { k: 'sector_weight', label: '板块权重', step: 0.05 },
+      { k: 'volume_weight', label: '量能权重', step: 0.05 },
+      { k: 'first_breakout_position_pct', label: '一突仓位', type: 'text' },
+      { k: 'second_breakout_position_pct', label: '二突仓位', type: 'text' },
+      { k: 'third_breakout_position_mode', label: '三突模式', type: 'text' },
+      { k: 'double_bump_take_profit_pct', label: '止盈%', step: 0.01 },
+    ],
+  },
+  {
+    key: 'n_shape', title: 'N 形战法',
+    fields: [
+      { k: 'n_pattern_score_threshold', label: 'N 形态分阈值', step: 1 },
+      { k: 'n_shape_D1_threshold', label: 'D1 事件阈值', step: 0.05 },
+      { k: 'n_shape_D2_min_full', label: 'D2 满分最低', step: 1 },
+      { k: 'n_shape_D3_over', label: 'D3 超跌阈值', step: 0.05 },
+      { k: 'oversold_pb_ratio', label: '超跌 PB 比', step: 0.05 },
+      { k: 'n_shape_entry_left_pct', label: '左侧入场%', step: 0.05 },
+      { k: 'n_shape_entry_right_pct', label: '右侧入场%', step: 0.05 },
+      { k: 'n_shape_breakout_ratio', label: '突破幅度比', step: 0.05 },
+      { k: 'n_shape_vol_ratio', label: '量比', step: 0.1 },
+      { k: 'n_shape_flag_retreat_pct', label: '旗形回撤%', step: 0.01 },
+      { k: 'n_flag_vol_ratio_max', label: '旗形量比上限', step: 0.1 },
+      { k: 'n_second_break_vol_ratio', label: '二突量比', step: 0.1 },
+      { k: 'n_second_break_macd_red_bars', label: '二突红柱数', step: 1 },
+      { k: 'n_flag_duration_min', label: '旗形最短天数', step: 1 },
+      { k: 'n_flag_duration_max', label: '旗形最长天数', step: 1 },
+      { k: 'n_second_break_time_limit', label: '二突时间限制', type: 'text' },
+      { k: 'hard_stop_loss', label: '硬止损%', step: 0.01 },
+      { k: 'sector_gain_pct_min', label: '板块涨幅下限%', step: 0.1 },
+    ],
+  },
+  {
+    key: 'dragon_return', title: '龙回头战法',
+    fields: [
+      { k: 'min_pullback_pct', label: '最小回调%', step: 0.01 },
+      { k: 'max_pullback_pct', label: '最大回调%', step: 0.01 },
+      { k: 'volume_shrink_ratio', label: '量缩比', step: 0.05 },
+      { k: 'rebound_volume_ratio', label: '反弹量比', step: 0.05 },
+      { k: 'stop_loss_pct', label: '止损%', step: 0.01 },
+      { k: 'take_profit_pct', label: '止盈%', step: 0.01 },
+      { k: 'max_hold_days', label: '最长持仓天数', step: 1 },
+      { k: 'target1_multiplier', label: '目标1倍数', step: 0.05 },
+      { k: 'target2_multiplier', label: '目标2倍数', step: 0.05 },
+      { k: 'trailing_drawback', label: '移动止损回撤%', step: 0.01 },
+    ],
+  },
+  {
+    key: 'momentum', title: '动量分权重（合计建议=100）',
+    fields: [
+      { k: 'volume_price_weight', label: '量价权重', step: 5 },
+      { k: 'macd_weight', label: 'MACD权重', step: 5 },
+      { k: 'trend_weight', label: '走势权重', step: 5 },
+    ],
+  },
+]
+
+/** 保存战法参数到后端并持久化 */
+async function saveStrategy() {
+  strategySaving.value = true
+  strategyMsg.value = ''
+  try {
+    await api.setStrategyConfig(strategyCfg.value)
+    strategyMsg.value = '战法参数已保存，重启后端生效'
+    strategyMsgType.value = 'ok'
+  } catch (e) {
+    strategyMsg.value = '保存失败: ' + (e.message || '未知错误')
+    strategyMsgType.value = 'err'
+  }
+  strategySaving.value = false
+}
 
 /** 保存服务器地址到 localStorage */
 function saveServer() {
@@ -185,6 +314,17 @@ onMounted(async () => {
       llmApiUrl.value = cfg.api_url || ''
       llmModel.value = cfg.model || ''
       llmConfigured.value = !!(cfg.api_key || cfg.api_url)
+    }
+  } catch (_) {}
+  try {
+    // 拉取四战法参数并回填表单
+    const sc = await api.fetchStrategyConfig()
+    if (sc) {
+      strategyCfg.value = { dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} }
+      for (const group of strategyGroups) {
+        const src = sc[group.key]
+        if (src) Object.assign(strategyCfg.value[group.key], src)
+      }
     }
   } catch (_) {}
 })

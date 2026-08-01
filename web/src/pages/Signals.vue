@@ -81,8 +81,8 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import * as api from '../api/index.js'
+import { ref, computed, onMounted, onUnmounted } from 'vue' // Vue 组合式 API：响应式、计算属性与生命周期钩子
+import * as api from '../api/index.js'                      // 后端 API 调用封装（信号列表、操作、SSE 等）
 
 // ── 响应式状态 ──
 const signals = ref([])               // 原始信号列表
@@ -91,8 +91,8 @@ const showConfirm = ref(false)        // 是否显示交易确认弹窗
 const tradeTarget = ref({})           // 待操作的信号对象
 const tradeAction = ref('')           // 操作类型：'buy' | 'ignore'
 
-let timer = null
-let unsubSSE = null
+let timer = null        // 3 秒轮询定时器句柄
+let unsubSSE = null     // SSE 订阅解绑函数（卸载时调用以取消订阅）
 
 // 等级筛选选项
 const filters = [

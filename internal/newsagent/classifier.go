@@ -130,9 +130,9 @@ const combinedBodyLimit = 300
 
 // combinedJudge 合并调用的单条判定结果。
 type combinedJudge struct {
-	Official       bool
-	Material       bool
-	CorrectedTitle string
+	Official       bool   // 是否为官方/权威来源（非机构观点/互动/海外盘面）
+	Material       bool   // 是否有投资参考价值
+	CorrectedTitle string // 标题党校正标题（为空表示标题忠于正文）
 }
 
 // classifyCombined 合并 Stage0 垃圾过滤 + Stage1 价值初筛 + 标题党复核 为单次 LLM 分批调用。
@@ -148,14 +148,17 @@ func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, erro
 		return out, fmt.Errorf("LLM未配置")
 	}
 
+	// 按 llmBatchSize 分块调用，控制单批 prompt 体积避免超时
 	for _, b := range batchBounds(n, llmBatchSize) {
 		start, end := b[0], b[1]
+		// 拼装批内 prompt：序号 + 标题 + 截断后的正文（供标题党复核）
 		var sb strings.Builder
 		for i := start; i < end; i++ {
 			body := truncateRunes(bodies[i], combinedBodyLimit)
 			sb.WriteString(fmt.Sprintf("%d. %s\n正文: %s\n", i-start+1, titles[i], body))
 		}
 
+		// LLM 轮询重试：最多 3 次，间隔随尝试次数递增（2s/4s）
 		var resp string
 		var err error
 		for attempt := 1; attempt <= 3; attempt++ {
@@ -173,17 +176,19 @@ func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, erro
 			return nil, err
 		}
 
+		// 清洗 markdown 围栏后解析 JSON 数组
 		resp = cleanJSON(resp)
 		var raw []struct {
-			Index     int    `json:"index"`
-			Category  string `json:"category"`
-			Material  bool   `json:"material"`
-			Corrected string `json:"corrected_title"`
+			Index     int    `json:"index"`           // LLM 返回的序号（1 起）
+			Category  string `json:"category"`        // official/institution/interactive/overseas
+			Material  bool   `json:"material"`        // 是否有投资参考价值
+			Corrected string `json:"corrected_title"` // 标题党校正标题
 		}
 		if err := json.Unmarshal([]byte(resp), &raw); err != nil {
 			log.Printf("[newsagent] Stage0/1合并 JSON解析失败, 该批%d条归一般(不降级): %v", end-start, err)
 			return nil, err
 		}
+		// 将批内序号映射回全局索引并落盘到结果切片（越界序号安全忽略）
 		for _, r := range raw {
 			if r.Index < 1 || r.Index > end-start {
 				continue
@@ -240,10 +245,12 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 	res.CorrectedTitle = make(map[int]string)
 	for i, item := range items {
 		j := judgements[i]
+		// 规则一：非官方来源（机构观点/互动/海外盘面）直接归一般，仅展示不进引擎
 		if !j.Official {
 			res.GeneralIdx = append(res.GeneralIdx, i)
 			continue
 		}
+		// 规则二：IPO 新闻（新股/申购/上市关键词）直构事件，不走 LLM 深度分析
 		if matchIPOKeywords(item.Title) {
 			res.IpoIdx = append(res.IpoIdx, i)
 			continue
@@ -253,6 +260,7 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 		if len(item.Content) > 0 {
 			text += " " + item.Content
 		}
+		// 规则三：命中已知股票名 → 个股新闻，预填关联股票并视为有投资价值
 		if a.cleaner != nil {
 			if hits := a.cleaner.FindStocksInText(text); len(hits) > 0 {
 				res.StockIdx = append(res.StockIdx, i)
@@ -261,12 +269,14 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 				continue
 			}
 		}
+		// 规则四：标题含行业/宏观关键词 → 板块新闻，须通过 LLM 的 material 价值初筛
 		if matchKeywords(item.Title) {
 			res.SectorIdx = append(res.SectorIdx, i)
 			res.Material[i] = j.Material
 			applyCorrected(&res, i, item.Title, j)
 			continue
 		}
+		// 兜底：其余新闻归一般
 		res.GeneralIdx = append(res.GeneralIdx, i)
 	}
 	log.Printf("[newsagent] Stage0分类(合并): 个股%d 板块%d IPO%d 一般%d (材料通过%d)",
@@ -319,15 +329,18 @@ func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
 		return junk, nil
 	}
 
+	// 分块处理，每批最多 llmBatchSize 条，控制 prompt 体积避免 LLM 超时
 	for _, b := range batchBounds(len(titles), llmBatchSize) {
 		start, end := b[0], b[1]
 		chunk := titles[start:end]
 
+		// 拼装批内标题列表 prompt
 		var sb strings.Builder
 		for i, t := range chunk {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
 		}
 
+		// LLM 轮询重试：最多 3 次，固定间隔 2s
 		var resp string
 		var err error
 		for attempt := 1; attempt <= 3; attempt++ {
@@ -341,6 +354,7 @@ func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
 			}
 		}
 		if err != nil {
+			// 降级策略：LLM 不可用时改用关键词兜底，只剔除明显非官方内容，保证流水线不中断
 			log.Printf("[newsagent] Stage0垃圾过滤 LLM失败, 降级关键词过滤该批%d条: %v", len(chunk), err)
 			for j := start; j < end; j++ {
 				if junkFallback(titles[j]) {
@@ -356,6 +370,7 @@ func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
 			Type  string `json:"type"`
 		}
 		if err := json.Unmarshal([]byte(resp), &raw); err != nil {
+			// JSON 解析失败不降级：整批按非官方处理（宁可误杀不放垃圾）
 			log.Printf("[newsagent] Stage0垃圾过滤JSON解析失败(不降级), 该批%d条归一般: %v", len(chunk), err)
 			for j := start; j < end; j++ {
 				junk[j] = true
@@ -363,6 +378,7 @@ func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
 			continue
 		}
 
+		// 非 official 类型的条目标记为垃圾，序号做越界安全过滤
 		for _, r := range raw {
 			if strings.EqualFold(r.Type, "official") {
 				continue
@@ -395,15 +411,18 @@ func (a *Agent) classifyMaterial(titles []string) ([]int, error) {
 	}
 
 	var valid []int
+	// 分块处理，每批最多 llmBatchSize 条
 	for _, b := range batchBounds(len(titles), llmBatchSize) {
 		start, end := b[0], b[1]
 		chunk := titles[start:end]
 
+		// 拼装批内标题列表 prompt
 		var sb strings.Builder
 		for i, t := range chunk {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
 		}
 
+		// LLM 轮询重试：最多 3 次，固定间隔 2s
 		var resp string
 		var err error
 		for attempt := 1; attempt <= 3; attempt++ {
@@ -417,6 +436,7 @@ func (a *Agent) classifyMaterial(titles []string) ([]int, error) {
 			}
 		}
 		if err != nil {
+			// 该批 LLM 失败：整批视为有价值，避免漏掉重要事件
 			log.Printf("[newsagent] Stage1失败, 该批%d条全部视为有价值: %v", len(chunk), err)
 			for j := start; j < end; j++ {
 				valid = append(valid, j)
@@ -427,6 +447,7 @@ func (a *Agent) classifyMaterial(titles []string) ([]int, error) {
 
 		var indices []int
 		if err := json.Unmarshal([]byte(resp), &indices); err != nil {
+			// JSON 解析失败：同样整批视为有价值
 			log.Printf("[newsagent] Stage1 JSON解析失败, 该批%d条全部视为有价值: %v", len(chunk), err)
 			for j := start; j < end; j++ {
 				valid = append(valid, j)

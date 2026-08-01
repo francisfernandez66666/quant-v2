@@ -73,13 +73,14 @@ func (d *DoubleBumpStrategy) Evaluate(code string, data interface{}) (*strategy.
 //
 // 输入: si（个股信息）、kLines（日K线列表，需 ≥10 根）
 func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []data.KLine) *strategy.Evaluation {
+	// 基础校验：无实时价或 K 线不足 10 根无法评分
 	if si == nil || si.Price <= 0 || len(kLines) < 10 {
 		return nil
 	}
 	cfg := d.cfg.Get()
 	dbc := cfg.Strategy.DoubleBump
 
-	// 计算回看期内均量和均价
+	// 计算回看期内均量和均价（去掉最后一根，作为"第一波"的对比基准）
 	avgVol := 0.0
 	avgClose := 0.0
 	n := len(kLines)
@@ -91,7 +92,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	avgVol /= float64(lookback)
 	avgClose /= float64(lookback)
 
-	// 检测第一波放量突破（近5日内）
+	// 检测第一波放量突破（近5日内）：放量上破 5% 即视为第一波启动
 	firstBreak := false
 	firstBreakVol := 0.0
 	for i := n - 5; i < n; i++ {
@@ -111,6 +112,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 
 	// 第二波确认：最后一根K线量能 > 均量 × SecondBreakVolumeMultiple
+	// 两波放量说明资金持续介入，趋势健康
 	lastVol := kLines[n-1].Volume
 	volScore := 0.0
 	if firstBreakVol > 0 && lastVol > avgVol*dbc.SecondBreakVolumeMultiple {
@@ -118,6 +120,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 
 	// 调整深度评分：振幅 / 均价 < AdjustVolRatioMax×2 说明调整温和
+	// （调整幅度小意味着抛压可控、筹码锁定良好）
 	high := kLines[n-1].High
 	low := kLines[n-1].Low
 	adjustDepth := (high - low) / avgClose * 100
@@ -127,6 +130,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 
 	// 均线趋势：MA5 > MA10 为多头排列
+	// 多头排列给 80%，收盘再站稳 MA5 才给满 100%
 	maScore := 0.0
 	ma5 := movingAvg(kLines, n, 5)
 	ma10 := movingAvg(kLines, n, 10)
@@ -137,6 +141,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		}
 	}
 
+	// 总分封顶 100；≥70 → full_chain（买入），≥50 → brief（观察）
 	total := math.Min(volScore+adjustScore+maScore, 100)
 	pass := total >= 50
 	level := "watch"
@@ -234,6 +239,7 @@ const (
 // 使用最新K线判断：第一波突破 → 第二波突破 → 失效反转。
 // 需要至少 20 根 K 线来计算均线和量能。
 func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpPhase {
+	// K 线不足 20 根时无法计算均量/均线，保守判定为第一波阶段
 	if len(kLines) < 20 {
 		return PhaseFirst
 	}
@@ -241,7 +247,7 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 	dbc := cfg.Strategy.DoubleBump
 	n := len(kLines)
 
-	// 计算 20 日均量和均价
+	// 计算 20 日均量和均价（不含当日）
 	avgVol := 0.0
 	avgClose := 0.0
 	for i := n - 20; i < n-1; i++ {
@@ -251,22 +257,24 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 	avgVol /= 20
 	avgClose /= 20
 
-	// 检测最近是否有放量突破
+	// 当日量价特征（用于阶段判定）
 	lastVol := kLines[n-1].Volume
 	lastClose := kLines[n-1].Close
+	// 放量突破：收盘上破 5% 且成交量超第一波阈值
 	isBreakout := lastClose > avgClose*1.05 && lastVol > avgVol*dbc.FirstBreakVolumeMultiple
 
-	// 检测是否处于调整阶段（缩量）
+	// 缩量调整：成交量低于均量 70%（第二波前的蓄势）
 	isShrink := lastVol < avgVol*0.7
 
-	// 检测是否失效（放量滞涨或破位）
+	// 形态失效：放量滞涨（量超 1.5 倍但收跌）
 	isIDF := lastVol > avgVol*1.5 && lastClose < kLines[n-2].Close
 
+	// 优先判定失效（破坏性事件优先于形态推进）
 	if isIDF {
 		return PhaseIDF
 	}
 	if isBreakout {
-		// 检查之前是否有第一波突破（近 10 日内）
+		// 近 10 日内出现过放量突破 → 本次是第二波；否则是刚启动的第一波
 		for i := n - 10; i < n-1; i++ {
 			if i < 0 {
 				continue
@@ -285,18 +293,19 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 
 // CheckIDFReturn 检查是否出现形态失效后的反转信号。
 // 判断逻辑：最近两根K线收涨且成交量放大，之前有超过 3% 的下跌。
+// 用于在 PhaseIDF 失效后捕捉可能的修复反弹买点。
 func (d *DoubleBumpStrategy) CheckIDFReturn(code string, kLines []data.KLine) bool {
 	if len(kLines) < 5 {
 		return false
 	}
 	n := len(kLines)
 
-	// 检查最近两根 K 线是否收涨
+	// 条件1：最近两根 K 线均收涨（连续两日阳线确认反转力度）
 	if kLines[n-1].Close <= kLines[n-2].Close || kLines[n-2].Close <= kLines[n-3].Close {
 		return false
 	}
 
-	// 检查最近两根 K 线成交量是否放大（大于 20 日均量）
+	// 条件2：最近两根 K 线成交量均放大（大于 20 日均量×1.2，资金回流）
 	avgVol := 0.0
 	for i := n - 20; i < n-2; i++ {
 		if i < 0 {
@@ -310,7 +319,7 @@ func (d *DoubleBumpStrategy) CheckIDFReturn(code string, kLines []data.KLine) bo
 		return false
 	}
 
-	// 检查之前是否有超过 3% 的下跌
+	// 条件3：近期（近 5 日）曾出现单日跌幅 >3% 的深跌（存在超跌修复空间）
 	for i := n - 5; i < n-2; i++ {
 		if i < 1 {
 			continue

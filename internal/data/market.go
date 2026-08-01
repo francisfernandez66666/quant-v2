@@ -61,6 +61,8 @@ type MarketAPI struct {
 // 显著降低前端轮询/多接口下的限流压力（东财 3 req/s）。
 const quoteTTL = 5 * time.Second
 
+// cachedQuote 实时行情缓存条目。
+// si 为缓存的行情快照，at 为缓存写入时间（用于判断是否超过 quoteTTL）。
 type cachedQuote struct {
 	si *StockInfo
 	at time.Time
@@ -106,9 +108,8 @@ func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) 
 	return m.client.Do(req)
 }
 
-// secID 将股票代码转换为东方财富 push2 证券ID格式。
-// 沪市（6/5 开头）加 "1." 前缀，深市加 "0." 前缀。
-// stripSuffix 剥离股票代码的交易所后缀（.SH / .SZ / .BJ）
+// stripSuffix 剥离股票代码的交易所后缀（.SH / .SZ / .BJ）。
+// 如 "600519.SH" → "600519"，用于统一内部代码格式。
 func stripSuffix(code string) string {
 	if len(code) > 3 && code[len(code)-3:] == ".SH" || len(code) > 3 && code[len(code)-3:] == ".SZ" || len(code) > 3 && code[len(code)-3:] == ".BJ" {
 		return code[:len(code)-3]
@@ -116,6 +117,9 @@ func stripSuffix(code string) string {
 	return code
 }
 
+// secID 将股票代码转换为东方财富 push2 证券ID格式。
+// 沪市（6/5 开头）加 "1." 前缀，深市加 "0." 前缀。
+// 东财 secid 形如 "1.600519"（沪）/ "0.000001"（深），是 push2 各接口的通用标识。
 func secID(code string) string {
 	code = stripSuffix(code)
 	if strings.HasPrefix(code, "6") || strings.HasPrefix(code, "5") {
@@ -255,6 +259,8 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 	return sina, nil
 }
 
+// quoteHit 命中返回缓存中的实时行情副本；缓存不存在或已过期（超过 quoteTTL）时返回 nil,false。
+// 返回副本而非原指针，避免调用方修改污染缓存。
 func (m *MarketAPI) quoteHit(code string) (*StockInfo, bool) {
 	m.quoteMu.Lock()
 	defer m.quoteMu.Unlock()
@@ -266,12 +272,16 @@ func (m *MarketAPI) quoteHit(code string) (*StockInfo, bool) {
 	return &cp, true
 }
 
+// quoteStore 将行情快照写入缓存，并记录当前时间。
 func (m *MarketAPI) quoteStore(code string, si *StockInfo) {
 	m.quoteMu.Lock()
 	m.quoteCache[code] = cachedQuote{si: si, at: time.Now()}
 	m.quoteMu.Unlock()
 }
 
+// getEastMoneyQuote 通过东方财富 push2 stock/get 接口拉取单只股票实时行情。
+// 返回的 F43/F44/F45/F46/F60 价格字段单位为分，已 ÷100 转换为元。
+// F50 涨跌幅为百分数（如 1.23 表示 +1.23%），直接使用。
 func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=%s", sid, stockQuoteFields)
@@ -498,6 +508,67 @@ type sinaKLineRaw struct {
 	Close  string `json:"close"`  // 收盘价
 	Volume string `json:"volume"` // 成交量
 	Amount string `json:"amount"` // 成交额
+}
+
+// GetSinaMinuteKLine 获取新浪财经分钟级 K 线。
+// scale 为分钟数（1/5/15/30/60），count 为返回的K线根数。
+// 分钟K线的 day 字段为 "YYYY-MM-DD HH:MM:SS" 格式，解析逻辑与日线不同。
+func (m *MarketAPI) GetSinaMinuteKLine(code string, scale, count int) ([]KLine, error) {
+	prefix := "sh"
+	if !strings.HasPrefix(code, "6") && !strings.HasPrefix(code, "5") {
+		prefix = "sz"
+	}
+	url := fmt.Sprintf("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=%s%s&scale=%d&ma=no&datalen=%d", prefix, code, scale, count)
+	SinaLimiter.Wait()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sina minute kline request: %v", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
+	req.Header.Set("Referer", "https://finance.sina.com.cn")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sina minute kline http: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("sina minute kline read: %v", err)
+	}
+	var raw []sinaKLineRaw
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("sina minute kline json: %v", err)
+	}
+	klines := make([]KLine, 0, len(raw))
+	for _, r := range raw {
+		if r.Day == "" {
+			continue
+		}
+		t, err := time.ParseInLocation("2006-01-02 15:04:05", r.Day, time.Local)
+		if err != nil {
+			continue
+		}
+		open, _ := strconv.ParseFloat(r.Open, 64)
+		high, _ := strconv.ParseFloat(r.High, 64)
+		low, _ := strconv.ParseFloat(r.Low, 64)
+		close, _ := strconv.ParseFloat(r.Close, 64)
+		volume, _ := strconv.ParseFloat(r.Volume, 64)
+		amount, _ := strconv.ParseFloat(r.Amount, 64)
+		klines = append(klines, KLine{
+			Date:   t,
+			Open:   open,
+			High:   high,
+			Low:    low,
+			Close:  close,
+			Volume: volume,
+			Amount: amount,
+		})
+	}
+	// 分钟数据源时间序不固定，统一按时间升序排序
+	sort.Slice(klines, func(i, j int) bool {
+		return klines[i].Date.Before(klines[j].Date)
+	})
+	return klines, nil
 }
 
 // parseSinaKLine 解析新浪 K 线 JSON 数组。
@@ -1180,7 +1251,7 @@ func getStringField(m map[string]interface{}, key string) string {
 	return ""
 }
 
-// maxSector 求多个 SectorInfo 中 ChangePct 最大的值，用于归一化评分。
+// maxSectorChange 求多个 SectorInfo 中 ChangePct 最大的值，用于归一化评分。
 func maxSectorChange(sectors []SectorInfo) float64 {
 	m := 0.0
 	for _, s := range sectors {
@@ -1222,9 +1293,9 @@ const stockListFields = "f12,f14,f9,f20"
 
 // stockRawItem 东方财富全量股票列表的原始 JSON 行。
 type stockRawItem struct {
-	Code string  `json:"f12"`
-	Name string  `json:"f14"`
-	PE   float64 `json:"f9"`
+	Code string  `json:"f12"` // 股票代码
+	Name string  `json:"f14"` // 股票名称
+	PE   float64 `json:"f9"`  // 市盈率
 	MCap float64 `json:"f20"` // 总市值
 }
 
@@ -1246,7 +1317,7 @@ func (m *MarketAPI) GetStockList() (map[string]string, error) {
 	}
 	var raw struct {
 		Data *struct {
-			Total int                    `json:"total"`
+			Total int                     `json:"total"`
 			Diff  map[string]stockRawItem `json:"diff"`
 		} `json:"data"`
 	}

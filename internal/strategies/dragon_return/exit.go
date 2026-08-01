@@ -8,13 +8,17 @@ import (
 )
 
 // CheckExit 判断龙回头策略是否触发退出信号。
+// 检查顺序：止损（-StopLossPct）→ 止盈 T2（Target2）→ 移动止损（回撤 TrailingDrawback）→ 跌破 MA20×0.98 → 止盈 T1 → 超期。
+// 返回 nil 表示继续持有。
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
+	// 成本或现价非法时无法评估，视为不退出
 	if cost <= 0 || price <= 0 {
 		return nil
 	}
 
+	// 维护阶段最高价（优先取 EntryMeta 记录，其次取现价）
 	highest := cost
 	if ctx.EntryMeta != nil {
 		if h, ok := ctx.EntryMeta["highest_price"]; ok && h > highest {
@@ -25,24 +29,29 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strat
 		highest = price
 	}
 
+	// 盈亏率
 	lossPct := (price - cost) / cost * 100
 
+	// 止损：浮亏达到 StopLossPct（默认 -5%）立即止损离场
 	sl := -cfg.StopLossPct
 	if lossPct <= sl {
 		return &strategy.ExitResult{Reason: "龙回头止损", Priority: strategy.P1}
 	}
 
+	// 止盈 T2：到达目标价2（默认成本×1.25），兑现主升利润
 	target2 := cost * cfg.Target2Multiplier
 	if price >= target2 {
 		return &strategy.ExitResult{Reason: "龙回头止盈T2", Priority: strategy.P2}
 	}
 
+	// 移动止损：从阶段最高点回撤超过 TrailingDrawback（默认 8%）且已盈利过 → 保护利润
 	trailPct := (price - highest) / highest * 100
 	trailThreshold := -cfg.TrailingDrawback
 	if trailPct <= trailThreshold && highest > cost {
 		return &strategy.ExitResult{Reason: "龙回头移动止盈", Priority: strategy.P2}
 	}
 
+	// 破位：收盘跌破 MA20×0.98，中期支撑失守离场
 	if len(ctx.DailyK) >= 20 {
 		var ma20Sum float64
 		for i := len(ctx.DailyK) - 20; i < len(ctx.DailyK); i++ {
@@ -55,11 +64,13 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strat
 		}
 	}
 
+	// 止盈 T1：到达目标价1（默认成本×1.0）且非深套状态（浮亏 <2%）→ 先保本兑现
 	target1 := cost * cfg.Target1Multiplier
 	if price >= target1 && price < target2 && lossPct > -2 {
 		return &strategy.ExitResult{Reason: "龙回头止盈T1", Priority: strategy.P2}
 	}
 
+	// 超期：持仓超过 MaxHoldDays（默认 8 天）强制离场（二波逻辑失效）
 	if ctx.EntryAt != "" {
 		now := ctx.Now
 		if now.IsZero() {

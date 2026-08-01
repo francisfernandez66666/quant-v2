@@ -27,18 +27,21 @@ var techSectors = []string{
 // 返回 0.0~1.0 范围的综合得分，再乘以 WeightScore 权重系数。
 // 评分维度：市值(30%)、市盈率(30%)、换手率(20%)、科技板块加权(20% 乘数)。
 func ScoreLaodeng(cfg *config.LaodengConfig, marketCap, pe, turnover float64, sector string) float64 {
+	// 配置未启用或为空时直接返回 0（不参与评分）
 	if cfg == nil || !cfg.Enabled {
 		return 0
 	}
 
 	score := 0.0
 
+	// 市值维度（满分 0.3）：达标给满，未达标按比例线性折算
 	if marketCap >= cfg.MarketCapMin {
 		score += 0.3
 	} else {
 		score += 0.3 * (marketCap / cfg.MarketCapMin)
 	}
 
+	// 市盈率维度（满分 0.3）：PE≤上限给满，超出后线性衰减；无 PE 数据给保底 0.1
 	if pe > 0 && pe <= cfg.PeMax {
 		score += 0.3
 	} else if pe > 0 {
@@ -47,12 +50,15 @@ func ScoreLaodeng(cfg *config.LaodengConfig, marketCap, pe, turnover float64, se
 		score += 0.1
 	}
 
+	// 换手率维度（满分 0.2）：达标给满，未达标按比例线性折算
 	if turnover >= cfg.TurnoverMin {
 		score += 0.2
 	} else {
 		score += 0.2 * (turnover / cfg.TurnoverMin)
 	}
 
+	// 科技板块加权（乘数）：命中任一科技关键词则整体分数乘 (1+TechPenalty)
+	// 行业名做小写归一后子串匹配，命中即跳出循环
 	s := strings.ToLower(sector)
 	for _, ts := range techSectors {
 		if strings.Contains(s, strings.ToLower(ts)) {
@@ -61,6 +67,7 @@ func ScoreLaodeng(cfg *config.LaodengConfig, marketCap, pe, turnover float64, se
 		}
 	}
 
+	// 最终得分收敛到 [0,1] 区间后再乘权重系数
 	return math.Max(0, math.Min(1, score)) * cfg.WeightScore
 }
 

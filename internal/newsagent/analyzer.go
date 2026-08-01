@@ -10,25 +10,34 @@ import (
 )
 
 // analyzeDeep Stage2 全量分析：调用 LLM 对筛选后的新闻深度分析，生成结构化 NewsEvent。
+// LLM 轮询重试（最多3次）仍失败时整批归一般（返回 nil，不降级关键词兜底）。
 // 后置校正：档位归一 + 中性→0 + datetime 回退。
 func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 	if len(items) == 0 {
 		return nil
 	}
 
+	// 抽取标题列表，供 LLM 批量分析
 	titles := make([]string, len(items))
 	for i, item := range items {
 		titles[i] = item.Title
 	}
 
-	results := a.llmClient.AnalyzeHotTopicBatch(titles)
+	results, err := a.llmClient.AnalyzeHotTopicBatch(titles)
+	if err != nil {
+		log.Printf("[newsagent] Stage2 LLM批量分析失败, %d条归一般(不降级): %v", len(titles), err)
+		return nil
+	}
 
 	events := make([]NewsEvent, 0, len(results))
 	for i, ht := range results {
+		// 跳过空结果：LLM 未给出标题的无效项
 		if ht == nil || ht.Title == "" {
 			continue
 		}
+		// 后置校正：档位归一 + 中性强制归零
 		postProcess(ht)
+		// 兜底时间：新闻无发布时间时用当前时间
 		dt := items[i].Datetime
 		if dt == "" {
 			dt = time.Now().Format("2006-01-02 15:04:05")
@@ -41,6 +50,7 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 			}
 			related = append(related, s)
 		}
+		// 组装 NewsEvent：标题/正文取原始新闻，分析字段取 LLM 结果
 		event := NewsEvent{
 			Title:             items[i].Title,
 			Content:           items[i].Content,
@@ -80,6 +90,7 @@ func containsStr(slice []string, s string) bool {
 //   - 档位归一：|score| 归到 {0,0.25,0.5,0.75} 最近档，>0.75 截断为 0.75
 //   - 中性→0：LLM 自身判定方向/情绪为"中性"时强制 score=0（消除 +0.5 中性污染）
 func postProcess(ht *llm.HotTopic) {
+	// 取绝对值并截断上限，只处理强度档位
 	s := ht.Score
 	if s < 0 {
 		s = -s
@@ -87,6 +98,7 @@ func postProcess(ht *llm.HotTopic) {
 	if s > 0.75 {
 		s = 0.75
 	}
+	// 遍历四个档位找与 |score| 最近的档位（贪心最近邻）
 	tiers := []float64{0, 0.25, 0.5, 0.75}
 	best := tiers[0]
 	for _, t := range tiers {
@@ -98,10 +110,12 @@ func postProcess(ht *llm.HotTopic) {
 			best = t
 		}
 	}
+	// 还原原始符号（利好正分/利空负分），中性档 0 无符号
 	score := best
 	if ht.Score < 0 {
 		score = -score
 	}
+	// 中性判定强制归零：消除 LLM 输出"中性"却带正分的情况
 	if strings.EqualFold(ht.Sentiment, "中性") || strings.EqualFold(ht.Direction, "中性") {
 		score = 0
 	}

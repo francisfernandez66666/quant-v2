@@ -6,6 +6,8 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
+// TestClassifyLimitUp 验证涨停原因分类：按关键词命中政策/业绩/题材/舆情，
+// 无新闻或新闻无命中关键词时归为"情绪技术"。
 func TestClassifyLimitUp(t *testing.T) {
 	cases := []struct {
 		name string
@@ -27,6 +29,8 @@ func TestClassifyLimitUp(t *testing.T) {
 	}
 }
 
+// TestCheckExpectationGap 验证预期差检测：
+// 利好不涨触发、涨停兑现不触发、利空不跌触发、空新闻不触发。
 func TestCheckExpectationGap(t *testing.T) {
 	g := CheckExpectationGap("公司中标大单", true, -2.0, 5, 0)
 	if !g.Trigger || g.GapType != GapBullishNoRise {
@@ -46,6 +50,8 @@ func TestCheckExpectationGap(t *testing.T) {
 	}
 }
 
+// TestScoreLeaderWeights 验证龙头评分：强票（高连板/早封板/高封单/低换手）
+// 评分应在 (0,100] 区间，且明显高于弱票（首板/午后封板/低封单/高换手）。
 func TestScoreLeaderWeights(t *testing.T) {
 	industryCnt := map[string]int{"燃气": 1}
 	industryStocks := map[string][]data.LimitUpStock{
@@ -73,6 +79,7 @@ func TestScoreLeaderWeights(t *testing.T) {
 	}
 }
 
+// TestAnalyzeLimitUpEmpty 验证空涨停池的兜底行为：总数 0、龙头列表为空。
 func TestAnalyzeLimitUpEmpty(t *testing.T) {
 	res := AnalyzeLimitUp(nil, nil)
 	if res.Total != 0 || res.Leaders != nil {

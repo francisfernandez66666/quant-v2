@@ -243,6 +243,7 @@ func NewLeftSideScorer(matcher *data.EventMatcher) *LeftSideScorer {
 func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResult {
 	res := &ScoreResult{}
 
+	// 情绪硬闸：衰退期一律拒绝入场（可能伴随流动性枯竭/恐慌）
 	if emotionHardBlock[ctx.EmotionPhase] {
 		res.Reason = "emotion_recession_block"
 		return res
@@ -252,6 +253,7 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 	d1, tags, blocked := s.calcD1(ctx)
 	res.Matched = tags
 	if blocked {
+		// 负面阻断：记录命中的第一条负面规则作为失败原因
 		res.Reason = "d1_neg:" + (func() string {
 			if len(tags) > 0 {
 				return tags[0]
@@ -272,6 +274,7 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 	}
 
 	// D2: 三层受益 proxy（集合竞价强度+量比+超额收益）
+	// 同时按时间窗口与情绪周期计算优先级基础分
 	prio := priorityOf(ib.TTime, d1, wa.IsSectorLeader, ctx.EmotionPhase)
 	res.Priority = prio.Level
 	res.RemindLevel = prio.Label
@@ -298,12 +301,14 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 	if d1 > 0 && res.Total >= Threshold && d2 >= D2FullThreshold {
 		res.Valid = true
 	} else if d1 >= MaxD1 && res.Total >= Threshold && d2 < D2FullThreshold {
+		// D1 满分但 D2 相对强度不足：无法构成完整链
 		if res.Reason == "" {
 			res.Reason = "d2_below_full"
 		} else {
 			res.Reason += ";d2_below_full"
 		}
 	} else if d1 < MaxD1 {
+		// D1 未满分（事件强度不足）
 		if res.Reason == "" {
 			res.Reason = "d1_not_full"
 		} else {
@@ -312,6 +317,7 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 	}
 
 	// 10:00 后降级：即使 Valid，但时间优先级不足 strong 则降级为 observe 不可开仓
+	// （黄金窗口过后追高风险上升，需要更严格的入场条件）
 	if res.Valid && res.Priority < StrongMin {
 		res.RemindLevel = "observe"
 		res.CanOpen = false
@@ -325,6 +331,7 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 	// 一突信号检测: 当前价 > 前日最高价×1.005 且量比 ≥ 1.8
 	// 说明已有主力资金开始攻击，是左侧抢先入场信号
 	if ib.CurPrice > ib.PrevHigh*1.005 && ib.CumVol > 0 && ib.PrevClose > 0 {
+		// 量比用当日累计量 / 前日最低价量级近似
 		volRatio := ib.CumVol / math.Max(ib.PrevLow, 1)
 		if volRatio >= 1.8 {
 			res.LeftSignal = true
@@ -530,7 +537,7 @@ func morphologyGate(wa *WaveA, ib *IntradayB) string {
 }
 
 // --- helpers ---
-// safeDiv 安全除法，分母为 0 时返回 0。
+// safeDiv 安全除法，分母为 0 时返回 0（避免评分出现 NaN/Inf）。
 func safeDiv(a, b float64) float64 {
 	if b == 0 {
 		return 0
@@ -538,6 +545,7 @@ func safeDiv(a, b float64) float64 {
 	return a / b
 }
 
+// maxInt 返回两个整数中的较大值。
 func maxInt(a, b int) int {
 	if a > b {
 		return a
@@ -545,6 +553,7 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// minInt 返回两个整数中的较小值。
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -552,10 +561,12 @@ func minInt(a, b int) int {
 	return b
 }
 
+// itoa 将整数转为十进制字符串（Go 内置 strconv.Itoa 的简化等价）。
 func itoa(i int) string {
 	return fmt.Sprintf("%d", i)
 }
 
+// d1desc 生成 D1 事件维度的描述文本：无匹配返回"无事件"，否则拼接事件标签。
 func d1desc(tags []string) string {
 	if len(tags) == 0 {
 		return "无事件"
@@ -563,8 +574,10 @@ func d1desc(tags []string) string {
 	return "事件:" + strings.Join(tags, ",")
 }
 
+// d2desc 生成 D2 相对强度维度的描述：按 竞价强弱/放量程度/超额收益 组合中文短语。
 func d2desc(wa *WaveA, ib *IntradayB, score float64) string {
 	var parts []string
+	// 竞价强度档位
 	if ib.AuctionChgPct >= 1.5 && ib.AuctionChgPct <= 5 {
 		parts = append(parts, "竞价强")
 	} else if ib.AuctionChgPct > 5 {
@@ -572,6 +585,7 @@ func d2desc(wa *WaveA, ib *IntradayB, score float64) string {
 	} else if ib.AuctionChgPct < 0 {
 		parts = append(parts, "竞价弱")
 	}
+	// 量比档位（与 calcD2 同一时间进度口径）
 	if ib.AvgDailyVol > 0 && ib.CumVol > 0 {
 		mins := float64(ib.TTime/100*60 + ib.TTime%100 - 570)
 		if mins < 0 {
@@ -590,6 +604,7 @@ func d2desc(wa *WaveA, ib *IntradayB, score float64) string {
 			parts = append(parts, "缩量")
 		}
 	}
+	// 相对大盘超额收益
 	stockChg := safeDiv(ib.CurPrice, ib.PrevClose) - 1
 	excess := stockChg - ib.BenchCurChg
 	if excess > 0.02 {
@@ -603,7 +618,9 @@ func d2desc(wa *WaveA, ib *IntradayB, score float64) string {
 	return strings.Join(parts, ",")
 }
 
+// d3desc 生成 D3 超跌确认维度的描述：有 PE 时按估值档位，否则按回撤深度区间。
 func d3desc(wa *WaveA, ib *IntradayB, ctx *Ctx, score float64) string {
+	// PE 估值档位
 	if ctx.StockPE > 0 {
 		if ctx.StockPE < 15 {
 			return "PE低估"
@@ -630,6 +647,7 @@ func d3desc(wa *WaveA, ib *IntradayB, ctx *Ctx, score float64) string {
 	return fmt.Sprintf("回撤%.0f分", score)
 }
 
+// d4desc 生成 D4 资金确认维度的描述：MACD 水上/水下 + 增量资金/量能平平。
 func d4desc(ib *IntradayB, avgVol float64, score float64) string {
 	var parts []string
 	if ib.MinuteMACDDIF > ib.MinuteMACDDEA && ib.MinuteMACDDIF > 0 {
@@ -637,6 +655,7 @@ func d4desc(ib *IntradayB, avgVol float64, score float64) string {
 	} else {
 		parts = append(parts, "MACD水下")
 	}
+	// 量能对比（与 calcD4 同一时间进度折算口径）
 	if ib.CumVol > 0 && avgVol > 0 {
 		mins := float64(ib.TTime/100*60 + ib.TTime%100 - 570)
 		if mins < 0 {

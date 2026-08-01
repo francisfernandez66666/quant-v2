@@ -48,11 +48,16 @@ func retry[T any](name string, attempts int, fn func() (T, error)) (T, error) {
 	return zero, err
 }
 
+// main 联网抓取实盘数据并生成 e2e 测试 fixture：
+// 依次抓取同花顺板块页、东财板块/股票列表、涨停池/龙虎榜/新股日历、
+// 场景板块成分股与个股行情/K线/资金流，最后写入 internal/e2e/testdata/fixtures.json。
 func main() {
 	log.SetFlags(log.LstdFlags)
+	// 东财行情 API + 同花顺板块客户端
 	api := data.NewMarketAPI()
 	ths := data.NewTHSClient()
 
+	// fixture 载体：CapturedAt 记录抓取时间，News 使用固定编写的场景新闻
 	fix := &e2e.Fixture{
 		CapturedAt: time.Now().Format("2006-01-02 15:04:05"),
 		News:       authoredNews(),
@@ -108,6 +113,7 @@ func main() {
 	var boards []data.SectorInfo
 	if b, err := ths.GetBoardList(); err == nil {
 		boards = b
+		// 建立 板块名→板块信息 索引，便于按场景板块名精确命中真实板块
 		byName := make(map[string]data.SectorInfo)
 		for _, bl := range boards {
 			byName[bl.Name] = bl
@@ -138,6 +144,7 @@ func main() {
 
 	sinaQuotes := api.GetSinaQuotes(scenarioStocks)
 	for _, code := range scenarioStocks {
+		// 新浪行情：保留到 fix.Quotes（CSV 字符串），并抓取个股所属行业
 		if si, ok := sinaQuotes[code]; ok && si != nil && si.Price > 0 {
 			fix.Quotes[code] = sinaQuoteCSV(si)
 			if ind := api.GetStockIndustry(code); ind != "" {
@@ -147,6 +154,7 @@ func main() {
 			log.Printf("新浪行情缺失 %s", code)
 		}
 
+		// K线：新浪返回升序，mock 需要最新在前（解析器会再反转）
 		if klines, err := api.GetSinaKLine(code, 120); err == nil && len(klines) > 0 {
 			// 新浪返回升序，mock 需要最新在前（解析器会再反转）
 			rev := make([]data.KLine, len(klines))
@@ -158,6 +166,7 @@ func main() {
 			log.Printf("K线缺失 %s: %v", code, err)
 		}
 
+		// 资金流：东财易被反爬拦截，需带重试；金额单位换算为万元后存为 CSV 行
 		if cf, err := retry("资金流", 4, func() (*data.CapitalFlow, error) { return api.GetStockMoneyFlow(code) }); err == nil && cf != nil {
 			fix.MoneyFlow[code] = []string{
 				fmt.Sprintf("2026-07-29,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,0,0,0",
@@ -264,12 +273,12 @@ func applyFallbacks(fix *e2e.Fixture, api *data.MarketAPI, sinaQuotes map[string
 			board string
 			codes []string
 		}{
-			{"人工智能", []string{"300308", "000938"}},   // 中际旭创 / 紫光股份
-			{"半导体", []string{"688981"}},              // 中芯国际
-			{"锂电池概念", []string{"300750"}},           // 宁德时代
-			{"化学制药", []string{"600276"}},            // 恒瑞医药
-			{"白酒", []string{"600519"}},               // 贵州茅台
-			{"汽车整车", []string{"002594"}},            // 比亚迪
+			{"人工智能", []string{"300308", "000938"}}, // 中际旭创 / 紫光股份
+			{"半导体", []string{"688981"}},            // 中芯国际
+			{"锂电池概念", []string{"300750"}},          // 宁德时代
+			{"化学制药", []string{"600276"}},           // 恒瑞医药
+			{"白酒", []string{"600519"}},             // 贵州茅台
+			{"汽车整车", []string{"002594"}},           // 比亚迪
 		} {
 			b, ok := byName[sec.board]
 			if !ok {
@@ -369,6 +378,7 @@ func applyFallbacks(fix *e2e.Fixture, api *data.MarketAPI, sinaQuotes map[string
 }
 
 // sectorMembers 场景板块成分股的 名称→代码 映射（与 applyFallbacks 内保持一致）。
+// stockNameCode 是"股票名称→股票代码"的二元组，用于兜底股票列表/名称映射。
 type stockNameCode struct{ name, code string }
 
 func sectorMembers() []stockNameCode {

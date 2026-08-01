@@ -12,14 +12,14 @@ import (
 // TrackedStock 表示一条被跟踪的个股记录。
 // 包含方向（利好/利空）、有效期、进入理由等信息，用于策略的持续监控。
 type TrackedStock struct {
-	Code          string `json:"code"`
-	Name          string `json:"name"`
-	Direction     string `json:"direction"` // 利好/利空
-	EntryTD       string `json:"entry_td"`
-	ExpiryTD      string `json:"expiry_td"`
-	Reason        string `json:"reason"`
-	LastSeenTD    string `json:"last_seen_td"`
-	LastHadSignal bool   `json:"last_had_signal"`
+	Code          string `json:"code"`            // 股票代码
+	Name          string `json:"name"`            // 股票名称
+	Direction     string `json:"direction"`       // 利好/利空
+	EntryTD       string `json:"entry_td"`        // 进入跟踪日期（YYYY-MM-DD）
+	ExpiryTD      string `json:"expiry_td"`       // 过期日期，超过后不再跟踪
+	Reason        string `json:"reason"`          // 进入跟踪的理由
+	LastSeenTD    string `json:"last_seen_td"`    // 最近一次策略周期日期
+	LastHadSignal bool   `json:"last_had_signal"` // 最近周期是否产生信号
 }
 
 // StockTracker 个股跟踪器，维护被跟踪的个股池，支持自动过期清理和文件持久化。
@@ -107,9 +107,9 @@ func (t *StockTracker) GetActiveByDirection(td, direction string) []*TrackedStoc
 // td: 当前周期日期。
 // signaledCodes: 本周期产生信号的个股代码列表。
 // 逻辑：
-//   1. 更新所有跟踪记录的最后出现日期和信号状态。
-//   2. 删除已过期的记录（td > ExpiryTD）。
-//   3. 删除到期日当天且未产生信号的记录。
+//  1. 更新所有跟踪记录的最后出现日期和信号状态。
+//  2. 删除已过期的记录（td > ExpiryTD）。
+//  3. 删除到期日当天且未产生信号的记录。
 func (t *StockTracker) OnCycleDone(td string, signaledCodes []string) {
 	sigSet := make(map[string]bool)
 	for _, c := range signaledCodes {

@@ -103,7 +103,7 @@ func IsMorningHighFreq(now time.Time) bool {
 	return m >= defaultTradeTime.FullOpen && m < defaultTradeTime.MorningHighEnd
 }
 
-// IsMidFreqWindow 早盘中频窗口。
+// IsMidFreqWindow 早盘中频窗口（9:45-10:00，早盘高频扫描的次级节奏）。
 func IsMidFreqWindow(now time.Time) bool {
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {

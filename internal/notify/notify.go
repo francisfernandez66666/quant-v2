@@ -16,24 +16,24 @@ import (
 type AlertLevel int
 
 const (
-	LevelLow    AlertLevel = iota
-	LevelMedium AlertLevel = 1
-	LevelHigh   AlertLevel = 2
+	LevelLow    AlertLevel = iota // 低级别（如命中提醒、观察信号）
+	LevelMedium AlertLevel = 1    // 中级别（默认告警）
+	LevelHigh   AlertLevel = 2    // 高级别（交易提醒，弹桌面通知）
 )
 
 // Message 推送消息体，包含级别、标题、正文和可选的信号对象。
 type Message struct {
-	Level   AlertLevel       `json:"level"`
-	Title   string           `json:"title"`
-	Content string           `json:"content"`
-	Signal  *strategy.Signal `json:"signal,omitempty"`
+	Level   AlertLevel       `json:"level"`            // 告警级别
+	Title   string           `json:"title"`            // 消息标题
+	Content string           `json:"content"`          // 消息正文
+	Signal  *strategy.Signal `json:"signal,omitempty"` // 关联的策略信号（可选）
 }
 
 // Notifier 推送器，管理 WebSocket 客户端和 Webhook URL 列表。
 type Notifier struct {
-	mu          sync.RWMutex
-	wsClients   map[string]chan Message
-	webhookURLs []string
+	mu          sync.RWMutex            // 保护 wsClients/webhookURLs 的读写锁
+	wsClients   map[string]chan Message // WS 客户端 ID → 消息通道
+	webhookURLs []string                // Webhook HTTP 回调地址列表
 }
 
 // New 创建推送器实例。
@@ -44,6 +44,7 @@ func New() *Notifier {
 }
 
 // Push 向所有 WS 客户端和 Webhook 地址推送消息（非阻塞）。
+// WS 客户端通道已满时直接丢弃该消息（防止慢消费者阻塞推送方）；Webhook 为异步 goroutine 发送。
 func (n *Notifier) Push(msg Message) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -62,6 +63,7 @@ func (n *Notifier) Push(msg Message) {
 }
 
 // PushSignal 根据信号优先级自动选择告警级别并推送。
+// 级别映射：P1/P2→高（弹桌面通知），P4→低，其余→中。
 func (n *Notifier) PushSignal(sig *strategy.Signal) {
 	level := LevelMedium
 	switch sig.Priority {
@@ -108,6 +110,7 @@ func (n *Notifier) PushHit(sig *strategy.Signal, chgPct, volume float64, reasons
 }
 
 // PushTrade 交易提醒：符合策略规则的股票，强提醒（含量价+仓位+桌面通知）。
+// 比 PushHit 更高级别：弹桌面通知并推送含建议股数/金额的高级别消息。
 func (n *Notifier) PushTrade(sig *strategy.Signal, changePct, volume float64) {
 	title := "🚀" + string(sig.Type) + "交易"
 	body := fmt.Sprintf("%s %s — %.0f分 现价%.2f %.2f%% 量%.0f 建议%d股/%.0f元",

@@ -151,8 +151,8 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import * as api from '../api/index.js'
+import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子
+import * as api from '../api/index.js'                       // 后端 API 封装：状态/评分/板块轮次/资讯/IPO 等数据接口
 
 // ── 工具函数 ──
 
@@ -187,6 +187,7 @@ function rowClass(e) {
 const sortKey = ref('')
 const sortDir = ref(-1)
 
+/** 设置排序列：同列再次点击切换升降序，切换列时默认降序 */
 function setSort(key) {
   if (sortKey.value === key) {
     // 同列再次点击时切换升降序
@@ -197,11 +198,13 @@ function setSort(key) {
   }
 }
 
+/** 返回排序列的箭头指示符：▼ 降序 / ▲ 升序，非排序列返回空串 */
 function sortArrow(key) {
   if (sortKey.value !== key) return ''
   return sortDir.value === -1 ? ' ▼' : ' ▲'
 }
 
+/** 安全取值：字符串为空返回 ''，其余为空返回 0，用于排序比较 */
 function val(e, key) {
   const v = e[key]
   if (typeof v === 'string') return v || ''
@@ -217,6 +220,7 @@ const news = ref([])              // 资讯 + 日历事件
 const ipoCalendar = ref([])       // IPO 日历
 const reasonTarget = ref(null)    // 当前查看异动原因的板块
 
+/** 展示板块异动原因弹窗（点击板块卡片触发） */
 function showReason(s) { reasonTarget.value = s }
 
 /** 切换轮次记录：展示该轮次板块快照 */
@@ -234,8 +238,8 @@ function formatHotTime(t) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-let timer = null
-let unsubSSE = null
+let timer = null                  // 定时轮询句柄
+let unsubSSE = null               // SSE 取消订阅函数
 let loading = false              // 防并发请求标志
 
 // ── 计算属性 ──

@@ -2,6 +2,7 @@
 // 借鉴 astock-market-engine market_reasoning_engine 的 6 类预期差：
 // 利好不涨 / 利空不跌 / 放量涨次日弱(需次日数据,暂跳过) / 高位放量滞涨 / 缩量上涨 / 业绩利好反而跌。
 // 每类 0-4 分规则累计，归一化后 ≥0.4 触发提醒信号。
+// 检测入口为 CheckExpectationGap，在 ScanLimitUp 中被涨停池与 8a/8b 个股复用。
 package combat_agent
 
 import (
@@ -10,17 +11,17 @@ import (
 
 // gapType 预期差类型常量。
 const (
-	GapBullishNoRise   = "利好不涨"   // 有明确利好新闻，股价却未涨
-	GapBearishNoDrop   = "利空不跌"   // 有明确利空新闻，股价却不跌反涨
-	GapHighVolSluggish = "高位放量滞涨" // 放量但涨幅不足（滞涨）
+	GapBullishNoRise   = "利好不涨"    // 有明确利好新闻，股价却未涨
+	GapBearishNoDrop   = "利空不跌"    // 有明确利空新闻，股价却不跌反涨
+	GapHighVolSluggish = "高位放量滞涨"  // 放量但涨幅不足（滞涨）
 	GapShrinkRise      = "缩量上涨"    // 缩量创新高/上涨，承接弱
 	GapEarningsFall    = "业绩利好反而跌" // 业绩增长但股价下跌
 )
 
 // ExpectationGapResult 预期差检测结果。
 type ExpectationGapResult struct {
-	GapType string  // 预期差类型
-	Score   float64 // 归一化 0-1
+	GapType string  // 预期差类型（GapBullishNoRise 等常量）
+	Score   float64 // 归一化 0-1（由 0-4 原始分 /4 得到）
 	Trigger bool    // 是否触发提醒（>=0.4）
 	Reason  string  // 可读描述
 }
@@ -32,15 +33,17 @@ type ExpectationGapResult struct {
 func CheckExpectationGap(newsText string, positive bool, changePct, turnover, volRatio float64) ExpectationGapResult {
 	res := ExpectationGapResult{Score: 0}
 	newsText = strings.TrimSpace(newsText)
+	// 无新闻文本 → 无从判断预期差，直接返回未触发
 	if newsText == "" {
 		return res
 	}
 
 	if positive {
-		// 利好方向
+		// 利好方向：新闻利好但股价反应不足 → 预期差
 		switch {
 		case changePct <= 0:
 			// 利好不涨：跌幅越大分越高（0-4）
+			// 微跌（>-3%）按比例加权，深跌直接给满分 4
 			raw := 4.0
 			if changePct > -3 {
 				raw = 2 + (-changePct)*0.6
@@ -49,7 +52,7 @@ func CheckExpectationGap(newsText string, positive bool, changePct, turnover, vo
 			res.Reason = "有利好新闻但股价未涨"
 			res.setNorm(raw)
 		case changePct < 3:
-			// 利好反应不足
+			// 利好反应不足：涨幅低于 3% 视为没充分兑现
 			raw := 1.5 + (3-changePct)*0.5
 			res.GapType = GapBullishNoRise
 			res.Reason = "有利好新闻但涨幅不足"
@@ -57,20 +60,22 @@ func CheckExpectationGap(newsText string, positive bool, changePct, turnover, vo
 		case changePct >= 3 && changePct < 9.5:
 			// 高位放量滞涨：涨幅 3-9.5% 且换手异常放大
 			if turnover > 20 && volRatio > 2 {
+				// 高换手 + 高量比但涨幅一般 → 滞涨
 				res.GapType = GapHighVolSluggish
 				res.Reason = "放量滞涨，承接盘待观察"
 				res.setNorm(3.5)
 			} else if volRatio < 0.7 {
+				// 量比明显萎缩的上涨 → 承接弱，注意缩量上行
 				res.GapType = GapShrinkRise
 				res.Reason = "缩量上涨，量能承接不足"
 				res.setNorm(2.5)
 			} else {
-				// 正常反应，不触发
+				// 量价配合正常，利好已合理反映 → 不触发
 				res.Score = 0
 				return res
 			}
 		default:
-			// 涨停或大幅上涨：利好兑现，不触发
+			// 涨停或大幅上涨（≥9.5%）：利好兑现，不触发
 			res.Score = 0
 			return res
 		}
@@ -78,18 +83,20 @@ func CheckExpectationGap(newsText string, positive bool, changePct, turnover, vo
 		return res
 	}
 
-	// 利空方向
+	// 利空方向：新闻利空但股价反应不足 → 预期差
 	switch {
 	case changePct >= 0:
+		// 利空不跌反涨：涨幅越大分越高
 		res.GapType = GapBearishNoDrop
 		res.Reason = "有利空新闻但股价不跌反涨"
 		res.setNorm(2.0 + changePct*0.4)
 	case changePct > -3:
+		// 利空但跌幅不足（微跌）
 		res.GapType = GapBearishNoDrop
 		res.Reason = "有利空新闻但跌幅不足"
 		res.setNorm(1.5 + (3+changePct)*0.4)
 	default:
-		// 利空兑现，不触发
+		// 深跌（≤-3%）：利空兑现，不触发
 		res.Score = 0
 		return res
 	}
@@ -98,6 +105,7 @@ func CheckExpectationGap(newsText string, positive bool, changePct, turnover, vo
 }
 
 // setNorm 将 0-4 分归一化为 0-1 并写入 Score。
+// 先把原始分裁剪到 0~4 区间，再除以 4 得到 0~1 的归一化分数。
 func (r *ExpectationGapResult) setNorm(raw float64) {
 	if raw > 4 {
 		raw = 4

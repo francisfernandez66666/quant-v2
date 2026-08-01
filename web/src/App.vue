@@ -2,23 +2,30 @@
   根组件 App.vue
   主布局：侧边栏导航 + 顶部栏 + 内容区（router-view）
   未登录时显示登录页
+
+  文件职责：
+  1. 已登录：渲染应用主界面（侧边栏导航 + 顶部栏 + 内容区）；
+  2. 未登录：渲染登录页（服务器地址 / 账号 / 密码表单）；
+  3. 应用生命周期管理：登录态恢复、15 秒状态轮询、SSE 实时推送订阅、
+     做空开关、通知测试、Toast 提示等全局逻辑都集中在本组件。
 -->
 <template>
   <!-- 已登录：主界面 -->
   <div class="app" v-if="loggedIn">
-    <!-- 移动端汉堡菜单按钮 -->
+    <!-- 移动端汉堡菜单按钮：点击切换侧边栏展开/收起 -->
     <div class="hamburger" @click="menuOpen = !menuOpen">
       <span></span><span></span><span></span>
     </div>
-    <!-- 移动端侧栏遮罩层 -->
+    <!-- 移动端侧栏遮罩层：点击遮罩即关闭侧边栏 -->
     <div class="sidebar-overlay" v-if="menuOpen" @click="menuOpen = false"></div>
-    <!-- 侧边栏导航 -->
+    <!-- 侧边栏导航：通过 router-link 切换页面，点击后关闭移动端菜单 -->
     <aside class="sidebar" :class="{ open: menuOpen }">
       <div class="logo">量仔期货</div>
       <nav class="nav">
         <router-link to="/dashboard" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">📊</span> 仪表盘
         </router-link>
+        <!-- 信号入口：signalCount > 0 时展示未读信号角标 -->
         <router-link to="/signals" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">⚡</span> 信号
           <span class="badge" v-if="signalCount > 0">{{ signalCount }}</span>
@@ -29,6 +36,7 @@
         <router-link to="/hotspot" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">🔥</span> 热点
         </router-link>
+        <!-- 消息入口：alertCount > 0 时展示未读提醒角标 -->
         <router-link to="/msgcenter" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">💬</span> 消息
           <span class="badge" v-if="alertCount > 0">{{ alertCount }}</span>
@@ -45,9 +53,11 @@
       </nav>
       <!-- 侧栏底部：服务状态 & 账号 -->
       <div class="sidebar-footer">
+        <!-- 后端服务在线状态：serverOnline 控制绿色“在线”/灰色“离线” -->
         <div class="server-status" :class="{ online: serverOnline }">
           {{ serverOnline ? '服务在线' : '离线' }}
         </div>
+        <!-- 当前登录账号名 -->
         <div class="account-name">{{ account }}</div>
       </div>
     </aside>
@@ -55,25 +65,30 @@
     <main class="main">
       <!-- 顶部栏：交易时段、做空开关、通知测试、退出 -->
       <div class="topbar">
+        <!-- 交易时段标识：inTradeTime 为 null 时不展示（尚未拉到状态） -->
         <div class="trade-time" v-if="inTradeTime !== null">
           {{ inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后' }}
         </div>
         <div class="topbar-right">
+          <!-- 做空开关：v-model 绑定 shortEnabled，切换时调用 onShortToggle 持久化 -->
           <label class="short-toggle" :class="{ active: shortEnabled }">
             <input type="checkbox" v-model="shortEnabled" @change="onShortToggle" />
             <span class="toggle-track"><span class="toggle-thumb"></span></span>
             <span class="toggle-label">{{ shortEnabled ? '做多+空' : '仅做多' }}</span>
           </label>
+          <!-- 通知测试按钮：点击弹出浏览器系统通知 -->
           <button class="btn-notify" @click="testNotify">🔔</button>
+          <!-- 退出登录按钮 -->
           <button class="btn-logout" @click="logout">退出</button>
         </div>
       </div>
+      <!-- 内容区：由当前路由对应的页面组件填充 -->
       <div class="content">
         <router-view />
       </div>
     </main>
 
-    <!-- Toast 消息容器 -->
+    <!-- Toast 消息容器：按添加顺序堆叠展示，type 决定样式（info/warning/success/err） -->
     <div class="toast-container">
       <div v-for="(t, i) in toasts" :key="i" :class="['toast', t.type]">{{ t.msg }}</div>
     </div>
@@ -83,10 +98,12 @@
     <div class="login-box">
       <h1>量仔期货</h1>
       <p class="subtitle">量化交易辅助工具</p>
+      <!-- 服务器地址：所有 API 请求的基础地址，保存后供 api.baseUrl() 使用 -->
       <div class="form-group">
         <label>服务器地址</label>
         <input v-model="serverUrl" placeholder="http://127.0.0.1:8080" />
       </div>
+      <!-- 账号 / 密码：登录凭据；密码框回车可直接触发登录 -->
       <div class="form-group">
         <label>账号</label>
         <input v-model="username" placeholder="输入账号" />
@@ -95,19 +112,26 @@
         <label>密码</label>
         <input v-model="password" type="password" placeholder="输入密码" @keyup.enter="handleLogin" />
       </div>
+      <!-- 登录按钮：登录中显示“登录中...”并禁用，防止重复提交 -->
       <button class="btn-login" @click="handleLogin" :disabled="logging">
         {{ logging ? '登录中...' : '登录' }}
       </button>
+      <!-- 登录错误提示：失败时展示后端返回的错误信息 -->
       <p class="login-error" v-if="loginError">{{ loginError }}</p>
     </div>
   </div>
 </template>
 
 <script setup>
+// ── 依赖导入 ──
+// ref 定义响应式数据；onMounted / onUnmounted 注册组件生命周期钩子
 import { ref, onMounted, onUnmounted } from 'vue'
+// useRouter 获取路由实例，用于退出登录后编程式跳转
 import { useRouter } from 'vue-router'
+// 后端 API 方法统一挂载在 api 命名空间下
 import * as api from './api/index.js'
 
+// 路由实例：logout 时跳转回根路由（登录页）
 const router = useRouter()
 
 // ── 响应式状态 ──
@@ -122,6 +146,7 @@ const menuOpen = ref(false)          // 移动端侧栏是否展开
 const shortEnabled = ref(false)      // 做空开关状态
 
 // ── 登录表单状态 ──
+// 服务器地址初始值优先取本地持久化值，否则用默认本地地址
 const serverUrl = ref(api.getStoredServer() || 'http://127.0.0.1:8080')
 const username = ref('')
 const password = ref('')
@@ -129,10 +154,14 @@ const logging = ref(false)           // 是否正在登录中
 const loginError = ref('')           // 登录错误提示
 
 // ── 定时器 & SSE 引用 ──
+// statusTimer：15 秒状态轮询的定时器句柄
 let statusTimer = null
+// unsubSSE：SSE 回调的注销函数（由 api.onSSE 返回），退出时调用以解除订阅
 let unsubSSE = null
 
 /** 弹出 Toast 消息，3 秒后自动消失 */
+// @param {string} msg  - 消息文本内容
+// @param {string} type - 提示类型：info（默认）/ success / warning / err，决定样式
 function addToast(msg, type = 'info') {
   toasts.value.push({ msg, type })
   // 3 秒后从队列移除最旧的消息
@@ -140,6 +169,7 @@ function addToast(msg, type = 'info') {
 }
 
 /** 测试浏览器通知功能 */
+// 说明：已授权通知权限时直接弹出系统通知；无论是否授权都弹出 Toast 提示结果
 async function testNotify() {
   if ('Notification' in window && Notification.permission === 'granted') {
     new Notification('量仔期货', { body: '通知测试成功', icon: '' })
@@ -148,6 +178,8 @@ async function testNotify() {
 }
 
 /** 切换做空开关，失败时回滚 UI 状态 */
+// 说明：切换开关本质是调用后端接口持久化开关状态；
+//       失败时 v-model 已将 UI 开关值改变，这里需回滚到原值并给出错误提示
 async function onShortToggle() {
   try {
     // 调用后端接口切换做空开关
@@ -161,6 +193,8 @@ async function onShortToggle() {
 }
 
 /** 检查本地 token 是否存在，恢复登录态 */
+// 说明：组件挂载时调用；本地存在 token 则直接进入主界面并同步服务器地址，
+//       否则停留在登录页，由用户手动登录。
 async function checkAuth() {
   if (api.isLoggedIn()) {
     // 本地已有登录态则直接恢复界面
@@ -174,9 +208,12 @@ async function checkAuth() {
 }
 
 /** 执行登录：提交凭据，成功后启动轮询 */
+// 说明：登录成功后持久化服务器地址、启动 15 秒轮询 + SSE 连接，
+//       并顺带请求浏览器通知权限；失败时把后端错误信息展示在登录页。
 async function handleLogin() {
   logging.value = true
   loginError.value = ''
+  // 先把服务器地址持久化，后续所有请求都基于该地址拼接
   api.setStoredServer(serverUrl.value)
   try {
     // 提交登录凭据到后端
@@ -186,6 +223,7 @@ async function handleLogin() {
     // 登录成功后启动轮询，并顺带请求通知权限
     startPolling()
     addToast('登录成功', 'success')
+    // 浏览器通知权限为“默认”时主动申请，便于新信号及时提醒
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission()
     }
@@ -197,6 +235,8 @@ async function handleLogin() {
 }
 
 /** 退出登录：清除数据并停止轮询 */
+// 说明：清除本地认证信息、停止轮询与 SSE 连接、关闭移动端菜单，
+//       并跳转回根路由（此时因 loggedIn 为 false 显示登录页）。
 function logout() {
   // 清除认证并停止后台任务
   api.clearAuth()
@@ -207,6 +247,8 @@ function logout() {
 }
 
 /** 刷新服务端状态、信号数、提醒数和做空状态 */
+// 说明：三个接口各自 try/catch 独立执行，互不阻塞；
+//       任一失败只影响对应状态（如状态接口失败则将服务标记为离线）。
 async function refreshStatus() {
   try {
     // 拉取服务状态与信号数
@@ -228,6 +270,8 @@ async function refreshStatus() {
 }
 
 /** SSE 消息处理器：新信号时弹 Toast 并刷新状态 */
+// 说明：作为回调注册到 api.onSSE()；收到含 signal 字段的推送时，
+//       弹出新信号提示并触发一次状态刷新，保证界面实时同步。
 function handleSSE(msg) {
   if (msg.signal) {
     // 新信号到来时弹 Toast 并刷新状态栏
@@ -237,6 +281,8 @@ function handleSSE(msg) {
 }
 
 /** 启动定时轮询和 SSE 连接 */
+// 说明：先立即刷新一次状态，随后每 15 秒轮询一次；
+//       同时建立与后端的 SSE 长连接，并注册新信号的消息回调。
 function startPolling() {
   // 立即刷新一次，随后每 15 秒轮询
   refreshStatus()
@@ -247,6 +293,8 @@ function startPolling() {
 }
 
 /** 停止定时轮询并断开 SSE */
+// 说明：清除轮询定时器、断开 SSE 连接并注销回调；
+//       在退出登录与组件卸载时调用，防止定时器与长连接泄漏。
 function stopPolling() {
   // 清除轮询定时器并断开 SSE 连接
   if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
@@ -255,16 +303,19 @@ function stopPolling() {
 }
 
 /** 挂载时检查登录态，已登录则开始轮询 */
+// 生命周期：组件挂载完成后先恢复登录态，成功则启动后台轮询与 SSE
 onMounted(async () => {
   // 恢复登录态，成功则启动后台任务
   const ok = await checkAuth()
   if (ok) startPolling()
 })
 /** 卸载时停止所有后台任务 */
+// 生命周期：组件卸载前停止轮询与 SSE，避免后台任务泄漏
 onUnmounted(stopPolling)
 </script>
 
 <style>
+/* 全局样式：去除浏览器默认内外边距，统一盒模型 */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif;

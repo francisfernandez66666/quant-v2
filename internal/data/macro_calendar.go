@@ -134,7 +134,9 @@ func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 	})
 }
 
-// 返回按优先级排序的事件列表
+// GetActiveMacroEvents 筛选当前处于"影响期"或未来 7 天内即将发生的宏观事件。
+// 影响期 = 事件日前 Duration 天至事件日后 Duration 天；
+// 返回按优先级（war > contract > fomc > pce > cpi > nfp > other）降序排列。
 func GetActiveMacroEvents(events []MacroEvent) []MacroEvent {
 	now := time.Now()
 	var active []MacroEvent
@@ -195,6 +197,7 @@ func MacroEventDesc(events []MacroEvent) string {
 	return s
 }
 
+// monthCN 将月份数字（1-12）转为中文月名（如 1 → "1月"），越界返回空串。
 func monthCN(m int) string {
 	names := []string{"", "1月", "2月", "3月", "4月", "5月", "6月",
 		"7月", "8月", "9月", "10月", "11月", "12月"}
@@ -204,6 +207,7 @@ func monthCN(m int) string {
 	return ""
 }
 
+// itoa 将整数转为十进制字符串（避免引入 strconv 依赖，支持负数）。
 func itoa(i int) string {
 	if i == 0 {
 		return "0"

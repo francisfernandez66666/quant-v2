@@ -6,17 +6,21 @@ import (
 	"quant-trading-v2/internal/llm"
 )
 
-// rebuildIndex 从事件板块重建个股→板块倒排索引
+// rebuildIndex 从事件板块重建个股→板块倒排索引。
+// 遍历每个事件的板块（含上游/下游），通过 LLM ResolveStocks 解析出关联个股，建立 code → 板块列表 的映射。
+// 仅在本次结果非空时替换旧索引（避免无事件轮次清空缓存索引）。
 func (e *Engine) rebuildIndex(events []newsagent.NewsEvent) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	idx := make(map[string][]string)
 	for _, ev := range events {
+		// 汇总事件涉及的全部板块：本级 + 上游 + 下游
 		allSectors := append([]string{}, ev.Sectors...)
 		allSectors = append(allSectors, ev.UpstreamSectors...)
 		allSectors = append(allSectors, ev.DownstreamSectors...)
 		for _, s := range allSectors {
+			// 解析事件关联个股（LLM 从 RelatedStocks 中识别出代码）
 			codes, _ := llm.ResolveStocks(ev.RelatedStocks)
 			for _, code := range codes {
 				if !contains(idx[code], s) {
@@ -32,6 +36,8 @@ func (e *Engine) rebuildIndex(events []newsagent.NewsEvent) {
 }
 
 // sectorStocks 根据板块名称查询成分股列表，从 scanner 获取板块代码后调用市场 API。
+// 先经 scanner 精确匹配板块名得到板块代码，再拉取该板块前 30 只成分股，返回其代码列表。
+// 板块名未命中或成分股拉取失败时返回 nil。
 func (e *Engine) sectorStocks(sectorName string) []string {
 	if e.scanner == nil {
 		return nil

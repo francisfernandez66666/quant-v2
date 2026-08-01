@@ -22,24 +22,24 @@ import (
 // fixSignal 适配前端信号格式的结构体。
 // 将内部 combat_agent.Signal 转换为前端期望的字段名和格式。
 type fixSignal struct {
-	Code         string  `json:"code"`
-	Name         string  `json:"name"`
-	Strategy     string  `json:"strategy"`
-	TotalScore   float64 `json:"total_score"`
-	RemindLevel  string  `json:"remind_level"`
-	Level        string  `json:"level"`
-	Action       string  `json:"action"`
-	Price        float64 `json:"price"`
-	CanOpen      bool    `json:"can_open"`
-	D1           float64 `json:"d1"`
-	D2           float64 `json:"d2"`
-	D3           float64 `json:"d3"`
-	D4           float64 `json:"d4"`
-	D1Desc       string  `json:"d1_desc"`
-	D2Desc       string  `json:"d2_desc"`
-	D3Desc       string  `json:"d3_desc"`
-	D4Desc       string  `json:"d4_desc"`
-	SignalActive bool    `json:"signal_active"`
+	Code         string  `json:"code"`          // 股票代码
+	Name         string  `json:"name"`          // 股票名称
+	Strategy     string  `json:"strategy"`      // 触发策略
+	TotalScore   float64 `json:"total_score"`   // 总分（0~100）
+	RemindLevel  string  `json:"remind_level"`  // 提醒级别：strong/observe/mute
+	Level        string  `json:"level"`         // 固定"交易"
+	Action       string  `json:"action"`        // 交易动作（buy 等）
+	Price        float64 `json:"price"`         // 信号触发价格
+	CanOpen      bool    `json:"can_open"`      // 是否可开仓（置信度≥0.7 且为买入）
+	D1           float64 `json:"d1"`            // 维度1 评分
+	D2           float64 `json:"d2"`            // 维度2 评分
+	D3           float64 `json:"d3"`            // 维度3 评分
+	D4           float64 `json:"d4"`            // 维度4 评分
+	D1Desc       string  `json:"d1_desc"`       // 维度1 说明（触发理由）
+	D2Desc       string  `json:"d2_desc"`       // 维度2 说明（所属板块）
+	D3Desc       string  `json:"d3_desc"`       // 维度3 说明
+	D4Desc       string  `json:"d4_desc"`       // 维度4 说明
+	SignalActive bool    `json:"signal_active"` // 信号是否活跃
 }
 
 // scoreToRemindLevel 将总分转换为前端提醒级别。
@@ -110,6 +110,7 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		finalCount = len(dash.FinalSignals)
 	}
 	now := time.Now()
+	// 交易时段判定：1=早盘(9:00-11:30)，3=午盘(13:00-15:00)，0=盘前，2=午间休市/盘后
 	switch {
 	case now.Hour() >= 9 && now.Hour() < 11 || (now.Hour() == 11 && now.Minute() < 30):
 		session = 1
@@ -170,6 +171,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]map[string]interface{}, 0)
+	// 兜底路径：先用看板告警信号，再补充持仓日志中的在持/已平仓记录
 	for _, a := range dash.AlertSignals {
 		lvl := a.AlertType
 		if lvl == "" {
@@ -191,6 +193,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item)
 	}
 	for _, l := range s.rpt.List() {
+		// 仅展示持仓中或已平仓的记录，平仓记录用当前盈亏补全提示文本
 		if l.Status == "持仓中" || l.ExitAt != nil {
 			alertType := "持仓提示"
 			pct := ""
@@ -275,6 +278,8 @@ type fixHolding struct {
 	SignalActive  bool    `json:"signal_active"`
 	NSscore       float64 `json:"n_score"`
 	DragonScore   float64 `json:"dragon_score"`
+	DbScore       float64 `json:"db_score"`
+	DrScore       float64 `json:"dr_score"`
 	MScore        float64 `json:"m_score"`
 	TakeProfit    float64 `json:"take_profit"`
 	StopLoss      float64 `json:"stop_loss"`
@@ -294,12 +299,13 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 		chg := 0.0
 		pnl := 0.0
 		name := l.Name
-		// 实时拉取股价
+		// 实时拉取股价；失败时回退到开仓价（盈亏视为 0）
 		if info, err := s.market.GetRealtimeQuote(l.Code); err == nil {
 			cur = info.Price
 			chg = info.ChangePct
 			name = info.Name
 		}
+		// 盈亏比例 = (现价 - 成本价) / 成本价 * 100
 		if cur > 0 && l.EntryPrice > 0 {
 			pnl = (cur - l.EntryPrice) / l.EntryPrice * 100
 		}
@@ -318,11 +324,21 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 		}
 		dash := s.agg.Current()
 		if dash != nil {
-			for _, fs := range dash.FinalSignals {
-				if fs.Code == l.Code {
-					h.SignalActive = true
-					h.NSscore = fs.Confidence * 100
-					break
+			// 优先取 8a/8b 持续打分分数；无打分记录时回退到最终信号置信度
+			if sc, ok := dash.Scores[l.Code]; ok {
+				h.SignalActive = sc.SignalActive
+				h.NSscore = sc.NScore
+				h.DragonScore = sc.DragonScore
+				h.MScore = sc.MomentumScore
+				h.DbScore = sc.DoubleBumpScore
+				h.DrScore = sc.DragonReturnScore
+			} else {
+				for _, fs := range dash.FinalSignals {
+					if fs.Code == l.Code {
+						h.SignalActive = true
+						h.NSscore = fs.Confidence * 100
+						break
+					}
 				}
 			}
 		}
@@ -495,36 +511,34 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 
 // handleFixEvaluations 处理 GET /api/evaluations 请求，返回自选股的多维度评分评估数据。
 // 包含 N-score、Dragon-score、DB-score、DR-score、M-score 五种评分及对应的通过阈值判断。
+// 数据来源为 8a/8b 持续打分（dash.Scores），无打分记录时按 0 处理。
 func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 	dash := s.agg.Current()
 	codes := s.watchlist.List()
 	seen := map[string]bool{}
 	out := make([]map[string]interface{}, 0)
-	// 构建信号map
-	sigMap := map[string]combat_agent.Signal{}
+	var scores map[string]combat_agent.StockScores
 	if dash != nil {
-		for _, sig := range dash.FinalSignals {
-			sigMap[sig.Code] = sig
-		}
+		scores = dash.Scores
 	}
 	for _, code := range codes {
 		if seen[code] {
 			continue
 		}
 		seen[code] = true
-		sig, hasSig := sigMap[code]
 		nScore := 0.0
 		dragonScore := 0.0
 		dbScore := 0.0
 		drScore := 0.0
 		mScore := 0.0
-		if hasSig {
-			base := sig.Confidence * 100
-			nScore = base
-			dragonScore = base
-			dbScore = base
-			drScore = base
-			mScore = base
+		sigActive := false
+		if sc, ok := scores[code]; ok {
+			nScore = sc.NScore
+			dragonScore = sc.DragonScore
+			dbScore = sc.DoubleBumpScore
+			drScore = sc.DragonReturnScore
+			mScore = sc.MomentumScore
+			sigActive = sc.SignalActive
 		}
 		info, _ := s.market.GetRealtimeQuote(code)
 		name := code
@@ -536,20 +550,21 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 			chg = info.ChangePct
 		}
 		out = append(out, map[string]interface{}{
-			"code":         code,
-			"name":         name,
-			"price":        price,
-			"change_pct":   chg,
-			"n_score":      nScore,
-			"n_pass":       nScore >= 60,
-			"dragon_score": dragonScore,
-			"dragon_pass":  dragonScore >= 70,
-			"db_score":     dbScore,
-			"db_pass":      dbScore >= 70,
-			"dr_score":     drScore,
-			"dr_pass":      drScore >= 60,
-			"m_score":      mScore,
-			"m_pass":       mScore >= 50,
+			"code":          code,
+			"name":          name,
+			"price":         price,
+			"change_pct":    chg,
+			"n_score":       nScore,
+			"n_pass":        nScore >= 60,
+			"dragon_score":  dragonScore,
+			"dragon_pass":   dragonScore >= 70,
+			"db_score":      dbScore,
+			"db_pass":       dbScore >= 70,
+			"dr_score":      drScore,
+			"dr_pass":       drScore >= 60,
+			"m_score":       mScore,
+			"m_pass":        mScore >= 50,
+			"signal_active": sigActive,
 		})
 	}
 	if len(out) == 0 {
@@ -631,16 +646,19 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	macroEvents := s.macroEvents(now)
 	for _, me := range macroEvents {
+		// 仅展示近 14 天内的事件（已开始超过 1 天的直接丢弃）
 		daysLeft := int(me.Date.Sub(now).Hours() / 24)
 		if daysLeft < -1 || daysLeft > 14 {
 			continue
 		}
+		// 影响级别转中文标签：high→高 / medium→中 / 其余→低
 		label := "低"
 		if me.Impact == "high" {
 			label = "高"
 		} else if me.Impact == "medium" {
 			label = "中"
 		}
+		// 剩余天数文案：已开始→进行中 / 今天→今日 / 未来→N天后
 		leftStr := ""
 		switch {
 		case daysLeft < 0:

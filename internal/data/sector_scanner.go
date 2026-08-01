@@ -20,27 +20,27 @@ type HotSector struct {
 
 // ScoredStock 板块内个股评分结果。
 type ScoredStock struct {
-	Code      string
-	Name      string
-	Price     float64 `json:"price"`
-	ChangePct float64 `json:"change_pct"`
-	Turnover  float64 `json:"turnover"`
-	Volume    float64 `json:"volume"`
-	Amount    float64 `json:"amount"`
-	Score     float64 `json:"score"` // 0-100 综合分
+	Code      string  `json:"code"`       // 股票代码
+	Name      string  `json:"name"`       // 股票名称
+	Price     float64 `json:"price"`      // 最新价（元）
+	ChangePct float64 `json:"change_pct"` // 涨跌幅（%）
+	Turnover  float64 `json:"turnover"`   // 换手率（%）
+	Volume    float64 `json:"volume"`     // 成交量（股）
+	Amount    float64 `json:"amount"`     // 成交额（元）
+	Score     float64 `json:"score"`      // 0-100 综合分
 }
 
 // SectorScanner 板块扫描器。
 // 对全量板块进行多因子评分，筛选热点板块；
 // 结合 D1 事件匹配引擎，识别事件驱动型板块机会。
 type SectorScanner struct {
-	mu               sync.RWMutex
-	cachedSector     []SectorInfo       // 缓存的全量板块列表
-	api              *MarketAPI         // 行情 API（用于拉取成分股）
-	hotSectors       []HotSector        // 最新热点板块结果
-	expandedList     []string           // 展开后的自选股列表
-	matcher          *EventMatcher      // D1 事件匹配器
-	eventMap map[string]string // 板块代码 → 事件描述
+	mu           sync.RWMutex
+	cachedSector []SectorInfo      // 缓存的全量板块列表
+	api          *MarketAPI        // 行情 API（用于拉取成分股）
+	hotSectors   []HotSector       // 最新热点板块结果
+	expandedList []string          // 展开后的自选股列表
+	matcher      *EventMatcher     // D1 事件匹配器
+	eventMap     map[string]string // 板块代码 → 事件描述
 }
 
 // NewSectorScanner 创建板块扫描器。

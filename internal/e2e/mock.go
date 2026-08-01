@@ -18,7 +18,7 @@ import (
 // fixtureTransport 实现 http.RoundTripper，按 host+path 路由到 fixture 数据，
 // 响应格式与 internal/data 各解析器严格一致。
 type fixtureTransport struct {
-	fix *Fixture
+	fix *Fixture // 实盘数据快照，所有请求都从这里读取响应
 }
 
 // RoundTrip 路由请求到对应 fixture 数据。
@@ -62,6 +62,7 @@ func (t *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 }
 
+// json 构造一个 200 状态、application/json 类型的 mock 响应。
 func (t *fixtureTransport) json(v interface{}) (*http.Response, error) {
 	body, err := json.Marshal(v)
 	if err != nil {
@@ -70,6 +71,7 @@ func (t *fixtureTransport) json(v interface{}) (*http.Response, error) {
 	return response(200, "application/json", body), nil
 }
 
+// text 构造一个 200 状态、text/html 编码的 mock 响应（用于同花顺页面 HTML 重放）。
 func (t *fixtureTransport) text(s string) (*http.Response, error) {
 	return response(200, "text/html; charset=utf-8", []byte(s)), nil
 }
@@ -149,7 +151,7 @@ func (t *fixtureTransport) emClist(req *http.Request) (*http.Response, error) {
 		for i, s := range t.fix.EMBoardList {
 			items[strconv.Itoa(i)] = map[string]interface{}{
 				"f12": s.Code, "f14": s.Name,
-				"f3": s.ChangePct * 100,
+				"f3":  s.ChangePct * 100,
 				"f20": s.Amount, "f62": s.NetInflow,
 				"f104": s.VolumeRank, "f105": s.LimitupCnt,
 			}
@@ -328,6 +330,7 @@ func sealToInt(hhmm string) int {
 	return h*10000 + m*100
 }
 
+// response 构造一个最小可用的 *http.Response（含状态码、Content-Type 与请求体）。
 func response(code int, contentType string, body []byte) *http.Response {
 	return &http.Response{
 		StatusCode: code,
@@ -343,9 +346,9 @@ func response(code int, contentType string, body []byte) *http.Response {
 
 // llmCalls 记录 mock LLM 的调用类型与请求文本。
 type llmCalls struct {
-	stage0   []string
-	stage2   []string
-	d1       []string
+	stage0 []string
+	stage2 []string
+	d1     []string
 }
 
 // newMockLLMServer 启动按 system prompt 区分的 mock LLM 服务。
@@ -406,13 +409,15 @@ type combinedJudge struct {
 // materialTitles 有投资价值的场景新闻（其余 official 新闻 material=false）。
 var materialTitles = map[string]bool{
 	"工信部等七部门印发《人工智能算力基础设施高质量发展行动计划》": true,
-	"宁德时代中标沙特10GWh储能系统大单":                      true,
-	"贵州茅台三季度营收净利双降 单季净利同比下滑15%":             true,
-	"国家医保局拟开展第七轮药品集采 创新药面临利空":             true,
-	"恒瑞医药创新药获批上市":                            true,
-	"突发！大消息！AI算力再迎超级风口":                     true,
+	"宁德时代中标沙特10GWh储能系统大单":            true,
+	"贵州茅台三季度营收净利双降 单季净利同比下滑15%":      true,
+	"国家医保局拟开展第七轮药品集采 创新药面临利空":        true,
+	"恒瑞医药创新药获批上市":                    true,
+	"突发！大消息！AI算力再迎超级风口":              true,
 }
 
+// judgeCombined 按标题关键词判定 Stage0 质检结果：
+// 含"研报/中金"的归为机构噪音（official=false），其余看是否在 materialTitles 中判定投资价值。
 func judgeCombined(title string) combinedJudge {
 	if strings.Contains(title, "研报") || strings.Contains(title, "中金") {
 		return combinedJudge{official: false}
@@ -506,7 +511,7 @@ var scenarioAnalyses = map[string]htResult{
 		Level: "板块", Sentiment: "正面", Score: 0.75, ImpactLevel: "中", EventType: "行业",
 		Urgency: "关注", Direction: "利好", Sectors: []string{"人工智能"},
 		RelatedStocks: []string{"300308", "000938"},
-		Strategy: "无", Reason: "AI算力板块午后集体走强",
+		Strategy:      "无", Reason: "AI算力板块午后集体走强",
 	},
 }
 

@@ -18,12 +18,14 @@ func (a *Agent) EnrichContents(items []data.NewsItem) []data.NewsItem {
 	if a.marketAPI == nil {
 		return items
 	}
+	// 统计本轮需要抓正文的条数：有 URL 且当前摘要过短（不足 minEnrichLen）
 	todo := 0
 	for i := range items {
 		if items[i].URL != "" && len(items[i].Content) < minEnrichLen {
 			todo++
 		}
 	}
+	// 单轮抓取上限，防止追回大包时对文章页产生洪峰请求
 	if todo > maxEnrichPerRound {
 		todo = maxEnrichPerRound
 	}
@@ -31,10 +33,12 @@ func (a *Agent) EnrichContents(items []data.NewsItem) []data.NewsItem {
 		return items
 	}
 
+	// 信号量限制并发抓取数为 4，避免瞬时大量并发请求
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	done := 0
 	for i := range items {
+		// 跳过无需抓取（无 URL 或摘要已足够）以及超过本轮上限的条目
 		if items[i].URL == "" || len(items[i].Content) >= minEnrichLen {
 			continue
 		}
@@ -49,9 +53,11 @@ func (a *Agent) EnrichContents(items []data.NewsItem) []data.NewsItem {
 			defer func() { <-sem }()
 			body, err := a.marketAPI.GetArticle(items[i].URL)
 			if err != nil {
+				// 抓取失败保留原摘要，仅记日志，不阻断流水线
 				log.Printf("[newsagent] 正文抓取失败 %s: %v", items[i].URL, err)
 				return
 			}
+			// 仅当抓取到的正文更长时才覆盖摘要，避免降级替换
 			if len(body) > len(items[i].Content) {
 				items[i].Content = body
 			}

@@ -11,6 +11,7 @@
         <button class="btn-clear" @click="onClearAll">清空全部</button>
       </div>
     </div>
+    <!-- 消息等级筛选栏：全部 / 命中提醒 / 策略信号 / 止盈止损 / 持仓提示 -->
     <div class="filter-row">
       <button v-for="f in filters" :key="f.key"
         :class="['filter-btn', activeFilter === f.key ? 'active' : '']"
@@ -41,15 +42,15 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
-import { onMounted, onUnmounted } from 'vue'
-import * as api from '../api/index.js'
+import { ref, computed } from 'vue'        // Vue 组合式 API：响应式 ref、计算属性
+import { onMounted, onUnmounted } from 'vue'  // 挂载/卸载生命周期钩子
+import * as api from '../api/index.js'       // 后端 API 封装：提醒消息增删查接口
 
 // ── 响应式状态 ──
 const alerts = ref([])               // 全部提醒消息
 const activeFilter = ref('all')      // 当前筛选类别
-let timer = null
-let unsubSSE = null
+let timer = null                  // 定时轮询句柄
+let unsubSSE = null               // SSE 取消订阅函数
 
 /** SSE 触发刷新 */
 function handleSSE() { load() }

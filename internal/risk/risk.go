@@ -55,8 +55,10 @@ func (e *Engine) CheckSignal(sig *strategy.Signal) *CheckResult {
 // 参数 entryPrice: 入场价；currentPrice: 当前价；cfg: 回撤规则配置。
 // 若回撤幅度超过规则设定则返回不通过并附带建议动作。
 func (e *Engine) CheckDrawdown(entryPrice, currentPrice float64, cfg config.DrawdownRule) *CheckResult {
+	// 回撤幅度 = (当前价 - 入场价) / 入场价 * 100，正值盈利、负值亏损
 	drawdown := (currentPrice - entryPrice) / entryPrice * 100
 
+	// 回撤超过阈值（drawdown ≤ 阈值即触发，drawdown 为负值）则执行配置动作
 	if drawdown <= cfg.Pct {
 		return &CheckResult{
 			Pass:     false,
@@ -119,9 +121,11 @@ func (e *Engine) checkCompliance(cc config.ComplianceConfig) *CheckResult {
 func (e *Engine) M8Check(currentTotal, peakTotal float64) *CheckResult {
 	cfg := e.cfg.Get()
 	rc := cfg.RiskCtrl
+	// M8 兜底未启用或无有效峰值时不检查
 	if !rc.M8Enabled || peakTotal <= 0 {
 		return &CheckResult{Pass: true}
 	}
+	// 组合回撤 = (当前市值 - 峰值市值) / 峰值市值 * 100
 	drawdown := (currentTotal - peakTotal) / peakTotal * 100
 	if drawdown <= rc.M8PortfolioDrawdownPct {
 		return &CheckResult{
@@ -146,6 +150,7 @@ func (e *Engine) PositionLimitCheck(currentPct, singlePct, totalPct float64, str
 	cfg := e.cfg.Get()
 	rc := cfg.RiskCtrl
 
+	// N 形策略特殊规则：不受 30%/80% 常规限制，仅做 90% 单票截断
 	if strategyType == strategy.SignalNShape {
 		if singlePct > 90 {
 			return &CheckResult{Pass: false, Action: "block", Priority: strategy.P1, Reason: "N形单票超90%截断"}
@@ -153,6 +158,7 @@ func (e *Engine) PositionLimitCheck(currentPct, singlePct, totalPct float64, str
 		return &CheckResult{Pass: true}
 	}
 
+	// 常规策略：先检查单票仓位上限，再检查总仓位上限
 	if singlePct > rc.PerStockMax {
 		return &CheckResult{Pass: false, Action: "block", Priority: strategy.P3, Reason: "单票仓位超限"}
 	}

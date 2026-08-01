@@ -69,7 +69,7 @@ func DetectEmotionPhaseV2(pool []LimitUpStock, upCount, downCount int, cfg *conf
 		return "启动" // 数据缺失（盘前/接口异常）不判冰点，保守归"启动"
 	}
 	limitUpCnt := len(pool)
-	maxBoard := 0
+	maxBoard := 0 // 最高连板数（涨停池中 LianBan 的最大值）
 	for _, s := range pool {
 		if s.LianBan > maxBoard {
 			maxBoard = s.LianBan

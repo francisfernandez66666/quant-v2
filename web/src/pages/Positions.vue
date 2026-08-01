@@ -123,8 +123,8 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import * as api from '../api/index.js'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue' // Vue 组合式 API：响应式、计算属性、侦听器、DOM 更新钩子与生命周期钩子
+import * as api from '../api/index.js'                                        // 后端 API 调用封装（持仓、资金、状态等）
 
 // ── 响应式状态 ──
 const holdings = ref([])                    // 持仓列表
@@ -133,14 +133,16 @@ const showAdd = ref(false)                  // 是否显示新增/编辑弹窗
 const pnlOffset = ref(parseFloat(localStorage.getItem('pnl_offset') || '0'))  // 盈亏清零偏移量
 
 // ── 本地持久化镜像：进 tab 秒开，增删改才变更 ──
-const CACHE_KEY = 'pos_cache_v1'
-const BALANCE_KEY = 'pos_balance_v1'
+const CACHE_KEY = 'pos_cache_v1'   // localStorage 键名：持仓与资金缓存快照
+const BALANCE_KEY = 'pos_balance_v1' // localStorage 键名：可用资金缓存（预留）
+/** 将当前持仓与资金快照写入 localStorage 缓存 */
 function persistCache() {
   try {
     // 将持仓与资金快照写入 localStorage
     localStorage.setItem(CACHE_KEY, JSON.stringify({ holdings: holdings.value, balance: availableBalance.value }))
   } catch (_) {}
 }
+/** 从 localStorage 缓存恢复持仓与资金，实现进页面秒开 */
 function loadCache() {
   try {
     // 从本地缓存恢复持仓与资金，进页面秒开
@@ -152,6 +154,7 @@ function loadCache() {
     }
   } catch (_) {}
 }
+// 侦听持仓与资金变化，深拷贝写入本地缓存
 watch([holdings, availableBalance], persistCache, { deep: true })
 
 /** 计算总盈亏 = Σ(现价-成本)*数量 - 偏移量 */
@@ -182,18 +185,18 @@ function resetPnl() {
 
 // ── 表单状态 ──
 const editingIdx = ref(-1)       // -1 表示新增，>=0 表示编辑对应索引
-const formCode = ref('')
-const formCost = ref(0)
-const formQty = ref(0)
+const formCode = ref('')         // 新增/编辑表单：股票代码
+const formCost = ref(0)          // 新增/编辑表单：成本价
+const formQty = ref(0)           // 新增/编辑表单：持股数量
 const lookupName = ref('')       // 代码查询返回的股票名称
 const lookupPrice = ref(0)       // 代码查询返回的现价
 const formTp = ref(8)            // 默认止盈 +8%
 const formSl = ref(5)            // 默认止损 -5%
-const editingBalance = ref(false)
-const balanceInputVal = ref(0)
-const balanceInput = ref(null)
+const editingBalance = ref(false)  // 是否正在编辑可用资金（显示输入框）
+const balanceInputVal = ref(0)     // 可用资金编辑输入框的值
+const balanceInput = ref(null)     // 可用资金编辑输入框的 DOM 引用（用于自动聚焦）
 
-let timer = null
+let timer = null   // 30 秒轮询定时器句柄
 
 /** 进入编辑可用资金模式 */
 function editBalanceStart() {

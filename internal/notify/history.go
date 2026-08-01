@@ -13,26 +13,26 @@ import (
 
 // SignalRecord 单条信号历史记录，包含时间、代码、策略、操作、评分等字段。
 type SignalRecord struct {
-	Time           time.Time
-	Code           string
-	Name           string
-	Strategy       string
-	Action         string
-	Priority       int
-	Score          float64
-	D1, D2, D3, D4 float64
-	Price          float64
-	Level          string
+	Time           time.Time // 信号时间
+	Code           string    // 股票代码
+	Name           string    // 股票名称
+	Strategy       string    // 触发策略
+	Action         string    // 操作（buy/sell 等）
+	Priority       int       // 优先级
+	Score          float64   // 综合评分
+	D1, D2, D3, D4 float64   // 四个维度评分
+	Price          float64   // 信号价格
+	Level          string    // 提醒级别（strong/observe 等）
 }
 
 // History 信号历史管理器，维护当日 CSV 文件写入和内存记录。
 type History struct {
-	mu      sync.Mutex
-	file    *os.File
-	writer  *csv.Writer
-	records []SignalRecord
-	dir     string
-	today   string
+	mu      sync.Mutex     // 保护内存记录与文件写入的互斥锁
+	file    *os.File       // 当日 CSV 文件句柄
+	writer  *csv.Writer    // CSV 写入器
+	records []SignalRecord // 内存中的信号记录列表
+	dir     string         // CSV 存储目录
+	today   string         // 当前文件对应的日期（YYYY-MM-DD），跨天时切换文件
 }
 
 // NewHistory 创建历史管理器，自动创建或追加当日 CSV 文件。
@@ -81,6 +81,7 @@ func (h *History) YesterdayRecords() []SignalRecord {
 	return h.filterByDate(time.Now().AddDate(0, 0, -1))
 }
 
+// filterByDate 按指定日期的 YYYY-MM-DD 过滤内存记录（调用方需持有锁）。
 func (h *History) filterByDate(t time.Time) []SignalRecord {
 	date := t.Format("2006-01-02")
 	var out []SignalRecord

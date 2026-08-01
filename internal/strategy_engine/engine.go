@@ -16,8 +16,19 @@ import (
 type Engine struct {
 	mu             sync.RWMutex        // 读写锁
 	marketAPI      *data.MarketAPI     // 行情 API
+	ths            *data.THSClient     // 同花顺客户端（行情降级链路：新浪→同花顺→东财）
 	scanner        *data.SectorScanner // 板块扫描器
 	stockSectorIdx map[string][]string // 个股→板块倒排索引
+
+	klineCacheMu sync.RWMutex
+	klineCache   map[string]*klineCacheEntry // 日K/资金流缓存（近实时打分用）
+}
+
+// klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。
+type klineCacheEntry struct {
+	klines    []data.KLine
+	moneyFlow *data.CapitalFlow
+	fetchedAt time.Time
 }
 
 // New 创建策略引擎实例。
@@ -25,7 +36,15 @@ func New(marketAPI *data.MarketAPI) *Engine {
 	return &Engine{
 		marketAPI:      marketAPI,
 		stockSectorIdx: make(map[string][]string),
+		klineCache:     make(map[string]*klineCacheEntry),
 	}
+}
+
+// SetTHS 设置同花顺客户端（线程安全），接入 新浪→同花顺→东财 行情降级链路。
+func (e *Engine) SetTHS(ths *data.THSClient) {
+	e.mu.Lock()
+	e.ths = ths
+	e.mu.Unlock()
 }
 
 // SetScanner 设置板块扫描器（线程安全）。
@@ -39,11 +58,10 @@ func (e *Engine) SetScanner(scanner *data.SectorScanner) {
 // events 为已通过阈值过滤（|score|≥0.50）的新闻事件；positions 为当前持仓，watchlist 为用户自选。
 func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, positions, watchlist []string) *StrategyResult {
 	t0 := time.Now()
-	log.Printf("[strategy_engine] Evaluate 开始")
-
 	if len(events) == 0 {
-		log.Printf("[strategy_engine] 无事件，返回空结果")
-		return &StrategyResult{}
+		log.Printf("[strategy_engine] 无事件，仅收拢 持仓+自选 打分池")
+	} else {
+		log.Printf("[strategy_engine] Evaluate 开始")
 	}
 
 	// 1. attribution: 事件 → 板块/个股分流
@@ -58,11 +76,13 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 		if ev.Level != "个股" || len(ev.CleanedStocks) == 0 {
 			continue
 		}
+		// 方向判定：Score>0 利好进做多池，Score<0 利空进做空池，Score=0（中性）跳过
 		isLong := ev.Score > 0
 		isShort := ev.Score < 0
 		if !isLong && !isShort {
 			continue
 		}
+		// CleanedStocks 元素形如 "名称|代码"，拆分后规范化代码（去 SH/SZ 前后缀）
 		for _, cs := range ev.CleanedStocks {
 			parts := strings.SplitN(cs, "|", 2)
 			if len(parts) != 2 {
@@ -83,7 +103,7 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 	}
 	log.Printf("[strategy_engine] 个股分流: %d利好 %d利空", len(longStocks), len(shortStocks))
 
-	// 3. 收拢打分池：Stage2 个股 + 持仓 + 自选
+	// 3. 收拢打分池：Stage2 个股 + 持仓 + 自选（Set 去重）
 	poolSet := make(map[string]bool)
 	for _, st := range longStocks {
 		poolSet[st.Code] = true
@@ -97,6 +117,7 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 	for _, code := range watchlist {
 		poolSet[code] = true
 	}
+	// 从 Set 还原为无序切片，供后续统一拉行情与打分
 	scoringPool := make([]string, 0, len(poolSet))
 	for code := range poolSet {
 		scoringPool = append(scoringPool, code)
@@ -125,28 +146,45 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 }
 
 // fetchMarketData 为打分池所有个股拉取行情数据（实时价 + KLine + 资金流向）。
-// 实时行情走新浪批量 CSV（一次网络请求拉全池），K线/资金流并发拉取（每只2次请求）。
+// 实时行情降级链路：新浪批量 CSV（一次网络请求拉全池）→ 同花顺单查 → 东财单查。
+// K线/资金流并发拉取（每只2次请求）。
 func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string]*StockMarketData {
 	result := make(map[string]*StockMarketData, len(codes))
 	for _, code := range codes {
 		result[code] = &StockMarketData{Code: code}
 	}
 
-	// 1. 批量实时行情（新浪 CSV 单次请求）
-	for code, si := range e.marketAPI.GetSinaQuotes(codes) {
+	// 1. 批量实时行情（新浪 CSV 单次请求，全池一次拉完）
+	sinaQuotes := e.marketAPI.GetSinaQuotes(codes)
+	for code, si := range sinaQuotes {
 		if md, ok := result[code]; ok && si != nil && si.Price > 0 {
 			md.Name = si.Name
 			md.Price = si.Price
 			md.ChangePct = si.ChangePct
+			md.Quote = si
 		}
 	}
-	// 兜底：批量未命中的个股单查东财实时行情
+	// 2. 兜底：批量未命中的个股先走同花顺，仍失败再东财单查
+	var thsMiss, emMiss int
 	for code, md := range result {
 		if md.Price > 0 {
 			continue
 		}
+		if e.ths != nil {
+			si, err := e.ths.GetQuote(code)
+			if err == nil && si != nil && si.Price > 0 {
+				md.Name = si.Name
+				md.Price = si.Price
+				md.ChangePct = si.ChangePct
+				md.Quote = si
+				continue
+			}
+			thsMiss++
+		}
+		// 最后一层兜底：东财实时报价；仍失败则记录 Error 供上层排查
 		si, err := e.marketAPI.GetRealtimeQuote(code)
 		if err != nil || si == nil || si.Price <= 0 {
+			emMiss++
 			md.Error = "行情获取失败"
 			log.Printf("[strategy_engine] 行情失败 %s: %v", code, err)
 			continue
@@ -154,9 +192,14 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 		md.Name = si.Name
 		md.Price = si.Price
 		md.ChangePct = si.ChangePct
+		md.Quote = si
+	}
+	if thsMiss > 0 || emMiss > 0 {
+		log.Printf("[strategy_engine] 行情降级: 新浪%d只 → 同花顺兜底失败%d → 东财兜底失败%d",
+			len(sinaQuotes), thsMiss, emMiss)
 	}
 
-	// 2. K线 + 资金流向：并发拉取（限流由 data 层 limiter 保证）
+	// 2. K线 + 资金流向 + 分钟级量价/MACD：并发拉取（限流由 data 层 limiter 保证）
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 6)
 	for code, md := range result {
@@ -166,6 +209,7 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			// 日K：优先新浪，失败降级东财（101=日线）
 			klines, err := e.marketAPI.GetSinaKLine(code, 120)
 			if err == nil && len(klines) > 0 {
 				md.KLines = klines
@@ -176,15 +220,135 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 				}
 			}
 
+			// 资金流向（主力净流入，供资金维度评分）
 			cf, err := e.marketAPI.GetStockMoneyFlow(code)
 			if err == nil && cf != nil {
 				md.MoneyFlow = cf
+			}
+
+			// 分钟K线（5分钟，48根≈当日）→ 计算 MACD，供 8a/8b 动量分与 N 形评分使用
+			minKL, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48)
+			if err == nil && len(minKL) >= 2 {
+				md.MinuteKLine = minKL
+				md.MinuteMACD = data.CalcMACD(minKL)
 			}
 		}(code, md)
 	}
 	wg.Wait()
 
 	return result
+}
+
+// BuildScoringData 为近实时 8a/8b 打分循环构建行情数据（5s 节奏）。
+// - 实时量价优先取外部快照 quotes（data.Fetcher 5s 采集：新浪→同花顺→东财），缺失的走本引擎降级链补齐；
+// - 日K + 资金流走进程内缓存（TTL 5 分钟，交易日内基本不变）；
+// - 分钟K线（MACD）每轮现拉，保证动量/N 形评分的实时性。
+func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes map[string]*data.StockInfo) map[string]*StockMarketData {
+	result := make(map[string]*StockMarketData, len(codes))
+	for _, code := range codes {
+		result[code] = &StockMarketData{Code: code}
+	}
+
+	// 1. 实时量价：外部快照优先，缺失走 新浪批量→同花顺→东财 兜底
+	var missing []string
+	for code, md := range result {
+		if si, ok := quotes[code]; ok && si != nil && si.Price > 0 {
+			md.Name = si.Name
+			md.Price = si.Price
+			md.ChangePct = si.ChangePct
+			md.Quote = si
+			continue
+		}
+		missing = append(missing, code)
+	}
+	if len(missing) > 0 {
+		fallback := e.fetchQuotes(missing)
+		for code, md := range result {
+			if md.Price > 0 {
+				continue
+			}
+			if si, ok := fallback[code]; ok && si != nil && si.Price > 0 {
+				md.Name = si.Name
+				md.Price = si.Price
+				md.ChangePct = si.ChangePct
+				md.Quote = si
+			}
+		}
+	}
+
+	// 2. 日K + 资金流：走缓存（TTL 5min）；分钟K线现拉（并发，限流由 data 层保证）
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 6)
+	for code, md := range result {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(code string, md *StockMarketData) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			md.KLines, md.MoneyFlow = e.cachedKLine(code)
+			minKL, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48)
+			if err == nil && len(minKL) >= 2 {
+				md.MinuteKLine = minKL
+				md.MinuteMACD = data.CalcMACD(minKL)
+			}
+		}(code, md)
+	}
+	wg.Wait()
+
+	log.Printf("[strategy_engine] BuildScoringData: %d只 (快照quote=%d 兜底=%d)", len(codes), len(codes)-len(missing), len(missing))
+	return result
+}
+
+// fetchQuotes 只拉实时行情（降级链：新浪批量→同花顺→东财），用于快照缺失的个股。
+func (e *Engine) fetchQuotes(codes []string) map[string]*data.StockInfo {
+	out := make(map[string]*data.StockInfo, len(codes))
+	for code, si := range e.marketAPI.GetSinaQuotes(codes) {
+		if si != nil && si.Price > 0 {
+			out[code] = si
+		}
+	}
+	for _, code := range codes {
+		if _, ok := out[code]; ok {
+			continue
+		}
+		if e.ths != nil {
+			if si, err := e.ths.GetQuote(code); err == nil && si != nil && si.Price > 0 {
+				out[code] = si
+				continue
+			}
+		}
+		if si, err := e.marketAPI.GetRealtimeQuote(code); err == nil && si != nil && si.Price > 0 {
+			out[code] = si
+		}
+	}
+	return out
+}
+
+// cachedKLine 返回个股日K + 资金流，走 5 分钟 TTL 缓存；缓存缺失/过期时重新拉取。
+func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
+	now := time.Now()
+	e.klineCacheMu.RLock()
+	ent, ok := e.klineCache[code]
+	e.klineCacheMu.RUnlock()
+	if ok && now.Sub(ent.fetchedAt) < 5*time.Minute && len(ent.klines) > 0 {
+		return ent.klines, ent.moneyFlow
+	}
+
+	klines, err := e.marketAPI.GetSinaKLine(code, 120)
+	if err != nil || len(klines) == 0 {
+		if k2, err2 := e.marketAPI.GetKLine(code, "101", 120); err2 == nil && len(k2) > 0 {
+			klines = k2
+		}
+	}
+	cf, err := e.marketAPI.GetStockMoneyFlow(code)
+	if err != nil {
+		cf = nil
+	}
+
+	e.klineCacheMu.Lock()
+	e.klineCache[code] = &klineCacheEntry{klines: klines, moneyFlow: cf, fetchedAt: now}
+	e.klineCacheMu.Unlock()
+	return klines, cf
 }
 
 // attribution 事件归因：将新闻事件按利好/利空方向分流到板块，合并相同板块的事件。
@@ -199,6 +363,7 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 			continue
 		}
 
+		// 按 Score 符号决定事件归属的板块池：负分进利空池，否则进利好池
 		isBear := ev.Score < 0
 
 		for _, sec := range ev.Sectors {
@@ -209,6 +374,7 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 			if isBear {
 				m = bearMap
 			}
+			// 同一板块的多次事件合并：累计新闻标题，保留 |score| 最大的一次事件属性
 			if existing, ok := m[sec]; ok {
 				existing.NewsTitles = append(existing.NewsTitles, ev.Title)
 				if absScore(ev.Score) > absScore(existing.Score) {

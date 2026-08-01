@@ -61,8 +61,8 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import * as api from '../api/index.js'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、监听器、生命周期钩子
+import * as api from '../api/index.js'                             // 后端 API 封装：状态/快照/自选列表/评分等数据接口
 
 // ── 响应式状态 ──
 const stocks = ref([])                // 自选股数据（含实时价格 + 评分）
@@ -73,13 +73,15 @@ const adding = ref(false)             // 是否正在添加
 const feedback = ref('')              // 操作反馈文字
 const feedbackType = ref('ok')        // 反馈类型：'ok' | 'err'
 
-let timer = null
+let timer = null                  // 定时轮询句柄
 
 // ── 本地持久化镜像：进 tab 秒开，增删改才变更 ──
-const CACHE_KEY = 'wl_cache_v1'
+const CACHE_KEY = 'wl_cache_v1'   // localStorage 缓存键名
+/** 将当前自选股列表快照写入 localStorage 缓存（供下次进入页面秒开） */
 function persistCache() {
   try { localStorage.setItem(CACHE_KEY, JSON.stringify(stocks.value)) } catch (_) {}
 }
+/** 从 localStorage 缓存恢复自选股列表；无缓存或解析失败时返回空数组 */
 function loadCache() {
   try {
     const raw = localStorage.getItem(CACHE_KEY)
@@ -87,6 +89,7 @@ function loadCache() {
     return Array.isArray(arr) ? arr : []
   } catch (_) { return [] }
 }
+/** 深度监听自选股列表变化，自动写入本地缓存 */
 watch(stocks, persistCache, { deep: true })
 
 /**
@@ -269,6 +272,7 @@ onMounted(() => {
   load()
   timer = setInterval(load, 30000)
 })
+/** 卸载时清理定时器，避免内存泄漏 */
 onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 

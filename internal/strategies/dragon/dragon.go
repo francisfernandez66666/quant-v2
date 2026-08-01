@@ -73,6 +73,7 @@ func (d *DragonStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 // F3 溢价率：个股涨幅超出板块最强涨幅 2%+ 说明辨识度突出。
 // F4 RS 强度：近 5 日趋势涨幅。
 func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []data.KLine, sectors []data.SectorInfo) *strategy.Evaluation {
+	// 基础数据校验：无实时价或 K 线不足 5 根无法评分
 	if si == nil || si.Price <= 0 || len(kLines) < 5 {
 		return nil
 	}
@@ -83,6 +84,7 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	// 涨幅>9.5%视为封板，量额比高说明封板坚决。
 	f1 := 0.0
 	if si.ChangePct > 9.5 {
+		// 基础分 = 权重×90%；量额比（成交量/成交额）越高封板越坚决，最高补充 10%
 		f1 = dc.F1SealWeight * 100 * 0.9
 		if si.Amount > 0 {
 			f1 += (float64(si.Volume) / si.Amount) * 0.1 * dc.F1SealWeight * 100
@@ -105,6 +107,7 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	}
 
 	// F3: 溢价率 — 个股涨幅偏离板块最强涨幅
+	// 超出最强板块 2%+ → 满分（辨识度突出）；个股自身 >5% → 半值
 	f3 := 0.0
 	if bestSector > 0 && si.ChangePct > bestSector+2 {
 		f3 = dc.F3PremiumWeight * 100
@@ -124,6 +127,7 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 		}
 	}
 
+	// 总分封顶 100；pass 至少需 ≥50
 	total := math.Min(f1+f2+f3+f4, 100)
 	pass := total >= 50
 	level := "watch"
@@ -153,11 +157,13 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 // full_chain → buy，置信度>0.8 → P1，否则 P2。
 // brief → watch，P3_5。
 func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
+	// 默认：仅观察（watch / P3）
 	prio := strategy.P3
 	action := strategy.ActionWatch
 
 	switch eval.Level {
 	case "full_chain":
+		// 完整链确认：买入信号，按置信度分 P1/P2
 		action = strategy.ActionBuy
 		if eval.Confidence > 0.8 {
 			prio = strategy.P1
@@ -165,10 +171,12 @@ func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 			prio = strategy.P2
 		}
 	case "brief":
+		// 半确认：保持观察，P3_5
 		action = strategy.ActionWatch
 		prio = strategy.P3_5
 	}
 
+	// 复制评分明细到 Meta（供前端展示 F1~F4 分数）
 	meta := make(map[string]float64)
 	for k, v := range eval.Details {
 		meta[k] = v

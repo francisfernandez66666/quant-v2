@@ -1,3 +1,5 @@
+// Package data — 消息中心持久化存储。
+// 按稳定键（ID）去重合并消息，支持删除墓碑（当日不再自动出现）与跨交易日清理。
 package data
 
 import (
@@ -12,19 +14,21 @@ import (
 // MessageItem 消息中心单条消息（与前端 /api/alerts 结构一致）。
 // ID 为稳定去重键（如 600519@止盈 / hold@SIGxxx），供手工删除定位。
 type MessageItem struct {
-	ID          string    `json:"id"`
-	Code        string    `json:"code"`
-	Name        string    `json:"name"`
-	Level       string    `json:"level"`
-	Action      string    `json:"action"`
-	Strategy    string    `json:"strategy"`
-	Time        string    `json:"time"`
-	Title       string    `json:"title"`
-	Body        string    `json:"body"`
-	Direction   string    `json:"direction"`
-	GeneratedAt time.Time `json:"generated_at"`
+	ID          string    `json:"id"`           // 稳定去重键
+	Code        string    `json:"code"`         // 股票代码
+	Name        string    `json:"name"`         // 股票名称
+	Level       string    `json:"level"`        // 级别（如 止盈/止损/提示）
+	Action      string    `json:"action"`       // 动作
+	Strategy    string    `json:"strategy"`     // 关联策略
+	Time        string    `json:"time"`         // 触发时间字符串
+	Title       string    `json:"title"`        // 标题
+	Body        string    `json:"body"`         // 正文
+	Direction   string    `json:"direction"`    // 方向（利好/利空）
+	GeneratedAt time.Time `json:"generated_at"` // 生成时间
 }
 
+// messageFile 消息中心持久化文件结构。
+// TradingDay 记录当前交易日；Messages 为消息列表；DeletedKeys 为当日删除墓碑。
 type messageFile struct {
 	TradingDay  string        `json:"trading_day"`
 	Messages    []MessageItem `json:"messages"`
@@ -34,8 +38,8 @@ type messageFile struct {
 // MessageStore 消息中心持久化存储。
 // 按稳定键（ID）去重合并；已删除键记录墓碑（当日内不再自动出现），跨交易日自动清除墓碑。
 type MessageStore struct {
-	mu   sync.Mutex
-	path string
+	mu   sync.Mutex // 保护 file 的并发读写
+	path string     // 持久化文件路径
 	file messageFile
 }
 
@@ -57,6 +61,8 @@ func NewMessageStore(path string) *MessageStore {
 	return s
 }
 
+// persist 将当前消息状态序列化并写入本地文件。
+// 更新 TradingDay 为当前交易日；path 为空或写文件失败时记录日志并跳过。
 func (s *MessageStore) persist() {
 	if s.path == "" {
 		return

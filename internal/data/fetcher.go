@@ -22,11 +22,29 @@ const maxWatchStocks = 60 // 热点监控股票上限
 // 非交易时段应调用 FetchOnce() 手动触发，避免无效轮询。
 type Fetcher struct {
 	dc         *DataCoordinator
+	api        *MarketAPI // 行情 API（新浪批量优先）
 	mu         sync.RWMutex
 	snapshot   *MarketSnapshot
 	baseStocks []string // 自选+持仓，无上限
 	hotStocks  []string // 热点板块个股，上限 60，随板块替换
 	stopCh     chan struct{}
+}
+
+// allStocks 返回去重合并后的完整监控列表（base + hot）。
+// 通过 map 去重，避免同一只股票被重复拉取。
+func (f *Fetcher) allStocks() []string {
+	set := make(map[string]bool)
+	for _, s := range f.baseStocks {
+		set[s] = true
+	}
+	for _, s := range f.hotStocks {
+		set[s] = true
+	}
+	r := make([]string, 0, len(set))
+	for s := range set {
+		r = append(r, s)
+	}
+	return r
 }
 
 // SetBaseStocks 设置自选+持仓监控列表（无上限）。
@@ -77,28 +95,13 @@ func (f *Fetcher) EnsureStock(code string) {
 	f.mu.Unlock()
 }
 
-// allStocks 返回去重合并后的完整监控列表（base + hot）。
-func (f *Fetcher) allStocks() []string {
-	set := make(map[string]bool)
-	for _, s := range f.baseStocks {
-		set[s] = true
-	}
-	for _, s := range f.hotStocks {
-		set[s] = true
-	}
-	r := make([]string, 0, len(set))
-	for s := range set {
-		r = append(r, s)
-	}
-	return r
-}
-
 // NewFetcher 创建行情采集器。
-// stocks 为初始基础监控列表（自选），dc 为数据协调器（管理多源切换与熔断）。
-func NewFetcher(stocks []string, dc *DataCoordinator) *Fetcher {
+// stocks 为初始基础监控列表（自选），api 为行情 API（新浪批量优先），dc 为数据协调器（同花顺/东财兜底）。
+func NewFetcher(stocks []string, api *MarketAPI, dc *DataCoordinator) *Fetcher {
 	ch := make(chan struct{})
 	close(ch) // 初始为"已停止"状态，Running() 返回 false
 	return &Fetcher{
+		api:        api,
 		dc:         dc,
 		baseStocks: stocks,
 		stopCh:     ch,
@@ -202,8 +205,8 @@ func (f *Fetcher) loop() {
 	}
 }
 
-// fetch 执行一次完整数据拉取：逐一获取每只股票的行情 + 板块列表。
-// 结果存入 f.snapshot，供外部通过 Snapshot() 读取。
+// fetch 执行一次完整数据拉取：新浪批量拉取全池实时行情，未命中的走同花顺→东财兜底；
+// 板块列表另拉一次。结果存入 f.snapshot，供外部通过 Snapshot() 读取。
 func (f *Fetcher) fetch() {
 	snapshot := &MarketSnapshot{
 		Stocks: make(map[string]*StockInfo),
@@ -212,9 +215,25 @@ func (f *Fetcher) fetch() {
 	}
 
 	all := f.allStocks()
+
+	// 1. 新浪批量（单次请求全池），满足 新浪→同花顺→东财 降级链且避免单股限流拖慢 5s 循环
+	if f.api != nil {
+		for code, si := range f.api.GetSinaQuotes(all) {
+			if si != nil && si.Price > 0 {
+				snapshot.Stocks[code] = si
+			}
+		}
+	}
+
+	// 2. 兜底：未命中的个股走同花顺→东财
+	miss := 0
 	for _, code := range all {
+		if _, ok := snapshot.Stocks[code]; ok {
+			continue
+		}
 		si, err := f.dc.GetQuote(code)
 		if err != nil {
+			miss++
 			log.Printf("获取 %s 失败: %v", code, err)
 			continue
 		}
@@ -226,7 +245,7 @@ func (f *Fetcher) fetch() {
 		snapshot.Sector = sectors
 	}
 
-	log.Printf("数据采集: %d/%d 只 %d 板块 [%s]", len(snapshot.Stocks), len(all), len(snapshot.Sector), snapshot.Source)
+	log.Printf("数据采集: %d/%d 只 %d 板块 (兜底%d) [%s]", len(snapshot.Stocks), len(all), len(snapshot.Sector), miss, snapshot.Source)
 
 	f.mu.Lock()
 	f.snapshot = snapshot

@@ -31,14 +31,14 @@ import (
 
 // testRig 端到端装配产物：除引擎外暴露 SSE/报表/行情客户端等供后续子测试直接断言。
 type testRig struct {
-	eng    *engine.Engine
-	agg    *display.Aggregator
-	calls  *llmCalls
-	sse    *server.SSEBroker
-	rpt    *report.Report
-	market *data.MarketAPI
-	cfgMgr *config.Manager
-	wl     *data.WatchlistManager
+	eng    *engine.Engine         // 顶层编排引擎
+	agg    *display.Aggregator    // 看板聚合器（读取最终看板快照）
+	calls  *llmCalls              // mock LLM 调用记录（断言各阶段调用覆盖）
+	sse    *server.SSEBroker      // SSE 广播器（断言广播链路）
+	rpt    *report.Report         // 交易报表（断言持仓提醒）
+	market *data.MarketAPI        // 行情客户端（断言板块/新闻解析）
+	cfgMgr *config.Manager        // 配置管理器（战法权重等）
+	wl     *data.WatchlistManager // 自选股管理器
 }
 
 // applyScenarioOverrides 为战法触发/空路径验证场景对实盘快照做确定性增量覆盖：
@@ -50,11 +50,11 @@ func applyScenarioOverrides(fix *Fixture) {
 	if csv, ok := fix.Quotes["300308"]; ok {
 		parts := strings.Split(csv, ",")
 		if len(parts) > 5 {
-			parts[1] = "95.00"  // open
-			parts[2] = "86.54"  // prev_close：相对现价 95.21 涨 +10.02%
-			parts[3] = "95.21"  // price
-			parts[4] = "95.21"  // high
-			parts[5] = "94.00"  // low
+			parts[1] = "95.00" // open
+			parts[2] = "86.54" // prev_close：相对现价 95.21 涨 +10.02%
+			parts[3] = "95.21" // price
+			parts[4] = "95.21" // high
+			parts[5] = "94.00" // low
 			fix.Quotes["300308"] = strings.Join(parts, ",")
 		}
 	}
@@ -552,6 +552,7 @@ func TestEndToEndFullPipeline(t *testing.T) {
 
 // ── 断言辅助 ──
 
+// findEvent 在事件列表中按标题关键词查找第一条匹配事件，未找到返回 nil。
 func findEvent(events []newsagent.NewsEvent, kw string) *newsagent.NewsEvent {
 	for i := range events {
 		if strings.Contains(events[i].Title, kw) {
@@ -561,6 +562,7 @@ func findEvent(events []newsagent.NewsEvent, kw string) *newsagent.NewsEvent {
 	return nil
 }
 
+// assertEvent 断言事件的事件级别、方向与评分三个关键字段。
 func assertEvent(t *testing.T, ev *newsagent.NewsEvent, level, direction string, score float64) {
 	t.Helper()
 	if ev.Level != level {
@@ -574,6 +576,7 @@ func assertEvent(t *testing.T, ev *newsagent.NewsEvent, level, direction string,
 	}
 }
 
+// assertHasSector 断言板块列表中包含期望板块名。
 func assertHasSector(t *testing.T, sectors []string, want string) {
 	t.Helper()
 	if !containsStr(sectors, want) {
@@ -581,6 +584,7 @@ func assertHasSector(t *testing.T, sectors []string, want string) {
 	}
 }
 
+// assertHasCode 断言关联股票列表中包含期望代码（子串匹配）。
 func assertHasCode(t *testing.T, stocks []string, want string) {
 	t.Helper()
 	for _, s := range stocks {
@@ -591,6 +595,7 @@ func assertHasCode(t *testing.T, stocks []string, want string) {
 	t.Errorf("RelatedStocks=%v 缺少代码 %s", stocks, want)
 }
 
+// findSector 在板块列表中按名称查找板块，未找到返回 nil。
 func findSector(sectors []strategy_engine.SectorHot, name string) *strategy_engine.SectorHot {
 	for i := range sectors {
 		if sectors[i].Name == name {
@@ -600,6 +605,7 @@ func findSector(sectors []strategy_engine.SectorHot, name string) *strategy_engi
 	return nil
 }
 
+// containsCode 判断个股列表（按代码分流的结果）是否包含指定代码。
 func containsCode(stocks []strategy_engine.IndividualStock, code string) bool {
 	for _, s := range stocks {
 		if s.Code == code {
@@ -609,6 +615,7 @@ func containsCode(stocks []strategy_engine.IndividualStock, code string) bool {
 	return false
 }
 
+// containsVerified 判断已验证板块列表中是否包含指定板块名。
 func containsVerified(vs []sector_agent.VerifiedSector, name string) bool {
 	for _, v := range vs {
 		if v.Name == name {
@@ -618,6 +625,7 @@ func containsVerified(vs []sector_agent.VerifiedSector, name string) bool {
 	return false
 }
 
+// findSignal 在信号列表中按代码查找第一条匹配信号，未找到返回 nil。
 func findSignal(signals []combat_agent.Signal, code string) *combat_agent.Signal {
 	for i := range signals {
 		if signals[i].Code == code {
@@ -637,6 +645,7 @@ func findAlert(signals []combat_agent.Signal, code, alertType string) *combat_ag
 	return nil
 }
 
+// containsStr 判断字符串切片中是否包含指定字符串。
 func containsStr(ss []string, s string) bool {
 	for _, v := range ss {
 		if v == s {

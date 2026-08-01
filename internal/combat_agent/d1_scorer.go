@@ -1,5 +1,7 @@
 // Package combat_agent 提供操盘战斗 Agent 的核心评分逻辑。
 // D1Scorer 负责对个股进行 D1 级别的事件驱动评分，依赖 LLM 分析新闻事件与行情数据。
+// 评分维度（含优先级）：负面过滤(blocked) > 顶级影响 > 间接影响 > 中等影响 > 低影响，
+// 输出 0.0~1.0 的归一化分数并附 LLM 分析理由。
 package combat_agent
 
 import (
@@ -17,14 +19,15 @@ import (
 // D1Score 表示单只个股的 D1 事件评分结果。
 // Score 范围 0.0~1.0，Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
 type D1Score struct {
-	Code      string  `json:"code"`
-	Score     float64 `json:"score"`      // 评分值，0.0~1.0，越高越值得关注
-	Blocked   bool    `json:"blocked"`    // 是否被负面过滤拦截（利空事件命中）
-	Reason    string  `json:"reason"`     // LLM 给出的评分分析理由
+	Code    string  `json:"code"`
+	Score   float64 `json:"score"`   // 评分值，0.0~1.0，越高越值得关注
+	Blocked bool    `json:"blocked"` // 是否被负面过滤拦截（利空事件命中）
+	Reason  string  `json:"reason"`  // LLM 给出的评分分析理由
 }
 
 // D1Scorer 批量个股 D1 评分器。
 // 收拢到 combat_agent，LLM 参考 events_leftside.yaml 规则评分。
+// 非并发安全，建议由 Engine 在独立 goroutine 中单实例调用。
 type D1Scorer struct {
 	llmClient   *llm.Client
 	yamlContent string // events_leftside.yaml 原始内容，作为 LLM prompt 参考
@@ -69,6 +72,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	t0 := time.Now()
 	result := make(map[string]D1Score, len(codes))
 
+	// LLM 客户端未配置或没有待评分个股 → 全量默认 0 分
 	if ds.llmClient == nil || len(codes) == 0 {
 		for _, code := range codes {
 			result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: "LLM未配置，默认0分"}
@@ -80,6 +84,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	// 构建用户prompt：列出每只个股及其关联事件、行情数据
 	var sb strings.Builder
 	sb.WriteString("请对以下个股进行D1评分，参考events_leftside.yaml分级规则：\n\n")
+	// 附上评分规则原文，让 LLM 按项目规则打分
 	if ds.yamlContent != "" {
 		sb.WriteString("参考规则:\n")
 		sb.WriteString(ds.yamlContent)
@@ -89,6 +94,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	for i, code := range codes {
 		sb.WriteString(fmt.Sprintf("%d. 代码: %s\n", i+1, code))
 		md := marketData[code]
+		// 有行情数据则补充名称与价格/涨跌幅，辅助 LLM 判断
 		if md != nil {
 			if md.Name != "" {
 				sb.WriteString(fmt.Sprintf("   名称: %s\n", md.Name))
@@ -97,7 +103,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 				sb.WriteString(fmt.Sprintf("   价格: %.2f  涨跌幅: %.2f%%\n", md.Price, md.ChangePct))
 			}
 		}
-		// 事件描述来自 events
+		// 事件描述来自 events（按代码子串匹配关联新闻标题）
 		eventDesc := findEventForCode(code, events)
 		if eventDesc != "" {
 			sb.WriteString(fmt.Sprintf("   关联事件: %s\n", eventDesc))
@@ -110,7 +116,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	prompt := sb.String()
 	log.Printf("[D1Scorer] 批量评分 %d只个股, prompt=%d字符", len(codes), len(prompt))
 
-	// 调用LLM
+	// 调用LLM（系统提示词 d1SystemPrompt 固定，用户提示词携带个股与规则）
 	resp, err := ds.llmClient.Chat(d1SystemPrompt, prompt)
 	if err != nil {
 		log.Printf("[D1Scorer] LLM调用失败: %v, 全量默认0分", err)
@@ -120,6 +126,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 		return result
 	}
 
+	// 清洗 LLM 输出（去掉 markdown 代码块与多余文字，仅保留 JSON 数组）
 	resp = cleanJSON(resp)
 
 	var raw []D1Score
@@ -133,6 +140,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 
 	for _, r := range raw {
 		if r.Code != "" {
+			// 分数越界防护：裁剪到 0.0~1.0
 			if r.Score > 1.0 {
 				r.Score = 1.0
 			}
@@ -144,7 +152,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 		}
 	}
 
-	// 补全LLM未返回的个股
+	// 补全LLM未返回的个股（兜底 0 分，保证结果完整）
 	for _, code := range codes {
 		if _, ok := result[code]; !ok {
 			result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: "LLM未返回"}

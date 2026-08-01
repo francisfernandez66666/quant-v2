@@ -45,23 +45,23 @@ type Signal struct {
 	At        time.Time `json:"at"`         // 触发时间
 }
 
-// tickState 单只股票的窗口滑动状态。
+// tickState 单只股票的窗口滑动状态，记录上一 tick 的快照用于计算差分指标。
 type tickState struct {
-	prevPrice    float64
-	prevAmt      float64
-	prevTurn     float64
-	lastAt       time.Time
-	lastTrigger  time.Time
+	prevPrice   float64   // 上一 tick 价格
+	prevAmt     float64   // 上一 tick 累计成交额
+	prevTurn    float64   // 上一 tick 累计换手
+	lastAt      time.Time // 上一 tick 时间
+	lastTrigger time.Time // 最近一次触发时间（用于冷却判断）
 }
 
 // Engine 实时触发引擎：持有行情采集器与 SSE 广播器，逐 tick 检测放量急拉。
 type Engine struct {
-	fetcher *data.Fetcher
-	sse     *server.SSEBroker
-	cfg     Config
+	fetcher *data.Fetcher     // 5s 行情快照采集器
+	sse     *server.SSEBroker // SSE 广播器（触发时推送 signal 事件）
+	cfg     Config            // 触发参数配置
 
-	mu     sync.Mutex
-	states map[string]*tickState
+	mu     sync.Mutex            // 保护 states 的互斥锁
+	states map[string]*tickState // 股票代码 → 滑动窗口状态
 }
 
 // New 创建实时触发引擎。
@@ -109,17 +109,22 @@ func (e *Engine) Run(ctx context.Context) {
 func (e *Engine) check(snap *data.MarketSnapshot) {
 	now := snap.Time
 	for code, si := range snap.Stocks {
+		// 过滤无效行情（空指针/价格非正/成交额为负）
 		if si == nil || si.Price <= 0 || si.Amount < 0 {
 			continue
 		}
+		// 推进窗口并计算秒均涨幅/成交额/换手
 		secRise, secAmt, secTurn, st := e.advance(code, si, now)
+		// st 为 nil 表示冷却期内，secRise==0 表示首帧或间隔异常（仅初始化）
 		if st == nil || secRise == 0 {
 			continue
 		}
+		// 双阈值判定：秒均涨幅 ≥ RaRate 且秒成交额 ≥ StockAmt 才触发
 		if secRise < e.cfg.RaRate || secAmt < e.cfg.StockAmt {
 			continue
 		}
 
+		// 记录触发时间，进入冷却期
 		e.mu.Lock()
 		st.lastTrigger = now
 		e.mu.Unlock()
@@ -158,9 +163,11 @@ func (e *Engine) advance(code string, si *data.StockInfo, now time.Time) (float6
 		st = &tickState{}
 		e.states[code] = st
 	}
+	// 冷却期内：返回 nil 表示跳过该股票的触发评估
 	if !st.lastTrigger.IsZero() && now.Sub(st.lastTrigger) < e.cfg.Cooldown {
 		return 0, 0, 0, nil
 	}
+	// 首个 tick：仅记录基准状态，不产生触发
 	if st.lastAt.IsZero() || st.prevPrice <= 0 {
 		st.prevPrice = si.Price
 		st.prevAmt = si.Amount
@@ -168,6 +175,7 @@ func (e *Engine) advance(code string, si *data.StockInfo, now time.Time) (float6
 		st.lastAt = now
 		return 0, 0, 0, st
 	}
+	// 时间间隔异常（非正或超过 60s）：视为断流，重置基准状态，不产生触发
 	dt := now.Sub(st.lastAt).Seconds()
 	if dt <= 0 || dt > 60 {
 		st.prevPrice = si.Price
@@ -177,6 +185,7 @@ func (e *Engine) advance(code string, si *data.StockInfo, now time.Time) (float6
 		return 0, 0, 0, st
 	}
 
+	// 差分计算：秒均涨幅 = Δ价/基准价/Δt；秒均成交额、秒均换手同理
 	secRise := (si.Price - st.prevPrice) / st.prevPrice * 100 / dt
 	secAmt := (si.Amount - st.prevAmt) / dt
 	secTurn := (si.Turnover - st.prevTurn) / dt

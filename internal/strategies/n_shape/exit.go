@@ -8,13 +8,17 @@ import (
 )
 
 // CheckExit 判断 N 形策略是否触发退出信号。
+// 按优先级依次检查：硬止损 → N 形形态失败（入场时 phase=5）→ 尾盘 14:57 后按入场阶段强平/止盈 → 量能衰竭。
+// 返回 nil 表示继续持有；否则返回带理由和优先级的退出建议。
 func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
+	// 成本或现价非法时无法评估，视为不退出
 	if cost <= 0 || price <= 0 {
 		return nil
 	}
 
+	// 硬止损：现价跌破 成本×(1-hardStop) 立即退出（默认 hardStop=0.955，即 -4.5%）
 	hardStop := cfg.HardStopLoss
 	if hardStop <= 0 {
 		hardStop = 0.955
@@ -23,6 +27,7 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.Ex
 		return &strategy.ExitResult{Reason: "N形硬止损", Priority: strategy.P1}
 	}
 
+	// 入场时已处于"形态失败"阶段的持仓（NPhaseFailed=5）直接退出
 	if ctx.EntryMeta != nil {
 		if phase, ok := ctx.EntryMeta["entry_nphase"]; ok {
 			if phase == 5 {
@@ -31,19 +36,23 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.Ex
 		}
 	}
 
+	// 尾盘门控：14:57 后为尾盘集合竞价，超短策略必须日内了结
 	now := ctx.Now
 	if !now.IsZero() {
 		marketClose := time.Date(now.Year(), now.Month(), now.Day(), 14, 57, 0, 0, now.Location())
 		if now.After(marketClose) {
+			// 入场时形态已"完成"（NPhaseCompleted=4）则视为完整止盈离场
 			if ctx.EntryMeta != nil {
 				if phase, ok := ctx.EntryMeta["entry_nphase"]; ok && phase == 4 {
 					return &strategy.ExitResult{Reason: "N形完成止盈", Priority: strategy.P2}
 				}
 			}
+			// 否则尾盘无条件强平（超短不留隔夜）
 			return &strategy.ExitResult{Reason: "N形收盘强平", Priority: strategy.P2}
 		}
 	}
 
+	// 量能衰竭：入场时记录的 vol_ratio < 0.5 说明承接不足，逢高离场
 	if ctx.EntryMeta != nil {
 		if volRatio, ok := ctx.EntryMeta["vol_ratio"]; ok && volRatio > 0 && volRatio < 0.5 {
 			return &strategy.ExitResult{Reason: "N形量能衰竭", Priority: strategy.P3}

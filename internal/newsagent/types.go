@@ -7,23 +7,23 @@ import "time"
 // Score 带符号：正值利好（+0.5 中 / +0.75 强），负值利空（-0.5 中 / -0.75 强），±0.25 弱/中性。
 // Direction 由 Score 符号推导，仅用于展示。
 type NewsEvent struct {
-	Title             string   `json:"title"`
-	Content           string   `json:"content,omitempty"`
-	Datetime          string   `json:"datetime"`
-	Source            string   `json:"source"`
-	IsMaterial        bool     `json:"is_material"`
-	Level             string   `json:"level"`
-	Direction         string   `json:"direction"`
-	Score             float64  `json:"score"`
-	Sectors           []string `json:"sectors,omitempty"`
-	UpstreamSectors   []string `json:"upstream_sectors,omitempty"`
-	DownstreamSectors []string `json:"downstream_sectors,omitempty"`
-	RelatedStocks     []string `json:"related_stocks,omitempty"`
-	CleanedStocks     []string `json:"cleaned_stocks,omitempty"`
-	ImpactLevel       string   `json:"impact_level,omitempty"`
-	EventType         string   `json:"event_type,omitempty"`
-	Urgency           string   `json:"urgency,omitempty"`
-	Reason            string   `json:"reason,omitempty"`
+	Title             string   `json:"title"`                        // 新闻标题
+	Content           string   `json:"content,omitempty"`            // 新闻正文/摘要
+	Datetime          string   `json:"datetime"`                     // 事件时间 YYYY-MM-DD HH:MM:SS
+	Source            string   `json:"source"`                       // 新闻来源（如 IPO日历/财联社）
+	IsMaterial        bool     `json:"is_material"`                  // 是否通过价值初筛
+	Level             string   `json:"level"`                        // 影响级别：个股/板块/宏观
+	Direction         string   `json:"direction"`                    // 方向：利好/利空/中性（由 Score 推导）
+	Score             float64  `json:"score"`                        // 带符号强度分，驱动引擎阈值过滤
+	Sectors           []string `json:"sectors,omitempty"`            // 相关板块
+	UpstreamSectors   []string `json:"upstream_sectors,omitempty"`   // 上游产业链板块
+	DownstreamSectors []string `json:"downstream_sectors,omitempty"` // 下游产业链板块
+	RelatedStocks     []string `json:"related_stocks,omitempty"`     // 关联个股（原始名称/代码）
+	CleanedStocks     []string `json:"cleaned_stocks,omitempty"`     // 清洗后的个股 "名称|代码"
+	ImpactLevel       string   `json:"impact_level,omitempty"`       // 冲击程度：高/中/低
+	EventType         string   `json:"event_type,omitempty"`         // 事件类型：公司/行业/宏观...
+	Urgency           string   `json:"urgency,omitempty"`            // 紧急程度：紧急/关注/一般
+	Reason            string   `json:"reason,omitempty"`             // LLM 归因说明
 }
 
 // Stage0Result Stage0 分类结果：按标题归因将新闻分为个股/板块/一般三类。

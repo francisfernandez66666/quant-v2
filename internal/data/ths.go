@@ -25,7 +25,7 @@ import (
 // 提供个股实时行情和板块列表两种数据获取能力。
 // 所有请求经 THSLimiter 限流（3 req/5s）。
 type THSClient struct {
-	client *http.Client
+	client *http.Client // 底层 HTTP 客户端（默认超时 10s，可经 SetTransport 替换）
 }
 
 // thsUserAgent 同花顺请求使用的浏览器 User-Agent。
@@ -166,11 +166,11 @@ func (tc *THSClient) getBoardPage(url string) ([]SectorInfo, error) {
 // topBoardTableRe 匹配同花顺板块列表页中带行情数据的表格。
 // 首屏表（按涨跌幅排序的前 20 名）为服务端渲染，无分页反爬，可直接解析。
 var (
-	topBoardTbodyRe = regexp.MustCompile(`(?s)<tbody>(.*?)</tbody>`)
-	topBoardTrRe    = regexp.MustCompile(`(?s)<tr>(.*?)</tr>`)
-	topBoardTdRe    = regexp.MustCompile(`(?s)<td[^>]*>(.*?)</td>`)
-	topBoardCodeRe  = regexp.MustCompile(`/detail/code/(\d+)/`)
-	topBoardStripRe = regexp.MustCompile(`<[^>]+>`)
+	topBoardTbodyRe = regexp.MustCompile(`(?s)<tbody>(.*?)</tbody>`) // 匹配 <tbody> 块
+	topBoardTrRe    = regexp.MustCompile(`(?s)<tr>(.*?)</tr>`)       // 匹配表格行
+	topBoardTdRe    = regexp.MustCompile(`(?s)<td[^>]*>(.*?)</td>`)  // 匹配表格单元格
+	topBoardCodeRe  = regexp.MustCompile(`/detail/code/(\d+)/`)      // 从行内链接提取板块代码
+	topBoardStripRe = regexp.MustCompile(`<[^>]+>`)                  // 去除单元格内的残留 HTML 标签
 )
 
 // GetTopBoards 获取同花顺板块行情表（首屏 top-20 按涨跌幅排序）。

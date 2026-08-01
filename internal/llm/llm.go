@@ -15,10 +15,10 @@ import (
 
 // Client LLM API 客户端，封装与 SiliconFlow 对话接口的通信。
 type Client struct {
-	httpClient *http.Client
-	apiKey     string
-	apiURL     string
-	model      string
+	httpClient *http.Client // HTTP 客户端（30s 超时，禁用 HTTP2 强制走 HTTP1.1）
+	apiKey     string       // API 密钥（Authorization: Bearer）
+	apiURL     string       // chat/completions 请求地址
+	model      string       // 模型名称
 }
 
 // DefaultModel 未显式指定模型时的默认模型。
@@ -109,22 +109,23 @@ func (c *Client) Chat(system, user string) (string, error) {
 
 // HotTopic 热点新闻结构化分析结果。
 type HotTopic struct {
-	Title             string   `json:"title"`
-	Level             string   `json:"level"`
-	Sentiment         string   `json:"sentiment"`
-	Score             float64  `json:"score"`
-	ImpactLevel       string   `json:"impact_level"`
-	EventType         string   `json:"event_type"`
-	Urgency           string   `json:"urgency"`
-	Direction         string   `json:"direction"`
-	Sectors           []string `json:"sectors"`
-	UpstreamSectors   []string `json:"upstream_sectors"`
-	DownstreamSectors []string `json:"downstream_sectors"`
-	RelatedStocks     []string `json:"related_stocks"`
-	Strategy          string   `json:"strategy"`
-	Reason            string   `json:"reason"`
+	Title             string   `json:"title"`              // 新闻标题
+	Level             string   `json:"level"`              // 事件级别：板块 / 个股
+	Sentiment         string   `json:"sentiment"`          // 情感：正面 / 负面 / 中性
+	Score             float64  `json:"score"`              // 带符号强度：正=利好 负=利空 0=中性
+	ImpactLevel       string   `json:"impact_level"`       // 影响级别：高 / 中 / 低
+	EventType         string   `json:"event_type"`         // 事件类型：政策/财报/行业/公司/宏观/事件驱动
+	Urgency           string   `json:"urgency"`            // 紧急程度：立即 / 关注 / 观察
+	Direction         string   `json:"direction"`          // 方向：利好 / 利空 / 中性
+	Sectors           []string `json:"sectors"`            // 直接影响板块
+	UpstreamSectors   []string `json:"upstream_sectors"`   // 上游产业链受影响板块
+	DownstreamSectors []string `json:"downstream_sectors"` // 下游产业链受影响板块
+	RelatedStocks     []string `json:"related_stocks"`     // 关联个股名称或代码
+	Strategy          string   `json:"strategy"`           // 匹配战法：N形/龙头/双凸/龙回头/无
+	Reason            string   `json:"reason"`             // 简要分析理由
 }
 
+// hotTopicSystemPrompt 单条热点分析的 system 提示词：约束 LLM 输出严格 JSON 格式的评分/归因结果。
 var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提供的新闻标题进行全方位分析，严格按JSON格式返回。
 
 首先判断事件级别：
@@ -165,8 +166,14 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
   "strategy": "N形|龙头|双凸|龙回头|无",
   "reason": "简要分析理由"
 }
-只输出JSON，不要多余文字。`
+只输出JSON，不要多余文字。
 
+补充规则：
+- 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
+- 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
+`
+
+// batchSystemPrompt 批量热点分析的 system 提示词：从编号列表中筛选实质影响事件并输出 JSON 数组。
 var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下新闻中筛选出对A股有实质性影响的重大事件（如政策、行业景气、公司重大利好/利空、宏观数据、技术突破等），忽略娱乐、社会、体育、影视、名人八卦、灾难事故等无关新闻。
 
 必须忽略以下噪音类型（score一律输出0）：
@@ -217,33 +224,42 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
     "strategy": "N形|龙头|双凸|龙回头|无",
     "reason": "简要分析理由"
   }
-]
- 只输出JSON数组，不要多余文字。`
+  ]
+ 只输出JSON数组，不要多余文字。
+
+补充规则：
+- 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
+- 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
+`
 
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
 const llmBatchSize = 30
 
 // AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批调用并合并结果。
-// 某批失败时重试2次，仍失败则该批使用关键词兜底。
-func (c *Client) AnalyzeHotTopicBatch(titles []string) []*HotTopic {
+// 任一 批 LLM 轮询重试（最多3次、递增间隔）仍失败时返回错误，不降级关键词兜底，
+// 由调用方决定如何处置（归一般仅展示），避免错误情绪打分进入事件流。
+func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 	result := make([]*HotTopic, len(titles))
 	if len(titles) == 0 {
-		return result
+		return result, nil
 	}
 	for start := 0; start < len(titles); start += llmBatchSize {
 		end := start + llmBatchSize
 		if end > len(titles) {
 			end = len(titles)
 		}
-		sub := c.analyzeBatch(titles[start:end])
+		sub, err := c.analyzeBatch(titles[start:end])
+		if err != nil {
+			return nil, err
+		}
 		copy(result[start:end], sub)
 	}
-	return result
+	return result, nil
 }
 
 // analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。
-// 失败时重试2次，仍失败则使用关键词兜底。
-func (c *Client) analyzeBatch(titles []string) []*HotTopic {
+// 失败时按递增间隔轮询重试（最多3次：2s/4s/6s），仍失败返回错误——不降级关键词兜底。
+func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	// 构建批量请求文本
 	var sb strings.Builder
 	for i, t := range titles {
@@ -251,20 +267,22 @@ func (c *Client) analyzeBatch(titles []string) []*HotTopic {
 	}
 	prompt := sb.String()
 
-	// 重试2次
+	// 轮询重试（最多3次、间隔递增）
 	var resp string
 	var err error
-	for attempt := 1; attempt <= 2; attempt++ {
+	for attempt := 1; attempt <= 3; attempt++ {
 		resp, err = c.Chat(batchSystemPrompt, prompt)
 		if err == nil {
 			break
 		}
-		log.Printf("LLM[%d/%d] API失败(第%d次), 重试: %v", len(titles), attempt, attempt, err)
-		time.Sleep(2 * time.Second)
+		if attempt < 3 {
+			log.Printf("LLM[%d/%d] API失败(第%d次), 轮询重试: %v", len(titles), attempt, attempt, err)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
 	}
 	if err != nil {
-		log.Printf("LLM[%d] API重试2次仍失败, 使用关键词兜底", len(titles))
-		return batchFallback(titles)
+		log.Printf("LLM[%d] API轮询重试3次仍失败, 该批归一般(不降级): %v", len(titles), err)
+		return nil, err
 	}
 	resp = cleanJSON(resp)
 
@@ -285,8 +303,8 @@ func (c *Client) analyzeBatch(titles []string) []*HotTopic {
 		Reason            string   `json:"reason"`
 	}
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		log.Printf("LLM[%d] JSON解析失败, raw[:%d]=%q, 使用关键词兜底: %v", len(titles), minInt(len(resp), 300), resp[:minInt(len(resp), 300)], err)
-		return batchFallback(titles)
+		log.Printf("LLM[%d] JSON解析失败, 该批归一般(不降级): raw[:%d]=%q: %v", len(titles), minInt(len(resp), 300), resp[:minInt(len(resp), 300)], err)
+		return nil, err
 	}
 
 	// 日志：LLM返回了哪些板块和个股
@@ -346,16 +364,7 @@ func (c *Client) analyzeBatch(titles []string) []*HotTopic {
 		result[i] = ht
 	}
 	log.Printf("LLM批量分析完成: %d/%d条", len(raw), len(titles))
-	return result
-}
-
-// batchFallback 批量关键词兜底分析。
-func batchFallback(titles []string) []*HotTopic {
-	result := make([]*HotTopic, len(titles))
-	for i, title := range titles {
-		result[i] = fallbackAnalysis(title)
-	}
-	return result
+	return result, nil
 }
 
 // AnalyzeHotTopic 对新闻标题进行多维度热点分析。
@@ -532,16 +541,28 @@ func fallbackAnalysis(title string) *HotTopic {
 		}
 	}
 
-	// 情感关键词（带符号评分：利好=+0.75，利空=-0.75）
-	if containsAny(title, []string{"涨停", "大涨", "暴涨", "走强", "反弹", "利好", "突破"}) {
-		ht.Sentiment = "正面"
-		ht.Score = 0.75
-		ht.Direction = "利好"
-	}
-	if containsAny(title, []string{"跌停", "大跌", "暴跌", "走弱", "利空", "立案", "调查", "减持", "处罚"}) {
+	// 情感关键词（带符号评分，分强/中两档；利空优先于利好判定）
+	strongBull := []string{"涨停", "大涨", "暴涨", "走强", "突破", "飙升", "翻倍", "创新高"}
+	medBull := []string{"反弹", "利好", "回暖", "回升", "增持", "预增", "扭亏", "上调"}
+	strongBear := []string{"跌停", "大跌", "暴跌", "重挫", "下挫", "跳水", "崩盘", "闪崩", "抛售", "暴雷", "腰斩", "跌超", "立案", "调查", "处罚", "退市"}
+	medBear := []string{"走弱", "利空", "减持", "放缓", "下滑", "走低", "回落", "不及预期", "承压", "疲软", "萎缩", "高企", "预警", "连跌", "转弱", "低于预期"}
+	switch {
+	case containsAny(title, strongBear):
 		ht.Sentiment = "负面"
 		ht.Score = -0.75
 		ht.Direction = "利空"
+	case containsAny(title, medBear):
+		ht.Sentiment = "负面"
+		ht.Score = -0.5
+		ht.Direction = "利空"
+	case containsAny(title, strongBull):
+		ht.Sentiment = "正面"
+		ht.Score = 0.75
+		ht.Direction = "利好"
+	case containsAny(title, medBull):
+		ht.Sentiment = "正面"
+		ht.Score = 0.5
+		ht.Direction = "利好"
 	}
 
 	// 事件类型
@@ -578,6 +599,7 @@ func fallbackAnalysis(title string) *HotTopic {
 	return ht
 }
 
+// minInt 返回两个整数中的较小值（用于截断日志输出长度）。
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -585,6 +607,7 @@ func minInt(a, b int) int {
 	return b
 }
 
+// containsAny 判断字符串 s 是否包含 keywords 中的任意一个关键词。
 func containsAny(s string, keywords []string) bool {
 	for _, kw := range keywords {
 		if strings.Contains(s, kw) {
@@ -745,6 +768,8 @@ func ResolveStocks(stocks []string) (codes []string, unresolved []string) {
 	return
 }
 
+// autoSuffix 根据 A 股代码首位数字自动补交易所后缀：
+// 6/9 开头→上海(.SH)，0/3/2 开头→深圳(.SZ)，4/8 开头→北交所(.BJ)。
 func autoSuffix(code string) string {
 	if len(code) != 6 {
 		return code
@@ -760,6 +785,7 @@ func autoSuffix(code string) string {
 	return code
 }
 
+// isAlphaNumeric 判断字符串是否全部由字母或数字组成。
 func isAlphaNumeric(s string) bool {
 	for _, r := range s {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {

@@ -164,11 +164,11 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
-import * as api from '../api/index.js'
+import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子
+import { useRouter } from 'vue-router'                       // Vue Router：获取路由实例，用于页面跳转
+import * as api from '../api/index.js'                       // 后端 API 封装：信号/状态/资讯/板块/快照/IPO 等数据接口
 
-const router = useRouter()
+const router = useRouter()                                   // 路由实例：点击策略信号行时跳转到信号详情页 /signals
 
 // ── 响应式数据 ──
 const signals = ref([])               // 策略信号列表
@@ -183,6 +183,7 @@ let timer = null                      // 定时轮询句柄
 let sseUnsub = null                   // SSE 取消订阅函数
 
 // ── 计算属性 ──
+/** 扫描统计字段快捷引用（服务端状态里的 scan_stats 子对象，未返回时兜底为空对象） */
 const scanStats = computed(() => status.value.scan_stats || {})
 
 /** 强信号数量 */

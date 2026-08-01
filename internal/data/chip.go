@@ -96,6 +96,7 @@ func TriangularChipDistribution(klines []KLine, params ChipParams) *ChipAnalysis
 			spread = 0.001
 		}
 
+		// 每根 K 线在典型价 ± spread 范围内离散化为 steps+1 个价格柱（0~steps）
 		steps := 20
 		for j := 0; j <= steps; j++ {
 			p := typical - spread + (2.0*spread*float64(j))/float64(steps)

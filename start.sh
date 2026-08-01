@@ -1,13 +1,19 @@
 #!/bin/bash
 # quant-trading-v2 启动脚本
 # usage: ./start.sh [dev|prod]
+#   dev    — 开发模式：编译后端 + 启动后端与前端 dev server（Ctrl+C 一并停止）
+#   prod   - 生产模式：编译前后端，nohup 后台运行
+#   build  — 仅编译前后端，不启动
 
 set -euo pipefail
 
+# 运行模式：默认 dev
 MODE="${1:-dev}"
+# 项目根目录（脚本所在目录），后续所有命令基于此切换工作目录
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
 
+# 默认环境变量：HTTP 监听地址 + 数据目录
 export QUANT_ADDR="${QUANT_ADDR:-:8080}"
 export QUANT_DATA_DIR="${QUANT_DATA_DIR:-$HOME/.quant-trading-v2}"
 
@@ -17,6 +23,7 @@ export QUANT_DATA_DIR="${QUANT_DATA_DIR:-$HOME/.quant-trading-v2}"
 # QUANT_ADDR           — HTTP监听地址（默认 :8080）
 # QUANT_DATA_DIR       — 数据目录（默认 ~/.quant-trading-v2）
 
+# 确保数据目录存在（后端持久化文件存放于此）
 mkdir -p "$QUANT_DATA_DIR"
 
 echo "=============================="
@@ -26,25 +33,31 @@ echo " ADDR:    $QUANT_ADDR"
 echo " DATADIR: $QUANT_DATA_DIR"
 echo "=============================="
 
+# BUILD_QUANT：是否编译后端（设为 0 可跳过编译直接运行已有二进制）
 BUILD_QUANT="${BUILD_QUANT:-1}"
 
+# build 编译后端二进制（输出到项目根目录 ./quant）
 build() {
     echo "[*] 编译后端..."
     GONOSUMCHECK=* GONOSUMDB=* go build -o quant ./cmd/quant
     echo "[*] 后端编译完成"
 }
 
+# build_web 安装前端依赖并执行生产构建
 build_web() {
     echo "[*] 编译前端..."
     cd web && npm install --silent && npm run build 2>/dev/null && cd "$APP_DIR"
     echo "[*] 前端编译完成"
 }
 
+# run_dev 开发模式：编译后端 → 后台启动后端 → 启动前端 dev server，
+# 并在 Ctrl+C 时统一清理所有子进程
 run_dev() {
     if [ "$BUILD_QUANT" = "1" ]; then build; fi
     echo "[*] 启动后端 (dev mode)"
     export LLM_API_KEY="${LLM_API_KEY:-}"
     LOGFILE="$QUANT_DATA_DIR/quant.log"
+    # 后台启动后端，日志重定向到 quant.log
     ./quant > "$LOGFILE" 2>&1 &
     QUANT_PID=$!
     echo "[*] 后端 PID: $QUANT_PID (日志: $LOGFILE)"
@@ -58,6 +71,7 @@ run_dev() {
     cd web && npm install --silent && npm run dev &
     WEB_PID=$!
 
+    # 退出时杀掉前后端进程并等待回收，避免残留
     cleanup() { kill "$QUANT_PID" "$WEB_PID" 2>/dev/null; wait; }
     trap "cleanup; exit" INT TERM
     echo "[*] 按 Ctrl+C 停止所有服务"
@@ -67,21 +81,25 @@ run_dev() {
     wait
 }
 
+# run_prod 生产模式：编译前后端，nohup 后台常驻运行并打印 PID
 run_prod() {
     if [ "$BUILD_QUANT" = "1" ]; then build; fi
     build_web
     LOGFILE="$QUANT_DATA_DIR/quant.log"
     echo "[*] 启动后端 (prod mode)"
+    # nohup 脱离终端运行，即使 SSH 断开也不受影响
     nohup ./quant > "$LOGFILE" 2>&1 &
     echo "[*] 后端 PID: $! (日志: $LOGFILE)"
 
     echo "[*] 启动前端 (port 5173)..."
+    # 前端使用构建产物 preview 模式（默认端口 5173）
     cd web && nohup npm run preview -- --port 5173 > /dev/null 2>&1 &
     echo "[*] 前端 PID: $!"
     echo "[*] 访问 http://localhost:5173"
     echo "[*] 查看后端日志: tail -f $LOGFILE"
 }
 
+# 按模式分发
 case "$MODE" in
     dev) run_dev ;;
     prod) run_prod ;;

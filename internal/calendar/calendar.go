@@ -9,15 +9,15 @@ import (
 
 // Event 宏观事件，包含日期、标题、影响程度和提前提醒天数。
 type Event struct {
-	Date        time.Time
-	Title       string
-	Impact      string
-	DaysAdvance int
+	Date        time.Time // 事件发生日期
+	Title       string    // 事件标题
+	Impact      string    // 影响程度（high/medium/low）
+	DaysAdvance int       // 提前显示/提醒天数
 }
 
 // Calendar 日历管理器，维护配置中的事件列表。
 type Calendar struct {
-	events []config.CalendarEvent
+	events []config.CalendarEvent // 事件原始配置列表
 }
 
 // New 创建日历实例。
@@ -31,6 +31,7 @@ func (c *Calendar) UpcomingEvents(days int) []Event {
 	now := time.Now()
 	var out []Event
 	for _, e := range c.events {
+		// 解析事件日期，格式非法的事件直接跳过
 		t, err := time.Parse("2006-01-02", e.Date)
 		if err != nil {
 			continue
@@ -39,6 +40,7 @@ func (c *Calendar) UpcomingEvents(days int) []Event {
 		start := t.AddDate(0, 0, -e.DaysAdvance)
 		// 事件窗口结束 = 事件日期 + days（延续显示）
 		end := t.AddDate(0, 0, days)
+		// 当前时间落入 [start, end) 窗口内则纳入结果（含已开始未结束的事件）
 		if now.Before(end) && !now.Before(start) {
 			out = append(out, Event{
 				Date: t, Title: e.Title, Impact: e.Impact,

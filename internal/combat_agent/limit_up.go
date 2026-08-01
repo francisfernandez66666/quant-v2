@@ -1,5 +1,6 @@
 // 涨停池分析：龙头识别评分 + 涨停原因分类。
 // 龙头评分借鉴 astock-market-engine dragon_leader_engine：连板25+封板15+封单比10+板块影响力15+首封时间10+换手10+板块排名10+舆情5。
+// 输出龙头信号（评分≥70 且板块内前10）与预期差提醒信号，供 ScanLimitUp 扫描使用。
 package combat_agent
 
 import (
@@ -16,16 +17,16 @@ import (
 type LeaderInfo struct {
 	Stock  data.LimitUpStock
 	Score  float64 // 龙头评分 0-100
-	Rank   int     // 板块内排名
-	Reason string  // 评分理由
+	Rank   int     // 板块内排名（1 起，按评分降序）
+	Reason string  // 评分理由（连板/封单/首封时间摘要）
 }
 
 // LimitUpAnalysis 涨停池分析结果。
 type LimitUpAnalysis struct {
-	Total   int            // 涨停总数
-	Leaders []LeaderInfo   // 龙头（按评分降序）
-	ByType  map[string]int // 涨停原因分类统计
-	HotIndustry string    // 涨停家数最多的行业
+	Total       int            // 涨停总数
+	Leaders     []LeaderInfo   // 龙头（按评分降序）
+	ByType      map[string]int // 涨停原因分类统计（政策/业绩/题材/舆情/情绪技术）
+	HotIndustry string         // 涨停家数最多的行业
 }
 
 // lianBanScore 连板分档：5板+满25，3-4板20，2板14，1板8。
@@ -94,9 +95,11 @@ func turnoverScore(t float64) float64 {
 
 // industryInfluenceScore 板块影响力：该行业涨停家数占全池前 3 名分别得 15/12/9，其余 4。
 func industryInfluenceScore(industry string, industryCnt map[string]int, total int) float64 {
+	// 全池无涨停（total==0）时无板块影响力可言，给基准分 4
 	if total == 0 {
 		return 4
 	}
+	// 将行业计数转成可排序的临时结构
 	type ic struct {
 		name  string
 		count int
@@ -105,11 +108,13 @@ func industryInfluenceScore(industry string, industryCnt map[string]int, total i
 	for n, c := range industryCnt {
 		list = append(list, ic{n, c})
 	}
+	// 按涨停家数降序排列 → 排名即板块热度
 	sort.Slice(list, func(i, j int) bool { return list[i].count > list[j].count })
 	for i, v := range list {
 		if v.name != industry {
 			continue
 		}
+		// 涨停家数全池前 3 的行业分别得 15/12/9 分，其余 4 分
 		switch i {
 		case 0:
 			return 15
@@ -132,10 +137,10 @@ func industryRankScore(industry string, industryStocks map[string][]data.LimitUp
 	}
 	// 已按首封时间升序（涨停池接口默认 sort=fbt:asc，但本地再确保一次）
 	sort.Slice(group, func(i, j int) bool { return group[i].FirstSeal < group[j].FirstSeal })
-	for i, s := range group {
+	for i := range group {
+		// 同行业内首封越早名次越高，前 3 名给 10/7/5 分，其余 2 分
 		switch i {
 		case 0:
-			_ = s
 			return 10
 		case 1:
 			return 7
@@ -150,21 +155,24 @@ func industryRankScore(industry string, industryStocks map[string][]data.LimitUp
 
 // ScoreLeader 计算单只涨停股的龙头评分（0-100）。
 // industryCnt/industryStocks 为全池统计，用于板块影响力与板块排名维度。
+// 返回 (评分, 评分理由摘要)；各维度按固定权重累加，总和不超过 100。
 func ScoreLeader(s data.LimitUpStock, industryCnt map[string]int, industryStocks map[string][]data.LimitUpStock, total int) (float64, string) {
 	score := 0.0
-	score += lianBanScore(s.LianBan)                       // 连板 25
-	seal := 15 - float64(s.BreakCount)*2                    // 封板 15（炸板一次扣2，下限5）
+	score += lianBanScore(s.LianBan) // 连板 25
+	// 封板 15：炸板（BreakCount）一次扣 2 分，保底下限 5
+	seal := 15 - float64(s.BreakCount)*2
 	if seal < 5 {
 		seal = 5
 	}
 	score += seal
-	score += sealRatioScore(s.SealRatio)                    // 封单比 10
+	score += sealRatioScore(s.SealRatio)                            // 封单比 10
 	score += industryInfluenceScore(s.Industry, industryCnt, total) // 板块影响力 15
-	score += sealTimeScore(s.FirstSeal)                     // 首封时间 10
-	score += turnoverScore(s.Turnover)                      // 换手 10
-	score += industryRankScore(s.Industry, industryStocks)  // 板块排名 10
-	score += 3                                              // 舆情 5（缺省3，后续接入新闻情感）
+	score += sealTimeScore(s.FirstSeal)                             // 首封时间 10
+	score += turnoverScore(s.Turnover)                              // 换手 10
+	score += industryRankScore(s.Industry, industryStocks)          // 板块排名 10
+	score += 3                                                      // 舆情 5（缺省3，后续接入新闻情感）
 
+	// 评分理由摘要：连板数 + 封单占比 + 首封时间
 	reasons := []string{
 		fmt.Sprintf("连板%d", s.LianBan),
 		fmt.Sprintf("封单%.1f%%", s.SealRatio),
@@ -174,16 +182,19 @@ func ScoreLeader(s data.LimitUpStock, industryCnt map[string]int, industryStocks
 }
 
 // AnalyzeLimitUp 分析整个涨停池：统计涨停家数、识别龙头、分类涨停原因。
+// 入参 pool 为当日涨停池，newsTitles 为 code → 关联新闻标题列表（用于涨停原因分类）。
 // 返回按评分降序的龙头列表与分类统计。
 func AnalyzeLimitUp(pool []data.LimitUpStock, newsTitles map[string][]string) LimitUpAnalysis {
 	res := LimitUpAnalysis{
 		Total:  len(pool),
 		ByType: make(map[string]int),
 	}
+	// 空池直接返回零值结果
 	if len(pool) == 0 {
 		return res
 	}
 
+	// 先按行业聚合，供板块影响力/板块排名维度统计
 	industryCnt := make(map[string]int)
 	industryStocks := make(map[string][]data.LimitUpStock)
 	for _, s := range pool {
@@ -191,7 +202,7 @@ func AnalyzeLimitUp(pool []data.LimitUpStock, newsTitles map[string][]string) Li
 		industryStocks[s.Industry] = append(industryStocks[s.Industry], s)
 	}
 
-	// 涨停家数最多的行业
+	// 涨停家数最多的行业 → 今日热点行业
 	maxCnt := 0
 	for name, c := range industryCnt {
 		if c > maxCnt {
@@ -202,6 +213,7 @@ func AnalyzeLimitUp(pool []data.LimitUpStock, newsTitles map[string][]string) Li
 
 	leaders := make([]LeaderInfo, 0, len(pool))
 	for _, s := range pool {
+		// 每只涨停股算龙头分 + 分类涨停原因（写入 LimitType 并统计）
 		score, reason := ScoreLeader(s, industryCnt, industryStocks, len(pool))
 		s.LimitType = ClassifyLimitUp(s, newsTitles[s.Code])
 		res.ByType[s.LimitType]++
@@ -211,6 +223,7 @@ func AnalyzeLimitUp(pool []data.LimitUpStock, newsTitles map[string][]string) Li
 			Reason: reason,
 		})
 	}
+	// 按龙头评分降序排序并回填排名（1 起）
 	sort.Slice(leaders, func(i, j int) bool { return leaders[i].Score > leaders[j].Score })
 	for i := range leaders {
 		leaders[i].Rank = i + 1
@@ -269,12 +282,14 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 
 	// 1. 龙头识别 + 涨停分类
 	if len(input.LimitUpPool) > 0 {
+		// 先提取每只涨停股的新闻标题（用于涨停原因分类）
 		news := make(map[string][]string, len(input.LimitUpPool))
 		for _, s := range input.LimitUpPool {
 			news[s.Code] = newsTitlesOf(input.News, s.Code)
 		}
 		analysis := AnalyzeLimitUp(input.LimitUpPool, news)
 		for _, l := range analysis.Leaders {
+			// 仅评分达到阈值且板块内排名前 10 的个股产出龙头信号
 			if l.Score < leaderThreshold || l.Rank > 10 {
 				continue
 			}
@@ -295,11 +310,13 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 	}
 
 	// 2. 预期差检测：涨停池内个股 + 8a/8b 个股直入
+	// 汇总所有待检测代码（涨停池 + 个股直入，去重）
 	gapCodes := map[string]bool{}
 	for _, s := range input.LimitUpPool {
 		gapCodes[s.Code] = true
 	}
 	for _, code := range input.IndividualStocks {
+		// L1 阻塞的个股跳过预期差检测
 		if input.L1Blocked[code] {
 			continue
 		}
@@ -307,18 +324,22 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 	}
 
 	for code := range gapCodes {
+		// 无关联新闻则无法判断预期差
 		if len(input.News[code]) == 0 {
 			continue
 		}
 		md := input.MarketData[code]
+		// 行情缺失或价格无效 → 跳过
 		if md == nil || md.ChangePct == 0 && md.Price <= 0 {
 			continue
 		}
 		changePct := md.ChangePct
 		turnover := 0.0
+		// 涨停池内的股票取其换手率用于滞涨判断，其余为 0（未知）
 		if lu, ok := limitUpByCode(input.LimitUpPool, code); ok {
 			turnover = lu.Turnover
 		}
+		// 对每条关联新闻做预期差检测，命中即生成一条提醒并跳出
 		for _, nb := range input.News[code] {
 			gap := CheckExpectationGap(nb.Title, nb.Positive, changePct, turnover, 0)
 			if !gap.Trigger {

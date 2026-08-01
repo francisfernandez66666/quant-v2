@@ -133,7 +133,8 @@ type ScoreResult struct {
 }
 
 // Evaluate 执行龙回头评分。
-// 输入 data 必须为 *StockData 类型。
+// 输入 data 必须为 *StockData 类型；类型不符或为空时返回 Pass=false 的空结果。
+// 输出 Evaluation：按总分分档为 none/first/main/accelerate 四级信号级别。
 func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	sd, ok := data.(*StockData)
 	if !ok || sd == nil {
@@ -143,6 +144,7 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 	sr := d.score(sd)
 	pass := sr.Total >= 60
 
+	// 信号级别分档：≥85 加速 / ≥75 主升 / ≥60 首次 / 其余不操作
 	level := "none"
 	if sr.Total >= 85 {
 		level = "accelerate"
@@ -153,6 +155,7 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 	}
 	confidence := sr.Total / 100.0
 
+	// 组装结果：总分 + 四因子明细 + 原始输入指标（供前端/复盘展示）
 	return &strategy.Evaluation{
 		TotalScore: sr.Total,
 		Pass:       pass,
@@ -180,6 +183,7 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 func (d *DragonReturnStrategy) score(sd *StockData) ScoreResult {
 	var sr ScoreResult
 
+	// 龙性识别是硬性前置条件：不达标直接返回（其余因子不再计算）
 	sr.DragonID = d.dragonIdentity(sd)
 	if sr.DragonID < 25 {
 		return sr
@@ -191,6 +195,7 @@ func (d *DragonReturnStrategy) score(sd *StockData) ScoreResult {
 
 	sr.Total = sr.DragonID + sr.PullbackHealth + sr.DuckHead + sr.Confirm
 
+	// 依据总分映射信号级别
 	sr.Signal = "none"
 	if sr.Total >= 85 {
 		sr.Signal = "accelerate"
@@ -407,10 +412,12 @@ func (d *DragonReturnStrategy) confirmSignal(sd *StockData) float64 {
 // 总分 ≥60 → first（P3_5 买入）
 // <60 不生成信号。
 func (d *DragonReturnStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
+	// 未通过评分（总分<60）直接返回 nil，不产生信号
 	if !eval.Pass {
 		return nil, nil
 	}
 
+	// 默认仅观察；按总分档位逐步升级为买入信号并提高优先级
 	action := strategy.ActionWatch
 	priority := strategy.P3
 

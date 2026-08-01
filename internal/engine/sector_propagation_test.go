@@ -1,3 +1,6 @@
+// 本文件：板块事件相关单元测试——板块验真回填（verifySectorAttribution，剔除 LLM 幻觉板块名）
+// 与板块→个股事件级传播（propagateSectorToStocks，注入成分股到监测池）。
+// 依赖真实 THS 板块名单（GetBoardList），断言采用"真实板块名 + 构造假板块名"的确定性方式。
 package engine
 
 import (
@@ -9,7 +12,7 @@ import (
 )
 
 // TestVerifySectorAttribution 验证板块验真回填：剔除 LLM 幻觉板块名。
-// 依赖真实 THS 板块名单（GetBoardList），确定性断言。
+// 覆盖三种场景：真实+幻觉混合（幻觉剔除）、非板块事件（不受影响）、低分板块事件（不处理）。
 func TestVerifySectorAttribution(t *testing.T) {
 	api := data.NewMarketAPI()
 	ths := data.NewTHSClient()

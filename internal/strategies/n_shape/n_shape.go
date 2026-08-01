@@ -96,11 +96,13 @@ func (n *NShapeStrategy) EvaluateWave(wa *WaveA, ib *IntradayB, ctx *Ctx) (*stra
 // full_chain 级别生成 buy 信号，按置信度分 P1/P2/P3；
 // 若左侧一突信号触发则最低 P2。
 func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
+	// 默认动作：watch / P3；仅 full_chain 才升级为买入
 	action := strategy.ActionWatch
 	prio := strategy.P3
 
 	switch eval.Level {
 	case "full_chain":
+		// 完整链确认：按置信度分档 高→P1(≥0.8)、中→P2(≥0.6)、低→P3
 		action = strategy.ActionBuy
 		if eval.Confidence >= 0.8 {
 			prio = strategy.P1
@@ -112,12 +114,14 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	}
 
 	// 一突信号提高优先级: 价格突破前高且量比≥1.8 时，最低提升至 P2
+	// （说明主力已开始攻击，即使置信度不高也应提高关注级别）
 	if d, ok := eval.Details["left_signal"]; ok && d > 0 {
 		if prio > strategy.P2 {
 			prio = strategy.P2
 		}
 	}
 
+	// 将评分明细复制进 Meta（前端展示各维度分数）
 	meta := make(map[string]float64)
 	for k, v := range eval.Details {
 		meta[k] = v

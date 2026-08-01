@@ -1,12 +1,24 @@
 <!DOCTYPE html>
+<!--
+  前端入口 HTML：量仔期货桌面版
+  职责说明：
+  1. #app 是 Vue 应用的挂载节点，根组件 App.vue 会渲染到该 div 内；
+  2. /src/main.js 是 ES Module 入口脚本，浏览器按 type="module"
+     加载它后创建 Vue 应用并完成挂载，拉起整个前端应用。
+-->
 <html lang="zh-CN">
 <head>
+  <!-- 字符编码：UTF-8，确保中文界面正常显示 -->
   <meta charset="UTF-8" />
+  <!-- 视口配置：适配移动端，initial-scale=1.0 防止页面缩放偏移 -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- 页面标题：显示在浏览器标签页上的应用名称 -->
   <title>量仔期货 — 桌面版</title>
 </head>
 <body>
+  <!-- Vue 应用挂载点：由 main.js 将根组件渲染进此节点 -->
   <div id="app"></div>
+  <!-- 入口脚本：type="module" 让浏览器以 ES Module 方式加载并执行 main.js -->
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

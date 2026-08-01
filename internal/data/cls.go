@@ -1,4 +1,5 @@
 // 财联社电报客户端。电报自带正文（Content），无需二次抓取，天然规避标题党问题。
+// 接口要求按参数排序后计算 sign 签名（sha1→md5），请求走 CLSLimiter 限流。
 package data
 
 import (
@@ -16,23 +17,23 @@ import (
 )
 
 const (
-	clsRollURL      = "https://www.cls.cn/v1/roll/get_roll_list"
-	clsRollReferer  = "https://www.cls.cn/telegraph"
-	clsApp          = "CailianpressWeb"
-	clsOS           = "web"
-	clsSV           = "7.7.5"
-	clsDefaultLimit = 20
+	clsRollURL      = "https://www.cls.cn/v1/roll/get_roll_list" // 电报滚动列表 API
+	clsRollReferer  = "https://www.cls.cn/telegraph"             // 请求 Referer（电报页）
+	clsApp          = "CailianpressWeb"                          // 客户端标识
+	clsOS           = "web"                                      // 操作系统标识
+	clsSV           = "7.7.5"                                    // 客户端版本号
+	clsDefaultLimit = 20                                         // 默认返回条数上限
 )
 
 // clsNewsRaw 财联社电报原始响应条目（只取需要的字段）。
 type clsNewsRaw struct {
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	CTime     int64  `json:"ctime"`
-	ID        int64  `json:"id"`
+	Title     string `json:"title"`   // 标题
+	Content   string `json:"content"` // 正文（电报自带，无需二次抓取）
+	CTime     int64  `json:"ctime"`   // 发布时间（Unix 秒）
+	ID        int64  `json:"id"`      // 电报唯一 ID
 	StockList []struct {
-		Name    string `json:"name"`
-		StockID string `json:"StockID"`
+		Name    string `json:"name"`    // 关联股票名称
+		StockID string `json:"StockID"` // 关联股票内部 ID
 	} `json:"stock_list"`
 }
 
@@ -110,7 +111,7 @@ func (m *MarketAPI) GetCLSNews(limit int) ([]NewsItem, error) {
 // 电报自带正文，Content 直接用；stock_list 名称存入 Stocks 供归因预填。
 func parseCLSNews(body []byte) ([]NewsItem, error) {
 	var raw struct {
-		Errno int `json:"errno"`
+		Errno int    `json:"errno"`
 		Msg   string `json:"msg"`
 		Data  struct {
 			RollData []clsNewsRaw `json:"roll_data"`
