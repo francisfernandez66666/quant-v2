@@ -381,6 +381,7 @@ func applyFallbacks(fix *e2e.Fixture, api *data.MarketAPI, sinaQuotes map[string
 // stockNameCode 是"股票名称→股票代码"的二元组，用于兜底股票列表/名称映射。
 type stockNameCode struct{ name, code string }
 
+// sectorMembers 场景板块成分股的 名称→代码 映射（与 applyFallbacks 内保持一致）。
 func sectorMembers() []stockNameCode {
 	return []stockNameCode{
 		{"中际旭创", "300308"}, {"紫光股份", "000938"}, {"中芯国际", "688981"},

@@ -175,7 +175,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	if input.Scores == nil {
 		input.Scores = make(map[string]StockScores)
 	}
-	sc := StockScores{Code: code}
+	sc := StockScores{Code: code, DataGaps: make(map[string]bool)}
 	var sigs []Signal
 	for _, runner := range runners {
 		// 策略实例为空则跳过该运行器
@@ -184,9 +184,14 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		}
 		// 按战法类型分发到真实评分逻辑（adapter.go evalFor）
 		eval, err := evalFor(runner, code, md, sector, input.EmotionPhase)
-		// 评分失败或返回空结果 → 该战法视为 0 分，不产出信号
+		// 评分失败或返回空结果 → 该战法视为 0 分，不产出信号；同时标记数据缺口
 		if err != nil || eval == nil {
+			markDataGap(&sc, runner.Type, md)
 			continue
+		}
+		// 战法各自数据不满足硬性门槛时（如 K 线不足被降级为 0）标记缺口
+		if eval.TotalScore == 0 && strategyDataInsufficient(runner.Type, md) {
+			markDataGap(&sc, runner.Type, md)
 		}
 		// 按战法类型归档原始总分到 StockScores（前端展示用，即使未通过也记录）
 		switch runner.Type {
@@ -229,7 +234,27 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	}
 	// 动量分单独计算（量价+MACD+走势），作为 8a/8b 打分量的一部分
 	sc.MomentumScore = MomentumScore(md, a.momentumWeights())
+	sc.MomentumValid = momentumDataValid(md)
 	sc.SignalActive = len(sigs) > 0
+
+	// Q2: 动量分达到阈值且四战法均未出信号时，补一条 watch 观察信号
+	// （量价齐升/资金流入但战法形态未确认，仅观察不自动交易）
+	if len(sigs) == 0 && sc.MomentumScore >= a.momentumSignalThreshold() {
+		sigs = append(sigs, Signal{
+			ID:          seqID(),
+			Code:        code,
+			Name:        md.Name,
+			Strategy:    "动量",
+			Direction:   direction,
+			Action:      "watch",
+			Price:       md.Price,
+			Confidence:  sc.MomentumScore / 100.0,
+			Reason:      fmt.Sprintf("动量%.0f 量价齐升(MA+MACD+走势)", sc.MomentumScore),
+			Sector:      sectorName,
+			GeneratedAt: now,
+		})
+		sc.SignalActive = true
+	}
 	sc.UpdatedAt = now
 	input.Scores[code] = sc
 	// 战法评分日志：code + 各维度分 + 是否命中（FLOW 全流程日志要求）
@@ -274,9 +299,63 @@ func (a *Agent) momentumWeights() config.MomentumConfig {
 	a.mu.RUnlock()
 	// 配置缺失时回退默认权重：量价40 + MACD30 + 走势30
 	if cfg == nil {
-		return config.MomentumConfig{VolumePriceWeight: 40, MACDWeight: 30, TrendWeight: 30}
+		return config.MomentumConfig{VolumePriceWeight: 40, MACDWeight: 30, TrendWeight: 30, SignalThreshold: 60}
 	}
 	return cfg.Momentum
+}
+
+// momentumSignalThreshold 读取动量分触发信号的阈值（默认 60）。
+func (a *Agent) momentumSignalThreshold() float64 {
+	w := a.momentumWeights()
+	if w.SignalThreshold <= 0 {
+		return 60
+	}
+	return w.SignalThreshold
+}
+
+// strategyDataInsufficient 判断某战法类型的输入数据是否不足（不足时得分 0 不代表真实 0 分）。
+func strategyDataInsufficient(t strategy.SignalType, md *strategy_engine.StockMarketData) bool {
+	if md == nil {
+		return true
+	}
+	switch t {
+	case strategy.SignalDragon:
+		// 龙头需要实时价 + 至少 5 根日K（RS 趋势）
+		return md.Price <= 0 || len(md.KLines) < 5
+	case strategy.SignalDoubleBump:
+		// 双响炮需要至少 20 根日K（均线与量能）
+		return len(md.KLines) < 20
+	case strategy.SignalDragonReturn:
+		// 龙回头需要至少 30 根日K（主升段/回调）
+		return len(md.KLines) < 30
+	case strategy.SignalNShape:
+		// N 形需要实时价 + 日K + 分钟K(MACD)
+		return md.Price <= 0 || len(md.KLines) < 2 || len(md.MinuteKLine) < 2
+	default:
+		return false
+	}
+}
+
+// momentumDataValid 判断动量分所需数据是否完整（量价 + 走势 + MACD 任一缺失即视为不完整）。
+func momentumDataValid(md *strategy_engine.StockMarketData) bool {
+	if md == nil || md.Quote == nil {
+		return false
+	}
+	q := md.Quote
+	if q.Price <= 0 || q.Volume <= 0 || len(md.KLines) < 5 {
+		return false
+	}
+	// 分钟 MACD 需有有效数据
+	m := md.MinuteMACD
+	return !(m.DIF == 0 && m.DEA == 0 && m.Bar == 0)
+}
+
+// markDataGap 记录某战法因数据不足而降级的数据缺口，供前端区分真实 0 分与无数据。
+func markDataGap(sc *StockScores, t strategy.SignalType, md *strategy_engine.StockMarketData) {
+	if sc.DataGaps == nil {
+		sc.DataGaps = make(map[string]bool)
+	}
+	sc.DataGaps[string(t)] = true
 }
 
 // ScanShort 执行做空扫描：7b 板块利空→验证后个股→8b；8b 个股利空→直入战法（反向信号）。

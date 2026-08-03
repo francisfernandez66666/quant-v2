@@ -12,6 +12,7 @@ import (
 // Fixture 实盘数据快照（由 cmd/fixturecapture 抓取生成，固化在 testdata/fixtures.json）。
 // 测试运行时只读该文件，不联网。
 type Fixture struct {
+	// CapturedAt 快照抓取时间（格式 YYYY-MM-DD HH:MM:SS）。
 	CapturedAt string `json:"captured_at"`
 
 	// THS 板块页 HTML（UTF-8 解码后），同时供 GetBoardList / GetTopBoards 解析。

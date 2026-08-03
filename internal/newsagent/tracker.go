@@ -84,6 +84,7 @@ func (t *tracker) MarkSeen(title, datetime string) {
 func (t *tracker) BulkMarkSeen(titles []string, datetimes []string) {
 	t.mu.Lock()
 	for i := range titles {
+		// datetimes 不足时跳过该条（保留旧值），保证不越界
 		if i < len(datetimes) {
 			t.data.SeenTitles[titleHash(titles[i])] = datetimes[i]
 		}

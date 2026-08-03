@@ -59,15 +59,18 @@ func (n *NShapeStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 // 评分链路: scorer.Evaluate → D1/D2/D3/D4 → Total → Valid 判断。
 func (n *NShapeStrategy) EvaluateWave(wa *WaveA, ib *IntradayB, ctx *Ctx) (*strategy.Evaluation, error) {
 	sr := n.scorer.Evaluate(wa, ib, ctx)
+	// 评分器返回 nil 表示数据不足或情绪硬闸（"衰退"）拦截
 	if sr == nil {
 		return &strategy.Evaluation{Pass: false, Level: "noscore"}, nil
 	}
 
+	// 仅当 Valid（D1>0 且 总分≥60 且 D2≥15）时才标记为 full_chain
 	level := "fail"
 	if sr.Valid {
 		level = "full_chain"
 	}
 
+	// 组装 D1~D4 分值与信号标志（供前端各维度展示）
 	return &strategy.Evaluation{
 		TotalScore: sr.Total,
 		Details: map[string]float64{

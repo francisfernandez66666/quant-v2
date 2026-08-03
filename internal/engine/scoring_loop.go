@@ -116,6 +116,8 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 // filterTransitionSignals 状态翻转去重（纯函数）：返回本轮应广播的信号 + 下一轮去重状态。
 // 仅当某股某战法从 非Pass → Pass 翻转时广播；持续 Pass 不重发；翻回后再翻上会再发。
 func filterTransitionSignals(sigs []combat_agent.Signal, prev map[string]map[string]bool) (emit []combat_agent.Signal, next map[string]map[string]bool) {
+	// 双缓冲区翻转检测：prev 记录上一轮 Pass 状态，next 为本轮新状态；
+	// 仅当某股某战法从 非Pass → Pass 翻越状态边界时放入 emit，持续 Pass 不重发。
 	next = make(map[string]map[string]bool, len(sigs))
 	for _, sig := range sigs {
 		was := prev[sig.Code][sig.Strategy]

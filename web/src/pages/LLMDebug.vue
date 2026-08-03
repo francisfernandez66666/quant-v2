@@ -45,6 +45,7 @@
 
       <!-- Stage1：新闻初筛标题列表，标注通过/过滤 -->
       <h3 class="section-title">Stage1 · 新闻初筛</h3>
+      <!-- Stage1 新闻条目：标注通过/过滤，通过索引来自该轮次记录的 selected_idx -->
       <div class="stage1-list">
         <div v-for="(title, i) in data.raw_titles" :key="i"
           :class="['title-item', isSelected(i) ? 'selected' : 'discarded']">
@@ -58,6 +59,7 @@
 
       <!-- Stage2：LLM 深度分析事件卡片 -->
       <h3 class="section-title">Stage2 · LLM 分析结果</h3>
+      <!-- 事件卡片：标题 + 方向/评分 + 板块/个股/上下游/影响/类型/理由 -->
       <div class="stage2-events" v-if="data.stage2_events && data.stage2_events.length">
         <div v-for="(ev, i) in data.stage2_events" :key="i" class="event-card">
           <div class="event-header">

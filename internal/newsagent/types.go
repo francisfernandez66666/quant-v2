@@ -44,17 +44,17 @@ type Stage0Result struct {
 
 // DebugInfo LLM 调试信息，记录 Stage1/Stage2 处理过程和中间数据。
 type DebugInfo struct {
-	Stage1Mode    string      `json:"stage1_mode"`    // "llm" / "keyword"
-	RawCount      int         `json:"raw_count"`      // total raw titles
-	SelectedCount int         `json:"selected_count"` // titles after stage1
-	RawTitles     []string    `json:"raw_titles"`     // all raw titles
-	SelectedIdx   []int       `json:"selected_idx"`   // selected indices
-	Stage2Events  []NewsEvent `json:"stage2_events"`  // analyzed events
-	ProcessTime   time.Time   `json:"process_time"`   // when this debug was captured
+	Stage1Mode    string      `json:"stage1_mode"`    // "llm" / "keyword"：Stage1 使用的初筛方式
+	RawCount      int         `json:"raw_count"`      // total raw titles：原始标题总数
+	SelectedCount int         `json:"selected_count"` // titles after stage1：Stage1 初筛后的条数
+	RawTitles     []string    `json:"raw_titles"`     // all raw titles：全部原始标题
+	SelectedIdx   []int       `json:"selected_idx"`   // selected indices：被选中的标题索引
+	Stage2Events  []NewsEvent `json:"stage2_events"`  // analyzed events：Stage2 分析产出的事件
+	ProcessTime   time.Time   `json:"process_time"`   // when this debug was captured：调试快照的时间
 }
 
-// TrackerData 新闻追踪器数据，用于记录已处理的新闻标题和最后同步时间，避免重复处理。
+// TrackerData 新闻追踪器数据，存储已处理的标题与各来源同步时间，避免重复处理。
 type TrackerData struct {
-	SeenTitles map[string]string `json:"seen_titles"` // md5(title) → datetime
-	LastSync   map[string]string `json:"last_sync"`   // source → latest_datetime
+	SeenTitles map[string]string `json:"seen_titles"` // md5(title) → datetime：已处理标题及其时间
+	LastSync   map[string]string `json:"last_sync"`   // source → latest_datetime：各来源最近同步时间
 }

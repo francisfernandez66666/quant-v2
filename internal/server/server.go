@@ -29,6 +29,9 @@ type EngineController interface {
 	GetDebugInfo() *newsagent.DebugInfo
 	GetStageRecords() []newsagent.DebugInfo
 	GetHotRecords() []data.HotRecord
+	GetAllNewsEvents() []newsagent.NewsEvent
+	SetNewsShowAll(v bool)
+	NewsShowAll() bool
 	GetMessages() []data.MessageItem
 	ClearMessages()
 	DeleteMessage(id string)
@@ -194,6 +197,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/ipo/calendar", s.authMiddleware(s.handleFixIPOCalendar))
 	s.mux.HandleFunc("GET /api/stock/lookup", s.authMiddleware(s.handleFixStockLookup))
 	s.mux.HandleFunc("GET /api/news", s.authMiddleware(s.handleFixNews))
+	s.mux.HandleFunc("POST /api/news/showall", s.authMiddleware(s.handleNewsShowAllToggle))
+	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
 	s.mux.HandleFunc("GET /api/watchlist", s.authMiddleware(s.handleFixGetWatchlist))
 	s.mux.HandleFunc("POST /api/watchlist", s.authMiddleware(s.handleFixAddWatchlist))
 	s.mux.HandleFunc("DELETE /api/watchlist", s.authMiddleware(s.handleFixRemoveWatchlist))
@@ -496,6 +501,38 @@ func (s *Server) handleShortStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOn()})
 }
 
+// newsShowAllReq 资讯"显示全部"开关请求体。
+type newsShowAllReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+// newsShowAllOn 读取引擎"资讯显示全部"开关；未接入引擎时回退默认（关闭）。
+func (s *Server) newsShowAllOn() bool {
+	if s.ctrl != nil {
+		return s.ctrl.NewsShowAll()
+	}
+	return false
+}
+
+// handleNewsShowAllToggle 处理 POST /api/news/showall：切换"资讯显示全部"开关。
+func (s *Server) handleNewsShowAllToggle(w http.ResponseWriter, r *http.Request) {
+	var req newsShowAllReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if s.ctrl != nil {
+		s.ctrl.SetNewsShowAll(req.Enabled)
+	}
+	log.Printf("[server] 资讯显示全部开关: %v", req.Enabled)
+	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn()})
+}
+
+// handleNewsShowAllStatus 处理 GET /api/news/showall：返回"资讯显示全部"开关状态。
+func (s *Server) handleNewsShowAllStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn()})
+}
+
 // ── 持仓管理 ──
 
 // createPositionReq 新建持仓请求体：股票代码/名称、方向、策略、开仓价及止盈止损百分比。
@@ -721,6 +758,7 @@ func (s *Server) handleStageRecords(w http.ResponseWriter, r *http.Request) {
 	if recs == nil {
 		recs = []newsagent.DebugInfo{}
 	}
+	// 就地倒序，最新轮次的记录排在最前
 	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
 		recs[i], recs[j] = recs[j], recs[i]
 	}

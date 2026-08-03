@@ -77,9 +77,10 @@
       <span v-if="llmMsg" :class="['feedback', llmMsgType]">{{ llmMsg }}</span>
     </div>
 
-    <!-- 战法参数配置 -->
+    <!-- 战法参数配置：按策略分组渲染输入项，值绑定到 strategyCfg[分组key][字段key] -->
     <div class="setting-card" v-for="group in strategyGroups" :key="group.key">
       <div class="setting-header">{{ group.title }}</div>
+      <!-- 分组内各字段输入行：step/type 由字段定义控制 -->
       <div class="setting-row" v-for="f in group.fields" :key="f.k">
         <label :title="f.hint || ''">{{ f.label }}</label>
         <input v-model.number="strategyCfg[group.key][f.k]"
@@ -96,6 +97,23 @@
       </div>
       <button class="btn-save" @click="saveStrategy" :disabled="strategySaving">{{ strategySaving ? '保存中...' : '保存战法参数' }}</button>
       <span v-if="strategyMsg" :class="['feedback', strategyMsgType]">{{ strategyMsg }}</span>
+    </div>
+
+    <!-- 资讯显示开关 -->
+    <div class="setting-card">
+      <div class="setting-header">资讯显示</div>
+      <!-- 资讯显示开关：切换时调用 toggleNewsShowAll 持久化到后端 -->
+      <div class="setting-row">
+        <label title="开启后弱档/中性资讯（|score|<0.25）也出现在资讯列表；关闭则仅显示有价值的强事件">显示全部资讯（含弱/中性）</label>
+        <label class="switch">
+          <input type="checkbox" v-model="newsShowAll" @change="toggleNewsShowAll" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="setting-row">
+        <label>说明</label>
+        <span style="font-size:12px;color:#888">该开关即时生效，不影响引擎打分（引擎始终按 |score|≥0.5 过滤）</span>
+      </div>
     </div>
 
     <!-- 系统信息 -->
@@ -242,6 +260,20 @@ async function saveStrategy() {
   strategySaving.value = false
 }
 
+// ── 资讯显示开关 ──
+const newsShowAll = ref(false) // "显示全部资讯"开关状态（含弱/中性）
+
+/** 切换"显示全部资讯"开关并同步后端 */
+async function toggleNewsShowAll() {
+  try {
+    const res = await api.toggleNewsShowAll(newsShowAll.value)
+    if (res && typeof res.news_show_all === 'boolean') newsShowAll.value = res.news_show_all
+  } catch (e) {
+    newsShowAll.value = !newsShowAll.value
+    alert('切换失败: ' + (e.message || '未知错误'))
+  }
+}
+
 /** 保存服务器地址到 localStorage */
 function saveServer() {
   // 持久化服务器地址
@@ -327,6 +359,11 @@ onMounted(async () => {
       }
     }
   } catch (_) {}
+  try {
+    // 拉取"显示全部资讯"开关状态
+    const ns = await api.fetchNewsShowAllStatus()
+    if (ns && typeof ns.news_show_all === 'boolean') newsShowAll.value = ns.news_show_all
+  } catch (_) {}
 })
 </script>
 
@@ -357,6 +394,18 @@ onMounted(async () => {
 .btn-save:hover, .btn-test:hover { background: #2a2a3e; }
 .btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
 .feedback { font-size: 12px; margin-top: 8px; padding: 4px 8px; border-radius: 4px; display: inline-block; }
+.switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute; cursor: pointer; inset: 0; border-radius: 24px;
+  background: #333; transition: 0.3s;
+}
+.slider::before {
+  content: ''; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px;
+  border-radius: 50%; background: #888; transition: 0.3s;
+}
+.switch input:checked + .slider { background: #FF4D4F; }
+.switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
 .feedback.ok { color: #4caf50; }
 .feedback.err { color: #FF4D4F; }
 </style>

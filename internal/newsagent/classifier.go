@@ -40,6 +40,8 @@ const stage0FilterSystemPrompt = `你是一个A股新闻来源分类器。将以
 返回JSON数组，每项格式: {"index": 序号, "type": "official|institution|interactive|overseas"}
 每条新闻都必须给出分类。只输出JSON数组，不要多余文字。`
 
+// stage1Keywords 投资价值关键词表：标题命中任一关键词即视为有板块/宏观投资价值的候选，
+// 用于无 LLM 时的 Stage1 关键词兜底初筛。
 var stage1Keywords = []string{
 	"业绩", "财报", "预增", "预亏", "扭亏", "翻倍", "涨停", "跌停",
 	"重大合同", "中标", "订单", "重组", "定增", "增发", "回购", "减持", "增持",
@@ -85,6 +87,7 @@ func junkFallback(title string) bool {
 	return false
 }
 
+// ipoKeywords IPO 相关关键词：命中即判定为新股/申购/上市类新闻，直构事件不走 LLM。
 var ipoKeywords = []string{
 	"IPO", "新股", "申购", "中签", "首发", "过会", "招股", "发行价",
 	"上市首日", "新股上市", "挂牌上市", "注册生效", "网上发行",

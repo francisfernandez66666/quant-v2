@@ -20,15 +20,15 @@ type Engine struct {
 	scanner        *data.SectorScanner // 板块扫描器
 	stockSectorIdx map[string][]string // 个股→板块倒排索引
 
-	klineCacheMu sync.RWMutex
+	klineCacheMu sync.RWMutex                // 保护 klineCache 的读写锁（近实时打分并发访问）
 	klineCache   map[string]*klineCacheEntry // 日K/资金流缓存（近实时打分用）
 }
 
 // klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。
 type klineCacheEntry struct {
-	klines    []data.KLine
-	moneyFlow *data.CapitalFlow
-	fetchedAt time.Time
+	klines    []data.KLine      // 日K线数据（近120根，趋势/均线类战法使用）
+	moneyFlow *data.CapitalFlow // 资金流向（主力净流入）
+	fetchedAt time.Time         // 拉取时间（用于 5 分钟 TTL 判过期）
 }
 
 // New 创建策略引擎实例。
@@ -338,6 +338,16 @@ func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 	if err != nil || len(klines) == 0 {
 		if k2, err2 := e.marketAPI.GetKLine(code, "101", 120); err2 == nil && len(k2) > 0 {
 			klines = k2
+		}
+	}
+	// 日K两条数据源均失败时做一次瞬时重试，避免网络抖动导致自选/持仓持续无K线（0分误导）
+	if len(klines) == 0 {
+		time.Sleep(50 * time.Millisecond)
+		klines, err = e.marketAPI.GetSinaKLine(code, 120)
+		if err == nil && len(klines) == 0 {
+			if k2, err2 := e.marketAPI.GetKLine(code, "101", 120); err2 == nil && len(k2) > 0 {
+				klines = k2
+			}
 		}
 	}
 	cf, err := e.marketAPI.GetStockMoneyFlow(code)

@@ -22,15 +22,23 @@
 
     <!-- 消息列表 -->
     <div class="msg-list">
+      <!-- 消息卡片：等级徽标/股票代码/时间/操作徽标/删除按钮 + 标题 + 正文，按等级显示左边框颜色 -->
       <div v-for="(a, i) in filteredAlerts" :key="a.id || i" :class="['msg-card', alertClass(a)]">
         <div class="msg-header">
+          <!-- 消息等级徽标：止损/策略信号=红，止盈/加仓=绿，减仓=黄，其余=蓝 -->
           <span :class="['badge-level', levelClass(a.level)]">{{ a.level }}</span>
+          <!-- 关联股票代码与名称 -->
           <span class="msg-stock">{{ a.code }} {{ a.name }}</span>
+          <!-- 消息产生时间 -->
           <span class="msg-time">{{ a.time }}</span>
+          <!-- 操作徽标：依据标题内容推导买入/卖出/持有 -->
           <span :class="['badge-action', actionClass(a)]">{{ actionText(a) }}</span>
+          <!-- 单条删除按钮 -->
           <button class="btn-del" title="删除该消息" @click="onDeleteOne(a)">✕</button>
         </div>
+        <!-- 消息标题 -->
         <div class="msg-title">{{ a.title }}</div>
+        <!-- 消息正文 -->
         <div class="msg-body">{{ a.body }}</div>
       </div>
     </div>

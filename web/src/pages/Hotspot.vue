@@ -14,6 +14,7 @@
           </option>
         </select>
       </div>
+      <!-- 板块卡片：名称/异动原因摘要/评分/涨幅/涨停数/净流入，点击弹出异动详情 -->
       <div class="sector-grid" v-if="sectors.length">
         <div v-for="s in sectors" :key="s.code" class="sector-card" @click="showReason(s)">
           <div class="sec-name">{{ s.name }}</div>
@@ -37,10 +38,12 @@
     <div class="modal" v-if="reasonTarget">
       <div class="modal-header">{{ reasonTarget.name }}</div>
       <div class="modal-body">
+        <!-- 异动原因详情段落：优先展示 reason_detail，缺失时回退到 reason -->
         <div class="modal-section">
           <div class="modal-subtitle">板块异动原因</div>
           <div class="modal-reason">{{ reasonTarget.reason_detail || reasonTarget.reason || '暂无' }}</div>
         </div>
+        <!-- 触发新闻列表：列出与本次异动相关的新闻标题 -->
         <div v-if="reasonTarget.news_titles && reasonTarget.news_titles.length" class="modal-section">
           <div class="modal-subtitle">触发新闻（{{ reasonTarget.news_titles.length }}条）</div>
           <div v-for="(t, i) in reasonTarget.news_titles" :key="i" class="modal-news-item">
@@ -70,6 +73,7 @@
           <span class="ev-dr sortable" @click="setSort('dr_score')" title="龙回头≥60首次入场">回≥60{{ sortArrow('dr_score') }}</span>
           <span class="ev-m sortable" @click="setSort('m_score')" title="动量≥50值得看">量≥50{{ sortArrow('m_score') }}</span>
         </div>
+        <!-- 评分行：代码/名称/现价/涨跌 + 五维评分，强势或达标时整行高亮 -->
         <div class="ev-body">
           <div v-for="e in sortedEvals" :key="e.code" :class="rowClass(e)">
             <span class="ev-code">{{ e.code }}</span>
@@ -103,6 +107,7 @@
     <!-- 宏观日历 -->
     <div class="card" style="margin-top: 14px;">
       <div class="card-header">📅 宏观日历</div>
+      <!-- 宏观日历事件行：日期（MM-DD）+ 事件标题 -->
       <div class="hs-cal-scroll">
         <div v-for="(c, i) in calendarEvents" :key="'c'+i" class="hs-cal-item">
           <span class="hs-cal-date">{{ c.datetime ? c.datetime.slice(5, 10) : '' }}</span>
@@ -115,6 +120,7 @@
     <!-- IPO日历 -->
     <div class="card" style="margin-top: 14px;">
       <div class="card-header">📋 IPO日历</div>
+      <!-- IPO 事件行：日期 + 名称（代码）+ 发行价 + 上市状态（L=已上市） -->
       <div class="hs-cal-scroll">
         <div v-for="(c, i) in ipoCalendar" :key="'ipo'+i" class="hs-cal-item">
           <span class="hs-cal-date">{{ c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '') }}</span>
@@ -129,6 +135,7 @@
     <!-- 热点资讯列表 -->
     <div class="card" style="margin-top: 14px;">
       <div class="card-header">📰 热点资讯</div>
+      <!-- 资讯行：时间 + 标题 + 情绪/方向/影响/板块/个股标签 -->
       <div v-if="newsItems.length" class="hs-news-scroll">
         <div v-for="(n, i) in newsItems" :key="i" class="hs-news-item">
           <div class="hs-news-head">

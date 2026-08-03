@@ -142,6 +142,7 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 	}
 
 	sr := d.score(sd)
+	// 通过判定：总分 ≥ 60（ScoreThreshold）
 	pass := sr.Total >= 60
 
 	// 信号级别分档：≥85 加速 / ≥75 主升 / ≥60 首次 / 其余不操作
@@ -153,6 +154,7 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 	} else if sr.Total >= 60 {
 		level = "first"
 	}
+	// 置信度 = 总分 / 100（满分 100 口径）
 	confidence := sr.Total / 100.0
 
 	// 组装结果：总分 + 四因子明细 + 原始输入指标（供前端/复盘展示）

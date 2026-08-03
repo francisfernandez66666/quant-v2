@@ -2,6 +2,7 @@ package newsagent
 
 import (
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -10,8 +11,8 @@ import (
 )
 
 // analyzeDeep Stage2 全量分析：调用 LLM 对筛选后的新闻深度分析，生成结构化 NewsEvent。
-// LLM 轮询重试（最多3次）仍失败时整批归一般（返回 nil，不降级关键词兜底）。
-// 后置校正：档位归一 + 中性→0 + datetime 回退。
+// LLM 轮询重试（最多3次、递增间隔）仍失败时该批丢弃（返回 nil，不降级关键词兜底）。
+// 后置校正：档位归一 + 中性归零 + datetime 回退。
 func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 	if len(items) == 0 {
 		return nil
@@ -25,7 +26,7 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 
 	results, err := a.llmClient.AnalyzeHotTopicBatch(titles)
 	if err != nil {
-		log.Printf("[newsagent] Stage2 LLM批量分析失败, %d条归一般(不降级): %v", len(titles), err)
+		log.Printf("[newsagent] Stage2 LLM批量分析失败, 该批%d条丢弃: %v", len(titles), err)
 		return nil
 	}
 
@@ -88,7 +89,8 @@ func containsStr(slice []string, s string) bool {
 
 // postProcess 对 LLM 分析结果做后置校正：
 //   - 档位归一：|score| 归到 {0,0.25,0.5,0.75} 最近档，>0.75 截断为 0.75
-//   - 中性→0：LLM 自身判定方向/情绪为"中性"时强制 score=0（消除 +0.5 中性污染）
+//   - 中性归零（放宽）：仅当方向/情绪为"中性" 且 强度档位为 0（fallback 无方向）
+//     时才归零；对 LLM 明确给出的非零方向分数保留量化档，避免弱事件被误清空。
 func postProcess(ht *llm.HotTopic) {
 	// 取绝对值并截断上限，只处理强度档位
 	s := ht.Score
@@ -101,13 +103,11 @@ func postProcess(ht *llm.HotTopic) {
 	// 遍历四个档位找与 |score| 最近的档位（贪心最近邻）
 	tiers := []float64{0, 0.25, 0.5, 0.75}
 	best := tiers[0]
-	for _, t := range tiers {
-		diff := s - t
-		if diff < 0 {
-			diff = -diff
-		}
-		if diff < s-best {
+	bestDiff := math.Abs(s - tiers[0])
+	for _, t := range tiers[1:] {
+		if diff := math.Abs(s - t); diff < bestDiff {
 			best = t
+			bestDiff = diff
 		}
 	}
 	// 还原原始符号（利好正分/利空负分），中性档 0 无符号
@@ -115,8 +115,10 @@ func postProcess(ht *llm.HotTopic) {
 	if ht.Score < 0 {
 		score = -score
 	}
-	// 中性判定强制归零：消除 LLM 输出"中性"却带正分的情况
-	if strings.EqualFold(ht.Sentiment, "中性") || strings.EqualFold(ht.Direction, "中性") {
+	// 中性归零（放宽版）：LLM 判定方向为"中性" 且 无明确档位时归零，
+	// 消除 fallback 遗留污染；有明确非中性分档的事件保留，避免误杀。
+	neutral := strings.EqualFold(ht.Sentiment, "中性") || strings.EqualFold(ht.Direction, "中性")
+	if neutral && best == 0 {
 		score = 0
 	}
 	ht.Score = score

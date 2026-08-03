@@ -78,6 +78,7 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 		return nil
 	}
 	cfg := d.cfg.Get()
+	// 读取热加载的破局龙配置（F1~F4 权重、回调幅度等）
 	dc := cfg.Strategy.Dragon
 
 	// F1: 封板质量 — 基于涨幅和成交量

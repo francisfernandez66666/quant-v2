@@ -10,17 +10,17 @@ import (
 
 // VerifiedSector 已验证板块，包含方向、评分、RPS 排名、成分股与板块状态（加强/持续/退潮/反弹）。
 type VerifiedSector struct {
-	Name       string   `json:"name"`
-	Direction  string   `json:"direction"`
-	Score      float64  `json:"score"`
-	RPSRank    int      `json:"rps_rank,omitempty"`
+	Name       string   `json:"name"`                  // 板块名称
+	Direction  string   `json:"direction"`             // 板块方向（利好/利空）
+	Score      float64  `json:"score"`                 // 板块评分
+	RPSRank    int      `json:"rps_rank,omitempty"`    // 板块 RPS 排名位次
 	RPS20      float64  `json:"rps20,omitempty"`       // 板块20日RPS（用于龙回头龙性判定）
 	Phase      string   `json:"phase,omitempty"`       // 板块状态：加强/持续/退潮/反弹
 	Flow       float64  `json:"flow,omitempty"`        // 主力净流入(元)
 	ChangePct  float64  `json:"change_pct,omitempty"`  // 板块当日涨跌幅(%)
 	LimitupCnt int      `json:"limitup_cnt,omitempty"` // 板块内涨停家数
-	Stocks     []string `json:"stocks,omitempty"`
-	Reason     string   `json:"reason,omitempty"`
+	Stocks     []string `json:"stocks,omitempty"`      // 评分靠前的可操作成分股代码
+	Reason     string   `json:"reason,omitempty"`      // 验证结论/理由
 }
 
 // classifyPhase 板块状态机（抄自开源 sector_rotation 规则）：

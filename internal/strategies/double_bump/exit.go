@@ -18,6 +18,7 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strateg
 		return nil
 	}
 
+	// 当前持仓盈亏率（%，正=盈利）
 	pnlPct := (price - cost) / cost * 100
 
 	// 维护阶段最高价（优先取 EntryMeta 中记录的，其次取现价）
@@ -31,6 +32,7 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strateg
 		highest = price
 	}
 
+	// 有足够日K线（≥5根）才进行量价形态类检查（派发/破MA5）
 	if len(ctx.DailyK) >= 5 {
 		last := ctx.DailyK[len(ctx.DailyK)-1]
 		prev := ctx.DailyK[len(ctx.DailyK)-2]

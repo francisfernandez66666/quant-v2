@@ -39,6 +39,7 @@
             <span class="st-price">现价</span>
             <span class="st-chg">涨跌</span>
           </div>
+          <!-- 快照行：代码/名称/板块/现价/涨跌幅，红涨绿跌；板块悬停可看异动原因 -->
           <div class="st-body">
             <div v-for="s in snapshotStocks" :key="s.code" class="st-row">
               <span class="st-code">{{ s.code }}</span>
@@ -65,6 +66,7 @@
         <!-- 宏观日历 -->
         <div class="cal-section">
           <div class="section-label">📅 宏观日历</div>
+          <!-- 宏观日历事件行：日期（MM-DD）+ 事件标题 -->
           <div class="cal-scroll">
             <div v-for="(c, i) in calendarEvents" :key="'c'+i" class="cal-item">
               <span class="cal-date">{{ c.datetime ? c.datetime.slice(5, 10) : '' }}</span>
@@ -79,6 +81,7 @@
         <!-- IPO日历 -->
         <div class="cal-section">
           <div class="section-label">📋 IPO日历</div>
+          <!-- IPO 事件行：日期 + 名称（代码）+ 发行价 + 上市倒计时状态（L=已上市） -->
           <div class="cal-scroll">
             <div v-for="(c, i) in ipoCalendar" :key="'ipo'+i" class="cal-item">
               <span class="cal-date">{{ c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '') }}</span>
@@ -94,6 +97,7 @@
 
         <!-- 热门板块 -->
         <div v-if="hotSectors.length" class="section-label">🔥 热门板块</div>
+        <!-- 热门板块行：涨幅 + 板块名 + 净流入金额（只展示前 5 名） -->
         <div class="sec-scroll" v-if="hotSectors.length">
           <div v-for="(s, i) in hotSectors.slice(0, 5)" :key="'s'+i" class="sec-row">
             <span class="sec-pct">{{ (s.change_pct || 0) > 0 ? '+' : '' }}{{ (s.change_pct || 0).toFixed(1) }}%</span>
@@ -106,6 +110,7 @@
 
         <!-- 资讯列表 -->
         <div v-if="newsItems.length" class="section-label">📰 资讯</div>
+        <!-- 资讯行：时间 + 标题 + 方向/影响/板块/个股标签（最多展示前 15 条） -->
         <div class="news-scroll">
           <div v-for="(n, i) in newsItems.slice(0, 15)" :key="'n'+i" class="news-row">
             <div class="news-head">
@@ -132,6 +137,7 @@
         <span>策略信号</span>
         <span class="card-sub">{{ signals.length }}条</span>
       </div>
+      <!-- 信号行：代码/名称/策略 + D1-D4 子维度评分条 + 总分，点击跳转到信号页 -->
       <div v-if="filteredSignals.length" class="signal-mini">
         <div v-for="s in filteredSignals" :key="s.code" class="sig-row" @click="$router.push('/signals')">
           <span class="sig-code">{{ s.code }}</span>
@@ -154,6 +160,7 @@
     <!-- 系统运行信息 -->
     <div class="card" style="margin-top: 16px;">
       <div class="card-header">系统</div>
+      <!-- 运行信息行：运行时长 / 快照规模（股+板块） / 原始信号到最终信号的转换数 -->
       <div class="status-row-inline">
         <span>运行 {{ status.uptime || '-' }}</span>
         <span>快照 {{ scanStats.total_stocks || 0 }}股 / {{ scanStats.hot_sector_count || 0 }}板块</span>

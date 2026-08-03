@@ -25,11 +25,9 @@ func (a *Agent) fetchCatchUp() []data.NewsItem {
 	clsItems := a.fetchCLSOnce(seen)
 	all = append(all, clsItems...)
 
-	// 兜底：新浪（只1页，去重）；仅当主源数量不足时才补充
-	if len(all) < 20 {
-		sinaItems := a.fetchSinaOnce(seen)
-		all = append(all, sinaItems...)
-	}
+	// 新浪（只1页，去重）：补充视角，始终尝试拉取（不再受主源数量门槛限制）
+	sinaItems := a.fetchSinaOnce(seen)
+	all = append(all, sinaItems...)
 
 	// 标记所有追回的新闻为"已见"，防止下次轮询重复拉取
 	titles := make([]string, len(all))

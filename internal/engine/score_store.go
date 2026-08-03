@@ -12,8 +12,8 @@ import (
 
 // scoreStoreFile scores.json 磁盘结构（按交易日分桶）。
 type scoreStoreFile struct {
-	TradingDay string                              `json:"trading_day"`
-	Scores     map[string]combat_agent.StockScores `json:"scores"`
+	TradingDay string                              `json:"trading_day"` // 交易日（YYYY-MM-DD）
+	Scores     map[string]combat_agent.StockScores `json:"scores"`      // 当日各股最新打分（code → 打分明细）
 }
 
 // scoreStore 打分持久化存储，Save 覆盖写当日最新分，Load 返回最近一次结果。

@@ -7,6 +7,7 @@ import (
 	"quant-trading-v2/internal/config"
 )
 
+// emotionCfgStub 构造测试用情绪阈值配置（各字段对应 rules.json 的 EmotionConfig）。
 func emotionCfgStub() *config.EmotionConfig {
 	return &config.EmotionConfig{
 		EmoClimaxLimitupMin:  80,

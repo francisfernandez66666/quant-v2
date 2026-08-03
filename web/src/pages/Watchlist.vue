@@ -29,6 +29,7 @@
         <span class="ev-m sortable" @click="setSort('m_score')" title="动量≥50值得看">量≥50{{ sortArrow('m_score') }}</span>
       </div>
       <div class="ev-body">
+          <!-- 自选行：代码/名称/现价/涨跌 + 五维评分 + 删除按钮，强势或达标时整行高亮 -->
           <div v-for="e in sortedEvals" :key="e.code" :class="rowClass(e)">
           <span class="ev-code">{{ e.code }}</span>
           <span class="ev-name">{{ e.name || '-' }}</span>

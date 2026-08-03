@@ -22,10 +22,17 @@ type Agent struct {
 	tracker    *tracker           // 去重记账器：记录已见标题与来源同步时间，避免重复处理
 	dataDir    string             // 数据目录：存放 news_events.json / news_tracker.json
 	newsDBPath string             // 新闻事件本地持久化文件路径（news_events.json）
+	minScore   float64            // 落盘过滤最低分（默认 0.25；前端"显示全部"开关可改为 0）
 }
 
 // SetLLMClient 设置 LLM 客户端。
 func (a *Agent) SetLLMClient(c *llm.Client) { a.llmClient = c }
+
+// SetMinScore 设置落盘过滤最低分（|score| 低于该值的事件不落盘展示）。
+func (a *Agent) SetMinScore(v float64) { a.minScore = v }
+
+// MinScore 返回当前落盘过滤最低分。
+func (a *Agent) MinScore() float64 { return a.minScore }
 
 // New 创建新闻智能体实例。
 func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCleaner, dataDir string) *Agent {
@@ -36,6 +43,7 @@ func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCl
 		tracker:    newTracker(dataDir),
 		dataDir:    dataDir,
 		newsDBPath: filepath.Join(dataDir, "news_events.json"),
+		minScore:   0.25, // 默认最低落盘分 0.25（前端"显示全部"可降为 0）
 	}
 }
 
@@ -74,6 +82,7 @@ func (a *Agent) Stage1(titles []string) []int {
 func (a *Agent) Stage2(items []data.NewsItem) []NewsEvent {
 	events := a.analyzeDeep(items)
 	if a.cleaner != nil {
+		// 对每个事件关联的个股做名称/代码归一化清洗（→ "名称|代码"）
 		for i := range events {
 			events[i].CleanedStocks = a.cleaner.CleanBatch(events[i].RelatedStocks)
 		}
@@ -163,12 +172,13 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 		seen[key] = true
 	}
 	for _, e := range events {
-		// 取分数绝对值作为过滤依据：低于 0.25 的中性/无价值噪音直接丢弃
+		// 取分数绝对值作为过滤依据：低于 minScore 的中性/无价值噪音直接丢弃
+		// （默认 0.25，前端"显示全部"开关可降为 0，让弱档/中性事件也出现在 /api/news）
 		s := e.Score
 		if s < 0 {
 			s = -s
 		}
-		if s < 0.25 {
+		if s < a.minScore {
 			continue // 过滤中性/无价值噪音
 		}
 		// 标题级去重：同标题事件仅保留第一条
@@ -206,6 +216,15 @@ func (a *Agent) loadNewsDB() *newsDB {
 		return &newsDB{}
 	}
 	return &db
+}
+
+// AllEvents 返回持久化到本地的全部已打标新闻事件（含中性/一般），供 /api/news?all=true 展示。
+func (a *Agent) AllEvents() []NewsEvent {
+	db := a.loadNewsDB()
+	if db == nil {
+		return nil
+	}
+	return db.Events
 }
 
 // buildIPOEvents 从 IPO 日历构建 NewsEvent（新股申购/上市），跳过已存在的事件。

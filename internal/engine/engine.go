@@ -55,7 +55,7 @@ type Engine struct {
 
 	msgStore   *data.MessageStore // 消息中心持久化存储
 	hotRecords []data.HotRecord   // 当日热点板块轮次记录（固化到磁盘）
-	hotRecPath string
+	hotRecPath string             // 热点板块记录持久化文件路径
 
 	sectorEventTimes map[string]time.Time  // 板块事件时间戳（重复事件衰减状态）
 	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
@@ -102,6 +102,7 @@ func New(
 	ths *data.THSClient,
 	dataDir string,
 ) *Engine {
+	// 根据 dataDir 计算各持久化文件路径（dataDir 为空时不落盘，纯内存模式）
 	stageRecPath := ""
 	msgPath := ""
 	scoreRecPath := ""
@@ -139,7 +140,7 @@ func New(
 		prevPass:         make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
 	}
-	e.syncMessages(nil)
+	e.syncMessages(nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心
 	// 启动时回填上次持久化的 8a/8b 打分（重启后前端立即可见）
 	if loaded := e.scoreStore.Load(); len(loaded) > 0 {
 		e.agg.UpdateFast(loaded, nil, e.rpt)
@@ -199,6 +200,45 @@ func (e *Engine) GetStageRecords() []newsagent.DebugInfo {
 	out := make([]newsagent.DebugInfo, len(e.stageRecords))
 	copy(out, e.stageRecords)
 	return out
+}
+
+// GetAllNewsEvents 返回持久化到本地的全部已打标新闻事件，供 /api/news?all=true 展示。
+func (e *Engine) GetAllNewsEvents() []newsagent.NewsEvent {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return nil
+	}
+	return na.AllEvents()
+}
+
+// SetNewsShowAll 设置"资讯显示全部"开关：开启时落盘过滤分降到 0，
+// 弱档/中性事件也出现在 /api/news；关闭时恢复默认 0.25。
+func (e *Engine) SetNewsShowAll(v bool) {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return
+	}
+	if v {
+		na.SetMinScore(0)
+	} else {
+		na.SetMinScore(0.25)
+	}
+	log.Printf("[engine] 资讯显示全部开关: %v (落盘最低分=%v)", v, na.MinScore())
+}
+
+// NewsShowAll 返回"资讯显示全部"开关当前状态。
+func (e *Engine) NewsShowAll() bool {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return false
+	}
+	return na.MinScore() == 0
 }
 
 // ── 热点板块记录 ──
@@ -455,6 +495,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	} else {
 		// 2. Stage0 归因分类：个股 / 板块 / 一般（合并垃圾过滤+价值初筛+标题党复核）
 		st0 = e.newsAgent.Stage0(rawNews)
+		log.Printf("[engine][news漏斗] 原始=%d 个股=%d 板块=%d IPO=%d 一般=%d (板块material保留=%d)",
+			len(rawNews), len(st0.StockIdx), len(st0.SectorIdx), len(st0.IpoIdx), len(st0.GeneralIdx), len(st0.Material))
 
 		// 2b. 标题党修复：LLM 校正标题应用到原文（供 Stage2 分析、事件与展示使用）
 		for i, t := range st0.CorrectedTitle {
@@ -497,9 +539,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 		// 5. 持久化全量事件供 /api/news 展示（含中性/一般新闻）
 		e.newsAgent.SaveEvents(events)
+		log.Printf("[engine][news漏斗] 事件共=%d (>=0.25落盘), 个股+板块+IPO来源", len(events))
 
 		// 6. 阈值过滤：仅 |score| ≥ 0.50 进引擎（弱/中性丢弃）
 		valid = filterThreshold(events, 0.50)
+		log.Printf("[engine][news漏斗] 阈值过滤0.5 -> 有效=%d", len(valid))
 		if len(valid) > 0 {
 			// 6a. 事件聚簇：同板块/同方向的重复新闻合并为单条（去重避免刷屏）
 			valid = clusterEvents(valid)
@@ -509,6 +553,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 			// 6c. 衰减后再次阈值过滤（重复事件降权后可掉出 0.5 线）
 			valid = filterThreshold(valid, 0.50)
+			log.Printf("[engine][news漏斗] 聚簇+衰减后再滤 -> 有效=%d", len(valid))
 			if len(valid) > 0 {
 				// 6b. 板块验真回填：剔除 LLM 幻觉板块名（命中真实板块名单才保留）
 				e.verifySectorAttribution(valid)
@@ -687,6 +732,20 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 14. 聚合器更新看板
 	e.agg.Update(sr, verifiedBull, verifiedBear, bullSignals, bearSignals, alertSignals, stockScores, e.rpt)
 
+	// 14b. 信号产生日志：逐条输出本轮生成的做多/做空/提醒信号（带日期时间戳，便于排障）
+	for _, sig := range bullSignals {
+		log.Printf("[engine] 产生信号 %s %s(%s) 方向=%s 操作=%s 置信=%.2f | %s",
+			sig.Strategy, sig.Code, sig.Name, sig.Direction, sig.Action, sig.Confidence, sig.Reason)
+	}
+	for _, sig := range bearSignals {
+		log.Printf("[engine] 产生信号 %s %s(%s) 方向=%s 操作=%s 置信=%.2f | %s",
+			sig.Strategy, sig.Code, sig.Name, sig.Direction, sig.Action, sig.Confidence, sig.Reason)
+	}
+	for _, sig := range alertSignals {
+		log.Printf("[engine] 产生信号 %s %s(%s) 方向=%s 操作=%s 置信=%.2f | %s",
+			sig.Strategy, sig.Code, sig.Name, sig.Direction, sig.Action, sig.Confidence, sig.Reason)
+	}
+
 	// 8a/8b 打分持久化（与近实时循环同口径，当日最新分）
 	e.scoreStore.Save(td, stockScores)
 
@@ -764,6 +823,7 @@ func (e *Engine) feedRPS(boards []data.SectorInfo) {
 	for i, r := range rows {
 		rank := 0.0
 		if len(rows) > 1 {
+			// 按当日涨幅排名线性映射 RPS 近似值（第一名≈100，最后一名≈0）
 			rank = 100 * (1 - float64(i)/float64(len(rows)-1))
 		}
 		rps = append(rps, data.SectorRPS{
@@ -830,7 +890,7 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 				continue
 			}
 			if fetched[si.Code] {
-				continue
+				continue // 同一板块每轮只取一次成分股，避免重复注入
 			}
 			fetched[si.Code] = true
 			stocks, err := e.marketAPI.GetSectorStocks(si.Code, 10)
@@ -841,7 +901,7 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 			for _, st := range stocks {
 				label := fmt.Sprintf("%s(%s)", st.Name, st.Code)
 				if strContains(ev.RelatedStocks, label) || strContains(ev.RelatedStocks, st.Name) {
-					continue
+					continue // 已注入过同名/同标签则跳过
 				}
 				ev.RelatedStocks = append(ev.RelatedStocks, label)
 				injected++
@@ -1004,14 +1064,14 @@ func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
 	clusters := make([][]int, 0, len(events))
 	assign := func(ev newsagent.NewsEvent) int {
 		if ev.Level == "个股" {
-			return -1
+			return -1 // 个股级事件不参与聚簇，各自独立
 		}
 		for _, sec := range ev.Sectors {
 			if idx, ok := clusterOf[sec]; ok {
-				return idx
+				return idx // 命中已有板块簇则归入该簇
 			}
 		}
-		return -1
+		return -1 // 无共享板块，新建独立簇
 	}
 	for i, ev := range events {
 		idx := assign(ev)

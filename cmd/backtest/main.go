@@ -118,6 +118,7 @@ func (w *sseWatcher) count() int { return len(w.raw) }
 // close 注销 SSE 订阅.
 func (w *sseWatcher) close() { w.broker.Unsubscribe(w.ch) }
 
+// main 回测入口：解析命令行参数，调用回测 run，失败时终止进程。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	opts, err := parseFlags()

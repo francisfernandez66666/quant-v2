@@ -43,9 +43,11 @@ type StockScores struct {
 	DragonScore       float64   `json:"dragon_score"`  // 龙头战法分（0~100）
 	DoubleBumpScore   float64   `json:"db_score"`      // 双响炮战法分（0~100）
 	DragonReturnScore float64   `json:"dr_score"`      // 龙回头战法分（0~100）
-	MomentumScore     float64   `json:"m_score"`       // 动量分（量价+MACD+走势，0~100）
-	SignalActive      bool      `json:"signal_active"` // 本轮是否有该股信号
-	UpdatedAt         time.Time `json:"updated_at"`    // 打分时间
+	MomentumScore     float64         `json:"m_score"`       // 动量分（量价+MACD+走势，0~100）
+	MomentumValid     bool            `json:"m_valid"`       // 动量分数据是否完整（量价/走势/MACD 任一缺失为 false）
+	SignalActive      bool            `json:"signal_active"` // 本轮是否有该股信号
+	DataGaps          map[string]bool `json:"data_gaps"`     // 数据缺口标记：key=战法类型，true=该战法输入数据不足（0 分不代表真实 0）
+	UpdatedAt         time.Time       `json:"updated_at"`    // 打分时间
 }
 
 // Signal 战法引擎输出的信号，包含方向、操作、置信度等信息。

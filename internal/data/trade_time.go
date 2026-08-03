@@ -20,6 +20,7 @@ type TradeTimeConfig struct {
 
 }
 
+// defaultTradeTime 默认交易时段参数（A 股标准时段），可用 SetTradeTimeConfig 覆盖。
 var defaultTradeTime = TradeTimeConfig{
 	TradeOpen: 915, TradeClose: 1500,
 	FullOpen: 915, FullClose: 1530,

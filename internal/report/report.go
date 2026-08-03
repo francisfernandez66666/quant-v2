@@ -26,6 +26,7 @@ type ExecLog struct {
 	ProfitPct      *float64   `json:"profit_pct,omitempty"` // 盈亏百分比（正值为盈利，负值为亏损，nil 表示尚未平仓）
 	TakeProfitPct  float64    `json:"take_profit_pct"`      // 预设止盈百分比
 	StopLossPct    float64    `json:"stop_loss_pct"`        // 预设止损百分比
+	Quantity       float64    `json:"quantity"`             // 持仓数量（手动设置，默认 1）
 }
 
 // Report 管理所有交易持仓记录，提供线程安全的增删改查与文件持久化能力。

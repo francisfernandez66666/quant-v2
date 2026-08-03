@@ -264,15 +264,15 @@ func thsSecID(code string) string {
 // thsQuoteRaw 同花顺行情 JSON 响应结构（备用，实际解析用更松散的 []interface{}）。
 type thsQuoteRaw struct {
 	Items map[string]struct {
-		Code      string  `json:"code"`
-		Name      string  `json:"name"`
-		Price     float64 `json:"price"`
-		High      float64 `json:"high"`
-		Low       float64 `json:"low"`
-		Open      float64 `json:"open"`
-		Volume    float64 `json:"volume"`
-		Amount    float64 `json:"amount"`
-		ChangePct float64 `json:"change_pct"`
+		Code      string  `json:"code"`       // 股票代码
+		Name      string  `json:"name"`       // 股票名称
+		Price     float64 `json:"price"`      // 最新价
+		High      float64 `json:"high"`       // 最高价
+		Low       float64 `json:"low"`        // 最低价
+		Open      float64 `json:"open"`       // 开盘价
+		Volume    float64 `json:"volume"`     // 成交量
+		Amount    float64 `json:"amount"`     // 成交额
+		ChangePct float64 `json:"change_pct"` // 涨跌幅（%）
 	} `json:"items"`
 }
 

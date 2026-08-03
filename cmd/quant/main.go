@@ -180,6 +180,7 @@ func main() {
 	if v := os.Getenv("QUANT_ADDR"); v != "" {
 		addr = v
 	}
+	// 后台运行 HTTP 服务：阻塞监听 addr，Serve 返回错误时由 log.Fatal 终止进程
 	go func() {
 		log.Fatal(srv.Serve(addr))
 	}()

@@ -19,7 +19,7 @@ import (
 // D1Score 表示单只个股的 D1 事件评分结果。
 // Score 范围 0.0~1.0，Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
 type D1Score struct {
-	Code    string  `json:"code"`
+	Code    string  `json:"code"`    // 股票代码
 	Score   float64 `json:"score"`   // 评分值，0.0~1.0，越高越值得关注
 	Blocked bool    `json:"blocked"` // 是否被负面过滤拦截（利空事件命中）
 	Reason  string  `json:"reason"`  // LLM 给出的评分分析理由
@@ -29,8 +29,8 @@ type D1Score struct {
 // 收拢到 combat_agent，LLM 参考 events_leftside.yaml 规则评分。
 // 非并发安全，建议由 Engine 在独立 goroutine 中单实例调用。
 type D1Scorer struct {
-	llmClient   *llm.Client
-	yamlContent string // events_leftside.yaml 原始内容，作为 LLM prompt 参考
+	llmClient   *llm.Client // LLM 客户端，用于调用大模型进行 D1 评分
+	yamlContent string      // events_leftside.yaml 原始内容，作为 LLM prompt 参考
 }
 
 // NewD1Scorer 创建 D1Scorer 实例。

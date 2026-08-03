@@ -77,6 +77,17 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	if si == nil || si.Price <= 0 || len(kLines) < 10 {
 		return nil
 	}
+	// 今日实时走弱（低开低走）时，双凸第二波确认被打破，不构成做多信号：
+	// 日K最后一根可能是昨日收盘，需用实时涨跌幅抑制当日下跌时的误报。
+	if si.ChangePct <= -1.5 {
+		return &strategy.Evaluation{
+			TotalScore: 0,
+			Pass:       false,
+			Level:      "watch",
+			Confidence: 0,
+		}
+	}
+	// 读取热加载的双凸配置（放量倍数、权重、调整阈值等）
 	cfg := d.cfg.Get()
 	dbc := cfg.Strategy.DoubleBump
 
@@ -84,6 +95,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	avgVol := 0.0
 	avgClose := 0.0
 	n := len(kLines)
+	// 回看窗口最多 20 根且剔除最后一根（避免用当日数据污染基准）
 	lookback := int(math.Min(float64(n-1), 20))
 	for i := n - lookback - 1; i < n-1; i++ {
 		avgVol += kLines[i].Volume
@@ -191,6 +203,7 @@ func min(a, b int) int {
 // full_chain → buy，置信度>0.8 → P1，否则 P2。
 // brief → watch，P3_5。
 func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
+	// 默认：仅观察（watch / P3）
 	prio := strategy.P3
 	action := strategy.ActionWatch
 
@@ -207,6 +220,7 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 		prio = strategy.P3_5
 	}
 
+	// 复制评分明细到 Meta（供前端展示各维度分数）
 	meta := make(map[string]float64)
 	for k, v := range eval.Details {
 		meta[k] = v
@@ -313,6 +327,7 @@ func (d *DoubleBumpStrategy) CheckIDFReturn(code string, kLines []data.KLine) bo
 		}
 		avgVol += kLines[i].Volume
 	}
+	// 回看均值分母：最多 18 根（去掉最近两根被比较的K线），不足则按实际可用数
 	avgVol /= float64(min(18, n-2))
 
 	if kLines[n-1].Volume < avgVol*1.2 || kLines[n-2].Volume < avgVol*1.2 {

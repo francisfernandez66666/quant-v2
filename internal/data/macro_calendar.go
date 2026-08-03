@@ -17,12 +17,12 @@ import (
 
 // MacroEvent 宏观事件定义
 type MacroEvent struct {
-	Date     time.Time `json:"date"`
-	Title    string    `json:"title"`
-	Level    string    `json:"level"`
-	Impact   string    `json:"impact"`
-	Duration int       `json:"duration"`
-	DaysLeft int       `json:"days_left"`
+	Date     time.Time `json:"date"`      // 事件日期
+	Title    string    `json:"title"`     // 事件标题
+	Level    string    `json:"level"`     // 事件类型（fomc/cpi/nfp/pce/contract/war）
+	Impact   string    `json:"impact"`    // 影响程度（high/medium/low）
+	Duration int       `json:"duration"`  // 影响期天数（事件日前/后各 Duration 天为影响期）
+	DaysLeft int       `json:"days_left"` // 距离事件结束的剩余天数（由筛选逻辑计算）
 }
 
 // GenMacroEvents 生成指定年份的全部宏观事件
@@ -312,12 +312,12 @@ func FetchCalendarFromLLM(chat ChatFunc, months int) []ExternalEvent {
 
 // EventResult 宏观事件发布结果
 type EventResult struct {
-	Title     string `json:"title"`
-	Value     string `json:"value"`
-	Expect    string `json:"expect"`
-	Compare   string `json:"compare"`
-	Sentiment string `json:"sentiment"`
-	Summary   string `json:"summary"`
+	Title     string `json:"title"`     // 事件标题
+	Value     string `json:"value"`     // 实际公布值
+	Expect    string `json:"expect"`    // 预期值
+	Compare   string `json:"compare"`   // 对比结果（高于预期/低于预期/符合预期）
+	Sentiment string `json:"sentiment"` // 市场影响（利好/利空/中性）
+	Summary   string `json:"summary"`   // 一句话总结
 }
 
 // FetchEventResult 查询已发生宏观事件的真实数据结果

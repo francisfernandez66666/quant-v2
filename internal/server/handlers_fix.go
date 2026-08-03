@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -18,6 +19,12 @@ import (
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 )
+
+// r2 四舍五入到 2 位小数（价格/百分比）。
+func r2(v float64) float64 { return math.Round(v*100) / 100 }
+
+// r0 四舍五入到整数（分数）。
+func r0(v float64) float64 { return math.Round(v) }
 
 // fixSignal 适配前端信号格式的结构体。
 // 将内部 combat_agent.Signal 转换为前端期望的字段名和格式。
@@ -257,6 +264,7 @@ func (s *Server) handleSectorHotRecords(w http.ResponseWriter, r *http.Request) 
 	if recs == nil {
 		recs = []data.HotRecord{}
 	}
+	// 就地倒序，最新轮次的热点记录排在最前
 	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
 		recs[i], recs[j] = recs[j], recs[i]
 	}
@@ -266,23 +274,23 @@ func (s *Server) handleSectorHotRecords(w http.ResponseWriter, r *http.Request) 
 // fixHolding 前端持仓格式的结构体。
 // 包含持仓数量、成本价、现价、盈亏比例、止盈止损价等字段。
 type fixHolding struct {
-	Code          string  `json:"code"`
-	Name          string  `json:"name"`
-	Quantity      float64 `json:"quantity"`
-	CostPrice     float64 `json:"cost_price"`
-	CurPrice      float64 `json:"cur_price"`
-	ChangePct     float64 `json:"change_pct"`
-	PnlPct        float64 `json:"pnl_pct"`
-	TakeProfitPct float64 `json:"take_profit_pct"`
-	StopLossPct   float64 `json:"stop_loss_pct"`
-	SignalActive  bool    `json:"signal_active"`
-	NSscore       float64 `json:"n_score"`
-	DragonScore   float64 `json:"dragon_score"`
-	DbScore       float64 `json:"db_score"`
-	DrScore       float64 `json:"dr_score"`
-	MScore        float64 `json:"m_score"`
-	TakeProfit    float64 `json:"take_profit"`
-	StopLoss      float64 `json:"stop_loss"`
+	Code          string  `json:"code"`           // 股票代码
+	Name          string  `json:"name"`           // 股票名称
+	Quantity      float64 `json:"quantity"`       // 持仓数量
+	CostPrice     float64 `json:"cost_price"`     // 持仓成本价
+	CurPrice      float64 `json:"cur_price"`      // 最新现价
+	ChangePct     float64 `json:"change_pct"`     // 当日涨跌幅（%）
+	PnlPct        float64 `json:"pnl_pct"`        // 持仓盈亏比例（%）
+	TakeProfitPct float64 `json:"take_profit_pct"` // 止盈百分比设置
+	StopLossPct   float64 `json:"stop_loss_pct"`   // 止损百分比设置
+	SignalActive  bool    `json:"signal_active"`   // 是否有活跃信号
+	NSscore       float64 `json:"n_score"`         // N形策略评分
+	DragonScore   float64 `json:"dragon_score"`    // 破局龙策略评分
+	DbScore       float64 `json:"db_score"`        // 双凸策略评分
+	DrScore       float64 `json:"dr_score"`        // 龙回头策略评分
+	MScore        float64 `json:"m_score"`         // 动量策略评分
+	TakeProfit    float64 `json:"take_profit"`     // 止盈目标价
+	StopLoss      float64 `json:"stop_loss"`       // 止损价位
 }
 
 // handleFixGetHoldings 处理 GET /api/holdings 请求，返回当前持仓列表。
@@ -309,18 +317,22 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 		if cur > 0 && l.EntryPrice > 0 {
 			pnl = (cur - l.EntryPrice) / l.EntryPrice * 100
 		}
+		qty := l.Quantity
+		if qty <= 0 {
+			qty = 1
+		}
 		h := fixHolding{
 			Code:          l.Code,
 			Name:          name,
-			Quantity:      1,
-			CostPrice:     l.EntryPrice,
-			CurPrice:      cur,
-			ChangePct:     chg,
-			PnlPct:        pnl,
-			TakeProfitPct: l.TakeProfitPct,
-			StopLossPct:   l.StopLossPct,
-			TakeProfit:    l.EntryPrice * (1 + l.TakeProfitPct/100),
-			StopLoss:      l.EntryPrice * (1 - l.StopLossPct/100),
+			Quantity:      qty,
+			CostPrice:     r2(l.EntryPrice),
+			CurPrice:      r2(cur),
+			ChangePct:     r2(chg),
+			PnlPct:        r2(pnl),
+			TakeProfitPct: r2(l.TakeProfitPct),
+			StopLossPct:   r2(l.StopLossPct),
+			TakeProfit:    r2(l.EntryPrice * (1 + l.TakeProfitPct/100)),
+			StopLoss:      r2(l.EntryPrice * (1 - l.StopLossPct/100)),
 		}
 		dash := s.agg.Current()
 		if dash != nil {
@@ -369,11 +381,13 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 		existing := s.rpt.FindBySignalID(h.Code + "_fix")
 		if existing == nil {
 			s.rpt.LogSignal(h.Code+"_fix", h.Code, h.Name, "做多", "手动", h.CostPrice, h.TakeProfitPct, h.StopLossPct)
+			s.rpt.Update(h.Code+"_fix", func(l *report.ExecLog) { l.Quantity = h.Quantity })
 		} else {
 			s.rpt.Update(h.Code+"_fix", func(l *report.ExecLog) {
 				l.EntryPrice = h.CostPrice
 				l.TakeProfitPct = h.TakeProfitPct
 				l.StopLossPct = h.StopLossPct
+				l.Quantity = h.Quantity
 			})
 		}
 	}
@@ -428,14 +442,14 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]interface{}{
 			"name":          sec.Name,
 			"code":          si.Code,
-			"score":         sec.Score,
-			"change_pct":    si.ChangePct,
+			"score":         r0(sec.Score),
+			"change_pct":    r2(si.ChangePct),
 			"d1":            0,
 			"reason":        sec.Reason,
 			"reason_detail": sec.Reason,
 			"direction":     sec.Direction,
 			"limitup_cnt":   si.LimitupCnt,
-			"net_inflow":    si.NetInflow,
+			"net_inflow":    r2(si.NetInflow),
 			"news_titles":   newsTitles,
 		})
 	}
@@ -462,8 +476,8 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]interface{}{
 			"code":       info.Code,
 			"name":       info.Name,
-			"price":      info.Price,
-			"change_pct": chg,
+			"price":      r2(info.Price),
+			"change_pct": r2(chg),
 			"sector":     info.Sector,
 		})
 	}
@@ -499,8 +513,8 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]interface{}{
 			"code":          sig.Code,
 			"name":          sig.Name,
-			"price":         price,
-			"change_pct":    chg,
+			"price":         r2(price),
+			"change_pct":    r2(chg),
 			"sector":        sig.Sector,
 			"sector_reason": sig.Reason,
 			"reason":        sig.Reason,
@@ -552,17 +566,17 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]interface{}{
 			"code":          code,
 			"name":          name,
-			"price":         price,
-			"change_pct":    chg,
-			"n_score":       nScore,
+			"price":         r2(price),
+			"change_pct":    r2(chg),
+			"n_score":       r0(nScore),
 			"n_pass":        nScore >= 60,
-			"dragon_score":  dragonScore,
+			"dragon_score":  r0(dragonScore),
 			"dragon_pass":   dragonScore >= 70,
-			"db_score":      dbScore,
+			"db_score":      r0(dbScore),
 			"db_pass":       dbScore >= 70,
-			"dr_score":      drScore,
+			"dr_score":      r0(drScore),
 			"dr_pass":       drScore >= 60,
-			"m_score":       mScore,
+			"m_score":       r0(mScore),
 			"m_pass":        mScore >= 50,
 			"signal_active": sigActive,
 		})
@@ -621,9 +635,24 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 // 数据来源：引擎持久化的新闻事件（聚合器展示缓存）+ 自动生成的宏观日历事件（影响级别高/中/低）。
 // 宏观日历仅显示近 14 天内的事件，标注剩余天数。
 func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
+	all := r.URL.Query().Get("all") == "true"
 	var events []newsagent.NewsEvent
+	// all=true：读取持久化的全量已打标新闻（含中性/一般，跨轮次累计）
+	if all && s.ctrl != nil {
+		events = s.ctrl.GetAllNewsEvents()
+	}
+	// 再补充看板内存中的本轮事件（去重标题），保证实时事件不遗漏
+	seen := make(map[string]bool)
+	for _, e := range events {
+		seen[e.Title] = true
+	}
 	if cur := s.agg.Current(); cur != nil {
-		events = cur.NewsEvents
+		for _, e := range cur.NewsEvents {
+			if !seen[e.Title] {
+				events = append(events, e)
+				seen[e.Title] = true
+			}
+		}
 	}
 	out := make([]map[string]interface{}, 0)
 	for _, e := range events {

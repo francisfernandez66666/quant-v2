@@ -8,14 +8,17 @@
     <div class="page-header">
       <h2>持仓管理</h2>
       <div class="header-right">
+        <!-- 总盈亏：红赚绿亏，点击"清零"把当前累计盈亏记为偏移量 -->
         <div class="total-pnl" :class="totalPnl >= 0 ? 'up' : 'down'">
           总盈亏: {{ totalPnl >= 0 ? '+' : '' }}¥{{ totalPnl.toFixed(2) }}
           <button class="btn-reset" @click="resetPnl">清零</button>
         </div>
+        <!-- 可用资金：点击切换到编辑输入框，回车/失焦保存 -->
         <div class="balance" v-if="!editingBalance" @click="editBalanceStart">可用资金: ¥{{ availableBalance.toFixed(2) }} ✏️</div>
         <div class="balance-editing" v-else>
           <input ref="balanceInput" v-model.number="balanceInputVal" type="number" step="0.01" @blur="editBalanceSave" @keydown.enter="editBalanceSave" @keydown.escape="editBalanceCancel" />
         </div>
+        <!-- 新增持仓按钮：弹出新增/编辑弹窗 -->
         <button class="btn-add" @click="showAdd = true">+ 新增持仓</button>
       </div>
     </div>
@@ -24,11 +27,13 @@
     <div class="modal-overlay" v-if="showAdd" @click.self="showAdd = false">
       <div class="modal">
         <div class="modal-title">{{ editingIdx >= 0 ? '编辑持仓' : '新增持仓' }}</div>
+        <!-- 代码输入行：编辑模式禁用，输入时自动查询股票名称与现价 -->
         <div class="form-row">
           <label>代码</label>
           <input v-model="formCode" placeholder="输入代码" @input="onCodeInput" :disabled="editingIdx >= 0" />
           <span class="lookup-result" v-if="lookupName">{{ lookupName }} ¥{{ lookupPrice?.toFixed(2) }}</span>
         </div>
+        <!-- 成本价 / 持股数输入行 -->
         <div class="form-row">
           <label>成本价</label>
           <input v-model.number="formCost" type="number" step="0.001" placeholder="成本价" />
@@ -37,6 +42,7 @@
           <label>持股数</label>
           <input v-model.number="formQty" type="number" step="1" placeholder="持股数量" />
         </div>
+        <!-- 止盈 / 止损百分比输入行（留空则使用默认 +8% / -5%） -->
         <div class="form-row">
           <label>止盈%</label>
           <input v-model.number="formTp" type="number" step="0.1" placeholder="默认+8%" />
@@ -68,6 +74,7 @@
         <span class="col-score" title="动量≥50关注">量</span>
         <span class="col-sl">止盈/止损</span>
       </div>
+      <!-- 持仓行：代码/名称/数量/成本/现价/当日涨跌/持仓盈亏/信号/评分/止盈止损 + 编辑删除 -->
       <div v-for="h in holdings" :key="h.code" :class="rowClass(h)">
         <span class="col-code">{{ h.code }}</span>
         <span class="col-name">{{ h.name }}</span>

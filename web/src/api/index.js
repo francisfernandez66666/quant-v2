@@ -479,3 +479,17 @@ export async function fetchShortStatus() {
 export async function toggleShort(enabled) {
   return request('/api/short/toggle', { method: 'POST', data: { enabled } })
 }
+
+// ── 资讯显示全部开关 ──
+
+/** 查询"资讯显示全部"开关状态 */
+// 对应 GET /api/news/showall，返回 { news_show_all } 布尔值
+export async function fetchNewsShowAllStatus() {
+  return request('/api/news/showall')
+}
+
+/** 切换"资讯显示全部"开关 */
+// 对应 POST /api/news/showall，请求体 { enabled }；开启时弱档/中性资讯也出现在 /api/news
+export async function toggleNewsShowAll(enabled) {
+  return request('/api/news/showall', { method: 'POST', data: { enabled } })
+}

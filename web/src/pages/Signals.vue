@@ -26,6 +26,7 @@
         <span class="col-level">等级</span>
         <span class="col-detail">D1/D2/D3/D4</span>
       </div>
+      <!-- 信号行：代码/名称/策略/总分/等级徽标/D1-D4 维度评分（含简短描述）+ 操作（买入或忽略） -->
       <div v-for="s in filteredSignals" :key="s.code" class="table-row">
         <span class="col-code">{{ s.code }}</span>
         <span class="col-name">{{ s.name || '-' }}</span>
@@ -50,7 +51,7 @@
             {{ (s.d4 || 0).toFixed(0) }}<em v-if="s.d4_desc">{{ shortDesc(s.d4_desc) }}</em>
           </span>
         </span>
-        <!-- 操作列：可开仓显示"买入"，已买入显示"忽略" -->
+        <!-- 操作列：可开仓时显示"买入"按钮；已确认买入的显示"忽略"按钮；其余显示占位符 -->
         <span class="col-action">
           <button v-if="s.can_open" class="btn-buy" @click="confirmTrade(s, 'buy')">买入</button>
           <button v-else-if="s.action === 'buy'" class="btn-ignore" @click="confirmTrade(s, 'ignore')">忽略</button>

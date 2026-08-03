@@ -110,6 +110,7 @@ func priorityOf(t int, d1 float64, isLeader bool, emotion string) PriorityResult
 	default:
 		base = 0
 	}
+	// 基础分下限保护：时间衰减后不出现负分
 	if base < 0 {
 		base = 0
 	}

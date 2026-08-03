@@ -12,10 +12,10 @@ import (
 
 // HotSector 热点板块评分结果。
 type HotSector struct {
-	Sector SectorInfo // 板块基础信息
-	Score  float64    // 综合评分
-	Reason string     // 上榜原因描述
-	D1     float64    // D1 事件评分
+	Sector SectorInfo // 板块基础信息（代码/名称/涨跌幅等）
+	Score  float64    // 综合评分（D1 事件分 + F 系列量价分）
+	Reason string     // 上榜原因描述（如"涨停潮 主力流入"）
+	D1     float64    // D1 事件评分（预留字段）
 }
 
 // ScoredStock 板块内个股评分结果。
@@ -177,6 +177,7 @@ func (ss *SectorScanner) scoreSectors(sectors []SectorInfo, limitupBull, limitup
 		fScore := fSeriesScore(s, maxLimitup, maxAmt, maxInflow)
 		total := fScore
 
+		// 按涨停家数与涨跌幅生成上榜原因（涨停潮/异动/领涨/领跌），再追加主力资金方向
 		reason := ""
 		if s.LimitupCnt >= limitupBull {
 			reason = "涨停潮"

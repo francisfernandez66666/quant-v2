@@ -72,8 +72,8 @@ type Evaluation struct {
 
 // ExitContext 止盈止损评估的上下文参数。
 type ExitContext struct {
-	Code      string
-	Name      string
+	Code      string             // 股票代码
+	Name      string             // 股票名称
 	CostPrice float64            // 持仓成本
 	CurPrice  float64            // 当前价格
 	EntryAt   string             // 入场时间

@@ -138,6 +138,7 @@ type MomentumConfig struct {
 	VolumePriceWeight float64 `json:"volume_price_weight"` // 量价分权重（0~100）
 	MACDWeight        float64 `json:"macd_weight"`         // MACD分权重（0~100）
 	TrendWeight       float64 `json:"trend_weight"`        // 走势分权重（0~100）
+	SignalThreshold   float64 `json:"signal_threshold"`    // 动量分触发信号阈值（默认 60）
 }
 
 // DragonConfig 龙头战法参数：多因子权重、回撤止盈止损阈值、买入条件等。
@@ -413,6 +414,7 @@ func defaultStrategyConfig() StrategyConfig {
 			VolumePriceWeight: 40,
 			MACDWeight:        30,
 			TrendWeight:       30,
+			SignalThreshold:   60,
 		},
 	}
 }

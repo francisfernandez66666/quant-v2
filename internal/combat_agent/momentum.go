@@ -17,7 +17,7 @@ import (
 func MomentumScore(md *strategy_engine.StockMarketData, w config.MomentumConfig) float64 {
 	// 权重全 0（未配置）→ 回退默认 40/30/30
 	if w.VolumePriceWeight == 0 && w.MACDWeight == 0 && w.TrendWeight == 0 {
-		w = config.MomentumConfig{VolumePriceWeight: 40, MACDWeight: 30, TrendWeight: 30}
+		w = config.MomentumConfig{VolumePriceWeight: 40, MACDWeight: 30, TrendWeight: 30, SignalThreshold: 60}
 	}
 	if md == nil {
 		return 0

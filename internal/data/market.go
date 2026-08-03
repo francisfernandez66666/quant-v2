@@ -211,6 +211,7 @@ func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
 		}
 		code := mch[1]
 		fields := strings.Split(mch[2], ",")
+		// 新浪行情 CSV 字段索引：0名称 1今开 2昨收 3现价 4最高 5最低 6买价 7卖价 8成交量 9成交额
 		if len(fields) < 10 {
 			continue
 		}
@@ -693,11 +694,11 @@ func (m *MarketAPI) GetSinaNews(pageSize int) ([]NewsItem, error) {
 
 // sinaNewsItemRaw 新浪新闻原始响应条目。
 type sinaNewsItemRaw struct {
-	Title    string `json:"title"`
-	Content  string `json:"content"`
-	ShowTime string `json:"show_time"`
-	Ctime    string `json:"ctime"`
-	Url      string `json:"url"`
+	Title    string `json:"title"`     // 标题
+	Content  string `json:"content"`   // 内容/摘要
+	ShowTime string `json:"show_time"` // 展示时间字符串
+	Ctime    string `json:"ctime"`     // 发布时间字符串
+	Url      string `json:"url"`       // 原文链接
 }
 
 // parseSinaNews 解析新浪新闻 JSON 响应。

@@ -26,6 +26,7 @@ const DefaultModel = "THUDM/GLM-Z1-9B-0414"
 
 // New 创建 LLM 客户端。
 func New(cfg Config) *Client {
+	// 未指定地址/模型时填充默认值，保证客户端可直接使用
 	if cfg.APIURL == "" {
 		cfg.APIURL = "https://api.siliconflow.cn/v1/chat/completions"
 	}
@@ -33,6 +34,7 @@ func New(cfg Config) *Client {
 		cfg.Model = DefaultModel
 	}
 
+	// 30s 超时；禁用 HTTP2（ForceAttemptHTTP2=false），强制走 HTTP1.1 规避连接复用问题
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -94,16 +96,19 @@ func (c *Client) Chat(system, user string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	// 读取响应体并解析为对话响应结构
 	body, _ := io.ReadAll(resp.Body)
 	var chatResp ChatResponse
 	if err := json.Unmarshal(body, &chatResp); err != nil {
 		return "", err
 	}
 
+	// 无任何候选回答则视为空响应错误
 	if len(chatResp.Choices) == 0 {
 		return "", fmt.Errorf("no response from LLM")
 	}
 
+	// 取第一个候选的回复内容
 	return chatResp.Choices[0].Message.Content, nil
 }
 
@@ -237,7 +242,7 @@ const llmBatchSize = 30
 
 // AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批调用并合并结果。
 // 任一 批 LLM 轮询重试（最多3次、递增间隔）仍失败时返回错误，不降级关键词兜底，
-// 由调用方决定如何处置（归一般仅展示），避免错误情绪打分进入事件流。
+// 由调用方决定如何处置（丢弃该批），避免错误情绪打分进入事件流。
 func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 	result := make([]*HotTopic, len(titles))
 	if len(titles) == 0 {
@@ -258,7 +263,8 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 }
 
 // analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。
-// 失败时按递增间隔轮询重试（最多3次：2s/4s/6s），仍失败返回错误——不降级关键词兜底。
+// 失败时按递增间隔轮询重试（最多3次：2s/4s/6s），仍失败返回错误，
+// 由调用方丢弃该批（不降级关键词，避免错误情绪打分进入事件流）。
 func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	// 构建批量请求文本
 	var sb strings.Builder
@@ -267,43 +273,44 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	}
 	prompt := sb.String()
 
-	// 轮询重试（最多3次、间隔递增）
+	// 轮询重试（最多3次、间隔递增 2s/4s/6s）
+	const maxAttempts = 3
 	var resp string
 	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		resp, err = c.Chat(batchSystemPrompt, prompt)
 		if err == nil {
 			break
 		}
-		if attempt < 3 {
+		if attempt < maxAttempts {
 			log.Printf("LLM[%d/%d] API失败(第%d次), 轮询重试: %v", len(titles), attempt, attempt, err)
 			time.Sleep(time.Duration(attempt) * 2 * time.Second)
 		}
 	}
 	if err != nil {
-		log.Printf("LLM[%d] API轮询重试3次仍失败, 该批归一般(不降级): %v", len(titles), err)
+		log.Printf("LLM[%d] API轮询重试%d次仍失败, 该批%d条丢弃: %v", len(titles), maxAttempts, len(titles), err)
 		return nil, err
 	}
 	resp = cleanJSON(resp)
 
 	var raw []struct {
-		Index             int      `json:"index"`
-		Level             string   `json:"level"`
-		Sentiment         string   `json:"sentiment"`
-		Score             float64  `json:"score"`
-		ImpactLevel       string   `json:"impact_level"`
-		EventType         string   `json:"event_type"`
-		Urgency           string   `json:"urgency"`
-		Direction         string   `json:"direction"`
-		Sectors           []string `json:"sectors"`
-		UpstreamSectors   []string `json:"upstream_sectors"`
-		DownstreamSectors []string `json:"downstream_sectors"`
-		RelatedStocks     []string `json:"related_stocks"`
-		Strategy          string   `json:"strategy"`
-		Reason            string   `json:"reason"`
+		Index             int      `json:"index"`               // LLM 返回的批内序号（1 起）
+		Level             string   `json:"level"`              // 事件级别：板块/个股
+		Sentiment         string   `json:"sentiment"`          // 情感：正面/负面/中性
+		Score             float64  `json:"score"`              // 带符号强度分
+		ImpactLevel       string   `json:"impact_level"`       // 影响级别：高/中/低
+		EventType         string   `json:"event_type"`         // 事件类型
+		Urgency           string   `json:"urgency"`            // 紧急程度
+		Direction         string   `json:"direction"`          // 方向：利好/利空/中性
+		Sectors           []string `json:"sectors"`            // 直接影响板块
+		UpstreamSectors   []string `json:"upstream_sectors"`   // 上游产业链板块
+		DownstreamSectors []string `json:"downstream_sectors"` // 下游产业链板块
+		RelatedStocks     []string `json:"related_stocks"`     // 关联个股
+		Strategy          string   `json:"strategy"`           // 匹配战法
+		Reason            string   `json:"reason"`             // 分析理由
 	}
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		log.Printf("LLM[%d] JSON解析失败, 该批归一般(不降级): raw[:%d]=%q: %v", len(titles), minInt(len(resp), 300), resp[:minInt(len(resp), 300)], err)
+		log.Printf("LLM[%d] JSON解析失败, 该批%d条丢弃: raw[:%d]=%q: %v", len(titles), len(titles), minInt(len(resp), 300), resp[:minInt(len(resp), 300)], err)
 		return nil, err
 	}
 
@@ -321,6 +328,7 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 
 	result := make([]*HotTopic, len(titles))
 	for i, title := range titles {
+		// 先以关键词兜底结果初始化，再按 LLM 返回序号覆盖对应字段（未命中则保留兜底）
 		ht := fallbackAnalysis(title)
 		for _, r := range raw {
 			if r.Index == i+1 {
@@ -366,7 +374,6 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	log.Printf("LLM批量分析完成: %d/%d条", len(raw), len(titles))
 	return result, nil
 }
-
 // AnalyzeHotTopic 对新闻标题进行多维度热点分析。
 // 返回:
 //   - *HotTopic: 分析结果（API失败时返回关键词兜底结果，不返回 nil）
@@ -387,6 +394,7 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 		return fallbackAnalysis(title), err
 	}
 
+	// 空字段补默认值，保证下游字段齐整
 	if ht.Level == "" {
 		ht.Level = "板块"
 	}
@@ -490,7 +498,7 @@ func fallbackAnalysis(title string) *HotTopic {
 		Title:       title,
 		Level:       "板块",
 		Sentiment:   "中性",
-		Score:       0.5,
+		Score:       0,
 		ImpactLevel: "中",
 		EventType:   "行业",
 		Urgency:     "关注",
@@ -546,6 +554,7 @@ func fallbackAnalysis(title string) *HotTopic {
 	medBull := []string{"反弹", "利好", "回暖", "回升", "增持", "预增", "扭亏", "上调"}
 	strongBear := []string{"跌停", "大跌", "暴跌", "重挫", "下挫", "跳水", "崩盘", "闪崩", "抛售", "暴雷", "腰斩", "跌超", "立案", "调查", "处罚", "退市"}
 	medBear := []string{"走弱", "利空", "减持", "放缓", "下滑", "走低", "回落", "不及预期", "承压", "疲软", "萎缩", "高企", "预警", "连跌", "转弱", "低于预期"}
+	// 按优先级判定：强利空 → 中利空 → 强利好 → 中利好，均未命中保持中性 0 分
 	switch {
 	case containsAny(title, strongBear):
 		ht.Sentiment = "负面"
@@ -631,17 +640,20 @@ func ParseSectors(sectors []string) []SectorTag {
 	var result []SectorTag
 	re := regexp.MustCompile(`^(.+?)\(([\d.]+)\)$`)
 	for _, s := range sectors {
+		// 兼容 "/" 分隔的复合格式，逐段解析
 		for _, part := range strings.Split(s, "/") {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
 			}
 			st := SectorTag{Name: part, Confidence: 1.0}
+			// 形如 "固态电池(0.8)" 时提取名称与置信度，解析失败回退默认 1.0
 			if m := re.FindStringSubmatch(part); len(m) == 3 {
 				st.Name = strings.TrimSpace(m[1])
 				if f, err := fmt.Sscanf(m[2], "%f", &st.Confidence); err != nil || f != 1 {
 					st.Confidence = 1.0
 				}
+				// 置信度钳制到 [0,1]
 				if st.Confidence > 1 {
 					st.Confidence = 1
 				}

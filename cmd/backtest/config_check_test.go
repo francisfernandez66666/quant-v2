@@ -1,3 +1,4 @@
+// Package main backtest 工具：本测试文件验证回测参数配置文件能被 config.Manager 全量解析。
 package main
 
 import (

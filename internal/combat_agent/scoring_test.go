@@ -9,6 +9,7 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/strategies/n_shape"
+	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -112,4 +113,68 @@ func TestEvalForNShape(t *testing.T) {
 		t.Fatalf("evalFor nshape 返回 nil")
 	}
 	_ = eval.TotalScore
+}
+
+// failStrategy 恒不通过的战法桩（用于隔离测试动量信号的补发逻辑）。
+type failStrategy struct{}
+
+// Name 返回战法名称（恒为"失败战法"）。
+func (failStrategy) Name() string               { return "失败战法" }
+// Type 返回战法类型（恒为 N 形，便于走通用评分路径）。
+func (failStrategy) Type() strategy.SignalType  { return strategy.SignalNShape }
+// Evaluate 恒返回未通过（Pass=false）且总分为 0 的评估，用于隔离测试动量信号的补发逻辑。
+func (failStrategy) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
+	return &strategy.Evaluation{Pass: false, TotalScore: 0}, nil
+}
+// GenerateSignal 恒不产出信号，确保测试只关注动量补发信号。
+func (failStrategy) GenerateSignal(string, *strategy.Evaluation) (*strategy.Signal, error) {
+	return nil, nil
+}
+
+// TestScorePoolMomentumSignal 验证 Q2：四战法均不通过但动量分达阈值时，ScorePool 补发动量 watch 信号。
+func TestScorePoolMomentumSignal(t *testing.T) {
+	mc := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
+	mc.Momentum.SignalThreshold = 60
+	a := New(mc)
+	a.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: failStrategy{}}})
+
+	md := mkBullMarketData()
+	// 强多头动量分应>=70，超过阈值 60
+	if MomentumScore(md, mc.Momentum) < 60 {
+		t.Fatalf("测试数据动量分不足60, 无法触发信号")
+	}
+	scores, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": md}, "")
+
+	sc, ok := scores["600000"]
+	if !ok {
+		t.Fatalf("缺少打分结果")
+	}
+	if !sc.MomentumValid {
+		t.Fatalf("强多头数据应判为动量数据完整")
+	}
+	if len(sigs) != 1 || sigs[0].Strategy != "动量" || sigs[0].Action != "watch" {
+		t.Fatalf("应补发动量watch信号, got %+v", sigs)
+	}
+}
+
+// TestScorePoolMomentumBelowThreshold 验证低于阈值的动量不产生信号。
+func TestScorePoolMomentumBelowThreshold(t *testing.T) {
+	m := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
+	m.Momentum.SignalThreshold = 60
+	a := New(m)
+	a.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: failStrategy{}}})
+
+	// 非强势行情：平走 + 缩量 → 动量分必然 < 60
+	muted := &strategy_engine.StockMarketData{
+		Code:  "600000",
+		Name:  "测试",
+		Price: 10,
+		Quote: &data.StockInfo{Price: 10, Volume: 100},
+	}
+	_, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": muted}, "")
+	for _, s := range sigs {
+		if s.Strategy == "动量" {
+			t.Fatalf("低动量不应发信号: %+v", s)
+		}
+	}
 }

@@ -20,6 +20,6 @@ type HotSectorRecord struct {
 
 // HotRecord 一轮热点板块记录（与 Stage 记录同一固化节奏：跨交易日清除）。
 type HotRecord struct {
-	ProcessTime time.Time         `json:"process_time"`
-	Sectors     []HotSectorRecord `json:"sectors"`
+	ProcessTime time.Time         `json:"process_time"` // 记录生成时间
+	Sectors     []HotSectorRecord `json:"sectors"`      // 本轮热点板块快照列表
 }
