@@ -1,0 +1,156 @@
+{
+  "rules": {
+    "emotion_cycle": {
+      "emo_ice_board_max": 15,
+      "emo_ice_limitup_max": 3,
+      "emo_ice_blast_min": 0.35,
+      "emo_position_ice": 0.1,
+      "emo_start_board_max": 40,
+      "emo_start_limitup_min": 3,
+      "emo_start_limitup_max": 5,
+      "emo_start_blast_min": 0.1,
+      "emo_start_blast_max": 0.35,
+      "emo_position_start": 0.2,
+      "emo_ferment_board_max": 70,
+      "emo_ferment_limitup_min": 5,
+      "emo_ferment_limitup_max": 7,
+      "emo_ferment_blast_max": 0.2,
+      "emo_position_ferment": 0.4,
+      "emo_climax_board_min": 60,
+      "emo_climax_limitup_min": 6,
+      "emo_climax_blast_max": 0.15,
+      "emo_position_climax": 0.6,
+      "emo_diverge_board_drop": 20,
+      "emo_diverge_limitup_drop": 2,
+      "emo_diverge_blast_rise": 0.1,
+      "emo_position_diverge": 0.3,
+      "emo_retreat_board_max": 30,
+      "emo_retreat_limitup_max": 4,
+      "emo_retreat_blast_min": 0.25,
+      "emo_position_retreat": 0.1
+    },
+    "strategy": {
+      "dragon": {
+        "f1_seal_weight": 0.3,
+        "f2_resonance_weight": 0.25,
+        "f3_premium_weight": 0.2,
+        "f4_rs_weight": 0.25,
+        "f3_one_board_discount": 0.5,
+        "pullback_max_pct": 0.05,
+        "breaker_sell_half_pct": 0.08,
+        "breaker_sell_all_pct": 0.12,
+        "buy_pullback_sell_half_pct": 0.05,
+        "buy_pullback_sell_all_pct": 0.08,
+        "buy_day_close_below": 0.03,
+        "next_open_if_below": 0.05
+      },
+      "double_bump": {
+        "first_break_volume_multiple": 1.5,
+        "second_break_volume_multiple": 1.5,
+        "big_candle_threshold": 5,
+        "adjust_vol_ratio_max": 3,
+        "pullback_to_entity_pct": 50,
+        "adjust_days_min": 1,
+        "adjust_days_max": 5,
+        "adjust_days_overflow": 6,
+        "position_weight": 0.3,
+        "ma_weight": 0.3,
+        "sector_weight": 0.2,
+        "volume_weight": 0.4
+      },
+      "n_shape": {
+        "n_pattern_score_threshold": 60,
+        "n_shape_D1_threshold": 0.5,
+        "n_shape_D2_min_full": 15,
+        "n_shape_D3_over": 0.5,
+        "oversold_pb_ratio": 0.5,
+        "n_shape_entry_left_pct": 0.5,
+        "n_shape_entry_right_pct": 0.5,
+        "n_shape_total_max_pct": 1.0,
+        "n_shape_breakout_ratio": 1.05,
+        "n_shape_vol_ratio": 1.8,
+        "n_shape_flag_retreat_pct": 0.15,
+        "n_flag_vol_ratio_max": 0.8,
+        "n_second_break_vol_ratio": 1.5,
+        "n_second_break_macd_red_bars": 2,
+        "n_flag_duration_min": 2,
+        "n_flag_duration_max": 5,
+        "n_second_break_time_limit": "10:00",
+        "hard_stop_loss": 0.08,
+        "sector_gain_pct_min": 1.0
+      },
+      "dragon_return": {
+        "min_pullback_pct": 0.15,
+        "max_pullback_pct": 0.3,
+        "volume_shrink_ratio": 0.5,
+        "rebound_volume_ratio": 1.2,
+        "stop_loss_pct": 0.05,
+        "take_profit_pct": 0.25,
+        "max_hold_days": 8,
+        "target1_multiplier": 1.0,
+        "target2_multiplier": 1.25,
+        "trailing_drawback": 0.08
+      },
+      "momentum": {
+        "volume_price_weight": 40,
+        "macd_weight": 30,
+        "trend_weight": 30
+      }
+    },
+    "laodeng": {
+      "enabled": false,
+      "market_cap_min": 50,
+      "pe_max": 100,
+      "turnover_min": 2,
+      "tech_penalty": 0.1,
+      "weight_score": 0.1
+    },
+    "main_sector": {
+      "main_sector_limitup_bull": 3,
+      "main_sector_volrank_bull": 10,
+      "main_sector_gain2d_bull": 3.0,
+      "main_sector_limitup_shock": 2,
+      "main_sector_volrank_shock": 20,
+      "main_sector_gain2d_shock": 2.0,
+      "main_sector_max_count": 5
+    },
+    "llm": {
+      "api_url": "",
+      "model": ""
+    },
+    "trade_time": {
+      "full_open": 915,
+      "afternoon_start": 1300,
+      "trade_close": 1500
+    },
+    "theme": {
+      "watch_list": [],
+      "black_list": []
+    },
+    "risk_ctrl": {
+      "stop_loss": {
+        "drawdown_after_buy": [
+          { "pct": 0.05, "action": "减仓" },
+          { "pct": 0.08, "action": "清仓" }
+        ]
+      },
+      "compliance": {
+        "compliance_mode": false
+      },
+      "m8_enabled": false,
+      "m8_portfolio_drawdown_pct": 0.1,
+      "per_stock_max": 0.2
+    },
+    "position": {
+      "max_total_position_pct": 0.8
+    }
+  },
+  "d1": {
+    "rules": [
+      { "pattern": ".*破产.*", "direction": "利空", "score": 0.7, "blocked": true },
+      { "pattern": ".*立案.*", "direction": "利空", "score": 0.6, "blocked": true },
+      { "pattern": ".*退市.*", "direction": "利空", "score": 0.8, "blocked": true },
+      { "pattern": ".*重组预案.*", "direction": "利好", "score": 0.6 }
+    ]
+  }
+}
