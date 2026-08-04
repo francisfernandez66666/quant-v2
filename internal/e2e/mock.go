@@ -43,12 +43,19 @@ func (t *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return t.emLimitUpPool(req)
 	case host == "datacenter-web.eastmoney.com" && strings.Contains(req.URL.Query().Get("reportName"), "IPOAPPLY"):
 		return t.emIPO(req)
+	case host == "datacenter-web.eastmoney.com" && strings.Contains(req.URL.Query().Get("reportName"), "BILLBOARD"):
+		return t.emLHB(req)
 	case host == "news.10jqka.com.cn" && path == "/tapp/news/push/stock":
 		return t.thsNews(req)
+	case host == "finance.sina.com.cn":
+		// 新浪财经文章页正文（GetArticle 用 id="artibody" 提取）
+		return t.text(`<html><body><div id="artibody"><p>新浪正文：沪指半日涨0.62%，AI算力概念持续走强，光模块方向领涨。</p><p>（mock 文章正文，供正文回填覆盖测试。）</p></div></body></html>`)
 	case host == "www.cls.cn" && path == "/v1/roll/get_roll_list":
 		return t.clsNews(req)
 	case host == "feed.mix.sina.com.cn":
 		return t.sinaNews(req)
+	case host == "vip.stock.finance.sina.com.cn" && strings.Contains(path, "getHQNodeData"):
+		return t.sinaStockList(req)
 	case host == "q.10jqka.com.cn" && path == "/gn/":
 		return t.text(t.fix.THSConcepts)
 	case host == "q.10jqka.com.cn" && path == "/thshy/":
@@ -57,6 +64,8 @@ func (t *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return t.json(map[string]interface{}{"data": map[string]interface{}{"list": []interface{}{}}})
 	case host == "q.10jqka.com.cn" && strings.Contains(path, "realhead"):
 		return t.json(map[string]interface{}{})
+	case host == "d.10jqka.com.cn" && strings.Contains(path, "realhead"):
+		return t.thsQuote(req)
 	default:
 		return t.json(map[string]interface{}{})
 	}
@@ -77,8 +86,16 @@ func (t *fixtureTransport) text(s string) (*http.Response, error) {
 }
 
 // sinaQuotes 新浪批量实时行情：var hq_str_sh600519="CSV,...";
+// 真实 URL 形态为 https://hq.sinajs.cn/list=sz300750,sh600519（代码位于 path 而非 query）。
 func (t *fixtureTransport) sinaQuotes(req *http.Request) (*http.Response, error) {
-	symbols := strings.Split(req.URL.Query().Get("list"), ",")
+	raw := req.URL.Path
+	if !strings.Contains(raw, "=") {
+		raw = req.URL.Query().Get("list")
+	}
+	if idx := strings.Index(raw, "="); idx >= 0 {
+		raw = raw[idx+1:]
+	}
+	symbols := strings.Split(raw, ",")
 	var buf strings.Builder
 	for _, sym := range symbols {
 		sym = strings.TrimSpace(sym)
@@ -273,6 +290,68 @@ func (t *fixtureTransport) emIPO(req *http.Request) (*http.Response, error) {
 	})
 }
 
+// emLHB 东财龙虎榜：按 fixture.LHB 数据返回（真实记录重放）。
+func (t *fixtureTransport) emLHB(req *http.Request) (*http.Response, error) {
+	data := make([]map[string]interface{}, 0, len(t.fix.LHB))
+	for _, s := range t.fix.LHB {
+		data = append(data, map[string]interface{}{
+			"SECURITY_CODE": s.Code, "SECURITY_NAME_ABBR": s.Name,
+			"CLOSE_PRICE": s.Price, "CHANGE_RATE": s.ChangePct,
+			"EXPLANATION": s.Reason, "EXPLAIN": s.SeatInfo,
+			"BILLBOARD_NET_AMT": s.NetAmt, "BILLBOARD_BUY_AMT": s.BuyAmt,
+			"BILLBOARD_SELL_AMT": s.SellAmt,
+			"BUY_SEAT":           s.BuySeat, "SELL_SEAT": s.SellSeat,
+			"TURNOVERRATE": s.Turnover,
+		})
+	}
+	return t.json(map[string]interface{}{
+		"success": true,
+		"result":  map[string]interface{}{"data": data},
+	})
+}
+
+// thsQuote 同花顺实时行情 JSONP：与 parseTHSQuote 预期一致
+// （items 内每只股票为数组，索引约定 [.., code, name, open, high, low, price, volume, amount, ..]，长度须≥10）。
+// 真实 URL 形态为 /v2/realhead/hs_{secid}/last.js，secid 位于 path 倒数第二段。
+func (t *fixtureTransport) thsQuote(req *http.Request) (*http.Response, error) {
+	segs := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
+	secID := ""
+	for i := len(segs) - 1; i >= 0; i-- {
+		if strings.HasPrefix(segs[i], "hs_") {
+			secID = strings.TrimPrefix(segs[i], "hs_")
+			break
+		}
+	}
+	if secID == "" {
+		return t.json(map[string]interface{}{"data": map[string]interface{}{"items": map[string]interface{}{}}})
+	}
+	code := secID
+	code = strings.ReplaceAll(code, "1.", "")
+	code = strings.ReplaceAll(code, "0.", "")
+
+	items := make(map[string]interface{})
+	if csv, ok := t.fix.Quotes[code]; ok {
+		p := strings.Split(csv, ",")
+		parse := func(i int) float64 {
+			f, _ := strconv.ParseFloat(p[i], 64)
+			return f
+		}
+		arr := make([]interface{}, 12)
+		arr[1] = "hs_" + secID // 代码（含前缀，parseTHSQuote 内部剥离）
+		arr[2] = p[0]          // 名称
+		arr[3] = parse(1)      // 今开
+		arr[4] = parse(4)      // 最高
+		arr[5] = parse(5)      // 最低
+		arr[6] = parse(3)      // 现价
+		arr[7] = parse(8)      // 成交量
+		arr[8] = parse(9)      // 成交额
+		items[secID] = arr
+	}
+	return t.json(map[string]interface{}{
+		"data": map[string]interface{}{"items": items},
+	})
+}
+
 // thsNews 同花顺快讯：page 1 返回全部 ths 场景新闻，后续页为空。
 func (t *fixtureTransport) thsNews(req *http.Request) (*http.Response, error) {
 	page, _ := strconv.Atoi(req.URL.Query().Get("page"))
@@ -317,6 +396,35 @@ func (t *fixtureTransport) sinaNews(req *http.Request) (*http.Response, error) {
 	return t.json(map[string]interface{}{
 		"result": map[string]interface{}{"data": data},
 	})
+}
+
+// sinaMockPageSize 新浪全市场列表 mock 每页条数（与 data 包 sinaMockPageSize 一致）。
+const sinaMockPageSize = 100
+
+// sinaStockList 新浪全市场 A 股列表（getHQNodeData 分页，100/页）。
+// 将 fixture.StockList（name→code）折叠为新浪格式并按下标分组，page 参数驱动翻页。
+func (t *fixtureTransport) sinaStockList(req *http.Request) (*http.Response, error) {
+	page, _ := strconv.Atoi(req.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	all := make([]map[string]string, 0, len(t.fix.StockList))
+	for name, code := range t.fix.StockList {
+		sec := "sh"
+		if strings.HasPrefix(code, "0") || strings.HasPrefix(code, "3") {
+			sec = "sz"
+		}
+		all = append(all, map[string]string{"symbol": sec + code, "code": code, "name": name})
+	}
+	start := (page - 1) * sinaMockPageSize
+	if start >= len(all) {
+		return t.json([]map[string]string{})
+	}
+	end := start + sinaMockPageSize
+	if end > len(all) {
+		end = len(all)
+	}
+	return t.json(all[start:end])
 }
 
 // sealToInt 将 "HH:MM" 转为东财 HHMMSS 整数（090000 → 90000）。

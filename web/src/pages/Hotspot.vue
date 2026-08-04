@@ -8,11 +8,7 @@
     <div class="card">
       <div class="card-header">
         <span>🔥 热点板块</span>
-        <select class="hot-round-select" v-model="hotRoundIdx" :disabled="hotRecords.length < 2" @change="applyHotRound">
-          <option v-for="(r, i) in hotRecords" :key="r.process_time" :value="i">
-            {{ formatHotTime(r.process_time) }}（{{ r.sectors.length }} 板块）
-          </option>
-        </select>
+        <button class="btn-log" @click="showLog = true">📋 日志</button>
       </div>
       <!-- 板块卡片：名称/异动原因摘要/评分/涨幅/涨停数/净流入，点击弹出异动详情 -->
       <div class="sector-grid" v-if="sectors.length">
@@ -54,6 +50,7 @@
       </div>
       <button class="modal-close" @click="reasonTarget = null">知道了</button>
     </div>
+    <LogModal :visible="showLog" @close="showLog = false" />
 
     <!-- 个股全维度评分排名（含排序功能） -->
     <div class="card" style="margin-top: 14px;">
@@ -160,6 +157,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子
 import * as api from '../api/index.js'                       // 后端 API 封装：状态/评分/板块轮次/资讯/IPO 等数据接口
+import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）
 
 // ── 工具函数 ──
 
@@ -219,31 +217,15 @@ function val(e, key) {
 }
 
 // ── 响应式数据 ──
-const sectors = ref([])           // 热点板块（当前选中轮次）
-const hotRecords = ref([])        // 当日热点板块轮次记录（持久化）
-const hotRoundIdx = ref(0)        // 选中轮次索引（默认最新）
+const sectors = ref([])           // 热点板块（当前最新轮次）
 const evals = ref([])             // 全市场个股评分
 const news = ref([])              // 资讯 + 日历事件
 const ipoCalendar = ref([])       // IPO 日历
 const reasonTarget = ref(null)    // 当前查看异动原因的板块
+const showLog = ref(false)        // 是否打开日志弹窗
 
 /** 展示板块异动原因弹窗（点击板块卡片触发） */
 function showReason(s) { reasonTarget.value = s }
-
-/** 切换轮次记录：展示该轮次板块快照 */
-function applyHotRound() {
-  const r = hotRecords.value[hotRoundIdx.value]
-  // 将选中轮次的板块快照设为当前展示
-  sectors.value = r ? r.sectors || [] : []
-}
-
-/** 格式化轮次时间为 MM-DD HH:mm:ss */
-function formatHotTime(t) {
-  if (!t) return '-'
-  const d = new Date(t)
-  const p = n => String(n).padStart(2, '0')
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
 
 let timer = null                  // 定时轮询句柄
 let unsubSSE = null               // SSE 取消订阅函数
@@ -320,12 +302,11 @@ async function load() {
   } catch (_) {}
   let fromRecords = false
   try {
-    // 优先加载轮次记录，用于切换历史快照
+    // 加载当日热点板块轮次记录，用于日志弹窗/当前展示
     const recs = await api.fetchSectorHotRecords()
     if (Array.isArray(recs) && recs.length) {
-      hotRecords.value = recs
-      hotRoundIdx.value = 0
-      applyHotRound()
+      // 默认展示最新一轮板块快照
+      sectors.value = recs[0].sectors || []
       fromRecords = true
     }
   } catch (_) {}
@@ -370,10 +351,11 @@ onUnmounted(() => {
 .card { background: #1a1a2e; border-radius: 8px; padding: 14px; }
 .card-header { font-size: 14px; font-weight: 600; color: #ccc; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
 .card-sub { font-size: 11px; color: #666; font-weight: 400; }
-.hot-round-select {
-  padding: 4px 8px; border-radius: 5px; border: 1px solid #333;
-  background: #1a1a2e; color: #ccc; font-size: 11px; cursor: pointer; max-width: 200px;
+.btn-log {
+  padding: 4px 10px; border-radius: 5px; border: 1px solid #b388ff;
+  background: transparent; color: #b388ff; font-size: 11px; cursor: pointer;
 }
+.btn-log:hover { background: rgba(179,136,255,0.1); }
 
 .sector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
 .sector-card { background: #0f0f23; border-radius: 6px; padding: 12px; cursor: pointer; }

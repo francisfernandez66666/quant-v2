@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
@@ -28,6 +29,7 @@ type EngineController interface {
 	SetShortEnabled(v bool)
 	GetDebugInfo() *newsagent.DebugInfo
 	GetStageRecords() []newsagent.DebugInfo
+	GetSignalLogs() []combat_agent.SignalLog
 	GetHotRecords() []data.HotRecord
 	GetAllNewsEvents() []newsagent.NewsEvent
 	SetNewsShowAll(v bool)
@@ -61,6 +63,10 @@ type Server struct {
 	macroCacheDay string // 宏观日历缓存对应的日期（用于按天失效）
 	ipoCache      []data.IPOEvent
 	ipoCacheDay   string // IPO 日历缓存对应的日期（用于按天失效）
+
+	thsMu       sync.Mutex        // 保护同花顺板块兜底缓存的互斥锁
+	thsBoards   []data.SectorInfo // 同花顺 top 板块兜底缓存（LLM 无归因时使用）
+	thsBoardsAt time.Time         // 兜底缓存最近刷新时间（每分钟轮动一次）
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
@@ -206,6 +212,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
 	s.mux.HandleFunc("GET /api/stage-records", s.authMiddleware(s.handleStageRecords))
+	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
 
@@ -759,6 +766,23 @@ func (s *Server) handleStageRecords(w http.ResponseWriter, r *http.Request) {
 		recs = []newsagent.DebugInfo{}
 	}
 	// 就地倒序，最新轮次的记录排在最前
+	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
+		recs[i], recs[j] = recs[j], recs[i]
+	}
+	writeJSON(w, 200, recs)
+}
+
+// handleSignalLogs 返回当日全量信号批次记录（用于"信号日志"弹窗按批次复盘）。
+func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeJSON(w, 200, map[string]string{"status": "no_engine"})
+		return
+	}
+	recs := s.ctrl.GetSignalLogs()
+	if recs == nil {
+		recs = []combat_agent.SignalLog{}
+	}
+	// 就地倒序，最新批次的记录排在最前
 	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
 		recs[i], recs[j] = recs[j], recs[i]
 	}

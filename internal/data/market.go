@@ -228,6 +228,10 @@ func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
 		if prevClose > 0 && si.Price > 0 {
 			si.ChangePct = (si.Price - prevClose) / prevClose * 100
 		}
+		// 现价为 0（停牌/未成交）视为无效行情，不入缓存，避免下游按 0 价误算盈亏。
+		if si.Price <= 0 {
+			continue
+		}
 		out[code] = si
 	}
 	return out
@@ -1301,9 +1305,19 @@ type stockRawItem struct {
 }
 
 // GetStockList 获取全量 A 股列表（代码+名称）。
-// 同时查询上海主板、深圳主板、创业板、科创板，合并返回。
+// 兜底链：新浪财经全市场列表（主源，分页抓取） → 东方财富（按板块合并）。
+// 注意：同花顺全市场列表页为 JS 渲染（chameleon 反爬），无服务端可解析端点，
+// 故兜底链为 新浪 → 东财 两级（同花顺仅提供个股行情/板块名单）。
 func (m *MarketAPI) GetStockList() (map[string]string, error) {
-	// 同时查询各板块：沪A、深A、创业板、科创板、北交所
+	// 主源：新浪财经全市场列表（hs_a 节点，分页抓取，约 5500+ 只）
+	if list, err := m.GetSinaStockList(); err == nil && len(list) > 0 {
+		log.Printf("[stocklist] 新浪全市场 %d 只", len(list))
+		return list, nil
+	} else if err != nil {
+		log.Printf("[stocklist] 新浪列表失败: %v, 降级东财", err)
+	}
+
+	// 兜底：东方财富各板块合并
 	fs := "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81"
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10000&fs=%s&fields=%s", fs, stockListFields)
 	EastMoneyLimiter.Wait()
@@ -1336,6 +1350,77 @@ func (m *MarketAPI) GetStockList() (map[string]string, error) {
 		result[item.Name] = item.Code
 	}
 	return result, nil
+}
+
+// sinaStockPageSize 新浪全市场列表每页条数（接口固定上限 100）。
+const sinaStockPageSize = 100
+
+// sinaStockListMaxPages 新浪全市场列表最大翻页数（约 5500 只 / 100 = 56 页）。
+const sinaStockListMaxPages = 60
+
+// GetSinaStockList 从新浪财经获取全市场 A 股列表（代码+名称），分页抓取合并。
+// 数据来源：Market_Center.getHQNodeData，node=hs_a 覆盖沪深北全部 A 股。
+// 返回 map[股票名称]代码，供 StockCleaner 建立名称↔代码映射。
+func (m *MarketAPI) GetSinaStockList() (map[string]string, error) {
+	result := make(map[string]string)
+	for page := 1; page <= sinaStockListMaxPages; page++ {
+		items, err := m.fetchSinaStockPage(page)
+		if err != nil {
+			if len(result) > 0 {
+				return result, nil // 已有部分数据，部分失败也返回已抓取的
+			}
+			return nil, err
+		}
+		if len(items) == 0 {
+			break
+		}
+		for _, it := range items {
+			if it.Code == "" || it.Name == "" {
+				continue
+			}
+			result[it.Name] = it.Code
+		}
+		if len(items) < sinaStockPageSize {
+			break // 已到最后一页
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("sina stock list empty")
+	}
+	return result, nil
+}
+
+// sinaStockItemRaw 新浪全市场列表 JSON 条目（getHQNodeData 返回数组）。
+type sinaStockItemRaw struct {
+	Symbol string `json:"symbol"` // 带交易所前缀代码，如 "sh600519"
+	Code   string `json:"code"`   // 纯 6 位代码
+	Name   string `json:"name"`   // 股票名称
+}
+
+// fetchSinaStockPage 拉取新浪全市场列表第 page 页（每页 100 条）。
+func (m *MarketAPI) fetchSinaStockPage(page int) ([]sinaStockItemRaw, error) {
+	url := fmt.Sprintf("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=%d&num=%d&sort=symbol&asc=1&node=hs_a", page, sinaStockPageSize)
+	SinaLimiter.Wait()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sina stock list request: %v", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Referer", "https://finance.sina.com.cn")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sina stock list http: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("sina stock list read: %v", err)
+	}
+	var items []sinaStockItemRaw
+	if err := json.Unmarshal(body, &items); err != nil {
+		return nil, fmt.Errorf("sina stock list json: %v", err)
+	}
+	return items, nil
 }
 
 // filterStocksBySector 按板块代码过滤成分股列表。

@@ -13,8 +13,17 @@
           @click="activeFilter = f.key">
           {{ f.label }}
         </button>
+        <!-- 策略名称筛选：与"策略"列同名，按信号所属策略名称过滤 -->
+        <select v-model="activeStrategy" class="strategy-select" title="按策略名称筛选">
+          <option value="all">全部策略</option>
+          <option v-for="st in strategyOptions" :key="st" :value="st">
+            {{ st }}
+          </option>
+        </select>
+        <button class="btn-log" @click="showLog = true">📋 日志</button>
       </div>
     </div>
+    <LogModal :visible="showLog" @close="showLog = false" />
 
     <!-- 信号列表表格 -->
     <div class="signals-table">
@@ -84,11 +93,14 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue' // Vue 组合式 API：响应式、计算属性与生命周期钩子
 import * as api from '../api/index.js'                      // 后端 API 调用封装（信号列表、操作、SSE 等）
+import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）
 
 // ── 响应式状态 ──
 const signals = ref([])               // 原始信号列表
 const activeFilter = ref('all')       // 当前筛选等级
+const activeStrategy = ref('all')     // 当前筛选战法
 const showConfirm = ref(false)        // 是否显示交易确认弹窗
+const showLog = ref(false)            // 是否打开日志弹窗
 const tradeTarget = ref({})           // 待操作的信号对象
 const tradeAction = ref('')           // 操作类型：'buy' | 'ignore'
 
@@ -103,11 +115,21 @@ const filters = [
   { key: 'mute', label: '静默' },
 ]
 
-/** 根据 activeFilter 过滤信号 */
+// 策略名称筛选：动态收集当前信号中的全部策略名称（与"策略"列同名，保证精确匹配）
+const strategyOptions = computed(() => {
+  const set = new Set()
+  signals.value.forEach(s => { if (s.strategy) set.add(s.strategy) })
+  return [...set]
+})
+
+/** 根据 activeFilter 与 activeStrategy 双重过滤信号 */
 const filteredSignals = computed(() => {
-  if (activeFilter.value === 'all') return signals.value
-  // 按当前选中等级过滤信号
-  return signals.value.filter(s => s.remind_level === activeFilter.value)
+  let list = signals.value
+  // 等级过滤
+  if (activeFilter.value !== 'all') list = list.filter(s => s.remind_level === activeFilter.value)
+  // 策略名称过滤
+  if (activeStrategy.value !== 'all') list = list.filter(s => s.strategy === activeStrategy.value)
+  return list
 })
 
 /**
@@ -182,6 +204,16 @@ onUnmounted(() => {
   background: transparent; color: #888; font-size: 13px; cursor: pointer;
 }
 .filter-btn.active { background: #FF4D4F; border-color: #FF4D4F; color: #fff; }
+.strategy-select {
+  padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
+  background: #1a1a2e; color: #ccc; font-size: 13px; cursor: pointer; outline: none;
+}
+.strategy-select:focus { border-color: #FF4D4F; }
+.btn-log {
+  padding: 6px 14px; border-radius: 6px; border: 1px solid #b388ff;
+  background: transparent; color: #b388ff; font-size: 13px; cursor: pointer;
+}
+.btn-log:hover { background: rgba(179,136,255,0.1); }
 .signals-table { background: #1a1a2e; border-radius: 8px; overflow: hidden; }
 .table-header, .table-row {
   display: flex; align-items: center; padding: 10px 16px; gap: 8px; font-size: 13px;

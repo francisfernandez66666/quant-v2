@@ -4,20 +4,17 @@
 -->
 <template>
   <div class="llm-debug-page">
-    <!-- 页头：标题 + 轮次选择 + 刷新按钮 -->
+    <!-- 页头：标题 + 日志按钮 + 刷新按钮 -->
     <div class="page-header">
       <h2>LLM 分析诊断</h2>
       <div class="header-right">
-        <select class="round-select" v-model="roundIdx" :disabled="records.length < 2" @change="applyRound">
-          <option v-for="(r, i) in records" :key="r.process_time" :value="i">
-            轮次 {{ records.length - i }} · {{ formatTime(r.process_time) }}（{{ r.raw_count }} 条 / 选 {{ r.selected_count }}）
-          </option>
-        </select>
+        <button class="btn-log" @click="showLog = true">📋 日志</button>
         <button class="btn-refresh" @click="loadData" :disabled="loading">
           {{ loading ? '加载中...' : '刷新' }}
         </button>
       </div>
     </div>
+    <LogModal :visible="showLog" @close="showLog = false" />
 
     <!-- 状态判断 -->
     <div v-if="noAgent" class="empty">Agent 未就绪</div>
@@ -115,14 +112,15 @@
 <script setup>
 import { ref, onMounted } from 'vue'   // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子
 import * as api from '../api/index.js' // 后端 API 调用封装（获取轮次记录等）
+import LogModal from '../components/LogModal.vue' // 日志弹窗（LLM 批次 + 信号批次）
 
 // ── 响应式状态 ──
 const loading = ref(false)        // 是否正在加载
 const records = ref([])           // 当日全量轮次记录（持久化）
-const roundIdx = ref(0)           // 当前选中轮次索引（records 下标，默认最新）
-const data = ref(null)            // 当前轮次诊断数据
+const data = ref(null)            // 当前展示轮次诊断数据（最新一轮）
 const noAgent = ref(false)        // Agent 未就绪
 const noData = ref(false)         // 暂无数据
+const showLog = ref(false)        // 是否打开日志弹窗
 
 /** 被 Stage1 筛选通过的新闻索引集合 */
 const selectedSet = ref(new Set())
@@ -132,11 +130,10 @@ function isSelected(i) {
   return selectedSet.value.has(i)
 }
 
-/** 切换轮次后应用选中记录 */
-function applyRound() {
-  const r = records.value[roundIdx.value]
-  // 将选中轮次的记录设为当前展示数据
-  data.value = r || null
+/** 展示最新一轮记录 */
+function applyLatest() {
+  const r = records.value[0] || null
+  data.value = r
   noAgent.value = false
   noData.value = !r
   // 回填该轮次通过 Stage1 筛选的新闻索引
@@ -168,10 +165,9 @@ async function loadData() {
       records.value = []
       data.value = null
     } else {
-      // 有记录时默认展示最新一轮
+      // 有记录时展示最新一轮
       records.value = res
-      roundIdx.value = 0
-      applyRound()
+      applyLatest()
     }
   } catch (e) {
     console.error('LLMDebug 加载失败', e)
@@ -189,10 +185,11 @@ onMounted(loadData)
 .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .page-header h2 { font-size: 18px; }
 .header-right { display: flex; align-items: center; gap: 10px; }
-.round-select {
-  padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
-  background: #1a1a2e; color: #ccc; font-size: 12px; cursor: pointer; max-width: 320px;
+.btn-log {
+  padding: 6px 14px; border-radius: 6px; border: 1px solid #b388ff;
+  background: transparent; color: #b388ff; font-size: 13px; cursor: pointer;
 }
+.btn-log:hover { background: rgba(179,136,255,0.1); }
 .btn-refresh { padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F; background: transparent; color: #FF4D4F; font-size: 13px; cursor: pointer; }
 .btn-refresh:disabled { opacity: 0.5; }
 .btn-refresh:hover { background: rgba(255,77,79,0.1); }

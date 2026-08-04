@@ -145,6 +145,16 @@ async function request(path, opts = {}) {
     clearAuth()
     throw new Error('登录已过期')
   }
+  // 非 2xx：尝试解析后端错误信息，解析失败则给出明确状态码提示，
+  // 避免下游 res.json() 对 HTML 等非 JSON 响应抛出的隐晦异常。
+  if (!res.ok) {
+    let msg = '请求失败 ' + res.status
+    try {
+      const e = await res.json()
+      if (e && e.error) msg = e.error
+    } catch (_) {}
+    throw new Error(msg)
+  }
   return res.json()
 }
 
@@ -464,6 +474,12 @@ export async function fetchLLMDebug() {
 // 对应 GET /api/stage-records，返回当日全部轮次快照，用于事后复盘
 export async function fetchStageRecords() {
   return request('/api/stage-records')
+}
+
+/** 获取当日全量信号批次记录（固化到磁盘，供复盘） */
+// 对应 GET /api/signal-logs，返回当日各轮信号批次快照（做多/做空/提醒），用于信号日志弹窗
+export async function fetchSignalLogs() {
+  return request('/api/signal-logs')
 }
 
 // ── 做空开关 ──

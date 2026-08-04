@@ -9,7 +9,6 @@ import (
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
-	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -114,31 +113,13 @@ func (a *Aggregator) Current() *DashboardData {
 	return a.current
 }
 
-// resolveConflict 信号冲突裁决：合并做多/做空/提醒三类信号，按置信度去重排序。
+// resolveConflict 信号冲突裁决：合并做多/做空信号，按置信度去重排序。
 // 被 blocked 的股票直接排除，相同股票取最新生成的信号。
+// 止盈/止损等提醒信号（alerts）不并入最终信号——它们只走 AlertSignals 通道
+// （消息中心/SSE 提醒），避免在"策略信号"列表里被误渲染成带评分的交易信号。
 func resolveConflict(bull, bear, alerts []combat_agent.Signal, blocked map[string]bool) []combat_agent.Signal {
-	// 收集已有策略信号（做多/做空）覆盖的股票代码，
-	// 提醒类信号不覆盖已存在策略信号的标的（策略信号优先展示）。
-	strategyCodes := make(map[string]bool)
-	for _, s := range bull {
-		if strategy.IsActionWatchOrAbove(s.Action) {
-			strategyCodes[s.Code] = true
-		}
-	}
-	for _, s := range bear {
-		if strategy.IsActionWatchOrAbove(s.Action) {
-			strategyCodes[s.Code] = true
-		}
-	}
-
-	// 做多 + 做空 全量并入，提醒信号仅在无策略信号时补入
+	// 做多 + 做空 全量并入；提醒信号不进入最终信号
 	all := append(bull, bear...)
-	for _, s := range alerts {
-		if strategyCodes[s.Code] {
-			continue
-		}
-		all = append(all, s)
-	}
 
 	// 先按置信度降序排序，再按代码去重：
 	// 同代码出现多次时保留生成时间最新的信号；blocked 的股票直接剔除。

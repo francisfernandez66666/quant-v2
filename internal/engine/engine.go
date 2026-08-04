@@ -53,6 +53,9 @@ type Engine struct {
 	stageRecords []newsagent.DebugInfo // 当日全量轮次记录（固化到磁盘）
 	stageRecPath string                // Stage 记录持久化文件路径
 
+	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
+	signalRecPath string                   // 信号批次记录持久化文件路径
+
 	msgStore   *data.MessageStore // 消息中心持久化存储
 	hotRecords []data.HotRecord   // 当日热点板块轮次记录（固化到磁盘）
 	hotRecPath string             // 热点板块记录持久化文件路径
@@ -86,6 +89,12 @@ type hotRecordFile struct {
 	Records    []data.HotRecord `json:"records"`
 }
 
+// signalRecordFile 信号批次记录磁盘持久化结构（按交易日分桶）。
+type signalRecordFile struct {
+	TradingDay string                   `json:"trading_day"`
+	Records    []combat_agent.SignalLog `json:"records"`
+}
+
 // New 创建顶层编排引擎。
 func New(
 	marketAPI *data.MarketAPI,
@@ -112,8 +121,10 @@ func New(
 		scoreRecPath = filepath.Join(dataDir, "scores.json")
 	}
 	hotRecPath := ""
+	signalRecPath := ""
 	if dataDir != "" {
 		hotRecPath = filepath.Join(dataDir, "hot_records.json")
+		signalRecPath = filepath.Join(dataDir, "signal_records.json")
 	}
 	e := &Engine{
 		marketAPI:        marketAPI,
@@ -132,6 +143,8 @@ func New(
 		shortEnabled:     false,
 		stageRecords:     loadStageRecords(stageRecPath),
 		stageRecPath:     stageRecPath,
+		signalRecords:    loadSignalRecords(signalRecPath),
+		signalRecPath:    signalRecPath,
 		msgStore:         data.NewMessageStore(msgPath),
 		hotRecords:       loadHotRecords(hotRecPath),
 		hotRecPath:       hotRecPath,
@@ -200,6 +213,70 @@ func (e *Engine) GetStageRecords() []newsagent.DebugInfo {
 	out := make([]newsagent.DebugInfo, len(e.stageRecords))
 	copy(out, e.stageRecords)
 	return out
+}
+
+// loadSignalRecords 从磁盘加载当日信号批次记录；跨交易日自动重置。
+func loadSignalRecords(path string) []combat_agent.SignalLog {
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var f signalRecordFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		log.Printf("[engine] signal_records 解析失败: %v", err)
+		return nil
+	}
+	if f.TradingDay != data.TradingDayDate(time.Now()) {
+		return nil
+	}
+	return f.Records
+}
+
+// persistSignalRecords 将当日信号批次记录写入磁盘。
+func (e *Engine) persistSignalRecords() {
+	if e.signalRecPath == "" {
+		return
+	}
+	e.mu.RLock()
+	f := signalRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: e.signalRecords}
+	e.mu.RUnlock()
+	raw, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		log.Printf("[engine] signal_records 序列化失败: %v", err)
+		return
+	}
+	if err := os.WriteFile(e.signalRecPath, raw, 0644); err != nil {
+		log.Printf("[engine] signal_records 写入失败: %v", err)
+	}
+}
+
+// GetSignalLogs 返回当日全量信号批次记录（供前端"信号日志"弹窗按批次展示）。
+func (e *Engine) GetSignalLogs() []combat_agent.SignalLog {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]combat_agent.SignalLog, len(e.signalRecords))
+	copy(out, e.signalRecords)
+	return out
+}
+
+// captureSignalRecords 收集本轮全部信号为一条批次快照，固化到当日信号记录。
+func (e *Engine) captureSignalRecords(rawCount int, signals []combat_agent.Signal) {
+	e.mu.Lock()
+	rec := combat_agent.SignalLog{
+		ProcessTime: time.Now(),
+		RawCount:    rawCount,
+		Signals:     make([]combat_agent.Signal, len(signals)),
+	}
+	copy(rec.Signals, signals)
+	e.signalRecords = append(e.signalRecords, rec)
+	if len(e.signalRecords) > 20 {
+		e.signalRecords = e.signalRecords[len(e.signalRecords)-20:]
+	}
+	e.mu.Unlock()
+	e.persistSignalRecords()
 }
 
 // GetAllNewsEvents 返回持久化到本地的全部已打标新闻事件，供 /api/news?all=true 展示。
@@ -754,6 +831,13 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 	// 15. 调试数据
 	e.captureDebug(rawNews, st0, events)
+
+	// 15b. 信号批次快照：收拢本轮全部信号（做多/做空/提醒）供"信号日志"弹窗按批次复盘
+	allSignals := make([]combat_agent.Signal, 0, len(bullSignals)+len(bearSignals)+len(alertSignals))
+	allSignals = append(allSignals, bullSignals...)
+	allSignals = append(allSignals, bearSignals...)
+	allSignals = append(allSignals, alertSignals...)
+	e.captureSignalRecords(len(rawNews), allSignals)
 
 	// 16. SSE 广播通知前端（附信号摘要）
 	if e.sse != nil && e.sse.Len() > 0 {

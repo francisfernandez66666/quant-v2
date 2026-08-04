@@ -4,6 +4,8 @@
 -->
 <template>
   <div class="dashboard">
+    <button class="btn-log" @click="showLog = true">📋 日志</button>
+    <LogModal :visible="showLog" @close="showLog = false" />
     <!-- 统计卡片：强信号 / 观察中 / 静默 / 监控个股数 -->
     <div class="stats-row">
       <div class="stat-card strong">
@@ -174,6 +176,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子
 import { useRouter } from 'vue-router'                       // Vue Router：获取路由实例，用于页面跳转
 import * as api from '../api/index.js'                       // 后端 API 封装：信号/状态/资讯/板块/快照/IPO 等数据接口
+import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）
 
 const router = useRouter()                                   // 路由实例：点击策略信号行时跳转到信号详情页 /signals
 
@@ -185,6 +188,7 @@ const hotSectors = ref([])            // 热门板块
 const snapshotStocks = ref([])        // 热门个股快照
 const snapshotTime = ref('')          // 快照更新时间
 const ipoCalendar = ref([])           // IPO 日历
+const showLog = ref(false)            // 是否打开日志弹窗
 
 let timer = null                      // 定时轮询句柄
 let sseUnsub = null                   // SSE 取消订阅函数
@@ -291,7 +295,13 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.dashboard { max-width: 1200px; }
+.dashboard { max-width: 1200px; position: relative; }
+.btn-log {
+  position: absolute; top: 0; right: 0; z-index: 10;
+  padding: 6px 14px; border-radius: 6px; border: 1px solid #b388ff;
+  background: transparent; color: #b388ff; font-size: 13px; cursor: pointer;
+}
+.btn-log:hover { background: rgba(179,136,255,0.1); }
 .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
 .stat-card { text-align: center; padding: 16px; border-radius: 8px; background: #1a1a2e; }
 .stat-card.strong .stat-num { color: #FF4D4F; }

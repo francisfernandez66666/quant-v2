@@ -38,11 +38,11 @@ type ScanInput struct {
 // 无论战法是否通过都记录原始分，前端据此展示自选/持仓的持续评分。
 // JSON 标签供前端按稳定 key 取值展示。
 type StockScores struct {
-	Code              string    `json:"code"`          // 股票代码
-	NScore            float64   `json:"n_score"`       // N 形战法分（0~100）
-	DragonScore       float64   `json:"dragon_score"`  // 龙头战法分（0~100）
-	DoubleBumpScore   float64   `json:"db_score"`      // 双响炮战法分（0~100）
-	DragonReturnScore float64   `json:"dr_score"`      // 龙回头战法分（0~100）
+	Code              string          `json:"code"`          // 股票代码
+	NScore            float64         `json:"n_score"`       // N 形战法分（0~100）
+	DragonScore       float64         `json:"dragon_score"`  // 龙头战法分（0~100）
+	DoubleBumpScore   float64         `json:"db_score"`      // 双响炮战法分（0~100）
+	DragonReturnScore float64         `json:"dr_score"`      // 龙回头战法分（0~100）
 	MomentumScore     float64         `json:"m_score"`       // 动量分（量价+MACD+走势，0~100）
 	MomentumValid     bool            `json:"m_valid"`       // 动量分数据是否完整（量价/走势/MACD 任一缺失为 false）
 	SignalActive      bool            `json:"signal_active"` // 本轮是否有该股信号
@@ -66,4 +66,12 @@ type Signal struct {
 	Reason      string    `json:"reason"`               // 信号生成原因
 	Sector      string    `json:"sector"`               // 所属板块
 	GeneratedAt time.Time `json:"generated_at"`         // 信号生成时间
+}
+
+// SignalLog 单轮策略信号批次快照，记录该轮产出的全部信号与产出时间。
+// 供前端"信号日志"弹窗按批次（时间分组）展示，用于复盘信号历史。
+type SignalLog struct {
+	ProcessTime time.Time `json:"process_time"` // 信号批次产出时间
+	RawCount    int       `json:"raw_count"`    // 本轮原始新闻条数
+	Signals     []Signal  `json:"signals"`      // 本轮全部信号（做多/做空/提醒）
 }

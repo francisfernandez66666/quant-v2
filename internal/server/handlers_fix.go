@@ -274,13 +274,13 @@ func (s *Server) handleSectorHotRecords(w http.ResponseWriter, r *http.Request) 
 // fixHolding 前端持仓格式的结构体。
 // 包含持仓数量、成本价、现价、盈亏比例、止盈止损价等字段。
 type fixHolding struct {
-	Code          string  `json:"code"`           // 股票代码
-	Name          string  `json:"name"`           // 股票名称
-	Quantity      float64 `json:"quantity"`       // 持仓数量
-	CostPrice     float64 `json:"cost_price"`     // 持仓成本价
-	CurPrice      float64 `json:"cur_price"`      // 最新现价
-	ChangePct     float64 `json:"change_pct"`     // 当日涨跌幅（%）
-	PnlPct        float64 `json:"pnl_pct"`        // 持仓盈亏比例（%）
+	Code          string  `json:"code"`            // 股票代码
+	Name          string  `json:"name"`            // 股票名称
+	Quantity      float64 `json:"quantity"`        // 持仓数量
+	CostPrice     float64 `json:"cost_price"`      // 持仓成本价
+	CurPrice      float64 `json:"cur_price"`       // 最新现价
+	ChangePct     float64 `json:"change_pct"`      // 当日涨跌幅（%）
+	PnlPct        float64 `json:"pnl_pct"`         // 持仓盈亏比例（%）
 	TakeProfitPct float64 `json:"take_profit_pct"` // 止盈百分比设置
 	StopLossPct   float64 `json:"stop_loss_pct"`   // 止损百分比设置
 	SignalActive  bool    `json:"signal_active"`   // 是否有活跃信号
@@ -409,49 +409,94 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
+// thsTopFallbackBoards 返回同花顺板块行情表（行业+概念 top-20），带 60s 缓存。
+// 兜底板块每分钟轮动一次（前端 3s 轮询 /api/sector/hot 时不再逐次请求同花顺）。
+func (s *Server) thsTopFallbackBoards() []data.SectorInfo {
+	s.thsMu.Lock()
+	defer s.thsMu.Unlock()
+	if s.ths == nil {
+		return nil
+	}
+	// 缓存命中（60s 内）：直接复用，避免高频刷新同花顺页面
+	if len(s.thsBoards) > 0 && time.Since(s.thsBoardsAt) < time.Minute {
+		out := make([]data.SectorInfo, len(s.thsBoards))
+		copy(out, s.thsBoards)
+		return out
+	}
+	list, err := s.ths.GetTopBoards()
+	if err != nil {
+		log.Printf("[server] 同花顺 top板块获取失败: %v", err)
+		return nil
+	}
+	s.thsBoards = list
+	s.thsBoardsAt = time.Now()
+	out := make([]data.SectorInfo, len(list))
+	copy(out, list)
+	return out
+}
+
 // handleFixSectorHot 处理 GET /api/sector/hot 请求，返回热门板块列表。
 // 数据出口：同花顺首屏 top-20 板块表（一级行业+概念），含同花顺涨跌幅/主力净流入。
-// 仅展示能匹配到同花顺 top-20 的板块，匹配不到的丢弃。
+// 优先展示 LLM 归因出的热点板块（仅保留能匹配到同花顺 top-20 的板块）；
+// 当 LLM 未筛选出任何板块时，用同花顺板块行情表（行业+概念）兜底，取涨幅前十，
+// 每分钟刷新一次实现板块轮动。
 func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 	dash := s.agg.Current()
-	if dash == nil {
-		writeJSON(w, 200, []map[string]interface{}{})
-		return
-	}
 	// 同花顺板块行情表（首屏 top-20，按涨跌幅排序），按名称精确匹配
 	sectorMap := map[string]data.SectorInfo{}
-	if s.ths != nil {
-		if list, err := s.ths.GetTopBoards(); err == nil {
-			for _, si := range list {
-				sectorMap[si.Name] = si
-			}
-		} else {
-			log.Printf("[server] 同花顺 top板块获取失败: %v", err)
-		}
+	thsBoards := s.thsTopFallbackBoards()
+	for _, si := range thsBoards {
+		sectorMap[si.Name] = si
 	}
 	out := make([]map[string]interface{}, 0)
-	for _, sec := range dash.HotSectors {
-		si, ok := sectorMap[sec.Name]
-		if !ok {
-			continue
+	if dash != nil {
+		for _, sec := range dash.HotSectors {
+			si, ok := sectorMap[sec.Name]
+			if !ok {
+				continue
+			}
+			newsTitles := sec.NewsTitles
+			if newsTitles == nil {
+				newsTitles = []string{}
+			}
+			out = append(out, map[string]interface{}{
+				"name":          sec.Name,
+				"code":          si.Code,
+				"score":         r0(sec.Score),
+				"change_pct":    r2(si.ChangePct),
+				"d1":            0,
+				"reason":        sec.Reason,
+				"reason_detail": sec.Reason,
+				"direction":     sec.Direction,
+				"limitup_cnt":   si.LimitupCnt,
+				"net_inflow":    r2(si.NetInflow),
+				"news_titles":   newsTitles,
+			})
 		}
-		newsTitles := sec.NewsTitles
-		if newsTitles == nil {
-			newsTitles = []string{}
+	}
+	// LLM 未筛选出热点板块（或匹配不到同花顺 top-20）：拿同花顺板块+概念兜底
+	if len(out) == 0 {
+		// 按涨跌幅从高到低取前十，实现轮动
+		top := append([]data.SectorInfo(nil), thsBoards...)
+		sort.SliceStable(top, func(i, j int) bool { return top[i].ChangePct > top[j].ChangePct })
+		if len(top) > 10 {
+			top = top[:10]
 		}
-		out = append(out, map[string]interface{}{
-			"name":          sec.Name,
-			"code":          si.Code,
-			"score":         r0(sec.Score),
-			"change_pct":    r2(si.ChangePct),
-			"d1":            0,
-			"reason":        sec.Reason,
-			"reason_detail": sec.Reason,
-			"direction":     sec.Direction,
-			"limitup_cnt":   si.LimitupCnt,
-			"net_inflow":    r2(si.NetInflow),
-			"news_titles":   newsTitles,
-		})
+		for _, si := range top {
+			out = append(out, map[string]interface{}{
+				"name":          si.Name,
+				"code":          si.Code,
+				"score":         0,
+				"change_pct":    r2(si.ChangePct),
+				"d1":            0,
+				"reason":        "",
+				"reason_detail": "同花顺板块兜底（LLM 本轮未归因出热点板块）",
+				"direction":     "中性",
+				"limitup_cnt":   si.LimitupCnt,
+				"net_inflow":    r2(si.NetInflow),
+				"news_titles":   []string{},
+			})
+		}
 	}
 	writeJSON(w, 200, out)
 }
@@ -631,13 +676,40 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleFixNews 处理 GET /api/news 请求，返回新闻事件列表（含宏观日历事件）。
-// 数据来源：引擎持久化的新闻事件（聚合器展示缓存）+ 自动生成的宏观日历事件（影响级别高/中/低）。
-// 宏观日历仅显示近 14 天内的事件，标注剩余天数。
+// handleFixNews 处理 GET /api/news 请求，返回热点资讯（混合数据源，独立于 LLM Stage）。
+// 数据来源（按序混合去重）：
+//  1. 原始新闻流：同花顺快讯（主源）+ 新浪财经（兜底），"有啥刷啥"不依赖 LLM；
+//  2. 已打标事件：引擎持久化的新闻事件（聚合器展示缓存，跨轮次累计）；
+//  3. 宏观日历事件：自动生成，影响级别高/中/低，仅显示近 14 天内。
+//
+// 原始新闻（未打标）以 source 区分展示，已打标事件带 direction/sectors/stocks 等标签。
 func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "true"
+
+	// 1. 原始新闻流：同花顺快讯(主) → 新浪(兜底)，标题截断去重合并
+	rawNews := make([]data.NewsItem, 0, 60)
+	rawSeen := make(map[string]bool)
+	addRaw := func(items []data.NewsItem, err error) {
+		if err != nil {
+			return
+		}
+		for _, n := range items {
+			if n.Title == "" {
+				continue
+			}
+			key := truncateTitle(n.Title, 60)
+			if rawSeen[key] {
+				continue
+			}
+			rawSeen[key] = true
+			rawNews = append(rawNews, n)
+		}
+	}
+	addRaw(s.market.GetTonghuashunNews(40))
+	addRaw(s.market.GetSinaNews(40))
+
+	// 2. 已打标事件：all=true 读取持久化全量已打标新闻（含中性/一般，跨轮次累计）
 	var events []newsagent.NewsEvent
-	// all=true：读取持久化的全量已打标新闻（含中性/一般，跨轮次累计）
 	if all && s.ctrl != nil {
 		events = s.ctrl.GetAllNewsEvents()
 	}
@@ -654,7 +726,11 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	out := make([]map[string]interface{}, 0)
+
+	// 3. 合并输出：先已打标事件（带标签），再补原始新闻（仅标题/来源/时间）
+	// 已打标事件的标题优先于原始流同名标题（原始流中已被 LLM 打标的去重掉）
+	tagged := make(map[string]bool)
+	out := make([]map[string]interface{}, 0, len(events)+len(rawNews))
 	for _, e := range events {
 		item := map[string]interface{}{
 			"id":           e.Title,
@@ -668,9 +744,31 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 			"sectors":      e.Sectors,
 			"stocks":       e.CleanedStocks,
 			"score":        e.Score,
+			"tagged":       true,
 		}
 		out = append(out, item)
+		tagged[truncateTitle(e.Title, 60)] = true
 	}
+	for _, n := range rawNews {
+		if tagged[truncateTitle(n.Title, 60)] {
+			continue // 已被 LLM 打标，不重复展示原始版
+		}
+		out = append(out, map[string]interface{}{
+			"id":           n.Title,
+			"title":        n.Title,
+			"content":      n.Content,
+			"datetime":     n.Datetime,
+			"source":       n.Source,
+			"direction":    "",
+			"sentiment":    "",
+			"impact_level": "",
+			"sectors":      []string{},
+			"stocks":       []string{},
+			"score":        0,
+			"tagged":       false,
+		})
+	}
+
 	// 追加宏观日历事件（按天缓存）
 	now := time.Now()
 	macroEvents := s.macroEvents(now)
@@ -709,6 +807,15 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, 200, out)
+}
+
+// truncateTitle 将标题按 rune 截断到 maxLen（保留中文字符完整性），用于标题去重归一化 key。
+func truncateTitle(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen])
+	}
+	return s
 }
 
 // handleFixGetWatchlist 处理 GET /api/watchlist 请求，返回自选股列表及其实时行情。

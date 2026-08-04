@@ -28,6 +28,14 @@ type StrategyRunner struct {
 	Strategy strategy.Strategy   // 策略接口实现
 }
 
+// orDefault 返回 a 非空时的值，否则回退到 b。
+func orDefault(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
 // Agent 战法引擎核心，管理多策略运行器与配置热更新。
 // 所有字段通过 mu 读写锁保护，保证并发扫描/热更新安全。
 type Agent struct {
@@ -221,7 +229,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		sigs = append(sigs, Signal{
 			ID:          seqID(),
 			Code:        code,
-			Name:        sig.Name,
+			Name:        orDefault(sig.Name, md.Name),
 			Strategy:    string(runner.Type),
 			Direction:   direction,
 			Action:      action,
@@ -429,9 +437,10 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 			continue
 		}
 
-		// 拉取实时报价，失败/为空则跳过该持仓
+		// 拉取实时报价，失败/为空/现价为 0（停牌未成交）则跳过该持仓，
+		// 避免以无效价格误判止盈/止损（如 0 价会算成 -100%）。
 		quote, err := marketAPI.GetRealtimeQuote(pos.Code)
-		if err != nil || quote == nil {
+		if err != nil || quote == nil || quote.Price <= 0 {
 			continue
 		}
 
