@@ -168,6 +168,37 @@ func (e *Engine) SetFetcher(f *data.Fetcher) {
 	e.mu.Unlock()
 }
 
+// updateHotPool 将验证通过的板块成分股并入 5s 实时监控池。
+// 热点股随板块轮换替换（上限 60 由 Fetcher 内部裁剪），缺失板块验证结果时保留原热点。
+func (e *Engine) updateHotPool(bull, bear []sector_agent.VerifiedSector) {
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	set := make(map[string]bool)
+	for _, sec := range bull {
+		for _, code := range sec.Stocks {
+			set[code] = true
+		}
+	}
+	for _, sec := range bear {
+		for _, code := range sec.Stocks {
+			set[code] = true
+		}
+	}
+	if len(set) == 0 {
+		return // 本轮无验证通过的板块，保持原热点不变
+	}
+	stocks := make([]string, 0, len(set))
+	for code := range set {
+		stocks = append(stocks, code)
+	}
+	f.UpdateHotStocks(stocks)
+	log.Printf("[engine] 热点池更新: %d 只板块成分股入 5s 实时池", len(stocks))
+}
+
 // loadStageRecords 从磁盘加载当日 Stage 记录；跨交易日自动重置。
 func loadStageRecords(path string) []newsagent.DebugInfo {
 	if path == "" {
@@ -652,12 +683,21 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 7b. 固化本轮热点板块记录（同花顺 top-20 匹配后，供前端展示历史）
 	e.captureHotRecord(sr)
 
-	// 8. D1 评分（所有打分池个股）
+	// 8. D1 评分（所有打分池个股；LLM 失败/漏项回退上一轮评分，避免断链归零）
 	d1Scorer := combat_agent.NewD1Scorer(e.llmClient, "")
-	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, valid, sr.MarketData)
+	e.mu.RLock()
+	prevD1 := e.lastD1Scores
+	e.mu.RUnlock()
+	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, valid, sr.MarketData, prevD1)
 	e.mu.Lock()
 	e.lastD1Scores = d1Scores
 	e.mu.Unlock()
+
+	// 8a. 打分池 PE 预取（N 形 D3 超跌评分；东财 clist f9，TTL 缓存降低限流压力）
+	peScores := make(map[string]float64, len(sr.ScoringPool))
+	for _, code := range sr.ScoringPool {
+		peScores[code] = e.marketAPI.GetStockPE(code)
+	}
 
 	td := data.TradingDayDate(time.Now())
 
@@ -687,6 +727,9 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		verifiedBear = e.sectorAgent.Verify(sr.BearSectors)
 	}
 
+	// 9b. 验证通过的板块成分股并入 5s 实时监控池（fetcher 新浪批量拉取，热点股随板块轮换）
+	e.updateHotPool(verifiedBull, verifiedBear)
+
 	// 10. 利好开关开 → 做多分支
 	var bullSignals []combat_agent.Signal
 	if e.LongEnabled() {
@@ -696,6 +739,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			L1Blocked:    sr.L1Blocked,
 			MarketData:   sr.MarketData,
 			D1Scores:     d1Scores,
+			PE:           peScores,
 			LimitUpPool:  pool,
 			News:         newsBriefs,
 			Scores:       stockScores,
@@ -717,6 +761,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		News:             newsBriefs,
 		Scores:           stockScores,
 		EmotionPhase:     emotionPhase,
+		PE:               peScores,
 	})
 	bullSignals = append(bullSignals, limitSignals...)
 
@@ -729,6 +774,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			L1Blocked:    sr.L1Blocked,
 			MarketData:   sr.MarketData,
 			D1Scores:     d1Scores,
+			PE:           peScores,
 			LimitUpPool:  pool,
 			News:         newsBriefs,
 			Scores:       stockScores,
@@ -764,6 +810,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			L1Blocked:        sr.L1Blocked,
 			MarketData:       sr.MarketData,
 			D1Scores:         d1Scores,
+			PE:               peScores,
 			Scores:           stockScores,
 			EmotionPhase:     emotionPhase,
 		}
@@ -776,6 +823,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			L1Blocked:        sr.L1Blocked,
 			MarketData:       sr.MarketData,
 			D1Scores:         d1Scores,
+			PE:               peScores,
 			Scores:           stockScores,
 			EmotionPhase:     emotionPhase,
 		}

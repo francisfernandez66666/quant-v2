@@ -501,6 +501,24 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+// snapshotQuote 获取个股实时行情：优先读 fetcher 5s 快照（新浪批量，一次全池），
+// 缺失时降级 同花顺→东财 单查（同花顺优先于东财，降低东财限流压力）。
+func (s *Server) snapshotQuote(code string) (*data.StockInfo, error) {
+	if s.fetcher != nil {
+		if snap := s.fetcher.Snapshot(); snap != nil {
+			if si, ok := snap.Stocks[code]; ok && si != nil && si.Price > 0 {
+				return si, nil
+			}
+		}
+	}
+	if s.ths != nil {
+		if si, err := s.ths.GetQuote(code); err == nil && si != nil && si.Price > 0 {
+			return si, nil
+		}
+	}
+	return s.market.GetRealtimeQuote(code)
+}
+
 // handleFixSnapshot 处理 GET /api/snapshot 请求，返回指定个股或全部自选股的实时快照数据。
 // 支持 ?codes=600519,000001 参数指定代码列表，不传则返回自选股列表中的所有个股。
 func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -513,7 +531,7 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]interface{}, 0)
 	for _, code := range stockList {
-		info, err := s.market.GetRealtimeQuote(code)
+		info, err := s.snapshotQuote(code)
 		if err != nil {
 			continue
 		}
@@ -548,7 +566,7 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[sig.Code] = true
-		info, err := s.market.GetRealtimeQuote(sig.Code)
+		info, err := s.snapshotQuote(sig.Code)
 		price := sig.Price
 		chg := 0.0
 		if err == nil {

@@ -22,6 +22,10 @@ type Engine struct {
 
 	klineCacheMu sync.RWMutex                // 保护 klineCache 的读写锁（近实时打分并发访问）
 	klineCache   map[string]*klineCacheEntry // 日K/资金流缓存（近实时打分用）
+
+	benchChgMu   sync.RWMutex // 保护基准指数涨跌幅缓存
+	benchChgVal  float64      // 上证指数最新涨跌幅（%）
+	benchChgAt   time.Time    // 基准指数拉取时间（TTL 判断）
 }
 
 // klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。
@@ -70,10 +74,16 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 
 	e.rebuildIndex(events)
 
-	// 2. 分流个股事件到 LongStocks / ShortStocks（按带符号 Score 判定方向）
+	// 2. 分流事件个股到 LongStocks / ShortStocks（按带符号 Score 判定方向）。
+	//    个股级事件取 LLM 识别的关联股；板块级事件经 propagateSectorToStocks 已注入成分股（CleanedStocks），
+	//    一并并入打分池，扩大 8a 个股监测覆盖（Stage2 归因仅板块、无个股时也能出候选）。
 	var longStocks, shortStocks []IndividualStock
 	for _, ev := range events {
-		if ev.Level != "个股" || len(ev.CleanedStocks) == 0 {
+		if len(ev.CleanedStocks) == 0 {
+			continue
+		}
+		// 仅处理 个股 与 板块 级事件（上游/下游/中性事件不产个股候选）
+		if ev.Level != "个股" && ev.Level != "板块" {
 			continue
 		}
 		// 方向判定：Score>0 利好进做多池，Score<0 利空进做空池，Score=0（中性）跳过
@@ -145,6 +155,28 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 	}
 }
 
+// benchChg 返回上证指数当前涨跌幅（%），供 N 形 D2 相对强度对比。
+// 指数行情 30s TTL 缓存（非交易时段也会取到当日值，可接受），失败返回 0。
+func (e *Engine) benchChg() float64 {
+	e.benchChgMu.RLock()
+	if time.Since(e.benchChgAt) < 30*time.Second {
+		v := e.benchChgVal
+		e.benchChgMu.RUnlock()
+		return v
+	}
+	e.benchChgMu.RUnlock()
+
+	si, err := e.marketAPI.GetIndexQuote("000001")
+	if err != nil || si == nil {
+		return 0
+	}
+	e.benchChgMu.Lock()
+	e.benchChgVal = si.ChangePct
+	e.benchChgAt = time.Now()
+	e.benchChgMu.Unlock()
+	return si.ChangePct
+}
+
 // fetchMarketData 为打分池所有个股拉取行情数据（实时价 + KLine + 资金流向）。
 // 实时行情降级链路：新浪批量 CSV（一次网络请求拉全池）→ 同花顺单查 → 东财单查。
 // K线/资金流并发拉取（每只2次请求）。
@@ -152,6 +184,12 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 	result := make(map[string]*StockMarketData, len(codes))
 	for _, code := range codes {
 		result[code] = &StockMarketData{Code: code}
+	}
+
+	// 基准指数涨跌幅（N 形 D2 相对强度对比）
+	benchChg := e.benchChg()
+	for _, md := range result {
+		md.BenchChg = benchChg
 	}
 
 	// 1. 批量实时行情（新浪 CSV 单次请求，全池一次拉完）
@@ -247,6 +285,12 @@ func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes ma
 	result := make(map[string]*StockMarketData, len(codes))
 	for _, code := range codes {
 		result[code] = &StockMarketData{Code: code}
+	}
+
+	// 基准指数涨跌幅（N 形 D2 相对强度对比）
+	benchChg := e.benchChg()
+	for _, md := range result {
+		md.BenchChg = benchChg
 	}
 
 	// 1. 实时量价：外部快照优先，缺失走 新浪批量→同花顺→东财 兜底

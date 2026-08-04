@@ -135,8 +135,10 @@ func dragonReturnDataFromMarketData(code string, md *strategy_engine.StockMarket
 //   - DragonReturn 从K线派生 StockData 走 Evaluate
 //   - NShape 从日K+实时量价+分钟MACD构造 WaveA/IntradayB/Ctx 走 EvaluateWave
 //
-// sector 传 nil 表示无板块上下文（个股直入 8a/8b 场景）；emotionPhase 供 N 形情绪硬闸。
-func evalFor(runner StrategyRunner, code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, emotionPhase string) (*strategy.Evaluation, error) {
+// sector 传 nil 表示无板块上下文（个股直入 8a/8b 场景）；emotionPhase 供 N 形情绪硬闸；
+// d1 为 D1Scorer 对该股的评分（含 LLM 打分与负面阻断），eventDesc 为个股关联新闻标题（供 D1 YAML 兜底），
+// pe 为个股PE（供 D3 超跌评分），两者仅 N 形战法消费，其他战法忽略。
+func evalFor(runner StrategyRunner, code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, emotionPhase string, d1 *D1Score, eventDesc string, pe float64) (*strategy.Evaluation, error) {
 	// 行情数据缺失时回退到策略的默认评估接口（各战法自行处理 nil 行情）
 	if md == nil {
 		return runner.Strategy.Evaluate(code, md)
@@ -157,8 +159,8 @@ func evalFor(runner StrategyRunner, code string, md *strategy_engine.StockMarket
 		// 龙回头：从日K派生首轮涨幅/回调/缩量输入
 		return st.Evaluate(code, dragonReturnDataFromMarketData(code, md, sector))
 	case *n_shape.NShapeStrategy:
-		// N形：日K A波 + 日内快照 B段 + 上下文（含情绪硬闸）
-		return st.EvaluateWave(buildWaveA(md, sector), buildIntradayB(md), buildCtx(md, emotionPhase))
+		// N形：日K A波 + 日内快照 B段 + 上下文（含情绪硬闸 + D1 事件 + PE）
+		return st.EvaluateWave(buildWaveA(md, sector), buildIntradayB(md), buildCtx(md, emotionPhase, d1, eventDesc, pe))
 	default:
 		// 未知/未特化策略 → 回退到策略默认评估接口
 		return runner.Strategy.Evaluate(code, md)

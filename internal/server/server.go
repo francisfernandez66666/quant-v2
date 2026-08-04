@@ -48,10 +48,11 @@ type Server struct {
 	mux         *http.ServeMux                     // 路由注册表
 	market      *data.MarketAPI                    // 行情数据 API（实时报价/板块/IPO 等）
 	ths         *data.THSClient                    // 同花顺客户端（板块行情表）
+	fetcher     *data.Fetcher                      // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
 	watchlist   *data.WatchlistManager             // 自选股管理器
 	sse         *SSEBroker                         // SSE 事件广播器（向前端实时推送）
 	startTime   time.Time                          // 服务启动时间（用于 uptime 统计）
-	llmRecreate func(apiKey, apiURL, model string) // 热重建 LLM 客户端
+	llmRecreate func(apiKey, apiURL, model string, timeoutSec int) // 热重建 LLM 客户端
 	ctrl        EngineController                   // 引擎控制面（做多/做空开关、流水线调试数据等）
 
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
@@ -70,7 +71,10 @@ type Server struct {
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
-func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string)) { s.llmRecreate = fn }
+func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int)) { s.llmRecreate = fn }
+
+// SetFetcher 注入 5s 实时行情采集器（报价接口优先读快照，缺失再降级拉取）。
+func (s *Server) SetFetcher(f *data.Fetcher) { s.fetcher = f }
 
 // SetEngineController 设置引擎控制器。
 func (s *Server) SetEngineController(c EngineController) { s.ctrl = c }
@@ -683,9 +687,10 @@ func (s *Server) handleSetD1Config(w http.ResponseWriter, r *http.Request) {
 
 // setLLMConfigReq LLM 配置请求体：APIKey 可选（不修改时留空），APIURL 与 Model 必填。
 type setLLMConfigReq struct {
-	APIKey string `json:"api_key,omitempty"`
-	APIURL string `json:"api_url"`
-	Model  string `json:"model"`
+	APIKey    string `json:"api_key,omitempty"`
+	APIURL    string `json:"api_url"`
+	Model     string `json:"model"`
+	TimeoutSec int   `json:"timeout_sec"` // 单次请求超时（秒），缺省 0
 }
 
 // handleGetLLMConfig 处理 GET /api/config/llm：返回 API 地址与运行时实际生效的模型名。
@@ -709,8 +714,9 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	// 保存 APIURL + Model 到 config.json
 	s.cfg.SetLLMConfig(&config.LLMConfig{
-		APIURL: req.APIURL,
-		Model:  req.Model,
+		APIURL:     req.APIURL,
+		Model:      req.Model,
+		TimeoutSec: req.TimeoutSec,
 	})
 
 	// 保存 APIKey 到 auth config
@@ -727,7 +733,7 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 				key = v
 			}
 		}
-		s.llmRecreate(key, req.APIURL, req.Model)
+		s.llmRecreate(key, req.APIURL, req.Model, req.TimeoutSec)
 	}
 
 	// 记录运行时实际生效的 model（空值会被 llm 客户端按默认模型兜底）

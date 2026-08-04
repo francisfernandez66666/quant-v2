@@ -55,6 +55,37 @@ type MarketAPI struct {
 
 	quoteMu    sync.Mutex
 	quoteCache map[string]cachedQuote // 实时行情 TTL 缓存
+
+	peMu   sync.Mutex              // 保护 PE 缓存的读写
+	peTTL  time.Duration           // PE 缓存有效期（PE 变动低频）
+	peMap  map[string]peCacheEntry // code → PE 缓存条目
+}
+
+// peCacheEntry PE 缓存条目。
+type peCacheEntry struct {
+	pe float64   // 动态市盈率
+	at time.Time // 缓存写入时间
+}
+
+// getPECache 读取 PE 缓存，命中且在有效期内返回 true。
+func (m *MarketAPI) getPECache(code string) (float64, bool) {
+	m.peMu.Lock()
+	defer m.peMu.Unlock()
+	e, ok := m.peMap[code]
+	if !ok || time.Since(e.at) > m.peTTL {
+		return 0, false
+	}
+	return e.pe, true
+}
+
+// setPECache 写入 PE 缓存。
+func (m *MarketAPI) setPECache(code string, pe float64) {
+	m.peMu.Lock()
+	defer m.peMu.Unlock()
+	if m.peMap == nil {
+		m.peMap = make(map[string]peCacheEntry)
+	}
+	m.peMap[code] = peCacheEntry{pe: pe, at: time.Now()}
 }
 
 // quoteTTL 实时行情缓存有效期：同一股票在窗口内只打一次网络，
@@ -86,6 +117,8 @@ func NewMarketAPI() *MarketAPI {
 	return &MarketAPI{
 		client:     &http.Client{Timeout: 10 * time.Second},
 		quoteCache: make(map[string]cachedQuote),
+		peMap:      make(map[string]peCacheEntry),
+		peTTL:      10 * time.Minute,
 	}
 }
 
@@ -1302,6 +1335,46 @@ type stockRawItem struct {
 	Name string  `json:"f14"` // 股票名称
 	PE   float64 `json:"f9"`  // 市盈率
 	MCap float64 `json:"f20"` // 总市值
+}
+
+// GetStockPE 获取单只个股的动态市盈率（PE-TTM）。
+// 通过东财 clist 接口按证券ID单查（fields=f9 市盈率），失败返回 0（调用方按无PE处理）。
+// 带独立 TTL 缓存（PE 变动低频），避免高频调用撞东财限流。
+func (m *MarketAPI) GetStockPE(code string) float64 {
+	code = stripSuffix(code)
+	if code == "" {
+		return 0
+	}
+	if v, ok := m.getPECache(code); ok {
+		return v
+	}
+
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:%s&fields=f12,f14,f9", secID(code))
+	EastMoneyLimiter.Wait()
+	resp, err := m.getWithHeaders(url, emReferer)
+	if err != nil {
+		log.Printf("[stockpe] 获取 %s 失败: %v", code, err)
+		return 0
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0
+	}
+	var raw struct {
+		Data *struct {
+			Diff []stockRawItem `json:"diff"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil || raw.Data == nil || len(raw.Data.Diff) == 0 {
+		return 0
+	}
+	item := raw.Data.Diff[0]
+	if item.PE <= 0 {
+		return 0
+	}
+	m.setPECache(code, item.PE)
+	return item.PE
 }
 
 // GetStockList 获取全量 A 股列表（代码+名称）。

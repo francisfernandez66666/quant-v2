@@ -46,7 +46,8 @@ func buildWaveA(md *strategy_engine.StockMarketData, sector *sector_agent.Verifi
 }
 
 // buildIntradayB 从实时量价快照 + 分钟MACD 构造日内快照（B段）。
-// 竞价数据仅盘前可得，此处置零降级（D2 相对强度偏低但 N 形仍出总分）。
+// 竞价数据仅盘前可得：开盘竞价涨跌幅用 Quote.Open 对前日收盘计算（非零时填充），
+// 竞价量/趋势在非竞价时段无法回溯，置零降级（D2 相对强度偏低但 N 形仍出总分）。
 func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 	ib := &n_shape.IntradayB{}
 	kl := md.KLines
@@ -65,6 +66,12 @@ func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 		ib.PrevHigh = prev.High
 		ib.PrevLow = prev.Low
 	}
+	// 基准指数当前涨跌幅（N 形 D2 相对强度对比），无数据时为 0
+	ib.BenchCurChg = md.BenchChg
+	// 开盘竞价涨跌幅：Quote.Open 相对前日收盘（%）
+	if q := md.Quote; q != nil && q.Open > 0 && ib.PrevClose > 0 {
+		ib.AuctionChgPct = (q.Open - ib.PrevClose) / ib.PrevClose * 100
+	}
 	ib.AvgDailyVol = avgVol(kl[:len(kl)], 20)
 	// 分钟级 MACD 三值直接透传，供 B 段多头/红柱判断
 	ib.MinuteMACDDIF = md.MinuteMACD.DIF
@@ -73,10 +80,18 @@ func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 	return ib
 }
 
-// buildCtx 构造 N 形评分上下文：情绪阶段 + 20日均量。
+// buildCtx 构造 N 形评分上下文：情绪阶段 + 20日均量 + D1 事件评分。
 // emotionPhase 供情绪硬闸（如冰点禁开仓）使用；均量为波动率/强度参考。
-func buildCtx(md *strategy_engine.StockMarketData, emotionPhase string) *n_shape.Ctx {
-	ctx := &n_shape.Ctx{EmotionPhase: emotionPhase}
+// d1 为 D1Scorer 批量评分结果（LLM 0~1 分 + 负面阻断标记），nil 表示本轮无 D1 数据；
+// eventDesc 为个股关联新闻标题（供 calcD1 的 YAML 负面阻断 + LLM 评分三段式）；
+// pe 为个股市盈率（供 D3 超跌评分，<=0 时走斐波那契兜底）。
+func buildCtx(md *strategy_engine.StockMarketData, emotionPhase string, d1 *D1Score, eventDesc string, pe float64) *n_shape.Ctx {
+	ctx := &n_shape.Ctx{EmotionPhase: emotionPhase, EventDesc: eventDesc, StockPE: pe}
+	if d1 != nil {
+		// LLM 评分 0~1 映射到 D1（calcD1 内部 ×MaxD1）；负面阻断标记透传
+		ctx.LLMD1Score = d1.Score
+		ctx.LLMBlocked = d1.Blocked
+	}
 	if md != nil {
 		ctx.AvgDailyVol = avgVol(md.KLines, 20)
 	}

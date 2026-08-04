@@ -38,6 +38,7 @@ type StockMarketData struct {
 	Quote       *data.StockInfo   `json:"quote,omitempty"`        // 实时量价快照（新浪批量/同花顺兜底）
 	MinuteKLine []data.KLine      `json:"minute_kline,omitempty"` // 分钟K线（5分钟，用于 MACD/动量）
 	MinuteMACD  data.MACD         `json:"minute_macd,omitempty"`  // 分钟级 MACD（DIF/DEA/Bar）
+	BenchChg    float64           `json:"bench_chg,omitempty"`    // 基准指数（上证）当前涨跌幅（%，供 N 形 D2 相对强度对比）
 	Error       string            `json:"error,omitempty"`        // 行情获取错误信息（非空表示该股行情缺失）
 }
 

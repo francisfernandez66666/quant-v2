@@ -10,7 +10,7 @@
 //   - D4 资金确认（满分 10）：MACD 水上金叉 + 当日量能放大至 20 日均量 1.5 倍以上
 //
 // 信号生成阈值：
-//   - full_chain（完整链）：D1≥40 且总分≥60 且 D2≥15 → 买入
+//   - full_chain（完整链）：D1>0 且总分≥60 → 买入
 //   - 置信度 ≥0.8 → P1；≥0.6 → P2；其余 P3
 //   - 左侧一突信号（价格突破前高×1.005 且量比≥1.8）提升优先级至至少 P2
 //
@@ -64,7 +64,7 @@ func (n *NShapeStrategy) EvaluateWave(wa *WaveA, ib *IntradayB, ctx *Ctx) (*stra
 		return &strategy.Evaluation{Pass: false, Level: "noscore"}, nil
 	}
 
-	// 仅当 Valid（D1>0 且 总分≥60 且 D2≥15）时才标记为 full_chain
+	// 仅当 Valid（D1>0 且 总分≥60）时才标记为 full_chain
 	level := "fail"
 	if sr.Valid {
 		level = "full_chain"

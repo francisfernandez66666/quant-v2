@@ -457,6 +457,9 @@ type llmCalls struct {
 	stage0 []string
 	stage2 []string
 	d1     []string
+
+	// failD1 置为 true 后，mock 对 D1 评分请求返回 500，用于验证 D1 失败回退上一轮评分。
+	failD1 bool
 }
 
 // newMockLLMServer 启动按 system prompt 区分的 mock LLM 服务。
@@ -491,6 +494,11 @@ func newMockLLMServer() (*httptest.Server, *llmCalls) {
 			content = mockStage0JSON(user)
 		case strings.Contains(system, "D1事件评分"):
 			calls.d1 = append(calls.d1, user)
+			if calls.failD1 {
+				// 模拟 D1 LLM 整批失败（500）：触发 BatchScore 轮询重试后回退上一轮评分
+				http.Error(w, "mock D1 LLM failure", 500)
+				return
+			}
 			content = mockD1JSON(user)
 		case strings.Contains(system, "热点分析专家"):
 			calls.stage2 = append(calls.stage2, user)

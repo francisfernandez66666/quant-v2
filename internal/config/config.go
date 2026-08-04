@@ -77,8 +77,9 @@ type MainSectorConfig struct {
 
 // LLMConfig LLM 客户端连接配置。
 type LLMConfig struct {
-	APIURL string `json:"api_url"` // LLM API 地址
-	Model  string `json:"model"`   // 模型名称
+	APIURL    string `json:"api_url"`     // LLM API 地址
+	Model     string `json:"model"`       // 模型名称
+	TimeoutSec int   `json:"timeout_sec"` // 单次请求超时（秒），缺省 60
 }
 
 // TradeTimeConfig 交易时段参数（HHMM 整数格式）。

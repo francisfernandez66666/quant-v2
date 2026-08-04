@@ -87,6 +87,7 @@ func main() {
 	if llmCfg.Model == "" {
 		llmCfg.Model = cfgMgr.Rules.LLM.Model
 	}
+	llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
 	var llmClient *llm.Client
@@ -147,10 +148,10 @@ func main() {
 	eng.SetScanner(scanner)
 	srv.SetEngineController(eng)
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程
-	srv.SetLLMRecreate(func(apiKey, apiURL, model string) {
-		lc := llm.New(llm.Config{APIKey: apiKey, APIURL: apiURL, Model: model})
+	srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int) {
+		lc := llm.New(llm.Config{APIKey: apiKey, APIURL: apiURL, Model: model, Timeout: time.Duration(timeoutSec) * time.Second})
 		eng.SetLLMClient(lc)
-		log.Printf("[LLM] 客户端已热重建: model=%s url=%s", model, apiURL)
+		log.Printf("[LLM] 客户端已热重建: model=%s url=%s timeout=%ds", model, apiURL, timeoutSec)
 	})
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
@@ -158,6 +159,7 @@ func main() {
 	fetcher := data.NewFetcher(baseStocks, marketAPI, data.NewDataCoordinator(marketAPI, thsClient))
 	go fetcher.Start()
 	defer fetcher.Stop()
+	srv.SetFetcher(fetcher) // 报价接口优先读 5s 快照，缺失再降级拉取
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
 
 	// 实时触发引擎（daban式放量急拉检测，SSE 推送）

@@ -28,6 +28,7 @@ type ScanInput struct {
 	IndividualStocks []string                                    // 个股直接输入（跳过板块验证）
 	MarketData       map[string]*strategy_engine.StockMarketData // 行情数据（Engine传过来）
 	D1Scores         map[string]D1Score                          // D1评分结果
+	PE               map[string]float64                          // code → 个股动态市盈率（N 形 D3 用，Engine 预取）
 	LimitUpPool      []data.LimitUpStock                         // 当日涨停池（龙头识别/涨停分类）
 	News             map[string][]NewsBrief                      // code → 关联新闻简报（预期差）
 	Scores           map[string]StockScores                      // 8a/8b 打分输出（engine 初始化，扫描写入）

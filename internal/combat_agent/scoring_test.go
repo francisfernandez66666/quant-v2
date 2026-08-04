@@ -94,7 +94,7 @@ func TestNShapeScoreAlwaysReturns(t *testing.T) {
 	if ib == nil || ib.CurPrice <= 0 {
 		t.Fatalf("IntradayB 应有当前价: %+v", ib)
 	}
-	ctx := buildCtx(md, "")
+	ctx := buildCtx(md, "", nil, "", 0)
 	if ctx == nil {
 		t.Fatalf("Ctx 不应为 nil")
 	}
@@ -105,7 +105,7 @@ func TestNShapeScoreAlwaysReturns(t *testing.T) {
 func TestEvalForNShape(t *testing.T) {
 	cfg := config.NewManager(filepath.Join(t.TempDir(), "config.json"))
 	ns := n_shape.New(cfg, nil)
-	eval, err := evalFor(StrategyRunner{Type: "n_shape", Strategy: ns}, "600000", mkBullMarketData(), nil, "")
+	eval, err := evalFor(StrategyRunner{Type: "n_shape", Strategy: ns}, "600000", mkBullMarketData(), nil, "", nil, "", 0)
 	if err != nil {
 		t.Fatalf("evalFor nshape err: %v", err)
 	}
@@ -113,6 +113,35 @@ func TestEvalForNShape(t *testing.T) {
 		t.Fatalf("evalFor nshape 返回 nil")
 	}
 	_ = eval.TotalScore
+}
+
+// TestBuildCtxD1Propagation 验证 D1 评分透传：buildCtx 收到非零 D1Score 时
+// 应写入 ctx.LLMD1Score/LLMBlocked，calcD1 据此产出 d1>0（断链修复的核心断言）。
+func TestBuildCtxD1Propagation(t *testing.T) {
+	md := mkBullMarketData()
+	// 1) 无 D1 → LLMD1Score 保持 0（缺省路径）
+	ctx := buildCtx(md, "", nil, "", 0)
+	if ctx.LLMD1Score != 0 || ctx.LLMBlocked {
+		t.Fatalf("无D1时 LLMD1Score/Blocked 应为零, got %.2f/%v", ctx.LLMD1Score, ctx.LLMBlocked)
+	}
+	// 2) 有正向 D1 → LLMD1Score 透传
+	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: 0.5, Blocked: false}, "利好事件", 0)
+	if ctx.LLMD1Score != 0.5 || ctx.LLMBlocked {
+		t.Fatalf("D1=0.5 应透传, got %.2f/%v", ctx.LLMD1Score, ctx.LLMBlocked)
+	}
+	if ctx.EventDesc != "利好事件" {
+		t.Fatalf("EventDesc 未透传: %q", ctx.EventDesc)
+	}
+	// 3) 负面阻断 D1 → LLMBlocked 透传
+	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: 0, Blocked: true}, "", 0)
+	if !ctx.LLMBlocked {
+		t.Fatal("Blocked 应透传")
+	}
+	// 4) PE 透传（D3 超跌评分用）
+	ctx = buildCtx(md, "", nil, "", 15.5)
+	if ctx.StockPE != 15.5 {
+		t.Fatalf("StockPE 未透传: %.2f", ctx.StockPE)
+	}
 }
 
 // failStrategy 恒不通过的战法桩（用于隔离测试动量信号的补发逻辑）。
@@ -143,7 +172,7 @@ func TestScorePoolMomentumSignal(t *testing.T) {
 	if MomentumScore(md, mc.Momentum) < 60 {
 		t.Fatalf("测试数据动量分不足60, 无法触发信号")
 	}
-	scores, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": md}, "")
+	scores, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": md}, nil, "")
 
 	sc, ok := scores["600000"]
 	if !ok {
@@ -171,7 +200,7 @@ func TestScorePoolMomentumBelowThreshold(t *testing.T) {
 		Price: 10,
 		Quote: &data.StockInfo{Price: 10, Volume: 100},
 	}
-	_, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": muted}, "")
+	_, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": muted}, nil, "")
 	for _, s := range sigs {
 		if s.Strategy == "动量" {
 			t.Fatalf("低动量不应发信号: %+v", s)

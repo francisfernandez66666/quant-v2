@@ -9,6 +9,7 @@ package combat_agent
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -184,6 +185,17 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		input.Scores = make(map[string]StockScores)
 	}
 	sc := StockScores{Code: code, DataGaps: make(map[string]bool)}
+	// 提取 N 形战法消费的 D1 评分 / 事件描述 / PE（仅一次，供各战法共享）
+	var d1 *D1Score
+	if ds, ok := input.D1Scores[code]; ok {
+		d1 = &ds
+	}
+	eventDesc := strings.Join(newsTitlesOf(input.News, code), "；")
+	// PE 由上层 Engine 预取填充（input.PE 为空表示该股无 PE，N 形 D3 走斐波那契兜底）
+	var pe float64
+	if input.PE != nil {
+		pe = input.PE[code]
+	}
 	var sigs []Signal
 	for _, runner := range runners {
 		// 策略实例为空则跳过该运行器
@@ -191,7 +203,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			continue
 		}
 		// 按战法类型分发到真实评分逻辑（adapter.go evalFor）
-		eval, err := evalFor(runner, code, md, sector, input.EmotionPhase)
+		eval, err := evalFor(runner, code, md, sector, input.EmotionPhase, d1, eventDesc, pe)
 		// 评分失败或返回空结果 → 该战法视为 0 分，不产出信号；同时标记数据缺口
 		if err != nil || eval == nil {
 			markDataGap(&sc, runner.Type, md)
@@ -274,9 +286,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 // ScorePool 近实时 8a/8b 持续打分入口：对打分池（持仓+自选）逐只执行四战法评分 + 动量分，
 // 无论是否通过都记录原始分；Pass 的战法生成信号返回（由调用方决定是否广播）。
 // 与 ScanLong/ScanShort 共用 evalAll，保证打分口径一致。
-// 入参 codes 为打分池代码列表，md 为行情映射，emotionPhase 供 N 形情绪硬闸使用。
+// 入参 codes 为打分池代码列表，md 为行情映射，d1Scores 为最近一轮 D1 评分缓存
+// （主循环产出，近实时循环复用，不每 5s 调 LLM），emotionPhase 供 N 形情绪硬闸使用。
 // 返回 scores（code → 各战法原始分）与 sigs（本轮通过战法产生的信号）。
-func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMarketData, emotionPhase string) (map[string]StockScores, []Signal) {
+func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMarketData, d1Scores map[string]D1Score, emotionPhase string) (map[string]StockScores, []Signal) {
 	a.mu.RLock()
 	runners := a.runners
 	a.mu.RUnlock()
@@ -284,8 +297,8 @@ func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMa
 		return nil, nil
 	}
 	scores := make(map[string]StockScores, len(codes))
-	// 组装最小化 ScanInput：个股直入（无板块上下文）、打分池行情、情绪阶段
-	input := &ScanInput{MarketData: md, Scores: scores, EmotionPhase: emotionPhase}
+	// 组装最小化 ScanInput：个股直入（无板块上下文）、打分池行情、D1 评分缓存、情绪阶段
+	input := &ScanInput{MarketData: md, Scores: scores, D1Scores: d1Scores, EmotionPhase: emotionPhase}
 	now := time.Now()
 	var sigs []Signal
 	for _, code := range codes {

@@ -476,6 +476,49 @@ func TestEndToEndFullPipeline(t *testing.T) {
 		}
 	})
 
+	t.Run("N形D1链路", func(t *testing.T) {
+		// 链路验证：D1 评分(LLM) → buildCtx 透传 → calcD1(d1>0) 进入总分 → 闸门(D1>0 且 Total≥60) → 信号。
+		// 改前 buildCtx 不读 D1Scores，d1 恒 0 永不进入总分/永不 Valid；改后 mock D1=0.3 应使 300308 的 NScore>0。
+		if len(rig.calls.d1) == 0 {
+			t.Error("D1 批量评分 LLM 未被调用（链路在 D1Scorer 处断裂）")
+		}
+		// 1) 300308 应被 D1 评分（mock 返回非零分）
+		d1Found := false
+		for _, d1call := range rig.calls.d1 {
+			if strings.Contains(d1call, "300308") {
+				d1Found = true
+				break
+			}
+		}
+		if !d1Found {
+			t.Error("300308 未出现在 D1 评分批次中")
+		}
+		// 2) N 形战法应对 300308 打分，且总分 >0（证明 D1 分数已透传入评分，而非断链恒 0）
+		sc, ok := dash.Scores["300308"]
+		if !ok {
+			t.Errorf("300308 无 8a/8b 打分记录（DataGaps=%v）", sc.DataGaps)
+		} else {
+			t.Logf("300308 NScore=%.0f 缺口=%v", sc.NScore, sc.DataGaps)
+			if sc.NScore <= 0 {
+				t.Errorf("300308 NScore 应>0（D1 已透传）, got %.0f（DataGaps=%v）", sc.NScore, sc.DataGaps)
+			}
+		}
+		// 3) 门控断言（本轮 N 形门槛放开后）：fixture 上 300308 D1=0.3 已进总分，
+		//    但 Total=15<60（D2/D3/D4 凑分不足），闸门必须拦截 → 无 N 形信号。
+		//    这正好覆盖强断言场景"D1 有分但总分<60 → 不出信号"（另见 n_shape_gate_test.go 三场景）。
+		var nSig int
+		for _, s := range dash.FinalSignals {
+			if s.Strategy == "n_shape" && s.Direction == "做多" {
+				nSig++
+				t.Logf("N形信号 %s(%s) 分=%.0f %s", s.Code, s.Name, s.Confidence*100, s.Reason)
+			}
+		}
+		t.Logf("N形做多信号数=%d（fixture 300308 Total=15<60，闸门拦截预期=0）", nSig)
+		if nSig != 0 {
+			t.Errorf("fixture 300308 Total<60 不应产出 N 形信号, got %d（D1 已透传但总分闸门应拦截）", nSig)
+		}
+	})
+
 	t.Run("东财板块列表", func(t *testing.T) {
 		boards, err := rig.market.GetSectorList()
 		if err != nil {

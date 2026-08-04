@@ -15,7 +15,7 @@ import (
 
 // Client LLM API 客户端，封装与 SiliconFlow 对话接口的通信。
 type Client struct {
-	httpClient *http.Client // HTTP 客户端（30s 超时，禁用 HTTP2 强制走 HTTP1.1）
+	httpClient *http.Client // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
 	apiKey     string       // API 密钥（Authorization: Bearer）
 	apiURL     string       // chat/completions 请求地址
 	model      string       // 模型名称
@@ -24,20 +24,29 @@ type Client struct {
 // DefaultModel 未显式指定模型时的默认模型。
 const DefaultModel = "THUDM/GLM-Z1-9B-0414"
 
+// DefaultTimeout 未显式指定超时时的默认单次请求超时（慢 LLM 响应兜底）。
+const DefaultTimeout = 60 * time.Second
+
+// Timeout 返回客户端单次请求超时时间（供配置校验/展示）。
+func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
+
 // New 创建 LLM 客户端。
 func New(cfg Config) *Client {
-	// 未指定地址/模型时填充默认值，保证客户端可直接使用
+	// 未指定地址/模型/超时时填充默认值，保证客户端可直接使用
 	if cfg.APIURL == "" {
 		cfg.APIURL = "https://api.siliconflow.cn/v1/chat/completions"
 	}
 	if cfg.Model == "" {
 		cfg.Model = DefaultModel
 	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = DefaultTimeout
+	}
 
-	// 30s 超时；禁用 HTTP2（ForceAttemptHTTP2=false），强制走 HTTP1.1 规避连接复用问题
+	// 可配置超时；禁用 HTTP2（ForceAttemptHTTP2=false），强制走 HTTP1.1 规避连接复用问题
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: cfg.Timeout,
 			Transport: &http.Transport{
 				ForceAttemptHTTP2: false,
 			},

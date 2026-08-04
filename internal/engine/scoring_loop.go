@@ -56,6 +56,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	e.mu.RLock()
 	f := e.fetcher
 	emotionPhase := e.lastEmotionPhase // 复用主循环算出的情绪阶段，不重复调涨停池接口
+	d1Scores := e.lastD1Scores         // 复用主循环最近一轮 D1 评分，不每 5s 调 LLM
 	e.mu.RUnlock()
 	if f == nil {
 		return
@@ -76,7 +77,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	}
 
 	md := e.strategy.BuildScoringData(ctx, pool, quotes)
-	scores, sigs := e.combatAgent.ScorePool(pool, md, emotionPhase)
+	scores, sigs := e.combatAgent.ScorePool(pool, md, d1Scores, emotionPhase)
 
 	// 状态翻转去重：仅 非Pass→Pass 翻转的信号广播；持续 Pass 不重发；翻回后再翻上会再发。
 	e.mu.RLock()

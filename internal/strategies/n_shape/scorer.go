@@ -12,7 +12,7 @@
 //     ① 集合竞价涨幅（15分）：+1.5%~+5% 最佳（15分），>5% 次之（10分），低开微涨（2分）
 //     ② 量比（8分）：1.2~1.8 得4分，1.8~3.0 得8分，>3.0 得3分（过高说明一致性太强）
 //     ③ 超额收益（7分）：（个股涨幅-基准涨幅）/ 3%，上限7分
-//     阈值：D2 ≥ 15 才构成完整链（full_chain）
+//     软门槛：D2 仅贡献总分，不单独拦截信号。
 //
 //   - D3 超跌确认（20分）：判断回调深度是否到位。
 //     有PE数据时：PE<15 满20分，<30 得10分，<50 得5分，>50 不计分。
@@ -23,7 +23,7 @@
 //     MACD水上（DIF>DEA且DIF>0）：5分
 //     当日累计量 > 20日均量×1.5（按时间进度折算）：5分
 //
-// 评分始终计算（D1不足时也出总分），信号硬闸门：D1>0 且 总分≥60 且 D2≥15 → Valid=true → 才生成信号
+// 评分始终计算（D1不足时也出总分），信号硬闸门：D1>0 且 总分≥60 → Valid=true → 才生成信号
 // 时间衰减：10:00后优先级降低，14:30后再降低。
 // 情绪否决："衰退"阶段禁止入场；"退潮"减30基础分；"高潮"减20基础分。
 package n_shape
@@ -44,8 +44,6 @@ const (
 	Threshold  = 60.0 // 总分通过阈值（需≥60 才视为有效信号）
 	StrongMin  = 80   // 高优先级基础分阈值（≥80 可开仓）
 	ObserveMin = 40   // 可观察最低基础分（<40 直接 mute）
-
-	D2FullThreshold = 15.0 // D2 完整链阈值（需要 ≥15 才算完整信号）
 )
 
 // 时间窗口定义（HHMM 整数格式，用于优先级计算）。
@@ -200,7 +198,7 @@ type ScoreResult struct {
 	D3Pullback  float64  `json:"d3"`               // D3 超跌确认得分（0~20）
 	D4Accept    float64  `json:"d4"`               // D4 资金确认得分（0~10）
 	Total       float64  `json:"total"`            // 总分（D1+D2+D3+D4，0~100）
-	Valid       bool     `json:"valid"`            // 是否有效信号（D1=40 且 总分≥60 且 D2≥15）
+	Valid       bool     `json:"valid"`            // 是否有效信号（D1>0 且 总分≥60）
 	Priority    int      `json:"priority"`         // 时间优先级分数（0~100）
 	RemindLevel string   `json:"remind"`           // 提醒级别（strong/observe/mute）
 	CanOpen     bool     `json:"can_open"`         // 是否允许开仓
@@ -238,7 +236,7 @@ func NewLeftSideScorer(matcher *data.EventMatcher) *LeftSideScorer {
 //  5. D2 相对强度评分（集合竞价+量比+超额收益）
 //  6. D3 超跌评分（PE 或斐波那契深度）
 //  7. D4 资金评分（MACD+量能）
-//  8. 计算总分，判断 full_chain 有效性（D1>0 且 总分≥60 且 D2≥15）
+//  8. 计算总分，判断 full_chain 有效性（D1>0 且 总分≥60）
 //  9. 10:00 后降级处理
 //  10. 左侧一突信号检测
 func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResult {
@@ -297,19 +295,20 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 
 	res.Total = res.D1Event + res.D2RS + res.D3Pullback + res.D4Accept
 
-	// 评分始终计算，但信号硬闸门：D1>0 且 总分≥60 且 D2≥15 才 Valid
-	// D1 标准从 ==40 放宽到 >0，使 LLM 打分的个股也能通过闸门。
-	if d1 > 0 && res.Total >= Threshold && d2 >= D2FullThreshold {
+	// 评分始终计算，但信号硬闸门：D1>0 且 总分≥60 才 Valid
+	// D1 标准从 ==40 放宽到 >0，使 LLM 打分的个股也能通过闸门；
+	// D2/D3/D4 仅贡献总分（软门槛），不单独拦截信号。
+	if d1 > 0 && res.Total >= Threshold {
 		res.Valid = true
-	} else if d1 >= MaxD1 && res.Total >= Threshold && d2 < D2FullThreshold {
-		// D1 满分但 D2 相对强度不足：无法构成完整链
+	} else if d1 > 0 {
+		// D1 有分但总分不足（D2/D3/D4 凑分不够）
 		if res.Reason == "" {
-			res.Reason = "d2_below_full"
+			res.Reason = "total_below_threshold"
 		} else {
-			res.Reason += ";d2_below_full"
+			res.Reason += ";total_below_threshold"
 		}
-	} else if d1 < MaxD1 {
-		// D1 未满分（事件强度不足）
+	} else {
+		// D1 未满分（事件强度不足），无 D1 分无信号
 		if res.Reason == "" {
 			res.Reason = "d1_not_full"
 		} else {
