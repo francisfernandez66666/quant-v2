@@ -273,7 +273,8 @@ func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
 // ── 东方财富 push2 实时行情 ──
 
 // stockQuoteFields 东方财富 push2 个股行情字段列表。
-const stockQuoteFields = "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f60,f116,f117,f162,f167,f168,f169,f170,f171,f292"
+// 注意：主力净流入是 f62，不是 f162（f162 在 stock/get 单股接口中为动态市盈率）。
+const stockQuoteFields = "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f60,f62,f116,f117,f167,f168,f169,f170,f171,f292"
 
 // GetRealtimeQuote 获取实时行情。先尝试东方财富 push2，失败时回退到新浪。
 // 结果按 quoteTTL 短期缓存，同一股票在窗口内的重复请求直接命中缓存。
@@ -349,7 +350,7 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 			F168 float64 `json:"f168"` // 换手率 ×100
 			F169 float64 `json:"f169"` // 涨跌额 ×100
 			F170 float64 `json:"f170"` // 涨跌幅 ×100
-			F162 float64 `json:"f162"` // 主力净流入
+			F62  float64 `json:"f62"`  // 主力净流入（元）
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -370,7 +371,7 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 		Amount:    raw.Data.F49,
 		ChangePct: raw.Data.F170 / 100,
 		Turnover:  raw.Data.F168 / 100,
-		NetInflow: raw.Data.F162,
+		NetInflow: raw.Data.F62,
 	}, nil
 }
 

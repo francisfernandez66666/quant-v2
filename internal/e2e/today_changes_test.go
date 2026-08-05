@@ -185,8 +185,9 @@ func TestConsultMultipleStocks(t *testing.T) {
 	}
 }
 
-// TestConsultRealtimeQuoteF162 通过东财 emStockGet f162 验证净流入 -2.22亿 可被 GetRealtimeQuote 读取。
-func TestConsultRealtimeQuoteF162(t *testing.T) {
+// TestConsultRealtimeQuoteNetInflow 通过东财 emStockGet f62 验证净流入 -2.22亿 可被 GetRealtimeQuote 读取。
+// 东财单股接口主力净流入字段为 f62（f162 是动态市盈率）。
+func TestConsultRealtimeQuoteNetInflow(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
@@ -236,5 +237,106 @@ func TestConsultTimeInjected(t *testing.T) {
 	now := time.Now().Format("2006-01-02")
 	if !strings.Contains(ctx, "数据获取时间 "+now) {
 		t.Errorf("context 应含今日时间戳 %q\n---context---\n%s", now, ctx)
+	}
+}
+
+// TestConsultSingleSystemFirst 发送给模型的消息必须只有一条 system 且位于最前，
+// 专业模式的实时行情上下文并入该条 system（避免多条/中途 system 导致模型回答跑偏）。
+func TestConsultSingleSystemFirst(t *testing.T) {
+	data.DisableAll = true
+	defer func() { data.DisableAll = false }()
+
+	rig := newTestEngine(t, loadTodayFixture(t))
+	_ = todayConsult(t, rig, "卧龙电驱(600580) 今天主力净流入多少？", true)
+	if len(rig.calls.consultMsgs) == 0 {
+		t.Fatal("mock 未记录咨询消息序列")
+	}
+	msgs := rig.calls.consultMsgs[len(rig.calls.consultMsgs)-1]
+	if len(msgs) == 0 || msgs[0].Role != "system" {
+		t.Fatalf("首条消息应为 system, got %+v", msgs[0])
+	}
+	sysCnt := 0
+	for i, m := range msgs {
+		if m.Role == "system" {
+			sysCnt++
+			if i != 0 {
+				t.Errorf("system 消息应只位于最前(位置0), 但出现在位置%d", i)
+			}
+		}
+	}
+	if sysCnt != 1 {
+		t.Errorf("应仅1条 system 消息, got %d", sysCnt)
+	}
+	// 实时行情上下文应并入该条 system
+	if !strings.Contains(msgs[0].Content, "现价 36.86") || !strings.Contains(msgs[0].Content, "-22200.00万元") {
+		t.Errorf("实时行情应并入 system 消息\n---system---\n%s", msgs[0].Content)
+	}
+	// 最后一条是当前 user 提问
+	last := msgs[len(msgs)-1]
+	if last.Role != "user" || !strings.Contains(last.Content, "600580") {
+		t.Errorf("最后一条应为当前 user 提问, got %+v", last)
+	}
+}
+
+// TestConsultHistoryLimitedTo6Rounds 多轮历史上限为最近 6 条消息（约 3 组问答），
+// 连续多轮咨询后，发送给模型的历史仅保留最近 6 条 + 当前提问。
+func TestConsultHistoryLimitedTo6Rounds(t *testing.T) {
+	data.DisableAll = true
+	defer func() { data.DisableAll = false }()
+
+	rig := newTestEngine(t, loadTodayFixture(t))
+	// 连续 8 轮咨询填充历史（每轮写入 1 条 user + 1 条 assistant，共 16 条历史）
+	for i := 0; i < 8; i++ {
+		if _, err := rig.eng.ConsultLLM("tester", "第"+string(rune('A'+i))+"轮问题", false); err != nil {
+			t.Fatalf("第%d轮 ConsultLLM: %v", i, err)
+		}
+	}
+
+	// 第 9 轮（本轮提问），此时历史已超限
+	_ = todayConsult(t, rig, "卧龙电驱(600580) 今天主力净流入多少？", true)
+	if len(rig.calls.consultMsgs) == 0 {
+		t.Fatal("mock 未记录咨询消息序列")
+	}
+	msgs := rig.calls.consultMsgs[len(rig.calls.consultMsgs)-1]
+	// 结构：1 条 system + 历史(≤6) + 当前提问
+	history := msgs[1 : len(msgs)-1]
+	if len(history) != 6 {
+		t.Errorf("历史应截取最近 6 条, got %d 条 (消息总数 %d)", len(history), len(msgs))
+	}
+	// 最早的两轮（问题A/回答A、问题B/回答B）应被丢弃
+	joined := strings.Join(func() []string {
+		out := make([]string, len(history))
+		for i, m := range history {
+			out[i] = m.Content
+		}
+		return out
+	}(), "|")
+	if strings.Contains(joined, "第A轮问题") || strings.Contains(joined, "第B轮问题") {
+		t.Errorf("最早的历史消息应被丢弃, 保留 %q", joined)
+	}
+	// 最近几轮（问题G/回答G）应保留
+	if !strings.Contains(joined, "第G轮问题") || !strings.Contains(joined, "第G轮问题") {
+		t.Errorf("应保留最近的历史消息, got %q", joined)
+	}
+}
+
+// TestConsultNetInflowMissingHint 东财未返回净流入(走新浪兜底)时，上下文提示"数据源未返回"而非误导为 0。
+func TestConsultNetInflowMissingHint(t *testing.T) {
+	data.DisableAll = true
+	defer func() { data.DisableAll = false }()
+
+	fix := loadTodayFixture(t)
+	// 清空东财净流入：模拟东财未返回 f62，走新浪兜底（新浪无净流入字段 → 0）
+	fix2 := *fix
+	fix2.NetInflows = nil
+
+	rig := newTestEngine(t, &fix2)
+	_ = todayConsult(t, rig, "卧龙电驱(600580) 今天主力净流入多少？", true)
+	if len(rig.calls.consult) == 0 {
+		t.Fatal("mock 未记录咨询")
+	}
+	ctx := rig.calls.consult[len(rig.calls.consult)-1]
+	if !strings.Contains(ctx, "数据源未返回") {
+		t.Errorf("净流入缺失时应提示数据源未返回\n---context---\n%s", ctx)
 	}
 }

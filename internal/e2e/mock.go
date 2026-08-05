@@ -244,7 +244,7 @@ func (t *fixtureTransport) emStockGet(req *http.Request) (*http.Response, error)
 		"data": map[string]interface{}{
 			"f43": price * 100, "f44": high * 100, "f45": low * 100, "f46": open * 100,
 			"f60": prev * 100, "f48": parse(8), "f49": parse(9), "f50": changePct,
-			"f57": code, "f58": name, "f170": changePct * 100, "f162": netInflow,
+			"f57": code, "f58": name, "f170": changePct * 100, "f62": netInflow,
 		},
 	})
 }
@@ -478,8 +478,17 @@ type llmCalls struct {
 	// consult 记录股票咨询请求的 system prompt（含注入的专业模式上下文）。
 	consult []string
 
+	// consultMsgs 记录每次咨询请求的完整消息序列（role 顺序），用于断言单条 system 置于最前。
+	consultMsgs [][]roleMsg
+
 	// failD1 置为 true 后，mock 对 D1 评分请求返回 500，用于验证 D1 失败回退上一轮评分。
 	failD1 bool
+}
+
+// roleContent 咨询请求中的一条消息（role + content）。
+type roleMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 // newMockLLMServer 启动按 system prompt 区分的 mock LLM 服务。
@@ -510,8 +519,13 @@ func newMockLLMServer() (*httptest.Server, *llmCalls) {
 		var content string
 		switch {
 		case strings.Contains(system, "股票投资顾问"):
-			// 股票咨询：记录注入的 system prompt（专业模式含实时行情上下文），返回确定性回复。
+			// 股票咨询：记录注入的 system prompt（专业模式含实时行情上下文）与完整消息序列，返回确定性回复。
 			calls.consult = append(calls.consult, system)
+			msgs := make([]roleMsg, 0, len(req.Messages))
+			for _, m := range req.Messages {
+				msgs = append(msgs, roleMsg{Role: m.Role, Content: m.Content})
+			}
+			calls.consultMsgs = append(calls.consultMsgs, msgs)
 			content = "已收到您的咨询。根据实测数据：卧龙电驱今日主力净流入-22200万元，现价36.86元，涨跌幅3.34%。请注意当前行情仅供分析参考，不构成投资建议。"
 		case strings.Contains(system, "质检与价值判断"):
 			calls.stage0 = append(calls.stage0, user)

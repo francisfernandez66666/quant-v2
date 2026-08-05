@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -489,9 +490,13 @@ func (e *Engine) DeleteMessage(id string) {
 
 // ── 股票咨询（多轮对话）──
 
+// consultHistoryLimit 送入模型的多轮历史上限（最近 N 条消息，约 3 组问答）。
+// 只带近期上下文，避免历史劣质回复持续污染后续判断，也降低小模型长上下文注意力漂移。
+const consultHistoryLimit = 6
+
 // ConsultLLM 以多轮对话方式调用 LLM 生成咨询回复（股票咨询页使用）。
-// 将用户提问与历史对话一并发给模型；LLM 未配置时返回错误提示前端引导配置。
-// 回复生成后同步追加到当日对话历史（跨交易日自动清空）。
+// 组装顺序：唯一一条 system（角色提示词，专业模式时并入实时行情数据）→ 历史最近 N 条 → 当前提问。
+// LLM 未配置时返回错误提示前端引导配置；回复生成后同步追加到当日对话历史（跨交易日自动清空）。
 func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error) {
 	e.mu.RLock()
 	client := e.llmClient
@@ -500,29 +505,45 @@ func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error
 		return "", fmt.Errorf("未配置 LLM_API_KEY，请先在股票咨询页配置 API Key")
 	}
 
-	// 组装多轮对话历史（此前全部 user/assistant 消息 + 本轮提问）
-	messages := make([]llm.Message, 0, 8)
+	// system 起始即角色提示词；专业模式下把实时行情上下文并入同一段 system（只保留一条 system 且置于最前）。
+	system := llm.ConsultSystemPrompt()
+	if proMode {
+		if ctx := e.buildConsultContext(userMsg); ctx != "" {
+			system += "\n\n" + ctx
+		} else {
+			system += "\n\n" + consultNoStockPrompt
+		}
+	}
+
+	// 历史：仅取最近 consultHistoryLimit 条（正序）。
+	messages := make([]llm.Message, 0, consultHistoryLimit+2)
 	if e.consultStore != nil {
-		for _, m := range e.consultStore.List() {
+		hist := e.consultStore.List()
+		if len(hist) > consultHistoryLimit {
+			hist = hist[len(hist)-consultHistoryLimit:]
+		}
+		for _, m := range hist {
 			messages = append(messages, llm.Message{Role: m.Role, Content: m.Content})
 		}
 	}
-
-	// 专业模式：解析用户提到的股票，注入真实实时行情上下文，禁止 LLM 编造数字。
-	if proMode {
-		if ctx := e.buildConsultContext(userMsg); ctx != "" {
-			messages = append(messages, llm.Message{Role: "system", Content: ctx})
-		} else {
-			messages = append(messages, llm.Message{Role: "system", Content: consultNoStockPrompt})
-		}
-	}
-
 	messages = append(messages, llm.Message{Role: "user", Content: userMsg})
 
-	reply, err := client.ChatMessages(messages)
+	// 完整消息序列：system 在最前，后接历史与当前提问。
+	msgs := append([]llm.Message{{Role: "system", Content: system}}, messages...)
+
+	reply, err := client.ChatMessages(msgs)
 	if err != nil {
 		return "", fmt.Errorf("咨询调用失败: %v", err)
 	}
+
+	// 数字审计：剔除模型编造、没有任何可信出处的金钱/数量类数字（金额、成交量、笔数等）。
+	// 可信来源=注入的实时行情上下文 + 用户自己的描述 + 此前已落盘的历史（已在此前被审计过）。
+	histTexts := make([]string, 0, len(messages))
+	for _, m := range messages {
+		histTexts = append(histTexts, m.Content)
+	}
+	trusted := collectTrustedNumbers(append([]string{system, userMsg}, histTexts...)...)
+	reply = auditNumbers(reply, trusted)
 
 	// 对话历史落盘：用户提问 + 模型回复
 	if e.consultStore != nil {
@@ -532,11 +553,79 @@ func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error
 	return reply, nil
 }
 
+// auditedNumberRe 匹配带金融单位的数字：金额（万元/亿元/元）、成交量（万股/亿股）、笔数/手数，
+// 及百分比与倍数（% / 倍）——这些同样是模型幻觉的高发区。
+// 支持"万/亿"紧邻 笔/手/股 的组合（如 2.3万笔、1.2亿股）。
+// 刻意不匹配：时间、股票代码、时长、日期——避免误伤。
+var auditedNumberRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?(?:万元|亿元|元|万股|亿股|万|亿|手|笔|[%％]|倍)`)
+
+// collectTrustedNumbers 从可信文本（实时行情上下文、用户描述、历史消息）中收集"有出处的数字"集合。
+// 数值归一化后存储，便于匹配不同写法（"-22200.00万元" 与 "-22200万元" 视为同一值）。
+func collectTrustedNumbers(texts ...string) map[string]bool {
+	trusted := make(map[string]bool)
+	for _, t := range texts {
+		for _, tok := range auditedNumberRe.FindAllString(t, -1) {
+			if v, ok := normNumberToken(tok); ok {
+				trusted[v] = true
+			}
+		}
+	}
+	return trusted
+}
+
+// normNumberToken 抽取带单位数字 token 的数值部分并做浮点归一化，返回规范形式。
+// "-22200.00万元" → "-22200"；"2.3万笔" → "2.3"；"12%" → "12"；"3倍" → "3"。归一化失败返回 ok=false。
+func normNumberToken(tok string) (string, bool) {
+	i := strings.IndexAny(tok, "万亿元亿手股%％倍")
+	if i < 0 {
+		return "", false
+	}
+	numStr := tok[:i]
+	f, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return "", false
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64), true
+}
+
+// auditNumbers 扫描模型回复中的金融数字，凡数值无可信出处（不在 trusted 集合中）即替换为数据缺失标注。
+// 仅替换带单位的金钱/数量类数字，避免误伤百分比、时间、代码等。
+func auditNumbers(reply string, trusted map[string]bool) string {
+	if len(trusted) == 0 {
+		return reply
+	}
+	idx := auditedNumberRe.FindAllStringIndex(reply, -1)
+	if len(idx) == 0 {
+		return reply
+	}
+	var sb strings.Builder
+	sb.Grow(len(reply))
+	last := 0
+	for _, m := range idx {
+		tok := reply[m[0]:m[1]]
+		v, ok := normNumberToken(tok)
+		if ok && trusted[v] {
+			sb.WriteString(reply[last:m[1]])
+		} else {
+			sb.WriteString(reply[last:m[0]])
+			sb.WriteString("[数据缺失]")
+		}
+		last = m[1]
+	}
+	sb.WriteString(reply[last:])
+	return sb.String()
+}
+
 // consultCodeRe 从文本中提取 6 位股票代码。
 var consultCodeRe = regexp.MustCompile(`\b\d{6}\b`)
 
 // consultNoStockPrompt 专业模式下未能从消息中解析出股票时注入的提示词。
-const consultNoStockPrompt = `当前消息中未识别到明确的股票名称或 6 位代码。请向用户说明：专业模式需要您指明具体股票（如：卧龙电驱 600580），我才能拉取其实时行情（现价/涨跌幅/主力净流入/大单明细/均线/MACD/策略信号）做分析。在未指定股票前，不要编造任何个股的具体行情数字。`
+// 引导模型：无个股数据时做定性判断＋明确数据缺口，绝不编造个股/板块的任何具体数字。
+const consultNoStockPrompt = `当前消息中未识别到明确的股票名称或 6 位代码，因此我这边没有任何该股的实时行情数据（现价/涨跌幅/主力净流入/大单明细/均线/MACD/策略信号都没有）。请你：
+1. 先向用户说明：如果要我结合实时数据做分析，需要你指明具体股票（如：卧龙电驱 600580）。
+2. 若用户是在问板块/情绪这类开放问题，你可以基于A股的一般规律做定性框架分析（例如"尾盘急拉回落常见于情绪资金抢跑""板块集体冲高回落要防情绪退潮"），也可以引用用户在问题里描述的现象来分析，但要明确标注这是"一般规律/经验判断"。
+3. 严禁编造任何个股或板块的具体数字（成交额、净流入、撤单、振幅、持仓、涨幅、收益率、期货合约价、板块内具体个股名等），数据里没有就如实说"没有数据，无法确认"。
+4. 措辞审慎，不承诺收益、不给绝对化的买卖指令。`
 
 // buildConsultContext 从用户消息解析提到的股票，拉取真实实时行情组装为上下文文本。
 // 返回空串表示未解析出任何股票（调用方应提示用户指明股票）。
@@ -602,7 +691,11 @@ func (e *Engine) buildStockBlock(code, name string) string {
 			si.Price, si.ChangePct, si.Open, si.High, si.Low, si.Close))
 		b.WriteString(fmt.Sprintf("成交量 %.0f股 成交额%.0f元 换手率 %.2f%%\n",
 			si.Volume, si.Amount, si.Turnover))
-		b.WriteString(fmt.Sprintf("主力净流入 %.2f万元\n", si.NetInflow/1e4))
+		if si.NetInflow != 0 {
+			b.WriteString(fmt.Sprintf("主力净流入 %.2f万元\n", si.NetInflow/1e4))
+		} else {
+			b.WriteString("主力净流入: 数据源未返回（无法获取该字段，请勿编造）\n")
+		}
 	} else {
 		b.WriteString("实时行情获取失败。\n")
 	}
@@ -646,12 +739,28 @@ func (e *Engine) buildStockBlock(code, name string) string {
 	}
 
 	// 引擎战法信号（该股是否已触发某战法）
+	sigFound := false
 	if e.agg != nil {
 		if dash := e.agg.Current(); dash != nil {
 			for _, sig := range dash.FinalSignals {
 				if sig.Code == code {
 					b.WriteString(fmt.Sprintf("策略信号: [%s] %s %s %s 触发价%.2f 理由:%s\n",
 						sig.Strategy, sig.Direction, sig.Action, sig.Name, sig.Price, sig.Reason))
+					sigFound = true
+				}
+			}
+		}
+	}
+	// 该股当日信号批次（含触发时间），供模型据实判断"今天是否触发过量化信号、几点、什么性质"。
+	if !sigFound {
+		e.mu.RLock()
+		records := e.signalRecords
+		e.mu.RUnlock()
+		for _, rec := range records {
+			for _, sg := range rec.Signals {
+				if sg.Code == code {
+					b.WriteString(fmt.Sprintf("今日信号批次: %s触发 [%s] %s %s %s 触发价%.2f\n",
+						rec.ProcessTime.Format("15:04"), sg.Strategy, sg.Direction, sg.Action, sg.Name, sg.Price))
 				}
 			}
 		}
