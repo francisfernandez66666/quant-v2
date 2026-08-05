@@ -98,6 +98,14 @@ func (a *Agent) CleanStocks(items []string) []string {
 	return a.cleaner.CleanBatch(items)
 }
 
+// FindStocksInText 在文本中查找出现的股票名称（供咨询/归因等按自然语言识别个股）。
+func (a *Agent) FindStocksInText(text string) []string {
+	if a.cleaner == nil || text == "" {
+		return nil
+	}
+	return a.cleaner.FindStocksInText(text)
+}
+
 // SaveEvents 持久化事件到 newsDB 文件并保存 tracker，供 /api/news 展示。
 func (a *Agent) SaveEvents(events []NewsEvent) {
 	a.saveNewsEvents(events)

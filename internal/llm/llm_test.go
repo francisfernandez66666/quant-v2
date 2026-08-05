@@ -41,3 +41,16 @@ func TestFallbackAnalysisKeywordScore(t *testing.T) {
 		t.Fatalf("期望归因半导体板块，实际 %v", ht.Sectors)
 	}
 }
+
+// TestChatMessagesRequiresAPIKey 多轮咨询（股票咨询页）在 LLM 未配置时应直接报错，
+// 避免用空 Key 发起无意义请求。
+func TestChatMessagesRequiresAPIKey(t *testing.T) {
+	c := New(Config{APIKey: ""})
+	_, err := c.ChatMessages([]Message{{Role: "user", Content: "分析一下某股票"}})
+	if err == nil {
+		t.Fatalf("期望无 Key 时报错，实际无错误")
+	}
+	if !strings.Contains(err.Error(), "LLM_API_KEY") {
+		t.Fatalf("期望错误提示缺少 API Key，实际 %v", err)
+	}
+}

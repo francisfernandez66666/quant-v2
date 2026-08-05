@@ -116,6 +116,7 @@ func (t *fixtureTransport) sinaQuotes(req *http.Request) (*http.Response, error)
 }
 
 // sinaKLine 新浪 K 线 JSON 数组（数值为字符串，最新在前，解析器会反转）。
+// scale=5 时重放 MinuteKlines（5分钟线），其余 scale 重放日K Klines。
 func (t *fixtureTransport) sinaKLine(req *http.Request) (*http.Response, error) {
 	symbol := req.URL.Query().Get("symbol")
 	code := symbol
@@ -123,12 +124,24 @@ func (t *fixtureTransport) sinaKLine(req *http.Request) (*http.Response, error) 
 		code = code[2:]
 	}
 	kls := t.fix.Klines[code]
+	isMinute := req.URL.Query().Get("scale") == "5" && len(t.fix.MinuteKlines[code]) > 0
+	if isMinute {
+		kls = t.fix.MinuteKlines[code]
+	}
 	rows := make([]map[string]string, 0, len(kls))
-	// parseSinaKLine 假定输入为最新在前（倒序）并做反转，fixture 为升序 → 反序输出
-	for i := len(kls) - 1; i >= 0; i-- {
+	// 日K：parseSinaKLine 假定输入为最新在前（倒序）并做反转，fixture 为升序 → 反序输出。
+	// 分钟K：GetSinaMinuteKLine 自行按时间升序排序，fixture 升序直出。
+	for i := 0; i < len(kls); i++ {
 		k := kls[i]
+		if !isMinute {
+			k = kls[len(kls)-1-i]
+		}
+		dayFmt := "2006-01-02"
+		if isMinute {
+			dayFmt = "2006-01-02 15:04:05"
+		}
 		rows = append(rows, map[string]string{
-			"day":    k.Date.Format("2006-01-02"),
+			"day":    k.Date.Format(dayFmt),
 			"open":   strconv.FormatFloat(k.Open, 'f', 2, 64),
 			"high":   strconv.FormatFloat(k.High, 'f', 2, 64),
 			"low":    strconv.FormatFloat(k.Low, 'f', 2, 64),
@@ -223,11 +236,15 @@ func (t *fixtureTransport) emStockGet(req *http.Request) (*http.Response, error)
 	if prev > 0 {
 		changePct = (price - prev) / prev * 100
 	}
+	netInflow := 0.0
+	if t.fix.NetInflows != nil {
+		netInflow = t.fix.NetInflows[code]
+	}
 	return t.json(map[string]interface{}{
 		"data": map[string]interface{}{
 			"f43": price * 100, "f44": high * 100, "f45": low * 100, "f46": open * 100,
 			"f60": prev * 100, "f48": parse(8), "f49": parse(9), "f50": changePct,
-			"f57": code, "f58": name, "f170": 0.0, "f162": 0.0,
+			"f57": code, "f58": name, "f170": changePct * 100, "f162": netInflow,
 		},
 	})
 }
@@ -458,6 +475,9 @@ type llmCalls struct {
 	stage2 []string
 	d1     []string
 
+	// consult 记录股票咨询请求的 system prompt（含注入的专业模式上下文）。
+	consult []string
+
 	// failD1 置为 true 后，mock 对 D1 评分请求返回 500，用于验证 D1 失败回退上一轮评分。
 	failD1 bool
 }
@@ -480,15 +500,19 @@ func newMockLLMServer() (*httptest.Server, *llmCalls) {
 		var system, user string
 		for _, m := range req.Messages {
 			if m.Role == "system" {
-				system = m.Content
+				system += m.Content + "\n"
 			}
-			if m.Role == "user" {
+			if m.Role == "user" && user == "" {
 				user = m.Content
 			}
 		}
 
 		var content string
 		switch {
+		case strings.Contains(system, "股票投资顾问"):
+			// 股票咨询：记录注入的 system prompt（专业模式含实时行情上下文），返回确定性回复。
+			calls.consult = append(calls.consult, system)
+			content = "已收到您的咨询。根据实测数据：卧龙电驱今日主力净流入-22200万元，现价36.86元，涨跌幅3.34%。请注意当前行情仅供分析参考，不构成投资建议。"
 		case strings.Contains(system, "质检与价值判断"):
 			calls.stage0 = append(calls.stage0, user)
 			content = mockStage0JSON(user)

@@ -37,6 +37,7 @@ type fixSignal struct {
 	Level        string  `json:"level"`         // 固定"交易"
 	Action       string  `json:"action"`        // 交易动作（buy 等）
 	Price        float64 `json:"price"`         // 信号触发价格
+	ChangePct    float64 `json:"change_pct"`    // 实时涨跌幅（%）
 	CanOpen      bool    `json:"can_open"`      // 是否可开仓（置信度≥0.7 且为买入）
 	D1           float64 `json:"d1"`            // 维度1 评分
 	D2           float64 `json:"d2"`            // 维度2 评分
@@ -90,14 +91,24 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 	return out
 }
 
-// handleFixSignals 处理 GET /api/signals 请求，返回最新策略信号列表。
+// handleFixSignals 处理 GET /api/signals 请求，返回最新策略信号列表（附实时股价/涨跌幅）。
 func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
 	dash := s.agg.Current()
 	if dash == nil {
 		writeJSON(w, 200, []fixSignal{})
 		return
 	}
-	writeJSON(w, 200, toFixSignals(dash.FinalSignals))
+	out := toFixSignals(dash.FinalSignals)
+	// 逐票补充实时现价与涨跌幅（忽略失败，保留信号触发价兜底）
+	for i := range out {
+		info, err := s.market.GetRealtimeQuote(out[i].Code)
+		if err != nil {
+			continue
+		}
+		out[i].Price = info.Price
+		out[i].ChangePct = info.ChangePct
+	}
+	writeJSON(w, 200, out)
 }
 
 // handleFixStatus 处理 GET /api/status 请求，返回系统运行状态。

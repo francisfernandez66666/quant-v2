@@ -43,8 +43,15 @@ type Fixture struct {
 	// 个股日K线（升序，同花顺/新浪口径），同时供新浪/东财两种 K 线接口重放。
 	Klines map[string][]data.KLine `json:"klines"`
 
+	// 个股5分钟K线（升序）：供 GetSinaMinuteKLine(scale=5) 重放（专业模式 MACD 真实数据）。
+	MinuteKlines map[string][]data.KLine `json:"minute_klines"`
+
 	// 个股资金流：code -> 东财 fflow klines 行（date,elgBuy,elgSell,lgBuy,lgSell,mdBuy,mdSell,smBuy,smSell,net,...）。
 	MoneyFlow map[string][]string `json:"money_flow"`
+
+	// 个股主力净流入（元）：code -> 东财 push2 f162，供 emStockGet 实时行情返回与专业模式断言。
+	// 未填写的代码回退为 0。
+	NetInflows map[string]float64 `json:"net_inflows"`
 
 	// 指数行情（indexPrice/ma20/upCount/downCount）。
 	IndexPrice float64 `json:"index_price"`

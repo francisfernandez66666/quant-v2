@@ -201,6 +201,18 @@ func (m *Manager) ValidateToken(token string) *User {
 	return nil
 }
 
+// UserToken 返回指定用户名当前 token；用户不存在或无 token 时返回空串。
+func (m *Manager) UserToken(username string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, u := range m.db.Users {
+		if u.Username == username {
+			return u.Token
+		}
+	}
+	return ""
+}
+
 // SetConfig 写入用户配置项（键不存在则新增）。
 // 以 (userID, key) 为唯一维度，已存在则覆盖值，否则追加新条目并落盘。
 func (m *Manager) SetConfig(userID, key, value string) error {

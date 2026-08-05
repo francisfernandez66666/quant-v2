@@ -50,6 +50,9 @@
         <router-link to="/llm-debug" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">🧠</span> LLM诊断
         </router-link>
+        <router-link to="/consult" class="nav-item" active-class="active" @click="menuOpen = false">
+          <span class="nav-icon">🎯</span> 股票咨询
+        </router-link>
       </nav>
       <!-- 侧栏底部：服务状态 & 账号 -->
       <div class="sidebar-footer">

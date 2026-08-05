@@ -233,9 +233,9 @@ let loading = false              // 防并发请求标志
 
 // ── 计算属性 ──
 /** 过滤出非日历的普通资讯 */
-const newsItems = computed(() => news.value.filter(n => n.source !== '宏观日历'))
-/** 过滤出宏观日历事件 */
-const calendarEvents = computed(() => news.value.filter(n => n.source === '宏观日历'))
+const newsItems = computed(() => news.value.filter(n => n.source !== '宏观日历' && n.source !== '政策反制'))
+/** 过滤出宏观日历/政策反制事件 */
+const calendarEvents = computed(() => news.value.filter(n => n.source === '宏观日历' || n.source === '政策反制'))
 
 /** IPO 倒计时文本 */
 function ipoCountdown(c) {

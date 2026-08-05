@@ -120,9 +120,9 @@ async function request(path, opts = {}) {
   // 已登录时附加 Bearer 令牌，供后端鉴权
   if (token) headers['Authorization'] = 'Bearer ' + token
 
-  // 设置请求超时，超时后中止请求
+  // 设置请求超时（默认 REQUEST_TIMEOUT，可通过 opts.timeout 覆盖，如 LLM 咨询需要更长等待），超时后中止请求
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT)
+  const timer = setTimeout(() => ctrl.abort(), opts.timeout || REQUEST_TIMEOUT)
   let res
   try {
     res = await fetch(url, {
@@ -508,4 +508,38 @@ export async function fetchNewsShowAllStatus() {
 // 对应 POST /api/news/showall，请求体 { enabled }；开启时弱档/中性资讯也出现在 /api/news
 export async function toggleNewsShowAll(enabled) {
   return request('/api/news/showall', { method: 'POST', data: { enabled } })
+}
+
+// ── 股票咨询（多轮对话）──
+
+/** 发送咨询消息，获取 LLM 多轮对话回复 */
+// 对应 POST /api/consult，请求体 { message }；返回 { reply }
+// LLM 推理耗时较长，单独使用 120s 超时避免提前中止
+export async function consultChat(message) {
+  return request('/api/consult', { method: 'POST', data: { message }, timeout: 120000 })
+}
+
+/** 获取当日咨询对话历史 */
+// 对应 GET /api/consult/history，返回咨询消息数组
+export async function fetchConsultHistory() {
+  return request('/api/consult/history')
+}
+
+/** 获取专业模式开关状态 */
+// 对应 GET /api/consult/pro-mode，返回 { enabled } 布尔值
+export async function fetchConsultProMode() {
+  return request('/api/consult/pro-mode')
+}
+
+/** 切换专业模式开关 */
+// 对应 PUT /api/consult/pro-mode，请求体 { enabled }；开启后咨询会注入全部实时行情，
+// 盘中每 15 分钟限流一次，盘前盘后不限
+export async function setConsultProMode(enabled) {
+  return request('/api/consult/pro-mode', { method: 'PUT', data: { enabled } })
+}
+
+/** 清空当日咨询对话历史 */
+// 对应 DELETE /api/consult/history
+export async function clearConsultHistory() {
+  return request('/api/consult/history', { method: 'DELETE' })
 }

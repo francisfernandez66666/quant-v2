@@ -4,6 +4,7 @@ package strategy_engine
 import (
 	"context"
 	"log"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -257,6 +258,7 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 					md.KLines = k2
 				}
 			}
+			e.attachLiveBar(md)
 
 			// 资金流向（主力净流入，供资金维度评分）
 			cf, err := e.marketAPI.GetStockMoneyFlow(code)
@@ -330,6 +332,7 @@ func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes ma
 			defer wg.Done()
 			defer func() { <-sem }()
 			md.KLines, md.MoneyFlow = e.cachedKLine(code)
+			e.attachLiveBar(md)
 			minKL, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48)
 			if err == nil && len(minKL) >= 2 {
 				md.MinuteKLine = minKL
@@ -403,6 +406,85 @@ func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 	e.klineCache[code] = &klineCacheEntry{klines: klines, moneyFlow: cf, fetchedAt: now}
 	e.klineCacheMu.Unlock()
 	return klines, cf
+}
+
+// attachLiveBar 在日K序列尾部合成当日实时bar，让战法评分（如双凸 volScore/maScore）
+// 在盘中跟随实时行情，而不是整天使用最后一根（可能是昨日）收盘K线。
+// 当日实时快照含 open/high/low 与实时成交量，据此构造当日K线：
+//   - 若最后一根已是今日，直接用实时价修正其 open/high/low/close（数据源盘中已含当日时）；
+//   - 否则追加一根当日K线（前收作为 high 兜底，避免 high<price 偏差）。
+//
+// 仅当日K线日期早于今天（缓存了昨日数据）或最后bar已是今日时生效，且需有实时价可用。
+func (e *Engine) attachLiveBar(md *StockMarketData) {
+	if md == nil || len(md.KLines) == 0 || md.Price <= 0 {
+		return
+	}
+	// 无实时快照也无涨跌幅信息时无法构造当日bar，退回原序列。
+	if md.Quote == nil && md.ChangePct == 0 {
+		return
+	}
+	last := &md.KLines[len(md.KLines)-1]
+	today := time.Now()
+	todayDay := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
+
+	var open, high, low float64
+	if md.Quote != nil {
+		open = md.Quote.Open
+		high = md.Quote.High
+		low = md.Quote.Low
+	} else {
+		// 兜底用上一收盘价为开盘，构造当日阳/阴线基准。
+		open = last.Close
+		high = math.Max(last.Close, md.Price)
+		low = math.Min(last.Close, md.Price)
+	}
+
+	if !last.Date.Before(todayDay) {
+		// 最后一根就是今日：用实时价覆盖其高/低/收，避免缓存停留在昨日快照。
+		last.Close = md.Price
+		if high > 0 {
+			if last.High < high {
+				last.High = high
+			}
+		} else if last.High < md.Price {
+			last.High = md.Price
+		}
+		if low > 0 {
+			if last.Low > low {
+				last.Low = low
+			}
+		} else if last.Low <= 0 || last.Low > md.Price {
+			last.Low = md.Price
+		}
+		if last.Open <= 0 {
+			last.Open = open
+		}
+		if md.Quote != nil && md.Quote.Volume > 0 {
+			last.Volume = md.Quote.Volume
+		}
+		return
+	}
+
+	// 最后一根早于今日：追加当日bar。
+	bar := data.KLine{
+		Date:   today,
+		Open:   open,
+		High:   high,
+		Low:    low,
+		Close:  md.Price,
+		Volume: 0,
+	}
+	if md.Quote != nil && md.Quote.Volume > 0 {
+		bar.Volume = md.Quote.Volume
+		bar.Amount = md.Quote.Amount
+	}
+	if bar.High < bar.Close {
+		bar.High = bar.Close
+	}
+	if bar.Low <= 0 || bar.Low > bar.Close {
+		bar.Low = bar.Close
+	}
+	md.KLines = append(md.KLines, bar)
 }
 
 // attribution 事件归因：将新闻事件按利好/利空方向分流到板块，合并相同板块的事件。

@@ -2,10 +2,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +39,9 @@ type EngineController interface {
 	GetMessages() []data.MessageItem
 	ClearMessages()
 	DeleteMessage(id string)
+	ConsultLLM(userID, userMsg string, proMode bool) (string, error)
+	GetConsultHistory() []data.ConsultMessage
+	ClearConsultHistory()
 }
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
@@ -215,6 +220,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/action", s.authMiddleware(s.handleFixAction))
 	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
+	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
+	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))
+	s.mux.HandleFunc("DELETE /api/consult/history", s.authMiddleware(s.handleClearConsultHistory))
+	s.mux.HandleFunc("GET /api/consult/pro-mode", s.authMiddleware(s.handleGetConsultProMode))
+	s.mux.HandleFunc("PUT /api/consult/pro-mode", s.authMiddleware(s.handleSetConsultProMode))
 	s.mux.HandleFunc("GET /api/stage-records", s.authMiddleware(s.handleStageRecords))
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
@@ -224,6 +234,11 @@ func (s *Server) registerRoutes() {
 func (s *Server) Serve(addr string) error {
 	log.Printf("HTTP server starting on %s", addr)
 	return http.ListenAndServe(addr, s.corsMiddleware(s.mux))
+}
+
+// ServeHTTP 实现 http.Handler 接口，供 httptest / 内嵌路由直接驱动（测试与复用场景）。
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.corsMiddleware(s.mux).ServeHTTP(w, r)
 }
 
 // corsMiddleware 跨域中间件：为所有响应添加 CORS 头，并直接终结 OPTIONS 预检请求。
@@ -399,6 +414,15 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 
 // authMiddleware 认证中间件：从 Authorization 头提取 token（兼容 Bearer 前缀），
 // 校验通过后放行请求，否则返回 401。
+// ctxUserKey 认证用户上下文键，authMiddleware 将校验通过的用户写入 request context。
+type ctxUserKey struct{}
+
+// userFromContext 从请求上下文取出认证用户（由 authMiddleware 注入），未注入返回 nil。
+func userFromContext(r *http.Request) *auth.User {
+	u, _ := r.Context().Value(ctxUserKey{}).(*auth.User)
+	return u
+}
+
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("Authorization")
@@ -414,7 +438,7 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, 401, "invalid or expired token")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, user)))
 	}
 }
 
@@ -759,6 +783,149 @@ func (s *Server) handleLLMDebug(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, di)
+}
+
+// consultReq 股票咨询请求体：用户消息。
+type consultReq struct {
+	Message string `json:"message"`
+}
+
+// 专业模式相关配置键（per-user，落盘 auth.json，跨重启保留）。
+const (
+	consultProModeKey      = "consult_pro_mode"       // "1"/"0"，默认关
+	consultProModeLastUsed = "consult_pro_mode_last"  // 最近一次专业咨询 Unix 秒
+	consultProModeInterval = 15 * time.Minute         // 盘中专业模式调用间隔上限
+)
+
+// consultProModeEnabled 读取当前用户专业模式开关状态（默认关）。
+func (s *Server) consultProModeEnabled(userID string) bool {
+	v, _ := s.auth.GetConfig(userID, consultProModeKey)
+	return v == "1"
+}
+
+// consultProModeRateLimited 判定专业模式是否命中盘中 15 分钟限流。
+// 仅交易时段（周一至周五 9:15-15:00）受限；盘前/盘后/周末不限。
+// 命中限流返回剩余等待时长；未命中返回 0。
+func (s *Server) consultProModeRateLimited(userID string, now time.Time) time.Duration {
+	if !data.IsTradeTime(now) {
+		return 0
+	}
+	v, ok := s.auth.GetConfig(userID, consultProModeLastUsed)
+	if !ok || v == "" {
+		return 0
+	}
+	last, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	elapsed := now.Sub(time.Unix(last, 0))
+	if elapsed >= consultProModeInterval {
+		return 0
+	}
+	return consultProModeInterval - elapsed
+}
+
+// handleConsult 处理 POST /api/consult：多轮 LLM 咨询。
+// 专业模式（开关打开）时注入该股全部实时行情，且盘中 15 分钟限流一次；
+// 普通模式不注入数据、不限流。未接入引擎或 LLM 未配置时返回对应错误提示。
+func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeError(w, 503, "引擎未启动")
+		return
+	}
+	var req consultReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.Message == "" {
+		writeError(w, 400, "message required")
+		return
+	}
+	user := userFromContext(r)
+	userID := ""
+	if user != nil {
+		userID = user.ID
+	}
+	proMode := s.consultProModeEnabled(userID)
+
+	// 盘中限流：仅专业模式且交易时段生效（按用户，落盘跨重启保留）。
+	if proMode {
+		if wait := s.consultProModeRateLimited(userID, time.Now()); wait > 0 {
+			writeError(w, 429, fmt.Sprintf("盘中专业模式每 15 分钟可用一次，请 %s 后再试", wait.Round(time.Second)))
+			return
+		}
+	}
+
+	reply, err := s.ctrl.ConsultLLM(userID, req.Message, proMode)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	// 专业咨询成功后记录调用时间（供下次盘中限流判定）。
+	if proMode {
+		_ = s.auth.SetConfig(userID, consultProModeLastUsed, strconv.FormatInt(time.Now().Unix(), 10))
+	}
+	writeJSON(w, 200, map[string]string{"reply": reply})
+}
+
+// handleGetConsultProMode 处理 GET /api/consult/pro-mode：返回当前用户专业模式开关状态。
+func (s *Server) handleGetConsultProMode(w http.ResponseWriter, r *http.Request) {
+	user := userFromContext(r)
+	userID := ""
+	if user != nil {
+		userID = user.ID
+	}
+	writeJSON(w, 200, map[string]bool{"enabled": s.consultProModeEnabled(userID)})
+}
+
+// proModeReq 专业模式开关请求体。
+type proModeReq struct {
+	Enabled bool `json:"enabled"`
+}
+
+// handleSetConsultProMode 处理 PUT /api/consult/pro-mode：切换当前用户专业模式开关。
+func (s *Server) handleSetConsultProMode(w http.ResponseWriter, r *http.Request) {
+	user := userFromContext(r)
+	userID := ""
+	if user != nil {
+		userID = user.ID
+	}
+	var req proModeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	v := "0"
+	if req.Enabled {
+		v = "1"
+	}
+	if err := s.auth.SetConfig(userID, consultProModeKey, v); err != nil {
+		writeError(w, 500, "保存失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"enabled": req.Enabled})
+}
+
+// handleConsultHistory 处理 GET /api/consult/history：返回当日咨询对话历史。
+func (s *Server) handleConsultHistory(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeJSON(w, 200, []data.ConsultMessage{})
+		return
+	}
+	h := s.ctrl.GetConsultHistory()
+	if h == nil {
+		h = []data.ConsultMessage{}
+	}
+	writeJSON(w, 200, h)
+}
+
+// handleClearConsultHistory 处理 DELETE /api/consult/history：清空当日咨询对话。
+func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl != nil {
+		s.ctrl.ClearConsultHistory()
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 // handleStageRecords 返回当日全量 Stage 流水线轮次记录（用于复盘/策略引擎实时调取）。

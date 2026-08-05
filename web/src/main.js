@@ -34,6 +34,8 @@ import MsgCenter from './pages/MsgCenter.vue'
 import Settings from './pages/Settings.vue'
 // LLM 诊断页：调试查看 LLM 决策的输入输出
 import LLMDebug from './pages/LLMDebug.vue'
+// 股票咨询页：多轮 LLM 对话咨询
+import Consult from './pages/Consult.vue'
 
 // 路由配置：定义所有页面路径及对应组件
 // 每条记录由 path（URL hash 路径）与 component（渲染组件）组成
@@ -56,6 +58,8 @@ const routes = [
   { path: '/settings', component: Settings },
   // LLM 诊断：调试 LLM 决策过程
   { path: '/llm-debug', component: LLMDebug },
+  // 股票咨询：多轮 LLM 对话
+  { path: '/consult', component: Consult },
 ]
 
 // 使用 Hash 历史模式创建路由实例，避免刷新时 404

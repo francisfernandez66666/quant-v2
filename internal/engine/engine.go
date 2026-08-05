@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -56,7 +57,9 @@ type Engine struct {
 	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
 	signalRecPath string                   // 信号批次记录持久化文件路径
 
-	msgStore   *data.MessageStore // 消息中心持久化存储
+	msgStore       *data.MessageStore        // 消息中心持久化存储
+	consultStore   *data.ConsultStore        // 股票咨询对话持久化存储（跨交易日清空）
+	confrontStore  *data.ConfrontationStore  // 政策反制事件持久化存储（跨交易日清空）
 	hotRecords []data.HotRecord   // 当日热点板块轮次记录（固化到磁盘）
 	hotRecPath string             // 热点板块记录持久化文件路径
 
@@ -120,6 +123,14 @@ func New(
 		msgPath = filepath.Join(dataDir, "messages.json")
 		scoreRecPath = filepath.Join(dataDir, "scores.json")
 	}
+	consultPath := ""
+	if dataDir != "" {
+		consultPath = filepath.Join(dataDir, "consult_history.json")
+	}
+	confrontPath := ""
+	if dataDir != "" {
+		confrontPath = filepath.Join(dataDir, "confrontation.json")
+	}
 	hotRecPath := ""
 	signalRecPath := ""
 	if dataDir != "" {
@@ -146,6 +157,8 @@ func New(
 		signalRecords:    loadSignalRecords(signalRecPath),
 		signalRecPath:    signalRecPath,
 		msgStore:         data.NewMessageStore(msgPath),
+		consultStore:     data.NewConsultStore(consultPath),
+		confrontStore:    data.NewConfrontationStore(confrontPath),
 		hotRecords:       loadHotRecords(hotRecPath),
 		hotRecPath:       hotRecPath,
 		sectorEventTimes: make(map[string]time.Time),
@@ -153,7 +166,7 @@ func New(
 		prevPass:         make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
 	}
-	e.syncMessages(nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心
+	e.syncMessages(nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心
 	// 启动时回填上次持久化的 8a/8b 打分（重启后前端立即可见）
 	if loaded := e.scoreStore.Load(); len(loaded) > 0 {
 		e.agg.UpdateFast(loaded, nil, e.rpt)
@@ -474,8 +487,300 @@ func (e *Engine) DeleteMessage(id string) {
 	}
 }
 
+// ── 股票咨询（多轮对话）──
+
+// ConsultLLM 以多轮对话方式调用 LLM 生成咨询回复（股票咨询页使用）。
+// 将用户提问与历史对话一并发给模型；LLM 未配置时返回错误提示前端引导配置。
+// 回复生成后同步追加到当日对话历史（跨交易日自动清空）。
+func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error) {
+	e.mu.RLock()
+	client := e.llmClient
+	e.mu.RUnlock()
+	if client == nil {
+		return "", fmt.Errorf("未配置 LLM_API_KEY，请先在股票咨询页配置 API Key")
+	}
+
+	// 组装多轮对话历史（此前全部 user/assistant 消息 + 本轮提问）
+	messages := make([]llm.Message, 0, 8)
+	if e.consultStore != nil {
+		for _, m := range e.consultStore.List() {
+			messages = append(messages, llm.Message{Role: m.Role, Content: m.Content})
+		}
+	}
+
+	// 专业模式：解析用户提到的股票，注入真实实时行情上下文，禁止 LLM 编造数字。
+	if proMode {
+		if ctx := e.buildConsultContext(userMsg); ctx != "" {
+			messages = append(messages, llm.Message{Role: "system", Content: ctx})
+		} else {
+			messages = append(messages, llm.Message{Role: "system", Content: consultNoStockPrompt})
+		}
+	}
+
+	messages = append(messages, llm.Message{Role: "user", Content: userMsg})
+
+	reply, err := client.ChatMessages(messages)
+	if err != nil {
+		return "", fmt.Errorf("咨询调用失败: %v", err)
+	}
+
+	// 对话历史落盘：用户提问 + 模型回复
+	if e.consultStore != nil {
+		e.consultStore.Append("user", userMsg)
+		e.consultStore.Append("assistant", reply)
+	}
+	return reply, nil
+}
+
+// consultCodeRe 从文本中提取 6 位股票代码。
+var consultCodeRe = regexp.MustCompile(`\b\d{6}\b`)
+
+// consultNoStockPrompt 专业模式下未能从消息中解析出股票时注入的提示词。
+const consultNoStockPrompt = `当前消息中未识别到明确的股票名称或 6 位代码。请向用户说明：专业模式需要您指明具体股票（如：卧龙电驱 600580），我才能拉取其实时行情（现价/涨跌幅/主力净流入/大单明细/均线/MACD/策略信号）做分析。在未指定股票前，不要编造任何个股的具体行情数字。`
+
+// buildConsultContext 从用户消息解析提到的股票，拉取真实实时行情组装为上下文文本。
+// 返回空串表示未解析出任何股票（调用方应提示用户指明股票）。
+// 数据来源：东财 push2 实时价（含主力净流入 F162）+ 东财资金流明细 + 新浪日K/分钟K + 引擎战法信号。
+func (e *Engine) buildConsultContext(userMsg string) string {
+	codes := make(map[string]string) // code → name
+
+	// 1. 名称 → 代码：解析文本中出现的股票名称，再清洗为代码
+	var names []string
+	if e.newsAgent != nil {
+		names = e.newsAgent.FindStocksInText(userMsg)
+		for _, c := range e.newsAgent.CleanStocks(names) {
+			parts := strings.SplitN(c, "|", 2)
+			if len(parts) != 2 || parts[0] == "" {
+				continue
+			}
+			codes[parts[1]] = parts[0]
+		}
+	}
+	// 2. 文本中的纯 6 位代码
+	for _, m := range consultCodeRe.FindAllString(userMsg, -1) {
+		if _, ok := codes[m]; !ok {
+			codes[m] = ""
+		}
+	}
+
+	if len(codes) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("以下是用户可能关心的股票今日实时行情实测数据（数据获取时间 " +
+		time.Now().Format("2006-01-02 15:04:05") + "）：\n")
+	sb.WriteString("【要求】仅可引用下列提供的数据；未提供的信息（如大盘资金、期指贴水、撤单、盘口等）如实说明" +
+		"无法获取，严禁编造净流入/成交量/涨跌/触发等任何具体数字；净流入口径=主力(超大单+大单)，东方财富。\n")
+
+	for code, name := range codes {
+		sb.WriteString(e.buildStockBlock(code, name))
+	}
+	return sb.String()
+}
+
+// buildStockBlock 组装单只股票的实时行情数据块。
+func (e *Engine) buildStockBlock(code, name string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("\n—— 股票 %s", code))
+	if name != "" {
+		b.WriteString(" " + name)
+	}
+	b.WriteString(" ——\n")
+
+	// 实时报价（东财 push2，含主力净流入）
+	if e.marketAPI == nil {
+		b.WriteString("实时行情数据源未初始化。\n")
+		return b.String()
+	}
+	si, err := e.marketAPI.GetRealtimeQuote(code)
+	if err == nil && si != nil && si.Price > 0 {
+		if si.Name != "" {
+			name = si.Name
+		}
+		b.WriteString(fmt.Sprintf("现价 %.2f元 涨跌幅%.2f%% 今开%.2f 最高%.2f 最低%.2f 昨收%.2f\n",
+			si.Price, si.ChangePct, si.Open, si.High, si.Low, si.Close))
+		b.WriteString(fmt.Sprintf("成交量 %.0f股 成交额%.0f元 换手率 %.2f%%\n",
+			si.Volume, si.Amount, si.Turnover))
+		b.WriteString(fmt.Sprintf("主力净流入 %.2f万元\n", si.NetInflow/1e4))
+	} else {
+		b.WriteString("实时行情获取失败。\n")
+	}
+
+	// 资金流明细（超大/大/中/小单，均以万元计）
+	if cf, err := e.marketAPI.GetStockMoneyFlow(code); err == nil && cf != nil {
+		b.WriteString(fmt.Sprintf("资金明细: 超大单净流入%.0f万 大单净流入%.0f万 中单净流入%.0f万 小单净流入%.0f万\n",
+			(cf.SuperLargeIn-cf.SuperLargeOut)/1e4, (cf.LargeIn-cf.LargeOut)/1e4,
+			(cf.MediumIn-cf.MediumOut)/1e4, (cf.SmallIn-cf.SmallOut)/1e4))
+	}
+
+	// 日K：当日振幅、MA5/MA10、近5日量能
+	if kl, err := e.marketAPI.GetSinaKLine(code, 30); err == nil && len(kl) > 0 {
+		last := kl[len(kl)-1]
+		amp := 0.0
+		if last.Close > 0 {
+			amp = (last.High - last.Low) / last.Close * 100
+		}
+		b.WriteString(fmt.Sprintf("日K(最新一根 %s): 振幅%.2f%% 收%.2f 高%.2f 低%.2f\n",
+			last.Date.Format("2006-01-02"), amp, last.Close, last.High, last.Low))
+		if len(kl) >= 10 {
+			b.WriteString(fmt.Sprintf("MA5=%.2f MA10=%.2f %s\n",
+				consultMA(kl[len(kl)-5:]), consultMA(kl[len(kl)-10:]), consultMATrend(kl)))
+		}
+		// 近5日量能
+		avg5 := consultMAVolume(kl)
+		b.WriteString(fmt.Sprintf("近5日平均成交量 %.0f股，最新一根量 %.0f股\n", avg5, last.Volume))
+	}
+
+	// 分钟K（5分钟）MACD 状态
+	if minKL, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48); err == nil && len(minKL) >= 2 {
+		macd := data.CalcMACD(minKL)
+		status := "空头"
+		if macd.Bar > 0 {
+			status = "多头(红柱)"
+		} else if macd.Bar == 0 {
+			status = "零轴"
+		}
+		b.WriteString(fmt.Sprintf("5分钟MACD: DIF=%.4f DEA=%.4f BAR=%.4f(%s)\n",
+			macd.DIF, macd.DEA, macd.Bar, status))
+	}
+
+	// 引擎战法信号（该股是否已触发某战法）
+	if e.agg != nil {
+		if dash := e.agg.Current(); dash != nil {
+			for _, sig := range dash.FinalSignals {
+				if sig.Code == code {
+					b.WriteString(fmt.Sprintf("策略信号: [%s] %s %s %s 触发价%.2f 理由:%s\n",
+						sig.Strategy, sig.Direction, sig.Action, sig.Name, sig.Price, sig.Reason))
+				}
+			}
+		}
+	}
+
+	return b.String()
+}
+
+// consultMA 计算一段收盘价的简单平均。
+func consultMA(kl []data.KLine) float64 {
+	if len(kl) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, k := range kl {
+		sum += k.Close
+	}
+	return sum / float64(len(kl))
+}
+
+// consultMAVolume 计算最近5根日K的平均成交量（不足则取全部）。
+func consultMAVolume(kl []data.KLine) float64 {
+	if len(kl) == 0 {
+		return 0
+	}
+	n := 5
+	if len(kl) < n {
+		n = len(kl)
+	}
+	var sum float64
+	for _, k := range kl[len(kl)-n:] {
+		sum += k.Volume
+	}
+	return sum / float64(n)
+}
+
+// consultMATrend 判断 MA5 相对 MA10 的多头/空头排列。
+func consultMATrend(kl []data.KLine) string {
+	if len(kl) < 10 {
+		return ""
+	}
+	ma5 := consultMA(kl[len(kl)-5:])
+	ma10 := consultMA(kl[len(kl)-10:])
+	if ma5 > ma10 {
+		return "均线多头排列"
+	}
+	return "均线空头排列"
+}
+
+// GetConsultHistory 返回当日咨询对话历史。
+func (e *Engine) GetConsultHistory() []data.ConsultMessage {
+	if e.consultStore == nil {
+		return nil
+	}
+	return e.consultStore.List()
+}
+
+// ClearConsultHistory 清空当日咨询对话历史。
+func (e *Engine) ClearConsultHistory() {
+	if e.consultStore != nil {
+		e.consultStore.Clear()
+	}
+}
+
+// buildPolicyRetaliationSignals 将政策反制事件转为可展示信号：
+//  1. 事件去重后持久化到 confrontationStore（仅当日首次出现）；
+//  2. 生成消息中心"政策反制"提示（利空方向，提醒关注受影响板块）；
+//  3. 返回合成后的 NewsEvent（Source="政策反制"，供事件流/资讯展示）。
+func (e *Engine) buildPolicyRetaliationSignals(events []data.ConfrontationEvent) []newsagent.NewsEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	var out []newsagent.NewsEvent
+	for _, ev := range events {
+		if e.confrontStore != nil {
+			if e.confrontStore.HasTitle(ev.Title) {
+				continue // 当日已处理过，跳过避免重复提醒
+			}
+			e.confrontStore.Append(ev)
+		}
+		// 方向转带符号分数：利空 -0.75 / 利好 +0.75（高强度涉外政策事件）
+		score := 0.75
+		if ev.Direction == "利空" {
+			score = -0.75
+		}
+		newsEv := newsagent.NewsEvent{
+			Title:       ev.Title,
+			Content:     ev.Content,
+			Datetime:    ev.Datetime,
+			Source:      "政策反制",
+			Level:       "宏观",
+			Direction:   ev.Direction,
+			Score:       score,
+			Sectors:     ev.Sectors,
+			ImpactLevel: ev.Impact,
+			EventType:   "政策",
+			Urgency:     "紧急",
+			Reason:      "涉外政策反制事件，直接影响相关板块",
+		}
+		out = append(out, newsEv)
+
+		// 消息中心提示：提醒关注受影响板块（利空/利好方向由事件决定）
+		if e.msgStore != nil {
+			e.msgStore.Sync([]data.MessageItem{{
+				ID:          "confront@" + ev.Title,
+				Code:        "",
+				Name:        "",
+				Level:       "政策反制",
+				Action:      "提示",
+				Strategy:    "政策反制",
+				Time:        nowTimeString(),
+				Title:       "政策反制事件",
+				Body:        ev.Title + "（影响板块：" + strings.Join(ev.Sectors, "、") + "）",
+				Direction:   ev.Direction,
+				GeneratedAt: time.Now(),
+			}})
+		}
+	}
+	return out
+}
+
+// nowTimeString 返回当前时间的 HH:MM:SS 字符串，用于消息中心提示的时间戳。
+func nowTimeString() string {
+	return time.Now().Format("15:04:05")
+}
+
 // syncMessages 将本轮止盈止损告警与持仓提示合并进消息存储（按稳定键去重）。
-func (e *Engine) syncMessages(alertSignals []combat_agent.Signal) {
+// bearSectors/bearStocks 为本轮利空板块与利空个股，用于扫出"命中利空板块的持仓"并提醒卖出。
+func (e *Engine) syncMessages(alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult) {
 	if e.msgStore == nil {
 		return
 	}
@@ -499,6 +804,33 @@ func (e *Engine) syncMessages(alertSignals []combat_agent.Signal) {
 			GeneratedAt: sig.GeneratedAt,
 		})
 	}
+
+	// 利空板块持仓提醒：扫描当前持仓,凡命中本轮利空板块领跌股/利空个股的,提醒"卖出"。
+	// 仅在存在利空依据时触发；不出做空战法信号、不自动平仓。
+	if sr != nil {
+		bearCodes := bearHitCodes(sr)
+		held := e.rpt.HeldPositions()
+		now := time.Now()
+		for _, pos := range held {
+			if bearCodes[pos.Code] {
+				reason := fmt.Sprintf("持仓 %s(%s) 命中利空板块,建议考虑减仓/卖出", pos.Name, pos.Code)
+				items = append(items, data.MessageItem{
+					ID:          "bearhold@" + pos.Code,
+					Code:        pos.Code,
+					Name:        pos.Name,
+					Level:       "利空提示",
+					Action:      "卖出",
+					Strategy:    pos.Strategy,
+					Time:        now.Format("15:04:05"),
+					Title:       fmt.Sprintf("利空提示 %s", pos.Code),
+					Body:        reason,
+					Direction:   "利空",
+					GeneratedAt: now,
+				})
+			}
+		}
+	}
+
 	for _, l := range e.rpt.List() {
 		if l.Status != "持仓中" && l.ExitAt == nil {
 			continue
@@ -644,6 +976,10 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 		// 4. 注入 IPO 日历事件
 		events = append(events, e.newsAgent.BuildIPOEvents()...)
+
+		// 4b. 政策反制事件：从涉外政策新闻关键词识别（直构，不走 LLM），并入事件流
+		retEvents := e.buildPolicyRetaliationSignals(e.newsAgent.DeriveRetaliation(rawNews))
+		events = append(events, retEvents...)
 
 		// 5. 持久化全量事件供 /api/news 展示（含中性/一般新闻）
 		e.newsAgent.SaveEvents(events)
@@ -875,7 +1211,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.scoreStore.Save(td, stockScores)
 
 	// 14b. 告警/持仓提示合并进消息中心（持久化）
-	e.syncMessages(alertSignals)
+	e.syncMessages(alertSignals, sr)
 
 	// 15. 调试数据
 	e.captureDebug(rawNews, st0, events)
@@ -1293,6 +1629,21 @@ func mergeStr(a, b []string) []string {
 			continue
 		}
 		out = append(out, s)
+	}
+	return out
+}
+
+// bearHitCodes 收拢本轮全部利空标的（利空板块领跌股 + 利空个股），返回 code→true 映射。
+// 供持仓利空提醒使用：凡命中该集合的持仓提示卖出。
+func bearHitCodes(sr *strategy_engine.StrategyResult) map[string]bool {
+	out := make(map[string]bool)
+	for _, bs := range sr.BearSectors {
+		for _, code := range bs.LeadStocks {
+			out[code] = true
+		}
+	}
+	for _, code := range sr.BearStocks {
+		out[code] = true
 	}
 	return out
 }

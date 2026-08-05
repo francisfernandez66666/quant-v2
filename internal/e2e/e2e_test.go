@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
@@ -42,6 +43,8 @@ type testRig struct {
 	ths    *data.THSClient        // 同花顺客户端（断言 realhead/板块页解析）
 	cfgMgr *config.Manager        // 配置管理器（战法权重等）
 	wl     *data.WatchlistManager // 自选股管理器
+	auth   *auth.Manager          // 认证管理器（HTTP 级测试签发 token）
+	tmp    string                 // 临时数据目录（HTTP 测试持久化 consult/auth）
 }
 
 // applyScenarioOverrides 为战法触发/空路径验证场景对实盘快照做确定性增量覆盖：
@@ -113,6 +116,14 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 
 	tmp := t.TempDir()
 
+	authMgr := auth.NewManager(tmp)
+	if err := authMgr.Init(); err != nil {
+		t.Fatalf("auth init: %v", err)
+	}
+	if _, err := authMgr.Register("tester", "tester123"); err != nil {
+		t.Fatalf("auth register: %v", err)
+	}
+
 	cleaner := data.NewStockCleaner(marketAPI)
 	nAgent := newsagent.New(marketAPI, llmClient, cleaner, tmp)
 
@@ -156,6 +167,7 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 	return &testRig{
 		eng: eng, agg: agg, calls: calls, sse: sse, rpt: rpt,
 		market: marketAPI, ths: thsClient, cfgMgr: cfgMgr, wl: wlMgr,
+		auth: authMgr, tmp: tmp,
 	}
 }
 

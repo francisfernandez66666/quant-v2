@@ -133,32 +133,6 @@
       </div>
     </div>
 
-    <!-- 策略信号迷你列表 -->
-    <div class="card" style="margin-top: 16px;">
-      <div class="card-header">
-        <span>策略信号</span>
-        <span class="card-sub">{{ signals.length }}条</span>
-      </div>
-      <!-- 信号行：代码/名称/策略 + D1-D4 子维度评分条 + 总分，点击跳转到信号页 -->
-      <div v-if="filteredSignals.length" class="signal-mini">
-        <div v-for="s in filteredSignals" :key="s.code" class="sig-row" @click="$router.push('/signals')">
-          <span class="sig-code">{{ s.code }}</span>
-          <span class="sig-name">{{ s.name }}</span>
-          <span class="sig-strat">{{ s.strategy }}</span>
-          <div class="sig-bars">
-            <div class="d-bar"><div class="d-fill d1" :style="{ width: (s.d1 || 0) + '%' }"></div></div>
-            <div class="d-bar"><div class="d-fill d2" :style="{ width: (s.d2 || 0) + '%' }"></div></div>
-            <div class="d-bar"><div class="d-fill d3" :style="{ width: (s.d3 || 0) + '%' }"></div></div>
-            <div class="d-bar"><div class="d-fill d4" :style="{ width: (s.d4 || 0) + '%' }"></div></div>
-          </div>
-          <span :class="['sig-level', s.remind_level]">{{ s.total_score?.toFixed(0) }}</span>
-        </div>
-      </div>
-      <div class="empty" v-else>
-        <span class="loading-dot"></span> 扫描中，暂无触发信号...
-      </div>
-    </div>
-
     <!-- 系统运行信息 -->
     <div class="card" style="margin-top: 16px;">
       <div class="card-header">系统</div>
@@ -174,14 +148,11 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子
-import { useRouter } from 'vue-router'                       // Vue Router：获取路由实例，用于页面跳转
 import * as api from '../api/index.js'                       // 后端 API 封装：信号/状态/资讯/板块/快照/IPO 等数据接口
 import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）
 
-const router = useRouter()                                   // 路由实例：点击策略信号行时跳转到信号详情页 /signals
-
 // ── 响应式数据 ──
-const signals = ref([])               // 策略信号列表
+const signals = ref([])               // 策略信号列表（用于顶部统计卡片）
 const status = ref({})                // 服务端状态
 const newsItems = ref([])             // 资讯+日历事件
 const hotSectors = ref([])            // 热门板块
@@ -204,11 +175,8 @@ const observeCount = computed(() => signals.value.filter(s => s.remind_level ===
 /** 静默信号数量 */
 const muteCount = computed(() => signals.value.filter(s => s.remind_level === 'mute').length)
 
-/** 截取前 10 条信号用于概览展示 */
-const filteredSignals = computed(() => signals.value.slice(0, 10))
-
-/** 过滤出宏观日历事件（与普通资讯区分） */
-const calendarEvents = computed(() => newsItems.value.filter(n => n.source === '宏观日历'))
+/** 过滤出宏观日历/政策反制事件（与普通资讯区分） */
+const calendarEvents = computed(() => newsItems.value.filter(n => n.source === '宏观日历' || n.source === '政策反制'))
 
 /**
  * 计算 IPO 距今日的倒计时文本

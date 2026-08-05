@@ -30,15 +30,22 @@
       <div class="table-header">
         <span class="col-code">代码</span>
         <span class="col-name">名称</span>
+        <span class="col-price">现价/涨跌</span>
         <span class="col-strategy">策略</span>
         <span class="col-score">总分</span>
         <span class="col-level">等级</span>
         <span class="col-detail">D1/D2/D3/D4</span>
       </div>
-      <!-- 信号行：代码/名称/策略/总分/等级徽标/D1-D4 维度评分（含简短描述）+ 操作（买入或忽略） -->
+      <!-- 信号行：代码/名称/现价涨跌/策略/总分/等级徽标/D1-D4 维度评分（含简短描述）+ 操作（买入或忽略） -->
       <div v-for="s in filteredSignals" :key="s.code" class="table-row">
         <span class="col-code">{{ s.code }}</span>
         <span class="col-name">{{ s.name || '-' }}</span>
+        <span class="col-price">
+          <span class="px-price">¥{{ (s.price || 0).toFixed(2) }}</span>
+          <span :class="['px-chg', (s.change_pct || 0) >= 0 ? 'up' : 'down']">
+            {{ (s.change_pct || 0) > 0 ? '+' : '' }}{{ (s.change_pct || 0).toFixed(2) }}%
+          </span>
+        </span>
         <span class="col-strategy">{{ s.strategy }}</span>
         <span class="col-score">{{ s.total_score?.toFixed(0) }}</span>
         <span class="col-level">
@@ -223,6 +230,11 @@ onUnmounted(() => {
 .table-row:last-child { border-bottom: none; }
 .col-code { width: 80px; font-family: monospace; color: #4fc3f7; }
 .col-name { width: 100px; color: #e0e0e0; }
+.col-price { width: 130px; display: flex; flex-direction: column; gap: 2px; }
+.px-price { color: #e0e0e0; font-weight: 600; }
+.px-chg { font-size: 11px; }
+.px-chg.up { color: #FF4D4F; }
+.px-chg.down { color: #4caf50; }
 .col-strategy { width: 80px; color: #e0e0e0; }
 .col-score { width: 60px; font-weight: 600; color: #FAAD14; text-align: center; }
 .col-level { width: 70px; }

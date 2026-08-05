@@ -319,7 +319,8 @@ func (m *MarketAPI) quoteStore(code string, si *StockInfo) {
 
 // getEastMoneyQuote 通过东方财富 push2 stock/get 接口拉取单只股票实时行情。
 // 返回的 F43/F44/F45/F46/F60 价格字段单位为分，已 ÷100 转换为元。
-// F50 涨跌幅为百分数（如 1.23 表示 +1.23%），直接使用。
+// F170 涨跌幅 / F168 换手率 / F169 涨跌额 均为基准值 ×100，已 ÷100 转换。
+// F50 为量比（非涨跌幅），注意勿混淆。
 func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=%s", sid, stockQuoteFields)
@@ -342,10 +343,12 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 			F60  float64 `json:"f60"`  // 昨收（分）
 			F48  float64 `json:"f48"`  // 成交量
 			F49  float64 `json:"f49"`  // 成交额
-			F50  float64 `json:"f50"`  // 涨跌幅
+			F50  float64 `json:"f50"`  // 量比（非涨跌幅）
 			F57  string  `json:"f57"`  // 代码
 			F58  string  `json:"f58"`  // 名称
-			F170 float64 `json:"f170"` // 换手率
+			F168 float64 `json:"f168"` // 换手率 ×100
+			F169 float64 `json:"f169"` // 涨跌额 ×100
+			F170 float64 `json:"f170"` // 涨跌幅 ×100
 			F162 float64 `json:"f162"` // 主力净流入
 		} `json:"data"`
 	}
@@ -365,8 +368,8 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 		Close:     raw.Data.F60 / 100,
 		Volume:    raw.Data.F48,
 		Amount:    raw.Data.F49,
-		ChangePct: raw.Data.F50,
-		Turnover:  raw.Data.F170,
+		ChangePct: raw.Data.F170 / 100,
+		Turnover:  raw.Data.F168 / 100,
 		NetInflow: raw.Data.F162,
 	}, nil
 }

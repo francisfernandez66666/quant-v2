@@ -353,6 +353,17 @@ func parseTHSQuote(body []byte, code string) (*StockInfo, error) {
 				si.Amount = v
 			}
 		}
+		// 昨收（同花顺 realhead 数组中多数版本位于索引 9）：
+		// 仅在确实存在且数值合理时用于推算涨跌幅，避免猜测错误索引污染现有字段。
+		if len(arr) > 9 {
+			if v, ok := arr[9].(float64); ok && v > 0 && si.Price > 0 {
+				ratio := si.Price / v
+				if ratio > 0.5 && ratio < 5 {
+					si.Close = v
+					si.ChangePct = (si.Price - v) / v * 100
+				}
+			}
+		}
 		if si.Price > 0 {
 			return si, nil
 		}

@@ -121,6 +121,51 @@ func (c *Client) Chat(system, user string) (string, error) {
 	return chatResp.Choices[0].Message.Content, nil
 }
 
+// consultSystemPrompt 股票咨询多轮对话的系统提示词：设定 A 股投资顾问角色。
+var consultSystemPrompt = `你是专业的A股股票投资顾问。基于用户提供的多轮对话，给出客观、专业的分析建议。
+要求：
+- 若会话中附带了"实时行情实测数据"，必须以该数据为准进行分析，并优先引用其中的数字；数据缺失时明确说明该信息无法获取，严禁编造涨跌幅、净流入、成交量、撤单、期指贴水等任何具体数值。
+- 若未提供实时数据，不得虚构具体行情数字，仅做定性分析与常识层面的提示。
+- 区分"已提供的数据"与"你的推测"，推测需明确标注。不承诺收益、不给出绝对化的买卖指令，措辞保持中性审慎。
+- 若用户要求分析具体股票而你没有该股数据，请明确提示需要哪类数据。
+- 回答简洁、分点清晰，用中文。`
+
+// ChatMessages 以多轮对话方式调用 LLM（股票咨询页使用）。
+// messages 为完整对话历史（首条应为 system 设定角色），返回模型最新回复。
+func (c *Client) ChatMessages(messages []Message) (string, error) {
+	if c.apiKey == "" {
+		return "", fmt.Errorf("LLM_API_KEY not set")
+	}
+	msgs := make([]Message, 0, len(messages)+1)
+	msgs = append(msgs, Message{Role: "system", Content: consultSystemPrompt})
+	msgs = append(msgs, messages...)
+
+	req := ChatRequest{Model: c.model, Messages: msgs}
+	data, _ := json.Marshal(req)
+	httpReq, err := http.NewRequest("POST", c.apiURL, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var chatResp ChatResponse
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return "", err
+	}
+	if len(chatResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from LLM")
+	}
+	return chatResp.Choices[0].Message.Content, nil
+}
+
 // HotTopic 热点新闻结构化分析结果。
 type HotTopic struct {
 	Title             string   `json:"title"`              // 新闻标题
