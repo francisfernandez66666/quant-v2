@@ -148,13 +148,16 @@ func TestBuildCtxD1Propagation(t *testing.T) {
 type failStrategy struct{}
 
 // Name 返回战法名称（恒为"失败战法"）。
-func (failStrategy) Name() string               { return "失败战法" }
+func (failStrategy) Name() string { return "失败战法" }
+
 // Type 返回战法类型（恒为 N 形，便于走通用评分路径）。
-func (failStrategy) Type() strategy.SignalType  { return strategy.SignalNShape }
+func (failStrategy) Type() strategy.SignalType { return strategy.SignalNShape }
+
 // Evaluate 恒返回未通过（Pass=false）且总分为 0 的评估，用于隔离测试动量信号的补发逻辑。
 func (failStrategy) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Pass: false, TotalScore: 0}, nil
 }
+
 // GenerateSignal 恒不产出信号，确保测试只关注动量补发信号。
 func (failStrategy) GenerateSignal(string, *strategy.Evaluation) (*strategy.Signal, error) {
 	return nil, nil

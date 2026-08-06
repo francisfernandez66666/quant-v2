@@ -156,32 +156,44 @@
 </template>
 
 <script setup>
+// ── 依赖导入 ──
+// ref 定义响应式；watch 侦听 visible 变化触发加载；onMounted 在组件挂载时加载
 import { ref, watch, onMounted } from 'vue'
+// 后端 API 封装：Stage 流水线记录与信号批次记录获取接口
 import * as api from '../api/index.js'
 
+// 父组件传入的可见性控制：visible 为 true 时才渲染弹窗层
 const props = defineProps({
   visible: { type: Boolean, default: false },
 })
+// 通知父组件关闭弹窗（点击遮罩 / 右上角 ✕ 时触发）
 const emit = defineEmits(['close'])
 
-const activeTab = ref('llm')
-const loading = ref(false)
+// ── 响应式状态 ──
+const activeTab = ref('llm')      // 当前激活的 tab：'llm'（LLM 分析）/ 'signal'（信号批次）
+const loading = ref(false)        // 是否正在拉取数据（刷新按钮禁用状态）
 
-const llmRecords = ref([])
-const llmIdx = ref(0)
-const llmData = ref(null)
-const llmNoData = ref(false)
-const selectedSet = ref(new Set())
+// LLM 分析 tab 状态
+const llmRecords = ref([])        // 当日全量 Stage 轮次记录（按批次）
+const llmIdx = ref(0)             // 下拉框选中的轮次索引（默认最新=0）
+const llmData = ref(null)         // 当前展示的那一轮 LLM 分析数据
+const llmNoData = ref(false)      // 是否无 LLM 记录（展示空态文案）
+const selectedSet = ref(new Set()) // 该轮次通过 Stage1 筛选的新闻索引集合
 
-const sigRecords = ref([])
-const sigIdx = ref(0)
-const sigData = ref(null)
-const sigNoData = ref(false)
+// 信号批次 tab 状态
+const sigRecords = ref([])       // 当日全量信号批次记录
+const sigIdx = ref(0)            // 下拉框选中的批次索引
+const sigData = ref(null)         // 当前展示的那一批信号数据
+const sigNoData = ref(false)      // 是否无信号批次记录（展示空态文案）
 
+/** 判断某条新闻（按原始序号 i）是否通过 Stage1 筛选 */
+// 由 selectedSet 决定模板里显示"通过"还是"过滤"徽标
 function isSelected(i) {
   return selectedSet.value.has(i)
 }
 
+/** 将当前选中的 LLM 轮次应用到展示区 */
+// 原理：从 llmRecords 按 llmIdx 取出记录，回填 llmData 与筛选索引集合
 function applyLLM() {
   const r = llmRecords.value[llmIdx.value]
   llmData.value = r || null
@@ -189,30 +201,36 @@ function applyLLM() {
   selectedSet.value = new Set(r ? r.selected_idx || [] : [])
 }
 
+/** 将当前选中的信号批次应用到展示区 */
 function applySignal() {
   const r = sigRecords.value[sigIdx.value]
   sigData.value = r || null
   sigNoData.value = !r
 }
 
+/** 切换 tab（llm <-> signal） */
+// 仅在切换后当前 tab 无数据时才触发一次加载，避免无谓重复请求
 function switchTab(t) {
   activeTab.value = t
   if ((t === 'llm' && llmData.value) || (t === 'signal' && sigData.value)) return
   if (!llmRecords.value.length && !sigRecords.value.length) load()
 }
 
+/** 格式化时间为 HH:mm:ss（用于下拉选项与概要栏显示） */
 function fmtTime(t) {
   if (!t) return '-'
   const d = new Date(t)
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+/** 并行加载 LLM 轮次记录与信号批次记录 */
 async function load() {
   if (loading.value) return
   loading.value = true
   // 两个接口独立抓取：单个失败/无数据不影响另一个 tab，
   // 避免一处出错导致两个下拉框全部清空。
   const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs()])
+  // LLM 记录有值时默认展示最新一轮，否则进入空态
   if (srRes.status === 'fulfilled' && Array.isArray(srRes.value) && srRes.value.length) {
     llmRecords.value = srRes.value
     llmIdx.value = 0
@@ -222,6 +240,7 @@ async function load() {
     llmData.value = null
     llmNoData.value = true
   }
+  // 信号批次记录同理，成功则默认展示最新一批
   if (slRes.status === 'fulfilled' && Array.isArray(slRes.value) && slRes.value.length) {
     sigRecords.value = slRes.value
     sigIdx.value = 0
@@ -234,15 +253,19 @@ async function load() {
   loading.value = false
 }
 
+// 侦听 visible：每次打开弹窗都重新拉取，
+// 避免上次关闭后到再次打开期间新产出的记录未被加载
 watch(() => props.visible, (v) => {
   // 每次打开都重新拉取，避免首次打开时后台尚未产出记录而卡在空态
   if (v) load()
 })
 
+/** 关闭弹窗：向父组件派发 close 事件 */
 function close() {
   emit('close')
 }
 
+// 挂载时若初始即为打开状态（如路由直接带着弹窗进入），补一次加载
 onMounted(() => {
   if (props.visible) load()
 })

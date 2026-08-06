@@ -14,13 +14,13 @@ import (
 // ConfrontationEvent 一条政策反制事件。
 // 由 newsagent 从涉外政策新闻关键词推导，方向多为利空（对受影响板块施压）。
 type ConfrontationEvent struct {
-	Title     string   `json:"title"`                // 事件标题
-	Content   string   `json:"content,omitempty"`    // 事件正文/摘要
-	Datetime  string   `json:"datetime"`             // 事件时间 YYYY-MM-DD HH:MM:SS
-	Sectors   []string `json:"sectors,omitempty"`    // 受影响的板块
-	Direction string   `json:"direction"`            // 方向：利好/利空
-	Impact    string   `json:"impact"`               // 影响级别：高/中/低
-	Source    string   `json:"source"`               // 来源（通常为"政策反制"）
+	Title     string   `json:"title"`             // 事件标题
+	Content   string   `json:"content,omitempty"` // 事件正文/摘要
+	Datetime  string   `json:"datetime"`          // 事件时间 YYYY-MM-DD HH:MM:SS
+	Sectors   []string `json:"sectors,omitempty"` // 受影响的板块
+	Direction string   `json:"direction"`         // 方向：利好/利空
+	Impact    string   `json:"impact"`            // 影响级别：高/中/低
+	Source    string   `json:"source"`            // 来源（通常为"政策反制"）
 }
 
 // confrontationFile 政策反制持久化文件结构。

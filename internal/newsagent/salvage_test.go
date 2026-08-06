@@ -96,7 +96,7 @@ func TestSalvageStage0ObjectsTrailingJunk(t *testing.T) {
 	}
 }
 
-// TestSalvageStage0ObjectsSingleQuote 模型把键尾引号/空值写成单引号时（"corrected_title':''"）应修复。
+// TestSalvageStage0ObjectsSingleQuote 模型把键尾引号/空值写成单引号时（"corrected_title':”"）应修复。
 func TestSalvageStage0ObjectsSingleQuote(t *testing.T) {
 	resp := `[{"index":1,"category":"official","material":false,"corrected_title':''"},{"index":2,"category":"official","material":true,"corrected_title':''"}]`
 	raw, ok := salvageStage0Objects(resp)

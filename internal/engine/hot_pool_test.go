@@ -1,3 +1,5 @@
+// 本文件：热点板块监控池相关单元测试——updateHotPool 将验证通过的板块成分股（bull/bear）去重合并
+// 并入 5s 实时监控池，空板块保持原热点、超上限（60 只）截断。
 package engine
 
 import (

@@ -161,8 +161,8 @@ func main() {
 	fetcher := data.NewFetcher(baseStocks, marketAPI, dc)
 	go fetcher.Start()
 	defer fetcher.Stop()
-	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
-	srv.SetCoordinator(dc)    // HTTP 展示层统一走该降级链，保证跨页价格一致
+	srv.SetFetcher(fetcher) // 报价接口优先读 5s 快照，缺失再降级拉取
+	srv.SetCoordinator(dc)  // HTTP 展示层统一走该降级链，保证跨页价格一致
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
 
 	// 实时触发引擎（daban式放量急拉检测，SSE 推送）

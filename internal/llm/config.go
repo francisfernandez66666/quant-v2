@@ -6,9 +6,9 @@ import "time"
 // Config LLM（大语言模型）客户端配置。
 // 包含 API 密钥、请求地址、模型名称和请求超时。
 type Config struct {
-	APIKey string        // API 密钥，用于认证
-	APIURL string        // API 请求地址（如 https://api.openai.com/v1/chat/completions）
-	Model  string        // 模型名称（如 gpt-4、deepseek-chat 等）
+	APIKey  string        // API 密钥，用于认证
+	APIURL  string        // API 请求地址（如 https://api.openai.com/v1/chat/completions）
+	Model   string        // 模型名称（如 gpt-4、deepseek-chat 等）
 	Timeout time.Duration // 单次请求超时（<=0 时 New 兜底为 60s）
 
 	// Streaming 是否启用流式（SSE）响应。默认开启；推理模型（GLM-Z1 等）在非流式下

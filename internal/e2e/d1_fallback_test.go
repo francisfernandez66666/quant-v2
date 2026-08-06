@@ -1,7 +1,8 @@
 // e2e 专项验证本次"LLM 慢响应处理"改动：
-//   1) 超时配置（llm.Config.Timeout 默认 60s、自定义生效）
-//   2) D1 失败回退上一轮评分（mock LLM 500 → BatchScore 轮询重试失败 → 复用上一轮 D1）
-//   3) 5s 近实时 ScorePool 注入 D1 缓存（N 形评分消费到 D1 分）
+//  1. 超时配置（llm.Config.Timeout 默认 60s、自定义生效）
+//  2. D1 失败回退上一轮评分（mock LLM 500 → BatchScore 轮询重试失败 → 复用上一轮 D1）
+//  3. 5s 近实时 ScorePool 注入 D1 缓存（N 形评分消费到 D1 分）
+//
 // 全部使用 testdata/fixtures.json 实盘快照 mock 外部数据源，离线可复现。
 package e2e
 
@@ -31,9 +32,10 @@ func TestLLMTimeoutConfig(t *testing.T) {
 }
 
 // TestD1FallbackAcrossRuns 实盘快照下验证 D1 失败回退：
-//   第一轮 mock LLM 正常 → D1=0.3，300308 NScore>0；
-//   第二轮 mock LLM 对 D1 返回 500 → BatchScore 3 次重试全败 → 回退上一轮 D1，
-//   断言 NScore 仍>0（回退生效），且 D1 LLM 调用确有第二次失败记录。
+//
+//	第一轮 mock LLM 正常 → D1=0.3，300308 NScore>0；
+//	第二轮 mock LLM 对 D1 返回 500 → BatchScore 3 次重试全败 → 回退上一轮 D1，
+//	断言 NScore 仍>0（回退生效），且 D1 LLM 调用确有第二次失败记录。
 func TestD1FallbackAcrossRuns(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()

@@ -6,15 +6,17 @@
 // 把每个 pipeline 阶段的中间量 + 稳定性健康检查结果导出为 JSON + CSV，供复盘调参。
 //
 // 用法:
-//   export LLM_API_KEY=xxx        # LLM 必填（新闻 Stage0/2、D1 评分依赖）
-//   go run ./cmd/backtest
-//   go run ./cmd/backtest -cycles 5 -since "2026-08-03 08:30:00" -out ./bt
+//
+//	export LLM_API_KEY=xxx        # LLM 必填（新闻 Stage0/2、D1 评分依赖）
+//	go run ./cmd/backtest
+//	go run ./cmd/backtest -cycles 5 -since "2026-08-03 08:30:00" -out ./bt
 //
 // 输出目录（默认 ./backtest_out）:
-//   report.json     — 全平台 + 全参数 + 每 cycle 阶段指标 + 健康检查 + 最终信号
-//   signals.csv     — 收敛后的做多/提醒信号明细
-//   stages.csv      — 每个 cycle 各阶段计数与时延
-//   health.csv      — 每个 cycle 的边缘交互健康检查逐项结果
+//
+//	report.json     — 全平台 + 全参数 + 每 cycle 阶段指标 + 健康检查 + 最终信号
+//	signals.csv     — 收敛后的做多/提醒信号明细
+//	stages.csv      — 每个 cycle 各阶段计数与时延
+//	health.csv      — 每个 cycle 的边缘交互健康检查逐项结果
 package main
 
 import (
@@ -470,15 +472,15 @@ func splitCSV(s string) []string {
 
 // jsonReport 回测 JSON 报告结构.
 type jsonReport struct {
-	CapturedAt   time.Time          `json:"captured_at"`
-	Since        time.Time          `json:"since"`
-	Cycles       int                `json:"cycles"`
-	Params       *config.Rules      `json:"params"` // 全参数
-	D1           *config.D1Config   `json:"d1"`
-	Watchlist    []string           `json:"watchlist"`
-	CycleStats   []cycleMetrics     `json:"cycles_stats"`
-	Health       [][]healthItem     `json:"health"`
-	Dashboard    *display.DashboardData `json:"dashboard,omitempty"`
+	CapturedAt time.Time              `json:"captured_at"`
+	Since      time.Time              `json:"since"`
+	Cycles     int                    `json:"cycles"`
+	Params     *config.Rules          `json:"params"` // 全参数
+	D1         *config.D1Config       `json:"d1"`
+	Watchlist  []string               `json:"watchlist"`
+	CycleStats []cycleMetrics         `json:"cycles_stats"`
+	Health     [][]healthItem         `json:"health"`
+	Dashboard  *display.DashboardData `json:"dashboard,omitempty"`
 }
 
 // writeJSONReport 输出 report.json（全参数 + 每 cycle 指标 + 健康项 + 最终看板）.

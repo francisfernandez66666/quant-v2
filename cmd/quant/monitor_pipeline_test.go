@@ -21,12 +21,12 @@ import (
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
-	"quant-trading-v2/internal/strategy"
-	"quant-trading-v2/internal/strategy_engine"
 	"quant-trading-v2/internal/strategies/double_bump"
 	"quant-trading-v2/internal/strategies/dragon"
 	"quant-trading-v2/internal/strategies/dragon_return"
 	"quant-trading-v2/internal/strategies/n_shape"
+	"quant-trading-v2/internal/strategy"
+	"quant-trading-v2/internal/strategy_engine"
 )
 
 // stageRes 单个测试阶段的执行结果：阶段名、是否通过、耗时(毫秒)与详情描述。
@@ -354,8 +354,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	t.Log("\n=== STAGE 10 ===")
 	r10 := runStage("10_NShapeScorer", func() (bool, string) {
 		wa := &n_shape.WaveA{
-			ADate:  time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
-			AOpen:  95.0, AHigh: 106.0, ALow: 94.0, AClose: 100.0,
+			ADate: time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
+			AOpen: 95.0, AHigh: 106.0, ALow: 94.0, AClose: 100.0,
 			AVol: 80000, AChgPct: 6.0, AAboveMA60: true,
 		}
 		ib := &n_shape.IntradayB{

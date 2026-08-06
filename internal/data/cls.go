@@ -111,10 +111,10 @@ func (m *MarketAPI) GetCLSNews(limit int) ([]NewsItem, error) {
 // 电报自带正文，Content 直接用；stock_list 名称存入 Stocks 供归因预填。
 func parseCLSNews(body []byte) ([]NewsItem, error) {
 	var raw struct {
-		Errno int    `json:"errno"`
-		Msg   string `json:"msg"`
+		Errno int    `json:"errno"` // 接口错误码（0 表示成功）
+		Msg   string `json:"msg"`   // 接口错误信息
 		Data  struct {
-			RollData []clsNewsRaw `json:"roll_data"`
+			RollData []clsNewsRaw `json:"roll_data"` // 滚动电报列表
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {

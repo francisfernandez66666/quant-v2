@@ -12,9 +12,9 @@ import (
 
 // ConsultMessage 一条咨询对话消息。
 type ConsultMessage struct {
-	Role    string    `json:"role"`     // user / assistant
-	Content string    `json:"content"`  // 消息内容
-	Time    time.Time `json:"time"`     // 发送时间
+	Role    string    `json:"role"`    // user / assistant
+	Content string    `json:"content"` // 消息内容
+	Time    time.Time `json:"time"`    // 发送时间
 }
 
 // consultFile 咨询对话持久化文件结构。

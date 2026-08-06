@@ -15,10 +15,10 @@ import (
 
 // LeaderInfo 识别出的板块龙头。
 type LeaderInfo struct {
-	Stock  data.LimitUpStock
-	Score  float64 // 龙头评分 0-100
-	Rank   int     // 板块内排名（1 起，按评分降序）
-	Reason string  // 评分理由（连板/封单/首封时间摘要）
+	Stock  data.LimitUpStock // 对应涨停池原始条目（含连板/封单/首封时间等原始数据）
+	Score  float64           // 龙头评分 0-100
+	Rank   int               // 板块内排名（1 起，按评分降序）
+	Reason string            // 评分理由（连板/封单/首封时间摘要）
 }
 
 // LimitUpAnalysis 涨停池分析结果。

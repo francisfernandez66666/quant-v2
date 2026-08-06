@@ -236,9 +236,10 @@ func (f *flexBool) UnmarshalJSON(b []byte) error {
 }
 
 // salvageStage0Objects 对 Stage0 批量响应做两段式解析（抗推理模型 JSON 结构抖动）：
-// 1) 整体当作 JSON 数组解析（正常路径）；
-// 2) 整体失败 → 逐对象抢救：用花括号深度扫描提取每个 {…} 独立解析（无视换行/逗号/包裹格式），
-//    先修复 "key":] / "key":} 的空值畸形与字符串 index/material，单个坏对象只丢该条，不整批废弃。
+//  1. 整体当作 JSON 数组解析（正常路径）；
+//  2. 整体失败 → 逐对象抢救：用花括号深度扫描提取每个 {…} 独立解析（无视换行/逗号/包裹格式），
+//     先修复 "key":] / "key":} 的空值畸形与字符串 index/material，单个坏对象只丢该条，不整批废弃。
+//
 // 返回 (解析结果, 是否获得至少一条)。
 func salvageStage0Objects(resp string) ([]stage0Judge, bool) {
 	var raw []stage0Judge

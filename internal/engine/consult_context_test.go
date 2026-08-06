@@ -1,3 +1,5 @@
+// 本文件：股票咨询上下文与数字审计相关单元测试——buildConsultContext 从消息解析股票构建实时上下文、
+// consultNoStockPrompt 提示词约束，以及 auditNumbers 对模型编造数字的剔除与可信数字的保留。
 package engine
 
 import (

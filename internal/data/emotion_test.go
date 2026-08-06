@@ -10,20 +10,20 @@ import (
 // emotionCfgStub 构造测试用情绪阈值配置（各字段对应 rules.json 的 EmotionConfig）。
 func emotionCfgStub() *config.EmotionConfig {
 	return &config.EmotionConfig{
-		EmoClimaxLimitupMin:  80,
-		EmoClimaxBoardMin:    7,
-		EmoFermentLimitupMin: 40,
-		EmoFermentLimitupMax: 79,
-		EmoFermentBoardMax:   6,
-		EmoStartLimitupMin:   15,
-		EmoStartLimitupMax:   39,
-		EmoStartBoardMax:     3,
-		EmoIceLimitupMax:     14,
-		EmoIceBoardMax:       2,
-		EmoRetreatLimitupMax: 14,
-		EmoRetreatBoardMax:   3,
+		EmoClimaxLimitupMin:   80,
+		EmoClimaxBoardMin:     7,
+		EmoFermentLimitupMin:  40,
+		EmoFermentLimitupMax:  79,
+		EmoFermentBoardMax:    6,
+		EmoStartLimitupMin:    15,
+		EmoStartLimitupMax:    39,
+		EmoStartBoardMax:      3,
+		EmoIceLimitupMax:      14,
+		EmoIceBoardMax:        2,
+		EmoRetreatLimitupMax:  14,
+		EmoRetreatBoardMax:    3,
 		EmoDivergeLimitupDrop: 15,
-		EmoDivergeBoardDrop:  2,
+		EmoDivergeBoardDrop:   2,
 	}
 }
 

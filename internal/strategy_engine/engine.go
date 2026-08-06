@@ -24,9 +24,9 @@ type Engine struct {
 	klineCacheMu sync.RWMutex                // 保护 klineCache 的读写锁（近实时打分并发访问）
 	klineCache   map[string]*klineCacheEntry // 日K/资金流缓存（近实时打分用）
 
-	benchChgMu   sync.RWMutex // 保护基准指数涨跌幅缓存
-	benchChgVal  float64      // 上证指数最新涨跌幅（%）
-	benchChgAt   time.Time    // 基准指数拉取时间（TTL 判断）
+	benchChgMu  sync.RWMutex // 保护基准指数涨跌幅缓存
+	benchChgVal float64      // 上证指数最新涨跌幅（%）
+	benchChgAt  time.Time    // 基准指数拉取时间（TTL 判断）
 }
 
 // klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。

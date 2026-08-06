@@ -58,11 +58,11 @@ type Engine struct {
 	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
 	signalRecPath string                   // 信号批次记录持久化文件路径
 
-	msgStore       *data.MessageStore        // 消息中心持久化存储
-	consultStore   *data.ConsultStore        // 股票咨询对话持久化存储（跨交易日清空）
-	confrontStore  *data.ConfrontationStore  // 政策反制事件持久化存储（跨交易日清空）
-	hotRecords []data.HotRecord   // 当日热点板块轮次记录（固化到磁盘）
-	hotRecPath string             // 热点板块记录持久化文件路径
+	msgStore      *data.MessageStore       // 消息中心持久化存储
+	consultStore  *data.ConsultStore       // 股票咨询对话持久化存储（跨交易日清空）
+	confrontStore *data.ConfrontationStore // 政策反制事件持久化存储（跨交易日清空）
+	hotRecords    []data.HotRecord         // 当日热点板块轮次记录（固化到磁盘）
+	hotRecPath    string                   // 热点板块记录持久化文件路径
 
 	sectorEventTimes map[string]time.Time  // 板块事件时间戳（重复事件衰减状态）
 	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
@@ -1431,12 +1431,12 @@ func (e *Engine) ReanalyzeNews() (map[string]int, error) {
 	na.SaveEvents(events)
 
 	stat := map[string]int{
-		"raw":    len(raw),
-		"stock":  len(st0.StockIdx),
-		"sector": len(st0.SectorIdx),
-		"ipo":    len(st0.IpoIdx),
+		"raw":     len(raw),
+		"stock":   len(st0.StockIdx),
+		"sector":  len(st0.SectorIdx),
+		"ipo":     len(st0.IpoIdx),
 		"general": len(st0.GeneralIdx),
-		"events": len(events),
+		"events":  len(events),
 	}
 	log.Printf("[engine] 补推完成: 原始%d 个股%d 板块%d IPO%d 一般%d 事件%d (err=%v)",
 		stat["raw"], stat["stock"], stat["sector"], stat["ipo"], stat["general"], stat["events"], st0.Err)

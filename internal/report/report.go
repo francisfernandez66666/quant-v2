@@ -13,20 +13,20 @@ import (
 // ExecLog 表示一条交易执行记录，对应一次完整的开仓→持仓→平仓生命周期。
 // Status 字段取值包括："持仓中"、"已止盈"、"已止损"、"已删除"。
 type ExecLog struct {
-	SignalID       string     `json:"signal_id"`        // 信号唯一标识
-	Code           string     `json:"code"`              // 股票代码（纯数字，无交易所前缀）
-	Name           string     `json:"name"`              // 股票名称
-	Direction      string     `json:"direction"`         // 交易方向：做多 / 做空
-	Strategy       string     `json:"strategy"`          // 触发入场信号的战法名称
-	EntryAt        time.Time  `json:"entry_at"`          // 开仓时间
-	EntryPrice     float64    `json:"entry_price"`       // 开仓价格
-	ExitAt         *time.Time `json:"exit_at,omitempty"` // 平仓时间（nil 表示尚未平仓）
-	ExitPrice      *float64   `json:"exit_price,omitempty"` // 平仓价格（nil 表示尚未平仓）
-	Status         string     `json:"status"`               // 记录状态：持仓中 / 已止盈 / 已止损 / 已删除
-	ProfitPct      *float64   `json:"profit_pct,omitempty"` // 盈亏百分比（正值为盈利，负值为亏损，nil 表示尚未平仓）
-	TakeProfitPct  float64    `json:"take_profit_pct"`      // 预设止盈百分比
-	StopLossPct    float64    `json:"stop_loss_pct"`        // 预设止损百分比
-	Quantity       float64    `json:"quantity"`             // 持仓数量（手动设置，默认 1）
+	SignalID      string     `json:"signal_id"`            // 信号唯一标识
+	Code          string     `json:"code"`                 // 股票代码（纯数字，无交易所前缀）
+	Name          string     `json:"name"`                 // 股票名称
+	Direction     string     `json:"direction"`            // 交易方向：做多 / 做空
+	Strategy      string     `json:"strategy"`             // 触发入场信号的战法名称
+	EntryAt       time.Time  `json:"entry_at"`             // 开仓时间
+	EntryPrice    float64    `json:"entry_price"`          // 开仓价格
+	ExitAt        *time.Time `json:"exit_at,omitempty"`    // 平仓时间（nil 表示尚未平仓）
+	ExitPrice     *float64   `json:"exit_price,omitempty"` // 平仓价格（nil 表示尚未平仓）
+	Status        string     `json:"status"`               // 记录状态：持仓中 / 已止盈 / 已止损 / 已删除
+	ProfitPct     *float64   `json:"profit_pct,omitempty"` // 盈亏百分比（正值为盈利，负值为亏损，nil 表示尚未平仓）
+	TakeProfitPct float64    `json:"take_profit_pct"`      // 预设止盈百分比
+	StopLossPct   float64    `json:"stop_loss_pct"`        // 预设止损百分比
+	Quantity      float64    `json:"quantity"`             // 持仓数量（手动设置，默认 1）
 }
 
 // Report 管理所有交易持仓记录，提供线程安全的增删改查与文件持久化能力。
@@ -178,12 +178,13 @@ func (r *Report) FindBySignalID(id string) *ExecLog {
 }
 
 // Stats 计算并返回交易统计指标：
-//   total   - 总交易笔数（不含已删除记录）
-//   holding - 当前持仓数（状态为"持仓中"）
-//   win     - 盈利笔数（已平仓且 ProfitPct > 0）
-//   winRate - 胜率百分比 = win / (win + loss) * 100
-//   avgWin  - 平均盈利百分比
-//   avgLoss - 平均亏损百分比（负值）
+//
+//	total   - 总交易笔数（不含已删除记录）
+//	holding - 当前持仓数（状态为"持仓中"）
+//	win     - 盈利笔数（已平仓且 ProfitPct > 0）
+//	winRate - 胜率百分比 = win / (win + loss) * 100
+//	avgWin  - 平均盈利百分比
+//	avgLoss - 平均亏损百分比（负值）
 func (r *Report) Stats() (total, holding, win int, winRate, avgWin, avgLoss float64) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

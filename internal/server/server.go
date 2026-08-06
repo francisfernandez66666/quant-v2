@@ -48,20 +48,20 @@ type EngineController interface {
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
 type Server struct {
-	auth        *auth.Manager                      // 认证管理器：注册/登录/临时账号/token 校验
-	agg         *display.Aggregator                // 看板数据聚合器（读取实时看板快照）
-	cfg         *config.Manager                    // 配置管理器（策略/D1/LLM 参数）
-	rpt         *report.Report                     // 交易持仓报告（开仓/平仓/统计）
-	mux         *http.ServeMux                     // 路由注册表
-	market      *data.MarketAPI                    // 行情数据 API（实时报价/板块/IPO 等）
-	ths         *data.THSClient                    // 同花顺客户端（板块行情表）
-	fetcher     *data.Fetcher                      // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
-	dc          *data.DataCoordinator              // 行情统一数据源（新浪→同花顺→东财 三级降级链）
-	watchlist   *data.WatchlistManager             // 自选股管理器
-	sse         *SSEBroker                         // SSE 事件广播器（向前端实时推送）
-	startTime   time.Time                          // 服务启动时间（用于 uptime 统计）
+	auth        *auth.Manager                                                      // 认证管理器：注册/登录/临时账号/token 校验
+	agg         *display.Aggregator                                                // 看板数据聚合器（读取实时看板快照）
+	cfg         *config.Manager                                                    // 配置管理器（策略/D1/LLM 参数）
+	rpt         *report.Report                                                     // 交易持仓报告（开仓/平仓/统计）
+	mux         *http.ServeMux                                                     // 路由注册表
+	market      *data.MarketAPI                                                    // 行情数据 API（实时报价/板块/IPO 等）
+	ths         *data.THSClient                                                    // 同花顺客户端（板块行情表）
+	fetcher     *data.Fetcher                                                      // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
+	dc          *data.DataCoordinator                                              // 行情统一数据源（新浪→同花顺→东财 三级降级链）
+	watchlist   *data.WatchlistManager                                             // 自选股管理器
+	sse         *SSEBroker                                                         // SSE 事件广播器（向前端实时推送）
+	startTime   time.Time                                                          // 服务启动时间（用于 uptime 统计）
 	llmRecreate func(apiKey, apiURL, model string, timeoutSec int, streaming bool) // 热重建 LLM 客户端
-	ctrl        EngineController                   // 引擎控制面（做多/做空开关、流水线调试数据等）
+	ctrl        EngineController                                                   // 引擎控制面（做多/做空开关、流水线调试数据等）
 
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
@@ -79,7 +79,9 @@ type Server struct {
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
-func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int, streaming bool)) { s.llmRecreate = fn }
+func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int, streaming bool)) {
+	s.llmRecreate = fn
+}
 
 // SetFetcher 注入 5s 实时行情采集器（报价接口优先读快照，缺失再降级拉取）。
 func (s *Server) SetFetcher(f *data.Fetcher) { s.fetcher = f }
@@ -788,7 +790,7 @@ type setLLMConfigReq struct {
 	APIKey     string `json:"api_key,omitempty"`
 	APIURL     string `json:"api_url"`
 	Model      string `json:"model"`
-	TimeoutSec int    `json:"timeout_sec"` // 单次请求超时（秒），缺省 0
+	TimeoutSec int    `json:"timeout_sec"`      // 单次请求超时（秒），缺省 0
 	Stream     *bool  `json:"stream,omitempty"` // 流式开关，缺省维持现状/默认开启
 }
 
@@ -796,9 +798,9 @@ type setLLMConfigReq struct {
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.GetLLMConfig()
 	writeJSON(w, 200, map[string]interface{}{
-		"api_url":  cfg.APIURL,
-		"model":    s.runtimeModel(),
-		"stream":   cfg.StreamingEnabled(),
+		"api_url":     cfg.APIURL,
+		"model":       s.runtimeModel(),
+		"stream":      cfg.StreamingEnabled(),
 		"timeout_sec": cfg.TimeoutSec,
 	})
 }
@@ -870,9 +872,9 @@ type consultReq struct {
 
 // 专业模式相关配置键（per-user，落盘 auth.json，跨重启保留）。
 const (
-	consultProModeKey      = "consult_pro_mode"       // "1"/"0"，默认关
-	consultProModeLastUsed = "consult_pro_mode_last"  // 最近一次专业咨询 Unix 秒
-	consultProModeInterval = 15 * time.Minute         // 盘中专业模式调用间隔上限
+	consultProModeKey      = "consult_pro_mode"      // "1"/"0"，默认关
+	consultProModeLastUsed = "consult_pro_mode_last" // 最近一次专业咨询 Unix 秒
+	consultProModeInterval = 15 * time.Minute        // 盘中专业模式调用间隔上限
 )
 
 // consultProModeEnabled 读取当前用户专业模式开关状态（默认关）。

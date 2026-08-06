@@ -165,22 +165,22 @@ func (m *MarketAPI) GetLHBData(date string) ([]LHBItem, error) {
 // Institution 通过检查席位说明是否含"机构"关键字标记。
 func parseLHB(body []byte) ([]LHBItem, error) {
 	var raw struct {
-		Success bool `json:"success"`
+		Success bool `json:"success"` // 接口调用是否成功
 		Result  *struct {
 			Data []struct {
-				Code      string  `json:"SECURITY_CODE"`
-				Name      string  `json:"SECURITY_NAME_ABBR"`
-				Price     float64 `json:"CLOSE_PRICE"`
-				ChangePct float64 `json:"CHANGE_RATE"`
-				Reason    string  `json:"EXPLANATION"`
-				SeatInfo  string  `json:"EXPLAIN"`
-				NetAmt    float64 `json:"BILLBOARD_NET_AMT"`
-				BuyAmt    float64 `json:"BILLBOARD_BUY_AMT"`
-				SellAmt   float64 `json:"BILLBOARD_SELL_AMT"`
-				BuySeat   float64 `json:"BUY_SEAT"`
-				SellSeat  float64 `json:"SELL_SEAT"`
-				Turnover  float64 `json:"TURNOVERRATE"`
-			} `json:"data"`
+				Code      string  `json:"SECURITY_CODE"`      // 代码
+				Name      string  `json:"SECURITY_NAME_ABBR"` // 名称
+				Price     float64 `json:"CLOSE_PRICE"`        // 收盘价
+				ChangePct float64 `json:"CHANGE_RATE"`        // 涨跌幅（%）
+				Reason    string  `json:"EXPLANATION"`        // 上榜原因
+				SeatInfo  string  `json:"EXPLAIN"`            // 席位说明
+				NetAmt    float64 `json:"BILLBOARD_NET_AMT"`  // 净买入额（元）
+				BuyAmt    float64 `json:"BILLBOARD_BUY_AMT"`  // 买入额（元）
+				SellAmt   float64 `json:"BILLBOARD_SELL_AMT"` // 卖出额（元）
+				BuySeat   float64 `json:"BUY_SEAT"`           // 买入席位数
+				SellSeat  float64 `json:"SELL_SEAT"`          // 卖出席位数
+				Turnover  float64 `json:"TURNOVERRATE"`       // 换手率（%）
+			} `json:"data"` // 龙虎榜记录数组
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {

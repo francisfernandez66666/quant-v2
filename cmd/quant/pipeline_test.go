@@ -19,12 +19,12 @@ import (
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
-	"quant-trading-v2/internal/strategy"
-	"quant-trading-v2/internal/strategy_engine"
 	"quant-trading-v2/internal/strategies/double_bump"
 	"quant-trading-v2/internal/strategies/dragon"
 	"quant-trading-v2/internal/strategies/dragon_return"
 	"quant-trading-v2/internal/strategies/n_shape"
+	"quant-trading-v2/internal/strategy"
+	"quant-trading-v2/internal/strategy_engine"
 )
 
 // mockSectorStocksJSON 根据板块代码返回模拟的东方财富成分股 JSON 响应。
@@ -207,7 +207,7 @@ func TestFullPipelineMock(t *testing.T) {
 			DownstreamSectors: []string{"白酒经销", "餐饮"},
 			RelatedStocks:     []string{"贵州茅台", "600519", "五粮液|000858"},
 			CleanedStocks:     []string{"贵州茅台|SH600519", "五粮液|SZ000858"},
-			ImpactLevel: "高", EventType: "公司", Urgency: "立即", Reason: "茅台提价带动行业利润预期",
+			ImpactLevel:       "高", EventType: "公司", Urgency: "立即", Reason: "茅台提价带动行业利润预期",
 		},
 		{
 			Title: "碳酸锂价格跌破8万 锂电板块承压", Content: "碳酸锂现货持续走低。",
@@ -216,7 +216,7 @@ func TestFullPipelineMock(t *testing.T) {
 			Sectors: []string{"新能源", "锂电池"}, UpstreamSectors: []string{"锂矿"},
 			DownstreamSectors: []string{"新能源汽车"},
 			RelatedStocks:     []string{"宁德时代", "300750", "赣锋锂业|002460"},
-			ImpactLevel: "高", EventType: "行业", Urgency: "立即", Reason: "上游价格下行压缩利润",
+			ImpactLevel:       "高", EventType: "行业", Urgency: "立即", Reason: "上游价格下行压缩利润",
 		},
 		{
 			Title: "央行降准0.5个百分点", Content: "中国人民银行宣布全面降准。",
@@ -224,7 +224,7 @@ func TestFullPipelineMock(t *testing.T) {
 			Direction: "利好", Score: 0.65,
 			Sectors: []string{"银行", "房地产", "证券"}, UpstreamSectors: []string{"金融科技"},
 			RelatedStocks: []string{"工商银行", "601398", "招商银行|600036"},
-			ImpactLevel: "高", EventType: "宏观", Urgency: "立即", Reason: "降准释放流动性利好金融",
+			ImpactLevel:   "高", EventType: "宏观", Urgency: "立即", Reason: "降准释放流动性利好金融",
 		},
 		{
 			Title: "美国对华半导体出口管制升级", Content: "美国商务部将更多中国半导体企业列入实体清单。",
@@ -233,16 +233,16 @@ func TestFullPipelineMock(t *testing.T) {
 			Sectors: []string{"半导体", "芯片"}, UpstreamSectors: []string{"半导体设备", "电子化学品"},
 			DownstreamSectors: []string{"消费电子"},
 			RelatedStocks:     []string{"中芯国际|688981", "北方华创|002371"},
-			ImpactLevel: "中", EventType: "宏观", Urgency: "关注", Reason: "出口管制升级打压半导体",
+			ImpactLevel:       "中", EventType: "宏观", Urgency: "关注", Reason: "出口管制升级打压半导体",
 		},
 		{
 			Title: "科大讯飞星火大模型4.0发布", Content: "科大讯飞发布星火大模型4.0。",
 			Datetime: now.Format("2006-01-02 15:04:05"), Source: "同花顺",
 			Direction: "利好", Score: 0.75,
-			Sectors: []string{"人工智能"},
+			Sectors:       []string{"人工智能"},
 			RelatedStocks: []string{"科大讯飞", "002230", "寒武纪|688256"},
 			CleanedStocks: []string{"科大讯飞|SZ002230", "寒武纪|SH688256"},
-			ImpactLevel: "高", EventType: "行业", Urgency: "立即", Reason: "AI大模型发布",
+			ImpactLevel:   "高", EventType: "行业", Urgency: "立即", Reason: "AI大模型发布",
 		},
 		{
 			Title: "茅台提价——个股利好", Content: "贵州茅台提价20%。",
@@ -483,14 +483,14 @@ func TestFullPipelineMock(t *testing.T) {
 // 验证评分器 Evaluate 的得分计算是否符合预期（D1 事件分、D2 强度分、D3 回调分、D4 承接分、总分 >= 60 触发有效信号）。
 func TestNShapeScorer(t *testing.T) {
 	wa := &n_shape.WaveA{
-		ADate:       time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
-		AOpen:       95.0,
-		AHigh:       106.0,
-		ALow:        94.0,
-		AClose:      100.0,
-		AVol:        80000,
-		AChgPct:     6.0, // >= 5% → 通过 morphologyGate
-		AAboveMA60:  true,
+		ADate:      time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
+		AOpen:      95.0,
+		AHigh:      106.0,
+		ALow:       94.0,
+		AClose:     100.0,
+		AVol:       80000,
+		AChgPct:    6.0, // >= 5% → 通过 morphologyGate
+		AAboveMA60: true,
 	}
 	ib := &n_shape.IntradayB{
 		TTime:         945, // 9:45
@@ -500,15 +500,15 @@ func TestNShapeScorer(t *testing.T) {
 		PrevHigh:      106.0,
 		PrevLow:       95.0,
 		AvgDailyVol:   100000,
-		AuctionChgPct: 2.5,   // 1.5%~5.0% → D2a=15
+		AuctionChgPct: 2.5, // 1.5%~5.0% → D2a=15
 		BenchCurChg:   0.5,
 		MinuteMACDDIF: 0.5,
 		MinuteMACDDEA: 0.3, // DIF > DEA && DIF > 0 → D4a=5
 	}
 	ctx := &n_shape.Ctx{
-		LLMD1Score: 0.5,   // D1 = 0.5 * 40 = 20
-		LLMBlocked: false,
-		StockPE:    12,    // < 15 → D3=20
+		LLMD1Score:  0.5, // D1 = 0.5 * 40 = 20
+		LLMBlocked:  false,
+		StockPE:     12, // < 15 → D3=20
 		AvgDailyVol: 100000,
 	}
 

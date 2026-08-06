@@ -294,7 +294,7 @@ func parseTHSQuote(body []byte, code string) (*StockInfo, error) {
 
 	var raw struct {
 		Data struct {
-			Items map[string][]interface{} `json:"items"`
+			Items map[string][]interface{} `json:"items"` // 个股数组，key 为证券ID
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {

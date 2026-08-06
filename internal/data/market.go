@@ -56,9 +56,9 @@ type MarketAPI struct {
 	quoteMu    sync.Mutex
 	quoteCache map[string]cachedQuote // 实时行情 TTL 缓存
 
-	peMu   sync.Mutex              // 保护 PE 缓存的读写
-	peTTL  time.Duration           // PE 缓存有效期（PE 变动低频）
-	peMap  map[string]peCacheEntry // code → PE 缓存条目
+	peMu  sync.Mutex              // 保护 PE 缓存的读写
+	peTTL time.Duration           // PE 缓存有效期（PE 变动低频）
+	peMap map[string]peCacheEntry // code → PE 缓存条目
 }
 
 // peCacheEntry PE 缓存条目。
@@ -409,8 +409,8 @@ func (m *MarketAPI) GetSectorList() ([]SectorInfo, error) {
 func parseSectorList(body []byte) ([]SectorInfo, error) {
 	var raw struct {
 		Data *struct {
-			Total int                      `json:"total"`
-			Diff  map[string]sectorRawItem `json:"diff"`
+			Total int                      `json:"total"` // 板块总数
+			Diff  map[string]sectorRawItem `json:"diff"`  // 板块明细（key 为索引）
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -672,7 +672,7 @@ func (m *MarketAPI) GetKLine(code, period string, count int) ([]KLine, error) {
 	}
 	var raw struct {
 		Data struct {
-			KLines []string `json:"klines"`
+			KLines []string `json:"klines"` // K 线 CSV 行数组
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -747,7 +747,7 @@ type sinaNewsItemRaw struct {
 func parseSinaNews(body []byte) ([]NewsItem, error) {
 	var raw struct {
 		Result struct {
-			Data []sinaNewsItemRaw `json:"data"`
+			Data []sinaNewsItemRaw `json:"data"` // 新闻条目数组
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -797,11 +797,11 @@ func parseEastMoneyNews(body []byte) ([]NewsItem, error) {
 	var raw struct {
 		Data struct {
 			List []struct {
-				Title    string `json:"title"`
-				Content  string `json:"content"`
-				ShowTime string `json:"show_time"`
-				Source   string `json:"source"`
-			} `json:"list"`
+				Title    string `json:"title"`     // 标题
+				Content  string `json:"content"`   // 正文摘要
+				ShowTime string `json:"show_time"` // 发布时间
+				Source   string `json:"source"`    // 来源
+			} `json:"list"` // 快讯列表
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -888,14 +888,14 @@ func (m *MarketAPI) GetTonghuashunNewsPage(page, pageSize int) ([]NewsItem, erro
 // code 非 "200" 表示接口异常，直接返回错误。
 func parseTonghuashunNews(body []byte) ([]NewsItem, error) {
 	var raw struct {
-		Code string `json:"code"`
+		Code string `json:"code"` // 接口状态码（"200" 表示成功）
 		Data struct {
 			List []struct {
-				Title  string `json:"title"`
-				Digest string `json:"digest"`
-				Ctime  string `json:"ctime"`
-				Url    string `json:"url"`
-			} `json:"list"`
+				Title  string `json:"title"`  // 标题
+				Digest string `json:"digest"` // 摘要
+				Ctime  string `json:"ctime"`  // 发布时间
+				Url    string `json:"url"`    // 原文链接
+			} `json:"list"` // 快讯列表
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -1048,15 +1048,15 @@ func (m *MarketAPI) GetEastMoneyIPOCalendar() ([]IPOEvent, error) {
 // parseEastMoneyIPO 解析东方财富新股日历 JSON。
 func parseEastMoneyIPO(body []byte) ([]IPOEvent, error) {
 	var raw struct {
-		Success bool `json:"success"`
+		Success bool `json:"success"` // 接口调用是否成功
 		Result  struct {
 			Data []struct {
-				SecurityCode string  `json:"SECURITY_CODE"`
-				SecurityName string  `json:"SECURITY_NAME"`
-				ApplyDate    string  `json:"APPLY_DATE"`
-				IssuePrice   float64 `json:"ISSUE_PRICE"`
-				ListingDate  string  `json:"LISTING_DATE"`
-			} `json:"data"`
+				SecurityCode string  `json:"SECURITY_CODE"` // 股票代码
+				SecurityName string  `json:"SECURITY_NAME"` // 股票名称
+				ApplyDate    string  `json:"APPLY_DATE"`    // 申购日期
+				IssuePrice   float64 `json:"ISSUE_PRICE"`   // 发行价（元）
+				ListingDate  string  `json:"LISTING_DATE"`  // 上市日期
+			} `json:"data"` // IPO 记录数组
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -1226,7 +1226,7 @@ func (m *MarketAPI) GetStockMoneyFlow(code string) (*CapitalFlow, error) {
 func parseMoneyFlow(body []byte, code string) (*CapitalFlow, error) {
 	var raw struct {
 		Data struct {
-			KLines []string `json:"klines"`
+			KLines []string `json:"klines"` // 资金流 CSV 行数组
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -1367,7 +1367,7 @@ func (m *MarketAPI) GetStockPE(code string) float64 {
 	}
 	var raw struct {
 		Data *struct {
-			Diff []stockRawItem `json:"diff"`
+			Diff []stockRawItem `json:"diff"` // 查询命中的股票行
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil || raw.Data == nil || len(raw.Data.Diff) == 0 {
@@ -1409,8 +1409,8 @@ func (m *MarketAPI) GetStockList() (map[string]string, error) {
 	}
 	var raw struct {
 		Data *struct {
-			Total int                     `json:"total"`
-			Diff  map[string]stockRawItem `json:"diff"`
+			Total int                     `json:"total"` // 股票总数
+			Diff  map[string]stockRawItem `json:"diff"`  // 股票明细（key 为索引）
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {

@@ -13,10 +13,10 @@ import (
 // retaliationRule 政策反制关键词匹配规则。
 // 命中的标题将推导为对应板块与方向的 ConfrontationEvent。
 type retaliationRule struct {
-	keywords []string // 触发关键词（任一命中即可）
-	sectors  []string // 受影响板块
-	direction string  // 方向：利好/利空
-	impact   string   // 影响级别：高/中/低
+	keywords  []string // 触发关键词（任一命中即可）
+	sectors   []string // 受影响板块
+	direction string   // 方向：利好/利空
+	impact    string   // 影响级别：高/中/低
 }
 
 // retaliationRules 政策反制识别规则表。

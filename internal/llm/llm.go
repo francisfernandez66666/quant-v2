@@ -17,11 +17,11 @@ import (
 
 // Client LLM API 客户端，封装与 SiliconFlow 对话接口的通信。
 type Client struct {
-	httpClient *http.Client // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
-	apiKey     string       // API 密钥（Authorization: Bearer）
-	apiURL     string       // chat/completions 请求地址
-	model      string       // 模型名称
-	streaming  bool         // 是否启用流式（SSE）响应；false 走一次性非流式
+	httpClient  *http.Client  // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
+	apiKey      string        // API 密钥（Authorization: Bearer）
+	apiURL      string        // chat/completions 请求地址
+	model       string        // 模型名称
+	streaming   bool          // 是否启用流式（SSE）响应；false 走一次性非流式
 	idleTimeout time.Duration // 流式下相邻分片空闲阈值（超过视为卡死）
 }
 
@@ -767,26 +767,26 @@ var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
 
 // stage2Row Stage2 批量返回的单行（容错：index 兼容字符串）。
 type stage2Row struct {
-	Index               flexInt        `json:"index"`
-	Level               string         `json:"level"`
-	Sentiment           string         `json:"sentiment"`
-	Score               flexibleFloat  `json:"score"`
-	ImpactLevel         string         `json:"impact_level"`
-	EventType           string         `json:"event_type"`
-	Urgency             string         `json:"urgency"`
-	Direction           string         `json:"direction"`
-	Sectors             []string       `json:"sectors"`
-	UpstreamSectors     []string       `json:"upstream_sectors"`
-	DownstreamSectors   []string       `json:"downstream_sectors"`
-	RelatedStocks       []string       `json:"related_stocks"`
-	UpstreamStocks      []string       `json:"upstream_stocks"`
-	DownstreamStocks    []string       `json:"downstream_stocks"`
-	Strategy            string         `json:"strategy"`
-	Reason              string         `json:"reason"`
-	Region              string         `json:"region"`
-	Relation            string         `json:"relation"`
-	UpstreamDirection   string         `json:"upstream_direction"`
-	DownstreamDirection string         `json:"downstream_direction"`
+	Index               flexInt       `json:"index"`
+	Level               string        `json:"level"`
+	Sentiment           string        `json:"sentiment"`
+	Score               flexibleFloat `json:"score"`
+	ImpactLevel         string        `json:"impact_level"`
+	EventType           string        `json:"event_type"`
+	Urgency             string        `json:"urgency"`
+	Direction           string        `json:"direction"`
+	Sectors             []string      `json:"sectors"`
+	UpstreamSectors     []string      `json:"upstream_sectors"`
+	DownstreamSectors   []string      `json:"downstream_sectors"`
+	RelatedStocks       []string      `json:"related_stocks"`
+	UpstreamStocks      []string      `json:"upstream_stocks"`
+	DownstreamStocks    []string      `json:"downstream_stocks"`
+	Strategy            string        `json:"strategy"`
+	Reason              string        `json:"reason"`
+	Region              string        `json:"region"`
+	Relation            string        `json:"relation"`
+	UpstreamDirection   string        `json:"upstream_direction"`
+	DownstreamDirection string        `json:"downstream_direction"`
 }
 
 // flexInt 兼容 JSON 中整数为数字或字符串（1 / "1"）的解析。
