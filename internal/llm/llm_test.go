@@ -2,22 +2,31 @@ package llm
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
-// TestAnalyzeHotTopicBatchDropsOnFailure LLM 批量失败（重试耗尽）时返回 nil + error，
-// 不再用关键词兜底产出结果，由调用方丢弃该批。
-func TestAnalyzeHotTopicBatchDropsOnFailure(t *testing.T) {
+// TestAnalyzeHotTopicBatchIsolatesSubBatch LLM 批量失败（重试耗尽）时子批隔离：
+// 返回非 nil 结果（用关键词兜底占位），不返回错误，主干继续。
+func TestAnalyzeHotTopicBatchIsolatesSubBatch(t *testing.T) {
 	c := New(Config{APIKey: ""}) // 无 key → Chat 必然失败
 	titles := []string{"某公司涨停", "海外指数小幅波动", "某公司业绩暴跌"}
 
 	results, err := c.AnalyzeHotTopicBatch(titles)
-	if err == nil {
-		t.Fatalf("期望返回错误（LLM 未配置），实际无错误")
+	if err != nil {
+		t.Fatalf("子批隔离后不应返回错误，实际 %v", err)
 	}
-	if results != nil {
-		t.Fatalf("期望失败时返回 nil（丢弃该批），实际返回 %d 条", len(results))
+	if len(results) != len(titles) {
+		t.Fatalf("期望返回 %d 条兜底占位，实际 %d", len(titles), len(results))
+	}
+	for i, ht := range results {
+		if ht == nil {
+			t.Fatalf("第%d条应得到兜底占位，实际 nil", i)
+		}
 	}
 }
 
@@ -136,5 +145,150 @@ func TestChatMessagesRequiresAPIKey(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "LLM_API_KEY") {
 		t.Fatalf("期望错误提示缺少 API Key，实际 %v", err)
+	}
+}
+
+// TestParseHotTopicBatchTwoStage 整体数组带畸形对象时，逐对象抢救应捞回完好对象，
+// 无法修复的坏对象（如 "score"):0 键冒号间夹杂括号）只丢该条，不连累其余。
+func TestParseHotTopicBatchTwoStage(t *testing.T) {
+	resp := `[
+{"index":1,"level":"板块","direction":"利好","score":0.75,"sectors":["半导体材料"],"related_stocks":["云南锗业","有研新材"]},
+{"index":2,"level":"板块","direction":"利空","score":-0.75,"sectors":["光模块"]},
+{"index":3,"level":"个股","direction":"中性","score"):0,"sectors":[]}
+]`
+	raw, err := parseHotTopicBatch(resp)
+	if err != nil {
+		t.Fatalf("两段式解析应成功: %v", err)
+	}
+	if len(raw) != 2 {
+		t.Fatalf("坏对象(3)应被丢弃, 期望2条实际 %d: %+v", len(raw), raw)
+	}
+	if int(raw[0].Index) != 1 || raw[0].Direction != "利好" {
+		t.Fatalf("第1条应保留: %+v", raw[0])
+	}
+	if int(raw[1].Index) != 2 || raw[1].Direction != "利空" {
+		t.Fatalf("第2条应保留: %+v", raw[1])
+	}
+}
+
+// TestParseHotTopicBatchStringIndex 模型把 index 输出为字符串（"1"）时应容错。
+func TestParseHotTopicBatchStringIndex(t *testing.T) {
+	raw, err := parseHotTopicBatch(`[{"index":"1","level":"板块","direction":"利好"}]`)
+	if err != nil || len(raw) != 1 || int(raw[0].Index) != 1 {
+		t.Fatalf("字符串 index 应容错: err=%v raw=%+v", err, raw)
+	}
+}
+
+// TestParseHotTopicBatchAllBroke 完全没有可解析对象时返回错误（触发重试队列）。
+func TestParseHotTopicBatchAllBroke(t *testing.T) {
+	_, err := parseHotTopicBatch(`garbage without braces`)
+	if err == nil {
+		t.Fatalf("应判定解析失败")
+	}
+}
+
+// sseServer 构造一个按 handler 返回响应的 httptest 服务器，客户端指向该服务器。
+func sseServer(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	c := New(Config{
+		APIKey:            "test-key",
+		APIURL:            srv.URL + "/v1/chat/completions",
+		Model:             "test-model",
+		Timeout:           5 * time.Second,
+		Streaming:         true,
+		StreamIdleTimeout: 300 * time.Millisecond,
+	})
+	return c, srv
+}
+
+// TestStreamChatSuccess 流式分片累加 content、忽略 reasoning_content、遇 [DONE] 结束。
+func TestStreamChatSuccess(t *testing.T) {
+	chunk := func(delta string) string {
+		return fmt.Sprintf(`data: {"choices":[{"delta":{"content":%q}}]}`+"\n\n", delta)
+	}
+	var hits int
+	c, _ := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, chunk("美股"))
+		fmt.Fprint(w, chunk("上涨"))
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"","reasoning_content":"思维链"}}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	got, err := c.Chat("system", "user")
+	if err != nil {
+		t.Fatalf("流式调用应成功: %v", err)
+	}
+	if got != "美股上涨" {
+		t.Fatalf("应只累加 content 且忽略 reasoning, 实际 %q", got)
+	}
+	if hits != 1 {
+		t.Fatalf("流式成功不应回落非流式, 请求次数=%d", hits)
+	}
+}
+
+// TestStreamChatIdleTimeout 相邻分片间隔超过空闲阈值判定卡死返回错误。
+func TestStreamChatIdleTimeout(t *testing.T) {
+	c, _ := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"第一片"}}]}`+"\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(600 * time.Millisecond) // 超过 idleTimeout=300ms
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"第二片"}}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	_, err := c.Chat("system", "user")
+	if err == nil || !strings.Contains(err.Error(), "空闲超时") {
+		t.Fatalf("分片间隔超阈值应报空闲超时, 实际 %v", err)
+	}
+}
+
+// TestStreamChatStatusError 非 2xx 状态码应返回带状态码的错误。
+func TestStreamChatStatusError(t *testing.T) {
+	c, _ := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"rate limit"}`, http.StatusTooManyRequests)
+	})
+	_, err := c.Chat("system", "user")
+	if err == nil || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("应返回 429 错误, 实际 %v", err)
+	}
+}
+
+// TestStreamChatFallbackNonStream 上游对 stream=true 返回普通 JSON（非 SSE）时，
+// 流式解析无有效内容应自动回落到非流式成功取回。
+func TestStreamChatFallbackNonStream(t *testing.T) {
+	reply := `{"choices":[{"message":{"role":"assistant","content":"非流式答复"}}]}`
+	c, _ := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, reply)
+	})
+	got, err := c.Chat("system", "user")
+	if err != nil {
+		t.Fatalf("应回落到非流式成功: %v", err)
+	}
+	if got != "非流式答复" {
+		t.Fatalf("应取到非流式内容, 实际 %q", got)
+	}
+}
+
+// TestNonStreamChat 关闭流式开关后走一次性非流式取回。
+func TestNonStreamChat(t *testing.T) {
+	reply := `{"choices":[{"message":{"role":"assistant","content":"一次性答复"}}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Stream {
+			t.Errorf("streaming=false 时不应发送 stream=true")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, reply)
+	}))
+	defer srv.Close()
+	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: false, Timeout: 5 * time.Second})
+	got, err := c.Chat("system", "user")
+	if err != nil || got != "一次性答复" {
+		t.Fatalf("非流式应成功: err=%v got=%q", err, got)
 	}
 }

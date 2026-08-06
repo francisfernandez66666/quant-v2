@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,49 +164,149 @@ func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, erro
 			sb.WriteString(fmt.Sprintf("%d. %s\n正文: %s\n", i-start+1, titles[i], body))
 		}
 
-		// LLM 轮询重试：指数退避最多 5 次（1s/2s/4s/8s），应对上游瞬时抖动/连不通
-		resp, err := retryLLM(sb.String(), func() (string, error) {
-			return a.llmClient.Chat(stageCombinedSystemPrompt, sb.String())
-		})
+		// 调用+解析统一进重试队列：API 连接失败 与 JSON 解析失败 都纳入轮询重试
+		//（解析失败不再直接吞掉，而是与调用失败同样退避重试）。
+		// 该批重试到头仍解析不出 → 隔离跳过本批（丢本批，不影响主干其余批次）。
+		raw, err := a.stage0ParseRetry(sb.String())
 		if err != nil {
-			// 留痕：打印该批序号与标题，便于事后定位是哪批/哪些新闻没被分析
-			trace := make([]string, 0, 3)
-			for i := start; i < min(end, start+3); i++ {
-				trace = append(trace, titles[i])
-			}
-			ellipsis := ""
-			if end-start > 3 {
-				ellipsis = fmt.Sprintf("…(共%d条)", end-start)
-			}
-			log.Printf("[newsagent] Stage0/1合并 LLM轮询重试仍失败, 该批%d条归一般(不降级): %v；本批前几条: %v%v",
-				end-start, err, trace, ellipsis)
-			return nil, err
-		}
-
-		// 清洗 markdown 围栏后解析 JSON 数组
-		resp = cleanJSON(resp)
-		var raw []struct {
-			Index     int    `json:"index"`           // LLM 返回的序号（1 起）
-			Category  string `json:"category"`        // official/institution/interactive/overseas
-			Material  bool   `json:"material"`        // 是否有投资参考价值
-			Corrected string `json:"corrected_title"` // 标题党校正标题
-		}
-		if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-			log.Printf("[newsagent] Stage0/1合并 JSON解析失败, 该批%d条归一般(不降级): %v", end-start, err)
-			return nil, err
+			os.WriteFile("/tmp/5t0_fail_"+time.Now().Format("150405")+".json", []byte(sb.String()), 0o644)
+			log.Printf("[newsagent] Stage0/1合并 该批%d条重试队列用尽仍解析失败, 跳过本批(主干继续): %v", end-start, err)
+			continue
 		}
 		// 将批内序号映射回全局索引并落盘到结果切片（越界序号安全忽略）
 		for _, r := range raw {
-			if r.Index < 1 || r.Index > end-start {
+			if r.Index < 1 || int(r.Index) > end-start {
 				continue
 			}
-			idx := start + r.Index - 1
+			idx := start + int(r.Index) - 1
 			out[idx].Official = strings.EqualFold(r.Category, "official")
-			out[idx].Material = r.Material
+			out[idx].Material = bool(r.Material)
 			out[idx].CorrectedTitle = strings.TrimSpace(r.Corrected)
 		}
 	}
 	return out, nil
+}
+
+// stage0EmptyValueRe 匹配对象键与空值畸形：`"key":]` 或 `"key":}`（模型丢了值直接写括号）。
+// 修复为 `"key": ""`，覆盖单个对象解析时的空值缺失。
+var stage0EmptyValueRe = regexp.MustCompile(`("(?:[^"\\]|\\.)*"\s*:)\s*[}\]]`)
+
+// trailingJunkRe 匹配字符串收引号后紧跟的杂散 `)`/`'`（如 "上涨"") 、"死"'} ），
+// 归一为单收引号，恢复为合法 JSON。
+var trailingJunkRe = regexp.MustCompile(`"\s*[\)']+\s*([,}\]]|$)`)
+
+// stage0Obj matches a single Stage0 judgement object shape.
+type stage0Judge struct {
+	Index     flexInt  `json:"index"`
+	Category  string   `json:"category"`
+	Material  flexBool `json:"material"`
+	Corrected string   `json:"corrected_title"`
+}
+
+// flexInt 兼容 JSON 中整数字段为数字或字符串（如 1 或 "1"）的解析。
+// 推理模型常把数值输出成带引号字符串，标准 json.Unmarshal 到 int 会失败。
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(strings.Trim(string(b), `"`))
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		*f = 0
+	}
+	*f = flexInt(v)
+	return nil
+}
+
+// flexBool 兼容 JSON 中布尔字段为布尔或字符串（如 true 或 "true"）的解析。
+type flexBool bool
+
+func (f *flexBool) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(strings.Trim(string(b), `"`))
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		*f = false
+		return nil
+	}
+	*f = flexBool(v)
+	return nil
+}
+
+// salvageStage0Objects 对 Stage0 批量响应做两段式解析（抗推理模型 JSON 结构抖动）：
+// 1) 整体当作 JSON 数组解析（正常路径）；
+// 2) 整体失败 → 逐对象抢救：用花括号深度扫描提取每个 {…} 独立解析（无视换行/逗号/包裹格式），
+//    先修复 "key":] / "key":} 的空值畸形与字符串 index/material，单个坏对象只丢该条，不整批废弃。
+// 返回 (解析结果, 是否获得至少一条)。
+func salvageStage0Objects(resp string) ([]stage0Judge, bool) {
+	var raw []stage0Judge
+	if err := json.Unmarshal([]byte(resp), &raw); err == nil {
+		return raw, true
+	}
+	var out []stage0Judge
+	for _, obj := range extractObjects(resp) {
+		// 单引号畸形：模型把键尾引号/空值写成单引号，如 "corrected_title':''"，
+		// 修复为 "corrected_title":""。
+		obj = strings.ReplaceAll(obj, `':''`, `":"`)
+		// 字符串收尾垃圾：`"上涨"")` / `"死"'} `（收引号后多引号/括号/撇号）→ 归一为收引号。
+		obj = trailingJunkRe.ReplaceAllString(obj, `"$1`)
+		obj = stage0EmptyValueRe.ReplaceAllString(obj, `$1""`)
+		var one stage0Judge
+		if err := json.Unmarshal([]byte(obj), &one); err == nil {
+			out = append(out, one)
+		} else {
+			log.Printf("[newsagent] Stage0逐对象抢救跳过 1 条: %s", truncateRunes(obj, 80))
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	log.Printf("[newsagent] Stage0整体解析失败, 逐对象抢救成功 %d 条", len(out))
+	return out, true
+}
+
+// extractObjects 用花括号配对扫描提取字符串中所有独立的 JSON 对象 `{...}`（含嵌套），
+// 无视换行/逗号/数组包裹等格式差异（推理模型的输出排版不可靠）。
+func extractObjects(s string) []string {
+	var objs []string
+	start := -1
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if c == '\\' {
+			esc = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch c {
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 && start >= 0 {
+				objs = append(objs, s[start:i+1])
+				start = -1
+			}
+		}
+	}
+	return objs
 }
 
 // truncateRunes 按字符数截断字符串（超出部分截断），避免超长正文撑爆 prompt。
@@ -306,13 +409,48 @@ func newsTitles(items []data.NewsItem) []string {
 }
 
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
-const llmBatchSize = 30
+// 推理模型（GLM-Z1-9B）对大批次首 token 极慢，30 条会 240s 超时等不到响应头，
+// 调小到 10 条使单批在超时内完成，代价是多几次调用（更稳）。
+const llmBatchSize = 10
 
 // llmRetryMax LLM 单次调用的最大重试次数（含首次），指数退避，应对上游瞬时抖动/连不通。
 const llmRetryMax = 5
 
 // retryLLM 以指数退避方式重试一次 LLM 调用：失败重试 5 次，间隔 1s/2s/4s/8s。
 // 返回 (响应, 最后一次错误)。记录每次失败以便排障。
+// stage0ParseRetry 单批"调用+解析"的重试循环（重试队列）：API 失败 与 JSON 解析失败 一律退避重试，
+// 任一次调用能抢救出 ≥1 条即成功（局部坏对象已由 salvageStage0Objects 内部跳过），
+// 全部失败返回错误，由调用方将该批隔离跳过（不影响主干其余批次）。
+func (a *Agent) stage0ParseRetry(userMsg string) ([]stage0Judge, error) {
+	var lastErr error
+	for attempt := 1; attempt <= llmRetryMax; attempt++ {
+		resp, err := a.llmClient.Chat(stageCombinedSystemPrompt, userMsg)
+		if err == nil {
+			resp = cleanJSON(resp)
+			if judges, ok := salvageStage0Objects(resp); ok {
+				return judges, nil
+			}
+			lastErr = fmt.Errorf("批次JSON解析失败(整体+逐对象抢救均无效)")
+		} else {
+			lastErr = err
+		}
+		log.Printf("[newsagent] Stage0调用/解析失败(第%d/%d次): %v", attempt, llmRetryMax, lastErr)
+		if attempt < llmRetryMax {
+			time.Sleep(backoffStep(attempt))
+		}
+	}
+	return nil, fmt.Errorf("重试队列用尽(%d次): %v", llmRetryMax, lastErr)
+}
+
+// backoffStep 第 attempt 次失败后的退避间隔（指数递增，1s/2s/4s/8s/16s 封顶）。
+func backoffStep(attempt int) time.Duration {
+	base := []time.Duration{1, 2, 4, 8, 16}
+	if attempt-1 < len(base) {
+		return base[attempt-1] * time.Second
+	}
+	return 16 * time.Second
+}
+
 func retryLLM(userMsg string, call func() (string, error)) (string, error) {
 	var resp string
 	var err error
@@ -493,5 +631,54 @@ func cleanJSON(s string) string {
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
-	return s
+	// 提取 JSON 数组边界（第一个 [ 到最后一个 ]）——推理模型会在 JSON 前输出思考过程。
+	if start := strings.IndexByte(s, '['); start >= 0 {
+		if end := strings.LastIndexByte(s, ']'); end > start {
+			s = s[start : end+1]
+		}
+	}
+	s = strings.TrimRight(s, ".,; ")
+	// 剥离数值位置的裸 '+' 前缀（"score": +0.75 是非法 JSON 数字）。
+	s = plusNumberRe.ReplaceAllString(s, "$1 ")
+	// 清洗非法转义（\( 等）与字符串内未转义换行；并修复对象键后单引号/空值畸形。
+	var buf strings.Builder
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\\' && i+1 < len(s) {
+			next := s[i+1]
+			if !isValidJSONEscape(next) {
+				buf.WriteByte(next)
+				i++
+				continue
+			}
+			buf.WriteByte(ch)
+			buf.WriteByte(next)
+			i++
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			buf.WriteByte(ch)
+			continue
+		}
+		if inStr && (ch == '\n' || ch == '\r') {
+			buf.WriteString("\\n")
+		} else {
+			buf.WriteByte(ch)
+		}
+	}
+	return buf.String()
 }
+
+// isValidJSONEscape 判断字节是否为合法 JSON 转义字符。
+func isValidJSONEscape(b byte) bool {
+	switch b {
+	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+		return true
+	}
+	return false
+}
+
+// plusNumberRe 匹配冒号/逗号/左括号后的 '+' 前缀（数值位置），用于剥离非法 '+'。
+var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)

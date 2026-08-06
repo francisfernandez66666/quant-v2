@@ -10,4 +10,12 @@ type Config struct {
 	APIURL string        // API 请求地址（如 https://api.openai.com/v1/chat/completions）
 	Model  string        // 模型名称（如 gpt-4、deepseek-chat 等）
 	Timeout time.Duration // 单次请求超时（<=0 时 New 兜底为 60s）
+
+	// Streaming 是否启用流式（SSE）响应。默认开启；推理模型（GLM-Z1 等）在非流式下
+	// 需等整段含思维链生成完毕才返回响应头，易误判"等待响应头超时"。
+	// Streaming=false 时回落到非流式一次性取回，供不支持 SSE 的上游兜底。
+	Streaming bool
+	// StreamIdleTimeout 流式下"相邻数据分片"的空闲阈值：超过则认为模型卡死（区别于
+	// 仍在思维链输出的心跳），返回错误交由上层走重试队列。<=0 时 New 兜底为 60s。
+	StreamIdleTimeout time.Duration
 }

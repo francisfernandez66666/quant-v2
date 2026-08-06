@@ -2,6 +2,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,8 @@ type Client struct {
 	apiKey     string       // API 密钥（Authorization: Bearer）
 	apiURL     string       // chat/completions 请求地址
 	model      string       // 模型名称
+	streaming  bool         // 是否启用流式（SSE）响应；false 走一次性非流式
+	idleTimeout time.Duration // 流式下相邻分片空闲阈值（超过视为卡死）
 }
 
 // DefaultModel 未显式指定模型时的默认模型。
@@ -27,6 +30,9 @@ const DefaultModel = "THUDM/GLM-Z1-9B-0414"
 
 // DefaultTimeout 未显式指定超时时的默认单次请求超时（慢 LLM 响应兜底）。
 const DefaultTimeout = 60 * time.Second
+
+// DefaultStreamIdleTimeout 流式下默认"相邻分片空闲"阈值：超过视为模型卡死。
+const DefaultStreamIdleTimeout = 60 * time.Second
 
 // Timeout 返回客户端单次请求超时时间（供配置校验/展示）。
 func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
@@ -43,18 +49,28 @@ func New(cfg Config) *Client {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultTimeout
 	}
+	if cfg.StreamIdleTimeout <= 0 {
+		cfg.StreamIdleTimeout = DefaultStreamIdleTimeout
+	}
+
+	transport := &http.Transport{
+		ForceAttemptHTTP2: false,
+		// 响应头等待单独限时：流式下首个分片秒级即到，此字段是"服务端迟迟不开始
+		// 生成/协议不兼容"时的兜底，避免整段等待被统一超时吃掉。
+		ResponseHeaderTimeout: cfg.Timeout,
+	}
 
 	// 可配置超时；禁用 HTTP2（ForceAttemptHTTP2=false），强制走 HTTP1.1 规避连接复用问题
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
-			Transport: &http.Transport{
-				ForceAttemptHTTP2: false,
-			},
+			Timeout:   cfg.Timeout,
+			Transport: transport,
 		},
-		apiKey: cfg.APIKey,
-		apiURL: cfg.APIURL,
-		model:  cfg.Model,
+		apiKey:      cfg.APIKey,
+		apiURL:      cfg.APIURL,
+		model:       cfg.Model,
+		streaming:   cfg.Streaming,
+		idleTimeout: cfg.StreamIdleTimeout,
 	}
 }
 
@@ -78,7 +94,10 @@ type ChatResponse struct {
 }
 
 // Chat 向 SiliconFlow API 发送对话请求。先传入 system 提示词（设定角色和输出格式），再传入 user 问题。
-// HTTP 客户端超时时间 30s，超时后会返回错误，调用方应据此做好重试或兜底。
+// 默认走流式（SSE）响应：推理模型在非流式下需等整段生成（含思维链）完毕才返回，首字延迟极高、
+// 易被"等待响应头超时"误杀；流式下首个分片秒级到达，CoT 期间持续有 reasoning_content 心跳，
+// 只有真正卡死（相邻分片超过 idleTimeout）才报错。流式解析失败时自动回落到非流式一次性取回。
+// 上游 API 失败/超时返回错误，调用方应据此做好重试或兜底。
 func (c *Client) Chat(system, user string) (string, error) {
 	if c.apiKey == "" {
 		return "", fmt.Errorf("LLM_API_KEY not set")
@@ -91,35 +110,158 @@ func (c *Client) Chat(system, user string) (string, error) {
 			{Role: "user", Content: user},
 		},
 	}
+	return c.do(req)
+}
 
-	data, _ := json.Marshal(req)
-	httpReq, err := http.NewRequest("POST", c.apiURL, bytes.NewReader(data))
+// ChatMessages 以多轮对话方式调用 LLM（股票咨询页使用）。
+// messages 为完整消息序列，首条必须是 system（角色+注入数据），后接历史与当前提问。
+// 只透传调用方组装好的消息，不再自动追加 system，避免出现多条/中途 system 导致模型上下文错乱。
+// 与 Chat 一致默认走流式响应，解析失败自动回落到非流式。
+func (c *Client) ChatMessages(messages []Message) (string, error) {
+	if c.apiKey == "" {
+		return "", fmt.Errorf("LLM_API_KEY not set")
+	}
+	return c.do(ChatRequest{Model: c.model, Messages: messages})
+}
+
+// do 发起单次对话请求：优先流式解析，特定失败场景回落到非流式一次性取回。
+func (c *Client) do(req ChatRequest) (string, error) {
+	if c.streaming {
+		content, streamErr := c.streamChat(req)
+		if streamErr == nil {
+			return content, nil
+		}
+		// 仅当流式因"未收到任何有效内容"失败（典型：上游不支持 SSE，对 stream=true 返回普通 JSON）
+		// 时回落到非流式重试一次；超时/空闲/网络等错误直接返回，交由上层重试队列处理，避免重复放大延迟。
+		if strings.Contains(streamErr.Error(), "no response") {
+			if content, err := c.nonStreamChat(req); err == nil {
+				log.Printf("LLM 流式无有效内容(%v), 已回落到非流式成功", streamErr)
+				return content, nil
+			}
+		}
+		return "", streamErr
+	}
+	return c.nonStreamChat(req)
+}
+
+// chatCompletionRequest 透传给上游的完整请求体（ChatRequest 上叠加流式/长度控制参数）。
+type chatCompletionRequest struct {
+	ChatRequest
+	Stream    bool `json:"stream"`
+	MaxTokens int  `json:"max_tokens,omitempty"`
+}
+
+// streamChat 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
+// 只累加 delta.content（忽略 reasoning_content 思维链），遇 [DONE] 结束；
+// 相邻分片空闲超过 idleTimeout 判定为卡死返回错误。
+func (c *Client) streamChat(req ChatRequest) (string, error) {
+	body, err := c.post(req, true, 0)
 	if err != nil {
 		return "", err
+	}
+	defer body.Close()
+
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 1024*1024), 4*1024*1024) // 首分片可能携带完整 usage 元数据，行可能很大
+	sc.Split(bufio.ScanLines)
+
+	var sb strings.Builder
+	var lastTime = time.Now()
+	for sc.Scan() {
+		now := time.Now()
+		if now.Sub(lastTime) > c.idleTimeout {
+			return "", fmt.Errorf("流式响应空闲超时(%s): 模型疑似卡死", c.idleTimeout)
+		}
+		lastTime = now
+
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk chatCompletionChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		sb.WriteString(chunk.Choices[0].Delta.Content)
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	content := sb.String()
+	if strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("no response from LLM")
+	}
+	return content, nil
+}
+
+// chatCompletionChunk 流式响应单分片（只取需要的字段）。
+type chatCompletionChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用）。
+func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
+	body, err := c.post(req, false, 4096)
+	if err != nil {
+		return "", err
+	}
+	defer body.Close()
+
+	respBody, err := io.ReadAll(body)
+	if err != nil {
+		return "", err
+	}
+	var chatResp ChatResponse
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		return "", fmt.Errorf("非流式响应解析失败: %v", err)
+	}
+	if len(chatResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from LLM")
+	}
+	return chatResp.Choices[0].Message.Content, nil
+}
+
+// post 构造并发送 chat/completions 请求，返回可读响应体。非 2xx 状态码读响应体构造错误。
+// stream=true 时请求带 stream 参数且不设 max_tokens（避免截断思维链/长输出，靠空闲看门狗防卡死）；
+// 非流式时设 max_tokens 兜底，防超长输出触发上游 504/截断。
+func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadCloser, error) {
+	payload := chatCompletionRequest{
+		ChatRequest: req,
+		Stream:      stream,
+		MaxTokens:   maxTokens,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequest("POST", c.apiURL, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	// 读取响应体并解析为对话响应结构
-	body, _ := io.ReadAll(resp.Body)
-	var chatResp ChatResponse
-	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return "", err
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("LLM API 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
-
-	// 无任何候选回答则视为空响应错误
-	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("no response from LLM")
-	}
-
-	// 取第一个候选的回复内容
-	return chatResp.Choices[0].Message.Content, nil
+	return resp.Body, nil
 }
 
 // consultSystemPrompt 股票咨询多轮对话的系统提示词：设定有独立分析能力的 A 股顾问角色。
@@ -152,39 +294,6 @@ var consultSystemPrompt = `你是专业的A股股票投资顾问，负责回答�
 
 // ConsultSystemPrompt 返回股票咨询的角色提示词（供引擎组装唯一 system 消息使用）。
 func ConsultSystemPrompt() string { return consultSystemPrompt }
-
-// ChatMessages 以多轮对话方式调用 LLM（股票咨询页使用）。
-// messages 为完整消息序列，首条必须是 system（角色+注入数据），后接历史与当前提问。
-// 只透传调用方组装好的消息，不再自动追加 system，避免出现多条/中途 system 导致模型上下文错乱。
-func (c *Client) ChatMessages(messages []Message) (string, error) {
-	if c.apiKey == "" {
-		return "", fmt.Errorf("LLM_API_KEY not set")
-	}
-	req := ChatRequest{Model: c.model, Messages: messages}
-	data, _ := json.Marshal(req)
-	httpReq, err := http.NewRequest("POST", c.apiURL, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var chatResp ChatResponse
-	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return "", err
-	}
-	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("no response from LLM")
-	}
-	return chatResp.Choices[0].Message.Content, nil
-}
 
 // HotTopic 热点新闻结构化分析结果。
 type HotTopic struct {
@@ -357,11 +466,13 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
 ` + valueChainSection
 
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
-const llmBatchSize = 30
+// 推理模型（GLM-Z1-9B）对大批次首 token 极慢，30 条会 240s 超时等不到响应头，
+// 调小到 10 条使单批在超时内完成（与 classifier.go 的 llmBatchSize 保持一致）。
+const llmBatchSize = 10
 
 // AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批调用并合并结果。
-// 任一 批 LLM 轮询重试（最多3次、递增间隔）仍失败时返回错误，不降级关键词兜底，
-// 由调用方决定如何处置（丢弃该批），避免错误情绪打分进入事件流。
+// 子批失败做隔离：该子批用关键词兜底结果占位（fallbackAnalysis），不 abort 全批，
+// 保证某几个坏子批不会拖垮整批 Stage2（主干继续）。
 func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 	result := make([]*HotTopic, len(titles))
 	if len(titles) == 0 {
@@ -374,7 +485,12 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 		}
 		sub, err := c.analyzeBatch(titles[start:end])
 		if err != nil {
-			return nil, err
+			log.Printf("LLM[%d] 子批%d..%d 重试队列用尽, 该子批%d条用兜底占位(主干继续): %v",
+				len(titles), start+1, end, end-start, err)
+			for i := start; i < end; i++ {
+				result[i] = fallbackAnalysis(titles[i])
+			}
+			continue
 		}
 		copy(result[start:end], sub)
 	}
@@ -382,8 +498,8 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 }
 
 // analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。
-// 失败时按递增间隔轮询重试（最多5次：2s/4s/8s/16s/30s），仍失败返回错误，
-// 由调用方丢弃该批（不降级关键词，避免错误情绪打分进入事件流）。
+// API 失败 与 JSON 解析失败 都纳入重试队列（最多5次：2s/4s/8s/16s/30s），
+// 仍失败返回错误；由 AnalyzeHotTopicBatch 做子批隔离（只丢本子批，不影响主干）。
 func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	// 构建批量请求文本
 	var sb strings.Builder
@@ -392,58 +508,37 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	}
 	prompt := sb.String()
 
-	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s）
+	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s）：调用失败或解析失败均重试
 	const maxAttempts = 5
-	var resp string
-	var err error
+	var raw []stage2Row
+	var lastErr error
+	ok := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, err = c.Chat(batchSystemPrompt, prompt)
+		resp, err := c.Chat(batchSystemPrompt, prompt)
 		if err == nil {
-			break
+			resp = cleanJSON(resp)
+			raw, err = parseHotTopicBatch(resp)
+			if err == nil {
+				ok = true
+				break
+			}
 		}
+		lastErr = err
+		log.Printf("LLM[%d] 调用/解析失败(第%d/%d次): %v", len(titles), attempt, maxAttempts, err)
 		if attempt < maxAttempts {
-			log.Printf("LLM[%d/%d] API失败(第%d次), 轮询重试: %v", len(titles), attempt, attempt, err)
 			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 		}
 	}
-	if err != nil {
-		log.Printf("LLM[%d] API轮询重试%d次仍失败, 该批%d条丢弃: %v", len(titles), maxAttempts, len(titles), err)
-		return nil, err
-	}
-	resp = cleanJSON(resp)
-
-	var raw []struct {
-		Index               int      `json:"index"`                // LLM 返回的批内序号（1 起）
-		Level               string   `json:"level"`                // 事件级别：板块/个股
-		Sentiment           string   `json:"sentiment"`            // 情感：正面/负面/中性
-		Score               flexibleFloat `json:"score"`              // 带符号强度分（兼容 "0.75" 字符串）
-		ImpactLevel         string   `json:"impact_level"`         // 影响级别：高/中/低
-		EventType           string   `json:"event_type"`           // 事件类型
-		Urgency             string   `json:"urgency"`              // 紧急程度
-		Direction           string   `json:"direction"`            // 方向：利好/利空/中性
-		Sectors             []string `json:"sectors"`              // 直接影响板块
-		UpstreamSectors     []string `json:"upstream_sectors"`     // 上游产业链板块
-		DownstreamSectors   []string `json:"downstream_sectors"`   // 下游产业链板块
-		RelatedStocks       []string `json:"related_stocks"`       // 关联个股
-		UpstreamStocks      []string `json:"upstream_stocks"`      // 上游关联个股
-		DownstreamStocks    []string `json:"downstream_stocks"`    // 下游关联个股
-		Strategy            string   `json:"strategy"`             // 匹配战法
-		Reason              string   `json:"reason"`               // 分析理由
-		Region              string   `json:"region"`               // 事件来源地域
-		Relation            string   `json:"relation"`             // 海外事件与A股板块关系
-		UpstreamDirection   string   `json:"upstream_direction"`   // 上游传导方向
-		DownstreamDirection string   `json:"downstream_direction"` // 下游传导方向
-	}
-	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		log.Printf("LLM[%d] JSON解析失败, 该批%d条丢弃: raw[:%d]=%q: %v", len(titles), len(titles), minInt(len(resp), 300), resp[:minInt(len(resp), 300)], err)
-		return nil, err
+	if !ok {
+		log.Printf("LLM[%d] 重试队列用尽仍失败, 该批%d条丢弃: %v", len(titles), len(titles), lastErr)
+		return nil, lastErr
 	}
 
 	// 日志：LLM返回了哪些板块和个股
 	for _, r := range raw {
 		sectors := strings.Join(r.Sectors, ",")
 		stocks := strings.Join(r.RelatedStocks, ",")
-		idx := r.Index - 1
+		idx := int(r.Index) - 1
 		title := ""
 		if idx >= 0 && idx < len(titles) {
 			title = titles[idx][:minInt(len(titles[idx]), 30)]
@@ -456,7 +551,7 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 		// 先以关键词兜底结果初始化，再按 LLM 返回序号覆盖对应字段（未命中则保留兜底）
 		ht := fallbackAnalysis(title)
 		for _, r := range raw {
-			if r.Index == i+1 {
+			if int(r.Index) == i+1 {
 				ht.Level = r.Level
 				ht.Sentiment = r.Sentiment
 				ht.Score = float64(r.Score)
@@ -669,6 +764,116 @@ func isValidJSONEscape(b byte) bool {
 
 // plusNumberRe 匹配冒号/逗号/左括号后的 '+' 前缀（数值位置），用于剥离非法 '+'。
 var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
+
+// stage2Row Stage2 批量返回的单行（容错：index 兼容字符串）。
+type stage2Row struct {
+	Index               flexInt        `json:"index"`
+	Level               string         `json:"level"`
+	Sentiment           string         `json:"sentiment"`
+	Score               flexibleFloat  `json:"score"`
+	ImpactLevel         string         `json:"impact_level"`
+	EventType           string         `json:"event_type"`
+	Urgency             string         `json:"urgency"`
+	Direction           string         `json:"direction"`
+	Sectors             []string       `json:"sectors"`
+	UpstreamSectors     []string       `json:"upstream_sectors"`
+	DownstreamSectors   []string       `json:"downstream_sectors"`
+	RelatedStocks       []string       `json:"related_stocks"`
+	UpstreamStocks      []string       `json:"upstream_stocks"`
+	DownstreamStocks    []string       `json:"downstream_stocks"`
+	Strategy            string         `json:"strategy"`
+	Reason              string         `json:"reason"`
+	Region              string         `json:"region"`
+	Relation            string         `json:"relation"`
+	UpstreamDirection   string         `json:"upstream_direction"`
+	DownstreamDirection string         `json:"downstream_direction"`
+}
+
+// flexInt 兼容 JSON 中整数为数字或字符串（1 / "1"）的解析。
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(strings.Trim(string(b), `"`))
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		*f = 0
+	}
+	*f = flexInt(v)
+	return nil
+}
+
+// parseHotTopicBatch 两段式解析 Stage2 批量响应：整体数组解析失败 → 逐对象扫描抢救。
+// 单坏对象只丢该条；整体+逐对象都抢救不出才返回错误（触发重试队列）。
+func parseHotTopicBatch(resp string) ([]stage2Row, error) {
+	var raw []stage2Row
+	if err := json.Unmarshal([]byte(resp), &raw); err == nil {
+		return raw, nil
+	}
+	var out []stage2Row
+	for _, obj := range extractObjects(resp) {
+		obj = strings.ReplaceAll(obj, `':''`, `":"`)
+		obj = llmTrailingJunkRe.ReplaceAllString(obj, `"$1`)
+		obj = llmEmptyValueRe.ReplaceAllString(obj, `$1""`)
+		var one stage2Row
+		if err := json.Unmarshal([]byte(obj), &one); err == nil {
+			out = append(out, one)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("批次JSON整体解析失败且逐对象抢救无效")
+	}
+	log.Printf("LLM[%d] 整体解析失败, 逐对象抢救成功 %d 条", len(out), len(out))
+	return out, nil
+}
+
+// extractObjects 用花括号配对扫描提取字符串中所有独立 JSON 对象 `{...}`（含嵌套、无视排版）。
+func extractObjects(s string) []string {
+	var objs []string
+	start := -1
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if c == '\\' {
+			esc = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch c {
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 && start >= 0 {
+				objs = append(objs, s[start:i+1])
+				start = -1
+			}
+		}
+	}
+	return objs
+}
+
+// llmEmptyValueRe / llmTrailingJunkRe 与 newsagent 的修复规则同源，修复模型畸形输出。
+var llmEmptyValueRe = regexp.MustCompile(`("(?:[^"\\]|\\.)*"\s*:)\s*[}\]]`)
+var llmTrailingJunkRe = regexp.MustCompile(`"\s*[\)']+\s*([,}\]]|$)`)
 
 // flexibleFloat 兼容 JSON 中字段为数字或字符串（如 "0.75" / "+0.75"）的浮点解析。
 // 部分小模型会把数值输出成带符号字符串，导致标准 json.Unmarshal 失败，这里做容错。

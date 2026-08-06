@@ -60,7 +60,7 @@ type Server struct {
 	watchlist   *data.WatchlistManager             // 自选股管理器
 	sse         *SSEBroker                         // SSE 事件广播器（向前端实时推送）
 	startTime   time.Time                          // 服务启动时间（用于 uptime 统计）
-	llmRecreate func(apiKey, apiURL, model string, timeoutSec int) // 热重建 LLM 客户端
+	llmRecreate func(apiKey, apiURL, model string, timeoutSec int, streaming bool) // 热重建 LLM 客户端
 	ctrl        EngineController                   // 引擎控制面（做多/做空开关、流水线调试数据等）
 
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
@@ -79,7 +79,7 @@ type Server struct {
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
-func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int)) { s.llmRecreate = fn }
+func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int, streaming bool)) { s.llmRecreate = fn }
 
 // SetFetcher 注入 5s 实时行情采集器（报价接口优先读快照，缺失再降级拉取）。
 func (s *Server) SetFetcher(f *data.Fetcher) { s.fetcher = f }
@@ -634,6 +634,14 @@ func (s *Server) handleNewsTestAttribution(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, 200, map[string]interface{}{"events": events})
 }
 
+// streamingEnabled 解析流式开关：nil（请求未携带）时保持默认开启。
+func streamingEnabled(s *bool) bool {
+	if s == nil {
+		return true
+	}
+	return *s
+}
+
 // ── 持仓管理 ──
 
 // createPositionReq 新建持仓请求体：股票代码/名称、方向、策略、开仓价及止盈止损百分比。
@@ -777,18 +785,21 @@ func (s *Server) handleSetD1Config(w http.ResponseWriter, r *http.Request) {
 
 // setLLMConfigReq LLM 配置请求体：APIKey 可选（不修改时留空），APIURL 与 Model 必填。
 type setLLMConfigReq struct {
-	APIKey    string `json:"api_key,omitempty"`
-	APIURL    string `json:"api_url"`
-	Model     string `json:"model"`
-	TimeoutSec int   `json:"timeout_sec"` // 单次请求超时（秒），缺省 0
+	APIKey     string `json:"api_key,omitempty"`
+	APIURL     string `json:"api_url"`
+	Model      string `json:"model"`
+	TimeoutSec int    `json:"timeout_sec"` // 单次请求超时（秒），缺省 0
+	Stream     *bool  `json:"stream,omitempty"` // 流式开关，缺省维持现状/默认开启
 }
 
-// handleGetLLMConfig 处理 GET /api/config/llm：返回 API 地址与运行时实际生效的模型名。
+// handleGetLLMConfig 处理 GET /api/config/llm：返回 API 地址、运行时生效模型与流式开关。
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.GetLLMConfig()
 	writeJSON(w, 200, map[string]interface{}{
-		"api_url": cfg.APIURL,
-		"model":   s.runtimeModel(),
+		"api_url":  cfg.APIURL,
+		"model":    s.runtimeModel(),
+		"stream":   cfg.StreamingEnabled(),
+		"timeout_sec": cfg.TimeoutSec,
 	})
 }
 
@@ -807,6 +818,7 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		APIURL:     req.APIURL,
 		Model:      req.Model,
 		TimeoutSec: req.TimeoutSec,
+		Stream:     req.Stream,
 	})
 
 	// 保存 APIKey 到 auth config
@@ -823,7 +835,7 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 				key = v
 			}
 		}
-		s.llmRecreate(key, req.APIURL, req.Model, req.TimeoutSec)
+		s.llmRecreate(key, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream))
 	}
 
 	// 记录运行时实际生效的 model（空值会被 llm 客户端按默认模型兜底）

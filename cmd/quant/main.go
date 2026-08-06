@@ -88,6 +88,7 @@ func main() {
 		llmCfg.Model = cfgMgr.Rules.LLM.Model
 	}
 	llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
+	llmCfg.Streaming = cfgMgr.Rules.LLM.StreamingEnabled()
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
 	var llmClient *llm.Client
@@ -148,10 +149,10 @@ func main() {
 	eng.SetScanner(scanner)
 	srv.SetEngineController(eng)
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程
-	srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int) {
-		lc := llm.New(llm.Config{APIKey: apiKey, APIURL: apiURL, Model: model, Timeout: time.Duration(timeoutSec) * time.Second})
+	srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int, streaming bool) {
+		lc := llm.New(llm.Config{APIKey: apiKey, APIURL: apiURL, Model: model, Timeout: time.Duration(timeoutSec) * time.Second, Streaming: streaming})
 		eng.SetLLMClient(lc)
-		log.Printf("[LLM] 客户端已热重建: model=%s url=%s timeout=%ds", model, apiURL, timeoutSec)
+		log.Printf("[LLM] 客户端已热重建: model=%s url=%s timeout=%ds stream=%v", model, apiURL, timeoutSec, streaming)
 	})
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
