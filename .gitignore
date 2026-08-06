@@ -10,7 +10,8 @@ ARCH*
 SEQUENCE*
 
 # 构建产物
-quant
+# 仅忽略仓库根的编译产物 ./quant，避免误伤源码目录 cmd/quant/（其 *_test.go 需纳入版本控制）
+/quant
 dist/
 
 # 前端依赖
