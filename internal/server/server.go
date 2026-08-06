@@ -36,6 +36,8 @@ type EngineController interface {
 	GetAllNewsEvents() []newsagent.NewsEvent
 	SetNewsShowAll(v bool)
 	NewsShowAll() bool
+	ReanalyzeNews() (map[string]int, error)
+	TestAttribution(title, digest string) ([]newsagent.NewsEvent, error)
 	GetMessages() []data.MessageItem
 	ClearMessages()
 	DeleteMessage(id string)
@@ -54,6 +56,7 @@ type Server struct {
 	market      *data.MarketAPI                    // 行情数据 API（实时报价/板块/IPO 等）
 	ths         *data.THSClient                    // 同花顺客户端（板块行情表）
 	fetcher     *data.Fetcher                      // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
+	dc          *data.DataCoordinator              // 行情统一数据源（新浪→同花顺→东财 三级降级链）
 	watchlist   *data.WatchlistManager             // 自选股管理器
 	sse         *SSEBroker                         // SSE 事件广播器（向前端实时推送）
 	startTime   time.Time                          // 服务启动时间（用于 uptime 统计）
@@ -80,6 +83,9 @@ func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec
 
 // SetFetcher 注入 5s 实时行情采集器（报价接口优先读快照，缺失再降级拉取）。
 func (s *Server) SetFetcher(f *data.Fetcher) { s.fetcher = f }
+
+// SetCoordinator 注入行情统一数据源（新浪→同花顺→东财 三级降级链）。
+func (s *Server) SetCoordinator(dc *data.DataCoordinator) { s.dc = dc }
 
 // SetEngineController 设置引擎控制器。
 func (s *Server) SetEngineController(c EngineController) { s.ctrl = c }
@@ -214,6 +220,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/news", s.authMiddleware(s.handleFixNews))
 	s.mux.HandleFunc("POST /api/news/showall", s.authMiddleware(s.handleNewsShowAllToggle))
 	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
+	s.mux.HandleFunc("POST /api/news/reanalyze", s.authMiddleware(s.handleNewsReanalyze))
+	s.mux.HandleFunc("POST /api/news/test-attribution", s.authMiddleware(s.handleNewsTestAttribution))
 	s.mux.HandleFunc("GET /api/watchlist", s.authMiddleware(s.handleFixGetWatchlist))
 	s.mux.HandleFunc("POST /api/watchlist", s.authMiddleware(s.handleFixAddWatchlist))
 	s.mux.HandleFunc("DELETE /api/watchlist", s.authMiddleware(s.handleFixRemoveWatchlist))
@@ -566,6 +574,64 @@ func (s *Server) handleNewsShowAllToggle(w http.ResponseWriter, r *http.Request)
 // handleNewsShowAllStatus 处理 GET /api/news/showall：返回"资讯显示全部"开关状态。
 func (s *Server) handleNewsShowAllStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn()})
+}
+
+// handleNewsReanalyze 处理 POST /api/news/reanalyze：手动 LLM 补推。
+// 异步执行（拉取+LLM耗时），立即返回 202 表示已触发；结果打印到日志。
+func (s *Server) handleNewsReanalyze(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeError(w, 503, "engine not ready")
+		return
+	}
+	log.Printf("[server] 触发手动LLM补推")
+	writeJSON(w, 202, map[string]bool{"accepted": true})
+	go func() {
+		stat, err := s.ctrl.ReanalyzeNews()
+		if err != nil {
+			log.Printf("[server] 补推失败: %v", err)
+			return
+		}
+		log.Printf("[server] 补推完成: 原始%d 个股%d 板块%d IPO%d 一般%d 事件%d",
+			stat["raw"], stat["stock"], stat["sector"], stat["ipo"], stat["general"], stat["events"])
+	}()
+}
+
+// testAttributionReq 单条归因测试请求体：标题 + 可选正文摘要（供 LLM 价值链背景）。
+type testAttributionReq struct {
+	Title  string `json:"title"`
+	Digest string `json:"digest,omitempty"`
+}
+
+// handleNewsTestAttribution 处理 POST /api/news/test-attribution：单条新闻走 Stage2
+// 归因测试（含产业链价值传导推导 + 差分事件拆分），返回拆分后的 NewsEvent。
+// 用于快速验证"海外自产关键材料→利好国内上游"等归因逻辑是否正确产出个股。
+func (s *Server) handleNewsTestAttribution(w http.ResponseWriter, r *http.Request) {
+	if s.ctrl == nil {
+		writeError(w, 503, "engine not ready")
+		return
+	}
+	var req testAttributionReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		writeError(w, 400, "title required")
+		return
+	}
+	events, err := s.ctrl.TestAttribution(req.Title, req.Digest)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if len(events) == 0 {
+		writeJSON(w, 200, map[string]interface{}{
+			"events": []interface{}{},
+			"note":   "无事件产出：可能 LLM 判定中性/无 A 股归因，或 LLM 调用失败",
+		})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"events": events})
 }
 
 // ── 持仓管理 ──

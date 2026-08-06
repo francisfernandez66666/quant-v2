@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -187,21 +188,54 @@ func (c *Client) ChatMessages(messages []Message) (string, error) {
 
 // HotTopic 热点新闻结构化分析结果。
 type HotTopic struct {
-	Title             string   `json:"title"`              // 新闻标题
-	Level             string   `json:"level"`              // 事件级别：板块 / 个股
-	Sentiment         string   `json:"sentiment"`          // 情感：正面 / 负面 / 中性
-	Score             float64  `json:"score"`              // 带符号强度：正=利好 负=利空 0=中性
-	ImpactLevel       string   `json:"impact_level"`       // 影响级别：高 / 中 / 低
-	EventType         string   `json:"event_type"`         // 事件类型：政策/财报/行业/公司/宏观/事件驱动
-	Urgency           string   `json:"urgency"`            // 紧急程度：立即 / 关注 / 观察
-	Direction         string   `json:"direction"`          // 方向：利好 / 利空 / 中性
-	Sectors           []string `json:"sectors"`            // 直接影响板块
-	UpstreamSectors   []string `json:"upstream_sectors"`   // 上游产业链受影响板块
-	DownstreamSectors []string `json:"downstream_sectors"` // 下游产业链受影响板块
-	RelatedStocks     []string `json:"related_stocks"`     // 关联个股名称或代码
-	Strategy          string   `json:"strategy"`           // 匹配战法：N形/龙头/双凸/龙回头/无
-	Reason            string   `json:"reason"`             // 简要分析理由
+	Title               string   `json:"title"`                // 新闻标题
+	Level               string   `json:"level"`                // 事件级别：板块 / 个股
+	Sentiment           string   `json:"sentiment"`            // 情感：正面 / 负面 / 中性
+	Score               float64  `json:"score"`                // 带符号强度：正=利好 负=利空 0=中性
+	ImpactLevel         string   `json:"impact_level"`         // 影响级别：高 / 中 / 低
+	EventType           string   `json:"event_type"`           // 事件类型：政策/财报/行业/公司/宏观/事件驱动
+	Urgency             string   `json:"urgency"`              // 紧急程度：立即 / 关注 / 观察
+	Direction           string   `json:"direction"`            // 方向：利好 / 利空 / 中性
+	Sectors             []string `json:"sectors"`              // 直接影响板块
+	UpstreamSectors     []string `json:"upstream_sectors"`     // 上游产业链受影响板块
+	DownstreamSectors   []string `json:"downstream_sectors"`   // 下游产业链受影响板块
+	RelatedStocks       []string `json:"related_stocks"`       // 关联个股名称或代码
+	UpstreamStocks      []string `json:"upstream_stocks"`      // 上游产业链关联个股（具体核心供应商）
+	DownstreamStocks    []string `json:"downstream_stocks"`    // 下游产业链关联个股（具体核心应用/终端）
+	Strategy            string   `json:"strategy"`             // 匹配战法：N形/龙头/双凸/龙回头/无
+	Reason              string   `json:"reason"`               // 简要分析理由
+	Region              string   `json:"region"`               // 事件来源地域：国内 / 海外
+	Relation            string   `json:"relation"`             // 海外事件与A股板块关系：对抗制裁/合作/不涉及
+	UpstreamDirection   string   `json:"upstream_direction"`   // 上游传导方向：利好/利空/中性
+	DownstreamDirection string   `json:"downstream_direction"` // 下游传导方向：利好/利空/中性
 }
+
+// valueChainSection 产业链价值传导推理规则：决定事件归因到产业链上/下游的准确性。
+// 核心机制：国内事件全链同向传导；海外事件先判对抗/合作关系，
+// 合作→同向传导，对抗制裁→上游利好/下游利空；海外自产关键材料=价值确认→利好掌握上游原料供给的国内公司。
+var valueChainSection = `
+
+产业链价值传导推理（最重要，直接决定归因质量，必须严格执行）：
+- 先判定事件来源地域 region："国内"=事件主体为境内公司/政策/市场；"海外"=事件主体为境外公司/政府（美国/欧洲/日本/韩国等）。
+- 若为海外事件，再判定 relation（该事件与A股相关板块的关系）：
+  - "对抗制裁"：美国等对中国特定产业/公司实施制裁、出口管制、加征关税、技术封锁，或中国对美/全球实施关键原料（磷化铟/锗/铟/镓/稀土等）出口管制反制
+  - "合作"：海外公司正常扩产/并购/技术合作/订单采购，不涉及制裁对抗
+  - "不涉及"：事件与中国产业链无关联，score=0 中性
+- 按关系推导上/下游传导方向：
+  - 国内事件 → 全链同向传导：direction 为上、下游共同方向（如国内扩产同时利好上游原料与下游应用）
+  - 海外事件 relation="合作" → 同向传导，上游/下游方向与 direction 一致
+  - 海外事件 relation="对抗制裁" → 上游传导利好、下游传导利空：上游=中国掌控供给或可国产替代/自主可控的关键原料/材料/设备环节（利好），下游=依赖被制裁市场或进口技术的环节（利空）
+- 价值确认传导机制（对抗制裁下的关键推理）：
+  - 当海外公司自产/扩产某关键材料，而中国掌握该材料上游原料供给时，海外自产本身即确认了该材料的战略核心价值 → 间接证明国内掌握该原料供给的上游板块与个股价值 → 传导为国内上游重大利好（+0.75）
+  - 示例："诺基亚收购恩智浦一工厂 计划自产磷化铟半导体" → 背景：美国制裁中国光模块、中国掌控全球磷化铟上游原料供给 → 海外自产确认磷化铟核心价值 → 利好国内磷化铟上游（云南锗业/有研新材/光智科技/南大光电等，+0.75 重大利好），下游光模块受制裁利空（-0.50~-0.75）
+- sectors 只填同花顺真实板块名（半导体材料/小金属/光模块/光通信等）；概念名（如"磷化铟"）不要放进 sectors，写进 reason 与 related_stocks
+- 对抗制裁且上/下游方向不同时，必须同时给出 upstream_sectors/downstream_sectors（上游=关键原料材料设备板块如"半导体材料/小金属"，下游=受制裁环节板块如"光模块"），不得合并成一个 sectors
+- 对抗制裁且上/下游方向不同时，必须同时给出 upstream_stocks 与 downstream_stocks 两个数组：
+  - upstream_stocks = 掌握关键原料/材料供给的上游A股核心供应商（如磷化铟上游=云南锗业/有研新材/光智科技/南大光电）
+  - downstream_stocks = 依赖被制裁市场/进口技术的下游A股应用公司（如光模块=中际旭创/新易盛/光迅科技/剑桥科技）
+  - 两数组均不得为空；related_stocks 写两者的并集即可
+- related_stocks 必须给出产业链上游/下游的具体A股公司名（优先核心供应商，如磷化铟上游=云南锗业/有研新材/光智科技/南大光电），不得只给板块名或仅覆盖单一环节
+`
 
 // hotTopicSystemPrompt 单条热点分析的 system 提示词：约束 LLM 输出严格 JSON 格式的评分/归因结果。
 var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提供的新闻标题进行全方位分析，严格按JSON格式返回。
@@ -241,15 +275,21 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
   "upstream_sectors": ["上游产业链受影响板块"],
   "downstream_sectors": ["下游产业链受影响板块"],
   "related_stocks": ["关联个股名称或代码"],
+  "upstream_stocks": ["上游产业链关联个股（具体核心供应商）"],
+  "downstream_stocks": ["下游产业链关联个股（具体核心应用/终端）"],
   "strategy": "N形|龙头|双凸|龙回头|无",
-  "reason": "简要分析理由"
+  "reason": "简要分析理由",
+  "region": "国内|海外",
+  "relation": "对抗制裁|合作|不涉及",
+  "upstream_direction": "利好|利空|中性",
+  "downstream_direction": "利好|利空|中性"
 }
 只输出JSON，不要多余文字。
 
 补充规则：
 - 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
 - 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
-`
+` + valueChainSection
 
 // batchSystemPrompt 批量热点分析的 system 提示词：从编号列表中筛选实质影响事件并输出 JSON 数组。
 var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下新闻中筛选出对A股有实质性影响的重大事件（如政策、行业景气、公司重大利好/利空、宏观数据、技术突破等），忽略娱乐、社会、体育、影视、名人八卦、灾难事故等无关新闻。
@@ -299,8 +339,14 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
     "upstream_sectors": ["上游产业链受影响板块"],
     "downstream_sectors": ["下游产业链受影响板块"],
     "related_stocks": ["关联个股名称或代码"],
+    "upstream_stocks": ["上游产业链关联个股（具体核心供应商）"],
+    "downstream_stocks": ["下游产业链关联个股（具体核心应用/终端）"],
     "strategy": "N形|龙头|双凸|龙回头|无",
-    "reason": "简要分析理由"
+    "reason": "简要分析理由",
+    "region": "国内|海外",
+    "relation": "对抗制裁|合作|不涉及",
+    "upstream_direction": "利好|利空|中性",
+    "downstream_direction": "利好|利空|中性"
   }
   ]
  只输出JSON数组，不要多余文字。
@@ -308,7 +354,7 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
 补充规则：
 - 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
 - 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
-`
+` + valueChainSection
 
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
 const llmBatchSize = 30
@@ -336,7 +382,7 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 }
 
 // analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。
-// 失败时按递增间隔轮询重试（最多3次：2s/4s/6s），仍失败返回错误，
+// 失败时按递增间隔轮询重试（最多5次：2s/4s/8s/16s/30s），仍失败返回错误，
 // 由调用方丢弃该批（不降级关键词，避免错误情绪打分进入事件流）。
 func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	// 构建批量请求文本
@@ -346,8 +392,8 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	}
 	prompt := sb.String()
 
-	// 轮询重试（最多3次、间隔递增 2s/4s/6s）
-	const maxAttempts = 3
+	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s）
+	const maxAttempts = 5
 	var resp string
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -357,7 +403,7 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 		}
 		if attempt < maxAttempts {
 			log.Printf("LLM[%d/%d] API失败(第%d次), 轮询重试: %v", len(titles), attempt, attempt, err)
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 		}
 	}
 	if err != nil {
@@ -367,20 +413,26 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	resp = cleanJSON(resp)
 
 	var raw []struct {
-		Index             int      `json:"index"`               // LLM 返回的批内序号（1 起）
-		Level             string   `json:"level"`              // 事件级别：板块/个股
-		Sentiment         string   `json:"sentiment"`          // 情感：正面/负面/中性
-		Score             float64  `json:"score"`              // 带符号强度分
-		ImpactLevel       string   `json:"impact_level"`       // 影响级别：高/中/低
-		EventType         string   `json:"event_type"`         // 事件类型
-		Urgency           string   `json:"urgency"`            // 紧急程度
-		Direction         string   `json:"direction"`          // 方向：利好/利空/中性
-		Sectors           []string `json:"sectors"`            // 直接影响板块
-		UpstreamSectors   []string `json:"upstream_sectors"`   // 上游产业链板块
-		DownstreamSectors []string `json:"downstream_sectors"` // 下游产业链板块
-		RelatedStocks     []string `json:"related_stocks"`     // 关联个股
-		Strategy          string   `json:"strategy"`           // 匹配战法
-		Reason            string   `json:"reason"`             // 分析理由
+		Index               int      `json:"index"`                // LLM 返回的批内序号（1 起）
+		Level               string   `json:"level"`                // 事件级别：板块/个股
+		Sentiment           string   `json:"sentiment"`            // 情感：正面/负面/中性
+		Score               flexibleFloat `json:"score"`              // 带符号强度分（兼容 "0.75" 字符串）
+		ImpactLevel         string   `json:"impact_level"`         // 影响级别：高/中/低
+		EventType           string   `json:"event_type"`           // 事件类型
+		Urgency             string   `json:"urgency"`              // 紧急程度
+		Direction           string   `json:"direction"`            // 方向：利好/利空/中性
+		Sectors             []string `json:"sectors"`              // 直接影响板块
+		UpstreamSectors     []string `json:"upstream_sectors"`     // 上游产业链板块
+		DownstreamSectors   []string `json:"downstream_sectors"`   // 下游产业链板块
+		RelatedStocks       []string `json:"related_stocks"`       // 关联个股
+		UpstreamStocks      []string `json:"upstream_stocks"`      // 上游关联个股
+		DownstreamStocks    []string `json:"downstream_stocks"`    // 下游关联个股
+		Strategy            string   `json:"strategy"`             // 匹配战法
+		Reason              string   `json:"reason"`               // 分析理由
+		Region              string   `json:"region"`               // 事件来源地域
+		Relation            string   `json:"relation"`             // 海外事件与A股板块关系
+		UpstreamDirection   string   `json:"upstream_direction"`   // 上游传导方向
+		DownstreamDirection string   `json:"downstream_direction"` // 下游传导方向
 	}
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
 		log.Printf("LLM[%d] JSON解析失败, 该批%d条丢弃: raw[:%d]=%q: %v", len(titles), len(titles), minInt(len(resp), 300), resp[:minInt(len(resp), 300)], err)
@@ -407,7 +459,7 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 			if r.Index == i+1 {
 				ht.Level = r.Level
 				ht.Sentiment = r.Sentiment
-				ht.Score = r.Score
+				ht.Score = float64(r.Score)
 				ht.ImpactLevel = r.ImpactLevel
 				ht.EventType = r.EventType
 				ht.Urgency = r.Urgency
@@ -424,11 +476,29 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 				if len(r.RelatedStocks) > 0 {
 					ht.RelatedStocks = r.RelatedStocks
 				}
+				if len(r.UpstreamStocks) > 0 {
+					ht.UpstreamStocks = r.UpstreamStocks
+				}
+				if len(r.DownstreamStocks) > 0 {
+					ht.DownstreamStocks = r.DownstreamStocks
+				}
 				if r.Strategy != "" {
 					ht.Strategy = r.Strategy
 				}
 				if r.Reason != "" {
 					ht.Reason = r.Reason
+				}
+				if r.Region != "" {
+					ht.Region = r.Region
+				}
+				if r.Relation != "" {
+					ht.Relation = r.Relation
+				}
+				if r.UpstreamDirection != "" {
+					ht.UpstreamDirection = r.UpstreamDirection
+				}
+				if r.DownstreamDirection != "" {
+					ht.DownstreamDirection = r.DownstreamDirection
 				}
 				break
 			}
@@ -447,14 +517,28 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	log.Printf("LLM批量分析完成: %d/%d条", len(raw), len(titles))
 	return result, nil
 }
+
 // AnalyzeHotTopic 对新闻标题进行多维度热点分析。
 // 返回:
 //   - *HotTopic: 分析结果（API失败时返回关键词兜底结果，不返回 nil）
 //   - error: API 调用或 JSON 解析的错误（非 nil 表示结果来自 fallback）
 func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
-	resp, err := c.Chat(hotTopicSystemPrompt, title)
+	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s），与批量路径一致
+	const maxAttempts = 5
+	var resp string
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err = c.Chat(hotTopicSystemPrompt, title)
+		if err == nil {
+			break
+		}
+		if attempt < maxAttempts {
+			log.Printf("LLM API失败(第%d次), 轮询重试(%s): %v", attempt, title[:minInt(len(title), 30)], err)
+			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+		}
+	}
 	if err != nil {
-		log.Printf("LLM API调用失败(%s), 使用关键词兜底: %v", title[:minInt(len(title), 30)], err)
+		log.Printf("LLM API调用失败(%s), 轮询%d次仍失败, 使用关键词兜底: %v", title[:minInt(len(title), 30)], maxAttempts, err)
 		return fallbackAnalysis(title), err
 	}
 
@@ -535,20 +619,29 @@ func cleanJSON(s string) string {
 	}
 	// 移除尾部的非法字符（如句号、逗号）只保留 JSON 部分
 	s = strings.TrimRight(s, ".,; ")
+	// 清理非法 '+' 前缀数值：部分小模型输出 "score": +0.75 或 "score": 0.5（裸 + 号），
+	// JSON 数字不允许 '+' 前缀，这里把冒号/逗号/左括号后的 '+' 剥掉（不影响字符串内的 '+'）。
+	s = plusNumberRe.ReplaceAllString(s, "$1 ")
 	// 转义字符串值中的换行符（JSON 不允许字符串内未转义的 \n）
+	// 并清理非法转义：9B 推理模型常在字符串里输出 \( \) 等非法 JSON 转义，
+	// 遇到反斜杠后跟非合法转义集（" \ / b f n r t u）的字符时，丢弃反斜杠保留原字符。
 	var buf strings.Builder
 	inStr := false
-	escaped := false
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
-		if escaped {
+		if ch == '\\' && i+1 < len(s) {
+			next := s[i+1]
+			if !isValidJSONEscape(next) {
+				// 非法转义（如 \( \））→ 只保留原字符，丢弃反斜杠
+				buf.WriteByte(next)
+				i++
+				continue
+			}
+			// 合法转义（\" \\ \/ \b \f \n \r \t \u）→ 原样保留，跳过下一字节
+			// 转义的引号不切换 inStr 状态（\" 不会被视为字符串结束符）
 			buf.WriteByte(ch)
-			escaped = false
-			continue
-		}
-		if ch == '\\' {
-			buf.WriteByte(ch)
-			escaped = true
+			buf.WriteByte(next)
+			i++
 			continue
 		}
 		if ch == '"' {
@@ -563,6 +656,40 @@ func cleanJSON(s string) string {
 		}
 	}
 	return buf.String()
+}
+
+// isValidJSONEscape 判断字节是否为合法 JSON 转义字符（反斜杠后的有效转义序列首字符）。
+func isValidJSONEscape(b byte) bool {
+	switch b {
+	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+		return true
+	}
+	return false
+}
+
+// plusNumberRe 匹配冒号/逗号/左括号后的 '+' 前缀（数值位置），用于剥离非法 '+'。
+var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
+
+// flexibleFloat 兼容 JSON 中字段为数字或字符串（如 "0.75" / "+0.75"）的浮点解析。
+// 部分小模型会把数值输出成带符号字符串，导致标准 json.Unmarshal 失败，这里做容错。
+type flexibleFloat float64
+
+// UnmarshalJSON 实现 json.Unmarshaler：数字或字符串（允许 + 前缀/空白）都能解析。
+func (f *flexibleFloat) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(strings.Trim(string(b), `"`))
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	s = strings.TrimPrefix(s, "+")
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		// 解析失败时按 0 处理，避免整批 JSON 因单个坏值被丢弃
+		*f = 0
+		return nil
+	}
+	*f = flexibleFloat(v)
+	return nil
 }
 
 // fallbackAnalysis 关键词兜底分析（LLM 解析失败时使用）。

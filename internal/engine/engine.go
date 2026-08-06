@@ -1044,6 +1044,10 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	} else {
 		// 2. Stage0 归因分类：个股 / 板块 / 一般（合并垃圾过滤+价值初筛+标题党复核）
 		st0 = e.newsAgent.Stage0(rawNews)
+		if st0.Err != nil {
+			// Stage0 失败：整批归一般（仅展示，不进 LLM 深度分析），明确记录原因便于排障
+			log.Printf("[engine][news漏斗] Stage0失败, 原始%d条全部归一般, 无LLM分析: %v", len(rawNews), st0.Err)
+		}
 		log.Printf("[engine][news漏斗] 原始=%d 个股=%d 板块=%d IPO=%d 一般=%d (板块material保留=%d)",
 			len(rawNews), len(st0.StockIdx), len(st0.SectorIdx), len(st0.IpoIdx), len(st0.GeneralIdx), len(st0.Material))
 
@@ -1296,8 +1300,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 个股信号并入做多信号流统一展示/广播
 	bullSignals = append(bullSignals, individualSignals...)
 
-	// 13. 持仓止盈/止损提醒
-	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI)
+	// 13. 持仓止盈/止损提醒（传入当轮打分表：有活跃信号时降级为提示，不硬推止盈/止损）
+	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, stockScores)
 
 	// 14. 聚合器更新看板
 	e.agg.Update(sr, verifiedBull, verifiedBear, bullSignals, bearSignals, alertSignals, stockScores, e.rpt)
@@ -1354,7 +1358,115 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	log.Printf("[engine] 流水线完成: %d条原始 → %d事件 → %d有效 (%v)",
 		len(rawNews), len(events), len(valid), time.Since(t0))
 
+	// 本轮无 LLM 分析原因的显式提示：新闻有但未产出有效事件时，一眼定位是"LLM失败"还是"被阈值过滤"
+	if len(rawNews) > 0 {
+		if st0.Err != nil {
+			log.Printf("[engine] 本轮无LLM分析原因: Stage0失败(%v), 原始%d条全部归一般(仅展示)", st0.Err, len(rawNews))
+		} else if len(events) == 0 {
+			log.Printf("[engine] 本轮无LLM分析原因: Stage0成功但无事件产出(个股/板块/IPO来源全空, 或全被material初筛过滤)")
+		} else if len(valid) == 0 {
+			log.Printf("[engine] 本轮无有效事件原因: 共%d事件但均|score|<0.50 被阈值过滤", len(events))
+		}
+	}
+
 	return sr
+}
+
+// ReanalyzeNews 手动 LLM 补推：强制重新拉取最近新闻（忽略 tracker 去重），
+// 走 Stage0 归因分类 + Stage2 深度分析，落盘事件，供前端"补推"按钮触发。
+// 适用场景：早盘/盘中 LLM 上游抖动导致 Stage0 失败、整批新闻被归"一般"未进 LLM。
+// 返回统计（原始条数/个股/板块/IPO/一般/事件数），以便前端提示结果。
+func (e *Engine) ReanalyzeNews() (map[string]int, error) {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return nil, fmt.Errorf("新闻代理未启动")
+	}
+
+	// 强制拉取（忽略历史去重，仅按本轮打重）
+	raw := na.FetchForce()
+	if len(raw) == 0 {
+		log.Printf("[engine] 补推: 未拉到新闻")
+		return map[string]int{"raw": 0}, nil
+	}
+	log.Printf("[engine] 补推: 强制拉取 %d 条新闻", len(raw))
+
+	// Stage0 归因分类（失败时整批归一般并保留错误原因）
+	st0 := na.Stage0(raw)
+	if st0.Err != nil {
+		log.Printf("[engine] 补推: Stage0失败, %d条归一般: %v", len(raw), st0.Err)
+	}
+
+	// 标题党校正
+	for i, t := range st0.CorrectedTitle {
+		if i >= 0 && i < len(raw) && t != "" {
+			raw[i].Title = t
+		}
+	}
+
+	// 收集事件：个股 → Stage2；板块 → material 初筛后 Stage2；IPO → 直构
+	var events []newsagent.NewsEvent
+	if len(st0.StockIdx) > 0 {
+		events = append(events, na.Stage2(pickItems(raw, st0.StockIdx))...)
+	}
+	if len(st0.SectorIdx) > 0 {
+		sectorItems := pickItems(raw, st0.SectorIdx)
+		var kept []int
+		for j := range sectorItems {
+			if st0.Material[st0.SectorIdx[j]] {
+				kept = append(kept, j)
+			}
+		}
+		if len(kept) > 0 {
+			events = append(events, na.Stage2(pickItems(sectorItems, kept))...)
+		}
+	}
+	if len(st0.IpoIdx) > 0 {
+		events = append(events, na.BuildIPOFeedEvents(pickItems(raw, st0.IpoIdx))...)
+	}
+	events = append(events, na.BuildIPOEvents()...)
+
+	// 落盘事件（供 /api/news 展示）
+	na.SaveEvents(events)
+
+	stat := map[string]int{
+		"raw":    len(raw),
+		"stock":  len(st0.StockIdx),
+		"sector": len(st0.SectorIdx),
+		"ipo":    len(st0.IpoIdx),
+		"general": len(st0.GeneralIdx),
+		"events": len(events),
+	}
+	log.Printf("[engine] 补推完成: 原始%d 个股%d 板块%d IPO%d 一般%d 事件%d (err=%v)",
+		stat["raw"], stat["stock"], stat["sector"], stat["ipo"], stat["general"], stat["events"], st0.Err)
+	return stat, nil
+}
+
+// TestAttribution 单条归因测试：传一条标题+正文摘要，直接走 Stage2 LLM 深度分析
+// （含产业链价值传导推导 + 差分事件拆分），返回拆分后的 NewsEvent 供快速验证归因逻辑。
+// 用于 B2 单条验证：如"诺基亚收购恩智浦一工厂 计划自产磷化铟半导体"应归因上游磷化铟厂商。
+func (e *Engine) TestAttribution(title, digest string) ([]newsagent.NewsEvent, error) {
+	e.mu.RLock()
+	na := e.newsAgent
+	e.mu.RUnlock()
+	if na == nil {
+		return nil, fmt.Errorf("新闻代理未启动")
+	}
+	if strings.TrimSpace(title) == "" {
+		return nil, fmt.Errorf("标题不能为空")
+	}
+	item := data.NewsItem{
+		Title:    title,
+		Content:  digest,
+		Source:   "测试",
+		Datetime: time.Now().Format("2006-01-02 15:04:05"),
+	}
+	events := na.Stage2([]data.NewsItem{item})
+	if len(events) == 0 {
+		log.Printf("[engine] 单条归因测试: 无事件产出 (title=%s)", title[:min(len(title), 40)])
+	}
+	return events, nil
 }
 
 // refreshSectors 每轮拉取同花顺全量板块名单并喂给 scanner，保证 FindSectorsByNames 可命中真实板块。
@@ -1447,6 +1559,7 @@ func (e *Engine) verifySectorAttribution(events []newsagent.NewsEvent) {
 // propagateSectorToStocks 板块→个股事件级传播：对命中真实板块的板块级事件，
 // 取板块前10成分股注入 RelatedStocks（"名称(代码)"），并同步清洗 CleanedStocks，
 // 使板块权重沿 事件→个股监测池(8a/8b) 传递。同一板块每轮只取一次成分股。
+// 遍历范围含直接板块 + 上游 + 下游板块，补足 LLM 未点名的产业链个股。
 func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	e.mu.RLock()
 	scanner := e.scanner
@@ -1461,7 +1574,11 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 		if ev.Level != "板块" || absScore(ev.Score) < 0.5 {
 			continue
 		}
-		for _, name := range ev.Sectors {
+		// 汇总直接板块 + 上游 + 下游板块一并传播
+		allSectors := append([]string{}, ev.Sectors...)
+		allSectors = append(allSectors, ev.UpstreamSectors...)
+		allSectors = append(allSectors, ev.DownstreamSectors...)
+		for _, name := range allSectors {
 			si := e.sectorByName(name)
 			if si == nil {
 				continue
@@ -1636,7 +1753,8 @@ func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
 	if len(events) < 2 {
 		return events
 	}
-	// 为每个板块名维护簇索引
+	// 为每个"板块+方向"维护簇索引：同板块不同方向的事件不得合并
+	// （对抗制裁型上游利好/下游利空拆分事件方向相反，误合并会吞掉方向）。
 	clusterOf := make(map[string]int)
 	clusters := make([][]int, 0, len(events))
 	assign := func(ev newsagent.NewsEvent) int {
@@ -1644,8 +1762,9 @@ func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
 			return -1 // 个股级事件不参与聚簇，各自独立
 		}
 		for _, sec := range ev.Sectors {
-			if idx, ok := clusterOf[sec]; ok {
-				return idx // 命中已有板块簇则归入该簇
+			key := sec + "|" + ev.Direction
+			if idx, ok := clusterOf[key]; ok {
+				return idx // 命中已有同板块同方向簇则归入该簇
 			}
 		}
 		return -1 // 无共享板块，新建独立簇
@@ -1658,7 +1777,7 @@ func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
 		}
 		clusters[idx] = append(clusters[idx], i)
 		for _, sec := range ev.Sectors {
-			clusterOf[sec] = idx
+			clusterOf[sec+"|"+ev.Direction] = idx
 		}
 	}
 

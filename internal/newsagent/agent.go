@@ -60,7 +60,7 @@ func (a *Agent) Stop() error {
 
 // Fetch 拉取未读新闻（含去重记账）。记账属 fetch 自身职能，不对外暴露。
 func (a *Agent) Fetch(ctx context.Context, since time.Time) []data.NewsItem {
-	rawNews := a.fetchCatchUp()
+	rawNews := a.fetchCatchUp(false)
 	if len(rawNews) > 0 {
 		log.Printf("[newsagent] 追回 %d 条新闻 (since=%s)", len(rawNews), since.Format("01-02 15:04"))
 	}

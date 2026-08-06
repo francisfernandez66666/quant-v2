@@ -131,7 +131,14 @@
 
     <!-- 热点资讯列表 -->
     <div class="card" style="margin-top: 14px;">
-      <div class="card-header">📰 热点资讯</div>
+      <div class="card-header">
+        📰 热点资讯
+        <div class="hs-actions">
+          <button class="btn-log" :disabled="reanalyzing" @click="onReanalyze">
+            {{ reanalyzing ? '补推中…' : '🔁 手动补推' }}
+          </button>
+        </div>
+      </div>
       <!-- 资讯行：时间 + 标题 + 情绪/方向/影响/板块/个股标签 -->
       <div v-if="newsItems.length" class="hs-news-scroll">
         <div v-for="(n, i) in newsItems" :key="i" class="hs-news-item">
@@ -230,6 +237,7 @@ function showReason(s) { reasonTarget.value = s }
 let timer = null                  // 定时轮询句柄
 let unsubSSE = null               // SSE 取消订阅函数
 let loading = false              // 防并发请求标志
+const reanalyzing = ref(false)   // 手动 LLM 补推进行中标志
 
 // ── 计算属性 ──
 /** 过滤出非日历的普通资讯 */
@@ -331,6 +339,21 @@ async function load() {
 /** SSE 触发刷新 */
 function handleSSE() { load() }
 
+/** 手动 LLM 补推：触发后端重跑最近新闻分析，随后刷新资讯列表 */
+async function onReanalyze() {
+  if (reanalyzing.value) return
+  reanalyzing.value = true
+  try {
+    const res = await api.reanalyzeNews()
+    if (res && res.accepted !== false) {
+      // 补推结果记录在后端日志；稍等片刻后刷新资讯展示新事件
+      setTimeout(() => load(), 1500)
+    }
+  } catch (_) {} finally {
+    reanalyzing.value = false
+  }
+}
+
 onMounted(() => {
   load()
   // 每 3 秒轮询一次热点数据
@@ -351,6 +374,8 @@ onUnmounted(() => {
 .card { background: #1a1a2e; border-radius: 8px; padding: 14px; }
 .card-header { font-size: 14px; font-weight: 600; color: #ccc; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
 .card-sub { font-size: 11px; color: #666; font-weight: 400; }
+.hs-actions { display: flex; align-items: center; gap: 6px; }
+.hs-actions .btn-compact:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-log {
   padding: 4px 10px; border-radius: 5px; border: 1px solid #b388ff;
   background: transparent; color: #b388ff; font-size: 11px; cursor: pointer;

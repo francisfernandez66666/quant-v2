@@ -161,21 +161,22 @@ func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, erro
 			sb.WriteString(fmt.Sprintf("%d. %s\n正文: %s\n", i-start+1, titles[i], body))
 		}
 
-		// LLM 轮询重试：最多 3 次，间隔随尝试次数递增（2s/4s）
-		var resp string
-		var err error
-		for attempt := 1; attempt <= 3; attempt++ {
-			resp, err = a.llmClient.Chat(stageCombinedSystemPrompt, sb.String())
-			if err == nil {
-				break
-			}
-			if attempt < 3 {
-				log.Printf("[newsagent] Stage0/1合并 LLM失败(第%d次), 重试: %v", attempt, err)
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-			}
-		}
+		// LLM 轮询重试：指数退避最多 5 次（1s/2s/4s/8s），应对上游瞬时抖动/连不通
+		resp, err := retryLLM(sb.String(), func() (string, error) {
+			return a.llmClient.Chat(stageCombinedSystemPrompt, sb.String())
+		})
 		if err != nil {
-			log.Printf("[newsagent] Stage0/1合并 LLM轮询重试仍失败, 该批%d条归一般(不降级): %v", end-start, err)
+			// 留痕：打印该批序号与标题，便于事后定位是哪批/哪些新闻没被分析
+			trace := make([]string, 0, 3)
+			for i := start; i < min(end, start+3); i++ {
+				trace = append(trace, titles[i])
+			}
+			ellipsis := ""
+			if end-start > 3 {
+				ellipsis = fmt.Sprintf("…(共%d条)", end-start)
+			}
+			log.Printf("[newsagent] Stage0/1合并 LLM轮询重试仍失败, 该批%d条归一般(不降级): %v；本批前几条: %v%v",
+				end-start, err, trace, ellipsis)
 			return nil, err
 		}
 
@@ -237,7 +238,8 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 	judgements, err := a.classifyCombined(titles, bodies)
 	if err != nil {
 		// 不兜底：整批归一般（仅展示），下一轮轮询可重新拉取
-		log.Printf("[newsagent] Stage0/1合并失败, 整批 %d 条归一般", len(items))
+		res.Err = err
+		log.Printf("[newsagent] Stage0/1合并失败, 整批 %d 条归一般: %v", len(items), err)
 		for i := range items {
 			res.GeneralIdx = append(res.GeneralIdx, i)
 		}
@@ -306,6 +308,28 @@ func newsTitles(items []data.NewsItem) []string {
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
 const llmBatchSize = 30
 
+// llmRetryMax LLM 单次调用的最大重试次数（含首次），指数退避，应对上游瞬时抖动/连不通。
+const llmRetryMax = 5
+
+// retryLLM 以指数退避方式重试一次 LLM 调用：失败重试 5 次，间隔 1s/2s/4s/8s。
+// 返回 (响应, 最后一次错误)。记录每次失败以便排障。
+func retryLLM(userMsg string, call func() (string, error)) (string, error) {
+	var resp string
+	var err error
+	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+	for attempt := 1; attempt <= llmRetryMax; attempt++ {
+		resp, err = call()
+		if err == nil {
+			return resp, nil
+		}
+		log.Printf("[newsagent] LLM调用失败(第%d/%d次): %v", attempt, llmRetryMax, err)
+		if attempt < llmRetryMax {
+			time.Sleep(backoff[attempt-1])
+		}
+	}
+	return "", fmt.Errorf("LLM连试%d次仍失败: %v", llmRetryMax, err)
+}
+
 // batchBounds 将 n 个元素按 size 分块，返回 [start,end) 区间列表。
 func batchBounds(n, size int) [][2]int {
 	var out [][2]int
@@ -343,19 +367,10 @@ func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
 		}
 
-		// LLM 轮询重试：最多 3 次，固定间隔 2s
-		var resp string
-		var err error
-		for attempt := 1; attempt <= 3; attempt++ {
-			resp, err = a.llmClient.Chat(stage0FilterSystemPrompt, sb.String())
-			if err == nil {
-				break
-			}
-			if attempt < 3 {
-				log.Printf("[newsagent] Stage0垃圾过滤 LLM失败(第%d次), 重试: %v", attempt, err)
-				time.Sleep(2 * time.Second)
-			}
-		}
+		// LLM 轮询重试：指数退避最多 5 次
+		resp, err := retryLLM(sb.String(), func() (string, error) {
+			return a.llmClient.Chat(stage0FilterSystemPrompt, sb.String())
+		})
 		if err != nil {
 			// 降级策略：LLM 不可用时改用关键词兜底，只剔除明显非官方内容，保证流水线不中断
 			log.Printf("[newsagent] Stage0垃圾过滤 LLM失败, 降级关键词过滤该批%d条: %v", len(chunk), err)

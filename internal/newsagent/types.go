@@ -24,6 +24,8 @@ type NewsEvent struct {
 	EventType         string   `json:"event_type,omitempty"`         // 事件类型：公司/行业/宏观...
 	Urgency           string   `json:"urgency,omitempty"`            // 紧急程度：紧急/关注/一般
 	Reason            string   `json:"reason,omitempty"`             // LLM 归因说明
+	Region            string   `json:"region,omitempty"`             // 事件来源地域：国内/海外（LLM 判定）
+	Relation          string   `json:"relation,omitempty"`           // 海外事件与A股板块关系：对抗制裁/合作/不涉及
 }
 
 // Stage0Result Stage0 分类结果：按标题归因将新闻分为个股/板块/一般三类。
@@ -40,6 +42,8 @@ type Stage0Result struct {
 	// CorrectedTitle 标题党校正：LLM 判定标题与正文不符时给出的校正标题。
 	// 键为 rawNews 索引。
 	CorrectedTitle map[int]string
+	// Err Stage0 失败的底层原因（如 LLM 连不通导致整批归一般）。成功或无异常时为 nil。
+	Err error
 }
 
 // DebugInfo LLM 调试信息，记录 Stage1/Stage2 处理过程和中间数据。

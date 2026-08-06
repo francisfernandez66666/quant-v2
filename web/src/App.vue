@@ -85,9 +85,13 @@
           <button class="btn-logout" @click="logout">退出</button>
         </div>
       </div>
-      <!-- 内容区：由当前路由对应的页面组件填充 -->
+      <!-- 内容区：由当前路由对应的页面组件填充（KeepAlive：切换 tab 不卸载页面、保留数据缓存） -->
       <div class="content">
-        <router-view />
+        <router-view v-slot="{ Component }">
+          <keep-alive>
+            <component :is="Component" />
+          </keep-alive>
+        </router-view>
       </div>
     </main>
 

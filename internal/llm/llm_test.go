@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -39,6 +40,89 @@ func TestFallbackAnalysisKeywordScore(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(ht.Sectors, ","), "半导体") {
 		t.Fatalf("期望归因半导体板块，实际 %v", ht.Sectors)
+	}
+}
+
+// TestCleanJSONInvalidEscape 非法转义（如 9B 推理模型输出 \( ）应被剥掉反斜杠，
+// 保留原字符，使响应可被 json.Unmarshal 正常解析。
+func TestCleanJSONInvalidEscape(t *testing.T) {
+	raw := "```json\n[{\"index\":1,\"reason\":\"磷化铟上游(云南锗业/有研新材)受益\\，海外自产确认价值\",\"sectors\":[\"半导体材料\"]}]\n```"
+	got := cleanJSON(raw)
+	var arr []map[string]interface{}
+	if err := json.Unmarshal([]byte(got), &arr); err != nil {
+		t.Fatalf("cleanJSON 后仍无法解析: %v\nraw=%q\ncleaned=%q", err, raw, got)
+	}
+	reason, _ := arr[0]["reason"].(string)
+	if !strings.Contains(reason, "(云南锗业/有研新材)") {
+		t.Fatalf("非法转义处理错误, reason=%q", reason)
+	}
+}
+
+// TestCleanJSONValidEscape 合法转义（\n \uXXXX \" \\）必须原样保留，不得误伤。
+func TestCleanJSONValidEscape(t *testing.T) {
+	raw := `[{"index":1,"title":"A \"quoted\" \u5f53\u524d","reason":"line1\nline2","path":"a\\b"}]`
+	got := cleanJSON(raw)
+	var arr []map[string]interface{}
+	if err := json.Unmarshal([]byte(got), &arr); err != nil {
+		t.Fatalf("合法转义被误伤: %v\ncleaned=%q", err, got)
+	}
+	title, _ := arr[0]["title"].(string)
+	if title != "A \"quoted\" 当前" {
+		t.Fatalf("标题转义解析错误: %q", title)
+	}
+	reason, _ := arr[0]["reason"].(string)
+	if !strings.Contains(reason, "line1\nline2") {
+		t.Fatalf("\\n 转义解析错误: %q", reason)
+	}
+	path, _ := arr[0]["path"].(string)
+	if path != `a\b` {
+		t.Fatalf("\\\\ 转义解析错误: %q", path)
+	}
+}
+
+// TestFlexibleFloatStringScore 9B 模型把 score 输出为字符串（"+0.75"）时也能解析。
+func TestFlexibleFloatStringScore(t *testing.T) {
+	var s struct {
+		Score flexibleFloat `json:"score"`
+	}
+	for _, raw := range []string{`{"score":"+0.75"}`, `{"score":-0.5}`, `{"score":0.25}`, `{"score":" 1 "}`} {
+		if err := json.Unmarshal([]byte(raw), &s); err != nil {
+			t.Fatalf("解析失败 %s: %v", raw, err)
+		}
+		if s.Score == 0 {
+			t.Fatalf("score 不应为 0: %s", raw)
+		}
+	}
+	// 非法值容错为 0，不崩
+	var zero struct {
+		Score flexibleFloat `json:"score"`
+	}
+	if err := json.Unmarshal([]byte(`{"score":"abc"}`), &zero); err != nil {
+		t.Fatalf("非法 score 应容错不报错: %v", err)
+	}
+	if zero.Score != 0 {
+		t.Fatalf("非法 score 应为 0, 实际 %v", zero.Score)
+	}
+}
+
+// TestCleanJSONBarePlusNumber 裸 '+' 前缀数值（"score": +0.75）为非法 JSON，应剥掉 '+' 可解析。
+func TestCleanJSONBarePlusNumber(t *testing.T) {
+	raw := `[{"index":1,"score": +0.75,"sectors":["半导体材料"]},{"index":2,"score":-0.5}]`
+	got := cleanJSON(raw)
+	var arr []struct {
+		Score float64 `json:"score"`
+	}
+	if err := json.Unmarshal([]byte(got), &arr); err != nil {
+		t.Fatalf("裸 + 号数值清理后仍无法解析: %v\ncleaned=%q", err, got)
+	}
+	if len(arr) != 2 || arr[0].Score != 0.75 || arr[1].Score != -0.5 {
+		t.Fatalf("数值解析错误: %+v", arr)
+	}
+	// 字符串内的 '+' 不能被误删
+	rawStr := `[{"reason":"A + B 传导"}]`
+	gotStr := cleanJSON(rawStr)
+	if !strings.Contains(gotStr, "A + B") {
+		t.Fatalf("字符串内 + 被误删: %q", gotStr)
 	}
 }
 

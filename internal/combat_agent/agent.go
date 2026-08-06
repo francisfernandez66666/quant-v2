@@ -434,8 +434,10 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 
 // CheckPositionAlerts 检查所有持仓的止盈止损条件，返回需要提醒的信号列表。
 // 根据实时行情价格计算盈亏比例，触发止盈/止损阈值时生成提醒信号。
-// 入参 rpt 提供持仓明细，marketAPI 提供实时报价；返回提醒信号（AlertType=止盈/止损）。
-func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI) []Signal {
+// 入参 rpt 提供持仓明细，marketAPI 提供实时报价，scores 为当轮个股打分表。
+// 若该股当前已有活跃信号（SignalActive=true），止盈/止损触线不硬推，降级为"提示"，
+// 遵循"先看有无高分信号，有则提示持有观察、不再硬通知止盈/止损"的逻辑。
+func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI, scores map[string]StockScores) []Signal {
 	positions := rpt.HeldPositions()
 	if len(positions) == 0 {
 		return nil
@@ -460,36 +462,54 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 		// 按现价计算持仓盈亏比例（%）
 		pnl := (quote.Price - pos.EntryPrice) / pos.EntryPrice * 100
 
-		// 触及止盈线 → 生成止盈提醒（置信度固定 1.0）
+		// 该股当前是否有活跃信号：有则止盈/止损触线不硬推，降级为提示
+		hasActive := false
+		if sc, ok := scores[pos.Code]; ok {
+			hasActive = sc.SignalActive
+		}
+
+		// 触及止盈线 → 生成止盈提醒（置信度固定 1.0）；已有活跃信号时降级为"提示"
 		if pos.TakeProfitPct > 0 && pnl >= pos.TakeProfitPct {
+			alertType, action, reason := "止盈", "止盈",
+				fmt.Sprintf("盈亏%.2f%% 触及止盈%.0f%%", pnl, pos.TakeProfitPct)
+			if hasActive {
+				alertType, action = "提示", "关注"
+				reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%% 但仍有活跃信号,建议持有观察", pnl, pos.TakeProfitPct)
+			}
 			alerts = append(alerts, Signal{
 				ID:          seqID(),
 				Code:        pos.Code,
 				Name:        pos.Name,
 				Strategy:    pos.Strategy,
 				Direction:   "提醒",
-				Action:      "止盈",
-				AlertType:   "止盈",
+				Action:      action,
+				AlertType:   alertType,
 				Price:       quote.Price,
 				Confidence:  1.0,
-				Reason:      fmt.Sprintf("盈亏%.2f%% 触及止盈%.0f%%", pnl, pos.TakeProfitPct),
+				Reason:      reason,
 				GeneratedAt: now,
 			})
 		}
 
-		// 触及止损线 → 生成止损提醒（置信度固定 1.0）
+		// 触及止损线 → 生成止损提醒（置信度固定 1.0）；已有活跃信号时降级为"提示"
 		if pos.StopLossPct > 0 && pnl <= -pos.StopLossPct {
+			alertType, action, reason := "止损", "止损",
+				fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%", pnl, pos.StopLossPct)
+			if hasActive {
+				alertType, action = "提示", "关注"
+				reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 但有活跃信号,关注是否转强", pnl, pos.StopLossPct)
+			}
 			alerts = append(alerts, Signal{
 				ID:          seqID(),
 				Code:        pos.Code,
 				Name:        pos.Name,
 				Strategy:    pos.Strategy,
 				Direction:   "提醒",
-				Action:      "止损",
-				AlertType:   "止损",
+				Action:      action,
+				AlertType:   alertType,
 				Price:       quote.Price,
 				Confidence:  1.0,
-				Reason:      fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%", pnl, pos.StopLossPct),
+				Reason:      reason,
 				GeneratedAt: now,
 			})
 		}

@@ -101,7 +101,7 @@ func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
 	out := toFixSignals(dash.FinalSignals)
 	// 逐票补充实时现价与涨跌幅（忽略失败，保留信号触发价兜底）
 	for i := range out {
-		info, err := s.market.GetRealtimeQuote(out[i].Code)
+		info, err := s.quote(out[i].Code)
 		if err != nil {
 			continue
 		}
@@ -319,7 +319,7 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 		pnl := 0.0
 		name := l.Name
 		// 实时拉取股价；失败时回退到开仓价（盈亏视为 0）
-		if info, err := s.market.GetRealtimeQuote(l.Code); err == nil {
+		if info, err := s.quote(l.Code); err == nil {
 			cur = info.Price
 			chg = info.ChangePct
 			name = info.Name
@@ -512,9 +512,10 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// snapshotQuote 获取个股实时行情：优先读 fetcher 5s 快照（新浪批量，一次全池），
-// 缺失时降级 同花顺→东财 单查（同花顺优先于东财，降低东财限流压力）。
-func (s *Server) snapshotQuote(code string) (*data.StockInfo, error) {
+// quote 统一行情入口：优先读 fetcher 5s 快照（新浪批量，一次全池），
+// 缺失时走 DataCoordinator 新浪→同花顺→东财 三级降级链。
+// 所有展示价格的 handler 一律调用本函数，保证跨页同一时刻价格一致。
+func (s *Server) quote(code string) (*data.StockInfo, error) {
 	if s.fetcher != nil {
 		if snap := s.fetcher.Snapshot(); snap != nil {
 			if si, ok := snap.Stocks[code]; ok && si != nil && si.Price > 0 {
@@ -522,10 +523,8 @@ func (s *Server) snapshotQuote(code string) (*data.StockInfo, error) {
 			}
 		}
 	}
-	if s.ths != nil {
-		if si, err := s.ths.GetQuote(code); err == nil && si != nil && si.Price > 0 {
-			return si, nil
-		}
+	if s.dc != nil {
+		return s.dc.GetQuote(code)
 	}
 	return s.market.GetRealtimeQuote(code)
 }
@@ -542,7 +541,7 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]interface{}, 0)
 	for _, code := range stockList {
-		info, err := s.snapshotQuote(code)
+		info, err := s.quote(code)
 		if err != nil {
 			continue
 		}
@@ -577,7 +576,7 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[sig.Code] = true
-		info, err := s.snapshotQuote(sig.Code)
+		info, err := s.quote(sig.Code)
 		price := sig.Price
 		chg := 0.0
 		if err == nil {
@@ -628,7 +627,7 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 			mScore = sc.MomentumScore
 			sigActive = sc.SignalActive
 		}
-		info, _ := s.market.GetRealtimeQuote(code)
+		info, _ := s.quote(code)
 		name := code
 		price := 0.0
 		chg := 0.0
@@ -693,7 +692,7 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "code required")
 		return
 	}
-	info, err := s.market.GetRealtimeQuote(code)
+	info, err := s.quote(code)
 	if err != nil {
 		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "price": 0})
 		return
@@ -852,7 +851,7 @@ func (s *Server) handleFixGetWatchlist(w http.ResponseWriter, r *http.Request) {
 	list := s.watchlist.List()
 	out := make([]map[string]interface{}, 0)
 	for _, code := range list {
-		info, err := s.market.GetRealtimeQuote(code)
+		info, err := s.quote(code)
 		name := code
 		price := 0.0
 		chg := 0.0
@@ -893,7 +892,7 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"status": "ok", "duplicate": true})
 		return
 	}
-	info, _ := s.market.GetRealtimeQuote(code)
+	info, _ := s.quote(code)
 	name := code
 	price := 0.0
 	chg := 0.0

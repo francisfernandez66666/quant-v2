@@ -39,6 +39,26 @@ func TestClusterEvents(t *testing.T) {
 	}
 }
 
+// TestClusterEventsSameSectorDiffDirection 同板块不同方向的事件不得合并：
+// 对抗制裁型上游利好/下游利空拆分事件共享"光通信"板块时，方向相反必须各自独立保留。
+func TestClusterEventsSameSectorDiffDirection(t *testing.T) {
+	events := []newsagent.NewsEvent{
+		{Title: "上游利好", Sectors: []string{"光通信"}, Score: 0.75, Direction: "利好"},
+		{Title: "下游利空", Sectors: []string{"光通信"}, Score: -0.5, Direction: "利空"},
+	}
+	out := clusterEvents(events)
+	if len(out) != 2 {
+		t.Fatalf("同板块不同方向事件不应合并: %d 条, want 2", len(out))
+	}
+	directions := map[string]bool{}
+	for _, ev := range out {
+		directions[ev.Direction] = true
+	}
+	if !directions["利好"] || !directions["利空"] {
+		t.Fatalf("应同时保留利好与利空两个方向, 实际 %v", directions)
+	}
+}
+
 // TestApplyEventDecay 验证重复事件衰减规则：首次不衰减；4 小时后同板块同方向事件 score ×0.5；
 // 个股级事件不参与衰减。
 func TestApplyEventDecay(t *testing.T) {

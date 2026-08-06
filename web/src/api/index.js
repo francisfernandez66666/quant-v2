@@ -326,6 +326,15 @@ export async function fetchNews(all) {
   return request(all ? '/api/news?all=true' : '/api/news')
 }
 
+/**
+ * 手动 LLM 补推：强制重新拉取最近新闻并重跑 Stage0+Stage2 分析。
+ * 用于早盘/盘中 LLM 上游抖动导致整批新闻未被分析时的补救。
+ * 异步执行，返回 202 表示已触发。
+ */
+export async function reanalyzeNews() {
+  return request('/api/news/reanalyze', { method: 'POST' })
+}
+
 // ── 自选股 ──
 
 /** 获取自选股列表 */
