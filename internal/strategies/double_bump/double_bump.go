@@ -18,6 +18,10 @@
 //     MA5 > MA10 判定多头排列；收盘价 > MA5 确认短期趋势强势。
 //     均线多头排列是趋势延续的基础条件。
 //
+//   - 第二波方向闸门（当日实时涨跌幅）：
+//     第二波必须是向上结构 —— 当日 ChangePct > MinChangePct(默认0) 才计"第二波放量/调整"分；
+//     水下/平盘（跌水日）被降为仅均线分，最多 watch，避免全天绿票误报双凸买入。
+//
 // 信号阈值：
 //   - total ≥ 70 → full_chain（完整链，买入），置信度>0.8 → P1，其余 P2
 //   - total ≥ 50 → brief（半确认），P3_5 观察
@@ -90,6 +94,10 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	// 读取热加载的双凸配置（放量倍数、权重、调整阈值等）
 	cfg := d.cfg.Get()
 	dbc := cfg.Strategy.DoubleBump
+	// 第二波当日方向闸门：双凸的"第二波"必须是向上结构，
+	// 水下/平盘（ChangePct<=MinChangePct，默认0）不能充当"放量上攻波"。
+	// 此时量能分/调整分强制为 0，只剩均线分（≤MAWeight×100，远低于 full_chain 阈值）。
+	upSession := si.ChangePct > dbc.MinChangePct
 
 	// 计算回看期内均量和均价（去掉最后一根，作为"第一波"的对比基准）
 	avgVol := 0.0
@@ -124,20 +132,22 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 
 	// 第二波确认：最后一根K线量能 > 均量 × SecondBreakVolumeMultiple
-	// 两波放量说明资金持续介入，趋势健康
-	lastVol := kLines[n-1].Volume
+	// 两波放量说明资金持续介入，趋势健康；但仅当日上行时才计量能分（水下放量=出货/放量下跌）
 	volScore := 0.0
-	if firstBreakVol > 0 && lastVol > avgVol*dbc.SecondBreakVolumeMultiple {
+	if upSession && firstBreakVol > 0 && (func() bool {
+		lastVol := kLines[n-1].Volume
+		return lastVol > avgVol*dbc.SecondBreakVolumeMultiple
+	})() {
 		volScore = dbc.VolumeWeight * 100
 	}
 
 	// 调整深度评分：振幅 / 均价 < AdjustVolRatioMax×2 说明调整温和
-	// （调整幅度小意味着抛压可控、筹码锁定良好）
+	// （调整幅度小意味着抛压可控、筹码锁定良好）；仅当日上行时才计调整分（水下窄幅不算确认）
 	high := kLines[n-1].High
 	low := kLines[n-1].Low
 	adjustDepth := (high - low) / avgClose * 100
 	adjustScore := 0.0
-	if adjustDepth < dbc.AdjustVolRatioMax*2 {
+	if upSession && adjustDepth < dbc.AdjustVolRatioMax*2 {
 		adjustScore = dbc.PositionWeight * 100
 	}
 

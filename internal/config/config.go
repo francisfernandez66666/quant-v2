@@ -180,6 +180,7 @@ type DoubleBumpConfig struct {
 	AdjustDaysMin             int     `json:"adjust_days_min"`              // 最短调整天数
 	AdjustDaysMax             int     `json:"adjust_days_max"`              // 最长调整天数
 	AdjustDaysOverflow        int     `json:"adjust_days_overflow"`         // 调整超期天数（超期判弱）
+	MinChangePct              float64 `json:"min_change_pct"`              // 第二波当日最低涨跌幅(%)：<=该值判无效，水下不评买入
 	PositionWeight            float64 `json:"position_weight"`              // 仓位因子权重
 	MAWeight                  float64 `json:"ma_weight"`                    // 均线因子权重
 	SectorWeight              float64 `json:"sector_weight"`                // 板块因子权重
@@ -384,6 +385,7 @@ func defaultStrategyConfig() StrategyConfig {
 			AdjustDaysMin:             1,
 			AdjustDaysMax:             5,
 			AdjustDaysOverflow:        6,
+			MinChangePct:              0,
 			PositionWeight:            0.3,
 			MAWeight:                  0.3,
 			SectorWeight:              0.2,
