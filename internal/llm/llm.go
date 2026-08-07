@@ -4,6 +4,7 @@ package llm
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -657,6 +658,47 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 		ht.Urgency = "观察"
 	}
 	return &ht, nil
+}
+
+// Ping 发送最小请求验证 LLM 通道（API Key / 网络 / 上游服务）可用性。
+// 使用极小的非流式请求（max_tokens=1），成功返回 nil；失败返回上游错误。
+// 供启动时序在进入盘前新闻分析前快速探活，尽早暴露 key 失效/断网问题。
+func (c *Client) Ping() error {
+	if c.apiKey == "" {
+		return fmt.Errorf("LLM_API_KEY not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	payload := chatCompletionRequest{
+		ChatRequest: ChatRequest{
+			Model: c.model,
+			Messages: []Message{
+				{Role: "user", Content: "好"},
+			},
+		},
+		Stream:    false,
+		MaxTokens: 1,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.apiURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("LLM API 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return nil
 }
 
 // AnalyzeSentiment 简版情感分析（用于快速评分）。

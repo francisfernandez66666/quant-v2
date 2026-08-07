@@ -62,3 +62,18 @@ type TrackerData struct {
 	SeenTitles map[string]string `json:"seen_titles"` // md5(title) → datetime：已处理标题及其时间
 	LastSync   map[string]string `json:"last_sync"`   // source → latest_datetime：各来源最近同步时间
 }
+
+// FrozenEvent 固化事件：保留 Stage2 分析出的利好/利空价值及其关联个股，跨盘前刷新持续存在。
+// 自产生交易日保留，顺延一个交易日；期间若同板块+同方向出现新事件则整体覆盖（分数取最新），
+// 否则在下一交易日保存时到期清除。
+type FrozenEvent struct {
+	NewsEvent // 内嵌原始事件（Title/Score/Direction/RelatedStocks/CleanedStocks/Sectors 等）
+	Day       string `json:"day"` // 固化产生交易日（YYYY-MM-DD），用于跨日到期判断
+	Key       string `json:"key"` // 覆盖键：sector|direction（同板块+同方向新事件据此覆盖）
+}
+
+// frozenDB 固化事件本地持久化结构（frozen_events.json）。
+type frozenDB struct {
+	TradingDay string        `json:"trading_day"` // 最近写入的交易日（用于跨日归档/清理）
+	Events     []FrozenEvent `json:"events"`      // 当前固化的利好/利空事件列表
+}

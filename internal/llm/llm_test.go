@@ -292,3 +292,45 @@ func TestNonStreamChat(t *testing.T) {
 		t.Fatalf("非流式应成功: err=%v got=%q", err, got)
 	}
 }
+
+// TestPingOK 校验探活请求成功路径（极小 max_tokens、一次往返即返回）。
+func TestPingOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Stream {
+			t.Error("探活不应使用流式")
+		}
+		if req.MaxTokens != 1 {
+			t.Errorf("探活 max_tokens 应为 1, 实际 %d", req.MaxTokens)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"好"}}]}`)
+	}))
+	defer srv.Close()
+	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: false, Timeout: 5 * time.Second})
+	if err := c.Ping(); err != nil {
+		t.Fatalf("探活应成功: %v", err)
+	}
+}
+
+// TestPingNoKey 未配置 APIKey 应直接报错。
+func TestPingNoKey(t *testing.T) {
+	c := New(Config{APIKey: "", APIURL: "http://x", Model: "m"})
+	if err := c.Ping(); err == nil {
+		t.Fatal("无 APIKey 探活应失败")
+	}
+}
+
+// TestPingUpstreamError 上游返回非 2xx 时探活应报错并带出状态码。
+func TestPingUpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		fmt.Fprint(w, "boom")
+	}))
+	defer srv.Close()
+	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: false})
+	if err := c.Ping(); err == nil {
+		t.Fatal("上游 500 探活应失败")
+	}
+}

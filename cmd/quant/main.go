@@ -98,6 +98,15 @@ func main() {
 		log.Println("[LLM] 未配置 API Key，LLM 功能不可用")
 	}
 
+	// 启动前 LLM 通道预检：尽早暴露 key 失效/断网问题，避免盘前才被发现
+	if llmClient != nil {
+		if err := llmClient.Ping(); err != nil {
+			log.Printf("[LLM] 启动预检失败(将降级运行): %v", err)
+		} else {
+			log.Printf("[LLM] 启动预检通过")
+		}
+	}
+
 	// 股票清洗器：负责股票代码/名称归一化，供新闻归因与板块扫描使用
 	cleaner := data.NewStockCleaner(marketAPI)
 
@@ -200,7 +209,17 @@ func main() {
 		since, ok := sinceForSession(session, now)
 		if ok {
 			log.Printf("[main] Session=%s 追回起始=%s", session, since.Format("01-02 15:04"))
-			eng.Run(ctx, since)
+			if session == data.SessionPreMarket {
+				// 盘前：新闻流水线含 LLM，异步触发，避免 LLM 同步重试阻塞主循环/近实时打分
+				if eng.TryAsyncRun(ctx, since) {
+					log.Printf("[main] 盘前异步引擎已触发")
+				} else {
+					log.Printf("[main] 盘前异步引擎仍在运行, 跳过本轮")
+				}
+			} else {
+				// 午前/盘中：同步触发，保证上一轮结果落地后再进下一轮
+				eng.Run(ctx, since)
+			}
 		} else {
 			log.Printf("[main] Session=%s 非处理时段, 跳过本轮", session)
 		}

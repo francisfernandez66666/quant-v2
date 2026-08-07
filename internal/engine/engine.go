@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
@@ -50,6 +51,8 @@ type Engine struct {
 
 	longEnabled  bool // 利好开关（做多分支）
 	shortEnabled bool // 利空开关（做空分支）
+
+	asyncBusy int32 // 盘前异步引擎运行标记（忙锁，避免异步 run 重入）
 
 	debugInfo    *newsagent.DebugInfo  // 最近一轮流水线的调试数据（/api/debug 展示）
 	stageRecords []newsagent.DebugInfo // 当日全量轮次记录（固化到磁盘）
@@ -1025,104 +1028,148 @@ func (e *Engine) GetDebugInfo() *newsagent.DebugInfo {
 	return e.debugInfo
 }
 
-// Run 驱动一轮完整流水线：拉取 → Stage0 → Stage1/2 → 阈值过滤 → 归因 → 板块验证 → 战法扫描 → 信号聚合 → 广播。
-// since 为新闻追回起始时间，由调用方（主循环）根据市场时段计算。
-func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.StrategyResult {
-	t0 := time.Now()
+// produceOut 新闻流水线的中间产物，供 Run 后续环节复用（策略评估/D1评分/调试快照）。
+type produceOut struct {
+	rawNews []data.NewsItem        // 原始新闻（标题党校正后）
+	st0     newsagent.Stage0Result // Stage0 归因分类结果
+	events  []newsagent.NewsEvent  // 全量已打标事件（含中性/一般）
+	valid   []newsagent.NewsEvent  // 阈值过滤+聚簇+衰减后的有效事件（进引擎）
+}
+
+// produceNews 执行新闻流水线：拉取→Stage0 归因→Stage2 深度分析→固化→阈值→聚簇→衰减→归因验真传播。
+// 独立成方法以便盘前以异步 goroutine 触发，避免 LLM 同步重试阻塞主循环。
+func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
+	out := produceOut{}
 
 	// 0. 刷新同花顺板块名单到 scanner（FindSectorsByNames/归因校验依赖真实板块名单）
 	e.refreshSectors()
 
 	// 1. 拉取原始新闻（含去重记账，属 newsagent 职能）
-	rawNews := e.newsAgent.Fetch(ctx, since)
-	var st0 newsagent.Stage0Result
-	var events []newsagent.NewsEvent
-	var valid []newsagent.NewsEvent
+	out.rawNews = e.newsAgent.Fetch(ctx, since)
 
-	if len(rawNews) == 0 {
+	if len(out.rawNews) == 0 {
 		log.Printf("[engine] 无新新闻 (since=%s), 本轮仅执行打分", since.Format("01-02 15:04"))
-	} else {
-		// 2. Stage0 归因分类：个股 / 板块 / 一般（合并垃圾过滤+价值初筛+标题党复核）
-		st0 = e.newsAgent.Stage0(rawNews)
-		if st0.Err != nil {
-			// Stage0 失败：整批归一般（仅展示，不进 LLM 深度分析），明确记录原因便于排障
-			log.Printf("[engine][news漏斗] Stage0失败, 原始%d条全部归一般, 无LLM分析: %v", len(rawNews), st0.Err)
-		}
-		log.Printf("[engine][news漏斗] 原始=%d 个股=%d 板块=%d IPO=%d 一般=%d (板块material保留=%d)",
-			len(rawNews), len(st0.StockIdx), len(st0.SectorIdx), len(st0.IpoIdx), len(st0.GeneralIdx), len(st0.Material))
+		return out
+	}
 
-		// 2b. 标题党修复：LLM 校正标题应用到原文（供 Stage2 分析、事件与展示使用）
-		for i, t := range st0.CorrectedTitle {
-			if i >= 0 && i < len(rawNews) && t != "" {
-				rawNews[i].Title = t
-			}
-		}
+	// 2. Stage0 归因分类：个股 / 板块 / 一般（合并垃圾过滤+价值初筛+标题党复核）
+	out.st0 = e.newsAgent.Stage0(out.rawNews)
+	if out.st0.Err != nil {
+		// Stage0 失败：整批归一般（仅展示，不进 LLM 深度分析），明确记录原因便于排障
+		log.Printf("[engine][news漏斗] Stage0失败, 原始%d条全部归一般, 无LLM分析: %v", len(out.rawNews), out.st0.Err)
+	}
+	log.Printf("[engine][news漏斗] 原始=%d 个股=%d 板块=%d IPO=%d 一般=%d (板块material保留=%d)",
+		len(out.rawNews), len(out.st0.StockIdx), len(out.st0.SectorIdx), len(out.st0.IpoIdx), len(out.st0.GeneralIdx), len(out.st0.Material))
 
-		// 3. 收集全量事件
-		// 3a. 个股新闻：跳过 Stage1，直接 Stage2 深度分析
-		if len(st0.StockIdx) > 0 {
-			stockItems := pickItems(rawNews, st0.StockIdx)
-			events = append(events, e.newsAgent.Stage2(stockItems)...)
-		}
-
-		// 3b. 板块新闻：material 价值初筛（合并进 Stage0 单次调用）→ Stage2 深度分析
-		if len(st0.SectorIdx) > 0 {
-			sectorItems := pickItems(rawNews, st0.SectorIdx)
-			var kept []int
-			for j := range sectorItems {
-				if st0.Material[st0.SectorIdx[j]] {
-					kept = append(kept, j)
-				}
-			}
-			if len(kept) > 0 {
-				events = append(events, e.newsAgent.Stage2(pickItems(sectorItems, kept))...)
-			}
-		}
-
-		// 3c. IPO 新闻：直构事件（不走 LLM）
-		if len(st0.IpoIdx) > 0 {
-			ipoItems := pickItems(rawNews, st0.IpoIdx)
-			events = append(events, e.newsAgent.BuildIPOFeedEvents(ipoItems)...)
-		}
-
-		// 3d. 一般新闻：不入引擎，仅由 SaveEvents 保存展示
-
-		// 4. 注入 IPO 日历事件
-		events = append(events, e.newsAgent.BuildIPOEvents()...)
-
-		// 4b. 政策反制事件：从涉外政策新闻关键词识别（直构，不走 LLM），并入事件流
-		retEvents := e.buildPolicyRetaliationSignals(e.newsAgent.DeriveRetaliation(rawNews))
-		events = append(events, retEvents...)
-
-		// 5. 持久化全量事件供 /api/news 展示（含中性/一般新闻）
-		e.newsAgent.SaveEvents(events)
-		log.Printf("[engine][news漏斗] 事件共=%d (>=0.25落盘), 个股+板块+IPO来源", len(events))
-
-		// 6. 阈值过滤：仅 |score| ≥ 0.50 进引擎（弱/中性丢弃）
-		valid = filterThreshold(events, 0.50)
-		log.Printf("[engine][news漏斗] 阈值过滤0.5 -> 有效=%d", len(valid))
-		if len(valid) > 0 {
-			// 6a. 事件聚簇：同板块/同方向的重复新闻合并为单条（去重避免刷屏）
-			valid = clusterEvents(valid)
-
-			// 6b. 事件衰减：同板块同方向事件在窗口内重复出现时按 0.5^(h/4) 降权
-			e.applyEventDecay(valid)
-
-			// 6c. 衰减后再次阈值过滤（重复事件降权后可掉出 0.5 线）
-			valid = filterThreshold(valid, 0.50)
-			log.Printf("[engine][news漏斗] 聚簇+衰减后再滤 -> 有效=%d", len(valid))
-			if len(valid) > 0 {
-				// 6b. 板块验真回填：剔除 LLM 幻觉板块名（命中真实板块名单才保留）
-				e.verifySectorAttribution(valid)
-
-				// 6c. 板块→个股事件级传播：板块 top 成分股注入 RelatedStocks 进个股监测池
-				e.propagateSectorToStocks(valid)
-			}
-		}
-		if len(valid) == 0 {
-			log.Printf("[engine] 无有效事件(|score|>=0.5), 本轮仅执行打分")
+	// 2b. 标题党修复：LLM 校正标题应用到原文（供 Stage2 分析、事件与展示使用）
+	for i, t := range out.st0.CorrectedTitle {
+		if i >= 0 && i < len(out.rawNews) && t != "" {
+			out.rawNews[i].Title = t
 		}
 	}
+
+	// 3. 收集全量事件
+	// 3a. 个股新闻：跳过 Stage1，直接 Stage2 深度分析
+	if len(out.st0.StockIdx) > 0 {
+		stockItems := pickItems(out.rawNews, out.st0.StockIdx)
+		out.events = append(out.events, e.newsAgent.Stage2(stockItems)...)
+	}
+
+	// 3b. 板块新闻：material 价值初筛（合并进 Stage0 单次调用）→ Stage2 深度分析
+	if len(out.st0.SectorIdx) > 0 {
+		sectorItems := pickItems(out.rawNews, out.st0.SectorIdx)
+		var kept []int
+		for j := range sectorItems {
+			if out.st0.Material[out.st0.SectorIdx[j]] {
+				kept = append(kept, j)
+			}
+		}
+		if len(kept) > 0 {
+			out.events = append(out.events, e.newsAgent.Stage2(pickItems(sectorItems, kept))...)
+		}
+	}
+
+	// 3c. IPO 新闻：直构事件（不走 LLM）
+	if len(out.st0.IpoIdx) > 0 {
+		ipoItems := pickItems(out.rawNews, out.st0.IpoIdx)
+		out.events = append(out.events, e.newsAgent.BuildIPOFeedEvents(ipoItems)...)
+	}
+
+	// 3d. 一般新闻：不入引擎，仅由 SaveEvents 保存展示
+
+	// 4. 注入 IPO 日历事件
+	out.events = append(out.events, e.newsAgent.BuildIPOEvents()...)
+
+	// 4b. 政策反制事件：从涉外政策新闻关键词识别（直构，不走 LLM），并入事件流
+	retEvents := e.buildPolicyRetaliationSignals(e.newsAgent.DeriveRetaliation(out.rawNews))
+	out.events = append(out.events, retEvents...)
+
+	// 5. 持久化全量事件供 /api/news 展示（含中性/一般新闻）
+	e.newsAgent.SaveEvents(out.events)
+	log.Printf("[engine][news漏斗] 事件共=%d (>=0.25落盘), 个股+板块+IPO来源", len(out.events))
+
+	// 5b. 固化 Stage2 带价值事件（|score|≥0.25 且方向=利好/利空，含关联个股），跨刷新/跨日持续存在。
+	// 同板块+同方向新事件覆盖（分数取最新）；随下一交易日到期清理。
+	e.newsAgent.SaveFrozen(out.events)
+
+	// 6. 阈值过滤：仅 |score| ≥ 0.50 进引擎（弱/中性丢弃）
+	out.valid = filterThreshold(out.events, 0.50)
+	// 6a. 固化事件回填：本轮没有产出有效事件时，回填昨日/上一轮固化的事件，避免弱刷新或 LLM
+	// 偶发失败把已固化的利好/利空事件（及关联个股）直接打没。正常连产场景未复用避免重复。
+	if len(out.valid) == 0 {
+		frozen := e.newsAgent.FrozenEvents()
+		if len(frozen) > 0 {
+			out.valid = filterThreshold(frozen, 0.50)
+			if len(out.valid) > 0 {
+				log.Printf("[engine][news漏斗] 本轮无新有效事件, 回填固化 %d 条保底", len(out.valid))
+			}
+		}
+	}
+	log.Printf("[engine][news漏斗] 有效=%d (阈值0.5, 含固化回填)", len(out.valid))
+	if len(out.valid) > 0 {
+		// 6b. 事件聚簇：同板块/同方向的重复新闻合并为单条（去重避免刷屏）
+		out.valid = clusterEvents(out.valid)
+
+		// 6c. 事件衰减：同板块同方向事件在窗口内重复出现时按 0.5^(h/4) 降权
+		e.applyEventDecay(out.valid)
+
+		// 6d. 衰减后再次阈值过滤（重复事件降权后可掉出 0.5 线）
+		out.valid = filterThreshold(out.valid, 0.50)
+		log.Printf("[engine][news漏斗] 聚簇+衰减后再滤 -> 有效=%d", len(out.valid))
+		if len(out.valid) > 0 {
+			// 6e. 板块验真回填：剔除 LLM 幻觉板块名（命中真实板块名单才保留）
+			e.verifySectorAttribution(out.valid)
+
+			// 6f. 板块→个股事件级传播：板块 top 成分股注入 RelatedStocks 进个股监测池
+			e.propagateSectorToStocks(out.valid)
+		}
+	}
+	if len(out.valid) == 0 {
+		log.Printf("[engine] 无有效事件(|score|>=0.5), 本轮仅执行打分")
+	}
+	return out
+}
+
+// TryAsyncRun 尝试异步触发一次引擎 run（盘前用）：已有异步 run 进行中则返回 false 跳过本轮，
+// 避免多 goroutine 并发重入导致状态互相覆盖；其余时段仍由主循环同步调用 Run。
+func (e *Engine) TryAsyncRun(ctx context.Context, since time.Time) bool {
+	if !atomic.CompareAndSwapInt32(&e.asyncBusy, 0, 1) {
+		return false
+	}
+	go func() {
+		defer atomic.StoreInt32(&e.asyncBusy, 0)
+		e.Run(ctx, since)
+	}()
+	return true
+}
+
+// Run 驱动一轮完整流水线：拉取 → Stage0 → Stage1/2 → 阈值过滤 → 归因 → 板块验证 → 战法扫描 → 信号聚合 → 广播。
+// since 为本次追回起始时间，由调用方（主循环）根据市场时段计算。
+func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.StrategyResult {
+	t0 := time.Now()
+	// 0-6. 新闻流水线：拉取→Stage0/1/2→固化→阈值→聚簇→衰减→归因验真传播
+	pOut := e.produceNews(ctx, since)
+	rawNews, st0, events, valid := pOut.rawNews, pOut.st0, pOut.events, pOut.valid
 
 	// 7. 策略评估：归因 + 分流 + 评分池 + 行情数据（无事件时仅覆盖 持仓+自选 打分池）
 	positions := e.rpt.HeldPositionCodes()

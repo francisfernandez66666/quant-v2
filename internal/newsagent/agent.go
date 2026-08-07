@@ -22,6 +22,7 @@ type Agent struct {
 	tracker    *tracker           // 去重记账器：记录已见标题与来源同步时间，避免重复处理
 	dataDir    string             // 数据目录：存放 news_events.json / news_tracker.json
 	newsDBPath string             // 新闻事件本地持久化文件路径（news_events.json）
+	frozenPath string             // 固化事件持久化文件路径（frozen_events.json）
 	minScore   float64            // 落盘过滤最低分（默认 0.25；前端"显示全部"开关可改为 0）
 }
 
@@ -43,6 +44,7 @@ func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCl
 		tracker:    newTracker(dataDir),
 		dataDir:    dataDir,
 		newsDBPath: filepath.Join(dataDir, "news_events.json"),
+		frozenPath: filepath.Join(dataDir, "frozen_events.json"),
 		minScore:   0.25, // 默认最低落盘分 0.25（前端"显示全部"可降为 0）
 	}
 }
@@ -233,6 +235,156 @@ func (a *Agent) AllEvents() []NewsEvent {
 		return nil
 	}
 	return db.Events
+}
+
+// FrozenEvents 返回当前全部未过期的固化事件（供引擎合并进有效事件池）。
+func (a *Agent) FrozenEvents() []NewsEvent {
+	db := a.loadFrozenDB()
+	if db == nil {
+		return nil
+	}
+	td := data.TradingDayDate(time.Now())
+	out := make([]NewsEvent, 0, len(db.Events))
+	for i := range db.Events {
+		if !isFrozenExpired(db.Events[i], td) {
+			out = append(out, db.Events[i].NewsEvent)
+		}
+	}
+	return out
+}
+
+// SaveFrozen 将本轮产出的带价值事件写入固化层：同板块+同方向（Key）覆盖、分数取最新；
+// 同时做跨日到期清理（过期事件移除）。写盘前先备份原文件（损坏恢复兜底）。
+func (a *Agent) SaveFrozen(fresh []NewsEvent) {
+	td := data.TradingDayDate(time.Now())
+	db := a.loadFrozenDB()
+	if db == nil {
+		db = &frozenDB{}
+	}
+	// 保留未过期的事件
+	kept := make([]FrozenEvent, 0, len(db.Events)+len(fresh))
+	byKey := make(map[string]int)
+	for i := range db.Events {
+		if isFrozenExpired(db.Events[i], td) {
+			continue
+		}
+		byKey[db.Events[i].Key] = len(kept)
+		kept = append(kept, db.Events[i])
+	}
+	// 本轮新带价值事件：同板块+同方向 → 覆盖（分数/时间/个股取最新），否则追加
+	for _, e := range fresh {
+		if !shouldFreeze(e) {
+			continue
+		}
+		key := frozenKey(e)
+		fe := FrozenEvent{NewsEvent: e, Day: td, Key: key}
+		if idx, ok := byKey[key]; ok {
+			kept[idx] = fe // 覆盖旧事件（Score 永远取最新值）
+		} else {
+			byKey[key] = len(kept)
+			kept = append(kept, fe)
+		}
+	}
+	// 控制规模：仅保留最新 100 条
+	if len(kept) > 100 {
+		kept = kept[len(kept)-100:]
+	}
+	outDB := &frozenDB{TradingDay: td, Events: kept}
+	if err := a.writeFrozenDB(outDB); err != nil {
+		log.Printf("[frozen] 固化文件写入失败: %v", err)
+	}
+}
+
+// writeFrozenDB 序列化并写入固化文件。写入前先备份当前文件为 .bak，便于损坏时恢复。
+func (a *Agent) writeFrozenDB(db *frozenDB) error {
+	data, err := json.MarshalIndent(db, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(a.frozenPath); err == nil {
+		if raw, rerr := os.ReadFile(a.frozenPath); rerr == nil {
+			_ = os.WriteFile(a.frozenPath+".bak", raw, 0644)
+		}
+	}
+	return os.WriteFile(a.frozenPath, data, 0644)
+}
+
+// frozenKey 计算固化覆盖键：sector|direction。无板块时以标题代替板块，方向缺失时按 Score 符号推断。
+func frozenKey(e NewsEvent) string {
+	sector := ""
+	if len(e.Sectors) > 0 && strings.TrimSpace(e.Sectors[0]) != "" {
+		sector = strings.TrimSpace(e.Sectors[0])
+	} else {
+		sector = e.Title
+	}
+	dir := e.Direction
+	if e.Direction == "" {
+		if e.Score >= 0 {
+			dir = "利好"
+		} else {
+			dir = "利空"
+		}
+	}
+	return sector + "|" + dir
+}
+
+// shouldFreeze 判断事件是否需要固化：|Score|≥0.25 且方向为利好/利空。
+func shouldFreeze(e NewsEvent) bool {
+	s := e.Score
+	if s < 0 {
+		s = -s
+	}
+	return s >= 0.25 && (e.Direction == "利好" || e.Direction == "利空")
+}
+
+// isFrozenExpired 判断固化事件是否已到期。
+// 事件在其产生日(day)及顺延一个自然日(day+1)内有效；当前交易日 td 已在 day+1 之后即过期移除。
+func isFrozenExpired(fe FrozenEvent, td string) bool {
+	if fe.Day == "" {
+		return false // 无日期（旧数据）保守保留
+	}
+	d, err1 := time.Parse("20060102", fe.Day)
+	t, err2 := time.Parse("20060102", td)
+	if err1 != nil || err2 != nil {
+		return false // 解析失败保守保留
+	}
+	horizon := d.AddDate(0, 0, 1) // day+1 自然日
+	return t.After(horizon)
+}
+
+// loadFrozenDB 从文件加载固化事件库（含损坏恢复）。
+// 整体解析失败时先逐条尝试抢救，仍失败则把损坏文件备份为 .bak 后返回空库，绝不因坏文件阻断固化层。
+func (a *Agent) loadFrozenDB() *frozenDB {
+	data, err := os.ReadFile(a.frozenPath)
+	if err != nil {
+		return &frozenDB{}
+	}
+	var db frozenDB
+	if err := json.Unmarshal(data, &db); err == nil {
+		return &db
+	}
+	// 整体解析失败 → 逐条对象抢救（按行尝试单独解析出可用的 FrozenEvent）
+	log.Printf("[frozen] 固化文件整体解析失败, 尝试逐条抢救")
+	var salvaged []FrozenEvent
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimSuffix(line, ",") // 截断的 JSON 中非末行事件对象末尾常带逗号，先去掉再尝试解析
+		if line == "" {
+			continue
+		}
+		var fe FrozenEvent
+		if json.Unmarshal([]byte(line), &fe) == nil && fe.Title != "" {
+			salvaged = append(salvaged, fe)
+		}
+	}
+	if len(salvaged) > 0 {
+		log.Printf("[frozen] 逐条抢救成功 %d 条", len(salvaged))
+		return &frozenDB{Events: salvaged}
+	}
+	// 完全无法解析：备份损坏文件，返回空库
+	_ = os.WriteFile(a.frozenPath+".bak", data, 0644)
+	log.Printf("[frozen] 固化文件损坏且抢救失败, 已备份为 .bak")
+	return &frozenDB{}
 }
 
 // buildIPOEvents 从 IPO 日历构建 NewsEvent（新股申购/上市），跳过已存在的事件。
