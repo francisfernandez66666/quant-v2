@@ -1378,8 +1378,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 个股信号并入做多信号流统一展示/广播
 	bullSignals = append(bullSignals, individualSignals...)
 
-	// 13. 持仓止盈/止损提醒（传入当轮打分表：有活跃信号时降级为提示，不硬推止盈/止损）
-	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, stockScores)
+	// 13. 持仓止盈/止损提醒（传入当轮打分表 + 利空板块信号：有反向信号才硬推止盈/止损）
+	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, stockScores, bearHitCodes(sr))
 
 	// 14. 聚合器更新看板
 	e.agg.Update(sr, verifiedBull, verifiedBear, bullSignals, bearSignals, alertSignals, stockScores, e.rpt)

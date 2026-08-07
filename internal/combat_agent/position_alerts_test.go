@@ -80,7 +80,7 @@ func TestCheckPositionAlerts_SignalActiveDowngradesToHint(t *testing.T) {
 	}
 }
 
-// TestCheckPositionAlerts_StopLossDowngrade 止损同样受活跃信号压制：降级为"提示"。
+// TestCheckPositionAlerts_StopLossDowngrade 做多止损未出现利空确认 → 降级为"提示"观察（可能洗盘）。
 func TestCheckPositionAlerts_StopLossDowngrade(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	// 开仓 10 元，止损 5%（现价 8.00 → 盈亏 -20% ≤ -5% 触发）
@@ -93,7 +93,39 @@ func TestCheckPositionAlerts_StopLossDowngrade(t *testing.T) {
 		t.Fatalf("应产出 1 条降级提示, got %d", len(alerts))
 	}
 	if alerts[0].AlertType != "提示" {
-		t.Errorf("有活跃信号时止损应降级为提示, got %s", alerts[0].AlertType)
+		t.Errorf("做止损未出现做空信号应降级为提示, got %s", alerts[0].AlertType)
+	}
+}
+
+// TestCheckPositionAlerts_StopLossHardWhenBear 做多止损出现做空/利空信号 → 硬止损（不降级）。
+func TestCheckPositionAlerts_StopLossHardWhenBear(t *testing.T) {
+	a, rpt, m := newAlertTestRig(t)
+	// 开仓 10 元，止损 5%（现价 8.00 → 盈亏 -20% ≤ -5% 触发），且该股命中利空板块(做空信号)
+	rpt.LogSignal("pos-2", "600000", "浦发银行", "做多", "n_shape", 10.0, 8.0, 5.0)
+	alerts := a.CheckPositionAlerts(rpt, m, map[string]StockScores{}, map[string]bool{"600000": true})
+	if len(alerts) != 1 {
+		t.Fatalf("应产出 1 条硬止损, got %d", len(alerts))
+	}
+	if alerts[0].AlertType != "止损" {
+		t.Errorf("出现做空信号应硬止损, got %s", alerts[0].AlertType)
+	}
+}
+
+// TestCheckPositionAlerts_TakeProfitNeedsBull 做多止盈：有做多信号时→降级提示持有；无→硬止盈。
+func TestCheckPositionAlerts_TakeProfitNeedsBull(t *testing.T) {
+	a, rpt, m := newAlertTestRig(t)
+	// 开仓 40 元，止盈 8%（现价 43.79 → 盈亏 +9.47% ≥ 8% 触发），有做多信号 → 提示持有
+	rpt.LogSignal("pos-1", "600206", "有研新材", "做多", "dragon", 40.0, 8.0, 5.0)
+	scores := map[string]StockScores{"600206": {Code: "600206", SignalActive: true}}
+	alerts := a.CheckPositionAlerts(rpt, m, scores)
+	if len(alerts) != 1 {
+		t.Fatalf("应产出 1 条提醒, got %d", len(alerts))
+	}
+	if alerts[0].AlertType != "提示" {
+		t.Errorf("有做多信号时止盈应降级为提示持有, got %s", alerts[0].AlertType)
+	}
+	if !strings.Contains(alerts[0].Reason, "做多信号") {
+		t.Errorf("降级提示理由应包含做多信号, got %s", alerts[0].Reason)
 	}
 }
 

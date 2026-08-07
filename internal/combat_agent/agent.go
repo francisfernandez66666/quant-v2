@@ -522,13 +522,24 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 
 // CheckPositionAlerts 检查所有持仓的止盈止损条件，返回需要提醒的信号列表。
 // 根据实时行情价格计算盈亏比例，触发止盈/止损阈值时生成提醒信号。
-// 入参 rpt 提供持仓明细，marketAPI 提供实时报价，scores 为当轮个股打分表。
-// 若该股当前已有活跃信号（SignalActive=true），止盈/止损触线不硬推，降级为"提示"，
-// 遵循"先看有无高分信号，有则提示持有观察、不再硬通知止盈/止损"的逻辑。
-func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI, scores map[string]StockScores) []Signal {
+// 入参 rpt 提供持仓明细，marketAPI 提供实时报价，scores 为当轮做多打分表（SignalActive=该股做多信号），
+// bearHit 为客置参数：该股本轮命中利空板块/利空个股的 code→true 映射（即"做空/利空信号"）。
+//
+// 止盈/止损按持仓方向看对应信号（跟 N 形/动量一致，做空则镜像反）：
+//   - 做多止盈：仍有做多信号 → 继续持有(降级提示)；无 → 硬止盈。
+//   - 做多止损：出现做空/利空信号 → 硬止损；未出现 → 可能洗盘，降级提示观察。
+//   - 做空止盈：仍有做空/利空信号 → 继续持有(降级提示)；无 → 硬止盈。
+//   - 做空止损：出现做多/利好信号 → 硬止损；未出现 → 降级提示观察。
+func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI, scores map[string]StockScores, bearHit ...map[string]bool) []Signal {
 	positions := rpt.HeldPositions()
 	if len(positions) == 0 {
 		return nil
+	}
+
+	// 可选：本轮利空(做空)信号命中集合（命中利空板块/利空个股）
+	var bears map[string]bool
+	if len(bearHit) > 0 {
+		bears = bearHit[0]
 	}
 
 	var alerts []Signal
@@ -550,19 +561,33 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 		// 按现价计算持仓盈亏比例（%）
 		pnl := (quote.Price - pos.EntryPrice) / pos.EntryPrice * 100
 
-		// 该股当前是否有活跃信号：有则止盈/止损触线不硬推，降级为提示
-		hasActive := false
+		// 该股当前信号：做多信号=打分表 SignalActive(做多池)；做空/利空信号=命中利空板块映射
+		hasBull := false
 		if sc, ok := scores[pos.Code]; ok {
-			hasActive = sc.SignalActive
+			hasBull = sc.SignalActive
 		}
+		hasBear := false
+		if bears != nil {
+			hasBear = bears[pos.Code]
+		}
+		isShort := pos.Direction == "做空"
 
-		// 触及止盈线 → 生成止盈提醒（置信度固定 1.0）；已有活跃信号时降级为"提示"
+		// 触及止盈线 → 生成止盈提醒。
+		// 做多：仍有做多信号→持有(降级提示)；无→硬止盈。做空：仍有做空信号→持有；无→硬止盈。
 		if pos.TakeProfitPct > 0 && pnl >= pos.TakeProfitPct {
-			alertType, action, reason := "止盈", "止盈",
-				fmt.Sprintf("盈亏%.2f%% 触及止盈%.0f%%", pnl, pos.TakeProfitPct)
-			if hasActive {
+			alertType, action := "止盈", "止盈"
+			reason := fmt.Sprintf("盈亏%.2f%% 触及止盈%.0f%%", pnl, pos.TakeProfitPct)
+			keepSig := hasBear // 做空：有做空信号继续持有
+			if !isShort {
+				keepSig = hasBull // 做多：有做多信号继续持有
+			}
+			if keepSig {
 				alertType, action = "提示", "关注"
-				reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%% 但仍有活跃信号,建议持有观察", pnl, pos.TakeProfitPct)
+				if isShort {
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%% 但仍有做空信号,建议持有观察", pnl, pos.TakeProfitPct)
+				} else {
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止盈%.0f%% 但仍有做多信号,建议持有观察", pnl, pos.TakeProfitPct)
+				}
 			}
 			alerts = append(alerts, Signal{
 				ID:          seqID(),
@@ -579,13 +604,25 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 			})
 		}
 
-		// 触及止损线 → 生成止损提醒（置信度固定 1.0）；已有活跃信号时降级为"提示"
+		// 触及止损线 → 生成止损提醒。
+		// 做多：出现做空/利空信号→硬止损；未出现→可能是洗盘，降级提示观察。做空：出现做多信号→硬止损；否则提示。
 		if pos.StopLossPct > 0 && pnl <= -pos.StopLossPct {
-			alertType, action, reason := "止损", "止损",
-				fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%", pnl, pos.StopLossPct)
-			if hasActive {
+			alertType, action := "止损", "止损"
+			reason := fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%", pnl, pos.StopLossPct)
+			// 是否出现对已方向不利的信号决定是否硬止损
+			hard := false
+			if isShort {
+				hard = hasBull // 做空止损：出现做多(利好)信号→硬止损
+			} else {
+				hard = hasBear // 做多止损：出现做空(利空)信号→硬止损
+			}
+			if !hard {
 				alertType, action = "提示", "关注"
-				reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 但有活跃信号,关注是否转强", pnl, pos.StopLossPct)
+				if isShort {
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未出现利好确认,关注是否回稳", pnl, pos.StopLossPct)
+				} else {
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未出现利空/做空信号,关注是否洗盘", pnl, pos.StopLossPct)
+				}
 			}
 			alerts = append(alerts, Signal{
 				ID:          seqID(),
