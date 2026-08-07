@@ -1,3 +1,5 @@
+// 固化事件存储（news_events.json）单测：验证利好/利空固化、覆盖键(sector|direction)、
+// 跨交易日到期清除与磁盘持久化回读。
 package newsagent
 
 import (

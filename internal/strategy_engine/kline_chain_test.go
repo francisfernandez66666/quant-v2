@@ -1,3 +1,5 @@
+// K 线降级链单测：验证 fetchDayKLine/fetchMinuteKLine 按 新浪→同花顺→腾讯→东财 顺序
+// 逐源兜底（前一源失败回落下一源），以及全源失败时的错误透传。
 package strategy_engine
 
 import (

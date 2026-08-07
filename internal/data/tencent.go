@@ -25,7 +25,7 @@ func tencentPrefix(code string) string {
 
 // gbKLine 请求体解构用的内部结构。
 type tencentKResp struct {
-	Code int `json:"code"`
+	Code int                     `json:"code"`
 	Data map[string]tencentKData `json:"data"`
 }
 

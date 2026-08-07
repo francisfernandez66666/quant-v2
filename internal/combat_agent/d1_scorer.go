@@ -29,9 +29,9 @@ type D1Score struct {
 // 收拢到 combat_agent，LLM 参考 events_leftside.yaml 规则评分。
 // 非并发安全，建议由 Engine 在独立 goroutine 中单实例调用。
 type D1Scorer struct {
-	llmClient    *llm.Client // LLM 客户端，用于调用大模型进行 D1 评分
-	yamlContent  string      // events_leftside.yaml 原始内容，作为 LLM prompt 参考
-	maxAttempts  int         // D1 LLM 调用轮询重试次数（含首次），默认 5；0/负回退默认
+	llmClient    *llm.Client   // LLM 客户端，用于调用大模型进行 D1 评分
+	yamlContent  string        // events_leftside.yaml 原始内容，作为 LLM prompt 参考
+	maxAttempts  int           // D1 LLM 调用轮询重试次数（含首次），默认 5；0/负回退默认
 	retryBackoff time.Duration // 相邻两次重试的基础间隔
 }
 
@@ -44,10 +44,10 @@ const defaultMaxAttempts = 5
 // yamlContent: events_leftside.yaml 的原始内容，作为评分规则的参考上下文。
 func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 	return &D1Scorer{
-		llmClient:     llmClient,
-		yamlContent:   yamlContent,
-		maxAttempts:   defaultMaxAttempts,
-		retryBackoff:  2 * time.Second,
+		llmClient:    llmClient,
+		yamlContent:  yamlContent,
+		maxAttempts:  defaultMaxAttempts,
+		retryBackoff: 2 * time.Second,
 	}
 }
 

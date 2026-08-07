@@ -29,7 +29,7 @@ type Engine struct {
 	benchChgVal float64      // 上证指数最新涨跌幅（%）
 	benchChgAt  time.Time    // 基准指数拉取时间（TTL 判断）
 
-	kSrcMu sync.Mutex    // 保护 K 线源统计计数
+	kSrcMu sync.Mutex     // 保护 K 线源统计计数
 	kSrc   map[string]int // K 线来源→次数（本轮聚合，供可观测日志）
 }
 

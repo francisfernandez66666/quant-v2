@@ -15,9 +15,9 @@ func mkEv(title, level, direction string, score float64) newsagent.NewsEvent {
 // TestLogDroppedFromPool 验证：消息中心展示(≥0.25)但在有效池(≥0.5)之外的事件被计入 dropped。
 func TestLogDroppedFromPool(t *testing.T) {
 	shown := []newsagent.NewsEvent{
-		mkEv("A-l", "个股", "利好", 0.8),  // ≥0.5 且进池(标题在 valid) → 不计
-		mkEv("B-mid", "个股", "利好", 0.4), // 0.25~0.5 落盘但掉阈值 → 计入
-		mkEv("C-low", "个股", "利好", 0.1), // <0.25 未落盘 → 不计
+		mkEv("A-l", "个股", "利好", 0.8),     // ≥0.5 且进池(标题在 valid) → 不计
+		mkEv("B-mid", "个股", "利好", 0.4),   // 0.25~0.5 落盘但掉阈值 → 计入
+		mkEv("C-low", "个股", "利好", 0.1),   // <0.25 未落盘 → 不计
 		mkEv("D-valid", "板块", "利好", 0.7), // ≥0.5 但标题不在 valid → 计入
 	}
 	valid := []newsagent.NewsEvent{

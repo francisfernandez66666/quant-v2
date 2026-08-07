@@ -58,7 +58,10 @@ func TestParseLimitUpPoolInvalid(t *testing.T) {
 
 // TestSealTime 封板时间格式化边界。
 func TestSealTime(t *testing.T) {
-	cases := []struct{ in int; want string }{
+	cases := []struct {
+		in   int
+		want string
+	}{
 		{0, ""}, {92500, "09:25"}, {100000, "10:00"}, {113001, "11:30"}, {150500, "15:05"},
 	}
 	for _, c := range cases {

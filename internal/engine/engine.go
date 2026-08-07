@@ -231,7 +231,10 @@ func (e *Engine) updateHotPool(bull, bear []sector_agent.VerifiedSector) {
 // 只对没有专属 D1 的成分股打底，避免覆盖个股自己的评分。
 func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_engine.StrategyResult, verifiedBull, verifiedBear []sector_agent.VerifiedSector, d1Scores map[string]combat_agent.D1Score, peScores map[string]float64) {
 	// 1. 收拢全部板块成分股（去重），并记录每个 code 所属板块的事件分
-	type secInfo struct{ score float64; name string }
+	type secInfo struct {
+		score float64
+		name  string
+	}
 	secOf := make(map[string]secInfo)
 	for _, vs := range verifiedBull {
 		if vs.Score <= 0 {

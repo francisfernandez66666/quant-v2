@@ -67,7 +67,7 @@ type TrackerData struct {
 // 自产生交易日保留，顺延一个交易日；期间若同板块+同方向出现新事件则整体覆盖（分数取最新），
 // 否则在下一交易日保存时到期清除。
 type FrozenEvent struct {
-	NewsEvent // 内嵌原始事件（Title/Score/Direction/RelatedStocks/CleanedStocks/Sectors 等）
+	NewsEvent        // 内嵌原始事件（Title/Score/Direction/RelatedStocks/CleanedStocks/Sectors 等）
 	Day       string `json:"day"` // 固化产生交易日（YYYY-MM-DD），用于跨日到期判断
 	Key       string `json:"key"` // 覆盖键：sector|direction（同板块+同方向新事件据此覆盖）
 }

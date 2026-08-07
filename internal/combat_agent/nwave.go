@@ -16,11 +16,11 @@ import (
 
 // waveState 单只股票的日内突破状态。
 type waveState struct {
-	day         string  // 交易日（跨日重置依据）
-	prevHigh    float64 // 前日最高价
-	armed       bool    // 是否已发生一突破位
+	day          string  // 交易日（跨日重置依据）
+	prevHigh     float64 // 前日最高价
+	armed        bool    // 是否已发生一突破位
 	highAfterArm float64 // 一突以来的盘中最高价（峰价）
-	dipped      bool    // 是否已从峰价回调（跌破 0.997 倍峰价）
+	dipped       bool    // 是否已从峰价回调（跌破 0.997 倍峰价）
 }
 
 // WaveTracker N 形一突/二突状态机容器，按股票代码维护日内状态。

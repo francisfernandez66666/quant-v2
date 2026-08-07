@@ -63,8 +63,8 @@ func TestParseTencentMinuteKLine(t *testing.T) {
 func TestParseTencentKLineInvalid(t *testing.T) {
 	rows := [][]string{
 		{"2026-08-06", "40.800", "43.790", "30.000", "40.500", "1030100.000"}, // high<low
-		{"bad-date", "40.800", "43.790", "43.790", "40.500", "1030100.000"},    // 日期非法
-		{"2026-08-07", "0", "0", "0", "0", "0"},                                // 数值为0
+		{"bad-date", "40.800", "43.790", "43.790", "40.500", "1030100.000"},   // 日期非法
+		{"2026-08-07", "0", "0", "0", "0", "0"},                               // 数值为0
 	}
 	klines, err := parseTencentKLine(rows, false)
 	if err == nil || len(klines) != 0 {
