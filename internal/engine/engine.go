@@ -216,6 +216,76 @@ func (e *Engine) updateHotPool(bull, bear []sector_agent.VerifiedSector) {
 	log.Printf("[engine] 热点池更新: %d 只板块成分股入 5s 实时池", len(stocks))
 }
 
+// mergeSectorStocksIntoScores 板块→个股归因：把验证通过的板块 top 成分股并入打分行情/D1/PE，
+// 使 ScanLong/ScanShort 遍历 sector.Stocks 时 MarketData[code] 有值（否则 evalAll md==nil 丢弃，
+// 板块利好永远落不到个股）。
+// D1 沿用板块事件分（sector.Score 0~1 → LLMD1Score，仅做多板块种子），不额外调 LLM；
+// 只对没有专属 D1 的成分股打底，避免覆盖个股自己的评分。
+func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_engine.StrategyResult, verifiedBull, verifiedBear []sector_agent.VerifiedSector, d1Scores map[string]combat_agent.D1Score, peScores map[string]float64) {
+	// 1. 收拢全部板块成分股（去重），并记录每个 code 所属板块的事件分
+	type secInfo struct{ score float64; name string }
+	secOf := make(map[string]secInfo)
+	for _, vs := range verifiedBull {
+		if vs.Score <= 0 {
+			continue
+		}
+		for _, c := range vs.Stocks {
+			if _, ok := secOf[c]; !ok {
+				secOf[c] = secInfo{score: vs.Score, name: vs.Name}
+			}
+		}
+	}
+	var extras []string
+	for c := range secOf {
+		if _, ok := sr.MarketData[c]; ok {
+			continue // 已在打分池（新闻/持仓/自选）
+		}
+		extras = append(extras, c)
+	}
+	if len(extras) == 0 {
+		return
+	}
+	if e.strategy == nil || e.marketAPI == nil {
+		log.Printf("[engine] 板块→个股归因跳过: 策略引擎/行情API未配置")
+		return
+	}
+
+	// 2. 补拉成分股行情（K线/实时/资金流，走缓存），merge 进 sr.MarketData
+	extraMD := e.strategy.BuildScoringData(ctx, extras, nil)
+	for c, md := range extraMD {
+		sr.MarketData[c] = md
+	}
+
+	// 3. 补 PE 与板块事件 D1 种子（仅做多板块；只填缺项的）
+	for _, c := range extras {
+		peScores[c] = e.marketAPI.GetStockPE(c)
+		si, ok := secOf[c]
+		if !ok || si.score <= 0 {
+			continue
+		}
+		if _, has := d1Scores[c]; has {
+			continue
+		}
+		s := si.score
+		if s > 1.0 {
+			s = 1.0
+		}
+		d1Scores[c] = combat_agent.D1Score{Code: c, Score: s, Blocked: false, Reason: "板块传导:" + si.name}
+	}
+
+	// 4. 合并进 lastD1Scores，供 5s 近实时打分循环复用（板块成分股 N 形 d1 门不为空）
+	e.mu.Lock()
+	for c, d := range d1Scores {
+		if _, has := e.lastD1Scores[c]; !has {
+			e.lastD1Scores[c] = d
+		}
+	}
+	e.mu.Unlock()
+
+	log.Printf("[engine] 板块→个股归因: 补 %d 只成分股行情+D1(板块事件沿用), 板块=%d",
+		len(extras), len(secOf))
+}
+
 // loadStageRecords 从磁盘加载当日 Stage 记录；跨交易日自动重置。
 func loadStageRecords(path string) []newsagent.DebugInfo {
 	if path == "" {
@@ -1290,6 +1360,12 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 	// 9b. 验证通过的板块成分股并入 5s 实时监控池（fetcher 新浪批量拉取，热点股随板块轮换）
 	e.updateHotPool(verifiedBull, verifiedBear)
+
+	// 9c. 板块→个股归因：热点板块 top 成分股并入打分池行情/D1。
+	// 修复"板块利好只有板块、没有个股"：此前成分股不在 sr.MarketData 里，
+	// ScanLong 遍历 sector.Stocks 时 md==nil 直接丢弃 → 板块永远归因不到个股。
+	// D1 仅沿用板块事件（sector.Score 0~1 → LLMD1Score），不额外调 LLM。
+	e.mergeSectorStocksIntoScores(ctx, sr, verifiedBull, verifiedBear, d1Scores, peScores)
 
 	// 10. 利好开关开 → 做多分支
 	var bullSignals []combat_agent.Signal

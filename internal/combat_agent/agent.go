@@ -244,13 +244,36 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		pe = input.PE[code]
 	}
 	var sigs []Signal
-	for _, runner := range runners {
+
+	// 战法评分并发化：同一只股票的各战法评分彼此独立（无共享可变状态），
+	// 并发调用 evalFor 后按原 runner 顺序合并处理，保证信号顺序与波状态机确定性。
+	type evalResult struct {
+		eval *strategy.Evaluation
+		err  error
+	}
+	n := len(runners)
+	res := make([]evalResult, n)
+	var wg sync.WaitGroup
+	for i, runner := range runners {
+		if runner.Strategy == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, r StrategyRunner) {
+			defer wg.Done()
+			ev, err := evalFor(r, code, md, sector, input.EmotionPhase, d1, eventDesc, pe)
+			res[i] = evalResult{eval: ev, err: err}
+		}(i, runner)
+	}
+	wg.Wait()
+
+	for i, runner := range runners {
 		// 策略实例为空则跳过该运行器
 		if runner.Strategy == nil {
 			continue
 		}
-		// 按战法类型分发到真实评分逻辑（adapter.go evalFor）
-		eval, err := evalFor(runner, code, md, sector, input.EmotionPhase, d1, eventDesc, pe)
+		// 按战法类型分发到真实评分逻辑（adapter.go evalFor，并发结果按序取用）
+		eval, err := res[i].eval, res[i].err
 		// 评分失败或返回空结果 → 该战法视为 0 分，不产出信号；同时标记数据缺口
 		if err != nil || eval == nil {
 			markDataGap(&sc, runner.Type, md)
