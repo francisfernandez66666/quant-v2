@@ -189,6 +189,9 @@ func main() {
 	// 情绪周期阈值注入（SSE 广播情绪阶段）
 	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
 
+	// D1 评分 LLM 轮询重试次数（防重要信号随 LLM 偶发失败丢失）
+	eng.SetD1MaxRetries(cfgMgr.Rules.LLM.MaxRetryTimes)
+
 	// 启动 HTTP 服务，监听地址可用 QUANT_ADDR 覆盖
 	addr := ":8080"
 	if v := os.Getenv("QUANT_ADDR"); v != "" {

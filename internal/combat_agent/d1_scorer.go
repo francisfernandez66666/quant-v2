@@ -29,18 +29,37 @@ type D1Score struct {
 // 收拢到 combat_agent，LLM 参考 events_leftside.yaml 规则评分。
 // 非并发安全，建议由 Engine 在独立 goroutine 中单实例调用。
 type D1Scorer struct {
-	llmClient   *llm.Client // LLM 客户端，用于调用大模型进行 D1 评分
-	yamlContent string      // events_leftside.yaml 原始内容，作为 LLM prompt 参考
+	llmClient    *llm.Client // LLM 客户端，用于调用大模型进行 D1 评分
+	yamlContent  string      // events_leftside.yaml 原始内容，作为 LLM prompt 参考
+	maxAttempts  int         // D1 LLM 调用轮询重试次数（含首次），默认 5；0/负回退默认
+	retryBackoff time.Duration // 相邻两次重试的基础间隔
 }
+
+// defaultMaxAttempts 默认 D1 LLM 轮询重试次数（含首次）。
+// 加重次数以抗 LLM 偶发超时/限流，避免重要 D1 评分随调用失败而丢失。
+const defaultMaxAttempts = 5
 
 // NewD1Scorer 创建 D1Scorer 实例。
 // llmClient: LLM 客户端，用于调用大模型进行评分。
 // yamlContent: events_leftside.yaml 的原始内容，作为评分规则的参考上下文。
 func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 	return &D1Scorer{
-		llmClient:   llmClient,
-		yamlContent: yamlContent,
+		llmClient:     llmClient,
+		yamlContent:   yamlContent,
+		maxAttempts:   defaultMaxAttempts,
+		retryBackoff:  2 * time.Second,
 	}
+}
+
+// SetMaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。
+// n<=0 时回退默认 defaultMaxAttempts。返回设置的生效值。
+func (ds *D1Scorer) SetMaxRetries(n int) int {
+	if n <= 0 {
+		ds.maxAttempts = defaultMaxAttempts
+	} else {
+		ds.maxAttempts = n
+	}
+	return ds.maxAttempts
 }
 
 // d1SystemPrompt 是 D1 评分的系统级提示词，定义评分优先级规则和输出格式。
@@ -119,8 +138,12 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	log.Printf("[D1Scorer] 批量评分 %d只个股, prompt=%d字符", len(codes), len(prompt))
 
 	// 调用LLM（系统提示词 d1SystemPrompt 固定，用户提示词携带个股与规则）。
-	// 轮询重试（最多3次、间隔递增 2s/4s/6s，复用触发层失败重试模式），仍失败再全量默认0分。
-	const maxAttempts = 3
+	// 轮询重试（最多 maxAttempts 次、间隔按指数抖动并封顶，防重要 D1 评分随调用失败丢失），
+	// 仍失败则回退上一轮评分（fallback 里有值）或按理由兜底 0 分。
+	maxAttempts := ds.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultMaxAttempts
+	}
 	var resp string
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -129,8 +152,13 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 			break
 		}
 		if attempt < maxAttempts {
-			log.Printf("[D1Scorer] LLM调用失败(第%d次), 轮询重试: %v", attempt, err)
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			backoff := ds.retryBackoff * time.Duration(attempt)
+			if cap := 9 * time.Second; backoff > cap {
+				backoff = cap
+			}
+			log.Printf("[D1Scorer] LLM调用失败(第%d次,还剩%d次), %v后重试: %v",
+				attempt, maxAttempts-attempt, backoff, err)
+			time.Sleep(backoff)
 		}
 	}
 	if err != nil {

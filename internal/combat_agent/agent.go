@@ -37,6 +37,21 @@ func orDefault(a, b string) string {
 	return b
 }
 
+// strategyLabel 战法类型 → 日志用简称。
+func strategyLabel(t strategy.SignalType) string {
+	switch t {
+	case strategy.SignalDragon:
+		return "龙"
+	case strategy.SignalDoubleBump:
+		return "双"
+	case strategy.SignalNShape:
+		return "N"
+	case strategy.SignalDragonReturn:
+		return "回"
+	}
+	return string(t)
+}
+
 // nShapeReason 为 N 形信号附加 D1 评分理由（LLM 分析的故事），使信号可读性更强。
 // base 为战法自身原因（如 left_signal/full_chain），d1 非空时把其 Reason 拼在其后。
 func nShapeReason(base string, d1 *D1Score) string {
@@ -244,6 +259,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		pe = input.PE[code]
 	}
 	var sigs []Signal
+	var unSig []string // 未出信号战法的原因（诊断：为何非龙头战法不出信号）
 
 	// 战法评分并发化：同一只股票的各战法评分彼此独立（无共享可变状态），
 	// 并发调用 evalFor 后按原 runner 顺序合并处理，保证信号顺序与波状态机确定性。
@@ -277,6 +293,11 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		// 评分失败或返回空结果 → 该战法视为 0 分，不产出信号；同时标记数据缺口
 		if err != nil || eval == nil {
 			markDataGap(&sc, runner.Type, md)
+			if err != nil {
+				unSig = append(unSig, strategyLabel(runner.Type)+":错误("+err.Error()+")")
+			} else {
+				unSig = append(unSig, strategyLabel(runner.Type)+":无结果")
+			}
 			continue
 		}
 		// 战法各自数据不满足硬性门槛时（如 K 线不足被降级为 0）标记缺口
@@ -326,11 +347,13 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		}
 		// 未通过战法硬性/评分门槛；二突/一突已在上面被提为 Pass → 只记分不出信号
 		if !eval.Pass {
+			unSig = append(unSig, fmt.Sprintf("%s:%s(%.0f)", strategyLabel(runner.Type), eval.Level, eval.TotalScore))
 			continue
 		}
 		// 通过的战法生成交易信号，失败或为空则跳过
 		sig, err := runner.Strategy.GenerateSignal(code, eval)
 		if err != nil || sig == nil {
+			unSig = append(unSig, strategyLabel(runner.Type)+":信号生成失败")
 			continue
 		}
 		// 操作类型缺省为 watch（仅观察），避免空 action
@@ -389,8 +412,13 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	sc.UpdatedAt = now
 	input.Scores[code] = sc
 	// 战法评分日志：code + 各维度分 + 是否命中（FLOW 全流程日志要求）
-	log.Printf("[combat_agent] 评分 %s(%s) 龙=%.0f 双=%.0f N=%.0f 回=%.0f 动量=%.0f 命中=%v",
-		code, md.Name, sc.DragonScore, sc.DoubleBumpScore, sc.NScore, sc.DragonReturnScore, sc.MomentumScore, sc.SignalActive)
+	// 附加"未出"原因（diagnostic）：各战法未出信号的具体原因，便于排查非龙头为何不出分/不发声。
+	unSigNote := ""
+	if len(unSig) > 0 {
+		unSigNote = " | 未出: " + strings.Join(unSig, " ")
+	}
+	log.Printf("[combat_agent] 评分 %s(%s) 龙=%.0f 双=%.0f N=%.0f 回=%.0f 动量=%.0f 命中=%v%s",
+		code, md.Name, sc.DragonScore, sc.DoubleBumpScore, sc.NScore, sc.DragonReturnScore, sc.MomentumScore, sc.SignalActive, unSigNote)
 	return sigs
 }
 

@@ -261,6 +261,114 @@ func thsSecID(code string) string {
 	return "0." + code
 }
 
+// parseTHSLine 解析同花顺 K 线 JSONP 响应。
+// 响应为 `quotebridge_v6_line_..._last({...})` 联牌格式，内部 data 为 K 线 CSV 字符串数组
+// （行内字段同东财：[date,open,high,low,close,volume,amount]）。
+// 采用松散提取：先剥 JSONP 括号，再取 data 数组，逐行严格校验数值，脏行直接跳过，
+// 无有效行时返回错误（调用方据此降级到下一源）。isMinute 为 true 时时间含 "HH:MM"。
+func parseTHSLine(body []byte, isMinute bool) ([]KLine, error) {
+	text := strings.TrimSpace(string(body))
+	// 剥 JSONP 包裹：e.g. quotebridge_v6_line_hs_1.600206_01_last({...})
+	if i := strings.Index(text, "("); i >= 0 {
+		text = text[i+1:]
+	}
+	if i := strings.LastIndex(text, ")"); i >= 0 {
+		text = text[:i]
+	}
+	var wrapper struct {
+		Data []string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(text), &wrapper); err != nil || len(wrapper.Data) == 0 {
+		return nil, fmt.Errorf("ths kline json: no data")
+	}
+	klines := make([]KLine, 0, len(wrapper.Data))
+	for _, line := range wrapper.Data {
+		parts := strings.Split(line, ",")
+		if len(parts) < 7 {
+			continue
+		}
+		var t time.Time
+		var err error
+		if isMinute {
+			if len(parts[0]) >= 15 {
+				// "yyyyMMddHHmmss" 或 "yyyyMMdd HH:MM"
+				t, err = time.ParseInLocation("20060102150405", parts[0], time.Local)
+				if err != nil {
+					t, err = time.ParseInLocation("20060102 15:04", parts[0], time.Local)
+				}
+			} else {
+				t, err = time.Parse("2006-01-02", parts[0])
+			}
+		} else {
+			t, err = time.Parse("2006-01-02", parts[0])
+			if err != nil {
+				t, err = time.Parse("20060102", parts[0])
+			}
+		}
+		if err != nil {
+			continue
+		}
+		open := toFloat64(parts[1])
+		high := toFloat64(parts[2])
+		low := toFloat64(parts[3])
+		close := toFloat64(parts[4])
+		volume := toFloat64(parts[5])
+		if open <= 0 || high <= 0 || low <= 0 || close <= 0 {
+			continue
+		}
+		if high < open || high < close || high < low || low > open || low > close {
+			continue
+		}
+		klines = append(klines, KLine{
+			Date:   t,
+			Open:   open,
+			High:   high,
+			Low:    low,
+			Close:  close,
+			Volume: volume,
+			Amount: toFloat64(parts[6]),
+		})
+	}
+	if len(klines) == 0 {
+		return nil, fmt.Errorf("ths line: no valid rows")
+	}
+	return klines, nil
+}
+
+// GetTHSKLine 获取同花顺日 K 线（best-effort，作为降级链第二源）。
+// 走 d.10jqka.com.cn/v6/line/hs_{secid}/01/last.js。解析失败/空返回错误，由上层降级。
+func (tc *THSClient) GetTHSKLine(code string) ([]KLine, error) {
+	url := fmt.Sprintf("https://d.10jqka.com.cn/v6/line/hs_%s/01/last.js", thsSecID(code))
+	THSLimiter.Wait()
+	resp, err := tc.getWithHeaders(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return parseTHSLine(body, false)
+}
+
+// GetTHSMinuteKLine 获取同花顺分钟 K 线（best-effort，作为降级链第二源）。
+// 走 d.10jqka.com.cn/v6/line/hs_{secid}/06/last.js（06=分钟线）。
+func (tc *THSClient) GetTHSMinuteKLine(code string) ([]KLine, error) {
+	url := fmt.Sprintf("https://d.10jqka.com.cn/v6/line/hs_%s/06/last.js", thsSecID(code))
+	THSLimiter.Wait()
+	resp, err := tc.getWithHeaders(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return parseTHSLine(body, true)
+}
+
 // thsQuoteRaw 同花顺行情 JSON 响应结构（备用，实际解析用更松散的 []interface{}）。
 type thsQuoteRaw struct {
 	Items map[string]struct {

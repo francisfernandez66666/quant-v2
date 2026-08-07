@@ -3,6 +3,7 @@ package strategy_engine
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"strings"
@@ -27,6 +28,9 @@ type Engine struct {
 	benchChgMu  sync.RWMutex // 保护基准指数涨跌幅缓存
 	benchChgVal float64      // 上证指数最新涨跌幅（%）
 	benchChgAt  time.Time    // 基准指数拉取时间（TTL 判断）
+
+	kSrcMu sync.Mutex    // 保护 K 线源统计计数
+	kSrc   map[string]int // K 线来源→次数（本轮聚合，供可观测日志）
 }
 
 // klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。
@@ -248,16 +252,8 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// 日K：优先新浪，失败降级东财（101=日线）
-			klines, err := e.marketAPI.GetSinaKLine(code, 120)
-			if err == nil && len(klines) > 0 {
-				md.KLines = klines
-			} else {
-				k2, err2 := e.marketAPI.GetKLine(code, "101", 120)
-				if err2 == nil && len(k2) > 0 {
-					md.KLines = k2
-				}
-			}
+			// 日K：统一降级链 新浪→同花顺→腾讯→东财
+			md.KLines = e.fetchDayKLine(code)
 			e.attachLiveBar(md)
 
 			// 资金流向（主力净流入，供资金维度评分）
@@ -267,8 +263,8 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 			}
 
 			// 分钟K线（5分钟，48根≈当日）→ 计算 MACD，供 8a/8b 动量分与 N 形评分使用
-			minKL, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48)
-			if err == nil && len(minKL) >= 2 {
+			minKL := e.fetchMinuteKLine(code)
+			if len(minKL) >= 2 {
 				md.MinuteKLine = minKL
 				md.MinuteMACD = data.CalcMACD(minKL)
 			}
@@ -276,6 +272,7 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 	}
 	wg.Wait()
 
+	e.logKLineSrc()
 	return result
 }
 
@@ -333,8 +330,8 @@ func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes ma
 			defer func() { <-sem }()
 			md.KLines, md.MoneyFlow = e.cachedKLine(code)
 			e.attachLiveBar(md)
-			minKL, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48)
-			if err == nil && len(minKL) >= 2 {
+			minKL := e.fetchMinuteKLine(code)
+			if len(minKL) >= 2 {
 				md.MinuteKLine = minKL
 				md.MinuteMACD = data.CalcMACD(minKL)
 			}
@@ -342,7 +339,24 @@ func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes ma
 	}
 	wg.Wait()
 
-	log.Printf("[strategy_engine] BuildScoringData: %d只 (快照quote=%d 兜底=%d)", len(codes), len(codes)-len(missing), len(missing))
+	logKLineSrc := ""
+	{
+		m := e.takeKLineSrc()
+		if len(m) > 0 {
+			order := []string{"新浪", "同花顺", "腾讯", "东财", "新浪分钟", "同花顺分钟", "腾讯分钟", "东财分钟", "失败", "分钟失败"}
+			parts := make([]string, 0, len(order))
+			for _, k := range order {
+				if n, ok := m[k]; ok {
+					parts = append(parts, fmt.Sprintf("%s=%d", k, n))
+				}
+			}
+			if len(parts) > 0 {
+				logKLineSrc = " K线源: " + strings.Join(parts, " ")
+			}
+		}
+	}
+	log.Printf("[strategy_engine] BuildScoringData: %d只 (快照quote=%d 兜底=%d)%s",
+		len(codes), len(codes)-len(missing), len(missing), logKLineSrc)
 	return result
 }
 
@@ -372,6 +386,7 @@ func (e *Engine) fetchQuotes(codes []string) map[string]*data.StockInfo {
 }
 
 // cachedKLine 返回个股日K + 资金流，走 5 分钟 TTL 缓存；缓存缺失/过期时重新拉取。
+// 日K 使用统一降级链：新浪 → 同花顺 → 腾讯 → 东财（任一源可出）。
 func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 	now := time.Now()
 	e.klineCacheMu.RLock()
@@ -381,22 +396,8 @@ func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 		return ent.klines, ent.moneyFlow
 	}
 
-	klines, err := e.marketAPI.GetSinaKLine(code, 120)
-	if err != nil || len(klines) == 0 {
-		if k2, err2 := e.marketAPI.GetKLine(code, "101", 120); err2 == nil && len(k2) > 0 {
-			klines = k2
-		}
-	}
-	// 日K两条数据源均失败时做一次瞬时重试，避免网络抖动导致自选/持仓持续无K线（0分误导）
-	if len(klines) == 0 {
-		time.Sleep(50 * time.Millisecond)
-		klines, err = e.marketAPI.GetSinaKLine(code, 120)
-		if err == nil && len(klines) == 0 {
-			if k2, err2 := e.marketAPI.GetKLine(code, "101", 120); err2 == nil && len(k2) > 0 {
-				klines = k2
-			}
-		}
-	}
+	klines := e.fetchDayKLine(code)
+
 	cf, err := e.marketAPI.GetStockMoneyFlow(code)
 	if err != nil {
 		cf = nil
@@ -406,6 +407,94 @@ func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 	e.klineCache[code] = &klineCacheEntry{klines: klines, moneyFlow: cf, fetchedAt: now}
 	e.klineCacheMu.Unlock()
 	return klines, cf
+}
+
+// fetchDayKLine 按 新浪→同花顺→腾讯→东财 降级链拉取日 K 线（120 根）。
+// 任一源返回有效数据即停；全失败时统计"失败"并返回 nil。
+func (e *Engine) fetchDayKLine(code string) []data.KLine {
+	if klines, err := e.marketAPI.GetSinaKLine(code, 120); err == nil && len(klines) > 0 {
+		e.bumpKLineSrc("新浪")
+		return klines
+	}
+	if e.ths != nil {
+		if klines, err := e.ths.GetTHSKLine(code); err == nil && len(klines) > 0 {
+			e.bumpKLineSrc("同花顺")
+			return klines
+		}
+	}
+	if klines, err := e.marketAPI.GetTencentKLine(code, 120); err == nil && len(klines) > 0 {
+		e.bumpKLineSrc("腾讯")
+		return klines
+	}
+	if klines, err := e.marketAPI.GetKLine(code, "101", 120); err == nil && len(klines) > 0 {
+		e.bumpKLineSrc("东财")
+		return klines
+	}
+	e.bumpKLineSrc("失败")
+	return nil
+}
+
+// fetchMinuteKLine 按 新浪→同花顺→腾讯→东财 降级链获取分钟K线（5分钟，48根）。
+// 用于 N 形 MinuteMACD；新浪分钟被封时落底到其它源。
+func (e *Engine) fetchMinuteKLine(code string) []data.KLine {
+	if klines, err := e.marketAPI.GetSinaMinuteKLine(code, 5, 48); err == nil && len(klines) >= 2 {
+		e.bumpKLineSrc("新浪分钟")
+		return klines
+	}
+	if e.ths != nil {
+		if klines, err := e.ths.GetTHSMinuteKLine(code); err == nil && len(klines) >= 2 {
+			e.bumpKLineSrc("同花顺分钟")
+			return klines
+		}
+	}
+	if klines, err := e.marketAPI.GetTencentMinuteKLine(code, 5, 48); err == nil && len(klines) >= 2 {
+		e.bumpKLineSrc("腾讯分钟")
+		return klines
+	}
+	if klines, err := e.marketAPI.GetKLine(code, "5", 48); err == nil && len(klines) >= 2 {
+		e.bumpKLineSrc("东财分钟")
+		return klines
+	}
+	e.bumpKLineSrc("分钟失败")
+	return nil
+}
+
+// bumpKLineSrc 累计一次 K 线源统计（线程安全）。
+func (e *Engine) bumpKLineSrc(src string) {
+	e.kSrcMu.Lock()
+	if e.kSrc == nil {
+		e.kSrc = make(map[string]int)
+	}
+	e.kSrc[src]++
+	e.kSrcMu.Unlock()
+}
+
+// takeKLineSrc 取出并清空本轮 K 线源统计（供可观测日志）。
+func (e *Engine) takeKLineSrc() map[string]int {
+	e.kSrcMu.Lock()
+	defer e.kSrcMu.Unlock()
+	m := e.kSrc
+	e.kSrc = make(map[string]int)
+	return m
+}
+
+// logKLineSrc 输出并清空本轮 K 线源统计，供排查数据源故障。
+func (e *Engine) logKLineSrc() {
+	m := e.takeKLineSrc()
+	if len(m) == 0 {
+		return
+	}
+	order := []string{"新浪", "同花顺", "腾讯", "东财", "新浪分钟", "同花顺分钟", "腾讯分钟", "东财分钟", "失败", "分钟失败"}
+	parts := make([]string, 0, len(m))
+	for _, k := range order {
+		if n, ok := m[k]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%d", k, n))
+		}
+	}
+	if len(parts) == 0 {
+		return
+	}
+	log.Printf("[strategy_engine] K线源: %s", strings.Join(parts, " "))
 }
 
 // attachLiveBar 在日K序列尾部合成当日实时bar，让战法评分（如双凸 volScore/maScore）

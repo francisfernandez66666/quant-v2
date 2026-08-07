@@ -100,3 +100,27 @@ func TestBatchScoreNilLLM(t *testing.T) {
 		t.Fatalf("结果应含2只个股, got %d", len(got))
 	}
 }
+
+// TestSetMaxRetries 验证轮询重试次数（含首次）默认值与配置语义：
+// 默认加大到 defaultMaxAttempts（防重要 D1 信号随 LLM 偶发失败丢失），
+// 0/负值回退默认，显式正值生效。
+func TestSetMaxRetries(t *testing.T) {
+	ds := NewD1Scorer(nil, "")
+	if ds.maxAttempts != defaultMaxAttempts {
+		t.Fatalf("默认重试次数=%d, want %d", ds.maxAttempts, defaultMaxAttempts)
+	}
+	if ds.maxAttempts < 3 {
+		t.Fatalf("重试次数应比旧值(3)更大, got %d", ds.maxAttempts)
+	}
+	// 显式配置生效
+	if got := ds.SetMaxRetries(8); got != 8 || ds.maxAttempts != 8 {
+		t.Fatalf("显式重试次数失败: got %d", got)
+	}
+	// 0/负值回退默认
+	if got := ds.SetMaxRetries(0); got != defaultMaxAttempts {
+		t.Fatalf("0应回退默认, got %d", got)
+	}
+	if got := ds.SetMaxRetries(-1); got != defaultMaxAttempts {
+		t.Fatalf("-1应回退默认, got %d", got)
+	}
+}

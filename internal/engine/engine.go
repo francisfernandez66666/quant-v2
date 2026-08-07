@@ -75,12 +75,20 @@ type Engine struct {
 	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
 	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
 	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
+	d1MaxRetries     int                             // D1 评分 LLM 轮询重试次数（<=0 用默认5）
 }
 
 // SetEmotionConfig 设置情绪周期阈值（线程安全）。
 func (e *Engine) SetEmotionConfig(cfg *config.EmotionConfig) {
 	e.mu.Lock()
 	e.emotionCfg = cfg
+	e.mu.Unlock()
+}
+
+// SetD1MaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。n<=0 使用默认5。
+func (e *Engine) SetD1MaxRetries(n int) {
+	e.mu.Lock()
+	e.d1MaxRetries = n
 	e.mu.Unlock()
 }
 
@@ -1316,6 +1324,10 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 	// 8. D1 评分（所有打分池个股；LLM 失败/漏项回退上一轮评分，避免断链归零）
 	d1Scorer := combat_agent.NewD1Scorer(e.llmClient, "")
+	e.mu.RLock()
+	retries := e.d1MaxRetries
+	e.mu.RUnlock()
+	d1Scorer.SetMaxRetries(retries)
 	e.mu.RLock()
 	prevD1 := e.lastD1Scores
 	e.mu.RUnlock()

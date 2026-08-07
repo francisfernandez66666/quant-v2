@@ -83,6 +83,9 @@ type LLMConfig struct {
 	// Stream 流式（SSE）响应开关。nil（缺省/未配置）= 开启（推理模型非流式首字极慢，
 	// 恒开流式 + 内部回落为默认策略）；显式 false = 关闭，走一次性非流式。
 	Stream *bool `json:"stream,omitempty"`
+	// MaxRetryTimes D1 评分 LLM 调用轮询重试次数（含首次）。<=0 时回退默认 5。
+	// 重试防丢信号：LLM 偶发超时/限流时不再轻易丢弃重要 D1 评分。
+	MaxRetryTimes int `json:"max_retry_times"`
 }
 
 // StreamingEnabled 返回流式响应是否启用：未显式配置（nil）时默认开启。
