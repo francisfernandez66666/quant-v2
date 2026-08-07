@@ -7,9 +7,41 @@ package combat_agent
 import (
 	"encoding/json"
 	"testing"
+
+	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/strategy_engine"
 )
 
-// TestCleanJSONInteriorBOM 覆盖 b 修复：LLM 返回 JSON 数组内部夹 UTF-8 BOM（0xEF 0xBB 0xBF）
+// TestFindEventForCodeByName 覆盖板块级新闻"只带名称不带代码"的场景：按个股名称命中关联事件。
+// 此前 findEventForCode 仅按代码子串匹配，导致 LLM 关联的"招金黄金"等名称永远配不上 → D1=0 → 无信号。
+func TestFindEventForCodeByName(t *testing.T) {
+	events := []newsagent.NewsEvent{
+		{Title: "贵金属板块整体走高", RelatedStocks: []string{"招金黄金", "株冶集团", "中金黄金", "兴业银锡"}},
+	}
+	md := &strategy_engine.StockMarketData{Name: "招金黄金"}
+	// 纯名称命中
+	if got := findEventForCode("600540", md, events); got != "贵金属板块整体走高" {
+		t.Fatalf("按名称应命中, got %q", got)
+	}
+	// 名称(代码) 形态（propagateSectorToStocks 注入产物）
+	md2 := &strategy_engine.StockMarketData{Name: "株冶集团"}
+	events2 := []newsagent.NewsEvent{{Title: "贵金属走强", RelatedStocks: []string{"株冶集团(600961)"}}}
+	if got := findEventForCode("600961", md2, events2); got != "贵金属走强" {
+		t.Fatalf("标签形态应命中, got %q", got)
+	}
+	// 无名称时按代码命中
+	mdNil := &strategy_engine.StockMarketData{Name: ""}
+	events3 := []newsagent.NewsEvent{{Title: "中金涨停", CleanedStocks: []string{"中金黄金|600916"}}}
+	if got := findEventForCode("600916", mdNil, events3); got != "中金涨停" {
+		t.Fatalf("CleanedStocks代码应命中, got %q", got)
+	}
+	// 名称/代码都不匹配 → 空
+	if got := findEventForCode("000001", &strategy_engine.StockMarketData{Name: "平安银行"}, events); got != "" {
+		t.Fatalf("无关股票应返回空, got %q", got)
+	}
+}
+
+// TestCleanJSONInteriorBOM 覆盖 d1 修复：LLM 返回 JSON 数组内部夹 UTF-8 BOM（0xEF 0xBB 0xBF）
 // 时，过去 cleanJSON 只剥首尾导致 json.Unmarshal 整批失败、全部归 0；现在应全局剔除可正常解析。
 func TestCleanJSONInteriorBOM(t *testing.T) {
 	// 模拟 LLM 输出：数组第二个对象内 "reason" 值前、以及元素分隔处混入 BOM

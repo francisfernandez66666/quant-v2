@@ -105,8 +105,8 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 				sb.WriteString(fmt.Sprintf("   价格: %.2f  涨跌幅: %.2f%%\n", md.Price, md.ChangePct))
 			}
 		}
-		// 事件描述来自 events（按代码子串匹配关联新闻标题）
-		eventDesc := findEventForCode(code, events)
+		// 事件描述来自 events：按 代码 或 名称 匹配关联新闻标题（板块级新闻只带个股名称，须名称兜底）
+		eventDesc := findEventForCode(code, md, events)
 		if eventDesc != "" {
 			sb.WriteString(fmt.Sprintf("   关联事件: %s\n", eventDesc))
 		} else {
@@ -188,19 +188,42 @@ func (ds *D1Scorer) fillFallback(result map[string]D1Score, codes []string, fall
 }
 
 // findEventForCode 从 events 中查找个股关联事件描述。
-// 遍历所有事件的 RelatedStocks 字段，通过子串匹配找到对应事件标题。
+// 遍历所有事件的 RelatedStocks 与 CleanedStocks 字段，通过子串匹配找到对应事件标题。
 // code: 股票代码。
+// md: 个股行情数据（提供股票名称，板块级新闻常只带"名称"不带代码，须用名称兜底匹配）。
 // events: 新闻事件列表。
 // 返回匹配到的事件标题，未匹配则返回空字符串。
-func findEventForCode(code string, events []newsagent.NewsEvent) string {
+func findEventForCode(code string, md *strategy_engine.StockMarketData, events []newsagent.NewsEvent) string {
 	for _, ev := range events {
 		for _, s := range ev.RelatedStocks {
-			if strings.Contains(s, code) || strings.Contains(code, s) {
+			if stockMatch(s, code, md) {
+				return ev.Title
+			}
+		}
+		for _, s := range ev.CleanedStocks {
+			if stockMatch(s, code, md) {
 				return ev.Title
 			}
 		}
 	}
 	return ""
+}
+
+// stockMatch 判断事件关联股票串 s 是否与 代码/名称 命中。
+// s 可能形态：纯名称("招金黄金")、名称(代码)("招金黄金(600540)")、名称|代码("招金黄金|600540")。
+func stockMatch(s, code string, md *strategy_engine.StockMarketData) bool {
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, code) || strings.Contains(code, s) {
+		return true
+	}
+	if md != nil && md.Name != "" {
+		if strings.Contains(s, md.Name) || strings.Contains(md.Name, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // minInt 返回两个整数中的较小值。
