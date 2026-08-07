@@ -3,7 +3,9 @@
   按"批次"（时间分组）展示两类日志，类型分 tab 隔离：
   - LLM 分析：当日各轮 Stage 流水线（Stage1 初筛 + Stage2 深度分析）
   - 信号批次：当日各轮产出的全部策略信号（做多/做空/提醒）
-  每个 tab 内用轮次下拉切换批次，最新批次默认展示。
+  每个 tab 内支持两种浏览方式：
+  - 无搜索：轮次下拉切换批次，最新批次默认展示
+  - 有搜索：跨批次聚合匹配（按 个股名称/代码/板块 等），按批次分组展示命中项
 -->
 <template>
   <div v-if="visible" class="log-overlay" @click.self="close">
@@ -28,7 +30,19 @@
       <!-- LLM 分析 tab -->
       <div v-show="activeTab === 'llm'" class="log-body">
         <div class="log-toolbar">
-          <select v-model="llmIdx" :disabled="llmRecords.length < 2" @change="applyLLM" class="log-select">
+          <input
+            v-model="llmQuery"
+            type="text"
+            class="log-search"
+            placeholder="搜索：个股名称 / 代码 / 板块（跨批次）"
+          />
+          <select
+            v-show="!llmSearching"
+            v-model="llmIdx"
+            :disabled="llmRecords.length < 2"
+            @change="applyLLM"
+            class="log-select"
+          >
             <option v-for="(r, i) in llmRecords" :key="r.process_time" :value="i">
               轮次 {{ llmRecords.length - i }} · {{ fmtTime(r.process_time) }}（{{ r.raw_count }} 条 / 选 {{ r.selected_count }}）
             </option>
@@ -36,44 +50,18 @@
           <button class="btn-refresh" @click="load" :disabled="loading">刷新</button>
         </div>
 
-        <div v-if="llmNoData" class="log-empty">暂无 LLM 分析记录，等待下一轮扫描</div>
-        <template v-else-if="llmData">
-          <div class="summary-bar">
-            <div class="summary-item">
-              <span class="summary-label">Stage1 模式</span>
-              <span :class="['summary-value', llmData.stage1_mode === 'llm' ? 'tag-llm' : 'tag-keyword']">
-                {{ llmData.stage1_mode === 'llm' ? 'LLM' : '关键词' }}
-              </span>
-            </div>
-            <div class="summary-item">
-              <span class="summary-label">原始条数</span>
-              <span class="summary-value">{{ llmData.raw_count }}</span>
-            </div>
-            <div class="summary-item">
-              <span class="summary-label">筛选后</span>
-              <span class="summary-value">{{ llmData.selected_count }}</span>
-            </div>
-            <div class="summary-item">
-              <span class="summary-label">分析时间</span>
-              <span class="summary-value">{{ fmtTime(llmData.process_time) }}</span>
-            </div>
+        <!-- 跨批次搜索结果视图 -->
+        <div v-if="llmSearching" class="search-view">
+          <div v-if="!llmSearchGroups.length" class="log-empty">未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
+          <div v-else class="search-summary">
+            共 {{ llmTotalHits }} 条事件命中，跨 {{ llmSearchGroups.length }} 个轮次
           </div>
-
-          <h3 class="section-title">Stage1 · 新闻初筛</h3>
-          <div class="stage1-list">
-            <div v-for="(title, i) in llmData.raw_titles" :key="i"
-              :class="['title-item', isSelected(i) ? 'selected' : 'discarded']">
-              <span class="title-idx">{{ i + 1 }}</span>
-              <span class="title-text">{{ title }}</span>
-              <span :class="['title-badge', isSelected(i) ? 'badge-pass' : 'badge-skip']">
-                {{ isSelected(i) ? '通过' : '过滤' }}
-              </span>
+          <div v-for="(g, gi) in llmSearchGroups" :key="gi" class="search-group">
+            <div class="search-group-head">
+              <span class="search-batch">轮次 {{ fmtTime(g.time) }}</span>
+              <span class="search-count">命中 {{ g.items.length }} 条</span>
             </div>
-          </div>
-
-          <h3 class="section-title">Stage2 · LLM 分析结果</h3>
-          <div v-if="llmData.stage2_events && llmData.stage2_events.length" class="stage2-events">
-            <div v-for="(ev, i) in llmData.stage2_events" :key="i" class="event-card">
+            <div v-for="(ev, i) in g.items" :key="i" class="event-card">
               <div class="event-header">
                 <span class="event-title">{{ ev.title }}</span>
                 <span :class="['tag', 'tag-' + ev.direction]">{{ ev.direction || '中性' }}</span>
@@ -99,14 +87,94 @@
               </div>
             </div>
           </div>
-          <div v-else class="log-empty">Stage2 无分析结果</div>
+        </div>
+
+        <!-- 单批次浏览视图（无搜索时） -->
+        <template v-else>
+          <div v-if="llmNoData" class="log-empty">暂无 LLM 分析记录，等待下一轮扫描</div>
+          <template v-else-if="llmData">
+            <div class="summary-bar">
+              <div class="summary-item">
+                <span class="summary-label">Stage1 模式</span>
+                <span :class="['summary-value', llmData.stage1_mode === 'llm' ? 'tag-llm' : 'tag-keyword']">
+                  {{ llmData.stage1_mode === 'llm' ? 'LLM' : '关键词' }}
+                </span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">原始条数</span>
+                <span class="summary-value">{{ llmData.raw_count }}</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">筛选后</span>
+                <span class="summary-value">{{ llmData.selected_count }}</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">分析时间</span>
+                <span class="summary-value">{{ fmtTime(llmData.process_time) }}</span>
+              </div>
+            </div>
+
+            <h3 class="section-title">Stage1 · 新闻初筛</h3>
+            <div class="stage1-list">
+              <div v-for="(title, i) in llmData.raw_titles" :key="i"
+                :class="['title-item', isSelected(i) ? 'selected' : 'discarded']">
+                <span class="title-idx">{{ i + 1 }}</span>
+                <span class="title-text">{{ title }}</span>
+                <span :class="['title-badge', isSelected(i) ? 'badge-pass' : 'badge-skip']">
+                  {{ isSelected(i) ? '通过' : '过滤' }}
+                </span>
+              </div>
+            </div>
+
+            <h3 class="section-title">Stage2 · LLM 分析结果</h3>
+            <div v-if="llmData.stage2_events && llmData.stage2_events.length" class="stage2-events">
+              <div v-for="(ev, i) in llmData.stage2_events" :key="i" class="event-card">
+                <div class="event-header">
+                  <span class="event-title">{{ ev.title }}</span>
+                  <span :class="['tag', 'tag-' + ev.direction]">{{ ev.direction || '中性' }}</span>
+                  <span class="event-score">评分 {{ (ev.score || 0).toFixed(2) }}</span>
+                </div>
+                <div class="event-body">
+                  <div class="event-row" v-if="ev.sectors && ev.sectors.length">
+                    <span class="event-label">板块</span>
+                    <span class="event-tags">
+                      <span v-for="s in ev.sectors" :key="s" class="mini-tag sector">{{ s }}</span>
+                    </span>
+                  </div>
+                  <div class="event-row" v-if="ev.related_stocks && ev.related_stocks.length">
+                    <span class="event-label">个股</span>
+                    <span class="event-tags">
+                      <span v-for="s in ev.related_stocks" :key="s" class="mini-tag stock">{{ s }}</span>
+                    </span>
+                  </div>
+                  <div class="event-row" v-if="ev.reason">
+                    <span class="event-label">理由</span>
+                    <span class="event-reason">{{ ev.reason }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-else class="log-empty">Stage2 无分析结果</div>
+          </template>
         </template>
       </div>
 
       <!-- 信号批次 tab -->
       <div v-show="activeTab === 'signal'" class="log-body">
         <div class="log-toolbar">
-          <select v-model="sigIdx" :disabled="sigRecords.length < 2" @change="applySignal" class="log-select">
+          <input
+            v-model="sigQuery"
+            type="text"
+            class="log-search"
+            placeholder="搜索：个股名称 / 代码 / 板块（跨批次）"
+          />
+          <select
+            v-show="!sigSearching"
+            v-model="sigIdx"
+            :disabled="sigRecords.length < 2"
+            @change="applySignal"
+            class="log-select"
+          >
             <option v-for="(r, i) in sigRecords" :key="r.process_time" :value="i">
               批次 {{ sigRecords.length - i }} · {{ fmtTime(r.process_time) }}（{{ r.signals.length }} 信号 / {{ r.raw_count }} 条）
             </option>
@@ -114,25 +182,18 @@
           <button class="btn-refresh" @click="load" :disabled="loading">刷新</button>
         </div>
 
-        <div v-if="sigNoData" class="log-empty">暂无信号批次记录，等待下一轮扫描</div>
-        <template v-else-if="sigData">
-          <div class="summary-bar">
-            <div class="summary-item">
-              <span class="summary-label">批次时间</span>
-              <span class="summary-value">{{ fmtTime(sigData.process_time) }}</span>
-            </div>
-            <div class="summary-item">
-              <span class="summary-label">原始条数</span>
-              <span class="summary-value">{{ sigData.raw_count }}</span>
-            </div>
-            <div class="summary-item">
-              <span class="summary-label">信号数</span>
-              <span class="summary-value">{{ sigData.signals.length }}</span>
-            </div>
+        <!-- 跨批次搜索结果视图 -->
+        <div v-if="sigSearching" class="search-view">
+          <div v-if="!sigSearchGroups.length" class="log-empty">未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
+          <div v-else class="search-summary">
+            共 {{ sigTotalHits }} 条信号命中，跨 {{ sigSearchGroups.length }} 个批次
           </div>
-
-          <div v-if="sigData.signals.length" class="signal-list">
-            <div v-for="(sg, i) in sigData.signals" :key="sg.id || i" class="signal-item">
+          <div v-for="(g, gi) in sigSearchGroups" :key="gi" class="search-group">
+            <div class="search-group-head">
+              <span class="search-batch">批次 {{ fmtTime(g.time) }}</span>
+              <span class="search-count">命中 {{ g.items.length }} 条</span>
+            </div>
+            <div v-for="(sg, i) in g.items" :key="i" class="signal-item">
               <div class="sig-head">
                 <span class="sig-code">{{ sg.code }}</span>
                 <span class="sig-name">{{ sg.name || '-' }}</span>
@@ -148,7 +209,46 @@
               </div>
             </div>
           </div>
-          <div v-else class="log-empty">本轮无信号产出</div>
+        </div>
+
+        <!-- 单批次浏览视图（无搜索时） -->
+        <template v-else>
+          <div v-if="sigNoData" class="log-empty">暂无信号批次记录，等待下一轮扫描</div>
+          <template v-else-if="sigData">
+            <div class="summary-bar">
+              <div class="summary-item">
+                <span class="summary-label">批次时间</span>
+                <span class="summary-value">{{ fmtTime(sigData.process_time) }}</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">原始条数</span>
+                <span class="summary-value">{{ sigData.raw_count }}</span>
+              </div>
+              <div class="summary-item">
+                <span class="summary-label">信号数</span>
+                <span class="summary-value">{{ sigData.signals.length }}</span>
+              </div>
+            </div>
+
+            <div v-if="sigData.signals.length" class="signal-list">
+              <div v-for="(sg, i) in sigData.signals" :key="sg.id || i" class="signal-item">
+                <div class="sig-head">
+                  <span class="sig-code">{{ sg.code }}</span>
+                  <span class="sig-name">{{ sg.name || '-' }}</span>
+                  <span class="sig-strategy">{{ sg.strategy || '-' }}</span>
+                  <span :class="['tag', 'dir-' + sg.direction]">{{ sg.direction || '中性' }}</span>
+                  <span :class="['tag', 'act-' + sg.action]">{{ sg.action || '-' }}</span>
+                  <span class="sig-conf">置信 {{ (sg.confidence || 0).toFixed(2) }}</span>
+                  <span v-if="sg.price" class="sig-price">¥{{ sg.price.toFixed(2) }}</span>
+                </div>
+                <div class="sig-body">
+                  <span v-if="sg.sector" class="sig-sector">{{ sg.sector }}</span>
+                  <span v-if="sg.reason" class="sig-reason">{{ sg.reason }}</span>
+                </div>
+              </div>
+            </div>
+            <div v-else class="log-empty">本轮无信号产出</div>
+          </template>
         </template>
       </div>
     </div>
@@ -157,8 +257,8 @@
 
 <script setup>
 // ── 依赖导入 ──
-// ref 定义响应式；watch 侦听 visible 变化触发加载；onMounted 在组件挂载时加载
-import { ref, watch, onMounted } from 'vue'
+// ref 定义响应式；computed 派生跨批次搜索聚合结果；watch 侦听 visible 变化触发加载；onMounted 挂载时加载
+import { ref, computed, watch, onMounted } from 'vue'
 // 后端 API 封装：Stage 流水线记录与信号批次记录获取接口
 import * as api from '../api/index.js'
 
@@ -178,6 +278,7 @@ const llmRecords = ref([])        // 当日全量 Stage 轮次记录（按批次
 const llmIdx = ref(0)             // 下拉框选中的轮次索引（默认最新=0）
 const llmData = ref(null)         // 当前展示的那一轮 LLM 分析数据
 const llmNoData = ref(false)      // 是否无 LLM 记录（展示空态文案）
+const llmQuery = ref('')          // LLM 搜索关键词（名称/代码/板块）
 const selectedSet = ref(new Set()) // 该轮次通过 Stage1 筛选的新闻索引集合
 
 // 信号批次 tab 状态
@@ -185,6 +286,7 @@ const sigRecords = ref([])       // 当日全量信号批次记录
 const sigIdx = ref(0)            // 下拉框选中的批次索引
 const sigData = ref(null)         // 当前展示的那一批信号数据
 const sigNoData = ref(false)      // 是否无信号批次记录（展示空态文案）
+const sigQuery = ref('')          // 信号搜索关键词（名称/代码/板块）
 
 /** 判断某条新闻（按原始序号 i）是否通过 Stage1 筛选 */
 // 由 selectedSet 决定模板里显示"通过"还是"过滤"徽标
@@ -207,6 +309,75 @@ function applySignal() {
   sigData.value = r || null
   sigNoData.value = !r
 }
+
+// ── 跨批次搜索 ──
+
+/** 判断一条 LLM Stage2 事件是否命中关键词（名称/代码/板块/标题/理由，大小写不敏感） */
+function eventHit(ev, q) {
+  if (!ev) return false
+  if (hasText(ev.title, q)) return true
+  if (hasText(ev.reason, q)) return true
+  if (ev.sectors && ev.sectors.some((s) => hasText(s, q))) return true
+  if (ev.related_stocks && ev.related_stocks.some((s) => hasText(s, q))) return true
+  if (ev.cleaned_stocks && ev.cleaned_stocks.some((s) => hasText(s, q))) return true
+  return false
+}
+
+/** 判断一条信号是否命中关键词（代码/名称/板块/策略/理由，大小写不敏感） */
+function sigHit(sg, q) {
+  if (!sg) return false
+  if (hasText(sg.code, q)) return true
+  if (hasText(sg.name, q)) return true
+  if (hasText(sg.sector, q)) return true
+  if (hasText(sg.strategy, q)) return true
+  if (hasText(sg.reason, q)) return true
+  return false
+}
+
+/** 判断文本是否包含关键词（空串恒不命中；统一转大写忽略大小写） */
+function hasText(text, q) {
+  if (!text || !q) return false
+  return String(text).toUpperCase().includes(q)
+}
+
+/** LLM 是否处于搜索态（输入非空） */
+const llmSearching = computed(() => (llmQuery.value || '').trim() !== '')
+/** 信号是否处于搜索态（输入非空） */
+const sigSearching = computed(() => (sigQuery.value || '').trim() !== '')
+
+/** LLM 跨批次搜索结果：按轮次分组，组内含命中事件；llmRecords 本身最新在前 */
+const llmSearchGroups = computed(() => {
+  const q = (llmQuery.value || '').trim().toUpperCase()
+  if (!q) return []
+  const groups = []
+  for (const r of llmRecords.value) {
+    const items = (r.stage2_events || []).filter((ev) => eventHit(ev, q))
+    if (items.length) {
+      groups.push({ time: r.process_time, items })
+    }
+  }
+  return groups
+})
+
+/** LLM 全部命中事件数（搜索概要展示） */
+const llmTotalHits = computed(() => llmSearchGroups.value.reduce((n, g) => n + g.items.length, 0))
+
+/** 信号跨批次搜索结果：按批次分组，组内含命中信号；sigRecords 本身最新在前 */
+const sigSearchGroups = computed(() => {
+  const q = (sigQuery.value || '').trim().toUpperCase()
+  if (!q) return []
+  const groups = []
+  for (const r of sigRecords.value) {
+    const items = (r.signals || []).filter((sg) => sigHit(sg, q))
+    if (items.length) {
+      groups.push({ time: r.process_time, items })
+    }
+  }
+  return groups
+})
+
+/** 信号全部命中数（搜索概要展示） */
+const sigTotalHits = computed(() => sigSearchGroups.value.reduce((n, g) => n + g.items.length, 0))
 
 /** 切换 tab（llm <-> signal） */
 // 仅在切换后当前 tab 无数据时才触发一次加载，避免无谓重复请求
@@ -306,18 +477,36 @@ onMounted(() => {
 .log-toolbar {
   display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
 }
+.log-search {
+  flex: 1; min-width: 0;
+  padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
+  background: #1a1a2e; color: #e0e0e0; font-size: 12px; outline: none;
+}
+.log-search::placeholder { color: #666; }
+.log-search:focus { border-color: #FF4D4F; }
 .log-select {
   padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
   background: #1a1a2e; color: #ccc; font-size: 12px; cursor: pointer; max-width: 340px; flex: 1;
 }
 .btn-refresh {
   padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F;
-  background: transparent; color: #FF4D4F; font-size: 13px; cursor: pointer;
+  background: transparent; color: #FF4D4F; font-size: 13px; cursor: pointer; white-space: nowrap;
 }
 .btn-refresh:disabled { opacity: 0.5; }
 .btn-refresh:hover { background: rgba(255,77,79,0.1); }
 
 .log-empty { text-align: center; padding: 40px; color: #666; font-size: 13px; }
+
+/* ── 跨批次搜索结果视图 ── */
+.search-view { display: flex; flex-direction: column; gap: 12px; }
+.search-summary { font-size: 12px; color: #888; }
+.search-group { display: flex; flex-direction: column; gap: 8px; }
+.search-group-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 4px 2px; border-bottom: 1px dashed #2a2a3e;
+}
+.search-batch { font-size: 12px; font-weight: 600; color: #4fc3f7; }
+.search-count { font-size: 11px; color: #888; }
 
 .summary-bar {
   display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px;
