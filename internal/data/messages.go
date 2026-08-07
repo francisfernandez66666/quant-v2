@@ -119,7 +119,27 @@ func (s *MessageStore) Sync(items []MessageItem) {
 	s.persist()
 }
 
-// Delete 删除单条消息：移除并记录墓碑（当日内不再自动出现）。
+// RefreshNameByCode 按代码刷新股票名称：把 Code 匹配的全部消息 Name 覆盖为最新权威名。
+// 用于加自选后同步消息中心的旧名/空名；不改变消息去重键与顺序，随后持久化。
+func (s *MessageStore) RefreshNameByCode(code, name string) {
+	if code == "" || name == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for i := range s.file.Messages {
+		if s.file.Messages[i].Code == code && s.file.Messages[i].Name != name {
+			s.file.Messages[i].Name = name
+			changed = true
+		}
+	}
+	if changed {
+		s.persist()
+	}
+}
+
+// Delete 删除单条消息：移除并记录墓碑（当日去重后不再自动出现）。
 func (s *MessageStore) Delete(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

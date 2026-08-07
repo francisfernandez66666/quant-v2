@@ -491,6 +491,37 @@ func (e *Engine) DeleteMessage(id string) {
 	}
 }
 
+// RefreshMessageName 按代码刷新消息中心的股票名称为最新权威名。
+// 由前端加自选等入口调用，用于把消息里旧名/空名同步成 quote 权威名。
+func (e *Engine) RefreshMessageName(code, name string) {
+	if e.msgStore != nil {
+		e.msgStore.RefreshNameByCode(code, name)
+	}
+}
+
+// authoritativeName 尝试从行情接口取该股权威名称；失败或为空时返回 ""。
+// 仅用于持仓消息 Name 为空的兜底，避免消息中心出现空名。
+func (e *Engine) authoritativeName(code string) string {
+	if e.marketAPI == nil || code == "" {
+		return ""
+	}
+	si, err := e.marketAPI.GetRealtimeQuote(code)
+	if err != nil || si == nil || si.Name == "" {
+		return ""
+	}
+	return si.Name
+}
+
+// orName 依次返回第一个非空名称，全部为空时返回 ""。
+func orName(names ...string) string {
+	for _, n := range names {
+		if n != "" {
+			return n
+		}
+	}
+	return ""
+}
+
 // ── 股票咨询（多轮对话）──
 
 // consultHistoryLimit 送入模型的多轮历史上限（最近 N 条消息，约 3 组问答）。
@@ -954,7 +985,7 @@ func (e *Engine) syncMessages(alertSignals []combat_agent.Signal, sr *strategy_e
 		items = append(items, data.MessageItem{
 			ID:          "hold@" + l.SignalID,
 			Code:        l.Code,
-			Name:        l.Name,
+			Name:        orName(l.Name, e.authoritativeName(l.Code), l.Code),
 			Level:       "持仓提示",
 			Action:      l.Status,
 			Strategy:    l.Strategy,

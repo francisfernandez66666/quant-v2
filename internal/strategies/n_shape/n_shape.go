@@ -114,6 +114,14 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		} else {
 			prio = strategy.P3
 		}
+	case "left_signal":
+		// 左侧一突（价格破前高+量比≥1.8，且 D1>0 非情绪硬闸）→ 立即打标买入，至少 P2
+		action = strategy.ActionBuy
+		prio = strategy.P2
+	case "right_signal":
+		// 右侧二突（一突破位→回调→二次放量重破前高）→ 最强确认，P1
+		action = strategy.ActionBuy
+		prio = strategy.P1
 	}
 
 	// 一突信号提高优先级: 价格突破前高且量比≥1.8 时，最低提升至 P2

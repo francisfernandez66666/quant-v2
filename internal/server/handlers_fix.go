@@ -901,6 +901,10 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		price = info.Price
 		chg = info.ChangePct
 	}
+	// 加自选后同步消息中心该股的名称（旧名/空名刷新为权威名）
+	if name != "" && s.ctrl != nil {
+		s.ctrl.RefreshMessageName(code, name)
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"status": "ok",
 		"stock":  map[string]interface{}{"code": code, "name": name, "price": price, "change_pct": chg},

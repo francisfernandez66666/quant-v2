@@ -37,6 +37,20 @@ func orDefault(a, b string) string {
 	return b
 }
 
+// nShapeTag 映射 N 形评分级别到信号标记（一突/二突），其余级别返回 ""。
+func nShapeTag(eval *strategy.Evaluation) string {
+	if eval == nil {
+		return ""
+	}
+	switch eval.Level {
+	case "left_signal":
+		return "一突"
+	case "right_signal":
+		return "二突"
+	}
+	return ""
+}
+
 // Agent 战法引擎核心，管理多策略运行器与配置热更新。
 // 所有字段通过 mu 读写锁保护，保证并发扫描/热更新安全。
 type Agent struct {
@@ -46,6 +60,10 @@ type Agent struct {
 	runners      []StrategyRunner       // 多策略运行器列表（做多/通用扫描共用）
 	shortRunner  StrategyRunner         // 做空策略运行器（预留）
 	shortEnabled bool                   // 做空功能开关（关闭时 ScanShort 直接返回 nil）
+
+	waves  *WaveTracker // N 形一突/二突日内状态机（跨 5s 周期）
+	diagMu sync.Mutex   // 保护 nDiag 的并发读写
+	nDiag  []NDiag      // 本轮 N 形候选诊断条目（engine 每轮 DrainNDiag 收口）
 }
 
 // New 创建战法引擎实例。
@@ -53,7 +71,24 @@ func New(cfg *config.StrategyConfig) *Agent {
 	return &Agent{
 		strategyCfg: cfg,
 		runners:     make([]StrategyRunner, 0),
+		waves:       NewWaveTracker(),
 	}
+}
+
+// DrainNDiag 收口并清空本轮 N 形诊断条目（engine 每轮打分后调用并打印）。
+func (a *Agent) DrainNDiag() []NDiag {
+	a.diagMu.Lock()
+	defer a.diagMu.Unlock()
+	out := a.nDiag
+	a.nDiag = nil
+	return out
+}
+
+// recordNDiag 追加一条 N 形候选诊断（仅 N 形战法路径调用）。
+func (a *Agent) recordNDiag(d NDiag) {
+	a.diagMu.Lock()
+	defer a.diagMu.Unlock()
+	a.nDiag = append(a.nDiag, d)
 }
 
 // SetLaodengConfig 设置 Laodeng 评分配置（线程安全）。
@@ -224,7 +259,37 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		case strategy.SignalDragonReturn:
 			sc.DragonReturnScore = eval.TotalScore
 		}
-		// 未通过战法硬性/评分门槛 → 只记分不出信号
+		// N 形候选：推进一突/二突日内状态机，并尊重 D 硬闸（硬闸在于 noscore 被拦、d1=0 不提级）。
+		// 一突打标需 d1>0；二突为最强确认同样要求 d1>0。未满足硬闸保持原级别不发信号。
+		if runner.Type == strategy.SignalNShape && eval != nil {
+			left, right := a.waves.Eval(code, md)
+			d1 := 0.0
+			if v, ok := eval.Details["d1"]; ok {
+				d1 = v
+			}
+			tag := ""
+			switch {
+			case right && d1 > 0:
+				eval.Level = "right_signal"
+				eval.Pass = true
+				eval.Details["right_signal"] = 1
+				tag = "二突"
+			case left && d1 > 0:
+				eval.Level = "left_signal"
+				eval.Pass = true
+				eval.Details["left_signal"] = 1
+				tag = "一突"
+			}
+			reason := eval.Level
+			if d1 <= 0 {
+				reason = "d1=0"
+			} else if !eval.Pass {
+				reason = "total_below"
+			}
+			a.recordNDiag(NDiag{Code: code, Name: md.Name, D1: d1, Total: eval.TotalScore,
+				Level: eval.Level, Tag: tag, Pass: eval.Pass, Reason: reason})
+		}
+		// 未通过战法硬性/评分门槛；二突/一突已在上面被提为 Pass → 只记分不出信号
 		if !eval.Pass {
 			continue
 		}
@@ -245,6 +310,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			Strategy:    string(runner.Type),
 			Direction:   direction,
 			Action:      action,
+			Tag:         nShapeTag(eval),
 			Price:       sig.Price,
 			Confidence:  sig.Confidence,
 			Reason:      sig.Reason,

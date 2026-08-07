@@ -61,6 +61,7 @@ type Signal struct {
 	Strategy    string    `json:"strategy"`             // 策略名称
 	Direction   string    `json:"direction"`            // 方向：做多/做空/提醒
 	Action      string    `json:"action"`               // 操作：买入/卖出/watch
+	Tag         string    `json:"tag,omitempty"`        // 信号标记（如 N形 一突/二突）
 	AlertType   string    `json:"alert_type,omitempty"` // 提醒类型：止盈/止损
 	Price       float64   `json:"price"`                // 触发价格
 	Confidence  float64   `json:"confidence"`           // 置信度（0~1）
@@ -75,4 +76,17 @@ type SignalLog struct {
 	ProcessTime time.Time `json:"process_time"` // 信号批次产出时间
 	RawCount    int       `json:"raw_count"`    // 本轮原始新闻条数
 	Signals     []Signal  `json:"signals"`      // 本轮全部信号（做多/做空/提醒）
+}
+
+// NDiag N 形候选诊断条目：记录每只 N 候选的评分与拦截原因，供日志定位"当日为何无 N 信号"。
+// engine 每轮 DrainNDiag 收口后打印一行概要；单只详情可按需展开。
+type NDiag struct {
+	Code   string  `json:"code"`            // 股票代码
+	Name   string  `json:"name"`            // 股票名称
+	D1     float64 `json:"d1"`              // D1 事件分（0~40）
+	Total  float64 `json:"total"`           // 四维总分（0~100）
+	Level  string  `json:"level"`           // 判定级别（full_chain/left_signal/right_signal/fail/noscore）
+	Tag    string  `json:"tag,omitempty"`   // 信号标记（一突/二突）
+	Pass   bool    `json:"pass"`            // 本轮是否 Pass
+	Reason string  `json:"reason,omitempty"` // 拦截原因（d1=0/total_below/emotion 等）
 }

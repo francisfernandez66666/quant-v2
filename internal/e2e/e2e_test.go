@@ -515,20 +515,21 @@ func TestEndToEndFullPipeline(t *testing.T) {
 				t.Errorf("300308 NScore 应>0（D1 已透传）, got %.0f（DataGaps=%v）", sc.NScore, sc.DataGaps)
 			}
 		}
-		// 3) 门控断言（本轮 N 形门槛放开后）：fixture 上 300308 D1=0.3 已进总分，
-		//    但 Total=15<60（D2/D3/D4 凑分不足），闸门必须拦截 → 无 N 形信号。
-		//    这正好覆盖强断言场景"D1 有分但总分<60 → 不出信号"（另见 n_shape_gate_test.go 三场景）。
+		// 3) 门控断言（N形门槛放开 + 一突打标）：fixture 300308 D1=0.3 已进总分，
+		//    即使 Total=15<60（D2/D3/D4 凑分不足），一突破位（价>前高×1.005 且量比≥1.8）且
+		//    D1>0 时按新打标规则仍可产出一突/二突买入信号；全链闸门拦截仍由 n_shape_gate_test.go 覆盖。
+		//    因此此处断言：凡产出的 N 形做多信号必须带一突/二突标记（证明走打标路径，而非绕过闸门）。
 		var nSig int
 		for _, s := range dash.FinalSignals {
 			if s.Strategy == "n_shape" && s.Direction == "做多" {
 				nSig++
-				t.Logf("N形信号 %s(%s) 分=%.0f %s", s.Code, s.Name, s.Confidence*100, s.Reason)
+				t.Logf("N形信号 %s(%s) 分=%.0f tag=%s %s", s.Code, s.Name, s.Confidence*100, s.Tag, s.Reason)
+				if s.Tag != "一突" && s.Tag != "二突" {
+					t.Errorf("N形打标信号应带一突/二突标记, got tag=%q %s(%s)", s.Tag, s.Code, s.Name)
+				}
 			}
 		}
-		t.Logf("N形做多信号数=%d（fixture 300308 Total=15<60，闸门拦截预期=0）", nSig)
-		if nSig != 0 {
-			t.Errorf("fixture 300308 Total<60 不应产出 N 形信号, got %d（D1 已透传但总分闸门应拦截）", nSig)
-		}
+		t.Logf("N形做多信号数=%d(fixture D1>0 的一突/二突打标信号)", nSig)
 	})
 
 	t.Run("东财板块列表", func(t *testing.T) {

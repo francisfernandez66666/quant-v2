@@ -41,6 +41,7 @@ type EngineController interface {
 	GetMessages() []data.MessageItem
 	ClearMessages()
 	DeleteMessage(id string)
+	RefreshMessageName(code, name string)
 	ConsultLLM(userID, userMsg string, proMode bool) (string, error)
 	GetConsultHistory() []data.ConsultMessage
 	ClearConsultHistory()

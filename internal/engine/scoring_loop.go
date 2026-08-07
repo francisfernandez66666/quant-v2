@@ -7,6 +7,7 @@ package engine
 import (
 	"context"
 	"log"
+	"sort"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
@@ -79,6 +80,11 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	md := e.strategy.BuildScoringData(ctx, pool, quotes)
 	scores, sigs := e.combatAgent.ScorePool(pool, md, d1Scores, emotionPhase)
 
+	// N 形候选诊断：收口本轮 N 候选的 D1/总分/级别/拦截原因，一眼定位"为何无 N 信号"
+	if nd := e.combatAgent.DrainNDiag(); len(nd) > 0 {
+		e.logNShapeDiag(emotionPhase, nd)
+	}
+
 	// 状态翻转去重：仅 非Pass→Pass 翻转的信号广播；持续 Pass 不重发；翻回后再翻上会再发。
 	e.mu.RLock()
 	prev := e.prevPass
@@ -111,6 +117,39 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 			"emotion": emotionPhase,
 			"time":    time.Now().Format("15:04:05"),
 		})
+	}
+}
+
+// logNShapeDiag 打印本轮 N 形候选诊断概要 + 最可能出信号的若干明细。
+// 排序：Pass（含一突/二突标记）在前、其余按总分降序，最多展示 8 条，避免刷屏。
+func (e *Engine) logNShapeDiag(emotionPhase string, diags []combat_agent.NDiag) {
+	pass, fail, d1Zero, totalLow := 0, 0, 0, 0
+	for _, d := range diags {
+		if d.Pass {
+			pass++
+		} else {
+			fail++
+		}
+		if d.D1 <= 0 {
+			d1Zero++
+		} else if !d.Pass {
+			totalLow++
+		}
+	}
+	log.Printf("[engine] N形诊断 emotion=%s 候选=%d pass=%d fail=%d d1=0拦截=%d 总分不足=%d",
+		emotionPhase, len(diags), pass, fail, d1Zero, totalLow)
+	sort.Slice(diags, func(i, j int) bool {
+		if diags[i].Pass != diags[j].Pass {
+			return diags[i].Pass
+		}
+		return diags[i].Total > diags[j].Total
+	})
+	for i, d := range diags {
+		if i >= 8 {
+			break
+		}
+		log.Printf("[engine] N形候选 %s(%s) d1=%.0f total=%.0f level=%s tag=%s pass=%v | %s",
+			d.Code, d.Name, d.D1, d.Total, d.Level, d.Tag, d.Pass, d.Reason)
 	}
 }
 
