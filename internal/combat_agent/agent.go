@@ -37,6 +37,18 @@ func orDefault(a, b string) string {
 	return b
 }
 
+// nShapeReason 为 N 形信号附加 D1 评分理由（LLM 分析的故事），使信号可读性更强。
+// base 为战法自身原因（如 left_signal/full_chain），d1 非空时把其 Reason 拼在其后。
+func nShapeReason(base string, d1 *D1Score) string {
+	if d1 == nil || d1.Reason == "" {
+		return base
+	}
+	if base == "" {
+		return "D1: " + d1.Reason
+	}
+	return base + " | D1: " + d1.Reason
+}
+
 // nShapeTag 映射 N 形评分级别到信号标记（一突/二突），其余级别返回 ""。
 func nShapeTag(eval *strategy.Evaluation) string {
 	if eval == nil {
@@ -303,6 +315,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		if action == "" {
 			action = "watch"
 		}
+		sigReason := sig.Reason
+		if runner.Type == strategy.SignalNShape {
+			sigReason = nShapeReason(sigReason, d1)
+		}
 		sigs = append(sigs, Signal{
 			ID:          seqID(),
 			Code:        code,
@@ -313,7 +329,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			Tag:         nShapeTag(eval),
 			Price:       sig.Price,
 			Confidence:  sig.Confidence,
-			Reason:      sig.Reason,
+			Reason:      sigReason,
 			Sector:      sectorName,
 			GeneratedAt: now,
 		})
