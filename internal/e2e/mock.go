@@ -283,7 +283,7 @@ func (t *fixtureTransport) emLimitUpPool(req *http.Request) (*http.Response, err
 	pool := make([]map[string]interface{}, 0, len(t.fix.LimitUpPool))
 	for _, s := range t.fix.LimitUpPool {
 		pool = append(pool, map[string]interface{}{
-			"c": s.Code, "n": s.Name, "p": s.Price * 100, "zdp": s.ChangePct,
+			"c": s.Code, "n": s.Name, "p": s.Price * 1000, "zdp": s.ChangePct,
 			"amount": s.Amount, "ltsz": s.FlowMCap, "hs": s.Turnover, "lbc": s.LianBan,
 			"fbt": sealToInt(s.FirstSeal), "fund": s.SealAmt, "zbc": s.BreakCount,
 			"hybk": s.Industry, "zttj": map[string]interface{}{"days": s.UpDays},

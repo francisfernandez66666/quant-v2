@@ -74,8 +74,16 @@ type Engine struct {
 	scoreStore       *scoreStore                     // 8a/8b 打分持久化（scores.json）
 	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
 	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
-	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
+lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
 	d1MaxRetries     int                             // D1 评分 LLM 轮询重试次数（<=0 用默认5）
+	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
+}
+
+// LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
+func (e *Engine) LastRunTiming() *RunTiming {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastTiming
 }
 
 // SetEmotionConfig 设置情绪周期阈值（线程安全）。
@@ -1146,6 +1154,36 @@ type produceOut struct {
 	st0     newsagent.Stage0Result // Stage0 归因分类结果
 	events  []newsagent.NewsEvent  // 全量已打标事件（含中性/一般）
 	valid   []newsagent.NewsEvent  // 阈值过滤+聚簇+衰减后的有效事件（进引擎）
+	timing  NewsTiming             // 本轮新闻流水线分段耗时（e2e 实速模拟观测）
+}
+
+// NewsTiming 新闻生产子环节耗时（均为实测墙钟时长，含该环节内 LLM/网络等待）。
+type NewsTiming struct {
+	Sectors time.Duration // 板块名单刷新
+	Fetch   time.Duration // 原始新闻拉取
+	Stage0  time.Duration // Stage0 归因分类(LLM)
+	Stage2  time.Duration // Stage2 深度分析(LLM) + 事件构建
+	Events  time.Duration // 聚簇/衰减/验真/传播
+}
+
+// RunTiming 一轮 engine.Run 的完整分段耗时（e2e 实速模拟 + 性能观测）。
+// 各字段为实测墙钟时长，单位纳秒；聚合关系见报告输出。
+type RunTiming struct {
+	Total       time.Duration // 整轮总耗时
+	News        NewsTiming    // 0-6 新闻流水线
+	Evaluate    time.Duration // 7  策略评估(归因+分流+评分池+行情)
+	HotRec      time.Duration // 7b 热点板块记录固化
+	D1          time.Duration // 8  D1 批量评分(LLM)
+	PE          time.Duration // 8a PE 预取
+	Pool        time.Duration // 8b 涨停池+新闻简报
+	Verify      time.Duration // 9  板块验证
+	HotPool     time.Duration // 9b 热点池更新(成分股并监控池)
+	MergeSector time.Duration // 9c 板块→个股归因
+	Signals     time.Duration // 10-12 出信号(做多/涨停增强/做空/个股直入)
+	Tracker     time.Duration // 12b 跟踪池收尾
+	Alerts      time.Duration // 13 持仓止盈/止损提醒
+	Agg         time.Duration // 14 看板更新+信号日志
+	SSE         time.Duration // 16 SSE 广播
 }
 
 // produceNews 执行新闻流水线：拉取→Stage0 归因→Stage2 深度分析→固化→阈值→聚簇→衰减→归因验真传播。
@@ -1153,11 +1191,15 @@ type produceOut struct {
 func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	out := produceOut{}
 
-	// 0. 刷新同花顺板块名单到 scanner（FindSectorsByNames/归因校验依赖真实板块名单）
+// 0. 刷新同花顺板块名单到 scanner（FindSectorsByNames/归因校验依赖真实板块名单）
+	_stepSectors := time.Now()
 	e.refreshSectors()
+	out.timing.Sectors = time.Since(_stepSectors)
 
 	// 1. 拉取原始新闻（含去重记账，属 newsagent 职能）
+	_stepFetch := time.Now()
 	out.rawNews = e.newsAgent.Fetch(ctx, since)
+	out.timing.Fetch = time.Since(_stepFetch)
 
 	if len(out.rawNews) == 0 {
 		log.Printf("[engine] 无新新闻 (since=%s), 本轮仅执行打分", since.Format("01-02 15:04"))
@@ -1165,7 +1207,9 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	}
 
 	// 2. Stage0 归因分类：个股 / 板块 / 一般（合并垃圾过滤+价值初筛+标题党复核）
+	_stepStage0 := time.Now()
 	out.st0 = e.newsAgent.Stage0(out.rawNews)
+	out.timing.Stage0 = time.Since(_stepStage0)
 	if out.st0.Err != nil {
 		// Stage0 失败：整批归一般（仅展示，不进 LLM 深度分析），明确记录原因便于排障
 		log.Printf("[engine][news漏斗] Stage0失败, 原始%d条全部归一般, 无LLM分析: %v", len(out.rawNews), out.st0.Err)
@@ -1181,6 +1225,7 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	}
 
 	// 3. 收集全量事件
+	_stepStage2 := time.Now()
 	// 3a. 个股新闻：跳过 Stage1，直接 Stage2 深度分析
 	if len(out.st0.StockIdx) > 0 {
 		stockItems := pickItems(out.rawNews, out.st0.StockIdx)
@@ -1260,6 +1305,9 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 		log.Printf("[engine] 无有效事件(|score|>=0.5), 本轮仅执行打分")
 	}
 	logDroppedFromPool(out.events, out.valid)
+	// 阶段2(深度分析 LLM)+事件构建总耗时（含聚簇/衰减/验真/传播）
+	out.timing.Stage2 = time.Since(_stepStage2)
+	out.timing.Events = out.timing.Stage2
 	return out
 }
 
@@ -1320,12 +1368,17 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 7. 策略评估：归因 + 分流 + 评分池 + 行情数据（无事件时仅覆盖 持仓+自选 打分池）
 	positions := e.rpt.HeldPositionCodes()
 	watchlist := e.wlMgr.List()
+	_stepEval := time.Now()
 	sr := e.strategy.Evaluate(ctx, valid, positions, watchlist)
+	_evalT := time.Since(_stepEval)
 
 	// 7b. 固化本轮热点板块记录（同花顺 top-20 匹配后，供前端展示历史）
+	_stepHotRec := time.Now()
 	e.captureHotRecord(sr)
+	_hotRecT := time.Since(_stepHotRec)
 
 	// 8. D1 评分（所有打分池个股；LLM 失败/漏项回退上一轮评分，避免断链归零）
+	_stepD1 := time.Now()
 	d1Scorer := combat_agent.NewD1Scorer(e.llmClient, "")
 	e.mu.RLock()
 	retries := e.d1MaxRetries
@@ -1338,21 +1391,26 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.mu.Lock()
 	e.lastD1Scores = d1Scores
 	e.mu.Unlock()
+	_d1T := time.Since(_stepD1)
 
 	// 8a. 打分池 PE 预取（N 形 D3 超跌评分；东财 clist f9，TTL 缓存降低限流压力）
+	_stepPE := time.Now()
 	peScores := make(map[string]float64, len(sr.ScoringPool))
 	for _, code := range sr.ScoringPool {
 		peScores[code] = e.marketAPI.GetStockPE(code)
 	}
+	_peT := time.Since(_stepPE)
 
 	td := data.TradingDayDate(time.Now())
 
 	// 8b. 当日涨停池 + 事件新闻简报（龙头识别 / 涨停分类 / 预期差检测）
+	_stepPool := time.Now()
 	pool, poolErr := e.marketAPI.GetLimitUpPool("")
 	if poolErr != nil {
 		log.Printf("[engine] 涨停池拉取失败: %v", poolErr)
 	}
 	newsBriefs := newsBriefsByCode(valid)
+	_poolT := time.Since(_stepPool)
 
 	// 8c. 情绪阶段（供 N 形评分硬闸）+ 8a/8b 持续打分输出容器
 	emotionPhase := ""
@@ -1365,6 +1423,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	stockScores := make(map[string]combat_agent.StockScores)
 
 	// 9. 板块验证（开关控制），结果同时用于战法扫描与看板展示
+	_stepVerify := time.Now()
 	var verifiedBull, verifiedBear []sector_agent.VerifiedSector
 	if e.LongEnabled() {
 		verifiedBull = e.sectorAgent.Verify(sr.HotSectors)
@@ -1372,16 +1431,23 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	if e.ShortEnabled() {
 		verifiedBear = e.sectorAgent.Verify(sr.BearSectors)
 	}
+	_verifyT := time.Since(_stepVerify)
 
 	// 9b. 验证通过的板块成分股并入 5s 实时监控池（fetcher 新浪批量拉取，热点股随板块轮换）
+	_stepHotPool := time.Now()
 	e.updateHotPool(verifiedBull, verifiedBear)
+	_hotPoolT := time.Since(_stepHotPool)
 
 	// 9c. 板块→个股归因：热点板块 top 成分股并入打分池行情/D1。
 	// 修复"板块利好只有板块、没有个股"：此前成分股不在 sr.MarketData 里，
 	// ScanLong 遍历 sector.Stocks 时 md==nil 直接丢弃 → 板块永远归因不到个股。
 	// D1 仅沿用板块事件（sector.Score 0~1 → LLMD1Score），不额外调 LLM。
+	_stepMerge := time.Now()
 	e.mergeSectorStocksIntoScores(ctx, sr, verifiedBull, verifiedBear, d1Scores, peScores)
+	_mergeT := time.Since(_stepMerge)
 
+	// 10-12. 出信号：做多 + 涨停增强 + 做空 + 个股直入（D1 复用，不重复调 LLM）
+	_stepSignals := time.Now()
 	// 10. 利好开关开 → 做多分支
 	var bullSignals []combat_agent.Signal
 	if e.LongEnabled() {
@@ -1483,6 +1549,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	}
 
 	// 将本轮的个股信号写入跟踪池：有效期至下一交易日（到期后自动移出监测池）
+	_stepTracker := time.Now()
 	expiry := data.AddTradingDays(td, 1)
 	for _, sig := range individualSignals {
 		// 按信号方向映射为跟踪池的 利好/利空 标记
@@ -1503,11 +1570,21 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 个股信号并入做多信号流统一展示/广播
 	bullSignals = append(bullSignals, individualSignals...)
 
+	// 10-12 出信号结束
+	_signalsT := time.Since(_stepSignals)
+	// 12b 跟踪池收尾结束
+	_trackerT := time.Since(_stepTracker)
+
 	// 13. 持仓止盈/止损提醒（传入当轮打分表 + 利空板块信号：有反向信号才硬推止盈/止损）
+	_stepAlerts := time.Now()
 	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, stockScores, bearHitCodes(sr))
+	_alertsT := time.Since(_stepAlerts)
 
 	// 14. 聚合器更新看板
+	_stepAgg := time.Now()
 	e.agg.Update(sr, verifiedBull, verifiedBear, bullSignals, bearSignals, alertSignals, stockScores, e.rpt)
+	// 14 看板更新结束
+	_aggT := time.Since(_stepAgg)
 
 	// 14b. 信号产生日志：逐条输出本轮生成的做多/做空/提醒信号（带日期时间戳，便于排障）
 	for _, sig := range bullSignals {
@@ -1540,6 +1617,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.captureSignalRecords(len(rawNews), allSignals)
 
 	// 16. SSE 广播通知前端（附信号摘要）
+	_stepSSE := time.Now()
 	if e.sse != nil && e.sse.Len() > 0 {
 		payload := map[string]string{
 			"type":   "scan",
@@ -1557,6 +1635,28 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		}
 		e.sse.Broadcast(payload)
 	}
+	_sseT := time.Since(_stepSSE)
+
+	// 记录本轮分段耗时（供 e2e 实速模拟 + /api/debug 观测）
+	e.mu.Lock()
+	e.lastTiming = &RunTiming{
+		Total:       time.Since(t0),
+		News:        pOut.timing,
+		Evaluate:    _evalT,
+		HotRec:      _hotRecT,
+		D1:          _d1T,
+		PE:          _peT,
+		Pool:        _poolT,
+		Verify:      _verifyT,
+		HotPool:     _hotPoolT,
+		MergeSector: _mergeT,
+		Signals:     _signalsT,
+		Tracker:     _trackerT,
+		Alerts:      _alertsT,
+		Agg:         _aggT,
+		SSE:         _sseT,
+	}
+	e.mu.Unlock()
 
 	log.Printf("[engine] 流水线完成: %d条原始 → %d事件 → %d有效 (%v)",
 		len(rawNews), len(events), len(valid), time.Since(t0))
