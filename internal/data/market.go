@@ -285,14 +285,15 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 	if c, ok := m.quoteHit(code); ok {
 		return c, nil
 	}
-	info, err := m.getEastMoneyQuote(code)
-	if err == nil {
+	info, emErr := m.getEastMoneyQuote(code)
+	if emErr == nil {
 		m.quoteStore(code, info)
 		return info, nil
 	}
+	// 东财失败 → 回落到新浪。注意把两个来源的错误都透传，避免上层把新浪错误误标成东财失败。
 	sina, serr := m.GetSinaQuote(code)
 	if serr != nil {
-		return nil, serr
+		return nil, fmt.Errorf("eastmoney: %v; sina: %v", emErr, serr)
 	}
 	m.quoteStore(code, sina)
 	return sina, nil

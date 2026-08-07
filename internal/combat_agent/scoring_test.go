@@ -189,6 +189,36 @@ func TestScorePoolMomentumSignal(t *testing.T) {
 	}
 }
 
+// TestScorePoolMomentumNoTradePreOpen 验证竞价/盘前（今日成交量为 0）即使历史数据强势也不发动量 watch。
+// 场景：强多头 MACD+走势（动量分仍会≥60）但 Quote.Volume=0，MomentumValid 应为 false，信号被抑制。
+func TestScorePoolMomentumNoTradePreOpen(t *testing.T) {
+	mc := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
+	mc.Momentum.SignalThreshold = 60
+	a := New(mc)
+	a.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: failStrategy{}}})
+
+	md := mkBullMarketData()
+	// 模拟竞价阶段：未成交，今日成交量=0（价格/均线/MACD 仍沿用存量数据）
+	md.Quote.Volume = 0
+	if MomentumScore(md, mc.Momentum) < 60 {
+		t.Fatalf("存量数据强势时动量分仍应>=60(验证场景前提)")
+	}
+	scores, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": md}, nil, "")
+
+	sc, ok := scores["600000"]
+	if !ok {
+		t.Fatalf("缺少打分结果")
+	}
+	if sc.MomentumValid {
+		t.Fatal("成交量为0应判为动量数据不完整")
+	}
+	for _, s := range sigs {
+		if s.Strategy == "动量" {
+			t.Fatalf("成交前不应发动量watch信号: %+v", s)
+		}
+	}
+}
+
 // TestScorePoolMomentumBelowThreshold 验证低于阈值的动量不产生信号。
 func TestScorePoolMomentumBelowThreshold(t *testing.T) {
 	m := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()

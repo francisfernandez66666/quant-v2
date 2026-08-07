@@ -259,7 +259,9 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 
 	// Q2: 动量分达到阈值且四战法均未出信号时，补一条 watch 观察信号
 	// （量价齐升/资金流入但战法形态未确认，仅观察不自动交易）
-	if len(sigs) == 0 && sc.MomentumScore >= a.momentumSignalThreshold() {
+	// 门控 sc.MomentumValid：竞价/盘前今日成交量=0 时动量数据不完整（无真实成交），
+	// 不发存量历史数据凑出来的动量 watch，等 9:30 实盘有成交量后再出。
+	if len(sigs) == 0 && sc.MomentumValid && sc.MomentumScore >= a.momentumSignalThreshold() {
 		sigs = append(sigs, Signal{
 			ID:          seqID(),
 			Code:        code,
@@ -274,6 +276,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			GeneratedAt: now,
 		})
 		sc.SignalActive = true
+	} else if len(sigs) == 0 && sc.MomentumScore >= a.momentumSignalThreshold() && !sc.MomentumValid {
+		// 竞价/盘前数据不完整时不发 watch，但保留可排查日志
+		log.Printf("[combat_agent] 动量%.0f达阈值但成交前数据不完整(Volume<=0/MACD缺), 暂不发动量watch: %s",
+			sc.MomentumScore, code)
 	}
 	sc.UpdatedAt = now
 	input.Scores[code] = sc
