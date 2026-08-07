@@ -73,7 +73,7 @@ type limitUpRaw struct {
 		Pool []struct {
 			Code       string  `json:"c"`      // 代码
 			Name       string  `json:"n"`      // 名称
-			Price      float64 `json:"p"`      // 最新价（分）
+			Price      float64 `json:"p"`      // 最新价（厘，0.001元，需 ÷1000）
 			ChangePct  float64 `json:"zdp"`    // 涨跌幅（%）
 			Amount     float64 `json:"amount"` // 成交额（元）
 			FlowMCap   float64 `json:"ltsz"`   // 流通市值（元）
@@ -91,8 +91,8 @@ type limitUpRaw struct {
 }
 
 // parseLimitUpPool 解析东财涨停池 JSON。
-// 价格字段 p 单位为分需 ÷100；首次封板时间 fbt 为 HHMMSS 整数转 "HH:MM"。
-// 封单占比 SealRatio 由封单资金与流通市值计算得出。
+// 价格字段 p 单位为厘（0.001元/千分位）需 ÷1000（实测：有研新材 p=48170 = 48.17元）。
+// 首次封板时间 fbt 为 HHMMSS 整数转 "HH:MM"。封单占比 SealRatio 由封单资金与流通市值计算得出。
 func parseLimitUpPool(body []byte) ([]LimitUpStock, error) {
 	var raw limitUpRaw
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -106,7 +106,7 @@ func parseLimitUpPool(body []byte) ([]LimitUpStock, error) {
 		stocks = append(stocks, LimitUpStock{
 			Code:       p.Code,
 			Name:       p.Name,
-			Price:      p.Price / 100,
+			Price:      p.Price / 1000,
 			ChangePct:  p.ChangePct,
 			Amount:     p.Amount,
 			FlowMCap:   p.FlowMCap,
