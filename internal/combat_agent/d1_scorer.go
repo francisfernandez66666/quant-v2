@@ -144,8 +144,8 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 
 	var raw []D1Score
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		log.Printf("[D1Scorer] JSON解析失败: %v, raw=%q, 回退上一轮评分", err, resp[:minInt(len(resp), 300)])
 		ds.fillFallback(result, codes, fallback, "解析失败")
+		log.Printf("[D1Scorer] JSON解析失败→整批 %d 只个股归0/回退: %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
 		return result
 	}
 
@@ -212,9 +212,11 @@ func minInt(a, b int) int {
 }
 
 // cleanJSON 清洗 LLM 返回的原始字符串，提取出纯 JSON 数组部分。
-// 处理步骤：去除首尾空格 → 去除 markdown 代码块标记（ ```json / ``` ）
-// → 提取第一个 '[' 到最后一个 ']' 之间的内容 → 去除末尾多余的标点符号。
+// 处理步骤：去除首尾空格 → 全局剔除 UTF-8 BOM(U+FEFF)（LLM 输出可能在数组内部夹 BOM，
+// 仅剥首尾会漏掉中间字符导致 json.Unmarshal 整批失败）→ 去除 markdown 代码块标记
+// （ ```json / ``` ）→ 提取第一个 '[' 到最后一个 ']' 之间的内容 → 去除末尾多余标点。
 func cleanJSON(s string) string {
+	s = strings.ReplaceAll(s, "\ufeff", "")
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")

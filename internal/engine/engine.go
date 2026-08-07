@@ -1178,7 +1178,41 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	if len(out.valid) == 0 {
 		log.Printf("[engine] 无有效事件(|score|>=0.5), 本轮仅执行打分")
 	}
+	logDroppedFromPool(out.events, out.valid)
 	return out
+}
+
+// logDroppedFromPool 可观测旁路：消息中心已落盘展示(≥0.25)的事件，若未进入 ≥0.5 有效事件池
+// （因而不会参与 D1 打分 / N 形信号），打印事件标题、关联个股与丢弃原因，便于排查"打了利好却没进 D1"。
+// 返回被丢弃计数（供测试断言）。
+func logDroppedFromPool(shown, valid []newsagent.NewsEvent) int {
+	if len(shown) == 0 {
+		return 0
+	}
+	keep := make(map[string]bool, len(valid))
+	for _, ev := range valid {
+		keep[ev.Title] = true
+	}
+	var dropped int
+	var sb strings.Builder
+	for _, ev := range shown {
+		if absScore(ev.Score) < 0.25 {
+			continue // 未落盘展示的不在考察范围
+		}
+		if keep[ev.Title] {
+			continue
+		}
+		dropped++
+		code := ""
+		if len(ev.RelatedStocks) > 0 {
+			code = ev.RelatedStocks[0]
+		}
+		sb.WriteString(fmt.Sprintf("[%s|%s|score=%+.2f|%s] %s\n", ev.Level, ev.Direction, ev.Score, code, ev.Title))
+	}
+	if dropped > 0 {
+		log.Printf("[观察] 消息中心已展示但未进打分池 %d 条(请逐条核对 Level/关联股是否落入打分池):\n%s", dropped, sb.String())
+	}
+	return dropped
 }
 
 // TryAsyncRun 尝试异步触发一次引擎 run（盘前用）：已有异步 run 进行中则返回 false 跳过本轮，
