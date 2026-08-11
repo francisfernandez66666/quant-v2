@@ -28,6 +28,9 @@ mkdir -p "$QUANT_DATA_DIR"
 
 # find_free_port 端口探测：从 base 开始找第一个未被监听的端口（最多尝试 50 个），
 # 用于前后端端口被占用时自动切换到下一个空闲端口，避免 bind 冲突直接报错。
+# English: port probe — finds the first free port starting from base (up to 50 tries) so the frontend
+# and backend can auto-switch to the next available port when the default one is occupied, avoiding a
+# hard "bind" failure.
 find_free_port() {
     local base="${1:-8080}"
     local i port
@@ -70,6 +73,8 @@ build_web() {
 run_dev() {
     if [ "$BUILD_QUANT" = "1" ]; then build; fi
     # 端口占用自动顺延：后端默认 8080、前端默认 5173，被占用则换下一个空闲端口
+    # English: auto port-switch — backend defaults to 8080 and frontend to 5173, each rolling to the
+    # next free port when occupied.
     BACKEND_PORT="$(find_free_port 8080)"
     FRONTEND_PORT="$(find_free_port 5173)"
     export QUANT_ADDR=":$BACKEND_PORT"
@@ -108,6 +113,8 @@ run_prod() {
     if [ "$BUILD_QUANT" = "1" ]; then build; fi
     build_web
     LOGFILE="$QUANT_DATA_DIR/quant.log"
+    # 端口占用自动顺延：探测空闲后端/前端端口
+    # English: auto port-switch — probe free ports for the backend and frontend.
     BACKEND_PORT="$(find_free_port 8080)"
     FRONTEND_PORT="$(find_free_port 5173)"
     export QUANT_ADDR=":$BACKEND_PORT"

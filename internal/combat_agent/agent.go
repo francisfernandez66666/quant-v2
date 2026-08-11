@@ -426,6 +426,8 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		}
 		sigReason := sig.Reason
 		if runner.Type == strategy.SignalNShape {
+			// N 形信号附上 D1 事件信息（LLM 理由 + 事件名称），见 nShapeReason
+			// English: N-shape signals carry the D1 event info (LLM reason + event name), see nShapeReason.
 			sigReason = nShapeReason(sigReason, d1, eventDesc)
 		}
 		sigs = append(sigs, Signal{

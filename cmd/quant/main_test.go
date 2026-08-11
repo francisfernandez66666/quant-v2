@@ -687,13 +687,14 @@ func TestPackageImports(t *testing.T) {
 }
 
 // TestBumpPort 验证端口占位自增逻辑：正常地址 +1，非法地址原样返回。
+// English: verifies the port-increment helper — valid addresses get +1, invalid ones pass through.
 func TestBumpPort(t *testing.T) {
 	cases := map[string]string{
-		":8080":         ":8081",
-		"127.0.0.1:1":   "127.0.0.1:2",
+		":8080":          ":8081",
+		"127.0.0.1:1":    "127.0.0.1:2",
 		"localhost:7090": "localhost:7091",
-		"not-an-addr":   "not-an-addr",
-		":abc":          ":abc",
+		"not-an-addr":    "not-an-addr",
+		":abc":           ":abc",
 	}
 	for in, want := range cases {
 		if got := bumpPort(in); got != want {
@@ -704,6 +705,8 @@ func TestBumpPort(t *testing.T) {
 
 // TestPickListenerPortSwitch 验证端口被占用时自动顺延到下一个空闲端口：
 // 先占用 8090，再调用 pickListener(":8090", 3) 应返回 8091 的监听器。
+// English: verifies the auto port-switch — occupy 8090 first, then pickListener(":8090", 3)
+// must roll over and bind :8091.
 func TestPickListenerPortSwitch(t *testing.T) {
 	block, err := net.Listen("tcp", ":8090")
 	if err != nil {

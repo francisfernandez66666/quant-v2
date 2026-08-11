@@ -61,6 +61,7 @@ type Engine struct {
 	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
 	signalRecPath string                   // 信号批次记录持久化文件路径
 	signalStore   *signalStore             // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
+	// English: pinned per-day signal store (latest Pass per code@strategy, restored across restarts)
 
 	msgStore      *data.MessageStore       // 消息中心持久化存储
 	consultStore  *data.ConsultStore       // 股票咨询对话持久化存储（跨交易日清空）
@@ -192,6 +193,8 @@ func New(
 	}
 	e.syncMessages(nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
+	// English: on startup, backfill the last persisted 8a/8b scores and the day's pinned signals so the
+	// frontend shows them immediately after a restart.
 	loadedScores := e.scoreStore.Load()
 	if persisted := e.signalStore.List(); len(persisted) > 0 || len(loadedScores) > 0 {
 		e.agg.UpdateFast(loadedScores, persisted, e.rpt)
@@ -1045,6 +1048,8 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 			action = sig.Action
 		}
 		// 信号无成交价（行情缺失导致）时回填实时价，避免消息里"现价:0.00"
+		// English: when a signal has no fill price (quote was missing), backfill the realtime quote so the
+		// message body never reads "现价:0.00".
 		price := sig.Price
 		if price <= 0 && e.marketAPI != nil {
 			if si, err := e.marketAPI.GetRealtimeQuote(sig.Code); err == nil && si != nil && si.Price > 0 {
@@ -1631,12 +1636,15 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 14. 聚合器更新看板
 	_stepAgg := time.Now()
 	// 固化当日信号：本轮做多/做空 Pass 信号按 code@strategy 覆盖写盘
+	// English: pin today's signals — this round's long/short Passed signals overwrite the store per code@strategy.
 	if e.signalStore != nil {
 		tradeSignals := append([]combat_agent.Signal{}, bullSignals...)
 		tradeSignals = append(tradeSignals, bearSignals...)
 		e.signalStore.Upsert(tradeSignals)
 	}
 	// 展示信号 = 当日固化信号 + 本轮信号（固化信号未被新一轮评分替换前持续显示）
+	// English: displayed signals = pinned day signals + current round, so pinned signals stay visible
+	// all day until replaced by a newer score.
 	e.agg.Update(sr, verifiedBull, verifiedBear,
 		mergeSignals(bullSignals, e.signalStore.List()), bearSignals, alertSignals, stockScores, e.rpt)
 	// 14 看板更新结束

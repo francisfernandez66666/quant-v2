@@ -106,6 +106,8 @@ func TestNShapeTag(t *testing.T) {
 }
 
 // TestNShapeReason 验证 N 形信号附加 D1 理由（故事）与事件名称：有 base+D1 → 拼接；无 D1 → 原样。
+// English: verifies N-shape signals append the D1 reason (narrative) and event name — base+D1 are
+// joined when present, and the output stays intact when D1 is absent.
 func TestNShapeReason(t *testing.T) {
 	if got := nShapeReason("left_signal", &D1Score{Reason: "中标海外储能大单"}, ""); got != "left_signal | D1: 中标海外储能大单" {
 		t.Fatalf("应拼接 D1 理由, got %q", got)

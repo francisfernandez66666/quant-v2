@@ -197,6 +197,9 @@ func main() {
 	// 启动 HTTP 服务：地址可用 QUANT_ADDR 覆盖。
 	// 端口占用自动顺延：绑定失败时依次尝试下一个端口（最多 20 个），
 	// 避免"bind: address already in use"直接把整个进程打崩（stale 进程占端口时的常见故障）。
+	// English: start the HTTP server (address overridable via QUANT_ADDR). When the port is already
+	// taken, roll over to the next port (up to 20) so a stale process holding the port cannot crash
+	// the whole app with "bind: address already in use".
 	addr := ":8080"
 	if v := os.Getenv("QUANT_ADDR"); v != "" {
 		addr = v
@@ -274,6 +277,8 @@ func getDataDir() string {
 
 // pickListener 尝试监听 baseAddr；若端口被占用则自动顺延到下一个端口（最多 maxTries 次），
 // 返回成功绑定的监听器；均失败返回 nil。
+// English: tries to listen on baseAddr; when the port is taken it rolls over to the next port
+// (up to maxTries times) and returns the first successfully bound listener, or nil if all fail.
 func pickListener(baseAddr string, maxTries int) net.Listener {
 	addr := baseAddr
 	for i := 0; i < maxTries; i++ {
@@ -287,6 +292,8 @@ func pickListener(baseAddr string, maxTries int) net.Listener {
 }
 
 // bumpPort 将 host:port 地址中的端口号 +1（如 :8080 -> :8081）；解析失败时原样返回。
+// English: increments the port number of a host:port address (e.g. :8080 -> :8081);
+// returns the address unchanged when it cannot be parsed.
 func bumpPort(addr string) string {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {

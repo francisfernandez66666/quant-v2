@@ -1,6 +1,9 @@
 // Package engine 当日战法信号固化存储：
 // 记录每个 code@strategy 最近一次 Pass 的交易信号（做多/做空），跨重启持久化到磁盘。
 // 目标：信号"固化一天"——除非有新的评分信号替换，否则当日持续展示；重启后自动恢复。
+// English: per-day fixed storage of strategy signals: records the latest Passed trade signal
+// (long/short) for each code@strategy and persists it to disk across restarts. Goal: signals stay
+// pinned for the whole day — kept visible until replaced by a newer score, and restored after a restart.
 package engine
 
 import (
@@ -15,6 +18,7 @@ import (
 )
 
 // signalStoreFile 当日固化信号磁盘结构（按交易日分桶）。
+// English: on-disk layout of the pinned signals for the day (bucketed by trading day).
 type signalStoreFile struct {
 	TradingDay string                `json:"trading_day"`
 	Signals    []combat_agent.Signal `json:"signals"`
@@ -22,6 +26,8 @@ type signalStoreFile struct {
 
 // signalStore 当日战法信号固化存储，键为 code@strategy。
 // 加载时校验交易日，跨天自动重置为当日空桶。
+// English: pinned-signal store keyed by code@strategy; validates the trading day on load and
+// automatically resets to an empty day-bucket when the day rolls over.
 type signalStore struct {
 	mu    sync.Mutex
 	path  string
@@ -29,6 +35,7 @@ type signalStore struct {
 }
 
 // newSignalStore 创建当日信号固化存储并从磁盘加载（仅保留当前交易日的数据）。
+// English: creates the pinned-signal store and loads it from disk (keeps only the current day's data).
 func newSignalStore(path string) *signalStore {
 	s := &signalStore{path: path, byKey: make(map[string]combat_agent.Signal)}
 	if path == "" {
@@ -56,6 +63,9 @@ func newSignalStore(path string) *signalStore {
 
 // Upsert 合并本轮 Pass 信号：仅交易型（做多/做空）入库存，按 code@strategy 覆盖；
 // 新信号不早于已存信号时替换（刷新价格/理由）。提醒/止盈止损不入库存（消息中心已单独持久化）。
+// English: merges this round's Passed signals — only trade signals (long/short) are stored, keyed by
+// code@strategy; a signal replaces the stored one unless it is older (refreshing price/reason).
+// Alerts (take-profit/stop-loss) are not stored here because the message center persists them separately.
 func (s *signalStore) Upsert(sigs []combat_agent.Signal) {
 	if s == nil {
 		return
@@ -83,6 +93,7 @@ func (s *signalStore) Upsert(sigs []combat_agent.Signal) {
 }
 
 // List 返回当日固化信号列表（供聚合器展示用，键去重后的当前集合）。
+// English: returns the day's pinned signals (deduplicated current set) for the dashboard aggregator.
 func (s *signalStore) List() []combat_agent.Signal {
 	if s == nil {
 		return nil
@@ -97,6 +108,7 @@ func (s *signalStore) List() []combat_agent.Signal {
 }
 
 // save 将当日固化信号写盘（覆盖写，交易日标记）。
+// English: writes the day's pinned signals to disk (overwrite, marked with the trading day).
 func (s *signalStore) save() {
 	if s.path == "" {
 		return
@@ -118,6 +130,8 @@ func (s *signalStore) save() {
 }
 
 // mergeSignals 合并当前轮信号与当日固化信号（固化集合在前，冲突由聚合器按 code 去重裁决）。
+// English: merges the current round's signals with the day's pinned signals (pinned set first; the
+// aggregator resolves per-code conflicts afterwards).
 func mergeSignals(cur, persisted []combat_agent.Signal) []combat_agent.Signal {
 	out := make([]combat_agent.Signal, 0, len(cur)+len(persisted))
 	out = append(out, persisted...)

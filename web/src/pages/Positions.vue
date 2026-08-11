@@ -360,6 +360,7 @@ const lotFormPrice = ref(0)          // 加减仓弹窗：成交价
 const lotFormQty = ref(0)            // 加减仓弹窗：成交数量
 // add/trim modal: fill quantity
 const lotCurrentPrice = ref(0)       // 加减仓弹窗：当前实时现价（打开时刷新）
+// add/trim modal: current live price, refreshed on open
 // add/trim modal: live current price, refreshed on open
 const costFormPrice = ref(0)         // 改成本弹窗：目标成本
 // set-cost modal: target cost

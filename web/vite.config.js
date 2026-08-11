@@ -17,6 +17,8 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 // 后端实际端口：优先读环境变量，默认 8080（与 Go 后端默认端口一致）
+// English: actual backend port — read from the VITE_BACKEND_PORT env var (set by start.sh after probing
+// a free port), defaulting to 8080 (matching the Go backend's default).
 const backendPort = process.env.VITE_BACKEND_PORT || '8080'
 
 // 导出 Vite 配置对象（defineConfig 自带类型提示与配置校验）
@@ -26,6 +28,8 @@ export default defineConfig({
   server: {
     // 开发服务器端口：本地访问地址为 http://localhost:5173
     port: 5173,
+    // strictPort 关闭：5173 被占用时 Vite 自动顺延到下一个空闲端口
+    // English: strictPort off lets Vite auto-roll to the next free port when 5173 is occupied.
     strictPort: false,
     proxy: {
       // REST API 代理：以 /api 开头的请求转发至本地 Go 后端

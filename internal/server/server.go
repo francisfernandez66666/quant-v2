@@ -255,6 +255,9 @@ func (s *Server) Serve(addr string) error {
 // ServeListener 使用已创建的监听器启动 HTTP 服务。
 // 与 Serve 的区别：监听器由调用方预先绑定（端口占用自动顺延后拿到的 listener），
 // 复用同一对象服务请求，避免"先探测端口再 ListenAndServe"的 bind 竞争。
+// English: serves HTTP on a pre-bound listener. Unlike Serve, the listener is created by the caller
+// (e.g. after auto port-switching) and reused for serving, avoiding the bind race of
+// "probe the port, then ListenAndServe".
 func (s *Server) ServeListener(ln net.Listener) error {
 	log.Printf("HTTP server serving on %s", ln.Addr().String())
 	return http.Serve(ln, s.corsMiddleware(s.mux))
