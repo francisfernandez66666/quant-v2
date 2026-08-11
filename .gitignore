@@ -1,8 +1,10 @@
 # 文档/SVG
 *.svg
 *.pdf
+# 忽略散落的临时 md（项目正式文档 docs/ 与 PROJECT_DOCUMENT.md 需入库，见下方白名单）
 *.md
-PROJECT_DOCUMENT*
+!PROJECT_DOCUMENT.md
+!docs/*.md
 README*
 events_leftside.yaml
 FLOW*
