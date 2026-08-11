@@ -103,7 +103,12 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 
 	// 有分数才更新看板并落盘（保持与 8a/8b 主循环同口径）
 	if len(scores) > 0 {
-		e.agg.UpdateFast(scores, emit, e.rpt)
+		// 固化当日信号：本轮 Pass 信号按 code@strategy 覆盖写盘（跨重启恢复，信号固化一天）
+		if e.signalStore != nil {
+			e.signalStore.Upsert(sigs)
+		}
+		// 展示信号 = 当日固化信号 + 本轮新翻转信号（固化信号未被新一轮评分替换前持续显示）
+		e.agg.UpdateFast(scores, mergeSignals(emit, e.signalStore.List()), e.rpt)
 		e.scoreStore.Save(data.TradingDayDate(time.Now()), scores)
 	}
 

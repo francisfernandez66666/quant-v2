@@ -105,19 +105,25 @@ func TestNShapeTag(t *testing.T) {
 	}
 }
 
-// TestNShapeReason 验证 N 形信号附加 D1 理由（故事）：有 base+D1 → 拼接；无 D1 → 原样。
+// TestNShapeReason 验证 N 形信号附加 D1 理由（故事）与事件名称：有 base+D1 → 拼接；无 D1 → 原样。
 func TestNShapeReason(t *testing.T) {
-	if got := nShapeReason("left_signal", &D1Score{Reason: "中标海外储能大单"}); got != "left_signal | D1: 中标海外储能大单" {
+	if got := nShapeReason("left_signal", &D1Score{Reason: "中标海外储能大单"}, ""); got != "left_signal | D1: 中标海外储能大单" {
 		t.Fatalf("应拼接 D1 理由, got %q", got)
 	}
-	if got := nShapeReason("full_chain", &D1Score{Reason: ""}); got != "full_chain" {
+	if got := nShapeReason("full_chain", &D1Score{Reason: ""}, ""); got != "full_chain" {
 		t.Fatalf("空 D1 理由应原样输出, got %q", got)
 	}
-	if got := nShapeReason("", &D1Score{Reason: "利好"}); got != "D1: 利好" {
+	if got := nShapeReason("", &D1Score{Reason: "利好"}, ""); got != "D1: 利好" {
 		t.Fatalf("无 base 时只输出 D1, got %q", got)
 	}
-	if got := nShapeReason("full_chain", nil); got != "full_chain" {
+	if got := nShapeReason("full_chain", nil, ""); got != "full_chain" {
 		t.Fatalf("nil D1 应原样输出, got %q", got)
+	}
+	if got := nShapeReason("full_chain", nil, "储能新签订单，海外大单落地"); got != "full_chain | 事件: 储能新签订单，海外大单落地" {
+		t.Fatalf("应拼接事件名称, got %q", got)
+	}
+	if got := nShapeReason("", &D1Score{Reason: "中标大单"}, "储能新签订单"); got != "D1: 中标大单 | 事件: 储能新签订单" {
+		t.Fatalf("应拼接 D1+事件, got %q", got)
 	}
 }
 

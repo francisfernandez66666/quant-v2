@@ -60,6 +60,7 @@ type Engine struct {
 
 	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
 	signalRecPath string                   // 信号批次记录持久化文件路径
+	signalStore   *signalStore             // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
 
 	msgStore      *data.MessageStore       // 消息中心持久化存储
 	consultStore  *data.ConsultStore       // 股票咨询对话持久化存储（跨交易日清空）
@@ -153,9 +154,11 @@ func New(
 	}
 	hotRecPath := ""
 	signalRecPath := ""
+	signalStorePath := ""
 	if dataDir != "" {
 		hotRecPath = filepath.Join(dataDir, "hot_records.json")
 		signalRecPath = filepath.Join(dataDir, "signal_records.json")
+		signalStorePath = filepath.Join(dataDir, "signals_today.json")
 	}
 	e := &Engine{
 		marketAPI:        marketAPI,
@@ -176,6 +179,7 @@ func New(
 		stageRecPath:     stageRecPath,
 		signalRecords:    loadSignalRecords(signalRecPath),
 		signalRecPath:    signalRecPath,
+		signalStore:      newSignalStore(signalStorePath),
 		msgStore:         data.NewMessageStore(msgPath),
 		consultStore:     data.NewConsultStore(consultPath),
 		confrontStore:    data.NewConfrontationStore(confrontPath),
@@ -187,9 +191,10 @@ func New(
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
 	}
 	e.syncMessages(nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
-	// 启动时回填上次持久化的 8a/8b 打分（重启后前端立即可见）
-	if loaded := e.scoreStore.Load(); len(loaded) > 0 {
-		e.agg.UpdateFast(loaded, nil, e.rpt)
+	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
+	loadedScores := e.scoreStore.Load()
+	if persisted := e.signalStore.List(); len(persisted) > 0 || len(loadedScores) > 0 {
+		e.agg.UpdateFast(loadedScores, persisted, e.rpt)
 	}
 	return e
 }
@@ -1039,6 +1044,13 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 		} else if sig.Action != "" {
 			action = sig.Action
 		}
+		// 信号无成交价（行情缺失导致）时回填实时价，避免消息里"现价:0.00"
+		price := sig.Price
+		if price <= 0 && e.marketAPI != nil {
+			if si, err := e.marketAPI.GetRealtimeQuote(sig.Code); err == nil && si != nil && si.Price > 0 {
+				price = si.Price
+			}
+		}
 		items = append(items, data.MessageItem{
 			ID:          sig.Code + "@交易信号@" + sig.Strategy,
 			Code:        sig.Code,
@@ -1048,7 +1060,7 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 			Strategy:    sig.Strategy,
 			Time:        sig.GeneratedAt.Format("15:04:05"),
 			Title:       fmt.Sprintf("交易信号 %s %s", sig.Code, sig.Name),
-			Body:        fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f %s", action, sig.Strategy, sig.Confidence*100, sig.Price, sig.Reason),
+			Body:        fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f %s", action, sig.Strategy, sig.Confidence*100, price, sig.Reason),
 			Direction:   direction,
 			GeneratedAt: sig.GeneratedAt,
 		})
@@ -1618,7 +1630,15 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 	// 14. 聚合器更新看板
 	_stepAgg := time.Now()
-	e.agg.Update(sr, verifiedBull, verifiedBear, bullSignals, bearSignals, alertSignals, stockScores, e.rpt)
+	// 固化当日信号：本轮做多/做空 Pass 信号按 code@strategy 覆盖写盘
+	if e.signalStore != nil {
+		tradeSignals := append([]combat_agent.Signal{}, bullSignals...)
+		tradeSignals = append(tradeSignals, bearSignals...)
+		e.signalStore.Upsert(tradeSignals)
+	}
+	// 展示信号 = 当日固化信号 + 本轮信号（固化信号未被新一轮评分替换前持续显示）
+	e.agg.Update(sr, verifiedBull, verifiedBear,
+		mergeSignals(bullSignals, e.signalStore.List()), bearSignals, alertSignals, stockScores, e.rpt)
 	// 14 看板更新结束
 	_aggT := time.Since(_stepAgg)
 

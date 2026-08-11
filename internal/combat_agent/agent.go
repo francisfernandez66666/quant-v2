@@ -60,18 +60,24 @@ func strategyLabel(t strategy.SignalType) string {
 	return string(t)
 }
 
-// nShapeReason 为 N 形信号附加 D1 评分理由（LLM 分析的故事），使信号可读性更强。
-// base 为战法自身原因（如 left_signal/full_chain），d1 非空时把其 Reason 拼在其后。
-// English: appends the D1 scoring reason (the LLM narrative) to an N-shape signal for readability;
-// when d1 is non-nil its Reason is concatenated after the base strategy reason.
-func nShapeReason(base string, d1 *D1Score) string {
-	if d1 == nil || d1.Reason == "" {
-		return base
+// nShapeReason 为 N 形信号附加 D1 事件信息，使信号可读性更强：
+// - d1.Reason 为 LLM 的 D1 分析理由（故事）；
+// - eventDesc 为个股关联事件的名称（新闻标题），对应"D1 事件名称"。
+// base 为战法自身原因（如 left_signal/full_chain），三段按序拼接。
+// English: appends D1 event info to an N-shape signal for readability — d1.Reason is the LLM narrative
+// and eventDesc is the related news event name(s); base is the strategy's own reason (left_signal etc.).
+func nShapeReason(base string, d1 *D1Score, eventDesc string) string {
+	var parts []string
+	if base != "" {
+		parts = append(parts, base)
 	}
-	if base == "" {
-		return "D1: " + d1.Reason
+	if d1 != nil && d1.Reason != "" {
+		parts = append(parts, "D1: "+d1.Reason)
 	}
-	return base + " | D1: " + d1.Reason
+	if eventDesc != "" {
+		parts = append(parts, "事件: "+eventDesc)
+	}
+	return strings.Join(parts, " | ")
 }
 
 // nShapeTag 映射 N 形评分级别到信号标记（一突/二突），其余级别返回 ""。
@@ -420,7 +426,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		}
 		sigReason := sig.Reason
 		if runner.Type == strategy.SignalNShape {
-			sigReason = nShapeReason(sigReason, d1)
+			sigReason = nShapeReason(sigReason, d1, eventDesc)
 		}
 		sigs = append(sigs, Signal{
 			ID:          seqID(),
