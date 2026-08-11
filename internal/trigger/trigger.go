@@ -1,6 +1,9 @@
 // Package trigger 实时触发引擎（借鉴 freevolunteer/daban 打板触发模型）。
 // 消费 5s 行情快照（data.Fetcher），对监控池个股做滑动窗口检测：
 // 窗口内秒均涨幅 ≥ RaRate 且秒成交额 ≥ StockAmt 即判定为放量急拉，广播触发信号。
+// （Package trigger is a real-time trigger engine (modeled after freevolunteer/daban). It consumes
+// 5s market snapshots (data.Fetcher) and runs sliding-window checks on monitored stocks: if the
+// per-second gain ≥ RaRate and per-second turnover ≥ StockAmt, it's a volume-spike rally → broadcast.）
 package trigger
 
 import (
@@ -15,6 +18,7 @@ import (
 )
 
 // Config 实时触发配置（对应 daban TriggerConf）。
+// （Config is the real-time trigger configuration, mirroring daban's TriggerConf.）
 type Config struct {
 	Sec      int           // 观测窗口（秒），默认 6
 	RaRate   float64       // 秒均涨幅阈值（%/s），默认 0.125
@@ -23,6 +27,7 @@ type Config struct {
 }
 
 // DefaultConfig 返回 daban 同款默认参数。
+// （DefaultConfig returns the same defaults as daban.）
 func DefaultConfig() Config {
 	return Config{
 		Sec:      6,
@@ -33,6 +38,7 @@ func DefaultConfig() Config {
 }
 
 // Signal 实时触发信号。
+// （Signal is a real-time trigger signal.）
 type Signal struct {
 	Code      string    `json:"code"`       // 股票代码
 	Name      string    `json:"name"`       // 股票名称
@@ -46,6 +52,7 @@ type Signal struct {
 }
 
 // tickState 单只股票的窗口滑动状态，记录上一 tick 的快照用于计算差分指标。
+// （tickState holds the sliding-window state of a single stock, keeping the previous tick snapshot for delta metrics.）
 type tickState struct {
 	prevPrice   float64   // 上一 tick 价格
 	prevAmt     float64   // 上一 tick 累计成交额
@@ -55,6 +62,8 @@ type tickState struct {
 }
 
 // Engine 实时触发引擎：持有行情采集器与 SSE 广播器，逐 tick 检测放量急拉。
+// （Engine is the real-time trigger engine: it holds the quote fetcher and SSE broker, checking for
+// volume-spike rallies tick by tick.）
 type Engine struct {
 	fetcher *data.Fetcher     // 5s 行情快照采集器
 	sse     *server.SSEBroker // SSE 广播器（触发时推送 signal 事件）
@@ -65,6 +74,7 @@ type Engine struct {
 }
 
 // New 创建实时触发引擎。
+// （New creates a real-time trigger engine.）
 func New(fetcher *data.Fetcher, sse *server.SSEBroker, cfg Config) *Engine {
 	if cfg.Sec <= 0 {
 		cfg.Sec = 6
@@ -87,6 +97,7 @@ func New(fetcher *data.Fetcher, sse *server.SSEBroker, cfg Config) *Engine {
 }
 
 // Run 以 5s 间隔消费快照并检测，直到 ctx 取消。
+// （Run consumes snapshots every 5s and runs detection until ctx is cancelled.）
 func (e *Engine) Run(ctx context.Context) {
 	log.Printf("[trigger] 实时触发引擎启动: 窗口%ds 秒涨≥%.3f%% 秒额≥%.0f元 冷却%v",
 		e.cfg.Sec, e.cfg.RaRate, e.cfg.StockAmt, e.cfg.Cooldown)
@@ -106,6 +117,7 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 // check 对快照内所有股票做一次窗口检测。
+// （check runs one window-based detection pass over all stocks in the snapshot.）
 func (e *Engine) check(snap *data.MarketSnapshot) {
 	now := snap.Time
 	for code, si := range snap.Stocks {
@@ -154,6 +166,9 @@ func (e *Engine) check(snap *data.MarketSnapshot) {
 // advance 推进单只股票滑动窗口，返回窗口秒均涨幅/成交额/换手。
 // 首个 tick 或间隔异常（>60s）仅初始化状态，返回 0 表示未触发条件评估。
 // 冷却期内返回 nil 跳过。
+// （advance pushes the sliding window forward for one stock and returns the window's per-second
+// gain/amount/turnover. First tick or an abnormal gap (>60s) just initializes state and returns 0;
+// returning nil means the stock is inside its cooldown.）
 func (e *Engine) advance(code string, si *data.StockInfo, now time.Time) (float64, float64, float64, *tickState) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -198,6 +213,7 @@ func (e *Engine) advance(code string, si *data.StockInfo, now time.Time) (float6
 }
 
 // State 返回当前监控股票数量（调试用）。
+// （State returns the number of monitored stocks (for debugging).）
 func (e *Engine) State() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()

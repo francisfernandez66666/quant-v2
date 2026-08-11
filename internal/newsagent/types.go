@@ -1,4 +1,5 @@
 // Package newsagent 新闻代理：负责新闻获取、Stage0 归因、Stage1 初筛、Stage2 LLM 分析和事件构建。
+// （Package newsagent is the news agent handling fetching, Stage0 attribution, Stage1 screening, Stage2 LLM analysis and event building.）
 package newsagent
 
 import "time"
@@ -6,6 +7,8 @@ import "time"
 // NewsEvent 结构化新闻事件，包含 LLM 分析的级别、方向、相关板块和个股等信息。
 // Score 带符号：正值利好（+0.5 中 / +0.75 强），负值利空（-0.5 中 / -0.75 强），±0.25 弱/中性。
 // Direction 由 Score 符号推导，仅用于展示。
+// （NewsEvent is a structured news event holding LLM-analyzed level, direction, related sectors and stocks.
+// Score is signed: positive bullish, negative bearish; Direction is derived from the sign and is display-only.）
 type NewsEvent struct {
 	Title             string   `json:"title"`                        // 新闻标题
 	Content           string   `json:"content,omitempty"`            // 新闻正文/摘要
@@ -30,6 +33,7 @@ type NewsEvent struct {
 
 // Stage0Result Stage0 分类结果：按标题归因将新闻分为个股/板块/一般三类。
 // 个股新闻：标题包含已知股票名；板块新闻：标题含行业/宏观关键词；一般新闻：其余。
+// （Stage0Result is the Stage0 classification result splitting news into stock/sector/general via title attribution.）
 type Stage0Result struct {
 	StockIdx   []int // 个股新闻索引（标题含股票名）
 	SectorIdx  []int // 板块/宏观新闻索引（含行业关键词）
@@ -38,15 +42,19 @@ type Stage0Result struct {
 
 	// Material 板块新闻是否通过价值初筛（Stage1 职责合并进 Stage0 单次调用）。
 	// 键为 rawNews 索引。
+	// （Material marks whether sector news passed the value screen; keys are rawNews indices.）
 	Material map[int]bool
 	// CorrectedTitle 标题党校正：LLM 判定标题与正文不符时给出的校正标题。
 	// 键为 rawNews 索引。
+	// （CorrectedTitle is the clickbait-corrected title given by LLM when title diverges from body; keys are rawNews indices.）
 	CorrectedTitle map[int]string
 	// Err Stage0 失败的底层原因（如 LLM 连不通导致整批归一般）。成功或无异常时为 nil。
+	// （Err is the underlying failure cause of Stage0, nil on success.）
 	Err error
 }
 
 // DebugInfo LLM 调试信息，记录 Stage1/Stage2 处理过程和中间数据。
+// （DebugInfo is LLM debug info recording the Stage1/Stage2 processing and intermediate data.）
 type DebugInfo struct {
 	Stage1Mode    string      `json:"stage1_mode"`    // "llm" / "keyword"：Stage1 使用的初筛方式
 	RawCount      int         `json:"raw_count"`      // total raw titles：原始标题总数
@@ -58,6 +66,7 @@ type DebugInfo struct {
 }
 
 // TrackerData 新闻追踪器数据，存储已处理的标题与各来源同步时间，避免重复处理。
+// （TrackerData stores already-seen titles and per-source sync times to avoid duplicate processing.）
 type TrackerData struct {
 	SeenTitles map[string]string `json:"seen_titles"` // md5(title) → datetime：已处理标题及其时间
 	LastSync   map[string]string `json:"last_sync"`   // source → latest_datetime：各来源最近同步时间
@@ -66,6 +75,8 @@ type TrackerData struct {
 // FrozenEvent 固化事件：保留 Stage2 分析出的利好/利空价值及其关联个股，跨盘前刷新持续存在。
 // 自产生交易日保留，顺延一个交易日；期间若同板块+同方向出现新事件则整体覆盖（分数取最新），
 // 否则在下一交易日保存时到期清除。
+// （FrozenEvent is a frozen event preserving the Stage2 bullish/bearish value and related stocks across
+// pre-session refreshes. It lives for its trading day plus one; new same-sector/same-direction events overwrite it.）
 type FrozenEvent struct {
 	NewsEvent        // 内嵌原始事件（Title/Score/Direction/RelatedStocks/CleanedStocks/Sectors 等）
 	Day       string `json:"day"` // 固化产生交易日（YYYY-MM-DD），用于跨日到期判断
@@ -73,6 +84,7 @@ type FrozenEvent struct {
 }
 
 // frozenDB 固化事件本地持久化结构（frozen_events.json）。
+// （frozenDB is the local persistence shape for frozen events (frozen_events.json).）
 type frozenDB struct {
 	TradingDay string        `json:"trading_day"` // 最近写入的交易日（用于跨日归档/清理）
 	Events     []FrozenEvent `json:"events"`      // 当前固化的利好/利空事件列表

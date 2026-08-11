@@ -1,4 +1,6 @@
 // Package config 提供配置管理：加载/保存 JSON 配置文件，支持策略、风控、板块、LLM 等配置。
+// （Package config provides configuration management: loading/saving a JSON config file,
+// covering strategy, risk control, sector, LLM and other settings.）
 package config
 
 import (
@@ -8,6 +10,7 @@ import (
 )
 
 // LaodengConfig Laodeng 评分系统配置。
+// （LaodengConfig is the configuration for the Laodeng scoring system.）
 type LaodengConfig struct {
 	Enabled      bool    `json:"enabled"`        // 是否启用 Laodeng 评分修正
 	MarketCapMin float64 `json:"market_cap_min"` // 最低流通市值（亿）
@@ -18,6 +21,7 @@ type LaodengConfig struct {
 }
 
 // Rules 顶层规则配置，包含情绪周期、策略、板块、风控等完整配置。
+// （Rules is the top-level rules config aggregating emotion cycle, strategy, sector, risk control, etc.）
 type Rules struct {
 	Emotion    EmotionConfig    `json:"emotion_cycle"` // 情绪周期阶段阈值
 	Strategy   StrategyConfig   `json:"strategy"`      // 各策略参数
@@ -32,6 +36,8 @@ type Rules struct {
 
 // EmotionConfig 情绪周期六个阶段（冰点/启动/发酵/高潮/背离/退潮）的判定阈值。
 // 各阶段由涨停家数、炸板率、连板高度等市场情绪指标的上下限共同判定。
+// （EmotionConfig holds thresholds for the six emotion-cycle stages (ice/start/ferment/climax/
+// divergence/retreat), jointly determined by bounds on limit-up count, open-board rate, etc.）
 type EmotionConfig struct {
 	EmoIceBoardMax        int     `json:"emo_ice_board_max"`        // 冰点期：涨停家数上限
 	EmoIceLimitupMax      int     `json:"emo_ice_limitup_max"`      // 冰点期：连板高度上限
@@ -64,6 +70,8 @@ type EmotionConfig struct {
 
 // MainSectorConfig 主线板块识别配置：涨停家数、成交量排名、涨幅等阈值。
 // Bull/Shock 两套阈值分别对应牛市强势行情与震荡行情的板块强度判定。
+// （MainSectorConfig configures main-sector identification via limit-up count, volume rank, gain
+// thresholds, etc.; Bull/Shock presets match strong bull vs. choppy sideways markets.）
 type MainSectorConfig struct {
 	MainSectorLimitupBull  int               `json:"main_sector_limitup_bull"`   // 牛市：板块涨停家数下限
 	MainSectorVolrankBull  int               `json:"main_sector_volrank_bull"`   // 牛市：板块成交量排名阈值
@@ -76,6 +84,7 @@ type MainSectorConfig struct {
 }
 
 // LLMConfig LLM 客户端连接配置。
+// （LLMConfig is the LLM client connection configuration.）
 type LLMConfig struct {
 	APIURL     string `json:"api_url"`     // LLM API 地址
 	Model      string `json:"model"`       // 模型名称
@@ -89,6 +98,7 @@ type LLMConfig struct {
 }
 
 // StreamingEnabled 返回流式响应是否启用：未显式配置（nil）时默认开启。
+// （StreamingEnabled reports whether streaming is enabled; nil (unset) means enabled by default.）
 func (c *LLMConfig) StreamingEnabled() bool {
 	if c == nil || c.Stream == nil {
 		return true
@@ -97,6 +107,7 @@ func (c *LLMConfig) StreamingEnabled() bool {
 }
 
 // TradeTimeConfig 交易时段参数（HHMM 整数格式）。
+// （TradeTimeConfig holds trading-session parameters in HHMM integer format.）
 type TradeTimeConfig struct {
 	FullOpen       int `json:"full_open"`       // 完整开盘时间（默认 915）
 	AfternoonStart int `json:"afternoon_start"` // 下午开盘时间（默认 1300）
@@ -104,23 +115,27 @@ type TradeTimeConfig struct {
 }
 
 // ThemeConfig 主题白名单和黑名单。
+// （ThemeConfig is the theme watch-list and black-list configuration.）
 type ThemeConfig struct {
 	WatchList []string `json:"watch_list"` // 关注主题列表
 	BlackList []string `json:"black_list"` // 排除主题黑名单
 }
 
 // DrawdownRule 回撤规则：触发阈值时执行对应操作。
+// （DrawdownRule defines a drawdown rule: when the threshold is hit, the action fires.）
 type DrawdownRule struct {
 	Pct    float64 `json:"pct"`    // 回撤百分比阈值
 	Action string  `json:"action"` // 触发操作（如 "减仓"/"清仓"）
 }
 
 // ComplianceConfig 合规配置。
+// （ComplianceConfig is the compliance configuration.）
 type ComplianceConfig struct {
 	ComplianceMode bool `json:"compliance_mode"` // 是否启用合规模式
 }
 
 // RiskCtrlConfig 风控配置：止损规则、合规模式、组合回撤限制等。
+// （RiskCtrlConfig is the risk-control config: stop-loss rules, compliance mode, portfolio drawdown cap, etc.）
 type RiskCtrlConfig struct {
 	StopLoss               StopLossConfig   `json:"stop_loss"`                 // 止损规则
 	Compliance             ComplianceConfig `json:"compliance"`                // 合规模式
@@ -130,16 +145,19 @@ type RiskCtrlConfig struct {
 }
 
 // StopLossConfig 止损配置：买入后回撤阶梯规则。
+// （StopLossConfig holds stop-loss rules as a ladder of post-buy drawdown thresholds.）
 type StopLossConfig struct {
 	DrawdownAfterBuy []DrawdownRule `json:"drawdown_after_buy"` // 买入后回撤阶梯规则
 }
 
 // PositionConfig 总仓位上限配置。
+// （PositionConfig caps the total portfolio position.）
 type PositionConfig struct {
 	MaxTotalPositionPct float64 `json:"max_total_position_pct"` // 最大总仓位比例
 }
 
 // StrategyConfig 各策略的独立参数配置。
+// （StrategyConfig holds the per-strategy parameter configuration.）
 type StrategyConfig struct {
 	Dragon       DragonConfig       `json:"dragon"`        // 龙头战法配置
 	DoubleBump   DoubleBumpConfig   `json:"double_bump"`   // 双响炮战法配置
@@ -149,6 +167,7 @@ type StrategyConfig struct {
 }
 
 // MomentumConfig 动量分权重配置（默认 量价40 + MACD30 + 走势30，合计≤100）。
+// （MomentumConfig defines momentum-score weights; defaults: price-volume 40 + MACD 30 + trend 30, total ≤ 100.）
 type MomentumConfig struct {
 	VolumePriceWeight float64 `json:"volume_price_weight"` // 量价分权重（0~100）
 	MACDWeight        float64 `json:"macd_weight"`         // MACD分权重（0~100）
@@ -157,6 +176,7 @@ type MomentumConfig struct {
 }
 
 // DragonConfig 龙头战法参数：多因子权重、回撤止盈止损阈值、买入条件等。
+// （DragonConfig tunes the dragon-leader strategy: multi-factor weights, drawdown/take-profit/stop-loss thresholds, buy conditions.）
 type DragonConfig struct {
 	F1SealWeight           float64 `json:"f1_seal_weight"`             // F1 封单强度权重
 	F2ResonanceWeight      float64 `json:"f2_resonance_weight"`        // F2 板块共振权重
@@ -174,6 +194,7 @@ type DragonConfig struct {
 }
 
 // DoubleBumpConfig 双响炮战法参数：一突/二突放量倍数、调整周期、仓位比例等。
+// （DoubleBumpConfig tunes the double-bump strategy: first/second breakout volume multiples, adjustment window, position ratios.）
 type DoubleBumpConfig struct {
 	FirstBreakVolumeMultiple  float64 `json:"first_break_volume_multiple"`  // 一突放量倍数阈值
 	SecondBreakVolumeMultiple float64 `json:"second_break_volume_multiple"` // 二突放量倍数阈值
@@ -195,6 +216,7 @@ type DoubleBumpConfig struct {
 }
 
 // NShapeConfig N 形战法参数：D1~D4 评分阈值、旗形整理区间、突破量比等。
+// （NShapeConfig tunes the N-shape strategy: D1-D4 score thresholds, flag-consolidation window, breakout volume ratios.）
 type NShapeConfig struct {
 	NPatternScoreThreshold  float64 `json:"n_pattern_score_threshold"`    // N 形形态总分阈值
 	NShapeD1Threshold       float64 `json:"n_shape_D1_threshold"`         // D1 拉升幅度阈值
@@ -218,6 +240,7 @@ type NShapeConfig struct {
 }
 
 // DragonReturnConfig 龙回头战法参数：回调幅度、量缩比、止盈止损、持仓天数等。
+// （DragonReturnConfig tunes the dragon-return strategy: pullback depth, volume-shrink ratio, take-profit/stop-loss, hold days.）
 type DragonReturnConfig struct {
 	MinPullbackPct     float64 `json:"min_pullback_pct"`     // 最小回调幅度
 	MaxPullbackPct     float64 `json:"max_pullback_pct"`     // 最大回调幅度
@@ -232,6 +255,7 @@ type DragonReturnConfig struct {
 }
 
 // D1Rule D1 事件匹配规则：模式匹配、方向、评分、是否阻断。
+// （D1Rule is an event-matching rule for D1 scoring: pattern, direction, score and block flag.）
 type D1Rule struct {
 	Pattern   string  `json:"pattern"`           // 匹配模式
 	Direction string  `json:"direction"`         // 方向：利好/利空
@@ -240,11 +264,13 @@ type D1Rule struct {
 }
 
 // D1Config D1 事件匹配规则集。
+// （D1Config is the set of D1 event-matching rules.）
 type D1Config struct {
 	Rules []D1Rule `json:"rules"` // D1 规则列表
 }
 
 // Manager 配置管理器，负责 JSON 配置文件的加载、保存和查询。
+// （Manager is the config manager responsible for loading, saving and querying the JSON config file.）
 type Manager struct {
 	Rules *Rules    // 主规则配置
 	D1    *D1Config // D1 事件匹配规则
@@ -252,6 +278,7 @@ type Manager struct {
 }
 
 // NewManager 创建配置管理器，加载指定路径的 JSON 配置文件。
+// （NewManager creates a config manager and loads the JSON config from the given path.）
 func NewManager(path string) *Manager {
 	m := &Manager{
 		Rules: DefaultRules,
@@ -263,42 +290,50 @@ func NewManager(path string) *Manager {
 }
 
 // Get 返回当前规则配置指针。
+// （Get returns a pointer to the current rules config.）
 func (m *Manager) Get() *Rules { return m.Rules }
 
 // GetStrategyConfig 返回策略参数配置。
+// （GetStrategyConfig returns the strategy parameter config.）
 func (m *Manager) GetStrategyConfig() *StrategyConfig {
 	return &m.Rules.Strategy
 }
 
 // SetStrategyConfig 更新策略参数并持久化到文件。
+// （SetStrategyConfig updates the strategy parameters and persists them to the file.）
 func (m *Manager) SetStrategyConfig(cfg *StrategyConfig) {
 	m.Rules.Strategy = *cfg
 	m.Save()
 }
 
 // GetD1Config 返回 D1 事件匹配规则配置。
+// （GetD1Config returns the D1 event-matching rules config.）
 func (m *Manager) GetD1Config() *D1Config {
 	return m.D1
 }
 
 // SetD1Config 更新 D1 规则并持久化到文件。
+// （SetD1Config updates the D1 rules and persists them to the file.）
 func (m *Manager) SetD1Config(cfg *D1Config) {
 	m.D1 = cfg
 	m.Save()
 }
 
 // GetLLMConfig 返回 LLM 客户端配置。
+// （GetLLMConfig returns the LLM client config.）
 func (m *Manager) GetLLMConfig() *LLMConfig {
 	return &m.Rules.LLM
 }
 
 // SetLLMConfig 更新 LLM 配置并持久化到文件。
+// （SetLLMConfig updates the LLM config and persists it to the file.）
 func (m *Manager) SetLLMConfig(cfg *LLMConfig) {
 	m.Rules.LLM = *cfg
 	m.Save()
 }
 
 // Load 从配置文件读取并解析 JSON，更新 Rules 和 D1 配置。
+// （Load reads and parses the JSON config file, updating the Rules and D1 config.）
 func (m *Manager) Load() {
 	data, err := os.ReadFile(m.path)
 	if err != nil {
@@ -322,6 +357,7 @@ func (m *Manager) Load() {
 }
 
 // Save 将当前配置序列化为 JSON 并写入文件。
+// （Save serializes the current config to JSON and writes it to the file.）
 func (m *Manager) Save() {
 	wrapper := struct {
 		Rules *Rules    `json:"rules"`
@@ -343,6 +379,7 @@ func (m *Manager) Save() {
 }
 
 // CalendarEvent 宏观日历事件条目。
+// （CalendarEvent is an entry of a macro-calendar event.）
 type CalendarEvent struct {
 	Date        string `json:"date"`         // 事件日期（YYYY-MM-DD）
 	Title       string `json:"title"`        // 事件标题
@@ -351,18 +388,22 @@ type CalendarEvent struct {
 }
 
 // CalendarConfig 宏观日历配置。
+// （CalendarConfig is the macro-calendar configuration.）
 type CalendarConfig struct {
 	Enabled bool            `json:"enabled"` // 是否启用日历告警
 	Events  []CalendarEvent `json:"events"`  // 事件列表
 }
 
 // DefaultRules 默认交易规则实例（未初始化字段为零值）。
+// （DefaultRules is the default trading-rules instance; unset fields retain zero values.）
 var DefaultRules = &Rules{
 	Strategy: defaultStrategyConfig(),
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。
 // Dragon 权重为 e2e 验证过的 F1~F4 组合；DoubleBump 权重用于总分构成（Volume/Position/MA）。
+// （defaultStrategyConfig returns the factory-default parameters for the four strategies, tunable
+// and persistable from the frontend Settings. Dragon weights are the e2e-verified F1-F4 combo.）
 func defaultStrategyConfig() StrategyConfig {
 	return StrategyConfig{
 		Dragon: DragonConfig{

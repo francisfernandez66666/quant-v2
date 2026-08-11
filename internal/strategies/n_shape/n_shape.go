@@ -15,6 +15,9 @@
 //   - 左侧一突信号（价格突破前高×1.005 且量比≥1.8）提升优先级至至少 P2
 //
 // 前置依赖：需提供 WaveA（昨日波形）、IntradayB（日内快照）、Ctx（板块&情绪上下文）。
+// （English: Implements the intraday "N-shape" ultra-short-term momentum breakout strategy. Scores four dimensions
+// D1 event-gate (40) / D2 relative strength (30) / D3 oversold-pullback (20) / D4 fund confirmation (10); a signal is
+// valid when D1>0 and total ≥60, with priority boosted by time and by a left-side breakout.）
 package n_shape
 
 import (
@@ -23,14 +26,14 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// NShapeStrategy N 形超短策略主结构。
-// 持有配置管理器和左侧评分器，通过 EvaluateWave 执行实时评分。
+// NShapeStrategy N 形超短策略主结构。（NShapeStrategy is the N-shape strategy main struct.）
+// 持有配置管理器和左侧评分器，通过 EvaluateWave 执行实时评分。（Holds the config manager and left-side scorer; scores live via EvaluateWave.）
 type NShapeStrategy struct {
-	cfg    *config.Manager // 策略配置热加载
-	scorer *LeftSideScorer // D1~D4 评分器
+	cfg    *config.Manager // 策略配置热加载（Strategy config hot reload）
+	scorer *LeftSideScorer // D1~D4 评分器（D1~D4 scorer）
 }
 
-// New 创建 N 形策略实例。matcher 用于事件匹配（D1 评分依赖）。
+// New 创建 N 形策略实例。matcher 用于事件匹配（D1 评分依赖）。（New creates an N-shape instance; matcher feeds D1 event matching.）
 func New(cfg *config.Manager, matcher *data.EventMatcher) *NShapeStrategy {
 	return &NShapeStrategy{
 		cfg:    cfg,
@@ -38,39 +41,40 @@ func New(cfg *config.Manager, matcher *data.EventMatcher) *NShapeStrategy {
 	}
 }
 
-// Name 返回策略中文名称"N形超短"。
+// Name 返回策略中文名称"N形超短"。（Name returns the strategy display name "N形超短".）
 func (n *NShapeStrategy) Name() string {
 	return "N形超短"
 }
 
-// Type 返回信号类型标识 SignalNShape。
+// Type 返回信号类型标识 SignalNShape。（Type returns the signal type SignalNShape.）
 func (n *NShapeStrategy) Type() strategy.SignalType {
 	return strategy.SignalNShape
 }
 
-// Evaluate 标准接口（占位）。实际使用 EvaluateWave 传入结构化数据。
+// Evaluate 标准接口（占位）。实际使用 EvaluateWave 传入结构化数据。（Standard interface stub; real scoring uses EvaluateWave.）
 func (n *NShapeStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Pass: false, Level: "nodata", Confidence: 0}, nil
 }
 
-// EvaluateWave 执行 N 形策略核心评分。
+// EvaluateWave 执行 N 形策略核心评分。（EvaluateWave runs the core N-shape scoring.）
 // 输入: wa（昨日波形）、ib（日内快照，含竞价/量能/MACD）、ctx（板块情绪&事件）
 // 输出: Evaluation，包含 D1~D4 各维度分数、总分、是否 full_chain。
 // 评分链路: scorer.Evaluate → D1/D2/D3/D4 → Total → Valid 判断。
+// （Inputs: wa yesterday's wave, ib intraday snapshot, ctx sector/emotion/event context. Pipeline: scorer.Evaluate→D1..D4→Total→Valid.）
 func (n *NShapeStrategy) EvaluateWave(wa *WaveA, ib *IntradayB, ctx *Ctx) (*strategy.Evaluation, error) {
 	sr := n.scorer.Evaluate(wa, ib, ctx)
-	// 评分器返回 nil 表示数据不足或情绪硬闸（"衰退"）拦截
+	// 评分器返回 nil 表示数据不足或情绪硬闸（"衰退"）拦截（Nil from scorer → insufficient data or emotion hard-block "衰退"）
 	if sr == nil {
 		return &strategy.Evaluation{Pass: false, Level: "noscore"}, nil
 	}
 
-	// 仅当 Valid（D1>0 且 总分≥60）时才标记为 full_chain
+	// 仅当 Valid（D1>0 且 总分≥60）时才标记为 full_chain（Mark full_chain only when Valid (D1>0 and total ≥60)）
 	level := "fail"
 	if sr.Valid {
 		level = "full_chain"
 	}
 
-	// 组装 D1~D4 分值与信号标志（供前端各维度展示）
+	// 组装 D1~D4 分值与信号标志（供前端各维度展示）（Assemble D1~D4 scores and signal flags for the frontend）
 	return &strategy.Evaluation{
 		TotalScore: sr.Total,
 		Details: map[string]float64{
@@ -95,17 +99,17 @@ func (n *NShapeStrategy) EvaluateWave(wa *WaveA, ib *IntradayB, ctx *Ctx) (*stra
 	}, nil
 }
 
-// GenerateSignal 将评分结果转化为交易信号。
+// GenerateSignal 将评分结果转化为交易信号。（GenerateSignal converts an evaluation into a trade signal.）
 // full_chain 级别生成 buy 信号，按置信度分 P1/P2/P3；
-// 若左侧一突信号触发则最低 P2。
+// 若左侧一突信号触发则最低 P2。（full_chain→buy tiered by confidence; left-signal floors priority at P2.）
 func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
-	// 默认动作：watch / P3；仅 full_chain 才升级为买入
+	// 默认动作：watch / P3；仅 full_chain 才升级为买入（Default: watch / P3; only full_chain escalates to buy）
 	action := strategy.ActionWatch
 	prio := strategy.P3
 
 	switch eval.Level {
 	case "full_chain":
-		// 完整链确认：按置信度分档 高→P1(≥0.8)、中→P2(≥0.6)、低→P3
+		// 完整链确认：按置信度分档 高→P1(≥0.8)、中→P2(≥0.6)、低→P3（Full-chain: confidence tiers P1(≥0.8)/P2(≥0.6)/P3）
 		action = strategy.ActionBuy
 		if eval.Confidence >= 0.8 {
 			prio = strategy.P1
@@ -115,24 +119,24 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 			prio = strategy.P3
 		}
 	case "left_signal":
-		// 左侧一突（价格破前高+量比≥1.8，且 D1>0 非情绪硬闸）→ 立即打标买入，至少 P2
+		// 左侧一突（价格破前高+量比≥1.8，且 D1>0 非情绪硬闸）→ 立即打标买入，至少 P2（Left breakout (price>prev-high, vol ratio≥1.8) → immediate buy, at least P2）
 		action = strategy.ActionBuy
 		prio = strategy.P2
 	case "right_signal":
-		// 右侧二突（一突破位→回调→二次放量重破前高）→ 最强确认，P1
+		// 右侧二突（一突破位→回调→二次放量重破前高）→ 最强确认，P1（Right second breakout → strongest confirm, P1）
 		action = strategy.ActionBuy
 		prio = strategy.P1
 	}
 
 	// 一突信号提高优先级: 价格突破前高且量比≥1.8 时，最低提升至 P2
-	// （说明主力已开始攻击，即使置信度不高也应提高关注级别）
+	// （说明主力已开始攻击，即使置信度不高也应提高关注级别）（Left signal boosts priority to at least P2 — the main force has begun attacking）
 	if d, ok := eval.Details["left_signal"]; ok && d > 0 {
 		if prio > strategy.P2 {
 			prio = strategy.P2
 		}
 	}
 
-	// 将评分明细复制进 Meta（前端展示各维度分数）
+	// 将评分明细复制进 Meta（前端展示各维度分数）（Copy score details into Meta for the frontend）
 	meta := make(map[string]float64)
 	for k, v := range eval.Details {
 		meta[k] = v
@@ -148,20 +152,21 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	}, nil
 }
 
-// NPhase N 形日内状态机阶段。
+// NPhase N 形日内状态机阶段。（NPhase is the intraday N-shape state machine.）
 // 跟踪从 idle 到 first_breakout → flag → second_breakout → completed/failed 的完整生命周期。
+// （Tracks the lifecycle idle → first_breakout → flag → second_breakout → completed/failed.）
 type NPhase int
 
 const (
-	NPhaseIdle           NPhase = 0 // 空闲，未检测到首次突破
-	NPhaseFirstBreakout  NPhase = 1 // 第一波突破：价格快速拉高，伴随放量
-	NPhaseFlag           NPhase = 2 // 旗形整理：小幅回调，成交量萎缩
-	NPhaseSecondBreakout NPhase = 3 // 第二波突破：再次放量拉升突破前高
-	NPhaseCompleted      NPhase = 4 // N 形完成：二突破确认后完成形态
-	NPhaseFailed         NPhase = 5 // 形态失败：回调过深或二突破未出现
+	NPhaseIdle           NPhase = 0 // 空闲，未检测到首次突破（Idle: no first breakout yet）
+	NPhaseFirstBreakout  NPhase = 1 // 第一波突破：价格快速拉高，伴随放量（First breakout: fast rally on volume）
+	NPhaseFlag           NPhase = 2 // 旗形整理：小幅回调，成交量萎缩（Flag: shallow pullback, shrinking volume）
+	NPhaseSecondBreakout NPhase = 3 // 第二波突破：再次放量拉升突破前高（Second breakout: scale up past the prior high）
+	NPhaseCompleted      NPhase = 4 // N 形完成：二突破确认后完成形态（Completed: second breakout confirms the N-shape）
+	NPhaseFailed         NPhase = 5 // 形态失败：回调过深或二突破未出现（Failed: pullback too deep or no second breakout）
 )
 
-// remindToInt 将提醒级别文本转为数值（用于前端展示）。
+// remindToInt 将提醒级别文本转为数值（用于前端展示）。（remindToInt maps a remind label to a numeric for frontend display.）
 // strong=3, observe=2, mute=1, 其他=0。
 func remindToInt(l string) float64 {
 	switch l {
@@ -175,7 +180,7 @@ func remindToInt(l string) float64 {
 	return 0
 }
 
-// boolToFloat 布尔转 float64（true→1, false→0），用于 Details map。
+// boolToFloat 布尔转 float64（true→1, false→0），用于 Details map。（boolToFloat converts a bool to 1/0 for Details maps.）
 func boolToFloat(b bool) float64 {
 	if b {
 		return 1
@@ -183,7 +188,7 @@ func boolToFloat(b bool) float64 {
 	return 0
 }
 
-// NPhaseString 将 NPhase 枚举转为可读字符串。
+// NPhaseString 将 NPhase 枚举转为可读字符串。（NPhaseString converts an NPhase to a human-readable string.）
 func NPhaseString(p NPhase) string {
 	switch p {
 	case NPhaseIdle:

@@ -1,4 +1,6 @@
 // Package sector_agent 板块代理：验证新闻归因板块，结合 RPS 排名和成分股评分输出可操作的已验证板块。
+// （Package sector_agent validates news-attributed sectors, combining RPS ranking and constituent-stock
+// scoring to output actionable, verified sectors.）
 package sector_agent
 
 import (
@@ -9,6 +11,8 @@ import (
 )
 
 // VerifiedSector 已验证板块，包含方向、评分、RPS 排名、成分股与板块状态（加强/持续/退潮/反弹）。
+// （VerifiedSector is a verified sector: direction, score, RPS rank, constituent stocks and sector
+// phase (strengthening/sustaining/retreating/bouncing).）
 type VerifiedSector struct {
 	Name       string   `json:"name"`                  // 板块名称
 	Direction  string   `json:"direction"`             // 板块方向（利好/利空）
@@ -28,6 +32,10 @@ type VerifiedSector struct {
 //   - changePct>0 且 资金净流出 → 持续
 //   - changePct<0 且 资金净流出 → 退潮
 //   - changePct<0 且 资金净流入 → 反弹
+//
+// （classifyPhase is the sector phase state machine (ported from the open-source sector_rotation rules):
+// changePct>0 & net inflow → strengthening; changePct>0 & net outflow → sustaining;
+// changePct<0 & net outflow → retreating; changePct<0 & net inflow → bouncing.）
 func classifyPhase(changePct, flow float64) string {
 	switch {
 	case changePct > 0 && flow > 0:
@@ -42,17 +50,21 @@ func classifyPhase(changePct, flow float64) string {
 }
 
 // Agent 板块验证代理，依赖板块扫描器和 RPS 排名系统。
+// （Agent is the sector verification agent, depending on a sector scanner and the RPS ranking system.）
 type Agent struct {
 	scanner *data.SectorScanner // 板块扫描器
 	rps     *data.RPSManager    // RPS 强弱排名管理器
 }
 
 // New 创建板块验证代理实例。
+// （New creates a sector verification agent.）
 func New(scanner *data.SectorScanner, rps *data.RPSManager) *Agent {
 	return &Agent{scanner: scanner, rps: rps}
 }
 
 // FeedRPS 将板块 RPS 数据喂给内部 RPSManager（engine 每轮刷新板块名单时调用）。
+// （FeedRPS feeds sector RPS data into the internal RPSManager; the engine calls it each round it
+// refreshes the sector list.）
 func (a *Agent) FeedRPS(sectors []data.SectorRPS) {
 	if a.rps != nil && len(sectors) > 0 {
 		a.rps.Update(sectors)
@@ -60,6 +72,8 @@ func (a *Agent) FeedRPS(sectors []data.SectorRPS) {
 }
 
 // Verify 验证事件归因板块：补充 RPS 排名、板块状态与成分股评分，返回已验证板块列表。
+// （Verify validates news-attributed sectors: it enriches RPS rank, sector phase and constituent-stock
+// scores, returning the verified sector list.）
 func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 	if len(sectors) == 0 {
 		return nil

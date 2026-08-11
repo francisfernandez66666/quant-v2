@@ -1,4 +1,6 @@
 // Package display 看板数据聚合器：将战法引擎、策略引擎、板块验证等多路数据合并为统一的看板输出。
+// （Package display aggregates dashboard data: it merges outputs from combat, strategy and sector
+// verification into a unified dashboard view.）
 package display
 
 import (
@@ -13,6 +15,7 @@ import (
 )
 
 // DashboardData 看板数据，汇总所有模块的最新结果用于前端展示。
+// （DashboardData is the dashboard payload aggregating the latest results of all modules for the frontend.）
 type DashboardData struct {
 	NewsEvents   []newsagent.NewsEvent               `json:"news_events"`             // 新闻事件（事件归因产物）
 	HotSectors   []strategy_engine.SectorHot         `json:"hot_sectors"`             // 热点/利好板块
@@ -32,17 +35,22 @@ type DashboardData struct {
 
 // Aggregator 看板数据聚合器，持有最新的 DashboardData 快照。
 // 5min 主循环与近实时打分循环会并发更新快照，内部用 RWMutex 保护。
+// （Aggregator holds the latest DashboardData snapshot. The 5-minute main loop and the near-real-time
+// scoring loop update the snapshot concurrently, guarded by an internal RWMutex.）
 type Aggregator struct {
 	mu      sync.RWMutex   // 保护 current 快照的读写锁
 	current *DashboardData // 当前看板数据快照
 }
 
 // New 创建看板数据聚合器。
+// （New creates a dashboard data aggregator.）
 func New() *Aggregator {
 	return &Aggregator{}
 }
 
 // Update 更新看板数据：聚合策略结果、板块验证、做多/做空/提醒信号，完成冲突裁决后生成最终信号。
+// （Update refreshes the dashboard: it aggregates strategy results, sector verification and
+// bull/bear/alert signals, then runs conflict resolution to produce the final signals.）
 func (a *Aggregator) Update(
 	result *strategy_engine.StrategyResult,
 	verifiedBull, verifiedBear []sector_agent.VerifiedSector,
@@ -75,6 +83,8 @@ func (a *Aggregator) Update(
 
 // UpdateFast 近实时打分循环专用更新：只刷新 Scores 并把近实时信号并入最终信号，
 // 保留主循环产生的新闻/板块/验证数据不动（并发安全）。
+// （UpdateFast is for the near-real-time scoring loop: it only refreshes Scores and merges
+// fast signals into the final list, leaving main-loop news/sector/verification data intact (thread-safe).）
 func (a *Aggregator) UpdateFast(scores map[string]combat_agent.StockScores, fastSignals []combat_agent.Signal, rpt *report.Report) *DashboardData {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -107,6 +117,7 @@ func (a *Aggregator) UpdateFast(scores map[string]combat_agent.StockScores, fast
 }
 
 // Current 返回当前看板数据快照。
+// （Current returns the current dashboard data snapshot.）
 func (a *Aggregator) Current() *DashboardData {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -117,6 +128,9 @@ func (a *Aggregator) Current() *DashboardData {
 // 被 blocked 的股票直接排除，相同股票取最新生成的信号。
 // 止盈/止损等提醒信号（alerts）不并入最终信号——它们只走 AlertSignals 通道
 // （消息中心/SSE 提醒），避免在"策略信号"列表里被误渲染成带评分的交易信号。
+// （resolveConflict resolves signal conflicts: it merges bull/bear signals, dedups by confidence and
+// keeps the newest per code; blocked stocks are excluded. Alert (take-profit/stop-loss) signals are
+// NOT merged into final signals—they only flow through the AlertSignals channel (message center/SSE).）
 func resolveConflict(bull, bear, alerts []combat_agent.Signal, blocked map[string]bool) []combat_agent.Signal {
 	// 做多 + 做空 全量并入；提醒信号不进入最终信号
 	all := append(bull, bear...)

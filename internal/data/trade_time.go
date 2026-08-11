@@ -221,6 +221,16 @@ func CurrentSession(now time.Time) MarketSession {
 	}
 }
 
+// BeforeOpenTrade 判断当前时刻是否处于开盘（默认 9:30）之前。
+// 非交易日返回 true（此时同样不应产生基于实盘数据的交易信号）。
+// 用于盘前压制战法信号：只更新评分，不发布买入/watch 信号。
+func BeforeOpenTrade(now time.Time) bool {
+	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
+		return true
+	}
+	return now.Hour()*100+now.Minute() < 930
+}
+
 // NextTradeOpen 返回距离下一个交易时段开盘的等待时长。
 func NextTradeOpen(now time.Time) time.Duration {
 	for i := 0; i < 7; i++ {

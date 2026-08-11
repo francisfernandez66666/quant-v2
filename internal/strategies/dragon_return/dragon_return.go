@@ -32,6 +32,9 @@
 // 仓位管理：信号级别对应不同建仓比例，加速信号可用更高仓位。
 // 止损：5%（StopLossPct）；止盈 Target1 = 成本×1.0，Target2 = 成本×1.25
 // 持仓上限：8 天（MaxHoldDays），跌破移动止损线（8%）强制平仓。
+// （English: Implements the "Dragon Return" mid-line strategy — buy the second leg of a former sector leader after its
+// first surge (35~70%) pulls back on shrinking volume (15~25%, 5–8 days). Four-factor scoring (DragonID / PullbackHealth
+// / DuckHead / Confirm) maps totals to none/first/main/accelerate signals; stop-loss 5%, take-profits at 1.0×/1.25× cost.）
 package dragon_return
 
 import (
@@ -41,34 +44,34 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// DragonReturnStrategy 龙回头战法策略结构。
-// 通过四因子评分识别龙头股回调后的二波启动机会。
+// DragonReturnStrategy 龙回头战法策略结构。（DragonReturnStrategy is the Dragon Return strategy struct.）
+// 通过四因子评分识别龙头股回调后的二波启动机会。（Identifies post-pullback second-leg starts of leaders via four factors.）
 type DragonReturnStrategy struct {
-	cfg *config.Manager // 配置管理器
+	cfg *config.Manager // 配置管理器（Config manager）
 }
 
-// Params 龙回头策略参数。
+// Params 龙回头策略参数。（Params are the Dragon Return tunable parameters.）
 // 包含首轮涨幅范围、回调幅度/天数/缩量比阈值、评分权重、止损止盈参数。
-// 可通过 config/rules.json 覆盖默认值。
+// 可通过 config/rules.json 覆盖默认值。（First-rise range, pullback depth/days/shrink thresholds, weights, stop/take-profit; overridable in config/rules.json.）
 type Params struct {
-	FirstRiseMin        float64 // 首轮最小涨幅（默认 0.35=35%）
-	FirstRiseMax        float64 // 首轮最大涨幅（默认 0.70=70%）
-	PullbackOptimalLow  float64 // 回调深度最优下限（默认 0.15=15%）
-	PullbackOptimalHigh float64 // 回调深度最优上限（默认 0.25=25%）
-	PullbackDaysMin     int     // 最少回调天数（默认 5 天）
-	PullbackDaysMax     int     // 最多回调天数（默认 8 天）
-	VolumeRatioGood     float64 // 缩量比优秀阈值（默认 0.3=30%）
-	ScoreThreshold      float64 // 评分通过阈值（默认 60）
-	MainPositionScore   float64 // 主升信号阈值（默认 75）
-	AccelerateScore     float64 // 加速信号阈值（默认 85）
-	StopLossPct         float64 // 止损百分比（默认 0.05=5%）
-	Target1Multiplier   float64 // 目标价1倍数（默认 1.0，即成本价平推）
-	Target2Multiplier   float64 // 目标价2倍数（默认 1.25）
-	TrailingDrawback    float64 // 移动止损回撤幅度（默认 0.08=8%）
-	MaxHoldDays         int     // 最长持仓天数（默认 8 天）
+	FirstRiseMin        float64 // 首轮最小涨幅（默认 0.35=35%）（Min first-leg rise, default 0.35 = 35%）
+	FirstRiseMax        float64 // 首轮最大涨幅（默认 0.70=70%）（Max first-leg rise, default 0.70 = 70%）
+	PullbackOptimalLow  float64 // 回调深度最优下限（默认 0.15=15%）（Optimal pullback depth lower bound, default 0.15）
+	PullbackOptimalHigh float64 // 回调深度最优上限（默认 0.25=25%）（Optimal pullback depth upper bound, default 0.25）
+	PullbackDaysMin     int     // 最少回调天数（默认 5 天）（Min pullback days, default 5）
+	PullbackDaysMax     int     // 最多回调天数（默认 8 天）（Max pullback days, default 8）
+	VolumeRatioGood     float64 // 缩量比优秀阈值（默认 0.3=30%）（Good volume-shrink threshold, default 0.3）
+	ScoreThreshold      float64 // 评分通过阈值（默认 60）（Pass threshold, default 60）
+	MainPositionScore   float64 // 主升信号阈值（默认 75）（Main-signal threshold, default 75）
+	AccelerateScore     float64 // 加速信号阈值（默认 85）（Accelerate-signal threshold, default 85）
+	StopLossPct         float64 // 止损百分比（默认 0.05=5%）（Stop-loss %, default 0.05）
+	Target1Multiplier   float64 // 目标价1倍数（默认 1.0，即成本价平推）（Take-profit 1 multiplier, default 1.0 = cost）
+	Target2Multiplier   float64 // 目标价2倍数（默认 1.25）（Take-profit 2 multiplier, default 1.25）
+	TrailingDrawback    float64 // 移动止损回撤幅度（默认 0.08=8%）（Trailing-stop drawdown, default 0.08）
+	MaxHoldDays         int     // 最长持仓天数（默认 8 天）（Max holding days, default 8）
 }
 
-// DefaultParams 返回龙回头策略默认参数。
+// DefaultParams 返回龙回头策略默认参数。（DefaultParams returns the default Dragon Return parameters.）
 func DefaultParams() Params {
 	return Params{
 		FirstRiseMin:        0.35,
@@ -89,52 +92,53 @@ func DefaultParams() Params {
 	}
 }
 
-// New 创建龙回头战法策略实例。
+// New 创建龙回头战法策略实例。（New creates a Dragon Return strategy instance.）
 func New(cfg *config.Manager) *DragonReturnStrategy {
 	return &DragonReturnStrategy{cfg: cfg}
 }
 
-// Name 返回策略标识名称"dragon_return"。
+// Name 返回策略标识名称"dragon_return"。（Name returns the strategy identifier "dragon_return".）
 func (d *DragonReturnStrategy) Name() string { return "dragon_return" }
 
-// Type 返回信号类型标识。
+// Type 返回信号类型标识。（Type returns the signal type identifier.）
 func (d *DragonReturnStrategy) Type() strategy.SignalType { return "dragon_return" }
 
-// StockData 龙回头策略的输入数据结构。
-// 由外部数据源（Tushare/行情API）填充后传入 Evaluate 执行评分。
+// StockData 龙回头策略的输入数据结构。（StockData is the Dragon Return scoring input.）
+// 由外部数据源（Tushare/行情API）填充后传入 Evaluate 执行评分。（Filled by external sources (Tushare/quote API) before scoring.）
 type StockData struct {
-	Code         string  // 股票代码
-	Name         string  // 股票名称
-	CurrentPrice float64 // 当前价格
-	FirstRisePct float64 // 首轮涨幅（从启动到最高点的涨幅比例）
-	PullbackPct  float64 // 回调幅度（从最高点到当前的回调比例）
-	PullbackDays int     // 回调天数（从最高点至今的交易日数）
-	VolumeRatio  float64 // 缩量比（回调期间日均量 / 主升期间日均量）
-	MA5          float64 // 5日移动平均线
-	MA10         float64 // 10日移动平均线
-	MA20         float64 // 20日移动平均线
-	MACDGreen    float64 // MACD 绿柱长度（负数表示绿柱，绝对值越小越接近金叉）
-	HighestPrice float64 // 阶段最高价（首轮拉升高点）
-	PreviousHigh float64 // 前高（更早的阻力位）
-	IsSectorTop2 bool    // 是否板块内排名前2（龙头属性）
-	SectorRPS20  float64 // 板块20日相对强弱指标 RPS（需≥75）
-	SectorRPS60  float64 // 板块60日相对强弱指标 RPS
-	HasRiseFirst bool    // 板块内是否最先涨停（辨识度指标）
+	Code         string  // 股票代码（Stock code）
+	Name         string  // 股票名称（Stock name）
+	CurrentPrice float64 // 当前价格（Current price）
+	FirstRisePct float64 // 首轮涨幅（从启动到最高点的涨幅比例）（First-leg gain ratio, launch to peak）
+	PullbackPct  float64 // 回调幅度（从最高点到当前的回调比例）（Pullback depth from peak to now）
+	PullbackDays int     // 回调天数（从最高点至今的交易日数）（Pullback days from peak to now）
+	VolumeRatio  float64 // 缩量比（回调期间日均量 / 主升期间日均量）（Volume ratio: pullback avg volume / rally avg volume）
+	MA5          float64 // 5日移动平均线（5-day moving average）
+	MA10         float64 // 10日移动平均线（10-day moving average）
+	MA20         float64 // 20日移动平均线（20-day moving average）
+	MACDGreen    float64 // MACD 绿柱长度（负数表示绿柱，绝对值越小越接近金叉）（MACD green-bar length; smaller abs ≈ closer to golden cross）
+	HighestPrice float64 // 阶段最高价（首轮拉升高点）（Stage high price, first-leg peak）
+	PreviousHigh float64 // 前高（更早的阻力位）（Previous swing high, earlier resistance）
+	IsSectorTop2 bool    // 是否板块内排名前2（龙头属性）（Whether ranked top-2 in sector, leader attribute）
+	SectorRPS20  float64 // 板块20日相对强弱指标 RPS（需≥75）（Sector 20-day RPS, needs ≥75）
+	SectorRPS60  float64 // 板块60日相对强弱指标 RPS（Sector 60-day RPS）
+	HasRiseFirst bool    // 板块内是否最先涨停（辨识度指标）（Whether first to limit-up in sector, recognition flag）
 }
 
-// ScoreResult 四因子评分结果。
+// ScoreResult 四因子评分结果。（ScoreResult holds the four-factor scoring outputs.）
 type ScoreResult struct {
-	Total          float64 // 总分（子项之和，最大85）
-	DragonID       float64 // 龙性识别（0~25）
-	PullbackHealth float64 // 回调健康度（0~21）
-	DuckHead       float64 // 鸭头形态（0~25）
-	Confirm        float64 // 确认信号（0~14）
-	Signal         string  // 信号级别（none/first/main/accelerate）
+	Total          float64 // 总分（子项之和，最大85）（Total score, sum of factors, max 85）
+	DragonID       float64 // 龙性识别（0~25）（Dragon identity, 0~25）
+	PullbackHealth float64 // 回调健康度（0~21）（Pullback health, 0~21）
+	DuckHead       float64 // 鸭头形态（0~25）（Duck-head formation, 0~25）
+	Confirm        float64 // 确认信号（0~14）（Confirmation signal, 0~14）
+	Signal         string  // 信号级别（none/first/main/accelerate）（Signal level: none/first/main/accelerate）
 }
 
-// Evaluate 执行龙回头评分。
+// Evaluate 执行龙回头评分。（Evaluate runs the Dragon Return scoring.）
 // 输入 data 必须为 *StockData 类型；类型不符或为空时返回 Pass=false 的空结果。
 // 输出 Evaluation：按总分分档为 none/first/main/accelerate 四级信号级别。
+// （Input data must be *StockData; otherwise returns an empty Pass=false result. Maps total to none/first/main/accelerate.）
 func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	sd, ok := data.(*StockData)
 	if !ok || sd == nil {
@@ -142,10 +146,10 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 	}
 
 	sr := d.score(sd)
-	// 通过判定：总分 ≥ 60（ScoreThreshold）
+	// 通过判定：总分 ≥ 60（ScoreThreshold）（Pass: total ≥ 60 (ScoreThreshold)）
 	pass := sr.Total >= 60
 
-	// 信号级别分档：≥85 加速 / ≥75 主升 / ≥60 首次 / 其余不操作
+	// 信号级别分档：≥85 加速 / ≥75 主升 / ≥60 首次 / 其余不操作（Signal tiers: ≥85 accelerate / ≥75 main / ≥60 first / else none）
 	level := "none"
 	if sr.Total >= 85 {
 		level = "accelerate"
@@ -154,10 +158,10 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 	} else if sr.Total >= 60 {
 		level = "first"
 	}
-	// 置信度 = 总分 / 100（满分 100 口径）
+	// 置信度 = 总分 / 100（满分 100 口径）（Confidence = total / 100 on a 100-point scale）
 	confidence := sr.Total / 100.0
 
-	// 组装结果：总分 + 四因子明细 + 原始输入指标（供前端/复盘展示）
+	// 组装结果：总分 + 四因子明细 + 原始输入指标（供前端/复盘展示）（Assemble total + four factors + raw inputs for display/review）
 	return &strategy.Evaluation{
 		TotalScore: sr.Total,
 		Pass:       pass,
@@ -179,13 +183,13 @@ func (d *DragonReturnStrategy) Evaluate(code string, data interface{}) (*strateg
 	}, nil
 }
 
-// score 执行四因子加权评分。
-// 权重分配: 龙性 25% + 回调健康 30% + 鸭头 25% + 确认 20%
-// 龙性未通过（<25 分）时直接跳过后续评分。
+// score 执行四因子加权评分。（score runs the four-factor weighted scoring.）
+// 权重分配: 龙性 25% + 回调健康 30% + 鸭头 25% + 确认 20%（Weights: DragonID 25% + PullbackHealth 30% + DuckHead 25% + Confirm 20%.）
+// 龙性未通过（<25 分）时直接跳过后续评分。（Skips the remaining factors when DragonID < 25.）
 func (d *DragonReturnStrategy) score(sd *StockData) ScoreResult {
 	var sr ScoreResult
 
-	// 龙性识别是硬性前置条件：不达标直接返回（其余因子不再计算）
+	// 龙性识别是硬性前置条件：不达标直接返回（其余因子不再计算）（Dragon identity is a hard precondition: return early if unmet）
 	sr.DragonID = d.dragonIdentity(sd)
 	if sr.DragonID < 25 {
 		return sr
@@ -197,7 +201,7 @@ func (d *DragonReturnStrategy) score(sd *StockData) ScoreResult {
 
 	sr.Total = sr.DragonID + sr.PullbackHealth + sr.DuckHead + sr.Confirm
 
-	// 依据总分映射信号级别
+	// 依据总分映射信号级别（Map signal level from the total score）
 	sr.Signal = "none"
 	if sr.Total >= 85 {
 		sr.Signal = "accelerate"
@@ -210,13 +214,13 @@ func (d *DragonReturnStrategy) score(sd *StockData) ScoreResult {
 	return sr
 }
 
-// dragonIdentity 龙性识别（权重 25%，满分 25）。
+// dragonIdentity 龙性识别（权重 25%，满分 25）。（dragonIdentity scores the leader identity, 25% weight, max 25.）
 // 硬性条件（全部满足才可继续评分）：
 //  1. 板块前 2 名（IsSectorTop2）
 //  2. 首轮涨幅 35%~70%（排除涨幅不足或过高的标的）
 //  3. 板块 RPS20 ≥ 75（板块相对强度达标）
 //
-// 全部满足返回 25 分，否则返回 0。
+// 全部满足返回 25 分，否则返回 0。（Hard conditions: sector top-2, first-leg rise 35~70%, RPS20 ≥ 75 — all met returns 25, else 0.）
 func (d *DragonReturnStrategy) dragonIdentity(sd *StockData) float64 {
 	if !sd.IsSectorTop2 {
 		return 0
@@ -230,7 +234,7 @@ func (d *DragonReturnStrategy) dragonIdentity(sd *StockData) float64 {
 	return 25
 }
 
-// pullbackHealth 回调健康度评分（权重 30%，满分 21~30）。
+// pullbackHealth 回调健康度评分（权重 30%，满分 21~30）。（pullbackHealth scores pullback health, 30% weight, max 21~30.）
 //
 // 三子维度之和：
 //
@@ -256,6 +260,8 @@ func (d *DragonReturnStrategy) dragonIdentity(sd *StockData) float64 {
 //	40~50%:   5分（一般）
 //	50~60%:   3分（较差，抛压未衰竭）
 //	≥60%:     1分（差，缩量不明显）
+//
+// （English: sums three sub-scores — pullback depth 0~8, pullback days 0~5, volume-shrink 0~8.）
 func (d *DragonReturnStrategy) pullbackHealth(sd *StockData) float64 {
 	score := 0.0
 	pct := sd.PullbackPct
@@ -298,7 +304,7 @@ func (d *DragonReturnStrategy) pullbackHealth(sd *StockData) float64 {
 	return score
 }
 
-// duckHead 鸭头形态评分（权重 25%，满分 25）。
+// duckHead 鸭头形态评分（权重 25%，满分 25）。（duckHead scores the duck-head formation, 25% weight, max 25.）
 //
 // 鸭头形态由四部分组成，模拟鸭子头部的形状：
 //
@@ -319,17 +325,20 @@ func (d *DragonReturnStrategy) pullbackHealth(sd *StockData) float64 {
 // ④ 鸭鼻孔（5分）：MA5 < MA10 但 MA5 > MA20（均线粘合待发散）。
 //
 //	均线粘合是变盘前兆，发散方向决定二波启动。
+//
+// （English: four parts — duck-head top (5) on MA5<MA10 with shrink, duck neck (8) on MA20 support, duck beak (7) on MA5
+// cross + MACD green-bar contraction + moderate volume, duck nostril (5) on MA5>MA20 squeeze zone.）
 func (d *DragonReturnStrategy) duckHead(sd *StockData) float64 {
 	score := 0.0
 
-	// 鸭头顶 (5分): MA5<MA10 且缩量
+	// 鸭头顶 (5分): MA5<MA10 且缩量（Duck head (5): MA5<MA10 with volume shrink）
 	if sd.MA5 < sd.MA10 && sd.VolumeRatio < 0.5 {
 		score += 5
 	} else if sd.MA5 < sd.MA10 {
 		score += 2
 	}
 
-	// 鸭颈部 (8分): 股价在 MA20 附近获得支撑
+	// 鸭颈部 (8分): 股价在 MA20 附近获得支撑（Duck neck (8): price supported near MA20）
 	if sd.MA20 > 0 && sd.MA5 < sd.MA20 && sd.CurrentPrice >= sd.MA20*0.98 {
 		ma10Slope := (sd.MA10 - sd.MA10*0.99) / (sd.MA10 * 0.01)
 		if sd.MA10 > sd.MA5 {
@@ -337,13 +346,13 @@ func (d *DragonReturnStrategy) duckHead(sd *StockData) float64 {
 		} else {
 			score += 5
 		}
-		// MA10 斜率加分：斜率 > 0.5 额外加 2 分
+		// MA10 斜率加分：斜率 > 0.5 额外加 2 分（MA10 slope bonus: slope > 0.5 adds 2 points）
 		if ma10Slope > 0.5 {
 			score += 2
 		}
 	}
 
-	// 鸭嘴部 (7分): 三条件综合
+	// 鸭嘴部 (7分): 三条件综合（Duck beak (7): weighted by the three sub-conditions）
 	duckBeakScore := 0
 	if sd.MA5 > sd.MA10 {
 		duckBeakScore++
@@ -365,7 +374,7 @@ func (d *DragonReturnStrategy) duckHead(sd *StockData) float64 {
 		score += 2
 	}
 
-	// 鸭鼻孔 (5分): 均线粘合区
+	// 鸭鼻孔 (5分): 均线粘合区（Duck nostril (5): MA squeeze zone）
 	if sd.MA5 < sd.MA10 && sd.MA5 > sd.MA20 {
 		score += 5
 	} else if sd.MA5 <= sd.MA20 && sd.MA5 > sd.MA20*0.98 {
@@ -375,7 +384,7 @@ func (d *DragonReturnStrategy) duckHead(sd *StockData) float64 {
 	return score
 }
 
-// confirmSignal 确认信号评分（权重 20%，满分 14）。
+// confirmSignal 确认信号评分（权重 20%，满分 14）。（confirmSignal scores the confirmation signal, 20% weight, max 14.）
 //
 // ① 量能确认（7分）：量比 1.2~1.5 → 7分（温和放量，资金有序流入）；
 //
@@ -385,17 +394,19 @@ func (d *DragonReturnStrategy) duckHead(sd *StockData) float64 {
 //
 //	同时 > MA10 → 再加 2分（短期多头排列确认）；
 //	股价在 MA5 附近（0.98~1.00）×MA5 → 2分（企稳但未突破）。
+//
+// （English: volume confirm (7) on 1.2~1.5 volume ratio, and K-line confirm (7) on holding above MA5 / crossing MA10.）
 func (d *DragonReturnStrategy) confirmSignal(sd *StockData) float64 {
 	score := 0.0
 
-	// 量能确认 (7分)
+	// 量能确认 (7分)（Volume confirmation, 7 points）
 	if sd.VolumeRatio >= 1.2 && sd.VolumeRatio <= 1.5 {
 		score += 7
 	} else if sd.VolumeRatio > 0.8 && sd.VolumeRatio < 1.2 {
 		score += 3
 	}
 
-	// K线形态用当前价相对于均线的位置近似 (7分)
+	// K线形态用当前价相对于均线的位置近似 (7分)（K-line confirm approximated by price vs. MA position, 7 points）
 	if sd.CurrentPrice > sd.MA5 && sd.CurrentPrice > sd.MA5*1.03 {
 		score += 5
 		if sd.CurrentPrice > sd.MA5 && sd.CurrentPrice > sd.MA10 {
@@ -408,18 +419,18 @@ func (d *DragonReturnStrategy) confirmSignal(sd *StockData) float64 {
 	return score
 }
 
-// GenerateSignal 将评分结果转化为交易信号。
-// 总分 ≥85 → accelerate（P1 买入）
-// 总分 ≥75 → main（P2 买入）
-// 总分 ≥60 → first（P3_5 买入）
-// <60 不生成信号。
+// GenerateSignal 将评分结果转化为交易信号。（GenerateSignal converts an evaluation into a trade signal.）
+// 总分 ≥85 → accelerate（P1 买入）（Total ≥85 → accelerate (P1 buy).）
+// 总分 ≥75 → main（P2 买入）（Total ≥75 → main (P2 buy).）
+// 总分 ≥60 → first（P3_5 买入）（Total ≥60 → first (P3_5 buy).）
+// <60 不生成信号。（<60 produces no signal.）
 func (d *DragonReturnStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
-	// 未通过评分（总分<60）直接返回 nil，不产生信号
+	// 未通过评分（总分<60）直接返回 nil，不产生信号（Not passing (<60) → no signal）
 	if !eval.Pass {
 		return nil, nil
 	}
 
-	// 默认仅观察；按总分档位逐步升级为买入信号并提高优先级
+	// 默认仅观察；按总分档位逐步升级为买入信号并提高优先级（Default watch; escalate to buy and raise priority by total tier）
 	action := strategy.ActionWatch
 	priority := strategy.P3
 

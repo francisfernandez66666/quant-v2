@@ -1,4 +1,5 @@
 // Package llm 支持 OpenAI 兼容协议的 NLP 分析与热点标记封装。
+// （Package llm wraps NLP analysis and hot-topic tagging over an OpenAI-compatible protocol.）
 package llm
 
 import (
@@ -17,6 +18,7 @@ import (
 )
 
 // Client LLM API 客户端，封装与 SiliconFlow 对话接口的通信。
+// （Client is the LLM API client wrapping communication with the SiliconFlow chat interface.）
 type Client struct {
 	httpClient  *http.Client  // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
 	apiKey      string        // API 密钥（Authorization: Bearer）
@@ -27,18 +29,24 @@ type Client struct {
 }
 
 // DefaultModel 未显式指定模型时的默认模型。
+// （DefaultModel is the fallback model when none is explicitly specified.）
 const DefaultModel = "THUDM/GLM-Z1-9B-0414"
 
 // DefaultTimeout 未显式指定超时时的默认单次请求超时（慢 LLM 响应兜底）。
+// （DefaultTimeout is the default per-request timeout, a safety net for slow LLM responses.）
 const DefaultTimeout = 60 * time.Second
 
 // DefaultStreamIdleTimeout 流式下默认"相邻分片空闲"阈值：超过视为模型卡死。
+// （DefaultStreamIdleTimeout is the default idle threshold between adjacent stream chunks; exceeding
+// it means the model is considered stuck.）
 const DefaultStreamIdleTimeout = 60 * time.Second
 
 // Timeout 返回客户端单次请求超时时间（供配置校验/展示）。
+// （Timeout returns the client's per-request timeout, for config validation/display.）
 func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 
 // New 创建 LLM 客户端。
+// （New creates an LLM client.）
 func New(cfg Config) *Client {
 	// 未指定地址/模型/超时时填充默认值，保证客户端可直接使用
 	if cfg.APIURL == "" {
@@ -76,18 +84,21 @@ func New(cfg Config) *Client {
 }
 
 // Message 对话消息，包含角色和内容。
+// （Message is a chat message with a role and content.）
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
 // ChatRequest 聊天补全请求体。
+// （ChatRequest is the chat-completion request body.）
 type ChatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 }
 
 // ChatResponse 聊天补全响应体。
+// （ChatResponse is the chat-completion response body.）
 type ChatResponse struct {
 	Choices []struct {
 		Message Message `json:"message"`
@@ -99,6 +110,11 @@ type ChatResponse struct {
 // 易被"等待响应头超时"误杀；流式下首个分片秒级到达，CoT 期间持续有 reasoning_content 心跳，
 // 只有真正卡死（相邻分片超过 idleTimeout）才报错。流式解析失败时自动回落到非流式一次性取回。
 // 上游 API 失败/超时返回错误，调用方应据此做好重试或兜底。
+// （Chat sends a chat request to the SiliconFlow API: a system prompt first (role + output format),
+// then the user question. It streams (SSE) by default: reasoning models return the first token quickly
+// in streaming, with reasoning_content heartbeats during CoT; only a real stall (adjacent chunks beyond
+// idleTimeout) errors out. A failed stream parse falls back to a one-shot non-streaming call. Errors on
+// upstream API failure/timeout let callers retry or fall back.）
 func (c *Client) Chat(system, user string) (string, error) {
 	if c.apiKey == "" {
 		return "", fmt.Errorf("LLM_API_KEY not set")
@@ -118,6 +134,11 @@ func (c *Client) Chat(system, user string) (string, error) {
 // messages 为完整消息序列，首条必须是 system（角色+注入数据），后接历史与当前提问。
 // 只透传调用方组装好的消息，不再自动追加 system，避免出现多条/中途 system 导致模型上下文错乱。
 // 与 Chat 一致默认走流式响应，解析失败自动回落到非流式。
+// （ChatMessages calls the LLM with a multi-turn conversation (used by the stock-consultation page).
+// messages is the full sequence, first entry must be system (role + injected data), followed by history
+// and the current question. It only passes through caller-assembled messages—no automatic system is
+// appended—to avoid multi/mid-list system roles corrupting the model context. Like Chat it streams by
+// default and falls back to non-streaming on parse failure.）
 func (c *Client) ChatMessages(messages []Message) (string, error) {
 	if c.apiKey == "" {
 		return "", fmt.Errorf("LLM_API_KEY not set")
@@ -126,6 +147,7 @@ func (c *Client) ChatMessages(messages []Message) (string, error) {
 }
 
 // do 发起单次对话请求：优先流式解析，特定失败场景回落到非流式一次性取回。
+// （do sends one chat request: it prefers streaming, falling back to one-shot non-streaming in specific failures.）
 func (c *Client) do(req ChatRequest) (string, error) {
 	if c.streaming {
 		content, streamErr := c.streamChat(req)
@@ -146,6 +168,7 @@ func (c *Client) do(req ChatRequest) (string, error) {
 }
 
 // chatCompletionRequest 透传给上游的完整请求体（ChatRequest 上叠加流式/长度控制参数）。
+// （chatCompletionRequest is the full request body sent upstream: ChatRequest plus streaming/max-tokens controls.）
 type chatCompletionRequest struct {
 	ChatRequest
 	Stream    bool `json:"stream"`
@@ -155,6 +178,9 @@ type chatCompletionRequest struct {
 // streamChat 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
 // 只累加 delta.content（忽略 reasoning_content 思维链），遇 [DONE] 结束；
 // 相邻分片空闲超过 idleTimeout 判定为卡死返回错误。
+// （streamChat reads the full SSE streaming response and returns the accumulated content. Only
+// delta.content is accumulated (reasoning_content is ignored); [DONE] ends the stream; idle gaps beyond
+// idleTimeout are treated as a stall and return an error.）
 func (c *Client) streamChat(req ChatRequest) (string, error) {
 	body, err := c.post(req, true, 0)
 	if err != nil {
@@ -203,6 +229,7 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 }
 
 // chatCompletionChunk 流式响应单分片（只取需要的字段）。
+// （chatCompletionChunk is a single streaming response chunk, keeping only the needed fields.）
 type chatCompletionChunk struct {
 	Choices []struct {
 		Delta struct {
@@ -212,6 +239,7 @@ type chatCompletionChunk struct {
 }
 
 // nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用）。
+// （nonStreamChat fetches the full response in one non-streaming call (used on fallback/streaming off).）
 func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
 	body, err := c.post(req, false, 4096)
 	if err != nil {
@@ -236,6 +264,10 @@ func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
 // post 构造并发送 chat/completions 请求，返回可读响应体。非 2xx 状态码读响应体构造错误。
 // stream=true 时请求带 stream 参数且不设 max_tokens（避免截断思维链/长输出，靠空闲看门狗防卡死）；
 // 非流式时设 max_tokens 兜底，防超长输出触发上游 504/截断。
+// （post builds and sends the chat/completions request, returning a readable response body. Non-2xx
+// status codes are turned into errors from the response body. With stream=true the request carries the
+// stream flag and no max_tokens (to avoid truncating chain-of-thought/long output; the idle watchdog
+// guards against stalls); non-streaming sets max_tokens as a guard against upstream 504/truncation.）
 func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadCloser, error) {
 	payload := chatCompletionRequest{
 		ChatRequest: req,
@@ -268,6 +300,9 @@ func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadClose
 // consultSystemPrompt 股票咨询多轮对话的系统提示词：设定有独立分析能力的 A 股顾问角色。
 // 定位是"接得住问题的顾问"，不是数据播报员；不写死输出模板，紧扣用户问题灵活作答。
 // 强约束三点：讲人话、只引用注入的实测数据、严禁编造任何术语或数字（含正反示范引导小模型遵守）。
+// （consultSystemPrompt is the system prompt for the multi-turn stock-consultation dialogue: it sets the
+// role of an A-share advisor with independent analysis. It must answer questions directly with plain
+// language, only cite the injected real-time data, and never fabricate any terms or numbers.）
 var consultSystemPrompt = `你是专业的A股股票投资顾问，负责回答用户的股市问题。回答要像和对股票有了解、但听不懂花哨术语的朋友解释一样，把逻辑讲清楚、说人话，让用户听完能明白"到底怎么回事、该怎么办"。
 
 你的信息来源只有两个，除此之外任何内容都不得出现：
@@ -294,9 +329,11 @@ var consultSystemPrompt = `你是专业的A股股票投资顾问，负责回答�
 "集合竞价撤单达2383万"、"美术院特供3连板"、"铜期货主力合约昨收25305"、"主力净流出1.2亿"。这些数字都不在数据里，出现任何一个都算编造。`
 
 // ConsultSystemPrompt 返回股票咨询的角色提示词（供引擎组装唯一 system 消息使用）。
+// （ConsultSystemPrompt returns the consultation role prompt for the engine to build the sole system message.）
 func ConsultSystemPrompt() string { return consultSystemPrompt }
 
 // HotTopic 热点新闻结构化分析结果。
+// （HotTopic is the structured analysis result of a hot news item.）
 type HotTopic struct {
 	Title               string   `json:"title"`                // 新闻标题
 	Level               string   `json:"level"`                // 事件级别：板块 / 个股
@@ -323,6 +360,11 @@ type HotTopic struct {
 // valueChainSection 产业链价值传导推理规则：决定事件归因到产业链上/下游的准确性。
 // 核心机制：国内事件全链同向传导；海外事件先判对抗/合作关系，
 // 合作→同向传导，对抗制裁→上游利好/下游利空；海外自产关键材料=价值确认→利好掌握上游原料供给的国内公司。
+// （valueChainSection contains the industrial-chain value-propagation reasoning rules that determine the
+// accuracy of attributing events to upstream/downstream links: domestic events propagate in the same
+// direction along the whole chain; overseas events are judged on confrontation/cooperation first—
+// cooperation propagates the same direction, confrontation → upstream bullish/downstream bearish; overseas
+// self-production of a key material confirms its value → bullish for domestic upstream suppliers.）
 var valueChainSection = `
 
 产业链价值传导推理（最重要，直接决定归因质量，必须严格执行）：
@@ -348,6 +390,7 @@ var valueChainSection = `
 `
 
 // hotTopicSystemPrompt 单条热点分析的 system 提示词：约束 LLM 输出严格 JSON 格式的评分/归因结果。
+// （hotTopicSystemPrompt is the system prompt for single hot-topic analysis, forcing strict-JSON scoring/attribution output.）
 var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提供的新闻标题进行全方位分析，严格按JSON格式返回。
 
 首先判断事件级别：
@@ -402,6 +445,8 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
 ` + valueChainSection
 
 // batchSystemPrompt 批量热点分析的 system 提示词：从编号列表中筛选实质影响事件并输出 JSON 数组。
+// （batchSystemPrompt is the system prompt for batch hot-topic analysis: filter substantive events from
+// the numbered list and output a JSON array.）
 var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下新闻中筛选出对A股有实质性影响的重大事件（如政策、行业景气、公司重大利好/利空、宏观数据、技术突破等），忽略娱乐、社会、体育、影视、名人八卦、灾难事故等无关新闻。
 
 必须忽略以下噪音类型（score一律输出0）：
@@ -469,11 +514,17 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
 // 推理模型（GLM-Z1-9B）对大批次首 token 极慢，30 条会 240s 超时等不到响应头，
 // 调小到 10 条使单批在超时内完成（与 classifier.go 的 llmBatchSize 保持一致）。
+// （llmBatchSize caps the per-call batch size to avoid timeouts on oversized batches. Reasoning models
+// like GLM-Z1-9B are slow to produce the first token on large batches; shrinking to 10 per call keeps
+// each batch within the timeout (kept in sync with classifier.go's llmBatchSize).）
 const llmBatchSize = 10
 
 // AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批调用并合并结果。
 // 子批失败做隔离：该子批用关键词兜底结果占位（fallbackAnalysis），不 abort 全批，
 // 保证某几个坏子批不会拖垮整批 Stage2（主干继续）。
+// （AnalyzeHotTopicBatch analyzes many news items in batches of llmBatchSize and merges the results.
+// Sub-batch failures are isolated: the failed sub-batch is padded with keyword-fallback results
+// (fallbackAnalysis) instead of aborting the whole batch, so a few bad sub-batches cannot stall all of Stage2.）
 func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 	result := make([]*HotTopic, len(titles))
 	if len(titles) == 0 {
@@ -501,6 +552,9 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
 // analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。
 // API 失败 与 JSON 解析失败 都纳入重试队列（最多5次：2s/4s/8s/16s/30s），
 // 仍失败返回错误；由 AnalyzeHotTopicBatch 做子批隔离（只丢本子批，不影响主干）。
+// （analyzeBatch runs one batch of LLM analysis (internal use, batch size ≤ llmBatchSize). Both API
+// failures and JSON-parse failures enter a retry queue (up to 5 times: 2s/4s/8s/16s/30s); if it still
+// fails it returns an error, and AnalyzeHotTopicBatch isolates the sub-batch (only this sub-batch is lost).）
 func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	// 构建批量请求文本
 	var sb strings.Builder
@@ -618,6 +672,11 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 // 返回:
 //   - *HotTopic: 分析结果（API失败时返回关键词兜底结果，不返回 nil）
 //   - error: API 调用或 JSON 解析的错误（非 nil 表示结果来自 fallback）
+//
+// （AnalyzeHotTopic runs multi-dimensional hot-topic analysis on a news title.
+// Returns:
+//   - *HotTopic: the analysis result (a keyword-fallback result on API failure, never nil)
+//   - error: API call or JSON-parse error (non-nil means the result comes from the fallback)）
 func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s），与批量路径一致
 	const maxAttempts = 5
@@ -663,6 +722,9 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 // Ping 发送最小请求验证 LLM 通道（API Key / 网络 / 上游服务）可用性。
 // 使用极小的非流式请求（max_tokens=1），成功返回 nil；失败返回上游错误。
 // 供启动时序在进入盘前新闻分析前快速探活，尽早暴露 key 失效/断网问题。
+// （Ping sends a minimal request to verify the LLM channel (API key / network / upstream service).
+// It uses a tiny non-streaming request (max_tokens=1); nil on success, otherwise the upstream error.
+// The startup sequence pings before pre-market news analysis to surface key/network issues early.）
 func (c *Client) Ping() error {
 	if c.apiKey == "" {
 		return fmt.Errorf("LLM_API_KEY not set")
@@ -702,6 +764,7 @@ func (c *Client) Ping() error {
 }
 
 // AnalyzeSentiment 简版情感分析（用于快速评分）。
+// （AnalyzeSentiment is a lightweight sentiment analysis for quick scoring.）
 func (c *Client) AnalyzeSentiment(text string) (float64, error) {
 	resp, err := c.Chat(
 		"你是一个A股新闻情感分析师。只输出一个0-1之间的数字，0=极负面，0.5=中性，1=极正面。不要多余文字。",
@@ -719,6 +782,7 @@ func (c *Client) AnalyzeSentiment(text string) (float64, error) {
 }
 
 // AnalyzeNews 兼容旧接口（内部调用新分析）。
+// （AnalyzeNews is a legacy-compatible wrapper that internally calls the new analysis.）
 func (c *Client) AnalyzeNews(text string) (string, error) {
 	ht, err := c.AnalyzeHotTopic(text)
 	if err != nil {
@@ -729,6 +793,7 @@ func (c *Client) AnalyzeNews(text string) (string, error) {
 }
 
 // SentimentScore 旧版情感分数接口（关键词兜底）。
+// （SentimentScore is the legacy sentiment-score interface (keyword fallback).）
 func (c *Client) SentimentScore(text string) (float64, error) {
 	resp, err := c.AnalyzeHotTopic(text)
 	if err != nil {
@@ -742,6 +807,9 @@ func (c *Client) SentimentScore(text string) (float64, error) {
 // 2. 提取 JSON 数组边界（第一个 [ 到最后一个 ]）——有些推理模型（如 GLM-Z1）会在 JSON 前输出思考/推理过程文本。
 // 3. 移除尾部多余的 . , ; 等非法字符——部分模型在 JSON 结尾后随手加上了句号或逗号。
 // 注意：单条分析会正常解析，批量分析也会从整体中正确截取数组部分。
+// （cleanJSON sanitizes the raw LLM output so json.Unmarshal can parse it: (1) strips markdown code
+// fences, (2) extracts the JSON array bounds (first [ to last ]) to drop stray reasoning text some
+// reasoning models emit before the JSON, and (3) trims trailing illegal chars like . , ; .）
 func cleanJSON(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "```json")
@@ -796,6 +864,7 @@ func cleanJSON(s string) string {
 }
 
 // isValidJSONEscape 判断字节是否为合法 JSON 转义字符（反斜杠后的有效转义序列首字符）。
+// （isValidJSONEscape reports whether b is the leading char of a valid JSON escape sequence.）
 func isValidJSONEscape(b byte) bool {
 	switch b {
 	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
@@ -805,9 +874,11 @@ func isValidJSONEscape(b byte) bool {
 }
 
 // plusNumberRe 匹配冒号/逗号/左括号后的 '+' 前缀（数值位置），用于剥离非法 '+'。
+// （plusNumberRe matches a '+' prefix after a colon/comma/left bracket (number positions) to strip illegal '+'.）
 var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
 
 // stage2Row Stage2 批量返回的单行（容错：index 兼容字符串）。
+// （stage2Row is one row of the Stage2 batch response (fault-tolerant: index also accepts strings).）
 type stage2Row struct {
 	Index               flexInt       `json:"index"`
 	Level               string        `json:"level"`
@@ -832,8 +903,12 @@ type stage2Row struct {
 }
 
 // flexInt 兼容 JSON 中整数为数字或字符串（1 / "1"）的解析。
+// （flexInt parses integers that may be numbers or strings in JSON (1 / "1").）
 type flexInt int
 
+// UnmarshalJSON 实现 json.Unmarshaler：数字或字符串（允许 + 前缀/空白）都能解析。
+// （UnmarshalJSON implements json.Unmarshaler, accepting numbers or quoted-strings; parsed to int,
+// defaulting to 0 on parse failure.）
 func (f *flexInt) UnmarshalJSON(b []byte) error {
 	s := strings.TrimSpace(strings.Trim(string(b), `"`))
 	if s == "" {
@@ -850,6 +925,9 @@ func (f *flexInt) UnmarshalJSON(b []byte) error {
 
 // parseHotTopicBatch 两段式解析 Stage2 批量响应：整体数组解析失败 → 逐对象扫描抢救。
 // 单坏对象只丢该条；整体+逐对象都抢救不出才返回错误（触发重试队列）。
+// （parseHotTopicBatch parses the Stage2 batch response in two passes: a whole-array parse, then a
+// per-object salvage scan if that fails. A single bad object only drops that item; an error is returned
+// only if both passes fail (triggering the retry queue).）
 func parseHotTopicBatch(resp string) ([]stage2Row, error) {
 	var raw []stage2Row
 	if err := json.Unmarshal([]byte(resp), &raw); err == nil {
@@ -873,6 +951,8 @@ func parseHotTopicBatch(resp string) ([]stage2Row, error) {
 }
 
 // extractObjects 用花括号配对扫描提取字符串中所有独立 JSON 对象 `{...}`（含嵌套、无视排版）。
+// （extractObjects scans the string with brace-pair matching to extract every standalone JSON object
+// `{...}` (including nested ones, ignoring whitespace/layout).）
 func extractObjects(s string) []string {
 	var objs []string
 	start := -1
@@ -914,14 +994,18 @@ func extractObjects(s string) []string {
 }
 
 // llmEmptyValueRe / llmTrailingJunkRe 与 newsagent 的修复规则同源，修复模型畸形输出。
+// （llmEmptyValueRe / llmTrailingJunkRe share their origin with newsagent's fix rules for malformed model output.）
 var llmEmptyValueRe = regexp.MustCompile(`("(?:[^"\\]|\\.)*"\s*:)\s*[}\]]`)
 var llmTrailingJunkRe = regexp.MustCompile(`"\s*[\)']+\s*([,}\]]|$)`)
 
 // flexibleFloat 兼容 JSON 中字段为数字或字符串（如 "0.75" / "+0.75"）的浮点解析。
 // 部分小模型会把数值输出成带符号字符串，导致标准 json.Unmarshal 失败，这里做容错。
+// （flexibleFloat parses floats that may be numbers or strings in JSON (e.g. "0.75" / "+0.75"). Some
+// small models emit signed string numbers, failing standard json.Unmarshal; this adds tolerance.）
 type flexibleFloat float64
 
 // UnmarshalJSON 实现 json.Unmarshaler：数字或字符串（允许 + 前缀/空白）都能解析。
+// （UnmarshalJSON implements json.Unmarshaler, accepting numbers or strings (allowing a + prefix/whitespace).）
 func (f *flexibleFloat) UnmarshalJSON(b []byte) error {
 	s := strings.TrimSpace(strings.Trim(string(b), `"`))
 	if s == "" {
@@ -940,6 +1024,7 @@ func (f *flexibleFloat) UnmarshalJSON(b []byte) error {
 }
 
 // fallbackAnalysis 关键词兜底分析（LLM 解析失败时使用）。
+// （fallbackAnalysis runs keyword-based fallback analysis, used when the LLM parse fails.）
 func fallbackAnalysis(title string) *HotTopic {
 	ht := &HotTopic{
 		Title:       title,
@@ -1056,6 +1141,7 @@ func fallbackAnalysis(title string) *HotTopic {
 }
 
 // minInt 返回两个整数中的较小值（用于截断日志输出长度）。
+// （minInt returns the smaller of two ints (used to truncate log output length).）
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -1064,6 +1150,7 @@ func minInt(a, b int) int {
 }
 
 // containsAny 判断字符串 s 是否包含 keywords 中的任意一个关键词。
+// （containsAny reports whether s contains any keyword from keywords.）
 func containsAny(s string, keywords []string) bool {
 	for _, kw := range keywords {
 		if strings.Contains(s, kw) {
@@ -1074,6 +1161,7 @@ func containsAny(s string, keywords []string) bool {
 }
 
 // SectorTag 解析后的板块标签，含置信度权重。
+// （SectorTag is a parsed sector tag with a confidence weight.）
 type SectorTag struct {
 	Name       string  // 板块名
 	Confidence float64 // 置信度 0~1（无后缀时=1.0）
@@ -1083,6 +1171,8 @@ type SectorTag struct {
 // 格式1: "固态电池" → {Name:"固态电池", Confidence:1.0}
 // 格式2: "固态电池(0.8)" → {Name:"固态电池", Confidence:0.8}
 // 复合: "半导体(1.0)/芯片(0.7)" → split后分别解析
+// （ParseSectors parses the sectors list returned by the LLM. Format 1: "固态电池" → Confidence 1.0;
+// format 2: "固态电池(0.8)" → Confidence 0.8; compound "半导体(1.0)/芯片(0.7)" → split and parse each.）
 func ParseSectors(sectors []string) []SectorTag {
 	var result []SectorTag
 	re := regexp.MustCompile(`^(.+?)\(([\d.]+)\)$`)
@@ -1116,6 +1206,7 @@ func ParseSectors(sectors []string) []SectorTag {
 
 // StockCodeMap 股票名称→代码硬编码映射。
 // 不依赖 LLM prompt 格式，纯后处理。
+// （StockCodeMap is the hardcoded stock-name-to-code mapping, independent of the LLM prompt format—pure post-processing.）
 var StockCodeMap = map[string]string{
 	// 半导体/芯片
 	"中芯国际": "688981.SH", "北方华创": "002371.SZ", "韦尔股份": "603501.SH",
@@ -1181,6 +1272,9 @@ var StockCodeMap = map[string]string{
 // 每元素先按 "/" split 处理复合格式（LLM 常用 "中芯国际/北方华创/韦尔股份"）。
 // 解析优先级：硬编码表 > 正则提取 (XXXXXX) > 纯6位数字自动补后缀。
 // 返回 (已解析代码列表, 未解析的名称列表)。
+// （ResolveStocks parses the stocks list from the LLM into stock codes. Each element is first split by
+// "/" to handle compound formats (e.g. "中芯国际/北方华创/韦尔股份"). Priority: hardcoded table >
+// regex (XXXXXX) > bare 6-digit code with auto suffix. Returns (resolved codes, unresolved names).）
 func ResolveStocks(stocks []string) (codes []string, unresolved []string) {
 	re := regexp.MustCompile(`[（(]([A-Za-z0-9]{6})[）)]`)
 	seen := make(map[string]bool)
@@ -1229,6 +1323,7 @@ func ResolveStocks(stocks []string) (codes []string, unresolved []string) {
 
 // autoSuffix 根据 A 股代码首位数字自动补交易所后缀：
 // 6/9 开头→上海(.SH)，0/3/2 开头→深圳(.SZ)，4/8 开头→北交所(.BJ)。
+// （autoSuffix appends the exchange suffix by the first digit: 6/9 → .SH, 0/3/2 → .SZ, 4/8 → .BJ.）
 func autoSuffix(code string) string {
 	if len(code) != 6 {
 		return code
@@ -1245,6 +1340,7 @@ func autoSuffix(code string) string {
 }
 
 // isAlphaNumeric 判断字符串是否全部由字母或数字组成。
+// （isAlphaNumeric reports whether s consists only of letters and digits.）
 func isAlphaNumeric(s string) bool {
 	for _, r := range s {
 		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {

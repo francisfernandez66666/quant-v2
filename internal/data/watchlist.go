@@ -1,4 +1,6 @@
 // Package data — 自选股管理。提供自选股列表的增删查和 JSON 持久化。
+// Package data — watchlist management: add/remove/query of a stock watchlist
+// with JSON persistence.
 package data
 
 import (
@@ -9,6 +11,7 @@ import (
 )
 
 // WatchlistManager 自选股管理器，线程安全，持久化到 watchlist.json。
+// WatchlistManager manages the watchlist thread-safely, persisting to watchlist.json.
 type WatchlistManager struct {
 	mu   sync.RWMutex // 读写锁
 	dir  string       // 数据目录
@@ -16,6 +19,7 @@ type WatchlistManager struct {
 }
 
 // NewWatchlistManager 创建自选股管理器并加载已有数据。
+// NewWatchlistManager creates a manager and loads existing data.
 func NewWatchlistManager(dir string) *WatchlistManager {
 	w := &WatchlistManager{dir: dir}
 	w.load()
@@ -23,6 +27,7 @@ func NewWatchlistManager(dir string) *WatchlistManager {
 }
 
 // List 返回自选股列表副本（线程安全）。
+// List returns a thread-safe copy of the watchlist.
 func (w *WatchlistManager) List() []string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -32,6 +37,7 @@ func (w *WatchlistManager) List() []string {
 }
 
 // Add 添加股票到自选列表（去重），返回 true 表示新增成功。
+// Add appends a code (deduplicated); returns true if newly added.
 func (w *WatchlistManager) Add(code string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -46,6 +52,7 @@ func (w *WatchlistManager) Add(code string) bool {
 }
 
 // Remove 从自选列表中移除指定股票，返回 true 表示移除成功。
+// Remove deletes a code from the watchlist; returns true if removed.
 func (w *WatchlistManager) Remove(code string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -60,6 +67,7 @@ func (w *WatchlistManager) Remove(code string) bool {
 }
 
 // load 从 watchlist.json 读取自选股列表。
+// load reads the watchlist from watchlist.json.
 func (w *WatchlistManager) load() {
 	data, err := os.ReadFile(w.dir + "/watchlist.json")
 	if err != nil {
@@ -69,6 +77,7 @@ func (w *WatchlistManager) load() {
 }
 
 // save 将自选股列表写入 watchlist.json。
+// save writes the watchlist to watchlist.json.
 func (w *WatchlistManager) save() {
 	data, _ := json.MarshalIndent(w.list, "", "  ")
 	if err := os.WriteFile(w.dir+"/watchlist.json", data, 0644); err != nil {

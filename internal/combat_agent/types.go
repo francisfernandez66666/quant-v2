@@ -1,6 +1,9 @@
 // Package combat_agent 定义战法引擎的数据结构：扫描输入、信号输出等类型。
 // ScanInput 是三大扫描路径（ScanLong/ScanShort/Scan）与持续打分（ScorePool）的统一入参，
 // Signal 是引擎对外输出的统一信号模型，StockScores 承载 8a/8b 持续打分结果。
+// English: defines the data structures of the combat engine — ScanInput is the unified input of the
+// three scan paths (ScanLong/ScanShort/Scan) and persistent scoring (ScorePool), Signal is the unified
+// output model, and StockScores carries the 8a/8b persistent scoring results.
 package combat_agent
 
 import (
@@ -12,6 +15,7 @@ import (
 )
 
 // NewsBrief 个股关联新闻简报（供预期差检测使用）。
+// English: stock-linked news brief, consumed by expectation-gap detection.
 type NewsBrief struct {
 	Title    string // 新闻标题
 	Positive bool   // 事件方向：true=利好 false=利空
@@ -21,6 +25,9 @@ type NewsBrief struct {
 // ScanInput 战法扫描输入，包含已验证板块、行情数据、D1评分等信息。
 // 由上层 Engine 组装传入；其中 Scores 由 Engine 初始化、扫描过程中被写入，
 // 供 8a/8b 前端展示持续评分。
+// English: scan input for strategies, including verified sectors, market data and D1 scores.
+// Assembled and passed in by the upper Engine; Scores is initialized by Engine and written during
+// scanning to feed the 8a/8b persistent-score display.
 type ScanInput struct {
 	Sectors          []sector_agent.VerifiedSector               // 已验证的板块列表（含方向利好/利空）
 	L1Score          map[string]float64                          // L1 过滤评分结果
@@ -38,6 +45,9 @@ type ScanInput struct {
 // StockScores 单只股票的四战法原始分 + 动量分（8a/8b 持续打分输出）。
 // 无论战法是否通过都记录原始分，前端据此展示自选/持仓的持续评分。
 // JSON 标签供前端按稳定 key 取值展示。
+// English: per-stock raw scores of the four strategies plus momentum score (8a/8b persistent output).
+// Raw scores are recorded regardless of pass/fail for the frontend persistent display; JSON tags expose
+// stable keys.
 type StockScores struct {
 	Code              string          `json:"code"`          // 股票代码
 	NScore            float64         `json:"n_score"`       // N 形战法分（0~100）
@@ -54,6 +64,9 @@ type StockScores struct {
 // Signal 战法引擎输出的信号，包含方向、操作、置信度等信息。
 // 三大来源：战法评分（ScanLong/ScanShort/Scan/ScorePool）、持仓止盈止损提醒、
 // 涨停池增强（龙头识别/预期差）。上层据 Direction/Action 分发处理。
+// English: signal emitted by the engine, carrying direction, action, confidence, etc. Three sources:
+// strategy scoring (ScanLong/ScanShort/Scan/ScorePool), take-profit/stop-loss alerts for positions, and
+// limit-up-pool enhancements (leader detection/expectation gap); routed upstream by Direction/Action.
 type Signal struct {
 	ID          string    `json:"id"`                   // 信号唯一标识
 	Code        string    `json:"code"`                 // 股票代码
@@ -72,6 +85,8 @@ type Signal struct {
 
 // SignalLog 单轮策略信号批次快照，记录该轮产出的全部信号与产出时间。
 // 供前端"信号日志"弹窗按批次（时间分组）展示，用于复盘信号历史。
+// English: snapshot of one round of strategy signals, recording all produced signals and their time;
+// shown per batch (time-grouped) in the frontend "signal log" dialog for historical review.
 type SignalLog struct {
 	ProcessTime time.Time `json:"process_time"` // 信号批次产出时间
 	RawCount    int       `json:"raw_count"`    // 本轮原始新闻条数
@@ -80,6 +95,8 @@ type SignalLog struct {
 
 // NDiag N 形候选诊断条目：记录每只 N 候选的评分与拦截原因，供日志定位"当日为何无 N 信号"。
 // engine 每轮 DrainNDiag 收口后打印一行概要；单只详情可按需展开。
+// English: diagnostic entry for each N-shape candidate, recording score and block reason so logs can
+// explain why no N signal fired; engine prints a one-line summary after draining via DrainNDiag.
 type NDiag struct {
 	Code   string  `json:"code"`             // 股票代码
 	Name   string  `json:"name"`             // 股票名称

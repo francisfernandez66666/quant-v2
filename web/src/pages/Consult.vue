@@ -1,7 +1,9 @@
 <!--
-  股票咨询页面 Consult.vue
+  股票咨询页面 Consult.vue (Stock consultation page)
   多轮 LLM 股票咨询：对话气泡展示 + 输入框发送 + 内联 API Key 配置区
+  Multi-turn LLM stock consultation: chat bubbles + message input + inline API Key config
   对话历史保存在后端（consult_history.json），跨交易日自动清空
+  Conversation history is kept on the backend (consult_history.json) and cleared each trading day
 -->
 <template>
   <div class="consult-page">
@@ -64,41 +66,42 @@
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted } from 'vue' // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子
-import * as api from '../api/index.js' // 后端 API 调用封装（咨询 / 历史 / LLM 配置）
+import { ref, nextTick, onMounted } from 'vue' // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子 (Vue composition API: reactive ref + mount lifecycle hook)
+import * as api from '../api/index.js' // 后端 API 调用封装（咨询 / 历史 / LLM 配置） (backend API wrapper: chat / history / LLM config)
 
-// ── 响应式状态 ──
-const messages = ref([])          // 当日对话历史（user/assistant 消息）
-const draft = ref('')             // 输入框草稿
-const loading = ref(false)        // 是否正在等待 LLM 回复
-const chatBox = ref(null)         // 对话区 DOM 引用（滚动到底部）
-const proMode = ref(false)        // 专业模式开关：开启后注入全部实时行情
-const proModeSaving = ref(false)  // 开关是否正在保存
+// ── 响应式状态 ── (Reactive state)
+const messages = ref([])          // 当日对话历史（user/assistant 消息）(today's conversation history: user/assistant messages)
+const draft = ref('')             // 输入框草稿 (input draft text)
+const loading = ref(false)        // 是否正在等待 LLM 回复 (whether waiting for the LLM reply)
+const chatBox = ref(null)         // 对话区 DOM 引用（滚动到底部）(reference to the chat area DOM for auto-scroll)
+const proMode = ref(false)        // 专业模式开关：开启后注入全部实时行情 (pro mode: injects full realtime market data when on)
+const proModeSaving = ref(false)  // 开关是否正在保存 (whether the toggle is being saved)
 
-// ── LLM 配置区状态 ──
-const llmConfigured = ref(true)   // LLM 是否已配置（未配置时展示内联表单）
-const llmSaving = ref(false)      // 是否正在保存配置
-const llmMsg = ref('')            // 配置保存反馈信息
-const llmMsgType = ref('ok')      // 反馈类型：ok / err
-const cfgApiUrl = ref('')         // API 地址
-const cfgApiKey = ref('')         // API Key
-const cfgModel = ref('')          // 模型名
+// ── LLM 配置区状态 ── (LLM config area state)
+const llmConfigured = ref(true)   // LLM 是否已配置（未配置时展示内联表单）(whether LLM is configured; show inline form when not)
+const llmSaving = ref(false)      // 是否正在保存配置 (whether config saving is in progress)
+const llmMsg = ref('')            // 配置保存反馈信息 (feedback message for config save)
+const llmMsgType = ref('ok')      // 反馈类型：ok / err (feedback type: ok / err)
+const cfgApiUrl = ref('')         // API 地址 (API URL)
+const cfgApiKey = ref('')         // API Key (API Key)
+const cfgModel = ref('')          // 模型名 (model name)
 
-/** 格式化时间为 HH:mm:ss */
+/** 格式化时间为 HH:mm:ss (Format time as HH:mm:ss) */
 function formatTime(t) {
   if (!t) return ''
   const d = new Date(t)
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-/** 滚动对话区到底部 */
+/** 滚动对话区到底部 (Scroll the chat area to the bottom) */
+// 在 DOM 更新后（nextTick）再执行滚动，确保新消息已渲染 (scroll after DOM updates in nextTick so new messages are rendered)
 function scrollToBottom() {
   nextTick(() => {
     if (chatBox.value) chatBox.value.scrollTop = chatBox.value.scrollHeight
   })
 }
 
-/** 加载当日咨询历史 */
+/** 加载当日咨询历史 (Load today's consultation history) */
 async function loadHistory() {
   try {
     const h = await api.fetchConsultHistory()
@@ -107,7 +110,7 @@ async function loadHistory() {
   scrollToBottom()
 }
 
-/** 加载专业模式开关状态 */
+/** 加载专业模式开关状态 (Load the pro mode toggle state) */
 async function loadProMode() {
   try {
     const r = await api.fetchConsultProMode()
@@ -115,14 +118,14 @@ async function loadProMode() {
   } catch (_) {}
 }
 
-/** 切换专业模式开关 */
+/** 切换专业模式开关 (Toggle pro mode) */
 async function onToggleProMode() {
   proModeSaving.value = true
   try {
     const r = await api.setConsultProMode(proMode.value)
     proMode.value = !!(r && r.enabled)
   } catch (e) {
-    // 保存失败回滚开关状态，避免界面与后端不一致
+    // 保存失败回滚开关状态，避免界面与后端不一致 (on failure, revert the toggle so UI stays consistent with the backend)
     proMode.value = !proMode.value
     messages.value.push({ role: 'assistant', content: '⚠️ 专业模式切换失败: ' + (e.message || '未知错误'), time: new Date().toISOString() })
   } finally {
@@ -130,26 +133,28 @@ async function onToggleProMode() {
   }
 }
 
-/** 发送咨询消息 */
+/** 发送咨询消息 (Send a consultation message) */
 async function onSend() {
   const text = draft.value.trim()
   if (!text || loading.value) return
   draft.value = ''
   loading.value = true
-  // 乐观追加用户消息，立即展示
+  // 乐观追加用户消息，立即展示 (optimistically append the user message so it shows immediately)
   messages.value.push({ role: 'user', content: text, time: new Date().toISOString() })
   scrollToBottom()
   try {
     const res = await api.consultChat(text)
-    // 回复成功后追加 AI 消息（后端已持久化完整对话）
+    // 回复成功后追加 AI 消息（后端已持久化完整对话）(append the AI reply on success; the backend already persists the full conversation)
     messages.value.push({ role: 'assistant', content: res.reply, time: new Date().toISOString() })
     if (res.reply && res.reply.includes('未配置')) {
       llmConfigured.value = false
     }
   } catch (e) {
     // 咨询失败（如未配置 LLM / 网络错误 / 盘中限流）：提示并刷新历史回滚
+    // (on failure — e.g. LLM unconfigured / network error / intraday rate limit — show the error message)
     messages.value.push({ role: 'assistant', content: '⚠️ ' + (e.message || '咨询失败'), time: new Date().toISOString() })
     if ((e.message || '').includes('LLM_API_KEY') || (e.message || '').includes('配置')) {
+      // 检测到 LLM 未配置时收起对话并展示配置表单 (when LLM not configured, reveal the config form)
       llmConfigured.value = false
     }
   } finally {
@@ -158,7 +163,7 @@ async function onSend() {
   }
 }
 
-/** 保存 LLM 配置（内联表单） */
+/** 保存 LLM 配置（内联表单） (Save the LLM config from the inline form) */
 async function saveLLM() {
   llmSaving.value = true
   llmMsg.value = ''
@@ -178,7 +183,7 @@ async function saveLLM() {
   llmSaving.value = false
 }
 
-/** 清空当日对话 */
+/** 清空当日对话 (Clear today's conversation) */
 async function onClear() {
   try {
     await api.clearConsultHistory()
@@ -187,8 +192,10 @@ async function onClear() {
 }
 
 // 挂载时先拉取 LLM 配置判断是否已配置，再加载专业模式开关与历史
+// (On mount: fetch LLM config to detect configuration, then load pro mode state and history)
 onMounted(async () => {
   try {
+    // 后端返回配置信息则回填表单并判断是否已配置 (if config returned, backfill the form and decide whether configured)
     const cfg = await api.fetchLLMConfig()
     if (cfg) {
       cfgApiUrl.value = cfg.api_url || ''

@@ -13,6 +13,9 @@ import (
 // analyzeDeep Stage2 全量分析：调用 LLM 对筛选后的新闻深度分析，生成结构化 NewsEvent。
 // LLM 轮询重试（最多3次、递增间隔）仍失败时该批丢弃（返回 nil，不降级关键词兜底）。
 // 后置校正：档位归一 + 中性归零 + datetime 回退。
+// （analyzeDeep is the Stage2 full analysis: LLM deep-analysis of screened news producing structured NewsEvents.
+// On retry exhaustion the batch is dropped (nil, no keyword fallback), with post-processing for tier
+// normalization, neutral zeroing and datetime fallback.）
 func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 	if len(items) == 0 {
 		return nil
@@ -49,6 +52,8 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 // buildChainEvents 把一个 HotTopic 展开为 1~2 个 NewsEvent。
 // 差分（上游方向 ≠ 下游方向，如对抗制裁型上游利好/下游利空）拆为两个方向事件，
 // 使上游/下游各自以正确方向进入监测池与 N 形 D1 评分；同向则合并为单事件。
+// （buildChainEvents expands a HotTopic into 1-2 NewsEvents: differential upstream/downstream directions
+// (e.g. sanction type: upstream bull / downstream bear) split into two events, same direction merges into one.）
 func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 	// 兜底时间：新闻无发布时间时用当前时间
 	dt := item.Datetime
@@ -101,6 +106,7 @@ func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 }
 
 // titleWithDigest 把正文摘要（≤80 字）拼进标题，供 LLM 获取制裁/管制等背景。
+// （titleWithDigest appends a ≤80-run digest of the body into the title for LLM context like sanctions/controls.）
 func titleWithDigest(title, content string) string {
 	if content == "" {
 		return title
@@ -114,6 +120,8 @@ func titleWithDigest(title, content string) string {
 
 // buildChainEvent 按产业链环节组装单个 NewsEvent（上游/下游/全链环节）。
 // chainSectors 为环节板块（上游/下游），为空时回退 primarySectors/ht.Sectors。
+// （buildChainEvent assembles a single NewsEvent per supply-chain stage (upstream/downstream/full).
+// chainSectors override primarySectors/ht.Sectors when non-empty.）
 func buildChainEvent(base NewsEvent, ht *llm.HotTopic, primarySectors, related, chainSectors []string, direction, chain string) NewsEvent {
 	ev := base
 	switch {
@@ -139,6 +147,7 @@ func buildChainEvent(base NewsEvent, ht *llm.HotTopic, primarySectors, related, 
 }
 
 // chainDirection 同向合并事件的统一方向：优先用 ht.Direction，否则由 Score 推导。
+// （chainDirection returns the merged event's direction, preferring ht.Direction then deriving from Score.）
 func chainDirection(ht *llm.HotTopic) string {
 	if ht.Direction != "" && ht.Direction != "中性" {
 		return ht.Direction
@@ -147,6 +156,7 @@ func chainDirection(ht *llm.HotTopic) string {
 }
 
 // chainScore 按环节方向给事件赋带符号强度分（绝对值取自 ht.Score 归一卷）。
+// （chainScore assigns a signed strength score per stage direction from the normalized |ht.Score|.）
 func chainScore(score float64, dir string) float64 {
 	abs := score
 	if abs < 0 {
@@ -165,7 +175,7 @@ func chainScore(score float64, dir string) float64 {
 	}
 }
 
-// mergeStr 合并去重字符串切片。
+// mergeStr 合并去重字符串切片。（mergeStr merges and dedupes string slices.）
 func mergeStr(a, b []string) []string {
 	seen := make(map[string]bool, len(a)+len(b))
 	out := make([]string, 0, len(a)+len(b))
@@ -179,7 +189,7 @@ func mergeStr(a, b []string) []string {
 	return out
 }
 
-// containsStr 判断字符串切片中是否包含指定元素。
+// containsStr 判断字符串切片中是否包含指定元素。（containsStr reports whether the slice contains s.）
 func containsStr(slice []string, s string) bool {
 	for _, v := range slice {
 		if v == s {
@@ -193,6 +203,9 @@ func containsStr(slice []string, s string) bool {
 //   - 档位归一：|score| 归到 {0,0.25,0.5,0.75} 最近档，>0.75 截断为 0.75
 //   - 中性归零（放宽）：仅当方向/情绪为"中性" 且 强度档位为 0（fallback 无方向）
 //     时才归零；对 LLM 明确给出的非零方向分数保留量化档，避免弱事件被误清空。
+//
+// （postProcess normalizes scores to the nearest tier in {0,0.25,0.5,0.75} and zeroes neutral cases only when
+// the tier is 0, preserving explicit non-zero directional scores.）
 func postProcess(ht *llm.HotTopic) {
 	// 取绝对值并截断上限，只处理强度档位
 	s := ht.Score
@@ -227,6 +240,7 @@ func postProcess(ht *llm.HotTopic) {
 }
 
 // directionFromScore 由带符号 Score 推导展示用方向：>0 利好，<0 利空，==0 中性。
+// （directionFromScore derives a display direction from the signed Score: positive bull, negative bear, zero neutral.）
 func directionFromScore(score float64) string {
 	if score > 0 {
 		return "利好"

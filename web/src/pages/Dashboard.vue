@@ -1,6 +1,7 @@
 <!--
-  仪表盘 Dashboard.vue
+  仪表盘 Dashboard.vue (Dashboard page)
   首页概览：信号统计卡片、热门个股快照、宏观/IPO日历、热门板块、资讯、策略信号列表、系统运行状态
+  Home overview: signal stat cards, hot stock snapshot, macro/IPO calendars, hot sectors, news, signals, system status
 -->
 <template>
   <div class="dashboard">
@@ -147,46 +148,46 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子
-import * as api from '../api/index.js'                       // 后端 API 封装：信号/状态/资讯/板块/快照/IPO 等数据接口
-import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）
+import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子 (Vue composition API: ref, computed, mount/unmount hooks)
+import * as api from '../api/index.js'                       // 后端 API 封装：信号/状态/资讯/板块/快照/IPO 等数据接口 (backend API wrapper: signals/status/news/sectors/snapshot/IPO)
+import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）(log modal: LLM batches + signal batches)
 
-// ── 响应式数据 ──
-const signals = ref([])               // 策略信号列表（用于顶部统计卡片）
-const status = ref({})                // 服务端状态
-const newsItems = ref([])             // 资讯+日历事件
-const hotSectors = ref([])            // 热门板块
-const snapshotStocks = ref([])        // 热门个股快照
-const snapshotTime = ref('')          // 快照更新时间
-const ipoCalendar = ref([])           // IPO 日历
-const showLog = ref(false)            // 是否打开日志弹窗
+// ── 响应式数据 ── (Reactive data)
+const signals = ref([])               // 策略信号列表（用于顶部统计卡片）(strategy signals list for the stat cards)
+const status = ref({})                // 服务端状态 (server status)
+const newsItems = ref([])             // 资讯+日历事件 (news + calendar events)
+const hotSectors = ref([])            // 热门板块 (hot sectors)
+const snapshotStocks = ref([])        // 热门个股快照 (hot stock snapshot)
+const snapshotTime = ref('')          // 快照更新时间 (snapshot update time)
+const ipoCalendar = ref([])           // IPO 日历 (IPO calendar)
+const showLog = ref(false)            // 是否打开日志弹窗 (whether the log modal is open)
 
-let timer = null                      // 定时轮询句柄
-let sseUnsub = null                   // SSE 取消订阅函数
+let timer = null                      // 定时轮询句柄 (polling timer handle)
+let sseUnsub = null                   // SSE 取消订阅函数 (SSE unsubscribe function)
 
-// ── 计算属性 ──
-/** 扫描统计字段快捷引用（服务端状态里的 scan_stats 子对象，未返回时兜底为空对象） */
+// ── 计算属性 ── (Computed properties)
+/** 扫描统计字段快捷引用（服务端状态里的 scan_stats 子对象，未返回时兜底为空对象） (Shortcut to scan_stats sub-object in server status; falls back to {} when absent) */
 const scanStats = computed(() => status.value.scan_stats || {})
 
-/** 强信号数量 */
+/** 强信号数量 (Count of strong signals) */
 const strongCount = computed(() => signals.value.filter(s => s.remind_level === 'strong').length)
-/** 观察中信号数量 */
+/** 观察中信号数量 (Count of signals under observation) */
 const observeCount = computed(() => signals.value.filter(s => s.remind_level === 'observe').length)
-/** 静默信号数量 */
+/** 静默信号数量 (Count of muted signals) */
 const muteCount = computed(() => signals.value.filter(s => s.remind_level === 'mute').length)
 
-/** 过滤出宏观日历/政策反制事件（与普通资讯区分） */
+/** 过滤出宏观日历/政策反制事件（与普通资讯区分） (Filter calendar/policy-event items, separate from ordinary news) */
 const calendarEvents = computed(() => newsItems.value.filter(n => n.source === '宏观日历' || n.source === '政策反制'))
 
 /**
- * 计算 IPO 距今日的倒计时文本
- * @param {object} c - IPO 日历项
- * @returns {string} 如 "3天后"、"📌今天"、"5天前"
+ * 计算 IPO 距今日的倒计时文本 (Compute a countdown text from today for an IPO date)
+ * @param {object} c - IPO 日历项 (IPO calendar item)
+ * @returns {string} 如 "3天后"、"📌今天"、"5天前" (e.g. "3 days later" / "today" / "5 days ago")
  */
 function ipoCountdown(c) {
   const ds = c.listing_date || c.ipo_date
   if (!ds) return c.list_status === 'L' ? '已上市' : '即将上市'
-  // 解析 YYYYMMDD 日期并计算与今天的相差天数
+  // 解析 YYYYMMDD 日期并计算与今天的相差天数 (parse YYYYMMDD string and compute day difference from today)
   const t = new Date(+ds.slice(0,4), +ds.slice(4,6)-1, +ds.slice(6,8))
   const diff = Math.ceil((t - Date.now()) / 86400000)
   if (diff > 0) return `${diff}天后`
@@ -196,6 +197,7 @@ function ipoCountdown(c) {
 
 /**
  * 根据告警等级返回对应的 CSS 类名（当前未在模板中直接使用，保留以备扩展）
+ * (Return a CSS class based on alert level; currently unused in the template, kept for future use)
  */
 function alertLevelClass(level) {
   if (level.includes('信号') || level.includes('买入')) return 'tag-strong'
@@ -204,59 +206,59 @@ function alertLevelClass(level) {
   return 'tag-info'
 }
 
-/** 并发加载所有仪表盘数据（6个接口） */
+/** 并发加载所有仪表盘数据（6个接口） (Load all dashboard data concurrently — 6 API endpoints) */
 async function load() {
-  // 并发拉取 6 个数据源，单个失败不阻塞整体
+  // 并发拉取 6 个数据源，单个失败不阻塞整体 (fetch 6 sources in parallel; a single failure does not block the rest)
   const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes] = await Promise.allSettled([
     api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(), api.fetchHotSnapshot(), api.fetchIPOCalendar()
   ])
   if (sigRes.status === 'fulfilled' && Array.isArray(sigRes.value)) {
-    // 写入策略信号列表
+    // 写入策略信号列表 (store the strategy signal list)
     signals.value = sigRes.value
   }
   if (stRes.status === 'fulfilled' && stRes.value) {
-    // 写入服务端状态
+    // 写入服务端状态 (store the server status)
     status.value = stRes.value
   }
   if (newsRes.status === 'fulfilled' && Array.isArray(newsRes.value)) {
-    // 写入资讯与日历事件
+    // 写入资讯与日历事件 (store news and calendar events)
     newsItems.value = newsRes.value
   }
   if (secRes.status === 'fulfilled' && Array.isArray(secRes.value)) {
-    // 写入热门板块
+    // 写入热门板块 (store hot sectors)
     hotSectors.value = secRes.value
   }
   if (snapRes.status === 'fulfilled' && Array.isArray(snapRes.value) && snapRes.value.length) {
-    // 写入热门个股快照并记录更新时间
+    // 写入热门个股快照并记录更新时间 (store the hot stock snapshot and record its update time)
     snapshotStocks.value = snapRes.value
     snapshotTime.value = new Date().toLocaleTimeString()
   }
   if (ipoRes.status === 'fulfilled' && Array.isArray(ipoRes.value)) {
-    // 写入 IPO 日历
+    // 写入 IPO 日历 (store the IPO calendar)
     ipoCalendar.value = ipoRes.value
   }
 }
 
-/** SSE 消息触发重新加载 */
+/** SSE 消息触发重新加载 (Reload all data when an SSE message arrives) */
 function handleSSE(msg) {
   if (msg && typeof msg === 'object') {
-    // 收到 SSE 推送即刷新全部数据
+    // 收到 SSE 推送即刷新全部数据 (refresh everything on any SSE push)
     load()
   }
 }
 
-/** 挂载时首次加载并启动 2 秒定时轮询 + SSE */
+/** 挂载时首次加载并启动 2 秒定时轮询 + SSE (On mount, load once and start 2s polling + SSE) */
 onMounted(() => {
   load()
-  // 每 2 秒轮询刷新一次行情
+  // 每 2 秒轮询刷新一次行情 (poll every 2s to refresh quotes)
   timer = setInterval(load, 2000)
-  // 订阅后端 SSE 事件
+  // 订阅后端 SSE 事件 (subscribe to backend SSE events)
   api.connectSSE()
   sseUnsub = api.onSSE(handleSSE)
 })
-/** 卸载时清理定时器和 SSE 订阅 */
+/** 卸载时清理定时器和 SSE 订阅 (Clean up the timer and SSE subscription on unmount) */
 onUnmounted(() => {
-  // 清理定时器与订阅，避免泄漏
+  // 清理定时器与订阅，避免泄漏 (clear the timer and subscription to avoid leaks)
   if (timer) clearInterval(timer)
   if (sseUnsub) sseUnsub()
 })

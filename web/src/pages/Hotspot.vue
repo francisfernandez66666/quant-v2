@@ -1,6 +1,7 @@
 <!--
-  热点页面 Hotspot.vue
+  热点页面 Hotspot.vue (Hotspot page)
   展示热点板块（含异动原因弹窗）、全市场个股评分排名、宏观日历、IPO日历、热点资讯
+  Shows hot sectors (with reason modal), market-wide stock score rankings, macro calendar, IPO calendar, hot news
 -->
 <template>
   <div class="hotspot-page">
@@ -162,32 +163,32 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子
-import * as api from '../api/index.js'                       // 后端 API 封装：状态/评分/板块轮次/资讯/IPO 等数据接口
-import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）
+import { ref, computed, onMounted, onUnmounted } from 'vue'  // Vue 组合式 API：响应式 ref、计算属性、挂载/卸载生命周期钩子 (Vue composition API: ref, computed, mount/unmount hooks)
+import * as api from '../api/index.js'                       // 后端 API 封装：状态/评分/板块轮次/资讯/IPO 等数据接口 (backend API wrapper: status/scores/sector runs/news/IPO)
+import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）(log modal: LLM batches + signal batches)
 
-// ── 工具函数 ──
+// ── 工具函数 ── (Utility functions)
 
-/** 截取板块异动原因的前半段（第一个逗号前或前18字） */
+/** 截取板块异动原因的前半段（第一个逗号前或前18字） (Shorten a sector move reason: text before the first comma or the first 18 chars) */
 function shortReason(r) {
   if (!r) return ''
-  // 取第一个中文逗号前的摘要，否则截取前 18 字
+  // 取第一个中文逗号前的摘要，否则截取前 18 字 (use text before the first Chinese comma, else truncate to 18 chars)
   const idx = r.indexOf('，')
   return idx > 0 ? r.slice(0, idx) : r.slice(0, 18)
 }
 
-/** 根据评分阈值返回 CSS 类名 */
+/** 根据评分阈值返回 CSS 类名 (Return a CSS class based on score thresholds) */
 function scoreClass(score, pass, strongMin) {
   if (!score || score <= 0) return 'ev-score'
-  // 达强势阈值标红，过门槛标黄
+  // 达强势阈值标红，过门槛标黄 (red when reaching the strong threshold, yellow when just passing)
   if (score >= strongMin) return 'ev-score strong'
   if (pass) return 'ev-score pass'
   return 'ev-score'
 }
 
-/** 根据多维度评分判断行样式 */
+/** 根据多维度评分判断行样式 (Decide the row style based on multi-dimensional scores) */
 function rowClass(e) {
-  // 任一分维度达强势阈值即整行高亮
+  // 任一分维度达强势阈值即整行高亮 (highlight the whole row when any dimension reaches the strong threshold)
   const strong = (e.n_score || 0) >= 80 || (e.dragon_score || 0) >= 80 || (e.db_score || 0) >= 80 || (e.dr_score || 0) >= 80 || (e.m_score || 0) >= 70
   if (strong) return 'ev-row strong'
   const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 70 || (e.db_score || 0) >= 70 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
@@ -195,14 +196,14 @@ function rowClass(e) {
   return 'ev-row'
 }
 
-// ── 排序状态 ──
+// ── 排序状态 ── (Sort state)
 const sortKey = ref('')
 const sortDir = ref(-1)
 
-/** 设置排序列：同列再次点击切换升降序，切换列时默认降序 */
+/** 设置排序列：同列再次点击切换升降序，切换列时默认降序 (Set the sort column; clicking the same column toggles direction, new columns default to descending) */
 function setSort(key) {
   if (sortKey.value === key) {
-    // 同列再次点击时切换升降序
+    // 同列再次点击时切换升降序 (same column clicked again: flip the sort direction)
     sortDir.value *= -1
   } else {
     sortKey.value = key
@@ -210,46 +211,46 @@ function setSort(key) {
   }
 }
 
-/** 返回排序列的箭头指示符：▼ 降序 / ▲ 升序，非排序列返回空串 */
+/** 返回排序列的箭头指示符：▼ 降序 / ▲ 升序，非排序列返回空串 (Arrow indicator: '▼' for descending / '▲' for ascending; empty string for unsorted columns) */
 function sortArrow(key) {
   if (sortKey.value !== key) return ''
   return sortDir.value === -1 ? ' ▼' : ' ▲'
 }
 
-/** 安全取值：字符串为空返回 ''，其余为空返回 0，用于排序比较 */
+/** 安全取值：字符串为空返回 ''，其余为空返回 0，用于排序比较 (Safe getter: '' for empty strings, 0 for other empty values — used in comparisons) */
 function val(e, key) {
   const v = e[key]
   if (typeof v === 'string') return v || ''
   return v || 0
 }
 
-// ── 响应式数据 ──
-const sectors = ref([])           // 热点板块（当前最新轮次）
-const evals = ref([])             // 全市场个股评分
-const news = ref([])              // 资讯 + 日历事件
-const ipoCalendar = ref([])       // IPO 日历
-const reasonTarget = ref(null)    // 当前查看异动原因的板块
-const showLog = ref(false)        // 是否打开日志弹窗
+// ── 响应式数据 ── (Reactive data)
+const sectors = ref([])           // 热点板块（当前最新轮次）(hot sectors from the newest run)
+const evals = ref([])             // 全市场个股评分 (market-wide stock scores)
+const news = ref([])              // 资讯 + 日历事件 (news + calendar events)
+const ipoCalendar = ref([])       // IPO 日历 (IPO calendar)
+const reasonTarget = ref(null)    // 当前查看异动原因的板块 (sector whose move reason is currently shown)
+const showLog = ref(false)        // 是否打开日志弹窗 (whether the log modal is open)
 
-/** 展示板块异动原因弹窗（点击板块卡片触发） */
+/** 展示板块异动原因弹窗（点击板块卡片触发） (Show the sector move-reason modal, triggered by clicking a sector card) */
 function showReason(s) { reasonTarget.value = s }
 
-let timer = null                  // 定时轮询句柄
-let unsubSSE = null               // SSE 取消订阅函数
-let loading = false              // 防并发请求标志
-const reanalyzing = ref(false)   // 手动 LLM 补推进行中标志
+let timer = null                  // 定时轮询句柄 (polling timer handle)
+let unsubSSE = null               // SSE 取消订阅函数 (SSE unsubscribe function)
+let loading = false              // 防并发请求标志 (flag to prevent concurrent loads)
+const reanalyzing = ref(false)   // 手动 LLM 补推进行中标志 (flag: manual LLM reanalysis in progress)
 
-// ── 计算属性 ──
-/** 过滤出非日历的普通资讯 */
+// ── 计算属性 ── (Computed properties)
+/** 过滤出非日历的普通资讯 (Filter out calendar events, keeping ordinary news) */
 const newsItems = computed(() => news.value.filter(n => n.source !== '宏观日历' && n.source !== '政策反制'))
-/** 过滤出宏观日历/政策反制事件 */
+/** 过滤出宏观日历/政策反制事件 (Filter calendar/policy-event items) */
 const calendarEvents = computed(() => news.value.filter(n => n.source === '宏观日历' || n.source === '政策反制'))
 
-/** IPO 倒计时文本 */
+/** IPO 倒计时文本 (IPO countdown text) */
 function ipoCountdown(c) {
   const ds = c.listing_date || c.ipo_date
   if (!ds) return c.list_status === 'L' ? '已上市' : '即将上市'
-  // 解析 YYYYMMDD 日期并计算与今天的相差天数
+  // 解析 YYYYMMDD 日期并计算与今天的相差天数 (parse YYYYMMDD string and compute day difference from today)
   const t = new Date(+ds.slice(0,4), +ds.slice(4,6)-1, +ds.slice(6,8))
   const diff = Math.ceil((t - Date.now()) / 86400000)
   if (diff > 0) return `${diff}天后`
@@ -257,10 +258,10 @@ function ipoCountdown(c) {
   return `${-diff}天前`
 }
 
-/** 全市场最高评分（用于缩放显示） */
+/** 全市场最高评分（用于缩放显示） (Highest score across the whole market, used for scaling the display) */
 const maxScore = computed(() => {
   let m = 0
-  // 遍历所有个股取各维度最高分
+  // 遍历所有个股取各维度最高分 (iterate all stocks to find the max score across any dimension)
   for (const e of evals.value) {
     const t = Math.max(e.n_score || 0, e.dragon_score || 0, e.db_score || 0, e.dr_score || 0, e.m_score || 0)
     if (t > m) m = t
@@ -268,13 +269,13 @@ const maxScore = computed(() => {
   return m || 100
 })
 
-/** 按排序列和方向排序后的评分列表 */
+/** 按排序列和方向排序后的评分列表 (Score list sorted by the active column and direction) */
 const sortedEvals = computed(() => {
   if (!evals.value || !evals.value.length) return []
   const arr = [...evals.value]
   const sk = sortKey.value
   if (!sk) {
-    // 未选排序列时按各维度最高分降序
+    // 未选排序列时按各维度最高分降序 (when no column selected, sort by the highest dimension score descending)
     return arr.sort((a, b) => {
       const sa = Math.max(a.n_score || 0, a.dragon_score || 0, a.db_score || 0, a.dr_score || 0, a.m_score || 0)
       const sb = Math.max(b.n_score || 0, b.dragon_score || 0, b.db_score || 0, b.dr_score || 0, b.m_score || 0)
@@ -282,7 +283,7 @@ const sortedEvals = computed(() => {
     })
   }
   const dir = sortDir.value
-  // 按指定列排序，字符串用 localeCompare
+  // 按指定列排序，字符串用 localeCompare (sort by the given column; strings use localeCompare)
   return arr.sort((a, b) => {
     const va = val(a, sk)
     const vb = val(b, sk)
@@ -291,9 +292,9 @@ const sortedEvals = computed(() => {
   })
 })
 
-// ── 数据加载 ──
+// ── 数据加载 ── (Data loading)
 
-/** 加载板块热点、评分、资讯、IPO 数据（带防并发） */
+/** 加载板块热点、评分、资讯、IPO 数据（带防并发） (Load sector hotspots, scores, news and IPO data with concurrency guard) */
 async function load() {
   if (loading) return
   loading = true
@@ -302,7 +303,7 @@ async function load() {
     api.setLastSession(st.session)
     if (api.isTradingSession(st.session) || !evals.value.length) {
       try {
-        // 交易时段内刷新全市场评分
+        // 交易时段内刷新全市场评分 (refresh market-wide scores during trading hours)
         const e = await api.fetchEvaluations()
         if (e) evals.value = e
       } catch (_) {}
@@ -310,17 +311,17 @@ async function load() {
   } catch (_) {}
   let fromRecords = false
   try {
-    // 加载当日热点板块轮次记录，用于日志弹窗/当前展示
+    // 加载当日热点板块轮次记录，用于日志弹窗/当前展示 (load today's sector-hot run records for the log modal/current display)
     const recs = await api.fetchSectorHotRecords()
     if (Array.isArray(recs) && recs.length) {
-      // 默认展示最新一轮板块快照
+      // 默认展示最新一轮板块快照 (show the newest run's sector snapshot by default)
       sectors.value = recs[0].sectors || []
       fromRecords = true
     }
   } catch (_) {}
   if (!fromRecords) {
     try {
-      // 无轮次记录时直接拉取当前热点板块
+      // 无轮次记录时直接拉取当前热点板块 (when no run records exist, fetch the current hot sectors directly)
       const s = await api.fetchSectorHot()
       if (s) sectors.value = s
     } catch (_) {}
@@ -336,17 +337,17 @@ async function load() {
   loading = false
 }
 
-/** SSE 触发刷新 */
+/** SSE 触发刷新 (Reload on SSE push) */
 function handleSSE() { load() }
 
-/** 手动 LLM 补推：触发后端重跑最近新闻分析，随后刷新资讯列表 */
+/** 手动 LLM 补推：触发后端重跑最近新闻分析，随后刷新资讯列表 (Manual LLM reanalysis: tell the backend to re-run news analysis, then refresh the news list) */
 async function onReanalyze() {
   if (reanalyzing.value) return
   reanalyzing.value = true
   try {
     const res = await api.reanalyzeNews()
     if (res && res.accepted !== false) {
-      // 补推结果记录在后端日志；稍等片刻后刷新资讯展示新事件
+      // 补推结果记录在后端日志；稍等片刻后刷新资讯展示新事件 (results land in backend logs; refresh news shortly after to show new events)
       setTimeout(() => load(), 1500)
     }
   } catch (_) {} finally {
@@ -356,14 +357,14 @@ async function onReanalyze() {
 
 onMounted(() => {
   load()
-  // 每 3 秒轮询一次热点数据
+  // 每 3 秒轮询一次热点数据 (poll hotspot data every 3s)
   timer = setInterval(load, 3000)
-  // 订阅后端 SSE 推送
+  // 订阅后端 SSE 推送 (subscribe to backend SSE push events)
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
 })
 onUnmounted(() => {
-  // 清理定时器与 SSE 订阅
+  // 清理定时器与 SSE 订阅 (clear the timer and SSE subscription)
   if (timer) clearInterval(timer)
   if (unsubSSE) { unsubSSE(); unsubSSE = null }
 })

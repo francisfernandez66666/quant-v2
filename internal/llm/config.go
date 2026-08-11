@@ -1,10 +1,11 @@
-// Package llm 提供大语言模型（LLM）客户端配置与调用功能。
+// Package llm 提供大语言模型（LLM）客户端配置与调用功能。（Package llm provides LLM client configuration and invocation.）
 package llm
 
 import "time"
 
 // Config LLM（大语言模型）客户端配置。
 // 包含 API 密钥、请求地址、模型名称和请求超时。
+// （Config is the LLM client configuration: API key, request URL, model name and per-request timeout.）
 type Config struct {
 	APIKey  string        // API 密钥，用于认证
 	APIURL  string        // API 请求地址（如 https://api.openai.com/v1/chat/completions）
@@ -14,8 +15,10 @@ type Config struct {
 	// Streaming 是否启用流式（SSE）响应。默认开启；推理模型（GLM-Z1 等）在非流式下
 	// 需等整段含思维链生成完毕才返回响应头，易误判"等待响应头超时"。
 	// Streaming=false 时回落到非流式一次性取回，供不支持 SSE 的上游兜底。
+	// （Streaming enables SSE responses, on by default; false falls back to one-shot non-streaming.）
 	Streaming bool
 	// StreamIdleTimeout 流式下"相邻数据分片"的空闲阈值：超过则认为模型卡死（区别于
 	// 仍在思维链输出的心跳），返回错误交由上层走重试队列。<=0 时 New 兜底为 60s。
+	// （StreamIdleTimeout is the idle threshold between stream chunks; exceeding it means the model is stuck.）
 	StreamIdleTimeout time.Duration
 }

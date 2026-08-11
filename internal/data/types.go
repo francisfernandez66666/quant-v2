@@ -1,11 +1,16 @@
 // Package data 提供行情数据获取、多数据源协调、情绪面分析、筹码分析、板块扫描等核心数据能力。
 // 所有行情 API 调用均通过 net/http 直连，不引入第三方行情库。
+// Package data provides core data capabilities: quoting, multi-source coordination,
+// sentiment, chips and sector scanning. All market calls go direct via net/http
+// without third-party market libraries.
 package data
 
 import "time"
 
 // StockInfo 个股实时行情快照。
 // 由多数据源（东方财富 push2、新浪、同花顺）统一填充，缺失字段留零值。
+// StockInfo is a realtime quote snapshot filled uniformly across sources
+// (EastMoney push2, Sina, THS); missing fields remain zero-valued.
 type StockInfo struct {
 	Code      string  `json:"code"`       // 股票代码（如 "600519"）
 	Name      string  `json:"name"`       // 股票名称
@@ -24,6 +29,8 @@ type StockInfo struct {
 
 // KLine K 线数据。
 // Date 为交易日，其余字段含义与 StockInfo 同名字段一致。
+// KLine represents OHLCV data; Date is the trading day and the other fields
+// share the same meaning as their same-named StockInfo fields.
 type KLine struct {
 	Date   time.Time `json:"date"`   // 交易日
 	Open   float64   `json:"open"`   // 开盘价（元）
@@ -35,22 +42,29 @@ type KLine struct {
 }
 
 // KLineClose 提取 K 线收盘价，用于策略指标计算（如 MA、EMA）。
+// KLineClose extracts the closing price, used by strategy indicators (MA/EMA).
 func KLineClose(k KLine) float64 { return k.Close }
 
 // KLineHigh 提取 K 线最高价。
+// KLineHigh extracts the high price.
 func KLineHigh(k KLine) float64 { return k.High }
 
 // KLineLow 提取 K 线最低价。
+// KLineLow extracts the low price.
 func KLineLow(k KLine) float64 { return k.Low }
 
 // KLineOpen 提取 K 线开盘价。
+// KLineOpen extracts the open price.
 func KLineOpen(k KLine) float64 { return k.Open }
 
 // KLineVolume 提取 K 线成交量。
+// KLineVolume extracts the volume.
 func KLineVolume(k KLine) float64 { return k.Volume }
 
 // SectorInfo 板块行情快照。
 // 来源于东方财富行业板块行情列表，包含涨跌幅、涨停家数、资金流向等。
+// SectorInfo is a sector quote snapshot sourced from the EastMoney industry list,
+// including change pct, limit-up count and money flow.
 type SectorInfo struct {
 	Code       string  `json:"code"`                 // 板块代码（BKXXXX）
 	Name       string  `json:"name"`                 // 板块名称（如 "半导体"）
@@ -65,6 +79,8 @@ type SectorInfo struct {
 
 // EmotionData 市场情绪综合数据。
 // 用于六阶段情绪判断（冰点/启动/发酵/高潮/背离/退潮）。
+// EmotionData aggregates market-sentiment data used to judge the six-stage
+// sentiment cycle (freeze/start/ferment/climax/divergence/ebb).
 type EmotionData struct {
 	Stage       string  `json:"stage"`        // 情绪阶段名称："冰点"/"启动"/"发酵"/"高潮"/"背离"/"退潮"
 	LimitupCnt  int     `json:"limitup_cnt"`  // 涨停家数（含新股）
@@ -78,6 +94,8 @@ type EmotionData struct {
 
 // CapitalFlow 资金流向数据。
 // 按超大单/大单/中单/小单分维度统计，来源于东方财富。
+// CapitalFlow is capital-flow data broken down by order size (super-large/large/
+// medium/small), sourced from EastMoney.
 type CapitalFlow struct {
 	Code          string    `json:"code"`            // 股票代码
 	NetInflow     float64   `json:"net_inflow"`      // 主力净流入（元），超大单+大单净流入
@@ -94,6 +112,8 @@ type CapitalFlow struct {
 
 // NewsItem 财经快讯 / 新闻条目。
 // 可来自东方财富快讯、新浪财经、Tushare 新闻等源。
+// NewsItem is a financial flash-news entry, possibly sourced from EastMoney,
+// Sina Finance, Tushare, etc.
 type NewsItem struct {
 	Title          string   `json:"title"`                  // 新闻标题
 	Content        string   `json:"content,omitempty"`      // 正文摘要（可能为空）
@@ -113,6 +133,7 @@ type NewsItem struct {
 }
 
 // IPOEvent 新股日历事件。
+// IPOEvent is an IPO-calendar event (subscription/listing).
 type IPOEvent struct {
 	Code        string  `json:"code"`         // 股票代码（6位）
 	Name        string  `json:"name"`         // 股票名称
@@ -125,6 +146,8 @@ type IPOEvent struct {
 
 // FinancialInfo 个股基本面指标。
 // 用于风控筛选和估值判断，仅包含可量化的关键财务字段。
+// FinancialInfo holds quantifiable fundamentals used for risk screening
+// and valuation judgment.
 type FinancialInfo struct {
 	Code            string  `json:"code"`                   // 股票代码
 	IsST            bool    `json:"is_st"`                  // 是否 ST/*ST 股票

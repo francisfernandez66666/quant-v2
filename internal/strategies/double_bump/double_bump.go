@@ -27,10 +27,13 @@
 //   - total ≥ 50 → brief（半确认），P3_5 观察
 //   - total < 50 → watch，不操作
 //
-// 不适用 30%/80% 仓位限制（按 N 形仓位特殊规则，仅 90% 截断）。
+// 不适用 30%/80% 仓位限制（按 N 形仓位特殊规则，仅 90% 截断）。（English: implements the Double Bump continuation
+// strategy scoring volume / pullback depth / MA, gated by intraday up-session direction, with 70/50 thresholds→
+// full_chain/brief/watch, and only a 90% position ceiling instead of 30%/80% caps.）
 package double_bump
 
 import (
+	"log"
 	"math"
 
 	"quant-trading-v2/internal/config"
@@ -38,33 +41,33 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// DoubleBumpStrategy 双凸战法策略结构。
-// 通过量能/调整深度/均线三维度评分识别双凸突破机会。
+// DoubleBumpStrategy 双凸战法策略结构。（Double Bump strategy struct.）
+// 通过量能/调整深度/均线三维度评分识别双凸突破机会。（Scores double-bump breakouts across volume / depth / MA.）
 type DoubleBumpStrategy struct {
-	cfg *config.Manager // 配置管理器（热加载 DoubleBumpConfig）
+	cfg *config.Manager // 配置管理器（热加载 DoubleBumpConfig）（Config manager, hot-reloads DoubleBumpConfig）
 }
 
-// New 创建双凸战法策略实例。
+// New 创建双凸战法策略实例。（New creates a Double Bump strategy instance.）
 func New(cfg *config.Manager) *DoubleBumpStrategy {
 	return &DoubleBumpStrategy{cfg: cfg}
 }
 
-// Name 返回策略中文名称"双凸战法"。
+// Name 返回策略中文名称"双凸战法"。（Name returns the strategy display name "双凸战法".）
 func (d *DoubleBumpStrategy) Name() string {
 	return "双凸战法"
 }
 
-// Type 返回信号类型标识 SignalDoubleBump。
+// Type 返回信号类型标识 SignalDoubleBump。（Type returns the signal type SignalDoubleBump.）
 func (d *DoubleBumpStrategy) Type() strategy.SignalType {
 	return strategy.SignalDoubleBump
 }
 
-// Evaluate 标准接口（占位）。实际使用 EvaluateReal 传入结构化数据。
+// Evaluate 标准接口（占位）。实际使用 EvaluateReal 传入结构化数据。（Standard interface stub; real scoring uses EvaluateReal.）
 func (d *DoubleBumpStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Pass: false, Level: "nodata", Confidence: 0}, nil
 }
 
-// EvaluateReal 执行双凸战法核心评分。
+// EvaluateReal 执行双凸战法核心评分。（EvaluateReal runs the core Double Bump scoring.）
 //
 // 评分步骤：
 //  1. 计算 20 日均量和均价（lookback ≤ 可用K线数）
@@ -75,14 +78,15 @@ func (d *DoubleBumpStrategy) Evaluate(code string, data interface{}) (*strategy.
 //  6. MA 评分：MA5 > MA10 多头排列 + 收盘 > MA5 确认强势
 //  7. 总分 = volScore + adjustScore + maScore，上限 100
 //
-// 输入: si（个股信息）、kLines（日K线列表，需 ≥10 根）
+// 输入: si（个股信息）、kLines（日K线列表，需 ≥10 根）（Inputs: si stock info; kLines daily bars requiring ≥10.）
 func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []data.KLine) *strategy.Evaluation {
-	// 基础校验：无实时价或 K 线不足 10 根无法评分
+	// 基础校验：无实时价或 K 线不足 10 根无法评分（Guard: require a live price and ≥10 bars to score）
 	if si == nil || si.Price <= 0 || len(kLines) < 10 {
 		return nil
 	}
 	// 今日实时走弱（低开低走）时，双凸第二波确认被打破，不构成做多信号：
-	// 日K最后一根可能是昨日收盘，需用实时涨跌幅抑制当日下跌时的误报。
+	// 日K最后一根可能是昨日收盘，需用实时涨跌幅抑制当日下跌时的误报。（If today is already weak (≤-1.5%),
+	// the second wave confirm is broken — return watch to suppress false signals on falling days.）
 	if si.ChangePct <= -1.5 {
 		return &strategy.Evaluation{
 			TotalScore: 0,
@@ -91,19 +95,20 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 			Confidence: 0,
 		}
 	}
-	// 读取热加载的双凸配置（放量倍数、权重、调整阈值等）
+	// 读取热加载的双凸配置（放量倍数、权重、调整阈值等）（Load the hot-reloaded Double Bump config）
 	cfg := d.cfg.Get()
 	dbc := cfg.Strategy.DoubleBump
 	// 第二波当日方向闸门：双凸的"第二波"必须是向上结构，
 	// 水下/平盘（ChangePct<=MinChangePct，默认0）不能充当"放量上攻波"。
-	// 此时量能分/调整分强制为 0，只剩均线分（≤MAWeight×100，远低于 full_chain 阈值）。
+	// 此时量能分/调整分强制为 0，只剩均线分（≤MAWeight×100，远低于 full_chain 阈值）。（Direction gate: the second
+	// wave must be an up session; otherwise volume/adjust scores are forced to 0 leaving only the MA score.）
 	upSession := si.ChangePct > dbc.MinChangePct
 
-	// 计算回看期内均量和均价（去掉最后一根，作为"第一波"的对比基准）
+	// 计算回看期内均量和均价（去掉最后一根，作为"第一波"的对比基准）（Compute average volume/close in the lookback window, excluding the last bar）
 	avgVol := 0.0
 	avgClose := 0.0
 	n := len(kLines)
-	// 回看窗口最多 20 根且剔除最后一根（避免用当日数据污染基准）
+	// 回看窗口最多 20 根且剔除最后一根（避免用当日数据污染基准）（Cap lookback at 20 and drop the last bar to avoid polluting the baseline）
 	lookback := int(math.Min(float64(n-1), 20))
 	for i := n - lookback - 1; i < n-1; i++ {
 		avgVol += kLines[i].Volume
@@ -112,7 +117,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	avgVol /= float64(lookback)
 	avgClose /= float64(lookback)
 
-	// 检测第一波放量突破（近5日内）：放量上破 5% 即视为第一波启动
+	// 检测第一波放量突破（近5日内）：放量上破 5% 即视为第一波启动（Detect the first breakout within the last 5 bars: close +5% on above-average volume）
 	firstBreak := false
 	firstBreakVol := 0.0
 	for i := n - 5; i < n; i++ {
@@ -126,13 +131,14 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		}
 	}
 
-	// 无第一波突破 → 不构成双凸
+	// 无第一波突破 → 不构成双凸（No first wave → not a Double Bump pattern）
 	if !firstBreak {
 		return nil
 	}
 
 	// 第二波确认：最后一根K线量能 > 均量 × SecondBreakVolumeMultiple
-	// 两波放量说明资金持续介入，趋势健康；但仅当日上行时才计量能分（水下放量=出货/放量下跌）
+	// 两波放量说明资金持续介入，趋势健康；但仅当日上行时才计量能分（水下放量=出货/放量下跌）（Second-wave score: last bar volume
+	// above avg×SecondBreakVolumeMultiple earns full marks, only when the session is up (underwater volume = distribution).）
 	volScore := 0.0
 	if upSession && firstBreakVol > 0 && (func() bool {
 		lastVol := kLines[n-1].Volume
@@ -142,7 +148,8 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 
 	// 调整深度评分：振幅 / 均价 < AdjustVolRatioMax×2 说明调整温和
-	// （调整幅度小意味着抛压可控、筹码锁定良好）；仅当日上行时才计调整分（水下窄幅不算确认）
+	// （调整幅度小意味着抛压可控、筹码锁定良好）；仅当日上行时才计调整分（水下窄幅不算确认）（Adjust-depth score: a narrow
+	// amplitude (< AdjustVolRatioMax×2) means gentle consolidation, counted only on up sessions.）
 	high := kLines[n-1].High
 	low := kLines[n-1].Low
 	adjustDepth := (high - low) / avgClose * 100
@@ -152,7 +159,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 
 	// 均线趋势：MA5 > MA10 为多头排列
-	// 多头排列给 80%，收盘再站稳 MA5 才给满 100%
+	// 多头排列给 80%，收盘再站稳 MA5 才给满 100%（MA trend: bullish alignment MA5>MA10 gives 80%, +100% when close holds above MA5）
 	maScore := 0.0
 	ma5 := movingAvg(kLines, n, 5)
 	ma10 := movingAvg(kLines, n, 10)
@@ -163,7 +170,10 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		}
 	}
 
-	// 总分封顶 100；≥70 → full_chain（买入），≥50 → brief（观察）
+	log.Printf("[double_bump] %s 今日价=%.2f chg=%.2f%% K线n=%d 最后一根日期=%v 量=%.0f 20日均量=%.0f 二突?volScore=%.0f adjustScore=%.0f maScore=%.0f total=%.0f upSession=%v",
+		code, si.Price, si.ChangePct, n, kLines[n-1].Date, kLines[n-1].Volume, avgVol, volScore, adjustScore, maScore, math.Min(volScore+adjustScore+maScore, 100), upSession)
+
+	// 总分封顶 100；≥70 → full_chain（买入），≥50 → brief（观察）（Cap total at 100; ≥70 full_chain (buy), ≥50 brief (watch)）
 	total := math.Min(volScore+adjustScore+maScore, 100)
 	pass := total >= 50
 	level := "watch"
@@ -188,8 +198,8 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 }
 
-// movingAvg 计算移动平均线。
-// 从 K 线列表末尾向前取 period 根收盘价计算均值。
+// movingAvg 计算移动平均线。（movingAvg computes a moving average of closes.）
+// 从 K 线列表末尾向前取 period 根收盘价计算均值。（Averages the last `period` closes of the bar slice.）
 func movingAvg(kLines []data.KLine, n, period int) float64 {
 	if n < period {
 		return kLines[n-1].Close
@@ -201,7 +211,7 @@ func movingAvg(kLines []data.KLine, n, period int) float64 {
 	return sum / float64(period)
 }
 
-// min 返回两个整数中的较小值。
+// min 返回两个整数中的较小值。（min returns the smaller of two ints.）
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -209,11 +219,11 @@ func min(a, b int) int {
 	return b
 }
 
-// GenerateSignal 将评分结果转化为交易信号。
-// full_chain → buy，置信度>0.8 → P1，否则 P2。
-// brief → watch，P3_5。
+// GenerateSignal 将评分结果转化为交易信号。（GenerateSignal converts an evaluation into a trade signal.）
+// full_chain → buy，置信度>0.8 → P1，否则 P2。（full_chain→buy; confidence>0.8→P1 otherwise P2.）
+// brief → watch，P3_5。（brief→watch with priority P3_5.）
 func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
-	// 默认：仅观察（watch / P3）
+	// 默认：仅观察（watch / P3）（Default: watch only with P3）
 	prio := strategy.P3
 	action := strategy.ActionWatch
 
@@ -230,7 +240,7 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 		prio = strategy.P3_5
 	}
 
-	// 复制评分明细到 Meta（供前端展示各维度分数）
+	// 复制评分明细到 Meta（供前端展示各维度分数）（Copy score details into Meta for the frontend）
 	meta := make(map[string]float64)
 	for k, v := range eval.Details {
 		meta[k] = v
@@ -246,24 +256,24 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 	}, nil
 }
 
-// BumpPhase 双凸形态状态机阶段。
-// 跟踪从 first → adjust → second → third 的完整周期。
-// PhaseIDF 表示形态失效（形态破坏）。
+// BumpPhase 双凸形态状态机阶段。（BumpPhase is the Double Bump formation state machine.）
+// 跟踪从 first → adjust → second → third 的完整周期。（Tracks the cycle first → adjust → second → third.）
+// PhaseIDF 表示形态失效（形态破坏）。（PhaseIDF marks an invalidated/broken formation.）
 type BumpPhase int
 
 const (
-	PhaseFirst  BumpPhase = 1  // 第一波突破（首次放量拉升）
-	PhaseAdjust BumpPhase = 2  // 调整阶段（缩量回调，等待第二波）
-	PhaseSecond BumpPhase = 3  // 第二波突破（再次放量拉升，确认双凸）
-	PhaseThird  BumpPhase = 4  // 第三波延伸（强势延续，可能出现第三波）
-	PhaseIDF    BumpPhase = -1 // 形态失效（放量滞涨或破位）
+	PhaseFirst  BumpPhase = 1  // 第一波突破（首次放量拉升）（First breakout: first scaling rally）
+	PhaseAdjust BumpPhase = 2  // 调整阶段（缩量回调，等待第二波）（Adjust: volume-shrunk pullback awaiting second wave）
+	PhaseSecond BumpPhase = 3  // 第二波突破（再次放量拉升，确认双凸）（Second breakout: scaling rally confirming the double bump）
+	PhaseThird  BumpPhase = 4  // 第三波延伸（强势延续，可能出现第三波）（Third wave extension: strong continuation）
+	PhaseIDF    BumpPhase = -1 // 形态失效（放量滞涨或破位）（Formation invalid: high volume stalling or breakdown）
 )
 
-// DetectPhase 检测个股当前所处的双凸形态阶段。
-// 使用最新K线判断：第一波突破 → 第二波突破 → 失效反转。
-// 需要至少 20 根 K 线来计算均线和量能。
+// DetectPhase 检测个股当前所处的双凸形态阶段。（DetectPhase identifies the current Double Bump phase.）
+// 使用最新K线判断：第一波突破 → 第二波突破 → 失效反转。（Uses the latest bar: first→second breakout, else invalidation.）
+// 需要至少 20 根 K 线来计算均线和量能。（Requires ≥20 bars to compute averages.）
 func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpPhase {
-	// K 线不足 20 根时无法计算均量/均线，保守判定为第一波阶段
+	// K 线不足 20 根时无法计算均量/均线，保守判定为第一波阶段（With <20 bars, conservatively assume first wave）
 	if len(kLines) < 20 {
 		return PhaseFirst
 	}
@@ -271,7 +281,7 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 	dbc := cfg.Strategy.DoubleBump
 	n := len(kLines)
 
-	// 计算 20 日均量和均价（不含当日）
+	// 计算 20 日均量和均价（不含当日）（Compute 20-day average volume/close, excluding today）
 	avgVol := 0.0
 	avgClose := 0.0
 	for i := n - 20; i < n-1; i++ {
@@ -281,24 +291,24 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 	avgVol /= 20
 	avgClose /= 20
 
-	// 当日量价特征（用于阶段判定）
+	// 当日量价特征（用于阶段判定）（Today's volume/price features for phase detection）
 	lastVol := kLines[n-1].Volume
 	lastClose := kLines[n-1].Close
-	// 放量突破：收盘上破 5% 且成交量超第一波阈值
+	// 放量突破：收盘上破 5% 且成交量超第一波阈值（Breakout: close +5% on volume above the first-break multiple）
 	isBreakout := lastClose > avgClose*1.05 && lastVol > avgVol*dbc.FirstBreakVolumeMultiple
 
-	// 缩量调整：成交量低于均量 70%（第二波前的蓄势）
+	// 缩量调整：成交量低于均量 70%（第二波前的蓄势）（Shrink: volume below 70% of average, gearing up for the second wave）
 	isShrink := lastVol < avgVol*0.7
 
-	// 形态失效：放量滞涨（量超 1.5 倍但收跌）
+	// 形态失效：放量滞涨（量超 1.5 倍但收跌）（Invalidation: volume >1.5× but closing down）
 	isIDF := lastVol > avgVol*1.5 && lastClose < kLines[n-2].Close
 
-	// 优先判定失效（破坏性事件优先于形态推进）
+	// 优先判定失效（破坏性事件优先于形态推进）（Check invalidation first — destruction beats progression）
 	if isIDF {
 		return PhaseIDF
 	}
 	if isBreakout {
-		// 近 10 日内出现过放量突破 → 本次是第二波；否则是刚启动的第一波
+		// 近 10 日内出现过放量突破 → 本次是第二波；否则是刚启动的第一波（A breakout within the last 10 bars → second wave, else first wave）
 		for i := n - 10; i < n-1; i++ {
 			if i < 0 {
 				continue
@@ -315,21 +325,21 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 	return PhaseFirst
 }
 
-// CheckIDFReturn 检查是否出现形态失效后的反转信号。
+// CheckIDFReturn 检查是否出现形态失效后的反转信号。（CheckIDFReturn detects a reversal signal after invalidation.）
 // 判断逻辑：最近两根K线收涨且成交量放大，之前有超过 3% 的下跌。
-// 用于在 PhaseIDF 失效后捕捉可能的修复反弹买点。
+// 用于在 PhaseIDF 失效后捕捉可能的修复反弹买点。（Two up/expanding-volume bars after a >3% drop → rebound entry after PhaseIDF.）
 func (d *DoubleBumpStrategy) CheckIDFReturn(code string, kLines []data.KLine) bool {
 	if len(kLines) < 5 {
 		return false
 	}
 	n := len(kLines)
 
-	// 条件1：最近两根 K 线均收涨（连续两日阳线确认反转力度）
+	// 条件1：最近两根 K 线均收涨（连续两日阳线确认反转力度）（Condition 1: both last bars close up, confirming reversal force）
 	if kLines[n-1].Close <= kLines[n-2].Close || kLines[n-2].Close <= kLines[n-3].Close {
 		return false
 	}
 
-	// 条件2：最近两根 K 线成交量均放大（大于 20 日均量×1.2，资金回流）
+	// 条件2：最近两根 K 线成交量均放大（大于 20 日均量×1.2，资金回流）（Condition 2: both bars expand volume (>1.2× the 20-day avg), capital returning）
 	avgVol := 0.0
 	for i := n - 20; i < n-2; i++ {
 		if i < 0 {
@@ -337,14 +347,14 @@ func (d *DoubleBumpStrategy) CheckIDFReturn(code string, kLines []data.KLine) bo
 		}
 		avgVol += kLines[i].Volume
 	}
-	// 回看均值分母：最多 18 根（去掉最近两根被比较的K线），不足则按实际可用数
+	// 回看均值分母：最多 18 根（去掉最近两根被比较的K线），不足则按实际可用数（Denominator caps at 18 bars excluding the two compared bars）
 	avgVol /= float64(min(18, n-2))
 
 	if kLines[n-1].Volume < avgVol*1.2 || kLines[n-2].Volume < avgVol*1.2 {
 		return false
 	}
 
-	// 条件3：近期（近 5 日）曾出现单日跌幅 >3% 的深跌（存在超跌修复空间）
+	// 条件3：近期（近 5 日）曾出现单日跌幅 >3% 的深跌（存在超跌修复空间）（Condition 3: a >3% single-day drop in the last 5 days left oversold room）
 	for i := n - 5; i < n-2; i++ {
 		if i < 1 {
 			continue

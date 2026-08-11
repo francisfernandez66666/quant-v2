@@ -1,5 +1,7 @@
 // Package risk 实现风控引擎，提供信号级风控检查（黑名单/合规）、
 // 回撤检测、多信号冲突解决、M8组合兜底以及仓位限制校验。
+// （Package risk implements the risk engine: signal-level checks (blacklist/compliance), drawdown detection,
+// multi-signal conflict resolution, M8 portfolio fallback and position limit validation.）
 package risk
 
 import (
@@ -10,18 +12,19 @@ import (
 	"sort"
 )
 
-// Engine 风控引擎，依赖配置管理器进行各种风控检查。
+// Engine 风控引擎，依赖配置管理器进行各种风控检查。（Engine is the risk engine backed by the config manager.）
 type Engine struct {
 	cfg *config.Manager // 配置管理器（热加载）
 }
 
 // New 创建风控引擎。
 // 参数 cfg: 配置管理器（从 rules.json 读取风控参数）。
+// （New creates a risk engine; cfg is the config manager reading risk params from rules.json.）
 func New(cfg *config.Manager) *Engine {
 	return &Engine{cfg: cfg}
 }
 
-// CheckResult 风控检查结果。
+// CheckResult 风控检查结果。（CheckResult is the outcome of a risk check.）
 type CheckResult struct {
 	Pass     bool              `json:"pass"`     // 是否通过
 	Action   string            `json:"action"`   // 建议动作：pass/block/reduce/sell_all
@@ -34,6 +37,7 @@ type CheckResult struct {
 // 当前检查项：黑名单过滤 + 合规模式检查。
 // 参数 sig: 策略产生的交易信号。
 // 返回检查结果，若 Blocked 为 true 则信号不应被执行。
+// （CheckSignal runs signal-level checks (blacklist + compliance). When Blocked is true the signal must not execute.）
 func (e *Engine) CheckSignal(sig *strategy.Signal) *CheckResult {
 	cfg := e.cfg.Get()
 	rc := cfg.RiskCtrl
@@ -54,6 +58,7 @@ func (e *Engine) CheckSignal(sig *strategy.Signal) *CheckResult {
 // CheckDrawdown 检查单笔持仓的回撤是否触发了指定的止损规则。
 // 参数 entryPrice: 入场价；currentPrice: 当前价；cfg: 回撤规则配置。
 // 若回撤幅度超过规则设定则返回不通过并附带建议动作。
+// （CheckDrawdown checks whether a position's drawdown hits the configured stop rule and returns the suggested action when triggered.）
 func (e *Engine) CheckDrawdown(entryPrice, currentPrice float64, cfg config.DrawdownRule) *CheckResult {
 	// 回撤幅度 = (当前价 - 入场价) / 入场价 * 100，正值盈利、负值亏损
 	drawdown := (currentPrice - entryPrice) / entryPrice * 100
@@ -74,6 +79,8 @@ func (e *Engine) CheckDrawdown(entryPrice, currentPrice float64, cfg config.Draw
 // 排序规则：优先级高（数值小）优先；同级时卖出>买入>持有。
 // 参数 signals: 同一标的的多策略信号列表。
 // 返回优先级最高的信号。
+// （ResolveConflict resolves conflicts among multiple signals for the same stock: higher priority first,
+// then sell>buy>hold at equal priority. Returns the top signal.）
 func (e *Engine) ResolveConflict(signals []strategy.Signal) *strategy.Signal {
 	if len(signals) == 0 {
 		return nil
@@ -96,6 +103,7 @@ func (e *Engine) ResolveConflict(signals []strategy.Signal) *strategy.Signal {
 
 // checkBlacklist 检查股票代码是否在黑名单中。
 // 黑名单中的股票直接被阻断。
+// （checkBlacklist checks if a stock code is in the blacklist; blacklisted stocks are blocked outright.）
 func (e *Engine) checkBlacklist(code string, cfg *config.Rules) bool {
 	for _, item := range cfg.Theme.BlackList {
 		if code == item {
@@ -107,6 +115,7 @@ func (e *Engine) checkBlacklist(code string, cfg *config.Rules) bool {
 
 // checkCompliance 检查合规模式是否开启。
 // 合规模式下直接放行（实际合规限制由外部系统执行）。
+// （checkCompliance returns pass when compliance mode is on; actual limits are enforced externally.）
 func (e *Engine) checkCompliance(cc config.ComplianceConfig) *CheckResult {
 	if cc.ComplianceMode {
 		return &CheckResult{Pass: true, Action: "pass", Priority: strategy.P4, Reason: "合规模式"}
@@ -118,6 +127,8 @@ func (e *Engine) checkCompliance(cc config.ComplianceConfig) *CheckResult {
 // 当 currentTotal 从 peakTotal 的回撤超过配置值时触发全仓卖出。
 // 参数 currentTotal: 当前持仓总市值；peakTotal: 历史峰值市值。
 // 返回值中的 Blocked 为 true 时表示需要执行清仓操作。
+// （M8Check checks whether the portfolio drawdown from its peak hits the M8 fallback threshold,
+// triggering a sell-all when exceeded; Blocked=true means liquidation is required.）
 func (e *Engine) M8Check(currentTotal, peakTotal float64) *CheckResult {
 	cfg := e.cfg.Get()
 	rc := cfg.RiskCtrl
@@ -146,6 +157,8 @@ func (e *Engine) M8Check(currentTotal, peakTotal float64) *CheckResult {
 //
 // 参数 currentPct: 当前单票仓位百分比；singlePct: 建议仓位百分比；
 // totalPct: 建议后总仓位百分比；strategyType: 策略类型。
+// （PositionLimitCheck validates position sizes: N-shape strategy is exempt from the 30%/80% limits with only
+// a 90% single-stock cap; other strategies check PerStockMax and MaxTotalPositionPct.）
 func (e *Engine) PositionLimitCheck(currentPct, singlePct, totalPct float64, strategyType strategy.SignalType) *CheckResult {
 	cfg := e.cfg.Get()
 	rc := cfg.RiskCtrl

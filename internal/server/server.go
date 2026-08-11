@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -213,6 +214,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.authMiddleware(s.handleDeleteAlert))
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
 	s.mux.HandleFunc("POST /api/holdings", s.authMiddleware(s.handleFixSetHoldings))
+	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.authMiddleware(s.handleFixAddHoldingLot))
+	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.authMiddleware(s.handleFixSetCost))
+	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.authMiddleware(s.handleFixSellHolding))
+	s.mux.HandleFunc("POST /api/holdings/{code}/close", s.authMiddleware(s.handleFixCloseHolding))
 	s.mux.HandleFunc("GET /api/sector/hot", s.authMiddleware(s.handleFixSectorHot))
 	s.mux.HandleFunc("GET /api/sector/hot/records", s.authMiddleware(s.handleSectorHotRecords))
 	s.mux.HandleFunc("GET /api/snapshot", s.authMiddleware(s.handleFixSnapshot))
@@ -245,6 +250,14 @@ func (s *Server) registerRoutes() {
 func (s *Server) Serve(addr string) error {
 	log.Printf("HTTP server starting on %s", addr)
 	return http.ListenAndServe(addr, s.corsMiddleware(s.mux))
+}
+
+// ServeListener 使用已创建的监听器启动 HTTP 服务。
+// 与 Serve 的区别：监听器由调用方预先绑定（端口占用自动顺延后拿到的 listener），
+// 复用同一对象服务请求，避免"先探测端口再 ListenAndServe"的 bind 竞争。
+func (s *Server) ServeListener(ln net.Listener) error {
+	log.Printf("HTTP server serving on %s", ln.Addr().String())
+	return http.Serve(ln, s.corsMiddleware(s.mux))
 }
 
 // ServeHTTP 实现 http.Handler 接口，供 httptest / 内嵌路由直接驱动（测试与复用场景）。

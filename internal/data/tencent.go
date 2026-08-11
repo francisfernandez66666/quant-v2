@@ -2,6 +2,10 @@
 // 作为 新浪→同花顺→腾讯→东财 降级链中的 K 线备用源。
 // 当新浪 K 线接口被封/东财不可用时，腾讯日K与分钟K仍可正常返回。
 // 所有请求经 TencentLimiter 限流（10/s，20突发）。
+// Package data — the Tencent (ifzq.gtimg.cn) K-line API client.
+// It serves as a backup K-line source in the Sina→THS→Tencent→EastMoney chain,
+// still returning day/minute K-lines when other sources fail.
+// Requests are rate-limited by TencentLimiter (10/s, burst 20).
 package data
 
 import (
@@ -16,6 +20,7 @@ import (
 )
 
 // tencentPrefix 返回腾讯 K 线接口所需的板块前缀（sh/sz）。
+// tencentPrefix returns the exchange prefix (sh/sz) required by the Tencent K-line API.
 func tencentPrefix(code string) string {
 	if strings.HasPrefix(code, "6") || strings.HasPrefix(code, "5") {
 		return "sh"
@@ -24,11 +29,14 @@ func tencentPrefix(code string) string {
 }
 
 // gbKLine 请求体解构用的内部结构。
+// tencentKResp is the internal struct for decoding the Tencent K-line response.
 type tencentKResp struct {
 	Code int                     `json:"code"`
 	Data map[string]tencentKData `json:"data"`
 }
 
+// tencentKData 不同周期 K 线数组容器（前复权日线/日线/分钟线）。
+// tencentKData holds K-line arrays per granularity (qfq daily, daily, and minute lines).
 type tencentKData struct {
 	QfqDay [][]string `json:"qfqday"`
 	Day    [][]string `json:"day"`
@@ -40,6 +48,7 @@ type tencentKData struct {
 }
 
 // getTencentAndParse 发起腾讯 K 线请求并通过给定解析器解析。
+// getTencentAndParse issues a Tencent K-line request and parses it with the given parser.
 func (m *MarketAPI) getTencentAndParse(url string, parse func(body []byte, status int) ([]KLine, error)) ([]KLine, error) {
 	TencentLimiter.Wait()
 	req, err := http.NewRequest("GET", url, nil)
@@ -62,6 +71,8 @@ func (m *MarketAPI) getTencentAndParse(url string, parse func(body []byte, statu
 
 // GetTencentKLine 获取腾讯前复权日 K 线。
 // code 为股票代码，count 为根数。返回按日期升序排列的 KLine。
+// GetTencentKLine fetches Tencent qfq (forward-adjusted) daily K-lines,
+// returned in ascending date order.
 func (m *MarketAPI) GetTencentKLine(code string, count int) ([]KLine, error) {
 	url := fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s%s,day,,,%d,qfq",
 		tencentPrefix(code), code, count)
@@ -87,6 +98,8 @@ func (m *MarketAPI) GetTencentKLine(code string, count int) ([]KLine, error) {
 
 // GetTencentMinuteKLine 获取腾讯分钟 K 线。
 // scale 为分钟数（1/5/15/30/60），count 为根数。返回按时间升序排列的 KLine。
+// GetTencentMinuteKLine fetches Tencent minute K-lines for scale 1/5/15/30/60,
+// returned in ascending time order.
 func (m *MarketAPI) GetTencentMinuteKLine(code string, scale, count int) ([]KLine, error) {
 	url := fmt.Sprintf("https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=%s%s,m%d,,%d",
 		tencentPrefix(code), code, scale, count)
@@ -123,6 +136,9 @@ func (m *MarketAPI) GetTencentMinuteKLine(code string, scale, count int) ([]KLin
 // 腾讯字段顺序为 [时间, 开, 收, 高, 低, 成交量(手), ...]。
 // 日线时间格式 "2006-01-02"；分钟线时间格式 "200601021504"（yyyymmddHHMM）。
 // 严格校验每根K线有效且 high>=low，避免脏数据流入评分。
+// parseTencentKLine parses Tencent K-line rows. Column order is
+// [time, open, close, high, low, volume(...), ...]; every row is validated
+// (positive values and high>=low) so bad data never reaches the scoring logic.
 func parseTencentKLine(rows [][]string, isMinute bool) ([]KLine, error) {
 	klines := make([]KLine, 0, len(rows))
 	for _, r := range rows {

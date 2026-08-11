@@ -1,11 +1,17 @@
 <!--
-  日志弹窗 LogModal.vue
+  日志弹窗 LogModal.vue (Log modal component)
   按"批次"（时间分组）展示两类日志，类型分 tab 隔离：
+  Shows two kinds of batch logs (grouped by time) in separate tabs:
   - LLM 分析：当日各轮 Stage 流水线（Stage1 初筛 + Stage2 深度分析）
+    LLM analysis: each run's Stage pipeline today (Stage1 pre-filter + Stage2 deep analysis)
   - 信号批次：当日各轮产出的全部策略信号（做多/做空/提醒）
+    Signal batches: all strategy signals produced each run today (long/short/alert)
   每个 tab 内支持两种浏览方式：
+  Each tab supports two browsing modes:
   - 无搜索：轮次下拉切换批次，最新批次默认展示
+    No search: switch batches via the dropdown, newest shown by default
   - 有搜索：跨批次聚合匹配（按 个股名称/代码/板块 等），按批次分组展示命中项
+    With search: cross-batch aggregation match (by stock name/code/sector), grouped by batch
 -->
 <template>
   <div v-if="visible" class="log-overlay" @click.self="close">
@@ -258,44 +264,46 @@
 <script setup>
 // ── 依赖导入 ──
 // ref 定义响应式；computed 派生跨批次搜索聚合结果；watch 侦听 visible 变化触发加载；onMounted 挂载时加载
+// (ref for reactivity; computed for cross-batch search results; watch on visible to trigger load; onMounted initial load)
 import { ref, computed, watch, onMounted } from 'vue'
-// 后端 API 封装：Stage 流水线记录与信号批次记录获取接口
+// 后端 API 封装：Stage 流水线记录与信号批次记录获取接口 (backend API wrapper: stage pipeline & signal batch record fetchers)
 import * as api from '../api/index.js'
 
-// 父组件传入的可见性控制：visible 为 true 时才渲染弹窗层
+// 父组件传入的可见性控制：visible 为 true 时才渲染弹窗层 (props from parent: render the modal overlay only when visible)
 const props = defineProps({
   visible: { type: Boolean, default: false },
 })
-// 通知父组件关闭弹窗（点击遮罩 / 右上角 ✕ 时触发）
+// 通知父组件关闭弹窗（点击遮罩 / 右上角 ✕ 时触发）(emit close event to parent on overlay click / ✕ button)
 const emit = defineEmits(['close'])
 
 // ── 响应式状态 ──
-const activeTab = ref('llm')      // 当前激活的 tab：'llm'（LLM 分析）/ 'signal'（信号批次）
-const loading = ref(false)        // 是否正在拉取数据（刷新按钮禁用状态）
+const activeTab = ref('llm')      // 当前激活的 tab：'llm'（LLM 分析）/ 'signal'（信号批次）(active tab: 'llm' | 'signal')
+const loading = ref(false)        // 是否正在拉取数据（刷新按钮禁用状态）(whether data is being fetched, disables refresh button)
 
-// LLM 分析 tab 状态
-const llmRecords = ref([])        // 当日全量 Stage 轮次记录（按批次）
-const llmIdx = ref(0)             // 下拉框选中的轮次索引（默认最新=0）
-const llmData = ref(null)         // 当前展示的那一轮 LLM 分析数据
-const llmNoData = ref(false)      // 是否无 LLM 记录（展示空态文案）
-const llmQuery = ref('')          // LLM 搜索关键词（名称/代码/板块）
-const selectedSet = ref(new Set()) // 该轮次通过 Stage1 筛选的新闻索引集合
+// LLM 分析 tab 状态 (LLM analysis tab state)
+const llmRecords = ref([])        // 当日全量 Stage 轮次记录（按批次）(all Stage run records today, newest first)
+const llmIdx = ref(0)             // 下拉框选中的轮次索引（默认最新=0）(selected run index in dropdown, default newest=0)
+const llmData = ref(null)         // 当前展示的那一轮 LLM 分析数据 (currently displayed LLM analysis record)
+const llmNoData = ref(false)      // 是否无 LLM 记录（展示空态文案）(whether no LLM records exist, shows empty state)
+const llmQuery = ref('')          // LLM 搜索关键词（名称/代码/板块）(LLM search keyword: name/code/sector)
+const selectedSet = ref(new Set()) // 该轮次通过 Stage1 筛选的新闻索引集合 (set of news indices that passed Stage1 filtering)
 
-// 信号批次 tab 状态
-const sigRecords = ref([])       // 当日全量信号批次记录
-const sigIdx = ref(0)            // 下拉框选中的批次索引
-const sigData = ref(null)         // 当前展示的那一批信号数据
-const sigNoData = ref(false)      // 是否无信号批次记录（展示空态文案）
-const sigQuery = ref('')          // 信号搜索关键词（名称/代码/板块）
+// 信号批次 tab 状态 (Signal batch tab state)
+const sigRecords = ref([])       // 当日全量信号批次记录 (all signal batch records today)
+const sigIdx = ref(0)            // 下拉框选中的批次索引 (selected batch index in dropdown)
+const sigData = ref(null)         // 当前展示的那一批信号数据 (currently displayed signal batch record)
+const sigNoData = ref(false)      // 是否无信号批次记录（展示空态文案）(whether no signal batch records exist, shows empty state)
+const sigQuery = ref('')          // 信号搜索关键词（名称/代码/板块）(signal search keyword: name/code/sector)
 
-/** 判断某条新闻（按原始序号 i）是否通过 Stage1 筛选 */
-// 由 selectedSet 决定模板里显示"通过"还是"过滤"徽标
+/** 判断某条新闻（按原始序号 i）是否通过 Stage1 筛选 (Check whether news index i passed Stage1 filtering) */
+// 由 selectedSet 决定模板里显示"通过"还是"过滤"徽标 (selectedSet decides the "通过/pass" vs "过滤/skip" badge shown)
 function isSelected(i) {
   return selectedSet.value.has(i)
 }
 
-/** 将当前选中的 LLM 轮次应用到展示区 */
+/** 将当前选中的 LLM 轮次应用到展示区 (Apply the selected LLM run to the display area) */
 // 原理：从 llmRecords 按 llmIdx 取出记录，回填 llmData 与筛选索引集合
+// (Picks the record at llmIdx from llmRecords and fills llmData plus the filter index set)
 function applyLLM() {
   const r = llmRecords.value[llmIdx.value]
   llmData.value = r || null
@@ -303,7 +311,7 @@ function applyLLM() {
   selectedSet.value = new Set(r ? r.selected_idx || [] : [])
 }
 
-/** 将当前选中的信号批次应用到展示区 */
+/** 将当前选中的信号批次应用到展示区 (Apply the selected signal batch to the display area) */
 function applySignal() {
   const r = sigRecords.value[sigIdx.value]
   sigData.value = r || null
@@ -312,7 +320,7 @@ function applySignal() {
 
 // ── 跨批次搜索 ──
 
-/** 判断一条 LLM Stage2 事件是否命中关键词（名称/代码/板块/标题/理由，大小写不敏感） */
+/** 判断一条 LLM Stage2 事件是否命中关键词（名称/代码/板块/标题/理由，大小写不敏感） (Check if an LLM Stage2 event matches the keyword across title/reason/sectors/stocks, case-insensitive) */
 function eventHit(ev, q) {
   if (!ev) return false
   if (hasText(ev.title, q)) return true
@@ -323,7 +331,7 @@ function eventHit(ev, q) {
   return false
 }
 
-/** 判断一条信号是否命中关键词（代码/名称/板块/策略/理由，大小写不敏感） */
+/** 判断一条信号是否命中关键词（代码/名称/板块/策略/理由，大小写不敏感） (Check if a signal matches the keyword across code/name/sector/strategy/reason, case-insensitive) */
 function sigHit(sg, q) {
   if (!sg) return false
   if (hasText(sg.code, q)) return true
@@ -334,23 +342,24 @@ function sigHit(sg, q) {
   return false
 }
 
-/** 判断文本是否包含关键词（空串恒不命中；统一转大写忽略大小写） */
+/** 判断文本是否包含关键词（空串恒不命中；统一转大写忽略大小写） (Case-insensitive substring check; empty strings never match) */
 function hasText(text, q) {
   if (!text || !q) return false
   return String(text).toUpperCase().includes(q)
 }
 
-/** LLM 是否处于搜索态（输入非空） */
+/** LLM 是否处于搜索态（输入非空） (Whether LLM search mode is active, i.e. input not empty) */
 const llmSearching = computed(() => (llmQuery.value || '').trim() !== '')
-/** 信号是否处于搜索态（输入非空） */
+/** 信号是否处于搜索态（输入非空） (Whether signal search mode is active, i.e. input not empty) */
 const sigSearching = computed(() => (sigQuery.value || '').trim() !== '')
 
-/** LLM 跨批次搜索结果：按轮次分组，组内含命中事件；llmRecords 本身最新在前 */
+/** LLM 跨批次搜索结果：按轮次分组，组内含命中事件；llmRecords 本身最新在前 (LLM cross-batch search results grouped by run; llmRecords are already newest-first) */
 const llmSearchGroups = computed(() => {
   const q = (llmQuery.value || '').trim().toUpperCase()
   if (!q) return []
   const groups = []
   for (const r of llmRecords.value) {
+    // 过滤出该轮命中关键词的事件 (filter events of this run that match the keyword)
     const items = (r.stage2_events || []).filter((ev) => eventHit(ev, q))
     if (items.length) {
       groups.push({ time: r.process_time, items })
@@ -359,15 +368,16 @@ const llmSearchGroups = computed(() => {
   return groups
 })
 
-/** LLM 全部命中事件数（搜索概要展示） */
+/** LLM 全部命中事件数（搜索概要展示） (Total LLM hit count for the search summary) */
 const llmTotalHits = computed(() => llmSearchGroups.value.reduce((n, g) => n + g.items.length, 0))
 
-/** 信号跨批次搜索结果：按批次分组，组内含命中信号；sigRecords 本身最新在前 */
+/** 信号跨批次搜索结果：按批次分组，组内含命中信号；sigRecords 本身最新在前 (Signal cross-batch search results grouped by batch; sigRecords are already newest-first) */
 const sigSearchGroups = computed(() => {
   const q = (sigQuery.value || '').trim().toUpperCase()
   if (!q) return []
   const groups = []
   for (const r of sigRecords.value) {
+    // 过滤出该批命中关键词的信号 (filter signals of this batch that match the keyword)
     const items = (r.signals || []).filter((sg) => sigHit(sg, q))
     if (items.length) {
       groups.push({ time: r.process_time, items })
@@ -376,32 +386,34 @@ const sigSearchGroups = computed(() => {
   return groups
 })
 
-/** 信号全部命中数（搜索概要展示） */
+/** 信号全部命中数（搜索概要展示） (Total signal hit count for the search summary) */
 const sigTotalHits = computed(() => sigSearchGroups.value.reduce((n, g) => n + g.items.length, 0))
 
-/** 切换 tab（llm <-> signal） */
+/** 切换 tab（llm <-> signal） (Switch tab between 'llm' and 'signal') */
 // 仅在切换后当前 tab 无数据时才触发一次加载，避免无谓重复请求
+// (Only trigger a load if the newly activated tab has no data yet, avoiding redundant requests)
 function switchTab(t) {
   activeTab.value = t
   if ((t === 'llm' && llmData.value) || (t === 'signal' && sigData.value)) return
   if (!llmRecords.value.length && !sigRecords.value.length) load()
 }
 
-/** 格式化时间为 HH:mm:ss（用于下拉选项与概要栏显示） */
+/** 格式化时间为 HH:mm:ss（用于下拉选项与概要栏显示） (Format time as HH:mm:ss for dropdowns and summary bar) */
 function fmtTime(t) {
   if (!t) return '-'
   const d = new Date(t)
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-/** 并行加载 LLM 轮次记录与信号批次记录 */
+/** 并行加载 LLM 轮次记录与信号批次记录 (Load LLM run records and signal batch records in parallel) */
 async function load() {
   if (loading.value) return
   loading.value = true
   // 两个接口独立抓取：单个失败/无数据不影响另一个 tab，
   // 避免一处出错导致两个下拉框全部清空。
+  // (Fetch both APIs independently: a failure/empty result on one tab does not affect the other)
   const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs()])
-  // LLM 记录有值时默认展示最新一轮，否则进入空态
+  // LLM 记录有值时默认展示最新一轮，否则进入空态 (if LLM records exist show newest run by default, else empty state)
   if (srRes.status === 'fulfilled' && Array.isArray(srRes.value) && srRes.value.length) {
     llmRecords.value = srRes.value
     llmIdx.value = 0
@@ -411,7 +423,7 @@ async function load() {
     llmData.value = null
     llmNoData.value = true
   }
-  // 信号批次记录同理，成功则默认展示最新一批
+  // 信号批次记录同理，成功则默认展示最新一批 (same for signal batches: show newest on success)
   if (slRes.status === 'fulfilled' && Array.isArray(slRes.value) && slRes.value.length) {
     sigRecords.value = slRes.value
     sigIdx.value = 0
@@ -426,17 +438,19 @@ async function load() {
 
 // 侦听 visible：每次打开弹窗都重新拉取，
 // 避免上次关闭后到再次打开期间新产出的记录未被加载
+// (Watch visible: reload every time the modal opens so records produced while closed get loaded)
 watch(() => props.visible, (v) => {
-  // 每次打开都重新拉取，避免首次打开时后台尚未产出记录而卡在空态
+  // 每次打开都重新拉取，避免首次打开时后台尚未产出记录而卡在空态 (reload on each open to avoid an empty state when nothing was ready at first open)
   if (v) load()
 })
 
-/** 关闭弹窗：向父组件派发 close 事件 */
+/** 关闭弹窗：向父组件派发 close 事件 (Close the modal by emitting the close event to the parent) */
 function close() {
   emit('close')
 }
 
 // 挂载时若初始即为打开状态（如路由直接带着弹窗进入），补一次加载
+// (On mount, if initially open — e.g. entering via a route with the modal active — trigger an extra load)
 onMounted(() => {
   if (props.visible) load()
 })

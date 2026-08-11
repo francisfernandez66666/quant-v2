@@ -1,4 +1,6 @@
 // Package calendar 宏观日历告警，从配置读取重要经济事件，判断是否临近高影响事件。
+// （Package calendar provides macro-calendar alerts: it reads key economic events from config and
+// detects when a high-impact event is approaching.）
 package calendar
 
 import (
@@ -8,6 +10,7 @@ import (
 )
 
 // Event 宏观事件，包含日期、标题、影响程度和提前提醒天数。
+// （Event is a macro event with date, title, impact level and days of advance notice.）
 type Event struct {
 	Date        time.Time // 事件发生日期
 	Title       string    // 事件标题
@@ -16,17 +19,21 @@ type Event struct {
 }
 
 // Calendar 日历管理器，维护配置中的事件列表。
+// （Calendar is the calendar manager holding the configured event list.）
 type Calendar struct {
 	events []config.CalendarEvent // 事件原始配置列表
 }
 
 // New 创建日历实例。
+// （New creates a calendar instance.）
 func New(events []config.CalendarEvent) *Calendar {
 	return &Calendar{events: events}
 }
 
 // UpcomingEvents 返回未来 days 天内即将发生的事件列表。
 // DaysAdvance 控制事件提前显示天数。同时会包含进行中的事件（已开始但未结束）。
+// （UpcomingEvents returns events scheduled within the next days days. DaysAdvance controls how early
+// an event shows up; in-progress (already started but not ended) events are also included.）
 func (c *Calendar) UpcomingEvents(days int) []Event {
 	now := time.Now()
 	var out []Event
@@ -52,6 +59,7 @@ func (c *Calendar) UpcomingEvents(days int) []Event {
 }
 
 // HasHighImpactEvent 判断未来 days 天内是否存在高影响事件。
+// （HasHighImpactEvent reports whether a high-impact event occurs within the next days days.）
 func (c *Calendar) HasHighImpactEvent(days int) bool {
 	for _, e := range c.UpcomingEvents(days) {
 		if e.Impact == "high" {

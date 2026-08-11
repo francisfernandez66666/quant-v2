@@ -1,10 +1,12 @@
 <!--
   LLM 分析诊断页面 LLMDebug.vue
+  LLM analysis debug page LLMDebug.vue
   展示 LLM 新闻分析管线两阶段结果：Stage1 关键词初筛 + Stage2 LLM 深度分析
+  Shows the two-stage results of the LLM news analysis pipeline: Stage1 keyword pre-filter + Stage2 LLM deep analysis
 -->
 <template>
   <div class="llm-debug-page">
-    <!-- 页头：标题 + 日志按钮 + 刷新按钮 -->
+    <!-- 页头：标题 + 日志按钮 + 刷新按钮（Header: title + log button + refresh button）-->
     <div class="page-header">
       <h2>LLM 分析诊断</h2>
       <div class="header-right">
@@ -16,11 +18,11 @@
     </div>
     <LogModal :visible="showLog" @close="showLog = false" />
 
-    <!-- 状态判断 -->
+    <!-- 状态判断（Status checks: agent not ready / no data / has data）-->
     <div v-if="noAgent" class="empty">Agent 未就绪</div>
     <div v-else-if="noData" class="empty">暂无数据，等待下一轮扫描</div>
     <template v-else-if="data">
-      <!-- 概要统计栏 -->
+      <!-- 概要统计栏（Summary stats bar）-->
       <div class="summary-bar">
         <div class="summary-item">
           <span class="summary-label">Stage1 模式</span>
@@ -40,9 +42,9 @@
         </div>
       </div>
 
-      <!-- Stage1：新闻初筛标题列表，标注通过/过滤 -->
+      <!-- Stage1：新闻初筛标题列表，标注通过/过滤（Stage1: news pre-filter title list, marked pass/skip）-->
       <h3 class="section-title">Stage1 · 新闻初筛</h3>
-      <!-- Stage1 新闻条目：标注通过/过滤，通过索引来自该轮次记录的 selected_idx -->
+      <!-- Stage1 新闻条目：标注通过/过滤，通过索引来自该轮次记录的 selected_idx（Stage1 news items: marked pass/skip; the pass indices come from the round's selected_idx）-->
       <div class="stage1-list">
         <div v-for="(title, i) in data.raw_titles" :key="i"
           :class="['title-item', isSelected(i) ? 'selected' : 'discarded']">
@@ -54,9 +56,9 @@
         </div>
       </div>
 
-      <!-- Stage2：LLM 深度分析事件卡片 -->
+      <!-- Stage2：LLM 深度分析事件卡片（Stage2: LLM deep-analysis event cards）-->
       <h3 class="section-title">Stage2 · LLM 分析结果</h3>
-      <!-- 事件卡片：标题 + 方向/评分 + 板块/个股/上下游/影响/类型/理由 -->
+      <!-- 事件卡片：标题 + 方向/评分 + 板块/个股/上下游/影响/类型/理由（Event card: title + direction/score + sectors/stocks/upstream/downstream/impact/type/reason）-->
       <div class="stage2-events" v-if="data.stage2_events && data.stage2_events.length">
         <div v-for="(ev, i) in data.stage2_events" :key="i" class="event-card">
           <div class="event-header">
@@ -111,36 +113,51 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'   // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子
+// Vue Composition API: reactive ref and the onMounted lifecycle hook
 import * as api from '../api/index.js' // 后端 API 调用封装（获取轮次记录等）
+// backend API wrapper (fetching round records etc.)
 import LogModal from '../components/LogModal.vue' // 日志弹窗（LLM 批次 + 信号批次）
+// log modal (LLM batches + signal batches)
 
 // ── 响应式状态 ──
+// ── Reactive state ──
 const loading = ref(false)        // 是否正在加载
+// whether a load is in progress
 const records = ref([])           // 当日全量轮次记录（持久化）
+// all of today's round records (persisted)
 const data = ref(null)            // 当前展示轮次诊断数据（最新一轮）
+// diagnostic data of the currently shown round (the latest one)
 const noAgent = ref(false)        // Agent 未就绪
+// the analysis agent is not ready
 const noData = ref(false)         // 暂无数据
+// no data yet
 const showLog = ref(false)        // 是否打开日志弹窗
+// whether the log modal is open
 
 /** 被 Stage1 筛选通过的新闻索引集合 */
+/** Indices of news items passed by the Stage1 filter */
 const selectedSet = ref(new Set())
 
 /** 判断某条新闻是否通过 Stage1 筛选 */
+/** Whether a news item passed the Stage1 filter */
 function isSelected(i) {
   return selectedSet.value.has(i)
 }
 
 /** 展示最新一轮记录 */
+/** Display the latest round record */
 function applyLatest() {
   const r = records.value[0] || null
   data.value = r
   noAgent.value = false
   noData.value = !r
   // 回填该轮次通过 Stage1 筛选的新闻索引
+  // Backfill the news indices that passed Stage1 in this round
   selectedSet.value = new Set(r ? r.selected_idx || [] : [])
 }
 
 /** 格式化时间为 HH:mm:ss */
+/** Format a timestamp as HH:mm:ss */
 function formatTime(t) {
   if (!t) return '-'
   const d = new Date(t)
@@ -148,24 +165,28 @@ function formatTime(t) {
 }
 
 /** 从后端加载全量 LLM/Stage 轮次记录，默认展示最新一轮 */
+/** Load all LLM/Stage round records from the backend; show the latest round by default */
 async function loadData() {
   loading.value = true
   try {
     const res = await api.fetchStageRecords()
     if (res.status === 'no_engine') {
       // 后端未启用分析引擎，提示 Agent 未就绪
+      // Backend has no analysis engine; flag the agent as not ready
       noAgent.value = true
       noData.value = false
       records.value = []
       data.value = null
     } else if (!Array.isArray(res) || res.length === 0) {
       // 暂无轮次记录，展示空态
+      // No round records yet; show the empty state
       noData.value = true
       noAgent.value = false
       records.value = []
       data.value = null
     } else {
       // 有记录时展示最新一轮
+      // Records exist; display the latest round
       records.value = res
       applyLatest()
     }
@@ -177,6 +198,7 @@ async function loadData() {
 }
 
 // 挂载时加载一次最新轮次数据
+// Load the latest round data once on mount
 onMounted(loadData)
 </script>
 

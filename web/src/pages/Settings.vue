@@ -1,12 +1,14 @@
 <!--
   设置页面 Settings.vue
+  Settings page Settings.vue
   包含服务器连接、通知、账户信息、LLM 配置、系统信息等设置项
+  Contains server connection, notifications, account info, LLM config, system info and other settings
 -->
 <template>
   <div class="settings-page">
     <h2>设置</h2>
 
-    <!-- 服务器连接设置 -->
+    <!-- 服务器连接设置（Server connection settings）-->
     <div class="setting-card">
       <div class="setting-header">服务器连接</div>
       <div class="setting-row">
@@ -22,7 +24,7 @@
       <button class="btn-save" @click="saveServer">保存</button>
     </div>
 
-    <!-- 通知设置 -->
+    <!-- 通知设置（Notification settings）-->
     <div class="setting-card">
       <div class="setting-header">通知设置</div>
       <div class="setting-row">
@@ -39,7 +41,7 @@
       </div>
     </div>
 
-    <!-- 账户信息 -->
+    <!-- 账户信息（Account info）-->
     <div class="setting-card">
       <div class="setting-header">账户信息</div>
       <div class="setting-row">
@@ -52,7 +54,7 @@
       </div>
     </div>
 
-    <!-- LLM 配置 -->
+    <!-- LLM 配置（LLM configuration）-->
     <div class="setting-card">
       <div class="setting-header">LLM 配置</div>
       <div class="setting-row">
@@ -77,10 +79,10 @@
       <span v-if="llmMsg" :class="['feedback', llmMsgType]">{{ llmMsg }}</span>
     </div>
 
-    <!-- 战法参数配置：按策略分组渲染输入项，值绑定到 strategyCfg[分组key][字段key] -->
+    <!-- 战法参数配置：按策略分组渲染输入项，值绑定到 strategyCfg[分组key][字段key]（Strategy parameter config: renders inputs by strategy group, bound to strategyCfg[groupKey][fieldKey]）-->
     <div class="setting-card" v-for="group in strategyGroups" :key="group.key">
       <div class="setting-header">{{ group.title }}</div>
-      <!-- 分组内各字段输入行：step/type 由字段定义控制 -->
+      <!-- 分组内各字段输入行：step/type 由字段定义控制（Per-field input rows inside a group; step/type come from the field definition）-->
       <div class="setting-row" v-for="f in group.fields" :key="f.k">
         <label :title="f.hint || ''">{{ f.label }}</label>
         <input v-model.number="strategyCfg[group.key][f.k]"
@@ -99,10 +101,10 @@
       <span v-if="strategyMsg" :class="['feedback', strategyMsgType]">{{ strategyMsg }}</span>
     </div>
 
-    <!-- 资讯显示开关 -->
+    <!-- 资讯显示开关（"Show all news" toggle）-->
     <div class="setting-card">
       <div class="setting-header">资讯显示</div>
-      <!-- 资讯显示开关：切换时调用 toggleNewsShowAll 持久化到后端 -->
+      <!-- 资讯显示开关：切换时调用 toggleNewsShowAll 持久化到后端（"Show all news" toggle: persisted to the backend via toggleNewsShowAll on change）-->
       <div class="setting-row">
         <label title="开启后弱档/中性资讯（|score|<0.25）也出现在资讯列表；关闭则仅显示有价值的强事件">显示全部资讯（含弱/中性）</label>
         <label class="switch">
@@ -116,7 +118,7 @@
       </div>
     </div>
 
-    <!-- 系统信息 -->
+    <!-- 系统信息（System info）-->
     <div class="setting-card">
       <div class="setting-header">系统</div>
       <div class="setting-row">
@@ -133,32 +135,54 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'   // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子
+// Vue Composition API: reactive ref and the onMounted lifecycle hook
 import * as api from '../api/index.js' // 后端 API 调用封装（状态、LLM 配置、战法参数等）
+// backend API wrapper (status, LLM config, strategy params etc.)
 
 // ── 服务器连接 ──
+// ── Server connection ──
 const serverUrl = ref(api.getStoredServer() || '') // 服务器地址（默认取 localStorage 已存值）
+// server URL (defaults to the value already stored in localStorage)
 const serverOnline = ref(false)                    // 后端服务是否在线
+// whether the backend service is online
 
 // ── 账户信息 ──
+// ── Account info ──
 const account = ref(api.getAccount())                                  // 当前登录账号
+// the currently logged-in account
 const token = ref(localStorage.getItem('liangzai_token') || '')        // 登录令牌（仅展示前 20 位）
+// login token (only the first 20 chars shown)
 
 // ── LLM 配置 ──
+// ── LLM config ──
 const llmApiUrl = ref('')          // LLM API 地址
+// LLM API URL
 const llmApiKey = ref('')          // LLM API Key（密码框输入）
+// LLM API Key (entered in a password field)
 const llmModel = ref('')           // LLM 模型名
+// LLM model name
 const llmConfigured = ref(false)   // LLM 是否已配置（未配置则降级为关键词过滤）
+// whether LLM is configured (degrades to keyword filtering otherwise)
 const llmSaving = ref(false)       // LLM 配置保存中（禁用按钮防重复提交）
+// LLM config saving (disables the button to prevent double submits)
 const llmMsg = ref('')             // LLM 配置保存结果反馈文本
+// LLM config save feedback message
 const llmMsgType = ref('ok')       // LLM 反馈类型：'ok' 成功 / 'err' 失败
+// LLM feedback type: 'ok' success / 'err' failure
 
 // ── 战法参数配置 ──
+// ── Strategy parameter config ──
 const strategyCfg = ref({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} }) // 五大战法参数字典，key 对应后端 config.json 分组
+// dictionary of five strategy parameter groups; keys map to backend config.json groups
 const strategySaving = ref(false)  // 战法参数保存中（禁用按钮防重复提交）
+// strategy params saving (disables the button to prevent double submits)
 const strategyMsg = ref('')        // 战法参数保存结果反馈文本
+// strategy params save feedback message
 const strategyMsgType = ref('ok')  // 战法参数反馈类型：'ok' 成功 / 'err' 失败
+// strategy feedback type: 'ok' success / 'err' failure
 
 /** 四个战法的字段定义（key 对应后端 config.json 的 json tag） */
+/** Field definitions for the strategies (keys are the json tags of backend config.json) */
 const strategyGroups = [
   {
     key: 'dragon', title: '龙头战法（权重合计≤1）',
@@ -246,6 +270,7 @@ const strategyGroups = [
 ]
 
 /** 保存战法参数到后端并持久化 */
+/** Save the strategy parameters to the backend for persistence */
 async function saveStrategy() {
   strategySaving.value = true
   strategyMsg.value = ''
@@ -261,9 +286,12 @@ async function saveStrategy() {
 }
 
 // ── 资讯显示开关 ──
+// ── "Show all news" toggle ──
 const newsShowAll = ref(false) // "显示全部资讯"开关状态（含弱/中性）
+// "show all news" toggle state (includes weak/neutral)
 
 /** 切换"显示全部资讯"开关并同步后端 */
+/** Toggle "show all news" and sync with the backend */
 async function toggleNewsShowAll() {
   try {
     const res = await api.toggleNewsShowAll(newsShowAll.value)
@@ -275,18 +303,22 @@ async function toggleNewsShowAll() {
 }
 
 /** 保存服务器地址到 localStorage */
+/** Save the server URL to localStorage */
 function saveServer() {
   // 持久化服务器地址
+  // Persist the server URL
   api.setStoredServer(serverUrl.value)
   alert('服务器地址已保存')
 }
 
 /** 请求浏览器通知权限并发送测试通知 */
+/** Request browser notification permission and send a test notification */
 function requestNotify() {
   if ('Notification' in window) {
     Notification.requestPermission().then(perm => {
       if (perm === 'granted') {
         // 授权通过则弹出测试通知
+        // Permission granted: show a test notification
         new Notification('量仔期货', { body: '通知授权成功' })
         alert('通知授权成功')
       } else {
@@ -299,33 +331,41 @@ function requestNotify() {
 }
 
 /** 播放测试提示音（660Hz 正弦波，200ms） */
+/** Play a test beep (660Hz sine wave, 200ms) */
 function playTest() {
   try {
     // 创建音频上下文并组装振荡器/音量链路
+    // Create an audio context and wire up the oscillator/gain chain
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
     const osc = ctx.createOscillator()
     const gain = ctx.createGain()
     osc.connect(gain); gain.connect(ctx.destination)
     // 设定频率与音量后播放 200ms
+    // Set frequency and volume, then play for 200ms
     osc.frequency.value = 660; osc.type = 'sine'
     gain.gain.value = 0.1; osc.start(); osc.stop(ctx.currentTime + 0.2)
   } catch (_) {}
 }
 
 /** 保存 LLM 配置到后端 */
+/** Save the LLM configuration to the backend */
 async function saveLLM() {
   // 进入保存中状态并清空上次反馈
+  // Enter the saving state and clear the previous feedback
   llmSaving.value = true
   llmMsg.value = ''
   try {
     // 调用后端接口保存 LLM 配置
+    // Call the backend endpoint to save the LLM config
     await api.setLLMConfig({ api_key: llmApiKey.value, api_url: llmApiUrl.value, model: llmModel.value })
     // 依据是否填写 Key 判断配置是否生效
+    // Whether the config takes effect depends on whether a Key was provided
     llmConfigured.value = !!llmApiKey.value
     llmMsg.value = 'LLM 配置已保存，重启后端生效'
     llmMsgType.value = 'ok'
   } catch (e) {
     // 保存失败时展示错误信息
+    // Show the error message when saving fails
     llmMsg.value = '保存失败: ' + (e.message || '未知错误')
     llmMsgType.value = 'err'
   }
@@ -333,14 +373,17 @@ async function saveLLM() {
 }
 
 /** 挂载时加载服务连接状态和 LLM 现有配置 */
+/** On mount, load the server connection status and existing LLM config */
 onMounted(async () => {
   try {
     // 探测后端服务是否在线
+    // Probe whether the backend service is online
     const st = await api.fetchStatus()
     serverOnline.value = true
   } catch (_) { serverOnline.value = false }
   try {
     // 拉取已保存的 LLM 配置并回填表单
+    // Fetch the saved LLM config and backfill the form
     const cfg = await api.fetchLLMConfig()
     if (cfg) {
       llmApiUrl.value = cfg.api_url || ''
@@ -350,6 +393,7 @@ onMounted(async () => {
   } catch (_) {}
   try {
     // 拉取四战法参数并回填表单
+    // Fetch the strategy params and backfill the form
     const sc = await api.fetchStrategyConfig()
     if (sc) {
       strategyCfg.value = { dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} }
@@ -361,6 +405,7 @@ onMounted(async () => {
   } catch (_) {}
   try {
     // 拉取"显示全部资讯"开关状态
+    // Fetch the "show all news" toggle state
     const ns = await api.fetchNewsShowAllStatus()
     if (ns && typeof ns.news_show_all === 'boolean') newsShowAll.value = ns.news_show_all
   } catch (_) {}

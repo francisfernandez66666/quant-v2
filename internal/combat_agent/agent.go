@@ -4,6 +4,10 @@
 // CheckPositionAlerts 持仓止盈止损提醒，以及 HotReload 配置热更新。
 // 配套文件：types.go(数据结构)、adapter.go(数据适配)、momentum.go/nshape_input.go(打分输入)、
 // d1_scorer.go(D1 事件评分)、expectation_gap.go(预期差)、limit_up.go(涨停龙头) 、loader.go(配置热加载)。
+// English: the combat engine — multi-strategy signal execution and position monitoring. It supports
+// multi-direction (long/short) scanning, Laodeng score correction, take-profit/stop-loss alerts.
+// Core entry points: ScanLong/ScanShort/Scan, ScorePool persistent scoring, CheckPositionAlerts and
+// HotReload config hot-reload. Companion files list the data structures, adapters, scoring inputs, etc.
 package combat_agent
 
 import (
@@ -24,12 +28,15 @@ import (
 // StrategyRunner 策略运行器，封装策略类型与策略实例。
 // Type 标识该运行器对应的战法（如 SignalDragon 龙头战法），
 // Strategy 是具体的策略实现，Scan 阶段按 Type 分发到真实评分逻辑。
+// English: strategy runner wrapping a signal type and its strategy instance; Type identifies the
+// matching strategy (e.g. SignalDragon), Strategy is the concrete implementation dispatched at scan time.
 type StrategyRunner struct {
 	Type     strategy.SignalType // 策略信号类型（龙/双响炮/N形/龙回头）
 	Strategy strategy.Strategy   // 策略接口实现
 }
 
 // orDefault 返回 a 非空时的值，否则回退到 b。
+// English: returns a when non-empty, otherwise falls back to b.
 func orDefault(a, b string) string {
 	if a != "" {
 		return a
@@ -38,6 +45,7 @@ func orDefault(a, b string) string {
 }
 
 // strategyLabel 战法类型 → 日志用简称。
+// English: maps a signal type to a short label used in logs.
 func strategyLabel(t strategy.SignalType) string {
 	switch t {
 	case strategy.SignalDragon:
@@ -54,6 +62,8 @@ func strategyLabel(t strategy.SignalType) string {
 
 // nShapeReason 为 N 形信号附加 D1 评分理由（LLM 分析的故事），使信号可读性更强。
 // base 为战法自身原因（如 left_signal/full_chain），d1 非空时把其 Reason 拼在其后。
+// English: appends the D1 scoring reason (the LLM narrative) to an N-shape signal for readability;
+// when d1 is non-nil its Reason is concatenated after the base strategy reason.
 func nShapeReason(base string, d1 *D1Score) string {
 	if d1 == nil || d1.Reason == "" {
 		return base
@@ -65,6 +75,7 @@ func nShapeReason(base string, d1 *D1Score) string {
 }
 
 // nShapeTag 映射 N 形评分级别到信号标记（一突/二突），其余级别返回 ""。
+// English: maps an N-shape evaluation level to a signal tag (left/right breakout), "" for other levels.
 func nShapeTag(eval *strategy.Evaluation) string {
 	if eval == nil {
 		return ""
@@ -80,6 +91,8 @@ func nShapeTag(eval *strategy.Evaluation) string {
 
 // Agent 战法引擎核心，管理多策略运行器与配置热更新。
 // 所有字段通过 mu 读写锁保护，保证并发扫描/热更新安全。
+// English: core of the combat engine, managing multi-strategy runners and config hot-reload; all fields
+// are guarded by the mu RWMutex for safe concurrent scanning and hot-reload.
 type Agent struct {
 	mu           sync.RWMutex           // 读写锁，保护并发访问
 	strategyCfg  *config.StrategyConfig // 策略参数配置（含动量分权重等，可热更新）
@@ -94,6 +107,7 @@ type Agent struct {
 }
 
 // New 创建战法引擎实例。
+// English: creates a new combat engine instance.
 func New(cfg *config.StrategyConfig) *Agent {
 	return &Agent{
 		strategyCfg: cfg,
@@ -103,6 +117,7 @@ func New(cfg *config.StrategyConfig) *Agent {
 }
 
 // DrainNDiag 收口并清空本轮 N 形诊断条目（engine 每轮打分后调用并打印）。
+// English: drains and clears this round's N-shape diagnostics (called by engine each scoring round).
 func (a *Agent) DrainNDiag() []NDiag {
 	a.diagMu.Lock()
 	defer a.diagMu.Unlock()
@@ -112,6 +127,7 @@ func (a *Agent) DrainNDiag() []NDiag {
 }
 
 // recordNDiag 追加一条 N 形候选诊断（仅 N 形战法路径调用）。
+// English: appends an N-shape candidate diagnostic entry (called only by the N-shape path).
 func (a *Agent) recordNDiag(d NDiag) {
 	a.diagMu.Lock()
 	defer a.diagMu.Unlock()
@@ -119,6 +135,7 @@ func (a *Agent) recordNDiag(d NDiag) {
 }
 
 // SetLaodengConfig 设置 Laodeng 评分配置（线程安全）。
+// English: sets the Laodeng scoring config (thread-safe).
 func (a *Agent) SetLaodengConfig(cfg *config.LaodengConfig) {
 	a.mu.Lock()
 	a.laodengCfg = cfg
@@ -126,6 +143,7 @@ func (a *Agent) SetLaodengConfig(cfg *config.LaodengConfig) {
 }
 
 // SetRunners 设置策略运行器列表（线程安全）。
+// English: sets the strategy runner list (thread-safe).
 func (a *Agent) SetRunners(runners []StrategyRunner) {
 	a.mu.Lock()
 	a.runners = runners
@@ -133,6 +151,7 @@ func (a *Agent) SetRunners(runners []StrategyRunner) {
 }
 
 // SetShortEnabled 设置做空开关（线程安全）。
+// English: sets the short-selling switch (thread-safe).
 func (a *Agent) SetShortEnabled(enabled bool) {
 	a.mu.Lock()
 	a.shortEnabled = enabled
@@ -140,6 +159,7 @@ func (a *Agent) SetShortEnabled(enabled bool) {
 }
 
 // ShortEnabled 返回当前做空是否启用（线程安全）。
+// English: reports whether short-selling is currently enabled (thread-safe).
 func (a *Agent) ShortEnabled() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -147,6 +167,7 @@ func (a *Agent) ShortEnabled() bool {
 }
 
 // HotReload 热更新策略参数（线程安全）。
+// English: hot-reloads strategy parameters (thread-safe).
 func (a *Agent) HotReload(newCfg *config.StrategyConfig) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -155,6 +176,7 @@ func (a *Agent) HotReload(newCfg *config.StrategyConfig) {
 }
 
 // seqID 生成全局唯一信号 ID，格式：SIG + 纳秒时间戳。
+// English: generates a globally unique signal ID, formatted as SIG + nanosecond timestamp.
 func seqID() string {
 	return fmt.Sprintf("SIG%d", time.Now().UnixNano())
 }
@@ -162,6 +184,9 @@ func seqID() string {
 // applyLaodeng 对信号应用 Laodeng 评分修正，按评分系数提高置信度（上限 1.0）。
 // 逐信号乘以 (1+Laodeng 分)，使高分股置信度放大、低分股基本不变。
 // 入参 signals 为待修正的原始信号列表，返回修正后的新列表（不可用时原样返回）。
+// English: applies Laodeng score correction to signals, scaling each confidence by (1+Laodeng score)
+// capped at 1.0 so high-score stocks are amplified while low-score ones stay flat; returns the new list
+// or passes through unchanged when disabled/empty.
 func (a *Agent) applyLaodeng(signals []Signal) []Signal {
 	a.mu.RLock()
 	cfg := a.laodengCfg
@@ -190,12 +215,15 @@ func (a *Agent) applyLaodeng(signals []Signal) []Signal {
 // ScanLong 执行做多扫描：7a 板块利好→验证后个股→8a；8a 个股利好→直入战法。
 // 返回做多信号列表，若输入的板块/个股为空或无可运行策略则返回 nil。
 // 入参 input 含已验证板块（Sectors）、个股直入列表（IndividualStocks）、行情与 D1/L1 过滤结果。
+// English: runs the long scan — 7a verified bull sectors -> 8a stocks, and 8a stocks directly into the
+// strategies. Returns the long signal list, or nil when inputs are empty or no runner exists.
 func (a *Agent) ScanLong(input ScanInput) []Signal {
 	a.mu.RLock()
 	runners := a.runners
 	a.mu.RUnlock()
 
 	// 无可运行策略，或板块/个股输入均为空 → 无扫描对象，直接返回
+	// English: no runner configured or both sector/stock inputs empty → nothing to scan.
 	if len(runners) == 0 || (len(input.Sectors) == 0 && len(input.IndividualStocks) == 0) {
 		return nil
 	}
@@ -204,13 +232,16 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 	now := time.Now()
 
 	// 7a 板块利好 → 验证后的个股走 8a（同时记录持续打分）
+	// English: verified bull sectors feed their stocks through 8a (also recording persistent scores).
 	for _, sector := range input.Sectors {
 		// 仅处理方向为"利好"的板块（利空走做空路径 ScanShort）
+		// English: only bull-direction sectors are handled (bears go through ScanShort).
 		if sector.Direction != "利好" {
 			continue
 		}
 		for _, code := range sector.Stocks {
 			// L1 过滤阻塞的个股跳过，不再进入战法评分
+			// English: skip stocks blocked by the L1 filter.
 			if input.L1Blocked[code] {
 				continue
 			}
@@ -220,6 +251,8 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 
 	// 8a 个股利好 → 直入战法（同时记录自选/持仓持续打分）
 	// 个股直入场景无板块上下文，sector 传 nil 交给战法自行降级处理
+	// English: 8a direct stock inputs go straight to the strategies; no sector context, nil sector lets
+	// strategies degrade gracefully.
 	for _, code := range input.IndividualStocks {
 		if input.L1Blocked[code] {
 			continue
@@ -228,6 +261,7 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 	}
 
 	// 最后统一套 Laodeng 评分修正置信度
+	// English: apply the unified Laodeng confidence correction at the end.
 	signals := a.applyLaodeng(raw)
 	log.Printf("[combat_agent] ScanLong: %d 板块 %d 个股 → %d 做多信号", len(input.Sectors), len(input.IndividualStocks), len(signals))
 	return signals
@@ -237,23 +271,31 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 // （8a/8b 持续打分），只对通过的战法生成信号并返回。这是 8a/8b 打分与信号输出的统一入口。
 // 入参 sector 为板块上下文（nil 表示个股直入），direction 为做多/做空，
 // now 用于统一信号的生成时间。返回本次评分为该股生成的信号列表。
+// English: runs all strategies on one stock, recording raw scores into input.Scores regardless of
+// pass/fail (8a/8b persistent scoring) and returning signals only for passed strategies. It is the
+// unified 8a/8b scoring and signal-output entry; sector is the sector context (nil for direct input),
+// direction is long/short, and now timestamps all produced signals.
 func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, direction, sectorName string, now time.Time) []Signal {
 	// 无可运行策略或行情数据缺失 → 无法评分
+	// English: no runner or missing market data → cannot score.
 	if len(runners) == 0 || md == nil {
 		return nil
 	}
 	// 惰性初始化打分输出表，避免 nil map 写入 panic
+	// English: lazily initialize the score output map to avoid nil-map writes.
 	if input.Scores == nil {
 		input.Scores = make(map[string]StockScores)
 	}
 	sc := StockScores{Code: code, DataGaps: make(map[string]bool)}
 	// 提取 N 形战法消费的 D1 评分 / 事件描述 / PE（仅一次，供各战法共享）
+	// English: fetch D1 score / event description / PE for the N-shape strategy (once, shared by all).
 	var d1 *D1Score
 	if ds, ok := input.D1Scores[code]; ok {
 		d1 = &ds
 	}
 	eventDesc := strings.Join(newsTitlesOf(input.News, code), "；")
 	// PE 由上层 Engine 预取填充（input.PE 为空表示该股无 PE，N 形 D3 走斐波那契兜底）
+	// English: PE is prefetched by the upper Engine; empty means no PE, D3 falls back to Fibonacci.
 	var pe float64
 	if input.PE != nil {
 		pe = input.PE[code]
@@ -263,6 +305,8 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 
 	// 战法评分并发化：同一只股票的各战法评分彼此独立（无共享可变状态），
 	// 并发调用 evalFor 后按原 runner 顺序合并处理，保证信号顺序与波状态机确定性。
+	// English: each strategy's scoring on one stock is independent, so scoring is parallelized and results
+	// are merged in runner order to keep signal order and wave-state-machine determinism.
 	type evalResult struct {
 		eval *strategy.Evaluation
 		err  error
@@ -285,12 +329,16 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 
 	for i, runner := range runners {
 		// 策略实例为空则跳过该运行器
+		// English: skip runners without a strategy instance.
 		if runner.Strategy == nil {
 			continue
 		}
 		// 按战法类型分发到真实评分逻辑（adapter.go evalFor，并发结果按序取用）
+		// English: dispatch to the real scoring logic (evalFor in adapter.go), consuming concurrent
+		// results in runner order.
 		eval, err := res[i].eval, res[i].err
 		// 评分失败或返回空结果 → 该战法视为 0 分，不产出信号；同时标记数据缺口
+		// English: scoring error or empty result means 0 score, no signal, and a data-gap marker.
 		if err != nil || eval == nil {
 			markDataGap(&sc, runner.Type, md)
 			if err != nil {
@@ -301,10 +349,12 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			continue
 		}
 		// 战法各自数据不满足硬性门槛时（如 K 线不足被降级为 0）标记缺口
+		// English: mark a gap when a strategy's hard data requirement is unmet (e.g. insufficient K-lines).
 		if eval.TotalScore == 0 && strategyDataInsufficient(runner.Type, md) {
 			markDataGap(&sc, runner.Type, md)
 		}
 		// 按战法类型归档原始总分到 StockScores（前端展示用，即使未通过也记录）
+		// English: archive the raw total score per strategy type (for display, even when not passed).
 		switch runner.Type {
 		case strategy.SignalNShape:
 			sc.NScore = eval.TotalScore
@@ -317,6 +367,9 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		}
 		// N 形候选：推进一突/二突日内状态机，并尊重 D 硬闸（硬闸在于 noscore 被拦、d1=0 不提级）。
 		// 一突打标需 d1>0；二突为最强确认同样要求 d1>0。未满足硬闸保持原级别不发信号。
+		// English: for N-shape candidates advance the intraday left/right breakout state machine while
+		// respecting the D hard-gate — both labels require d1>0, otherwise keep the original level and
+		// emit no signal.
 		if runner.Type == strategy.SignalNShape && eval != nil {
 			left, right := a.waves.Eval(code, md)
 			d1 := 0.0
@@ -346,17 +399,21 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 				Level: eval.Level, Tag: tag, Pass: eval.Pass, Reason: reason})
 		}
 		// 未通过战法硬性/评分门槛；二突/一突已在上面被提为 Pass → 只记分不出信号
+		// English: strategy below hard/score gates (left/right already promoted to Pass above) →
+		// record score only, no signal.
 		if !eval.Pass {
 			unSig = append(unSig, fmt.Sprintf("%s:%s(%.0f)", strategyLabel(runner.Type), eval.Level, eval.TotalScore))
 			continue
 		}
 		// 通过的战法生成交易信号，失败或为空则跳过
+		// English: passed strategies generate a trade signal; skip on failure or empty result.
 		sig, err := runner.Strategy.GenerateSignal(code, eval)
 		if err != nil || sig == nil {
 			unSig = append(unSig, strategyLabel(runner.Type)+":信号生成失败")
 			continue
 		}
 		// 操作类型缺省为 watch（仅观察），避免空 action
+		// English: default action to watch (observation only) to avoid an empty action.
 		action := string(sig.Action)
 		if action == "" {
 			action = "watch"
@@ -381,6 +438,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		})
 	}
 	// 动量分单独计算（量价+MACD+走势），作为 8a/8b 打分量的一部分
+	// English: the momentum score (volume-price + MACD + trend) is computed separately as part of 8a/8b.
 	sc.MomentumScore = MomentumScore(md, a.momentumWeights())
 	sc.MomentumValid = momentumDataValid(md)
 	sc.SignalActive = len(sigs) > 0
@@ -389,6 +447,9 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	// （量价齐升/资金流入但战法形态未确认，仅观察不自动交易）
 	// 门控 sc.MomentumValid：竞价/盘前今日成交量=0 时动量数据不完整（无真实成交），
 	// 不发存量历史数据凑出来的动量 watch，等 9:30 实盘有成交量后再出。
+	// English: Q2 — when momentum reaches the threshold but none of the four strategies fired, emit a
+	// watch-only signal (volume/price rising but pattern unconfirmed, no auto trade). Gated on MomentumValid
+	// because pre-open volume of 0 makes momentum data incomplete; wait for real volume after 09:30.
 	if len(sigs) == 0 && sc.MomentumValid && sc.MomentumScore >= a.momentumSignalThreshold() {
 		sigs = append(sigs, Signal{
 			ID:          seqID(),
@@ -406,6 +467,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		sc.SignalActive = true
 	} else if len(sigs) == 0 && sc.MomentumScore >= a.momentumSignalThreshold() && !sc.MomentumValid {
 		// 竞价/盘前数据不完整时不发 watch，但保留可排查日志
+		// English: pre-open/incomplete data suppresses the momentum watch but keeps an audit log.
 		log.Printf("[combat_agent] 动量%.0f达阈值但成交前数据不完整(Volume<=0/MACD缺), 暂不发动量watch: %s",
 			sc.MomentumScore, code)
 	}
@@ -413,6 +475,8 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	input.Scores[code] = sc
 	// 战法评分日志：code + 各维度分 + 是否命中（FLOW 全流程日志要求）
 	// 附加"未出"原因（diagnostic）：各战法未出信号的具体原因，便于排查非龙头为何不出分/不发声。
+	// English: scoring log — code + each dimension score + hit flag (FLOW requirement), plus a diagnostic
+	// for why each strategy produced no signal, to debug why non-leaders stay silent.
 	unSigNote := ""
 	if len(unSig) > 0 {
 		unSigNote = " | 未出: " + strings.Join(unSig, " ")
@@ -428,6 +492,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 // 入参 codes 为打分池代码列表，md 为行情映射，d1Scores 为最近一轮 D1 评分缓存
 // （主循环产出，近实时循环复用，不每 5s 调 LLM），emotionPhase 供 N 形情绪硬闸使用。
 // 返回 scores（code → 各战法原始分）与 sigs（本轮通过战法产生的信号）。
+// English: near-realtime 8a/8b persistent scoring entry — scores every code in the pool (positions +
+// watchlist) with the four strategies plus momentum, recording raw scores regardless of pass/fail and
+// returning signals for passed ones (broadcast decision is left to the caller). Reuses evalAll for a
+// consistent scoring basis; d1Scores is a cached round from the main loop (reused, no per-5s LLM call).
 func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMarketData, d1Scores map[string]D1Score, emotionPhase string) (map[string]StockScores, []Signal) {
 	a.mu.RLock()
 	runners := a.runners
@@ -437,15 +505,19 @@ func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMa
 	}
 	scores := make(map[string]StockScores, len(codes))
 	// 组装最小化 ScanInput：个股直入（无板块上下文）、打分池行情、D1 评分缓存、情绪阶段
+	// English: assemble a minimal ScanInput — direct stock inputs, pool market data, cached D1 scores,
+	// emotion phase.
 	input := &ScanInput{MarketData: md, Scores: scores, D1Scores: d1Scores, EmotionPhase: emotionPhase}
 	now := time.Now()
 	var sigs []Signal
 	for _, code := range codes {
 		// L1 阻塞的股票跳过打分
+		// English: skip L1-blocked stocks.
 		if input.L1Blocked[code] {
 			continue
 		}
 		// 逐只走 evalAll，方向统一为做多、板块记为"个股"
+		// English: run evalAll per stock with a unified long direction and "个股" sector label.
 		sigs = append(sigs, a.evalAll(input, runners, code, md[code], nil, "做多", "个股", now)...)
 	}
 	return scores, sigs
@@ -453,6 +525,7 @@ func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMa
 
 // momentumWeights 读取动量分权重配置（nil 防护，缺省回退 40/30/30）。
 // 返回量价/ MACD /走势三者的权重配置，供 MomentumScore 使用。
+// English: reads the momentum weight config (nil-safe, defaults to 40/30/30) for MomentumScore.
 func (a *Agent) momentumWeights() config.MomentumConfig {
 	a.mu.RLock()
 	cfg := a.strategyCfg
@@ -465,6 +538,7 @@ func (a *Agent) momentumWeights() config.MomentumConfig {
 }
 
 // momentumSignalThreshold 读取动量分触发信号的阈值（默认 60）。
+// English: reads the momentum signal threshold (defaults to 60).
 func (a *Agent) momentumSignalThreshold() float64 {
 	w := a.momentumWeights()
 	if w.SignalThreshold <= 0 {
@@ -474,6 +548,7 @@ func (a *Agent) momentumSignalThreshold() float64 {
 }
 
 // strategyDataInsufficient 判断某战法类型的输入数据是否不足（不足时得分 0 不代表真实 0 分）。
+// English: reports whether a strategy's input data is insufficient (a 0 score then does not mean a real 0).
 func strategyDataInsufficient(t strategy.SignalType, md *strategy_engine.StockMarketData) bool {
 	if md == nil {
 		return true
@@ -497,6 +572,7 @@ func strategyDataInsufficient(t strategy.SignalType, md *strategy_engine.StockMa
 }
 
 // momentumDataValid 判断动量分所需数据是否完整（量价 + 走势 + MACD 任一缺失即视为不完整）。
+// English: reports whether momentum data is complete (missing any of volume-price, trend, or MACD).
 func momentumDataValid(md *strategy_engine.StockMarketData) bool {
 	if md == nil || md.Quote == nil {
 		return false
@@ -511,6 +587,8 @@ func momentumDataValid(md *strategy_engine.StockMarketData) bool {
 }
 
 // markDataGap 记录某战法因数据不足而降级的数据缺口，供前端区分真实 0 分与无数据。
+// English: records a data-gap marker when a strategy is degraded due to insufficient data, letting the
+// frontend distinguish a real 0 from missing data.
 func markDataGap(sc *StockScores, t strategy.SignalType, md *strategy_engine.StockMarketData) {
 	if sc.DataGaps == nil {
 		sc.DataGaps = make(map[string]bool)
@@ -521,8 +599,12 @@ func markDataGap(sc *StockScores, t strategy.SignalType, md *strategy_engine.Sto
 // ScanShort 执行做空扫描：7b 板块利空→验证后个股→8b；8b 个股利空→直入战法（反向信号）。
 // 仅当做空开关启用时执行，否则返回 nil。
 // 流程与 ScanLong 对称：方向字段标记为"做空"，供上层做反向处理。
+// English: runs the short scan — 7b bear sectors -> 8b stocks, and 8b stocks directly into the strategies
+// (inverted signals). Only runs when short-selling is enabled, otherwise nil; mirrors ScanLong with the
+// direction marked "做空" for upstream inversion.
 func (a *Agent) ScanShort(input ScanInput) []Signal {
 	// 做空开关关闭 → 直接返回，不做任何做空扫描
+	// English: short-selling disabled → return immediately without scanning.
 	if !a.ShortEnabled() {
 		return nil
 	}
@@ -543,13 +625,16 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 	now := time.Now()
 
 	// 7b 板块利空 → 验证后的个股走 8b
+	// English: verified bear sectors feed their stocks through 8b.
 	for _, sector := range input.Sectors {
 		// 仅处理方向为"利空"的板块（利好走做多路径 ScanLong）
+		// English: only bear-direction sectors are handled (bulls go through ScanLong).
 		if sector.Direction != "利空" {
 			continue
 		}
 		for _, code := range sector.Stocks {
 			// L1 阻塞的个股跳过
+			// English: skip L1-blocked stocks.
 			if input.L1Blocked[code] {
 				continue
 			}
@@ -558,6 +643,7 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 	}
 
 	// 8b 个股利空 → 直入战法（反向信号）
+	// English: 8b direct stock inputs go straight into the strategies (inverted signals).
 	for _, code := range input.IndividualStocks {
 		if input.L1Blocked[code] {
 			continue
@@ -566,6 +652,7 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 	}
 
 	// 同样套 Laodeng 评分修正
+	// English: apply the same Laodeng confidence correction.
 	signals := a.applyLaodeng(raw)
 	log.Printf("[combat_agent] ScanShort: %d 板块 %d 个股 → %d 做空信号", len(input.Sectors), len(input.IndividualStocks), len(signals))
 	return signals
@@ -581,6 +668,11 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 //   - 做多止损：出现做空/利空信号 → 硬止损；未出现 → 可能洗盘，降级提示观察。
 //   - 做空止盈：仍有做空/利空信号 → 继续持有(降级提示)；无 → 硬止盈。
 //   - 做空止损：出现做多/利好信号 → 硬止损；未出现 → 降级提示观察。
+//
+// English: checks take-profit/stop-loss conditions on all positions and returns alert signals, computed
+// from the realtime quote P/L vs thresholds. The decision depends on the position direction and current
+// same-direction signals: for longs, a live bull signal downgrades take-profit to a keep/watch hint while
+// a bear signal forces stop-loss; shorts mirror the logic with inverted signal meanings.
 func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI, scores map[string]StockScores, bearHit ...map[string]bool) []Signal {
 	positions := rpt.HeldPositions()
 	if len(positions) == 0 {
@@ -588,6 +680,7 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 	}
 
 	// 可选：本轮利空(做空)信号命中集合（命中利空板块/利空个股）
+	// English: optional bear-signal hit set for this round (hit bear sectors/stocks).
 	var bears map[string]bool
 	if len(bearHit) > 0 {
 		bears = bearHit[0]
@@ -598,21 +691,27 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 
 	for _, pos := range positions {
 		// 未设置止盈/止损阈值的持仓不检查
+		// English: skip positions without take-profit/stop-loss thresholds.
 		if pos.TakeProfitPct <= 0 && pos.StopLossPct <= 0 {
 			continue
 		}
 
 		// 拉取实时报价，失败/为空/现价为 0（停牌未成交）则跳过该持仓，
 		// 避免以无效价格误判止盈/止损（如 0 价会算成 -100%）。
+		// English: skip when the quote is missing/invalid or the price is 0 (suspended), avoiding false
+		// P/L judgments like a 0 price counting as -100%.
 		quote, err := marketAPI.GetRealtimeQuote(pos.Code)
 		if err != nil || quote == nil || quote.Price <= 0 {
 			continue
 		}
 
 		// 按现价计算持仓盈亏比例（%）
+		// English: compute the position P/L percentage against the current price.
 		pnl := (quote.Price - pos.EntryPrice) / pos.EntryPrice * 100
 
 		// 该股当前信号：做多信号=打分表 SignalActive(做多池)；做空/利空信号=命中利空板块映射
+		// English: current same-direction signals — bull from the score table's SignalActive, bear from
+		// the bear-sector hit map.
 		hasBull := false
 		if sc, ok := scores[pos.Code]; ok {
 			hasBull = sc.SignalActive
@@ -625,6 +724,8 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 
 		// 触及止盈线 → 生成止盈提醒。
 		// 做多：仍有做多信号→持有(降级提示)；无→硬止盈。做空：仍有做空信号→持有；无→硬止盈。
+		// English: take-profit line hit — with a same-direction signal keep holding (downgraded hint),
+		// otherwise issue a hard take-profit alert.
 		if pos.TakeProfitPct > 0 && pnl >= pos.TakeProfitPct {
 			alertType, action := "止盈", "止盈"
 			reason := fmt.Sprintf("盈亏%.2f%% 触及止盈%.0f%%", pnl, pos.TakeProfitPct)
@@ -657,10 +758,13 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 
 		// 触及止损线 → 生成止损提醒。
 		// 做多：出现做空/利空信号→硬止损；未出现→可能是洗盘，降级提示观察。做空：出现做多信号→硬止损；否则提示。
+		// English: stop-loss line hit — a same-direction adverse signal forces a hard stop-loss,
+		// otherwise it may be a shakeout, so downgrade to a watch hint.
 		if pos.StopLossPct > 0 && pnl <= -pos.StopLossPct {
 			alertType, action := "止损", "止损"
 			reason := fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%", pnl, pos.StopLossPct)
 			// 是否出现对已方向不利的信号决定是否硬止损
+			// English: an adverse signal in the opposite direction decides a hard stop-loss.
 			hard := false
 			if isShort {
 				hard = hasBull // 做空止损：出现做多(利好)信号→硬止损
@@ -698,12 +802,16 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 // Scan 通用扫描入口（不区分方向），对输入板块的每只股票逐策略评估打分。
 // 方向直接沿用板块本身的 Direction（利好/利空），不做做多/做空分流。
 // 返回所有通过策略评估的信号。
+// English: generic scan entry (direction-agnostic) scoring every stock in the input sectors; the signal
+// direction simply follows each sector's own Direction without long/short routing. Returns all signals
+// that passed strategy evaluation.
 func (a *Agent) Scan(input ScanInput) []Signal {
 	a.mu.RLock()
 	runners := a.runners
 	a.mu.RUnlock()
 
 	// 无可运行策略或没有输入板块 → 直接返回
+	// English: no runner or no input sectors → return immediately.
 	if len(runners) == 0 || len(input.Sectors) == 0 {
 		return nil
 	}
@@ -717,6 +825,7 @@ func (a *Agent) Scan(input ScanInput) []Signal {
 				continue
 			}
 			// 板块方向即信号方向，板块名作为信号所属板块
+			// English: sector direction becomes the signal direction, sector name tags the signal.
 			allSignals = append(allSignals, a.evalAll(&input, runners, code, input.MarketData[code], &sector, sector.Direction, sector.Name, now)...)
 		}
 	}

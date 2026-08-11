@@ -14,7 +14,7 @@ import (
 	"quant-trading-v2/internal/llm"
 )
 
-// Agent 新闻智能体：拉取、分析并持久化新闻事件。
+// Agent 新闻智能体：拉取、分析并持久化新闻事件。（Agent is the news agent: fetching, analyzing and persisting news events.）
 type Agent struct {
 	marketAPI  *data.MarketAPI    // 行情/新闻数据接口：分页拉取新闻、抓取正文、获取 IPO 日历
 	llmClient  *llm.Client        // LLM 客户端：用于 Stage0/1 分类初筛与 Stage2 深度分析
@@ -26,16 +26,17 @@ type Agent struct {
 	minScore   float64            // 落盘过滤最低分（默认 0.25；前端"显示全部"开关可改为 0）
 }
 
-// SetLLMClient 设置 LLM 客户端。
+// SetLLMClient 设置 LLM 客户端。（Sets the LLM client.）
 func (a *Agent) SetLLMClient(c *llm.Client) { a.llmClient = c }
 
 // SetMinScore 设置落盘过滤最低分（|score| 低于该值的事件不落盘展示）。
+// （SetMinScore sets the minimum |score| for persistence; lower-scoring events are not stored.）
 func (a *Agent) SetMinScore(v float64) { a.minScore = v }
 
-// MinScore 返回当前落盘过滤最低分。
+// MinScore 返回当前落盘过滤最低分。（MinScore returns the current minimum |score| for persistence.）
 func (a *Agent) MinScore() float64 { return a.minScore }
 
-// New 创建新闻智能体实例。
+// New 创建新闻智能体实例。（New creates a news agent instance.）
 func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCleaner, dataDir string) *Agent {
 	return &Agent{
 		marketAPI:  marketAPI,
@@ -49,18 +50,19 @@ func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCl
 	}
 }
 
-// Start 启动新闻智能体。
+// Start 启动新闻智能体。（Start starts the news agent.）
 func (a *Agent) Start() error {
 	log.Printf("[newsagent] 已启动, tracker=%s", a.tracker.filePath)
 	return nil
 }
 
-// Stop 停止新闻智能体并保存记账数据。
+// Stop 停止新闻智能体并保存记账数据。（Stop stops the news agent and saves the tracker data.）
 func (a *Agent) Stop() error {
 	return a.tracker.save()
 }
 
 // Fetch 拉取未读新闻（含去重记账）。记账属 fetch 自身职能，不对外暴露。
+// （Fetch pulls unread news including dedup bookkeeping; the bookkeeping stays internal to fetch.）
 func (a *Agent) Fetch(ctx context.Context, since time.Time) []data.NewsItem {
 	rawNews := a.fetchCatchUp(false)
 	if len(rawNews) > 0 {
@@ -70,6 +72,7 @@ func (a *Agent) Fetch(ctx context.Context, since time.Time) []data.NewsItem {
 }
 
 // Stage1 过滤：判断板块/宏观新闻是否有投资价值，返回有价值的标题索引。
+// （Stage1 filtering: judges whether sector/macro news has investment value and returns valuable title indices.）
 func (a *Agent) Stage1(titles []string) []int {
 	indices, err := a.classifyMaterial(titles)
 	if err != nil {
@@ -81,6 +84,8 @@ func (a *Agent) Stage1(titles []string) []int {
 
 // Stage2 深度分析：LLM 对新闻全量分析，输出带方向/分数/归因的结构化事件。
 // 中性事件照常输出，由引擎按阈值过滤丢弃。
+// （Stage2 deep analysis: LLM analyzes all news into structured events with direction/score/attribution;
+// neutral events are still emitted and the engine discards them by threshold.）
 func (a *Agent) Stage2(items []data.NewsItem) []NewsEvent {
 	events := a.analyzeDeep(items)
 	if a.cleaner != nil {
@@ -93,6 +98,7 @@ func (a *Agent) Stage2(items []data.NewsItem) []NewsEvent {
 }
 
 // CleanStocks 清洗股票列表（名称或代码 → "名称|代码"），供引擎对增强归因做清理。
+// （CleanStocks normalizes a stock list from name/code to "名称|代码" for engine attribution cleanup.）
 func (a *Agent) CleanStocks(items []string) []string {
 	if a.cleaner == nil {
 		return items
@@ -101,6 +107,7 @@ func (a *Agent) CleanStocks(items []string) []string {
 }
 
 // FindStocksInText 在文本中查找出现的股票名称（供咨询/归因等按自然语言识别个股）。
+// （FindStocksInText finds stock names appearing in the text for natural-language stock recognition.）
 func (a *Agent) FindStocksInText(text string) []string {
 	if a.cleaner == nil || text == "" {
 		return nil
@@ -109,17 +116,21 @@ func (a *Agent) FindStocksInText(text string) []string {
 }
 
 // SaveEvents 持久化事件到 newsDB 文件并保存 tracker，供 /api/news 展示。
+// （SaveEvents persists events to the newsDB file and saves the tracker for /api/news display.）
 func (a *Agent) SaveEvents(events []NewsEvent) {
 	a.saveNewsEvents(events)
 	_ = a.tracker.save()
 }
 
 // BuildIPOEvents 从 IPO 日历构建事件（直构 NewsEvent，不走 LLM）。
+// （BuildIPOEvents builds events directly from the IPO calendar into NewsEvent without the LLM.）
 func (a *Agent) BuildIPOEvents() []NewsEvent {
 	return a.buildIPOEvents()
 }
 
 // BuildIPOFeedEvents 从 IPO 新闻流直构事件（新股/申购/上市，Score+0.5 利好，不走 LLM）。
+// （BuildIPOFeedEvents builds events directly from the IPO news feed (new stock/subscription/listing) with a
+// +0.5 bullish score, skipping the LLM.）
 func (a *Agent) BuildIPOFeedEvents(items []data.NewsItem) []NewsEvent {
 	var out []NewsEvent
 	for _, item := range items {
@@ -159,12 +170,14 @@ func (a *Agent) BuildIPOFeedEvents(items []data.NewsItem) []NewsEvent {
 }
 
 // newsDB 新闻事件本地持久化结构，按交易日分批存储。
+// （newsDB is the local persistence shape for news events, bucketed per trading day.）
 type newsDB struct {
 	TradingDay string      `json:"trading_day"` // 交易日 YYYYMMDD
 	Events     []NewsEvent `json:"events"`      // 事件列表
 }
 
 // saveNewsEvents 将事件持久化到 newsDB 文件，按交易日归并去重，最多保留 200 条。
+// （saveNewsEvents persists events to the newsDB file, merging by trading day, deduping and keeping at most 200.）
 func (a *Agent) saveNewsEvents(events []NewsEvent) {
 	td := data.TradingDayDate(time.Now())
 	existing := a.loadNewsDB()
@@ -214,7 +227,7 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 	}
 }
 
-// loadNewsDB 从文件加载持久化的新闻事件数据库。
+// loadNewsDB 从文件加载持久化的新闻事件数据库。（loadNewsDB loads the persisted news-event database from file.）
 func (a *Agent) loadNewsDB() *newsDB {
 	data, err := os.ReadFile(a.newsDBPath)
 	if err != nil {
@@ -229,6 +242,7 @@ func (a *Agent) loadNewsDB() *newsDB {
 }
 
 // AllEvents 返回持久化到本地的全部已打标新闻事件（含中性/一般），供 /api/news?all=true 展示。
+// （AllEvents returns all locally persisted tagged news events, including neutral/general, for /api/news?all=true.）
 func (a *Agent) AllEvents() []NewsEvent {
 	db := a.loadNewsDB()
 	if db == nil {
@@ -238,6 +252,7 @@ func (a *Agent) AllEvents() []NewsEvent {
 }
 
 // FrozenEvents 返回当前全部未过期的固化事件（供引擎合并进有效事件池）。
+// （FrozenEvents returns all currently non-expired frozen events for the engine's effective event pool.）
 func (a *Agent) FrozenEvents() []NewsEvent {
 	db := a.loadFrozenDB()
 	if db == nil {
@@ -255,6 +270,8 @@ func (a *Agent) FrozenEvents() []NewsEvent {
 
 // SaveFrozen 将本轮产出的带价值事件写入固化层：同板块+同方向（Key）覆盖、分数取最新；
 // 同时做跨日到期清理（过期事件移除）。写盘前先备份原文件（损坏恢复兜底）。
+// （SaveFrozen writes this round's valuable events to the frozen layer: same sector+direction overwrites with
+// the latest score, plus cross-day expiry cleanup; it backups the file before writing for corruption recovery.）
 func (a *Agent) SaveFrozen(fresh []NewsEvent) {
 	td := data.TradingDayDate(time.Now())
 	db := a.loadFrozenDB()
@@ -296,6 +313,7 @@ func (a *Agent) SaveFrozen(fresh []NewsEvent) {
 }
 
 // writeFrozenDB 序列化并写入固化文件。写入前先备份当前文件为 .bak，便于损坏时恢复。
+// （writeFrozenDB serializes and writes the frozen file, backing it up to .bak first for recovery.）
 func (a *Agent) writeFrozenDB(db *frozenDB) error {
 	data, err := json.MarshalIndent(db, "", "  ")
 	if err != nil {
@@ -310,6 +328,8 @@ func (a *Agent) writeFrozenDB(db *frozenDB) error {
 }
 
 // frozenKey 计算固化覆盖键：sector|direction。无板块时以标题代替板块，方向缺失时按 Score 符号推断。
+// （frozenKey computes the overwrite key sector|direction, using the title as sector and inferring the
+// direction from the Score sign when missing.）
 func frozenKey(e NewsEvent) string {
 	sector := ""
 	if len(e.Sectors) > 0 && strings.TrimSpace(e.Sectors[0]) != "" {
@@ -329,6 +349,7 @@ func frozenKey(e NewsEvent) string {
 }
 
 // shouldFreeze 判断事件是否需要固化：|Score|≥0.25 且方向为利好/利空。
+// （shouldFreeze reports whether an event should be frozen: |Score|≥0.25 and direction bullish/bearish.）
 func shouldFreeze(e NewsEvent) bool {
 	s := e.Score
 	if s < 0 {
@@ -339,6 +360,8 @@ func shouldFreeze(e NewsEvent) bool {
 
 // isFrozenExpired 判断固化事件是否已到期。
 // 事件在其产生日(day)及顺延一个自然日(day+1)内有效；当前交易日 td 已在 day+1 之后即过期移除。
+// （isFrozenExpired reports whether a frozen event has expired: it stays valid through its day plus one
+// calendar day, and is removed once the current trading day td is past day+1.）
 func isFrozenExpired(fe FrozenEvent, td string) bool {
 	if fe.Day == "" {
 		return false // 无日期（旧数据）保守保留
@@ -354,6 +377,8 @@ func isFrozenExpired(fe FrozenEvent, td string) bool {
 
 // loadFrozenDB 从文件加载固化事件库（含损坏恢复）。
 // 整体解析失败时先逐条尝试抢救，仍失败则把损坏文件备份为 .bak 后返回空库，绝不因坏文件阻断固化层。
+// （loadFrozenDB loads the frozen-event DB with corruption recovery: salvages objects one by one on whole-parse
+// failure, and backs up a hopelessly broken file as .bak before returning an empty DB.）
 func (a *Agent) loadFrozenDB() *frozenDB {
 	data, err := os.ReadFile(a.frozenPath)
 	if err != nil {
@@ -388,6 +413,7 @@ func (a *Agent) loadFrozenDB() *frozenDB {
 }
 
 // buildIPOEvents 从 IPO 日历构建 NewsEvent（新股申购/上市），跳过已存在的事件。
+// （buildIPOEvents builds NewsEvents from the IPO calendar (subscription/listing), skipping existing ones.）
 func (a *Agent) buildIPOEvents() []NewsEvent {
 	if a.marketAPI == nil {
 		return nil
@@ -464,6 +490,7 @@ func (a *Agent) buildIPOEvents() []NewsEvent {
 }
 
 // isIPOExpired 判断 IPO 事件是否已过期（当前交易日 > 到期日）。
+// （isIPOExpired reports whether an IPO event has expired: current trading day > expiry.）
 func isIPOExpired(e NewsEvent, td string) bool {
 	if !strings.HasPrefix(e.Content, "expiry=") {
 		return false

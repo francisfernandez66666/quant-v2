@@ -13,6 +13,8 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
+// stage1SystemPrompt Stage1 价值筛选提示词：LLM 从新闻标题中筛选有投资参考价值的重大事件并返回索引数组。
+// （Stage1 value-screening prompt: LLM picks material events from headlines and returns their indices.）
 const stage1SystemPrompt = `你是一个A股新闻价值判断专家。从以下新闻标题中，筛选出具有投资参考价值的重大事件。
 
 重大事件包括但不限于：
@@ -34,6 +36,7 @@ const stage1SystemPrompt = `你是一个A股新闻价值判断专家。从以下
 如果没有任何有价值的条目，返回 []`
 
 // stage0FilterSystemPrompt Stage0 垃圾过滤：仅保留官方/权威事实新闻，剔除机构观点/互动/海外行情播报。
+// （Stage0 junk filter: keeps only official/authoritative factual news, removing institution/interactive/overseas tape reports.）
 const stage0FilterSystemPrompt = `你是一个A股新闻来源分类器。将以下每条新闻标题分类为四种类型之一：
 - official: 官方/权威信息源发布的事实新闻，包括政府、监管机构、央行、美联储、上市公司公告、财报、行业动态、宏观经济数据发布、政策发布
 - institution: 机构观点/专家评论/券商研报/分析师看市/名家观点
@@ -45,6 +48,8 @@ const stage0FilterSystemPrompt = `你是一个A股新闻来源分类器。将以
 
 // stage1Keywords 投资价值关键词表：标题命中任一关键词即视为有板块/宏观投资价值的候选，
 // 用于无 LLM 时的 Stage1 关键词兜底初筛。
+// （Stage1 investment-value keyword table: any match marks a headline as a sector/macro candidate,
+// used as the keyword fallback for Stage1 when no LLM is available.）
 var stage1Keywords = []string{
 	"业绩", "财报", "预增", "预亏", "扭亏", "翻倍", "涨停", "跌停",
 	"重大合同", "中标", "订单", "重组", "定增", "增发", "回购", "减持", "增持",
@@ -61,6 +66,7 @@ var stage1Keywords = []string{
 }
 
 // matchKeywords 关键词匹配：检查标题是否包含预定义的投资相关关键词。
+// （matchKeywords reports whether the title contains any predefined investment-related keyword.）
 func matchKeywords(title string) bool {
 	t := strings.ToLower(title)
 	for _, kw := range stage1Keywords {
@@ -72,6 +78,7 @@ func matchKeywords(title string) bool {
 }
 
 // junkFallbackKeywords 垃圾过滤兜底关键词：命中即判定为非官方（机构/互动/海外盘面等）。
+// （Junk-filter fallback keywords: a hit classifies the title as non-official (institution/interactive/overseas tape).）
 var junkFallbackKeywords = []string{
 	"机构观点", "专家", "研报", "分析师", "看市", "名家", "后市", "策略会",
 	"互动", "投资者关系", "董秘", "股吧", "网友", "问答", "回复",
@@ -80,6 +87,7 @@ var junkFallbackKeywords = []string{
 }
 
 // junkFallback 关键词兜底：标题命中明显非官方特征时返回 true。
+// （junkFallback returns true when the title shows obvious non-official characteristics.）
 func junkFallback(title string) bool {
 	t := strings.ToLower(title)
 	for _, kw := range junkFallbackKeywords {
@@ -91,12 +99,14 @@ func junkFallback(title string) bool {
 }
 
 // ipoKeywords IPO 相关关键词：命中即判定为新股/申购/上市类新闻，直构事件不走 LLM。
+// （IPO-related keywords: a hit marks the news as IPO/subscription/listing and builds events directly without LLM.）
 var ipoKeywords = []string{
 	"IPO", "新股", "申购", "中签", "首发", "过会", "招股", "发行价",
 	"上市首日", "新股上市", "挂牌上市", "注册生效", "网上发行",
 }
 
 // matchIPOKeywords 判断标题是否属于 IPO 相关新闻（新股/申购/上市）。
+// （matchIPOKeywords reports whether the title is IPO-related (new stock/subscription/listing).）
 func matchIPOKeywords(title string) bool {
 	t := strings.ToLower(title)
 	for _, kw := range ipoKeywords {
@@ -110,6 +120,8 @@ func matchIPOKeywords(title string) bool {
 // stageCombinedSystemPrompt Stage0/1 合并调用：
 // 单次 LLM 批次输出 来源类型(category) + 投资价值(material) + 校正标题(corrected_title)。
 // 输入含标题与正文，供标题党复核（正文由 EnrichContents 回填，正文不足时仅标题）。
+// （Combined Stage0/1 prompt: a single LLM batch outputs source category + investment material + corrected
+// title. Inputs include title and body for clickbait review.）
 const stageCombinedSystemPrompt = `你是一个A股新闻质检与价值判断专家。对每条新闻（含标题与正文）依次输出三个判断：
 
 1. category（来源类型），取值之一：
@@ -131,10 +143,10 @@ const stageCombinedSystemPrompt = `你是一个A股新闻质检与价值判断�
 返回JSON数组，每项: {"index": 序号, "category": "official|institution|interactive|overseas", "material": true/false, "corrected_title": "..."}
 每条新闻都必须给出。只输出JSON数组，不要多余文字。`
 
-// combinedBodyLimit 合并调用时正文截断长度（字符），控制单批 prompt 体积。
+// combinedBodyLimit 合并调用时正文截断长度（字符），控制单批 prompt 体积。（Body truncation length for combined calls, in runes.）
 const combinedBodyLimit = 300
 
-// combinedJudge 合并调用的单条判定结果。
+// combinedJudge 合并调用的单条判定结果。（combinedJudge is one judgement produced by the combined call.）
 type combinedJudge struct {
 	Official       bool   // 是否为官方/权威来源（非机构观点/互动/海外盘面）
 	Material       bool   // 是否有投资参考价值
@@ -143,6 +155,8 @@ type combinedJudge struct {
 
 // classifyCombined 合并 Stage0 垃圾过滤 + Stage1 价值初筛 + 标题党复核 为单次 LLM 分批调用。
 // 失败走轮询重试（每批最多3次、间隔递增），仍失败返回错误，由调用方将整批归一般（不降级关键词）。
+// （classifyCombined merges Stage0 junk filtering + Stage1 value screening + clickbait review into batched LLM
+// calls; on retry exhaustion it returns an error for the caller to classify the whole batch as general.）
 func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, error) {
 	n := len(titles)
 	out := make([]combinedJudge, n)
@@ -189,13 +203,15 @@ func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, erro
 
 // stage0EmptyValueRe 匹配对象键与空值畸形：`"key":]` 或 `"key":}`（模型丢了值直接写括号）。
 // 修复为 `"key": ""`，覆盖单个对象解析时的空值缺失。
+// （Matches object-key/empty-value malformations like `"key":]` and fixes them to `"key": ""`.）
 var stage0EmptyValueRe = regexp.MustCompile(`("(?:[^"\\]|\\.)*"\s*:)\s*[}\]]`)
 
 // trailingJunkRe 匹配字符串收引号后紧跟的杂散 `)`/`'`（如 "上涨"") 、"死"'} ），
 // 归一为单收引号，恢复为合法 JSON。
+// （Matches stray )/' after a closing quote and normalizes to a single closing quote for valid JSON.）
 var trailingJunkRe = regexp.MustCompile(`"\s*[\)']+\s*([,}\]]|$)`)
 
-// stage0Obj matches a single Stage0 judgement object shape.
+// stage0Judge 单条 Stage0 判定对象结构体。（matches a single Stage0 judgement object shape.）
 type stage0Judge struct {
 	Index     flexInt  `json:"index"`
 	Category  string   `json:"category"`
@@ -205,8 +221,10 @@ type stage0Judge struct {
 
 // flexInt 兼容 JSON 中整数字段为数字或字符串（如 1 或 "1"）的解析。
 // 推理模型常把数值输出成带引号字符串，标准 json.Unmarshal 到 int 会失败。
+// （flexInt tolerates int fields serialized as number or string (1 or "1"), as reasoning models often quote numbers.）
 type flexInt int
 
+// UnmarshalJSON 解析数字或字符串形式的整数，解析失败按 0 处理。（Parses number-or-string ints, defaulting to 0 on failure.）
 func (f *flexInt) UnmarshalJSON(b []byte) error {
 	s := strings.TrimSpace(strings.Trim(string(b), `"`))
 	if s == "" {
@@ -222,8 +240,10 @@ func (f *flexInt) UnmarshalJSON(b []byte) error {
 }
 
 // flexBool 兼容 JSON 中布尔字段为布尔或字符串（如 true 或 "true"）的解析。
+// （flexBool tolerates bool fields serialized as boolean or string, e.g. true or "true".）
 type flexBool bool
 
+// UnmarshalJSON 解析布尔或字符串形式的布尔值，解析失败按 false 处理。（Parses boolean-or-string bools, defaulting to false on failure.）
 func (f *flexBool) UnmarshalJSON(b []byte) error {
 	s := strings.TrimSpace(strings.Trim(string(b), `"`))
 	v, err := strconv.ParseBool(s)
@@ -241,6 +261,8 @@ func (f *flexBool) UnmarshalJSON(b []byte) error {
 //     先修复 "key":] / "key":} 的空值畸形与字符串 index/material，单个坏对象只丢该条，不整批废弃。
 //
 // 返回 (解析结果, 是否获得至少一条)。
+// （salvageStage0Objects parses a Stage0 batch in two passes against reasoning-model JSON jitter: try the whole
+// array first, then salvage per object via brace-depth scanning, so one bad object never discards the batch.）
 func salvageStage0Objects(resp string) ([]stage0Judge, bool) {
 	var raw []stage0Judge
 	if err := json.Unmarshal([]byte(resp), &raw); err == nil {
@@ -270,6 +292,7 @@ func salvageStage0Objects(resp string) ([]stage0Judge, bool) {
 
 // extractObjects 用花括号配对扫描提取字符串中所有独立的 JSON 对象 `{...}`（含嵌套），
 // 无视换行/逗号/数组包裹等格式差异（推理模型的输出排版不可靠）。
+// （extractObjects scans for balanced braces to pull out every standalone JSON object, ignoring formatting differences.）
 func extractObjects(s string) []string {
 	var objs []string
 	start := -1
@@ -311,6 +334,7 @@ func extractObjects(s string) []string {
 }
 
 // truncateRunes 按字符数截断字符串（超出部分截断），避免超长正文撑爆 prompt。
+// （truncateRunes truncates a string to max runes to keep prompts bounded.）
 func truncateRunes(s string, max int) string {
 	r := []rune(s)
 	if len(r) <= max {
@@ -326,6 +350,9 @@ func truncateRunes(s string, max int) string {
 //   - 个股新闻：标题+正文含已知股票名（StockCleaner 映射命中），预填关联股票
 //   - 板块新闻：标题含行业/宏观关键词，须通过 material 价值初筛（原 Stage1 职责）
 //   - 其余：一般
+//
+// （Stage0 attribution (merged): a single LLM call outputs category + value + corrected title, routed into
+// stock/sector/general/IPO buckets.）
 func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 	var res Stage0Result
 	if len(items) == 0 {
@@ -394,13 +421,14 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 }
 
 // applyCorrected 记录标题党校正标题（仅当 LLM 给出且与原标题不同）。
+// （applyCorrected records the corrected title only when the LLM provided one different from the original.）
 func applyCorrected(res *Stage0Result, idx int, original string, j combinedJudge) {
 	if j.CorrectedTitle != "" && j.CorrectedTitle != original {
 		res.CorrectedTitle[idx] = j.CorrectedTitle
 	}
 }
 
-// newsTitles 提取新闻列表的标题。
+// newsTitles 提取新闻列表的标题。（newsTitles extracts the titles of a news list.）
 func newsTitles(items []data.NewsItem) []string {
 	out := make([]string, len(items))
 	for i, item := range items {
@@ -412,16 +440,18 @@ func newsTitles(items []data.NewsItem) []string {
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。
 // 推理模型（GLM-Z1-9B）对大批次首 token 极慢，30 条会 240s 超时等不到响应头，
 // 调小到 10 条使单批在超时内完成，代价是多几次调用（更稳）。
+// （Max items per LLM batch to avoid timeouts; 10 keeps each batch within the timeout as reasoning models are slow on first tokens.）
 const llmBatchSize = 10
 
 // llmRetryMax LLM 单次调用的最大重试次数（含首次），指数退避，应对上游瞬时抖动/连不通。
+// （Max LLM retry attempts per call with exponential backoff against upstream jitter.）
 const llmRetryMax = 5
 
-// retryLLM 以指数退避方式重试一次 LLM 调用：失败重试 5 次，间隔 1s/2s/4s/8s。
-// 返回 (响应, 最后一次错误)。记录每次失败以便排障。
 // stage0ParseRetry 单批"调用+解析"的重试循环（重试队列）：API 失败 与 JSON 解析失败 一律退避重试，
 // 任一次调用能抢救出 ≥1 条即成功（局部坏对象已由 salvageStage0Objects 内部跳过），
 // 全部失败返回错误，由调用方将该批隔离跳过（不影响主干其余批次）。
+// （stage0ParseRetry is a per-batch call+parse retry loop with backoff; any attempt yielding ≥1 row succeeds,
+// otherwise the batch is isolated and skipped by the caller without affecting the main flow.）
 func (a *Agent) stage0ParseRetry(userMsg string) ([]stage0Judge, error) {
 	var lastErr error
 	for attempt := 1; attempt <= llmRetryMax; attempt++ {
@@ -444,6 +474,7 @@ func (a *Agent) stage0ParseRetry(userMsg string) ([]stage0Judge, error) {
 }
 
 // backoffStep 第 attempt 次失败后的退避间隔（指数递增，1s/2s/4s/8s/16s 封顶）。
+// （backoffStep returns the backoff interval for the given attempt, capping at 16s.）
 func backoffStep(attempt int) time.Duration {
 	base := []time.Duration{1, 2, 4, 8, 16}
 	if attempt-1 < len(base) {
@@ -452,6 +483,10 @@ func backoffStep(attempt int) time.Duration {
 	return 16 * time.Second
 }
 
+// retryLLM 以指数退避方式重试一次 LLM 调用：失败重试 5 次，间隔 1s/2s/4s/8s。
+// 返回 (响应, 最后一次错误)。记录每次失败以便排障。
+// （retryLLM retries an LLM call with exponential backoff (5 attempts, 1s/2s/4s/8s), returning the response
+// and last error, logging each failure for debugging.）
 func retryLLM(userMsg string, call func() (string, error)) (string, error) {
 	var resp string
 	var err error
@@ -470,6 +505,7 @@ func retryLLM(userMsg string, call func() (string, error)) (string, error) {
 }
 
 // batchBounds 将 n 个元素按 size 分块，返回 [start,end) 区间列表。
+// （batchBounds splits n items into size-sized chunks and returns the [start,end) ranges.）
 func batchBounds(n, size int) [][2]int {
 	var out [][2]int
 	for start := 0; start < n; start += size {
@@ -485,6 +521,8 @@ func batchBounds(n, size int) [][2]int {
 // classifyJunk LLM 分批分类新闻为 官方/机构/互动/海外 四类，返回垃圾（非 official）索引集合。
 // LLM 失败时降级为关键词过滤（仅剔除明显非官方的机构/互动/海外盘面类），保证流水线不中断。
 // 分批上限 llmBatchSize 条/次，避免超大批次导致 LLM 超时。
+// （classifyJunk classifies news into official/institution/interactive/overseas in batches and returns the
+// non-official indices, falling back to keyword filtering when the LLM fails so the pipeline keeps running.）
 func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
 	junk := make(map[int]bool)
 	if len(titles) == 0 {
@@ -551,6 +589,8 @@ func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
 
 // classifyMaterial Stage1 初筛：优先使用 LLM 判断新闻价值，无 LLM 时回退关键词过滤。
 // 分批处理（llmBatchSize 条/次）。某批 LLM 失败/解析失败时该批全部视为有价值。
+// （classifyMaterial is the Stage1 screen preferring LLM judgement and falling back to keywords without LLM;
+// a failed/parse-failed batch is treated as fully valuable.）
 func (a *Agent) classifyMaterial(titles []string) ([]int, error) {
 	if len(titles) == 0 {
 		return nil, nil
@@ -626,6 +666,7 @@ func (a *Agent) classifyMaterial(titles []string) ([]int, error) {
 }
 
 // cleanJSON 清理 LLM 返回的 JSON 字符串中的 markdown 代码块标记。
+// （cleanJSON strips markdown code fences from LLM JSON output.）
 func cleanJSON(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "```json")
@@ -672,7 +713,7 @@ func cleanJSON(s string) string {
 	return buf.String()
 }
 
-// isValidJSONEscape 判断字节是否为合法 JSON 转义字符。
+// isValidJSONEscape 判断字节是否为合法 JSON 转义字符。（isValidJSONEscape reports whether the byte is a valid JSON escape char.）
 func isValidJSONEscape(b byte) bool {
 	switch b {
 	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
@@ -682,4 +723,5 @@ func isValidJSONEscape(b byte) bool {
 }
 
 // plusNumberRe 匹配冒号/逗号/左括号后的 '+' 前缀（数值位置），用于剥离非法 '+'。
+// （Matches a stray + prefix at numeric positions after : , or [ for removal.）
 var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)

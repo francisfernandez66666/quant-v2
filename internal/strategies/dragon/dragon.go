@@ -28,6 +28,10 @@
 //	P2_divergence：分歧转一致（F3 高分时）
 //	P3_weak_to_strong：弱转强（F4 高分时）
 //	P4_pullback：回调低吸（PullbackMaxPct 配置）
+//
+// （English: Implements the "Dragon" sector-leader strategy — enter the strongest limit-up stock of a sector on the
+// first re-seal after divergence, scoring F1 seal quality / F2 sector resonance / F3 premium / F4 RS strength, with
+// 70/50 thresholds→ full_chain/brief/watch and four buy-point categories.）
 package dragon
 
 import (
@@ -38,33 +42,33 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// DragonStrategy 破局龙战法策略结构。
-// 使用 F1~F4 四维评分判断龙头股封板质量和参与机会。
+// DragonStrategy 破局龙战法策略结构。（DragonStrategy is the Dragon strategy struct.）
+// 使用 F1~F4 四维评分判断龙头股封板质量和参与机会。（Scores sector-leader seal quality via F1~F4.）
 type DragonStrategy struct {
-	cfg *config.Manager // 配置管理器（热加载 DragonConfig）
+	cfg *config.Manager // 配置管理器（热加载 DragonConfig）（Config manager, hot-reloads DragonConfig）
 }
 
-// New 创建破局龙战法策略实例。
+// New 创建破局龙战法策略实例。（New creates a Dragon strategy instance.）
 func New(cfg *config.Manager) *DragonStrategy {
 	return &DragonStrategy{cfg: cfg}
 }
 
-// Name 返回策略中文名称"破局龙战法"。
+// Name 返回策略中文名称"破局龙战法"。（Name returns the strategy display name "破局龙战法".）
 func (d *DragonStrategy) Name() string {
 	return "破局龙战法"
 }
 
-// Type 返回信号类型标识 SignalDragon。
+// Type 返回信号类型标识 SignalDragon。（Type returns the signal type SignalDragon.）
 func (d *DragonStrategy) Type() strategy.SignalType {
 	return strategy.SignalDragon
 }
 
-// Evaluate 标准接口（占位）。实际使用 EvaluateReal 传入结构化数据。
+// Evaluate 标准接口（占位）。实际使用 EvaluateReal 传入结构化数据。（Standard interface stub; real scoring uses EvaluateReal.）
 func (d *DragonStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Pass: false, Level: "nodata", Confidence: 0}, nil
 }
 
-// EvaluateReal 执行破局龙战法核心评分。
+// EvaluateReal 执行破局龙战法核心评分。（EvaluateReal runs the core Dragon scoring.）
 // 输入：si（个股实时信息，含价格/涨幅/成交量）、kLines（日K线，用于RS趋势）、
 // sectors（板块信息列表，用于板块共振判断）。
 //
@@ -72,27 +76,30 @@ func (d *DragonStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 // F2 板块共振：取所有板块最大涨幅。
 // F3 溢价率：个股涨幅超出板块最强涨幅 2%+ 说明辨识度突出。
 // F4 RS 强度：近 5 日趋势涨幅。
+//
+// （English: Inputs are si (realtime info), kLines (daily bars for RS trend) and sectors (for resonance). Scores the
+// seal quality F1, sector resonance F2, premium F3 and 5-day RS strength F4.）
 func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []data.KLine, sectors []data.SectorInfo) *strategy.Evaluation {
-	// 基础数据校验：无实时价或 K 线不足 5 根无法评分
+	// 基础数据校验：无实时价或 K 线不足 5 根无法评分（Guard: require a live price and ≥5 bars to score）
 	if si == nil || si.Price <= 0 || len(kLines) < 5 {
 		return nil
 	}
 	cfg := d.cfg.Get()
-	// 读取热加载的破局龙配置（F1~F4 权重、回调幅度等）
+	// 读取热加载的破局龙配置（F1~F4 权重、回调幅度等）（Load the hot-reloaded Dragon config, F1~F4 weights etc.）
 	dc := cfg.Strategy.Dragon
 
-	// F1: 封板质量 — 基于涨幅和成交量
-	// 涨幅>9.5%视为封板，量额比高说明封板坚决。
+	// F1: 封板质量 — 基于涨幅和成交量（F1: seal quality — based on gain and volume）
+	// 涨幅>9.5%视为封板，量额比高说明封板坚决。（Gain >9.5% counts as sealed; a high volume/turnover ratio implies a firm seal.）
 	f1 := 0.0
 	if si.ChangePct > 9.5 {
-		// 基础分 = 权重×90%；量额比（成交量/成交额）越高封板越坚决，最高补充 10%
+		// 基础分 = 权重×90%；量额比（成交量/成交额）越高封板越坚决，最高补充 10%（Base=weight×90%; volume/turnover ratio adds up to 10%）
 		f1 = dc.F1SealWeight * 100 * 0.9
 		if si.Amount > 0 {
 			f1 += (float64(si.Volume) / si.Amount) * 0.1 * dc.F1SealWeight * 100
 		}
 	}
 
-	// F2: 板块共振 — 取板块最大涨幅
+	// F2: 板块共振 — 取板块最大涨幅（F2: sector resonance — max sector gain）
 	f2 := 0.0
 	bestSector := 0.0
 	for _, sec := range sectors {
@@ -100,15 +107,15 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 			bestSector = sec.ChangePct
 		}
 	}
-	// 板块涨幅 >3% → 满分；>1% → 半值；否则 0
+	// 板块涨幅 >3% → 满分；>1% → 半值；否则 0（Sector gain >3% → full marks, >1% → half, else 0）
 	if bestSector > 3 {
 		f2 = dc.F2ResonanceWeight * 100
 	} else if bestSector > 1 {
 		f2 = dc.F2ResonanceWeight * 100 * 0.5
 	}
 
-	// F3: 溢价率 — 个股涨幅偏离板块最强涨幅
-	// 超出最强板块 2%+ → 满分（辨识度突出）；个股自身 >5% → 半值
+	// F3: 溢价率 — 个股涨幅偏离板块最强涨幅（F3: premium — stock gain vs. the strongest sector gain）
+	// 超出最强板块 2%+ → 满分（辨识度突出）；个股自身 >5% → 半值（+2% above the best sector → full marks (outstanding); own gain >5% → half）
 	f3 := 0.0
 	if bestSector > 0 && si.ChangePct > bestSector+2 {
 		f3 = dc.F3PremiumWeight * 100
@@ -116,11 +123,11 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 		f3 = dc.F3PremiumWeight * 100 * 0.5
 	}
 
-	// F4: RS强度 — 近5日趋势涨幅
+	// F4: RS强度 — 近5日趋势涨幅（F4: RS strength — 5-day trend gain）
 	f4 := 0.0
 	if len(kLines) >= 5 {
 		trend := (kLines[len(kLines)-1].Close - kLines[len(kLines)-5].Close) / kLines[len(kLines)-5].Close * 100
-		// 5日涨幅 >10% → 满分；>5% → 半值
+		// 5日涨幅 >10% → 满分；>5% → 半值（5-day gain >10% → full marks, >5% → half）
 		if trend > 10 {
 			f4 = dc.F4RsWeight * 100
 		} else if trend > 5 {
@@ -128,11 +135,11 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 		}
 	}
 
-	// 总分封顶 100；pass 至少需 ≥50
+	// 总分封顶 100；pass 至少需 ≥50（Cap total at 100; pass requires ≥50）
 	total := math.Min(f1+f2+f3+f4, 100)
 	pass := total >= 50
 	level := "watch"
-	// 总分 ≥70 → full_chain（完整链，买入）；≥50 → brief（半确认，观察）
+	// 总分 ≥70 → full_chain（完整链，买入）；≥50 → brief（半确认，观察）（Total ≥70 → full_chain (buy); ≥50 → brief (watch)）
 	if total >= 70 {
 		level = "full_chain"
 		pass = true
@@ -154,17 +161,17 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	}
 }
 
-// GenerateSignal 将评分结果转化为交易信号。
-// full_chain → buy，置信度>0.8 → P1，否则 P2。
-// brief → watch，P3_5。
+// GenerateSignal 将评分结果转化为交易信号。（GenerateSignal converts an evaluation into a trade signal.）
+// full_chain → buy，置信度>0.8 → P1，否则 P2。（full_chain→buy; confidence>0.8→P1 otherwise P2.）
+// brief → watch，P3_5。（brief→watch with priority P3_5.）
 func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
-	// 默认：仅观察（watch / P3）
+	// 默认：仅观察（watch / P3）（Default: watch only with P3）
 	prio := strategy.P3
 	action := strategy.ActionWatch
 
 	switch eval.Level {
 	case "full_chain":
-		// 完整链确认：买入信号，按置信度分 P1/P2
+		// 完整链确认：买入信号，按置信度分 P1/P2（Full-chain confirmation: buy, tiered by confidence to P1/P2）
 		action = strategy.ActionBuy
 		if eval.Confidence > 0.8 {
 			prio = strategy.P1
@@ -172,12 +179,12 @@ func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 			prio = strategy.P2
 		}
 	case "brief":
-		// 半确认：保持观察，P3_5
+		// 半确认：保持观察，P3_5（Half confirmation: keep watching at P3_5）
 		action = strategy.ActionWatch
 		prio = strategy.P3_5
 	}
 
-	// 复制评分明细到 Meta（供前端展示 F1~F4 分数）
+	// 复制评分明细到 Meta（供前端展示 F1~F4 分数）（Copy score details into Meta for the frontend）
 	meta := make(map[string]float64)
 	for k, v := range eval.Details {
 		meta[k] = v
@@ -193,13 +200,13 @@ func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	}, nil
 }
 
-// BuyPoints 返回四类买点对应的权重映射。
-// 用于仓位管理和分段建仓决策。
+// BuyPoints 返回四类买点对应的权重映射。（BuyPoints returns weight mappings for the four buy-point categories.）
+// 用于仓位管理和分段建仓决策。（Used for position sizing and staged entry decisions.）
 func (d *DragonStrategy) BuyPoints(cfg config.DragonConfig) map[string]float64 {
 	return map[string]float64{
-		"P1_first_to_second": cfg.F1SealWeight + cfg.F2ResonanceWeight, // 首封→二封
-		"P2_divergence":      cfg.F3PremiumWeight,                      // 分歧转一致
-		"P3_weak_to_strong":  cfg.F4RsWeight,                           // 弱转强
-		"P4_pullback":        cfg.PullbackMaxPct,                       // 回调低吸最大幅度
+		"P1_first_to_second": cfg.F1SealWeight + cfg.F2ResonanceWeight, // 首封→二封（First seal → second seal）
+		"P2_divergence":      cfg.F3PremiumWeight,                      // 分歧转一致（Divergence → convergence）
+		"P3_weak_to_strong":  cfg.F4RsWeight,                           // 弱转强（Weak to strong）
+		"P4_pullback":        cfg.PullbackMaxPct,                       // 回调低吸最大幅度（Max pullback dip-buying range）
 	}
 }

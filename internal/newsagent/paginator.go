@@ -7,12 +7,14 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
-// maxCatchUpPages 最多追回页数（同花顺20条/页 × 25页 = 500条）
+// maxCatchUpPages 最多追回页数（同花顺20条/页 × 25页 = 500条）（Max catch-up pages: 20 items/page × 25 = 500.）
 const maxCatchUpPages = 25
 
 // fetchCatchUp 追回未读新闻：多源拉取（同花顺分页 + 财联社 + 新浪兜底），
 // 统一去重并标记为已见，最后并发抓取正文回填。返回去重后的新闻列表。
 // force=true 时忽略历史已见标题（仅按本轮 seen 打重），用于"手动 LLM 补推"重跑分析。
+// （fetchCatchUp fetches unread news from THS paging + CLS + Sina fallback, then dedupes, marks seen and
+// concurrently enriches bodies. force=true ignores historical seen titles for manual LLM re-analysis.）
 func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 	var all []data.NewsItem
 	// seen 记录本轮已见过的标题（截断到60字符），跨源去重
@@ -46,6 +48,7 @@ func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 }
 
 // FetchForce 强制拉取最近新闻（忽略 tracker 历史去重），供"手动 LLM 补推"重跑分析使用。
+// （FetchForce fetches recent news ignoring tracker history dedup, for manual LLM re-analysis.）
 func (a *Agent) FetchForce() []data.NewsItem {
 	return a.fetchCatchUp(true)
 }
@@ -53,6 +56,8 @@ func (a *Agent) FetchForce() []data.NewsItem {
 // fetchTHSPages 从同花顺逐页拉取新闻（每页 20 条），只保留未读条目。
 // 当前页全部已读则停止追页，标识已达到上次已见位置。
 // force=true 时忽略历史去重（补推场景），仅按本轮 seen 打重，并追完所有页。
+// （fetchTHSPages pages through THS news (20/page), keeping only unread items. Stops when a page is fully
+// read; with force=true it ignores history dedup and fetches all pages.）
 func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem {
 	var all []data.NewsItem
 
@@ -93,6 +98,7 @@ func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem 
 }
 
 // fetchSinaOnce 拉取一页新浪新闻（20 条），去重后返回。
+// （fetchSinaOnce fetches one page of Sina news (20 items) and returns the deduplicated results.）
 func (a *Agent) fetchSinaOnce(seen map[string]bool, force bool) []data.NewsItem {
 	items, err := a.marketAPI.GetSinaNews(20)
 	if err != nil {
@@ -112,6 +118,7 @@ func (a *Agent) fetchSinaOnce(seen map[string]bool, force bool) []data.NewsItem 
 }
 
 // fetchCLSOnce 拉取一页财联社电报（正文自带），去重后返回。
+// （fetchCLSOnce fetches one page of CLS telegrams (with bodies) and returns the deduplicated results.）
 func (a *Agent) fetchCLSOnce(seen map[string]bool, force bool) []data.NewsItem {
 	items, err := a.marketAPI.GetCLSNews(20)
 	if err != nil {
@@ -132,6 +139,7 @@ func (a *Agent) fetchCLSOnce(seen map[string]bool, force bool) []data.NewsItem {
 }
 
 // truncateStr 按字符数截断字符串（最多 maxLen 个字符），用于标题去重键归一。
+// （truncateStr truncates a string by runes (max maxLen) to normalize dedup keys.）
 func truncateStr(s string, maxLen int) string {
 	runes := []rune(s)
 	if len(runes) > maxLen {

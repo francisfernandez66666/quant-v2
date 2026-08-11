@@ -1,4 +1,5 @@
 // Package notify 信号历史记录，将信号持久化到 CSV 文件并支持按日期查询。
+// （Package notify provides signal history: persisting signals to a CSV file and querying by date.）
 package notify
 
 import (
@@ -12,6 +13,7 @@ import (
 )
 
 // SignalRecord 单条信号历史记录，包含时间、代码、策略、操作、评分等字段。
+// （SignalRecord is a single signal history record with time, code, strategy, action and scores.）
 type SignalRecord struct {
 	Time           time.Time // 信号时间
 	Code           string    // 股票代码
@@ -26,6 +28,7 @@ type SignalRecord struct {
 }
 
 // History 信号历史管理器，维护当日 CSV 文件写入和内存记录。
+// （History manages the per-day CSV file writes and in-memory records.）
 type History struct {
 	mu      sync.Mutex     // 保护内存记录与文件写入的互斥锁
 	file    *os.File       // 当日 CSV 文件句柄
@@ -35,14 +38,14 @@ type History struct {
 	today   string         // 当前文件对应的日期（YYYY-MM-DD），跨天时切换文件
 }
 
-// NewHistory 创建历史管理器，自动创建或追加当日 CSV 文件。
+// NewHistory 创建历史管理器，自动创建或追加当日 CSV 文件。（Creates a history manager, opening or appending today's CSV.）
 func NewHistory(dir string) *History {
 	h := &History{dir: dir}
 	h.ensureFile()
 	return h
 }
 
-// Record 记录一条信号，追加到内存列表并写入 CSV。
+// Record 记录一条信号，追加到内存列表并写入 CSV。（Records a signal into memory and appends it to the CSV.）
 func (h *History) Record(sig *SignalRecord) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -67,14 +70,14 @@ func (h *History) Record(sig *SignalRecord) {
 	}
 }
 
-// TodayRecords 返回今天的所有信号记录。
+// TodayRecords 返回今天的所有信号记录。（Returns all of today's signal records.）
 func (h *History) TodayRecords() []SignalRecord {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.filterByDate(time.Now())
 }
 
-// YesterdayRecords 返回昨天的所有信号记录。
+// YesterdayRecords 返回昨天的所有信号记录。（Returns all of yesterday's signal records.）
 func (h *History) YesterdayRecords() []SignalRecord {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -82,6 +85,7 @@ func (h *History) YesterdayRecords() []SignalRecord {
 }
 
 // filterByDate 按指定日期的 YYYY-MM-DD 过滤内存记录（调用方需持有锁）。
+// （filterByDate filters in-memory records by the YYYY-MM-DD date; caller must hold the lock.）
 func (h *History) filterByDate(t time.Time) []SignalRecord {
 	date := t.Format("2006-01-02")
 	var out []SignalRecord
@@ -94,6 +98,7 @@ func (h *History) filterByDate(t time.Time) []SignalRecord {
 }
 
 // Summary 生成今日信号汇总日报文字，含强信号/观察/买入/卖出计数。
+// （Summary builds today's daily signal summary text with strong/observe/buy/sell counts.）
 func (h *History) Summary() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -128,7 +133,7 @@ func (h *History) Summary() string {
 `, today, strong+observe, strong, observe, buy, sell)
 }
 
-// Close 刷新并关闭 CSV 文件。
+// Close 刷新并关闭 CSV 文件。（Flushes and closes the CSV file.）
 func (h *History) Close() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -141,6 +146,7 @@ func (h *History) Close() {
 }
 
 // ensureFile 检查日期是否变更，按日切换 CSV 文件并写入表头。
+// （ensureFile checks for a date change, switches the CSV file per day and writes the header.）
 func (h *History) ensureFile() {
 	today := time.Now().Format("2006-01-02")
 	if h.today == today && h.file != nil {

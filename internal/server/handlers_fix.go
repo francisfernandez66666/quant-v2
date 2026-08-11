@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -165,10 +166,18 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]map[string]interface{}, 0, len(msgs))
 		for _, m := range msgs {
+			name := m.Name
+			// 消息中心名称为空或等于代码时，用行情权威名回填（一次性迁移，持久化到存储）
+			if name == "" || name == m.Code {
+				if info, err := s.quote(m.Code); err == nil && info.Name != "" && info.Name != m.Code {
+					name = info.Name
+					s.ctrl.RefreshMessageName(m.Code, name)
+				}
+			}
 			out = append(out, map[string]interface{}{
 				"id":        m.ID,
 				"code":      m.Code,
-				"name":      m.Name,
+				"name":      name,
 				"type":      m.Level,
 				"level":     m.Level,
 				"action":    m.Action,
@@ -300,8 +309,9 @@ type fixHolding struct {
 	DbScore       float64 `json:"db_score"`        // 双凸策略评分
 	DrScore       float64 `json:"dr_score"`        // 龙回头策略评分
 	MScore        float64 `json:"m_score"`         // 动量策略评分
-	TakeProfit    float64 `json:"take_profit"`     // 止盈目标价
-	StopLoss      float64 `json:"stop_loss"`       // 止损价位
+TakeProfit    float64    `json:"take_profit"`     // 止盈目标价
+	StopLoss      float64    `json:"stop_loss"`       // 止损价位
+	Lots          []report.Lot `json:"lots,omitempty"` // 加仓批次明细
 }
 
 // handleFixGetHoldings 处理 GET /api/holdings 请求，返回当前持仓列表。
@@ -314,63 +324,87 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 		if l.Status != "持仓中" {
 			continue
 		}
-		cur := l.EntryPrice
-		chg := 0.0
-		pnl := 0.0
-		name := l.Name
-		// 实时拉取股价；失败时回退到开仓价（盈亏视为 0）
-		if info, err := s.quote(l.Code); err == nil {
-			cur = info.Price
-			chg = info.ChangePct
-			name = info.Name
-		}
-		// 盈亏比例 = (现价 - 成本价) / 成本价 * 100
-		if cur > 0 && l.EntryPrice > 0 {
-			pnl = (cur - l.EntryPrice) / l.EntryPrice * 100
-		}
-		qty := l.Quantity
-		if qty <= 0 {
-			qty = 1
-		}
-		h := fixHolding{
-			Code:          l.Code,
-			Name:          name,
-			Quantity:      qty,
-			CostPrice:     r2(l.EntryPrice),
-			CurPrice:      r2(cur),
-			ChangePct:     r2(chg),
-			PnlPct:        r2(pnl),
-			TakeProfitPct: r2(l.TakeProfitPct),
-			StopLossPct:   r2(l.StopLossPct),
-			TakeProfit:    r2(l.EntryPrice * (1 + l.TakeProfitPct/100)),
-			StopLoss:      r2(l.EntryPrice * (1 - l.StopLossPct/100)),
-		}
-		dash := s.agg.Current()
-		if dash != nil {
-			// 优先取 8a/8b 持续打分分数；无打分记录时回退到最终信号置信度
-			if sc, ok := dash.Scores[l.Code]; ok {
-				h.SignalActive = sc.SignalActive
-				h.NSscore = sc.NScore
-				h.DragonScore = sc.DragonScore
-				h.MScore = sc.MomentumScore
-				h.DbScore = sc.DoubleBumpScore
-				h.DrScore = sc.DragonReturnScore
-			} else {
-				for _, fs := range dash.FinalSignals {
-					if fs.Code == l.Code {
-						h.SignalActive = true
-						h.NSscore = fs.Confidence * 100
-						break
-					}
-				}
-			}
-		}
-		holdings = append(holdings, h)
+		holdings = append(holdings, s.buildHolding(l))
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"holdings":          holdings,
 		"available_balance": 0,
 	})
+}
+
+// buildHolding 将一条持仓执行日志组装为前端 fixHolding 格式：
+// 实时拉取股价计算盈亏与当日涨跌，关联聚合器的评分/活跃信号，附上加仓批次明细。
+func (s *Server) buildHolding(l report.ExecLog) fixHolding {
+	cur := l.EntryPrice
+	chg := 0.0
+	pnl := 0.0
+	name := l.Name
+	// 实时拉取股价；失败时回退到开仓价（盈亏视为 0）
+	if info, err := s.quote(l.Code); err == nil {
+		cur = info.Price
+		chg = info.ChangePct
+		name = info.Name
+		// 顺带回填仓库里的旧名/空名，提升消息与展示一致性
+		if name != "" && name != l.Name {
+			s.rpt.Update(l.SignalID, func(x *report.ExecLog) { x.Name = name })
+		}
+	}
+	// 盈亏比例 = (现价 - 成本价) / 成本价 * 100
+	if cur > 0 && l.EntryPrice > 0 {
+		pnl = (cur - l.EntryPrice) / l.EntryPrice * 100
+	}
+	qty := l.Quantity
+	if qty <= 0 {
+		qty = 1
+	}
+	h := fixHolding{
+		Code:          l.Code,
+		Name:          name,
+		Quantity:      qty,
+		CostPrice:     r2(l.EntryPrice),
+		CurPrice:      r2(cur),
+		ChangePct:     r2(chg),
+		PnlPct:        r2(pnl),
+		TakeProfitPct: r2(l.TakeProfitPct),
+		StopLossPct:   r2(l.StopLossPct),
+		TakeProfit:    r2(l.EntryPrice * (1 + l.TakeProfitPct/100)),
+		StopLoss:      r2(l.EntryPrice * (1 - l.StopLossPct/100)),
+		Lots:          holdingLots(l),
+	}
+	dash := s.agg.Current()
+	if dash != nil {
+		// 优先取 8a/8b 持续打分分数；无打分记录时回退到最终信号置信度
+		if sc, ok := dash.Scores[l.Code]; ok {
+			h.SignalActive = sc.SignalActive
+			h.NSscore = sc.NScore
+			h.DragonScore = sc.DragonScore
+			h.MScore = sc.MomentumScore
+			h.DbScore = sc.DoubleBumpScore
+			h.DrScore = sc.DragonReturnScore
+		} else {
+			for _, fs := range dash.FinalSignals {
+				if fs.Code == l.Code {
+					h.SignalActive = true
+					h.NSscore = fs.Confidence * 100
+					break
+				}
+			}
+		}
+	}
+	return h
+}
+
+// holdingLots 返回持仓的加仓批次明细；无批次记录的旧数据用一条合成批次兜底
+// （以现有开仓价/数量为准），保证前端明细始终有数据可展示。
+func holdingLots(l report.ExecLog) []report.Lot {
+	if len(l.Lots) > 0 {
+		return l.Lots
+	}
+	qty := l.Quantity
+	if qty <= 0 {
+		qty = 1
+	}
+	return []report.Lot{{Price: l.EntryPrice, Quantity: qty, At: l.EntryAt}}
 }
 
 // fixSetHoldingsReq 手动设置持仓的请求结构体。
@@ -389,16 +423,42 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = req.AvailableBalance
 	for _, h := range req.Holdings {
-		existing := s.rpt.FindBySignalID(h.Code + "_fix")
+		// 定位持仓：优先手动 _fix；无 _fix 时回退到同代码的现有持仓（兼容信号创建的持仓，避免重复建档）
+		id := h.Code + "_fix"
+		if s.rpt.FindBySignalID(id) == nil {
+			if heldID := s.heldSignalIDByCode(h.Code); heldID != "" {
+				id = heldID
+			}
+		}
+		existing := s.rpt.FindBySignalID(id)
 		if existing == nil {
-			s.rpt.LogSignal(h.Code+"_fix", h.Code, h.Name, "做多", "手动", h.CostPrice, h.TakeProfitPct, h.StopLossPct)
-			s.rpt.Update(h.Code+"_fix", func(l *report.ExecLog) { l.Quantity = h.Quantity })
+			s.rpt.LogSignal(id, h.Code, h.Name, "做多", "手动", h.CostPrice, h.TakeProfitPct, h.StopLossPct)
+			s.rpt.AddLot(id, h.CostPrice, h.Quantity)
 		} else {
-			s.rpt.Update(h.Code+"_fix", func(l *report.ExecLog) {
-				l.EntryPrice = h.CostPrice
+			now := time.Now()
+			s.rpt.Update(id, func(l *report.ExecLog) {
+				// 重新买入：若该记录此前已平仓/删除，先重置为持仓中并清空平仓信息，
+				// 否则会被 handleFixGetHoldings 的“持仓中”过滤掉，导致刷新后持仓消失。
+				if l.Status != "持仓中" {
+					l.Status = "持仓中"
+					l.ExitAt = nil
+					l.ExitPrice = nil
+					l.ProfitPct = nil
+				}
 				l.TakeProfitPct = h.TakeProfitPct
 				l.StopLossPct = h.StopLossPct
-				l.Quantity = h.Quantity
+				if h.Name != "" {
+					l.Name = h.Name
+				}
+				// 仅当成本/数量被显式改动时才重建批次明细（编辑/覆盖）；
+				// 否则保留 加仓 接口维护的真实批次，避免整表同步时误清零明细。
+				costChanged := math.Abs(h.CostPrice-l.EntryPrice) > 0.005 ||
+					math.Abs(h.Quantity-l.Quantity) > 0.5
+				if len(l.Lots) == 0 || costChanged {
+					l.EntryPrice = h.CostPrice
+					l.Quantity = h.Quantity
+					l.Lots = []report.Lot{{Price: h.CostPrice, Quantity: h.Quantity, At: now}}
+				}
 			})
 		}
 	}
@@ -420,7 +480,198 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-// thsTopFallbackBoards 返回同花顺板块行情表（行业+概念 top-20），带 60s 缓存。
+// addHoldingLotReq 加仓请求体：加仓价格与数量。
+type addHoldingLotReq struct {
+	Price    float64 `json:"price"`
+	Quantity float64 `json:"quantity"`
+}
+
+// heldSignalIDByCode 返回某代码当前最末一笔"持仓中"记录的信号 ID；无持仓返回空串。
+func (s *Server) heldSignalIDByCode(code string) string {
+	for _, l := range s.rpt.HeldPositions() {
+		if l.Code == code {
+			return l.SignalID
+		}
+	}
+	return ""
+}
+
+// handleFixAddHoldingLot 处理 POST /api/holdings/{code}/add 请求：对持仓增量买入加仓。
+// 按代码定位持仓（兼容手动 _fix 与信号创建的持仓，避免产生重复记录），
+// 追加一笔批次并重算加权平均成本；该股无持仓时直接创建手动持仓作为首笔。
+func (s *Server) handleFixAddHoldingLot(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	var req addHoldingLotReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if code == "" || req.Price <= 0 || req.Quantity <= 0 {
+		writeError(w, 400, "code and positive price/quantity required")
+		return
+	}
+	id := s.heldSignalIDByCode(code)
+	if id == "" {
+		name := code
+		if info, err := s.quote(code); err == nil && info.Name != "" {
+			name = info.Name
+		}
+		// 新开仓使用唯一 ID（code+t时间戳），避免与已平仓的旧 _fix 记录复用同一 ID 导致批次错乱
+		id = code + "_fix_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		s.rpt.LogSignal(id, code, name, "做多", "手动", req.Price, 8, 5)
+		log.Printf("[server] 手动开仓 %s %s 价%.3f (id=%s)", code, name, req.Price, id)
+	}
+	s.rpt.AddLot(id, req.Price, req.Quantity)
+	log.Printf("[server] 加仓 %s 价%.3f 量%.0f", code, req.Price, req.Quantity)
+	for _, l := range s.rpt.HeldPositions() {
+		if l.Code == code {
+			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]interface{}{"holding": nil})
+}
+
+// handleFixSetCost 处理 POST /api/holdings/{code}/cost 请求：直接更新持仓成本价。
+func (s *Server) handleFixSetCost(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	var req addHoldingLotReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	id := s.heldSignalIDByCode(code)
+	if id == "" {
+		writeError(w, 404, "no position held for code")
+		return
+	}
+	if req.Price <= 0 {
+		writeError(w, 400, "positive price required")
+		return
+	}
+	s.rpt.SetCostBasis(id, req.Price)
+	log.Printf("[server] 更新成本 %s 成本%.3f", code, req.Price)
+	for _, l := range s.rpt.HeldPositions() {
+		if l.Code == code {
+			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]interface{}{"holding": nil})
+}
+
+// closeHoldingReq 清仓请求体：清仓价。
+type closeHoldingReq struct {
+	Price float64 `json:"price"`
+}
+
+// sellHoldingReq 减仓请求体：卖出价与卖出数量。
+type sellHoldingReq struct {
+	Price    float64 `json:"price"`
+	Quantity float64 `json:"quantity"`
+}
+
+// handleFixSellHolding 处理 POST /api/holdings/{code}/sell 请求：对该持仓减仓卖出部分数量。
+// 按代码定位持仓，调用 SellLot 以 FIFO 扣减批次并重算加权平均成本；
+// 卖出数量不足或超过当前持仓数量时返回 400。全部卖完时自动平仓（记录盈亏）。
+// 返回减仓后更新过的持仓（供前端原地替换）。
+func (s *Server) handleFixSellHolding(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	var req sellHoldingReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if code == "" || req.Price <= 0 || req.Quantity <= 0 {
+		writeError(w, 400, "code and positive price/quantity required")
+		return
+	}
+	var target report.ExecLog
+	var targetID string
+	for _, l := range s.rpt.HeldPositions() {
+		if l.Code == code {
+			target = l
+			targetID = l.SignalID
+			break
+		}
+	}
+	if targetID == "" {
+		writeError(w, 404, "no position held for code")
+		return
+	}
+	qty := target.Quantity
+	if qty <= 0 {
+		qty = 1
+	}
+	if req.Quantity > qty {
+		writeError(w, 400, "sell quantity exceeds held quantity")
+		return
+	}
+	// 全部卖完时走清仓路径（记录完整盈亏与平仓状态）
+	if req.Quantity >= qty {
+		s.rpt.LogExit(targetID, req.Price)
+		log.Printf("[server] 减仓(全清) %s 价%.3f 量%.0f", code, req.Price, req.Quantity)
+		writeJSON(w, 200, map[string]interface{}{"holding": nil, "closed": true, "code": code})
+		return
+	}
+	s.rpt.SellLot(targetID, req.Price, req.Quantity)
+	log.Printf("[server] 减仓 %s 价%.3f 量%.0f (剩余持仓)", code, req.Price, req.Quantity)
+	for _, l := range s.rpt.HeldPositions() {
+		if l.Code == code {
+			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]interface{}{"holding": nil})
+}
+
+// 定位持仓（兼容手动 _fix 与信号持仓），调用 LogExit 记录真实盈亏并标记已平仓；
+// 返回盈亏金额（(清仓价-成本)×数量）与盈亏比例，供前端展示。
+func (s *Server) handleFixCloseHolding(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	var req closeHoldingReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if code == "" || req.Price <= 0 {
+		writeError(w, 400, "code and positive close price required")
+		return
+	}
+	var target report.ExecLog
+	for _, l := range s.rpt.HeldPositions() {
+		if l.Code == code {
+			target = l
+			break
+		}
+	}
+	if target.SignalID == "" {
+		writeError(w, 404, "no position held for code")
+		return
+	}
+	qty := target.Quantity
+	if qty <= 0 {
+		qty = 1
+	}
+	amount := (req.Price - target.EntryPrice) * qty
+	pct := 0.0
+	if target.EntryPrice > 0 {
+		pct = (req.Price - target.EntryPrice) / target.EntryPrice * 100
+	}
+	s.rpt.LogExit(target.SignalID, req.Price)
+	log.Printf("[server] 清仓 %s 价%.3f 量%.0f 成本%.3f 盈亏¥%.2f(%.2f%%)", code, req.Price, qty, target.EntryPrice, amount, pct)
+	writeJSON(w, 200, map[string]interface{}{
+		"status":        "ok",
+		"code":          code,
+		"name":          target.Name,
+		"quantity":      qty,
+		"cost_price":    r2(target.EntryPrice),
+		"close_price":   r2(req.Price),
+		"profit_pct":    r2(pct),
+		"profit_amount": r2(amount),
+	})
+}
+
 // 兜底板块每分钟轮动一次（前端 3s 轮询 /api/sector/hot 时不再逐次请求同花顺）。
 func (s *Server) thsTopFallbackBoards() []data.SectorInfo {
 	s.thsMu.Lock()

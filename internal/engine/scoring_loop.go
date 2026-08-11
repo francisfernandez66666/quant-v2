@@ -80,6 +80,13 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	md := e.strategy.BuildScoringData(ctx, pool, quotes)
 	scores, sigs := e.combatAgent.ScorePool(pool, md, d1Scores, emotionPhase)
 
+	// 开市(9:30)前只更新评分数字，不发布任何战法信号：
+	// 盘前无实盘成交量，双响炮/龙头等易基于存量历史数据误报（如整池双响炮全 70、9:11 龙头）。
+	// prevPass 不加/清空处理由 filterTransitionSignals 自然完成：9:30 后首个 Pass 仍会翻转发一次。
+	if data.BeforeOpenTrade(time.Now()) {
+		sigs = nil
+	}
+
 	// N 形候选诊断：收口本轮 N 候选的 D1/总分/级别/拦截原因，一眼定位"为何无 N 信号"
 	if nd := e.combatAgent.DrainNDiag(); len(nd) > 0 {
 		e.logNShapeDiag(emotionPhase, nd)

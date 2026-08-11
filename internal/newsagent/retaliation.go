@@ -1,6 +1,9 @@
 // Package newsagent 政策反制事件推导。
 // 从涉外政策新闻标题中识别"反制/出口管制/稀土限制/关税反制"等关键词，
 // 直构 data.ConfrontationEvent（不走 LLM，保证涉外政策新闻稳定识别）。
+// （Package newsagent derives policy-retaliation events. It detects keywords like retaliation/export control/
+// rare-earth limits/tariff retaliation from foreign-policy headlines and directly builds data.ConfrontationEvent
+// without LLM for stable recognition.）
 package newsagent
 
 import (
@@ -12,6 +15,7 @@ import (
 
 // retaliationRule 政策反制关键词匹配规则。
 // 命中的标题将推导为对应板块与方向的 ConfrontationEvent。
+// （retaliationRule is a keyword-matching rule; a matched headline yields a ConfrontationEvent for the mapped sectors/direction.）
 type retaliationRule struct {
 	keywords  []string // 触发关键词（任一命中即可）
 	sectors   []string // 受影响板块
@@ -21,6 +25,7 @@ type retaliationRule struct {
 
 // retaliationRules 政策反制识别规则表。
 // 覆盖 A 股涉外反制主要情景：加征关税、出口管制、稀土/资源限制、反倾销等。
+// （retaliationRules covers main A-share retaliation scenarios: tariff hikes, export controls, rare-earth/resource limits, anti-dumping, etc.）
 var retaliationRules = []retaliationRule{
 	{
 		keywords:  []string{"反制", "对等关税", "关税反制", "精准反制"},
@@ -50,6 +55,7 @@ var retaliationRules = []retaliationRule{
 
 // DeriveRetaliation 从新闻标题推导涉外政策反制事件。
 // 标题命中任一关键词即生成对应事件；返回全部推导结果（无命中返回 nil）。
+// （DeriveRetaliation builds foreign-policy retaliation events from headlines; any keyword hit yields an event, nil when none.）
 func (a *Agent) DeriveRetaliation(items []data.NewsItem) []data.ConfrontationEvent {
 	var out []data.ConfrontationEvent
 	for _, item := range items {
@@ -81,6 +87,7 @@ func (a *Agent) DeriveRetaliation(items []data.NewsItem) []data.ConfrontationEve
 }
 
 // matchRetaliation 从标题中匹配首条命中的政策反制规则；无命中返回 nil。
+// （matchRetaliation returns the first matching retaliation rule for a title, nil when none.）
 func matchRetaliation(title string) *retaliationRule {
 	for i := range retaliationRules {
 		r := &retaliationRules[i]

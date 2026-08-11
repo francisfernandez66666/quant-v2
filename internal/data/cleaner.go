@@ -1,5 +1,7 @@
 // Package data 提供股票数据清洗、查询和跟踪功能。
 // StockCleaner 负责将用户输入的股票名称或代码标准化为统一的名称+代码格式。
+// Package data provides stock data cleaning, querying and tracking.
+// StockCleaner normalizes user input (names or codes) into a unified name+code form.
 package data
 
 import (
@@ -13,6 +15,8 @@ import (
 // StockCleaner 股票名称/代码清洗器。
 // 维护名称↔代码的双向映射表，支持各种输入格式（纯代码、带交易所前缀、带点号后缀等）。
 // 线程安全（使用 sync.RWMutex 保护映射表）。
+// StockCleaner maintains a bidirectional name↔code mapping and cleans the various
+// input formats; thread-safe via sync.RWMutex.
 type StockCleaner struct {
 	nameToCode map[string]string // 名称 → 代码 映射
 	codeToName map[string]string // 代码 → 名称 映射
@@ -22,6 +26,8 @@ type StockCleaner struct {
 
 // NewStockCleaner 创建 StockCleaner 实例，并立即从 MarketAPI 拉取全量股票列表初始化映射表。
 // marketAPI: 市场数据 API 客户端，用于获取股票列表。
+// NewStockCleaner creates a StockCleaner and eagerly loads the full stock list
+// from MarketAPI to initialize the mapping table.
 func NewStockCleaner(marketAPI *MarketAPI) *StockCleaner {
 	c := &StockCleaner{
 		nameToCode: make(map[string]string),
@@ -37,6 +43,8 @@ func NewStockCleaner(marketAPI *MarketAPI) *StockCleaner {
 // Refresh 重新从 MarketAPI 拉取全量股票列表，刷新名称↔代码映射表。
 // marketAPI: 市场数据 API 客户端。
 // 通常在映射表为空或需要更新时调用。
+// Refresh reloads the name↔code mapping from MarketAPI, typically when the
+// table is empty or needs updating.
 func (c *StockCleaner) Refresh(marketAPI *MarketAPI) error {
 	list, err := marketAPI.GetStockList()
 	if err != nil {
@@ -65,6 +73,8 @@ var reDotCode = regexp.MustCompile(`^(\d{6})\.(SH|SZ|BJ)$`) // 带点号交易�
 //   - "600519"（纯数字）
 //
 // 返回值：6 位纯数字代码；无法识别则返回原始输入。
+// normalizeCode normalizes a code (dot-suffix / SH/SZ-prefixed / plain digits)
+// to a pure 6-digit form; unrecognized input is returned unchanged.
 func normalizeCode(raw string) string {
 	if m := reDotCode.FindStringSubmatch(raw); len(m) == 3 {
 		return m[1]
@@ -85,6 +95,8 @@ func normalizeCode(raw string) string {
 // nameOrCode: 用户输入的股票名称或代码（支持各种格式）。
 // 返回: 股票名称, 标准化代码, 错误信息。
 // 匹配优先级：纯代码 → 带前缀代码 → 按名称查找。
+// Clean cleans a single stock input into a normalized (name, code). Priority:
+// plain code → prefixed code → lookup by name.
 func (c *StockCleaner) Clean(nameOrCode string) (string, string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -136,6 +148,8 @@ func (c *StockCleaner) Clean(nameOrCode string) (string, string, error) {
 // FindStocksInText 在文本中查找出现的股票名称。
 // 遍历名称↔代码映射，文本包含某只股票名称即命中，返回命中名称列表。
 // 用于新闻标题的 Stage0 归因分类。
+// FindStocksInText finds any stock names appearing in a text, used for
+// stage-0 attribution of news headlines.
 func (c *StockCleaner) FindStocksInText(text string) []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -155,6 +169,8 @@ func (c *StockCleaner) FindStocksInText(text string) []string {
 // items: 股票名称或代码列表。
 // 返回清洗后的字符串列表，格式为 "名称|代码"；清洗失败的项丢弃（不保留原始输入，杜绝垃圾名透传）。
 // 如果映射表为空，会自动尝试重新拉取。
+// CleanBatch cleans a list of stock inputs into "name|code" strings, dropping
+// unmatched items and auto-refreshing the mapping when empty.
 func (c *StockCleaner) CleanBatch(items []string) []string {
 	c.mu.RLock()
 	empty := len(c.codeToName) == 0

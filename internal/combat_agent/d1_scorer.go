@@ -2,6 +2,9 @@
 // D1Scorer 负责对个股进行 D1 级别的事件驱动评分，依赖 LLM 分析新闻事件与行情数据。
 // 评分维度（含优先级）：负面过滤(blocked) > 顶级影响 > 间接影响 > 中等影响 > 低影响，
 // 输出 0.0~1.0 的归一化分数并附 LLM 分析理由。
+// English: provides D1 event-driven scoring per stock, using the LLM to analyze news events and market
+// data. Scoring dimensions by priority: negative filter (blocked) > top impact > indirect > medium >
+// low; outputs a normalized 0.0~1.0 score with an LLM reason.
 package combat_agent
 
 import (
@@ -18,6 +21,8 @@ import (
 
 // D1Score 表示单只个股的 D1 事件评分结果。
 // Score 范围 0.0~1.0，Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
+// English: D1 event-scoring result for a single stock — Score in 0.0~1.0, Blocked means the negative
+// filter tripped, Reason is the LLM analysis.
 type D1Score struct {
 	Code    string  `json:"code"`    // 股票代码
 	Score   float64 `json:"score"`   // 评分值，0.0~1.0，越高越值得关注
@@ -28,6 +33,8 @@ type D1Score struct {
 // D1Scorer 批量个股 D1 评分器。
 // 收拢到 combat_agent，LLM 参考 events_leftside.yaml 规则评分。
 // 非并发安全，建议由 Engine 在独立 goroutine 中单实例调用。
+// English: batch D1 scorer for stocks, scoring with the LLM referencing events_leftside.yaml rules.
+// Not concurrency-safe; the Engine should call it from a single goroutine.
 type D1Scorer struct {
 	llmClient    *llm.Client   // LLM 客户端，用于调用大模型进行 D1 评分
 	yamlContent  string        // events_leftside.yaml 原始内容，作为 LLM prompt 参考
@@ -37,11 +44,14 @@ type D1Scorer struct {
 
 // defaultMaxAttempts 默认 D1 LLM 轮询重试次数（含首次）。
 // 加重次数以抗 LLM 偶发超时/限流，避免重要 D1 评分随调用失败而丢失。
+// English: default number of D1 LLM retries (including the first attempt), raised to survive occasional
+// LLM timeouts/rate-limits so important D1 scores are not lost to failures.
 const defaultMaxAttempts = 5
 
 // NewD1Scorer 创建 D1Scorer 实例。
 // llmClient: LLM 客户端，用于调用大模型进行评分。
 // yamlContent: events_leftside.yaml 的原始内容，作为评分规则的参考上下文。
+// English: creates a D1Scorer with the LLM client and the raw events_leftside.yaml as scoring-context.
 func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 	return &D1Scorer{
 		llmClient:    llmClient,
@@ -53,6 +63,8 @@ func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 
 // SetMaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。
 // n<=0 时回退默认 defaultMaxAttempts。返回设置的生效值。
+// English: sets the D1 LLM retry count (including the first attempt); n<=0 reverts to the default and
+// the effective value is returned.
 func (ds *D1Scorer) SetMaxRetries(n int) int {
 	if n <= 0 {
 		ds.maxAttempts = defaultMaxAttempts
@@ -64,6 +76,8 @@ func (ds *D1Scorer) SetMaxRetries(n int) int {
 
 // d1SystemPrompt 是 D1 评分的系统级提示词，定义评分优先级规则和输出格式。
 // LLM 根据该提示词对个股关联事件进行分级打分（负面过滤/顶级影响/间接影响/中等影响/低影响）。
+// English: the system prompt for D1 scoring, defining priority rules and the JSON output format that the
+// LLM uses to grade linked events of each stock.
 var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个股基于关联事件进行D1评分。
 
 按优先级：
@@ -89,11 +103,16 @@ var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个�
 // 仅当 LLM 整批失败（重试全败/解析失败）或漏掉某只个股时，才回退上一轮分数，无则归 0。
 // 返回 map[string]D1Score，key 为股票代码，value 为 D1Score 评分结果。
 // 逻辑：构建 prompt → 调用 LLM（3 次递增轮询）→ 解析 JSON 响应 → 补全未返回的个股 → 返回结果。
+// English: batch-scores a list of stocks. Scores explicitly returned by the LLM this round are always
+// kept; the prior-round fallback is used only when the whole batch fails (all retries / parse error) or
+// a specific stock is missed, otherwise it defaults to 0. Pipeline: build prompt → call LLM with
+// increasing retries → parse JSON → fill missing stocks → return the score map.
 func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, fallback map[string]D1Score) map[string]D1Score {
 	t0 := time.Now()
 	result := make(map[string]D1Score, len(codes))
 
 	// LLM 客户端未配置或没有待评分个股 → 全量默认 0 分
+	// English: no LLM client or no codes → default everything to 0.
 	if ds.llmClient == nil || len(codes) == 0 {
 		for _, code := range codes {
 			result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: "LLM未配置，默认0分"}
@@ -103,9 +122,11 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	}
 
 	// 构建用户prompt：列出每只个股及其关联事件、行情数据
+	// English: build the user prompt listing each stock with its events and market data.
 	var sb strings.Builder
 	sb.WriteString("请对以下个股进行D1评分，参考events_leftside.yaml分级规则：\n\n")
 	// 附上评分规则原文，让 LLM 按项目规则打分
+	// English: attach the raw rules so the LLM grades per the project's rules.
 	if ds.yamlContent != "" {
 		sb.WriteString("参考规则:\n")
 		sb.WriteString(ds.yamlContent)
@@ -116,6 +137,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 		sb.WriteString(fmt.Sprintf("%d. 代码: %s\n", i+1, code))
 		md := marketData[code]
 		// 有行情数据则补充名称与价格/涨跌幅，辅助 LLM 判断
+		// English: attach name and price/change when market data exists to aid the LLM.
 		if md != nil {
 			if md.Name != "" {
 				sb.WriteString(fmt.Sprintf("   名称: %s\n", md.Name))

@@ -1,13 +1,21 @@
 <!--
-  根组件 App.vue
+  根组件 App.vue (Root component)
   主布局：侧边栏导航 + 顶部栏 + 内容区（router-view）
+  Layout: sidebar navigation + top bar + content area (router-view)
   未登录时显示登录页
+  Shows the login page when not authenticated.
 
   文件职责：
   1. 已登录：渲染应用主界面（侧边栏导航 + 顶部栏 + 内容区）；
   2. 未登录：渲染登录页（服务器地址 / 账号 / 密码表单）；
   3. 应用生命周期管理：登录态恢复、15 秒状态轮询、SSE 实时推送订阅、
      做空开关、通知测试、Toast 提示等全局逻辑都集中在本组件。
+
+  File responsibilities:
+  1. Logged in: render the main UI (sidebar navigation + top bar + content area);
+  2. Not logged in: render the login page (server URL / account / password form);
+  3. App lifecycle management: auth restore, 15s status polling, SSE push subscription,
+     short-selling toggle, notification test, Toast messages — all global logic lives here.
 -->
 <template>
   <!-- 已登录：主界面 -->
@@ -130,53 +138,54 @@
 </template>
 
 <script setup>
-// ── 依赖导入 ──
-// ref 定义响应式数据；onMounted / onUnmounted 注册组件生命周期钩子
+// ── 依赖导入 ── (Imports)
+// ref 定义响应式数据；onMounted / onUnmounted 注册组件生命周期钩子 (ref for reactive data; onMounted/onUnmounted for lifecycle hooks)
 import { ref, onMounted, onUnmounted } from 'vue'
-// useRouter 获取路由实例，用于退出登录后编程式跳转
+// useRouter 获取路由实例，用于退出登录后编程式跳转 (useRouter for programmatic navigation after logout)
 import { useRouter } from 'vue-router'
-// 后端 API 方法统一挂载在 api 命名空间下
+// 后端 API 方法统一挂载在 api 命名空间下 (all backend API methods are namespaced under api)
 import * as api from './api/index.js'
 
-// 路由实例：logout 时跳转回根路由（登录页）
+// 路由实例：logout 时跳转回根路由（登录页）(router instance: navigate back to root on logout)
 const router = useRouter()
 
-// ── 响应式状态 ──
-const loggedIn = ref(false)          // 是否已登录
-const account = ref('')              // 当前账号名
-const serverOnline = ref(false)      // 后端服务是否在线
-const inTradeTime = ref(null)        // 是否处于交易时段
-const signalCount = ref(0)           // 未读信号数
-const alertCount = ref(0)            // 未读提醒数
-const toasts = ref([])               // Toast 消息队列
-const menuOpen = ref(false)          // 移动端侧栏是否展开
-const shortEnabled = ref(false)      // 做空开关状态
+// ── 响应式状态 ── (Reactive state)
+const loggedIn = ref(false)          // 是否已登录 (whether logged in)
+const account = ref('')              // 当前账号名 (current account name)
+const serverOnline = ref(false)      // 后端服务是否在线 (whether backend service is online)
+const inTradeTime = ref(null)        // 是否处于交易时段 (whether currently in trading session)
+const signalCount = ref(0)           // 未读信号数 (unread signal count)
+const alertCount = ref(0)            // 未读提醒数 (unread alert count)
+const toasts = ref([])               // Toast 消息队列 (Toast message queue)
+const menuOpen = ref(false)          // 移动端侧栏是否展开 (whether mobile sidebar is expanded)
+const shortEnabled = ref(false)      // 做空开关状态 (short-selling toggle state)
 
-// ── 登录表单状态 ──
-// 服务器地址初始值优先取本地持久化值，否则用默认本地地址
+// ── 登录表单状态 ── (Login form state)
+// 服务器地址初始值优先取本地持久化值，否则用默认本地地址 (server URL defaults to persisted value, otherwise localhost)
 const serverUrl = ref(api.getStoredServer() || 'http://127.0.0.1:8080')
 const username = ref('')
 const password = ref('')
-const logging = ref(false)           // 是否正在登录中
-const loginError = ref('')           // 登录错误提示
+const logging = ref(false)           // 是否正在登录中 (whether login is in progress)
+const loginError = ref('')           // 登录错误提示 (login error message)
 
-// ── 定时器 & SSE 引用 ──
-// statusTimer：15 秒状态轮询的定时器句柄
+// ── 定时器 & SSE 引用 ── (Timer & SSE references)
+// statusTimer：15 秒状态轮询的定时器句柄 (handler for the 15s status polling timer)
 let statusTimer = null
-// unsubSSE：SSE 回调的注销函数（由 api.onSSE 返回），退出时调用以解除订阅
+// unsubSSE：SSE 回调的注销函数（由 api.onSSE 返回），退出时调用以解除订阅 (unsubscribe fn returned by api.onSSE; called on logout)
 let unsubSSE = null
 
-/** 弹出 Toast 消息，3 秒后自动消失 */
-// @param {string} msg  - 消息文本内容
-// @param {string} type - 提示类型：info（默认）/ success / warning / err，决定样式
+/** 弹出 Toast 消息，3 秒后自动消失 (Show a Toast message that auto-dismisses after 3s) */
+// @param {string} msg  - 消息文本内容 (message text content)
+// @param {string} type - 提示类型：info（默认）/ success / warning / err，决定样式 (type: info(default)/success/warning/err, decides styling)
 function addToast(msg, type = 'info') {
   toasts.value.push({ msg, type })
-  // 3 秒后从队列移除最旧的消息
+  // 3 秒后从队列移除最旧的消息 (remove the oldest toast from the queue after 3s)
   setTimeout(() => { toasts.value.shift() }, 3000)
 }
 
-/** 测试浏览器通知功能 */
+/** 测试浏览器通知功能 (Test the browser notification feature) */
 // 说明：已授权通知权限时直接弹出系统通知；无论是否授权都弹出 Toast 提示结果
+// (Fire a system notification if permission is granted; always show a Toast with the outcome)
 async function testNotify() {
   if ('Notification' in window && Notification.permission === 'granted') {
     new Notification('量仔期货', { body: '通知测试成功', icon: '' })
@@ -184,27 +193,29 @@ async function testNotify() {
   addToast('通知测试' + (Notification.permission === 'granted' ? '已发送' : '（通知未授权）'), 'info')
 }
 
-/** 切换做空开关，失败时回滚 UI 状态 */
+/** 切换做空开关，失败时回滚 UI 状态 (Toggle short-selling; roll back UI state on failure) */
 // 说明：切换开关本质是调用后端接口持久化开关状态；
 //       失败时 v-model 已将 UI 开关值改变，这里需回滚到原值并给出错误提示
+// (Persists the toggle via the backend API; on failure v-model already flipped the UI, so revert and show an error)
 async function onShortToggle() {
   try {
-    // 调用后端接口切换做空开关
+    // 调用后端接口切换做空开关 (call backend API to toggle short-selling)
     const res = await api.toggleShort(shortEnabled.value)
     addToast(res.short_enabled ? '做空已开启' : '做空已关闭', 'info')
   } catch (_) {
-    // 失败时回滚开关状态并提示
+    // 失败时回滚开关状态并提示 (on failure, roll back the toggle and notify)
     shortEnabled.value = !shortEnabled.value
     addToast('做空开关切换失败', 'err')
   }
 }
 
-/** 检查本地 token 是否存在，恢复登录态 */
+/** 检查本地 token 是否存在，恢复登录态 (Check local token and restore the logged-in state) */
 // 说明：组件挂载时调用；本地存在 token 则直接进入主界面并同步服务器地址，
 //       否则停留在登录页，由用户手动登录。
+// (Called on mount; if a token exists, enter the main UI and sync the server URL, otherwise stay on login)
 async function checkAuth() {
   if (api.isLoggedIn()) {
-    // 本地已有登录态则直接恢复界面
+    // 本地已有登录态则直接恢复界面 (restore the UI directly if already logged in locally)
     loggedIn.value = true
     account.value = api.getAccount()
     api.setStoredServer(serverUrl.value)
@@ -214,23 +225,24 @@ async function checkAuth() {
   return false
 }
 
-/** 执行登录：提交凭据，成功后启动轮询 */
+/** 执行登录：提交凭据，成功后启动轮询 (Perform login: submit credentials, start polling on success) */
 // 说明：登录成功后持久化服务器地址、启动 15 秒轮询 + SSE 连接，
 //       并顺带请求浏览器通知权限；失败时把后端错误信息展示在登录页。
+// (On success: persist server URL, start 15s polling + SSE connection, request notification permission; on failure show the error)
 async function handleLogin() {
   logging.value = true
   loginError.value = ''
-  // 先把服务器地址持久化，后续所有请求都基于该地址拼接
+  // 先把服务器地址持久化，后续所有请求都基于该地址拼接 (persist the server URL first; all later requests use it)
   api.setStoredServer(serverUrl.value)
   try {
-    // 提交登录凭据到后端
+    // 提交登录凭据到后端 (submit login credentials to the backend)
     await api.login(username.value, password.value)
     account.value = api.getAccount()
     loggedIn.value = true
-    // 登录成功后启动轮询，并顺带请求通知权限
+    // 登录成功后启动轮询，并顺带请求通知权限 (start polling after login and request notification permission)
     startPolling()
     addToast('登录成功', 'success')
-    // 浏览器通知权限为“默认”时主动申请，便于新信号及时提醒
+    // 浏览器通知权限为“默认”时主动申请，便于新信号及时提醒 (ask for permission when "default" so fresh signals alert in time)
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission()
     }
@@ -241,11 +253,12 @@ async function handleLogin() {
   }
 }
 
-/** 退出登录：清除数据并停止轮询 */
+/** 退出登录：清除数据并停止轮询 (Logout: clear data and stop polling) */
 // 说明：清除本地认证信息、停止轮询与 SSE 连接、关闭移动端菜单，
 //       并跳转回根路由（此时因 loggedIn 为 false 显示登录页）。
+// (Clears local auth, stops polling and the SSE connection, closes the mobile menu, then routes to "/")
 function logout() {
-  // 清除认证并停止后台任务
+  // 清除认证并停止后台任务 (clear auth and stop background tasks)
   api.clearAuth()
   stopPolling()
   loggedIn.value = false
@@ -253,71 +266,103 @@ function logout() {
   router.push('/')
 }
 
-/** 刷新服务端状态、信号数、提醒数和做空状态 */
+/** 刷新服务端状态、信号数、提醒数和做空状态 (Refresh server status, signal count, alert count and short toggle) */
 // 说明：三个接口各自 try/catch 独立执行，互不阻塞；
 //       任一失败只影响对应状态（如状态接口失败则将服务标记为离线）。
+// (Three API calls each run in their own try/catch so a failure of one does not block the others)
 async function refreshStatus() {
   try {
-    // 拉取服务状态与信号数
+    // 拉取服务状态与信号数 (fetch server status and signal count)
     const st = await api.fetchStatus()
     serverOnline.value = true
     signalCount.value = st.signal_count || 0
     inTradeTime.value = st.in_trade_time
   } catch (_) { serverOnline.value = false }
   try {
-    // 拉取未读提醒数
+    // 拉取未读提醒数 (fetch unread alert count)
     const alerts = await api.fetchAlerts()
     alertCount.value = alerts?.length || 0
   } catch (_) {}
   try {
-    // 拉取做空开关状态
+    // 拉取做空开关状态 (fetch short-selling toggle state)
     const ss = await api.fetchShortStatus()
     shortEnabled.value = ss.short_enabled || false
   } catch (_) {}
 }
 
-/** SSE 消息处理器：新信号时弹 Toast 并刷新状态 */
-// 说明：作为回调注册到 api.onSSE()；收到含 signal 字段的推送时，
-//       弹出新信号提示并触发一次状态刷新，保证界面实时同步。
+/** SSE 消息处理器：新交易信号时弹浏览器通知 + Toast 并刷新状态 (SSE handler: notify + refresh on new trading signals) */
+// 说明：识别 scan 事件里的 bull（做多）与 bear（做空）信号数量，
+//       有交易信号时触发系统通知并弹 Toast；同时刷新状态栏与消息中心。
+// (Reads bull(long) and bear(short) signal counts from "scan" events; shows system notification + Toast, then refreshes status)
 function handleSSE(msg) {
+  if (msg && msg.type === 'scan') {
+    const bull = parseInt(msg.bull || '0', 10)
+    const bear = parseInt(msg.bear || '0', 10)
+    if (bull > 0 || bear > 0) {
+      const parts = []
+      if (bull > 0) parts.push('做多 ' + bull + ' 条')
+      if (bear > 0) parts.push('做空 ' + bear + ' 条')
+      const text = '新交易信号: ' + parts.join('、') + (msg.time ? ' (' + msg.time + ')' : '')
+      addToast(text, 'warning')
+      notifyTradeSignal(text)
+    }
+    refreshStatus()
+    return
+  }
   if (msg.signal) {
-    // 新信号到来时弹 Toast 并刷新状态栏
+    // 新信号到来时弹 Toast 并刷新状态栏 (show a Toast and refresh status when a new signal arrives)
     addToast('新信号: ' + (msg.signal.code || ''), 'warning')
     refreshStatus()
   }
 }
 
-/** 启动定时轮询和 SSE 连接 */
+/** 交易信号浏览器通知去重：60 秒窗口内同一批信号只通知一次，避免每轮刷新反复弹 (Dedupe: notify the same batch at most once per 60s window to avoid spam on each poll) */
+let lastNotifyAt = 0
+
+/** 发送交易信号浏览器通知（需用户已授权通知权限；页面不可见时也提醒） (Send a trading-signal browser notification; requires granted permission, works when tab is hidden) */
+function notifyTradeSignal(text) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+  const now = Date.now()
+  if (now - lastNotifyAt < 60000) return
+  lastNotifyAt = now
+  try {
+    new Notification('量仔期货 交易信号', { body: text, icon: '' })
+  } catch (_) {}
+}
+
+/** 启动定时轮询和 SSE 连接 (Start the polling timer and SSE connection) */
 // 说明：先立即刷新一次状态，随后每 15 秒轮询一次；
 //       同时建立与后端的 SSE 长连接，并注册新信号的消息回调。
+// (Refreshes immediately, then polls every 15s; opens an SSE connection and registers the signal callback)
 function startPolling() {
-  // 立即刷新一次，随后每 15 秒轮询
+  // 立即刷新一次，随后每 15 秒轮询 (refresh right away, then poll every 15s)
   refreshStatus()
   statusTimer = setInterval(refreshStatus, 15000)
-  // 订阅后端 SSE 推送
+  // 订阅后端 SSE 推送 (subscribe to backend SSE push events)
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
 }
 
-/** 停止定时轮询并断开 SSE */
+/** 停止定时轮询并断开 SSE (Stop the polling timer and disconnect SSE) */
 // 说明：清除轮询定时器、断开 SSE 连接并注销回调；
 //       在退出登录与组件卸载时调用，防止定时器与长连接泄漏。
+// (Clears the timer, disconnects SSE and unsubscribes the callback to prevent leaks; called on logout & unmount)
 function stopPolling() {
-  // 清除轮询定时器并断开 SSE 连接
+  // 清除轮询定时器并断开 SSE 连接 (clear the timer and disconnect the SSE connection)
   if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
   api.disconnectSSE()
   if (unsubSSE) { unsubSSE(); unsubSSE = null }
 }
 
-/** 挂载时检查登录态，已登录则开始轮询 */
-// 生命周期：组件挂载完成后先恢复登录态，成功则启动后台轮询与 SSE
+/** 挂载时检查登录态，已登录则开始轮询 (On mount, check auth state and start polling if logged in) */
+// 生命周期：组件挂载完成后先恢复登录态，成功则启动后台轮询与 SSE (lifecycle: restore auth first, then start polling & SSE)
 onMounted(async () => {
-  // 恢复登录态，成功则启动后台任务
+  // 恢复登录态，成功则启动后台任务 (restore auth; if ok, start background tasks)
   const ok = await checkAuth()
   if (ok) startPolling()
 })
-/** 卸载时停止所有后台任务 */
-// 生命周期：组件卸载前停止轮询与 SSE，避免后台任务泄漏
+/** 卸载时停止所有后台任务 (Stop all background tasks on unmount) */
+// 生命周期：组件卸载前停止轮询与 SSE，避免后台任务泄漏 (lifecycle: stop polling & SSE before unmount to avoid leaks)
 onUnmounted(stopPolling)
 </script>
 

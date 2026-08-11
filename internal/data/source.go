@@ -3,6 +3,12 @@
 //   - 行情：新浪 → 同花顺 → 东财 三级降级链，同花顺失败自动熔断 60s；
 //   - 板块/IPO：同花顺 → 东财，带 30s/60s TTL 缓存；
 //   - 新闻：同花顺(主) → 新浪(兜底) 去重合并。
+//
+// Package data — a multi-source dispatch and circuit-breaker layer.
+// It wraps EastMoney (MarketAPI) and Tonghuashun (THSClient) strategy:
+//   - Quotes: Sina → THS → EastMoney fallback chain, THS auto-breaks for 60s;
+//   - Sectors/IPOs: THS → EastMoney with 30s/60s TTL caches;
+//   - News: THS (primary) → Sina (fallback), merged with dedup.
 package data
 
 import (
@@ -16,6 +22,8 @@ import (
 // DataCoordinator 多数据源调度与熔断。
 // 行情数据源链：新浪 → 同花顺 → 东财
 // 板块/IPO 数据源链：同花顺 → 东财
+// DataCoordinator coordinates multiple sources with circuit breaking.
+// Quote chain: Sina → THS → EastMoney; Sector/IPO chain: THS → EastMoney.
 type DataCoordinator struct {
 	eastMoney *MarketAPI
 	ths       *THSClient
@@ -33,12 +41,14 @@ type DataCoordinator struct {
 }
 
 // cachedSectorStocks 板块成分股缓存条目。
+// cachedSectorStocks is a sector-constituent cache entry.
 type cachedSectorStocks struct {
 	stocks []StockInfo // 缓存的成分股列表
 	at     time.Time   // 缓存写入时间（用于判断是否过期）
 }
 
 // NewDataCoordinator 创建数据协调器实例。
+// NewDataCoordinator creates a DataCoordinator instance.
 func NewDataCoordinator(api *MarketAPI, ths *THSClient) *DataCoordinator {
 	return &DataCoordinator{
 		eastMoney:        api,
@@ -48,6 +58,8 @@ func NewDataCoordinator(api *MarketAPI, ths *THSClient) *DataCoordinator {
 }
 
 // GetQuote 获取个股实时行情。新浪 → 同花顺 → 东财
+// GetQuote fetches a per-stock realtime quote down the chain Sina → THS → EastMoney,
+// tripping THS for 60s after each THS failure.
 func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	si, err := dc.eastMoney.GetSinaQuote(code)
 	if err == nil && si != nil && si.Price > 0 {
@@ -81,6 +93,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 }
 
 // GetKLine 获取 K 线数据。新浪日线 → 东财
+// GetKLine fetches K-lines: Sina daily first, then EastMoney.
 func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, error) {
 	if period == "101" {
 		if klines, err := dc.eastMoney.GetSinaKLine(code, count); err == nil && len(klines) > 0 {
@@ -95,6 +108,8 @@ func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, er
 }
 
 // GetSectors 获取板块列表。同花顺 → 东财
+// GetSectors returns the board list from THS → EastMoney with a 30s cache,
+// merging THS board inventory with EastMoney realtime data when both succeed.
 func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 	dc.mu.RLock()
 	if len(dc.sectorCache) > 0 && time.Since(dc.sectorCacheAt) < 30*time.Second {
@@ -178,6 +193,8 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 }
 
 // GetSectorStocks 获取板块成分股。东财 → 同花顺
+// GetSectorStocks returns a sector's constituent stocks (EastMoney first, THS
+// fallback) with a 60s per-sector cache.
 func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]StockInfo, error) {
 	dc.mu.RLock()
 	if c, ok := dc.sectorStockCache[sectorCode]; ok && time.Since(c.at) < 60*time.Second {
@@ -226,16 +243,19 @@ func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]Stock
 }
 
 // GetStockMoneyFlow 获取资金流向。仅东财。
+// GetStockMoneyFlow fetches capital flow (EastMoney only).
 func (dc *DataCoordinator) GetStockMoneyFlow(code string) (*CapitalFlow, error) {
 	return dc.eastMoney.GetStockMoneyFlow(code)
 }
 
 // GetIndexData 获取指数行情。
+// GetIndexData fetches the index data via EastMoney.
 func (dc *DataCoordinator) GetIndexData() (indexPrice float64, ma20 float64, upCount, downCount int, err error) {
 	return dc.eastMoney.GetIndexData()
 }
 
 // CrossCheckPrice 用东财 push2 获取个股价格，用于信号复核。
+// CrossCheckPrice returns a price via EastMoney push2 for signal cross-checking.
 func (dc *DataCoordinator) CrossCheckPrice(code string) (price float64, err error) {
 	si, err := dc.eastMoney.GetRealtimeQuote(code)
 	if err != nil || si == nil {
@@ -245,17 +265,21 @@ func (dc *DataCoordinator) CrossCheckPrice(code string) (price float64, err erro
 }
 
 // SourceName 返回当前首选数据源的名称。
+// SourceName returns the name of the current primary data source.
 func (dc *DataCoordinator) SourceName() string {
 	return "Sina"
 }
 
 // GetAuctionData 获取集合竞价数据。
+// GetAuctionData fetches pre-open auction data via EastMoney.
 func (dc *DataCoordinator) GetAuctionData(code string) (*StockInfo, error) {
 	return dc.eastMoney.GetAuctionData(code)
 }
 
 // GetHotNews 多源合并获取热门新闻，按 pageSize 截顶返回。
 // 同花顺快讯(主源) → 新浪财经(兜底)
+// GetHotNews merges hot news across sources (THS primary → Sina fallback),
+// deduplicating by truncated titles and capping at pageSize.
 func (dc *DataCoordinator) GetHotNews(pageSize int) []NewsItem {
 	seen := make(map[string]bool)
 	var all []NewsItem
@@ -291,6 +315,8 @@ func (dc *DataCoordinator) GetHotNews(pageSize int) []NewsItem {
 
 // truncateStr 将字符串按 rune 截断到 maxLen 长度（保留中文字符完整性）。
 // 用于新闻标题去重的归一化 key 生成。
+// truncateStr truncates a string to maxLen runes (keeping multi-byte Chinese
+// characters intact), used to build normalized dedup keys for news titles.
 func truncateStr(s string, maxLen int) string {
 	runes := []rune(s)
 	if len(runes) > maxLen {
@@ -300,6 +326,8 @@ func truncateStr(s string, maxLen int) string {
 }
 
 // RefreshIPOCalendar 刷新新股日历缓存。同花顺(板块丰富) → 东财
+// RefreshIPOCalendar refreshes the IPO-calendar cache (5min TTL),
+// populating from EastMoney then enriching each record's sector.
 func (dc *DataCoordinator) RefreshIPOCalendar() {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -323,6 +351,8 @@ func (dc *DataCoordinator) RefreshIPOCalendar() {
 
 // enrichIPOSector 为新股日历事件补充所属行业板块。
 // 逐条调用东财行业查询接口（GetStockIndustry），缺失行业的事件保留空值。
+// enrichIPOSector fills each IPO event's sector via EastMoney's GetStockIndustry;
+// events with no sector keep an empty value.
 func (dc *DataCoordinator) enrichIPOSector(list []IPOEvent) {
 	if dc.eastMoney == nil {
 		return
@@ -343,6 +373,7 @@ func (dc *DataCoordinator) enrichIPOSector(list []IPOEvent) {
 }
 
 // GetIPOByCode 按股票代码查询新股日历事件。
+// GetIPOByCode looks up an IPO event by stock code, refreshing the cache if empty.
 func (dc *DataCoordinator) GetIPOByCode(code string) *IPOEvent {
 	dc.mu.RLock()
 	cache := dc.ipoCache
@@ -364,6 +395,7 @@ func (dc *DataCoordinator) GetIPOByCode(code string) *IPOEvent {
 }
 
 // GetAllIPOCalendar 返回全部新股日历数据。
+// GetAllIPOCalendar returns all IPO-calendar data, refreshing when empty.
 func (dc *DataCoordinator) GetAllIPOCalendar() []IPOEvent {
 	dc.mu.RLock()
 	cache := dc.ipoCache
@@ -380,6 +412,7 @@ func (dc *DataCoordinator) GetAllIPOCalendar() []IPOEvent {
 }
 
 // GetStockSector 查询个股所属板块名称。
+// GetStockSector returns the sector name of a stock via EastMoney.
 func (dc *DataCoordinator) GetStockSector(code string) string {
 	if dc.eastMoney != nil {
 		return dc.eastMoney.GetStockIndustry(code)
@@ -388,6 +421,7 @@ func (dc *DataCoordinator) GetStockSector(code string) string {
 }
 
 // TushareToken 保留以供前端初始化配置页面展示（已不再实际使用）。
+// TushareToken is kept only for display on the frontend config page (no longer used).
 func TushareToken() string {
 	return os.Getenv("TUSHARE_TOKEN")
 }

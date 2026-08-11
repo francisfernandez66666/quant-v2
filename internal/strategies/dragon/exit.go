@@ -7,21 +7,22 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// CheckExit 判断破局龙策略是否触发退出信号。
-// 检查顺序：买入回撤（全出/半仓）→ 炸板回落（跌破封板价）→ 买入日收盘不佳 → 次日开盘不及预期 → 超期退出。
-// 返回 nil 表示继续持有。
+// CheckExit 判断破局龙策略是否触发退出信号。（CheckExit decides whether the Dragon strategy should exit.）
+// 检查顺序：买入回撤（全出/半仓）→ 炸板回落（跌破封板价）→ 买入日收盘不佳 → 次日开盘不及预期 → 超期退出。（Checks in order:
+// post-buy pullback (all/half) → broken-seal retreat → bad close on entry day → weak next-day open → timeout.）
+// 返回 nil 表示继续持有。（Returns nil to keep holding.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
-	// 成本或现价非法时无法评估，视为不退出
+	// 成本或现价非法时无法评估，视为不退出（Cannot evaluate with invalid cost/price; hold）
 	if cost <= 0 || price <= 0 {
 		return nil
 	}
 
-	// 持仓盈亏率（正=盈利）
+	// 持仓盈亏率（正=盈利）（Holding P&L percentage, positive = profit）
 	pnlPct := (price - cost) / cost * 100
 
-	// 买入后回撤：跌超 BuyPullbackSellAllPct 全出；跌超 BuyPullbackSellHalfPct 半仓减
+	// 买入后回撤：跌超 BuyPullbackSellAllPct 全出；跌超 BuyPullbackSellHalfPct 半仓减（Post-buy pullback: below SellAll → exit all, below SellHalf → exit half）
 	if pnlPct <= -cfg.BuyPullbackSellAllPct {
 		return &strategy.ExitResult{Reason: "买入回撤全出", Priority: strategy.P1}
 	}
@@ -29,7 +30,7 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 		return &strategy.ExitResult{Reason: "买入回撤半仓", Priority: strategy.P2}
 	}
 
-	// 炸板回落：以入场时的封板价（limit_price）为基准，跌破阈值触发半仓/全出
+	// 炸板回落：以入场时的封板价（limit_price）为基准，跌破阈值触发半仓/全出（Broken seal: measured from the entry limit price, breaching thresholds triggers half/all exit）
 	if ctx.EntryMeta != nil {
 		if limitPrice, ok := ctx.EntryMeta["limit_price"]; ok && limitPrice > 0 {
 			breakPct := (price - limitPrice) / limitPrice * 100
@@ -42,7 +43,7 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 		}
 	}
 
-	// 尾盘检查（14:55~15:00）：买入日收盘浮亏超过 BuyDayCloseBelow 则离场
+	// 尾盘检查（14:55~15:00）：买入日收盘浮亏超过 BuyDayCloseBelow 则离场（Late-session check 14:55–15:00: exit if entry-day close loss ≤ BuyDayCloseBelow）
 	now := ctx.Now
 	if now.IsZero() {
 		now = time.Now()
@@ -54,13 +55,13 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 		}
 	}
 
-	// 次日及以后：按入场日期计算持仓天数
+	// 次日及以后：按入场日期计算持仓天数（From the next day on: compute holding days from the entry date）
 	if ctx.EntryAt != "" {
 		entryDate, err := time.Parse("2006-01-02", ctx.EntryAt)
 		if err == nil {
 			days := int(now.Sub(entryDate).Hours() / 24)
 			today := now.Format("2006-01-02")
-			// 持仓 ≥1 天：检查开盘价，低于 NextOpenIfBelow 视为次日不及预期
+			// 持仓 ≥1 天：检查开盘价，低于 NextOpenIfBelow 视为次日不及预期（Held ≥1 day: exit if today's open is below NextOpenIfBelow）
 			if entryDate.Format("2006-01-02") != today && days >= 1 {
 				openPrice := price
 				if len(ctx.DailyK) > 0 {
@@ -71,7 +72,7 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 					return &strategy.ExitResult{Reason: "次日开盘不及预期", Priority: strategy.P2}
 				}
 			}
-			// 持仓 ≥2 天：龙战法为超短策略，超期强制离场
+			// 持仓 ≥2 天：龙战法为超短策略，超期强制离场（Held ≥2 days: ultra-short-term, force exit on timeout）
 			if days >= 2 {
 				return &strategy.ExitResult{Reason: "破局龙超期", Priority: strategy.P3}
 			}
@@ -81,5 +82,5 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 	return nil
 }
 
-// NeedUpdateHighest 破局龙策略无需更新最高价。
+// NeedUpdateHighest 破局龙策略无需更新最高价。（NeedUpdateHighest reports that Dragon does not track a stage high price.）
 func NeedUpdateHighest() bool { return false }

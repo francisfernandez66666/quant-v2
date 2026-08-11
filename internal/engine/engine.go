@@ -186,7 +186,7 @@ func New(
 		prevPass:         make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
 	}
-	e.syncMessages(nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心
+	e.syncMessages(nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分（重启后前端立即可见）
 	if loaded := e.scoreStore.Load(); len(loaded) > 0 {
 		e.agg.UpdateFast(loaded, nil, e.rpt)
@@ -1010,13 +1010,49 @@ func nowTimeString() string {
 	return time.Now().Format("15:04:05")
 }
 
-// syncMessages 将本轮止盈止损告警与持仓提示合并进消息存储（按稳定键去重）。
+// syncMessages 汇总本轮交易信号（做多/做空）、止盈止损告警与持仓提示，合并进消息存储（按稳定键去重）。
+// （syncMessages merges this round's trade signals (long/short), profit-loss alerts and holding notices into the
+// message store, deduplicated by stable keys.)）
 // bearSectors/bearStocks 为本轮利空板块与利空个股，用于扫出"命中利空板块的持仓"并提醒卖出。
-func (e *Engine) syncMessages(alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult) {
+func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult) {
 	if e.msgStore == nil {
 		return
 	}
-	items := make([]data.MessageItem, 0, len(alertSignals)+2)
+	items := make([]data.MessageItem, 0, len(bull)+len(bear)+len(alertSignals)+2)
+	// 交易信号：做多/做空，消息中心级别为"交易信号"，Action 按其方向定为 买入/卖出
+	// （Trade signals: long/short, message level is "交易信号", Action mapped to 买入/卖出 by direction）
+	trade := make([]combat_agent.Signal, 0, len(bull)+len(bear))
+	trade = append(trade, bull...)
+	trade = append(trade, bear...)
+	for _, sig := range trade {
+		direction := sig.Direction
+		if direction == "" {
+			if sig.Action == "买入" || sig.Action == "buy" {
+				direction = "做多"
+			} else {
+				direction = "做空"
+			}
+		}
+		action := "买入"
+		if direction == "做空" {
+			action = "卖出"
+		} else if sig.Action != "" {
+			action = sig.Action
+		}
+		items = append(items, data.MessageItem{
+			ID:          sig.Code + "@交易信号@" + sig.Strategy,
+			Code:        sig.Code,
+			Name:        sig.Name,
+			Level:       "交易信号",
+			Action:      action,
+			Strategy:    sig.Strategy,
+			Time:        sig.GeneratedAt.Format("15:04:05"),
+			Title:       fmt.Sprintf("交易信号 %s %s", sig.Code, sig.Name),
+			Body:        fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f %s", action, sig.Strategy, sig.Confidence*100, sig.Price, sig.Reason),
+			Direction:   direction,
+			GeneratedAt: sig.GeneratedAt,
+		})
+	}
 	for _, sig := range alertSignals {
 		level := sig.AlertType
 		if level == "" {
@@ -1603,8 +1639,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 8a/8b 打分持久化（与近实时循环同口径，当日最新分）
 	e.scoreStore.Save(td, stockScores)
 
-	// 14b. 告警/持仓提示合并进消息中心（持久化）
-	e.syncMessages(alertSignals, sr)
+	// 14b. 交易信号/告警/持仓提示合并进消息中心（持久化）
+	e.syncMessages(bullSignals, bearSignals, alertSignals, sr)
 
 	// 15. 调试数据
 	e.captureDebug(rawNews, st0, events)

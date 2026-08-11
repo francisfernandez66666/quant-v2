@@ -7,13 +7,14 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
-// maxEnrichPerRound 单轮正文抓取条数上限，避免追回大包时对文章页洪峰请求。
+// maxEnrichPerRound 单轮正文抓取条数上限，避免追回大包时对文章页洪峰请求。（Max articles to fetch per round, avoiding request floods on article pages.）
 const maxEnrichPerRound = 40
 
-// minEnrichLen 已有正文摘要达到该长度即跳过抓取，减少重复请求。
+// minEnrichLen 已有正文摘要达到该长度即跳过抓取，减少重复请求。（Existing digest longer than this skips fetching to reduce duplicate requests.）
 const minEnrichLen = 200
 
 // EnrichContents 并发抓取新闻原文正文回填 Content（保留原摘要兜底，失败不阻断流水线）。
+// （EnrichContents concurrently fetches article bodies into Content; keeps existing digests as fallback and never blocks the pipeline.）
 func (a *Agent) EnrichContents(items []data.NewsItem) []data.NewsItem {
 	if a.marketAPI == nil {
 		return items

@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"quant-trading-v2/internal/auth"
@@ -192,14 +194,21 @@ func main() {
 	// D1 评分 LLM 轮询重试次数（防重要信号随 LLM 偶发失败丢失）
 	eng.SetD1MaxRetries(cfgMgr.Rules.LLM.MaxRetryTimes)
 
-	// 启动 HTTP 服务，监听地址可用 QUANT_ADDR 覆盖
+	// 启动 HTTP 服务：地址可用 QUANT_ADDR 覆盖。
+	// 端口占用自动顺延：绑定失败时依次尝试下一个端口（最多 20 个），
+	// 避免"bind: address already in use"直接把整个进程打崩（stale 进程占端口时的常见故障）。
 	addr := ":8080"
 	if v := os.Getenv("QUANT_ADDR"); v != "" {
 		addr = v
 	}
-	// 后台运行 HTTP 服务：阻塞监听 addr，Serve 返回错误时由 log.Fatal 终止进程
+	ln := pickListener(addr, 20)
+	if ln == nil {
+		log.Fatalf("HTTP 监听失败 %s: 连续 20 个端口均被占用", addr)
+	}
+	bound := ln.Addr().String()
+	log.Printf("[main] HTTP 服务已绑定 %s (来源 %s)", bound, addr)
 	go func() {
-		log.Fatal(srv.Serve(addr))
+		log.Fatal(srv.ServeListener(ln))
 	}()
 
 	ctx := context.Background()
@@ -261,4 +270,31 @@ func getDataDir() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".quant-trading-v2")
+}
+
+// pickListener 尝试监听 baseAddr；若端口被占用则自动顺延到下一个端口（最多 maxTries 次），
+// 返回成功绑定的监听器；均失败返回 nil。
+func pickListener(baseAddr string, maxTries int) net.Listener {
+	addr := baseAddr
+	for i := 0; i < maxTries; i++ {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln
+		}
+		addr = bumpPort(addr)
+	}
+	return nil
+}
+
+// bumpPort 将 host:port 地址中的端口号 +1（如 :8080 -> :8081）；解析失败时原样返回。
+func bumpPort(addr string) string {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return addr
+	}
+	return net.JoinHostPort(host, strconv.Itoa(p+1))
 }
