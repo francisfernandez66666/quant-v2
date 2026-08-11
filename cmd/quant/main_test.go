@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -683,4 +684,40 @@ func truncate(s string, n int) string {
 // TestPackageImports 是一个轻量编译检查测试，确保所有 import 的包在此测试文件中都能被正确解析和链接。
 func TestPackageImports(t *testing.T) {
 	t.Log("所有包导入正常")
+}
+
+// TestBumpPort 验证端口占位自增逻辑：正常地址 +1，非法地址原样返回。
+func TestBumpPort(t *testing.T) {
+	cases := map[string]string{
+		":8080":         ":8081",
+		"127.0.0.1:1":   "127.0.0.1:2",
+		"localhost:7090": "localhost:7091",
+		"not-an-addr":   "not-an-addr",
+		":abc":          ":abc",
+	}
+	for in, want := range cases {
+		if got := bumpPort(in); got != want {
+			t.Errorf("bumpPort(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestPickListenerPortSwitch 验证端口被占用时自动顺延到下一个空闲端口：
+// 先占用 8090，再调用 pickListener(":8090", 3) 应返回 8091 的监听器。
+func TestPickListenerPortSwitch(t *testing.T) {
+	block, err := net.Listen("tcp", ":8090")
+	if err != nil {
+		t.Skipf("无法占用测试端口 8090: %v", err)
+	}
+	defer block.Close()
+
+	ln := pickListener(":8090", 3)
+	if ln == nil {
+		t.Fatal("pickListener 返回 nil，应顺延到空闲端口")
+	}
+	defer ln.Close()
+	bound := ln.Addr().String()
+	if want := ":8091"; bound != want && bound != "[::]:8091" {
+		t.Errorf("应顺延到 :8091, 实际绑定 %s", bound)
+	}
 }
