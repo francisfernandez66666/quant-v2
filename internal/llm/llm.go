@@ -442,6 +442,7 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
 补充规则：
 - 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
 - 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
+- 澄清/否认公告（"无参股X""无涉足X业务""不涉及X概念""XX与公司无关""目前不具备/暂无X计划"等否定性表态）→ 这是对炒作题材的否定性澄清，不等于利好；一律 score=0, sentiment="中性", direction="中性", event_type="公司"（如"达实智能：无参股宇树科技，无机器人业务"→ score=0 中性，严禁判利好）
 ` + valueChainSection
 
 // batchSystemPrompt 批量热点分析的 system 提示词：从编号列表中筛选实质影响事件并输出 JSON 数组。
@@ -504,11 +505,12 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
     "downstream_direction": "利好|利空|中性"
   }
   ]
- 只输出JSON数组，不要多余文字。
+只输出JSON数组，不要多余文字。
 
 补充规则：
 - 宏观数据走弱（GDP增速放缓/低于预期、PMI走弱或跌破荣枯线、核心通胀高企黏性、就业走弱）→ level="板块", event_type="宏观", score=-0.50~-0.75, direction="利空"
 - 海外龙头公司（苹果/特斯拉/微软/英伟达等）财报或业绩指引不及预期、盘后大幅下跌，且涉及A股产业链（消费电子/苹果产业链/存储/算力/半导体等）→ level="板块", event_type="行业", score=-0.50~-0.75, direction="利空", sectors填对应A股产业链板块，不得按"海外行情播报"忽略
+- 澄清/否认公告（"无参股X""无涉足X业务""不涉及X概念""XX与公司无关""目前不具备/暂无X计划"等否定性表态）→ 这是对炒作题材的否定性澄清，不等于利好；一律 score=0, sentiment="中性", direction="中性", event_type="公司"（如"达实智能：无参股宇树科技，无机器人业务"→ score=0 中性，严禁判利好）
 ` + valueChainSection
 
 // llmBatchSize LLM 单次批量处理的最大条数，防止超大批次导致超时。

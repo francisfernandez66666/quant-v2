@@ -54,15 +54,10 @@ func TestRedDayNotFullChain(t *testing.T) {
 
 	si := &data.StockInfo{Code: "600001", Name: "测试", Price: closes[29], ChangePct: -1.3}
 	ev := newTest().EvaluateReal("600001", si, kbump(closes, vol))
-	if ev == nil {
-		t.Fatalf("不应返回 nil")
-	}
-	// 水下当日：量能分+调整分应为0，且不进 full_chain/不 Pass
-	if ev.Level == "full_chain" || ev.Pass {
-		t.Fatalf("水下当日不应评 full_chain/买入, got level=%s pass=%v total=%.0f", ev.Level, ev.Pass, ev.TotalScore)
-	}
-	if ev.Details["vol_score"] != 0 || ev.Details["adjust_score"] != 0 {
-		t.Fatalf("水下当日量能/调整分应为0, got vol=%.0f adj=%.0f", ev.Details["vol_score"], ev.Details["adjust_score"])
+	// 水下当日无第二波放量 → 不构成双凸（硬闸 volScore=0），直接无信号（nil）
+	// English: an underwater session has no second-wave volume (hard gate volScore=0), so no Double Bump signal at all.
+	if ev != nil {
+		t.Fatalf("水下当日无第二波放量应返回 nil(非双凸), got level=%s total=%.0f", ev.Level, ev.TotalScore)
 	}
 }
 

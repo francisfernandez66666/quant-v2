@@ -140,11 +140,23 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	// 两波放量说明资金持续介入，趋势健康；但仅当日上行时才计量能分（水下放量=出货/放量下跌）（Second-wave score: last bar volume
 	// above avg×SecondBreakVolumeMultiple earns full marks, only when the session is up (underwater volume = distribution).）
 	volScore := 0.0
-	if upSession && firstBreakVol > 0 && (func() bool {
+	secondBreak := false
+	if upSession && firstBreakVol > 0 {
 		lastVol := kLines[n-1].Volume
-		return lastVol > avgVol*dbc.SecondBreakVolumeMultiple
-	})() {
-		volScore = dbc.VolumeWeight * 100
+		if lastVol > avgVol*dbc.SecondBreakVolumeMultiple {
+			volScore = dbc.VolumeWeight * 100
+			secondBreak = true
+		}
+	}
+
+	// 双凸形态硬闸：必须有第二波放量确认（volScore>0）才构成双凸。
+	// 若最后一根未放量（第二波缺失），即使均线多头+窄幅也仅是第一波后的普通回调，
+	// 不构成双凸信号——否则会像"卧龙电驱(vol=0,total=54)"那样把非双凸当双凸误报。
+	// English: hard gate — a Double Bump REQUIRES the second-wave volume spike (volScore>0).
+	// Without it, MA-alignment + narrow amplitude is just a routine pullback after the first wave,
+	// not a Double Bump. Without this gate non-pattern stocks (e.g. vol=0,total=54) get mislabeled.
+	if !secondBreak {
+		return nil
 	}
 
 	// 调整深度评分：振幅 / 均价 < AdjustVolRatioMax×2 说明调整温和
