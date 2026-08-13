@@ -1,5 +1,11 @@
-// Package engine 顶层编排引擎：持有全部子代理，驱动新闻流水线（Stage0/1/2）→ 归因 → 板块验证 → 战法扫描 → 信号聚合。
-// 各子模块只输出结果，不做跨模块调用；唯一编排者是本引擎。
+// Package engine 顶层编排引擎：持有全部子代理（NewsAgent/StrategyAgent/SectorAgent/CombatAgent），
+// 每 5 分钟驱动一次完整流水线：新闻拉取 → Stage0/Stage1/Stage2 → 固化 → 板块验证 → 战法扫描 → 信号聚合 → SSE 广播。
+// 各子模块只输出结果，不直接相互调用；引擎是唯一的编排者，控制流程顺序、阈值过滤和状态同步。
+// English: top-level orchestrating engine that holds all sub-agents (NewsAgent/StrategyAgent/SectorAgent/CombatAgent).
+// Drives a full pipeline every 5 minutes: news pull → Stage0/1/2 → fixation → sector verification
+// → strategy scanning → signal aggregation → SSE broadcast.
+// Sub-modules only output results; they do not call each other directly.
+// The engine is the sole orchestrator, controlling flow order, threshold filtering, and state sync.
 package engine
 
 import (
@@ -24,6 +30,7 @@ import (
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
@@ -66,6 +73,7 @@ type Engine struct {
 	msgStore      *data.MessageStore       // 消息中心持久化存储
 	consultStore  *data.ConsultStore       // 股票咨询对话持久化存储（跨交易日清空）
 	confrontStore *data.ConfrontationStore // 政策反制事件持久化存储（跨交易日清空）
+	notifier      *notify.Notifier         // 推送器（桌面/Webhook；P1 清仓强提醒用）
 	hotRecords    []data.HotRecord         // 当日热点板块轮次记录（固化到磁盘）
 	hotRecPath    string                   // 热点板块记录持久化文件路径
 
@@ -76,7 +84,7 @@ type Engine struct {
 	scoreStore       *scoreStore                     // 8a/8b 打分持久化（scores.json）
 	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
 	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
-lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
+	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
 	d1MaxRetries     int                             // D1 评分 LLM 轮询重试次数（<=0 用默认5）
 	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
 }
@@ -191,7 +199,7 @@ func New(
 		prevPass:         make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
 	}
-	e.syncMessages(nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
+	e.syncMessages(nil, nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
 	// English: on startup, backfill the last persisted 8a/8b scores and the day's pinned signals so the
 	// frontend shows them immediately after a restart.
@@ -202,11 +210,33 @@ func New(
 	return e
 }
 
+// SetNotifier 设置推送器（P1 清仓/止损强提醒走桌面/Webhook）。
+func (e *Engine) SetNotifier(n *notify.Notifier) {
+	e.mu.Lock()
+	e.notifier = n
+	e.mu.Unlock()
+}
+
 // SetFetcher 设置 5s 实时行情采集器（近实时打分循环的快照来源）。
 func (e *Engine) SetFetcher(f *data.Fetcher) {
 	e.mu.Lock()
 	e.fetcher = f
 	e.mu.Unlock()
+}
+
+// snapshotQuotes 返回 fetcher 最近一轮 5s 实时行情快照（map: code → quote），
+// 供 syncMessages 等服务直接把最新价/涨跌幅带进消息中心；fetcher 未配置时返回 nil。
+func (e *Engine) snapshotQuotes() map[string]*data.StockInfo {
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	if snap := f.Snapshot(); snap != nil {
+		return snap.Stocks
+	}
+	return nil
 }
 
 // updateHotPool 将验证通过的板块成分股并入 5s 实时监控池。
@@ -1022,7 +1052,8 @@ func nowTimeString() string {
 // （syncMessages merges this round's trade signals (long/short), profit-loss alerts and holding notices into the
 // message store, deduplicated by stable keys.)）
 // bearSectors/bearStocks 为本轮利空板块与利空个股，用于扫出"命中利空板块的持仓"并提醒卖出。
-func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult) {
+// quotes 为调用方可复用的实时行情（5s fetcher 快照），trade 信号优先取用，缺失走 新浪批量→单查 回退。
+func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr *strategy_engine.StrategyResult, quotes map[string]*data.StockInfo) {
 	if e.msgStore == nil {
 		return
 	}
@@ -1032,6 +1063,41 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 	trade := make([]combat_agent.Signal, 0, len(bull)+len(bear))
 	trade = append(trade, bull...)
 	trade = append(trade, bear...)
+	// 预取 trade 信号的实时行情：5s 快照 → 新浪批量（一次请求）→ 实时单查回退，避免单查被限流时消息里"现价:0.00/无涨跌幅"。
+	// English: prefetch live quotes for trade signals once — 5s snapshot → Sina batch (one call) → per-code fallback,
+	// so rate-limited single lookups can't leave messages with 现价:0.00 or a missing 涨跌幅.
+	live := make(map[string]*data.StockInfo, len(trade))
+	if len(trade) > 0 && e.marketAPI != nil {
+		var miss []string
+		if quotes != nil {
+			for _, sig := range trade {
+				if si := quotes[sig.Code]; si != nil && si.Price > 0 {
+					live[sig.Code] = si
+				} else {
+					miss = append(miss, sig.Code)
+				}
+			}
+		} else {
+			for _, sig := range trade {
+				miss = append(miss, sig.Code)
+			}
+		}
+		if len(miss) > 0 {
+			for code, si := range e.marketAPI.GetSinaQuotes(miss) {
+				if si != nil && si.Price > 0 {
+					live[code] = si
+				}
+			}
+			for _, sig := range trade {
+				if _, ok := live[sig.Code]; ok {
+					continue
+				}
+				if si, err := e.marketAPI.GetRealtimeQuote(sig.Code); err == nil && si != nil && si.Price > 0 {
+					live[sig.Code] = si
+				}
+			}
+		}
+	}
 	for _, sig := range trade {
 		direction := sig.Direction
 		if direction == "" {
@@ -1047,14 +1113,23 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 		} else if sig.Action != "" {
 			action = sig.Action
 		}
-		// 信号无成交价（行情缺失导致）时回填实时价，避免消息里"现价:0.00"
-		// English: when a signal has no fill price (quote was missing), backfill the realtime quote so the
-		// message body never reads "现价:0.00".
+		// 现价与涨跌幅：优先实时行情（比信号触发价更新），行情失败则回退信号触发价，避免消息里"现价:0.00"
+		// English: prefer the live quote for the price and change% (fresher than the trigger price); fall
+		// back to the trigger price when the quote fails, so the message never reads "现价:0.00".
 		price := sig.Price
-		if price <= 0 && e.marketAPI != nil {
-			if si, err := e.marketAPI.GetRealtimeQuote(sig.Code); err == nil && si != nil && si.Price > 0 {
-				price = si.Price
-			}
+		changePct := 0.0
+		hasQuote := false
+		if si := live[sig.Code]; si != nil && si.Price > 0 {
+			price = si.Price
+			changePct = si.ChangePct
+			hasQuote = true
+		}
+		body := fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f %s", action, sig.Strategy, sig.Confidence*100, price, sig.Reason)
+		if hasQuote {
+			// 有实时行情时在现价后补涨跌幅（%+.2f 自带 +/- 符号）
+			// English: when a live quote exists, append the change% after the price (%+.2f adds the +/- sign).
+			body = fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f 涨跌幅:%+.2f%% %s",
+				action, sig.Strategy, sig.Confidence*100, price, changePct, sig.Reason)
 		}
 		items = append(items, data.MessageItem{
 			ID:          sig.Code + "@交易信号@" + sig.Strategy,
@@ -1065,7 +1140,7 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 			Strategy:    sig.Strategy,
 			Time:        sig.GeneratedAt.Format("15:04:05"),
 			Title:       fmt.Sprintf("交易信号 %s %s", sig.Code, sig.Name),
-			Body:        fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f %s", action, sig.Strategy, sig.Confidence*100, price, sig.Reason),
+			Body:        body,
 			Direction:   direction,
 			GeneratedAt: sig.GeneratedAt,
 		})
@@ -1138,7 +1213,48 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 			GeneratedAt: l.EntryAt,
 		})
 	}
+	// P1 强提醒：本轮新产生的 清仓/止损 告警，首次出现时走桌面通知 + Webhook 推送。
+	// 依据消息去重键（code@level）判新：已在消息中心存在则说明前几轮已提醒过，不再重复推送。
+	// English: strong P1 push — brand-new close-out / stop-loss alerts get a desktop + Webhook
+	// notification on first appearance; deduped by the message-center key so repeats stay quiet.
+	e.pushCriticalAlerts(items)
 	e.msgStore.Sync(items)
+}
+
+// pushCriticalAlerts 对本次待同步消息中新增的关键告警（清仓/止损）推送桌面+Webhook 强提醒。
+// 仅推送消息中心尚未存在的键，避免 5s 循环重复轰炸；未配置推送器时直接跳过。
+// （pushCriticalAlerts pushes desktop + Webhook alerts for newly-added critical messages
+// (close-out / stop-loss) whose dedup key is not yet in the message center, so the 5s loop
+// stays quiet on repeats; no-op when no notifier is wired.）
+func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
+	e.mu.RLock()
+	nt := e.notifier
+	e.mu.RUnlock()
+	if nt == nil {
+		return
+	}
+	existing := make(map[string]bool)
+	for _, m := range e.msgStore.List() {
+		existing[m.ID] = true
+	}
+	for _, it := range items {
+		if it.Level != "清仓" && it.Level != "止损" {
+			continue
+		}
+		key := it.ID
+		if key == "" {
+			key = it.Code + "@" + it.Level
+		}
+		if existing[key] {
+			continue
+		}
+		title := fmt.Sprintf("%s %s(%s)", it.Level, it.Name, it.Code)
+		nt.Push(notify.Message{
+			Level:   notify.LevelHigh,
+			Title:   title,
+			Content: it.Body,
+		})
+	}
 }
 
 // SetScanner 设置板块扫描器（线程安全，透传给策略引擎）。
@@ -1181,10 +1297,16 @@ func (e *Engine) LongEnabled() bool {
 }
 
 // SetShortEnabled 设置做空开关状态。
+// 关闭（切回仅做多）时顺带清除消息中心残留的做空方向消息（Level/Direction=做空），
+// 避免仅做多界面误展示历史或测试产生的做空条目；不记录墓碑，重新开启后可正常同步。
 func (e *Engine) SetShortEnabled(v bool) {
 	e.mu.Lock()
 	e.shortEnabled = v
 	e.mu.Unlock()
+	if !v && e.msgStore != nil {
+		n := e.msgStore.PurgeShortLevel()
+		log.Printf("[engine] 做空已关闭, 已清除消息中心 %d 条做空残留", n)
+	}
 }
 
 // ShortEnabled 返回做空开关是否开启。
@@ -1244,7 +1366,7 @@ type RunTiming struct {
 func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	out := produceOut{}
 
-// 0. 刷新同花顺板块名单到 scanner（FindSectorsByNames/归因校验依赖真实板块名单）
+	// 0. 刷新同花顺板块名单到 scanner（FindSectorsByNames/归因校验依赖真实板块名单）
 	_stepSectors := time.Now()
 	e.refreshSectors()
 	out.timing.Sectors = time.Since(_stepSectors)
@@ -1462,7 +1584,10 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	if poolErr != nil {
 		log.Printf("[engine] 涨停池拉取失败: %v", poolErr)
 	}
-	newsBriefs := newsBriefsByCode(valid)
+	// 事件简报取当日全量已打标事件（比本轮 valid 更全：个股级事件即使本轮未过阈值也可关联信号标题）
+	// English: build news briefs from today's full attributed-event store (richer than this round's `valid`,
+	// so individual-stock events below this round's threshold can still title D1 events on their signals).
+	newsBriefs := newsBriefsByCode(e.newsAgent.AllEvents())
 	_poolT := time.Since(_stepPool)
 
 	// 8c. 情绪阶段（供 N 形评分硬闸）+ 8a/8b 持续打分输出容器
@@ -1623,6 +1748,18 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 个股信号并入做多信号流统一展示/广播
 	bullSignals = append(bullSignals, individualSignals...)
 
+	// 午休(11:30-13:00)行情冻结，压制做多/做空买卖信号（与近实时循环一致）：只保留
+	// 止盈/止损/卖点/情绪退潮等提醒信号，不发布新的买入/watch/watch 战法信号。
+	// prevPass 由 filterTransitionSignals 维护，13:00 开盘后首个 Pass 仍会正常翻转。
+	// English: quotes freeze at lunch (11:30-13:00), so suppress long/short trade signals exactly like the
+	// near-realtime loop — keep take-profit/stop-loss/sell-point/emotion-retreat reminders, but emit no new
+	// buy/watch strategy signals. prevPass is maintained by filterTransitionSignals, so the first Pass
+	// after 13:00 re-flips normally.
+	if data.IsPreAfternoon(time.Now()) {
+		bullSignals = nil
+		bearSignals = nil
+	}
+
 	// 10-12 出信号结束
 	_signalsT := time.Since(_stepSignals)
 	// 12b 跟踪池收尾结束
@@ -1633,10 +1770,54 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, stockScores, bearHitCodes(sr))
 	_alertsT := time.Since(_stepAlerts)
 
+	// 13b. 战法退出引擎实时评估（移动止盈/分批止盈/尾盘强平/破位/超期 等卖点提醒，仅提醒不自动执行）。
+	// 行情与日K复用本轮打分池数据（sr.MarketData），持仓由 HeldPositions 覆盖。
+	// English: live wiring of the strategy exit engines (trailing stop / staged take-profit / intraday
+	// close / breakdown / timeout…), reminder-only; reuses this round's scoring-pool quotes and daily bars.
+	exitQuotes := make(map[string]*data.StockInfo, len(sr.MarketData))
+	exitDayK := make(map[string][]data.KLine, len(sr.MarketData))
+	for code, md := range sr.MarketData {
+		if md == nil {
+			continue
+		}
+		if md.Quote != nil && md.Quote.Price > 0 {
+			exitQuotes[code] = md.Quote
+		}
+		if len(md.KLines) > 0 {
+			exitDayK[code] = md.KLines
+		}
+	}
+	alertSignals = append(alertSignals, e.combatAgent.CheckPositionsExits(e.rpt, exitQuotes, exitDayK, time.Now())...)
+
+	// 13c. 情绪退潮/背离 → 对做多持仓整体减仓建议（仅提醒）。
+	// English: when the emotion cycle turns to retreat/divergence, advise trimming all long positions.
+	alertSignals = append(alertSignals, e.combatAgent.EmotionRetreatAlerts(e.rpt, exitQuotes, emotionPhase, time.Now())...)
+
+	// 13d. 逐股卖点评估：对打分池全量个股（含未持仓的自选/跟踪股）评估利空D1/破位/派发/动量衰竭，
+	// 命中即产出"卖点"提醒（仅提醒不自动执行）；消息中心按 code@卖点评估 稳定键去重，5s 循环同键刷新。
+	// 仅做多（shortEnabled=false）时非持仓个股不评估、不发减仓/清仓提醒（非持仓无从减仓，纯噪音）；
+	// 做多+做空（shortEnabled=true）时评估全打分池，级别徽标按卖出方向显示为"做空"。
+	// English: per-stock sell-point assessment over the whole scoring pool (including watchlist/tracked
+	// stocks not yet held) — bearish D1 / breakdown / distribution / momentum-exhaustion; reminder-only,
+	// deduped in the message center by code@卖点评估, refreshed by the 5s loop on the same key. In
+	// long-only mode non-held codes are skipped (no point trimming what you don't hold); in long+short
+	// mode the whole pool is assessed and the level badge reads 做空 (sell direction).
+	if len(sr.ScoringPool) > 0 {
+		sellCodes := sr.ScoringPool
+		if !e.ShortEnabled() {
+			sellCodes = e.rpt.HeldPositionCodes()
+		}
+		alertSignals = append(alertSignals, e.combatAgent.AssessSellSide(sellCodes, sr.MarketData, d1Scores, stockScores, e.ShortEnabled())...)
+	}
+
 	// 14. 聚合器更新看板
 	_stepAgg := time.Now()
 	// 固化当日信号：本轮做多/做空 Pass 信号按 code@strategy 覆盖写盘
 	// English: pin today's signals — this round's long/short Passed signals overwrite the store per code@strategy.
+	// 先为做多/做空信号补全真实 D1 事件信息（评分/负面拦截/LLM理由/事件标题），随信号一并固化展示
+	// English: backfill real D1 event info onto long/short signals first so it rides along when pinned/displayed.
+	enrichSignalsWithD1(bullSignals, d1Scores, newsBriefs)
+	enrichSignalsWithD1(bearSignals, d1Scores, newsBriefs)
 	if e.signalStore != nil {
 		tradeSignals := append([]combat_agent.Signal{}, bullSignals...)
 		tradeSignals = append(tradeSignals, bearSignals...)
@@ -1667,8 +1848,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 8a/8b 打分持久化（与近实时循环同口径，当日最新分）
 	e.scoreStore.Save(td, stockScores)
 
-	// 14b. 交易信号/告警/持仓提示合并进消息中心（持久化）
-	e.syncMessages(bullSignals, bearSignals, alertSignals, sr)
+	// 14b. 交易信号/告警/持仓提示合并进消息中心（持久化），带 5s 快照行情（现价+涨跌幅）
+	e.syncMessages(bullSignals, bearSignals, alertSignals, sr, e.snapshotQuotes())
 
 	// 15. 调试数据
 	e.captureDebug(rawNews, st0, events)
@@ -2093,16 +2274,70 @@ func mergeCodes(groups ...[]string) []string {
 // 方向由事件 Score 符号推导（score≥0 视为利好）。
 func newsBriefsByCode(events []newsagent.NewsEvent) map[string][]combat_agent.NewsBrief {
 	m := make(map[string][]combat_agent.NewsBrief)
+	codeCandidates := func(ev newsagent.NewsEvent) []string {
+		codes := make([]string, 0, len(ev.RelatedStocks)+len(ev.CleanedStocks))
+		// RelatedStocks 可能是 "名称"、"名称(代码)" 或裸代码；CleanedStocks 统一为 "名称|代码"。
+		// 优先用 CleanedStocks（格式最规范），再补 RelatedStocks，去重。
+		// English: RelatedStocks may hold names, "name(code)" or bare codes; CleanedStocks is uniformly
+		// "name|code". Prefer CleanedStocks (most normalized), then RelatedStocks, deduped.
+		seen := make(map[string]bool)
+		clean := func(raw string) string {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				return ""
+			}
+			if _, after, ok := strings.Cut(raw, "|"); ok {
+				raw = strings.TrimSpace(after)
+			} else if i := strings.Index(raw, "("); i > 0 {
+				raw = strings.TrimSpace(strings.TrimSuffix(raw[i+1:], ")"))
+			}
+			raw = strings.TrimSpace(raw)
+			// 仅接受可判定为代码的条目：6 位数字，或含字母的港美股/指数代码（如 0700.HK）。
+			// 纯名称（如 "中兴商业"）无法映射到信号，跳过以免脏关联。
+			// English: only accept entries resolvable to codes — 6-digit A-share codes, or alphanumeric
+			// HK/US/index codes (e.g. 0700.HK). Bare names (e.g. "中兴商业") can't map to signals; skip.
+			digits := 0
+			alnum := 0
+			for _, r := range raw {
+				switch {
+				case r >= '0' && r <= '9':
+					digits++
+					alnum++
+				case (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+					alnum++
+				}
+			}
+			if alnum == 0 {
+				return ""
+			}
+			if digits == 6 && alnum == 6 {
+				return raw
+			}
+			if digits > 0 && alnum > digits {
+				return raw // 含字母的代码（港美股/带后缀）
+			}
+			return ""
+		}
+		for _, cs := range ev.CleanedStocks {
+			if c := clean(cs); c != "" && !seen[c] {
+				seen[c] = true
+				codes = append(codes, c)
+			}
+		}
+		for _, rs := range ev.RelatedStocks {
+			if c := clean(rs); c != "" && !seen[c] {
+				seen[c] = true
+				codes = append(codes, c)
+			}
+		}
+		return codes
+	}
 	for _, ev := range events {
 		if ev.Title == "" {
 			continue
 		}
 		positive := ev.Score >= 0
-		for _, code := range ev.RelatedStocks {
-			code = strings.TrimSpace(code)
-			if code == "" {
-				continue
-			}
+		for _, code := range codeCandidates(ev) {
 			m[code] = append(m[code], combat_agent.NewsBrief{
 				Title:    ev.Title,
 				Positive: positive,
@@ -2113,8 +2348,52 @@ func newsBriefsByCode(events []newsagent.NewsEvent) map[string][]combat_agent.Ne
 	return m
 }
 
-// clusterEvents 事件聚簇：同方向且共享任一板块的事件合并为单条。
-// 簇内标题用" | "连接（最多保留 3 条），个股/相关股票去重合并，Score 取 |score| 最大者。
+// enrichSignalsWithD1 为信号补全真实 D1 事件信息（区别于策略 Reason）：
+// 从引擎最近一轮 D1 评分缓存（d1Scores[code].Score/Blocked/Reason）和新闻事件简报
+// （newsBriefs[code] 的标题）回填 Signal.D1Score/D1Blocked/D1Reason/D1Event，
+// 供前端"信号"列表单独展示 D1 事件分析，而不混入策略信号本身的原因。
+// 复用各战法已扫描结果里的 D1 上下文，不额外调 LLM。
+// English: backfills real D1 event info onto signals (distinct from the strategy Reason) — takes the
+// latest D1 score cache (d1Scores[code].Score/Blocked/Reason) and news briefs (newsBriefs[code] titles)
+// into Signal.D1Score/D1Blocked/D1Reason/D1Event, so the frontend signal list can show the D1 event
+// analysis separately instead of mixing it into the strategy reason. Reuses existing D1 context; no new LLM call.
+func enrichSignalsWithD1(sigs []combat_agent.Signal, d1Scores map[string]combat_agent.D1Score, newsBriefs map[string][]combat_agent.NewsBrief) {
+	if len(sigs) == 0 {
+		return
+	}
+	for i := range sigs {
+		s := &sigs[i]
+		// D1 事件标题（新闻归因）独立于 D1 评分缓存：即使 LLM D1 评分缺失/降级为 0，事件仍应展示。
+		// English: the D1 event title (news attribution) is independent of the D1 score cache — even when the
+		// LLM D1 score is missing or degraded to 0, the event should still be shown.
+		if briefs := newsBriefs[s.Code]; len(briefs) > 0 {
+			// 取与信号方向一致的事件标题（利好→做多；利空→做空），无匹配则取首条
+			// English: pick a title matching the signal direction (bullish→long; bearish→short),
+			// falling back to the first brief when none matches.
+			pos := s.Direction == "做多"
+			picked := ""
+			for _, b := range briefs {
+				if b.Positive == pos {
+					picked = b.Title
+					break
+				}
+			}
+			if picked == "" {
+				picked = briefs[0].Title
+			}
+			s.D1Event = picked
+		}
+		d1, ok := d1Scores[s.Code]
+		if !ok {
+			continue
+		}
+		s.D1Score = d1.Score
+		s.D1Blocked = d1.Blocked
+		s.D1Reason = d1.Reason
+	}
+}
+
+// clusterEvents 事件聚簇：同方向且共享任一板块的事件合并为单条。// 簇内标题用" | "连接（最多保留 3 条），个股/相关股票去重合并，Score 取 |score| 最大者。
 // 防止同一主题的多条快讯在信号流中刷屏。
 func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
 	if len(events) < 2 {

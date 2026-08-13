@@ -141,6 +141,14 @@ func (n *Notifier) RegisterWS(id string) chan Message {
 	return ch
 }
 
+// SetWebhooks 设置 Webhook 回调地址列表（替换式，运行时热更新用）。
+// （SetWebhooks replaces the Webhook URL list; used for hot reload at runtime.）
+func (n *Notifier) SetWebhooks(urls []string) {
+	n.mu.Lock()
+	n.webhookURLs = append([]string(nil), urls...)
+	n.mu.Unlock()
+}
+
 // UnregisterWS 注销 WebSocket 客户端。（Unregisters a WebSocket client.）
 func (n *Notifier) UnregisterWS(id string) {
 	n.mu.Lock()

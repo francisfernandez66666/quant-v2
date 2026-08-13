@@ -10,6 +10,16 @@ import (
 // maxCatchUpPages 最多追回页数（同花顺20条/页 × 25页 = 500条）（Max catch-up pages: 20 items/page × 25 = 500.）
 const maxCatchUpPages = 25
 
+// maxCatchUpItems 单轮最多追回条数上限。
+// 防止进程重启（tracker 记账丢失）后一次性追回数百条、Stage0/Stage2 串行调 LLM
+// 数小时不返回，导致 asyncBusy 一直占用、主循环跳过所有后续轮次（看板/日志全部停更）。
+// 超出部分留待下一轮 5min 轮询继续追回，确保单轮处理时长有界。
+// （Max catch-up items per round. Prevents a restart (lost tracker ledger) from pulling hundreds of items and
+// then blocking for hours on sequential LLM Stage0/Stage2 calls, which would keep asyncBusy set and make the
+// main loop skip every following round (dashboard/logs freeze). Items beyond the cap are caught up in the next
+// 5-min round so each round's processing time stays bounded.）
+const maxCatchUpItems = 60
+
 // fetchCatchUp 追回未读新闻：多源拉取（同花顺分页 + 财联社 + 新浪兜底），
 // 统一去重并标记为已见，最后并发抓取正文回填。返回去重后的新闻列表。
 // force=true 时忽略历史已见标题（仅按本轮 seen 打重），用于"手动 LLM 补推"重跑分析。
@@ -32,6 +42,14 @@ func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 	sinaItems := a.fetchSinaOnce(seen, force)
 	all = append(all, sinaItems...)
 
+	// 单轮数量上限（仅常规轮询；force 补推场景不截断，全量重分析）
+	// （Per-round cap for the normal polling loop only; force re-analysis is not truncated.）
+	if !force && len(all) > maxCatchUpItems {
+		log.Printf("[newsagent] 单轮追回 %d 条超上限 %d, 截断取前 %d 条（余量留待下一轮）",
+			len(all), maxCatchUpItems, maxCatchUpItems)
+		all = all[:maxCatchUpItems]
+	}
+
 	// 标记所有追回的新闻为"已见"，防止下次轮询重复拉取
 	titles := make([]string, len(all))
 	times := make([]string, len(all))
@@ -40,6 +58,10 @@ func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 		times[i] = n.Datetime
 	}
 	a.tracker.BulkMarkSeen(titles, times)
+	// 立即落盘 seen 记账：若后续 LLM 阶段耗时数小时/进程被杀，也不会在重启后重复追回同一批新闻
+	// （Immediately persist the seen ledger so a later long LLM phase or a killed process does not re-fetch
+	// the same news after restart.）
+	_ = a.tracker.save()
 
 	// 并发抓取原文正文（失败保留摘要，不阻断流水线）
 	a.EnrichContents(all)

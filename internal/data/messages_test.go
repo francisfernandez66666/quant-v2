@@ -43,3 +43,36 @@ func TestRefreshNameByCode(t *testing.T) {
 		}
 	}
 }
+
+// TestPurgeShortLevel 验证 PurgeShortLevel：仅清除做空方向消息（Level/Direction=做空），
+// 不写墓碑（deleted_keys），做多/其他方向消息不受影响，可持久化。
+func TestPurgeShortLevel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages.json")
+	s := NewMessageStore(path)
+	base := time.Now()
+	s.Sync([]MessageItem{
+		{ID: "000001@做空", Code: "000001", Name: "平安", Level: "做空", Direction: "做空", GeneratedAt: base},
+		{ID: "000002@交易信号@动量", Code: "000002", Name: "", Level: "交易信号", Direction: "做空", GeneratedAt: base},
+		{ID: "600519@交易信号@动量", Code: "600519", Name: "茅台", Level: "交易信号", Direction: "做多", GeneratedAt: base},
+		{ID: "000003@减仓", Code: "000003", Name: "", Level: "减仓", Direction: "提醒", GeneratedAt: base},
+	})
+
+	if n := s.PurgeShortLevel(); n != 2 {
+		t.Fatalf("应清除 2 条做空, got %d", n)
+	}
+	got := s.List()
+	if len(got) != 2 {
+		t.Fatalf("应剩 2 条, got %d: %+v", len(got), got)
+	}
+	for _, m := range got {
+		if m.Level == "做空" || m.Direction == "做空" {
+			t.Fatalf("做空消息不应残留: %+v", m)
+		}
+	}
+	if len(s.file.DeletedKeys) != 0 {
+		t.Fatalf("不应写墓碑(切回可重同步), got %v", s.file.DeletedKeys)
+	}
+	if len(s.file.Messages) != 2 {
+		t.Fatalf("持久化消息数应 2, got %d", len(s.file.Messages))
+	}
+}

@@ -2,12 +2,20 @@
 //   - TestFillFallback：D1 失败回退上一轮评分（有值复用 / 无值归 0）
 //   - TestBatchScoreNilLLM：LLM 未配置时全量归 0，不受 fallback 影响
 //   - TestCleanJSONInteriorBOM：LLM 输出数组内部夹 BOM 时仍可被解析（曾整批亏损）
+//   - TestBatchScoreChunked：按 llmBatchSize 分批调用 LLM，每批独立解析、不漏股
 package combat_agent
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
+	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -122,5 +130,93 @@ func TestSetMaxRetries(t *testing.T) {
 	}
 	if got := ds.SetMaxRetries(-1); got != defaultMaxAttempts {
 		t.Fatalf("-1应回退默认, got %d", got)
+	}
+}
+
+// TestBatchScoreChunked 覆盖"按 llmBatchSize 分批调用"：
+// 25 只个股应产生 ceil(25/10)=3 次 LLM 调用，每批 prompt 内个股数 ≤10；
+// 每批 LLM 全量返回 → 结果 25 只全有分数、无漏项、无 fallback 回退。
+func TestBatchScoreChunked(t *testing.T) {
+	var mu sync.Mutex
+	var calls [][]string
+	var prompts []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		// 从 user 消息内容里提取本批实际请求的个股代码
+		var req llm.ChatRequest
+		var codes []string
+		if err := json.Unmarshal(body, &req); err == nil {
+			for _, m := range req.Messages {
+				if m.Role == "user" {
+					for _, line := range strings.Split(m.Content, "\n") {
+						line = strings.TrimSpace(line)
+						if idx := strings.Index(line, "代码: "); idx >= 0 {
+							codes = append(codes, strings.TrimSpace(line[idx+len("代码: "):]))
+						}
+					}
+				}
+			}
+		}
+		mu.Lock()
+		calls = append(calls, append([]string{}, codes...))
+		prompts = append(prompts, string(body))
+		mu.Unlock()
+		// 回显同批 codes 的完整 JSON（包在 OpenAI chat.completions 响应壳内），模拟 LLM 全量返回
+		var arr []map[string]any
+		for _, c := range codes {
+			arr = append(arr, map[string]any{"code": c, "score": 0.5, "blocked": false, "reason": "测试"})
+		}
+		b, _ := json.Marshal(arr)
+		resp := map[string]any{
+			"choices": []any{
+				map[string]any{"message": map[string]any{"content": string(b)}},
+			},
+		}
+		out, _ := json.Marshal(resp)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(out)
+	}))
+	defer srv.Close()
+
+	cl := llm.New(llm.Config{
+		APIKey:     "test",
+		APIURL:     srv.URL,
+		Model:      "test-model",
+		Streaming:  false,
+		Timeout:    0,
+	})
+	ds := NewD1Scorer(cl, "")
+
+	// 25 只个股（代码 600001~600025），应分 3 批（10/10/5）
+	var codes []string
+	for i := 1; i <= 25; i++ {
+		codes = append(codes, fmt.Sprintf("600%03d", i))
+	}
+	got := ds.BatchScore(codes, nil, nil, nil)
+
+	if len(calls) != 3 {
+		t.Fatalf("应产生3次LLM调用, got %d", len(calls))
+	}
+	for i, c := range calls {
+		if len(c) > llmBatchSize {
+			t.Fatalf("第%d批个股数=%d 应≤%d", i+1, len(c), llmBatchSize)
+		}
+	}
+	if len(prompts) != 3 {
+		t.Fatalf("应构建3个prompt, got %d", len(prompts))
+	}
+	// 25 只全部有分、无漏项
+	if len(got) != 25 {
+		t.Fatalf("应25只全有分, got %d", len(got))
+	}
+	for _, c := range codes {
+		if s, ok := got[c]; !ok || s.Score != 0.5 {
+			t.Fatalf("%s 应有score=0.5, got %+v ok=%v", c, s, ok)
+		}
+	}
+	// 分批日志应出现在输出中（覆盖分批评分路径）
+	if !strings.Contains(prompts[0], "代码: 600001") || !strings.Contains(prompts[2], "代码: 600021") {
+		t.Fatalf("分批边界异常: prompts[0]=%s prompts[2]=%s", prompts[0], prompts[2])
 	}
 }

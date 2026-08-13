@@ -19,6 +19,7 @@ import (
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
@@ -132,6 +133,7 @@ func main() {
 	laodengCfg := &cfgMgr.Rules.Laodeng
 	cAgent := combat_agent.New(stratCfg)
 	cAgent.SetLaodengConfig(laodengCfg)
+	cAgent.SetPositionDailyDropPct(cfgMgr.Rules.Position.DailyDropAlertPct)
 	cAgent.SetRunners([]combat_agent.StrategyRunner{
 		{Type: strategy.SignalDragon, Strategy: dragon.New(cfgMgr)},
 		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(cfgMgr)},
@@ -158,6 +160,10 @@ func main() {
 	// 顶层编排引擎：绑定新闻/策略/板块/作战/报告等全部模块
 	eng := engine.New(marketAPI, nAgent, strategyEngine, sAgent, cAgent, agg, rpt, stockTracker, wlMgr, srv.GetSSE(), llmClient, thsClient, dataDir)
 	eng.SetScanner(scanner)
+	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
+	notifier := notify.New()
+	notifier.SetWebhooks(cfgMgr.GetNotifyConfig().WebhookURLs)
+	eng.SetNotifier(notifier)
 	srv.SetEngineController(eng)
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程
 	srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int, streaming bool) {
@@ -232,8 +238,15 @@ func main() {
 					log.Printf("[main] 盘前异步引擎仍在运行, 跳过本轮")
 				}
 			} else {
-				// 午前/盘中：同步触发，保证上一轮结果落地后再进下一轮
-				eng.Run(ctx, since)
+				// 午前/盘中：异步触发，避免 LLM 重试阻塞主循环/近实时打分，轮次仍按 5min 节奏推进；
+				// asyncBusy 忙锁防止并发重入（上一轮未完成时本轮跳过）。
+				// English: trade sessions also run asynchronously so LLM retries never block the main loop or
+				// near-realtime scoring; the asyncBusy guard skips overlap, and rounds keep the 5-min cadence.
+				if eng.TryAsyncRun(ctx, since) {
+					log.Printf("[main] 盘中异步引擎已触发")
+				} else {
+					log.Printf("[main] 异步引擎仍在运行, 跳过本轮")
+				}
 			}
 		} else {
 			log.Printf("[main] Session=%s 非处理时段, 跳过本轮", session)

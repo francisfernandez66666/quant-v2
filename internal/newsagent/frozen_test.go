@@ -3,6 +3,7 @@
 package newsagent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -151,11 +152,14 @@ func TestFrozenSaveCrossDay(t *testing.T) {
 func TestFrozenCorruptRecovery(t *testing.T) {
 	a := newTestAgent(t)
 
-	// 截断：整体 JSON 缺尾括号解析失败，但每个事件对象行仍可单独解析 → 逐条抢救
-	broken := `{"trading_day":"20260806",
+	// 截断：整体 JSON 缺尾括号解析失败，但每个事件对象行仍可单独解析 → 逐条抢救。
+	// （用动态当日日期，确保抢救出的事件不会被 isFrozenExpired 按跨日窗口判为过期而过滤。）
+	// （Dynamic today-based day keeps salvaged events within the expiry window so FrozenEvents returns them.）
+	cur := time.Now().Format("20060102")
+	broken := fmt.Sprintf(`{"trading_day":%q,
 "events":[
-{"title":"抢救成功","key":"x|利好","day":"20260806"},
-{"title":"第二条","key":"y|利好","day":"20260806"}`
+{"title":"抢救成功","key":"x|利好","day":%q},
+{"title":"第二条","key":"y|利好","day":%q}`, cur, cur, cur)
 	if err := os.WriteFile(a.frozenPath, []byte(broken), 0644); err != nil {
 		t.Fatal(err)
 	}

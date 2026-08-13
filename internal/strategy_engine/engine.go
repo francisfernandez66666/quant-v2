@@ -27,6 +27,9 @@ type Engine struct {
 	klineCacheMu sync.RWMutex                // 保护 klineCache 的读写锁（近实时打分并发访问）（Lock guarding klineCache for concurrent near-realtime scoring）
 	klineCache   map[string]*klineCacheEntry // 日K/资金流缓存（近实时打分用）（Daily-bar / capital-flow cache for near-realtime scoring）
 
+	minuteKCacheMu sync.RWMutex                   // 保护 minuteKCache 的读写锁（Lock guarding minuteKCache）
+	minuteKCache   map[string]*minuteKCacheEntry  // 分钟K线缓存（60s TTL，避免扩大打分池后 5s 循环压垮数据源）（Minute-bar cache, 60s TTL, so the widened pool doesn't hammer the data source）
+
 	benchChgMu  sync.RWMutex // 保护基准指数涨跌幅缓存（Lock guarding the benchmark change cache）
 	benchChgVal float64      // 上证指数最新涨跌幅（%）（Latest SSE index change %）
 	benchChgAt  time.Time    // 基准指数拉取时间（TTL 判断）（Benchmark fetch time, for TTL checks）
@@ -42,12 +45,19 @@ type klineCacheEntry struct {
 	fetchedAt time.Time         // 拉取时间（用于 5 分钟 TTL 判过期）（Fetch time, for the 5-minute TTL check）
 }
 
+// minuteKCacheEntry 分钟K线缓存条目（5分钟48根≈当日；60s TTL）。
+type minuteKCacheEntry struct {
+	bars      []data.KLine
+	fetchedAt time.Time
+}
+
 // New 创建策略引擎实例。（New creates a strategy-engine instance.）
 func New(marketAPI *data.MarketAPI) *Engine {
 	return &Engine{
 		marketAPI:      marketAPI,
 		stockSectorIdx: make(map[string][]string),
 		klineCache:     make(map[string]*klineCacheEntry),
+		minuteKCache:   make(map[string]*minuteKCacheEntry),
 	}
 }
 
@@ -273,7 +283,7 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 			}
 
 			// 分钟K线（5分钟，48根≈当日）→ 计算 MACD，供 8a/8b 动量分与 N 形评分使用（Minute bars (5-min, 48 ≈ a day) → MACD for 8a/8b momentum and N-shape scoring）
-			minKL := e.fetchMinuteKLine(code)
+			minKL := e.cachedMinuteKLine(code)
 			if len(minKL) >= 2 {
 				md.MinuteKLine = minKL
 				md.MinuteMACD = data.CalcMACD(minKL)
@@ -343,7 +353,7 @@ func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes ma
 			defer func() { <-sem }()
 			md.KLines, md.MoneyFlow = e.cachedKLine(code)
 			e.attachLiveBar(md)
-			minKL := e.fetchMinuteKLine(code)
+			minKL := e.cachedMinuteKLine(code)
 			if len(minKL) >= 2 {
 				md.MinuteKLine = minKL
 				md.MinuteMACD = data.CalcMACD(minKL)
@@ -477,6 +487,25 @@ func (e *Engine) fetchMinuteKLine(code string) []data.KLine {
 	}
 	e.bumpKLineSrc("分钟失败")
 	return nil
+}
+
+// cachedMinuteKLine 分钟K线（5分钟48根）带 60s TTL 缓存：扩大近实时打分池后避免每 5s 重复拉取压垮数据源。
+// 分钟K线内容随 5 分钟 K 线收盘才更新，60s 内复用的失真可忽略。
+// （cachedMinuteKLine caches minute bars with a 60s TTL so the widened near-realtime pool does not hammer the data
+// source every 5s; content only refreshes on each 5-min bar close, so reuse within 60s is safe.）
+func (e *Engine) cachedMinuteKLine(code string) []data.KLine {
+	now := time.Now()
+	e.minuteKCacheMu.RLock()
+	ent, ok := e.minuteKCache[code]
+	e.minuteKCacheMu.RUnlock()
+	if ok && now.Sub(ent.fetchedAt) < time.Minute && len(ent.bars) >= 2 {
+		return ent.bars
+	}
+	bars := e.fetchMinuteKLine(code)
+	e.minuteKCacheMu.Lock()
+	e.minuteKCache[code] = &minuteKCacheEntry{bars: bars, fetchedAt: now}
+	e.minuteKCacheMu.Unlock()
+	return bars
 }
 
 // bumpKLineSrc 累计一次 K 线源统计（线程安全）。（bumpKLineSrc increments the K-line source counter, thread-safe.）

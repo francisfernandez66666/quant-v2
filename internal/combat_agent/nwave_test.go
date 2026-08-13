@@ -173,3 +173,100 @@ func TestScorePoolN1NoD1Suppressed(t *testing.T) {
 		}
 	}
 }
+
+// fakeFullChainStrategy 固定返回 full_chain Pass 的伪战法，用于隔离测试 B2 盘中确认门
+// （避开 n_shape 真实波形/情绪硬闸，直接验证 evalAll 对纯 full_chain 的门控逻辑）。
+// English: a fake strategy that always returns a full_chain Pass, isolating the B2 intraday
+// confirmation gate from real n_shape waveform/emotion logic.
+type fakeFullChainStrategy struct{}
+
+func (fakeFullChainStrategy) Name() string                     { return "fake_n" }
+func (fakeFullChainStrategy) Type() strategy.SignalType        { return strategy.SignalNShape }
+func (fakeFullChainStrategy) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
+	return &strategy.Evaluation{
+		Level: "full_chain", Pass: true, TotalScore: 80,
+		Details: map[string]float64{"d1": 0.8},
+		Confidence: 0.7,
+	}, nil
+}
+func (fakeFullChainStrategy) GenerateSignal(code string, _ *strategy.Evaluation) (*strategy.Signal, error) {
+	return &strategy.Signal{
+		Code: code, Name: "突破", Action: strategy.ActionBuy,
+		Price: 11.0, Confidence: 0.7, Reason: "N形full_chain形态",
+	}, nil
+}
+
+// scorePoolFullChain 用伪战法跑 ScorePool，返回 code 的 N 形信号。
+func scorePoolFullChain(t *testing.T, md *strategy_engine.StockMarketData) []Signal {
+	t.Helper()
+	cfg := config.NewManager(filepath.Join(t.TempDir(), "config.json"))
+	a := New(cfg.GetStrategyConfig())
+	a.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: fakeFullChainStrategy{}}})
+	pool := map[string]*strategy_engine.StockMarketData{"600899": md}
+	_, sigs := a.ScorePool([]string{"600899"}, pool, map[string]D1Score{"600899": {Code: "600899", Score: 0.8, Blocked: false}}, "")
+	return sigs
+}
+
+// TestFullChainVolumeGateWatchBeforeOpen 验证 B2 盘中确认门：竞价/盘前无真实成交（Volume=0）时，
+// 纯 full_chain 形态买入信号降级为 watch，避免基于竞价/存量的假买入信号。
+func TestFullChainVolumeGateWatchBeforeOpen(t *testing.T) {
+	sigs := scorePoolFullChain(t, mkWaveMD(11.0, 0))
+	for _, s := range sigs {
+		if s.Code != "600899" {
+			continue
+		}
+		if s.Action == "buy" {
+			t.Fatalf("Volume=0 时 full_chain 不应买入, got %+v", s)
+		}
+		if s.Action != "watch" || !containsSubstr(s.Reason, "待盘中确认") {
+			t.Fatalf("Volume=0 时 full_chain 应降级为 watch+待盘中确认, got %+v", s)
+		}
+		return
+	}
+	t.Fatalf("应产出降级后的 watch 信号, got %+v", sigs)
+}
+
+// TestFullChainVolumeGateBuyAfterOpen 验证 B2 盘中确认门：实盘有真实成交（Volume>0）后，
+// 纯 full_chain 形态维持 buy 信号（门放行）。
+func TestFullChainVolumeGateBuyAfterOpen(t *testing.T) {
+	sigs := scorePoolFullChain(t, mkWaveMD(11.0, 2_000_000))
+	for _, s := range sigs {
+		if s.Code != "600899" {
+			continue
+		}
+		if s.Action != "buy" {
+			t.Fatalf("Volume>0 时 full_chain 应维持买入, got %+v", s)
+		}
+		if containsSubstr(s.Reason, "待盘中确认") {
+			t.Fatalf("Volume>0 时不应标记待盘中确认, got %+v", s)
+		}
+		return
+	}
+	t.Fatalf("应产出 buy 信号, got %+v", sigs)
+}
+
+// TestFullChainVolumeGateLeftNotGated 验证确认门不误伤：已由波形状态机提升为 left_signal/right_signal
+// 的信号（一突/二突，本身即盘中确认）不受 volume 门控，Volume=0 时仍为 buy。
+func TestFullChainVolumeGateLeftNotGated(t *testing.T) {
+	// 现价 11.2 > 前高11×1.005 且放量 → 一突打标，level 被提升为 left_signal
+	sigs := scorePoolFullChain(t, mkWaveMD(11.2, 2_000_000))
+	for _, s := range sigs {
+		if s.Code != "600899" {
+			continue
+		}
+		if s.Action != "buy" {
+			t.Fatalf("一突/二突不被 volume 门控, 应保持 buy, got %+v", s)
+		}
+		return
+	}
+	t.Fatalf("应产出 buy 信号, got %+v", sigs)
+}
+
+func containsSubstr(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

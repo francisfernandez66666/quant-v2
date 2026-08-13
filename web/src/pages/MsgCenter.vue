@@ -96,7 +96,9 @@ const filteredAlerts = computed(() => {
   // Stop-loss and take-profit are filtered together
   if (activeFilter.value === 'stop') return alerts.value.filter(a => a.level === '止盈' || a.level === '止损')
   if (activeFilter.value === 'hold') return alerts.value.filter(a => a.level === '持仓提示')
-  return alerts.value
+  // 默认剔除“预期差”提醒，保持战法纯净
+  // English: always filter out "Expectation Gap" reminders to keep the core strategies pristine
+  return alerts.value.filter(a => a.strategy !== '预期差')
 })
 
 /** 根据消息等级返回卡片边框颜色类 */

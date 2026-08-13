@@ -167,6 +167,31 @@ func (s *MessageStore) ClearAll() {
 	s.persist()
 }
 
+// PurgeShortLevel 清除全部做空方向的消息（Level=做空，或做空方向的交易信号/卖点评估），
+// 不记录墓碑（deleted_keys）：仅做多开关切回后即时清理残留，再次切回做多+做空时可正常重新同步。
+// 返回清除条数。用于做空开关关闭时清理测试/历史残留，避免仅做多界面误展示做空消息。
+// English: removes every short-direction message (Level=做空, or trade/sell-side messages with
+// Direction=做空) WITHOUT recording a tombstone, so flipping back to long+short can re-sync them.
+// Returns how many were removed. Called when the short toggle turns off, to purge stale test/historical
+// residue from the long-only view.
+func (s *MessageStore) PurgeShortLevel() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.file.Messages[:0]
+	for _, m := range s.file.Messages {
+		if m.Level == "做空" || m.Direction == "做空" {
+			continue
+		}
+		out = append(out, m)
+	}
+	removed := len(s.file.Messages) - len(out)
+	if removed > 0 {
+		s.file.Messages = out
+		s.persist()
+	}
+	return removed
+}
+
 // List 返回全部消息（按生成时间倒序）。
 func (s *MessageStore) List() []MessageItem {
 	s.mu.Lock()

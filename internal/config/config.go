@@ -32,6 +32,14 @@ type Rules struct {
 	Theme      ThemeConfig      `json:"theme"`         // 主题/黑名单配置
 	RiskCtrl   RiskCtrlConfig   `json:"risk_ctrl"`     // 风控参数
 	Position   PositionConfig   `json:"position"`      // 仓位管理参数
+	Notify     NotifyConfig     `json:"notify"`        // 通知推送参数
+}
+
+// NotifyConfig 通知推送配置：Webhook 回调地址列表（P1 清仓/止损强提醒时异步回调）。
+// （NotifyConfig holds notification settings, e.g. the Webhook callback URLs used when P1
+// close-out/stop-loss alerts fire.）
+type NotifyConfig struct {
+	WebhookURLs []string `json:"webhook_urls,omitempty"` // Webhook 地址列表（空则只走桌面/SSE）
 }
 
 // EmotionConfig 情绪周期六个阶段（冰点/启动/发酵/高潮/背离/退潮）的判定阈值。
@@ -150,10 +158,15 @@ type StopLossConfig struct {
 	DrawdownAfterBuy []DrawdownRule `json:"drawdown_after_buy"` // 买入后回撤阶梯规则
 }
 
-// PositionConfig 总仓位上限配置。
-// （PositionConfig caps the total portfolio position.）
+// PositionConfig 仓位配置：总仓位上限 + 持仓当日跌幅提醒阈值。
+// （PositionConfig caps the total portfolio position and sets the daily-drop alert threshold.）
 type PositionConfig struct {
 	MaxTotalPositionPct float64 `json:"max_total_position_pct"` // 最大总仓位比例
+	// DailyDropAlertPct 持仓当日跌幅(%)提醒阈值：当日涨跌幅 ≤ -该值 时，
+	// 无论成本盈亏是否触及止损线，都在持仓提醒中提示（<=0 用默认 5）。
+	// （DailyDropAlertPct is the intraday daily-drop alert threshold for holdings: when a held stock's
+	// daily change ≤ -threshold, a holding alert fires regardless of cost-based P/L (<=0 defaults to 5).）
+	DailyDropAlertPct float64 `json:"daily_drop_alert_pct"`
 }
 
 // StrategyConfig 各策略的独立参数配置。
@@ -325,6 +338,19 @@ func (m *Manager) GetLLMConfig() *LLMConfig {
 	return &m.Rules.LLM
 }
 
+// GetNotifyConfig 返回通知推送配置。
+// （GetNotifyConfig returns the notification config.）
+func (m *Manager) GetNotifyConfig() *NotifyConfig {
+	return &m.Rules.Notify
+}
+
+// SetNotifyConfig 更新通知配置并持久化到文件。
+// （SetNotifyConfig updates the notification config and persists it.）
+func (m *Manager) SetNotifyConfig(cfg *NotifyConfig) {
+	m.Rules.Notify = *cfg
+	m.Save()
+}
+
 // SetLLMConfig 更新 LLM 配置并持久化到文件。
 // （SetLLMConfig updates the LLM config and persists it to the file.）
 func (m *Manager) SetLLMConfig(cfg *LLMConfig) {
@@ -398,6 +424,9 @@ type CalendarConfig struct {
 // （DefaultRules is the default trading-rules instance; unset fields retain zero values.）
 var DefaultRules = &Rules{
 	Strategy: defaultStrategyConfig(),
+	Position: PositionConfig{
+		DailyDropAlertPct: 5,
+	},
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。

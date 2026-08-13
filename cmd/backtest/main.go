@@ -257,6 +257,7 @@ func (o *backtestOptions) run() error {
 
 	cAgent := combat_agent.New(o.cfgMgr.GetStrategyConfig())
 	cAgent.SetLaodengConfig(&o.cfgMgr.Rules.Laodeng)
+	cAgent.SetPositionDailyDropPct(o.cfgMgr.Rules.Position.DailyDropAlertPct)
 	cAgent.SetRunners([]combat_agent.StrategyRunner{
 		{Type: strategy.SignalDragon, Strategy: dragon.New(o.cfgMgr)},
 		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(o.cfgMgr)},

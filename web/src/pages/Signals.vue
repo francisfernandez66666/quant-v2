@@ -37,9 +37,12 @@
         <span class="col-score">总分</span>
         <span class="col-level">等级</span>
         <span class="col-detail">D1/D2/D3/D4</span>
+        <span class="col-kline">分时</span>
+        <span class="col-action">操作</span>
       </div>
-      <!-- 信号行：代码/名称/现价涨跌/策略/总分/等级徽标/D1-D4 维度评分（含简短描述）+ 操作（买入或忽略）（Signal row: code/name/price & change/strategy/total score/level badge/D1-D4 dimension scores with short descriptions + action (buy or ignore)）-->
-      <div v-for="s in filteredSignals" :key="s.code" class="table-row">
+      <!-- 信号行 + 可展开 分时区（Signal row + expandable K-line area）-->
+      <div v-for="s in filteredSignals" :key="s.code" class="table-row-group">
+      <div class="table-row">
         <span class="col-code">{{ s.code }}</span>
         <span class="col-name">{{ s.name || '-' }}</span>
         <span class="col-price">
@@ -56,8 +59,10 @@
           </span>
         </span>
         <span class="col-detail">
-          <span class="d-pill d1" :title="'D1: ' + (s.d1_desc || '')">
-            {{ (s.d1 || 0).toFixed(0) }}<em v-if="s.d1_desc">{{ shortDesc(s.d1_desc) }}</em>
+          <span class="d-pill d1"
+                :title="'D1事件: ' + (s.d1_reason || s.d1_event || '无事件') + (s.d1_blocked ? '（负面拦截）' : '')">
+            <em v-if="s.d1_score && (s.d1_reason || s.d1_event)">{{ d1Tag(s) }}</em>
+            <span v-else class="d1-none">{{ s.d1 ? s.d1.toFixed(0) : '—' }}</span>
           </span>
           <span class="d-pill d2" :title="'D2: ' + (s.d2_desc || '')">
             {{ (s.d2 || 0).toFixed(0) }}<em v-if="s.d2_desc">{{ shortDesc(s.d2_desc) }}</em>
@@ -69,12 +74,22 @@
             {{ (s.d4 || 0).toFixed(0) }}<em v-if="s.d4_desc">{{ shortDesc(s.d4_desc) }}</em>
           </span>
         </span>
-        <!-- 操作列：可开仓时显示"买入"按钮；已确认买入的显示"忽略"按钮；其余显示占位符（Action column: "buy" when tradeable; "ignore" after a confirmed buy; a placeholder otherwise）-->
+        <span class="col-kline">
+          <button class="btn-kline" @click="toggleKline(s.code)" :title="klineOpen.has(s.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(s.code) ? '收起' : '分时' }}</button>
+        </span>
+        <!-- 操作列：可开仓时显示"买入"按钮；已确认买入的显示"忽略"按钮；其余显示占位符；增加"收藏"按钮可一键添加到自选股（Action column: "buy" when tradeable; "ignore" after a confirmed buy; a placeholder otherwise; "collect" button to add to watchlist）-->
         <span class="col-action">
           <button v-if="s.can_open" class="btn-buy" @click="confirmTrade(s, 'buy')">买入</button>
           <button v-else-if="s.action === 'buy'" class="btn-ignore" @click="confirmTrade(s, 'ignore')">忽略</button>
           <span v-else class="text-muted">—</span>
+          <!-- 收藏/加入自选股按钮：一键将信号股票代码加入自选股列表（Add to watchlist button: one-click add signal's code to watchlist）-->
+          <button v-if="!s.can_open && s.action !== 'buy'" class="btn-collect" @click="collectToWatchlist(s)">收藏</button>
         </span>
+      </div>
+      <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
+      <div v-if="klineOpen.has(s.code)" class="col-kline-row">
+        <KLineChart :code="s.code" :name="s.name" />
+      </div>
       </div>
       <div class="empty" v-if="filteredSignals.length === 0">暂无信号</div>
     </div>
@@ -106,11 +121,15 @@ import * as api from '../api/index.js'                      // 后端 API 调用
 // backend API wrapper (signal list, actions, SSE etc.)
 import LogModal from '../components/LogModal.vue'            // 日志弹窗（LLM 批次 + 信号批次）
 // log modal (LLM batches + signal batches)
+import KLineChart from '../components/KLineChart.vue'        // 分时图组件（展开行展示）
+// K-line chart component (shown in expanded rows)
 
 // ── 响应式状态 ──
 // ── Reactive state ──
 const signals = ref([])               // 原始信号列表
 // raw signal list
+const klineOpen = ref(new Set())      // 已展开分时的信号代码集合
+// the set of signal codes whose K-line is expanded
 const activeFilter = ref('all')       // 当前筛选等级
 // the currently selected level filter
 const activeStrategy = ref('all')     // 当前筛选战法
@@ -156,6 +175,10 @@ const filteredSignals = computed(() => {
   // 策略名称过滤
   // Strategy-name filter
   if (activeStrategy.value !== 'all') list = list.filter(s => s.strategy === activeStrategy.value)
+  // 默认排除“预期差”策略信号（非开仓提醒类），保持四大战法纯净
+  // English: always filter out "Expectation Gap" strategy signals (non-trading reminder type)
+  // to keep the four core strategies pristine
+  list = list.filter(s => s.strategy !== '预期差')
   return list
 })
 
@@ -172,6 +195,16 @@ function shortDesc(s) {
   // Take the part before the comma, or the first 6 chars when there is no comma
   const idx = s.indexOf(',')
   return idx > 0 ? s.slice(0, idx) : s.slice(0, 6)
+}
+
+/** D1 事件列的徽标文字：优先事件标题，其次 LLM 理由，最多展示 8 字符，并附分数与拦截标记 */
+/** D1-event pill label: prefers the event title, then the LLM reason, capped at 8 chars, with score/blocked flag */
+function d1Tag(s) {
+  const label = s.d1_event || s.d1_reason || ''
+  const base = shortDesc(label) || '事件'
+  const score = s.d1_score ? (s.d1_score * 100).toFixed(0) : ''
+  const blocked = s.d1_blocked ? '·拦' : ''
+  return [base, score, blocked].filter(Boolean).join('')
 }
 
 /** 打开交易确认弹窗 */
@@ -201,8 +234,34 @@ async function doAction(action) {
   }
 }
 
+/** 展开/收起某信号的 分时区 */
+/** Toggle a signal's K-line area */
+function toggleKline(code) {
+  const next = new Set(klineOpen.value)
+  if (next.has(code)) next.delete(code)
+  else next.add(code)
+  klineOpen.value = next
+}
+
 /** 从 API 加载信号列表 */
 /** Load the signal list from the API */
+
+/** 一键收藏到自选股 */
+/** Add to watchlist one-click */
+async function collectToWatchlist(s) {
+  try {
+    // 调用后端接口将信号股票加入自选
+    // Call the backend endpoint to add the signal's code to watchlist
+    const res = await api.addWatchlist(s.code)
+    // 显示反馈
+    // Show feedback
+    showFeedback('已收藏 ' + s.code, 'ok')
+    // 刷新自观列表（如果有打开）
+    // Refresh watchlist if open
+  } catch (e) {
+    showFeedback('收藏失败: ' + e.message, 'err')
+  }
+}
 async function load() {
   try { signals.value = await api.fetchSignals() } catch (_) {}
 }
@@ -237,6 +296,20 @@ onUnmounted(() => {
 })
 </script>
 
+
+/** 显示临时反馈文字，2.5 秒后消失 */
+/** Show temporary feedback text that disappears after 2.5 seconds */
+function showFeedback(msg, type) {
+  const typeClass = type || 'ok'
+  const div = document.createElement('div')
+  div.className = 'toast ' + typeClass
+  div.textContent = msg
+  const container = document.querySelector('.signals-page')
+  if (container) {
+    container.insertBefore(div, container.firstChild)
+  }
+  setTimeout(() => { div.remove() }, 2500)
+}
 <style scoped>
 .signals-page { max-width: 1200px; }
 .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
@@ -261,9 +334,9 @@ onUnmounted(() => {
 .table-header, .table-row {
   display: flex; align-items: center; padding: 10px 16px; gap: 8px; font-size: 13px;
 }
+.table-row-group { border-bottom: 1px solid #2a2a3e; }
 .table-header { background: #2a2a3e; color: #888; font-weight: 600; }
-.table-row { border-bottom: 1px solid #2a2a3e; }
-.table-row:last-child { border-bottom: none; }
+.table-row { border-bottom: none; }
 .col-code { width: 80px; font-family: monospace; color: #4fc3f7; }
 .col-name { width: 100px; color: #e0e0e0; }
 .col-price { width: 130px; display: flex; flex-direction: column; gap: 2px; }
@@ -276,6 +349,13 @@ onUnmounted(() => {
 .col-level { width: 70px; }
 .col-detail { flex: 1; display: flex; gap: 6px; align-items: center; }
 .col-action { width: 80px; text-align: center; }
+.col-kline { width: 60px; text-align: center; }
+.btn-kline {
+  background: transparent; border: 1px solid #3a3a55; color: #7ab8ff;
+  border-radius: 4px; cursor: pointer; font-size: 11px; padding: 2px 8px;
+}
+.btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
+.col-kline-row { padding: 8px 16px 12px; background: #16162a; }
 .tag { font-size: 11px; padding: 2px 10px; border-radius: 10px; }
 .tag.strong { background: rgba(255,77,79,0.15); color: #FF4D4F; }
 .tag.observe { background: rgba(250,173,20,0.15); color: #FAAD14; }
@@ -286,6 +366,7 @@ onUnmounted(() => {
 }
 .d-pill em { font-size: 10px; font-style: normal; opacity: 0.85; }
 .d-pill.d1 { color: #FF4D4F; background: rgba(255,77,79,0.10); }
+.d-pill .d1-none { color: #8fa3bf; }
 .d-pill.d2 { color: #FAAD14; background: rgba(250,173,20,0.10); }
 .d-pill.d3 { color: #4fc3f7; background: rgba(79,195,247,0.10); }
 .d-pill.d4 { color: #4caf50; background: rgba(76,175,80,0.10); }

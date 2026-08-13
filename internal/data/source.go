@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -105,6 +106,34 @@ func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, er
 		return klines, nil
 	}
 	return nil, fmt.Errorf("所有K线源均失败 for %s", code)
+}
+
+// GetMinuteKLine 获取分钟级 K 线（分时）。新浪分钟 → 同花顺分钟 → 腾讯分钟 → 东财分钟。
+// scale 为分钟数（1/5/15/30/60），返回按时间升序排列的 KLine。
+// GetMinuteKLine fetches minute K-lines (分时). Chain: Sina → THS → Tencent → EastMoney.
+func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLine, error) {
+	if klines, err := dc.eastMoney.GetSinaMinuteKLine(code, scale, count); err == nil && len(klines) > 0 {
+		return klines, nil
+	}
+
+	if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+		thsKL, thsErr := dc.ths.GetTHSMinuteKLine(code)
+		if thsErr == nil && len(thsKL) > 0 {
+			return thsKL, nil
+		} else if thsErr != nil {
+			dc.thsDeadline = time.Now().Add(60 * time.Second)
+			log.Printf("同花顺分钟线失败 (%s): %v, 熔断60s", code, thsErr)
+		}
+	}
+
+	if klines, err := dc.eastMoney.GetTencentMinuteKLine(code, scale, count); err == nil && len(klines) > 0 {
+		return klines, nil
+	}
+
+	if klines, err := dc.eastMoney.GetKLine(code, strconv.Itoa(scale), count); err == nil && len(klines) > 0 {
+		return klines, nil
+	}
+	return nil, fmt.Errorf("所有分钟K线源均失败 for %s", code)
 }
 
 // GetSectors 获取板块列表。同花顺 → 东财

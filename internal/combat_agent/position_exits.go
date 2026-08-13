@@ -1,0 +1,298 @@
+// position_exits.go 战法退出引擎的实时接线：把四个战法已实现的 CheckExit
+// （移动止盈 / 分批止盈 / 尾盘强平 / 破位 / 超期 等）接到持仓实时评估上，
+// 输出 清仓 / 减仓 / 提示 三级告警信号（仅提醒，不自动执行）。
+// English: wires the four strategies' already-implemented CheckExit engines (trailing stop, staged
+// take-profit, intraday close, breakdown, timeout…) onto live position evaluation, emitting
+// 清仓/减仓/提示 (close/trim/notice) alert signals (reminder-only, never auto-executed).
+package combat_agent
+
+import (
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/strategy"
+	"quant-trading-v2/internal/strategies/double_bump"
+	"quant-trading-v2/internal/strategies/dragon"
+	"quant-trading-v2/internal/strategies/dragon_return"
+	"quant-trading-v2/internal/strategies/n_shape"
+)
+
+// normalizePctForExit 把配置中"比例"阈值的字段换算为战法退出引擎使用的"百分数"口径。
+// 配置按比例存储（0.05=5%），而退出引擎按百分数比较（-5）；值 >= 1 视为已是百分数原样保留。
+// English: converts a config ratio threshold (0.05=5%) to the percent scale the exit engines compare
+// against (e.g. -5); values >= 1 are assumed to already be percent and kept as-is.
+func normalizePctForExit(v float64) float64 {
+	if v > 0 && v < 1 {
+		return v * 100
+	}
+	return v
+}
+
+// exitConfigs 由 Agent 持有的原始策略配置派生一份"百分数口径"副本供退出引擎使用，不改动原始配置。
+// 涉及按百分比比较的阈值：龙头 回撤/炸板/收盘/开盘 阈值、龙回头 止损/移动回撤、双凸 止盈比例。
+// N 形硬止损为比例语义（0.08=-8%），直接透传。调用方持读锁由本方法内部加锁。
+// English: derives percent-scaled copies of the strategy configs for the exit engines without mutating
+// the originals — dragon drawdown/breaker/close/open thresholds, dragon-return stop-loss/trailing and
+// double-bump take-profit are percent-compared; n-shape hard stop stays ratio-based and passes through.
+func (a *Agent) exitConfigs() (dragonCfg config.DragonConfig, dbCfg config.DoubleBumpConfig, nsCfg config.NShapeConfig, drCfg config.DragonReturnConfig) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cfg := a.strategyCfg
+	if cfg == nil {
+		return
+	}
+	dragonCfg = cfg.Dragon
+	dragonCfg.BuyPullbackSellAllPct = normalizePctForExit(dragonCfg.BuyPullbackSellAllPct)
+	dragonCfg.BuyPullbackSellHalfPct = normalizePctForExit(dragonCfg.BuyPullbackSellHalfPct)
+	dragonCfg.BreakerSellHalfPct = normalizePctForExit(dragonCfg.BreakerSellHalfPct)
+	dragonCfg.BreakerSellAllPct = normalizePctForExit(dragonCfg.BreakerSellAllPct)
+	dragonCfg.BuyDayCloseBelow = normalizePctForExit(dragonCfg.BuyDayCloseBelow)
+	dragonCfg.NextOpenIfBelow = normalizePctForExit(dragonCfg.NextOpenIfBelow)
+
+	dbCfg = cfg.DoubleBump
+	dbCfg.DoubleBumpTakeProfitPct = normalizePctForExit(dbCfg.DoubleBumpTakeProfitPct)
+
+	nsCfg = cfg.NShape
+
+	drCfg = cfg.DragonReturn
+	drCfg.StopLossPct = normalizePctForExit(drCfg.StopLossPct)
+	drCfg.TrailingDrawback = normalizePctForExit(drCfg.TrailingDrawback)
+	return
+}
+
+// exitStrategy 持仓可接入的战法退出引擎枚举。
+// English: the strategy exit engines a position may map onto.
+type exitStrategy int
+
+const (
+	exitStrategyGeneric exitStrategy = iota // 手动/未知战法：走通用移动止盈+超期回退
+	exitStrategyDragon                      // 龙头
+	exitStrategyDoubleBump                  // 双响炮
+	exitStrategyNShape                      // N 形超短
+	exitStrategyDragonReturn                // 龙回头(中线)
+)
+
+// classifyExitStrategy 把持仓记录的 Strategy 字符串归一化为退出引擎枚举。
+// 兼容信号类型常量（dragon/double_bump/n_shape/dragon_return）与中文名（龙头/双响炮/N形/龙回头）。
+// English: normalizes a position's Strategy string to an exit-engine enum, accepting both signal-type
+// constants and Chinese labels.
+func classifyExitStrategy(s string) exitStrategy {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "dragon", "dragon(龙头)", "龙头":
+		return exitStrategyDragon
+	case "double_bump", "doublebump", "双凸", "双响炮":
+		return exitStrategyDoubleBump
+	case "n_shape", "nshape", "n形", "n", "N形":
+		return exitStrategyNShape
+	case "dragon_return", "dragonreturn", "龙回头", "回":
+		return exitStrategyDragonReturn
+	}
+	return exitStrategyGeneric
+}
+
+// toStrategyKLine 把 data.KLine 简化为退出引擎使用的 strategy.KLine。
+// English: trims a data.KLine into the strategy.KLine shape the exit engines consume.
+func toStrategyKLine(in []data.KLine) []strategy.KLine {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]strategy.KLine, len(in))
+	for i, k := range in {
+		out[i] = strategy.KLine{Open: k.Open, High: k.High, Low: k.Low, Close: k.Close, Volume: k.Volume}
+	}
+	return out
+}
+
+// buildExitContext 由持仓与实时行情构造退出评估上下文，并把持久化的阶段最高价合入 EntryMeta。
+// English: builds the exit-evaluation context from a position and live quote, folding the persisted
+// stage high into EntryMeta so the strategy engines use the freshest trailing-stop baseline.
+func buildExitContext(pos report.ExecLog, price float64, dayK []data.KLine, now time.Time) *strategy.ExitContext {
+	stageHigh := pos.HighestPrice
+	if stageHigh <= 0 {
+		stageHigh = pos.EntryPrice
+	}
+	if price > stageHigh {
+		stageHigh = price
+	}
+	meta := make(map[string]float64, len(pos.EntryMeta)+1)
+	for k, v := range pos.EntryMeta {
+		meta[k] = v
+	}
+	meta["highest_price"] = stageHigh
+	return &strategy.ExitContext{
+		Code:      pos.Code,
+		Name:      pos.Name,
+		CostPrice: pos.EntryPrice,
+		CurPrice:  price,
+		EntryAt:   pos.EntryAt.Format("2006-01-02"),
+		EntryMeta: meta,
+		DailyK:    toStrategyKLine(dayK),
+		Now:       now,
+	}
+}
+
+// exitSignalFromResult 把战法退出结果映射为告警信号：P1=清仓（立即） P2=减仓 P3=提示。
+// English: maps a strategy exit result to an alert signal — P1=清仓 (immediate), P2=减仓, P3=提示.
+func exitSignalFromResult(pos report.ExecLog, price float64, res *strategy.ExitResult, now time.Time) Signal {
+	alertType, action := "提示", "关注"
+	switch res.Priority {
+	case strategy.P1:
+		alertType, action = "清仓", "卖出"
+	case strategy.P2:
+		alertType, action = "减仓", "卖出"
+	case strategy.P3, strategy.P3_5, strategy.P4:
+		alertType, action = "提示", "关注"
+	}
+	return Signal{
+		ID:          seqID(),
+		Code:        pos.Code,
+		Name:        pos.Name,
+		Strategy:    pos.Strategy,
+		Direction:   "提醒",
+		Action:      action,
+		AlertType:   alertType,
+		Price:       price,
+		Confidence:  1.0,
+		Reason:      res.Reason,
+		GeneratedAt: now,
+	}
+}
+
+// genericTrailingExit 手动/未知战法持仓的通用退出回退：移动止盈（从阶段高点回撤）＋ 超期强制离场。
+// 止盈/止损按预设百分比仍由 CheckPositionAlerts 负责，这里补上"利润保护"能力。
+// English: generic exit fallback for manual/unknown positions — a trailing stop from the stage high plus
+// a timeout force-exit; threshold-based TP/SL stays with CheckPositionAlerts, this adds profit protection.
+func genericTrailingExit(ctx *strategy.ExitContext, now time.Time) *strategy.ExitResult {
+	cost := ctx.CostPrice
+	price := ctx.CurPrice
+	if cost <= 0 || price <= 0 {
+		return nil
+	}
+	stageHigh := cost
+	if h, ok := ctx.EntryMeta["highest_price"]; ok && h > stageHigh {
+		stageHigh = h
+	}
+	// 移动止盈：阶段高点回撤 8%（且曾盈利）→ 减仓保护利润
+	trailPct := (price - stageHigh) / stageHigh * 100
+	if trailPct <= -8 && stageHigh > cost {
+		return &strategy.ExitResult{Reason: "回撤止损(移动止盈)", Priority: strategy.P2}
+	}
+	// 超期：持仓超过 15 天未完成形态，强制离场提醒
+	if ctx.EntryAt != "" {
+		entryDate, err := time.Parse("2006-01-02", ctx.EntryAt)
+		if err == nil {
+			days := int(now.Sub(entryDate).Hours() / 24)
+			if days >= 15 {
+				return &strategy.ExitResult{Reason: "持仓超期离场", Priority: strategy.P3}
+			}
+		}
+	}
+	return nil
+}
+
+// CheckPositionsExits 对全部持仓逐只运行对应战法的退出引擎，返回退出告警信号。
+// 与 CheckPositionAlerts（按预设百分比止盈/止损）互补：覆盖移动止盈、分批止盈、尾盘强平、
+// 破位、量能派发、形态失败、超期等战法级卖点。仅提醒、不自动执行。
+// 入参 quotes 为实时报价（code → 现价），dayKLines 为日K线（code → 历史日K，缺失则跳过需K线的检查），
+// now 用于尾盘/超期判定。返回信号列表（空表示无退出建议）。
+// English: runs each held position through its strategy's exit engine and returns exit alerts. It
+// complements CheckPositionAlerts (percentage TP/SL) with trailing stops, staged take-profits, intraday
+// close-outs, breakdowns, volume distribution, formation failures and timeouts. Reminder-only. quotes
+// supply live prices, dayKLines supply daily bars (checks needing bars are skipped when absent), and now
+// drives the intraday/timeout gates.
+func (a *Agent) CheckPositionsExits(rpt *report.Report, quotes map[string]*data.StockInfo, dayKLines map[string][]data.KLine, now time.Time) []Signal {
+	dragonCfg, dbCfg, nsCfg, drCfg := a.exitConfigs()
+
+	positions := rpt.HeldPositions()
+	if len(positions) == 0 {
+		return nil
+	}
+
+	var alerts []Signal
+	for _, pos := range positions {
+		// 实时报价缺失/现价无效（停牌）则跳过，避免以无效价误判退出
+		// English: skip when the quote is missing or the price is invalid (suspended).
+		q, ok := quotes[pos.Code]
+		if !ok || q == nil || q.Price <= 0 {
+			continue
+		}
+		price := q.Price
+
+		// 阶段高点实时更新：仅当价格创新高时抬高并持久化（写盘节流，创新高频率天然低频）
+		// English: raise the persisted stage high only on a new high (writes are naturally infrequent).
+		if price > pos.HighestPrice {
+			rpt.RaiseHighest(pos.SignalID, price)
+		}
+
+		ctx := buildExitContext(pos, price, dayKLines[pos.Code], now)
+		if ctx == nil {
+			continue
+		}
+
+		var res *strategy.ExitResult
+		switch classifyExitStrategy(pos.Strategy) {
+		case exitStrategyDragon:
+			res = dragon.CheckExit(ctx, &dragonCfg)
+		case exitStrategyDoubleBump:
+			res = double_bump.CheckExit(ctx, &dbCfg)
+		case exitStrategyNShape:
+			res = n_shape.CheckExit(ctx, &nsCfg)
+		case exitStrategyDragonReturn:
+			res = dragon_return.CheckExit(ctx, &drCfg)
+		default:
+			res = genericTrailingExit(ctx, now)
+		}
+
+		if res == nil {
+			continue
+		}
+		alerts = append(alerts, exitSignalFromResult(pos, price, res, now))
+	}
+
+	if len(alerts) > 0 {
+		log.Printf("[combat_agent] CheckPositionsExits: %d 持仓 → %d 退出提醒", len(positions), len(alerts))
+	}
+	return alerts
+}
+
+// emotionRetreatAlerts 情绪进入退潮/背离阶段时，对全部做多持仓给出减仓建议（仅提醒）。
+// English: when the emotion cycle enters 退潮/背离 (retreat/divergence), advises trimming every long
+// position (reminder-only).
+func (a *Agent) EmotionRetreatAlerts(rpt *report.Report, quotes map[string]*data.StockInfo, phase string, now time.Time) []Signal {
+	if phase != "退潮" && phase != "背离" {
+		return nil
+	}
+	positions := rpt.HeldPositions()
+	if len(positions) == 0 {
+		return nil
+	}
+	var alerts []Signal
+	for _, pos := range positions {
+		if pos.Direction == "做空" {
+			continue
+		}
+		price := pos.EntryPrice
+		if q := quotes[pos.Code]; q != nil && q.Price > 0 {
+			price = q.Price
+		}
+		alerts = append(alerts, Signal{
+			ID:          seqID(),
+			Code:        pos.Code,
+			Name:        pos.Name,
+			Strategy:    pos.Strategy,
+			Direction:   "提醒",
+			Action:      "卖出",
+			AlertType:   "减仓",
+			Price:       price,
+			Confidence:  1.0,
+			Reason:      fmt.Sprintf("情绪周期进入[%s],市场赚钱效应收缩,建议对持仓 %s(%s) 整体减仓控制风险", phase, pos.Name, pos.Code),
+			GeneratedAt: now,
+		})
+	}
+	return alerts
+}

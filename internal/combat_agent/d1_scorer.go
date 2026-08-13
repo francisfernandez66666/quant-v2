@@ -95,18 +95,44 @@ var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个�
 ]
 只输出JSON数组，不要多余文字。`
 
+// llmBatchSize D1 单次 LLM 调用承载的最大个股条数。
+// 与 classifier.go 的 llmBatchSize 保持一致：超大批次会让推理模型 prompt 过长、
+// 输出被截断漏项（观察：55只漏38%、49只漏16%、17只不漏），故按此大小分批调用。
+// English: max stocks per D1 LLM call, kept in sync with classifier.go's llmBatchSize. Oversized batches
+// produce prompts so long the reasoning model truncates its output and drops tail stocks.
+const llmBatchSize = 10
+
+// batchBounds 将 n 个元素按 size 分块，返回 [start,end) 区间列表。
+// English: splits n items into size-sized chunks and returns the [start,end) ranges.
+func batchBounds(n, size int) [][2]int {
+	if size <= 0 {
+		size = 1
+	}
+	var bounds [][2]int
+	for start := 0; start < n; start += size {
+		end := start + size
+		if end > n {
+			end = n
+		}
+		bounds = append(bounds, [2]int{start, end})
+	}
+	return bounds
+}
+
 // BatchScore 对一组个股进行批量 D1 评分。
 // codes: 待评分的个股代码列表。
 // events: 当前周期的新闻事件列表，用于查找个股关联事件。
 // marketData: 个股行情数据映射，key 为股票代码。
 // fallback: 上一轮成功评分结果（可 nil）。本轮 LLM 明确给出的分数一律保留；
-// 仅当 LLM 整批失败（重试全败/解析失败）或漏掉某只个股时，才回退上一轮分数，无则归 0。
+// 仅当 LLM 某批失败（重试全败/解析失败）或漏掉某只个股时，才回退上一轮分数，无则归 0。
 // 返回 map[string]D1Score，key 为股票代码，value 为 D1Score 评分结果。
-// 逻辑：构建 prompt → 调用 LLM（3 次递增轮询）→ 解析 JSON 响应 → 补全未返回的个股 → 返回结果。
+// 逻辑：按 llmBatchSize 分批 → 每批独立"构建 prompt → 调用 LLM（轮询重试）→ 解析 JSON →
+// 补全未返回个股" → 合并结果返回。
 // English: batch-scores a list of stocks. Scores explicitly returned by the LLM this round are always
-// kept; the prior-round fallback is used only when the whole batch fails (all retries / parse error) or
-// a specific stock is missed, otherwise it defaults to 0. Pipeline: build prompt → call LLM with
-// increasing retries → parse JSON → fill missing stocks → return the score map.
+// kept; the prior-round fallback is used only when a chunk fails (all retries / parse error) or a
+// specific stock is missed, otherwise it defaults to 0. Pipeline: split into llmBatchSize chunks →
+// per chunk (build prompt → call LLM with increasing retries → parse JSON → fill missing stocks) →
+// merge and return the score map.
 func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, fallback map[string]D1Score) map[string]D1Score {
 	t0 := time.Now()
 	result := make(map[string]D1Score, len(codes))
@@ -121,6 +147,31 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 		return result
 	}
 
+	maxAttempts := ds.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultMaxAttempts
+	}
+
+	// 按 llmBatchSize 分批调用，避免单批 prompt 过长导致 LLM 输出截断漏项。
+	// English: call in llmBatchSize-sized chunks so each prompt stays small enough for the model to
+	// return every stock without truncating its output.
+	for _, b := range batchBounds(len(codes), llmBatchSize) {
+		chunk := codes[b[0]:b[1]]
+		log.Printf("[D1Scorer] 分批评分 %d~%d / %d 只", b[0]+1, b[1], len(codes))
+		ds.scoreChunk(result, chunk, events, marketData, fallback, maxAttempts)
+	}
+
+	log.Printf("[D1Scorer] 批量评分完成: %d/%d只, 耗时 %v", len(result), len(codes), time.Since(t0))
+	return result
+}
+
+// scoreChunk 对单批个股（≤ llmBatchSize 只）构建 prompt 并调用 LLM 评分，结果合并入 result。
+// 轮询重试（最多 maxAttempts 次、间隔按指数抖动并封顶，防重要 D1 评分随调用失败丢失），
+// 整批失败/解析失败/漏项则回退上一轮评分（fallback 里有值）或按理由兜底 0 分。
+// English: builds a prompt for one chunk (≤ llmBatchSize stocks) and calls the LLM, merging results into
+// result. Retries with capped exponential backoff; on whole-chunk failure/parse error/missing stock it
+// falls back to the prior-round score (if present) or a reason-based 0.
+func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, fallback map[string]D1Score, maxAttempts int) {
 	// 构建用户prompt：列出每只个股及其关联事件、行情数据
 	// English: build the user prompt listing each stock with its events and market data.
 	var sb strings.Builder
@@ -157,15 +208,9 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	}
 
 	prompt := sb.String()
-	log.Printf("[D1Scorer] 批量评分 %d只个股, prompt=%d字符", len(codes), len(prompt))
+	log.Printf("[D1Scorer] 单批评分 %d只个股, prompt=%d字符", len(codes), len(prompt))
 
 	// 调用LLM（系统提示词 d1SystemPrompt 固定，用户提示词携带个股与规则）。
-	// 轮询重试（最多 maxAttempts 次、间隔按指数抖动并封顶，防重要 D1 评分随调用失败丢失），
-	// 仍失败则回退上一轮评分（fallback 里有值）或按理由兜底 0 分。
-	maxAttempts := ds.maxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = defaultMaxAttempts
-	}
 	var resp string
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -186,7 +231,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	if err != nil {
 		log.Printf("[D1Scorer] LLM调用轮询重试%d次仍失败: %v, 回退上一轮评分", maxAttempts, err)
 		ds.fillFallback(result, codes, fallback, "LLM失败")
-		return result
+		return
 	}
 
 	// 清洗 LLM 输出（去掉 markdown 代码块与多余文字，仅保留 JSON 数组）
@@ -195,8 +240,8 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 	var raw []D1Score
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
 		ds.fillFallback(result, codes, fallback, "解析失败")
-		log.Printf("[D1Scorer] JSON解析失败→整批 %d 只个股归0/回退: %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
-		return result
+		log.Printf("[D1Scorer] JSON解析失败→本批 %d 只个股归0/回退: %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
+		return
 	}
 
 	for _, r := range raw {
@@ -219,9 +264,6 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 			ds.fillFallback(result, []string{code}, fallback, "LLM未返回")
 		}
 	}
-
-	log.Printf("[D1Scorer] 批量评分完成: %d/%d只, 耗时 %v", len(raw), len(codes), time.Since(t0))
-	return result
 }
 
 // fillFallback 对缺失评分的个股回退上一轮评分（fallback 有值则复用，无则按 reason 归 0）。

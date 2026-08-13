@@ -138,3 +138,53 @@ func TestCheckPositionAlerts_NoThreshold(t *testing.T) {
 		t.Errorf("无阈值不应产出提醒, got %d", len(alerts))
 	}
 }
+
+// dailyDropTransport 模拟当日大跌行情（F170=-700 → 涨跌幅 -7.00%）。
+type dailyDropTransport struct{}
+
+func (rt *dailyDropTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !strings.Contains(req.URL.Hostname(), "push2.eastmoney.com") {
+		return nil, http.ErrHandlerTimeout
+	}
+	body := `{"data":{"f43":4000,"f57":"600206","f58":"有研新材","f170":-700}}`
+	return &http.Response{
+		StatusCode: 200,
+		Status:     "200 OK",
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewBufferString(body)),
+	}, nil
+}
+
+// TestCheckPositionAlerts_DailyDrop 当日跌幅超过阈值、成本盈亏未触线 → 仍产出"跌幅提醒"。
+func TestCheckPositionAlerts_DailyDrop(t *testing.T) {
+	a, rpt, m := newAlertTestRig(t)
+	// 开仓 42 元、止损 5%（现价 40.00 → 成本盈亏 -4.76%，未触及止损线）
+	// 但当日涨跌幅 -7% ≤ -5% → 应产出"跌幅提醒"
+	rpt.LogSignal("pos-4", "600206", "有研新材", "做多", "dragon", 42.0, 0, 5.0)
+	m.SetTransport(&dailyDropTransport{})
+	alerts := a.CheckPositionAlerts(rpt, m, nil)
+	if len(alerts) != 1 {
+		t.Fatalf("应产出 1 条跌幅提醒, got %d", len(alerts))
+	}
+	if alerts[0].AlertType != "跌幅提醒" {
+		t.Errorf("AlertType 应为跌幅提醒, got %s", alerts[0].AlertType)
+	}
+	if alerts[0].Action != "关注" {
+		t.Errorf("Action 应为关注, got %s", alerts[0].Action)
+	}
+	if !strings.Contains(alerts[0].Reason, "-7.00%") {
+		t.Errorf("理由应包含当日跌幅, got %s", alerts[0].Reason)
+	}
+}
+
+// TestCheckPositionAlerts_DailyDropOff 当日跌幅低于阈值 → 不产出跌幅提醒。
+func TestCheckPositionAlerts_DailyDropOff(t *testing.T) {
+	a, rpt, m := newAlertTestRig(t)
+	// 现价 40.00 当日 -2% > -5%，未触止损线（成本 42 → -4.76%），无任何提醒
+	rpt.LogSignal("pos-4", "600206", "有研新材", "做多", "dragon", 42.0, 0, 5.0)
+	m.SetTransport(&quoteMockTransport{}) // f170=+10%
+	alerts := a.CheckPositionAlerts(rpt, m, nil)
+	if len(alerts) != 0 {
+		t.Errorf("当日跌幅未超阈值不应产出提醒, got %d", len(alerts))
+	}
+}

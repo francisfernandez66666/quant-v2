@@ -207,6 +207,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/positions", s.authMiddleware(s.handleListPositions))
 
 	// fix 兼容端点
+	s.mux.HandleFunc("GET /api/kline", s.authMiddleware(s.handleFixKLine))
+	s.mux.HandleFunc("GET /api/minute", s.authMiddleware(s.handleFixMinute))
 	s.mux.HandleFunc("GET /api/signals", s.authMiddleware(s.handleFixSignals))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
 	s.mux.HandleFunc("GET /api/alerts", s.authMiddleware(s.handleFixAlerts))
@@ -743,7 +745,7 @@ func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "exit_price required")
 		return
 	}
-	s.rpt.LogExit(id, req.ExitPrice)
+	s.rpt.LogExit(id, req.ExitPrice, "手动平仓")
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 

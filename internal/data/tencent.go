@@ -37,14 +37,42 @@ type tencentKResp struct {
 
 // tencentKData 不同周期 K 线数组容器（前复权日线/日线/分钟线）。
 // tencentKData holds K-line arrays per granularity (qfq daily, daily, and minute lines).
+// 分钟线行内偶有裸 `{}` 占位对象（如成交量字段），无法直接解到 [][]string，
+// 故分钟字段使用 tencentRow（容错非字符串元素 → 空串）。
+// Minute rows may carry a bare `{}` placeholder (e.g. the volume column), which cannot
+// unmarshal into [][]string; the minute fields therefore use tencentRow (tolerant).
 type tencentKData struct {
-	QfqDay [][]string `json:"qfqday"`
-	Day    [][]string `json:"day"`
-	M1     [][]string `json:"m1"`
-	M5     [][]string `json:"m5"`
-	M15    [][]string `json:"m15"`
-	M30    [][]string `json:"m30"`
-	M60    [][]string `json:"m60"`
+	QfqDay [][]string   `json:"qfqday"`
+	Day    [][]string   `json:"day"`
+	M1     []tencentRow `json:"m1"`
+	M5     []tencentRow `json:"m5"`
+	M15    []tencentRow `json:"m15"`
+	M30    []tencentRow `json:"m30"`
+	M60    []tencentRow `json:"m60"`
+}
+
+// tencentRow 是腾讯分钟 K 线的一行；非字符串元素（如 `{}` 占位）容错为空串。
+// tencentRow is a single Tencent minute K-line row; non-string elements (e.g. the `{}`
+// placeholder) are tolerated and replaced with the empty string.
+type tencentRow []string
+
+// UnmarshalJSON 逐元素解包，非字符串元素记为 ""。
+// UnmarshalJSON decodes element by element, mapping non-string elements to "".
+func (r *tencentRow) UnmarshalJSON(b []byte) error {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(b, &elems); err != nil {
+		return err
+	}
+	out := make([]string, 0, len(elems))
+	for _, el := range elems {
+		var s string
+		if err := json.Unmarshal(el, &s); err != nil {
+			s = ""
+		}
+		out = append(out, s)
+	}
+	*r = out
+	return nil
 }
 
 // getTencentAndParse 发起腾讯 K 线请求并通过给定解析器解析。
@@ -118,18 +146,28 @@ func (m *MarketAPI) GetTencentMinuteKLine(code string, scale, count int) ([]KLin
 		var rows [][]string
 		switch scale {
 		case 1:
-			rows = stk.M1
+			rows = toRows(stk.M1)
 		case 15:
-			rows = stk.M15
+			rows = toRows(stk.M15)
 		case 30:
-			rows = stk.M30
+			rows = toRows(stk.M30)
 		case 60:
-			rows = stk.M60
+			rows = toRows(stk.M60)
 		default:
-			rows = stk.M5
+			rows = toRows(stk.M5)
 		}
 		return parseTencentKLine(rows, true)
 	})
+}
+
+// toRows 将容错分钟行转换为 [][]string，供 parseTencentKLine 使用。
+// toRows converts tolerant minute rows into [][]string for parseTencentKLine.
+func toRows(rows []tencentRow) [][]string {
+	out := make([][]string, len(rows))
+	for i, r := range rows {
+		out[i] = []string(r)
+	}
+	return out
 }
 
 // parseTencentKLine 解析腾讯 K 线行数组。

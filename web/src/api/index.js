@@ -269,6 +269,28 @@ export async function fetchSignals() {
   return request('/api/signals')
 }
 
+/** 获取个股 K 线数据 */
+/** Fetch a stock's K-line data */
+// 对应 GET /api/kline；code 必填，period 默认日线，count 默认 90，返回 [{ date, open, high, low, close, volume, amount }]
+// Maps to GET /api/kline; code is required, period defaults to daily, count defaults to 90; returns [{ date, open, high, low, close, volume, amount }]
+export async function fetchKline(code, period, count) {
+  const p = period || '101'
+  const c = count || 90
+  return request('/api/kline?code=' + encodeURIComponent(code) + '&period=' + encodeURIComponent(p) + '&count=' + c)
+}
+
+/** 获取个股分时数据（分时价格 + 成交量 + MACD） */
+/** Fetch a stock's intraday (分时) data: price line + volume + MACD */
+// 对应 GET /api/minute；code 必填，scale 分钟数（默认 1），count 点数（默认 241）；
+// Maps to GET /api/minute; code is required, scale defaults to 1 minute, count defaults to 241;
+// 返回 { code, name, prev_close, points: [{ time, open, high, low, close, volume, amount, dif, dea, bar }] }
+// returns { code, name, prev_close, points: [{ time, open, high, low, close, volume, amount, dif, dea, bar }] }
+export async function fetchMinute(code, scale, count) {
+  const s = scale || 1
+  const c = count || 241
+  return request('/api/minute?code=' + encodeURIComponent(code) + '&scale=' + encodeURIComponent(s) + '&count=' + c)
+}
+
 // ── 系统状态 ──
 // ── System status ──
 

@@ -22,6 +22,9 @@ import (
 type signalStoreFile struct {
 	TradingDay string                `json:"trading_day"`
 	Signals    []combat_agent.Signal `json:"signals"`
+	// 失效墓碑 key 集合（code@strategy）：买入前提已破坏的固化信号当日不再复活。
+	// English: tombstoned keys (code@strategy) whose buy premise broke; never re-pinned that day.
+	Invalidated []string `json:"invalidated,omitempty"`
 }
 
 // signalStore 当日战法信号固化存储，键为 code@strategy。
@@ -32,12 +35,15 @@ type signalStore struct {
 	mu    sync.Mutex
 	path  string
 	byKey map[string]combat_agent.Signal
+	// invalidated 失效墓碑集合：已被标记失效的 key 当日不允许重新固化（防"假信号复活"）。
+	// English: tombstone set — invalidated keys can't be re-pinned for the rest of the day.
+	invalidated map[string]bool
 }
 
 // newSignalStore 创建当日信号固化存储并从磁盘加载（仅保留当前交易日的数据）。
 // English: creates the pinned-signal store and loads it from disk (keeps only the current day's data).
 func newSignalStore(path string) *signalStore {
-	s := &signalStore{path: path, byKey: make(map[string]combat_agent.Signal)}
+	s := &signalStore{path: path, byKey: make(map[string]combat_agent.Signal), invalidated: make(map[string]bool)}
 	if path == "" {
 		return s
 	}
@@ -58,14 +64,21 @@ func newSignalStore(path string) *signalStore {
 			s.byKey[sig.Code+"@"+sig.Strategy] = sig
 		}
 	}
+	for _, k := range f.Invalidated {
+		if k != "" {
+			s.invalidated[k] = true
+		}
+	}
 	return s
 }
 
 // Upsert 合并本轮 Pass 信号：仅交易型（做多/做空）入库存，按 code@strategy 覆盖；
 // 新信号不早于已存信号时替换（刷新价格/理由）。提醒/止盈止损不入库存（消息中心已单独持久化）。
+// 已被失效墓碑标记的 key 直接跳过，保证"失效即死、当日不复活"。
 // English: merges this round's Passed signals — only trade signals (long/short) are stored, keyed by
 // code@strategy; a signal replaces the stored one unless it is older (refreshing price/reason).
 // Alerts (take-profit/stop-loss) are not stored here because the message center persists them separately.
+// Keys marked by an invalidation tombstone are skipped so a dead signal can't resurrect that day.
 func (s *signalStore) Upsert(sigs []combat_agent.Signal) {
 	if s == nil {
 		return
@@ -81,6 +94,9 @@ func (s *signalStore) Upsert(sigs []combat_agent.Signal) {
 			continue
 		}
 		key := sig.Code + "@" + sig.Strategy
+		if s.invalidated[key] {
+			continue
+		}
 		if cur, ok := s.byKey[key]; ok && !sig.GeneratedAt.IsZero() && !cur.GeneratedAt.IsZero() && sig.GeneratedAt.Before(cur.GeneratedAt) {
 			continue
 		}
@@ -90,6 +106,37 @@ func (s *signalStore) Upsert(sigs []combat_agent.Signal) {
 	if changed {
 		s.save()
 	}
+}
+
+// Invalidate 标记 code@strategy 的信号失效（失效墓碑）：删除固化信号并记录墓碑，
+// 当日该 key 不再允许固化（防假信号复活），调用方应同时删除消息中心对应条目。
+// English: marks a signal invalid (invalidation tombstone): removes the pinned signal and records the
+// tombstone so that key can't be re-pinned for the day (blocking false-signal resurrection). The caller
+// should also delete the matching message-center item.
+func (s *signalStore) Invalidate(code, strategy string) {
+	if s == nil || code == "" || strategy == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := code + "@" + strategy
+	if _, ok := s.byKey[key]; !ok && s.invalidated[key] {
+		return
+	}
+	delete(s.byKey, key)
+	s.invalidated[key] = true
+	s.save()
+}
+
+// IsInvalidated 判断 code@strategy 今日是否已被失效墓碑标记。
+// English: reports whether code@strategy has been tombstoned for today.
+func (s *signalStore) IsInvalidated(code, strategy string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.invalidated[code+"@"+strategy]
 }
 
 // List 返回当日固化信号列表（供聚合器展示用，键去重后的当前集合）。
@@ -116,9 +163,13 @@ func (s *signalStore) save() {
 	f := signalStoreFile{
 		TradingDay: data.TradingDayDate(time.Now()),
 		Signals:    make([]combat_agent.Signal, 0, len(s.byKey)),
+		Invalidated: make([]string, 0, len(s.invalidated)),
 	}
 	for _, sig := range s.byKey {
 		f.Signals = append(f.Signals, sig)
+	}
+	for k := range s.invalidated {
+		f.Invalidated = append(f.Invalidated, k)
 	}
 	raw, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {

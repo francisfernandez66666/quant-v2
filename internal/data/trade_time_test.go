@@ -27,3 +27,26 @@ func TestBeforeOpenTrade(t *testing.T) {
 		}
 	}
 }
+
+// TestIsPreAfternoon 午休(11:30-13:00)判定：午休返回 true，盘中/盘前/非交易日返回 false。
+func TestIsPreAfternoon(t *testing.T) {
+	tue := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local) // 2026-08-04 是周二
+	cases := []struct {
+		name string
+		time time.Time
+		want bool
+	}{
+		{"11:29:59 上午盘末", tue.Add(11*time.Hour + 29*time.Minute + 59*time.Second), false},
+		{"11:30 午休开始", tue.Add(11*time.Hour + 30*time.Minute), true},
+		{"12:00 午休中", tue.Add(12 * time.Hour), true},
+		{"12:59:59 午休末", tue.Add(12*time.Hour + 59*time.Minute + 59*time.Second), true},
+		{"13:00 午后开盘", tue.Add(13 * time.Hour), false},
+		{"10:00 盘中", tue.Add(10 * time.Hour), false},
+		{"周末 12:00", time.Date(2026, 8, 8, 12, 0, 0, 0, time.Local), false},
+	}
+	for _, c := range cases {
+		if got := IsPreAfternoon(c.time); got != c.want {
+			t.Errorf("%s: IsPreAfternoon(%v) = %v, want %v", c.name, c.time, got, c.want)
+		}
+	}
+}

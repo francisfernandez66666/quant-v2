@@ -75,9 +75,12 @@
         <span class="col-score" title="龙头≥70买入">龙</span>
         <span class="col-score" title="动量≥50关注">量</span>
         <span class="col-sl">止盈/止损</span>
+        <span class="col-kline">分时</span>
+        <span class="col-actions">操作</span>
       </div>
-      <!-- 持仓行：代码/名称/数量/成本/现价/当日涨跌/持仓盈亏/信号/评分/止盈止损 + 编辑删除（Holding row: code/name/qty/cost/price/daily change/P&L/signal/scores/take-profit-stop-loss + edit and delete）-->
-      <div v-for="h in holdings" :key="h.code" :class="rowClass(h)">
+      <!-- 持仓行 + 可展开 分时区（Holding row + expandable K-line area）-->
+      <div v-for="h in holdings" :key="h.code" class="pos-row-group">
+      <div :class="rowClass(h)">
         <span class="col-code">{{ h.code }}</span>
         <span class="col-name">{{ h.name }}</span>
         <span class="col-num">{{ h.quantity }}</span>
@@ -105,6 +108,9 @@
           <span class="sl-div">/</span>
           <span class="sl-sel">-{{ (h.stop_loss_pct||5).toFixed(1) }}%</span>
         </span>
+        <span class="col-kline">
+          <button class="btn-kline" @click="toggleKline(h.code)" :title="klineOpen.has(h.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(h.code) ? '收起' : '分时' }}</button>
+        </span>
         <span class="col-actions">
           <button class="btn-lot" @click="openAddLot(h)">加减仓</button>
           <button class="btn-cost" @click="openSetCost(h)">改成本</button>
@@ -112,6 +118,11 @@
           <button class="btn-edit" @click="editHolding(h)">编辑</button>
           <button class="btn-sell" @click="openCloseHolding(h)">清仓</button>
         </span>
+      </div>
+      <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
+      <div v-if="klineOpen.has(h.code)" class="pos-kline-row">
+        <KLineChart :code="h.code" :name="h.name" />
+      </div>
       </div>
     </div>
 
@@ -249,11 +260,15 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue' // 
 // Vue Composition API: reactive refs, computed, watchers, nextTick, and lifecycle hooks
 import * as api from '../api/index.js'                                        // 后端 API 调用封装（持仓、资金、状态等）
 // backend API wrapper (holdings, funds, status etc.)
+import KLineChart from '../components/KLineChart.vue'                         // 分时图组件（展开行展示）
+// K-line chart component (shown in expanded rows)
 
 // ── 响应式状态 ──
 // ── Reactive state ──
 const holdings = ref([])                    // 持仓列表
 // the holdings list
+const klineOpen = ref(new Set())            // 已展开分时的持仓代码集合
+// the set of holding codes whose K-line is expanded
 const availableBalance = ref(0)             // 可用资金
 // available cash
 const showAdd = ref(false)                  // 是否显示新增/编辑弹窗
@@ -736,6 +751,15 @@ onMounted(() => { loadCache(); load(); timer = setInterval(load, 30000) })
 // 卸载时清理定时器
 // Clear the timer on unmount
 onUnmounted(() => { if (timer) clearInterval(timer) })
+
+/** 展开/收起某持仓的 分时区 */
+/** Toggle a holding's K-line area */
+function toggleKline(code) {
+  const next = new Set(klineOpen.value)
+  if (next.has(code)) next.delete(code)
+  else next.add(code)
+  klineOpen.value = next
+}
 </script>
 
 <style scoped>
@@ -757,15 +781,24 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .positions-table { background: #1a1a2e; border-radius: 8px; overflow-x: auto; font-size: 13px; white-space: nowrap; }
 .table-header, .table-row {
   display: flex; align-items: center; padding: 10px 16px; gap: 0;
-  min-width: 1020px;
+  min-width: 1120px;
 }
 .table-header { background: #2a2a3e; color: #888; font-weight: 600; }
-.table-row { border-bottom: 1px solid #2a2a3e; }
+.table-row { border-bottom: none; }
+.pos-row-group { border-bottom: 1px solid #2a2a3e; min-width: 1120px; }
+.pos-row-group:last-child { border-bottom: none; }
 .table-row.signal { background: rgba(79,195,247,0.08); }
 .table-row.danger { background: rgba(250,173,20,0.15); }
 .table-row.watch { background: rgba(250,173,20,0.08); }
 .table-row.strong { background: rgba(255,77,79,0.10); }
-.table-row:last-child { border-bottom: none; }
+
+.col-kline { flex: 0 0 60px; text-align: center; }
+.btn-kline {
+  background: transparent; border: 1px solid #3a3a55; color: #7ab8ff;
+  border-radius: 4px; cursor: pointer; font-size: 11px; padding: 2px 8px;
+}
+.btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
+.pos-kline-row { padding: 8px 16px 12px; background: #16162a; }
 
 /* 所有字段等宽分布，溢出横向滚动 */
 .col-code  { flex: 1; color: #4fc3f7; text-align: center; }

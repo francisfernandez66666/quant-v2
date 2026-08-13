@@ -109,4 +109,8 @@ func (a *Agent) reloadConfig(path string) {
 	// 热更新策略参数（线程安全，由 Agent.HotReload 加锁写入）
 	// Hot-update the strategy params (thread-safe, written under the lock in Agent.HotReload).
 	a.HotReload(&wrapper.Rules.Strategy)
+
+	// 同步更新持仓当日跌幅提醒阈值（策略之外的位置配置，同样可热生效）
+	// English: also refresh the holding daily-drop alert threshold (the position config live-applies too).
+	a.SetPositionDailyDropPct(wrapper.Rules.Position.DailyDropAlertPct)
 }

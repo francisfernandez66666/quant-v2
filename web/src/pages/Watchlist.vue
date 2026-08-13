@@ -29,10 +29,13 @@
         <span class="ev-db sortable" @click="setSort('db_score')" title="双凸≥70买入,50-70观察">凸≥70{{ sortArrow('db_score') }}</span>
         <span class="ev-dr sortable" @click="setSort('dr_score')" title="龙回头≥60首次入场">回≥60{{ sortArrow('dr_score') }}</span>
         <span class="ev-m sortable" @click="setSort('m_score')" title="动量≥50值得看">量≥50{{ sortArrow('m_score') }}</span>
+        <span class="ev-k">K线</span>
+        <span class="ev-act">操作</span>
       </div>
       <div class="ev-body">
-          <!-- 自选行：代码/名称/现价/涨跌 + 五维评分 + 删除按钮，强势或达标时整行高亮（Watchlist row: code/name/price/change + five dimension scores + delete button; whole row highlights when strong or passing）-->
-          <div v-for="e in sortedEvals" :key="e.code" :class="rowClass(e)">
+          <!-- 自选行 + 可展开 分时区（Watchlist row + expandable K-line area）-->
+          <div v-for="e in sortedEvals" :key="e.code" class="ev-row-group">
+          <div :class="rowClass(e)">
           <span class="ev-code">{{ e.code }}</span>
           <span class="ev-name">{{ e.name || '-' }}</span>
           <span class="ev-price">¥{{ (e.price || 0).toFixed(2) }}</span>
@@ -44,8 +47,14 @@
           <span :class="scoreClass(e.db_score, e.db_pass, 80)">{{ e.db_score > 0 ? e.db_score.toFixed(0) : '—' }}</span>
           <span :class="scoreClass(e.dr_score, e.dr_pass, 80)">{{ e.dr_score > 0 ? e.dr_score.toFixed(0) : '—' }}</span>
           <span :class="scoreClass(e.m_score, e.m_pass, 70)">{{ e.m_score > 0 ? e.m_score.toFixed(0) : '—' }}</span>
+          <span><button class="btn-kline" @click="toggleKline(e.code)" :title="klineOpen.has(e.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(e.code) ? '收起' : '分时' }}</button></span>
           <span><button class="btn-remove" @click="remove(e.code)">✕</button></span>
         </div>
+        <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
+        <div v-if="klineOpen.has(e.code)" class="ev-kline-row">
+          <KLineChart :code="e.code" :name="e.name" />
+        </div>
+      </div>
       </div>
     </div>
     <div class="empty" v-else>暂无自选股，输入代码添加</div>
@@ -68,11 +77,15 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'  // Vue 组�
 // Vue Composition API: reactive refs, computed properties, watchers, and lifecycle hooks
 import * as api from '../api/index.js'                             // 后端 API 封装：状态/快照/自选列表/评分等数据接口
 // backend API wrapper: status/snapshot/watchlist/evaluations endpoints
+import KLineChart from '../components/KLineChart.vue'              // 分时图组件（展开行展示）
+// K-line chart component (shown in expanded rows)
 
 // ── 响应式状态 ──
 // ── Reactive state ──
 const stocks = ref([])                // 自选股数据（含实时价格 + 评分）
 // watchlist data (realtime prices + scores)
+const klineOpen = ref(new Set())      // 已展开分时的自选代码集合
+// the set of watchlist codes with their K-line expanded
 const newCode = ref('')               // 添加输入框的代码
 // the code typed in the add input
 const sortKey = ref('')               // 当前排序列
@@ -332,6 +345,15 @@ function showFeedback(msg, type) {
   setTimeout(() => { feedback.value = '' }, 2500)
 }
 
+/** 展开/收起某自选股的 分时区 */
+/** Toggle a watchlist stock's K-line area */
+function toggleKline(code) {
+  const next = new Set(klineOpen.value)
+  if (next.has(code)) next.delete(code)
+  else next.add(code)
+  klineOpen.value = next
+}
+
 onMounted(() => {
   // 先读缓存秒开，再拉取最新，并 30s 轮询
   // Read the cache for an instant open, fetch fresh data, then poll every 30s
@@ -382,6 +404,14 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .ev-score.pass { color: #FAAD14; }
 .ev-score.strong { color: #FF4D4F; }
 .ev-act { flex: 0 0 30px; text-align: center; }
+.ev-k { flex: 0 0 52px; text-align: center; color: #888; font-weight: 600; }
+.ev-row-group { min-width: 660px; }
+.btn-kline {
+  background: transparent; border: 1px solid #3a3a55; color: #7ab8ff;
+  border-radius: 4px; cursor: pointer; font-size: 11px; padding: 2px 8px;
+}
+.btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
+.ev-kline-row { padding: 8px 12px; background: #16162a; border-bottom: 1px solid #1a1a26; }
 .sortable { cursor: pointer; user-select: none; }
 .sortable:hover { color: #ccc; }
 .btn-remove {

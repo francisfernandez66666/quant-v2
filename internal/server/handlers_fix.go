@@ -49,6 +49,14 @@ type fixSignal struct {
 	D3Desc       string  `json:"d3_desc"`       // 维度3 说明
 	D4Desc       string  `json:"d4_desc"`       // 维度4 说明
 	SignalActive bool    `json:"signal_active"` // 信号是否活跃
+
+	// 真实 D1 事件信息：区别于上面的 D1Desc（策略理由），单独展示新闻事件的 D1 分析
+	// English: real D1 event info — distinct from D1Desc (strategy reason), shown separately as the
+	// news-event D1 analysis (score 0~1, negative-filter flag, LLM reason, linked event title).
+	D1Score   float64 `json:"d1_score"`   // D1 事件评分（0~1）
+	D1Blocked bool    `json:"d1_blocked"` // D1 负面过滤拦截标记
+	D1Reason  string  `json:"d1_reason"`  // D1 事件分析理由（LLM）
+	D1Event   string  `json:"d1_event"`   // D1 关联事件名称
 }
 
 // scoreToRemindLevel 将总分转换为前端提醒级别。
@@ -86,10 +94,42 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			D1Desc:       s.Reason,
 			D2Desc:       s.Sector,
 			SignalActive: true,
+			D1Score:      s.D1Score,
+			D1Blocked:    s.D1Blocked,
+			D1Reason:     s.D1Reason,
+			D1Event:      s.D1Event,
 		}
 		out = append(out, fs)
 	}
 	return out
+}
+
+// filterStaleSignals 信号展示的实时复核（仅影响"当前信号"展示，不改写任何存储/日志）：
+// 做多信号当日转绿(ChangePct<=0)、做空信号当日转红(ChangePct>=0) 视为已失效剔除；
+// ST/*ST/S*ST/退市整理 个股信号一律剔除（风险警示）。
+// 行情缺失时保留（fail-open，避免网络波动误撤）。返回筛选后的信号与剔除条数。
+// （filterStaleSignals is the display-only live re-validation for the current-signals tab: a long
+// signal whose stock turned red (ChangePct<=0), or a short signal whose stock turned green
+// (ChangePct>=0), is stale and removed. ST/*ST/delisting stocks are always dropped (risk warning).
+// Missing quotes keep the signal (fail-open).）
+func filterStaleSignals(sigs []combat_agent.Signal, quotes map[string]*data.StockInfo) ([]combat_agent.Signal, int) {
+	live := make([]combat_agent.Signal, 0, len(sigs))
+	pruned := 0
+	for _, sig := range sigs {
+		if combat_agent.IsSTStock(sig.Name) {
+			pruned++
+			continue
+		}
+		if info, ok := quotes[sig.Code]; ok && info != nil && info.Price > 0 {
+			if (sig.Direction == "做多" && info.ChangePct <= 0) ||
+				(sig.Direction == "做空" && info.ChangePct >= 0) {
+				pruned++
+				continue
+			}
+		}
+		live = append(live, sig)
+	}
+	return live, pruned
 }
 
 // handleFixSignals 处理 GET /api/signals 请求，返回最新策略信号列表（附实时股价/涨跌幅）。
@@ -99,15 +139,199 @@ func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []fixSignal{})
 		return
 	}
-	out := toFixSignals(dash.FinalSignals)
-	// 逐票补充实时现价与涨跌幅（忽略失败，保留信号触发价兜底）
-	for i := range out {
-		info, err := s.quote(out[i].Code)
-		if err != nil {
+	// 逐票拉取一次实时行情（优先 5s 快照，回落行情 API）
+	quotes := make(map[string]*data.StockInfo, len(dash.FinalSignals))
+	for _, sig := range dash.FinalSignals {
+		if sig.Code == "" {
 			continue
 		}
-		out[i].Price = info.Price
-		out[i].ChangePct = info.ChangePct
+		if _, ok := quotes[sig.Code]; ok {
+			continue
+		}
+		if info, err := s.quote(sig.Code); err == nil {
+			quotes[sig.Code] = info
+		}
+	}
+	live, pruned := filterStaleSignals(dash.FinalSignals, quotes)
+	if pruned > 0 {
+		log.Printf("[server] /api/signals 撤下 %d 条失效信号(仅展示层,不影响日志/存储)", pruned)
+	}
+	out := toFixSignals(live)
+	// 逐票补充实时现价与涨跌幅（忽略失败，保留信号触发价兜底）
+	for i := range out {
+		if info, ok := quotes[out[i].Code]; ok && info != nil {
+			out[i].Price = info.Price
+			out[i].ChangePct = info.ChangePct
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
+// fixKLine 前端 K 线单条数据格式。
+// （fixKLine is one frontend K-line bar.）
+type fixKLine struct {
+	Date   string  `json:"date"`   // 交易日（2006-01-02）
+	Open   float64 `json:"open"`   // 开盘价（元，2 位小数）
+	High   float64 `json:"high"`   // 最高价（元，2 位小数）
+	Low    float64 `json:"low"`    // 最低价（元，2 位小数）
+	Close  float64 `json:"close"`  // 收盘价（元，2 位小数）
+	Volume float64 `json:"volume"` // 成交量（股，取整）
+	Amount float64 `json:"amount"` // 成交额（元，取整）
+}
+
+// fixMinutePoint 分时数据点。MACD 三值由后端按分钟K线收盘价整条计算。
+// fixMinutePoint is one intraday (分时) point; MACD values are computed on the whole minute series.
+type fixMinutePoint struct {
+	Time   string  `json:"time"`   // 时间（2006-01-02 15:04）
+	Open   float64 `json:"open"`   // 开盘价
+	High   float64 `json:"high"`   // 最高价
+	Low    float64 `json:"low"`    // 最低价
+	Close  float64 `json:"close"`  // 收盘价
+	Volume float64 `json:"volume"` // 成交量（股）
+	Amount float64 `json:"amount"` // 成交额（元）
+	DIF    float64 `json:"dif"`    // MACD DIF
+	DEA    float64 `json:"dea"`    // MACD DEA
+	BAR    float64 `json:"bar"`    // MACD 柱（2*(DIF-DEA)）
+}
+
+// handleFixMinute 处理 GET /api/minute 请求，返回个股分钟级分时 + 成交量 + MACD。
+// 参数：code 必填；scale 分钟数（默认 1）；count 点数（默认 241，即一整交易日分钟数）。
+// 返回 { code, name, prev_close, points: [...] }。
+func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		writeJSON(w, 400, map[string]interface{}{"error": "缺少 code 参数"})
+		return
+	}
+	scale := 1
+	if raw := r.URL.Query().Get("scale"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			scale = n
+		}
+	}
+	count := 241
+	if raw := r.URL.Query().Get("count"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			count = n
+		}
+	}
+	if count > 3000 {
+		count = 3000
+	}
+
+	var klines []data.KLine
+	var err error
+	if s.dc != nil {
+		klines, err = s.dc.GetMinuteKLine(code, scale, count)
+	} else if s.market != nil {
+		klines, err = s.market.GetTencentMinuteKLine(code, scale, count)
+	}
+	if err != nil || len(klines) == 0 {
+		log.Printf("[server] /api/minute %s 获取失败: %v", code, err)
+		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "prev_close": 0, "points": []fixMinutePoint{}})
+		return
+	}
+
+	macd := data.CalcMACDSeries(klines)
+	points := make([]fixMinutePoint, 0, len(klines))
+	for i, k := range klines {
+		m := macd[i]
+		points = append(points, fixMinutePoint{
+			Time:   k.Date.Format("2006-01-02 15:04"),
+			Open:   r2(k.Open),
+			High:   r2(k.High),
+			Low:    r2(k.Low),
+			Close:  r2(k.Close),
+			Volume: r0(k.Volume),
+			Amount: r0(k.Amount),
+			DIF:    math.Round(m.DIF*100) / 100,
+			DEA:    math.Round(m.DEA*100) / 100,
+			BAR:    math.Round(m.Bar*100) / 100,
+		})
+	}
+
+	// 昨收价：优先取分时数据首根之前最近一根日线收盘，缺省用首根开盘价
+	prevClose := 0.0
+	if len(klines) > 0 && klines[0].Open > 0 {
+		prevClose = klines[0].Open
+	}
+	if s.dc != nil {
+		if daily, derr := s.dc.GetKLine(code, "101", 2); derr == nil && len(daily) > 0 {
+			prevClose = daily[len(daily)-1].Close
+		}
+	} else if s.market != nil {
+		if daily, derr := s.market.GetSinaKLine(code, 2); derr == nil && len(daily) > 0 {
+			prevClose = daily[len(daily)-1].Close
+		}
+	}
+
+	writeJSON(w, 200, map[string]interface{}{
+		"code":       code,
+		"name":       s.stockName(code),
+		"prev_close": r2(prevClose),
+		"points":     points,
+	})
+}
+
+// stockName 返回个股名称（持仓记录已知则用之，否则返回空串）。
+func (s *Server) stockName(code string) string {
+	if s.rpt != nil {
+		for _, h := range s.rpt.List() {
+			if h.Code == code && h.Name != "" {
+				return h.Name
+			}
+		}
+	}
+	return ""
+}
+
+// handleFixKLine 处理 GET /api/kline 请求，返回个股 K 线数据。
+// 参数：code 必填（股票代码）；period 周期（默认 "101" 日线）；count 数量（默认 90，上限 500）。
+// 数据源：DataCoordinator（新浪日线 → 东财）。
+func (s *Server) handleFixKLine(w http.ResponseWriter, r *http.Request) {
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		writeJSON(w, 400, map[string]interface{}{"error": "缺少 code 参数"})
+		return
+	}
+	period := r.URL.Query().Get("period")
+	if period == "" {
+		period = "101"
+	}
+	count := 90
+	if raw := r.URL.Query().Get("count"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			count = n
+		}
+	}
+	if count > 500 {
+		count = 500
+	}
+
+	var klines []data.KLine
+	var err error
+	if s.dc != nil {
+		klines, err = s.dc.GetKLine(code, period, count)
+	} else if s.market != nil {
+		klines, err = s.market.GetKLine(code, period, count)
+	}
+	if err != nil || len(klines) == 0 {
+		log.Printf("[server] /api/kline %s 获取失败: %v", code, err)
+		writeJSON(w, 200, []fixKLine{})
+		return
+	}
+
+	out := make([]fixKLine, 0, len(klines))
+	for _, k := range klines {
+		out = append(out, fixKLine{
+			Date:   k.Date.Format("2006-01-02"),
+			Open:   r2(k.Open),
+			High:   r2(k.High),
+			Low:    r2(k.Low),
+			Close:  r2(k.Close),
+			Volume: r0(k.Volume),
+			Amount: r0(k.Amount),
+		})
 	}
 	writeJSON(w, 200, out)
 }
@@ -609,7 +833,7 @@ func (s *Server) handleFixSellHolding(w http.ResponseWriter, r *http.Request) {
 	}
 	// 全部卖完时走清仓路径（记录完整盈亏与平仓状态）
 	if req.Quantity >= qty {
-		s.rpt.LogExit(targetID, req.Price)
+		s.rpt.LogExit(targetID, req.Price, "手动减仓(全清)")
 		log.Printf("[server] 减仓(全清) %s 价%.3f 量%.0f", code, req.Price, req.Quantity)
 		writeJSON(w, 200, map[string]interface{}{"holding": nil, "closed": true, "code": code})
 		return
@@ -658,7 +882,7 @@ func (s *Server) handleFixCloseHolding(w http.ResponseWriter, r *http.Request) {
 	if target.EntryPrice > 0 {
 		pct = (req.Price - target.EntryPrice) / target.EntryPrice * 100
 	}
-	s.rpt.LogExit(target.SignalID, req.Price)
+	s.rpt.LogExit(target.SignalID, req.Price, "手动清仓")
 	log.Printf("[server] 清仓 %s 价%.3f 量%.0f 成本%.3f 盈亏¥%.2f(%.2f%%)", code, req.Price, qty, target.EntryPrice, amount, pct)
 	writeJSON(w, 200, map[string]interface{}{
 		"status":        "ok",

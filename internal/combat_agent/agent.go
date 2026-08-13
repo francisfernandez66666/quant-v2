@@ -106,6 +106,9 @@ type Agent struct {
 	runners      []StrategyRunner       // 多策略运行器列表（做多/通用扫描共用）
 	shortRunner  StrategyRunner         // 做空策略运行器（预留）
 	shortEnabled bool                   // 做空功能开关（关闭时 ScanShort 直接返回 nil）
+	// positionDailyDropPct 持仓当日跌幅提醒阈值(%)；<=0 时用默认 5。
+	// （positionDailyDropPct is the holding daily-drop alert threshold in percent; <=0 falls back to 5.）
+	positionDailyDropPct float64
 
 	waves  *WaveTracker // N 形一突/二突日内状态机（跨 5s 周期）
 	diagMu sync.Mutex   // 保护 nDiag 的并发读写
@@ -162,6 +165,22 @@ func (a *Agent) SetShortEnabled(enabled bool) {
 	a.mu.Lock()
 	a.shortEnabled = enabled
 	a.mu.Unlock()
+}
+
+// SetPositionDailyDropPct 设置持仓当日跌幅提醒阈值(%)（线程安全，<=0 用默认 5）。
+// English: sets the holding daily-drop alert threshold in percent (thread-safe; <=0 falls back to 5).
+func (a *Agent) SetPositionDailyDropPct(pct float64) {
+	a.mu.Lock()
+	a.positionDailyDropPct = pct
+	a.mu.Unlock()
+}
+
+// PositionDailyDropPct 返回持仓当日跌幅提醒阈值(%)（线程安全；<=0 表示使用默认 5）。
+// English: returns the holding daily-drop alert threshold in percent (thread-safe; <=0 means the default 5 applies).
+func (a *Agent) PositionDailyDropPct() float64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.positionDailyDropPct
 }
 
 // ShortEnabled 返回当前做空是否启用（线程安全）。
@@ -285,6 +304,20 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	// 无可运行策略或行情数据缺失 → 无法评分
 	// English: no runner or missing market data → cannot score.
 	if len(runners) == 0 || md == nil {
+		return nil
+	}
+	// ST 个股屏蔽：名称以 ST/*ST/S*ST/退 开头（含风险警示/退市整理）的股票不产生任何信号，
+	// 评分本身仍写入 StockScores（8a/8b 打分量保留，但不出交易/提醒信号）。
+	// English: block ST-listed stocks — names prefixed with ST/*ST/S*ST/退 (risk-warning or delisting)
+	// produce no signals; their scores are still recorded in StockScores but never surface as signals.
+	if IsSTStock(md.Name) {
+		if input.Scores == nil {
+			input.Scores = make(map[string]StockScores)
+		}
+		sc := StockScores{Code: code, DataGaps: make(map[string]bool)}
+		sc.UpdatedAt = now
+		input.Scores[code] = sc
+		log.Printf("[combat_agent] 跳过 ST 个股 %s(%s): 不产生信号", code, md.Name)
 		return nil
 	}
 	// 惰性初始化打分输出表，避免 nil map 写入 panic
@@ -429,6 +462,18 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			// N 形信号附上 D1 事件信息（LLM 理由 + 事件名称），见 nShapeReason
 			// English: N-shape signals carry the D1 event info (LLM reason + event name), see nShapeReason.
 			sigReason = nShapeReason(sigReason, d1, eventDesc)
+			// B2 盘中确认门：纯 full_chain（形态 Pass，无 一突/二突 波形确认）要求盘中真实成交
+			// （今日成交量 Volume>0）才视为可操作买入；竞价/盘前成交量=0（无真实成交）时
+			// 降级为 watch 观察，杜绝基于竞价/存量的"假买入信号"，等 9:30 实盘放量后再由
+			// 状态机/下一轮评分确认升级。已提升为 left_signal/right_signal 的信号不受门控。
+			// English: B2 intraday-confirmation gate — a pure full_chain (pattern Pass with no 一突/二突
+			// wave confirmation) is only an actionable buy once real intraday volume exists (Volume>0).
+			// Pre-open/call-auction volume is 0 (no real trades), so it degrades to watch, blocking
+			// false buys from auction/stale data; signals promoted to left/right are not gated.
+			if eval.Level == "full_chain" && (md == nil || md.Quote == nil || md.Quote.Volume <= 0) {
+				action = "watch"
+				sigReason = "待盘中确认: " + sigReason
+			}
 		}
 		sigs = append(sigs, Signal{
 			ID:          seqID(),
@@ -579,6 +624,36 @@ func strategyDataInsufficient(t strategy.SignalType, md *strategy_engine.StockMa
 	}
 }
 
+// IsSTStock 判断个股是否为风险警示/退市整理股票（ST / *ST / S*ST / SST / 退 开头）。
+// 用于战法信号层屏蔽：此类股票不产生交易/提醒信号。
+// English: reports whether a stock is risk-warning or delisting (prefixed ST / *ST / S*ST / SST / 退);
+// used to suppress trade/alert signals for such stocks.
+func IsSTStock(name string) bool {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return false
+	}
+	// 统一大写比对，覆盖 *ST / S*ST / SST / ST 与 "退市" 前缀
+	// compare upper-cased to cover *ST / S*ST / SST / ST and the "退市" prefix
+	u := strings.ToUpper(n)
+	for _, p := range []string{"*ST", "S*ST", "SST", "ST", "退"} {
+		if strings.HasPrefix(u, p) {
+			// 前缀后必须紧跟汉字（A股 ST 命名规范），避免误伤英文含 ST 字母的名称
+			// the char right after the prefix must be a CJK char (A-share ST naming rule),
+			// so English names merely containing the letters "ST" are not blocked
+			rest := []rune(n[len(p):])
+			return len(rest) == 0 || isCJK(rest[0])
+		}
+	}
+	return false
+}
+
+// isCJK 判断 rune 是否中文字符（基本区 \u4e00-\u9fff 起始范围，含扩展容纳常用名）。
+// English: reports whether a rune is a CJK ideograph (main block \u4e00-\u9fff onwards).
+func isCJK(r rune) bool {
+	return r >= 0x4e00 && r <= 0x9fff
+}
+
 // momentumDataValid 判断动量分所需数据是否完整（量价 + 走势 + MACD 任一缺失即视为不完整）。
 // English: reports whether momentum data is complete (missing any of volume-price, trend, or MACD).
 func momentumDataValid(md *strategy_engine.StockMarketData) bool {
@@ -697,13 +772,14 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 	var alerts []Signal
 	now := time.Now()
 
-	for _, pos := range positions {
-		// 未设置止盈/止损阈值的持仓不检查
-		// English: skip positions without take-profit/stop-loss thresholds.
-		if pos.TakeProfitPct <= 0 && pos.StopLossPct <= 0 {
-			continue
-		}
+	// 当日跌幅提醒阈值：未配置(<=0)时默认 5%
+	// English: daily-drop threshold defaults to 5% when unconfigured.
+	dropPct := 5.0
+	if p := a.PositionDailyDropPct(); p > 0 {
+		dropPct = p
+	}
 
+	for _, pos := range positions {
 		// 拉取实时报价，失败/为空/现价为 0（停牌未成交）则跳过该持仓，
 		// 避免以无效价格误判止盈/止损（如 0 价会算成 -100%）。
 		// English: skip when the quote is missing/invalid or the price is 0 (suspended), avoiding false
@@ -729,6 +805,34 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 			hasBear = bears[pos.Code]
 		}
 		isShort := pos.Direction == "做空"
+
+		// 当日跌幅提醒（独立于成本止损）：做多持仓当日跌幅超过阈值即提醒，
+		// 与"按持仓成本盈亏"的止损逻辑分开，防止当日急跌但成本尚未破线时不提示。
+		// 做空持仓下跌=获利方向，不触发。（English: daily-drop alert for long holdings — a daily decline
+		// beyond the threshold triggers regardless of cost-based P/L, so an intraday plunge never goes
+		// unreported even when cost P/L has not hit the stop-loss line yet. Shorts profit from drops, so
+		// they are excluded.）
+		if !isShort && quote.ChangePct <= -dropPct {
+			alerts = append(alerts, Signal{
+				ID:          seqID(),
+				Code:        pos.Code,
+				Name:        pos.Name,
+				Strategy:    pos.Strategy,
+				Direction:   "提醒",
+				Action:      "关注",
+				AlertType:   "跌幅提醒",
+				Price:       quote.Price,
+				Confidence:  1.0,
+				Reason:      fmt.Sprintf("当日跌幅%.2f%% 注意短期风险,关注是否止跌企稳", quote.ChangePct),
+				GeneratedAt: now,
+			})
+		}
+
+		// 未设置止盈/止损阈值的持仓跳过止盈/止损检查（跌幅提醒不受此限制）
+		// English: positions without take-profit/stop-loss thresholds skip those checks (daily-drop alert is exempt).
+		if pos.TakeProfitPct <= 0 && pos.StopLossPct <= 0 {
+			continue
+		}
 
 		// 触及止盈线 → 生成止盈提醒。
 		// 做多：仍有做多信号→持有(降级提示)；无→硬止盈。做空：仍有做空信号→持有；无→硬止盈。

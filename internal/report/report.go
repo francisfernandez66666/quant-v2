@@ -38,8 +38,11 @@ type ExecLog struct {
 	ProfitPct     *float64   `json:"profit_pct,omitempty"` // 盈亏百分比（正值为盈利，负值为亏损，nil 表示尚未平仓）
 	TakeProfitPct float64    `json:"take_profit_pct"`      // 预设止盈百分比
 	StopLossPct   float64    `json:"stop_loss_pct"`        // 预设止损百分比
-	Quantity      float64    `json:"quantity"`             // 持仓数量（手动设置，默认 1）
-	Lots          []Lot      `json:"lots,omitempty"`       // 加仓批次明细（加权平均成本 = EntryPrice，数量 = Quantity）
+	Quantity      float64              `json:"quantity"`             // 持仓数量（手动设置，默认 1）
+	Lots          []Lot                `json:"lots,omitempty"`       // 加仓批次明细（加权平均成本 = EntryPrice，数量 = Quantity）
+	EntryMeta     map[string]float64   `json:"entry_meta,omitempty"` // 入场评分快照（entry_nphase/vol_ratio/limit_price/highest_price 等，供战法退出引擎使用）
+	HighestPrice  float64              `json:"highest_price,omitempty"` // 阶段最高价（移动止盈基准；开仓时=入场价，盘中实时抬高）
+	ExitReason    string               `json:"exit_reason,omitempty"`   // 卖出原因（如 手动/止损/移动止盈/尾盘强平，供消息与复盘）
 }
 
 // Report 管理所有交易持仓记录，提供线程安全的增删改查与文件持久化能力。
@@ -67,8 +70,29 @@ func New(path string) *Report {
 // 参数依次为：id-信号ID, code-股票代码, name-股票名称, direction-交易方向,
 // strategy-战法名称, entryPrice-开仓价格, takeProfitPct-止盈百分比, stopLossPct-止损百分比。
 // 记录后自动持久化到文件。
-// （LogSignal appends a new open-position ExecLog and persists it automatically.）
+// 入场评分快照默认为 {highest_price: 入场价}（阶段最高价的初始值，供移动止盈使用）。
+// （LogSignal appends a new open-position ExecLog and persists it automatically. The entry-meta
+// snapshot defaults to {highest_price: entry price} as the initial stage high for trailing stops.）
 func (r *Report) LogSignal(id, code, name, direction, strategy string, entryPrice, takeProfitPct, stopLossPct float64) {
+	r.LogSignalWithMeta(id, code, name, direction, strategy, entryPrice, takeProfitPct, stopLossPct, nil)
+}
+
+// LogSignalWithMeta 在 LogSignal 基础上支持附加入场评分快照（EntryMeta）。
+// 未显式提供 highest_price 时自动补为入场价，保证移动止盈基准始终存在。
+// （LogSignalWithMeta extends LogSignal with an entry-meta snapshot; it fills in highest_price as the
+// entry price when absent so the trailing-stop baseline always exists.）
+func (r *Report) LogSignalWithMeta(id, code, name, direction, strategy string, entryPrice, takeProfitPct, stopLossPct float64, meta map[string]float64) {
+	entryMeta := make(map[string]float64, len(meta)+1)
+	for k, v := range meta {
+		entryMeta[k] = v
+	}
+	if _, ok := entryMeta["highest_price"]; !ok {
+		entryMeta["highest_price"] = entryPrice
+	}
+	highest := entryPrice
+	if h, ok := entryMeta["highest_price"]; ok && h > 0 {
+		highest = h
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.logs = append(r.logs, ExecLog{
@@ -82,6 +106,8 @@ func (r *Report) LogSignal(id, code, name, direction, strategy string, entryPric
 		Status:        "持仓中",
 		TakeProfitPct: takeProfitPct,
 		StopLossPct:   stopLossPct,
+		EntryMeta:     entryMeta,
+		HighestPrice:  highest,
 	})
 	r.save()
 	log.Printf("[report] 开仓记录: %s %s %s %.2f", strategy, code, name, entryPrice)
@@ -89,9 +115,11 @@ func (r *Report) LogSignal(id, code, name, direction, strategy string, entryPric
 
 // LogExit 根据 signalID 平仓。计算盈亏百分比（(exitPrice - entryPrice) / entryPrice * 100），
 // 并据此标记状态为"已止盈"（pct > 0）或"已止损"（pct <= 0）。
+// 可选参数 reason 记录卖出原因（如 手动/止损/移动止盈/尾盘强平）。
 // 若找不到匹配的持仓记录（或该记录已平仓），则静默返回。
-// （LogExit closes a position by signalID, computes the P&L percentage and marks it 已止盈/已止损; silently returns when not found.）
-func (r *Report) LogExit(signalID string, exitPrice float64) {
+// （LogExit closes a position by signalID, computes the P&L percentage and marks it 已止盈/已止损; an
+// optional reason is recorded as ExitReason; silently returns when not found.）
+func (r *Report) LogExit(signalID string, exitPrice float64, reason ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
@@ -101,16 +129,36 @@ func (r *Report) LogExit(signalID string, exitPrice float64) {
 			r.logs[i].ExitAt = &now
 			r.logs[i].ExitPrice = &exitPrice
 			r.logs[i].ProfitPct = &pct
+			if len(reason) > 0 && reason[0] != "" {
+				r.logs[i].ExitReason = reason[0]
+			}
 			if pct > 0 {
 				r.logs[i].Status = "已止盈"
 			} else {
 				r.logs[i].Status = "已止损"
 			}
 			r.save()
-			log.Printf("[report] 平仓记录: %s 盈亏%.2f%%", signalID, pct)
+			log.Printf("[report] 平仓记录: %s 盈亏%.2f%% 原因=%s", signalID, pct, r.logs[i].ExitReason)
 			return
 		}
 	}
+}
+
+// RaiseHighest 抬高某持仓的阶段最高价：仅当 price 高于当前记录值且持仓未平仓时更新并持久化。
+// 返回是否发生抬高（false 表示未找到记录、已平仓或价格未创新高）。用于移动止盈基准的实时追踪。
+// （RaiseHighest raises a position's stage high to price only when it is a new high and the position is
+// still open, persisting the change; returns whether the high actually rose.）
+func (r *Report) RaiseHighest(id string, price float64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.logs {
+		if r.logs[i].SignalID == id && r.logs[i].ExitAt == nil && price > r.logs[i].HighestPrice {
+			r.logs[i].HighestPrice = price
+			r.save()
+			return true
+		}
+	}
+	return false
 }
 
 // Update 根据信号 ID 查找对应的 ExecLog，并在持有写锁的情况下执行用户自定义修改函数 fn。

@@ -174,6 +174,15 @@
             class="log-search"
             placeholder="搜索：个股名称 / 代码 / 板块（跨批次）"
           />
+          <!-- 战法策略筛选：与信号条上的"策略"同名精确匹配（Strategy filter: exact match against the strategy shown on each signal row）-->
+          <select
+            v-model="activeSigStrategy"
+            class="log-strategy-select"
+            title="按战法策略筛选"
+          >
+            <option value="all">全部战法</option>
+            <option v-for="st in sigStrategyOptions" :key="st" :value="st">{{ st }}</option>
+          </select>
           <select
             v-show="!sigSearching"
             v-model="sigIdx"
@@ -236,8 +245,8 @@
               </div>
             </div>
 
-            <div v-if="sigData.signals.length" class="signal-list">
-              <div v-for="(sg, i) in sigData.signals" :key="sg.id || i" class="signal-item">
+            <div v-if="sigFiltered.length" class="signal-list">
+              <div v-for="(sg, i) in sigFiltered" :key="sg.id || i" class="signal-item">
                 <div class="sig-head">
                   <span class="sig-code">{{ sg.code }}</span>
                   <span class="sig-name">{{ sg.name || '-' }}</span>
@@ -253,7 +262,7 @@
                 </div>
               </div>
             </div>
-            <div v-else class="log-empty">本轮无信号产出</div>
+            <div v-else class="log-empty">{{ sigData.signals.length ? '当前战法无匹配信号' : '本轮无信号产出' }}</div>
           </template>
         </template>
       </div>
@@ -294,6 +303,7 @@ const sigIdx = ref(0)            // 下拉框选中的批次索引 (selected bat
 const sigData = ref(null)         // 当前展示的那一批信号数据 (currently displayed signal batch record)
 const sigNoData = ref(false)      // 是否无信号批次记录（展示空态文案）(whether no signal batch records exist, shows empty state)
 const sigQuery = ref('')          // 信号搜索关键词（名称/代码/板块）(signal search keyword: name/code/sector)
+const activeSigStrategy = ref('all') // 信号批次按战法策略筛选（all=不筛选）(signal strategy filter; 'all' disables filtering)
 
 /** 判断某条新闻（按原始序号 i）是否通过 Stage1 筛选 (Check whether news index i passed Stage1 filtering) */
 // 由 selectedSet 决定模板里显示"通过"还是"过滤"徽标 (selectedSet decides the "通过/pass" vs "过滤/skip" badge shown)
@@ -348,6 +358,31 @@ function hasText(text, q) {
   return String(text).toUpperCase().includes(q)
 }
 
+/** 判断信号是否命中当前战法筛选（'all'=不筛选） (Whether a signal passes the active strategy filter; 'all' disables it) */
+function sigMatchStrategy(sg) {
+  if (!sg) return false
+  if (activeSigStrategy.value === 'all') return true
+  return sg.strategy === activeSigStrategy.value
+}
+
+/** 战法策略选项：跨批次收集全部策略名称（与信号条上的"策略"同名） (Strategy options collected across all batches, matching the strategy shown on each signal row) */
+const sigStrategyOptions = computed(() => {
+  const set = new Set()
+  for (const r of sigRecords.value) {
+    for (const sg of (r.signals || [])) {
+      if (sg.strategy) set.add(sg.strategy)
+    }
+  }
+  return [...set]
+})
+
+/** 当前批次按战法筛选后的信号列表（单批次浏览视图使用） (Signals of the selected batch filtered by strategy, for the single-batch view) */
+const sigFiltered = computed(() => {
+  const sigs = sigData.value?.signals || []
+  if (activeSigStrategy.value === 'all') return sigs
+  return sigs.filter((sg) => sg.strategy === activeSigStrategy.value)
+})
+
 /** LLM 是否处于搜索态（输入非空） (Whether LLM search mode is active, i.e. input not empty) */
 const llmSearching = computed(() => (llmQuery.value || '').trim() !== '')
 /** 信号是否处于搜索态（输入非空） (Whether signal search mode is active, i.e. input not empty) */
@@ -377,8 +412,8 @@ const sigSearchGroups = computed(() => {
   if (!q) return []
   const groups = []
   for (const r of sigRecords.value) {
-    // 过滤出该批命中关键词的信号 (filter signals of this batch that match the keyword)
-    const items = (r.signals || []).filter((sg) => sigHit(sg, q))
+    // 过滤出该批命中关键词 + 命中当前战法筛选的信号 (filter signals of this batch that match both the keyword and the active strategy filter)
+    const items = (r.signals || []).filter((sg) => sigHit(sg, q) && sigMatchStrategy(sg))
     if (items.length) {
       groups.push({ time: r.process_time, items })
     }
@@ -502,6 +537,11 @@ onMounted(() => {
   padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
   background: #1a1a2e; color: #ccc; font-size: 12px; cursor: pointer; max-width: 340px; flex: 1;
 }
+.log-strategy-select {
+  padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
+  background: #1a1a2e; color: #ccc; font-size: 12px; cursor: pointer; outline: none;
+}
+.log-strategy-select:focus { border-color: #b388ff; }
 .btn-refresh {
   padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F;
   background: transparent; color: #FF4D4F; font-size: 13px; cursor: pointer; white-space: nowrap;

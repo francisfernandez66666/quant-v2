@@ -769,7 +769,12 @@ func parseEastMoneyKLine(rawLines []string) ([]KLine, error) {
 		}
 		t, err := time.Parse("2006-01-02", parts[0])
 		if err != nil {
-			continue
+			// 分钟级别行形如 "2006-01-02 15:04"，尝试日期时间格式
+			// minute-level rows look like "2006-01-02 15:04"; try the datetime format
+			t, err = time.Parse("2006-01-02 15:04", parts[0])
+			if err != nil {
+				continue
+			}
 		}
 		klines = append(klines, KLine{
 			Date:   t,

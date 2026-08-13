@@ -31,6 +31,31 @@ func ema(closes []float64, n int) []float64 {
 	return out
 }
 
+// CalcMACDSeries 从 K 线收盘价计算整条 MACD 序列（每根一根）。
+// 与 CalcMACD 同口径（EMA12/26 → DIF，DEA=EMA9(DIF)，BAR=2×(DIF−DEA)），
+// 逐点按前缀序列递推，长度与 klines 一致；不足 2 根时返回等长全零序列。
+func CalcMACDSeries(klines []KLine) []MACD {
+	closes := make([]float64, len(klines))
+	for i, k := range klines {
+		closes[i] = k.Close
+	}
+	out := make([]MACD, len(closes))
+	if len(closes) < 2 {
+		return out
+	}
+	difSeries := make([]float64, len(closes))
+	for i := range closes {
+		ema12 := ema(closes[:i+1], 12)
+		ema26 := ema(closes[:i+1], 26)
+		difSeries[i] = ema12[len(ema12)-1] - ema26[len(ema26)-1]
+	}
+	deaSeries := ema(difSeries, 9)
+	for i := range closes {
+		out[i] = MACD{DIF: difSeries[i], DEA: deaSeries[i], Bar: 2 * (difSeries[i] - deaSeries[i])}
+	}
+	return out
+}
+
 // CalcMACD 从 K 线收盘价计算 MACD（EMA12/26 → DIF，DEA=EMA9(DIF)，BAR=2×(DIF−DEA)）。
 // K 线不足 26 根时按可用数量降级计算，不足 2 根返回零值。
 func CalcMACD(klines []KLine) MACD {

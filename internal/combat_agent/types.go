@@ -81,6 +81,17 @@ type Signal struct {
 	Reason      string    `json:"reason"`               // 信号生成原因
 	Sector      string    `json:"sector"`               // 所属板块
 	GeneratedAt time.Time `json:"generated_at"`         // 信号生成时间
+
+	// D1 事件信息（新闻归因/LLM 分析，区别于策略 Reason）：
+	// D1Score 为该股最近一轮 D1 事件评分（0~1，越高越值得关注）；D1Blocked 表示是否被负面过滤拦截
+	// （立案/减持/质押/解禁等）；D1Reason 为 LLM 对事件的 D1 分析理由；D1Event 为个股关联的事件名称（新闻标题）。
+	// English: D1 event info (news attribution / LLM analysis, distinct from the strategy Reason):
+	// D1Score is the stock's latest D1 event score (0~1, higher = more noteworthy); D1Blocked means the
+	// negative filter tripped; D1Reason is the LLM's D1 analysis; D1Event is the linked event title.
+	D1Score    float64 `json:"d1_score,omitempty"`    // D1 事件评分（0~1）
+	D1Blocked  bool    `json:"d1_blocked,omitempty"`  // D1 负面过滤拦截标记
+	D1Reason   string  `json:"d1_reason,omitempty"`   // D1 事件分析理由（LLM）
+	D1Event    string  `json:"d1_event,omitempty"`    // D1 关联事件名称
 }
 
 // SignalLog 单轮策略信号批次快照，记录该轮产出的全部信号与产出时间。
