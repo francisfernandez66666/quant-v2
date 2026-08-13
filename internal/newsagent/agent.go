@@ -71,6 +71,48 @@ func (a *Agent) Fetch(ctx context.Context, since time.Time) []data.NewsItem {
 	return rawNews
 }
 
+// UnattributedItems 返回当前待归因（已抓取但 Stage0/Stage2 尚未成功）的新闻队列，
+// 按发布时间最新在前排序。供引擎在盘前/盘中每轮与新增新闻一并重试归因。
+// （UnattributedItems returns the current queue of fetched-but-not-yet-attributed news, newest-first,
+// for the engine to re-attempt alongside newly fetched news each premarket/intraday round.）
+func (a *Agent) UnattributedItems() []data.NewsItem {
+	a.tracker.SortPendingNewestFirst()
+	return a.tracker.Pending()
+}
+
+// MarkAttributed 把成功归因的新闻标记为已见（从未归因队列移除并写入 seen 记账）。
+// 归因成功定义：Stage0 分类成功且（对个股/板块）Stage2 深度分析产出事件。
+// 被标记后该新闻不再进入重试队列。
+// （MarkAttributed marks successfully-attributed news as seen (dropped from the queue, recorded in the
+// seen ledger) so they are not retried. Success = Stage0 classified it and Stage2 emitted events.）
+func (a *Agent) MarkAttributed(items []data.NewsItem) {
+	if len(items) == 0 {
+		return
+	}
+	a.tracker.RemovePending(items)
+	log.Printf("[newsagent] 归因成功 %d 条新闻已标记seen, 剩余待归因 %d", len(items), len(a.tracker.Pending()))
+}
+
+// MarkAttributedTitles 按标题标记归因成功（用于已入队新闻经一轮归因后，按标题反查移除）。
+// 供引擎把本轮成功归因的新闻从未归因队列摘除，避免下轮重复分析。
+// （MarkAttributedTitles marks news as attributed by matching titles, dropping them from the queue so
+// the next round does not re-analyze already-processed items.）
+func (a *Agent) MarkAttributedTitles(titles map[string]bool) {
+	if len(titles) == 0 {
+		return
+	}
+	pending := a.tracker.Pending()
+	var matched []data.NewsItem
+	for _, it := range pending {
+		if titles[it.Title] {
+			matched = append(matched, it)
+		}
+	}
+	if len(matched) > 0 {
+		a.tracker.RemovePending(matched)
+	}
+}
+
 // Stage1 过滤：判断板块/宏观新闻是否有投资价值，返回有价值的标题索引。
 // （Stage1 filtering: judges whether sector/macro news has investment value and returns valuable title indices.）
 func (a *Agent) Stage1(titles []string) []int {
@@ -84,17 +126,19 @@ func (a *Agent) Stage1(titles []string) []int {
 
 // Stage2 深度分析：LLM 对新闻全量分析，输出带方向/分数/归因的结构化事件。
 // 中性事件照常输出，由引擎按阈值过滤丢弃。
+// 返回第二个值 failedItems：LLM 分析失败（被兜底占位）未归因的新闻，调用方应留队重试。
 // （Stage2 deep analysis: LLM analyzes all news into structured events with direction/score/attribution;
-// neutral events are still emitted and the engine discards them by threshold.）
-func (a *Agent) Stage2(items []data.NewsItem) []NewsEvent {
-	events := a.analyzeDeep(items)
+// neutral events are still emitted and the engine discards them by threshold. The second return failedItems
+// lists news whose LLM analysis failed (padded by fallback), which callers should keep for retry.）
+func (a *Agent) Stage2(items []data.NewsItem) ([]NewsEvent, []data.NewsItem) {
+	events, failed := a.analyzeDeep(items)
 	if a.cleaner != nil {
 		// 对每个事件关联的个股做名称/代码归一化清洗（→ "名称|代码"）
 		for i := range events {
 			events[i].CleanedStocks = a.cleaner.CleanBatch(events[i].RelatedStocks)
 		}
 	}
-	return events
+	return events, failed
 }
 
 // CleanStocks 清洗股票列表（名称或代码 → "名称|代码"），供引擎对增强归因做清理。

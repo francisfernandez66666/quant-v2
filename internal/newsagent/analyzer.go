@@ -13,12 +13,15 @@ import (
 // analyzeDeep Stage2 全量分析：调用 LLM 对筛选后的新闻深度分析，生成结构化 NewsEvent。
 // LLM 轮询重试（最多3次、递增间隔）仍失败时该批丢弃（返回 nil，不降级关键词兜底）。
 // 后置校正：档位归一 + 中性归零 + datetime 回退。
+// 返回值：events 为成功产出的事件；failedItems 为 LLM 重试耗尽、未完成归因的新闻
+// （被兜底占位），调用方应把它们留在未归因队列供下一轮重试。
 // （analyzeDeep is the Stage2 full analysis: LLM deep-analysis of screened news producing structured NewsEvents.
 // On retry exhaustion the batch is dropped (nil, no keyword fallback), with post-processing for tier
-// normalization, neutral zeroing and datetime fallback.）
-func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
+// normalization, neutral zeroing and datetime fallback. It returns events for successes and failedItems for
+// news whose LLM analysis failed (padded by fallback), which callers should keep in the unattributed queue.）
+func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedItems []data.NewsItem) {
 	if len(items) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// 抽取标题列表（附正文摘要），供 LLM 批量分析。
@@ -28,14 +31,24 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 		titles[i] = titleWithDigest(item.Title, item.Content)
 	}
 
-	results, err := a.llmClient.AnalyzeHotTopicBatch(titles)
+	results, failedIdx, err := a.llmClient.AnalyzeHotTopicBatch(titles)
 	if err != nil {
 		log.Printf("[newsagent] Stage2 LLM批量分析失败, 该批%d条丢弃: %v", len(titles), err)
-		return nil
+		return nil, items
 	}
 
-	events := make([]NewsEvent, 0, len(results))
+	// LLM 重试耗尽被兜底占位的新闻：视为未归因，交调用方留队下一轮重试
+	failedSet := make(map[int]bool, len(failedIdx))
+	for _, f := range failedIdx {
+		failedSet[f] = true
+	}
+
+	events = make([]NewsEvent, 0, len(results))
 	for i, ht := range results {
+		if failedSet[i] {
+			failedItems = append(failedItems, items[i])
+			continue
+		}
 		// 跳过空结果：LLM 未给出标题的无效项
 		if ht == nil || ht.Title == "" {
 			continue
@@ -45,8 +58,8 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) []NewsEvent {
 		events = append(events, buildChainEvents(ht, items[i])...)
 	}
 
-	log.Printf("[newsagent] Stage2全量分析: %d 个事件", len(events))
-	return events
+	log.Printf("[newsagent] Stage2全量分析: %d 个事件, %d 条未归因留队重试", len(events), len(failedItems))
+	return events, failedItems
 }
 
 // buildChainEvents 把一个 HotTopic 展开为 1~2 个 NewsEvent。

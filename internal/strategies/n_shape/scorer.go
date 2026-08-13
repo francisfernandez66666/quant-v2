@@ -4,8 +4,8 @@
 //
 //   - D1 事件驱动（40分）：事件驱动匹配。
 //     采用三段式计算：YAML负面阻断（硬闸）→ LLM评分（优先）→ YAML正面兜底。
-//     LLM 评分从 HotTopic.Direction 和 Score 推导：利空→blocked，中性→减半，利好→正常。
-//     LLMD1Score 以 0.0~1.0 传入，calcD1 映射到 0~40 分。
+//     目前实际走前两段：D1 完全由 LLM D1Scorer 独立打分（与板块利好/利空事件分解耦），
+//     LLMD1Score 直接以 0~40 满分制传入，calcD1 不再乘 MaxD1（利空→blocked=0）。
 //     信号硬闸门：D1>0（放宽，原为 D1=40），配合 LLM 评分体系。
 //
 //   - D2 相对强度 RS（30分）：三层proxy衡量资金攻击意愿。
@@ -187,7 +187,7 @@ type Ctx struct {
 	// LLMD1Score > 0 时优先使用 LLM 评分（替换 YAML EventMatcher 的得分）。
 	// LLMBlocked 为 true 时直接否决（LLM 判定为利空）。
 	// （LLM D1 fields: LLMD1Score>0 takes precedence over the YAML matcher; LLMBlocked vetoes outright.）
-	LLMD1Score float64 // LLM 给出的个股 D1 评分（0.0~1.0），0 表示无 LLM 结果（LLM D1 score 0.0~1.0; 0 means no LLM result）
+	LLMD1Score float64 // LLM 给出的个股 D1 评分（0~40），0 表示无 LLM 结果或有利空阻断（LLM D1 score 0~40; 0 means no LLM result / bearish block）
 	LLMBlocked bool    // LLM 判定利空时阻塞（calcD1 直接返回 blocked）（LLM bearish → calcD1 returns blocked）
 
 	EmotionPhase       string  // 情绪周期阶段（"冰点"/"启动"/"高潮"/"退潮"/"衰退"）（Emotion phase: 冰点/启动/高潮/退潮/衰退）
@@ -343,10 +343,13 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 		}
 	}
 
-	// 一突信号检测: 当前价 > 前日最高价×1.005 且量比 ≥ 1.8
+	// 一突信号检测: 当前价 > 前日最高价×1.005 且量比 ≥ 1.8，且必须有有效 D1 事件分
 	// 说明已有主力资金开始攻击，是左侧抢先入场信号（Left-breakout detection: price > prev-high×1.005 with volume ratio ≥1.8 —
-	// main capital is attacking, a left-side early-entry signal）
-	if ib.CurPrice > ib.PrevHigh*1.005 && ib.CumVol > 0 && ib.PrevClose > 0 {
+	// main capital is attacking, a left-side early-entry signal）。无 D1 事件分不标一突，避免
+	// "无特定事件"之类的占位低分仍触发左侧买入/提醒。
+	// English: left-breakout requires a valid D1 event score along with the price/volume shape, so a
+	// placeholder low/zero D1 never fires the left-buy reminder.
+	if res.D1Event > 0 && ib.CurPrice > ib.PrevHigh*1.005 && ib.CumVol > 0 && ib.PrevClose > 0 {
 		// 量比用当日累计量 / 前日最低价量级近似（Volume ratio approximated as cumulative volume scaled by prior low）
 		volRatio := ib.CumVol / math.Max(ib.PrevLow, 1)
 		if volRatio >= 1.8 {
@@ -367,10 +370,11 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 //
 //	Stage 2: LLM 评分（优先于 YAML）
 //	  若 LLM 判定利空（LLMBlocked=true），直接返回 blocked。
-//	  否则以 LLMD1Score × MaxD1 作为 D1 得分。
+//	  否则以 LLMD1Score 直接作为 D1 得分（LLM 现已按 0~40 满分制打分，不再 ×MaxD1）。
 //
 // D1 评分收拢到 combat_agent/d1_scorer，此方法仅在 LLM 结果已传入时调用。
-// （Stage 1 YAML negative block (hard gate); Stage 2 LLM score takes priority — blocked on LLMBlocked, else LLMD1Score×MaxD1.）
+// （Stage 1 YAML negative block (hard gate); Stage 2 LLM score takes priority — blocked on LLMBlocked,
+// else LLMD1Score directly (the LLM now grades on the 0~40 scale, no ×MaxD1).）
 func (s *LeftSideScorer) calcD1(ctx *Ctx) (float64, []string, bool) {
 	// Stage 1: YAML 负面阻断（Stage 1: YAML negative block）
 	if ctx.EventDesc != "" && ctx.EventDesc != "null" && s.matcher != nil {
@@ -385,7 +389,7 @@ func (s *LeftSideScorer) calcD1(ctx *Ctx) (float64, []string, bool) {
 		return 0, []string{"llm_blocked"}, true
 	}
 	if ctx.LLMD1Score > 0 {
-		return ctx.LLMD1Score * MaxD1, []string{"llm_d1"}, false
+		return ctx.LLMD1Score, []string{"llm_d1"}, false
 	}
 
 	return 0, nil, false

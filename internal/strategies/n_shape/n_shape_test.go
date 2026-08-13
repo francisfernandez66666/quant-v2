@@ -16,7 +16,7 @@ func newNS() *NShapeStrategy {
 // fullCtx 构造 D1=LLM满评分 + D2/D3/D4 满分 的环境，确保 full_chain。
 func fullCtx() *Ctx {
 	return &Ctx{
-		LLMD1Score:      1.0, // D1 = 40
+		LLMD1Score:      40, // D1 = 40（0~40 满分制，calcD1 直接采用）
 		EmotionPhase:     "启动",
 		SectorTurnoverMA20: 0, // 跳过板块冷清检查
 		PreEventReturn5d: 0.1,
@@ -105,10 +105,16 @@ func TestGenerateSignal(t *testing.T) {
 		t.Errorf("right_signal 应 buy/P1, got %s/%d", sig.Action, sig.Priority)
 	}
 
-	// 低置信 + 左侧一突 → 提升至 P2
-	sig, _ = n.GenerateSignal("1", &strategy.Evaluation{Level: "full_chain", Confidence: 0.5, Details: map[string]float64{"left_signal": 1}})
+	// 低置信 + 左侧一突（且 D1>0）→ 提升至 P2
+	sig, _ = n.GenerateSignal("1", &strategy.Evaluation{Level: "full_chain", Confidence: 0.5, Details: map[string]float64{"left_signal": 1, "d1": 1}})
 	if sig.Priority != strategy.P2 {
 		t.Errorf("left_signal 提升优先级至 P2, got %d", sig.Priority)
+	}
+
+	// 无 D1（left_signal 但 d1=0）→ 不提升优先级
+	sig, _ = n.GenerateSignal("1", &strategy.Evaluation{Level: "full_chain", Confidence: 0.5, Details: map[string]float64{"left_signal": 1, "d1": 0}})
+	if sig.Priority == strategy.P2 {
+		t.Errorf("d1=0 时不应提升优先级至 P2, got %d", sig.Priority)
 	}
 
 	// 失败级别 → 观察
@@ -147,5 +153,29 @@ func TestNPhaseString(t *testing.T) {
 func TestRemindToInt(t *testing.T) {
 	if remindToInt("strong") != 3 || remindToInt("observe") != 2 || remindToInt("mute") != 1 || remindToInt("x") != 0 {
 		t.Error("remindToInt 映射错误")
+	}
+}
+
+// TestLeftSignalRequiresD1 验证一突(left_signal)必须 D1>0：
+// 价格突破前高×1.005 且量比≥1.8 的形态，若无有效 D1 事件分则不标一突，
+// 杜绝"无特定事件"占位低分/零分仍触发左侧买入提醒。
+// English: verifies the left breakout (一突) label requires a valid D1 event score — the breakout shape
+// alone (price>prev-high×1.005, volume ratio≥1.8) doesn't set LeftSignal when D1=0.
+func TestLeftSignalRequiresD1(t *testing.T) {
+	s := NewLeftSideScorer(nil)
+
+	ctx := fullCtx()
+	ctx.LLMD1Score = 0 // 无实质事件 → D1=0，仅形态突破
+	if sr := s.Evaluate(fullWA(), fullIB(), ctx); sr == nil {
+		t.Fatal("Evaluate 返回 nil")
+	} else if sr.LeftSignal {
+		t.Fatalf("D1=0 时不应标一突(left_signal), got LeftSignal=%v", sr.LeftSignal)
+	}
+
+	ctx.LLMD1Score = 40 // 有效 D1
+	if sr := s.Evaluate(fullWA(), fullIB(), ctx); sr == nil {
+		t.Fatal("Evaluate 返回 nil")
+	} else if !sr.LeftSignal {
+		t.Fatalf("D1>0 且突破形态应标一突(left_signal), got LeftSignal=%v", sr.LeftSignal)
 	}
 }

@@ -129,9 +129,9 @@ func TestNShapeReason(t *testing.T) {
 	}
 }
 
-// TestScorePoolNLeftBreakoutEmitUnmarked 验证端到端："一突打标"链路。
-// 一突破位（价>前高×1.005 且量比≥1.8）且 D1>0 → 即使总分未达 full_chain，也提升为
-// Pass 并产出带 tag=一突 的 buy 信号（P2）。避免旧逻辑在该股非 full_chain 时被过滤掉。
+// TestScorePoolN1BreakoutEmit 验证端到端："一突打标"链路（0~40 D1 制下修正）。
+// 一突破位（价>前高×1.005 且量比≥1.8）且 d1>0、总分≥60 时 → 提升为 Pass 并产出
+// 带 tag=一突 的 buy 信号。低分股（总分<60）不强制推荐（见 TestScorePoolN1LowTotalSuppressed）。
 func TestScorePoolN1BreakoutEmit(t *testing.T) {
 	cfg := config.NewManager(filepath.Join(t.TempDir(), "config.json"))
 	a := New(cfg.GetStrategyConfig())
@@ -141,7 +141,8 @@ func TestScorePoolN1BreakoutEmit(t *testing.T) {
 	}})
 
 	pool := map[string]*strategy_engine.StockMarketData{"600899": mkWaveMD(11.2, 2_000_000)}
-	d1Scores := map[string]D1Score{"600899": {Code: "600899", Score: 0.5, Blocked: false}}
+	// D1 满分（0~40 制）→ 配合波形 D 分使总分≥60，满足一突门槛
+	d1Scores := map[string]D1Score{"600899": {Code: "600899", Score: 40, Blocked: false}}
 
 	_, sigs := a.ScorePool([]string{"600899"}, pool, d1Scores, "")
 
@@ -152,7 +153,30 @@ func TestScorePoolN1BreakoutEmit(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("一突且D1>0应产出 buy+一突 信号, got %+v", sigs)
+		t.Fatalf("总分≥60 时一突应产出 buy+一突 信号, got %+v", sigs)
+	}
+}
+
+// TestScorePoolN1LowTotalSuppressed 验证一突总分门槛：波形一突确认但总分<60 时，
+// 不比被强制提升为 Pass/发 buy（修复低分股被强制推荐）。
+func TestScorePoolN1LowTotalSuppressed(t *testing.T) {
+	cfg := config.NewManager(filepath.Join(t.TempDir(), "config.json"))
+	a := New(cfg.GetStrategyConfig())
+	a.SetRunners([]StrategyRunner{{
+		Type:     strategy.SignalNShape,
+		Strategy: n_shape.New(cfg, nil),
+	}})
+
+	pool := map[string]*strategy_engine.StockMarketData{"600899": mkWaveMD(11.2, 2_000_000)}
+	// D1 低（0~40 制，0.5）→ 总分达不到 60 → 不发一突/buy
+	d1Scores := map[string]D1Score{"600899": {Code: "600899", Score: 0.5, Blocked: false}}
+
+	_, sigs := a.ScorePool([]string{"600899"}, pool, d1Scores, "")
+
+	for _, s := range sigs {
+		if s.Code == "600899" && s.Strategy == "n_shape" && (s.Tag == "一突" || s.Action == "buy") {
+			t.Fatalf("总分<60 时一突不应发 buy 信号, got %+v", s)
+		}
 	}
 }
 

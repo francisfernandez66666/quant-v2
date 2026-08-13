@@ -14,19 +14,28 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Client LLM API 客户端，封装与 SiliconFlow 对话接口的通信。
 // （Client is the LLM API client wrapping communication with the SiliconFlow chat interface.）
 type Client struct {
-	httpClient  *http.Client  // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
-	apiKey      string        // API 密钥（Authorization: Bearer）
-	apiURL      string        // chat/completions 请求地址
-	model       string        // 模型名称
-	streaming   bool          // 是否启用流式（SSE）响应；false 走一次性非流式
-	idleTimeout time.Duration // 流式下相邻分片空闲阈值（超过视为卡死）
+	httpClient       *http.Client  // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
+	apiKey           string        // API 密钥（Authorization: Bearer）
+	apiURL           string        // chat/completions 请求地址
+	model            string        // 模型名称
+	streaming        bool          // 是否启用流式（SSE）响应；false 走一次性非流式
+	idleTimeout      time.Duration // 流式下相邻分片空闲阈值（超过视为卡死）
+	batchConcurrency int           // 批量分析最大并发批次（默认 4）
 }
+
+// DefaultBatchConcurrency 未显式配置时的批量分析默认并发批次。
+// （DefaultBatchConcurrency is the default concurrent batch count for batched analysis.）
+const DefaultBatchConcurrency = 4
+
+// BatchConcurrency 返回批量分析最大并发批次。（BatchConcurrency returns the max concurrent batch count.）
+func (c *Client) BatchConcurrency() int { return c.batchConcurrency }
 
 // DefaultModel 未显式指定模型时的默认模型。
 // （DefaultModel is the fallback model when none is explicitly specified.）
@@ -70,16 +79,21 @@ func New(cfg Config) *Client {
 	}
 
 	// 可配置超时；禁用 HTTP2（ForceAttemptHTTP2=false），强制走 HTTP1.1 规避连接复用问题
+	bc := cfg.BatchConcurrency
+	if bc <= 0 {
+		bc = DefaultBatchConcurrency
+	}
 	return &Client{
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
 			Transport: transport,
 		},
-		apiKey:      cfg.APIKey,
-		apiURL:      cfg.APIURL,
-		model:       cfg.Model,
-		streaming:   cfg.Streaming,
-		idleTimeout: cfg.StreamIdleTimeout,
+		apiKey:           cfg.APIKey,
+		apiURL:           cfg.APIURL,
+		model:            cfg.Model,
+		streaming:        cfg.Streaming,
+		idleTimeout:      cfg.StreamIdleTimeout,
+		batchConcurrency: bc,
 	}
 }
 
@@ -521,34 +535,71 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
 // each batch within the timeout (kept in sync with classifier.go's llmBatchSize).）
 const llmBatchSize = 10
 
-// AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批调用并合并结果。
+// batchBounds 将 n 个元素按 size 分块，返回 [start,end) 区间列表。
+// （batchBounds splits n items into size-sized chunks and returns the [start,end) ranges.）
+func batchBounds(n, size int) [][2]int {
+	var out [][2]int
+	for start := 0; start < n; start += size {
+		end := start + size
+		if end > n {
+			end = n
+		}
+		out = append(out, [2]int{start, end})
+	}
+	return out
+}
+
+// AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批并**并发**调用合并结果。
 // 子批失败做隔离：该子批用关键词兜底结果占位（fallbackAnalysis），不 abort 全批，
 // 保证某几个坏子批不会拖垮整批 Stage2（主干继续）。
-// （AnalyzeHotTopicBatch analyzes many news items in batches of llmBatchSize and merges the results.
+// 返回第三个值 failedIdx：被兜底占位（LLM 重试耗尽）的全局索引，调用方据此把对应新闻
+// 留在未归因队列供下一轮重试，避免"LLM 偶发失败 = 该新闻永久丢失"。
+// （AnalyzeHotTopicBatch analyzes many news items in batches of llmBatchSize, run **concurrently**.
 // Sub-batch failures are isolated: the failed sub-batch is padded with keyword-fallback results
-// (fallbackAnalysis) instead of aborting the whole batch, so a few bad sub-batches cannot stall all of Stage2.）
-func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, error) {
+// (fallbackAnalysis) instead of aborting the whole batch. The third return failedIdx lists the global
+// indices that were padded, so the caller can keep those news in the unattributed queue for the next
+// round rather than permanently losing them to a transient LLM failure.）
+func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, []int, error) {
 	result := make([]*HotTopic, len(titles))
 	if len(titles) == 0 {
-		return result, nil
+		return result, nil, nil
 	}
-	for start := 0; start < len(titles); start += llmBatchSize {
-		end := start + llmBatchSize
-		if end > len(titles) {
-			end = len(titles)
-		}
-		sub, err := c.analyzeBatch(titles[start:end])
-		if err != nil {
-			log.Printf("LLM[%d] 子批%d..%d 重试队列用尽, 该子批%d条用兜底占位(主干继续): %v",
-				len(titles), start+1, end, end-start, err)
-			for i := start; i < end; i++ {
-				result[i] = fallbackAnalysis(titles[i])
+
+	concurrency := c.batchConcurrency
+	if concurrency < 1 {
+		concurrency = DefaultBatchConcurrency
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var failedMu sync.Mutex
+	var failedIdx []int
+
+	for _, b := range batchBounds(len(titles), llmBatchSize) {
+		start, end := b[0], b[1]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(start, end int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			sub, err := c.analyzeBatch(titles[start:end])
+			if err != nil {
+				log.Printf("LLM[%d] 子批%d..%d 重试队列用尽, 该子批%d条用兜底占位(主干继续): %v",
+					len(titles), start+1, end, end-start, err)
+				for i := start; i < end; i++ {
+					result[i] = fallbackAnalysis(titles[i])
+				}
+				failedMu.Lock()
+				for i := start; i < end; i++ {
+					failedIdx = append(failedIdx, i)
+				}
+				failedMu.Unlock()
+				return
 			}
-			continue
-		}
-		copy(result[start:end], sub)
+			copy(result[start:end], sub)
+		}(start, end)
 	}
-	return result, nil
+	wg.Wait()
+	return result, failedIdx, nil
 }
 
 // analyzeBatch 单批 LLM 批量分析（内部使用，批次规模 ≤ llmBatchSize）。

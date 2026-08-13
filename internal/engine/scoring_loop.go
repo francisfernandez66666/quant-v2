@@ -12,6 +12,7 @@ import (
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -105,7 +106,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// English: B2 invalidation tombstone — check today's pinned buy signals against fresh quotes; when
 	// the price falls below the trigger (buy premise broken), tombstone it: remove from the store and
 	// delete its message-center entry, so a dead signal stops displaying and can't re-alert.
-	e.invalidateBrokenSignals(md)
+	e.invalidateBrokenSignals(md, d1Scores)
 
 	// 近实时退出通道：复用本轮打分池行情/日K，跑战法退出引擎（移动止盈/硬止损/破MA5/尾盘强平/超期），
 	// 让止损/移动止盈提醒从主循环 5 分钟粒度压缩到 ~5s。仅提醒、不自动执行。
@@ -286,7 +287,17 @@ func (e *Engine) logNShapeDiag(emotionPhase string, diags []combat_agent.NDiag) 
 // (sig.Price) the buy premise is broken, so code@strategy gets an invalidation tombstone: it's removed
 // from the pinned store (no longer pinned/shown today), its message-center entry is deleted, and it's logged.
 // Only long signals are processed; missing/invalid quotes are skipped and re-checked next round.
-func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMarketData) {
+// invalidateBrokenSignals 校验当日固化的做多买入信号，对失效信号打墓碑：
+//  1. 现价跌破触发价（sig.Price）→ 买入依据破坏；
+//  2. N 形(n_shape)信号当前 D1=0（无实质事件）→ 不再具备"有 D1 事件"+一突 的买入前提。
+// 命中即移出固化存储（当日不再固化/展示）+ 删除消息中心对应条目 + 日志。
+// 仅处理做多信号；行情缺失/价格无效时跳过（等下一轮有数据再判）。
+// English: validates today's pinned buy signals and tombstones stale ones — (1) live price below the
+// trigger sig.Price; (2) an n_shape signal whose current D1=0 (no substantive event) no longer meets the
+// "valid D1 + breakout" premise. Tombstoned signals are removed from the pinned store (not shown/pinned
+// again today), their message-center entry is deleted, and it's logged. Long signals only; missing/invalid
+// quotes are skipped and re-checked next round.
+func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMarketData, d1Scores map[string]combat_agent.D1Score) {
 	if e.signalStore == nil || e.msgStore == nil {
 		return
 	}
@@ -299,16 +310,23 @@ func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMar
 			continue
 		}
 		smd := md[sig.Code]
-		if smd == nil || smd.Quote == nil || smd.Quote.Price <= 0 || sig.Price <= 0 {
-			continue // 无有效行情，留待下一轮判定
+		// 现价跌破触发价 → 买入依据破坏
+		if smd != nil && smd.Quote != nil && smd.Quote.Price > 0 && sig.Price > 0 && smd.Quote.Price < sig.Price {
+			e.signalStore.Invalidate(sig.Code, sig.Strategy)
+			e.msgStore.Delete(sig.Code + "@交易信号@" + sig.Strategy)
+			log.Printf("[engine] 失效墓碑: %s(%s) %s 现价%.2f<触发价%.2f 买入依据破坏, 已移除信号",
+				sig.Code, sig.Name, sig.Strategy, smd.Quote.Price, sig.Price)
+			continue
 		}
-		if smd.Quote.Price >= sig.Price {
-			continue // 现价未跌破触发价，信号仍有效
+		// N 形信号当前无有效 D1（无实质事件被归 0）→ 不具备买入前提
+		// English: n_shape pinned signal whose current D1 is 0 (no substantive event) — premise no longer holds.
+		if sig.Strategy == string(strategy.SignalNShape) {
+			if d, ok := d1Scores[sig.Code]; ok && d.Blocked == false && d.Score <= 0 {
+				e.signalStore.Invalidate(sig.Code, sig.Strategy)
+				e.msgStore.Delete(sig.Code + "@交易信号@" + sig.Strategy)
+				log.Printf("[engine] 失效墓碑: %s(%s) n_shape 当前D1=0(无实质事件), 已移除信号", sig.Code, sig.Name)
+			}
 		}
-		e.signalStore.Invalidate(sig.Code, sig.Strategy)
-		e.msgStore.Delete(sig.Code + "@交易信号@" + sig.Strategy)
-		log.Printf("[engine] 失效墓碑: %s(%s) %s 现价%.2f<触发价%.2f 买入依据破坏, 已移除信号",
-			sig.Code, sig.Name, sig.Strategy, smd.Quote.Price, sig.Price)
 	}
 }
 

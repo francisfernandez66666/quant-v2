@@ -506,7 +506,7 @@ func TestNShapeScorer(t *testing.T) {
 		MinuteMACDDEA: 0.3, // DIF > DEA && DIF > 0 → D4a=5
 	}
 	ctx := &n_shape.Ctx{
-		LLMD1Score:  0.5, // D1 = 0.5 * 40 = 20
+		LLMD1Score:  20, // D1 满分 0~40 制，直接采用 LLM 分
 		LLMBlocked:  false,
 		StockPE:     12, // < 15 → D3=20
 		AvgDailyVol: 100000,

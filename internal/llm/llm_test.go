@@ -11,12 +11,12 @@ import (
 )
 
 // TestAnalyzeHotTopicBatchIsolatesSubBatch LLM 批量失败（重试耗尽）时子批隔离：
-// 返回非 nil 结果（用关键词兜底占位），不返回错误，主干继续。
+// 返回非 nil 结果（用关键词兜底占位），不返回错误，主干继续；并报告失败批索引供留队重试。
 func TestAnalyzeHotTopicBatchIsolatesSubBatch(t *testing.T) {
 	c := New(Config{APIKey: ""}) // 无 key → Chat 必然失败
 	titles := []string{"某公司涨停", "海外指数小幅波动", "某公司业绩暴跌"}
 
-	results, err := c.AnalyzeHotTopicBatch(titles)
+	results, failedIdx, err := c.AnalyzeHotTopicBatch(titles)
 	if err != nil {
 		t.Fatalf("子批隔离后不应返回错误，实际 %v", err)
 	}
@@ -27,6 +27,10 @@ func TestAnalyzeHotTopicBatchIsolatesSubBatch(t *testing.T) {
 		if ht == nil {
 			t.Fatalf("第%d条应得到兜底占位，实际 nil", i)
 		}
+	}
+	// 全批失败（无 key）→ 全部索引应标记失败
+	if len(failedIdx) != len(titles) {
+		t.Fatalf("期望 %d 条失败索引，实际 %d", len(titles), len(failedIdx))
 	}
 }
 

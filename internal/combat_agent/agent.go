@@ -427,25 +427,31 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		case strategy.SignalDragonReturn:
 			sc.DragonReturnScore = eval.TotalScore
 		}
-		// N 形候选：推进一突/二突日内状态机，并尊重 D 硬闸（硬闸在于 noscore 被拦、d1=0 不提级）。
-		// 一突打标需 d1>0；二突为最强确认同样要求 d1>0。未满足硬闸保持原级别不发信号。
+		// N 形候选：推进一突/二突日内状态机，并尊重 D 硬闸 + 总分门槛。
+		// 一突/二突标记需 d1>0 且 总分≥60（与 full_chain 的 Valid 硬闸一致）才 Pass；
+		// 否则即使波形确认也不发信号（避免光迅这类 d1=4、total=26 的低分被强制推荐）。
 		// English: for N-shape candidates advance the intraday left/right breakout state machine while
-		// respecting the D hard-gate — both labels require d1>0, otherwise keep the original level and
-		// emit no signal.
+		// respecting the D1 hard-gate AND the total-score gate — both labels need d1>0 and total ≥60 to
+		// Pass (matching full_chain's Valid gate); otherwise no signal fires even with wave confirmation
+		// (prevents low-score stocks like total=26 from being force-recommended).
 		if runner.Type == strategy.SignalNShape && eval != nil {
 			left, right := a.waves.Eval(code, md)
 			d1 := 0.0
 			if v, ok := eval.Details["d1"]; ok {
 				d1 = v
 			}
+			// 与 N 形 Valid 硬闸保持一致：总分≥60 且 D1>0 才可发信号
+			// English: consistent with the N-shape Valid gate — total ≥60 and D1>0 required.
+			minTotal := 60.0
+			totalOK := eval.TotalScore >= minTotal
 			tag := ""
 			switch {
-			case right && d1 > 0:
+			case right && d1 > 0 && totalOK:
 				eval.Level = "right_signal"
 				eval.Pass = true
 				eval.Details["right_signal"] = 1
 				tag = "二突"
-			case left && d1 > 0:
+			case left && d1 > 0 && totalOK:
 				eval.Level = "left_signal"
 				eval.Pass = true
 				eval.Details["left_signal"] = 1
@@ -454,8 +460,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			reason := eval.Level
 			if d1 <= 0 {
 				reason = "d1=0"
-			} else if !eval.Pass {
+			} else if !totalOK {
 				reason = "total_below"
+			} else if !eval.Pass {
+				reason = "wave_not_confirmed"
 			}
 			a.recordNDiag(NDiag{Code: code, Name: md.Name, D1: d1, Total: eval.TotalScore,
 				Level: eval.Level, Tag: tag, Pass: eval.Pass, Reason: reason})

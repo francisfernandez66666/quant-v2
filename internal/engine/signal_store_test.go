@@ -107,7 +107,7 @@ func TestInvalidateBrokenSignalsRemovesBelowTrigger(t *testing.T) {
 	md := map[string]*strategy_engine.StockMarketData{
 		"600001": {Code: "600001", Price: 9.5, Quote: &data.StockInfo{Price: 9.5}},
 	}
-	e.invalidateBrokenSignals(md)
+	e.invalidateBrokenSignals(md, nil)
 
 	if len(e.signalStore.List()) != 0 {
 		t.Fatalf("跌破触发价后固化信号应移除, got %+v", e.signalStore.List())
@@ -131,7 +131,7 @@ func TestInvalidateBrokenSignalsKeepsAboveTrigger(t *testing.T) {
 	md := map[string]*strategy_engine.StockMarketData{
 		"600001": {Code: "600001", Price: 10.5, Quote: &data.StockInfo{Price: 10.5}},
 	}
-	e.invalidateBrokenSignals(md)
+	e.invalidateBrokenSignals(md, nil)
 
 	if len(e.signalStore.List()) != 1 {
 		t.Fatalf("现价未跌破触发价不应移除, got %+v", e.signalStore.List())
@@ -155,7 +155,7 @@ func TestInvalidateBrokenSignalsSkipsShortAndMissing(t *testing.T) {
 	md := map[string]*strategy_engine.StockMarketData{
 		"600001": {Code: "600001", Quote: &data.StockInfo{Price: 0}},
 	}
-	e.invalidateBrokenSignals(md)
+	e.invalidateBrokenSignals(md, nil)
 
 	if len(e.signalStore.List()) != 2 {
 		t.Fatalf("做空/无有效行情信号不应被移除, got %+v", e.signalStore.List())

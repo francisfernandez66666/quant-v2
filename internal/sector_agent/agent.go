@@ -52,14 +52,23 @@ func classifyPhase(changePct, flow float64) string {
 // Agent 板块验证代理，依赖板块扫描器和 RPS 排名系统。
 // （Agent is the sector verification agent, depending on a sector scanner and the RPS ranking system.）
 type Agent struct {
-	scanner *data.SectorScanner // 板块扫描器
-	rps     *data.RPSManager    // RPS 强弱排名管理器
+	scanner         *data.SectorScanner // 板块扫描器
+	rps             *data.RPSManager    // RPS 强弱排名管理器
+	constituentTopN int                 // 每板块可操作成分股数量（默认 20；越大覆盖同板块强势股越广）
 }
 
 // New 创建板块验证代理实例。
 // （New creates a sector verification agent.）
 func New(scanner *data.SectorScanner, rps *data.RPSManager) *Agent {
-	return &Agent{scanner: scanner, rps: rps}
+	return &Agent{scanner: scanner, rps: rps, constituentTopN: 20}
+}
+
+// SetConstituentTopN 设置每板块纳入可操作成分股的数量（>0 时生效）。
+// English: sets how many constituents per sector are treated as actionable (takes effect when >0).
+func (a *Agent) SetConstituentTopN(n int) {
+	if n > 0 {
+		a.constituentTopN = n
+	}
 }
 
 // FeedRPS 将板块 RPS 数据喂给内部 RPSManager（engine 每轮刷新板块名单时调用）。
@@ -105,11 +114,11 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 			}
 		}
 
-		// 成分股验证：按板块代码评分前 10 只成分股，取其代码作为可操作标的
+		// 成分股验证：按板块代码评分前 N 只成分股，取其代码作为可操作标的
 		if a.scanner != nil {
 			sectorsInfo := a.scanner.FindSectorsByNames([]string{s.Name})
 			if len(sectorsInfo) > 0 {
-				stocks, err := a.scanner.ScoreSectorStocks(sectorsInfo[0].Code, 10)
+				stocks, err := a.scanner.ScoreSectorStocks(sectorsInfo[0].Code, a.constituentTopN)
 				if err == nil {
 					for _, st := range stocks {
 						vs.Stocks = append(vs.Stocks, st.Code)

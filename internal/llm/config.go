@@ -21,4 +21,10 @@ type Config struct {
 	// 仍在思维链输出的心跳），返回错误交由上层走重试队列。<=0 时 New 兜底为 60s。
 	// （StreamIdleTimeout is the idle threshold between stream chunks; exceeding it means the model is stuck.）
 	StreamIdleTimeout time.Duration
+
+	// BatchConcurrency LLM 批量分析（Stage0/Stage2 分批）的最大并发批次数量。
+	// <=0 时 New 兜底为 4。API 配额充足时可调高以加快盘前新闻归因吞吐。
+	// （BatchConcurrency caps how many LLM batch calls (Stage0/Stage2 chunked analysis) run concurrently;
+	// <=0 defaults to 4. Raise it when API quota allows to speed premarket news attribution.）
+	BatchConcurrency int
 }

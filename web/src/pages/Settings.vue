@@ -70,6 +70,10 @@
         <input v-model="llmModel" placeholder="gpt-4o-mini" />
       </div>
       <div class="setting-row">
+        <label>归因批并发度</label>
+        <input v-model.number="llmBatchConcurrency" type="number" min="1" max="16" placeholder="4" />
+      </div>
+      <div class="setting-row">
         <label>状态</label>
         <span :class="['status', llmConfigured ? 'online' : 'offline']">
           {{ llmConfigured ? '已配置' : '未配置（降级为关键词过滤）' }}
@@ -167,6 +171,8 @@ const llmApiKey = ref('')          // LLM API Key（密码框输入）
 // LLM API Key (entered in a password field)
 const llmModel = ref('')           // LLM 模型名
 // LLM model name
+const llmBatchConcurrency = ref(4) // 新闻归因 LLM 批量并发度
+// news-attribution LLM batch concurrency
 const llmConfigured = ref(false)   // LLM 是否已配置（未配置则降级为关键词过滤）
 // whether LLM is configured (degrades to keyword filtering otherwise)
 const llmSaving = ref(false)       // LLM 配置保存中（禁用按钮防重复提交）
@@ -371,11 +377,16 @@ async function saveLLM() {
   try {
     // 调用后端接口保存 LLM 配置
     // Call the backend endpoint to save the LLM config
-    await api.setLLMConfig({ api_key: llmApiKey.value, api_url: llmApiUrl.value, model: llmModel.value })
+    await api.setLLMConfig({
+      api_key: llmApiKey.value,
+      api_url: llmApiUrl.value,
+      model: llmModel.value,
+      batch_concurrency: llmBatchConcurrency.value,
+    })
     // 依据是否填写 Key 判断配置是否生效
     // Whether the config takes effect depends on whether a Key was provided
     llmConfigured.value = !!llmApiKey.value
-    llmMsg.value = 'LLM 配置已保存，重启后端生效'
+    llmMsg.value = 'LLM 配置已保存并热生效'
     llmMsgType.value = 'ok'
   } catch (e) {
     // 保存失败时展示错误信息
@@ -402,6 +413,7 @@ onMounted(async () => {
     if (cfg) {
       llmApiUrl.value = cfg.api_url || ''
       llmModel.value = cfg.model || ''
+      if (cfg.batch_concurrency > 0) llmBatchConcurrency.value = cfg.batch_concurrency
       llmConfigured.value = !!(cfg.api_key || cfg.api_url)
     }
   } catch (_) {}

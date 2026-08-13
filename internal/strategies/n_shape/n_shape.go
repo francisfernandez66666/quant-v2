@@ -128,11 +128,15 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		prio = strategy.P1
 	}
 
-	// 一突信号提高优先级: 价格突破前高且量比≥1.8 时，最低提升至 P2
-	// （说明主力已开始攻击，即使置信度不高也应提高关注级别）（Left signal boosts priority to at least P2 — the main force has begun attacking）
-	if d, ok := eval.Details["left_signal"]; ok && d > 0 {
-		if prio > strategy.P2 {
-			prio = strategy.P2
+	// 一突信号提高优先级: 价格突破前高且量比≥1.8 且 D1>0 时，最低提升至 P2
+	// （说明主力已开始攻击，即使置信度不高也应提高关注级别；无 D1 事件分不提升，
+	// 避免"无特定事件"占位低分仍被当一突拔高优先级）
+	// English: left signal boosts priority to at least P2 only when a valid D1 event score exists.
+	if d1v, d1ok := eval.Details["d1"]; d1ok && d1v > 0 {
+		if d, ok := eval.Details["left_signal"]; ok && d > 0 {
+			if prio > strategy.P2 {
+				prio = strategy.P2
+			}
 		}
 	}
 

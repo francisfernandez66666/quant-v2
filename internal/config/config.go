@@ -89,6 +89,12 @@ type MainSectorConfig struct {
 	MainSectorGain2dShock  float64           `json:"main_sector_gain2d_shock"`   // 震荡市：两日板块涨幅下限
 	MainSectorMaxCount     int               `json:"main_sector_max_count"`      // 主线板块最大数量
 	SectorEventMap         map[string]string `json:"sector_event_map,omitempty"` // 板块→事件映射（可选）
+	// SectorConstituentTopN 每板块纳入可操作成分股的数量（板块→个股传播/成分股评分）。
+	// 默认 20：扩大覆盖使同板块强势股（如剑桥科技）能进打分池，避免只覆盖龙头前10而漏选。
+	// English: number of constituents per sector treated as actionable (sector→stock propagation /
+	// constituent scoring). Default 20 to widen coverage so more same-sector leaders like Cambridge reach
+	// the pool instead of only the top-10 leaders.
+	SectorConstituentTopN int `json:"sector_constituent_top_n"`
 }
 
 // LLMConfig LLM 客户端连接配置。
@@ -103,6 +109,9 @@ type LLMConfig struct {
 	// MaxRetryTimes D1 评分 LLM 调用轮询重试次数（含首次）。<=0 时回退默认 5。
 	// 重试防丢信号：LLM 偶发超时/限流时不再轻易丢弃重要 D1 评分。
 	MaxRetryTimes int `json:"max_retry_times"`
+	// BatchConcurrency 新闻归因（Stage0/Stage2）LLM 批量分析的最大并发批次数量。
+	// <=0 时回退默认 4；API 配额充足时调高可加快盘前新闻归因吞吐，前端可热改。
+	BatchConcurrency int `json:"batch_concurrency"`
 }
 
 // StreamingEnabled 返回流式响应是否启用：未显式配置（nil）时默认开启。

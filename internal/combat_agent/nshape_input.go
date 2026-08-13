@@ -106,17 +106,17 @@ func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 // buildCtx builds the N-shape scoring context: emotion phase + 20-day avg volume + D1 event score.
 // emotionPhase 供情绪硬闸（如冰点禁开仓）使用；均量为波动率/强度参考。
 // emotionPhase drives the emotion hard-gate (e.g. freeze-open at fear); the avg volume is a volatility/strength reference.
-// d1 为 D1Scorer 批量评分结果（LLM 0~1 分 + 负面阻断标记），nil 表示本轮无 D1 数据；
-// d1 is the D1Scorer batch result (LLM 0~1 score + negative-block flag); nil means no D1 data this round;
-// eventDesc 为个股关联新闻标题（供 calcD1 的 YAML 负面阻断 + LLM 评分三段式）；
+// d1 为 D1Scorer 批量评分结果（LLM 0~40 分 + 负面阻断标记），nil 表示本轮无 D1 数据；
+// d1 is the D1Scorer batch result (LLM 0~40 score + negative-block flag); nil means no D1 data this round;
+// eventDesc 为个股关联新闻标题（供 calcD1 的 YAML 负面阻断 + LLM 评分）；
 // eventDesc is the stock's related news titles (for calcD1's YAML negative-block + LLM three-stage scoring);
 // pe 为个股市盈率（供 D3 超跌评分，<=0 时走斐波那契兜底）。
 // pe is the stock's P/E ratio (for the D3 oversold scoring; when <= 0, a Fibonacci fallback is used).
 func buildCtx(md *strategy_engine.StockMarketData, emotionPhase string, d1 *D1Score, eventDesc string, pe float64) *n_shape.Ctx {
 	ctx := &n_shape.Ctx{EmotionPhase: emotionPhase, EventDesc: eventDesc, StockPE: pe}
 	if d1 != nil {
-		// LLM 评分 0~1 映射到 D1（calcD1 内部 ×MaxD1）；负面阻断标记透传
-		// The LLM 0~1 score maps to D1 (calcD1 multiplies by MaxD1 internally); the negative-block flag passes through.
+		// LLM 评分 0~40 直接作为 D1（calcD1 不再乘 MaxD1）；负面阻断标记透传
+		// The LLM 0~40 score is used directly as D1 (calcD1 no longer multiplies by MaxD1); the negative-block flag passes through.
 		ctx.LLMD1Score = d1.Score
 		ctx.LLMBlocked = d1.Blocked
 	}

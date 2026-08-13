@@ -193,7 +193,13 @@ func TestBatchScoreChunked(t *testing.T) {
 	for i := 1; i <= 25; i++ {
 		codes = append(codes, fmt.Sprintf("600%03d", i))
 	}
-	got := ds.BatchScore(codes, nil, nil, nil)
+	// 每只都带关联事件，保证 LLM 的 0.5 分不被"无实质事件→归0"规则清掉（该规则另测）
+	// English: give every code a linked event so the LLM's 0.5 survives the no-event-zeroing rule (tested separately).
+	events := make([]newsagent.NewsEvent, 0, len(codes))
+	for _, c := range codes {
+		events = append(events, newsagent.NewsEvent{Title: "事件-" + c, RelatedStocks: []string{c}})
+	}
+	got := ds.BatchScore(codes, events, nil, nil)
 
 	if len(calls) != 3 {
 		t.Fatalf("应产生3次LLM调用, got %d", len(calls))
@@ -218,5 +224,48 @@ func TestBatchScoreChunked(t *testing.T) {
 	// 分批日志应出现在输出中（覆盖分批评分路径）
 	if !strings.Contains(prompts[0], "代码: 600001") || !strings.Contains(prompts[2], "代码: 600021") {
 		t.Fatalf("分批边界异常: prompts[0]=%s prompts[2]=%s", prompts[0], prompts[2])
+	}
+}
+
+// TestBatchScoreNoSubstantiveEventZeroed 验证"无实质事件→D1归0"：
+// 个股既无关联新闻、也无板块正向事件时，即使 LLM 给了占位低分（如 0.5），
+// 也强制归 0，杜绝其充当有效 D1 触发买入/固化提醒。
+// 而带关联事件的个股保留 LLM 原始分。
+// English: verifies the "no substantive event → D1=0" rule — a stock with no linked news and no bullish
+// sector event is forced to 0 even if the LLM returned a placeholder low score, so it can't act as a valid
+// D1 that fires/pins buy alerts. Stocks with a linked event keep their LLM score.
+func TestBatchScoreNoSubstantiveEventZeroed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var arr []map[string]any
+		for _, c := range []string{"600001", "600002", "600003"} {
+			arr = append(arr, map[string]any{"code": c, "score": 0.5, "blocked": false, "reason": "测试"})
+		}
+		b, _ := json.Marshal(arr)
+		resp := map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": string(b)}}},
+		}
+		out, _ := json.Marshal(resp)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(out)
+	}))
+	defer srv.Close()
+
+	cl := llm.New(llm.Config{APIKey: "test", APIURL: srv.URL, Model: "test-model", Streaming: false, Timeout: 0})
+	ds := NewD1Scorer(cl, "")
+
+	// 600001 有关联事件；600002 无关联事件；600003 无关联事件但所属板块有事件
+	events := []newsagent.NewsEvent{{Title: "重大利好", RelatedStocks: []string{"600001"}}}
+	ds.sectorEvents = map[string]string{"600003": "板块利好事件"}
+
+	got := ds.BatchScore([]string{"600001", "600002", "600003"}, events, nil, nil)
+
+	if s := got["600001"]; s.Score != 0.5 {
+		t.Fatalf("600001 有关联事件应保留 LLM 分 0.5, got %+v", s)
+	}
+	if s := got["600003"]; s.Score != 0.5 {
+		t.Fatalf("600003 有板块事件应保留 LLM 分 0.5, got %+v", s)
+	}
+	if s := got["600002"]; s.Score != 0 {
+		t.Fatalf("600002 无任何事件应强制归 0, got %+v", s)
 	}
 }

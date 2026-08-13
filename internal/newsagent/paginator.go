@@ -50,16 +50,15 @@ func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 		all = all[:maxCatchUpItems]
 	}
 
-	// 标记所有追回的新闻为"已见"，防止下次轮询重复拉取
-	titles := make([]string, len(all))
-	times := make([]string, len(all))
-	for i, n := range all {
-		titles[i] = n.Title
-		times[i] = n.Datetime
-	}
-	a.tracker.BulkMarkSeen(titles, times)
-	// 立即落盘 seen 记账：若后续 LLM 阶段耗时数小时/进程被杀，也不会在重启后重复追回同一批新闻
-	// （Immediately persist the seen ledger so a later long LLM phase or a killed process does not re-fetch
+	// 抓取到的新闻加入"未归因队列"（不立即标记 seen）：
+	// LLM Stage0/Stage2 归因成功后才移入 seen（RemovePending），失败则留在队列由盘前/下一轮重试，
+	// 解决"昨夜新闻因 LLM 慢/失败被永久丢弃"的问题。fetch 去重改为跳过 seen 或已排队标题。
+	// （Fetched news joins the unattributed queue instead of being marked seen immediately: items are
+	// only marked seen (RemovePending) once Stage0/Stage2 attribution succeeds; failures stay queued for
+	// premarket/next-round retry, fixing yesterday's news being permanently lost to slow/failed LLM.）
+	a.tracker.AddPending(all)
+	// 立即落盘未归因队列：若后续 LLM 阶段耗时数小时/进程被杀，也不会在重启后重复追回同一批新闻
+	// （Immediately persist the queue so a later long LLM phase or a killed process does not re-fetch
 	// the same news after restart.）
 	_ = a.tracker.save()
 
@@ -93,11 +92,11 @@ func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem 
 			break
 		}
 
-		// 页内去重：跳过本轮已见或（非force时）历史已处理的标题
+		// 页内去重：跳过本轮已见、或（非force时）已处理(seen)或已排队(pending)的标题
 		var fresh []data.NewsItem
 		for _, item := range items {
 			key := truncateStr(item.Title, 60)
-			if seen[key] || (!force && a.tracker.IsSeen(item.Title)) {
+			if seen[key] || (!force && (a.tracker.IsSeen(item.Title) || a.tracker.IsPending(item.Title))) {
 				continue
 			}
 			seen[key] = true
@@ -130,7 +129,7 @@ func (a *Agent) fetchSinaOnce(seen map[string]bool, force bool) []data.NewsItem 
 	var fresh []data.NewsItem
 	for _, item := range items {
 		key := truncateStr(item.Title, 60)
-		if seen[key] || (!force && a.tracker.IsSeen(item.Title)) {
+		if seen[key] || (!force && (a.tracker.IsSeen(item.Title) || a.tracker.IsPending(item.Title))) {
 			continue
 		}
 		seen[key] = true
@@ -150,7 +149,7 @@ func (a *Agent) fetchCLSOnce(seen map[string]bool, force bool) []data.NewsItem {
 	var fresh []data.NewsItem
 	for _, item := range items {
 		key := truncateStr(item.Title, 60)
-		if seen[key] || (!force && a.tracker.IsSeen(item.Title)) {
+		if seen[key] || (!force && (a.tracker.IsSeen(item.Title) || a.tracker.IsPending(item.Title))) {
 			continue
 		}
 		seen[key] = true

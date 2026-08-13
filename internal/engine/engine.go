@@ -79,6 +79,7 @@ type Engine struct {
 
 	sectorEventTimes map[string]time.Time  // 板块事件时间戳（重复事件衰减状态）
 	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
+	sectorConstTopN  int                   // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
 
 	fetcher          *data.Fetcher                   // 5s 实时行情采集器（近实时打分快照来源）
 	scoreStore       *scoreStore                     // 8a/8b 打分持久化（scores.json）
@@ -100,6 +101,16 @@ func (e *Engine) LastRunTiming() *RunTiming {
 func (e *Engine) SetEmotionConfig(cfg *config.EmotionConfig) {
 	e.mu.Lock()
 	e.emotionCfg = cfg
+	e.mu.Unlock()
+}
+
+// SetSectorConstituentTopN 设置板块→个股传播每板块纳入的成分股数量（>0 时生效）。
+// English: sets the per-sector constituent count for sector→stock propagation (effective when >0).
+func (e *Engine) SetSectorConstituentTopN(n int) {
+	e.mu.Lock()
+	if n > 0 {
+		e.sectorConstTopN = n
+	}
 	e.mu.Unlock()
 }
 
@@ -195,6 +206,7 @@ func New(
 		hotRecords:       loadHotRecords(hotRecPath),
 		hotRecPath:       hotRecPath,
 		sectorEventTimes: make(map[string]time.Time),
+		sectorConstTopN:  20,
 		scoreStore:       newScoreStore(scoreRecPath),
 		prevPass:         make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
@@ -270,25 +282,60 @@ func (e *Engine) updateHotPool(bull, bear []sector_agent.VerifiedSector) {
 	log.Printf("[engine] 热点池更新: %d 只板块成分股入 5s 实时池", len(stocks))
 }
 
+// pushFreshHotspots 新热点立马进池：把归因产出的有效事件立即归因出板块 → 板块验真 → 并入 5s 实时监控池。
+// 与 Run 尾部 9b 的 updateHotPool 幂等。strategy 或 sectorAgent 未初始化时优雅跳过（不 panic）。
+// （pushFreshHotspots immediately attributes valid events into sectors, verifies them, and merges the
+// constituents into the 5s watch pool. Idempotent with the updateHotPool at the end of Run.）
+func (e *Engine) pushFreshHotspots(valid []newsagent.NewsEvent) {
+	if len(valid) == 0 || e.strategy == nil || e.sectorAgent == nil {
+		return
+	}
+	_stepHot := time.Now()
+	bullCand, bearCand := e.strategy.BuildHotSectors(valid)
+	var vb, vbr []sector_agent.VerifiedSector
+	if e.LongEnabled() {
+		vb = e.sectorAgent.Verify(bullCand)
+	}
+	if e.ShortEnabled() {
+		vbr = e.sectorAgent.Verify(bearCand)
+	}
+	e.updateHotPool(vb, vbr)
+	_hotPoolT := time.Since(_stepHot)
+	if _hotPoolT > 500*time.Millisecond {
+		log.Printf("[engine] 新热点立即进池: %d利好板块 %d利空板块, 耗时 %v", len(vb), len(vbr), _hotPoolT)
+	}
+}
+
 // mergeSectorStocksIntoScores 板块→个股归因：把验证通过的板块 top 成分股并入打分行情/D1/PE，
 // 使 ScanLong/ScanShort 遍历 sector.Stocks 时 MarketData[code] 有值（否则 evalAll md==nil 丢弃，
 // 板块利好永远落不到个股）。
 // D1 沿用板块事件分（sector.Score 0~1 → LLMD1Score，仅做多板块种子），不额外调 LLM；
 // 只对没有专属 D1 的成分股打底，避免覆盖个股自己的评分。
-func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_engine.StrategyResult, verifiedBull, verifiedBear []sector_agent.VerifiedSector, d1Scores map[string]combat_agent.D1Score, peScores map[string]float64) {
-	// 1. 收拢全部板块成分股（去重），并记录每个 code 所属板块的事件分
+// mergeSectorStocksIntoScores 板块→个股归因：把已验证利好板块的成分股并入 打分池 + 行情数据，
+// 返回"代码→板块事件标题"映射供 D1 评分注入上下文。
+// 不做 D1 打分（D1 已与板块利好/利空事件分完全解耦，只由 D1Scorer LLM 独立核定）——
+// 板块成分股并入 sr.ScoringPool 后，由随后运行的 D1 batch 统一打分。
+// English: sector→stock attribution — merges verified-bull sector constituents into the scoring pool +
+// market data, and returns a code→sector-event-title map for D1 scoring context. It does NOT assign D1
+// (D1 is fully decoupled from the sector bull/bear event score and graded independently by the D1Scorer
+// LLM); constituents are added to sr.ScoringPool so the following D1 batch scores them uniformly.
+func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_engine.StrategyResult, verifiedBull, verifiedBear []sector_agent.VerifiedSector, peScores map[string]float64) map[string]string {
+	// 1. 收拢全部板块成分股（去重），并记录每个 code 所属板块的事件标题（做多板块种子）
 	type secInfo struct {
-		score float64
-		name  string
+		eventTitle string
 	}
 	secOf := make(map[string]secInfo)
 	for _, vs := range verifiedBull {
 		if vs.Score <= 0 {
 			continue
 		}
+		title := vs.Reason
+		if title == "" {
+			title = vs.Name
+		}
 		for _, c := range vs.Stocks {
 			if _, ok := secOf[c]; !ok {
-				secOf[c] = secInfo{score: vs.Score, name: vs.Name}
+				secOf[c] = secInfo{eventTitle: title}
 			}
 		}
 	}
@@ -300,47 +347,39 @@ func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_e
 		extras = append(extras, c)
 	}
 	if len(extras) == 0 {
-		return
+		return nil
 	}
 	if e.strategy == nil || e.marketAPI == nil {
 		log.Printf("[engine] 板块→个股归因跳过: 策略引擎/行情API未配置")
-		return
+		return nil
 	}
 
-	// 2. 补拉成分股行情（K线/实时/资金流，走缓存），merge 进 sr.MarketData
+	// 2. 补拉成分股行情（K线/实时/资金流，走缓存），merge 进 sr.MarketData 与打分池
 	extraMD := e.strategy.BuildScoringData(ctx, extras, nil)
+	// 打分池去重集合（ScoringPool 为无序切片，用 map 判重）
+	poolSet := make(map[string]bool, len(sr.ScoringPool))
+	for _, c := range sr.ScoringPool {
+		poolSet[c] = true
+	}
+	eventMap := make(map[string]string, len(extras))
 	for c, md := range extraMD {
-		sr.MarketData[c] = md
-	}
-
-	// 3. 补 PE 与板块事件 D1 种子（仅做多板块；只填缺项的）
-	for _, c := range extras {
+		if _, ok := sr.MarketData[c]; !ok {
+			sr.MarketData[c] = md
+		}
+		// 并入打分池，使板块成分股进入 D1 batch 的统一打分范围（板块事件标题作为评分上下文）
+		if si, ok := secOf[c]; ok && si.eventTitle != "" {
+			eventMap[c] = si.eventTitle
+		}
+		if !poolSet[c] {
+			sr.ScoringPool = append(sr.ScoringPool, c)
+			poolSet[c] = true
+		}
+		// 3. 补 PE（N 形 D3 超跌评分）
 		peScores[c] = e.marketAPI.GetStockPE(c)
-		si, ok := secOf[c]
-		if !ok || si.score <= 0 {
-			continue
-		}
-		if _, has := d1Scores[c]; has {
-			continue
-		}
-		s := si.score
-		if s > 1.0 {
-			s = 1.0
-		}
-		d1Scores[c] = combat_agent.D1Score{Code: c, Score: s, Blocked: false, Reason: "板块传导:" + si.name}
 	}
 
-	// 4. 合并进 lastD1Scores，供 5s 近实时打分循环复用（板块成分股 N 形 d1 门不为空）
-	e.mu.Lock()
-	for c, d := range d1Scores {
-		if _, has := e.lastD1Scores[c]; !has {
-			e.lastD1Scores[c] = d
-		}
-	}
-	e.mu.Unlock()
-
-	log.Printf("[engine] 板块→个股归因: 补 %d 只成分股行情+D1(板块事件沿用), 板块=%d",
-		len(extras), len(secOf))
+	log.Printf("[engine] 板块→个股归因: 补 %d 只成分股行情并入打分池, 板块=%d", len(extras), len(secOf))
+	return eventMap
 }
 
 // loadStageRecords 从磁盘加载当日 Stage 记录；跨交易日自动重置。
@@ -1371,13 +1410,17 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	e.refreshSectors()
 	out.timing.Sectors = time.Since(_stepSectors)
 
-	// 1. 拉取原始新闻（含去重记账，属 newsagent 职能）
+	// 1. 拉取原始新闻（新抓入未归因队列）+ 历史未归因新闻（LLM 上一轮失败留队重试）
+	// 合并去重后统一跑 Stage0/Stage2：成功归因的从队列移除并标记 seen，失败留队下一轮重试，
+	// 保证"昨夜新闻因 LLM 慢/失败"也能在盘前多轮内补上归因。
 	_stepFetch := time.Now()
-	out.rawNews = e.newsAgent.Fetch(ctx, since)
+	newNews := e.newsAgent.Fetch(ctx, since)
+	pending := e.newsAgent.UnattributedItems()
+	out.rawNews = dedupNews(append(newNews, pending...))
 	out.timing.Fetch = time.Since(_stepFetch)
 
 	if len(out.rawNews) == 0 {
-		log.Printf("[engine] 无新新闻 (since=%s), 本轮仅执行打分", since.Format("01-02 15:04"))
+		log.Printf("[engine] 无新新闻且无待归因新闻 (since=%s), 本轮仅执行打分", since.Format("01-02 15:04"))
 		return out
 	}
 
@@ -1401,10 +1444,14 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 
 	// 3. 收集全量事件
 	_stepStage2 := time.Now()
+	// 本轮归因失败的新闻（留未归因队列，下轮重试）
+	var failedNews []data.NewsItem
 	// 3a. 个股新闻：跳过 Stage1，直接 Stage2 深度分析
 	if len(out.st0.StockIdx) > 0 {
 		stockItems := pickItems(out.rawNews, out.st0.StockIdx)
-		out.events = append(out.events, e.newsAgent.Stage2(stockItems)...)
+		evs, failed := e.newsAgent.Stage2(stockItems)
+		out.events = append(out.events, evs...)
+		failedNews = append(failedNews, failed...)
 	}
 
 	// 3b. 板块新闻：material 价值初筛（合并进 Stage0 单次调用）→ Stage2 深度分析
@@ -1417,7 +1464,9 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 			}
 		}
 		if len(kept) > 0 {
-			out.events = append(out.events, e.newsAgent.Stage2(pickItems(sectorItems, kept))...)
+			evs, failed := e.newsAgent.Stage2(pickItems(sectorItems, kept))
+			out.events = append(out.events, evs...)
+			failedNews = append(failedNews, failed...)
 		}
 	}
 
@@ -1480,9 +1529,73 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 		log.Printf("[engine] 无有效事件(|score|>=0.5), 本轮仅执行打分")
 	}
 	logDroppedFromPool(out.events, out.valid)
+	// 6g. 归因完成判定并从未归因队列移除：
+	//    - 成功归因 = 产出事件（含中性，只要 Stage2 分析完成）或 Stage0 明确分类为一般/IPO；
+	//    - 失败留队 = Stage0 FailedIdx（LLM 重试耗尽未判定）或 Stage2 failedItems（深度分析失败）。
+	// 用标题匹配把成功者移出 pending（MarkAttributedTitles），失败者由下一轮盘前/盘中重试，
+	// 避免"LLM 慢/失败一次 = 昨夜有价值的新闻永久丢失"。
+	e.markAttributedFromProduce(out, failedNews)
 	// 阶段2(深度分析 LLM)+事件构建总耗时（含聚簇/衰减/验真/传播）
 	out.timing.Stage2 = time.Since(_stepStage2)
 	out.timing.Events = out.timing.Stage2
+	return out
+}
+
+// markAttributedFromProduce 从未归因队列移除本轮成功归因的新闻（保留失败者留队重试）。
+// 成功集合 = 产出事件新闻 ∪ Stage0 判为一般/IPO 的新闻；失败集合 = Stage0 FailedIdx ∪ Stage2 failedItems。
+// （markAttributedFromProduce removes this round's successfully-attributed news from the unattributed queue,
+// keeping failures queued for retry. Success = emitted events ∪ Stage0-classified general/IPO; failure =
+// Stage0 FailedIdx ∪ Stage2 failedItems.）
+func (e *Engine) markAttributedFromProduce(out produceOut, failedNews []data.NewsItem) {
+	failed := make(map[string]bool, len(failedNews))
+	for _, it := range failedNews {
+		failed[it.Title] = true
+	}
+	for _, f := range out.st0.FailedIdx {
+		if f >= 0 && f < len(out.rawNews) {
+			failed[out.rawNews[f].Title] = true
+		}
+	}
+	// 事件标题集合（成功归因）
+	success := make(map[string]bool)
+	for _, ev := range out.events {
+		success[ev.Title] = true
+	}
+	// Stage0 判为一般（Official=false 等明确分类）或 IPO 的新闻也算归因完成（无需 LLM 深度分析）
+	for _, i := range out.st0.GeneralIdx {
+		if i >= 0 && i < len(out.rawNews) {
+			success[out.rawNews[i].Title] = true
+		}
+	}
+	for _, i := range out.st0.IpoIdx {
+		if i >= 0 && i < len(out.rawNews) {
+			success[out.rawNews[i].Title] = true
+		}
+	}
+	// 移除成功者中不冲突的（失败优先：失败标题覆盖成功标题）
+	for t := range failed {
+		delete(success, t)
+	}
+	if len(success) > 0 {
+		e.newsAgent.MarkAttributedTitles(success)
+	}
+}
+
+// dedupNews 按标题去重合并两批新闻（保留先出现者，通常新抓在前、历史未归因在后）。
+// （dedupNews merges two news slices by title, keeping the first occurrence (new fetches first, then pending).）
+func dedupNews(items []data.NewsItem) []data.NewsItem {
+	if len(items) <= 1 {
+		return items
+	}
+	seen := make(map[string]bool, len(items))
+	out := make([]data.NewsItem, 0, len(items))
+	for _, it := range items {
+		if it.Title == "" || seen[it.Title] {
+			continue
+		}
+		seen[it.Title] = true
+		out = append(out, it)
+	}
 	return out
 }
 
@@ -1532,6 +1645,14 @@ func (e *Engine) TryAsyncRun(ctx context.Context, since time.Time) bool {
 	return true
 }
 
+// AsyncIdle 返回异步引擎是否空闲（上一轮异步 Run 已完成）。
+// 供盘前主循环"跑完即排下一轮"轮询，替代固定 5min 间隔。
+// （AsyncIdle reports whether the async engine is idle (previous async Run finished), for the premarket
+// main loop to trigger the next round immediately instead of waiting a fixed 5 minutes.）
+func (e *Engine) AsyncIdle() bool {
+	return atomic.LoadInt32(&e.asyncBusy) == 0
+}
+
 // Run 驱动一轮完整流水线：拉取 → Stage0 → Stage1/2 → 阈值过滤 → 归因 → 板块验证 → 战法扫描 → 信号聚合 → 广播。
 // since 为本次追回起始时间，由调用方（主循环）根据市场时段计算。
 func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.StrategyResult {
@@ -1539,6 +1660,14 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 0-6. 新闻流水线：拉取→Stage0/1/2→固化→阈值→聚簇→衰减→归因验真传播
 	pOut := e.produceNews(ctx, since)
 	rawNews, st0, events, valid := pOut.rawNews, pOut.st0, pOut.events, pOut.valid
+
+	// 6g. 新热点立马进池：新闻归因一产出有效事件，立即归因出板块 → 验证 → 更新 5s 实时监控池，
+	// 不等主循环末尾。这样归因出板块成分股的瞬间就能被近实时循环盯上（减少"板块已热但个股迟迟不入池"）。
+	// 与 9b 的 updateHotPool 幂等（相同板块重复写入无害）。
+	// English: push fresh hotspots into the watch pool immediately after attribution, without waiting for
+	// the round's end, so sector constituents are picked up by the near-realtime loop at once (idempotent
+	// with the later updateHotPool at step 9b).
+	e.pushFreshHotspots(valid)
 
 	// 7. 策略评估：归因 + 分流 + 评分池 + 行情数据（无事件时仅覆盖 持仓+自选 打分池）
 	positions := e.rpt.HeldPositionCodes()
@@ -1551,30 +1680,6 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	_stepHotRec := time.Now()
 	e.captureHotRecord(sr)
 	_hotRecT := time.Since(_stepHotRec)
-
-	// 8. D1 评分（所有打分池个股；LLM 失败/漏项回退上一轮评分，避免断链归零）
-	_stepD1 := time.Now()
-	d1Scorer := combat_agent.NewD1Scorer(e.llmClient, "")
-	e.mu.RLock()
-	retries := e.d1MaxRetries
-	e.mu.RUnlock()
-	d1Scorer.SetMaxRetries(retries)
-	e.mu.RLock()
-	prevD1 := e.lastD1Scores
-	e.mu.RUnlock()
-	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, valid, sr.MarketData, prevD1)
-	e.mu.Lock()
-	e.lastD1Scores = d1Scores
-	e.mu.Unlock()
-	_d1T := time.Since(_stepD1)
-
-	// 8a. 打分池 PE 预取（N 形 D3 超跌评分；东财 clist f9，TTL 缓存降低限流压力）
-	_stepPE := time.Now()
-	peScores := make(map[string]float64, len(sr.ScoringPool))
-	for _, code := range sr.ScoringPool {
-		peScores[code] = e.marketAPI.GetStockPE(code)
-	}
-	_peT := time.Since(_stepPE)
 
 	td := data.TradingDayDate(time.Now())
 
@@ -1616,13 +1721,53 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.updateHotPool(verifiedBull, verifiedBear)
 	_hotPoolT := time.Since(_stepHotPool)
 
-	// 9c. 板块→个股归因：热点板块 top 成分股并入打分池行情/D1。
+	// 9c. 板块→个股归因：热点板块 top 成分股并入打分池 + 行情。
 	// 修复"板块利好只有板块、没有个股"：此前成分股不在 sr.MarketData 里，
 	// ScanLong 遍历 sector.Stocks 时 md==nil 直接丢弃 → 板块永远归因不到个股。
-	// D1 仅沿用板块事件（sector.Score 0~1 → LLMD1Score），不额外调 LLM。
+	// 现在 D1 与板块利好/利空事件分完全解耦：不再用 SectorHot.Score 直接当 D1，
+	// 而是把成分股并入 ScoringPool、由随后的 D1 batch 统一 LLM 打分；
+	// 板块事件标题经 eventMap 注入 D1 评分上下文，供 LLM 合理核定。
+	// English: sector→stock attribution merges verified-bull top constituents into the scoring pool +
+	// market data. D1 is fully decoupled from the sector bull/bear event score: constituents join the pool
+	// and the following D1 batch grades them via LLM, with the sector event title injected as D1 context.
 	_stepMerge := time.Now()
-	e.mergeSectorStocksIntoScores(ctx, sr, verifiedBull, verifiedBear, d1Scores, peScores)
+	peScores := make(map[string]float64, len(sr.ScoringPool))
+	eventMap := e.mergeSectorStocksIntoScores(ctx, sr, verifiedBull, verifiedBear, peScores)
 	_mergeT := time.Since(_stepMerge)
+
+	// 8. D1 评分（扩展后的打分池个股：新闻/持仓/自选 + 板块成分股）。
+	// 板块事件标题一并注入 D1 评分上下文（个股不在新闻点名里也能按板块事件合理打分）；
+	// LLM 失败/漏项回退上一轮评分，避免断链归零。D1 与板块利好/利空事件分解耦，独立 40 分制。
+	// English: D1 batch scores the expanded pool (news/holdings/watchlist + sector constituents). Sector
+	// event titles are injected into D1 context so non-news-named constituents still grade fairly.
+	_stepD1 := time.Now()
+	d1Scorer := combat_agent.NewD1Scorer(e.llmClient, "")
+	e.mu.RLock()
+	retries := e.d1MaxRetries
+	e.mu.RUnlock()
+	d1Scorer.SetMaxRetries(retries)
+	e.mu.RLock()
+	prevD1 := e.lastD1Scores
+	e.mu.RUnlock()
+	d1Scorer.SetSectorEvents(eventMap)
+	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, valid, sr.MarketData, prevD1)
+	e.mu.Lock()
+	e.lastD1Scores = d1Scores
+	e.mu.Unlock()
+	_d1T := time.Since(_stepD1)
+
+	// 8a. 打分池 PE 预取（N 形 D3 超跌评分；东财 clist f9，TTL 缓存降低限流压力）。
+	// 板块成分股的 PE 已在 9c 内补，这里只补其余池内个股。
+	// English: prefetch PE for the scoring pool (N-shape D3 oversold). Constituent PE was filled in 9c;
+	// only remaining pool codes are fetched here.
+	_stepPE := time.Now()
+	for _, code := range sr.ScoringPool {
+		if _, ok := peScores[code]; ok {
+			continue
+		}
+		peScores[code] = e.marketAPI.GetStockPE(code)
+	}
+	_peT := time.Since(_stepPE)
 
 	// 10-12. 出信号：做多 + 涨停增强 + 做空 + 个股直入（D1 复用，不重复调 LLM）
 	_stepSignals := time.Now()
@@ -1960,8 +2105,11 @@ func (e *Engine) ReanalyzeNews() (map[string]int, error) {
 
 	// 收集事件：个股 → Stage2；板块 → material 初筛后 Stage2；IPO → 直构
 	var events []newsagent.NewsEvent
+	var failedNews []data.NewsItem
 	if len(st0.StockIdx) > 0 {
-		events = append(events, na.Stage2(pickItems(raw, st0.StockIdx))...)
+		evs, failed := na.Stage2(pickItems(raw, st0.StockIdx))
+		events = append(events, evs...)
+		failedNews = append(failedNews, failed...)
 	}
 	if len(st0.SectorIdx) > 0 {
 		sectorItems := pickItems(raw, st0.SectorIdx)
@@ -1972,7 +2120,9 @@ func (e *Engine) ReanalyzeNews() (map[string]int, error) {
 			}
 		}
 		if len(kept) > 0 {
-			events = append(events, na.Stage2(pickItems(sectorItems, kept))...)
+			evs, failed := na.Stage2(pickItems(sectorItems, kept))
+			events = append(events, evs...)
+			failedNews = append(failedNews, failed...)
 		}
 	}
 	if len(st0.IpoIdx) > 0 {
@@ -1990,9 +2140,10 @@ func (e *Engine) ReanalyzeNews() (map[string]int, error) {
 		"ipo":     len(st0.IpoIdx),
 		"general": len(st0.GeneralIdx),
 		"events":  len(events),
+		"failed":  len(failedNews),
 	}
-	log.Printf("[engine] 补推完成: 原始%d 个股%d 板块%d IPO%d 一般%d 事件%d (err=%v)",
-		stat["raw"], stat["stock"], stat["sector"], stat["ipo"], stat["general"], stat["events"], st0.Err)
+	log.Printf("[engine] 补推完成: 原始%d 个股%d 板块%d IPO%d 一般%d 事件%d 未归因%d (err=%v)",
+		stat["raw"], stat["stock"], stat["sector"], stat["ipo"], stat["general"], stat["events"], stat["failed"], st0.Err)
 	return stat, nil
 }
 
@@ -2015,7 +2166,7 @@ func (e *Engine) TestAttribution(title, digest string) ([]newsagent.NewsEvent, e
 		Source:   "测试",
 		Datetime: time.Now().Format("2006-01-02 15:04:05"),
 	}
-	events := na.Stage2([]data.NewsItem{item})
+	events, _ := na.Stage2([]data.NewsItem{item})
 	if len(events) == 0 {
 		log.Printf("[engine] 单条归因测试: 无事件产出 (title=%s)", title[:min(len(title), 40)])
 	}
@@ -2110,15 +2261,20 @@ func (e *Engine) verifySectorAttribution(events []newsagent.NewsEvent) {
 }
 
 // propagateSectorToStocks 板块→个股事件级传播：对命中真实板块的板块级事件，
-// 取板块前10成分股注入 RelatedStocks（"名称(代码)"），并同步清洗 CleanedStocks，
+// 取板块前 N 成分股注入 RelatedStocks（"名称(代码)"），并同步清洗 CleanedStocks，
 // 使板块权重沿 事件→个股监测池(8a/8b) 传递。同一板块每轮只取一次成分股。
+// N 由 sectorConstTopN（默认 20）决定，扩大覆盖以纳入更多同板块强势股。
 // 遍历范围含直接板块 + 上游 + 下游板块，补足 LLM 未点名的产业链个股。
 func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	e.mu.RLock()
 	scanner := e.scanner
+	topN := e.sectorConstTopN
 	e.mu.RUnlock()
 	if scanner == nil {
 		return
+	}
+	if topN <= 0 {
+		topN = 20
 	}
 	injected := 0
 	fetched := make(map[string]bool)
@@ -2140,7 +2296,7 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 				continue // 同一板块每轮只取一次成分股，避免重复注入
 			}
 			fetched[si.Code] = true
-			stocks, err := e.marketAPI.GetSectorStocks(si.Code, 10)
+			stocks, err := e.marketAPI.GetSectorStocks(si.Code, topN)
 			if err != nil {
 				log.Printf("[engine] 板块成分股获取失败 %s: %v", name, err)
 				continue

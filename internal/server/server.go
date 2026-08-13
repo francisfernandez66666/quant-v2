@@ -62,7 +62,7 @@ type Server struct {
 	watchlist   *data.WatchlistManager                                             // 自选股管理器
 	sse         *SSEBroker                                                         // SSE 事件广播器（向前端实时推送）
 	startTime   time.Time                                                          // 服务启动时间（用于 uptime 统计）
-	llmRecreate func(apiKey, apiURL, model string, timeoutSec int, streaming bool) // 热重建 LLM 客户端
+	llmRecreate func(apiKey, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) // 热重建 LLM 客户端
 	ctrl        EngineController                                                   // 引擎控制面（做多/做空开关、流水线调试数据等）
 
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
@@ -81,7 +81,7 @@ type Server struct {
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
-func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int, streaming bool)) {
+func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int)) {
 	s.llmRecreate = fn
 }
 
@@ -811,16 +811,21 @@ type setLLMConfigReq struct {
 	Model      string `json:"model"`
 	TimeoutSec int    `json:"timeout_sec"`      // 单次请求超时（秒），缺省 0
 	Stream     *bool  `json:"stream,omitempty"` // 流式开关，缺省维持现状/默认开启
+	// BatchConcurrency 新闻归因 LLM 批量并发批次，<=0 时维持现状/默认 4。
+	// （BatchConcurrency is the news-attribution LLM batch concurrency; <=0 keeps current/default 4.）
+	BatchConcurrency int `json:"batch_concurrency,omitempty"`
 }
 
 // handleGetLLMConfig 处理 GET /api/config/llm：返回 API 地址、运行时生效模型与流式开关。
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.GetLLMConfig()
 	writeJSON(w, 200, map[string]interface{}{
-		"api_url":     cfg.APIURL,
-		"model":       s.runtimeModel(),
-		"stream":      cfg.StreamingEnabled(),
-		"timeout_sec": cfg.TimeoutSec,
+		"api_url":            cfg.APIURL,
+		"model":              s.runtimeModel(),
+		"stream":             cfg.StreamingEnabled(),
+		"timeout_sec":        cfg.TimeoutSec,
+		"batch_concurrency":  cfg.BatchConcurrency,
+		"max_retry_times":    cfg.MaxRetryTimes,
 	})
 }
 
@@ -836,10 +841,11 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 	// 保存 APIURL + Model 到 config.json
 	s.cfg.SetLLMConfig(&config.LLMConfig{
-		APIURL:     req.APIURL,
-		Model:      req.Model,
-		TimeoutSec: req.TimeoutSec,
-		Stream:     req.Stream,
+		APIURL:           req.APIURL,
+		Model:            req.Model,
+		TimeoutSec:       req.TimeoutSec,
+		Stream:           req.Stream,
+		BatchConcurrency: req.BatchConcurrency,
 	})
 
 	// 保存 APIKey 到 auth config
@@ -856,7 +862,7 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 				key = v
 			}
 		}
-		s.llmRecreate(key, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream))
+		s.llmRecreate(key, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream), req.BatchConcurrency)
 	}
 
 	// 记录运行时实际生效的 model（空值会被 llm 客户端按默认模型兜底）

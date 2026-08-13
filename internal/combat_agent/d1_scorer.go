@@ -1,10 +1,14 @@
 // Package combat_agent 提供操盘战斗 Agent 的核心评分逻辑。
 // D1Scorer 负责对个股进行 D1 级别的事件驱动评分，依赖 LLM 分析新闻事件与行情数据。
 // 评分维度（含优先级）：负面过滤(blocked) > 顶级影响 > 间接影响 > 中等影响 > 低影响，
-// 输出 0.0~1.0 的归一化分数并附 LLM 分析理由。
+// 输出 0~40 满分制分数（对应 N 形 D1 事件维度）并附 LLM 分析理由。
+// D1 分独立于"板块利好/利空事件分"（HotTopic.Score / SectorHot.Score，0~1，仅作评分上下文），
+// 由 LLM 按 40 分制独立核定，避免两者混用。
 // English: provides D1 event-driven scoring per stock, using the LLM to analyze news events and market
 // data. Scoring dimensions by priority: negative filter (blocked) > top impact > indirect > medium >
-// low; outputs a normalized 0.0~1.0 score with an LLM reason.
+// low; outputs a 0~40 grade (the N-shape D1 event dimension) with an LLM reason. D1 is decoupled from
+// the sector bull/bear event score (HotTopic.Score / SectorHot.Score, 0~1, used only as scoring context)
+// and graded independently on the 40-point scale to avoid conflating the two.
 package combat_agent
 
 import (
@@ -20,12 +24,12 @@ import (
 )
 
 // D1Score 表示单只个股的 D1 事件评分结果。
-// Score 范围 0.0~1.0，Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
-// English: D1 event-scoring result for a single stock — Score in 0.0~1.0, Blocked means the negative
-// filter tripped, Reason is the LLM analysis.
+// Score 范围 0~40（对应 N 形 D1 维度满分 40），Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
+// English: D1 event-scoring result for a single stock — Score in 0~40 (the N-shape D1 dimension max),
+// Blocked means the negative filter tripped, Reason is the LLM analysis.
 type D1Score struct {
 	Code    string  `json:"code"`    // 股票代码
-	Score   float64 `json:"score"`   // 评分值，0.0~1.0，越高越值得关注
+	Score   float64 `json:"score"`   // 评分值，0~40，越高越值得关注
 	Blocked bool    `json:"blocked"` // 是否被负面过滤拦截（利空事件命中）
 	Reason  string  `json:"reason"`  // LLM 给出的评分分析理由
 }
@@ -40,6 +44,7 @@ type D1Scorer struct {
 	yamlContent  string        // events_leftside.yaml 原始内容，作为 LLM prompt 参考
 	maxAttempts  int           // D1 LLM 调用轮询重试次数（含首次），默认 5；0/负回退默认
 	retryBackoff time.Duration // 相邻两次重试的基础间隔
+	sectorEvents map[string]string // 代码→所属板块事件标题（板块事件传导 D1：个股不在新闻点名里也能拿到板块利好作为评分上下文）
 }
 
 // defaultMaxAttempts 默认 D1 LLM 轮询重试次数（含首次）。
@@ -58,7 +63,17 @@ func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 		yamlContent:  yamlContent,
 		maxAttempts:  defaultMaxAttempts,
 		retryBackoff: 2 * time.Second,
+		sectorEvents: make(map[string]string),
 	}
+}
+
+// SetSectorEvents 设置"代码→所属板块事件标题"映射，用于把板块级别事件传导到个股的 D1 评分上下文。
+// 个股即使不在新闻点名的 RelatedStocks 里，只要所属热点板块有正向事件，也能获得该事件标题供 LLM 合理打分。
+// English: sets the code→sector-event-title map used to relay sector-level events into per-stock D1
+// scoring context, so a constituent of a hot sector with a bullish event gets a fair score even when
+// the news didn't name it individually.
+func (ds *D1Scorer) SetSectorEvents(m map[string]string) {
+	ds.sectorEvents = m
 }
 
 // SetMaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。
@@ -76,22 +91,32 @@ func (ds *D1Scorer) SetMaxRetries(n int) int {
 
 // d1SystemPrompt 是 D1 评分的系统级提示词，定义评分优先级规则和输出格式。
 // LLM 根据该提示词对个股关联事件进行分级打分（负面过滤/顶级影响/间接影响/中等影响/低影响）。
-// English: the system prompt for D1 scoring, defining priority rules and the JSON output format that the
-// LLM uses to grade linked events of each stock.
+// 打分采用 0~40 满分制（对应 N 形 D1 维度：事件驱动硬闸，满分 40，信号需 D1>0）。
+// English: the system prompt for D1 scoring. The LLM grades each stock's linked events on a 0~40 scale
+// (the N-shape D1 event-gate dimension, max 40; a signal needs D1>0).
 var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个股基于关联事件进行D1评分。
 
+评分采用 0~40 满分制，对应 N 形策略的 D1 事件驱动维度（满分 40，信号需 D1>0 且 总分≥60）。
+分数越高代表该股的事件驱动越强、越值得关注；请给出明确的正向分值，避免一律给极低分。
+
 按优先级：
-1. 负面过滤(negative_filter): score=0, blocked=true — 立案/减持/质押/解禁等
-2. 顶级影响(top_impact): score=0.4~1.0 — 政策/技术突破/并购重组等
-3. 间接影响(indirect): score=0.3~0.6 — 板块情绪传导等
-4. 中等影响(medium_impact): score=0.2~0.5 — 业绩/回购/涨价等
-5. 低影响(low_impact): score=0.0~0.2 — 普通公告/调研等
+1. 负面过滤(negative_filter): score=0, blocked=true — 立案/减持/质押/解禁/被调查等
+2. 顶级影响(top_impact): score=16~40 — 政策/技术突破/并购重组/龙头大额回购等
+3. 间接影响(indirect): score=12~24 — 板块情绪传导/上游下游联动等
+4. 中等影响(medium_impact): score=8~20 — 业绩/回购/涨价/订单等
+5. 低影响(low_impact): score=0~8 — 普通公告/机构调研等
+
+注意：
+- 若给到的"关联事件"是热点板块级别事件（光模块/算力/AI/半导体等产业链利好），
+  应按该板块事件的利好强度给该股一个与其绑定的合理分值，而非 0 或极低的 0~4 分。
+- 仅当确实无任何利好事件、且无板块关联时才给低分。
+- 只有命中负面过滤（立案/减持/质押/解禁等明确利空）时才 blocked=true 并给 0 分。
 
 详细规则见下方参考。
 
 输出JSON数组：
 [
-  {"code":"600519","score":0.0~1.0,"blocked":true/false,"reason":"评分理由"}
+  {"code":"600519","score":0~40,"blocked":true/false,"reason":"评分理由"}
 ]
 只输出JSON数组，不要多余文字。`
 
@@ -184,6 +209,11 @@ func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events
 		sb.WriteString("\n\n")
 	}
 
+	// 无实质事件集合：既无个股关联新闻、也无板块正向事件的个股，D1 一律归 0
+	// （不允许 LLM 给"无特定事件"占位低分，否则会当作有效 D1 触发左侧买入并固化提醒）。
+	// English: stocks with no substantive event (no individual news match and no bullish sector event)
+	// are forced to D1=0 so a placeholder low score can't act as a valid D1 that fires/gets pinned.
+	noEvent := make(map[string]bool, len(codes))
 	for i, code := range codes {
 		sb.WriteString(fmt.Sprintf("%d. 代码: %s\n", i+1, code))
 		md := marketData[code]
@@ -197,11 +227,21 @@ func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events
 				sb.WriteString(fmt.Sprintf("   价格: %.2f  涨跌幅: %.2f%%\n", md.Price, md.ChangePct))
 			}
 		}
-		// 事件描述来自 events：按 代码 或 名称 匹配关联新闻标题（板块级新闻只带个股名称，须名称兜底）
+		// 事件描述：先按 代码/名称 匹配关联新闻标题；未命中但该股所属热点板块有正向事件时，
+		// 注入板块事件标题作为 D1 评分上下文，避免"未点名个股→无特定事件→LLM 给 0.1"。
+		// 但无任何事件关联的个股标记为 noEvent，评分后强制归 0。
+		// English: attach the linked event title — first by matching code/name against news events; when no
+		// individual event matches but the stock belongs to a hot sector with a bullish event, inject the
+		// sector event title so the LLM grades it fairly instead of "no specific event → ~0.1". Codes with
+		// no event link at all are flagged noEvent and forced to 0 afterwards.
 		eventDesc := findEventForCode(code, md, events)
+		if eventDesc == "" {
+			eventDesc = ds.sectorEvents[code]
+		}
 		if eventDesc != "" {
 			sb.WriteString(fmt.Sprintf("   关联事件: %s\n", eventDesc))
 		} else {
+			noEvent[code] = true
 			sb.WriteString("   关联事件: 无特定事件\n")
 		}
 		sb.WriteString("\n")
@@ -246,9 +286,9 @@ func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events
 
 	for _, r := range raw {
 		if r.Code != "" {
-			// 分数越界防护：裁剪到 0.0~1.0
-			if r.Score > 1.0 {
-				r.Score = 1.0
+			// 分数越界防护：裁剪到 0~40
+			if r.Score > 40 {
+				r.Score = 40
 			}
 			if r.Score < 0 {
 				r.Score = 0
@@ -262,6 +302,23 @@ func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events
 	for _, code := range codes {
 		if _, ok := result[code]; !ok {
 			ds.fillFallback(result, []string{code}, fallback, "LLM未返回")
+		}
+	}
+
+	// 无实质事件（无个股新闻、无板块正向事件）的个股 D1 强制归 0：
+	// 不允许 LLM 给"无特定事件"占位低分充当有效 D1。同时清除可能残留的占位理由，
+	// 避免该股凭 0 分之上的一点点占位分被当作有效 D1 触发买入/固化提醒。
+	// English: force D1=0 for stocks with no substantive event, so a placeholder low score can never act
+	// as a valid D1. This closes the "无特定事件 → LLM 给 0.1 → 触发左侧买入并固化" leak.
+	for code := range noEvent {
+		if r, ok := result[code]; ok {
+			if r.Score > 0 {
+				log.Printf("[D1Scorer] %s 无实质事件 → D1强制归0 (原score=%.2f reason=%s)", code, r.Score, r.Reason)
+			}
+			r.Score = 0
+			r.Blocked = false
+			r.Reason = "无特定事件，D1归0"
+			result[code] = r
 		}
 	}
 }

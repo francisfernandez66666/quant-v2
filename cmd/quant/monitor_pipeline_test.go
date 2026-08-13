@@ -365,7 +365,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 			BenchCurChg: 0.5, MinuteMACDDIF: 0.5, MinuteMACDDEA: 0.3,
 		}
 		ctx := &n_shape.Ctx{
-			LLMD1Score: 0.5, LLMBlocked: false,
+			LLMD1Score: 30, LLMBlocked: false, // D1 满分 0~40 制
 			StockPE: 12, AvgDailyVol: 100000,
 		}
 		scorer := n_shape.NewLeftSideScorer(nil)

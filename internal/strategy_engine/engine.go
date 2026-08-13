@@ -684,6 +684,14 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 	return
 }
 
+// BuildHotSectors 将事件归因出利好/利空板块候选列表（供引擎"新热点立马进池"复用）。
+// 与 Evaluate 内的 attribution 共用同一实现，幂等可重复调用。
+// （BuildHotSectors attributes events into bullish/bearish sector candidates, reusing the same logic as
+// attribution inside Evaluate so the engine can push fresh hotspots into the watch pool immediately.）
+func (e *Engine) BuildHotSectors(events []newsagent.NewsEvent) (bull, bear []SectorHot) {
+	return e.attribution(events)
+}
+
 // absScore 取评分的绝对值。（absScore returns the absolute value of a score.）
 func absScore(s float64) float64 {
 	if s < 0 {

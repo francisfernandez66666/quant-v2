@@ -2,7 +2,11 @@
 // （Package newsagent is the news agent handling fetching, Stage0 attribution, Stage1 screening, Stage2 LLM analysis and event building.）
 package newsagent
 
-import "time"
+import (
+	"time"
+
+	"quant-trading-v2/internal/data"
+)
 
 // NewsEvent 结构化新闻事件，包含 LLM 分析的级别、方向、相关板块和个股等信息。
 // Score 带符号：正值利好（+0.5 中 / +0.75 强），负值利空（-0.5 中 / -0.75 强），±0.25 弱/中性。
@@ -48,6 +52,11 @@ type Stage0Result struct {
 	// 键为 rawNews 索引。
 	// （CorrectedTitle is the clickbait-corrected title given by LLM when title diverges from body; keys are rawNews indices.）
 	CorrectedTitle map[int]string
+	// FailedIdx Stage0 判定失败的批内新闻索引（该批 LLM 重试耗尽被跳过，未完成判定）。
+	// 这些新闻应留在未归因队列由下一轮重试，而非被误归为一般新闻。
+	// （FailedIdx holds rawNews indices whose Stage0 batch was skipped after retry exhaustion; these stay
+	// in the unattributed queue for the next round rather than being misclassified as general news.）
+	FailedIdx []int
 	// Err Stage0 失败的底层原因（如 LLM 连不通导致整批归一般）。成功或无异常时为 nil。
 	// （Err is the underlying failure cause of Stage0, nil on success.）
 	Err error
@@ -70,6 +79,11 @@ type DebugInfo struct {
 type TrackerData struct {
 	SeenTitles map[string]string `json:"seen_titles"` // md5(title) → datetime：已处理标题及其时间
 	LastSync   map[string]string `json:"last_sync"`   // source → latest_datetime：各来源最近同步时间
+	// PendingItems 未归因队列：已抓取但 Stage0/Stage2 尚未成功归因的新闻（完整内容），
+	// 供下一轮盘前/盘中重试。成功归因后移入 SeenTitles。
+	// （PendingItems is the unattributed queue: fetched news that has not yet been successfully attributed
+	// by Stage0/Stage2 (full content kept), retried in later rounds; removed once attributed.）
+	PendingItems []data.NewsItem `json:"pending_items,omitempty"`
 }
 
 // FrozenEvent 固化事件：保留 Stage2 分析出的利好/利空价值及其关联个股，跨盘前刷新持续存在。

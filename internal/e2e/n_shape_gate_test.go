@@ -12,7 +12,7 @@ import (
 
 // gateInput 构造一组 D1~D4 可控的评分输入。
 type gateInput struct {
-	llmD1Score    float64 // LLM D1 评分（0.0~1.0，calcD1 ×MaxD1 映射到 0~40）
+	llmD1Score    float64 // LLM D1 评分（0~40，calcD1 直接采用，不再乘 MaxD1）
 	stockPE       float64 // D3：PE<15 → 满 20 分
 	auctionChgPct float64 // D2a：1.5~5 → 15 分
 	volRatio      float64 // D2b/D4b 量比（相对 20 日均量×时间进度）
@@ -65,7 +65,7 @@ func evaluate(in gateInput) *n_shape.ScoreResult {
 func TestNShapeGateD1AndTotal(t *testing.T) {
 	t.Run("D1有分_总分>=60_出信号", func(t *testing.T) {
 		res := evaluate(gateInput{
-			llmD1Score:    0.5,               // d1 = 20
+			llmD1Score:    20,                // d1 = 20
 			stockPE:       10,                // d3 = 20
 			auctionChgPct: 2.0,               // d2a = 15
 			volRatio:      2.0,               // d2b = 8, d4b 放量
@@ -82,7 +82,7 @@ func TestNShapeGateD1AndTotal(t *testing.T) {
 
 	t.Run("D1有分_总分<60_不出信号", func(t *testing.T) {
 		res := evaluate(gateInput{
-			llmD1Score: 0.5, // d1 = 20
+			llmD1Score: 20, // d1 = 20
 			// D2/D3/D4 全无效 → 总分 = 20 < 60
 			stockPE: 100, auctionChgPct: 0, volRatio: 0, macdDIF: -1, macdDEA: 0,
 		})
@@ -96,7 +96,7 @@ func TestNShapeGateD1AndTotal(t *testing.T) {
 
 	t.Run("无D1分_总分>=60_不出信号", func(t *testing.T) {
 		res := evaluate(gateInput{
-			llmD1Score:    0.0,               // d1 = 0，无 D1 分
+			llmD1Score:    0,                 // d1 = 0，无 D1 分
 			stockPE:       10,                // d3 = 20
 			auctionChgPct: 2.0,               // d2a = 15
 			volRatio:      2.0,               // d2b = 8

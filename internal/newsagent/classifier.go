@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -154,21 +155,33 @@ type combinedJudge struct {
 }
 
 // classifyCombined 合并 Stage0 垃圾过滤 + Stage1 价值初筛 + 标题党复核 为单次 LLM 分批调用。
-// 失败走轮询重试（每批最多3次、间隔递增），仍失败返回错误，由调用方将整批归一般（不降级关键词）。
+// 返回失败批的全局索引（failedBatches）：某批重试队列用尽被跳过时，其新闻未被判定，
+// 由调用方将失败批新闻留在"未归因队列"供下一轮重试，而不是错误归为一般新闻。
+// 失败走轮询重试（每批最多3次、间隔递增）。
 // （classifyCombined merges Stage0 junk filtering + Stage1 value screening + clickbait review into batched LLM
-// calls; on retry exhaustion it returns an error for the caller to classify the whole batch as general.）
-func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, error) {
+// calls. It also returns the global indices of failed batches: when a batch's retry queue is exhausted and it is
+// skipped, those news were never judged, so the caller keeps them in the unattributed queue for the next round
+// instead of misclassifying them as general news. Failures use polling retries with backoff.）
+func (a *Agent) classifyCombined(titles, bodies []string) (judgements []combinedJudge, failedBatches []int, err error) {
 	n := len(titles)
 	out := make([]combinedJudge, n)
 	if n == 0 {
-		return out, nil
+		return out, nil, nil
 	}
 	if a.llmClient == nil {
 		log.Printf("[newsagent] LLM未配置, Stage0/1合并跳过")
-		return out, fmt.Errorf("LLM未配置")
+		return out, nil, fmt.Errorf("LLM未配置")
 	}
 
-	// 按 llmBatchSize 分块调用，控制单批 prompt 体积避免超时
+	// 按 llmBatchSize 分块并**并发**调用，控制单批 prompt 体积避免超时的同时提高归因吞吐。
+	// 并发度取自 LLM 客户端 BatchConcurrency（前端可热改）。
+	concurrency := llmRetryMax // 兜底并发度
+	if a.llmClient != nil {
+		concurrency = a.llmClient.BatchConcurrency()
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	for _, b := range batchBounds(n, llmBatchSize) {
 		start, end := b[0], b[1]
 		// 拼装批内 prompt：序号 + 标题 + 截断后的正文（供标题党复核）
@@ -178,27 +191,40 @@ func (a *Agent) classifyCombined(titles, bodies []string) ([]combinedJudge, erro
 			sb.WriteString(fmt.Sprintf("%d. %s\n正文: %s\n", i-start+1, titles[i], body))
 		}
 
-		// 调用+解析统一进重试队列：API 连接失败 与 JSON 解析失败 都纳入轮询重试
-		//（解析失败不再直接吞掉，而是与调用失败同样退避重试）。
-		// 该批重试到头仍解析不出 → 隔离跳过本批（丢本批，不影响主干其余批次）。
-		raw, err := a.stage0ParseRetry(sb.String())
-		if err != nil {
-			os.WriteFile("/tmp/5t0_fail_"+time.Now().Format("150405")+".json", []byte(sb.String()), 0o644)
-			log.Printf("[newsagent] Stage0/1合并 该批%d条重试队列用尽仍解析失败, 跳过本批(主干继续): %v", end-start, err)
-			continue
-		}
-		// 将批内序号映射回全局索引并落盘到结果切片（越界序号安全忽略）
-		for _, r := range raw {
-			if r.Index < 1 || int(r.Index) > end-start {
-				continue
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(start, end int, sb strings.Builder) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// 调用+解析统一进重试队列：API 连接失败 与 JSON 解析失败 都纳入轮询重试
+			//（解析失败不再直接吞掉，而是与调用失败同样退避重试）。
+			// 该批重试到头仍解析不出 → 记录失败批索引（丢本批判定，但不影响主干其余批次），
+			// 交由调用方把该批新闻留在未归因队列下一轮重试。
+			raw, err := a.stage0ParseRetry(sb.String())
+			if err != nil {
+				os.WriteFile("/tmp/5t0_fail_"+time.Now().Format("150405")+".json", []byte(sb.String()), 0o644)
+				log.Printf("[newsagent] Stage0/1合并 该批%d条重试队列用尽仍解析失败, 标记失败批(主干继续): %v", end-start, err)
+				mu.Lock()
+				for i := start; i < end; i++ {
+					failedBatches = append(failedBatches, i)
+				}
+				mu.Unlock()
+				return
 			}
-			idx := start + int(r.Index) - 1
-			out[idx].Official = strings.EqualFold(r.Category, "official")
-			out[idx].Material = bool(r.Material)
-			out[idx].CorrectedTitle = strings.TrimSpace(r.Corrected)
-		}
+			// 将批内序号映射回全局索引并落盘到结果切片（越界序号安全忽略）
+			for _, r := range raw {
+				if r.Index < 1 || int(r.Index) > end-start {
+					continue
+				}
+				idx := start + int(r.Index) - 1
+				out[idx].Official = strings.EqualFold(r.Category, "official")
+				out[idx].Material = bool(r.Material)
+				out[idx].CorrectedTitle = strings.TrimSpace(r.Corrected)
+			}
+		}(start, end, sb)
 	}
-	return out, nil
+	wg.Wait()
+	return out, failedBatches, nil
 }
 
 // stage0EmptyValueRe 匹配对象键与空值畸形：`"key":]` 或 `"key":}`（模型丢了值直接写括号）。
@@ -366,7 +392,8 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 		bodies[i] = it.Content
 	}
 
-	judgements, err := a.classifyCombined(titles, bodies)
+	judgements, failedBatches, err := a.classifyCombined(titles, bodies)
+	res.FailedIdx = failedBatches
 	if err != nil {
 		// 不兜底：整批归一般（仅展示），下一轮轮询可重新拉取
 		res.Err = err
@@ -377,9 +404,19 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 		return res
 	}
 
+	// 失败批（LLM 重试耗尽被跳过的批）：保留在未归因队列供下一轮重试，
+	// 不归一般/个股/板块（避免失败批被误判为"一般新闻"而丢失昨夜有价值信息）。
+	failedSet := make(map[int]bool, len(failedBatches))
+	for _, f := range failedBatches {
+		failedSet[f] = true
+	}
+
 	res.Material = make(map[int]bool)
 	res.CorrectedTitle = make(map[int]string)
 	for i, item := range items {
+		if failedSet[i] {
+			continue
+		}
 		j := judgements[i]
 		// 规则一：非官方来源（机构观点/互动/海外盘面）直接归一般，仅展示不进引擎
 		if !j.Official {

@@ -6,7 +6,6 @@ import (
 	"context"
 	"testing"
 
-	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -19,24 +18,22 @@ func TestMergeSectorStocksSkipsCovered(t *testing.T) {
 			"600001": {Code: "600001"}, // 已覆盖
 		},
 	}
-	d1 := map[string]combat_agent.D1Score{}
 	pe := map[string]float64{}
 	vs := []sector_agent.VerifiedSector{{Name: "贵金属", Score: 0.5, Stocks: []string{"600001", "600002"}}}
 	// 无行情/策略引擎：未配置时应安全返回，不得 panic
-	e.mergeSectorStocksIntoScores(context.Background(), sr, vs, nil, d1, pe)
+	e.mergeSectorStocksIntoScores(context.Background(), sr, vs, nil, pe)
 	if _, ok := sr.MarketData["600002"]; ok {
 		t.Fatal("未配置行情引擎时不得写入 MarketData")
 	}
 }
 
-// TestMergeSectorStocksNoSector 验证：无板块成分股时直接返回。
+// TestMergeSectorStocksNoSector 验证：无板块成分股时直接返回，不写 MarketData。
 func TestMergeSectorStocksNoSector(t *testing.T) {
 	e := &Engine{}
 	sr := &strategy_engine.StrategyResult{MarketData: map[string]*strategy_engine.StockMarketData{}}
-	d1 := map[string]combat_agent.D1Score{}
 	pe := map[string]float64{}
-	e.mergeSectorStocksIntoScores(context.Background(), sr, nil, nil, d1, pe)
-	if len(d1) != 0 {
-		t.Fatalf("无板块时不应写入 D1, got %d", len(d1))
+	e.mergeSectorStocksIntoScores(context.Background(), sr, nil, nil, pe)
+	if len(sr.MarketData) != 0 {
+		t.Fatalf("无板块时不应写入 MarketData, got %d", len(sr.MarketData))
 	}
 }

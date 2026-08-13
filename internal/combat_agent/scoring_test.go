@@ -124,10 +124,10 @@ func TestBuildCtxD1Propagation(t *testing.T) {
 	if ctx.LLMD1Score != 0 || ctx.LLMBlocked {
 		t.Fatalf("无D1时 LLMD1Score/Blocked 应为零, got %.2f/%v", ctx.LLMD1Score, ctx.LLMBlocked)
 	}
-	// 2) 有正向 D1 → LLMD1Score 透传
-	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: 0.5, Blocked: false}, "利好事件", 0)
-	if ctx.LLMD1Score != 0.5 || ctx.LLMBlocked {
-		t.Fatalf("D1=0.5 应透传, got %.2f/%v", ctx.LLMD1Score, ctx.LLMBlocked)
+	// 2) 有正向 D1 → LLMD1Score 透传（0~40 制）
+	ctx = buildCtx(md, "", &D1Score{Code: "600000", Score: 20, Blocked: false}, "利好事件", 0)
+	if ctx.LLMD1Score != 20 || ctx.LLMBlocked {
+		t.Fatalf("D1=20 应透传, got %.2f/%v", ctx.LLMD1Score, ctx.LLMBlocked)
 	}
 	if ctx.EventDesc != "利好事件" {
 		t.Fatalf("EventDesc 未透传: %q", ctx.EventDesc)

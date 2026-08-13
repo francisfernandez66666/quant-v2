@@ -52,8 +52,8 @@ type fixSignal struct {
 
 	// 真实 D1 事件信息：区别于上面的 D1Desc（策略理由），单独展示新闻事件的 D1 分析
 	// English: real D1 event info — distinct from D1Desc (strategy reason), shown separately as the
-	// news-event D1 analysis (score 0~1, negative-filter flag, LLM reason, linked event title).
-	D1Score   float64 `json:"d1_score"`   // D1 事件评分（0~1）
+	// news-event D1 analysis (score 0~40, negative-filter flag, LLM reason, linked event title).
+	D1Score   float64 `json:"d1_score"`   // D1 事件评分（0~40）
 	D1Blocked bool    `json:"d1_blocked"` // D1 负面过滤拦截标记
 	D1Reason  string  `json:"d1_reason"`  // D1 事件分析理由（LLM）
 	D1Event   string  `json:"d1_event"`   // D1 关联事件名称

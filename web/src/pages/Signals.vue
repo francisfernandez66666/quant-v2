@@ -202,7 +202,9 @@ function shortDesc(s) {
 function d1Tag(s) {
   const label = s.d1_event || s.d1_reason || ''
   const base = shortDesc(label) || '事件'
-  const score = s.d1_score ? (s.d1_score * 100).toFixed(0) : ''
+  // D1 分数为 0~40 满分制，直接显示（不再 ×100 当作 0~1 百分比）
+  // English: the D1 score is already on the 0~40 scale, shown directly (no longer *100 as a 0~1 percent).
+  const score = s.d1_score ? s.d1_score.toFixed(0) : ''
   const blocked = s.d1_blocked ? '·拦' : ''
   return [base, score, blocked].filter(Boolean).join('')
 }
