@@ -103,3 +103,21 @@ func TestScoreStoreCorruptFile(t *testing.T) {
 		t.Fatalf("损坏文件应返回空")
 	}
 }
+
+// TestCountAction 验证 countAction 仅统计指定 Action 的信号（用于 SSE 通知只计 buy）。
+// 做多信号里 buy / watch / brief 混合时，只统计 buy。
+func TestCountAction(t *testing.T) {
+	sigs := []combat_agent.Signal{
+		{Action: "buy"},   // 全链买入 → 计入
+		{Action: "watch"}, // 观察 → 不计
+		{Action: "buy"},   // 计入
+		{Action: "brief"}, // 半确认 → 不计
+		{Action: "sell"},  // 其它动作 → 不计
+	}
+	if n := countAction(sigs, "buy"); n != 2 {
+		t.Fatalf("应只统计 2 条 buy, got %d", n)
+	}
+	if n := countAction(nil, "buy"); n != 0 {
+		t.Fatalf("空列表应为 0, got %d", n)
+	}
+}

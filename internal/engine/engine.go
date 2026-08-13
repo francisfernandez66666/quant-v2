@@ -1862,13 +1862,18 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.captureSignalRecords(len(rawNews), allSignals)
 
 	// 16. SSE 广播通知前端（附信号摘要）
+	// bull/bear 只统计可操作买入（Action=="buy"）信号：watch/brief 观察信号仍进消息中心与信号列表，
+	// 但不计入浏览器通知数量，避免观察类信号频繁弹系统通知。
+	// English: bull/bear count only actionable buy (Action=="buy") signals — watch/brief observations still
+	// land in the message center and signal list, but aren't counted for browser notifications, so
+	// watch-only signals don't spam the system notification.
 	_stepSSE := time.Now()
 	if e.sse != nil && e.sse.Len() > 0 {
 		payload := map[string]string{
 			"type":   "scan",
 			"status": "done",
-			"bull":   fmt.Sprintf("%d", len(bullSignals)),
-			"bear":   fmt.Sprintf("%d", len(bearSignals)),
+			"bull":   fmt.Sprintf("%d", countAction(bullSignals, "buy")),
+			"bear":   fmt.Sprintf("%d", countAction(bearSignals, "buy")),
 			"alert":  fmt.Sprintf("%d", len(alertSignals)),
 			"time":   time.Now().Format("15:04:05"),
 		}

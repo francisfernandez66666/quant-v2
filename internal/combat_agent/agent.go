@@ -110,18 +110,29 @@ type Agent struct {
 	// （positionDailyDropPct is the holding daily-drop alert threshold in percent; <=0 falls back to 5.）
 	positionDailyDropPct float64
 
-	waves  *WaveTracker // N 形一突/二突日内状态机（跨 5s 周期）
-	diagMu sync.Mutex   // 保护 nDiag 的并发读写
-	nDiag  []NDiag      // 本轮 N 形候选诊断条目（engine 每轮 DrainNDiag 收口）
+	waves   *WaveTracker       // N 形一突/二突日内状态机（跨 5s 周期）（N-shape first/second breakout intraday state machine, across 5s cycles）
+	dbwaves *DoubleBumpWatcher // 双响炮第二波日内确认状态机（跨 5s 周期）（Double-Bump second-wave intraday confirmation machine, across 5s cycles）
+	diagMu  sync.Mutex         // 保护 nDiag 的并发读写（guards concurrent reads/writes of nDiag）
+	nDiag   []NDiag            // 本轮 N 形候选诊断条目（engine 每轮 DrainNDiag 收口）（this round's N-shape candidate diagnostics, drained each round）
+
+	// 动量分提升门槛：每只股票记录上一轮动量分，仅当"提升/未明显回落"时才视为有实质改善。
+	// 跨交易日隔离重置，避免把前一日高动量带到今天。
+	// English: momentum-gate delta tracking — the prior-round momentum score per code; only a rise (or a
+	// fall within tolerance) counts as a meaningful improvement. Reset across trading days.
+	momentumPrev    map[string]float64
+	momentumPrevDay string
+	momentumPrevMu  sync.Mutex
 }
 
 // New 创建战法引擎实例。
 // English: creates a new combat engine instance.
 func New(cfg *config.StrategyConfig) *Agent {
 	return &Agent{
-		strategyCfg: cfg,
-		runners:     make([]StrategyRunner, 0),
-		waves:       NewWaveTracker(),
+		strategyCfg:  cfg,
+		runners:      make([]StrategyRunner, 0),
+		waves:        NewWaveTracker(),
+		dbwaves:      NewDoubleBumpWatcher(),
+		momentumPrev: make(map[string]float64),
 	}
 }
 
@@ -342,6 +353,18 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	var sigs []Signal
 	var unSig []string // 未出信号战法的原因（诊断：为何非龙头战法不出信号）
 
+	// 动量分单独计算（量价+MACD+走势），作为 8a/8b 打分量的一部分；
+	// 提前到循环前算出，供"动量提升才提醒"门槛对 double_bump/龙头/龙回头 逐战法放行判断。
+	// English: momentum score (volume-price + MACD + trend) computed up front so the "improvement-only"
+	// momentum gate can be applied per strategy (double-bump / dragon / dragon-return) inside the loop.
+	momentumScore := MomentumScore(md, a.momentumWeights())
+	momentumValid := momentumDataValid(md)
+	// 注意：本轮动量分在循环结束后才 record（见函数末尾），先以"上一轮"历史值做提升门槛比较，
+	// 再写入本轮新值供下一轮比较。若在循环前提前覆盖，会丢失上一轮基准导致门槛失效。
+	// English: this round's momentum is only recorded at the end of evalAll (see below), so the
+	// improvement gate first compares against the *previous* baseline, then stores this round's value for
+	// next round. Recording it earlier would overwrite the baseline before comparison and break the gate.
+
 	// 战法评分并发化：同一只股票的各战法评分彼此独立（无共享可变状态），
 	// 并发调用 evalFor 后按原 runner 顺序合并处理，保证信号顺序与波状态机确定性。
 	// English: each strategy's scoring on one stock is independent, so scoring is parallelized and results
@@ -444,6 +467,33 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			unSig = append(unSig, fmt.Sprintf("%s:%s(%.0f)", strategyLabel(runner.Type), eval.Level, eval.TotalScore))
 			continue
 		}
+		// 双响炮第二波日内确认（叠加在 volScore>0 硬闸之上）：即便日K评分已满 volScore，
+		// 也要等日内状态机推进到第二波突破（PhaseSecond）才放行买入；未到第二波则记分并提示"待二波"。
+		// 竞价/盘前（Volume=0）无真实成交，状态机不推进 → 不会误放行假双凸。
+		// English: Double-Bump second-wave intraday confirmation stacked on the volScore>0 hard gate —
+		// even when the daily-bar score already has volScore, the buy only fires once the intraday state
+		// machine reaches the second breakout (PhaseSecond); otherwise record the score and note "待二波".
+		// Pre-open (Volume=0) has no real trades, so the machine won't advance and can't falsely confirm.
+		if runner.Type == strategy.SignalDoubleBump {
+			if !mdEmpty(md) {
+				dbc := a.doubleBumpConfig()
+				if !a.dbwaves.Confirm(code, md, dbc) {
+					unSig = append(unSig, strategyLabel(runner.Type)+":待二波")
+					continue
+				}
+			}
+		}
+		// 动量分"提升才提醒"门槛：仅套用 非N形 战法（double_bump/龙头/龙回头），N 形不套用。
+		// 开启时，动量分未提升/明显回落（且数据有效）则拦截该战法信号，避免反复刷同一条提醒。
+		// English: the momentum "improvement-only" gate applies only to non-N strategies (double-bump /
+		// dragon / dragon-return); N-shape is exempt. When enabled and momentum hasn't improved (with valid
+		// data), the strategy signal is withheld to avoid re-flooding the same alert.
+		if a.momentumGateEnabled() && runner.Type != strategy.SignalNShape {
+			if !a.momentumImproved(code, momentumScore, momentumValid) {
+				unSig = append(unSig, strategyLabel(runner.Type)+":动量未提升")
+				continue
+			}
+		}
 		// 通过的战法生成交易信号，失败或为空则跳过
 		// English: passed strategies generate a trade signal; skip on failure or empty result.
 		sig, err := runner.Strategy.GenerateSignal(code, eval)
@@ -456,6 +506,16 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		action := string(sig.Action)
 		if action == "" {
 			action = "watch"
+		}
+		// B2 式固化可撤销修正：策略 GenerateSignal 常不填触发价（Price=0），导致上层
+		// invalidateBrokenSignals 因"触发价无效"跳过，固化信号跌破现价也不会被撤销。
+		// 这里用现价 md.Price 兜底触发价，使"现价跌破触发价→撤销固化"的校验真正生效。
+		// English: fix for pinned-signal invalidation — GenerateSignal often leaves the trigger price
+		// (Price) as 0, so invalidateBrokenSignals skips it and a pinned buy wouldn't be revoked when the
+		// price breaks below. Falling back to the live price md.Price makes the "below-trigger -> revoke" check work.
+		sigPrice := sig.Price
+		if sigPrice <= 0 {
+			sigPrice = md.Price
 		}
 		sigReason := sig.Reason
 		if runner.Type == strategy.SignalNShape {
@@ -483,17 +543,17 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			Direction:   direction,
 			Action:      action,
 			Tag:         nShapeTag(eval),
-			Price:       sig.Price,
+			Price:       sigPrice,
 			Confidence:  sig.Confidence,
 			Reason:      sigReason,
 			Sector:      sectorName,
 			GeneratedAt: now,
 		})
 	}
-	// 动量分单独计算（量价+MACD+走势），作为 8a/8b 打分量的一部分
-	// English: the momentum score (volume-price + MACD + trend) is computed separately as part of 8a/8b.
-	sc.MomentumScore = MomentumScore(md, a.momentumWeights())
-	sc.MomentumValid = momentumDataValid(md)
+	// 动量分已在循环前计算并写入下方 sc（保持 8a/8b 打分量输出一致）
+	// English: momentum score was already computed before the loop; assign it to keep 8a/8b output stable.
+	sc.MomentumScore = momentumScore
+	sc.MomentumValid = momentumValid
 	sc.SignalActive = len(sigs) > 0
 
 	// Q2: 动量分达到阈值且四战法均未出信号时，补一条 watch 观察信号
@@ -526,6 +586,10 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	}
 	sc.UpdatedAt = now
 	input.Scores[code] = sc
+	// 在全部战法/动量门槛判定完成后，才记录本轮动量分作为下一轮的提升基准。
+	// English: only after all strategies & the momentum gate have been evaluated, store this round's
+	// momentum score as the baseline for next round's improvement check.
+	a.momentumRecord(code, momentumScore)
 	// 战法评分日志：code + 各维度分 + 是否命中（FLOW 全流程日志要求）
 	// 附加"未出"原因（diagnostic）：各战法未出信号的具体原因，便于排查非龙头为何不出分/不发声。
 	// English: scoring log — code + each dimension score + hit flag (FLOW requirement), plus a diagnostic
@@ -598,6 +662,95 @@ func (a *Agent) momentumSignalThreshold() float64 {
 		return 60
 	}
 	return w.SignalThreshold
+}
+
+// momentumGateEnabled 读取动量分"提升才提醒"门槛开关（默认开）。
+// 开关经前端 Settings 动量分组切换，随策略配置热更新即时生效。
+// English: reads the momentum "improvement-only" gate switch (default on). Toggled from the frontend
+// Settings momentum group and hot-reloaded live.
+func (a *Agent) momentumGateEnabled() bool {
+	w := a.momentumWeights()
+	return w.MomentumGateEnabled
+}
+
+// momentumDeltaTol 读取动量分回落容忍差（默认 5）。
+// English: reads the momentum delta tolerance (default 5).
+func (a *Agent) momentumDeltaTol() float64 {
+	w := a.momentumWeights()
+	if w.MomentumDeltaTol <= 0 {
+		return 5
+	}
+	return w.MomentumDeltaTol
+}
+
+// doubleBumpConfig 读取双响炮配置（nil 防护，回退零值结构）。
+// English: reads the Double-Bump config (nil-safe, falls back to a zero struct).
+func (a *Agent) doubleBumpConfig() config.DoubleBumpConfig {
+	a.mu.RLock()
+	cfg := a.strategyCfg
+	a.mu.RUnlock()
+	if cfg == nil {
+		return config.DoubleBumpConfig{}
+	}
+	return cfg.DoubleBump
+}
+
+// mdEmpty 判断行情快照是否为空（nil 或缺现价）。
+// English: reports whether the market snapshot is empty (nil or missing live price).
+func mdEmpty(md *strategy_engine.StockMarketData) bool {
+	return md == nil || md.Price <= 0
+}
+
+// momentumPrevious 读取该股上一轮动量分（跨交易日隔离出重置）。
+// 返回（上一轮动量分, 是否已有记录）。
+// English: returns the prior round's momentum score for the code (isolated per trading day).
+// Returns (prior score, whether a record exists).
+func (a *Agent) momentumPrevious(code string) (float64, bool) {
+	a.momentumPrevMu.Lock()
+	defer a.momentumPrevMu.Unlock()
+	day := data.TradingDayDate(time.Now())
+	if a.momentumPrevDay != day {
+		// 跨交易日：重置历史，避免把上一交易日的动量带到今天
+		// English: new trading day resets history so yesterday's momentum isn't carried into today.
+		a.momentumPrev = make(map[string]float64)
+		a.momentumPrevDay = day
+		return 0, false
+	}
+	v, ok := a.momentumPrev[code]
+	return v, ok
+}
+
+// momentumRecord 记录该股本轮动量分（供下一轮提升门槛比较）。
+// English: records this round's momentum score for the code (for the next round's improvement gate).
+func (a *Agent) momentumRecord(code string, score float64) {
+	a.momentumPrevMu.Lock()
+	defer a.momentumPrevMu.Unlock()
+	day := data.TradingDayDate(time.Now())
+	if a.momentumPrevDay != day {
+		a.momentumPrev = make(map[string]float64)
+		a.momentumPrevDay = day
+	}
+	a.momentumPrev[code] = score
+}
+
+// momentumImproved 判断动量分相对上一轮是否"提升/未明显回落"（当前 ≥ 上一轮 − 容忍差）。
+// hasPrev 为 true 且未达到该条件时返回 false（应被门槛拦截）；无上一轮记录或数据无效时放行。
+// English: reports whether the current momentum score improved (or fell within tolerance) vs the prior
+// round (current >= prior - tolerance). Returns false only when a prior record exists and the condition
+// fails; missing prior history or invalid data always passes.
+func (a *Agent) momentumImproved(code string, cur float64, valid bool) bool {
+	// 动量数据无效（竞价/盘前 Volume=0 等）→ 跳过门槛放行
+	// English: invalid momentum data (auction/pre-open Volume=0) -> skip the gate and let it through.
+	if !valid {
+		return true
+	}
+	prev, has := a.momentumPrevious(code)
+	if !has {
+		// 无上一轮记录（本轮为该股首轮评分）→ 视为起点，放行
+		// English: no prior record (first round for this code this session) -> treated as a baseline, pass.
+		return true
+	}
+	return cur >= prev-a.momentumDeltaTol()
 }
 
 // strategyDataInsufficient 判断某战法类型的输入数据是否不足（不足时得分 0 不代表真实 0 分）。

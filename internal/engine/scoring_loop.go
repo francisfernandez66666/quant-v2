@@ -312,6 +312,18 @@ func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMar
 	}
 }
 
+// countAction 统计信号列表中指定 Action 的条数（如只统计 "buy"，用于 SSE 通知计数）。
+// English: counts how many signals carry the given Action (e.g. only "buy"), used for SSE notification counts.
+func countAction(sigs []combat_agent.Signal, action string) int {
+	n := 0
+	for _, s := range sigs {
+		if s.Action == action {
+			n++
+		}
+	}
+	return n
+}
+
 // filterTransitionSignals 状态翻转去重（纯函数）：返回本轮应广播的信号 + 下一轮去重状态。
 // 仅当某股某战法从 非Pass → Pass 翻转时广播；持续 Pass 不重发；翻回后再翻上会再发。
 func filterTransitionSignals(sigs []combat_agent.Signal, prev map[string]map[string]bool) (emit []combat_agent.Signal, next map[string]map[string]bool) {

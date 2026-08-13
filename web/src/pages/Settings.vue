@@ -85,7 +85,13 @@
       <!-- 分组内各字段输入行：step/type 由字段定义控制（Per-field input rows inside a group; step/type come from the field definition）-->
       <div class="setting-row" v-for="f in group.fields" :key="f.k">
         <label :title="f.hint || ''">{{ f.label }}</label>
-        <input v-model.number="strategyCfg[group.key][f.k]"
+        <!-- switch 字段渲染为开关（checkbox），其余为数字输入（switch fields render as a toggle; others as a number input）-->
+        <label v-if="f.type === 'switch'" class="switch">
+          <input type="checkbox" v-model="strategyCfg[group.key][f.k]" />
+          <span class="slider"></span>
+        </label>
+        <input v-else
+               v-model.number="strategyCfg[group.key][f.k]"
                :type="f.type || 'number'"
                :step="f.type === 'number' ? (f.step || 'any') : undefined"
                placeholder="0" />
@@ -260,14 +266,22 @@ const strategyGroups = [
     ],
   },
   {
-    key: 'momentum', title: '动量分权重（合计建议=100）',
-    fields: [
-      { k: 'volume_price_weight', label: '量价权重', step: 5 },
-      { k: 'macd_weight', label: 'MACD权重', step: 5 },
-      { k: 'trend_weight', label: '走势权重', step: 5 },
-    ],
-  },
-]
+     key: 'momentum', title: '动量分权重（合计建议=100）',
+     fields: [
+       { k: 'volume_price_weight', label: '量价权重', step: 5 },
+       { k: 'macd_weight', label: 'MACD权重', step: 5 },
+       { k: 'trend_weight', label: '走势权重', step: 5 },
+       // 动量"提升才提醒"开关：开启后仅当动量分提升(或回落≤容忍差)才放行 双响炮/龙头/龙回头 战法信号；N形不受影响
+       // Momentum "improvement-only" toggle: when on, double-bump / dragon / dragon-return signals only
+       // pass when the momentum score improved (or fell within tolerance); N-shape is unaffected.
+       { k: 'momentum_gate_enabled', label: '动量提升才提醒', type: 'switch', hint: '开启后仅当动量分提升(或回落≤容忍差)才放行 双响炮/龙头/龙回头 战法信号；N形不受影响' },
+       // 回落容忍差(分)：相对上一轮动量分回落 ≤ 该值仍视为提升；设为 0 表示需严格不回落
+       // Momentum delta tolerance (points): a fall from the prior score within this value still counts as
+       // improvement; set to 0 for strictly no-fallback.
+       { k: 'momentum_delta_tol', label: '回落容忍差(分)', step: 1, hint: '动量分相对上一轮回落 ≤ 该值仍视为提升；设为0表示需严格不回落' },
+     ],
+   },
+ ]
 
 /** 保存战法参数到后端并持久化 */
 /** Save the strategy parameters to the backend for persistence */
@@ -276,7 +290,7 @@ async function saveStrategy() {
   strategyMsg.value = ''
   try {
     await api.setStrategyConfig(strategyCfg.value)
-    strategyMsg.value = '战法参数已保存，重启后端生效'
+    strategyMsg.value = '战法参数已保存，热更新即时生效'
     strategyMsgType.value = 'ok'
   } catch (e) {
     strategyMsg.value = '保存失败: ' + (e.message || '未知错误')

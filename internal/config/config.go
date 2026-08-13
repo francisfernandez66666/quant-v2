@@ -186,6 +186,15 @@ type MomentumConfig struct {
 	MACDWeight        float64 `json:"macd_weight"`         // MACD分权重（0~100）
 	TrendWeight       float64 `json:"trend_weight"`        // 走势分权重（0~100）
 	SignalThreshold   float64 `json:"signal_threshold"`    // 动量分触发信号阈值（默认 60）
+	// MomentumGateEnabled 动量分"提升才提醒"门槛开关：开启后仅当动量分明显提升时
+	// 才放行 double_bump/龙头/龙回头 战法信号（N 形不套用）。可热更新，前端 Settings 动量分组内开关控制。
+	// English: momentum-gate switch — when on, only a meaningful momentum-score improvement lets the
+	// double-bump / dragon / dragon-return strategies pass their signal (N-shape is exempt).
+	MomentumGateEnabled bool `json:"momentum_gate_enabled"`
+	// MomentumDeltaTol 动量分回落容忍差：当前动量分 ≥ 上一轮 − 该值 视为"未明显回落"，仍算提升。
+	// 默认 5 分。English: momentum delta tolerance — current score >= prior - tolerance still counts as
+	// an improvement (no obvious fall). Default 5.
+	MomentumDeltaTol float64 `json:"momentum_delta_tol"`
 }
 
 // DragonConfig 龙头战法参数：多因子权重、回撤止盈止损阈值、买入条件等。
@@ -498,10 +507,12 @@ func defaultStrategyConfig() StrategyConfig {
 			TrailingDrawback:   0.08,
 		},
 		Momentum: MomentumConfig{
-			VolumePriceWeight: 40,
-			MACDWeight:        30,
-			TrendWeight:       30,
-			SignalThreshold:   60,
+			VolumePriceWeight:   40,
+			MACDWeight:          30,
+			TrendWeight:         30,
+			SignalThreshold:     60,
+			MomentumGateEnabled: true, // 动量"提升才提醒"默认开启
+			MomentumDeltaTol:    5,
 		},
 	}
 }
