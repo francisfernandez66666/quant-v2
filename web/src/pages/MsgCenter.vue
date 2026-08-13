@@ -22,6 +22,15 @@
       </button>
     </div>
 
+    <!-- 战法策略分类栏：按 strategy 字段分组筛选交易信号（Strategy classifier bar: filter trade signals by the strategy field）-->
+    <div class="filter-row strategy-row" v-if="activeFilter === 'all' || activeFilter === 'trade' || activeFilter === 'strategy'">
+      <button v-for="s in strategyOptions" :key="s"
+        :class="['filter-btn', activeStrategy === s ? 'active' : '']"
+        @click="activeStrategy = (activeStrategy === s ? 'all' : s)">
+        {{ s }}
+      </button>
+    </div>
+
     <!-- 消息列表（Message list）-->
     <div class="msg-list">
       <!-- 消息卡片：等级徽标/股票代码/时间/操作徽标/删除按钮 + 标题 + 正文，按等级显示左边框颜色（Message card: level badge/code/time/action badge/delete + title + body, with a level-based left border color）-->
@@ -65,6 +74,8 @@ const alerts = ref([])               // 全部提醒消息
 // all alert messages
 const activeFilter = ref('all')      // 当前筛选类别
 // the currently active filter
+const activeStrategy = ref('all')    // 当前战法策略分类（all=全部战法）
+// the currently selected strategy classifier (all = every strategy)
 let timer = null                  // 定时轮询句柄
 // polling timer handle
 let unsubSSE = null               // SSE 取消订阅函数
@@ -85,20 +96,35 @@ const filters = [
   { key: 'hold', label: '持仓提示' },
 ]
 
+/** 消息里出现的全部战法策略（按出现次数降序），供分类栏使用 */
+/** Every strategy name appearing in the messages (descending by frequency), for the classifier bar */
+const strategyOptions = computed(() => {
+  const cnt = {}
+  for (const a of alerts.value) {
+    if (a.strategy) cnt[a.strategy] = (cnt[a.strategy] || 0) + 1
+  }
+  return Object.entries(cnt).sort((x, y) => y[1] - x[1]).map(([k]) => k)
+})
+
 /** 根据 activeFilter 过滤消息 */
 /** Filter messages by activeFilter */
 const filteredAlerts = computed(() => {
-  if (activeFilter.value === 'all') return alerts.value
-  if (activeFilter.value === 'hit') return alerts.value.filter(a => a.level === '命中提醒')
-  if (activeFilter.value === 'trade') return alerts.value.filter(a => a.level === '交易信号')
-  if (activeFilter.value === 'strategy') return alerts.value.filter(a => a.level === '策略信号')
+  let list = alerts.value
+  if (activeFilter.value === 'hit') list = list.filter(a => a.level === '命中提醒')
+  if (activeFilter.value === 'trade') list = list.filter(a => a.level === '交易信号')
+  if (activeFilter.value === 'strategy') list = list.filter(a => a.level === '策略信号')
   // 止盈止损合并过滤
   // Stop-loss and take-profit are filtered together
-  if (activeFilter.value === 'stop') return alerts.value.filter(a => a.level === '止盈' || a.level === '止损')
-  if (activeFilter.value === 'hold') return alerts.value.filter(a => a.level === '持仓提示')
-  // 默认剔除“预期差”提醒，保持战法纯净
-  // English: always filter out "Expectation Gap" reminders to keep the core strategies pristine
-  return alerts.value.filter(a => a.strategy !== '预期差')
+  if (activeFilter.value === 'stop') list = list.filter(a => a.level === '止盈' || a.level === '止损')
+  if (activeFilter.value === 'hold') list = list.filter(a => a.level === '持仓提示')
+  // 选中具体战法策略时按 strategy 精确分类
+  // English: when a specific strategy is selected, filter messages by that strategy
+  if (activeStrategy.value !== 'all') list = list.filter(a => a.strategy === activeStrategy.value)
+  // 默认剔除“预期差”提醒，保持战法纯净（选中预期差本身时保留）
+  // English: by default filter out "Expectation Gap" reminders to keep core strategies pristine,
+  // unless the user explicitly selected "预期差"
+  if (activeStrategy.value !== '预期差') list = list.filter(a => a.strategy !== '预期差')
+  return list
 })
 
 /** 根据消息等级返回卡片边框颜色类 */
@@ -202,6 +228,8 @@ onUnmounted(() => {
 .page-header h2 { font-size: 16px; color: #e0e0e0; margin-bottom: 12px; }
 .header-actions { display: flex; align-items: center; }
 .filter-row { display: flex; gap: 8px; margin-bottom: 14px; }
+/* 战法分类栏：与等级栏稍加区分（Strategy classifier row: subtle separation from the level bar）*/
+.strategy-row { margin-top: -6px; flex-wrap: wrap; }
 .btn-clear {
   padding: 6px 16px; border-radius: 6px; border: 1px solid #FF4D4F;
   background: transparent; color: #FF4D4F; font-size: 12px; cursor: pointer;
