@@ -37,6 +37,21 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
+	// 时区加固：全部交易时段判断基于 time.Local（如 CurrentSession / 主循环 sinceForSession），
+	// 服务器若在海外（如首尔 KST=UTC+9）或系统默认 UTC，会导致开盘/收盘/盘前窗口整体偏移。
+	// 统一强制 Asia/Shanghai（北京时间，A 股交易时区）；仅当外部显式设置 TZ 环境变量时遵循外部值。
+	// systemd 侧同时设置 TZ=Asia/Shanghai 双保险。
+	// English: force Asia/Shanghai as process timezone so trading-session windows (which read time.Local)
+	// align with A-share trading hours even on overseas hosts (e.g. Seoul KST) or UTC-default Ubuntu.
+	// An explicit external TZ env var overrides this default.
+	if os.Getenv("TZ") == "" {
+		os.Setenv("TZ", "Asia/Shanghai")
+		if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+			time.Local = loc
+		}
+		log.Printf("[main] 进程时区已固定为 Asia/Shanghai (北京时间), 当前 %s", time.Now().Format("2006-01-02 15:04:05 -07:00"))
+	}
+
 	// 数据目录：存放认证、配置、报告、自选等持久化文件
 	dataDir := getDataDir()
 	os.MkdirAll(dataDir, 0755)
@@ -92,6 +107,7 @@ func main() {
 	}
 	llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
 	llmCfg.Streaming = cfgMgr.Rules.LLM.StreamingEnabled()
+	llmCfg.BatchConcurrency = cfgMgr.Rules.LLM.BatchConcurrency
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
 	var llmClient *llm.Client
@@ -166,10 +182,16 @@ func main() {
 	eng.SetNotifier(notifier)
 	srv.SetEngineController(eng)
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程
-	srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int, streaming bool) {
-		lc := llm.New(llm.Config{APIKey: apiKey, APIURL: apiURL, Model: model, Timeout: time.Duration(timeoutSec) * time.Second, Streaming: streaming})
+srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) {
+		lc := llm.New(llm.Config{
+			APIKey:           apiKey,
+			APIURL:           apiURL,
+			Model:            model,
+			Timeout:          time.Duration(timeoutSec) * time.Second,
+			Streaming:        streaming,
+			BatchConcurrency: batchConcurrency,
+		})
 		eng.SetLLMClient(lc)
-		log.Printf("[LLM] 客户端已热重建: model=%s url=%s timeout=%ds stream=%v", model, apiURL, timeoutSec, streaming)
 	})
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
@@ -197,6 +219,15 @@ func main() {
 	// 情绪周期阈值注入（SSE 广播情绪阶段）
 	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
 
+	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选
+	// English: per-sector constituent coverage (default 20) — widen same-sector leaders into the pool
+	sectorTopN := cfgMgr.Rules.MainSector.SectorConstituentTopN
+	if sectorTopN <= 0 {
+		sectorTopN = 20
+	}
+	eng.SetSectorConstituentTopN(sectorTopN)
+	sAgent.SetConstituentTopN(sectorTopN)
+
 	// D1 评分 LLM 轮询重试次数（防重要信号随 LLM 偶发失败丢失）
 	eng.SetD1MaxRetries(cfgMgr.Rules.LLM.MaxRetryTimes)
 
@@ -223,7 +254,10 @@ func main() {
 	ctx := context.Background()
 	log.Println("quant-trading-v2 已启动")
 
-	// 主循环：每 5 分钟按市场时段驱动一次顶层引擎
+	// 主循环：按市场时段驱动顶层引擎。
+	// 盘前（8:30-9:15）"跑完即排下一轮"：等待异步引擎完成后立即触发下一轮，最大化新闻归因轮次，
+	// 让昨夜晚间新闻在开盘前尽可能完成 LLM 归因（配合未归因队列失败重试）；
+	// 其他时段按 5 分钟节奏推进，asyncBusy 忙锁防并发重入。
 	for {
 		now := time.Now()
 		session := data.CurrentSession(now)
@@ -231,12 +265,18 @@ func main() {
 		if ok {
 			log.Printf("[main] Session=%s 追回起始=%s", session, since.Format("01-02 15:04"))
 			if session == data.SessionPreMarket {
-				// 盘前：新闻流水线含 LLM，异步触发，避免 LLM 同步重试阻塞主循环/近实时打分
+				// 盘前：新闻流水线含 LLM，异步触发避免阻塞近实时打分；等待完成后立即排下一轮，
+				// 用 AsyncIdle 轮询替代固定 5min 间隔，保证 9:15 前尽可能多轮归因。
 				if eng.TryAsyncRun(ctx, since) {
-					log.Printf("[main] 盘前异步引擎已触发")
+					log.Printf("[main] 盘前异步引擎已触发, 等待完成后续轮")
 				} else {
-					log.Printf("[main] 盘前异步引擎仍在运行, 跳过本轮")
+					log.Printf("[main] 盘前异步引擎仍在运行, 等待其完成")
 				}
+				// 等待本轮异步引擎完成（asyncBusy 清零）再立即排下一轮
+				for !eng.AsyncIdle() {
+					time.Sleep(500 * time.Millisecond)
+				}
+				continue // 立即下一轮，不 sleep 5min
 			} else {
 				// 午前/盘中：异步触发，避免 LLM 重试阻塞主循环/近实时打分，轮次仍按 5min 节奏推进；
 				// asyncBusy 忙锁防止并发重入（上一轮未完成时本轮跳过）。

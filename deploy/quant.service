@@ -1,0 +1,49 @@
+# quant-trading-v2 systemd 单元
+# 首尔 Ubuntu 服务器上以后端进程常驻方式运行（开机自启 / 崩溃自愈 / journald 日志）。
+# 部署：见 scripts/deploy_seoul.sh。
+#
+# 说明：
+#   - 只监听 127.0.0.1，不直接暴露公网；公网 HTTPS 由 Caddy 反向代理到 8080。
+#   - TZ=Asia/Shanghai 与 main.go 的时区加固双保险，确保 A 股交易时段不错位。
+#   - LLM_API_KEY 等敏感环境变量通过 EnvironmentFile 注入，避免明文写死在 unit 里。
+#     EnvironmentFile 语法：每行 KEY=VALUE，冒号开头的行表示不可覆盖（重复则忽略）。
+
+[Unit]
+Description=quant-trading-v2 quant engine + API
+Documentation=https://github.com/anomalyco/opencode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/opt/quant
+ExecStart=/opt/quant/quant
+Restart=always
+RestartSec=5
+# 防止 OOM / 日志膨胀：限制内存与日志大小
+MemoryMax=1G
+# 硬性限流防误开
+LimitNOFILE=65535
+
+# 进程时区：A 股按北京时间（首尔 KST 或 Ubuntu UTC 会导致交易时段整体偏移）
+Environment=TZ=Asia/Shanghai
+# HTTP 只绑本机回环，公网访问走 Caddy 反代
+Environment=QUANT_ADDR=127.0.0.1:8080
+# 数据目录（认证/配置/报告/自选/新闻队列等全部 JSON 落盘于此）
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+
+# 敏感项从 /etc/quant.env 注入：LLM_API_KEY / LLM_API_URL / LLM_MODEL / TUSHARE_TOKEN
+# 未提供该文件时下方内容被忽略（EnvironmentFile 文件缺失不报错）
+EnvironmentFile=-/etc/quant.env
+
+# 加固：不继承无关环境、禁止写 /tmp 以外任意路径、禁止提权
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quant-trading-v2
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

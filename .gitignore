@@ -41,3 +41,15 @@ __pycache__/
 
 # 本地回测工具（不入库）
 bt_jq/
+
+# Android 移动端构建产物（源码入库，构建输出不入库）
+mobile/.gradle/
+mobile/build/
+mobile/app/build/
+mobile/local.properties
+mobile/.kotlin/
+mobile/keystore.jks
+mobile/gradle/wrapper/gradle-wrapper.jar
+mobile/gradle/wrapper/gradle-wrapper.jar.*
+# APK 内嵌的前端产物（由 build_apk.sh 从 web/dist 生成，不入库）
+mobile/app/src/main/assets/

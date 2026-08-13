@@ -1,0 +1,33 @@
+# quant-trading-v2 HTTPS 反向代理（Caddy）
+# 部署：见 scripts/deploy_seoul.sh。Caddy 自动申请/续期 Let's Encrypt 证书，无需手动管证书。
+#
+# 使用前：把下面的域名替换成你的真实域名（DNS A 记录指向首尔服务器 EIP）。
+# 首次部署时若域名尚未解析，Caddy 会因 ACME 验证失败启动报错——先确保 DNS 生效再 start。
+#
+# 说明：
+#   - 后端只监听 127.0.0.1:8080，这里把公网 443/80 反代过去。
+#   - /api 的 SSE(EventSource) 是长连接，Caddy 默认对 text/event-stream 不做缓冲，天然透传。
+#   - CORS 已由后端 corsMiddleware 全开（*），跨域前端（APK）可直接调用。
+
+YOUR_DOMAIN_HERE.com {
+	# 后端 API / SSE
+	reverse_proxy 127.0.0.1:8080
+
+	# 传输安全与压缩
+	encode gzip
+
+	# 请求体上限（新闻原文/LLM 咨询可能较大）
+	request_body {
+		max_size 10MB
+	}
+
+	# 日志（可关）
+	log {
+		output file /var/log/caddy/quant.access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
+
+# 说明：如无需外部日志，可把整个 log 块删掉。
