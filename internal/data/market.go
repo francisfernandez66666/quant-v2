@@ -8,6 +8,8 @@
 package data
 
 import (
+	"strconv"
+	"time"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,13 +18,11 @@ import (
 	urlpkg "net/url"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
-	"time"
 )
 
 // htmlTagRe 匹配 HTML 标签（含属性），用于正文清洗。
@@ -335,14 +335,66 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 	}
 	// 东财失败 → 回落到新浪。注意把两个来源的错误都透传，避免上层把新浪错误误标成东财失败。
 	sina, serr := m.GetSinaQuote(code)
-	if serr != nil {
-		return nil, fmt.Errorf("eastmoney: %v; sina: %v", emErr, serr)
+	if serr == nil {
+		m.quoteStore(code, sina)
+		return sina, nil
 	}
-	m.quoteStore(code, sina)
-	return sina, nil
+	// 东财/新浪都失败 → 回落到腾讯实时行情（ifzq/qt.gtimg.cn，通常更稳定）。
+	// Fall back to Tencent realtime quotes (ifzq/qt.gtimg.cn) when both EastMoney and Sina fail.
+	ten, terr := m.getTencentQuote(code)
+	if terr != nil {
+		return nil, fmt.Errorf("eastmoney: %v; sina: %v; tencent: %v", emErr, serr, terr)
+	}
+	m.quoteStore(code, ten)
+	return ten, nil
 }
 
-// quoteHit 命中返回缓存中的实时行情副本；缓存不存在或已过期（超过 quoteTTL）时返回 nil,false。
+
+
+// checkEastMoneyHealth 探测东财行情源是否可用。
+// （checkEastMoneyHealth probes whether the EastMoney data source is available.）
+func (m *MarketAPI) checkEastMoneyHealth(code string) bool {
+	_, err := m.getEastMoneyQuote(code)
+	return err == nil
+}
+
+// checkSinaHealth 探测新浪行情源是否可用。
+// （checkSinaHealth probes whether the Sina data source is available.）
+func (m *MarketAPI) checkSinaHealth(code string) bool {
+	_, err := m.GetSinaQuote(code)
+	return err == nil
+}
+
+// checkTencentHealth 探测腾讯行情源是否可用。
+// （checkTencentHealth probes whether the Tencent data source is available.）
+func (m *MarketAPI) checkTencentHealth(code string) bool {
+	_, err := m.getTencentQuote(code)
+	return err == nil
+}
+
+// HealthCheck 探测所有行情源的可用性。
+// 返回每个数据源的探测结果（true=可用，false=不可用）。
+// （HealthCheck probes the availability of all market data sources.
+//  Returns the availability status of each data source.）
+func (m *MarketAPI) HealthCheck() map[string]bool {
+	result := make(map[string]bool, 4)
+
+	// 探测东财：尝试获取已知代码 000021 的行情
+	result["eastmoney"] = m.checkEastMoneyHealth("000021")
+
+	// 探测新浪：尝试获取已知代码 600580 的行情
+	result["sina"] = m.checkSinaHealth("600580")
+
+	// 探测腾讯：尝试获取已知代码 000021 的行情
+	result["tencent"] = m.checkTencentHealth("000021")
+
+	// 探测同花顺：同花顺行情源由 DataCoordinator 联合探测，前端通过
+	// /api/data_source_health 汇总返回；此处保持兼容，返回 false。
+	result["ths"] = false
+
+	return result
+}
+
 // 返回副本而非原指针，避免调用方修改污染缓存。
 // quoteHit returns a copy of a cached quote (nil,false if missing/expired);
 // a copy is returned to avoid callers mutating the shared cache.
@@ -372,6 +424,94 @@ func (m *MarketAPI) quoteStore(code string, si *StockInfo) {
 // getEastMoneyQuote pulls one stock's realtime quote via push2 stock/get.
 // Price fields (F43/F44/F45/F46/F60) are in cent units and divided by 100 to Yuan;
 // F170/F168/F169 are scaled by 100; F50 is the volume ratio, not change pct.
+// getTencentQuote 通过腾讯行情接口拉取单只股票实时行情（qt.gtimg.cn，GBK 编码 CSV）。
+// 返回格式：v_sz000021="51~深科技~000021~39.55~40.35~41.00~...~-0.80~-1.98~41.78~39.53~..."
+// 字段索引（分号 CSV）：0市场标记 1名称 2代码 3现价 4昨收 5今开 6成交量(手) ... 31涨跌额 32涨跌幅 33最高 34最低
+func (m *MarketAPI) getTencentQuote(code string) (*StockInfo, error) {
+	quotes := m.getTencentQuotes([]string{code})
+	if si, ok := quotes[code]; ok {
+		return si, nil
+	}
+	return nil, fmt.Errorf("tencent: no quote data for %s", code)
+}
+
+// GetTencentQuotes 批量获取腾讯实时行情（单次请求多只，逗号分隔），返回 code → StockInfo。
+// 未解析成功的代码不会出现在返回映射中。
+// （GetTencentQuotes fetches many Tencent realtime quotes in one request and returns code→StockInfo.）
+func (m *MarketAPI) GetTencentQuotes(codes []string) map[string]*StockInfo {
+	return m.getTencentQuotes(codes)
+}
+
+// tencentQuoteRe 匹配腾讯行情行：v_sz000021="...";
+var tencentQuoteRe = regexp.MustCompile(`v_(?:sh|sz|bj)(\d+)\s*=\s*"([^"]*)"`)
+
+// getTencentQuotes 发起单次腾讯批量请求并解析全部行。
+func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
+	out := make(map[string]*StockInfo, len(codes))
+	if len(codes) == 0 {
+		return out
+	}
+	var parts []string
+	for _, c := range codes {
+		c = stripSuffix(c)
+		prefix := "sz"
+		if strings.HasPrefix(c, "6") || strings.HasPrefix(c, "5") {
+			prefix = "sh"
+		}
+		if strings.HasPrefix(c, "4") || strings.HasPrefix(c, "8") || strings.HasPrefix(c, "9") {
+			prefix = "bj"
+		}
+		parts = append(parts, prefix+c)
+	}
+	url := "https://qt.gtimg.cn/q=" + strings.Join(parts, ",")
+	TencentLimiter.Wait()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return out
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
+	req.Header.Set("Referer", "https://gu.qq.com/")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return out
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return out
+	}
+	utfBody, _, _ := transform.String(simplifiedchinese.GBK.NewDecoder(), string(body))
+	for _, mch := range tencentQuoteRe.FindAllStringSubmatch(utfBody, -1) {
+		if len(mch) < 3 {
+			continue
+		}
+		code := mch[1]
+		fields := strings.Split(mch[2], "~")
+		if len(fields) < 35 {
+			continue
+		}
+		price, _ := strconv.ParseFloat(fields[3], 64)
+		prevClose, _ := strconv.ParseFloat(fields[4], 64)
+		chg, _ := strconv.ParseFloat(fields[32], 64)
+		open, _ := strconv.ParseFloat(fields[5], 64)
+		high, _ := strconv.ParseFloat(fields[33], 64)
+		low, _ := strconv.ParseFloat(fields[34], 64)
+		vol, _ := strconv.ParseFloat(fields[6], 64)
+		out[code] = &StockInfo{
+			Code:      code,
+			Name:      fields[1],
+			Price:     price,
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     prevClose,
+			Volume:    vol * 100, // 手 → 股
+			ChangePct: chg,
+		}
+	}
+	return out
+}
+
 func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=%s", sid, stockQuoteFields)
@@ -972,7 +1112,6 @@ func (m *MarketAPI) GetTonghuashunNewsPage(page, pageSize int) ([]NewsItem, erro
 // 同花顺 push API 返回结构：
 //
 //	{"code":"200","data":{"list":[
-//	  {"title":"标题","digest":"摘要","time":"2026-07-29 10:30:00"}
 //	]}}
 //
 // code 非 "200" 表示接口异常，直接返回错误。
@@ -1001,11 +1140,17 @@ func parseTonghuashunNews(body []byte) ([]NewsItem, error) {
 		if r.Title == "" {
 			continue
 		}
+		var ctimeTime time.Time
+		if sec, err := strconv.ParseInt(r.Ctime, 10, 64); err == nil {
+			ctimeTime = time.Unix(sec, 0)
+		} else {
+			ctimeTime = time.Time{}
+		}
 		items = append(items, NewsItem{
 			Title:    r.Title,
 			Content:  r.Digest,
 			URL:      r.Url,
-			Datetime: r.Ctime,
+			Datetime: ctimeTime.Format("2006-01-02 15:04:05"),
 			Source:   "同花顺",
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sync"
 )
 
 // LaodengConfig Laodeng 评分系统配置。
@@ -300,12 +301,34 @@ type D1Config struct {
 	Rules []D1Rule `json:"rules"` // D1 规则列表
 }
 
+// KVStore 配置持久化抽象：按 userID 读写任意 key-value。
+// 由 auth.Manager 实现（其 auth.json 已支持 per-user 配置项），使 config.Manager
+// 可为每个账号保存独立的 Rules/D1 快照，实现多账号多配置。
+// （KVStore abstracts per-user key-value persistence, implemented by auth.Manager so that
+// config.Manager can keep an independent Rules/D1 snapshot per account.）
+type KVStore interface {
+	SetConfig(userID, key, value string) error
+	GetConfig(userID, key string) (string, bool)
+}
+
+// perUserKey 每账号配置在 KVStore 中的键。
+// （perUserKey is the KVStore key holding a per-account config snapshot.）
+const perUserKey = "quant_config_json_v1"
+
+// perUserD1Key 每账号 D1 规则在 KVStore 中的键。
+// （perUserD1Key is the KVStore key holding a per-account D1 rules snapshot.）
+const perUserD1Key = "quant_config_d1_v1"
+
 // Manager 配置管理器，负责 JSON 配置文件的加载、保存和查询。
-// （Manager is the config manager responsible for loading, saving and querying the JSON config file.）
+// 全局默认配置来自文件；每个账号可在 KVStore 中保存独立覆盖（多账号多配置）。
+// （Manager is the config manager responsible for loading, saving and querying the JSON config file.
+// Global defaults come from the file; each account may store its own override in the KVStore.）
 type Manager struct {
 	Rules *Rules    // 主规则配置
 	D1    *D1Config // D1 事件匹配规则
-	path  string    // 配置文件路径
+	path  string    // 配置文件路径（全局默认）
+	mu    sync.RWMutex
+	store KVStore // per-user 配置存储（可为 nil，表示不支持账号级隔离）
 }
 
 // NewManager 创建配置管理器，加载指定路径的 JSON 配置文件。
@@ -320,38 +343,160 @@ func NewManager(path string) *Manager {
 	return m
 }
 
+// SetStore 注入 per-user 配置存储（auth.Manager）。
+// （SetStore injects the per-user config store, i.e. the auth.Manager.）
+func (m *Manager) SetStore(s KVStore) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store = s
+}
+
+// userRules 返回指定账号的规则快照；未配置账号级覆盖时回退全局 Rules。
+// 快照来自 KVStore 中的 JSON，反序列化为副本，避免污染全局。
+// （userRules returns the rules snapshot for a user, falling back to global Rules when
+// the account has no override; the snapshot is a deserialized copy.）
+func (m *Manager) userRules(userID string) *Rules {
+	if m.store == nil || userID == "" {
+		return m.Rules
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(userID, perUserKey)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return m.Rules
+	}
+	var r Rules
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		log.Printf("[config] 账号 %s 配置反序列化失败, 回退全局: %v", userID, err)
+		return m.Rules
+	}
+	return &r
+}
+
+// saveUserRules 将账号规则快照持久化到 KVStore。
+// （saveUserRules persists an account's rules snapshot to the KVStore.）
+func (m *Manager) saveUserRules(userID string, r *Rules) {
+	if m.store == nil || userID == "" {
+		return
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		log.Printf("[config] 账号 %s 配置序列化失败: %v", userID, err)
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.SetConfig(userID, perUserKey, string(data)); err != nil {
+		log.Printf("[config] 账号 %s 配置保存失败: %v", userID, err)
+	}
+}
+
 // Get 返回当前规则配置指针。
 // （Get returns a pointer to the current rules config.）
 func (m *Manager) Get() *Rules { return m.Rules }
 
-// GetStrategyConfig 返回策略参数配置。
-// （GetStrategyConfig returns the strategy parameter config.）
+// GetStrategyConfigFor 返回指定账号的策略参数配置（账号级覆盖优先，否则全局）。
+// （GetStrategyConfigFor returns the strategy config for a user (account override wins, else global).）
+func (m *Manager) GetStrategyConfigFor(userID string) *StrategyConfig {
+	return &m.userRules(userID).Strategy
+}
+
+// SetStrategyConfigFor 更新指定账号的策略参数并持久化（账号级覆盖）。
+// （SetStrategyConfigFor updates and persists a user's strategy params as an account override.）
+func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
+	if m.store == nil || userID == "" {
+		m.Rules.Strategy = *cfg
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	r.Strategy = *cfg
+	m.saveUserRules(userID, r)
+}
+
+// GetLLMConfigFor 返回指定账号的 LLM 配置（账号级覆盖优先，否则全局）。
+func (m *Manager) GetLLMConfigFor(userID string) *LLMConfig {
+	return &m.userRules(userID).LLM
+}
+
+// SetLLMConfigFor 更新指定账号的 LLM 配置并持久化（账号级覆盖）。
+func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
+	if m.store == nil || userID == "" {
+		m.Rules.LLM = *cfg
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	r.LLM = *cfg
+	m.saveUserRules(userID, r)
+}
+
+// GetD1ConfigFor 返回指定账号的 D1 事件匹配规则（账号级覆盖优先，否则全局）。
+func (m *Manager) GetD1ConfigFor(userID string) *D1Config {
+	if m.store == nil || userID == "" {
+		return m.D1
+	}
+	m.mu.RLock()
+	raw, ok := m.store.GetConfig(userID, perUserD1Key)
+	m.mu.RUnlock()
+	if !ok || raw == "" {
+		return m.D1
+	}
+	var d D1Config
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		log.Printf("[config] 账号 %s D1 配置反序列化失败, 回退全局: %v", userID, err)
+		return m.D1
+	}
+	return &d
+}
+
+// SetD1ConfigFor 更新指定账号的 D1 规则并持久化（账号级覆盖）。
+func (m *Manager) SetD1ConfigFor(userID string, cfg *D1Config) {
+	if m.store == nil || userID == "" {
+		m.D1 = cfg
+		m.Save()
+		return
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		log.Printf("[config] 账号 %s D1 配置序列化失败: %v", userID, err)
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.SetConfig(userID, perUserD1Key, string(data)); err != nil {
+		log.Printf("[config] 账号 %s D1 配置保存失败: %v", userID, err)
+	}
+}
+
+// GetStrategyConfig 返回全局策略参数配置（无账号隔离时使用）。
+// （GetStrategyConfig returns the global strategy config.）
 func (m *Manager) GetStrategyConfig() *StrategyConfig {
 	return &m.Rules.Strategy
 }
 
-// SetStrategyConfig 更新策略参数并持久化到文件。
-// （SetStrategyConfig updates the strategy parameters and persists them to the file.）
+// SetStrategyConfig 更新全局策略参数并持久化到文件。
+// （SetStrategyConfig updates the global strategy params and persists them.）
 func (m *Manager) SetStrategyConfig(cfg *StrategyConfig) {
 	m.Rules.Strategy = *cfg
 	m.Save()
 }
 
-// GetD1Config 返回 D1 事件匹配规则配置。
-// （GetD1Config returns the D1 event-matching rules config.）
+// GetD1Config 返回全局 D1 事件匹配规则配置。
+// （GetD1Config returns the global D1 event-matching rules config.）
 func (m *Manager) GetD1Config() *D1Config {
 	return m.D1
 }
 
-// SetD1Config 更新 D1 规则并持久化到文件。
-// （SetD1Config updates the D1 rules and persists them to the file.）
+// SetD1Config 更新全局 D1 规则并持久化到文件。
+// （SetD1Config updates the global D1 rules and persists them.）
 func (m *Manager) SetD1Config(cfg *D1Config) {
 	m.D1 = cfg
 	m.Save()
 }
 
-// GetLLMConfig 返回 LLM 客户端配置。
-// （GetLLMConfig returns the LLM client config.）
+// GetLLMConfig 返回全局 LLM 客户端配置。
+// （GetLLMConfig returns the global LLM client config.）
 func (m *Manager) GetLLMConfig() *LLMConfig {
 	return &m.Rules.LLM
 }
@@ -369,8 +514,8 @@ func (m *Manager) SetNotifyConfig(cfg *NotifyConfig) {
 	m.Save()
 }
 
-// SetLLMConfig 更新 LLM 配置并持久化到文件。
-// （SetLLMConfig updates the LLM config and persists it to the file.）
+// SetLLMConfig 更新全局 LLM 配置并持久化到文件。
+// （SetLLMConfig updates the global LLM config and persists it.）
 func (m *Manager) SetLLMConfig(cfg *LLMConfig) {
 	m.Rules.LLM = *cfg
 	m.Save()

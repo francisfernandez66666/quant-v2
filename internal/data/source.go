@@ -16,6 +16,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -61,6 +62,43 @@ func NewDataCoordinator(api *MarketAPI, ths *THSClient) *DataCoordinator {
 // GetQuote 获取个股实时行情。新浪 → 同花顺 → 东财
 // GetQuote fetches a per-stock realtime quote down the chain Sina → THS → EastMoney,
 // tripping THS for 60s after each THS failure.
+// HealthCheck 探测所有行情源的可用性，委托给东财 MarketAPI 的健康检查。
+// （HealthCheck probes the availability of all market data sources, delegating to the EastMoney MarketAPI health check.）
+func (dc *DataCoordinator) HealthCheck() map[string]bool {
+	if dc.eastMoney == nil {
+		return map[string]bool{"eastmoney": false, "sina": false, "tencent": false, "ths": false}
+	}
+	base := dc.eastMoney.HealthCheck()
+	// 同花顺由 THSClient 探测（由 DataCoordinator 持有）
+	if dc.ths != nil {
+		result := make(map[string]bool, 4)
+		for k, v := range base {
+			result[k] = v
+		}
+		result["ths"] = dc.ths.HealthCheck()
+		return result
+	}
+	return base
+}
+
+// NewsSourceHealth 探测新闻资讯源的可用性。
+// （NewsSourceHealth probes the availability of news information sources.）
+// 探测三大主流资讯源：财联社、同花顺快讯、新浪
+// Probe the three major news sources: CLS, THS flash news, Sina
+func (dc *DataCoordinator) NewsSourceHealth() map[string]bool {
+	// 探测财联社：检查 eastMoney client 是否就绪（CLS 为主要新闻源）
+	clsOk := dc.eastMoney != nil && dc.eastMoney.client != nil
+	// 探测同花顺快讯：检查 THSClient 是否就绪
+	thsOk := dc.ths != nil
+	// 探测新浪：简化判断，检查 eastMoney client 是否就绪
+	// (新浪新闻通过 GetSinaNews 接口获取，同东财 client 就绪视为可用)
+	sinaOk := dc.eastMoney != nil && dc.eastMoney.client != nil
+	return map[string]bool{
+		"cainanshe": clsOk,
+		"kuaixun":   thsOk,
+		"sina":      sinaOk,
+	}
+}
 func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	si, err := dc.eastMoney.GetSinaQuote(code)
 	if err == nil && si != nil && si.Price > 0 {
@@ -234,6 +272,34 @@ func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]Stock
 	}
 	dc.mu.RUnlock()
 
+	// 同花顺优先：东财被限流时板块成分股改走同花顺。
+	// THS-first: when EastMoney is rate-limited, sector constituents come from THS.
+	if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+		thsCode, thsName := dc.matchTHSBoardCode(sectorCode)
+		if thsCode == "" {
+			thsCode = sectorCode
+		}
+		stockList, thsErr := dc.ths.GetBoardStocks(thsCode, topN)
+		if thsErr == nil && len(stockList) > 0 {
+			// 只取代码/名称，实时行情后续由 BuildScoringData/快照兜底补全
+			codes := make([]StockInfo, 0, len(stockList))
+			for _, st := range stockList {
+				codes = append(codes, StockInfo{Code: st.Code, Name: st.Name})
+			}
+			dc.mu.Lock()
+			dc.sectorStockCache[sectorCode] = cachedSectorStocks{stocks: codes, at: time.Now()}
+			dc.mu.Unlock()
+			log.Printf("GetSectorStocks: 同花顺取 %d 只成分股 (%s%s)", len(codes), sectorCode, func() string {
+				if thsName != "" {
+					return "/" + thsName
+				}
+				return ""
+			}())
+			return codes, nil
+		}
+	}
+
+	// 东财兜底
 	s, err := dc.eastMoney.GetSectorStocks(sectorCode, topN)
 	if err == nil && len(s) > 0 {
 		dc.mu.Lock()
@@ -241,34 +307,46 @@ func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]Stock
 		dc.mu.Unlock()
 		return s, nil
 	}
+	if err != nil {
+		log.Printf("东财板块成分股失败 (%s): %v", sectorCode, err)
+	}
+	return s, err
+}
 
-	if dc.ths != nil && time.Now().After(dc.thsDeadline) {
-		dc.mu.RLock()
-		sectorName := ""
-		for _, sec := range dc.sectorCache {
-			if sec.Code == sectorCode {
-				sectorName = sec.Name
-				break
-			}
+// matchTHSBoardCode 将入参板块代码映射到同花顺板块代码。
+// 入参可能是同花顺代码（308xxx/881xxx，来自 sector_scanner）或东财 BK 代码。
+// 返回同花顺板块代码与名称；映射失败时返回空串（调用方回退用原始代码尝试）。
+// matchTHSBoardCode maps an incoming sector code to a THS board code. The input may
+// already be a THS code (308xxx/881xxx, from sector_scanner) or an EastMoney BK code.
+func (dc *DataCoordinator) matchTHSBoardCode(sectorCode string) (string, string) {
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
+	// 1) 直接精确匹配（入参已是同花顺代码）
+	for _, sec := range dc.sectorCache {
+		if sec.Code == sectorCode {
+			return sec.Code, sec.Name
 		}
-		dc.mu.RUnlock()
-
-		if sectorName != "" {
-			stockInfo, thsErr := dc.ths.GetQuote(sectorCode)
-			if thsErr == nil && stockInfo != nil {
-				dc.mu.Lock()
-				dc.sectorStockCache[sectorCode] = cachedSectorStocks{stocks: []StockInfo{
-					{Code: sectorCode, Name: sectorName, Price: stockInfo.Price},
-				}, at: time.Now()}
-				dc.mu.Unlock()
-				return []StockInfo{
-					{Code: sectorCode, Name: sectorName, Price: stockInfo.Price},
-				}, nil
+	}
+	// 2) 东财 BK 代码 → 剥离前缀尝试数字段（BK0477 ↔ 同花顺 885477 偶有对应）
+	if strings.HasPrefix(sectorCode, "BK") {
+		try := strings.TrimPrefix(sectorCode, "BK")
+		for _, sec := range dc.sectorCache {
+			if sec.Code == try {
+				return sec.Code, sec.Name
 			}
 		}
 	}
-
-	return s, err
+	// 3) 名称匹配：东财板块代码在 sectorCache 中对应的名称去匹配同花顺板块
+	for _, sec := range dc.sectorCache {
+		if sec.Code == sectorCode && sec.Name != "" {
+			for _, sec2 := range dc.sectorCache {
+				if sec2.Name == sec.Name && sec2.Code != sec.Code {
+					return sec2.Code, sec2.Name
+				}
+			}
+		}
+	}
+	return "", ""
 }
 
 // GetStockMoneyFlow 获取资金流向。仅东财。

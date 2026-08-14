@@ -6,9 +6,13 @@ import (
 	"context"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"quant-trading-v2/internal/auth"
@@ -108,10 +112,21 @@ func main() {
 	llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
 	llmCfg.Streaming = cfgMgr.Rules.LLM.StreamingEnabled()
 	llmCfg.BatchConcurrency = cfgMgr.Rules.LLM.BatchConcurrency
+	// 多 API 密钥：认证配置优先（逗号分隔），否则回退单 key
+	if v, ok := authMgr.GetConfig("", "llm_api_keys"); ok && v != "" {
+		for _, k := range strings.Split(v, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				llmCfg.APIKeys = append(llmCfg.APIKeys, k)
+			}
+		}
+	}
+	if len(llmCfg.APIKeys) == 0 && llmCfg.APIKey != "" {
+		llmCfg.APIKeys = []string{llmCfg.APIKey}
+	}
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
 	var llmClient *llm.Client
-	if llmCfg.APIKey != "" {
+	if len(llmCfg.APIKeys) > 0 {
 		llmClient = llm.New(llmCfg)
 	} else {
 		log.Println("[LLM] 未配置 API Key，LLM 功能不可用")
@@ -140,6 +155,7 @@ func main() {
 
 	// 板块扫描器 + RPS 强度管理器：板块→个股传播与验证
 	scanner := data.NewSectorScanner(marketAPI, matcher)
+	scanner.SetSectorSource(thsClient) // 板块成分股：同花顺优先，东财兜底
 	strategyEngine.SetScanner(scanner)
 	rpsMgr := data.NewRPSManager()
 	sAgent := sector_agent.New(scanner, rpsMgr)
@@ -182,9 +198,9 @@ func main() {
 	eng.SetNotifier(notifier)
 	srv.SetEngineController(eng)
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程
-srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) {
+srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) {
 		lc := llm.New(llm.Config{
-			APIKey:           apiKey,
+			APIKeys:          apiKeys,
 			APIURL:           apiURL,
 			Model:            model,
 			Timeout:          time.Duration(timeoutSec) * time.Second,
@@ -195,7 +211,7 @@ srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int, streaming 
 	})
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
-	baseStocks := append(wlMgr.List(), rpt.HeldPositionCodes()...)
+	baseStocks := append(wlMgr.All(), rpt.HeldPositionCodes()...)
 	dc := data.NewDataCoordinator(marketAPI, thsClient) // 统一行情源：新浪→同花顺→东财 三级降级链
 	fetcher := data.NewFetcher(baseStocks, marketAPI, dc)
 	go fetcher.Start()
@@ -247,8 +263,38 @@ srv.SetLLMRecreate(func(apiKey, apiURL, model string, timeoutSec int, streaming 
 	}
 	bound := ln.Addr().String()
 	log.Printf("[main] HTTP 服务已绑定 %s (来源 %s)", bound, addr)
+
+	// HTTP 服务加固：设置读写超时/头部超时/空闲超时，防慢速攻击与连接悬挂；
+	// 不设 WriteTimeout 上限过大（SSE 长连接需长期保持），仅约束头部与空闲期。
+	// English: hardened HTTP server with header/read/idle timeouts (slow-loris protection);
+	// WriteTimeout is left generous because SSE keeps long-lived connections open.
+	hs := &http.Server{
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
-		log.Fatal(srv.ServeListener(ln))
+		if err := hs.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("[main] HTTP 服务异常退出: %v", err)
+		}
+	}()
+
+	// 优雅停机：收到 SIGTERM/SIGINT（systemd stop / Ctrl-C）时先关闭 HTTP、
+	// 停掉所有后台循环，再做最终落盘，避免写一半的 JSON 损坏。
+	// English: graceful shutdown on SIGTERM/SIGINT — close HTTP first, stop background
+	// loops, then let deferred writers flush, avoiding half-written JSON files.
+	stop := make(chan os.Signal, 2)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-stop
+		log.Println("[main] 收到退出信号，正在优雅停机…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = hs.Shutdown(shutdownCtx)
+		trigCancel()
+		scoreCancel()
+		os.Exit(0)
 	}()
 
 	ctx := context.Background()

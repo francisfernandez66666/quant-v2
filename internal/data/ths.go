@@ -58,6 +58,28 @@ func (tc *THSClient) SetTransport(rt http.RoundTripper) {
 	tc.client.Transport = rt
 }
 
+// HealthCheck 探测 THS 服务是否可达。
+// （HealthCheck probes whether the THS service is reachable.）
+func (tc *THSClient) HealthCheck() bool {
+	// 简单探测：通过 HEAD 请求检查探针 URL
+	// Simple probe: check reachability via HEAD request to probe URL
+	u := "https://d.10jqka.com.cn"
+	req, err := http.NewRequest("HEAD", u, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", thsUserAgent)
+	req.Header.Set("Referer", thsReferer)
+	resp, err := tc.client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	// 只要服务响应（HTTP 状态码在 200-599 范围）即视为可达；
+	// 同花顺根路径可能返回 404/405，但连接建立成功说明源可用。
+	return resp.StatusCode > 0
+}
+
 // getWithHeaders 发起带浏览器头部模拟的 GET 请求。
 // getWithHeaders issues a GET request with simulated browser headers.
 func (tc *THSClient) getWithHeaders(url string) (*http.Response, error) {
@@ -183,6 +205,65 @@ func (tc *THSClient) getBoardPage(url string) ([]SectorInfo, error) {
 		})
 	}
 	return result, nil
+}
+
+// boardStockLinkRe 匹配同花顺板块成分股页面中的个股链接。
+// 格式: <a ... href="http://stockpage.10jqka.com.cn/{code}/" ...>
+// boardStockLinkRe matches per-stock links in a THS board-constituent page.
+var boardStockLinkRe = regexp.MustCompile(`stockpage\.10jqka\.com\.cn/(\d{6})`)
+
+// GetBoardStocks 获取同花顺板块成分股列表（东财接口故障时的降级源）。
+// 板块代码为同花顺格式：行业板块 881xxx 走 /thshy/detail/code/，概念板块 308xxx 走 /gn/detail/code/；
+// 页面为 GBK 服务端渲染，成分股以 stockpage.10jqka.com.cn/{code}/ 链接形式出现，每页 10 只，
+// 按 page/{n}/ 分页拉取直至满足 topN。仅返回代码/名称（无行情字段），调用方自行补全实时行情。
+// GetBoardStocks returns a THS board's constituent stock codes (fallback when EastMoney
+// sector-stocks is down). THS board codes: industry 881xxx → /thshy/detail/code/, concept
+// 308xxx → /gn/detail/code/. Pages are GBK server-rendered, constituents appear as
+// stockpage links (10/page), paginated via page/{n}/ until topN is met. Only code/name are
+// filled; live quotes are backfilled by the caller.
+func (tc *THSClient) GetBoardStocks(boardCode string, topN int) ([]StockInfo, error) {
+	if topN <= 0 {
+		topN = 10
+	}
+	base := "https://q.10jqka.com.cn/gn/detail/code/" + boardCode
+	if strings.HasPrefix(boardCode, "881") || strings.HasPrefix(boardCode, "885") {
+		base = "https://q.10jqka.com.cn/thshy/detail/code/" + boardCode
+	}
+	var out []StockInfo
+	seen := make(map[string]bool)
+	// 最多拉 10 页（100 只），超过即止（板块成分通常远小于此）
+	for page := 1; page <= 10 && len(out) < topN; page++ {
+		url := base
+		if page > 1 {
+			url = fmt.Sprintf("%s/page/%d/", base, page)
+		}
+		text, err := tc.fetchDecoded(url)
+		if err != nil {
+			if len(out) > 0 {
+				break // 后续页失败但已有数据 → 返回已取部分
+			}
+			return nil, err
+		}
+		matches := boardStockLinkRe.FindAllStringSubmatch(text, -1)
+		if len(matches) == 0 {
+			break // 无新链接 → 到底了
+		}
+		for _, m := range matches {
+			code := m[1]
+			if code == "" || seen[code] {
+				continue
+			}
+			seen[code] = true
+			out = append(out, StockInfo{Code: code})
+			if len(out) >= topN {
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("ths board %s: no constituents found", boardCode)
+	}
+	return out, nil
 }
 
 // topBoardTableRe 匹配同花顺板块列表页中带行情数据的表格。

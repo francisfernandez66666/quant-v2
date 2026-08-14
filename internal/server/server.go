@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,7 +63,7 @@ type Server struct {
 	watchlist   *data.WatchlistManager                                             // 自选股管理器
 	sse         *SSEBroker                                                         // SSE 事件广播器（向前端实时推送）
 	startTime   time.Time                                                          // 服务启动时间（用于 uptime 统计）
-	llmRecreate func(apiKey, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) // 热重建 LLM 客户端
+	llmRecreate func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) // 热重建 LLM 客户端
 	ctrl        EngineController                                                   // 引擎控制面（做多/做空开关、流水线调试数据等）
 
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
@@ -81,7 +82,7 @@ type Server struct {
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
-func (s *Server) SetLLMRecreate(fn func(apiKey, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int)) {
+func (s *Server) SetLLMRecreate(fn func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int)) {
 	s.llmRecreate = fn
 }
 
@@ -171,6 +172,11 @@ func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rp
 		sse:       NewSSEBroker(),
 		startTime: time.Now(),
 	}
+	// 多账号多配置：把 auth.Manager 作为 per-user 配置存储注入 config.Manager，
+	// 使策略/D1/LLM 配置可按账号隔离保存。
+	// English: inject the auth.Manager as the per-user config store so that strategy/D1/LLM
+	// settings can be isolated per account.
+	cfg.SetStore(authMgr)
 	s.registerRoutes()
 	return s
 }
@@ -189,6 +195,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /setup", s.handleSetupSubmit)
 
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
+	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
+	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
 	s.mux.HandleFunc("POST /api/long/toggle", s.authMiddleware(s.handleLongToggle))
 	s.mux.HandleFunc("GET /api/long/status", s.authMiddleware(s.handleLongStatus))
@@ -211,6 +219,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/minute", s.authMiddleware(s.handleFixMinute))
 	s.mux.HandleFunc("GET /api/signals", s.authMiddleware(s.handleFixSignals))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
+	s.mux.HandleFunc("GET /api/engine_health", s.authMiddleware(s.handleFixEngineHealth))
 	s.mux.HandleFunc("GET /api/alerts", s.authMiddleware(s.handleFixAlerts))
 	s.mux.HandleFunc("DELETE /api/alerts", s.authMiddleware(s.handleClearAlerts))
 	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.authMiddleware(s.handleDeleteAlert))
@@ -248,10 +257,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
 
+// maxBodyBytes 请求体大小上限：64KB（防超大 body 打爆内存，正常业务请求远小于此）。
+// （maxBodyBytes caps request bodies at 64KB to prevent memory exhaustion.）
+const maxBodyBytes = 64 << 10
+
 // Serve 启动 HTTP 服务监听指定地址。
 func (s *Server) Serve(addr string) error {
 	log.Printf("HTTP server starting on %s", addr)
-	return http.ListenAndServe(addr, s.corsMiddleware(s.mux))
+	return http.ListenAndServe(addr, s.chain(s.mux))
 }
 
 // ServeListener 使用已创建的监听器启动 HTTP 服务。
@@ -262,12 +275,42 @@ func (s *Server) Serve(addr string) error {
 // "probe the port, then ListenAndServe".
 func (s *Server) ServeListener(ln net.Listener) error {
 	log.Printf("HTTP server serving on %s", ln.Addr().String())
-	return http.Serve(ln, s.corsMiddleware(s.mux))
+	return http.Serve(ln, s.chain(s.mux))
 }
 
 // ServeHTTP 实现 http.Handler 接口，供 httptest / 内嵌路由直接驱动（测试与复用场景）。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.corsMiddleware(s.mux).ServeHTTP(w, r)
+	s.chain(s.mux).ServeHTTP(w, r)
+}
+
+// recoverMiddleware 恢复中间件：捕获请求处理链中的 panic，记录日志并返回 500，
+// 避免单个 handler 崩溃把整个 HTTP 服务进程打挂（配合 systemd Restart=always 双保险）。
+// 已开始写入的响应无法再改状态码，此时仅记录日志并中止该连接。
+// （recoverMiddleware catches panics in the request chain, logs them and returns 500
+// so a single handler crash cannot take down the whole HTTP process.）
+func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				stack := make([]byte, 1<<16)
+				n := runtime.Stack(stack, false)
+				log.Printf("[server] PANIC recovered: %v\n%s", rec, stack[:n])
+				// 响应尚未写入时返回 500；已写入则放弃改写状态码
+				if rw, ok := w.(http.Hijacker); ok && rw != nil {
+					_ = rw
+				}
+				// 尽力尝试写入错误响应（若头已发送则 WriteHeader 无效，不报错）
+				defer func() {
+					if rec2 := recover(); rec2 != nil {
+						log.Printf("[server] panic-response write also panicked: %v", rec2)
+					}
+				}()
+				w.Header().Set("Content-Type", "application/json")
+				writeError(w, 500, "internal server error")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // corsMiddleware 跨域中间件：为所有响应添加 CORS 头，并直接终结 OPTIONS 预检请求。
@@ -282,6 +325,12 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// chain 将多个中间件按顺序包装 next（外层 → 内层）。
+// recoverMiddleware 在最外层兜底 panic。
+func (s *Server) chain(next http.Handler) http.Handler {
+	return s.recoverMiddleware(s.corsMiddleware(next))
 }
 
 // GetServeMux 返回路由注册表。
@@ -476,6 +525,18 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // handleHealth 处理 GET /api/health：健康检查，恒返回 {"status":"ok"}。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleDataSourceHealth 处理 GET /api/data_source_health：返回各数据源健康探测结果。
+// （handleDataSourceHealth returns the probing results of each data source.）
+func (s *Server) handleDataSourceHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.dc.HealthCheck())
+}
+
+// handleNewsSourceHealth 处理 GET /api/news_source_health：返回新闻资讯源健康探测结果。
+// （handleNewsSourceHealth returns the probing results of each news source.）
+func (s *Server) handleNewsSourceHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.dc.NewsSourceHealth())
 }
 
 // handleDashboard 处理 GET /api/dashboard：返回看板聚合快照。
@@ -687,8 +748,10 @@ func (s *Server) handleCreatePosition(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "code and entry_price required")
 		return
 	}
+	uid := requestUserID(r)
 	id := fmt.Sprintf("POS%d", time.Now().UnixNano())
 	s.rpt.LogSignal(id, req.Code, req.Name, req.Direction, req.Strategy, req.EntryPrice, req.TakeProfitPct, req.StopLossPct)
+	s.rpt.Update(id, func(log *report.ExecLog) { log.UserID = uid })
 	writeJSON(w, 201, map[string]string{"id": id})
 }
 
@@ -749,11 +812,12 @@ func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-// handleListPositions 处理 GET /api/positions：返回全部持仓记录与交易统计指标。
+// handleListPositions 处理 GET /api/positions：返回当前账号的持仓记录与交易统计指标。
 func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
-	logs := s.rpt.List()
+	uid := requestUserID(r)
+	logs := s.rpt.ListFor(uid)
 	reportStats := map[string]interface{}{}
-	total, holding, win, wr, avgW, avgL := s.rpt.Stats()
+	total, holding, win, wr, avgW, avgL := s.rpt.StatsFor(uid)
 	reportStats["total"] = total
 	reportStats["holding"] = holding
 	reportStats["win"] = win
@@ -768,12 +832,13 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 
 // ── 策略参数配置 ──
 
-// handleGetStrategyConfig 处理 GET /api/config/strategy：返回当前策略参数配置。
+// handleGetStrategyConfig 处理 GET /api/config/strategy：返回全局策略参数配置。
+// 战法参数全局共享（多账号一致），不按账号隔离。
 func (s *Server) handleGetStrategyConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.cfg.GetStrategyConfig())
 }
 
-// handleSetStrategyConfig 处理 POST /api/config/strategy：保存新的策略参数配置。
+// handleSetStrategyConfig 处理 POST /api/config/strategy：保存全局策略参数配置。
 func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request) {
 	var cfg config.StrategyConfig
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
@@ -786,12 +851,12 @@ func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request)
 
 // ── D1 规则配置 ──
 
-// handleGetD1Config 处理 GET /api/config/d1：返回 D1 规则配置。
+// handleGetD1Config 处理 GET /api/config/d1：返回全局 D1 规则配置（战法一致）。
 func (s *Server) handleGetD1Config(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.cfg.GetD1Config())
 }
 
-// handleSetD1Config 处理 POST /api/config/d1：保存新的 D1 规则配置。
+// handleSetD1Config 处理 POST /api/config/d1：保存全局 D1 规则配置。
 func (s *Server) handleSetD1Config(w http.ResponseWriter, r *http.Request) {
 	var cfg config.D1Config
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
@@ -806,21 +871,35 @@ func (s *Server) handleSetD1Config(w http.ResponseWriter, r *http.Request) {
 
 // setLLMConfigReq LLM 配置请求体：APIKey 可选（不修改时留空），APIURL 与 Model 必填。
 type setLLMConfigReq struct {
-	APIKey     string `json:"api_key,omitempty"`
-	APIURL     string `json:"api_url"`
-	Model      string `json:"model"`
-	TimeoutSec int    `json:"timeout_sec"`      // 单次请求超时（秒），缺省 0
-	Stream     *bool  `json:"stream,omitempty"` // 流式开关，缺省维持现状/默认开启
+	APIKey     string   `json:"api_key,omitempty"`
+	APIKeys    []string `json:"api_keys,omitempty"` // 多 API 密钥（逗号分隔或数组，轮询分发；为空时回退 APIKey）
+	APIURL     string   `json:"api_url"`
+	Model      string   `json:"model"`
+	TimeoutSec int      `json:"timeout_sec"`      // 单次请求超时（秒），缺省 0
+	Stream     *bool    `json:"stream,omitempty"` // 流式开关，缺省维持现状/默认开启
 	// BatchConcurrency 新闻归因 LLM 批量并发批次，<=0 时维持现状/默认 4。
 	// （BatchConcurrency is the news-attribution LLM batch concurrency; <=0 keeps current/default 4.）
 	BatchConcurrency int `json:"batch_concurrency,omitempty"`
 }
 
-// handleGetLLMConfig 处理 GET /api/config/llm：返回 API 地址、运行时生效模型与流式开关。
+// handleGetLLMConfig 处理 GET /api/config/llm：返回当前账号的 API 地址、运行时生效模型与流式开关。
 func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
-	cfg := s.cfg.GetLLMConfig()
+	cfg := s.cfg.GetLLMConfigFor(requestUserID(r))
+	// 多 key 从 auth config 读取（逗号分隔）
+	var apiKeys []string
+	uid := requestUserID(r)
+	if v, ok := s.auth.GetConfig(uid, "llm_api_keys"); ok && v != "" {
+		apiKeys = splitLLMKeys(v)
+	}
+	if len(apiKeys) == 0 {
+		// 兼容旧单 key 配置
+		if v, ok := s.auth.GetConfig(uid, "llm_api_key"); ok && v != "" {
+			apiKeys = []string{v}
+		}
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"api_url":            cfg.APIURL,
+		"api_keys":           apiKeys,
 		"model":              s.runtimeModel(),
 		"stream":             cfg.StreamingEnabled(),
 		"timeout_sec":        cfg.TimeoutSec,
@@ -829,18 +908,46 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSetLLMConfig 处理 POST /api/config/llm：保存 LLM 配置并热重建客户端。
-// 依次执行：APIURL+Model 写入 config.json → APIKey 写入 auth 配置 → 触发 llmRecreate
+// splitLLMKeys 解析逗号分隔（含空白）的 API 密钥列表为去空去重数组。
+// （splitLLMKeys splits a comma-separated key string into a trimmed, deduplicated list.）
+func splitLLMKeys(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// requestUserID 从请求上下文取出当前登录用户 ID；未认证返回空串（走全局配置）。
+// （requestUserID returns the authenticated user ID, or "" for unauthenticated requests.）
+func requestUserID(r *http.Request) string {
+	u := userFromContext(r)
+	if u == nil {
+		return ""
+	}
+	return u.ID
+}
+
+// handleSetLLMConfig 处理 POST /api/config/llm：保存当前账号的 LLM 配置并热重建客户端。
+// 依次执行：APIURL+Model 写入当前账号配置 → APIKey 写入 auth 配置 → 触发 llmRecreate
 // 回调重建客户端 → 记录运行时实际生效的 model（空值兜底为默认模型）。
 func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
+	uid := requestUserID(r)
 	var req setLLMConfigReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
 
-	// 保存 APIURL + Model 到 config.json
-	s.cfg.SetLLMConfig(&config.LLMConfig{
+	// 保存 APIURL + Model 到当前账号配置（多账号多配置隔离）
+	s.cfg.SetLLMConfigFor(uid, &config.LLMConfig{
 		APIURL:           req.APIURL,
 		Model:            req.Model,
 		TimeoutSec:       req.TimeoutSec,
@@ -848,21 +955,37 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		BatchConcurrency: req.BatchConcurrency,
 	})
 
-	// 保存 APIKey 到 auth config
+	// 保存 APIKey 到 auth config（按账号隔离）
 	if req.APIKey != "" {
-		s.auth.SetConfig("", "llm_api_key", req.APIKey)
+		s.auth.SetConfig(uid, "llm_api_key", req.APIKey)
+	}
+
+	// 保存多 API 密钥到 auth config（逗号分隔）；为空时维持现状
+	if len(req.APIKeys) > 0 {
+		s.auth.SetConfig(uid, "llm_api_keys", strings.Join(req.APIKeys, ","))
 	}
 
 	// 热重建 LLM 客户端（如果提供了回调）
 	if s.llmRecreate != nil {
-		// 从 auth config 读取 key（可能刚保存的 key 还没刷新，用请求里的值）
-		key := req.APIKey
-		if key == "" {
-			if v, ok := s.auth.GetConfig("", "llm_api_key"); ok {
-				key = v
+		// 优先用请求里的多 key；未提供则读已保存的多 key；再无则回退单 key
+		keys := req.APIKeys
+		if len(keys) == 0 {
+			if v, ok := s.auth.GetConfig(uid, "llm_api_keys"); ok && v != "" {
+				keys = splitLLMKeys(v)
 			}
 		}
-		s.llmRecreate(key, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream), req.BatchConcurrency)
+		if len(keys) == 0 {
+			key := req.APIKey
+			if key == "" {
+				if v, ok := s.auth.GetConfig(uid, "llm_api_key"); ok {
+					key = v
+				}
+			}
+			if key != "" {
+				keys = []string{key}
+			}
+		}
+		s.llmRecreate(keys, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream), req.BatchConcurrency)
 	}
 
 	// 记录运行时实际生效的 model（空值会被 llm 客户端按默认模型兜底）

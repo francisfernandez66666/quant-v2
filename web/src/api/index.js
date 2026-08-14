@@ -304,6 +304,14 @@ export async function fetchStatus() {
   return request('/api/status')
 }
 
+// 获取流程引擎子系统健康状况
+// Fetch engine health status
+// 对应 GET /api/engine_health，返回各子系统连通性
+// Maps to GET /api/engine_health, returns connectivity of each subsystem
+export async function fetchEngineHealth() {
+  return request('/api/engine_health')
+}
+
 // ── 消息提醒 ──
 // ── Alerts ──
 
@@ -767,6 +775,23 @@ export async function toggleNewsShowAll(enabled) {
   return request('/api/news/showall', { method: 'POST', data: { enabled } })
 }
 
+// ── 数据源健康状况 ──
+// ── Data source health ──
+// 对应 GET /api/data_source_health，返回各数据源健康探测结果
+// Maps to GET /api/data_source_health
+// 返回 { eastmoney: true|false, sina: true|false, tencent: true|false, ths: true|false }
+// (由 DataCoordinator.HealthCheck 返回，包含东财/新浪/腾讯/同花顺四大数据源的健康探测结果)
+export async function fetchDataSourceHealth() {
+  return request('/api/data_source_health')
+}
+
+// 对应 GET /api/news_source_health，返回新闻源健康探测结果
+// Maps to GET /api/news_source_health
+// 返回 { cainanshe: true|false, kuaixun: true|false }
+export async function fetchNewsSourceHealth() {
+  return request('/api/news_source_health')
+}
+
 // ── 股票咨询（多轮对话）──
 // ── Stock consultation (multi-turn chat) ──
 
@@ -788,6 +813,13 @@ export async function fetchConsultHistory() {
   return request('/api/consult/history')
 }
 
+/** Clear today's consultation chat history */
+// 对应 DELETE /api/consult/history，清空当日咨询对话
+// Maps to DELETE /api/consult/history; clears today's consultation messages
+export async function clearConsultHistory() {
+  return request('/api/consult/history', { method: 'DELETE' })
+}
+
 /** 获取专业模式开关状态 */
 /** Fetch the pro-mode toggle state */
 // 对应 GET /api/consult/pro-mode，返回 { enabled } 布尔值
@@ -806,10 +838,4 @@ export async function setConsultProMode(enabled) {
   return request('/api/consult/pro-mode', { method: 'PUT', data: { enabled } })
 }
 
-/** 清空当日咨询对话历史 */
-/** Clear today's consultation chat history */
-// 对应 DELETE /api/consult/history
-// Maps to DELETE /api/consult/history
-export async function clearConsultHistory() {
-  return request('/api/consult/history', { method: 'DELETE' })
-}
+

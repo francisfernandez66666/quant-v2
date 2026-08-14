@@ -286,7 +286,7 @@ func (o *backtestOptions) run() error {
 	}
 
 	for _, code := range o.watchlist {
-		wlMgr.Add(code)
+		wlMgr.Add("", code)
 		log.Printf("[backtest] 注入自选股 %s", code)
 	}
 

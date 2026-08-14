@@ -1,13 +1,22 @@
 package com.liangzai.quant
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.webkit.WebViewAssetLoader
 
 /**
@@ -34,6 +43,13 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            android.webkit.WebView.setWebContentsDebuggingEnabled(true)
+        }
+
+        ensureNotificationChannel()
+        requestNotificationPermission()
 
         val webView = findViewById<WebView>(R.id.webview)
 
@@ -74,7 +90,82 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // WebView 内 JS 的 Notification API 需要 WebChromeClient.onShowNotification 才会显示系统通知
+        // 同时把 JS console.log 转发到 Android logcat（调试定位用）
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
+                if (msg != null) android.util.Log.d("QUANT_WEB", msg.message())
+                return true
+            }
+        }
+
+        // 原生通知桥：前端 JS 调用 window.AndroidNotify.show(title, body) 显示 Android 系统通知
+        webView.addJavascriptInterface(object {
+            @android.webkit.JavascriptInterface
+            fun show(title: String, body: String) {
+                val manager = getSystemService(NotificationManager::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                    return
+                }
+                val intent = android.content.Intent(this@MainActivity, MainActivity::class.java)
+                val pending = android.app.PendingIntent.getActivity(
+                    this@MainActivity, 0, intent,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+                )
+                val notification = NotificationCompat.Builder(this@MainActivity, "quant_signals")
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setSmallIcon(android.R.drawable.stat_notify_chat)
+                    .setAutoCancel(true)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setContentIntent(pending)
+                    .build()
+                manager.notify((title + body).hashCode(), notification)
+            }
+        }, "AndroidNotify")
+
         webView.loadUrl("https://appassets.androidplatform.net/index.html")
+    }
+
+    /** 创建通知渠道（Android 8+ 通知必需要有渠道，否则 WebView 内 Notification 静默丢弃） */
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            val channel = NotificationChannel(
+                "quant_signals", "量仔期货信号", NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "策略信号与提醒推送"
+            }
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    /** Android 13+ 需要运行时申请通知权限，否则 Notification API 一律静默失败 */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001
+                )
+            }
+        }
+    }
+
+    /** 请求结果回调：授权后刷新 WebView 中的通知权限状态 */
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            val webView = findViewById<WebView>(R.id.webview)
+            // 重新执行前端通知权限检查逻辑：Notification.permission 会重新求值
+            webView.evaluateJavascript("(function(){ if(typeof window.onNotifyPermissionChange==='function'){window.onNotifyPermissionChange();} })()", null)
+        }
     }
 
     // 系统返回键：优先 WebView 内部历史，回退到应用根部再退出

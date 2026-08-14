@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,7 +23,9 @@ import (
 // （Client is the LLM API client wrapping communication with the SiliconFlow chat interface.）
 type Client struct {
 	httpClient       *http.Client  // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
-	apiKey           string        // API 密钥（Authorization: Bearer）
+	apiKey           string        // API 密钥（Authorization: Bearer，单 key 兼容字段）
+	apiKeys          []string      // 多 API 密钥（并发请求按 key 轮询分发，突破单 key 限流）
+	keyIdx           uint64        // 轮询分发计数（sync/atomic）
 	apiURL           string        // chat/completions 请求地址
 	model            string        // 模型名称
 	streaming        bool          // 是否启用流式（SSE）响应；false 走一次性非流式
@@ -83,18 +86,52 @@ func New(cfg Config) *Client {
 	if bc <= 0 {
 		bc = DefaultBatchConcurrency
 	}
+	// 多 key：显式 APIKeys 优先；否则回退单 APIKey（兼容旧配置）
+	apiKeys := cfg.APIKeys
+	if len(apiKeys) == 0 {
+		if cfg.APIKey != "" {
+			apiKeys = []string{cfg.APIKey}
+		}
+	}
+	// 去空白、去重，保留有效 key
+	seen := make(map[string]bool, len(apiKeys))
+	keys := make([]string, 0, len(apiKeys))
+	for _, k := range apiKeys {
+		k = strings.TrimSpace(k)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		keys = append(keys, k)
+	}
+	first := ""
+	if len(keys) > 0 {
+		first = keys[0]
+	}
 	return &Client{
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
 			Transport: transport,
 		},
-		apiKey:           cfg.APIKey,
+		apiKey:           first,
+		apiKeys:          keys,
 		apiURL:           cfg.APIURL,
 		model:            cfg.Model,
 		streaming:        cfg.Streaming,
 		idleTimeout:      cfg.StreamIdleTimeout,
 		batchConcurrency: bc,
 	}
+}
+
+// authKey 返回当前请求使用的 API 密钥：多 key 时原子轮询分发（并发请求均匀落到不同
+// key，突破单 key 限流）；单 key 时始终返回唯一 key（零额外开销）。
+// （authKey returns the API key for the current request: round-robins across apiKeys with an
+// atomic counter so concurrent requests spread over different keys; single-key falls through.）
+func (c *Client) authKey() string {
+	if len(c.apiKeys) <= 1 {
+		return c.apiKey
+	}
+	return c.apiKeys[atomic.AddUint64(&c.keyIdx, 1)%uint64(len(c.apiKeys))]
 }
 
 // Message 对话消息，包含角色和内容。
@@ -130,7 +167,7 @@ type ChatResponse struct {
 // idleTimeout) errors out. A failed stream parse falls back to a one-shot non-streaming call. Errors on
 // upstream API failure/timeout let callers retry or fall back.）
 func (c *Client) Chat(system, user string) (string, error) {
-	if c.apiKey == "" {
+	if len(c.apiKeys) == 0 {
 		return "", fmt.Errorf("LLM_API_KEY not set")
 	}
 
@@ -154,7 +191,7 @@ func (c *Client) Chat(system, user string) (string, error) {
 // appended—to avoid multi/mid-list system roles corrupting the model context. Like Chat it streams by
 // default and falls back to non-streaming on parse failure.）
 func (c *Client) ChatMessages(messages []Message) (string, error) {
-	if c.apiKey == "" {
+	if len(c.apiKeys) == 0 {
 		return "", fmt.Errorf("LLM_API_KEY not set")
 	}
 	return c.do(ChatRequest{Model: c.model, Messages: messages})
@@ -296,7 +333,7 @@ func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadClose
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+c.authKey())
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -779,7 +816,7 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 // It uses a tiny non-streaming request (max_tokens=1); nil on success, otherwise the upstream error.
 // The startup sequence pings before pre-market news analysis to surface key/network issues early.）
 func (c *Client) Ping() error {
-	if c.apiKey == "" {
+	if len(c.apiKeys) == 0 {
 		return fmt.Errorf("LLM_API_KEY not set")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

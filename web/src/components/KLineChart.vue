@@ -129,7 +129,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import * as api from '../api/index.js'
 
 // ── 输入属性 ──
@@ -499,6 +499,14 @@ onMounted(() => {
   }
 })
 
+// code 变化时重新加载（组件实例被复用/展开不同股票时强制刷新，避免显示上个股票的数据）
+watch(() => props.code, () => {
+  name.value = props.name || ''
+  points.value = []
+  raw.value = []
+  load()
+})
+
 onBeforeUnmount(() => {
   if (ro) ro.disconnect()
   if (timer) clearInterval(timer)
@@ -511,7 +519,7 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   padding: 8px 10px 6px;
   color: #cdd9e9;
-  font-size: 12px;
+  font-size: 14px;
 }
 .kline-toolbar {
   display: flex;
@@ -533,7 +541,7 @@ onBeforeUnmount(() => {
   border-radius: 4px;
   padding: 2px 10px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 14px;
 }
 .btn-refresh:hover { background: #27406a; }
 .btn-refresh:disabled { opacity: 0.55; cursor: default; }
@@ -553,10 +561,10 @@ onBeforeUnmount(() => {
 .grid-line { stroke: #2a3a55; stroke-width: 1; stroke-dasharray: 3 3; }
 .panel-line { stroke: #24334d; stroke-width: 1; }
 .prev-line { stroke: #f0b90b; stroke-width: 1; stroke-dasharray: 4 3; }
-.prev-label { fill: #f0b90b; font-size: 10px; font-family: monospace; }
+.prev-label { fill: #f0b90b; font-size: 14px; font-family: monospace; }
 .axis-text {
   fill: #7d8fab;
-  font-size: 10px;
+  font-size: 14px;
   font-family: monospace;
 }
 .crosshair { stroke: #f0b90b; stroke-width: 1; }
@@ -569,7 +577,7 @@ onBeforeUnmount(() => {
   padding: 4px 8px;
   pointer-events: none;
   z-index: 5;
-  font-size: 11px;
+  font-size: 14px;
   line-height: 1.5;
   white-space: nowrap;
 }

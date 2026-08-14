@@ -24,7 +24,10 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // 加固：开启 R8 代码混淆 + 资源收缩，提高反编译/逆向成本。
+            // （Hardening: enable R8 code obfuscation and resource shrinking to raise reverse-engineering cost.）
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/llm"
@@ -177,26 +178,56 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 		maxAttempts = defaultMaxAttempts
 	}
 
-	// 按 llmBatchSize 分批调用，避免单批 prompt 过长导致 LLM 输出截断漏项。
-	// English: call in llmBatchSize-sized chunks so each prompt stays small enough for the model to
-	// return every stock without truncating its output.
-	for _, b := range batchBounds(len(codes), llmBatchSize) {
+	// 按 llmBatchSize 分批**并发**调用：每批独立 goroutine，用独立 map 合并，
+	// 配合 LLM 客户端多 key 轮询，各批请求落到不同 API key，突破单 key 限流、显著提速。
+	// 并发度取自 LLM 客户端 BatchConcurrency（前端可热改），默认 4。
+	// English: chunks of llmBatchSize are scored concurrently (one goroutine per chunk, each
+	// producing its own map merged afterwards). Combined with the client's multi-key round-robin,
+	// concurrent chunks spread across different API keys, beating single-key rate limits.
+	concurrency := 1
+	if ds.llmClient != nil {
+		if bc := ds.llmClient.BatchConcurrency(); bc > 0 {
+			concurrency = bc
+		}
+	}
+	bounds := batchBounds(len(codes), llmBatchSize)
+	chunkResults := make([]map[string]D1Score, len(bounds))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i, b := range bounds {
 		chunk := codes[b[0]:b[1]]
 		log.Printf("[D1Scorer] 分批评分 %d~%d / %d 只", b[0]+1, b[1], len(codes))
-		ds.scoreChunk(result, chunk, events, marketData, fallback, maxAttempts)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, chunk []string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			chunkResults[i] = ds.scoreChunk(chunk, events, marketData, fallback, maxAttempts)
+		}(i, chunk)
+	}
+	wg.Wait()
+
+	// 合并各批独立结果（无锁：每批写自己专属的 map 槽位）
+	for _, m := range chunkResults {
+		for code, sc := range m {
+			result[code] = sc
+		}
 	}
 
 	log.Printf("[D1Scorer] 批量评分完成: %d/%d只, 耗时 %v", len(result), len(codes), time.Since(t0))
 	return result
 }
 
-// scoreChunk 对单批个股（≤ llmBatchSize 只）构建 prompt 并调用 LLM 评分，结果合并入 result。
-// 轮询重试（最多 maxAttempts 次、间隔按指数抖动并封顶，防重要 D1 评分随调用失败丢失），
-// 整批失败/解析失败/漏项则回退上一轮评分（fallback 里有值）或按理由兜底 0 分。
-// English: builds a prompt for one chunk (≤ llmBatchSize stocks) and calls the LLM, merging results into
-// result. Retries with capped exponential backoff; on whole-chunk failure/parse error/missing stock it
-// falls back to the prior-round score (if present) or a reason-based 0.
-func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, fallback map[string]D1Score, maxAttempts int) {
+// scoreChunk 对单批个股（≤ llmBatchSize 只）构建 prompt 并调用 LLM 评分，返回本批独立结果 map
+// （不写共享 map，天然并发安全）。轮询重试（最多 maxAttempts 次、间隔按指数抖动并封顶，
+// 防重要 D1 评分随调用失败丢失），整批失败/解析失败/漏项则回退上一轮评分（fallback 里有值）
+// 或按理由兜底 0 分。
+// English: builds a prompt for one chunk (≤ llmBatchSize stocks) and calls the LLM, returning this
+// chunk's own result map (no shared map, so it is naturally concurrency-safe). Retries with capped
+// exponential backoff; on whole-chunk failure/parse error/missing stock it falls back to the prior
+// round score (if present) or a reason-based 0.
+func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, fallback map[string]D1Score, maxAttempts int) map[string]D1Score {
+	result := make(map[string]D1Score, len(codes))
 	// 构建用户prompt：列出每只个股及其关联事件、行情数据
 	// English: build the user prompt listing each stock with its events and market data.
 	var sb strings.Builder
@@ -271,7 +302,7 @@ func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events
 	if err != nil {
 		log.Printf("[D1Scorer] LLM调用轮询重试%d次仍失败: %v, 回退上一轮评分", maxAttempts, err)
 		ds.fillFallback(result, codes, fallback, "LLM失败")
-		return
+		return result
 	}
 
 	// 清洗 LLM 输出（去掉 markdown 代码块与多余文字，仅保留 JSON 数组）
@@ -281,7 +312,7 @@ func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
 		ds.fillFallback(result, codes, fallback, "解析失败")
 		log.Printf("[D1Scorer] JSON解析失败→本批 %d 只个股归0/回退: %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
-		return
+		return result
 	}
 
 	for _, r := range raw {
@@ -321,6 +352,7 @@ func (ds *D1Scorer) scoreChunk(result map[string]D1Score, codes []string, events
 			result[code] = r
 		}
 	}
+	return result
 }
 
 // fillFallback 对缺失评分的个股回退上一轮评分（fallback 有值则复用，无则按 reason 归 0）。

@@ -37,10 +37,37 @@ type SectorScanner struct {
 	mu           sync.RWMutex
 	cachedSector []SectorInfo      // 缓存的全量板块列表
 	api          *MarketAPI        // 行情 API（用于拉取成分股）
+	ths          *THSClient        // 同花顺出口（板块成分股 THS 优先，东财兜底）
 	hotSectors   []HotSector       // 最新热点板块结果
 	expandedList []string          // 展开后的自选股列表
 	matcher      *EventMatcher     // D1 事件匹配器
 	eventMap     map[string]string // 板块代码 → 事件描述
+}
+
+// SetSectorSource 注入同花顺出口：板块成分股获取改为同花顺优先、东财兜底，
+// 东财限流（502）时板块价值传导不中断。
+// （SetSectorSource injects the THS client so sector constituents prefer THS and fall
+// back to EastMoney, keeping sector→stock propagation alive during EastMoney throttling.）
+func (ss *SectorScanner) SetSectorSource(ths *THSClient) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.ths = ths
+}
+
+// sectorStocks 获取板块成分股：同花顺优先（仅代码/名称），失败或为空回退东财（含行情字段）。
+// THS 板块代码（881xxx/308xxx）直接可用；东财兜底供多因子打分使用完整行情。
+// （sectorStocks returns a sector's constituents: THS first (code/name only), falling back
+// to EastMoney (full quotes) for the multi-factor scoring path.）
+func (ss *SectorScanner) sectorStocks(sectorCode string, topN int) ([]StockInfo, error) {
+	ss.mu.RLock()
+	ths := ss.ths
+	ss.mu.RUnlock()
+	if ths != nil {
+		if list, err := ths.GetBoardStocks(sectorCode, topN); err == nil && len(list) > 0 {
+			return list, nil
+		}
+	}
+	return ss.api.GetSectorStocks(sectorCode, topN)
 }
 
 // NewSectorScanner 创建板块扫描器。
@@ -280,7 +307,7 @@ func (ss *SectorScanner) BuildEventMapFromNews(news []NewsItem, base map[string]
 // 因子：涨跌幅(0-35) + 换手率(0-25) + 成交额(0-20) + 量能(0-20) + 龙头加成(0-15)
 // 返回按总分降序排列的 ScoredStock 切片。
 func (ss *SectorScanner) ScoreSectorStocks(sectorCode string, maxStocks int) ([]ScoredStock, error) {
-	allStocks, err := ss.api.GetSectorStocks(sectorCode, 100)
+	allStocks, err := ss.sectorStocks(sectorCode, 100)
 	if err != nil || len(allStocks) == 0 {
 		return nil, fmt.Errorf("no stocks for sector %s", sectorCode)
 	}
@@ -408,7 +435,7 @@ func (ss *SectorScanner) ExpandWatchlist(hotSectors []HotSector, baseWatchlist [
 		if topN <= 0 {
 			topN = 3
 		}
-		stocks, err := ss.api.GetSectorStocks(hs.Sector.Code, topN)
+		stocks, err := ss.sectorStocks(hs.Sector.Code, topN)
 		if err != nil {
 			continue
 		}
@@ -434,18 +461,51 @@ func (ss *SectorScanner) ExpandWatchlist(hotSectors []HotSector, baseWatchlist [
 }
 
 // FindSectorsByNames 接收板块名称列表，从缓存的板块 Map 中匹配并返回对应的 SectorInfo（不区分大小写）。
+// 先做精确匹配；查不到的再做包含/子串匹配（事件归因板块名可能带 LLM 噪声，
+// 如"通信服务·的观点里线光缆"能落到真实板块"通信服务"），每个请求名最多返回一个最接近的板块。
 // 供 LLM 热点板块扩展使用：将 LLM 识别的板块名称映射为代码库中的板块对象，以便后续展开成分股。
+// （FindSectorsByNames matches requested sector names against the cached sector map (case-insensitive).
+// Exact match first; names that miss are then matched by containment/substring so noisy LLM sector
+// names like "通信服务·观点里线光缆" resolve to the real "通信服务". At most one closest board per
+// requested name is returned.）
 func (ss *SectorScanner) FindSectorsByNames(names []string) []SectorInfo {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
-	nameSet := make(map[string]bool, len(names))
-	for _, n := range names {
-		nameSet[strings.ToLower(strings.TrimSpace(n))] = true
-	}
 	var out []SectorInfo
-	for _, s := range ss.cachedSector {
-		if nameSet[strings.ToLower(strings.TrimSpace(s.Name))] {
-			out = append(out, s)
+	for _, n := range names {
+		query := strings.ToLower(strings.TrimSpace(n))
+		if query == "" {
+			continue
+		}
+		// 1) 精确匹配（无改动，保留原行为）（exact match, preserving prior behavior）
+		found := false
+		for _, s := range ss.cachedSector {
+			if strings.ToLower(strings.TrimSpace(s.Name)) == query {
+				out = append(out, s)
+				found = true
+			}
+		}
+		if found {
+			continue
+		}
+		// 2) 包含/子串匹配：事件板块名与真实板块名互相包含，取最长的真实板块名（最贴近语义）
+		best := &SectorInfo{}
+		bestLen := 0
+		for _, s := range ss.cachedSector {
+			realName := strings.ToLower(strings.TrimSpace(s.Name))
+			if realName == "" {
+				continue
+			}
+			if strings.Contains(query, realName) || strings.Contains(realName, query) {
+				if len(realName) > bestLen {
+					cp := s
+					best = &cp
+					bestLen = len(realName)
+				}
+			}
+		}
+		if best.Name != "" {
+			out = append(out, *best)
 		}
 	}
 	return out

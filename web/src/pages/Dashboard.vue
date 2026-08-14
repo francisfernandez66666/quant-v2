@@ -117,7 +117,7 @@
         <div class="news-scroll">
           <div v-for="(n, i) in newsItems.slice(0, 15)" :key="'n'+i" class="news-row">
             <div class="news-head">
-              <span class="news-time">{{ n.datetime ? n.datetime.slice(5, 16) : '' }}</span>
+              <span class="news-time">{{ fmtNewsTime(n.datetime) }}</span>
               <span class="news-title-text">{{ n.title }}</span>
             </div>
             <div class="news-tags-line">
@@ -140,8 +140,11 @@
       <!-- 运行信息行：运行时长 / 快照规模（股+板块） / 原始信号到最终信号的转换数 -->
       <div class="status-row-inline">
         <span>运行 {{ status.uptime || '-' }}</span>
+        <span>数据源：东财{{ dataSourceHealth.eastmoney ? '●' : '○' }} 新浪{{ dataSourceHealth.sina ? '●' : '○' }} 腾讯{{ dataSourceHealth.tencent ? '●' : '○' }} 同花顺{{ dataSourceHealth.ths ? '●' : '○' }}</span>
+        <span>新闻：财联社{{ newsSourceHealth.cainanshe ? '●' : '○' }} 同花顺{{ newsSourceHealth.kuaixun ? '●' : '○' }} 新浪{{ newsSourceHealth.sina ? '●' : '○' }}</span>
         <span>快照 {{ scanStats.total_stocks || 0 }}股 / {{ scanStats.hot_sector_count || 0 }}板块</span>
         <span>原始 {{ scanStats.raw_signals || 0 }} → 最终 {{ scanStats.final_signals || 0 }}</span>
+        <span>流程引擎：新闻抓取{{ engineHealth.news_agent ? "●" : "○" }} 策略引擎{{ engineHealth.strategy_engine ? "●" : "○" }} 板块验证{{ engineHealth.sector_agent ? "●" : "○" }} 战法扫描{{ engineHealth.combat_agent ? "●" : "○" }} LLM{{ engineHealth.llm ? "●" : "○" }} 同花顺{{ engineHealth.ths ? "●" : "○" }} 聚合器{{ engineHealth.aggregator ? "●" : "○" }}</span>
       </div>
     </div>
   </div>
@@ -161,6 +164,9 @@ const snapshotStocks = ref([])        // 热门个股快照 (hot stock snapshot)
 const snapshotTime = ref('')          // 快照更新时间 (snapshot update time)
 const ipoCalendar = ref([])           // IPO 日历 (IPO calendar)
 const showLog = ref(false)            // 是否打开日志弹窗 (whether the log modal is open)
+const dataSourceHealth = ref({})      // 数据源健康状况（东财/新浪/腾讯/同花顺）
+const newsSourceHealth = ref({})      // 新闻源健康状况（财联社/同花顺/新浪）
+const engineHealth = ref({})          // 流程引擎子系统健康状况
 
 let timer = null                      // 定时轮询句柄 (polling timer handle)
 let sseUnsub = null                   // SSE 取消订阅函数 (SSE unsubscribe function)
@@ -193,6 +199,29 @@ function ipoCountdown(c) {
   if (diff > 0) return `${diff}天后`
   if (diff === 0) return '📌今天'
   return `${-diff}天前`
+}
+
+/**
+ * 新闻时间格式化：兼容后端归一化后的 "YYYY-MM-DD HH:MM" 字符串，
+ * 以及历史遗留的 epoch 秒（数字或纯数字字符串），统一显示 "MM-DD HH:MM"。
+ * (Format news time: handles normalized "YYYY-MM-DD HH:MM" strings and legacy epoch
+ * seconds (numeric or numeric-string), showing "MM-DD HH:MM".)
+ */
+function fmtNewsTime(dt) {
+  if (dt === null || dt === undefined || dt === '') return ''
+  const s = String(dt)
+  if (/^\d+$/.test(s)) {
+    const t = new Date(Number(s) * 1000)
+    if (!isNaN(t.getTime())) {
+      const mm = String(t.getMonth()+1).padStart(2,'0')
+      const dd = String(t.getDate()).padStart(2,'0')
+      const hh = String(t.getHours()).padStart(2,'0')
+      const mi = String(t.getMinutes()).padStart(2,'0')
+      return `${mm}-${dd} ${hh}:${mi}`
+    }
+    return ''
+  }
+  return s.length >= 16 ? s.slice(5, 16) : s
 }
 
 /**
@@ -255,6 +284,12 @@ onMounted(() => {
   // 订阅后端 SSE 事件 (subscribe to backend SSE events)
   api.connectSSE()
   sseUnsub = api.onSSE(handleSSE)
+  // 初次加载：探测数据源健康状况 (probe data source health on first load)
+  api.fetchDataSourceHealth().then(r => { dataSourceHealth.value = r })
+  // 初次加载：探测新闻资讯源健康状况 (probe news source health on first load)
+  api.fetchNewsSourceHealth().then(r => { newsSourceHealth.value = r })
+  // 初次加载：探测流程引擎子系统健康状况 (probe engine health on first load)
+  api.fetchEngineHealth().then(r => { engineHealth.value = (r && r.engine) || r || {} })
 })
 /** 卸载时清理定时器和 SSE 订阅 (Clean up the timer and SSE subscription on unmount) */
 onUnmounted(() => {

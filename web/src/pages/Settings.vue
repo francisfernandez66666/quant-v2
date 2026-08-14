@@ -62,8 +62,8 @@
         <input v-model="llmApiUrl" placeholder="https://api.openai.com/v1" />
       </div>
       <div class="setting-row">
-        <label>API Key</label>
-        <input v-model="llmApiKey" type="password" placeholder="sk-..." />
+        <label>API Key(s)</label>
+        <textarea v-model="llmApiKeys" rows="4" placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" class="api-keys-input"></textarea>
       </div>
       <div class="setting-row">
         <label>模型</label>
@@ -167,8 +167,8 @@ const token = ref(localStorage.getItem('liangzai_token') || '')        // 登录
 // ── LLM config ──
 const llmApiUrl = ref('')          // LLM API 地址
 // LLM API URL
-const llmApiKey = ref('')          // LLM API Key（密码框输入）
-// LLM API Key (entered in a password field)
+const llmApiKeys = ref('')         // LLM API Key(s)（逗号分隔，多个则轮询分发）
+// LLM API Key(s) (comma-separated; multiple keys round-robin across requests)
 const llmModel = ref('')           // LLM 模型名
 // LLM model name
 const llmBatchConcurrency = ref(4) // 新闻归因 LLM 批量并发度
@@ -378,14 +378,14 @@ async function saveLLM() {
     // 调用后端接口保存 LLM 配置
     // Call the backend endpoint to save the LLM config
     await api.setLLMConfig({
-      api_key: llmApiKey.value,
+      api_keys: llmApiKeys.value.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
       api_url: llmApiUrl.value,
       model: llmModel.value,
       batch_concurrency: llmBatchConcurrency.value,
     })
     // 依据是否填写 Key 判断配置是否生效
     // Whether the config takes effect depends on whether a Key was provided
-    llmConfigured.value = !!llmApiKey.value
+    llmConfigured.value = !!llmApiKeys.value
     llmMsg.value = 'LLM 配置已保存并热生效'
     llmMsgType.value = 'ok'
   } catch (e) {
@@ -414,7 +414,12 @@ onMounted(async () => {
       llmApiUrl.value = cfg.api_url || ''
       llmModel.value = cfg.model || ''
       if (cfg.batch_concurrency > 0) llmBatchConcurrency.value = cfg.batch_concurrency
-      llmConfigured.value = !!(cfg.api_key || cfg.api_url)
+      if (Array.isArray(cfg.api_keys) && cfg.api_keys.length) {
+        llmApiKeys.value = cfg.api_keys.join('\n')
+      } else if (cfg.api_key) {
+        llmApiKeys.value = cfg.api_key
+      }
+      llmConfigured.value = !!(llmApiKeys.value || cfg.api_url)
     }
   } catch (_) {}
   try {
@@ -447,24 +452,30 @@ onMounted(async () => {
 .setting-header { font-size: 14px; font-weight: 600; color: #ccc; margin-bottom: 12px; }
 .setting-row {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 0; font-size: 13px;
+  padding: 8px 0; font-size: 14px;
 }
 .setting-row label { color: #888; }
 .setting-row input {
   padding: 6px 10px; border-radius: 4px; border: 1px solid #333;
-  background: #0f0f23; color: #e0e0e0; font-size: 13px; width: 240px; outline: none;
+  background: #0f0f23; color: #e0e0e0; font-size: 14px; width: 240px; outline: none;
 }
 .setting-row input:focus { border-color: #FF4D4F; }
+.setting-row textarea.api-keys-input {
+  padding: 6px 10px; border-radius: 4px; border: 1px solid #333;
+  background: #0f0f23; color: #e0e0e0; font-size: 14px; width: 240px; outline: none;
+  resize: vertical; font-family: inherit;
+}
+.setting-row textarea.api-keys-input:focus { border-color: #FF4D4F; }
 .status.online { color: #4caf50; }
 .status.offline { color: #888; }
 .account { color: #FF4D4F; }
 .btn-save, .btn-test {
   margin-top: 8px; padding: 6px 16px; border-radius: 4px; border: 1px solid #333;
-  background: transparent; color: #e0e0e0; cursor: pointer; font-size: 13px;
+  background: transparent; color: #e0e0e0; cursor: pointer; font-size: 14px;
 }
 .btn-save:hover, .btn-test:hover { background: #2a2a3e; }
 .btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
-.feedback { font-size: 12px; margin-top: 8px; padding: 4px 8px; border-radius: 4px; display: inline-block; }
+.feedback { font-size: 14px; margin-top: 8px; padding: 4px 8px; border-radius: 4px; display: inline-block; }
 .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .slider {
@@ -479,4 +490,12 @@ onMounted(async () => {
 .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
 .feedback.ok { color: #4caf50; }
 .feedback.err { color: #FF4D4F; }
+
+/* ====== Mobile ====== */
+@media (max-width: 768px) {
+  .setting-card { padding: 12px; }
+  .setting-row { flex-direction: column; align-items: stretch; gap: 6px; }
+  .setting-row input, .setting-row textarea { width: 100%; }
+  .setting-row label { font-size: 14px; }
+}
 </style>

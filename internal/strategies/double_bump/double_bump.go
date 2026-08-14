@@ -119,6 +119,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 
 	// 检测第一波放量突破（近5日内）：放量上破 5% 即视为第一波启动（Detect the first breakout within the last 5 bars: close +5% on above-average volume）
 	firstBreak := false
+	firstBreakIdx := -1
 	firstBreakVol := 0.0
 	for i := n - 5; i < n; i++ {
 		if i < 0 || i >= n {
@@ -126,6 +127,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		}
 		if kLines[i].Close > avgClose*1.05 && kLines[i].Volume > avgVol*dbc.FirstBreakVolumeMultiple {
 			firstBreak = true
+			firstBreakIdx = i
 			firstBreakVol = kLines[i].Volume
 			break
 		}
@@ -136,16 +138,24 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		return nil
 	}
 
-	// 第二波确认：最后一根K线量能 > 均量 × SecondBreakVolumeMultiple
-	// 两波放量说明资金持续介入，趋势健康；但仅当日上行时才计量能分（水下放量=出货/放量下跌）（Second-wave score: last bar volume
-	// above avg×SecondBreakVolumeMultiple earns full marks, only when the session is up (underwater volume = distribution).）
+	// 第二波确认（5日窗口）：在第一波之后的近5日内，任一再放量上行（收盘>开盘 且 量>均量×SecondBreakVolumeMultiple）
+	// 即视为第二波确认——不苛求"最后一根"正好放量，兼容盘中未放量但近5日已完成两波放量的形态。
+	// 但仅当日上行时才计量能分（水下放量=出货/放量下跌）（Second-wave confirm within the 5-day window: any up
+	// bar AFTER the first breakout with volume above avg×SecondBreakVolumeMultiple counts as the second wave.
+	// The last bar needn't be the spike itself, so patterns with two completed volume waves in the window still qualify;
+	// volume score still requires today's session to be up (underwater volume = distribution).）
 	volScore := 0.0
 	secondBreak := false
 	if upSession && firstBreakVol > 0 {
-		lastVol := kLines[n-1].Volume
-		if lastVol > avgVol*dbc.SecondBreakVolumeMultiple {
-			volScore = dbc.VolumeWeight * 100
-			secondBreak = true
+		for i := firstBreakIdx + 1; i < n; i++ {
+			if i >= n {
+				break
+			}
+			if kLines[i].Volume > avgVol*dbc.SecondBreakVolumeMultiple {
+				volScore = dbc.VolumeWeight * 100
+				secondBreak = true
+				break
+			}
 		}
 	}
 

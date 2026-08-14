@@ -235,25 +235,25 @@ onUnmounted(() => {
 .filter-row { display: flex; gap: 8px; margin-bottom: 14px; }
 /* 交易信号二级分类行：标签 + 下拉，战法再多也只占一行（Second-level classifier row: label + dropdown, one line no matter how many strategies）*/
 .strategy-row { margin-top: -6px; align-items: center; }
-.strategy-label { font-size: 12px; color: #888; }
+.strategy-label { font-size: 14px; color: #888; }
 .strategy-select {
   padding: 4px 8px; border: 1px solid #d9d9d9; border-radius: 4px;
-  background: #fff; color: #333; font-size: 13px;
+  background: #fff; color: #333; font-size: 14px;
 }
 .btn-clear {
   padding: 6px 16px; border-radius: 6px; border: 1px solid #FF4D4F;
-  background: transparent; color: #FF4D4F; font-size: 12px; cursor: pointer;
+  background: transparent; color: #FF4D4F; font-size: 14px; cursor: pointer;
 }
 .btn-clear:hover { background: rgba(255,77,79,0.1); }
 .btn-del {
   margin-left: auto; width: 20px; height: 20px; border-radius: 4px;
-  border: none; background: transparent; color: #666; font-size: 12px;
+  border: none; background: transparent; color: #666; font-size: 14px;
   line-height: 1; cursor: pointer; flex-shrink: 0;
 }
 .btn-del:hover { background: rgba(255,77,79,0.15); color: #FF4D4F; }
 .filter-btn {
   padding: 6px 16px; border-radius: 6px; border: 1px solid #333;
-  background: transparent; color: #999; font-size: 12px; cursor: pointer;
+  background: transparent; color: #999; font-size: 14px; cursor: pointer;
 }
 .filter-btn.active { background: #FF4D4F; border-color: #FF4D4F; color: #fff; }
 .msg-list { display: flex; flex-direction: column; gap: 8px; }
@@ -266,22 +266,32 @@ onUnmounted(() => {
 .msg-card.alert-warn { border-left-color: #FAAD14; }
 .msg-card.alert-info { border-left-color: #4fc3f7; }
 .msg-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
-.badge-level { font-size: 11px; padding: 1px 8px; border-radius: 4px; font-weight: 600; }
-.msg-stock { font-size: 12px; color: #4fc3f7; font-family: monospace; font-weight: 600; }
+.badge-level { font-size: 14px; padding: 1px 8px; border-radius: 4px; font-weight: 600; }
+.msg-stock { font-size: 14px; color: #4fc3f7; font-family: monospace; font-weight: 600; }
 .level-danger { background: rgba(255,77,79,0.15); color: #FF4D4F; }
 .level-success { background: rgba(76,175,80,0.15); color: #4caf50; }
 .level-warn { background: rgba(250,173,20,0.15); color: #FAAD14; }
 .level-info { background: rgba(79,195,247,0.15); color: #4fc3f7; }
-.msg-time { font-size: 11px; color: #555; flex: 1; }
-.badge-action { font-size: 11px; padding: 1px 8px; border-radius: 4px; }
+.msg-time { font-size: 14px; color: #555; flex: 1; }
+.badge-action { font-size: 14px; padding: 1px 8px; border-radius: 4px; }
 .action-buy { background: rgba(76,175,80,0.15); color: #4caf50; }
 .action-sell { background: rgba(255,77,79,0.15); color: #FF4D4F; }
 .action-hold { background: rgba(153,153,153,0.15); color: #999; }
-.msg-title { font-size: 13px; color: #e0e0e0; font-weight: 600; }
-.msg-body { font-size: 12px; color: #999; margin-top: 4px; }
+.msg-title { font-size: 14px; color: #e0e0e0; font-weight: 600; }
+.msg-body { font-size: 14px; color: #999; margin-top: 4px; }
 .msg-footer { display: flex; gap: 12px; margin-top: 8px; }
-.msg-code { font-size: 11px; color: #4fc3f7; font-family: monospace; }
-.msg-name { font-size: 11px; color: #888; }
+.msg-code { font-size: 14px; color: #4fc3f7; font-family: monospace; }
+.msg-name { font-size: 14px; color: #888; }
 .empty { padding: 60px; text-align: center; }
 .empty-text { font-size: 14px; color: #555; }
+
+/* ====== Mobile ====== */
+@media (max-width: 768px) {
+  .filter-row { flex-wrap: wrap; gap: 6px; }
+  .filter-btn { padding: 6px 14px; font-size: 14px; }
+  .msg-card { padding: 12px; }
+  .msg-footer { flex-wrap: wrap; }
+  .msg-title { font-size: 14px; }
+  .msg-body { font-size: 14px; }
+}
 </style>

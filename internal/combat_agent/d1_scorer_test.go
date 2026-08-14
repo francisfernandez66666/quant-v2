@@ -221,9 +221,12 @@ func TestBatchScoreChunked(t *testing.T) {
 			t.Fatalf("%s 应有score=0.5, got %+v ok=%v", c, s, ok)
 		}
 	}
-	// 分批日志应出现在输出中（覆盖分批评分路径）
-	if !strings.Contains(prompts[0], "代码: 600001") || !strings.Contains(prompts[2], "代码: 600021") {
-		t.Fatalf("分批边界异常: prompts[0]=%s prompts[2]=%s", prompts[0], prompts[2])
+	// 分批边界：所有分批结果合并后应覆盖全部代码（并发下批次顺序不定，按内容断言）
+	// English: chunk boundaries — all chunks merged must cover every code (chunk order is
+	// nondeterministic under concurrency, so assert by content).
+	allPrompts := strings.Join(prompts, "\n")
+	if !strings.Contains(allPrompts, "代码: 600001") || !strings.Contains(allPrompts, "代码: 600021") {
+		t.Fatalf("分批边界异常: prompts=%v", prompts)
 	}
 }
 

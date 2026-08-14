@@ -251,6 +251,25 @@ func (f *Fetcher) fetch() {
 		}
 	}
 
+	// 1b. 腾讯批量兜底：新浪源被封/超时时，用腾讯 qt.gtimg.cn 一次拉全池，
+	// 保证 5s 快照始终有数据（quote() 直接命中，HTTP 接口秒回）。
+	// Tencent batch fallback so the 5s snapshot is always warm even when Sina is blocked.
+	if len(snapshot.Stocks) < len(all) && f.api != nil {
+		var missCodes []string
+		for _, c := range all {
+			if _, ok := snapshot.Stocks[c]; !ok {
+				missCodes = append(missCodes, c)
+			}
+		}
+		if len(missCodes) > 0 {
+			for code, si := range f.api.GetTencentQuotes(missCodes) {
+				if si != nil && si.Price > 0 {
+					snapshot.Stocks[code] = si
+				}
+			}
+		}
+	}
+
 	// 2. 兜底：未命中的个股走同花顺→东财
 	miss := 0
 	for _, code := range all {

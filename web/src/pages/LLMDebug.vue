@@ -209,10 +209,10 @@ onMounted(loadData)
 .header-right { display: flex; align-items: center; gap: 10px; }
 .btn-log {
   padding: 6px 14px; border-radius: 6px; border: 1px solid #b388ff;
-  background: transparent; color: #b388ff; font-size: 13px; cursor: pointer;
+  background: transparent; color: #b388ff; font-size: 14px; cursor: pointer;
 }
 .btn-log:hover { background: rgba(179,136,255,0.1); }
-.btn-refresh { padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F; background: transparent; color: #FF4D4F; font-size: 13px; cursor: pointer; }
+.btn-refresh { padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F; background: transparent; color: #FF4D4F; font-size: 14px; cursor: pointer; }
 .btn-refresh:disabled { opacity: 0.5; }
 .btn-refresh:hover { background: rgba(255,77,79,0.1); }
 
@@ -220,7 +220,7 @@ onMounted(loadData)
 
 .summary-bar { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; background: #1a1a2e; border-radius: 8px; padding: 12px 16px; }
 .summary-item { display: flex; flex-direction: column; gap: 2px; min-width: 80px; }
-.summary-label { font-size: 11px; color: #888; }
+.summary-label { font-size: 14px; color: #888; }
 .summary-value { font-size: 16px; font-weight: 600; color: #e0e0e0; }
 .tag-llm { color: #4caf50; }
 .tag-keyword { color: #ff9800; }
@@ -228,12 +228,12 @@ onMounted(loadData)
 .section-title { font-size: 15px; margin-bottom: 10px; color: #ccc; border-bottom: 1px solid #2a2a3e; padding-bottom: 6px; }
 
 .stage1-list { margin-bottom: 24px; }
-.title-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 4px; margin-bottom: 2px; font-size: 13px; }
+.title-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 4px; margin-bottom: 2px; font-size: 14px; }
 .title-item.selected { background: rgba(76,175,80,0.08); }
 .title-item.discarded { opacity: 0.45; }
-.title-idx { color: #666; min-width: 24px; font-size: 11px; text-align: right; }
+.title-idx { color: #666; min-width: 24px; font-size: 14px; text-align: right; }
 .title-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.title-badge { font-size: 11px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
+.title-badge { font-size: 14px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
 .badge-pass { background: rgba(76,175,80,0.2); color: #4caf50; }
 .badge-skip { background: rgba(255,152,0,0.15); color: #ff9800; }
 
@@ -241,22 +241,31 @@ onMounted(loadData)
 .event-card { background: #1a1a2e; border-radius: 8px; padding: 12px 14px; border: 1px solid #2a2a3e; }
 .event-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .event-title { flex: 1; font-size: 14px; font-weight: 600; color: #e0e0e0; min-width: 0; }
-.event-score { font-size: 12px; color: #888; white-space: nowrap; }
+.event-score { font-size: 14px; color: #888; white-space: nowrap; }
 
-.tag { font-size: 11px; padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
+.tag { font-size: 14px; padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
 .tag-利好 { background: rgba(76,175,80,0.2); color: #4caf50; }
 .tag-利空 { background: rgba(255,77,79,0.2); color: #FF4D4F; }
 .tag-中性 { background: rgba(255,152,0,0.15); color: #ff9800; }
 
 .event-body { display: flex; flex-direction: column; gap: 5px; }
-.event-row { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; }
+.event-row { display: flex; align-items: flex-start; gap: 8px; font-size: 14px; }
 .event-label { color: #888; min-width: 32px; flex-shrink: 0; }
 .event-tags { display: flex; flex-wrap: wrap; gap: 4px; }
-.mini-tag { font-size: 11px; padding: 1px 6px; border-radius: 3px; background: #2a2a3e; color: #aaa; }
+.mini-tag { font-size: 14px; padding: 1px 6px; border-radius: 3px; background: #2a2a3e; color: #aaa; }
 .mini-tag.sector { color: #64b5f6; background: rgba(100,181,246,0.1); }
 .mini-tag.stock { color: #ff9800; background: rgba(255,152,0,0.1); }
 .mini-tag.impact-高 { color: #FF4D4F; background: rgba(255,77,79,0.15); }
 .mini-tag.impact-中 { color: #ff9800; background: rgba(255,152,0,0.12); }
 .mini-tag.impact-低 { color: #888; background: #2a2a3e; }
 .event-reason { color: #aaa; line-height: 1.4; }
+
+/* ====== Mobile ====== */
+@media (max-width: 768px) {
+  .page-header { flex-wrap: wrap; gap: 8px; }
+  .title-item { flex-wrap: wrap; }
+  .summary-bar { gap: 10px; padding: 10px; }
+  .title-text { font-size: 14px; }
+  .event-title { font-size: 15px; }
+}
 </style>

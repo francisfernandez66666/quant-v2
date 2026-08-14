@@ -80,43 +80,43 @@
       </div>
       <!-- 持仓行 + 可展开 分时区（Holding row + expandable K-line area）-->
       <div v-for="h in holdings" :key="h.code" class="pos-row-group">
-      <div :class="rowClass(h)">
-        <span class="col-code">{{ h.code }}</span>
-        <span class="col-name">{{ h.name }}</span>
-        <span class="col-num">{{ h.quantity }}</span>
-        <span class="col-price">{{ h.cost_price?.toFixed(2) }}</span>
-        <span class="col-price">{{ h.cur_price?.toFixed(2) }}</span>
-        <span :class="['col-chg', (h.change_pct || 0) >= 0 ? 'up' : 'down']">
+      <div :class="rowClass(h)" @click="onRowTap(h)">
+        <span class="col-code" data-label="代码">{{ h.code }}</span>
+        <span class="col-name" data-label="名称">{{ h.name }}</span>
+        <span class="col-num" data-label="数量">{{ h.quantity }}</span>
+        <span class="col-price" data-label="成本价">{{ h.cost_price?.toFixed(2) }}</span>
+        <span class="col-price" data-label="现价">{{ h.cur_price?.toFixed(2) }}</span>
+        <span :class="['col-chg', (h.change_pct || 0) >= 0 ? 'up' : 'down']" data-label="当日涨跌">
           {{ (h.change_pct || 0) > 0 ? '+' : '' }}{{ (h.change_pct || 0).toFixed(2) }}%
         </span>
-        <span :class="['col-chg', (h.pnl_pct || 0) >= 0 ? 'up' : 'down']">
+        <span :class="['col-chg', (h.pnl_pct || 0) >= 0 ? 'up' : 'down']" data-label="持仓盈亏">
           {{ (h.pnl_pct || 0) > 0 ? '+' : '' }}{{ (h.pnl_pct || 0).toFixed(2) }}%
         </span>
-        <span v-if="h.signal_active" class="col-sig" title="有策略信号">⚡</span>
-        <span v-else class="col-sig dim">—</span>
-        <span :class="['col-score', (h.n_score||0) >= 60 ? 'strong' : ((h.n_score||0) > 0 ? 'watch' : '')]">
+        <span v-if="h.signal_active" class="col-sig" data-label="信号" title="有策略信号">⚡</span>
+        <span v-else class="col-sig dim" data-label="信号">—</span>
+        <span :class="['col-score', (h.n_score||0) >= 60 ? 'strong' : ((h.n_score||0) > 0 ? 'watch' : '')]" data-label="N形">
           {{ (h.n_score || 0) > 0 ? h.n_score.toFixed(0) : '—' }}
         </span>
-        <span :class="['col-score', (h.dragon_score||0) >= 70 ? 'strong' : ((h.dragon_score||0) >= 50 ? 'watch' : '')]">
+        <span :class="['col-score', (h.dragon_score||0) >= 70 ? 'strong' : ((h.dragon_score||0) >= 50 ? 'watch' : '')]" data-label="龙头">
           {{ (h.dragon_score || 0) > 0 ? h.dragon_score.toFixed(0) : '—' }}
         </span>
-        <span :class="['col-score', (h.m_score||0) >= 50 ? 'watch' : '']">
+        <span :class="['col-score', (h.m_score||0) >= 50 ? 'watch' : '']" data-label="动量">
           {{ (h.m_score || 0) > 0 ? h.m_score.toFixed(0) : '—' }}
         </span>
-        <span class="col-sl">
+        <span class="col-sl" data-label="止盈/止损">
           <span class="sl-tp">+{{ (h.take_profit_pct||8).toFixed(1) }}%</span>
           <span class="sl-div">/</span>
           <span class="sl-sel">-{{ (h.stop_loss_pct||5).toFixed(1) }}%</span>
         </span>
-        <span class="col-kline">
-          <button class="btn-kline" @click="toggleKline(h.code)" :title="klineOpen.has(h.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(h.code) ? '收起' : '分时' }}</button>
+        <span class="col-kline" data-label="分时">
+          <button class="btn-kline" @click.stop="toggleKline(h.code)" :title="klineOpen.has(h.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(h.code) ? '收起' : '分时' }}</button>
         </span>
-        <span class="col-actions">
-          <button class="btn-lot" @click="openAddLot(h)">加减仓</button>
-          <button class="btn-cost" @click="openSetCost(h)">改成本</button>
-          <button class="btn-edit" @click="showLotsFor(h)">明细</button>
-          <button class="btn-edit" @click="editHolding(h)">编辑</button>
-          <button class="btn-sell" @click="openCloseHolding(h)">清仓</button>
+        <span class="col-actions" data-label="操作">
+          <button class="btn-lot" @click.stop="openAddLot(h)">加减仓</button>
+          <button class="btn-cost" @click.stop="openSetCost(h)">改成本</button>
+          <button class="btn-edit" @click.stop="showLotsFor(h)">明细</button>
+          <button class="btn-edit" @click.stop="editHolding(h)">编辑</button>
+          <button class="btn-sell" @click.stop="openCloseHolding(h)">清仓</button>
         </span>
       </div>
       <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
@@ -126,7 +126,19 @@
       </div>
     </div>
 
-    <!-- 加减仓弹窗：展示当前数量/成本，选择加/减方向，输入价格与数量，实时预览结果（Add/trim modal: shows qty/cost, picks add or trim, inputs price and qty, and previews the result live）-->
+    <!-- 移动端：点击行弹出的底部操作菜单 -->
+    <div class="sheet-overlay" v-if="sheetHolding" @click="sheetHolding = null">
+      <div class="action-sheet" @click.stop>
+        <div class="sheet-title">{{ sheetHolding.code }} {{ sheetHolding.name }}</div>
+        <button class="sheet-btn" @click="sheetKline">{{ klineOpen.has(sheetHolding.code) ? '收起分时' : '展开分时' }}</button>
+        <button class="sheet-btn" @click="sheetLot">加减仓</button>
+        <button class="sheet-btn" @click="sheetCost">改成本</button>
+        <button class="sheet-btn" @click="sheetLots">加仓明细</button>
+        <button class="sheet-btn" @click="sheetEdit">编辑持仓</button>
+        <button class="sheet-btn sheet-danger" @click="sheetClose">清仓</button>
+        <button class="sheet-btn sheet-cancel" @click="sheetHolding = null">取消</button>
+      </div>
+    </div>
     <div class="modal-overlay" v-if="showLot" @click.self="showLot = false">
       <div class="modal">
         <div class="modal-title">
@@ -392,6 +404,8 @@ const closePnlAmount = ref(0)        // 清仓弹窗：盈亏金额
 // close-out modal: P&L amount
 const closePnlPct = ref(0)           // 清仓弹窗：盈亏比例
 // close-out modal: P&L percentage
+const sheetHolding = ref(null)       // 移动端操作菜单当前选中的持仓对象
+// the holding currently selected in the mobile action sheet
 const closePreviewValid = ref(false) // 清仓弹窗：是否可展示盈亏预览
 // close-out modal: whether the P&L preview is valid
 
@@ -760,6 +774,54 @@ function toggleKline(code) {
   else next.add(code)
   klineOpen.value = next
 }
+
+/** 移动端：点击行打开操作菜单 */
+/** Mobile: tap a row to open the action sheet */
+function onRowTap(h) {
+  if (window.innerWidth > 768) return
+  sheetHolding.value = h
+}
+/** 移动端：操作菜单 - 展开/收起分时 */
+function sheetKline() {
+  if (!sheetHolding.value) return
+  toggleKline(sheetHolding.value.code)
+  sheetHolding.value = null
+}
+/** 移动端：操作菜单 - 加减仓 */
+function sheetLot() {
+  if (!sheetHolding.value) return
+  const h = sheetHolding.value
+  sheetHolding.value = null
+  openAddLot(h)
+}
+/** 移动端：操作菜单 - 改成本 */
+function sheetCost() {
+  if (!sheetHolding.value) return
+  const h = sheetHolding.value
+  sheetHolding.value = null
+  openSetCost(h)
+}
+/** 移动端：操作菜单 - 加仓明细 */
+function sheetLots() {
+  if (!sheetHolding.value) return
+  const h = sheetHolding.value
+  sheetHolding.value = null
+  showLotsFor(h)
+}
+/** 移动端：操作菜单 - 编辑持仓 */
+function sheetEdit() {
+  if (!sheetHolding.value) return
+  const h = sheetHolding.value
+  sheetHolding.value = null
+  editHolding(h)
+}
+/** 移动端：操作菜单 - 清仓 */
+function sheetClose() {
+  if (!sheetHolding.value) return
+  const h = sheetHolding.value
+  sheetHolding.value = null
+  openCloseHolding(h)
+}
 </script>
 
 <style scoped>
@@ -770,15 +832,15 @@ function toggleKline(code) {
 .total-pnl { font-size: 16px; font-weight: 700; white-space: nowrap; margin-right: 16px; }
 .total-pnl.up { color: #e74c3c; }
 .total-pnl.down { color: #27ae60; }
-.btn-reset { font-size: 11px; margin-left: 8px; padding: 2px 8px; border: 1px solid #555; border-radius: 4px; background: none; color: #aaa; cursor: pointer; }
+.btn-reset { font-size: 14px; margin-left: 8px; padding: 2px 8px; border: 1px solid #555; border-radius: 4px; background: none; color: #aaa; cursor: pointer; }
 .btn-reset:hover { background: #333; }
 .balance { font-size: 14px; color: #4caf50; font-weight: 600; cursor: pointer; }
 .balance-editing input { width: 150px; padding: 6px 10px; border-radius: 6px; border: 1px solid #4caf50; background: #0f0f23; color: #4caf50; font-size: 14px; font-weight: 600; text-align: right; outline: none; }
 .btn-add {
   padding: 8px 16px; border-radius: 6px; border: none;
-  background: #FF4D4F; color: #fff; font-size: 13px; cursor: pointer;
+  background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer;
 }
-.positions-table { background: #1a1a2e; border-radius: 8px; overflow-x: auto; font-size: 13px; white-space: nowrap; }
+.positions-table { background: #1a1a2e; border-radius: 8px; overflow-x: auto; font-size: 14px; white-space: nowrap; }
 .table-header, .table-row {
   display: flex; align-items: center; padding: 10px 16px; gap: 0;
   min-width: 1120px;
@@ -795,7 +857,7 @@ function toggleKline(code) {
 .col-kline { flex: 0 0 60px; text-align: center; }
 .btn-kline {
   background: transparent; border: 1px solid #3a3a55; color: #7ab8ff;
-  border-radius: 4px; cursor: pointer; font-size: 11px; padding: 2px 8px;
+  border-radius: 4px; cursor: pointer; font-size: 14px; padding: 2px 8px;
 }
 .btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
 .pos-kline-row { padding: 8px 16px 12px; background: #16162a; }
@@ -819,7 +881,7 @@ function toggleKline(code) {
 .sl-sel { color: #4caf50; }
 .col-actions { display: flex; gap: 4px; flex: 0 0 240px; justify-content: center; }
 .btn-edit, .btn-sell, .btn-lot, .btn-cost {
-  padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; white-space: nowrap;
+  padding: 4px 8px; border-radius: 4px; font-size: 14px; cursor: pointer; white-space: nowrap;
 }
 .btn-edit { border: 1px solid #4fc3f7; background: transparent; color: #4fc3f7; }
 .btn-edit:hover { background: rgba(79,195,247,0.1); }
@@ -829,8 +891,8 @@ function toggleKline(code) {
 .btn-cost:hover { background: rgba(250,173,20,0.1); }
 .btn-sell { border: 1px solid #FAAD14; background: transparent; color: #FAAD14; }
 .btn-sell:hover { background: rgba(250,173,20,0.1); }
-.empty { text-align: center; padding: 60px; color: #555; font-size: 13px; }
-.hint { color: #444; font-size: 12px; margin-top: 8px; }
+.empty { text-align: center; padding: 60px; color: #555; font-size: 14px; }
+.hint { color: #444; font-size: 14px; margin-top: 8px; }
 
 /* modal */
 .modal-overlay {
@@ -843,7 +905,7 @@ function toggleKline(code) {
 .modal-title { font-size: 16px; font-weight: 600; color: #e0e0e0; margin-bottom: 16px; }
 .modal-title .lot-dir { display: inline-flex; gap: 4px; margin-left: 12px; vertical-align: middle; }
 .lot-dir .dir-btn {
-  padding: 3px 12px; border-radius: 4px; font-size: 12px; cursor: pointer;
+  padding: 3px 12px; border-radius: 4px; font-size: 14px; cursor: pointer;
   border: 1px solid #333; background: transparent; color: #888;
 }
 .lot-dir .dir-btn.active-add { border-color: #FF4D4F; background: rgba(255,77,79,0.15); color: #FF4D4F; }
@@ -852,19 +914,19 @@ function toggleKline(code) {
 .btn-confirm-sell { background: #4caf50; }
 .btn-confirm-sell:disabled { opacity: 0.5; cursor: not-allowed; }
 .form-row { margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
-.form-row label { width: 56px; color: #888; font-size: 13px; flex-shrink: 0; }
+.form-row label { width: 56px; color: #888; font-size: 14px; flex-shrink: 0; }
 .form-row input {
   flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid #333;
-  background: #0f0f23; color: #e0e0e0; font-size: 13px; outline: none;
+  background: #0f0f23; color: #e0e0e0; font-size: 14px; outline: none;
 }
 .form-row input:focus { border-color: #FF4D4F; }
-.lookup-result { font-size: 11px; color: #4caf50; white-space: nowrap; }
-.static-val { color: #e0e0e0; font-size: 13px; white-space: nowrap; }
-.preview { margin: 4px 0 8px 64px; font-size: 12px; color: #b388ff; }
+.lookup-result { font-size: 14px; color: #4caf50; white-space: nowrap; }
+.static-val { color: #e0e0e0; font-size: 14px; white-space: nowrap; }
+.preview { margin: 4px 0 8px 64px; font-size: 14px; color: #b388ff; }
 .pnl-up { color: #FF4D4F; font-weight: 700; }
 .pnl-down { color: #4caf50; font-weight: 700; }
 .modal.wide { width: 480px; }
-.lots-table { margin-bottom: 12px; font-size: 12px; }
+.lots-table { margin-bottom: 12px; font-size: 14px; }
 .lots-header, .lots-row {
   display: flex; align-items: center; padding: 6px 8px; gap: 8px;
 }
@@ -876,14 +938,14 @@ function toggleKline(code) {
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .btn-cancel {
   padding: 8px 20px; border-radius: 6px; border: 1px solid #333;
-  background: transparent; color: #888; font-size: 13px; cursor: pointer;
+  background: transparent; color: #888; font-size: 14px; cursor: pointer;
 }
 .btn-confirm {
   padding: 8px 20px; border-radius: 6px; border: none;
-  background: #FF4D4F; color: #fff; font-size: 13px; cursor: pointer;
+  background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer;
 }
 .legend {
-  margin-top: 12px; padding: 6px 12px; font-size: 11px; color: #666;
+  margin-top: 12px; padding: 6px 12px; font-size: 14px; color: #666;
   background: #1a1a2e; border-radius: 6px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
 }
 .lg-sep { color: #333; }
@@ -891,4 +953,42 @@ function toggleKline(code) {
 .lg-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; vertical-align: middle; }
 .lg-dot.up { background: #FF4D4F; }
 .lg-dot.warn { background: #FAAD14; }
+
+/* ====== Mobile: horizontal scroll + larger fonts ====== */
+@media (max-width: 768px) {
+  .positions-table { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+  .table-header, .table-row { min-width: 1200px; font-size: 14px; padding: 10px 14px; }
+  .table-header { display: flex; }
+  .pos-row-group { min-width: 0; }
+  .page-header { flex-direction: column; align-items: stretch; gap: 8px; }
+  .header-right { flex-wrap: wrap; gap: 8px; }
+  .total-pnl { font-size: 15px; margin-right: 0; }
+  .pos-kline-row { padding: 6px; }
+  .modal { width: 92%; max-width: 360px; padding: 18px; }
+  .modal.wide { width: 92%; }
+  .form-row { flex-wrap: wrap; }
+  .form-row label { width: 64px; }
+  .preview { margin-left: 0; }
+  .table-row { cursor: pointer; }
+  .sheet-overlay {
+    position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,0.6);
+    display: flex; align-items: flex-end;
+  }
+  .action-sheet {
+    width: 100%; background: #1a1a2e; border-radius: 14px 14px 0 0;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+  }
+  .sheet-title {
+    font-size: 14px; color: #999; text-align: center;
+    padding: 8px 0 12px; border-bottom: 1px solid #2a2a3e; margin-bottom: 8px;
+  }
+  .sheet-btn {
+    width: 100%; padding: 14px; border-radius: 8px; border: none;
+    background: #0f0f23; color: #4fc3f7; font-size: 16px; cursor: pointer;
+    margin-bottom: 8px; text-align: center;
+  }
+  .sheet-btn:active { opacity: 0.8; }
+  .sheet-danger { color: #FF4D4F; }
+  .sheet-cancel { background: #2a2a3e; color: #888; }
+}
 </style>

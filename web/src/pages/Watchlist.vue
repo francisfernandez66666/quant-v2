@@ -35,24 +35,24 @@
       <div class="ev-body">
           <!-- 自选行 + 可展开 分时区（Watchlist row + expandable K-line area）-->
           <div v-for="e in sortedEvals" :key="e.code" class="ev-row-group">
-          <div :class="rowClass(e)">
-          <span class="ev-code">{{ e.code }}</span>
-          <span class="ev-name">{{ e.name || '-' }}</span>
-          <span class="ev-price">¥{{ (e.price || 0).toFixed(2) }}</span>
-          <span :class="['ev-chg', (e.change_pct || 0) >= 0 ? 'up' : 'down']">
+          <div :class="rowClass(e)" @click="onRowTap(e)">
+          <span class="ev-code" data-label="代码">{{ e.code }}</span>
+          <span class="ev-name" data-label="名称">{{ e.name || '-' }}</span>
+          <span class="ev-price" data-label="现价">¥{{ (e.price || 0).toFixed(2) }}</span>
+          <span :class="['ev-chg', (e.change_pct || 0) >= 0 ? 'up' : 'down']" data-label="涨跌">
             {{ (e.change_pct || 0) > 0 ? '+' : '' }}{{ (e.change_pct || 0).toFixed(2) }}%
           </span>
-          <span :class="scoreClass(e.n_score, e.n_pass, 80)">{{ e.n_score > 0 ? e.n_score.toFixed(0) : '—' }}</span>
-          <span :class="scoreClass(e.dragon_score, e.dragon_pass, 80)">{{ e.dragon_score > 0 ? e.dragon_score.toFixed(0) : '—' }}</span>
-          <span :class="scoreClass(e.db_score, e.db_pass, 80)">{{ e.db_score > 0 ? e.db_score.toFixed(0) : '—' }}</span>
-          <span :class="scoreClass(e.dr_score, e.dr_pass, 80)">{{ e.dr_score > 0 ? e.dr_score.toFixed(0) : '—' }}</span>
-          <span :class="scoreClass(e.m_score, e.m_pass, 70)">{{ e.m_score > 0 ? e.m_score.toFixed(0) : '—' }}</span>
-          <span><button class="btn-kline" @click="toggleKline(e.code)" :title="klineOpen.has(e.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(e.code) ? '收起' : '分时' }}</button></span>
-          <span><button class="btn-remove" @click="remove(e.code)">✕</button></span>
+          <span :class="scoreClass(e.n_score, e.n_pass, 80)" data-label="N形">{{ e.n_score > 0 ? e.n_score.toFixed(0) : '—' }}</span>
+          <span :class="scoreClass(e.dragon_score, e.dragon_pass, 80)" data-label="龙头">{{ e.dragon_score > 0 ? e.dragon_score.toFixed(0) : '—' }}</span>
+          <span :class="scoreClass(e.db_score, e.db_pass, 80)" data-label="双凸">{{ e.db_score > 0 ? e.db_score.toFixed(0) : '—' }}</span>
+          <span :class="scoreClass(e.dr_score, e.dr_pass, 80)" data-label="回头">{{ e.dr_score > 0 ? e.dr_score.toFixed(0) : '—' }}</span>
+          <span :class="scoreClass(e.m_score, e.m_pass, 70)" data-label="动量">{{ e.m_score > 0 ? e.m_score.toFixed(0) : '—' }}</span>
+          <span data-label="K线"><button class="btn-kline" @click.stop="toggleKline(e.code)" :title="klineOpenCode === e.code ? '收起分时' : '展开分时'">{{ klineOpenCode === e.code ? '收起' : '分时' }}</button></span>
+          <span data-label="操作"><button class="btn-remove" @click.stop="remove(e.code)">✕</button></span>
         </div>
         <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
-        <div v-if="klineOpen.has(e.code)" class="ev-kline-row">
-          <KLineChart :code="e.code" :name="e.name" />
+        <div v-if="klineOpenCode === e.code" class="ev-kline-row">
+          <KLineChart :key="e.code" :code="e.code" :name="e.name" />
         </div>
       </div>
       </div>
@@ -69,6 +69,18 @@
       <span class="lg-sep">|</span>
       <span class="lg-item">点击表头排序</span>
     </div>
+
+    <!-- 移动端：点击行弹出的底部操作菜单 -->
+    <div class="sheet-overlay" v-if="sheetStock" @click="sheetStock = null">
+      <div class="action-sheet" @click.stop>
+        <div class="sheet-title">{{ sheetStock.code }} {{ sheetStock.name || '' }}</div>
+        <button class="sheet-btn" @click="sheetToggleKline">
+          {{ klineOpenCode === sheetStock.code ? '收起分时' : '展开分时' }}
+        </button>
+        <button class="sheet-btn sheet-danger" @click="sheetRemove">删除</button>
+        <button class="sheet-btn sheet-cancel" @click="sheetStock = null">取消</button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -84,8 +96,6 @@ import KLineChart from '../components/KLineChart.vue'              // 分时图�
 // ── Reactive state ──
 const stocks = ref([])                // 自选股数据（含实时价格 + 评分）
 // watchlist data (realtime prices + scores)
-const klineOpen = ref(new Set())      // 已展开分时的自选代码集合
-// the set of watchlist codes with their K-line expanded
 const newCode = ref('')               // 添加输入框的代码
 // the code typed in the add input
 const sortKey = ref('')               // 当前排序列
@@ -98,6 +108,8 @@ const feedback = ref('')              // 操作反馈文字
 // action feedback text
 const feedbackType = ref('ok')        // 反馈类型：'ok' | 'err'
 // feedback type: 'ok' | 'err'
+const sheetStock = ref(null)          // 移动端操作菜单当前选中的股票对象
+// the stock object currently selected in the mobile action sheet
 
 let timer = null                  // 定时轮询句柄
 // polling timer handle
@@ -220,9 +232,12 @@ const sortedEvals = computed(() => {
 async function load() {
   try {
     const st = await api.fetchStatus()
-    // 非交易时段直接跳过，保留旧数据
-    // Outside trading hours, skip and keep the old data
-    if (!api.isTradingSession(st.session) && stocks.value.length) {
+    // 非交易时段直接跳过，保留旧数据；
+    // 例外：检测到空 code（历史 bug 写入的脏缓存）时仍强制刷新，否则分时展开判定会全行命中
+    // Outside trading hours, keep old data; EXCEPT when rows have empty codes (stale dirty cache from an
+    // earlier bug) — then force a refresh, otherwise the K-line expand check matches every row.
+    const hasEmptyCode = stocks.value.some(s => !s.code)
+    if (!api.isTradingSession(st.session) && stocks.value.length && !hasEmptyCode) {
       return
     }
     api.setLastSession(st.session)
@@ -244,17 +259,21 @@ async function load() {
     if (ev) ev.forEach(e => { evMap[e.code] = e })
     // 快照中查不到的自选股用占位数据填充（优先自选接口的名称/价格，避免显示乱码代码/0 价）
     // Watchlist stocks missing from the snapshot get placeholder rows (preferring the watchlist endpoint's name/price, avoiding garbled codes / 0 prices)
-    const wlRow = (c) => ({
-      code: c.code,
-      name: wlMap[c.code]?.name || evMap[c.code]?.name || c.code,
-      price: Number(wlMap[c.code]?.price) || 0,
-      change_pct: Number(wlMap[c.code]?.change_pct) || 0,
-      n_score: evMap[c.code]?.n_score || 0, n_pass: evMap[c.code]?.n_pass || false,
-      dragon_score: evMap[c.code]?.dragon_score || 0, dragon_pass: evMap[c.code]?.dragon_pass || false,
-      db_score: evMap[c.code]?.db_score || 0, db_pass: evMap[c.code]?.db_pass || false,
-      dr_score: evMap[c.code]?.dr_score || 0, dr_pass: evMap[c.code]?.dr_pass || false,
-      m_score: evMap[c.code]?.m_score || 0, m_pass: evMap[c.code]?.m_pass || false,
-    })
+    // 兼容传入字符串或 {code} 对象两种调用方式：wlRow('000021') 与 wlRow({code:'000021'}) 均得到正确 code
+    const wlRow = (c) => {
+      const code = typeof c === 'string' ? c : (c && c.code)
+      return {
+        code,
+        name: wlMap[code]?.name || evMap[code]?.name || code,
+        price: Number(wlMap[code]?.price) || 0,
+        change_pct: Number(wlMap[code]?.change_pct) || 0,
+        n_score: evMap[code]?.n_score || 0, n_pass: evMap[code]?.n_pass || false,
+        dragon_score: evMap[code]?.dragon_score || 0, dragon_pass: evMap[code]?.dragon_pass || false,
+        db_score: evMap[code]?.db_score || 0, db_pass: evMap[code]?.db_pass || false,
+        dr_score: evMap[code]?.dr_score || 0, dr_pass: evMap[code]?.dr_pass || false,
+        m_score: evMap[code]?.m_score || 0, m_pass: evMap[code]?.m_pass || false,
+      }
+    }
     if (snap && snap.length) {
       stocks.value = snap
         .filter(s => codes.includes(s.code))
@@ -345,13 +364,34 @@ function showFeedback(msg, type) {
   setTimeout(() => { feedback.value = '' }, 2500)
 }
 
-/** 展开/收起某自选股的 分时区 */
-/** Toggle a watchlist stock's K-line area */
+/** 当前展开分时的自选代码（单值，互斥：同一时间只展开一只） */
+/** Code of the currently expanded K-line (single value, exclusive) */
+const klineOpenCode = ref('')
+
+/** 展开/收起某自选股的分时区（单值互斥） */
+/** Toggle a watchlist stock's K-line area (single-value exclusive) */
 function toggleKline(code) {
-  const next = new Set(klineOpen.value)
-  if (next.has(code)) next.delete(code)
-  else next.add(code)
-  klineOpen.value = next
+  klineOpenCode.value = klineOpenCode.value === code ? '' : code
+}
+
+/** 移动端：点击行打开操作菜单 */
+/** Mobile: tap a row to open the action sheet */
+function onRowTap(e) {
+  if (window.innerWidth > 768) return
+  sheetStock.value = e
+}
+/** 移动端：操作菜单 - 展开/收起分时 */
+function sheetToggleKline() {
+  if (!sheetStock.value) return
+  toggleKline(sheetStock.value.code)
+  sheetStock.value = null
+}
+/** 移动端：操作菜单 - 删除 */
+function sheetRemove() {
+  if (!sheetStock.value) return
+  const code = sheetStock.value.code
+  sheetStock.value = null
+  remove(code)
 }
 
 onMounted(() => {
@@ -373,18 +413,18 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .add-row { display: flex; gap: 8px; }
 .add-row input {
   padding: 8px 12px; border-radius: 6px; border: 1px solid #333;
-  background: #0f0f23; color: #e0e0e0; font-size: 13px; width: 160px; outline: none;
+  background: #0f0f23; color: #e0e0e0; font-size: 14px; width: 160px; outline: none;
 }
 .add-row input:focus { border-color: #FF4D4F; }
 .btn-add {
   padding: 8px 16px; border-radius: 6px; border: none;
-  background: #FF4D4F; color: #fff; font-size: 13px; cursor: pointer;
+  background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer;
 }
 .btn-add:disabled { opacity: 0.5; cursor: not-allowed; }
-.feedback { font-size: 12px; padding: 4px 10px; border-radius: 4px; white-space: nowrap; }
+.feedback { font-size: 14px; padding: 4px 10px; border-radius: 4px; white-space: nowrap; }
 .feedback.ok { color: #4caf50; }
 .feedback.err { color: #FF4D4F; }
-.eval-table { font-size: 12px; background: #1a1a2e; border-radius: 8px; overflow-x: auto; white-space: nowrap; }
+.eval-table { font-size: 14px; background: #1a1a2e; border-radius: 8px; overflow-x: auto; white-space: nowrap; }
 .ev-header, .ev-row { display: flex; align-items: center; padding: 4px 12px; gap: 0; min-width: 660px; }
 .ev-header { background: #2a2a3e; color: #888; font-weight: 600; border-bottom: 1px solid #2a2a3e; }
 .ev-row { border-bottom: 1px solid #1a1a26; }
@@ -408,7 +448,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .ev-row-group { min-width: 660px; }
 .btn-kline {
   background: transparent; border: 1px solid #3a3a55; color: #7ab8ff;
-  border-radius: 4px; cursor: pointer; font-size: 11px; padding: 2px 8px;
+  border-radius: 4px; cursor: pointer; font-size: 14px; padding: 2px 8px;
 }
 .btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
 .ev-kline-row { padding: 8px 12px; background: #16162a; border-bottom: 1px solid #1a1a26; }
@@ -416,13 +456,13 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .sortable:hover { color: #ccc; }
 .btn-remove {
   background: transparent; border: 1px solid #333; color: #666;
-  width: 22px; height: 22px; border-radius: 4px; cursor: pointer; font-size: 11px;
+  width: 22px; height: 22px; border-radius: 4px; cursor: pointer; font-size: 14px;
   display: flex; align-items: center; justify-content: center;
 }
 .btn-remove:hover { border-color: #FF4D4F; color: #FF4D4F; }
-.empty { text-align: center; padding: 40px; color: #555; font-size: 13px; }
+.empty { text-align: center; padding: 40px; color: #555; font-size: 14px; }
 .legend {
-  margin-top: 8px; padding: 6px 12px; font-size: 11px; color: #666;
+  margin-top: 8px; padding: 6px 12px; font-size: 14px; color: #666;
   background: #1a1a2e; border-radius: 6px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
 .lg-strong { color: #FF4D4F; }
@@ -430,4 +470,39 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .lg-low { color: #555; }
 .lg-sep { color: #333; }
 .lg-item { color: #666; }
+
+/* ====== Mobile: horizontal scroll + larger fonts ====== */
+@media (max-width: 768px) {
+  .eval-table { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+  .ev-header, .ev-row { min-width: 780px; font-size: 14px; padding: 8px 12px; }
+  .ev-header { display: flex; }
+  .ev-body { max-height: none; overflow-y: visible; }
+  .ev-row-group { min-width: 0; }
+  .ev-row { cursor: pointer; }
+  .ev-kline-row { padding: 6px; }
+  .legend { font-size: 14px; gap: 6px; }
+  .page-header { flex-direction: column; align-items: stretch; gap: 8px; }
+  .add-row { width: 100%; }
+  .add-row input { flex: 1; min-width: 0; }
+  .sheet-overlay {
+    position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,0.6);
+    display: flex; align-items: flex-end;
+  }
+  .action-sheet {
+    width: 100%; background: #1a1a2e; border-radius: 14px 14px 0 0;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+  }
+  .sheet-title {
+    font-size: 14px; color: #999; text-align: center;
+    padding: 8px 0 12px; border-bottom: 1px solid #2a2a3e; margin-bottom: 8px;
+  }
+  .sheet-btn {
+    width: 100%; padding: 14px; border-radius: 8px; border: none;
+    background: #0f0f23; color: #4fc3f7; font-size: 16px; cursor: pointer;
+    margin-bottom: 8px; text-align: center;
+  }
+  .sheet-btn:active { opacity: 0.8; }
+  .sheet-danger { color: #FF4D4F; }
+  .sheet-cancel { background: #2a2a3e; color: #888; }
+}
 </style>

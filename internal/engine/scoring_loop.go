@@ -81,7 +81,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	td := data.TradingDayDate(time.Now())
 	pool := mergeCodes(
 		e.rpt.HeldPositionCodes(),
-		e.wlMgr.List(),
+		e.wlMgr.All(),
 		trackedCodes(e.stockTracker.GetActiveByDirection(td, "利好")),
 		trackedCodes(e.stockTracker.GetActiveByDirection(td, "利空")),
 	)

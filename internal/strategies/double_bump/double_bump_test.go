@@ -89,3 +89,32 @@ func TestGreenDayFullChain(t *testing.T) {
 		t.Fatalf("绿日放量+多头应≥70, got %.0f", ev.TotalScore)
 	}
 }
+
+// TestSecondWaveInWindow 验证"双凸第二波放宽到近5日窗口"：
+// 结构：近 30 日横盘 → 前3日第一波放量突破(11.6/300k) → 前2日放量上攻(11.8/250k,第二波) → 前1日缩量回调(11.5/60k)
+// → 今日平盘窄幅(0.2%)未放量(90k)。旧逻辑要求"最后一根放量"会返回 nil；新逻辑在近5日窗口内
+// 找到第一波之后的放量K线即构成双凸。
+func TestSecondWaveInWindow(t *testing.T) {
+	closes := make([]float64, 30)
+	vol := make([]float64, 30)
+	for i := 0; i < 30; i++ {
+		closes[i] = 10.0
+		vol[i] = 100000
+	}
+	// 近5日内：第一波(第3根) → 第二波(第2根) → 缩量回调(第1根)
+	closes[27] = 11.6
+	vol[27] = 300000
+	closes[28] = 11.8
+	vol[28] = 250000
+	closes[29] = 11.5
+	vol[29] = 60000
+
+	ev := newTest().EvaluateReal("600001",
+		&data.StockInfo{Price: closes[29], Code: "600001", ChangePct: 0.2}, kbump(closes, vol))
+	if ev == nil {
+		t.Fatal("近5日窗口内存在两波放量不应返回 nil")
+	}
+	if ev.TotalScore < 50 {
+		t.Fatalf("窗口内两波放量+多头应≥50, got total=%.0f", ev.TotalScore)
+	}
+}

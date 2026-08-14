@@ -4,6 +4,9 @@
     <!-- 访问云服务器 API / SSE 所需 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Android 13+ 通知（WebView 内 Notification API 依赖此权限） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"

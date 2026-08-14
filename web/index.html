@@ -10,8 +10,8 @@
 <head>
   <!-- 字符编码：UTF-8，确保中文界面正常显示 -->
   <meta charset="UTF-8" />
-  <!-- 视口配置：适配移动端，initial-scale=1.0 防止页面缩放偏移 -->
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- 视口配置：适配移动端，viewport-fit=cover 让安全区常量 env() 生效（避开刘海/状态栏），user-scalable=no 禁止缩放防误触 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <!-- 页面标题：显示在浏览器标签页上的应用名称 -->
   <title>量仔期货 — 桌面版</title>
 </head>

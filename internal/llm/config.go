@@ -8,6 +8,7 @@ import "time"
 // （Config is the LLM client configuration: API key, request URL, model name and per-request timeout.）
 type Config struct {
 	APIKey  string        // API 密钥，用于认证
+	APIKeys []string      // 多 API 密钥（并发请求按 key 轮询分发，突破单 key 限流；为空时回退 APIKey）
 	APIURL  string        // API 请求地址（如 https://api.openai.com/v1/chat/completions）
 	Model   string        // 模型名称（如 gpt-4、deepseek-chat 等）
 	Timeout time.Duration // 单次请求超时（<=0 时 New 兜底为 60s）

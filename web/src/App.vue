@@ -116,7 +116,7 @@
       <!-- 服务器地址：所有 API 请求的基础地址，保存后供 api.baseUrl() 使用 -->
       <div class="form-group">
         <label>服务器地址</label>
-        <input v-model="serverUrl" placeholder="http://127.0.0.1:8080" />
+        <input v-model="serverUrl" placeholder="留空表示使用当前域名" />
       </div>
       <!-- 账号 / 密码：登录凭据；密码框回车可直接触发登录 -->
       <div class="form-group">
@@ -162,7 +162,7 @@ const shortEnabled = ref(false)      // 做空开关状态 (short-selling toggle
 
 // ── 登录表单状态 ── (Login form state)
 // 服务器地址初始值优先取本地持久化值，否则用默认本地地址 (server URL defaults to persisted value, otherwise localhost)
-const serverUrl = ref(api.getStoredServer() || 'http://127.0.0.1:8080')
+const serverUrl = ref(api.getStoredServer() || '')
 const username = ref('')
 const password = ref('')
 const logging = ref(false)           // 是否正在登录中 (whether login is in progress)

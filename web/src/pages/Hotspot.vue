@@ -74,17 +74,17 @@
         <!-- 评分行：代码/名称/现价/涨跌 + 五维评分，强势或达标时整行高亮 -->
         <div class="ev-body">
           <div v-for="e in sortedEvals" :key="e.code" :class="rowClass(e)">
-            <span class="ev-code">{{ e.code }}</span>
-            <span class="ev-name">{{ e.name || '-' }}</span>
-            <span class="ev-price">¥{{ (e.price || 0).toFixed(2) }}</span>
-            <span :class="['ev-chg', (e.change_pct || 0) >= 0 ? 'up' : 'down']">
+            <span class="ev-code" data-label="代码">{{ e.code }}</span>
+            <span class="ev-name" data-label="名称">{{ e.name || '-' }}</span>
+            <span class="ev-price" data-label="现价">¥{{ (e.price || 0).toFixed(2) }}</span>
+            <span :class="['ev-chg', (e.change_pct || 0) >= 0 ? 'up' : 'down']" data-label="涨跌">
               {{ (e.change_pct || 0) > 0 ? '+' : '' }}{{ (e.change_pct || 0).toFixed(2) }}%
             </span>
-            <span :class="scoreClass(e.n_score, e.n_pass, 80)">{{ e.n_score > 0 ? e.n_score.toFixed(0) : '—' }}</span>
-            <span :class="scoreClass(e.dragon_score, e.dragon_pass, 80)">{{ e.dragon_score > 0 ? e.dragon_score.toFixed(0) : '—' }}</span>
-            <span :class="scoreClass(e.db_score, e.db_pass, 80)">{{ e.db_score > 0 ? e.db_score.toFixed(0) : '—' }}</span>
-            <span :class="scoreClass(e.dr_score, e.dr_pass, 80)">{{ e.dr_score > 0 ? e.dr_score.toFixed(0) : '—' }}</span>
-            <span :class="scoreClass(e.m_score, e.m_pass, 70)">{{ e.m_score > 0 ? e.m_score.toFixed(0) : '—' }}</span>
+            <span :class="scoreClass(e.n_score, e.n_pass, 80)" data-label="N形">{{ e.n_score > 0 ? e.n_score.toFixed(0) : '—' }}</span>
+            <span :class="scoreClass(e.dragon_score, e.dragon_pass, 80)" data-label="龙头">{{ e.dragon_score > 0 ? e.dragon_score.toFixed(0) : '—' }}</span>
+            <span :class="scoreClass(e.db_score, e.db_pass, 80)" data-label="双凸">{{ e.db_score > 0 ? e.db_score.toFixed(0) : '—' }}</span>
+            <span :class="scoreClass(e.dr_score, e.dr_pass, 80)" data-label="回头">{{ e.dr_score > 0 ? e.dr_score.toFixed(0) : '—' }}</span>
+            <span :class="scoreClass(e.m_score, e.m_pass, 70)" data-label="动量">{{ e.m_score > 0 ? e.m_score.toFixed(0) : '—' }}</span>
           </div>
         </div>
       </div>
@@ -144,7 +144,7 @@
       <div v-if="newsItems.length" class="hs-news-scroll">
         <div v-for="(n, i) in newsItems" :key="i" class="hs-news-item">
           <div class="hs-news-head">
-            <span class="hs-news-time">{{ n.datetime ? n.datetime.slice(5, 16) : '' }}</span>
+              <span class="hs-news-time">{{ fmtNewsTime(n.datetime) }}</span>
             <span class="hs-news-title">{{ n.title }}</span>
           </div>
           <div class="hs-news-tags">
@@ -256,6 +256,29 @@ function ipoCountdown(c) {
   if (diff > 0) return `${diff}天后`
   if (diff === 0) return '📌今天'
   return `${-diff}天前`
+}
+
+/**
+ * 新闻时间格式化：兼容后端归一化后的 "YYYY-MM-DD HH:MM" 字符串，
+ * 以及历史遗留的 epoch 秒（数字或纯数字字符串），统一显示 "MM-DD HH:MM"。
+ * (Format news time: handles normalized "YYYY-MM-DD HH:MM" strings and legacy epoch
+ * seconds (numeric or numeric-string), showing "MM-DD HH:MM".)
+ */
+function fmtNewsTime(dt) {
+  if (dt === null || dt === undefined || dt === '') return ''
+  const s = String(dt)
+  if (/^\d+$/.test(s)) {
+    const t = new Date(Number(s) * 1000)
+    if (!isNaN(t.getTime())) {
+      const mm = String(t.getMonth()+1).padStart(2,'0')
+      const dd = String(t.getDate()).padStart(2,'0')
+      const hh = String(t.getHours()).padStart(2,'0')
+      const mi = String(t.getMinutes()).padStart(2,'0')
+      return `${mm}-${dd} ${hh}:${mi}`
+    }
+    return ''
+  }
+  return s.length >= 16 ? s.slice(5, 16) : s
 }
 
 /** 全市场最高评分（用于缩放显示） (Highest score across the whole market, used for scaling the display) */
@@ -374,12 +397,12 @@ onUnmounted(() => {
 .hotspot-page { max-width: 1200px; }
 .card { background: #1a1a2e; border-radius: 8px; padding: 14px; }
 .card-header { font-size: 14px; font-weight: 600; color: #ccc; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
-.card-sub { font-size: 11px; color: #666; font-weight: 400; }
+.card-sub { font-size: 14px; color: #666; font-weight: 400; }
 .hs-actions { display: flex; align-items: center; gap: 6px; }
 .hs-actions .btn-compact:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-log {
   padding: 4px 10px; border-radius: 5px; border: 1px solid #b388ff;
-  background: transparent; color: #b388ff; font-size: 11px; cursor: pointer;
+  background: transparent; color: #b388ff; font-size: 14px; cursor: pointer;
 }
 .btn-log:hover { background: rgba(179,136,255,0.1); }
 
@@ -388,7 +411,7 @@ onUnmounted(() => {
 .sector-card:active { opacity: 0.8; }
 .sec-name { font-size: 14px; font-weight: 600; color: #e0e0e0; }
 .sec-reason {
-  font-size: 11px; color: #4fc3f7; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 14px; color: #4fc3f7; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   background: rgba(79,195,247,0.08); border-radius: 3px; padding: 1px 6px; display: inline-block; max-width: 100%;
 }
 
@@ -402,27 +425,27 @@ onUnmounted(() => {
   text-align: center;
 }
 .modal-header { font-size: 14px; font-weight: 600; color: #e0e0e0; margin-bottom: 10px; }
-.modal-body { font-size: 12px; color: #ccc; line-height: 1.6; margin-bottom: 16px; word-break: break-word; text-align: left; max-height: 60vh; overflow-y: auto; }
+.modal-body { font-size: 14px; color: #ccc; line-height: 1.6; margin-bottom: 16px; word-break: break-word; text-align: left; max-height: 60vh; overflow-y: auto; }
 .modal-section { margin-bottom: 12px; }
 .modal-section:last-child { margin-bottom: 0; }
-.modal-subtitle { font-size: 11px; color: #888; font-weight: 600; margin-bottom: 4px; border-bottom: 1px solid #2a2a3e; padding-bottom: 3px; }
-.modal-reason { font-size: 12px; color: #e0e0e0; line-height: 1.7; white-space: pre-line; }
-.modal-news-item { display: flex; gap: 4px; padding: 2px 0; font-size: 12px; line-height: 1.5; }
+.modal-subtitle { font-size: 14px; color: #888; font-weight: 600; margin-bottom: 4px; border-bottom: 1px solid #2a2a3e; padding-bottom: 3px; }
+.modal-reason { font-size: 14px; color: #e0e0e0; line-height: 1.7; white-space: pre-line; }
+.modal-news-item { display: flex; gap: 4px; padding: 2px 0; font-size: 14px; line-height: 1.5; }
 .modal-news-idx { color: #666; flex-shrink: 0; min-width: 18px; }
 .modal-news-title { color: #ccc; }
 .modal-close {
   padding: 8px 28px; border-radius: 8px; border: none;
-  background: #FF4D4F; color: #fff; font-size: 13px; cursor: pointer;
+  background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer;
 }
 .modal-close:active { opacity: 0.8; }
-.sec-score { font-size: 11px; color: #FAAD14; margin-top: 4px; }
+.sec-score { font-size: 14px; color: #FAAD14; margin-top: 4px; }
 .sec-pct { font-size: 20px; font-weight: 700; margin-top: 4px; }
 .sec-pct.up { color: #FF4D4F; }
 .sec-pct.down { color: #4caf50; }
-.sec-meta { display: flex; gap: 12px; font-size: 11px; color: #666; margin-top: 6px; }
+.sec-meta { display: flex; gap: 12px; font-size: 14px; color: #666; margin-top: 6px; }
 .d1-badge { color: #b388ff; background: rgba(179,136,255,0.15); padding: 0 5px; border-radius: 3px; font-weight: 600; }
 
-.eval-table { font-size: 12px; }
+.eval-table { font-size: 14px; }
 .ev-header, .ev-row { display: flex; align-items: center; padding: 4px 0; gap: 4px; }
 .ev-header { color: #555; border-bottom: 1px solid #2a2a3e; font-weight: 600; }
 .ev-row { border-bottom: 1px solid #1a1a26; }
@@ -445,23 +468,23 @@ onUnmounted(() => {
 .ev-body::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
 
 .hs-cal-scroll { max-height: 80px; overflow-y: auto; }
-.hs-cal-item { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
-.hs-cal-date { color: #888; width: 76px; flex-shrink: 0; font-size: 11px; }
-.hs-cal-title { flex: 1; color: #e0e0e0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-.hs-cal-empty { font-size: 12px; color: #555; padding: 6px 0; }
-.cal-price { width: 60px; text-align: right; color: #4fc3f7; font-size: 11px; flex-shrink: 0; }
-.cal-status { width: 56px; text-align: right; font-size: 10px; padding: 1px 6px; border-radius: 3px; flex-shrink: 0; }
+.hs-cal-item { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 14px; }
+.hs-cal-date { color: #888; width: 76px; flex-shrink: 0; font-size: 14px; }
+.hs-cal-title { flex: 1; color: #e0e0e0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.hs-cal-empty { font-size: 14px; color: #555; padding: 6px 0; }
+.cal-price { width: 60px; text-align: right; color: #4fc3f7; font-size: 14px; flex-shrink: 0; }
+.cal-status { width: 56px; text-align: right; font-size: 14px; padding: 1px 6px; border-radius: 3px; flex-shrink: 0; }
 .cal-status-l { color: #888; background: rgba(136,136,136,0.15); }
 .cal-status-u { color: #FAAD14; background: rgba(250,173,20,0.15); }
 .hs-news-scroll { max-height: 400px; overflow-y: auto; }
 .hs-news-item { padding: 6px 0; border-bottom: 1px solid #1a1a26; }
 .hs-news-item:last-child { border-bottom: none; }
 .hs-news-head { display: flex; gap: 8px; align-items: flex-start; }
-.hs-news-time { color: #888; width: 76px; flex-shrink: 0; font-size: 11px; line-height: 16px; }
-.hs-news-title { flex: 1; color: #ccc; font-size: 12px; line-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hs-news-time { color: #888; width: 76px; flex-shrink: 0; font-size: 14px; line-height: 16px; }
+.hs-news-title { flex: 1; color: #ccc; font-size: 14px; line-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hs-news-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; margin-left: 84px; min-height: 16px; }
 .tag-placeholder { display: inline-block; width: 1px; height: 16px; }
-.tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
+.tag { font-size: 14px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
 .tag-sent-正面 { background: #1a3a1a; color: #4caf50; }
 .tag-sent-负面 { background: #3a1a1a; color: #ff4d4f; }
 .tag-sent-中性 { background: #2a2a2a; color: #999; }
@@ -476,14 +499,14 @@ onUnmounted(() => {
 .tag-urgent { background: #3a1a1a; color: #ff4d4f; font-weight: 600; }
 .tag-watch { background: #3a2a1a; color: #faad14; }
 .tag-obs { background: #2a2a2a; color: #666; }
-.sector-label { font-size: 10px; color: #555; padding: 1px 0; }
-.sector-tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: rgba(179,136,255,0.15); color: #b388ff; white-space: nowrap; }
-.stock-tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: rgba(255,152,0,0.15); color: #FF9800; font-family: monospace; }
-.empty { text-align: center; padding: 30px; color: #555; font-size: 12px; }
+.sector-label { font-size: 14px; color: #555; padding: 1px 0; }
+.sector-tag { font-size: 14px; padding: 1px 6px; border-radius: 3px; background: rgba(179,136,255,0.15); color: #b388ff; white-space: nowrap; }
+.stock-tag { font-size: 14px; padding: 1px 6px; border-radius: 3px; background: rgba(255,152,0,0.15); color: #FF9800; font-family: monospace; }
+.empty { text-align: center; padding: 30px; color: #555; font-size: 14px; }
 .loading-dot { display: inline-block; width: 6px; height: 6px; background: #4fc3f7; border-radius: 50%; margin-right: 6px; animation: pulse 1.5s infinite; }
 @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 .legend {
-  margin-top: 8px; padding: 6px 12px; font-size: 11px; color: #666;
+  margin-top: 8px; padding: 6px 12px; font-size: 14px; color: #666;
   background: #1a1a2e; border-radius: 6px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
 .lg-strong { color: #FF4D4F; }
@@ -491,4 +514,17 @@ onUnmounted(() => {
 .lg-low { color: #555; }
 .lg-sep { color: #333; }
 .lg-item { color: #666; }
+
+/* ====== Mobile: horizontal scroll + larger fonts ====== */
+@media (max-width: 768px) {
+  .eval-table { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+  .ev-header, .ev-row { min-width: 760px; font-size: 14px; padding: 6px 8px; gap: 6px; }
+  .ev-header { display: flex; }
+  .ev-body { max-height: none; overflow-y: visible; }
+  .card { padding: 10px; }
+  .card-header { font-size: 14px; flex-wrap: wrap; gap: 4px; }
+  .card-sub { font-size: 14px; }
+  .legend { font-size: 14px; gap: 6px; flex-wrap: wrap; }
+  .sector-card { padding: 10px; }
+}
 </style>

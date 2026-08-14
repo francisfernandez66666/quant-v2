@@ -218,32 +218,32 @@ onMounted(async () => {
 .pro-mode {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 6px 12px; border-radius: 6px; border: 1px solid #b388ff;
-  background: rgba(179,136,255,0.08); color: #b388ff; font-size: 13px; cursor: pointer;
+  background: rgba(179,136,255,0.08); color: #b388ff; font-size: 14px; cursor: pointer;
 }
 .pro-mode input { accent-color: #b388ff; cursor: pointer; }
 .pro-mode:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-clear {
   padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F;
-  background: transparent; color: #FF4D4F; font-size: 13px; cursor: pointer;
+  background: transparent; color: #FF4D4F; font-size: 14px; cursor: pointer;
 }
 .btn-clear:disabled { opacity: 0.5; }
 .btn-clear:hover { background: rgba(255,77,79,0.1); }
 
 /* LLM 配置区 */
 .llm-config { background: #1a1a2e; border: 1px solid #2a2a3e; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
-.llm-config-title { font-size: 13px; color: #b388ff; margin-bottom: 8px; }
+.llm-config-title { font-size: 14px; color: #b388ff; margin-bottom: 8px; }
 .llm-config-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .llm-config-row input {
   flex: 1; min-width: 140px; padding: 8px 10px; border-radius: 6px; border: 1px solid #333;
-  background: #0f0f23; color: #e0e0e0; font-size: 13px; outline: none;
+  background: #0f0f23; color: #e0e0e0; font-size: 14px; outline: none;
 }
 .llm-config-row input:focus { border-color: #b388ff; }
 .btn-save {
   padding: 8px 16px; border-radius: 6px; border: none; background: #b388ff;
-  color: #fff; font-size: 13px; cursor: pointer; white-space: nowrap;
+  color: #fff; font-size: 14px; cursor: pointer; white-space: nowrap;
 }
 .btn-save:disabled { opacity: 0.5; }
-.llm-msg { margin-top: 8px; font-size: 12px; }
+.llm-msg { margin-top: 8px; font-size: 14px; }
 .msg-ok { color: #4caf50; }
 .msg-err { color: #FF4D4F; }
 
@@ -253,14 +253,14 @@ onMounted(async () => {
   border: 1px solid #2a2a3e; padding: 14px; display: flex; flex-direction: column; gap: 10px;
   min-height: 300px; max-height: calc(100vh - 300px);
 }
-.chat-empty { text-align: center; color: #666; font-size: 13px; padding: 40px 0; }
-.bubble { max-width: 82%; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; }
-.bubble-name { font-size: 11px; color: #888; margin-bottom: 4px; }
+.chat-empty { text-align: center; color: #666; font-size: 14px; padding: 40px 0; }
+.bubble { max-width: 82%; padding: 10px 12px; border-radius: 8px; font-size: 14px; line-height: 1.5; }
+.bubble-name { font-size: 14px; color: #888; margin-bottom: 4px; }
 .bubble-user { align-self: flex-end; background: rgba(179,136,255,0.15); border: 1px solid #b388ff; }
 .bubble-user .bubble-name { text-align: right; }
 .bubble-assistant { align-self: flex-start; background: #0f0f23; border: 1px solid #333; }
 .bubble-content { white-space: pre-wrap; word-break: break-word; color: #e0e0e0; }
-.bubble-time { font-size: 10px; color: #666; margin-top: 4px; }
+.bubble-time { font-size: 14px; color: #666; margin-top: 4px; }
 .bubble-loading .bubble-content { color: #888; }
 
 /* 输入区 */
@@ -276,4 +276,13 @@ onMounted(async () => {
   color: #fff; font-size: 14px; cursor: pointer;
 }
 .btn-send:disabled { opacity: 0.5; }
+
+/* ====== Mobile ====== */
+@media (max-width: 768px) {
+  .page-header { flex-wrap: wrap; gap: 8px; }
+  .header-right { flex-wrap: wrap; gap: 8px; }
+  .bubble { max-width: 90%; }
+  .bubble-content { font-size: 14px; }
+  .chat-box { max-height: calc(100vh - 340px); padding: 10px; }
+}
 </style>

@@ -26,6 +26,7 @@ type Lot struct {
 // （ExecLog is one execution record covering the open→hold→close lifecycle. Status ∈ {持仓中, 已止盈, 已止损, 已删除}.）
 type ExecLog struct {
 	SignalID      string     `json:"signal_id"`            // 信号唯一标识
+	UserID        string     `json:"user_id,omitempty"`    // 所属账号 ID（空=系统/全局，引擎监控全部）
 	Code          string     `json:"code"`                 // 股票代码（纯数字，无交易所前缀）
 	Name          string     `json:"name"`                 // 股票名称
 	Direction     string     `json:"direction"`            // 交易方向：做多 / 做空
@@ -310,6 +311,40 @@ func (r *Report) List() []ExecLog {
 	return out
 }
 
+// ListFor 返回指定账号（userID）的交易记录副本；空 userID 返回全部（系统/跨账号视角）。
+// 用于多账号隔离：各账号只看到自己创建的持仓。
+// （ListFor returns copies of records owned by userID; empty userID returns all.）
+func (r *Report) ListFor(userID string) []ExecLog {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if userID == "" {
+		out := make([]ExecLog, len(r.logs))
+		copy(out, r.logs)
+		return out
+	}
+	var out []ExecLog
+	for _, l := range r.logs {
+		if l.UserID == userID {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// HeldPositionsFor 返回指定账号状态为"持仓中"的完整 ExecLog 记录列表。
+// （HeldPositionsFor returns currently-held position records owned by userID.）
+func (r *Report) HeldPositionsFor(userID string) []ExecLog {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []ExecLog
+	for _, l := range r.logs {
+		if l.Status == "持仓中" && (userID == "" || l.UserID == userID) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
 // HeldPositionCodes 返回当前所有状态为"持仓中"的股票代码（已去重）。
 // 用于向策略引擎提供当前持仓信息，影响打分池构建和风险控制决策。
 // （HeldPositionCodes returns deduplicated codes of all currently held positions, feeding strategy scoring and risk control.）
@@ -369,10 +404,27 @@ func (r *Report) FindBySignalID(id string) *ExecLog {
 func (r *Report) Stats() (total, holding, win int, winRate, avgWin, avgLoss float64) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	total = len(r.logs)
+	return r.statsFor("")
+}
+
+// StatsFor 返回指定账号的交易统计指标；空 userID 返回全部。
+// 与 Stats 相同指标，仅按所属账号过滤记录。
+// （StatsFor computes trading statistics scoped to a user; empty userID means all.）
+func (r *Report) StatsFor(userID string) (total, holding, win int, winRate, avgWin, avgLoss float64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.statsFor(userID)
+}
+
+// statsFor 内部统计实现：userID 为空时统计全部记录。
+func (r *Report) statsFor(userID string) (total, holding, win int, winRate, avgWin, avgLoss float64) {
 	var winCount, lossCount int
 	var winSum, lossSum float64
 	for _, l := range r.logs {
+		if userID != "" && l.UserID != userID {
+			continue
+		}
+		total++
 		if l.ExitAt != nil && l.ProfitPct != nil {
 			if *l.ProfitPct > 0 {
 				winCount++

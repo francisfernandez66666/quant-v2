@@ -346,12 +346,18 @@ func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_e
 		}
 		extras = append(extras, c)
 	}
-	if len(extras) == 0 {
-		return nil
+	// 板块→个股 D1 上下文：所有 verifiedBull 成分股（含已在打分池的自选/持仓）
+	// 都映射到所属板块事件标题，使 D1 评分覆盖"属利好板块但未被新闻点名"的池内个股。
+	// D1 仍是个股分——板块标题只作为 LLM 评分上下文，由 LLM 对每只个股独立核定受益程度。
+	eventMap := make(map[string]string, len(secOf))
+	for c, si := range secOf {
+		if si.eventTitle != "" {
+			eventMap[c] = si.eventTitle
+		}
 	}
 	if e.strategy == nil || e.marketAPI == nil {
 		log.Printf("[engine] 板块→个股归因跳过: 策略引擎/行情API未配置")
-		return nil
+		return eventMap
 	}
 
 	// 2. 补拉成分股行情（K线/实时/资金流，走缓存），merge 进 sr.MarketData 与打分池
@@ -361,15 +367,11 @@ func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_e
 	for _, c := range sr.ScoringPool {
 		poolSet[c] = true
 	}
-	eventMap := make(map[string]string, len(extras))
 	for c, md := range extraMD {
 		if _, ok := sr.MarketData[c]; !ok {
 			sr.MarketData[c] = md
 		}
-		// 并入打分池，使板块成分股进入 D1 batch 的统一打分范围（板块事件标题作为评分上下文）
-		if si, ok := secOf[c]; ok && si.eventTitle != "" {
-			eventMap[c] = si.eventTitle
-		}
+		// 并入打分池，使板块成分股进入 D1 batch 的统一打分范围
 		if !poolSet[c] {
 			sr.ScoringPool = append(sr.ScoringPool, c)
 			poolSet[c] = true
@@ -1670,8 +1672,9 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.pushFreshHotspots(valid)
 
 	// 7. 策略评估：归因 + 分流 + 评分池 + 行情数据（无事件时仅覆盖 持仓+自选 打分池）
+	// 自选取全部账号并集（引擎全局打分，不区分账号）。
 	positions := e.rpt.HeldPositionCodes()
-	watchlist := e.wlMgr.List()
+	watchlist := e.wlMgr.All()
 	_stepEval := time.Now()
 	sr := e.strategy.Evaluate(ctx, valid, positions, watchlist)
 	_evalT := time.Since(_stepEval)
@@ -2296,7 +2299,9 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 				continue // 同一板块每轮只取一次成分股，避免重复注入
 			}
 			fetched[si.Code] = true
-			stocks, err := e.marketAPI.GetSectorStocks(si.Code, topN)
+			// 板块成分股：同花顺优先（仅代码/名称，供归因注入足够），失败/为空回退东财。
+			// THS-first keeps sector→stock propagation alive during EastMoney throttling (502).
+			stocks, err := e.sectorConstituents(si.Code, topN)
 			if err != nil {
 				log.Printf("[engine] 板块成分股获取失败 %s: %v", name, err)
 				continue
@@ -2319,15 +2324,32 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	}
 }
 
+// sectorConstituents 获取板块成分股：同花顺优先（东财限流时的兜底源），失败/为空回退东财。
+// THS 板块代码（881xxx/308xxx）与扫描器缓存一致，可直接调 GetBoardStocks。
+// （sectorConstituents returns a sector's constituents: THS first (fallback source when
+// EastMoney is throttled), EastMoney otherwise. THS board codes match the scanner cache.）
+func (e *Engine) sectorConstituents(sectorCode string, topN int) ([]data.StockInfo, error) {
+	e.mu.RLock()
+	ths := e.ths
+	marketAPI := e.marketAPI
+	e.mu.RUnlock()
+	if ths != nil {
+		if list, err := ths.GetBoardStocks(sectorCode, topN); err == nil && len(list) > 0 {
+			return list, nil
+		}
+	}
+	return marketAPI.GetSectorStocks(sectorCode, topN)
+}
+
 // sectorByName 精确匹配板块名称返回 SectorInfo，未命中返回 nil。
 func (e *Engine) sectorByName(name string) *data.SectorInfo {
 	if e.scanner == nil {
 		return nil
 	}
-	for _, s := range e.scanner.FindSectorsByNames([]string{name}) {
-		if s.Name == name {
-			return &s
-		}
+	// FindSectorsByNames 已含精确+包含匹配，直接取首个命中（板块名噪声也能落到真实板块）
+	infos := e.scanner.FindSectorsByNames([]string{name})
+	if len(infos) > 0 {
+		return &infos[0]
 	}
 	return nil
 }

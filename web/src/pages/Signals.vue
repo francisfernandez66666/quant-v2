@@ -42,23 +42,23 @@
       </div>
       <!-- 信号行 + 可展开 分时区（Signal row + expandable K-line area）-->
       <div v-for="s in filteredSignals" :key="s.code" class="table-row-group">
-      <div class="table-row">
-        <span class="col-code">{{ s.code }}</span>
-        <span class="col-name">{{ s.name || '-' }}</span>
-        <span class="col-price">
+      <div class="table-row" @click="onRowTap(s)">
+        <span class="col-code" data-label="代码">{{ s.code }}</span>
+        <span class="col-name" data-label="名称">{{ s.name || '-' }}</span>
+        <span class="col-price" data-label="现价/涨跌">
           <span class="px-price">¥{{ (s.price || 0).toFixed(2) }}</span>
           <span :class="['px-chg', (s.change_pct || 0) >= 0 ? 'up' : 'down']">
             {{ (s.change_pct || 0) > 0 ? '+' : '' }}{{ (s.change_pct || 0).toFixed(2) }}%
           </span>
         </span>
-        <span class="col-strategy">{{ s.strategy }}</span>
-        <span class="col-score">{{ s.total_score?.toFixed(0) }}</span>
-        <span class="col-level">
+        <span class="col-strategy" data-label="策略">{{ s.strategy }}</span>
+        <span class="col-score" data-label="总分">{{ s.total_score?.toFixed(0) }}</span>
+        <span class="col-level" data-label="等级">
           <span :class="['tag', s.remind_level]">
             {{ s.level === '交易' ? '交易' : s.level === '观望' ? '观望' : s.remind_level === 'strong' ? '可开仓' : s.remind_level === 'observe' ? '观察' : '静默' }}
           </span>
         </span>
-        <span class="col-detail">
+        <span class="col-detail" data-label="D1/D2/D3/D4">
           <span class="d-pill d1"
                 :title="'D1事件: ' + (s.d1_reason || s.d1_event || '无事件') + (s.d1_blocked ? '（负面拦截）' : '')">
             <em v-if="s.d1_score && (s.d1_reason || s.d1_event)">{{ d1Tag(s) }}</em>
@@ -74,16 +74,16 @@
             {{ (s.d4 || 0).toFixed(0) }}<em v-if="s.d4_desc">{{ shortDesc(s.d4_desc) }}</em>
           </span>
         </span>
-        <span class="col-kline">
-          <button class="btn-kline" @click="toggleKline(s.code)" :title="klineOpen.has(s.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(s.code) ? '收起' : '分时' }}</button>
+        <span class="col-kline" data-label="分时">
+          <button class="btn-kline" @click.stop="toggleKline(s.code)" :title="klineOpen.has(s.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(s.code) ? '收起' : '分时' }}</button>
         </span>
         <!-- 操作列：可开仓时显示"买入"按钮；已确认买入的显示"忽略"按钮；其余显示占位符；增加"收藏"按钮可一键添加到自选股（Action column: "buy" when tradeable; "ignore" after a confirmed buy; a placeholder otherwise; "collect" button to add to watchlist）-->
-        <span class="col-action">
-          <button v-if="s.can_open" class="btn-buy" @click="confirmTrade(s, 'buy')">买入</button>
-          <button v-else-if="s.action === 'buy'" class="btn-ignore" @click="confirmTrade(s, 'ignore')">忽略</button>
+        <span class="col-action" data-label="操作">
+          <button v-if="s.can_open" class="btn-buy" @click.stop="confirmTrade(s, 'buy')">买入</button>
+          <button v-else-if="s.action === 'buy'" class="btn-ignore" @click.stop="confirmTrade(s, 'ignore')">忽略</button>
           <span v-else class="text-muted">—</span>
           <!-- 收藏/加入自选股按钮：一键将信号股票代码加入自选股列表（Add to watchlist button: one-click add signal's code to watchlist）-->
-          <button v-if="!s.can_open && s.action !== 'buy'" class="btn-collect" @click="collectToWatchlist(s)">收藏</button>
+          <button v-if="!s.can_open && s.action !== 'buy'" class="btn-collect" @click.stop="collectToWatchlist(s)">收藏</button>
         </span>
       </div>
       <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
@@ -92,6 +92,18 @@
       </div>
       </div>
       <div class="empty" v-if="filteredSignals.length === 0">暂无信号</div>
+    </div>
+
+    <!-- 移动端：点击行弹出的底部操作菜单 -->
+    <div class="sheet-overlay" v-if="sheetSignal" @click="sheetSignal = null">
+      <div class="action-sheet" @click.stop>
+        <div class="sheet-title">{{ sheetSignal.code }} {{ sheetSignal.name || '' }} · {{ sheetSignal.strategy }}</div>
+        <button v-if="sheetSignal.can_open" class="sheet-btn sheet-danger" @click="sheetBuy">买入</button>
+        <button v-if="sheetSignal.action === 'buy'" class="sheet-btn" @click="sheetIgnore">忽略</button>
+        <button v-if="!sheetSignal.can_open && sheetSignal.action !== 'buy'" class="sheet-btn" @click="sheetCollect">收藏</button>
+        <button class="sheet-btn" @click="sheetKline">{{ klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时' }}</button>
+        <button class="sheet-btn sheet-cancel" @click="sheetSignal = null">取消</button>
+      </div>
     </div>
 
     <!-- 交易确认弹窗（Trade-confirm modal）-->
@@ -138,6 +150,8 @@ const showConfirm = ref(false)        // 是否显示交易确认弹窗
 // whether the trade-confirm modal is visible
 const showLog = ref(false)            // 是否打开日志弹窗
 // whether the log modal is visible
+const sheetSignal = ref(null)         // 移动端操作菜单当前选中的信号对象
+// the signal object currently selected in the mobile action sheet
 const tradeTarget = ref({})           // 待操作的信号对象
 // the signal object pending an action
 const tradeAction = ref('')           // 操作类型：'buy' | 'ignore'
@@ -245,6 +259,40 @@ function toggleKline(code) {
   klineOpen.value = next
 }
 
+/** 移动端：点击行打开操作菜单 */
+/** Mobile: tap a row to open the action sheet */
+function onRowTap(s) {
+  if (window.innerWidth > 768) return
+  sheetSignal.value = s
+}
+/** 移动端：操作菜单 - 买入 */
+function sheetBuy() {
+  if (!sheetSignal.value) return
+  const s = sheetSignal.value
+  sheetSignal.value = null
+  confirmTrade(s, 'buy')
+}
+/** 移动端：操作菜单 - 忽略 */
+function sheetIgnore() {
+  if (!sheetSignal.value) return
+  const s = sheetSignal.value
+  sheetSignal.value = null
+  confirmTrade(s, 'ignore')
+}
+/** 移动端：操作菜单 - 收藏 */
+function sheetCollect() {
+  if (!sheetSignal.value) return
+  const s = sheetSignal.value
+  sheetSignal.value = null
+  collectToWatchlist(s)
+}
+/** 移动端：操作菜单 - 展开/收起分时 */
+function sheetKline() {
+  if (!sheetSignal.value) return
+  toggleKline(sheetSignal.value.code)
+  sheetSignal.value = null
+}
+
 /** 从 API 加载信号列表 */
 /** Load the signal list from the API */
 
@@ -319,22 +367,22 @@ function showFeedback(msg, type) {
 .filter-row { display: flex; gap: 8px; }
 .filter-btn {
   padding: 6px 16px; border-radius: 6px; border: 1px solid #333;
-  background: transparent; color: #888; font-size: 13px; cursor: pointer;
+  background: transparent; color: #888; font-size: 14px; cursor: pointer;
 }
 .filter-btn.active { background: #FF4D4F; border-color: #FF4D4F; color: #fff; }
 .strategy-select {
   padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
-  background: #1a1a2e; color: #ccc; font-size: 13px; cursor: pointer; outline: none;
+  background: #1a1a2e; color: #ccc; font-size: 14px; cursor: pointer; outline: none;
 }
 .strategy-select:focus { border-color: #FF4D4F; }
 .btn-log {
   padding: 6px 14px; border-radius: 6px; border: 1px solid #b388ff;
-  background: transparent; color: #b388ff; font-size: 13px; cursor: pointer;
+  background: transparent; color: #b388ff; font-size: 14px; cursor: pointer;
 }
 .btn-log:hover { background: rgba(179,136,255,0.1); }
 .signals-table { background: #1a1a2e; border-radius: 8px; overflow: hidden; }
 .table-header, .table-row {
-  display: flex; align-items: center; padding: 10px 16px; gap: 8px; font-size: 13px;
+  display: flex; align-items: center; padding: 10px 16px; gap: 8px; font-size: 14px;
 }
 .table-row-group { border-bottom: 1px solid #2a2a3e; }
 .table-header { background: #2a2a3e; color: #888; font-weight: 600; }
@@ -343,7 +391,7 @@ function showFeedback(msg, type) {
 .col-name { width: 100px; color: #e0e0e0; }
 .col-price { width: 130px; display: flex; flex-direction: column; gap: 2px; }
 .px-price { color: #e0e0e0; font-weight: 600; }
-.px-chg { font-size: 11px; }
+.px-chg { font-size: 14px; }
 .px-chg.up { color: #FF4D4F; }
 .px-chg.down { color: #4caf50; }
 .col-strategy { width: 80px; color: #e0e0e0; }
@@ -354,19 +402,19 @@ function showFeedback(msg, type) {
 .col-kline { width: 60px; text-align: center; }
 .btn-kline {
   background: transparent; border: 1px solid #3a3a55; color: #7ab8ff;
-  border-radius: 4px; cursor: pointer; font-size: 11px; padding: 2px 8px;
+  border-radius: 4px; cursor: pointer; font-size: 14px; padding: 2px 8px;
 }
 .btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
 .col-kline-row { padding: 8px 16px 12px; background: #16162a; }
-.tag { font-size: 11px; padding: 2px 10px; border-radius: 10px; }
+.tag { font-size: 14px; padding: 2px 10px; border-radius: 10px; }
 .tag.strong { background: rgba(255,77,79,0.15); color: #FF4D4F; }
 .tag.observe { background: rgba(250,173,20,0.15); color: #FAAD14; }
 .tag.mute { background: rgba(153,153,153,0.15); color: #999; }
 .d-pill {
   display: inline-flex; align-items: center; gap: 2px;
-  font-size: 11px; padding: 0 5px; border-radius: 3px; white-space: nowrap;
+  font-size: 14px; padding: 0 5px; border-radius: 3px; white-space: nowrap;
 }
-.d-pill em { font-size: 10px; font-style: normal; opacity: 0.85; }
+.d-pill em { font-size: 14px; font-style: normal; opacity: 0.85; }
 .d-pill.d1 { color: #FF4D4F; background: rgba(255,77,79,0.10); }
 .d-pill .d1-none { color: #8fa3bf; }
 .d-pill.d2 { color: #FAAD14; background: rgba(250,173,20,0.10); }
@@ -380,14 +428,14 @@ function showFeedback(msg, type) {
 .d-fill.d4 { background: #4caf50; }
 .btn-buy {
   padding: 4px 12px; border-radius: 4px; border: none;
-  background: #FF4D4F; color: #fff; font-size: 12px; cursor: pointer;
+  background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer;
 }
 .btn-ignore {
   padding: 4px 12px; border-radius: 4px; border: 1px solid #555;
-  background: transparent; color: #888; font-size: 12px; cursor: pointer;
+  background: transparent; color: #888; font-size: 14px; cursor: pointer;
 }
-.text-muted { color: #555; font-size: 12px; }
-.empty { text-align: center; padding: 40px; color: #555; font-size: 13px; }
+.text-muted { color: #555; font-size: 14px; }
+.empty { text-align: center; padding: 40px; color: #555; font-size: 14px; }
 
 .modal-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6);
@@ -395,11 +443,45 @@ function showFeedback(msg, type) {
 }
 .modal { background: #1a1a2e; border-radius: 8px; padding: 24px; width: 360px; }
 .modal h3 { font-size: 16px; margin-bottom: 16px; color: #e0e0e0; }
-.modal-body p { font-size: 13px; color: #888; margin-bottom: 6px; }
+.modal-body p { font-size: 14px; color: #888; margin-bottom: 6px; }
 .modal-body strong { color: #e0e0e0; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 .btn-cancel {
   padding: 8px 16px; border-radius: 4px; border: 1px solid #333;
-  background: transparent; color: #888; cursor: pointer; font-size: 13px;
+  background: transparent; color: #888; cursor: pointer; font-size: 14px;
+}
+
+/* ====== Mobile: horizontal scroll + larger fonts ====== */
+@media (max-width: 768px) {
+  .signals-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-header, .table-row { min-width: 900px; font-size: 14px; padding: 10px 14px; gap: 8px; }
+  .table-header { display: flex; }
+  .page-header { flex-direction: column; align-items: stretch; gap: 8px; }
+  .filter-row { flex-wrap: wrap; gap: 6px; }
+  .filter-btn { padding: 6px 14px; font-size: 14px; }
+  .strategy-select { flex: 1; min-width: 0; font-size: 14px; }
+  .col-kline-row { padding: 6px; }
+  .modal { width: 90%; max-width: 360px; }
+  .table-row { cursor: pointer; }
+  .sheet-overlay {
+    position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,0.6);
+    display: flex; align-items: flex-end;
+  }
+  .action-sheet {
+    width: 100%; background: #1a1a2e; border-radius: 14px 14px 0 0;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+  }
+  .sheet-title {
+    font-size: 14px; color: #999; text-align: center;
+    padding: 8px 0 12px; border-bottom: 1px solid #2a2a3e; margin-bottom: 8px;
+  }
+  .sheet-btn {
+    width: 100%; padding: 14px; border-radius: 8px; border: none;
+    background: #0f0f23; color: #4fc3f7; font-size: 16px; cursor: pointer;
+    margin-bottom: 8px; text-align: center;
+  }
+  .sheet-btn:active { opacity: 0.8; }
+  .sheet-danger { color: #FF4D4F; }
+  .sheet-cancel { background: #2a2a3e; color: #888; }
 }
 </style>

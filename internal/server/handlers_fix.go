@@ -379,6 +379,22 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleFixEngineHealth 处理 GET /api/engine_health 请求，返回流程引擎各子系统健康状况。
+// （handleFixEngineHealth handles GET /api/engine_health, returning the health status of each engine subsystem.）
+func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
+	status := map[string]bool{
+		"news_agent":    s.ctrl != nil && s.ctrl.GetAllNewsEvents() != nil,
+		"strategy_engine": s.ctrl != nil && s.ctrl.GetStageRecords() != nil,
+		"sector_agent":  s.ctrl != nil && s.ctrl.GetHotRecords() != nil,
+		"combat_agent":  s.ctrl != nil && s.ctrl.GetSignalLogs() != nil,
+		"llm":           s.ctrl != nil && s.runtimeLLM != "",
+		"ths":           s.ths != nil,
+		"fetcher":       s.fetcher != nil,
+		"aggregator":    s.agg != nil,
+	}
+	writeJSON(w, 200, status)
+}
+
 // handleFixAlerts 处理 GET /api/alerts 请求，返回系统告警列表。
 // 数据来源：消息中心持久化存储（引擎每轮同步 止盈/止损/策略信号/持仓提示）。
 // 未接入引擎时回退到实时看板 + 持仓日志。结果按时间倒序排列。
@@ -443,7 +459,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, item)
 	}
-	for _, l := range s.rpt.List() {
+	for _, l := range s.rpt.ListFor(requestUserID(r)) {
 		// 仅展示持仓中或已平仓的记录，平仓记录用当前盈亏补全提示文本
 		if l.Status == "持仓中" || l.ExitAt != nil {
 			alertType := "持仓提示"
@@ -542,7 +558,7 @@ TakeProfit    float64    `json:"take_profit"`     // 止盈目标价
 // 从执行日志中筛选状态为"持仓中"的记录，实时拉取最新股价计算盈亏。
 // 同时关联信号数据，标注持仓是否有活跃信号。
 func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
-	logs := s.rpt.List()
+	logs := s.rpt.ListFor(requestUserID(r))
 	holdings := make([]fixHolding, 0)
 	for _, l := range logs {
 		if l.Status != "持仓中" {
@@ -645,12 +661,18 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	uid := requestUserID(r)
+	// 手动持仓 ID 按账号隔离：code_userID_fix（空账号兼容旧格式 code_fix）
+	fixSuffix := "_fix"
+	if uid != "" {
+		fixSuffix = "_" + uid + "_fix"
+	}
 	_ = req.AvailableBalance
 	for _, h := range req.Holdings {
 		// 定位持仓：优先手动 _fix；无 _fix 时回退到同代码的现有持仓（兼容信号创建的持仓，避免重复建档）
-		id := h.Code + "_fix"
+		id := h.Code + fixSuffix
 		if s.rpt.FindBySignalID(id) == nil {
-			if heldID := s.heldSignalIDByCode(h.Code); heldID != "" {
+			if heldID := s.heldSignalIDByCode(h.Code, uid); heldID != "" {
 				id = heldID
 			}
 		}
@@ -658,9 +680,11 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 		if existing == nil {
 			s.rpt.LogSignal(id, h.Code, h.Name, "做多", "手动", h.CostPrice, h.TakeProfitPct, h.StopLossPct)
 			s.rpt.AddLot(id, h.CostPrice, h.Quantity)
+			s.rpt.Update(id, func(l *report.ExecLog) { l.UserID = uid })
 		} else {
 			now := time.Now()
 			s.rpt.Update(id, func(l *report.ExecLog) {
+				l.UserID = uid
 				// 重新买入：若该记录此前已平仓/删除，先重置为持仓中并清空平仓信息，
 				// 否则会被 handleFixGetHoldings 的“持仓中”过滤掉，导致刷新后持仓消失。
 				if l.Status != "持仓中" {
@@ -686,12 +710,12 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	// 删除不在本次提交中的手动持仓
-	for _, l := range s.rpt.List() {
-		if strings.HasSuffix(l.SignalID, "_fix") {
+	// 删除不在本次提交中的本账号手动持仓
+	for _, l := range s.rpt.ListFor(uid) {
+		if strings.HasSuffix(l.SignalID, fixSuffix) {
 			found := false
 			for _, h := range req.Holdings {
-				if h.Code+"_fix" == l.SignalID {
+				if h.Code+fixSuffix == l.SignalID {
 					found = true
 					break
 				}
@@ -710,9 +734,9 @@ type addHoldingLotReq struct {
 	Quantity float64 `json:"quantity"`
 }
 
-// heldSignalIDByCode 返回某代码当前最末一笔"持仓中"记录的信号 ID；无持仓返回空串。
-func (s *Server) heldSignalIDByCode(code string) string {
-	for _, l := range s.rpt.HeldPositions() {
+// heldSignalIDByCode 返回指定账号某代码当前最末一笔"持仓中"记录的信号 ID；无持仓返回空串。
+func (s *Server) heldSignalIDByCode(code, userID string) string {
+	for _, l := range s.rpt.HeldPositionsFor(userID) {
 		if l.Code == code {
 			return l.SignalID
 		}
@@ -734,7 +758,8 @@ func (s *Server) handleFixAddHoldingLot(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 400, "code and positive price/quantity required")
 		return
 	}
-	id := s.heldSignalIDByCode(code)
+	uid := requestUserID(r)
+	id := s.heldSignalIDByCode(code, uid)
 	if id == "" {
 		name := code
 		if info, err := s.quote(code); err == nil && info.Name != "" {
@@ -743,11 +768,12 @@ func (s *Server) handleFixAddHoldingLot(w http.ResponseWriter, r *http.Request) 
 		// 新开仓使用唯一 ID（code+t时间戳），避免与已平仓的旧 _fix 记录复用同一 ID 导致批次错乱
 		id = code + "_fix_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 		s.rpt.LogSignal(id, code, name, "做多", "手动", req.Price, 8, 5)
-		log.Printf("[server] 手动开仓 %s %s 价%.3f (id=%s)", code, name, req.Price, id)
+		s.rpt.Update(id, func(l *report.ExecLog) { l.UserID = uid })
+		log.Printf("[server] 手动开仓 %s %s 价%.3f (id=%s uid=%s)", code, name, req.Price, id, uid)
 	}
 	s.rpt.AddLot(id, req.Price, req.Quantity)
 	log.Printf("[server] 加仓 %s 价%.3f 量%.0f", code, req.Price, req.Quantity)
-	for _, l := range s.rpt.HeldPositions() {
+	for _, l := range s.rpt.HeldPositionsFor(uid) {
 		if l.Code == code {
 			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
 			return
@@ -764,7 +790,8 @@ func (s *Server) handleFixSetCost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	id := s.heldSignalIDByCode(code)
+	uid := requestUserID(r)
+	id := s.heldSignalIDByCode(code, uid)
 	if id == "" {
 		writeError(w, 404, "no position held for code")
 		return
@@ -775,7 +802,7 @@ func (s *Server) handleFixSetCost(w http.ResponseWriter, r *http.Request) {
 	}
 	s.rpt.SetCostBasis(id, req.Price)
 	log.Printf("[server] 更新成本 %s 成本%.3f", code, req.Price)
-	for _, l := range s.rpt.HeldPositions() {
+	for _, l := range s.rpt.HeldPositionsFor(uid) {
 		if l.Code == code {
 			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
 			return
@@ -810,9 +837,10 @@ func (s *Server) handleFixSellHolding(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "code and positive price/quantity required")
 		return
 	}
+	uid := requestUserID(r)
 	var target report.ExecLog
 	var targetID string
-	for _, l := range s.rpt.HeldPositions() {
+	for _, l := range s.rpt.HeldPositionsFor(uid) {
 		if l.Code == code {
 			target = l
 			targetID = l.SignalID
@@ -840,7 +868,7 @@ func (s *Server) handleFixSellHolding(w http.ResponseWriter, r *http.Request) {
 	}
 	s.rpt.SellLot(targetID, req.Price, req.Quantity)
 	log.Printf("[server] 减仓 %s 价%.3f 量%.0f (剩余持仓)", code, req.Price, req.Quantity)
-	for _, l := range s.rpt.HeldPositions() {
+	for _, l := range s.rpt.HeldPositionsFor(uid) {
 		if l.Code == code {
 			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
 			return
@@ -863,7 +891,7 @@ func (s *Server) handleFixCloseHolding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var target report.ExecLog
-	for _, l := range s.rpt.HeldPositions() {
+	for _, l := range s.rpt.HeldPositionsFor(requestUserID(r)) {
 		if l.Code == code {
 			target = l
 			break
@@ -1012,7 +1040,7 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 	if codes != "" {
 		stockList = strings.Split(codes, ",")
 	} else {
-		stockList = s.watchlist.List()
+		stockList = s.watchlist.List(requestUserID(r))
 	}
 	out := make([]map[string]interface{}, 0)
 	for _, code := range stockList {
@@ -1076,7 +1104,7 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 // 数据来源为 8a/8b 持续打分（dash.Scores），无打分记录时按 0 处理。
 func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 	dash := s.agg.Current()
-	codes := s.watchlist.List()
+	codes := s.watchlist.List(requestUserID(r))
 	seen := map[string]bool{}
 	out := make([]map[string]interface{}, 0)
 	var scores map[string]combat_agent.StockScores
@@ -1179,6 +1207,49 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// normalizeNewsTime 把新闻时间统一规范化为 "YYYY-MM-DD HH:MM"（保留到分钟）。
+// 兼容三种来源格式：已格式化的日期字符串（原样或截断）、epoch 秒（数字或纯数字字符串）、
+// 以及纯日期 "YYYY-MM-DD"。防止任何源的 epoch 秒时间直接透传给前端展示成乱码。
+// normalizeNewsTime coerces a news timestamp into "YYYY-MM-DD HH:MM". It accepts formatted
+// date strings (passed through/truncated), epoch seconds (numeric or numeric-string), and
+// bare dates, so raw epoch seconds can never leak to the frontend as garbage.
+func normalizeNewsTime(datetime interface{}) string {
+	switch v := datetime.(type) {
+	case nil:
+		return ""
+	case float64:
+		return newsTimeFromEpoch(int64(v))
+	case int64:
+		return newsTimeFromEpoch(v)
+	case int:
+		return newsTimeFromEpoch(int64(v))
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return ""
+		}
+		if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return newsTimeFromEpoch(sec)
+		}
+		// 已格式化：优先取 "MM-DD HH:MM"（长度足够时截掉秒）
+		if len(s) >= 16 {
+			return s[:16]
+		}
+		return s
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+// newsTimeFromEpoch 将 epoch 秒转为 "YYYY-MM-DD HH:MM"。
+// 非法/越界值返回空串，避免 0001-01-01 之类的脏数据展示。
+func newsTimeFromEpoch(sec int64) string {
+	if sec <= 0 {
+		return ""
+	}
+	return time.Unix(sec, 0).Format("2006-01-02 15:04")
+}
+
 // handleFixNews 处理 GET /api/news 请求，返回热点资讯（混合数据源，独立于 LLM Stage）。
 // 数据来源（按序混合去重）：
 //  1. 原始新闻流：同花顺快讯（主源）+ 新浪财经（兜底），"有啥刷啥"不依赖 LLM；
@@ -1239,7 +1310,7 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 			"id":           e.Title,
 			"title":        e.Title,
 			"content":      e.Content,
-			"datetime":     e.Datetime,
+			"datetime":     normalizeNewsTime(e.Datetime),
 			"source":       e.Source,
 			"direction":    e.Direction,
 			"sentiment":    e.Direction,
@@ -1260,7 +1331,7 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 			"id":           n.Title,
 			"title":        n.Title,
 			"content":      n.Content,
-			"datetime":     n.Datetime,
+			"datetime":     normalizeNewsTime(n.Datetime),
 			"source":       n.Source,
 			"direction":    "",
 			"sentiment":    "",
@@ -1309,6 +1380,20 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 			"stocks":       []string{},
 		})
 	}
+	// 按事件时间倒序（最新在前）：datetime 已统一为 "YYYY-MM-DD HH:MM"（宏观日历为 "YYYY-MM-DD"），
+	// 字符串字典序即时间序；空时间排最后。
+	// （Sort news by event time descending: datetime is normalized to "YYYY-MM-DD HH:MM" (macro
+	// calendar uses "YYYY-MM-DD"), so string order equals time order; empty timestamps go last.）
+	sort.SliceStable(out, func(i, j int) bool {
+		di, dj := out[i]["datetime"].(string), out[j]["datetime"].(string)
+		if di == "" {
+			return false
+		}
+		if dj == "" {
+			return true
+		}
+		return di > dj
+	})
 	writeJSON(w, 200, out)
 }
 
@@ -1323,7 +1408,7 @@ func truncateTitle(s string, maxLen int) string {
 
 // handleFixGetWatchlist 处理 GET /api/watchlist 请求，返回自选股列表及其实时行情。
 func (s *Server) handleFixGetWatchlist(w http.ResponseWriter, r *http.Request) {
-	list := s.watchlist.List()
+	list := s.watchlist.List(requestUserID(r))
 	out := make([]map[string]interface{}, 0)
 	for _, code := range list {
 		info, err := s.quote(code)
@@ -1363,7 +1448,7 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "code required")
 		return
 	}
-	if !s.watchlist.Add(code) {
+	if !s.watchlist.Add(requestUserID(r), code) {
 		writeJSON(w, 200, map[string]interface{}{"status": "ok", "duplicate": true})
 		return
 	}
@@ -1393,7 +1478,7 @@ func (s *Server) handleFixRemoveWatchlist(w http.ResponseWriter, r *http.Request
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.watchlist.Remove(req.Code)
+	s.watchlist.Remove(requestUserID(r), req.Code)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
