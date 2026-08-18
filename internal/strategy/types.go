@@ -16,6 +16,8 @@ const (
 	SignalNShape        SignalType = "n_shape"        // N 形超短（N-shape ultra-short）
 	SignalDragonReturn  SignalType = "dragon_return"  // 龙回头(中线)（Dragon Return, mid-line）
 	SignalShortSkeleton SignalType = "short_skeleton" // 做空骨架（Short-sell skeleton）
+	SignalFactor        SignalType = "factor"         // 因子战法（E6：自动发现的因子组合，实盘信号）（Factor strategy, E6）
+	SignalPattern       SignalType = "pattern"        // 形态战法（F3：自动发现的形态模板，实盘信号）（Pattern strategy, F3）
 )
 
 // TradeAction 交易动作类型。（TradeAction is a trade action type.）
@@ -82,6 +84,26 @@ type ExitContext struct {
 	EntryMeta map[string]float64 // 入场时评分明细（Score details at entry）
 	DailyK    []KLine            // 日 K 线历史（Daily K-line history）
 	Now       time.Time          // 当前时间（Current time）
+
+	// C4 ATR 动态止损：ATR 为标的当前 ATR（通常 ATR14，缺日K时为 0），
+	// ATRStopMult 为止损倍数（≤0 表示未启用、回退固定百分比）。
+	// English: C4 ATR dynamic stop — ATR is the instrument's current ATR (usually ATR14, 0 when daily
+	// bars are missing); ATRStopMult is the stop multiplier (≤0 = disabled, fall back to fixed percent).
+	ATR         float64
+	ATRStopMult float64
+}
+
+// ATRStopPct 返回本持仓的有效止损亏损百分比（相对成本）：
+// ATRStopMult>0 且 ATR>0 时返回 ATR×mult/成本×100（动态 ATR 止损），否则返回 fallbackPct（固定百分比）。
+// English: returns this position's effective stop-loss loss percent (vs cost): ATR×mult/cost×100 when
+// ATR stopping is active (ATRStopMult>0 and ATR>0), else the fixed fallbackPct.
+func (c *ExitContext) ATRStopPct(fallbackPct float64) float64 {
+	if c.ATRStopMult > 0 && c.ATR > 0 && c.CostPrice > 0 {
+		if atrPct := c.ATR * c.ATRStopMult / c.CostPrice * 100; atrPct > 0 {
+			return atrPct
+		}
+	}
+	return fallbackPct
 }
 
 // KLine 简化的 K 线数据结构（用于退出评估）。（KLine is a simplified bar used for exit evaluation.）

@@ -11,7 +11,7 @@ import (
 )
 
 // TestAnalyzeHotTopicBatchIsolatesSubBatch LLM 批量失败（重试耗尽）时子批隔离：
-// 返回非 nil 结果（用关键词兜底占位），不返回错误，主干继续；并报告失败批索引供留队重试。
+// 返回 nil 占位（不做关键词兜底），不返回错误，主干继续；并报告失败批索引供留队重试。
 func TestAnalyzeHotTopicBatchIsolatesSubBatch(t *testing.T) {
 	c := New(Config{APIKey: ""}) // 无 key → Chat 必然失败
 	titles := []string{"某公司涨停", "海外指数小幅波动", "某公司业绩暴跌"}
@@ -21,11 +21,11 @@ func TestAnalyzeHotTopicBatchIsolatesSubBatch(t *testing.T) {
 		t.Fatalf("子批隔离后不应返回错误，实际 %v", err)
 	}
 	if len(results) != len(titles) {
-		t.Fatalf("期望返回 %d 条兜底占位，实际 %d", len(titles), len(results))
+		t.Fatalf("期望返回 %d 条结果，实际 %d", len(titles), len(results))
 	}
 	for i, ht := range results {
-		if ht == nil {
-			t.Fatalf("第%d条应得到兜底占位，实际 nil", i)
+		if ht != nil {
+			t.Fatalf("第%d条失败子批应为 nil 占位（不做关键词兜底），实际非 nil", i)
 		}
 	}
 	// 全批失败（无 key）→ 全部索引应标记失败
@@ -34,25 +34,16 @@ func TestAnalyzeHotTopicBatchIsolatesSubBatch(t *testing.T) {
 	}
 }
 
-// TestFallbackAnalysisDefaultScore B：无关键词命中时 fallback 默认 Score=0（消除 +0.5 中性污染）。
-func TestFallbackAnalysisDefaultScore(t *testing.T) {
-	ht := fallbackAnalysis("某上市公司例行披露董事会决议")
-	if ht.Score != 0 {
-		t.Fatalf("期望默认 Score=0，实际 %v", ht.Score)
+// TestAnalyzeHotTopicFailureReturnsNil LLM 单条失败（重试耗尽）应返回 nil,err，
+// 不再返回关键词兜底结果，由调用方入重试队列。
+func TestAnalyzeHotTopicFailureReturnsNil(t *testing.T) {
+	c := New(Config{APIKey: ""}) // 无 key → Chat 必然失败
+	ht, err := c.AnalyzeHotTopic("某公司涨停")
+	if err == nil {
+		t.Fatalf("无 key 应返回错误")
 	}
-	if ht.Direction != "中性" {
-		t.Fatalf("期望方向中性，实际 %s", ht.Direction)
-	}
-}
-
-// TestFallbackAnalysisKeywordScore fallback 关键词命中时给出正确档位。
-func TestFallbackAnalysisKeywordScore(t *testing.T) {
-	ht := fallbackAnalysis("某芯片公司获重大订单 股价大涨")
-	if ht.Score <= 0 {
-		t.Fatalf("期望正向分，实际 %v", ht.Score)
-	}
-	if !strings.Contains(strings.Join(ht.Sectors, ","), "半导体") {
-		t.Fatalf("期望归因半导体板块，实际 %v", ht.Sectors)
+	if ht != nil {
+		t.Fatalf("失败时应返回 nil（不做关键词兜底），实际 %v", ht)
 	}
 }
 

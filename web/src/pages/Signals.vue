@@ -88,7 +88,10 @@
       </div>
       <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
       <div v-if="klineOpen.has(s.code)" class="col-kline-row">
-        <KLineChart :code="s.code" :name="s.name" />
+        <div class="kline-flex">
+          <div class="kline-main"><KLineChart :code="s.code" :name="s.name" /></div>
+          <div class="depth-side"><DepthPanel :code="s.code" :name="s.name" /></div>
+        </div>
       </div>
       </div>
       <div class="empty" v-if="filteredSignals.length === 0">暂无信号</div>
@@ -135,6 +138,8 @@ import LogModal from '../components/LogModal.vue'            // 日志弹窗（L
 // log modal (LLM batches + signal batches)
 import KLineChart from '../components/KLineChart.vue'        // 分时图组件（展开行展示）
 // K-line chart component (shown in expanded rows)
+import DepthPanel from '../components/DepthPanel.vue'        // 盘口面板（展开行展示，买卖五档）
+// order-book panel (shown in expanded rows, 5 bid/ask levels)
 
 // ── 响应式状态 ──
 // ── Reactive state ──
@@ -157,7 +162,8 @@ const tradeTarget = ref({})           // 待操作的信号对象
 const tradeAction = ref('')           // 操作类型：'buy' | 'ignore'
 // the action type: 'buy' | 'ignore'
 
-let timer = null        // 3 秒轮询定时器句柄
+let timer = null        // 5 秒轮询定时器句柄
+let visHandler = null   // 页面可见性切换回调（暂停/恢复轮询）
 // 3s polling timer handle
 let unsubSSE = null     // SSE 订阅解绑函数（卸载时调用以取消订阅）
 // SSE unsubscribe function (called on unmount to cancel the subscription)
@@ -324,13 +330,28 @@ function handleSSE(msg) {
   if (msg.signal || msg.type === 'scan') load()
 }
 
-/** 挂载时首次加载，启动 3 秒轮询 + SSE */
-/** On mount: initial load, start 3s polling + SSE */
+/** 挂载时首次加载，启动 5 秒轮询 + SSE；页面不可见时暂停轮询 */
+/** On mount: initial load, start 5s polling + SSE; pause while the tab is hidden */
+// 说明：轮询由 3s 降到 5s 并配合页面可见性暂停，降低对行情数据源的请求洪峰；
+// 信号为后端统一计算结果，轮询仅补足 SSE 偶发丢失，跨设备结果一致。
+// (Poll interval reduced from 3s to 5s plus visibility pause to cut quote-source load; the
+// signals are the backend's single computed result, polling only backfills SSE drops.)
 onMounted(() => {
   load()
-  // 每 3 秒轮询一次信号列表
-  // Poll the signal list every 3 seconds
-  timer = setInterval(load, 3000)
+  // 每 5 秒轮询一次信号列表 (poll the signal list every 5 seconds)
+  timer = setInterval(load, 5000)
+  // 页面不可见时暂停轮询，切回时立即补拉一次 (pause polling when hidden; refresh on return)
+  visHandler = () => {
+    if (document.hidden) {
+      if (timer) { clearInterval(timer); timer = null }
+    } else {
+      if (!timer) {
+        load()
+        timer = setInterval(load, 5000)
+      }
+    }
+  }
+  document.addEventListener('visibilitychange', visHandler)
   // 订阅后端 SSE 推送
   // Subscribe to backend SSE pushes
   api.connectSSE()
@@ -342,6 +363,7 @@ onUnmounted(() => {
   // 清理定时器与 SSE 订阅
   // Clear the timer and SSE subscription
   if (timer) clearInterval(timer)
+  if (visHandler) document.removeEventListener('visibilitychange', visHandler)
   if (unsubSSE) unsubSSE()
 })
 </script>
@@ -406,6 +428,13 @@ function showFeedback(msg, type) {
 }
 .btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
 .col-kline-row { padding: 8px 16px 12px; background: #16162a; }
+.kline-flex { display: flex; gap: 12px; align-items: stretch; }
+.kline-main { flex: 1 1 auto; min-width: 0; }
+.depth-side { flex: 0 0 300px; }
+@media (max-width: 720px) {
+  .kline-flex { flex-direction: column; }
+  .depth-side { flex: 1 1 auto; }
+}
 .tag { font-size: 14px; padding: 2px 10px; border-radius: 10px; }
 .tag.strong { background: rgba(255,77,79,0.15); color: #FF4D4F; }
 .tag.observe { background: rgba(250,173,20,0.15); color: #FAAD14; }

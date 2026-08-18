@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/auth"
-	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
@@ -27,12 +26,8 @@ import (
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
-	"quant-trading-v2/internal/strategies/double_bump"
-	"quant-trading-v2/internal/strategies/dragon"
-	"quant-trading-v2/internal/strategies/dragon_return"
-	"quant-trading-v2/internal/strategies/n_shape"
-	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trigger"
 )
 
@@ -66,7 +61,7 @@ func main() {
 		log.Fatalf("auth init: %v", err)
 	}
 	if !authMgr.IsInitialized() {
-		u, err := authMgr.Register("admin", "admin123")
+		u, err := authMgr.CreateUser("admin", "admin123", auth.RoleAdmin, nil, 0)
 		if err != nil {
 			log.Fatalf("create default admin: %v", err)
 		}
@@ -112,6 +107,8 @@ func main() {
 	llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
 	llmCfg.Streaming = cfgMgr.Rules.LLM.StreamingEnabled()
 	llmCfg.BatchConcurrency = cfgMgr.Rules.LLM.BatchConcurrency
+	// 可选分类专用模型：新闻归因 Stage0/1 等快速分类/初筛用它，主模型留给 D1/Stage2 深度分析。
+	llmCfg.ClassifierModel = cfgMgr.Rules.LLM.ClassifierModel
 	// 多 API 密钥：认证配置优先（逗号分隔），否则回退单 key
 	if v, ok := authMgr.GetConfig("", "llm_api_keys"); ok && v != "" {
 		for _, k := range strings.Split(v, ",") {
@@ -160,20 +157,6 @@ func main() {
 	rpsMgr := data.NewRPSManager()
 	sAgent := sector_agent.New(scanner, rpsMgr)
 
-	// 组合作战代理：挂载四大战法 runner + Laodeng 评分修正，支持配置热更新
-	stratCfg := cfgMgr.GetStrategyConfig()
-	laodengCfg := &cfgMgr.Rules.Laodeng
-	cAgent := combat_agent.New(stratCfg)
-	cAgent.SetLaodengConfig(laodengCfg)
-	cAgent.SetPositionDailyDropPct(cfgMgr.Rules.Position.DailyDropAlertPct)
-	cAgent.SetRunners([]combat_agent.StrategyRunner{
-		{Type: strategy.SignalDragon, Strategy: dragon.New(cfgMgr)},
-		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(cfgMgr)},
-		{Type: strategy.SignalNShape, Strategy: n_shape.New(cfgMgr, matcher)},
-		{Type: strategy.SignalDragonReturn, Strategy: dragon_return.New(cfgMgr)},
-	})
-	cAgent.StartHotReload(filepath.Join(dataDir, "config.json"))
-
 	// 报告 / 前端聚合 / 自选股 / 持仓追踪等数据服务
 	rpt := report.New(filepath.Join(dataDir, "report.json"))
 	agg := display.New()
@@ -189,26 +172,17 @@ func main() {
 	srv.SetRuntimeLLM(llmCfg.APIURL, effModel)
 	log.Printf("[LLM] 运行模型: %s @ %s", effModel, llmCfg.APIURL)
 
-	// 顶层编排引擎：绑定新闻/策略/板块/作战/报告等全部模块
-	eng := engine.New(marketAPI, nAgent, strategyEngine, sAgent, cAgent, agg, rpt, stockTracker, wlMgr, srv.GetSSE(), llmClient, thsClient, dataDir)
-	eng.SetScanner(scanner)
+	// B5 研究闭环：研究库与实时库同目录，web 审批端点读写候选、应用权重。
+	if researchDB, err := store.Open(filepath.Join(dataDir, "trading.db")); err != nil {
+		log.Printf("[research] 研究库接入失败: %v", err)
+	} else {
+		srv.SetResearch(researchDB, dataDir)
+		log.Printf("[research] 研究库已接入: %s", filepath.Join(dataDir, "trading.db"))
+	}
+
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
 	notifier := notify.New()
 	notifier.SetWebhooks(cfgMgr.GetNotifyConfig().WebhookURLs)
-	eng.SetNotifier(notifier)
-	srv.SetEngineController(eng)
-	// 前端修改 LLM 配置时热重建客户端，避免重启进程
-srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) {
-		lc := llm.New(llm.Config{
-			APIKeys:          apiKeys,
-			APIURL:           apiURL,
-			Model:            model,
-			Timeout:          time.Duration(timeoutSec) * time.Second,
-			Streaming:        streaming,
-			BatchConcurrency: batchConcurrency,
-		})
-		eng.SetLLMClient(lc)
-	})
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
 	baseStocks := append(wlMgr.All(), rpt.HeldPositionCodes()...)
@@ -220,32 +194,62 @@ srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, 
 	srv.SetCoordinator(dc)  // HTTP 展示层统一走该降级链，保证跨页价格一致
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
 
-	// 实时触发引擎（daban式放量急拉检测，SSE 推送）
-	trigCtx, trigCancel := context.WithCancel(context.Background())
-	defer trigCancel()
-	triggerEngine := trigger.New(fetcher, srv.GetSSE(), trigger.DefaultConfig())
-	go triggerEngine.Run(trigCtx)
-
-	// 近实时 8a/8b 打分循环（5s 节奏，持仓+自选持续打分 + 状态翻转信号）
-	eng.SetFetcher(fetcher)
-	scoreCtx, scoreCancel := context.WithCancel(context.Background())
-	defer scoreCancel()
-	go eng.RunScoringLoop(scoreCtx)
-
-	// 情绪周期阈值注入（SSE 广播情绪阶段）
-	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
-
 	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选
 	// English: per-sector constituent coverage (default 20) — widen same-sector leaders into the pool
 	sectorTopN := cfgMgr.Rules.MainSector.SectorConstituentTopN
 	if sectorTopN <= 0 {
 		sectorTopN = 20
 	}
-	eng.SetSectorConstituentTopN(sectorTopN)
 	sAgent.SetConstituentTopN(sectorTopN)
 
-	// D1 评分 LLM 轮询重试次数（防重要信号随 LLM 偶发失败丢失）
-	eng.SetD1MaxRetries(cfgMgr.Rules.LLM.MaxRetryTimes)
+	// 多账号独立引擎注册表：数据源全局共享一份，每个账号登录时懒加载自己的引擎实例。
+	// 同一账号任何设备读取同一份后端计算结果（信号/评分/做多做空开关/战法参数均按账号隔离）。
+	// English: multi-account engine registry — data sources are shared; each account lazily gets its
+	// own engine on login. The same account reads the same backend-computed results on any device
+	// (signals/scores/long-short toggles/strategy params are all isolated per account).
+	registry := engine.NewRegistry(engine.EngineOptions{
+		MarketAPI:    marketAPI,
+		NewsAgent:    nAgent,
+		StrategyEng:  strategyEngine,
+		SectorAgent:  sAgent,
+		Scanner:      scanner,
+		Matcher:      matcher,
+		Rpt:          rpt,
+		StockTracker: stockTracker,
+		WlMgr:        wlMgr,
+		SSE:          srv.GetSSE(),
+		LLMClient:    llmClient,
+		THS:          thsClient,
+		Fetcher:      fetcher,
+		CfgMgr:       cfgMgr,
+		DataDir:      dataDir,
+		Notifier:     notifier,
+		SectorTopN:   sectorTopN,
+		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
+	})
+	srv.SetEngineRegistry(registry)
+
+	// 前端修改 LLM 配置时热重建客户端，避免重启进程（对所有已创建账号引擎生效）
+	srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) {
+		lc := llm.New(llm.Config{
+			APIKeys:          apiKeys,
+			APIURL:           apiURL,
+			Model:            model,
+			Timeout:          time.Duration(timeoutSec) * time.Second,
+			Streaming:        streaming,
+			BatchConcurrency: batchConcurrency,
+			ClassifierModel:  classifierModel,
+		})
+		for _, e := range registry.All() {
+			e.SetLLMClient(lc)
+		}
+	})
+
+	// 实时触发引擎（daban式放量急拉检测，SSE 推送）
+	trigCtx, trigCancel := context.WithCancel(context.Background())
+	defer trigCancel()
+	triggerEngine := trigger.New(fetcher, srv.GetSSE(), trigger.DefaultConfig())
+	go triggerEngine.Run(trigCtx)
 
 	// 启动 HTTP 服务：地址可用 QUANT_ADDR 覆盖。
 	// 端口占用自动顺延：绑定失败时依次尝试下一个端口（最多 20 个），
@@ -293,14 +297,37 @@ srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, 
 		defer cancel()
 		_ = hs.Shutdown(shutdownCtx)
 		trigCancel()
-		scoreCancel()
 		os.Exit(0)
 	}()
 
 	ctx := context.Background()
 	log.Println("quant-trading-v2 已启动")
 
-	// 主循环：按市场时段驱动顶层引擎。
+	// 近实时 8a/8b 打分循环：5s 节奏，驱动所有已创建的账号引擎（共享引擎去重）。
+	// 各账号引擎内部按各自配置打分，持仓+自选持续打分 + 状态翻转信号。
+	// English: near-realtime 8a/8b scoring loop at a 5s cadence, driving every created account
+	// engine (shared engines deduplicated). Each engine scores by its own config over its pool.
+	scoreLoopCtx, scoreLoopCancel := context.WithCancel(ctx)
+	defer scoreLoopCancel()
+	go func() {
+		<-scoreLoopCtx.Done()
+	}()
+	go func() {
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-scoreLoopCtx.Done():
+				return
+			case <-tick.C:
+				for _, e := range registry.All() {
+					e.RunScoringLoopOnce(scoreLoopCtx)
+				}
+			}
+		}
+	}()
+
+	// 主循环：按市场时段驱动所有账号引擎。
 	// 盘前（8:30-9:15）"跑完即排下一轮"：等待异步引擎完成后立即触发下一轮，最大化新闻归因轮次，
 	// 让昨夜晚间新闻在开盘前尽可能完成 LLM 归因（配合未归因队列失败重试）；
 	// 其他时段按 5 分钟节奏推进，asyncBusy 忙锁防并发重入。
@@ -310,35 +337,124 @@ srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, 
 		since, ok := sinceForSession(session, now)
 		if ok {
 			log.Printf("[main] Session=%s 追回起始=%s", session, since.Format("01-02 15:04"))
+			engines := registry.All()
+			if len(engines) == 0 {
+				// 尚无账号登录/懒加载引擎，跳过本轮（等服务有账号时再驱动）
+				time.Sleep(5 * time.Minute)
+				continue
+			}
 			if session == data.SessionPreMarket {
 				// 盘前：新闻流水线含 LLM，异步触发避免阻塞近实时打分；等待完成后立即排下一轮，
 				// 用 AsyncIdle 轮询替代固定 5min 间隔，保证 9:15 前尽可能多轮归因。
-				if eng.TryAsyncRun(ctx, since) {
-					log.Printf("[main] 盘前异步引擎已触发, 等待完成后续轮")
-				} else {
-					log.Printf("[main] 盘前异步引擎仍在运行, 等待其完成")
+				for _, e := range engines {
+					if e.TryAsyncRun(ctx, since) {
+						log.Printf("[main] 盘前异步引擎已触发 (账号 %s)", e.UserID())
+					} else {
+						log.Printf("[main] 盘前异步引擎仍在运行 (账号 %s)", e.UserID())
+					}
 				}
-				// 等待本轮异步引擎完成（asyncBusy 清零）再立即排下一轮
-				for !eng.AsyncIdle() {
+				// 等待所有账号引擎异步完成（asyncBusy 清零）再立即排下一轮
+				for {
+					allIdle := true
+					for _, e := range engines {
+						if !e.AsyncIdle() {
+							allIdle = false
+							break
+						}
+					}
+					if allIdle {
+						break
+					}
 					time.Sleep(500 * time.Millisecond)
 				}
 				continue // 立即下一轮，不 sleep 5min
 			} else {
-				// 午前/盘中：异步触发，避免 LLM 重试阻塞主循环/近实时打分，轮次仍按 5min 节奏推进；
+				// 午前/盘中：异步触发，避免 LLM 重试阻塞主循环/近实时打分；
 				// asyncBusy 忙锁防止并发重入（上一轮未完成时本轮跳过）。
-				// English: trade sessions also run asynchronously so LLM retries never block the main loop or
-				// near-realtime scoring; the asyncBusy guard skips overlap, and rounds keep the 5-min cadence.
-				if eng.TryAsyncRun(ctx, since) {
-					log.Printf("[main] 盘中异步引擎已触发")
-				} else {
-					log.Printf("[main] 异步引擎仍在运行, 跳过本轮")
+				// 触发后用"新新闻到达或超时兜底"的自适应等待替代原固定 5min 心跳：
+				// 一旦探测到新新闻（或距上次触发满 maxIdleWait 兜底）且引擎空闲，立即排下一轮，
+				// 把"新闻出现→开始扫描"的延迟从分钟级压到探测周期内（默认 30s）。
+				// English: trade sessions run asynchronously so LLM retries never block the main loop or
+				// near-realtime scoring; the asyncBusy guard skips overlap. After triggering, an adaptive wait
+				// replaces the old fixed 5-min heartbeat: as soon as new news is probed (or the maxIdleWait
+				// backstop elapses) with engines idle, the next round starts at once, cutting news→scan
+				// latency down to the probe period (default 30s).
+				for _, e := range engines {
+					if e.TryAsyncRun(ctx, since) {
+						log.Printf("[main] 盘中异步引擎已触发 (账号 %s)", e.UserID())
+					} else {
+						log.Printf("[main] 异步引擎仍在运行, 跳过本轮 (账号 %s)", e.UserID())
+					}
 				}
+				adaptiveIntradayWait(ctx, engines)
+				continue // 由自适应等待决定何时排下一轮（不再固定 sleep 5min）
 			}
 		} else {
 			log.Printf("[main] Session=%s 非处理时段, 跳过本轮", session)
 		}
 		time.Sleep(5 * time.Minute)
 	}
+}
+
+// adaptiveIntradayWait 盘中自适应等待：以短周期探测各引擎是否空闲 + 是否有新新闻到达，
+// 满足"全部空闲 且（有新新闻 或 距上次触发已超最大空闲间隔）"即返回让主循环立即排下一轮。
+// 相比原固定 5min 心跳，"新闻到达→触发扫描"的延迟压缩到探测周期内（默认 30s）；
+// 无新闻时靠 maxIdleWait 兜底周期刷新（行情/自选持仓打分仍需周期性更新），避免盘中长时间静默。
+// （adaptiveIntradayWait waits adaptively during trade sessions: on a short cadence it checks whether all
+// engines are idle and whether new news has arrived, and returns once all idle AND either new news arrived
+// or the max idle interval elapsed, so the main loop starts the next round at once. vs the old fixed 5-min
+// heartbeat, news→scan latency drops to ~the probe period (default 30s); quiet periods are covered by the
+// maxIdleWait backstop so quote/watchlist-only refreshes still happen periodically.）
+func adaptiveIntradayWait(ctx context.Context, engines []*engine.Engine) {
+	const (
+		probeInterval = 30 * time.Second // 新新闻探测周期：决定"新闻到达→触发"的最大感知延迟
+		maxIdleWait   = 3 * time.Minute  // 无新新闻时的兜底触发间隔
+	)
+	lastTrigger := time.Now()
+	probe := time.NewTicker(probeInterval)
+	defer probe.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-probe.C:
+			// 上一轮异步尚未结束时不排下一轮（asyncBusy 忙锁防并发重入）
+			if !allEnginesIdle(engines) {
+				continue
+			}
+			// 有新新闻到达 → 立即触发下一轮扫描
+			if anyNewNews(engines) {
+				log.Printf("[main] 盘中探测到新新闻, 立即排下一轮")
+				return
+			}
+			// 兜底：距上次触发已超最大空闲间隔，即使无新新闻也刷新一轮
+			// （行情/自选持仓打分需要周期性更新，防止盘中长时间静默）
+			if time.Since(lastTrigger) >= maxIdleWait {
+				log.Printf("[main] 盘中无新新闻已达 %v, 超时兜底排下一轮", maxIdleWait)
+				return
+			}
+		}
+	}
+}
+
+// allEnginesIdle 报告全部引擎异步是否空闲（上轮异步 run 均已完成）。
+func allEnginesIdle(engines []*engine.Engine) bool {
+	for _, e := range engines {
+		if !e.AsyncIdle() {
+			return false
+		}
+	}
+	return true
+}
+
+// anyNewNews 探测任一引擎的新闻源是否有新新闻到达（命中即触发下一轮扫描）。
+func anyNewNews(engines []*engine.Engine) bool {
+	for _, e := range engines {
+		if e.HasNewNews() {
+			return true
+		}
+	}
+	return false
 }
 
 // sinceForSession 根据市场时段计算新闻追回起始时间：

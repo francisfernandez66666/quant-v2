@@ -37,7 +37,7 @@ func TestManagerLoadSaveRoundTrip(t *testing.T) {
 	newStrat.Dragon.F1SealWeight = 0.5
 	m.SetStrategyConfig(&newStrat)
 
-	d1 := &D1Config{Rules: []D1Rule{{Pattern: "中标", Direction: "利好", Score: 0.8}}}
+	d1 := &D1Config{Rules: []D1Rule{{Direction: "利好", Score: 0.8}}}
 	m.SetD1Config(d1)
 
 	if _, err := os.Stat(path); err != nil {

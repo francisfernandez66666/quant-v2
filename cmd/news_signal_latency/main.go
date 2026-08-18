@@ -21,10 +21,6 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
-	"quant-trading-v2/internal/strategies/double_bump"
-	"quant-trading-v2/internal/strategies/dragon"
-	"quant-trading-v2/internal/strategies/dragon_return"
-	"quant-trading-v2/internal/strategies/n_shape"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -146,7 +142,7 @@ func main() {
 		scorer := combat_agent.NewD1Scorer(llm.New(llmCfg), loadRawEvents())
 		fmt.Printf("  真实LLM D1批量评分(模型=%s): ", llmCfg.Model)
 		tD1 := time.Now()
-		d1s = scorer.BatchScore(codes, buildNews(), md, nil)
+		d1s = scorer.BatchScore(codes, buildNews(), md)
 		d1Ms = time.Since(tD1)
 		fmt.Printf("完成, 耗时 %v\n", d1Ms)
 	} else {
@@ -160,12 +156,7 @@ func main() {
 	// 新闻就绪锚点：行情+D1 完成后（等同于新闻注入完成）。
 	cAgent := combat_agent.New(cfgMgr.GetStrategyConfig())
 	cAgent.SetLaodengConfig(&cfgMgr.Rules.Laodeng)
-	cAgent.SetRunners([]combat_agent.StrategyRunner{
-		{Type: strategy.SignalDragon, Strategy: dragon.New(cfgMgr)},
-		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(cfgMgr)},
-		{Type: strategy.SignalNShape, Strategy: n_shape.New(cfgMgr, matcher)},
-		{Type: strategy.SignalDragonReturn, Strategy: dragon_return.New(cfgMgr)},
-	})
+	cAgent.SetRunners(combat_agent.NewRunners(cfgMgr, matcher))
 
 	fmt.Printf("=== 阶段3 逐战法评分+信号(生产5s节奏, %d轮) ===\n", *cycles)
 	tAnchor := time.Now()

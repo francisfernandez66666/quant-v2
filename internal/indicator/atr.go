@@ -1,0 +1,55 @@
+// ATR 平均真实波幅（Wilder 平滑，常用 n=14），供 C4 ATR 动态止损使用。
+package indicator
+
+// TrueRange 计算真实波幅序列：TR=max(H−L, |H−Cprev|, |L−Cprev|)，首根 TR=H−L。
+// （TrueRange computes the true range series.）
+func TrueRange(highs, lows, closes []float64) []float64 {
+	out := make([]float64, len(highs))
+	if len(highs) == 0 {
+		return out
+	}
+	out[0] = highs[0] - lows[0]
+	for i := 1; i < len(highs); i++ {
+		tr := highs[i] - lows[i]
+		if hc := mathAbs(highs[i] - closes[i-1]); hc > tr {
+			tr = hc
+		}
+		if lc := mathAbs(lows[i] - closes[i-1]); lc > tr {
+			tr = lc
+		}
+		out[i] = tr
+	}
+	return out
+}
+
+// ATR 计算 ATR 序列。首值取前 n 根 TR 简单平均，之后按 Wilder 递推；预热期为 NaN。
+// （ATR computes the ATR series: the first value is the simple mean of the first n TRs,
+// then Wilder smoothing; NaN during warm-up.）
+func ATR(highs, lows, closes []float64, n int) []float64 {
+	tr := TrueRange(highs, lows, closes)
+	out := make([]float64, len(tr))
+	for i := range out {
+		out[i] = nan()
+	}
+	if n <= 0 || len(tr) < n {
+		return out
+	}
+	out[n-1] = mean(tr[:n])
+	for i := n; i < len(tr); i++ {
+		out[i] = (out[i-1]*float64(n-1) + tr[i]) / float64(n)
+	}
+	return out
+}
+
+// ATR14 以常用参数 14 计算 ATR。
+// （ATR14 computes ATR with the standard period of 14.）
+func ATR14(highs, lows, closes []float64) []float64 {
+	return ATR(highs, lows, closes, 14)
+}
+
+func mathAbs(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}

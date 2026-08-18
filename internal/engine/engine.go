@@ -56,8 +56,10 @@ type Engine struct {
 	ths          *data.THSClient         // 同花顺客户端（板块名单/行情表/实时报价降级）
 	scanner      *data.SectorScanner     // 板块扫描器（板块名单索引，板块验真与归因校验依赖）
 
-	longEnabled  bool // 利好开关（做多分支）
-	shortEnabled bool // 利空开关（做空分支）
+	userID       string          // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/scores）
+	cfgMgr       *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
+	longEnabled  bool            // 利好开关（做多分支）
+	shortEnabled bool            // 利空开关（做空分支）
 
 	asyncBusy int32 // 盘前异步引擎运行标记（忙锁，避免异步 run 重入）
 
@@ -85,6 +87,7 @@ type Engine struct {
 	scoreStore       *scoreStore                     // 8a/8b 打分持久化（scores.json）
 	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
 	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
+	d1RetryQueue     map[string]bool                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
 	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
 	d1MaxRetries     int                             // D1 评分 LLM 轮询重试次数（<=0 用默认5）
 	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
@@ -97,11 +100,44 @@ func (e *Engine) LastRunTiming() *RunTiming {
 	return e.lastTiming
 }
 
-// SetEmotionConfig 设置情绪周期阈值（线程安全）。
+// LastD1Scores 返回主循环最近一轮 D1 评分结果（副本），含 RetryPending 标记，
+// 供 e2e/诊断断言"LLM 失败不兜底、走重试队列"语义。
+// English: returns a copy of the main loop's latest D1 scores (incl. RetryPending), for e2e/diagnostic
+// assertions of the "no LLM fallback, via retry queue" semantics.
+func (e *Engine) LastD1Scores() map[string]combat_agent.D1Score {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make(map[string]combat_agent.D1Score, len(e.lastD1Scores))
+	for code, d := range e.lastD1Scores {
+		out[code] = d
+	}
+	return out
+}
+
+// D1RetryQueueCodes 返回当前 D1 LLM 重试队列中的个股代码（副本），
+// 供 e2e 断言失败股确实并入重试队列。
+// English: returns a copy of the current D1 LLM retry-queue codes, for e2e assertions that failed stocks
+// actually joined the retry queue.
+func (e *Engine) D1RetryQueueCodes() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]string, 0, len(e.d1RetryQueue))
+	for code := range e.d1RetryQueue {
+		out = append(out, code)
+	}
+	return out
+}
+
+// SetEmotionConfig 设置情绪周期阈值（线程安全），并把 C5 禁止开仓阶段列表同步给战法代理。
+// English: sets the emotion-cycle thresholds (thread-safe) and pushes the C5 block-buy phases to the
+// combat agent.
 func (e *Engine) SetEmotionConfig(cfg *config.EmotionConfig) {
 	e.mu.Lock()
 	e.emotionCfg = cfg
 	e.mu.Unlock()
+	if e.combatAgent != nil && cfg != nil {
+		e.combatAgent.SetEmotionBlockPhases(cfg.BlockBuyPhases)
+	}
 }
 
 // SetSectorConstituentTopN 设置板块→个股传播每板块纳入的成分股数量（>0 时生效）。
@@ -210,6 +246,7 @@ func New(
 		scoreStore:       newScoreStore(scoreRecPath),
 		prevPass:         make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
+		d1RetryQueue:     make(map[string]bool),
 	}
 	e.syncMessages(nil, nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
@@ -220,6 +257,79 @@ func New(
 		e.agg.UpdateFast(loadedScores, persisted, e.rpt)
 	}
 	return e
+}
+
+// SetUserID 设置账号 ID（多账号独占引擎模式；Run/打分循环前应调用 syncAccountConfig 同步账号配置）。
+// English: sets the account ID for a per-account (non-shared) engine; call syncAccountConfig
+// before Run/scoring to apply that account's config.
+func (e *Engine) SetUserID(userID string) {
+	e.mu.Lock()
+	e.userID = userID
+	e.mu.Unlock()
+}
+
+// UserID 返回本引擎所属账号 ID。
+// English: returns the account ID this engine belongs to.
+func (e *Engine) UserID() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.userID
+}
+
+// SetCfgMgr 设置配置管理器（账号级配置读取来源）。
+// English: sets the config manager (source of per-account settings).
+func (e *Engine) SetCfgMgr(m *config.Manager) {
+	e.mu.Lock()
+	e.cfgMgr = m
+	e.mu.Unlock()
+}
+
+// SetLongShortConfig 固化本引擎的做多/做空开关（共享引擎在构建时由注册表按共享组配置设置）。
+// English: pins this engine's long/short toggles at build time (the registry sets them from the
+// shared group's config so the engine doesn't need to re-read a specific account at runtime).
+func (e *Engine) SetLongShortConfig(longEnabled, shortEnabled bool) {
+	e.mu.Lock()
+	e.longEnabled = longEnabled
+	e.shortEnabled = shortEnabled
+	e.mu.Unlock()
+	if e.combatAgent != nil {
+		e.combatAgent.SetShortEnabled(shortEnabled)
+	}
+}
+
+// syncAccountConfig 将账号级配置应用到本引擎（仅独占引擎使用）：
+//   - 做多/做空开关：按账号持久化的状态覆盖引擎内存开关
+//   - 战法参数：热更新到本账号的 combat_agent（runner 按账号读取）
+//
+// 共享引擎（userID 为空）跳过——其配置已在构建时按共享组固化，所有共享账号配置一致，
+// 因此任何设备读到同一份结果。
+// English: applies this account's config to the engine (per-account non-shared engines only) — the
+// account-persisted long/short toggles override the in-memory switches, and the account's strategy
+// params are hot-reloaded into this account's combat agent. Shared engines (empty userID) skip this:
+// their config was pinned at build time from the shared group, whose members all share one config.
+func (e *Engine) syncAccountConfig() {
+	e.mu.RLock()
+	cfgMgr, userID := e.cfgMgr, e.userID
+	e.mu.RUnlock()
+	if cfgMgr == nil || userID == "" {
+		return
+	}
+	ls := cfgMgr.GetLongShortConfigFor(userID)
+	e.mu.Lock()
+	e.longEnabled = ls.LongEnabled
+	e.shortEnabled = ls.ShortEnabled
+	e.mu.Unlock()
+	if e.combatAgent != nil {
+		e.combatAgent.SetShortEnabled(ls.ShortEnabled)
+		e.combatAgent.SetD1Config(cfgMgr.GetD1ConfigFor(userID))
+		pos := cfgMgr.GetRulesFor(userID).Position
+		e.combatAgent.SetPositionDailyDropPct(pos.DailyDropAlertPct)
+		e.combatAgent.SetATRStop(pos.ATREnabled, pos.ATRStopMult)
+		sc := cfgMgr.GetStrategyConfigFor(userID)
+		if sc != nil {
+			e.combatAgent.HotReload(sc)
+		}
+	}
 }
 
 // SetNotifier 设置推送器（P1 清仓/止损强提醒走桌面/Webhook）。
@@ -280,6 +390,59 @@ func (e *Engine) updateHotPool(bull, bear []sector_agent.VerifiedSector) {
 	}
 	f.UpdateHotStocks(stocks)
 	log.Printf("[engine] 热点池更新: %d 只板块成分股入 5s 实时池", len(stocks))
+}
+
+// syncSignalPool 把本轮展示的做多/做空/提醒信号代码并入 5s 实时监控池（与板块热点池取并集，上限 60）。
+// 否则信号股不在"自选+持仓"监控池时，/api/signals、/api/snapshot/hot 等展示接口读不到实时行情，
+// 涨跌幅显示 0.00%、现价停留在信号触发时的陈旧值。
+// （English: merges the current round's long/short/alert signal codes into the 5s live monitor
+// pool (union with the sector hot pool, capped at 60). Without this, signal stocks outside the
+// watchlist+positions pool show 0.00% change and a stale trigger price on the display endpoints
+// such as /api/signals and /api/snapshot/hot.）
+func (e *Engine) syncSignalPool(bull, bear, alert []combat_agent.Signal) {
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	// 与现有热点池取并集，避免覆盖掉板块入池个股
+	cur := f.HotStocks()
+	set := make(map[string]bool, len(cur)+len(bull)+len(bear)+len(alert))
+	for _, c := range cur {
+		set[c] = true
+	}
+	for _, s := range bull {
+		if s.Code != "" {
+			set[s.Code] = true
+		}
+	}
+	for _, s := range bear {
+		if s.Code != "" {
+			set[s.Code] = true
+		}
+	}
+	for _, s := range alert {
+		if s.Code != "" {
+			set[s.Code] = true
+		}
+	}
+	// 当日固化信号也持续展示（看板 FinalSignals 包含它们），一并入池保证现价/涨跌幅真实
+	if e.signalStore != nil {
+		for _, s := range e.signalStore.List() {
+			if s.Code != "" {
+				set[s.Code] = true
+			}
+		}
+	}
+	if len(set) == 0 {
+		return
+	}
+	stocks := make([]string, 0, len(set))
+	for c := range set {
+		stocks = append(stocks, c)
+	}
+	f.UpdateHotStocks(stocks)
 }
 
 // pushFreshHotspots 新热点立马进池：把归因产出的有效事件立即归因出板块 → 板块验真 → 并入 5s 实时监控池。
@@ -1154,6 +1317,16 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 		} else if sig.Action != "" {
 			action = sig.Action
 		}
+		// C3 自动纸面开仓：做多买入信号且开启 AutoTrackSignals 时，写入持仓记录
+		// （幂等：已持仓代码跳过），激活 CheckPositionsExits 离场路径。
+		// English: C3 auto-paper-open — for long buy signals with AutoTrackSignals on, write the
+		// position (idempotent: already-held codes skipped) so the exit path activates.
+		if direction == "做多" && action == "买入" && e.autoTrackEnabled() {
+			if si := live[sig.Code]; si != nil && si.Price > 0 {
+				sig.Price = si.Price
+			}
+			e.paperOpenBuy(sig)
+		}
 		// 现价与涨跌幅：优先实时行情（比信号触发价更新），行情失败则回退信号触发价，避免消息里"现价:0.00"
 		// English: prefer the live quote for the price and change% (fresher than the trigger price); fall
 		// back to the trigger price when the quote fails, so the message never reads "现价:0.00".
@@ -1357,6 +1530,13 @@ func (e *Engine) ShortEnabled() bool {
 	return e.shortEnabled
 }
 
+// DashboardData 返回当前看板快照（引擎内部 agg 的 Current()）。多账号模式下各引擎独立看板。
+// English: returns the current dashboard snapshot from this engine's agg. In multi-account mode
+// each engine has its own agg, so results are per-account.
+func (e *Engine) DashboardData() *display.DashboardData {
+	return e.agg.Current()
+}
+
 // GetDebugInfo 返回最近一轮流水线的调试数据。
 func (e *Engine) GetDebugInfo() *newsagent.DebugInfo {
 	e.mu.RLock()
@@ -1431,8 +1611,12 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 	out.st0 = e.newsAgent.Stage0(out.rawNews)
 	out.timing.Stage0 = time.Since(_stepStage0)
 	if out.st0.Err != nil {
-		// Stage0 失败：整批归一般（仅展示，不进 LLM 深度分析），明确记录原因便于排障
-		log.Printf("[engine][news漏斗] Stage0失败, 原始%d条全部归一般, 无LLM分析: %v", len(out.rawNews), out.st0.Err)
+		// Stage0 失败（如 LLM 未配置/连不通）：整批不归一般（避免误判丢失），
+		// 全部标记 FailedIdx 留未归因队列，下一轮轮询重新调 LLM；仅记录原因便于排障。
+		// English: Stage0 failure (e.g. LLM unconfigured/unreachable): the whole batch is NOT misclassified as
+		// general news; all items stay in the unattributed queue (FailedIdx) and are re-attributed next round
+		// once the LLM is reachable.
+		log.Printf("[engine][news漏斗] Stage0失败, 原始%d条留待重试(入未归因队列), 无LLM分析: %v", len(out.rawNews), out.st0.Err)
 	}
 	log.Printf("[engine][news漏斗] 原始=%d 个股=%d 板块=%d IPO=%d 一般=%d (板块material保留=%d)",
 		len(out.rawNews), len(out.st0.StockIdx), len(out.st0.SectorIdx), len(out.st0.IpoIdx), len(out.st0.GeneralIdx), len(out.st0.Material))
@@ -1482,6 +1666,12 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 
 	// 4. 注入 IPO 日历事件
 	out.events = append(out.events, e.newsAgent.BuildIPOEvents()...)
+
+	// 4a. IPO 启动板块事件：即将上市新股（宇树科技等）LLM 分析产业链价值传导，
+	// 归因出热点板块与上下游影响个股（卧龙电驱/三花智控），灌入板块监测与打分池。
+	// （IPO boot events: LLM chain analysis for soon-to-list IPOs turns their listing into a hot sector
+	// with upstream/downstream beneficiaries, feeding sector monitoring and the scoring pool.）
+	out.events = append(out.events, e.newsAgent.BuildIPOBootEvents()...)
 
 	// 4b. 政策反制事件：从涉外政策新闻关键词识别（直构，不走 LLM），并入事件流
 	retEvents := e.buildPolicyRetaliationSignals(e.newsAgent.DeriveRetaliation(out.rawNews))
@@ -1655,10 +1845,24 @@ func (e *Engine) AsyncIdle() bool {
 	return atomic.LoadInt32(&e.asyncBusy) == 0
 }
 
+// HasNewNews 委托新闻代理做轻量"新新闻到达"探测（无新闻代理则视为无新料），
+// 供盘中调度器决定是否立即触发新一轮扫描（而非等固定 5min 心跳）。
+// （HasNewNews delegates to the news agent's cheap "new news arrived" probe, telling the intraday
+// scheduler whether to trigger a fresh round immediately instead of waiting on the fixed heartbeat.）
+func (e *Engine) HasNewNews() bool {
+	if e.newsAgent == nil {
+		return false
+	}
+	return e.newsAgent.HasNewNews()
+}
+
 // Run 驱动一轮完整流水线：拉取 → Stage0 → Stage1/2 → 阈值过滤 → 归因 → 板块验证 → 战法扫描 → 信号聚合 → 广播。
 // since 为本次追回起始时间，由调用方（主循环）根据市场时段计算。
 func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.StrategyResult {
 	t0 := time.Now()
+	// 同步本账号配置（做多/做空开关 + 战法参数），保证账号内各设备一致
+	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
+	e.syncAccountConfig()
 	// 0-6. 新闻流水线：拉取→Stage0/1/2→固化→阈值→聚簇→衰减→归因验真传播
 	pOut := e.produceNews(ctx, since)
 	rawNews, st0, events, valid := pOut.rawNews, pOut.st0, pOut.events, pOut.valid
@@ -1738,11 +1942,14 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	eventMap := e.mergeSectorStocksIntoScores(ctx, sr, verifiedBull, verifiedBear, peScores)
 	_mergeT := time.Since(_stepMerge)
 
-	// 8. D1 评分（扩展后的打分池个股：新闻/持仓/自选 + 板块成分股）。
+	// 8. D1 评分（扩展后的打分池个股：新闻/持仓/自选 + 板块成分股 + LLM重试队列）。
 	// 板块事件标题一并注入 D1 评分上下文（个股不在新闻点名里也能按板块事件合理打分）；
-	// LLM 失败/漏项回退上一轮评分，避免断链归零。D1 与板块利好/利空事件分解耦，独立 40 分制。
-	// English: D1 batch scores the expanded pool (news/holdings/watchlist + sector constituents). Sector
-	// event titles are injected into D1 context so non-news-named constituents still grade fairly.
+	// LLM 失败/漏项不兜底（不回退上一轮、不归0占位）：标记 RetryPending 并入重试队列，
+	// 下轮随打分池重新调 LLM，避免断链归零。D1 与板块利好/利空事件分解耦，独立 40 分制。
+	// English: D1 batch scores the expanded pool (news/holdings/watchlist + sector constituents + the LLM
+	// retry queue). Sector event titles are injected into D1 context so non-news-named constituents still
+	// grade fairly. LLM failures are NEVER padded (no prior-round fallback, no plain-0 placeholder): they are
+	// marked RetryPending and merged back into the retry queue for a fresh LLM call next round.
 	_stepD1 := time.Now()
 	d1Scorer := combat_agent.NewD1Scorer(e.llmClient, "")
 	e.mu.RLock()
@@ -1750,12 +1957,38 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.mu.RUnlock()
 	d1Scorer.SetMaxRetries(retries)
 	e.mu.RLock()
-	prevD1 := e.lastD1Scores
+	retryQueue := make([]string, 0, len(e.d1RetryQueue))
+	for code := range e.d1RetryQueue {
+		retryQueue = append(retryQueue, code)
+	}
 	e.mu.RUnlock()
+	// 重试队列并入本轮打分池：失败股下轮重新走 LLM，不回退、不丢弃。
+	// English: merge the retry queue into this round's pool so failed stocks are re-scored via LLM.
+	if len(retryQueue) > 0 {
+		inPool := make(map[string]bool, len(sr.ScoringPool))
+		for _, c := range sr.ScoringPool {
+			inPool[c] = true
+		}
+		for _, c := range retryQueue {
+			if !inPool[c] {
+				sr.ScoringPool = append(sr.ScoringPool, c)
+			}
+		}
+		log.Printf("[engine] D1重试队列%d只并入本轮打分池", len(retryQueue))
+	}
 	d1Scorer.SetSectorEvents(eventMap)
-	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, valid, sr.MarketData, prevD1)
+	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, valid, sr.MarketData)
+	// 收集 LLM 失败待重试个股：并入重试队列（下轮重调 LLM），并清理已成功个股。
+	// English: collect RetryPending stocks into the retry queue (re-scored next round); drop the resolved ones.
+	nextRetry := make(map[string]bool)
+	for code, d := range d1Scores {
+		if d.RetryPending {
+			nextRetry[code] = true
+		}
+	}
 	e.mu.Lock()
 	e.lastD1Scores = d1Scores
+	e.d1RetryQueue = nextRetry
 	e.mu.Unlock()
 	_d1T := time.Since(_stepD1)
 
@@ -1907,6 +2140,17 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		bullSignals = nil
 		bearSignals = nil
 	}
+	// 开盘(9:30)前同样压制做多/做空战法信号：盘前无实盘成交量/最新价，
+	// 动量/量价齐升等易基于昨日存量 K 线误报（与近实时循环 BeforeOpenTrade 同口径）。
+	// 新闻归因/D1 评分仍正常推进，只是不对外发布买入/watch 信号。
+	// English: also suppress long/short strategy signals before the 9:30 open — pre-open there is no live
+	// volume or latest price, so momentum/volume-price strategies would false-fire on stale daily bars
+	// (same gate as the near-realtime loop's BeforeOpenTrade). News attribution / D1 scoring still run;
+	// only buy/watch signals are held back.
+	if data.BeforeOpenTrade(time.Now()) {
+		bullSignals = nil
+		bearSignals = nil
+	}
 
 	// 10-12 出信号结束
 	_signalsT := time.Since(_stepSignals)
@@ -1941,6 +2185,13 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// English: when the emotion cycle turns to retreat/divergence, advise trimming all long positions.
 	alertSignals = append(alertSignals, e.combatAgent.EmotionRetreatAlerts(e.rpt, exitQuotes, emotionPhase, time.Now())...)
 
+	// 13c'. 利空归因持仓抛售提醒（E4）：做多持仓命中利空板块/利空个股 → 独立于价格止损提醒尽快抛售。
+	// 使用 bearHitReasons 提供归因说明（板块名/上榜原因/关联新闻），让用户理解为何抛售。
+	// English: E4 bearish-attribution sell alerts — long holdings hit by bearish sectors/stocks get an
+	// independent "sell soon" reminder decoupled from price stops, with an attribution reason (sector
+	// name / listing reason / linked news) explaining why.
+	alertSignals = append(alertSignals, e.combatAgent.BearishAttributionAlerts(e.rpt, exitQuotes, bearHitReasons(sr), time.Now())...)
+
 	// 13d. 逐股卖点评估：对打分池全量个股（含未持仓的自选/跟踪股）评估利空D1/破位/派发/动量衰竭，
 	// 命中即产出"卖点"提醒（仅提醒不自动执行）；消息中心按 code@卖点评估 稳定键去重，5s 循环同键刷新。
 	// 仅做多（shortEnabled=false）时非持仓个股不评估、不发减仓/清仓提醒（非持仓无从减仓，纯噪音）；
@@ -1960,6 +2211,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 	// 14. 聚合器更新看板
 	_stepAgg := time.Now()
+	// 本轮全部展示信号并入 5s 实时监控池，保证展示接口的现价/涨跌幅真实（信号股不在自选池时也能读到行情）
+	e.syncSignalPool(bullSignals, bearSignals, alertSignals)
 	// 固化当日信号：本轮做多/做空 Pass 信号按 code@strategy 覆盖写盘
 	// English: pin today's signals — this round's long/short Passed signals overwrite the store per code@strategy.
 	// 先为做多/做空信号补全真实 D1 事件信息（评分/负面拦截/LLM理由/事件标题），随信号一并固化展示
@@ -2279,8 +2532,18 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	if topN <= 0 {
 		topN = 20
 	}
-	injected := 0
+
+	// 第一遍：仅收集需要拉成分股的板块（串行、无网络 IO），按所属事件下标分组。
+	// 同一板块每轮只取一次成分股，避免重复注入。
+	// （Pass 1: collect which sectors need constituents, grouped by owning event index,
+	// serially and without any network I/O. Each sector is fetched once per round.）
+	type needFetch struct {
+		evIdx int    // 所属事件下标（events 切片）
+		code  string // 板块代码
+		name  string // 板块名（日志用）
+	}
 	fetched := make(map[string]bool)
+	var needs []needFetch
 	for i := range events {
 		ev := &events[i]
 		if ev.Level != "板块" || absScore(ev.Score) < 0.5 {
@@ -2296,26 +2559,75 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 				continue
 			}
 			if fetched[si.Code] {
-				continue // 同一板块每轮只取一次成分股，避免重复注入
-			}
-			fetched[si.Code] = true
-			// 板块成分股：同花顺优先（仅代码/名称，供归因注入足够），失败/为空回退东财。
-			// THS-first keeps sector→stock propagation alive during EastMoney throttling (502).
-			stocks, err := e.sectorConstituents(si.Code, topN)
-			if err != nil {
-				log.Printf("[engine] 板块成分股获取失败 %s: %v", name, err)
 				continue
 			}
-			for _, st := range stocks {
-				label := fmt.Sprintf("%s(%s)", st.Name, st.Code)
-				if strContains(ev.RelatedStocks, label) || strContains(ev.RelatedStocks, st.Name) {
-					continue // 已注入过同名/同标签则跳过
-				}
-				ev.RelatedStocks = append(ev.RelatedStocks, label)
-				injected++
-			}
+			fetched[si.Code] = true
+			needs = append(needs, needFetch{evIdx: i, code: si.Code, name: name})
 		}
-		if injected > 0 || len(ev.RelatedStocks) > 0 {
+	}
+	if len(needs) == 0 {
+		return
+	}
+
+	// 第二遍：并发拉取成分股（有界 worker 池）。实际并发受各数据源限流器约束，
+	// 不会打爆同花顺/东财；串行 N 板块 O(N×T) 因此压到 ~O(T)。
+	// （Pass 2: fetch constituents concurrently with a bounded worker pool. Real concurrency is
+	// capped by the per-source rate limiters, so THS/EastMoney are never hammered; the serial
+	// O(N×T) cost over N sectors drops to ~O(T).）
+	type result struct {
+		code   string
+		stocks []data.StockInfo
+		err    error
+	}
+	const sectorFetchWorkers = 6
+	jobs := make(chan needFetch)
+	results := make(chan result, len(needs))
+	var wg sync.WaitGroup
+	for w := 0; w < sectorFetchWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for nf := range jobs {
+				stocks, err := e.sectorConstituents(nf.code, topN)
+				results <- result{code: nf.code, stocks: stocks, err: err}
+			}
+		}()
+	}
+	for _, nf := range needs {
+		jobs <- nf
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	// 第三遍：按板块代码暂存结果，再串行注入各自事件（避免并发写 events 切片）。
+	// （Pass 3: stage results by sector code, then inject serially to avoid racing on events.）
+	byCode := make(map[string][]data.StockInfo, len(needs))
+	for r := range results {
+		if r.err != nil {
+			log.Printf("[engine] 板块成分股获取失败 %s: %v", r.code, r.err)
+			continue
+		}
+		byCode[r.code] = r.stocks
+	}
+	injected := 0
+	for _, nf := range needs {
+		ev := &events[nf.evIdx]
+		stocks, ok := byCode[nf.code]
+		if !ok {
+			continue
+		}
+		added := 0
+		for _, st := range stocks {
+			label := fmt.Sprintf("%s(%s)", st.Name, st.Code)
+			if strContains(ev.RelatedStocks, label) || strContains(ev.RelatedStocks, st.Name) {
+				continue // 已注入过同名/同标签则跳过
+			}
+			ev.RelatedStocks = append(ev.RelatedStocks, label)
+			added++
+		}
+		injected += added
+		if added > 0 || len(ev.RelatedStocks) > 0 {
 			ev.CleanedStocks = e.newsAgent.CleanStocks(ev.RelatedStocks)
 		}
 	}
@@ -2701,6 +3013,37 @@ func bearHitCodes(sr *strategy_engine.StrategyResult) map[string]bool {
 	}
 	for _, code := range sr.BearStocks {
 		out[code] = true
+	}
+	return out
+}
+
+// bearHitReasons 返回 利空个股 → 归因说明 的映射（E4：利空归因持仓抛售提醒用）。
+// 说明拼接命中的利空板块名、上榜原因与关联新闻标题，供"利空归因到持仓"时向用户解释为何抛售。
+// English: returns a map of bearish stock → attribution reason (E4: bearish-attribution sell alerts).
+// The reason concatenates the hit bear sector name, its listing reason and linked news titles so the
+// user understands why their holding should be sold.
+func bearHitReasons(sr *strategy_engine.StrategyResult) map[string]string {
+	out := make(map[string]string)
+	for _, bs := range sr.BearSectors {
+		desc := bs.Name
+		if bs.Reason != "" {
+			desc += "(" + bs.Reason + ")"
+		}
+		if len(bs.NewsTitles) > 0 {
+			desc += " 事件:" + strings.Join(bs.NewsTitles, ";")
+		}
+		for _, code := range bs.LeadStocks {
+			if prev, ok := out[code]; ok {
+				out[code] = prev + " | " + desc
+			} else {
+				out[code] = desc
+			}
+		}
+	}
+	for _, code := range sr.BearStocks {
+		if _, ok := out[code]; !ok {
+			out[code] = "利空个股事件"
+		}
 	}
 	return out
 }

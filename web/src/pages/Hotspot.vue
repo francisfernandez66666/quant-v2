@@ -237,6 +237,7 @@ function showReason(s) { reasonTarget.value = s }
 
 let timer = null                  // 定时轮询句柄 (polling timer handle)
 let unsubSSE = null               // SSE 取消订阅函数 (SSE unsubscribe function)
+let visHandler = null             // 页面可见性切换回调（暂停/恢复轮询）
 let loading = false              // 防并发请求标志 (flag to prevent concurrent loads)
 const reanalyzing = ref(false)   // 手动 LLM 补推进行中标志 (flag: manual LLM reanalysis in progress)
 
@@ -380,8 +381,21 @@ async function onReanalyze() {
 
 onMounted(() => {
   load()
-  // 每 3 秒轮询一次热点数据 (poll hotspot data every 3s)
-  timer = setInterval(load, 3000)
+  // 每 5 秒轮询一次热点数据；页面不可见时暂停轮询 (poll hotspot every 5s; pause when hidden)
+  // 说明：轮询由 3s 降到 5s 并配合可见性暂停，降低对数据源的请求洪峰；SSE 仍实时推送新事件。
+  // (Poll interval reduced 3s→5s plus visibility pause to cut data-source load; SSE stays realtime.)
+  timer = setInterval(load, 5000)
+  visHandler = () => {
+    if (document.hidden) {
+      if (timer) { clearInterval(timer); timer = null }
+    } else {
+      if (!timer) {
+        load()
+        timer = setInterval(load, 5000)
+      }
+    }
+  }
+  document.addEventListener('visibilitychange', visHandler)
   // 订阅后端 SSE 推送 (subscribe to backend SSE push events)
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
@@ -389,6 +403,7 @@ onMounted(() => {
 onUnmounted(() => {
   // 清理定时器与 SSE 订阅 (clear the timer and SSE subscription)
   if (timer) clearInterval(timer)
+  if (visHandler) document.removeEventListener('visibilitychange', visHandler)
   if (unsubSSE) { unsubSSE(); unsubSSE = null }
 })
 </script>

@@ -58,6 +58,12 @@ import LLMDebug from './pages/LLMDebug.vue'
 // 股票咨询页：多轮 LLM 对话咨询
 // Consult page: multi-turn LLM Q&A consultation
 import Consult from './pages/Consult.vue'
+// 自动研究页：B5 优化候选审批与应用
+// Auto-research page: B5 optimizer candidate approval and application
+import Research from './pages/Research.vue'
+// 用户管理页：账号开通/权限配置（仅 admin）
+// Admin page: account creation and permission management (admin only)
+import Admin from './pages/Admin.vue'
 
 // 路由配置：定义所有页面路径及对应组件
 // Route config: defines every page path and its component
@@ -94,6 +100,12 @@ const routes = [
   // 股票咨询：多轮 LLM 对话
   // Consult: multi-turn LLM chat
   { path: '/consult', component: Consult },
+  // 自动研究：B5 候选审批与应用
+  // Auto-research: B5 candidate approval and application
+  { path: '/research', component: Research },
+  // 用户管理：账号开通/权限配置（仅 admin）
+  // Admin: account creation and permission management (admin only)
+  { path: '/admin', component: Admin },
 ]
 
 // 使用 Hash 历史模式创建路由实例，避免刷新时 404

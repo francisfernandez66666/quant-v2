@@ -33,8 +33,11 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strat
 	// 盈亏率（P&L percentage）
 	lossPct := (price - cost) / cost * 100
 
-	// 止损：浮亏达到 StopLossPct（默认 -5%）立即止损离场（Stop-loss: exit immediately at −StopLossPct, default −5%）
-	sl := -cfg.StopLossPct
+	// 止损：浮亏达到 StopLossPct（默认 -5%）立即止损离场（C4：ATR 动态止损启用时
+	// 止损距离取 ATR×mult，否则回退 StopLossPct）。
+	// English: stop-loss — exit immediately at −StopLossPct (default −5%); C4: the ATR dynamic stop
+	// (ATR×mult) takes precedence when enabled, else fall back to StopLossPct.
+	sl := -ctx.ATRStopPct(cfg.StopLossPct)
 	if lossPct <= sl {
 		return &strategy.ExitResult{Reason: "龙回头止损", Priority: strategy.P1}
 	}

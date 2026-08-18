@@ -24,7 +24,7 @@ func mkWaveMD(price float64, volShares int64) *strategy_engine.StockMarketData {
 		Code:   "600899",
 		Name:   "突破",
 		Price:  price,
-		Quote:  &data.StockInfo{Price: price, Volume: float64(volShares)},
+		Quote:  &data.StockInfo{Price: price, Volume: float64(volShares), Open: 10.3},
 		KLines: []data.KLine{prev, today},
 	}
 }

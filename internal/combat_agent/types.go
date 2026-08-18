@@ -78,6 +78,7 @@ type Signal struct {
 	AlertType   string    `json:"alert_type,omitempty"` // 提醒类型：止盈/止损
 	Price       float64   `json:"price"`                // 触发价格
 	Confidence  float64   `json:"confidence"`           // 置信度（0~1）
+	ATR         float64   `json:"atr,omitempty"`        // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
 	Reason      string    `json:"reason"`               // 信号生成原因
 	Sector      string    `json:"sector"`               // 所属板块
 	GeneratedAt time.Time `json:"generated_at"`         // 信号生成时间
@@ -93,6 +94,12 @@ type Signal struct {
 	D1Blocked  bool    `json:"d1_blocked,omitempty"`  // D1 负面过滤拦截标记
 	D1Reason   string  `json:"d1_reason,omitempty"`   // D1 事件分析理由（LLM）
 	D1Event    string  `json:"d1_event,omitempty"`    // D1 关联事件名称
+
+	// DepthFactors 盘口派生因子（免费源五档，Level-2 可扩十档）：供战法读取买卖压力/封单量。
+	// 仅当数据可用时填充（omitempty），缺失为零值——战法应容忍因子缺失。
+	// English: derived order-book factors (5 levels free / 10 with Level-2) for strategies to read
+	// bid/ask pressure & seal volume. Filled only when available; strategies must tolerate zero.
+	DepthFactors *data.OrderBookFactors `json:"depth_factors,omitempty"`
 }
 
 // SignalLog 单轮策略信号批次快照，记录该轮产出的全部信号与产出时间。

@@ -41,6 +41,7 @@ type ExecLog struct {
 	StopLossPct   float64    `json:"stop_loss_pct"`        // 预设止损百分比
 	Quantity      float64              `json:"quantity"`             // 持仓数量（手动设置，默认 1）
 	Lots          []Lot                `json:"lots,omitempty"`       // 加仓批次明细（加权平均成本 = EntryPrice，数量 = Quantity）
+	RealizedPnl   float64              `json:"realized_pnl,omitempty"` // 该标的累计已实现盈亏（元，含已平仓历史；减仓/清仓时累加）
 	EntryMeta     map[string]float64   `json:"entry_meta,omitempty"` // 入场评分快照（entry_nphase/vol_ratio/limit_price/highest_price 等，供战法退出引擎使用）
 	HighestPrice  float64              `json:"highest_price,omitempty"` // 阶段最高价（移动止盈基准；开仓时=入场价，盘中实时抬高）
 	ExitReason    string               `json:"exit_reason,omitempty"`   // 卖出原因（如 手动/止损/移动止盈/尾盘强平，供消息与复盘）
@@ -114,6 +115,26 @@ func (r *Report) LogSignalWithMeta(id, code, name, direction, strategy string, e
 	log.Printf("[report] 开仓记录: %s %s %s %.2f", strategy, code, name, entryPrice)
 }
 
+// LogSignalWithMetaQty 在 LogSignalWithMeta 基础上支持指定开仓数量（C6 仓位管理）。
+// qty<=0 时使用默认 1。其余行为与 LogSignalWithMeta 一致。
+// English: extends LogSignalWithMeta with an explicit opening quantity (C6 position sizing); qty<=0
+// falls back to 1. Otherwise identical.
+func (r *Report) LogSignalWithMetaQty(id, code, name, direction, strategy string, entryPrice, takeProfitPct, stopLossPct float64, qty float64, meta map[string]float64) {
+	r.LogSignalWithMeta(id, code, name, direction, strategy, entryPrice, takeProfitPct, stopLossPct, meta)
+	if qty <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.logs {
+		if r.logs[i].SignalID == id {
+			r.logs[i].Quantity = qty
+			break
+		}
+	}
+	r.save()
+}
+
 // LogExit 根据 signalID 平仓。计算盈亏百分比（(exitPrice - entryPrice) / entryPrice * 100），
 // 并据此标记状态为"已止盈"（pct > 0）或"已止损"（pct <= 0）。
 // 可选参数 reason 记录卖出原因（如 手动/止损/移动止盈/尾盘强平）。
@@ -126,7 +147,16 @@ func (r *Report) LogExit(signalID string, exitPrice float64, reason ...string) {
 	now := time.Now()
 	for i := range r.logs {
 		if r.logs[i].SignalID == signalID && r.logs[i].ExitAt == nil {
+			qty := r.logs[i].Quantity
+			if qty <= 0 {
+				qty = 1
+			}
 			pct := (exitPrice - r.logs[i].EntryPrice) / r.logs[i].EntryPrice * 100
+			// 平仓时把 (清仓价-均价)×数量 计入该标的已实现盈亏；
+			// SellLot 全卖路径已在清零数量前累计过，此处 Quantity=0 时跳过避免重复。
+			if r.logs[i].Quantity > 0 {
+				r.logs[i].RealizedPnl += (exitPrice - r.logs[i].EntryPrice) * qty
+			}
 			r.logs[i].ExitAt = &now
 			r.logs[i].ExitPrice = &exitPrice
 			r.logs[i].ProfitPct = &pct
@@ -215,7 +245,9 @@ func (r *Report) SellLot(id string, price, qty float64) {
 			cur = 1
 		}
 		if qty >= cur {
-			// 全部卖出：先扣光批次数量再平仓，避免残留零数量批次
+			// 全部卖出：先扣光批次数量再平仓，避免残留零数量批次；
+			// 已实现盈亏按 (卖出价-均价)×当前持仓数 计入（在清零数量前累计）。
+			l.RealizedPnl += (price - l.EntryPrice) * cur
 			l.Lots = nil
 			l.Quantity = 0
 			fullClose = true
@@ -231,8 +263,12 @@ func (r *Report) SellLot(id string, price, qty float64) {
 			}
 			if lot.Quantity > remain {
 				newLots = append(newLots, Lot{Price: lot.Price, Quantity: lot.Quantity - remain, At: lot.At})
+				// 被卖出的 remain 股按该批次成本记账：已实现盈亏=(卖出价-批次成本)×数量
+				l.RealizedPnl += (price - lot.Price) * remain
 				remain = 0
 			} else {
+				// 整批卖出：全批计入已实现盈亏
+				l.RealizedPnl += (price - lot.Price) * lot.Quantity
 				remain -= lot.Quantity
 			}
 		}
@@ -362,6 +398,19 @@ func (r *Report) HeldPositionCodes() []string {
 	return codes
 }
 
+// HasHolding 判断某代码当前是否有持仓中记录（含其他账号？不含，仅本报告实例）。
+// English: reports whether a code currently has a held position in this report.
+func (r *Report) HasHolding(code string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, l := range r.logs {
+		if l.Code == code && l.Status == "持仓中" {
+			return true
+		}
+	}
+	return false
+}
+
 // HeldPositions 返回当前所有状态为"持仓中"的完整 ExecLog 记录列表。
 // 用于显示模块展示当前持仓详情。
 // （HeldPositions returns the full records of all currently held positions for display.）
@@ -389,6 +438,36 @@ func (r *Report) FindBySignalID(id string) *ExecLog {
 		}
 	}
 	return nil
+}
+
+// TotalRealizedPnl 返回全部交易记录（含已平仓）累计已实现盈亏（元）。
+// userID 为空时统计全部账号；否则仅统计指定账号。
+// （TotalRealizedPnl returns the cumulative realized P&L in yuan across all records
+// including closed ones. Empty userID means all accounts.）
+func (r *Report) TotalRealizedPnl(userID string) float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var sum float64
+	for _, l := range r.logs {
+		if userID != "" && l.UserID != userID {
+			continue
+		}
+		sum += l.RealizedPnl
+	}
+	return sum
+}
+
+// RealizedPnlFor 返回指定持仓记录（signalID）的累计已实现盈亏（元）。
+// （RealizedPnlFor returns a position's cumulative realized P&L in yuan.）
+func (r *Report) RealizedPnlFor(signalID string) float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, l := range r.logs {
+		if l.SignalID == signalID {
+			return l.RealizedPnl
+		}
+	}
+	return 0
 }
 
 // Stats 计算并返回交易统计指标：

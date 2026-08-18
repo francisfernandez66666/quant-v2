@@ -203,10 +203,10 @@ func TestEndToEndFullPipeline(t *testing.T) {
 	}
 
 	// 自选股注入：300750 + 300308 进入打分池（D1 权重=4；300308 供 Dragon 战法评估）。
-	if !rig.wl.Add("300750") {
+	if !rig.wl.Add("", "300750") {
 		t.Fatal("自选添加 300750 失败")
 	}
-	if !rig.wl.Add("300308") {
+	if !rig.wl.Add("", "300308") {
 		t.Fatal("自选添加 300308 失败")
 	}
 	// 持仓注入：600276 恒瑞医药 开仓价 20 元（现价≈44.5，盈利 >122% 触及止盈50%）

@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,12 +23,61 @@ import (
 // User 用户账号记录。
 // （User is a user account record.）
 type User struct {
-	ID           string `json:"id"`                  // 用户唯一标识（u_ 前缀）
-	Username     string `json:"username"`            // 登录用户名
-	PasswordHash string `json:"password_hash"`       // bcrypt 密码哈希（临时账户为空）
-	Token        string `json:"token,omitempty"`     // 认证令牌
-	TokenExp     int64  `json:"token_exp,omitempty"` // 令牌过期 Unix 时间戳（0 表示永不过期）
-	CreatedAt    int64  `json:"created_at"`          // 创建时间 Unix 时间戳
+	ID           string   `json:"id"`                  // 用户唯一标识（u_ 前缀）
+	Username     string   `json:"username"`            // 登录用户名
+	PasswordHash string   `json:"password_hash"`       // bcrypt 密码哈希（临时账户为空）
+	Token        string   `json:"token,omitempty"`     // 认证令牌
+	TokenExp     int64    `json:"token_exp,omitempty"` // 令牌过期 Unix 时间戳（0 表示永不过期）
+	Role         string   `json:"role,omitempty"`      // 角色：admin=管理员 / user=普通用户（空按 user 处理）
+	Perms        []string `json:"perms,omitempty"`     // 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
+	Enabled      bool     `json:"enabled,omitempty"`   // 账号是否启用（默认 true；禁用后登录/令牌失效）
+	CreatedAt    int64    `json:"created_at"`          // 创建时间 Unix 时间戳
+	ExpiresAt    int64    `json:"expires_at,omitempty"` // 账号有效期截止 Unix 时间戳（0=永久）
+}
+
+// 角色常量。
+// （Role constants.）
+const (
+	RoleAdmin = "admin" // 管理员：拥有全部权限，可管理账号/配置
+	RoleUser  = "user"  // 普通用户：权限由 Perms 决定
+)
+
+// 权限位常量：细粒度功能权限，管理员角色隐式拥有全部权限位。
+// （Permission bit constants: fine-grained feature permissions; the admin role implicitly holds all of them.）
+const (
+	// PermResearchApprove 研究候选审批/驳回权限（自动研究 B5 的审批应用操作）。
+	PermResearchApprove = "research_approve"
+)
+
+// PermResearchApprove 之外可按需扩展更多权限位。
+
+// AllPerms 返回当前定义的全体权限位（供前端渲染权限清单）。
+// （AllPerms returns all defined permission bits for frontend rendering.）
+func AllPerms() []string {
+	return []string{PermResearchApprove}
+}
+
+// HasPerm 判断用户是否拥有指定权限位。
+// 管理员角色隐式拥有全部权限；临时/空角色用户仅当权限位命中才返回 true。
+// （HasPerm reports whether the user holds a permission bit. Admin role implicitly holds all;）
+func (u *User) HasPerm(perm string) bool {
+	if u == nil {
+		return false
+	}
+	if u.Role == RoleAdmin {
+		return true
+	}
+	for _, p := range u.Perms {
+		if p == perm {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAdmin 判断用户是否为管理员角色。
+func (u *User) IsAdmin() bool {
+	return u != nil && u.Role == RoleAdmin
 }
 
 // ConfigEntry 用户配置键值项。
@@ -65,8 +115,11 @@ func NewManager(dataDir string) *Manager {
 
 // Init 初始化认证数据库（不存在时新建）。
 // 若 auth.json 已存在则解析加载；解析失败时重置为空库，保证进程可继续运行。
+// 加载后执行兼容迁移：默认角色 user、默认启用；首个 "admin" 用户提升为管理员。
 // （Init initializes the auth database, creating it if absent. If auth.json exists it is parsed and
-// loaded; on parse failure the db is reset to empty so the process can keep running.）
+// loaded; on parse failure the db is reset to empty so the process can keep running.
+// After loading it runs compatibility migration: default role "user", default enabled;
+// the first user named "admin" is promoted to the admin role.）
 func (m *Manager) Init() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -80,15 +133,71 @@ func (m *Manager) Init() error {
 			// 数据库文件损坏：回退为空库，避免启动崩溃
 			m.db = &DB{}
 		}
-		return nil
-	}
-	if !os.IsNotExist(err) {
+	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("read auth db: %w", err)
+	} else {
+		// 首次运行：创建空库并落盘
+		m.db = &DB{}
+		return m.save()
 	}
 
-	// 首次运行：创建空库并落盘
-	m.db = &DB{}
-	return m.save()
+	// 兼容迁移：老库没有 Role/Enabled/Perms 字段，需补齐默认值并提升 admin
+	// （Compatibility migration: legacy dbs lack Role/Enabled/Perms; backfill defaults and promote admin.）
+	migrated := false
+	adminPromoted := false
+	for i := range m.db.Users {
+		u := &m.db.Users[i]
+		if u.Role == "" {
+			u.Role = RoleUser
+			migrated = true
+		}
+		if !u.Enabled && u.ID != "" {
+			u.Enabled = true
+			migrated = true
+		}
+		if u.Username == "admin" && u.Role != RoleAdmin && !adminPromoted {
+			u.Role = RoleAdmin
+			adminPromoted = true
+			migrated = true
+		}
+		if u.Perms == nil {
+			u.Perms = []string{}
+		}
+	}
+	// 无任何 admin 时，把最早创建的非临时用户提升为管理员，保证系统始终可管理
+	// （If no admin exists, promote the earliest non-temp user so the system stays manageable.）
+	if !adminPromoted {
+		for i := range m.db.Users {
+			u := &m.db.Users[i]
+			if u.Role == RoleAdmin {
+				adminPromoted = true
+				break
+			}
+		}
+	}
+	if !adminPromoted {
+		var earliest *User
+		for i := range m.db.Users {
+			u := &m.db.Users[i]
+			if strings.HasPrefix(u.ID, "tmp_") || u.Username == "" {
+				continue
+			}
+			if earliest == nil || u.CreatedAt < earliest.CreatedAt {
+				earliest = u
+			}
+		}
+		if earliest != nil {
+			earliest.Role = RoleAdmin
+			adminPromoted = true
+			migrated = true
+		}
+	}
+	if migrated {
+		if err := m.save(); err != nil {
+			return fmt.Errorf("migrate auth db: %w", err)
+		}
+	}
+	return nil
 }
 
 // save 将内存数据库序列化为 JSON 并写入 auth.json。
@@ -142,7 +251,9 @@ func (m *Manager) Register(username, password string) (*User, error) {
 		Username:     username,
 		PasswordHash: string(hash),
 		Token:        token,
-		TokenExp:     0, // 0 表示令牌永不过期
+		TokenExp:     0,     // 0 表示令牌永不过期
+		Role:         RoleUser, // 注册用户默认为普通用户
+		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
 	}
 	m.db.Users = append(m.db.Users, user)
@@ -170,6 +281,8 @@ func (m *Manager) CreateTemp(duration time.Duration) (*User, error) {
 		Username:  fmt.Sprintf("temp_%s", token[:8]),
 		Token:     token,
 		TokenExp:  time.Now().Add(duration).Unix(), // 令牌过期时间
+		Role:      RoleUser,
+		Enabled:   true,
 		CreatedAt: time.Now().Unix(),
 	}
 	m.db.Users = append(m.db.Users, user)
@@ -191,6 +304,12 @@ func (m *Manager) Login(username, password string) (*User, error) {
 		if u.Username == username {
 			if u.PasswordHash == "" {
 				return nil, fmt.Errorf("cannot login with temp account")
+			}
+			if !u.Enabled {
+				return nil, fmt.Errorf("account disabled")
+			}
+			if u.expired() {
+				return nil, fmt.Errorf("account expired")
 			}
 			if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
 				return nil, fmt.Errorf("wrong password")
@@ -214,6 +333,12 @@ func (m *Manager) ValidateToken(token string) *User {
 			if u.TokenExp > 0 && time.Now().Unix() > u.TokenExp {
 				return nil
 			}
+			if u.expired() {
+				return nil
+			}
+			if !u.Enabled {
+				return nil
+			}
 			return &u
 		}
 	}
@@ -231,6 +356,252 @@ func (m *Manager) UserToken(username string) string {
 		}
 	}
 	return ""
+}
+
+// PublicUser 返回不包含敏感字段（密码哈希/令牌）的用户公开视图。
+// （PublicUser returns a user view stripped of sensitive fields (password hash/token).）
+func (u *User) PublicUser() User {
+	out := *u
+	out.PasswordHash = ""
+	out.Token = ""
+	return out
+}
+
+// ListUsers 返回全部用户（公开视图，不含密码哈希与令牌）。
+// （ListUsers returns all users as public views, without password hashes or tokens.）
+func (m *Manager) ListUsers() []User {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]User, 0, len(m.db.Users))
+	for _, u := range m.db.Users {
+		out = append(out, u.PublicUser())
+	}
+	return out
+}
+
+// UserByID 返回指定 ID 的用户（公开视图）；不存在返回 nil。
+func (m *Manager) UserByID(userID string) *User {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, u := range m.db.Users {
+		if u.ID == userID {
+			pu := u.PublicUser()
+			return &pu
+		}
+	}
+	return nil
+}
+
+// updateUser 按 ID 定位用户并应用变更，写入磁盘。
+// （updateUser locates a user by ID, applies a mutation and persists.）
+func (m *Manager) updateUser(userID string, mutate func(u *User) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.db.Users {
+		if m.db.Users[i].ID == userID {
+			if err := mutate(&m.db.Users[i]); err != nil {
+				return err
+			}
+			return m.save()
+		}
+	}
+	return fmt.Errorf("user not found")
+}
+
+// SetRole 设置用户角色（admin / user）。
+func (m *Manager) SetRole(userID, role string) error {
+	if role != RoleAdmin && role != RoleUser {
+		return fmt.Errorf("invalid role")
+	}
+	return m.updateUser(userID, func(u *User) error {
+		u.Role = role
+		return nil
+	})
+}
+
+// GrantPerm 给用户追加一个权限位。
+func (m *Manager) GrantPerm(userID, perm string) error {
+	return m.updateUser(userID, func(u *User) error {
+		for _, p := range u.Perms {
+			if p == perm {
+				return nil
+			}
+		}
+		u.Perms = append(u.Perms, perm)
+		return nil
+	})
+}
+
+// RevokePerm 撤销用户的一个权限位。
+func (m *Manager) RevokePerm(userID, perm string) error {
+	return m.updateUser(userID, func(u *User) error {
+		out := u.Perms[:0]
+		for _, p := range u.Perms {
+			if p != perm {
+				out = append(out, p)
+			}
+		}
+		u.Perms = out
+		return nil
+	})
+}
+
+// SetPerms 整体覆盖用户的权限位列表。
+func (m *Manager) SetPerms(userID string, perms []string) error {
+	return m.updateUser(userID, func(u *User) error {
+		u.Perms = perms
+		return nil
+	})
+}
+
+// HasPerm 判断用户是否拥有指定权限位（管理员隐式全部）。
+func (m *Manager) HasPerm(userID, perm string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, u := range m.db.Users {
+		if u.ID == userID {
+			return u.HasPerm(perm)
+		}
+	}
+	return false
+}
+
+// IsAdmin 判断用户是否为管理员。
+func (m *Manager) IsAdmin(userID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, u := range m.db.Users {
+		if u.ID == userID {
+			return u.Role == RoleAdmin
+		}
+	}
+	return false
+}
+
+// ChangePassword 修改用户密码（bcrypt 哈希）并重新签发令牌，使旧 token 失效。
+func (m *Manager) ChangePassword(userID, newPassword string) error {
+	if newPassword == "" {
+		return fmt.Errorf("password required")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+	token, err := generateToken()
+	if err != nil {
+		return fmt.Errorf("generate token: %w", err)
+	}
+	return m.updateUser(userID, func(u *User) error {
+		u.PasswordHash = string(hash)
+		u.Token = token
+		return nil
+	})
+}
+
+// SetEnabled 启用/禁用账号；禁用后登录与令牌校验均被拒绝。
+func (m *Manager) SetEnabled(userID string, enabled bool) error {
+	return m.updateUser(userID, func(u *User) error {
+		if u.Role == RoleAdmin && !enabled {
+			return fmt.Errorf("cannot disable admin")
+		}
+		u.Enabled = enabled
+		return nil
+	})
+}
+
+// SetExpiry 设置账号有效期：days>0 表示 days 天后到期，0 表示永久有效。
+// 管理员账号不可设置有限有效期（避免锁死系统）。
+// （SetExpiry sets an account expiry: days>0 lapses the account after that many days, 0 = permanent.
+// Admin accounts cannot be given a finite expiry so the system can never lock itself out.）
+func (m *Manager) SetExpiry(userID string, days int) error {
+	if days < 0 {
+		return fmt.Errorf("invalid expiry days")
+	}
+	return m.updateUser(userID, func(u *User) error {
+		if u.Role == RoleAdmin && days > 0 {
+			return fmt.Errorf("cannot set finite expiry for admin")
+		}
+		if days > 0 {
+			u.ExpiresAt = time.Now().AddDate(0, 0, days).Unix()
+		} else {
+			u.ExpiresAt = 0
+		}
+		return nil
+	})
+}
+
+// expired 判断账号是否已过有效期（ExpiresAt=0 表示永久，永不过期）。
+// （expired reports whether an account has passed its expiry; ExpiresAt=0 means permanent.）
+func (u *User) expired() bool {
+	return u != nil && u.ExpiresAt > 0 && time.Now().Unix() > u.ExpiresAt
+}
+
+// CreateUser 由管理员创建正式用户：指定用户名/密码/角色/权限位/有效期天数。
+// expiresDays>0 时账号在该天数后到期；0 表示永久有效。
+// （CreateUser lets an admin create a real user with username/password/role/perms;
+// a positive expiresDays makes the account lapse after that many days, 0 = permanent.）
+func (m *Manager) CreateUser(username, password, role string, perms []string, expiresDays int) (*User, error) {
+	if role == "" {
+		role = RoleUser
+	}
+	if role != RoleAdmin && role != RoleUser {
+		return nil, fmt.Errorf("invalid role")
+	}
+	if expiresDays < 0 {
+		return nil, fmt.Errorf("invalid expiry days")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, u := range m.db.Users {
+		if u.Username == username {
+			return nil, fmt.Errorf("username already exists")
+		}
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+	token, err := generateToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate token: %w", err)
+	}
+	user := User{
+		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
+		Username:     username,
+		PasswordHash: string(hash),
+		Token:        token,
+		Role:         role,
+		Perms:        perms,
+		Enabled:      true,
+		CreatedAt:    time.Now().Unix(),
+	}
+	if expiresDays > 0 {
+		user.ExpiresAt = time.Now().AddDate(0, 0, expiresDays).Unix()
+	}
+	m.db.Users = append(m.db.Users, user)
+	if err := m.save(); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+// DeleteUser 删除指定用户（管理员账号不可删除）。
+// （DeleteUser removes a user by ID; the admin account cannot be deleted.）
+func (m *Manager) DeleteUser(userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.db.Users {
+		u := &m.db.Users[i]
+		if u.ID != userID {
+			continue
+		}
+		if u.Role == RoleAdmin {
+			return fmt.Errorf("cannot delete admin")
+		}
+		m.db.Users = append(m.db.Users[:i], m.db.Users[i+1:]...)
+		return m.save()
+	}
+	return fmt.Errorf("user not found")
 }
 
 // SetConfig 写入用户配置项（键不存在则新增）。

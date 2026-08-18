@@ -35,10 +35,28 @@ func NewRateLimiter(name string, ratePerSec, burst float64) *RateLimiter {
 var DisableAll bool
 
 // Wait 获取一个令牌，不足时阻塞等待。
+// 关键：令牌不足时的等待**必须在锁外进行**。若在持锁期间 sleep，
+// 该限流器上的所有并发请求会全局串行阻塞——一个被限流的请求会
+// 拖死所有请求同一数据源的路（表现为"一个账户占用全部数据源接口"）。
+// （English: the token wait must happen OUTSIDE the mutex. Sleeping while
+// holding the lock serializes every concurrent caller on the same limiter —
+// one throttled request stalls the whole data source for all accounts.）
 func (rl *RateLimiter) Wait() {
 	if DisableAll {
 		return
 	}
+	wait := rl.consumeOrWait()
+	if wait > 0 {
+		log.Printf("[rate] %s 限流等待 %v", rl.name, wait)
+		time.Sleep(wait)
+	}
+}
+
+// consumeOrWait 尝试消耗一个令牌；不足时返回需要等待的时长（此时未消耗令牌）。
+// 返回 0 表示已成功消耗令牌，可直接继续。
+// （English: consumeOrWait tries to take one token; when none is available it
+// returns the required wait duration without consuming a token. Returns 0 on success.）
+func (rl *RateLimiter) consumeOrWait() time.Duration {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -51,14 +69,13 @@ func (rl *RateLimiter) Wait() {
 		rl.tokens = rl.burst
 	}
 	if rl.tokens < 1 {
-		// 令牌不足：计算缺口所需等待时间并阻塞，随后清零
+		// 令牌不足：计算缺口所需等待时间（解锁后由调用方 sleep）
 		wait := time.Duration((1 - rl.tokens) / rl.rate * float64(time.Second))
-		log.Printf("[rate] %s 限流等待 %v", rl.name, wait)
-		time.Sleep(wait)
 		rl.tokens = 0
-	} else {
-		rl.tokens--
+		return wait
 	}
+	rl.tokens--
+	return 0
 }
 
 var (

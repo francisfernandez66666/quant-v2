@@ -1,0 +1,94 @@
+// 研究候选库（B5）：优化器产出的候选 → 人工审批 → 应用。
+package store
+
+import (
+	"time"
+)
+
+// Candidate 一条研究候选（待审批的战法/因子参数改动）。
+// （Candidate is one research candidate awaiting approval.）
+type Candidate struct {
+	ID        int64   `json:"id"`
+	CreatedAt string  `json:"created_at"`
+	Kind      string  `json:"kind"` // weights | d1rule | factor | depth
+	Status    string  `json:"status"` // proposed | approved | rejected | applied
+	Factors   string  `json:"factors"` // 因子 JSON 数组
+	Weights   string  `json:"weights"` // 权重 JSON 对象
+	Metric    float64 `json:"metric"`
+	ICMean    float64 `json:"ic_mean"`
+	IR        float64 `json:"ir"`
+	AvgExcess float64 `json:"avg_excess"`
+	Horizon   int     `json:"horizon"`
+	Reason    string  `json:"reason"`
+}
+
+// SaveCandidate 写入一条候选。
+// （SaveCandidate inserts a candidate.）
+func (d *DB) SaveCandidate(c *Candidate) (int64, error) {
+	if c.CreatedAt == "" {
+		c.CreatedAt = time.Now().Format("2006-01-02 15:04:05")
+	}
+	if c.Status == "" {
+		c.Status = "proposed"
+	}
+	res, err := d.db.Exec(`INSERT INTO research_candidates
+		(created_at, kind, status, factors, weights, metric, ic_mean, ir, avg_excess, horizon, reason)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		c.CreatedAt, c.Kind, c.Status, c.Factors, c.Weights,
+		c.Metric, c.ICMean, c.IR, c.AvgExcess, c.Horizon, c.Reason)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ListCandidates 列出候选（status 为空则全量，按创建时间倒序）。
+// （ListCandidates lists candidates, newest first.）
+func (d *DB) ListCandidates(status string) ([]Candidate, error) {
+	query := `SELECT id, created_at, kind, status, factors, weights,
+		COALESCE(metric,0), COALESCE(ic_mean,0), COALESCE(ir,0), COALESCE(avg_excess,0),
+		COALESCE(horizon,0), COALESCE(reason,'') FROM research_candidates`
+	args := []any{}
+	if status != "" {
+		query += ` WHERE status=?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY id DESC`
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Candidate
+	for rows.Next() {
+		var c Candidate
+		if err := rows.Scan(&c.ID, &c.CreatedAt, &c.Kind, &c.Status, &c.Factors, &c.Weights,
+			&c.Metric, &c.ICMean, &c.IR, &c.AvgExcess, &c.Horizon, &c.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CandidateByID 按 ID 取候选。
+// （CandidateByID fetches one candidate by ID.）
+func (d *DB) CandidateByID(id int64) (*Candidate, error) {
+	query := `SELECT id, created_at, kind, status, factors, weights,
+		COALESCE(metric,0), COALESCE(ic_mean,0), COALESCE(ir,0), COALESCE(avg_excess,0),
+		COALESCE(horizon,0), COALESCE(reason,'') FROM research_candidates WHERE id=?`
+	row := d.db.QueryRow(query, id)
+	var c Candidate
+	if err := row.Scan(&c.ID, &c.CreatedAt, &c.Kind, &c.Status, &c.Factors, &c.Weights,
+		&c.Metric, &c.ICMean, &c.IR, &c.AvgExcess, &c.Horizon, &c.Reason); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// UpdateCandidateStatus 更新候选状态。
+// （UpdateCandidateStatus sets a candidate's status.）
+func (d *DB) UpdateCandidateStatus(id int64, status string) error {
+	_, err := d.db.Exec(`UPDATE research_candidates SET status=? WHERE id=?`, status, id)
+	return err
+}

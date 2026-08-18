@@ -165,3 +165,36 @@ func TestEmotionRetreatAlerts(t *testing.T) {
 		t.Errorf("应减仓 600276, got %+v", alerts[0])
 	}
 }
+
+// TestBearishAttributionAlerts 利空归因持仓抛售提醒（E4）：命中利空板块的做多持仓产抛售提醒，
+// 未命中或做空持仓不产；归因说明应带板块名/原因。
+func TestBearishAttributionAlerts(t *testing.T) {
+	a := newTestAgent(t)
+	r := report.New("")
+	r.LogSignal("long1", "600276", "恒瑞", "做多", "dragon_return", 10, 20, 5)
+	r.LogSignal("long2", "600519", "茅台", "做多", "手动", 100, 20, 5)
+	r.LogSignal("short1", "000001", "平安", "做空", "手动", 8, 20, 5)
+
+	// 仅 600276 命中利空板块（医药板块利空）
+	bearReasons := map[string]string{
+		"600276": "医药(集采利空) 事件:医药集采落地",
+	}
+	alerts := a.BearishAttributionAlerts(r, qs(map[string]float64{
+		"600276": 9, "600519": 100, "000001": 8,
+	}), bearReasons, time.Now())
+	if len(alerts) != 1 {
+		t.Fatalf("应只对命中利空的做多持仓发 1 条抛售提醒, got %d", len(alerts))
+	}
+	sig := alerts[0]
+	if sig.Code != "600276" || sig.AlertType != "利空抛售" || sig.Action != "卖出" {
+		t.Errorf("抛售提醒字段异常: %+v", sig)
+	}
+	if sig.Reason == "" || !containsStr(sig.Reason, "集采") || !containsStr(sig.Reason, "尽快抛售") {
+		t.Errorf("抛售提醒应含归因说明, reason=%s", sig.Reason)
+	}
+
+	// 空 bearReasons → 无提醒
+	if a := a.BearishAttributionAlerts(r, qs(map[string]float64{"600276": 9}), nil, time.Now()); len(a) != 0 {
+		t.Errorf("空归因不应发提醒, got %d", len(a))
+	}
+}

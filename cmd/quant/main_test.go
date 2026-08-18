@@ -32,10 +32,6 @@ import (
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
-	"quant-trading-v2/internal/strategies/double_bump"
-	"quant-trading-v2/internal/strategies/dragon"
-	"quant-trading-v2/internal/strategies/dragon_return"
-	"quant-trading-v2/internal/strategies/n_shape"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -165,20 +161,16 @@ func newTestComponents(t *testing.T) (
 		DoubleBump: config.DoubleBumpConfig{
 			FirstBreakVolumeMultiple:  2.0,
 			SecondBreakVolumeMultiple: 1.5,
-			AdjustDaysMax:             10,
 			PositionWeight:            0.3,
 		},
 		NShape: config.NShapeConfig{
 			NPatternScoreThreshold: 0.6,
-			NShapeD1Threshold:      0.5,
 			HardStopLoss:           -5.0,
 		},
 		DragonReturn: config.DragonReturnConfig{
-			MinPullbackPct: -15.0,
-			MaxPullbackPct: -5.0,
-			StopLossPct:    -7.0,
-			TakeProfitPct:  15.0,
-			MaxHoldDays:    20,
+			StopLossPct:   -7.0,
+			TakeProfitPct: 15.0,
+			MaxHoldDays:   20,
 		},
 	})
 	cfgMgr.Rules.Laodeng = config.LaodengConfig{
@@ -207,12 +199,7 @@ func newTestComponents(t *testing.T) (
 	laodengCfg := &cfgMgr.Rules.Laodeng
 	cAgent := combat_agent.New(stratCfg)
 	cAgent.SetLaodengConfig(laodengCfg)
-	cAgent.SetRunners([]combat_agent.StrategyRunner{
-		{Type: strategy.SignalDragon, Strategy: dragon.New(cfgMgr)},
-		{Type: strategy.SignalDoubleBump, Strategy: double_bump.New(cfgMgr)},
-		{Type: strategy.SignalNShape, Strategy: n_shape.New(cfgMgr, nil)},
-		{Type: strategy.SignalDragonReturn, Strategy: dragon_return.New(cfgMgr)},
-	})
+	cAgent.SetRunners(combat_agent.NewRunners(cfgMgr, nil))
 	cAgent.SetShortEnabled(true)
 
 	rpt := report.New(filepath.Join(dir, "report.json"))

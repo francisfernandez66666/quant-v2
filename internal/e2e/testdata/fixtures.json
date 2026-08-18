@@ -1293,29 +1293,29 @@
  "lhb": null,
  "ipo": [
   {
-   "code": "920038",
-   "name": "森合高科",
-   "ipo_date": "20260813",
-   "listing_date": "20260814",
-   "issue_price": 29.06,
+   "code": "920059",
+   "name": "双英集团",
+   "ipo_date": "20260810",
+   "listing_date": "20260819",
+   "issue_price": 11.13,
    "list_status": "U",
    "sector": ""
   },
   {
-   "code": "001232",
-   "name": "嘉立创",
-   "ipo_date": "20260813",
-   "listing_date": "20260815",
-   "issue_price": 84.46,
+   "code": "688836",
+   "name": "宇树科技",
+   "ipo_date": "20260810",
+   "listing_date": "20260819",
+   "issue_price": 150.8,
    "list_status": "U",
    "sector": ""
   },
   {
-   "code": "920258",
-   "name": "N聚仁",
-   "ipo_date": "20260813",
-   "listing_date": "20260816",
-   "issue_price": 4.48,
+   "code": "688826",
+   "name": "N频准",
+   "ipo_date": "20260807",
+   "listing_date": "20260818",
+   "issue_price": 186.88,
    "list_status": "U",
    "sector": ""
   }

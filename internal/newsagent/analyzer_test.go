@@ -54,8 +54,7 @@ func TestPostProcessNegativeKept(t *testing.T) {
 	}
 }
 
-// TestPostProcessFallbackPollutionCleared B：fallback 遗留（Direction=中性 且 强度档=0）
-// 被归零，消除 +0.5 中性污染。
+// TestPostProcessFallbackPollutionCleared B：中性方向且强度档为 0 的残留被归零。
 func TestPostProcessFallbackPollutionCleared(t *testing.T) {
 	ht := &llm.HotTopic{
 		Title:       "常规公告",
@@ -67,7 +66,6 @@ func TestPostProcessFallbackPollutionCleared(t *testing.T) {
 	postProcess(ht)
 	// 量化后 0.5 → best=0.5，但 Direction/Sentiment 均中性；放宽规则下
 	// 仅当 best==0 才归零，这里应保留 0.5（LLM 未明确给方向，保留量化档由引擎阈值把关）。
-	// 注：fallback 默认 Score 已改为 0，此处为 LLM 显式给 0.5 且标中性的边界。
 	if ht.Score == 0 {
 		t.Fatalf("有明确分数的事件不应被归零，实际 0")
 	}

@@ -1,6 +1,6 @@
-// Package combat_agent D1 评分器单测：覆盖本轮"LLM 慢响应处理"改动的回退语义——
-//   - TestFillFallback：D1 失败回退上一轮评分（有值复用 / 无值归 0）
-//   - TestBatchScoreNilLLM：LLM 未配置时全量归 0，不受 fallback 影响
+// Package combat_agent D1 评分器单测：覆盖"LLM 失败不靠兜底、全部走重试队列"的语义——
+//   - TestMarkRetryPending：LLM 失败标记 RetryPending=true 待重试，不回退上一轮、不归0占位
+//   - TestBatchScoreNilLLM：LLM 未配置时全量归 0（无 LLM 可重试）
 //   - TestCleanJSONInteriorBOM：LLM 输出数组内部夹 BOM 时仍可被解析（曾整批亏损）
 //   - TestBatchScoreChunked：按 llmBatchSize 分批调用 LLM，每批独立解析、不漏股
 package combat_agent
@@ -72,40 +72,37 @@ func TestCleanJSONInteriorBOM(t *testing.T) {
 	}
 }
 
-// TestFillFallback 验证 D1 缺失评分回退语义：
-// fallback 有值则复用上一轮评分，无值则按 reason 归 0。
-func TestFillFallback(t *testing.T) {
+// TestMarkRetryPending 验证 LLM 失败不靠兜底：
+// 失败的个股标记 RetryPending=true（Score=0），入重试队列下轮重新调 LLM，
+// 不回退上一轮评分、不伪造分数。
+func TestMarkRetryPending(t *testing.T) {
 	ds := &D1Scorer{}
-	fallback := map[string]D1Score{
+	// 即使"上一轮有分"，LLM 本轮失败也不得回退复用：必须标记待重试。
+	result := map[string]D1Score{
 		"600519": {Code: "600519", Score: 0.7, Blocked: false, Reason: "上一轮评分"},
 	}
-	result := map[string]D1Score{}
-
-	// 有上一轮值：应回退复用，而非归 0
-	ds.fillFallback(result, []string{"600519"}, fallback, "LLM失败")
-	if got := result["600519"]; got.Score != 0.7 || got.Blocked || got.Reason != "上一轮评分" {
-		t.Fatalf("回退失败: got %+v, want score=0.7 上一轮评分", got)
+	ds.markRetryPending(result, []string{"600519"}, "LLM失败")
+	got := result["600519"]
+	if got.Score != 0 || got.RetryPending != true || got.Blocked {
+		t.Fatalf("应标记 RetryPending 待重试(Score=0), got %+v", got)
 	}
-
-	// 无上一轮值：按 reason 归 0
-	ds.fillFallback(result, []string{"000001"}, fallback, "LLM失败")
-	if got := result["000001"]; got.Score != 0 || got.Blocked || got.Reason != "LLM失败" {
-		t.Fatalf("无回退归0失败: got %+v, want 0/LLM失败", got)
+	if !strings.Contains(got.Reason, "待重试") {
+		t.Fatalf("Reason 应注明待重试, got %q", got.Reason)
 	}
 }
 
-// TestBatchScoreNilLLM 验证 LLM 未配置时全量归 0，不受 fallback 影响（无上一轮概念）。
+// TestBatchScoreNilLLM 验证 LLM 未配置时全量归 0（无 LLM 可重试，不标 RetryPending）。
 func TestBatchScoreNilLLM(t *testing.T) {
 	ds := NewD1Scorer(nil, "")
-	fallback := map[string]D1Score{
-		"600519": {Code: "600519", Score: 0.7, Blocked: false, Reason: "上一轮评分"},
-	}
-	got := ds.BatchScore([]string{"600519", "000001"}, nil, nil, fallback)
+	got := ds.BatchScore([]string{"600519", "000001"}, nil, nil)
 	if got["600519"].Score != 0 || got["000001"].Score != 0 {
 		t.Fatalf("LLM未配置应全量0分, got %+v", got)
 	}
 	if len(got) != 2 {
 		t.Fatalf("结果应含2只个股, got %d", len(got))
+	}
+	if got["600519"].RetryPending {
+		t.Fatalf("LLM未配置不应标 RetryPending（无可重试）: %+v", got["600519"])
 	}
 }
 
@@ -180,11 +177,11 @@ func TestBatchScoreChunked(t *testing.T) {
 	defer srv.Close()
 
 	cl := llm.New(llm.Config{
-		APIKey:     "test",
-		APIURL:     srv.URL,
-		Model:      "test-model",
-		Streaming:  false,
-		Timeout:    0,
+		APIKey:    "test",
+		APIURL:    srv.URL,
+		Model:     "test-model",
+		Streaming: false,
+		Timeout:   0,
 	})
 	ds := NewD1Scorer(cl, "")
 
@@ -199,7 +196,7 @@ func TestBatchScoreChunked(t *testing.T) {
 	for _, c := range codes {
 		events = append(events, newsagent.NewsEvent{Title: "事件-" + c, RelatedStocks: []string{c}})
 	}
-	got := ds.BatchScore(codes, events, nil, nil)
+	got := ds.BatchScore(codes, events, nil)
 
 	if len(calls) != 3 {
 		t.Fatalf("应产生3次LLM调用, got %d", len(calls))
@@ -260,7 +257,7 @@ func TestBatchScoreNoSubstantiveEventZeroed(t *testing.T) {
 	events := []newsagent.NewsEvent{{Title: "重大利好", RelatedStocks: []string{"600001"}}}
 	ds.sectorEvents = map[string]string{"600003": "板块利好事件"}
 
-	got := ds.BatchScore([]string{"600001", "600002", "600003"}, events, nil, nil)
+	got := ds.BatchScore([]string{"600001", "600002", "600003"}, events, nil)
 
 	if s := got["600001"]; s.Score != 0.5 {
 		t.Fatalf("600001 有关联事件应保留 LLM 分 0.5, got %+v", s)

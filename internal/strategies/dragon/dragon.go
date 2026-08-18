@@ -45,12 +45,31 @@ import (
 // DragonStrategy 破局龙战法策略结构。（DragonStrategy is the Dragon strategy struct.）
 // 使用 F1~F4 四维评分判断龙头股封板质量和参与机会。（Scores sector-leader seal quality via F1~F4.）
 type DragonStrategy struct {
-	cfg *config.Manager // 配置管理器（热加载 DragonConfig）（Config manager, hot-reloads DragonConfig）
+	cfg    *config.Manager // 配置管理器（热加载 DragonConfig）（Config manager, hot-reloads DragonConfig）
+	userID string          // 账号 ID：非空时按该账号的策略配置读取，否则回退全局（Account ID: per-account strategy config when set, else global）
 }
 
 // New 创建破局龙战法策略实例。（New creates a Dragon strategy instance.）
 func New(cfg *config.Manager) *DragonStrategy {
 	return &DragonStrategy{cfg: cfg}
+}
+
+// SetUserID 设置账号 ID（多账号独立引擎时，各账号 runner 按本账号配置读取）。
+// English: sets the account ID so a per-account engine's runner reads that account's config.
+func (d *DragonStrategy) SetUserID(userID string) {
+	d.userID = userID
+}
+
+// strategyCfg 返回当前账号的破局龙配置（账号级覆盖优先，否则全局）。
+// English: returns the Dragon config for the current account (account override wins, else global).
+func (d *DragonStrategy) strategyCfg() config.DragonConfig {
+	if d.userID != "" && d.cfg != nil {
+		return d.cfg.GetStrategyConfigFor(d.userID).Dragon
+	}
+	if d.cfg != nil {
+		return d.cfg.Get().Strategy.Dragon
+	}
+	return config.DragonConfig{}
 }
 
 // Name 返回策略中文名称"破局龙战法"。（Name returns the strategy display name "破局龙战法".）
@@ -84,9 +103,7 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	if si == nil || si.Price <= 0 || len(kLines) < 5 {
 		return nil
 	}
-	cfg := d.cfg.Get()
-	// 读取热加载的破局龙配置（F1~F4 权重、回调幅度等）（Load the hot-reloaded Dragon config, F1~F4 weights etc.）
-	dc := cfg.Strategy.Dragon
+	dc := d.strategyCfg()
 
 	// F1: 封板质量 — 基于涨幅和成交量（F1: seal quality — based on gain and volume）
 	// 涨幅>9.5%视为封板，量额比高说明封板坚决。（Gain >9.5% counts as sealed; a high volume/turnover ratio implies a firm seal.）

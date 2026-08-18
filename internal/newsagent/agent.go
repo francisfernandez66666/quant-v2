@@ -24,6 +24,8 @@ type Agent struct {
 	newsDBPath string             // 新闻事件本地持久化文件路径（news_events.json）
 	frozenPath string             // 固化事件持久化文件路径（frozen_events.json）
 	minScore   float64            // 落盘过滤最低分（默认 0.25；前端"显示全部"开关可改为 0）
+	bootCache  map[string]bool    // IPO启动分析缓存：交易日:代码 → 已分析
+	bootCacheDay string           // bootCache 对应的交易日 YYYYMMDD
 }
 
 // SetLLMClient 设置 LLM 客户端。（Sets the LLM client.）
@@ -71,6 +73,44 @@ func (a *Agent) Fetch(ctx context.Context, since time.Time) []data.NewsItem {
 	return rawNews
 }
 
+// HasNewNews 轻量探测"是否有新新闻到达"：只拉各源第 1 页并检查是否存在
+// 既未读(seen)也未排队(pending)的标题，不做分页追回、不做正文抓取，远轻于 Fetch。
+// 供盘中调度器高频探测，实现"新闻到达即触发扫描"而非等固定 5min 心跳。
+// （HasNewNews cheaply probes whether new news has arrived: it fetches only the first page of each
+// source and checks for titles that are neither seen nor queued. It skips paging and body enrichment,
+// so it is far lighter than Fetch. The intraday scheduler uses it to trigger a scan the moment news
+// arrives instead of waiting on the fixed 5-minute heartbeat.）
+func (a *Agent) HasNewNews() bool {
+	// 同花顺第 1 页探测
+	if items, err := a.marketAPI.GetTonghuashunNewsPage(1, 20); err == nil {
+		for _, it := range items {
+			if a.tracker.IsSeen(it.Title) || a.tracker.IsPending(it.Title) {
+				continue
+			}
+			return true
+		}
+	}
+	// 财联社电报第 1 页探测（正文自带，来源最及时）
+	if items, err := a.marketAPI.GetCLSNews(20); err == nil {
+		for _, it := range items {
+			if a.tracker.IsSeen(it.Title) || a.tracker.IsPending(it.Title) {
+				continue
+			}
+			return true
+		}
+	}
+	// 新浪第 1 页探测（补充视角）
+	if items, err := a.marketAPI.GetSinaNews(20); err == nil {
+		for _, it := range items {
+			if a.tracker.IsSeen(it.Title) || a.tracker.IsPending(it.Title) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
 // UnattributedItems 返回当前待归因（已抓取但 Stage0/Stage2 尚未成功）的新闻队列，
 // 按发布时间最新在前排序。供引擎在盘前/盘中每轮与新增新闻一并重试归因。
 // （UnattributedItems returns the current queue of fetched-but-not-yet-attributed news, newest-first,
@@ -113,23 +153,14 @@ func (a *Agent) MarkAttributedTitles(titles map[string]bool) {
 	}
 }
 
-// Stage1 过滤：判断板块/宏观新闻是否有投资价值，返回有价值的标题索引。
-// （Stage1 filtering: judges whether sector/macro news has investment value and returns valuable title indices.）
-func (a *Agent) Stage1(titles []string) []int {
-	indices, err := a.classifyMaterial(titles)
-	if err != nil {
-		log.Printf("[newsagent] Stage1失败: %v", err)
-		return nil
-	}
-	return indices
-}
-
 // Stage2 深度分析：LLM 对新闻全量分析，输出带方向/分数/归因的结构化事件。
 // 中性事件照常输出，由引擎按阈值过滤丢弃。
-// 返回第二个值 failedItems：LLM 分析失败（被兜底占位）未归因的新闻，调用方应留队重试。
+// 返回第二个值 failedItems：LLM 分析失败（nil 占位，不做关键词兜底）未归因的新闻，
+// 调用方应把它们留在未归因队列供下一轮重试。
 // （Stage2 deep analysis: LLM analyzes all news into structured events with direction/score/attribution;
 // neutral events are still emitted and the engine discards them by threshold. The second return failedItems
-// lists news whose LLM analysis failed (padded by fallback), which callers should keep for retry.）
+// lists news whose LLM analysis failed (nil placeholder, no keyword fallback), which callers should keep
+// in the unattributed queue for the next round.）
 func (a *Agent) Stage2(items []data.NewsItem) ([]NewsEvent, []data.NewsItem) {
 	events, failed := a.analyzeDeep(items)
 	if a.cleaner != nil {
@@ -529,6 +560,99 @@ func (a *Agent) buildIPOEvents() []NewsEvent {
 	}
 	if len(out) > 0 {
 		log.Printf("[newsagent] IPO注入 %d 个事件", len(out))
+	}
+	return out
+}
+
+// BuildIPOBootEvents 对"即将上市"的新股做板块级 LLM 深度分析（IPO 启动事件）。
+// 背景：宇树科技等未上市公司不在股票库、东财行业接口也查不到板块，单纯"新股上市"
+// 个股级事件被 attribution() 以 Level==个股 直接跳过，永远无法归因出机器人板块，
+// 也无法把卧龙电驱/三花智控等上下游价值传导到打分池与 D1 评分上下文。
+// 因此本函数把即将上市（未来 ≤ bootDays 个交易日，默认 5）的新股标题交给 LLM
+// 按产业链热点分析（AnalyzeHotTopic → HotTopic），产出 Level=板块 的事件，
+// 其中 Sectors=所属概念板块、Upstream/DownstreamStocks=上下游影响个股、
+// Upstream/DownstreamSectors=上下游板块。随后 buildChainEvents 展开为带方向事件，
+// 经 attribution() 归因出热点板块，板块成分股/上下游个股并入打分池供 D1 评分。
+// 缓存：按交易日+新股代码记录已分析项，同日不重复调用 LLM（防每轮全跑）。
+// （BuildIPOBootEvents runs LLM chain analysis for soon-to-list IPOs. An unlisted issuer like
+// Unitree is absent from the stock DB and its industry cannot be fetched via EastMoney, so the plain
+// per-stock IPO event (Level=个股) is skipped by attribution() and never produces a robot sector nor
+// propagates upstream/downstream beneficiaries (e.g. Wolong/Sanhua) into the scoring pool / D1 context.
+// This method feeds each soon-to-list IPO title (within bootDays trading days, default 5) to the LLM
+// hotspot analyzer (AnalyzeHotTopic → HotTopic) and emits Level=板块 events carrying Sectors plus
+// upstream/downstream stocks/sectors; buildChainEvents expands them into directional events that
+// attribution() turns into hot sectors whose constituents/beneficiaries join the D1 scoring pool.
+// Cache: analyzed IPO codes are recorded per trading day so the LLM is not re-invoked every round.）
+func (a *Agent) BuildIPOBootEvents() []NewsEvent {
+	if a.marketAPI == nil || a.llmClient == nil {
+		return nil
+	}
+	now := time.Now()
+	td := data.TradingDayDate(now)
+
+	// 跨交易日重置缓存（bootAnalyzed: "交易日:代码" → 已分析）
+	if a.bootCacheDay != td {
+		a.bootCache = make(map[string]bool)
+		a.bootCacheDay = td
+	}
+
+	list, err := a.marketAPI.GetEastMoneyIPOCalendar()
+	if err != nil {
+		log.Printf("[newsagent] 获取IPO日历失败(boot): %v", err)
+		return nil
+	}
+
+	const bootDays = 5
+	bootDeadline := data.AddTradingDays(td, bootDays)
+	var titles []string
+	type bootTarget struct {
+		code, name, title string
+	}
+	var targets []bootTarget
+	for _, ipo := range list {
+		if ipo.ListStatus != "U" && ipo.ListStatus != "" {
+			continue // 已上市的不再视为启动事件
+		}
+		listing := ipo.ListingDate
+		if listing == "" {
+			listing = ipo.IPODate
+		}
+		if listing == "" || listing > bootDeadline {
+			continue // 超过 bootDays 内上市的跳过
+		}
+		key := td + ":" + ipo.Code
+		if a.bootCache[key] {
+			continue
+		}
+		a.bootCache[key] = true
+		title := fmt.Sprintf("%s(%s) 将于 %s 上市，请分析该新股上市对A股产业链的价值传导影响", ipo.Name, ipo.Code, listing)
+		targets = append(targets, bootTarget{code: ipo.Code, name: ipo.Name, title: title})
+		titles = append(titles, title)
+	}
+	if len(titles) == 0 {
+		return nil
+	}
+
+	var out []NewsEvent
+	for i, t := range titles {
+		ht, err := a.llmClient.AnalyzeHotTopic(t)
+		if err != nil || ht == nil {
+			log.Printf("[newsagent] IPO启动LLM分析失败(%s): %v", targets[i].code, err)
+			continue
+		}
+		postProcess(ht)
+		// 强制板块级：IPO 启动是产业链事件，非个股
+		ht.Level = "板块"
+		item := data.NewsItem{
+			Title:    t,
+			Datetime: now.Format("2006-01-02 15:04:05"),
+			Source:   "IPO日历",
+			Content:  fmt.Sprintf("新股 %s(%s) 上市，产业链价值传导启动", targets[i].name, targets[i].code),
+		}
+		out = append(out, buildChainEvents(ht, item)...)
+	}
+	if len(out) > 0 {
+		log.Printf("[newsagent] IPO启动板块事件注入 %d 个", len(out))
 	}
 	return out
 }

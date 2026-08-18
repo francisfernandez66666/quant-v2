@@ -40,6 +40,13 @@ func (e *Engine) RunScoringLoop(ctx context.Context) {
 	}
 }
 
+// RunScoringLoopOnce 执行一轮近实时打分（供多账号注册表统一 5s 调度调用）。
+// English: runs one near-realtime scoring cycle (called by the multi-account registry's shared
+// 5s scheduler).
+func (e *Engine) RunScoringLoopOnce(ctx context.Context) {
+	e.scoreCycle(ctx)
+}
+
 // scoreCycle 执行一轮近实时打分：收拢持仓+自选 → 构建行情 → 8a/8b 打分+信号 → 状态翻转去重 → 更新看板/落盘。
 func (e *Engine) scoreCycle(ctx context.Context) {
 	// 防御：单轮 panic 不拖垮整个循环，记录日志后继续下一轮
@@ -55,6 +62,10 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	default:
 		return
 	}
+
+	// 同步本账号配置（做多/做空开关 + 战法参数），保证账号内各设备一致
+	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
+	e.syncAccountConfig()
 
 	e.mu.RLock()
 	f := e.fetcher
@@ -225,6 +236,9 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		// English: displayed signals = pinned day signals + this round's newly-flipped signals.
 		e.agg.UpdateFast(scores, mergeSignals(emit, e.signalStore.List()), e.rpt)
 		e.scoreStore.Save(data.TradingDayDate(time.Now()), scores)
+		// 本轮全部 Pass 信号并入 5s 监控池：让展示接口优先走批量快照（而非每票 TTL 兜底），
+		// 现价/涨跌幅真实且不加重上游逐票请求。
+		e.syncSignalPool(sigs, nil, nil)
 	}
 
 	// 记录本轮新翻转出来的信号（供排查）
@@ -290,6 +304,7 @@ func (e *Engine) logNShapeDiag(emotionPhase string, diags []combat_agent.NDiag) 
 // invalidateBrokenSignals 校验当日固化的做多买入信号，对失效信号打墓碑：
 //  1. 现价跌破触发价（sig.Price）→ 买入依据破坏；
 //  2. N 形(n_shape)信号当前 D1=0（无实质事件）→ 不再具备"有 D1 事件"+一突 的买入前提。
+//
 // 命中即移出固化存储（当日不再固化/展示）+ 删除消息中心对应条目 + 日志。
 // 仅处理做多信号；行情缺失/价格无效时跳过（等下一轮有数据再判）。
 // English: validates today's pinned buy signals and tombstones stale ones — (1) live price below the
@@ -318,10 +333,14 @@ func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMar
 				sig.Code, sig.Name, sig.Strategy, smd.Quote.Price, sig.Price)
 			continue
 		}
-		// N 形信号当前无有效 D1（无实质事件被归 0）→ 不具备买入前提
-		// English: n_shape pinned signal whose current D1 is 0 (no substantive event) — premise no longer holds.
+		// N 形信号当前无有效 D1（无实质事件被归 0）→ 不具备买入前提；
+		// 但 LLM 失败待重试（RetryPending，Score=0 是占位而非真实归0）不触发墓碑，
+		// 等重试队列下轮重新调 LLM 拿到真实分数再判。
+		// English: n_shape pinned signal whose current D1 is 0 (no substantive event) — premise no longer
+		// holds. But a RetryPending entry (Score=0 is a placeholder, not a real zero) must NOT tombstone:
+		// wait for the retry queue to re-score it via LLM next round.
 		if sig.Strategy == string(strategy.SignalNShape) {
-			if d, ok := d1Scores[sig.Code]; ok && d.Blocked == false && d.Score <= 0 {
+			if d, ok := d1Scores[sig.Code]; ok && d.Blocked == false && d.Score <= 0 && !d.RetryPending {
 				e.signalStore.Invalidate(sig.Code, sig.Strategy)
 				e.msgStore.Delete(sig.Code + "@交易信号@" + sig.Strategy)
 				log.Printf("[engine] 失效墓碑: %s(%s) n_shape 当前D1=0(无实质事件), 已移除信号", sig.Code, sig.Name)

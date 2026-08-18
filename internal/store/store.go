@@ -1,0 +1,615 @@
+// Package store — SQLite 历史数据存储层（B 阶段数据地基）。
+// 基于纯 Go 驱动 modernc.org/sqlite（无 cgo），存放 Tushare 历史数据（日线/复权因子/
+// 每日指标/涨跌停/财务指标/利润表/现金流/指数）与研究产物。
+// 仅服务离线研究链路（dataload/回测/因子/自动研究），交易时段的实时数据仍走内存 JSON。
+// （Package store is the SQLite historical-data persistence layer for the Phase-B data foundation,
+// built on the pure-Go modernc.org/sqlite driver (no cgo). It holds Tushare history used only by the
+// offline research chain; realtime trading data keeps flowing through in-memory JSON as before.）
+package store
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动（driver 名 "sqlite"）
+)
+
+// DB 历史数据存储句柄。
+// （DB wraps the research database handle.）
+type DB struct {
+	db *sql.DB
+}
+
+// Open 打开（必要时创建）研究数据库并初始化表结构。
+// （Open opens (creating if needed) the research DB and initializes the schema.）
+func Open(dbPath string) (*DB, error) {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return nil, fmt.Errorf("store mkdir: %v", err)
+	}
+	// busy_timeout 避免多进程（dataload 与回测）并发写时报 database is locked；
+	// WAL 提升并发读写吞吐。English: busy_timeout avoids "database is locked" across the
+	// dataload/backtest processes; WAL boosts concurrent read/write throughput.
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)")
+	if err != nil {
+		return nil, fmt.Errorf("store open %s: %v", dbPath, err)
+	}
+	// 连接池收敛为少量连接：SQLite 单写者模型下并发连接反而放大锁竞争。
+	db.SetMaxOpenConns(4)
+	d := &DB{db: db}
+	if err := d.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return d, nil
+}
+
+// Close 关闭数据库。
+// （Close closes the database.）
+func (d *DB) Close() error { return d.db.Close() }
+
+// migrate 建表（幂等，IF NOT EXISTS）。
+// 所有表均为历史研究数据，主键即 Tushare 主键，便于 INSERT OR REPLACE 断点续传。
+// （migrate creates the schema idempotently; primary keys match Tushare's for resumable upserts.）
+func (d *DB) migrate() error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS stocks (
+			ts_code TEXT PRIMARY KEY, name TEXT, area TEXT, industry TEXT,
+			market TEXT, list_date TEXT, delist_date TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS trade_cal (
+			cal_date TEXT PRIMARY KEY, is_open INTEGER
+		)`,
+		`CREATE TABLE IF NOT EXISTS daily (
+			ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
+			open REAL, high REAL, low REAL, close REAL, pre_close REAL,
+			change REAL, pct_chg REAL, vol REAL, amount REAL,
+			PRIMARY KEY (ts_code, trade_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS adj_factor (
+			ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, adj_factor REAL,
+			PRIMARY KEY (ts_code, trade_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS daily_basic (
+			ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
+			turnover_rate REAL, turnover_rate_f REAL, volume_ratio REAL,
+			pe REAL, pe_ttm REAL, pb REAL, ps REAL, ps_ttm REAL, pcf_ttm REAL,
+			dv_ratio REAL, dv_ttm REAL, total_share REAL, float_share REAL,
+			free_share REAL, total_mv REAL, circ_mv REAL, is_st INTEGER,
+			PRIMARY KEY (ts_code, trade_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS stk_limit (
+			ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
+			up_limit REAL, down_limit REAL,
+			PRIMARY KEY (ts_code, trade_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS index_daily (
+			ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
+			open REAL, high REAL, low REAL, close REAL, pre_close REAL,
+			change REAL, pct_chg REAL, vol REAL, amount REAL,
+			PRIMARY KEY (ts_code, trade_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS fina_indicator (
+			ts_code TEXT NOT NULL, end_date TEXT NOT NULL, ann_date TEXT,
+			eps REAL, roe REAL, roe_waa REAL, roa REAL, roe_dt REAL,
+			grossprofit_margin REAL, netprofit_margin REAL, debt_to_assets REAL,
+			yoy_or REAL, yoy_net_profit REAL, or_yoy REAL, netprofit_yoy REAL,
+			PRIMARY KEY (ts_code, end_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS income (
+			ts_code TEXT NOT NULL, end_date TEXT NOT NULL,
+			n_income_attr_p REAL, revenue REAL, total_revenue REAL,
+			PRIMARY KEY (ts_code, end_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS cashflow (
+			ts_code TEXT NOT NULL, end_date TEXT NOT NULL,
+			n_cashflow_act REAL, n_cashflow_inv_act REAL, n_cashflow_fnc_act REAL,
+			PRIMARY KEY (ts_code, end_date)
+		)`,
+		// 研究候选库（B5 自动研究闭环：优化器产出 → 人工审批 → 应用）
+		`CREATE TABLE IF NOT EXISTS research_candidates (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'proposed',
+			factors TEXT,
+			weights TEXT,
+			metric REAL,
+			ic_mean REAL,
+			ir REAL,
+			avg_excess REAL,
+			horizon INTEGER,
+			reason TEXT
+		)`,
+		// 板块历史（E5）：按行业聚合的板块日线（离线重建），供形态战法回测与因子环境分组。
+		// English: sector daily history (E5) — per-industry aggregated board daily bars, rebuilt offline
+		// from daily+stk_limit, used for pattern backtests and factor environment grouping.
+		`CREATE TABLE IF NOT EXISTS sector_history (
+			trade_date TEXT NOT NULL,
+			industry TEXT NOT NULL,
+			limitup_cnt INTEGER DEFAULT 0,
+			change_pct REAL DEFAULT 0,
+			member_count INTEGER DEFAULT 0,
+			top_stocks TEXT,
+			PRIMARY KEY (trade_date, industry)
+		)`,
+		// 常用查询索引（主键外的补充加速）
+		`CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_db_date ON daily_basic(trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_adj_date ON adj_factor(trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_stklimit_date ON stk_limit(trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_fina_code ON fina_indicator(ts_code)`,
+		`CREATE INDEX IF NOT EXISTS idx_sector_date ON sector_history(trade_date)`,
+	}
+	for _, s := range stmts {
+		if _, err := d.db.Exec(s); err != nil {
+			return fmt.Errorf("store migrate: %w\n%s", err, s)
+		}
+	}
+	// 旧库增量迁移：为已存在的表补新列（幂等）。
+	// （Incremental migration: add new columns to tables created by older schema versions.）
+	for _, mig := range []struct{ table, column, ddl string }{
+		{"daily_basic", "pcf_ttm", "ALTER TABLE daily_basic ADD COLUMN pcf_ttm REAL"},
+		{"daily_basic", "is_st", "ALTER TABLE daily_basic ADD COLUMN is_st INTEGER"},
+	} {
+		has, err := d.hasColumn(mig.table, mig.column)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.db.Exec(mig.ddl); err != nil {
+				return fmt.Errorf("store migrate add column: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// hasColumn 判断表是否已含某列（用于旧库增量迁移幂等）。
+// （hasColumn reports whether a table already has a column, for idempotent migration.）
+func (d *DB) hasColumn(table, column string) (bool, error) {
+	rows, err := d.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// InsertRows 批量 INSERT OR REPLACE（单事务），用于各表的断点续传式装载。
+// cols 为与 Tushare 返回字段一致的小写列名；值为 nil 的单元格写入 NULL。
+// （InsertRows bulk-upserts rows in one transaction per call, for resumable loading.
+// cols are lowercase column names matching Tushare's returned fields; nil cells become NULL.）
+func (d *DB) InsertRows(table string, cols []string, rows []map[string]any) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",")
+	query := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
+		table, strings.Join(cols, ","), placeholders)
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(query)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	for _, r := range rows {
+		args := make([]any, 0, len(cols))
+		for _, c := range cols {
+			if v, ok := r[c]; ok && v != nil {
+				args = append(args, v)
+			} else {
+				args = append(args, nil)
+			}
+		}
+		if _, err := stmt.Exec(args...); err != nil {
+			return 0, fmt.Errorf("store insert %s: %w", table, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(rows)), nil
+}
+
+// TableColumns 各表写入时的列清单（与 migrate 的建表列一致）。
+// （TableColumns returns each table's writable column list, aligned with the schema.）
+func TableColumns(table string) []string {
+	switch table {
+	case "stocks":
+		return []string{"ts_code", "name", "area", "industry", "market", "list_date", "delist_date"}
+	case "trade_cal":
+		return []string{"cal_date", "is_open"}
+	case "daily", "index_daily":
+		return []string{"ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"}
+	case "adj_factor":
+		return []string{"ts_code", "trade_date", "adj_factor"}
+	case "daily_basic":
+		return []string{"ts_code", "trade_date", "turnover_rate", "turnover_rate_f", "volume_ratio", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "pcf_ttm", "dv_ratio", "dv_ttm", "total_share", "float_share", "free_share", "total_mv", "circ_mv", "is_st"}
+	case "stk_limit":
+		return []string{"ts_code", "trade_date", "up_limit", "down_limit"}
+	case "fina_indicator":
+		return []string{"ts_code", "end_date", "ann_date", "eps", "roe", "roe_waa", "roa", "roe_dt", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "yoy_or", "yoy_net_profit", "or_yoy", "netprofit_yoy"}
+	case "income":
+		return []string{"ts_code", "end_date", "n_income_attr_p", "revenue", "total_revenue"}
+	case "cashflow":
+		return []string{"ts_code", "end_date", "n_cashflow_act", "n_cashflow_inv_act", "n_cashflow_fnc_act"}
+	case "sector_history":
+		return []string{"trade_date", "industry", "limitup_cnt", "change_pct", "member_count", "top_stocks"}
+	}
+	return nil
+}
+
+// MaxTradeDate 返回某张行情表（daily/daily_basic/...）中指定股票的最近交易日，无数据返回空串。
+// 用于逐票断点续传：从 max+1 日开始拉取。
+// （MaxTradeDate returns a stock's latest loaded trade date in a bar table ("" if none),
+// enabling per-stock resume from the next trading day.）
+func (d *DB) MaxTradeDate(table, tsCode string) (string, error) {
+	// trade_date 为 YYYYMMDD 字符串，字典序即时间序
+	query := fmt.Sprintf("SELECT MAX(trade_date) FROM %s WHERE ts_code=?", table)
+	var v sql.NullString
+	if err := d.db.QueryRow(query, tsCode).Scan(&v); err != nil {
+		return "", err
+	}
+	return v.String, nil
+}
+
+// MaxTradeDateAll 返回某行情表全局最近交易日（全部股票），无数据返回空串。
+// （MaxTradeDateAll returns the latest trade date across all stocks in a bar table.）
+func (d *DB) MaxTradeDateAll(table string) (string, error) {
+	query := fmt.Sprintf("SELECT MAX(trade_date) FROM %s", table)
+	var v sql.NullString
+	if err := d.db.QueryRow(query).Scan(&v); err != nil {
+		return "", err
+	}
+	return v.String, nil
+}
+
+// MaxEndDate 返回财务类表（fina_indicator/income/cashflow）中某股票的最新报告期。
+// （MaxEndDate returns a stock's latest report end_date in a financial table.）
+func (d *DB) MaxEndDate(table, tsCode string) (string, error) {
+	query := fmt.Sprintf("SELECT MAX(end_date) FROM %s WHERE ts_code=?", table)
+	var v sql.NullString
+	if err := d.db.QueryRow(query, tsCode).Scan(&v); err != nil {
+		return "", err
+	}
+	return v.String, nil
+}
+
+// Count 返回表的行数（可选按日期过滤）。
+// （Count returns a table's row count, optionally filtered by a date column lower bound.）
+func (d *DB) Count(table string, fromDate string) (int, error) {
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
+	var args []any
+	// 财务类用 end_date、行情类用 trade_date 作为通用"日期列"（按表内嵌的判断）
+	if fromDate != "" {
+		if table == "fina_indicator" || table == "income" || table == "cashflow" {
+			query += " WHERE end_date >= ?"
+		} else {
+			query += " WHERE trade_date >= ?"
+		}
+		args = append(args, fromDate)
+	}
+	var n int
+	if err := d.db.QueryRow(query, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// TradeDates 返回 [from,to]（含）内全部交易日（升序）。
+// （TradeDates returns the ascending trade dates within [from,to] inclusive.）
+func (d *DB) TradeDates(from, to string) ([]string, error) {
+	rows, err := d.db.Query("SELECT cal_date FROM trade_cal WHERE is_open=1 AND cal_date>=? AND cal_date<=? ORDER BY cal_date", from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// StockCodes 返回全部股票代码（含已退市）。
+// （StockCodes returns all stock codes, delisted included.）
+func (d *DB) StockCodes() ([]string, error) {
+	rows, err := d.db.Query("SELECT ts_code FROM stocks ORDER BY ts_code")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ReadyStockCount 返回近一年（约 244 个交易日）内有日线数据的股票数。
+// 作为"研究池就绪"的代理：B3/B5 因子装配与盘口扫描依赖近一年有行情的股票。
+// （ReadyStockCount returns how many stocks have daily bars within the last year
+// (~244 trading days), the proxy for "research-ready": B3/B5 factor assembly and
+// depth scanning depend on stocks with recent daily data.）
+func (d *DB) ReadyStockCount() (int, error) {
+	cutoff := time.Now().AddDate(-1, 0, 0).Format("20060102")
+	var n int
+	err := d.db.QueryRow(`SELECT COUNT(DISTINCT ts_code) FROM daily WHERE trade_date >= ?`, cutoff).Scan(&n)
+	return n, err
+}
+
+// HfqBars 读取某股票 hfq 后复权日线（升序）。
+// 换算：hfq_close = close * adj_factor（基座因子在收益率/动量等比例型因子里自然抵消；
+// 价格类因子如 MA/52周高距在同一基准下自洽，不影响相对结论）。
+// （HfqBars reads a stock's hfq back-adjusted daily bars (ascending). hfq_close = close * adj_factor;
+// the base factor cancels in ratio-based factors and stays self-consistent for price factors.）
+func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
+	query := `SELECT d.trade_date,
+		COALESCE(d.open,0), COALESCE(d.high,0), COALESCE(d.low,0), COALESCE(d.close,0),
+		COALESCE(d.vol,0), COALESCE(d.amount,0), COALESCE(a.adj_factor,1) AS adj
+		FROM daily d LEFT JOIN adj_factor a ON a.ts_code=d.ts_code AND a.trade_date=d.trade_date
+		WHERE d.ts_code=? AND d.trade_date>=? AND d.trade_date<=?
+		ORDER BY d.trade_date`
+	rows, err := d.db.Query(query, tsCode, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Bar
+	for rows.Next() {
+		var b Bar
+		var adj float64
+		if err := rows.Scan(&b.Date, &b.Open, &b.High, &b.Low, &b.Close, &b.Vol, &b.Amount, &adj); err != nil {
+			return nil, err
+		}
+		// hfq 换算：价格类按复权因子等比缩放；量能不需复权
+		b.Open *= adj
+		b.High *= adj
+		b.Low *= adj
+		b.Close *= adj
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// RawBars 读取某股票未复权日线（升序），供回测按真实成交价撮合。
+// （RawBars reads a stock's unadjusted daily bars for realistic backtest fills.）
+func (d *DB) RawBars(tsCode, start, end string) ([]Bar, error) {
+	query := `SELECT trade_date,
+		COALESCE(open,0), COALESCE(high,0), COALESCE(low,0), COALESCE(close,0),
+		COALESCE(vol,0), COALESCE(amount,0)
+		FROM daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date`
+	rows, err := d.db.Query(query, tsCode, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Bar
+	for rows.Next() {
+		var b Bar
+		if err := rows.Scan(&b.Date, &b.Open, &b.High, &b.Low, &b.Close, &b.Vol, &b.Amount); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// DailyBasicRange 读取某股票一段区间的每日指标（升序），供估值/流动性类因子。
+// （DailyBasicRange reads a stock's per-day indicators over a range for valuation/liquidity factors.）
+func (d *DB) DailyBasicRange(tsCode, start, end string) ([]DailyBasic, error) {
+	query := `SELECT trade_date,
+		COALESCE(turnover_rate,0), COALESCE(volume_ratio,0), COALESCE(pe_ttm,0),
+		COALESCE(pb,0), COALESCE(ps_ttm,0), COALESCE(pcf_ttm,0), COALESCE(dv_ttm,0),
+		COALESCE(total_share,0), COALESCE(total_mv,0), COALESCE(circ_mv,0), COALESCE(is_st,0)
+		FROM daily_basic WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date`
+	rows, err := d.db.Query(query, tsCode, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DailyBasic
+	for rows.Next() {
+		var b DailyBasic
+		if err := rows.Scan(&b.Date, &b.TurnoverRate, &b.VolumeRatio, &b.PETTM, &b.PB, &b.PSTTM,
+			&b.PcfTTM, &b.DVTTM, &b.TotalShare, &b.TotalMV, &b.CircMV, &b.IsST); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// IncomeHistory 读取某股票全部利润表快照（按报告期升序），供 SUE 等单季净利因子。
+// （IncomeHistory reads a stock's income-statement snapshots for single-quarter factors.）
+func (d *DB) IncomeHistory(tsCode string) ([]IncomeRow, error) {
+	query := `SELECT end_date, COALESCE(n_income_attr_p,0), COALESCE(revenue,0)
+		FROM income WHERE ts_code=? ORDER BY end_date`
+	rows, err := d.db.Query(query, tsCode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IncomeRow
+	for rows.Next() {
+		var r IncomeRow
+		if err := rows.Scan(&r.EndDate, &r.NIncomeAttrP, &r.Revenue); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// FinaHistory 读取某股票全部财务指标快照（按报告期升序），供成长/质量因子。
+// 含 ann_date（公告日），供回测做点对时（point-in-time）过滤、避免未来函数。
+// （FinaHistory reads a stock's financial-indicator snapshots for quality/growth factors.
+// ann_date (announcement date) enables point-in-time filtering to avoid lookahead bias.）
+func (d *DB) FinaHistory(tsCode string) ([]FinaRow, error) {
+	query := `SELECT end_date, ann_date,
+		COALESCE(eps,0), COALESCE(roe,0), COALESCE(roa,0), COALESCE(grossprofit_margin,0),
+		COALESCE(netprofit_margin,0), COALESCE(debt_to_assets,0), COALESCE(yoy_or,0),
+		COALESCE(yoy_net_profit,0)
+		FROM fina_indicator WHERE ts_code=? ORDER BY end_date`
+	rows, err := d.db.Query(query, tsCode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FinaRow
+	for rows.Next() {
+		var f FinaRow
+		if err := rows.Scan(&f.EndDate, &f.AnnDate, &f.EPS, &f.ROE, &f.ROA, &f.GrossMargin,
+			&f.NetMargin, &f.DebtToAssets, &f.YoyOR, &f.YoyNetProfit); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// IndexBars 读取指数日线（如沪深300，升序），供超额收益基准。
+// （IndexBars reads index daily bars (e.g. CSI300) as the excess-return benchmark.）
+func (d *DB) IndexBars(tsCode, start, end string) ([]Bar, error) {
+	query := `SELECT trade_date,
+		COALESCE(open,0), COALESCE(high,0), COALESCE(low,0), COALESCE(close,0),
+		COALESCE(vol,0), COALESCE(amount,0)
+		FROM index_daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date`
+	rows, err := d.db.Query(query, tsCode, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Bar
+	for rows.Next() {
+		var b Bar
+		if err := rows.Scan(&b.Date, &b.Open, &b.High, &b.Low, &b.Close, &b.Vol, &b.Amount); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// LimitRange 读取某股票一段区间的涨跌停价（升序），供回测 T+1 与涨跌停约束。
+// （LimitRange reads a stock's limit-up/down prices over a range for backtest constraints.）
+func (d *DB) LimitRange(tsCode, start, end string) ([]LimitRow, error) {
+	query := `SELECT trade_date, COALESCE(up_limit,0), COALESCE(down_limit,0) FROM stk_limit
+		WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date`
+	rows, err := d.db.Query(query, tsCode, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LimitRow
+	for rows.Next() {
+		var l LimitRow
+		if err := rows.Scan(&l.Date, &l.Up, &l.Down); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// Bar 日线（未复权原始价 + 成交量/额），研究读取的基本单元。
+// （Bar is one daily bar with raw prices, the basic read unit for research.）
+type Bar struct {
+	Date   string  // 交易日 YYYYMMDD
+	Open   float64 // 开盘
+	High   float64 // 最高
+	Low    float64 // 最低
+	Close  float64 // 收盘
+	Vol    float64 // 成交量（手）
+	Amount float64 // 成交额（元）
+}
+
+// DailyBasic 每日指标行。
+// （DailyBasic is one row of per-day market indicators.）
+type DailyBasic struct {
+	Date          string
+	TurnoverRate  float64 // 换手率(%)
+	VolumeRatio   float64 // 量比
+	PETTM         float64 // 市盈率 TTM
+	PB            float64 // 市净率
+	PSTTM         float64 // 市销率 TTM
+	PcfTTM        float64 // 市现率 TTM
+	DVTTM         float64 // 股息率 TTM(%)
+	TotalShare    float64 // 总股本(股)
+	TotalMV       float64 // 总市值(万元)
+	CircMV        float64 // 流通市值(万元)
+	IsST          int     // 是否 ST（1=是）
+}
+
+// IncomeRow 利润表快照行（SUE 单季净利因子来源）。
+// （IncomeRow is one income-statement snapshot for single-quarter factors.）
+type IncomeRow struct {
+	EndDate      string  // 报告期 YYYYMMDD
+	NIncomeAttrP float64 // 归母净利润（累计值）
+	Revenue      float64 // 营业收入（累计值）
+}
+
+// FinaRow 财务指标快照行（质量/成长因子来源）。
+// （FinaRow is one financial-indicator snapshot for quality/growth factors.）
+type FinaRow struct {
+	EndDate       string  // 报告期 YYYYMMDD
+	AnnDate       string  // 公告日 YYYYMMDD（点对时过滤用）
+	EPS           float64 // 每股收益
+	ROE           float64 // 净资产收益率
+	ROA           float64 // 总资产收益率
+	GrossMargin   float64 // 毛利率(%)
+	NetMargin     float64 // 净利率(%)
+	DebtToAssets  float64 // 资产负债率(%)
+	YoyOR         float64 // 营收同比增长(%)
+	YoyNetProfit  float64 // 净利同比增长(%)
+}
+
+// LimitRow 涨跌停价行。
+// （LimitRow is one row of limit-up/down prices.）
+type LimitRow struct {
+	Date string
+	Up   float64 // 涨停价
+	Down float64 // 跌停价
+}
+
+// DebugCount 输出各表行数（dataload verify 用）。
+// （DebugCount logs row counts per table for dataload verify.）
+func (d *DB) DebugCount() {
+	for _, t := range []string{"stocks", "trade_cal", "daily", "adj_factor", "daily_basic", "stk_limit", "index_daily", "fina_indicator", "income", "cashflow"} {
+		n, err := d.Count(t, "")
+		if err != nil {
+			log.Printf("[store] %s count err: %v", t, err)
+			continue
+		}
+		log.Printf("[store] %s: %d 行", t, n)
+	}
+}

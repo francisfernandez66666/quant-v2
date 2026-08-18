@@ -14,11 +14,12 @@ import (
 // LLM 轮询重试（最多3次、递增间隔）仍失败时该批丢弃（返回 nil，不降级关键词兜底）。
 // 后置校正：档位归一 + 中性归零 + datetime 回退。
 // 返回值：events 为成功产出的事件；failedItems 为 LLM 重试耗尽、未完成归因的新闻
-// （被兜底占位），调用方应把它们留在未归因队列供下一轮重试。
+// （nil 占位，不做关键词兜底），调用方应把它们留在未归因队列供下一轮重试。
 // （analyzeDeep is the Stage2 full analysis: LLM deep-analysis of screened news producing structured NewsEvents.
 // On retry exhaustion the batch is dropped (nil, no keyword fallback), with post-processing for tier
 // normalization, neutral zeroing and datetime fallback. It returns events for successes and failedItems for
-// news whose LLM analysis failed (padded by fallback), which callers should keep in the unattributed queue.）
+// news whose LLM analysis failed (nil placeholder, no keyword fallback), which callers should keep in the
+// unattributed queue for the next round.）
 func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedItems []data.NewsItem) {
 	if len(items) == 0 {
 		return nil, nil
@@ -37,7 +38,7 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedIt
 		return nil, items
 	}
 
-	// LLM 重试耗尽被兜底占位的新闻：视为未归因，交调用方留队下一轮重试
+	// LLM 重试耗尽失败的新闻（nil 占位）：视为未归因，交调用方留队下一轮重试
 	failedSet := make(map[int]bool, len(failedIdx))
 	for _, f := range failedIdx {
 		failedSet[f] = true
@@ -214,8 +215,8 @@ func containsStr(slice []string, s string) bool {
 
 // postProcess 对 LLM 分析结果做后置校正：
 //   - 档位归一：|score| 归到 {0,0.25,0.5,0.75} 最近档，>0.75 截断为 0.75
-//   - 中性归零（放宽）：仅当方向/情绪为"中性" 且 强度档位为 0（fallback 无方向）
-//     时才归零；对 LLM 明确给出的非零方向分数保留量化档，避免弱事件被误清空。
+//   - 中性归零（放宽）：仅当方向/情绪为"中性" 且 强度档位为 0 时才归零；
+//     对 LLM 明确给出的非零方向分数保留量化档，避免弱事件被误清空。
 //
 // （postProcess normalizes scores to the nearest tier in {0,0.25,0.5,0.75} and zeroes neutral cases only when
 // the tier is 0, preserving explicit non-zero directional scores.）
@@ -244,7 +245,7 @@ func postProcess(ht *llm.HotTopic) {
 		score = -score
 	}
 	// 中性归零（放宽版）：LLM 判定方向为"中性" 且 无明确档位时归零，
-	// 消除 fallback 遗留污染；有明确非中性分档的事件保留，避免误杀。
+	// 避免弱/无方向事件带占位分；有明确非中性分档的事件保留，避免误杀。
 	neutral := strings.EqualFold(ht.Sentiment, "中性") || strings.EqualFold(ht.Direction, "中性")
 	if neutral && best == 0 {
 		score = 0

@@ -44,12 +44,31 @@ import (
 // DoubleBumpStrategy 双凸战法策略结构。（Double Bump strategy struct.）
 // 通过量能/调整深度/均线三维度评分识别双凸突破机会。（Scores double-bump breakouts across volume / depth / MA.）
 type DoubleBumpStrategy struct {
-	cfg *config.Manager // 配置管理器（热加载 DoubleBumpConfig）（Config manager, hot-reloads DoubleBumpConfig）
+	cfg    *config.Manager // 配置管理器（热加载 DoubleBumpConfig）（Config manager, hot-reloads DoubleBumpConfig）
+	userID string          // 账号 ID：非空时按该账号的策略配置读取，否则回退全局（Account ID: per-account strategy config when set, else global）
 }
 
 // New 创建双凸战法策略实例。（New creates a Double Bump strategy instance.）
 func New(cfg *config.Manager) *DoubleBumpStrategy {
 	return &DoubleBumpStrategy{cfg: cfg}
+}
+
+// SetUserID 设置账号 ID（多账号独立引擎时，各账号 runner 按本账号配置读取）。
+// English: sets the account ID so a per-account engine's runner reads that account's config.
+func (d *DoubleBumpStrategy) SetUserID(userID string) {
+	d.userID = userID
+}
+
+// strategyCfg 返回当前账号的双凸配置（账号级覆盖优先，否则全局）。
+// English: returns the Double Bump config for the current account (account override wins, else global).
+func (d *DoubleBumpStrategy) strategyCfg() config.DoubleBumpConfig {
+	if d.userID != "" && d.cfg != nil {
+		return d.cfg.GetStrategyConfigFor(d.userID).DoubleBump
+	}
+	if d.cfg != nil {
+		return d.cfg.Get().Strategy.DoubleBump
+	}
+	return config.DoubleBumpConfig{}
 }
 
 // Name 返回策略中文名称"双凸战法"。（Name returns the strategy display name "双凸战法".）
@@ -96,8 +115,7 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		}
 	}
 	// 读取热加载的双凸配置（放量倍数、权重、调整阈值等）（Load the hot-reloaded Double Bump config）
-	cfg := d.cfg.Get()
-	dbc := cfg.Strategy.DoubleBump
+	dbc := d.strategyCfg()
 	// 第二波当日方向闸门：双凸的"第二波"必须是向上结构，
 	// 水下/平盘（ChangePct<=MinChangePct，默认0）不能充当"放量上攻波"。
 	// 此时量能分/调整分强制为 0，只剩均线分（≤MAWeight×100，远低于 full_chain 阈值）。（Direction gate: the second
@@ -299,8 +317,7 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 	if len(kLines) < 20 {
 		return PhaseFirst
 	}
-	cfg := d.cfg.Get()
-	dbc := cfg.Strategy.DoubleBump
+	dbc := d.strategyCfg()
 	n := len(kLines)
 
 	// 计算 20 日均量和均价（不含当日）（Compute 20-day average volume/close, excluding today）

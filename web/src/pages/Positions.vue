@@ -121,7 +121,10 @@
       </div>
       <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
       <div v-if="klineOpen.has(h.code)" class="pos-kline-row">
-        <KLineChart :code="h.code" :name="h.name" />
+        <div class="kline-flex">
+          <div class="kline-main"><KLineChart :code="h.code" :name="h.name" /></div>
+          <div class="depth-side"><DepthPanel :code="h.code" :name="h.name" /></div>
+        </div>
       </div>
       </div>
     </div>
@@ -273,6 +276,7 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue' // 
 import * as api from '../api/index.js'                                        // 后端 API 调用封装（持仓、资金、状态等）
 // backend API wrapper (holdings, funds, status etc.)
 import KLineChart from '../components/KLineChart.vue'                         // 分时图组件（展开行展示）
+import DepthPanel from '../components/DepthPanel.vue'                         // 盘口面板（展开行展示，买卖五档）
 // K-line chart component (shown in expanded rows)
 
 // ── 响应式状态 ──
@@ -287,6 +291,8 @@ const showAdd = ref(false)                  // 是否显示新增/编辑弹窗
 // whether the add/edit modal is visible
 const pnlOffset = ref(parseFloat(localStorage.getItem('pnl_offset') || '0'))  // 盈亏清零偏移量
 // P&L reset offset
+const totalRealizedPnl = ref(0)  // 累计已实现盈亏（后端返回，含已平仓历史）
+// cumulative realized P&L (from backend, includes closed history)
 
 // ── 本地持久化镜像：进 tab 秒开，增删改才变更 ──
 // ── Local persisted mirror: instant open on tab entry; only mutated on add/remove/edit ──
@@ -321,12 +327,12 @@ function loadCache() {
 // Watch holdings and cash; write a deep copy into the local cache on change
 watch([holdings, availableBalance], persistCache, { deep: true })
 
-/** 计算总盈亏 = Σ(现价-成本)*数量 - 偏移量 */
-/** Total P&L = Σ(current - cost) * quantity - offset */
+/** 计算总盈亏 = 已实现盈亏累计 + Σ(现价-成本)*数量 - 偏移量 */
+/** Total P&L = cumulative realized P&L + Σ(current - cost) * quantity - offset */
 const totalPnl = computed(() => {
-  let sum = 0
-  // 累加每只持仓的 (现价-成本)*数量
-  // Sum (current - cost) * quantity over every holding
+  let sum = totalRealizedPnl.value
+  // 累加每只持仓的 (现价-成本)*数量（浮动盈亏）
+  // Sum floating (current - cost) * quantity over every holding
   for (const h of holdings.value) {
     const qty = h.quantity || 1
     const cost = h.cost_price || 0
@@ -336,12 +342,12 @@ const totalPnl = computed(() => {
   return sum - pnlOffset.value
 })
 
-/** 清零总盈亏：将当前累计盈亏记录为偏移量 */
-/** Reset total P&L: store the current cumulative P&L as an offset */
+/** 清零总盈亏：将当前累计盈亏（已实现+浮动）记录为偏移量 */
+/** Reset total P&L: store the current cumulative P&L (realized + floating) as an offset */
 function resetPnl() {
-  pnlOffset.value = 0
-  // 将当前累计盈亏累加为偏移量，实现界面清零
-  // Accumulate the current P&L into the offset to zero the display
+  pnlOffset.value = totalRealizedPnl.value
+  // 将当前浮动盈亏累加为偏移量，实现界面清零
+  // Accumulate the current floating P&L into the offset to zero the display
   for (const h of holdings.value) {
     const qty = h.quantity || 1
     const cost = h.cost_price || 0
@@ -561,6 +567,7 @@ async function load() {
     if (data) {
       holdings.value = data.holdings || []
       availableBalance.value = data.available_balance || 0
+      totalRealizedPnl.value = data.total_realized_pnl || 0
     }
   } catch (_) {}
 }
@@ -861,6 +868,13 @@ function sheetClose() {
 }
 .btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
 .pos-kline-row { padding: 8px 16px 12px; background: #16162a; }
+.kline-flex { display: flex; gap: 12px; align-items: stretch; }
+.kline-main { flex: 1 1 auto; min-width: 0; }
+.depth-side { flex: 0 0 300px; }
+@media (max-width: 720px) {
+  .kline-flex { flex-direction: column; }
+  .depth-side { flex: 1 1 auto; }
+}
 
 /* 所有字段等宽分布，溢出横向滚动 */
 .col-code  { flex: 1; color: #4fc3f7; text-align: center; }

@@ -481,7 +481,7 @@ type llmCalls struct {
 	// consultMsgs 记录每次咨询请求的完整消息序列（role 顺序），用于断言单条 system 置于最前。
 	consultMsgs [][]roleMsg
 
-	// failD1 置为 true 后，mock 对 D1 评分请求返回 500，用于验证 D1 失败回退上一轮评分。
+	// failD1 置为 true 后，mock 对 D1 评分请求返回 500，用于验证 D1 失败标记待重试并入重试队列。
 	failD1 bool
 }
 
@@ -533,7 +533,8 @@ func newMockLLMServer() (*httptest.Server, *llmCalls) {
 		case strings.Contains(system, "D1事件评分"):
 			calls.d1 = append(calls.d1, user)
 			if calls.failD1 {
-				// 模拟 D1 LLM 整批失败（500）：触发 BatchScore 轮询重试后回退上一轮评分
+				// 模拟 D1 LLM 整批失败（500）：BatchScore 轮询重试失败后标记 RetryPending，
+				// 失败股并入重试队列，下轮重新调 LLM（不回退上一轮评分、不归0兜底）
 				http.Error(w, "mock D1 LLM failure", 500)
 				return
 			}

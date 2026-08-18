@@ -21,8 +21,10 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.Ex
 	}
 
 	// 硬止损：现价跌破 成本×(1−hardStop) 立即退出（hardStop 为止损比例，默认 0.045 即 -4.5%）
+	// C4：ATR 动态止损启用时止损距离为 ATR×mult（百分比口径），否则回退 hardStop。
 	// English: hard stop — exit immediately when price ≤ cost×(1−hardStop), where hardStop is the loss
 	// ratio (config default 0.08 = -8%; legacy 0.955 multiplier semantic is normalized to ~4.5% loss).
+	// C4: when ATR stopping is active the stop distance is ATR×mult (percent), else fall back to hardStop.
 	hardStop := cfg.HardStopLoss
 	if hardStop <= 0 {
 		hardStop = 0.045
@@ -31,7 +33,10 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.Ex
 		// English: backward-compat with the legacy "price multiplier" semantic (e.g. 0.955) — treat as 1−x loss ratio.
 		hardStop = 1 - hardStop
 	}
-	if price <= cost*(1-hardStop) {
+	// ATRStopPct 返回的是"亏损百分比"口径（与 pnlPct 同量纲）
+	// English: ATRStopPct returns loss-percent units (same scale as pnlPct).
+	pnlPct := (price - cost) / cost * 100
+	if pnlPct <= -ctx.ATRStopPct(hardStop*100) {
 		return &strategy.ExitResult{Reason: "N形硬止损", Priority: strategy.P1}
 	}
 

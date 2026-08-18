@@ -170,6 +170,7 @@ const engineHealth = ref({})          // 流程引擎子系统健康状况
 
 let timer = null                      // 定时轮询句柄 (polling timer handle)
 let sseUnsub = null                   // SSE 取消订阅函数 (SSE unsubscribe function)
+let visibilityHandler = null         // 页面可见性切换回调（暂停/恢复轮询）
 
 // ── 计算属性 ── (Computed properties)
 /** 扫描统计字段快捷引用（服务端状态里的 scan_stats 子对象，未返回时兜底为空对象） (Shortcut to scan_stats sub-object in server status; falls back to {} when absent) */
@@ -276,14 +277,30 @@ function handleSSE(msg) {
   }
 }
 
-/** 挂载时首次加载并启动 2 秒定时轮询 + SSE (On mount, load once and start 2s polling + SSE) */
+/** 挂载时首次加载并启动定时轮询 + SSE (On mount, load once and start polling + SSE) */
+// 说明：轮询由 2s 降到 5s，并在页面不可见时暂停，大幅降低对后端行情/资讯数据源的请求洪峰
+// （同一份后端结果跨设备一致，轮询仅用于补足 SSE 偶发丢失）。
+// (Poll interval reduced from 2s to 5s and paused while the tab is hidden, cutting the load
+// on quote/news data sources. The backend result is identical across devices; polling only
+// backfills occasional SSE drops.)
 onMounted(() => {
   load()
-  // 每 2 秒轮询刷新一次行情 (poll every 2s to refresh quotes)
-  timer = setInterval(load, 2000)
+  timer = setInterval(load, 5000)
   // 订阅后端 SSE 事件 (subscribe to backend SSE events)
   api.connectSSE()
   sseUnsub = api.onSSE(handleSSE)
+  // 页面不可见时暂停轮询，切回时立即补拉一次 (pause polling when hidden; refresh on return)
+  visibilityHandler = () => {
+    if (document.hidden) {
+      if (timer) { clearInterval(timer); timer = null }
+    } else {
+      if (!timer) {
+        load()
+        timer = setInterval(load, 5000)
+      }
+    }
+  }
+  document.addEventListener('visibilitychange', visibilityHandler)
   // 初次加载：探测数据源健康状况 (probe data source health on first load)
   api.fetchDataSourceHealth().then(r => { dataSourceHealth.value = r })
   // 初次加载：探测新闻资讯源健康状况 (probe news source health on first load)
@@ -295,6 +312,7 @@ onMounted(() => {
 onUnmounted(() => {
   // 清理定时器与订阅，避免泄漏 (clear the timer and subscription to avoid leaks)
   if (timer) clearInterval(timer)
+  if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler)
   if (sseUnsub) sseUnsub()
 })
 </script>

@@ -30,12 +30,15 @@ type Client struct {
 	model            string        // 模型名称
 	streaming        bool          // 是否启用流式（SSE）响应；false 走一次性非流式
 	idleTimeout      time.Duration // 流式下相邻分片空闲阈值（超过视为卡死）
-	batchConcurrency int           // 批量分析最大并发批次（默认 4）
+	batchConcurrency int           // 批量分析最大并发批次（默认 8）
+	classifierModel  string        // 可选分类专用模型（Stage0/1 等快速分类/初筛，空则用主模型）
 }
 
 // DefaultBatchConcurrency 未显式配置时的批量分析默认并发批次。
-// （DefaultBatchConcurrency is the default concurrent batch count for batched analysis.）
-const DefaultBatchConcurrency = 4
+// 默认 8：在 API 配额允许时最大化盘前新闻归因吞吐（Stage0/1 与 Stage2 分批调用并发执行）。
+// （DefaultBatchConcurrency is the default concurrent batch count for batched analysis.
+// Default 8: maximizes premarket news-attribution throughput when API quota allows.）
+const DefaultBatchConcurrency = 8
 
 // BatchConcurrency 返回批量分析最大并发批次。（BatchConcurrency returns the max concurrent batch count.）
 func (c *Client) BatchConcurrency() int { return c.batchConcurrency }
@@ -44,9 +47,23 @@ func (c *Client) BatchConcurrency() int { return c.batchConcurrency }
 // （DefaultModel is the fallback model when none is explicitly specified.）
 const DefaultModel = "THUDM/GLM-Z1-9B-0414"
 
-// DefaultTimeout 未显式指定超时时的默认单次请求超时（慢 LLM 响应兜底）。
-// （DefaultTimeout is the default per-request timeout, a safety net for slow LLM responses.）
-const DefaultTimeout = 60 * time.Second
+// DefaultTimeout 未显式配置时的默认"等待响应头"超时（默认 30s）。
+// 主要防护上游"迟迟不开始生成"的故障：配合流式+空闲看门狗，让卡住的请求尽快失败进入重试/兜底；
+// 正常推理模型流式长输出（CoT 持续心跳）由 StreamIdleTimeout 与整体请求超时下限兜底，不受此值误杀。
+// （DefaultTimeout is the default response-header wait when not configured (30s). It mostly guards
+// "upstream never starts generating": with streaming + the idle watchdog, a stuck request fails fast into
+// the retry/fallback path. Legit reasoning-model streams are governed by StreamIdleTimeout and the total
+// request-timeout floor instead.）
+const DefaultTimeout = 30 * time.Second
+
+// minTotalTimeout 流式请求整体超时的下限（保底 60s）：推理模型（GLM-Z1 等）单批流式长输出总时长
+// 可能超过 30s，若总超时随之收紧会把正常慢流误判为超时。故整体请求超时最低保底 60s，可经
+// timeout_sec 调高；响应头等待单独用 DefaultTimeout/配置值，用于快速探测"不开始生成"。
+// （minTotalTimeout floors the whole-request timeout at 60s: reasoning-model streams can exceed 30s in
+// total, so a tight total timeout would misjudge legit slow streams as timed out. The total request
+// timeout stays ≥60s (raise via timeout_sec), while the response-header wait uses DefaultTimeout/config
+// to detect "never starts generating" fast.）
+const minTotalTimeout = 60 * time.Second
 
 // DefaultStreamIdleTimeout 流式下默认"相邻分片空闲"阈值：超过视为模型卡死。
 // （DefaultStreamIdleTimeout is the default idle threshold between adjacent stream chunks; exceeding
@@ -74,6 +91,12 @@ func New(cfg Config) *Client {
 		cfg.StreamIdleTimeout = DefaultStreamIdleTimeout
 	}
 
+	// 响应头等待用 cfg.Timeout（快速探测"不开始生成"）；整体请求超时保底 minTotalTimeout，
+	// 防止收紧后的默认超时误杀推理模型流式长输出（CoT 期间有持续心跳，不依赖总超时兜底）。
+	totalTimeout := cfg.Timeout
+	if totalTimeout < minTotalTimeout {
+		totalTimeout = minTotalTimeout
+	}
 	transport := &http.Transport{
 		ForceAttemptHTTP2: false,
 		// 响应头等待单独限时：流式下首个分片秒级即到，此字段是"服务端迟迟不开始
@@ -110,7 +133,7 @@ func New(cfg Config) *Client {
 	}
 	return &Client{
 		httpClient: &http.Client{
-			Timeout:   cfg.Timeout,
+			Timeout:   totalTimeout,
 			Transport: transport,
 		},
 		apiKey:           first,
@@ -120,6 +143,7 @@ func New(cfg Config) *Client {
 		streaming:        cfg.Streaming,
 		idleTimeout:      cfg.StreamIdleTimeout,
 		batchConcurrency: bc,
+		classifierModel:  cfg.ClassifierModel,
 	}
 }
 
@@ -181,7 +205,28 @@ func (c *Client) Chat(system, user string) (string, error) {
 	return c.do(req)
 }
 
-// ChatMessages 以多轮对话方式调用 LLM（股票咨询页使用）。
+// ChatClassifier 用分类专用模型执行对话（未配置分类模型时回落到主模型，与 Chat 一致）。
+// 供 Stage0/1 等"快速分类/初筛"批量调用使用：可用轻量快速模型分流，把深度分析（D1 评分、
+// Stage2 深度归因、股票咨询）留给主模型，从而在保证质量的前提下显著加快分类吞吐。
+// （ChatClassifier runs the chat with the optional classifier model, falling back to the main model when
+// unset (identical to Chat). It serves cheap classification/screening batches like Stage0/1, letting a
+// lighter/faster model handle the volume while the main model stays on deep work such as D1 scoring,
+// Stage2 attribution and stock consultation.）
+func (c *Client) ChatClassifier(system, user string) (string, error) {
+	model := c.model
+	if c.classifierModel != "" {
+		model = c.classifierModel
+	}
+	req := ChatRequest{
+		Model: model,
+		Messages: []Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		},
+	}
+	return c.do(req)
+}
+
 // messages 为完整消息序列，首条必须是 system（角色+注入数据），后接历史与当前提问。
 // 只透传调用方组装好的消息，不再自动追加 system，避免出现多条/中途 system 导致模型上下文错乱。
 // 与 Chat 一致默认走流式响应，解析失败自动回落到非流式。
@@ -587,15 +632,15 @@ func batchBounds(n, size int) [][2]int {
 }
 
 // AnalyzeHotTopicBatch 批量分析多条新闻，按 llmBatchSize 分批并**并发**调用合并结果。
-// 子批失败做隔离：该子批用关键词兜底结果占位（fallbackAnalysis），不 abort 全批，
+// 子批失败做隔离：该子批保留 nil 占位（不生成关键词兜底结果），不 abort 全批，
 // 保证某几个坏子批不会拖垮整批 Stage2（主干继续）。
-// 返回第三个值 failedIdx：被兜底占位（LLM 重试耗尽）的全局索引，调用方据此把对应新闻
+// 返回第三个值 failedIdx：LLM 重试耗尽失败的全局索引，调用方据此把对应新闻
 // 留在未归因队列供下一轮重试，避免"LLM 偶发失败 = 该新闻永久丢失"。
 // （AnalyzeHotTopicBatch analyzes many news items in batches of llmBatchSize, run **concurrently**.
-// Sub-batch failures are isolated: the failed sub-batch is padded with keyword-fallback results
-// (fallbackAnalysis) instead of aborting the whole batch. The third return failedIdx lists the global
-// indices that were padded, so the caller can keep those news in the unattributed queue for the next
-// round rather than permanently losing them to a transient LLM failure.）
+// Sub-batch failures are isolated: the failed sub-batch is left as nil placeholders (no keyword-fallback
+// results) instead of aborting the whole batch. The third return failedIdx lists the global indices that
+// failed, so the caller can keep those news in the unattributed queue for the next round rather than
+// permanently losing them to a transient LLM failure.）
 func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, []int, error) {
 	result := make([]*HotTopic, len(titles))
 	if len(titles) == 0 {
@@ -620,11 +665,8 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, []int, erro
 			defer func() { <-sem }()
 			sub, err := c.analyzeBatch(titles[start:end])
 			if err != nil {
-				log.Printf("LLM[%d] 子批%d..%d 重试队列用尽, 该子批%d条用兜底占位(主干继续): %v",
+				log.Printf("LLM[%d] 子批%d..%d 重试队列用尽, 该子批%d条留待重试(nil占位, 主干继续): %v",
 					len(titles), start+1, end, end-start, err)
-				for i := start; i < end; i++ {
-					result[i] = fallbackAnalysis(titles[i])
-				}
 				failedMu.Lock()
 				for i := start; i < end; i++ {
 					failedIdx = append(failedIdx, i)
@@ -693,8 +735,9 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 
 	result := make([]*HotTopic, len(titles))
 	for i, title := range titles {
-		// 先以关键词兜底结果初始化，再按 LLM 返回序号覆盖对应字段（未命中则保留兜底）
-		ht := fallbackAnalysis(title)
+		// 以空结构初始化（不依赖关键词兜底），再按 LLM 返回序号覆盖对应字段
+		// （未命中字段保留空值/默认值，LLM 明确给出的字段一律采用）。
+		ht := &HotTopic{Title: title}
 		for _, r := range raw {
 			if int(r.Index) == i+1 {
 				ht.Level = r.Level
@@ -760,13 +803,13 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 
 // AnalyzeHotTopic 对新闻标题进行多维度热点分析。
 // 返回:
-//   - *HotTopic: 分析结果（API失败时返回关键词兜底结果，不返回 nil）
-//   - error: API 调用或 JSON 解析的错误（非 nil 表示结果来自 fallback）
+//   - *HotTopic: 分析结果（API 失败/解析失败时返回 nil，不生成关键词兜底结果）
+//   - error: API 调用或 JSON 解析的错误（非 nil 表示分析失败）
 //
 // （AnalyzeHotTopic runs multi-dimensional hot-topic analysis on a news title.
 // Returns:
-//   - *HotTopic: the analysis result (a keyword-fallback result on API failure, never nil)
-//   - error: API call or JSON-parse error (non-nil means the result comes from the fallback)）
+//   - *HotTopic: the analysis result (nil on API/parse failure — no keyword-fallback result is fabricated)
+//   - error: API call or JSON-parse error (non-nil means the analysis failed)）
 func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 	// 轮询重试（最多5次、间隔递增 2s/4s/8s/16s/30s），与批量路径一致
 	const maxAttempts = 5
@@ -783,8 +826,8 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 		}
 	}
 	if err != nil {
-		log.Printf("LLM API调用失败(%s), 轮询%d次仍失败, 使用关键词兜底: %v", title[:minInt(len(title), 30)], maxAttempts, err)
-		return fallbackAnalysis(title), err
+		log.Printf("LLM API调用失败(%s), 轮询%d次仍失败, 返回nil(由调用方入重试队列): %v", title[:minInt(len(title), 30)], maxAttempts, err)
+		return nil, err
 	}
 
 	resp = cleanJSON(resp)
@@ -792,8 +835,8 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 	var ht HotTopic
 	ht.Title = title
 	if err := json.Unmarshal([]byte(resp), &ht); err != nil {
-		log.Printf("LLM JSON解析失败(%s), 使用关键词兜底: %s", title[:minInt(len(title), 30)], resp[:minInt(len(resp), 100)])
-		return fallbackAnalysis(title), err
+		log.Printf("LLM JSON解析失败(%s), 返回nil(由调用方入重试队列): %s", title[:minInt(len(title), 30)], resp[:minInt(len(resp), 100)])
+		return nil, err
 	}
 
 	// 空字段补默认值，保证下游字段齐整
@@ -855,20 +898,23 @@ func (c *Client) Ping() error {
 
 // AnalyzeSentiment 简版情感分析（用于快速评分）。
 // （AnalyzeSentiment is a lightweight sentiment analysis for quick scoring.）
+// AnalyzeSentiment 单条文本情感打分（0~1）。失败/解析失败返回错误，不伪造中性分。
+// （AnalyzeSentiment scores a single text's sentiment (0~1). On failure/parse error it returns an error —
+// no fabricated neutral score.）
 func (c *Client) AnalyzeSentiment(text string) (float64, error) {
 	resp, err := c.Chat(
 		"你是一个A股新闻情感分析师。只输出一个0-1之间的数字，0=极负面，0.5=中性，1=极正面。不要多余文字。",
 		text,
 	)
 	if err != nil {
-		return 0.5, err
+		return 0, err
 	}
 	resp = strings.TrimSpace(resp)
 	var score float64
 	if _, e := fmt.Sscanf(resp, "%f", &score); e == nil && score >= 0 && score <= 1 {
 		return score, nil
 	}
-	return 0.5, nil
+	return 0, fmt.Errorf("LLM情感分解析失败: %q", resp[:minInt(len(resp), 100)])
 }
 
 // AnalyzeNews 兼容旧接口（内部调用新分析）。
@@ -882,12 +928,13 @@ func (c *Client) AnalyzeNews(text string) (string, error) {
 	return string(data), nil
 }
 
-// SentimentScore 旧版情感分数接口（关键词兜底）。
-// （SentimentScore is the legacy sentiment-score interface (keyword fallback).）
+// SentimentScore 旧版情感分数接口（原为关键词兜底，现已不再兜底：失败返回错误，由调用方处理重试）。
+// （SentimentScore is the legacy sentiment-score interface — keyword fallback removed; on failure it
+// returns an error for the caller to route into the LLM retry queue.）
 func (c *Client) SentimentScore(text string) (float64, error) {
 	resp, err := c.AnalyzeHotTopic(text)
 	if err != nil {
-		return 0.5, err
+		return 0, err
 	}
 	return resp.Score, nil
 }
@@ -906,9 +953,21 @@ func cleanJSON(s string) string {
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
-	// 提取 JSON 数组：找到第一个 [ 和最后一个 ]
-	if start := strings.IndexByte(s, '['); start >= 0 {
-		if end := strings.LastIndexByte(s, ']'); end > start {
+	// 提取 JSON 主体：LLM 可能输出单个对象（HotTopic）或数组（D1 评分等）。
+	// 按首字符区分：'{' 提取首个 { 到末尾 } 之间；'[' 提取首个 [ 到末尾 ] 之间。
+	// 若对象内嵌数组（如 "sectors":["机器人"]）时按第一个 [ 截取会把对象前半截切掉，
+	// 故必须按最外层括号类型提取。
+	// English: extract the JSON body — LLM may emit a single object (HotTopic) or an array
+	// (D1 scoring etc.). Use the first non-space char to choose delimiters: '{' → first { to last };
+	// '[' → first [ to last ]. Slicing at the first '[' would cut off an object whose fields hold
+	// arrays (e.g. "sectors":["机器人"]), so we must match the outermost bracket kind.
+	if start := strings.IndexAny(s, "{["); start >= 0 {
+		open := s[start]
+		close := byte('}')
+		if open == '[' {
+			close = ']'
+		}
+		if end := strings.LastIndexByte(s, close); end > start {
 			s = s[start : end+1]
 		}
 	}
@@ -1113,123 +1172,6 @@ func (f *flexibleFloat) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// fallbackAnalysis 关键词兜底分析（LLM 解析失败时使用）。
-// （fallbackAnalysis runs keyword-based fallback analysis, used when the LLM parse fails.）
-func fallbackAnalysis(title string) *HotTopic {
-	ht := &HotTopic{
-		Title:       title,
-		Level:       "板块",
-		Sentiment:   "中性",
-		Score:       0,
-		ImpactLevel: "中",
-		EventType:   "行业",
-		Urgency:     "关注",
-		Direction:   "中性",
-		Strategy:    "无",
-	}
-
-	// 板块关键词
-	sectorKeywords := map[string]string{
-		"人工智能": "人工智能", "AI": "人工智能", "芯片": "半导体", "半导体": "半导体",
-		"新能源": "新能源", "光伏": "光伏", "锂电": "锂电池", "汽车": "汽车", "特斯拉": "汽车",
-		"医药": "医药", "医疗": "医药", "白酒": "白酒", "消费": "消费",
-		"金融": "金融", "银行": "银行", "券商": "券商", "地产": "房地产",
-		"军工": "军工", "通信": "通信", "软件": "软件", "传媒": "传媒",
-		"化工": "化工", "有色": "有色金属", "煤炭": "煤炭", "电力": "电力",
-		"机器人": "机器人", "人形": "机器人", "机器": "机器人",
-		"减速器": "机器人", "伺服": "机器人", "电机": "机器人",
-		"算力": "算力", "数据中心": "算力",
-	}
-	for kw, sec := range sectorKeywords {
-		if strings.Contains(title, kw) {
-			ht.Sectors = append(ht.Sectors, sec)
-		}
-	}
-
-	// 去重 Sectors
-	if len(ht.Sectors) > 1 {
-		seen := make(map[string]bool)
-		uniq := make([]string, 0, len(ht.Sectors))
-		for _, s := range ht.Sectors {
-			if !seen[s] {
-				seen[s] = true
-				uniq = append(uniq, s)
-			}
-		}
-		ht.Sectors = uniq
-	}
-	if len(ht.Sectors) == 0 {
-		ht.Level = "个股"
-	}
-
-	// 板块→个股：通过 StockCodeMap 查找
-	for _, sec := range ht.Sectors {
-		for name, code := range StockCodeMap {
-			if strings.Contains(name, sec) || strings.Contains(sec, name) {
-				ht.RelatedStocks = append(ht.RelatedStocks, code)
-			}
-		}
-	}
-
-	// 情感关键词（带符号评分，分强/中两档；利空优先于利好判定）
-	strongBull := []string{"涨停", "大涨", "暴涨", "走强", "突破", "飙升", "翻倍", "创新高"}
-	medBull := []string{"反弹", "利好", "回暖", "回升", "增持", "预增", "扭亏", "上调"}
-	strongBear := []string{"跌停", "大跌", "暴跌", "重挫", "下挫", "跳水", "崩盘", "闪崩", "抛售", "暴雷", "腰斩", "跌超", "立案", "调查", "处罚", "退市"}
-	medBear := []string{"走弱", "利空", "减持", "放缓", "下滑", "走低", "回落", "不及预期", "承压", "疲软", "萎缩", "高企", "预警", "连跌", "转弱", "低于预期"}
-	// 按优先级判定：强利空 → 中利空 → 强利好 → 中利好，均未命中保持中性 0 分
-	switch {
-	case containsAny(title, strongBear):
-		ht.Sentiment = "负面"
-		ht.Score = -0.75
-		ht.Direction = "利空"
-	case containsAny(title, medBear):
-		ht.Sentiment = "负面"
-		ht.Score = -0.5
-		ht.Direction = "利空"
-	case containsAny(title, strongBull):
-		ht.Sentiment = "正面"
-		ht.Score = 0.75
-		ht.Direction = "利好"
-	case containsAny(title, medBull):
-		ht.Sentiment = "正面"
-		ht.Score = 0.5
-		ht.Direction = "利好"
-	}
-
-	// 事件类型
-	if containsAny(title, []string{"政策", "国务院", "央行", "证监会", "监管", "法规"}) {
-		ht.EventType = "政策"
-		ht.ImpactLevel = "高"
-	}
-	if containsAny(title, []string{"财报", "业绩", "营收", "利润", "亏损"}) {
-		ht.EventType = "财报"
-	}
-	if containsAny(title, []string{"公告", "重组", "收购", "减持", "增持", "分红"}) {
-		ht.EventType = "公司"
-	}
-	if containsAny(title, []string{"CPI", "GDP", "PMI", "利率", "降息", "加息", "通胀"}) {
-		ht.EventType = "宏观"
-	}
-
-	// 策略匹配
-	if containsAny(title, []string{"涨停", "连板", "龙头", "机器人"}) {
-		ht.Strategy = "龙头"
-	} else if containsAny(title, []string{"反弹", "反转", "突破"}) {
-		ht.Strategy = "双凸"
-	} else if containsAny(title, []string{"回调", "回踩", "低吸"}) {
-		ht.Strategy = "N形"
-	}
-
-	// 紧急程度
-	if ht.Score >= 0.75 && ht.ImpactLevel == "高" {
-		ht.Urgency = "立即"
-	} else if ht.Score >= 0.6 || ht.ImpactLevel == "高" {
-		ht.Urgency = "关注"
-	}
-
-	return ht
-}
-
 // minInt 返回两个整数中的较小值（用于截断日志输出长度）。
 // （minInt returns the smaller of two ints (used to truncate log output length).）
 func minInt(a, b int) int {
@@ -1237,17 +1179,6 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// containsAny 判断字符串 s 是否包含 keywords 中的任意一个关键词。
-// （containsAny reports whether s contains any keyword from keywords.）
-func containsAny(s string, keywords []string) bool {
-	for _, kw := range keywords {
-		if strings.Contains(s, kw) {
-			return true
-		}
-	}
-	return false
 }
 
 // SectorTag 解析后的板块标签，含置信度权重。

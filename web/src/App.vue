@@ -61,6 +61,12 @@
         <router-link to="/consult" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">🎯</span> 股票咨询
         </router-link>
+        <router-link to="/research" class="nav-item" active-class="active" @click="menuOpen = false" v-if="canResearch">
+          <span class="nav-icon">🔬</span> 自动研究
+        </router-link>
+        <router-link to="/admin" class="nav-item" active-class="active" @click="menuOpen = false" v-if="canAdmin">
+          <span class="nav-icon">👥</span> 用户管理
+        </router-link>
       </nav>
       <!-- 侧栏底部：服务状态 & 账号 -->
       <div class="sidebar-footer">
@@ -140,11 +146,14 @@
 <script setup>
 // ── 依赖导入 ── (Imports)
 // ref 定义响应式数据；onMounted / onUnmounted 注册组件生命周期钩子 (ref for reactive data; onMounted/onUnmounted for lifecycle hooks)
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 // useRouter 获取路由实例，用于退出登录后编程式跳转 (useRouter for programmatic navigation after logout)
 import { useRouter } from 'vue-router'
 // 后端 API 方法统一挂载在 api 命名空间下 (all backend API methods are namespaced under api)
 import * as api from './api/index.js'
+// 通知工具：APK WebView 走原生桥，桌面浏览器走标准 Notification API
+// (Notification helper: native bridge in the APK WebView, standard API on desktop)
+import { isNative, canNotify, requestPermission, notify as sendNotify } from './notify.js'
 
 // 路由实例：logout 时跳转回根路由（登录页）(router instance: navigate back to root on logout)
 const router = useRouter()
@@ -159,6 +168,13 @@ const alertCount = ref(0)            // 未读提醒数 (unread alert count)
 const toasts = ref([])               // Toast 消息队列 (Toast message queue)
 const menuOpen = ref(false)          // 移动端侧栏是否展开 (whether mobile sidebar is expanded)
 const shortEnabled = ref(false)      // 做空开关状态 (short-selling toggle state)
+
+// ── 权限门禁 ──
+// ── Permission gates ──
+// 是否可进入"自动研究"页（拥有 research_approve 权限位或 admin）
+const canResearch = computed(() => api.hasPerm('research_approve'))
+// 是否可进入"用户管理"页（仅 admin）
+const canAdmin = computed(() => api.isAdmin())
 
 // ── 登录表单状态 ── (Login form state)
 // 服务器地址初始值优先取本地持久化值，否则用默认本地地址 (server URL defaults to persisted value, otherwise localhost)
@@ -183,14 +199,12 @@ function addToast(msg, type = 'info') {
   setTimeout(() => { toasts.value.shift() }, 3000)
 }
 
-/** 测试浏览器通知功能 (Test the browser notification feature) */
-// 说明：已授权通知权限时直接弹出系统通知；无论是否授权都弹出 Toast 提示结果
-// (Fire a system notification if permission is granted; always show a Toast with the outcome)
-async function testNotify() {
-  if ('Notification' in window && Notification.permission === 'granted') {
-    new Notification('量仔期货', { body: '通知测试成功', icon: '' })
-  }
-  addToast('通知测试' + (Notification.permission === 'granted' ? '已发送' : '（通知未授权）'), 'info')
+/** 测试通知功能 (Test the notification feature) */
+// 说明：通过原生桥（APK）或浏览器通知（桌面）发送系统通知，并弹出 Toast 提示结果
+// (Fire a system notification via the native bridge (APK) or browser API (desktop); always show a Toast with the outcome)
+function testNotify() {
+  const sent = sendNotify('量仔期货', '通知测试成功')
+  addToast('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')), 'info')
 }
 
 /** 切换做空开关，失败时回滚 UI 状态 (Toggle short-selling; roll back UI state on failure) */
@@ -219,6 +233,9 @@ async function checkAuth() {
     loggedIn.value = true
     account.value = api.getAccount()
     api.setStoredServer(serverUrl.value)
+    // 静默刷新当前用户角色/权限位（页面刷新后兜底，失败不影响主界面）
+    // Silently refresh role/perms after a page reload (best-effort; failure keeps the UI usable)
+    try { await api.refreshMe() } catch (_) {}
     return true
   }
   loggedIn.value = false
@@ -242,10 +259,9 @@ async function handleLogin() {
     // 登录成功后启动轮询，并顺带请求通知权限 (start polling after login and request notification permission)
     startPolling()
     addToast('登录成功', 'success')
-    // 浏览器通知权限为“默认”时主动申请，便于新信号及时提醒 (ask for permission when "default" so fresh signals alert in time)
-    if ('Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission()
-    }
+    // 请求通知权限（APK 内走原生桥无需浏览器权限；桌面浏览器主动弹窗申请）
+    // (Request notification permission; no browser permission needed on the native bridge)
+    requestPermission()
   } catch (e) {
     loginError.value = e.message || '登录失败'
   } finally {
@@ -319,16 +335,18 @@ function handleSSE(msg) {
 /** 交易信号浏览器通知去重：60 秒窗口内同一批信号只通知一次，避免每轮刷新反复弹 (Dedupe: notify the same batch at most once per 60s window to avoid spam on each poll) */
 let lastNotifyAt = 0
 
-/** 发送交易信号浏览器通知（需用户已授权通知权限；页面不可见时也提醒） (Send a trading-signal browser notification; requires granted permission, works when tab is hidden) */
+/** 发送交易信号系统通知（APK 走原生桥，桌面需已授权浏览器通知；页面不可见时也提醒） (Send a trading-signal system notification via native bridge or browser; works when tab is hidden) */
 function notifyTradeSignal(text) {
-  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+  if (!canNotify()) return
   const now = Date.now()
   if (now - lastNotifyAt < 60000) return
   lastNotifyAt = now
-  try {
-    new Notification('量仔期货 交易信号', { body: text, icon: '' })
-  } catch (_) {}
+  sendNotify('量仔期货 交易信号', text)
 }
+
+// Android 原生端申请通知权限后的回调（MainActivity 调用；原生桥不依赖浏览器权限，故为空操作）
+// (Callback invoked by MainActivity after requesting POST_NOTIFICATIONS; the native bridge doesn't need browser permission, so it's a no-op)
+window.onNotifyPermissionChange = function () {}
 
 /** 启动定时轮询和 SSE 连接 (Start the polling timer and SSE connection) */
 // 说明：先立即刷新一次状态，随后每 15 秒轮询一次；

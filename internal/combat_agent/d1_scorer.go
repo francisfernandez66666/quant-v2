@@ -26,13 +26,16 @@ import (
 
 // D1Score 表示单只个股的 D1 事件评分结果。
 // Score 范围 0~40（对应 N 形 D1 维度满分 40），Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
+// RetryPending 表示本轮 LLM 失败（未拿到有效评分），分数 0 且待重试队列下轮重新调 LLM。
 // English: D1 event-scoring result for a single stock — Score in 0~40 (the N-shape D1 dimension max),
-// Blocked means the negative filter tripped, Reason is the LLM analysis.
+// Blocked means the negative filter tripped, Reason is the LLM analysis. RetryPending marks a stock whose
+// LLM scoring failed this round (score 0); it joins the retry queue and is re-scored via LLM next round.
 type D1Score struct {
-	Code    string  `json:"code"`    // 股票代码
-	Score   float64 `json:"score"`   // 评分值，0~40，越高越值得关注
-	Blocked bool    `json:"blocked"` // 是否被负面过滤拦截（利空事件命中）
-	Reason  string  `json:"reason"`  // LLM 给出的评分分析理由
+	Code         string  `json:"code"`          // 股票代码
+	Score        float64 `json:"score"`         // 评分值，0~40，越高越值得关注
+	Blocked      bool    `json:"blocked"`       // 是否被负面过滤拦截（利空事件命中）
+	Reason       string  `json:"reason"`        // LLM 给出的评分分析理由
+	RetryPending bool    `json:"retry_pending"` // LLM 失败待重试（分数 0，入重试队列，下轮重新调 LLM）
 }
 
 // D1Scorer 批量个股 D1 评分器。
@@ -41,10 +44,10 @@ type D1Score struct {
 // English: batch D1 scorer for stocks, scoring with the LLM referencing events_leftside.yaml rules.
 // Not concurrency-safe; the Engine should call it from a single goroutine.
 type D1Scorer struct {
-	llmClient    *llm.Client   // LLM 客户端，用于调用大模型进行 D1 评分
-	yamlContent  string        // events_leftside.yaml 原始内容，作为 LLM prompt 参考
-	maxAttempts  int           // D1 LLM 调用轮询重试次数（含首次），默认 5；0/负回退默认
-	retryBackoff time.Duration // 相邻两次重试的基础间隔
+	llmClient    *llm.Client       // LLM 客户端，用于调用大模型进行 D1 评分
+	yamlContent  string            // events_leftside.yaml 原始内容，作为 LLM prompt 参考
+	maxAttempts  int               // D1 LLM 调用轮询重试次数（含首次），默认 5；0/负回退默认
+	retryBackoff time.Duration     // 相邻两次重试的基础间隔
 	sectorEvents map[string]string // 代码→所属板块事件标题（板块事件传导 D1：个股不在新闻点名里也能拿到板块利好作为评分上下文）
 }
 
@@ -149,17 +152,21 @@ func batchBounds(n, size int) [][2]int {
 // codes: 待评分的个股代码列表。
 // events: 当前周期的新闻事件列表，用于查找个股关联事件。
 // marketData: 个股行情数据映射，key 为股票代码。
-// fallback: 上一轮成功评分结果（可 nil）。本轮 LLM 明确给出的分数一律保留；
-// 仅当 LLM 某批失败（重试全败/解析失败）或漏掉某只个股时，才回退上一轮分数，无则归 0。
 // 返回 map[string]D1Score，key 为股票代码，value 为 D1Score 评分结果。
+// 失败策略（全局原则：LLM 失败不靠兜底，全部走 LLM 重试队列）：
+//   - 本轮 LLM 明确给出的分数一律保留；
+//   - 某批失败（重试全败/解析失败）或漏掉某只个股时，该批/该股不伪造分数、
+//     不回退上一轮，标记 RetryPending=true 且 Score=0（Reason 注明"待重试"），
+//     由调用方把这类个股并入重试队列，下一轮重新调 LLM。
+//
 // 逻辑：按 llmBatchSize 分批 → 每批独立"构建 prompt → 调用 LLM（轮询重试）→ 解析 JSON →
-// 补全未返回个股" → 合并结果返回。
+// 标记失败个股" → 合并结果返回。
 // English: batch-scores a list of stocks. Scores explicitly returned by the LLM this round are always
-// kept; the prior-round fallback is used only when a chunk fails (all retries / parse error) or a
-// specific stock is missed, otherwise it defaults to 0. Pipeline: split into llmBatchSize chunks →
-// per chunk (build prompt → call LLM with increasing retries → parse JSON → fill missing stocks) →
-// merge and return the score map.
-func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, fallback map[string]D1Score) map[string]D1Score {
+// kept; a failing chunk (all retries / parse error) or a missed stock is NEVER padded with prior-round
+// scores — it is marked RetryPending=true with Score=0 so the caller queues it for a fresh LLM call next
+// round. Pipeline: split into llmBatchSize chunks → per chunk (build prompt → call LLM with increasing
+// retries → parse JSON → mark failed stocks) → merge and return the score map.
+func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData) map[string]D1Score {
 	t0 := time.Now()
 	result := make(map[string]D1Score, len(codes))
 
@@ -202,7 +209,7 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 		go func(i int, chunk []string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			chunkResults[i] = ds.scoreChunk(chunk, events, marketData, fallback, maxAttempts)
+			chunkResults[i] = ds.scoreChunk(chunk, events, marketData, maxAttempts)
 		}(i, chunk)
 	}
 	wg.Wait()
@@ -220,13 +227,17 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 
 // scoreChunk 对单批个股（≤ llmBatchSize 只）构建 prompt 并调用 LLM 评分，返回本批独立结果 map
 // （不写共享 map，天然并发安全）。轮询重试（最多 maxAttempts 次、间隔按指数抖动并封顶，
-// 防重要 D1 评分随调用失败丢失），整批失败/解析失败/漏项则回退上一轮评分（fallback 里有值）
-// 或按理由兜底 0 分。
+// 防重要 D1 评分随调用失败丢失）。
+// 失败策略（全局原则：LLM 失败不靠兜底，全部走 LLM 重试队列）：
+// 整批失败/解析失败/漏项时不再回退上一轮评分或按理由兜底 0 分，而是把该批/该股标记为
+// RetryPending=true（Score=0, Reason 注明"待重试"），由调用方并入重试队列下轮重新调 LLM。
 // English: builds a prompt for one chunk (≤ llmBatchSize stocks) and calls the LLM, returning this
 // chunk's own result map (no shared map, so it is naturally concurrency-safe). Retries with capped
-// exponential backoff; on whole-chunk failure/parse error/missing stock it falls back to the prior
-// round score (if present) or a reason-based 0.
-func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, fallback map[string]D1Score, maxAttempts int) map[string]D1Score {
+// exponential backoff so important D1 scores are not lost to a single call failure. Per the global
+// "no fallback, all via LLM retry queue" principle, a whole-chunk failure / parse error / missed stock
+// is marked RetryPending=true (Score=0, Reason "待重试") for the caller to re-score via LLM next round —
+// never padded with prior-round scores or a reason-based 0.
+func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, maxAttempts int) map[string]D1Score {
 	result := make(map[string]D1Score, len(codes))
 	// 构建用户prompt：列出每只个股及其关联事件、行情数据
 	// English: build the user prompt listing each stock with its events and market data.
@@ -300,8 +311,8 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 		}
 	}
 	if err != nil {
-		log.Printf("[D1Scorer] LLM调用轮询重试%d次仍失败: %v, 回退上一轮评分", maxAttempts, err)
-		ds.fillFallback(result, codes, fallback, "LLM失败")
+		log.Printf("[D1Scorer] LLM调用轮询重试%d次仍失败: %v, 本批%d只标记待重试(入重试队列)", maxAttempts, err, len(codes))
+		ds.markRetryPending(result, codes, "LLM失败")
 		return result
 	}
 
@@ -310,8 +321,8 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 
 	var raw []D1Score
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		ds.fillFallback(result, codes, fallback, "解析失败")
-		log.Printf("[D1Scorer] JSON解析失败→本批 %d 只个股归0/回退: %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
+		log.Printf("[D1Scorer] JSON解析失败→本批 %d 只标记待重试(入重试队列): %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
+		ds.markRetryPending(result, codes, "解析失败")
 		return result
 	}
 
@@ -329,11 +340,18 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 		}
 	}
 
-	// 补全LLM未返回的个股：优先回退上一轮评分，无则兜底 0 分，保证结果完整
+	// 补全LLM未返回的个股：标记 RetryPending 待重试（不回退上一轮、不归 0 兜底），
+	// 由调用方并入重试队列下轮重新调 LLM。
+	// English: stocks the LLM didn't return are marked RetryPending for the next round's LLM call —
+	// never padded with prior-round scores or a plain 0.
+	var missed []string
 	for _, code := range codes {
 		if _, ok := result[code]; !ok {
-			ds.fillFallback(result, []string{code}, fallback, "LLM未返回")
+			missed = append(missed, code)
 		}
+	}
+	if len(missed) > 0 {
+		ds.markRetryPending(result, missed, "LLM未返回")
 	}
 
 	// 无实质事件（无个股新闻、无板块正向事件）的个股 D1 强制归 0：
@@ -355,16 +373,14 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 	return result
 }
 
-// fillFallback 对缺失评分的个股回退上一轮评分（fallback 有值则复用，无则按 reason 归 0）。
-func (ds *D1Scorer) fillFallback(result map[string]D1Score, codes []string, fallback map[string]D1Score, reason string) {
+// markRetryPending 对 LLM 评分失败的个股标记 RetryPending（Score=0, Reason 注明"待重试"），
+// 由调用方把该股并入 LLM 重试队列，下一轮重新调 LLM；不伪造分数、不回退上一轮。
+// English: marks stocks whose LLM scoring failed as RetryPending (Score=0, Reason "待重试") so the
+// caller queues them for a fresh LLM call next round — no fabricated score, no prior-round fallback.
+func (ds *D1Scorer) markRetryPending(result map[string]D1Score, codes []string, reason string) {
 	for _, code := range codes {
-		if f, ok := fallback[code]; ok {
-			result[code] = f
-			log.Printf("[D1Scorer] %s %s, 回退上一轮 score=%.2f blocked=%v", code, reason, f.Score, f.Blocked)
-			continue
-		}
-		result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: reason}
-		log.Printf("[D1Scorer] %s %s, 无上一轮评分, 默认0分", code, reason)
+		result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: reason + "待重试", RetryPending: true}
+		log.Printf("[D1Scorer] %s %s, 标记待重试(Score=0)", code, reason)
 	}
 }
 

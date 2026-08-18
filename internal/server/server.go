@@ -22,6 +22,7 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/store"
 )
 
 // EngineController 引擎对外暴露的控制面：利好/利空开关 + 流水线调试数据 + 消息中心 + 热点记录。
@@ -47,6 +48,9 @@ type EngineController interface {
 	ConsultLLM(userID, userMsg string, proMode bool) (string, error)
 	GetConsultHistory() []data.ConsultMessage
 	ClearConsultHistory()
+	// DashboardData 返回该账号/引擎的当前看板快照（信号/评分/新闻事件/开关状态等）。
+	// English: returns the current dashboard snapshot for this account/engine (signals/scores/news/toggles).
+	DashboardData() *display.DashboardData
 }
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
@@ -63,8 +67,11 @@ type Server struct {
 	watchlist   *data.WatchlistManager                                             // 自选股管理器
 	sse         *SSEBroker                                                         // SSE 事件广播器（向前端实时推送）
 	startTime   time.Time                                                          // 服务启动时间（用于 uptime 统计）
-	llmRecreate func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int) // 热重建 LLM 客户端
+	llmRecreate func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) // 热重建 LLM 客户端
 	ctrl        EngineController                                                   // 引擎控制面（做多/做空开关、流水线调试数据等）
+
+	researchDB  *store.DB // B5 研究候选库（optimize 产出入库；web 审批读写）
+	researchDir string    // B5 应用目录（applied_rules.json 落盘处）
 
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
@@ -79,10 +86,55 @@ type Server struct {
 	thsMu       sync.Mutex        // 保护同花顺板块兜底缓存的互斥锁
 	thsBoards   []data.SectorInfo // 同花顺 top 板块兜底缓存（LLM 无归因时使用）
 	thsBoardsAt time.Time         // 兜底缓存最近刷新时间（每分钟轮动一次）
+
+	newsMu     sync.Mutex            // 保护 news 响应缓存的互斥锁
+	newsCache  map[string][]byte     // news 接口 TTL 缓存（key: "all"/""，value: JSON 响应）
+	newsCacheAt time.Time            // news 缓存最近刷新时间（TTL 30s）
+
+	registry EngineRegistry // 多账号引擎注册表（懒加载/按配置指纹共享计算引擎）
+}
+
+// EngineRegistry 引擎注册表的 HTTP 可见接口（由 engine.Registry 实现，避免 server→engine 依赖环）。
+// 提供按账号获取引擎控制面、查询初始化进度、懒加载引擎的能力。
+// English: the registry interface visible to the HTTP layer (implemented by engine.Registry;
+// avoids a server→engine import cycle). Provides per-account engine control, init-status probing
+// and lazy load.
+type EngineRegistry interface {
+	GetController(userID string) EngineController
+	InitStatusJSON(userID string) map[string]interface{}
+	AllControllers() []EngineController
+	Len() int
+}
+// SetEngineRegistry 设置多账号引擎注册表（懒加载/按配置指纹共享）。
+func (s *Server) SetEngineRegistry(r EngineRegistry) { s.registry = r }
+
+// ctrlFor 返回指定账号的引擎控制面；账号首次访问时懒加载其引擎（登录后立即可用）。
+// 未接入注册表时回退全局 ctrl（旧单引擎模式）。
+// English: returns the engine controller for an account, lazily loading its engine on first access
+// (available right after login). Falls back to the global ctrl in the legacy single-engine mode.
+func (s *Server) ctrlFor(userID string) EngineController {
+	if s.registry != nil {
+		return s.registry.GetController(userID)
+	}
+	return s.ctrl
+}
+
+// dashFor 返回指定账号的看板快照（通过注册表懒加载引擎）。
+// 未接入注册表时回退全局 agg（旧单引擎模式）。
+// English: returns the dashboard snapshot for an account (via registry lazy load).
+// Falls back to the global agg in legacy single-engine mode.
+func (s *Server) dashFor(userID string) *display.DashboardData {
+	if s.registry != nil {
+		if c := s.registry.GetController(userID); c != nil {
+			return c.DashboardData()
+		}
+		return nil
+	}
+	return s.agg.Current()
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
-func (s *Server) SetLLMRecreate(fn func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int)) {
+func (s *Server) SetLLMRecreate(fn func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string)) {
 	s.llmRecreate = fn
 }
 
@@ -143,17 +195,21 @@ func (s *Server) ipoCalendar(now time.Time) ([]data.IPOEvent, error) {
 	return list, nil
 }
 
-// longOn / shortOn 读取引擎开关；未接入引擎时回退默认值（做多开 / 做空关）。
-func (s *Server) longOn() bool {
-	if s.ctrl != nil {
-		return s.ctrl.LongEnabled()
+// longOnFor / shortOnFor 读取指定账号的开关：账号级配置优先，未配置回退全局默认
+// （做多开 / 做空关）。多账号各自独立保存，跨设备同一账号读到的状态一致。
+// English: per-account long/short toggles; account override wins, else the global default
+// (long on / short off). Each account persists its own state; the same account sees the
+// same value on any device.
+func (s *Server) longOnFor(userID string) bool {
+	if s.cfg != nil {
+		return s.cfg.GetLongShortConfigFor(userID).LongEnabled
 	}
 	return true
 }
 
-func (s *Server) shortOn() bool {
-	if s.ctrl != nil {
-		return s.ctrl.ShortEnabled()
+func (s *Server) shortOnFor(userID string) bool {
+	if s.cfg != nil {
+		return s.cfg.GetLongShortConfigFor(userID).ShortEnabled
 	}
 	return false
 }
@@ -181,6 +237,13 @@ func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rp
 	return s
 }
 
+// SetResearch 注入 B5 研究候选库与应用目录（approve 时把权重写入 applied_rules.json）。
+// （SetResearch wires the research-candidate store and app dir used by the approval endpoints.）
+func (s *Server) SetResearch(db *store.DB, dataDir string) {
+	s.researchDB = db
+	s.researchDir = dataDir
+}
+
 // GetSSE 返回 SSE 事件推送器。
 func (s *Server) GetSSE() *SSEBroker { return s.sse }
 
@@ -193,6 +256,28 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	s.mux.HandleFunc("GET /setup", s.handleSetupStatus)
 	s.mux.HandleFunc("POST /setup", s.handleSetupSubmit)
+
+	// 当前登录用户信息（前端据此渲染权限相关的菜单/按钮）
+	s.mux.HandleFunc("GET /api/auth/me", s.authMiddleware(s.handleAuthMe))
+
+	// 用户/账号管理（仅 admin）
+	s.mux.HandleFunc("GET /api/admin/users", s.adminMiddleware(s.handleListUsers))
+	s.mux.HandleFunc("POST /api/admin/users", s.adminMiddleware(s.handleCreateUser))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/role", s.adminMiddleware(s.handleSetUserRole))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/perms", s.adminMiddleware(s.handleSetUserPerms))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/password", s.adminMiddleware(s.handleSetUserPassword))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/enabled", s.adminMiddleware(s.handleSetUserEnabled))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/expiry", s.adminMiddleware(s.handleSetUserExpiry))
+	s.mux.HandleFunc("DELETE /api/admin/users/{id}", s.adminMiddleware(s.handleDeleteUser))
+	// 管理员代配他人账号配置（strategy / d1 / longshort / llm）
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminGetStrategyConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminSetStrategyConfig))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/d1", s.adminMiddleware(s.handleAdminGetD1Config))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/d1", s.adminMiddleware(s.handleAdminSetD1Config))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/longshort", s.adminMiddleware(s.handleAdminGetLongShortConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/longshort", s.adminMiddleware(s.handleAdminSetLongShortConfig))
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminGetLLMConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminSetLLMConfig))
 
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
@@ -236,11 +321,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/evaluations", s.authMiddleware(s.handleFixEvaluations))
 	s.mux.HandleFunc("GET /api/ipo/calendar", s.authMiddleware(s.handleFixIPOCalendar))
 	s.mux.HandleFunc("GET /api/stock/lookup", s.authMiddleware(s.handleFixStockLookup))
+	s.mux.HandleFunc("GET /api/depth/{code}", s.authMiddleware(s.handleFixDepth))
 	s.mux.HandleFunc("GET /api/news", s.authMiddleware(s.handleFixNews))
 	s.mux.HandleFunc("POST /api/news/showall", s.authMiddleware(s.handleNewsShowAllToggle))
 	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
 	s.mux.HandleFunc("POST /api/news/reanalyze", s.authMiddleware(s.handleNewsReanalyze))
 	s.mux.HandleFunc("POST /api/news/test-attribution", s.authMiddleware(s.handleNewsTestAttribution))
+	s.mux.HandleFunc("GET /api/engine/init-status", s.authMiddleware(s.handleEngineInitStatus))
 	s.mux.HandleFunc("GET /api/watchlist", s.authMiddleware(s.handleFixGetWatchlist))
 	s.mux.HandleFunc("POST /api/watchlist", s.authMiddleware(s.handleFixAddWatchlist))
 	s.mux.HandleFunc("DELETE /api/watchlist", s.authMiddleware(s.handleFixRemoveWatchlist))
@@ -254,6 +341,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/consult/pro-mode", s.authMiddleware(s.handleSetConsultProMode))
 	s.mux.HandleFunc("GET /api/stage-records", s.authMiddleware(s.handleStageRecords))
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
+	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
+	s.mux.HandleFunc("GET /api/research/progress", s.authMiddleware(s.handleResearchProgress))
+	s.mux.HandleFunc("GET /api/research/candidates", s.authMiddleware(s.handleResearchCandidates))
+	s.mux.HandleFunc("POST /api/research/candidates/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleResearchApprove))
+	s.mux.HandleFunc("POST /api/research/candidates/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleResearchReject))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
 
@@ -425,6 +517,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"token":   user.Token,
 		"id":      user.ID,
 		"account": user.Username,
+		"role":    user.Role,
+		"perms":   user.Perms,
 	})
 }
 
@@ -465,7 +559,7 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.auth.Register(req.Username, req.Password)
+	user, err := s.auth.CreateUser(req.Username, req.Password, auth.RoleAdmin, nil, 0)
 	if err != nil {
 		writeError(w, 409, err.Error())
 		return
@@ -520,6 +614,31 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// adminMiddleware 管理员中间件：在认证基础上要求当前用户为管理员角色，否则返回 403。
+// 仅包裹用户/账号管理与全局配置等管理类接口。
+func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		user := userFromContext(r)
+		if user == nil || !user.IsAdmin() {
+			writeError(w, 403, "admin required")
+			return
+		}
+		next(w, r)
+	})
+}
+
+// permMiddleware 权限位中间件：要求当前用户拥有指定权限位（管理员隐式拥有全部）。
+func (s *Server) permMiddleware(perm string, next http.HandlerFunc) http.HandlerFunc {
+	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		user := userFromContext(r)
+		if user == nil || !user.HasPerm(perm) {
+			writeError(w, 403, "no permission: "+perm)
+			return
+		}
+		next(w, r)
+	})
+}
+
 // ── API handlers ──
 
 // handleHealth 处理 GET /api/health：健康检查，恒返回 {"status":"ok"}。
@@ -543,7 +662,8 @@ func (s *Server) handleNewsSourceHealth(w http.ResponseWriter, r *http.Request) 
 // 包括新闻事件、热门/利空板块、多空信号、最终信号、L1 评分与做多/做空开关状态；
 // 若报表存在则附带统计指标与持仓日志。无数据时返回 waiting_for_data。
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	data := s.agg.Current()
+	userID := requestUserID(r)
+	data := s.dashFor(userID)
 	if data == nil {
 		writeJSON(w, 200, map[string]string{"status": "waiting_for_data"})
 		return
@@ -560,8 +680,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"final_signals": data.FinalSignals,
 		"l1_score":      data.L1Score,
 		"l1_blocked":    data.L1Blocked,
-		"long_enabled":  s.longOn(),
-		"short_enabled": s.shortOn(),
+		"long_enabled":  s.longOnFor(userID),
+		"short_enabled": s.shortOnFor(userID),
 	}
 	if data.Report != nil {
 		total, holding, win, wr, avgW, avgL := data.Report.Stats()
@@ -583,23 +703,29 @@ type longToggleReq struct {
 	Enabled bool `json:"enabled"`
 }
 
-// handleLongToggle 处理 POST /api/long/toggle：切换做多开关（经引擎控制面生效）并返回最新状态。
+// handleLongToggle 处理 POST /api/long/toggle：切换做多开关（按账号持久化）并返回最新状态。
 func (s *Server) handleLongToggle(w http.ResponseWriter, r *http.Request) {
 	var req longToggleReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if s.ctrl != nil {
-		s.ctrl.SetLongEnabled(req.Enabled)
+	userID := requestUserID(r)
+	if s.cfg != nil {
+		cur := s.cfg.GetLongShortConfigFor(userID)
+		cur.LongEnabled = req.Enabled
+		s.cfg.SetLongShortConfigFor(userID, cur)
 	}
-	log.Printf("[server] 做多开关: %v", req.Enabled)
-	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOn()})
+	if c := s.ctrlFor(userID); c != nil {
+		c.SetLongEnabled(req.Enabled)
+	}
+	log.Printf("[server] 账号 %s 做多开关: %v", userID, req.Enabled)
+	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOnFor(userID)})
 }
 
-// handleLongStatus 处理 GET /api/long/status：返回当前做多开关状态。
+// handleLongStatus 处理 GET /api/long/status：返回指定账号当前做多开关状态。
 func (s *Server) handleLongStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOn()})
+	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOnFor(requestUserID(r))})
 }
 
 // shortToggleReq 做空开关请求体。
@@ -607,23 +733,29 @@ type shortToggleReq struct {
 	Enabled bool `json:"enabled"`
 }
 
-// handleShortToggle 处理 POST /api/short/toggle：切换做空开关并返回最新状态。
+// handleShortToggle 处理 POST /api/short/toggle：切换做空开关（按账号持久化）并返回最新状态。
 func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 	var req shortToggleReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if s.ctrl != nil {
-		s.ctrl.SetShortEnabled(req.Enabled)
+	userID := requestUserID(r)
+	if s.cfg != nil {
+		cur := s.cfg.GetLongShortConfigFor(userID)
+		cur.ShortEnabled = req.Enabled
+		s.cfg.SetLongShortConfigFor(userID, cur)
 	}
-	log.Printf("[server] 做空开关: %v", req.Enabled)
-	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOn()})
+	if c := s.ctrlFor(userID); c != nil {
+		c.SetShortEnabled(req.Enabled)
+	}
+	log.Printf("[server] 账号 %s 做空开关: %v", userID, req.Enabled)
+	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOnFor(userID)})
 }
 
-// handleShortStatus 处理 GET /api/short/status：返回当前做空开关状态。
+// handleShortStatus 处理 GET /api/short/status：返回指定账号当前做空开关状态。
 func (s *Server) handleShortStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOn()})
+	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOnFor(requestUserID(r))})
 }
 
 // newsShowAllReq 资讯"显示全部"开关请求体。
@@ -632,9 +764,9 @@ type newsShowAllReq struct {
 }
 
 // newsShowAllOn 读取引擎"资讯显示全部"开关；未接入引擎时回退默认（关闭）。
-func (s *Server) newsShowAllOn() bool {
-	if s.ctrl != nil {
-		return s.ctrl.NewsShowAll()
+func (s *Server) newsShowAllOn(userID string) bool {
+	if c := s.ctrlFor(userID); c != nil {
+		return c.NewsShowAll()
 	}
 	return false
 }
@@ -646,29 +778,57 @@ func (s *Server) handleNewsShowAllToggle(w http.ResponseWriter, r *http.Request)
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if s.ctrl != nil {
-		s.ctrl.SetNewsShowAll(req.Enabled)
+	userID := requestUserID(r)
+	if c := s.ctrlFor(userID); c != nil {
+		c.SetNewsShowAll(req.Enabled)
 	}
-	log.Printf("[server] 资讯显示全部开关: %v", req.Enabled)
-	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn()})
+	log.Printf("[server] 账号 %s 资讯显示全部开关: %v", userID, req.Enabled)
+	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn(userID)})
 }
 
 // handleNewsShowAllStatus 处理 GET /api/news/showall：返回"资讯显示全部"开关状态。
+// handleEngineInitStatus 处理 GET /api/engine/init-status：返回指定账号的引擎初始化进度。
+// 前端登录后轮询该接口显示进度条 + 预计时间。
+// English: handles GET /api/engine/init-status — returns the account's engine init progress
+// for the frontend login progress bar + ETA.
+func (s *Server) handleEngineInitStatus(w http.ResponseWriter, r *http.Request) {
+	if s.registry == nil {
+		writeJSON(w, 200, map[string]interface{}{
+			"initialized": true,
+			"stage":       "ready",
+			"percent":     100,
+			"eta_seconds": 0,
+		})
+		return
+	}
+	resp := s.registry.InitStatusJSON(requestUserID(r))
+	if resp == nil {
+		resp = map[string]interface{}{
+			"initialized": false,
+			"percent":     0,
+			"eta_seconds": 0,
+			"stage":       "",
+		}
+	}
+	writeJSON(w, 200, resp)
+}
+
 func (s *Server) handleNewsShowAllStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn()})
+	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn(requestUserID(r))})
 }
 
 // handleNewsReanalyze 处理 POST /api/news/reanalyze：手动 LLM 补推。
 // 异步执行（拉取+LLM耗时），立即返回 202 表示已触发；结果打印到日志。
 func (s *Server) handleNewsReanalyze(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	c := s.ctrlFor(requestUserID(r))
+	if c == nil {
 		writeError(w, 503, "engine not ready")
 		return
 	}
 	log.Printf("[server] 触发手动LLM补推")
 	writeJSON(w, 202, map[string]bool{"accepted": true})
 	go func() {
-		stat, err := s.ctrl.ReanalyzeNews()
+		stat, err := c.ReanalyzeNews()
 		if err != nil {
 			log.Printf("[server] 补推失败: %v", err)
 			return
@@ -688,7 +848,8 @@ type testAttributionReq struct {
 // 归因测试（含产业链价值传导推导 + 差分事件拆分），返回拆分后的 NewsEvent。
 // 用于快速验证"海外自产关键材料→利好国内上游"等归因逻辑是否正确产出个股。
 func (s *Server) handleNewsTestAttribution(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	c := s.ctrlFor(requestUserID(r))
+	if c == nil {
 		writeError(w, 503, "engine not ready")
 		return
 	}
@@ -701,7 +862,7 @@ func (s *Server) handleNewsTestAttribution(w http.ResponseWriter, r *http.Reques
 		writeError(w, 400, "title required")
 		return
 	}
-	events, err := s.ctrl.TestAttribution(req.Title, req.Digest)
+	events, err := c.TestAttribution(req.Title, req.Digest)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -880,6 +1041,9 @@ type setLLMConfigReq struct {
 	// BatchConcurrency 新闻归因 LLM 批量并发批次，<=0 时维持现状/默认 4。
 	// （BatchConcurrency is the news-attribution LLM batch concurrency; <=0 keeps current/default 4.）
 	BatchConcurrency int `json:"batch_concurrency,omitempty"`
+	// ClassifierModel 可选分类专用模型（Stage0/1 等快速分类/初筛），留空用主模型。
+	// （ClassifierModel is an optional dedicated model for cheap classification/screening; empty = main model.）
+	ClassifierModel string `json:"classifier_model,omitempty"`
 }
 
 // handleGetLLMConfig 处理 GET /api/config/llm：返回当前账号的 API 地址、运行时生效模型与流式开关。
@@ -905,6 +1069,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		"timeout_sec":        cfg.TimeoutSec,
 		"batch_concurrency":  cfg.BatchConcurrency,
 		"max_retry_times":    cfg.MaxRetryTimes,
+		"classifier_model":   cfg.ClassifierModel,
 	})
 }
 
@@ -953,6 +1118,7 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		TimeoutSec:       req.TimeoutSec,
 		Stream:           req.Stream,
 		BatchConcurrency: req.BatchConcurrency,
+		ClassifierModel:  req.ClassifierModel,
 	})
 
 	// 保存 APIKey 到 auth config（按账号隔离）
@@ -985,7 +1151,7 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 				keys = []string{key}
 			}
 		}
-		s.llmRecreate(keys, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream), req.BatchConcurrency)
+		s.llmRecreate(keys, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream), req.BatchConcurrency, req.ClassifierModel)
 	}
 
 	// 记录运行时实际生效的 model（空值会被 llm 客户端按默认模型兜底）
@@ -1001,11 +1167,12 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 // handleLLMDebug 处理 GET /api/llm-debug：返回引擎的 LLM 流水线调试信息。
 // 未接入引擎或无数据时分别返回 no_engine / no_data 状态。
 func (s *Server) handleLLMDebug(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	c := s.ctrlFor(requestUserID(r))
+	if c == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
-	di := s.ctrl.GetDebugInfo()
+	di := c.GetDebugInfo()
 	if di == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_data"})
 		return
@@ -1057,7 +1224,8 @@ func (s *Server) consultProModeRateLimited(userID string, now time.Time) time.Du
 // 专业模式（开关打开）时注入该股全部实时行情，且盘中 15 分钟限流一次；
 // 普通模式不注入数据、不限流。未接入引擎或 LLM 未配置时返回对应错误提示。
 func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	c := s.ctrlFor(requestUserID(r))
+	if c == nil {
 		writeError(w, 503, "引擎未启动")
 		return
 	}
@@ -1085,7 +1253,7 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	reply, err := s.ctrl.ConsultLLM(userID, req.Message, proMode)
+	reply, err := c.ConsultLLM(userID, req.Message, proMode)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -1137,11 +1305,12 @@ func (s *Server) handleSetConsultProMode(w http.ResponseWriter, r *http.Request)
 
 // handleConsultHistory 处理 GET /api/consult/history：返回当日咨询对话历史。
 func (s *Server) handleConsultHistory(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	c := s.ctrlFor(requestUserID(r))
+	if c == nil {
 		writeJSON(w, 200, []data.ConsultMessage{})
 		return
 	}
-	h := s.ctrl.GetConsultHistory()
+	h := c.GetConsultHistory()
 	if h == nil {
 		h = []data.ConsultMessage{}
 	}
@@ -1150,19 +1319,20 @@ func (s *Server) handleConsultHistory(w http.ResponseWriter, r *http.Request) {
 
 // handleClearConsultHistory 处理 DELETE /api/consult/history：清空当日咨询对话。
 func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl != nil {
-		s.ctrl.ClearConsultHistory()
+	if c := s.ctrlFor(requestUserID(r)); c != nil {
+		c.ClearConsultHistory()
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 // handleStageRecords 返回当日全量 Stage 流水线轮次记录（用于复盘/策略引擎实时调取）。
 func (s *Server) handleStageRecords(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	c := s.ctrlFor(requestUserID(r))
+	if c == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
-	recs := s.ctrl.GetStageRecords()
+	recs := c.GetStageRecords()
 	if recs == nil {
 		recs = []newsagent.DebugInfo{}
 	}
@@ -1175,11 +1345,12 @@ func (s *Server) handleStageRecords(w http.ResponseWriter, r *http.Request) {
 
 // handleSignalLogs 返回当日全量信号批次记录（用于"信号日志"弹窗按批次复盘）。
 func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	c := s.ctrlFor(requestUserID(r))
+	if c == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
-	recs := s.ctrl.GetSignalLogs()
+	recs := c.GetSignalLogs()
 	if recs == nil {
 		recs = []combat_agent.SignalLog{}
 	}

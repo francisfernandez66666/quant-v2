@@ -57,17 +57,18 @@ type Stage0Result struct {
 	// （FailedIdx holds rawNews indices whose Stage0 batch was skipped after retry exhaustion; these stay
 	// in the unattributed queue for the next round rather than being misclassified as general news.）
 	FailedIdx []int
-	// Err Stage0 失败的底层原因（如 LLM 连不通导致整批归一般）。成功或无异常时为 nil。
-	// （Err is the underlying failure cause of Stage0, nil on success.）
+	// Err Stage0 失败的底层原因（如 LLM 连不通导致整批留队重试）。成功或无异常时为 nil。
+	// （Err is the underlying failure cause of Stage0, nil on success. When set, the whole batch stays in
+	// the retry queue (FailedIdx) rather than being misclassified as general news.）
 	Err error
 }
 
-// DebugInfo LLM 调试信息，记录 Stage1/Stage2 处理过程和中间数据。
-// （DebugInfo is LLM debug info recording the Stage1/Stage2 processing and intermediate data.）
+// DebugInfo LLM 调试信息，记录 Stage0(合并)/Stage2 处理过程和中间数据。
+// （DebugInfo is LLM debug info recording the merged-Stage0/Stage2 processing and intermediate data.）
 type DebugInfo struct {
-	Stage1Mode    string      `json:"stage1_mode"`    // "llm" / "keyword"：Stage1 使用的初筛方式
+	Stage1Mode    string      `json:"stage1_mode"`    // 初筛方式（合并 Stage0 后固定 "combined"）
 	RawCount      int         `json:"raw_count"`      // total raw titles：原始标题总数
-	SelectedCount int         `json:"selected_count"` // titles after stage1：Stage1 初筛后的条数
+	SelectedCount int         `json:"selected_count"` // titles after stage1：初筛后的条数
 	RawTitles     []string    `json:"raw_titles"`     // all raw titles：全部原始标题
 	SelectedIdx   []int       `json:"selected_idx"`   // selected indices：被选中的标题索引
 	Stage2Events  []NewsEvent `json:"stage2_events"`  // analyzed events：Stage2 分析产出的事件

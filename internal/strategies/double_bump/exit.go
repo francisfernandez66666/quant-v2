@@ -22,6 +22,12 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strateg
 	// 当前持仓盈亏率（%，正=盈利）（Current P&L percentage, positive = profit）
 	pnlPct := (price - cost) / cost * 100
 
+	// C4 ATR 硬止损：启用且日K充足时，跌破 ATR×mult 立即离场（避免双凸回撤过大）。
+	// English: C4 ATR hard stop — when active and bars suffice, exit once price breaks below ATR×mult.
+	if ctx.ATRStopMult > 0 && ctx.ATR > 0 && pnlPct <= -ctx.ATRStopPct(8) {
+		return &strategy.ExitResult{Reason: "双凸ATR止损", Priority: strategy.P1}
+	}
+
 	// 维护阶段最高价（优先取 EntryMeta 中记录的，其次取现价）（Track the stage high, preferring EntryMeta then live price）
 	highest := cost
 	if ctx.EntryMeta != nil {

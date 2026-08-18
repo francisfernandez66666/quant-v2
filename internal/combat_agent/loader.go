@@ -110,7 +110,9 @@ func (a *Agent) reloadConfig(path string) {
 	// Hot-update the strategy params (thread-safe, written under the lock in Agent.HotReload).
 	a.HotReload(&wrapper.Rules.Strategy)
 
-	// 同步更新持仓当日跌幅提醒阈值（策略之外的位置配置，同样可热生效）
-	// English: also refresh the holding daily-drop alert threshold (the position config live-applies too).
+	// 同步更新持仓当日跌幅提醒阈值与 ATR 动态止损参数（策略之外的位置配置，同样可热生效）
+	// English: also refresh the holding daily-drop alert threshold and the ATR dynamic-stop params (the
+	// position config live-applies too).
 	a.SetPositionDailyDropPct(wrapper.Rules.Position.DailyDropAlertPct)
+	a.SetATRStop(wrapper.Rules.Position.ATREnabled, wrapper.Rules.Position.ATRStopMult)
 }

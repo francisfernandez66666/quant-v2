@@ -134,11 +134,10 @@ func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 	})
 }
 
-// GetActiveMacroEvents 筛选当前处于"影响期"或未来 7 天内即将发生的宏观事件。
+// GetActiveMacroEvents 筛选 now 时刻处于"影响期"或未来 7 天内即将发生的宏观事件。
 // 影响期 = 事件日前 Duration 天至事件日后 Duration 天；
 // 返回按优先级（war > contract > fomc > pce > cpi > nfp > other）降序排列。
-func GetActiveMacroEvents(events []MacroEvent) []MacroEvent {
-	now := time.Now()
+func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
 	var active []MacroEvent
 
 	priority := map[string]int{

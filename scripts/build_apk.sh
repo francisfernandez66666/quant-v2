@@ -95,9 +95,10 @@ echo "[5/5] 打包 APK (${MODE})..."
 export JAVA_HOME="$JAVA_HOME_DIR"
 export ANDROID_HOME="$ANDROID_SDK"
 if [ "$MODE" = "release" ]; then
-    # 签名配置
+    # 签名配置：keystore 默认用 mobile/keystore.jks，密码默认 QzK8mXp2vL5nT9aR
+    # （通过环境变量传给 Gradle，不再追加 gradle.properties，避免重复堆积）
     KS="${MOBILE_KEYSTORE:-$APP_DIR/mobile/keystore.jks}"
-    KSPASS="${MOBILE_KEYSTORE_PASS:-changeme}"
+    KSPASS="${MOBILE_KEYSTORE_PASS:-QzK8mXp2vL5nT9aR}"
     if [ ! -f "$KS" ]; then
         echo "      生成自签名 keystore: $KS"
         "$JAVA_HOME/bin/keytool" -genkeypair -v \
@@ -105,14 +106,10 @@ if [ "$MODE" = "release" ]; then
             -keyalg RSA -keysize 2048 -validity 3650 \
             -dname "CN=liangzai, OU=quant, O=quant, L=Beijing, ST=Beijing, C=CN"
     fi
-    # 注入签名到 gradle.properties（临时）
-    cat >> gradle.properties <<EOF
-
-android.injected.signing.store.file=$KS
-android.injected.signing.store.password=$KSPASS
-android.injected.signing.key.alias=quant
-android.injected.signing.key.password=$KSPASS
-EOF
+    export ORG_GRADLE_PROJECT_android_injected_signing_store_file="$KS"
+    export ORG_GRADLE_PROJECT_android_injected_signing_store_password="$KSPASS"
+    export ORG_GRADLE_PROJECT_android_injected_signing_key_alias="quant"
+    export ORG_GRADLE_PROJECT_android_injected_signing_key_password="$KSPASS"
     ./gradlew assembleRelease
     OUT="app/build/outputs/apk/release/app-release.apk"
 else

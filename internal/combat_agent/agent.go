@@ -56,6 +56,10 @@ func strategyLabel(t strategy.SignalType) string {
 		return "N"
 	case strategy.SignalDragonReturn:
 		return "回"
+	case strategy.SignalFactor:
+		return "因"
+	case strategy.SignalPattern:
+		return "形"
 	}
 	return string(t)
 }
@@ -122,6 +126,30 @@ type Agent struct {
 	momentumPrev    map[string]float64
 	momentumPrevDay string
 	momentumPrevMu  sync.Mutex
+
+	// d1Boost D1 软加成配置（C1）：BoostWeight>0 时对非 N 战法总分做加成；负面 blocked 硬 veto。
+	// 由 Engine 在构建/热更时注入（见 SetD1Config），零值视为未启用。
+	// English: C1 D1 soft-boost settings — when BoostWeight>0, non-N strategy totals get boosted;
+	// a blocked D1 hard-vetoes the stock. Injected by the Engine (SetD1Config); zero = disabled.
+	d1Boost config.D1Config
+
+	// atrStop C4 ATR 动态止损参数：atrEnabled 开关 + atrMult 倍数（止损距离 = atrMult×ATR）。
+	// 由 Engine/loader 注入（见 SetATRStop），未注入时回退固定百分比止损。
+	// English: C4 ATR dynamic-stop params — atrEnabled switch + atrMult multiplier (stop distance =
+	// atrMult×ATR). Injected by the Engine/loader (SetATRStop); unset falls back to fixed percent.
+	atrEnabled bool
+	atrMult    float64
+
+	// emotionBlock C5 情绪周期禁止开仓的阶段列表（见 SetEmotionBlockPhases）；空时回退默认 ["衰退"]。
+	// English: C5 emotion phases that forbid buying (SetEmotionBlockPhases); empty falls back to ["衰退"].
+	emotionBlock []string
+
+	// depthFn 盘口因子获取回调（由 Server/Engine 注入，nil 表示不拉取）。
+	// 信号生成后对通过战法的个股拉取一次盘口因子（买卖压力/封单量），供战法与前端共同使用。
+	// English: order-book factor fetcher injected by Server/Engine (nil disables). After signal
+	// generation, per-signal depth factors (bid/ask pressure, seal volume) are fetched once for
+	// strategies and the frontend alike.
+	depthFn func(code string) *data.OrderBookFactors
 }
 
 // New 创建战法引擎实例。
@@ -133,6 +161,68 @@ func New(cfg *config.StrategyConfig) *Agent {
 		waves:        NewWaveTracker(),
 		dbwaves:      NewDoubleBumpWatcher(),
 		momentumPrev: make(map[string]float64),
+	}
+}
+
+// SetDepthFactorFn 注入盘口因子获取回调（nil 禁用）。
+// English: injects the order-book factor fetcher (nil disables it).
+func (a *Agent) SetDepthFactorFn(fn func(code string) *data.OrderBookFactors) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.depthFn = fn
+}
+
+// attachDepthFactors 对信号列表批量附加盘口因子（并发拉取）。
+// 回调未注入或拉取失败时信号保留零值因子，战法/前端均须容忍缺失。
+// English: attaches order-book factors to a batch of signals (fetched concurrently).
+// Signals keep zero-valued factors when the fetcher is unset or fails; strategies and
+// the frontend must tolerate missing factors.
+func (a *Agent) attachDepthFactors(signals []Signal) {
+	if len(signals) == 0 {
+		return
+	}
+	a.mu.RLock()
+	fn := a.depthFn
+	a.mu.RUnlock()
+	if fn == nil {
+		return
+	}
+	// 同一代码只拉一次（同一轮多战法命中同股共用因子）
+	// English: fetch once per code (signals of the same stock share the factor).
+	seen := make(map[string]int)
+	var idx []int
+	for i, s := range signals {
+		if s.Code == "" {
+			continue
+		}
+		if _, ok := seen[s.Code]; !ok {
+			seen[s.Code] = i
+			idx = append(idx, i)
+		}
+	}
+	if len(idx) == 0 {
+		return
+	}
+	type res struct {
+		i int
+		f *data.OrderBookFactors
+	}
+	ch := make(chan res, len(idx))
+	var wg sync.WaitGroup
+	for _, i := range idx {
+		code := signals[i].Code
+		wg.Add(1)
+		go func(i int, c string) {
+			defer wg.Done()
+			ch <- res{i, fn(c)}
+		}(i, code)
+	}
+	wg.Wait()
+	close(ch)
+	for r := range ch {
+		if r.f != nil {
+			signals[r.i].DepthFactors = r.f
+		}
 	}
 }
 
@@ -160,6 +250,62 @@ func (a *Agent) SetLaodengConfig(cfg *config.LaodengConfig) {
 	a.mu.Lock()
 	a.laodengCfg = cfg
 	a.mu.Unlock()
+}
+
+// SetD1Config 注入 D1 软加成配置（C1）：负面硬 veto + 高分软加成（线程安全）。
+// English: injects the C1 D1 soft-boost config — negative hard veto + high-score soft boost (thread-safe).
+func (a *Agent) SetD1Config(cfg *config.D1Config) {
+	if cfg == nil {
+		return
+	}
+	a.mu.Lock()
+	a.d1Boost = *cfg
+	a.mu.Unlock()
+}
+
+// SetATRStop 注入 C4 ATR 动态止损参数（线程安全）。enabled=false 时回退固定百分比止损。
+// English: injects the C4 ATR dynamic-stop params (thread-safe); false falls back to fixed percent.
+func (a *Agent) SetATRStop(enabled bool, mult float64) {
+	a.mu.Lock()
+	a.atrEnabled = enabled
+	a.atrMult = mult
+	a.mu.Unlock()
+}
+
+// atrStopParams 读取 ATR 动态止损参数（线程安全）。未启用时 mult=0（回退固定百分比）。
+// English: reads the ATR dynamic-stop params (thread-safe); mult=0 when disabled.
+func (a *Agent) atrStopParams() (enabled bool, mult float64) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.atrEnabled, a.atrMult
+}
+
+// SetEmotionBlockPhases 注入 C5 情绪周期禁止开仓阶段列表（线程安全；nil 回退默认 ["衰退"]）。
+// English: injects the C5 emotion block-buy phase list (thread-safe; nil falls back to ["衰退"]).
+func (a *Agent) SetEmotionBlockPhases(phases []string) {
+	a.mu.Lock()
+	a.emotionBlock = phases
+	a.mu.Unlock()
+}
+
+// emotionBlocksBuy 判断某情绪阶段是否禁止开仓（C5）。空配置回退默认仅"衰退"。
+// English: reports whether an emotion phase forbids buying (C5); empty config defaults to 衰退 only.
+func (a *Agent) emotionBlocksBuy(phase string) bool {
+	if phase == "" {
+		return false
+	}
+	a.mu.RLock()
+	phases := a.emotionBlock
+	a.mu.RUnlock()
+	if len(phases) == 0 {
+		phases = []string{"衰退"}
+	}
+	for _, p := range phases {
+		if p == phase {
+			return true
+		}
+	}
+	return false
 }
 
 // SetRunners 设置策略运行器列表（线程安全）。
@@ -299,6 +445,9 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 	// 最后统一套 Laodeng 评分修正置信度
 	// English: apply the unified Laodeng confidence correction at the end.
 	signals := a.applyLaodeng(raw)
+	// 对最终信号批量附加盘口因子（买卖压力/封单量，供战法与前端使用）
+	// English: attach order-book factors (bid/ask pressure & seal volume) to final signals.
+	a.attachDepthFactors(signals)
 	log.Printf("[combat_agent] ScanLong: %d 板块 %d 个股 → %d 做多信号", len(input.Sectors), len(input.IndividualStocks), len(signals))
 	return signals
 }
@@ -342,6 +491,19 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	var d1 *D1Score
 	if ds, ok := input.D1Scores[code]; ok {
 		d1 = &ds
+	}
+	// C1 负面硬 veto：D1 命中负面过滤（立案/减持/质押/解禁等）的个股，
+	// 任何战法都不产生做多信号（记分保留，仅拦截信号）。
+	// English: C1 negative hard-veto — a stock whose D1 tripped the negative filter produces no
+	// buy signal from any strategy (scores are still recorded; only signals are withheld).
+	if d1 != nil && d1.Blocked {
+		if input.Scores == nil {
+			input.Scores = make(map[string]StockScores)
+		}
+		scb := StockScores{Code: code, DataGaps: make(map[string]bool), UpdatedAt: now}
+		input.Scores[code] = scb
+		log.Printf("[combat_agent] D1 负面拦截 %s: %s", code, d1.Reason)
+		return nil
 	}
 	eventDesc := strings.Join(newsTitlesOf(input.News, code), "；")
 	// PE 由上层 Engine 预取填充（input.PE 为空表示该股无 PE，N 形 D3 走斐波那契兜底）
@@ -426,6 +588,15 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			sc.DoubleBumpScore = eval.TotalScore
 		case strategy.SignalDragonReturn:
 			sc.DragonReturnScore = eval.TotalScore
+		}
+		// C1 D1 软加成：对 非N 战法（龙头/双响炮/龙回头），当 D1 分达到加成门槛时，
+		// 总分 ×(1+BoostWeight×D1/40)（封顶 100）并重判 pass/level，让强事件股越过买入门槛；
+		// N 形已有自身 D1 硬闸，不再叠加。负数/未启用时保持不变。
+		// English: C1 D1 soft boost — for non-N strategies, a D1 score above the boost threshold
+		// multiplies the total by (1+BoostWeight×D1/40), capped at 100, then re-derives pass/level so a
+		// strong-event stock clears its buy gate. N-shape already has its own D1 hard gate and is skipped.
+		if runner.Type != strategy.SignalNShape && d1 != nil && !d1.Blocked {
+			a.applyD1Boost(runner.Type, eval, d1)
 		}
 		// N 形候选：推进一突/二突日内状态机，并尊重 D 硬闸 + 总分门槛。
 		// 一突/二突标记需 d1>0 且 总分≥60（与 full_chain 的 Valid 硬闸一致）才 Pass；
@@ -515,6 +686,16 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		if action == "" {
 			action = "watch"
 		}
+		// C5 情绪周期过滤扩展到四战法：当前阶段禁止开仓时（如"衰退"），
+		// 买入信号一律降级为 watch 观察（仅提醒不交易），与 N 形既有情绪硬闸口径一致。
+		// English: C5 extends the emotion-cycle filter to all four strategies — under a block-buy phase
+		// (e.g. 衰退), every buy signal downgrades to watch (alert-only), consistent with N-shape's gate.
+		if input.EmotionPhase != "" && (action == "买入" || action == "buy") && a.emotionBlocksBuy(input.EmotionPhase) {
+			action = "watch"
+			sigReason := sig.Reason
+			sigReason = "情绪[" + input.EmotionPhase + "]禁止开仓: " + sigReason
+			sig.Reason = sigReason
+		}
 		// B2 式固化可撤销修正：策略 GenerateSignal 常不填触发价（Price=0），导致上层
 		// invalidateBrokenSignals 因"触发价无效"跳过，固化信号跌破现价也不会被撤销。
 		// 这里用现价 md.Price 兜底触发价，使"现价跌破触发价→撤销固化"的校验真正生效。
@@ -553,6 +734,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			Tag:         nShapeTag(eval),
 			Price:       sigPrice,
 			Confidence:  sig.Confidence,
+			ATR:         atr14Last(md.KLines),
 			Reason:      sigReason,
 			Sector:      sectorName,
 			GeneratedAt: now,
@@ -598,6 +780,17 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	// English: only after all strategies & the momentum gate have been evaluated, store this round's
 	// momentum score as the baseline for next round's improvement check.
 	a.momentumRecord(code, momentumScore)
+
+	// E1 宏观利空门控：股指期货交割日等高影响宏观事件当日，买入信号统一降级，
+	// 仅超高置信度（"特别高质量信号"）放行；N 形超短与动量 watch 一律拦截。
+	// English: E1 macro bearish gate — on high-impact macro days (e.g. 交割日), buy signals are
+	// downgraded unless exceptionally high-confidence; N-shape and momentum watch are blocked.
+	if active, mcfg := a.macroGateActive(); active {
+		sigs = applyMacroGate(sigs, true, mcfg)
+		if len(sigs) > 0 {
+			log.Printf("[combat_agent] 宏观利空门控生效: %d 条信号已降级/拦截", len(sigs))
+		}
+	}
 	// 战法评分日志：code + 各维度分 + 是否命中（FLOW 全流程日志要求）
 	// 附加"未出"原因（diagnostic）：各战法未出信号的具体原因，便于排查非龙头为何不出分/不发声。
 	// English: scoring log — code + each dimension score + hit flag (FLOW requirement), plus a diagnostic
@@ -701,6 +894,81 @@ func (a *Agent) doubleBumpConfig() config.DoubleBumpConfig {
 		return config.DoubleBumpConfig{}
 	}
 	return cfg.DoubleBump
+}
+
+// applyD1Boost 对非 N 战法评分做 D1 软加成（C1）：当 D1 分 ≥ BoostThreshold 时，
+// 总分 ×(1+BoostWeight×D1/40)（封顶 100），并按各战法自身门槛重判 pass/level，
+// 让强事件股（如高确定性研报）跨越买入阈值。原始总分写入 Details["d1_raw"]，
+// 加成量写入 Details["d1_boost"]（前端可见，透明可追溯）。N 形战法有独立 D1 硬闸，不叠加。
+// English: applies the C1 D1 soft boost to a non-N strategy evaluation — when the D1 score is at or
+// above BoostThreshold the total is scaled by (1+BoostWeight×D1/40), capped at 100, then pass/level are
+// re-derived from each strategy's own thresholds so strong-event stocks clear their buy gate. The raw
+// total and boost delta are recorded in Details["d1_raw"]/["d1_boost"] for transparency. N-shape keeps
+// its own independent D1 hard gate and is skipped.
+func (a *Agent) applyD1Boost(t strategy.SignalType, eval *strategy.Evaluation, d1 *D1Score) {
+	a.mu.RLock()
+	cfg := a.d1Boost
+	a.mu.RUnlock()
+	if cfg.BoostWeight <= 0 || d1 == nil || d1.Blocked || d1.Score < cfg.BoostThreshold {
+		return
+	}
+	tiers, ok := d1BoostTiers(t)
+	if !ok {
+		return
+	}
+	boosted := eval.TotalScore * (1 + cfg.BoostWeight*d1.Score/40)
+	if boosted > 100 {
+		boosted = 100
+	}
+	if boosted <= eval.TotalScore {
+		return
+	}
+	if eval.Details == nil {
+		eval.Details = make(map[string]float64)
+	}
+	eval.Details["d1_raw"] = eval.TotalScore
+	eval.Details["d1_boost"] = boosted - eval.TotalScore
+	eval.TotalScore = boosted
+	if level, pass := tiers(boosted); pass {
+		eval.Pass = true
+		eval.Level = level
+	}
+}
+
+// d1BoostTiers 返回非 N 战法的级别重判函数，门槛与 strategies/* 评分实现保持一致：
+//   - dragon / double_bump：≥70 full_chain(买入)，≥50 brief(观察)
+//   - dragon_return：≥85 accelerate，≥75 main，≥60 first（P1/P2/P3_5）
+//
+// English: returns the level re-derivation for non-N strategies, matching the thresholds in
+// strategies/*: dragon/double-bump ≥70 full_chain (buy) / ≥50 brief (watch); dragon-return
+// ≥85 accelerate / ≥75 main / ≥60 first (P1/P2/P3_5).
+func d1BoostTiers(t strategy.SignalType) (func(score float64) (string, bool), bool) {
+	switch t {
+	case strategy.SignalDragon, strategy.SignalDoubleBump:
+		return func(s float64) (string, bool) {
+			if s >= 70 {
+				return "full_chain", true
+			}
+			if s >= 50 {
+				return "brief", true
+			}
+			return "", false
+		}, true
+	case strategy.SignalDragonReturn:
+		return func(s float64) (string, bool) {
+			if s >= 85 {
+				return "accelerate", true
+			}
+			if s >= 75 {
+				return "main", true
+			}
+			if s >= 60 {
+				return "first", true
+			}
+			return "", false
+		}, true
+	}
+	return nil, false
 }
 
 // mdEmpty 判断行情快照是否为空（nil 或缺现价）。
@@ -898,6 +1166,9 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 	// 同样套 Laodeng 评分修正
 	// English: apply the same Laodeng confidence correction.
 	signals := a.applyLaodeng(raw)
+	// 对最终信号批量附加盘口因子（买卖压力/封单量，供战法与前端使用）
+	// English: attach order-book factors (bid/ask pressure & seal volume) to final signals.
+	a.attachDepthFactors(signals)
 	log.Printf("[combat_agent] ScanShort: %d 板块 %d 个股 → %d 做空信号", len(input.Sectors), len(input.IndividualStocks), len(signals))
 	return signals
 }

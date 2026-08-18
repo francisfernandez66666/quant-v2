@@ -151,9 +151,9 @@ func TestFullPipelineMock(t *testing.T) {
 	cfgMgr := config.NewManager(filepath.Join(dir, "config.json"))
 	cfgMgr.SetStrategyConfig(&config.StrategyConfig{
 		Dragon:       config.DragonConfig{F1SealWeight: 0.30, F2ResonanceWeight: 0.25, F3PremiumWeight: 0.25, F4RsWeight: 0.20, PullbackMaxPct: 5.0},
-		DoubleBump:   config.DoubleBumpConfig{FirstBreakVolumeMultiple: 2.0, SecondBreakVolumeMultiple: 1.5, AdjustDaysMax: 10, PositionWeight: 0.3},
-		NShape:       config.NShapeConfig{NPatternScoreThreshold: 0.6, NShapeD1Threshold: 0.5, HardStopLoss: -5.0},
-		DragonReturn: config.DragonReturnConfig{MinPullbackPct: -15.0, MaxPullbackPct: -5.0, StopLossPct: -7.0, TakeProfitPct: 15.0, MaxHoldDays: 20},
+		DoubleBump:   config.DoubleBumpConfig{FirstBreakVolumeMultiple: 2.0, SecondBreakVolumeMultiple: 1.5, PositionWeight: 0.3},
+		NShape:       config.NShapeConfig{NPatternScoreThreshold: 0.6, HardStopLoss: -5.0},
+		DragonReturn: config.DragonReturnConfig{StopLossPct: -7.0, TakeProfitPct: 15.0, MaxHoldDays: 20},
 	})
 	cfgMgr.Rules.Laodeng = config.LaodengConfig{Enabled: true, MarketCapMin: 500, PeMax: 15, TurnoverMin: 1.0, TechPenalty: -0.3, WeightScore: 0.15}
 	cfgMgr.Save()
@@ -190,8 +190,8 @@ func TestFullPipelineMock(t *testing.T) {
 	rpt.LogSignal("POS001", "600519", "贵州茅台", "做多", "Dragon", 1480, 10, 5)
 	rpt.LogSignal("POS002", "688256", "寒武纪", "做多", "DoubleBump", 118, 12, 6)
 	positions := rpt.HeldPositionCodes()
-	wlMgr.Add("002230")
-	watchlist := wlMgr.List()
+	wlMgr.Add("", "002230")
+	watchlist := wlMgr.List("")
 
 	t.Logf("持仓: %v", positions)
 	t.Logf("自选: %v", watchlist)
@@ -371,7 +371,7 @@ func TestFullPipelineMock(t *testing.T) {
 	// ─── Step 3: D1Scorer ───
 	t.Logf("\n=== [3/6] D1Scorer (无LLM→默认0分) ===")
 	d1Scorer := combat_agent.NewD1Scorer(nil, "")
-	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData, nil)
+	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData)
 	t.Logf("  D1评分: %d只", len(d1Scores))
 	for code, ds := range d1Scores {
 		if ds.Score != 0 {

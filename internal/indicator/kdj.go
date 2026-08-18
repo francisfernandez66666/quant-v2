@@ -1,0 +1,52 @@
+// KDJ 随机指标（9,3,3，通达信口径）。
+package indicator
+
+// KDJPoint 单根K线的 KDJ 三值。
+type KDJPoint struct {
+	RSV float64 // 未成熟随机值
+	K   float64
+	D   float64
+	J   float64 // J = 3K − 2D
+}
+
+// KDJ 计算 KDJ 序列（默认 9,3,3）。
+// RSV 以最近 n 根高低价区间衡量收盘位置；区间为 0（最高==最低）时 RSV=50（中性）。
+// K/D 初始值 50，按 1/3 平滑递推。序列从头即有值。
+// （KDJ computes the KDJ series (default 9,3,3). RSV=50 when the n-bar range is zero.
+// K/D start at 50 and smooth with a 1/3 factor.）
+func KDJ(closes, highs, lows []float64, n, m1, m2 int) []KDJPoint {
+	out := make([]KDJPoint, len(closes))
+	if n <= 0 || m1 <= 0 || m2 <= 0 || len(closes) == 0 {
+		return out
+	}
+	k, d := 50.0, 50.0
+	for i := range closes {
+		lo, hi := lows[i], highs[i]
+		from := 0
+		if i-n+1 > from {
+			from = i - n + 1
+		}
+		for j := from; j <= i; j++ {
+			if lows[j] < lo {
+				lo = lows[j]
+			}
+			if highs[j] > hi {
+				hi = highs[j]
+			}
+		}
+		rsv := 50.0
+		if hi != lo {
+			rsv = (closes[i] - lo) / (hi - lo) * 100
+		}
+		k = k*(1-1/float64(m1)) + rsv/float64(m1)
+		d = d*(1-1/float64(m2)) + k/float64(m2)
+		out[i] = KDJPoint{RSV: rsv, K: k, D: d, J: 3*k - 2*d}
+	}
+	return out
+}
+
+// KDJDefault 以默认参数（9,3,3）计算 KDJ。
+// （KDJDefault computes KDJ with the default 9,3,3 parameters.）
+func KDJDefault(closes, highs, lows []float64) []KDJPoint {
+	return KDJ(closes, highs, lows, 9, 3, 3)
+}

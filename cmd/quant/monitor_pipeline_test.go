@@ -67,9 +67,9 @@ func TestMonitorPipelineStages(t *testing.T) {
 	cfgMgr := config.NewManager(filepath.Join(dir, "config.json"))
 	cfgMgr.SetStrategyConfig(&config.StrategyConfig{
 		Dragon:       config.DragonConfig{F1SealWeight: 0.30, F2ResonanceWeight: 0.25, F3PremiumWeight: 0.25, F4RsWeight: 0.20, PullbackMaxPct: 5.0},
-		DoubleBump:   config.DoubleBumpConfig{FirstBreakVolumeMultiple: 2.0, SecondBreakVolumeMultiple: 1.5, AdjustDaysMax: 10, PositionWeight: 0.3},
-		NShape:       config.NShapeConfig{NPatternScoreThreshold: 0.6, NShapeD1Threshold: 0.5, HardStopLoss: -5.0},
-		DragonReturn: config.DragonReturnConfig{MinPullbackPct: -15.0, MaxPullbackPct: -5.0, StopLossPct: -7.0, TakeProfitPct: 15.0, MaxHoldDays: 20},
+		DoubleBump:   config.DoubleBumpConfig{FirstBreakVolumeMultiple: 2.0, SecondBreakVolumeMultiple: 1.5, PositionWeight: 0.3},
+		NShape:       config.NShapeConfig{NPatternScoreThreshold: 0.6, HardStopLoss: -5.0},
+		DragonReturn: config.DragonReturnConfig{StopLossPct: -7.0, TakeProfitPct: 15.0, MaxHoldDays: 20},
 	})
 	cfgMgr.Rules.Laodeng = config.LaodengConfig{Enabled: true, MarketCapMin: 500, PeMax: 15, TurnoverMin: 1.0, TechPenalty: -0.3, WeightScore: 0.15}
 	cfgMgr.Save()
@@ -164,7 +164,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 	r2 := runStage("2_D1Scorer", func() (bool, string) {
 		sr := engine.Evaluate(context.Background(), mockEvents, positions, nil)
 		d1 := combat_agent.NewD1Scorer(nil, "")
-		scores := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData, nil)
+		scores := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData)
 		var codes []string
 		for code := range scores {
 			codes = append(codes, code)
@@ -224,7 +224,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 		sr := engine.Evaluate(context.Background(), mockEvents, positions, nil)
 		vb := sAgent.Verify(sr.HotSectors)
 		d1 := combat_agent.NewD1Scorer(nil, "")
-		d1s := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData, nil)
+		d1s := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData)
 		input := combat_agent.ScanInput{
 			Sectors: vb, L1Score: sr.L1Score, L1Blocked: sr.L1Blocked,
 			MarketData: sr.MarketData, D1Scores: d1s,
@@ -279,7 +279,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 		sr := engine.Evaluate(context.Background(), mockEvents, positions, nil)
 		vb := sAgent.Verify(sr.HotSectors)
 		d1 := combat_agent.NewD1Scorer(nil, "")
-		d1s := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData, nil)
+		d1s := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData)
 		sigs := cAgent.ScanLong(combat_agent.ScanInput{
 			Sectors: vb, L1Score: sr.L1Score, L1Blocked: sr.L1Blocked,
 			MarketData: sr.MarketData, D1Scores: d1s,
@@ -321,7 +321,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 		vb := sAgent.Verify(sr.HotSectors)
 		ve := sAgent.Verify(sr.BearSectors)
 		d1 := combat_agent.NewD1Scorer(nil, "")
-		d1s := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData, nil)
+		d1s := d1.BatchScore(sr.ScoringPool, sr.Events, sr.MarketData)
 		bs := cAgent.ScanLong(combat_agent.ScanInput{
 			Sectors: vb, L1Score: sr.L1Score, L1Blocked: sr.L1Blocked,
 			MarketData: sr.MarketData, D1Scores: d1s,

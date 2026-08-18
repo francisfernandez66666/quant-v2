@@ -74,16 +74,31 @@ class MainActivity : AppCompatActivity() {
                 return assetLoader.shouldInterceptRequest(request.url)
             }
 
-            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
-                // 首次打开：若未设置过服务器地址且配置了默认值，则写入 localStorage 预填
+            // WebView 内 JS 的 Notification API 需要 WebChromeClient.onShowNotification 才会显示系统通知
+            // 同时把 JS console.log 转发到 Android logcat（调试定位用）
+            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                // 每次页面开始加载即无条件写入默认服务器地址。
+                // WebView 内嵌资源运行在 appassets 源，若 localStorage 的 server_url 缺失或残留脏值
+                // （如历史版本的 https://www.quant-trading.top），前端 fetch 会打到无效主机而报
+                // "Failed to fetch"。这里保证请求永远指向当前默认地址。
+                // （Unconditionally persist the default server URL before any page load. Without it,
+                // stale/missing localStorage values make the frontend fetch an invalid host from the
+                // appassets origin, surfacing as "Failed to fetch".）
                 if (DEFAULT_SERVER_URL.isNotEmpty()) {
                     view.evaluateJavascript(
-                        "(function(){" +
-                            "if(!localStorage.getItem('liangzai_server_url')){" +
-                            "localStorage.setItem('liangzai_server_url','$DEFAULT_SERVER_URL');" +
-                            "}" +
-                            "})()",
+                        "localStorage.setItem('liangzai_server_url','$DEFAULT_SERVER_URL');",
+                        null
+                    )
+                }
+            }
+
+            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                // 页面加载完成后再次确认默认地址已写入（部分机型 onPageStarted 时机过早，JS 尚未就绪）
+                if (DEFAULT_SERVER_URL.isNotEmpty()) {
+                    view.evaluateJavascript(
+                        "localStorage.setItem('liangzai_server_url','$DEFAULT_SERVER_URL');",
                         null
                     )
                 }

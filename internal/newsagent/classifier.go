@@ -14,43 +14,10 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
-// stage1SystemPrompt Stage1 价值筛选提示词：LLM 从新闻标题中筛选有投资参考价值的重大事件并返回索引数组。
-// （Stage1 value-screening prompt: LLM picks material events from headlines and returns their indices.）
-const stage1SystemPrompt = `你是一个A股新闻价值判断专家。从以下新闻标题中，筛选出具有投资参考价值的重大事件。
-
-重大事件包括但不限于：
-- 业绩预告/财报发布
-- 重大合同/中标/订单
-- 重组/定增/增发/回购/减持
-- 新药获批/临床试验突破
-- 重大政策发布/行业利好利空
-- 龙头公司重大动向
-- 宏观经济数据发布
-
-必须忽略：
-- 机构观点/专家评论/券商研报/分析师看市（如"机构观点""专家看市""后市研判""某券商认为"）
-- 股吧/互动问答/投资者关系/董秘回复
-- 海外市场行情播报（美股/港股/欧股/外汇/黄金/原油盘面）
-- 娱乐、社会、体育、影视、名人八卦、灾难事故等无关新闻
-
-返回JSON数组，只包含有投资价值的条目索引（从1开始），如 [1,3,7]
-如果没有任何有价值的条目，返回 []`
-
-// stage0FilterSystemPrompt Stage0 垃圾过滤：仅保留官方/权威事实新闻，剔除机构观点/互动/海外行情播报。
-// （Stage0 junk filter: keeps only official/authoritative factual news, removing institution/interactive/overseas tape reports.）
-const stage0FilterSystemPrompt = `你是一个A股新闻来源分类器。将以下每条新闻标题分类为四种类型之一：
-- official: 官方/权威信息源发布的事实新闻，包括政府、监管机构、央行、美联储、上市公司公告、财报、行业动态、宏观经济数据发布、政策发布
-- institution: 机构观点/专家评论/券商研报/分析师看市/名家观点
-- interactive: 互动问答/投资者关系/董秘回复/股吧/网友观点
-- overseas: 海外市场行情播报（美股/港股/欧股/外汇/黄金/原油等盘面，不含对A股有直接影响的政策事件）
-
-返回JSON数组，每项格式: {"index": 序号, "type": "official|institution|interactive|overseas"}
-每条新闻都必须给出分类。只输出JSON数组，不要多余文字。`
-
 // stage1Keywords 投资价值关键词表：标题命中任一关键词即视为有板块/宏观投资价值的候选，
-// 用于无 LLM 时的 Stage1 关键词兜底初筛。
+// 用于无 LLM 时的 Stage0 合并判定兜底初筛。
 // （Stage1 investment-value keyword table: any match marks a headline as a sector/macro candidate,
-// used as the keyword fallback for Stage1 when no LLM is available.）
+// used as the keyword fallback when no LLM is available.）
 var stage1Keywords = []string{
 	"业绩", "财报", "预增", "预亏", "扭亏", "翻倍", "涨停", "跌停",
 	"重大合同", "中标", "订单", "重组", "定增", "增发", "回购", "减持", "增持",
@@ -71,27 +38,6 @@ var stage1Keywords = []string{
 func matchKeywords(title string) bool {
 	t := strings.ToLower(title)
 	for _, kw := range stage1Keywords {
-		if strings.Contains(t, strings.ToLower(kw)) {
-			return true
-		}
-	}
-	return false
-}
-
-// junkFallbackKeywords 垃圾过滤兜底关键词：命中即判定为非官方（机构/互动/海外盘面等）。
-// （Junk-filter fallback keywords: a hit classifies the title as non-official (institution/interactive/overseas tape).）
-var junkFallbackKeywords = []string{
-	"机构观点", "专家", "研报", "分析师", "看市", "名家", "后市", "策略会",
-	"互动", "投资者关系", "董秘", "股吧", "网友", "问答", "回复",
-	"美股", "港股", "欧股", "日股", "外汇", "黄金", "原油", "大宗商品",
-	"盘面", "收盘播报", "开盘播报", "快讯", "播报", "转播",
-}
-
-// junkFallback 关键词兜底：标题命中明显非官方特征时返回 true。
-// （junkFallback returns true when the title shows obvious non-official characteristics.）
-func junkFallback(title string) bool {
-	t := strings.ToLower(title)
-	for _, kw := range junkFallbackKeywords {
 		if strings.Contains(t, strings.ToLower(kw)) {
 			return true
 		}
@@ -395,11 +341,13 @@ func (a *Agent) Stage0(items []data.NewsItem) Stage0Result {
 	judgements, failedBatches, err := a.classifyCombined(titles, bodies)
 	res.FailedIdx = failedBatches
 	if err != nil {
-		// 不兜底：整批归一般（仅展示），下一轮轮询可重新拉取
+		// 不兜底（全局原则：LLM 失败不靠兜底，全部走 LLM 重试队列）：
+		// 整批判定失败时**不**归一般（避免把未判定新闻误判为"一般新闻"而丢失），
+		// 而是全部标记 FailedIdx 留在未归因队列，下一轮轮询重新调 LLM 判定。
 		res.Err = err
-		log.Printf("[newsagent] Stage0/1合并失败, 整批 %d 条归一般: %v", len(items), err)
+		log.Printf("[newsagent] Stage0/1合并失败, 整批 %d 条留待重试(入重试队列): %v", len(items), err)
 		for i := range items {
-			res.GeneralIdx = append(res.GeneralIdx, i)
+			res.FailedIdx = append(res.FailedIdx, i)
 		}
 		return res
 	}
@@ -492,7 +440,7 @@ const llmRetryMax = 5
 func (a *Agent) stage0ParseRetry(userMsg string) ([]stage0Judge, error) {
 	var lastErr error
 	for attempt := 1; attempt <= llmRetryMax; attempt++ {
-		resp, err := a.llmClient.Chat(stageCombinedSystemPrompt, userMsg)
+		resp, err := a.llmClient.ChatClassifier(stageCombinedSystemPrompt, userMsg)
 		if err == nil {
 			resp = cleanJSON(resp)
 			if judges, ok := salvageStage0Objects(resp); ok {
@@ -553,153 +501,6 @@ func batchBounds(n, size int) [][2]int {
 		out = append(out, [2]int{start, end})
 	}
 	return out
-}
-
-// classifyJunk LLM 分批分类新闻为 官方/机构/互动/海外 四类，返回垃圾（非 official）索引集合。
-// LLM 失败时降级为关键词过滤（仅剔除明显非官方的机构/互动/海外盘面类），保证流水线不中断。
-// 分批上限 llmBatchSize 条/次，避免超大批次导致 LLM 超时。
-// （classifyJunk classifies news into official/institution/interactive/overseas in batches and returns the
-// non-official indices, falling back to keyword filtering when the LLM fails so the pipeline keeps running.）
-func (a *Agent) classifyJunk(titles []string) (map[int]bool, error) {
-	junk := make(map[int]bool)
-	if len(titles) == 0 {
-		return junk, nil
-	}
-	if a.llmClient == nil {
-		log.Printf("[newsagent] LLM未配置, Stage0垃圾过滤跳过")
-		return junk, nil
-	}
-
-	// 分块处理，每批最多 llmBatchSize 条，控制 prompt 体积避免 LLM 超时
-	for _, b := range batchBounds(len(titles), llmBatchSize) {
-		start, end := b[0], b[1]
-		chunk := titles[start:end]
-
-		// 拼装批内标题列表 prompt
-		var sb strings.Builder
-		for i, t := range chunk {
-			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
-		}
-
-		// LLM 轮询重试：指数退避最多 5 次
-		resp, err := retryLLM(sb.String(), func() (string, error) {
-			return a.llmClient.Chat(stage0FilterSystemPrompt, sb.String())
-		})
-		if err != nil {
-			// 降级策略：LLM 不可用时改用关键词兜底，只剔除明显非官方内容，保证流水线不中断
-			log.Printf("[newsagent] Stage0垃圾过滤 LLM失败, 降级关键词过滤该批%d条: %v", len(chunk), err)
-			for j := start; j < end; j++ {
-				if junkFallback(titles[j]) {
-					junk[j] = true
-				}
-			}
-			continue
-		}
-
-		resp = cleanJSON(resp)
-		var raw []struct {
-			Index int    `json:"index"`
-			Type  string `json:"type"`
-		}
-		if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-			// JSON 解析失败不降级：整批按非官方处理（宁可误杀不放垃圾）
-			log.Printf("[newsagent] Stage0垃圾过滤JSON解析失败(不降级), 该批%d条归一般: %v", len(chunk), err)
-			for j := start; j < end; j++ {
-				junk[j] = true
-			}
-			continue
-		}
-
-		// 非 official 类型的条目标记为垃圾，序号做越界安全过滤
-		for _, r := range raw {
-			if strings.EqualFold(r.Type, "official") {
-				continue
-			}
-			if r.Index >= 1 && r.Index <= end-start {
-				junk[start+r.Index-1] = true
-			}
-		}
-	}
-	log.Printf("[newsagent] Stage0垃圾过滤: %d/%d 条非官方", len(junk), len(titles))
-	return junk, nil
-}
-
-// classifyMaterial Stage1 初筛：优先使用 LLM 判断新闻价值，无 LLM 时回退关键词过滤。
-// 分批处理（llmBatchSize 条/次）。某批 LLM 失败/解析失败时该批全部视为有价值。
-// （classifyMaterial is the Stage1 screen preferring LLM judgement and falling back to keywords without LLM;
-// a failed/parse-failed batch is treated as fully valuable.）
-func (a *Agent) classifyMaterial(titles []string) ([]int, error) {
-	if len(titles) == 0 {
-		return nil, nil
-	}
-	if a.llmClient == nil {
-		log.Printf("[newsagent] LLM未配置, 使用关键词过滤Stage1")
-		var matched []int
-		for i, t := range titles {
-			if matchKeywords(t) {
-				matched = append(matched, i)
-			}
-		}
-		log.Printf("[newsagent] Stage1关键词过滤: %d/%d 条", len(matched), len(titles))
-		return matched, nil
-	}
-
-	var valid []int
-	// 分块处理，每批最多 llmBatchSize 条
-	for _, b := range batchBounds(len(titles), llmBatchSize) {
-		start, end := b[0], b[1]
-		chunk := titles[start:end]
-
-		// 拼装批内标题列表 prompt
-		var sb strings.Builder
-		for i, t := range chunk {
-			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, t))
-		}
-
-		// LLM 轮询重试：最多 3 次，固定间隔 2s
-		var resp string
-		var err error
-		for attempt := 1; attempt <= 3; attempt++ {
-			resp, err = a.llmClient.Chat(stage1SystemPrompt, sb.String())
-			if err == nil {
-				break
-			}
-			if attempt < 3 {
-				log.Printf("[newsagent] Stage1 LLM失败(第%d次), 重试: %v", attempt, err)
-				time.Sleep(2 * time.Second)
-			}
-		}
-		if err != nil {
-			// 该批 LLM 失败：整批视为有价值，避免漏掉重要事件
-			log.Printf("[newsagent] Stage1失败, 该批%d条全部视为有价值: %v", len(chunk), err)
-			for j := start; j < end; j++ {
-				valid = append(valid, j)
-			}
-			continue
-		}
-		resp = cleanJSON(resp)
-
-		var indices []int
-		if err := json.Unmarshal([]byte(resp), &indices); err != nil {
-			// JSON 解析失败：同样整批视为有价值
-			log.Printf("[newsagent] Stage1 JSON解析失败, 该批%d条全部视为有价值: %v", len(chunk), err)
-			for j := start; j < end; j++ {
-				valid = append(valid, j)
-			}
-			continue
-		}
-
-		// 转为0-based + 偏移到全局索引 + 安全过滤
-		for _, idx := range indices {
-			gi := start + idx - 1
-			if gi >= start && gi < end {
-				valid = append(valid, gi)
-			}
-		}
-	}
-
-	log.Printf("[newsagent] Stage1初筛: %d/%d 条有价值", len(valid), len(titles))
-	return valid, nil
 }
 
 // cleanJSON 清理 LLM 返回的 JSON 字符串中的 markdown 代码块标记。

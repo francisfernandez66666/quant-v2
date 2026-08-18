@@ -70,6 +70,10 @@
         <input v-model="llmModel" placeholder="gpt-4o-mini" />
       </div>
       <div class="setting-row">
+        <label>分类专用模型</label>
+        <input v-model="llmClassifierModel" placeholder="留空则用主模型" />
+      </div>
+      <div class="setting-row">
         <label>归因批并发度</label>
         <input v-model.number="llmBatchConcurrency" type="number" min="1" max="16" placeholder="4" />
       </div>
@@ -147,6 +151,7 @@
 import { ref, onMounted } from 'vue'   // Vue 组合式 API：响应式引用 ref 与挂载生命周期钩子
 // Vue Composition API: reactive ref and the onMounted lifecycle hook
 import * as api from '../api/index.js' // 后端 API 调用封装（状态、LLM 配置、战法参数等）
+import { requestPermission, notify as sendNotify } from '../notify.js' // 通知工具：APK 走原生桥，桌面走浏览器 Notification API
 // backend API wrapper (status, LLM config, strategy params etc.)
 
 // ── 服务器连接 ──
@@ -170,6 +175,7 @@ const llmApiUrl = ref('')          // LLM API 地址
 const llmApiKeys = ref('')         // LLM API Key(s)（逗号分隔，多个则轮询分发）
 // LLM API Key(s) (comma-separated; multiple keys round-robin across requests)
 const llmModel = ref('')           // LLM 模型名
+const llmClassifierModel = ref('') // 分类专用模型（Stage0/1 快速分类/初筛，留空用主模型）
 // LLM model name
 const llmBatchConcurrency = ref(4) // 新闻归因 LLM 批量并发度
 // news-attribution LLM batch concurrency
@@ -203,7 +209,6 @@ const strategyGroups = [
       { k: 'f2_resonance_weight', label: 'F2 共振权重', step: 0.05 },
       { k: 'f3_premium_weight', label: 'F3 溢价权重', step: 0.05 },
       { k: 'f4_rs_weight', label: 'F4 强度权重', step: 0.05 },
-      { k: 'f3_one_board_discount', label: '一字板折扣', step: 0.1 },
       { k: 'pullback_max_pct', label: '最大回撤%', step: 0.01 },
       { k: 'breaker_sell_half_pct', label: '炸板减半%', step: 0.01 },
       { k: 'breaker_sell_all_pct', label: '炸板清仓%', step: 0.01 },
@@ -211,6 +216,7 @@ const strategyGroups = [
       { k: 'buy_pullback_sell_all_pct', label: '买入回撤清仓%', step: 0.01 },
       { k: 'buy_day_close_below', label: '买入日收盘低于%', step: 0.01 },
       { k: 'next_open_if_below', label: '次日开盘低于%', step: 0.01 },
+      { k: 'take_profit_pct', label: '止盈%', step: 1 },
     ],
   },
   {
@@ -218,18 +224,10 @@ const strategyGroups = [
     fields: [
       { k: 'first_break_volume_multiple', label: '一突量比', step: 0.1 },
       { k: 'second_break_volume_multiple', label: '二突量比', step: 0.1 },
-      { k: 'big_candle_threshold', label: '大阳线阈值%', step: 0.5 },
       { k: 'adjust_vol_ratio_max', label: '调整量比上限', step: 0.5 },
-      { k: 'pullback_to_entity_pct', label: '回调至实体%', step: 1 },
-      { k: 'adjust_days_min', label: '最短调整天数', step: 1 },
-      { k: 'adjust_days_max', label: '最长调整天数', step: 1 },
       { k: 'position_weight', label: '调整深度权重', step: 0.05 },
       { k: 'ma_weight', label: '均线权重', step: 0.05 },
-      { k: 'sector_weight', label: '板块权重', step: 0.05 },
       { k: 'volume_weight', label: '量能权重', step: 0.05 },
-      { k: 'first_breakout_position_pct', label: '一突仓位', type: 'text' },
-      { k: 'second_breakout_position_pct', label: '二突仓位', type: 'text' },
-      { k: 'third_breakout_position_mode', label: '三突模式', type: 'text' },
       { k: 'double_bump_take_profit_pct', label: '止盈%', step: 0.01 },
     ],
   },
@@ -237,32 +235,12 @@ const strategyGroups = [
     key: 'n_shape', title: 'N 形战法',
     fields: [
       { k: 'n_pattern_score_threshold', label: 'N 形态分阈值', step: 1 },
-      { k: 'n_shape_D1_threshold', label: 'D1 事件阈值', step: 0.05 },
-      { k: 'n_shape_D2_min_full', label: 'D2 满分最低', step: 1 },
-      { k: 'n_shape_D3_over', label: 'D3 超跌阈值', step: 0.05 },
-      { k: 'oversold_pb_ratio', label: '超跌 PB 比', step: 0.05 },
-      { k: 'n_shape_entry_left_pct', label: '左侧入场%', step: 0.05 },
-      { k: 'n_shape_entry_right_pct', label: '右侧入场%', step: 0.05 },
-      { k: 'n_shape_breakout_ratio', label: '突破幅度比', step: 0.05 },
-      { k: 'n_shape_vol_ratio', label: '量比', step: 0.1 },
-      { k: 'n_shape_flag_retreat_pct', label: '旗形回撤%', step: 0.01 },
-      { k: 'n_flag_vol_ratio_max', label: '旗形量比上限', step: 0.1 },
-      { k: 'n_second_break_vol_ratio', label: '二突量比', step: 0.1 },
-      { k: 'n_second_break_macd_red_bars', label: '二突红柱数', step: 1 },
-      { k: 'n_flag_duration_min', label: '旗形最短天数', step: 1 },
-      { k: 'n_flag_duration_max', label: '旗形最长天数', step: 1 },
-      { k: 'n_second_break_time_limit', label: '二突时间限制', type: 'text' },
       { k: 'hard_stop_loss', label: '硬止损%', step: 0.01 },
-      { k: 'sector_gain_pct_min', label: '板块涨幅下限%', step: 0.1 },
     ],
   },
   {
     key: 'dragon_return', title: '龙回头战法',
     fields: [
-      { k: 'min_pullback_pct', label: '最小回调%', step: 0.01 },
-      { k: 'max_pullback_pct', label: '最大回调%', step: 0.01 },
-      { k: 'volume_shrink_ratio', label: '量缩比', step: 0.05 },
-      { k: 'rebound_volume_ratio', label: '反弹量比', step: 0.05 },
       { k: 'stop_loss_pct', label: '止损%', step: 0.01 },
       { k: 'take_profit_pct', label: '止盈%', step: 0.01 },
       { k: 'max_hold_days', label: '最长持仓天数', step: 1 },
@@ -331,23 +309,19 @@ function saveServer() {
   alert('服务器地址已保存')
 }
 
-/** 请求浏览器通知权限并发送测试通知 */
-/** Request browser notification permission and send a test notification */
+/** 请求通知权限并发送测试通知 */
+/** Request notification permission and send a test notification */
 function requestNotify() {
-  if ('Notification' in window) {
-    Notification.requestPermission().then(perm => {
-      if (perm === 'granted') {
-        // 授权通过则弹出测试通知
-        // Permission granted: show a test notification
-        new Notification('量仔期货', { body: '通知授权成功' })
-        alert('通知授权成功')
-      } else {
-        alert('通知被拒绝，请在浏览器设置中开启')
-      }
-    })
-  } else {
-    alert('浏览器不支持通知')
-  }
+  requestPermission().then(perm => {
+    if (perm === 'granted') {
+      // 授权通过则弹出测试通知
+      // Permission granted: show a test notification
+      sendNotify('量仔期货', '通知授权成功')
+      alert('通知授权成功')
+    } else {
+      alert('通知被拒绝，请在系统设置中开启通知')
+    }
+  })
 }
 
 /** 播放测试提示音（660Hz 正弦波，200ms） */
@@ -381,6 +355,7 @@ async function saveLLM() {
       api_keys: llmApiKeys.value.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
       api_url: llmApiUrl.value,
       model: llmModel.value,
+      classifier_model: llmClassifierModel.value,
       batch_concurrency: llmBatchConcurrency.value,
     })
     // 依据是否填写 Key 判断配置是否生效
@@ -413,6 +388,7 @@ onMounted(async () => {
     if (cfg) {
       llmApiUrl.value = cfg.api_url || ''
       llmModel.value = cfg.model || ''
+      llmClassifierModel.value = cfg.classifier_model || ''
       if (cfg.batch_concurrency > 0) llmBatchConcurrency.value = cfg.batch_concurrency
       if (Array.isArray(cfg.api_keys) && cfg.api_keys.length) {
         llmApiKeys.value = cfg.api_keys.join('\n')

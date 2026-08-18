@@ -14,12 +14,13 @@ import (
 
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/indicator"
 	"quant-trading-v2/internal/report"
-	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategies/double_bump"
 	"quant-trading-v2/internal/strategies/dragon"
 	"quant-trading-v2/internal/strategies/dragon_return"
 	"quant-trading-v2/internal/strategies/n_shape"
+	"quant-trading-v2/internal/strategy"
 )
 
 // normalizePctForExit 把配置中"比例"阈值的字段换算为战法退出引擎使用的"百分数"口径。
@@ -70,11 +71,11 @@ func (a *Agent) exitConfigs() (dragonCfg config.DragonConfig, dbCfg config.Doubl
 type exitStrategy int
 
 const (
-	exitStrategyGeneric exitStrategy = iota // 手动/未知战法：走通用移动止盈+超期回退
-	exitStrategyDragon                      // 龙头
-	exitStrategyDoubleBump                  // 双响炮
-	exitStrategyNShape                      // N 形超短
-	exitStrategyDragonReturn                // 龙回头(中线)
+	exitStrategyGeneric      exitStrategy = iota // 手动/未知战法：走通用移动止盈+超期回退
+	exitStrategyDragon                           // 龙头
+	exitStrategyDoubleBump                       // 双响炮
+	exitStrategyNShape                           // N 形超短
+	exitStrategyDragonReturn                     // 龙回头(中线)
 )
 
 // classifyExitStrategy 把持仓记录的 Strategy 字符串归一化为退出引擎枚举。
@@ -108,9 +109,31 @@ func toStrategyKLine(in []data.KLine) []strategy.KLine {
 	return out
 }
 
-// buildExitContext 由持仓与实时行情构造退出评估上下文，并把持久化的阶段最高价合入 EntryMeta。
+// atr14Last 计算日K的 ATR14 末值；K线不足 14 根时返回 0（供信号/退出上下文注入 ATR）。
+// English: computes the trailing ATR14 value from daily bars, or 0 when fewer than 14 bars exist
+// (feeds ATR into signals and exit contexts).
+func atr14Last(klines []data.KLine) float64 {
+	if len(klines) < 14 {
+		return 0
+	}
+	hs := make([]float64, len(klines))
+	ls := make([]float64, len(klines))
+	cs := make([]float64, len(klines))
+	for i, k := range klines {
+		hs[i], ls[i], cs[i] = k.High, k.Low, k.Close
+	}
+	atrs := indicator.ATR(hs, ls, cs, 14)
+	if v := atrs[len(atrs)-1]; v > 0 {
+		return v
+	}
+	return 0
+}
+
+// buildExitContext 由持仓与实时行情构造退出评估上下文，并把持久化的阶段最高价合入 EntryMeta，
+// 同时注入 C4 ATR 动态止损参数（ATR14 + 倍数）。日K不足（<14根）时 ATR=0 → 回退固定百分比。
 // English: builds the exit-evaluation context from a position and live quote, folding the persisted
-// stage high into EntryMeta so the strategy engines use the freshest trailing-stop baseline.
+// stage high into EntryMeta and injecting the C4 ATR dynamic-stop params (ATR14 + multiplier). With too
+// few daily bars (<14) ATR stays 0 so fixed-percentage stops are used.
 func buildExitContext(pos report.ExecLog, price float64, dayK []data.KLine, now time.Time) *strategy.ExitContext {
 	stageHigh := pos.HighestPrice
 	if stageHigh <= 0 {
@@ -134,6 +157,22 @@ func buildExitContext(pos report.ExecLog, price float64, dayK []data.KLine, now 
 		DailyK:    toStrategyKLine(dayK),
 		Now:       now,
 	}
+}
+
+// buildExitContextWithATR 在 buildExitContext 基础上注入 ATR 动态止损（C4）。
+// 有 ≥14 根日K时用 ATR14 末值；否则 ATR=0（回退固定百分比）。
+// English: extends buildExitContext with the C4 ATR dynamic stop — uses the trailing ATR14 value when
+// ≥14 daily bars exist, else ATR=0 (fixed-percentage fallback).
+func buildExitContextWithATR(pos report.ExecLog, price float64, dayK []data.KLine, now time.Time, enabled bool, mult float64) *strategy.ExitContext {
+	ctx := buildExitContext(pos, price, dayK, now)
+	if !enabled || mult <= 0 || len(dayK) < 14 {
+		return ctx
+	}
+	if v := atr14Last(dayK); v > 0 {
+		ctx.ATR = v
+		ctx.ATRStopMult = mult
+	}
+	return ctx
 }
 
 // exitSignalFromResult 把战法退出结果映射为告警信号：P1=清仓（立即） P2=减仓 P3=提示。
@@ -229,7 +268,8 @@ func (a *Agent) CheckPositionsExits(rpt *report.Report, quotes map[string]*data.
 			rpt.RaiseHighest(pos.SignalID, price)
 		}
 
-		ctx := buildExitContext(pos, price, dayKLines[pos.Code], now)
+		atrOn, atrMult := a.atrStopParams()
+		ctx := buildExitContextWithATR(pos, price, dayKLines[pos.Code], now, atrOn, atrMult)
 		if ctx == nil {
 			continue
 		}
@@ -293,6 +333,57 @@ func (a *Agent) EmotionRetreatAlerts(rpt *report.Report, quotes map[string]*data
 			Reason:      fmt.Sprintf("情绪周期进入[%s],市场赚钱效应收缩,建议对持仓 %s(%s) 整体减仓控制风险", phase, pos.Name, pos.Code),
 			GeneratedAt: now,
 		})
+	}
+	return alerts
+}
+
+// BearishAttributionAlerts 利空归因持仓抛售提醒（E4）：对做多持仓逐只检查是否命中
+// 本轮利空板块/利空个股（bearReasons: code → 归因说明），命中即独立于价格止损产出一条
+// "利空归因 → 尽快抛掉"卖出提醒。与 CheckPositionAlerts 的价格止损解耦：只要该持仓被 8b
+// 利空识别归因（如板块利空/利空事件/D1 负面传导），即便尚未跌破止损线也提醒避险。
+// 已做空持仓忽略（利空对做空是顺向）。
+// English: E4 bearish-attribution sell alerts — for each long holding, if it is hit by this round's
+// bearish sector/stock signals (bearReasons: code → attribution), emit an independent "利空归因 →
+// 尽快抛掉" sell reminder, decoupled from the price-based stop-loss in CheckPositionAlerts: a holding
+// hit by 8b bearish attribution (sector bearishness / bearish event / D1-negative propagation) triggers
+// even before its stop-loss line is breached. Short positions are ignored (bearish is their direction).
+func (a *Agent) BearishAttributionAlerts(rpt *report.Report, quotes map[string]*data.StockInfo, bearReasons map[string]string, now time.Time) []Signal {
+	if len(bearReasons) == 0 {
+		return nil
+	}
+	positions := rpt.HeldPositions()
+	if len(positions) == 0 {
+		return nil
+	}
+	var alerts []Signal
+	for _, pos := range positions {
+		if pos.Direction == "做空" {
+			continue
+		}
+		reason, hit := bearReasons[pos.Code]
+		if !hit {
+			continue
+		}
+		price := pos.EntryPrice
+		if q := quotes[pos.Code]; q != nil && q.Price > 0 {
+			price = q.Price
+		}
+		alerts = append(alerts, Signal{
+			ID:          seqID(),
+			Code:        pos.Code,
+			Name:        pos.Name,
+			Strategy:    pos.Strategy,
+			Direction:   "提醒",
+			Action:      "卖出",
+			AlertType:   "利空抛售",
+			Price:       price,
+			Confidence:  1.0,
+			Reason:      "利空归因: " + reason + " → 建议尽快抛售该持仓以规避风险",
+			GeneratedAt: now,
+		})
+	}
+	if len(alerts) > 0 {
+		log.Printf("[combat_agent] BearishAttributionAlerts: %d 持仓命中利空归因 → %d 抛售提醒", len(positions), len(alerts))
 	}
 	return alerts
 }

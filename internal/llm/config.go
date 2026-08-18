@@ -24,8 +24,15 @@ type Config struct {
 	StreamIdleTimeout time.Duration
 
 	// BatchConcurrency LLM 批量分析（Stage0/Stage2 分批）的最大并发批次数量。
-	// <=0 时 New 兜底为 4。API 配额充足时可调高以加快盘前新闻归因吞吐。
+	// <=0 时 New 兜底为 8。API 配额充足时可调高以加快盘前新闻归因吞吐。
 	// （BatchConcurrency caps how many LLM batch calls (Stage0/Stage2 chunked analysis) run concurrently;
-	// <=0 defaults to 4. Raise it when API quota allows to speed premarket news attribution.）
+	// <=0 defaults to 8. Raise it when API quota allows to speed premarket news attribution.）
 	BatchConcurrency int
+
+	// ClassifierModel 可选的新闻归因分类专用模型（Stage0/1 合并调用等"快速分类/初筛"场景）。
+	// 配置轻量/快速模型可显著加快分类吞吐；留空则与主模型一致，行为不变。
+	// （ClassifierModel is an optional dedicated model for news-attribution classification (Stage0/1
+	// combined calls and other cheap classification/screening). A lighter/faster model here speeds up
+	// classification throughput; when empty, the main model is used and behavior is unchanged.）
+	ClassifierModel string
 }

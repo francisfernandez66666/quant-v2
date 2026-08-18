@@ -237,3 +237,69 @@ func TestSellLotOverSell(t *testing.T) {
 		t.Fatal("超过持有量减仓应视为全部卖出并平仓")
 	}
 }
+
+// TestRealizedPnlIncremental 已实现盈亏随加减仓增量累计：
+// 10@100 + 20@100 → 卖50@30（FIFO 从首批扣，已实现=(30-10)*50=1000）→ 再卖50@30（首批剩50全卖，已实现+=(30-10)*50=1000）
+// → 全卖150@30（均价16.67，已实现+=(30-16.67)*150≈2000）→ 累计≈4000。
+func TestRealizedPnlIncremental(t *testing.T) {
+	r := New("")
+	r.LogSignal("p", "000001", "平安", "做多", "x", 10.0, 8, 5)
+	r.AddLot("p", 10.0, 100)
+	r.AddLot("p", 20.0, 100) // 200 股 @ 15
+	l := r.FindBySignalID("p")
+	if math.Abs(l.EntryPrice-15) > 1e-9 {
+		t.Fatalf("前置：加权成本应=15, got %.4f", l.EntryPrice)
+	}
+	// 第一次部分卖出 50 @ 30（FIFO 扣首批 100 中的 50）
+	r.SellLot("p", 30.0, 50)
+	l = r.FindBySignalID("p")
+	if math.Abs(l.RealizedPnl-1000) > 0.01 {
+		t.Errorf("卖50@30 已实现应=1000, got %.2f", l.RealizedPnl)
+	}
+	if l.ExitAt != nil {
+		t.Fatal("部分卖出不应平仓")
+	}
+	// 第二次部分卖出 50 @ 30（首批 100 已剩 50，整批卖完）
+	r.SellLot("p", 30.0, 50)
+	l = r.FindBySignalID("p")
+	if math.Abs(l.RealizedPnl-2000) > 0.01 {
+		t.Errorf("累计已实现应=2000, got %.2f", l.RealizedPnl)
+	}
+	// 剩余 100 @ 20，全卖 @ 30
+	r.SellLot("p", 30.0, 100)
+	l = r.FindBySignalID("p")
+	if l.ExitAt == nil {
+		t.Fatal("全卖应平仓")
+	}
+	want := float64(2000) + (30-20)*100
+	if math.Abs(l.RealizedPnl-want) > 0.01 {
+		t.Errorf("全卖后累计已实现应=%.2f, got %.2f", want, l.RealizedPnl)
+	}
+	if got := r.TotalRealizedPnl(""); math.Abs(got-want) > 0.01 {
+		t.Errorf("TotalRealizedPnl 应=%.2f, got %.2f", want, got)
+	}
+}
+
+// TestRealizedPnlLogExit 直接平仓（LogExit 路径）也累计已实现。
+func TestRealizedPnlLogExit(t *testing.T) {
+	r := New("")
+	r.LogSignal("e", "600000", "浦发", "做多", "x", 10.0, 8, 5)
+	r.AddLot("e", 10.0, 100)
+	r.LogExit("e", 12.0, "手动")
+	if got := r.RealizedPnlFor("e"); math.Abs(got-200) > 0.01 {
+		t.Errorf("LogExit 后已实现应=200, got %.2f", got)
+	}
+}
+
+// TestRealizedPnlSetCostBasis 改成本不改变已实现累计。
+func TestRealizedPnlSetCostBasis(t *testing.T) {
+	r := New("")
+	r.LogSignal("c", "600001", "B", "做多", "x", 10.0, 8, 5)
+	r.AddLot("c", 10.0, 100)
+	r.AddLot("c", 20.0, 100)
+	r.SellLot("c", 30.0, 50) // 已实现 1000
+	r.SetCostBasis("c", 18.0)
+	if got := r.RealizedPnlFor("c"); math.Abs(got-1000) > 0.01 {
+		t.Errorf("改成本不应改变已实现, got %.2f", got)
+	}
+}

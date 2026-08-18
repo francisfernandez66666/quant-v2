@@ -20,6 +20,7 @@ func dragonCfg() *config.DragonConfig {
 		BreakerSellAllPct:      0.10,
 		BuyDayCloseBelow:       0.03,
 		NextOpenIfBelow:        0.05,
+		TakeProfitPct:          10,
 	}
 }
 
@@ -30,9 +31,29 @@ func TestExitBuyPullback(t *testing.T) {
 	if r == nil || r.Priority != strategy.P1 {
 		t.Errorf("深度亏损应触发 P1 退出, got %+v", r)
 	}
-	// 浮盈不应退出
-	if ok := CheckExit(&strategy.ExitContext{CostPrice: 10, CurPrice: 11, Now: time.Now()}, cfg); ok != nil {
-		t.Errorf("盈利不应退出, got %+v", ok)
+	// 小幅浮盈（未达止盈线）不应触发止损退出
+	if ok := CheckExit(&strategy.ExitContext{CostPrice: 10, CurPrice: 10.5, Now: time.Now()}, cfg); ok != nil {
+		t.Errorf("小幅浮盈不应退出, got %+v", ok)
+	}
+}
+
+// TestExitTakeProfit 浮盈达到 TakeProfitPct（C2）→ 止盈落袋。
+func TestExitTakeProfit(t *testing.T) {
+	cfg := dragonCfg()
+	r := CheckExit(&strategy.ExitContext{CostPrice: 10, CurPrice: 11.2, Now: time.Now()}, cfg)
+	if r == nil || r.Reason != "破局龙止盈" {
+		t.Errorf("浮盈≥止盈线应触发止盈, got %+v", r)
+	}
+	// 未达止盈线的浮盈应继续持有
+	if ok := CheckExit(&strategy.ExitContext{CostPrice: 10, CurPrice: 10.9, Now: time.Now()}, cfg); ok != nil {
+		t.Errorf("未达止盈线不应退出, got %+v", ok)
+	}
+	// 止盈阈值未配置时回退默认 10%：+10% 恰好触发
+	cfg2 := *cfg
+	cfg2.TakeProfitPct = 0
+	r2 := CheckExit(&strategy.ExitContext{CostPrice: 10, CurPrice: 11.0, Now: time.Now()}, &cfg2)
+	if r2 == nil || r2.Reason != "破局龙止盈" {
+		t.Errorf("默认止盈 10%% 应触发, got %+v", r2)
 	}
 }
 
@@ -48,12 +69,12 @@ func TestExitBreaker(t *testing.T) {
 	}
 }
 
-// TestExitTimeout 持仓 ≥2 天 → 破局龙超期强制离场。
+// TestExitTimeout 持仓 ≥2 天 → 破局龙超期强制离场（价格未达止盈线时）。
 func TestExitTimeout(t *testing.T) {
 	cfg := dragonCfg()
 	now := time.Now()
 	entry := now.AddDate(0, 0, -3).Format("2006-01-02")
-	r := CheckExit(&strategy.ExitContext{CostPrice: 10, CurPrice: 11, Now: now, EntryAt: entry}, cfg)
+	r := CheckExit(&strategy.ExitContext{CostPrice: 10, CurPrice: 10.5, Now: now, EntryAt: entry}, cfg)
 	if r == nil || r.Reason != "破局龙超期" {
 		t.Errorf("超期应强制离场, got %+v", r)
 	}

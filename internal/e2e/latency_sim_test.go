@@ -155,8 +155,8 @@ func TestRealSpeedRehearsal(t *testing.T) {
 		rig := newRehearsalRig(t, fix, profile, metricsMain, true)
 		rig.eng.SetShortEnabled(true)
 		rig.eng.SetLongEnabled(true)
-		rig.wl.Add("300750")
-		rig.wl.Add("300308")
+		rig.wl.Add("", "300750")
+		rig.wl.Add("", "300308")
 		rig.eng.Run(context.Background(), newsSince(t, fix))
 		mainTimings = append(mainTimings, rig.eng.LastRunTiming())
 	}
@@ -166,8 +166,8 @@ func TestRealSpeedRehearsal(t *testing.T) {
 	consumeRig := newRehearsalRig(t, fix, profile, metricsScore, false)
 	consumeRig.eng.SetShortEnabled(true)
 	consumeRig.eng.SetLongEnabled(true)
-	consumeRig.wl.Add("300750")
-	consumeRig.wl.Add("300308")
+	consumeRig.wl.Add("", "300750")
+	consumeRig.wl.Add("", "300308")
 	since := newsSince(t, fix)
 	consumeRig.eng.Run(context.Background(), since) // 消费新闻
 	var scoreTimings []*engine.RunTiming
@@ -182,8 +182,8 @@ func TestRealSpeedRehearsal(t *testing.T) {
 	rig0 := newRehearsalRig(t, fix, prof0, &simMetrics{}, true)
 	rig0.eng.SetShortEnabled(true)
 	rig0.eng.SetLongEnabled(true)
-	rig0.wl.Add("300750")
-	rig0.wl.Add("300308")
+	rig0.wl.Add("", "300750")
+	rig0.wl.Add("", "300308")
 	rig0.eng.Run(context.Background(), newsSince(t, fix))
 	compute := rig0.eng.LastRunTiming()
 

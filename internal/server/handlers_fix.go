@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
@@ -57,6 +58,10 @@ type fixSignal struct {
 	D1Blocked bool    `json:"d1_blocked"` // D1 负面过滤拦截标记
 	D1Reason  string  `json:"d1_reason"`  // D1 事件分析理由（LLM）
 	D1Event   string  `json:"d1_event"`   // D1 关联事件名称
+
+	// DepthFactors 盘口因子（买卖压力/封单量，免费五档 / Level-2 十档），供前端与战法展示使用
+	// English: order-book factors (bid/ask pressure & seal volumes; 5 levels free / 10 with Level-2)
+	DepthFactors *data.OrderBookFactors `json:"depth_factors,omitempty"`
 }
 
 // scoreToRemindLevel 将总分转换为前端提醒级别。
@@ -98,6 +103,7 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			D1Blocked:    s.D1Blocked,
 			D1Reason:     s.D1Reason,
 			D1Event:      s.D1Event,
+			DepthFactors: s.DepthFactors,
 		}
 		out = append(out, fs)
 	}
@@ -134,24 +140,32 @@ func filterStaleSignals(sigs []combat_agent.Signal, quotes map[string]*data.Stoc
 
 // handleFixSignals 处理 GET /api/signals 请求，返回最新策略信号列表（附实时股价/涨跌幅）。
 func (s *Server) handleFixSignals(w http.ResponseWriter, r *http.Request) {
-	dash := s.agg.Current()
+	dash := s.dashFor(requestUserID(r))
 	if dash == nil {
 		writeJSON(w, 200, []fixSignal{})
 		return
 	}
-	// 逐票拉取一次实时行情（优先 5s 快照，回落行情 API）
+	// 逐票从 5s 快照取实时行情（只读，不回落真打上游，避免轮询打爆数据源）
 	quotes := make(map[string]*data.StockInfo, len(dash.FinalSignals))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	seen := make(map[string]bool, len(dash.FinalSignals))
 	for _, sig := range dash.FinalSignals {
-		if sig.Code == "" {
+		if sig.Code == "" || seen[sig.Code] {
 			continue
 		}
-		if _, ok := quotes[sig.Code]; ok {
-			continue
-		}
-		if info, err := s.quote(sig.Code); err == nil {
-			quotes[sig.Code] = info
-		}
+		seen[sig.Code] = true
+		wg.Add(1)
+		go func(code string) {
+			defer wg.Done()
+			if info := s.quoteDisplay(code); info != nil {
+				mu.Lock()
+				quotes[code] = info
+				mu.Unlock()
+			}
+		}(sig.Code)
 	}
+	wg.Wait()
 	live, pruned := filterStaleSignals(dash.FinalSignals, quotes)
 	if pruned > 0 {
 		log.Printf("[server] /api/signals 撤下 %d 条失效信号(仅展示层,不影响日志/存储)", pruned)
@@ -340,7 +354,8 @@ func (s *Server) handleFixKLine(w http.ResponseWriter, r *http.Request) {
 // 包含：运行时长、当前交易时段（早盘/午盘/非交易）、信号数量、扫描统计信息。
 func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	uptime := time.Since(s.startTime).Round(time.Second).String()
-	dash := s.agg.Current()
+	userID := requestUserID(r)
+	dash := s.dashFor(userID)
 	rawCount := 0
 	matCount := 0
 	hotCount := 0
@@ -382,15 +397,16 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 // handleFixEngineHealth 处理 GET /api/engine_health 请求，返回流程引擎各子系统健康状况。
 // （handleFixEngineHealth handles GET /api/engine_health, returning the health status of each engine subsystem.）
 func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
+	ctrl := s.ctrlFor(requestUserID(r))
 	status := map[string]bool{
-		"news_agent":    s.ctrl != nil && s.ctrl.GetAllNewsEvents() != nil,
-		"strategy_engine": s.ctrl != nil && s.ctrl.GetStageRecords() != nil,
-		"sector_agent":  s.ctrl != nil && s.ctrl.GetHotRecords() != nil,
-		"combat_agent":  s.ctrl != nil && s.ctrl.GetSignalLogs() != nil,
-		"llm":           s.ctrl != nil && s.runtimeLLM != "",
+		"news_agent":    ctrl != nil && ctrl.GetAllNewsEvents() != nil,
+		"strategy_engine": ctrl != nil && ctrl.GetStageRecords() != nil,
+		"sector_agent":  ctrl != nil && ctrl.GetHotRecords() != nil,
+		"combat_agent":  ctrl != nil && ctrl.GetSignalLogs() != nil,
+		"llm":           ctrl != nil && s.runtimeLLM != "",
 		"ths":           s.ths != nil,
 		"fetcher":       s.fetcher != nil,
-		"aggregator":    s.agg != nil,
+		"aggregator":    ctrl != nil,
 	}
 	writeJSON(w, 200, status)
 }
@@ -399,8 +415,9 @@ func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 // 数据来源：消息中心持久化存储（引擎每轮同步 止盈/止损/策略信号/持仓提示）。
 // 未接入引擎时回退到实时看板 + 持仓日志。结果按时间倒序排列。
 func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl != nil {
-		msgs := s.ctrl.GetMessages()
+	ctrl := s.ctrlFor(requestUserID(r))
+	if ctrl != nil {
+		msgs := ctrl.GetMessages()
 		if msgs == nil {
 			msgs = []data.MessageItem{}
 		}
@@ -411,7 +428,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 			if name == "" || name == m.Code {
 				if info, err := s.quote(m.Code); err == nil && info.Name != "" && info.Name != m.Code {
 					name = info.Name
-					s.ctrl.RefreshMessageName(m.Code, name)
+					ctrl.RefreshMessageName(m.Code, name)
 				}
 			}
 			out = append(out, map[string]interface{}{
@@ -432,7 +449,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dash := s.agg.Current()
+	dash := s.dashFor(requestUserID(r))
 	if dash == nil {
 		writeJSON(w, 200, []map[string]interface{}{})
 		return
@@ -489,19 +506,21 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// handleClearAlerts 处理 DELETE /api/alerts 请求：清空消息中心全部消息。
+// handleClearAlerts 处理 DELETE /api/alerts 请求：清空消息中心全部消息（按账号）。
 func (s *Server) handleClearAlerts(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	ctrl := s.ctrlFor(requestUserID(r))
+	if ctrl == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
-	s.ctrl.ClearMessages()
+	ctrl.ClearMessages()
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-// handleDeleteAlert 处理 DELETE /api/alerts/{id} 请求：手工删除单条消息。
+// handleDeleteAlert 处理 DELETE /api/alerts/{id} 请求：手工删除单条消息（按账号）。
 func (s *Server) handleDeleteAlert(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	ctrl := s.ctrlFor(requestUserID(r))
+	if ctrl == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
@@ -510,17 +529,18 @@ func (s *Server) handleDeleteAlert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "missing id"})
 		return
 	}
-	s.ctrl.DeleteMessage(id)
+	ctrl.DeleteMessage(id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-// handleSectorHotRecords 处理 GET /api/sector/hot/records 请求，返回当日热点板块轮次记录。
+// handleSectorHotRecords 处理 GET /api/sector/hot/records 请求，返回当日热点板块轮次记录（按账号）。
 func (s *Server) handleSectorHotRecords(w http.ResponseWriter, r *http.Request) {
-	if s.ctrl == nil {
+	ctrl := s.ctrlFor(requestUserID(r))
+	if ctrl == nil {
 		writeJSON(w, 200, []data.HotRecord{})
 		return
 	}
-	recs := s.ctrl.GetHotRecords()
+	recs := ctrl.GetHotRecords()
 	if recs == nil {
 		recs = []data.HotRecord{}
 	}
@@ -551,6 +571,7 @@ type fixHolding struct {
 	MScore        float64 `json:"m_score"`         // 动量策略评分
 TakeProfit    float64    `json:"take_profit"`     // 止盈目标价
 	StopLoss      float64    `json:"stop_loss"`       // 止损价位
+	RealizedPnl   float64    `json:"realized_pnl"`    // 该标的累计已实现盈亏（元）
 	Lots          []report.Lot `json:"lots,omitempty"` // 加仓批次明细
 }
 
@@ -558,23 +579,25 @@ TakeProfit    float64    `json:"take_profit"`     // 止盈目标价
 // 从执行日志中筛选状态为"持仓中"的记录，实时拉取最新股价计算盈亏。
 // 同时关联信号数据，标注持仓是否有活跃信号。
 func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
-	logs := s.rpt.ListFor(requestUserID(r))
+	userID := requestUserID(r)
+	logs := s.rpt.ListFor(userID)
 	holdings := make([]fixHolding, 0)
 	for _, l := range logs {
 		if l.Status != "持仓中" {
 			continue
 		}
-		holdings = append(holdings, s.buildHolding(l))
+		holdings = append(holdings, s.buildHolding(l, userID))
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"holdings":          holdings,
-		"available_balance": 0,
+		"holdings":            holdings,
+		"available_balance":   0,
+		"total_realized_pnl":  s.rpt.TotalRealizedPnl(userID),
 	})
 }
 
 // buildHolding 将一条持仓执行日志组装为前端 fixHolding 格式：
 // 实时拉取股价计算盈亏与当日涨跌，关联聚合器的评分/活跃信号，附上加仓批次明细。
-func (s *Server) buildHolding(l report.ExecLog) fixHolding {
+func (s *Server) buildHolding(l report.ExecLog, userID string) fixHolding {
 	cur := l.EntryPrice
 	chg := 0.0
 	pnl := 0.0
@@ -609,9 +632,10 @@ func (s *Server) buildHolding(l report.ExecLog) fixHolding {
 		StopLossPct:   r2(l.StopLossPct),
 		TakeProfit:    r2(l.EntryPrice * (1 + l.TakeProfitPct/100)),
 		StopLoss:      r2(l.EntryPrice * (1 - l.StopLossPct/100)),
+		RealizedPnl:   r2(l.RealizedPnl),
 		Lots:          holdingLots(l),
 	}
-	dash := s.agg.Current()
+	dash := s.dashFor(userID)
 	if dash != nil {
 		// 优先取 8a/8b 持续打分分数；无打分记录时回退到最终信号置信度
 		if sc, ok := dash.Scores[l.Code]; ok {
@@ -775,7 +799,7 @@ func (s *Server) handleFixAddHoldingLot(w http.ResponseWriter, r *http.Request) 
 	log.Printf("[server] 加仓 %s 价%.3f 量%.0f", code, req.Price, req.Quantity)
 	for _, l := range s.rpt.HeldPositionsFor(uid) {
 		if l.Code == code {
-			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
+			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l, uid)})
 			return
 		}
 	}
@@ -804,7 +828,7 @@ func (s *Server) handleFixSetCost(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[server] 更新成本 %s 成本%.3f", code, req.Price)
 	for _, l := range s.rpt.HeldPositionsFor(uid) {
 		if l.Code == code {
-			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
+			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l, uid)})
 			return
 		}
 	}
@@ -870,7 +894,7 @@ func (s *Server) handleFixSellHolding(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[server] 减仓 %s 价%.3f 量%.0f (剩余持仓)", code, req.Price, req.Quantity)
 	for _, l := range s.rpt.HeldPositionsFor(uid) {
 		if l.Code == code {
-			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l)})
+			writeJSON(w, 200, map[string]interface{}{"holding": s.buildHolding(l, uid)})
 			return
 		}
 	}
@@ -955,7 +979,7 @@ func (s *Server) thsTopFallbackBoards() []data.SectorInfo {
 // 当 LLM 未筛选出任何板块时，用同花顺板块行情表（行业+概念）兜底，取涨幅前十，
 // 每分钟刷新一次实现板块轮动。
 func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
-	dash := s.agg.Current()
+	dash := s.dashFor(requestUserID(r))
 	// 同花顺板块行情表（首屏 top-20，按涨跌幅排序），按名称精确匹配
 	sectorMap := map[string]data.SectorInfo{}
 	thsBoards := s.thsTopFallbackBoards()
@@ -1032,6 +1056,45 @@ func (s *Server) quote(code string) (*data.StockInfo, error) {
 	return s.market.GetRealtimeQuote(code)
 }
 
+// quoteSnapshot 只读行情入口：仅从 fetcher 5s 快照取价，缺失不回落真打上游。
+// 供高频展示接口（/api/signals、/api/snapshot、/api/snapshot/hot 等）使用，
+// 避免前端轮询每次逐票打行情接口造成数据源洪峰（同一份后端结果跨设备一致）。
+// （English: read-only quote from the fetcher 5s snapshot; does NOT fall back to live upstream
+// calls. Used by high-frequency display endpoints so frontend polling never thunders the data
+// sources, keeping results consistent across devices.）
+func (s *Server) quoteSnapshot(code string) *data.StockInfo {
+	if s.fetcher == nil {
+		return nil
+	}
+	snap := s.fetcher.Snapshot()
+	if snap == nil {
+		return nil
+	}
+	si, ok := snap.Stocks[code]
+	if !ok || si == nil || si.Price <= 0 {
+		return nil
+	}
+	return si
+}
+
+// quoteDisplay 展示行情入口：优先读 fetcher 5s 快照（批量、跨页一致），
+// 快照缺失（信号/热门个股刚出现尚未入池）时回落到 TTL 缓存的实时行情（s.quote），
+// 保证 /api/signals、/api/snapshot/hot 等展示接口的现价/涨跌幅始终真实，而非 0.00%/陈旧价。
+// 回落走 dc.GetQuote 的 5s TTL 缓存，同一股票在窗口内只打一次上游，不会造成洪峰。
+// （English: display quote entry: prefers the fetcher 5s snapshot, and falls back to the
+// TTL-cached live quote via s.quote when the stock is missing (a signal/hot stock that just
+// appeared and hasn't joined the pool yet), so price/change are always real instead of 0.00%.）
+func (s *Server) quoteDisplay(code string) *data.StockInfo {
+	if si := s.quoteSnapshot(code); si != nil {
+		return si
+	}
+	si, err := s.quote(code)
+	if err != nil {
+		return nil
+	}
+	return si
+}
+
 // handleFixSnapshot 处理 GET /api/snapshot 请求，返回指定个股或全部自选股的实时快照数据。
 // 支持 ?codes=600519,000001 参数指定代码列表，不传则返回自选股列表中的所有个股。
 func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -1044,8 +1107,8 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]interface{}, 0)
 	for _, code := range stockList {
-		info, err := s.quote(code)
-		if err != nil {
+		info := s.quoteDisplay(code)
+		if info == nil {
 			continue
 		}
 		chg := info.ChangePct
@@ -1067,7 +1130,7 @@ func (s *Server) handleFixSnapshot(w http.ResponseWriter, r *http.Request) {
 // handleFixHotSnapshot 处理 GET /api/snapshot/hot 请求，返回当前有信号的个股实时快照。
 // 从 FinalSignals 中提取个股信息并拉取实时行情，去重后返回。
 func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
-	dash := s.agg.Current()
+	dash := s.dashFor(requestUserID(r))
 	if dash == nil {
 		writeJSON(w, 200, []map[string]interface{}{})
 		return
@@ -1079,10 +1142,10 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[sig.Code] = true
-		info, err := s.quote(sig.Code)
+		info := s.quoteDisplay(sig.Code)
 		price := sig.Price
 		chg := 0.0
-		if err == nil {
+		if info != nil {
 			price = info.Price
 			chg = info.ChangePct
 		}
@@ -1103,7 +1166,7 @@ func (s *Server) handleFixHotSnapshot(w http.ResponseWriter, r *http.Request) {
 // 包含 N-score、Dragon-score、DB-score、DR-score、M-score 五种评分及对应的通过阈值判断。
 // 数据来源为 8a/8b 持续打分（dash.Scores），无打分记录时按 0 处理。
 func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
-	dash := s.agg.Current()
+	dash := s.dashFor(requestUserID(r))
 	codes := s.watchlist.List(requestUserID(r))
 	seen := map[string]bool{}
 	out := make([]map[string]interface{}, 0)
@@ -1130,7 +1193,7 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 			mScore = sc.MomentumScore
 			sigActive = sc.SignalActive
 		}
-		info, _ := s.quote(code)
+		info := s.quoteDisplay(code)
 		name := code
 		price := 0.0
 		chg := 0.0
@@ -1207,7 +1270,34 @@ func (s *Server) handleFixStockLookup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// normalizeNewsTime 把新闻时间统一规范化为 "YYYY-MM-DD HH:MM"（保留到分钟）。
+// handleFixDepth 处理 GET /api/depth/{code} 请求，返回个股盘口快照与派生因子。
+// 免费数据源返回五档（Bids/Asks 按十档预分配，6~10 档为零值）；
+// 战法可读 factors 字段（买卖压力、委比、封单量、价差、报价覆盖范围）。
+func (s *Server) handleFixDepth(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	if code == "" {
+		writeError(w, 400, "code required")
+		return
+	}
+	ob, err := s.market.GetOrderBook(code)
+	if err != nil {
+		writeError(w, 502, "depth unavailable: "+err.Error())
+		return
+	}
+	levels := data.DepthLevels
+	writeJSON(w, 200, map[string]interface{}{
+		"code":       ob.Code,
+		"name":       ob.Name,
+		"price":      ob.Price,
+		"prev_close": ob.PrevClose,
+		"time":       ob.Time,
+		"source":     ob.Source,
+		"bids":       ob.Bids,
+		"asks":       ob.Asks,
+		"levels":     levels,
+		"factors":    ob.Factors(5),
+	})
+}
 // 兼容三种来源格式：已格式化的日期字符串（原样或截断）、epoch 秒（数字或纯数字字符串）、
 // 以及纯日期 "YYYY-MM-DD"。防止任何源的 epoch 秒时间直接透传给前端展示成乱码。
 // normalizeNewsTime coerces a news timestamp into "YYYY-MM-DD HH:MM". It accepts formatted
@@ -1257,8 +1347,31 @@ func newsTimeFromEpoch(sec int64) string {
 //  3. 宏观日历事件：自动生成，影响级别高/中/低，仅显示近 14 天内。
 //
 // 原始新闻（未打标）以 source 区分展示，已打标事件带 direction/sectors/stocks 等标签。
+// newsTTL 资讯接口 TTL 缓存时长：30 秒。
+// 资讯页 3s 轮询时命中缓存，避免每次请求直接打同花顺/新浪新闻源造成数据源洪峰。
+// （English: news endpoint TTL cache duration, 30s. The hotspot page polls every 3s; the cache
+// absorbs the bursts so the news sources are not hit on every request.）
+const newsTTL = 30 * time.Second
+
 func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "true"
+	cacheKey := "all"
+	if !all {
+		cacheKey = ""
+	}
+
+	// TTL 缓存：30s 内命中直接返回上次 JSON 响应（原始新闻流 + 事件合并结果均被缓存）
+	// English: within the 30s TTL serve the cached JSON; otherwise recompute below.
+	s.newsMu.Lock()
+	if s.newsCache != nil && time.Since(s.newsCacheAt) < newsTTL {
+		if body, ok := s.newsCache[cacheKey]; ok {
+			s.newsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(body)
+			return
+		}
+	}
+	s.newsMu.Unlock()
 
 	// 1. 原始新闻流：同花顺快讯(主) → 新浪(兜底)，标题截断去重合并
 	rawNews := make([]data.NewsItem, 0, 60)
@@ -1284,15 +1397,15 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 
 	// 2. 已打标事件：all=true 读取持久化全量已打标新闻（含中性/一般，跨轮次累计）
 	var events []newsagent.NewsEvent
-	if all && s.ctrl != nil {
-		events = s.ctrl.GetAllNewsEvents()
+	if c := s.ctrlFor(requestUserID(r)); all && c != nil {
+		events = c.GetAllNewsEvents()
 	}
 	// 再补充看板内存中的本轮事件（去重标题），保证实时事件不遗漏
 	seen := make(map[string]bool)
 	for _, e := range events {
 		seen[e.Title] = true
 	}
-	if cur := s.agg.Current(); cur != nil {
+	if cur := s.dashFor(requestUserID(r)); cur != nil {
 		for _, e := range cur.NewsEvents {
 			if !seen[e.Title] {
 				events = append(events, e)
@@ -1394,6 +1507,19 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 		}
 		return di > dj
 	})
+	// 写入 TTL 缓存后返回（仅缓存最近一次 all 与默认视图）
+	// English: store into the TTL cache then respond.
+	if body, err := json.Marshal(out); err == nil {
+		s.newsMu.Lock()
+		if s.newsCache == nil {
+			s.newsCache = make(map[string][]byte)
+		}
+		s.newsCache[cacheKey] = body
+		s.newsCacheAt = time.Now()
+		s.newsMu.Unlock()
+		writeJSON(w, 200, out)
+		return
+	}
 	writeJSON(w, 200, out)
 }
 
@@ -1411,11 +1537,11 @@ func (s *Server) handleFixGetWatchlist(w http.ResponseWriter, r *http.Request) {
 	list := s.watchlist.List(requestUserID(r))
 	out := make([]map[string]interface{}, 0)
 	for _, code := range list {
-		info, err := s.quote(code)
+		info := s.quoteDisplay(code)
 		name := code
 		price := 0.0
 		chg := 0.0
-		if err == nil {
+		if info != nil {
 			name = info.Name
 			price = info.Price
 			chg = info.ChangePct
@@ -1452,7 +1578,15 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"status": "ok", "duplicate": true})
 		return
 	}
-	info, _ := s.quote(code)
+	// 把新自选股纳入 fetcher 5s 监控池，使其后续进入快照（下一次轮询即补齐行情），
+	// 避免本请求真打行情接口（数据源被限流占满时阻塞 → 前端添加失败）。
+	// (Add the symbol to the fetcher's 5s monitor pool so its quote arrives on the next poll;
+	// this avoids a live upstream call in the add request, which would block while the
+	// rate limiter is saturated and make the frontend "add" fail on timeout.)
+	if s.fetcher != nil {
+		s.fetcher.EnsureStock(code)
+	}
+	info := s.quoteDisplay(code)
 	name := code
 	price := 0.0
 	chg := 0.0
@@ -1462,8 +1596,10 @@ func (s *Server) handleFixAddWatchlist(w http.ResponseWriter, r *http.Request) {
 		chg = info.ChangePct
 	}
 	// 加自选后同步消息中心该股的名称（旧名/空名刷新为权威名）
-	if name != "" && s.ctrl != nil {
-		s.ctrl.RefreshMessageName(code, name)
+	if name != "" {
+		if c := s.ctrlFor(requestUserID(r)); c != nil {
+			c.RefreshMessageName(code, name)
+		}
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"status": "ok",

@@ -42,13 +42,26 @@ const BASE = ''
 const STORAGE_KEY = 'liangzai_token'
 const STORAGE_SERVER = 'liangzai_server_url'
 const STORAGE_ACCOUNT = 'liangzai_account'
+const STORAGE_ROLE = 'liangzai_role'
+const STORAGE_PERMS = 'liangzai_perms'
 
 // 从 localStorage 读取服务器基础地址
 // Reads the base server URL from localStorage
 // 说明：所有请求均基于该地址拼接相对路径；未配置时返回空串，表示使用同源相对请求
 // Note: every request joins relative paths onto this base; returns '' when unset, meaning same-origin relative requests
+// 追加兜底：在移动端 WebView（https://appassets.androidplatform.net 同源内嵌）里，
+// 若 localStorage 尚无 server_url（例如首次安装且 JS 初始化早于原生注入），
+// 直接回退到默认服务器地址，避免请求打到 appassets 无效源而报 "Failed to fetch"。
+// (Fallback for the mobile WebView: when running on the appassets origin with no stored
+// server URL yet, use the default server so fetches don't hit the invalid appassets origin.)
 function baseUrl() {
-  return localStorage.getItem(STORAGE_SERVER) || ''
+  const stored = localStorage.getItem(STORAGE_SERVER)
+  if (stored) return stored
+  if (typeof location !== 'undefined' && location.origin &&
+      location.origin.indexOf('appassets.androidplatform.net') >= 0) {
+    return 'https://quant-trading.top'
+  }
+  return ''
 }
 
 // 从 localStorage 读取 JWT 令牌
@@ -67,9 +80,11 @@ function getToken() {
 // @param {string} account    - logged-in account name (may be empty)
 // @param {string} expiresAt  - 令牌过期时间（预留参数，当前未使用，用于将来做本地过期校验）
 // @param {string} expiresAt  - token expiry time (reserved, currently unused, for future local expiry checks)
-function storeAuth(token, account, expiresAt) {
+function storeAuth(token, account, expiresAt, role, perms) {
   localStorage.setItem(STORAGE_KEY, token)
   localStorage.setItem(STORAGE_ACCOUNT, account || '')
+  localStorage.setItem(STORAGE_ROLE, role || 'user')
+  localStorage.setItem(STORAGE_PERMS, JSON.stringify(perms || []))
 }
 
 /**
@@ -81,6 +96,8 @@ function storeAuth(token, account, expiresAt) {
 export function clearAuth() {
   localStorage.removeItem(STORAGE_KEY)
   localStorage.removeItem(STORAGE_ACCOUNT)
+  localStorage.removeItem(STORAGE_ROLE)
+  localStorage.removeItem(STORAGE_PERMS)
 }
 
 /**
@@ -105,6 +122,57 @@ export function isLoggedIn() {
  */
 export function getAccount() {
   return localStorage.getItem(STORAGE_ACCOUNT) || ''
+}
+
+/**
+ * 获取当前登录用户角色（admin / user）
+ * Returns the current logged-in user's role (admin / user)
+ */
+export function getRole() {
+  return localStorage.getItem(STORAGE_ROLE) || 'user'
+}
+
+/**
+ * 获取当前登录用户的权限位列表
+ * Returns the current logged-in user's permission bits
+ * @returns {string[]} 权限位数组
+ */
+export function getPerms() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_PERMS) || '[]')
+  } catch (_) {
+    return []
+  }
+}
+
+/**
+ * 当前用户是否为管理员
+ * Whether the current user is an admin
+ */
+export function isAdmin() {
+  return getRole() === 'admin'
+}
+
+/**
+ * 当前用户是否拥有指定权限位（管理员隐式全部）
+ * Whether the current user holds a permission bit (admin implies all)
+ * @param {string} perm - 权限位名
+ */
+export function hasPerm(perm) {
+  if (isAdmin()) return true
+  return getPerms().indexOf(perm) >= 0
+}
+
+/**
+ * 拉取并缓存当前登录用户信息（角色/权限位）
+ * Fetches and caches the current user's profile (role / permission bits)
+ * @returns {Promise<object>} { id, username, role, perms, enabled }
+ */
+export async function refreshMe() {
+  const me = await request('/api/auth/me')
+  localStorage.setItem(STORAGE_ROLE, me.role || 'user')
+  localStorage.setItem(STORAGE_PERMS, JSON.stringify(me.perms || []))
+  return me
 }
 
 /**
@@ -254,7 +322,7 @@ export async function login(username, password) {
   const data = await res.json()
   // 登录成功后持久化 token 与账号
   // Persist token and account after a successful login
-  storeAuth(data.token, data.account, data.expires_at)
+  storeAuth(data.token, data.account, data.expires_at, data.role, data.perms)
   return data
 }
 
@@ -266,7 +334,7 @@ export async function login(username, password) {
 // 对应后端 GET /api/signals，返回策略信号数组（含 code、action、score 等字段）
 // Maps to backend GET /api/signals; returns an array of strategy signals (code, action, score, etc.)
 export async function fetchSignals() {
-  return request('/api/signals')
+  return request('/api/signals', { timeout: 20000 })
 }
 
 /** 获取个股 K 线数据 */
@@ -289,6 +357,16 @@ export async function fetchMinute(code, scale, count) {
   const s = scale || 1
   const c = count || 241
   return request('/api/minute?code=' + encodeURIComponent(code) + '&scale=' + encodeURIComponent(s) + '&count=' + c)
+}
+
+/** 获取个股盘口快照（买卖五档 + 派生因子） */
+/** Fetch a stock's order-book snapshot (5 bid/ask levels + derived factors) */
+// 对应 GET /api/depth/{code}；返回 { code, name, price, prev_close, time, source, bids, asks, levels, factors }
+// Maps to GET /api/depth/{code}; returns { code, name, price, prev_close, time, source, bids, asks, levels, factors }
+// bids/asks 下标 0 为最优档（买一/卖一），长度 levels（免费源填充前五档，其余零值）
+// bids/asks index 0 is the best level (bid1/ask1), length is `levels` (free source fills five, rest zero)
+export async function fetchDepth(code) {
+  return request('/api/depth/' + encodeURIComponent(code), { timeout: 15000 })
 }
 
 // ── 系统状态 ──
@@ -836,6 +914,131 @@ export async function fetchConsultProMode() {
 // throttled to once every 15 minutes intraday, unlimited pre/post market
 export async function setConsultProMode(enabled) {
   return request('/api/consult/pro-mode', { method: 'PUT', data: { enabled } })
+}
+
+// ── B5 研究候选 ──
+// ── B5 research candidates ──
+
+/** 获取研究处理进度（GET /api/research/progress） */
+/** Fetch the research processing progress (GET /api/research/progress) */
+// 返回 { stocks, ready_stocks, ready_pct, daily_rows, fin_rows, candidates, applied, proposed, db_attached }
+// Returns { stocks, ready_stocks, ready_pct, daily_rows, fin_rows, candidates, applied, proposed, db_attached }
+export async function fetchResearchProgress() {
+  return request('/api/research/progress')
+}
+
+/** 获取研究候选列表（可选按状态过滤） */
+/** Fetch the research candidate list (optionally filtered by status) */
+// 对应 GET /api/research/candidates?status=...，返回 { candidates: [...] }
+// Maps to GET /api/research/candidates?status=...; returns { candidates: [...] }
+export async function fetchResearchCandidates(status) {
+  const q = status ? '?status=' + encodeURIComponent(status) : ''
+  return request('/api/research/candidates' + q)
+}
+
+/** 审批通过候选并应用权重（POST /api/research/candidates/{id}/approve） */
+/** Approve a candidate and apply its weights (POST /api/research/candidates/{id}/approve) */
+export async function approveResearchCandidate(id) {
+  return request('/api/research/candidates/' + encodeURIComponent(id) + '/approve', { method: 'POST' })
+}
+
+/** 驳回候选（POST /api/research/candidates/{id}/reject） */
+/** Reject a candidate (POST /api/research/candidates/{id}/reject) */
+export async function rejectResearchCandidate(id) {
+  return request('/api/research/candidates/' + encodeURIComponent(id) + '/reject', { method: 'POST' })
+}
+
+// ── 用户/账号管理（仅 admin）──
+// ── User / account management (admin only) ──
+
+/** 获取全部用户列表与权限位清单 */
+/** Fetch the full user list and permission-bit catalog */
+// 对应 GET /api/admin/users，返回 { users: [...], perms: [...] }；users 为公开视图（不含密码/令牌）
+// Maps to GET /api/admin/users; returns { users: [...], perms: [...] }; users are public views (no password/token)
+export async function fetchAdminUsers() {
+  return request('/api/admin/users')
+}
+
+/** 创建用户（POST /api/admin/users） */
+/** Create a user (POST /api/admin/users) */
+export async function createAdminUser(data) {
+  return request('/api/admin/users', { method: 'POST', data })
+}
+
+/** 设置用户角色（POST /api/admin/users/{id}/role） */
+/** Set a user's role (POST /api/admin/users/{id}/role) */
+export async function setAdminUserRole(id, role) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/role', { method: 'POST', data: { role } })
+}
+
+/** 整体覆盖用户权限位（POST /api/admin/users/{id}/perms） */
+/** Replace a user's permission bits (POST /api/admin/users/{id}/perms) */
+export async function setAdminUserPerms(id, perms) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/perms', { method: 'POST', data: { perms } })
+}
+
+/** 重置用户密码（POST /api/admin/users/{id}/password） */
+/** Reset a user's password (POST /api/admin/users/{id}/password) */
+export async function setAdminUserPassword(id, password) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/password', { method: 'POST', data: { password } })
+}
+
+/** 启用/禁用用户（POST /api/admin/users/{id}/enabled） */
+/** Enable/disable a user (POST /api/admin/users/{id}/enabled) */
+export async function setAdminUserEnabled(id, enabled) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/enabled', { method: 'POST', data: { enabled } })
+}
+
+/** 设置账号有效期（POST /api/admin/users/{id}/expiry，expires_days=0 表示永久） */
+/** Set an account expiry (POST /api/admin/users/{id}/expiry; expires_days=0 means permanent) */
+export async function setAdminUserExpiry(id, expiresDays) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/expiry', { method: 'POST', data: { expires_days: expiresDays } })
+}
+
+/** 删除用户（DELETE /api/admin/users/{id}，管理员不可删） */
+/** Delete a user (DELETE /api/admin/users/{id}; the admin account cannot be deleted) */
+export async function deleteAdminUser(id) {
+  return request('/api/admin/users/' + encodeURIComponent(id), { method: 'DELETE' })
+}
+
+/** 读取指定账号战法参数（GET /api/admin/users/{id}/config/strategy） */
+export async function fetchAdminStrategyConfig(id) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/strategy')
+}
+
+/** 保存指定账号战法参数（POST /api/admin/users/{id}/config/strategy） */
+export async function setAdminStrategyConfig(id, cfg) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/strategy', { method: 'POST', data: cfg })
+}
+
+/** 读取指定账号 D1 规则（GET /api/admin/users/{id}/config/d1） */
+export async function fetchAdminD1Config(id) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/d1')
+}
+
+/** 保存指定账号 D1 规则（POST /api/admin/users/{id}/config/d1） */
+export async function setAdminD1Config(id, cfg) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/d1', { method: 'POST', data: cfg })
+}
+
+/** 读取指定账号做多/做空开关（GET /api/admin/users/{id}/config/longshort） */
+export async function fetchAdminLongShortConfig(id) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/longshort')
+}
+
+/** 保存指定账号做多/做空开关（POST /api/admin/users/{id}/config/longshort） */
+export async function setAdminLongShortConfig(id, cfg) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/longshort', { method: 'POST', data: cfg })
+}
+
+/** 读取指定账号 LLM 配置（GET /api/admin/users/{id}/config/llm） */
+export async function fetchAdminLLMConfig(id) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/llm')
+}
+
+/** 保存指定账号 LLM 配置（POST /api/admin/users/{id}/config/llm） */
+export async function setAdminLLMConfig(id, cfg) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/llm', { method: 'POST', data: cfg })
 }
 
 

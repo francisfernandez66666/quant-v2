@@ -52,7 +52,10 @@
         </div>
         <!-- 展开的 分时区（全宽，位于该行下方）（Expanded K-line area, full width, below the row）-->
         <div v-if="klineOpenCode === e.code" class="ev-kline-row">
-          <KLineChart :key="e.code" :code="e.code" :name="e.name" />
+          <div class="kline-flex">
+            <div class="kline-main"><KLineChart :key="e.code" :code="e.code" :name="e.name" /></div>
+            <div class="depth-side"><DepthPanel :code="e.code" :name="e.name" /></div>
+          </div>
         </div>
       </div>
       </div>
@@ -91,6 +94,8 @@ import * as api from '../api/index.js'                             // 后端 API
 // backend API wrapper: status/snapshot/watchlist/evaluations endpoints
 import KLineChart from '../components/KLineChart.vue'              // 分时图组件（展开行展示）
 // K-line chart component (shown in expanded rows)
+import DepthPanel from '../components/DepthPanel.vue'              // 盘口面板（展开行展示，买卖五档）
+// order-book panel (shown in expanded rows, 5 bid/ask levels)
 
 // ── 响应式状态 ──
 // ── Reactive state ──
@@ -452,6 +457,13 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 }
 .btn-kline:hover { border-color: #4fc3f7; color: #4fc3f7; }
 .ev-kline-row { padding: 8px 12px; background: #16162a; border-bottom: 1px solid #1a1a26; }
+.kline-flex { display: flex; gap: 12px; align-items: stretch; }
+.kline-main { flex: 1 1 auto; min-width: 0; }
+.depth-side { flex: 0 0 300px; }
+@media (max-width: 720px) {
+  .kline-flex { flex-direction: column; }
+  .depth-side { flex: 1 1 auto; }
+}
 .sortable { cursor: pointer; user-select: none; }
 .sortable:hover { color: #ccc; }
 .btn-remove {

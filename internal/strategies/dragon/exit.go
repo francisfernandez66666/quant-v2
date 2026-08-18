@@ -8,8 +8,8 @@ import (
 )
 
 // CheckExit 判断破局龙策略是否触发退出信号。（CheckExit decides whether the Dragon strategy should exit.）
-// 检查顺序：买入回撤（全出/半仓）→ 炸板回落（跌破封板价）→ 买入日收盘不佳 → 次日开盘不及预期 → 超期退出。（Checks in order:
-// post-buy pullback (all/half) → broken-seal retreat → bad close on entry day → weak next-day open → timeout.）
+// 检查顺序：止盈 → 买入回撤（全出/半仓）→ 炸板回落（跌破封板价）→ 买入日收盘不佳 → 次日开盘不及预期 → 超期退出。（Checks in order:
+// take-profit → post-buy pullback (all/half) → broken-seal retreat → bad close on entry day → weak next-day open → timeout.）
 // 返回 nil 表示继续持有。（Returns nil to keep holding.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
@@ -22,11 +22,27 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 	// 持仓盈亏率（正=盈利）（Holding P&L percentage, positive = profit）
 	pnlPct := (price - cost) / cost * 100
 
-	// 买入后回撤：跌超 BuyPullbackSellAllPct 全出；跌超 BuyPullbackSellHalfPct 半仓减（Post-buy pullback: below SellAll → exit all, below SellHalf → exit half）
-	if pnlPct <= -cfg.BuyPullbackSellAllPct {
+	// 止盈（C2）：浮盈达到 TakeProfitPct（默认 10%）落袋。龙战法为超短策略，
+	// 封板利润到目标即锁定，避免次日回吐（Take profit: once unrealized gain hits
+	// TakeProfitPct (default 10%), lock it in — an ultra-short dragon shouldn't give back gains).
+	tp := cfg.TakeProfitPct
+	if tp <= 0 {
+		tp = 10
+	}
+	if pnlPct >= tp {
+		return &strategy.ExitResult{Reason: "破局龙止盈", Priority: strategy.P2}
+	}
+
+	// 买入后回撤（C4 ATR 动态止损优先）：止损距离取 ATR×mult（启用且日K充足时），
+	// 否则回退固定百分比；跌超全出线清仓、跌超半仓线减半。
+	// English: post-buy pullback — the C4 ATR dynamic stop (ATR×mult when enabled and bars suffice) takes
+	// precedence over the fixed percent; below the all-out line → exit all, below the half line → exit half.
+	sellAll := ctx.ATRStopPct(cfg.BuyPullbackSellAllPct)
+	sellHalf := ctx.ATRStopPct(cfg.BuyPullbackSellHalfPct)
+	if pnlPct <= -sellAll {
 		return &strategy.ExitResult{Reason: "买入回撤全出", Priority: strategy.P1}
 	}
-	if pnlPct <= -cfg.BuyPullbackSellHalfPct {
+	if pnlPct <= -sellHalf {
 		return &strategy.ExitResult{Reason: "买入回撤半仓", Priority: strategy.P2}
 	}
 

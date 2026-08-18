@@ -2,16 +2,12 @@
 # 部署：见 scripts/deploy_seoul.sh。Caddy 自动申请/续期 Let's Encrypt 证书，无需手动管证书。
 #
 # 使用前：
-#   1. 把下面的域名替换成你的真实域名（DNS A 记录指向服务器 EIP）；
-#   2. 把 BASIC_AUTH_USER / BASIC_AUTH_PASS 的 bcrypt 哈希替换到 basic_auth 块。
-#      生成哈希：caddy hash-password --plaintext '你的密码'
+#   1. 把下面的域名替换成你的真实域名（DNS A 记录指向服务器 EIP）。
 #
 # 说明：
-#   - 桌面浏览器访问 https://域名 先弹 basic_auth（页面级口令），通过后显示前端登录页，
-#     再用后端账号登录（后端 JWT 鉴权仍生效，两层保护）。
+#   - 页面级 basic_auth 已移除：前端有自己的登录页，后端 /api/* 由 JWT 鉴权保护。
 #   - 前端（web/dist）静态托管在 /var/www/quant-web，hash 路由无需 SPA fallback。
-#   - /api 前缀（REST + SSE）单独 handle 反代到后端 127.0.0.1:8080，
-#     不套 basic_auth（APK 走 /api 不受页面口令限制）；SSE 长连接天然透传。
+#   - /api 前缀（REST + SSE）单独 handle 反代到后端 127.0.0.1:8080，SSE 长连接天然透传。
 #   - 两个 handle 分支按路径互斥：/api/* → 后端；其余（/、/assets/* 等）→ 静态前端。
 #   - CORS 已由后端 corsMiddleware 全开（*），跨域 APK 走 /api 同样可用。
 
@@ -19,17 +15,14 @@ quant-trading.top {
 	# 传输安全与压缩
 	encode gzip
 
-	# 后端 API / SSE（handle 精确匹配 /api 前缀，剥离后反代，不套 basic_auth）
+	# 后端 API / SSE（handle 精确匹配 /api 前缀，剥离后反代）
 	handle /api/* {
 		reverse_proxy 127.0.0.1:8080
 	}
 
-	# 前端静态资源（其余所有路径；先弹 basic_auth 页面口令）
+	# 前端静态资源（其余所有路径）
 	handle {
 		root * /var/www/quant-web
-		basic_auth {
-			liangzai BCRYPT_HASH_PLACEHOLDER
-		}
 		file_server
 	}
 

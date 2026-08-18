@@ -7,6 +7,7 @@ package combat_agent
 
 import (
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/indicator"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/strategies/double_bump"
 	"quant-trading-v2/internal/strategies/dragon"
@@ -41,23 +42,29 @@ func stockInfoFromMarketData(md *strategy_engine.StockMarketData) *data.StockInf
 	return si
 }
 
-// ma 计算最近 n 根K线的收盘均线。
-// K线数量不足 n 根时按实际数量计算；n<=0 或空列表时返回 0。
-// English: computes the simple moving average of the last n K-line closes; falls back to the available
-// count when K-lines are fewer than n, and returns 0 for n<=0 or an empty list.
+// ma 计算最近 n 根K线的收盘均线（委托指标库 indicator.SMA，末尾值）。
+// K线数量不足 n 根时按实际数量回退计算（SMA 预热期为 NaN，此处回退简单平均）；n<=0 或空列表返回 0。
+// English: last simple moving average of the n K-line closes, delegating to indicator.SMA. Falls back to
+// the available-count average when K-lines are fewer than n (SMA warm-up is NaN), and returns 0 for
+// n<=0 or an empty list.
 func ma(kl []data.KLine, n int) float64 {
-	if len(kl) < n {
-		n = len(kl)
-	}
-	if n <= 0 {
+	if len(kl) == 0 || n <= 0 {
 		return 0
 	}
-	s := 0.0
-	// 取倒数 n 根K线的收盘价累加求平均
-	for _, k := range kl[len(kl)-n:] {
-		s += k.Close
+	closes := make([]float64, len(kl))
+	for i, k := range kl {
+		closes[i] = k.Close
 	}
-	return s / float64(n)
+	smas := indicator.SMA(closes, n)
+	if v := smas[len(smas)-1]; v == v { // 非 NaN：末值即最近 n 根均值
+		return v
+	}
+	// 预热期不足：按实际数量简单平均回退（与原 ma 语义一致）
+	s := 0.0
+	for _, c := range closes {
+		s += c
+	}
+	return s / float64(len(closes))
 }
 
 // avgVol 计算最近 n 根K线的平均成交量。

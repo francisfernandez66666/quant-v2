@@ -10,26 +10,22 @@
 #   SERVER_USER       SSH 用户（默认 root）
 #   SERVER_DOMAIN     域名（Caddy 用，必须已解析到 SERVER_IP；Caddy 首次启动会做 ACME 验证）
 #   LLM_API_KEY       LLM 服务 API Key（写入 /etc/quant.env）
-#   LLM_API_URL       LLM API 地址（可选，默认 https://api.siliconflow.cn）
+#   LLM_API_URL       LLM API 地址（可选，默认 https://api.siliconflow.cn/v1/chat/completions）
 #   LLM_MODEL         LLM 模型名（可选，默认 THUDM/GLM-Z1-9B-0414）
 #   DEPLOY_DIR        服务器代码目录（默认 /opt/quant）
 #   QUANT_DATA_DIR    服务器数据目录（默认 /var/lib/quant-trading-v2）
-#   BASIC_AUTH_USER   网页 basic_auth 用户名（默认 liangzai）
-#   BASIC_AUTH_PASS   网页 basic_auth 密码（必填，用于 Caddy 页面级口令；生成 bcrypt 哈希）
 
 set -euo pipefail
 
 # ── 必填参数校验 ──
 : "${SERVER_IP:?请设置 SERVER_IP（首尔服务器公网 IP）}"
 : "${SERVER_DOMAIN:?请设置 SERVER_DOMAIN（域名，需已解析到 SERVER_IP）}"
-: "${BASIC_AUTH_PASS:?请设置 BASIC_AUTH_PASS（网页访问口令）}"
 SERVER_USER="${SERVER_USER:-root}"
 LLM_API_KEY="${LLM_API_KEY:-}"
-LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn}"
+LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn/v1/chat/completions}"
 LLM_MODEL="${LLM_MODEL:-THUDM/GLM-Z1-9B-0414}"
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/quant}"
 QUANT_DATA_DIR="${QUANT_DATA_DIR:-/var/lib/quant-trading-v2}"
-BASIC_AUTH_USER="${BASIC_AUTH_USER:-liangzai}"
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_DIR"
@@ -42,7 +38,6 @@ echo " IP:     $SERVER_IP"
 echo " 域名:   $SERVER_DOMAIN"
 echo " 目录:   $DEPLOY_DIR (代码) / $QUANT_DATA_DIR (数据)"
 echo " LLM:    $LLM_API_URL / $LLM_MODEL"
-echo " Web:    basic_auth 用户=$BASIC_AUTH_USER"
 echo "=============================================="
 
 # ── 1. 本地交叉编译（linux/amd64，静态链接纯 Go）──
@@ -99,9 +94,6 @@ echo "      上传前端到 /var/www/quant-web..."
 $SSH "sudo rm -rf /var/www/quant-web/* && sudo mkdir -p /tmp/quant-web"
 $SCP -r "$APP_DIR/web/dist/." $SERVER_USER@$SERVER_IP:/tmp/quant-web/
 $SSH "sudo mv /tmp/quant-web/* /var/www/quant-web/ && sudo chown -R caddy:caddy /var/www/quant-web"
-echo "      生成 basic_auth 哈希 ($BASIC_AUTH_USER)..."
-HASH="$($SSH "caddy hash-password --plaintext '$BASIC_AUTH_PASS' | tr -d '\n'")"
-$SSH "sudo sed -i 's|BCRYPT_HASH_PLACEHOLDER|$HASH|' /etc/caddy/Caddyfile"
 $SSH "sudo sed -i 's/YOUR_DOMAIN_HERE.com/$SERVER_DOMAIN/g' /etc/caddy/Caddyfile"
 $SSH "sudo chown -R caddy:caddy /var/log/caddy 2>/dev/null || true"
 $SSH "which caddy >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq caddy)"
@@ -117,7 +109,7 @@ $SSH "sudo systemctl restart caddy"
 # ── 7. 健康检查 ──
 echo "[7/8] 健康检查..."
 sleep 3
-# 后端本机直连检查（不经 Caddy，避免 basic_auth 干扰）
+# 后端本机直连检查（不经 Caddy）
 if $SSH "curl -sf -o /dev/null -m 10 http://127.0.0.1:8080/setup"; then
     echo "  ✓ 后端进程已响应 (127.0.0.1:8080)"
 else
@@ -126,8 +118,8 @@ fi
 # HTTPS 检查（首次 ACME 申请可能要等几秒~几十秒）
 echo "  等待 HTTPS 证书就绪 (最多 60s)..."
 for i in $(seq 1 60); do
-    if $SSH "curl -sf -o /dev/null -m 10 -u '$BASIC_AUTH_USER:$BASIC_AUTH_PASS' https://$SERVER_DOMAIN/"; then
-        echo "  ✓ HTTPS + basic_auth 已就绪: https://$SERVER_DOMAIN/"
+    if $SSH "curl -sf -o /dev/null -m 10 https://$SERVER_DOMAIN/"; then
+        echo "  ✓ HTTPS 已就绪: https://$SERVER_DOMAIN/"
         break
     fi
     sleep 1
@@ -136,9 +128,9 @@ done
 
 echo "=============================================="
 echo " 部署完成。首次登录："
-echo "   1. 浏览器打开 https://$SERVER_DOMAIN （先输 basic_auth: $BASIC_AUTH_USER / 你的口令）"
+echo "   1. 浏览器打开 https://$SERVER_DOMAIN ，直接进前端登录页"
 echo "   2. 前端登录页用后端账号登录（首次部署默认 admin / admin123，请立即改密码）"
-echo "   3. APK 走 /api 不受 basic_auth 影响，直接用账号登录"
+echo "   3. APK 走 /api 直接用账号登录"
 echo " 常用运维："
 echo "   journalctl -u quant -f          # 后端日志"
 echo "   systemctl restart quant         # 重启后端"
