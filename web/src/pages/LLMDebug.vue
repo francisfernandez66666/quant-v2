@@ -22,7 +22,7 @@
     <div v-if="noAgent" class="empty">Agent 未就绪</div>
     <div v-else-if="noData" class="empty">暂无数据，等待下一轮扫描</div>
     <template v-else-if="data">
-      <!-- 概要统计栏（Summary stats bar）-->
+      <!-- 概要统计栏：Stage1 初筛模式（LLM=大模型初筛 / 关键词=规则初筛）、原始/筛选条数、分析时间 -->
       <div class="summary-bar">
         <div class="summary-item">
           <span class="summary-label">Stage1 模式</span>

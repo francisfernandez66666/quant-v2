@@ -16,6 +16,7 @@
 <template>
   <div v-if="visible" class="log-overlay" @click.self="close">
     <div class="log-modal">
+      <!-- 弹窗头部：标题 + 关闭按钮 -->
       <div class="log-header">
         <span class="log-title">📋 日志</span>
         <button class="log-close" @click="close">✕</button>
@@ -99,6 +100,7 @@
         <template v-else>
           <div v-if="llmNoData" class="log-empty">暂无 LLM 分析记录，等待下一轮扫描</div>
           <template v-else-if="llmData">
+            <!-- 批次概要：Stage1 模式 / 原始条数 / 筛选后 / 分析时间 -->
             <div class="summary-bar">
               <div class="summary-item">
                 <span class="summary-label">Stage1 模式</span>
@@ -120,6 +122,7 @@
               </div>
             </div>
 
+            <!-- Stage1 新闻初筛：逐条新闻标题 + 通过/过滤徽标 -->
             <h3 class="section-title">Stage1 · 新闻初筛</h3>
             <div class="stage1-list">
               <div v-for="(title, i) in llmData.raw_titles" :key="i"
@@ -132,6 +135,7 @@
               </div>
             </div>
 
+            <!-- Stage2 LLM 深度分析：每张事件卡片展示方向/评分/板块/个股/理由 -->
             <h3 class="section-title">Stage2 · LLM 分析结果</h3>
             <div v-if="llmData.stage2_events && llmData.stage2_events.length" class="stage2-events">
               <div v-for="(ev, i) in llmData.stage2_events" :key="i" class="event-card">
@@ -230,6 +234,7 @@
         <template v-else>
           <div v-if="sigNoData" class="log-empty">暂无信号批次记录，等待下一轮扫描</div>
           <template v-else-if="sigData">
+            <!-- 批次概要：批次时间 / 原始条数 / 信号数 -->
             <div class="summary-bar">
               <div class="summary-item">
                 <span class="summary-label">批次时间</span>

@@ -4,6 +4,7 @@
 //	子命令：
 //	  full    全量装载：基础信息+交易日历+指数+行情类（baostock 逐票 / tushare 按日）
 //	  daily   仅行情类表（daily/adj_factor/daily_basic/stk_limit，增量）
+//	  adjfactor  专项补齐 adj_factor（复权因子，daily 满但因子缺时用）
 //	  finance 财务类表（baostock 逐(票,年,季)，默认全市场、慢，建议 --codes 研究池）
 //	  bars <ts_code>  回读单只股票的 hfq 日线做校验
 //	  verify 打印各表行数
@@ -36,6 +37,8 @@ var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.d
 // indexCodes 基准/风格指数（超出基准收益用）。
 var indexCodes = []string{"000300.SH", "000905.SH", "000852.SH"}
 
+// main 数据装载入口：解析 flags 与子命令，按 provider 分派到 baostock/tushare 实现，
+// 并完成库打开、校验与各子命令的错误处理。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	dbPath := flag.String("db", defaultDB, "研究 SQLite 库路径")
@@ -87,6 +90,27 @@ func main() {
 		}
 		if err != nil {
 			log.Fatalf("daily 失败: %v", err)
+		}
+	case "adjfactor":
+		// 专项补齐复权因子（baostock）：daily 已满但 adj_factor 单独缺失时使用。
+		// 支持 --codes 研究池文件（每行一个 ts_code），只补清单内股票。
+		// （adjfactor backfills the adj_factor table when daily is current but factors are missing.
+		// With --codes it processes only the listed stocks.）
+		codes := make([]string, 0)
+		var err error
+		if *codesFile != "" {
+			codes, err = readCodesFile(*codesFile)
+			if err != nil {
+				log.Fatalf("读取 codes 文件失败: %v", err)
+			}
+		} else {
+			codes, err = db.StockCodes()
+			if err != nil {
+				log.Fatalf("读取股票列表失败: %v", err)
+			}
+		}
+		if err := bsLoadAdjFactor(db, bsClient, codes, *start, *end); err != nil {
+			log.Fatalf("adjfactor 失败: %v", err)
 		}
 	case "finance":
 		codes, err := db.StockCodes()

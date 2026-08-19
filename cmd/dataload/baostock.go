@@ -335,6 +335,68 @@ func bsInsertFinancial(db *store.DB, code string, profit, growth, balance []data
 	return err
 }
 
+// bsLoadAdjFactor 专项补齐 adj_factor 表（复权因子）。
+// 背景：daily 表已最新但 adj_factor 可能单独缺失（如 baostock 对 adjust_factor 接口失败时）。
+// bsLoadStockTables 的断点只看 daily 表，daily 满了会跳过整只股票，补不了缺失的因子。
+// 本函数按 adj_factor 单票断点续拉：一次调用覆盖整段区间，空则全量拉，非空则从最近之后补。
+// （bsLoadAdjFactor backfills the adj_factor table on its own. bsLoadStockTables resumes by the
+// daily table only, so a full daily table skips the stock and leaves missing factors. This walks
+// the adj_factor table's own per-stock resume point; one call fetches the whole span.）
+func bsLoadAdjFactor(db *store.DB, c *data.BaostockClient, codes []string, start, end string) error {
+	log.Printf("[dataload] adj_factor 补齐开始：%d 只股票（baostock 逐票单次全区间）", len(codes))
+	tStart := time.Now()
+	done, inserted, skipped := 0, 0, 0
+	const maxRetry = 3
+	for _, code := range codes {
+		maxD, err := db.MaxTradeDate("adj_factor", code)
+		if err != nil {
+			return err
+		}
+		from := start
+		if maxD != "" {
+			from = nextDay(maxD)
+			if from > end {
+				skipped++
+				continue // 该票因子已是最新
+			}
+		}
+		bsCode := data.TsCodeToBS(code)
+		adj, err := c.AdjFactor(bsCode, toISO(from), toISO(end))
+		for attempt := 0; err != nil && attempt < maxRetry; attempt++ {
+			log.Printf("[dataload] %s adj_factor 重试 %d/%d: %v", code, attempt+1, maxRetry, err)
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			adj, err = c.AdjFactor(bsCode, toISO(from), toISO(end))
+		}
+		if err != nil {
+			log.Printf("[dataload] %s adj_factor 重试 %d 次仍失败，跳过: %v", code, maxRetry, err)
+			skipped++
+			continue
+		}
+		rows := make([]map[string]any, 0, len(adj))
+		for _, r := range adj {
+			rows = append(rows, map[string]any{
+				"ts_code": code, "trade_date": normDate(r.S("dividoperatedate")),
+				"adj_factor": r.F("backadjustfactor"),
+			})
+		}
+		if len(rows) > 0 {
+			n, err := db.InsertRows("adj_factor", store.TableColumns("adj_factor"), rows)
+			if err != nil {
+				return fmt.Errorf("%s adj_factor insert: %v", code, err)
+			}
+			inserted += int(n)
+		}
+		done++
+		if done%500 == 0 || done == len(codes) {
+			log.Printf("[dataload] adj_factor 进度 %d/%d，累计 %d 行，跳过 %d，耗时 %v",
+				done, len(codes), inserted, skipped, time.Since(tStart).Round(time.Second))
+		}
+	}
+	log.Printf("[dataload] adj_factor 完成：%d 只，累计 %d 行，跳过 %d，耗时 %v",
+		len(codes), inserted, skipped, time.Since(tStart).Round(time.Second))
+	return nil
+}
+
 // optF 取行字段；空值/缺失返回 nil（写库为 NULL），有值返回 float64。
 // （optF returns the float value of a cell, or nil when empty/missing so it is stored as NULL.）
 func optF(r data.TushareRow, key string) any {

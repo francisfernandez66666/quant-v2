@@ -316,7 +316,7 @@ const activeTab = ref('candidates')
 // active sub-tab
 const editingName = ref({}) // 战法 id → 是否在改名
 const nameDraft = ref({})   // 战法 id → 改名草稿
-const backtestEnabled = ref(false) // 全量回测全局开关
+const backtestEnabled = ref(false) // 全量回测全局开关（保存到 rules.scheduler.nightly.backtest_enabled）
 
 /** 百分比显示（0~100 取整） */
 /** Percentage display (0~100, rounded) */

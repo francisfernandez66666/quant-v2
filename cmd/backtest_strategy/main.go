@@ -65,6 +65,8 @@ type adapter interface {
 
 // ── double_bump 适配器（纯日K完整回放） ──
 
+// doubleBumpAdapter 双凸战法适配器：直接复用 double_bump.EvaluateReal 用日K完整回放，
+// 仅需注入配置（权重/倍数必须非零，否则永不触发）。
 type doubleBumpAdapter struct {
 	st  *double_bump.DoubleBumpStrategy
 	cfg *config.DoubleBumpConfig
@@ -360,6 +362,7 @@ func toStrategyKLine(klines []data.KLine) []strategy.KLine {
 
 // ── 回测运行 ──
 
+// options 回测命令行参数（数据库、日期区间、战法选择与近似开关）。
 type options struct {
 	dbPath    string
 	start     string
@@ -641,6 +644,7 @@ func printReport(s *summary, name string, stockCount int) {
 
 // config 包的默认战法参数（供适配器构造，见 defaultConfig）。
 
+// main 回测入口：解析参数并运行，失败时打印日志退出。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	o := parseFlags()

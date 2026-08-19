@@ -25,6 +25,8 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// defaultDB 默认研究 SQLite 库路径（~/.quant-trading-v2/trading.db）。
+// （defaultDB is the default research SQLite DB path.）
 var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.db")
 
 func main() {
@@ -110,6 +112,9 @@ func cmdSectorRebuild(db *store.DB, start, end string) {
 	_ = lus
 }
 
+// runFactor 执行因子验证主流程：装配研究池面板 → 对全部已注册因子逐个体算
+// IC/IR/分层单调性报告 → 输出 report.json + report.html。
+// （runFactor validates every registered factor over the research pool and writes reports.）
 func runFactor(db *store.DB, start, end string, horizon, quantiles, minStocks int, codesFile, outDir string) {
 	codes, err := db.StockCodes()
 	if codesFile != "" {

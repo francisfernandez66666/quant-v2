@@ -70,6 +70,8 @@ func SpearmanIC(f, r []float64) float64 {
 	return pearson(rf, rr)
 }
 
+// pairsF 抽出配对的因子值序列（保持与 pairsR 对齐，供 rank 排序）。
+// （pairsF extracts the factor-value series from aligned pairs.）
 func pairsF(p []pair) []float64 {
 	out := make([]float64, len(p))
 	for i := range p {
@@ -78,6 +80,8 @@ func pairsF(p []pair) []float64 {
 	return out
 }
 
+// pairsR 抽出配对的前瞻收益序列（与 pairsF 同序对齐）。
+// （pairsR extracts the forward-return series from aligned pairs.）
 func pairsR(p []pair) []float64 {
 	out := make([]float64, len(p))
 	for i := range p {

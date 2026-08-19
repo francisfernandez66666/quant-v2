@@ -811,7 +811,6 @@ func (s *Server) handleNewsShowAllToggle(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn(userID)})
 }
 
-// handleNewsShowAllStatus 处理 GET /api/news/showall：返回"资讯显示全部"开关状态。
 // handleEngineInitStatus 处理 GET /api/engine/init-status：返回指定账号的引擎初始化进度。
 // 前端登录后轮询该接口显示进度条 + 预计时间。
 // English: handles GET /api/engine/init-status — returns the account's engine init progress
@@ -838,6 +837,7 @@ func (s *Server) handleEngineInitStatus(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, 200, resp)
 }
 
+// handleNewsShowAllStatus 处理 GET /api/news/showall：返回"资讯显示全部"开关状态。
 func (s *Server) handleNewsShowAllStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"news_show_all": s.newsShowAllOn(requestUserID(r))})
 }

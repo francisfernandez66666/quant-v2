@@ -9,7 +9,7 @@
   <div class="admin-page">
     <h2>用户管理</h2>
 
-    <!-- 开户表单 -->
+    <!-- 开户表单：填写用户名/密码/角色/权限/有效期，提交后创建新账号 -->
     <div class="card">
       <div class="card-header">开通新账号</div>
       <div class="form-grid">
@@ -54,7 +54,7 @@
       <span v-if="createMsg" :class="['feedback', createMsgType]">{{ createMsg }}</span>
     </div>
 
-    <!-- 用户列表 -->
+    <!-- 用户列表：每行一个账号，展示角色/启用状态/有效期，并提供改角色、重置密码、启禁用、设有效期、配战法参数、删除等操作 -->
     <div class="card" v-if="users.length">
       <div class="card-header">账号列表</div>
       <div class="user-table">
@@ -94,7 +94,7 @@
       </div>
     </div>
 
-    <!-- 代配战法参数弹层 -->
+    <!-- 代配战法参数弹层：管理员代替目标账号编辑各战法（龙头/双响炮/N形/龙回头/动量）的参数并保存，保存后该账号热更新即时生效 -->
     <div v-if="activeUser" class="modal-mask" @click.self="closeStrategy">
       <div class="modal">
         <div class="modal-header">
@@ -134,17 +134,28 @@ import { ref, onMounted } from 'vue'
 import * as api from '../api/index.js'
 
 // ── 状态 ──
+// 全部账号列表（含 id/角色/权限/启用状态/有效期），用于账号列表区渲染
 const users = ref([])
+// 系统支持的权限位定义（如 research_approve 研究审批），由后端返回
 const allPerms = ref([])
+// 开户请求进行中标记，用于禁用创建按钮防重复提交
 const creating = ref(false)
+// 开户表单的结果提示文案
 const createMsg = ref('')
+// 开户提示的类型：ok=成功 / err=失败，决定提示文字颜色
 const createMsgType = ref('ok')
+// 开户表单模型：用户名、初始密码、角色、权限位、有效期天数、是否永久
 const newUser = ref({ username: '', password: '', role: 'user', perms: [], expiresDays: 0, permanent: true })
 
+// 当前正在为其代配战法参数的用户（非 null 时弹层显示），null 表示弹层关闭
 const activeUser = ref(null)
+// 弹层内编辑的战法参数，结构为 { 分组key: { 字段key: 值 } }，保存后整体提交
 const activeStrategy = ref({})
+// 战法参数保存中标记，用于禁用保存按钮
 const strategySaving = ref(false)
+// 战法参数操作的结果提示文案
 const strategyMsg = ref('')
+// 战法参数提示类型：ok=成功 / err=失败
 const strategyMsgType = ref('ok')
 
 // 战法参数分组定义（与 Settings.vue 一致）
@@ -370,6 +381,7 @@ async function openStrategy(u) {
   }
 }
 
+/** 关闭战法参数弹层：清空当前目标用户，模板中的 v-if 使弹层隐藏 */
 function closeStrategy() {
   activeUser.value = null
 }
@@ -389,6 +401,7 @@ async function saveStrategy() {
   strategySaving.value = false
 }
 
+// 页面挂载后立即拉取一次用户列表与权限位定义
 onMounted(loadUsers)
 </script>
 

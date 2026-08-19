@@ -537,6 +537,8 @@ func storeNextDay(yyyymmdd string) string {
 	return itoa4(y) + itoa2(m) + itoa2(d)
 }
 
+// atoi8 手写 8 位数字字符串 → int（YYYYMMDD 日期解析，避免引入 strconv 依赖）。
+// English: hand-rolled 8-digit string→int (YYYYMMDD date parsing, no strconv dependency).
 func atoi8(s string) int {
 	v := 0
 	for i := 0; i < len(s); i++ {
@@ -545,6 +547,8 @@ func atoi8(s string) int {
 	return v
 }
 
+// daysInMonth 返回某年某月的天数（含闰年 2 月）。
+// English: returns the number of days in a month (leap-year aware).
 func daysInMonth(y, m int) int {
 	switch m {
 	case 1, 3, 5, 7, 8, 10, 12:
@@ -563,6 +567,8 @@ func daysInMonth(y, m int) int {
 func itoa4(v int) string { return itoaN(v, 4) }
 func itoa2(v int) string { return itoaN(v, 2) }
 
+// itoaN 手写整数 → 定宽数字字符串（高位补零），供 storeNextDay 拼 YYYYMMDD。
+// English: hand-rolled int→zero-padded fixed-width decimal string (for storeNextDay).
 func itoaN(v, w int) string {
 	s := ""
 	for v > 0 {

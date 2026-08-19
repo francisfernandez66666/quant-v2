@@ -11,38 +11,41 @@ import (
 )
 
 // Pick 单只入选股票的前瞻验证结果。
+// （Pick is one picked stock's forward-validation result.）
 type Pick struct {
-	Code       string          `json:"code"`
-	Score      float64         `json:"score"`
-	EntryDate  string          `json:"entry_date"`
-	EntryPrice float64         `json:"entry_price"`
-	Returns    map[int]float64 `json:"returns"` // horizon → 收益
-	Excess     map[int]float64 `json:"excess"`  // horizon → 超额收益
+	Code       string          `json:"code"`        // 股票代码
+	Score      float64         `json:"score"`       // 复合信号得分
+	EntryDate  string          `json:"entry_date"`  // 入场日 YYYYMMDD（事件次日）
+	EntryPrice float64         `json:"entry_price"` // 入场价（入场日开盘）
+	Returns    map[int]float64 `json:"returns"`     // horizon → 收益
+	Excess     map[int]float64 `json:"excess"`      // horizon → 超额收益（相对基准）
 }
 
 // EventResult 单事件回测结果。
+// （EventResult is the backtest result of one event.）
 type EventResult struct {
-	Date         string          `json:"date"`
-	Industry     string          `json:"industry"`
-	LimitUpCount int             `json:"limit_up_count"`
-	Constituents int             `json:"constituents"`
-	Picks        []Pick          `json:"picks"`
-	MeanExcess   map[int]float64 `json:"mean_excess"`
-	HitRate      map[int]float64 `json:"hit_rate"`
+	Date         string          `json:"date"`           // 事件日
+	Industry     string          `json:"industry"`       // 触发行业
+	LimitUpCount int             `json:"limit_up_count"` // 当日板块涨停家数
+	Constituents int             `json:"constituents"`   // 当日板块成分股数
+	Picks        []Pick          `json:"picks"`          // 入选股票及前瞻验证
+	MeanExcess   map[int]float64 `json:"mean_excess"`    // horizon → 事件内平均超额
+	HitRate      map[int]float64 `json:"hit_rate"`       // horizon → 事件内正超额占比
 }
 
 // ChainReport 全链路回测汇总。
+// （ChainReport aggregates the full-chain backtest.）
 type ChainReport struct {
-	Start       string          `json:"start"`
-	End         string          `json:"end"`
-	Benchmark   string          `json:"benchmark"`
-	Horizons    []int           `json:"horizons"`
-	Rule        SignalRule      `json:"rule"`
-	Events      []EventResult   `json:"events"`
-	TotalEvents int             `json:"total_events"`
-	TotalPicks  int             `json:"total_picks"`
-	AvgExcess   map[int]float64 `json:"avg_excess"`  // horizon → 事件级平均超额
-	OverallHit  map[int]float64 `json:"overall_hit"` // horizon → 股票级命中率
+	Start       string          `json:"start"`        // 事件区间起点
+	End         string          `json:"end"`          // 事件区间终点
+	Benchmark   string          `json:"benchmark"`    // 基准指数
+	Horizons    []int           `json:"horizons"`     // 前瞻天数列表
+	Rule        SignalRule      `json:"rule"`         // 所用信号规则
+	Events      []EventResult   `json:"events"`       // 各事件明细
+	TotalEvents int             `json:"total_events"` // 事件总数
+	TotalPicks  int             `json:"total_picks"`  // 入选股票总数
+	AvgExcess   map[int]float64 `json:"avg_excess"`   // horizon → 事件级平均超额
+	OverallHit  map[int]float64 `json:"overall_hit"`  // horizon → 股票级命中率
 }
 
 // Summarize 汇总全部事件的平均超额与命中率。
@@ -110,6 +113,8 @@ func (r *ChainReport) HTMLReport() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// fv 格式化浮点数为 4 位小数；NaN 显示为占位横线（HTML 表格中避免 "NaN" 字样）。
+// （fv formats a float to 4 decimals, replacing NaN with an em dash.）
 func fv(v float64) string {
 	if math.IsNaN(v) {
 		return "—"
@@ -117,6 +122,8 @@ func fv(v float64) string {
 	return fmt.Sprintf("%.4f", v)
 }
 
+// btTpl 全链路回测报告的自包含 HTML 模板（汇总表 + 事件明细表，5 日超额降序）。
+// （btTpl is the self-contained HTML template for the chain-backtest report.）
 var btTpl = template.Must(template.New("bt").Funcs(template.FuncMap{"fv": fv}).Parse(`<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>全链路回测报告</title>
 <style>

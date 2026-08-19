@@ -127,7 +127,9 @@ func cmdOptimize(db *store.DB, args []string) {
 	log.Printf("候选 #%d 已入库（%s）", id, res.Reason)
 }
 
-// cmdList 列出候选。
+// cmdList 列出候选：按状态（proposed/approved/rejected/applied）过滤，缺省全部。
+// 打印每条候选的关键证据（IR/IC/回测超额/前瞻天数/理由），供人工审批参考。
+// （cmdList lists candidates, optionally filtered by status, with key evidence for approval.）
 func cmdList(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	status := fs.String("status", "", "按状态过滤: proposed|approved|rejected|applied")

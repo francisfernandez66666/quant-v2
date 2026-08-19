@@ -48,5 +48,17 @@
                 <category android:name="${applicationId}" />
             </intent-filter>
         </receiver>
+
+        <!-- 极光 JCore 必需服务（JCore 4.9.4+/JPush 5.x 要求，缺失会导致初始化失败） -->
+        <!-- English: JCommonService is required by JCore 5.x/JPush 5.x; without it JPush fails to init. -->
+        <service
+            android:name="cn.jpush.android.service.JCommonService"
+            android:enabled="true"
+            android:exported="false"
+            android:process=":multiprocess">
+            <intent-filter>
+                <action android:name="cn.jpush.android.intent.PushService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

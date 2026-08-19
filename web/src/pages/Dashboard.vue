@@ -134,10 +134,11 @@
       </div>
     </div>
 
-    <!-- 按战法胜率统计：各战法样本数/胜率/平均盈/平均亏/盈亏比 -->
+    <!-- 按战法胜率统计：各战法样本数/胜率/平均盈/平均亏/盈亏比，来自 /api/dashboard 的 report_stats.by_strategy -->
     <div class="card" style="margin-top: 16px;" v-if="strategyStats && Object.keys(strategyStats).length">
       <div class="card-header">按战法胜率</div>
       <div class="strategy-table">
+        <!-- 表头：战法 / 样本 / 已平仓 / 胜率 / 平均盈 / 平均亏 / 盈亏比 / 持仓中 -->
         <div class="stg-header">
           <span class="stg-strategy">战法</span>
           <span class="stg-num">样本</span>
@@ -272,7 +273,8 @@ function fmtProfitFactor(pf) {
   return pf.toFixed(2)
 }
 
-/** 并发加载所有仪表盘数据（7个接口） (Load all dashboard data concurrently — 7 API endpoints) */
+// 并发加载所有仪表盘数据：7 个接口互相独立，均通过 Promise.allSettled 兜底，
+// 任一数据源失败仅影响对应区块，不会阻断整页加载
 async function load() {
   // 并发拉取 7 个数据源，单个失败不阻塞整体 (fetch 7 sources in parallel; a single failure does not block the rest)
   const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes, dashRes] = await Promise.allSettled([

@@ -133,6 +133,8 @@ func (s *Server) handleResearchReject(w http.ResponseWriter, r *http.Request) {
 	s.approveCandidate(w, r, "reject")
 }
 
+// approveCandidate 审批/驳回候选的公共实现：更新候选状态；审批时按候选类型
+// （weights/factor/pattern）写应用配置并热重载引擎，驳回仅改状态。
 func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action string) {
 	if s.researchDB == nil {
 		writeError(w, 503, "研究库未接入")

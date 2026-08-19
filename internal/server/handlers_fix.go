@@ -673,7 +673,7 @@ func holdingLots(l report.ExecLog) []report.Lot {
 	return []report.Lot{{Price: l.EntryPrice, Quantity: qty, At: l.EntryAt}}
 }
 
-// fixSetHoldingsReq 手动设置持仓的请求结构体。
+// fixSetHoldingsReq 手动设置持仓的请求结构体：待同步的持仓列表 + 可用资金。
 type fixSetHoldingsReq struct {
 	Holdings         []fixHolding `json:"holdings"`
 	AvailableBalance float64      `json:"available_balance"`
@@ -903,6 +903,7 @@ func (s *Server) handleFixSellHolding(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"holding": nil})
 }
 
+// handleFixCloseHolding 处理 POST /api/holdings/{code}/close 请求：按指定价格清仓该股持仓。
 // 定位持仓（兼容手动 _fix 与信号持仓），调用 LogExit 记录真实盈亏并标记已平仓；
 // 返回盈亏金额（(清仓价-成本)×数量）与盈亏比例，供前端展示。
 func (s *Server) handleFixCloseHolding(w http.ResponseWriter, r *http.Request) {
@@ -950,6 +951,7 @@ func (s *Server) handleFixCloseHolding(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// thsTopFallbackBoards 返回同花顺首屏 top 板块列表（带 60s 缓存），
 // 兜底板块每分钟轮动一次（前端 3s 轮询 /api/sector/hot 时不再逐次请求同花顺）。
 func (s *Server) thsTopFallbackBoards() []data.SectorInfo {
 	s.thsMu.Lock()

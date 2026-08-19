@@ -25,6 +25,7 @@ import (
 	"quant-trading-v2/internal/strategy_engine"
 )
 
+// probeStock 探针标的（代码 + 名称）。
 type probeStock struct{ Code, Name string }
 
 // 今日关注的实盘标的（有色/电力/算力，覆盖四大战法候选）。
@@ -35,6 +36,7 @@ var probeStocks = []probeStock{
 	{"001896", "豫能控股"},
 }
 
+// defaultDataDir 返回默认数据目录：QUANT_DATA_DIR 环境变量优先，否则 ~/.quant-trading-v2。
 func defaultDataDir() string {
 	if d := os.Getenv("QUANT_DATA_DIR"); d != "" {
 		return d
@@ -74,6 +76,8 @@ func buildNews() []newsagent.NewsEvent {
 	}
 }
 
+// loadRawEvents 读取左侧事件 YAML（若存在），供 D1Scorer 作为事件匹配上下文；
+// 文件缺失时返回空串（不阻塞后续链路）。
 func loadRawEvents() string {
 	b, err := os.ReadFile("events_leftside.yaml")
 	if err != nil {
@@ -82,6 +86,9 @@ func loadRawEvents() string {
 	return string(b)
 }
 
+// main 测量"新闻→信号"端到端耗时：
+// 阶段1 真实网络拉行情 → 阶段2 新闻→D1（真实 LLM 或种子分）→ 阶段3 按生产 5s 节奏
+// 逐轮跑逐战法评分，记录每个战法首个信号的产出耗时并汇总打印。
 func main() {
 	cycles := flag.Int("cycles", 12, "模拟生产近实时扫描轮数（每轮间隔 -sleep 秒）")
 	sleepSec := flag.Int("sleep", 5, "每轮等待(秒，对齐生产5s节奏)")

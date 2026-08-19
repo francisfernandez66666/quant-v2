@@ -72,6 +72,9 @@ class MainActivity : AppCompatActivity() {
         webView.settings.allowFileAccess = false
         webView.settings.loadsImagesAutomatically = true
         webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        // 内嵌 assets 始终从最新打包产物加载，避免升级 APK 后 WebView 缓存旧版前端
+        // (Always load the latest bundled assets so an app upgrade never serves a stale cached page.)
+        webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
 
         webView.webViewClient = object : WebViewClient() {
             // 内嵌资源统一走 assetLoader，网络请求放行系统默认（https）
@@ -185,8 +188,13 @@ class MainActivity : AppCompatActivity() {
      * 设置极光推送设备别名：与服务端 config.json 的 push.alias（默认 quant_owner）保持一致，
      * 服务端按该别名下发关键提醒，后台/离线也能收到系统通知。
      * 设置结果通过 JPushMessageReceiver.onAliasOperatorResult 回调确认。
+     * 已设置成功过则跳过（避免重复设置触发极光 6022「alias 操作进行中」）。
      */
     private fun setupJPushAlias() {
+        val prefs = getSharedPreferences("jpush_prefs", MODE_PRIVATE)
+        if (prefs.getBoolean("alias_set", false)) {
+            return
+        }
         try {
             JPushInterface.setAlias(this, JPUSH_ALIAS_SEQ, QUANT_PUSH_ALIAS)
         } catch (e: Exception) {

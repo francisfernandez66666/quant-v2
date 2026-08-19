@@ -89,6 +89,7 @@ func (p *LatencyProfile) llmDuration(tokens int) time.Duration {
 	return first + body
 }
 
+// maxI 返回两整数较大者（LLM token 数下限保护）。
 func maxI(a, b int) int {
 	if a > b {
 		return a
@@ -219,6 +220,7 @@ func fmtDurMS(d time.Duration) string {
 	return fmtMs(d.Milliseconds())
 }
 
+// fmtMs 毫秒数格式化为可读文本：≥1s 显示为秒，否则显示为毫秒。
 func fmtMs(ms int64) string {
 	if ms >= 1000 {
 		return fmt.Sprintf("%.2fs", float64(ms)/1000)
@@ -226,6 +228,7 @@ func fmtMs(ms int64) string {
 	return fmt.Sprintf("%dms", ms)
 }
 
+// fmtCount 调用次数格式化为十进制字符串。
 func fmtCount(n int) string {
 	return strconv.Itoa(n)
 }

@@ -88,10 +88,15 @@ const props = defineProps({
   height: { type: Number, default: 260 },
 })
 
+// 盘口原始数据：{ name, code, price, prev_close, time, source, levels, bids[], asks[], factors }
 const ob = ref({})
+// 由后端算好的派生因子（委比、买卖压力、封单、价差等），数据源不支持时为 null
 const factors = ref(null)
+// 拉取中标记，禁用刷新按钮并显示"加载中…"
 const loading = ref(false)
+// 加载失败时的错误文案，非空时替代盘口内容展示
 const error = ref('')
+// 盘口显示名，优先取后端返回的股票名称，其次为父组件传入的 name
 const name = ref(props.name)
 
 // 实际档位数：后端 levels（免费源 5，十档接入后为 10）；无则按数组长度推导
@@ -117,6 +122,7 @@ function fmtVol(v) {
   return n ? String(Math.round(n)) : '--'
 }
 
+// 现价相对昨收的涨跌幅百分比文本（如 +2.35%），用于现价行的涨幅展示
 const pctText = computed(() => {
   const p = ob.value.price || 0
   const pc = ob.value.prev_close || 0
@@ -124,11 +130,14 @@ const pctText = computed(() => {
   const d = (p - pc) / pc * 100
   return (d >= 0 ? '+' : '') + d.toFixed(2) + '%'
 })
+// 现价涨跌对应的颜色样式：上涨红色、下跌绿色（A股配色）
 const nowCls = computed(() => (pctText.value.startsWith('+') ? 'up' : 'down'))
 
+// 盘口颜色约定：卖盘绿（卖出价） / 买盘红（买入价）
 function askColor(i) { return 'down' }   // 卖盘绿
 function bidColor(i) { return 'up' }     // 买盘红
 
+// 按 code 拉取盘口：成功则整体替换 ob 并取回因子/名称，失败记录 error；任何情况下复位 loading
 async function load() {
   if (!props.code) return
   loading.value = true
@@ -149,6 +158,7 @@ async function load() {
   }
 }
 
+// code 变化时先清空旧盘口与名称，再拉取新股盘口（组件复用于不同股票场景）
 watch(() => props.code, () => {
   ob.value = {}
   factors.value = null
@@ -156,6 +166,7 @@ watch(() => props.code, () => {
   load()
 })
 
+// 挂载即拉取一次盘口
 onMounted(load)
 </script>
 

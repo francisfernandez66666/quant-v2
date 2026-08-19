@@ -258,7 +258,7 @@ const timeAxis = computed(() => {
 
 // ── 数据构建 ──
 // ── Geometry building ──
-// 按当前宽度重算分时几何坐标（不重新请求）
+// 按当前宽度重算分时几何坐标（不重新请求），并刷新价格线/均价线/成交量/MACD 图元与最新价
 function build() {
   const data = raw.value
   if (!Array.isArray(data) || data.length === 0) return
@@ -379,13 +379,14 @@ function macdLineY(v, maxAbs, half) {
 }
 
 // 中间态：points 构建时使用的辅助变量（保持在原始作用域）
-const priceLine = ref('')
-const avgLine = ref('')
-const volBars = ref([])
-const macdBars = ref([])
-const difLine = ref('')
-const deaLine = ref('')
-const avgPointsRaw = ref([]) // 每个数据下标对应的累计均价
+// 以下 SVG 图元数据由 build() 根据当前宽度重算，改变容器大小后即重新生成
+const priceLine = ref('')        // 分时价格线的 SVG polyline points 串
+const avgLine = ref('')          // 均价线的 SVG polyline points 串
+const volBars = ref([])          // 成交量柱数组 {x,y,w,h,color}
+const macdBars = ref([])         // MACD 柱数组 {x,y,w,h,color}
+const difLine = ref('')          // MACD DIF 线的 polyline points 串
+const deaLine = ref('')          // MACD DEA 线的 polyline points 串
+const avgPointsRaw = ref([])     // 每个数据下标对应的累计均价
 
 // x 坐标由索引换算（平均线用）
 function cxOf(idx) {
@@ -413,6 +414,7 @@ function refit() {
 
 // ── 加载 ──
 // ── Load ──
+// 拉取分时数据并回填昨收/名称，随后重建全部图元坐标；失败写入 error 展示错误态
 async function load() {
   loading.value = true
   error.value = ''
@@ -437,12 +439,14 @@ async function load() {
 
 // ── hover ──
 // ── Hover ──
+// 鼠标移动：按 X 距离找最近分时点，计算相对昨收的涨跌额/幅度与累计均价，驱动十字线与顶部提示框
 function onMove(ev) {
   if (points.value.length === 0) return
   const rect = ev.currentTarget.getBoundingClientRect()
   const lx = ev.clientX - rect.left
   const ly = ev.clientY - rect.top
 
+  // 线性扫描最近点（点数最多 241，性能可接受）
   let best = null
   let bestDist = Infinity
   for (const p of points.value) {
@@ -461,15 +465,17 @@ function onMove(ev) {
     delta,
     pct,
     avg: avgAt(best.i),
+    // 提示框横向偏移夹在绘图区内，避免溢出容器左右边缘
     tipX: Math.min(Math.max(best.cx - 84, axisL), viewW.value - 168),
   }
 }
 
+// 鼠标移出：清除十字线
 function onLeave() {
   hover.value = null
 }
 
-// 格式化
+// 格式化：量/额大于 1 亿显示"亿"、大于 1 万显示"万"，否则原样输出（hover 提示用）
 function fmtVol(v) {
   const n = Number(v) || 0
   if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿'
@@ -489,8 +495,11 @@ let ro = null
 let timer = null
 
 onMounted(() => {
+  // 先按容器宽度自适应，再拉取数据
   refit()
   load()
+  // 监听容器尺寸变化（如页面展开/折叠、响应式布局），变化时按新宽度重算坐标；
+  // 老环境无 ResizeObserver 时退化为 500ms 轮询检测宽度
   if (wrapRef.value && typeof ResizeObserver !== 'undefined') {
     ro = new ResizeObserver(refit)
     ro.observe(wrapRef.value)
@@ -507,6 +516,7 @@ watch(() => props.code, () => {
   load()
 })
 
+// 卸载时断开尺寸监听与轮询定时器，避免内存泄漏
 onBeforeUnmount(() => {
   if (ro) ro.disconnect()
   if (timer) clearInterval(timer)

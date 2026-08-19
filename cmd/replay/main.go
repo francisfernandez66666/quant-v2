@@ -25,6 +25,8 @@ import (
 
 var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.db")
 
+// main 解析命令行参数、打开研究库、组装回测选项后执行 B4 全链路回测，
+// 并把结果输出为 report.json + report.html（落盘到 --out 目录）。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	dbPath := flag.String("db", defaultDB, "研究 SQLite 库路径")
@@ -96,6 +98,7 @@ func main() {
 	log.Printf("完成：%s", *outDir)
 }
 
+// splitCSV 把逗号分隔字符串拆成去空白非空的切片。
 func splitCSV(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {

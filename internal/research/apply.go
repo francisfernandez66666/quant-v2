@@ -476,7 +476,8 @@ func appendAppliedPattern(dataDir string, entry AppliedPatternEntry) error {
 	return saveAppliedPatterns(dataDir, entries)
 }
 
-// SetAppliedPatternEnabled 启用/禁用战法库某条（按 ID）。
+// SetAppliedPatternEnabled 启用/禁用形态战法库某条（按 ID）。
+// （SetAppliedPatternEnabled enables/disables a pattern-library entry by ID.）
 func SetAppliedPatternEnabled(dataDir, id string, enabled bool) error {
 	entries, err := ListAppliedPatternRules(dataDir)
 	if err != nil {
@@ -496,7 +497,8 @@ func SetAppliedPatternEnabled(dataDir, id string, enabled bool) error {
 	return saveAppliedPatterns(dataDir, entries)
 }
 
-// RemoveAppliedPatternRule 删除战法库某条（按 ID）。
+// RemoveAppliedPatternRule 删除形态战法库某条（按 ID）。
+// （RemoveAppliedPatternRule removes a pattern-library entry by ID.）
 func RemoveAppliedPatternRule(dataDir, id string) error {
 	entries, err := ListAppliedPatternRules(dataDir)
 	if err != nil {
@@ -517,7 +519,8 @@ func RemoveAppliedPatternRule(dataDir, id string) error {
 	return saveAppliedPatterns(dataDir, out)
 }
 
-// RenameAppliedPattern 重命名战法库某条（按 ID）。
+// RenameAppliedPattern 重命名形态战法库某条（按 ID）。空名忽略。
+// （RenameAppliedPattern renames a pattern-library entry by ID; empty name is ignored.）
 func RenameAppliedPattern(dataDir, id, name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -541,7 +544,8 @@ func RenameAppliedPattern(dataDir, id, name string) error {
 	return saveAppliedPatterns(dataDir, entries)
 }
 
-// UpdateAppliedPatternStats 更新战法库某条的运行统计（效果监测回写）。
+// UpdateAppliedPatternStats 更新形态战法库某条的运行统计（效果监测回写）。
+// （UpdateAppliedPatternStats updates a pattern-library entry's run stats.）
 func UpdateAppliedPatternStats(dataDir, id string, sc, win, loss int, cum float64) error {
 	entries, err := ListAppliedPatternRules(dataDir)
 	if err != nil {
@@ -561,7 +565,8 @@ func UpdateAppliedPatternStats(dataDir, id string, sc, win, loss int, cum float6
 	return saveAppliedPatterns(dataDir, entries)
 }
 
-// saveAppliedPatterns 落盘形态战法库。
+// saveAppliedPatterns 落盘形态战法库（JSON 缩进格式，0644）。
+// （saveAppliedPatterns persists the pattern strategy library.）
 func saveAppliedPatterns(dataDir string, entries []AppliedPatternEntry) error {
 	b, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {

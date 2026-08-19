@@ -60,6 +60,7 @@
         <span class="card-sub">N形≥60 / 龙头≥70 / 双凸≥70 / 回头≥60 / 动量≥50</span>
       </div>
       <div class="eval-table" v-if="evals.length">
+        <!-- 表头：每列可点击排序，title 提示对应战法门槛 -->
         <div class="ev-header">
           <span class="ev-code sortable" @click="setSort('code')">代码{{ sortArrow('code') }}</span>
           <span class="ev-name sortable" @click="setSort('name')">名称{{ sortArrow('name') }}</span>
@@ -197,7 +198,9 @@ function rowClass(e) {
 }
 
 // ── 排序状态 ── (Sort state)
+// 当前排序列（评分维度字段名或 code/name/price 等），空串表示按综合最高分降序
 const sortKey = ref('')
+// 排序方向：-1 降序 / 1 升序，默认降序
 const sortDir = ref(-1)
 
 /** 设置排序列：同列再次点击切换升降序，切换列时默认降序 (Set the sort column; clicking the same column toggles direction, new columns default to descending) */

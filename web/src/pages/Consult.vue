@@ -35,7 +35,7 @@
       <p v-if="llmMsg" :class="['llm-msg', llmMsgType === 'ok' ? 'msg-ok' : 'msg-err']">{{ llmMsg }}</p>
     </div>
 
-    <!-- 对话区：消息气泡列表 -->
+    <!-- 对话区：消息气泡列表（user 靠右、assistant 靠左；加载历史后自动滚到底部） -->
     <div ref="chatBox" class="chat-box">
       <div v-if="messages.length === 0" class="chat-empty">开始咨询，向 AI 提问任意 A 股相关问题</div>
       <div v-for="(m, i) in messages" :key="i" :class="['bubble', m.role === 'user' ? 'bubble-user' : 'bubble-assistant']">
@@ -43,14 +43,14 @@
         <div class="bubble-content">{{ m.content }}</div>
         <div v-if="m.time" class="bubble-time">{{ formatTime(m.time) }}</div>
       </div>
-      <!-- 输入中状态：等待 LLM 回复 -->
+      <!-- 输入中状态：等待 LLM 回复时展示占位气泡 -->
       <div v-if="loading" class="bubble bubble-assistant bubble-loading">
         <div class="bubble-name">AI 顾问</div>
         <div class="bubble-content">思考中...</div>
       </div>
     </div>
 
-    <!-- 输入区：消息输入框 + 发送按钮 -->
+    <!-- 输入区：消息输入框（Enter 发送 / Shift+Enter 换行）+ 发送按钮 -->
     <div class="chat-input">
       <textarea
         v-model="draft"
