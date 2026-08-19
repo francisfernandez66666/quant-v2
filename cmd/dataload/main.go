@@ -10,7 +10,7 @@
 //
 // flags：--db（默认 ~/.quant-trading-v2/trading.db）、--provider（baostock|tushare，默认
 // baostock）、--pyurl（baostock sidecar 地址，默认 http://127.0.0.1:8787）、--token
-//（仅 tushare 需要）、--start（YYYYMMDD，默认 20200101）、--end（YYYYMMDD，默认今天）、
+// （仅 tushare 需要）、--start（YYYYMMDD，默认 20200101）、--end（YYYYMMDD，默认今天）、
 // --codes <文件>（finance 的研究池：每行一个 ts_code，# 注释）、--fin-start/--fin-end（年份）。
 // 支持断点续传：行情表按最近交易日续拉，财务表按单票最近报告期续拉。
 // （dataload loads historical data into the research SQLite DB. Provider baostock is the

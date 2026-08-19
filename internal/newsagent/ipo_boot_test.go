@@ -147,4 +147,3 @@ func (m *listedIPOTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"success":true,"result":{"data":[]}}`))}, nil
 }
-

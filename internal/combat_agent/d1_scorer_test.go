@@ -72,6 +72,29 @@ func TestCleanJSONInteriorBOM(t *testing.T) {
 	}
 }
 
+// TestCleanJSONReasonLiteralNewline 覆盖线上 D1 整批失败的根因：GLM-Z1 在 reason 字符串里
+// 输出未转义换行（`invalid character '\n' in string literal`），此前 cleanJSON 不处理导致
+// json.Unmarshal 整批失败、10 只全部标记待重试。现在应把字符串内字面换行转成 \n 并可正常解析。
+func TestCleanJSONReasonLiteralNewline(t *testing.T) {
+	// 模拟线上失败样本：reason 值内嵌真实换行（反引号内的 \n 是字面换行）
+	raw := "```json\n[\n  {\"code\":\"688432\",\"score\":18,\"blocked\":false,\"reason\":\"半导体材料供应商\n受益于上海张江能智终端产业链政策\"},\n  {\"code\":\"600460\",\"score\":18,\"blocked\":false,\"reason\":\"半导体分立器件企业，伴随AI终端规划受益\"}\n]```"
+
+	got := cleanJSON(raw)
+	var arr []D1Score
+	if err := json.Unmarshal([]byte(got), &arr); err != nil {
+		t.Fatalf("reason含字面换行应可解析, cleanJSON=%q, err=%v", got, err)
+	}
+	if len(arr) != 2 {
+		t.Fatalf("应解析出2只个股, got %d: %+v", len(arr), arr)
+	}
+	if arr[0].Code != "688432" || arr[0].Score != 18 || arr[0].Blocked {
+		t.Fatalf("688432 解析异常: %+v", arr[0])
+	}
+	if arr[0].Reason != "半导体材料供应商\n受益于上海张江能智终端产业链政策" {
+		t.Fatalf("reason 字面换行应转义为 \\n 且内容保留, got %q", arr[0].Reason)
+	}
+}
+
 // TestMarkRetryPending 验证 LLM 失败不靠兜底：
 // 失败的个股标记 RetryPending=true（Score=0），入重试队列下轮重新调 LLM，
 // 不回退上一轮评分、不伪造分数。

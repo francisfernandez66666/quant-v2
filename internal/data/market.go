@@ -8,8 +8,6 @@
 package data
 
 import (
-	"strconv"
-	"time"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,8 +16,10 @@ import (
 	urlpkg "net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
@@ -349,8 +349,6 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 	return ten, nil
 }
 
-
-
 // checkEastMoneyHealth 探测东财行情源是否可用。
 // （checkEastMoneyHealth probes whether the EastMoney data source is available.）
 func (m *MarketAPI) checkEastMoneyHealth(code string) bool {
@@ -375,7 +373,8 @@ func (m *MarketAPI) checkTencentHealth(code string) bool {
 // HealthCheck 探测所有行情源的可用性。
 // 返回每个数据源的探测结果（true=可用，false=不可用）。
 // （HealthCheck probes the availability of all market data sources.
-//  Returns the availability status of each data source.）
+//
+//	Returns the availability status of each data source.）
 func (m *MarketAPI) HealthCheck() map[string]bool {
 	result := make(map[string]bool, 4)
 

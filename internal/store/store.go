@@ -556,18 +556,18 @@ type Bar struct {
 // DailyBasic 每日指标行。
 // （DailyBasic is one row of per-day market indicators.）
 type DailyBasic struct {
-	Date          string
-	TurnoverRate  float64 // 换手率(%)
-	VolumeRatio   float64 // 量比
-	PETTM         float64 // 市盈率 TTM
-	PB            float64 // 市净率
-	PSTTM         float64 // 市销率 TTM
-	PcfTTM        float64 // 市现率 TTM
-	DVTTM         float64 // 股息率 TTM(%)
-	TotalShare    float64 // 总股本(股)
-	TotalMV       float64 // 总市值(万元)
-	CircMV        float64 // 流通市值(万元)
-	IsST          int     // 是否 ST（1=是）
+	Date         string
+	TurnoverRate float64 // 换手率(%)
+	VolumeRatio  float64 // 量比
+	PETTM        float64 // 市盈率 TTM
+	PB           float64 // 市净率
+	PSTTM        float64 // 市销率 TTM
+	PcfTTM       float64 // 市现率 TTM
+	DVTTM        float64 // 股息率 TTM(%)
+	TotalShare   float64 // 总股本(股)
+	TotalMV      float64 // 总市值(万元)
+	CircMV       float64 // 流通市值(万元)
+	IsST         int     // 是否 ST（1=是）
 }
 
 // IncomeRow 利润表快照行（SUE 单季净利因子来源）。
@@ -581,16 +581,16 @@ type IncomeRow struct {
 // FinaRow 财务指标快照行（质量/成长因子来源）。
 // （FinaRow is one financial-indicator snapshot for quality/growth factors.）
 type FinaRow struct {
-	EndDate       string  // 报告期 YYYYMMDD
-	AnnDate       string  // 公告日 YYYYMMDD（点对时过滤用）
-	EPS           float64 // 每股收益
-	ROE           float64 // 净资产收益率
-	ROA           float64 // 总资产收益率
-	GrossMargin   float64 // 毛利率(%)
-	NetMargin     float64 // 净利率(%)
-	DebtToAssets  float64 // 资产负债率(%)
-	YoyOR         float64 // 营收同比增长(%)
-	YoyNetProfit  float64 // 净利同比增长(%)
+	EndDate      string  // 报告期 YYYYMMDD
+	AnnDate      string  // 公告日 YYYYMMDD（点对时过滤用）
+	EPS          float64 // 每股收益
+	ROE          float64 // 净资产收益率
+	ROA          float64 // 总资产收益率
+	GrossMargin  float64 // 毛利率(%)
+	NetMargin    float64 // 净利率(%)
+	DebtToAssets float64 // 资产负债率(%)
+	YoyOR        float64 // 营收同比增长(%)
+	YoyNetProfit float64 // 净利同比增长(%)
 }
 
 // LimitRow 涨跌停价行。

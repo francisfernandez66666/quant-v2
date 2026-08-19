@@ -88,7 +88,7 @@ type healthItem struct {
 // sseWatcher 订阅 SSEBroker，累计收到的广播，用于验证引擎→推送链路.
 type sseWatcher struct {
 	broker *server.SSEBroker
-	ch     chan []byte
+	ch     chan server.SSEEvent
 	raw    [][]byte
 }
 
@@ -101,8 +101,8 @@ func newSSEWatcher(broker *server.SSEBroker) *sseWatcher {
 func (w *sseWatcher) drain() {
 	for {
 		select {
-		case raw := <-w.ch:
-			w.raw = append(w.raw, raw)
+		case ev := <-w.ch:
+			w.raw = append(w.raw, ev.Data)
 		default:
 			return
 		}

@@ -65,22 +65,22 @@ func (c Category) CategoryName() string {
 // StockSeries 单只股票按日期对齐的研究输入（hfq 主序列 + 估值/换手 + 点对时财务）。
 // （StockSeries is one stock's date-aligned research input.）
 type StockSeries struct {
-	Dates     []string
-	CloseHfq  []float64 // hfq 收盘（价格比率因子）
-	CloseRaw  []float64 // 原始收盘（规模等需真实价）
-	Open      []float64 // hfq 开盘
-	High      []float64 // hfq 最高
-	Low       []float64 // hfq 最低
-	Vol       []float64 // 成交量（手）
-	Amount    []float64 // 成交额（元）
-	Turnover  []float64 // 换手率（%）
-	PeTTM     []float64 // 市盈率 TTM
-	Pb        []float64 // 市净率
-	PsTTM     []float64 // 市销率 TTM
-	PcfTTM    []float64 // 市现率 TTM
-	DvTTM     []float64 // 股息率 TTM（%）
+	Dates      []string
+	CloseHfq   []float64 // hfq 收盘（价格比率因子）
+	CloseRaw   []float64 // 原始收盘（规模等需真实价）
+	Open       []float64 // hfq 开盘
+	High       []float64 // hfq 最高
+	Low        []float64 // hfq 最低
+	Vol        []float64 // 成交量（手）
+	Amount     []float64 // 成交额（元）
+	Turnover   []float64 // 换手率（%）
+	PeTTM      []float64 // 市盈率 TTM
+	Pb         []float64 // 市净率
+	PsTTM      []float64 // 市销率 TTM
+	PcfTTM     []float64 // 市现率 TTM
+	DvTTM      []float64 // 股息率 TTM（%）
 	TotalShare []float64 // 股本（股，季频近似）
-	IsST      []float64 // 是否 ST（1=是；回测需剔除）
+	IsST       []float64 // 是否 ST（1=是；回测需剔除）
 	// 财务（点对时：调用方取 ann_date ≤ 当日 的最新报告值，无则 NaN）
 	Roe                []float64 // 净资产收益率
 	GrossMargin        []float64 // 毛利率
@@ -88,6 +88,7 @@ type StockSeries struct {
 	DebtToAssets       []float64 // 资产负债率
 	YoyNetProfit       []float64 // 净利同比
 	SingleQuarterNIYoy []float64 // 单季净利同比（SUE 降级版）
+	Eps                []float64 // 每股收益
 }
 
 // Len 返回序列长度。

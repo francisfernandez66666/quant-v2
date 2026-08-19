@@ -50,6 +50,15 @@ echo "[2/8] 上传二进制与配置..."
 $SSH "sudo mkdir -p $DEPLOY_DIR/config"
 $SCP /tmp/quant_linux $SERVER_USER@$SERVER_IP:/tmp/quant_linux
 $SSH "sudo mv /tmp/quant_linux $DEPLOY_DIR/quant && sudo chmod +x $DEPLOY_DIR/quant"
+
+# 研究/下载/调度二进制：独立研究服务（quant-research）与 sidecar 依赖
+echo "      编译 research/dataload/researchd (linux/amd64)..."
+GOOS=linux GOARCH=amd64 go build -o /tmp/research_linux ./cmd/research
+GOOS=linux GOARCH=amd64 go build -o /tmp/dataload_linux ./cmd/dataload
+GOOS=linux GOARCH=amd64 go build -o /tmp/researchd_linux ./cmd/researchd
+$SCP /tmp/research_linux /tmp/dataload_linux /tmp/researchd_linux $SERVER_USER@$SERVER_IP:/tmp/
+$SSH "sudo mv /tmp/research_linux $DEPLOY_DIR/research && sudo mv /tmp/dataload_linux $DEPLOY_DIR/dataload && sudo mv /tmp/researchd_linux $DEPLOY_DIR/researchd"
+$SSH "sudo chmod +x $DEPLOY_DIR/research $DEPLOY_DIR/dataload $DEPLOY_DIR/researchd"
 # 事件匹配规则（相对路径加载），缺失时优雅降级但也尽量带上
 EVENTS_SRC=""
 for cand in "$APP_DIR/config/events_leftside.yaml" "$APP_DIR/events_leftside.yaml"; do
@@ -73,6 +82,15 @@ echo "[3/8] 初始化数据目录与运行用户..."
 $SSH "sudo mkdir -p $QUANT_DATA_DIR /var/log/caddy /var/www/quant-web"
 $SSH "id quant >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin quant"
 $SSH "sudo chown -R quant:quant $QUANT_DATA_DIR $DEPLOY_DIR"
+
+# ── 3b. baostock 研究数据 sidecar（Python venv，dataload 依赖 :8787）──
+echo "[3b/8] 部署 baostock sidecar (Python venv)..."
+$SSH "sudo mkdir -p $DEPLOY_DIR/pydata"
+$SCP "$APP_DIR/cmd/pydata/server.py" "$APP_DIR/cmd/pydata/requirements.txt" $SERVER_USER@$SERVER_IP:/tmp/
+$SSH "sudo mv /tmp/server.py $DEPLOY_DIR/pydata/server.py && sudo mv /tmp/requirements.txt $DEPLOY_DIR/pydata/requirements.txt"
+$SSH "which python3 >/dev/null 2>&1 || (sudo apt-get update -qq && DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq python3 python3-venv)"
+$SSH "sudo -u quant python3 -m venv $DEPLOY_DIR/venv"
+$SSH "sudo -u quant $DEPLOY_DIR/venv/bin/pip install --quiet -r $DEPLOY_DIR/pydata/requirements.txt"
 
 # ── 4. 写入环境变量文件（LLM Key 等敏感项）──
 echo "[4/8] 写入 /etc/quant.env..."
@@ -102,8 +120,15 @@ $SSH "which caddy >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get in
 echo "[6/8] 安装并启动 quant.service..."
 $SCP "$APP_DIR/deploy/quant.service" $SERVER_USER@$SERVER_IP:/tmp/quant.service
 $SSH "sudo mv /tmp/quant.service /etc/systemd/system/quant.service"
+# 独立研究服务 + baostock sidecar（按时段切换调度，见 deploy/quant-research.service）
+$SCP "$APP_DIR/deploy/quant-research.service" $SERVER_USER@$SERVER_IP:/tmp/quant-research.service
+$SSH "sudo mv /tmp/quant-research.service /etc/systemd/system/quant-research.service"
+$SCP "$APP_DIR/deploy/pydata.service" $SERVER_USER@$SERVER_IP:/tmp/pydata.service
+$SSH "sudo mv /tmp/pydata.service /etc/systemd/system/pydata.service"
 $SSH "sudo systemctl daemon-reload"
 $SSH "sudo systemctl enable --now quant"
+$SSH "sudo systemctl enable --now pydata"
+$SSH "sudo systemctl enable --now quant-research"
 $SSH "sudo systemctl restart caddy"
 
 # ── 7. 健康检查 ──
@@ -115,6 +140,14 @@ if $SSH "curl -sf -o /dev/null -m 10 http://127.0.0.1:8080/setup"; then
 else
     echo "  ✗ 后端未就绪，请查看日志: journalctl -u quant -n 50"
 fi
+# 独立研究服务 + baostock sidecar 状态
+for svc in pydata quant-research; do
+    if $SSH "systemctl is-active $svc >/dev/null 2>&1"; then
+        echo "  ✓ $svc 运行中"
+    else
+        echo "  ✗ $svc 未运行，查看: journalctl -u $svc -n 50"
+    fi
+done
 # HTTPS 检查（首次 ACME 申请可能要等几秒~几十秒）
 echo "  等待 HTTPS 证书就绪 (最多 60s)..."
 for i in $(seq 1 60); do
@@ -131,6 +164,10 @@ echo " 部署完成。首次登录："
 echo "   1. 浏览器打开 https://$SERVER_DOMAIN ，直接进前端登录页"
 echo "   2. 前端登录页用后端账号登录（首次部署默认 admin / admin123，请立即改密码）"
 echo "   3. APK 走 /api 直接用账号登录"
+echo " 研究调度（quant-research）："
+echo "   - 交易时段只做 dataload 增量下载；盘后 15:30/周末各跑一轮自动研究"
+echo "   - 配置: $QUANT_DATA_DIR/config.json -> rules.scheduler（默认即可，无需改动）"
+echo "   - 查看: journalctl -u quant-research -f / systemctl restart quant-research"
 echo " 常用运维："
 echo "   journalctl -u quant -f          # 后端日志"
 echo "   systemctl restart quant         # 重启后端"

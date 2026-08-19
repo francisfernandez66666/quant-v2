@@ -13,6 +13,7 @@ package pattern
 
 import (
 	"math"
+	"sync"
 
 	"quant-trading-v2/internal/data"
 	factorlib "quant-trading-v2/internal/factor"
@@ -36,46 +37,128 @@ type PatternRule struct {
 	BuyThreshold int    // 可选：额外总分门槛（暂未用，保留扩展）
 }
 
-// PatternStrategy 形态战法策略：按 PatternRule 对实盘个股解释执行。
-// （PatternStrategy interprets a PatternRule on live stocks.）
+// ActivePattern 战法库中的一条已应用形态战法（带独立 ID/名称/来源候选/运行统计）。
+// English: one applied pattern strategy in the library (with its own ID/name/source-candidate/run stats).
+type ActivePattern struct {
+	ID     string // 规则唯一 ID（"pat_<candID>"）
+	Name   string // 显示名
+	CandID int64  // 来源候选 ID
+	Conds  []Cond // 条件集
+	// 效果监测
+	SignalCount int
+	Win         int
+	Loss        int
+	CumReturn   float64
+}
+
+// PatternStrategy 形态战法策略：按一组 ActivePattern 对实盘个股解释执行。
+// 支持多形态同时实盘：任一满足全部条件的形态触发，以其 Name 作为信号 strategy 名。
+// English: interprets a set of ActivePatterns on live stocks. Multiple patterns run concurrently;
+// any whose conditions are all met fires a signal named by that pattern.
 type PatternStrategy struct {
-	rule    PatternRule
-	enabled bool
+	mu    sync.RWMutex
+	rules []*ActivePattern
+	// 本回合缓存：code → 触发的形态（GenerateSignal 取用）
+	pending map[string]*ActivePattern
 }
 
-// New 创建形态战法策略实例（默认未启用，需 SetRule 注入有效规则后生效）。
-// English: creates a PatternStrategy; disabled until SetRule injects a valid rule.
+// New 创建形态战法策略实例（默认未启用，需 SetRules 注入有效规则后生效）。
+// English: creates a PatternStrategy; disabled until SetRules injects valid rules.
 func New() *PatternStrategy {
-	return &PatternStrategy{rule: PatternRule{}, enabled: false}
+	return &PatternStrategy{rules: nil, pending: make(map[string]*ActivePattern)}
 }
 
-// SetRule 注入模板规则（来自审批通过的 pattern 候选）。空 Conds 视为禁用。
-// English: injects the template rule (from an approved pattern candidate). Empty Conds disables.
+// SetRule 注入单条模板规则（兼容旧版：清空后加一条）。空 Conds 视为禁用。
+// English: injects a single template rule (back-compat: clears then adds one). Empty Conds disables.
 func (s *PatternStrategy) SetRule(r PatternRule) {
-	s.rule = r
-	s.enabled = len(r.Conds) > 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(r.Conds) == 0 {
+		s.rules = nil
+		return
+	}
+	name := r.Name
+	if name == "" {
+		name = "形态战法"
+	}
+	s.rules = []*ActivePattern{{ID: "pat_0", Name: name, CandID: 0, Conds: r.Conds}}
 }
 
-// Enabled 返回是否启用。
-func (s *PatternStrategy) Enabled() bool { return s.enabled }
+// SetRules 注入多规则（形态战法库）。空列表禁用。
+// English: injects multiple rules (pattern library). Empty disables.
+func (s *PatternStrategy) SetRules(rules []*ActivePattern) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rules = nil
+	for _, r := range rules {
+		if r == nil || len(r.Conds) == 0 {
+			continue
+		}
+		if r.ID == "" {
+			r.ID = "pat_auto"
+		}
+		if r.Name == "" {
+			r.Name = "形态战法"
+		}
+		s.rules = append(s.rules, r)
+	}
+}
+
+// Enabled 返回是否启用（已注入至少一条有效规则）。
+// English: reports whether the strategy is enabled (at least one valid rule injected).
+func (s *PatternStrategy) Enabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.rules) > 0
+}
 
 // Name 返回策略中文名。
-func (s *PatternStrategy) Name() string {
-	if s.rule.Name != "" {
-		return s.rule.Name
-	}
-	return "形态战法"
-}
+func (s *PatternStrategy) Name() string { return "形态战法" }
 
 // Type 返回信号类型 SignalPattern。
 func (s *PatternStrategy) Type() strategy.SignalType { return strategy.SignalPattern }
 
-// Evaluate 对单只股票解释执行模板（实现 Strategy 接口）。data 为 *strategy_engine.StockMarketData。
-// 满足全部算子条件 → Pass（full_chain），否则 watch。
-// English: interprets the template on one stock (Strategy interface); data is
-// *strategy_engine.StockMarketData. Pass when all operator conditions are met (full_chain), else watch.
+// Stats 返回各规则运行统计快照（效果监测用）。
+// English: returns a snapshot of each rule's run stats (for effectiveness monitoring).
+func (s *PatternStrategy) Stats() []ActivePattern {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]ActivePattern, 0, len(s.rules))
+	for _, r := range s.rules {
+		out = append(out, *r)
+	}
+	return out
+}
+
+// RecordForwardReturn 记录某条形态规则一条触发股的 5 日前向收益（效果监测）。
+// English: records a pattern rule's 5-day forward return for one triggered stock (monitoring).
+func (s *PatternStrategy) RecordForwardReturn(ruleID string, ret float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.rules {
+		if r.ID == ruleID {
+			if ret > 0 {
+				r.Win++
+			} else if ret < 0 {
+				r.Loss++
+			}
+			r.CumReturn += ret
+			return
+		}
+	}
+}
+
+// Evaluate 对单只股票解释执行全部模板（实现 Strategy 接口）。data 为 *strategy_engine.StockMarketData。
+// 任一模板满足全部算子条件即 Pass（full_chain）；取满足条件数最多的模板作为结果。
+// English: interprets all templates on one stock (Strategy interface); data is
+// *strategy_engine.StockMarketData. Pass when any template's conditions are all met (full_chain); the
+// template with the most met conditions wins.
 func (s *PatternStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
-	if !s.enabled {
+	s.mu.RLock()
+	rules := make([]*ActivePattern, len(s.rules))
+	copy(rules, s.rules)
+	s.mu.RUnlock()
+	if len(rules) == 0 {
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "nodata", Details: map[string]float64{}}, nil
 	}
 	md, ok := data.(*strategy_engine.StockMarketData)
@@ -85,10 +168,36 @@ func (s *PatternStrategy) Evaluate(code string, data interface{}) (*strategy.Eva
 	}
 	series := seriesFromKLines(md.KLines)
 
-	// 计算各形态算子当前值并判定是否满足全部条件
+	// 取满足条件数最多的模板
+	var bestRule *ActivePattern
+	best := &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "watch", Details: map[string]float64{}}
+	for _, r := range rules {
+		eval := evalRule(r.Conds, series)
+		if eval.Pass || eval.TotalScore > best.TotalScore {
+			if eval.Pass {
+				best = eval
+				bestRule = r
+				break // 有模板全部命中即采用（AND 语义，取第一个全命中）
+			}
+			best = eval
+		}
+	}
+	s.mu.Lock()
+	if bestRule != nil {
+		s.pending[code] = bestRule
+	} else {
+		delete(s.pending, code)
+	}
+	s.mu.Unlock()
+	return best, nil
+}
+
+// evalRule 对单条模板解释执行。
+// English: interprets a single template.
+func evalRule(conds []Cond, series *factorlib.StockSeries) *strategy.Evaluation {
 	met := 0
 	details := make(map[string]float64)
-	for _, c := range s.rule.Conds {
+	for _, c := range conds {
 		df, ok := factorlib.Get(c.Factor)
 		if !ok {
 			continue
@@ -108,10 +217,9 @@ func (s *PatternStrategy) Evaluate(code string, data interface{}) (*strategy.Eva
 	}
 	if met == 0 {
 		return &strategy.Evaluation{TotalScore: 0, Pass: false, Level: "watch",
-			Details: details, Reasons: map[string]string{"pattern": "形态条件未满足"}}, nil
+			Details: details, Reasons: map[string]string{"pattern": "形态条件未满足"}}
 	}
-	// 全部条件满足 → 触发
-	all := len(s.rule.Conds)
+	all := len(conds)
 	score := float64(met) / float64(all) * 100
 	pass := met == all
 	level := "watch"
@@ -123,23 +231,38 @@ func (s *PatternStrategy) Evaluate(code string, data interface{}) (*strategy.Eva
 		Confidence: score / 100,
 		Details:    details,
 		Reasons:    map[string]string{"pattern": "形态触发 " + itoa(met) + "/" + itoa(all)},
-	}, nil
+	}
 }
 
-// GenerateSignal 把评分转为交易信号（实现 Strategy 接口）。
-// English: converts the evaluation into a trade signal (Strategy interface).
+// GenerateSignal 把评分转为交易信号（实现 Strategy 接口）。信号以触发形态名为 strategy 名。
+// English: converts the evaluation into a trade signal (Strategy interface), named by the triggering pattern.
 func (s *PatternStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
 	if eval == nil || !eval.Pass {
 		return nil, nil
+	}
+	s.mu.Lock()
+	ap := s.pending[code]
+	delete(s.pending, code)
+	s.mu.Unlock()
+	name := "形态战法"
+	if ap != nil {
+		name = ap.Name
+		ap.SignalCount++
 	}
 	prio := strategy.P3
 	if eval.Confidence >= 0.9 {
 		prio = strategy.P2
 	}
+	candID := int64(0)
+	if ap != nil {
+		candID = ap.CandID
+	}
 	return &strategy.Signal{
 		Code: code, Type: strategy.SignalPattern, Action: strategy.ActionBuy,
 		Priority: prio, Confidence: eval.Confidence,
-		Reason: "形态战法触发: " + eval.Reasons["pattern"],
+		StrategyName: name,
+		Meta:         map[string]float64{"strategy_id": float64(candID)},
+		Reason:       name + "触发: " + eval.Reasons["pattern"],
 	}, nil
 }
 

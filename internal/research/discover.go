@@ -25,6 +25,17 @@ type DiscoverOpts struct {
 	MinIR      float64  // 全区间护栏 |IR| 下限（默认 0.3）
 	MinDays    int      // 全区间护栏有效日下限（默认 20）
 	SplitPct   float64  // 样本内占比（0~1，默认 0.7），用于时间分段样本外验证
+	// MinGenT 反推泛化护栏（Welch t 检验）：高分组 vs 非高分组 的 5 日前瞻收益差
+	// 的 t 统计量低于该负阈值才拦截（默认 -2，约 5% 单侧显著）。
+	// 用统计显著性而非固定百分比——样本量海量时标准误极小，哪怕 0.3% 的负超额也可能
+	// t=-11 显著为负，固定百分数阈值会错误放行；小样本下小幅负超额因 t 不显著则正常放行。
+	// English: reverse-extension guard (Welch t-test) — the t-statistic of the top-quintile vs
+	// non-top 5-day return difference below this negative threshold fails the guard (default -2, ~5%
+	// one-sided). Uses statistical significance rather than a fixed percentage: with huge sample sizes
+	// the standard error is tiny so even a 0.3% negative excess can be t=-11 and significantly negative,
+	// which a fixed-percent threshold would wrongly pass; with small samples a mildly negative excess
+	// passes because its t is not significant.
+	MinGenT float64 // 默认 -2
 }
 
 // DiscoverResult 因子发现结果。
@@ -40,11 +51,13 @@ type DiscoverResult struct {
 	Reason      string
 	InsampleIR  float64 // E3 样本内 IR（前半段）
 	OutsampleIR float64 // E3 样本外 IR（后半段）
-	// 反推泛化（E3）：在样本外区间，把每日按复合分排序，高分组（top 20%）
-	// 平均前瞻收益 vs 全样本平均 —— 衡量"相同因子环境在同类股票上是否普适上涨"。
+	// 反推泛化（E3）：在样本外区间，把每日按复合分排序，高分组（top 20%）平均前瞻收益
+	// vs 非高分组平均 —— 衡量"相同因子环境在同类股票上是否普适上涨"。
 	GenTopMean float64 // 高分组平均前瞻收益
-	GenAllMean float64 // 全样本平均前瞻收益
+	GenAllMean float64 // 非高分组平均前瞻收益
 	GenExcess  float64 // 高分组超额 = GenTopMean - GenAllMean（>0 表示因子环境普适）
+	GenStdErr  float64 // 超额的标准误（Welch）
+	GenT       float64 // 超额 t 统计量 = GenExcess / GenStdErr（< -2 显著为负 → 反推失败）
 }
 
 // DiscoverFactors 执行因子子集选择 + 分段/反推验证。
@@ -83,6 +96,13 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 	}
 	if opts.SplitPct <= 0 || opts.SplitPct >= 1 {
 		opts.SplitPct = 0.7
+	}
+	if opts.MinGenT >= 0 {
+		// 未显式设置（>=0 视为未配置）→ 默认 -2（约 5% 单侧显著）。
+		// 只有显式传负值才收紧/放宽该护栏。
+		// English: when unset (>=0 means not configured), default to -2 (~5% one-sided). Only an
+		// explicit negative value tightens/loosens this guard.
+		opts.MinGenT = -2
 	}
 	if len(opts.Factors) == 0 {
 		// 缺省用全部已注册因子
@@ -189,7 +209,7 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 	// 4) E3 分段 + 反推验证
 	res.InsampleIR = compositeIRInRange(panels, selected, opt.Weights, opts, "", splitDate)
 	res.OutsampleIR = compositeIRInRange(panels, selected, opt.Weights, opts, splitDate, "")
-	res.GenTopMean, res.GenAllMean, res.GenExcess = reverseExtension(panels, selected, dirs, opt.Weights, opts, splitDate, "")
+	res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT = reverseExtension(panels, selected, dirs, opt.Weights, opts, splitDate, "")
 
 	// 样本外护栏：样本外 IR 也需达标才视为稳健
 	if res.OutsampleIR < opts.MinIR {
@@ -198,8 +218,17 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 			res.PassGuard = false
 		}
 	}
-	if res.GenExcess <= 0 && res.PassGuard {
-		res.Reason = "反推泛化不足（高分组未跑赢全样本）"
+	// 反推泛化护栏（Welch t 检验）：高分组 vs 非高分组 收益差的 t 统计量显著为负
+	// （t < MinGenT，默认 -2）才拦截。样本量海量时标准误极小，固定百分比阈值会误放行
+	// 显著负超额，因此用统计显著性判断；小样本下小幅负超额 t 不显著则正常放行。
+	// GenT 为 NaN（样本不足/无波动）时不否决（数据不足以否定组合稳健性）。
+	// English: the reverse-extension guard uses a Welch t-test — only a t-statistic below MinGenT
+	// (default -2) fails the guard. With huge sample sizes a fixed-percent threshold would wrongly pass
+	// a significantly negative excess, so statistical significance is used; small-sample mildly
+	// negative excesses pass because their t is not significant. A NaN GenT (insufficient data) is not
+	// a veto.
+	if res.PassGuard && !isNaN(res.GenT) && res.GenT < opts.MinGenT {
+		res.Reason = "反推泛化不足（高分组超额" + trimFloat(res.GenExcess) + "，t=" + trimFloat(res.GenT) + "显著为负）"
 		res.PassGuard = false
 	}
 	return res
@@ -219,14 +248,15 @@ func compositeIRInRange(panels []*Panel, factors []string, weights map[string]fl
 // reverseExtension 反推泛化：在 [start,end] 区间，每日按复合分排序，
 // 高分组（top 20%）平均前瞻收益 vs 全样本平均，返回 (topMean, allMean, excess)。
 // 衡量"相同因子环境在同类股票上是否普适上涨"（对应需求：反推其他股票看同环境是否涨）。
-// English: reverse-extension generalization — in [start,end], each day ranks stocks by composite
-// score; compares the top-quintile mean forward return to the full-sample mean, returning
-// (topMean, allMean, excess). Measures whether the factor environment generalizes to similar stocks.
-func reverseExtension(panels []*Panel, factors []string, dirs map[string]int, weights map[string]float64, opts DiscoverOpts, start, end string) (float64, float64, float64) {
-	type scored struct {
-		score, r float64
-	}
-	var all, top []scored
+// 与 CompositeIC 同口径：每日对复合分做截面 z 标准化后再排序，保证 top 分组与 IR 一致，
+// 避免原始因子量纲差异导致高分组选错股票。
+// English: reverse-extension generalization — in [start,end], each day ranks stocks by the
+// cross-sectional z-scored composite (consistent with CompositeIC), compares the top-quintile mean
+// forward return to the non-top mean, and returns (topMean, restMean, excess, stdErr, t) where t is
+// the Welch t-statistic of the excess (top vs non-top). Measures whether the factor environment
+// generalizes to similar stocks, using statistical significance rather than a fixed percentage.
+func reverseExtension(panels []*Panel, factors []string, dirs map[string]int, weights map[string]float64, opts DiscoverOpts, start, end string) (float64, float64, float64, float64, float64) {
+	var topRets, restRets []float64
 	for _, d := range unionDates(panels) {
 		if start != "" && d < start {
 			continue
@@ -234,7 +264,7 @@ func reverseExtension(panels []*Panel, factors []string, dirs map[string]int, we
 		if end != "" && d > end {
 			continue
 		}
-		// 当日截面：复合分 + 前瞻收益
+		// 当日截面：原始复合分 + 前瞻收益
 		type kv struct {
 			code string
 			sc   float64
@@ -259,31 +289,76 @@ func reverseExtension(panels []*Panel, factors []string, dirs map[string]int, we
 		if len(day) < opts.MinStocks {
 			continue
 		}
-		sort.Slice(day, func(i, j int) bool { return day[i].sc > day[j].sc })
-		nTop := len(day) / 5
+		// 截面 z 标准化（与 CompositeIC 同口径）：z = (sc - mean) / std
+		var sum, sum2 float64
+		for _, v := range day {
+			sum += v.sc
+			sum2 += v.sc * v.sc
+		}
+		mean := sum / float64(len(day))
+		std := math.Sqrt(sum2/float64(len(day)) - mean*mean)
+		if std <= 0 {
+			continue
+		}
+		zs := make([]kv, len(day))
+		for i, v := range day {
+			zs[i] = kv{v.code, (v.sc - mean) / std, v.r}
+		}
+		sort.Slice(zs, func(i, j int) bool { return zs[i].sc > zs[j].sc })
+		nTop := len(zs) / 5
 		if nTop < 1 {
 			nTop = 1
 		}
-		for i, v := range day {
-			all = append(all, scored{v.sc, v.r})
+		for i, v := range zs {
 			if i < nTop {
-				top = append(top, scored{v.sc, v.r})
+				topRets = append(topRets, v.r)
+			} else {
+				restRets = append(restRets, v.r)
 			}
 		}
 	}
-	if len(all) == 0 || len(top) == 0 {
-		return 0, 0, 0
+	if len(topRets) == 0 || len(restRets) == 0 {
+		return 0, 0, 0, 0, nan()
 	}
-	var as, ts float64
-	for _, v := range all {
-		as += v.r
+	topMean := meanOf(topRets)
+	restMean := meanOf(restRets)
+	excess := topMean - restMean
+	// Welch t 检验：t = (topMean - restMean) / sqrt(var_top/n_top + var_rest/n_rest)
+	varTop := varianceOf(topRets, topMean)
+	varRest := varianceOf(restRets, restMean)
+	stdErr := math.Sqrt(varTop/float64(len(topRets)) + varRest/float64(len(restRets)))
+	var t float64
+	if stdErr > 0 {
+		t = excess / stdErr
+	} else {
+		t = nan()
 	}
-	for _, v := range top {
-		ts += v.r
+	return topMean, restMean, excess, stdErr, t
+}
+
+// meanOf 返回切片均值（空切片返回 0）。
+func meanOf(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
 	}
-	allMean := as / float64(len(all))
-	topMean := ts / float64(len(top))
-	return topMean, allMean, topMean - allMean
+	var s float64
+	for _, v := range xs {
+		s += v
+	}
+	return s / float64(len(xs))
+}
+
+// varianceOf 返回切片总体方差（相对给定均值）。
+func varianceOf(xs []float64, mean float64) float64 {
+	if len(xs) < 2 {
+		return 0
+	}
+	var s float64
+	for _, v := range xs {
+		d := v - mean
+		s += d * d
+	}
+	return s / float64(len(xs))
 }
 
 // compositeScore 计算单只股票在某日的加权复合分（含方向）。

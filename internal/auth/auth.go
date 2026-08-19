@@ -23,15 +23,15 @@ import (
 // User 用户账号记录。
 // （User is a user account record.）
 type User struct {
-	ID           string   `json:"id"`                  // 用户唯一标识（u_ 前缀）
-	Username     string   `json:"username"`            // 登录用户名
-	PasswordHash string   `json:"password_hash"`       // bcrypt 密码哈希（临时账户为空）
-	Token        string   `json:"token,omitempty"`     // 认证令牌
-	TokenExp     int64    `json:"token_exp,omitempty"` // 令牌过期 Unix 时间戳（0 表示永不过期）
-	Role         string   `json:"role,omitempty"`      // 角色：admin=管理员 / user=普通用户（空按 user 处理）
-	Perms        []string `json:"perms,omitempty"`     // 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
-	Enabled      bool     `json:"enabled,omitempty"`   // 账号是否启用（默认 true；禁用后登录/令牌失效）
-	CreatedAt    int64    `json:"created_at"`          // 创建时间 Unix 时间戳
+	ID           string   `json:"id"`                   // 用户唯一标识（u_ 前缀）
+	Username     string   `json:"username"`             // 登录用户名
+	PasswordHash string   `json:"password_hash"`        // bcrypt 密码哈希（临时账户为空）
+	Token        string   `json:"token,omitempty"`      // 认证令牌
+	TokenExp     int64    `json:"token_exp,omitempty"`  // 令牌过期 Unix 时间戳（0 表示永不过期）
+	Role         string   `json:"role,omitempty"`       // 角色：admin=管理员 / user=普通用户（空按 user 处理）
+	Perms        []string `json:"perms,omitempty"`      // 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
+	Enabled      bool     `json:"enabled,omitempty"`    // 账号是否启用（默认 true；禁用后登录/令牌失效）
+	CreatedAt    int64    `json:"created_at"`           // 创建时间 Unix 时间戳
 	ExpiresAt    int64    `json:"expires_at,omitempty"` // 账号有效期截止 Unix 时间戳（0=永久）
 }
 
@@ -251,7 +251,7 @@ func (m *Manager) Register(username, password string) (*User, error) {
 		Username:     username,
 		PasswordHash: string(hash),
 		Token:        token,
-		TokenExp:     0,     // 0 表示令牌永不过期
+		TokenExp:     0,        // 0 表示令牌永不过期
 		Role:         RoleUser, // 注册用户默认为普通用户
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),

@@ -263,39 +263,33 @@ func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userI
 			setter.SetUserID(userID)
 		}
 	}
-	// E6：从 applied_factors.json 注入审批通过的因子战法规则（未启用时该文件不存在 → 跳过）。
-	// English: E6 — inject the approved factor-strategy rule from applied_factors.json (skipped when
-	// the file is absent, i.e. the factor strategy is not enabled).
-	rule, err := research.LoadAppliedFactorRule(dataDir)
+	// E6：从 applied_factors.json 注入全部**启用**的因子战法规则（战法库，多规则同时实盘）。
+	// English: E6 — inject all **enabled** factor-strategy rules from applied_factors.json (the
+	// strategy library; multiple rules run concurrently).
+	rules, err := research.LoadEnabledFactorRules(dataDir)
 	if err != nil {
-		log.Printf("[registry] 加载因子战法规则失败: %v", err)
+		log.Printf("[registry] 加载因子战法库失败: %v", err)
 	}
-	if rule != nil {
+	if len(rules) > 0 {
 		for i := range runners {
 			if fs, ok := runners[i].Strategy.(*factorstrat.FactorStrategy); ok {
-				fs.SetRule(factorstrat.Rule{
-					Factors: rule.Factors, Weights: rule.Weights,
-					Directions: rule.Directions, BuyThreshold: rule.BuyThreshold,
-				})
-				log.Printf("[registry] 因子战法已启用: %d 个因子 阈值=%.0f", len(rule.Factors), rule.BuyThreshold)
+				fs.SetRules(rules)
+				log.Printf("[registry] 因子战法库已启用 %d 条规则", len(rules))
 			}
 		}
 	}
-	// F3：从 applied_patterns.json 注入审批通过的形态模板规则。
-	// English: F3 — inject the approved pattern-template rule from applied_patterns.json.
-	pr, err := research.LoadAppliedPatternRule(dataDir)
+	// F3：从 applied_patterns.json 注入全部**启用**的形态模板规则（形态战法库，多形态同时实盘）。
+	// English: F3 — inject all **enabled** pattern-template rules from applied_patterns.json (the
+	// pattern library; multiple patterns run concurrently).
+	patterns, err := research.LoadEnabledPatternRules(dataDir)
 	if err != nil {
-		log.Printf("[registry] 加载形态战法规则失败: %v", err)
+		log.Printf("[registry] 加载形态战法库失败: %v", err)
 	}
-	if pr != nil {
+	if len(patterns) > 0 {
 		for i := range runners {
 			if ps, ok := runners[i].Strategy.(*patternstrat.PatternStrategy); ok {
-				conds := make([]patternstrat.Cond, len(pr.Conds))
-				for j, c := range pr.Conds {
-					conds[j] = patternstrat.Cond{Factor: c.Factor, Min: c.Min, Max: c.Max}
-				}
-				ps.SetRule(patternstrat.PatternRule{Name: pr.Name, Conds: conds})
-				log.Printf("[registry] 形态战法已启用: %d 个条件", len(conds))
+				ps.SetRules(patterns)
+				log.Printf("[registry] 形态战法库已启用 %d 条规则", len(patterns))
 			}
 		}
 	}

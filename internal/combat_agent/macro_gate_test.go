@@ -1,5 +1,6 @@
 // E1 宏观利空门控测试：交割日信号降级/拦截逻辑。
 // 覆盖：非 N 低置信买入降级、高置信放行、N 形拦截、动量 watch 拦截、门控关闭不生效。
+// English: E1 macro bearish gate tests: settlement-day signal downgrade/blocking logic. Covers: non-N low-confidence buys downgraded, high-confidence passes, N-shape blocked, momentum watch blocked, and gate disabled has no effect.
 package combat_agent
 
 import (
@@ -12,11 +13,13 @@ import (
 )
 
 // testSignal 构造一条测试信号。
+// English: testSignal builds a test signal.
 func testSignal(strategyType string, action string, conf float64) Signal {
 	return Signal{Strategy: strategyType, Action: action, Confidence: conf}
 }
 
 // TestApplyMacroGateLowConfBuy 交割日：低置信买入信号降级为 watch。
+// English: TestApplyMacroGateLowConfBuy on settlement day: low-confidence buy signals are downgraded to watch.
 func TestApplyMacroGateLowConfBuy(t *testing.T) {
 	cfg := config.MacroGateConfig{Enabled: true, MinConfidence: 0.85}
 	sigs := []Signal{
@@ -32,6 +35,7 @@ func TestApplyMacroGateLowConfBuy(t *testing.T) {
 }
 
 // TestApplyMacroGateHighConfBuy 交割日：高置信（特别高质量）买入信号放行。
+// English: TestApplyMacroGateHighConfBuy on settlement day: high-confidence (exceptional quality) buy signals pass through.
 func TestApplyMacroGateHighConfBuy(t *testing.T) {
 	cfg := config.MacroGateConfig{Enabled: true, MinConfidence: 0.85}
 	sigs := []Signal{
@@ -44,6 +48,7 @@ func TestApplyMacroGateHighConfBuy(t *testing.T) {
 }
 
 // TestApplyMacroGateNShape 交割日：N 形超短买入一律拦截为 watch。
+// English: TestApplyMacroGateNShape on settlement day: N-shape ultra-short buys are always blocked to watch.
 func TestApplyMacroGateNShape(t *testing.T) {
 	cfg := config.MacroGateConfig{Enabled: true}
 	sigs := []Signal{
@@ -56,6 +61,7 @@ func TestApplyMacroGateNShape(t *testing.T) {
 }
 
 // TestApplyMacroGateMomentumWatch 交割日：动量 watch 观察信号拦截。
+// English: TestApplyMacroGateMomentumWatch on settlement day: momentum watch signals are blocked.
 func TestApplyMacroGateMomentumWatch(t *testing.T) {
 	cfg := config.MacroGateConfig{Enabled: true}
 	sigs := []Signal{
@@ -68,6 +74,7 @@ func TestApplyMacroGateMomentumWatch(t *testing.T) {
 }
 
 // TestApplyMacroGateInactive 门控关闭或未命中交割日时行为不变。
+// English: TestApplyMacroGateInactive behavior is unchanged when the gate is disabled or settlement day is not hit.
 func TestApplyMacroGateInactive(t *testing.T) {
 	cfg := config.MacroGateConfig{Enabled: true}
 	sigs := []Signal{
@@ -80,6 +87,7 @@ func TestApplyMacroGateInactive(t *testing.T) {
 }
 
 // TestMacroGateLevels 级别匹配：contract 命中，其他级别（如 nfp）不命中。
+// English: TestMacroGateLevels level matching: contract matches, other levels (e.g. nfp) do not.
 func TestMacroGateLevels(t *testing.T) {
 	if !hasGateTriggerLevel([]data.MacroEvent{{Level: "contract"}}, nil) {
 		t.Fatal("contract 应命中门控")
@@ -93,6 +101,7 @@ func TestMacroGateLevels(t *testing.T) {
 }
 
 // containsStr 判断字符串包含子串。
+// English: containsStr reports whether a string contains a substring.
 func containsStr(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
@@ -103,13 +112,16 @@ func containsStr(s, sub string) bool {
 }
 
 // TestMacroEventsNow 交割日检测：2026 年 3 月 20 日（周五）应为交割日附近影响期。
+// English: TestMacroEventsNow settlement-day detection: March 20, 2026 (Friday) should be within the settlement-day impact window.
 func TestMacroEventsNow(t *testing.T) {
 	// 2026-03-20 是周五（每月第三个周五交割日）；影响期 Duration=2 天（3/18~3/22）
+	// English: 2026-03-20 is a Friday (settlement day is the third Friday of each month); impact window Duration=2 days (3/18~3/22).
 	events := macroEventsAt(time.Date(2026, 3, 20, 10, 0, 0, 0, time.UTC))
 	if !hasGateTriggerLevel(events, macroGateLevels) {
 		t.Fatalf("2026-03-20 应为交割日影响期，实际事件=%+v", events)
 	}
 	// 非交割日（如 2026-03-10，月中）不应命中
+	// English: A non-settlement day (e.g. 2026-03-10, mid-month) should not match.
 	events2 := macroEventsAt(time.Date(2026, 3, 10, 10, 0, 0, 0, time.UTC))
 	if hasGateTriggerLevel(events2, macroGateLevels) {
 		t.Fatalf("2026-03-10 不应为交割日影响期，实际事件=%+v", events2)

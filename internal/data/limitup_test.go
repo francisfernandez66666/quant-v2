@@ -1,4 +1,5 @@
 // 涨停池 / 龙虎榜解析单测：锁定价格单位换算，防止"分/厘/元"误判回归。
+// English: Unit tests for limit-up pool / dragon-tiger list parsing: pin down price-unit conversion to prevent "分/厘/元" misjudgment regressions.
 package data
 
 import (

@@ -13,6 +13,7 @@ import (
 
 // fakeDragonStrategy 固定返回 full_chain Pass 的伪龙头战法，用于隔离测试动量"提升才提醒"门槛
 // （龙头战法不套用双响炮第二波确认门，可干净地验证动量门槛）。
+// English: fakeDragonStrategy is a fake dragon strategy that always returns full_chain Pass, used to isolate the momentum "alert only on improvement" gate (the dragon strategy does not apply the double-bump second-wave confirmation gate, so the momentum gate can be tested cleanly).
 type fakeDragonStrategy struct{}
 
 func (fakeDragonStrategy) Name() string              { return "fake_dragon" }
@@ -26,6 +27,7 @@ func (fakeDragonStrategy) GenerateSignal(code string, _ *strategy.Evaluation) (*
 
 // mkMomentumMD 构造带有效动量数据的行情：Volume>0、≥5 根日K、非零 MinuteMACD。
 // changePct 控制动量分里的价格维度，volume 控制量能维度。
+// English: mkMomentumMD builds a quote with valid momentum data: Volume>0, >=5 daily K-lines, non-zero MinuteMACD. changePct controls the price dimension of the momentum score and volume controls the volume dimension.
 func mkMomentumMD(chgPct float64, volume float64) *strategy_engine.StockMarketData {
 	base := time.Now()
 	kl := make([]data.KLine, 20)
@@ -47,6 +49,7 @@ func mkMomentumMD(chgPct float64, volume float64) *strategy_engine.StockMarketDa
 
 // runMomentumPool 用一个复用 Agent 按给定行情序列逐轮跑 ScorePool（龙头战法），返回每轮该股是否有信号。
 // 关键：Agent 跨轮复用，动量历史 momentumPrev 与双响炮状态机才会跨 5s 周期保留。
+// English: runMomentumPool runs ScorePool round by round (dragon strategy) over the given quote sequence with a reused Agent, returning whether the stock had a signal each round. Key point: the Agent is reused across rounds so the momentum history momentumPrev and the double-bump state machine persist across 5s cycles.
 func runMomentumPool(t *testing.T, cfg *config.StrategyConfig, mds ...*strategy_engine.StockMarketData) []bool {
 	t.Helper()
 	a := New(cfg)
@@ -67,6 +70,7 @@ func runMomentumPool(t *testing.T, cfg *config.StrategyConfig, mds ...*strategy_
 }
 
 // activeVCfg 返回动量门槛开启且数据有效所需的动量配置：Volume>0 且 MACD 有效。
+// English: activeMomentumCfg returns the momentum config needed for the gate enabled and valid data: Volume>0 and valid MACD.
 func activeMomentumCfg(t *testing.T) *config.StrategyConfig {
 	t.Helper()
 	cfg := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
@@ -76,8 +80,10 @@ func activeMomentumCfg(t *testing.T) *config.StrategyConfig {
 }
 
 // TestMomentumGateImprovedPasses 验证：动量分提升时放行信号。
+// English: TestMomentumGateImprovedPasses verifies: signals pass when the momentum score improves.
 func TestMomentumGateImprovedPasses(t *testing.T) {
 	// 第一轮 momentum=60（起点，无上一轮 → 放行），第二轮 changePct 更高 → 动量提升 → 放行
+	// English: Round one momentum=60 (starting point, no previous round → passes); round two has a higher changePct → momentum improves → passes.
 	low := mkMomentumMD(1.0, 20000)  // 较低动量
 	high := mkMomentumMD(6.0, 20000) // 涨幅更大 → 动量提升
 	outs := runMomentumPool(t, activeMomentumCfg(t), low, high)
@@ -87,8 +93,10 @@ func TestMomentumGateImprovedPasses(t *testing.T) {
 }
 
 // TestMomentumGateFallWithinTolPasses 验证：动量分虽略回落但 ≤ 容忍差(5) 仍放行。
+// English: TestMomentumGateFallWithinTolPasses verifies: a slight momentum drop within the tolerance (5) still passes.
 func TestMomentumGateFallWithinTolPasses(t *testing.T) {
 	// 第一轮涨幅 6% 高动量，第二轮涨幅 3% 略回落（差 3 ≤ 5）→ 仍放行
+	// English: Round one +6% high momentum, round two +3% slight drop (difference 3 <= 5) → still passes.
 	high := mkMomentumMD(6.0, 20000)
 	medium := mkMomentumMD(3.0, 20000)
 	outs := runMomentumPool(t, activeMomentumCfg(t), high, medium)
@@ -98,8 +106,10 @@ func TestMomentumGateFallWithinTolPasses(t *testing.T) {
 }
 
 // TestMomentumGateFallBeyondTolSilent 验证：动量分明显回落（>容忍差）时静默拦截信号。
+// English: TestMomentumGateFallBeyondTolSilent verifies: signals are silently blocked when momentum drops markedly (>tolerance).
 func TestMomentumGateFallBeyondTolSilent(t *testing.T) {
 	// 第一轮涨幅 6% 高动量，第二轮涨幅 0%（平盘）→ 动量明显回落 → 拦截
+	// English: Round one +6% high momentum, round two 0% (flat) → momentum drops markedly → blocked.
 	high := mkMomentumMD(6.0, 20000)
 	flat := mkMomentumMD(0.0, 20000)
 	outs := runMomentumPool(t, activeMomentumCfg(t), high, flat)
@@ -112,8 +122,10 @@ func TestMomentumGateFallBeyondTolSilent(t *testing.T) {
 }
 
 // TestMomentumGateInvalidDataPasses 验证：动量数据无效（竞价 Volume=0）时跳过门槛放行。
+// English: TestMomentumGateInvalidDataPasses verifies: when momentum data is invalid (auction Volume=0) the gate is skipped and the signal passes.
 func TestMomentumGateInvalidDataPasses(t *testing.T) {
 	// Volume=0 → momentumDataValid=false → 门槛放行（等实盘有量后再正常判定）
+	// English: Volume=0 → momentumDataValid=false → the gate passes (judged normally once live volume appears).
 	high := mkMomentumMD(6.0, 20000)
 	beforeOpen := mkMomentumMD(3.0, 0) // 竞价无成交
 	outs := runMomentumPool(t, activeMomentumCfg(t), high, beforeOpen)
@@ -123,6 +135,7 @@ func TestMomentumGateInvalidDataPasses(t *testing.T) {
 }
 
 // TestMomentumGateDisabledAlwaysPasses 验证：动量门槛开关关闭时，即使动量回落也始终放行。
+// English: TestMomentumGateDisabledAlwaysPasses verifies: when the momentum gate toggle is off, signals always pass even on a momentum drop.
 func TestMomentumGateDisabledAlwaysPasses(t *testing.T) {
 	cfg := activeMomentumCfg(t)
 	cfg.Momentum.MomentumGateEnabled = false

@@ -8,6 +8,7 @@ import (
 )
 
 // maxCatchUpPages 最多追回页数（同花顺20条/页 × 25页 = 500条）（Max catch-up pages: 20 items/page × 25 = 500.）
+// English: max catch-up pages (THS 20 items/page x 25 pages = 500 items).
 const maxCatchUpPages = 25
 
 // maxCatchUpItems 单轮最多追回条数上限。
@@ -18,6 +19,7 @@ const maxCatchUpPages = 25
 // then blocking for hours on sequential LLM Stage0/Stage2 calls, which would keep asyncBusy set and make the
 // main loop skip every following round (dashboard/logs freeze). Items beyond the cap are caught up in the next
 // 5-min round so each round's processing time stays bounded.）
+// English: maxCatchUpItems caps items caught up per round. It prevents a restart (lost tracker ledger) from pulling back hundreds of items and then blocking for hours on sequential LLM Stage0/Stage2 calls, which would keep asyncBusy set and make the main loop skip all following rounds (dashboard/logs freeze). Items beyond the cap are caught up in the next 5-minute round, keeping each round's processing time bounded.
 const maxCatchUpItems = 60
 
 // fetchCatchUp 追回未读新闻：多源拉取（同花顺分页 + 财联社 + 新浪兜底），
@@ -25,25 +27,31 @@ const maxCatchUpItems = 60
 // force=true 时忽略历史已见标题（仅按本轮 seen 打重），用于"手动 LLM 补推"重跑分析。
 // （fetchCatchUp fetches unread news from THS paging + CLS + Sina fallback, then dedupes, marks seen and
 // concurrently enriches bodies. force=true ignores historical seen titles for manual LLM re-analysis.）
+// English: fetchCatchUp fetches unread news from multiple sources (THS paging + Cailian Press + Sina fallback), dedupes uniformly, marks seen, then concurrently fetches bodies. force=true ignores historical seen titles (dedupes only on this round's seen) for manual LLM re-analysis.
 func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 	var all []data.NewsItem
 	// seen 记录本轮已见过的标题（截断到60字符），跨源去重
+	// English: seen records titles already seen this round (truncated to 60 chars) for cross-source dedup
 	seen := make(map[string]bool)
 
 	// 主源：同花顺（支持分页，追回量大）
+	// English: primary source: THS (supports paging, large catch-up volume)
 	thsItems := a.fetchTHSPages(seen, force)
 	all = append(all, thsItems...)
 
 	// 主源：财联社电报（自带正文，覆盖标题党短板）
+	// English: primary source: Cailian Press telegrams (bodies included, covering the clickbait shortfall)
 	clsItems := a.fetchCLSOnce(seen, force)
 	all = append(all, clsItems...)
 
 	// 新浪（只1页，去重）：补充视角，始终尝试拉取（不再受主源数量门槛限制）
+	// English: Sina (1 page only, deduped): supplementary view, always attempted (no longer gated by a primary-source quantity threshold)
 	sinaItems := a.fetchSinaOnce(seen, force)
 	all = append(all, sinaItems...)
 
 	// 单轮数量上限（仅常规轮询；force 补推场景不截断，全量重分析）
 	// （Per-round cap for the normal polling loop only; force re-analysis is not truncated.）
+	// English: per-round cap for the normal polling loop only; force re-analysis is not truncated (full re-analysis).
 	if !force && len(all) > maxCatchUpItems {
 		log.Printf("[newsagent] 单轮追回 %d 条超上限 %d, 截断取前 %d 条（余量留待下一轮）",
 			len(all), maxCatchUpItems, maxCatchUpItems)
@@ -56,13 +64,16 @@ func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 	// （Fetched news joins the unattributed queue instead of being marked seen immediately: items are
 	// only marked seen (RemovePending) once Stage0/Stage2 attribution succeeds; failures stay queued for
 	// premarket/next-round retry, fixing yesterday's news being permanently lost to slow/failed LLM.）
+	// English: fetched news joins the unattributed queue instead of being marked seen immediately: items are only marked seen (RemovePending) once LLM Stage0/Stage2 attribution succeeds; failures stay queued for premarket/next-round retry, fixing the problem of last night's news being permanently lost to a slow/failed LLM. Fetch dedup now skips seen or already-queued titles.
 	a.tracker.AddPending(all)
 	// 立即落盘未归因队列：若后续 LLM 阶段耗时数小时/进程被杀，也不会在重启后重复追回同一批新闻
 	// （Immediately persist the queue so a later long LLM phase or a killed process does not re-fetch
 	// the same news after restart.）
+	// English: immediately persist the unattributed queue so a later long LLM phase or a killed process does not re-fetch the same news after a restart.
 	_ = a.tracker.save()
 
 	// 并发抓取原文正文（失败保留摘要，不阻断流水线）
+	// English: concurrently fetch article bodies (on failure keep the digest, never block the pipeline)
 	a.EnrichContents(all)
 
 	return all
@@ -70,6 +81,7 @@ func (a *Agent) fetchCatchUp(force bool) []data.NewsItem {
 
 // FetchForce 强制拉取最近新闻（忽略 tracker 历史去重），供"手动 LLM 补推"重跑分析使用。
 // （FetchForce fetches recent news ignoring tracker history dedup, for manual LLM re-analysis.）
+// English: FetchForce fetches recent news ignoring tracker history dedup, for manual LLM re-analysis.
 func (a *Agent) FetchForce() []data.NewsItem {
 	return a.fetchCatchUp(true)
 }
@@ -79,6 +91,7 @@ func (a *Agent) FetchForce() []data.NewsItem {
 // force=true 时忽略历史去重（补推场景），仅按本轮 seen 打重，并追完所有页。
 // （fetchTHSPages pages through THS news (20/page), keeping only unread items. Stops when a page is fully
 // read; with force=true it ignores history dedup and fetches all pages.）
+// English: fetchTHSPages pages through THS news (20 items/page), keeping only unread items. It stops paging when the current page is fully read, having reached the last-seen position; with force=true it ignores history dedup (re-analysis scenario), dedupes only on this round's seen and fetches all pages.
 func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem {
 	var all []data.NewsItem
 
@@ -93,6 +106,7 @@ func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem 
 		}
 
 		// 页内去重：跳过本轮已见、或（非force时）已处理(seen)或已排队(pending)的标题
+		// English: in-page dedup: skip titles seen this round, or (when not force) already processed (seen) or queued (pending)
 		var fresh []data.NewsItem
 		for _, item := range items {
 			key := truncateStr(item.Title, 60)
@@ -106,11 +120,13 @@ func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem 
 		all = append(all, fresh...)
 
 		// 如果当前页没有未读新闻了，说明应该停止追页（force 时仍继续追完所有页）
+		// English: if the current page has no unread news, stop paging (with force, keep fetching all pages)
 		if !force && len(fresh) == 0 {
 			break
 		}
 
 		// 页间隔，避免对同花顺造成请求压力
+		// English: interval between pages to avoid request pressure on THS
 		time.Sleep(200 * time.Millisecond)
 	}
 
@@ -120,6 +136,7 @@ func (a *Agent) fetchTHSPages(seen map[string]bool, force bool) []data.NewsItem 
 
 // fetchSinaOnce 拉取一页新浪新闻（20 条），去重后返回。
 // （fetchSinaOnce fetches one page of Sina news (20 items) and returns the deduplicated results.）
+// English: fetchSinaOnce fetches one page of Sina news (20 items) and returns the deduplicated results.
 func (a *Agent) fetchSinaOnce(seen map[string]bool, force bool) []data.NewsItem {
 	items, err := a.marketAPI.GetSinaNews(20)
 	if err != nil {
@@ -140,6 +157,7 @@ func (a *Agent) fetchSinaOnce(seen map[string]bool, force bool) []data.NewsItem 
 
 // fetchCLSOnce 拉取一页财联社电报（正文自带），去重后返回。
 // （fetchCLSOnce fetches one page of CLS telegrams (with bodies) and returns the deduplicated results.）
+// English: fetchCLSOnce fetches one page of Cailian Press telegrams (with bodies) and returns the deduplicated results.
 func (a *Agent) fetchCLSOnce(seen map[string]bool, force bool) []data.NewsItem {
 	items, err := a.marketAPI.GetCLSNews(20)
 	if err != nil {
@@ -161,6 +179,7 @@ func (a *Agent) fetchCLSOnce(seen map[string]bool, force bool) []data.NewsItem {
 
 // truncateStr 按字符数截断字符串（最多 maxLen 个字符），用于标题去重键归一。
 // （truncateStr truncates a string by runes (max maxLen) to normalize dedup keys.）
+// English: truncateStr truncates a string by runes (max maxLen) to normalize dedup keys.
 func truncateStr(s string, maxLen int) string {
 	runes := []rune(s)
 	if len(runes) > maxLen {

@@ -33,13 +33,86 @@ type Rules struct {
 	RiskCtrl   RiskCtrlConfig   `json:"risk_ctrl"`     // 风控参数
 	Position   PositionConfig   `json:"position"`      // 仓位管理参数
 	Notify     NotifyConfig     `json:"notify"`        // 通知推送参数
+	Scheduler  SchedulerConfig  `json:"scheduler"`     // 研究调度器配置（quant-research 服务读取）
+}
+
+// SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
+// 交易时段：只做 dataload 增量下载（绝不回测/研究）；盘后/周末：跑完整夜间研究作业。
+// English: session-based research scheduler config (read by the standalone quant-research service).
+// Trading hours run dataload incremental download only (never backtest/research); after-hours and
+// weekends run the full nightly research job.
+type SchedulerConfig struct {
+	Enabled             bool                      `json:"enabled"`                 // 总开关（默认 true）
+	ResearchBin         string                    `json:"research_bin"`            // research 二进制路径
+	DataloadBin         string                    `json:"dataload_bin"`            // dataload 二进制路径
+	DB                  string                    `json:"db"`                      // 研究库路径（trading.db）
+	PyURL               string                    `json:"pyurl"`                   // baostock sidecar 地址（默认 http://127.0.0.1:8787）
+	Nightly             NightlyConfig             `json:"nightly"`                 // 盘后/周末夜间作业
+	DataloadDuringTrade DataloadDuringTradeConfig `json:"dataload_during_trading"` // 交易时段增量下载
+}
+
+// NightlyConfig 夜间研究作业配置（盘后/周末触发）。
+type NightlyConfig struct {
+	StartHHMM        int      `json:"start_hhmm"`         // 交易日盘后启动时间 HHMM（默认 1530）
+	WeekendStartHHMM int      `json:"weekend_start_hhmm"` // 周末启动时间 HHMM（默认 1530，周六周日各跑一次）
+	Steps            []string `json:"steps"`              // 步骤序列（dataload/sector_rebuild/discover_factors/discover_patterns/list）
+	AbortOnError     bool     `json:"abort_on_error"`     // 单步失败是否终止整链（默认 false=记录后继续）
+	// BacktestEnabled 是否在发现因子候选后追加一次 B4 全链路回测，把候选的「回测超额」
+	// （avg_excess）填上（前端原本显示"未测"）。默认 false（省时省 CPU）。
+	// English: when true, after factor discovery the nightly job also runs a B4 full-chain backtest
+	// on the newest proposed factor candidate, filling in its "回测超额" (avg_excess) — the field the
+	// UI shows as "未测" otherwise. Default false to save time/CPU.
+	BacktestEnabled bool `json:"backtest_enabled"`
+	// BacktestEvents B4 回测事件数上限（backtest_enabled 时生效；0=用默认合理值）。
+	BacktestEvents int `json:"backtest_events"`
+}
+
+// DataloadDuringTradeConfig 交易时段增量下载配置（只下载，不含任何研究/回测）。
+type DataloadDuringTradeConfig struct {
+	Enabled         bool `json:"enabled"`          // 开关（默认 true）
+	IntervalMinutes int  `json:"interval_minutes"` // 间隔分钟（默认 30）
+}
+
+// DefaultSchedulerConfig 返回研究调度器出厂默认配置。
+// English: returns factory-default research-scheduler config.
+func DefaultSchedulerConfig() SchedulerConfig {
+	return SchedulerConfig{
+		Enabled:     true,
+		ResearchBin: "research",
+		DataloadBin: "dataload",
+		PyURL:       "http://127.0.0.1:8787",
+		Nightly: NightlyConfig{
+			StartHHMM:        1530,
+			WeekendStartHHMM: 1530,
+			Steps:            []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "list"},
+			AbortOnError:     false,
+			BacktestEnabled:  false,
+			BacktestEvents:   0,
+		},
+		DataloadDuringTrade: DataloadDuringTradeConfig{
+			Enabled:         true,
+			IntervalMinutes: 30,
+		},
+	}
 }
 
 // NotifyConfig 通知推送配置：Webhook 回调地址列表（P1 清仓/止损强提醒时异步回调）。
 // （NotifyConfig holds notification settings, e.g. the Webhook callback URLs used when P1
 // close-out/stop-loss alerts fire.）
 type NotifyConfig struct {
-	WebhookURLs []string `json:"webhook_urls,omitempty"` // Webhook 地址列表（空则只走桌面/SSE）
+	WebhookURLs []string   `json:"webhook_urls,omitempty"` // Webhook 地址列表（空则只走桌面/SSE）
+	Push        PushConfig `json:"push,omitempty"`         // 外部推送网关配置（APK 后台/离线触达）
+}
+
+// PushConfig 外部推送网关配置。
+// URL 指向一个接收 JSON 的推送地址（自建 APK 中转，或极光/个推等厂商 REST 网关）；
+// Enabled 关闭时不启用推送网关。本配置为通用 webhook 形态，厂商专属字段由网关层扩展。
+// （PushConfig configures the external push gateway. URL points to a JSON endpoint (self-hosted APK
+// relay or a vendor REST gateway). Enabled=false disables it. This uses the generic webhook shape;
+// vendor-specific fields can extend the gateway layer.）
+type PushConfig struct {
+	Enabled bool   `json:"enabled"`       // 是否启用外部推送网关
+	URL     string `json:"url,omitempty"` // 推送接收地址（JSON POST）
 }
 
 // EmotionConfig 情绪周期六个阶段（冰点/启动/发酵/高潮/背离/退潮）的判定阈值。
@@ -564,6 +637,20 @@ func (m *Manager) GetD1Config() *D1Config {
 	return m.D1
 }
 
+// SetSchedulerConfig 更新全局研究调度器配置（rules.scheduler）并持久化到文件。
+// 用于前端"全量回测全局开关"等调度选项的读写。
+// English: updates the global research-scheduler config (rules.scheduler) and persists it, used by the
+// frontend "full-backtest global toggle" and other scheduler options.
+func (m *Manager) SetSchedulerConfig(cfg *SchedulerConfig) {
+	if cfg == nil {
+		return
+	}
+	m.mu.Lock()
+	m.Rules.Scheduler = *cfg
+	m.mu.Unlock()
+	m.Save()
+}
+
 // SetD1Config 更新全局 D1 规则并持久化到文件。
 // （SetD1Config updates the global D1 rules and persists them.）
 func (m *Manager) SetD1Config(cfg *D1Config) {
@@ -621,8 +708,7 @@ func (m *Manager) Load() {
 	log.Printf("[config] 已加载配置文件: %s", m.path)
 }
 
-// Save 将当前配置序列化为 JSON 并写入文件。
-// （Save serializes the current config to JSON and writes it to the file.）
+// Save 将当前配置序列化为 JSON 并写入文件。// （Save serializes the current config to JSON and writes it to the file.）
 func (m *Manager) Save() {
 	wrapper := struct {
 		Rules *Rules    `json:"rules"`
@@ -641,6 +727,148 @@ func (m *Manager) Save() {
 		return
 	}
 	log.Printf("[config] 已保存配置文件: %s", m.path)
+}
+
+// LoadSchedulerConfig 从配置文件读取 rules.scheduler（供独立研究服务 quant-research 使用）。
+// 只覆盖 JSON 中显式出现的字段，其余回退 DefaultSchedulerConfig；文件缺失/解析失败整体回退默认。
+// English: reads rules.scheduler from the config file (for the standalone quant-research service).
+// Only fields explicitly present in JSON are applied; the rest fall back to DefaultSchedulerConfig;
+// a missing/unparseable file returns defaults wholesale.
+func LoadSchedulerConfig(path string) SchedulerConfig {
+	def := DefaultSchedulerConfig()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[scheduler] 读取配置 %s 失败(用默认): %v", path, err)
+		return def
+	}
+	var wrapper struct {
+		Rules struct {
+			Scheduler json.RawMessage `json:"scheduler"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		log.Printf("[scheduler] 解析配置 %s 失败(用默认): %v", path, err)
+		return def
+	}
+	raw := wrapper.Rules.Scheduler
+	if len(raw) == 0 || string(raw) == "null" {
+		return def
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		log.Printf("[scheduler] 解析 scheduler 段失败(用默认): %v", err)
+		return def
+	}
+	out := def
+	if v, ok := cfgBool(m, "enabled"); ok {
+		out.Enabled = v
+	}
+	if v, ok := cfgStr(m, "research_bin"); ok && v != "" {
+		out.ResearchBin = v
+	}
+	if v, ok := cfgStr(m, "dataload_bin"); ok && v != "" {
+		out.DataloadBin = v
+	}
+	if v, ok := cfgStr(m, "db"); ok && v != "" {
+		out.DB = v
+	}
+	if v, ok := cfgStr(m, "pyurl"); ok && v != "" {
+		out.PyURL = v
+	}
+	if sub, ok := cfgObject(m, "nightly"); ok {
+		if v, ok := cfgInt(sub, "start_hhmm"); ok {
+			out.Nightly.StartHHMM = v
+		}
+		if v, ok := cfgInt(sub, "weekend_start_hhmm"); ok {
+			out.Nightly.WeekendStartHHMM = v
+		}
+		if v, ok := cfgBool(sub, "abort_on_error"); ok {
+			out.Nightly.AbortOnError = v
+		}
+		if v, ok := cfgBool(sub, "backtest_enabled"); ok {
+			out.Nightly.BacktestEnabled = v
+		}
+		if v, ok := cfgInt(sub, "backtest_events"); ok {
+			out.Nightly.BacktestEvents = v
+		}
+		if v, ok := cfgStrs(sub, "steps"); ok && len(v) > 0 {
+			out.Nightly.Steps = v
+		}
+	}
+	if sub, ok := cfgObject(m, "dataload_during_trading"); ok {
+		if v, ok := cfgBool(sub, "enabled"); ok {
+			out.DataloadDuringTrade.Enabled = v
+		}
+		if v, ok := cfgInt(sub, "interval_minutes"); ok {
+			out.DataloadDuringTrade.IntervalMinutes = v
+		}
+	}
+	return out
+}
+
+// cfgStr 返回字符串字段（非字符串或不存在时 ok=false）。
+func cfgStr(m map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// cfgBool 返回布尔字段（非布尔或不存在时 ok=false）。
+func cfgBool(m map[string]json.RawMessage, key string) (bool, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return false, false
+	}
+	var v bool
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false, false
+	}
+	return v, true
+}
+
+// cfgInt 返回整数字段（非整数或不存在时 ok=false）。
+func cfgInt(m map[string]json.RawMessage, key string) (int, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	var v int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// cfgStrs 返回字符串数组字段（非数组或不存在时 ok=false）。
+func cfgStrs(m map[string]json.RawMessage, key string) ([]string, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var v []string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+// cfgObject 返回子对象字段的 map（不存在或非对象时 ok=false）。
+func cfgObject(m map[string]json.RawMessage, key string) (map[string]json.RawMessage, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var sub map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &sub); err != nil {
+		return nil, false
+	}
+	return sub, true
 }
 
 // CalendarEvent 宏观日历事件条目。
@@ -669,6 +897,7 @@ var DefaultRules = &Rules{
 		ATRStopMult:       2.5,
 		DailyDropAlertPct: 5,
 	},
+	Scheduler: DefaultSchedulerConfig(),
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。

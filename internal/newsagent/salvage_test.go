@@ -7,6 +7,8 @@ import (
 
 // TestSalvageStage0ObjectsLineSalvage 整体数组解析失败时应逐行抢救，
 // 且 "key":] 空值畸形行经修复也能救活，不丢数据。
+// English: TestSalvageStage0ObjectsLineSalvage: when the whole-array parse fails, salvage line by line;
+// English: a malformed "key":] empty-value line is also recoverable after repair, without data loss.
 func TestSalvageStage0ObjectsLineSalvage(t *testing.T) {
 	resp := `[
 {"index": 1, "category": "official", "material": true, "corrected_title": ""},
@@ -32,6 +34,7 @@ func TestSalvageStage0ObjectsLineSalvage(t *testing.T) {
 }
 
 // TestSalvageStage0ObjectsClean 整体可正常解析时直接走整组。
+// English: TestSalvageStage0ObjectsClean: when the whole parses fine, use the whole array directly.
 func TestSalvageStage0ObjectsClean(t *testing.T) {
 	resp := `[{"index":1,"category":"official","material":true,"corrected_title":"x"}]`
 	raw, ok := salvageStage0Objects(resp)
@@ -41,6 +44,7 @@ func TestSalvageStage0ObjectsClean(t *testing.T) {
 }
 
 // TestSalvageStage0ObjectsAllBroke 完全没有可解析对象时返回失败。
+// English: TestSalvageStage0ObjectsAllBroke: returns failure when nothing is parseable.
 func TestSalvageStage0ObjectsAllBroke(t *testing.T) {
 	resp := `garbage output without any braces`
 	_, ok := salvageStage0Objects(resp)
@@ -50,6 +54,7 @@ func TestSalvageStage0ObjectsAllBroke(t *testing.T) {
 }
 
 // TestSalvageStage0ObjectsStringIndex 模型把 index/material 输出成字符串（"1"/"true"）时应能容错解析。
+// English: TestSalvageStage0ObjectsStringIndex: should tolerate parsing when the model outputs index/material as strings ("1"/"true").
 func TestSalvageStage0ObjectsStringIndex(t *testing.T) {
 	resp := `[{"index": "1", "category": "official", "material": "true", "corrected_title": ""}]`
 	raw, ok := salvageStage0Objects(resp)
@@ -62,6 +67,7 @@ func TestSalvageStage0ObjectsStringIndex(t *testing.T) {
 }
 
 // TestSalvageStage0ObjectsSingleLineCorrupt 单行数组内嵌畸形对象时，逐对象扫描应全部救回。
+// English: TestSalvageStage0ObjectsSingleLineCorrupt: with malformed objects embedded in a single-line array, per-object scanning should recover all.
 func TestSalvageStage0ObjectsSingleLineCorrupt(t *testing.T) {
 	resp := `[{"index":1,"category":"official","material":true,"corrected_title":]},{"index":2,"category":"interactive","material":false,"corrected_title":""}]`
 	raw, ok := salvageStage0Objects(resp)
@@ -75,6 +81,8 @@ func TestSalvageStage0ObjectsSingleLineCorrupt(t *testing.T) {
 
 // TestSalvageStage0ObjectsTrailingJunk 字符串收尾杂散括号/撇号（"上涨") 等）应被修复。
 // 注：若模型再塞一个多余引号（"上涨"")）会破坏花括号配对的字符串状态，交由重试队列处理。
+// English: TestSalvageStage0ObjectsTrailingJunk: stray brackets/quotes at the end of strings (e.g. "上涨") ) should be repaired.
+// English: Note: if the model adds one more quote ("上涨"")), it breaks the brace-pairing string state and is left to the retry queue.
 func TestSalvageStage0ObjectsTrailingJunk(t *testing.T) {
 	resp := `[
 {"index":1,"category":"official","material":true,"corrected_title":"美股三大指数开盘均上涨")},
@@ -97,6 +105,7 @@ func TestSalvageStage0ObjectsTrailingJunk(t *testing.T) {
 }
 
 // TestSalvageStage0ObjectsSingleQuote 模型把键尾引号/空值写成单引号时（"corrected_title':”"）应修复。
+// English: TestSalvageStage0ObjectsSingleQuote: should repair when the model writes key-end quotes/empty values with single quotes (e.g. "corrected_title':”").
 func TestSalvageStage0ObjectsSingleQuote(t *testing.T) {
 	resp := `[{"index":1,"category":"official","material":false,"corrected_title':''"},{"index":2,"category":"official","material":true,"corrected_title':''"}]`
 	raw, ok := salvageStage0Objects(resp)

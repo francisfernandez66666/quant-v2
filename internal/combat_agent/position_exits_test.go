@@ -1,5 +1,6 @@
 // 战法退出引擎实时接线测试：CheckPositionsExits 的分发、移动止盈、派发、尾盘强平、
 // 手动回退、阶段高点持久化，以及情绪退潮减仓告警。
+// English: Strategy exit engine live-wiring tests: CheckPositionsExits dispatch, trailing take-profit, distribution, end-of-session forced liquidation, manual fallback, stage-high persistence, and emotion-retreat position-reduction alerts.
 package combat_agent
 
 import (
@@ -26,6 +27,7 @@ func qs(m map[string]float64) map[string]*data.StockInfo {
 }
 
 // TestExitDragonReturnTrailing 龙回头移动止盈：阶段高点 12、现价 10.8（回撤>8%）→ P2 减仓。
+// English: TestExitDragonReturnTrailing dragon-return trailing take-profit: stage high 12, current price 10.8 (drawdown>8%) → P2 reduction.
 func TestExitDragonReturnTrailing(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -46,12 +48,14 @@ func TestExitDragonReturnTrailing(t *testing.T) {
 }
 
 // TestExitDoubleBumpDistribution 双凸派发：放量1.5倍+收阴 → P1 清仓。
+// English: TestExitDoubleBumpDistribution double-bump distribution: 1.5x volume + bearish close → P1 full liquidation.
 func TestExitDoubleBumpDistribution(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
 	r.LogSignal("p2", "300750", "宁德", "做多", "double_bump", 10, 15, 5)
 
 	// 5 根日K：前 4 根量 100，最后一根放量 200 且收阴（11→10.6）
+	// English: 5 daily K-lines: first 4 have volume 100, the last has volume 200 and a bearish close (11→10.6).
 	ks := make([]data.KLine, 5)
 	for i := 0; i < 4; i++ {
 		ks[i] = data.KLine{Open: 10, High: 11, Low: 10, Close: 10.5, Volume: 100}
@@ -73,6 +77,7 @@ func TestExitDoubleBumpDistribution(t *testing.T) {
 }
 
 // TestExitNShapeHardStop N 形硬止损：现价跌破成本×(1−8%) → P1 清仓。
+// English: TestExitNShapeHardStop N-shape hard stop: price breaks below cost×(1−8%) → P1 full liquidation.
 func TestExitNShapeHardStop(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -88,6 +93,7 @@ func TestExitNShapeHardStop(t *testing.T) {
 }
 
 // TestExitNShapeLateClose N 形尾盘强平：14:58 后未完成形态 → P2 减仓。
+// English: TestExitNShapeLateClose N-shape end-of-session forced liquidation: pattern not completed after 14:58 → P2 reduction.
 func TestExitNShapeLateClose(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -104,6 +110,7 @@ func TestExitNShapeLateClose(t *testing.T) {
 }
 
 // TestExitManualTrailing 手动持仓走通用回退：阶段高点 12、现价 10 → 回撤移动止盈 P2。
+// English: TestExitManualTrailing manual positions take the generic fallback: stage high 12, current price 10 → drawdown trailing take-profit P2.
 func TestExitManualTrailing(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -120,21 +127,25 @@ func TestExitManualTrailing(t *testing.T) {
 }
 
 // TestExitNoSignal 正常持有不产生退出提醒；无效报价跳过。
+// English: TestExitNoSignal normal holdings produce no exit alerts; invalid quotes are skipped.
 func TestExitNoSignal(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
 	r.LogSignal("p6", "600519", "茅台", "做多", "dragon_return", 100, 20, 5)
 	// 价格 99（-1%）：未到止损(-5%)、未创新高、T1 需>=成本价且未到 T2 → 无退出
+	// English: Price 99 (-1%): not at stop-loss (-5%), not a new high, T1 requires >= cost and T2 not reached → no exit.
 	if alerts := a.CheckPositionsExits(r, qs(map[string]float64{"600519": 99}), nil, time.Now()); len(alerts) != 0 {
 		t.Errorf("正常持有不应有退出提醒, got %d", len(alerts))
 	}
 	// 停牌（现价 0）应跳过
+	// English: A suspended stock (price 0) should be skipped.
 	if alerts := a.CheckPositionsExits(r, qs(map[string]float64{"600519": 0}), nil, time.Now()); len(alerts) != 0 {
 		t.Errorf("无效报价应跳过, got %d", len(alerts))
 	}
 }
 
 // TestExitPersistsStageHigh 价格创新高时阶段高点被持久化（移动止盈基准随之抬高）。
+// English: TestExitPersistsStageHigh the stage high is persisted when the price makes a new high (raising the trailing take-profit baseline).
 func TestExitPersistsStageHigh(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -148,6 +159,7 @@ func TestExitPersistsStageHigh(t *testing.T) {
 }
 
 // TestEmotionRetreatAlerts 退潮/背离阶段应向做多持仓发减仓告警；做空与无关阶段不发。
+// English: TestEmotionRetreatAlerts retreat/divergence phases should send reduction alerts to long positions; shorts and unrelated phases do not.
 func TestEmotionRetreatAlerts(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -168,6 +180,7 @@ func TestEmotionRetreatAlerts(t *testing.T) {
 
 // TestBearishAttributionAlerts 利空归因持仓抛售提醒（E4）：命中利空板块的做多持仓产抛售提醒，
 // 未命中或做空持仓不产；归因说明应带板块名/原因。
+// English: TestBearishAttributionAlerts bearish-attribution position sell alerts (E4): long positions hitting a bearish sector produce sell alerts, non-matching or short positions do not; the attribution text should include the sector name/reason.
 func TestBearishAttributionAlerts(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -176,6 +189,7 @@ func TestBearishAttributionAlerts(t *testing.T) {
 	r.LogSignal("short1", "000001", "平安", "做空", "手动", 8, 20, 5)
 
 	// 仅 600276 命中利空板块（医药板块利空）
+	// English: Only 600276 matches a bearish sector (pharmaceutical sector bearish).
 	bearReasons := map[string]string{
 		"600276": "医药(集采利空) 事件:医药集采落地",
 	}
@@ -194,6 +208,7 @@ func TestBearishAttributionAlerts(t *testing.T) {
 	}
 
 	// 空 bearReasons → 无提醒
+	// English: Empty bearReasons → no alerts.
 	if a := a.BearishAttributionAlerts(r, qs(map[string]float64{"600276": 9}), nil, time.Now()); len(a) != 0 {
 		t.Errorf("空归因不应发提醒, got %d", len(a))
 	}

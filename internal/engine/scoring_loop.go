@@ -57,9 +57,8 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	}()
 
 	// 交易时段门控（盘后/休市跳过，避免无效拉取）
-	switch data.CurrentSession(time.Now()) {
-	case data.SessionPreMarket, data.SessionMorningTrade, data.SessionPreAfternoon, data.SessionAfternoonTrade:
-	default:
+	// English: session gate — skip after-market/holiday to avoid pointless fetching.
+	if !data.IsActiveSession(time.Now()) {
 		return
 	}
 

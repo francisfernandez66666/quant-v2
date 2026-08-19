@@ -134,6 +134,33 @@
       </div>
     </div>
 
+    <!-- 按战法胜率统计：各战法样本数/胜率/平均盈/平均亏/盈亏比 -->
+    <div class="card" style="margin-top: 16px;" v-if="strategyStats && Object.keys(strategyStats).length">
+      <div class="card-header">按战法胜率</div>
+      <div class="strategy-table">
+        <div class="stg-header">
+          <span class="stg-strategy">战法</span>
+          <span class="stg-num">样本</span>
+          <span class="stg-num">已平仓</span>
+          <span class="stg-num">胜率</span>
+          <span class="stg-num">平均盈</span>
+          <span class="stg-num">平均亏</span>
+          <span class="stg-num">盈亏比</span>
+          <span class="stg-num">持仓中</span>
+        </div>
+        <div v-for="(s, name) in strategyStats" :key="name" class="stg-row">
+          <span class="stg-strategy">{{ s.strategy || name }}</span>
+          <span class="stg-num">{{ s.total }}</span>
+          <span class="stg-num">{{ s.closed }}</span>
+          <span :class="['stg-num', s.win_rate >= 50 ? 'up' : 'down']">{{ (s.win_rate || 0).toFixed(1) }}%</span>
+          <span class="stg-num up">{{ (s.avg_win_pct || 0).toFixed(1) }}%</span>
+          <span class="stg-num down">{{ (s.avg_loss_pct || 0).toFixed(1) }}%</span>
+          <span class="stg-num">{{ fmtProfitFactor(s.profit_factor) }}</span>
+          <span class="stg-num">{{ s.holding }}</span>
+        </div>
+      </div>
+    </div>
+
     <!-- 系统运行信息 -->
     <div class="card" style="margin-top: 16px;">
       <div class="card-header">系统</div>
@@ -167,6 +194,7 @@ const showLog = ref(false)            // 是否打开日志弹窗 (whether the l
 const dataSourceHealth = ref({})      // 数据源健康状况（东财/新浪/腾讯/同花顺）
 const newsSourceHealth = ref({})      // 新闻源健康状况（财联社/同花顺/新浪）
 const engineHealth = ref({})          // 流程引擎子系统健康状况
+const strategyStats = ref({})         // 按战法分组的胜率统计（来自 /api/dashboard 的 report_stats.by_strategy）
 
 let timer = null                      // 定时轮询句柄 (polling timer handle)
 let sseUnsub = null                   // SSE 取消订阅函数 (SSE unsubscribe function)
@@ -236,11 +264,19 @@ function alertLevelClass(level) {
   return 'tag-info'
 }
 
-/** 并发加载所有仪表盘数据（6个接口） (Load all dashboard data concurrently — 6 API endpoints) */
+// 格式化盈亏比：无亏损（0）时显示为 "∞" 或 "--"，避免展示误导性的 0
+function fmtProfitFactor(pf) {
+  if (pf === null || pf === undefined) return '--'
+  if (pf === Infinity) return '∞'
+  if (pf === 0) return '--'
+  return pf.toFixed(2)
+}
+
+/** 并发加载所有仪表盘数据（7个接口） (Load all dashboard data concurrently — 7 API endpoints) */
 async function load() {
-  // 并发拉取 6 个数据源，单个失败不阻塞整体 (fetch 6 sources in parallel; a single failure does not block the rest)
-  const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes] = await Promise.allSettled([
-    api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(), api.fetchHotSnapshot(), api.fetchIPOCalendar()
+  // 并发拉取 7 个数据源，单个失败不阻塞整体 (fetch 7 sources in parallel; a single failure does not block the rest)
+  const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes, dashRes] = await Promise.allSettled([
+    api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(), api.fetchHotSnapshot(), api.fetchIPOCalendar(), api.fetchDashboard()
   ])
   if (sigRes.status === 'fulfilled' && Array.isArray(sigRes.value)) {
     // 写入策略信号列表 (store the strategy signal list)
@@ -266,6 +302,10 @@ async function load() {
   if (ipoRes.status === 'fulfilled' && Array.isArray(ipoRes.value)) {
     // 写入 IPO 日历 (store the IPO calendar)
     ipoCalendar.value = ipoRes.value
+  }
+  if (dashRes.status === 'fulfilled' && dashRes.value && dashRes.value.report_stats) {
+    // 写入按战法分组的胜率统计 (store the per-strategy win-rate stats)
+    strategyStats.value = dashRes.value.report_stats.by_strategy || {}
   }
 }
 
@@ -424,4 +464,18 @@ onUnmounted(() => {
 .empty { text-align: center; padding: 30px; color: #555; font-size: 12px; }
 .loading-dot { display: inline-block; width: 6px; height: 6px; background: #4fc3f7; border-radius: 50%; margin-right: 6px; animation: pulse 1.5s infinite; }
 .status-row-inline { display: flex; gap: 20px; font-size: 12px; color: #666; flex-wrap: wrap; }
+
+/* 按战法胜率表 */
+.strategy-table { font-size: 12px; }
+.stg-header, .stg-row { display: flex; align-items: center; padding: 4px 0; gap: 8px; }
+.stg-header { color: #555; border-bottom: 1px solid #2a2a3e; font-weight: 600; }
+.stg-row { border-bottom: 1px solid #1a1a26; }
+.stg-row:last-child { border-bottom: none; }
+.stg-strategy { flex: 1; color: #b388ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stg-num { width: 70px; text-align: right; color: #ccc; }
+.stg-num.up { color: #FF4D4F; }
+.stg-num.down { color: #4caf50; }
+@media (max-width: 768px) {
+  .stg-num { width: 56px; font-size: 11px; }
+}
 </style>

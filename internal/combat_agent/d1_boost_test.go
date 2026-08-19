@@ -1,4 +1,5 @@
 // C1 D1 软加成与负面硬 veto 测试。
+// English: C1 D1 soft boost and negative hard-veto tests.
 package combat_agent
 
 import (
@@ -14,6 +15,7 @@ import (
 
 // d1BoostDragonMD 构造龙头"准满分级"行情：封板 + 溢价 + 5日强趋势，无板块上下文时
 // 总分 ≈62（brief 观察档，差一步进 full_chain ≥70）。Volume/Amount 取自最后一根日K。
+// English: d1BoostDragonMD builds a dragon "near-full-score" market: sealed limit-up + premium + 5-day strong trend; without sector context the total is ≈62 (brief observation tier, one step short of full_chain >=70). Volume/Amount come from the last daily K-line.
 func d1BoostDragonMD() *strategy_engine.StockMarketData {
 	base := time.Now()
 	ks := make([]data.KLine, 10)
@@ -34,6 +36,7 @@ func d1BoostDragonMD() *strategy_engine.StockMarketData {
 
 // TestD1BoostNearMissCrossesBuyGate 软加成单元：龙头 63 分 + D1=30（0~40 制）
 // → 63×1.1125≈70.1 ≥70 → 提升为 full_chain/Pass，跨过买入门槛，且加成量被记录。
+// English: TestD1BoostNearMissCrossesBuyGate soft-boost unit: dragon 63 + D1=30 (0~40 scale) → 63×1.1125≈70.1 >=70 → raised to full_chain/Pass, crossing the buy gate, and the boost amount is recorded.
 func TestD1BoostNearMissCrossesBuyGate(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
@@ -51,6 +54,7 @@ func TestD1BoostNearMissCrossesBuyGate(t *testing.T) {
 }
 
 // TestD1BoostDragonReturnFirst 龙回头 56 分 + D1=20 → 56×1.075≈60.2 ≥60 → 提升为 first/Pass。
+// English: TestD1BoostDragonReturnFirst dragon-return 56 + D1=20 → 56×1.075≈60.2 >=60 → raised to first/Pass.
 func TestD1BoostDragonReturnFirst(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
@@ -62,6 +66,7 @@ func TestD1BoostDragonReturnFirst(t *testing.T) {
 }
 
 // TestD1BoostCapAt100 加成封顶 100：90 分 + D1=40 → 90×1.15=103.5 → 截断到 100 且仍为买入档。
+// English: TestD1BoostCapAt100 boost caps at 100: 90 + D1=40 → 90×1.15=103.5 → truncated to 100 and still the buy tier.
 func TestD1BoostCapAt100(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
@@ -76,6 +81,7 @@ func TestD1BoostCapAt100(t *testing.T) {
 }
 
 // TestD1BoostBelowThresholdNoOp D1 分低于 BoostThreshold（8）时不加成。
+// English: TestD1BoostBelowThresholdNoOp no boost when the D1 score is below BoostThreshold (8).
 func TestD1BoostBelowThresholdNoOp(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
@@ -87,6 +93,7 @@ func TestD1BoostBelowThresholdNoOp(t *testing.T) {
 }
 
 // TestD1BoostBlockedNoOp D1 负面 blocked 时软加成不生效（该股由 evalAll 前置硬 veto 整体拦截）。
+// English: TestD1BoostBlockedNoOp the soft boost does not apply when D1 is negatively blocked (the stock is wholly blocked by evalAll's upfront hard veto).
 func TestD1BoostBlockedNoOp(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
@@ -98,6 +105,7 @@ func TestD1BoostBlockedNoOp(t *testing.T) {
 }
 
 // TestD1BoostDisabledNoOp BoostWeight≤0（未启用）时保持原分。
+// English: TestD1BoostDisabledNoOp when BoostWeight<=0 (disabled) the original score is kept.
 func TestD1BoostDisabledNoOp(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0, BoostThreshold: 8})
@@ -110,6 +118,7 @@ func TestD1BoostDisabledNoOp(t *testing.T) {
 
 // TestD1BoostDragonEndToEnd 端到端：龙头真实评分 ≈62（brief/watch）时，
 // 不加成只发 watch；D1=40 软加成后跨过 70 → 升级为 buy 信号。
+// English: TestD1BoostDragonEndToEnd end-to-end: with a real dragon score of ≈62 (brief/watch), only a watch is emitted without the boost; after the soft boost of D1=40 the score crosses 70 → upgraded to a buy signal.
 func TestD1BoostDragonEndToEnd(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())
@@ -119,12 +128,14 @@ func TestD1BoostDragonEndToEnd(t *testing.T) {
 	pool := map[string]*strategy_engine.StockMarketData{"300000": d1BoostDragonMD()}
 
 	// 对照组：无 D1（Score=0）→ 保持 brief → 仅 watch
+	// English: Control group: no D1 (Score=0) → stays brief → only watch.
 	_, sigsNo := a.ScorePool([]string{"300000"}, pool, map[string]D1Score{}, "")
 	if !hasDragonAction(sigsNo, "300000", "watch") {
 		t.Fatalf("无 D1 加成时应为 dragon watch(brief), got %+v", sigsNo)
 	}
 
 	// D1=40 → 62.3×1.15≈71.6 ≥70 → full_chain → buy
+	// English: D1=40 → 62.3×1.15≈71.6 >=70 → full_chain → buy.
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: dragon.New(cfg)}})
@@ -135,10 +146,11 @@ func TestD1BoostDragonEndToEnd(t *testing.T) {
 }
 
 // fakeAlwaysPass 恒通过的假战法，用于隔离 D1 负面硬 veto 的拦截行为。
+// English: fakeAlwaysPass is a fake strategy that always passes, used to isolate the blocking behavior of the D1 negative hard veto.
 type fakeAlwaysPass struct{}
 
-func (f *fakeAlwaysPass) Name() string                        { return "恒通过" }
-func (f *fakeAlwaysPass) Type() strategy.SignalType           { return strategy.SignalDragon }
+func (f *fakeAlwaysPass) Name() string              { return "恒通过" }
+func (f *fakeAlwaysPass) Type() strategy.SignalType { return strategy.SignalDragon }
 func (f *fakeAlwaysPass) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{TotalScore: 80, Pass: true, Level: "full_chain", Confidence: 0.8}, nil
 }
@@ -148,6 +160,7 @@ func (f *fakeAlwaysPass) GenerateSignal(code string, _ *strategy.Evaluation) (*s
 
 // TestD1BlockedVetoesAllSignals 负面硬 veto：D1.Blocked=true 时该股任何战法都不产信号；
 // 对照组（未 blocked）正常产出。
+// English: TestD1BlockedVetoesAllSignals negative hard veto: when D1.Blocked=true no strategy produces signals for that stock; the control group (not blocked) produces them normally.
 func TestD1BlockedVetoesAllSignals(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())
@@ -165,6 +178,7 @@ func TestD1BlockedVetoesAllSignals(t *testing.T) {
 	}
 
 	// 对照组：未 blocked 时正常产出 dragon buy
+	// English: Control group: when not blocked, a dragon buy is produced normally.
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: &fakeAlwaysPass{}}})
@@ -176,6 +190,7 @@ func TestD1BlockedVetoesAllSignals(t *testing.T) {
 }
 
 // hasDragonAction 判断信号列表中是否存在某股指定 action 的 dragon 信号。
+// English: hasDragonAction reports whether the signal list contains a dragon signal for a given stock with the given action.
 func hasDragonAction(sigs []Signal, code, action string) bool {
 	for _, s := range sigs {
 		if s.Code == code && s.Strategy == "dragon" && s.Action == action {

@@ -1,0 +1,51 @@
+# quant-trading-v2 自动研究调度服务（与量化主程序解耦，按时段切换）。
+# 首尔 Ubuntu 服务器上独立 cgroup 运行，避免研究/回测在盘中与 quant 争抢 CPU：
+#   - 交易时段：只跑 dataload 增量下载（默认每 30min），绝不回测/研究；
+#   - 盘后/周末：跑完整夜间研究作业（dataload → sector-rebuild → discover-factors
+#     → discover-patterns → list）；
+#   - 下一交易日盘前 8:30 自动终止遗留作业，CPU 交还量化主程序。
+# 资源限流（不抢占 quant）：低优先级 + CPU 硬上限 + 内存软硬限 + I/O 让行。
+# 配置：/var/lib/quant-trading-v2/config.json -> rules.scheduler（30s tick 重读，热生效）。
+# 幂等状态：/var/lib/quant-trading-v2/research_state.json（断点续跑，跨天重置）。
+
+[Unit]
+Description=quant-trading-v2 research scheduler (session-gated auto research)
+Documentation=https://github.com/anomalyco/opencode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/var/lib/quant-trading-v2
+ExecStart=/opt/quant/researchd
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+# 资源不抢占 quant 主程序（适配 2 核 / 1.6G 小 VPS）
+# 内存上限收紧到 900M：本机物理内存仅 1.6G（quant 独占 1G），研究作业若超上限
+# 只被杀、不影响 quant；配合 discover_factors 的窗口分块（峰值 ~340M）可正常跑完。
+Nice=10
+CPUWeight=8
+CPUQuota=100%
+MemoryHigh=700M
+MemoryMax=900M
+IOSchedulingClass=idle
+
+Environment=TZ=Asia/Shanghai
+Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
+Environment=PATH=/opt/quant:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# 单核执行：研究作业本就慢可接受，限制单核避免挤占 quant 主程序与 sshd
+Environment=GOMAXPROCS=1
+
+# 加固：子进程（research/dataload）同样以 quant 用户运行
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quant-trading-v2
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

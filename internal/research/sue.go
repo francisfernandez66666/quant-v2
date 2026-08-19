@@ -1,4 +1,5 @@
 // SUE 降级版：由利润表累计净利序列计算单季净利同比。
+// English: SUE downgrade: derives single-quarter net-profit YoY from the income statement's cumulative net-profit series.
 package research
 
 import (
@@ -17,6 +18,7 @@ import (
 //	同比 yoy = (sq − 上年同期单季) / |上年同期单季|
 //
 // 无法计算（无上年同期/上年同期为 0）时为 NaN。
+// English: NaN when not computable (no prior-year quarter, or prior-year quarter is 0).
 // （SingleQuarterNetProfitYoy derives single-quarter net-profit YoY (the degraded SUE) from
 // the cumulative net-profit income series; NaN when not computable.）
 func SingleQuarterNetProfitYoy(income []store.IncomeRow) []float64 {
@@ -28,6 +30,7 @@ func SingleQuarterNetProfitYoy(income []store.IncomeRow) []float64 {
 		return out
 	}
 	// 上年同期的单季净利（按 end_date 的 MMDD 索引，仅当恰好为上年时采用）
+	// English: prior-year same-quarter single-quarter net profit (indexed by the end_date MMDD, used only when it is exactly the prior year)
 	prevY := make(map[string]prevQuarter)
 	for i, r := range income {
 		sq := singleQuarter(income, i)
@@ -47,6 +50,7 @@ type prevQuarter struct {
 }
 
 // yearMinusOne 返回上一年（YYYY）。
+// English: yearMinusOne returns the prior year (YYYY).
 func yearMinusOne(year string) string {
 	y, err := strconv.Atoi(year)
 	if err != nil {
@@ -56,6 +60,7 @@ func yearMinusOne(year string) string {
 }
 
 // singleQuarter 计算第 i 个报告期的单季净利（累计差分，Q1 即累计）。
+// English: singleQuarter computes the single-quarter net profit of the i-th reporting period (cumulative difference; Q1 is the cumulative value).
 func singleQuarter(income []store.IncomeRow, i int) float64 {
 	cum := income[i].NIncomeAttrP
 	if i > 0 && income[i].EndDate[0:4] == income[i-1].EndDate[0:4] {

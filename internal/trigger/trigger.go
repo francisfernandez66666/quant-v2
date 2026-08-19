@@ -103,12 +103,28 @@ func (e *Engine) Run(ctx context.Context) {
 		e.cfg.Sec, e.cfg.RaRate, e.cfg.StockAmt, e.cfg.Cooldown)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	paused := false
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("[trigger] 实时触发引擎停止")
 			return
 		case <-ticker.C:
+			// 非活跃时段门控：盘后/休市停止检测（fetcher 已暂停，重复消费陈旧快照
+			// 只是空转；advance 对 >60s 间隔会自动重置基线，恢复后不会误触发）。
+			// English: inactive-session gate — skip detection after market/holidays; the fetcher
+			// is already paused, and advance resets baselines on >60s gaps so resume can't misfire.
+			if !data.IsActiveSession(time.Now()) {
+				if !paused {
+					log.Println("[trigger] 非活跃时段, 暂停实时触发检测")
+					paused = true
+				}
+				continue
+			}
+			if paused {
+				log.Println("[trigger] 进入活跃时段, 恢复实时触发检测")
+				paused = false
+			}
 			if snap := e.fetcher.Snapshot(); snap != nil {
 				e.check(snap)
 			}

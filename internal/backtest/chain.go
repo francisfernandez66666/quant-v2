@@ -1,5 +1,8 @@
 // B4 全链路回测引擎：合成事件（板块涨停潮）→ 板块 → 个股 → 多因子信号 → 前瞻收益验证。
 // 纯离线（读研究 SQLite 库），库化供 B5 优化器调用；回测参数由调用方/CLI 配置。
+// English: B4 full-chain backtest engine: synthesized events (sector limit-up surges) → sector → stocks
+// → multi-factor signals → forward-return validation. Purely offline (reads the research SQLite DB),
+// exposed as a library for the B5 optimizer; params come from the caller/CLI.
 // （B4 full-chain backtest engine: synthesized sector limit-up events → sector → stocks →
 // multi-factor signal → forward-return verification. Offline-only, library for B5.）
 package backtest
@@ -27,23 +30,23 @@ type SectorEvent struct {
 // SignalRule 多因子复合信号规则。
 // （SignalRule is the composite multi-factor signal rule.）
 type SignalRule struct {
-	Factors    []string       // 因子 ID（因子库注册名）
-	Directions map[string]int // factorID → +1/-1（缺失按类别默认方向）
+	Factors    []string           // 因子 ID（因子库注册名）
+	Directions map[string]int     // factorID → +1/-1（缺失按类别默认方向）
 	Weights    map[string]float64 // factorID → 权重（缺失=1，B5 优化器产出）
-	TopK       int            // 每事件选股数
-	MinStocks  int            // 当日有效样本下限
-	MinCover   float64        // 因子覆盖要求（0~1，缺失占比过高则剔除）
+	TopK       int                // 每事件选股数
+	MinStocks  int                // 当日有效样本下限
+	MinCover   float64            // 因子覆盖要求（0~1，缺失占比过高则剔除）
 }
 
 // DefaultRule 返回默认信号规则（7 大类精选 + 合理方向）。
 // （DefaultRule returns the default signal rule.）
 func DefaultRule() SignalRule {
 	return SignalRule{
-		Factors:   []string{"EP_ttm", "BP", "ROE", "YoyNetProfit", "SUE", "Mom20", "STO20"},
+		Factors:    []string{"EP_ttm", "BP", "ROE", "YoyNetProfit", "SUE", "Mom20", "STO20"},
 		Directions: nil, // 按类别默认
-		TopK:      5,
-		MinStocks: 10,
-		MinCover:  0.5,
+		TopK:       5,
+		MinStocks:  10,
+		MinCover:   0.5,
 	}
 }
 
@@ -65,14 +68,14 @@ func dirOf(fdef factor.Def, dirs map[string]int) int {
 // Options 回测选项。
 // （Options configures a backtest run.）
 type Options struct {
-	Start        string // 事件区间起点 YYYYMMDD
-	End          string // 事件区间终点 YYYYMMDD
-	Horizons     []int  // 前瞻天数（默认 [1,5,10]）
-	MinLimitUps  int    // 触发事件的行业涨停家数下限（默认 3）
-	MaxPerDay    int    // 每日最多事件数（默认 3，取涨停家数最多）
-	Benchmark    string // 基准指数（默认 000300.SH）
-	Lookback     int    // 因子预热回看天数（默认 70）
-	Rule         SignalRule
+	Start       string // 事件区间起点 YYYYMMDD
+	End         string // 事件区间终点 YYYYMMDD
+	Horizons    []int  // 前瞻天数（默认 [1,5,10]）
+	MinLimitUps int    // 触发事件的行业涨停家数下限（默认 3）
+	MaxPerDay   int    // 每日最多事件数（默认 3，取涨停家数最多）
+	Benchmark   string // 基准指数（默认 000300.SH）
+	Lookback    int    // 因子预热回看天数（默认 70）
+	Rule        SignalRule
 }
 
 // DefaultOptions 返回默认回测选项。

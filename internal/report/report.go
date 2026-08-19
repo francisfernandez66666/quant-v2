@@ -25,26 +25,26 @@ type Lot struct {
 // Status 字段取值包括："持仓中"、"已止盈"、"已止损"、"已删除"。
 // （ExecLog is one execution record covering the open→hold→close lifecycle. Status ∈ {持仓中, 已止盈, 已止损, 已删除}.）
 type ExecLog struct {
-	SignalID      string     `json:"signal_id"`            // 信号唯一标识
-	UserID        string     `json:"user_id,omitempty"`    // 所属账号 ID（空=系统/全局，引擎监控全部）
-	Code          string     `json:"code"`                 // 股票代码（纯数字，无交易所前缀）
-	Name          string     `json:"name"`                 // 股票名称
-	Direction     string     `json:"direction"`            // 交易方向：做多 / 做空
-	Strategy      string     `json:"strategy"`             // 触发入场信号的战法名称
-	EntryAt       time.Time  `json:"entry_at"`             // 开仓时间
-	EntryPrice    float64    `json:"entry_price"`          // 开仓价格
-	ExitAt        *time.Time `json:"exit_at,omitempty"`    // 平仓时间（nil 表示尚未平仓）
-	ExitPrice     *float64   `json:"exit_price,omitempty"` // 平仓价格（nil 表示尚未平仓）
-	Status        string     `json:"status"`               // 记录状态：持仓中 / 已止盈 / 已止损 / 已删除
-	ProfitPct     *float64   `json:"profit_pct,omitempty"` // 盈亏百分比（正值为盈利，负值为亏损，nil 表示尚未平仓）
-	TakeProfitPct float64    `json:"take_profit_pct"`      // 预设止盈百分比
-	StopLossPct   float64    `json:"stop_loss_pct"`        // 预设止损百分比
-	Quantity      float64              `json:"quantity"`             // 持仓数量（手动设置，默认 1）
-	Lots          []Lot                `json:"lots,omitempty"`       // 加仓批次明细（加权平均成本 = EntryPrice，数量 = Quantity）
-	RealizedPnl   float64              `json:"realized_pnl,omitempty"` // 该标的累计已实现盈亏（元，含已平仓历史；减仓/清仓时累加）
-	EntryMeta     map[string]float64   `json:"entry_meta,omitempty"` // 入场评分快照（entry_nphase/vol_ratio/limit_price/highest_price 等，供战法退出引擎使用）
-	HighestPrice  float64              `json:"highest_price,omitempty"` // 阶段最高价（移动止盈基准；开仓时=入场价，盘中实时抬高）
-	ExitReason    string               `json:"exit_reason,omitempty"`   // 卖出原因（如 手动/止损/移动止盈/尾盘强平，供消息与复盘）
+	SignalID      string             `json:"signal_id"`               // 信号唯一标识
+	UserID        string             `json:"user_id,omitempty"`       // 所属账号 ID（空=系统/全局，引擎监控全部）
+	Code          string             `json:"code"`                    // 股票代码（纯数字，无交易所前缀）
+	Name          string             `json:"name"`                    // 股票名称
+	Direction     string             `json:"direction"`               // 交易方向：做多 / 做空
+	Strategy      string             `json:"strategy"`                // 触发入场信号的战法名称
+	EntryAt       time.Time          `json:"entry_at"`                // 开仓时间
+	EntryPrice    float64            `json:"entry_price"`             // 开仓价格
+	ExitAt        *time.Time         `json:"exit_at,omitempty"`       // 平仓时间（nil 表示尚未平仓）
+	ExitPrice     *float64           `json:"exit_price,omitempty"`    // 平仓价格（nil 表示尚未平仓）
+	Status        string             `json:"status"`                  // 记录状态：持仓中 / 已止盈 / 已止损 / 已删除
+	ProfitPct     *float64           `json:"profit_pct,omitempty"`    // 盈亏百分比（正值为盈利，负值为亏损，nil 表示尚未平仓）
+	TakeProfitPct float64            `json:"take_profit_pct"`         // 预设止盈百分比
+	StopLossPct   float64            `json:"stop_loss_pct"`           // 预设止损百分比
+	Quantity      float64            `json:"quantity"`                // 持仓数量（手动设置，默认 1）
+	Lots          []Lot              `json:"lots,omitempty"`          // 加仓批次明细（加权平均成本 = EntryPrice，数量 = Quantity）
+	RealizedPnl   float64            `json:"realized_pnl,omitempty"`  // 该标的累计已实现盈亏（元，含已平仓历史；减仓/清仓时累加）
+	EntryMeta     map[string]float64 `json:"entry_meta,omitempty"`    // 入场评分快照（entry_nphase/vol_ratio/limit_price/highest_price 等，供战法退出引擎使用）
+	HighestPrice  float64            `json:"highest_price,omitempty"` // 阶段最高价（移动止盈基准；开仓时=入场价，盘中实时抬高）
+	ExitReason    string             `json:"exit_reason,omitempty"`   // 卖出原因（如 手动/止损/移动止盈/尾盘强平，供消息与复盘）
 }
 
 // Report 管理所有交易持仓记录，提供线程安全的增删改查与文件持久化能力。
@@ -495,7 +495,100 @@ func (r *Report) StatsFor(userID string) (total, holding, win int, winRate, avgW
 	return r.statsFor(userID)
 }
 
+// StrategyStats 表示按战法分组的交易统计指标。
+// 用于评估每个战法（Dragon/DoubleBump/NShape/DragonReturn 等）各自的胜率与盈亏表现，
+// 支撑"按战法归因"的绩效分析。ProfitFactor 为盈亏比（总盈利/总亏损绝对值），
+// 无亏损记录时为 0（避免除零，由调用方决定展示口径）。
+type StrategyStats struct {
+	Strategy     string  // 战法名称（对应 ExecLog.Strategy）
+	Total        int     // 计入统计的总记录数（不含已删除）
+	Closed       int     // 已平仓笔数（含赢/亏/平手）
+	Win          int     // 盈利笔数
+	Loss         int     // 亏损笔数
+	Draw         int     // 平手笔数（盈亏为 0）
+	Holding      int     // 仍在持仓中的笔数
+	WinRate      float64 // 胜率百分比（Win / (Win+Loss) * 100）
+	AvgWinPct    float64 // 平均盈利百分比（正数）
+	AvgLossPct   float64 // 平均亏损百分比（负数）
+	ProfitFactor float64 // 盈亏比（总盈利 / 总亏损绝对值），无亏损时为 0
+}
+
+// StatsByStrategy 返回按战法分组的交易统计指标（胜率/平均盈/平均亏/盈亏比/样本数）。
+// userID 为空时统计全部账号记录，否则仅统计指定账号。
+// 该口径与 statsFor 保持一致：已删除记录不计入、盈亏为 0 算平手。
+func (r *Report) StatsByStrategy(userID string) map[string]StrategyStats {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	// 聚合缓冲：按战法名累积各计数与盈亏和
+	type agg struct {
+		winCount, lossCount, drawCount int
+		winSum, lossSum                float64
+		holding                        int
+	}
+	aggs := make(map[string]*agg)
+	for _, l := range r.logs {
+		if userID != "" && l.UserID != userID {
+			continue
+		}
+		if l.Status == "已删除" {
+			continue // 已删除记录不计入统计口径
+		}
+		strategy := l.Strategy
+		if strategy == "" {
+			strategy = "未命名" // 兜底：缺省战法名的记录归到"未命名"分组
+		}
+		a, ok := aggs[strategy]
+		if !ok {
+			a = &agg{}
+			aggs[strategy] = a
+		}
+		if l.ExitAt != nil && l.ProfitPct != nil {
+			switch {
+			case *l.ProfitPct > 0:
+				a.winCount++
+				a.winSum += *l.ProfitPct
+			case *l.ProfitPct == 0:
+				a.drawCount++
+			default:
+				a.lossCount++
+				a.lossSum += *l.ProfitPct
+			}
+		} else if l.Status == "持仓中" {
+			a.holding++
+		}
+	}
+	// 组装输出
+	out := make(map[string]StrategyStats, len(aggs))
+	for strategy, a := range aggs {
+		ss := StrategyStats{
+			Strategy: strategy,
+			Total:    a.winCount + a.lossCount + a.drawCount + a.holding,
+			Closed:   a.winCount + a.lossCount + a.drawCount,
+			Win:      a.winCount,
+			Loss:     a.lossCount,
+			Draw:     a.drawCount,
+			Holding:  a.holding,
+		}
+		if a.winCount+a.lossCount > 0 {
+			ss.WinRate = float64(a.winCount) / float64(a.winCount+a.lossCount) * 100
+		}
+		if a.winCount > 0 {
+			ss.AvgWinPct = a.winSum / float64(a.winCount)
+		}
+		if a.lossCount > 0 {
+			ss.AvgLossPct = a.lossSum / float64(a.lossCount)
+		}
+		if a.lossSum != 0 {
+			ss.ProfitFactor = a.winSum / -a.lossSum
+		}
+		out[strategy] = ss
+	}
+	return out
+}
+
 // statsFor 内部统计实现：userID 为空时统计全部记录。
+// 口径说明：已删除记录不计入任何统计；盈亏为 0 的按"平手"处理（计入总笔数，
+// 但既不算赢也不算亏，不进胜率分母）；平均盈/亏为百分比（正/负）。
 func (r *Report) statsFor(userID string) (total, holding, win int, winRate, avgWin, avgLoss float64) {
 	var winCount, lossCount int
 	var winSum, lossSum float64
@@ -503,12 +596,18 @@ func (r *Report) statsFor(userID string) (total, holding, win int, winRate, avgW
 		if userID != "" && l.UserID != userID {
 			continue
 		}
+		if l.Status == "已删除" {
+			continue // 已删除记录不计入统计口径
+		}
 		total++
 		if l.ExitAt != nil && l.ProfitPct != nil {
-			if *l.ProfitPct > 0 {
+			switch {
+			case *l.ProfitPct > 0:
 				winCount++
 				winSum += *l.ProfitPct
-			} else {
+			case *l.ProfitPct == 0:
+				// 平手：既不算赢也不算亏，不影响胜率分母
+			default:
 				lossCount++
 				lossSum += *l.ProfitPct
 			}

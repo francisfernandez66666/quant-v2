@@ -211,12 +211,30 @@ func (f *Fetcher) loop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	// 非活跃时段门控：盘后/休市停止抓行情（保留上一份快照供 HTTP/SSE 读旧值），
+	// 避免 5s 循环 24/7 空转消耗 CPU；时段切换各打一条日志。
+	// English: inactive-session gate — outside active sessions (after-market/holiday) the loop
+	// keeps the last snapshot but stops polling quotes/sectors, so the 5s cadence doesn't burn
+	// CPU around the clock. One log line is emitted on each session transition.
+	paused := false
 	for {
 		select {
 		case <-f.stopCh:
 			log.Println("数据采集停止")
 			return
 		case <-ticker.C:
+			active := IsActiveSession(time.Now())
+			if !active {
+				if !paused {
+					log.Printf("数据采集暂停: 非活跃时段 (保留上一份快照 %s)", time.Now().Format("15:04:05"))
+					paused = true
+				}
+				continue
+			}
+			if paused {
+				log.Printf("数据采集恢复: 进入活跃时段")
+				paused = false
+			}
 			func() {
 				defer func() {
 					if r := recover(); r != nil {

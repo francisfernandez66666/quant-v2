@@ -6,6 +6,7 @@ import (
 )
 
 // 构造五档盘口：买一到买五价格递减、卖一到卖五递增，委托量可配置。
+// English: builds a 5-level order book: bid 1..5 prices decrease, ask 1..5 increase, volumes are configurable.
 func testDepth(price float64) *OrderBook {
 	ob := newOrderBook("600519", "贵州茅台")
 	ob.Price = price
@@ -23,6 +24,7 @@ func TestOrderBookPreallocatedTenLevels(t *testing.T) {
 		t.Fatalf("盘口需预分配 %d 档（十档预留），got bids=%d asks=%d", DepthLevels, len(ob.Bids), len(ob.Asks))
 	}
 	// 填充前五档后，6~10 档为零值。
+	// English: after filling the first 5 levels, levels 6-10 are zero values.
 	for i := 5; i < DepthLevels; i++ {
 		if ob.Bids[i].Price != 0 || ob.Asks[i].Price != 0 {
 			t.Fatalf("第 %d 档应为零值（未填充），got %+v/%+v", i+1, ob.Bids[i], ob.Asks[i])
@@ -34,6 +36,7 @@ func TestOrderBookFactors(t *testing.T) {
 	price := 10.0
 	ob := testDepth(price)
 	// 买盘：100+101+102+103+104=510；卖盘：200+201+202+203+204=1010
+	// English: bids: 100+101+102+103+104=510; asks: 200+201+202+203+204=1010
 	f := ob.Factors(5)
 	if math.Abs(f.BidVol-510) > 1e-6 {
 		t.Errorf("买量应=510, got %.2f", f.BidVol)
@@ -49,14 +52,17 @@ func TestOrderBookFactors(t *testing.T) {
 		t.Errorf("封单量应为 100/200, got %.1f/%.1f", f.SealBid, f.SealAsk)
 	}
 	// 买一 9.99 卖一 10.01 → 价差 0.2%
+	// English: bid1 9.99 ask1 10.01 → spread 0.2%
 	if math.Abs(f.SpreadPct-0.2) > 1e-6 {
 		t.Errorf("价差百分比应=0.2, got %.4f", f.SpreadPct)
 	}
 	// 买五 9.95 卖五 10.05 → 覆盖 1%
+	// English: bid5 9.95 ask5 10.05 → covers 1%
 	if math.Abs(f.NearPct-1.0) > 1e-6 {
 		t.Errorf("覆盖范围应=1.0%%, got %.4f", f.NearPct)
 	}
 	// 默认档位数=5（levels 传 0）
+	// English: default level count = 5 (levels passed as 0)
 	f0 := ob.Factors(0)
 	if math.Abs(f0.BidVol-510) > 1e-6 {
 		t.Errorf("默认档位数应为5, got bid_vol=%.2f", f0.BidVol)
@@ -89,10 +95,13 @@ func TestExtractTencentTime(t *testing.T) {
 
 // TestDetectBigOrders 验证托单/压单识别：单档量占同侧五档总量 ≥30% 判大单，
 // 买盘大单→托单(support)、卖盘大单→压单(resistance)。
+// English: TestDetectBigOrders verifies support/resistance order detection: a level whose volume is ≥30% of the same-side 5-level total is a big order;
+// English: big orders on the bid side → support, on the ask side → resistance.
 func TestDetectBigOrders(t *testing.T) {
 	ob := newOrderBook("600519", "贵州茅台")
 	ob.Price = 10
 	// 买盘：买一 500 手占 80%，其余均摊 → 买一是托单(strong)
+	// English: bids: bid1 500 lots is 80%, the rest spread out → bid1 is a strong support
 	ob.Bids = []OrderLevel{
 		{Price: 9.99, Volume: 500},
 		{Price: 9.98, Volume: 50},
@@ -101,6 +110,7 @@ func TestDetectBigOrders(t *testing.T) {
 		{Price: 9.95, Volume: 20},
 	}
 	// 卖盘：卖一 500 手占 56% → 压单(strong)；卖三 300 手占 34% → 压单(weak)
+	// English: asks: ask1 500 lots is 56% → strong resistance; ask3 300 lots is 34% → weak resistance
 	ob.Asks = []OrderLevel{
 		{Price: 10.01, Volume: 500},
 		{Price: 10.02, Volume: 20},
@@ -110,6 +120,7 @@ func TestDetectBigOrders(t *testing.T) {
 	}
 	orders := ob.DetectBigOrders(BigOrderConfig{})
 	// 买盘总量=640，卖盘总量=890
+	// English: bid-side total=640, ask-side total=890
 	support := filterByKind(orders, BigOrderSupport)
 	resist := filterByKind(orders, BigOrderResistance)
 	if len(support) != 1 {
@@ -131,10 +142,12 @@ func TestDetectBigOrders(t *testing.T) {
 		t.Errorf("压单应为卖三300手 weak, got %+v", resist[1])
 	}
 	// 空盘口 → 无大单
+	// English: empty order book → no big orders
 	if n := newOrderBook("000001", "平安银行").DetectBigOrders(BigOrderConfig{}); len(n) != 0 {
 		t.Errorf("空盘口不应有大单, got %+v", n)
 	}
 	// 默认阈值=0.3；提高阈值到 0.7 后 500/640=0.78 仍命中，其余排除
+	// English: default threshold=0.3; raising it to 0.7 still hits 500/640=0.78 and excludes the rest
 	strict := ob.DetectBigOrders(BigOrderConfig{MinSharePct: 0.7})
 	if len(strict) != 1 || strict[0].Level != 1 {
 		t.Errorf("阈值0.7应只剩买一托单, got %+v", strict)

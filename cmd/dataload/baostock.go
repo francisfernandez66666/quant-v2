@@ -188,7 +188,7 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 			"ts_code": code, "trade_date": date,
 			"open": r.F("open"), "high": r.F("high"), "low": r.F("low"), "close": closeV,
 			"pre_close": preClose, "change": closeV - preClose, "pct_chg": r.F("pctchg"),
-			"vol": r.F("volume") / 100, // 股 → 手
+			"vol":    r.F("volume") / 100, // 股 → 手
 			"amount": r.F("amount"),
 		})
 		basis = append(basis, map[string]any{

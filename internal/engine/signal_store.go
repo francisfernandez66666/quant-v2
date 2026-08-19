@@ -161,8 +161,8 @@ func (s *signalStore) save() {
 		return
 	}
 	f := signalStoreFile{
-		TradingDay: data.TradingDayDate(time.Now()),
-		Signals:    make([]combat_agent.Signal, 0, len(s.byKey)),
+		TradingDay:  data.TradingDayDate(time.Now()),
+		Signals:     make([]combat_agent.Signal, 0, len(s.byKey)),
 		Invalidated: make([]string, 0, len(s.invalidated)),
 	}
 	for _, sig := range s.byKey {

@@ -16,12 +16,12 @@ func newNS() *NShapeStrategy {
 // fullCtx 构造 D1=LLM满评分 + D2/D3/D4 满分 的环境，确保 full_chain。
 func fullCtx() *Ctx {
 	return &Ctx{
-		LLMD1Score:      40, // D1 = 40（0~40 满分制，calcD1 直接采用）
-		EmotionPhase:     "启动",
+		LLMD1Score:         40, // D1 = 40（0~40 满分制，calcD1 直接采用）
+		EmotionPhase:       "启动",
 		SectorTurnoverMA20: 0, // 跳过板块冷清检查
-		PreEventReturn5d: 0.1,
-		StockPE:          12, // D3 = 20
-		AvgDailyVol:      1000,
+		PreEventReturn5d:   0.1,
+		StockPE:            12, // D3 = 20
+		AvgDailyVol:        1000,
 	}
 }
 
@@ -32,8 +32,8 @@ func fullIB() *IntradayB {
 		PrevClose:     11.5,
 		PrevHigh:      5.0,
 		PrevLow:       1.0,
-		CumVol:        200, // 量比 200/(1000*0.1)=2.0 → D2b=8
-		AuctionChgPct: 2.5, // D2a=15
+		CumVol:        200,  // 量比 200/(1000*0.1)=2.0 → D2b=8
+		AuctionChgPct: 2.5,  // D2a=15
 		BenchCurChg:   0.01, // 超额→D2c=7
 		AvgDailyVol:   1000,
 		MinuteMACDDIF: 1.0, // D4a=5

@@ -12,6 +12,7 @@ import (
 )
 
 // sellTestMD 构造一个含行情/日K/分钟MACD的 StockMarketData。
+// English: sellTestMD builds a StockMarketData with quote/daily K-lines/minute MACD.
 func sellTestMD(price float64, chgPct float64, kl []data.KLine, macd data.MACD) *strategy_engine.StockMarketData {
 	return &strategy_engine.StockMarketData{
 		Code:       "600001",
@@ -25,6 +26,7 @@ func sellTestMD(price float64, chgPct float64, kl []data.KLine, macd data.MACD) 
 }
 
 // upKLines 构造 n 根上行K线（close 逐根+1 从 100 起）。
+// English: upKLines builds n rising K-lines (close increments by 1 each bar starting from 100).
 func upKLines(n int) []data.KLine {
 	kl := make([]data.KLine, n)
 	for i := 0; i < n; i++ {
@@ -34,6 +36,7 @@ func upKLines(n int) []data.KLine {
 }
 
 // TestSellFactorBearishD1 利空D1（负面过滤拦截）→ 清仓级。
+// English: TestSellFactorBearishD1 bearish D1 (negative filter veto) → liquidation tier.
 func TestSellFactorBearishD1(t *testing.T) {
 	md := sellTestMD(120, 2, upKLines(30), data.MACD{DIF: 0.5, DEA: 0.4, Bar: 0.1})
 	fs := assessSellFactor("600001", md, D1Score{Score: 0, Blocked: true, Reason: "控股股东减持"}, 80, 60)
@@ -43,8 +46,10 @@ func TestSellFactorBearishD1(t *testing.T) {
 }
 
 // TestSellFactorBreakMA 现价跌破MA5与MA20 → 减仓级。
+// English: TestSellFactorBreakMA price breaks below MA5 and MA20 → reduction tier.
 func TestSellFactorBreakMA(t *testing.T) {
 	// 前30根上行到129，现价跌到110（低于MA5≈124与MA20≈119）→ 破位
+	// English: First 30 bars rise to 129, price drops to 110 (below MA5≈124 and MA20≈119) → breakdown.
 	md := sellTestMD(110, -3, upKLines(30), data.MACD{DIF: 0.5, DEA: 0.4, Bar: 0.1})
 	fs := assessSellFactor("600001", md, D1Score{}, 80, 60)
 	found := false
@@ -59,10 +64,12 @@ func TestSellFactorBreakMA(t *testing.T) {
 }
 
 // TestSellFactorVolumeDistribution 放量下跌 → 减仓级。
+// English: TestSellFactorVolumeDistribution high-volume decline → reduction tier.
 func TestSellFactorVolumeDistribution(t *testing.T) {
 	kl := upKLines(21) // 前20根为基准量，最后1根是当日
 	md := sellTestMD(115, -2.5, kl, data.MACD{DIF: 0.5, DEA: 0.4, Bar: 0.1})
 	// 当日量放大到均量的 2 倍（基准 1000，现 2000），且跌幅为负 → 派发
+	// English: Today's volume expands to 2x the average (baseline 1000, now 2000) with a negative change → distribution.
 	md.Quote.Volume = 2000
 	md.ChangePct = -2.5
 	fs := assessSellFactor("600001", md, D1Score{}, 80, 60)
@@ -78,6 +85,7 @@ func TestSellFactorVolumeDistribution(t *testing.T) {
 }
 
 // TestSellFactorMomentumExhaustion 动量分过低且分钟MACD零下死叉 → 提示级。
+// English: TestSellFactorMomentumExhaustion momentum score too low with a below-zero minute-MACD death cross → hint tier.
 func TestSellFactorMomentumExhaustion(t *testing.T) {
 	md := sellTestMD(105, -1, upKLines(30), data.MACD{DIF: -0.2, DEA: 0.1, Bar: -0.3})
 	fs := assessSellFactor("600001", md, D1Score{}, 25, 60)

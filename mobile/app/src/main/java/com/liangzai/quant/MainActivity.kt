@@ -115,14 +115,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 原生通知桥：前端 JS 调用 window.AndroidNotify.show(title, body) 显示 Android 系统通知
+        // 返回布尔值：true=已发送；false=未获通知权限（前端据此提示用户去授权，避免静默丢失）
         webView.addJavascriptInterface(object {
             @android.webkit.JavascriptInterface
-            fun show(title: String, body: String) {
+            fun show(title: String, body: String): Boolean {
                 val manager = getSystemService(NotificationManager::class.java)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                     ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS)
                     != PackageManager.PERMISSION_GRANTED) {
-                    return
+                    // 未授权：返回 false 供前端感知，并主动触发一次权限申请引导
+                    this@MainActivity.requestNotificationPermission()
+                    return false
                 }
                 val intent = android.content.Intent(this@MainActivity, MainActivity::class.java)
                 val pending = android.app.PendingIntent.getActivity(
@@ -138,6 +141,7 @@ class MainActivity : AppCompatActivity() {
                     .setContentIntent(pending)
                     .build()
                 manager.notify((title + body).hashCode(), notification)
+                return true
             }
         }, "AndroidNotify")
 

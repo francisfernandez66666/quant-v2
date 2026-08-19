@@ -1,17 +1,21 @@
 // KDJ 随机指标（9,3,3，通达信口径）。
+// English: KDJ stochastic indicator (9,3,3, Tongdaxin convention).
 package indicator
 
 // KDJPoint 单根K线的 KDJ 三值。
+// English: KDJPoint holds the three KDJ values for a single bar.
 type KDJPoint struct {
 	RSV float64 // 未成熟随机值
-	K   float64
-	D   float64
-	J   float64 // J = 3K − 2D
+	// English: RSV is the immature stochastic value.
+	K float64
+	D float64
+	J float64 // J = 3K − 2D
 }
 
 // KDJ 计算 KDJ 序列（默认 9,3,3）。
 // RSV 以最近 n 根高低价区间衡量收盘位置；区间为 0（最高==最低）时 RSV=50（中性）。
 // K/D 初始值 50，按 1/3 平滑递推。序列从头即有值。
+// English: KDJ computes the KDJ series (default 9,3,3). RSV measures the close position within the recent n-bar high/low range; RSV=50 (neutral) when the range is zero (high==low). K/D start at 50 and are smoothed recursively by a factor of 1/3. The series has values from the first bar.
 // （KDJ computes the KDJ series (default 9,3,3). RSV=50 when the n-bar range is zero.
 // K/D start at 50 and smooth with a 1/3 factor.）
 func KDJ(closes, highs, lows []float64, n, m1, m2 int) []KDJPoint {
@@ -46,6 +50,7 @@ func KDJ(closes, highs, lows []float64, n, m1, m2 int) []KDJPoint {
 }
 
 // KDJDefault 以默认参数（9,3,3）计算 KDJ。
+// English: KDJDefault computes KDJ with the default 9,3,3 parameters.
 // （KDJDefault computes KDJ with the default 9,3,3 parameters.）
 func KDJDefault(closes, highs, lows []float64) []KDJPoint {
 	return KDJ(closes, highs, lows, 9, 3, 3)

@@ -75,6 +75,7 @@
         <span class="col-score" title="龙头≥70买入">龙</span>
         <span class="col-score" title="动量≥50关注">量</span>
         <span class="col-sl">止盈/止损</span>
+        <span class="col-sl" title="移动止盈基准（阶段最高价）">移动止盈</span>
         <span class="col-kline">分时</span>
         <span class="col-actions">操作</span>
       </div>
@@ -107,6 +108,10 @@
           <span class="sl-tp">+{{ (h.take_profit_pct||8).toFixed(1) }}%</span>
           <span class="sl-div">/</span>
           <span class="sl-sel">-{{ (h.stop_loss_pct||5).toFixed(1) }}%</span>
+        </span>
+        <span class="col-sl" data-label="移动止盈">
+          <span v-if="h.highest_price > 0" :class="['sl-move', h.highest_price > (h.cost_price||0) ? 'up' : '']">¥{{ h.highest_price.toFixed(2) }}</span>
+          <span v-else>—</span>
         </span>
         <span class="col-kline" data-label="分时">
           <button class="btn-kline" @click.stop="toggleKline(h.code)" :title="klineOpen.has(h.code) ? '收起分时' : '展开分时'">{{ klineOpen.has(h.code) ? '收起' : '分时' }}</button>
@@ -893,6 +898,8 @@ function sheetClose() {
 .sl-tp { color: #FF4D4F; }
 .sl-div { color: #333; margin: 0 2px; }
 .sl-sel { color: #4caf50; }
+.sl-move { color: #b388ff; }
+.sl-move.up { color: #FF4D4F; }
 .col-actions { display: flex; gap: 4px; flex: 0 0 240px; justify-content: center; }
 .btn-edit, .btn-sell, .btn-lot, .btn-cost {
   padding: 4px 8px; border-radius: 4px; font-size: 14px; cursor: pointer; white-space: nowrap;

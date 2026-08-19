@@ -399,14 +399,14 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.ctrlFor(requestUserID(r))
 	status := map[string]bool{
-		"news_agent":    ctrl != nil && ctrl.GetAllNewsEvents() != nil,
+		"news_agent":      ctrl != nil && ctrl.GetAllNewsEvents() != nil,
 		"strategy_engine": ctrl != nil && ctrl.GetStageRecords() != nil,
-		"sector_agent":  ctrl != nil && ctrl.GetHotRecords() != nil,
-		"combat_agent":  ctrl != nil && ctrl.GetSignalLogs() != nil,
-		"llm":           ctrl != nil && s.runtimeLLM != "",
-		"ths":           s.ths != nil,
-		"fetcher":       s.fetcher != nil,
-		"aggregator":    ctrl != nil,
+		"sector_agent":    ctrl != nil && ctrl.GetHotRecords() != nil,
+		"combat_agent":    ctrl != nil && ctrl.GetSignalLogs() != nil,
+		"llm":             ctrl != nil && s.runtimeLLM != "",
+		"ths":             s.ths != nil,
+		"fetcher":         s.fetcher != nil,
+		"aggregator":      ctrl != nil,
 	}
 	writeJSON(w, 200, status)
 }
@@ -554,25 +554,26 @@ func (s *Server) handleSectorHotRecords(w http.ResponseWriter, r *http.Request) 
 // fixHolding 前端持仓格式的结构体。
 // 包含持仓数量、成本价、现价、盈亏比例、止盈止损价等字段。
 type fixHolding struct {
-	Code          string  `json:"code"`            // 股票代码
-	Name          string  `json:"name"`            // 股票名称
-	Quantity      float64 `json:"quantity"`        // 持仓数量
-	CostPrice     float64 `json:"cost_price"`      // 持仓成本价
-	CurPrice      float64 `json:"cur_price"`       // 最新现价
-	ChangePct     float64 `json:"change_pct"`      // 当日涨跌幅（%）
-	PnlPct        float64 `json:"pnl_pct"`         // 持仓盈亏比例（%）
-	TakeProfitPct float64 `json:"take_profit_pct"` // 止盈百分比设置
-	StopLossPct   float64 `json:"stop_loss_pct"`   // 止损百分比设置
-	SignalActive  bool    `json:"signal_active"`   // 是否有活跃信号
-	NSscore       float64 `json:"n_score"`         // N形策略评分
-	DragonScore   float64 `json:"dragon_score"`    // 破局龙策略评分
-	DbScore       float64 `json:"db_score"`        // 双凸策略评分
-	DrScore       float64 `json:"dr_score"`        // 龙回头策略评分
-	MScore        float64 `json:"m_score"`         // 动量策略评分
-TakeProfit    float64    `json:"take_profit"`     // 止盈目标价
-	StopLoss      float64    `json:"stop_loss"`       // 止损价位
-	RealizedPnl   float64    `json:"realized_pnl"`    // 该标的累计已实现盈亏（元）
-	Lots          []report.Lot `json:"lots,omitempty"` // 加仓批次明细
+	Code          string       `json:"code"`            // 股票代码
+	Name          string       `json:"name"`            // 股票名称
+	Quantity      float64      `json:"quantity"`        // 持仓数量
+	CostPrice     float64      `json:"cost_price"`      // 持仓成本价
+	CurPrice      float64      `json:"cur_price"`       // 最新现价
+	ChangePct     float64      `json:"change_pct"`      // 当日涨跌幅（%）
+	PnlPct        float64      `json:"pnl_pct"`         // 持仓盈亏比例（%）
+	TakeProfitPct float64      `json:"take_profit_pct"` // 止盈百分比设置
+	StopLossPct   float64      `json:"stop_loss_pct"`   // 止损百分比设置
+	SignalActive  bool         `json:"signal_active"`   // 是否有活跃信号
+	NSscore       float64      `json:"n_score"`         // N形策略评分
+	DragonScore   float64      `json:"dragon_score"`    // 破局龙策略评分
+	DbScore       float64      `json:"db_score"`        // 双凸策略评分
+	DrScore       float64      `json:"dr_score"`        // 龙回头策略评分
+	MScore        float64      `json:"m_score"`         // 动量策略评分
+	TakeProfit    float64      `json:"take_profit"`     // 止盈目标价
+	StopLoss      float64      `json:"stop_loss"`       // 止损价位
+	HighestPrice  float64      `json:"highest_price"`   // 移动止盈基准（阶段最高价，开仓=入场价）
+	RealizedPnl   float64      `json:"realized_pnl"`    // 该标的累计已实现盈亏（元）
+	Lots          []report.Lot `json:"lots,omitempty"`  // 加仓批次明细
 }
 
 // handleFixGetHoldings 处理 GET /api/holdings 请求，返回当前持仓列表。
@@ -589,9 +590,9 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 		holdings = append(holdings, s.buildHolding(l, userID))
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"holdings":            holdings,
-		"available_balance":   0,
-		"total_realized_pnl":  s.rpt.TotalRealizedPnl(userID),
+		"holdings":           holdings,
+		"available_balance":  0,
+		"total_realized_pnl": s.rpt.TotalRealizedPnl(userID),
 	})
 }
 
@@ -632,6 +633,7 @@ func (s *Server) buildHolding(l report.ExecLog, userID string) fixHolding {
 		StopLossPct:   r2(l.StopLossPct),
 		TakeProfit:    r2(l.EntryPrice * (1 + l.TakeProfitPct/100)),
 		StopLoss:      r2(l.EntryPrice * (1 - l.StopLossPct/100)),
+		HighestPrice:  r2(l.HighestPrice),
 		RealizedPnl:   r2(l.RealizedPnl),
 		Lots:          holdingLots(l),
 	}
@@ -1298,6 +1300,7 @@ func (s *Server) handleFixDepth(w http.ResponseWriter, r *http.Request) {
 		"factors":    ob.Factors(5),
 	})
 }
+
 // 兼容三种来源格式：已格式化的日期字符串（原样或截断）、epoch 秒（数字或纯数字字符串）、
 // 以及纯日期 "YYYY-MM-DD"。防止任何源的 epoch 秒时间直接透传给前端展示成乱码。
 // normalizeNewsTime coerces a news timestamp into "YYYY-MM-DD HH:MM". It accepts formatted
@@ -1643,6 +1646,7 @@ func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
 // handleFixSSE 处理 GET /api/events 请求，建立 Server-Sent Events (SSE) 连接。
 // 用于向前端推送实时事件更新。需要 token 认证。
 // 连接建立后：15 秒发送一次心跳保活，有数据时立即推送。
+// 账号隔离：按 token 解析 userID，仅订阅该账号定向事件；断线续传：读取 Last-Event-ID 补发漏掉的事件。
 func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 	tokenStr := r.URL.Query().Get("token")
 	if tokenStr == "" {
@@ -1654,7 +1658,7 @@ func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "invalid token")
 		return
 	}
-	_ = user
+	userID := user.ID
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1666,8 +1670,13 @@ func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := s.sse.Subscribe()
-	defer s.sse.Unsubscribe(ch)
+	// 读取 Last-Event-ID 头实现断线续传：>0 时按账号补发历史中该序号之后的事件
+	var lastID uint64
+	if v := r.Header.Get("Last-Event-ID"); v != "" {
+		fmt.Sscanf(v, "%d", &lastID)
+	}
+	ch := s.sse.SubscribeFor(userID, lastID)
+	defer s.sse.UnsubscribeFor(userID, ch)
 
 	ctx := r.Context()
 	// 发送心跳保活
@@ -1678,8 +1687,12 @@ func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case data := <-ch:
-			fmt.Fprintf(w, "data: %s\n\n", data)
+		case ev := <-ch:
+			// 先写事件序号（供客户端断线续传），再写数据与空行
+			if ev.ID > 0 {
+				fmt.Fprintf(w, "id: %d\n", ev.ID)
+			}
+			fmt.Fprintf(w, "data: %s\n\n", ev.Data)
 			flusher.Flush()
 		case <-ticker.C:
 			fmt.Fprintf(w, ": heartbeat\n\n")

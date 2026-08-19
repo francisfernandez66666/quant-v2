@@ -336,14 +336,14 @@ func renderRehearsalReport(t *testing.T, p *LatencyProfile, mMain, mScore *simMe
 	llmSerial := llm1x(p.Stage0Tokens, 1) + llm1x(p.Stage2Tokens, 2) + llm1x(p.D1Tokens, 1)
 	if llmSerial > budget5s {
 		todos = append(todos, "单轮 LLM 串行总时长 "+fmtDur(llmSerial)+" 超 5s → 建议：批量合并或 LLM 超时/降级策略")
-		push("  ✗ 单轮 LLM 串行 "+fmtDur(llmSerial)+" 超 5s 预算")
+		push("  ✗ 单轮 LLM 串行 " + fmtDur(llmSerial) + " 超 5s 预算")
 	} else {
 		push("  ✓ 单轮 LLM 串行 " + fmtDur(llmSerial) + " 在 5s 预算内")
 	}
 	score1x := avgScore / time.Duration(maxI(int(p.ScaleFactor*1000), 1)) * 1000
 	if score1x > budget5s {
 		todos = append(todos, "近实时打分轮 1× "+fmtDur(score1x)+" 超 5s → 建议：行情拉取批量/缓存")
-		push("  ✗ 打分轮 1× "+fmtDur(score1x)+" 超 5s 预算")
+		push("  ✗ 打分轮 1× " + fmtDur(score1x) + " 超 5s 预算")
 	} else {
 		push("  ✓ 打分轮 1× " + fmtDur(score1x) + " 在 5s 预算内")
 	}

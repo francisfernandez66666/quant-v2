@@ -10,6 +10,7 @@ import (
 
 // TestReloadConfigAppliesPositionThreshold 热加载应同时应用持仓当日跌幅提醒阈值，
 // 保证前端/手动改 config.json 后无需重启即可生效。
+// English: TestReloadConfigAppliesPositionThreshold hot reload must also apply the position daily-drop alert threshold, so frontend/manual edits to config.json take effect without a restart.
 func TestReloadConfigAppliesPositionThreshold(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(p, []byte(`{"rules":{"strategy":{"momentum":{}},"position":{"daily_drop_alert_pct":7}}}`), 0644); err != nil {

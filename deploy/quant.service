@@ -22,8 +22,14 @@ WorkingDirectory=/opt/quant
 ExecStart=/opt/quant/quant
 Restart=always
 RestartSec=5
-# 防止 OOM / 日志膨胀：限制内存与日志大小
-MemoryMax=1G
+# 防止 OOM / 日志膨胀：限制内存与日志大小。
+# MemoryMax 给到 2G：正常运行时 quant 仅占 ~200-400M；留出余量给前端触发的全量回测
+# （回测以独立子进程 research backtest 运行，计入同一 cgroup）。服务器 1.6G 内存 + 2G swap，
+# 盘中 quant-research 空闲，总量可控。
+# English: MemoryMax=2G — quant normally uses ~200-400M; headroom allows a frontend-triggered full
+# backtest (spawned as a separate research backtest child in the same cgroup). Server has 1.6G RAM +
+# 2G swap; quant-research is idle during trading hours, so the total stays within budget.
+MemoryMax=2G
 # 硬性限流防误开
 LimitNOFILE=65535
 

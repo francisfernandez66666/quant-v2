@@ -11,8 +11,8 @@ import (
 	"log"
 	"math"
 
-	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/config"
 )
 
 // paperOpenTpSl 返回某战法纸面开仓时的止盈/止损百分比（供持仓记录与百分比止盈止损提醒使用）。

@@ -83,6 +83,12 @@ type Signal struct {
 	Sector      string    `json:"sector"`               // 所属板块
 	GeneratedAt time.Time `json:"generated_at"`         // 信号生成时间
 
+	// StrategyID 战法库规则 ID（如 "fac_1"）。用于效果监测：把触发信号归属到具体已应用战法规则。
+	// 仅多规则战法（因子战法库）填充；其余战法为空。
+	// English: strategy-library rule ID (e.g. "fac_1") used to attribute a signal to a specific applied
+	// strategy rule for effectiveness monitoring. Populated only for multi-rule strategies (factor library).
+	StrategyID string `json:"strategy_id,omitempty"`
+
 	// D1 事件信息（新闻归因/LLM 分析，区别于策略 Reason）：
 	// D1Score 为该股最近一轮 D1 事件评分（0~40，越高越值得关注；与板块利好/利空事件分解耦，独立 LLM 打分）；
 	// D1Blocked 表示是否被负面过滤拦截（立案/减持/质押/解禁等）；D1Reason 为 LLM 对事件的 D1 分析理由；D1Event 为个股关联的事件名称（新闻标题）。
@@ -90,10 +96,10 @@ type Signal struct {
 	// D1Score is the stock's latest D1 event score (0~40, higher = more noteworthy; decoupled from the
 	// sector bull/bear event score and graded independently by the LLM); D1Blocked means the
 	// negative filter tripped; D1Reason is the LLM's D1 analysis; D1Event is the linked event title.
-	D1Score    float64 `json:"d1_score,omitempty"`    // D1 事件评分（0~40）
-	D1Blocked  bool    `json:"d1_blocked,omitempty"`  // D1 负面过滤拦截标记
-	D1Reason   string  `json:"d1_reason,omitempty"`   // D1 事件分析理由（LLM）
-	D1Event    string  `json:"d1_event,omitempty"`    // D1 关联事件名称
+	D1Score   float64 `json:"d1_score,omitempty"`   // D1 事件评分（0~40）
+	D1Blocked bool    `json:"d1_blocked,omitempty"` // D1 负面过滤拦截标记
+	D1Reason  string  `json:"d1_reason,omitempty"`  // D1 事件分析理由（LLM）
+	D1Event   string  `json:"d1_event,omitempty"`   // D1 关联事件名称
 
 	// DepthFactors 盘口派生因子（免费源五档，Level-2 可扩十档）：供战法读取买卖压力/封单量。
 	// 仅当数据可用时填充（omitempty），缺失为零值——战法应容忍因子缺失。

@@ -1,4 +1,5 @@
 // 规模类因子：对数市值（原始价 × 股本，季频近似）。
+// English: Size factor: log market cap (raw price × shares, quarterly approximation).
 package factor
 
 import "math"

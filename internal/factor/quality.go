@@ -1,4 +1,5 @@
 // 质量类因子：盈利质量与偿债结构（点对时财务）。
+// English: Quality factors: earnings quality and debt structure (point-in-time financials).
 package factor
 
 func roeFactor(s *StockSeries) []float64 {

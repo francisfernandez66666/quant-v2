@@ -153,7 +153,7 @@ import { useRouter } from 'vue-router'
 import * as api from './api/index.js'
 // 通知工具：APK WebView 走原生桥，桌面浏览器走标准 Notification API
 // (Notification helper: native bridge in the APK WebView, standard API on desktop)
-import { isNative, canNotify, requestPermission, notify as sendNotify } from './notify.js'
+import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 
 // 路由实例：logout 时跳转回根路由（登录页）(router instance: navigate back to root on logout)
 const router = useRouter()
@@ -325,6 +325,14 @@ function handleSSE(msg) {
     refreshStatus()
     return
   }
+  if (msg && msg.type === 'message' && msg.item) {
+    // 后端推送的关键消息（D2）：止盈/止损/清仓/交易信号等，刷新消息中心并对关键级别弹系统通知
+    const level = msg.item.level || ''
+    const critical = level.indexOf('止盈') >= 0 || level.indexOf('止损') >= 0 || level.indexOf('清仓') >= 0 || level.indexOf('交易信号') >= 0 || level.indexOf('买入') >= 0
+    if (critical) notifyCriticalMessage(msg.item)
+    refreshStatus()
+    return
+  }
   if (msg.signal) {
     // 新信号到来时弹 Toast 并刷新状态栏 (show a Toast and refresh status when a new signal arrives)
     addToast('新信号: ' + (msg.signal.code || ''), 'warning')
@@ -332,16 +340,23 @@ function handleSSE(msg) {
   }
 }
 
-/** 交易信号浏览器通知去重：60 秒窗口内同一批信号只通知一次，避免每轮刷新反复弹 (Dedupe: notify the same batch at most once per 60s window to avoid spam on each poll) */
-let lastNotifyAt = 0
-
-/** 发送交易信号系统通知（APK 走原生桥，桌面需已授权浏览器通知；页面不可见时也提醒） (Send a trading-signal system notification via native bridge or browser; works when tab is hidden) */
+/** 发送交易信号系统通知（APK 走原生桥，桌面需已授权浏览器通知；按 scan 批次限流） (Send a trading-signal system notification via native bridge or browser; throttled per scan batch) */
 function notifyTradeSignal(text) {
-  if (!canNotify()) return
-  const now = Date.now()
-  if (now - lastNotifyAt < 60000) return
-  lastNotifyAt = now
-  sendNotify('量仔期货 交易信号', text)
+  // 按 "scan" 维度限流：同一轮信号批次窗口内只弹一次，避免每轮刷新反复提醒
+  notifyThrottled('scan', '量仔期货 交易信号', text)
+}
+
+/** 发送关键消息系统通知（止盈/止损/清仓等），按 "code@level" 限流 (Send a critical message system notification, throttled per code@level) */
+// 说明：后端经 SSE 推送的 message 事件（D2）携带消息明细，这里对止盈/止损/清仓等
+//       关键级别弹系统通知；按 code@level 限流避免同一标的同级别反复弹。
+function notifyCriticalMessage(item) {
+  if (!item) return
+  const level = item.level || ''
+  const code = item.code || ''
+  const name = item.name || ''
+  const title = level ? ('量仔期货 ' + level) : '量仔期货 提醒'
+  const body = (code ? code + ' ' : '') + (name || '') + (item.title || item.body || '')
+  notifyThrottled(code + '@' + level, title, body)
 }
 
 // Android 原生端申请通知权限后的回调（MainActivity 调用；原生桥不依赖浏览器权限，故为空操作）
@@ -378,10 +393,24 @@ onMounted(async () => {
   // 恢复登录态，成功则启动后台任务 (restore auth; if ok, start background tasks)
   const ok = await checkAuth()
   if (ok) startPolling()
+  // 监听"登录过期"事件：后端 401 时（含 SSE 重连探测）自动退出回到登录页，终止对过期 token 的无限重连
+  // Listen for the auth-expired event: on a 401 (including SSE reconnect probing), log out automatically
+  // to return to the login page and stop reconnecting with a dead token.
+  window.addEventListener('auth:expired', onAuthExpired)
 })
 /** 卸载时停止所有后台任务 (Stop all background tasks on unmount) */
 // 生命周期：组件卸载前停止轮询与 SSE，避免后台任务泄漏 (lifecycle: stop polling & SSE before unmount to avoid leaks)
-onUnmounted(stopPolling)
+onUnmounted(() => {
+  window.removeEventListener('auth:expired', onAuthExpired)
+  stopPolling()
+})
+
+/** 登录过期处理：复用退出登录逻辑，清除数据、停止后台任务并回到登录页 */
+function onAuthExpired() {
+  if (!loggedIn.value) return
+  addToast('登录已过期，请重新登录', 'err')
+  logout()
+}
 </script>
 
 <style>

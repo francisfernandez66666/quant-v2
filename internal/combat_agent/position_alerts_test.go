@@ -15,6 +15,7 @@ import (
 
 // quoteMockTransport 模拟东财 push2 stock/get 返回固定行情（F43 单位为分）。
 // 按 secid 区分股票：600206 → 4379分(43.79)，600000 → 800分(8.00)。
+// English: quoteMockTransport simulates the Eastmoney push2 stock/get endpoint returning fixed quotes (F43 unit is cents). Stocks are distinguished by secid: 600206 → 4379 cents (43.79), 600000 → 800 cents (8.00).
 type quoteMockTransport struct{}
 
 func (rt *quoteMockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -38,6 +39,8 @@ func (rt *quoteMockTransport) RoundTrip(req *http.Request) (*http.Response, erro
 //   - Agent：仅需空策略配置（CheckPositionAlerts 不依赖策略运行器）
 //   - Report：临时文件路径的持仓报表
 //   - MarketAPI：mock 东财行情（避免真实网络）
+//
+// English: newAlertTestRig builds the CheckPositionAlerts test rig: Agent only needs an empty strategy config (CheckPositionAlerts does not depend on strategy runners); Report uses a holdings report at a temp file path; MarketAPI mocks the Eastmoney quotes (avoiding real network calls).
 func newAlertTestRig(t *testing.T) (*Agent, *report.Report, *data.MarketAPI) {
 	t.Helper()
 	a := New(&config.StrategyConfig{})
@@ -48,9 +51,11 @@ func newAlertTestRig(t *testing.T) (*Agent, *report.Report, *data.MarketAPI) {
 }
 
 // TestCheckPositionAlerts_NoScore 无打分表时：触止盈线 → 仍产出"止盈"硬提醒。
+// English: TestCheckPositionAlerts_NoScore with no score table: hitting the take-profit line → still produces a hard "take profit" alert.
 func TestCheckPositionAlerts_NoScore(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	// 开仓 40 元，止盈 8%（现价 43.79 → 盈亏 +9.47% ≥ 8% 触发）
+	// English: Opened at 40, take-profit 8% (current price 43.79 → P&L +9.47% ≥ 8% triggers).
 	rpt.LogSignal("pos-1", "600206", "有研新材", "做多", "dragon", 40.0, 8.0, 5.0)
 	alerts := a.CheckPositionAlerts(rpt, m, nil)
 	if len(alerts) != 1 {
@@ -62,6 +67,7 @@ func TestCheckPositionAlerts_NoScore(t *testing.T) {
 }
 
 // TestCheckPositionAlerts_SignalActiveDowngradesToHint 有活跃信号时：触止盈/止损线 → 降级为"提示"。
+// English: TestCheckPositionAlerts_SignalActiveDowngradesToHint with an active signal: hitting the take-profit/stop-loss line → downgraded to a "hint".
 func TestCheckPositionAlerts_SignalActiveDowngradesToHint(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	rpt.LogSignal("pos-1", "600206", "有研新材", "做多", "dragon", 40.0, 8.0, 5.0)
@@ -81,9 +87,11 @@ func TestCheckPositionAlerts_SignalActiveDowngradesToHint(t *testing.T) {
 }
 
 // TestCheckPositionAlerts_StopLossDowngrade 做多止损未出现利空确认 → 降级为"提示"观察（可能洗盘）。
+// English: TestCheckPositionAlerts_StopLossDowngrade a long stop-loss without a bearish confirmation → downgraded to a "hint" for observation (possibly a shakeout).
 func TestCheckPositionAlerts_StopLossDowngrade(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	// 开仓 10 元，止损 5%（现价 8.00 → 盈亏 -20% ≤ -5% 触发）
+	// English: Opened at 10, stop-loss 5% (current price 8.00 → P&L -20% ≤ -5% triggers).
 	rpt.LogSignal("pos-2", "600000", "浦发银行", "做多", "n_shape", 10.0, 8.0, 5.0)
 	scores := map[string]StockScores{
 		"600000": {Code: "600000", DragonReturnScore: 65, SignalActive: true},
@@ -98,9 +106,11 @@ func TestCheckPositionAlerts_StopLossDowngrade(t *testing.T) {
 }
 
 // TestCheckPositionAlerts_StopLossHardWhenBear 做多止损出现做空/利空信号 → 硬止损（不降级）。
+// English: TestCheckPositionAlerts_StopLossHardWhenBear a long stop-loss with a short/bearish signal → hard stop-loss (no downgrade).
 func TestCheckPositionAlerts_StopLossHardWhenBear(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	// 开仓 10 元，止损 5%（现价 8.00 → 盈亏 -20% ≤ -5% 触发），且该股命中利空板块(做空信号)
+	// English: Opened at 10, stop-loss 5% (current price 8.00 → P&L -20% ≤ -5% triggers), and the stock matches a bearish sector (short signal).
 	rpt.LogSignal("pos-2", "600000", "浦发银行", "做多", "n_shape", 10.0, 8.0, 5.0)
 	alerts := a.CheckPositionAlerts(rpt, m, map[string]StockScores{}, map[string]bool{"600000": true})
 	if len(alerts) != 1 {
@@ -112,9 +122,11 @@ func TestCheckPositionAlerts_StopLossHardWhenBear(t *testing.T) {
 }
 
 // TestCheckPositionAlerts_TakeProfitNeedsBull 做多止盈：有做多信号时→降级提示持有；无→硬止盈。
+// English: TestCheckPositionAlerts_TakeProfitNeedsBull long take-profit: with a long signal → downgraded to a hint to hold; without one → hard take-profit.
 func TestCheckPositionAlerts_TakeProfitNeedsBull(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	// 开仓 40 元，止盈 8%（现价 43.79 → 盈亏 +9.47% ≥ 8% 触发），有做多信号 → 提示持有
+	// English: Opened at 40, take-profit 8% (current price 43.79 → P&L +9.47% ≥ 8% triggers), with a long signal → hint to hold.
 	rpt.LogSignal("pos-1", "600206", "有研新材", "做多", "dragon", 40.0, 8.0, 5.0)
 	scores := map[string]StockScores{"600206": {Code: "600206", SignalActive: true}}
 	alerts := a.CheckPositionAlerts(rpt, m, scores)
@@ -130,6 +142,7 @@ func TestCheckPositionAlerts_TakeProfitNeedsBull(t *testing.T) {
 }
 
 // TestCheckPositionAlerts_NoThreshold 未设置止盈/止损阈值 → 不产出提醒。
+// English: TestCheckPositionAlerts_NoThreshold with no take-profit/stop-loss thresholds set → no alerts produced.
 func TestCheckPositionAlerts_NoThreshold(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	rpt.LogSignal("pos-3", "600206", "有研新材", "做多", "dragon", 40.0, 0, 0)
@@ -140,6 +153,7 @@ func TestCheckPositionAlerts_NoThreshold(t *testing.T) {
 }
 
 // dailyDropTransport 模拟当日大跌行情（F170=-700 → 涨跌幅 -7.00%）。
+// English: dailyDropTransport simulates a sharp same-day drop quote (F170=-700 → change -7.00%).
 type dailyDropTransport struct{}
 
 func (rt *dailyDropTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -156,10 +170,12 @@ func (rt *dailyDropTransport) RoundTrip(req *http.Request) (*http.Response, erro
 }
 
 // TestCheckPositionAlerts_DailyDrop 当日跌幅超过阈值、成本盈亏未触线 → 仍产出"跌幅提醒"。
+// English: TestCheckPositionAlerts_DailyDrop when the day's drop exceeds the threshold but cost P&L has not hit the line → still produces a "drop alert".
 func TestCheckPositionAlerts_DailyDrop(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	// 开仓 42 元、止损 5%（现价 40.00 → 成本盈亏 -4.76%，未触及止损线）
 	// 但当日涨跌幅 -7% ≤ -5% → 应产出"跌幅提醒"
+	// English: Opened at 42 with stop-loss 5% (current price 40.00 → cost P&L -4.76%, stop line not hit), but the day's change of -7% ≤ -5% → should produce a "drop alert".
 	rpt.LogSignal("pos-4", "600206", "有研新材", "做多", "dragon", 42.0, 0, 5.0)
 	m.SetTransport(&dailyDropTransport{})
 	alerts := a.CheckPositionAlerts(rpt, m, nil)
@@ -178,9 +194,11 @@ func TestCheckPositionAlerts_DailyDrop(t *testing.T) {
 }
 
 // TestCheckPositionAlerts_DailyDropOff 当日跌幅低于阈值 → 不产出跌幅提醒。
+// English: TestCheckPositionAlerts_DailyDropOff when the day's drop is below the threshold → no drop alert produced.
 func TestCheckPositionAlerts_DailyDropOff(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	// 现价 40.00 当日 -2% > -5%，未触止损线（成本 42 → -4.76%），无任何提醒
+	// English: Current price 40.00, day -2% > -5%, stop line not hit (cost 42 → -4.76%) → no alerts.
 	rpt.LogSignal("pos-4", "600206", "有研新材", "做多", "dragon", 42.0, 0, 5.0)
 	m.SetTransport(&quoteMockTransport{}) // f170=+10%
 	alerts := a.CheckPositionAlerts(rpt, m, nil)

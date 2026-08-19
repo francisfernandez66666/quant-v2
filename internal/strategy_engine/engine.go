@@ -27,8 +27,8 @@ type Engine struct {
 	klineCacheMu sync.RWMutex                // 保护 klineCache 的读写锁（近实时打分并发访问）（Lock guarding klineCache for concurrent near-realtime scoring）
 	klineCache   map[string]*klineCacheEntry // 日K/资金流缓存（近实时打分用）（Daily-bar / capital-flow cache for near-realtime scoring）
 
-	minuteKCacheMu sync.RWMutex                   // 保护 minuteKCache 的读写锁（Lock guarding minuteKCache）
-	minuteKCache   map[string]*minuteKCacheEntry  // 分钟K线缓存（60s TTL，避免扩大打分池后 5s 循环压垮数据源）（Minute-bar cache, 60s TTL, so the widened pool doesn't hammer the data source）
+	minuteKCacheMu sync.RWMutex                  // 保护 minuteKCache 的读写锁（Lock guarding minuteKCache）
+	minuteKCache   map[string]*minuteKCacheEntry // 分钟K线缓存（60s TTL，避免扩大打分池后 5s 循环压垮数据源）（Minute-bar cache, 60s TTL, so the widened pool doesn't hammer the data source）
 
 	benchChgMu  sync.RWMutex // 保护基准指数涨跌幅缓存（Lock guarding the benchmark change cache）
 	benchChgVal float64      // 上证指数最新涨跌幅（%）（Latest SSE index change %）
@@ -36,6 +36,32 @@ type Engine struct {
 
 	kSrcMu sync.Mutex     // 保护 K 线源统计计数（Lock guarding the K-line-source counters）
 	kSrc   map[string]int // K 线来源→次数（本轮聚合，供可观测日志）（K-line source→count, aggregated per round for observability）
+
+	finaMu     sync.Mutex                  // 保护 finaLookup（Lock guarding finaLookup）
+	finaLookup func(string) *FinancialData // 个股最新财务指标查询（实盘财务因子评分用；nil=未接入）
+}
+
+// SetFinaLookup 设置个股最新财务指标查询函数（由顶层引擎注入研究库读取逻辑）。
+// 用于实盘因子战法对财务类因子（ROE/净利同比等）打分。nil 表示不注入财务数据。
+// English: sets the per-stock latest-financials lookup (injected by the top-level engine from the
+// research DB), enabling live factor-strategy scoring of financial factors (ROE/YoyNetProfit/etc.).
+// nil disables financial injection.
+func (e *Engine) SetFinaLookup(fn func(string) *FinancialData) {
+	e.finaMu.Lock()
+	e.finaLookup = fn
+	e.finaMu.Unlock()
+}
+
+// finaOf 返回某股最新财务指标（无查询或缺失返回 nil）。
+// English: returns a stock's latest financials, or nil when no lookup/missing.
+func (e *Engine) finaOf(code string) *FinancialData {
+	e.finaMu.Lock()
+	fn := e.finaLookup
+	e.finaMu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(code)
 }
 
 // klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。（klineCacheEntry is a cached daily-bar + capital-flow entry refreshed by TTL.）
@@ -306,7 +332,7 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes map[string]*data.StockInfo) map[string]*StockMarketData {
 	result := make(map[string]*StockMarketData, len(codes))
 	for _, code := range codes {
-		result[code] = &StockMarketData{Code: code}
+		result[code] = &StockMarketData{Code: code, Fina: e.finaOf(code)}
 	}
 
 	// 基准指数涨跌幅（N 形 D2 相对强度对比）（Benchmark change % for N-shape D2 relative strength）

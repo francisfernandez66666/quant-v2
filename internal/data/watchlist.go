@@ -18,7 +18,7 @@ import (
 // isolation (watchlist_{userID}.json); empty userID falls back to watchlist.json for legacy data.
 type WatchlistManager struct {
 	mu  sync.RWMutex // 读写锁
-	dir string      // 数据目录
+	dir string       // 数据目录
 }
 
 // watchlistFile 返回指定账号的自选股文件路径。

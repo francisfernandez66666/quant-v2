@@ -142,7 +142,7 @@ func TestPrunePendingWindow(t *testing.T) {
 	tr := newTestTracker(t)
 	now := time.Date(2026, 1, 12, 10, 0, 0, 0, time.Local) // 周一 10:00
 	items := []data.NewsItem{
-		{Title: "上周四新闻", Datetime: "2026-01-08 10:00:00"}, // 早于窗口起点(周五15:00) → 裁剪
+		{Title: "上周四新闻", Datetime: "2026-01-08 10:00:00"},  // 早于窗口起点(周五15:00) → 裁剪
 		{Title: "周五盘后新闻", Datetime: "2026-01-09 16:00:00"}, // 周五15:00后 → 保留
 		{Title: "周一盘前新闻", Datetime: "2026-01-12 08:30:00"}, // 窗口内 → 保留
 	}

@@ -10,8 +10,8 @@ import (
 type Candidate struct {
 	ID        int64   `json:"id"`
 	CreatedAt string  `json:"created_at"`
-	Kind      string  `json:"kind"` // weights | d1rule | factor | depth
-	Status    string  `json:"status"` // proposed | approved | rejected | applied
+	Kind      string  `json:"kind"`    // weights | d1rule | factor | depth
+	Status    string  `json:"status"`  // proposed | approved | rejected | applied
 	Factors   string  `json:"factors"` // 因子 JSON 数组
 	Weights   string  `json:"weights"` // 权重 JSON 对象
 	Metric    float64 `json:"metric"`
@@ -90,5 +90,12 @@ func (d *DB) CandidateByID(id int64) (*Candidate, error) {
 // （UpdateCandidateStatus sets a candidate's status.）
 func (d *DB) UpdateCandidateStatus(id int64, status string) error {
 	_, err := d.db.Exec(`UPDATE research_candidates SET status=? WHERE id=?`, status, id)
+	return err
+}
+
+// UpdateCandidateAvgExcess 更新候选的回测超额（B4 回测结果回填）。
+// （UpdateCandidateAvgExcess backfills a candidate's backtest excess (B4 result).）
+func (d *DB) UpdateCandidateAvgExcess(id int64, avgExcess float64) error {
+	_, err := d.db.Exec(`UPDATE research_candidates SET avg_excess=? WHERE id=?`, avgExcess, id)
 	return err
 }

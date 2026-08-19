@@ -1,4 +1,5 @@
 // 分层收益：按因子值分位数考察前瞻收益单调性。
+// English: layer returns: examines forward-return monotonicity by factor-value quantiles.
 package research
 
 import (
@@ -7,15 +8,21 @@ import (
 )
 
 // LayerSummary 某分层的汇总（跨重平衡日期池化）。
+// English: LayerSummary is the summary of one layer (pooled across rebalance dates).
 type LayerSummary struct {
-	Layer     int     // 0 = 因子值最低层
-	N         int     // 参与统计的 股票-日期 数
+	Layer int // 0 = 因子值最低层
+	// English: 0 = the layer with the lowest factor values.
+	N int // 参与统计的 股票-日期 数
+	// English: number of stock-date pairs included.
 	MeanReturn float64 // 平均前瞻收益
+	// English: mean forward return.
 }
 
 // LayerReturns 分层检验：每个重平衡日期把当日股票按因子值分 k 层，
 // 计算各层平均前瞻收益，再跨日期池化求每层均值。
 // 层 0 为因子值最低层，层 k−1 为最高层。
+// English: LayerReturns splits stocks into k quantiles per date by factor value and pools each
+// layer's mean h-day forward return across dates; layer 0 is the lowest and layer k-1 the highest.
 // （LayerReturns splits stocks into k quantiles per date by factor value and pools each
 // layer's mean h-day forward return across dates.）
 func LayerReturns(panels []*Panel, factorID string, h, quantiles, minStocks int) []LayerSummary {
@@ -50,6 +57,7 @@ func LayerReturns(panels []*Panel, factorID string, h, quantiles, minStocks int)
 		}
 		sort.Slice(list, func(i, j int) bool { return list[i].f < list[j].f })
 		// 均分到各层（余数分给靠后层）
+		// English: divide evenly across layers (the remainder goes to the later layers).
 		base := len(list) / quantiles
 		extra := len(list) % quantiles
 		idx := 0
@@ -78,6 +86,8 @@ func LayerReturns(panels []*Panel, factorID string, h, quantiles, minStocks int)
 
 // Monotonic 判断分层收益是否单调（相邻层差值同号，忽略相等层）。
 // 返回 (单调, 方向)：(true, +1) 单调递增 / (true, −1) 单调递减。
+// English: Monotonic reports whether layer mean returns are monotonic, with direction;
+// returns (monotonic, direction): (true, +1) increasing / (true, -1) decreasing.
 // （Monotonic reports whether layer mean returns are monotonic, with direction.）
 func Monotonic(layers []LayerSummary) (bool, int) {
 	var signs []int

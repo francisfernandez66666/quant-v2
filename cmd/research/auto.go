@@ -327,6 +327,7 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	split := fs.Float64("split", 0.7, "样本内占比（0~1）")
 	minIR := fs.Float64("min-ir", 0.3, "护栏 |IR| 下限")
 	minDays := fs.Int("min-days", 20, "护栏有效日下限")
+	minGenT := fs.Float64("min-gen-t", -2, "反推泛化护栏 Welch t 阈值（t 低于此负值拦截，默认 -2）")
 	metric := fs.String("metric", "ir", "优化目标: ir|ic")
 	factors := fs.String("factors", "", "候选因子池（逗号分隔，缺省全部注册因子）")
 	codesFile := fs.String("codes", "", "研究池文件（每行一个 ts_code）")
@@ -342,16 +343,6 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	if len(codes) == 0 {
 		log.Fatalf("研究池为空")
 	}
-	defs := factor.All()
-	log.Printf("装配 %d 只股票（%s ~ %s）…", len(codes), *start, *end)
-	panels, err := research.BuildPanels(db, codes, *start, *end, defs)
-	if err != nil {
-		log.Fatalf("装配面板失败: %v", err)
-	}
-	if len(panels) == 0 {
-		log.Fatalf("无有效面板")
-	}
-
 	var pool []string
 	if *factors != "" {
 		for _, f := range strings.Split(*factors, ",") {
@@ -363,11 +354,16 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	}
 	opts := research.DiscoverOpts{
 		Factors: pool, Horizon: *h, MinStocks: *minStocks, Metric: *metric,
-		MaxFactors: *maxFactors, SplitPct: *split, MinIR: *minIR, MinDays: *minDays,
+		MaxFactors: *maxFactors, SplitPct: *split, MinIR: *minIR, MinDays: *minDays, MinGenT: *minGenT,
 	}
-	log.Printf("因子发现：池=%d 只 目标=%s 组合上限=%d 样本内=%.0f%%…",
-		len(opts.Factors), *metric, *maxFactors, *split*100)
-	res := research.DiscoverFactors(panels, opts)
+	// 内存可控的窗口分块发现：不再一次性 BuildPanels 全量加载（全市场近3年约 2.8GB），
+	// 而是按交易日窗口逐窗装配、算完即释放，峰值内存压到单窗口（900M 内），代价是更慢。
+	// English: memory-bounded windowed discovery — no longer loads the full panel set at once
+	// (~2.8GB for the whole universe × 3y), but assembles per trading-day window and releases it,
+	// keeping peak memory within a single window (under 900M) at the cost of speed.
+	log.Printf("因子发现（窗口分块）：%d 只股票 目标=%s 组合上限=%d 样本内=%.0f%%…",
+		len(codes), *metric, *maxFactors, *split*100)
+	res := research.DiscoverFactorsWindowed(db, codes, *start, *end, opts)
 
 	wj, _ := json.Marshal(res.Weights)
 	fj, _ := json.Marshal(res.Factors)
@@ -380,8 +376,8 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 		"buy_threshold": 70,
 	})
 	_ = wj
-	reason := fmt.Sprintf("%s | 样本内IR=%.3f 样本外IR=%.3f 反推超额=%.4f",
-		res.Reason, res.InsampleIR, res.OutsampleIR, res.GenExcess)
+	reason := fmt.Sprintf("%s | 样本内IR=%.3f 样本外IR=%.3f 反推超额=%.4f 反推t=%.2f",
+		res.Reason, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT)
 	status := "proposed"
 	if !res.PassGuard {
 		status = "proposed" // 护栏不过仍入库，标记 reason
@@ -394,8 +390,8 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	if err != nil {
 		log.Fatalf("保存候选失败: %v", err)
 	}
-	log.Printf("因子候选 #%d：因子=%v IR=%.3f 样本内=%.3f 样本外=%.3f 反推=%.4f 护栏=%v",
-		id, res.Factors, res.IR, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.PassGuard)
+	log.Printf("因子候选 #%d：因子=%v IR=%.3f 样本内=%.3f 样本外=%.3f 反推=%.4f 反推t=%.2f 护栏=%v",
+		id, res.Factors, res.IR, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT, res.PassGuard)
 	for _, f := range sortedIDs(res.Weights) {
 		dir := "+"
 		if res.Directions[f] < 0 {
@@ -434,16 +430,6 @@ func cmdDiscoverPatterns(db *store.DB, args []string) {
 	if len(codes) == 0 {
 		log.Fatalf("研究池为空")
 	}
-	defs := factor.All()
-	log.Printf("装配 %d 只股票（%s ~ %s）…", len(codes), *start, *end)
-	panels, err := research.BuildPanels(db, codes, *start, *end, defs)
-	if err != nil {
-		log.Fatalf("装配面板失败: %v", err)
-	}
-	if len(panels) == 0 {
-		log.Fatalf("无有效面板")
-	}
-
 	// 内置形态模板骨架（可用 F1 形态算子组合扩展）
 	templates := []research.PatternTemplate{
 		{
@@ -462,6 +448,33 @@ func cmdDiscoverPatterns(db *store.DB, args []string) {
 			},
 		},
 	}
+	// 只装配形态模板用到的算子因子（而非全部 45 因子），显著降低内存占用
+	// （5545 只 × 近3年 × 6 形态算子 ≈ 196MB，900M 内）。
+	// English: assemble only the morphology-operator factors used by the templates (instead of all 45),
+	// cutting memory sharply (~196MB for 5545 × 3y × 6 operators, within 900M).
+	needFid := map[string]bool{
+		"Drawdown20": true, "VolShrink": true, "BullAlign": true, "VolSurge5": true, "Brk20": true,
+	}
+	for _, tmpl := range templates {
+		for _, cg := range tmpl.Conds {
+			needFid[cg.Factor] = true
+		}
+	}
+	var defs []factor.Def
+	for _, d := range factor.All() {
+		if needFid[d.ID] {
+			defs = append(defs, d)
+		}
+	}
+	log.Printf("装配 %d 只股票（%s ~ %s，形态算子 %d 个）…", len(codes), *start, *end, len(defs))
+	panels, err := research.BuildPanels(db, codes, *start, *end, defs)
+	if err != nil {
+		log.Fatalf("装配面板失败: %v", err)
+	}
+	if len(panels) == 0 {
+		log.Fatalf("无有效面板")
+	}
+
 	opts := research.DiscoverOptsPattern{
 		Horizon: *h, MinTrigger: *minTrigger, MinExcess: *minExcess, SplitPct: *split,
 	}
@@ -493,4 +506,128 @@ func cmdDiscoverPatterns(db *store.DB, args []string) {
 			log.Printf("    %s ∈ [%.3f, %.3f)", c.Factor, c.Min, c.Max)
 		}
 	}
+}
+
+// cmdBacktestCandidate 对最近的因子候选跑一次 B4 全链路回测，把 avg_excess（回测超额）回填。
+// 用法：research [--db ...] [--start ...] [--end ...] backtest [--id <候选ID>] [--h 5]
+//
+//	--id 缺省取最近一条 kind="factor" 且 status="proposed" 的候选。
+//
+// 用途：夜间研究的「回测开关」开启时，discover-factors 产出候选后追加本步骤，把前端
+// 「全链路回测 未测」填上真实超额。
+// English: runs a B4 full-chain backtest on the most recent factor candidate and backfills its
+// avg_excess. --id defaults to the newest proposed factor candidate. Used by the nightly job's
+// backtest step (when enabled) to fill the "全链路回测" field with a real excess.
+func cmdBacktestCandidate(db *store.DB, args []string) {
+	fs := flag.NewFlagSet("backtest", flag.ExitOnError)
+	start := fs.String("start", "20200101", "起始日期 YYYYMMDD")
+	end := fs.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
+	h := fs.Int("h", 5, "前瞻天数")
+	id := fs.Int64("id", 0, "候选 ID（0=最近一条 proposed factor 候选）")
+	minStocks := fs.Int("min-stocks", 10, "B4 回测每日最小样本")
+	minLimitUps := fs.Int("min-limit-ups", 3, "B4 回测事件触发涨停下限")
+	topK := fs.Int("top-k", 5, "B4 回测每事件选股数")
+	maxPerDay := fs.Int("max-per-day", 1, "B4 回测每日最多事件数")
+	fs.Parse(args)
+
+	var c *store.Candidate
+	var err error
+	if *id > 0 {
+		c, err = db.CandidateByID(*id)
+		if err != nil {
+			log.Fatalf("候选 %d 不存在: %v", *id, err)
+		}
+	} else {
+		c, err = latestFactorCandidate(db)
+		if err != nil {
+			log.Fatalf("读取候选失败: %v", err)
+		}
+	}
+	if c == nil {
+		log.Printf("无可回测的因子候选（尚无 proposed factor 候选）")
+		return
+	}
+
+	// 解析候选：factors 为 JSON 数组，weights 为复合结构 {"weights":{...},"directions":{...}}
+	factors, err := parseFactorsJSON(c.Factors)
+	if err != nil {
+		log.Fatalf("解析候选因子失败: %v", err)
+	}
+	weights, directions, err := parseFactorWeightsJSON(c.Weights)
+	if err != nil {
+		log.Fatalf("解析候选权重失败: %v", err)
+	}
+
+	log.Printf("回测候选 #%d 因子=%v…", c.ID, factors)
+	bopts := backtest.DefaultOptions()
+	bopts.Start, bopts.End = *start, *end
+	bopts.Horizons = []int{*h}
+	bopts.MinLimitUps = *minLimitUps
+	bopts.MaxPerDay = *maxPerDay
+	bopts.Rule = backtest.DefaultRule()
+	bopts.Rule.Factors = factors
+	bopts.Rule.Directions = directions
+	bopts.Rule.Weights = weights
+	bopts.Rule.TopK = *topK
+	bopts.Rule.MinStocks = *minStocks
+	rep, err := backtest.Run(db, bopts)
+	if err != nil {
+		log.Fatalf("B4 回测失败: %v", err)
+	}
+	avgExcess := 0.0
+	if v, ok := rep.AvgExcess[*h]; ok {
+		avgExcess = v
+	}
+	if err := db.UpdateCandidateAvgExcess(c.ID, avgExcess); err != nil {
+		log.Fatalf("回填 avg_excess 失败: %v", err)
+	}
+	log.Printf("B4 回测完成: 候选 #%d 事件=%d 入选=%d 平均超额=%.4f（已回填）",
+		c.ID, rep.TotalEvents, rep.TotalPicks, avgExcess)
+}
+
+// latestFactorCandidate 取最近一条 kind="factor" 且 status="proposed" 的候选。
+// （latestFactorCandidate returns the newest proposed factor candidate.）
+func latestFactorCandidate(db *store.DB) (*store.Candidate, error) {
+	cands, err := db.ListCandidates("proposed")
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cands { // ListCandidates 已按 id DESC（最新在前）
+		if c.Kind == "factor" {
+			return &c, nil
+		}
+	}
+	return nil, nil
+}
+
+// parseFactorsJSON 解析候选 factors 字段（JSON 字符串数组）。
+// （parseFactorsJSON parses the candidate factors field — a JSON string array.）
+func parseFactorsJSON(raw string) ([]string, error) {
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// parseFactorWeightsJSON 解析 factor 候选的复合 weights 结构
+// {"weights":{id:0.25},"directions":{id:±1},"buy_threshold":N}，返回 (weights, directions)。
+// 兼容旧的扁平 {id:weight} 结构（directions 置空，走类别默认方向）。
+// （parseFactorWeightsJSON parses a factor candidate's composite weights
+// {"weights":{...},"directions":{...},"buy_threshold":N} into (weights, directions);
+// also accepts the legacy flat {id:weight} shape with nil directions.）
+func parseFactorWeightsJSON(raw string) (map[string]float64, map[string]int, error) {
+	var composite struct {
+		Weights    map[string]float64 `json:"weights"`
+		Directions map[string]int     `json:"directions"`
+	}
+	if err := json.Unmarshal([]byte(raw), &composite); err == nil && composite.Weights != nil {
+		return composite.Weights, composite.Directions, nil
+	}
+	// 回退：扁平结构
+	var flat map[string]float64
+	if err := json.Unmarshal([]byte(raw), &flat); err != nil {
+		return nil, nil, err
+	}
+	return flat, nil, nil
 }

@@ -1,4 +1,5 @@
 // 装配端到端测试：临时库 + 手工插入行情/财务，验证点对时对齐与 SUE 接线。
+// English: Assembly end-to-end test: temp DB + manually inserted quotes/financials, verifying point-in-time alignment and SUE wiring.
 package research
 
 import (
@@ -10,6 +11,7 @@ import (
 )
 
 // dailyCols/dailyRows 插入单日行情（hfq 恒等因子，原始价=复权价）。
+// English: dailyCols/dailyRows inserts a single day of quotes (hfq identity factor, raw price = adjusted price).
 func dailyRows(ts, date string, close float64, vol float64) map[string]any {
 	return map[string]any{
 		"ts_code": ts, "trade_date": date, "open": close - 0.1,
@@ -23,6 +25,11 @@ func dailyRows(ts, date string, close float64, vol float64) map[string]any {
 // 财务 2020 Q1-Q4 与 2021 Q1：ann_date 全部晚于行情区间（最早 2020-04-30 仍早于
 // 区间起点？否——2020 年报告 ann 在 2020，但 2021 区间 [20210104,20210108] 内
 // 最新已披露为 2020Q4(ann=20210430 越界) → 用 2020Q3(ann=20201031)。验证点对时跳步。
+// English: seedDB creates a temp DB and inserts quotes/financials for a single stock (000001.SZ).
+// Quotes: 5 trading days, close 10→14; daily_basic covers 4 bars (missing 20210105).
+// Financials 2020 Q1-Q4 and 2021 Q1: all ann_dates fall outside the quote window (earliest 2020-04-30 is still
+// before the window start? No — 2020 reports are announced in 2020, but within the 2021 window [20210104,20210108]
+// the latest disclosed is 2020Q4 (ann=20210430 out of range) → so 2020Q3 (ann=20201031) is used. Verifies point-in-time skipping.
 func seedDB(t *testing.T) *store.DB {
 	t.Helper()
 	db, err := store.Open(t.TempDir() + "/r.db")
@@ -56,6 +63,7 @@ func seedDB(t *testing.T) *store.DB {
 		"pb", "ps_ttm", "pcf_ttm", "dv_ttm", "total_share", "total_mv", "circ_mv", "is_st"}
 	var basicRows []map[string]any
 	// 覆盖 0、2、3、4 四根（缺第 1 根 20210105）
+	// English: Covers bars 0, 2, 3, 4 (missing the 1st bar 20210105).
 	for _, i := range []int{0, 2, 3, 4} {
 		basicRows = append(basicRows, map[string]any{
 			"ts_code": "000001.SZ", "trade_date": dates[i], "turnover_rate": 1.0,
@@ -69,6 +77,7 @@ func seedDB(t *testing.T) *store.DB {
 	}
 
 	// 财务 fina_indicator：ann_date 交错，验证点对时取"ann ≤ 当日 的最新报告"
+	// English: Financials fina_indicator: interleaved ann_dates, verifying point-in-time picks the latest report with ann ≤ current day.
 	finaCols := []string{"ts_code", "end_date", "ann_date", "roe", "grossprofit_margin",
 		"netprofit_margin", "debt_to_assets", "yoy_or", "yoy_net_profit"}
 	finaRows := []map[string]any{
@@ -83,6 +92,7 @@ func seedDB(t *testing.T) *store.DB {
 	}
 
 	// 利润表：2020 Q1-Q4 + 2021 Q1 累计归母净利（单季 100/200/300/400 / 110）
+	// English: Income statement: 2020 Q1-Q4 + 2021 Q1 cumulative net profit attributable to parent (single-quarter 100/200/300/400 / 110).
 	incomeCols := []string{"ts_code", "end_date", "n_income_attr_p", "revenue"}
 	incomeRows := []map[string]any{
 		{"ts_code": "000001.SZ", "end_date": "20200331", "n_income_attr_p": 100.0, "revenue": 500.0},
@@ -107,10 +117,12 @@ func TestAssemblePointInTime(t *testing.T) {
 		t.Fatalf("期望 5 根，得 %d", s.Len())
 	}
 	// 收盘 hfq 递增
+	// English: Close hfq is increasing.
 	if s.CloseHfq[4] != 14 {
 		t.Fatalf("期望最后一根收盘 14，得 %v", s.CloseHfq[4])
 	}
 	// 点对时：区间内最新已披露 = 2020Q3（ann=20201031），2020Q4 ann=20210430 越界
+	// English: Point-in-time: latest disclosed within window = 2020Q3 (ann=20201031); 2020Q4 ann=20210430 is out of range.
 	for i := range s.Dates {
 		if s.Roe[i] != 6.0 {
 			t.Fatalf("日期 %s 期望 ROE=6（2020Q3），得 %v", s.Dates[i], s.Roe[i])
@@ -120,12 +132,14 @@ func TestAssemblePointInTime(t *testing.T) {
 		}
 	}
 	// SUE：区间内最新报告 2020Q3（end 20200930）单季净利同比 = (300-400)/400 = -0.25
+	// English: SUE: latest report in window 2020Q3 (end 20200930) single-quarter NI YoY = (300-400)/400 = -0.25.
 	for i := range s.Dates {
 		if math.Abs(s.SingleQuarterNIYoy[i]+0.25) > 1e-9 {
 			t.Fatalf("日期 %s 期望 SUE=-0.25，得 %v", s.Dates[i], s.SingleQuarterNIYoy[i])
 		}
 	}
 	// daily_basic 缺第 2 根（20210105）→ PeTTM NaN；其余有值
+	// English: daily_basic is missing the 2nd bar (20210105) → PeTTM is NaN; others have values.
 	if !isNaN(s.PeTTM[1]) {
 		t.Fatalf("20210105 期望 PeTTM NaN（缺 daily_basic），得 %v", s.PeTTM[1])
 	}
@@ -148,9 +162,11 @@ func TestAssembleMissingSeries(t *testing.T) {
 }
 
 // TestReportEndToEnd 全链路冒烟：2 只股票 → 面板 → Summarize → JSON/HTML 渲染。
+// English: TestReportEndToEnd full-chain smoke test: 2 stocks → panels → Summarize → JSON/HTML rendering.
 func TestReportEndToEnd(t *testing.T) {
 	db := seedDB(t)
 	// 第二只股票 600000.SH：closes 20→24，其余字段复用（财务同构但 ROE 更高）
+	// English: Second stock 600000.SH: closes 20→24, other fields reused (isomorphic financials but higher ROE).
 	dates := []string{"20210104", "20210105", "20210106", "20210107", "20210108"}
 	closes := []float64{20, 21, 22, 23, 24}
 	var dailyRowsList []map[string]any
@@ -186,6 +202,7 @@ func TestReportEndToEnd(t *testing.T) {
 		t.Fatalf("插入 daily_basic(600000) 失败: %v", err)
 	}
 	// 财务复用同构数据（ROE 不同）
+	// English: Financials reuse isomorphic data (different ROE).
 	finaCols := []string{"ts_code", "end_date", "ann_date", "roe", "grossprofit_margin",
 		"netprofit_margin", "debt_to_assets", "yoy_or", "yoy_net_profit"}
 	finaRows := []map[string]any{
@@ -243,6 +260,7 @@ func indexBytes(b, sub []byte) int {
 }
 
 // TestBuildPanelFactor 面板构建应能算出规模因子（依赖 TotalShare 与 CloseRaw）。
+// English: TestBuildPanelFactor panel construction should compute the size factor (depends on TotalShare and CloseRaw).
 func TestBuildPanelFactor(t *testing.T) {
 	db := seedDB(t)
 	ln, ok := factor.Get("LnMktCap")

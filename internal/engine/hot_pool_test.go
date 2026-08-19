@@ -1,5 +1,6 @@
 // 本文件：热点板块监控池相关单元测试——updateHotPool 将验证通过的板块成分股（bull/bear）去重合并
 // 并入 5s 实时监控池，空板块保持原热点、超上限（60 只）截断。
+// English: This file: unit tests for the hotspot sector monitoring pool — updateHotPool deduplicates and merges verified sector constituents (bull/bear) into the 5s realtime monitoring pool; empty sectors keep the original hotspots, and the pool truncates when it exceeds the 60-stock cap.
 package engine
 
 import (
@@ -10,12 +11,14 @@ import (
 )
 
 // newFetcher 构造一个仅带 base/hot 列表的 Fetcher（不启动轮询协程）。
+// English: newFetcher builds a Fetcher carrying only base/hot lists (does not start the polling goroutine).
 func newFetcher() *data.Fetcher {
 	return &data.Fetcher{}
 }
 
 // TestUpdateHotPoolMergesSectorStocks 验证通过的板块成分股并入 5s 实时监控池：
 // bull/bear 板块成分股去重合并后调用 fetcher.UpdateHotStocks。
+// English: TestUpdateHotPoolMergesSectorStocks verifies verified sector constituents are merged into the 5s realtime monitoring pool: bull/bear sector constituents are deduplicated and merged, then fetcher.UpdateHotStocks is called.
 func TestUpdateHotPoolMergesSectorStocks(t *testing.T) {
 	f := newFetcher()
 	e := &Engine{fetcher: f}
@@ -44,6 +47,7 @@ func TestUpdateHotPoolMergesSectorStocks(t *testing.T) {
 }
 
 // TestUpdateHotPoolEmptyKeepsHotStocks 无验证通过的板块时热点池保持不变。
+// English: TestUpdateHotPoolEmptyKeepsHotStocks: the hotspot pool stays unchanged when no sector is verified.
 func TestUpdateHotPoolEmptyKeepsHotStocks(t *testing.T) {
 	f := newFetcher()
 	f.UpdateHotStocks([]string{"600580"})
@@ -58,6 +62,7 @@ func TestUpdateHotPoolEmptyKeepsHotStocks(t *testing.T) {
 }
 
 // TestUpdateHotStocksCapsAt60 热点池超过上限 60 只时截断。
+// English: TestUpdateHotStocksCapsAt60: the hotspot pool is truncated when it exceeds the 60-stock cap.
 func TestUpdateHotStocksCapsAt60(t *testing.T) {
 	f := newFetcher()
 	stocks := make([]string, 80)

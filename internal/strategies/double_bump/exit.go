@@ -86,7 +86,12 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strateg
 	if ctx.EntryAt != "" {
 		entryDate, err := time.Parse("2006-01-02", ctx.EntryAt)
 		if err == nil {
-			days := int(time.Since(entryDate).Hours() / 24)
+			// 用回测上下文时间（ctx.Now）而非 time.Since（真实时间），历史回测时不会立即超期
+			now := ctx.Now
+			if now.IsZero() {
+				now = time.Now()
+			}
+			days := int(now.Sub(entryDate).Hours() / 24)
 			overflow := cfg.AdjustDaysOverflow
 			if overflow <= 0 {
 				overflow = 10

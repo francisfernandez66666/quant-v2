@@ -53,20 +53,20 @@ const DepthLevels = 10
 type BigOrderKind string
 
 const (
-	BigOrderSupport   BigOrderKind = "support"   // 托单：买盘大额挂单，意图托住股价
+	BigOrderSupport    BigOrderKind = "support"    // 托单：买盘大额挂单，意图托住股价
 	BigOrderResistance BigOrderKind = "resistance" // 压单：卖盘大额挂单，意图压制股价
 )
 
 // BigOrder 识别出的一档托/压大单。
 // BigOrder is a detected large order at one price level.
 type BigOrder struct {
-	Kind      BigOrderKind `json:"kind"`       // support=托单 / resistance=压单
-	Level     int          `json:"level"`      // 档位（1=买一/卖一）
-	Price     float64      `json:"price"`      // 委托价（元）
-	Volume    float64      `json:"volume"`     // 委托量（手）
-	SharePct  float64      `json:"share_pct"`  // 单档量占同侧五档总委托量比例（0~1）
-	Signal    string       `json:"signal"`     // 方向含义：买盘支撑 / 卖盘压制
-	Strength  string       `json:"strength"`   // 强度：strong / medium / weak
+	Kind     BigOrderKind `json:"kind"`      // support=托单 / resistance=压单
+	Level    int          `json:"level"`     // 档位（1=买一/卖一）
+	Price    float64      `json:"price"`     // 委托价（元）
+	Volume   float64      `json:"volume"`    // 委托量（手）
+	SharePct float64      `json:"share_pct"` // 单档量占同侧五档总委托量比例（0~1）
+	Signal   string       `json:"signal"`    // 方向含义：买盘支撑 / 卖盘压制
+	Strength string       `json:"strength"`  // 强度：strong / medium / weak
 }
 
 // BigOrderConfig 托/压大单识别阈值配置。
@@ -175,9 +175,11 @@ var tencentDepthRe = regexp.MustCompile(`v_(?:sh|sz|bj)(\d+)\s*=\s*"([^"]*)"`)
 
 // getTencentDepth 从腾讯 qt.gtimg.cn 解析五档盘口。
 // 字段布局（~ 分隔，实测）：[1]名称 [3]现价 [4]昨收
-//   [9]/[10] 买一价/量 [11]/[12] 买二 ... [17]/[18] 买五
-//   [19]/[20] 卖一价/量 [21]/[22] 卖二 ... [27]/[28] 卖五
-//   数量单位为手。
+//
+//	[9]/[10] 买一价/量 [11]/[12] 买二 ... [17]/[18] 买五
+//	[19]/[20] 卖一价/量 [21]/[22] 卖二 ... [27]/[28] 卖五
+//	数量单位为手。
+//
 // getTencentDepth parses the 5-level order book from Tencent qt.gtimg.cn.
 func (m *MarketAPI) getTencentDepth(code string) (*OrderBook, error) {
 	prefix := "sz"
@@ -263,31 +265,31 @@ func (m *MarketAPI) getEastMoneyDepth(code string) (*OrderBook, error) {
 	}
 	var raw struct {
 		Data struct {
-			F11  float64 `json:"f11"`  // 买五价
-			F12  float64 `json:"f12"`  // 买五量
-			F13  float64 `json:"f13"`  // 买四价
-			F14  float64 `json:"f14"`  // 买四量
-			F15  float64 `json:"f15"`  // 买三价
-			F16  float64 `json:"f16"`  // 买三量
-			F17  float64 `json:"f17"`  // 买二价
-			F18  float64 `json:"f18"`  // 买二量
-			F19  float64 `json:"f19"`  // 买一价
-			F20  float64 `json:"f20"`  // 买一量
-			F31  float64 `json:"f31"`  // 卖五价
-			F32  float64 `json:"f32"`  // 卖五量
-			F33  float64 `json:"f33"`  // 卖四价
-			F34  float64 `json:"f34"`  // 卖四量
-			F35  float64 `json:"f35"`  // 卖三价
-			F36  float64 `json:"f36"`  // 卖三量
-			F37  float64 `json:"f37"`  // 卖二价
-			F38  float64 `json:"f38"`  // 卖二量
-			F39  float64 `json:"f39"`  // 卖一价
-			F40  float64 `json:"f40"`  // 卖一量
-			F43  float64 `json:"f43"`  // 最新价
-			F57  string  `json:"f57"`  // 代码
-			F58  string  `json:"f58"`  // 名称
-			F60  float64 `json:"f60"`  // 昨收
-			F86  string  `json:"f86"`  // 时间戳 yyyyMMddHHmmss
+			F11 float64 `json:"f11"` // 买五价
+			F12 float64 `json:"f12"` // 买五量
+			F13 float64 `json:"f13"` // 买四价
+			F14 float64 `json:"f14"` // 买四量
+			F15 float64 `json:"f15"` // 买三价
+			F16 float64 `json:"f16"` // 买三量
+			F17 float64 `json:"f17"` // 买二价
+			F18 float64 `json:"f18"` // 买二量
+			F19 float64 `json:"f19"` // 买一价
+			F20 float64 `json:"f20"` // 买一量
+			F31 float64 `json:"f31"` // 卖五价
+			F32 float64 `json:"f32"` // 卖五量
+			F33 float64 `json:"f33"` // 卖四价
+			F34 float64 `json:"f34"` // 卖四量
+			F35 float64 `json:"f35"` // 卖三价
+			F36 float64 `json:"f36"` // 卖三量
+			F37 float64 `json:"f37"` // 卖二价
+			F38 float64 `json:"f38"` // 卖二量
+			F39 float64 `json:"f39"` // 卖一价
+			F40 float64 `json:"f40"` // 卖一量
+			F43 float64 `json:"f43"` // 最新价
+			F57 string  `json:"f57"` // 代码
+			F58 string  `json:"f58"` // 名称
+			F60 float64 `json:"f60"` // 昨收
+			F86 string  `json:"f86"` // 时间戳 yyyyMMddHHmmss
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -319,13 +321,13 @@ func (m *MarketAPI) getEastMoneyDepth(code string) (*OrderBook, error) {
 // OrderBookFactors 盘口派生因子，供战法打分与信号辅助判断。
 // OrderBookFactors are derived order-book factors for strategy scoring.
 type OrderBookFactors struct {
-	BidVol     float64 `json:"bid_vol"`     // 买盘前 N 档委托总量（手）
-	AskVol     float64 `json:"ask_vol"`     // 卖盘前 N 档委托总量（手）
+	BidVol      float64 `json:"bid_vol"`       // 买盘前 N 档委托总量（手）
+	AskVol      float64 `json:"ask_vol"`       // 卖盘前 N 档委托总量（手）
 	BidAskRatio float64 `json:"bid_ask_ratio"` // 委比 = (买量-卖量)/(买量+卖量)，-1~1，>0 买压强
-	SealBid    float64 `json:"seal_bid"`    // 买一封单量（手，涨停时代表封单）
-	SealAsk    float64 `json:"seal_ask"`    // 卖一封单量（手，跌停时代表封单）
-	SpreadPct  float64 `json:"spread_pct"`  // 买一卖一价差百分比（越小流动性越好）
-	NearPct    float64 `json:"near_pct"`    // 买五~卖五 报价覆盖范围占现价比例（%）
+	SealBid     float64 `json:"seal_bid"`      // 买一封单量（手，涨停时代表封单）
+	SealAsk     float64 `json:"seal_ask"`      // 卖一封单量（手，跌停时代表封单）
+	SpreadPct   float64 `json:"spread_pct"`    // 买一卖一价差百分比（越小流动性越好）
+	NearPct     float64 `json:"near_pct"`      // 买五~卖五 报价覆盖范围占现价比例（%）
 }
 
 // Factors 计算盘口派生因子。levels 为参与统计的档位数（免费源为 5）。

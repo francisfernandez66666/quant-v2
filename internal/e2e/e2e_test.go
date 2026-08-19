@@ -193,7 +193,7 @@ func TestEndToEndFullPipeline(t *testing.T) {
 			select {
 			case raw := <-sseCh:
 				var m map[string]string
-				if err := json.Unmarshal(raw, &m); err == nil {
+				if err := json.Unmarshal(raw.Data, &m); err == nil {
 					sseRaw = append(sseRaw, m)
 				}
 			default:

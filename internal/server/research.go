@@ -6,8 +6,29 @@ import (
 	"net/http"
 	"strconv"
 
+	"quant-trading-v2/internal/factor"
 	"quant-trading-v2/internal/research"
 )
+
+// handleResearchFactors 处理 GET /api/research/factors：返回全部已注册因子的元数据
+// （ID / 中文名 / 大类 / 一句话解释），供前端自动研究页把因子规则渲染成可读文案。
+// 由后端 `factor` 库直接提供，前端无需硬编码维护两份映射。
+// （handleResearchFactors serves GET /api/research/factors — metadata for every registered factor
+// (ID / Chinese name / category / one-line description), so the auto-research page can render factor
+// rules as readable text. Sourced directly from the factor registry; the frontend keeps no duplicate map.）
+func (s *Server) handleResearchFactors(w http.ResponseWriter, r *http.Request) {
+	defs := factor.All()
+	out := make([]map[string]any, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, map[string]any{
+			"id":   d.ID,
+			"name": d.Name,
+			"cat":  d.Cat.CategoryName(),
+			"desc": d.Desc,
+		})
+	}
+	writeJSON(w, 200, map[string]any{"factors": out})
+}
 
 // handleResearchProgress 处理 GET /api/research/progress：返回研究库数据加载与研究任务进度。
 // 统计：股票总数、行情覆盖天数/行数、财务覆盖、候选数、研究池可用股票数。
@@ -144,9 +165,9 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 			}
 			log.Printf("[research] 候选 #%d 审批并应用权重", id)
 		}
-		// E6：因子战法候选审批 → 写 applied_factors.json，实盘因子 runner 读取生效。
-		// English: E6 — approving a factor candidate writes applied_factors.json, consumed by the live
-		// factor runner to take effect.
+		// E6：因子战法候选审批 → 追加到战法库 applied_factors.json 并热重载引擎（多战法同时实盘）。
+		// English: E6 — approving a factor candidate appends it to the library applied_factors.json and
+		// hot-reloads the engine (multiple strategies run concurrently).
 		if c.Kind == "factor" {
 			if err := research.ApplyFactorRule(s.researchDir, c); err != nil {
 				writeError(w, 500, "应用因子规则失败: "+err.Error())
@@ -156,11 +177,11 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 				writeError(w, 500, err.Error())
 				return
 			}
+			s.reloadLibraries() // 立即注入 8a/8b，无需重启
 			log.Printf("[research] 候选 #%d 审批并应用因子规则", id)
 		}
-		// F3：形态战法候选审批 → 写 applied_patterns.json，实盘形态解释器读取生效。
-		// English: F3 — approving a pattern candidate writes applied_patterns.json, consumed by the live
-		// pattern interpreter to take effect.
+		// F3：形态战法候选审批 → 追加到战法库 applied_patterns.json 并热重载引擎（多形态同时实盘）。
+		// English: F3 — approving a pattern candidate appends it to the library and hot-reloads the engine.
 		if c.Kind == "pattern" {
 			if err := research.ApplyPatternRule(s.researchDir, c); err != nil {
 				writeError(w, 500, "应用形态规则失败: "+err.Error())
@@ -170,6 +191,7 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 				writeError(w, 500, err.Error())
 				return
 			}
+			s.reloadLibraries()
 			log.Printf("[research] 候选 #%d 审批并应用形态规则", id)
 		}
 	case "reject":

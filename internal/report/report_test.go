@@ -73,9 +73,9 @@ func TestStats(t *testing.T) {
 	r.LogSignal("l1", "3", "C", "long", "x", 10, 100, 100)
 	r.LogSignal("h1", "4", "D", "long", "x", 10, 100, 100)
 
-	r.LogExit("w1", 12)  // +20%
-	r.LogExit("w2", 8)   // -20%
-	r.LogExit("h1", 20)  // +100%
+	r.LogExit("w1", 12) // +20%
+	r.LogExit("w2", 8)  // -20%
+	r.LogExit("h1", 20) // +100%
 
 	total, holding, win, winRate, avgWin, avgLoss := r.Stats()
 	if total != 4 || holding != 1 {
@@ -192,6 +192,7 @@ func TestLotsPersistenceRoundTrip(t *testing.T) {
 		t.Errorf("重载后明细/加权成本异常: lots=%d cost=%.4f qty=%.0f", len(l.Lots), l.EntryPrice, l.Quantity)
 	}
 }
+
 // TestSellLotPartialFIFO 减仓部分卖出：FIFO 扣减批次、重算平均成本与剩余数量。
 func TestSellLotPartialFIFO(t *testing.T) {
 	r := New("")
@@ -301,5 +302,83 @@ func TestRealizedPnlSetCostBasis(t *testing.T) {
 	r.SetCostBasis("c", 18.0)
 	if got := r.RealizedPnlFor("c"); math.Abs(got-1000) > 0.01 {
 		t.Errorf("改成本不应改变已实现, got %.2f", got)
+	}
+}
+
+// TestStatsExcludesDeletedAndDraw 覆盖胜率口径修正（A2）：
+// 已删除记录不计入 total；盈亏为 0 的记录按"平手"处理，不计入赢/亏分母。
+func TestStatsExcludesDeletedAndDraw(t *testing.T) {
+	r := New("")
+	r.LogSignal("w1", "1", "A", "long", "x", 10, 100, 100)
+	r.LogSignal("w2", "2", "B", "long", "x", 10, 100, 100)
+	r.LogSignal("l1", "3", "C", "long", "x", 10, 100, 100)
+	r.LogSignal("d1", "4", "D", "long", "x", 10, 100, 100)
+	r.LogSignal("z1", "5", "E", "long", "x", 10, 100, 100)
+
+	r.LogExit("w1", 12) // +20%
+	r.LogExit("l1", 8)  // -20%
+	r.LogExit("z1", 10) // 0% 平手
+	r.Delete("d1")      // 软删除
+
+	total, holding, win, winRate, _, _ := r.Stats()
+	// total 应排除已删除 d1：5 条 - 1 已删除 = 4
+	if total != 4 {
+		t.Errorf("total 应=4（排除已删除 d1）, got %d", total)
+	}
+	// 平手 z1 不算亏损，胜率分母 = 1胜+1负 = 2 → 50%
+	if win != 1 {
+		t.Errorf("win 应=1, got %d", win)
+	}
+	if diff := winRate - 50.0; diff > 0.01 || diff < -0.01 {
+		t.Errorf("winRate 应=50%%（平手不进分母）, got %.1f%%", winRate)
+	}
+	if holding != 1 {
+		t.Errorf("holding 应=1（w2 未平仓）, got %d", holding)
+	}
+}
+
+// TestStatsByStrategy 覆盖按战法分组统计（A1）：各战法独立统计胜率/平均盈/平均亏/盈亏比。
+func TestStatsByStrategy(t *testing.T) {
+	r := New("")
+	// Dragon：2 胜 1 负
+	r.LogSignal("dw1", "1", "A", "做多", "Dragon", 10, 10, 8)
+	r.LogSignal("dw2", "2", "B", "做多", "Dragon", 10, 10, 8)
+	r.LogSignal("dl1", "3", "C", "做多", "Dragon", 10, 10, 8)
+	// DoubleBump：1 胜 1 平手 1 持仓
+	r.LogSignal("bw1", "4", "D", "做多", "DoubleBump", 10, 10, 8)
+	r.LogSignal("bz1", "5", "E", "做多", "DoubleBump", 10, 10, 8)
+	r.LogSignal("bh1", "6", "F", "做多", "DoubleBump", 10, 10, 8)
+
+	r.LogExit("dw1", 12) // +20%
+	r.LogExit("dw2", 14) // +40%
+	r.LogExit("dl1", 8)  // -20%
+	r.LogExit("bw1", 12) // +20%
+	r.LogExit("bz1", 10) // 0% 平手
+
+	by := r.StatsByStrategy("")
+	if len(by) != 2 {
+		t.Fatalf("应按 2 个战法分组, got %d", len(by))
+	}
+
+	dr := by["Dragon"]
+	if dr.Total != 3 || dr.Win != 2 || dr.Loss != 1 {
+		t.Errorf("Dragon 应 total=3 win=2 loss=1, got %+v", dr)
+	}
+	if diff := dr.WinRate - 66.6667; diff > 0.01 || diff < -0.01 {
+		t.Errorf("Dragon 胜率应≈66.7%%, got %.1f%%", dr.WinRate)
+	}
+	if diff := dr.AvgWinPct - 30.0; diff > 0.01 || diff < -0.01 {
+		t.Errorf("Dragon avgWin 应=(20+40)/2=30, got %.1f", dr.AvgWinPct)
+	}
+	if diff := dr.ProfitFactor - 3.0; diff > 0.01 || diff < -0.01 {
+		t.Errorf("Dragon 盈亏比应=60/20=3, got %.2f", dr.ProfitFactor)
+	}
+
+	bb := by["DoubleBump"]
+	if bb.Total != 3 || bb.Win != 1 || bb.Draw != 1 || bb.Holding != 1 {
+		t.Errorf("DoubleBump 应 total=3 win=1 draw=1 holding=1, got %+v", bb)
+	}
+	if bb.Loss != 0 {
+		t.Errorf("DoubleBump 平手不应算亏损, got loss=%d", bb.Loss)
 	}
 }

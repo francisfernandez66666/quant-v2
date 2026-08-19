@@ -1,4 +1,5 @@
 // 研究引擎纯函数测试（无 DB）：SUE、IC/IR、分层。
+// English: Pure-function tests of the research engine (no DB): SUE, IC/IR, layering.
 package research
 
 import (
@@ -20,6 +21,7 @@ func TestSpearmanIC(t *testing.T) {
 		t.Fatalf("NaN 跳过期望 1，得 %v", ic)
 	}
 	// 并列处理：{1,1,2} vs {1,2,3} → 秩 {1.5,1.5,3} 与 {1,2,3} 的皮尔逊相关 = 0.866
+	// English: tie handling: {1,1,2} vs {1,2,3} → Pearson correlation of ranks {1.5,1.5,3} and {1,2,3} = 0.866
 	if ic := SpearmanIC([]float64{1, 1, 2}, []float64{1, 2, 3}); math.Abs(ic-0.8660254) > 1e-6 {
 		t.Fatalf("并列平均秩期望 0.866，得 %v", ic)
 	}
@@ -32,6 +34,7 @@ func TestSpearmanIC(t *testing.T) {
 }
 
 // mkPanel 构造测试面板：fvals 为因子值，closes 为收盘（末位用于算前瞻收益）。
+// English: mkPanel builds a test panel: fvals are factor values, closes are closes (the last is used to compute forward returns).
 func mkPanel(dates []string, fvals, closes []float64) *Panel {
 	idx := make(map[string]int, len(dates))
 	for i, d := range dates {
@@ -46,6 +49,7 @@ func mkPanel(dates []string, fvals, closes []float64) *Panel {
 
 func TestICByDate(t *testing.T) {
 	// 3 只股票在 20230103 形成完全同序截面 → IC=1；其中一只后续日期越界不影响
+	// English: 3 stocks form a fully ordered cross-section on 20230103 → IC=1; one stock's later dates going out of range has no effect
 	p1 := mkPanel([]string{"20230103", "20230104", "20230105", "20230106"},
 		[]float64{1, 2, 3, 4}, []float64{100, 100, 105, 100})
 	p2 := mkPanel([]string{"20230103", "20230104"},

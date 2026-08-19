@@ -41,7 +41,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|list|approve")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|backtest|list|approve")
 	}
 	cmd := args[0]
 
@@ -64,6 +64,8 @@ func main() {
 		cmdDiscoverPatterns(db, args[1:])
 	case "sector-rebuild":
 		cmdSectorRebuild(db, *start, *end)
+	case "backtest":
+		cmdBacktestCandidate(db, args[1:])
 	case "list":
 		cmdList(db, args[1:])
 	case "approve":

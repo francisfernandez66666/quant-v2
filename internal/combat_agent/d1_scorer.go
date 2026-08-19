@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -442,11 +443,64 @@ func cleanJSON(s string) string {
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
-	if start := strings.IndexByte(s, '['); start >= 0 {
-		if end := strings.LastIndexByte(s, ']'); end > start {
+	// 提取 JSON 主体：LLM 可能输出单个对象（HotTopic）或数组（D1 评分等）。
+	// 按首字符区分：'{' 提取首个 { 到末尾 } 之间；'[' 提取首个 [ 到末尾 ] 之间。
+	// English: extract the JSON body — LLM may emit a single object (HotTopic) or an array
+	// (D1 scoring etc.). Use the first non-space char to choose delimiters: '{' → first { to last };
+	// '[' → first [ to last ].
+	if start := strings.IndexAny(s, "{["); start >= 0 {
+		open := s[start]
+		close := byte('}')
+		if open == '[' {
+			close = ']'
+		}
+		if end := strings.LastIndexByte(s, close); end > start {
 			s = s[start : end+1]
 		}
 	}
 	s = strings.TrimRight(s, ".,; ")
-	return s
+	// 清理非法 '+' 前缀数值：部分小模型输出 "score": +0.75（裸 + 号），JSON 数字不允许。
+	s = d1PlusNumberRe.ReplaceAllString(s, "$1 ")
+	// 转义字符串值中的换行符（JSON 不允许字符串内未转义的 \n）
+	// 并清理非法转义：9B 推理模型常在字符串里输出 \( \) 等非法 JSON 转义。
+	var buf strings.Builder
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\\' && i+1 < len(s) {
+			next := s[i+1]
+			if !isValidJSONEscape(next) {
+				buf.WriteByte(next)
+				i++
+				continue
+			}
+			buf.WriteByte(ch)
+			buf.WriteByte(next)
+			i++
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			buf.WriteByte(ch)
+			continue
+		}
+		if inStr && (ch == '\n' || ch == '\r') {
+			buf.WriteString("\\n")
+		} else {
+			buf.WriteByte(ch)
+		}
+	}
+	return buf.String()
+}
+
+// d1PlusNumberRe 匹配冒号/逗号/左括号后的 '+' 前缀（数值位置），用于剥离非法 '+'。
+var d1PlusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
+
+// isValidJSONEscape 判断字节是否为合法 JSON 转义字符。
+func isValidJSONEscape(b byte) bool {
+	switch b {
+	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+		return true
+	}
+	return false
 }

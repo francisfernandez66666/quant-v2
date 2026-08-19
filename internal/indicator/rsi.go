@@ -1,4 +1,5 @@
 // RSI 相对强弱指标（Wilder 平滑）。常用 n=14。
+// English: RSI is the Relative Strength Index with Wilder smoothing; n=14 is common.
 package indicator
 
 // RSI 计算 RSI 序列。第 n 根起有值：首值用前 n 段涨跌的简单平均，之后按 Wilder 递推
@@ -40,6 +41,7 @@ func RSI(closes []float64, n int) []float64 {
 }
 
 // rsiValue 由平均涨幅/跌幅计算 RSI。
+// English: rsiValue computes RSI from the average gain/loss.
 func rsiValue(avgGain, avgLoss float64) float64 {
 	if avgLoss == 0 {
 		return 100

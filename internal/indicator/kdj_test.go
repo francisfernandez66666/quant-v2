@@ -6,6 +6,7 @@ import (
 )
 
 // TestKDJGolden 校验 KDJ(9,3,3) 的 RSV/K/D/J 与 golden 数据。
+// English: TestKDJGolden verifies KDJ(9,3,3)'s RSV/K/D/J against golden data.
 func TestKDJGolden(t *testing.T) {
 	g := loadGolden(t)
 	got := KDJDefault(g["close"], g["high"], g["low"])
@@ -32,6 +33,7 @@ func TestKDJGolden(t *testing.T) {
 }
 
 // TestKDJJRelation 校验 J=3K−2D 恒等式。
+// English: TestKDJJRelation verifies the identity J=3K-2D.
 func TestKDJJRelation(t *testing.T) {
 	g := loadGolden(t)
 	got := KDJDefault(g["close"], g["high"], g["low"])
@@ -43,6 +45,7 @@ func TestKDJJRelation(t *testing.T) {
 }
 
 // TestKDJFlatRange 区间为 0 时 RSV=50（中性）。
+// English: TestKDJFlatRange: when the range is 0, RSV=50 (neutral).
 func TestKDJFlatRange(t *testing.T) {
 	closes := []float64{10, 10, 10, 10, 10, 10, 10, 10, 10, 10}
 	got := KDJDefault(closes, closes, closes)
@@ -50,6 +53,7 @@ func TestKDJFlatRange(t *testing.T) {
 		t.Fatalf("区间为 0 RSV 应 50，得 %v", got[0].RSV)
 	}
 	// 全部 10 → RSV 恒 50 → K 从 50 平滑收敛到 50（浮点误差容忍）
+	// English: All values 10 -> RSV stays 50 -> K smoothly converges from 50 back to 50 (tolerating floating-point error).
 	if math.Abs(got[9].K-50) > 1e-9 {
 		t.Fatalf("恒定序列 K 应 50，得 %v", got[9].K)
 	}

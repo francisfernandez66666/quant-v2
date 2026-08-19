@@ -6,6 +6,7 @@ import (
 )
 
 // TestBOLLGolden 校验 BOLL(20,2) 的 中/上/下轨 与 golden 数据。
+// English: TestBOLLGolden verifies BOLL(20,2)'s middle/upper/lower bands against golden data.
 func TestBOLLGolden(t *testing.T) {
 	g := loadGolden(t)
 	got := BOLLDefault(g["close"])
@@ -30,6 +31,7 @@ func TestBOLLGolden(t *testing.T) {
 }
 
 // TestBOLLSymmetry 上下轨以中轨对称（Up+Low=2×Mid）。
+// English: TestBOLLSymmetry checks that upper and lower bands are symmetric around the middle band (Up+Low=2xMid).
 func TestBOLLSymmetry(t *testing.T) {
 	g := loadGolden(t)
 	got := BOLLDefault(g["close"])
@@ -44,6 +46,7 @@ func TestBOLLSymmetry(t *testing.T) {
 }
 
 // TestBOLLConstant 恒定序列标准差为 0，三轨相等。
+// English: TestBOLLConstant: a constant series has standard deviation 0 and all three bands are equal.
 func TestBOLLConstant(t *testing.T) {
 	closes := make([]float64, 30)
 	for i := range closes {

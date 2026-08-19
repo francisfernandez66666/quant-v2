@@ -1,6 +1,7 @@
 // 本文件：板块事件相关单元测试——板块验真回填（verifySectorAttribution，剔除 LLM 幻觉板块名）
 // 与板块→个股事件级传播（propagateSectorToStocks，注入成分股到监测池）。
 // 依赖真实 THS 板块名单（GetBoardList），断言采用"真实板块名 + 构造假板块名"的确定性方式。
+// English: This file: unit tests for sector events — sector verification backfill (verifySectorAttribution, removes hallucinated sector names from the LLM) and sector→stock event-level propagation (propagateSectorToStocks, injects constituents into the monitoring pool). Depends on the real THS sector list (GetBoardList); assertions use the deterministic approach of "real sector name + fabricated fake sector name".
 package engine
 
 import (
@@ -13,6 +14,7 @@ import (
 
 // TestVerifySectorAttribution 验证板块验真回填：剔除 LLM 幻觉板块名。
 // 覆盖三种场景：真实+幻觉混合（幻觉剔除）、非板块事件（不受影响）、低分板块事件（不处理）。
+// English: TestVerifySectorAttribution verifies sector verification backfill: removes hallucinated sector names from the LLM. Covers three scenarios: real+hallucinated mix (hallucination removed), non-sector events (unaffected), and low-score sector events (not processed).
 func TestVerifySectorAttribution(t *testing.T) {
 	api := data.NewMarketAPI()
 	ths := data.NewTHSClient()
@@ -32,6 +34,7 @@ func TestVerifySectorAttribution(t *testing.T) {
 	e := &Engine{scanner: sc}
 
 	// 板块级事件：真实+幻觉板块混合，幻觉应被剔除
+	// English: Sector-level event: a mix of real and hallucinated sectors; the hallucination should be removed.
 	events := []newsagent.NewsEvent{
 		{Level: "板块", Score: 0.75, Sectors: []string{realName, fakeName}},
 	}
@@ -42,6 +45,7 @@ func TestVerifySectorAttribution(t *testing.T) {
 	}
 
 	// 非板块事件不受影响
+	// English: Non-sector events are unaffected.
 	ev2 := []newsagent.NewsEvent{{Level: "个股", Score: 0.75, Sectors: []string{fakeName}}}
 	e.verifySectorAttribution(ev2)
 	if len(ev2[0].Sectors) != 1 {
@@ -49,6 +53,7 @@ func TestVerifySectorAttribution(t *testing.T) {
 	}
 
 	// 低分板块事件不处理
+	// English: Low-score sector events are not processed.
 	ev3 := []newsagent.NewsEvent{{Level: "板块", Score: 0.25, Sectors: []string{fakeName}}}
 	e.verifySectorAttribution(ev3)
 	if len(ev3[0].Sectors) != 1 {
@@ -58,6 +63,7 @@ func TestVerifySectorAttribution(t *testing.T) {
 
 // TestPropagateSectorToStocks 验证板块→个股事件级传播。
 // push2 可用时断言成分股注入与格式；push2 拒连（网络问题）时断言优雅跳过不报错。
+// English: TestPropagateSectorToStocks verifies sector→stock event-level propagation. When push2 is available, asserts constituent injection and format; when push2 refuses to connect (network issue), asserts graceful skipping without errors.
 func TestPropagateSectorToStocks(t *testing.T) {
 	api := data.NewMarketAPI()
 	ths := data.NewTHSClient()
@@ -91,6 +97,7 @@ func TestPropagateSectorToStocks(t *testing.T) {
 	}
 
 	// 低分事件不应传播
+	// English: Low-score events should not propagate.
 	ev2 := []newsagent.NewsEvent{{Level: "板块", Score: 0.25, Sectors: []string{realName}}}
 	e.propagateSectorToStocks(ev2)
 	if len(ev2[0].RelatedStocks) != 0 {

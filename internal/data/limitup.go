@@ -1,6 +1,10 @@
 // 东方财富涨停池与龙虎榜数据源（push2ex / datacenter-web）。
 // 涨停池字段：lbc连板 / fund封单 / zbc炸板次数 / fbt首次封板时间 / hybk行业 / hs换手 / ltsz流通市值。
 // 龙虎榜字段：BILLBOARD_NET_AMT净买入 / BUY_SEAT卖出席位数 / EXPLAIN席位说明。
+// English: EastMoney limit-up pool and dragon-tiger-list data sources (push2ex / datacenter-web).
+// Pool fields: lbc consecutive limit-ups / fund seal amount / zbc break count / fbt first-seal time /
+// hybk industry / hs turnover / ltsz float market cap.
+// LHB fields: BILLBOARD_NET_AMT net buy / BUY_SEAT buy-seat count / EXPLAIN seat explanation.
 package data
 
 import (
@@ -12,6 +16,7 @@ import (
 )
 
 // LimitUpStock 涨停池中的单只股票。
+// English: LimitUpStock is a single stock in the limit-up pool.
 type LimitUpStock struct {
 	Code       string  `json:"code"`        // 股票代码
 	Name       string  `json:"name"`        // 股票名称
@@ -31,6 +36,7 @@ type LimitUpStock struct {
 }
 
 // LHBItem 龙虎榜单条记录。
+// English: LHBItem is a single dragon-tiger-list record.
 type LHBItem struct {
 	Code        string  `json:"code"`        // 股票代码
 	Name        string  `json:"name"`        // 股票名称

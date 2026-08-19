@@ -15,21 +15,21 @@ func newDR() *DragonReturnStrategy {
 // goodStock 构造一个满足龙性前置 + 良好回调的标的。
 func goodStock() *StockData {
 	return &StockData{
-		Code:            "x",
-		CurrentPrice:   12.0,
-		FirstRisePct:   0.5, // 首轮 +50%（35%~70% 区间）
-		PullbackPct:    0.18, // 回调 18%（15%~20% 最优 → 8分）
-		PullbackDays:   6,    // 6 天（5~8 → 5分）
-		VolumeRatio:    0.2,  // 缩量 20%（<30% → 8分）
-		MA5:            11.0,
-		MA10:           11.2,
-		MA20:           10.8,
-		MACDGreen:      -0.3, // 绿柱收窄
-		IsSectorTop2:   true, // 板块前 2
-		SectorRPS20:    80,   // ≥75
-		HighestPrice:   14.0,
-		PreviousHigh:   13.0,
-		HasRiseFirst:   true,
+		Code:         "x",
+		CurrentPrice: 12.0,
+		FirstRisePct: 0.5,  // 首轮 +50%（35%~70% 区间）
+		PullbackPct:  0.18, // 回调 18%（15%~20% 最优 → 8分）
+		PullbackDays: 6,    // 6 天（5~8 → 5分）
+		VolumeRatio:  0.2,  // 缩量 20%（<30% → 8分）
+		MA5:          11.0,
+		MA10:         11.2,
+		MA20:         10.8,
+		MACDGreen:    -0.3, // 绿柱收窄
+		IsSectorTop2: true, // 板块前 2
+		SectorRPS20:  80,   // ≥75
+		HighestPrice: 14.0,
+		PreviousHigh: 13.0,
+		HasRiseFirst: true,
 	}
 }
 

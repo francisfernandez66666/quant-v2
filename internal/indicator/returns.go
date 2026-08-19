@@ -1,15 +1,18 @@
 // 量能类指标与收益率/波动率序列（研究因子常用基础量）。
+// English: Volume indicators and return/volatility series (common building blocks for research factors).
 package indicator
 
 import "math"
 
 // VolMA 成交量简单移动平均（等价 SMA）。
+// English: VolMA is the volume simple moving average (equivalent to SMA).
 // （VolMA is the volume simple moving average.）
 func VolMA(volumes []float64, n int) []float64 {
 	return SMA(volumes, n)
 }
 
 // Returns 简单收益率序列：r[i]=closes[i]/closes[i−1]−1，首根为 NaN。
+// English: Returns computes the simple return series: r[i]=closes[i]/closes[i-1]-1; the first element is NaN.
 // （Returns computes simple returns; the first element is NaN.）
 func Returns(closes []float64) []float64 {
 	out := make([]float64, len(closes))
@@ -24,6 +27,7 @@ func Returns(closes []float64) []float64 {
 }
 
 // LogReturns 对数收益率序列：r[i]=ln(closes[i]/closes[i−1])，首根为 NaN。
+// English: LogReturns computes the log return series: r[i]=ln(closes[i]/closes[i-1]); the first element is NaN.
 // （LogReturns computes log returns; the first element is NaN.）
 func LogReturns(closes []float64) []float64 {
 	out := make([]float64, len(closes))
@@ -38,6 +42,7 @@ func LogReturns(closes []float64) []float64 {
 }
 
 // RollingStd 滚动总体标准差（窗口 n 的收益率波动率）；预热期为 NaN。
+// English: RollingStd computes the rolling population standard deviation (return volatility over a window of n); NaN during warm-up.
 // （RollingStd computes the rolling population standard deviation over n windows.）
 func RollingStd(xs []float64, n int) []float64 {
 	out := make([]float64, len(xs))

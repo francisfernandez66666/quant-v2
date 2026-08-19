@@ -6,6 +6,7 @@ import (
 )
 
 // TestParseTencentDayKLine 腾讯日K字段序 [date, open, close, high, low, volume]。
+// English: TestParseTencentDayKLine Tencent daily-K field order [date, open, close, high, low, volume].
 func TestParseTencentDayKLine(t *testing.T) {
 	body := `{"code":0,"msg":"","data":{"sh600206":{"qfqday":[
 		["2026-07-31","38.640","35.390","38.750","35.330","1087126.000"],
@@ -25,6 +26,7 @@ func TestParseTencentDayKLine(t *testing.T) {
 		t.Fatalf("应3根, got %d", len(klines))
 	}
 	// 字段序：open=idx1, close=idx2, high=idx3, low=idx4
+	// English: field order: open=idx1, close=idx2, high=idx3, low=idx4
 	if klines[0].Open != 38.640 || klines[0].Close != 35.390 {
 		t.Errorf("首根 open/close 错误: %.3f/%.3f", klines[0].Open, klines[0].Close)
 	}
@@ -35,9 +37,11 @@ func TestParseTencentDayKLine(t *testing.T) {
 		t.Errorf("末根 close 应43.79, got %.3f", klines[2].Close)
 	}
 	_ = body // body 仅示意，实际解析走行数组
+	// English: body is only illustrative; parsing actually goes through the row array
 }
 
 // TestParseTencentMinuteKLine 腾讯分钟K时间格式 yyyyMMddHHMM 与升序排序。
+// English: TestParseTencentMinuteKLine Tencent minute-K time format yyyyMMddHHMM and ascending sorting.
 func TestParseTencentMinuteKLine(t *testing.T) {
 	rows := [][]string{
 		{"202608071445", "48.17", "48.17", "48.17", "48.17", "1703.00", "{}", "2.01"},
@@ -60,11 +64,15 @@ func TestParseTencentMinuteKLine(t *testing.T) {
 }
 
 // TestParseTencentKLineInvalid 脏行/非法K线（high<low 等）应被剔除，全部无效返回错误。
+// English: TestParseTencentKLineInvalid dirty rows/invalid K-lines (e.g. high<low) should be dropped; returns an error if all are invalid.
 func TestParseTencentKLineInvalid(t *testing.T) {
 	rows := [][]string{
 		{"2026-08-06", "40.800", "43.790", "30.000", "40.500", "1030100.000"}, // high<low
-		{"bad-date", "40.800", "43.790", "43.790", "40.500", "1030100.000"},   // 日期非法
-		{"2026-08-07", "0", "0", "0", "0", "0"},                               // 数值为0
+		// English: high<low
+		{"bad-date", "40.800", "43.790", "43.790", "40.500", "1030100.000"}, // 日期非法
+		// English: invalid date
+		{"2026-08-07", "0", "0", "0", "0", "0"}, // 数值为0
+		// English: value is 0
 	}
 	klines, err := parseTencentKLine(rows, false)
 	if err == nil || len(klines) != 0 {
@@ -76,6 +84,7 @@ func TestParseTencentKLineInvalid(t *testing.T) {
 }
 
 // TestParseTHSLine 同花顺 JSONP K线（data 为 CSV 字符串数组，字段同东财顺序）。
+// English: TestParseTHSLine Tonghuashun JSONP K-line (data is a CSV string array, field order same as Eastmoney).
 func TestParseTHSLine(t *testing.T) {
 	body := []byte(`quotebridge_v6_line_hs_1.600206_01_last({
 		"data":[
@@ -100,6 +109,7 @@ func TestParseTHSLine(t *testing.T) {
 }
 
 // TestParseTHSLineInvalid 非法内容/空 data 应返回错误（保证降级链不会喂入脏数据）。
+// English: TestParseTHSLineInvalid invalid content/empty data should return an error (so the fallback chain never feeds dirty data).
 func TestParseTHSLineInvalid(t *testing.T) {
 	if _, err := parseTHSLine([]byte(`quotebridge_xxx({})`), false); err == nil {
 		t.Fatal("空 data 应返回错误")

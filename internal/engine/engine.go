@@ -34,6 +34,8 @@ import (
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
+	factorstrat "quant-trading-v2/internal/strategies/factor"
+	patternstrat "quant-trading-v2/internal/strategies/pattern"
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -91,6 +93,7 @@ type Engine struct {
 	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
 	d1MaxRetries     int                             // D1 评分 LLM 轮询重试次数（<=0 用默认5）
 	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
+	factorMon        *factorMonitor                  // 因子战法效果监测（战法库触发信号前向收益结算）
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -155,6 +158,76 @@ func (e *Engine) SetD1MaxRetries(n int) {
 	e.mu.Lock()
 	e.d1MaxRetries = n
 	e.mu.Unlock()
+}
+
+// ReloadFactorRules 从战法库 applied_factors.json 重载全部启用规则并注入因子 runner（热生效）。
+// 战法库启用/禁用/删除/审批后由 server 调用，无需重启。
+// English: reloads all enabled rules from the strategy library and injects them into the factor
+// runner (hot-applied). Called by the server after library mutations; no restart needed.
+func (e *Engine) ReloadFactorRules(dataDir string) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.ReloadFactorRules(dataDir)
+	}
+}
+
+// FactorStats 返回因子 runner 的各规则运行统计（效果监测）。
+// English: returns per-rule run stats of the factor runner (effectiveness monitoring).
+func (e *Engine) FactorStats() []factorstrat.ActiveRule {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		return ca.FactorStats()
+	}
+	return nil
+}
+
+// RecordFactorForwardReturn 记录某条因子规则一条触发股的 Horizon 日前向收益（效果监测）。
+// English: records a rule's Horizon-day forward return for one triggered stock (effectiveness monitoring).
+func (e *Engine) RecordFactorForwardReturn(ruleID string, ret float64) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.RecordFactorForwardReturn(ruleID, ret)
+	}
+}
+
+// ReloadPatternRules 从形态战法库 applied_patterns.json 重载全部启用规则并注入形态 runner（热生效）。
+// English: reloads all enabled rules from the pattern library and injects them (hot-applied).
+func (e *Engine) ReloadPatternRules(dataDir string) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.ReloadPatternRules(dataDir)
+	}
+}
+
+// PatternStats 返回形态 runner 的各规则运行统计（效果监测）。
+// English: returns per-rule run stats of the pattern runner (effectiveness monitoring).
+func (e *Engine) PatternStats() []patternstrat.ActivePattern {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		return ca.PatternStats()
+	}
+	return nil
+}
+
+// RecordPatternForwardReturn 记录某条形态规则一条触发股的 Horizon 日前向收益（效果监测）。
+// English: records a pattern rule's Horizon-day forward return for one triggered stock (monitoring).
+func (e *Engine) RecordPatternForwardReturn(ruleID string, ret float64) {
+	e.mu.RLock()
+	ca := e.combatAgent
+	e.mu.RUnlock()
+	if ca != nil {
+		ca.RecordPatternForwardReturn(ruleID, ret)
+	}
 }
 
 // stageRecordFile Stage 记录磁盘持久化结构（按交易日分桶）。
@@ -247,6 +320,7 @@ func New(
 		prevPass:         make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
 		d1RetryQueue:     make(map[string]bool),
+		factorMon:        newFactorMonitor(dataDir, 5),
 	}
 	e.syncMessages(nil, nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
@@ -1432,7 +1506,39 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 	// English: strong P1 push — brand-new close-out / stop-loss alerts get a desktop + Webhook
 	// notification on first appearance; deduped by the message-center key so repeats stay quiet.
 	e.pushCriticalAlerts(items)
+	e.pushSSEMessages(items)
 	e.msgStore.Sync(items)
+}
+
+// pushSSEMessages 把本轮新增的关键消息经 SSE 定向推送给本账号前端（账号隔离）。
+// 仅推送止盈/止损/清仓/交易信号等关键级别，且只在消息中心首次出现时推送（按去重键判新），
+// 避免 5s 循环对同一消息反复推送。前端收到 message 事件后弹系统通知并刷新消息中心。
+func (e *Engine) pushSSEMessages(items []data.MessageItem) {
+	if e.sse == nil {
+		return
+	}
+	existing := make(map[string]bool)
+	for _, m := range e.msgStore.List() {
+		existing[m.ID] = true
+	}
+	for _, it := range items {
+		// 关键级别才推送：止盈/止损/清仓/交易信号
+		critical := it.Level == "止盈" || it.Level == "止损" || it.Level == "清仓" || it.Level == "交易信号"
+		if !critical {
+			continue
+		}
+		key := it.ID
+		if key == "" {
+			key = it.Code + "@" + it.Level
+		}
+		if existing[key] {
+			continue
+		}
+		e.sse.BroadcastTo(e.userID, map[string]interface{}{
+			"type": "message",
+			"item": it,
+		})
+	}
 }
 
 // pushCriticalAlerts 对本次待同步消息中新增的关键告警（清仓/止损）推送桌面+Webhook 强提醒。
@@ -1463,11 +1569,14 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 			continue
 		}
 		title := fmt.Sprintf("%s %s(%s)", it.Level, it.Name, it.Code)
-		nt.Push(notify.Message{
+		msg := notify.Message{
 			Level:   notify.LevelHigh,
 			Title:   title,
 			Content: it.Body,
-		})
+		}
+		nt.Push(msg)
+		// 同步转发到外部推送网关（若已配置），让关键提醒触达 APK 后台/离线场景
+		nt.PushGateway(msg)
 	}
 }
 

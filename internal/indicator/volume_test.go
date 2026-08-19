@@ -8,6 +8,7 @@ import (
 )
 
 // TestVolMAGolden 校验成交量 MA5 与 golden 数据。
+// English: TestVolMAGolden verifies volume MA5 against golden data.
 func TestVolMAGolden(t *testing.T) {
 	g := loadGolden(t)
 	got := VolMA(g["volume"], 5)
@@ -15,6 +16,7 @@ func TestVolMAGolden(t *testing.T) {
 }
 
 // TestBarAdapters 校验 store.Bar → 序列 的提取函数。
+// English: TestBarAdapters verifies the extraction functions from store.Bar to series.
 func TestBarAdapters(t *testing.T) {
 	bars := []store.Bar{
 		{Date: "20200102", Open: 1, High: 2, Low: 0.5, Close: 1.5, Vol: 100, Amount: 1000},
@@ -35,6 +37,7 @@ func TestBarAdapters(t *testing.T) {
 }
 
 // TestReturns 校验简单/对数收益率与滚动波动率。
+// English: TestReturns verifies simple/log returns and rolling volatility.
 func TestReturns(t *testing.T) {
 	closes := []float64{10, 11, 9.9}
 	r := Returns(closes)
@@ -46,6 +49,7 @@ func TestReturns(t *testing.T) {
 		t.Fatalf("LogReturns 不符: %v", lr)
 	}
 	// 滚动波动率：恒定序列标准差为 0
+	// English: Rolling volatility: standard deviation of a constant series is 0
 	const5 := make([]float64, 10)
 	for i := range const5 {
 		const5[i] = 1
@@ -58,6 +62,7 @@ func TestReturns(t *testing.T) {
 		t.Fatalf("预热期应 NaN: %v", rs[3])
 	}
 	// 手算：{1,2,3} 的总体标准差 = sqrt((1+0+1)/3)=sqrt(2/3)
+	// English: By hand: population std dev of {1,2,3} = sqrt((1+0+1)/3)=sqrt(2/3)
 	rs2 := RollingStd([]float64{1, 2, 3, 4, 5, 6}, 3)
 	want := math.Sqrt(2.0 / 3.0)
 	if math.Abs(rs2[2]-want) > 1e-12 {

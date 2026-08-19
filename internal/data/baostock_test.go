@@ -1,5 +1,6 @@
 // baostock sidecar 客户端的测试（httptest 模拟 sidecar，不依赖真实 baostock）。
 // （Tests for the baostock sidecar client using an httptest mock sidecar.）
+// English: Tests for the baostock sidecar client using an httptest mock sidecar (no real baostock dependency).
 package data
 
 import (
@@ -10,6 +11,7 @@ import (
 
 // bsMock 最小 sidecar mock：按路由返回 CSV 或 "error: ..."。
 // （bsMock is a minimal sidecar stub serving CSV or error per route.）
+// English: bsMock is a minimal sidecar stub serving CSV or error per route.
 func bsMock(t *testing.T) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -99,6 +101,7 @@ func TestBaostockKlineEmptyCells(t *testing.T) {
 		t.Fatalf("期望 2 行，得到 %d", len(rows))
 	}
 	// 第二行为停牌模拟：open/volume/turn 空 → nil
+	// English: second row simulates a suspension: open/volume/turn empty → nil
 	if rows[1].F("open") != 0 {
 		t.Errorf("空 open 应为 0: %v", rows[1].F("open"))
 	}
@@ -156,6 +159,7 @@ func TestBaostockCodeConversion(t *testing.T) {
 		}
 	}
 	// 反向：仅对带后缀的代码做往返校验（无后缀输入本就会补全交易所后缀）
+	// English: reverse: round-trip check only for codes with a suffix (suffixless input already gets the exchange suffix filled in)
 	round := map[string]string{
 		"600000.SH": "sh.600000",
 		"000001.SZ": "sz.000001",
@@ -167,6 +171,7 @@ func TestBaostockCodeConversion(t *testing.T) {
 		}
 	}
 	// 裸代码容错（akshare fallback 输出）：按首位猜交易所补全。
+	// English: bare-code tolerance (akshare fallback output): infer the exchange from the first digit and fill it in.
 	bare := map[string]string{
 		"600000": "600000.SH",
 		"000001": "000001.SZ",

@@ -56,6 +56,12 @@ type Signal struct {
 	Timestamp  int64              `json:"timestamp"`      // 生成时间戳（Generation timestamp）
 	Meta       map[string]float64 `json:"meta,omitempty"` // 分数明细（Score breakdown）
 	Reasons    map[string]string  `json:"-"`              // 各维度理由（不入JSON）（Per-dimension reasons, excluded from JSON）
+	// StrategyName 可选：覆盖默认的战法名（string(runner.Type)）。
+	// 用于同一战法类型下有多个独立规则时区分信号（如多因子战法各规则），使消息中心去重键互不冲突。
+	// English: optional override for the default strategy name (string(runner.Type)). Used when a single
+	// strategy type hosts several independent rules (e.g. multiple factor strategies), so each signal's
+	// message-center dedup key stays distinct.
+	StrategyName string `json:"strategy_name,omitempty"`
 }
 
 // SignalResult 批量信号结果。（SignalResult is a batch signal result.）

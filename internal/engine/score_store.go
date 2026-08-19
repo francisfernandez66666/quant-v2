@@ -1,5 +1,8 @@
 // Package engine 8a/8b 打分持久化：scores.json 存当日最新分（无信号也持续写盘）。
 // 启动时 Load 回填聚合器，重启后前端立即可见上次打分结果。
+// English: Package engine 8a/8b score persistence: scores.json stores the latest score of the day
+// (written continuously even without signals). On startup Load backfills the aggregator, so the
+// frontend immediately sees the last scoring result after a restart.
 package engine
 
 import (
@@ -11,21 +14,32 @@ import (
 )
 
 // scoreStoreFile scores.json 磁盘结构（按交易日分桶）。
+// English: scoreStoreFile is the on-disk structure of scores.json (bucketed by trading day).
 type scoreStoreFile struct {
-	TradingDay string                              `json:"trading_day"` // 交易日（YYYY-MM-DD）
-	Scores     map[string]combat_agent.StockScores `json:"scores"`      // 当日各股最新打分（code → 打分明细）
+	TradingDay string `json:"trading_day"` // 交易日（YYYY-MM-DD）
+	// English: trading day (YYYY-MM-DD).
+	Scores map[string]combat_agent.StockScores `json:"scores"` // 当日各股最新打分（code → 打分明细）
+	// English: latest score per stock for the day (code -> score detail).
 }
 
 // scoreStore 打分持久化存储，Save 覆盖写当日最新分，Load 返回最近一次结果。
+// English: scoreStore is the score persistence store; Save overwrites the day's latest score,
+// and Load returns the most recent result.
 type scoreStore struct {
-	path   string                              // scores.json 磁盘路径（空表示不持久化）
-	mu     sync.RWMutex                        // 保护 day/scores 的读写
-	day    string                              // 当前交易日（YYYY-MM-DD）
+	path string // scores.json 磁盘路径（空表示不持久化）
+	// English: on-disk path of scores.json (empty = not persisted).
+	mu sync.RWMutex // 保护 day/scores 的读写
+	// English: guards reads/writes of day/scores.
+	day string // 当前交易日（YYYY-MM-DD）
+	// English: current trading day (YYYY-MM-DD).
 	scores map[string]combat_agent.StockScores // 当日各股最新打分（code → 打分明细）
+	// English: latest score per stock for the day (code -> score detail).
 }
 
 // newScoreStore 创建打分存储并加载已有文件（不存在时忽略）。
 // path 为空表示纯内存模式（不落盘），常用于测试或未配置 dataDir 的场景。
+// English: newScoreStore creates the score store and loads the existing file (ignored when absent).
+// An empty path means in-memory-only mode (not persisted), often used in tests or when dataDir is unset.
 func newScoreStore(path string) *scoreStore {
 	s := &scoreStore{path: path, scores: make(map[string]combat_agent.StockScores)}
 	if path != "" {
@@ -36,6 +50,9 @@ func newScoreStore(path string) *scoreStore {
 
 // Save 持久化当日最新分（调用方已持有最新 map，直接覆盖写盘）。
 // 内存与磁盘同时更新：先更新内存供 Load 快速返回，再整文件覆盖写盘保证重启可恢复。
+// English: Save persists the day's latest score (the caller already holds the latest map, so it
+// overwrites the file directly). Both memory and disk are updated: memory first so Load returns
+// quickly, then the whole file is overwritten to be recoverable after a restart.
 func (s *scoreStore) Save(day string, scores map[string]combat_agent.StockScores) {
 	if s == nil || s.path == "" {
 		return
@@ -58,6 +75,7 @@ func (s *scoreStore) Save(day string, scores map[string]combat_agent.StockScores
 }
 
 // Load 读取磁盘打分记录（跨交易日保留最近一次，前端由新轮次覆盖）。
+// English: Load reads the score record (keeps the most recent across trading days; overwritten by the frontend in new rounds).
 func (s *scoreStore) Load() map[string]combat_agent.StockScores {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -69,6 +87,7 @@ func (s *scoreStore) Load() map[string]combat_agent.StockScores {
 }
 
 // load 从磁盘加载 scores.json。文件不存在或损坏时静默保留空 map（不 panic）。
+// English: load reads scores.json from disk. When the file is missing or corrupt, it silently keeps an empty map (no panic).
 func (s *scoreStore) load() {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {

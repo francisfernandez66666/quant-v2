@@ -1,5 +1,6 @@
 // P1 清仓/止损强提醒推送：新告警首次出现时推送，重复出现不重复推。
 // （Push tests for P1 close-out/stop-loss strong alerts: pushed once on first appearance, quiet on repeats.）
+// English: P1 strong-alert push for close-out/stop-loss: pushed when an alert first appears, not re-pushed on repeats.
 package engine
 
 import (
@@ -15,6 +16,7 @@ func item(id, code, level, body string) data.MessageItem {
 }
 
 // TestPushCriticalFirstOnly 同一去重键的清仓/止损告警仅在首次出现时推送。
+// English: TestPushCriticalFirstOnly pushes close-out/stop-loss alerts only on first appearance for the same dedup key.
 func TestPushCriticalFirstOnly(t *testing.T) {
 	e := &Engine{msgStore: data.NewMessageStore(""), notifier: notify.New()}
 	ch := e.notifier.RegisterWS("t1")
@@ -39,6 +41,7 @@ func TestPushCriticalFirstOnly(t *testing.T) {
 	}
 
 	// 再次推送相同键：消息中心已存在，不再重复推送
+	// English: Pushing the same keys again: already present in the message center, so not re-pushed.
 	e.pushCriticalAlerts(items)
 	select {
 	case m := <-ch:
@@ -48,6 +51,7 @@ func TestPushCriticalFirstOnly(t *testing.T) {
 }
 
 // TestPushCriticalSkipsLowLevel 非清仓/止损级别（如持仓提示）不推送强提醒。
+// English: TestPushCriticalSkipsLowLevel does not push strong alerts for non-close-out/stop-loss levels (e.g. holding reminders).
 func TestPushCriticalSkipsLowLevel(t *testing.T) {
 	e := &Engine{msgStore: data.NewMessageStore(""), notifier: notify.New()}
 	ch := e.notifier.RegisterWS("t1")
@@ -62,6 +66,7 @@ func TestPushCriticalSkipsLowLevel(t *testing.T) {
 }
 
 // TestPushCriticalNilNotifier 未配置推送器时静默跳过，不 panic。
+// English: TestPushCriticalNilNotifier silently skips when no notifier is configured, without panicking.
 func TestPushCriticalNilNotifier(t *testing.T) {
 	e := &Engine{msgStore: data.NewMessageStore("")}
 	e.pushCriticalAlerts([]data.MessageItem{item("600001@清仓", "600001", "清仓", "N形硬止损")})

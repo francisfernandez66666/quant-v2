@@ -8,6 +8,7 @@ import (
 )
 
 // emotionCfgStub 构造测试用情绪阈值配置（各字段对应 rules.json 的 EmotionConfig）。
+// English: emotionCfgStub builds an emotion-threshold config for tests (each field corresponds to EmotionConfig in rules.json).
 func emotionCfgStub() *config.EmotionConfig {
 	return &config.EmotionConfig{
 		EmoClimaxLimitupMin:   80,
@@ -28,6 +29,7 @@ func emotionCfgStub() *config.EmotionConfig {
 }
 
 // poolOf 构造 n 只涨停股，其中 index 0 连板为 maxBoard。
+// English: poolOf builds n limit-up stocks, where index 0 has a consecutive-limit count of maxBoard.
 func poolOf(n, maxBoard int) []LimitUpStock {
 	pool := make([]LimitUpStock, n)
 	for i := range pool {

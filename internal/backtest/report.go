@@ -33,16 +33,16 @@ type EventResult struct {
 
 // ChainReport 全链路回测汇总。
 type ChainReport struct {
-	Start       string             `json:"start"`
-	End         string             `json:"end"`
-	Benchmark   string             `json:"benchmark"`
-	Horizons    []int              `json:"horizons"`
-	Rule        SignalRule         `json:"rule"`
-	Events      []EventResult      `json:"events"`
-	TotalEvents int                `json:"total_events"`
-	TotalPicks  int                `json:"total_picks"`
-	AvgExcess   map[int]float64    `json:"avg_excess"`  // horizon → 事件级平均超额
-	OverallHit  map[int]float64    `json:"overall_hit"` // horizon → 股票级命中率
+	Start       string          `json:"start"`
+	End         string          `json:"end"`
+	Benchmark   string          `json:"benchmark"`
+	Horizons    []int           `json:"horizons"`
+	Rule        SignalRule      `json:"rule"`
+	Events      []EventResult   `json:"events"`
+	TotalEvents int             `json:"total_events"`
+	TotalPicks  int             `json:"total_picks"`
+	AvgExcess   map[int]float64 `json:"avg_excess"`  // horizon → 事件级平均超额
+	OverallHit  map[int]float64 `json:"overall_hit"` // horizon → 股票级命中率
 }
 
 // Summarize 汇总全部事件的平均超额与命中率。

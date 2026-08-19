@@ -198,6 +198,22 @@ func (s MarketSession) String() string {
 	}
 }
 
+// IsActiveSession 判断当前是否处于"活跃行情时段"：盘前/上午盘/午前/下午盘。
+// 与 scoreCycle 近实时打分循环的门控集合一致——非活跃时段（盘后/休市）应停止
+// 5s 行情采集与实时触发，避免无谓轮询消耗 CPU。
+// English: reports whether now is in an "active market session" — premarket / morning /
+// pre-afternoon / afternoon trade. Matches the scoreCycle near-realtime gating set; outside
+// these windows (after-market / closed) the 5s quote fetcher and real-time trigger should
+// pause to avoid wasteful polling.
+func IsActiveSession(now time.Time) bool {
+	switch CurrentSession(now) {
+	case SessionPreMarket, SessionMorningTrade, SessionPreAfternoon, SessionAfternoonTrade:
+		return true
+	default:
+		return false
+	}
+}
+
 // CurrentSession 返回当前市场时段。
 func CurrentSession(now time.Time) MarketSession {
 	wd := now.Weekday()

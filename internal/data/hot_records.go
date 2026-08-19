@@ -1,10 +1,13 @@
 // Package data — 热门板块记录固化。
 // 定义热点板块快照与轮次记录的结构，供跨交易日持久化使用。
+// English: Package data — persistence of hot-sector records.
+// Defines the hot-sector snapshot and round-record structures for cross-day persistence.
 package data
 
 import "time"
 
 // HotSectorRecord 热门板块单条快照（同花顺板块行情表匹配后的展示数据）。
+// English: HotSectorRecord is a single hot-sector snapshot (display data matched from the THS sector table).
 type HotSectorRecord struct {
 	Name       string   `json:"name"`        // 板块名称
 	Code       string   `json:"code"`        // 板块代码
@@ -19,6 +22,8 @@ type HotSectorRecord struct {
 }
 
 // HotRecord 一轮热点板块记录（与 Stage 记录同一固化节奏：跨交易日清除）。
+// English: HotRecord is one round of hot-sector records (same persistence cadence as Stage
+// records: cleared across trading days).
 type HotRecord struct {
 	ProcessTime time.Time         `json:"process_time"` // 记录生成时间
 	Sectors     []HotSectorRecord `json:"sectors"`      // 本轮热点板块快照列表

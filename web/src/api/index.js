@@ -273,6 +273,10 @@ async function request(path, opts = {}) {
   // 401 means the token expired; clear local auth state
   if (res.status === 401) {
     clearAuth()
+    // 广播"登录过期"事件，让 App 层监听后退出登录回到登录页（配合 SSE 无限重连的兜底）
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('auth:expired'))
+    }
     throw new Error('登录已过期')
   }
   // 非 2xx：尝试解析后端错误信息，解析失败则给出明确状态码提示，
@@ -380,6 +384,13 @@ export async function fetchDepth(code) {
 // used by the top status bar and the 15s polling
 export async function fetchStatus() {
   return request('/api/status')
+}
+
+// 获取仪表盘汇总数据（含按战法分组的胜率统计）
+// 对应 GET /api/dashboard，返回 { report_stats: { by_strategy: {...} }, ... }；
+// by_strategy 按战法聚合胜率/平均盈亏/盈亏比，用于绩效归因展示。
+export async function fetchDashboard() {
+  return request('/api/dashboard')
 }
 
 // 获取流程引擎子系统健康状况
@@ -698,6 +709,8 @@ let sse = null
 // 已注册的 SSE 消息回调列表，新增信号等推送会依次通知所有回调
 // List of registered SSE callbacks; pushes such as new signals notify each callback in turn
 let sseCallbacks = []
+// SSE 连续重连次数，用于退避重连与登录态失效探测（成功收到消息后重置为 0）
+let sseRetry = 0
 
 /**
  * 注册 SSE 消息回调，返回取消注册的函数
@@ -730,18 +743,37 @@ export function connectSSE() {
   // 未登录时不建立连接
   // Do not connect when not logged in
   if (!token) return
+  // 说明：浏览器 EventSource 会自动携带 Last-Event-ID 头（来自服务端 `id:` 行），
+  //       服务端据此实现断线续传（见 handleFixSSE 读取 Last-Event-ID）。
+  // Note: the browser EventSource automatically sends the Last-Event-ID header
+  //       (from the server's `id:` line), enabling reconnect resume server-side.
   sse = new EventSource(baseUrl() + '/api/events?token=' + encodeURIComponent(token))
   sse.onmessage = (e) => {
+    // 成功收到一条消息即重置重连计数（连接已恢复）
+    sseRetry = 0
     try {
       const msg = JSON.parse(e.data)
       sseCallbacks.forEach(fn => fn(msg))
     } catch (_) {}
   }
   sse.onerror = () => {
-    // 连接断开时先关闭，3 秒后自动重连
-    // Close on disconnect, then auto-reconnect after 3 seconds
+    // 连接断开时先关闭，随后按退避重连
+    // Close on disconnect, then reconnect with backoff
     disconnectSSE()
-    setTimeout(connectSSE, 3000)
+    sseRetry++
+    // 退避延迟：3s 起，指数增长并封顶 30s，避免网络异常时无限快速重连风暴
+    // Backoff delay: starts at 3s, grows exponentially and caps at 30s to avoid a reconnect storm
+    const delay = Math.min(3000 * Math.pow(1.6, sseRetry - 1), 30000)
+    // 连续重连多次仍失败时，探测一次登录态：若 token 已失效（401），
+    // request() 内部会 clearAuth 并广播 auth:expired，App 层据此回到登录页，
+    // 从而终止对过期 token 的无限重连。
+    // After many consecutive failures, probe auth once; if the token is expired (401),
+    // request() clears auth and dispatches auth:expired so the app returns to login,
+    // stopping the infinite reconnect loop on a dead token.
+    if (sseRetry === 5) {
+      request('/api/status').catch(() => {})
+    }
+    setTimeout(connectSSE, delay)
   }
 }
 
@@ -927,6 +959,14 @@ export async function fetchResearchProgress() {
   return request('/api/research/progress')
 }
 
+/** 获取全部因子元数据（GET /api/research/factors） */
+/** Fetch factor metadata (GET /api/research/factors) */
+// 返回 { factors: [{ id, name, cat, desc }, ...] }，供自动研究页把因子规则渲染成中文可读文案
+// Returns { factors: [{ id, name, cat, desc }, ...] } so the auto-research page can render factor rules in Chinese
+export async function fetchResearchFactors() {
+  return request('/api/research/factors')
+}
+
 /** 获取研究候选列表（可选按状态过滤） */
 /** Fetch the research candidate list (optionally filtered by status) */
 // 对应 GET /api/research/candidates?status=...，返回 { candidates: [...] }
@@ -946,6 +986,57 @@ export async function approveResearchCandidate(id) {
 /** Reject a candidate (POST /api/research/candidates/{id}/reject) */
 export async function rejectResearchCandidate(id) {
   return request('/api/research/candidates/' + encodeURIComponent(id) + '/reject', { method: 'POST' })
+}
+
+/** 对指定候选跑一次全量回测（POST /api/research/candidates/{id}/backtest，异步） */
+/** Run a full backtest on a candidate (POST ..., async) */
+export async function backtestResearchCandidate(id) {
+  return request('/api/research/candidates/' + encodeURIComponent(id) + '/backtest', { method: 'POST' })
+}
+
+/** 查询回测任务状态（GET /api/research/backtest/{id}） */
+/** Query a backtest job's status (GET /api/research/backtest/{id}) */
+export async function fetchBacktestStatus(id) {
+  return request('/api/research/backtest/' + encodeURIComponent(id))
+}
+
+// ── 战法库（已应用因子战法管理 + 效果监测）──
+// Strategy library: applied factor-strategy management + effectiveness monitoring
+
+/** 获取战法库（GET /api/research/library） */
+/** Fetch the strategy library (GET /api/research/library) */
+export async function fetchResearchLibrary() {
+  return request('/api/research/library')
+}
+
+/** 启用/禁用战法库某条（POST /api/research/library/{id}/enable|disable） */
+/** Enable/disable a library strategy (POST .../{id}/enable|disable) */
+export async function setResearchLibraryEnabled(id, enabled) {
+  return request('/api/research/library/' + encodeURIComponent(id) + (enabled ? '/enable' : '/disable'), { method: 'POST' })
+}
+
+/** 删除战法库某条（POST /api/research/library/{id}/delete） */
+/** Delete a library strategy (POST /api/research/library/{id}/delete) */
+export async function deleteResearchLibrary(id) {
+  return request('/api/research/library/' + encodeURIComponent(id) + '/delete', { method: 'POST' })
+}
+
+/** 重命名战法库某条（POST /api/research/library/{id}/rename，body {name}） */
+/** Rename a library strategy (POST /api/research/library/{id}/rename, body {name}) */
+export async function renameResearchLibrary(id, name) {
+  return request('/api/research/library/' + encodeURIComponent(id) + '/rename', { method: 'POST', data: { name } })
+}
+
+/** 查询全量回测全局开关（GET /api/research/backtest-toggle） */
+/** Get the global full-backtest toggle (GET /api/research/backtest-toggle) */
+export async function fetchBacktestToggle() {
+  return request('/api/research/backtest-toggle')
+}
+
+/** 设置全量回测全局开关（POST /api/research/backtest-toggle，body {enabled}） */
+/** Set the global full-backtest toggle (POST /api/research/backtest-toggle, body {enabled}) */
+export async function setBacktestToggle(enabled) {
+  return request('/api/research/backtest-toggle', { method: 'POST', data: { enabled } })
 }
 
 // ── 用户/账号管理（仅 admin）──

@@ -1,4 +1,5 @@
 // 股票面板：单只股票的研究序列 + 全量因子值，供横截面 IC/分层/回测。
+// English: stock panel: one stock's research series + all factor values, for cross-sectional IC / layering / backtests.
 package research
 
 import (
@@ -7,15 +8,19 @@ import (
 )
 
 // Panel 单只股票的因子面板。
+// English: Panel holds one stock's factor values aligned to its trade dates.
 // （Panel holds one stock's factor values aligned to its trade dates.）
 type Panel struct {
 	Code    string
 	Series  *factor.StockSeries
-	DateIdx map[string]int          // 日期 → 序列下标
-	Factors map[string][]float64    // factorID → 与 Dates 对齐的因子值
+	DateIdx map[string]int // 日期 → 序列下标
+	// English: date -> series index.
+	Factors map[string][]float64 // factorID → 与 Dates 对齐的因子值
+	// English: factorID -> factor values aligned with Dates.
 }
 
 // BuildPanel 装配单只股票并计算指定因子的值。
+// English: BuildPanel assembles one stock and computes the given factors.
 // （BuildPanel assembles one stock and computes the given factors.）
 func BuildPanel(db *store.DB, code, start, end string, defs []factor.Def) (*Panel, error) {
 	series, err := Assemble(db, code, start, end)
@@ -38,6 +43,7 @@ func BuildPanel(db *store.DB, code, start, end string, defs []factor.Def) (*Pane
 }
 
 // BuildPanels 装配一批股票的因子面板（股票无行情时跳过并记录）。
+// English: BuildPanels assembles panels for many stocks, skipping those without data.
 // （BuildPanels assembles panels for many stocks, skipping those without data.）
 func BuildPanels(db *store.DB, codes []string, start, end string, defs []factor.Def) ([]*Panel, error) {
 	var panels []*Panel
@@ -45,6 +51,7 @@ func BuildPanels(db *store.DB, codes []string, start, end string, defs []factor.
 		p, err := BuildPanel(db, code, start, end, defs)
 		if err != nil {
 			// 无行情/区间外股票跳过
+			// English: skip stocks without market data / outside the range.
 			continue
 		}
 		panels = append(panels, p)
@@ -53,6 +60,7 @@ func BuildPanels(db *store.DB, codes []string, start, end string, defs []factor.
 }
 
 // forwardReturn 未来 h 个交易日收益（hfq）；越界为 NaN。
+// English: forwardReturn is the h-day forward return (hfq); NaN when out of bounds.
 func forwardReturn(series *factor.StockSeries, i, h int) float64 {
 	if i+h >= len(series.CloseHfq) || i < 0 {
 		return nan()

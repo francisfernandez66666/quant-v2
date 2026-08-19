@@ -20,6 +20,7 @@ import (
 // normalization, neutral zeroing and datetime fallback. It returns events for successes and failedItems for
 // news whose LLM analysis failed (nil placeholder, no keyword fallback), which callers should keep in the
 // unattributed queue for the next round.）
+// English: analyzeDeep is the Stage2 full analysis: LLM deep-analysis of screened news producing structured NewsEvents. On retry exhaustion the batch is dropped (nil, no keyword fallback), with post-processing for tier normalization, neutral zeroing and datetime fallback. It returns events for successes and failedItems for news whose LLM analysis failed (nil placeholder, no keyword fallback), which callers should keep in the unattributed queue for the next round.
 func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedItems []data.NewsItem) {
 	if len(items) == 0 {
 		return nil, nil
@@ -27,6 +28,7 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedIt
 
 	// 抽取标题列表（附正文摘要），供 LLM 批量分析。
 	// 摘要（≤80 字）给 LLM 提供"制裁/管制"等背景，避免仅凭标题误判而漏掉产业链归因。
+	// English: extract the title list (with a body digest) for batch LLM analysis. The digest (<=80 runes) gives the LLM background such as sanctions/controls, avoiding misjudging on title alone and missing supply-chain attribution.
 	titles := make([]string, len(items))
 	for i, item := range items {
 		titles[i] = titleWithDigest(item.Title, item.Content)
@@ -39,6 +41,7 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedIt
 	}
 
 	// LLM 重试耗尽失败的新闻（nil 占位）：视为未归因，交调用方留队下一轮重试
+	// English: news whose LLM retries were exhausted (nil placeholder) is treated as unattributed and handed to the caller to queue for the next round
 	failedSet := make(map[int]bool, len(failedIdx))
 	for _, f := range failedIdx {
 		failedSet[f] = true
@@ -51,10 +54,12 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedIt
 			continue
 		}
 		// 跳过空结果：LLM 未给出标题的无效项
+		// English: skip empty results: invalid items for which the LLM gave no title
 		if ht == nil || ht.Title == "" {
 			continue
 		}
 		// 后置校正：档位归一 + 中性强制归零
+		// English: post-processing: tier normalization + forced zeroing of neutral cases
 		postProcess(ht)
 		events = append(events, buildChainEvents(ht, items[i])...)
 	}
@@ -64,17 +69,20 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedIt
 }
 
 // buildChainEvents 把一个 HotTopic 展开为 1~2 个 NewsEvent。
+// English: buildChainEvents expands a HotTopic into 1-2 NewsEvents: differential upstream/downstream directions (e.g. sanction type: upstream bull / downstream bear) split into two directional events so each enters the watch pool and N-shape D1 scoring with the right sign; same direction merges into a single event.
 // 差分（上游方向 ≠ 下游方向，如对抗制裁型上游利好/下游利空）拆为两个方向事件，
 // 使上游/下游各自以正确方向进入监测池与 N 形 D1 评分；同向则合并为单事件。
 // （buildChainEvents expands a HotTopic into 1-2 NewsEvents: differential upstream/downstream directions
 // (e.g. sanction type: upstream bull / downstream bear) split into two events, same direction merges into one.）
 func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 	// 兜底时间：新闻无发布时间时用当前时间
+	// English: fallback time: use the current time when the news has no publish time
 	dt := item.Datetime
 	if dt == "" {
 		dt = time.Now().Format("2006-01-02 15:04:05")
 	}
 	// 来源自带的个股标签（如财联社 stock_list）并入归因，交 cleaner 清洗
+	// English: the source's own stock tags (e.g. Cailian Press stock_list) are merged into the attribution and cleaned by the cleaner
 	sourceStocks := mergeStr(ht.RelatedStocks, item.Stocks)
 
 	base := NewsEvent{
@@ -100,6 +108,7 @@ func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 
 	if ht.UpstreamDirection != "" && ht.DownstreamDirection != "" && ht.UpstreamDirection != ht.DownstreamDirection {
 		// 分化：上游与下游各自独立方向事件。
+		// English: divergence: upstream and downstream each become an independent directional event. The upstream event prefers upstream_stocks, falling back to the full related_stocks when missing (models often fold upstream contractors into it); the downstream event uses only downstream_stocks, left empty when missing (sector propagation injects constituents), avoiding upstream-bull stocks polluting the downstream-bear event.
 		// 上游事件优先用 upstream_stocks，缺失时回落全量 related_stocks（模型常把上游承包商并入其中）；
 		// 下游事件只用 downstream_stocks，缺失时留空（交给板块传播注入成分股），
 		// 避免把上游利好个股污染进下游利空事件。
@@ -114,12 +123,14 @@ func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 		}
 	}
 	// 同向：合并为单事件（上/下游板块与个股并入）
+	// English: same direction: merge into a single event (upstream/downstream sectors and stocks merged in)
 	allStocks := mergeStr(sourceStocks, mergeStr(ht.UpstreamStocks, ht.DownstreamStocks))
 	allSectors := mergeStr(ht.Sectors, mergeStr(ht.UpstreamSectors, ht.DownstreamSectors))
 	return []NewsEvent{buildChainEvent(base, ht, ht.Sectors, allStocks, allSectors, chainDirection(ht), "全链")}
 }
 
 // titleWithDigest 把正文摘要（≤80 字）拼进标题，供 LLM 获取制裁/管制等背景。
+// English: titleWithDigest appends a <=80-run digest of the body into the title for LLM context like sanctions/controls.
 // （titleWithDigest appends a ≤80-run digest of the body into the title for LLM context like sanctions/controls.）
 func titleWithDigest(title, content string) string {
 	if content == "" {
@@ -133,6 +144,7 @@ func titleWithDigest(title, content string) string {
 }
 
 // buildChainEvent 按产业链环节组装单个 NewsEvent（上游/下游/全链环节）。
+// English: buildChainEvent assembles a single NewsEvent per supply-chain stage (upstream/downstream/full). chainSectors are the stage sectors, falling back to primarySectors/ht.Sectors when empty.
 // chainSectors 为环节板块（上游/下游），为空时回退 primarySectors/ht.Sectors。
 // （buildChainEvent assembles a single NewsEvent per supply-chain stage (upstream/downstream/full).
 // chainSectors override primarySectors/ht.Sectors when non-empty.）
@@ -161,6 +173,7 @@ func buildChainEvent(base NewsEvent, ht *llm.HotTopic, primarySectors, related, 
 }
 
 // chainDirection 同向合并事件的统一方向：优先用 ht.Direction，否则由 Score 推导。
+// English: chainDirection returns the merged event's direction, preferring ht.Direction then deriving from Score.
 // （chainDirection returns the merged event's direction, preferring ht.Direction then deriving from Score.）
 func chainDirection(ht *llm.HotTopic) string {
 	if ht.Direction != "" && ht.Direction != "中性" {
@@ -170,6 +183,7 @@ func chainDirection(ht *llm.HotTopic) string {
 }
 
 // chainScore 按环节方向给事件赋带符号强度分（绝对值取自 ht.Score 归一卷）。
+// English: chainScore assigns a signed strength score per stage direction from the normalized |ht.Score|.
 // （chainScore assigns a signed strength score per stage direction from the normalized |ht.Score|.）
 func chainScore(score float64, dir string) float64 {
 	abs := score
@@ -190,6 +204,7 @@ func chainScore(score float64, dir string) float64 {
 }
 
 // mergeStr 合并去重字符串切片。（mergeStr merges and dedupes string slices.）
+// English: mergeStr merges and dedupes string slices.
 func mergeStr(a, b []string) []string {
 	seen := make(map[string]bool, len(a)+len(b))
 	out := make([]string, 0, len(a)+len(b))
@@ -204,6 +219,7 @@ func mergeStr(a, b []string) []string {
 }
 
 // containsStr 判断字符串切片中是否包含指定元素。（containsStr reports whether the slice contains s.）
+// English: containsStr reports whether the slice contains s.
 func containsStr(slice []string, s string) bool {
 	for _, v := range slice {
 		if v == s {
@@ -220,8 +236,10 @@ func containsStr(slice []string, s string) bool {
 //
 // （postProcess normalizes scores to the nearest tier in {0,0.25,0.5,0.75} and zeroes neutral cases only when
 // the tier is 0, preserving explicit non-zero directional scores.）
+// English: postProcess normalizes scores to the nearest tier in {0,0.25,0.5,0.75} and zeroes neutral cases only when the tier is 0, preserving explicit non-zero directional scores.
 func postProcess(ht *llm.HotTopic) {
 	// 取绝对值并截断上限，只处理强度档位
+	// English: take the absolute value and cap the ceiling; only the strength tier is processed
 	s := ht.Score
 	if s < 0 {
 		s = -s
@@ -230,6 +248,7 @@ func postProcess(ht *llm.HotTopic) {
 		s = 0.75
 	}
 	// 遍历四个档位找与 |score| 最近的档位（贪心最近邻）
+	// English: scan the four tiers for the one nearest |score| (greedy nearest-neighbor)
 	tiers := []float64{0, 0.25, 0.5, 0.75}
 	best := tiers[0]
 	bestDiff := math.Abs(s - tiers[0])
@@ -240,11 +259,13 @@ func postProcess(ht *llm.HotTopic) {
 		}
 	}
 	// 还原原始符号（利好正分/利空负分），中性档 0 无符号
+	// English: restore the original sign (bullish positive / bearish negative); the neutral tier 0 has no sign
 	score := best
 	if ht.Score < 0 {
 		score = -score
 	}
 	// 中性归零（放宽版）：LLM 判定方向为"中性" 且 无明确档位时归零，
+	// English: neutral zeroing (relaxed): zero the score only when the LLM judged the direction as "neutral" and there is no explicit tier, avoiding weak/directionless events carrying a placeholder score; events with an explicit non-neutral tier are kept to avoid false kills.
 	// 避免弱/无方向事件带占位分；有明确非中性分档的事件保留，避免误杀。
 	neutral := strings.EqualFold(ht.Sentiment, "中性") || strings.EqualFold(ht.Direction, "中性")
 	if neutral && best == 0 {
@@ -254,6 +275,7 @@ func postProcess(ht *llm.HotTopic) {
 }
 
 // directionFromScore 由带符号 Score 推导展示用方向：>0 利好，<0 利空，==0 中性。
+// English: directionFromScore derives a display direction from the signed Score: >0 bull, <0 bear, ==0 neutral.
 // （directionFromScore derives a display direction from the signed Score: positive bull, negative bear, zero neutral.）
 func directionFromScore(score float64) string {
 	if score > 0 {

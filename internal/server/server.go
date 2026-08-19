@@ -23,6 +23,8 @@ import (
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/store"
+	factorstrat "quant-trading-v2/internal/strategies/factor"
+	patternstrat "quant-trading-v2/internal/strategies/pattern"
 )
 
 // EngineController 引擎对外暴露的控制面：利好/利空开关 + 流水线调试数据 + 消息中心 + 热点记录。
@@ -51,24 +53,34 @@ type EngineController interface {
 	// DashboardData 返回该账号/引擎的当前看板快照（信号/评分/新闻事件/开关状态等）。
 	// English: returns the current dashboard snapshot for this account/engine (signals/scores/news/toggles).
 	DashboardData() *display.DashboardData
+	// 战法库（因子战法）：热重载 / 运行统计 / 前向收益记录（效果监测）。
+	// English: factor-strategy library: hot-reload / run stats / forward-return recording (monitoring).
+	ReloadFactorRules(dataDir string)
+	FactorStats() []factorstrat.ActiveRule
+	RecordFactorForwardReturn(ruleID string, ret float64)
+	// 战法库（形态战法）：热重载 / 运行统计 / 前向收益记录（效果监测）。
+	// English: pattern-strategy library: hot-reload / run stats / forward-return recording (monitoring).
+	ReloadPatternRules(dataDir string)
+	PatternStats() []patternstrat.ActivePattern
+	RecordPatternForwardReturn(ruleID string, ret float64)
 }
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
 type Server struct {
-	auth        *auth.Manager                                                      // 认证管理器：注册/登录/临时账号/token 校验
-	agg         *display.Aggregator                                                // 看板数据聚合器（读取实时看板快照）
-	cfg         *config.Manager                                                    // 配置管理器（策略/D1/LLM 参数）
-	rpt         *report.Report                                                     // 交易持仓报告（开仓/平仓/统计）
-	mux         *http.ServeMux                                                     // 路由注册表
-	market      *data.MarketAPI                                                    // 行情数据 API（实时报价/板块/IPO 等）
-	ths         *data.THSClient                                                    // 同花顺客户端（板块行情表）
-	fetcher     *data.Fetcher                                                      // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
-	dc          *data.DataCoordinator                                              // 行情统一数据源（新浪→同花顺→东财 三级降级链）
-	watchlist   *data.WatchlistManager                                             // 自选股管理器
-	sse         *SSEBroker                                                         // SSE 事件广播器（向前端实时推送）
-	startTime   time.Time                                                          // 服务启动时间（用于 uptime 统计）
+	auth        *auth.Manager                                                                                                              // 认证管理器：注册/登录/临时账号/token 校验
+	agg         *display.Aggregator                                                                                                        // 看板数据聚合器（读取实时看板快照）
+	cfg         *config.Manager                                                                                                            // 配置管理器（策略/D1/LLM 参数）
+	rpt         *report.Report                                                                                                             // 交易持仓报告（开仓/平仓/统计）
+	mux         *http.ServeMux                                                                                                             // 路由注册表
+	market      *data.MarketAPI                                                                                                            // 行情数据 API（实时报价/板块/IPO 等）
+	ths         *data.THSClient                                                                                                            // 同花顺客户端（板块行情表）
+	fetcher     *data.Fetcher                                                                                                              // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
+	dc          *data.DataCoordinator                                                                                                      // 行情统一数据源（新浪→同花顺→东财 三级降级链）
+	watchlist   *data.WatchlistManager                                                                                                     // 自选股管理器
+	sse         *SSEBroker                                                                                                                 // SSE 事件广播器（向前端实时推送）
+	startTime   time.Time                                                                                                                  // 服务启动时间（用于 uptime 统计）
 	llmRecreate func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) // 热重建 LLM 客户端
-	ctrl        EngineController                                                   // 引擎控制面（做多/做空开关、流水线调试数据等）
+	ctrl        EngineController                                                                                                           // 引擎控制面（做多/做空开关、流水线调试数据等）
 
 	researchDB  *store.DB // B5 研究候选库（optimize 产出入库；web 审批读写）
 	researchDir string    // B5 应用目录（applied_rules.json 落盘处）
@@ -87,9 +99,9 @@ type Server struct {
 	thsBoards   []data.SectorInfo // 同花顺 top 板块兜底缓存（LLM 无归因时使用）
 	thsBoardsAt time.Time         // 兜底缓存最近刷新时间（每分钟轮动一次）
 
-	newsMu     sync.Mutex            // 保护 news 响应缓存的互斥锁
-	newsCache  map[string][]byte     // news 接口 TTL 缓存（key: "all"/""，value: JSON 响应）
-	newsCacheAt time.Time            // news 缓存最近刷新时间（TTL 30s）
+	newsMu      sync.Mutex        // 保护 news 响应缓存的互斥锁
+	newsCache   map[string][]byte // news 接口 TTL 缓存（key: "all"/""，value: JSON 响应）
+	newsCacheAt time.Time         // news 缓存最近刷新时间（TTL 30s）
 
 	registry EngineRegistry // 多账号引擎注册表（懒加载/按配置指纹共享计算引擎）
 }
@@ -105,6 +117,7 @@ type EngineRegistry interface {
 	AllControllers() []EngineController
 	Len() int
 }
+
 // SetEngineRegistry 设置多账号引擎注册表（懒加载/按配置指纹共享）。
 func (s *Server) SetEngineRegistry(r EngineRegistry) { s.registry = r }
 
@@ -343,9 +356,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
 	s.mux.HandleFunc("GET /api/research/progress", s.authMiddleware(s.handleResearchProgress))
+	s.mux.HandleFunc("GET /api/research/factors", s.authMiddleware(s.handleResearchFactors))
 	s.mux.HandleFunc("GET /api/research/candidates", s.authMiddleware(s.handleResearchCandidates))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleResearchApprove))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleResearchReject))
+	s.mux.HandleFunc("POST /api/research/candidates/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest))
+	s.mux.HandleFunc("GET /api/research/backtest/{id}", s.authMiddleware(s.handleBacktestStatus))
+	// 战法库（因子战法）：列出已应用 + 启用/禁用/删除 + 重命名 + 效果监测 + 全量回测全局开关
+	s.mux.HandleFunc("GET /api/research/library", s.authMiddleware(s.handleResearchLibrary))
+	s.mux.HandleFunc("POST /api/research/library/{id}/enable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("enable")))
+	s.mux.HandleFunc("POST /api/research/library/{id}/disable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("disable")))
+	s.mux.HandleFunc("POST /api/research/library/{id}/delete", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryDelete))
+	s.mux.HandleFunc("POST /api/research/library/{id}/rename", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryRename))
+	s.mux.HandleFunc("GET /api/research/backtest-toggle", s.authMiddleware(s.handleResearchBacktestToggle))
+	s.mux.HandleFunc("POST /api/research/backtest-toggle", s.permMiddleware(auth.PermResearchApprove, s.handleResearchBacktestToggle))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
 
@@ -692,6 +716,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			"win_rate":     wr,
 			"avg_win_pct":  avgW,
 			"avg_loss_pct": avgL,
+			"by_strategy":  data.Report.StatsByStrategy(""), // 按战法分组的胜率/盈亏比明细
 		}
 		resp["report_logs"] = data.Report.List()
 	}
@@ -985,6 +1010,7 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	reportStats["win_rate"] = wr
 	reportStats["avg_win_pct"] = avgW
 	reportStats["avg_loss_pct"] = avgL
+	reportStats["by_strategy"] = s.rpt.StatsByStrategy(uid) // 按账号、按战法分组的胜率明细
 	writeJSON(w, 200, map[string]interface{}{
 		"positions": logs,
 		"stats":     reportStats,
@@ -1062,14 +1088,14 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"api_url":            cfg.APIURL,
-		"api_keys":           apiKeys,
-		"model":              s.runtimeModel(),
-		"stream":             cfg.StreamingEnabled(),
-		"timeout_sec":        cfg.TimeoutSec,
-		"batch_concurrency":  cfg.BatchConcurrency,
-		"max_retry_times":    cfg.MaxRetryTimes,
-		"classifier_model":   cfg.ClassifierModel,
+		"api_url":           cfg.APIURL,
+		"api_keys":          apiKeys,
+		"model":             s.runtimeModel(),
+		"stream":            cfg.StreamingEnabled(),
+		"timeout_sec":       cfg.TimeoutSec,
+		"batch_concurrency": cfg.BatchConcurrency,
+		"max_retry_times":   cfg.MaxRetryTimes,
+		"classifier_model":  cfg.ClassifierModel,
 	})
 }
 

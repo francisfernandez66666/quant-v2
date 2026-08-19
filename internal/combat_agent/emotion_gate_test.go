@@ -1,4 +1,5 @@
 // C5 情绪周期过滤扩展到四战法测试：禁止开仓阶段下买入降级为 watch，允许阶段保持买入。
+// English: C5 emotion-cycle filtering extended to the four strategies: in blocked phases buy downgrades to watch; in allowed phases buy is kept.
 package combat_agent
 
 import (
@@ -10,6 +11,7 @@ import (
 )
 
 // TestEmotionGateBlocksAllStrategies 情绪"衰退"阶段下四战法 buy 一律降级为 watch。
+// English: TestEmotionGateBlocksAllStrategies in the "recession" phase all four strategies' buy signals are downgraded to watch.
 func TestEmotionGateBlocksAllStrategies(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())
@@ -32,6 +34,7 @@ func TestEmotionGateBlocksAllStrategies(t *testing.T) {
 }
 
 // TestEmotionGateDefaultOnlyRecession 默认配置（未注入）仅"衰退"禁止开仓，其他阶段放行。
+// English: TestEmotionGateDefaultOnlyRecession the default config (not injected) blocks opening only in "recession"; other phases pass through.
 func TestEmotionGateDefaultOnlyRecession(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())
@@ -40,12 +43,14 @@ func TestEmotionGateDefaultOnlyRecession(t *testing.T) {
 	pool := map[string]*strategy_engine.StockMarketData{"600100": d1BoostDragonMD()}
 
 	// 未注入阶段列表 + 允许阶段（高潮）→ buy 保持
+	// English: No injected phase list + allowed phase (climax) → buy is kept.
 	_, sigsClimax := a.ScorePool([]string{"600100"}, pool, map[string]D1Score{}, "高潮")
 	if !hasDragonAction(sigsClimax, "600100", "buy") {
 		t.Fatalf("高潮期应保持 buy, got %+v", sigsClimax)
 	}
 
 	// 空阶段列表 → 默认"衰退"仍拦截
+	// English: Empty phase list → the default "recession" still blocks.
 	_, sigsRecession := a.ScorePool([]string{"600100"}, pool, map[string]D1Score{}, "衰退")
 	if hasDragonAction(sigsRecession, "600100", "buy") {
 		t.Fatalf("默认衰退期应拦截 buy, got %+v", sigsRecession)
@@ -53,6 +58,7 @@ func TestEmotionGateDefaultOnlyRecession(t *testing.T) {
 }
 
 // TestEmotionGateCustomPhases 自定义禁止阶段列表生效（如"冰点"）且未列入的阶段放行。
+// English: TestEmotionGateCustomPhases a custom blocked-phase list takes effect (e.g. "freezing") and phases not listed pass through.
 func TestEmotionGateCustomPhases(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())

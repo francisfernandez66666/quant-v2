@@ -1,4 +1,5 @@
 // 因子库测试：registry 结构 + 各因子公式单测。
+// English: Factor library tests: registry structure + per-factor formula unit tests.
 package factor
 
 import (
@@ -7,6 +8,7 @@ import (
 )
 
 // approx 校验数值近似（NaN 要求一致，否则容差 1e-9）。
+// English: approx checks numeric approximation (NaN must match, otherwise tolerance 1e-9).
 func approx(t *testing.T, got, want []float64) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -26,6 +28,7 @@ func approx(t *testing.T, got, want []float64) {
 }
 
 // TestRegistry 校验注册表：ID 唯一、按 ID 排序、7 大类齐备、元信息完整。
+// English: TestRegistry validates the registry: unique IDs, sorted by ID, all 7 categories present, complete metadata.
 func TestRegistry(t *testing.T) {
 	all := All()
 	if len(all) == 0 {
@@ -52,6 +55,7 @@ func TestRegistry(t *testing.T) {
 		t.Fatalf("应覆盖 7 大类，实际 %d: %v", len(cats), cats)
 	}
 	// 每类中文名有效
+	// English: Chinese name valid for every category.
 	for c := range cats {
 		if c.CategoryName() == "未知" {
 			t.Fatalf("类别 %d 中文名缺失", c)

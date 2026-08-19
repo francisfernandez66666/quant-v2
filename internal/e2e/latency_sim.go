@@ -55,16 +55,16 @@ type LatencyProfile struct {
 // realisticProfile 返回一组对齐实盘观测的延迟基线。
 func realisticProfile() *LatencyProfile {
 	return &LatencyProfile{
-		Quote:          200 * time.Millisecond,
-		News:           150 * time.Millisecond,
-		Board:          250 * time.Millisecond,
-		LLMFirstToken:  2200 * time.Millisecond,
-		LLMPerToken:    time.Second / 45,
-		Stage0Tokens:   30,
-		Stage2Tokens:   90,
-		D1Tokens:       60,
-		Jitter:         0.10,
-		ScaleFactor:    0.02,
+		Quote:         200 * time.Millisecond,
+		News:          150 * time.Millisecond,
+		Board:         250 * time.Millisecond,
+		LLMFirstToken: 2200 * time.Millisecond,
+		LLMPerToken:   time.Second / 45,
+		Stage0Tokens:  30,
+		Stage2Tokens:  90,
+		D1Tokens:      60,
+		Jitter:        0.10,
+		ScaleFactor:   0.02,
 	}
 }
 
@@ -118,13 +118,38 @@ type simMetrics struct {
 	otherN   int
 }
 
-func (m *simMetrics) addQuote(d time.Duration)   { m.mu.Lock(); m.quoteMs += d; m.quoteN++; m.mu.Unlock() }
-func (m *simMetrics) addNews(d time.Duration)    { m.mu.Lock(); m.newsMs += d; m.newsN++; m.mu.Unlock() }
-func (m *simMetrics) addBoard(d time.Duration)   { m.mu.Lock(); m.boardMs += d; m.boardN++; m.mu.Unlock() }
-func (m *simMetrics) addStage0(d time.Duration)  { m.mu.Lock(); m.stage0Ms += d; m.stage0N++; m.mu.Unlock() }
-func (m *simMetrics) addStage2(d time.Duration)  { m.mu.Lock(); m.stage2Ms += d; m.stage2N++; m.mu.Unlock() }
-func (m *simMetrics) addD1(d time.Duration)      { m.mu.Lock(); m.d1Ms += d; m.d1N++; m.mu.Unlock() }
-func (m *simMetrics) addOther(d time.Duration)   { m.mu.Lock(); m.otherMs += d; m.otherN++; m.mu.Unlock() }
+func (m *simMetrics) addQuote(d time.Duration) {
+	m.mu.Lock()
+	m.quoteMs += d
+	m.quoteN++
+	m.mu.Unlock()
+}
+func (m *simMetrics) addNews(d time.Duration) { m.mu.Lock(); m.newsMs += d; m.newsN++; m.mu.Unlock() }
+func (m *simMetrics) addBoard(d time.Duration) {
+	m.mu.Lock()
+	m.boardMs += d
+	m.boardN++
+	m.mu.Unlock()
+}
+func (m *simMetrics) addStage0(d time.Duration) {
+	m.mu.Lock()
+	m.stage0Ms += d
+	m.stage0N++
+	m.mu.Unlock()
+}
+func (m *simMetrics) addStage2(d time.Duration) {
+	m.mu.Lock()
+	m.stage2Ms += d
+	m.stage2N++
+	m.mu.Unlock()
+}
+func (m *simMetrics) addD1(d time.Duration) { m.mu.Lock(); m.d1Ms += d; m.d1N++; m.mu.Unlock() }
+func (m *simMetrics) addOther(d time.Duration) {
+	m.mu.Lock()
+	m.otherMs += d
+	m.otherN++
+	m.mu.Unlock()
+}
 
 // tabData 汇总数据回传分项：(名称, 调用次数, 单次1×耗时, 累计1×耗时)。
 func (m *simMetrics) tabData(p *LatencyProfile) [][4]string {
@@ -176,16 +201,16 @@ func (m *simMetrics) tabLLM(p *LatencyProfile) [][4]string {
 // oneXBase 返回 1× 均抖口径（去掉 Scale/Jitter 波动项用于口径统一外推）。
 func oneXBase(p *LatencyProfile) *LatencyProfile {
 	return &LatencyProfile{
-		Quote:          p.Quote,
-		News:           p.News,
-		Board:          p.Board,
-		LLMFirstToken:  p.LLMFirstToken,
-		LLMPerToken:    p.LLMPerToken,
-		Stage0Tokens:   p.Stage0Tokens,
-		Stage2Tokens:   p.Stage2Tokens,
-		D1Tokens:       p.D1Tokens,
-		Jitter:         p.Jitter / 2,
-		ScaleFactor:    1,
+		Quote:         p.Quote,
+		News:          p.News,
+		Board:         p.Board,
+		LLMFirstToken: p.LLMFirstToken,
+		LLMPerToken:   p.LLMPerToken,
+		Stage0Tokens:  p.Stage0Tokens,
+		Stage2Tokens:  p.Stage2Tokens,
+		D1Tokens:      p.D1Tokens,
+		Jitter:        p.Jitter / 2,
+		ScaleFactor:   1,
 	}
 }
 

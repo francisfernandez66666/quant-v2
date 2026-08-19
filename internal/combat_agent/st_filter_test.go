@@ -3,6 +3,7 @@ package combat_agent
 import "testing"
 
 // TestIsSTStock 覆盖 ST/*ST/S*ST/SST/退市 前缀与正常个股。
+// English: TestIsSTStock covers the ST/*ST/S*ST/SST/delisting prefixes and normal stocks.
 func TestIsSTStock(t *testing.T) {
 	cases := []struct {
 		name string
@@ -15,7 +16,7 @@ func TestIsSTStock(t *testing.T) {
 		{"退市博元", true},
 		{"退市整理股", true},
 		{"平安银行", false},
-		{"STOCK INC", false},   // 名称中间含 ST 不算（仅前缀匹配）
+		{"STOCK INC", false}, // 名称中间含 ST 不算（仅前缀匹配）
 		{"", false},
 	}
 	for _, c := range cases {

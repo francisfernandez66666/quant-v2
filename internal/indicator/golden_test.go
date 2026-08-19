@@ -1,5 +1,6 @@
 // golden-data 测试框架：读取 testdata/golden.txt（由 Python 按本包相同公式生成并冻结），
 // 提供统一的序列断言工具。
+// English: golden-data test framework: reads testdata/golden.txt (generated and frozen by Python using the same formulas as this package) and provides unified series assertion utilities.
 package indicator
 
 import (
@@ -12,6 +13,7 @@ import (
 
 // loadGolden 解析 golden.txt 为 名称→序列 的映射。
 // 文件格式：# 名称 行 + 逗号分隔数值行（nan 表示 NaN）。
+// English: loadGolden parses golden.txt into a name->series map. File format: "# name" lines plus comma-separated value lines (nan means NaN).
 func loadGolden(t *testing.T) map[string][]float64 {
 	t.Helper()
 	b, err := os.ReadFile("testdata/golden.txt")
@@ -51,6 +53,7 @@ func loadGolden(t *testing.T) map[string][]float64 {
 }
 
 // assertSeries 对比指标输出与 golden 序列（NaN 位置与数值均需一致，容差 1e-9）。
+// English: assertSeries compares indicator output with the golden series (both NaN positions and values must match, tolerance 1e-9).
 func assertSeries(t *testing.T, got, want []float64) {
 	t.Helper()
 	if len(got) != len(want) {

@@ -1,9 +1,11 @@
 // 动量/反转类因子：过去 n 日收益（反转由 B3 层按 IC 符号决定方向）。
+// English: Momentum/reversal factors: past n-day return (reversal direction is decided in layer B3 by the IC sign).
 package factor
 
 import "math"
 
 // momentum 过去 n 日收益 = closeHfq[i]/closeHfq[i−n] − 1；不足 n 根为 NaN。
+// English: momentum is the past n-day return = closeHfq[i]/closeHfq[i-n] - 1; NaN when fewer than n bars are available.
 func momentum(n int) func(*StockSeries) []float64 {
 	return func(s *StockSeries) []float64 {
 		out := make([]float64, s.Len())

@@ -6,6 +6,7 @@ import (
 )
 
 // TestATRGolden 校验 ATR14 与 TrueRange 与 golden 数据。
+// English: TestATRGolden verifies ATR14 and TrueRange against golden data.
 func TestATRGolden(t *testing.T) {
 	g := loadGolden(t)
 	got := ATR14(g["high"], g["low"], g["close"])
@@ -15,6 +16,7 @@ func TestATRGolden(t *testing.T) {
 }
 
 // TestATRFirst 首根 TR 应为 H−L。
+// English: TestATRFirst checks that the first TR equals H-L.
 func TestATRFirst(t *testing.T) {
 	g := loadGolden(t)
 	tr := TrueRange(g["high"], g["low"], g["close"])
@@ -25,6 +27,7 @@ func TestATRFirst(t *testing.T) {
 }
 
 // TestATRFormulas 手算首值：ATR14 首值为前 14 根 TR 的简单平均。
+// English: TestATRFormulas hand-computes the first value: ATR14's first value is the simple average of the first 14 TR values.
 func TestATRFormulas(t *testing.T) {
 	g := loadGolden(t)
 	tr := TrueRange(g["high"], g["low"], g["close"])
@@ -39,6 +42,7 @@ func TestATRFormulas(t *testing.T) {
 }
 
 // TestATREdge 边界：长度不足应全 NaN。
+// English: TestATREdge edge case: insufficient length should yield all NaN.
 func TestATREdge(t *testing.T) {
 	got := ATR14(make([]float64, 5), make([]float64, 5), make([]float64, 5))
 	for _, v := range got {

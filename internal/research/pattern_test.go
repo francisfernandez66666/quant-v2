@@ -1,4 +1,5 @@
 // F2 形态模板搜索测试：触发判定、模板展开、护栏过滤。
+// English: F2 pattern template search test: trigger judgment, template expansion, guard-rail filtering.
 package research
 
 import (
@@ -8,12 +9,16 @@ import (
 )
 
 // mkPatternPanels 构造带形态算子因子的合成面板：
+// English: mkPatternPanels builds a synthetic panel with pattern-operator factors:
 // 每只股票给 Drawdown20（回撤）与 VolShrink（缩量）与 BullAlign 序列。
+// English: each stock gets Drawdown20 (drawdown), VolShrink (volume shrink), and BullAlign sequences.
 // 构造使"回调 0.1~0.2 + 缩量<0.6"条件在部分日期触发且前瞻收益为正。
+// English: constructed so that the "pullback 0.1~0.2 + volume shrink <0.6" condition triggers on some dates with positive forward returns.
 func mkPatternPanels(t *testing.T) []*Panel {
 	t.Helper()
 	dates := makeDates(40)
 	// 2 只股票，人为设计触发日（第 25 天回撤 0.15、缩量 0.5、多头 1）
+	// English: 2 stocks, trigger days designed by hand (day 25: drawdown 0.15, volume shrink 0.5, bull 1)
 	var panels []*Panel
 	for k := 0; k < 2; k++ {
 		idx := make(map[string]int, len(dates))
@@ -24,22 +29,26 @@ func mkPatternPanels(t *testing.T) []*Panel {
 		vs := make([]float64, len(dates))
 		ba := make([]float64, len(dates))
 		// 默认无触发
+		// English: no trigger by default
 		for i := range dd {
 			dd[i] = 0.9
 			vs[i] = 1.5
 			ba[i] = 0
 		}
 		// 第 25 天触发条件
+		// English: trigger condition on day 25
 		dd[25] = 0.15
 		vs[25] = 0.5
 		ba[25] = 1
 		// 为满足 MinTrigger 让多日触发：第 24~27 天连续满足
+		// English: to satisfy MinTrigger, make it trigger across multiple days: days 24~27 satisfied consecutively
 		for i := 24; i <= 27; i++ {
 			dd[i] = 0.15
 			vs[i] = 0.5
 			ba[i] = 1
 		}
 		// 收盘序列：非触发日 +0.5%，触发日（24-28）后 +2%（使触发前瞻收益显著更高）
+		// English: close series: +0.5% on non-trigger days, +2% after trigger days (24-28) (making trigger forward returns significantly higher)
 		closes := make([]float64, len(dates))
 		closes[0] = 100
 		for i := 1; i < len(dates); i++ {
@@ -79,6 +88,7 @@ func intToString2(v int) string {
 }
 
 // TestPatternTriggers 条件满足/不满足判定。
+// English: TestPatternTriggers: condition satisfied/not-satisfied judgment.
 func TestPatternTriggers(t *testing.T) {
 	panels := mkPatternPanels(t)
 	p := Pattern{Conds: []PatternCond{
@@ -87,16 +97,19 @@ func TestPatternTriggers(t *testing.T) {
 		{Factor: "BullAlign", Min: 0.5, Max: 1.5},
 	}}
 	// 第 25 天满足全部条件
+	// English: day 25 satisfies all conditions
 	if !patternTriggers(panels[0], p, 25) {
 		t.Fatalf("第25天应触发")
 	}
 	// 第 10 天不满足（dd=0.9 超区间）
+	// English: day 10 does not satisfy (dd=0.9 out of range)
 	if patternTriggers(panels[0], p, 10) {
 		t.Fatalf("第10天不应触发")
 	}
 }
 
 // TestDiscoverPatterns 搜索应产出通过护栏的形态（触发次数达标 + 正超额 + 样本外正）。
+// English: TestDiscoverPatterns: search should produce patterns that pass the guard rail (trigger count met + positive excess + positive out-of-sample).
 func TestDiscoverPatterns(t *testing.T) {
 	panels := mkPatternPanels(t)
 	templates := []PatternTemplate{{
@@ -125,12 +138,14 @@ func TestDiscoverPatterns(t *testing.T) {
 }
 
 // TestExpandTemplate 笛卡尔积展开。
+// English: TestExpandTemplate: Cartesian product expansion.
 func TestExpandTemplate(t *testing.T) {
 	tmpl := PatternTemplate{Conds: []CondGrid{
 		{Factor: "A", MinVals: []float64{0, 1}, MaxVals: []float64{2}},
 		{Factor: "B", MinVals: []float64{0}, MaxVals: []float64{1}},
 	}}
 	// A: (0,2),(1,2) 2 种；B: (0,1) 1 种 → 共 2
+	// English: A: (0,2),(1,2) 2 variants; B: (0,1) 1 variant → 2 in total
 	ps := expandTemplate(tmpl, 5)
 	if len(ps) != 2 {
 		t.Fatalf("展开数=%d 期望 2", len(ps))

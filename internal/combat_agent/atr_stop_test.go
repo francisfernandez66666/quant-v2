@@ -1,4 +1,5 @@
 // C4 ATR 动态止损测试：ATR 止损距离计算、双凸 ATR 硬止损、CheckPositionsExits 端到端激活。
+// English: C4 ATR dynamic stop-loss tests: ATR stop distance calculation, double-bump ATR hard stop, and end-to-end activation through CheckPositionsExits.
 package combat_agent
 
 import (
@@ -13,22 +14,27 @@ import (
 )
 
 // TestATRStopPctUnit ATR 动态止损距离：启用时 ATR×mult/成本×100，否则回退固定百分比。
+// English: TestATRStopPctUnit ATR dynamic stop distance: when enabled, ATR×mult/cost×100; otherwise fall back to a fixed percentage.
 func TestATRStopPctUnit(t *testing.T) {
 	// 未启用（mult=0）→ 回退固定百分比
+	// English: Not enabled (mult=0) → fall back to the fixed percentage.
 	if got := (&strategy.ExitContext{CostPrice: 10, ATR: 0.4, ATRStopMult: 0}).ATRStopPct(8); got != 8 {
 		t.Fatalf("mult=0 应回退 8, got %.2f", got)
 	}
 	// ATR=0（日K不足）→ 回退固定百分比
+	// English: ATR=0 (insufficient daily K-lines) → fall back to the fixed percentage.
 	if got := (&strategy.ExitContext{CostPrice: 10, ATR: 0, ATRStopMult: 2.5}).ATRStopPct(8); got != 8 {
 		t.Fatalf("ATR=0 应回退 8, got %.2f", got)
 	}
 	// 启用：ATR=0.4 × 2.5 / 10 × 100 = 10%
+	// English: Enabled: ATR=0.4 × 2.5 / 10 × 100 = 10%.
 	if got := (&strategy.ExitContext{CostPrice: 10, ATR: 0.4, ATRStopMult: 2.5}).ATRStopPct(8); got != 10 {
 		t.Fatalf("ATR×2.5/10×100 应为 10, got %.2f", got)
 	}
 }
 
 // atrKlines 构造 20 根振幅约 1.6% 的日K（ATR≈0.16 → 2.5×ATR/10≈4% 止损距离）。
+// English: atrKlines builds 20 daily K-lines with amplitude of about 1.6% (ATR≈0.16 → 2.5×ATR/10≈4% stop distance).
 func atrKlines(base float64) []data.KLine {
 	now := time.Now()
 	ks := make([]data.KLine, 20)
@@ -45,6 +51,7 @@ func atrKlines(base float64) []data.KLine {
 
 // TestDoubleBumpATRHardStop 双凸 ATR 硬止损：ATR≈0.2、mult=2.5 → 止损距离≈5%；
 // 跌 6% 触发双凸ATR止损；未启用时仅固定 8% 阈值（跌 6% 不触发 ATR 分支）。
+// English: TestDoubleBumpATRHardStop double-bump ATR hard stop: ATR≈0.2, mult=2.5 → stop distance≈5%; a 6% drop triggers the double-bump ATR stop; when disabled only the fixed 8% threshold applies (a 6% drop does not trigger the ATR branch).
 func TestDoubleBumpATRHardStop(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())
@@ -70,6 +77,7 @@ func TestDoubleBumpATRHardStop(t *testing.T) {
 	}
 
 	// 未启用：跌 6% 未破固定 8% → 无 ATR 止损（双凸其他分支可能触发，过滤掉即视为通过）
+	// English: Not enabled: a 6% drop stays within the fixed 8% → no ATR stop (other double-bump branches may fire; filtering them out counts as passing).
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetATRStop(false, 2.5)
 	rpt2 := report.New(filepath.Join(t.TempDir(), "rpt2.json"))
@@ -84,6 +92,7 @@ func TestDoubleBumpATRHardStop(t *testing.T) {
 
 // TestDragonATRStopNarrowerThanFixed 龙头 ATR 止损：ATR≈0.2、mult=2.5 → 止损≈5%，
 // 比固定 8% 更紧：跌 6% 时 ATR 模式触发"买入回撤全出"，固定模式不触发。
+// English: TestDragonATRStopNarrowerThanFixed dragon ATR stop: ATR≈0.2, mult=2.5 → stop≈5%, tighter than the fixed 8%: on a 6% drop the ATR mode triggers "buy pullback full exit" while the fixed mode does not.
 func TestDragonATRStopNarrowerThanFixed(t *testing.T) {
 	cfg := config.NewManager("")
 	dc := cfg.GetStrategyConfig().Dragon
@@ -109,6 +118,7 @@ func TestDragonATRStopNarrowerThanFixed(t *testing.T) {
 	}
 
 	// 固定模式（ATR 关闭）：跌 6% 未破 8% → 无"买入回撤全出"
+	// English: Fixed mode (ATR off): a 6% drop stays within 8% → no "buy pullback full exit".
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetATRStop(false, 2.5)
 	rpt2 := report.New(filepath.Join(t.TempDir(), "dragon2.json"))

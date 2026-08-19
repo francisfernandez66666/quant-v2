@@ -1,9 +1,11 @@
 // 估值类因子：比率倒数形式（越大越"便宜"）。
+// English: Valuation factors: reciprocal form of ratios (larger means "cheaper").
 package factor
 
 import "math"
 
 // epTTM 市盈率 TTM 倒数（1/PE，>0 时有效）。
+// English: epTTM reciprocal of the TTM P/E ratio (1/PE, valid when > 0).
 func epTTM(s *StockSeries) []float64 {
 	out := make([]float64, s.Len())
 	for i := range out {
@@ -16,6 +18,7 @@ func epTTM(s *StockSeries) []float64 {
 }
 
 // bp 市净率倒数（1/PB）。
+// English: bp reciprocal of the price-to-book ratio (1/PB).
 func bp(s *StockSeries) []float64 {
 	out := make([]float64, s.Len())
 	for i := range out {
@@ -28,6 +31,7 @@ func bp(s *StockSeries) []float64 {
 }
 
 // spTTM 市销率 TTM 倒数（1/PS）。
+// English: spTTM reciprocal of the TTM price-to-sales ratio (1/PS).
 func spTTM(s *StockSeries) []float64 {
 	out := make([]float64, s.Len())
 	for i := range out {
@@ -40,6 +44,7 @@ func spTTM(s *StockSeries) []float64 {
 }
 
 // cfpTTM 市现率 TTM 倒数（1/PCF）。
+// English: cfpTTM reciprocal of the TTM price-to-cash-flow ratio (1/PCF).
 func cfpTTM(s *StockSeries) []float64 {
 	out := make([]float64, s.Len())
 	for i := range out {
@@ -52,6 +57,7 @@ func cfpTTM(s *StockSeries) []float64 {
 }
 
 // dp 股息率 TTM（%）。
+// English: dp TTM dividend yield (%).
 func dp(s *StockSeries) []float64 {
 	out := make([]float64, s.Len())
 	for i := range out {
@@ -61,6 +67,7 @@ func dp(s *StockSeries) []float64 {
 }
 
 // 估值类因子注册。
+// English: Registration of valuation factors.
 func init() {
 	Register(Def{ID: "EP_ttm", Name: "市盈率TTM倒数", Cat: CatValue, Desc: "1/PE_ttm，越大越便宜", Compute: epTTM})
 	Register(Def{ID: "BP", Name: "市净率倒数", Cat: CatValue, Desc: "1/PB，越大越便宜", Compute: bp})

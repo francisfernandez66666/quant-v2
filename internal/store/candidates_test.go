@@ -1,4 +1,5 @@
 // B5 候选库往返测试：建表 → 保存 → 列表 → 查询 → 状态流转。
+// English: B5 candidate store round-trip test: create table → save → list → query → status transition.
 package store
 
 import (
@@ -7,6 +8,7 @@ import (
 )
 
 // TestCandidates 验证 research_candidates 全流程（B5 自动研究闭环）。
+// English: TestCandidates verifies the full research_candidates flow (B5 automated research loop).
 func TestCandidates(t *testing.T) {
 	db := testDB(t)
 
@@ -26,6 +28,7 @@ func TestCandidates(t *testing.T) {
 	}
 
 	// 列表全部
+	// English: List all.
 	all, err := db.ListCandidates("")
 	if err != nil || len(all) != 1 {
 		t.Fatalf("ListCandidates 全部: n=%d err=%v", len(all), err)
@@ -35,6 +38,7 @@ func TestCandidates(t *testing.T) {
 	}
 
 	// 按状态过滤
+	// English: Filter by status.
 	if got, _ := db.ListCandidates("proposed"); len(got) != 1 {
 		t.Fatalf("ListCandidates proposed: n=%d", len(got))
 	}
@@ -43,12 +47,14 @@ func TestCandidates(t *testing.T) {
 	}
 
 	// 单条查询
+	// English: Query a single record.
 	c, err := db.CandidateByID(id)
 	if err != nil || c.ID != id || c.Kind != "weights" {
 		t.Fatalf("CandidateByID: %+v err=%v", c, err)
 	}
 
 	// 状态流转 proposed → applied
+	// English: Status transition proposed → applied.
 	if err := db.UpdateCandidateStatus(id, "applied"); err != nil {
 		t.Fatalf("UpdateCandidateStatus: %v", err)
 	}

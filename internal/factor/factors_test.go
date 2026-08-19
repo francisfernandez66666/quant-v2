@@ -6,6 +6,7 @@ import (
 )
 
 // TestValueFactors 估值类公式：倒数与股息率。
+// English: TestValueFactors value factors: reciprocals and dividend yield.
 func TestValueFactors(t *testing.T) {
 	s := &StockSeries{
 		Dates:  []string{"d0", "d1", "d2"},
@@ -16,9 +17,11 @@ func TestValueFactors(t *testing.T) {
 		DvTTM:  []float64{3.5, 0, 2},
 	}
 	// EP：PE>0 取倒数，否则 NaN
+	// English: EP: take reciprocal when PE>0, otherwise NaN.
 	got := mustGet(t, "EP_ttm").Compute(s)
 	approx(t, got, []float64{0.1, math.NaN(), math.NaN()})
 	// BP：PB>0 取倒数
+	// English: BP: take reciprocal when PB>0.
 	got = mustGet(t, "BP").Compute(s)
 	approx(t, got, []float64{0.5, math.NaN(), 0.25})
 	// SP
@@ -28,16 +31,18 @@ func TestValueFactors(t *testing.T) {
 	got = mustGet(t, "CFP_ttm").Compute(s)
 	approx(t, got, []float64{0.2, 0.2, math.NaN()})
 	// DP 直传
+	// English: DP passed through directly.
 	got = mustGet(t, "DP").Compute(s)
 	approx(t, got, []float64{3.5, 0, 2})
 }
 
 // TestGrowthFactors 成长类直传；缺失字段全 NaN。
+// English: TestGrowthFactors growth factors passed through; missing fields are all NaN.
 func TestGrowthFactors(t *testing.T) {
 	s := &StockSeries{
-		Dates:                []string{"d0", "d1", "d2"},
-		YoyNetProfit:         []float64{10, 20, 30},
-		SingleQuarterNIYoy:   []float64{5, 6, 7},
+		Dates:              []string{"d0", "d1", "d2"},
+		YoyNetProfit:       []float64{10, 20, 30},
+		SingleQuarterNIYoy: []float64{5, 6, 7},
 	}
 	approx(t, mustGet(t, "YoyNetProfit").Compute(s), []float64{10, 20, 30})
 	approx(t, mustGet(t, "SUE").Compute(s), []float64{5, 6, 7})
@@ -49,6 +54,7 @@ func TestGrowthFactors(t *testing.T) {
 }
 
 // TestQualityFactors 质量类直传。
+// English: TestQualityFactors quality factors passed through directly.
 func TestQualityFactors(t *testing.T) {
 	s := &StockSeries{
 		Dates:        []string{"d0"},
@@ -64,6 +70,7 @@ func TestQualityFactors(t *testing.T) {
 }
 
 // TestSizeFactor 对数市值 = ln(原始价×股本)。
+// English: TestSizeFactor log market cap = ln(raw price × share count).
 func TestSizeFactor(t *testing.T) {
 	s := &StockSeries{
 		Dates:      []string{"d0", "d1"},
@@ -77,6 +84,7 @@ func TestSizeFactor(t *testing.T) {
 		t.Fatalf("LnMktCap 不符: %v", got)
 	}
 	// 价格缺失 → NaN
+	// English: Missing price → NaN.
 	bad := &StockSeries{Dates: []string{"d0"}, CloseRaw: []float64{0}, TotalShare: []float64{1e8}}
 	if !math.IsNaN(mustGet(t, "LnMktCap").Compute(bad)[0]) {
 		t.Fatalf("无价应 NaN")
@@ -84,8 +92,10 @@ func TestSizeFactor(t *testing.T) {
 }
 
 // TestMomentumFactors 动量 = close[i]/close[i−n]−1，预热期 NaN。
+// English: TestMomentumFactors momentum = close[i]/close[i−n]−1, NaN during warm-up.
 func TestMomentumFactors(t *testing.T) {
 	// 收盘 10..16，7 根
+	// English: Closes 10..16, 7 bars.
 	closes := []float64{10, 11, 12, 13, 14, 15, 16}
 	s := &StockSeries{Dates: []string{"0", "1", "2", "3", "4", "5", "6"}, CloseHfq: closes}
 	got := mustGet(t, "Mom5").Compute(s)
@@ -94,8 +104,10 @@ func TestMomentumFactors(t *testing.T) {
 }
 
 // TestVolatilityFactors 波动率：恒定序列为 0；振幅手算。
+// English: TestVolatilityFactors volatility: constant series is 0; amplitude computed by hand.
 func TestVolatilityFactors(t *testing.T) {
 	// 恒定收盘 → 对数收益 0 → 波动率 0
+	// English: Constant closes → log return 0 → volatility 0.
 	const30 := make([]float64, 30)
 	dates := make([]string, 30)
 	for i := range const30 {
@@ -108,11 +120,13 @@ func TestVolatilityFactors(t *testing.T) {
 		t.Fatalf("恒定序列波动率应 0: got[18]=%v got[29]=%v", got[18], got[29])
 	}
 	// 振幅：20 日均值 (H−L)/C。构造 21 根，末值 = 均值。
+	// English: Amplitude: 20-day mean of (H−L)/C. Build 21 bars, last value = mean.
 	amp := make([]float64, 21)
 	h, l, c := make([]float64, 21), make([]float64, 21), make([]float64, 21)
 	ds := make([]string, 21)
 	for i := range amp {
 		// 每根 (H−L)/C = 0.04 + i*0.001
+		// English: Each bar (H−L)/C = 0.04 + i*0.001.
 		c[i] = 100
 		half := (0.04 + float64(i)*0.001) * 100 / 2
 		h[i], l[i] = 100+half, 100-half
@@ -121,6 +135,7 @@ func TestVolatilityFactors(t *testing.T) {
 	s = &StockSeries{Dates: ds, CloseHfq: c, High: h, Low: l}
 	got = mustGet(t, "Amplitude20").Compute(s)
 	// 末 20 根的均值
+	// English: Mean of the last 20 bars.
 	var sum float64
 	for i := 1; i < 21; i++ {
 		sum += 0.04 + float64(i)*0.001
@@ -132,6 +147,7 @@ func TestVolatilityFactors(t *testing.T) {
 }
 
 // TestLiquidityFactors 流动性：STO/STOA/Amihud 手算。
+// English: TestLiquidityFactors liquidity: STO/STOA/Amihud computed by hand.
 func TestLiquidityFactors(t *testing.T) {
 	n := 21
 	dates := make([]string, n)
@@ -146,16 +162,19 @@ func TestLiquidityFactors(t *testing.T) {
 	}
 	s := &StockSeries{Dates: dates, Turnover: turn, Amount: amount, CloseHfq: closeH}
 	// STO20 = 恒 2
+	// English: STO20 = constant 2.
 	got := mustGet(t, "STO20").Compute(s)
 	if math.Abs(got[20]-2) > 1e-12 {
 		t.Fatalf("STO20 应 2，得 %v", got[20])
 	}
 	// STOA = ln(1000)
+	// English: STOA = ln(1000).
 	got = mustGet(t, "STOA").Compute(s)
 	if math.Abs(got[20]-math.Log(1000)) > 1e-9 {
 		t.Fatalf("STOA 应 %v，得 %v", math.Log(1000), got[20])
 	}
 	// Amihud：|r|/amount 每根 = |1/close[i-1]|/1000；末 20 均值
+	// English: Amihud: per-bar |r|/amount = |1/close[i-1]|/1000; mean of last 20.
 	var sum float64
 	for i := 1; i < n; i++ {
 		sum += math.Abs(closeH[i]/closeH[i-1]-1) / amount[i]
@@ -171,6 +190,7 @@ func itoa(i int) string {
 }
 
 // mustGet 取注册因子（不存在则测试失败）。
+// English: mustGet returns the registered factor (fails the test if not present).
 func mustGet(t *testing.T, id string) Def {
 	t.Helper()
 	d, ok := Get(id)

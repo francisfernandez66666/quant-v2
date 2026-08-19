@@ -6,6 +6,7 @@ import (
 )
 
 // TestMACDGolden 校验 MACD(12,26,9) 的 DIF/DEA/Bar 与 golden 数据。
+// English: TestMACDGolden verifies MACD(12,26,9) DIF/DEA/Bar against golden data.
 func TestMACDGolden(t *testing.T) {
 	g := loadGolden(t)
 	got := MACDDefault(g["close"])
@@ -30,6 +31,7 @@ func TestMACDGolden(t *testing.T) {
 }
 
 // TestMACDBarRelation 校验柱状图恒等关系 Bar=2×(DIF−DEA)。
+// English: TestMACDBarRelation verifies the histogram identity Bar=2×(DIF−DEA).
 func TestMACDBarRelation(t *testing.T) {
 	g := loadGolden(t)
 	got := MACDDefault(g["close"])
@@ -42,6 +44,7 @@ func TestMACDBarRelation(t *testing.T) {
 }
 
 // TestMACDEdge 边界：长度不足 slow（26）应全 NaN；参数非法应全 NaN。
+// English: TestMACDEdge edge cases: length below slow (26) should be all NaN; invalid parameters should be all NaN.
 func TestMACDEdge(t *testing.T) {
 	short := make([]float64, 10)
 	got := MACDDefault(short)

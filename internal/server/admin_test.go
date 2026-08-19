@@ -1,4 +1,5 @@
 // 用户/账号管理端点测试：admin 中间件鉴权、开户、改角色/权限/密码/启禁用、代配配置。
+// English: User/account management endpoint tests: admin middleware auth, create account, change role/perms/password/enable-disable, configure on behalf of others.
 package server
 
 import (
@@ -14,6 +15,7 @@ import (
 )
 
 // newAdminTestServer 构建带认证 + 配置管理器的 Server，用于 admin 端点测试。
+// English: newAdminTestServer builds a Server with auth + config manager for admin endpoint tests.
 func newAdminTestServer(t *testing.T) (*Server, *auth.User) {
 	t.Helper()
 	dir := t.TempDir()
@@ -34,6 +36,8 @@ func newAdminTestServer(t *testing.T) (*Server, *auth.User) {
 
 // adminReq 构造带管理员 token 的请求并注入认证上下文。
 // 注意：不走真实中间件，而是直接向请求上下文注入 user（等价于 authMiddleware 的产物）。
+// English: adminReq builds a request with an admin token and injects the auth context.
+// English: Note: it does not go through the real middleware; instead it injects user directly into the request context (equivalent to the output of authMiddleware).
 func adminReq(s *Server, u *auth.User, method, path string, body string) *http.Request {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+u.Token)
@@ -43,6 +47,7 @@ func adminReq(s *Server, u *auth.User, method, path string, body string) *http.R
 }
 
 // adminDo 走 Server.mux 完整路由执行请求，返回 recorder。
+// English: adminDo executes the request through the full Server.mux routes and returns the recorder.
 func adminDo(s *Server, req *http.Request) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
 	s.mux.ServeHTTP(rr, req)
@@ -50,6 +55,7 @@ func adminDo(s *Server, req *http.Request) *httptest.ResponseRecorder {
 }
 
 // TestAdminMiddlewareBlocksNonAdmin 非管理员访问 admin 端点应 403。
+// English: TestAdminMiddlewareBlocksNonAdmin non-admin access to admin endpoints should return 403.
 func TestAdminMiddlewareBlocksNonAdmin(t *testing.T) {
 	s, admin := newAdminTestServer(t)
 	normal, _ := s.auth.CreateUser("user1", "pw", "", nil, 0)

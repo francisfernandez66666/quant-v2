@@ -1,4 +1,5 @@
 // 因子验证报告：JSON 数据 + HTML 展示。
+// English: factor validation report: JSON data + HTML display.
 package research
 
 import (
@@ -13,26 +14,38 @@ import (
 )
 
 // FactorReport 单因子的验证汇总（供 B3 cmd/research 输出）。
+// English: FactorReport aggregates one factor's validation for the B3 tool output.
 // （FactorReport aggregates one factor's validation for the B3 tool output.）
 type FactorReport struct {
-	ID          string          `json:"id"`
-	Name        string          `json:"name"`
-	Category    string          `json:"category"`
-	Start       string          `json:"start"`
-	End         string          `json:"end"`
-	Horizon     int             `json:"horizon"`     // 前瞻天数
-	Quantiles   int             `json:"quantiles"`   // 分层数
-	MinStocks   int             `json:"min_stocks"`  // 每日最小样本
-	IC          []ICRow         `json:"ic"`          // 逐日 IC
-	ICMean      float64         `json:"ic_mean"`     // IC 均值
-	ICStd       float64         `json:"ic_std"`      // IC 标准差
-	IR          float64         `json:"ir"`          // 信息比率
-	Layers      []LayerSummary  `json:"layers"`      // 分层收益
-	Monotonic   bool            `json:"monotonic"`   // 是否单调
-	MonotonicDir int            `json:"monotonic_dir"` // +1 递增 / -1 递减 / 0 无
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Category string `json:"category"`
+	Start    string `json:"start"`
+	End      string `json:"end"`
+	Horizon  int    `json:"horizon"` // 前瞻天数
+	// English: forward horizon in days.
+	Quantiles int `json:"quantiles"` // 分层数
+	// English: number of quantiles.
+	MinStocks int `json:"min_stocks"` // 每日最小样本
+	// English: minimum daily sample.
+	IC []ICRow `json:"ic"` // 逐日 IC
+	// English: daily IC.
+	ICMean float64 `json:"ic_mean"` // IC 均值
+	// English: IC mean.
+	ICStd float64 `json:"ic_std"` // IC 标准差
+	// English: IC standard deviation.
+	IR float64 `json:"ir"` // 信息比率
+	// English: information ratio.
+	Layers []LayerSummary `json:"layers"` // 分层收益
+	// English: layer returns.
+	Monotonic bool `json:"monotonic"` // 是否单调
+	// English: whether monotonic.
+	MonotonicDir int `json:"monotonic_dir"` // +1 递增 / -1 递减 / 0 无
+	// English: +1 increasing / -1 decreasing / 0 none.
 }
 
 // Summarize 对单个因子做完整验证汇总。
+// English: Summarize runs the full validation pipeline for one factor.
 // （Summarize runs the full validation pipeline for one factor.）
 func Summarize(panels []*Panel, d factor.Def, start, end string, h, quantiles, minStocks int) *FactorReport {
 	ics := ICByDate(panels, d.ID, h, minStocks)
@@ -41,7 +54,7 @@ func Summarize(panels []*Panel, d factor.Def, start, end string, h, quantiles, m
 	return &FactorReport{
 		ID: d.ID, Name: d.Name, Category: d.Cat.CategoryName(),
 		Start: start, End: end, Horizon: h, Quantiles: quantiles, MinStocks: minStocks,
-		IC: ics,
+		IC:     ics,
 		ICMean: meanIC(ics), ICStd: stdIC(ics), IR: IR(ics),
 		Layers: layers, Monotonic: mono, MonotonicDir: dir,
 	}
@@ -72,12 +85,14 @@ func stdIC(rows []ICRow) float64 {
 }
 
 // JSONReport 序列化报告列表为 JSON（NaN 输出为 null）。
+// English: JSONReport marshals factor reports to JSON, writing NaN as null.
 // （JSONReport marshals factor reports to JSON, writing NaN as null.）
 func JSONReport(reports []*FactorReport) ([]byte, error) {
 	return json.MarshalIndent(reports, "", "  ")
 }
 
 // fptr 把 NaN 转为 nil（JSON null），其余取地址。
+// English: fptr converts NaN to nil (JSON null) and takes the address otherwise.
 func fptr(v float64) *float64 {
 	if isNaN(v) {
 		return nil
@@ -86,6 +101,7 @@ func fptr(v float64) *float64 {
 }
 
 // MarshalJSON NaN→null 适配（Go 原生 JSON 无法编码 NaN）。
+// English: MarshalJSON adapts NaN to null (Go's native JSON cannot encode NaN).
 type icRowJSON struct {
 	Date string
 	N    int
@@ -132,8 +148,10 @@ func (r *FactorReport) MarshalJSON() ([]byte, error) {
 }
 
 // renderHTML 用内嵌模板渲染报告 HTML（自包含，无外部依赖）。
+// English: renderHTML renders the report HTML with an inline template (self-contained, no external dependencies).
 func renderHTML(reports []*FactorReport) ([]byte, error) {
 	// 按 |IR| 降序汇总表
+	// English: summary table sorted by |IR| descending.
 	sorted := make([]*FactorReport, len(reports))
 	copy(sorted, reports)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -162,6 +180,7 @@ func abs(v float64) float64 {
 }
 
 // HTMLReport 渲染报告 HTML。
+// English: HTMLReport renders the factor report as a self-contained HTML page.
 // （HTMLReport renders the factor report as a self-contained HTML page.）
 func HTMLReport(reports []*FactorReport) ([]byte, error) {
 	return renderHTML(reports)

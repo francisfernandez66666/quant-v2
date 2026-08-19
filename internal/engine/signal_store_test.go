@@ -11,6 +11,7 @@ import (
 )
 
 // mkBuySig 构造一个做多交易信号（含生成时间）。
+// English: mkBuySig constructs a long trade signal (including the generation time).
 func mkBuySig(code, strategy string, at time.Time) combat_agent.Signal {
 	return combat_agent.Signal{
 		ID:          code + "@" + strategy,
@@ -28,6 +29,8 @@ func mkBuySig(code, strategy string, at time.Time) combat_agent.Signal {
 
 // TestSignalStoreInvalidateTombstone 验证失效墓碑核心行为：
 // 打墓碑后信号移出固化列表，同日同一 code@strategy 再次 Upsert 也不会复活。
+// English: TestSignalStoreInvalidateTombstone verifies the core tombstone behavior:
+// after tombstoning, the signal leaves the persisted list, and a same-day Upsert of the same code@strategy does not revive it.
 func TestSignalStoreInvalidateTombstone(t *testing.T) {
 	s := newSignalStore("")
 	at := time.Now()
@@ -46,6 +49,7 @@ func TestSignalStoreInvalidateTombstone(t *testing.T) {
 	}
 
 	// 同日再次出现同一 key 的 Pass 信号 → 被墓碑拦截，不复活
+	// English: A Pass signal for the same key reappearing the same day → blocked by the tombstone, not revived.
 	s.Upsert([]combat_agent.Signal{mkBuySig("600001", "n_shape", at.Add(10*time.Second))})
 	if len(s.List()) != 0 {
 		t.Fatalf("墓碑后同 key 不应复活, got %+v", s.List())
@@ -53,6 +57,7 @@ func TestSignalStoreInvalidateTombstone(t *testing.T) {
 }
 
 // TestSignalStoreInvalidateOtherKeysUnaffected 验证墓碑只作用单只股票单战法，其他信号不受影响。
+// English: TestSignalStoreInvalidateOtherKeysUnaffected verifies the tombstone only affects a single stock and single strategy; other signals are unaffected.
 func TestSignalStoreInvalidateOtherKeysUnaffected(t *testing.T) {
 	s := newSignalStore("")
 	at := time.Now()
@@ -70,6 +75,7 @@ func TestSignalStoreInvalidateOtherKeysUnaffected(t *testing.T) {
 }
 
 // TestSignalStoreInvalidatePersistsAcrossReload 验证墓碑跨重启持久化：重载后同日仍不复活。
+// English: TestSignalStoreInvalidatePersistsAcrossReload verifies the tombstone persists across restarts: same day still not revived after reload.
 func TestSignalStoreInvalidatePersistsAcrossReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "signals.json")
 	at := time.Now()
@@ -89,6 +95,7 @@ func TestSignalStoreInvalidatePersistsAcrossReload(t *testing.T) {
 }
 
 // invalidateTestEngine 组装 invalidateBrokenSignals 所需的最小 Engine（固化存储 + 消息中心）。
+// English: invalidateTestEngine builds the minimal Engine required by invalidateBrokenSignals (persisted store + message center).
 func invalidateTestEngine() *Engine {
 	return &Engine{
 		signalStore: newSignalStore(""),
@@ -98,6 +105,8 @@ func invalidateTestEngine() *Engine {
 
 // TestInvalidateBrokenSignalsRemovesBelowTrigger 验证失效墓碑：现价跌破触发价 → 移出固化、
 // 删除消息中心条目并记录墓碑（同日不复活）。
+// English: TestInvalidateBrokenSignalsRemovesBelowTrigger verifies the invalidation tombstone: current price below trigger → removed from persisted,
+// message-center entry deleted and tombstone recorded (not revived same day).
 func TestInvalidateBrokenSignalsRemovesBelowTrigger(t *testing.T) {
 	e := invalidateTestEngine()
 	at := time.Now()
@@ -123,6 +132,7 @@ func TestInvalidateBrokenSignalsRemovesBelowTrigger(t *testing.T) {
 }
 
 // TestInvalidateBrokenSignalsKeepsAboveTrigger 验证现价未跌破触发价 → 信号保持有效。
+// English: TestInvalidateBrokenSignalsKeepsAboveTrigger verifies that when the current price has not fallen below the trigger → the signal stays valid.
 func TestInvalidateBrokenSignalsKeepsAboveTrigger(t *testing.T) {
 	e := invalidateTestEngine()
 	at := time.Now()
@@ -143,6 +153,8 @@ func TestInvalidateBrokenSignalsKeepsAboveTrigger(t *testing.T) {
 
 // TestInvalidateBrokenSignalsSkipsShortAndMissing 验证：做空信号不受墓碑影响；
 // 行情缺失/价格无效时跳过（不误删），留待下一轮有数据再判。
+// English: TestInvalidateBrokenSignalsSkipsShortAndMissing verifies: short signals are not affected by the tombstone;
+// missing quotes / invalid prices are skipped (no wrongful deletion), left to be judged next round when data is available.
 func TestInvalidateBrokenSignalsSkipsShortAndMissing(t *testing.T) {
 	e := invalidateTestEngine()
 	at := time.Now()
@@ -152,6 +164,7 @@ func TestInvalidateBrokenSignalsSkipsShortAndMissing(t *testing.T) {
 	e.signalStore.Upsert([]combat_agent.Signal{long, short})
 
 	// 600002 无行情（不在 md 中）；600001 有行情但价格无效
+	// English: 600002 has no quotes (not in md); 600001 has quotes but an invalid price.
 	md := map[string]*strategy_engine.StockMarketData{
 		"600001": {Code: "600001", Quote: &data.StockInfo{Price: 0}},
 	}

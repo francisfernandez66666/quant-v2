@@ -1,6 +1,9 @@
 // Package data — 宏观事件日历生成器
 // 自动生成 FOMC/CPI/非农/核心PCE/股指期货交割日等定期事件，
 // 支持从 rules.json 补充自定义事件，地缘冲突由 D1 新闻匹配实时识别。
+// English: Package data — macro-event calendar generator.
+// English: Auto-generates recurring events such as FOMC/CPI/NFP/core-PCE/index-futures delivery days;
+// English: supports extra custom events from rules.json; geopolitical conflicts are identified live via D1 news matching.
 
 package data
 
@@ -16,6 +19,7 @@ import (
 )
 
 // MacroEvent 宏观事件定义
+// English: MacroEvent defines a macro event.
 type MacroEvent struct {
 	Date     time.Time `json:"date"`      // 事件日期
 	Title    string    `json:"title"`     // 事件标题
@@ -23,14 +27,20 @@ type MacroEvent struct {
 	Impact   string    `json:"impact"`    // 影响程度（high/medium/low）
 	Duration int       `json:"duration"`  // 影响期天数（事件日前/后各 Duration 天为影响期）
 	DaysLeft int       `json:"days_left"` // 距离事件结束的剩余天数（由筛选逻辑计算）
+	// English: Date: event date; Title: event title; Level: event type (fomc/cpi/nfp/pce/contract/war);
+	// English: Impact: impact level (high/medium/low); Duration: impact-period days (Duration days before/after the event date);
+	// English: DaysLeft: remaining days until the event ends (computed by the filter logic).
 }
 
 // GenMacroEvents 生成指定年份的全部宏观事件
 // supplement 从 rules.json 读取的补充事件，会合并到结果中
+// English: GenMacroEvents generates all macro events for a given year.
+// English: supplement holds custom events read from rules.json, merged into the result.
 func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 	var events []MacroEvent
 
 	// FOMC 会议（2026年已知会议日期）
+	// English: FOMC meetings (known 2026 meeting dates).
 	fomcDates := []struct {
 		m, d int
 		note string
@@ -52,6 +62,7 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 	}
 
 	// 非农 (NFP): 每月第一个周五
+	// English: Nonfarm payrolls (NFP): the first Friday of each month.
 	firstFri := func(y int, m time.Month) time.Time {
 		d := time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
 		for d.Weekday() != time.Friday {
@@ -68,6 +79,7 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 	}
 
 	// CPI: 每月 10-15 日之间发布（取 13 日为估计值）
+	// English: CPI: released between the 10th and 15th of each month (day 13 used as estimate).
 	for m := 1; m <= 12; m++ {
 		d := time.Date(year, time.Month(m), 13, 0, 0, 0, 0, time.UTC)
 		events = append(events, MacroEvent{
@@ -77,6 +89,7 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 	}
 
 	// 核心 PCE: 每月最后一天
+	// English: Core PCE: the last day of each month.
 	for m := 1; m <= 12; m++ {
 		first := time.Date(year, time.Month(m), 1, 0, 0, 0, 0, time.UTC)
 		last := first.AddDate(0, 1, -1)
@@ -87,12 +100,14 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 	}
 
 	// 股指期货交割日: 每月第三个周五
+	// English: Index-futures delivery day: the third Friday of each month.
 	thirdFri := func(y int, m time.Month) time.Time {
 		d := time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
 		for d.Weekday() != time.Friday {
 			d = d.AddDate(0, 0, 1)
 		}
 		return d.AddDate(0, 0, 14) // 第1个周五+14天=第3个周五
+		// English: 1st Friday + 14 days = 3rd Friday.
 	}
 	for m := 1; m <= 12; m++ {
 		d := thirdFri(year, time.Month(m))
@@ -103,9 +118,12 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 	}
 
 	// 合并 rules.json 补充事件
+	// English: Merge supplementary events from rules.json.
 	for title, impact := range supplement {
 		// supplement 格式: "date|impact|duration" 或 "date|impact"
 		// 简化处理: 直接使用 title 作为描述，impact 为级别
+		// English: supplement format: "date|impact|duration" or "date|impact".
+		// English: Simplified: use title directly as the description, impact as the level.
 		_ = title
 		_ = impact
 	}
@@ -115,6 +133,8 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 
 // AddGeopoliticalEvent 从新闻标题注入战争/地缘事件。
 // 标题中包含 geopolitical 关键词时触发，Duration=0（不设限）。
+// English: AddGeopoliticalEvent injects war/geopolitical events from news titles.
+// English: Triggered when the title contains geopolitical keywords; Duration=0 (no window).
 func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 	if title == "" {
 		return
@@ -122,6 +142,7 @@ func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 	for _, e := range *events {
 		if e.Level == "war" && e.Title == title {
 			return // 已存在，去重
+			// English: Already exists, dedup.
 		}
 	}
 	*events = append(*events, MacroEvent{
@@ -137,6 +158,9 @@ func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 // GetActiveMacroEvents 筛选 now 时刻处于"影响期"或未来 7 天内即将发生的宏观事件。
 // 影响期 = 事件日前 Duration 天至事件日后 Duration 天；
 // 返回按优先级（war > contract > fomc > pce > cpi > nfp > other）降序排列。
+// English: GetActiveMacroEvents filters events within their "impact period" at now or due within the next 7 days.
+// English: Impact period = Duration days before to Duration days after the event date.
+// English: Returns sorted by priority (war > contract > fomc > pce > cpi > nfp > other) descending.
 func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
 	var active []MacroEvent
 
@@ -154,6 +178,7 @@ func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
 		before := e.Date.AddDate(0, 0, -e.Duration)
 		after := e.Date.AddDate(0, 0, e.Duration)
 		// 当前在影响期内，或未来7天内即将发生
+		// English: Currently in the impact period, or due within the next 7 days.
 		inRange := (now.After(before) && now.Before(after.AddDate(0, 0, 1))) ||
 			(now.Before(e.Date) && e.Date.Sub(now).Hours() <= 168)
 		if inRange {
@@ -163,6 +188,7 @@ func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
 	}
 
 	// 按优先级排序
+	// English: Sort by priority.
 	for i := 0; i < len(active); i++ {
 		for j := i + 1; j < len(active); j++ {
 			if priority[active[i].Level] < priority[active[j].Level] {
@@ -175,6 +201,8 @@ func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
 
 // MacroEventDesc 生成宏观事件描述文本（用于嵌入信号消息）
 // 例如："背景：美联储7月议息会议影响期(剩余2天) | 股指期货交割日(进行中)"
+// English: MacroEventDesc builds macro-event description text (for embedding in signal messages).
+// English: E.g. "Background: Fed July FOMC meeting impact period (2 days left) | Index-futures delivery day (ongoing)".
 func MacroEventDesc(events []MacroEvent) string {
 	if len(events) == 0 {
 		return ""
@@ -197,6 +225,7 @@ func MacroEventDesc(events []MacroEvent) string {
 }
 
 // monthCN 将月份数字（1-12）转为中文月名（如 1 → "1月"），越界返回空串。
+// English: monthCN converts a month number (1-12) to a Chinese month name (e.g. 1 → "1月"); returns empty string out of range.
 func monthCN(m int) string {
 	names := []string{"", "1月", "2月", "3月", "4月", "5月", "6月",
 		"7月", "8月", "9月", "10月", "11月", "12月"}
@@ -207,6 +236,7 @@ func monthCN(m int) string {
 }
 
 // itoa 将整数转为十进制字符串（避免引入 strconv 依赖，支持负数）。
+// English: itoa converts an integer to a decimal string (avoids a strconv dependency, supports negatives).
 func itoa(i int) string {
 	if i == 0 {
 		return "0"
@@ -227,15 +257,19 @@ func itoa(i int) string {
 }
 
 // ExternalEvent 外部日历API返回的单条事件（标准JSON格式）
+// English: ExternalEvent is a single event returned by an external calendar API (standard JSON format).
 type ExternalEvent struct {
 	Date   string `json:"date"`   // YYYY-MM-DD
 	Title  string `json:"title"`  // 事件标题
 	Impact string `json:"impact"` // high/medium/low
 	Level  string `json:"level"`  // 事件类型(可选): fomc/cpi/nfp/pce/contract
+	// English: Date: YYYY-MM-DD; Title: event title; Impact: high/medium/low; Level: event type (optional): fomc/cpi/nfp/pce/contract.
 }
 
 // FetchCalendarFromAPI 从外部API获取宏观事件列表。
 // url为空或请求失败时返回nil。
+// English: FetchCalendarFromAPI fetches the macro-event list from an external API.
+// English: Returns nil when url is empty or the request fails.
 func FetchCalendarFromAPI(apiURL string) []ExternalEvent {
 	if apiURL == "" {
 		return nil
@@ -253,10 +287,12 @@ func FetchCalendarFromAPI(apiURL string) []ExternalEvent {
 		return nil
 	}
 	// 尝试解析为JSON数组
+	// English: Try to parse as a JSON array.
 	var events []ExternalEvent
 	if err := json.Unmarshal(body, &events); err != nil {
 		log.Printf("宏观日历API解析失败(%s): %v", apiURL, err)
 		// 如果外部API不可用，回退到算法生成
+		// English: If the external API is unavailable, fall back to algorithmic generation.
 		return nil
 	}
 	log.Printf("宏观日历API成功: %d条事件 (%s)", len(events), apiURL)
@@ -264,6 +300,7 @@ func FetchCalendarFromAPI(apiURL string) []ExternalEvent {
 }
 
 // minInt 整数取小
+// English: minInt returns the smaller of two integers.
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -272,9 +309,11 @@ func minInt(a, b int) int {
 }
 
 // ChatFunc 通用 LLM 聊天函数签名，避免 calendar 包直接依赖 llm 包
+// English: ChatFunc is a generic LLM chat function signature, avoiding a direct dependency of the calendar package on the llm package.
 type ChatFunc func(system, user string) (string, error)
 
 // LLMCalendarPrompt 生成日历专属的 system+user prompt
+// English: LLMCalendarPrompt generates the calendar-specific system+user prompt.
 func LLMCalendarPrompt(months int) (string, string) {
 	now := time.Now()
 	end := now.AddDate(0, months, 0)
@@ -292,6 +331,7 @@ func LLMCalendarPrompt(months int) (string, string) {
 }
 
 // FetchCalendarFromLLM 用LLM生成宏观事件日历
+// English: FetchCalendarFromLLM generates the macro-event calendar using an LLM.
 func FetchCalendarFromLLM(chat ChatFunc, months int) []ExternalEvent {
 	system, user := LLMCalendarPrompt(months)
 	reply, err := chat(system, user)
@@ -310,6 +350,7 @@ func FetchCalendarFromLLM(chat ChatFunc, months int) []ExternalEvent {
 }
 
 // EventResult 宏观事件发布结果
+// English: EventResult is the published result of a macro event.
 type EventResult struct {
 	Title     string `json:"title"`     // 事件标题
 	Value     string `json:"value"`     // 实际公布值
@@ -317,9 +358,13 @@ type EventResult struct {
 	Compare   string `json:"compare"`   // 对比结果（高于预期/低于预期/符合预期）
 	Sentiment string `json:"sentiment"` // 市场影响（利好/利空/中性）
 	Summary   string `json:"summary"`   // 一句话总结
+	// English: Title: event title; Value: actual published value; Expect: expected value;
+	// English: Compare: comparison result (above/below/in line with expectations);
+	// English: Sentiment: market impact (bullish/bearish/neutral); Summary: one-line summary.
 }
 
 // FetchEventResult 查询已发生宏观事件的真实数据结果
+// English: FetchEventResult queries the real published result of an already-occurred macro event.
 func FetchEventResult(chat ChatFunc, title, date string) *EventResult {
 	system := "你是一个宏观数据助手。查询指定事件的真实发布结果。返回纯JSON。"
 	user := "查询以下宏观事件的实际公布结果：\n事件：" + title + "\n日期：" + date + "\n\n" +
@@ -341,6 +386,7 @@ func FetchEventResult(chat ChatFunc, title, date string) *EventResult {
 }
 
 // cleanJSONBlock 从LLM回复中提取纯JSON（去除markdown代码块等）
+// English: cleanJSONBlock extracts pure JSON from an LLM reply (strips markdown code fences etc.).
 func cleanJSONBlock(s string) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "```") {
@@ -356,12 +402,15 @@ func cleanJSONBlock(s string) string {
 }
 
 // CalendarCacheFile 日历缓存文件格式
+// English: CalendarCacheFile is the calendar cache file format.
 type CalendarCacheFile struct {
 	Date   string       `json:"date"`   // 缓存日期 YYYY-MM-DD
 	Events []MacroEvent `json:"events"` // 事件列表
+	// English: Date: cache date YYYY-MM-DD; Events: event list.
 }
 
 // SaveCalendarCache 将日历事件缓存到文件
+// English: SaveCalendarCache writes the calendar events to a cache file.
 func SaveCalendarCache(filePath string, events []MacroEvent) error {
 	cached := CalendarCacheFile{
 		Date:   time.Now().Format("2006-01-02"),
@@ -376,6 +425,8 @@ func SaveCalendarCache(filePath string, events []MacroEvent) error {
 
 // LoadCalendarCache 从文件加载日历缓存（仅当天有效）
 // 返回 events 和 ok；缓存不存在或日期不匹配时 ok=false
+// English: LoadCalendarCache loads the calendar cache from a file (valid only for the current day).
+// English: Returns events and ok; ok=false when the cache is missing or the date does not match.
 func LoadCalendarCache(filePath string) (events []MacroEvent, ok bool) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -387,6 +438,7 @@ func LoadCalendarCache(filePath string) (events []MacroEvent, ok bool) {
 	}
 	if cached.Date != time.Now().Format("2006-01-02") {
 		return nil, false // 缓存过期
+		// English: Cache expired.
 	}
 	return cached.Events, true
 }

@@ -1,5 +1,7 @@
 // Package data — 市场情绪六阶段检测。
 // 基于涨停家数、炸板率两个核心指标将市场分为六个情绪阶段。
+// English: Package data — market sentiment six-phase detection.
+// English: Classifies the market into six sentiment phases using two core metrics: limit-up count and blast-out rate.
 package data
 
 import "quant-trading-v2/internal/config"
@@ -8,6 +10,10 @@ import "quant-trading-v2/internal/config"
 // 返回与 N 形策略评分器兼容的中文阶段名称：
 // "冰点" / "启动" / "发酵" / "高潮" / "背离" / "退潮"
 // 判定逻辑来自 rules.json 中的 EmotionConfig 阈值。
+// English: DetectEmotionPhase computes the market sentiment phase from a quote snapshot.
+// English: Returns Chinese phase names compatible with the N-shaped strategy scorer:
+// English: "freeze" / "start" / "ferment" / "climax" / "divergence" / "retreat".
+// English: The rules come from the EmotionConfig thresholds in rules.json.
 func DetectEmotionPhase(snap *MarketSnapshot, cfg *config.EmotionConfig) string {
 	if snap == nil || len(snap.Stocks) == 0 {
 		return "启动"
@@ -23,6 +29,7 @@ func DetectEmotionPhase(snap *MarketSnapshot, cfg *config.EmotionConfig) string 
 			limitUpCnt++
 		}
 		// 触及涨停但未封住：最高>=9.5% 但当前涨幅<5%
+		// English: Touched limit-up but not sealed: high>=9.5% but current change<5%.
 		if si.High >= 9.5 && si.ChangePct < 5.0 {
 			blastCnt++
 		}
@@ -64,12 +71,18 @@ func DetectEmotionPhase(snap *MarketSnapshot, cfg *config.EmotionConfig) string 
 // 输入为当日东财涨停池（涨停家数 + 最高连板高度），配合涨跌家数辅助修正。
 // 六个阶段：冰点 / 启动 / 发酵 / 高潮 / 背离 / 退潮。
 // 涨停池为空且涨跌家数未知（upCount=0）时返回"启动"（数据缺失兜底）。
+// English: DetectEmotionPhaseV2 determines the sentiment phase from the real limit-up pool (upgraded version).
+// English: Input is the day's EastMoney limit-up pool (limit-up count + max consecutive-board height), corrected by up/down counts.
+// English: Six phases: freeze / start / ferment / climax / divergence / retreat.
+// English: Returns "start" when the pool is empty and up/down counts are unknown (upCount=0) as a data-missing fallback.
 func DetectEmotionPhaseV2(pool []LimitUpStock, upCount, downCount int, cfg *config.EmotionConfig) string {
 	if len(pool) == 0 {
 		return "启动" // 数据缺失（盘前/接口异常）不判冰点，保守归"启动"
+		// English: Data missing (pre-market/API error): don't judge freeze, conservatively return "start".
 	}
 	limitUpCnt := len(pool)
 	maxBoard := 0 // 最高连板数（涨停池中 LianBan 的最大值）
+	// English: Max consecutive-board count (max of LianBan in the limit-up pool).
 	for _, s := range pool {
 		if s.LianBan > maxBoard {
 			maxBoard = s.LianBan

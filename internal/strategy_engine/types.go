@@ -32,6 +32,25 @@ type IndividualStock struct {
 // 由 Evaluate / BuildScoringData 填充，供 8a/8b 打分、战法评分与信号扫描消费。
 // （StockMarketData holds one stock's market data: live price, bars, money flow, minute volume/MACD. Filled by
 // Evaluate / BuildScoringData and consumed by 8a/8b scoring, strategy scoring and signal scanning.）
+
+// FinancialData 个股最新财务指标（实盘因子战法/财务因子评分用）。
+// 由研究库 fina_indicator 最新报告期填充（点对时：ann_date ≤ 当日 的最新值），缺失为 0。
+// English: a stock's latest financial indicators (for live factor-strategy financial scoring), filled
+// from the research DB's latest fina_indicator report (point-in-time: latest ann_date ≤ today); 0 when missing.
+type FinancialData struct {
+	Roe          float64 `json:"roe,omitempty"`            // 净资产收益率（%）
+	YoyNetProfit float64 `json:"yoy_net_profit,omitempty"` // 净利同比（%）
+	NetMargin    float64 `json:"net_margin,omitempty"`     // 净利率（%）
+	GrossMargin  float64 `json:"gross_margin,omitempty"`   // 毛利率（%）
+	DebtToAssets float64 `json:"debt_to_assets,omitempty"` // 资产负债率（%）
+	Eps          float64 `json:"eps,omitempty"`            // 每股收益
+	YoyOR        float64 `json:"yoy_or,omitempty"`         // 营收同比（%）
+}
+
+// StockMarketData 个股行情数据：实时价、K线、资金流向、分钟级量价/MACD等。
+// 由 Evaluate / BuildScoringData 填充，供 8a/8b 打分、战法评分与信号扫描消费。
+// （StockMarketData holds one stock's market data: live price, bars, money flow, minute volume/MACD. Filled by
+// Evaluate / BuildScoringData and consumed by 8a/8b scoring, strategy scoring and signal scanning.）
 type StockMarketData struct {
 	Code        string            `json:"code"`                   // 股票代码（Stock code）
 	Name        string            `json:"name"`                   // 股票名称（Stock name）
@@ -44,6 +63,7 @@ type StockMarketData struct {
 	MinuteMACD  data.MACD         `json:"minute_macd,omitempty"`  // 分钟级 MACD（DIF/DEA/Bar）（Minute MACD: DIF/DEA/Bar）
 	BenchChg    float64           `json:"bench_chg,omitempty"`    // 基准指数（上证）当前涨跌幅（%，供 N 形 D2 相对强度对比）（Benchmark (SSE) change %, for N-shape D2 relative strength）
 	Error       string            `json:"error,omitempty"`        // 行情获取错误信息（非空表示该股行情缺失）（Quote error; non-empty means missing quotes）
+	Fina        *FinancialData    `json:"fina,omitempty"`         // 最新财务指标（财务因子评分用）（Latest financials for financial-factor scoring）
 }
 
 // StrategyResult 策略引擎评估结果，包含板块、个股、行情数据和 L1 过滤信息。

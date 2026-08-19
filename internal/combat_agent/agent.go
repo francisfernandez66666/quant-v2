@@ -13,6 +13,7 @@ package combat_agent
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,10 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
+	factorstrat "quant-trading-v2/internal/strategies/factor"
+	patternstrat "quant-trading-v2/internal/strategies/pattern"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -42,6 +46,21 @@ func orDefault(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// strategyIDFromMeta 从策略信号的 Meta["strategy_id"]（候选 ID）转成战法库规则 ID "fac_<id>"。
+// 无 strategy_id 或 ≤0 返回空串（非因子战法库信号）。
+// English: converts a strategy signal's Meta["strategy_id"] (candidate ID) into the library rule ID
+// "fac_<id>". Empty when absent/≤0 (non-library signals).
+func strategyIDFromMeta(sig *strategy.Signal) string {
+	if sig == nil {
+		return ""
+	}
+	v, ok := sig.Meta["strategy_id"]
+	if !ok || v <= 0 {
+		return ""
+	}
+	return "fac_" + strconv.FormatInt(int64(v), 10)
 }
 
 // strategyLabel 战法类型 → 日志用简称。
@@ -314,6 +333,95 @@ func (a *Agent) SetRunners(runners []StrategyRunner) {
 	a.mu.Lock()
 	a.runners = runners
 	a.mu.Unlock()
+}
+
+// ReloadFactorRules 从战法库 applied_factors.json 重载全部启用规则并注入因子 runner（热生效）。
+// 供战法库的启用/禁用/删除/新增审批后调用，无需重启。若因子 runner 不存在则忽略。
+// English: reloads all enabled rules from the strategy library applied_factors.json and injects them
+// into the factor runner (hot-applied). Call after library mutations (enable/disable/delete/approve);
+// no restart needed. No-op if the factor runner is absent.
+func (a *Agent) ReloadFactorRules(dataDir string) {
+	rules, err := research.LoadEnabledFactorRules(dataDir)
+	if err != nil {
+		log.Printf("[combat_agent] 重载因子战法库失败: %v", err)
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.runners {
+		if fs, ok := a.runners[i].Strategy.(*factorstrat.FactorStrategy); ok {
+			fs.SetRules(rules)
+			log.Printf("[combat_agent] 因子战法库已热重载: %d 条规则", len(rules))
+		}
+	}
+}
+
+// FactorStats 返回因子 runner 的各规则运行统计（效果监测）。
+// English: returns per-rule run stats of the factor runner (effectiveness monitoring).
+func (a *Agent) FactorStats() []factorstrat.ActiveRule {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.runners {
+		if fs, ok := a.runners[i].Strategy.(*factorstrat.FactorStrategy); ok {
+			return fs.Stats()
+		}
+	}
+	return nil
+}
+
+// RecordFactorForwardReturn 记录某条因子规则一条触发股的 Horizon 日前向收益（效果监测）。
+// English: records a rule's Horizon-day forward return for one triggered stock (effectiveness monitoring).
+func (a *Agent) RecordFactorForwardReturn(ruleID string, ret float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.runners {
+		if fs, ok := a.runners[i].Strategy.(*factorstrat.FactorStrategy); ok {
+			fs.RecordForwardReturn(ruleID, ret)
+		}
+	}
+}
+
+// ReloadPatternRules 从形态战法库 applied_patterns.json 重载全部启用规则并注入形态 runner（热生效）。
+// English: reloads all enabled rules from the pattern library and injects them (hot-applied).
+func (a *Agent) ReloadPatternRules(dataDir string) {
+	rules, err := research.LoadEnabledPatternRules(dataDir)
+	if err != nil {
+		log.Printf("[combat_agent] 重载形态战法库失败: %v", err)
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.runners {
+		if ps, ok := a.runners[i].Strategy.(*patternstrat.PatternStrategy); ok {
+			ps.SetRules(rules)
+			log.Printf("[combat_agent] 形态战法库已热重载: %d 条规则", len(rules))
+		}
+	}
+}
+
+// PatternStats 返回形态 runner 的各规则运行统计（效果监测）。
+// English: returns per-rule run stats of the pattern runner (effectiveness monitoring).
+func (a *Agent) PatternStats() []patternstrat.ActivePattern {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.runners {
+		if ps, ok := a.runners[i].Strategy.(*patternstrat.PatternStrategy); ok {
+			return ps.Stats()
+		}
+	}
+	return nil
+}
+
+// RecordPatternForwardReturn 记录某条形态规则一条触发股的 Horizon 日前向收益（效果监测）。
+// English: records a pattern rule's Horizon-day forward return for one triggered stock (monitoring).
+func (a *Agent) RecordPatternForwardReturn(ruleID string, ret float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.runners {
+		if ps, ok := a.runners[i].Strategy.(*patternstrat.PatternStrategy); ok {
+			ps.RecordForwardReturn(ruleID, ret)
+		}
+	}
 }
 
 // SetShortEnabled 设置做空开关（线程安全）。
@@ -728,7 +836,8 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			ID:          seqID(),
 			Code:        code,
 			Name:        orDefault(sig.Name, md.Name),
-			Strategy:    string(runner.Type),
+			Strategy:    orDefault(sig.StrategyName, string(runner.Type)),
+			StrategyID:  strategyIDFromMeta(sig),
 			Direction:   direction,
 			Action:      action,
 			Tag:         nShapeTag(eval),

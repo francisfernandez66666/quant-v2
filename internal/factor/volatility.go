@@ -1,4 +1,5 @@
 // 波动率类因子：收益波动率与振幅。
+// English: Volatility factors: return volatility and amplitude.
 package factor
 
 import (

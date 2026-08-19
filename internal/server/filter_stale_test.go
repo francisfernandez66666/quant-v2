@@ -83,10 +83,10 @@ func TestFilterStaleSignals_ST(t *testing.T) {
 		"600123": quote(3.0),
 	}
 	sigs := []combat_agent.Signal{
-		{Code: "002586", Name: "ST围海", Action: "buy", Confidence: 1.0},       // ST → 撤
-		{Code: "000999", Name: "*ST某", Action: "buy", Confidence: 1.0},        // *ST → 撤
-		{Code: "600123", Name: "退市整理股", Action: "buy", Confidence: 1.0},     // 退 → 撤
-		{Code: "300175", Name: "正常股票", Direction: "做多", Confidence: 1.0},   // 正常 → 留
+		{Code: "002586", Name: "ST围海", Action: "buy", Confidence: 1.0},   // ST → 撤
+		{Code: "000999", Name: "*ST某", Action: "buy", Confidence: 1.0},   // *ST → 撤
+		{Code: "600123", Name: "退市整理股", Action: "buy", Confidence: 1.0},  // 退 → 撤
+		{Code: "300175", Name: "正常股票", Direction: "做多", Confidence: 1.0}, // 正常 → 留
 	}
 	live, pruned := filterStaleSignals(sigs, quotes)
 	if pruned != 3 || len(live) != 1 {

@@ -26,8 +26,8 @@ import (
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
-	"quant-trading-v2/internal/strategy_engine"
 	"quant-trading-v2/internal/store"
+	"quant-trading-v2/internal/strategy_engine"
 	"quant-trading-v2/internal/trigger"
 )
 
@@ -173,16 +173,32 @@ func main() {
 	log.Printf("[LLM] 运行模型: %s @ %s", effModel, llmCfg.APIURL)
 
 	// B5 研究闭环：研究库与实时库同目录，web 审批端点读写候选、应用权重。
+	// 同时把研究库作为实盘财务因子数据源（SetFinaLookup：把最新财务指标注入 StockMarketData，
+	// 供实盘因子战法对 ROE/净利同比等财务类因子打分）。
+	// English: the research DB (same dir as live) backs the B5 approval endpoints and also serves as the
+	// live financial source (SetFinaLookup injects latest financials into StockMarketData so the live
+	// factor strategy can score financial factors like ROE/YoyNetProfit).
 	if researchDB, err := store.Open(filepath.Join(dataDir, "trading.db")); err != nil {
 		log.Printf("[research] 研究库接入失败: %v", err)
 	} else {
 		srv.SetResearch(researchDB, dataDir)
-		log.Printf("[research] 研究库已接入: %s", filepath.Join(dataDir, "trading.db"))
+		// 实盘财务因子查询：取研究库 fina_indicator 最新报告期（点对时）作为该股财务指标。
+		// 带进程内 TTL 缓存，避免 5s 打分循环反复查库；缓存缺失/过期时读库。
+		finaCache := newFinaCache(researchDB)
+		strategyEngine.SetFinaLookup(finaCache.Lookup)
+		log.Printf("[research] 研究库已接入（含实盘财务因子）: %s", filepath.Join(dataDir, "trading.db"))
 	}
 
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
 	notifier := notify.New()
 	notifier.SetWebhooks(cfgMgr.GetNotifyConfig().WebhookURLs)
+	// 外部推送网关：config.json notify.push 启用且配置 URL 时，把关键提醒转发到推送服务，
+	// 实现 APK 后台/离线的系统通知触达（通用 webhook 网关，厂商通道可在该 URL 承接）。
+	if pushCfg := cfgMgr.GetNotifyConfig().Push; pushCfg.Enabled && pushCfg.URL != "" {
+		gw := notify.NewWebhookGateway(pushCfg.URL)
+		notifier.SetGateway(gw)
+		log.Printf("[main] 外部推送网关已启用: %s", pushCfg.URL)
+	}
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
 	baseStocks := append(wlMgr.All(), rpt.HeldPositionCodes()...)

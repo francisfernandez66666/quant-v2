@@ -1,4 +1,5 @@
 // 流动性类因子：换手率、成交额、Amihud 非流动性。
+// English: Liquidity factors: turnover, trading amount, and Amihud illiquidity.
 package factor
 
 import (

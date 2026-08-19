@@ -1,0 +1,29 @@
+# quant-trading-v2 baostock 研究数据 sidecar（dataload 的 HTTP 数据源）。
+# :8788 仅监听本机回环，供 cmd/dataload（以及 quant-research 服务）调用。
+# 注意：8787 在该服务器上被其他应用占用（翻译助手），故用 8788。
+# baostock 免费服务单账号单连接，sidecar 内部已全局串行；空闲时近零 CPU。
+# 依赖已装于 /opt/quant/venv（见 scripts/deploy_seoul.sh）。
+
+[Unit]
+Description=quant-trading-v2 baostock research data sidecar
+Documentation=https://github.com/anomalyco/opencode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+ExecStart=/opt/quant/venv/bin/python /opt/quant/pydata/server.py --host 127.0.0.1 --port 8788
+Restart=always
+RestartSec=5
+MemoryMax=512M
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

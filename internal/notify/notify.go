@@ -37,6 +37,7 @@ type Notifier struct {
 	mu          sync.RWMutex            // 保护 wsClients/webhookURLs 的读写锁
 	wsClients   map[string]chan Message // WS 客户端 ID → 消息通道
 	webhookURLs []string                // Webhook HTTP 回调地址列表
+	gateway     PushGateway             // 外部推送网关（极光/个推/通用 REST，APK 后台/离线触达）
 }
 
 // New 创建推送器实例。（Creates a Notifier instance.）

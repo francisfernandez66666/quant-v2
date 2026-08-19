@@ -1,7 +1,9 @@
 // ATR 平均真实波幅（Wilder 平滑，常用 n=14），供 C4 ATR 动态止损使用。
+// English: ATR is the average true range (Wilder smoothing, commonly n=14), used by the C4 ATR dynamic stop-loss.
 package indicator
 
 // TrueRange 计算真实波幅序列：TR=max(H−L, |H−Cprev|, |L−Cprev|)，首根 TR=H−L。
+// English: TrueRange computes the true range series: TR=max(H-L, |H-Cprev|, |L-Cprev|); the first TR=H-L.
 // （TrueRange computes the true range series.）
 func TrueRange(highs, lows, closes []float64) []float64 {
 	out := make([]float64, len(highs))
@@ -23,6 +25,7 @@ func TrueRange(highs, lows, closes []float64) []float64 {
 }
 
 // ATR 计算 ATR 序列。首值取前 n 根 TR 简单平均，之后按 Wilder 递推；预热期为 NaN。
+// English: ATR computes the ATR series. The first value is the simple mean of the first n TRs, then Wilder recursion; NaN during warm-up.
 // （ATR computes the ATR series: the first value is the simple mean of the first n TRs,
 // then Wilder smoothing; NaN during warm-up.）
 func ATR(highs, lows, closes []float64, n int) []float64 {
@@ -42,6 +45,7 @@ func ATR(highs, lows, closes []float64, n int) []float64 {
 }
 
 // ATR14 以常用参数 14 计算 ATR。
+// English: ATR14 computes ATR with the standard period of 14.
 // （ATR14 computes ATR with the standard period of 14.）
 func ATR14(highs, lows, closes []float64) []float64 {
 	return ATR(highs, lows, closes, 14)

@@ -204,12 +204,12 @@ func TestScorePoolN1NoD1Suppressed(t *testing.T) {
 // confirmation gate from real n_shape waveform/emotion logic.
 type fakeFullChainStrategy struct{}
 
-func (fakeFullChainStrategy) Name() string                     { return "fake_n" }
-func (fakeFullChainStrategy) Type() strategy.SignalType        { return strategy.SignalNShape }
+func (fakeFullChainStrategy) Name() string              { return "fake_n" }
+func (fakeFullChainStrategy) Type() strategy.SignalType { return strategy.SignalNShape }
 func (fakeFullChainStrategy) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{
 		Level: "full_chain", Pass: true, TotalScore: 80,
-		Details: map[string]float64{"d1": 0.8},
+		Details:    map[string]float64{"d1": 0.8},
 		Confidence: 0.7,
 	}, nil
 }
