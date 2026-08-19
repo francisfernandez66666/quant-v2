@@ -22,6 +22,7 @@ import (
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
@@ -172,6 +173,26 @@ func main() {
 	srv.SetRuntimeLLM(llmCfg.APIURL, effModel)
 	log.Printf("[LLM] 运行模型: %s @ %s", effModel, llmCfg.APIURL)
 
+	// 模拟盘（纸面交易）：独立于真实持仓的虚拟撮合/净值/信号质量统计。
+	// 开启后引擎按实时快照价自动撮合 buy 信号；config.json 的 rules.paper 控制开关与参数。
+	// English: paper trading — virtual fills/net-value/signal-quality stats isolated from the real book.
+	// When enabled, the engine auto-fills buy signals at the live snapshot price; rules.paper in
+	// config.json controls the switch and parameters.
+	paperCfg := cfgMgr.Rules.Paper
+	paperEngine := paper.New(paper.Config{
+		Enabled:        paperCfg.Enabled,
+		FixedAmount:    paperCfg.FixedAmount,
+		MaxPositions:   paperCfg.MaxPositions,
+		InitialCapital: paperCfg.InitialCapital,
+	}, filepath.Join(dataDir, "paper.json"))
+	srv.SetPaper(paperEngine)
+	if paperEngine.Enabled() {
+		log.Printf("[paper] 模拟盘已启用: 每票%.0f元 上限%d仓 初始%.0f元",
+			paperEngine.Cfg().FixedAmount, paperEngine.Cfg().MaxPositions, paperEngine.Cfg().InitialCapital)
+	} else {
+		log.Printf("[paper] 模拟盘未启用（rules.paper.enabled=false）")
+	}
+
 	// B5 研究闭环：研究库与实时库同目录，web 审批端点读写候选、应用权重。
 	// 同时把研究库作为实盘财务因子数据源（SetFinaLookup：把最新财务指标注入 StockMarketData，
 	// 供实盘因子战法对 ROE/净利同比等财务类因子打分）。
@@ -248,6 +269,7 @@ func main() {
 		DataDir:      dataDir,
 		Notifier:     notifier,
 		SectorTopN:   sectorTopN,
+		Paper:        paperEngine,
 		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
 	})
 	srv.SetEngineRegistry(registry)

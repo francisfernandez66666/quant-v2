@@ -31,6 +31,7 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
@@ -94,6 +95,7 @@ type Engine struct {
 	d1MaxRetries     int                             // D1 评分 LLM 轮询重试次数（<=0 用默认5）
 	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
 	factorMon        *factorMonitor                  // 因子战法效果监测（战法库触发信号前向收益结算）
+	paper            *paper.Engine                   // 模拟盘引擎（独立纸面交易，可空=未启用）
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -410,6 +412,14 @@ func (e *Engine) syncAccountConfig() {
 func (e *Engine) SetNotifier(n *notify.Notifier) {
 	e.mu.Lock()
 	e.notifier = n
+	e.mu.Unlock()
+}
+
+// SetPaper 注入模拟盘引擎（nil 表示未启用）。
+// English: injects the paper-trading engine (nil = disabled).
+func (e *Engine) SetPaper(p *paper.Engine) {
+	e.mu.Lock()
+	e.paper = p
 	e.mu.Unlock()
 }
 

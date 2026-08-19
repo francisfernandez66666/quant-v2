@@ -52,6 +52,9 @@
         <router-link to="/positions" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">💼</span> 持仓
         </router-link>
+        <router-link to="/paper" class="nav-item" active-class="active" @click="menuOpen = false" v-if="paperEnabled">
+          <span class="nav-icon">🧪</span> 模拟盘
+        </router-link>
         <router-link to="/settings" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">⚙</span> 设置
         </router-link>
@@ -175,6 +178,9 @@ const shortEnabled = ref(false)      // 做空开关状态 (short-selling toggle
 const canResearch = computed(() => api.hasPerm('research_approve'))
 // 是否可进入"用户管理"页（仅 admin）
 const canAdmin = computed(() => api.isAdmin())
+// 是否展示"模拟盘"入口：后端启用模拟盘时才显示（仅一次探测，避免多余请求）
+const paperEnabled = ref(false)
+api.fetchPaperState().then(d => { paperEnabled.value = !!d.enabled }).catch(() => { paperEnabled.value = false })
 
 // ── 登录表单状态 ── (Login form state)
 // 服务器地址初始值优先取本地持久化值，否则用默认本地地址 (server URL defaults to persisted value, otherwise localhost)

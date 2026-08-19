@@ -441,6 +441,49 @@ export async function fetchHoldings() {
   return request('/api/holdings')
 }
 
+/** 模拟盘：总开关与绩效/信号质量统计 */
+/** Paper trading: master switch plus performance/signal-quality stats */
+// 对应 GET /api/paper/state，返回 { enabled, stats:{...} }
+// Maps to GET /api/paper/state; returns { enabled, stats:{...} }
+export async function fetchPaperState() {
+  return request('/api/paper/state')
+}
+
+/** 模拟盘：当前持仓（含实时估值价/浮盈/信号价参照） */
+/** Paper trading: open positions (with live mark price, floating P/L and signal-price reference) */
+// 对应 GET /api/paper/positions
+export async function fetchPaperPositions() {
+  return request('/api/paper/positions')
+}
+
+/** 模拟盘：成交记录（最新在前） */
+/** Paper trading: fill records (newest first) */
+// 对应 GET /api/paper/trades
+export async function fetchPaperTrades() {
+  return request('/api/paper/trades')
+}
+
+/** 模拟盘：净值曲线 */
+/** Paper trading: equity curve */
+// 对应 GET /api/paper/equity
+export async function fetchPaperEquity() {
+  return request('/api/paper/equity')
+}
+
+/** 模拟盘：手动按实时价卖出持仓（清仓） */
+/** Paper trading: manually sell a position at the live price */
+// 对应 POST /api/paper/sell，data: { code }
+export async function sellPaperPosition(code) {
+  return request('/api/paper/sell', { method: 'POST', data: { code } })
+}
+
+/** 模拟盘：清盘重置（按最后估值价平仓，重置现金/成交/净值） */
+/** Paper trading: liquidate and reset (cash/trades/equity back to initial) */
+// 对应 POST /api/paper/reset
+export async function resetPaper() {
+  return request('/api/paper/reset', { method: 'POST' })
+}
+
 /** 更新持仓数据（含可用资金） */
 /** Update holdings data (including available cash) */
 // 对应 POST /api/holdings，data 为完整持仓快照，整体覆盖保存

@@ -203,6 +203,28 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 			}
 		}
 		e.syncMessages(bullE, bearE, nil, nil, quotes)
+
+		// 模拟盘撮合：本轮翻转的做多 buy 信号按实时快照价自动成交（独立于真实持仓）。
+		// 信号价作为辅助参照记录，量化「信号发出→成交」的延迟与滑点对收益的影响。
+		// English: paper fill — this round's flipped long buy signals auto-fill at the live snapshot
+		// price (isolated from the real book). The signal price is recorded as a reference to quantify
+		// the signal-to-fill latency and slippage impact on returns.
+		e.mu.RLock()
+		pe := e.paper
+		e.mu.RUnlock()
+		if pe != nil && pe.Enabled() {
+			pe.OnSignals(emit, quotes)
+		}
+	}
+
+	// 模拟盘估值与日净值：每轮用实时快照价刷新持仓市值，并记录当日净值点。
+	// English: paper mark-to-market + daily equity point each round, using the live snapshot.
+	e.mu.RLock()
+	pe := e.paper
+	e.mu.RUnlock()
+	if pe != nil && pe.Enabled() {
+		pe.MarkToMarket(quotes)
+		pe.Snapshot(time.Now())
 	}
 
 	// 有分数才更新看板并落盘（保持与 8a/8b 主循环同口径）

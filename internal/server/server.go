@@ -21,6 +21,7 @@ import (
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
@@ -76,6 +77,7 @@ type Server struct {
 	ths         *data.THSClient                                                                                                            // 同花顺客户端（板块行情表）
 	fetcher     *data.Fetcher                                                                                                              // 5s 实时行情采集器（报价优先读其快照，缺失再降级拉取）
 	dc          *data.DataCoordinator                                                                                                      // 行情统一数据源（新浪→同花顺→东财 三级降级链）
+	paper       *paper.Engine                                                                                                              // 模拟盘引擎（独立纸面交易，nil=未启用）
 	watchlist   *data.WatchlistManager                                                                                                     // 自选股管理器
 	sse         *SSEBroker                                                                                                                 // SSE 事件广播器（向前端实时推送）
 	startTime   time.Time                                                                                                                  // 服务启动时间（用于 uptime 统计）
@@ -156,6 +158,10 @@ func (s *Server) SetFetcher(f *data.Fetcher) { s.fetcher = f }
 
 // SetCoordinator 注入行情统一数据源（新浪→同花顺→东财 三级降级链）。
 func (s *Server) SetCoordinator(dc *data.DataCoordinator) { s.dc = dc }
+
+// SetPaper 注入模拟盘引擎（nil 表示未启用）。
+// English: injects the paper-trading engine (nil = disabled).
+func (s *Server) SetPaper(p *paper.Engine) { s.paper = p }
 
 // SetEngineController 设置引擎控制器。
 func (s *Server) SetEngineController(c EngineController) { s.ctrl = c }
@@ -306,6 +312,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/config/d1", s.authMiddleware(s.handleSetD1Config))
 	s.mux.HandleFunc("GET /api/config/llm", s.authMiddleware(s.handleGetLLMConfig))
 	s.mux.HandleFunc("POST /api/config/llm", s.authMiddleware(s.handleSetLLMConfig))
+
+	// 模拟盘（纸面交易）：独立于真实持仓，实时价撮合 + 净值曲线 + 信号质量统计
+	s.mux.HandleFunc("GET /api/paper/state", s.authMiddleware(s.handlePaperState))
+	s.mux.HandleFunc("GET /api/paper/positions", s.authMiddleware(s.handlePaperPositions))
+	s.mux.HandleFunc("GET /api/paper/trades", s.authMiddleware(s.handlePaperTrades))
+	s.mux.HandleFunc("GET /api/paper/equity", s.authMiddleware(s.handlePaperEquity))
+	s.mux.HandleFunc("POST /api/paper/sell", s.authMiddleware(s.handlePaperSell))
+	s.mux.HandleFunc("POST /api/paper/reset", s.authMiddleware(s.handlePaperReset))
 	s.mux.HandleFunc("POST /api/positions", s.authMiddleware(s.handleCreatePosition))
 	s.mux.HandleFunc("PUT /api/positions/{id}", s.authMiddleware(s.handleUpdatePosition))
 	s.mux.HandleFunc("DELETE /api/positions/{id}", s.authMiddleware(s.handleDeletePosition))

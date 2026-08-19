@@ -64,6 +64,9 @@ import Research from './pages/Research.vue'
 // 用户管理页：账号开通/权限配置（仅 admin）
 // Admin page: account creation and permission management (admin only)
 import Admin from './pages/Admin.vue'
+// 模拟盘页：纸面交易持仓/净值与信号质量统计（独立于真实持仓）
+// Paper page: paper-trading positions, equity curve and signal-quality stats (isolated from the real book)
+import Paper from './pages/Paper.vue'
 
 // 路由配置：定义所有页面路径及对应组件
 // Route config: defines every page path and its component
@@ -106,6 +109,9 @@ const routes = [
   // 用户管理：账号开通/权限配置（仅 admin）
   // Admin: account creation and permission management (admin only)
   { path: '/admin', component: Admin },
+  // 模拟盘：纸面交易持仓/净值/成交与信号质量统计
+  // Paper: paper-trading positions / equity / fills and signal-quality stats
+  { path: '/paper', component: Paper },
 ]
 
 // 使用 Hash 历史模式创建路由实例，避免刷新时 404

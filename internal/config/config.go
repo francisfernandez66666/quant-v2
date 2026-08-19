@@ -34,6 +34,18 @@ type Rules struct {
 	Position   PositionConfig   `json:"position"`      // 仓位管理参数
 	Notify     NotifyConfig     `json:"notify"`        // 通知推送参数
 	Scheduler  SchedulerConfig  `json:"scheduler"`     // 研究调度器配置（quant-research 服务读取）
+	Paper      PaperConfig      `json:"paper"`         // 模拟盘/纸面交易配置
+}
+
+// PaperConfig 模拟盘（纸面交易）配置：把 buy 信号按实时价自动撮合成虚拟持仓，独立于真实持仓。
+// 默认关闭（Enabled=false），开启后引擎在每轮信号产出时自动撮合。
+// English: paper-trading config — auto-fills buy signals at the live price into virtual positions,
+// isolated from the real book. Off by default; when enabled the engine fills each signal round.
+type PaperConfig struct {
+	Enabled        bool    `json:"enabled"`         // 总开关（默认 false）
+	FixedAmount    float64 `json:"fixed_amount"`    // 每票固定买入资金（元，默认 10000）
+	MaxPositions   int     `json:"max_positions"`   // 最大并行持仓数（默认 10）
+	InitialCapital float64 `json:"initial_capital"` // 初始资金（元，默认 100000）
 }
 
 // SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
@@ -903,6 +915,7 @@ var DefaultRules = &Rules{
 		DailyDropAlertPct: 5,
 	},
 	Scheduler: DefaultSchedulerConfig(),
+	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000},
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。

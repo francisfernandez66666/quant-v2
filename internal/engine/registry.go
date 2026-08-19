@@ -28,6 +28,7 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
@@ -58,6 +59,7 @@ type EngineOptions struct {
 	Notifier     *notify.Notifier
 	SectorTopN   int
 	D1MaxRetries int
+	Paper        *paper.Engine // 模拟盘引擎全局单例（nil=未启用）
 }
 
 // InitStage 引擎初始化进度阶段。
@@ -243,6 +245,9 @@ func (r *Registry) build(userID string) *Engine {
 	if opts.D1MaxRetries > 0 {
 		e.SetD1MaxRetries(opts.D1MaxRetries)
 	}
+	// 模拟盘引擎：全局单例注入（与真实持仓隔离，独立 paper.json 存储）。
+	// English: the global paper engine singleton (isolated from the real book; own paper.json store).
+	e.SetPaper(opts.Paper)
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)
 	e.SetLongShortConfig(ls.LongEnabled, ls.ShortEnabled)
