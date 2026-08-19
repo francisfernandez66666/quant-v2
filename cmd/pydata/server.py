@@ -155,6 +155,109 @@ def _try_ak(fn, *args):
         raise RuntimeError("akshare fallback failed: %s" % e)
 
 
+def _num(v):
+    """兼容数值/字符串/NaN 的安全取数（空值返回 0.0）。"""
+    if v is None:
+        return 0.0
+    try:
+        f = float(v)
+        return f if f == f else 0.0  # NaN 过滤
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bs_sym(code):
+    """baostock 代码（sh.600000 / bj.920002）→ 裸 6 位代码（akshare symbol）。"""
+    return code.split(".")[-1] if "." in code else code
+
+
+def _sina_sym(code):
+    """baostock 代码（sh.600000 / sz.000001 / bj.920002）→ 新浪 akshare symbol（sh600000）。
+    新版 akshare 的 stock_zh_a_daily 必须带交易所前缀，否则报 KeyError。"""
+    prefix = code.split(".")[0].lower() if "." in code else ""
+    num = code.split(".")[-1] if "." in code else code
+    if prefix in ("sh", "sz", "bj"):
+        return prefix + num
+    # 无前缀容错：按首位猜交易所
+    if num[:1] in ("6",):
+        return "sh" + num
+    if num[:1] in ("0", "3"):
+        return "sz" + num
+    return "bj" + num
+
+
+def _is_bj(code):
+    """判断北交所代码：baostock 前缀 bj.，或裸代码 4/8/92 开头（920 为新代码段）。"""
+    c = code.lower()
+    if c.startswith("bj."):
+        return True
+    num = c.split(".")[-1]
+    return num[:1] in ("4", "8") or num[:3] == "920"
+
+
+def _ak_sina_daily(code, start, end):
+    """新浪 stock_zh_a_daily 拉日线（沪深与北交所均支持），按 _STOCK_FIELDS 列序对齐返回 rows。
+    新浪 volume 单位=股、turnover=小数比率（×100 转 baostock 百分比口径）；
+    无涨跌幅列，preclose 用前一日 close 填充（首行缺省为当日 close）。
+    （English: Sina daily bars via akshare (SH/SZ/BJ all supported), aligned to _STOCK_FIELDS.
+    Sina volume is in shares; turnover is a decimal ratio (×100 → baostock percent); there is no
+    pct_chg column, so preclose falls back to the prior close (first row = its own close).）"""
+    sym = _sina_sym(code)
+    df = _try_ak(lambda ak: ak.stock_zh_a_daily(symbol=sym, start_date=start, end_date=end, adjust=""))
+    if df is None or df.empty:
+        raise RuntimeError("akshare sina daily empty for %s" % sym)
+    df = df.sort_values("date")
+    rows = []
+    prev_close = None
+    for _, r in df.iterrows():
+        close = _num(r.get("close"))
+        preclose = prev_close if prev_close else close
+        rows.append([
+            str(r["date"]).replace("-", ""), code,
+            _num(r.get("open")), _num(r.get("high")), _num(r.get("low")), close, preclose,
+            _num(r.get("volume")), _num(r.get("amount")), "3",
+            _num(r.get("turnover")) * 100, "1", "", "", "", "", "", "",
+        ])
+        prev_close = close
+    return rows
+
+
+def _ak_em_daily(code, start, end):
+    """东财 stock_zh_a_hist 拉日线（支持北交所），按 _STOCK_FIELDS 列序对齐返回 rows。
+    东财成交量单位=手（×100 转股）；估值/ST 字段缺失留空；preclose 由 close/涨跌幅 反推。
+    （English: pulls daily bars from Eastmoney via akshare (Beijing exchange supported), aligned to
+    _STOCK_FIELDS columns. Volume in lots (×100 → shares); valuation/ST columns empty; preclose
+    back-computed from close and pct_chg.）"""
+    symbol = _bs_sym(code)
+    df = _try_ak(lambda ak: ak.stock_zh_a_hist(
+        symbol=symbol, period="daily",
+        start_date=start.replace("-", ""), end_date=end.replace("-", ""), adjust=""))
+    if df is None or df.empty:
+        raise RuntimeError("akshare eastmoney daily empty for %s" % symbol)
+    df = df.sort_values("日期")
+    rows = []
+    for _, r in df.iterrows():
+        close = _num(r.get("收盘"))
+        pct = _num(r.get("涨跌幅"))
+        preclose = close if pct == 0 else close / (1 + pct / 100.0)
+        rows.append([
+            str(r["日期"]).replace("-", ""), code,
+            _num(r.get("开盘")), _num(r.get("最高")), _num(r.get("最低")), close, preclose,
+            _num(r.get("成交量")) * 100, _num(r.get("成交额")), "3",
+            _num(r.get("换手率")), "1", pct, "", "", "", "", "",
+        ])
+    return rows
+
+
+def _ak_sina_dates(code, start, end):
+    """新浪日线的交易日序列（复权因子降级时用；每交易日 factor=1）。"""
+    sym = _sina_sym(code)
+    df = _try_ak(lambda ak: ak.stock_zh_a_daily(symbol=sym, start_date=start, end_date=end, adjust=""))
+    if df is None or df.empty:
+        raise RuntimeError("akshare sina dates empty for %s" % sym)
+    return [str(d).replace("-", "") for d in df["date"].tolist()]
+
+
 # ---------------- 路由实现 ----------------
 
 def r_health(params):
@@ -198,10 +301,24 @@ def _recent_weekday():
 
 
 def r_stock_basic(params):
-    """查询个股基础信息（代码/名称/上市状态等），与 Tushare stock_basic 对齐。"""
+    """查询个股基础信息（代码/名称/上市状态等），与 Tushare stock_basic 对齐。
+    baostock 不可用（黑名单/北交所）时降级到东财个股信息。"""
     code = params.get("code", "")
-    rows, fields = _bs_query(bs.query_stock_basic, code=code, code_name="")
-    return _to_csv(fields, rows)
+    try:
+        rows, fields = _bs_query(bs.query_stock_basic, code=code, code_name="")
+        if not rows:
+            raise RuntimeError("query_stock_basic empty for %s" % code)
+        return _to_csv(fields, rows)
+    except Exception:
+        # 降级：新浪 A 股全表匹配该代码（含北交所）→ code, code_name, tradestatus=1
+        symbol = _bs_sym(code)
+        df = _try_ak(lambda ak: ak.stock_info_a_code_name())
+        nm = ""
+        for _, r in df.iterrows():
+            if str(r.get("code", "")).strip() == symbol:
+                nm = str(r.get("name", ""))
+                break
+        return _to_csv(["code", "code_name", "tradestatus"], [[symbol, nm, "1"]])
 
 
 def _kline_impl(params, index=False):
@@ -215,22 +332,22 @@ def _kline_impl(params, index=False):
 
 
 def r_kline(params):
+    code, start, end = params.get("code", ""), params.get("start", ""), params.get("end", "")
     try:
         return _kline_impl(params, index=False)
     except Exception:
-        # 降级：新浪日线（无估值/换手/ST，空列补齐），返回同样的列结构
-        code, start, end = params.get("code", ""), params.get("start", ""), params.get("end", "")
-        df = _try_ak(lambda ak: ak.stock_zh_a_daily(symbol=code.replace(".", ""), start_date=start, end_date=end, adjust=""))
-        df = df.sort_values("date")
-        cols = _STOCK_FIELDS.split(",")
-        rows = []
-        for _, r in df.iterrows():
-            rows.append([
-                str(r["date"]).replace("-", ""), code,
-                r.get("open", ""), r.get("high", ""), r.get("low", ""), r.get("close", ""),
-                "", r.get("volume", ""), r.get("amount", ""), "3", "", "1", "", "", "", "", "", "",
-            ])
-        return _to_csv(cols, rows)
+        # 降级链路：新浪优先（沪深/北交所均支持），失败再东财最后兜底。
+        # 新版 akshare 的 stock_zh_a_daily 需交易所前缀（sh/sz/bj），由 _sina_sym 转换。
+        # （English: fallback chain — Sina first (SH/SZ/BJ all covered), then Eastmoney as the last
+        # resort. The new akshare stock_zh_a_daily needs an exchange prefix (sh/sz/bj).）
+        rows = None
+        try:
+            rows = _ak_sina_daily(code, start, end)
+        except Exception:
+            rows = None
+        if rows is None:
+            rows = _ak_em_daily(code, start, end)
+        return _to_csv(_STOCK_FIELDS.split(","), rows)
 
 
 def r_index_kline(params):
@@ -239,10 +356,21 @@ def r_index_kline(params):
 
 
 def r_adjust_factor(params):
-    """复权因子（前后复权系数），Go 侧用它计算前/后复权价格。"""
+    """复权因子（前后复权系数），Go 侧用它计算前/后复权价格。
+    baostock 不可用（黑名单/北交所）时降级：东财交易日序列 + factor=1（北交所历史短、分红少，
+    前复权≈不复权，作为可用的兜底）。"""
     code, start, end = params.get("code", ""), params.get("start", ""), params.get("end", "")
-    rows, fields = _bs_query(bs.query_adjust_factor, code=code, start_date=start, end_date=end)
-    return _to_csv(fields, rows)
+    try:
+        rows, fields = _bs_query(bs.query_adjust_factor, code=code, start_date=start, end_date=end)
+        return _to_csv(fields, rows)
+    except Exception:
+        dates = _ak_sina_dates(code, start, end)
+        fields = ["dividOperateDate", "backAdjustFactor", "adjustFactor", "dividPreNoticeDate",
+                  "dividCashPsBeforeTax", "dividStocksPsBeforeTax", "dividTaxRate",
+                  "dividCashPsAfterTax", "dividStocksPsAfterTax", "dividCashTotalAmt",
+                  "dividStocksTotalAmt", "dividRemark"]
+        rows = [[d, "1", "1", "", "", "", "", "", "", "", "", ""] for d in dates]
+        return _to_csv(fields, rows)
 
 
 def _fina(params, fn, name):

@@ -252,7 +252,8 @@ func bsPrefix(suffix string) string {
 	}
 }
 
-// guessExchange 无后缀时按代码首位猜交易所（6→沪, 0/3→深, 4/8→北）。
+// guessExchange 无后缀时按代码首位猜交易所（6→沪, 0/3→深, 4/8/920→北）。
+// 920 为北交所新代码段（原 8 开头 4 开头除外），补齐后北交所研究/实盘链路能正确转 bj. 前缀。
 func guessExchange(num string) string {
 	if num == "" {
 		return ".SH"
@@ -264,6 +265,11 @@ func guessExchange(num string) string {
 		return ".SZ"
 	case '4', '8':
 		return ".BJ"
+	case '9':
+		if len(num) >= 3 && num[:3] == "920" {
+			return ".BJ"
+		}
+		return ".SH"
 	default:
 		return ".SH"
 	}
