@@ -23,11 +23,9 @@ android {
 
         // 极光推送 JPush：包名 + AppKey（极光控制台创建应用后获得）+ 渠道号
         // （JPush placeholders: package name, AppKey from the JPush console, channel label.）
-        manifestPlaceholders = mapOf(
-            "JPUSH_PKGNAME" to applicationId,
-            "JPUSH_APPKEY" to "bf0fd9cb1beafa282f88329c",
-            "JPUSH_CHANNEL" to "developer-default"
-        )
+        manifestPlaceholders["JPUSH_PKGNAME"] = "com.liangzai.quant"
+        manifestPlaceholders["JPUSH_APPKEY"] = "bf0fd9cb1beafa282f88329c"
+        manifestPlaceholders["JPUSH_CHANNEL"] = "developer-default"
     }
 
     buildTypes {
