@@ -104,6 +104,7 @@
       <div class="action-sheet" @click.stop>
         <div class="sheet-title">{{ sheetSignal.code }} {{ sheetSignal.name || '' }} · {{ sheetSignal.strategy }}</div>
         <button v-if="sheetSignal.can_open" class="sheet-btn sheet-danger" @click="sheetBuy">买入</button>
+        <!-- 模拟盘买入（移动端菜单）：仅在模拟盘启用时显示，按实时价成交（mobile menu paper buy: only when paper trading is enabled, fills at live price）-->
         <button v-if="sheetSignal.can_open && paperOn" class="sheet-btn sheet-paper" @click="sheetPaperBuy">模拟买入</button>
         <button v-if="sheetSignal.action === 'buy'" class="sheet-btn" @click="sheetIgnore">忽略</button>
         <button v-if="!sheetSignal.can_open && sheetSignal.action !== 'buy'" class="sheet-btn" @click="sheetCollect">收藏</button>

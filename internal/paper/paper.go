@@ -595,6 +595,8 @@ func (e *Engine) Stats() Stats {
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
+// 撮合错误定义：全部为中文可读消息，直接透传给前端弹窗/接口返回。
+// （Fill errors: human-readable Chinese messages surfaced to the frontend directly.）
 var (
 	errDisabled    = errMsg("模拟盘未启用")
 	errNotHeld     = errMsg("未持有该股票")
@@ -605,6 +607,8 @@ var (
 	errCash        = errMsg("可用资金不足")
 )
 
+// errMsg 让普通字符串可充当 error，避免为每个错误单独建类型。
+// （errMsg lets a plain string act as an error without a dedicated type per case.）
 type errMsg string
 
 func (e errMsg) Error() string { return string(e) }

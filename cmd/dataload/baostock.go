@@ -232,7 +232,7 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 }
 
 // limitUpDown 按板块/ST 规则计算当日涨跌停价（回测护栏用）。
-// 主板 ±10%（ST ±5%）；创业板(300/301)/科创板(688/689) ±20%；北交所(4/8) ±30%。
+// 主板 ±10%（ST ±5%）；创业板(300/301)/科创板(688/689) ±20%；北交所(4/8/920) ±30%。
 // 精确到分（四舍五入）；上市初期无涨跌停的近似由 pre_close=0 时返回 0 兜底。
 // （limitUpDown computes limit-up/down prices from board/ST rules as a backtest guard rail.）
 func limitUpDown(preClose float64, isST int, code string) (up, down float64) {
@@ -244,7 +244,8 @@ func limitUpDown(preClose float64, isST int, code string) (up, down float64) {
 	case strings.HasPrefix(code, "300"), strings.HasPrefix(code, "301"),
 		strings.HasPrefix(code, "688"), strings.HasPrefix(code, "689"):
 		ratio = 0.20
-	case strings.HasPrefix(code, "4"), strings.HasPrefix(code, "8"):
+	case strings.HasPrefix(code, "4"), strings.HasPrefix(code, "8"),
+		strings.HasPrefix(code, "920"):
 		ratio = 0.30
 	case isST == 1:
 		ratio = 0.05
