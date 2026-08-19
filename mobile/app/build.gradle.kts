@@ -20,6 +20,14 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+
+        // 极光推送 JPush：包名 + AppKey（极光控制台创建应用后获得）+ 渠道号
+        // （JPush placeholders: package name, AppKey from the JPush console, channel label.）
+        manifestPlaceholders = mapOf(
+            "JPUSH_PKGNAME" to applicationId,
+            "JPUSH_APPKEY" to "bf0fd9cb1beafa282f88329c",
+            "JPUSH_CHANNEL" to "developer-default"
+        )
     }
 
     buildTypes {
@@ -47,4 +55,6 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     // WebViewAssetLoader：把内嵌 assets/www 映射为 https 安全源，localStorage/SSE 正常工作
     implementation("androidx.webkit:webkit:1.11.0")
+    // 极光推送 JPush Android SDK（5.0.0 起自动拉取 JCore，无需单独配置）
+    implementation("cn.jiguang.sdk:jpush:5.8.0")
 }

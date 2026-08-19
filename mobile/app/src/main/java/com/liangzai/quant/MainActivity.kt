@@ -18,6 +18,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.webkit.WebViewAssetLoader
+import cn.jpush.android.api.JPushInterface
 
 /**
  * 移动端薄壳：加载内嵌前端 assets/（web/dist 构建产物），API/SSE 指向云服务器。
@@ -37,6 +38,12 @@ class MainActivity : AppCompatActivity() {
     companion object {
         /** 预填服务器地址。改为 https://你的域名 后，首次打开登录页即带出。 */
         const val DEFAULT_SERVER_URL = "https://quant-trading.top"
+
+        /** 极光推送设备别名（必须与后端 config.json notify.push.alias 一致，默认 quant_owner）。 */
+        const val QUANT_PUSH_ALIAS = "quant_owner"
+
+        /** setAlias 请求序列号（极光要求递增，用于回调匹配；单次设置固定值即可）。 */
+        const val JPUSH_ALIAS_SEQ = 1
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -50,6 +57,7 @@ class MainActivity : AppCompatActivity() {
 
         ensureNotificationChannel()
         requestNotificationPermission()
+        setupJPushAlias()
 
         val webView = findViewById<WebView>(R.id.webview)
 
@@ -170,6 +178,19 @@ class MainActivity : AppCompatActivity() {
                     this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001
                 )
             }
+        }
+    }
+
+    /**
+     * 设置极光推送设备别名：与服务端 config.json 的 push.alias（默认 quant_owner）保持一致，
+     * 服务端按该别名下发关键提醒，后台/离线也能收到系统通知。
+     * 设置结果通过 JPushMessageReceiver.onAliasOperatorResult 回调确认。
+     */
+    private fun setupJPushAlias() {
+        try {
+            JPushInterface.setAlias(this, JPUSH_ALIAS_SEQ, QUANT_PUSH_ALIAS)
+        } catch (e: Exception) {
+            android.util.Log.e("QUANT_JPUSH", "setAlias 调用异常: ${e.message}")
         }
     }
 

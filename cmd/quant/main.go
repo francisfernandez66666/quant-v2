@@ -192,12 +192,19 @@ func main() {
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
 	notifier := notify.New()
 	notifier.SetWebhooks(cfgMgr.GetNotifyConfig().WebhookURLs)
-	// 外部推送网关：config.json notify.push 启用且配置 URL 时，把关键提醒转发到推送服务，
-	// 实现 APK 后台/离线的系统通知触达（通用 webhook 网关，厂商通道可在该 URL 承接）。
-	if pushCfg := cfgMgr.GetNotifyConfig().Push; pushCfg.Enabled && pushCfg.URL != "" {
-		gw := notify.NewWebhookGateway(pushCfg.URL)
-		notifier.SetGateway(gw)
-		log.Printf("[main] 外部推送网关已启用: %s", pushCfg.URL)
+	// 外部推送网关：config.json notify.push 启用时，把关键提醒转发到推送服务，
+	// 实现 APK 后台/离线的系统通知触达。provider=jpush 走极光 REST API（AppKey+Secret+Alias），
+	// 否则走通用 webhook 网关（URL 指向接收 JSON 的推送地址）。
+	if pushCfg := cfgMgr.GetNotifyConfig().Push; pushCfg.Enabled {
+		if pushCfg.Provider == "jpush" {
+			gw := notify.NewJPushGateway(pushCfg.AppKey, pushCfg.Secret, pushCfg.Alias)
+			notifier.SetGateway(gw)
+			log.Printf("[main] 外部推送网关已启用: 极光(alias=%s)", gw.Alias)
+		} else if pushCfg.URL != "" {
+			gw := notify.NewWebhookGateway(pushCfg.URL)
+			notifier.SetGateway(gw)
+			log.Printf("[main] 外部推送网关已启用: webhook(%s)", pushCfg.URL)
+		}
 	}
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）

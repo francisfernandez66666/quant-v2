@@ -9,3 +9,13 @@
 
 # 保留 MainActivity（入口 Activity，Manifest 引用，防混淆/裁剪误删）
 -keep class com.liangzai.quant.MainActivity { *; }
+-keep class com.liangzai.quant.QuantApp { *; }
+
+# 极光推送 JPush 混淆规则（官方推荐：SDK 类全部保留，Receiver 子类保留）
+-dontoptimize
+-dontpreverify
+-dontwarn cn.jpush.**
+-keep class cn.jpush.** { *; }
+-keep class * extends cn.jpush.android.service.JPushMessageReceiver { *; }
+-dontwarn cn.jiguang.**
+-keep class cn.jiguang.** { *; }

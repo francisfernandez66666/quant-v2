@@ -105,14 +105,19 @@ type NotifyConfig struct {
 }
 
 // PushConfig 外部推送网关配置。
-// URL 指向一个接收 JSON 的推送地址（自建 APK 中转，或极光/个推等厂商 REST 网关）；
-// Enabled 关闭时不启用推送网关。本配置为通用 webhook 形态，厂商专属字段由网关层扩展。
-// （PushConfig configures the external push gateway. URL points to a JSON endpoint (self-hosted APK
-// relay or a vendor REST gateway). Enabled=false disables it. This uses the generic webhook shape;
-// vendor-specific fields can extend the gateway layer.）
+// Provider 为 "jpush" 时使用极光 REST API（AppKey+Secret 鉴权，Alias 指定推送目标设备别名）；
+// 否则使用通用 webhook 网关（URL 指向接收 JSON 的推送地址）。
+// Enabled 关闭时不启用推送网关。
+// （PushConfig configures the external push gateway. Provider "jpush" uses the JPush REST API
+// (AppKey+Secret auth, Alias targets the device alias); otherwise the generic webhook gateway
+// POSTs JSON to URL. Enabled=false disables the gateway.）
 type PushConfig struct {
-	Enabled bool   `json:"enabled"`       // 是否启用外部推送网关
-	URL     string `json:"url,omitempty"` // 推送接收地址（JSON POST）
+	Enabled  bool   `json:"enabled"`           // 是否启用外部推送网关
+	Provider string `json:"provider"`          // 网关类型：jpush | webhook（默认 webhook）
+	URL      string `json:"url,omitempty"`     // webhook 推送接收地址（JSON POST）
+	AppKey   string `json:"app_key,omitempty"` // 极光 AppKey（服务端推送鉴权用）
+	Secret   string `json:"secret,omitempty"`  // 极光 Master Secret（服务端推送鉴权用，勿入库/勿进 APK）
+	Alias    string `json:"alias,omitempty"`   // 极光推送目标设备别名（默认 quant_owner）
 }
 
 // EmotionConfig 情绪周期六个阶段（冰点/启动/发酵/高潮/背离/退潮）的判定阈值。
