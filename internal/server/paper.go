@@ -59,6 +59,53 @@ func (s *Server) handlePaperEquity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, pe.Equity())
 }
 
+// handlePaperBuy 手动按实时价买入一只股票（前端/APK 信号页"模拟买入"）。请求体：
+// {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8}。
+// English: manually buys one stock at the live price (frontend/APK signal-page "paper buy").
+// Body: {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8}.
+func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
+	pe := s.paperEngine()
+	if pe == nil || !pe.Enabled() {
+		writeError(w, 400, "模拟盘未启用")
+		return
+	}
+	var req struct {
+		Code        string  `json:"code"`
+		Name        string  `json:"name"`
+		Strategy    string  `json:"strategy"`
+		SignalPrice float64 `json:"signal_price"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+		writeError(w, 400, "缺少股票代码")
+		return
+	}
+	quotes := s.liveQuotes(req.Code)
+	if err := pe.Buy(req.Code, req.Name, req.Strategy, req.SignalPrice, quotes); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// liveQuotes 构造实时行情表：优先 5s 快照，缺失时对指定代码降级单票拉取。
+// English: builds a live quote map — the 5s snapshot first, falling back to a one-off pull for the code.
+func (s *Server) liveQuotes(code string) map[string]*data.StockInfo {
+	quotes := make(map[string]*data.StockInfo)
+	if f := s.fetcher; f != nil {
+		if snap := f.Snapshot(); snap != nil && snap.Stocks != nil {
+			for c, q := range snap.Stocks {
+				quotes[c] = q
+			}
+		}
+	}
+	if _, ok := quotes[code]; !ok && s.dc != nil {
+		if info, err := s.dc.GetQuote(code); err == nil && info != nil {
+			quotes[code] = info
+		}
+	}
+	return quotes
+}
+
 // handlePaperSell 手动按实时价卖出指定模拟持仓（清仓）。请求体 {"code":"600000.SH"}。
 // English: manually sells a paper position at the live price. Body: {"code":"600000.SH"}.
 func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
@@ -74,21 +121,7 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
-	// 实时行情：优先 5s 快照，缺失降级单票拉取
-	quotes := make(map[string]*data.StockInfo)
-	if f := s.fetcher; f != nil {
-		if snap := f.Snapshot(); snap != nil && snap.Stocks != nil {
-			for c, q := range snap.Stocks {
-				quotes[c] = q
-			}
-		}
-	}
-	if _, ok := quotes[req.Code]; !ok && s.dc != nil {
-		if info, err := s.dc.GetQuote(req.Code); err == nil && info != nil {
-			quotes[req.Code] = info
-		}
-	}
-	if err := pe.Sell(req.Code, quotes); err != nil {
+	if err := pe.Sell(req.Code, s.liveQuotes(req.Code)); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}

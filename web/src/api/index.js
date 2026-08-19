@@ -470,6 +470,13 @@ export async function fetchPaperEquity() {
   return request('/api/paper/equity')
 }
 
+/** 模拟盘：手动按实时价买入（信号页"模拟买入"按钮触发） */
+/** Paper trading: manually buy one stock at the live price (signal-page "paper buy" button) */
+// 对应 POST /api/paper/buy，data: { code, name, strategy, signal_price }
+export async function buyPaperPosition(code, name, strategy, signalPrice) {
+  return request('/api/paper/buy', { method: 'POST', data: { code, name, strategy, signal_price: signalPrice || 0 } })
+}
+
 /** 模拟盘：手动按实时价卖出持仓（清仓） */
 /** Paper trading: manually sell a position at the live price */
 // 对应 POST /api/paper/sell，data: { code }

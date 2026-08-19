@@ -82,6 +82,8 @@
           <button v-if="s.can_open" class="btn-buy" @click.stop="confirmTrade(s, 'buy')">买入</button>
           <button v-else-if="s.action === 'buy'" class="btn-ignore" @click.stop="confirmTrade(s, 'ignore')">忽略</button>
           <span v-else class="text-muted">—</span>
+          <!-- 模拟盘买入：后端启用模拟盘时显示，按实时价自动撮合（Paper buy: shown when paper trading is enabled, fills at the live price）-->
+          <button v-if="paperOn && s.can_open" class="btn-paper" @click.stop="paperBuy(s)">模拟买入</button>
           <!-- 收藏/加入自选股按钮：一键将信号股票代码加入自选股列表（Add to watchlist button: one-click add signal's code to watchlist）-->
           <button v-if="!s.can_open && s.action !== 'buy'" class="btn-collect" @click.stop="collectToWatchlist(s)">收藏</button>
         </span>
@@ -102,6 +104,7 @@
       <div class="action-sheet" @click.stop>
         <div class="sheet-title">{{ sheetSignal.code }} {{ sheetSignal.name || '' }} · {{ sheetSignal.strategy }}</div>
         <button v-if="sheetSignal.can_open" class="sheet-btn sheet-danger" @click="sheetBuy">买入</button>
+        <button v-if="sheetSignal.can_open && paperOn" class="sheet-btn sheet-paper" @click="sheetPaperBuy">模拟买入</button>
         <button v-if="sheetSignal.action === 'buy'" class="sheet-btn" @click="sheetIgnore">忽略</button>
         <button v-if="!sheetSignal.can_open && sheetSignal.action !== 'buy'" class="sheet-btn" @click="sheetCollect">收藏</button>
         <button class="sheet-btn" @click="sheetKline">{{ klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时' }}</button>
@@ -157,6 +160,8 @@ const showLog = ref(false)            // 是否打开日志弹窗
 // whether the log modal is visible
 const sheetSignal = ref(null)         // 移动端操作菜单当前选中的信号对象
 // the signal object currently selected in the mobile action sheet
+const paperOn = ref(false)            // 模拟盘开关（后端启用时显示"模拟买入"按钮）
+// paper-trading switch (shows the "paper buy" button when enabled)
 const tradeTarget = ref({})           // 待操作的信号对象
 // the signal object pending an action
 const tradeAction = ref('')           // 操作类型：'buy' | 'ignore'
@@ -278,6 +283,25 @@ function sheetBuy() {
   sheetSignal.value = null
   confirmTrade(s, 'buy')
 }
+
+/** 模拟盘买入：确认后按实时价自动撮合一笔虚拟持仓（paper buy: confirm then auto-fill a virtual position at the live price）*/
+async function paperBuy(s) {
+  if (!confirm(`确认模拟买入 ${s.code} ${s.name || ''}？将按实时价成交固定资金。`)) return
+  try {
+    await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0)
+    alert(`已模拟买入 ${s.code}`)
+  } catch (e) {
+    alert(e.message || '模拟买入失败')
+  }
+}
+
+/** 移动端：操作菜单 - 模拟买入 */
+function sheetPaperBuy() {
+  if (!sheetSignal.value) return
+  const s = sheetSignal.value
+  sheetSignal.value = null
+  paperBuy(s)
+}
 /** 移动端：操作菜单 - 忽略 */
 function sheetIgnore() {
   if (!sheetSignal.value) return
@@ -322,6 +346,11 @@ async function load() {
   try { signals.value = await api.fetchSignals() } catch (_) {}
 }
 
+/** 探测模拟盘开关：启用后显示"模拟买入"按钮（probe the paper switch once; enables the paper-buy button）*/
+async function probePaper() {
+  try { paperOn.value = !!(await api.fetchPaperState()).enabled } catch (_) {}
+}
+
 /** SSE 消息触发刷新（新信号或扫描完成） */
 /** Refresh triggered by an SSE message (new signal or completed scan) */
 function handleSSE(msg) {
@@ -338,6 +367,7 @@ function handleSSE(msg) {
 // signals are the backend's single computed result, polling only backfills SSE drops.)
 onMounted(() => {
   load()
+  probePaper()
   // 每 5 秒轮询一次信号列表 (poll the signal list every 5 seconds)
   timer = setInterval(load, 5000)
   // 页面不可见时暂停轮询，切回时立即补拉一次 (pause polling when hidden; refresh on return)
@@ -459,6 +489,10 @@ function showFeedback(msg, type) {
   padding: 4px 12px; border-radius: 4px; border: none;
   background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer;
 }
+.btn-paper {
+  padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(82, 196, 26, 0.5);
+  background: rgba(82, 196, 26, 0.12); color: #52c41a; font-size: 14px; cursor: pointer;
+}
 .btn-ignore {
   padding: 4px 12px; border-radius: 4px; border: 1px solid #555;
   background: transparent; color: #888; font-size: 14px; cursor: pointer;
@@ -511,6 +545,7 @@ function showFeedback(msg, type) {
   }
   .sheet-btn:active { opacity: 0.8; }
   .sheet-danger { color: #FF4D4F; }
+  .sheet-paper { color: #52c41a; }
   .sheet-cancel { background: #2a2a3e; color: #888; }
 }
 </style>

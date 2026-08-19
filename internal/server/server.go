@@ -319,6 +319,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/paper/trades", s.authMiddleware(s.handlePaperTrades))
 	s.mux.HandleFunc("GET /api/paper/equity", s.authMiddleware(s.handlePaperEquity))
 	s.mux.HandleFunc("POST /api/paper/sell", s.authMiddleware(s.handlePaperSell))
+	s.mux.HandleFunc("POST /api/paper/buy", s.authMiddleware(s.handlePaperBuy))
 	s.mux.HandleFunc("POST /api/paper/reset", s.authMiddleware(s.handlePaperReset))
 	s.mux.HandleFunc("POST /api/positions", s.authMiddleware(s.handleCreatePosition))
 	s.mux.HandleFunc("PUT /api/positions/{id}", s.authMiddleware(s.handleUpdatePosition))

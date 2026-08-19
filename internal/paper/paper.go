@@ -133,7 +133,7 @@ type Trade struct {
 	Time        time.Time `json:"time"`
 	// LatencySec 信号发出→成交 的秒数（买入时记录；量化信号时效性）。
 	// English: seconds from signal generation to fill (recorded on buys; quantifies signal timeliness).
-	LatencySec int64 `json:"latency_sec,omitempty"`
+	LatencySec int64  `json:"latency_sec,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 }
 
@@ -296,51 +296,87 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		} else {
 			continue
 		}
-		qty := int(e.cfg.FixedAmount / price / 100) * 100
-		if qty <= 0 {
-			continue // 一手都买不起，跳过（不足 A 股一手）
-		}
-		cost := float64(qty) * price
-		if cost > e.cash {
-			continue // 现金不足，跳过
-		}
-		e.cash -= cost
-		e.positions[s.Code] = &Position{
-			Code:        s.Code,
-			Name:        s.Name,
-			Strategy:    s.Strategy,
-			Qty:         qty,
-			CostPrice:   price,
-			Cost:        cost,
-			SignalPrice: s.Price,
-			SignalAt:    s.GeneratedAt,
-			FilledAt:    now,
-			Mark:        price,
-		}
-		latency := int64(0)
-		if !s.GeneratedAt.IsZero() {
-			latency = int64(now.Sub(s.GeneratedAt).Seconds())
-			if latency < 0 {
-				latency = 0
-			}
-		}
-		e.trades = append(e.trades, Trade{
-			Code:        s.Code,
-			Name:        s.Name,
-			Strategy:    s.Strategy,
-			Side:        "buy",
-			Price:       price,
-			SignalPrice: s.Price,
-			Qty:         qty,
-			Amount:      cost,
-			Time:        now,
-			LatencySec:  latency,
-			Reason:      s.Reason,
-		})
-		log.Printf("[paper] 模拟买入 %s(%s) %d股 @%.2f 信号价%.2f 延迟%ds",
-			s.Code, s.Name, qty, price, s.Price, latency)
+		e.fillLocked(s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, s.Reason)
 	}
 	e.persist()
+}
+
+// fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
+// English: fills a buy at the given price (caller must hold the lock); returns an error on failure.
+func (e *Engine) fillLocked(code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, reason string) error {
+	qty := int(e.cfg.FixedAmount/price/100) * 100
+	if qty <= 0 {
+		return errLotTooSmall // 一手都买不起（不足 A 股一手）
+	}
+	cost := float64(qty) * price
+	if cost > e.cash {
+		return errCash
+	}
+	e.cash -= cost
+	e.positions[code] = &Position{
+		Code:        code,
+		Name:        name,
+		Strategy:    strategy,
+		Qty:         qty,
+		CostPrice:   price,
+		Cost:        cost,
+		SignalPrice: signalPrice,
+		SignalAt:    signalAt,
+		FilledAt:    now,
+		Mark:        price,
+	}
+	latency := int64(0)
+	if !signalAt.IsZero() {
+		latency = int64(now.Sub(signalAt).Seconds())
+		if latency < 0 {
+			latency = 0
+		}
+	}
+	e.trades = append(e.trades, Trade{
+		Code:        code,
+		Name:        name,
+		Strategy:    strategy,
+		Side:        "buy",
+		Price:       price,
+		SignalPrice: signalPrice,
+		Qty:         qty,
+		Amount:      cost,
+		Time:        now,
+		LatencySec:  latency,
+		Reason:      reason,
+	})
+	log.Printf("[paper] 模拟买入 %s(%s) %d股 @%.2f 信号价%.2f 延迟%ds",
+		code, name, qty, price, signalPrice, latency)
+	return nil
+}
+
+// Buy 手动按实时价买入一只股票（APK/前端信号页"模拟买入"按钮触发）。
+// 与自动撮合共用 fillLocked：同一持仓去重/仓位上限/现金约束。
+// English: manually buys one stock at the live price (triggered by the APK/frontend signal page's
+// "paper buy" button). Shares fillLocked with auto-fill: dedupe / position cap / cash checks.
+func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes map[string]*data.StockInfo) error {
+	if !e.cfg.Enabled {
+		return errDisabled
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, held := e.positions[code]; held {
+		return errHeld
+	}
+	if len(e.positions) >= e.cfg.MaxPositions {
+		return errMaxPos
+	}
+	var price float64
+	if q, ok := quotes[code]; ok && q != nil && q.Price > 0 {
+		price = q.Price
+	} else {
+		return errNoQuote
+	}
+	if err := e.fillLocked(code, name, strategy, signalPrice, time.Now(), time.Now(), price, "手动模拟买入"); err != nil {
+		return err
+	}
+	e.persist()
+	return nil
 }
 
 // MarkToMarket 用实时快照价更新持仓估值价。
@@ -560,9 +596,13 @@ func (e *Engine) Stats() Stats {
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
 var (
-	errDisabled = errMsg("模拟盘未启用")
-	errNotHeld  = errMsg("未持有该股票")
-	errNoQuote  = errMsg("无实时行情，无法成交")
+	errDisabled    = errMsg("模拟盘未启用")
+	errNotHeld     = errMsg("未持有该股票")
+	errNoQuote     = errMsg("无实时行情，无法成交")
+	errHeld        = errMsg("已持有该股票")
+	errMaxPos      = errMsg("已达持仓数量上限")
+	errLotTooSmall = errMsg("资金不足以买入一手")
+	errCash        = errMsg("可用资金不足")
 )
 
 type errMsg string
