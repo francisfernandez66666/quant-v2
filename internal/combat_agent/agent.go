@@ -847,6 +847,7 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			Reason:      sigReason,
 			Sector:      sectorName,
 			GeneratedAt: now,
+			Meta:        sig.Meta,
 		})
 	}
 	// 动量分已在循环前计算并写入下方 sc（保持 8a/8b 打分量输出一致）

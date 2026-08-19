@@ -92,10 +92,10 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			Action:       s.Action,
 			Price:        s.Price,
 			CanOpen:      s.Confidence >= 0.7 && s.Action == "buy",
-			D1:           s.Confidence * 100,
-			D2:           s.Confidence * 100,
-			D3:           s.Confidence * 100,
-			D4:           s.Confidence * 100,
+			D1:           metaD(s, "d1"),
+			D2:           metaD(s, "d2"),
+			D3:           metaD(s, "d3"),
+			D4:           metaD(s, "d4"),
 			D1Desc:       s.Reason,
 			D2Desc:       s.Sector,
 			SignalActive: true,
@@ -108,6 +108,17 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 		out = append(out, fs)
 	}
 	return out
+}
+
+// metaD 从信号 Meta 读取某维度的真实评分（d1/d2/d3/d4），缺失或非正数返回 0。
+// 修复历史问题：旧实现把 Confidence×100 复用到全部维度，导致前端 D2/D3/D4 虚高为总分。
+// English: reads a real dimension score (d1/d2/d3/d4) from signal Meta; 0 when absent. Fixes the
+// legacy bug of reusing Confidence×100 for every dimension, which inflated D2/D3/D4 to the total.
+func metaD(s combat_agent.Signal, key string) float64 {
+	if s.Meta == nil {
+		return 0
+	}
+	return s.Meta[key]
 }
 
 // filterStaleSignals 信号展示的实时复核（仅影响"当前信号"展示，不改写任何存储/日志）：

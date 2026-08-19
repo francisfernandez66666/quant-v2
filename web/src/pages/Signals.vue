@@ -65,13 +65,13 @@
             <span v-else class="d1-none">{{ s.d1 ? s.d1.toFixed(0) : '—' }}</span>
           </span>
           <span class="d-pill d2" :title="'D2: ' + (s.d2_desc || '')">
-            {{ (s.d2 || 0).toFixed(0) }}<em v-if="s.d2_desc">{{ shortDesc(s.d2_desc) }}</em>
+            {{ s.d2 ? s.d2.toFixed(0) : '—' }}<em v-if="s.d2_desc">{{ shortDesc(s.d2_desc) }}</em>
           </span>
           <span class="d-pill d3" :title="'D3: ' + (s.d3_desc || '')">
-            {{ (s.d3 || 0).toFixed(0) }}<em v-if="s.d3_desc">{{ shortDesc(s.d3_desc) }}</em>
+            {{ s.d3 ? s.d3.toFixed(0) : '—' }}<em v-if="s.d3_desc">{{ shortDesc(s.d3_desc) }}</em>
           </span>
           <span class="d-pill d4" :title="'D4: ' + (s.d4_desc || '')">
-            {{ (s.d4 || 0).toFixed(0) }}<em v-if="s.d4_desc">{{ shortDesc(s.d4_desc) }}</em>
+            {{ s.d4 ? s.d4.toFixed(0) : '—' }}<em v-if="s.d4_desc">{{ shortDesc(s.d4_desc) }}</em>
           </span>
         </span>
         <span class="col-kline" data-label="分时">

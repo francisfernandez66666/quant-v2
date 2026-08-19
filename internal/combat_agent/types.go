@@ -101,6 +101,12 @@ type Signal struct {
 	D1Reason  string  `json:"d1_reason,omitempty"`  // D1 事件分析理由（LLM）
 	D1Event   string  `json:"d1_event,omitempty"`   // D1 关联事件名称
 
+	// Meta 策略评分明细（key=d1/d2/d3/d4 等），从 strategy.Signal.Meta 原样拷贝，
+	// 供前端展示真实维度分（避免把总分复用到各维度）。
+	// English: per-dimension score breakdown (keys d1/d2/d3/d4...) copied verbatim from
+	// strategy.Signal.Meta, so the frontend shows real dimension scores instead of the total.
+	Meta map[string]float64 `json:"meta,omitempty"`
+
 	// DepthFactors 盘口派生因子（免费源五档，Level-2 可扩十档）：供战法读取买卖压力/封单量。
 	// 仅当数据可用时填充（omitempty），缺失为零值——战法应容忍因子缺失。
 	// English: derived order-book factors (5 levels free / 10 with Level-2) for strategies to read
