@@ -35,10 +35,11 @@ func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"enabled":      pe.Enabled(),
-		"is_admin":     s.auth.IsAdmin(uid),
-		"stats":        pe.Stats(),
+		"enabled":         pe.Enabled(),
+		"is_admin":        s.auth.IsAdmin(uid),
+		"stats":           pe.Stats(),
 		"initial_capital": pe.Cfg().InitialCapital,
+		"max_positions":   pe.Cfg().MaxPositions,
 	})
 }
 
@@ -145,9 +146,11 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePaperReset 清盘模拟盘（按最后估值价平仓全部持仓，重置现金/成交/净值）。
-// 请求体可选 {"initial_capital": 200000} 自定义初始资金（>0 生效）。
+// 请求体可选 {"initial_capital": 200000} 自定义初始资金（>0 生效），
+// {"max_positions": 20} 自定义持仓上限（>0 生效；0/缺省=不设限，由资金自然决定）。
 // English: liquidates the paper book at the last mark and resets cash/trades/equity.
-// Optional body {"initial_capital": 200000} customizes the starting capital (applies when > 0).
+// Optional body {"initial_capital": 200000} customizes the starting capital (applies when > 0),
+// {"max_positions": 20} customizes the position cap (applies when > 0; 0/missing = unlimited).
 func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	pe := s.paperEngineFor(requestUserID(r))
 	if pe == nil {
@@ -156,8 +159,16 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		InitialCapital float64 `json:"initial_capital"`
+		MaxPositions   int     `json:"max_positions"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	pe.Reset(req.InitialCapital)
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "initial_capital": pe.Cfg().InitialCapital})
+	if req.MaxPositions > 0 {
+		pe.SetMaxPositions(req.MaxPositions)
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"ok":             true,
+		"initial_capital": pe.Cfg().InitialCapital,
+		"max_positions":  pe.Cfg().MaxPositions,
+	})
 }

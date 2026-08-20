@@ -26,8 +26,8 @@ import (
 // English: paper-trading config (rules.paper).
 type Config struct {
 	Enabled        bool    `json:"enabled"`         // 总开关（默认 false）
-	FixedAmount    float64 `json:"fixed_amount"`    // 每票固定买入资金（元，默认 10000）
-	MaxPositions   int     `json:"max_positions"`   // 最大并行持仓数（默认 10）
+	FixedAmount    float64 `json:"fixed_amount"`    // 每票固定买入资金（元，默认 10000；现金不足时按剩余现金整手买入）
+	MaxPositions   int     `json:"max_positions"`   // 自定义持仓上限（0=不设限，持仓数由本金/现金余额自然决定；默认 0）
 	InitialCapital float64 `json:"initial_capital"` // 初始资金（元，默认 100000）
 }
 
@@ -37,7 +37,7 @@ func DefaultConfig() Config {
 	return Config{
 		Enabled:        false,
 		FixedAmount:    10000,
-		MaxPositions:   10,
+		MaxPositions:   0,
 		InitialCapital: 100000,
 	}
 }
@@ -189,9 +189,6 @@ func New(cfg Config, path string) *Engine {
 	if cfg.FixedAmount <= 0 {
 		cfg.FixedAmount = 10000
 	}
-	if cfg.MaxPositions <= 0 {
-		cfg.MaxPositions = 10
-	}
 	if cfg.InitialCapital <= 0 {
 		cfg.InitialCapital = 100000
 	}
@@ -228,6 +225,7 @@ func (e *Engine) Cfg() Config {
 type persistedState struct {
 	Cash           float64              `json:"cash"`
 	InitialCapital float64              `json:"initial_capital,omitempty"` // 自定义初始资金（reset 设置；空历史时保留，重启后恢复）
+	MaxPositions   int                  `json:"max_positions,omitempty"`   // 自定义持仓上限（>0 生效；0=不设限，由资金自然决定）
 	Positions      map[string]*Position `json:"positions"`
 	Trades         []Trade              `json:"trades"`
 	Equity         []EquityPoint        `json:"equity"`
@@ -243,6 +241,7 @@ func (e *Engine) persist() {
 	st := persistedState{
 		Cash:           e.cash,
 		InitialCapital: e.cfg.InitialCapital,
+		MaxPositions:   e.cfg.MaxPositions,
 		Positions:      e.positions,
 		Trades:         e.trades,
 		Equity:         e.equity,
@@ -279,6 +278,9 @@ func (e *Engine) load() {
 	if st.InitialCapital > 0 {
 		e.cfg.InitialCapital = st.InitialCapital
 	}
+	if st.MaxPositions > 0 {
+		e.cfg.MaxPositions = st.MaxPositions
+	}
 	e.cash = st.Cash
 	e.realized = st.Realized
 	if st.Positions != nil {
@@ -310,7 +312,10 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if _, held := e.positions[s.Code]; held {
 			continue
 		}
-		if len(e.positions) >= e.cfg.MaxPositions {
+		// 自定义持仓上限：>0 时封顶；0（默认）不设限，持仓数由本金/现金余额自然决定。
+		// English: custom position cap — enforced only when > 0; 0 (default) means unlimited, with the
+		// position count naturally bounded by the capital / cash balance.
+		if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 			return
 		}
 		var price float64
@@ -330,15 +335,25 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 }
 
 // fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
+// 每票按 FixedAmount 整手买入；现金不足买足额时按剩余现金缩减到整手（不足一手跳过），
+// 让持仓数由本金与现金余额自然决定（灵活持仓）。
 // English: fills a buy at the given price (caller must hold the lock); returns an error on failure.
+// Each stock is bought with FixedAmount in board lots; when cash is short of the full amount, the qty
+// shrinks to the affordable whole lot (skipped below one lot), so position count follows the balance.
 func (e *Engine) fillLocked(code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, reason string) error {
-	qty := int(e.cfg.FixedAmount/price/100) * 100
+	qty := int(e.cfg.FixedAmount / price / 100) * 100
 	if qty <= 0 {
 		return errLotTooSmall // 一手都买不起（不足 A 股一手）
 	}
 	cost := float64(qty) * price
 	if cost > e.cash {
-		return errCash
+		// 现金不足：按剩余现金缩减到整手；缩减后仍买不起一手则跳过
+		// English: cash short — shrink to the largest affordable whole lot; skip if below one lot.
+		qty = int(e.cash / price / 100) * 100
+		if qty <= 0 {
+			return errCash
+		}
+		cost = float64(qty) * price
 	}
 	e.cash -= cost
 	e.positions[code] = &Position{
@@ -391,7 +406,7 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 	if _, held := e.positions[code]; held {
 		return errHeld
 	}
-	if len(e.positions) >= e.cfg.MaxPositions {
+	if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 		return errMaxPos
 	}
 	var price float64
@@ -510,6 +525,18 @@ func (e *Engine) Reset(initialCapital float64) {
 	e.trades = nil
 	e.equity = nil
 	e.realized = 0
+	e.persist()
+}
+
+// SetMaxPositions 设置自定义持仓上限（>0 生效；0/负数=不设限，由资金自然决定），并持久化。
+// English: sets the custom position cap (>0 applies; <=0 means unlimited, driven by the balance) and persists it.
+func (e *Engine) SetMaxPositions(n int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	e.cfg.MaxPositions = n
 	e.persist()
 }
 

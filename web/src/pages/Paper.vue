@@ -19,6 +19,9 @@
         </span>
         <input v-model="initCapital" type="number" min="10000" step="10000"
                :disabled="!enabled" class="cap-input" placeholder="初始资金" :title="'当前初始资金 ' + fmt(initialCapital)" />
+        <input v-model="maxPos" type="number" min="0" step="1"
+               :disabled="!enabled" class="cap-input cap-max" placeholder="持仓上限" title="持仓上限（0=不设限，由资金决定持仓）" />
+        <button class="btn-confirm" :disabled="!enabled" @click="confirmCapital">确认资金</button>
         <button class="btn-reset" :disabled="!enabled" @click="doReset">清盘重置</button>
       </div>
     </div>
@@ -95,8 +98,18 @@
       <div v-else class="empty-hint">净值数据不足（模拟盘开启并产生成交后显示）</div>
     </div>
 
+    <!-- 持仓 / 成交日志 页签（tabs: positions / trade log）-->
+    <div class="tabs">
+      <button class="tab" :class="{ active: tab === 'positions' }" @click="tab = 'positions'">
+        当前持仓 <em class="sub">{{ positions.length }} 只</em>
+      </button>
+      <button class="tab" :class="{ active: tab === 'trades' }" @click="tab = 'trades'">
+        成交日志 <em class="sub">{{ trades.length }} 笔</em>
+      </button>
+    </div>
+
     <!-- 持仓表（Positions table）-->
-    <div class="panel">
+    <div class="panel" v-if="tab === 'positions'">
       <div class="panel-title">当前持仓 <em class="sub">{{ positions.length }} 只</em></div>
       <table class="data-table" v-if="positions.length">
         <thead>
@@ -127,9 +140,9 @@
       <div v-else class="empty-hint">暂无持仓（出现可开仓信号时按实时价自动买入）</div>
     </div>
 
-    <!-- 成交记录（Fill records）-->
-    <div class="panel">
-      <div class="panel-title">成交记录 <em class="sub">{{ trades.length }} 笔</em></div>
+    <!-- 成交记录（Fill records / trade log）-->
+    <div class="panel" v-if="tab === 'trades'">
+      <div class="panel-title">成交日志 <em class="sub">{{ trades.length }} 笔</em></div>
       <table class="data-table" v-if="trades.length">
         <thead>
           <tr>
@@ -165,7 +178,9 @@ import * as api from '../api/index.js' // 后端 API 封装（模拟盘接口）
 // ── 状态 ── (State)
 const enabled = ref(false)       // 模拟盘总开关
 const isAdmin = ref(false)       // admin 账户标记（模拟盘可联动回测/自动化交易）
-const initialCapital = ref('')   // 自定义初始资金输入（清盘重置时生效）
+const initialCapital = ref('')   // 自定义初始资金输入（确认资金/清盘重置时生效）
+const maxPos = ref('')           // 自定义持仓上限输入（0=不设限）
+const tab = ref('positions')     // 页签：positions=持仓 / trades=成交日志
 const stats = ref(null)          // 绩效与信号质量汇总
 const positions = ref([])        // 当前持仓
 const trades = ref([])           // 成交记录
@@ -209,6 +224,7 @@ async function load() {
     enabled.value = !!st.enabled
     isAdmin.value = !!st.is_admin
     if (st.initial_capital > 0 && !initialCapital.value) initialCapital.value = String(st.initial_capital)
+    if (st.max_positions !== undefined && !maxPos.value) maxPos.value = st.max_positions > 0 ? String(st.max_positions) : '0'
     stats.value = st.stats || null
   } catch (_) {}
   if (!enabled.value) return
@@ -227,14 +243,27 @@ async function sell(code) {
   } catch (e) { alert(e.message || '卖出失败') }
 }
 
-// 清盘重置：确认后重置现金/成交/净值；输入框数值>0 时一并自定义初始资金
-// Reset: confirm then reset cash/trades/equity; a positive input also customizes the starting capital
-async function doReset() {
+// 确认资金：输入初始资金（可选持仓上限）后点确认，弹窗确认后清盘并按新资金/上限重开模拟盘
+// Confirm capital: after entering a starting capital (and optional position cap), confirm with a
+// dialog, then liquidate and reopen the paper book with the new capital/cap.
+async function confirmCapital() {
   const cap = parseFloat(initialCapital.value)
-  const hint = cap > 0 ? '（并设置初始资金为 ¥' + fmt(cap) + '）' : ''
-  if (!confirm('清盘模拟盘？将按最后估值价平仓全部持仓并重置净值。此操作不影响真实持仓。' + hint)) return
+  if (!(cap > 0)) { alert('请输入有效的初始资金'); return }
+  const mp = parseInt(maxPos.value, 10)
+  const capHint = mp > 0 ? '，持仓上限 ' + mp + ' 只' : '（持仓上限不设限，由资金决定）'
+  if (!confirm('确认设置初始资金为 ¥' + fmt(cap) + capHint + '？将清空当前模拟盘重新开始。')) return
   try {
-    await api.resetPaper(cap > 0 ? cap : 0)
+    await api.resetPaper(cap, mp > 0 ? mp : 0)
+    await load()
+  } catch (e) { alert(e.message || '设置失败') }
+}
+
+// 清盘重置：仅清仓并按配置初始资金重置，不修改自定义资金
+// Reset: liquidate everything and reset to the configured capital, without changing custom settings
+async function doReset() {
+  if (!confirm('清盘模拟盘？将按最后估值价平仓全部持仓并重置净值。此操作不影响真实持仓。')) return
+  try {
+    await api.resetPaper(0, 0)
     await load()
   } catch (e) { alert(e.message || '重置失败') }
 }
@@ -259,8 +288,14 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .admin-badge { font-size: 12px; padding: 3px 10px; border-radius: 10px; background: rgba(255, 213, 79, 0.15); color: #FFD54F; }
 .cap-input { background: #16162a; color: #e6edf3; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 6px 10px; font-size: 13px; width: 120px; }
 .cap-input:disabled { opacity: 0.4; cursor: not-allowed; }
+.cap-max { width: 90px; }
+.btn-confirm { background: rgba(82, 196, 26, 0.15); color: #52c41a; border: 1px solid rgba(82, 196, 26, 0.4); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.btn-confirm:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn-reset { background: rgba(255, 77, 79, 0.12); color: #FF4D4F; border: 1px solid rgba(255, 77, 79, 0.35); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .btn-reset:disabled { opacity: 0.4; cursor: not-allowed; }
+.tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+.tab { background: rgba(255, 255, 255, 0.04); color: #8fa3bf; border: 1px solid rgba(255, 255, 255, 0.1); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+.tab.active { background: rgba(255, 77, 79, 0.12); color: #FF4D4F; border-color: rgba(255, 77, 79, 0.4); }
 .panel { background: #1b1b30; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
 .panel-title { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
 .sub { font-size: 12px; font-weight: 400; color: #8fa3bf; font-style: normal; }
