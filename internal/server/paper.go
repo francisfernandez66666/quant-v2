@@ -145,12 +145,19 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }
 
-// handlePaperReset 清盘模拟盘（按最后估值价平仓全部持仓，重置现金/成交/净值）。
-// 请求体可选 {"initial_capital": 200000} 自定义初始资金（>0 生效），
-// {"max_positions": 20} 自定义持仓上限（>0 生效；0/缺省=不设限，由资金自然决定）。
-// English: liquidates the paper book at the last mark and resets cash/trades/equity.
-// Optional body {"initial_capital": 200000} customizes the starting capital (applies when > 0),
-// {"max_positions": 20} customizes the position cap (applies when > 0; 0/missing = unlimited).
+// handlePaperReset 重置模拟盘。区分两种语义（联动版前端两个按钮）：
+//   - 请求体带 {"initial_capital":N}（>0）→ 确认资金：Reconfigure 设置新初始资金/持仓上限，
+//     清空当前持仓、净值从新资金重开，**保留成交日志**（历史固化不丢）。
+//   - 请求体不带/为 0 → 清盘重置：Reset 只清空重开（持仓/成交/净值），不改自定义资金与上限。
+//     可选 {"max_positions":N} 自定义持仓上限（>=0 生效；0=不设限，由资金自然决定）。
+//
+// English: resets the paper book. Two semantics (matching the two frontend buttons):
+//   - body with {"initial_capital":N} (>0) → confirm capital: Reconfigure applies the new starting
+//     capital / position cap, clears positions, restarts the equity curve from the new capital, and
+//     **keeps the fill log** (history survives a capital change).
+//   - body absent / zero → liquidate: Reset just reopens the book (positions/trades/equity cleared)
+//     without changing the user's customized capital or cap.
+//     Optional {"max_positions":N} customizes the position cap (applies when >= 0; 0 = unlimited).
 func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	pe := s.paperEngineFor(requestUserID(r))
 	if pe == nil {
@@ -162,9 +169,15 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 		MaxPositions   int     `json:"max_positions"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	pe.Reset(req.InitialCapital)
-	if req.MaxPositions > 0 {
-		pe.SetMaxPositions(req.MaxPositions)
+	if req.InitialCapital > 0 {
+		// 确认资金：设新资金/上限，保留成交日志，净值从新资金重开
+		pe.Reconfigure(req.InitialCapital, req.MaxPositions)
+	} else {
+		// 清盘重置：不改资金/上限，仅清空重开
+		pe.Reset()
+		if req.MaxPositions >= 0 && req.InitialCapital == 0 && req.MaxPositions > 0 {
+			pe.SetMaxPositions(req.MaxPositions)
+		}
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":             true,

@@ -131,11 +131,31 @@ func TestSellAndReset(t *testing.T) {
 	if len(e.Positions()) != 0 {
 		t.Fatalf("应已清仓")
 	}
-	// 复位
-	e.Reset(0)
+	// 清盘重置：不改资金，现金恢复初始，全部清空（持仓/成交/净值）
+	e.Reset()
 	st = e.Stats()
 	if st.Cash != 100000 || len(e.Trades()) != 0 || len(e.Equity()) != 0 {
-		t.Errorf("复位后应回到初始状态: cash=%v trades=%d equity=%d", st.Cash, len(e.Trades()), len(e.Equity()))
+		t.Errorf("清盘重置后应回到初始状态: cash=%v trades=%d equity=%d", st.Cash, len(e.Trades()), len(e.Equity()))
+	}
+	// 确认资金：设新初始资金/上限，保留成交日志，净值从新资金重开
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "N形", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	e.Snapshot(now)
+	before := len(e.Trades())
+	e.Reconfigure(500000, 5)
+	st = e.Stats()
+	if st.InitialCapital != 500000 || st.Cash != 500000 {
+		t.Errorf("确认资金后初始资金/现金应为 500000, 实际 %v/%v", st.InitialCapital, st.Cash)
+	}
+	if len(e.Positions()) != 0 || len(e.Equity()) != 0 {
+		t.Errorf("确认资金后应清空持仓与净值曲线: pos=%d equity=%d", len(e.Positions()), len(e.Equity()))
+	}
+	if got := len(e.Trades()); got != before {
+		t.Errorf("确认资金应保留成交日志: 之前 %d 笔, 现在 %d 笔", before, got)
+	}
+	if got := e.Cfg().MaxPositions; got != 5 {
+		t.Errorf("确认资金后持仓上限应为 5, 实际 %d", got)
 	}
 }
 

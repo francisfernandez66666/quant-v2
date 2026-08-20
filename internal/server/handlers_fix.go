@@ -409,6 +409,10 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 // （handleFixEngineHealth handles GET /api/engine_health, returning the health status of each engine subsystem.）
 func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.ctrlFor(requestUserID(r))
+	// 模拟盘子系统：流程引擎的信号/估值分发目标，账户级引擎存在且启用即健康。
+	// English: paper subsystem — the pipeline's signal/mark dispatch target; healthy when the
+	// account-level engine exists and is enabled.
+	pe := s.paperEngineFor(requestUserID(r))
 	status := map[string]bool{
 		"news_agent":      ctrl != nil && ctrl.GetAllNewsEvents() != nil,
 		"strategy_engine": ctrl != nil && ctrl.GetStageRecords() != nil,
@@ -418,6 +422,7 @@ func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 		"ths":             s.ths != nil,
 		"fetcher":         s.fetcher != nil,
 		"aggregator":      ctrl != nil,
+		"paper":           pe != nil && pe.Enabled(),
 	}
 	writeJSON(w, 200, status)
 }

@@ -149,7 +149,7 @@
 <script setup>
 // ── 依赖导入 ── (Imports)
 // ref 定义响应式数据；onMounted / onUnmounted 注册组件生命周期钩子 (ref for reactive data; onMounted/onUnmounted for lifecycle hooks)
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 // useRouter 获取路由实例，用于退出登录后编程式跳转 (useRouter for programmatic navigation after logout)
 import { useRouter } from 'vue-router'
 // 后端 API 方法统一挂载在 api 命名空间下 (all backend API methods are namespaced under api)
@@ -174,10 +174,28 @@ const shortEnabled = ref(false)      // 做空开关状态 (short-selling toggle
 
 // ── 权限门禁 ──
 // ── Permission gates ──
+// 说明：canResearch / canAdmin 用 ref 而非 computed —— computed 依赖 api.isAdmin()/hasPerm()
+//       读取的是 localStorage（非响应式），退出再换账号登录时 computed 缓存不会失效，
+//       导致管理员 tab（自动研究/用户管理）残留或丢失。故改为响应式 ref，
+//       在登录成功 / 恢复会话 / 退出时显式调用 applyRoleGates() 重算。
+// Note: canResearch / canAdmin are refs, not computed — a computed depending on api.isAdmin()/hasPerm()
+//       reads localStorage (non-reactive), so its cache never invalidates when the account is switched
+//       after logout, leaving the admin tabs (自动研究 / 用户管理) stale or missing. They are therefore
+//       reactive refs, recomputed explicitly via applyRoleGates() on login / session restore / logout.
 // 是否可进入"自动研究"页（拥有 research_approve 权限位或 admin）
-const canResearch = computed(() => api.hasPerm('research_approve'))
+// Whether the "自动研究" page is reachable (holds the research_approve bit or is admin)
+const canResearch = ref(false)
 // 是否可进入"用户管理"页（仅 admin）
-const canAdmin = computed(() => api.isAdmin())
+// Whether the "用户管理" page is reachable (admin only)
+const canAdmin = ref(false)
+
+// 依据当前账号角色/权限位刷新侧栏权限门禁（换账号/登录/退出后必须调用，保证 tab 与账号一致）
+// Recomputes the sidebar permission gates from the current account's role/perms; must be called after
+// account switch / login / logout so the tabs always match the logged-in account.
+function applyRoleGates() {
+  canResearch.value = api.hasPerm('research_approve')
+  canAdmin.value = api.isAdmin()
+}
 // 是否展示"模拟盘"入口：后端启用模拟盘时才显示（仅一次探测，避免多余请求）
 const paperEnabled = ref(false)
 api.fetchPaperState().then(d => { paperEnabled.value = !!d.enabled }).catch(() => { paperEnabled.value = false })
@@ -242,9 +260,11 @@ async function checkAuth() {
     // 静默刷新当前用户角色/权限位（页面刷新后兜底，失败不影响主界面）
     // Silently refresh role/perms after a page reload (best-effort; failure keeps the UI usable)
     try { await api.refreshMe() } catch (_) {}
+    applyRoleGates()
     return true
   }
   loggedIn.value = false
+  applyRoleGates()
   return false
 }
 
@@ -262,6 +282,9 @@ async function handleLogin() {
     await api.login(username.value, password.value)
     account.value = api.getAccount()
     loggedIn.value = true
+    // 登录成功后按新账号角色/权限位刷新侧栏权限门禁（换账号后管理员 tab 正确显隐）
+    // After login, recompute the sidebar gates from the new account's role/perms (admin tabs show/hide correctly)
+    applyRoleGates()
     // 登录成功后启动轮询，并顺带请求通知权限 (start polling after login and request notification permission)
     startPolling()
     addToast('登录成功', 'success')
@@ -285,6 +308,9 @@ function logout() {
   stopPolling()
   loggedIn.value = false
   menuOpen.value = false
+  // 退出后清空侧栏权限门禁（避免下次登录其他账号时残留管理员 tab）
+  // Clear the sidebar gates on logout so a later login as another account never shows stale admin tabs
+  applyRoleGates()
   router.push('/')
 }
 

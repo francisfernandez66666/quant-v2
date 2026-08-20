@@ -225,7 +225,11 @@ func (e *Engine) Cfg() Config {
 type persistedState struct {
 	Cash           float64              `json:"cash"`
 	InitialCapital float64              `json:"initial_capital,omitempty"` // 自定义初始资金（reset 设置；空历史时保留，重启后恢复）
-	MaxPositions   int                  `json:"max_positions,omitempty"`   // 自定义持仓上限（>0 生效；0=不设限，由资金自然决定）
+	// 自定义持仓上限：>0 生效，0=不设限（由资金自然决定）。不用 omitempty，
+	// 保证 0（不设限）也明确落盘可见，避免"上限设置没固化"的排查困惑。
+	// English: custom position cap — applies when > 0, 0 = unlimited (driven by the balance).
+	// No omitempty so that 0 (unlimited) is explicitly written to disk, avoiding "cap not persisted" confusion.
+	MaxPositions int `json:"max_positions"`
 	Positions      map[string]*Position `json:"positions"`
 	Trades         []Trade              `json:"trades"`
 	Equity         []EquityPoint        `json:"equity"`
@@ -473,7 +477,11 @@ func (e *Engine) MarkToMarket(quotes map[string]*data.StockInfo) {
 }
 
 // Snapshot 记录当日净值（同一交易日只保留最新一个点）。
+// 值变化才落盘：同日净值不变（价格未波动）不再重复写盘，
+// 避免近实时循环每 5s 一次的无意义 IO/日志压力（低配服务器磁盘与 CPU 友好）。
 // English: records the day's equity (one point per trading day, overwritten when the day repeats).
+// Persists only when the value actually changes — a same-day identical value is not rewritten,
+// cutting the pointless every-5s write (friendly to the small server's disk and CPU).
 func (e *Engine) Snapshot(now time.Time) {
 	if !e.cfg.Enabled {
 		return
@@ -484,7 +492,11 @@ func (e *Engine) Snapshot(now time.Time) {
 	mv := e.marketValueLocked()
 	val := e.cash + mv
 	if len(e.equity) > 0 && e.equity[len(e.equity)-1].Date == date {
-		e.equity[len(e.equity)-1] = EquityPoint{Date: date, Value: val, Cash: e.cash}
+		last := &e.equity[len(e.equity)-1]
+		if last.Value == val && last.Cash == e.cash {
+			return
+		}
+		*last = EquityPoint{Date: date, Value: val, Cash: e.cash}
 	} else {
 		e.equity = append(e.equity, EquityPoint{Date: date, Value: val, Cash: e.cash})
 	}
@@ -538,16 +550,46 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	return nil
 }
 
-// Reset 清盘模拟盘：全部持仓按最后估值价平仓，清空成交/净值并重置现金。
-// initialCapital >0 时同时自定义初始资金（否则沿用当前配置默认）。
-// English: liquidates everything at the last mark, wipes trades/equity and resets cash.
-// A positive initialCapital also customizes the starting capital (otherwise the configured default).
-func (e *Engine) Reset(initialCapital float64) {
+// Reconfigure 确认资金：按新初始资金/持仓上限重开模拟盘，并落盘固化。
+// 语义（对应前端"确认资金"按钮）：
+//   - initialCapital > 0 时设置新初始资金（否则沿用当前初始资金）
+//   - maxPositions >= 0 时设置新持仓上限（0 = 不设限，由资金自然决定）
+//   - 现金重置为新初始资金，清空当前持仓与已实现盈亏
+//   - 净值曲线从新资金重新记录（equity 清空，重新按日 Snapshot）
+//   - 成交日志保留（trades 不清，3 个月自动清理继续生效）——历史交易固化，改资金不丢
+//
+// English: Reconfigure reopens the paper book with a new starting capital / position cap and persists.
+// Semantics (the frontend "confirm capital" action):
+//   - a positive initialCapital sets the new starting capital (otherwise the current one is kept)
+//   - a non-negative maxPositions sets the new position cap (0 = unlimited, driven by the balance)
+//   - cash resets to the new starting capital; current positions and realized P/L are cleared
+//   - the equity curve restarts from the new capital (equity cleared, re-snapshotted daily)
+//   - the fill log is preserved (trades kept; the 3-month retention still applies) — history survives a
+//     capital change instead of being wiped.
+func (e *Engine) Reconfigure(initialCapital float64, maxPositions int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if initialCapital > 0 {
 		e.cfg.InitialCapital = initialCapital
 	}
+	if maxPositions >= 0 {
+		e.cfg.MaxPositions = maxPositions
+	}
+	e.cash = e.cfg.InitialCapital
+	e.positions = make(map[string]*Position)
+	e.equity = nil
+	e.realized = 0
+	e.persist()
+}
+
+// Reset 清盘重置：不改资金/持仓上限，按当前初始资金恢复现金，清空持仓/成交/净值/已实现盈亏。
+// 对应前端"清盘重置"按钮——只清空重开，不修改用户已自定义的资金与上限设置。
+// English: Reset liquidates the whole book without touching capital/cap: cash restores to the current
+// initial capital, while positions/trades/equity/realized are all cleared. Backs the frontend
+// "清盘重置" button — it only clears, never changes the user's customized capital and cap.
+func (e *Engine) Reset() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.cash = e.cfg.InitialCapital
 	e.positions = make(map[string]*Position)
 	e.trades = nil

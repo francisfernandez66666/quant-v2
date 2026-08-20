@@ -17,7 +17,10 @@
         <span class="enabled-badge" :class="enabled ? 'on' : 'off'">
           {{ enabled ? '自动撮合中' : '未启用（rules.paper.enabled）' }}
         </span>
-        <input v-model="initCapital" type="number" min="10000" step="10000"
+        <span class="cap-badge" v-if="enabled" title="当前生效的持仓上限（经确认资金固化）">
+          上限：{{ appliedMax > 0 ? appliedMax + ' 只' : '不设限' }}
+        </span>
+        <input v-model="initialCapital" type="number" min="10000" step="10000"
                :disabled="!enabled" class="cap-input" placeholder="初始资金" :title="'当前初始资金 ' + fmt(initialCapital)" />
         <input v-model="maxPos" type="number" min="0" step="1"
                :disabled="!enabled" class="cap-input cap-max" placeholder="持仓上限" title="持仓上限（0=不设限，由资金决定持仓）" />
@@ -36,6 +39,9 @@
         <div class="stat-label">总收益</div>
         <div class="stat-value" :class="stats.total_return_pct >= 0 ? 'up' : 'down'">
           {{ stats.total_return_pct >= 0 ? '+' : '' }}{{ stats.total_return_pct.toFixed(2) }}%
+          <!-- 标注收益计算基数：基于确认资金固化后的初始资金，避免"收益百分比失真"的误读 -->
+          <!-- Notes the return basis: computed against the persisted initial capital, so the % reads clearly -->
+          <em class="sub">基于初始资金 ¥{{ fmt(stats.initial_capital) }}</em>
         </div>
       </div>
       <div class="stat-card">
@@ -180,6 +186,7 @@ const enabled = ref(false)       // 模拟盘总开关
 const isAdmin = ref(false)       // admin 账户标记（模拟盘可联动回测/自动化交易）
 const initialCapital = ref('')   // 自定义初始资金输入（确认资金/清盘重置时生效）
 const maxPos = ref('')           // 自定义持仓上限输入（0=不设限）
+const appliedMax = ref(0)        // 当前生效的持仓上限（经确认资金固化；0=不设限，header 展示用）
 const tab = ref('positions')     // 页签：positions=持仓 / trades=成交日志
 const stats = ref(null)          // 绩效与信号质量汇总
 const positions = ref([])        // 当前持仓
@@ -225,6 +232,7 @@ async function load() {
     isAdmin.value = !!st.is_admin
     if (st.initial_capital > 0 && !initialCapital.value) initialCapital.value = String(st.initial_capital)
     if (st.max_positions !== undefined && !maxPos.value) maxPos.value = st.max_positions > 0 ? String(st.max_positions) : '0'
+    appliedMax.value = (st.max_positions !== undefined && st.max_positions > 0) ? st.max_positions : 0
     stats.value = st.stats || null
   } catch (_) {}
   if (!enabled.value) return
@@ -250,10 +258,16 @@ async function confirmCapital() {
   const cap = parseFloat(initialCapital.value)
   if (!(cap > 0)) { alert('请输入有效的初始资金'); return }
   const mp = parseInt(maxPos.value, 10)
-  const capHint = mp > 0 ? '，持仓上限 ' + mp + ' 只' : '（持仓上限不设限，由资金决定）'
-  if (!confirm('确认设置初始资金为 ¥' + fmt(cap) + capHint + '？将清空当前模拟盘重新开始。')) return
+  const mpv = mp > 0 ? mp : 0
+  const capHint = mpv > 0 ? '，持仓上限 ' + mpv + ' 只' : '（持仓上限不设限，由资金决定）'
+  if (!confirm('确认设置初始资金为 ¥' + fmt(cap) + capHint + '？将清空当前持仓、净值从新资金重开，历史成交日志保留。')) return
   try {
-    await api.resetPaper(cap, mp > 0 ? mp : 0)
+    const res = await api.resetPaper(cap, mpv)
+    // 确认成功后同步输入框与当前生效上限，避免轮询 load 覆盖显示旧值
+    // After a successful confirm, sync the inputs and the applied cap so polling doesn't show stale values
+    initialCapital.value = String(res.initial_capital || cap)
+    maxPos.value = String(res.max_positions > 0 ? res.max_positions : 0)
+    appliedMax.value = res.max_positions > 0 ? res.max_positions : 0
     await load()
   } catch (e) { alert(e.message || '设置失败') }
 }
@@ -286,6 +300,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .enabled-badge.on { background: rgba(82, 196, 26, 0.15); color: #52c41a; }
 .enabled-badge.off { background: rgba(255, 255, 255, 0.06); color: #8fa3bf; }
 .admin-badge { font-size: 12px; padding: 3px 10px; border-radius: 10px; background: rgba(255, 213, 79, 0.15); color: #FFD54F; }
+.cap-badge { font-size: 12px; padding: 3px 10px; border-radius: 10px; background: rgba(255, 255, 255, 0.04); color: #8fa3bf; border: 1px solid rgba(255, 255, 255, 0.1); white-space: nowrap; }
 .cap-input { background: #16162a; color: #e6edf3; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 6px 10px; font-size: 13px; width: 120px; }
 .cap-input:disabled { opacity: 0.4; cursor: not-allowed; }
 .cap-max { width: 90px; }
