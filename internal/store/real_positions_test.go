@@ -95,3 +95,39 @@ func TestUpsertRealOrderIdempotent(t *testing.T) {
 		t.Fatalf("orders 应 1 条，got %d err=%v", len(orders), err)
 	}
 }
+
+// TestApplyRealFillEdge 成交回报边界：超卖钳制清仓、卖空仓不报错、清仓后再买入重建仓。
+// English: fill edge cases — over-sell clamps to close, selling a non-existent position is a no-op,
+// and a buy after close rebuilds a fresh position.
+func TestApplyRealFillEdge(t *testing.T) {
+	db := testDB(t)
+	if err := db.ApplyRealFill(RealFill{OrderID: "O1", Code: "600000.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: "t1"}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// 超卖：卖 150（持仓仅 100）→ 钳制为 0 → 删除持仓行，不报错
+	if err := db.ApplyRealFill(RealFill{OrderID: "O2", Code: "600000.SH", Side: "卖出", Price: 11, Qty: 150, Amount: 1650, TradedAt: "t2"}); err != nil {
+		t.Fatalf("over-sell should not error: %v", err)
+	}
+	if _, err := db.RealPositionByCode("600000.SH"); err != sql.ErrNoRows {
+		t.Fatalf("over-sell 后应清仓删除，err=%v", err)
+	}
+	// 卖空仓：不报错、不建行
+	if err := db.ApplyRealFill(RealFill{OrderID: "O3", Code: "000001.SZ", Side: "卖出", Price: 5, Qty: 100, Amount: 500, TradedAt: "t3"}); err != nil {
+		t.Fatalf("sell non-existent should not error: %v", err)
+	}
+	if _, err := db.RealPositionByCode("000001.SZ"); err != sql.ErrNoRows {
+		t.Fatalf("卖空仓不应建行，err=%v", err)
+	}
+	// 清仓后再买入：重建仓，成本/最高价按新价
+	if err := db.ApplyRealFill(RealFill{OrderID: "O4", Code: "600000.SH", Side: "买入", Price: 15, Qty: 200, Amount: 3000, TradedAt: "t4"}); err != nil {
+		t.Fatalf("re-entry: %v", err)
+	}
+	p, err := db.RealPositionByCode("600000.SH")
+	if err != nil || p.Qty != 200 || p.CostPrice != 15 || p.HighestPrice != 15 {
+		t.Fatalf("重建仓异常: %+v err=%v", p, err)
+	}
+	fills, _ := db.RealFills()
+	if len(fills) != 4 {
+		t.Fatalf("fills 应 4 条，got %d", len(fills))
+	}
+}

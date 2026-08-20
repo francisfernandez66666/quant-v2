@@ -158,7 +158,8 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID)
 	switch {
 	case err == sql.ErrNoRows:
-		// 首次成交：建仓
+		// 首次成交：建仓（卖出空仓视为 no-op，仅记录 fills，不建行）
+		err = nil
 		if f.Side == "买入" {
 			_, err = tx.Exec(`INSERT INTO real_positions
 				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at)

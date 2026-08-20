@@ -126,10 +126,28 @@ $SSH "sudo mv /tmp/quant-research.service /etc/systemd/system/quant-research.ser
 $SCP "$APP_DIR/deploy/pydata.service" $SERVER_USER@$SERVER_IP:/tmp/pydata.service
 $SSH "sudo mv /tmp/pydata.service /etc/systemd/system/pydata.service"
 $SSH "sudo systemctl daemon-reload"
-$SSH "sudo systemctl enable --now quant"
-$SSH "sudo systemctl enable --now pydata"
-$SSH "sudo systemctl enable --now quant-research"
-$SSH "sudo systemctl restart caddy"
+ $SSH "sudo systemctl enable --now quant"
+ $SSH "sudo systemctl enable --now pydata"
+ $SSH "sudo systemctl enable --now quant-research"
+ $SSH "sudo systemctl restart caddy"
+
+# ── 6b. QMT 网关（AUTO_TRADING_PLAN M1/M2 预留）──
+#  - cmd/qmt-mock：Linux 上先跑 mock 网关做端到端联调（qmt-mock.service 默认关闭，联调时 enable）
+#  - qmt_gateway/：M2 真实 Windows 网关 Python 骨架（待 Windows 云主机后上传运行，此处仅落盘）
+# English: QMT gateway prep — uploads the Go mock gateway (unit disabled by default) and the M2 Python
+# gateway skeleton to the server.
+echo "[6b/8] 部署 QMT 网关（mock + M2 Python 骨架）..."
+GOOS=linux GOARCH=amd64 go build -o /tmp/qmt-mock_linux ./cmd/qmt-mock
+$SCP /tmp/qmt-mock_linux $SERVER_USER@$SERVER_IP:/tmp/qmt-mock_linux
+$SSH "sudo mv /tmp/qmt-mock_linux $DEPLOY_DIR/qmt-mock && sudo chmod +x $DEPLOY_DIR/qmt-mock"
+$SCP "$APP_DIR/deploy/qmt-mock.service" $SERVER_USER@$SERVER_IP:/tmp/qmt-mock.service
+$SSH "sudo mv /tmp/qmt-mock.service /etc/systemd/system/qmt-mock.service"
+# 默认关闭（联调时手动 enable --now qmt-mock）；token 由 /etc/qmt-mock.env 提供
+$SSH "sudo mkdir -p $DEPLOY_DIR/qmt_gateway"
+$SCP -r "$APP_DIR/qmt_gateway/." $SERVER_USER@$SERVER_IP:/tmp/qmt_gateway/
+$SSH "sudo mv /tmp/qmt_gateway/* $DEPLOY_DIR/qmt_gateway/"
+$SSH "sudo systemctl daemon-reload"
+echo "      qmt-mock 已部署（service 关闭）；qmt_gateway/ Python 骨架已落盘 $DEPLOY_DIR/qmt_gateway"
 
 # ── 7. 健康检查 ──
 echo "[7/8] 健康检查..."

@@ -69,6 +69,7 @@ type book struct {
 	mu       sync.Mutex
 	orders   map[string]*order
 	positions map[string]*pos
+	signal   map[string]string // signal_id → order_id（幂等索引）
 	account  string
 	nextID   int
 }
@@ -77,6 +78,7 @@ func newBook(account string) *book {
 	return &book{
 		orders:    map[string]*order{},
 		positions: map[string]*pos{},
+		signal:    map[string]string{},
 		account:   account,
 		nextID:    1,
 	}
@@ -251,6 +253,17 @@ func main() {
 			http.Error(w, `{"ok":false,"err":"code/qty required"}`, http.StatusBadRequest)
 			return
 		}
+		// signal_id 幂等：同 signal_id 已受理 → 返回原 order_id（不重复下单，与 M2 网关语义一致）
+		if req.SignalID != "" {
+			b.mu.Lock()
+			if prev, dup := b.signal[req.SignalID]; dup {
+				b.mu.Unlock()
+				log.Printf("[mock] idempotent signal_id=%s → return existing %s", req.SignalID, prev)
+				writeJSON(w, map[string]interface{}{"ok": true, "order_id": prev})
+				return
+			}
+			b.mu.Unlock()
+		}
 		orderID := b.nextOrderID()
 		o := &order{
 			OrderID: orderID, SignalID: req.SignalID, Code: req.Code, Name: req.Name,
@@ -262,6 +275,9 @@ func main() {
 		}
 		b.mu.Lock()
 		b.orders[orderID] = o
+		if req.SignalID != "" {
+			b.signal[req.SignalID] = orderID
+		}
 		b.mu.Unlock()
 		log.Printf("[mock] order accepted %s %s %d@%.2f", req.Side, req.Code, req.Qty, req.Price)
 

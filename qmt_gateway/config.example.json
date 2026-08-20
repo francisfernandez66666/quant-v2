@@ -1,0 +1,15 @@
+{
+  "listen": "0.0.0.0:8789",
+  "token": "change-me",
+  "broker": "mock",
+  "account": "MOCK0001",
+  "db": "qmt_gateway/data.db",
+  "report_url": "http://127.0.0.1:8080",
+  "report_token": "change-me",
+  "reconcile_sec": 60,
+  "max_positions": 10,
+  "seed": [
+    { "ts_code": "600519.SH", "name": "贵州茅台", "qty": 100, "cost_price": 1500.0, "highest_price": 1500.0 },
+    { "ts_code": "300750.SZ", "name": "宁德时代", "qty": 200, "cost_price": 180.0, "highest_price": 180.0 }
+  ]
+}

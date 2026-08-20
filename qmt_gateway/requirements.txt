@@ -1,0 +1,4 @@
+# qmt_gateway 依赖（M2 真实网关，Windows 云主机上安装）
+# 仅 mock 联调（broker=mock）时零第三方依赖，无需安装任何包。
+# xtquant 为国信 MiniQMT 官方 Python 库，仅 Windows 可用，需从国信官网/客户端安装目录获得，
+# 安装后应能被 `from xtquant import xttrader` 导入。
