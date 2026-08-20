@@ -132,7 +132,7 @@ func TestSellAndReset(t *testing.T) {
 		t.Fatalf("应已清仓")
 	}
 	// 复位
-	e.Reset()
+	e.Reset(0)
 	st = e.Stats()
 	if st.Cash != 100000 || len(e.Trades()) != 0 || len(e.Equity()) != 0 {
 		t.Errorf("复位后应回到初始状态: cash=%v trades=%d equity=%d", st.Cash, len(e.Trades()), len(e.Equity()))

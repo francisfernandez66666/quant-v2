@@ -117,6 +117,7 @@ type EngineRegistry interface {
 	GetController(userID string) EngineController
 	InitStatusJSON(userID string) map[string]interface{}
 	AllControllers() []EngineController
+	PaperForUser(userID string) *paper.Engine
 	Len() int
 }
 

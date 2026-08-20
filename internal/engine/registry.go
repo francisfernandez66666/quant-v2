@@ -59,7 +59,7 @@ type EngineOptions struct {
 	Notifier     *notify.Notifier
 	SectorTopN   int
 	D1MaxRetries int
-	Paper        *paper.Engine // 模拟盘引擎全局单例（nil=未启用）
+	Paper        *paper.Engine // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
 }
 
 // InitStage 引擎初始化进度阶段。
@@ -87,17 +87,112 @@ type Registry struct {
 	byUser   map[string]*Engine    // userID → Engine（账号归属引擎）
 	initDone map[string]bool       // userID → 是否已完成初始化
 	initProg map[string]*InitStage // userID → 当前初始化进度
+
+	// 账户级模拟盘：每账号独立 paper 引擎（独立现金/持仓/成交，独立 paper.json）。
+	// English: per-account paper engines — each account owns an isolated paper book (cash/positions/
+	// trades, own paper.json) under accounts/<userID>/.
+	papers    map[string]*paper.Engine // userID → paper 引擎（懒加载创建）
+	coreUsers map[*Engine][]string     // 共享引擎 → 服务账号列表（信号按账号分发模拟盘）
 }
 
 // NewRegistry 创建引擎注册表。
 // English: creates the engine registry.
 func NewRegistry(opts EngineOptions) *Registry {
 	return &Registry{
-		opts:     opts,
-		cores:    make(map[string]*Engine),
-		byUser:   make(map[string]*Engine),
-		initDone: make(map[string]bool),
-		initProg: make(map[string]*InitStage),
+		opts:      opts,
+		cores:     make(map[string]*Engine),
+		byUser:    make(map[string]*Engine),
+		initDone:  make(map[string]bool),
+		initProg:  make(map[string]*InitStage),
+		papers:    make(map[string]*paper.Engine),
+		coreUsers: make(map[*Engine][]string),
+	}
+}
+
+// paperPath 返回某账号模拟盘持久化路径（accounts/<userID>/paper.json）。
+// English: returns the per-account paper persistence path.
+func (r *Registry) paperPath(userID string) string {
+	if r.opts.DataDir == "" || userID == "" {
+		return ""
+	}
+	return filepath.Join(r.opts.DataDir, "accounts", userID, "paper.json")
+}
+
+// GetPaper 返回某账号的独立模拟盘引擎（懒加载创建/恢复；未启用或不可用返回 nil）。
+// 每账号独立现金/持仓/成交（初始资金默认取 rules.paper.initial_capital，可经 reset 自定义）。
+// English: returns an account's independent paper engine (lazily created/restored; nil when disabled).
+// Each account has its own cash/positions/trades (initial capital defaults to rules.paper, overridable
+// via reset).
+func (r *Registry) GetPaper(userID string) *paper.Engine {
+	if userID == "" {
+		return nil
+	}
+	r.mu.Lock()
+	if pe, ok := r.papers[userID]; ok {
+		r.mu.Unlock()
+		return pe
+	}
+	if r.opts.Paper == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	cfg := r.opts.Paper.Cfg()
+	pe := paper.New(cfg, r.paperPath(userID))
+	r.papers[userID] = pe
+	r.mu.Unlock()
+	return pe
+}
+
+// PaperForUser 返回某账号的独立模拟盘引擎（HTTP 层按账号读取模拟盘）。
+// English: returns an account's independent paper engine for the HTTP layer.
+func (r *Registry) PaperForUser(userID string) *paper.Engine { return r.GetPaper(userID) }
+
+// usersOf 返回共享引擎当前服务的账号列表（模拟盘信号按账号分发）。
+// English: returns the account list a shared engine currently serves (per-account paper dispatch).
+func (r *Registry) usersOf(e *Engine) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.coreUsers[e]...)
+}
+
+// registerUser 把账号绑定到其计算引擎并登记到共享引擎的账号列表（供模拟盘分发）。
+// English: binds a user to its compute engine and registers it on the shared engine's account list
+// (for per-account paper dispatch).
+func (r *Registry) registerUser(e *Engine, userID string) {
+	if e == nil || userID == "" {
+		return
+	}
+	seen := false
+	for _, u := range r.coreUsers[e] {
+		if u == userID {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		r.coreUsers[e] = append(r.coreUsers[e], userID)
+	}
+}
+
+// dispatchPaperSignals 把本轮翻转信号分发给共享引擎服务的所有账号的模拟盘（各自独立撮合）。
+// English: dispatches this round's flipped signals to the paper engines of every account the shared
+// engine serves (each fills independently).
+func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+	for _, uid := range r.usersOf(e) {
+		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
+			pe.OnSignals(emit, quotes)
+		}
+	}
+}
+
+// dispatchPaperMark 用实时快照刷新共享引擎所服务账号的模拟盘估值与净值。
+// English: refreshes marks/equity for the paper engines of every account a shared engine serves.
+func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInfo) {
+	for _, uid := range r.usersOf(e) {
+		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
+			pe.MarkToMarket(quotes)
+			pe.Snapshot(time.Now())
+		}
 	}
 }
 
@@ -153,6 +248,7 @@ func (r *Registry) GetOrCreate(userID string) *Engine {
 		r.byUser[userID] = e
 		r.initDone[userID] = true
 		r.initProg[userID] = &InitStage{Stage: "ready", Percent: 100, EtaSec: 0}
+		r.registerUser(e, userID)
 		r.mu.Unlock()
 		return e
 	}
@@ -165,6 +261,7 @@ func (r *Registry) GetOrCreate(userID string) *Engine {
 	r.byUser[userID] = e
 	r.initDone[userID] = true
 	r.initProg[userID] = &InitStage{Stage: "ready", Percent: 100, EtaSec: 0}
+	r.registerUser(e, userID)
 	r.mu.Unlock()
 	return e
 }
@@ -245,9 +342,15 @@ func (r *Registry) build(userID string) *Engine {
 	if opts.D1MaxRetries > 0 {
 		e.SetD1MaxRetries(opts.D1MaxRetries)
 	}
-	// 模拟盘引擎：全局单例注入（与真实持仓隔离，独立 paper.json 存储）。
-	// English: the global paper engine singleton (isolated from the real book; own paper.json store).
+	// 模拟盘引擎：账户级独立实例（每账号独立 paper.json），信号/估值按账号分发。
+	// 全局模板仅提供配置（opts.Paper）；e.paper 保留为旧单引擎回退。
+	// English: per-account paper engines (own paper.json); signals/marks dispatch per account. The global
+	// template only supplies config; e.paper stays as the legacy single-engine fallback.
 	e.SetPaper(opts.Paper)
+	e.SetPaperDispatch(
+		func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) { r.dispatchPaperSignals(e, emit, quotes) },
+		func(quotes map[string]*data.StockInfo) { r.dispatchPaperMark(e, quotes) },
+	)
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)
 	e.SetLongShortConfig(ls.LongEnabled, ls.ShortEnabled)

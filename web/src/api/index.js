@@ -484,11 +484,13 @@ export async function sellPaperPosition(code) {
   return request('/api/paper/sell', { method: 'POST', data: { code } })
 }
 
-/** 模拟盘：清盘重置（按最后估值价平仓，重置现金/成交/净值） */
-/** Paper trading: liquidate and reset (cash/trades/equity back to initial) */
+/** 模拟盘：清盘重置（按最后估值价平仓，重置现金/成交/净值；initialCapital>0 时自定义初始资金） */
+/** Paper trading: liquidate and reset (liquidate at last mark, reset cash/trades/equity; a positive
+ *  initialCapital also customizes the starting capital) */
 // 对应 POST /api/paper/reset
-export async function resetPaper() {
-  return request('/api/paper/reset', { method: 'POST' })
+export async function resetPaper(initialCapital) {
+  const data = initialCapital > 0 ? { initial_capital: initialCapital } : {}
+  return request('/api/paper/reset', { method: 'POST', data })
 }
 
 /** 更新持仓数据（含可用资金） */

@@ -219,13 +219,34 @@ func (e *Engine) Cfg() Config {
 	return e.cfg
 }
 
+// persistedState 持久化状态快照（persist/load 共享）。
+// 直接序列化 Engine 会因 cash/positions 等私有字段被 json 忽略而写入空对象，
+// 导致 load 读到 cash=0、模拟盘永久无法买入（errCash）。故显式落盘状态字段。
+// English: the persisted-state snapshot shared by persist/load. Marshaling the Engine directly would
+// drop the private fields (cash/positions/…), writing an empty object and loading cash=0 so the paper
+// book could never fill. State fields are therefore persisted explicitly.
+type persistedState struct {
+	Cash      float64              `json:"cash"`
+	Positions map[string]*Position `json:"positions"`
+	Trades    []Trade              `json:"trades"`
+	Equity    []EquityPoint        `json:"equity"`
+	Realized  float64              `json:"realized"`
+}
+
 // persist 将当前状态写入 JSON（幂等，失败仅记录日志）。
 // English: writes current state to the JSON file (best-effort; failures only log).
 func (e *Engine) persist() {
 	if e.path == "" {
 		return
 	}
-	data, err := json.MarshalIndent(e, "", "  ")
+	st := persistedState{
+		Cash:      e.cash,
+		Positions: e.positions,
+		Trades:    e.trades,
+		Equity:    e.equity,
+		Realized:  e.realized,
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		log.Printf("[paper] 序列化失败: %v", err)
 		return
@@ -242,15 +263,15 @@ func (e *Engine) load() {
 	if err != nil {
 		return
 	}
-	var st struct {
-		Cash      float64              `json:"cash"`
-		Positions map[string]*Position `json:"positions"`
-		Trades    []Trade              `json:"trades"`
-		Equity    []EquityPoint        `json:"equity"`
-		Realized  float64              `json:"realized"`
-	}
+	var st persistedState
 	if err := json.Unmarshal(raw, &st); err != nil {
 		log.Printf("[paper] 解析 %s 失败: %v", e.path, err)
+		return
+	}
+	// 空/旧格式历史（无有效状态）：保留初始资金，避免 cash=0 导致永久无法买入。
+	// English: empty/legacy history (no valid state) keeps the initial capital, avoiding a permanent
+	// cash=0 that makes the paper book unable to fill.
+	if st.Cash <= 0 && len(st.Positions) == 0 && len(st.Trades) == 0 {
 		return
 	}
 	e.cash = st.Cash
@@ -296,7 +317,9 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		} else {
 			continue
 		}
-		e.fillLocked(s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, s.Reason)
+		if err := e.fillLocked(s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, s.Reason); err != nil {
+			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
+		}
 	}
 	e.persist()
 }
@@ -467,11 +490,16 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	return nil
 }
 
-// Reset 清盘模拟盘：全部持仓按最后估值价平仓，清空成交/净值并重置现金到初始资金。
-// English: liquidates everything at the last mark, wipes trades/equity and resets cash to initial.
-func (e *Engine) Reset() {
+// Reset 清盘模拟盘：全部持仓按最后估值价平仓，清空成交/净值并重置现金。
+// initialCapital >0 时同时自定义初始资金（否则沿用当前配置默认）。
+// English: liquidates everything at the last mark, wipes trades/equity and resets cash.
+// A positive initialCapital also customizes the starting capital (otherwise the configured default).
+func (e *Engine) Reset(initialCapital float64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if initialCapital > 0 {
+		e.cfg.InitialCapital = initialCapital
+	}
 	e.cash = e.cfg.InitialCapital
 	e.positions = make(map[string]*Position)
 	e.trades = nil

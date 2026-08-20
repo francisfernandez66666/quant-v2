@@ -98,6 +98,8 @@ type Engine struct {
 	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
 	factorMon        *factorMonitor                  // 因子战法效果监测（战法库触发信号前向收益结算）
 	paper            *paper.Engine                   // 模拟盘引擎（独立纸面交易，可空=未启用）
+	paperOnSignals   func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy 信号撮合（registry 注入）
+	paperMarkFn      func(quotes map[string]*data.StockInfo)                              // 按账号分发估值/净值（registry 注入）
 	lastTrim         time.Time                       // 盘后内存释放最近一次执行时间（节流用）
 }
 
@@ -460,6 +462,51 @@ func (e *Engine) SetPaper(p *paper.Engine) {
 	e.mu.Lock()
 	e.paper = p
 	e.mu.Unlock()
+}
+
+// SetPaperDispatch 注入按账号的模拟盘分发回调（多账号模式；注入后优先于全局 e.paper）。
+// English: injects the per-account paper dispatch callbacks (multi-account mode; take precedence over
+// the global e.paper when set).
+func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo), mark func(quotes map[string]*data.StockInfo)) {
+	e.mu.Lock()
+	e.paperOnSignals = onSignals
+	e.paperMarkFn = mark
+	e.mu.Unlock()
+}
+
+// paperSignals 把本轮翻转信号送入模拟盘撮合：优先按账号分发，回退全局引擎。
+// English: feeds this round's flipped signals into paper filling — per-account dispatch first, global
+// engine as the fallback.
+func (e *Engine) paperSignals(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+	e.mu.RLock()
+	dispatch := e.paperOnSignals
+	pe := e.paper
+	e.mu.RUnlock()
+	if dispatch != nil {
+		dispatch(emit, quotes)
+		return
+	}
+	if pe != nil && pe.Enabled() {
+		pe.OnSignals(emit, quotes)
+	}
+}
+
+// paperMark 用实时快照刷新模拟盘估值与净值：优先按账号分发，回退全局引擎。
+// English: refreshes paper marks and equity from the live snapshot — per-account dispatch first, global
+// engine as the fallback.
+func (e *Engine) paperMark(quotes map[string]*data.StockInfo) {
+	e.mu.RLock()
+	mark := e.paperMarkFn
+	pe := e.paper
+	e.mu.RUnlock()
+	if mark != nil {
+		mark(quotes)
+		return
+	}
+	if pe != nil && pe.Enabled() {
+		pe.MarkToMarket(quotes)
+		pe.Snapshot(time.Now())
+	}
 }
 
 // SetFetcher 设置 5s 实时行情采集器（近实时打分循环的快照来源）。
@@ -1590,11 +1637,13 @@ func (e *Engine) pushSSEMessages(items []data.MessageItem) {
 	}
 }
 
-// pushCriticalAlerts 对本次待同步消息中新增的关键告警（清仓/止损）推送桌面+Webhook 强提醒。
+// pushCriticalAlerts 对本次待同步消息中新增的关键告警（清仓/止损/交易信号/止盈）推送桌面+Webhook+外部推送网关强提醒。
 // 仅推送消息中心尚未存在的键，避免 5s 循环重复轰炸；未配置推送器时直接跳过。
-// （pushCriticalAlerts pushes desktop + Webhook alerts for newly-added critical messages
-// (close-out / stop-loss) whose dedup key is not yet in the message center, so the 5s loop
-// stays quiet on repeats; no-op when no notifier is wired.）
+// 推送级别与 SSE 定向推送一致（止盈/止损/清仓/交易信号），让 APK 后台/离线也能收到交易信号与关键通知。
+// （pushCriticalAlerts pushes desktop + Webhook + external-push-gateway alerts for newly-added critical
+// messages (close-out / stop-loss / trade signals / take-profit) whose dedup key is not yet in the
+// message center, so the 5s loop stays quiet on repeats; no-op when no notifier is wired. The level
+// set matches the SSE push so APK background/offline still receives trade signals and key alerts.）
 func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 	e.mu.RLock()
 	nt := e.notifier
@@ -1607,7 +1656,9 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 		existing[m.ID] = true
 	}
 	for _, it := range items {
-		if it.Level != "清仓" && it.Level != "止损" {
+		switch it.Level {
+		case "清仓", "止损", "止盈", "交易信号":
+		default:
 			continue
 		}
 		key := it.ID

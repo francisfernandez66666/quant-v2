@@ -13,9 +13,12 @@
     <div class="page-header">
       <h2>模拟盘</h2>
       <div class="header-right">
+        <span class="admin-badge" v-if="isAdmin" title="admin 账户的模拟盘支持回测与自动化交易联动">联动版</span>
         <span class="enabled-badge" :class="enabled ? 'on' : 'off'">
           {{ enabled ? '自动撮合中' : '未启用（rules.paper.enabled）' }}
         </span>
+        <input v-model="initCapital" type="number" min="10000" step="10000"
+               :disabled="!enabled" class="cap-input" placeholder="初始资金" :title="'当前初始资金 ' + fmt(initialCapital)" />
         <button class="btn-reset" :disabled="!enabled" @click="doReset">清盘重置</button>
       </div>
     </div>
@@ -161,6 +164,8 @@ import * as api from '../api/index.js' // 后端 API 封装（模拟盘接口）
 
 // ── 状态 ── (State)
 const enabled = ref(false)       // 模拟盘总开关
+const isAdmin = ref(false)       // admin 账户标记（模拟盘可联动回测/自动化交易）
+const initialCapital = ref('')   // 自定义初始资金输入（清盘重置时生效）
 const stats = ref(null)          // 绩效与信号质量汇总
 const positions = ref([])        // 当前持仓
 const trades = ref([])           // 成交记录
@@ -202,6 +207,8 @@ async function load() {
   try {
     const st = await api.fetchPaperState()
     enabled.value = !!st.enabled
+    isAdmin.value = !!st.is_admin
+    if (st.initial_capital > 0 && !initialCapital.value) initialCapital.value = String(st.initial_capital)
     stats.value = st.stats || null
   } catch (_) {}
   if (!enabled.value) return
@@ -220,11 +227,14 @@ async function sell(code) {
   } catch (e) { alert(e.message || '卖出失败') }
 }
 
-// 清盘重置：确认后重置现金/成交/净值（Reset: confirm then reset cash/trades/equity）
+// 清盘重置：确认后重置现金/成交/净值；输入框数值>0 时一并自定义初始资金
+// Reset: confirm then reset cash/trades/equity; a positive input also customizes the starting capital
 async function doReset() {
-  if (!confirm('清盘模拟盘？将按最后估值价平仓全部持仓并重置净值。此操作不影响真实持仓。')) return
+  const cap = parseFloat(initialCapital.value)
+  const hint = cap > 0 ? '（并设置初始资金为 ¥' + fmt(cap) + '）' : ''
+  if (!confirm('清盘模拟盘？将按最后估值价平仓全部持仓并重置净值。此操作不影响真实持仓。' + hint)) return
   try {
-    await api.resetPaper()
+    await api.resetPaper(cap > 0 ? cap : 0)
     await load()
   } catch (e) { alert(e.message || '重置失败') }
 }
@@ -246,6 +256,9 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .enabled-badge { font-size: 12px; padding: 3px 10px; border-radius: 10px; }
 .enabled-badge.on { background: rgba(82, 196, 26, 0.15); color: #52c41a; }
 .enabled-badge.off { background: rgba(255, 255, 255, 0.06); color: #8fa3bf; }
+.admin-badge { font-size: 12px; padding: 3px 10px; border-radius: 10px; background: rgba(255, 213, 79, 0.15); color: #FFD54F; }
+.cap-input { background: #16162a; color: #e6edf3; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 6px 10px; font-size: 13px; width: 120px; }
+.cap-input:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn-reset { background: rgba(255, 77, 79, 0.12); color: #FF4D4F; border: 1px solid rgba(255, 77, 79, 0.35); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .btn-reset:disabled { opacity: 0.4; cursor: not-allowed; }
 .panel { background: #1b1b30; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
