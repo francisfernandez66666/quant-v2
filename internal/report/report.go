@@ -68,6 +68,16 @@ func New(path string) *Report {
 	return r
 }
 
+// NewFromLogs 用给定持仓记录创建一个仅内存的 Report（不持久化、不读文件）。
+// 供实盘账本（real_positions）构造只读视图，复用卖出侧决策函数（CheckPositionsExits 等）。
+// English: NewFromLogs builds an in-memory-only Report from the given position records (no persistence,
+// no file I/O). Used to construct a read-only view of the real book (real_positions) so the sell-side
+// decision functions (CheckPositionsExits etc.) can be reused unchanged.
+func NewFromLogs(logs []ExecLog) *Report {
+	r := &Report{logs: logs}
+	return r
+}
+
 // LogSignal 记录一条新的开仓信号，将 ExecLog 追加到日志列表末尾。
 // 参数依次为：id-信号ID, code-股票代码, name-股票名称, direction-交易方向,
 // strategy-战法名称, entryPrice-开仓价格, takeProfitPct-止盈百分比, stopLossPct-止损百分比。

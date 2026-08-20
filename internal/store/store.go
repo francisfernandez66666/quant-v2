@@ -215,6 +215,46 @@ func (d *DB) migrate() error {
 			created_at TEXT NOT NULL,
 			UNIQUE(date, user_id)
 		)`,
+		// 实盘持仓（AUTO_TRADING_PLAN 真实账本主源）：由国内 QMT 网关全量对账/成交回报驱动，
+		// 与纸面 report.Report 完全独立（双账本并存）。ts_code 为持仓唯一键，signal_id 关联开仓信号。
+		// English: real book positions (AUTO_TRADING_PLAN live ledger source) — driven by the domestic QMT
+		// gateway's reconciliation/fill reports, fully independent of the paper report.Report (dual ledgers).
+		`CREATE TABLE IF NOT EXISTS real_positions (
+			ts_code TEXT PRIMARY KEY,
+			name TEXT DEFAULT '',
+			qty INTEGER NOT NULL DEFAULT 0,
+			cost_price REAL NOT NULL DEFAULT 0,
+			amount REAL NOT NULL DEFAULT 0,
+			highest_price REAL NOT NULL DEFAULT 0,
+			strategy TEXT DEFAULT '',
+			signal_id TEXT DEFAULT '',
+			updated_at TEXT NOT NULL
+		)`,
+		// 实盘委托单：order_id 为网关返回的单号，signal_id 唯一（幂等，防重复下单）。
+		// English: real order tickets — order_id from the gateway, signal_id unique (idempotency key).
+		`CREATE TABLE IF NOT EXISTS orders (
+			order_id TEXT PRIMARY KEY,
+			signal_id TEXT UNIQUE,
+			code TEXT NOT NULL,
+			side TEXT NOT NULL,
+			status TEXT NOT NULL,
+			price REAL,
+			qty INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		// 实盘成交回报：网关成交事件逐条落库（对账/研究用）。
+		// English: real fill reports — one row per gateway trade event (reconciliation/research).
+		`CREATE TABLE IF NOT EXISTS fills (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			order_id TEXT NOT NULL,
+			code TEXT NOT NULL,
+			side TEXT NOT NULL,
+			price REAL NOT NULL,
+			qty INTEGER NOT NULL,
+			amount REAL NOT NULL,
+			traded_at TEXT NOT NULL,
+			signal_id TEXT DEFAULT ''
+		)`,
 		// 常用查询索引（主键外的补充加速）
 		`CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_db_date ON daily_basic(trade_date)`,

@@ -25,8 +25,8 @@
       </div>
     </div>
 
-    <!-- 新增/编辑持仓弹窗（Add/edit holding modal）-->
-    <div class="modal-overlay" v-if="showAdd" @click.self="closeAdd">
+    <!-- 新增/编辑持仓弹窗（仅纸面账本，Add/edit holding modal, paper book only）-->
+    <div class="modal-overlay" v-if="showAdd && bookTab === 'paper'" @click.self="closeAdd">
       <div class="modal">
         <div class="modal-title">{{ editingIdx >= 0 ? '编辑持仓' : '新增持仓' }}</div>
         <!-- 代码输入行：编辑模式禁用，输入时自动查询股票名称与现价（Code input row: disabled in edit mode; auto-looks-up name and current price while typing）-->
@@ -60,7 +60,19 @@
       </div>
     </div>
 
-    <!-- 持仓列表（Holdings list）-->
+    <!-- 账本切换：纸面（模拟盘，左侧栏入口的原有持仓管理）| 实盘（AUTO_TRADING_PLAN M1 真实持仓，来自 QMT 网关回报） -->
+    <!-- Book switch: Paper (the original holdings management reachable from the sidebar) | Live (AUTO_TRADING_PLAN M1 real positions fed by the QMT gateway) -->
+    <div class="book-tabs">
+      <button :class="['book-tab', bookTab === 'paper' ? 'active' : '']" @click="switchBook('paper')">纸面持仓</button>
+      <button :class="['book-tab', bookTab === 'real' ? 'active' : '']" @click="switchBook('real')">
+        实盘持仓
+        <span v-if="qmtState.tripped" class="tripped-dot" title="网关断线熔断中">!</span>
+      </button>
+    </div>
+
+    <!-- 纸面持仓区（原持仓管理内容，仅 bookTab=paper 时显示） -->
+    <!-- Paper holdings area (the original holdings management, shown only when bookTab=paper) -->
+    <div v-if="bookTab === 'paper'">
     <div class="positions-table" v-if="holdings.length">
       <div class="table-header">
         <span class="col-code">代码</span>
@@ -272,6 +284,94 @@
       <span class="lg-sep">|</span>
       <span>N≥60可买 龙≥70买 量≥50关注</span>
     </div>
+    </div>
+
+    <!-- 实盘持仓区（AUTO_TRADING_PLAN M1，仅 bookTab=real 时显示） -->
+    <!-- Live holdings area (AUTO_TRADING_PLAN M1, shown only when bookTab=real) -->
+    <div v-else class="real-book">
+      <div class="real-book-bar">
+        <span class="real-bar-item" :class="qmtState.enabled ? 'ok' : 'off'">{{ qmtState.enabled ? '已启用' : '未启用' }}</span>
+        <span class="real-bar-item">模式: {{ qmtState.mode || 'manual' }}</span>
+        <span class="real-bar-item" :class="qmtState.tripped ? 'bad' : 'ok'">熔断: {{ qmtState.tripped ? '已熔断' : '正常' }}</span>
+        <span class="real-bar-item dim" v-if="qmtState.gateway_url">网关 {{ qmtState.gateway_url }}</span>
+        <button class="btn-refresh" @click="loadReal" title="刷新实盘数据">刷新</button>
+      </div>
+
+      <div class="real-empty" v-if="!realPositions.length">
+        <p>{{ realEnabled ? '暂无实盘持仓' : '实盘未启用（config.toml 中 qmt.enabled=true 并配置网关）' }}</p>
+        <p class="hint" v-if="realEnabled">等待 QMT 网关回报 /api/qmt/report 推送持仓对账</p>
+      </div>
+
+      <div class="positions-table" v-else>
+        <div class="table-header">
+          <span class="col-code">代码</span>
+          <span class="col-name">名称</span>
+          <span class="col-num">数量</span>
+          <span class="col-price">成本价</span>
+          <span class="col-price">现价</span>
+          <span class="col-chg">持仓盈亏</span>
+          <span class="col-chg">最高价</span>
+          <span class="col-sig">建议</span>
+          <span class="col-actions">操作</span>
+        </div>
+        <div v-for="p in realPositions" :key="p.ts_code" class="pos-row-group">
+          <div class="table-row" :class="realRowClass(p)">
+            <span class="col-code" data-label="代码">{{ p.ts_code }}</span>
+            <span class="col-name" data-label="名称">{{ p.name }}</span>
+            <span class="col-num" data-label="数量">{{ p.qty }}</span>
+            <span class="col-price" data-label="成本价">{{ p.cost_price?.toFixed(3) }}</span>
+            <span class="col-price" data-label="现价">{{ curPrice(p) ? '¥' + curPrice(p).toFixed(2) : '—' }}</span>
+            <span :class="['col-chg', realPnlPct(p) >= 0 ? 'up' : 'down']" data-label="持仓盈亏">
+              {{ p.cost_price > 0 && curPrice(p) ? (realPnlPct(p) > 0 ? '+' : '') + realPnlPct(p).toFixed(2) + '%' : '—' }}
+            </span>
+            <span class="col-chg" data-label="最高价">¥{{ p.highest_price?.toFixed(2) || '—' }}</span>
+            <span class="col-sig" data-label="建议">
+              <span v-if="adviceFor(p.ts_code)" :class="['advice-badge', adviceFor(p.ts_code).action]">
+                {{ adviceFor(p.ts_code).label }}
+              </span>
+              <span v-else class="dim">—</span>
+            </span>
+            <span class="col-actions" data-label="操作">
+              <button class="btn-lot" @click="openRealAction(p, 'add')" :disabled="realTripped">加仓</button>
+              <button class="btn-lot" @click="openRealAction(p, 'reduce')" :disabled="realTripped">减仓</button>
+              <button class="btn-cost" @click="openRealAction(p, 'tp')" :disabled="realTripped">止盈</button>
+              <button class="btn-sell" @click="openRealAction(p, 'close')" :disabled="realTripped">清仓</button>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 实盘下单确认弹窗（manual 模式前端确认后下发真实委托） -->
+    <!-- Live order-confirmation modal (real ticket dispatched after manual confirmation) -->
+    <div class="modal-overlay" v-if="realAction" @click.self="realAction = null">
+      <div class="modal">
+        <div class="modal-title">实盘{{ realActionLabel(realAction.dir) }} {{ realAction.pos.ts_code }} {{ realAction.pos.name }}</div>
+        <div class="form-row">
+          <label>当前持仓</label>
+          <span class="static-val">{{ realAction.pos.qty }} 股 / 成本 ¥{{ realAction.pos.cost_price?.toFixed(3) }}</span>
+        </div>
+        <div class="form-row">
+          <label>参考价</label>
+          <input v-model.number="realFormPrice" type="number" step="0.001" placeholder="成交参考价" />
+        </div>
+        <div class="form-row">
+          <label>{{ realAction.dir === 'add' ? '加仓数量' : '数量' }}</label>
+          <input v-model.number="realFormQty" type="number" step="100" :placeholder="realAction.dir === 'add' ? '股数（一手=100）' : '股数' " />
+        </div>
+        <div class="form-row">
+          <label>战法</label>
+          <input v-model="realFormStrategy" placeholder="策略名（可选）" />
+        </div>
+        <div class="preview" v-if="realFormQty > 0 && realFormPrice > 0">
+          预估金额：¥{{ (realFormQty * realFormPrice).toFixed(2) }}
+        </div>
+        <div class="modal-actions">
+          <button class="btn-cancel" @click="realAction = null">取消</button>
+          <button class="btn-confirm" @click="confirmRealAction" :disabled="realSubmitting">{{ realSubmitting ? '下单中…' : '确认下单' }}</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -298,6 +398,120 @@ const pnlOffset = ref(parseFloat(localStorage.getItem('pnl_offset') || '0'))  //
 // P&L reset offset
 const totalRealizedPnl = ref(0)  // 累计已实现盈亏（后端返回，含已平仓历史）
 // cumulative realized P&L (from backend, includes closed history)
+
+// ── 账本切换：纸面 | 实盘（AUTO_TRADING_PLAN M1）──
+// ── Book switch: Paper | Live (AUTO_TRADING_PLAN M1) ──
+const bookTab = ref('paper')             // 当前账本 tab（paper/real）
+const qmtState = ref({ enabled: false, mode: 'manual', tripped: false, gateway_url: '' })  // 网关状态
+const realPositions = ref([])            // 实盘真实持仓（real_positions）
+const realAdvices = ref({})              // 建议映射：ts_code → { action, label }（SSE real_advice 实时填充）
+const realEnabled = computed(() => !!qmtState.value.enabled)  // 是否已启用实盘
+const realTripped = computed(() => !!qmtState.value.tripped)  // 是否熔断
+const realAction = ref(null)             // 实盘下单确认弹窗：{ pos, dir }
+const realFormPrice = ref(0)             // 实盘下单参考价
+const realFormQty = ref(0)               // 实盘下单数量（股数）
+const realFormStrategy = ref('')         // 实盘下单策略名
+const realSubmitting = ref(false)        // 实盘下单提交中
+let realTimer = null                     // 实盘数据轮询定时器句柄
+
+/** 切换账本 tab：进入实盘时立即拉取一次数据并启动轮询 */
+/** Switch the book tab; entering Live immediately fetches data and starts polling */
+function switchBook(tab) {
+  bookTab.value = tab
+  if (tab === 'real') {
+    loadReal()
+    if (!realTimer) realTimer = setInterval(loadReal, 30000)
+  } else if (realTimer) {
+    clearInterval(realTimer)
+    realTimer = null
+  }
+}
+
+/** 拉取实盘持仓与网关状态 */
+/** Fetch live positions and gateway status */
+async function loadReal() {
+  try {
+    const st = await api.fetchQMTState()
+    if (st) qmtState.value = st
+  } catch (_) {}
+  try {
+    const data = await api.fetchRealPositions()
+    if (data && Array.isArray(data.positions)) realPositions.value = data.positions
+  } catch (_) {}
+}
+
+/** 实盘持仓行 CSS：有建议/亏损中高亮 */
+/** Live row CSS: highlight when advised or underwater */
+function realRowClass(p) {
+  if (adviceFor(p.ts_code)) return 'table-row signal'
+  if (p.cost_price > 0 && curPrice(p) && (p.cost_price - curPrice(p)) / p.cost_price <= -0.05) return 'table-row danger'
+  return 'table-row'
+}
+
+/** 查某持仓的现价（实时估值：优先从建议，无则用成本价占位） */
+/** Current price for a position (live mark; falls back to cost price when unavailable) */
+function curPrice(p) {
+  return (p.cur_price && p.cur_price > 0) ? p.cur_price : 0
+}
+
+/** 持仓盈亏百分比 = (现价-成本)/成本 */
+/** P&L percentage = (current - cost) / cost */
+function realPnlPct(p) {
+  if (!p.cost_price || p.cost_price <= 0 || !curPrice(p)) return 0
+  return (curPrice(p) - p.cost_price) / p.cost_price * 100
+}
+
+/** 按 ts_code 查建议徽标 */
+/** Look up the advice badge by ts_code */
+function adviceFor(tsCode) {
+  return realAdvices.value[tsCode] || null
+}
+
+/** 实盘操作按钮文案 */
+/** Live action button label */
+function realActionLabel(dir) {
+  return { add: '加仓', reduce: '减仓', tp: '止盈', close: '清仓' }[dir] || dir
+}
+
+/** 打开实盘下单确认弹窗：回填参考价（建议价或成本价） */
+/** Open the live order-confirmation modal; pre-fill the reference price (advice price or cost) */
+function openRealAction(p, dir) {
+  if (realTripped.value) { alert('网关已熔断，暂停实盘下单'); return }
+  realAction.value = { pos: p, dir }
+  realFormPrice.value = curPrice(p) || p.cost_price || 0
+  realFormQty.value = dir === 'add' ? 100 : Math.min(100, p.qty || 0)
+  realFormStrategy.value = ''
+}
+
+/** 提交实盘下单：按方向映射买卖并计算数量（清仓=全量剩余） */
+/** Submit the live order: map direction to buy/sell and compute qty (close = all remaining) */
+async function confirmRealAction() {
+  const a = realAction.value
+  if (!a) return
+  const qty = a.dir === 'close' ? (a.pos.qty || 0) : Math.round(Number(realFormQty.value) || 0)
+  const price = Number(realFormPrice.value) || 0
+  if (qty <= 0 || price <= 0) { alert('请输入有效的价格与数量'); return }
+  const sell = a.dir === 'reduce' || a.dir === 'tp' || a.dir === 'close'
+  realSubmitting.value = true
+  try {
+    const res = await api.executeRealAction({
+      code: a.pos.ts_code,
+      side: sell ? '卖出' : '买入',
+      action: realActionLabel(a.dir),
+      qty,
+      price,
+      strategy: realFormStrategy.value,
+      reason: 'manual:' + a.dir,
+    })
+    alert((sell ? '卖出' : '买入') + '委托已提交 ' + a.pos.ts_code + ' ' + qty + ' 股' + (res.order_id ? '（单号 ' + res.order_id + '）' : ''))
+    realAction.value = null
+    setTimeout(loadReal, 2000)
+  } catch (e) {
+    alert('下单失败: ' + (e.message || ''))
+  } finally {
+    realSubmitting.value = false
+  }
+}
 
 // ── 本地持久化镜像：进 tab 秒开，增删改才变更 ──
 // ── Local persisted mirror: instant open on tab entry; only mutated on add/remove/edit ──
@@ -773,10 +987,31 @@ function openAddNew() {
 
 // 先读本地缓存秒开，再拉取最新数据，并启动 30s 轮询
 // Read the cache for an instant open, fetch fresh data, then start 30s polling
-onMounted(() => { loadCache(); load(); timer = setInterval(load, 30000) })
-// 卸载时清理定时器
-// Clear the timer on unmount
-onUnmounted(() => { if (timer) clearInterval(timer) })
+// 订阅 SSE：实时接收实盘建议（real_advice）与网关回报（qmt_report），熔断时同步状态
+// Subscribe to SSE: live position advice (real_advice) and gateway reports (qmt_report); sync breaker state on trips
+let unsubSSE = null
+onMounted(() => {
+  loadCache(); load(); timer = setInterval(load, 30000)
+  unsubSSE = api.onSSE((msg) => {
+    if (!msg || !msg.type) return
+    if (msg.type === 'real_advice' && Array.isArray(msg.advices)) {
+      const m = {}
+      for (const a of msg.advices) {
+        if (a && (a.ts_code || a.code)) {
+          const key = a.ts_code || a.code
+          m[key] = { action: a.action, label: a.label || a.action, ref_price: a.ref_price, reason: a.reason, level: a.level }
+        }
+      }
+      realAdvices.value = m
+    } else if (msg.type === 'qmt_report' || msg.type === 'real_order') {
+      qmtState.value = { ...qmtState.value, tripped: !!msg.tripped }
+      loadReal()
+    }
+  })
+})
+// 卸载时清理定时器与 SSE 订阅
+// Clear the timer and SSE subscription on unmount
+onUnmounted(() => { if (timer) clearInterval(timer); if (realTimer) clearInterval(realTimer); if (unsubSSE) unsubSSE() })
 
 /** 展开/收起某持仓的 分时区 */
 /** Toggle a holding's K-line area */
@@ -838,6 +1073,40 @@ function sheetClose() {
 
 <style scoped>
 .positions-page { max-width: 1200px; }
+/* 账本切换 tab（Book switch tabs） */
+.book-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+.book-tab {
+  padding: 6px 18px; border-radius: 6px; border: 1px solid #3a3a55;
+  background: transparent; color: #999; font-size: 14px; cursor: pointer; position: relative;
+}
+.book-tab.active { background: #2a2a3e; color: #fff; border-color: #4fc3f7; }
+.tripped-dot {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 50%; background: #FF4D4F; color: #fff;
+  font-size: 11px; font-weight: 700; margin-left: 4px;
+}
+/* 实盘区（Live book area） */
+.real-book-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; font-size: 14px; flex-wrap: wrap; }
+.real-bar-item { color: #999; }
+.real-bar-item.ok { color: #4caf50; }
+.real-bar-item.off { color: #FAAD14; }
+.real-bar-item.bad { color: #FF4D4F; font-weight: 700; }
+.real-bar-item.dim { color: #666; }
+.btn-refresh {
+  margin-left: auto; padding: 4px 12px; border: 1px solid #3a3a55; border-radius: 4px;
+  background: transparent; color: #7ab8ff; font-size: 14px; cursor: pointer;
+}
+.btn-refresh:hover { border-color: #4fc3f7; color: #4fc3f7; }
+.real-empty { padding: 30px; text-align: center; color: #888; background: #1a1a2e; border-radius: 8px; font-size: 14px; }
+.real-empty .hint { margin-top: 8px; font-size: 13px; color: #666; }
+.advice-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 13px; font-weight: 600;
+}
+.advice-badge.add { background: rgba(255,77,79,0.15); color: #FF4D4F; }
+.advice-badge.reduce { background: rgba(250,173,20,0.15); color: #FAAD14; }
+.advice-badge.tp { background: rgba(76,175,80,0.15); color: #4caf50; }
+.advice-badge.stop, .advice-badge.close { background: rgba(76,175,80,0.15); color: #4caf50; }
+.advice-badge.hold { background: rgba(123,184,255,0.12); color: #7ab8ff; }
 .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 .page-header h2 { font-size: 18px; font-weight: 600; }
 .header-right { display: flex; align-items: center; gap: 12px; }

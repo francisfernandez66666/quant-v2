@@ -196,18 +196,21 @@ func main() {
 	// B5 研究闭环：研究库与实时库同目录，web 审批端点读写候选、应用权重。
 	// 同时把研究库作为实盘财务因子数据源（SetFinaLookup：把最新财务指标注入 StockMarketData，
 	// 供实盘因子战法对 ROE/净利同比等财务类因子打分）。
-	// English: the research DB (same dir as live) backs the B5 approval endpoints and also serves as the
-	// live financial source (SetFinaLookup injects latest financials into StockMarketData so the live
-	// factor strategy can score financial factors like ROE/YoyNetProfit).
-	if researchDB, err := store.Open(filepath.Join(dataDir, "trading.db")); err != nil {
-		log.Printf("[research] 研究库接入失败: %v", err)
-	} else {
+	// 也是实盘账本（AUTO_TRADING_PLAN M1）存储：real_positions/orders/fills 供 QMT 控制器存取。
+	// English: the research DB (same dir as live) backs the B5 approval endpoints, serves as the live
+	// financial source (SetFinaLookup injects latest financials into StockMarketData so the live factor
+	// strategy can score financial factors like ROE/YoyNetProfit), and hosts the real book
+	// (AUTO_TRADING_PLAN M1) — real_positions/orders/fills for the QMT controller.
+	researchDB, dbErr := store.Open(filepath.Join(dataDir, "trading.db"))
+	if researchDB != nil && dbErr == nil {
 		srv.SetResearch(researchDB, dataDir)
 		// 实盘财务因子查询：取研究库 fina_indicator 最新报告期（点对时）作为该股财务指标。
 		// 带进程内 TTL 缓存，避免 5s 打分循环反复查库；缓存缺失/过期时读库。
 		finaCache := newFinaCache(researchDB)
 		strategyEngine.SetFinaLookup(finaCache.Lookup)
-		log.Printf("[research] 研究库已接入（含实盘财务因子）: %s", filepath.Join(dataDir, "trading.db"))
+		log.Printf("[research] 研究库已接入（含实盘财务因子 + 实盘账本）: %s", filepath.Join(dataDir, "trading.db"))
+	} else if dbErr != nil {
+		log.Printf("[research] 研究库接入失败: %v", dbErr)
 	}
 
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
@@ -271,6 +274,7 @@ func main() {
 		SectorTopN:   sectorTopN,
 		Paper:        paperEngine,
 		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
+		RealStore:    researchDB, // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions
 	})
 	srv.SetEngineRegistry(registry)
 

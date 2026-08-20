@@ -26,6 +26,7 @@ import (
 	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
+	"quant-trading-v2/internal/trading"
 )
 
 // EngineController 引擎对外暴露的控制面：利好/利空开关 + 流水线调试数据 + 消息中心 + 热点记录。
@@ -64,6 +65,11 @@ type EngineController interface {
 	ReloadPatternRules(dataDir string)
 	PatternStats() []patternstrat.ActivePattern
 	RecordPatternForwardReturn(ruleID string, ret float64)
+	// QMTController 返回实盘交易执行控制器（AUTO_TRADING_PLAN M1；可为 nil = 未接入）。
+	// 供 HTTP 层读取熔断/配置、触发下单与回报落库。
+	// English: returns the live-trading controller (AUTO_TRADING_PLAN M1; may be nil when not wired).
+	// Lets the HTTP layer read the breaker/config, place orders and persist gateway reports.
+	QMTController() *trading.Controller
 }
 
 // Server HTTP 服务端，聚合所有依赖组件并注册 REST/SSE 路由。
@@ -378,6 +384,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/watchlist", s.authMiddleware(s.handleFixRemoveWatchlist))
 	s.mux.HandleFunc("POST /api/action", s.authMiddleware(s.handleFixAction))
 	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
+	// 实盘交易（AUTO_TRADING_PLAN M1）：持仓页实盘 tab 拉真实持仓/建议/执行 + 网关回报/状态。
+	// English: live trading (AUTO_TRADING_PLAN M1) — live tab real positions/advice/execute + gateway report/state.
+	s.mux.HandleFunc("GET /api/positions/real", s.authMiddleware(s.handleRealPositions))
+	s.mux.HandleFunc("GET /api/positions/advice", s.authMiddleware(s.handleRealAdvice))
+	s.mux.HandleFunc("POST /api/positions/execute", s.authMiddleware(s.handleExecuteAction))
+	s.mux.HandleFunc("POST /api/qmt/report", s.authMiddleware(s.handleQMTReport))
+	s.mux.HandleFunc("GET /api/qmt/state", s.authMiddleware(s.handleQMTState))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
 	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
 	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))

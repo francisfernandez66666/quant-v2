@@ -441,6 +441,34 @@ export async function fetchHoldings() {
   return request('/api/holdings')
 }
 
+/** 实盘（AUTO_TRADING_PLAN M1）：真实持仓（来自 QMT 网关回报的 real_positions） */
+/** Live trading (AUTO_TRADING_PLAN M1): real holdings fed by the QMT gateway reports */
+// 对应 GET /api/positions/real，返回 { positions:[...], enabled, tripped, mode }
+export async function fetchRealPositions() {
+  return request('/api/positions/real')
+}
+
+/** 实盘：持仓处理建议（加仓/减仓/止盈/止损） */
+/** Live: position-handling advice (add/trim/take-profit/stop-loss) */
+// 对应 GET /api/positions/advice，返回 { advices:[...], tripped }（主要数据走 SSE real_advice 实时推送）
+export async function fetchRealAdvice() {
+  return request('/api/positions/advice')
+}
+
+/** 实盘：执行 manual 下单（手动确认后的真实委托） */
+/** Live: execute a manual order (real ticket after manual confirmation) */
+// 对应 POST /api/positions/execute，body { code, side, action, qty, price, strategy, reason }
+export async function executeRealAction(data) {
+  return request('/api/positions/execute', { method: 'POST', data })
+}
+
+/** 实盘：网关连接/熔断/模式状态 */
+/** Live: gateway connectivity / breaker / mode status */
+// 对应 GET /api/qmt/state，返回 { enabled, mode, tripped, gateway_url }
+export async function fetchQMTState() {
+  return request('/api/qmt/state')
+}
+
 /** 模拟盘：总开关与绩效/信号质量统计 */
 /** Paper trading: master switch plus performance/signal-quality stats */
 // 对应 GET /api/paper/state，返回 { enabled, stats:{...} }

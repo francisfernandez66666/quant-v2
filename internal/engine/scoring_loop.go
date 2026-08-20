@@ -14,6 +14,7 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/trading"
 )
 
 // RunScoringLoop 启动近实时打分循环，直到 ctx 取消。
@@ -158,6 +159,14 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		all = append(all, sellSigs...)
 		e.syncMessages(nil, nil, all, nil, quotes)
 	}
+
+	// 实盘持仓处理分析（AUTO_TRADING_PLAN M1）：qmt.enabled 时对真实持仓（real_positions）
+	// 生成 加仓/减仓/止盈/止损/格局 建议，经 SSE 推前端持仓页实盘 tab。
+	// 仅交易时段运行；无持仓/未启用时零开销。不触碰纸面账本。
+	// English: live position advice (AUTO_TRADING_PLAN M1) — when qmt.enabled, generates 加仓/减仓/止盈/
+	// 止损/格局 advice for the real book (real_positions) and pushes it to the frontend live tab via SSE.
+	// Trading-hours only; no cost when disabled or no holdings. Never touches the paper book.
+	e.pushRealAdvice(md, scores, d1Scores, emotionPhase, quotes)
 
 	// 开市(9:30)前及午休(11:30-13:00)只更新评分数字，不发布任何战法信号：
 	// 盘前无实盘成交量，双响炮/龙头等易基于存量历史数据误报（如整池双响炮全 70、9:11 龙头）；
@@ -390,4 +399,73 @@ func filterTransitionSignals(sigs []combat_agent.Signal, prev map[string]map[str
 		m[sig.Strategy] = true
 	}
 	return emit, next
+}
+
+// pushRealAdvice 实盘持仓处理分析（AUTO_TRADING_PLAN M1）：qmt.enabled 时对真实持仓生成建议。
+// 每 5s 读 real_positions → trading.Advise（复用卖出侧 + 加仓/格局规则）→ SSE 推前端实盘 tab。
+// 熔断健康探测也在此节流执行（网关失联 → 暂停下单并告警）。仅交易时段运行（盘后省内存）。
+// English: live position advice (AUTO_TRADING_PLAN M1) — when qmt.enabled, reads real_positions each 5s,
+// runs trading.Advise (sell-side reuse + add/hold rules), and pushes the advice to the frontend live tab
+// via SSE. Circuit-breaker health probing is also throttled here (gateway loss pauses orders and alerts).
+// Trading-hours only (after-hours skips to save memory).
+func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, scores map[string]combat_agent.StockScores, d1Scores map[string]combat_agent.D1Score, emotionPhase string, quotes map[string]*data.StockInfo) {
+	e.mu.RLock()
+	ctrl := e.qmtCtrl
+	realStore := e.realStore
+	agent := e.combatAgent
+	marketAPI := e.marketAPI
+	sse := e.sse
+	e.mu.RUnlock()
+	if ctrl == nil || realStore == nil || agent == nil {
+		return
+	}
+	if !data.IsActiveSession(time.Now()) || !ctrl.Enabled() {
+		return
+	}
+
+	// 熔断健康探测（节流：miss_heartbeat_sec/2）
+	ctrl.HealthCheck()
+
+	positions, err := realStore.RealPositions()
+	if err != nil || len(positions) == 0 {
+		return
+	}
+
+	// 组装分析入参：复用本轮打分池的行情/日K/分数（不额外拉取）
+	exitQuotes := make(map[string]*data.StockInfo, len(md))
+	exitDayK := make(map[string][]data.KLine, len(md))
+	for code, smd := range md {
+		if smd == nil {
+			continue
+		}
+		if smd.Quote != nil && smd.Quote.Price > 0 {
+			exitQuotes[code] = smd.Quote
+		}
+		if len(smd.KLines) > 0 {
+			exitDayK[code] = smd.KLines
+		}
+	}
+
+	advices := trading.Advise(trading.AdviceInput{
+		Agent:        agent,
+		MarketAPI:    marketAPI,
+		Positions:    positions,
+		Quotes:       exitQuotes,
+		DayKLines:    exitDayK,
+		Scores:       scores,
+		MD:           md,
+		D1Scores:     d1Scores,
+		ShortEnabled: e.ShortEnabled(),
+		EmotionPhase: emotionPhase,
+		Cfg:          ctrl.Config(),
+	})
+	if len(advices) == 0 || sse == nil {
+		return
+	}
+	sse.Broadcast(map[string]interface{}{
+		"type":    "real_advice",
+		"advices": advices,
+		"tripped": ctrl.Tripped(),
+		"time":    time.Now().Format("15:04:05"),
+	})
 }

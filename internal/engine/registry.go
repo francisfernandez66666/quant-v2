@@ -35,7 +35,9 @@ import (
 	"quant-trading-v2/internal/server"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
+	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/trading"
 )
 
 // EngineOptions 注册表的共享依赖（数据源全局一份，所有账号引擎复用）。
@@ -60,6 +62,11 @@ type EngineOptions struct {
 	SectorTopN   int
 	D1MaxRetries int
 	Paper        *paper.Engine // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
+	// 实盘账本（AUTO_TRADING_PLAN M1）：研究库句柄，供 QMT 控制器存取 real_positions/orders/fills。
+	// 与纸面账本完全独立。nil = 未接入实盘（QMT 链路整体禁用）。
+	// English: real book (AUTO_TRADING_PLAN M1) — research-DB handle for the QMT controller's
+	// real_positions/orders/fills access. Fully independent of the paper book. nil = no live chain.
+	RealStore *store.DB
 }
 
 // InitStage 引擎初始化进度阶段。
@@ -471,6 +478,40 @@ func (r *Registry) build(userID string) *Engine {
 		},
 		func(quotes map[string]*data.StockInfo) { r.dispatchPaperMark(e, quotes) },
 	)
+	// 实盘交易（AUTO_TRADING_PLAN M1）：QMT 执行控制器 + 实盘账本 store（独立于纸面账本）。
+	// 引擎每 5s 把 qmt 配置热同步给控制器（syncAccountConfig），熔断/健康探测随分析循环节流执行。
+	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the
+	// paper book. The engine hot-syncs the qmt config each 5s cycle (syncAccountConfig); breaker/health
+	// probing runs throttled inside the advice loop.
+	if opts.RealStore != nil {
+		qmtCfg := opts.CfgMgr.GetRulesFor(userID).QMT
+		// 熔断/恢复告警走推送器（与 P1 强提醒同通道）
+		onAlert := func(level, title, content string) {}
+		if opts.Notifier != nil {
+			onAlert = func(level, title, content string) {
+				notifyLevel := notify.LevelMedium
+				switch level {
+				case "high":
+					notifyLevel = notify.LevelHigh
+				case "low":
+					notifyLevel = notify.LevelLow
+				}
+				opts.Notifier.Push(notify.Message{
+					Level:   notifyLevel,
+					Title:   title,
+					Content: content,
+				})
+			}
+		}
+		// 网关客户端：真实网关或 noop（enabled=false / URL 为空时 noop 降级，仅记账不真下）。
+		var exec trading.Executor = trading.NoopExecutor{}
+		if qmtCfg.Enabled && qmtCfg.GatewayURL != "" {
+			exec = trading.NewQMTClient(qmtCfg.GatewayURL, qmtCfg.Token,
+				time.Duration(qmtCfg.TimeoutSec)*time.Second, 1)
+		}
+		ctrl := trading.NewController(exec, opts.RealStore, userID, qmtCfg, onAlert)
+		e.SetQMT(ctrl, opts.RealStore)
+	}
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)
 	e.SetLongShortConfig(ls.LongEnabled, ls.ShortEnabled)

@@ -39,7 +39,9 @@ import (
 	"quant-trading-v2/internal/server"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
+	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/trading"
 )
 
 // Engine 顶层编排引擎，持有全部子代理引用与利好/利空开关。
@@ -101,6 +103,14 @@ type Engine struct {
 	paperOnSignals   func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy 信号撮合（registry 注入）
 	paperMarkFn      func(quotes map[string]*data.StockInfo)                             // 按账号分发估值/净值（registry 注入）
 	lastTrim         time.Time                                                           // 盘后内存释放最近一次执行时间（节流用）
+
+	// 实盘交易（AUTO_TRADING_PLAN M1）：QMT 控制器 + 实盘账本 store。独立于纸面账本。
+	// 仅 qmt.enabled=true 时参与 5s 分析循环（读 real_positions 生成持仓建议 / 熔断 / 自动下单）。
+	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the
+	// paper book. Only active when qmt.enabled=true: reads real_positions for position advice, circuit
+	// breaking and auto-orders each 5s cycle.
+	qmtCtrl     *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
+	realStore   *store.DB           // 研究库（real_positions/orders/fills 实盘账本存取）
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -447,6 +457,12 @@ func (e *Engine) syncAccountConfig() {
 			e.combatAgent.HotReload(sc)
 		}
 	}
+	// QMT 实盘配置热同步：每轮从配置管理器读取，控制器据此切换 enabled/mode/参数（5s 生效）。
+	// English: hot-sync the QMT live config each cycle from the manager; the controller flips
+	// enabled/mode/params accordingly (5s latency).
+	if c := e.QMTController(); c != nil {
+		c.UpdateConfig(cfgMgr.GetRulesFor(userID).QMT)
+	}
 }
 
 // SetNotifier 设置推送器（P1 清仓/止损强提醒走桌面/Webhook）。
@@ -474,6 +490,34 @@ func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, quo
 	e.mu.Unlock()
 }
 
+// SetQMT 注入 QMT 实盘执行控制器与实盘账本 store（AUTO_TRADING_PLAN M1）。
+// qmtCtrl 可空（未启用）；realStore 为研究库句柄（real_positions 存取）。
+// English: injects the QMT live-trading controller and the real-book store (AUTO_TRADING_PLAN M1).
+// qmtCtrl may be nil (disabled); realStore is the research-DB handle (real_positions access).
+func (e *Engine) SetQMT(qmtCtrl *trading.Controller, realStore *store.DB) {
+	e.mu.Lock()
+	e.qmtCtrl = qmtCtrl
+	e.realStore = realStore
+	e.mu.Unlock()
+}
+
+// QMTEnabled 实盘链路是否启用（qmt.enabled 热加载）。
+// English: QMTEnabled reports whether the live-trading chain is on (qmt.enabled hot-reloaded).
+func (e *Engine) QMTEnabled() bool {
+	e.mu.RLock()
+	c := e.qmtCtrl
+	e.mu.RUnlock()
+	return c != nil && c.Enabled()
+}
+
+// QMTController 返回 QMT 执行控制器（HTTP 层读取熔断/配置用，可空）。
+// English: QMTController returns the QMT controller for the HTTP layer (breaker/config reads; may be nil).
+func (e *Engine) QMTController() *trading.Controller {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.qmtCtrl
+}
+
 // paperSignals 把本轮翻转信号送入模拟盘撮合：优先按账号分发，回退全局引擎。
 // 仅交易时段执行（盘后停自动撮合，省内存）。
 // English: feeds this round's flipped signals into paper filling — per-account dispatch first, global
@@ -489,6 +533,89 @@ func (e *Engine) paperSignals(emit []combat_agent.Signal, quotes map[string]*dat
 	}
 	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
 		pe.OnSignals(emit, quotes)
+	}
+}
+
+// autoPlace AUTO_TRADING_PLAN M1：qmt.enabled + mode=auto 时把做多买入信号直连网关下单。
+// 幂等：signal_id 唯一键（Orders 表 UNIQUE），熔断中跳过；现价缺省时用信号触发价。
+// 金额按 fixed_amount（受 max_positions 预检约束）；code 补后缀便于网关识别交易所。
+// English: AUTO_TRADING_PLAN M1 — when qmt.enabled and mode=auto, places a real buy order for a long
+// signal straight to the gateway. Idempotent via the signal_id unique key (Orders table UNIQUE), skipped
+// while tripped; the live price is used when available, else the signal trigger price. Amount uses
+// fixed_amount (pre-checked against max_positions); the code gets its exchange suffix for the gateway.
+func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockInfo) {
+	e.mu.RLock()
+	ctrl := e.qmtCtrl
+	e.mu.RUnlock()
+	if ctrl == nil || !ctrl.Enabled() || ctrl.Mode() != "auto" {
+		return
+	}
+	cfg := ctrl.Config()
+	if len(cfg.Strategies) > 0 && sig.Strategy != "" {
+		allowed := false
+		for _, s := range cfg.Strategies {
+			if s == sig.Strategy {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return
+		}
+	}
+	price := sig.Price
+	if si := live[sig.Code]; si != nil && si.Price > 0 {
+		price = si.Price
+	}
+	if price <= 0 {
+		return
+	}
+	amount := cfg.FixedAmount
+	if amount <= 0 {
+		amount = 10000
+	}
+	qty := int(amount / price / 100) * 100
+	if qty <= 0 {
+		qty = 100
+	}
+	// 信号 ID 缺失时用 code@auto 兜底（幂等键仍需唯一）。
+	id := sig.ID
+	if id == "" {
+		id = sig.Code + "@auto"
+	}
+	res, err := ctrl.PlaceOrder(trading.OrderRequest{
+		SignalID:  id,
+		Code:      withSuffix(sig.Code),
+		Name:      sig.Name,
+		Strategy:  sig.Strategy,
+		Side:      trading.SideBuy,
+		PriceType: cfg.PriceType,
+		Price:     price,
+		Qty:       qty,
+		Amount:    float64(qty) * price,
+		CreatedAt: time.Now().Format(time.RFC3339),
+	})
+	if err != nil {
+		log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
+		return
+	}
+	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+}
+
+// withSuffix 为纯数字股票代码补交易所后缀（600000 → 600000.SH；000001 → 000001.SZ；4/8 开头 → .BJ）。
+// English: withSuffix appends the exchange suffix to a bare digit code (600000→600000.SH, 000001→000001.SZ,
+// 4/8-prefix→.BJ).
+func withSuffix(code string) string {
+	if strings.Contains(code, ".") {
+		return code
+	}
+	switch {
+	case strings.HasPrefix(code, "6"), strings.HasPrefix(code, "9"):
+		return code + ".SH"
+	case strings.HasPrefix(code, "4"), strings.HasPrefix(code, "8"):
+		return code + ".BJ"
+	default:
+		return code + ".SZ"
 	}
 }
 
@@ -1499,6 +1626,16 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 				sig.Price = si.Price
 			}
 			e.paperOpenBuy(sig)
+		}
+		// AUTO_TRADING_PLAN M1：qmt.enabled 且 mode=auto 时，做多买入信号直连网关真实下单
+		// （幂等：signal_id 唯一键，网关/首尔双端去重，熔断中自动跳过）。manual 模式不下单，
+		// 由前端持仓页实盘 tab 确认后经 POST /api/positions/execute 执行。
+		// English: AUTO_TRADING_PLAN M1 — when qmt.enabled and mode=auto, place a real order straight to the
+		// gateway for long buy signals (idempotent via signal_id; double-deduped gateway & Seoul; skipped
+		// while the breaker is open). manual mode sends nothing — the frontend live tab confirms first via
+		// POST /api/positions/execute.
+		if direction == "做多" && action == "买入" {
+			e.autoPlace(sig, live)
 		}
 		// 现价与涨跌幅：优先实时行情（比信号触发价更新），行情失败则回退信号触发价，避免消息里"现价:0.00"
 		// English: prefer the live quote for the price and change% (fresher than the trigger price); fall

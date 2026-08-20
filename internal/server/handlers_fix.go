@@ -20,6 +20,7 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/trading"
 )
 
 // r2 四舍五入到 2 位小数（价格/百分比）。
@@ -1640,17 +1641,66 @@ func (s *Server) handleFixRemoveWatchlist(w http.ResponseWriter, r *http.Request
 }
 
 // handleFixAction 处理 POST /api/action 请求，接收用户手动操作指令（买入/卖出等）。
-// 目前仅记录日志，暂未实现实际交易逻辑。
+// AUTO_TRADING_PLAN M1：qmt.enabled 且 manual 模式时，该端点为前端确认后的实盘下单入口
+// （signal_id 幂等 + 熔断前置校验）；未启用实盘时保持兼容的空操作 stub（仅日志）。
+// English: POST /api/action — manual operation command. Under AUTO_TRADING_PLAN M1, when qmt.enabled and
+// mode=manual this is the frontend-confirmed live order entry (signal_id idempotent + breaker pre-check);
+// otherwise it stays a no-op stub (log only) for compatibility.
 func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Code   string `json:"code"`
-		Action string `json:"action"`
+		Code     string  `json:"code"`
+		Action   string  `json:"action"`
+		SignalID string  `json:"signal_id"` // 信号 ID（幂等键）
+		Price    float64 `json:"price"`     // 参考价
+		Qty      int     `json:"qty"`       // 股数
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	log.Printf("[action] %s %s", req.Action, req.Code)
+	user := userFromContext(r)
+	ctrl := s.qmtCtrlFor(user.ID)
+	if ctrl != nil && ctrl.Enabled() && ctrl.Mode() == "manual" {
+		if req.Code == "" {
+			writeError(w, 400, "code required")
+			return
+		}
+		side := trading.SideBuy
+		if req.Action == "卖出" || req.Action == "sell" {
+			side = trading.SideSell
+		}
+		price := req.Price
+		if price <= 0 {
+			if q, err := s.quote(req.Code); err == nil && q != nil && q.Price > 0 {
+				price = q.Price
+			}
+		}
+		if price <= 0 {
+			writeError(w, 400, "price unavailable")
+			return
+		}
+		qty := req.Qty
+		if qty <= 0 {
+			qty = 100
+		}
+		signalID := req.SignalID
+		if signalID == "" {
+			signalID = "manual@" + req.Code + "@" + time.Now().Format("20060102150405")
+		}
+		res, err := ctrl.PlaceOrder(trading.OrderRequest{
+			SignalID: signalID, Code: normalizeTsCode(req.Code), Name: s.stockName(req.Code),
+			Side: side, PriceType: ctrl.Config().PriceType, Price: price, Qty: qty,
+			Amount: float64(qty) * price, CreatedAt: time.Now().Format(time.RFC3339),
+		})
+		if err != nil {
+			writeError(w, 400, "order rejected: "+err.Error())
+			return
+		}
+		log.Printf("[action] %s %s(%s) qty=%d price=%.2f → %+v", side, req.Code, s.stockName(req.Code), qty, price, res)
+		writeJSON(w, 200, res)
+		return
+	}
+	log.Printf("[action] %s %s (qmt disabled, stub)", req.Action, req.Code)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 

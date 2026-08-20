@@ -35,6 +35,7 @@ type Rules struct {
 	Notify     NotifyConfig     `json:"notify"`        // 通知推送参数
 	Scheduler  SchedulerConfig  `json:"scheduler"`     // 研究调度器配置（quant-research 服务读取）
 	Paper      PaperConfig      `json:"paper"`         // 模拟盘/纸面交易配置
+	QMT        QMTConfig        `json:"qmt"`           // 国信 MiniQMT 实盘交易配置
 	Runtime    RuntimeConfig    `json:"runtime"`       // 运行时内存治理配置
 }
 
@@ -65,6 +66,70 @@ type PaperConfig struct {
 	FixedAmount    float64 `json:"fixed_amount"`    // 每票固定买入资金（元，默认 10000）
 	MaxPositions   int     `json:"max_positions"`   // 最大并行持仓数（默认 10）
 	InitialCapital float64 `json:"initial_capital"` // 初始资金（元，默认 100000）
+}
+
+// QMTAdviceConfig 持仓处理分析层（实盘持仓）规则参数：加仓/格局判定阈值。
+// English: position-advice layer rules for the real book: add-position and hold(格局) thresholds.
+type QMTAdviceConfig struct {
+	// AddReopenDrawdownPct 加仓判定：现价相对持仓最高价（highest_price）回撤不超过该值才允许加仓
+	// （负值表示回撤幅度上限，如 -5 表示回撤超 5% 后不再建议加仓）。
+	AddReopenDrawdownPct float64 `json:"add_reopen_drawdown_pct"`
+	// AddSignalActive 加仓判定：是否要求该股信号仍活跃（StockScores.SignalActive）。
+	AddSignalActive bool `json:"add_signal_active"`
+	// HoldMinProfitPct 格局判定：现价相对成本盈利不低于该值（%）才建议格局（继续持有）。
+	HoldMinProfitPct float64 `json:"hold_min_profit_pct"`
+}
+
+// QMTConfig 国信 MiniQMT 实盘交易配置：把首尔侧的决策（信号/持仓建议）转发给国内 Windows 网关执行真实下单，
+// 网关回报（成交/持仓/断线）经 /api/qmt/report 回传。与纸面账本（PaperConfig）完全独立（双账本并存）。
+// English: Guoxin MiniQMT live-trading config — forwards Seoul-side decisions (signals / position advice)
+// to the domestic Windows gateway for real orders; gateway reports (fills/positions/disconnect) come back
+// via /api/qmt/report. Fully independent of the paper book (PaperConfig); the two books coexist.
+type QMTConfig struct {
+	// Enabled 总开关：是否传递信号/建议给交易服务器（热加载）。false 时实盘链路整体停用，纸面不受影响。
+	Enabled bool `json:"enabled"`
+	// Mode auto=全自动（信号 emit 直接下单）/ manual=半自动（前端确认后下单）。默认 manual。
+	Mode string `json:"mode"`
+	// GatewayURL 国内网关地址（如 https://<国内IP>:8789）。
+	GatewayURL string `json:"gateway_url"`
+	// Token 与网关双向鉴权的 Bearer token。
+	Token string `json:"token"`
+	// PriceType market=对手价（网关取实时盘口）/ limit=按信号参考价限价。默认 market。
+	PriceType string `json:"price_type"`
+	// FixedAmount 单票买入金额（元，默认 10000）。
+	FixedAmount float64 `json:"fixed_amount"`
+	// MaxPositions 最大并行实盘持仓数（默认 10，双端校验）。
+	MaxPositions int `json:"max_positions"`
+	// InitialCapital 初始实盘资金（元，默认 100000，用于仓位约束预检）。
+	InitialCapital float64 `json:"initial_capital"`
+	// Strategies 转发策略白名单（空=全部）。
+	Strategies []string `json:"strategies"`
+	// TimeoutSec 下单请求超时秒数（默认 10）。
+	TimeoutSec int `json:"timeout_sec"`
+	// MissHeartbeatSec 心跳超时秒数：网关 /health 连续失联超过该值 → 熔断暂停下单并告警（默认 120）。
+	MissHeartbeatSec int `json:"miss_heartbeat_sec"`
+	// Advice 持仓处理分析层（实盘持仓）规则参数。
+	Advice QMTAdviceConfig `json:"advice"`
+}
+
+// DefaultQMTConfig 返回 QMT 实盘配置出厂默认：enabled=false（默认关闭）、manual 半自动、对手价。
+// English: returns factory-default QMT live-trading config: disabled, manual mode, market price.
+func DefaultQMTConfig() QMTConfig {
+	return QMTConfig{
+		Enabled:          false,
+		Mode:             "manual",
+		PriceType:        "market",
+		FixedAmount:      10000,
+		MaxPositions:     10,
+		InitialCapital:   100000,
+		TimeoutSec:       10,
+		MissHeartbeatSec: 120,
+		Advice: QMTAdviceConfig{
+			AddReopenDrawdownPct: -5,
+			AddSignalActive:      true,
+			HoldMinProfitPct:     0,
+		},
+	}
 }
 
 // SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
@@ -952,6 +1017,7 @@ var DefaultRules = &Rules{
 	},
 	Scheduler: DefaultSchedulerConfig(),
 	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000},
+	QMT:       DefaultQMTConfig(),
 	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15},
 }
 

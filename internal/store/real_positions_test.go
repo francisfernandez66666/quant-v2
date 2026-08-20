@@ -1,0 +1,97 @@
+// 实盘账本（AUTO_TRADING_PLAN M1）存取测试：全量对账 upsert、成交回报应用（建仓/加仓/减仓/清仓）、幂等下单。
+package store
+
+import (
+	"database/sql"
+	"testing"
+)
+
+// TestUpsertRealPositions 验证全量对账：upsert 覆盖 + 移除已清仓行 + highest_price 单调不回退。
+func TestUpsertRealPositions(t *testing.T) {
+	db := testDB(t)
+	base := []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 300, CostPrice: 10, Amount: 3000, HighestPrice: 11, Strategy: "N形", SignalID: "SIG1"},
+		{TsCode: "000001.SZ", Name: "平安", Qty: 100, CostPrice: 50, Amount: 5000, HighestPrice: 52},
+	}
+	if n, err := db.UpsertRealPositions(base); err != nil || n != 2 {
+		t.Fatalf("first upsert: n=%d err=%v", n, err)
+	}
+	// 第二推：600000 数量变化 + 最高价降级（应保留旧最高价）；000001 消失（应删除）
+	second := []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 400, CostPrice: 10.5, Amount: 4200, HighestPrice: 10.2},
+	}
+	if n, err := db.UpsertRealPositions(second); err != nil || n != 1 {
+		t.Fatalf("second upsert: n=%d err=%v", n, err)
+	}
+	p, err := db.RealPositionByCode("600000.SH")
+	if err != nil {
+		t.Fatalf("by code: %v", err)
+	}
+	if p.Qty != 400 || p.CostPrice != 10.5 {
+		t.Fatalf("upsert 覆盖失败: %+v", p)
+	}
+	if p.HighestPrice != 11 {
+		t.Fatalf("highest_price 应保留旧峰值 11，got %v", p.HighestPrice)
+	}
+	if _, err := db.RealPositionByCode("000001.SZ"); err != sql.ErrNoRows {
+		t.Fatalf("000001 应被移除，err=%v", err)
+	}
+}
+
+// TestApplyRealFill 验证成交回报驱动：买入建仓 → 加仓加权成本 → 减仓 → 清仓删除 + fills 落库。
+func TestApplyRealFill(t *testing.T) {
+	db := testDB(t)
+	// 建仓买入
+	if err := db.ApplyRealFill(RealFill{OrderID: "O1", Code: "600000.SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000, TradedAt: "2026-08-20 09:35:00", SignalID: "SIG1"}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	p, err := db.RealPositionByCode("600000.SH")
+	if err != nil || p.Qty != 100 || p.CostPrice != 10 || p.HighestPrice != 10 {
+		t.Fatalf("open 异常: %+v err=%v", p, err)
+	}
+	// 加仓买入：加权成本应变为 (1000+12*100)/200=11
+	if err := db.ApplyRealFill(RealFill{OrderID: "O2", Code: "600000.SH", Side: "买入", Price: 12, Qty: 100, Amount: 1200, TradedAt: "2026-08-20 10:00:00"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	p, _ = db.RealPositionByCode("600000.SH")
+	if p.Qty != 200 || p.CostPrice != 11 || p.HighestPrice != 12 {
+		t.Fatalf("加仓加权成本异常: %+v", p)
+	}
+	// 减仓 50
+	if err := db.ApplyRealFill(RealFill{OrderID: "O3", Code: "600000.SH", Side: "卖出", Price: 13, Qty: 50, Amount: 650, TradedAt: "2026-08-20 11:00:00"}); err != nil {
+		t.Fatalf("reduce: %v", err)
+	}
+	p, _ = db.RealPositionByCode("600000.SH")
+	if p.Qty != 150 || p.Amount != 1650 {
+		t.Fatalf("减仓异常: %+v", p)
+	}
+	// 清仓
+	if err := db.ApplyRealFill(RealFill{OrderID: "O4", Code: "600000.SH", Side: "卖出", Price: 13, Qty: 150, Amount: 1950, TradedAt: "2026-08-20 14:00:00"}); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := db.RealPositionByCode("600000.SH"); err != sql.ErrNoRows {
+		t.Fatalf("清仓后应删除，err=%v", err)
+	}
+	fills, err := db.RealFills()
+	if err != nil || len(fills) != 4 {
+		t.Fatalf("fills 应 4 条，got %d err=%v", len(fills), err)
+	}
+}
+
+// TestUpsertRealOrderIdempotent 验证同一 signal_id 重复下单被幂等拦截。
+func TestUpsertRealOrderIdempotent(t *testing.T) {
+	db := testDB(t)
+	o := RealOrder{OrderID: "GW1", SignalID: "SIG1", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-08-20 09:30:00"}
+	existed, err := db.UpsertRealOrder(o)
+	if err != nil || existed {
+		t.Fatalf("first order: existed=%v err=%v", existed, err)
+	}
+	existed, err = db.UpsertRealOrder(o)
+	if err != nil || !existed {
+		t.Fatalf("duplicate signal_id 应幂等返回 existed=true, got %v err=%v", existed, err)
+	}
+	orders, err := db.RealOrders()
+	if err != nil || len(orders) != 1 {
+		t.Fatalf("orders 应 1 条，got %d err=%v", len(orders), err)
+	}
+}
