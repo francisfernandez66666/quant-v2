@@ -35,6 +35,25 @@ type Rules struct {
 	Notify     NotifyConfig     `json:"notify"`        // 通知推送参数
 	Scheduler  SchedulerConfig  `json:"scheduler"`     // 研究调度器配置（quant-research 服务读取）
 	Paper      PaperConfig      `json:"paper"`         // 模拟盘/纸面交易配置
+	Runtime    RuntimeConfig    `json:"runtime"`       // 运行时内存治理配置
+}
+
+// RuntimeConfig 运行时内存治理配置：盘后释放常驻服务内存，避免与夜间研究作业叠加触发 OOM。
+// 服务器物理内存仅 1.6GiB：quant 常驻服务盘后仅需展示数据快照（无需跑全量性能），
+// 主动把 Go 堆/缓存归还 OS，把物理内存让给盘后 research 作业。
+// English: runtime memory-governance config — releases the resident engine's memory after hours so it
+// doesn't stack with the nightly research job on the 1.6GiB box. After hours the engine only serves
+// data snapshots (no heavy work), so the Go heap/cache is returned to the OS for research to use.
+type RuntimeConfig struct {
+	// TrimAfterHours 盘后内存释放总开关（默认 true）：非活跃时段（盘后/休市）定时
+	// runtime.GC()+debug.FreeOSMemory() 把堆归还 OS；盘中不触发，不影响性能。
+	// English: after-hours memory-trim master switch (default true): outside active sessions the engine
+	// periodically runs runtime.GC()+debug.FreeOSMemory() to return the heap to the OS; never during
+	// trading hours, so live performance is unaffected.
+	TrimAfterHours bool `json:"trim_after_hours"`
+	// TrimIntervalMin 盘后释放节流间隔（分钟，默认 15）。
+	// English: after-hours trim throttle interval in minutes (default 15).
+	TrimIntervalMin int `json:"trim_interval_min"`
 }
 
 // PaperConfig 模拟盘（纸面交易）配置：把 buy 信号按实时价自动撮合成虚拟持仓，独立于真实持仓。
@@ -61,6 +80,13 @@ type SchedulerConfig struct {
 	PyURL               string                    `json:"pyurl"`                   // baostock sidecar 地址（默认 http://127.0.0.1:8787）
 	Nightly             NightlyConfig             `json:"nightly"`                 // 盘后/周末夜间作业
 	DataloadDuringTrade DataloadDuringTradeConfig `json:"dataload_during_trading"` // 交易时段增量下载
+	// TrimIntervalMin 盘中内存释放节流间隔（分钟，默认 15）：活跃时段 researchd 自身
+	// 定时 runtime.GC()+debug.FreeOSMemory() 并防御性清理残留的 research/discover 子进程，
+	// 保证研究绝不残留盘中（物理内存让给盘中的 quant 常驻服务）。
+	// English: in-session trim throttle in minutes (default 15): during active sessions the researchd
+	// daemon periodically GC+FreeOSMemory itself and defensively kills leftover research/discover child
+	// processes, so research never lingers during trading hours (leaving RAM to the quant engine).
+	TrimIntervalMin int `json:"trim_interval_min"`
 }
 
 // NightlyConfig 夜间研究作业配置（盘后/周末触发）。
@@ -105,6 +131,7 @@ func DefaultSchedulerConfig() SchedulerConfig {
 			Enabled:         true,
 			IntervalMinutes: 30,
 		},
+		TrimIntervalMin: 15,
 	}
 }
 
@@ -820,6 +847,9 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 			out.DataloadDuringTrade.IntervalMinutes = v
 		}
 	}
+	if v, ok := cfgInt(m, "trim_interval_min"); ok {
+		out.TrimIntervalMin = v
+	}
 	return out
 }
 
@@ -916,6 +946,7 @@ var DefaultRules = &Rules{
 	},
 	Scheduler: DefaultSchedulerConfig(),
 	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000},
+	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15},
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。

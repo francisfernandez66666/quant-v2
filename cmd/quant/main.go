@@ -368,6 +368,13 @@ func main() {
 				for _, e := range registry.All() {
 					e.RunScoringLoopOnce(scoreLoopCtx)
 				}
+				// 盘后内存释放：非活跃时段按节流间隔把常驻堆归还 OS，
+				// 让物理内存让给盘后 research 夜间作业（避免叠加 OOM）。
+				// English: after-hours memory trim — release the resident heap back to the OS on a
+				// throttled cadence so the nightly research job has the RAM it needs (no stacking OOM).
+				for _, e := range registry.All() {
+					e.TrimAfterHoursIfDue(time.Now())
+				}
 			}
 		}
 	}()

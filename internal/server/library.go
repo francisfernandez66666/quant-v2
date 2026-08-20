@@ -4,9 +4,11 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -53,6 +55,10 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 		Horizon      int                    `json:"horizon,omitempty"`
 		IR           float64                `json:"ir,omitempty"`
 		Excess       float64                `json:"excess,omitempty"`
+		ICMean       float64                `json:"ic_mean,omitempty"` // 全样本 IC 均值（候选表回填）
+		AvgExcess    float64                `json:"avg_excess,omitempty"` // 全链路回测超额（候选表 avg_excess，>0 表示已回测）
+		BacktestDone bool                   `json:"backtest_done"`     // 全链路回测是否已跑过（avg_excess 已回填）
+		Reason       string                 `json:"reason,omitempty"`  // 候选证据文本（样本内外 IR / 反推超额）
 		Conds        []research.PatternCond `json:"conds,omitempty"`
 	}
 	var out []libItem
@@ -71,12 +77,26 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, e := range stats {
-		out = append(out, libItem{
+		item := libItem{
 			Kind: "factor", ID: e.ID, Name: e.Name, Enabled: e.Enabled, CandID: e.CandID,
 			AppliedAt: e.AppliedAt, SignalCount: e.SignalCount, Win: e.Win, Loss: e.Loss, CumReturn: e.CumReturn,
 			Factors: e.Factors, Weights: e.Weights, Directions: e.Directions,
 			BuyThreshold: e.BuyThreshold, Horizon: e.Horizon, IR: e.IR, Excess: e.Excess,
-		})
+		}
+		// 关联候选表验证信息：全样本 IC / 全链路回测超额与状态 / 证据文本（样本内外 IR、反推超额），
+		// 让战法库卡片完整展示"这条规律电脑验证过吗"。
+		// English: join the candidate's validation info — full-sample IC, full-chain backtest excess &
+		// status, and the evidence text (in/out-of-sample IR, extrapolated excess) — so each library card
+		// shows the full "was this rule computer-validated" story.
+		if s.researchDB != nil && e.CandID > 0 {
+			if c, err := s.researchDB.CandidateByID(e.CandID); err == nil && c != nil {
+				item.ICMean = c.ICMean
+				item.AvgExcess = c.AvgExcess
+				item.BacktestDone = c.AvgExcess != 0
+				item.Reason = c.Reason
+			}
+		}
+		out = append(out, item)
 	}
 	// 形态战法库
 	patterns, err := research.ListAppliedPatternRules(s.researchDir)
@@ -273,7 +293,7 @@ func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request)
 
 	// 后台执行
 	go func() {
-		avg, err := s.runCandidateBacktest(id)
+		avg, err := s.runCandidateBacktest(id, job)
 		backtestJobs.Lock()
 		defer backtestJobs.Unlock()
 		j := backtestJobs.m[id]
@@ -314,7 +334,7 @@ func (s *Server) handleBacktestStatus(w http.ResponseWriter, r *http.Request) {
 // English: runs a full B4 backtest on a candidate and backfills avg_excess, spawning the
 // `research backtest` CLI as a separate child process so the backtest's memory/CPU can't OOM the
 // quant engine (quant runs under a 1G MemoryMax cgroup; in-process full backtests have OOM-killed it).
-func (s *Server) runCandidateBacktest(id int64) (float64, error) {
+func (s *Server) runCandidateBacktest(id int64, job *backtestJob) (float64, error) {
 	// 定位 research 二进制：优先常见部署路径，其次 PATH，最后 researchDir 同目录。
 	// English: locate the research binary — common deploy paths first, then PATH, then next to researchDir.
 	bin := ""
@@ -350,11 +370,51 @@ func (s *Server) runCandidateBacktest(id int64) (float64, error) {
 	}
 	args := []string{"--db", dbPath, "backtest", "--id", strconv.FormatInt(id, 10)}
 	cmd := exec.Command(bin, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, fmt.Errorf("打开子进程输出失败: %v", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return 0, fmt.Errorf("打开子进程错误输出失败: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("回测子进程启动失败: %v", err)
+	}
+	// 逐行解析子进程输出：识别"回测进度 xx%"实时更新任务进度（前端 5s 轮询），
+	// 末尾"平均超额=%.4f"为最终结果；stdout/stderr 合并按行处理，任一行崩溃不拖垮轮询。
+	// English: read the child's output line-by-line — "回测进度 xx%" updates the job progress in
+	// real time (frontend polls every 5s); the trailing "平均超额=%.4f" is the final result; stdout
+	// and stderr are both scanned; a bad line can never break the polling loop.
 	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		return 0, fmt.Errorf("回测子进程失败: %v: %s", err, out.String())
+	var wg sync.WaitGroup
+	scan := func(r io.Reader) {
+		defer wg.Done()
+		br := bufio.NewReader(r)
+		for {
+			line, err := br.ReadString('\n')
+			if len(line) > 0 {
+				out.WriteString(line)
+				if m := backtestProgressRe.FindStringSubmatch(line); len(m) == 2 {
+					backtestJobs.Lock()
+					if job != nil {
+						job.Progress = m[1] + "%"
+					}
+					backtestJobs.Unlock()
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go scan(stdout)
+	go scan(stderr)
+	waitErr := cmd.Wait()
+	wg.Wait()
+	if waitErr != nil {
+		return 0, fmt.Errorf("回测子进程失败: %v: %s", waitErr, out.String())
 	}
 	// 解析 CLI 输出的"平均超额=%.4f"
 	avg := 0.0
@@ -371,6 +431,10 @@ func (s *Server) runCandidateBacktest(id int64) (float64, error) {
 // avgExcessRe 匹配 research backtest CLI 输出的平均超额。
 // English: matches the avg-excess printed by the research backtest CLI.
 var avgExcessRe = regexp.MustCompile(`平均超额=(-?\d+\.?\d*)`)
+
+// backtestProgressRe 匹配 research backtest CLI 的阶段进度输出（"回测进度 xx%"）。
+// English: matches the stage-progress output of the research backtest CLI ("回测进度 xx%").
+var backtestProgressRe = regexp.MustCompile(`回测进度 (\d+)%`)
 
 // BacktestJobsSnapshot 供测试/诊断读取回测任务表。
 // English: exposes the backtest job table for tests/diagnostics.

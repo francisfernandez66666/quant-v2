@@ -76,6 +76,11 @@ type Options struct {
 	Benchmark   string // 基准指数（默认 000300.SH）
 	Lookback    int    // 因子预热回看天数（默认 70）
 	Rule        SignalRule
+	// OnProgress 可选进度回调（已处理事件数/总事件数）。供 CLI/HTTP 上报回测进度，
+	// 前端据此渲染"全链路回测进度条"。nil 时不回调。
+	// English: optional progress callback (events done / total). Lets the CLI/HTTP layer report
+	// backtest progress so the frontend can render a "full-chain backtest" progress bar. nil = no-op.
+	OnProgress func(done, total int)
 }
 
 // DefaultOptions 返回默认回测选项。
@@ -180,11 +185,15 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 		Start: opts.Start, End: opts.End, Benchmark: opts.Benchmark,
 		Rule: opts.Rule, Horizons: opts.Horizons,
 	}
-	for _, e := range events {
+	total := len(events)
+	for i, e := range events {
 		er := evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons)
 		rep.Events = append(rep.Events, er)
 		rep.TotalEvents++
 		rep.TotalPicks += len(er.Picks)
+		if opts.OnProgress != nil {
+			opts.OnProgress(i+1, total)
+		}
 	}
 	rep.Summarize()
 	return rep, nil

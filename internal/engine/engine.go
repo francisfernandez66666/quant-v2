@@ -17,6 +17,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -96,6 +98,7 @@ type Engine struct {
 	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
 	factorMon        *factorMonitor                  // 因子战法效果监测（战法库触发信号前向收益结算）
 	paper            *paper.Engine                   // 模拟盘引擎（独立纸面交易，可空=未启用）
+	lastTrim         time.Time                       // 盘后内存释放最近一次执行时间（节流用）
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -160,6 +163,42 @@ func (e *Engine) SetD1MaxRetries(n int) {
 	e.mu.Lock()
 	e.d1MaxRetries = n
 	e.mu.Unlock()
+}
+
+// TrimAfterHoursIfDue 盘后内存释放：非活跃时段（盘后/休市）按节流间隔执行
+// runtime.GC()+debug.FreeOSMemory()，把常驻 Go 堆/缓存归还 OS。
+// 服务器物理内存仅 1.6GiB：quant 常驻服务盘后只展示数据快照、不跑全量性能，
+// 主动释放内存让给盘后 research 夜间作业，避免两者叠加触发 global_oom。
+// 由 main 的 5s 打分调度每轮调用；盘中（活跃时段）不触发，不影响性能。
+// English: after-hours memory trim — outside active sessions, periodically runs
+// runtime.GC()+debug.FreeOSMemory() (throttled) to return the resident Go heap/cache to the OS.
+// The 1.6GiB box can't afford quant + the nightly research job simultaneously; after hours the
+// engine only serves data snapshots, so it gives memory back to research. Called by the 5s scoring
+// dispatcher each round; never runs during active trading sessions.
+func (e *Engine) TrimAfterHoursIfDue(now time.Time) {
+	if e.cfgMgr == nil {
+		return
+	}
+	rc := e.cfgMgr.Rules.Runtime
+	if !rc.TrimAfterHours || data.IsActiveSession(now) {
+		return
+	}
+	interval := time.Duration(rc.TrimIntervalMin) * time.Minute
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	e.mu.Lock()
+	due := now.Sub(e.lastTrim) >= interval
+	if due {
+		e.lastTrim = now
+	}
+	e.mu.Unlock()
+	if !due {
+		return
+	}
+	runtime.GC()
+	debug.FreeOSMemory()
+	log.Printf("[engine] 盘后内存释放完成 (trim_after_hours, 节流 %v)", interval)
 }
 
 // ReloadFactorRules 从战法库 applied_factors.json 重载全部启用规则并注入因子 runner（热生效）。

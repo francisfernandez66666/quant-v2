@@ -35,6 +35,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,6 +61,7 @@ type Scheduler struct {
 	jobRunning    bool               // 是否有作业在跑
 	tradingDLBusy bool               // 交易时段 dataload 是否在跑（防重叠）
 	lastRunStep   string             // 最近执行步骤（日志）
+	lastTrim      time.Time          // 盘中内存释放最近一次执行时间（节流用）
 	state         stateFile
 }
 
@@ -116,13 +119,63 @@ func (s *Scheduler) tick() {
 	}
 	now := s.now()
 	if data.IsActiveSession(now) {
-		// 交易时段：终止遗留夜间作业 + 可选的增量下载（只下载，不研究）
+		// 交易时段：终止遗留夜间作业 + 盘中内存释放 + 可选的增量下载（只下载，不研究）
 		s.killRunning("交易时段开始")
+		s.trimInSession(cfg, now)
 		s.maybeTradingDataload(cfg, now)
 		return
 	}
 	// 盘后/周末：夜间作业
 	s.ensureNightly(cfg, now)
+}
+
+// trimInSession 盘中内存治理：活跃时段按节流间隔执行
+// 1) 防御性清理残留的 research 研究子进程（夜间作业被 OOM 击杀后遗留的孤儿进程，
+//    绝不会让研究在盘中继续占用内存/CPU）；
+// 2) 对 researchd 自身 runtime.GC()+debug.FreeOSMemory() 归还堆内存。
+// 服务器物理内存仅 1.6GiB：盘中把内存让给 quant 常驻服务，盘后 quant 又让给 research，
+// 两者互补，避免叠加 OOM。
+// English: in-session memory governance — on a throttled cadence during active sessions it (1)
+// defensively kills leftover `research` study child processes (orphans left behind when the nightly
+// job was OOM-killed, so research never lingers intraday) and (2) GC+FreeOSMemory on researchd itself
+// to return its heap. On the 1.6GiB box this hands RAM to quant during the day, which hands it back
+// to research at night — complementary, no stacking OOM.
+func (s *Scheduler) trimInSession(cfg config.SchedulerConfig, now time.Time) {
+	interval := time.Duration(cfg.TrimIntervalMin) * time.Minute
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	s.mu.Lock()
+	due := now.Sub(s.lastTrim) >= interval
+	if due {
+		s.lastTrim = now
+	}
+	s.mu.Unlock()
+	if !due {
+		return
+	}
+	s.killOrphanResearch()
+	runtime.GC()
+	debug.FreeOSMemory()
+	log.Printf("[scheduler] 盘中内存释放完成 (trim_interval_min=%d)", cfg.TrimIntervalMin)
+}
+
+// killOrphanResearch 防御性清理残留的 research 研究子进程：
+// 只匹配"research 二进制且命令行含 discover"的进程（夜间 discover-factors 是唯一重内存任务，
+// OOM 被击杀后可能遗留孤儿）。不碰 researchd 本身（进程名 researchd）、
+// 不碰 quant 手动触发的回测子进程（命令行是 backtest 不含 discover）、不碰 dataload。
+// English: defensively kills leftover `research` study child processes, matching only processes whose
+// command line runs the research binary with a discover arg (the nightly discover-factors job is the
+// only heavy-memory task and may leave orphans when OOM-killed). Never touches researchd itself
+// (process name researchd), the quant-triggered backtest child (its arg is backtest, not discover),
+// or dataload.
+func (s *Scheduler) killOrphanResearch() {
+	if _, err := exec.LookPath("pkill"); err != nil {
+		return
+	}
+	if err := exec.Command("pkill", "-f", "research .*discover").Run(); err == nil {
+		log.Printf("[scheduler] 盘中防御性清理残留 research 子进程")
+	}
 }
 
 // maybeTradingDataload 交易时段按间隔跑 dataload daily（仅增量下载，绝不研究/回测）。

@@ -572,6 +572,20 @@ func cmdBacktestCandidate(db *store.DB, args []string) {
 	bopts.Rule.Weights = weights
 	bopts.Rule.TopK = *topK
 	bopts.Rule.MinStocks = *minStocks
+	// 进度上报：每推进 10% 打印一次"回测进度 xx%"（供 HTTP 层逐行解析 → 前端进度条）。
+	// English: report progress — print "回测进度 xx%" every 10% so the HTTP layer can parse it
+	// line-by-line and drive the frontend progress bar.
+	lastPct := 0
+	bopts.OnProgress = func(done, total int) {
+		if total <= 0 {
+			return
+		}
+		pct := done * 100 / total
+		if pct >= lastPct+10 {
+			lastPct = pct
+			log.Printf("回测进度 %d%% (%d/%d)", pct, done, total)
+		}
+	}
 	rep, err := backtest.Run(db, bopts)
 	if err != nil {
 		log.Fatalf("B4 回测失败: %v", err)

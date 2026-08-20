@@ -122,6 +122,22 @@
             <span class="stat">累计前向收益 <b :class="s.cum_return >= 0 ? 'pos' : 'neg'">{{ fmtPct(s.cum_return) }}</b></span>
             <span class="stat">回测超额 <b :class="signClass(s.excess)">{{ fmt(s.excess) }}</b></span>
           </div>
+          <!-- 规律验证：样本内外 IR / 反推超额 / 全样本 IR·IC / 全链路回测（候选表关联） -->
+          <div class="lib-verify" v-if="s.kind === 'factor'">
+            <div class="lib-verify-title">这条规律靠谱吗？（电脑验证过）</div>
+            <div class="lib-verify-row">
+              <span class="v-label">前瞻</span><span class="v-value">{{ s.horizon }} 个交易日</span>
+              <span class="v-label">样本内 IR</span><span class="v-value">{{ fmt(parseReason(s,'样本内IR')) }}</span>
+              <span class="v-label">样本外 IR</span><span class="v-value">{{ fmt(parseReason(s,'样本外IR')) }}</span>
+              <span class="v-label">反推超额</span><span class="v-value">{{ fmtPct(parseReason(s,'反推超额')) }}</span>
+              <span class="v-label">全样本 IR</span><span class="v-value">{{ fmt(s.ir) }}</span>
+              <span class="v-label">全样本 IC</span><span class="v-value">{{ fmt(s.ic_mean) }}</span>
+              <span class="v-label">全链路回测</span>
+              <span class="v-value" :class="s.backtest_done ? (s.avg_excess >= 0 ? 'pos' : 'neg') : 'dim'">
+                {{ s.backtest_done ? fmt(s.avg_excess) : '未测' }}
+              </span>
+            </div>
+          </div>
           <div class="lib-actions" v-if="canApprove">
             <button class="btn-toggle" @click="toggleLibrary(s)">
               {{ s.enabled ? '停用' : '启用' }}
@@ -262,8 +278,15 @@
             :disabled="backtestLoading[c.id]"
             @click="doBacktest(c)"
           >
-            {{ backtestLoading[c.id] ? (backtestState[c.id] === 'running' ? '回测中...' : '回测中...') : (c.avg_excess ? '重新回测' : '全量回测') }}
+            {{ backtestLoading[c.id] ? '回测中...' : (c.avg_excess ? '重新回测' : '全量回测') }}
           </button>
+          <!-- 回测进度条：后端子进程每推进 10% 上报一次，前端 5s 轮询刷新 -->
+          <div v-if="backtestLoading[c.id] && backtestProgress[c.id]" class="bt-progress">
+            <div class="bt-progress-bar">
+              <div class="bt-progress-fill" :style="{ width: btPct(c.id) }"></div>
+            </div>
+            <span class="bt-progress-label">全链路回测 {{ backtestProgress[c.id] }}</span>
+          </div>
           <span v-if="backtestResult[c.id]" class="bt-result" :class="signClass(backtestResult[c.id])">
             回测超额 {{ fmt(backtestResult[c.id]) }}
           </span>
@@ -305,6 +328,8 @@ const backtestState = ref({})   // 候选 id → running/done/error
 // candidate id → backtest state
 const backtestResult = ref({})  // 候选 id → 回测超额结果
 // candidate id → backtest excess result
+const backtestProgress = ref({}) // 候选 id → 回测进度（如 "45%"）
+// candidate id → backtest progress (e.g. "45%")
 
 // 子页 tab
 const tabs = [
@@ -542,6 +567,15 @@ function btTested(c) {
   return c.avg_excess !== 0
 }
 
+/** 回测进度百分比（进度字符串 "45%" → 用于进度条宽度） */
+/** backtest progress percent ("45%" → progress-bar width) */
+function btPct(id) {
+  const p = backtestProgress.value[id]
+  if (!p) return '0%'
+  const n = parseInt(p, 10)
+  return (isNaN(n) ? 0 : Math.max(0, Math.min(100, n))) + '%'
+}
+
 /** 从后端加载候选列表 */
 /** Load the candidate list from the backend */
 async function loadData() {
@@ -722,10 +756,15 @@ async function doBacktest(c) {
   const poll = setInterval(async () => {
     try {
       const j = await api.fetchBacktestStatus(c.id)
+      // 回测进度实时更新（后端子进程输出逐行解析出"回测进度 xx%"）
+      if (j.progress) {
+        backtestProgress.value = { ...backtestProgress.value, [c.id]: j.progress }
+      }
       if (j.status === 'done') {
         clearInterval(poll)
         backtestLoading.value = { ...backtestLoading.value, [c.id]: false }
         backtestState.value = { ...backtestState.value, [c.id]: 'done' }
+        backtestProgress.value = { ...backtestProgress.value, [c.id]: null }
         backtestResult.value = { ...backtestResult.value, [c.id]: j.avg_excess }
         c.avg_excess = j.avg_excess
         alert('候选 #' + c.id + ' 回测完成，回测超额 ' + (j.avg_excess !== undefined ? (j.avg_excess * 100).toFixed(2) + '%' : '0%'))
@@ -734,6 +773,7 @@ async function doBacktest(c) {
         clearInterval(poll)
         backtestLoading.value = { ...backtestLoading.value, [c.id]: false }
         backtestState.value = { ...backtestState.value, [c.id]: 'error' }
+        backtestProgress.value = { ...backtestProgress.value, [c.id]: null }
         alert('候选 #' + c.id + ' 回测失败: ' + (j.error || ''))
       }
     } catch (e) {
@@ -801,9 +841,17 @@ function stopPolling() {
 .lib-time { font-size: 11px; color: #777; margin-left: auto; }
 .lib-factors { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .lib-stats { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: #aaa; margin-bottom: 8px; }
-.lib-stats .stat b { font-weight: 600; }
-.lib-stats .stat b.pos { color: #4caf50; }
-.lib-stats .stat b.neg { color: #FF4D4F; }
+ .lib-stats .stat b { font-weight: 600; }
+ .lib-stats .stat b.pos { color: #4caf50; }
+ .lib-stats .stat b.neg { color: #FF4D4F; }
+ .lib-verify { background: #141428; border: 1px solid #2a2a3e; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
+ .lib-verify-title { font-size: 12px; font-weight: 600; color: #e0e0e0; margin-bottom: 6px; }
+ .lib-verify-row { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; color: #aaa; align-items: baseline; }
+ .lib-verify-row .v-label { color: #777; }
+ .lib-verify-row .v-value { font-weight: 600; color: #e0e0e0; }
+ .lib-verify-row .v-value.pos { color: #4caf50; }
+ .lib-verify-row .v-value.neg { color: #FF4D4F; }
+ .lib-verify-row .v-value.dim { color: #777; font-weight: 400; }
 .lib-actions { display: flex; gap: 10px; }
 .btn-toggle { padding: 4px 12px; border-radius: 6px; border: 1px solid #64b5f6; background: rgba(100,181,246,0.12); color: #64b5f6; font-size: 12px; cursor: pointer; }
 .btn-toggle:hover { background: rgba(100,181,246,0.22); }
@@ -813,6 +861,10 @@ function stopPolling() {
  .bt-result { font-size: 12px; font-weight: 600; align-self: center; }
  .bt-result.pos { color: #4caf50; }
  .bt-result.neg { color: #FF4D4F; }
+ .bt-progress { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; width: 220px; }
+ .bt-progress-bar { width: 100%; height: 6px; border-radius: 3px; background: #2a2a3e; overflow: hidden; }
+ .bt-progress-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #ff9800, #ffc107); transition: width 0.5s ease; }
+ .bt-progress-label { font-size: 11px; color: #ff9800; }
 
 /* 子页 tab */
 .research-tabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid #2a2a3e; padding-bottom: 8px; }

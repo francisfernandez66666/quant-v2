@@ -25,8 +25,12 @@ import (
 )
 
 // windowDays 每个窗口包含的交易日数。越小峰值内存越低、但装配次数越多（越慢）。
+// 90→60：2026-08-20 起调小以进一步压低研究峰值内存（~716MB→~450MB），
+// 配合 quant 盘后释放 + MemoryMax 1500M，让 1.6G 小 VPS 的夜间作业不再叠加 OOM。
 // English: trading days per window. Smaller → lower peak memory, more assembles (slower).
-const windowDays = 90
+// 90→60 (since 2026-08-20): shrinks the research peak (~716MB→~450MB) so the nightly job no longer
+// stacks with quant on the 1.6G box (alongside quant's after-hours release and MemoryMax 1500M).
+const windowDays = 60
 
 // windowDefs 把因子 ID 列表解析为装配用的 Def 列表（缺省全部已注册）。
 // English: resolves factor IDs into Defs for assembly (defaults to all registered factors).

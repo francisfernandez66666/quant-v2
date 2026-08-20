@@ -25,13 +25,16 @@ RestartSec=5
 LimitNOFILE=65535
 
 # 资源不抢占 quant 主程序（适配 2 核 / 1.6G 小 VPS）
-# 内存上限收紧到 900M：本机物理内存仅 1.6G（quant 独占 1G），研究作业若超上限
-# 只被杀、不影响 quant；配合 discover_factors 的窗口分块（峰值 ~340M）可正常跑完。
+# 内存上限 900M→1500M（2026-08-20）：quant 盘后已主动释放内存（trim_after_hours），
+# 整机 1.6G 盘后只剩 research 重负载（窗口 60 后峰值 ~450M），给足余量让它可超过 1G 跑全量研究。
+# English: MemoryMax 900M→1500M (2026-08-20): quant now releases its memory after hours
+# (trim_after_hours), so research is the only heavy load at night (~450M peak with window 60);
+# the headroom lets it exceed 1G for the full research job.
 Nice=10
 CPUWeight=8
 CPUQuota=100%
 MemoryHigh=700M
-MemoryMax=900M
+MemoryMax=1500M
 IOSchedulingClass=idle
 
 Environment=TZ=Asia/Shanghai
