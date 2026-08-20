@@ -226,11 +226,12 @@ func (e *Engine) Cfg() Config {
 // drop the private fields (cash/positions/…), writing an empty object and loading cash=0 so the paper
 // book could never fill. State fields are therefore persisted explicitly.
 type persistedState struct {
-	Cash      float64              `json:"cash"`
-	Positions map[string]*Position `json:"positions"`
-	Trades    []Trade              `json:"trades"`
-	Equity    []EquityPoint        `json:"equity"`
-	Realized  float64              `json:"realized"`
+	Cash           float64              `json:"cash"`
+	InitialCapital float64              `json:"initial_capital,omitempty"` // 自定义初始资金（reset 设置；空历史时保留，重启后恢复）
+	Positions      map[string]*Position `json:"positions"`
+	Trades         []Trade              `json:"trades"`
+	Equity         []EquityPoint        `json:"equity"`
+	Realized       float64              `json:"realized"`
 }
 
 // persist 将当前状态写入 JSON（幂等，失败仅记录日志）。
@@ -240,11 +241,12 @@ func (e *Engine) persist() {
 		return
 	}
 	st := persistedState{
-		Cash:      e.cash,
-		Positions: e.positions,
-		Trades:    e.trades,
-		Equity:    e.equity,
-		Realized:  e.realized,
+		Cash:           e.cash,
+		InitialCapital: e.cfg.InitialCapital,
+		Positions:      e.positions,
+		Trades:         e.trades,
+		Equity:         e.equity,
+		Realized:       e.realized,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -273,6 +275,9 @@ func (e *Engine) load() {
 	// cash=0 that makes the paper book unable to fill.
 	if st.Cash <= 0 && len(st.Positions) == 0 && len(st.Trades) == 0 {
 		return
+	}
+	if st.InitialCapital > 0 {
+		e.cfg.InitialCapital = st.InitialCapital
 	}
 	e.cash = st.Cash
 	e.realized = st.Realized
