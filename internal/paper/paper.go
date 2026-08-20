@@ -232,12 +232,19 @@ type persistedState struct {
 	Realized       float64              `json:"realized"`
 }
 
+// tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
+// English: how long fill records are kept — 3 months, for strategy-effect / slippage / latency analysis.
+const tradeRetention = 90 * 24 * time.Hour
+
 // persist 将当前状态写入 JSON（幂等，失败仅记录日志）。
-// English: writes current state to the JSON file (best-effort; failures only log).
+// 写入前先清理超过保留期（3 个月）的成交日志，避免无限膨胀。
+// English: writes current state to the JSON file (best-effort; failures only log), trimming fills
+// older than the retention window first so the log can't grow without bound.
 func (e *Engine) persist() {
 	if e.path == "" {
 		return
 	}
+	e.trimTradesLocked()
 	st := persistedState{
 		Cash:           e.cash,
 		InitialCapital: e.cfg.InitialCapital,
@@ -288,6 +295,27 @@ func (e *Engine) load() {
 	}
 	e.trades = st.Trades
 	e.equity = st.Equity
+	e.trimTradesLocked()
+}
+
+// trimTradesLocked 清理超过保留期（3 个月）的成交记录（调用方须持锁）。
+// 按成交时间过滤；trades 数组长度变化时原地压缩。供成交日志长期留档、分析用。
+// English: drops fills older than the retention window (3 months); caller must hold the lock.
+// Filters by fill time and compacts in place when the length changes. Keeps the trade log for analysis.
+func (e *Engine) trimTradesLocked() {
+	if len(e.trades) == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-tradeRetention)
+	out := e.trades[:0]
+	for _, t := range e.trades {
+		if t.Time.After(cutoff) {
+			out = append(out, t)
+		}
+	}
+	if len(out) != len(e.trades) {
+		e.trades = out
+	}
 }
 
 // OnSignals 消费一轮策略信号做自动撮合：仅做多 buy 信号，用实时快照价成交固定资金。

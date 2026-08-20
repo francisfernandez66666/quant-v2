@@ -104,7 +104,7 @@
         当前持仓 <em class="sub">{{ positions.length }} 只</em>
       </button>
       <button class="tab" :class="{ active: tab === 'trades' }" @click="tab = 'trades'">
-        成交日志 <em class="sub">{{ trades.length }} 笔</em>
+        成交日志 <em class="sub">{{ trades.length }} 笔 · 近3月</em>
       </button>
     </div>
 
@@ -140,9 +140,9 @@
       <div v-else class="empty-hint">暂无持仓（出现可开仓信号时按实时价自动买入）</div>
     </div>
 
-    <!-- 成交记录（Fill records / trade log）-->
+    <!-- 成交记录（Fill records / trade log，保留近 3 个月供分析）-->
     <div class="panel" v-if="tab === 'trades'">
-      <div class="panel-title">成交日志 <em class="sub">{{ trades.length }} 笔</em></div>
+      <div class="panel-title">成交日志 <em class="sub">{{ trades.length }} 笔 · 近3个月</em></div>
       <table class="data-table" v-if="trades.length">
         <thead>
           <tr>
