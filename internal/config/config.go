@@ -122,10 +122,16 @@ func DefaultSchedulerConfig() SchedulerConfig {
 		Nightly: NightlyConfig{
 			StartHHMM:        1530,
 			WeekendStartHHMM: 1530,
-			Steps:            []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "list"},
-			AbortOnError:     false,
-			BacktestEnabled:  false,
-			BacktestEvents:   0,
+			// 默认夜间研究步骤序列：行情装载 → 板块重建 → 因子挖掘 → 形态挖掘 → 模拟盘研究
+			// （读取盘后落库的模拟盘成交/净值生成信号质量报告）→ 候选列表汇总。
+			// backtest 由 BacktestEnabled 开关控制追加。
+			// English: default nightly steps — dataload → sector rebuild → factor discovery → pattern
+			// discovery → paper research (reads the post-close paper fills/snapshots for a signal-quality
+			// report) → candidate listing. The backtest step is appended by the BacktestEnabled toggle.
+			Steps:           []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "paper_research", "list"},
+			AbortOnError:    false,
+			BacktestEnabled: false,
+			BacktestEvents:  0,
 		},
 		DataloadDuringTrade: DataloadDuringTradeConfig{
 			Enabled:         true,

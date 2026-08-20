@@ -470,18 +470,25 @@ export async function fetchPaperEquity() {
   return request('/api/paper/equity')
 }
 
-/** 模拟盘：手动按实时价买入（信号页"模拟买入"按钮触发） */
-/** Paper trading: manually buy one stock at the live price (signal-page "paper buy" button) */
-// 对应 POST /api/paper/buy，data: { code, name, strategy, signal_price }
-export async function buyPaperPosition(code, name, strategy, signalPrice) {
-  return request('/api/paper/buy', { method: 'POST', data: { code, name, strategy, signal_price: signalPrice || 0 } })
+/** 模拟盘：手动买入（信号页"模拟买入"按钮触发）。qty>0 时按用户输入价格/手数成交（静态记账），
+ *  price=0 回退实时价；qty<=0 回退固定金额整手（旧行为）。 */
+/** Paper trading: manual buy (signal-page "paper buy" button). qty>0 fills the typed price/lots (static
+ *  bookkeeping), price=0 falls back to the live quote; qty<=0 falls back to fixed-amount whole lots. */
+// 对应 POST /api/paper/buy，data: { code, name, strategy, signal_price, price, qty }
+export async function buyPaperPosition(code, name, strategy, signalPrice, price, qty) {
+  return request('/api/paper/buy', {
+    method: 'POST',
+    data: { code, name, strategy, signal_price: signalPrice || 0, price: price || 0, qty: qty || 0 },
+  })
 }
 
-/** 模拟盘：手动按实时价卖出持仓（清仓） */
-/** Paper trading: manually sell a position at the live price */
-// 对应 POST /api/paper/sell，data: { code }
-export async function sellPaperPosition(code) {
-  return request('/api/paper/sell', { method: 'POST', data: { code } })
+/** 模拟盘：手动卖出。qty>0 时按指定数量减仓（price>0 用输入价，price=0 回退实时价；qty>=持仓=清仓），
+ *  qty<=0 时按实时价清仓（旧行为）。 */
+/** Paper trading: manual sell. qty>0 trims the typed lot count (price>0 uses the typed price, price=0
+ *  falls back to the live quote; qty>=position closes it), qty<=0 closes at the live price (legacy). */
+// 对应 POST /api/paper/sell，data: { code, price, qty }
+export async function sellPaperPosition(code, price, qty) {
+  return request('/api/paper/sell', { method: 'POST', data: { code, price: price || 0, qty: qty || 0 } })
 }
 
 /** 模拟盘：清盘重置（按最后估值价平仓，重置现金/成交/净值；initialCapital>0 时自定义初始资金，
@@ -1054,6 +1061,18 @@ export async function backtestResearchCandidate(id) {
 /** Query a backtest job's status (GET /api/research/backtest/{id}) */
 export async function fetchBacktestStatus(id) {
   return request('/api/research/backtest/' + encodeURIComponent(id))
+}
+
+/** 查询运行中的回测任务列表（GET /api/research/backtest/running，页面刷新后恢复轮询） */
+/** Fetch running backtest jobs (GET /api/research/backtest/running; used to resume polling after a refresh) */
+export async function fetchRunningBacktests() {
+  return request('/api/research/backtest/running')
+}
+
+/** 查询全部回测任务列表（GET /api/research/backtest/list，回测 tab 进度查看，含夜间全量） */
+/** Fetch all backtest jobs (GET /api/research/backtest/list; backtest-tab progress view, includes nightly runs) */
+export async function fetchAllBacktests() {
+  return request('/api/research/backtest/list')
 }
 
 // ── 战法库（已应用因子战法管理 + 效果监测）──

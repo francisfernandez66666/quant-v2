@@ -93,19 +93,35 @@ type Registry struct {
 	// trades, own paper.json) under accounts/<userID>/.
 	papers    map[string]*paper.Engine // userID → paper 引擎（懒加载创建）
 	coreUsers map[*Engine][]string     // 共享引擎 → 服务账号列表（信号按账号分发模拟盘）
+	// 盘后落库：每账号导出日期记录（一天一次）+ 导出回调（main 注入 server.ExportPaperToResearch）。
+	// English: post-close export — per-account last-export date (once a day) + the export callback
+	// (wired by main to server.ExportPaperToResearch).
+	paperExportDay map[string]string
+	dayCloseHook   func(userID string, pe *paper.Engine)
+
+	// 战法分仓：全局资金池类型模板（engine.ActivePoolTypes 注入），新老账号模拟盘据此分池，
+	// 每个战法池只扣自己战法的预算（防波动突破垄断）。English: strategy pooling — the global
+	// pool-type template (injected from engine.ActivePoolTypes); each account's paper splits cash by it.
+	paperPoolTypes []string
+	// 自动撮合账号判定：仅返回 true 的账号参与按战法自动建仓/自动估值（admin）；
+	// 普通用户的模拟盘纯手动 + 静态存储，不联动任何自动行为。nil = 默认全部自动（兼容旧行为）。
+	// English: auto-paper account check — only accounts returning true get strategy-driven auto-fills
+	// and auto-marks (admin); normal users' paper is purely manual + static. nil = all auto (legacy).
+	autoCheck func(userID string) bool
 }
 
 // NewRegistry 创建引擎注册表。
 // English: creates the engine registry.
 func NewRegistry(opts EngineOptions) *Registry {
 	return &Registry{
-		opts:      opts,
-		cores:     make(map[string]*Engine),
-		byUser:    make(map[string]*Engine),
-		initDone:  make(map[string]bool),
-		initProg:  make(map[string]*InitStage),
-		papers:    make(map[string]*paper.Engine),
-		coreUsers: make(map[*Engine][]string),
+		opts:           opts,
+		cores:          make(map[string]*Engine),
+		byUser:         make(map[string]*Engine),
+		initDone:       make(map[string]bool),
+		initProg:       make(map[string]*InitStage),
+		papers:         make(map[string]*paper.Engine),
+		coreUsers:      make(map[*Engine][]string),
+		paperExportDay: make(map[string]string),
 	}
 }
 
@@ -138,6 +154,11 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	}
 	cfg := r.opts.Paper.Cfg()
 	pe := paper.New(cfg, r.paperPath(userID))
+	// 新账号继承全局战法资金池模板（分仓，防单战法垄断）。
+	// English: a new account inherits the global strategy pool template (allocation against monopolies).
+	if len(r.paperPoolTypes) > 0 {
+		pe.SetStrategyPools(r.paperPoolTypes)
+	}
 	r.papers[userID] = pe
 	r.mu.Unlock()
 	return pe
@@ -174,25 +195,122 @@ func (r *Registry) registerUser(e *Engine, userID string) {
 	}
 }
 
-// dispatchPaperSignals 把本轮翻转信号分发给共享引擎服务的所有账号的模拟盘（各自独立撮合）。
-// English: dispatches this round's flipped signals to the paper engines of every account the shared
-// engine serves (each fills independently).
+// dispatchPaperSignals 把本轮翻转信号分发给共享引擎服务的账号中"参与自动撮合"的模拟盘
+// （各自独立撮合；普通用户账号不自动建仓，模拟盘纯手动）。仅交易时段运行（盘后省内存）。
+// English: dispatches this round's flipped signals to the paper engines of the accounts served by the
+// shared engine that participate in auto-fill (each fills independently; normal users' books are manual).
+// Runs only during trading hours (after-hours skips to save memory).
 func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+	if !data.IsFullTradingHours(time.Now()) {
+		return
+	}
 	for _, uid := range r.usersOf(e) {
+		if !r.isAutoPaper(uid) {
+			continue
+		}
 		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
 			pe.OnSignals(emit, quotes)
 		}
 	}
 }
 
-// dispatchPaperMark 用实时快照刷新共享引擎所服务账号的模拟盘估值与净值。
-// English: refreshes marks/equity for the paper engines of every account a shared engine serves.
+// dispatchPaperMark 用实时快照刷新"参与自动撮合"账号模拟盘的估值与净值（仅交易时段，盘后省内存）；
+// 普通用户模拟盘为静态记账（只按手动录入价/手数），不自动估值/快照。
+// 交易时段收盘后（15:00 后首次 tick）触发一次盘后落库：当日成交 + 每日快照写入研究库供自动研究。
+// English: refreshes marks/equity for the auto-paper accounts of a shared engine — trading hours only
+// (after-hours saves memory). Normal users' paper is static bookkeeping (manual price/lot entries) with
+// no auto-marking or snapshots. After the close (first tick past 15:00 on a trading day) it triggers one
+// post-close export: the day's fills + daily snapshot go to the research DB for auto-research.
 func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInfo) {
+	now := time.Now()
+	inSession := data.IsFullTradingHours(now)
 	for _, uid := range r.usersOf(e) {
-		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
-			pe.MarkToMarket(quotes)
-			pe.Snapshot(time.Now())
+		if !r.isAutoPaper(uid) {
+			continue
 		}
+		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
+			if inSession {
+				pe.MarkToMarket(quotes)
+				pe.Snapshot(now)
+			}
+			r.checkDayClose(uid, pe, now)
+		}
+	}
+}
+
+// checkDayClose 每日盘后（交易日 15:00 后）首次调用时触发一次盘后导出 hook（当日成交 + 每日快照
+// 落研究库）。按账号记录导出日期，一天只导一次；幂等写入由 store 的唯一键保证。
+// English: fires the post-close export hook once per account per day — on the first call after 15:00 on a
+// trading day (exports the day's fills + daily snapshot to the research DB). One export per day per
+// account; store unique keys keep the write idempotent.
+func (r *Registry) checkDayClose(userID string, pe *paper.Engine, now time.Time) {
+	if !data.IsTradingDay(now) || now.Hour() < 15 {
+		return
+	}
+	day := now.Format("2006-01-02")
+	r.mu.Lock()
+	last := r.paperExportDay[userID]
+	if last == day {
+		r.mu.Unlock()
+		return
+	}
+	r.paperExportDay[userID] = day
+	hook := r.dayCloseHook
+	r.mu.Unlock()
+	if hook != nil {
+		hook(userID, pe)
+	}
+}
+
+// SetDayCloseExport 注入盘后导出回调（main 接线 server.ExportPaperToResearch：把模拟盘当日成交与
+// 每日快照写入研究库，供自动研究消费）。
+// English: injects the post-close export callback (main wires server.ExportPaperToResearch, which writes
+// the paper day's fills + daily snapshot into the research DB for auto-research).
+func (r *Registry) SetDayCloseExport(fn func(userID string, pe *paper.Engine)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dayCloseHook = fn
+}
+
+// isAutoPaper 判断某账号是否参与自动撮合/自动估值。autoCheck 未注入（nil）时默认全部自动（兼容旧行为）。
+// English: reports whether an account joins auto-fill/auto-mark. A nil autoCheck defaults to all-auto
+// (legacy-compatible).
+func (r *Registry) isAutoPaper(userID string) bool {
+	r.mu.Lock()
+	fn := r.autoCheck
+	r.mu.Unlock()
+	if fn == nil {
+		return true
+	}
+	return fn(userID)
+}
+
+// SetAutoPaperCheck 注入"是否参与自动撮合/估值"的判定函数（main 注入 auth.IsAdmin：
+// admin 账号自动按战法建仓，普通用户仅手动 + 静态存储）。
+// English: injects the auto-paper check (main wires auth.IsAdmin — admin accounts get strategy-driven
+// auto-fills; normal users are manual-only + static).
+func (r *Registry) SetAutoPaperCheck(fn func(userID string) bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.autoCheck = fn
+}
+
+// SetPaperPools 设置全局战法资金池类型模板并同步到所有已建账号模拟盘。
+// 幂等：pe.SetStrategyPools 在池集合未变时保留各池现金，热加载（因子/形态审批、启停）后调用安全。
+// 注入路径：engine.ActivePoolTypes → registry.SetPaperPools → 各账号 pe.SetStrategyPools。
+// English: sets the global strategy pool-type template and syncs it to every existing paper engine.
+// Idempotent: SetStrategyPools keeps cash while the type set is unchanged, so hot reloads are safe.
+// Injected via engine.ActivePoolTypes → registry.SetPaperPools → each account's pe.SetStrategyPools.
+func (r *Registry) SetPaperPools(types []string) {
+	r.mu.Lock()
+	r.paperPoolTypes = append([]string(nil), types...)
+	pes := make([]*paper.Engine, 0, len(r.papers))
+	for _, pe := range r.papers {
+		pes = append(pes, pe)
+	}
+	r.mu.Unlock()
+	for _, pe := range pes {
+		pe.SetStrategyPools(types)
 	}
 }
 
@@ -348,7 +466,9 @@ func (r *Registry) build(userID string) *Engine {
 	// template only supplies config; e.paper stays as the legacy single-engine fallback.
 	e.SetPaper(opts.Paper)
 	e.SetPaperDispatch(
-		func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) { r.dispatchPaperSignals(e, emit, quotes) },
+		func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+			r.dispatchPaperSignals(e, emit, quotes)
+		},
 		func(quotes map[string]*data.StockInfo) { r.dispatchPaperMark(e, quotes) },
 	)
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）

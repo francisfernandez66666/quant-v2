@@ -8,7 +8,9 @@
 package backtest
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"time"
@@ -81,6 +83,15 @@ type Options struct {
 	// English: optional progress callback (events done / total). Lets the CLI/HTTP layer report
 	// backtest progress so the frontend can render a "full-chain backtest" progress bar. nil = no-op.
 	OnProgress func(done, total int)
+
+	// CandidateID 候选 ID（>0 时启用断点续跑）：每个事件先读 backtest_event_results 缓存，
+	// 命中则复用结果跳过重算，未命中才 evalEvent 并落库。中断/重启后续跑只重算剩余事件，
+	// 且同一候选重跑覆盖旧缓存（规则参数变更后自动失效）。
+	// English: candidate ID — when > 0, checkpoint-resume is enabled: each event first reads the
+	// backtest_event_results cache, reusing a hit and skipping recomputation; a miss is computed and
+	// persisted. A resumed run only recomputes events not yet cached; reruns overwrite stale rows so a
+	// parameter change on the same candidate invalidates old cache automatically.
+	CandidateID int64
 }
 
 // DefaultOptions 返回默认回测选项。
@@ -187,7 +198,28 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 	}
 	total := len(events)
 	for i, e := range events {
-		er := evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons)
+		// 断点续跑：命中缓存则反序列化复用，未命中才重算并落库（每事件完整结果，报告可复用）。
+		// English: checkpoint-resume — a cache hit is unmarshalled and reused; a miss is computed and
+		// persisted as the full per-event result (reusable by reports).
+		var er EventResult
+		cached := false
+		if opts.CandidateID > 0 {
+			if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry); err == nil && ok {
+				if json.Unmarshal([]byte(js), &er) == nil {
+					cached = true
+				}
+			}
+		}
+		if !cached {
+			er = evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons)
+			if opts.CandidateID > 0 {
+				if js, err := json.Marshal(er); err == nil {
+					if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, string(js)); err != nil {
+						log.Printf("backtest: 缓存事件结果失败 cand=%d %s/%s: %v", opts.CandidateID, e.Date, e.Industry, err)
+					}
+				}
+			}
+		}
 		rep.Events = append(rep.Events, er)
 		rep.TotalEvents++
 		rep.TotalPicks += len(er.Picks)

@@ -285,12 +285,27 @@ function sheetBuy() {
   confirmTrade(s, 'buy')
 }
 
-/** 模拟盘买入：确认后按实时价自动撮合一笔虚拟持仓（paper buy: confirm then auto-fill a virtual position at the live price）*/
+/** 模拟盘买入：输入买入价+买入手数后按用户指定记账（普通用户"搬运持仓"；留空价格用实时价）。
+ *  English: paper buy — fill the typed price and lot count (normal users' "copy real positions";
+ *  an empty price uses the live quote). */
 async function paperBuy(s) {
-  if (!confirm(`确认模拟买入 ${s.code} ${s.name || ''}？将按实时价成交固定资金。`)) return
+  const priceStr = prompt('输入买入价（元，留空用实时价）：', s.price || s.close || '')
+  const qtyStr = prompt('输入买入手数（1 手 = 100 股）：', '1')
+  if (qtyStr === null || priceStr === null) return // 用户取消
+  const qty = parseInt(qtyStr, 10)
+  const price = parseFloat(priceStr)
+  if (isNaN(qty) || qty <= 0) {
+    alert('买入手数无效，请填写正整数')
+    return
+  }
+  if (isNaN(price) || price <= 0) {
+    if (!confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手？将按实时价成交。`)) return
+  } else {
+    if (!confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手 @${price.toFixed(2)}？`)) return
+  }
   try {
-    await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0)
-    alert(`已模拟买入 ${s.code}`)
+    await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty)
+    alert(`已模拟买入 ${s.code} ${qty} 手`)
   } catch (e) {
     alert(e.message || '模拟买入失败')
   }

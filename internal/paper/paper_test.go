@@ -178,3 +178,39 @@ func TestMaxPositions(t *testing.T) {
 		t.Fatalf("应受 2 仓上限约束, 实际 %d", len(e.Positions()))
 	}
 }
+
+// TestDepositPreservesPositions 验证注入资金是增量：现金增加、持仓/成交/净值保留、收益基准累计。
+func TestDepositPreservesPositions(t *testing.T) {
+	e := New(testCfg(), "")
+	now := time.Now()
+	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10.0}}
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发银行", Strategy: "N形", Direction: "做多", Action: "buy", Price: 9.8, GeneratedAt: now.Add(-30 * time.Second)},
+	}, quotes)
+	if got := len(e.Positions()); got != 1 {
+		t.Fatalf("注入前应已有 1 笔持仓, 实际 %d", got)
+	}
+	tradesBefore := len(e.Trades())
+	cashBefore := e.Stats().Cash
+	equityBefore := len(e.Equity())
+	capBefore := e.Cfg().InitialCapital
+
+	e.Deposit(50000)
+
+	st := e.Stats()
+	if st.Cash != cashBefore+50000 {
+		t.Errorf("现金应增量 +50000（%.2f → %.2f）", cashBefore, st.Cash)
+	}
+	if len(e.Positions()) != 1 {
+		t.Errorf("注入后持仓不应被清空, 实际 %d", len(e.Positions()))
+	}
+	if len(e.Trades()) != tradesBefore {
+		t.Errorf("注入后成交日志不应被清空")
+	}
+	if len(e.Equity()) != equityBefore {
+		t.Errorf("注入后净值曲线不应被清空")
+	}
+	if st.InitialCapital != capBefore+50000 {
+		t.Errorf("累计投入基准应 +50000（%.2f → %.2f）", capBefore, st.InitialCapital)
+	}
+}

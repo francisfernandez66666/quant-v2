@@ -47,15 +47,21 @@ func DefaultConfig() Config {
 // English: a paper position. SignalPrice is the reference signal price; CostPrice is the actual
 // fill price (live price).
 type Position struct {
-	Code        string    `json:"code"`
-	Name        string    `json:"name"`
-	Strategy    string    `json:"strategy"`
-	Qty         int       `json:"qty"`
-	CostPrice   float64   `json:"cost_price"`
-	Cost        float64   `json:"cost"`
-	SignalPrice float64   `json:"signal_price"`
-	SignalAt    time.Time `json:"signal_at"`
-	FilledAt    time.Time `json:"filled_at"`
+	Code     string `json:"code"`
+	Name     string `json:"name"`
+	Strategy string `json:"strategy"`
+	// StrategyType 该持仓所属战法池类型（fillLocked 时由信号 StrategyType 记录；
+	// 卖出时收益按此回池。旧数据/手动买入为空 → 归"其他池"）。
+	// English: the strategy-pool type this position belongs to (recorded at fill from the signal's
+	// StrategyType; sale proceeds return to that pool on exit. Empty for legacy data / manual buys,
+	// which fall into the "other" pool).
+	StrategyType string    `json:"strategy_type,omitempty"`
+	Qty          int       `json:"qty"`
+	CostPrice    float64   `json:"cost_price"`
+	Cost         float64   `json:"cost"`
+	SignalPrice  float64   `json:"signal_price"`
+	SignalAt     time.Time `json:"signal_at"`
+	FilledAt     time.Time `json:"filled_at"`
 	// Mark 最近一次估值价（实时快照，前端展示现价/浮盈用）。
 	// English: last mark price from the live snapshot, for live P/L display.
 	Mark float64 `json:"mark"`
@@ -122,15 +128,19 @@ func (p *Position) LatencySec() int64 {
 // Trade 一笔模拟成交记录（买入含信号价参照与延迟）。
 // English: one paper fill. Buys carry the reference signal price and latency.
 type Trade struct {
-	Code        string    `json:"code"`
-	Name        string    `json:"name"`
-	Strategy    string    `json:"strategy"`
-	Side        string    `json:"side"` // buy / sell
-	Price       float64   `json:"price"`
-	SignalPrice float64   `json:"signal_price,omitempty"`
-	Qty         int       `json:"qty"`
-	Amount      float64   `json:"amount"`
-	Time        time.Time `json:"time"`
+	Code     string `json:"code"`
+	Name     string `json:"name"`
+	Strategy string `json:"strategy"`
+	// StrategyType 该成交所属战法池类型（分池/盘后研究落库归类用；空=其他池/手动）。
+	// English: the strategy-pool type of this fill (for pooling and post-close research export; empty =
+	// the other pool / manual).
+	StrategyType string    `json:"strategy_type,omitempty"`
+	Side         string    `json:"side"` // buy / sell
+	Price        float64   `json:"price"`
+	SignalPrice  float64   `json:"signal_price,omitempty"`
+	Qty          int       `json:"qty"`
+	Amount       float64   `json:"amount"`
+	Time         time.Time `json:"time"`
 	// LatencySec 信号发出→成交 的秒数（买入时记录；量化信号时效性）。
 	// English: seconds from signal generation to fill (recorded on buys; quantifies signal timeliness).
 	LatencySec int64  `json:"latency_sec,omitempty"`
@@ -167,6 +177,36 @@ type Stats struct {
 	EquityCurvePoints int     `json:"equity_curve_points"` // 净值点数量
 }
 
+// StrategyPoolState 一个战法资金池的展示快照（前端分仓条）。
+// English: one strategy cash pool's display snapshot (frontend allocation strip).
+type StrategyPoolState struct {
+	Key       string  `json:"key"`       // 策略类型（""=其他/手动池）
+	Label     string  `json:"label"`     // 展示名
+	Cash      float64 `json:"cash"`      // 池内可用现金
+	RatioPct  float64 `json:"ratio_pct"` // 占总现金比例（%）
+	Positions int     `json:"positions"` // 池内持仓数
+}
+
+// strategyPoolLabel 战法池类型 → 展示名。
+// English: strategy-pool type → display label.
+func strategyPoolLabel(t string) string {
+	switch t {
+	case "dragon":
+		return "龙回头"
+	case "double_bump":
+		return "双响炮"
+	case "n_shape":
+		return "N形超短"
+	case "dragon_return":
+		return "龙回头中线"
+	case "factor":
+		return "因子战法"
+	case "pattern":
+		return "形态战法"
+	}
+	return "其他"
+}
+
 // Engine 模拟盘引擎：独立于真实持仓的虚拟撮合/估值/统计。
 // path 为 JSON 持久化路径（空则不落盘，纯内存）。
 // English: the paper engine — virtual fill/mark/statistics, isolated from the real book.
@@ -176,6 +216,8 @@ type Engine struct {
 
 	mu        sync.Mutex
 	cash      float64
+	pools     map[string]float64 // 战法资金池：key=策略类型（""=其他/手动池），Σpools == cash
+	poolTypes []string           // 启用的战法类型（不含 ""），保持有序；空=未分仓（单池）
 	positions map[string]*Position
 	trades    []Trade
 	equity    []EquityPoint
@@ -195,6 +237,7 @@ func New(cfg Config, path string) *Engine {
 	e := &Engine{
 		cfg:       cfg,
 		cash:      cfg.InitialCapital,
+		pools:     map[string]float64{"": cfg.InitialCapital}, // 默认单池（未分仓）兼容
 		positions: make(map[string]*Position),
 		path:      path,
 	}
@@ -223,17 +266,24 @@ func (e *Engine) Cfg() Config {
 // drop the private fields (cash/positions/…), writing an empty object and loading cash=0 so the paper
 // book could never fill. State fields are therefore persisted explicitly.
 type persistedState struct {
-	Cash           float64              `json:"cash"`
-	InitialCapital float64              `json:"initial_capital,omitempty"` // 自定义初始资金（reset 设置；空历史时保留，重启后恢复）
+	Cash           float64 `json:"cash"`
+	InitialCapital float64 `json:"initial_capital,omitempty"` // 自定义初始资金（reset 设置；空历史时保留，重启后恢复）
 	// 自定义持仓上限：>0 生效，0=不设限（由资金自然决定）。不用 omitempty，
 	// 保证 0（不设限）也明确落盘可见，避免"上限设置没固化"的排查困惑。
 	// English: custom position cap — applies when > 0, 0 = unlimited (driven by the balance).
 	// No omitempty so that 0 (unlimited) is explicitly written to disk, avoiding "cap not persisted" confusion.
-	MaxPositions int `json:"max_positions"`
-	Positions      map[string]*Position `json:"positions"`
-	Trades         []Trade              `json:"trades"`
-	Equity         []EquityPoint        `json:"equity"`
-	Realized       float64              `json:"realized"`
+	MaxPositions int                  `json:"max_positions"`
+	Positions    map[string]*Position `json:"positions"`
+	Trades       []Trade              `json:"trades"`
+	Equity       []EquityPoint        `json:"equity"`
+	Realized     float64              `json:"realized"`
+	// Pools 战法资金池（key=策略类型，""=其他池；Pools 与 PoolTypes 同时落盘，跨重启保留各池现金）。
+	// 旧数据（无 Pools）兼容：load 时按现金建单池 {"": cash}，行为与分仓前完全一致。
+	// English: strategy cash pools (key = strategy type, "" = the other pool; both Pools and PoolTypes are
+	// persisted so per-pool cash survives restarts). Legacy data without Pools is compatible: load falls
+	// back to the single pool {"": cash}, identical to pre-allocation behavior.
+	Pools     map[string]float64 `json:"pools,omitempty"`
+	PoolTypes []string           `json:"pool_types,omitempty"`
 }
 
 // tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
@@ -257,6 +307,8 @@ func (e *Engine) persist() {
 		Trades:         e.trades,
 		Equity:         e.equity,
 		Realized:       e.realized,
+		Pools:          e.pools,
+		PoolTypes:      e.poolTypes,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -299,6 +351,23 @@ func (e *Engine) load() {
 	}
 	e.trades = st.Trades
 	e.equity = st.Equity
+	// 恢复战法资金池：旧数据（无 Pools）按现金建单池（分仓前行为一致）；有 Pools 时还原各池现金，
+	// 并按其求和兜底现金（历史现金字段与池和一致性修正）。
+	// English: restore strategy pools — legacy data without Pools becomes the single pool {"": cash} (same as
+	// before allocation); with Pools, per-pool cash is restored and the aggregate cash is reconciled to it.
+	if st.Pools != nil && len(st.Pools) > 0 {
+		e.pools = st.Pools
+		e.poolTypes = st.PoolTypes
+		sum := 0.0
+		for _, v := range e.pools {
+			sum += v
+		}
+		if sum > 0 {
+			e.cash = sum
+		}
+	} else {
+		e.pools = map[string]float64{"": e.cash}
+	}
 	e.trimTradesLocked()
 }
 
@@ -359,7 +428,17 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		} else {
 			continue
 		}
-		if err := e.fillLocked(s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, s.Reason); err != nil {
+		// 战法分池：按信号 StrategyType 归池；类型未启用（无对应池）时跳过该信号，
+		// 空类型（watch/手动）走"其他池"。池扣款由 fillLocked 完成。
+		// English: strategy pooling — the signal debits its own pool by StrategyType; a type without a
+		// pool (disabled) is skipped, and empty types (watch/manual) fall into the "other" pool.
+		poolKey := s.StrategyType
+		if poolKey != "" {
+			if _, ok := e.pools[poolKey]; !ok {
+				continue
+			}
+		}
+		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 		}
 	}
@@ -367,38 +446,50 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 }
 
 // fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
-// 每票按 FixedAmount 整手买入；现金不足买足额时按剩余现金缩减到整手（不足一手跳过），
-// 让持仓数由本金与现金余额自然决定（灵活持仓）。
+// poolKey 为该笔买入所属的战法资金池（""=其他/手动池）；扣款只扣对应池预算，池与池互不侵占。
+// qty > 0 为显式手数（手动买入/加仓，超出池内资金直接失败）；
+// qty <= 0 时按 FixedAmount 自动算整手，现金不足按池内剩余现金缩减到整手（不足一手跳过）。
 // English: fills a buy at the given price (caller must hold the lock); returns an error on failure.
-// Each stock is bought with FixedAmount in board lots; when cash is short of the full amount, the qty
-// shrinks to the affordable whole lot (skipped below one lot), so position count follows the balance.
-func (e *Engine) fillLocked(code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, reason string) error {
-	qty := int(e.cfg.FixedAmount / price / 100) * 100
+// poolKey is the strategy cash pool this buy debits ("" = the other/manual pool); pools never invade
+// each other. qty > 0 is an explicit lot count (manual buy/add, fails when exceeding the pool balance);
+// qty <= 0 auto-sizes to FixedAmount in whole lots, shrinking to the largest affordable lot on a
+// shortfall (skipping below one lot).
+func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string) error {
+	explicitQty := qty > 0
+	if !explicitQty {
+		qty = int(e.cfg.FixedAmount/price/100) * 100
+	}
 	if qty <= 0 {
 		return errLotTooSmall // 一手都买不起（不足 A 股一手）
 	}
 	cost := float64(qty) * price
-	if cost > e.cash {
-		// 现金不足：按剩余现金缩减到整手；缩减后仍买不起一手则跳过
-		// English: cash short — shrink to the largest affordable whole lot; skip if below one lot.
-		qty = int(e.cash / price / 100) * 100
+	pool := e.pools[poolKey]
+	if cost > pool {
+		if explicitQty {
+			return errCash // 手动指定手数超出池内资金，不静默缩减
+		}
+		// 自动金额现金不足：按池内剩余现金缩减到整手；缩减后仍买不起一手则跳过
+		// English: auto-amount cash short — shrink to the largest whole lot within the pool balance.
+		qty = int(pool/price/100) * 100
 		if qty <= 0 {
 			return errCash
 		}
 		cost = float64(qty) * price
 	}
+	e.pools[poolKey] = pool - cost
 	e.cash -= cost
 	e.positions[code] = &Position{
-		Code:        code,
-		Name:        name,
-		Strategy:    strategy,
-		Qty:         qty,
-		CostPrice:   price,
-		Cost:        cost,
-		SignalPrice: signalPrice,
-		SignalAt:    signalAt,
-		FilledAt:    now,
-		Mark:        price,
+		Code:         code,
+		Name:         name,
+		Strategy:     strategy,
+		StrategyType: poolKey,
+		Qty:          qty,
+		CostPrice:    price,
+		Cost:         cost,
+		SignalPrice:  signalPrice,
+		SignalAt:     signalAt,
+		FilledAt:     now,
+		Mark:         price,
 	}
 	latency := int64(0)
 	if !signalAt.IsZero() {
@@ -408,27 +499,29 @@ func (e *Engine) fillLocked(code, name, strategy string, signalPrice float64, si
 		}
 	}
 	e.trades = append(e.trades, Trade{
-		Code:        code,
-		Name:        name,
-		Strategy:    strategy,
-		Side:        "buy",
-		Price:       price,
-		SignalPrice: signalPrice,
-		Qty:         qty,
-		Amount:      cost,
-		Time:        now,
-		LatencySec:  latency,
-		Reason:      reason,
+		Code:         code,
+		Name:         name,
+		Strategy:     strategy,
+		StrategyType: poolKey,
+		Side:         "buy",
+		Price:        price,
+		SignalPrice:  signalPrice,
+		Qty:          qty,
+		Amount:       cost,
+		Time:         now,
+		LatencySec:   latency,
+		Reason:       reason,
 	})
 	log.Printf("[paper] 模拟买入 %s(%s) %d股 @%.2f 信号价%.2f 延迟%ds",
 		code, name, qty, price, signalPrice, latency)
 	return nil
 }
 
-// Buy 手动按实时价买入一只股票（APK/前端信号页"模拟买入"按钮触发）。
-// 与自动撮合共用 fillLocked：同一持仓去重/仓位上限/现金约束。
-// English: manually buys one stock at the live price (triggered by the APK/frontend signal page's
-// "paper buy" button). Shares fillLocked with auto-fill: dedupe / position cap / cash checks.
+// Buy 手动按实时价买入一只股票（前端信号页/持仓页"模拟买入"按钮触发，固定金额整手）。
+// 与自动撮合共用 fillLocked：同一持仓去重/仓位上限/现金约束；手动买入归"其他池"。
+// English: manually buys one stock at the live price (frontend/APK signal-page or positions-page "paper
+// buy" button; fixed-amount whole lots). Shares fillLocked with auto-fill: dedupe / position cap / cash
+// checks; manual buys debit the "other" pool.
 func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes map[string]*data.StockInfo) error {
 	if !e.cfg.Enabled {
 		return errDisabled
@@ -447,9 +540,83 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 	} else {
 		return errNoQuote
 	}
-	if err := e.fillLocked(code, name, strategy, signalPrice, time.Now(), time.Now(), price, "手动模拟买入"); err != nil {
+	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, "手动模拟买入"); err != nil {
 		return err
 	}
+	e.persist()
+	return nil
+}
+
+// BuyEx 手动按指定价格与手数买入一只股票（普通用户模拟盘：输入买入价+买入手数，静态记账）。
+// price > 0 时按用户输入价成交（不依赖行情）；price = 0 时回退实时价。
+// qty 为手数（A 股一手 100 股，调用方已换算；<=0 拒绝）。手动买入归"其他池"，不挤占战法池。
+// 已持仓时自动合并为加仓（加权平均成本，追加买入记录）。
+// English: manually buys a stock at an explicit price and lot count (normal users' paper book: the buyer
+// types the price and lots; static bookkeeping). A price > 0 fills at the typed price (no quote needed);
+// price = 0 falls back to the live quote. qty is in board lots (1 lot = 100 shares; <=0 rejected).
+// Manual buys debit the "other" pool and never crowd a strategy pool. An already-held code merges as an
+// add-on (quantity added, cost averaged, extra fill appended).
+func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, qty int, quotes map[string]*data.StockInfo) error {
+	if !e.cfg.Enabled {
+		return errDisabled
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if p, held := e.positions[code]; held {
+		return e.addToPositionLocked(p, code, name, strategy, signalPrice, price, qty, "手动模拟加仓")
+	}
+	if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
+		return errMaxPos
+	}
+	if qty <= 0 {
+		return errLotTooSmall
+	}
+	if price <= 0 {
+		if q, ok := quotes[code]; ok && q != nil && q.Price > 0 {
+			price = q.Price
+		} else {
+			return errNoQuote
+		}
+	}
+	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, "手动模拟买入"); err != nil {
+		return err
+	}
+	e.persist()
+	return nil
+}
+
+// addToPositionLocked 已持仓加仓：加权平均成本、追加买入记录、从"其他池"扣款（须持锁调用）。
+// English: adds to an existing position — quantity up, cost averaged, an extra buy fill appended, cash
+// debited from the "other" pool (caller must hold the lock).
+func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, signalPrice, price float64, qty int, reason string) error {
+	if qty <= 0 {
+		return errLotTooSmall
+	}
+	cost := float64(qty) * price
+	pool := e.pools[""]
+	if cost > pool {
+		return errCash
+	}
+	e.pools[""] = pool - cost
+	e.cash -= cost
+	p.Cost += cost
+	p.Qty += qty
+	p.CostPrice = p.Cost / float64(p.Qty)
+	p.Mark = price
+	e.trades = append(e.trades, Trade{
+		Code:         code,
+		Name:         name,
+		Strategy:     strategy,
+		StrategyType: "",
+		Side:         "buy",
+		Price:        price,
+		SignalPrice:  signalPrice,
+		Qty:          qty,
+		Amount:       cost,
+		Time:         time.Now(),
+		Reason:       reason,
+	})
+	log.Printf("[paper] 模拟加仓 %s(%s) +%d股 @%.2f 现持%d股 均价%.3f", code, name, qty, price, p.Qty, p.CostPrice)
 	e.persist()
 	return nil
 }
@@ -531,23 +698,177 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	} else {
 		return errNoQuote
 	}
+	return e.sellAllLocked(p, price)
+}
+
+// SellEx 手动按指定价格与数量减仓（部分卖出）。qty 手数；price > 0 用输入价，price = 0 回退实时价。
+// 数量 >= 当前持仓时退化为清仓（复用 sellAllLocked）。
+// English: manually trims a position at an explicit price and count. qty is in board lots; price > 0 uses
+// the typed price, price = 0 falls back to the live quote. A qty >= the position degrades to a full close
+// (reuses sellAllLocked).
+func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*data.StockInfo) error {
+	if !e.cfg.Enabled {
+		return errDisabled
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p, held := e.positions[code]
+	if !held {
+		return errNotHeld
+	}
+	if qty <= 0 {
+		return errLotTooSmall
+	}
+	if price <= 0 {
+		if q, ok := quotes[code]; ok && q != nil && q.Price > 0 {
+			price = q.Price
+		} else {
+			return errNoQuote
+		}
+	}
+	if qty >= p.Qty {
+		return e.sellAllLocked(p, price)
+	}
+	proceeds := price * float64(qty)
+	// 减仓收益回原战法池（按持仓记录的类型；空=其他池）。
+	// English: trim proceeds return to the position's own strategy pool (per its recorded type; empty =
+	// the other pool).
+	e.pools[p.StrategyType] += proceeds
+	e.cash += proceeds
+	e.realized += (price - p.CostPrice) * float64(qty)
+	p.Qty -= qty
+	e.trades = append(e.trades, Trade{
+		Code:         p.Code,
+		Name:         p.Name,
+		Strategy:     p.Strategy,
+		StrategyType: p.StrategyType,
+		Side:         "sell",
+		Price:        price,
+		Qty:          qty,
+		Amount:       proceeds,
+		Time:         time.Now(),
+		Reason:       "手动模拟减仓",
+	})
+	log.Printf("[paper] 模拟减仓 %s(%s) -%d股 @%.2f 剩余%d股", p.Code, p.Name, qty, price, p.Qty)
+	e.persist()
+	return nil
+}
+
+// sellAllLocked 清仓单一持仓：回池、结算已实现盈亏、追加卖出记录（须持锁调用）。
+// English: closes a single position — pool return, realized P&L, extra sell fill (caller must hold the lock).
+func (e *Engine) sellAllLocked(p *Position, price float64) error {
 	proceeds := price * float64(p.Qty)
+	// 卖出收益回原战法池（按持仓记录的类型；空=其他池）。
+	// English: sale proceeds return to the position's own strategy pool (per its recorded type; empty =
+	// the other pool).
+	e.pools[p.StrategyType] += proceeds
 	e.cash += proceeds
 	e.realized += proceeds - p.Cost
 	e.trades = append(e.trades, Trade{
-		Code:     p.Code,
-		Name:     p.Name,
-		Strategy: p.Strategy,
-		Side:     "sell",
-		Price:    price,
-		Qty:      p.Qty,
-		Amount:   proceeds,
-		Time:     time.Now(),
+		Code:         p.Code,
+		Name:         p.Name,
+		Strategy:     p.Strategy,
+		StrategyType: p.StrategyType,
+		Side:         "sell",
+		Price:        price,
+		Qty:          p.Qty,
+		Amount:       proceeds,
+		Time:         time.Now(),
 	})
 	log.Printf("[paper] 模拟卖出 %s(%s) %d股 @%.2f 盈亏%.2f", p.Code, p.Name, p.Qty, price, proceeds-p.Cost)
-	delete(e.positions, code)
+	delete(e.positions, p.Code)
 	e.persist()
 	return nil
+}
+
+// SetStrategyPools 设置启用的战法资金池（按当前现金均分，key 集合 = types + ""）。
+// 幂等：types 集合未变化时保留各池现金（热加载/重复注入安全）；
+// 集合变化时按当前总现金重新均分并持久化。
+// 注入路径：engine.ActivePoolTypes → registry.SetPaperPools → 各账号 pe.SetStrategyPools。
+// English: configures the enabled strategy cash pools (split the current cash evenly, key set = types +
+// ""). Idempotent: an unchanged type set keeps per-pool cash intact (safe for hot reload / repeated
+// injection); a changed set re-splits the current total cash evenly and persists. Injected via
+// engine.ActivePoolTypes → registry.SetPaperPools → each account's pe.SetStrategyPools.
+func (e *Engine) SetStrategyPools(types []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// 规范化排序比较，集合比较与输入顺序无关
+	// English: normalized sorted comparison makes the set comparison order-insensitive.
+	sorted := append([]string(nil), types...)
+	sort.Strings(sorted)
+	cur := append([]string(nil), e.poolTypes...)
+	sort.Strings(cur)
+	if equalStrings(sorted, cur) {
+		return // 集合未变：保留各池现金
+	}
+	e.poolTypes = append([]string(nil), types...)
+	e.rebuildPoolsLocked()
+	log.Printf("[paper] 战法资金池已按 %v 均分：每池 %.2f", e.poolTypes, e.pools[""])
+}
+
+// rebuildPoolsLocked 按当前 poolTypes 重建资金池：总现金均分到 types + "" 每池（须持锁调用）。
+// 未分仓（poolTypes 为空）时退化为单池 {"": cash}，与分仓前行为一致。
+// English: rebuilds the pools from poolTypes: the total cash is split evenly across types + "" (caller
+// must hold the lock). With no allocation (empty poolTypes) it degrades to the single pool {"": cash},
+// identical to pre-allocation behavior.
+func (e *Engine) rebuildPoolsLocked() {
+	if len(e.poolTypes) == 0 {
+		e.pools = map[string]float64{"": e.cash}
+		return
+	}
+	keys := append([]string(nil), e.poolTypes...)
+	keys = append(keys, "") // 其他/手动池
+	share := e.cash / float64(len(keys))
+	e.pools = make(map[string]float64, len(keys))
+	for _, k := range keys {
+		e.pools[k] = share
+	}
+}
+
+// equalStrings 顺序无关的字符串切片相等比较（SetStrategyPools 幂等判断用）。
+// English: order-insensitive string-slice equality (used for SetStrategyPools idempotency).
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// StrategyPools 返回各战法资金池的展示快照（前端分仓条：池余量/占比/持仓数）。
+// English: returns each strategy pool's display snapshot (frontend allocation strip: balance/ratio/positions).
+func (e *Engine) StrategyPools() []StrategyPoolState {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	total := 0.0
+	for _, v := range e.pools {
+		total += v
+	}
+	keys := append([]string(nil), e.poolTypes...)
+	keys = append(keys, "")
+	sort.Strings(keys)
+	out := make([]StrategyPoolState, 0, len(keys))
+	for _, k := range keys {
+		cash := e.pools[k]
+		ratio := 0.0
+		if total > 0 {
+			ratio = cash / total * 100
+		}
+		cnt := 0
+		for _, p := range e.positions {
+			if p.StrategyType == k {
+				cnt++
+			}
+		}
+		out = append(out, StrategyPoolState{
+			Key: k, Label: strategyPoolLabel(k), Cash: cash, RatioPct: ratio, Positions: cnt,
+		})
+	}
+	return out
 }
 
 // Reconfigure 确认资金：按新初始资金/持仓上限重开模拟盘，并落盘固化。
@@ -579,6 +900,7 @@ func (e *Engine) Reconfigure(initialCapital float64, maxPositions int) {
 	e.positions = make(map[string]*Position)
 	e.equity = nil
 	e.realized = 0
+	e.rebuildPoolsLocked() // 新资金按当前池集合重新均分
 	e.persist()
 }
 
@@ -595,6 +917,41 @@ func (e *Engine) Reset() {
 	e.trades = nil
 	e.equity = nil
 	e.realized = 0
+	e.rebuildPoolsLocked() // 现金恢复后按当前池集合重新均分
+	e.persist()
+}
+
+// Deposit 注入资金（增量）：现金 += amount，并按当前各池占比分配新增资金，保留全部持仓/净值/成交日志。
+// 收益基准 initial_capital 同步累计（+amount），使总收益基于真实累计投入计算，而非被注入稀释。
+// 对应前端"注入资金"按钮（区别于清盘重置：只加钱、不清仓）。
+// English: Deposit adds capital incrementally — cash += amount, distributed to the pools by their current
+// share; positions / equity / fill log are all kept. The return basis (initial_capital) accumulates so
+// total_return is computed against the true cumulative investment instead of being diluted by deposits.
+// Backs the frontend "注入资金" action (unlike a liquidation reset: it only adds money, never clears).
+func (e *Engine) Deposit(amount float64) {
+	if amount <= 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	total := 0.0
+	for _, v := range e.pools {
+		total += v
+	}
+	e.cash += amount
+	e.cfg.InitialCapital += amount
+	if total > 0 {
+		for k, v := range e.pools {
+			e.pools[k] = v + amount*(v/total)
+		}
+	} else if len(e.pools) > 0 {
+		share := amount / float64(len(e.pools))
+		for k := range e.pools {
+			e.pools[k] = share
+		}
+	}
+	log.Printf("[paper] 注入资金 +%.2f → 现金=%.2f 累计投入=%.2f 持仓保留=%d",
+		amount, e.cash, e.cfg.InitialCapital, len(e.positions))
 	e.persist()
 }
 

@@ -572,6 +572,13 @@ func cmdBacktestCandidate(db *store.DB, args []string) {
 	bopts.Rule.Weights = weights
 	bopts.Rule.TopK = *topK
 	bopts.Rule.MinStocks = *minStocks
+	// 断点续跑：候选 ID 传给 backtest.Run——每事件先读 backtest_event_results 缓存，
+	// 命中即复用（同一候选重跑/中断后续跑只重算未缓存事件）；单候选（--id）与夜间
+	// （缺省最近候选）都受益。
+	// English: checkpoint-resume — the candidate ID is passed to backtest.Run so each event first
+	// reads the backtest_event_results cache and reuses hits (reruns / resumes after interruption only
+	// recompute uncached events). Both --id (per-candidate) and nightly (default latest) runs benefit.
+	bopts.CandidateID = c.ID
 	// 进度上报：每推进 10% 打印一次"回测进度 xx%"（供 HTTP 层逐行解析 → 前端进度条）。
 	// English: report progress — print "回测进度 xx%" every 10% so the HTTP layer can parse it
 	// line-by-line and drive the frontend progress bar.

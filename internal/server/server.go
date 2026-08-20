@@ -119,6 +119,10 @@ type EngineRegistry interface {
 	AllControllers() []EngineController
 	PaperForUser(userID string) *paper.Engine
 	Len() int
+	// SetPaperPools 更新全局战法资金池类型模板并同步到所有账号模拟盘（分仓，热加载用）。
+	// English: updates the global strategy pool-type template and syncs every account's paper book
+	// (allocation; used on hot reload).
+	SetPaperPools(types []string)
 }
 
 // SetEngineRegistry 设置多账号引擎注册表（懒加载/按配置指纹共享）。
@@ -262,6 +266,18 @@ func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rp
 func (s *Server) SetResearch(db *store.DB, dataDir string) {
 	s.researchDB = db
 	s.researchDir = dataDir
+	// 启动恢复：上次进程崩溃遗留的 running 回测任务标记为 interrupted（前端可重新发起续跑，
+	// 断点缓存仍有效）。只在研究库接入时才执行。
+	// English: startup recovery — any leftover running backtest jobs from a crashed process are marked
+	// interrupted (the frontend can re-trigger a resume; checkpoints remain valid). Runs only when the
+	// research DB is wired in.
+	if db != nil {
+		if n, err := db.MarkRunningInterrupted(); err != nil {
+			log.Printf("[research] 标记残留回测任务失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[research] 已把 %d 个残留 running 回测任务标记为 interrupted", n)
+		}
+	}
 }
 
 // GetSSE 返回 SSE 事件推送器。
@@ -378,6 +394,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleResearchReject))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest))
 	s.mux.HandleFunc("GET /api/research/backtest/{id}", s.authMiddleware(s.handleBacktestStatus))
+	// 回测任务中心：运行中任务列表（前端刷新后恢复轮询）+ 全部任务列表（回测 tab 进度查看，含夜间全量）
+	// English: backtest task center — running-job list (for frontend polling recovery after a refresh)
+	// and the full job list (backtest tab progress view, including nightly runs).
+	s.mux.HandleFunc("GET /api/research/backtest/running", s.authMiddleware(s.handleBacktestRunning))
+	s.mux.HandleFunc("GET /api/research/backtest/list", s.authMiddleware(s.handleBacktestList))
 	// 战法库（因子战法）：列出已应用 + 启用/禁用/删除 + 重命名 + 效果监测 + 全量回测全局开关
 	s.mux.HandleFunc("GET /api/research/library", s.authMiddleware(s.handleResearchLibrary))
 	s.mux.HandleFunc("POST /api/research/library/{id}/enable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("enable")))

@@ -44,6 +44,7 @@ import (
 
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/store"
 )
 
 // researchStart 夜间研究窗口起点（近 3 年，与既有 run_auto_research_full.sh 一致）。
@@ -130,9 +131,10 @@ func (s *Scheduler) tick() {
 }
 
 // trimInSession 盘中内存治理：活跃时段按节流间隔执行
-// 1) 防御性清理残留的 research 研究子进程（夜间作业被 OOM 击杀后遗留的孤儿进程，
-//    绝不会让研究在盘中继续占用内存/CPU）；
-// 2) 对 researchd 自身 runtime.GC()+debug.FreeOSMemory() 归还堆内存。
+//  1. 防御性清理残留的 research 研究子进程（夜间作业被 OOM 击杀后遗留的孤儿进程，
+//     绝不会让研究在盘中继续占用内存/CPU）；
+//  2. 对 researchd 自身 runtime.GC()+debug.FreeOSMemory() 归还堆内存。
+//
 // 服务器物理内存仅 1.6GiB：盘中把内存让给 quant 常驻服务，盘后 quant 又让给 research，
 // 两者互补，避免叠加 OOM。
 // English: in-session memory governance — on a throttled cadence during active sessions it (1)
@@ -358,20 +360,60 @@ func (s *Scheduler) runStep(ctx context.Context, cfg config.SchedulerConfig, ste
 	if err != nil {
 		return err
 	}
+	dbPath := cfg.DB
+	if dbPath == "" {
+		dbPath = defaultDB()
+	}
+	// 夜间全量回测任务生命周期落库（kind='nightly', candidate_id=0）：running → done/error，
+	// 与单候选回测共用 backtest_jobs 表，前端「回测」tab 可查看进度与结果。
+	// English: persist the nightly full backtest job lifecycle (kind='nightly', candidate_id=0):
+	// running → done/error, sharing the backtest_jobs table with per-candidate runs so the frontend
+	// "backtest" tab can show its progress and result.
+	if step == "backtest" {
+		s.persistNightlyJob(dbPath, "running", "")
+	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dirOfDB(cfg)
 	cmd.Stdout = &lineLogger{prefix: fmt.Sprintf("[scheduler:%s] ", step)}
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
+		if step == "backtest" {
+			s.persistNightlyJob(dbPath, "error", err.Error())
+		}
 		return fmt.Errorf("启动 %s: %w", step, err)
 	}
 	s.mu.Lock()
 	s.lastRunStep = step
 	s.mu.Unlock()
 	if err := cmd.Wait(); err != nil {
+		if step == "backtest" {
+			s.persistNightlyJob(dbPath, "error", err.Error())
+		}
 		return fmt.Errorf("%s 退出异常: %w", step, err)
 	}
+	if step == "backtest" {
+		s.persistNightlyJob(dbPath, "done", "")
+	}
 	return nil
+}
+
+// persistNightlyJob 把夜间全量回测任务状态写入 backtest_jobs（kind='nightly', candidate_id=0）。
+// 临时打开研究库写入后即关闭（夜间低频，开库代价可忽略；WAL + busy_timeout 兼容多进程并发）。
+// English: writes the nightly full backtest job state to backtest_jobs (kind='nightly', candidate_id=0).
+// The research DB is opened briefly for the write and closed immediately (nightly writes are rare;
+// WAL + busy_timeout already tolerate cross-process concurrency).
+func (s *Scheduler) persistNightlyJob(dbPath, status, errMsg string) {
+	db, err := store.Open(dbPath)
+	if err != nil {
+		log.Printf("[scheduler] 打开研究库写夜间回测任务失败: %v", err)
+		return
+	}
+	defer db.Close()
+	if err := db.UpsertBacktestJob(&store.BacktestJob{Kind: "nightly", CandidateID: 0, Status: status, Error: errMsg}); err != nil {
+		log.Printf("[scheduler] 写夜间回测任务失败: %v", err)
+		return
+	}
+	log.Printf("[scheduler] 夜间全量回测任务 -> %s", status)
 }
 
 // buildCommand 根据步骤名组装二进制与参数。
@@ -429,6 +471,15 @@ func (s *Scheduler) buildCommand(cfg config.SchedulerConfig, step string, now ti
 			args = append(args, "--max-per-day", strconv.Itoa(ev))
 		}
 		return bin, args, nil
+	case "paper_research":
+		// 模拟盘研究：读取盘后落库的模拟盘成交/净值快照，生成信号质量与绩效报告并落库。
+		// English: paper research — reads the post-close paper fills/daily snapshots and produces a
+		// signal-quality & performance report, saving it into the research DB.
+		bin, err := s.resolveBin(cfg.ResearchBin)
+		if err != nil {
+			return "", nil, err
+		}
+		return bin, []string{"--db", db, "paper-research"}, nil
 	case "list":
 		bin, err := s.resolveBin(cfg.ResearchBin)
 		if err != nil {

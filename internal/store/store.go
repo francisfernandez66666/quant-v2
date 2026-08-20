@@ -137,6 +137,84 @@ func (d *DB) migrate() error {
 			top_stocks TEXT,
 			PRIMARY KEY (trade_date, industry)
 		)`,
+		// 回测任务中心：job 持久化（单候选 + 夜间全量都记录），quant 重启后可查/可恢复/可续跑。
+		// kind='candidate' 单候选回测（candidate_id 对应候选）；kind='nightly' 夜间全量回测（candidate_id=0）。
+		// UNIQUE(kind,candidate_id) 保证同一候选的任务只有一条，重跑覆盖。
+		// English: backtest task center — jobs are persisted (both per-candidate and nightly runs), so they
+		// survive restarts and can be resumed. kind='candidate' maps candidate_id to a candidate; 'nightly'
+		// uses candidate_id=0. UNIQUE(kind,candidate_id) keeps one row per candidate; reruns overwrite it.
+		`CREATE TABLE IF NOT EXISTS backtest_jobs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind TEXT NOT NULL,
+			candidate_id INTEGER DEFAULT 0,
+			status TEXT NOT NULL,
+			progress TEXT DEFAULT '',
+			avg_excess REAL,
+			error TEXT,
+			started_at TEXT NOT NULL,
+			finished_at TEXT,
+			updated_at TEXT NOT NULL,
+			UNIQUE(kind, candidate_id)
+		)`,
+		// 回测断点缓存：按候选 + 事件唯一键（事件日+行业）存完整 EventResult JSON，
+		// 中断/重启后续跑只重算未缓存的事件；同一候选重跑覆盖（INSERT OR REPLACE 语义）。
+		// English: backtest checkpoint cache — full EventResult JSON per (candidate, event-date, industry);
+		// a resumed run only recomputes uncached events; reruns overwrite (INSERT OR REPLACE semantics).
+		`CREATE TABLE IF NOT EXISTS backtest_event_results (
+			candidate_id INTEGER NOT NULL,
+			event_date TEXT NOT NULL,
+			industry TEXT NOT NULL,
+			result_json TEXT NOT NULL,
+			PRIMARY KEY (candidate_id, event_date, industry)
+		)`,
+		// 模拟盘研究落库：盘中模拟盘只在交易时段运行（省内存），盘后把当日成交与每日快照
+		// 导出到研究库，供自动研究（夜间 scheduler / research CLI）读取做信号质量与绩效研究。
+		// English: paper-to-research export — the paper book only runs during trading hours (memory
+		// friendly); after the close its day's fills and daily snapshot are exported into the research DB
+		// for auto-research (nightly scheduler / research CLI) to study signal quality and performance.
+		`CREATE TABLE IF NOT EXISTS paper_trades (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT NOT NULL,
+			code TEXT NOT NULL,
+			name TEXT DEFAULT '',
+			strategy TEXT DEFAULT '',
+			strategy_type TEXT DEFAULT '',
+			side TEXT NOT NULL,
+			price REAL NOT NULL,
+			signal_price REAL DEFAULT 0,
+			latency_sec REAL DEFAULT 0,
+			qty INTEGER NOT NULL,
+			amount REAL NOT NULL,
+			filled_at TEXT NOT NULL,
+			reason TEXT DEFAULT '',
+			UNIQUE(user_id, code, side, filled_at)
+		)`,
+		// 模拟盘每日快照：每交易日盘后导出一条（现金/市值/净值/已实现/持仓数），按账号+日期唯一。
+		// English: paper daily snapshot — one row per trading day after the close (cash/market value/
+		// equity/realized/positions), unique per account + date.
+		`CREATE TABLE IF NOT EXISTS paper_daily (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT NOT NULL,
+			date TEXT NOT NULL,
+			cash REAL NOT NULL,
+			market_value REAL NOT NULL,
+			total_value REAL NOT NULL,
+			realized REAL NOT NULL,
+			positions INTEGER NOT NULL,
+			UNIQUE(user_id, date)
+		)`,
+		// 模拟盘研究报告摘要：夜间 paper-research 步骤把信号质量与绩效报告落库（按日期+账号 UPSERT），
+		// 研究侧可直接查询历史报告。
+		// English: paper-research report summary — the nightly paper-research step saves its signal-quality
+		// & performance report here (UPSERT per date + account) for queryable research history.
+		`CREATE TABLE IF NOT EXISTS paper_research_reports (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			date TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			summary_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			UNIQUE(date, user_id)
+		)`,
 		// 常用查询索引（主键外的补充加速）
 		`CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_db_date ON daily_basic(trade_date)`,

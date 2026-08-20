@@ -168,6 +168,80 @@
     </div>
     </template>
 
+    <!-- ══════════ Tab 4: 回测任务中心（进度查看 + 任务添加）══════════ -->
+    <template v-else-if="activeTab === 'backtests'">
+    <div class="bt-center">
+      <!-- 任务添加：从待审批因子候选发起/重跑全量回测 -->
+      <!-- Task add: launch / rerun a full backtest from proposed factor candidates -->
+      <div class="bt-add">
+        <div class="bt-add-title">发起 / 重跑全量回测</div>
+        <div class="bt-add-row">
+          <select v-model="btPickId" class="bt-select" :disabled="btLoading">
+            <option :value="0" disabled>选择待审批因子候选</option>
+            <option v-for="c in btCandidates" :key="c.id" :value="c.id">
+              #{{ c.id }} 因子战法（IC {{ fmt(c.ic_mean) }}，IR {{ fmt(c.ir) }}）
+            </option>
+          </select>
+          <button
+            class="btn-backtest"
+            :disabled="btPickId === 0 || backtestLoading[btPickId]"
+            @click="doBacktestById(btPickId)"
+          >
+            {{ btPickId !== 0 && backtestLoading[btPickId] ? '回测中...' : '发起全量回测' }}
+          </button>
+          <button class="btn-refresh" @click="loadBacktests" :disabled="btLoading">
+            {{ btLoading ? '加载中...' : '刷新列表' }}
+          </button>
+        </div>
+        <div class="bt-add-hint">
+          断点续跑：任务记录持久化（单候选与夜间全量都记录），中断/重启后重跑只计算剩余事件；页面刷新后运行中任务自动恢复轮询。
+        </div>
+      </div>
+
+      <!-- 进度查看：全部回测任务（单候选 + 夜间全量，最新在前） -->
+      <!-- Progress view: all backtest jobs (per-candidate + nightly, newest first) -->
+      <div v-if="backtestJobs.length === 0" class="empty">
+        暂无回测任务。选择上方候选发起全量回测，或等待夜间调度器产出。
+      </div>
+      <div v-else class="bt-list">
+        <div v-for="j in backtestJobs" :key="j.id" class="bt-card" :class="'bt-' + j.status">
+          <div class="bt-head">
+            <span :class="['tag', j.kind === 'nightly' ? 'tag-kind' : 'tag-kind kind-factor']">
+              {{ j.kind === 'nightly' ? '夜间全量' : '单候选' }}
+            </span>
+            <span v-if="j.kind === 'candidate'" class="bt-cand">候选 #{{ j.candidate_id }}</span>
+            <span :class="['tag', 'bt-status', 'status-' + (j.status === 'done' ? 'applied' : (j.status === 'error' ? 'rejected' : 'proposed'))]">
+              {{ btStatusLabel(j.status) }}
+            </span>
+            <span class="bt-time">{{ j.started_at || '' }}<template v-if="j.finished_at"> → {{ j.finished_at }}</template></span>
+          </div>
+          <div class="bt-progress" v-if="j.status === 'running'">
+            <div class="bt-progress-bar">
+              <div class="bt-progress-fill" :style="{ width: jobPct(j) }"></div>
+            </div>
+            <span class="bt-progress-label">{{ jobPct(j) }}</span>
+          </div>
+          <div class="bt-result" v-if="j.status === 'done'">
+            回测超额 <b :class="signClass(j.avg_excess)">{{ fmt(j.avg_excess) }}</b>
+          </div>
+          <div class="bt-error" v-if="j.status === 'error'">{{ j.error }}</div>
+          <div class="bt-error" v-else-if="j.status === 'interrupted'">
+            {{ j.error || '任务中断，可重新发起续跑（断点缓存仍有效，重跑只计算剩余事件）' }}
+          </div>
+          <div class="bt-actions" v-if="j.kind === 'candidate' && canApprove">
+            <button
+              class="btn-backtest"
+              :disabled="backtestLoading[j.candidate_id]"
+              @click="doBacktestById(j.candidate_id)"
+            >
+              {{ backtestLoading[j.candidate_id] ? '回测中...' : '重新回测' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+    </template>
+
     <!-- 待审批候选：空态 + 候选列表（Tab 1 内） -->
     <div v-if="activeTab === 'candidates' && noDB" class="empty">研究库未接入（需后端开启 B5 研究闭环）</div>
     <div v-else-if="activeTab === 'candidates' && candidates.length === 0" class="empty">暂无候选，先在命令行跑 research optimize 产出</div>
@@ -280,12 +354,14 @@
           >
             {{ backtestLoading[c.id] ? '回测中...' : (c.avg_excess ? '重新回测' : '全量回测') }}
           </button>
-          <!-- 回测进度条：后端子进程每推进 10% 上报一次，前端 5s 轮询刷新 -->
-          <div v-if="backtestLoading[c.id] && backtestProgress[c.id]" class="bt-progress">
+          <!-- 回测进度条：job 创建即 0% 起步（后端落库 Progress="0%"），CLI 每 10% 推进，前端 5s 轮询刷新 -->
+          <!-- Backtest progress bar: starts at 0% immediately (backend persists Progress="0%"), advances every
+               10% from the CLI, refreshed by the 5s frontend polling -->
+          <div v-if="backtestLoading[c.id]" class="bt-progress">
             <div class="bt-progress-bar">
               <div class="bt-progress-fill" :style="{ width: btPct(c.id) }"></div>
             </div>
-            <span class="bt-progress-label">全链路回测 {{ backtestProgress[c.id] }}</span>
+            <span class="bt-progress-label">全链路回测 {{ backtestProgress[c.id] || '0%' }}</span>
           </div>
           <span v-if="backtestResult[c.id]" class="bt-result" :class="signClass(backtestResult[c.id])">
             回测超额 {{ fmt(backtestResult[c.id]) }}
@@ -301,8 +377,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onActivated, onUnmounted } from 'vue' // Vue 组合式 API：响应式引用与生命周期钩子
-// Vue Composition API: reactive ref and lifecycle hooks
+import { ref, computed, onMounted, onActivated, onUnmounted } from 'vue' // Vue 组合式 API：响应式引用/计算属性/生命周期钩子
+// Vue Composition API: reactive ref / computed / lifecycle hooks
 import * as api from '../api/index.js'           // 后端 API 调用封装（候选列表 / 审批 / 驳回）
 // backend API wrapper (candidate list / approve / reject)
 
@@ -331,10 +407,23 @@ const backtestResult = ref({})  // 候选 id → 回测超额结果
 const backtestProgress = ref({}) // 候选 id → 回测进度（如 "45%"）
 // candidate id → backtest progress (e.g. "45%")
 
-// 子页 tab
+// ── 回测任务中心（Tab 4：进度查看 + 任务添加）──
+// Backtest task center (Tab 4: progress view + task launch)
+const backtestJobs = ref([]) // 全部回测任务（单候选 + 夜间，最新在前）
+// all backtest jobs (per-candidate + nightly, newest first)
+const btLoading = ref(false)  // 回测任务列表加载中
+// backtest job list loading
+const btPickId = ref(0)       // 任务添加：选中的候选 ID
+// task-add: selected candidate ID
+const backtestPollers = {}    // 候选 id → 轮询 interval（页面刷新/切换后防重复轮询）
+// candidate id → polling interval (deduped across refreshes / tab switches)
+
+// 子页 tab（待审批候选 / 战法库 / 设置 / 回测任务中心）
+// Sub-tabs: proposed candidates / strategy library / settings / backtest task center
 const tabs = [
   { key: 'candidates', label: '待审批候选' },
   { key: 'library', label: '战法库' },
+  { key: 'backtests', label: '回测' },
   { key: 'settings', label: '设置' },
 ]
 const activeTab = ref('candidates')
@@ -736,12 +825,13 @@ async function saveBacktestToggle() {
   }
 }
 
-// ── 单条候选全量回测（异步）──
-// Per-candidate full backtest (async)
+// ── 单条候选全量回测（异步）+ 回测任务中心轮询 ──
+// Per-candidate full backtest (async) + task-center polling
 
 /** 对指定候选触发全量回测并轮询进度 */
 /** Trigger a full backtest on a candidate and poll its progress */
 async function doBacktest(c) {
+  if (backtestPollers[c.id]) return // 已在轮询，防止重复启动（防重入）
   backtestLoading.value = { ...backtestLoading.value, [c.id]: true }
   backtestState.value = { ...backtestState.value, [c.id]: 'running' }
   try {
@@ -752,29 +842,40 @@ async function doBacktest(c) {
     alert('回测启动失败: ' + (e.message || e))
     return
   }
-  // 轮询任务状态（全量回测可能耗时较长）
-  const poll = setInterval(async () => {
+  pollBacktest(c)
+}
+
+/** 轮询单个候选的回测任务状态（全量回测可能耗时较长；interval 唯一，防重复） */
+/** Poll a single candidate's backtest job (a full backtest can be slow; one interval per candidate) */
+function pollBacktest(c) {
+  const id = c.id
+  if (backtestPollers[id]) return
+  backtestPollers[id] = setInterval(async () => {
     try {
-      const j = await api.fetchBacktestStatus(c.id)
+      const j = await api.fetchBacktestStatus(id)
       // 回测进度实时更新（后端子进程输出逐行解析出"回测进度 xx%"）
       if (j.progress) {
-        backtestProgress.value = { ...backtestProgress.value, [c.id]: j.progress }
+        backtestProgress.value = { ...backtestProgress.value, [id]: j.progress }
+        // 任务列表同步刷新，回测 tab 进度条跟着走
+        syncJobIntoList(j)
       }
       if (j.status === 'done') {
-        clearInterval(poll)
-        backtestLoading.value = { ...backtestLoading.value, [c.id]: false }
-        backtestState.value = { ...backtestState.value, [c.id]: 'done' }
-        backtestProgress.value = { ...backtestProgress.value, [c.id]: null }
-        backtestResult.value = { ...backtestResult.value, [c.id]: j.avg_excess }
+        clearPoll(id)
+        backtestLoading.value = { ...backtestLoading.value, [id]: false }
+        backtestState.value = { ...backtestState.value, [id]: 'done' }
+        backtestProgress.value = { ...backtestProgress.value, [id]: null }
+        backtestResult.value = { ...backtestResult.value, [id]: j.avg_excess }
         c.avg_excess = j.avg_excess
-        alert('候选 #' + c.id + ' 回测完成，回测超额 ' + (j.avg_excess !== undefined ? (j.avg_excess * 100).toFixed(2) + '%' : '0%'))
+        syncJobIntoList({ status: 'done', candidate_id: id, progress: '100%', avg_excess: j.avg_excess })
+        alert('候选 #' + id + ' 回测完成，回测超额 ' + (j.avg_excess !== undefined ? (j.avg_excess * 100).toFixed(2) + '%' : '0%'))
         loadLibrary()
       } else if (j.status === 'error') {
-        clearInterval(poll)
-        backtestLoading.value = { ...backtestLoading.value, [c.id]: false }
-        backtestState.value = { ...backtestState.value, [c.id]: 'error' }
-        backtestProgress.value = { ...backtestProgress.value, [c.id]: null }
-        alert('候选 #' + c.id + ' 回测失败: ' + (j.error || ''))
+        clearPoll(id)
+        backtestLoading.value = { ...backtestLoading.value, [id]: false }
+        backtestState.value = { ...backtestState.value, [id]: 'error' }
+        backtestProgress.value = { ...backtestProgress.value, [id]: null }
+        syncJobIntoList({ status: 'error', candidate_id: id, progress: '100%', error: j.error })
+        alert('候选 #' + id + ' 回测失败: ' + (j.error || ''))
       }
     } catch (e) {
       // 轮询临时失败，继续
@@ -782,11 +883,97 @@ async function doBacktest(c) {
   }, 5000)
 }
 
+/** 清除某候选的轮询（interval 去重 + 卸载清理用） */
+/** Stop a candidate's polling (used for dedup and unmount cleanup) */
+function clearPoll(id) {
+  if (backtestPollers[id]) {
+    clearInterval(backtestPollers[id])
+    delete backtestPollers[id]
+  }
+}
+
+/** 页面刷新/重新挂载后恢复运行中任务的轮询（刷新不再丢进度） */
+/** Restore polling for running jobs after a page refresh / remount (progress survives refreshes) */
+async function restoreRunningBacktests() {
+  try {
+    const res = await api.fetchRunningBacktests()
+    const jobs = (res && res.jobs) || []
+    for (const j of jobs) {
+      if (j.status !== 'running') continue
+      const cand = candidates.value.find(x => x.id === j.candidate_id)
+      const c = cand || { id: j.candidate_id, kind: 'factor' }
+      backtestLoading.value = { ...backtestLoading.value, [c.id]: true }
+      backtestState.value = { ...backtestState.value, [c.id]: 'running' }
+      if (j.progress) backtestProgress.value = { ...backtestProgress.value, [c.id]: j.progress }
+      pollBacktest(c)
+    }
+  } catch (e) {
+    // running 接口不可用（研究库未接入）静默降级
+    console.error('恢复运行中回测任务失败', e)
+  }
+}
+
+/** 加载全部回测任务列表（回测 tab 进度查看） */
+/** Load all backtest jobs (backtest-tab progress view) */
+async function loadBacktests() {
+  btLoading.value = true
+  try {
+    const res = await api.fetchAllBacktests()
+    if (res && Array.isArray(res.jobs)) backtestJobs.value = res.jobs
+  } catch (e) {
+    console.error('加载回测任务失败', e)
+  } finally {
+    btLoading.value = false
+  }
+}
+
+/** 把单候选任务状态同步进任务列表（轮询期间回测 tab 进度条实时更新） */
+/** Merge a per-candidate job update into the task list (live progress on the backtest tab) */
+function syncJobIntoList(j) {
+  const jobs = backtestJobs.value.slice()
+  const idx = jobs.findIndex(x => x.kind === 'candidate' && x.candidate_id === j.candidate_id)
+  const merged = { ...(idx >= 0 ? jobs[idx] : {}), ...j }
+  if (idx >= 0) jobs[idx] = merged
+  else jobs.unshift(merged)
+  backtestJobs.value = jobs
+}
+
+/** 任务添加：按 ID 从候选列表找到对象并发起回测（回测 tab 的"重新回测"按钮复用） */
+/** Task-add: find the candidate by ID and launch its backtest (reused by the tab's "重新回测") */
+function doBacktestById(id) {
+  const c = candidates.value.find(x => x.id === id)
+  if (c) doBacktest(c)
+  else alert('候选 #' + id + ' 不存在（请先刷新候选列表）')
+}
+
+/** 回测任务状态中文标签 */
+/** Human-readable backtest status label */
+function btStatusLabel(s) {
+  const m = { running: '运行中', done: '已完成', error: '失败', interrupted: '已中断' }
+  return m[s] || s
+}
+
+/** 任务进度条宽度（任务对象版本，兼容无 progress 字段） */
+/** Job progress-bar width (job-object variant; tolerates a missing progress field) */
+function jobPct(j) {
+  const p = j.progress || '0%'
+  const n = parseInt(p, 10)
+  return (isNaN(n) ? 0 : Math.max(0, Math.min(100, n))) + '%'
+}
+
+/** 可发起回测的候选：待审批的因子战法候选（回测 tab 任务添加下拉） */
+/** Candidates available for backtest: proposed factor candidates (task-add dropdown) */
+const btCandidates = computed(() =>
+  candidates.value.filter(c => c.kind === 'factor' && c.status === 'proposed')
+)
+
 // 挂载时加载一次；KeepAlive 缓存激活时刷新（切换 tab 回来自动同步最新候选）
 // Load once on mount; refresh on KeepAlive reactivation so switching tabs syncs the latest candidates
-onMounted(() => { loadFactorMeta(); loadAll(); loadLibrary(); loadBacktestToggle(); startPolling() })
-onActivated(() => { loadAll(); loadLibrary(); loadBacktestToggle(); startPolling() })
-onUnmounted(stopPolling)
+// 刷新/重新激活时恢复运行中回测任务的轮询 + 加载任务列表（回测 tab）
+// English: on mount/activation also restore polling for running backtest jobs and load the job list
+onMounted(() => { loadFactorMeta(); loadAll(); loadLibrary(); loadBacktestToggle(); startPolling(); loadBacktests(); restoreRunningBacktests() })
+onActivated(() => { loadAll(); loadLibrary(); loadBacktestToggle(); startPolling(); loadBacktests(); restoreRunningBacktests() })
+onUnmounted(() => { stopPolling(); Object.keys(backtestPollers).forEach(clearPoll) })
 
 // 定时轮询研究进度（30s）：dataload 期间进度条实时推进
 // Poll the research progress every 30s so the data-loading progress bar stays fresh
@@ -986,4 +1173,27 @@ function stopPolling() {
   .page-header { flex-wrap: wrap; gap: 8px; }
   .metric-row { gap: 16px; }
 }
+
+/* 回测任务中心（Tab 4：进度查看 + 任务添加） */
+/* Backtest task center (Tab 4: progress view + task launch) */
+.bt-center { display: flex; flex-direction: column; gap: 12px; }
+.bt-add { background: #16162a; border: 1px solid #2a2a3e; border-radius: 8px; padding: 12px 14px; }
+.bt-add-title { font-size: 13px; font-weight: 600; color: #e0e0e0; margin-bottom: 10px; }
+.bt-add-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bt-select {
+  padding: 6px 10px; border-radius: 6px; border: 1px solid #333;
+  background: #0f0f23; color: #e0e0e0; font-size: 14px; outline: none; flex: 1; min-width: 220px;
+}
+.bt-select:disabled { opacity: 0.5; }
+.bt-add-hint { font-size: 11px; color: #777; margin-top: 8px; line-height: 1.5; }
+.bt-list { display: flex; flex-direction: column; gap: 10px; }
+.bt-card { background: #1a1a2e; border-radius: 8px; padding: 10px 12px; border: 1px solid #2a2a3e; }
+.bt-card.bt-error { border-color: rgba(255,77,79,0.4); }
+.bt-card.bt-interrupted { border-color: rgba(255,152,0,0.4); }
+.bt-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.bt-cand { font-size: 12px; font-weight: 600; color: #e0e0e0; }
+.bt-time { font-size: 11px; color: #777; margin-left: auto; }
+.bt-status.status-proposed { background: rgba(100,181,246,0.15); color: #64b5f6; }
+.bt-error { font-size: 12px; color: #FF4D4F; margin-bottom: 6px; }
+.bt-actions { display: flex; gap: 8px; }
 </style>

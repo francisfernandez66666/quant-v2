@@ -88,19 +88,19 @@ type Engine struct {
 	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
 	sectorConstTopN  int                   // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
 
-	fetcher          *data.Fetcher                   // 5s 实时行情采集器（近实时打分快照来源）
-	scoreStore       *scoreStore                     // 8a/8b 打分持久化（scores.json）
-	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
-	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
-	d1RetryQueue     map[string]bool                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
-	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
-	d1MaxRetries     int                             // D1 评分 LLM 轮询重试次数（<=0 用默认5）
-	lastTiming       *RunTiming                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
-	factorMon        *factorMonitor                  // 因子战法效果监测（战法库触发信号前向收益结算）
-	paper            *paper.Engine                   // 模拟盘引擎（独立纸面交易，可空=未启用）
+	fetcher          *data.Fetcher                                                       // 5s 实时行情采集器（近实时打分快照来源）
+	scoreStore       *scoreStore                                                         // 8a/8b 打分持久化（scores.json）
+	prevPass         map[string]map[string]bool                                          // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
+	lastD1Scores     map[string]combat_agent.D1Score                                     // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
+	d1RetryQueue     map[string]bool                                                     // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
+	lastEmotionPhase string                                                              // 主循环最近一轮情绪阶段（近实时循环复用）
+	d1MaxRetries     int                                                                 // D1 评分 LLM 轮询重试次数（<=0 用默认5）
+	lastTiming       *RunTiming                                                          // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
+	factorMon        *factorMonitor                                                      // 因子战法效果监测（战法库触发信号前向收益结算）
+	paper            *paper.Engine                                                       // 模拟盘引擎（独立纸面交易，可空=未启用）
 	paperOnSignals   func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy 信号撮合（registry 注入）
-	paperMarkFn      func(quotes map[string]*data.StockInfo)                              // 按账号分发估值/净值（registry 注入）
-	lastTrim         time.Time                       // 盘后内存释放最近一次执行时间（节流用）
+	paperMarkFn      func(quotes map[string]*data.StockInfo)                             // 按账号分发估值/净值（registry 注入）
+	lastTrim         time.Time                                                           // 盘后内存释放最近一次执行时间（节流用）
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -475,8 +475,9 @@ func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, quo
 }
 
 // paperSignals 把本轮翻转信号送入模拟盘撮合：优先按账号分发，回退全局引擎。
+// 仅交易时段执行（盘后停自动撮合，省内存）。
 // English: feeds this round's flipped signals into paper filling — per-account dispatch first, global
-// engine as the fallback.
+// engine as the fallback. Runs only during trading hours (no after-hours auto-fill to save memory).
 func (e *Engine) paperSignals(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
 	e.mu.RLock()
 	dispatch := e.paperOnSignals
@@ -486,14 +487,16 @@ func (e *Engine) paperSignals(emit []combat_agent.Signal, quotes map[string]*dat
 		dispatch(emit, quotes)
 		return
 	}
-	if pe != nil && pe.Enabled() {
+	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
 		pe.OnSignals(emit, quotes)
 	}
 }
 
 // paperMark 用实时快照刷新模拟盘估值与净值：优先按账号分发，回退全局引擎。
+// 仅交易时段执行（盘后停估值，省内存）；盘后落库由注册表盘后导出 hook 负责。
 // English: refreshes paper marks and equity from the live snapshot — per-account dispatch first, global
-// engine as the fallback.
+// engine as the fallback. Runs only during trading hours (no after-hours marking to save memory); the
+// post-close research export is handled by the registry's day-close hook.
 func (e *Engine) paperMark(quotes map[string]*data.StockInfo) {
 	e.mu.RLock()
 	mark := e.paperMarkFn
@@ -503,7 +506,7 @@ func (e *Engine) paperMark(quotes map[string]*data.StockInfo) {
 		mark(quotes)
 		return
 	}
-	if pe != nil && pe.Enabled() {
+	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
 		pe.MarkToMarket(quotes)
 		pe.Snapshot(time.Now())
 	}

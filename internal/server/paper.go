@@ -2,10 +2,13 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
+	"time"
 
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/paper"
+	"quant-trading-v2/internal/store"
 )
 
 // paperEngine 返回注入的全局模拟盘引擎（旧单引擎回退；未注入时返回 nil）。
@@ -24,9 +27,10 @@ func (s *Server) paperEngineFor(userID string) *paper.Engine {
 }
 
 // handlePaperState 返回模拟盘开关与绩效/信号质量汇总（含账号角色标记：
-// admin 账户的模拟盘额外支持回测与自动化交易联动）。
+// admin 账户的模拟盘额外支持回测与自动化交易联动），并附带战法资金池快照（分仓余量）。
 // English: returns the paper master state (enabled) plus performance/signal-quality stats, with the
-// account role flag (the admin account's paper additionally supports backtest + auto-trade linkage).
+// account role flag (the admin account's paper additionally supports backtest + auto-trade linkage),
+// plus the strategy pool snapshot (allocation balances).
 func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
 	pe := s.paperEngineFor(uid)
@@ -40,6 +44,7 @@ func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 		"stats":           pe.Stats(),
 		"initial_capital": pe.Cfg().InitialCapital,
 		"max_positions":   pe.Cfg().MaxPositions,
+		"strategy_pools":  pe.StrategyPools(),
 	})
 }
 
@@ -76,10 +81,18 @@ func (s *Server) handlePaperEquity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, pe.Equity())
 }
 
-// handlePaperBuy 手动按实时价买入一只股票（前端/APK 信号页"模拟买入"）。请求体：
-// {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8}。
-// English: manually buys one stock at the live price (frontend/APK signal-page "paper buy").
-// Body: {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8}.
+// handlePaperBuy 手动买入一只股票（前端信号页/持仓页"模拟买入/加仓"）。请求体：
+// {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8,"price":9.5,"qty":10}。
+//   - qty > 0：按用户输入的买入手数（10=10 手=1000 股）撮合，price > 0 时按用户输入价成交（静态记账），
+//     price = 0 时回退实时价——普通用户"搬运持仓"记账场景。
+//   - qty <= 0：回退固定金额（FixedAmount）整手买入（旧行为，实时价成交）。
+//
+// English: manually buys one stock (frontend/APK signal page or positions page "paper buy/add").
+// Body: {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8,"price":9.5,"qty":10}.
+//   - qty > 0: fills the typed lot count (10 = 10 lots = 1000 shares); price > 0 fills at the typed
+//     price (static bookkeeping), price = 0 falls back to the live quote — the "copy real positions"
+//     scenario for normal users.
+//   - qty <= 0: legacy fixed-amount whole-lot buy at the live price.
 func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 	pe := s.paperEngineFor(requestUserID(r))
 	if pe == nil || !pe.Enabled() {
@@ -91,17 +104,86 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 		Name        string  `json:"name"`
 		Strategy    string  `json:"strategy"`
 		SignalPrice float64 `json:"signal_price"`
+		Price       float64 `json:"price"` // 用户输入的买入价（>0 生效）
+		Qty         int     `json:"qty"`   // 用户输入的买入手数（>0 生效；<=0 回退固定金额）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
 	quotes := s.liveQuotes(req.Code)
-	if err := pe.Buy(req.Code, req.Name, req.Strategy, req.SignalPrice, quotes); err != nil {
-		writeError(w, 400, err.Error())
-		return
+	if req.Qty > 0 {
+		// 输入价格+手数：按用户指定记账（price=0 时用实时价，仍按指定手数）
+		// English: typed price + lots: fills as specified (price=0 falls back to the live quote but
+		// still respects the typed lot count).
+		if err := pe.BuyEx(req.Code, req.Name, req.Strategy, req.SignalPrice, req.Price, req.Qty, quotes); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	} else {
+		// 旧行为：固定金额整手，实时价成交
+		if err := pe.Buy(req.Code, req.Name, req.Strategy, req.SignalPrice, quotes); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// ExportPaperToResearch 盘后把某账号模拟盘的当日成交与每日快照导出到研究库（供自动研究消费）。
+// 由 main 注入 registry.SetDayCloseExport，注册表每日盘后触发一次；幂等由 store 唯一键保证。
+// 普通用户（非自动撮合账号）不参与（isAutoPaper 过滤已在上游完成）。
+// English: exports an account's paper fills + daily snapshot into the research DB after the close
+// (for auto-research). Wired by main into registry.SetDayCloseExport and fired once per day by the
+// registry; idempotency is guaranteed by store unique keys. Normal (non-auto) accounts are filtered
+// upstream.
+func (s *Server) ExportPaperToResearch(userID string, pe *paper.Engine) {
+	if s.researchDB == nil {
+		return
+	}
+	// 当日成交 → paper_trades（INSERT OR IGNORE，同一笔不重复入库）
+	// English: the day's fills → paper_trades (INSERT OR IGNORE, never duplicated).
+	trades := pe.Trades()
+	recs := make([]store.PaperTradeRecord, 0, len(trades))
+	for _, t := range trades {
+		recs = append(recs, store.PaperTradeRecord{
+			UserID:       userID,
+			Code:         t.Code,
+			Name:         t.Name,
+			Strategy:     t.Strategy,
+			StrategyType: t.StrategyType,
+			Side:         t.Side,
+			Price:        t.Price,
+			SignalPrice:  t.SignalPrice,
+			LatencySec:   float64(t.LatencySec),
+			Qty:          t.Qty,
+			Amount:       t.Amount,
+			FilledAt:     t.Time.Format("2006-01-02 15:04:05"),
+			Reason:       t.Reason,
+		})
+	}
+	if err := s.researchDB.SavePaperTrades(recs); err != nil {
+		log.Printf("[paper] 盘后导出成交失败 user=%s: %v", userID, err)
+		return
+	}
+	// 当日快照 → paper_daily（现金/市值/净值/已实现/持仓数）
+	// English: the daily snapshot → paper_daily (cash/market value/equity/realized/positions).
+	st := pe.Stats()
+	now := time.Now()
+	if err := s.researchDB.SavePaperDaily(store.PaperDailyRecord{
+		UserID:      userID,
+		Date:        now.Format("2006-01-02"),
+		Cash:        st.Cash,
+		MarketValue: st.MarketValue,
+		TotalValue:  st.TotalValue,
+		Realized:    st.RealizedPnl,
+		Positions:   st.OpenPositions,
+	}); err != nil {
+		log.Printf("[paper] 盘后导出快照失败 user=%s: %v", userID, err)
+		return
+	}
+	log.Printf("[paper] 盘后导出研究库 user=%s 成交=%d 快照现金=%.2f 净值=%.2f",
+		userID, len(recs), st.Cash, st.TotalValue)
 }
 
 // liveQuotes 构造实时行情表：优先 5s 快照，缺失时对指定代码降级单票拉取。
@@ -123,8 +205,14 @@ func (s *Server) liveQuotes(code string) map[string]*data.StockInfo {
 	return quotes
 }
 
-// handlePaperSell 手动按实时价卖出指定模拟持仓（清仓）。请求体 {"code":"600000.SH"}。
-// English: manually sells a paper position at the live price. Body: {"code":"600000.SH"}.
+// handlePaperSell 手动卖出指定模拟持仓。请求体 {"code":"600000.SH","price":9.5,"qty":5}：
+//   - qty > 0：按用户输入数量减仓（price > 0 用输入价，price = 0 回退实时价）；数量 >= 持仓=清仓。
+//   - qty <= 0：清仓（实时价，旧行为）。
+//
+// English: manually sells a paper position. Body {"code":"600000.SH","price":9.5,"qty":5}:
+//   - qty > 0: trims the typed lot count (price > 0 uses the typed price, price = 0 falls back to the
+//     live quote); qty >= the position closes it.
+//   - qty <= 0: closes the position at the live price (legacy behavior).
 func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 	pe := s.paperEngineFor(requestUserID(r))
 	if pe == nil || !pe.Enabled() {
@@ -132,32 +220,41 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Code string `json:"code"`
+		Code  string  `json:"code"`
+		Price float64 `json:"price"` // 用户输入的卖出价（>0 生效）
+		Qty   int     `json:"qty"`   // 用户输入的减仓手数（>0 生效；<=0 清仓）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
-	if err := pe.Sell(req.Code, s.liveQuotes(req.Code)); err != nil {
-		writeError(w, 400, err.Error())
-		return
+	if req.Qty > 0 {
+		if err := pe.SellEx(req.Code, req.Price, req.Qty, s.liveQuotes(req.Code)); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	} else {
+		if err := pe.Sell(req.Code, s.liveQuotes(req.Code)); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }
 
-// handlePaperReset 重置模拟盘。区分两种语义（联动版前端两个按钮）：
-//   - 请求体带 {"initial_capital":N}（>0）→ 确认资金：Reconfigure 设置新初始资金/持仓上限，
-//     清空当前持仓、净值从新资金重开，**保留成交日志**（历史固化不丢）。
+// handlePaperReset 重置/注入模拟盘。区分两种语义（联动版前端两个按钮）：
+//   - 请求体带 {"initial_capital":N}（>0）→ 注入资金：Deposit 增量加现金，按池占比分配，
+//     **保留现有持仓/净值/成交日志**，收益基准（累计投入）同步增加——与真实持仓一致，不清仓。
+//     可选 {"max_positions":N} 自定义持仓上限（>=0 生效；0=不设限）。
 //   - 请求体不带/为 0 → 清盘重置：Reset 只清空重开（持仓/成交/净值），不改自定义资金与上限。
-//     可选 {"max_positions":N} 自定义持仓上限（>=0 生效；0=不设限，由资金自然决定）。
 //
-// English: resets the paper book. Two semantics (matching the two frontend buttons):
-//   - body with {"initial_capital":N} (>0) → confirm capital: Reconfigure applies the new starting
-//     capital / position cap, clears positions, restarts the equity curve from the new capital, and
-//     **keeps the fill log** (history survives a capital change).
+// English: deposits into / resets the paper book. Two semantics (matching the two frontend buttons):
+//   - body with {"initial_capital":N} (>0) → deposit: Deposit adds cash incrementally, distributed to the
+//     pools by their share; **positions / equity / fill log are all kept** and the return basis
+//     (cumulative investment) grows — just like the real book, nothing is cleared.
+//     Optional {"max_positions":N} customizes the position cap (applies when >= 0; 0 = unlimited).
 //   - body absent / zero → liquidate: Reset just reopens the book (positions/trades/equity cleared)
 //     without changing the user's customized capital or cap.
-//     Optional {"max_positions":N} customizes the position cap (applies when >= 0; 0 = unlimited).
 func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	pe := s.paperEngineFor(requestUserID(r))
 	if pe == nil {
@@ -170,8 +267,11 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.InitialCapital > 0 {
-		// 确认资金：设新资金/上限，保留成交日志，净值从新资金重开
-		pe.Reconfigure(req.InitialCapital, req.MaxPositions)
+		// 注入资金：增量加现金，保留持仓/净值/成交；设置可选上限
+		pe.Deposit(req.InitialCapital)
+		if req.MaxPositions >= 0 {
+			pe.SetMaxPositions(req.MaxPositions)
+		}
 	} else {
 		// 清盘重置：不改资金/上限，仅清空重开
 		pe.Reset()
@@ -180,8 +280,8 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"ok":             true,
+		"ok":              true,
 		"initial_capital": pe.Cfg().InitialCapital,
-		"max_positions":  pe.Cfg().MaxPositions,
+		"max_positions":   pe.Cfg().MaxPositions,
 	})
 }

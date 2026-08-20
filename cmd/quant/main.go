@@ -22,8 +22,8 @@ import (
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
-	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
@@ -273,6 +273,19 @@ func main() {
 		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
 	})
 	srv.SetEngineRegistry(registry)
+
+	// 模拟盘账号策略：仅 admin 账号自动按战法建仓/估值；普通用户模拟盘纯手动 + 静态存储。
+	// 同时注入当前启用战法资金池模板（分仓，防单战法垄断）。
+	// English: paper account policy — only admin accounts auto-fill/mark from strategies; normal users'
+	// paper is manual-only and static. Also injects the enabled-strategy pool template (allocation).
+	registry.SetAutoPaperCheck(authMgr.IsAdmin)
+	registry.SetPaperPools(server.ActivePaperPoolTypes(dataDir))
+	// 盘后落库：每个交易日收盘后把模拟盘当日成交 + 每日快照导出研究库，供自动研究消费。
+	// English: post-close export — after each trading-day close, the paper day's fills + daily snapshot
+	// are exported to the research DB for auto-research.
+	registry.SetDayCloseExport(func(userID string, pe *paper.Engine) {
+		srv.ExportPaperToResearch(userID, pe)
+	})
 
 	// 前端修改 LLM 配置时热重建客户端，避免重启进程（对所有已创建账号引擎生效）
 	srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) {

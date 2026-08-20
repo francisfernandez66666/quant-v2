@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/research"
+	"quant-trading-v2/internal/store"
+	"quant-trading-v2/internal/strategy"
 )
 
 // handleResearchLibrary 处理 GET /api/research/library：返回战法库全部已应用因子战法
@@ -55,10 +57,10 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 		Horizon      int                    `json:"horizon,omitempty"`
 		IR           float64                `json:"ir,omitempty"`
 		Excess       float64                `json:"excess,omitempty"`
-		ICMean       float64                `json:"ic_mean,omitempty"` // 全样本 IC 均值（候选表回填）
+		ICMean       float64                `json:"ic_mean,omitempty"`    // 全样本 IC 均值（候选表回填）
 		AvgExcess    float64                `json:"avg_excess,omitempty"` // 全链路回测超额（候选表 avg_excess，>0 表示已回测）
-		BacktestDone bool                   `json:"backtest_done"`     // 全链路回测是否已跑过（avg_excess 已回填）
-		Reason       string                 `json:"reason,omitempty"`  // 候选证据文本（样本内外 IR / 反推超额）
+		BacktestDone bool                   `json:"backtest_done"`        // 全链路回测是否已跑过（avg_excess 已回填）
+		Reason       string                 `json:"reason,omitempty"`     // 候选证据文本（样本内外 IR / 反推超额）
 		Conds        []research.PatternCond `json:"conds,omitempty"`
 	}
 	var out []libItem
@@ -239,8 +241,11 @@ func (s *Server) handleResearchBacktestToggle(w http.ResponseWriter, r *http.Req
 	writeJSON(w, 200, map[string]any{"enabled": body.Enabled})
 }
 
-// reloadLibraries 对注册表内全部引擎热重载因子+形态战法库（启用/禁用/删除/重命名后立即生效）。
-// English: hot-reloads the factor and pattern libraries on every engine in the registry.
+// reloadLibraries 对注册表内全部引擎热重载因子+形态战法库（启用/禁用/删除/重命名后立即生效），
+// 并按最新启用战法集合同步模拟盘资金池（新增/停用战法后分仓随之更新）。
+// English: hot-reloads the factor and pattern libraries on every engine in the registry (immediately
+// effective after enable/disable/delete/rename) and syncs the paper strategy pools to the current
+// enabled set (pools follow strategy add/disable changes).
 func (s *Server) reloadLibraries() {
 	if s.registry == nil {
 		return
@@ -249,6 +254,31 @@ func (s *Server) reloadLibraries() {
 		c.ReloadFactorRules(s.researchDir)
 		c.ReloadPatternRules(s.researchDir)
 	}
+	s.registry.SetPaperPools(ActivePaperPoolTypes(s.researchDir))
+}
+
+// ActivePaperPoolTypes 构建"当前启用战法"资金池类型列表：
+// 4 形态战法恒启用；factor/pattern 视 research 是否有启用规则才计入（当前唯一因子规则=波动突破 → factor 池激活）。
+// 供 quant 启动与战法库热加载注入 registry.SetPaperPools（分仓防单战法垄断）。
+// English: builds the "currently enabled strategies" pool-type list — the four pattern strategies are
+// always on; factor/pattern join only when the research store has enabled rules (the sole enabled rule
+// today, 波动突破, activates the factor pool). Feeds registry.SetPaperPools at startup and hot reload.
+func ActivePaperPoolTypes(dataDir string) []string {
+	types := []string{
+		string(strategy.SignalDragon),
+		string(strategy.SignalDoubleBump),
+		string(strategy.SignalNShape),
+		string(strategy.SignalDragonReturn),
+	}
+	if dataDir != "" {
+		if rules, err := research.LoadEnabledFactorRules(dataDir); err == nil && len(rules) > 0 {
+			types = append(types, string(strategy.SignalFactor))
+		}
+		if pats, err := research.LoadEnabledPatternRules(dataDir); err == nil && len(pats) > 0 {
+			types = append(types, string(strategy.SignalPattern))
+		}
+	}
+	return types
 }
 
 // ---- 单条候选全量回测（异步）----
@@ -273,8 +303,10 @@ type backtestJob struct {
 
 // handleCandidateBacktest 处理 POST /api/research/candidates/{id}/backtest：对指定候选跑一次 B4 全量回测
 // （异步后台执行，前端轮询 GET /api/research/backtest/{id} 拿进度与结果）。
+// 任务状态同步落库 backtest_jobs（kind='candidate'），quant 重启后任务可查、可续跑。
 // English: POST /api/research/candidates/{id}/backtest — run a full B4 backtest on a specific candidate
-// (async background; frontend polls GET /api/research/backtest/{id} for progress/result).
+// (async background; frontend polls GET /api/research/backtest/{id} for progress/result). The job is
+// persisted to backtest_jobs (kind='candidate') so it survives quant restarts and can be resumed.
 func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -287,9 +319,13 @@ func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, 200, map[string]any{"status": "running", "job": j})
 		return
 	}
-	job := &backtestJob{CandID: id, Status: "running", Started: time.Now()}
+	// 建任务即落库（Progress="0%"），消灭 CLI 首个 10% 之前的前端进度空窗。
+	// English: the job is persisted immediately with Progress="0%" so the frontend has a visible bar
+	// before the CLI prints its first "回测进度" line.
+	job := &backtestJob{CandID: id, Status: "running", Started: time.Now(), Progress: "0%"}
 	backtestJobs.m[id] = job
 	backtestJobs.Unlock()
+	s.persistBacktestJob(id, job.Status, job.Progress, 0, "")
 
 	// 后台执行
 	go func() {
@@ -306,12 +342,33 @@ func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request)
 		} else {
 			j.Status, j.AvgExcess = "done", avg
 		}
+		// 完成态同步落库（done 回填 avg_excess；error 记录原因）。
+		// English: persist the terminal state (done backfills avg_excess; error stores the reason).
+		s.persistBacktestJob(id, j.Status, j.Progress, j.AvgExcess, j.Err)
 	}()
 	writeJSON(w, 202, map[string]any{"status": "started", "job": job})
 }
 
+// persistBacktestJob 把单候选回测任务状态写入 backtest_jobs（kind='candidate'）。
+// researchDB 未接入（nil）时静默跳过，不影响现有内存态行为。
+// English: persists a per-candidate backtest job to backtest_jobs (kind='candidate'). Silently skips
+// when the research DB isn't wired (nil), keeping the in-memory behavior intact.
+func (s *Server) persistBacktestJob(candID int64, status, progress string, avgExcess float64, errMsg string) {
+	if s.researchDB == nil {
+		return
+	}
+	if err := s.researchDB.UpsertBacktestJob(&store.BacktestJob{
+		Kind: "candidate", CandidateID: candID, Status: status,
+		Progress: progress, AvgExcess: avgExcess, Error: errMsg,
+	}); err != nil {
+		log.Printf("[research] 持久化回测任务失败 cand=%d: %v", candID, err)
+	}
+}
+
 // handleBacktestStatus 处理 GET /api/research/backtest/{id}：返回回测任务状态与结果。
-// English: GET /api/research/backtest/{id} — returns a backtest job's status and result.
+// 内存优先；quant 重启后内存表为空，回退读 backtest_jobs（任务可查/可续跑）。
+// English: GET /api/research/backtest/{id} — returns a backtest job's status and result. In-memory is
+// checked first; after a quant restart the in-memory table is empty, so it falls back to backtest_jobs.
 func (s *Server) handleBacktestStatus(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -321,11 +378,81 @@ func (s *Server) handleBacktestStatus(w http.ResponseWriter, r *http.Request) {
 	backtestJobs.Lock()
 	j := backtestJobs.m[id]
 	backtestJobs.Unlock()
+	if j == nil && s.researchDB != nil {
+		dbj, err := s.researchDB.GetBacktestJob("candidate", id)
+		if err == nil && dbj != nil {
+			j = &backtestJob{
+				CandID:    id,
+				Status:    dbj.Status,
+				Progress:  dbj.Progress,
+				AvgExcess: dbj.AvgExcess,
+				Err:       dbj.Error,
+			}
+			if t, terr := time.Parse("2006-01-02 15:04:05", dbj.StartedAt); terr == nil {
+				j.Started = t
+			}
+		}
+	}
 	if j == nil {
 		writeError(w, 404, "回测任务不存在")
 		return
 	}
 	writeJSON(w, 200, j)
+}
+
+// handleBacktestRunning 处理 GET /api/research/backtest/running：返回所有运行中的回测任务。
+// 前端页面刷新后据此恢复 loading 态与轮询（配合 onMounted 恢复逻辑）。
+// English: GET /api/research/backtest/running — returns every running backtest job. The frontend uses it
+// after a page refresh to restore loading states and polling (paired with the onMounted recovery hook).
+func (s *Server) handleBacktestRunning(w http.ResponseWriter, r *http.Request) {
+	jobs := []store.BacktestJob{}
+	if s.researchDB != nil {
+		rows, err := s.researchDB.RunningBacktestJobs()
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		jobs = rows
+	}
+	// 合并内存运行中任务（兜底 DB 写入失败 / 尚未落库的瞬态），内存态最新。
+	// English: merge in-memory running jobs (fallback for transient/DB-write-failure cases); in-memory
+	// state is the freshest.
+	backtestJobs.Lock()
+	defer backtestJobs.Unlock()
+	for id, j := range backtestJobs.m {
+		if j.Status != "running" {
+			continue
+		}
+		found := false
+		for i := range jobs {
+			if jobs[i].CandidateID == id {
+				jobs[i] = store.BacktestJob{Kind: "candidate", CandidateID: id, Status: j.Status, Progress: j.Progress}
+				found = true
+				break
+			}
+		}
+		if !found {
+			jobs = append(jobs, store.BacktestJob{Kind: "candidate", CandidateID: id, Status: j.Status, Progress: j.Progress})
+		}
+	}
+	writeJSON(w, 200, map[string]any{"jobs": jobs})
+}
+
+// handleBacktestList 处理 GET /api/research/backtest/list：返回全部回测任务（含夜间全量），最新在前，
+// 供前端「回测」tab 的进度查看列表。
+// English: GET /api/research/backtest/list — returns all backtest jobs (including nightly runs), newest
+// first, powering the progress list of the frontend's "backtest" tab.
+func (s *Server) handleBacktestList(w http.ResponseWriter, r *http.Request) {
+	if s.researchDB == nil {
+		writeError(w, 503, "研究库未接入")
+		return
+	}
+	jobs, err := s.researchDB.ListBacktestJobs()
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"jobs": jobs})
 }
 
 // runCandidateBacktest 对候选跑一次 B4 全量回测并回填 avg_excess。
@@ -401,6 +528,10 @@ func (s *Server) runCandidateBacktest(id int64, job *backtestJob) (float64, erro
 						job.Progress = m[1] + "%"
 					}
 					backtestJobs.Unlock()
+					// 进度同步落库（CLI 每 10% 打印一次，写入频率低；重启后进度可从 DB 恢复）。
+					// English: persist the progress line to DB (CLI prints every 10%, so writes are
+					// low-frequency; progress is recoverable from DB after a restart).
+					s.persistBacktestJob(id, "running", m[1]+"%", 0, "")
 				}
 			}
 			if err != nil {

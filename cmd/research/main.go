@@ -43,7 +43,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|backtest|list|approve")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|list|approve")
 	}
 	cmd := args[0]
 
@@ -66,6 +66,11 @@ func main() {
 		cmdDiscoverPatterns(db, args[1:])
 	case "sector-rebuild":
 		cmdSectorRebuild(db, *start, *end)
+	case "paper-research":
+		// 模拟盘研究：读取盘后落库的模拟盘成交/净值，生成信号质量报告并落库（夜间 scheduler 调用）
+		// English: paper research — reads the post-close paper fills/snapshots, produces a signal-quality
+		// report and persists it (invoked by the nightly scheduler).
+		cmdPaperResearch(db, args[1:])
 	case "backtest":
 		cmdBacktestCandidate(db, args[1:])
 	case "list":

@@ -89,6 +89,15 @@ type Signal struct {
 	// strategy rule for effectiveness monitoring. Populated only for multi-rule strategies (factor library).
 	StrategyID string `json:"strategy_id,omitempty"`
 
+	// StrategyType 战法来源类型（runner 类型：dragon/double_bump/n_shape/dragon_return/factor/pattern）。
+	// 用于模拟盘战法分仓：paper 引擎据此把信号归入对应战法资金池（buy 只扣本池现金）。
+	// 仅 8a/8b 战法信号填充；watch 级信号（龙头识别/预期差/动量等）为空，走"其他池"。
+	// English: source strategy type (runner type: dragon/double_bump/n_shape/dragon_return/factor/pattern).
+	// Used by the paper engine's strategy-pool allocation: a buy signal debits only its own strategy's
+	// cash pool. Populated for 8a/8b strategy signals; watch-level signals (leader/expectation-gap/
+	// momentum) are empty and fall into the "other" pool.
+	StrategyType string `json:"strategy_type,omitempty"`
+
 	// D1 事件信息（新闻归因/LLM 分析，区别于策略 Reason）：
 	// D1Score 为该股最近一轮 D1 事件评分（0~40，越高越值得关注；与板块利好/利空事件分解耦，独立 LLM 打分）；
 	// D1Blocked 表示是否被负面过滤拦截（立案/减持/质押/解禁等）；D1Reason 为 LLM 对事件的 D1 分析理由；D1Event 为个股关联的事件名称（新闻标题）。
