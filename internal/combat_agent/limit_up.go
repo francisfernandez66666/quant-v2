@@ -320,10 +320,23 @@ func newsTitlesOf(news map[string][]NewsBrief, code string) []string {
 // leaderThreshold is the trigger line for a leader score: >= 70 means an industry leader.
 const leaderThreshold = 70.0
 
+// leaderBuyThreshold 龙头识别买入线：评分 ≥60 且排名前 10 → 直接发 buy 买入信号
+// （放宽买入层级：用户要求其他战法适当放开买入控制，龙头识别统一到 60 分即可买）。
+// 低于该线仍发 watch 观察。English: the leader-buy threshold — score ≥60 and ranked top-10 fires a
+// buy signal directly (relaxed buy gate per request: leader identification buys at 60). Below the line
+// it stays a watch signal.
+const leaderBuyThreshold = 60.0
+
 // ScanLimitUp 涨停池分析扫描：识别龙头 + 涨停原因分类 + 预期差检测。
 // ScanLimitUp scans the limit-up pool: leader identification + reason classification + expectation-gap detection.
-// 龙头信号（Strategy=龙头识别，Action=watch）：评分≥70 且排进前 10 的个股。
-// Leader signals (Strategy=龙头识别, Action=watch): stocks with score >= 70 and ranked in the top 10.
+// 龙头信号（Strategy=龙头识别）：评分≥70 且排进前 10 的个股；
+//
+//	评分≥60 → Action=buy（放开买入层级，直接可交易）；<60 → watch（仅观察）。
+//
+// Leader signals (Strategy=龙头识别): stocks with score >= 70 and ranked in the top 10;
+//
+//	score >= 60 → Action=buy (relaxed buy gate, tradeable); < 60 → watch (observe only).
+//
 // 预期差信号（Strategy=预期差，Action=提醒）：利好/利空新闻与实际涨跌背离（score≥0.4）。
 // Gap signals (Strategy=预期差, Action=提醒): news direction conflicting with the actual move (score >= 0.4).
 // 涨停池为空时仍对 IndividualStocks 做预期差检测。
@@ -348,13 +361,19 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 			if l.Score < leaderThreshold || l.Rank > 10 {
 				continue
 			}
+			// 评分≥60 放开为 buy（可交易）；低于 60 仅 watch 观察
+			// English: score ≥60 relaxes to a tradeable buy; below that stays watch-only.
+			action := "watch"
+			if l.Score >= leaderBuyThreshold {
+				action = "buy"
+			}
 			signals = append(signals, Signal{
 				ID:          seqID(),
 				Code:        l.Stock.Code,
 				Name:        l.Stock.Name,
 				Strategy:    "龙头识别",
 				Direction:   "做多",
-				Action:      "watch",
+				Action:      action,
 				Price:       l.Stock.Price,
 				Confidence:  clamp01(l.Score / 100),
 				Reason:      fmt.Sprintf("龙头评分%.0f(排名%d): %s | %s | 行业:%s", l.Score, l.Rank, l.Reason, l.Stock.LimitType, l.Stock.Industry),

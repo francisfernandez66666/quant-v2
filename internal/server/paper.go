@@ -242,6 +242,71 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }
 
+// handlePaperPoolReset 单池清盘：只清指定战法资金池的持仓与持久化表现（平仓回池现金），
+// 其余池与全局净值/成交日志不受影响。请求体 {"pool":"n_shape"}（空 pool 清"其他池"）。
+// 对应前端分仓 tab 上的"清盘本池"按钮。
+// English: resets a single strategy pool — closes that pool's positions (proceeds return to the pool)
+// and zeroes its persisted cost/realized, leaving other pools and the global equity/fill log untouched.
+// Body {"pool":"n_shape"} (empty pool = the "other" pool). Backs the "清盘本池" button on a pool tab.
+func (s *Server) handlePaperPoolReset(w http.ResponseWriter, r *http.Request) {
+	pe := s.paperEngineFor(requestUserID(r))
+	if pe == nil || !pe.Enabled() {
+		writeError(w, 400, "模拟盘未启用")
+		return
+	}
+	var req struct {
+		Pool string `json:"pool"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "无效请求体")
+		return
+	}
+	pe.ResetPool(req.Pool)
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "pool": req.Pool})
+}
+
+// handlePaperPoolConfig 设置分仓池级自定义（资金分配 + 每池持仓上限），与全局持仓上限/资金解耦。
+// 请求体 {"max_positions":N, "pool_caps":{"n_shape":10,...}, "pool_allocs":{"n_shape":50000,...}}：
+//   - max_positions ≥0：更新全局持仓上限（0=不设限）。
+//   - pool_caps：每池持仓上限（n<=0=该池不单独设限）；Σ池上限 ≤ 全局上限由前端守恒校验。
+//   - pool_allocs：每池目标资金额（>0 生效）；SetPoolAllocs 保证 Σ池现金=总现金（守恒）。
+//
+// English: sets pool-level customization (per-pool cash allocation + per-pool position caps), decoupled
+// from the global cap/capital. Body {"max_positions":N, "pool_caps":{...}, "pool_allocs":{...}}:
+//   - max_positions ≥0 updates the global position cap (0 = unlimited).
+//   - pool_caps set per-pool position caps (n<=0 = no per-pool limit); Σpool caps ≤ the global cap is
+//     conserved by the frontend.
+//   - pool_allocs set per-pool target cash (>0 applies); SetPoolAllocs keeps Σpool cash = total cash.
+func (s *Server) handlePaperPoolConfig(w http.ResponseWriter, r *http.Request) {
+	pe := s.paperEngineFor(requestUserID(r))
+	if pe == nil {
+		writeError(w, 400, "模拟盘未启用")
+		return
+	}
+	var req struct {
+		MaxPositions int                `json:"max_positions"`
+		PoolCaps     map[string]int     `json:"pool_caps"`
+		PoolAllocs   map[string]float64 `json:"pool_allocs"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "无效请求体")
+		return
+	}
+	if req.MaxPositions >= 0 {
+		pe.SetMaxPositions(req.MaxPositions)
+	}
+	if len(req.PoolCaps) > 0 {
+		pe.SetPoolCaps(req.PoolCaps)
+	}
+	if len(req.PoolAllocs) > 0 {
+		pe.SetPoolAllocs(req.PoolAllocs)
+	} else {
+		// 未指定资金分配 → 恢复均分（"清除自定义"语义，与前端"分仓配置"保存空分配一致）
+		pe.ResetPoolAllocs()
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
 // handlePaperReset 重置/注入模拟盘。区分两种语义（联动版前端两个按钮）：
 //   - 请求体带 {"initial_capital":N}（>0）→ 注入资金：Deposit 增量加现金，按池占比分配，
 //     **保留现有持仓/净值/成交日志**，收益基准（累计投入）同步增加——与真实持仓一致，不清仓。

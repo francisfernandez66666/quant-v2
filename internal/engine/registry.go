@@ -33,9 +33,9 @@ import (
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
+	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
-	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy_engine"
 	"quant-trading-v2/internal/trading"
 )

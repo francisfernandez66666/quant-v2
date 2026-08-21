@@ -10,6 +10,10 @@
 #   - /api 前缀（REST + SSE）单独 handle 反代到后端 127.0.0.1:8080，SSE 长连接天然透传。
 #   - 两个 handle 分支按路径互斥：/api/* → 后端；其余（/、/assets/* 等）→ 静态前端。
 #   - CORS 已由后端 corsMiddleware 全开（*），跨域 APK 走 /api 同样可用。
+#   - 同服务器另一项目（翻译助手 translator.quant-trading.top）通过独立 conf 引入，
+#     `import /etc/caddy/translator.conf`（见 deploy/caddy/translator.conf）。
+#     本文件被 deploy_seoul.sh 用 mv 整体覆盖时只含本站点 + import 行，不内联 translator，
+#     保证另一项目配置独立不受影响；两端模板保持一致（均含 import 行）。
 
 quant-trading.top {
 	# 传输安全与压缩
@@ -41,3 +45,6 @@ quant-trading.top {
 }
 
 # 说明：如无需外部日志，可把整个 log 块删掉。
+
+# ===== 翻译助手（同服务器另一项目，独立 conf，见 deploy/caddy/translator.conf） =====
+import /etc/caddy/translator.conf

@@ -37,9 +37,9 @@ import (
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
+	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
-	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy_engine"
 	"quant-trading-v2/internal/trading"
 )
@@ -93,6 +93,7 @@ type Engine struct {
 	fetcher          *data.Fetcher                                                       // 5s 实时行情采集器（近实时打分快照来源）
 	scoreStore       *scoreStore                                                         // 8a/8b 打分持久化（scores.json）
 	prevPass         map[string]map[string]bool                                          // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
+	prevBullBuy      map[string]map[string]bool                                          // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
 	lastD1Scores     map[string]combat_agent.D1Score                                     // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
 	d1RetryQueue     map[string]bool                                                     // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
 	lastEmotionPhase string                                                              // 主循环最近一轮情绪阶段（近实时循环复用）
@@ -109,8 +110,8 @@ type Engine struct {
 	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the
 	// paper book. Only active when qmt.enabled=true: reads real_positions for position advice, circuit
 	// breaking and auto-orders each 5s cycle.
-	qmtCtrl     *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
-	realStore   *store.DB           // 研究库（real_positions/orders/fills 实盘账本存取）
+	qmtCtrl   *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
+	realStore *store.DB           // 研究库（real_positions/orders/fills 实盘账本存取）
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -371,6 +372,7 @@ func New(
 		sectorConstTopN:  20,
 		scoreStore:       newScoreStore(scoreRecPath),
 		prevPass:         make(map[string]map[string]bool),
+		prevBullBuy:      make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
 		d1RetryQueue:     make(map[string]bool),
 		factorMon:        newFactorMonitor(dataDir, 5),
@@ -574,7 +576,7 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	if amount <= 0 {
 		amount = 10000
 	}
-	qty := int(amount / price / 100) * 100
+	qty := int(amount/price/100) * 100
 	if qty <= 0 {
 		qty = 100
 	}
@@ -2499,6 +2501,32 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	if data.BeforeOpenTrade(time.Now()) {
 		bullSignals = nil
 		bearSignals = nil
+	}
+
+	// 主循环把可交易 buy 信号送入模拟盘撮合（龙头识别/涨停增强等仅在主循环产生的信号，
+	// 近实时循环的 ScorePool 不含它们；watch/提醒不撮合，只做翻转去重防重复买入）。
+	// English: the main loop feeds its tradeable buy signals into the paper fill (leader-ID / limit-up
+	// enhancements only exist here — the near-realtime ScorePool excludes them); watch/alert signals are
+	// skipped, and only non-Pass→Pass flips are emitted to avoid repeat buys.
+	{
+		var buys []combat_agent.Signal
+		for _, sig := range bullSignals {
+			if sig.Action == "buy" {
+				buys = append(buys, sig)
+			}
+		}
+		if len(buys) > 0 {
+			e.mu.RLock()
+			prev := e.prevBullBuy
+			e.mu.RUnlock()
+			emit, next := filterTransitionSignals(buys, prev)
+			e.mu.Lock()
+			e.prevBullBuy = next
+			e.mu.Unlock()
+			if len(emit) > 0 {
+				e.paperSignals(emit, e.snapshotQuotes())
+			}
+		}
 	}
 
 	// 10-12 出信号结束

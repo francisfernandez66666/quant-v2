@@ -519,6 +519,28 @@ export async function sellPaperPosition(code, price, qty) {
   return request('/api/paper/sell', { method: 'POST', data: { code, price: price || 0, qty: qty || 0 } })
 }
 
+/** 模拟盘：单池清盘（只清指定战法资金池的持仓与持久化表现，不影响其余池与全局净值/成交） */
+/** Paper trading: reset a single strategy pool (clears only that pool's positions & persisted perf;
+ *  other pools and the global equity/fill log are untouched) */
+// 对应 POST /api/paper/pool/reset，data: { pool }
+export async function resetPaperPool(pool) {
+  return request('/api/paper/pool/reset', { method: 'POST', data: { pool: pool || '' } })
+}
+
+/** 模拟盘：分仓池级配置（全局持仓上限 + 每池持仓上限/资金分配，与全局资金/上限解耦可自定义）。
+ *  总和守恒：Σ池资金=总现金，Σ池上限≤全局上限（前端校验）。 */
+/** Paper trading: pool-level config (global position cap + per-pool caps/cash allocation, decoupled
+ *  from the global capital/cap and customizable). Conservation: Σpool cash = total cash,
+ *  Σpool caps ≤ the global cap (checked on the frontend). */
+// 对应 POST /api/paper/pool/config，data: { max_positions, pool_caps, pool_allocs }
+export async function configPaperPools(maxPositions, poolCaps, poolAllocs) {
+  const data = {}
+  if (maxPositions >= 0) data.max_positions = maxPositions
+  if (poolCaps && Object.keys(poolCaps).length) data.pool_caps = poolCaps
+  if (poolAllocs && Object.keys(poolAllocs).length) data.pool_allocs = poolAllocs
+  return request('/api/paper/pool/config', { method: 'POST', data })
+}
+
 /** 模拟盘：清盘重置（按最后估值价平仓，重置现金/成交/净值；initialCapital>0 时自定义初始资金，
  *  maxPositions>0 时自定义持仓上限，0=不设限） */
 /** Paper trading: liquidate and reset (liquidate at last mark, reset cash/trades/equity; a positive

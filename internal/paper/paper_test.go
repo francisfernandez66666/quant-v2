@@ -1,12 +1,171 @@
 package paper
 
 import (
+	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 )
+
+// poolSnapshotCost 返回某池的累计买入成本（StrategyPools 快照）。
+// English: returns a pool's cumulative buy cost from the StrategyPools snapshot.
+func poolSnapshotCost(e *Engine, key string) float64 {
+	for _, p := range e.StrategyPools() {
+		if p.Key == key {
+			return p.Cost
+		}
+	}
+	return 0
+}
+
+// TestPoolCapsDecoupled 验证每池持仓上限与全局解耦：设置池上限后该池持仓数被约束，
+// 其余池不受影响；池上限 0 = 不单独设限。
+// English: verifies per-pool position caps decoupled from the global cap — a pool's holdings are bound
+// by its own cap while other pools are unaffected; 0 = no per-pool limit.
+func TestPoolCapsDecoupled(t *testing.T) {
+	c := testCfg()
+	c.MaxPositions = 5 // 全局上限 5（不设限语义下也不至于影响测试）
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape", "dragon"})
+	e.SetPoolCaps(map[string]int{"n_shape": 2})
+	now := time.Now()
+	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10}, "000001.SZ": {Price: 5}, "000002.SZ": {Price: 8}}
+	// 3 个 n_shape 信号：池上限 2 → 只买 2 个
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "A", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+		{Code: "000001.SZ", Name: "B", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 5, GeneratedAt: now},
+		{Code: "000002.SZ", Name: "C", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 8, GeneratedAt: now},
+	}, quotes)
+	// dragon 池：无上限，1 个信号买入
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "601000.SH", Name: "D", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 6, GeneratedAt: now},
+	}, quotes)
+	ns := e.PoolStats("n_shape")
+	dr := e.PoolStats("dragon")
+	if ns.OpenPositions != 2 {
+		t.Errorf("n_shape 池上限 2 应只买 2 仓, 实际 %d", ns.OpenPositions)
+	}
+	if dr.OpenPositions != 1 {
+		t.Errorf("dragon 池不应受 n_shape 上限影响, 实际 %d", dr.OpenPositions)
+	}
+	// 池上限 0 = 不单独设限：dragon 再买 1 个不受池级约束（全局 5 未到）
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "601001.SH", Name: "E", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 6, GeneratedAt: now},
+	}, quotes)
+	if got := e.PoolStats("dragon").OpenPositions; got != 2 {
+		t.Errorf("dragon 池无上限应可继续买, 实际 %d", got)
+	}
+	// 快照应暴露池上限字段
+	for _, p := range e.StrategyPools() {
+		if p.Key == "n_shape" && p.MaxPos != 2 {
+			t.Errorf("n_shape 池上限应在快照中为 2, 实际 %d", p.MaxPos)
+		}
+	}
+}
+
+// TestPoolAllocsConserve 验证资金分配守恒：Σ池现金=总现金，指定池按目标额、未指定池均分剩余。
+// English: verifies cash-allocation conservation — Σpool cash = total cash; given pools take their
+// targets and unmentioned pools split the remainder evenly.
+func TestPoolAllocsConserve(t *testing.T) {
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"n_shape", "dragon"})
+	total := e.cash // 100000
+	e.SetPoolAllocs(map[string]float64{"n_shape": 30000})
+	sum := 0.0
+	for _, p := range e.StrategyPools() {
+		sum += p.Cash
+	}
+	if sum != total {
+		t.Errorf("Σ池现金应等于总现金 %.2f, 实际 %.2f", total, sum)
+	}
+	var ns, dr, other float64
+	for _, p := range e.StrategyPools() {
+		switch p.Key {
+		case "n_shape":
+			ns = p.Cash
+		case "dragon":
+			dr = p.Cash
+		case "":
+			other = p.Cash
+		}
+	}
+	if ns != 30000 {
+		t.Errorf("n_shape 池应 30000, 实际 %.2f", ns)
+	}
+	// 剩余 70000 均分给 dragon + 其他池
+	exp := (total - 30000) / 2
+	if dr != exp || other != exp {
+		t.Errorf("dragon/其他 应各 %.2f, 实际 %.2f/%.2f", exp, dr, other)
+	}
+	// 持久化后恢复
+	path := t.TempDir() + "/paper.json"
+	e2 := New(testCfg(), path)
+	e2.SetStrategyPools([]string{"n_shape", "dragon"})
+	e2.SetPoolAllocs(map[string]float64{"n_shape": 40000})
+	e3 := New(testCfg(), path)
+	sum2 := 0.0
+	for _, p := range e3.StrategyPools() {
+		sum2 += p.Cash
+	}
+	if sum2 != 100000 {
+		t.Errorf("重启后 Σ池现金应仍守恒为 100000, 实际 %.2f", sum2)
+	}
+}
+
+// TestPoolPerfBackfillLegacy 验证旧数据迁移：池有持仓但无累计成本基准时，load 回填
+// 成本到持仓成本合计，避免分母≈0 放大涨跌幅；已有成本的池不受影响。
+// English: verifies legacy migration — a pool holding positions without a recorded cost basis gets its
+// Cost backfilled to the open-position cost sum on load, so a ≈0 denominator can't blow up the return;
+// pools already accruing cost are untouched.
+func TestPoolPerfBackfillLegacy(t *testing.T) {
+	path := t.TempDir() + "/paper.json"
+	c := testCfg()
+	e := New(c, path)
+	e.SetStrategyPools([]string{"factor"})
+	now := time.Now()
+	// 因子池买入 2 笔（每笔 10000 成本），再卖 1 笔，使其池现金、持仓、成本都真实存在
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "因子", StrategyType: "factor", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+		{Code: "000001.SZ", Name: "平安", Strategy: "因子", StrategyType: "factor", Direction: "做多", Action: "buy", Price: 5, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}, "000001.SZ": {Price: 5}})
+	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("卖出失败: %v", err)
+	}
+	// 篡改为旧数据形态：池 cost=0（未记录历史），但仍持有 1 笔 000001.SZ（成本 10000）
+	st := persistedState{Cash: e.cash, Pools: e.pools, PoolTypes: e.poolTypes, Positions: e.positions, Trades: e.trades}
+	raw, _ := json.Marshal(st)
+	_ = os.WriteFile(path, raw, 0644)
+
+	e2 := New(c, path)
+	var f *StrategyPoolState
+	for i := range e2.StrategyPools() {
+		p := e2.StrategyPools()[i]
+		if p.Key == "factor" {
+			f = &p
+		}
+	}
+	if f == nil {
+		t.Fatalf("应存在 factor 池")
+	}
+	if f.Cost < 10000 {
+		t.Errorf("旧数据应回填成本至持仓成本合计（≥10000）, 实际 %.2f", f.Cost)
+	}
+	// 新代码池（已有 cost）不被覆盖：重新写入带成本的状态再 load
+	e3 := New(c, path)
+	e3.poolPerf["factor"].Cost = 25000
+	raw2, _ := json.Marshal(persistedState{Cash: e3.cash, Pools: e3.pools, PoolTypes: e3.poolTypes, Positions: e3.positions, Trades: e3.trades, PoolPerf: e3.poolPerf})
+	_ = os.WriteFile(path, raw2, 0644)
+	e4 := New(c, path)
+	for i := range e4.StrategyPools() {
+		p := e4.StrategyPools()[i]
+		if p.Key == "factor" && p.Cost != 25000 {
+			t.Errorf("已有成本的池应保留 25000, 实际 %.2f", p.Cost)
+		}
+	}
+}
 
 func testCfg() Config {
 	c := DefaultConfig()
@@ -212,5 +371,241 @@ func TestDepositPreservesPositions(t *testing.T) {
 	}
 	if st.InitialCapital != capBefore+50000 {
 		t.Errorf("累计投入基准应 +50000（%.2f → %.2f）", capBefore, st.InitialCapital)
+	}
+}
+
+// TestPoolPerfTracksReturn 验证战法资金池持久化表现：买入累计成本、卖出仍记本池（已实现盈亏跨重启保留）、
+// 浮动盈亏计入总涨跌幅。
+// English: verifies the strategy-pool persisted performance — buy cost accumulates, sells still
+// attribute to the pool (realized P&L survives restart), floating P&L feeds the total return.
+func TestPoolPerfTracksReturn(t *testing.T) {
+	c := testCfg()
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape", "dragon"})
+	now := time.Now()
+	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10.0}}
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 9.8, GeneratedAt: now},
+	}, quotes)
+	// n_shape 池：成本 10000（FixedAmount）
+	pools := e.StrategyPools()
+	var ns, dragon *StrategyPoolState
+	for i := range pools {
+		if pools[i].Key == "n_shape" {
+			ns = &pools[i]
+		}
+		if pools[i].Key == "dragon" {
+			dragon = &pools[i]
+		}
+	}
+	if ns == nil || ns.Cost != 10000 {
+		t.Fatalf("n_shape 池成本应为 10000, 实际 %+v", ns)
+	}
+	// 浮盈：12 元估值 → 浮动盈亏 +2000，总涨跌幅 +20%
+	e.MarkToMarket(map[string]*data.StockInfo{"600000.SH": {Price: 12}})
+	pools = e.StrategyPools()
+	for i := range pools {
+		if pools[i].Key == "n_shape" {
+			ns = &pools[i]
+		}
+	}
+	if ns.Floating != 2000 || ns.Realized != 0 {
+		t.Errorf("n_shape 浮盈应为 2000/已实现 0, 实际 浮盈%.2f/已实现%.2f", ns.Floating, ns.Realized)
+	}
+	if ns.ReturnPct != 20 {
+		t.Errorf("n_shape 总涨跌幅应为 20%%, 实际 %.2f%%", ns.ReturnPct)
+	}
+	// 12 元卖出 → 已实现 +2000，成本保留 10000，总涨跌幅仍 +20%（卖出仍记本池）
+	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("卖出失败: %v", err)
+	}
+	pools = e.StrategyPools()
+	for i := range pools {
+		if pools[i].Key == "n_shape" {
+			ns = &pools[i]
+		}
+	}
+	if ns.Realized != 2000 || ns.Cost != 10000 {
+		t.Errorf("卖出后 n_shape 已实现应 2000/成本保留 10000, 实际 %.2f/%.2f", ns.Realized, ns.Cost)
+	}
+	if ns.ReturnPct != 20 {
+		t.Errorf("卖出后 n_shape 总涨跌幅应 20%%, 实际 %.2f%%", ns.ReturnPct)
+	}
+	// dragon 池从未交易：成本/已实现/涨跌幅均为 0
+	if dragon.Cost != 0 || dragon.Realized != 0 || dragon.ReturnPct != 0 {
+		t.Errorf("dragon 池应无交易, 实际 %+v", dragon)
+	}
+}
+
+// TestPoolPerfPersists 验证 poolPerf 跨重启保留（模拟持久化：新引擎从同一路径加载）。
+// English: verifies poolPerf survives a restart (a fresh engine loads the same file).
+func TestPoolPerfPersists(t *testing.T) {
+	path := t.TempDir() + "/paper.json"
+	c := testCfg()
+	e := New(c, path)
+	e.SetStrategyPools([]string{"n_shape"})
+	now := time.Now()
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 9.8, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10.0}})
+	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("卖出失败: %v", err)
+	}
+	// 重启：新引擎加载同一文件
+	e2 := New(c, path)
+	var ns *StrategyPoolState
+	for i := range e2.StrategyPools() {
+		p := e2.StrategyPools()[i]
+		if p.Key == "n_shape" {
+			ns = &p
+		}
+	}
+	if ns == nil || ns.Cost != 10000 || ns.Realized != 2000 {
+		t.Fatalf("重启后 n_shape 成本/已实现应为 10000/2000, 实际 %+v", ns)
+	}
+	if ns.ReturnPct != 20 {
+		t.Errorf("重启后 n_shape 总涨跌幅应 20%%, 实际 %.2f%%", ns.ReturnPct)
+	}
+}
+
+// TestPoolStatsScoped 验证池级 Stats 只统计该池：总资产=池现金+池内持仓市值，
+// 滑点/延迟/已撮合信号仅计该池成交；全账号 Stats 与池级可区分。
+// English: verifies pool-scoped Stats only count that pool — total value = pool cash + pool market
+// value, slippage/latency/filled-buys count only that pool's fills; global vs pool stats differ.
+func TestPoolStatsScoped(t *testing.T) {
+	c := testCfg()
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape"})
+	now := time.Now()
+	// n_shape 池买入：信号价 9.8，成交 10.0（滑点 +2.04%），延迟 30s
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 9.8, GeneratedAt: now.Add(-30 * time.Second)},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10.0}})
+	e.MarkToMarket(map[string]*data.StockInfo{"600000.SH": {Price: 11}})
+	global := e.Stats()
+	pool := e.PoolStats("n_shape")
+	if pool.Cash != e.pools["n_shape"] {
+		t.Errorf("池现金应为 %.2f, 实际 %.2f", e.pools["n_shape"], pool.Cash)
+	}
+	if pool.OpenPositions != 1 {
+		t.Errorf("池持仓数应为 1, 实际 %d", pool.OpenPositions)
+	}
+	if pool.TotalValue != e.pools["n_shape"]+11000 {
+		t.Errorf("池总资产应 = 池现金+市值, 实际 %.2f", pool.TotalValue)
+	}
+	if pool.FilledBuys != 1 {
+		t.Errorf("池已撮合信号应为 1, 实际 %d", pool.FilledBuys)
+	}
+	if pool.AvgLatencySec != 30 {
+		t.Errorf("池平均延迟应为 30s, 实际 %.1f", pool.AvgLatencySec)
+	}
+	// 滑点 = (10.0-9.8)/9.8 = +2.04%
+	if got := round2(pool.AvgSlippagePct); got != 2.04 {
+		t.Errorf("池平均滑点应为 2.04%%, 实际 %.2f%%", got)
+	}
+	// 全账号与池现金不同（全账号含其他池），且全账号持仓数一致
+	if global.Cash == pool.Cash {
+		t.Errorf("全账号现金应不等于池现金")
+	}
+	// 空池：无数据
+	empty := e.PoolStats("dragon")
+	if empty.OpenPositions != 0 || empty.FilledBuys != 0 || empty.TotalValue != e.pools["dragon"] {
+		t.Errorf("空池统计应为 0 持仓/0 信号/总资产=池现金, 实际 %+v", empty)
+	}
+}
+
+// TestResetPoolOnly 验证单池清盘：只清指定池持仓与表现，其余池与全局净值不受影响。
+// English: verifies pool-level reset — only that pool's positions/perf are cleared; other pools and
+// the global equity/realized are untouched.
+func TestResetPoolOnly(t *testing.T) {
+	c := testCfg()
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape", "dragon"})
+	now := time.Now()
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 9.8, GeneratedAt: now},
+		{Code: "000001.SZ", Name: "平安", Strategy: "龙", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 8.0, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10.0}, "000001.SZ": {Price: 8.0}})
+	if len(e.Positions()) != 2 {
+		t.Fatalf("应持有 2 仓, 实际 %d", len(e.Positions()))
+	}
+	// 估值：n_shape +20%（11 元），dragon 不变（8 元）
+	e.MarkToMarket(map[string]*data.StockInfo{"600000.SH": {Price: 11}, "000001.SZ": {Price: 8}})
+	e.Snapshot(now)
+	eqBefore := len(e.Equity())
+	realizedBefore := e.Stats().RealizedPnl
+
+	e.ResetPool("n_shape")
+
+	if len(e.Positions()) != 1 {
+		t.Fatalf("清盘 n_shape 后应剩 1 仓, 实际 %d", len(e.Positions()))
+	}
+	if len(e.Positions()) == 1 && e.Positions()[0].Code != "000001.SZ" {
+		t.Errorf("剩余持仓应为 dragon(000001.SZ), 实际 %+v", e.Positions())
+	}
+	// 清盘后池现金回补：n_shape 池现金应含平仓市值（11000）
+	pool := e.PoolStats("n_shape")
+	if pool.Cash != e.pools["n_shape"] {
+		t.Errorf("n_shape 池现金应保留, 实际 %.2f", pool.Cash)
+	}
+	// 其他池不受影响：dragon 持仓仍在
+	d := e.PoolStats("dragon")
+	if d.OpenPositions != 1 {
+		t.Errorf("dragon 池应仍持有 1 仓, 实际 %+v", d)
+	}
+	// 全局净值曲线与已实现盈亏保留（单池清盘不重置全局）
+	if len(e.Equity()) != eqBefore {
+		t.Errorf("全局净值应保留, 实际 %d", len(e.Equity()))
+	}
+	if e.Stats().RealizedPnl != realizedBefore {
+		t.Errorf("全局已实现盈亏应保留, 实际 %.2f", e.Stats().RealizedPnl)
+	}
+	// n_shape 池表现归零
+	ns := e.PoolStats("n_shape")
+	if ns.FilledBuys != 0 || ns.OpenPositions != 0 {
+		t.Errorf("n_shape 清盘后应无持仓/信号, 实际 %+v", ns)
+	}
+}
+
+// TestAddToPoolPosition 验证手动加仓归原持仓池：从该池扣款并累计成本，卖出收益仍记该池。
+// English: verifies a manual add-on credits the position's own pool — debits that pool and accrues its
+// cost; sale proceeds still attribute to that pool.
+func TestAddToPoolPosition(t *testing.T) {
+	c := testCfg()
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape", "dragon"})
+	now := time.Now()
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 9.8, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10.0}})
+	nsBefore := e.PoolStats("n_shape")
+	otherBefore := e.PoolStats("")
+	poolCashBefore := nsBefore.Cash
+	costBefore := poolSnapshotCost(e, "n_shape")
+
+	// 手动加仓（1000 股 @12）：应从 n_shape 池扣款（qty 为股数，调用方已换算）
+	if err := e.BuyEx("600000.SH", "浦发", "N形", 0, 12, 1000, map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("加仓失败: %v", err)
+	}
+
+	ns := e.PoolStats("n_shape")
+	if ns.Cash != poolCashBefore-12000 {
+		t.Errorf("加仓应从 n_shape 池扣 12000, 现金 %.2f → %.2f", poolCashBefore, ns.Cash)
+	}
+	// 其他池现金不受影响
+	if other := e.PoolStats(""); other.Cash != otherBefore.Cash {
+		t.Errorf("加仓不应动其他池现金, %.2f → %.2f", otherBefore.Cash, other.Cash)
+	}
+	// 池累计成本增加 12000
+	if got := poolSnapshotCost(e, "n_shape"); got != costBefore+12000 {
+		t.Errorf("n_shape 累计成本应 +12000（%.2f → %.2f）", costBefore, got)
+	}
+	// 持仓合并：均价 = (10000+12000)/2000 = 11
+	pos := e.Positions()
+	if len(pos) != 1 || pos[0].Qty != 2000 {
+		t.Fatalf("应合并为 2000 股, 实际 %+v", pos)
+	}
+	if got := pos[0].CostPrice; got != 11 {
+		t.Errorf("加权均价应为 11, 实际 %.2f", got)
 	}
 }

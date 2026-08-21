@@ -3,6 +3,7 @@ package combat_agent
 import (
 	"testing"
 
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 )
 
@@ -84,5 +85,29 @@ func TestAnalyzeLimitUpEmpty(t *testing.T) {
 	res := AnalyzeLimitUp(nil, nil)
 	if res.Total != 0 || res.Leaders != nil {
 		t.Errorf("空池: got %+v", res)
+	}
+}
+
+// TestScanLimitUpLeaderBuy 验证龙头识别信号放宽买入：评分≥60 且排名前 10 → Action=buy（可交易）。
+// English: verifies the leader-ID buy relaxation — score ≥60 and top-10 rank yields Action=buy (tradeable).
+func TestScanLimitUpLeaderBuy(t *testing.T) {
+	a := New(&config.StrategyConfig{})
+	pool := []data.LimitUpStock{
+		{Code: "600001", Name: "强票", Price: 10, LianBan: 5, FirstSeal: "09:25", SealRatio: 6, Turnover: 8, Industry: "燃气"},
+		{Code: "600002", Name: "弱票", Price: 20, LianBan: 1, FirstSeal: "14:30", SealRatio: 0.2, Turnover: 40, BreakCount: 3, Industry: "燃气"},
+	}
+	input := ScanInput{LimitUpPool: pool}
+	sigs := a.ScanLimitUp(input)
+	foundStrong := false
+	for _, s := range sigs {
+		if s.Code == "600001" && s.Strategy == "龙头识别" {
+			foundStrong = true
+			if s.Action != "buy" {
+				t.Errorf("强票龙头评分应放行为 buy, 实际 %q (score=%s)", s.Action, s.Reason)
+			}
+		}
+	}
+	if !foundStrong {
+		t.Errorf("应产出 600001 龙头识别信号, 实际 %+v", sigs)
 	}
 }

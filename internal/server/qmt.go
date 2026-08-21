@@ -8,15 +8,58 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
+
+// qmtReportMiddleware 认证网关回报（POST /api/qmt/report）：
+// 优先接受合法用户 token；否则接受 QMT 网关 Bearer token（qmt.token，配置在账号 QMT 配置里），
+// 并解析为持有该 token 的账号（供 SSE 定向推送 / 熔断控制器使用）。
+// English: authenticates gateway reports (POST /api/qmt/report). Accepts a valid user token first;
+// otherwise accepts the QMT gateway Bearer token (qmt.token, stored in an account's QMT config) and
+// resolves it to the owning account (for SSE routing / breaker controller).
+func (s *Server) qmtReportMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		token = strings.TrimSpace(token)
+		if token == "" {
+			writeError(w, 401, "missing authorization token")
+			return
+		}
+		if u := s.auth.ValidateToken(token); u != nil {
+			next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, u)))
+			return
+		}
+		if uid := s.userForQMTToken(token); uid != "" {
+			u := &auth.User{ID: uid}
+			next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, u)))
+			return
+		}
+		writeError(w, 401, "invalid or expired token")
+	}
+}
+
+// userForQMTToken 返回持有给定 QMT 网关 token 的账号 ID（遍历账号的 QMT 配置）；无匹配返回空串。
+// English: returns the account ID whose QMT config carries the given gateway token; "" when none.
+func (s *Server) userForQMTToken(token string) string {
+	if s.cfg == nil || token == "" {
+		return ""
+	}
+	for _, u := range s.auth.ListUsers() {
+		if s.cfg.GetRulesFor(u.ID).QMT.Token == token {
+			return u.ID
+		}
+	}
+	return ""
+}
 
 // userIDFor 返回当前请求账号 ID（鉴权中间件未置用户时返回空串，网关回报等直连场景安全）。
 // English: userIDFor returns the account ID for the request ("" when the auth middleware hasn't set a

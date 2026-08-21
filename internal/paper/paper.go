@@ -178,13 +178,38 @@ type Stats struct {
 }
 
 // StrategyPoolState 一个战法资金池的展示快照（前端分仓条）。
+// Cost/Realized/Floating/ReturnPct 为该池持久化的累计表现：买入按成交成本累计（卖出不减，
+// 收益仍记该池），卖出按实现盈亏累计，浮动盈亏按当前持仓现价估算；
+// 总涨跌幅 = (已实现 + 浮动) / 累计买入成本。Stats 为该池独立的绩效/信号质量汇总（前端
+// 切换到该池 tab 时，页顶统计卡/信号质量卡据此展示，与全局统计并列）。
 // English: one strategy cash pool's display snapshot (frontend allocation strip).
+// Cost/Realized/Floating/ReturnPct are the pool's persisted cumulative performance: buys accumulate
+// cost (never reduced on sells — P&L stays attributed to the pool), sells accumulate realized P&L,
+// floating P&L is marked from the open positions; total return = (realized + floating) / cumulative cost.
+// Stats is the pool's own performance/signal-quality summary (the top stat cards & quality cards render
+// from it when this pool tab is selected, alongside the global stats).
 type StrategyPoolState struct {
 	Key       string  `json:"key"`       // 策略类型（""=其他/手动池）
 	Label     string  `json:"label"`     // 展示名
 	Cash      float64 `json:"cash"`      // 池内可用现金
 	RatioPct  float64 `json:"ratio_pct"` // 占总现金比例（%）
 	Positions int     `json:"positions"` // 池内持仓数
+	// MaxPos 该池持仓上限（0=不单独设限，仅受全局上限约束；与全局解耦可自定义）。
+	// English: this pool's position cap (0 = no per-pool limit, only the global cap applies; decoupled
+	// from the global cap and customizable).
+	MaxPos    int     `json:"max_pos"`
+	Cost      float64 `json:"cost"`       // 累计买入成本（按买入后计数，卖出不减）
+	Realized  float64 `json:"realized"`   // 已实现盈亏（卖出结算，仍记本池）
+	Floating  float64 `json:"floating"`   // 浮动盈亏（当前持仓市值 - 成本）
+	ReturnPct float64 `json:"return_pct"` // 总涨跌幅（%）= (已实现+浮动)/累计成本
+	Stats     Stats   `json:"stats"`      // 该池独立绩效/信号质量汇总（前端分仓 tab 统计卡用）
+}
+
+// PoolPerf 一个战法资金池的持久化表现（成本基准 + 已实现盈亏）。
+// English: a strategy pool's persisted performance (cost basis + realized P&L).
+type PoolPerf struct {
+	Cost     float64 `json:"cost"`     // 累计买入成本（按买入后计数，卖出不减）
+	Realized float64 `json:"realized"` // 已实现盈亏（卖出结算，仍记本池）
 }
 
 // strategyPoolLabel 战法池类型 → 展示名。
@@ -214,15 +239,17 @@ func strategyPoolLabel(t string) string {
 type Engine struct {
 	cfg Config
 
-	mu        sync.Mutex
-	cash      float64
-	pools     map[string]float64 // 战法资金池：key=策略类型（""=其他/手动池），Σpools == cash
-	poolTypes []string           // 启用的战法类型（不含 ""），保持有序；空=未分仓（单池）
-	positions map[string]*Position
-	trades    []Trade
-	equity    []EquityPoint
-	realized  float64 // 已实现盈亏累计
-	path      string
+	mu         sync.Mutex
+	cash       float64
+	pools      map[string]float64   // 战法资金池：key=策略类型（""=其他/手动池），Σpools == cash
+	poolTypes  []string             // 启用的战法类型（不含 ""），保持有序；空=未分仓（单池）
+	poolPerf   map[string]*PoolPerf // 战法资金池持久化表现：key=策略类型（买入累计成本/已实现盈亏）
+	poolMaxPos map[string]int       // 每池持仓上限：key=策略类型（0=该池不单独设限，仅受全局上限约束；可自定义）
+	positions  map[string]*Position
+	trades     []Trade
+	equity     []EquityPoint
+	realized   float64 // 已实现盈亏累计
+	path       string
 }
 
 // New 创建模拟盘引擎并加载历史持久化数据。
@@ -235,11 +262,13 @@ func New(cfg Config, path string) *Engine {
 		cfg.InitialCapital = 100000
 	}
 	e := &Engine{
-		cfg:       cfg,
-		cash:      cfg.InitialCapital,
-		pools:     map[string]float64{"": cfg.InitialCapital}, // 默认单池（未分仓）兼容
-		positions: make(map[string]*Position),
-		path:      path,
+		cfg:        cfg,
+		cash:       cfg.InitialCapital,
+		pools:      map[string]float64{"": cfg.InitialCapital}, // 默认单池（未分仓）兼容
+		poolPerf:   make(map[string]*PoolPerf),
+		poolMaxPos: make(map[string]int),
+		positions:  make(map[string]*Position),
+		path:       path,
 	}
 	if path != "" {
 		e.load()
@@ -284,6 +313,14 @@ type persistedState struct {
 	// back to the single pool {"": cash}, identical to pre-allocation behavior.
 	Pools     map[string]float64 `json:"pools,omitempty"`
 	PoolTypes []string           `json:"pool_types,omitempty"`
+	// PoolMaxPos 每池持仓上限（key=策略类型，0=该池不单独设限；跨重启保留）。
+	// English: per-pool position caps (key = strategy type, 0 = no per-pool limit; survives restarts).
+	PoolMaxPos map[string]int `json:"pool_max_pos,omitempty"`
+	// PoolPerf 战法资金池持久化表现（累计买入成本/已实现盈亏；按买入后计数，卖出仍记本池）。
+	// 旧数据（无 PoolPerf）兼容：load 时按池类型初始化空记录。
+	// English: persisted per-pool performance (cumulative buy cost / realized P&L; counted after buy,
+	// sells still attribute to the pool). Legacy data without PoolPerf initializes empty records on load.
+	PoolPerf map[string]*PoolPerf `json:"pool_perf,omitempty"`
 }
 
 // tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
@@ -309,6 +346,8 @@ func (e *Engine) persist() {
 		Realized:       e.realized,
 		Pools:          e.pools,
 		PoolTypes:      e.poolTypes,
+		PoolMaxPos:     e.poolMaxPos,
+		PoolPerf:       e.poolPerf,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -368,7 +407,66 @@ func (e *Engine) load() {
 	} else {
 		e.pools = map[string]float64{"": e.cash}
 	}
+	// 恢复战法资金池持久化表现：旧数据无 PoolPerf 时按池类型初始化空记录。
+	// English: restore persisted pool performance; legacy data without PoolPerf gets empty records.
+	if st.PoolPerf != nil {
+		e.poolPerf = st.PoolPerf
+	}
+	// 恢复每池持仓上限（旧数据无则留空，各池不单独设限）。
+	// English: restore per-pool position caps (legacy data leaves them empty — no per-pool limits).
+	if st.PoolMaxPos != nil {
+		e.poolMaxPos = st.PoolMaxPos
+	}
+	e.backfillPoolPerfLocked()
 	e.trimTradesLocked()
+}
+
+// backfillPoolPerfLocked 兼容迁移：保证每个池的累计成本基准 ≥ 当前持仓成本合计。
+// 旧数据（分仓性能统计上线前建的池）没有完整 PoolPerf.Cost：即使有少量新买入累计了成本，
+// 历史持仓的成本从未记入池，导致分母偏小、浮盈/浮亏被异常放大（如 -150%）。
+// 回填 = max(池已记成本, 当前持仓成本合计)，只补足缺失部分：
+//   - 正常按新代码累计的池（Cost 已含全部买入，≥ 持仓成本）不受影响；
+//   - 只有持仓成本未记入的旧池会补到持仓成本合计（作为部署资本的下限基准）。
+//
+// 调用方须持锁；有变更则落盘。
+// English: compatibility migration — guarantees every pool's cumulative-cost basis ≥ the sum of its
+// open positions' cost. Legacy pools (created before the pool-performance feature) lack a complete
+// PoolPerf.Cost: even if a few post-upgrade buys accrued cost, the historical positions' cost was never
+// recorded, shrinking the denominator and blowing up floating P&L into absurd percentages (e.g. -150%).
+// Backfill = max(recorded cost, open-position cost sum), only topping up the shortfall:
+//   - pools already accruing full cost under the new code (Cost ≥ position cost) are untouched;
+//   - only legacy pools whose position cost was never recorded get topped up to their position-cost sum
+//     (a floor basis for the actually deployed capital).
+//
+// Caller must hold the lock; persists on any change.
+func (e *Engine) backfillPoolPerfLocked() {
+	if len(e.positions) == 0 {
+		return
+	}
+	if e.poolPerf == nil {
+		e.poolPerf = make(map[string]*PoolPerf)
+	}
+	changed := false
+	// 按池汇总当前持仓成本
+	posCost := map[string]float64{}
+	for _, p := range e.positions {
+		posCost[p.StrategyType] += p.Cost
+	}
+	for k, cost := range posCost {
+		perf := e.poolPerf[k]
+		if perf == nil {
+			e.poolPerf[k] = &PoolPerf{Cost: cost}
+			changed = true
+			continue
+		}
+		if perf.Cost < cost {
+			perf.Cost = cost
+			changed = true
+		}
+	}
+	if changed {
+		e.persist()
+	}
 }
 
 // trimTradesLocked 清理超过保留期（3 个月）的成交记录（调用方须持锁）。
@@ -419,15 +517,6 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
 			return
 		}
-		var price float64
-		if q, ok := quotes[s.Code]; ok && q != nil && q.Price > 0 {
-			price = q.Price
-		} else if s.Price > 0 {
-			// 行情缺失回退信号价（尽量避免该票长期滞留在参考价上；成交仍以实时优先）
-			price = s.Price
-		} else {
-			continue
-		}
 		// 战法分池：按信号 StrategyType 归池；类型未启用（无对应池）时跳过该信号，
 		// 空类型（watch/手动）走"其他池"。池扣款由 fillLocked 完成。
 		// English: strategy pooling — the signal debits its own pool by StrategyType; a type without a
@@ -438,11 +527,40 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 				continue
 			}
 		}
+		var price float64
+		if q, ok := quotes[s.Code]; ok && q != nil && q.Price > 0 {
+			price = q.Price
+		} else if s.Price > 0 {
+			// 行情缺失回退信号价（尽量避免该票长期滞留在参考价上；成交仍以实时优先）
+			price = s.Price
+		} else {
+			continue
+		}
+		// 每池持仓上限（与全局上限解耦，可自定义）：该池已持仓数 ≥ 池上限时跳过该信号。
+		// 池上限 0 = 该池不单独设限（仅受全局上限约束）；Σ池上限 ≤ 全局上限（前端配置时守恒校验）。
+		// English: per-pool position cap (decoupled from the global cap, customizable) — skip the signal
+		// when the pool already holds >= its cap. 0 = no per-pool limit (global cap only); Σpool caps ≤
+		// the global cap (conserved by the frontend config).
+		if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
+			continue
+		}
 		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 		}
 	}
 	e.persist()
+}
+
+// poolPositionCountLocked 返回某池当前持仓数（须持锁调用）。
+// English: returns the current position count of a pool (caller must hold the lock).
+func (e *Engine) poolPositionCountLocked(poolKey string) int {
+	n := 0
+	for _, p := range e.positions {
+		if p.StrategyType == poolKey {
+			n++
+		}
+	}
+	return n
 }
 
 // fillLocked 按给定价格撮合一笔买入（调用方须持锁）。返回错误信息。
@@ -455,6 +573,14 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 // qty <= 0 auto-sizes to FixedAmount in whole lots, shrinking to the largest affordable lot on a
 // shortfall (skipping below one lot).
 func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string) error {
+	// 每池持仓上限（与全局上限解耦，可自定义）：该池新开仓达到池上限即拒绝。
+	// 池上限 0 = 该池不单独设限；加仓（已持仓）不在此路径（走 addToPositionLocked）。
+	// English: per-pool position cap (decoupled from the global cap, customizable) — a new open in this
+	// pool is rejected once the pool reaches its cap. 0 = no per-pool limit; add-ons (already held) don't
+	// pass through here (they use addToPositionLocked).
+	if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
+		return errMaxPos
+	}
 	explicitQty := qty > 0
 	if !explicitQty {
 		qty = int(e.cfg.FixedAmount/price/100) * 100
@@ -478,6 +604,13 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	}
 	e.pools[poolKey] = pool - cost
 	e.cash -= cost
+	// 买入后计数：累计买入成本计入本池（卖出不减，收益仍记该池）。
+	// English: counted after buy — the buy cost accumulates to the pool (never reduced on sells, so
+	// P&L stays attributed to the pool).
+	if e.poolPerf[poolKey] == nil {
+		e.poolPerf[poolKey] = &PoolPerf{}
+	}
+	e.poolPerf[poolKey].Cost += cost
 	e.positions[code] = &Position{
 		Code:         code,
 		Name:         name,
@@ -585,20 +718,32 @@ func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, 
 	return nil
 }
 
-// addToPositionLocked 已持仓加仓：加权平均成本、追加买入记录、从"其他池"扣款（须持锁调用）。
+// addToPositionLocked 已持仓加仓：加权平均成本、追加买入记录、从该持仓所属战法池扣款（须持锁调用）。
+// 手动加仓归原持仓池（按持仓记录的 StrategyType；旧数据/空 = 其他池），与买入回池语义一致：
+// 加仓成本记入该池累计成本，卖出时收益仍记该池。
 // English: adds to an existing position — quantity up, cost averaged, an extra buy fill appended, cash
-// debited from the "other" pool (caller must hold the lock).
+// debited from the position's own strategy pool (caller must hold the lock). A manual add-on goes to the
+// pool the position belongs to (per its recorded StrategyType; empty/legacy = the other pool), matching
+// the buy-into-pool semantics: the add-on cost accrues to that pool's cumulative cost, and sale proceeds
+// still attribute to it.
 func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, signalPrice, price float64, qty int, reason string) error {
 	if qty <= 0 {
 		return errLotTooSmall
 	}
 	cost := float64(qty) * price
-	pool := e.pools[""]
+	poolKey := p.StrategyType // 加仓归原持仓池
+	pool := e.pools[poolKey]
 	if cost > pool {
 		return errCash
 	}
-	e.pools[""] = pool - cost
+	e.pools[poolKey] = pool - cost
 	e.cash -= cost
+	// 加仓成本照记入该池，保证池累计表现不遗漏。
+	// English: the add-on cost accrues to the pool so its cumulative performance stays complete.
+	if e.poolPerf[poolKey] == nil {
+		e.poolPerf[poolKey] = &PoolPerf{}
+	}
+	e.poolPerf[poolKey].Cost += cost
 	p.Cost += cost
 	p.Qty += qty
 	p.CostPrice = p.Cost / float64(p.Qty)
@@ -607,7 +752,7 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 		Code:         code,
 		Name:         name,
 		Strategy:     strategy,
-		StrategyType: "",
+		StrategyType: poolKey,
 		Side:         "buy",
 		Price:        price,
 		SignalPrice:  signalPrice,
@@ -616,7 +761,7 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 		Time:         time.Now(),
 		Reason:       reason,
 	})
-	log.Printf("[paper] 模拟加仓 %s(%s) +%d股 @%.2f 现持%d股 均价%.3f", code, name, qty, price, p.Qty, p.CostPrice)
+	log.Printf("[paper] 模拟加仓 %s(%s) +%d股 @%.2f 现持%d股 均价%.3f 池=%s", code, name, qty, price, p.Qty, p.CostPrice, strategyPoolLabel(poolKey))
 	e.persist()
 	return nil
 }
@@ -736,6 +881,13 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 	e.pools[p.StrategyType] += proceeds
 	e.cash += proceeds
 	e.realized += (price - p.CostPrice) * float64(qty)
+	// 卖出结算：已实现盈亏计入本池（卖出仍记分仓资金池，跨重启保留）。
+	// English: sale settlement — realized P&L credits the position's own pool (sells still attribute
+	// to the pool, persisted across restarts).
+	if e.poolPerf[p.StrategyType] == nil {
+		e.poolPerf[p.StrategyType] = &PoolPerf{}
+	}
+	e.poolPerf[p.StrategyType].Realized += (price - p.CostPrice) * float64(qty)
 	p.Qty -= qty
 	e.trades = append(e.trades, Trade{
 		Code:         p.Code,
@@ -764,6 +916,13 @@ func (e *Engine) sellAllLocked(p *Position, price float64) error {
 	e.pools[p.StrategyType] += proceeds
 	e.cash += proceeds
 	e.realized += proceeds - p.Cost
+	// 清仓结算：已实现盈亏计入本池（卖出仍记分仓资金池，跨重启保留）。
+	// English: close settlement — realized P&L credits the position's own pool (sells still attribute
+	// to the pool, persisted across restarts).
+	if e.poolPerf[p.StrategyType] == nil {
+		e.poolPerf[p.StrategyType] = &PoolPerf{}
+	}
+	e.poolPerf[p.StrategyType].Realized += proceeds - p.Cost
 	e.trades = append(e.trades, Trade{
 		Code:         p.Code,
 		Name:         p.Name,
@@ -814,14 +973,35 @@ func (e *Engine) SetStrategyPools(types []string) {
 func (e *Engine) rebuildPoolsLocked() {
 	if len(e.poolTypes) == 0 {
 		e.pools = map[string]float64{"": e.cash}
-		return
+	} else {
+		keys := append([]string(nil), e.poolTypes...)
+		keys = append(keys, "") // 其他/手动池
+		share := e.cash / float64(len(keys))
+		e.pools = make(map[string]float64, len(keys))
+		for _, k := range keys {
+			e.pools[k] = share
+		}
 	}
-	keys := append([]string(nil), e.poolTypes...)
-	keys = append(keys, "") // 其他/手动池
-	share := e.cash / float64(len(keys))
-	e.pools = make(map[string]float64, len(keys))
-	for _, k := range keys {
-		e.pools[k] = share
+	// 池集合变化：为每个池确保持久化表现记录存在（保留已有 Cost/Realized）。
+	// English: on a pool-set change, ensure each pool has a persisted-performance record (keeps any
+	// existing Cost/Realized).
+	if e.poolPerf == nil {
+		e.poolPerf = make(map[string]*PoolPerf)
+	}
+	for k := range e.pools {
+		if e.poolPerf[k] == nil {
+			e.poolPerf[k] = &PoolPerf{}
+		}
+	}
+	// 池集合变化：为每个池初始化持仓上限记录（0=该池不单独设限）。
+	// English: ensure each pool has a position-cap entry (0 = no per-pool limit).
+	if e.poolMaxPos == nil {
+		e.poolMaxPos = make(map[string]int)
+	}
+	for k := range e.pools {
+		if _, ok := e.poolMaxPos[k]; !ok {
+			e.poolMaxPos[k] = 0
+		}
 	}
 }
 
@@ -839,8 +1019,9 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// StrategyPools 返回各战法资金池的展示快照（前端分仓条：池余量/占比/持仓数）。
-// English: returns each strategy pool's display snapshot (frontend allocation strip: balance/ratio/positions).
+// StrategyPools 返回各战法资金池的展示快照（前端分仓条：池余量/占比/持仓数/累计表现）。
+// English: returns each strategy pool's display snapshot (frontend allocation strip:
+// balance/ratio/positions/cumulative performance).
 func (e *Engine) StrategyPools() []StrategyPoolState {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -859,13 +1040,35 @@ func (e *Engine) StrategyPools() []StrategyPoolState {
 			ratio = cash / total * 100
 		}
 		cnt := 0
+		floating := 0.0
 		for _, p := range e.positions {
 			if p.StrategyType == k {
 				cnt++
+				floating += p.PnL()
 			}
 		}
+		perf := e.poolPerf[k]
+		var cost, realized float64
+		if perf != nil {
+			cost = perf.Cost
+			realized = perf.Realized
+		}
+		retPct := 0.0
+		if cost > 0 {
+			retPct = (realized + floating) / cost * 100
+		}
 		out = append(out, StrategyPoolState{
-			Key: k, Label: strategyPoolLabel(k), Cash: cash, RatioPct: ratio, Positions: cnt,
+			Key:       k,
+			Label:     strategyPoolLabel(k),
+			Cash:      cash,
+			RatioPct:  ratio,
+			Positions: cnt,
+			MaxPos:    e.poolMaxPos[k],
+			Cost:      round2(cost),
+			Realized:  round2(realized),
+			Floating:  round2(floating),
+			ReturnPct: round2(retPct),
+			Stats:     e.statsFor(&k),
 		})
 	}
 	return out
@@ -900,6 +1103,7 @@ func (e *Engine) Reconfigure(initialCapital float64, maxPositions int) {
 	e.positions = make(map[string]*Position)
 	e.equity = nil
 	e.realized = 0
+	e.poolPerf = make(map[string]*PoolPerf)
 	e.rebuildPoolsLocked() // 新资金按当前池集合重新均分
 	e.persist()
 }
@@ -917,7 +1121,50 @@ func (e *Engine) Reset() {
 	e.trades = nil
 	e.equity = nil
 	e.realized = 0
+	e.poolPerf = make(map[string]*PoolPerf)
 	e.rebuildPoolsLocked() // 现金恢复后按当前池集合重新均分
+	e.persist()
+}
+
+// ResetPool 单池清盘：只清该战法资金池的持仓与持久化表现（按最后估值价平仓回补池现金，
+// 累计成本/已实现盈亏归零），其余池与全局净值/成交日志不受影响。
+// 对应前端"清盘本池"按钮（选中某分仓 tab 时出现）。
+// English: ResetPool liquidates a single strategy pool only — closes its positions at the last mark
+// price (proceeds return to the pool), zeroing that pool's cumulative cost/realized, while other pools
+// and the global equity/fill log are untouched. Backs the frontend "清盘本池" button (shown when a
+// pool tab is selected).
+func (e *Engine) ResetPool(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	proceeds := 0.0
+	closed := 0
+	for code, p := range e.positions {
+		if p.StrategyType == key {
+			proceeds += p.MarketValue()
+			delete(e.positions, code)
+			closed++
+		}
+	}
+	if proceeds > 0 {
+		e.pools[key] += proceeds
+		e.cash += proceeds
+	}
+	if e.poolPerf[key] != nil {
+		e.poolPerf[key].Cost = 0
+		e.poolPerf[key].Realized = 0
+	}
+	// 清掉该池成交记录（该池已清盘，避免统计仍从全局日志累出信号数）
+	// English: drop the pool's fills (the pool is liquidated, so stats must not count its fills again).
+	if len(e.trades) > 0 {
+		out := e.trades[:0]
+		for _, t := range e.trades {
+			if t.StrategyType != key {
+				out = append(out, t)
+			}
+		}
+		e.trades = out
+	}
+	log.Printf("[paper] 单池清盘 %s：平仓 %d 笔回池 %.2f", strategyPoolLabel(key), closed, proceeds)
 	e.persist()
 }
 
@@ -967,6 +1214,94 @@ func (e *Engine) SetMaxPositions(n int) {
 	e.persist()
 }
 
+// SetPoolCaps 设置每池持仓上限（key=策略类型；n<=0 = 该池不单独设限）。
+// 与全局持仓上限解耦：池上限是全局上限之内的子约束，Σ池上限 ≤ 全局上限由调用方（前端）守恒校验。
+// 池集合变化的池自动初始化；仅覆盖传入的池，其余保留。持久化。
+// English: sets per-pool position caps (key = strategy type; n<=0 = no per-pool limit). Decoupled from
+// the global cap — pool caps are sub-constraints within it; Σpool caps ≤ the global cap is conserved by
+// the caller (frontend). Only the given pools are set; others keep their values. Persisted.
+func (e *Engine) SetPoolCaps(caps map[string]int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.poolMaxPos == nil {
+		e.poolMaxPos = make(map[string]int)
+	}
+	for k, n := range caps {
+		if n < 0 {
+			n = 0
+		}
+		e.poolMaxPos[k] = n
+	}
+	e.persist()
+}
+
+// SetPoolAllocs 设置每池资金分配（key=策略类型 → 目标现金额），并按总和守恒重排：Σ池现金=总现金，
+// 各池目标额缩放为与总现金一致（总现金含持仓占用，故按当前现金占比分配可用现金）。
+// 仅覆盖传入的池；未传的池按剩余现金均分。持久化。
+// English: sets per-pool cash allocations (key → target cash) with conservation: Σpool cash = total
+// cash, targets scaled to the total. Only the given pools are set; unmentioned pools split the rest
+// evenly. Persisted.
+func (e *Engine) SetPoolAllocs(allocs map[string]float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(allocs) == 0 || len(e.pools) == 0 {
+		return
+	}
+	total := 0.0
+	for _, v := range e.pools {
+		total += v
+	}
+	// 先按传入目标分配，剩余现金再均分给未指定的池
+	assigned := 0.0
+	rest := make([]string, 0, len(e.pools))
+	for k := range e.pools {
+		if v, ok := allocs[k]; ok && v > 0 {
+			e.pools[k] = v
+			assigned += v
+		} else {
+			rest = append(rest, k)
+		}
+	}
+	if assigned >= total {
+		// 目标合计超总现金：等比压缩（守恒）
+		for k := range e.pools {
+			e.pools[k] = e.pools[k] / assigned * total
+		}
+	} else if len(rest) > 0 {
+		remain := total - assigned
+		share := remain / float64(len(rest))
+		for _, k := range rest {
+			e.pools[k] = share
+		}
+	}
+	e.cash = total
+	log.Printf("[paper] 资金分配已自定义：%v 总现金 %.2f", e.pools, total)
+	e.persist()
+}
+
+// ResetPoolAllocs 恢复资金分配为均分（清空自定义分配）：按当前池集合把总现金均分到各池。
+// 保留每池持仓上限（poolMaxPos 不动）。持久化。
+// English: restores the cash allocation to an even split (clears custom allocations): the total cash is
+// split evenly across the current pool set. Per-pool position caps (poolMaxPos) are kept. Persisted.
+func (e *Engine) ResetPoolAllocs() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.pools) == 0 {
+		return
+	}
+	total := 0.0
+	for _, v := range e.pools {
+		total += v
+	}
+	share := total / float64(len(e.pools))
+	for k := range e.pools {
+		e.pools[k] = share
+	}
+	e.cash = total
+	log.Printf("[paper] 资金分配已恢复均分：每池 %.2f 总现金 %.2f", share, total)
+	e.persist()
+}
+
 // Positions 返回持仓快照（按代码排序）。
 // English: returns a snapshot of open positions (sorted by code).
 func (e *Engine) Positions() []Position {
@@ -1001,33 +1336,83 @@ func (e *Engine) Equity() []EquityPoint {
 	return out
 }
 
-// Stats 汇总绩效与信号质量指标。
-// English: aggregates performance and signal-quality metrics.
+// Stats 汇总绩效与信号质量指标（全账号）。
+// English: aggregates performance and signal-quality metrics (whole account).
 func (e *Engine) Stats() Stats {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	mv := e.marketValueLocked()
-	total := e.cash + mv
-	st := Stats{
-		InitialCapital: e.cfg.InitialCapital,
-		Cash:           e.cash,
-		MarketValue:    mv,
-		TotalValue:     total,
-		RealizedPnl:    e.realized,
-		OpenPositions:  len(e.positions),
+	return e.statsFor(nil)
+}
+
+// PoolStats 返回某战法资金池的独立绩效/信号质量汇总（前端分仓 tab 统计卡用）。
+// 收益基准 = 该池累计买入成本（按买入后计数），已实现盈亏 = 该池持久化 realized。
+// English: returns a strategy pool's own performance/signal-quality summary (used by the frontend
+// stat cards when that pool tab is selected). The return basis is the pool's cumulative buy cost
+// (counted after buy); realized P&L is the pool's persisted realized value.
+func (e *Engine) PoolStats(key string) Stats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.statsFor(&key)
+}
+
+// statsFor 汇总绩效与信号质量。poolKey 为 nil = 全账号；否则仅统计该战法池
+// （现金=池余量、持仓=池内持仓、成交=池内成交、收益基准=池累计买入成本）。
+// 调用方须持锁。English: aggregates performance/signal quality. nil poolKey = whole account;
+// otherwise scoped to that strategy pool (cash=pool balance, positions=fills scoped to the pool,
+// return basis=pool cumulative buy cost). Caller must hold the lock.
+func (e *Engine) statsFor(poolKey *string) Stats {
+	global := poolKey == nil
+	matches := func(t string) bool { return global || t == *poolKey }
+	cash := e.cash
+	if !global {
+		cash = e.pools[*poolKey]
 	}
-	if e.cfg.InitialCapital > 0 {
-		st.TotalReturnPct = (total - e.cfg.InitialCapital) / e.cfg.InitialCapital * 100
-	}
-	// 当日收益：最新净值 vs 前一交易日净值
-	if len(e.equity) >= 2 {
-		prev := e.equity[len(e.equity)-2].Value
-		cur := e.equity[len(e.equity)-1].Value
-		if prev > 0 {
-			st.TodayReturnPct = (cur - prev) / prev * 100
+	mv := 0.0
+	openPos := 0
+	for _, p := range e.positions {
+		if matches(p.StrategyType) {
+			mv += p.MarketValue()
+			openPos++
 		}
 	}
-	st.EquityCurvePoints = len(e.equity)
+	total := cash + mv
+	st := Stats{
+		Cash:          cash,
+		MarketValue:   mv,
+		TotalValue:    total,
+		OpenPositions: openPos,
+	}
+	if global {
+		st.InitialCapital = e.cfg.InitialCapital
+		st.RealizedPnl = e.realized
+		if e.cfg.InitialCapital > 0 {
+			st.TotalReturnPct = (total - e.cfg.InitialCapital) / e.cfg.InitialCapital * 100
+		}
+		// 当日收益：最新净值 vs 前一交易日净值
+		if len(e.equity) >= 2 {
+			prev := e.equity[len(e.equity)-2].Value
+			cur := e.equity[len(e.equity)-1].Value
+			if prev > 0 {
+				st.TodayReturnPct = (cur - prev) / prev * 100
+			}
+		}
+		st.EquityCurvePoints = len(e.equity)
+	} else {
+		perf := e.poolPerf[*poolKey]
+		if perf != nil {
+			st.InitialCapital = perf.Cost
+			st.RealizedPnl = perf.Realized
+		}
+		if st.InitialCapital > 0 {
+			floating := 0.0
+			for _, p := range e.positions {
+				if p.StrategyType == *poolKey {
+					floating += p.PnL()
+				}
+			}
+			st.TotalReturnPct = (st.RealizedPnl + floating) / st.InitialCapital * 100
+		}
+	}
 
 	// 胜率：按卖出记录相对对应持仓成本估算（简化：盈利卖出笔数 / 卖出笔数）
 	wins, sells := 0, 0
@@ -1035,6 +1420,9 @@ func (e *Engine) Stats() Stats {
 	var sumSlip, sumLat float64
 	var maxLat int64
 	for _, t := range e.trades {
+		if !matches(t.StrategyType) {
+			continue
+		}
 		if t.Side == "buy" {
 			if t.SignalPrice > 0 {
 				sumSlip += (t.Price - t.SignalPrice) / t.SignalPrice * 100
@@ -1052,7 +1440,7 @@ func (e *Engine) Stats() Stats {
 			// 查找对应买入价：按代码向前匹配最近一笔 buy
 			for i := len(e.trades) - 1; i >= 0; i-- {
 				bt := e.trades[i]
-				if bt.Side == "buy" && bt.Code == t.Code && bt.Time.Before(t.Time) {
+				if bt.Side == "buy" && matches(bt.StrategyType) && bt.Code == t.Code && bt.Time.Before(t.Time) {
 					if (t.Price-bt.Price)*float64(t.Qty) > 0 {
 						wins++
 					}

@@ -76,6 +76,26 @@ $SCP "$APP_DIR/deploy/Caddyfile" $SERVER_USER@$SERVER_IP:/tmp/Caddyfile
 $SSH "sudo mkdir -p /etc/caddy"
 $SSH "sudo mv /tmp/Caddyfile /etc/caddy/Caddyfile"
 $SSH "sudo chown root:root /etc/caddy/Caddyfile && sudo chmod 644 /etc/caddy/Caddyfile"
+# 同服务器另一项目（翻译助手）：translator 站点通过 `import /etc/caddy/translator.conf` 引入，
+# 本文件只含本站点 + import 行（不内联 translator），保证另一项目配置独立。
+# 若服务器尚无 translator.conf（另一项目未部署过），用本仓库 deploy/caddy/translator.conf 兜底，
+# 避免 caddy import 缺失文件启动失败。
+# English: the translator project on the same server is imported via `import /etc/caddy/translator.conf`;
+# this file only contains this site + the import line (translator is never inlined), keeping the other
+# project's config independent. If the server lacks translator.conf (other project not yet deployed),
+# fall back to deploy/caddy/translator.conf so caddy's import doesn't fail to start.
+if $SSH "sudo test -f /etc/caddy/translator.conf"; then
+    echo "      translator.conf 已存在（另一项目部署过），保留服务器现有文件"
+else
+    if [ -f "$APP_DIR/deploy/caddy/translator.conf" ]; then
+        $SCP "$APP_DIR/deploy/caddy/translator.conf" $SERVER_USER@$SERVER_IP:/tmp/translator.conf
+        $SSH "sudo mv /tmp/translator.conf /etc/caddy/translator.conf"
+        $SSH "sudo chown root:root /etc/caddy/translator.conf && sudo chmod 644 /etc/caddy/translator.conf"
+        echo "      translator.conf 不存在，已用本仓库兜底文件部署"
+    else
+        echo "      [warn] 未找到 deploy/caddy/translator.conf，且服务器无该文件——import 将导致 caddy 启动失败"
+    fi
+fi
 
 # ── 3. 数据目录 + 运行用户 ──
 echo "[3/8] 初始化数据目录与运行用户..."

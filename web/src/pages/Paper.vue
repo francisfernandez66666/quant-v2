@@ -28,82 +28,101 @@
                :disabled="!enabled" class="cap-input cap-max" placeholder="持仓上限" title="持仓上限（0=不设限，由资金决定持仓）" />
         <button class="btn-confirm" :disabled="!enabled" @click="confirmDeposit">注入资金</button>
         <button class="btn-reset" :disabled="!enabled" @click="doReset">清盘重置</button>
+        <button class="btn-config" :disabled="!enabled" title="分仓资金分配 + 每池持仓上限（与全局解耦可自定义）"
+                @click="openPoolConfig">分仓配置</button>
       </div>
     </div>
 
-    <!-- 分仓条：当前启用战法的资金池余量（Strategy-pool allocation strip）-->
+    <!-- 分仓条：当前启用战法的资金池（可点按筛选持仓/成交，展示各池累计涨跌幅）
+         (Strategy-pool allocation strip — clickable tabs that filter positions/fills and show each
+         pool's cumulative return since buy) -->
     <div class="pools-bar" v-if="enabled && pools.length">
       <div class="pools-title">分仓资金池</div>
+      <div class="pool-chip" :class="{ active: activePool === null }" @click="activePool = null">
+        <span class="pool-label">全部</span>
+        <span class="pool-meta">{{ positions.length }} 仓</span>
+      </div>
       <div class="pool-chip" v-for="p in pools" :key="p.key"
-           :class="{ other: !p.key }" :title="p.key || '其他/手动'">
+           :class="{ active: activePool === (p.key || '__other__'), other: !p.key }"
+           :title="p.key || '其他/手动'" @click="togglePool(p.key)">
         <span class="pool-label">{{ p.label }}</span>
+        <span class="pool-return" :class="pnlCls(p.return_pct)">
+          {{ p.return_pct >= 0 ? '+' : '' }}{{ p.return_pct.toFixed(2) }}%
+        </span>
         <span class="pool-cash">¥{{ fmt(p.cash) }}</span>
         <span class="pool-meta">{{ p.ratio_pct.toFixed(1) }}% · {{ p.positions }} 仓</span>
       </div>
+      <!-- 单池清盘：仅当选中某分仓时出现（只清该池，不影响其他池/全局净值）-->
+      <button v-if="activePool !== null" class="btn-pool-reset"
+              :disabled="!enabled" title="只清当前选中池的持仓与累计表现，不影响其他池与全局净值/成交"
+              @click="confirmPoolReset">清盘本池</button>
     </div>
 
-    <!-- 绩效统计卡（Performance stat cards）-->
-    <div class="stats-grid" v-if="stats">
+    <!-- 绩效统计卡（Performance stat cards；跟随当前分仓 tab 筛选）-->
+    <div class="stats-scope" v-if="enabled && activePool !== null">
+      <span class="stats-scope-tag">统计范围：{{ activePoolLabel }}</span>
+    </div>
+    <div class="stats-grid" v-if="activeStats">
       <div class="stat-card">
         <div class="stat-label">总资产</div>
-        <div class="stat-value">¥{{ fmt(stats.total_value) }}</div>
+        <div class="stat-value">¥{{ fmt(activeStats.total_value) }}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">总收益</div>
-        <div class="stat-value" :class="stats.total_return_pct >= 0 ? 'up' : 'down'">
-          {{ stats.total_return_pct >= 0 ? '+' : '' }}{{ stats.total_return_pct.toFixed(2) }}%
+        <div class="stat-value" :class="activeStats.total_return_pct >= 0 ? 'up' : 'down'">
+          {{ activeStats.total_return_pct >= 0 ? '+' : '' }}{{ activeStats.total_return_pct.toFixed(2) }}%
           <!-- 标注收益计算基数：基于累计投入（注入资金会同步累加），避免"收益百分比失真"的误读 -->
           <!-- Notes the return basis: computed against the cumulative investment (deposits accumulate), so the % reads clearly -->
-          <em class="sub">基于累计投入 ¥{{ fmt(stats.initial_capital) }}</em>
+          <em class="sub">基于累计投入 ¥{{ fmt(activeStats.initial_capital) }}</em>
         </div>
       </div>
       <div class="stat-card">
         <div class="stat-label">当日收益</div>
-        <div class="stat-value" :class="stats.today_return_pct >= 0 ? 'up' : 'down'">
-          {{ stats.today_return_pct >= 0 ? '+' : '' }}{{ stats.today_return_pct.toFixed(2) }}%
+        <div class="stat-value" :class="activeStats.today_return_pct >= 0 ? 'up' : 'down'">
+          {{ activeStats.today_return_pct >= 0 ? '+' : '' }}{{ activeStats.today_return_pct.toFixed(2) }}%
         </div>
       </div>
       <div class="stat-card">
         <div class="stat-label">现金</div>
-        <div class="stat-value">¥{{ fmt(stats.cash) }}</div>
+        <div class="stat-value">¥{{ fmt(activeStats.cash) }}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">持仓市值 / 已实现盈亏</div>
         <div class="stat-value">
-          ¥{{ fmt(stats.market_value) }}
-          <em class="sub" :class="stats.realized_pnl >= 0 ? 'up' : 'down'">
-            {{ stats.realized_pnl >= 0 ? '+' : '' }}¥{{ fmt(stats.realized_pnl) }}
+          ¥{{ fmt(activeStats.market_value) }}
+          <em class="sub" :class="activeStats.realized_pnl >= 0 ? 'up' : 'down'">
+            {{ activeStats.realized_pnl >= 0 ? '+' : '' }}¥{{ fmt(activeStats.realized_pnl) }}
           </em>
         </div>
       </div>
       <div class="stat-card">
         <div class="stat-label">已平仓胜率</div>
-        <div class="stat-value">{{ stats.win_rate_pct.toFixed(0) }}% <em class="sub">/ {{ stats.open_positions }}仓</em></div>
+        <div class="stat-value">{{ activeStats.win_rate_pct.toFixed(0) }}% <em class="sub">/ {{ activeStats.open_positions }}仓</em></div>
       </div>
     </div>
 
     <!-- 信号质量统计卡：仅联动版（admin 自动撮合）有意义（Signal-quality stats, meaningful only on the
          auto-filled admin book）-->
-    <div class="stats-grid quality" v-if="stats && isAdmin">
+    <div class="stats-grid quality" v-if="activeStats && isAdmin">
       <div class="stat-card">
         <div class="stat-label">已撮合买入信号</div>
-        <div class="stat-value">{{ stats.filled_buys }}</div>
+        <div class="stat-value">{{ activeStats.filled_buys }}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">平均成交延迟</div>
-        <div class="stat-value">{{ stats.avg_latency_sec }}s <em class="sub">最大 {{ stats.max_latency_sec }}s</em></div>
+        <div class="stat-value">{{ activeStats.avg_latency_sec }}s <em class="sub">最大 {{ activeStats.max_latency_sec }}s</em></div>
       </div>
       <div class="stat-card">
         <div class="stat-label">平均滑点（成交 vs 信号价）</div>
-        <div class="stat-value" :class="stats.avg_slippage_pct >= 0 ? 'down' : 'up'">
-          {{ stats.avg_slippage_pct >= 0 ? '+' : '' }}{{ stats.avg_slippage_pct.toFixed(2) }}%
+        <div class="stat-value" :class="activeStats.avg_slippage_pct >= 0 ? 'down' : 'up'">
+          {{ activeStats.avg_slippage_pct >= 0 ? '+' : '' }}{{ activeStats.avg_slippage_pct.toFixed(2) }}%
         </div>
       </div>
       <div class="stat-card">
         <div class="stat-label">滑点累计成本</div>
-        <div class="stat-value" :class="stats.slippage_cost >= 0 ? 'down' : 'up'">
-          {{ stats.slippage_cost >= 0 ? '+' : '' }}¥{{ fmt(stats.slippage_cost) }}
-          <em class="sub">占初始 {{ stats.signal_amount_pct.toFixed(2) }}%</em>
+        <div class="stat-value" :class="activeStats.slippage_cost >= 0 ? 'down' : 'up'">
+          {{ activeStats.slippage_cost >= 0 ? '+' : '' }}¥{{ fmt(activeStats.slippage_cost) }}
+          <em class="sub">占初始 {{ activeStats.signal_amount_pct.toFixed(2) }}%</em>
         </div>
       </div>
     </div>
@@ -121,17 +140,17 @@
     <!-- 持仓 / 成交日志 页签（tabs: positions / trade log）-->
     <div class="tabs">
       <button class="tab" :class="{ active: tab === 'positions' }" @click="tab = 'positions'">
-        当前持仓 <em class="sub">{{ positions.length }} 只</em>
+        当前持仓 <em class="sub">{{ filteredPositions.length }} 只</em>
       </button>
       <button class="tab" :class="{ active: tab === 'trades' }" @click="tab = 'trades'">
-        成交日志 <em class="sub">{{ trades.length }} 笔 · 近3月</em>
+        成交日志 <em class="sub">{{ filteredTrades.length }} 笔 · 近3月</em>
       </button>
     </div>
 
     <!-- 持仓列表：div-grid（照搬真实持仓页模式：行内字段 + 分时展开 + 移动端 sheet）-->
     <div class="panel" v-if="tab === 'positions'">
-      <div class="panel-title">当前持仓 <em class="sub">{{ positions.length }} 只</em></div>
-      <div class="positions-table" v-if="positions.length">
+      <div class="panel-title">当前持仓 <em class="sub">{{ filteredPositions.length }} 只</em></div>
+      <div class="positions-table" v-if="filteredPositions.length">
         <div class="table-header">
           <span class="col-code">代码</span>
           <span class="col-name">名称</span>
@@ -140,11 +159,13 @@
           <span class="col-price">现价</span>
           <span class="col-chg">浮盈</span>
           <span class="col-chg">浮盈%</span>
+          <span class="col-chg">滑点</span>
+          <span class="col-num">延迟</span>
           <span class="col-pool">池</span>
           <span class="col-kline">分时</span>
           <span class="col-actions">操作</span>
         </div>
-        <div v-for="p in positions" :key="p.code" class="pos-row-group">
+        <div v-for="p in filteredPositions" :key="p.code" class="pos-row-group">
           <div class="table-row" @click="onRowTap(p)">
             <span class="col-code" data-label="代码">{{ p.code }}</span>
             <span class="col-name" data-label="名称">{{ p.name }}</span>
@@ -153,6 +174,8 @@
             <span class="col-price" data-label="现价">{{ (p.mark || 0).toFixed(2) }}</span>
             <span :class="['col-chg', pnlCls(p.pnl)]" data-label="浮盈">{{ fmt(p.pnl) }}</span>
             <span :class="['col-chg', pnlCls(p.pnl)]" data-label="浮盈%">{{ fmt(p.pnl_pct) }}%</span>
+            <span :class="['col-chg', pnlCls(p.slippage_pct)]" data-label="滑点">{{ fmt(p.slippage_pct) }}%</span>
+            <span class="col-num" data-label="延迟">{{ p.latency_sec }}s</span>
             <span class="col-pool" data-label="池">
               <span class="tag">{{ poolLabel(p.strategy_type) }}</span>
             </span>
@@ -183,8 +206,8 @@
 
     <!-- 成交日志：div-grid（同模式：行内字段 + 分时展开 + 移动端 sheet）-->
     <div class="panel" v-if="tab === 'trades'">
-      <div class="panel-title">成交日志 <em class="sub">{{ trades.length }} 笔 · 近3个月</em></div>
-      <div class="positions-table" v-if="trades.length">
+      <div class="panel-title">成交日志 <em class="sub">{{ filteredTrades.length }} 笔 · 近3个月</em></div>
+      <div class="positions-table" v-if="filteredTrades.length">
         <div class="table-header">
           <span class="col-time">时间</span>
           <span class="col-side">方向</span>
@@ -194,9 +217,11 @@
           <span class="col-num">数量</span>
           <span class="col-price">价格</span>
           <span class="col-price">金额</span>
+          <span class="col-chg">滑点</span>
+          <span class="col-num">延迟</span>
           <span class="col-kline">分时</span>
         </div>
-        <div v-for="(t, i) in trades" :key="i" class="pos-row-group">
+        <div v-for="(t, i) in filteredTrades" :key="i" class="pos-row-group">
           <div class="table-row" @click="onTradeTap(t, i)">
             <span class="col-time" data-label="时间">{{ fmtTime(t.time) }}</span>
             <span class="col-side" data-label="方向">
@@ -208,6 +233,8 @@
             <span class="col-num" data-label="数量">{{ t.qty }}</span>
             <span class="col-price" data-label="价格">{{ t.price.toFixed(2) }}</span>
             <span class="col-price" data-label="金额">{{ fmt(t.amount) }}</span>
+            <span :class="['col-chg', tradeSlippageCls(t)]" data-label="滑点">{{ tradeSlippage(t) }}</span>
+            <span class="col-num" data-label="延迟">{{ t.side === 'buy' ? (t.latency_sec || 0) + 's' : '—' }}</span>
             <span class="col-kline" data-label="分时">
               <button class="btn-kline" @click.stop="toggleKline('trade_' + i)">{{ klineOpen.has('trade_' + i) ? '收起' : '分时' }}</button>
             </span>
@@ -275,6 +302,37 @@
         </div>
       </div>
     </div>
+
+    <!-- 分仓配置弹窗：全局持仓上限 + 每池持仓上限/资金分配（与全局解耦可自定义，总和守恒）-->
+    <div class="modal-overlay" v-if="poolConfigOpen" @click.self="poolConfigOpen = false">
+      <div class="modal pool-config-modal">
+        <div class="modal-title">分仓配置</div>
+        <div class="form-row">
+          <label>全局持仓上限</label>
+          <input v-model.number="cfgMaxPos" type="number" min="0" step="1"
+                 placeholder="0=不设限（由资金决定持仓数）" :title="'当前生效 ' + appliedMax" />
+          <span class="static-val">（0=不设限）</span>
+        </div>
+        <div class="config-hint">
+          每池：资金额（元，可空=由其余池均分剩余）+ 持仓上限（0=该池不单独设限）。
+          守恒校验：Σ池资金 ≈ 总现金，Σ池上限 ≤ 全局上限。
+        </div>
+        <div v-for="p in pools" :key="p.key" class="pool-config-row">
+          <span class="pool-config-label">{{ p.label }}</span>
+          <input v-model.number="cfgAllocs[p.key]" type="number" min="0" step="1000" class="cfg-input"
+                 :placeholder="'当前 ¥' + fmt(p.cash)" title="该池资金额（空=自动均分剩余）" />
+          <input v-model.number="cfgCaps[p.key]" type="number" min="0" step="1" class="cfg-input cfg-cap"
+                 :placeholder="p.max_pos > 0 ? '当前 ' + p.max_pos : '不单独设限'" title="该池持仓上限（0=不单独设限）" />
+        </div>
+        <div class="preview" v-if="cfgWarn">
+          {{ cfgWarn }}
+        </div>
+        <div class="modal-actions">
+          <button class="btn-cancel" @click="poolConfigOpen = false">取消</button>
+          <button class="btn-confirm" @click="savePoolConfig">保存</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -297,8 +355,15 @@ const positions = ref([])        // 当前持仓
 const trades = ref([])           // 成交记录
 const equity = ref([])           // 净值序列
 const pools = ref([])            // 分仓资金池快照（strategy_pools）
+const activePool = ref(null)     // 当前筛选的分仓（null=全部；池 key，""=其他/手动用 '__other__'）
 const W = 900, H = 220           // 净值折线 SVG 画布尺寸
 let timer = null                 // 轮询定时器
+// ── 分仓配置弹窗（每池资金/上限自定义，与全局解耦，总和守恒）── (Pool-config modal)
+const poolConfigOpen = ref(false)   // 弹窗开关
+const cfgMaxPos = ref(0)            // 弹窗内全局持仓上限
+const cfgAllocs = ref({})           // 每池目标资金额（key=策略类型；空=自动均分剩余）
+const cfgCaps = ref({})             // 每池持仓上限（key=策略类型；0=不单独设限）
+const cfgWarn = ref('')             // 守恒校验提示（Σ资金/Σ上限超限时警示）
 
 // ── 分时展开 / 移动端 sheet（照搬真实持仓页）── (K-line expand / mobile sheet, ported from Positions)
 const klineOpen = ref(new Set())      // 已展开分时的行键集合（持仓=code，成交='trade_'+i）
@@ -344,12 +409,59 @@ function fmt(v) { return (v ?? 0).toLocaleString('zh-CN', { minimumFractionDigit
 function fmtTime(t) { return t ? t.slice(5, 16) : '—' }
 // 涨跌颜色类：非负红（A股习惯红涨），负绿（positive = red per A-share convention）
 function pnlCls(v) { return v >= 0 ? 'up' : 'down' }
-// 战法池展示名（空=其他/手动）
+// 单笔成交滑点%：（成交价 - 信号价）/ 信号价（仅买入有信号价参照；卖出/无信号价显示 —）
+// English: per-fill slippage % — (fill - signal) / signal, only meaningful on buys (sells show —).
+function tradeSlippage(t) {
+  if (t.side !== 'buy' || !(t.signal_price > 0)) return '—'
+  const pct = (t.price - t.signal_price) / t.signal_price * 100
+  return (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%'
+}
+function tradeSlippageCls(t) {
+  if (t.side !== 'buy' || !(t.signal_price > 0)) return ''
+  return t.price >= t.signal_price ? 'down' : 'up'
+}
+// 战法池展示名（空=其他/手动；与后端 strategyPoolLabel 保持一致）
 function poolLabel(k) {
   if (!k) return '其他/手动'
-  const labels = { dragon: '龙头', double_bump: '双板', n_shape: 'N形', dragon_return: '龙回头', factor: '波动突破', pattern: '形态' }
+  const labels = { dragon: '龙回头', double_bump: '双响炮', n_shape: 'N形超短', dragon_return: '龙回头中线', factor: '因子战法', pattern: '形态战法' }
   return labels[k] || k
 }
+
+// 池 key 规范化：空串（其他/手动池）映射为占位 '__other__'，避免与"全部(null)"冲突。
+// English: normalizes a pool key — the empty key (other/manual pool) maps to a sentinel so it never
+// collides with "all (null)".
+function normPoolKey(k) { return k || '__other__' }
+// 点按分仓 tab 切换筛选：再次点击当前池 = 回到全部。
+// English: toggles the pool filter; tapping the active pool again resets to all.
+function togglePool(k) {
+  const key = normPoolKey(k)
+  activePool.value = activePool.value === key ? null : key
+}
+// 按当前分仓筛选持仓 / 成交（全部时不筛选）。
+// English: filters positions / fills by the active pool (no filter when all).
+const filteredPositions = computed(() => {
+  if (activePool.value === null) return positions.value
+  return positions.value.filter(p => normPoolKey(p.strategy_type) === activePool.value)
+})
+const filteredTrades = computed(() => {
+  if (activePool.value === null) return trades.value
+  return trades.value.filter(t => normPoolKey(t.strategy_type) === activePool.value)
+})
+// 当前展示的统计：选中的分仓池用自己的 Stats（总资产/收益/滑点/延迟等随 tab 切换），
+// 未选择（全部）时用全账号 stats。
+// English: the stats currently shown — a selected pool uses its own Stats (total value / return /
+// slippage / latency follow the tab), otherwise the whole-account stats.
+const activeStats = computed(() => {
+  if (activePool.value === null) return stats.value
+  const p = pools.value.find(p => normPoolKey(p.key) === activePool.value)
+  return (p && p.stats) || stats.value
+})
+// 当前选中分仓的展示名（统计范围标签用）。
+// English: display label of the selected pool (for the stats-scope tag).
+const activePoolLabel = computed(() => {
+  const p = pools.value.find(p => normPoolKey(p.key) === activePool.value)
+  return p ? p.label : ''
+})
 
 // ── 分时 / sheet 交互（照搬真实持仓页）── (K-line & sheet interactions, ported from Positions)
 // 展开/收起某行的分时区
@@ -462,6 +574,68 @@ async function confirmDeposit() {
   } catch (e) { alert(e.message || '注入失败') }
 }
 
+// 单池清盘：只清当前选中分仓池的持仓与累计表现（平仓回池现金），其余池与全局净值/成交不受影响。
+// Reset a single pool: closes only the selected pool's positions & persisted perf (proceeds return to
+// the pool); other pools and the global equity/fill log are untouched.
+async function confirmPoolReset() {
+  if (activePool.value === null) return
+  const label = activePoolLabel.value
+  const count = filteredPositions.value.length
+  if (!confirm(`清盘「${label}」资金池？\n将按最后估值价平仓该池 ${count} 笔持仓（回补池现金），并清空该池累计涨跌幅表现。\n其他分仓资金池与全局净值/成交日志不受影响。`)) return
+  try {
+    await api.resetPaperPool(activePool.value === '__other__' ? '' : activePool.value)
+    await load()
+  } catch (e) { alert(e.message || '清盘失败') }
+}
+
+// 打开分仓配置弹窗：回填当前全局上限与各池资金/上限，校验用数据复制一份
+// Open the pool-config modal: prefill the global cap and per-pool cash/caps from the current state.
+function openPoolConfig() {
+  cfgMaxPos.value = appliedMax.value > 0 ? appliedMax.value : 0
+  cfgAllocs.value = {}
+  cfgCaps.value = {}
+  pools.value.forEach(p => {
+    cfgAllocs.value[p.key] = p.cash // 当前池现金作为默认资金（可改）
+    cfgCaps.value[p.key] = p.max_pos || 0
+  })
+  cfgWarn.value = ''
+  poolConfigOpen.value = true
+}
+
+// 保存分仓配置：守恒校验（Σ池资金≈总现金、Σ池上限≤全局上限），通过后提交。
+// Save the pool config: conservation checks (Σpool cash ≈ total cash, Σpool caps ≤ global cap) then submit.
+async function savePoolConfig() {
+  const totalCash = pools.value.reduce((s, p) => s + p.cash, 0)
+  // 资金守恒：填了资金的池求和不得超过总现金（未填的池由后端均分剩余）
+  let assigned = 0
+  Object.values(cfgAllocs.value).forEach(v => { const n = parseFloat(v); if (n > 0) assigned += n })
+  if (assigned > totalCash + 0.01) {
+    cfgWarn.value = `资金超额：Σ池资金 ¥${fmt(assigned)} > 总现金 ¥${fmt(totalCash)}，请调低`
+    return
+  }
+  // 上限守恒：Σ池上限不得超过全局上限（全局 0=不设限时放行）
+  let capSum = 0
+  Object.values(cfgCaps.value).forEach(v => { const n = parseInt(v, 10); if (n > 0) capSum += n })
+  const gCap = parseInt(cfgMaxPos.value, 10)
+  if (gCap > 0 && capSum > gCap) {
+    cfgWarn.value = `持仓上限超额：Σ池上限 ${capSum} > 全局 ${gCap}，请调低各池上限或提高全局上限`
+    return
+  }
+  // 组装提交：仅提交有值的资金/上限（空=后端均分/不单独设限）
+  const allocs = {}, caps = {}
+  pools.value.forEach(p => {
+    const a = parseFloat(cfgAllocs.value[p.key])
+    if (a > 0) allocs[p.key] = a
+    const c = parseInt(cfgCaps.value[p.key], 10)
+    if (c > 0) caps[p.key] = c
+  })
+  try {
+    await api.configPaperPools(gCap, caps, allocs)
+    poolConfigOpen.value = false
+    await load()
+  } catch (e) { alert(e.message || '保存失败') }
+}
+
 // 清盘重置：仅清仓并按配置初始资金重置，不修改自定义资金
 // Reset: liquidate everything and reset to the configured capital, without changing custom settings
 async function doReset() {
@@ -498,6 +672,8 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .btn-confirm:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn-reset { background: rgba(255, 77, 79, 0.12); color: #FF4D4F; border: 1px solid rgba(255, 77, 79, 0.35); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .btn-reset:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-config { background: rgba(124, 77, 255, 0.12); color: #b388ff; border: 1px solid rgba(124, 77, 255, 0.4); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.btn-config:disabled { opacity: 0.4; cursor: not-allowed; }
 .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
 .tab { background: rgba(255, 255, 255, 0.04); color: #8fa3bf; border: 1px solid rgba(255, 255, 255, 0.1); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; }
 .tab.active { background: rgba(255, 77, 79, 0.12); color: #FF4D4F; border-color: rgba(255, 77, 79, 0.4); }
@@ -509,11 +685,24 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 /* ── 分仓资金池条 ── (Strategy-pool allocation strip) */
 .pools-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: #1b1b30; border-radius: 10px; padding: 12px 14px; margin-bottom: 16px; }
 .pools-title { font-size: 12px; color: #8fa3bf; margin-right: 4px; white-space: nowrap; }
-.pool-chip { display: inline-flex; align-items: center; gap: 6px; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+.pool-chip { display: inline-flex; align-items: center; gap: 6px; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; user-select: none; }
+.pool-chip:hover { border-color: rgba(124, 77, 255, 0.5); }
+.pool-chip.active { background: rgba(124, 77, 255, 0.14); border-color: #7c4dff; box-shadow: 0 0 0 1px rgba(124, 77, 255, 0.4); }
 .pool-chip.other { border-style: dashed; opacity: 0.85; }
+.pool-chip.other.active { opacity: 1; }
 .pool-label { color: #b388ff; font-weight: 600; }
+.pool-return { font-weight: 600; }
+.pool-return.up { color: #FF4D4F; }
+.pool-return.down { color: #52c41a; }
 .pool-cash { color: #e6edf3; }
 .pool-meta { color: #8fa3bf; }
+.btn-pool-reset { background: rgba(255, 77, 79, 0.12); color: #FF4D4F; border: 1px solid rgba(255, 77, 79, 0.35); padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 12px; margin-left: auto; white-space: nowrap; }
+.btn-pool-reset:hover { background: rgba(255, 77, 79, 0.22); }
+.btn-pool-reset:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── 统计范围标签（跟随分仓 tab）── (Stats-scope tag, follows the pool tab) */
+.stats-scope { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.stats-scope-tag { font-size: 12px; color: #b388ff; background: rgba(124, 77, 255, 0.12); border: 1px solid rgba(124, 77, 255, 0.35); border-radius: 8px; padding: 3px 10px; }
 
 /* ── 统计卡 ── (Stat cards) */
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 16px; }
@@ -533,9 +722,9 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 
 /* ── 数据表（div-grid，照搬真实持仓页）── (div-grid, ported from the real positions page) */
 .positions-table { background: #16162a; border-radius: 8px; overflow-x: auto; font-size: 13px; white-space: nowrap; }
-.table-header, .table-row { display: flex; align-items: center; padding: 9px 14px; gap: 0; min-width: 980px; }
+.table-header, .table-row { display: flex; align-items: center; padding: 9px 14px; gap: 0; min-width: 1140px; }
 .table-header { background: #22223a; color: #8fa3bf; font-weight: 600; }
-.pos-row-group { border-bottom: 1px solid #22223a; min-width: 980px; }
+.pos-row-group { border-bottom: 1px solid #22223a; min-width: 1140px; }
 .pos-row-group:last-child { border-bottom: none; }
 .table-row:hover { background: rgba(255, 255, 255, 0.03); }
 .col-code  { flex: 1; color: #4fc3f7; text-align: center; }
@@ -581,6 +770,13 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .form-row input:focus { border-color: #FF4D4F; }
 .static-val { color: #e0e0e0; font-size: 14px; white-space: nowrap; }
 .preview { margin: 4px 0 8px 88px; font-size: 14px; color: #b388ff; }
+.config-hint { font-size: 12px; color: #8fa3bf; margin: 4px 0 10px; line-height: 1.6; }
+.pool-config-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pool-config-label { width: 90px; color: #b388ff; font-weight: 600; font-size: 13px; flex-shrink: 0; }
+.cfg-input { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid #333; background: #0f0f23; color: #e0e0e0; font-size: 13px; outline: none; min-width: 0; }
+.cfg-input:focus { border-color: #FF4D4F; }
+.cfg-cap { max-width: 120px; }
+.pool-config-modal { width: 480px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .btn-cancel { padding: 8px 20px; border-radius: 6px; border: 1px solid #333; background: transparent; color: #888; font-size: 14px; cursor: pointer; }
 .btn-confirm { padding: 8px 20px; border-radius: 6px; border: none; background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer; }
@@ -590,7 +786,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 /* ── 移动端：横向滚动 + sheet ── (Mobile: horizontal scroll + bottom action sheet) */
 @media (max-width: 768px) {
   .positions-table { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
-  .table-header, .table-row { min-width: 1000px; padding: 9px 12px; }
+  .table-header, .table-row { min-width: 1160px; padding: 9px 12px; }
   .pos-row-group { min-width: 0; }
   .page-header { flex-direction: column; align-items: stretch; gap: 8px; }
   .header-right { flex-wrap: wrap; gap: 8px; }
