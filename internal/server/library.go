@@ -379,7 +379,11 @@ func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	q := r.URL.Query()
-	payload := map[string]any{}
+	// 默认回测起点与夜间研究窗口对齐（20230801）：CLI 裸默认是 20200101，
+	// 手动不传参时会在 8 年区间上做事件合成/装配，小机器上分钟级零反馈。
+	// English: default the manual backtest start to the nightly research window — the CLI bare
+	// default (2020) sweeps 8 years and stalls the small box with zero feedback.
+	payload := map[string]any{"start": "20230801"}
 	for k, key := range map[string]string{"start": "start", "end": "end"} {
 		if v := q.Get(k); v != "" {
 			payload[key] = v
@@ -614,7 +618,7 @@ func (s *Server) handleBacktestList(w http.ResponseWriter, r *http.Request) {
 // btreplay mode); the summary lands in result_text for the backtest tab.
 func (s *Server) enqueuePatternCandidateBacktest(w http.ResponseWriter, r *http.Request, id int64) {
 	q := r.URL.Query()
-	payload := map[string]any{"kind": "pattern", "candidate_id": id}
+	payload := map[string]any{"kind": "pattern", "candidate_id": id, "start": "20230801"}
 	if v := q.Get("start"); v != "" {
 		payload["start"] = v
 	}
