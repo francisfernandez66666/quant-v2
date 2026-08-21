@@ -17,13 +17,13 @@
 package btreplay
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"strconv"
-	"encoding/json"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/config"
@@ -613,12 +613,22 @@ func (o *Options) Run() error {
 			return perr
 		}
 		ads = append(fa, pa...)
+		// 四大手写战法一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape）：
+		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。
+		// English: include the four hand-written strategies in the all-replay as well.
+		for _, name := range []string{"double_bump", "dragon", "dragon_return"} {
+			ad, aerr := newAdapter(name, o.Industry, o.D1Score)
+			if aerr != nil {
+				return aerr
+			}
+			ads = append(ads, ad)
+		}
 		if len(ads) == 0 {
 			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
 			return nil
 		}
-		log.Printf("战法库已加载 %d 条启用规则（factor=%d pattern=%d）",
-			len(ads), len(fa), len(pa))
+		log.Printf("all 回放：%d 条库规则（factor=%d pattern=%d）+ 四大手写战法",
+			len(fa)+len(pa), len(fa), len(pa))
 	} else if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
 		ads, err = loadRuleAdapters(o.Strategy, o.DataDir)
 		if err != nil {

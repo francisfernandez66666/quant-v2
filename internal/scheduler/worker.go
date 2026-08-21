@@ -78,6 +78,25 @@ func (s *Scheduler) openStore(cfg config.SchedulerConfig) *store.DB {
 	return opened
 }
 
+// drainAllowed 出队许可：盘后窗口内恒可；窗口外仅当存在 preempted 遗留任务
+// （续跑排水，见 workerTick 注释）。English: dequeue permission — always inside the evening
+// window; outside it only to drain preempted leftovers.
+func (s *Scheduler) drainAllowed(db *store.DB, cfg config.SchedulerConfig) bool {
+	if NightlyEligible(s.now(), cfg) {
+		return true
+	}
+	leftovers, err := db.ActiveResearchTasks()
+	if err != nil {
+		return false
+	}
+	for _, t := range leftovers {
+		if t.Status == store.TaskPreempted {
+			return true
+		}
+	}
+	return false
+}
+
 // preemptCurrent 抢占/终止当前运行中的子进程（标 preemptReq，等待 runner 落终态）。
 // 触发方：交易时段开始 / 调度器禁用 / 服务退出 / high 抢占 low。幂等。
 // 竞态安全：即使子进程尚未 Start（taskCancel 未就绪），请求也先粘住，runner 就绪后立即补杀。
@@ -107,11 +126,18 @@ func (s *Scheduler) preemptCurrent(reason string) {
 // English: dequeues and starts the next task when idle (after-hours gated). Self-draining entry so a
 // long queue drains continuously without waiting for ticks.
 func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
-	if !NightlyEligible(s.now(), cfg) {
-		return // 盘后硬门控（需求#4）：含手动任务
+	if !s.drainAllowed(db, cfg) {
+		return // 盘后硬门控（需求#4）：未到窗口且无遗留续跑时不出队
 	}
 	next, err := db.DequeueHighestTask()
 	if err != nil || next == nil {
+		return
+	}
+	// 窗口外排水限制：仅 preempted（被抢占遗留）可续跑；普通 queued（含手动新提交）
+	// 必须等到盘后窗口——否则"有遗留"会变成绕过门控的后门。
+	// English: outside the window only preempted rows may run; plain queued (incl. fresh manual
+	// submissions) must wait — otherwise leftovers become a gate bypass.
+	if !NightlyEligible(s.now(), cfg) && next.Status != store.TaskPreempted {
 		return
 	}
 	s.mu.Lock()
@@ -147,11 +173,28 @@ func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
 	if db == nil {
 		return
 	}
-	// 盘后硬门控（需求#4）：未到启动时间/盘中一律不取任务——手动 high 同样排队等待。
+	// 盘后硬门控（需求#4）：未到启动时间/盘中不**新起**任务——手动 high 同样排队等待。
+	// 例外（续跑语义，对齐旧版"在跑的作业让它跑完"）：存在 preempted 遗留任务时，
+	// 非交易时段即允许排水续跑——它们是被会话边界/重启打断的半成品，拖到次日 15:30
+	// 只会让断点缓存白白过期。English: hard gate blocks NEW tasks before the evening window,
+	// except draining preempted leftovers outside sessions (resume semantics).
 	if !NightlyEligible(now, cfg) {
-		return
+		hasLeftover := false
+		if leftovers, err := db.ActiveResearchTasks(); err == nil {
+			for _, t := range leftovers {
+				if t.Status == store.TaskPreempted {
+					hasLeftover = true
+					break
+				}
+			}
+		}
+		if !hasLeftover {
+			return
+		}
+		log.Printf("[scheduler] 盘后窗口未到，但存在被抢占遗留任务——仅排水续跑，不新起任务")
+	} else {
+		s.ensureNightlyEnqueue(db, cfg, now)
 	}
-	s.ensureNightlyEnqueue(db, cfg, now)
 
 	s.mu.Lock()
 	busy := s.busy
@@ -502,9 +545,13 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		}
 	}()
 
-	// 看门狗：仅高优先级手动任务启用（与旧 server 行为一致）；夜间链任务靠硬超时兜底。
+	// 看门狗：仅高优先级手动任务启用；夜间链任务靠硬超时兜底。
+	// 30 分钟（原 15）：B4 单窗装配在整机满负荷期可合法超过 15 分钟无事件完成，
+	// 曾把健康的续跑回测当挂死误杀（#9 error@50% 实录）。
+	// English: stall watchdog raised to 30m — a single window assembly can legitimately exceed 15m
+	// under box saturation; 15m mis-killed a healthy resumed backtest (#9 error@50%).
 	if tk.Priority == "high" {
-		const stallSecs = 15 * 60
+		const stallSecs = 30 * 60
 		watchStop := make(chan struct{})
 		go func() {
 			t := time.NewTicker(time.Minute)
