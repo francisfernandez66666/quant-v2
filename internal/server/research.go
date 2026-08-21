@@ -2,8 +2,11 @@
 package server
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 
 	"quant-trading-v2/internal/factor"
@@ -102,7 +105,30 @@ func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) 
 		"applied":      applied,
 		"proposed":     proposed,
 		"db_attached":  true,
+		"scheduler":    s.schedulerState(),
 	})
+}
+
+// schedulerState 读取 research_state.json 的最近步骤结果（阶段2.4 状态上报）：
+// 返回 {day, step_index, done, last_step, last_status, last_error, last_at}；文件缺失返回 null。
+// 前端自动研究页据此展示「夜间作业最近一步：discover_factors / done|error|timeout」，
+// 杜绝"dataload 卡 21h、step_index 停在 0"这类静默故障无感知。
+// English: reads the latest step outcome from research_state.json ({day, step_index, done, last_step,
+// last_status, last_error, last_at}); null when absent. The auto-research page shows it so silent
+// stalls (a dataload once hung 21h with step_index stuck at 0) become visible.
+func (s *Server) schedulerState() map[string]any {
+	if s.researchDir == "" {
+		return nil
+	}
+	b, err := os.ReadFile(filepath.Join(s.researchDir, "research_state.json"))
+	if err != nil {
+		return nil
+	}
+	var st map[string]any
+	if json.Unmarshal(b, &st) != nil {
+		return nil
+	}
+	return st
 }
 
 // handleResearchCandidates 处理 GET /api/research/candidates：列出候选（默认全部）。

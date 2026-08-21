@@ -310,6 +310,39 @@ func (d *DB) hasColumn(table, column string) (bool, error) {
 	return false, rows.Err()
 }
 
+// QueryRows 执行只读查询，返回 列名→值 的行切片（TEXT 以 string 返回，其余按驱动原生类型）。
+// 供增量导出（dataload export-delta）等通用读取场景；仅限 SELECT。
+// English: runs a read-only query returning rows as column→value maps (TEXT as string, other types
+// native). For generic reads like the delta export; SELECT only.
+func (d *DB) QueryRows(query string, args ...any) ([]map[string]any, error) {
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out []map[string]any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		m := make(map[string]any, len(cols))
+		for i, c := range cols {
+			m[c] = vals[i]
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // InsertRows 批量 INSERT OR REPLACE（单事务），用于各表的断点续传式装载。
 // cols 为与 Tushare 返回字段一致的小写列名；值为 nil 的单元格写入 NULL。
 // （InsertRows bulk-upserts rows in one transaction per call, for resumable loading.

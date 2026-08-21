@@ -66,12 +66,19 @@ type Scheduler struct {
 	state         stateFile
 }
 
-// stateFile 幂等状态：运行日 + 步骤进度 + 最近下载时间。
+// stateFile 幂等状态：运行日 + 步骤进度 + 最近下载时间 + 最近步骤结果（阶段2.4 状态上报）。
+// English: idempotent state — run day + step index + last download time + last step outcome.
 type stateFile struct {
 	Day          string `json:"day"`              // 当前作业所属运行日 YYYYMMDD
 	StepIndex    int    `json:"step_index"`       // 已完成步骤下标（下一待跑步骤）
 	Done         bool   `json:"done"`             // 当日作业是否已完成
 	LastDataload int64  `json:"last_dataload_ts"` // 交易时段最近一次 dataload UnixNano（节流，与本地时区无关）
+	// 最近一步的执行结果（前端 /api/research/progress 可见；排障用——曾发生 dataload 卡 21h 无感知）。
+	// English: the latest step's outcome (surfaced via /api/research/progress; a dataload once hung 21h unnoticed).
+	LastStep   string `json:"last_step,omitempty"`   // 步骤名
+	LastStatus string `json:"last_status,omitempty"` // running/done/error/timeout
+	LastError  string `json:"last_error,omitempty"`  // 失败原因
+	LastAt     string `json:"last_at,omitempty"`     // 该结果的落盘时间
 }
 
 // New 创建调度器。cfgPath/statePath 为空时由 dataDir 推导。
@@ -353,8 +360,12 @@ func (s *Scheduler) killRunning(reason string) {
 	}
 }
 
-// runStep 执行单个步骤子进程，stdout/stderr 转日志；失败返回 err。
+// runStep 执行单个步骤子进程：单步超时（阶段2.4，默认 90 分钟）超时 kill 并记 timeout；
+// stdout/stderr 转日志；每步结果（running/done/error/timeout）写入 research_state.json 上报前端。
 // ctx 取消时（CommandContext）直接杀子进程（SIGKILL）。
+// English: runs one step child process with a per-step timeout (default 90 minutes) — on expiry the
+// child is killed and the step marked timeout; stdout/stderr stream to logs; every outcome
+// (running/done/error/timeout) lands in research_state.json for the frontend.
 func (s *Scheduler) runStep(ctx context.Context, cfg config.SchedulerConfig, step string, now time.Time) error {
 	bin, args, err := s.buildCommand(cfg, step, now)
 	if err != nil {
@@ -372,7 +383,16 @@ func (s *Scheduler) runStep(ctx context.Context, cfg config.SchedulerConfig, ste
 	if step == "backtest" {
 		s.persistNightlyJob(dbPath, "running", "")
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	s.recordStepState(step, "running", "")
+	// 单步超时：一步挂死不再拖死整链（曾发生 dataload 卡 21h、step_index 停在 0）。
+	// English: per-step timeout so one hung step can't stall the chain (a dataload once hung 21h).
+	timeout := time.Duration(cfg.StepTimeoutMin) * time.Minute
+	if timeout <= 0 {
+		timeout = 90 * time.Minute
+	}
+	stepCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(stepCtx, bin, args...)
 	cmd.Dir = dirOfDB(cfg)
 	cmd.Stdout = &lineLogger{prefix: fmt.Sprintf("[scheduler:%s] ", step)}
 	cmd.Stderr = cmd.Stdout
@@ -380,21 +400,45 @@ func (s *Scheduler) runStep(ctx context.Context, cfg config.SchedulerConfig, ste
 		if step == "backtest" {
 			s.persistNightlyJob(dbPath, "error", err.Error())
 		}
+		s.recordStepState(step, "error", err.Error())
 		return fmt.Errorf("启动 %s: %w", step, err)
 	}
 	s.mu.Lock()
 	s.lastRunStep = step
 	s.mu.Unlock()
 	if err := cmd.Wait(); err != nil {
-		if step == "backtest" {
-			s.persistNightlyJob(dbPath, "error", err.Error())
+		msg := err.Error()
+		status := "error"
+		if stepCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			// 单步超时（非作业被终止）：显式标记，便于排障区分。
+			// English: per-step timeout (not a job cancellation) — flagged explicitly.
+			status = "timeout"
+			msg = fmt.Sprintf("单步超时(%s)被终止: %v", timeout, err)
+			log.Printf("[scheduler] 步骤 %s 超时: %v", step, timeout)
 		}
+		if step == "backtest" {
+			s.persistNightlyJob(dbPath, "error", msg)
+		}
+		s.recordStepState(step, status, msg)
 		return fmt.Errorf("%s 退出异常: %w", step, err)
 	}
 	if step == "backtest" {
 		s.persistNightlyJob(dbPath, "done", "")
 	}
+	s.recordStepState(step, "done", "")
 	return nil
+}
+
+// recordStepState 把步骤执行结果写入幂等状态文件并落盘（阶段2.4 状态上报，前端可见）。
+// English: records the step outcome into the idempotent state file (status reporting for the frontend).
+func (s *Scheduler) recordStepState(step, status, errMsg string) {
+	s.mu.Lock()
+	s.state.LastStep = step
+	s.state.LastStatus = status
+	s.state.LastError = errMsg
+	s.state.LastAt = time.Now().Format("2006-01-02 15:04:05")
+	s.mu.Unlock()
+	s.saveState()
 }
 
 // persistNightlyJob 把夜间全量回测任务状态写入 backtest_jobs（kind='nightly', candidate_id=0）。

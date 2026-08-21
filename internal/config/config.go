@@ -150,6 +150,12 @@ type SchedulerConfig struct {
 	PyURL               string                    `json:"pyurl"`                   // baostock sidecar 地址（默认 http://127.0.0.1:8787）
 	Nightly             NightlyConfig             `json:"nightly"`                 // 盘后/周末夜间作业
 	DataloadDuringTrade DataloadDuringTradeConfig `json:"dataload_during_trading"` // 交易时段增量下载
+	// StepTimeoutMin 夜间作业单步超时（分钟，默认 90，0=用默认）：超时 kill 子进程并记 error，
+	// 防止单步挂死拖死整链（曾发生 dataload 因 baostock 封 IP 卡 21h、step_index 停在 0）。
+	// English: per-step timeout for the nightly job (minutes, default 90, 0 = default): on expiry the
+	// child is killed and the step errors out, so one hung step can't stall the whole chain (a dataload
+	// once hung 21h on a baostock IP ban with step_index stuck at 0).
+	StepTimeoutMin int `json:"step_timeout_min"`
 	// TrimIntervalMin 盘中内存释放节流间隔（分钟，默认 15）：活跃时段 researchd 自身
 	// 定时 runtime.GC()+debug.FreeOSMemory() 并防御性清理残留的 research/discover 子进程，
 	// 保证研究绝不残留盘中（物理内存让给盘中的 quant 常驻服务）。

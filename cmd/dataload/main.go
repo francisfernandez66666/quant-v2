@@ -132,6 +132,14 @@ func main() {
 		}
 	case "verify":
 		db.DebugCount()
+	case "export-delta":
+		// 增量导出（阶段2.1 本地下载→云端导入）：date_col > since 的行写 gzip JSONL。
+		// English: delta export — rows with date_col > since into a gzipped JSONL file.
+		cmdExportDelta(db, args[1:])
+	case "import-delta":
+		// 增量导入：delta 文件按表 INSERT OR REPLACE 幂等合入（云端侧执行）。
+		// English: delta import — upserts the delta file per table (run on the cloud side).
+		cmdImportDelta(db, args[1:])
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}
