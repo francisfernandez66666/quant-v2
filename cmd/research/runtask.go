@@ -119,6 +119,7 @@ func payloadArgs(p map[string]any, keys ...string) []string {
 	return out
 }
 
+// payloadStr 取字符串参数：缺失或空串回退默认值。
 func payloadStr(p map[string]any, key, def string) string {
 	if v, ok := p[key].(string); ok && v != "" {
 		return v
@@ -126,6 +127,7 @@ func payloadStr(p map[string]any, key, def string) string {
 	return def
 }
 
+// payloadInt 取整数参数：JSON 反序列化后数字统一为 float64，此处转 int64；缺失回退默认值。
 func payloadInt(p map[string]any, key string, def int64) int64 {
 	if v, ok := p[key].(float64); ok {
 		return int64(v)
@@ -138,6 +140,7 @@ func payloadIntDef(p map[string]any, key string, def int) int {
 	return int(payloadInt(p, key, int64(def)))
 }
 
+// today 当前日期 YYYYMMDD（researchd 已固定 Asia/Shanghai 时区，海外主机不偏移）。
 func today() string { return time.Now().Format("20060102") }
 
 // dataDirOf 从库路径推导数据目录（applied_*.json 所在，与 QUANT_DATA_DIR 约定一致）。

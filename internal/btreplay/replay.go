@@ -80,8 +80,11 @@ type doubleBumpAdapter struct {
 	cfg *config.DoubleBumpConfig
 }
 
+// Name 战法名（回测报告分组键）。
 func (a *doubleBumpAdapter) Name() string { return "DoubleBump" }
 
+// Trigger 纯日K完整回放：复用实盘 EvaluateReal 判定（≥10 根 K 线且总分≥70 触发），
+// 入场评分明细带阶段最高价（移动止盈基准）。
 func (a *doubleBumpAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[string]float64, bool) {
 	if len(klines) < 10 {
 		return nil, false
@@ -109,6 +112,7 @@ func (a *doubleBumpAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (
 	return meta, true
 }
 
+// Exit 直接委托 double_bump.CheckExit（注入配置的移动止盈/破位/超期规则）。
 func (a *doubleBumpAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine) (*strategy.ExitResult, bool) {
 	res := double_bump.CheckExit(ctx, a.cfg)
 	if res == nil {
@@ -119,6 +123,8 @@ func (a *doubleBumpAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KL
 
 // ── dragon_return 适配器（日K派生 StockData） ──
 
+// dragonReturnAdapter 龙回头适配器：日K派生 StockData（MA/阶段高点/回撤等），
+// 板块龙性（IsSectorTop2/SectorRPS20）无真实板块数据时按 -industry 开关放宽近似。
 type dragonReturnAdapter struct {
 	st  *dragon_return.DragonReturnStrategy
 	cfg *config.DragonReturnConfig
@@ -126,8 +132,10 @@ type dragonReturnAdapter struct {
 	forceLeader bool
 }
 
+// Name 战法名（回测报告分组键）。
 func (a *dragonReturnAdapter) Name() string { return "DragonReturn" }
 
+// Trigger 日K派生 StockData 后走实盘 Evaluate（≥30 根 K 线）；入场明细带阶段最高价。
 func (a *dragonReturnAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[string]float64, bool) {
 	if len(klines) < 30 {
 		return nil, false
@@ -148,6 +156,7 @@ func (a *dragonReturnAdapter) Trigger(klines []data.KLine, prevClose, _ float64)
 	return meta, true
 }
 
+// Exit 直接委托 dragon_return.CheckExit（回撤/破位/超期规则与实盘同源）。
 func (a *dragonReturnAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine) (*strategy.ExitResult, bool) {
 	res := dragon_return.CheckExit(ctx, a.cfg)
 	if res == nil {
@@ -158,6 +167,8 @@ func (a *dragonReturnAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.
 
 // ── n_shape 适配器（日K近似 WaveA/IntradayB，D1 用规则分） ──
 
+// nShapeAdapter N 形适配器：高度依赖日内快照与 LLM D1，日K近似后准确性打折——
+// WaveA=前一交易日、IntradayB=当日近似，D1 用可配置规则分；MACD 序列预计算避免逐日 O(n²)。
 type nShapeAdapter struct {
 	st         *n_shape.NShapeStrategy
 	cfg        *config.NShapeConfig
@@ -166,6 +177,7 @@ type nShapeAdapter struct {
 	curIdx     int         // 当前判定日在 macdSeries 中的索引（由 backtestStock 逐日设置）
 }
 
+// Name 战法名（回测报告分组键）。
 func (a *nShapeAdapter) Name() string { return "NShape" }
 
 // Trigger 用日K近似构造 n_shape 的评分输入：WaveA=前一交易日，IntradayB=当日近似，
@@ -236,13 +248,18 @@ func (a *nShapeAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine)
 
 // ── dragon 适配器（板块用行业涨幅近似） ──
 
+// dragonAdapter 龙头战法适配器：板块共振（F2/F3）用所属行业当日涨幅近似，
+// 无行业数据传 0 时自动降级忽略板块维度。
 type dragonAdapter struct {
 	st  *dragon.DragonStrategy
 	cfg *config.DragonConfig
 }
 
+// Name 战法名（回测报告分组键）。
 func (a *dragonAdapter) Name() string { return "Dragon" }
 
+// Trigger 复用实盘 EvaluateReal（≥5 根 K 线且总分≥70 触发）；行业涨幅近似板块共振，
+// 入场明细带封板价（炸板回落基准）与阶段最高价。
 func (a *dragonAdapter) Trigger(klines []data.KLine, prevClose, industryChg float64) (map[string]float64, bool) {
 	if len(klines) < 5 {
 		return nil, false
@@ -276,6 +293,7 @@ func (a *dragonAdapter) Trigger(klines []data.KLine, prevClose, industryChg floa
 	return meta, true
 }
 
+// Exit 直接委托 dragon.CheckExit（封板/炸板/移动止盈规则与实盘同源）。
 func (a *dragonAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine) (*strategy.ExitResult, bool) {
 	res := dragon.CheckExit(ctx, a.cfg)
 	if res == nil {
@@ -383,6 +401,8 @@ type Options struct {
 	DataDir   string // 战法库目录（applied_factors.json / applied_patterns.json 所在）
 }
 
+// DefaultDB 研究库默认路径：QUANT_DATA_DIR 优先，否则 ~/.quant-trading-v2/trading.db
+// （与 research/scheduler 的 defaultDB 同一约定）。
 func DefaultDB() string {
 	if d := os.Getenv("QUANT_DATA_DIR"); d != "" {
 		return filepath.Join(d, "trading.db")
@@ -436,6 +456,7 @@ type ruleEvalAdapter struct {
 	ps   *pattern.PatternStrategy
 }
 
+// Name 返回规则显示名（如"因子战法#1"/"形态战法#2"），作为回测报告的分组键。
 func (a *ruleEvalAdapter) Name() string { return a.name }
 
 // Trigger 用截止当日（含）的日K构造 StockMarketData，走实盘 Evaluate 判定是否触发买入。

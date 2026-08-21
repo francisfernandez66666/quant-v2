@@ -237,6 +237,8 @@ func (d *DB) ActiveResearchTasks() ([]ResearchTask, error) {
 	return d.listResearchTasks(`WHERE status IN ('queued','running','paused','preempted')`)
 }
 
+// listResearchTasks 列表查询共用体：ListResearchTasks（全部）与 ActiveResearchTasks（未终结）
+// 仅 where 子句不同，扫描逻辑共享。
 func (d *DB) listResearchTasks(where string) ([]ResearchTask, error) {
 	rows, err := d.db.Query(`SELECT ` + researchTaskCols + ` FROM research_tasks ` + where +
 		` ORDER BY id DESC`)

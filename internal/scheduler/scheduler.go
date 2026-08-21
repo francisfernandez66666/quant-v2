@@ -235,6 +235,8 @@ type lineLogger struct {
 	buf    []byte
 }
 
+// Write 实现 io.Writer：把子进程输出按行拆分、带前缀转写进服务日志
+// （journalctl -u quant-research 可见，排障与 verify_nightly.sh 巡检依赖）。
 func (w *lineLogger) Write(p []byte) (int, error) {
 	w.buf = append(w.buf, p...)
 	for {

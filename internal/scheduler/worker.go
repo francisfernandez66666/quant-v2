@@ -278,6 +278,7 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 	return "", "", false
 }
 
+// mustJSON 序列化为 JSON；失败兜底返回 "{}"（保证 payload 列永远是合法 JSON）。
 func mustJSON(v any) string {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -617,6 +618,7 @@ func (s *Scheduler) recordStepState(step, status, errMsg string) {
 	s.saveState()
 }
 
+// tailOf 日志拼接用：错误信息非空时包一层全角括号，空串原样返回。
 func tailOf(msg string) string {
 	if msg == "" {
 		return ""

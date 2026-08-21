@@ -40,6 +40,8 @@ type winCkpt struct {
 	stage     string
 }
 
+// load 尝试命中窗口断点并反序列化到 dst：nil 接收者 / 未命中 / JSON 损坏一律返回 false
+// （调用方走正常装配路径，断点只是加速而非正确性依赖）。
 func (c *winCkpt) load(w [2]string, dst any) bool {
 	if c == nil || c.db == nil {
 		return false
@@ -51,6 +53,7 @@ func (c *winCkpt) load(w [2]string, dst any) bool {
 	return json.Unmarshal([]byte(js), dst) == nil
 }
 
+// save 把当前窗口的产物落库（序列化失败静默跳过，不阻断发现主流程）。
 func (c *winCkpt) save(w [2]string, v any) {
 	if c == nil || c.db == nil {
 		return
@@ -70,6 +73,7 @@ type stageProgress struct {
 	done   int
 }
 
+// newStageProgress 构造阶段进度器：total<=0 返回 nil（tick 对 nil 直通，无进度场景零开销）。
 func newStageProgress(lo, hi, total int) *stageProgress {
 	if total <= 0 {
 		return nil
@@ -77,6 +81,8 @@ func newStageProgress(lo, hi, total int) *stageProgress {
 	return &stageProgress{lo: lo, hi: hi, total: total}
 }
 
+// tick 每完成一个窗口调用一次：映射到 [lo,hi] 百分比带打印"发现进度 xx%"，
+// worker 正则解析后回写队列并喂看门狗。
 func (p *stageProgress) tick() {
 	if p == nil {
 		return
@@ -681,7 +687,10 @@ func daysInMonth(y, m int) int {
 	return 30
 }
 
+// itoa4/itoa2 定宽零填充整数字符串（4 位年 / 2 位月日），供 storeNextDay 拼回 YYYYMMDD。
 func itoa4(v int) string { return itoaN(v, 4) }
+
+// itoa2 同 itoa4，宽度 2（月/日）。
 func itoa2(v int) string { return itoaN(v, 2) }
 
 // itoaN 手写整数 → 定宽数字字符串（高位补零），供 storeNextDay 拼 YYYYMMDD。

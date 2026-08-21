@@ -29,6 +29,8 @@ import (
 // （defaultDB is the default research SQLite DB path.）
 var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.db")
 
+// main 入口：解析全局 flags（--db/--start/--end 等）后按子命令分发；
+// run-task 是任务队列的唯一执行入口（由 researchd worker 拉起）。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	dbPath := flag.String("db", defaultDB, "研究 SQLite 库路径")
