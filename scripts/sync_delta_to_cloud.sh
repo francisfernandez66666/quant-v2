@@ -43,7 +43,16 @@ log() { echo "[$(date '+%F %T')] $*"; }
 # ── 0. 前置检查 ──
 log "[0/6] 前置检查..."
 [ -f "$LOCAL_DB" ] || { log "本地库不存在: $LOCAL_DB"; exit 1; }
-$SSH "echo ok" >/dev/null || { log "SSH 不可达: $SERVER_USER@$SERVER_IP"; exit 1; }
+# SSH 预检带重试：云端夜间研究满负荷时 sshd 可能瞬时超时（今日实遇），3 次×20s
+# English: SSH precheck with retries — sshd can time out transiently while the nightly research
+# saturates the box (seen live); 3 tries × 20s.
+SSH_OK=0
+for i in 1 2 3; do
+    if $SSH "echo ok" >/dev/null 2>&1; then SSH_OK=1; break; fi
+    log "SSH 第${i}次不可达，20s 后重试..."
+    sleep 20
+done
+[ "$SSH_OK" = "1" ] || { log "SSH 连续 3 次不可达: $SERVER_USER@$SERVER_IP"; exit 1; }
 
 # dataload 二进制：优先已有，否则现场编译
 DATALOAD="$(command -v dataload || true)"
