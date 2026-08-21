@@ -52,13 +52,15 @@ $SCP /tmp/quant_linux $SERVER_USER@$SERVER_IP:/tmp/quant_linux
 $SSH "sudo mv /tmp/quant_linux $DEPLOY_DIR/quant && sudo chmod +x $DEPLOY_DIR/quant"
 
 # 研究/下载/调度二进制：独立研究服务（quant-research）与 sidecar 依赖
-echo "      编译 research/dataload/researchd (linux/amd64)..."
+echo "      编译 research/dataload/researchd/bt_strategy (linux/amd64)..."
 GOOS=linux GOARCH=amd64 go build -o /tmp/research_linux ./cmd/research
 GOOS=linux GOARCH=amd64 go build -o /tmp/dataload_linux ./cmd/dataload
 GOOS=linux GOARCH=amd64 go build -o /tmp/researchd_linux ./cmd/researchd
-$SCP /tmp/research_linux /tmp/dataload_linux /tmp/researchd_linux $SERVER_USER@$SERVER_IP:/tmp/
-$SSH "sudo mv /tmp/research_linux $DEPLOY_DIR/research && sudo mv /tmp/dataload_linux $DEPLOY_DIR/dataload && sudo mv /tmp/researchd_linux $DEPLOY_DIR/researchd"
-$SSH "sudo chmod +x $DEPLOY_DIR/research $DEPLOY_DIR/dataload $DEPLOY_DIR/researchd"
+# bt_strategy（阶段3.4 战法库回测：web 端点 /api/research/library/{id}/backtest 的子进程）
+GOOS=linux GOARCH=amd64 go build -o /tmp/bt_strategy_linux ./cmd/backtest_strategy
+$SCP /tmp/research_linux /tmp/dataload_linux /tmp/researchd_linux /tmp/bt_strategy_linux $SERVER_USER@$SERVER_IP:/tmp/
+$SSH "sudo mv /tmp/research_linux $DEPLOY_DIR/research && sudo mv /tmp/dataload_linux $DEPLOY_DIR/dataload && sudo mv /tmp/researchd_linux $DEPLOY_DIR/researchd && sudo mv /tmp/bt_strategy_linux $DEPLOY_DIR/bt_strategy"
+$SSH "sudo chmod +x $DEPLOY_DIR/research $DEPLOY_DIR/dataload $DEPLOY_DIR/researchd $DEPLOY_DIR/bt_strategy"
 # 事件匹配规则（相对路径加载），缺失时优雅降级但也尽量带上
 EVENTS_SRC=""
 for cand in "$APP_DIR/config/events_leftside.yaml" "$APP_DIR/events_leftside.yaml"; do

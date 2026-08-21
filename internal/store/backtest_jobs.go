@@ -10,20 +10,22 @@ import (
 	"database/sql"
 	"time"
 )
-
 // BacktestJob 一条回测任务（持久化到 backtest_jobs）。
 // English: one backtest job (persisted in backtest_jobs).
 type BacktestJob struct {
 	ID          int64   `json:"id"`           // 任务自增 ID
-	Kind        string  `json:"kind"`         // candidate=单候选 / nightly=夜间全量
-	CandidateID int64   `json:"candidate_id"` // kind=candidate 时对应候选 ID（nightly=0）
-	Status      string  `json:"status"`       // running / done / error / interrupted
+	Kind        string  `json:"kind"`         // candidate=单候选 / nightly=夜间全量 / library=战法库规则
+	CandidateID int64   `json:"candidate_id"` // kind=candidate/library 时对应候选或规则 ID（nightly=0）
+	Status      string  `json:"status"`       // running / paused / done / error / interrupted
 	Progress    string  `json:"progress"`     // "45%"
 	AvgExcess   float64 `json:"avg_excess"`   // 回测超额（h 日前瞻，done 后回填）
 	Error       string  `json:"error"`        // 失败原因（error 时）
-	StartedAt   string  `json:"started_at"`   // 开始时间 YYYY-MM-DD HH:MM:SS
-	FinishedAt  string  `json:"finished_at"`  // 结束时间（done/error/interrupted 时）
-	UpdatedAt   string  `json:"updated_at"`   // 最近更新时间
+	// ResultText 战法库回测的汇总报告文本（阶段3.4：胜率/盈亏比等，done 后回填，前端直接展示）。
+	// English: the library-backtest summary report text (win rate / profit factor…, backfilled on done).
+	ResultText string `json:"result_text,omitempty"`
+	StartedAt  string `json:"started_at"`  // 开始时间 YYYY-MM-DD HH:MM:SS
+	FinishedAt string `json:"finished_at"` // 结束时间（done/error/interrupted 时）
+	UpdatedAt  string `json:"updated_at"`  // 最近更新时间
 }
 
 // UpsertBacktestJob 写入/更新一条回测任务（同一 kind+candidate_id 覆盖，重跑不产生重复行）。
@@ -37,13 +39,15 @@ func (d *DB) UpsertBacktestJob(j *BacktestJob) error {
 		j.FinishedAt = j.UpdatedAt
 	}
 	_, err := d.db.Exec(`INSERT INTO backtest_jobs
-		(kind, candidate_id, status, progress, avg_excess, error, started_at, finished_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		(kind, candidate_id, status, progress, avg_excess, error, result_text, started_at, finished_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(kind, candidate_id) DO UPDATE SET
 			status=excluded.status, progress=excluded.progress, avg_excess=excluded.avg_excess,
-			error=excluded.error, started_at=excluded.started_at, finished_at=excluded.finished_at,
+			error=excluded.error, result_text=excluded.result_text,
+			started_at=excluded.started_at, finished_at=excluded.finished_at,
 			updated_at=excluded.updated_at`,
-		j.Kind, j.CandidateID, j.Status, j.Progress, j.AvgExcess, j.Error, j.StartedAt, j.FinishedAt, j.UpdatedAt)
+		j.Kind, j.CandidateID, j.Status, j.Progress, j.AvgExcess, j.Error, j.ResultText,
+		j.StartedAt, j.FinishedAt, j.UpdatedAt)
 	return err
 }
 
@@ -51,7 +55,7 @@ func (d *DB) UpsertBacktestJob(j *BacktestJob) error {
 // English: fetches a job by kind+candidate_id; returns (nil, nil) when absent.
 func (d *DB) GetBacktestJob(kind string, candidateID int64) (*BacktestJob, error) {
 	row := d.db.QueryRow(`SELECT id, kind, candidate_id, status,
-		COALESCE(progress,''), COALESCE(avg_excess,0), COALESCE(error,''),
+		COALESCE(progress,''), COALESCE(avg_excess,0), COALESCE(error,''), COALESCE(result_text,''),
 		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(updated_at,'')
 		FROM backtest_jobs WHERE kind=? AND candidate_id=?`, kind, candidateID)
 	j, err := scanBacktestJob(row)
@@ -76,7 +80,7 @@ func (d *DB) ListBacktestJobs() ([]BacktestJob, error) {
 
 func (d *DB) listBacktestJobs(where string) ([]BacktestJob, error) {
 	rows, err := d.db.Query(`SELECT id, kind, candidate_id, status,
-		COALESCE(progress,''), COALESCE(avg_excess,0), COALESCE(error,''),
+		COALESCE(progress,''), COALESCE(avg_excess,0), COALESCE(error,''), COALESCE(result_text,''),
 		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(updated_at,'')
 		FROM backtest_jobs ` + where + ` ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
@@ -99,7 +103,7 @@ func (d *DB) listBacktestJobs(where string) ([]BacktestJob, error) {
 func scanBacktestJob(s rowScanner) (*BacktestJob, error) {
 	var j BacktestJob
 	if err := s.Scan(&j.ID, &j.Kind, &j.CandidateID, &j.Status,
-		&j.Progress, &j.AvgExcess, &j.Error,
+		&j.Progress, &j.AvgExcess, &j.Error, &j.ResultText,
 		&j.StartedAt, &j.FinishedAt, &j.UpdatedAt); err != nil {
 		return nil, err
 	}

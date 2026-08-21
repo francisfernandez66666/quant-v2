@@ -421,6 +421,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/research/backtest/list", s.authMiddleware(s.handleBacktestList))
 	// 战法库（因子战法）：列出已应用 + 启用/禁用/删除 + 重命名 + 效果监测 + 全量回测全局开关
 	s.mux.HandleFunc("GET /api/research/library", s.authMiddleware(s.handleResearchLibrary))
+	// 阶段3.4 战法库回测入口：对战法库一条已应用规则跑历史回放回测（异步，结果进回测 tab）
+	s.mux.HandleFunc("POST /api/research/library/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleLibraryBacktest))
 	s.mux.HandleFunc("POST /api/research/library/{id}/enable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("enable")))
 	s.mux.HandleFunc("POST /api/research/library/{id}/disable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("disable")))
 	s.mux.HandleFunc("POST /api/research/library/{id}/delete", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryDelete))

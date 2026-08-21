@@ -22,12 +22,16 @@ import (
 
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategies/double_bump"
 	"quant-trading-v2/internal/strategies/dragon"
 	"quant-trading-v2/internal/strategies/dragon_return"
+	"quant-trading-v2/internal/strategies/factor"
 	"quant-trading-v2/internal/strategies/n_shape"
+	"quant-trading-v2/internal/strategies/pattern"
 	"quant-trading-v2/internal/strategy"
+	"quant-trading-v2/internal/strategy_engine"
 )
 
 // signal 一次回测触发的入场信号记录。
@@ -371,6 +375,7 @@ type options struct {
 	maxStocks int
 	d1Score   float64
 	industry  bool
+	dataDir   string // 战法库目录（applied_factors.json / applied_patterns.json 所在）
 }
 
 func parseFlags() *options {
@@ -378,10 +383,12 @@ func parseFlags() *options {
 	flag.StringVar(&o.dbPath, "db", defaultDB(), "离线研究库 SQLite 路径")
 	flag.StringVar(&o.start, "start", "20230101", "回测起始日 YYYYMMDD")
 	flag.StringVar(&o.end, "end", "20260101", "回测结束日 YYYYMMDD")
-	flag.StringVar(&o.strategy, "strategy", "double_bump", "战法: double_bump|dragon|dragon_return|n_shape")
+	flag.StringVar(&o.strategy, "strategy", "double_bump",
+		"战法: double_bump|dragon|dragon_return|n_shape|factor(战法库全部启用因子规则)|pattern(全部启用形态规则)")
 	flag.IntVar(&o.maxStocks, "maxstocks", 500, "最多回测股票数（0=全部）")
 	flag.Float64Var(&o.d1Score, "d1", 20, "n_shape 的规则 D1 分（日K近似假设的中性事件分；0=不触发 n_shape）")
 	flag.BoolVar(&o.industry, "industry", false, "dragon 是否用行业板块涨幅近似板块共振")
+	flag.StringVar(&o.dataDir, "datadir", defaultDataDir(), "战法库目录（applied_*.json；默认与数据目录一致）")
 	flag.Parse()
 	return o
 }
@@ -392,6 +399,15 @@ func defaultDB() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".quant-trading-v2", "trading.db")
+}
+
+// defaultDataDir 战法库默认目录（applied_factors.json/applied_patterns.json 所在，与数据目录一致）。
+func defaultDataDir() string {
+	if d := os.Getenv("QUANT_DATA_DIR"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".quant-trading-v2")
 }
 
 // newAdapter 根据参数构建对应战法适配器。
@@ -414,6 +430,111 @@ func newAdapter(name string, industry bool, d1 float64) (adapter, error) {
 	}
 }
 
+// ── 已应用战法回测适配器（阶段3.4：applied_factors.json / applied_patterns.json）──
+
+// ruleEvalAdapter 因子/形态规则回测适配器：直接复用实盘 FactorStrategy / PatternStrategy 的
+// Evaluate 逻辑（seriesFromKLines 由日K计算因子 → 时间序列分位×权重×方向 / [min,max) 条件解释），
+// 与 8a/8b 实盘同一套打分口径；退出用通用移动止盈+超期（与实盘未知战法回退 genericTrailingExit 同口径）。
+// 每条启用规则一个 adapter 实例，结果按规则名分组统计。
+// English: factor/pattern rule backtest adapters — reuses the live FactorStrategy/PatternStrategy
+// Evaluate (factors computed from daily bars; percentile×weight×direction scoring or [min,max) condition
+// interpretation), identical to the 8a/8b live path. Exits use the generic trailing-stop + timeout,
+// matching the live fallback for unknown strategies. One adapter per enabled rule; results group by name.
+type ruleEvalAdapter struct {
+	name string // 规则显示名（如 "因子战法#1"）
+	fs   *factor.FactorStrategy
+	ps   *pattern.PatternStrategy
+}
+
+func (a *ruleEvalAdapter) Name() string { return a.name }
+
+// Trigger 用截止当日（含）的日K构造 StockMarketData，走实盘 Evaluate 判定是否触发买入。
+// English: builds StockMarketData from bars up to the day and runs the live Evaluate as the trigger.
+func (a *ruleEvalAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[string]float64, bool) {
+	if len(klines) < 30 {
+		return nil, false // 与实盘同门槛：K线不足 30 根不打分
+	}
+	last := klines[len(klines)-1]
+	md := &strategy_engine.StockMarketData{KLines: klines}
+	var eval *strategy.Evaluation
+	var err error
+	if a.fs != nil {
+		eval, err = a.fs.Evaluate("", md)
+	} else {
+		eval, err = a.ps.Evaluate("", md)
+	}
+	if err != nil || eval == nil || !eval.Pass {
+		return nil, false
+	}
+	// 入场评分明细：阶段最高价基准（Exit 中逐日抬高）
+	return map[string]float64{"highest_price": last.Close}, true
+}
+
+// Exit 通用移动止盈 + 超期离场（与 combat_agent.genericTrailingExit 同口径）：
+// 阶段高点逐日抬高（EntryMeta 复用同一 map），从高点回撤 ≥8% 且曾盈利 → 减仓级平仓；
+// 持仓超 15 日未完成形态 → 超期平仓。
+// English: generic trailing stop + timeout (same semantics as the live fallback): raises the stage high
+// daily via the shared EntryMeta map, exits on an ≥8% drawdown from a profitable high or a 15-day timeout.
+func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine) (*strategy.ExitResult, bool) {
+	cost, price := ctx.CostPrice, ctx.CurPrice
+	if cost <= 0 || price <= 0 {
+		return nil, false
+	}
+	stageHigh := cost
+	if h, ok := ctx.EntryMeta["highest_price"]; ok && h > stageHigh {
+		stageHigh = h
+	}
+	if price > stageHigh {
+		stageHigh = price
+		ctx.EntryMeta["highest_price"] = stageHigh // 抬高并随 ctx 持续到后续交易日
+	}
+	// 移动止盈：阶段高点回撤 8%（且曾盈利）→ 平仓保护利润
+	if trailPct := (price - stageHigh) / stageHigh * 100; trailPct <= -8 && stageHigh > cost {
+		return &strategy.ExitResult{Reason: "回撤止损(移动止盈)", Priority: strategy.P2}, true
+	}
+	// 超期：持仓超过 15 天强制离场
+	if ctx.EntryAt != "" {
+		if entryDate, err := time.Parse("2006-01-02", ctx.EntryAt); err == nil {
+			if days := int(ctx.Now.Sub(entryDate).Hours() / 24); days >= 15 {
+				return &strategy.ExitResult{Reason: "持仓超期离场", Priority: strategy.P3}, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// loadRuleAdapters 从战法库加载全部启用规则，每条规则一个 adapter（kind: factor|pattern）。
+// English: loads every enabled library rule as one adapter (kind: factor|pattern).
+func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
+	switch strings.ToLower(kind) {
+	case "factor", "factor_rules", "applied_factors":
+		rules, err := research.LoadEnabledFactorRules(dataDir)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]adapter, 0, len(rules))
+		for _, r := range rules {
+			fs := factor.New()
+			fs.SetRules([]*factor.ActiveRule{r})
+			out = append(out, &ruleEvalAdapter{name: r.Name, fs: fs})
+		}
+		return out, nil
+	case "pattern", "pattern_rules", "applied_patterns":
+		rules, err := research.LoadEnabledPatternRules(dataDir)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]adapter, 0, len(rules))
+		for _, r := range rules {
+			ps := pattern.New()
+			ps.SetRules([]*pattern.ActivePattern{r})
+			out = append(out, &ruleEvalAdapter{name: r.Name, ps: ps})
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("未知战法库类型: %s", kind)
+}
+
 // run 执行回测主流程。
 func (o *options) run() error {
 	db, err := store.Open(o.dbPath)
@@ -430,9 +551,24 @@ func (o *options) run() error {
 		codes = codes[:o.maxStocks]
 	}
 
-	ad, err := newAdapter(o.strategy, o.industry, o.d1Score)
-	if err != nil {
-		return err
+	// 阶段3.4：factor/pattern → 从战法库加载全部启用规则（每条规则一个 adapter，分组统计）
+	var ads []adapter
+	if strings.EqualFold(o.strategy, "factor") || strings.EqualFold(o.strategy, "pattern") {
+		ads, err = loadRuleAdapters(o.strategy, o.dataDir)
+		if err != nil {
+			return err
+		}
+		if len(ads) == 0 {
+			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.dataDir)
+			return nil
+		}
+		log.Printf("战法库已加载 %d 条启用规则", len(ads))
+	} else {
+		ad, err := newAdapter(o.strategy, o.industry, o.d1Score)
+		if err != nil {
+			return err
+		}
+		ads = []adapter{ad}
 	}
 
 	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
@@ -460,22 +596,25 @@ func (o *options) run() error {
 		}
 	}
 
-	var trades []trade
-	for _, tsCode := range codes {
-		code := strings.Split(tsCode, ".")[0] // 000001.SZ -> 000001
-		bars, err := db.RawBars(tsCode, o.start, o.end)
-		if err != nil {
-			continue
+	// 逐 adapter 回放（多规则时按规则分组统计；单战法仅一条）
+	summaries := make([]*summary, 0, len(ads))
+	for _, ad := range ads {
+		var trades []trade
+		for _, tsCode := range codes {
+			code := strings.Split(tsCode, ".")[0] // 000001.SZ -> 000001
+			bars, err := db.RawBars(tsCode, o.start, o.end)
+			if err != nil {
+				continue
+			}
+			if len(bars) < 15 {
+				continue
+			}
+			klines := toDataKLine(bars)
+			trades = append(trades, o.backtestStock(code, klines, ad, industryChg[code])...)
 		}
-		if len(bars) < 15 {
-			continue
-		}
-		klines := toDataKLine(bars)
-		trades = append(trades, o.backtestStock(code, klines, ad, industryChg[code])...)
+		summaries = append(summaries, summarize(trades))
 	}
-
-	report := summarize(trades)
-	printReport(report, ad.Name(), len(codes))
+	printReports(summaries, len(codes))
 	return nil
 }
 
@@ -640,6 +779,14 @@ func printReport(s *summary, name string, stockCount int) {
 	fmt.Printf("盈亏比: %.2f\n", s.ProfitFactor)
 	fmt.Printf("平均持仓天数: %.1f\n", s.AvgHold)
 	fmt.Println("==============================================")
+}
+
+// printReports 打印多规则分组报告（阶段3.4 战法库回测：每条启用规则一组；单战法仅一组）。
+// English: prints grouped reports — one per library rule (a single group for single-strategy runs).
+func printReports(summaries []*summary, stockCount int) {
+	for _, s := range summaries {
+		printReport(s, s.Name, stockCount)
+	}
 }
 
 // config 包的默认战法参数（供适配器构造，见 defaultConfig）。

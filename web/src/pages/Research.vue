@@ -142,6 +142,8 @@
             <button class="btn-toggle" @click="toggleLibrary(s)">
               {{ s.enabled ? '停用' : '启用' }}
             </button>
+            <!-- 阶段3.4 战法库回测入口：对该规则跑历史回放回测（结果进「回测」tab） -->
+            <button class="btn-backtest" @click="doLibraryBacktest(s)">回测此战法</button>
             <button class="btn-reject" @click="removeLibrary(s)">删除</button>
           </div>
         </div>
@@ -214,48 +216,51 @@
       <div v-else class="bt-list">
         <div v-for="j in backtestJobs" :key="j.id" class="bt-card" :class="'bt-' + j.status">
           <div class="bt-head">
-            <span :class="['tag', j.kind === 'nightly' ? 'tag-kind' : 'tag-kind kind-factor']">
-              {{ j.kind === 'nightly' ? '夜间全量' : '单候选' }}
+            <span :class="['tag', 'tag-kind', j.kind === 'nightly' ? '' : (j.kind === 'library' ? 'kind-pattern' : 'kind-factor')]">
+              {{ j.kind === 'nightly' ? '夜间全量' : (j.kind === 'library' ? '战法库' : '单候选') }}
             </span>
             <span v-if="j.kind === 'candidate'" class="bt-cand">候选 #{{ j.candidate_id }}</span>
+            <span v-else-if="j.kind === 'library'" class="bt-cand">规则 {{ j.candidate_id }}</span>
             <span :class="['tag', 'bt-status', 'status-' + (j.status === 'done' ? 'applied' : (j.status === 'error' ? 'rejected' : 'proposed'))]">
               {{ btStatusLabel(j.status) }}
             </span>
             <span class="bt-time">{{ j.started_at || '' }}<template v-if="j.finished_at"> → {{ j.finished_at }}</template></span>
           </div>
-          <div class="bt-progress" v-if="j.status === 'running'">
+          <div class="bt-progress" v-if="j.status === 'running' || j.status === 'paused'">
             <div class="bt-progress-bar">
               <div class="bt-progress-fill" :style="{ width: jobPct(j) }"></div>
             </div>
             <span class="bt-progress-label">{{ jobPct(j) }}</span>
           </div>
-          <div class="bt-result" v-if="j.status === 'done'">
+          <!-- 战法库回测结果：汇总报告文本（触发信号数/胜率/盈亏比等） -->
+          <div class="bt-result bt-lib-result" v-if="j.status === 'done' && j.kind === 'library'">{{ j.result_text }}</div>
+          <div class="bt-result" v-if="j.status === 'done' && j.kind !== 'library'">
             回测超额 <b :class="signClass(j.avg_excess)">{{ fmt(j.avg_excess) }}</b>
           </div>
           <div class="bt-error" v-if="j.status === 'error'">{{ j.error }}</div>
           <div class="bt-error" v-else-if="j.status === 'interrupted'">
             {{ j.error || '任务中断，可重新发起续跑（断点缓存仍有效，重跑只计算剩余事件）' }}
           </div>
-          <div class="bt-actions" v-if="j.kind === 'candidate' && canApprove">
+          <div class="bt-actions" v-if="canApprove && (j.kind === 'candidate' || j.kind === 'library')">
             <!-- 阶段3.2 运行控制：运行中→暂停/取消；已暂停→继续/取消；已中断→续跑（断点续传）；其余→重新回测 -->
             <!-- Run controls: running→pause/cancel; paused→resume/cancel; interrupted→resume-run; else re-run -->
             <button
               v-if="j.status === 'running'"
               class="btn-backtest bt-ctl"
-              @click="doPauseBacktest(j.candidate_id)"
+              @click="doPauseBacktest(ctrlId(j))"
             >暂停</button>
             <button
               v-if="j.status === 'paused'"
               class="btn-backtest bt-ctl"
-              @click="doResumeBacktest(j.candidate_id)"
+              @click="doResumeBacktest(ctrlId(j))"
             >继续</button>
             <button
               v-if="j.status === 'running' || j.status === 'paused'"
               class="btn-backtest bt-ctl bt-danger"
-              @click="doCancelBacktest(j.candidate_id)"
+              @click="doCancelBacktest(ctrlId(j))"
             >取消</button>
             <button
-              v-else
+              v-else-if="j.kind === 'candidate'"
               class="btn-backtest"
               :disabled="backtestLoading[j.candidate_id]"
               @click="doBacktestById(j.candidate_id)"
@@ -905,6 +910,28 @@ async function doResumeBacktest(id) {
   } catch (e) { alert('恢复失败: ' + (e.message || e)) }
 }
 
+// ── 阶段3.4 战法库回测入口 ──
+let libPollTimer = null
+/** 对战法库一条规则发起历史回放回测（异步），完成后在「回测」tab 展示汇总报告 */
+async function doLibraryBacktest(s) {
+  if (!confirm(`回测战法「${s.name || s.id}」？（历史日K回放，结果进「回测」tab）`)) return
+  try {
+    await api.backtestLibraryRule(s.id, { start: btStart.value.trim(), end: btEnd.value.trim() })
+    activeTab.value = 'backtests'
+    await loadBacktests()
+    startLibPoll()
+  } catch (e) { alert('发起失败: ' + (e.message || e)) }
+}
+/** 战法库回测轻量轮询：有 running/paused 的 library 任务时每 5s 刷新任务列表，全部结束即停 */
+function startLibPoll() {
+  if (libPollTimer) return
+  libPollTimer = setInterval(async () => {
+    await loadBacktests()
+    const busy = backtestJobs.value.some(j => j.kind === 'library' && (j.status === 'running' || j.status === 'paused'))
+    if (!busy) { clearInterval(libPollTimer); libPollTimer = null }
+  }, 5000)
+}
+
 /** 轮询单个候选的回测任务状态（全量回测可能耗时较长；interval 唯一，防重复） */
 /** Poll a single candidate's backtest job (a full backtest can be slow; one interval per candidate) */
 function pollBacktest(c) {
@@ -1019,6 +1046,10 @@ function doBacktestById(id) {
 function btStatusLabel(s) {
   const m = { running: '运行中', paused: '已暂停', done: '已完成', error: '失败', interrupted: '已中断' }
   return m[s] || s
+}
+/** 运行控制接口的任务键：战法库任务用合成键（1e9+规则序号，与后端 libraryJobKey 对齐） */
+function ctrlId(j) {
+  return j.kind === 'library' ? 1000000000 + j.candidate_id : j.candidate_id
 }
 
 /** 任务进度条宽度（任务对象版本，兼容无 progress 字段） */

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -742,6 +743,143 @@ var avgExcessRe = regexp.MustCompile(`平均超额=(-?\d+\.?\d*)`)
 // backtestProgressRe 匹配 research backtest CLI 的阶段进度输出（"回测进度 xx%"）。
 // English: matches the stage-progress output of the research backtest CLI ("回测进度 xx%").
 var backtestProgressRe = regexp.MustCompile(`回测进度 (\d+)%`)
+
+// libraryJobKey 战法库回测在内存任务表中的合成键（与候选 ID 空间隔离：1e9+规则序号）。
+// English: synthetic in-memory key for library backtests (offset from the candidate-ID space).
+func libraryJobKey(ruleNum int64) int64 { return 1_000_000_000 + ruleNum }
+
+// handleLibraryBacktest 处理 POST /api/research/library/{id}/backtest（阶段3.4 前端入口）：
+// 对战法库中一条已应用规则（fac_<n> / pat_<n>）跑 bt_strategy 历史回放回测
+// （复用实盘 FactorStrategy/PatternStrategy Evaluate 口径），异步执行、汇总落库
+// backtest_jobs（kind='library'，result_text 存胜率/盈亏比报告），前端「回测」tab 展示。
+// 可选 query：start/end（YYYYMMDD）、maxstocks（默认 300）。
+// English: POST /api/research/library/{id}/backtest — replays one applied library rule (fac_<n>/pat_<n>)
+// over historical bars via the bt_strategy child (same Evaluate semantics as live), persisting the
+// summary into backtest_jobs (kind='library', result_text). Optional query: start/end/maxstocks.
+func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
+	ruleID := r.PathValue("id")
+	kind, num, ok := parseLibraryRuleID(ruleID)
+	if !ok {
+		writeError(w, 400, "无效规则 ID（应为 fac_<n> 或 pat_<n>）")
+		return
+	}
+	if s.researchDir == "" {
+		writeError(w, 503, "研究目录未接入")
+		return
+	}
+	q := r.URL.Query()
+	start, end, maxStocks := q.Get("start"), q.Get("end"), 300
+	if v, err := strconv.Atoi(q.Get("maxstocks")); err == nil && v > 0 {
+		maxStocks = v
+	}
+
+	key := libraryJobKey(num)
+	backtestJobs.Lock()
+	for _, j := range backtestJobs.m {
+		if j.Status == "running" || j.Status == "paused" {
+			backtestJobs.Unlock()
+			writeError(w, 409, "已有回测任务在运行，请先取消或等待完成")
+			return
+		}
+	}
+	job := &backtestJob{CandID: key, Status: "running", Started: time.Now(), Progress: "0%", lastProgress: time.Now().Unix()}
+	backtestJobs.m[key] = job
+	backtestJobs.Unlock()
+	s.persistLibraryJob(kind, num, "running", "", "")
+
+	go func() {
+		text, err := s.runLibraryBacktest(kind, num, start, end, maxStocks)
+		backtestJobs.Lock()
+		j := backtestJobs.m[key]
+		status, errMsg := "done", ""
+		if err != nil {
+			status, errMsg = "error", err.Error()
+		}
+		if j != nil {
+			j.Status, j.Err = status, errMsg
+		}
+		backtestJobs.Unlock()
+		s.persistLibraryJob(kind, num, status, text, errMsg)
+		log.Printf("[research] 战法库回测完成 %s_%d: %v", kind, num, err)
+	}()
+	writeJSON(w, 202, map[string]string{"status": "started"})
+}
+
+// parseLibraryRuleID 解析 fac_<n> / pat_<n> 规则 ID → (kind, 序号)。
+func parseLibraryRuleID(id string) (string, int64, bool) {
+	id = strings.ToLower(strings.TrimSpace(id))
+	switch {
+	case strings.HasPrefix(id, "fac_"):
+		n, err := strconv.ParseInt(strings.TrimPrefix(id, "fac_"), 10, 64)
+		return "factor", n, err == nil && n > 0
+	case strings.HasPrefix(id, "pat_"):
+		n, err := strconv.ParseInt(strings.TrimPrefix(id, "pat_"), 10, 64)
+		return "pattern", n, err == nil && n > 0
+	}
+	return "", 0, false
+}
+
+// persistLibraryJob 把战法库回测任务状态写入 backtest_jobs（kind='library'，candidate_id=规则序号）。
+func (s *Server) persistLibraryJob(kind string, num int64, status, resultText, errMsg string) {
+	if s.researchDB == nil {
+		return
+	}
+	if err := s.researchDB.UpsertBacktestJob(&store.BacktestJob{
+		Kind: "library", CandidateID: num, Status: status,
+		ResultText: resultText, Error: errMsg,
+	}); err != nil {
+		log.Printf("[research] 持久化战法库回测任务失败 %s_%d: %v", kind, num, err)
+	}
+}
+
+// runLibraryBacktest 同步执行一次 bt_strategy 子进程并解析汇总报告文本。
+// English: runs one bt_strategy child synchronously and parses the summary report text.
+func (s *Server) runLibraryBacktest(kind string, num int64, start, end string, maxStocks int) (string, error) {
+	bin := ""
+	for _, cand := range []string{"/opt/quant/bt_strategy", "/usr/local/bin/bt_strategy"} {
+		if _, err := os.Stat(cand); err == nil {
+			bin = cand
+			break
+		}
+	}
+	if bin == "" {
+		if p, err := exec.LookPath("bt_strategy"); err == nil {
+			bin = p
+		}
+	}
+	if bin == "" {
+		return "", fmt.Errorf("找不到 bt_strategy 二进制（需部署 cmd/backtest_strategy）")
+	}
+	dbPath := filepath.Join(s.researchDir, "trading.db")
+	if start == "" {
+		start = "20230101"
+	}
+	if end == "" {
+		end = time.Now().Format("20060102")
+	}
+	args := []string{
+		"--db", dbPath, "--datadir", s.researchDir,
+		"--strategy", kind, "--start", start, "--end", end,
+		"--maxstocks", strconv.Itoa(maxStocks),
+	}
+	outBytes, err := exec.Command(bin, args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("bt_strategy 失败: %v: %s", err, string(outBytes))
+	}
+	return parseBtSummary(string(outBytes)), nil
+}
+
+// btSummaryRe 匹配汇总块（触发信号数/胜率/盈亏比/平均持仓天数 行集合）。
+var btSummaryRe = regexp.MustCompile(`(?m)^(触发信号数|胜率|平均盈利|平均亏损|盈亏比|平均持仓天数):.*$`)
+
+// parseBtSummary 从 bt_strategy 输出提取汇总行拼接为报告文本。
+func parseBtSummary(out string) string {
+	lines := btSummaryRe.FindAllString(out, -1)
+	if len(lines) == 0 {
+		return "无触发信号"
+	}
+	return strings.Join(lines, "；")
+}
 
 // BacktestJobsSnapshot 供测试/诊断读取回测任务表。
 // English: exposes the backtest job table for tests/diagnostics.

@@ -1140,6 +1140,20 @@ export async function resumeBacktest(id) {
   return request('/api/research/backtest/' + encodeURIComponent(id) + '/resume', { method: 'POST' })
 }
 
+/** 战法库回测：对一条已应用规则（fac_<n>/pat_<n>）跑历史回放回测（阶段3.4，异步，结果进回测 tab）。
+ *  params 可选 {start,end,maxstocks} */
+/** Library-rule backtest: replay one applied rule over history (async; result lands in the backtest tab) */
+export async function backtestLibraryRule(id, params) {
+  const qs = new URLSearchParams()
+  if (params) {
+    if (params.start) qs.set('start', params.start)
+    if (params.end) qs.set('end', params.end)
+    if (params.maxstocks) qs.set('maxstocks', params.maxstocks)
+  }
+  const q = qs.toString()
+  return request('/api/research/library/' + encodeURIComponent(id) + '/backtest' + (q ? '?' + q : ''), { method: 'POST' })
+}
+
 /** 查询回测任务状态（GET /api/research/backtest/{id}） */
 /** Query a backtest job's status (GET /api/research/backtest/{id}) */
 export async function fetchBacktestStatus(id) {

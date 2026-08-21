@@ -273,6 +273,8 @@ func (d *DB) migrate() error {
 	for _, mig := range []struct{ table, column, ddl string }{
 		{"daily_basic", "pcf_ttm", "ALTER TABLE daily_basic ADD COLUMN pcf_ttm REAL"},
 		{"daily_basic", "is_st", "ALTER TABLE daily_basic ADD COLUMN is_st INTEGER"},
+		// 阶段3.4 战法库回测：done 任务的汇总报告文本（胜率/盈亏比等，前端直接展示）
+		{"backtest_jobs", "result_text", "ALTER TABLE backtest_jobs ADD COLUMN result_text TEXT DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {
