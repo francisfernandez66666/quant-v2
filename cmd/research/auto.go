@@ -450,39 +450,17 @@ func cmdDiscoverPatterns(db *store.DB, args []string) {
 			},
 		},
 	}
-	// 只装配形态模板用到的算子因子（而非全部 45 因子），显著降低内存占用
-	// （5545 只 × 近3年 × 6 形态算子 ≈ 196MB，900M 内）。
-	// English: assemble only the morphology-operator factors used by the templates (instead of all 45),
-	// cutting memory sharply (~196MB for 5545 × 3y × 6 operators, within 900M).
-	needFid := map[string]bool{
-		"Drawdown20": true, "VolShrink": true, "BullAlign": true, "VolSurge5": true, "Brk20": true,
-	}
-	for _, tmpl := range templates {
-		for _, cg := range tmpl.Conds {
-			needFid[cg.Factor] = true
-		}
-	}
-	var defs []factor.Def
-	for _, d := range factor.All() {
-		if needFid[d.ID] {
-			defs = append(defs, d)
-		}
-	}
-	log.Printf("装配 %d 只股票（%s ~ %s，形态算子 %d 个）…", len(codes), *start, *end, len(defs))
-	panels, err := research.BuildPanels(db, codes, *start, *end, defs)
-	if err != nil {
-		log.Fatalf("装配面板失败: %v", err)
-	}
-	if len(panels) == 0 {
-		log.Fatalf("无有效面板")
-	}
-
 	opts := research.DiscoverOptsPattern{
 		Horizon: *h, MinTrigger: *minTrigger, MinExcess: *minExcess, SplitPct: *split,
 	}
-	log.Printf("形态搜索：模板=%d 个 目标超额>%.3f 最小触发=%d 样本外=%.0f%%…",
-		len(templates), *minExcess, *minTrigger, *split*100)
-	results := research.DiscoverPatterns(panels, templates, opts)
+	// 窗口分块版（内存治理收口）：旧路径一次性全量装配全市场×3年面板，实测 RSS ~700MB，
+	// 是 1.6G 小机的内存挤压元凶（load 高的真正来源是内存回收风暴而非 CPU 配额失效）。
+	// 窗口版逐窗装配-评估-释放 + 窗口断点 + 进度输出，聚合口径与全量版一致。
+	// English: window-chunked discovery — the legacy full-range assembly peaked ~700MB RSS and caused
+	// reclaim storms on the 1.6G box; the windowed path bounds memory and adds checkpoints/progress.
+	log.Printf("形态搜索（窗口分块）：%d 只股票（%s ~ %s）模板=%d 个 目标超额>%.3f 最小触发=%d 样本外=%.0f%%…",
+		len(codes), *start, *end, len(templates), *minExcess, *minTrigger, *split*100)
+	results := research.DiscoverPatternsWindowed(db, codes, *start, *end, templates, opts)
 	if len(results) == 0 {
 		log.Printf("无形态通过护栏（触发数不足或超额不足）")
 		return

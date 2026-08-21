@@ -12,9 +12,32 @@
 package research
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"log"
 	"math"
 	"sort"
+
+	"quant-trading-v2/internal/factor"
+	"quant-trading-v2/internal/store"
 )
+
+// patternWarmupDays 窗口左侧预热边距（交易日）：覆盖形态算子最大的回看窗（20 日）再加余量，
+// 消除窗口头的算子截断误差。English: left warm-up margin in trade days for morphology lookbacks.
+const patternWarmupDays = 40
+
+// patWinAgg 单窗口聚合产物（断点 payload）：基准和/计数 + 每个参数组合的触发收益与样本外拆分。
+// 全部为线性可合并量——跨窗口累加即得全局统计，天然支持断点续算。
+// English: per-window aggregate (checkpoint payload): benchmark sums/counts plus per-combo trigger
+// returns and out-of-sample split — all linearly mergeable across windows.
+type patWinAgg struct {
+	BaseSum float64     `json:"bs"`
+	BaseN   int         `json:"bn"`
+	Rets    [][]float64 `json:"rets"`
+	OutSums []float64   `json:"os"`
+	OutNs   []int       `json:"on"`
+}
 
 // PatternCond 模板中的一个算子条件：某因子值落在 [Min, Max) 区间才视为满足。
 // （PatternCond is one operator condition: the factor value must lie in [Min, Max).）
@@ -236,4 +259,204 @@ func expandTemplate(tmpl PatternTemplate, horizon int) []Pattern {
 		}
 	}
 	return result
+}
+
+// DiscoverPatternsWindowed 形态模板搜索的窗口分块版（内存治理收口）：
+// 旧路径一次性全量装配全市场×全区间面板（实测 RSS ~700MB，1.6G 小机内存挤压元凶），
+// 改为按交易日窗口（60 日，与因子发现同口径）逐窗装配-评估-释放；聚合量全部线性可合并，
+// 跨窗口累加结果与全量版同口径。支持窗口级断点（stage="pattern"，被抢占续跑跳过已完成窗口）
+// 与"发现进度 xx%"进度输出。English: window-chunked pattern search — assembles per 60-day window
+// (same cadence as factor discovery) instead of one full-range panel set (~700MB RSS); all aggregates
+// are linearly mergeable so cross-window totals match the full version. Checkpoint-aware
+// (stage "pattern") with progress lines for the queue worker.
+func DiscoverPatternsWindowed(db *store.DB, codes []string, start, end string,
+	templates []PatternTemplate, opts DiscoverOptsPattern) []Pattern {
+
+	combos, accs, baseMean := discoverPatternsWindowedRaw(db, codes, start, end, templates, opts)
+
+	baseMeanV := baseMean
+	out := make([]Pattern, 0, len(combos))
+	for ci := range combos {
+		n := len(accs[ci].rets)
+		if n < opts.MinTrigger {
+			continue
+		}
+		p := combos[ci]
+		sum := 0.0
+		wins := 0.0
+		for _, r := range accs[ci].rets {
+			sum += r
+			if r > baseMeanV {
+				wins++
+			}
+		}
+		p.Triggers = n
+		p.MeanRet = sum / float64(n)
+		p.Excess = p.MeanRet - baseMeanV
+		p.HitRate = wins / float64(n)
+		if accs[ci].outN >= int(float64(opts.MinTrigger)*0.3) {
+			p.SampleOut = accs[ci].outSum/float64(accs[ci].outN) - baseMeanV
+		}
+		// 护栏与全量版一致：触发数达标 + 平均超额达标 + 样本外超额为正
+		if p.Triggers >= opts.MinTrigger && p.Excess >= opts.MinExcess && p.SampleOut > 0 {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Excess > out[j].Excess })
+	return out
+}
+
+// discoverPatternsWindowedRaw 窗口聚合内核（无护栏，供公共出口与测试复用）：
+// 返回展开后的参数组合、每组合的触发收益数组/样本外拆分、全局基准均值。
+// English: window-aggregation core without guard rails (shared by the public entry and tests).
+func discoverPatternsWindowedRaw(db *store.DB, codes []string, start, end string,
+	templates []PatternTemplate, opts DiscoverOptsPattern,
+) ([]Pattern, []struct {
+	rets   []float64
+	outSum float64
+	outN   int
+}, float64) {
+
+	if opts.Horizon <= 0 {
+		opts.Horizon = 5
+	}
+	if opts.MinTrigger <= 0 {
+		opts.MinTrigger = 20
+	}
+	if opts.MinExcess <= 0 {
+		opts.MinExcess = 0.01
+	}
+	if len(templates) == 0 || len(codes) == 0 {
+		return nil, nil, 0
+	}
+
+	dates, err := db.TradeDates(start, end)
+	if err != nil || len(dates) == 0 {
+		return nil, nil, 0
+	}
+	chunks := WindowChunks(dates, 0)
+	// 样本外拆分日：按全局交易日序列取分位点（与全量版 unionDates 口径一致）
+	splitDate := ""
+	if opts.SplitPct > 0 && opts.SplitPct < 1 {
+		idx := int(float64(len(dates)) * opts.SplitPct)
+		if idx < len(dates) {
+			splitDate = dates[idx]
+		}
+	}
+
+	// 只装配模板用到的形态算子（而非全部注册因子），进一步压内存
+	needFid := map[string]bool{}
+	for _, tmpl := range templates {
+		for _, cg := range tmpl.Conds {
+			needFid[cg.Factor] = true
+		}
+	}
+	var defs []factor.Def
+	for _, d := range factor.All() {
+		if needFid[d.ID] {
+			defs = append(defs, d)
+		}
+	}
+
+	// 参数网格展开一次（每组合一个累积器）
+	var combos []Pattern
+	for _, tmpl := range templates {
+		combos = append(combos, expandTemplate(tmpl, opts.Horizon)...)
+	}
+	accs := make([]struct {
+		rets   []float64
+		outSum float64
+		outN   int
+	}, len(combos))
+	baseSum, baseN := 0.0, 0
+
+	rk := fmt.Sprintf("dp|%s|%s|h%d|mt%d|%.2f|%.0f|%s",
+		start, end, opts.Horizon, opts.MinTrigger, opts.MinExcess, opts.SplitPct*100,
+		func() string {
+			sum := sha256.Sum256([]byte(fmt.Sprintf("%v", codes)))
+			return hex.EncodeToString(sum[:])[:10]
+		}())
+	log.Printf("[discover-patterns] 断点key=%s 窗口数=%d", rk, len(chunks))
+	prog := newStageProgress(5, 95, len(chunks))
+
+	for _, w := range chunks {
+		var wa patWinAgg
+		wck := winCkpt{db: db, resumeKey: rk, stage: "pattern"}
+		if !wck.load(w, &wa) {
+			asmbEnd := w[1]
+			for i := 0; i < opts.Horizon; i++ {
+				asmbEnd = nextDayStr(asmbEnd)
+			}
+			// 左侧预热边距：形态算子含 20 日级回看，窗口头若直接从 w0 装配，
+			// 前 ~20 日算子值为 NaN 导致触发丢失。回退 40 个交易日取预热历史，
+			// 评估仍然只计 [w0,w1] 内日期——与全量版口径对齐。
+			// English: left warm-up margin — operators need ~20d lookback; assemble from 40 trade-dates
+			// before w0 (evaluation still restricted to [w0,w1]) so edge values match the full run.
+			asmbStart := w[0]
+			if gi := sort.SearchStrings(dates, w[0]); gi > 0 {
+				lo := gi - patternWarmupDays
+				if lo < 0 {
+					lo = 0
+				}
+				asmbStart = dates[lo]
+			}
+			panels, err := BuildPanels(db, codes, asmbStart, asmbEnd, defs)
+			if err != nil {
+				prog.tick()
+				continue
+			}
+			wa = patWinAgg{Rets: make([][]float64, len(combos)), OutSums: make([]float64, len(combos)), OutNs: make([]int, len(combos))}
+			// 基准：窗口内全部股票日的 h 日前瞻收益（与全量版 baseRet 同集合）
+			for _, pnl := range panels {
+				for i := 0; i < pnl.Series.Len()-opts.Horizon; i++ {
+					d := pnl.Series.Dates[i]
+					if d < w[0] || d > w[1] {
+						continue
+					}
+					if r := forwardReturn(pnl.Series, i, opts.Horizon); !isNaN(r) {
+						wa.BaseSum += r
+						wa.BaseN++
+					}
+				}
+			}
+			// 触发：单遍扫描同时评估所有参数组合（比逐组合重扫快「组合数」倍）
+			for ci := range combos {
+				p := combos[ci]
+				for _, pnl := range panels {
+					for i := 0; i < pnl.Series.Len()-opts.Horizon; i++ {
+						d := pnl.Series.Dates[i]
+						if d < w[0] || d > w[1] {
+							continue
+						}
+						if !patternTriggers(pnl, p, i) {
+							continue
+						}
+						r := forwardReturn(pnl.Series, i, opts.Horizon)
+						if isNaN(r) {
+							continue
+						}
+						wa.Rets[ci] = append(wa.Rets[ci], r)
+						if splitDate != "" && d >= splitDate {
+							wa.OutSums[ci] += r
+							wa.OutNs[ci]++
+						}
+					}
+				}
+			}
+			wck.save(w, wa)
+		}
+		baseSum += wa.BaseSum
+		baseN += wa.BaseN
+		for ci := range combos {
+			accs[ci].rets = append(accs[ci].rets, wa.Rets[ci]...)
+			accs[ci].outSum += wa.OutSums[ci]
+			accs[ci].outN += wa.OutNs[ci]
+		}
+		prog.tick()
+	}
+	baseMean := 0.0
+	if baseN > 0 {
+		baseMean = baseSum / float64(baseN)
+	}
+	return combos, accs[:], baseMean
 }

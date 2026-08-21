@@ -64,6 +64,18 @@ func seedWindowDB(t *testing.T) *store.DB {
 	if _, err := db.InsertRows("adj_factor", adjCols, adjRows); err != nil {
 		t.Fatalf("插入 adj_factor 失败: %v", err)
 	}
+
+	// stocks 表：StockCodes 从该表读取——此前缺失导致依赖它的测试空转（0 只股票 0==0 假通过）
+	// English: seed the stocks table too — StockCodes reads it; without rows some tests passed vacuously.
+	var stockRows []map[string]any
+	for k := 0; k < 6; k++ {
+		stockRows = append(stockRows, map[string]any{
+			"ts_code": fmt.Sprintf("00000%d.SZ", k), "name": "测试", "industry": "测试",
+		})
+	}
+	if _, err := db.InsertRows("stocks", []string{"ts_code", "name", "industry"}, stockRows); err != nil {
+		t.Fatalf("插入 stocks 失败: %v", err)
+	}
 	return db
 }
 

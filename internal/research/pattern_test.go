@@ -156,3 +156,64 @@ func TestExpandTemplate(t *testing.T) {
 		}
 	}
 }
+
+// TestPatternWindowedMatchesFull 窗口分块形态搜索与"单窗全量参考"证据一致：
+// 参考口径 = 尾部多算 h 天的面板 + evalPattern（与窗口版相同的日期覆盖），
+// 断言 Triggers/平均收益/超额/命中率/样本外全部一致（浮点容差）。
+// English: windowed pattern search must match a single-window full reference (tail-extended panels
+// + evalPattern) on every evidence field within float tolerance.
+func TestPatternWindowedMatchesFull(t *testing.T) {
+	db := seedWindowDB(t)
+	codes, _ := db.StockCodes() // 夹具已含 stocks 表
+	start, end := "20230101", datesEnd(db)
+	const h = 5
+
+	// 全触发模板：条件恒真（Brk20 ∈ (-inf,+inf)），触发数=全部有效股票日，
+	// 使期望值可手工推导且对任何合成数据稳定。
+	tmpl := PatternTemplate{Name: "全触发", Conds: []CondGrid{
+		{Factor: "Brk20", MinVals: []float64{-1e9}, MaxVals: []float64{1e9}},
+	}}
+	opts := DiscoverOptsPattern{Horizon: h, MinTrigger: 1, MinExcess: -1e9, SplitPct: 0.7}
+
+	win := DiscoverPatternsWindowed(db, codes, start, end, []PatternTemplate{tmpl}, opts)
+	if len(win) != 1 {
+		t.Fatalf("窗口版应产出 1 条（恒真模板必过触发数护栏），实际 %d", len(win))
+	}
+
+	// 全量参考：装配 [start, end+h] 面板后走 evalPattern（尾部补 h 天保证前瞻完整）
+	defs := factor.All()
+	var need []factor.Def
+	for _, d := range defs {
+		if d.ID == "Brk20" {
+			need = append(need, d)
+		}
+	}
+	asmbEnd := end
+	for i := 0; i < h; i++ {
+		asmbEnd = nextDayStr(asmbEnd)
+	}
+	panels, err := BuildPanels(db, codes, start, asmbEnd, need)
+	if err != nil {
+		t.Fatalf("BuildPanels 失败: %v", err)
+	}
+	ref := evalPattern(panels, Pattern{Name: "全触发", Conds: []PatternCond{
+		{Factor: "Brk20", Min: -1e9, Max: 1e9},
+	}, Horizon: h}, opts, "", "")
+
+	got := win[0]
+	if got.Triggers != ref.Triggers {
+		t.Errorf("Triggers 不一致: win=%d ref=%d", got.Triggers, ref.Triggers)
+	}
+	for _, pair := range []struct {
+		name string
+		a, b float64
+	}{
+		{"MeanRet", got.MeanRet, ref.MeanRet},
+		{"Excess", got.Excess, ref.Excess},
+		{"HitRate", got.HitRate, ref.HitRate},
+	} {
+		if diff := pair.a - pair.b; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("%s 不一致: win=%.10f ref=%.10f", pair.name, pair.a, pair.b)
+		}
+	}
+}
