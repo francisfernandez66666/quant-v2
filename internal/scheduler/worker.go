@@ -190,10 +190,18 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 	if len(steps) == 0 {
 		steps = config.DefaultSchedulerConfig().Nightly.Steps
 	}
-	// 回测开关：开启时在 discover_factors 之后追加一次 B4 全链路回测（回填候选 avg_excess）。
+	// 回测开关：开启时在 discover_factors 之后追加一次 B4 全链路回测（回填候选 avg_excess）；
+	// 并在 discover_patterns 之后追加战法库全量回放（因子+形态启用规则，实盘口径回归验证）——
+	// 修复"自动研究没有形态战法回测"的不对称。
+	// English: when the toggle is on, append the B4 chain backtest after factor discovery AND a
+	// full library replay (factor+pattern rules) after pattern discovery.
 	if cfg.Nightly.BacktestEnabled && !containsStep(steps, "backtest") {
 		steps = insertAfter(steps, "discover_factors", "backtest")
 		log.Printf("[scheduler] 回测开关开启：夜间链追加 backtest 任务")
+	}
+	if cfg.Nightly.BacktestEnabled && !containsStep(steps, "library_replay") {
+		steps = insertAfter(steps, "discover_patterns", "library_replay")
+		log.Printf("[scheduler] 回测开关开启：夜间链追加 library_replay 任务（战法库因子+形态回放）")
 	}
 	for i, step := range steps {
 		typ, payload, ok := stepTask(step, cfg, today)
@@ -272,6 +280,13 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 		return store.TaskBacktestNightly, mustJSON(p), true
 	case "paper_research":
 		return store.TaskPaperResearch, "{}", true
+	case "library_replay":
+		// 战法库全量回放（因子+形态启用规则一起）：夜间对现行战法做实盘口径的
+		// 胜率/盈亏比回归验证，结果落 backtest_jobs（kind=library）供「回测」tab 查看。
+		// English: replays every enabled factor+pattern rule — nightly live-semantics regression test.
+		return store.TaskBacktestStrategy, mustJSON(map[string]any{
+			"kind": "all", "start": researchStart, "end": today, "maxstocks": 300,
+		}), true
 	case "list":
 		return store.TaskList, "{}", true
 	}

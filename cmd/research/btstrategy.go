@@ -19,7 +19,7 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 	start := fs.String("start", "20230101", "回放起始日 YYYYMMDD")
 	end := fs.String("end", "", "回放结束日 YYYYMMDD（空=今天）")
 	strategy := fs.String("strategy", "double_bump",
-		"战法: double_bump|dragon|dragon_return|n_shape|factor(战法库全部启用因子规则)|pattern(全部启用形态规则)")
+		"战法: double_bump|dragon|dragon_return|n_shape|factor(库全部启用因子规则)|pattern(库全部启用形态规则)|all(因子+形态一起)")
 	maxStocks := fs.Int("maxstocks", 500, "最多回测股票数（0=全部）")
 	d1 := fs.Float64("d1", 20, "n_shape 的规则 D1 分（0=不触发 n_shape）")
 	industry := fs.Bool("industry", false, "dragon 是否用行业板块涨幅近似板块共振")

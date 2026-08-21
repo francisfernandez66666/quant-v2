@@ -562,9 +562,29 @@ func (o *Options) Run() error {
 		codes = codes[:o.MaxStocks]
 	}
 
-	// 阶段3.4：factor/pattern → 从战法库加载全部启用规则（每条规则一个 adapter，分组统计）
+	// 阶段3.4：factor/pattern → 从战法库加载全部启用规则（每条规则一个 adapter，分组统计）。
+	// "all"（子系统统一改造新增）：因子+形态启用规则一起回放——夜间 library_replay 步骤用，
+	// 让自动研究每晚对现行战法做一次实盘口径的胜率/盈亏比回归验证。
+	// English: "all" replays every enabled factor AND pattern rule in one pass — used by the nightly
+	// library_replay step so auto-research regression-tests live strategies nightly.
 	var ads []adapter
-	if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
+	if strings.EqualFold(o.Strategy, "all") {
+		fa, ferr := loadRuleAdapters("factor", o.DataDir)
+		if ferr != nil {
+			return ferr
+		}
+		pa, perr := loadRuleAdapters("pattern", o.DataDir)
+		if perr != nil {
+			return perr
+		}
+		ads = append(fa, pa...)
+		if len(ads) == 0 {
+			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
+			return nil
+		}
+		log.Printf("战法库已加载 %d 条启用规则（factor=%d pattern=%d）",
+			len(ads), len(fa), len(pa))
+	} else if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
 		ads, err = loadRuleAdapters(o.Strategy, o.DataDir)
 		if err != nil {
 			return err

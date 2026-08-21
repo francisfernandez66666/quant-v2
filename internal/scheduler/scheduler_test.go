@@ -182,10 +182,11 @@ func TestNightlyBacktestStepInserted(t *testing.T) {
 		defer s.mu.Unlock()
 		return s.state.Done && s.state.Day == "20260822"
 	}, "夜间作业应完成")
-	// 步骤默认不含 backtest，BacktestEnabled 时应插入（fake 只记录调用，无法区分步骤，但应多一次调用）
-	// 默认 cfgSamples steps=["dataload"]，追加 backtest 后为 2 步，fake 应被调用 2 次
-	if got := callCount(t, logPath); got != 2 {
-		t.Errorf("BacktestEnabled 应追加 backtest 步骤使调用次数=2, 实际 %d", got)
+	// 步骤默认不含 backtest，BacktestEnabled 时应插入 backtest + library_replay
+	// （子系统统一改造后：B4 回测 + 战法库因子/形态回放）。
+	// 默认 cfgSamples steps=["dataload"]，追加后为 3 步，fake 应被调用 3 次
+	if got := callCount(t, logPath); got != 3 {
+		t.Errorf("BacktestEnabled 应追加 backtest+library_replay 使调用次数=3, 实际 %d", got)
 	}
 }
 

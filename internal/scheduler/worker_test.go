@@ -4,6 +4,7 @@ package scheduler
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,7 +91,7 @@ func TestWorkerDrainsQueueContinuously(t *testing.T) {
 	fake := fakeScript(t, dir)
 	dbPath := filepath.Join(dir, "trading.db")
 	cfg := cfgSamples(fake, dbPath)
-	cfg.Nightly.BacktestEnabled = true // 链含 2 个任务：dataload + backtest_nightly
+	cfg.Nightly.BacktestEnabled = true // 链含 3 个任务：dataload + backtest_nightly + library_replay
 	cfgPath := mustConfig(t, cfg)
 	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
 	loc := time.FixedZone("CST", 8*3600)
@@ -102,8 +103,8 @@ func TestWorkerDrainsQueueContinuously(t *testing.T) {
 		defer s.mu.Unlock()
 		return s.state.Done && s.state.Day == "20260822"
 	}, "两次 tick 之间链也应全部排空(Done=true)")
-	if got := callCount(t, logPath); got != 2 {
-		t.Fatalf("链应有 2 个任务被执行, 实际 %d", got)
+	if got := callCount(t, logPath); got != 3 {
+		t.Fatalf("链应有 3 个任务被执行, 实际 %d", got)
 	}
 }
 
@@ -144,4 +145,31 @@ func TestManualHighQueuedDuringSession(t *testing.T) {
 		t.Fatal("盘中不应启动任何研究子进程")
 	}
 	_ = config.DefaultSchedulerConfig // 引用防 unused（cfgSamples 已覆盖默认）
+}
+
+// TestLibraryReplayStepMappedAndInserted 回测开关开启时，夜间链应在 discover_patterns 后
+// 追加 library_replay 步骤，且该步骤映射为 kind=all 的战法库回放任务（修复形态战法无自动回测）。
+func TestLibraryReplayStepMappedAndInserted(t *testing.T) {
+	typ, payload, ok := stepTask("library_replay", config.DefaultSchedulerConfig(), "20260822")
+	if !ok || typ != store.TaskBacktestStrategy {
+		t.Fatalf("library_replay 映射错误: ok=%v typ=%s", ok, typ)
+	}
+	if !strings.Contains(payload, `"kind":"all"`) {
+		t.Fatalf("payload 应为 kind=all, 得 %s", payload)
+	}
+	steps := []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "list"}
+	if containsStep(steps, "backtest") {
+		t.Fatal("前置条件：默认步骤不含 backtest")
+	}
+	steps = insertAfter(steps, "discover_factors", "backtest")
+	steps = insertAfter(steps, "discover_patterns", "library_replay")
+	want := []string{"dataload", "sector_rebuild", "discover_factors", "backtest", "discover_patterns", "library_replay", "list"}
+	if len(steps) != len(want) {
+		t.Fatalf("链长度 %d != %d", len(steps), len(want))
+	}
+	for i := range want {
+		if steps[i] != want[i] {
+			t.Fatalf("链顺序错误: %v", steps)
+		}
+	}
 }
