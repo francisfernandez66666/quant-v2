@@ -1107,10 +1107,37 @@ export async function rejectResearchCandidate(id) {
   return request('/api/research/candidates/' + encodeURIComponent(id) + '/reject', { method: 'POST' })
 }
 
-/** 对指定候选跑一次全量回测（POST /api/research/candidates/{id}/backtest，异步） */
-/** Run a full backtest on a candidate (POST ..., async) */
-export async function backtestResearchCandidate(id) {
-  return request('/api/research/candidates/' + encodeURIComponent(id) + '/backtest', { method: 'POST' })
+/** 对指定候选跑一次全量回测（POST /api/research/candidates/{id}/backtest，异步）。
+ *  params 可选 {start,end,top_k,min_stocks}：自定义回测时长与选股数（阶段3.3，透传 CLI） */
+/** Run a full backtest on a candidate (POST ..., async). Optional params pass through to the CLI */
+export async function backtestResearchCandidate(id, params) {
+  const qs = new URLSearchParams()
+  if (params) {
+    if (params.start) qs.set('start', params.start)
+    if (params.end) qs.set('end', params.end)
+    if (params.top_k) qs.set('top_k', params.top_k)
+    if (params.min_stocks) qs.set('min_stocks', params.min_stocks)
+  }
+  const q = qs.toString()
+  return request('/api/research/candidates/' + encodeURIComponent(id) + '/backtest' + (q ? '?' + q : ''), { method: 'POST' })
+}
+
+/** 取消运行中的回测（kill 子进程 + 标 interrupted；断点缓存有效可续跑）（阶段3.2） */
+/** Cancel a running backtest (kills the child, marks interrupted; checkpoints stay valid) */
+export async function cancelBacktest(id) {
+  return request('/api/research/backtest/' + encodeURIComponent(id) + '/cancel', { method: 'POST' })
+}
+
+/** 暂停回测子进程（SIGSTOP，任务标 paused）（阶段3.2） */
+/** Pause a backtest child process (SIGSTOP; job marked paused) */
+export async function pauseBacktest(id) {
+  return request('/api/research/backtest/' + encodeURIComponent(id) + '/pause', { method: 'POST' })
+}
+
+/** 恢复已暂停的回测（SIGCONT，任务回到 running）（阶段3.2） */
+/** Resume a paused backtest (SIGCONT; job back to running) */
+export async function resumeBacktest(id) {
+  return request('/api/research/backtest/' + encodeURIComponent(id) + '/resume', { method: 'POST' })
 }
 
 /** 查询回测任务状态（GET /api/research/backtest/{id}） */

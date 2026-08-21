@@ -410,6 +410,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleResearchReject))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest))
 	s.mux.HandleFunc("GET /api/research/backtest/{id}", s.authMiddleware(s.handleBacktestStatus))
+	// 阶段3.2 回测运行控制：取消（kill+interrupted，断点缓存可续跑）/ 暂停（SIGSTOP）/ 继续（SIGCONT）
+	s.mux.HandleFunc("POST /api/research/backtest/{id}/cancel", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestCancel))
+	s.mux.HandleFunc("POST /api/research/backtest/{id}/pause", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestPause))
+	s.mux.HandleFunc("POST /api/research/backtest/{id}/resume", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestResume))
 	// 回测任务中心：运行中任务列表（前端刷新后恢复轮询）+ 全部任务列表（回测 tab 进度查看，含夜间全量）
 	// English: backtest task center — running-job list (for frontend polling recovery after a refresh)
 	// and the full job list (backtest tab progress view, including nightly runs).

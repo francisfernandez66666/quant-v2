@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"quant-trading-v2/internal/research"
@@ -294,42 +295,83 @@ var backtestJobs = struct {
 // English: one backtest job state.
 type backtestJob struct {
 	CandID    int64     `json:"candidate_id"`
-	Status    string    `json:"status"` // running | done | error
+	Status    string    `json:"status"` // running | paused | done | error | interrupted
 	Started   time.Time `json:"started"`
 	Progress  string    `json:"progress"`
 	AvgExcess float64   `json:"avg_excess,omitempty"`
 	Err       string    `json:"error,omitempty"`
+	// 运行控制（阶段3.2）：子进程句柄与标志。cancel=kill+interrupted；pause=SIGSTOP；
+	// resume=SIGCONT；lastProgress 供看门狗检测"进度停滞"（挂死置 error）。
+	// English: run-control handles — cancel kills and marks interrupted; pause sends SIGSTOP;
+	// resume sends SIGCONT; lastProgress feeds the stall watchdog (hung children error out).
+	cmd          *exec.Cmd
+	paused       bool
+	cancelReq    bool
+	lastProgress int64 // unix 秒，最近一次进度行时间（原子访问经 backtestJobs 锁保护）
+}
+
+// backtestRunOpts 一次候选回测的运行参数（阶段3.3 自定义时长与选股数：透传 CLI）。
+// English: per-run backtest parameters (custom range and pick counts, passed through to the CLI).
+type backtestRunOpts struct {
+	Start     string // YYYYMMDD 空=CLI 默认
+	End       string // YYYYMMDD 空=今天
+	TopK      int    // 每事件选股数 0=CLI 默认
+	MinStocks int    // 每日最小样本 0=CLI 默认
 }
 
 // handleCandidateBacktest 处理 POST /api/research/candidates/{id}/backtest：对指定候选跑一次 B4 全量回测
 // （异步后台执行，前端轮询 GET /api/research/backtest/{id} 拿进度与结果）。
 // 任务状态同步落库 backtest_jobs（kind='candidate'），quant 重启后任务可查、可续跑。
-// English: POST /api/research/candidates/{id}/backtest — run a full B4 backtest on a specific candidate
-// (async background; frontend polls GET /api/research/backtest/{id} for progress/result). The job is
-// persisted to backtest_jobs (kind='candidate') so it survives quant restarts and can be resumed.
+// 可选 query 参数（阶段3.3）：start/end（YYYYMMDD 回测时长）、top_k（每事件选股数）、
+// min_stocks（每日最小样本）——透传给 research backtest CLI。
+// 单例限制（阶段3.1）：全局同时只允许一个候选回测运行/暂停，防 1 核 VPS 并发回测互相拖死
+// （此前多候选并发全部卡 0% 即此因）。
+// English: POST /api/research/candidates/{id}/backtest — runs a full B4 backtest on a candidate
+// (async; frontend polls for progress). Persisted to backtest_jobs. Optional query params start/end/
+// top_k/min_stocks pass through to the CLI. Single-flight: only one candidate backtest may run at a
+// time so concurrent full backtests can't starve the 1-core box.
 func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, 400, "无效 id")
 		return
 	}
+	// 阶段3.3：解析可选运行参数
+	q := r.URL.Query()
+	opts := backtestRunOpts{Start: q.Get("start"), End: q.Get("end")}
+	if v, err := strconv.Atoi(q.Get("top_k")); err == nil && v > 0 {
+		opts.TopK = v
+	}
+	if v, err := strconv.Atoi(q.Get("min_stocks")); err == nil && v > 0 {
+		opts.MinStocks = v
+	}
+
 	backtestJobs.Lock()
-	if j, ok := backtestJobs.m[id]; ok && j.Status == "running" {
+	// 单例限制：任一 running/paused 任务存在即拒绝新启动（同 id 视为重复点击返回现态）。
+	// English: single-flight — any running/paused job blocks a new launch (same id returns current state).
+	for cid, j := range backtestJobs.m {
+		if j.Status != "running" && j.Status != "paused" {
+			continue
+		}
 		backtestJobs.Unlock()
-		writeJSON(w, 200, map[string]any{"status": "running", "job": j})
+		if cid == id {
+			writeJSON(w, 200, map[string]any{"status": "running", "job": j})
+		} else {
+			writeError(w, 409, fmt.Sprintf("已有回测任务在运行（候选 #%d），请先取消或等待完成", cid))
+		}
 		return
 	}
 	// 建任务即落库（Progress="0%"），消灭 CLI 首个 10% 之前的前端进度空窗。
 	// English: the job is persisted immediately with Progress="0%" so the frontend has a visible bar
 	// before the CLI prints its first "回测进度" line.
-	job := &backtestJob{CandID: id, Status: "running", Started: time.Now(), Progress: "0%"}
+	job := &backtestJob{CandID: id, Status: "running", Started: time.Now(), Progress: "0%", lastProgress: time.Now().Unix()}
 	backtestJobs.m[id] = job
 	backtestJobs.Unlock()
 	s.persistBacktestJob(id, job.Status, job.Progress, 0, "")
 
 	// 后台执行
 	go func() {
-		avg, err := s.runCandidateBacktest(id, job)
+		avg, err := s.runCandidateBacktest(id, job, opts)
 		backtestJobs.Lock()
 		defer backtestJobs.Unlock()
 		j := backtestJobs.m[id]
@@ -337,16 +379,100 @@ func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request)
 			j = job
 			backtestJobs.m[id] = j
 		}
-		if err != nil {
+		switch {
+		case j.cancelReq:
+			// 用户取消（阶段3.2）：标 interrupted，断点缓存仍有效可续跑。
+			// English: user cancel — mark interrupted; checkpoints stay valid for resume.
+			j.Status, j.Err = "interrupted", "已取消（断点缓存有效，可重新发起续跑）"
+		case err != nil:
 			j.Status, j.Err = "error", err.Error()
-		} else {
+		default:
 			j.Status, j.AvgExcess = "done", avg
 		}
-		// 完成态同步落库（done 回填 avg_excess；error 记录原因）。
-		// English: persist the terminal state (done backfills avg_excess; error stores the reason).
+		// 完成态同步落库（done 回填 avg_excess；error/interrupted 记录原因）。
+		// English: persist the terminal state.
 		s.persistBacktestJob(id, j.Status, j.Progress, j.AvgExcess, j.Err)
 	}()
 	writeJSON(w, 202, map[string]any{"status": "started", "job": job})
+}
+
+// handleBacktestCancel 处理 POST /api/research/backtest/{id}/cancel（阶段3.2）：
+// kill 运行中的回测子进程并标 interrupted（断点缓存 backtest_event_results 有效，
+// 重新发起只算剩余事件）。paused 状态同样可取消。
+// English: POST .../cancel — kills the running backtest child and marks it interrupted (checkpoints
+// stay valid; a relaunch only computes remaining events). Paused jobs are cancellable too.
+func (s *Server) handleBacktestCancel(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
+	}
+	backtestJobs.Lock()
+	j := backtestJobs.m[id]
+	if j == nil || (j.Status != "running" && j.Status != "paused") {
+		backtestJobs.Unlock()
+		writeError(w, 404, "该候选没有运行中的回测任务")
+		return
+	}
+	j.cancelReq = true
+	if j.cmd != nil && j.cmd.Process != nil {
+		_ = j.cmd.Process.Kill() // Wait() 随即返回，由后台 goroutine 落 interrupted 终态
+	}
+	backtestJobs.Unlock()
+	writeJSON(w, 200, map[string]string{"status": "cancelling"})
+}
+
+// handleBacktestPause 处理 POST /api/research/backtest/{id}/pause（阶段3.2）：
+// SIGSTOP 暂停子进程（进程保留内存，断点缓存照常），任务标 paused。
+// English: POST .../pause — SIGSTOPs the child process and marks the job paused.
+func (s *Server) handleBacktestPause(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
+	}
+	backtestJobs.Lock()
+	defer backtestJobs.Unlock()
+	j := backtestJobs.m[id]
+	if j == nil || j.Status != "running" || j.cmd == nil || j.cmd.Process == nil {
+		writeError(w, 404, "该候选没有可暂停的运行中任务")
+		return
+	}
+	if err := j.cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		writeError(w, 500, "暂停失败: "+err.Error())
+		return
+	}
+	j.paused = true
+	j.Status = "paused"
+	s.persistBacktestJob(id, j.Status, j.Progress, 0, "")
+	writeJSON(w, 200, map[string]string{"status": "paused"})
+}
+
+// handleBacktestResume 处理 POST /api/research/backtest/{id}/resume（阶段3.2）：
+// SIGCONT 恢复暂停的子进程，任务回到 running。
+// English: POST .../resume — SIGCONTs the paused child and flips the job back to running.
+func (s *Server) handleBacktestResume(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
+	}
+	backtestJobs.Lock()
+	defer backtestJobs.Unlock()
+	j := backtestJobs.m[id]
+	if j == nil || j.Status != "paused" || j.cmd == nil || j.cmd.Process == nil {
+		writeError(w, 404, "该候选没有已暂停的任务")
+		return
+	}
+	if err := j.cmd.Process.Signal(syscall.SIGCONT); err != nil {
+		writeError(w, 500, "恢复失败: "+err.Error())
+		return
+	}
+	j.paused = false
+	j.Status = "running"
+	j.lastProgress = time.Now().Unix() // 恢复后重置看门狗时钟
+	s.persistBacktestJob(id, j.Status, j.Progress, 0, "")
+	writeJSON(w, 200, map[string]string{"status": "running"})
 }
 
 // persistBacktestJob 把单候选回测任务状态写入 backtest_jobs（kind='candidate'）。
@@ -458,10 +584,13 @@ func (s *Server) handleBacktestList(w http.ResponseWriter, r *http.Request) {
 // runCandidateBacktest 对候选跑一次 B4 全量回测并回填 avg_excess。
 // 以独立子进程（research backtest CLI）执行，避免回测的内存/CPU 压垮 quant 服务
 // （quant 有 MemoryMax=1G cgroup，进程内跑全量回测曾触发 OOM 把整个引擎杀掉）。
+// 阶段3.2/3.3：opts 透传 start/end/top_k/min-stocks；cmd 存入 job 供 cancel/pause/resume；
+// 看门狗检测进度停滞（默认 15 分钟无进度行 → kill 置 error，杜绝"恒 running 0%"）。
 // English: runs a full B4 backtest on a candidate and backfills avg_excess, spawning the
-// `research backtest` CLI as a separate child process so the backtest's memory/CPU can't OOM the
-// quant engine (quant runs under a 1G MemoryMax cgroup; in-process full backtests have OOM-killed it).
-func (s *Server) runCandidateBacktest(id int64, job *backtestJob) (float64, error) {
+// `research backtest` CLI as a separate child process so its memory/CPU can't OOM the quant engine.
+// Passes through start/end/top-k/min-stocks; stores the cmd handle for cancel/pause/resume; a stall
+// watchdog kills children with no progress for 15 minutes (no more eternal "running 0%").
+func (s *Server) runCandidateBacktest(id int64, job *backtestJob, opts backtestRunOpts) (float64, error) {
 	// 定位 research 二进制：优先常见部署路径，其次 PATH，最后 researchDir 同目录。
 	// English: locate the research binary — common deploy paths first, then PATH, then next to researchDir.
 	bin := ""
@@ -496,6 +625,20 @@ func (s *Server) runCandidateBacktest(id int64, job *backtestJob) (float64, erro
 		return 0, nil
 	}
 	args := []string{"--db", dbPath, "backtest", "--id", strconv.FormatInt(id, 10)}
+	// 阶段3.3 自定义参数透传（CLI 已有同名 flag；空值保持 CLI 默认）。
+	// English: pass through custom params (CLI flags already exist; empty keeps CLI defaults).
+	if opts.Start != "" {
+		args = append(args, "--start", opts.Start)
+	}
+	if opts.End != "" {
+		args = append(args, "--end", opts.End)
+	}
+	if opts.TopK > 0 {
+		args = append(args, "--top-k", strconv.Itoa(opts.TopK))
+	}
+	if opts.MinStocks > 0 {
+		args = append(args, "--min-stocks", strconv.Itoa(opts.MinStocks))
+	}
 	cmd := exec.Command(bin, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -508,6 +651,38 @@ func (s *Server) runCandidateBacktest(id int64, job *backtestJob) (float64, erro
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("回测子进程启动失败: %v", err)
 	}
+	// 子进程句柄交给任务（cancel/pause/resume 用），并启动进度停滞看门狗。
+	// English: hand the child handle to the job and start the progress-stall watchdog.
+	backtestJobs.Lock()
+	job.cmd = cmd
+	backtestJobs.Unlock()
+	const stallSecs = 15 * 60 // 15 分钟无进度行视为挂死
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchDone:
+				return
+			case <-t.C:
+				backtestJobs.Lock()
+				stalled := !job.paused && !job.cancelReq &&
+					time.Now().Unix()-job.lastProgress > stallSecs
+				var proc *os.Process
+				if stalled && job.cmd != nil {
+					proc = job.cmd.Process
+				}
+				backtestJobs.Unlock()
+				if stalled && proc != nil {
+					log.Printf("[research] 候选 #%d 回测进度停滞>%dm，看门狗终止子进程", id, stallSecs/60)
+					_ = proc.Kill() // Wait 返回 error → 任务置 error
+					return
+				}
+			}
+		}
+	}()
 	// 逐行解析子进程输出：识别"回测进度 xx%"实时更新任务进度（前端 5s 轮询），
 	// 末尾"平均超额=%.4f"为最终结果；stdout/stderr 合并按行处理，任一行崩溃不拖垮轮询。
 	// English: read the child's output line-by-line — "回测进度 xx%" updates the job progress in
@@ -526,6 +701,7 @@ func (s *Server) runCandidateBacktest(id int64, job *backtestJob) (float64, erro
 					backtestJobs.Lock()
 					if job != nil {
 						job.Progress = m[1] + "%"
+						job.lastProgress = time.Now().Unix() // 喂看门狗
 					}
 					backtestJobs.Unlock()
 					// 进度同步落库（CLI 每 10% 打印一次，写入频率低；重启后进度可从 DB 恢复）。

@@ -175,6 +175,14 @@
       <!-- Task add: launch / rerun a full backtest from proposed factor candidates -->
       <div class="bt-add">
         <div class="bt-add-title">发起 / 重跑全量回测</div>
+        <!-- 阶段3.3 自定义回测参数：时长（起止日期）+ 选股数（top-k）+ 每日最小样本（min-stocks） -->
+        <!-- Custom backtest params: range (start/end) plus picks per event and min daily sample -->
+        <div class="bt-add-row bt-params-row">
+          <label class="bt-param">开始 <input v-model="btStart" class="bt-input" placeholder="20230801" /></label>
+          <label class="bt-param">结束 <input v-model="btEnd" class="bt-input" placeholder="留空=今天" /></label>
+          <label class="bt-param">选股数 <input v-model="btTopK" class="bt-input bt-input-sm" placeholder="5" /></label>
+          <label class="bt-param">最小样本 <input v-model="btMinStocks" class="bt-input bt-input-sm" placeholder="10" /></label>
+        </div>
         <div class="bt-add-row">
           <select v-model="btPickId" class="bt-select" :disabled="btLoading">
             <option :value="0" disabled>选择待审批因子候选</option>
@@ -194,7 +202,7 @@
           </button>
         </div>
         <div class="bt-add-hint">
-          断点续跑：任务记录持久化（单候选与夜间全量都记录），中断/重启后重跑只计算剩余事件；页面刷新后运行中任务自动恢复轮询。
+          断点续跑：任务记录持久化（单候选与夜间全量都记录），中断/重启后重跑只计算剩余事件；页面刷新后运行中任务自动恢复轮询。同一时间仅允许一个回测运行，可暂停/取消。
         </div>
       </div>
 
@@ -229,12 +237,30 @@
             {{ j.error || '任务中断，可重新发起续跑（断点缓存仍有效，重跑只计算剩余事件）' }}
           </div>
           <div class="bt-actions" v-if="j.kind === 'candidate' && canApprove">
+            <!-- 阶段3.2 运行控制：运行中→暂停/取消；已暂停→继续/取消；已中断→续跑（断点续传）；其余→重新回测 -->
+            <!-- Run controls: running→pause/cancel; paused→resume/cancel; interrupted→resume-run; else re-run -->
             <button
+              v-if="j.status === 'running'"
+              class="btn-backtest bt-ctl"
+              @click="doPauseBacktest(j.candidate_id)"
+            >暂停</button>
+            <button
+              v-if="j.status === 'paused'"
+              class="btn-backtest bt-ctl"
+              @click="doResumeBacktest(j.candidate_id)"
+            >继续</button>
+            <button
+              v-if="j.status === 'running' || j.status === 'paused'"
+              class="btn-backtest bt-ctl bt-danger"
+              @click="doCancelBacktest(j.candidate_id)"
+            >取消</button>
+            <button
+              v-else
               class="btn-backtest"
               :disabled="backtestLoading[j.candidate_id]"
               @click="doBacktestById(j.candidate_id)"
             >
-              {{ backtestLoading[j.candidate_id] ? '回测中...' : '重新回测' }}
+              {{ j.status === 'interrupted' ? '续跑（断点续传）' : (backtestLoading[j.candidate_id] ? '回测中...' : '重新回测') }}
             </button>
           </div>
         </div>
@@ -414,6 +440,11 @@ const backtestJobs = ref([]) // 全部回测任务（单候选 + 夜间，最新
 const btLoading = ref(false)  // 回测任务列表加载中
 // backtest job list loading
 const btPickId = ref(0)       // 任务添加：选中的候选 ID
+// 阶段3.3 自定义回测参数（空值=CLI 默认）
+const btStart = ref('')       // 回测开始日期 YYYYMMDD
+const btEnd = ref('')         // 回测结束日期（留空=今天）
+const btTopK = ref('')        // 每事件选股数
+const btMinStocks = ref('')   // 每日最小样本
 // task-add: selected candidate ID
 const backtestPollers = {}    // 候选 id → 轮询 interval（页面刷新/切换后防重复轮询）
 // candidate id → polling interval (deduped across refreshes / tab switches)
@@ -835,7 +866,13 @@ async function doBacktest(c) {
   backtestLoading.value = { ...backtestLoading.value, [c.id]: true }
   backtestState.value = { ...backtestState.value, [c.id]: 'running' }
   try {
-    await api.backtestResearchCandidate(c.id)
+    // 阶段3.3：携带自定义参数（时长 + 选股数 + 最小样本；空值由后端保持 CLI 默认）
+    await api.backtestResearchCandidate(c.id, {
+      start: btStart.value.trim(),
+      end: btEnd.value.trim(),
+      top_k: parseInt(btTopK.value, 10) || 0,
+      min_stocks: parseInt(btMinStocks.value, 10) || 0,
+    })
   } catch (e) {
     backtestLoading.value = { ...backtestLoading.value, [c.id]: false }
     backtestState.value = { ...backtestState.value, [c.id]: 'error' }
@@ -843,6 +880,29 @@ async function doBacktest(c) {
     return
   }
   pollBacktest(c)
+}
+
+/** 阶段3.2 运行控制：取消（kill+interrupted，断点缓存可续跑） */
+async function doCancelBacktest(id) {
+  if (!confirm('取消候选 #' + id + ' 的回测？（已算完的事件保留缓存，续跑只算剩余）')) return
+  try {
+    await api.cancelBacktest(id)
+    loadBacktests()
+  } catch (e) { alert('取消失败: ' + (e.message || e)) }
+}
+/** 阶段3.2 运行控制：暂停（SIGSTOP） */
+async function doPauseBacktest(id) {
+  try {
+    await api.pauseBacktest(id)
+    loadBacktests()
+  } catch (e) { alert('暂停失败: ' + (e.message || e)) }
+}
+/** 阶段3.2 运行控制：继续（SIGCONT） */
+async function doResumeBacktest(id) {
+  try {
+    await api.resumeBacktest(id)
+    loadBacktests()
+  } catch (e) { alert('恢复失败: ' + (e.message || e)) }
 }
 
 /** 轮询单个候选的回测任务状态（全量回测可能耗时较长；interval 唯一，防重复） */
@@ -919,7 +979,16 @@ async function loadBacktests() {
   btLoading.value = true
   try {
     const res = await api.fetchAllBacktests()
-    if (res && Array.isArray(res.jobs)) backtestJobs.value = res.jobs
+    if (res && Array.isArray(res.jobs)) {
+      // 阶段3.1 去重防御：按 kind+candidate_id 唯一（杜绝历史脏数据/合并缺口导致的重复卡片）
+      const seen = new Set()
+      backtestJobs.value = res.jobs.filter(j => {
+        const k = (j.kind || 'candidate') + ':' + j.candidate_id
+        if (seen.has(k)) return false
+        seen.add(k)
+        return true
+      })
+    }
   } catch (e) {
     console.error('加载回测任务失败', e)
   } finally {
@@ -946,10 +1015,9 @@ function doBacktestById(id) {
   else alert('候选 #' + id + ' 不存在（请先刷新候选列表）')
 }
 
-/** 回测任务状态中文标签 */
-/** Human-readable backtest status label */
+/** 任务状态中文标签（阶段3.2 增 paused） */
 function btStatusLabel(s) {
-  const m = { running: '运行中', done: '已完成', error: '失败', interrupted: '已中断' }
+  const m = { running: '运行中', paused: '已暂停', done: '已完成', error: '失败', interrupted: '已中断' }
   return m[s] || s
 }
 
@@ -1185,6 +1253,19 @@ function stopPolling() {
   background: #0f0f23; color: #e0e0e0; font-size: 14px; outline: none; flex: 1; min-width: 220px;
 }
 .bt-select:disabled { opacity: 0.5; }
+/* 阶段3.3 参数表单（时长 + 选股数 + 最小样本） */
+.bt-params-row { gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.bt-param { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #999; }
+.bt-input {
+  width: 110px; padding: 5px 8px; border-radius: 6px; border: 1px solid #333;
+  background: #0f0f23; color: #e0e0e0; font-size: 13px; outline: none;
+}
+.bt-input-sm { width: 64px; }
+.bt-input:focus { border-color: #4a6cf7; }
+/* 阶段3.2 运行控制按钮（暂停/继续/取消） */
+.bt-ctl { padding: 3px 12px; font-size: 12px; }
+.bt-ctl.bt-danger { border-color: rgba(255,77,79,0.5); color: #FF4D4F; }
+.bt-ctl.bt-danger:hover { background: rgba(255,77,79,0.15); }
 .bt-add-hint { font-size: 11px; color: #777; margin-top: 8px; line-height: 1.5; }
 .bt-list { display: flex; flex-direction: column; gap: 10px; }
 .bt-card { background: #1a1a2e; border-radius: 8px; padding: 10px 12px; border: 1px solid #2a2a3e; }
