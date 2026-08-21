@@ -23,13 +23,16 @@ ExecStart=/opt/quant/quant
 Restart=always
 RestartSec=5
 # 防止 OOM / 日志膨胀：限制内存与日志大小。
-# MemoryMax 给到 2G：正常运行时 quant 仅占 ~200-400M；留出余量给前端触发的全量回测
-# （回测以独立子进程 research backtest 运行，计入同一 cgroup）。服务器 1.6G 内存 + 2G swap，
-# 盘中 quant-research 空闲，总量可控。
-# English: MemoryMax=2G — quant normally uses ~200-400M; headroom allows a frontend-triggered full
-# backtest (spawned as a separate research backtest child in the same cgroup). Server has 1.6G RAM +
-# 2G swap; quant-research is idle during trading hours, so the total stays within budget.
-MemoryMax=2G
+# MemoryMax=900M（子系统统一改造后收紧）：回测/研究已全部迁往 quant-research 的 cgroup
+# （researchd 唯一执行器，独立限流），quant 自身只剩引擎+API（正常 ~200-400M）——
+# 旧值 2G 大于整机物理内存 1.6G，quant 一旦膨胀仍会引发全机内存挤压（内核回收风暴、
+# load 飙升、sshd 卡死），故收紧并加软限提前回收。
+# English: MemoryMax tightened to 900M — backtests/research now live in the researchd cgroup with
+# its own caps; quant (engine+API only) normally uses 200-400M. The old 2G exceeded the box's
+# physical RAM and let quant bloat stall the whole machine via reclaim storms. MemoryHigh applies
+# soft pressure first so the hard cap rarely kills.
+MemoryHigh=600M
+MemoryMax=900M
 # 硬性限流防误开
 LimitNOFILE=65535
 
