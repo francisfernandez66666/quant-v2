@@ -1619,16 +1619,13 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 		} else if sig.Action != "" {
 			action = sig.Action
 		}
-		// C3 自动纸面开仓：做多买入信号且开启 AutoTrackSignals 时，写入持仓记录
-		// （幂等：已持仓代码跳过），激活 CheckPositionsExits 离场路径。
-		// English: C3 auto-paper-open — for long buy signals with AutoTrackSignals on, write the
-		// position (idempotent: already-held codes skipped) so the exit path activates.
-		if direction == "做多" && action == "买入" && e.autoTrackEnabled() {
-			if si := live[sig.Code]; si != nil && si.Price > 0 {
-				sig.Price = si.Price
-			}
-			e.paperOpenBuy(sig)
-		}
+		// C3 自动纸面开仓已由「两本账合一」镜像取代（阶段1.2）：模拟盘 fillLocked 成交后经
+		// SetMirror 回调写 report 持仓账（registry.paperMirror），paper 为唯一真实账本，
+		// rpt 由镜像保持一致 → CheckPositionsExits 离场路径照常激活，且不再双账本漂移。
+		// English: C3 auto-paper-open is superseded by the unified-book mirror (unified books): after a
+		// paper fillLocked, the SetMirror callback writes the report holding book (registry.paperMirror);
+		// paper is the single source of truth and rpt stays consistent via mirroring — the exit path
+		// activates as before, with no more dual-book drift.
 		// AUTO_TRADING_PLAN M1：qmt.enabled 且 mode=auto 时，做多买入信号直连网关真实下单
 		// （幂等：signal_id 唯一键，网关/首尔双端去重，熔断中自动跳过）。manual 模式不下单，
 		// 由前端持仓页实盘 tab 确认后经 POST /api/positions/execute 执行。
@@ -2584,6 +2581,26 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			sellCodes = e.rpt.HeldPositionCodes()
 		}
 		alertSignals = append(alertSignals, e.combatAgent.AssessSellSide(sellCodes, sr.MarketData, d1Scores, stockScores, e.ShortEnabled())...)
+	}
+
+	// 13e 卖出提醒自动执行（阶段1.1 全自动卖出）：把本轮 清仓/减仓/硬止盈/硬止损 告警
+	// （combat_agent.SellAction 归一为 close/trim）送入模拟盘自动成交——清仓类全平、
+	// 减仓类半仓（paper 引擎内每码每日一次去重）。仅提醒级（提示/关注/跌幅提醒）不动作。
+	// 行情复用 exitQuotes（本轮打分池实时快照）。
+	// English: auto-execute sell alerts (full-auto selling) — this round's 清仓/减仓/hard-TP/hard-SL
+	// alerts (normalized to close/trim by combat_agent.SellAction) go straight into the paper engine:
+	// close-type exits fully, trim-type halves (deduped once per code per day inside paper). Reminder-only
+	// levels (提示/关注/跌幅提醒) never act. Quotes reuse exitQuotes (this round's live snapshot).
+	{
+		var sells []combat_agent.Signal
+		for _, s := range alertSignals {
+			if combat_agent.SellAction(s) != "" {
+				sells = append(sells, s)
+			}
+		}
+		if len(sells) > 0 {
+			e.paperSignals(sells, exitQuotes)
+		}
 	}
 
 	// 14. 聚合器更新看板

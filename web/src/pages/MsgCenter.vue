@@ -44,6 +44,9 @@
           <span class="msg-time">{{ a.time }}</span>
           <!-- 操作徽标：依据标题内容推导买入/卖出/持有（Action badge: buy/sell/hold derived from the title）-->
           <span :class="['badge-action', actionClass(a)]">{{ actionText(a) }}</span>
+          <!-- 一键模拟卖出（阶段1.4）：清仓/减仓/止盈/止损/利空抛售类提醒直达模拟盘按实时价卖出 -->
+          <!-- One-click paper sell: close/trim/TP/SL/bearish-sell alerts go straight to a live-price paper sell -->
+          <button v-if="isSellAlert(a)" class="btn-paper-sell" title="按实时价在模拟盘卖出该持仓" @click="onPaperSell(a)">模拟卖出</button>
           <!-- 单条删除按钮（Single-message delete button）-->
           <button class="btn-del" title="删除该消息" @click="onDeleteOne(a)">✕</button>
         </div>
@@ -197,6 +200,25 @@ async function onDeleteOne(a) {
   } catch (_) {}
 }
 
+/** 卖出类提醒判定：清仓/减仓/止盈/止损/利空抛售 → 展示一键模拟卖出按钮 */
+/** Sell-type alert check: 清仓/减仓/止盈/止损/利空抛售 show the one-click paper-sell button */
+function isSellAlert(a) {
+  return ['清仓', '减仓', '止盈', '止损', '利空抛售'].includes(a.level)
+}
+
+/** 一键模拟卖出：按实时价（price=0 由后端取实时）卖出该持仓，成功后刷新列表 */
+/** One-click paper sell: sell at the live price (price=0 lets the backend fetch it), then refresh */
+async function onPaperSell(a) {
+  if (!confirm(`模拟卖出 ${a.code} ${a.name || ''}？（按实时价全仓卖出）`)) return
+  try {
+    await api.sellPaperPosition(a.code, 0)
+    alert(`${a.code} 模拟卖出成功`)
+    load()
+  } catch (e) {
+    alert('模拟卖出失败: ' + (e.message || e))
+  }
+}
+
 /** 清空全部消息 */
 /** Clear all messages */
 async function onClearAll() {
@@ -251,6 +273,13 @@ onUnmounted(() => {
   line-height: 1; cursor: pointer; flex-shrink: 0;
 }
 .btn-del:hover { background: rgba(255,77,79,0.15); color: #FF4D4F; }
+/* 一键模拟卖出按钮：红描边小按钮，紧跟操作徽标（One-click paper-sell: small red-outlined button after the action badge）*/
+.btn-paper-sell {
+  margin-left: 6px; padding: 1px 8px; border-radius: 4px; font-size: 12px;
+  border: 1px solid rgba(255,77,79,0.5); background: transparent; color: #FF4D4F;
+  cursor: pointer; flex-shrink: 0;
+}
+.btn-paper-sell:hover { background: rgba(255,77,79,0.15); }
 .filter-btn {
   padding: 6px 16px; border-radius: 6px; border: 1px solid #333;
   background: transparent; color: #999; font-size: 14px; cursor: pointer;

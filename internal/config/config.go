@@ -66,6 +66,11 @@ type PaperConfig struct {
 	FixedAmount    float64 `json:"fixed_amount"`    // 每票固定买入资金（元，默认 10000）
 	MaxPositions   int     `json:"max_positions"`   // 最大并行持仓数（默认 10）
 	InitialCapital float64 `json:"initial_capital"` // 初始资金（元，默认 100000）
+	// AutoSell 卖出信号自动成交开关（阶段1.1 全自动执行）：nil/未配置=开启。开启时 清仓/减仓/
+	// 硬止盈/硬止损 告警直接在模拟盘自动平仓；关闭则卖出仅提醒、仍需手动。
+	// English: auto-sell switch (full-auto execution); nil/unset = on. When on, 清仓/减仓/hard-TP/hard-SL
+	// alerts close paper positions automatically; when off, sells stay reminder-only (manual).
+	AutoSell *bool `json:"auto_sell,omitempty"`
 }
 
 // QMTAdviceConfig 持仓处理分析层（实盘持仓）规则参数：加仓/格局判定阈值。

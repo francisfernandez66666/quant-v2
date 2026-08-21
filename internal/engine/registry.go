@@ -141,6 +141,66 @@ func (r *Registry) paperPath(userID string) string {
 	return filepath.Join(r.opts.DataDir, "accounts", userID, "paper.json")
 }
 
+// paperMirror 构造某账号模拟盘的账本镜像回调（阶段1.2 两本账合一）：
+//   - open：模拟盘新开仓后写 report 持仓账（稳定键 pap_<code>；止盈/止损按战法映射 + ATR 动态止损；
+//     dragon 补 limit_price 炸板基准）。AutoTrackSignals 关闭时不写（沿用 C3 开关语义，退出引擎随之不评估）；
+//     已有同码持仓记录（如手动建仓）幂等跳过。
+//   - close：整笔清仓时按 pap_<code> 平掉 report 记录（部分减仓不触发，记录保留至最终平仓）。
+//
+// rpt 未注入时返回 (nil, nil)，镜像整体停用。
+// English: builds an account's book-mirror callbacks (unified books): open writes the report holding
+// book after a new paper open (stable key pap_<code>; TP/SL from the strategy mapping plus the ATR
+// dynamic stop; dragon gets limit_price as the broken-seal baseline). Gated by AutoTrackSignals (C3
+// semantics — exits skip when off) and idempotent against existing same-code records. close closes the
+// pap_-keyed report record on full exits (partial trims don't fire). Returns (nil, nil) without a report.
+func (r *Registry) paperMirror(userID string) (func(paper.Position), func(string, float64, float64, string)) {
+	rpt := r.opts.Rpt
+	if rpt == nil {
+		return nil, nil
+	}
+	cm := r.opts.CfgMgr
+	open := func(pos paper.Position) {
+		// AutoTrackSignals 开关：关闭时不写纸面持仓记录（与 C3 行为一致）
+		// English: AutoTrackSignals gate — no holding record when off (same as C3).
+		if cm != nil {
+			if rules := cm.GetRulesFor(userID); rules != nil && !rules.Position.AutoTrackSignals {
+				return
+			}
+		}
+		if rpt.HasHolding(pos.Code) {
+			return // 已有同码记录（手动建仓/另一共享账号）幂等跳过
+		}
+		var sc *config.StrategyConfig
+		atrOn, atrMult := false, 0.0
+		if cm != nil {
+			if rules := cm.GetRulesFor(userID); rules != nil {
+				scfg := rules.Strategy
+				sc = &scfg
+				atrOn = rules.Position.ATREnabled
+				atrMult = rules.Position.ATRStopMult
+			}
+		}
+		tp, sl := paperOpenTpSl(pos.StrategyType, sc)
+		if atrOn && atrMult > 0 && pos.ATR > 0 && pos.CostPrice > 0 {
+			if s := pos.ATR * atrMult / pos.CostPrice * 100; s > 0 {
+				sl = s // ATR 动态止损优先（C4），无效回退固定百分比
+			}
+		}
+		meta := map[string]float64{}
+		if pos.StrategyType == "dragon" && pos.SignalPrice > 0 {
+			meta["limit_price"] = pos.SignalPrice // 炸板回落基准=买入触发价
+		}
+		rpt.LogSignalWithMetaQty("pap_"+pos.Code, pos.Code, pos.Name, "做多", pos.Strategy,
+			pos.CostPrice, tp, sl, float64(pos.Qty), meta)
+		log.Printf("[registry] 镜像开仓 %s(%s) 战法:%s 数量%d 止盈%.0f%% 止损%.0f%%",
+			pos.Name, pos.Code, pos.StrategyType, pos.Qty, tp, sl)
+	}
+	closeFn := func(code string, price, _ float64, reason string) {
+		rpt.LogExit("pap_"+code, price, reason)
+	}
+	return open, closeFn
+}
+
 // GetPaper 返回某账号的独立模拟盘引擎（懒加载创建/恢复；未启用或不可用返回 nil）。
 // 每账号独立现金/持仓/成交（初始资金默认取 rules.paper.initial_capital，可经 reset 自定义）。
 // English: returns an account's independent paper engine (lazily created/restored; nil when disabled).
@@ -161,6 +221,13 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	}
 	cfg := r.opts.Paper.Cfg()
 	pe := paper.New(cfg, r.paperPath(userID))
+	// 两本账合一（阶段1.2）：paper 为唯一真实账本，开仓/清仓镜像写 report 持仓账，
+	// 使 CheckPositionsExits 离场路径、持仓页、打分池消费的 rpt 与模拟盘保持一致。
+	// English: unified books — paper is the single source of truth; opens/closes mirror into the report
+	// holding book so the rpt consumed by exit engines / positions page / scoring pool stays consistent.
+	if open, closeFn := r.paperMirror(userID); open != nil {
+		pe.SetMirror(open, closeFn)
+	}
 	// 新账号继承全局战法资金池模板（分仓，防单战法垄断）。
 	// English: a new account inherits the global strategy pool template (allocation against monopolies).
 	if len(r.paperPoolTypes) > 0 {

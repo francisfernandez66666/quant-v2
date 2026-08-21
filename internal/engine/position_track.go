@@ -1,17 +1,14 @@
-// position_track.go 买入信号自动纸面开仓（C3）：把 buy 信号写入持仓记录（报告持久化），
-// 使 CheckPositionsExits 离场路径（止盈/止损/炸板/超期提醒）真正生效，避免离场逻辑沦为死代码。
-// 仅做纸面记录（不真实下单）；是否启用由 PositionConfig.AutoTrackSignals 控制（默认开）。
-// English: auto-paper-opens positions from buy signals (C3). Writing the buy into the persisted
-// holding log activates the CheckPositionsExits exit path (take-profit / stop-loss / broken-seal /
-// timeout alerts), so it is no longer dead code. Paper-only (never really orders); gated by
-// PositionConfig.AutoTrackSignals (default on).
+// position_track.go 纸面开仓的止盈/止损映射（C3 遗产，阶段1.2 两本账合一后保留）：
+// 模拟盘 fillLocked 成交后由 registry.paperMirror 经 SetMirror 回调写 report 持仓账，
+// 本文件仅保留战法→止盈/止损百分比的映射函数供镜像使用（paper 为唯一真实账本，
+// rpt 由镜像保持一致 → CheckPositionsExits 离场路径照常生效）。
+// English: TP/SL mapping for paper opens (C3 legacy, kept after the unified-book refactor): after a
+// paper fillLocked, registry.paperMirror writes the report holding book via the SetMirror callback.
+// Only the strategy→TP/SL percent mapping remains here for the mirror (paper is the single source of
+// truth; rpt stays consistent via mirroring so CheckPositionsExits keeps working).
 package engine
 
 import (
-	"log"
-	"math"
-
-	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 )
 
@@ -67,99 +64,4 @@ func paperOpenTpSl(strategyName string, sc *config.StrategyConfig) (tp, sl float
 		tp, sl = 10, 8
 	}
 	return
-}
-
-// paperOpenQty C6 仓位管理：按置信度 + 止损距离计算纸面开仓数量（股数）。
-// 以"8% 固定止损"为基准单位风险：qty = 10 × 置信度 × (8 / 止损%)。
-// 置信度越高、止损越窄（单位风险越大）→ 数量越多，使各持仓单位风险一致。
-// English: C6 position sizing — opening quantity from confidence and stop distance: qty = 10 ×
-// confidence × (8 / stop%), normalizing per-unit risk so tighter stops carry more shares.
-func paperOpenQty(confidence, stopPct float64) float64 {
-	if confidence <= 0 {
-		confidence = 0.5
-	}
-	if stopPct <= 0 {
-		stopPct = 8
-	}
-	return math.Round(10*confidence*(8/stopPct)*100) / 100
-}
-
-// paperOpenBuy 对一个买入选中的信号做纸面开仓（幂等：已持仓的代码跳过）。
-// 返回是否真正开仓（用于日志）。meta 里为 dragon 补 limit_price（炸板回落基准=买入触发价）；
-// 数量按 C6 置信度+ATR 止损距离计算（ATR 有效时优先，否则回退固定止损）。
-// English: paper-opens a position for one buy-selected signal (idempotent: codes already held are
-// skipped). Returns whether a position was actually opened. limit_price (the broken-seal baseline) is
-// filled for dragon from the trigger price; the quantity is sized by C6 confidence + ATR stop distance
-// (ATR wins when valid, else the fixed stop).
-func (e *Engine) paperOpenBuy(sig combat_agent.Signal) bool {
-	if e.rpt == nil || sig.Code == "" || sig.Price <= 0 {
-		return false
-	}
-	if e.rpt.HasHolding(sig.Code) {
-		return false
-	}
-	tp, sl := paperOpenTpSl(sig.Strategy, e.strategyConfig())
-	if sig.ATR > 0 {
-		if mult := e.atrStopMult(); mult > 0 {
-			if atrSl := sig.ATR * mult / sig.Price * 100; atrSl > 0 {
-				sl = atrSl
-			}
-		}
-	}
-	qty := paperOpenQty(sig.Confidence, sl)
-	meta := map[string]float64{}
-	if sig.Strategy == "dragon" {
-		meta["limit_price"] = sig.Price
-	}
-	id := sig.ID
-	if id == "" {
-		id = sig.Code + "@auto"
-	}
-	e.rpt.LogSignalWithMetaQty(id, sig.Code, sig.Name, "做多", sig.Strategy, sig.Price, tp, sl, qty, meta)
-	log.Printf("[engine] 纸面开仓 %s(%s) 战法:%s 数量%.0f 止盈%.0f%% 止损%.0f%%", sig.Name, sig.Code, sig.Strategy, qty, tp, sl)
-	return true
-}
-
-// atrStopMult 读取当前账号 ATR 动态止损倍数（C6 仓位管理的止损距离来源；未启用时为 0）。
-// English: reads the account's ATR stop multiplier (source of the C6 sizing stop distance; 0 when off).
-func (e *Engine) atrStopMult() float64 {
-	e.mu.RLock()
-	cfgMgr, userID := e.cfgMgr, e.userID
-	e.mu.RUnlock()
-	if cfgMgr == nil {
-		return 0
-	}
-	pos := cfgMgr.GetRulesFor(userID).Position
-	if !pos.ATREnabled {
-		return 0
-	}
-	return pos.ATRStopMult
-}
-
-// strategyConfig 读取当前账号的策略配置（nil 防护，供纸面开仓止盈/止损计算）。
-// English: reads the current account's strategy config (nil-safe), used for paper-open TP/SL.
-func (e *Engine) strategyConfig() *config.StrategyConfig {
-	e.mu.RLock()
-	cfgMgr, userID := e.cfgMgr, e.userID
-	e.mu.RUnlock()
-	if cfgMgr == nil {
-		return nil
-	}
-	return cfgMgr.GetStrategyConfigFor(userID)
-}
-
-// autoTrackEnabled 读取持仓自动纸面开仓开关（缺省开）。
-// English: reads the auto-paper-open switch (defaults on).
-func (e *Engine) autoTrackEnabled() bool {
-	e.mu.RLock()
-	cfgMgr, userID := e.cfgMgr, e.userID
-	e.mu.RUnlock()
-	if cfgMgr == nil {
-		return true
-	}
-	cfg := cfgMgr.GetRulesFor(userID)
-	if cfg == nil || !cfg.Position.AutoTrackSignals {
-		return false
-	}
-	return true
 }

@@ -175,6 +175,40 @@ func buildExitContextWithATR(pos report.ExecLog, price float64, dayK []data.KLin
 	return ctx
 }
 
+// SellAction 卖出信号强度归一（阶段1.1 打通卖出链路的统一词汇表）：
+// 把各告警源（战法退出引擎 / 止盈止损提醒 / 情绪退潮 / 利空归因 / 卖点评估）的
+// Action+AlertType 归一为模拟盘可执行的卖出动作：
+//   - "close"：全仓卖出 —— 退出引擎 P1 清仓、硬止盈（Action=止盈）、硬止损（Action=止损）
+//   - "trim" ：半仓减仓 —— 退出引擎 P2 减仓、情绪退潮减仓、利空归因抛售、卖点评估减仓级
+//   - ""     ：不动作 —— 提示/关注/跌幅提醒等仅提醒级，以及做空方向词（非卖出语义）
+//
+// 判定以 AlertType 优先（退出引擎/情绪/利空归因均用中文 AlertType），Action 兜底
+// （止盈/止损提醒的硬级别直接体现在 Action）。软降级（提示/关注）不会误判：
+// 它们的 AlertType 与 Action 都不在命中集。
+// English: normalizes sell-signal strength across alert sources into a paper-executable action —
+// "close" for full exits (P1 清仓, hard take-profit, hard stop-loss), "trim" for half-position trims
+// (P2 减仓, emotion-retreat trim, bearish-attribution sell, sell-point 减仓 level), "" for reminder-only
+// levels and the short-direction badge. AlertType is checked first with Action as fallback; soft
+// downgrades (提示/关注) never match.
+func SellAction(s Signal) string {
+	if s.Direction == "做空" {
+		return "" // 做空方向词是开仓方向语义，不是卖出提醒
+	}
+	switch s.AlertType {
+	case "清仓":
+		return "close"
+	case "减仓", "利空抛售":
+		return "trim"
+	}
+	switch s.Action {
+	case "止盈", "止损":
+		return "close"
+	case "sell", "卖出":
+		return "close"
+	}
+	return ""
+}
+
 // exitSignalFromResult 把战法退出结果映射为告警信号：P1=清仓（立即） P2=减仓 P3=提示。
 // English: maps a strategy exit result to an alert signal — P1=清仓 (immediate), P2=减仓, P3=提示.
 func exitSignalFromResult(pos report.ExecLog, price float64, res *strategy.ExitResult, now time.Time) Signal {

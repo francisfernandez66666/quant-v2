@@ -29,6 +29,11 @@ type Config struct {
 	FixedAmount    float64 `json:"fixed_amount"`    // 每票固定买入资金（元，默认 10000；现金不足时按剩余现金整手买入）
 	MaxPositions   int     `json:"max_positions"`   // 自定义持仓上限（0=不设限，持仓数由本金/现金余额自然决定；默认 0）
 	InitialCapital float64 `json:"initial_capital"` // 初始资金（元，默认 100000）
+	// AutoSell 卖出信号自动成交开关（阶段1.1 全自动执行）：开启时 清仓/减仓/硬止盈/硬止损
+	// 告警直接在模拟盘自动平仓。由 config.PaperConfig.AutoSell 缺省填充（未配置=true）。
+	// English: auto-sell switch (full-auto execution) — when on, 清仓/减仓/hard-TP/hard-SL alerts close
+	// paper positions automatically. Defaulted from config.PaperConfig.AutoSell (true when unset).
+	AutoSell bool `json:"auto_sell"`
 }
 
 // DefaultConfig 返回模拟盘出厂默认配置。
@@ -39,6 +44,7 @@ func DefaultConfig() Config {
 		FixedAmount:    10000,
 		MaxPositions:   0,
 		InitialCapital: 100000,
+		AutoSell:       true,
 	}
 }
 
@@ -65,6 +71,11 @@ type Position struct {
 	// Mark 最近一次估值价（实时快照，前端展示现价/浮盈用）。
 	// English: last mark price from the live snapshot, for live P/L display.
 	Mark float64 `json:"mark"`
+	// ATR 该股 ATR14（开仓信号携带，镜像写 report 账时供 C4/ATR 动态止损距离计算；
+	// 手动买入为 0 → 镜像回退固定百分比止损）。
+	// English: the stock's ATR14 carried by the opening signal — used by the report-book mirror for
+	// C4 ATR dynamic stop distance; 0 for manual buys (mirror falls back to fixed-percentage stops).
+	ATR float64 `json:"atr,omitempty"`
 }
 
 // MarketValue 返回该持仓按当前估值价的市值。
@@ -250,6 +261,22 @@ type Engine struct {
 	equity     []EquityPoint
 	realized   float64 // 已实现盈亏累计
 	path       string
+	// 账本镜像回调（阶段1.2 两本账合一）：paper 为唯一真实账本，开仓/清仓经回调同步写
+	// report 持仓账（由 engine/registry 注入），退出引擎/持仓页/打分池消费的 rpt 与模拟盘一致。
+	// onOpen 在新开仓后触发（含手动买入；加仓不触发）；onClose 仅在整笔清仓时触发（部分减仓不触发）。
+	// English: book-mirror callbacks (unified books) — paper is the single source of truth; opens/closes
+	// are mirrored into the report holding book via callbacks injected by engine/registry, so the rpt
+	// consumed by exit engines / positions page / scoring pool stays consistent with the paper book.
+	// onOpen fires after a NEW position (manual buys included; add-ons excluded); onClose fires only on
+	// full closes (partial trims excluded).
+	onOpen  func(p Position)
+	onClose func(code string, price, qty float64, reason string)
+	// trimDone 当日减仓去重：code → "YYYYMMDD"（同一交易日同一持仓只响应一次减仓类信号，
+	// 防止多轮告警把仓位反复减半）。清仓类无需去重（平仓后自然 no-op）。
+	// English: same-day trim dedup — code → "YYYYMMDD"; trim-type signals act at most once per code per
+	// trading day so repeated alerts can't keep halving the position. Full closes need no dedup (natural
+	// no-op once flat).
+	trimDone map[string]string
 }
 
 // New 创建模拟盘引擎并加载历史持久化数据。
@@ -268,6 +295,7 @@ func New(cfg Config, path string) *Engine {
 		poolPerf:   make(map[string]*PoolPerf),
 		poolMaxPos: make(map[string]int),
 		positions:  make(map[string]*Position),
+		trimDone:   make(map[string]string),
 		path:       path,
 	}
 	if path != "" {
@@ -286,6 +314,37 @@ func (e *Engine) Cfg() Config {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.cfg
+}
+
+// SetMirror 注入账本镜像回调（阶段1.2 两本账合一，由 engine/registry 在创建账号模拟盘时调用）。
+// open 在新开仓后触发（手动买入含、加仓不含）；close 仅整笔清仓触发（部分减仓不含）。
+// 回调内部不得再调用本引擎方法（避免锁递归）；nil 安全。
+// English: injects the book-mirror callbacks (unified books; called by engine/registry when creating an
+// account's paper engine). open fires after a NEW open (manual buys included, add-ons excluded); close
+// fires only on full closes. Callbacks must not call back into this engine (no recursive locking); nil-safe.
+func (e *Engine) SetMirror(open func(p Position), close func(code string, price, qty float64, reason string)) {
+	e.mu.Lock()
+	e.onOpen, e.onClose = open, close
+	e.mu.Unlock()
+}
+
+// mirrorOpenLocked 触发开仓镜像（须持锁调用；副本传值防回调侧读到后续变更）。
+// English: fires the open mirror (caller must hold the lock; passes a copy so the callback never sees later mutations).
+func (e *Engine) mirrorOpenLocked(p *Position) {
+	if e.onOpen == nil || p == nil {
+		return
+	}
+	cp := *p
+	e.onOpen(cp)
+}
+
+// mirrorCloseLocked 触发清仓镜像（须持锁调用）。
+// English: fires the close mirror (caller must hold the lock).
+func (e *Engine) mirrorCloseLocked(code string, price, qty float64, reason string) {
+	if e.onClose == nil {
+		return
+	}
+	e.onClose(code, price, qty, reason)
 }
 
 // persistedState 持久化状态快照（persist/load 共享）。
@@ -505,6 +564,14 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 	now := time.Now()
 	for i := range sigs {
 		s := sigs[i]
+		// 卖出信号自动成交（阶段1.1 全自动执行）：清仓/硬止盈/硬止损 → 全平；减仓类 → 半仓
+		// （每码每日一次）。非本账持仓（如手动记录账）自然跳过。
+		// English: auto-execute sell signals (full-auto) — 清仓/hard-TP/hard-SL close fully; trim-type
+		// alerts halve the position (once per code per day). Codes not in this book are skipped naturally.
+		if act := combat_agent.SellAction(s); act != "" {
+			e.autoSellLocked(&s, act, quotes)
+			continue
+		}
 		if s.Direction == "做空" || s.Action != "buy" {
 			continue
 		}
@@ -546,9 +613,61 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		}
 		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
+			continue
+		}
+		// 记录信号携带的 ATR14（镜像写 report 账时供 ATR 动态止损距离计算），随后触发开仓镜像。
+		// English: record the signal's ATR14 (used by the report-book mirror for the ATR dynamic stop
+		// distance), then fire the open mirror.
+		if p, ok := e.positions[s.Code]; ok {
+			p.ATR = s.ATR
+			e.mirrorOpenLocked(p)
 		}
 	}
 	e.persist()
+}
+
+// autoSellLocked 卖出信号自动成交（阶段1.1，须持锁调用）：
+//   - act=="close"：全仓卖出（清仓/硬止盈/硬止损），收益回池并镜像关闭 report 账记录；
+//   - act=="trim" ：半仓减仓（减仓/情绪退潮/利空归因），每码每交易日至多一次（trimDone 去重）。
+//
+// 行情缺失时跳过（避免以信号价误成交）；非本账持仓自然 no-op；AutoSell=false 时整体停用。
+// English: auto-executes a sell signal (caller must hold the lock): "close" sells the whole position
+// (proceeds back to pool + report-book mirror close); "trim" halves it at most once per code per trading
+// day (trimDone dedup). Skips on missing quotes; no-op for codes not in this book; disabled entirely
+// when AutoSell is off.
+func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[string]*data.StockInfo) {
+	if !e.cfg.AutoSell {
+		return
+	}
+	p, held := e.positions[s.Code]
+	if !held || p == nil {
+		return
+	}
+	var price float64
+	if q, ok := quotes[s.Code]; ok && q != nil && q.Price > 0 {
+		price = q.Price
+	} else {
+		return // 无实时价不自动成交（宁可不卖也不以错误价格记账）
+	}
+	reason := "自动" + s.AlertType
+	if reason == "自动" {
+		reason = "自动卖出"
+	}
+	switch act {
+	case "close":
+		e.sellAllLocked(p, price, reason)
+	case "trim":
+		today := time.Now().Format("20060102")
+		if e.trimDone[s.Code] == today {
+			return
+		}
+		half := p.Qty / 2 / 100 * 100 // 半仓取整手（A 股一手 100 股）
+		if half <= 0 {
+			return // 持仓不足两手无法半仓减仓，等清仓类信号处理
+		}
+		e.sellQtyLocked(p, price, half, reason)
+		e.trimDone[s.Code] = today
+	}
 }
 
 // poolPositionCountLocked 返回某池当前持仓数（须持锁调用）。
@@ -676,6 +795,7 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, "手动模拟买入"); err != nil {
 		return err
 	}
+	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil
 }
@@ -714,6 +834,7 @@ func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, 
 	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, "手动模拟买入"); err != nil {
 		return err
 	}
+	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil
 }
@@ -843,7 +964,7 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	} else {
 		return errNoQuote
 	}
-	return e.sellAllLocked(p, price)
+	return e.sellAllLocked(p, price, "手动模拟卖出")
 }
 
 // SellEx 手动按指定价格与数量减仓（部分卖出）。qty 手数；price > 0 用输入价，price = 0 回退实时价。
@@ -872,8 +993,17 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 		}
 	}
 	if qty >= p.Qty {
-		return e.sellAllLocked(p, price)
+		return e.sellAllLocked(p, price, "手动模拟卖出")
 	}
+	return e.sellQtyLocked(p, price, qty, "手动模拟减仓")
+}
+
+// sellQtyLocked 按股数部分减仓：回池、结算已实现盈亏、追加卖出记录（须持锁调用）。
+// 手动减仓与自动减仓（阶段1.1 卖出信号半仓）共用；不触发清仓镜像（report 账记录保留至整笔平仓）。
+// English: trims by share count — pool return, realized P&L, extra sell fill (caller must hold the lock).
+// Shared by manual trims and auto trims (sell-signal half exits); does NOT fire the close mirror (the
+// report-book record stays until the full close).
+func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason string) error {
 	proceeds := price * float64(qty)
 	// 减仓收益回原战法池（按持仓记录的类型；空=其他池）。
 	// English: trim proceeds return to the position's own strategy pool (per its recorded type; empty =
@@ -899,16 +1029,18 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 		Qty:          qty,
 		Amount:       proceeds,
 		Time:         time.Now(),
-		Reason:       "手动模拟减仓",
+		Reason:       reason,
 	})
-	log.Printf("[paper] 模拟减仓 %s(%s) -%d股 @%.2f 剩余%d股", p.Code, p.Name, qty, price, p.Qty)
+	log.Printf("[paper] 模拟减仓 %s(%s) -%d股 @%.2f 剩余%d股 原因=%s", p.Code, p.Name, qty, price, p.Qty, reason)
 	e.persist()
 	return nil
 }
 
-// sellAllLocked 清仓单一持仓：回池、结算已实现盈亏、追加卖出记录（须持锁调用）。
-// English: closes a single position — pool return, realized P&L, extra sell fill (caller must hold the lock).
-func (e *Engine) sellAllLocked(p *Position, price float64) error {
+// sellAllLocked 清仓单一持仓：回池、结算已实现盈亏、追加卖出记录，并触发清仓镜像
+// （阶段1.2 两本账合一：report 账对应记录同步平仓；须持锁调用）。
+// English: closes a single position — pool return, realized P&L, extra sell fill, plus the close mirror
+// (unified books: the report-book record is closed in sync; caller must hold the lock).
+func (e *Engine) sellAllLocked(p *Position, price float64, reason string) error {
 	proceeds := price * float64(p.Qty)
 	// 卖出收益回原战法池（按持仓记录的类型；空=其他池）。
 	// English: sale proceeds return to the position's own strategy pool (per its recorded type; empty =
@@ -923,6 +1055,7 @@ func (e *Engine) sellAllLocked(p *Position, price float64) error {
 		e.poolPerf[p.StrategyType] = &PoolPerf{}
 	}
 	e.poolPerf[p.StrategyType].Realized += proceeds - p.Cost
+	qty := p.Qty
 	e.trades = append(e.trades, Trade{
 		Code:         p.Code,
 		Name:         p.Name,
@@ -933,9 +1066,13 @@ func (e *Engine) sellAllLocked(p *Position, price float64) error {
 		Qty:          p.Qty,
 		Amount:       proceeds,
 		Time:         time.Now(),
+		Reason:       reason,
 	})
-	log.Printf("[paper] 模拟卖出 %s(%s) %d股 @%.2f 盈亏%.2f", p.Code, p.Name, p.Qty, price, proceeds-p.Cost)
+	log.Printf("[paper] 模拟卖出 %s(%s) %d股 @%.2f 盈亏%.2f 原因=%s", p.Code, p.Name, p.Qty, price, proceeds-p.Cost, reason)
 	delete(e.positions, p.Code)
+	// 清仓镜像（阶段1.2）：report 账对应记录同步平仓（pap_<code> 稳定键）。
+	// English: close mirror (unified books) — the report-book record closes in sync (stable key pap_<code>).
+	e.mirrorCloseLocked(p.Code, price, float64(qty), reason)
 	e.persist()
 	return nil
 }
@@ -1116,12 +1253,22 @@ func (e *Engine) Reconfigure(initialCapital float64, maxPositions int) {
 func (e *Engine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// 全局重置镜像（阶段1.2）：report 账中 pap_ 开头的模拟盘记录一并平仓（按估值价），
+	// 手动录入的非镜像记录不动。
+	// English: global-reset mirror (unified books) — pap_-prefixed report records close at mark price;
+	// manually entered non-mirrored records are untouched.
+	if e.onClose != nil {
+		for _, p := range e.positions {
+			e.onClose(p.Code, p.Mark, float64(p.Qty), "模拟盘重置")
+		}
+	}
 	e.cash = e.cfg.InitialCapital
 	e.positions = make(map[string]*Position)
 	e.trades = nil
 	e.equity = nil
 	e.realized = 0
 	e.poolPerf = make(map[string]*PoolPerf)
+	e.trimDone = make(map[string]string)
 	e.rebuildPoolsLocked() // 现金恢复后按当前池集合重新均分
 	e.persist()
 }
@@ -1143,6 +1290,10 @@ func (e *Engine) ResetPool(key string) {
 			proceeds += p.MarketValue()
 			delete(e.positions, code)
 			closed++
+			// 清盘镜像（阶段1.2）：report 账对应记录同步平仓（按估值价结算）。
+			// English: liquidation mirror (unified books) — the report-book record closes in sync
+			// (settled at the mark price).
+			e.mirrorCloseLocked(code, p.Mark, float64(p.Qty), "分仓清盘")
 		}
 	}
 	if proceeds > 0 {

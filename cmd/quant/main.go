@@ -184,6 +184,7 @@ func main() {
 		FixedAmount:    paperCfg.FixedAmount,
 		MaxPositions:   paperCfg.MaxPositions,
 		InitialCapital: paperCfg.InitialCapital,
+		AutoSell:       paperCfg.AutoSell == nil || *paperCfg.AutoSell, // 未配置默认全自动卖出
 	}, filepath.Join(dataDir, "paper.json"))
 	srv.SetPaper(paperEngine)
 	if paperEngine.Enabled() {
