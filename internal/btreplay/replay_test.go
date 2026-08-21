@@ -1,4 +1,4 @@
-package main
+package btreplay
 
 import (
 	"testing"

@@ -296,7 +296,7 @@ func TestNightlyJobKilledAtTradingOpen(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.jobRunning
+		return s.busy
 	}, "作业应已启动")
 
 	// 下一交易日周一 8:40 盘前 → 应 kill 作业
@@ -305,7 +305,7 @@ func TestNightlyJobKilledAtTradingOpen(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return !s.jobRunning
+		return !s.busy
 	}, "交易时段应终止夜间作业")
 }
 
@@ -377,7 +377,7 @@ func TestNightlyCrossDayReplacesJob(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.jobRunning && s.state.Day == "20260821"
+		return s.busy && s.state.Day == "20260821"
 	}, "周五作业应启动")
 
 	// 周六 15:30：跨天仍在跑 → 终止周五作业并启动周六作业
@@ -386,7 +386,7 @@ func TestNightlyCrossDayReplacesJob(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.state.Day == "20260822" && s.jobRunning
+		return s.state.Day == "20260822" && s.busy
 	}, "周六 15:30 应替换为周六作业")
 }
 
@@ -409,12 +409,12 @@ func TestRunCancelsJob(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.jobRunning
+		return s.busy
 	}, "Run 应启动作业")
 	cancel()
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return !s.jobRunning
+		return !s.busy
 	}, "Run 取消应终止作业")
 }

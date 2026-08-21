@@ -268,22 +268,13 @@ func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rp
 }
 
 // SetResearch 注入 B5 研究候选库与应用目录（approve 时把权重写入 applied_rules.json）。
-// （SetResearch wires the research-candidate store and app dir used by the approval endpoints.）
+// 回测任务自子系统统一改造（docs/RESEARCH_TASK_QUEUE_PLAN.md）起由 researchd 队列唯一执行，
+// quant 不再 spawn 研究子进程，也不再负责启动恢复（researchd worker 打开队列时执行 running→preempted）。
+// English: SetResearch wires the research-candidate store and app dir. Backtests are executed solely by
+// the researchd queue worker now — quant spawns no research children and owns no startup recovery.
 func (s *Server) SetResearch(db *store.DB, dataDir string) {
 	s.researchDB = db
 	s.researchDir = dataDir
-	// 启动恢复：上次进程崩溃遗留的 running 回测任务标记为 interrupted（前端可重新发起续跑，
-	// 断点缓存仍有效）。只在研究库接入时才执行。
-	// English: startup recovery — any leftover running backtest jobs from a crashed process are marked
-	// interrupted (the frontend can re-trigger a resume; checkpoints remain valid). Runs only when the
-	// research DB is wired in.
-	if db != nil {
-		if n, err := db.MarkRunningInterrupted(); err != nil {
-			log.Printf("[research] 标记残留回测任务失败: %v", err)
-		} else if n > 0 {
-			log.Printf("[research] 已把 %d 个残留 running 回测任务标记为 interrupted", n)
-		}
-	}
 }
 
 // GetSSE 返回 SSE 事件推送器。

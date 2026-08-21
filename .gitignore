@@ -60,3 +60,6 @@ mobile/gradle/wrapper/gradle-wrapper.jar
 mobile/gradle/wrapper/gradle-wrapper.jar.*
 # APK 内嵌的前端产物（由 build_apk.sh 从 web/dist 生成，不入库）
 mobile/app/src/main/assets/
+
+# go build ./cmd/research 产物（与包目录同名的本地构建二进制）
+/research

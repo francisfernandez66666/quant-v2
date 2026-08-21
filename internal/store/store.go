@@ -167,6 +167,47 @@ func (d *DB) migrate() error {
 			result_json TEXT NOT NULL,
 			PRIMARY KEY (candidate_id, event_date, industry)
 		)`,
+		// 研究任务队列（子系统统一改造一期）：quant(API) 与 researchd 夜间作业都只入队，
+		// 唯一消费者是 researchd worker（盘后门控 + 优先级 + kill 抢占）。
+		// 详见 docs/RESEARCH_TASK_QUEUE_PLAN.md §4。
+		// English: research task queue (unified-subsystem phase 1) — both quant(API) and the researchd
+		// nightly chain only enqueue; the single consumer is the researchd worker (after-hours gate +
+		// priority + kill-preemption). See docs/RESEARCH_TASK_QUEUE_PLAN.md §4.
+		`CREATE TABLE IF NOT EXISTS research_tasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			type TEXT NOT NULL,
+			ref_id INTEGER DEFAULT 0,
+			priority TEXT NOT NULL DEFAULT 'low',
+			status TEXT NOT NULL DEFAULT 'queued',
+			progress TEXT DEFAULT '',
+			result_num REAL DEFAULT 0,
+			result_text TEXT DEFAULT '',
+			error TEXT DEFAULT '',
+			payload TEXT NOT NULL DEFAULT '{}',
+			chain_day TEXT DEFAULT '',
+			chain_seq INTEGER DEFAULT 0,
+			control TEXT DEFAULT '',
+			created_at TEXT NOT NULL,
+			started_at TEXT DEFAULT '',
+			finished_at TEXT DEFAULT '',
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rtask_state ON research_tasks(status, priority)`,
+		`CREATE INDEX IF NOT EXISTS idx_rtask_chain ON research_tasks(chain_day)`,
+		// 研究窗口级断点（二期）：discover-factors 各阶段按窗口缓存装配产物（IC 行等），
+		// 被抢占/中断后续跑跳过已算窗口；resume_key 含区间+参数哈希，参数变更自动失效。
+		// English: window-level checkpoints (phase 2) — per-window artifacts (IC rows) cached per stage
+		// so a preempted discovery resumes skipping finished windows; resume_key embeds range+params so
+		// parameter changes invalidate automatically.
+		`CREATE TABLE IF NOT EXISTS research_ckpts (
+			resume_key TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			win_start TEXT NOT NULL,
+			win_end TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (resume_key, stage, win_start, win_end)
+		)`,
 		// 模拟盘研究落库：盘中模拟盘只在交易时段运行（省内存），盘后把当日成交与每日快照
 		// 导出到研究库，供自动研究（夜间 scheduler / research CLI）读取做信号质量与绩效研究。
 		// English: paper-to-research export — the paper book only runs during trading hours (memory
@@ -285,6 +326,14 @@ func (d *DB) migrate() error {
 				return fmt.Errorf("store migrate add column: %w", err)
 			}
 		}
+	}
+	// 一次性迁移：backtest_jobs → research_tasks（子系统统一改造，详见
+	// docs/RESEARCH_TASK_QUEUE_PLAN.md §9）。仅当队列表为空且旧表有数据时执行，
+	// 幂等安全：research_tasks 一旦有行（含新写入）绝不回填。
+	// English: one-shot backtest_jobs → research_tasks migration; runs only when the queue table is
+	// empty and legacy rows exist, so it can never clobber live queue data.
+	if err := d.migrateBacktestJobsToTasks(); err != nil {
+		return fmt.Errorf("store migrate backtest_jobs→research_tasks: %w", err)
 	}
 	return nil
 }

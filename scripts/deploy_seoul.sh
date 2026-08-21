@@ -52,15 +52,16 @@ $SCP /tmp/quant_linux $SERVER_USER@$SERVER_IP:/tmp/quant_linux
 $SSH "sudo mv /tmp/quant_linux $DEPLOY_DIR/quant && sudo chmod +x $DEPLOY_DIR/quant"
 
 # 研究/下载/调度二进制：独立研究服务（quant-research）与 sidecar 依赖
-echo "      编译 research/dataload/researchd/bt_strategy (linux/amd64)..."
+echo "      编译 research/dataload/researchd (linux/amd64)..."
+# 子系统统一改造（docs/RESEARCH_TASK_QUEUE_PLAN.md 二期）：bt_strategy 已并入 research
+# （backtest-strategy 子命令），不再单独构建/分发；服务器上的旧二进制顺带清理。
+# English: since the phase-2 merge, bt_strategy lives inside the research binary — no separate build.
 GOOS=linux GOARCH=amd64 go build -o /tmp/research_linux ./cmd/research
 GOOS=linux GOARCH=amd64 go build -o /tmp/dataload_linux ./cmd/dataload
 GOOS=linux GOARCH=amd64 go build -o /tmp/researchd_linux ./cmd/researchd
-# bt_strategy（阶段3.4 战法库回测：web 端点 /api/research/library/{id}/backtest 的子进程）
-GOOS=linux GOARCH=amd64 go build -o /tmp/bt_strategy_linux ./cmd/backtest_strategy
-$SCP /tmp/research_linux /tmp/dataload_linux /tmp/researchd_linux /tmp/bt_strategy_linux $SERVER_USER@$SERVER_IP:/tmp/
-$SSH "sudo mv /tmp/research_linux $DEPLOY_DIR/research && sudo mv /tmp/dataload_linux $DEPLOY_DIR/dataload && sudo mv /tmp/researchd_linux $DEPLOY_DIR/researchd && sudo mv /tmp/bt_strategy_linux $DEPLOY_DIR/bt_strategy"
-$SSH "sudo chmod +x $DEPLOY_DIR/research $DEPLOY_DIR/dataload $DEPLOY_DIR/researchd $DEPLOY_DIR/bt_strategy"
+$SCP /tmp/research_linux /tmp/dataload_linux /tmp/researchd_linux $SERVER_USER@$SERVER_IP:/tmp/
+$SSH "sudo mv /tmp/research_linux $DEPLOY_DIR/research && sudo mv /tmp/dataload_linux $DEPLOY_DIR/dataload && sudo mv /tmp/researchd_linux $DEPLOY_DIR/researchd && sudo rm -f $DEPLOY_DIR/bt_strategy"
+$SSH "sudo chmod +x $DEPLOY_DIR/research $DEPLOY_DIR/dataload $DEPLOY_DIR/researchd"
 # 事件匹配规则（相对路径加载），缺失时优雅降级但也尽量带上
 EVENTS_SRC=""
 for cand in "$APP_DIR/config/events_leftside.yaml" "$APP_DIR/events_leftside.yaml"; do
@@ -152,10 +153,14 @@ $SCP "$APP_DIR/deploy/quant-research.service" $SERVER_USER@$SERVER_IP:/tmp/quant
 $SSH "sudo mv /tmp/quant-research.service /etc/systemd/system/quant-research.service"
 $SCP "$APP_DIR/deploy/pydata.service" $SERVER_USER@$SERVER_IP:/tmp/pydata.service
 $SSH "sudo mv /tmp/pydata.service /etc/systemd/system/pydata.service"
-$SSH "sudo systemctl daemon-reload"
- $SSH "sudo systemctl enable --now quant"
- $SSH "sudo systemctl enable --now pydata"
- $SSH "sudo systemctl enable --now quant-research"
+ $SSH "sudo systemctl daemon-reload"
+ # restart 而非 enable --now：对已运行服务 enable --now 是空操作，会导致
+ # 新二进制上线后进程仍是旧代码（本次部署实际踩坑）。
+ # English: restart unconditionally — `enable --now` on a running unit is a no-op and leaves the old
+ # binary running after an upgrade (bit us in practice).
+ $SSH "sudo systemctl enable quant >/dev/null 2>&1; sudo systemctl restart quant"
+ $SSH "sudo systemctl enable pydata >/dev/null 2>&1; sudo systemctl restart pydata"
+ $SSH "sudo systemctl enable quant-research >/dev/null 2>&1; sudo systemctl restart quant-research"
  $SSH "sudo systemctl restart caddy"
 
 # ── 6b. QMT 网关（AUTO_TRADING_PLAN M1/M2 预留）──
@@ -171,6 +176,9 @@ $SCP "$APP_DIR/deploy/qmt-mock.service" $SERVER_USER@$SERVER_IP:/tmp/qmt-mock.se
 $SSH "sudo mv /tmp/qmt-mock.service /etc/systemd/system/qmt-mock.service"
 # 默认关闭（联调时手动 enable --now qmt-mock）；token 由 /etc/qmt-mock.env 提供
 $SSH "sudo mkdir -p $DEPLOY_DIR/qmt_gateway /tmp/qmt_gateway"
+# 先清空目标与暂存目录再复制（__pycache__/tests 等非空目录会让 mv 覆盖失败，set -e 中断部署）
+# English: clear target & staging first — non-empty dirs (pycache/tests) break plain mv overwrite.
+$SSH "sudo rm -rf /tmp/qmt_gateway $DEPLOY_DIR/qmt_gateway && sudo mkdir -p /tmp/qmt_gateway $DEPLOY_DIR/qmt_gateway"
 $SCP -r "$APP_DIR/qmt_gateway/." $SERVER_USER@$SERVER_IP:/tmp/qmt_gateway/
 $SSH "sudo mv /tmp/qmt_gateway/* $DEPLOY_DIR/qmt_gateway/ && sudo rm -rf /tmp/qmt_gateway"
 $SSH "sudo systemctl daemon-reload"

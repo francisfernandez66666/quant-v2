@@ -17,12 +17,85 @@
 package research
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
 	"math"
 	"sort"
+	"strings"
 
 	"quant-trading-v2/internal/factor"
 	"quant-trading-v2/internal/store"
 )
+
+// winCkpt 窗口级断点助手（二期）：命中即跳过该窗装配，算完即落库。
+// nil 接收者安全（所有方法判空直通），便于调用方无断点场景复用同一代码路径。
+// English: per-window checkpoint helper — a hit skips that window's assembly; completion persists it.
+// nil-receiver safe so callers without checkpoints share the same code path.
+type winCkpt struct {
+	db        *store.DB
+	resumeKey string
+	stage     string
+}
+
+func (c *winCkpt) load(w [2]string, dst any) bool {
+	if c == nil || c.db == nil {
+		return false
+	}
+	js, ok, err := c.db.GetWindowCkpt(c.resumeKey, c.stage, w[0], w[1])
+	if err != nil || !ok {
+		return false
+	}
+	return json.Unmarshal([]byte(js), dst) == nil
+}
+
+func (c *winCkpt) save(w [2]string, v any) {
+	if c == nil || c.db == nil {
+		return
+	}
+	js, err := json.Marshal(v)
+	if err == nil {
+		_ = c.db.PutWindowCkpt(c.resumeKey, c.stage, w[0], w[1], string(js))
+	}
+}
+
+// stageProgress 阶段进度：把窗口完成数映射到全局百分比带并打印"发现进度 xx%"
+// （worker 按 (?:任务|回测|发现)进度 解析回写队列；同时喂看门狗）。
+// English: maps finished windows into a global percentage band and prints "发现进度 xx%" for the worker.
+type stageProgress struct {
+	lo, hi int // 全局百分比带
+	total  int // 窗口总数
+	done   int
+}
+
+func newStageProgress(lo, hi, total int) *stageProgress {
+	if total <= 0 {
+		return nil
+	}
+	return &stageProgress{lo: lo, hi: hi, total: total}
+}
+
+func (p *stageProgress) tick() {
+	if p == nil {
+		return
+	}
+	p.done++
+	pct := p.lo + (p.hi-p.lo)*p.done/p.total
+	log.Printf("发现进度 %d%%", pct)
+}
+
+// discoveryResumeKey 断点键：任何影响结果的参数（区间/前瞻/最小样本/窗口宽/因子池/股票池）
+// 变更都会生成新 key，旧缓存自动失效。English: checkpoint key — any result-affecting change rolls a fresh key.
+func discoveryResumeKey(start, end string, horizon, minStocks, winDays int, fids []string, codes []string) string {
+	sorted := append([]string{}, fids...)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", codes)))
+	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s",
+		start, end, horizon, minStocks, winDays,
+		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10])
+}
 
 // windowDays 每个窗口包含的交易日数。越小峰值内存越低、但装配次数越多（越慢）。
 // 90→60：2026-08-20 起调小以进一步压低研究峰值内存（~716MB→~450MB），
@@ -78,23 +151,32 @@ func nextDayStr(yyyymmdd string) string {
 	return storeNextDay(yyyymmdd)
 }
 
+// weightsTag 权重集的稳定短标识（断点 stage 用：不同权重 = 不同缓存槽）。
+func weightsTag(w map[string]float64) string {
+	keys := make([]string, 0, len(w))
+	for k := range w {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", keys)))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
 // windowCompositeIC 按窗口分块装配，累积 CompositeIC 的逐日 IC 行（全区间）。
 // 每窗口：BuildPanels 装配 [winStart, endPlusH]（多算 h 天尾巴保证前瞻收益完整），
 // 然后 CompositeICRange 只统计窗口内日期。窗口算完释放。
-// English: chunked assembly of CompositeIC rows over the full range — per window it assembles
-// panels over [winStart, endPlusH] (extra h days so forward returns are complete) then keeps only
-// in-window rows via CompositeICRange; the window is released afterwards.
-func windowCompositeIC(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, winDays int, start, end string) []ICRow {
+// ck 非 nil 时启用断点（stage 需含权重标识——行值依赖权重）；nil 直通无缓存。
+// English: chunked CompositeIC rows over the full range; checkpoint-aware when ck is non-nil
+// (its stage must embed the weights tag since row values depend on them); nil passes through.
+func windowCompositeIC(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, chunks [][2]string, ck *winCkpt) []ICRow {
 	defs := windowDefs(factors)
-	dates, err := db.TradeDates(start, end)
-	if err != nil || len(dates) == 0 {
-		return nil
-	}
-	// 统计用的全区间边界
-	statStart, statEnd := dates[0], dates[len(dates)-1]
 	var all []ICRow
-	for _, w := range windowChunks(dates, winDays) {
-		// 窗口统计区间 + 尾部多算 h 天（保证窗口末日的前瞻收益可用）
+	for _, w := range chunks {
+		var rows []ICRow
+		if ck.load(w, &rows) {
+			all = append(all, rows...)
+			continue
+		}
 		asmbEnd := w[1]
 		for i := 0; i < h; i++ {
 			asmbEnd = nextDayStr(asmbEnd)
@@ -103,56 +185,63 @@ func windowCompositeIC(db *store.DB, codes []string, factors []string, weights m
 		if err != nil {
 			continue
 		}
-		rows := CompositeICRange(panels, factors, weights, h, min, w[0], w[1])
+		rows = CompositeICRange(panels, factors, weights, h, min, w[0], w[1])
+		ck.save(w, rows)
 		all = append(all, rows...)
 	}
-	_ = statStart
-	_ = statEnd
 	return all
 }
 
 // windowICByAllFactors 每窗口只装配一次（含全部候选因子），算出窗口内**所有**因子的
-// 单因子 IC 行。用于预筛阶段，把装配次数从「因子数×窗口数」降到「窗口数」，大幅提速。
-// 返回 map[fid][]ICRow（全区间，按窗口合并）。
-// English: assembles each window once (with all candidate factors) and computes every factor's
-// single-factor IC rows in that window. Used by the pre-screen, cutting assembles from
-// factors×windows down to windows (a big speedup). Returns map[fid][]ICRow merged over windows.
-func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min int, winDays int, start, end string) map[string][]ICRow {
+// 单因子 IC 行（预筛阶段，装配次数从「因子数×窗口数」降到「窗口数」）。
+// 断点 stage="pre"；prog 上报窗口完成进度。English: single-factor pre-screen per window;
+// checkpoint stage "pre", progress reported per window.
+func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min int, chunks [][2]string, ck *winCkpt, prog *stageProgress) map[string][]ICRow {
 	out := make(map[string][]ICRow, len(fids))
 	if len(fids) == 0 {
 		return out
 	}
 	defs := windowDefs(fids)
-	dates, err := db.TradeDates(start, end)
-	if err != nil || len(dates) == 0 {
-		return out
-	}
-	for _, w := range windowChunks(dates, winDays) {
+	for _, w := range chunks {
+		var winAll map[string][]ICRow
+		if ck.load(w, &winAll) && len(winAll) > 0 {
+			for fid, rows := range winAll {
+				out[fid] = append(out[fid], rows...)
+			}
+			prog.tick()
+			continue
+		}
 		asmbEnd := w[1]
 		for i := 0; i < h; i++ {
 			asmbEnd = nextDayStr(asmbEnd)
 		}
 		panels, err := BuildPanels(db, codes, w[0], asmbEnd, defs)
 		if err != nil {
+			prog.tick()
 			continue
 		}
-		// 对每个候选因子，用同一批窗口面板算单因子 IC
+		winAll = make(map[string][]ICRow, len(fids))
 		for _, fid := range fids {
 			rows := ICByDate(panels, fid, h, min)
+			var kept []ICRow
 			for _, r := range rows {
 				if r.Date >= w[0] && r.Date <= w[1] {
 					out[fid] = append(out[fid], r)
+					kept = append(kept, r)
 				}
 			}
+			winAll[fid] = kept
 		}
+		ck.save(w, winAll)
+		prog.tick()
 	}
 	return out
 }
 
-// windowCompositeIR 返回全区间复合 |IR|（窗口分块）。
-// English: composite |IR| over the full range via window chunking.
-func windowCompositeIR(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, winDays int, start, end string) float64 {
-	rows := windowCompositeIC(db, codes, factors, weights, h, min, winDays, start, end)
+// windowCompositeIR 返回全区间复合 |IR|（窗口分块，断点 stage 含权重标识）。
+func windowCompositeIR(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, chunks [][2]string, rk string) float64 {
+	ck := &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(weights)}
+	rows := windowCompositeIC(db, codes, factors, weights, h, min, chunks, ck)
 	ir := IR(rows)
 	if math.IsNaN(ir) {
 		return 0
@@ -162,11 +251,9 @@ func windowCompositeIR(db *store.DB, codes []string, factors []string, weights m
 
 // windowCompositeICForSubsets 贪心选择的提速版：每窗口只装配一次（含 base+全部候选因子），
 // 在该窗口内对每个候选子集（base+每个 cand）各算 CompositeIC 行并累积。
-// 把贪心每步的装配次数从「候选数×窗口数」降到「窗口数」。返回 map[cand][]ICRow。
-// English: greedy-selection speedup — assemble each window once (base + all candidate factors) and
-// compute CompositeIC rows for every candidate subset (base+cand) in that window, cutting a greedy
-// step's assembles from candidates×windows down to windows. Returns map[cand][]ICRow.
-func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []string, h, min int, winDays int, start, end string) map[string][]ICRow {
+// 断点 stage 含 base 标识（base 集不同 = 不同缓存槽）。English: greedy-step speedup with
+// per-window checkpointing keyed by the base set.
+func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []string, h, min int, chunks [][2]string, ck *winCkpt) map[string][]ICRow {
 	out := make(map[string][]ICRow, len(cands))
 	if len(cands) == 0 {
 		return out
@@ -174,11 +261,14 @@ func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []str
 	// 装配用的因子 = base + 全部候选
 	fids := append(append([]string{}, base...), cands...)
 	defs := windowDefs(fids)
-	dates, err := db.TradeDates(start, end)
-	if err != nil || len(dates) == 0 {
-		return out
-	}
-	for _, w := range windowChunks(dates, winDays) {
+	for _, w := range chunks {
+		var winOut map[string][]ICRow
+		if ck.load(w, &winOut) && len(winOut) > 0 {
+			for cand, rows := range winOut {
+				out[cand] = append(out[cand], rows...)
+			}
+			continue
+		}
 		asmbEnd := w[1]
 		for i := 0; i < h; i++ {
 			asmbEnd = nextDayStr(asmbEnd)
@@ -187,6 +277,7 @@ func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []str
 		if err != nil {
 			continue
 		}
+		winOut = make(map[string][]ICRow, len(cands))
 		for _, cand := range cands {
 			candFactors := append(append([]string{}, base...), cand)
 			wm := map[string]float64{}
@@ -195,25 +286,30 @@ func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []str
 			}
 			rows := CompositeICRange(panels, candFactors, wm, h, min, w[0], w[1])
 			out[cand] = append(out[cand], rows...)
+			winOut[cand] = rows
 		}
+		ck.save(w, winOut)
 	}
 	return out
 }
 
 // windowReverseExtension 按窗口分块累积反推泛化的 top/rest 收益数组并做 Welch t 检验。
-// 逻辑与 reverseExtension 一致（每日截面 z 化复合分 → top20% vs 其余），只是逐窗口装配、
-// 累积收益数组而非一次性聚合。
-// English: window-chunked reverse-extension — accumulates top/rest forward returns per window
-// (same daily z-scored composite → top-quintile vs rest logic as reverseExtension) and runs a
-// Welch t-test on the merged arrays.
-func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs map[string]int, weights map[string]float64, opts DiscoverOpts, winDays int, start, end string) (float64, float64, float64, float64, float64) {
+// 断点 stage="gen"（每窗缓存 top/rest 数组）。English: window-chunked reverse-extension with
+// per-window checkpoints (stage "gen" caches top/rest arrays).
+func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs map[string]int, weights map[string]float64, opts DiscoverOpts, chunks [][2]string, rk string) (float64, float64, float64, float64, float64) {
 	defs := windowDefs(factors)
-	dates, err := db.TradeDates(start, end)
-	if err != nil || len(dates) == 0 {
-		return 0, 0, 0, 0, nan()
-	}
+	ck := &winCkpt{db: db, resumeKey: rk, stage: "gen"}
 	var topRets, restRets []float64
-	for _, w := range windowChunks(dates, winDays) {
+	for _, w := range chunks {
+		var winTR struct {
+			Top  []float64 `json:"top"`
+			Rest []float64 `json:"rest"`
+		}
+		if ck.load(w, &winTR) {
+			topRets = append(topRets, winTR.Top...)
+			restRets = append(restRets, winTR.Rest...)
+			continue
+		}
 		asmbEnd := w[1]
 		for i := 0; i < opts.Horizon; i++ {
 			asmbEnd = nextDayStr(asmbEnd)
@@ -271,11 +367,14 @@ func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs
 			for i, v := range day {
 				if i < nTop {
 					topRets = append(topRets, v.r)
+					winTR.Top = append(winTR.Top, v.r)
 				} else {
 					restRets = append(restRets, v.r)
+					winTR.Rest = append(winTR.Rest, v.r)
 				}
 			}
 		}
+		ck.save(w, winTR)
 	}
 	if len(topRets) == 0 || len(restRets) == 0 {
 		return 0, 0, 0, 0, nan()
@@ -296,10 +395,12 @@ func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs
 }
 
 // windowOptimizeWeights 坐标上升权重优化（窗口分块版）。复刻 OptimizeWeights 的算法，
-// 但内部用 windowCompositeIC 代替全量面板的 CompositeIC。
-// English: window-chunked coordinate-ascent weight optimization, mirroring OptimizeWeights but
-// using windowCompositeIC instead of full-panel CompositeIC.
-func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, winDays int, start, end string) OptResult {
+// 但内部用 windowCompositeIC 代替全量面板的 CompositeIC。权重候选是瞬态的（坐标上升每步
+// 组合都不同），不做窗口断点——断点只覆盖输入确定的阶段（预筛/贪心/分段IR/反推）。
+// English: window-chunked coordinate-ascent weight optimization. Candidate weights are transient
+// (different every ascent step), so no window checkpoints here — checkpoints only cover
+// deterministic stages (pre-screen / greedy / split-IR / reverse-extension).
+func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chunks [][2]string) OptResult {
 	if len(opts.Factors) == 0 {
 		return OptResult{Reason: "因子池为空"}
 	}
@@ -320,7 +421,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, winD
 		w[f] = 1.0
 	}
 	w = cloneWeights(w)
-	best := windowEval(db, codes, opts, w, winDays, start, end)
+	best := windowEval(db, codes, opts, w, chunks)
 	for it := 0; it < opts.MaxIter; it++ {
 		improved := false
 		for _, f := range opts.Factors {
@@ -330,7 +431,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, winD
 				if cand[f] < 0 {
 					cand[f] = 0
 				}
-				r := windowEval(db, codes, opts, cand, winDays, start, end)
+				r := windowEval(db, codes, opts, cand, chunks)
 				if better(r, best, opts.Metric) {
 					best = r
 					w = cand
@@ -357,10 +458,9 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, winD
 	return best
 }
 
-// windowEval 用窗口分块计算某权重下的 IC 统计（等价 evaluate，但走窗口内核）。
-// English: window-chunked IC stats for a given weight set (equivalent to evaluate).
-func windowEval(db *store.DB, codes []string, opts OptimizeOpts, w map[string]float64, winDays int, start, end string) OptResult {
-	rows := windowCompositeIC(db, codes, opts.Factors, w, opts.Horizon, opts.MinStocks, winDays, start, end)
+// windowEval 用窗口分块计算某权重下的 IC 统计（等价 evaluate，但走窗口内核；无断点）。
+func windowEval(db *store.DB, codes []string, opts OptimizeOpts, w map[string]float64, chunks [][2]string) OptResult {
+	rows := windowCompositeIC(db, codes, opts.Factors, w, opts.Horizon, opts.MinStocks, chunks, nil)
 	return OptResult{
 		ICMean: meanIC(rows), ICStd: stdIC(rows), IR: IR(rows), NDays: len(rows),
 	}
@@ -414,15 +514,22 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 		return res
 	}
 	splitIdx := int(float64(len(dates)) * opts.SplitPct)
-	splitDate := dates[splitIdx]
 	winDays := windowDays
+	chunks := windowChunks(dates, winDays)
+
+	// 窗口级断点（二期）：resume_key 绑定区间+参数+股票池；被抢占后重入，
+	// 预筛/贪心/分段IR/反推各阶段命中窗口直接复用，不再重装配。
+	// English: window-level checkpoints — resume key binds range+params+pool; a preempted rerun
+	// reuses finished windows across the pre-screen / greedy / split-IR / gen stages.
+	rk := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes)
+	log.Printf("[discover] 断点key=%s 窗口数=%d（中断续跑跳过已完成窗口）", rk, len(chunks))
 
 	// 1) 单因子预筛：每窗口装配一次（含全部候选因子），一次性算所有因子的全区间 |IR|
-	// （比逐因子重新装配窗口快约「因子数」倍）。
-	// English: single-factor pre-screen — assemble each window once (all candidate factors) and compute
-	// every factor's full-range |IR| in one pass (~factors× faster than re-assembling per factor).
+	// （比逐因子重新装配窗口快约「因子数」倍）。进度带 5%–35%。
+	// English: single-factor pre-screen (progress band 5–35%).
 	var pre []string
-	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, winDays, start, end)
+	preCk := &winCkpt{db: db, resumeKey: rk, stage: "pre"}
+	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, chunks, preCk, newStageProgress(5, 35, len(chunks)))
 	for _, fid := range opts.Factors {
 		rows := allIC[fid]
 		if len(rows) < opts.MinDays {
@@ -458,7 +565,9 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 		// 每窗口装配一次，算所有候选子集（base+各 cand）的复合 IC（提速）
 		bestFid := ""
 		bestCandIR := bestIR
-		subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, winDays, start, end)
+		// 断点 stage 含 base 标识：贪心每步 base 集不同，各自成槽（stage embeds the base set）。
+		subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, chunks,
+			&winCkpt{db: db, resumeKey: rk, stage: "greedy|" + strings.Join(selected, "+")})
 		for _, fid := range cands {
 			ir := absf(IR(subsetIC[fid]))
 			if isNaN(ir) {
@@ -493,7 +602,7 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 		Factors: selected, Horizon: opts.Horizon, MinStocks: opts.MinStocks,
 		Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
 		GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
-	}, winDays, start, end)
+	}, chunks)
 	res.Factors = selected
 	res.Directions = dirs
 	res.Weights = opt.Weights
@@ -504,9 +613,13 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 	res.Reason = opt.Reason
 
 	// 4) E3 分段 + 反推验证（窗口分块）
-	res.InsampleIR = windowCompositeIR(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, winDays, start, splitDate)
-	res.OutsampleIR = windowCompositeIR(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, winDays, splitDate, end)
-	res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT = windowReverseExtension(db, codes, selected, dirs, opt.Weights, opts, winDays, splitDate, end)
+	// 分段 IR 与反推验证：输入确定（selected+权重固定），窗口断点全量生效。
+	splitChunks := windowChunks(dates[splitIdx:], winDays)
+	headChunks := windowChunks(dates[:splitIdx+1], winDays)
+	res.InsampleIR = windowCompositeIR(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, headChunks, rk)
+	res.OutsampleIR = windowCompositeIR(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, splitChunks, rk)
+	res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT =
+		windowReverseExtension(db, codes, selected, dirs, opt.Weights, opts, splitChunks, rk)
 
 	if res.OutsampleIR < opts.MinIR {
 		if res.PassGuard {
@@ -583,4 +696,13 @@ func itoaN(v, w int) string {
 		s = "0" + s
 	}
 	return s
+}
+
+// WindowChunks 导出版窗口切分：把交易日列表按 winDays 切成 [start,end] 窗口
+// （winDays<=0 用默认 windowDays）。供 B4 全链路回测等大装配场景复用，
+// 与 discover-factors 同一内存口径：峰值只装一个窗口。
+// English: exported window splitter — chunks a trade-date list into [start,end] windows
+// (winDays<=0 uses the default). Reused by the B4 chain backtest so peak memory stays at one window.
+func WindowChunks(dates []string, winDays int) [][2]string {
+	return windowChunks(dates, winDays)
 }

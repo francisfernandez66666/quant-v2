@@ -43,7 +43,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|list|approve")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve")
 	}
 	cmd := args[0]
 
@@ -73,6 +73,13 @@ func main() {
 		cmdPaperResearch(db, args[1:])
 	case "backtest":
 		cmdBacktestCandidate(db, args[1:])
+	case "backtest-strategy":
+		// 战法/规则历史回放（二期并入，原独立二进制 bt_strategy）。
+		cmdBacktestStrategy(db, *dbPath, args[1:])
+	case "run-task":
+		// 队列任务分发器（子系统统一改造一期）：worker 以 run-task --task-id N 拉起。
+		// English: queue-task dispatcher (phase 1) — the worker spawns `run-task --task-id N`.
+		cmdRunTask(db, *dbPath, args[1:])
 	case "list":
 		cmdList(db, args[1:])
 	case "approve":

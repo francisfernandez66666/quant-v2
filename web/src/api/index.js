@@ -1107,9 +1107,13 @@ export async function rejectResearchCandidate(id) {
   return request('/api/research/candidates/' + encodeURIComponent(id) + '/reject', { method: 'POST' })
 }
 
-/** 对指定候选跑一次全量回测（POST /api/research/candidates/{id}/backtest，异步）。
- *  params 可选 {start,end,top_k,min_stocks}：自定义回测时长与选股数（阶段3.3，透传 CLI） */
-/** Run a full backtest on a candidate (POST ..., async). Optional params pass through to the CLI */
+/** 对指定候选发起一次全量回测（POST /api/research/candidates/{id}/backtest，异步）。
+ *  队列化改造（docs/RESEARCH_TASK_QUEUE_PLAN.md）：本接口只把 high 优先级任务写入
+ *  research_tasks 队列即返回，由 researchd worker 在盘后窗口唯一执行——盘中提交会保持
+ *  "queued" 状态排队，绝不进入交易时段。同候选已有排队/运行任务时幂等返回现态。
+ *  params 可选 {start,end,top_k,min_stocks}：自定义回测时长与选股数（阶段3.3，透传执行参数）。
+ *  English: enqueues a high-priority candidate backtest; the researchd worker runs it after hours.
+ *  Same-ref duplicates return the existing task idempotently. Optional params pass through. */
 export async function backtestResearchCandidate(id, params) {
   const qs = new URLSearchParams()
   if (params) {
@@ -1122,8 +1126,11 @@ export async function backtestResearchCandidate(id, params) {
   return request('/api/research/candidates/' + encodeURIComponent(id) + '/backtest' + (q ? '?' + q : ''), { method: 'POST' })
 }
 
-/** 取消运行中的回测（kill 子进程 + 标 interrupted；断点缓存有效可续跑）（阶段3.2） */
-/** Cancel a running backtest (kills the child, marks interrupted; checkpoints stay valid) */
+/** 取消回测任务（阶段3.2；队列化改造后语义扩展）：
+ *  运行中 → worker kill 子进程并标 interrupted（断点缓存有效，可续跑）；
+ *  排队中(queued) → 直接置 cancelled 终态（尚未开始执行，无断点概念）。
+ *  English: cancel — running rows are killed+interrupted (checkpoints stay valid); queued rows are
+ *  cancelled outright (never started). */
 export async function cancelBacktest(id) {
   return request('/api/research/backtest/' + encodeURIComponent(id) + '/cancel', { method: 'POST' })
 }

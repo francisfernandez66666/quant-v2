@@ -4,21 +4,12 @@
 package server
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"quant-trading-v2/internal/research"
@@ -283,526 +274,118 @@ func ActivePaperPoolTypes(dataDir string) []string {
 	return types
 }
 
-// ---- 单条候选全量回测（异步）----
+// ---- 回测任务（子系统统一改造一期）：入队 + 查询 ----
+//
+// quant 不再 spawn 研究子进程：手动回测只把 high 任务写入 research_tasks 队列，
+// 由 researchd worker 在盘后窗口唯一执行（盘后门控对手动任务同样生效）。
+// 本文件保留旧 REST 契约与 JSON 形状，前端零改动；状态新增 queued/preempted
+// （preempted 对外映射为旧语义 interrupted）。
+// English: phase-1 queue refactor — manual backtests only enqueue a high-priority task; the researchd
+// worker executes them after hours. Legacy REST shapes preserved so the frontend is untouched.
 
-// backtestJobs 内存回测任务表（前端轮询进度）。单实例，进程内即可，无需持久化。
-// English: in-memory backtest job table (frontend polls progress). Single instance, no persistence.
-var backtestJobs = struct {
-	sync.Mutex
-	m map[int64]*backtestJob
-}{m: map[int64]*backtestJob{}}
-
-// backtestJob 一条回测任务状态。
-// English: one backtest job state.
-type backtestJob struct {
-	CandID    int64     `json:"candidate_id"`
-	Status    string    `json:"status"` // running | paused | done | error | interrupted
-	Started   time.Time `json:"started"`
-	Progress  string    `json:"progress"`
-	AvgExcess float64   `json:"avg_excess,omitempty"`
-	Err       string    `json:"error,omitempty"`
-	// 运行控制（阶段3.2）：子进程句柄与标志。cancel=kill+interrupted；pause=SIGSTOP；
-	// resume=SIGCONT；lastProgress 供看门狗检测"进度停滞"（挂死置 error）。
-	// English: run-control handles — cancel kills and marks interrupted; pause sends SIGSTOP;
-	// resume sends SIGCONT; lastProgress feeds the stall watchdog (hung children error out).
-	cmd          *exec.Cmd
-	paused       bool
-	cancelReq    bool
-	lastProgress int64 // unix 秒，最近一次进度行时间（原子访问经 backtestJobs 锁保护）
+// backtestTaskKinds 任务类型 → 旧 kind 字段（列表/状态接口兼容输出用）。
+var backtestTaskKinds = map[string]string{
+	store.TaskBacktestCandidate: "candidate",
+	store.TaskBacktestStrategy:  "library",
+	store.TaskBacktestNightly:   "nightly",
 }
 
-// backtestRunOpts 一次候选回测的运行参数（阶段3.3 自定义时长与选股数：透传 CLI）。
-// English: per-run backtest parameters (custom range and pick counts, passed through to the CLI).
-type backtestRunOpts struct {
-	Start     string // YYYYMMDD 空=CLI 默认
-	End       string // YYYYMMDD 空=今天
-	TopK      int    // 每事件选股数 0=CLI 默认
-	MinStocks int    // 每日最小样本 0=CLI 默认
+// isBacktestTask 是否回测类任务（回测 tab 只展示这些类型）。
+func isBacktestTask(t string) bool { _, ok := backtestTaskKinds[t]; return ok }
+
+// apiStatusOf 对外展示状态映射：preempted 沿用旧名 interrupted（断点有效可续跑语义一致）。
+func apiStatusOf(s string) string {
+	if s == store.TaskPreempted {
+		return "interrupted"
+	}
+	return s
 }
 
-// handleCandidateBacktest 处理 POST /api/research/candidates/{id}/backtest：对指定候选跑一次 B4 全量回测
-// （异步后台执行，前端轮询 GET /api/research/backtest/{id} 拿进度与结果）。
-// 任务状态同步落库 backtest_jobs（kind='candidate'），quant 重启后任务可查、可续跑。
-// 可选 query 参数（阶段3.3）：start/end（YYYYMMDD 回测时长）、top_k（每事件选股数）、
-// min_stocks（每日最小样本）——透传给 research backtest CLI。
-// 单例限制（阶段3.1）：全局同时只允许一个候选回测运行/暂停，防 1 核 VPS 并发回测互相拖死
-// （此前多候选并发全部卡 0% 即此因）。
-// English: POST /api/research/candidates/{id}/backtest — runs a full B4 backtest on a candidate
-// (async; frontend polls for progress). Persisted to backtest_jobs. Optional query params start/end/
-// top_k/min_stocks pass through to the CLI. Single-flight: only one candidate backtest may run at a
-// time so concurrent full backtests can't starve the 1-core box.
+// taskToLegacyJob 把队列行映射为旧 BacktestJob 形状（前端契约兼容）。
+func taskToLegacyJob(t store.ResearchTask) store.BacktestJob {
+	return store.BacktestJob{
+		Kind:        backtestTaskKinds[t.Type],
+		CandidateID: t.RefID,
+		Status:      apiStatusOf(t.Status),
+		Progress:    t.Progress,
+		AvgExcess:   t.ResultNum,
+		Error:       t.Error,
+		ResultText:  t.ResultText,
+		StartedAt:   t.StartedAt,
+		FinishedAt:  t.FinishedAt,
+		UpdatedAt:   t.UpdatedAt,
+	}
+}
+
+// enqueueBacktestTask 入队一条手动回测任务（high 优先级）。payload 为运行参数。
+func (s *Server) enqueueBacktestTask(taskType string, refID int64, payload map[string]any) (int64, *store.ResearchTask, error) {
+	if s.researchDB == nil {
+		return 0, nil, fmt.Errorf("研究库未接入")
+	}
+	// 同 ref 幂等：已有排队/运行中任务则直接返回现态，不重复入队。
+	has, err := s.researchDB.HasActiveTaskByRef(taskType, refID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if has {
+		t, err := s.researchDB.LatestTaskByRef(taskType, refID)
+		if err != nil || t == nil {
+			return 0, nil, fmt.Errorf("读取现有任务失败")
+		}
+		return t.ID, t, nil
+	}
+	pj, _ := json.Marshal(payload)
+	id, err := s.researchDB.EnqueueResearchTask(&store.ResearchTask{
+		Type:     taskType,
+		RefID:    refID,
+		Priority: "high",
+		Status:   store.TaskQueued,
+		Payload:  string(pj),
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	log.Printf("[research] 已入队 %s #%d（high，盘后执行）: %s", taskType, id, string(pj))
+	t, _ := s.researchDB.GetResearchTask(id)
+	return id, t, nil
+}
+
+// handleCandidateBacktest 处理 POST /api/research/candidates/{id}/backtest：
+// 入队一条 backtest_candidate 高优先级任务（异步、盘后由 researchd 执行），前端照旧轮询进度。
+// 可选 query：start/end/top_k/min_stocks 透传进 payload。同候选已有活跃任务时幂等返回现态。
+// English: POST /api/research/candidates/{id}/backtest — enqueues a high-priority candidate backtest;
+// executed by the researchd worker after hours. Optional params pass through into the payload.
 func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, 400, "无效 id")
 		return
 	}
-	// 阶段3.3：解析可选运行参数
 	q := r.URL.Query()
-	opts := backtestRunOpts{Start: q.Get("start"), End: q.Get("end")}
+	payload := map[string]any{}
+	for k, key := range map[string]string{"start": "start", "end": "end"} {
+		if v := q.Get(k); v != "" {
+			payload[key] = v
+		}
+	}
 	if v, err := strconv.Atoi(q.Get("top_k")); err == nil && v > 0 {
-		opts.TopK = v
+		payload["top-k"] = v
 	}
 	if v, err := strconv.Atoi(q.Get("min_stocks")); err == nil && v > 0 {
-		opts.MinStocks = v
+		payload["min-stocks"] = v
 	}
-
-	backtestJobs.Lock()
-	// 单例限制：任一 running/paused 任务存在即拒绝新启动（同 id 视为重复点击返回现态）。
-	// English: single-flight — any running/paused job blocks a new launch (same id returns current state).
-	for cid, j := range backtestJobs.m {
-		if j.Status != "running" && j.Status != "paused" {
-			continue
-		}
-		backtestJobs.Unlock()
-		if cid == id {
-			writeJSON(w, 200, map[string]any{"status": "running", "job": j})
-		} else {
-			writeError(w, 409, fmt.Sprintf("已有回测任务在运行（候选 #%d），请先取消或等待完成", cid))
-		}
-		return
-	}
-	// 建任务即落库（Progress="0%"），消灭 CLI 首个 10% 之前的前端进度空窗。
-	// English: the job is persisted immediately with Progress="0%" so the frontend has a visible bar
-	// before the CLI prints its first "回测进度" line.
-	job := &backtestJob{CandID: id, Status: "running", Started: time.Now(), Progress: "0%", lastProgress: time.Now().Unix()}
-	backtestJobs.m[id] = job
-	backtestJobs.Unlock()
-	s.persistBacktestJob(id, job.Status, job.Progress, 0, "")
-
-	// 后台执行
-	go func() {
-		avg, err := s.runCandidateBacktest(id, job, opts)
-		backtestJobs.Lock()
-		defer backtestJobs.Unlock()
-		j := backtestJobs.m[id]
-		if j == nil {
-			j = job
-			backtestJobs.m[id] = j
-		}
-		switch {
-		case j.cancelReq:
-			// 用户取消（阶段3.2）：标 interrupted，断点缓存仍有效可续跑。
-			// English: user cancel — mark interrupted; checkpoints stay valid for resume.
-			j.Status, j.Err = "interrupted", "已取消（断点缓存有效，可重新发起续跑）"
-		case err != nil:
-			j.Status, j.Err = "error", err.Error()
-		default:
-			j.Status, j.AvgExcess = "done", avg
-		}
-		// 完成态同步落库（done 回填 avg_excess；error/interrupted 记录原因）。
-		// English: persist the terminal state.
-		s.persistBacktestJob(id, j.Status, j.Progress, j.AvgExcess, j.Err)
-	}()
-	writeJSON(w, 202, map[string]any{"status": "started", "job": job})
-}
-
-// handleBacktestCancel 处理 POST /api/research/backtest/{id}/cancel（阶段3.2）：
-// kill 运行中的回测子进程并标 interrupted（断点缓存 backtest_event_results 有效，
-// 重新发起只算剩余事件）。paused 状态同样可取消。
-// English: POST .../cancel — kills the running backtest child and marks it interrupted (checkpoints
-// stay valid; a relaunch only computes remaining events). Paused jobs are cancellable too.
-func (s *Server) handleBacktestCancel(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, 400, "无效 id")
-		return
-	}
-	backtestJobs.Lock()
-	j := backtestJobs.m[id]
-	if j == nil || (j.Status != "running" && j.Status != "paused") {
-		backtestJobs.Unlock()
-		writeError(w, 404, "该候选没有运行中的回测任务")
-		return
-	}
-	j.cancelReq = true
-	if j.cmd != nil && j.cmd.Process != nil {
-		_ = j.cmd.Process.Kill() // Wait() 随即返回，由后台 goroutine 落 interrupted 终态
-	}
-	backtestJobs.Unlock()
-	writeJSON(w, 200, map[string]string{"status": "cancelling"})
-}
-
-// handleBacktestPause 处理 POST /api/research/backtest/{id}/pause（阶段3.2）：
-// SIGSTOP 暂停子进程（进程保留内存，断点缓存照常），任务标 paused。
-// English: POST .../pause — SIGSTOPs the child process and marks the job paused.
-func (s *Server) handleBacktestPause(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, 400, "无效 id")
-		return
-	}
-	backtestJobs.Lock()
-	defer backtestJobs.Unlock()
-	j := backtestJobs.m[id]
-	if j == nil || j.Status != "running" || j.cmd == nil || j.cmd.Process == nil {
-		writeError(w, 404, "该候选没有可暂停的运行中任务")
-		return
-	}
-	if err := j.cmd.Process.Signal(syscall.SIGSTOP); err != nil {
-		writeError(w, 500, "暂停失败: "+err.Error())
-		return
-	}
-	j.paused = true
-	j.Status = "paused"
-	s.persistBacktestJob(id, j.Status, j.Progress, 0, "")
-	writeJSON(w, 200, map[string]string{"status": "paused"})
-}
-
-// handleBacktestResume 处理 POST /api/research/backtest/{id}/resume（阶段3.2）：
-// SIGCONT 恢复暂停的子进程，任务回到 running。
-// English: POST .../resume — SIGCONTs the paused child and flips the job back to running.
-func (s *Server) handleBacktestResume(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, 400, "无效 id")
-		return
-	}
-	backtestJobs.Lock()
-	defer backtestJobs.Unlock()
-	j := backtestJobs.m[id]
-	if j == nil || j.Status != "paused" || j.cmd == nil || j.cmd.Process == nil {
-		writeError(w, 404, "该候选没有已暂停的任务")
-		return
-	}
-	if err := j.cmd.Process.Signal(syscall.SIGCONT); err != nil {
-		writeError(w, 500, "恢复失败: "+err.Error())
-		return
-	}
-	j.paused = false
-	j.Status = "running"
-	j.lastProgress = time.Now().Unix() // 恢复后重置看门狗时钟
-	s.persistBacktestJob(id, j.Status, j.Progress, 0, "")
-	writeJSON(w, 200, map[string]string{"status": "running"})
-}
-
-// persistBacktestJob 把单候选回测任务状态写入 backtest_jobs（kind='candidate'）。
-// researchDB 未接入（nil）时静默跳过，不影响现有内存态行为。
-// English: persists a per-candidate backtest job to backtest_jobs (kind='candidate'). Silently skips
-// when the research DB isn't wired (nil), keeping the in-memory behavior intact.
-func (s *Server) persistBacktestJob(candID int64, status, progress string, avgExcess float64, errMsg string) {
-	if s.researchDB == nil {
-		return
-	}
-	if err := s.researchDB.UpsertBacktestJob(&store.BacktestJob{
-		Kind: "candidate", CandidateID: candID, Status: status,
-		Progress: progress, AvgExcess: avgExcess, Error: errMsg,
-	}); err != nil {
-		log.Printf("[research] 持久化回测任务失败 cand=%d: %v", candID, err)
-	}
-}
-
-// handleBacktestStatus 处理 GET /api/research/backtest/{id}：返回回测任务状态与结果。
-// 内存优先；quant 重启后内存表为空，回退读 backtest_jobs（任务可查/可续跑）。
-// English: GET /api/research/backtest/{id} — returns a backtest job's status and result. In-memory is
-// checked first; after a quant restart the in-memory table is empty, so it falls back to backtest_jobs.
-func (s *Server) handleBacktestStatus(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, 400, "无效 id")
-		return
-	}
-	backtestJobs.Lock()
-	j := backtestJobs.m[id]
-	backtestJobs.Unlock()
-	if j == nil && s.researchDB != nil {
-		dbj, err := s.researchDB.GetBacktestJob("candidate", id)
-		if err == nil && dbj != nil {
-			j = &backtestJob{
-				CandID:    id,
-				Status:    dbj.Status,
-				Progress:  dbj.Progress,
-				AvgExcess: dbj.AvgExcess,
-				Err:       dbj.Error,
-			}
-			if t, terr := time.Parse("2006-01-02 15:04:05", dbj.StartedAt); terr == nil {
-				j.Started = t
-			}
-		}
-	}
-	if j == nil {
-		writeError(w, 404, "回测任务不存在")
-		return
-	}
-	writeJSON(w, 200, j)
-}
-
-// handleBacktestRunning 处理 GET /api/research/backtest/running：返回所有运行中的回测任务。
-// 前端页面刷新后据此恢复 loading 态与轮询（配合 onMounted 恢复逻辑）。
-// English: GET /api/research/backtest/running — returns every running backtest job. The frontend uses it
-// after a page refresh to restore loading states and polling (paired with the onMounted recovery hook).
-func (s *Server) handleBacktestRunning(w http.ResponseWriter, r *http.Request) {
-	jobs := []store.BacktestJob{}
-	if s.researchDB != nil {
-		rows, err := s.researchDB.RunningBacktestJobs()
-		if err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
-		jobs = rows
-	}
-	// 合并内存运行中任务（兜底 DB 写入失败 / 尚未落库的瞬态），内存态最新。
-	// English: merge in-memory running jobs (fallback for transient/DB-write-failure cases); in-memory
-	// state is the freshest.
-	backtestJobs.Lock()
-	defer backtestJobs.Unlock()
-	for id, j := range backtestJobs.m {
-		if j.Status != "running" {
-			continue
-		}
-		found := false
-		for i := range jobs {
-			if jobs[i].CandidateID == id {
-				jobs[i] = store.BacktestJob{Kind: "candidate", CandidateID: id, Status: j.Status, Progress: j.Progress}
-				found = true
-				break
-			}
-		}
-		if !found {
-			jobs = append(jobs, store.BacktestJob{Kind: "candidate", CandidateID: id, Status: j.Status, Progress: j.Progress})
-		}
-	}
-	writeJSON(w, 200, map[string]any{"jobs": jobs})
-}
-
-// handleBacktestList 处理 GET /api/research/backtest/list：返回全部回测任务（含夜间全量），最新在前，
-// 供前端「回测」tab 的进度查看列表。
-// English: GET /api/research/backtest/list — returns all backtest jobs (including nightly runs), newest
-// first, powering the progress list of the frontend's "backtest" tab.
-func (s *Server) handleBacktestList(w http.ResponseWriter, r *http.Request) {
-	if s.researchDB == nil {
-		writeError(w, 503, "研究库未接入")
-		return
-	}
-	jobs, err := s.researchDB.ListBacktestJobs()
+	taskID, t, err := s.enqueueBacktestTask(store.TaskBacktestCandidate, id, payload)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"jobs": jobs})
-}
-
-// runCandidateBacktest 对候选跑一次 B4 全量回测并回填 avg_excess。
-// 以独立子进程（research backtest CLI）执行，避免回测的内存/CPU 压垮 quant 服务
-// （quant 有 MemoryMax=1G cgroup，进程内跑全量回测曾触发 OOM 把整个引擎杀掉）。
-// 阶段3.2/3.3：opts 透传 start/end/top_k/min-stocks；cmd 存入 job 供 cancel/pause/resume；
-// 看门狗检测进度停滞（默认 15 分钟无进度行 → kill 置 error，杜绝"恒 running 0%"）。
-// English: runs a full B4 backtest on a candidate and backfills avg_excess, spawning the
-// `research backtest` CLI as a separate child process so its memory/CPU can't OOM the quant engine.
-// Passes through start/end/top-k/min-stocks; stores the cmd handle for cancel/pause/resume; a stall
-// watchdog kills children with no progress for 15 minutes (no more eternal "running 0%").
-func (s *Server) runCandidateBacktest(id int64, job *backtestJob, opts backtestRunOpts) (float64, error) {
-	// 定位 research 二进制：优先常见部署路径，其次 PATH，最后 researchDir 同目录。
-	// English: locate the research binary — common deploy paths first, then PATH, then next to researchDir.
-	bin := ""
-	for _, cand := range []string{
-		"/opt/quant/research",
-		"/usr/local/bin/research",
-	} {
-		if _, err := os.Stat(cand); err == nil {
-			bin = cand
-			break
-		}
+	status := "queued"
+	if t != nil {
+		status = apiStatusOf(t.Status)
 	}
-	if bin == "" {
-		if p, err := exec.LookPath("research"); err == nil {
-			bin = p
-		}
-	}
-	if bin == "" && s.researchDir != "" {
-		if _, err := os.Stat(filepath.Join(filepath.Dir(s.researchDir), "research")); err == nil {
-			bin = filepath.Join(filepath.Dir(s.researchDir), "research")
-		}
-	}
-	if bin == "" {
-		return 0, fmt.Errorf("找不到 research 二进制")
-	}
-	dbPath := ""
-	if s.researchDir != "" {
-		// 从 researchDir 推导研究库路径（trading.db 与 config 同目录）
-		dbPath = filepath.Join(s.researchDir, "trading.db")
-	}
-	if dbPath == "" {
-		return 0, nil
-	}
-	args := []string{"--db", dbPath, "backtest", "--id", strconv.FormatInt(id, 10)}
-	// 阶段3.3 自定义参数透传（CLI 已有同名 flag；空值保持 CLI 默认）。
-	// English: pass through custom params (CLI flags already exist; empty keeps CLI defaults).
-	if opts.Start != "" {
-		args = append(args, "--start", opts.Start)
-	}
-	if opts.End != "" {
-		args = append(args, "--end", opts.End)
-	}
-	if opts.TopK > 0 {
-		args = append(args, "--top-k", strconv.Itoa(opts.TopK))
-	}
-	if opts.MinStocks > 0 {
-		args = append(args, "--min-stocks", strconv.Itoa(opts.MinStocks))
-	}
-	cmd := exec.Command(bin, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return 0, fmt.Errorf("打开子进程输出失败: %v", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return 0, fmt.Errorf("打开子进程错误输出失败: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("回测子进程启动失败: %v", err)
-	}
-	// 子进程句柄交给任务（cancel/pause/resume 用），并启动进度停滞看门狗。
-	// English: hand the child handle to the job and start the progress-stall watchdog.
-	backtestJobs.Lock()
-	job.cmd = cmd
-	backtestJobs.Unlock()
-	const stallSecs = 15 * 60 // 15 分钟无进度行视为挂死
-	watchDone := make(chan struct{})
-	defer close(watchDone)
-	go func() {
-		t := time.NewTicker(time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-watchDone:
-				return
-			case <-t.C:
-				backtestJobs.Lock()
-				stalled := !job.paused && !job.cancelReq &&
-					time.Now().Unix()-job.lastProgress > stallSecs
-				var proc *os.Process
-				if stalled && job.cmd != nil {
-					proc = job.cmd.Process
-				}
-				backtestJobs.Unlock()
-				if stalled && proc != nil {
-					log.Printf("[research] 候选 #%d 回测进度停滞>%dm，看门狗终止子进程", id, stallSecs/60)
-					_ = proc.Kill() // Wait 返回 error → 任务置 error
-					return
-				}
-			}
-		}
-	}()
-	// 逐行解析子进程输出：识别"回测进度 xx%"实时更新任务进度（前端 5s 轮询），
-	// 末尾"平均超额=%.4f"为最终结果；stdout/stderr 合并按行处理，任一行崩溃不拖垮轮询。
-	// English: read the child's output line-by-line — "回测进度 xx%" updates the job progress in
-	// real time (frontend polls every 5s); the trailing "平均超额=%.4f" is the final result; stdout
-	// and stderr are both scanned; a bad line can never break the polling loop.
-	var out bytes.Buffer
-	var wg sync.WaitGroup
-	scan := func(r io.Reader) {
-		defer wg.Done()
-		br := bufio.NewReader(r)
-		for {
-			line, err := br.ReadString('\n')
-			if len(line) > 0 {
-				out.WriteString(line)
-				if m := backtestProgressRe.FindStringSubmatch(line); len(m) == 2 {
-					backtestJobs.Lock()
-					if job != nil {
-						job.Progress = m[1] + "%"
-						job.lastProgress = time.Now().Unix() // 喂看门狗
-					}
-					backtestJobs.Unlock()
-					// 进度同步落库（CLI 每 10% 打印一次，写入频率低；重启后进度可从 DB 恢复）。
-					// English: persist the progress line to DB (CLI prints every 10%, so writes are
-					// low-frequency; progress is recoverable from DB after a restart).
-					s.persistBacktestJob(id, "running", m[1]+"%", 0, "")
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}
-	wg.Add(2)
-	go scan(stdout)
-	go scan(stderr)
-	waitErr := cmd.Wait()
-	wg.Wait()
-	if waitErr != nil {
-		return 0, fmt.Errorf("回测子进程失败: %v: %s", waitErr, out.String())
-	}
-	// 解析 CLI 输出的"平均超额=%.4f"
-	avg := 0.0
-	m := avgExcessRe.FindStringSubmatch(out.String())
-	if len(m) == 2 {
-		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
-			avg = v
-		}
-	}
-	log.Printf("[research] 候选 #%d 全量回测完成, 平均超额=%.4f", id, avg)
-	return avg, nil
-}
-
-// avgExcessRe 匹配 research backtest CLI 输出的平均超额。
-// English: matches the avg-excess printed by the research backtest CLI.
-var avgExcessRe = regexp.MustCompile(`平均超额=(-?\d+\.?\d*)`)
-
-// backtestProgressRe 匹配 research backtest CLI 的阶段进度输出（"回测进度 xx%"）。
-// English: matches the stage-progress output of the research backtest CLI ("回测进度 xx%").
-var backtestProgressRe = regexp.MustCompile(`回测进度 (\d+)%`)
-
-// libraryJobKey 战法库回测在内存任务表中的合成键（与候选 ID 空间隔离：1e9+规则序号）。
-// English: synthetic in-memory key for library backtests (offset from the candidate-ID space).
-func libraryJobKey(ruleNum int64) int64 { return 1_000_000_000 + ruleNum }
-
-// handleLibraryBacktest 处理 POST /api/research/library/{id}/backtest（阶段3.4 前端入口）：
-// 对战法库中一条已应用规则（fac_<n> / pat_<n>）跑 bt_strategy 历史回放回测
-// （复用实盘 FactorStrategy/PatternStrategy Evaluate 口径），异步执行、汇总落库
-// backtest_jobs（kind='library'，result_text 存胜率/盈亏比报告），前端「回测」tab 展示。
-// 可选 query：start/end（YYYYMMDD）、maxstocks（默认 300）。
-// English: POST /api/research/library/{id}/backtest — replays one applied library rule (fac_<n>/pat_<n>)
-// over historical bars via the bt_strategy child (same Evaluate semantics as live), persisting the
-// summary into backtest_jobs (kind='library', result_text). Optional query: start/end/maxstocks.
-func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
-	ruleID := r.PathValue("id")
-	kind, num, ok := parseLibraryRuleID(ruleID)
-	if !ok {
-		writeError(w, 400, "无效规则 ID（应为 fac_<n> 或 pat_<n>）")
-		return
-	}
-	if s.researchDir == "" {
-		writeError(w, 503, "研究目录未接入")
-		return
-	}
-	q := r.URL.Query()
-	start, end, maxStocks := q.Get("start"), q.Get("end"), 300
-	if v, err := strconv.Atoi(q.Get("maxstocks")); err == nil && v > 0 {
-		maxStocks = v
-	}
-
-	key := libraryJobKey(num)
-	backtestJobs.Lock()
-	for _, j := range backtestJobs.m {
-		if j.Status == "running" || j.Status == "paused" {
-			backtestJobs.Unlock()
-			writeError(w, 409, "已有回测任务在运行，请先取消或等待完成")
-			return
-		}
-	}
-	job := &backtestJob{CandID: key, Status: "running", Started: time.Now(), Progress: "0%", lastProgress: time.Now().Unix()}
-	backtestJobs.m[key] = job
-	backtestJobs.Unlock()
-	s.persistLibraryJob(kind, num, "running", "", "")
-
-	go func() {
-		text, err := s.runLibraryBacktest(kind, num, start, end, maxStocks)
-		backtestJobs.Lock()
-		j := backtestJobs.m[key]
-		status, errMsg := "done", ""
-		if err != nil {
-			status, errMsg = "error", err.Error()
-		}
-		if j != nil {
-			j.Status, j.Err = status, errMsg
-		}
-		backtestJobs.Unlock()
-		s.persistLibraryJob(kind, num, status, text, errMsg)
-		log.Printf("[research] 战法库回测完成 %s_%d: %v", kind, num, err)
-	}()
-	writeJSON(w, 202, map[string]string{"status": "started"})
+	writeJSON(w, 202, map[string]any{"status": status, "task_id": taskID, "job": map[string]any{
+		"candidate_id": id, "status": status, "progress": "0%",
+	}})
 }
 
 // parseLibraryRuleID 解析 fac_<n> / pat_<n> 规则 ID → (kind, 序号)。
@@ -819,77 +402,199 @@ func parseLibraryRuleID(id string) (string, int64, bool) {
 	return "", 0, false
 }
 
-// persistLibraryJob 把战法库回测任务状态写入 backtest_jobs（kind='library'，candidate_id=规则序号）。
-func (s *Server) persistLibraryJob(kind string, num int64, status, resultText, errMsg string) {
-	if s.researchDB == nil {
+// resolveBacktestRef 解析 /api/research/backtest/{id} 的 id：候选 ID 直通；
+// 战法库沿用旧合成键空间 1e9+规则序号（libraryJobKey）。
+// English: resolves the path id — plain candidate ids vs the legacy 1e9+rule-num library key space.
+func resolveBacktestRef(id int64) (string, int64) {
+	if id >= 1_000_000_000 {
+		return store.TaskBacktestStrategy, id - 1_000_000_000
+	}
+	return store.TaskBacktestCandidate, id
+}
+
+// handleLibraryBacktest 处理 POST /api/research/library/{id}/backtest：
+// 入队一条 backtest_strategy 高优先级任务（战法库规则历史回放，researchd 盘后执行），
+// 结果汇总落 result_text，前端「回测」tab 展示。可选 query：start/end/maxstocks。
+// English: POST /api/research/library/{id}/backtest — enqueues a high-priority strategy-replay task;
+// its summary lands in result_text for the frontend's backtest tab.
+func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
+	ruleID := r.PathValue("id")
+	kind, num, ok := parseLibraryRuleID(ruleID)
+	if !ok {
+		writeError(w, 400, "无效规则 ID（应为 fac_<n> 或 pat_<n>）")
 		return
 	}
-	if err := s.researchDB.UpsertBacktestJob(&store.BacktestJob{
-		Kind: "library", CandidateID: num, Status: status,
-		ResultText: resultText, Error: errMsg,
-	}); err != nil {
-		log.Printf("[research] 持久化战法库回测任务失败 %s_%d: %v", kind, num, err)
+	q := r.URL.Query()
+	payload := map[string]any{"kind": kind}
+	if v := q.Get("start"); v != "" {
+		payload["start"] = v
 	}
+	if v := q.Get("end"); v != "" {
+		payload["end"] = v
+	}
+	if v, err := strconv.Atoi(q.Get("maxstocks")); err == nil && v > 0 {
+		payload["maxstocks"] = v
+	}
+	if _, _, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, num, payload); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 202, map[string]any{"status": "queued"})
 }
 
-// runLibraryBacktest 同步执行一次 bt_strategy 子进程并解析汇总报告文本。
-// English: runs one bt_strategy child synchronously and parses the summary report text.
-func (s *Server) runLibraryBacktest(kind string, num int64, start, end string, maxStocks int) (string, error) {
-	bin := ""
-	for _, cand := range []string{"/opt/quant/bt_strategy", "/usr/local/bin/bt_strategy"} {
-		if _, err := os.Stat(cand); err == nil {
-			bin = cand
-			break
-		}
+// latestBacktestTask 取某 id 对应的最新回测任务行（自动识别候选/战法库键空间）。
+func (s *Server) latestBacktestTask(id int64) (*store.ResearchTask, error) {
+	if s.researchDB == nil {
+		return nil, fmt.Errorf("研究库未接入")
 	}
-	if bin == "" {
-		if p, err := exec.LookPath("bt_strategy"); err == nil {
-			bin = p
-		}
-	}
-	if bin == "" {
-		return "", fmt.Errorf("找不到 bt_strategy 二进制（需部署 cmd/backtest_strategy）")
-	}
-	dbPath := filepath.Join(s.researchDir, "trading.db")
-	if start == "" {
-		start = "20230101"
-	}
-	if end == "" {
-		end = time.Now().Format("20060102")
-	}
-	args := []string{
-		"--db", dbPath, "--datadir", s.researchDir,
-		"--strategy", kind, "--start", start, "--end", end,
-		"--maxstocks", strconv.Itoa(maxStocks),
-	}
-	outBytes, err := exec.Command(bin, args...).CombinedOutput()
+	typ, ref := resolveBacktestRef(id)
+	return s.researchDB.LatestTaskByRef(typ, ref)
+}
+
+// handleBacktestCancel 处理 POST /api/research/backtest/{id}/cancel：
+// 写 control=cancel（worker kill 子进程或把排队任务置 cancelled）；断点缓存保持有效。
+// English: POST .../cancel — writes control=cancel; the worker kills the child or cancels a queued row.
+func (s *Server) handleBacktestCancel(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		return "", fmt.Errorf("bt_strategy 失败: %v: %s", err, string(outBytes))
+		writeError(w, 400, "无效 id")
+		return
 	}
-	return parseBtSummary(string(outBytes)), nil
+	t, err := s.latestBacktestTask(id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if t == nil || (t.Status != store.TaskQueued && t.Status != store.TaskRunning && t.Status != store.TaskPaused && t.Status != store.TaskPreempted) {
+		writeError(w, 404, "该候选没有可取消的回测任务")
+		return
+	}
+	if err := s.researchDB.SetTaskControl(t.ID, store.ControlCancel); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "cancelling"})
 }
 
-// btSummaryRe 匹配汇总块（触发信号数/胜率/盈亏比/平均持仓天数 行集合）。
-var btSummaryRe = regexp.MustCompile(`(?m)^(触发信号数|胜率|平均盈利|平均亏损|盈亏比|平均持仓天数):.*$`)
-
-// parseBtSummary 从 bt_strategy 输出提取汇总行拼接为报告文本。
-func parseBtSummary(out string) string {
-	lines := btSummaryRe.FindAllString(out, -1)
-	if len(lines) == 0 {
-		return "无触发信号"
+// handleBacktestPause 处理 POST /api/research/backtest/{id}/pause：写 control=pause
+// （worker SIGSTOP 子进程并标 paused）。仅 running 状态可暂停。
+func (s *Server) handleBacktestPause(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
 	}
-	return strings.Join(lines, "；")
+	t, err := s.latestBacktestTask(id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if t == nil || t.Status != store.TaskRunning {
+		writeError(w, 404, "该候选没有可暂停的运行中任务")
+		return
+	}
+	if err := s.researchDB.SetTaskControl(t.ID, store.ControlPause); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "paused"})
 }
 
-// BacktestJobsSnapshot 供测试/诊断读取回测任务表。
-// English: exposes the backtest job table for tests/diagnostics.
-func BacktestJobsSnapshot() map[int64]*backtestJob {
-	backtestJobs.Lock()
-	defer backtestJobs.Unlock()
-	out := make(map[int64]*backtestJob, len(backtestJobs.m))
-	for k, v := range backtestJobs.m {
-		cp := *v
-		out[k] = &cp
+// handleBacktestResume 处理 POST /api/research/backtest/{id}/resume：写 control=resume
+// （worker SIGCONT 恢复子进程并回到 running）。
+func (s *Server) handleBacktestResume(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
 	}
-	return out
+	t, err := s.latestBacktestTask(id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if t == nil || t.Status != store.TaskPaused {
+		writeError(w, 404, "该候选没有已暂停的任务")
+		return
+	}
+	if err := s.researchDB.SetTaskControl(t.ID, store.ControlResume); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "running"})
+}
+
+// handleBacktestStatus 处理 GET /api/research/backtest/{id}：返回最新任务的旧形状 JSON
+// （candidate_id/status/progress/avg_excess/error/started），前端轮询逻辑不变。
+func (s *Server) handleBacktestStatus(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, 400, "无效 id")
+		return
+	}
+	t, err := s.latestBacktestTask(id)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if t == nil {
+		writeError(w, 404, "回测任务不存在")
+		return
+	}
+	started := t.StartedAt
+	if tp, terr := time.Parse("2006-01-02 15:04:05", started); terr == nil {
+		_ = tp
+	}
+	_, ref := resolveBacktestRef(id)
+	writeJSON(w, 200, map[string]any{
+		"candidate_id": ref,
+		"status":       apiStatusOf(t.Status),
+		"progress":     t.Progress,
+		"avg_excess":   t.ResultNum,
+		"error":        t.Error,
+		"started":      started,
+		"task_id":      t.ID,
+	})
+}
+
+// handleBacktestRunning 处理 GET /api/research/backtest/running：返回所有未终结的回测任务
+// （queued/running/paused/preempted），前端刷新后恢复轮询与 loading 态。
+func (s *Server) handleBacktestRunning(w http.ResponseWriter, r *http.Request) {
+	jobs := []store.BacktestJob{}
+	if s.researchDB != nil {
+		tasks, err := s.researchDB.ActiveResearchTasks()
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		for _, t := range tasks {
+			if !isBacktestTask(t.Type) {
+				continue
+			}
+			jobs = append(jobs, taskToLegacyJob(t))
+		}
+	}
+	writeJSON(w, 200, map[string]any{"jobs": jobs})
+}
+
+// handleBacktestList 处理 GET /api/research/backtest/list：返回全部回测任务（含夜间与队列中），
+// 最新在前，供「回测」tab 进度查看。
+func (s *Server) handleBacktestList(w http.ResponseWriter, r *http.Request) {
+	if s.researchDB == nil {
+		writeError(w, 503, "研究库未接入")
+		return
+	}
+	tasks, err := s.researchDB.ListResearchTasks()
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	jobs := []store.BacktestJob{}
+	for _, t := range tasks {
+		if !isBacktestTask(t.Type) {
+			continue
+		}
+		jobs = append(jobs, taskToLegacyJob(t))
+	}
+	writeJSON(w, 200, map[string]any{"jobs": jobs})
 }

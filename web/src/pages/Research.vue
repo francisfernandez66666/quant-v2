@@ -226,11 +226,17 @@
             </span>
             <span class="bt-time">{{ j.started_at || '' }}<template v-if="j.finished_at"> → {{ j.finished_at }}</template></span>
           </div>
-          <div class="bt-progress" v-if="j.status === 'running' || j.status === 'paused'">
+          <!-- 进度条：运行中/已暂停显示实时进度；排队中显示 0% 占位（队列化改造：
+               手动回测入队后等盘后窗口执行，期间保持可见与轮询） -->
+          <div class="bt-progress" v-if="j.status === 'running' || j.status === 'paused' || j.status === 'queued'">
             <div class="bt-progress-bar">
               <div class="bt-progress-fill" :style="{ width: jobPct(j) }"></div>
             </div>
             <span class="bt-progress-label">{{ jobPct(j) }}</span>
+          </div>
+          <!-- 排队提示：研究子系统统一改造后所有回测只在盘后窗口执行（盘中硬门控） -->
+          <div class="bt-error" v-if="j.status === 'queued'" style="color: var(--muted, #888)">
+            已加入高优先级队列，将在今日盘后自动执行（交易时段绝不占用研究资源）
           </div>
           <!-- 战法库回测结果：汇总报告文本（触发信号数/胜率/盈亏比等） -->
           <div class="bt-result bt-lib-result" v-if="j.status === 'done' && j.kind === 'library'">{{ j.result_text }}</div>
@@ -254,13 +260,15 @@
               class="btn-backtest bt-ctl"
               @click="doResumeBacktest(ctrlId(j))"
             >继续</button>
+            <!-- 取消：运行中/已暂停/排队中均可取消（worker 对 queued 行直接置 cancelled 终态） -->
             <button
-              v-if="j.status === 'running' || j.status === 'paused'"
+              v-if="j.status === 'running' || j.status === 'paused' || j.status === 'queued'"
               class="btn-backtest bt-ctl bt-danger"
               @click="doCancelBacktest(ctrlId(j))"
             >取消</button>
+            <!-- 重新回测/续跑：仅在非活跃状态出现（queued 排队中不重复发起） -->
             <button
-              v-else-if="j.kind === 'candidate'"
+              v-else-if="j.kind === 'candidate' && j.status !== 'queued'"
               class="btn-backtest"
               :disabled="backtestLoading[j.candidate_id]"
               @click="doBacktestById(j.candidate_id)"
@@ -927,7 +935,8 @@ function startLibPoll() {
   if (libPollTimer) return
   libPollTimer = setInterval(async () => {
     await loadBacktests()
-    const busy = backtestJobs.value.some(j => j.kind === 'library' && (j.status === 'running' || j.status === 'paused'))
+    // busy 判定含 queued：排队中的战法库回测也要持续刷新列表直到真正执行完毕
+    const busy = backtestJobs.value.some(j => j.kind === 'library' && (j.status === 'running' || j.status === 'paused' || j.status === 'queued'))
     if (!busy) { clearInterval(libPollTimer); libPollTimer = null }
   }, 5000)
 }
@@ -986,7 +995,8 @@ async function restoreRunningBacktests() {
     const res = await api.fetchRunningBacktests()
     const jobs = (res && res.jobs) || []
     for (const j of jobs) {
-      if (j.status !== 'running') continue
+      // queued 同样恢复轮询：任务在盘后被 worker 拉起时，前端能自动切到运行态并接续进度条
+      if (j.status !== 'running' && j.status !== 'queued') continue
       const cand = candidates.value.find(x => x.id === j.candidate_id)
       const c = cand || { id: j.candidate_id, kind: 'factor' }
       backtestLoading.value = { ...backtestLoading.value, [c.id]: true }
@@ -1042,9 +1052,16 @@ function doBacktestById(id) {
   else alert('候选 #' + id + ' 不存在（请先刷新候选列表）')
 }
 
-/** 任务状态中文标签（阶段3.2 增 paused） */
+/** 任务状态中文标签（阶段3.2 增 paused；队列化改造增 queued/preempted）
+ *  queued：任务已入队但未到盘后执行窗口（盘后硬门控），或排在其他任务之后等待；
+ *  preempted：被高优先级任务抢占/会话终止——后端对外统一映射为 interrupted，这里仅防御。
+ *  English: status labels — 'queued' means enqueued but waiting for the after-hours window;
+ *  'preempted' is defensively mapped (the backend already exposes it as 'interrupted'). */
 function btStatusLabel(s) {
-  const m = { running: '运行中', paused: '已暂停', done: '已完成', error: '失败', interrupted: '已中断' }
+  const m = {
+    running: '运行中', paused: '已暂停', done: '已完成', error: '失败',
+    interrupted: '已中断', queued: '排队中·盘后执行', preempted: '已中断',
+  }
   return m[s] || s
 }
 /** 运行控制接口的任务键：战法库任务用合成键（1e9+规则序号，与后端 libraryJobKey 对齐） */

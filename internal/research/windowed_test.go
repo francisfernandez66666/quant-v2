@@ -6,6 +6,7 @@ package research
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"quant-trading-v2/internal/factor"
@@ -122,4 +123,41 @@ func datesEnd(db *store.DB) string {
 		return "20230101"
 	}
 	return dates[len(dates)-1]
+}
+
+// TestDiscoveryResumeKeyAndCkpt 断点键稳定性/参数敏感性与窗口缓存往返。
+func TestDiscoveryResumeKeyAndCkpt(t *testing.T) {
+	base := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"B", "A"}, []string{"600000.SH"})
+	same := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"})
+	if base != same {
+		t.Fatal("因子池顺序不应影响 resume_key")
+	}
+	diff := discoveryResumeKey("20230101", "20260822", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"})
+	if diff == base {
+		t.Fatal("区间变更必须换 key（旧缓存自动失效）")
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	w := [2]string{"20230101", "20230331"}
+	ck := &winCkpt{db: db, resumeKey: base, stage: "pre"}
+	var got map[string][]ICRow
+	if ck.load(w, &got) {
+		t.Fatal("空库不应命中")
+	}
+	want := map[string][]ICRow{"A": {{Date: "20230105", N: 100, IC: 0.03}}}
+	ck.save(w, want)
+	ck2 := &winCkpt{db: db, resumeKey: base, stage: "pre"}
+	if !ck2.load(w, &got) || got["A"][0].IC != 0.03 {
+		t.Fatalf("断点往返失败: %+v", got)
+	}
+	// 不同 stage 不串槽
+	ck3 := &winCkpt{db: db, resumeKey: base, stage: "gen"}
+	if ck3.load(w, &got) {
+		t.Fatal("stage 应相互隔离")
+	}
 }

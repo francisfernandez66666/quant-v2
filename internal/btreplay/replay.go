@@ -1,4 +1,9 @@
-// Package main 四大手写战法历史胜率回测命令。
+// Package btreplay 四大手写战法 + 战法库规则的历史回放回测（子系统统一改造二期：
+// 自 cmd/backtest_strategy 并入 research 二进制，消除子系统内的第二套回测进程代码）。
+// 对外入口：research [--db …] backtest-strategy …（run-task 的 backtest_strategy 类型进程内调用）。
+// English: package btreplay — historical replay backtests for the four hand-written strategies plus
+// applied factor/pattern library rules. Merged from the standalone bt_strategy binary into the
+// research binary (phase 2), leaving one research subsystem with a single entry.
 // 从离线研究库（trading.db）读取历史日K，逐交易日回放 dragon/double_bump/dragon_return/n_shape
 // 四个战法的触发信号，次日开盘入场，用各战法的 CheckExit 逐日模拟平仓并结算盈亏，
 // 输出按战法分组的胜率/平均盈亏/盈亏比，以及 1/5/10 日前瞻收益，用于验证与调参。
@@ -9,10 +14,9 @@
 //   - dragon：板块共振（F2/F3）用所属行业板块当日涨幅近似；无行业数据时降级忽略板块维度。
 //   - n_shape：高度依赖日内快照与 LLM D1，日K近似后准确性打折；D1 用可配置规则分（默认 0，
 //     此时仅统计其他维度，几乎不触发，需配合 -d1 提供规则分才有信号）。
-package main
+package btreplay
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -366,34 +370,20 @@ func toStrategyKLine(klines []data.KLine) []strategy.KLine {
 
 // ── 回测运行 ──
 
-// options 回测命令行参数（数据库、日期区间、战法选择与近似开关）。
-type options struct {
-	dbPath    string
-	start     string
-	end       string
-	strategy  string
-	maxStocks int
-	d1Score   float64
-	industry  bool
-	dataDir   string // 战法库目录（applied_factors.json / applied_patterns.json 所在）
+// Options 回放回测参数（数据库、日期区间、战法选择与近似开关）。
+// English: Options configures a replay backtest.
+type Options struct {
+	DBPath    string
+	Start     string
+	End       string
+	Strategy  string // double_bump|dragon|dragon_return|n_shape|factor|pattern
+	MaxStocks int    // 最多回测股票数（0=全部）
+	D1Score   float64
+	Industry  bool
+	DataDir   string // 战法库目录（applied_factors.json / applied_patterns.json 所在）
 }
 
-func parseFlags() *options {
-	o := &options{}
-	flag.StringVar(&o.dbPath, "db", defaultDB(), "离线研究库 SQLite 路径")
-	flag.StringVar(&o.start, "start", "20230101", "回测起始日 YYYYMMDD")
-	flag.StringVar(&o.end, "end", "20260101", "回测结束日 YYYYMMDD")
-	flag.StringVar(&o.strategy, "strategy", "double_bump",
-		"战法: double_bump|dragon|dragon_return|n_shape|factor(战法库全部启用因子规则)|pattern(全部启用形态规则)")
-	flag.IntVar(&o.maxStocks, "maxstocks", 500, "最多回测股票数（0=全部）")
-	flag.Float64Var(&o.d1Score, "d1", 20, "n_shape 的规则 D1 分（日K近似假设的中性事件分；0=不触发 n_shape）")
-	flag.BoolVar(&o.industry, "industry", false, "dragon 是否用行业板块涨幅近似板块共振")
-	flag.StringVar(&o.dataDir, "datadir", defaultDataDir(), "战法库目录（applied_*.json；默认与数据目录一致）")
-	flag.Parse()
-	return o
-}
-
-func defaultDB() string {
+func DefaultDB() string {
 	if d := os.Getenv("QUANT_DATA_DIR"); d != "" {
 		return filepath.Join(d, "trading.db")
 	}
@@ -402,7 +392,7 @@ func defaultDB() string {
 }
 
 // defaultDataDir 战法库默认目录（applied_factors.json/applied_patterns.json 所在，与数据目录一致）。
-func defaultDataDir() string {
+func DefaultDataDir() string {
 	if d := os.Getenv("QUANT_DATA_DIR"); d != "" {
 		return d
 	}
@@ -535,9 +525,9 @@ func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 	return nil, fmt.Errorf("未知战法库类型: %s", kind)
 }
 
-// run 执行回测主流程。
-func (o *options) run() error {
-	db, err := store.Open(o.dbPath)
+// Run 执行回放回测主流程（汇总报告打印到 stdout，供 worker 解析 result_text）。
+func (o *Options) Run() error {
+	db, err := store.Open(o.DBPath)
 	if err != nil {
 		return fmt.Errorf("打开数据库: %w", err)
 	}
@@ -547,24 +537,24 @@ func (o *options) run() error {
 	if err != nil {
 		return err
 	}
-	if o.maxStocks > 0 && len(codes) > o.maxStocks {
-		codes = codes[:o.maxStocks]
+	if o.MaxStocks > 0 && len(codes) > o.MaxStocks {
+		codes = codes[:o.MaxStocks]
 	}
 
 	// 阶段3.4：factor/pattern → 从战法库加载全部启用规则（每条规则一个 adapter，分组统计）
 	var ads []adapter
-	if strings.EqualFold(o.strategy, "factor") || strings.EqualFold(o.strategy, "pattern") {
-		ads, err = loadRuleAdapters(o.strategy, o.dataDir)
+	if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
+		ads, err = loadRuleAdapters(o.Strategy, o.DataDir)
 		if err != nil {
 			return err
 		}
 		if len(ads) == 0 {
-			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.dataDir)
+			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
 			return nil
 		}
 		log.Printf("战法库已加载 %d 条启用规则", len(ads))
 	} else {
-		ad, err := newAdapter(o.strategy, o.industry, o.d1Score)
+		ad, err := newAdapter(o.Strategy, o.Industry, o.D1Score)
 		if err != nil {
 			return err
 		}
@@ -574,7 +564,7 @@ func (o *options) run() error {
 	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
 	indMap := map[string]string{}
 	industryChg := map[string]map[string]float64{} // code -> date -> ChangePct
-	if o.industry {
+	if o.Industry {
 		if m, err := db.Industries(); err == nil {
 			indMap = m
 		}
@@ -583,7 +573,7 @@ func (o *options) run() error {
 			if !ok {
 				continue
 			}
-			sectorDays, err := db.SectorHistory(ind, o.start, o.end)
+			sectorDays, err := db.SectorHistory(ind, o.Start, o.End)
 			if err != nil {
 				continue
 			}
@@ -602,7 +592,7 @@ func (o *options) run() error {
 		var trades []trade
 		for _, tsCode := range codes {
 			code := strings.Split(tsCode, ".")[0] // 000001.SZ -> 000001
-			bars, err := db.RawBars(tsCode, o.start, o.end)
+			bars, err := db.RawBars(tsCode, o.Start, o.End)
 			if err != nil {
 				continue
 			}
@@ -632,7 +622,7 @@ func toDataKLine(bars []store.Bar) []data.KLine {
 }
 
 // backtestStock 对单只股票回放指定战法：逐日判定触发，触发后次日开盘入场并逐日模拟平仓。
-func (o *options) backtestStock(code string, klines []data.KLine, ad adapter, industryChgByDate map[string]float64) []trade {
+func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, industryChgByDate map[string]float64) []trade {
 	var trades []trade
 	// n_shape：预计算整条日线 MACD 序列（一次性，避免逐日重复 O(n²)）
 	if na, ok := ad.(*nShapeAdapter); ok && na.macdSeries == nil {
@@ -674,7 +664,7 @@ func (o *options) backtestStock(code string, klines []data.KLine, ad adapter, in
 }
 
 // simulateExit 从入场日 index 起逐日跑 CheckExit，返回平仓结果；到序列末尾仍未平仓则按末日收盘强制结算。
-func (o *options) simulateExit(code string, klines []data.KLine, entryIdx int, entry float64, meta map[string]float64, ad adapter) *trade {
+func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, entry float64, meta map[string]float64, ad adapter) *trade {
 	for j := entryIdx + 1; j < len(klines); j++ {
 		cur := klines[j].Close
 		if cur <= 0 {
@@ -786,16 +776,5 @@ func printReport(s *summary, name string, stockCount int) {
 func printReports(summaries []*summary, stockCount int) {
 	for _, s := range summaries {
 		printReport(s, s.Name, stockCount)
-	}
-}
-
-// config 包的默认战法参数（供适配器构造，见 defaultConfig）。
-
-// main 回测入口：解析参数并运行，失败时打印日志退出。
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	o := parseFlags()
-	if err := o.run(); err != nil {
-		log.Fatalf("回测失败: %v", err)
 	}
 }

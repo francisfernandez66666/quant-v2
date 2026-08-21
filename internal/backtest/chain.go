@@ -166,69 +166,123 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 	}
 	sort.Strings(codes)
 
-	// 一次性装配全部相关股票（含预热与前视窗口）
-	lookStart, err := shiftDate(opts.Start, -opts.Lookback)
+	// 资源治理（docs/RESEARCH_TASK_QUEUE_PLAN.md §7）：窗口分块装配。
+	// 旧实现把全部相关股票在完整区间一次性装配（全市场×3年可达数 GB）；
+	// 现改为按交易日窗口（复用 discover-factors 的 windowDays 口径，60 日/窗）
+	// 逐窗"装配-评估-释放"，峰值内存压到单窗口水平。窗口内仍是完整截面，
+	// 评估口径与旧实现一致；断点缓存命中的窗口直接跳过装配。
+	// English: resource governance — window-chunked assembly. The legacy path assembled every
+	// related stock over the full range at once (multi-GB for the full universe); now each
+	// trading-day window (same 60-day cadence as factor discovery) is assembled, evaluated and
+	// released in turn, keeping peak memory at single-window scale with identical semantics.
+	dates, err := db.TradeDates(opts.Start, opts.End)
 	if err != nil {
 		return nil, err
 	}
-	fwdEnd, err := shiftDate(opts.End, maxH+3)
-	if err != nil {
-		return nil, err
-	}
-	panels, err := assembleAll(db, codes, lookStart, fwdEnd, opts.Rule)
-	if err != nil {
-		return nil, err
-	}
-	if len(panels) == 0 {
-		return nil, fmt.Errorf("无装配面板（codes=%d）", len(codes))
-	}
-	// 基准指数
-	bench, err := db.IndexBars(opts.Benchmark, lookStart, fwdEnd)
-	if err != nil {
-		return nil, err
-	}
-	benchIdx := make(map[string]int, len(bench))
-	for i, b := range bench {
-		benchIdx[b.Date] = i
-	}
+	windows := research.WindowChunks(dates, 0)
 
 	rep := &ChainReport{
 		Start: opts.Start, End: opts.End, Benchmark: opts.Benchmark,
 		Rule: opts.Rule, Horizons: opts.Horizons,
 	}
 	total := len(events)
-	for i, e := range events {
-		// 断点续跑：命中缓存则反序列化复用，未命中才重算并落库（每事件完整结果，报告可复用）。
-		// English: checkpoint-resume — a cache hit is unmarshalled and reused; a miss is computed and
-		// persisted as the full per-event result (reusable by reports).
-		var er EventResult
-		cached := false
-		if opts.CandidateID > 0 {
-			if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry); err == nil && ok {
-				if json.Unmarshal([]byte(js), &er) == nil {
-					cached = true
+	done := 0
+	for _, w := range windows {
+		winEvents := filterEvents(events, w[0], w[1])
+		if len(winEvents) == 0 {
+			continue
+		}
+		// 断点续跑：整窗命中缓存则跳过装配（省内存也省时间）。
+		if opts.CandidateID > 0 && allEventsCached(db, opts.CandidateID, winEvents) {
+			for _, e := range winEvents {
+				var er EventResult
+				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry); err == nil && ok {
+					if json.Unmarshal([]byte(js), &er) == nil {
+						rep.Events = append(rep.Events, er)
+						rep.TotalEvents++
+						rep.TotalPicks += len(er.Picks)
+					}
+				}
+				done++
+				if opts.OnProgress != nil {
+					opts.OnProgress(done, total)
 				}
 			}
+			continue
 		}
-		if !cached {
-			er = evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons)
+		assembleStart, err := shiftDate(w[0], -opts.Lookback)
+		if err != nil {
+			return nil, err
+		}
+		assembleEnd, err := shiftDate(w[1], maxH+3)
+		if err != nil {
+			return nil, err
+		}
+		panels, err := assembleAll(db, codes, assembleStart, assembleEnd, opts.Rule)
+		if err != nil {
+			return nil, err
+		}
+		bench, err := db.IndexBars(opts.Benchmark, assembleStart, assembleEnd)
+		if err != nil {
+			return nil, err
+		}
+		benchIdx := make(map[string]int, len(bench))
+		for i, b := range bench {
+			benchIdx[b.Date] = i
+		}
+		for _, e := range winEvents {
+			var er EventResult
+			cached := false
 			if opts.CandidateID > 0 {
-				if js, err := json.Marshal(er); err == nil {
-					if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, string(js)); err != nil {
-						log.Printf("backtest: 缓存事件结果失败 cand=%d %s/%s: %v", opts.CandidateID, e.Date, e.Industry, err)
+				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry); err == nil && ok {
+					if json.Unmarshal([]byte(js), &er) == nil {
+						cached = true
 					}
 				}
 			}
+			if !cached {
+				er = evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons)
+				if opts.CandidateID > 0 {
+					if js, err := json.Marshal(er); err == nil {
+						if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, string(js)); err != nil {
+							log.Printf("backtest: 缓存事件结果失败 cand=%d %s/%s: %v", opts.CandidateID, e.Date, e.Industry, err)
+						}
+					}
+				}
+			}
+			rep.Events = append(rep.Events, er)
+			rep.TotalEvents++
+			rep.TotalPicks += len(er.Picks)
+			done++
+			if opts.OnProgress != nil {
+				opts.OnProgress(done, total)
+			}
 		}
-		rep.Events = append(rep.Events, er)
-		rep.TotalEvents++
-		rep.TotalPicks += len(er.Picks)
-		if opts.OnProgress != nil {
-			opts.OnProgress(i+1, total)
-		}
+		panels = nil // 窗口算完即释放（release the window's panels）
 	}
 	rep.Summarize()
 	return rep, nil
+}
+
+// filterEvents 取日期落在 [start,end] 的窗口内事件（保持原顺序）。
+func filterEvents(events []SectorEvent, start, end string) []SectorEvent {
+	out := make([]SectorEvent, 0, len(events))
+	for _, e := range events {
+		if e.Date >= start && e.Date <= end {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// allEventsCached 判断窗口内全部事件是否都有断点缓存（决定该窗是否可跳过装配）。
+func allEventsCached(db *store.DB, candID int64, winEvents []SectorEvent) bool {
+	for _, e := range winEvents {
+		if _, ok, err := db.GetBacktestEventResult(candID, e.Date, e.Industry); err != nil || !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // evalEvent 对单个事件做"选股 → 前瞻收益 → 基准超额"。
