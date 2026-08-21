@@ -94,15 +94,20 @@ $SSH "sudo -u quant $DEPLOY_DIR/venv/bin/pip install --quiet -r $DEPLOY_DIR/pyda
 
 # ── 4. 写入环境变量文件（LLM Key 等敏感项）──
 echo "[4/8] 写入 /etc/quant.env..."
-ENV_CONTENT="LLM_API_KEY=$LLM_API_KEY"
-[ -n "$LLM_API_URL" ] && ENV_CONTENT="$ENV_CONTENT
+# 未提供 LLM_API_KEY 时（云端后台已配）保留服务器现有文件，避免误覆盖
+if [ -n "$LLM_API_KEY" ]; then
+    ENV_CONTENT="LLM_API_KEY=$LLM_API_KEY"
+    [ -n "$LLM_API_URL" ] && ENV_CONTENT="$ENV_CONTENT
 LLM_API_URL=$LLM_API_URL"
-[ -n "$LLM_MODEL" ] && ENV_CONTENT="$ENV_CONTENT
+    [ -n "$LLM_MODEL" ] && ENV_CONTENT="$ENV_CONTENT
 LLM_MODEL=$LLM_MODEL"
-$SSH "sudo tee /etc/quant.env >/dev/null" <<EOF
+    $SSH "sudo tee /etc/quant.env >/dev/null" <<EOF
 $ENV_CONTENT
 EOF
-$SSH "sudo chmod 600 /etc/quant.env"
+    $SSH "sudo chmod 600 /etc/quant.env"
+else
+    echo "      LLM_API_KEY 未提供，保留服务器现有 /etc/quant.env（云端后台配置）"
+fi
 
 # ── 5. 域名占位符替换 + 安装 Caddy ──
 echo "[5/8] 前端构建上传 + 配置 Caddy ($SERVER_DOMAIN)..."
@@ -143,9 +148,9 @@ $SSH "sudo mv /tmp/qmt-mock_linux $DEPLOY_DIR/qmt-mock && sudo chmod +x $DEPLOY_
 $SCP "$APP_DIR/deploy/qmt-mock.service" $SERVER_USER@$SERVER_IP:/tmp/qmt-mock.service
 $SSH "sudo mv /tmp/qmt-mock.service /etc/systemd/system/qmt-mock.service"
 # 默认关闭（联调时手动 enable --now qmt-mock）；token 由 /etc/qmt-mock.env 提供
-$SSH "sudo mkdir -p $DEPLOY_DIR/qmt_gateway"
+$SSH "sudo mkdir -p $DEPLOY_DIR/qmt_gateway /tmp/qmt_gateway"
 $SCP -r "$APP_DIR/qmt_gateway/." $SERVER_USER@$SERVER_IP:/tmp/qmt_gateway/
-$SSH "sudo mv /tmp/qmt_gateway/* $DEPLOY_DIR/qmt_gateway/"
+$SSH "sudo mv /tmp/qmt_gateway/* $DEPLOY_DIR/qmt_gateway/ && sudo rm -rf /tmp/qmt_gateway"
 $SSH "sudo systemctl daemon-reload"
 echo "      qmt-mock 已部署（service 关闭）；qmt_gateway/ Python 骨架已落盘 $DEPLOY_DIR/qmt_gateway"
 
