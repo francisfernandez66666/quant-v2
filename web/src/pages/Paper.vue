@@ -145,6 +145,9 @@
       <button class="tab" :class="{ active: tab === 'trades' }" @click="tab = 'trades'">
         成交日志 <em class="sub">{{ filteredTrades.length }} 笔 · 近3月</em>
       </button>
+      <button class="tab" :class="{ active: tab === 'orders' }" @click="tab = 'orders'">
+        订单 <em class="sub">{{ filteredOrders.length }} 笔</em>
+      </button>
     </div>
 
     <!-- 持仓列表：div-grid（照搬真实持仓页模式：行内字段 + 分时展开 + 移动端 sheet）-->
@@ -250,6 +253,43 @@
       <div v-else class="empty-hint">暂无成交记录</div>
     </div>
 
+    <!-- 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕，含被拒原因，便于复盘为何没买进/没卖出 -->
+    <!-- Order lifecycle: full signal→order→outcome audit incl. rejections, so missed fills are reviewable -->
+    <div class="panel" v-if="tab === 'orders'">
+      <div class="panel-title">订单记录 <em class="sub">{{ filteredOrders.length }} 笔 · 含被拒留痕</em></div>
+      <div class="positions-table" v-if="filteredOrders.length">
+        <div class="table-header">
+          <span class="col-time">时间</span>
+          <span class="col-side">方向</span>
+          <span class="col-code">代码</span>
+          <span class="col-name">名称</span>
+          <span class="col-pool">来源</span>
+          <span class="col-num">状态</span>
+          <span class="col-num">数量</span>
+          <span class="col-price">成交价</span>
+          <span class="col-price">信号价</span>
+          <span class="col-name">说明</span>
+        </div>
+        <div v-for="(o, i) in filteredOrders" :key="o.id || i" class="table-row">
+          <span class="col-time" data-label="时间">{{ fmtTime(o.created_at) }}</span>
+          <span class="col-side" data-label="方向">
+            <span class="tag" :class="o.side === 'buy' ? 'buy' : 'sell'">{{ o.side === 'buy' ? '买入' : '卖出' }}</span>
+          </span>
+          <span class="col-code" data-label="代码">{{ o.code }}</span>
+          <span class="col-name" data-label="名称">{{ o.name }}</span>
+          <span class="col-pool" data-label="来源"><span class="tag">{{ o.kind || '—' }}</span></span>
+          <span class="col-num" data-label="状态">
+            <span class="tag" :class="orderStatusCls(o.status)">{{ orderStatusText(o.status) }}</span>
+          </span>
+          <span class="col-num" data-label="数量">{{ o.qty || '—' }}</span>
+          <span class="col-price" data-label="成交价">{{ o.price ? o.price.toFixed(2) : '—' }}</span>
+          <span class="col-price" data-label="信号价">{{ o.signal_price ? o.signal_price.toFixed(2) : '—' }}</span>
+          <span class="col-name" data-label="说明" :title="o.reason || ''">{{ shortReason(o.reason) }}</span>
+        </div>
+      </div>
+      <div v-else class="empty-hint">暂无订单记录</div>
+    </div>
+
     <!-- 移动端：点击行弹出的底部操作菜单（持仓）（Mobile bottom action sheet for a position row）-->
     <div class="sheet-overlay" v-if="sheetPos" @click="sheetPos = null">
       <div class="action-sheet" @click.stop>
@@ -353,6 +393,7 @@ const tab = ref('positions')     // 页签：positions=持仓 / trades=成交日
 const stats = ref(null)          // 绩效与信号质量汇总
 const positions = ref([])        // 当前持仓
 const trades = ref([])           // 成交记录
+const orders = ref([])           // 订单生命周期（阶段1.3：信号→订单→成交/拒绝 全留痕）
 const equity = ref([])           // 净值序列
 const pools = ref([])            // 分仓资金池快照（strategy_pools）
 const activePool = ref(null)     // 当前筛选的分仓（null=全部；池 key，""=其他/手动用 '__other__'）
@@ -447,6 +488,25 @@ const filteredTrades = computed(() => {
   if (activePool.value === null) return trades.value
   return trades.value.filter(t => normPoolKey(t.strategy_type) === activePool.value)
 })
+// 订单生命周期（随分仓 tab 筛选，与成交日志同口径）
+// Order lifecycle (pool-filtered, same semantics as the trade log)
+const filteredOrders = computed(() => {
+  if (activePool.value === null) return orders.value
+  return orders.value.filter(o => normPoolKey(o.strategy_type) === activePool.value)
+})
+/** 订单状态中文标签 */
+function orderStatusText(s) {
+  return { filled: '全部成交', partial: '部分成交', rejected: '已拒绝' }[s] || s
+}
+/** 订单状态徽标色：成交绿 / 部分黄 / 拒绝红 */
+function orderStatusCls(s) {
+  return { filled: 'buy', partial: 'hold', rejected: 'sell' }[s] || 'hold'
+}
+/** 说明列截断（完整内容悬停 title 展示） */
+function shortReason(r) {
+  if (!r) return '—'
+  return r.length > 18 ? r.slice(0, 18) + '…' : r
+}
 // 当前展示的统计：选中的分仓池用自己的 Stats（总资产/收益/滑点/延迟等随 tab 切换），
 // 未选择（全部）时用全账号 stats。
 // English: the stats currently shown — a selected pool uses its own Stats (total value / return /
@@ -547,6 +607,7 @@ async function load() {
   if (!enabled.value) return
   try { positions.value = await api.fetchPaperPositions() } catch (_) {}
   try { trades.value = await api.fetchPaperTrades() } catch (_) {}
+  try { orders.value = await api.fetchPaperOrders() } catch (_) {}
   try { equity.value = await api.fetchPaperEquity() } catch (_) {}
 }
 

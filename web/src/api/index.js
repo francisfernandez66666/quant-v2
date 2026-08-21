@@ -491,6 +491,12 @@ export async function fetchPaperTrades() {
   return request('/api/paper/trades')
 }
 
+/** 模拟盘：订单生命周期记录（信号→订单→成交/拒绝 全留痕，最新在前） */
+/** Paper order-lifecycle records (signal→order→outcome audit, newest first) */
+export async function fetchPaperOrders() {
+  return request('/api/paper/orders')
+}
+
 /** 模拟盘：净值曲线 */
 /** Paper trading: equity curve */
 // 对应 GET /api/paper/equity

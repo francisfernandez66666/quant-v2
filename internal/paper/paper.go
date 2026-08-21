@@ -11,11 +11,13 @@ package paper
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
@@ -158,6 +160,34 @@ type Trade struct {
 	Reason     string `json:"reason,omitempty"`
 }
 
+// Order 订单生命周期记录（阶段1.3）：一次"信号→订单→结果"的完整审计条目，
+// 与 Trade（仅成交）互补——被拒绝/部分成交的尝试也留痕，便于复盘为何没买进/没卖出。
+// English: an order-lifecycle record (one full signal→order→outcome audit entry), complementing
+// Trade (fills only) — rejected/partial attempts are kept too, so missed fills are reviewable.
+type Order struct {
+	ID          string    `json:"id"`                   // 订单号（ord_<seq>）
+	Code        string    `json:"code"`                 // 股票代码
+	Name        string    `json:"name"`                 // 股票名称
+	Strategy    string    `json:"strategy"`             // 战法名
+	StrategyType string   `json:"strategy_type,omitempty"` // 战法池类型
+	Side        string    `json:"side"`                 // buy / sell
+	Kind        string    `json:"kind"`                 // 来源：自动撮合/手动买入/自动清仓/自动减仓/手动卖出/手动减仓
+	SignalPrice float64   `json:"signal_price,omitempty"` // 信号价（参照）
+	Price       float64   `json:"price"`                // 成交价（rejected 时为 0）
+	Qty         int       `json:"qty"`                  // 成交数量（rejected 0；partial 为部分量）
+	Status      string    `json:"status"`               // filled=全部成交 / partial=部分成交 / rejected=已拒绝
+	Reason      string    `json:"reason,omitempty"`     // 拒绝原因或触发理由（告警文案）
+	CreatedAt   time.Time `json:"created_at"`           // 下单时间
+}
+
+// orderSeq 订单号自增（进程内唯一即可，重启从时间戳续）。
+// English: in-process order sequence; restarts reseed from the timestamp.
+var orderSeq atomic.Int64
+
+func newOrderID() string {
+	return fmt.Sprintf("ord_%d_%d", time.Now().Unix(), orderSeq.Add(1))
+}
+
 // EquityPoint 净值序列（按交易日一个点）。
 // English: an equity-curve point, one per trading day.
 type EquityPoint struct {
@@ -258,6 +288,7 @@ type Engine struct {
 	poolMaxPos map[string]int       // 每池持仓上限：key=策略类型（0=该池不单独设限，仅受全局上限约束；可自定义）
 	positions  map[string]*Position
 	trades     []Trade
+	orders     []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
 	equity     []EquityPoint
 	realized   float64 // 已实现盈亏累计
 	path       string
@@ -363,6 +394,7 @@ type persistedState struct {
 	MaxPositions int                  `json:"max_positions"`
 	Positions    map[string]*Position `json:"positions"`
 	Trades       []Trade              `json:"trades"`
+	Orders       []Order              `json:"orders,omitempty"` // 订单生命周期（旧数据无此字段，load 兼容为空）
 	Equity       []EquityPoint        `json:"equity"`
 	Realized     float64              `json:"realized"`
 	// Pools 战法资金池（key=策略类型，""=其他池；Pools 与 PoolTypes 同时落盘，跨重启保留各池现金）。
@@ -401,6 +433,7 @@ func (e *Engine) persist() {
 		MaxPositions:   e.cfg.MaxPositions,
 		Positions:      e.positions,
 		Trades:         e.trades,
+		Orders:         e.orders,
 		Equity:         e.equity,
 		Realized:       e.realized,
 		Pools:          e.pools,
@@ -476,6 +509,11 @@ func (e *Engine) load() {
 	if st.PoolMaxPos != nil {
 		e.poolMaxPos = st.PoolMaxPos
 	}
+	// 恢复订单生命周期（旧数据无此字段 → 空列表，兼容）。
+	// English: restore order lifecycle (legacy data without the field → empty list).
+	if st.Orders != nil {
+		e.orders = st.Orders
+	}
 	e.backfillPoolPerfLocked()
 	e.trimTradesLocked()
 }
@@ -546,6 +584,36 @@ func (e *Engine) trimTradesLocked() {
 	if len(out) != len(e.trades) {
 		e.trades = out
 	}
+	// 订单生命周期同窗口清理 + 绝对上限（防拒绝风暴撑爆文件）。
+	// English: order lifecycle trimmed on the same window plus an absolute cap (reject storms can't bloat the file).
+	if len(e.orders) > 0 {
+		oout := e.orders[:0]
+		for _, o := range e.orders {
+			if o.CreatedAt.After(cutoff) {
+				oout = append(oout, o)
+			}
+		}
+		e.orders = oout
+	}
+	if capOrderLimit > 0 && len(e.orders) > capOrderLimit {
+		e.orders = e.orders[len(e.orders)-capOrderLimit:]
+	}
+}
+
+// capOrderLimit 订单记录绝对上限（超出丢最旧）。
+// English: absolute order-record cap (oldest dropped beyond it).
+const capOrderLimit = 2000
+
+// recordOrderLocked 追加一条订单生命周期记录（须持锁调用；不主动 persist，由成交路径统一落盘）。
+// English: appends one order-lifecycle record (caller holds the lock; no persist here — fill paths persist).
+func (e *Engine) recordOrderLocked(o Order) {
+	if o.ID == "" {
+		o.ID = newOrderID()
+	}
+	if o.CreatedAt.IsZero() {
+		o.CreatedAt = time.Now()
+	}
+	e.orders = append(e.orders, o)
 }
 
 // OnSignals 消费一轮策略信号做自动撮合：仅做多 buy 信号，用实时快照价成交固定资金。
@@ -613,8 +681,18 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		}
 		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
+			// 订单留痕：买入被拒（现金不足/超上限/池上限/买不起一手）。
+			// English: order audit — the buy was rejected (cash short / cap / pool cap / can't afford a lot).
+			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy, StrategyType: poolKey,
+				Side: "buy", Kind: "自动撮合", SignalPrice: s.Price, Status: "rejected",
+				Reason: fmt.Sprintf("%v", err), CreatedAt: now})
 			continue
 		}
+		// 订单留痕：自动撮合全部成交。
+		// English: order audit — the auto fill completed.
+		e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy, StrategyType: poolKey,
+			Side: "buy", Kind: "自动撮合", SignalPrice: s.Price, Price: price,
+			Qty: e.positions[s.Code].Qty, Status: "filled", Reason: s.Reason, CreatedAt: now})
 		// 记录信号携带的 ATR14（镜像写 report 账时供 ATR 动态止损距离计算），随后触发开仓镜像。
 		// English: record the signal's ATR14 (used by the report-book mirror for the ATR dynamic stop
 		// distance), then fire the open mirror.
@@ -653,9 +731,16 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 	if reason == "自动" {
 		reason = "自动卖出"
 	}
+	mkOrder := func(status string, qty int) Order {
+		return Order{Code: s.Code, Name: s.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
+			Side: "sell", Kind: reason, SignalPrice: s.Price, Qty: qty, Status: status,
+			Reason: s.Reason, CreatedAt: time.Now()}
+	}
 	switch act {
 	case "close":
+		qty := p.Qty
 		e.sellAllLocked(p, price, reason)
+		e.recordOrderLocked(func() Order { o := mkOrder("filled", qty); o.Price = price; return o }())
 	case "trim":
 		today := time.Now().Format("20060102")
 		if e.trimDone[s.Code] == today {
@@ -666,6 +751,7 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 			return // 持仓不足两手无法半仓减仓，等清仓类信号处理
 		}
 		e.sellQtyLocked(p, price, half, reason)
+		e.recordOrderLocked(func() Order { o := mkOrder("partial", half); o.Price = price; return o }())
 		e.trimDone[s.Code] = today
 	}
 }
@@ -793,8 +879,13 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 		return errNoQuote
 	}
 	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, "手动模拟买入"); err != nil {
+		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
 	}
+	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+		Kind: "手动买入", SignalPrice: signalPrice, Price: price, Qty: e.positions[code].Qty,
+		Status: "filled", Reason: "手动模拟买入"})
 	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil
@@ -832,8 +923,13 @@ func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, 
 		}
 	}
 	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, "手动模拟买入"); err != nil {
+		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
 	}
+	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+		Kind: "手动买入", SignalPrice: signalPrice, Price: price, Qty: e.positions[code].Qty,
+		Status: "filled", Reason: "手动模拟买入"})
 	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil
@@ -964,7 +1060,14 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	} else {
 		return errNoQuote
 	}
-	return e.sellAllLocked(p, price, "手动模拟卖出")
+	qty := p.Qty
+	err := e.sellAllLocked(p, price, "手动模拟卖出")
+	if err == nil {
+		e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
+			Side: "sell", Kind: "手动卖出", Price: price, Qty: qty, Status: "filled", Reason: "手动模拟卖出"})
+		e.persist()
+	}
+	return err
 }
 
 // SellEx 手动按指定价格与数量减仓（部分卖出）。qty 手数；price > 0 用输入价，price = 0 回退实时价。
@@ -993,9 +1096,22 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 		}
 	}
 	if qty >= p.Qty {
-		return e.sellAllLocked(p, price, "手动模拟卖出")
+		full := p.Qty
+		err := e.sellAllLocked(p, price, "手动模拟卖出")
+		if err == nil {
+			e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
+				Side: "sell", Kind: "手动卖出", Price: price, Qty: full, Status: "filled", Reason: "手动模拟卖出"})
+			e.persist()
+		}
+		return err
 	}
-	return e.sellQtyLocked(p, price, qty, "手动模拟减仓")
+	err := e.sellQtyLocked(p, price, qty, "手动模拟减仓")
+	if err == nil {
+		e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
+			Side: "sell", Kind: "手动减仓", Price: price, Qty: qty, Status: "partial", Reason: "手动模拟减仓"})
+		e.persist()
+	}
+	return err
 }
 
 // sellQtyLocked 按股数部分减仓：回池、结算已实现盈亏、追加卖出记录（须持锁调用）。
@@ -1474,6 +1590,17 @@ func (e *Engine) Trades() []Trade {
 	out := make([]Trade, len(e.trades))
 	copy(out, e.trades)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+	return out
+}
+
+// Orders 返回订单生命周期记录（最新在前；阶段1.3 信号→订单→成交/拒绝 全留痕）。
+// English: returns order-lifecycle records (newest first; full signal→order→outcome audit).
+func (e *Engine) Orders() []Order {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]Order, len(e.orders))
+	copy(out, e.orders)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out
 }
 

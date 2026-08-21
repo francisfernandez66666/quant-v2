@@ -70,6 +70,17 @@ func (s *Server) handlePaperTrades(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, pe.Trades())
 }
 
+// handlePaperOrders 返回模拟盘订单生命周期记录（阶段1.3：信号→订单→成交/拒绝 全留痕，最新在前）。
+// English: returns paper order-lifecycle records (signal→order→outcome audit, newest first).
+func (s *Server) handlePaperOrders(w http.ResponseWriter, r *http.Request) {
+	pe := s.paperEngineFor(requestUserID(r))
+	if pe == nil {
+		writeJSON(w, 200, []paper.Order{})
+		return
+	}
+	writeJSON(w, 200, pe.Orders())
+}
+
 // handlePaperEquity 返回模拟盘净值曲线。
 // English: returns the paper equity curve.
 func (s *Server) handlePaperEquity(w http.ResponseWriter, r *http.Request) {

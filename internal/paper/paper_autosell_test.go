@@ -170,3 +170,45 @@ func TestMirrorOpenOnBuy(t *testing.T) {
 		t.Fatalf("手动买入应触发开仓镜像, opens=%d", len(opens))
 	}
 }
+
+// TestOrderLifecycle 订单生命周期留痕（阶段1.3）：成交→filled、减仓→partial、
+// 现金不足被拒→rejected（含原因），Orders() 最新在前。
+// English: order-lifecycle audit — filled / partial / rejected(with reason); Orders() newest first.
+func TestOrderLifecycle(t *testing.T) {
+	e := New(Config{Enabled: true, FixedAmount: 10000, InitialCapital: 1000, AutoSell: true}, "")
+	e.SetStrategyPools([]string{"dragon"})
+	// 1000 元本金买不起一手 10 元股 → rejected
+	sig := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头", StrategyType: "dragon",
+		Action: "buy", Price: 10, GeneratedAt: time.Now()}
+	e.OnSignals([]combat_agent.Signal{sig}, quotesOf(10))
+	if len(e.orders) != 1 || e.orders[0].Status != "rejected" {
+		t.Fatalf("现金不足应留 rejected 订单: %+v", e.orders)
+	}
+	if e.orders[0].Reason == "" {
+		t.Fatal("rejected 订单应带原因")
+	}
+	// 重置资金后成交 → filled
+	e.mu.Lock()
+	e.cash = 100000
+	e.pools["dragon"] = 50000
+	e.mu.Unlock()
+	e.OnSignals([]combat_agent.Signal{sig}, quotesOf(10))
+	p, ok := e.orders[len(e.orders)-1], true
+	_ = ok
+	if p.Status != "filled" || p.Qty != 1000 || p.Price != 10 {
+		t.Fatalf("成交应留 filled 订单: %+v", p)
+	}
+	// 减仓 → partial
+	trim := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头",
+		Direction: "提醒", Action: "卖出", AlertType: "减仓"}
+	e.OnSignals([]combat_agent.Signal{trim}, quotesOf(11))
+	last := e.orders[len(e.orders)-1]
+	if last.Status != "partial" || last.Qty != 500 {
+		t.Fatalf("减仓应留 partial 订单(500股): %+v", last)
+	}
+	// Orders() 最新在前
+	all := e.Orders()
+	if all[0].CreatedAt.Before(all[len(all)-1].CreatedAt) {
+		t.Fatal("Orders() 应按时间倒序")
+	}
+}
