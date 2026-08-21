@@ -672,11 +672,19 @@ func (o *Options) Run() error {
 		}
 	}
 
-	// 逐 adapter 回放（多规则时按规则分组统计；单战法仅一条）
+	// 逐 adapter 回放（多规则时按规则分组统计；单战法仅一条）。
+	// 进度输出：每 10% 打一行"回测进度 x%"（§8.6-A 同协议），队列 worker 解析回写，
+	// 否则整轮回放只有结尾汇总、进度条全程空窗。
+	// English: emit "回测进度 x%" every 10% of the stock loop so the queue worker can feed the bar.
 	summaries := make([]*summary, 0, len(ads))
 	for _, ad := range ads {
 		var trades []trade
-		for _, tsCode := range codes {
+		lastPct := -10
+		for ci2, tsCode := range codes {
+			if pct := ci2 * 100 / len(codes); pct >= lastPct+10 && len(codes) > 0 {
+				lastPct = pct
+				fmt.Printf("回测进度 %d%%\n", pct)
+			}
 			code := strings.Split(tsCode, ".")[0] // 000001.SZ -> 000001
 			bars, err := db.RawBars(tsCode, o.Start, o.End)
 			if err != nil {
