@@ -616,7 +616,7 @@ func (o *Options) Run() error {
 		// 四大手写战法一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape）：
 		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。
 		// English: include the four hand-written strategies in the all-replay as well.
-		for _, name := range []string{"double_bump", "dragon", "dragon_return"} {
+		for _, name := range []string{"double_bump", "dragon", "dragon_return", "n_shape"} {
 			ad, aerr := newAdapter(name, o.Industry, o.D1Score)
 			if aerr != nil {
 				return aerr

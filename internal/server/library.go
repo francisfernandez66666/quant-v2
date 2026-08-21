@@ -409,9 +409,24 @@ func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request)
 	}})
 }
 
+// builtinStrategies 实盘常驻的四大手写形态战法（引擎 8a/8b 链路始终运行，不经战法库文件）：
+// 名称 → 合成规则序号（回测任务 ref_id；前端据此映射显示名）。
+// English: builtin always-on pattern strategies (engine-resident, not library-file driven):
+// name → synthetic rule number used as the replay task's ref_id.
+var builtinStrategies = map[string]int64{
+	"double_bump":   901, // 双响炮
+	"dragon":        902, // 龙头
+	"dragon_return": 903, // 龙回头
+	"n_shape":       904, // N形（日K近似）
+}
+
 // parseLibraryRuleID 解析 fac_<n> / pat_<n> 规则 ID → (kind, 序号)。
+// 另接受内置战法名（double_bump/dragon/dragon_return/n_shape）→ ("builtin", 固定序号)。
 func parseLibraryRuleID(id string) (string, int64, bool) {
 	id = strings.ToLower(strings.TrimSpace(id))
+	if num, ok := builtinStrategies[id]; ok {
+		return "builtin", num, true
+	}
 	switch {
 	case strings.HasPrefix(id, "fac_"):
 		n, err := strconv.ParseInt(strings.TrimPrefix(id, "fac_"), 10, 64)
@@ -442,8 +457,13 @@ func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
 	ruleID := r.PathValue("id")
 	kind, num, ok := parseLibraryRuleID(ruleID)
 	if !ok {
-		writeError(w, 400, "无效规则 ID（应为 fac_<n> 或 pat_<n>）")
+		writeError(w, 400, "无效规则 ID（fac_<n>/pat_<n> 或内置战法名）")
 		return
+	}
+	// 内置战法：payload kind 直接用战法名——btreplay 单战法模式原生支持，
+	// 与库规则共用同一任务类型/回测 tab 展示。
+	if kind == "builtin" {
+		kind = strings.ToLower(strings.TrimSpace(ruleID))
 	}
 	q := r.URL.Query()
 	payload := map[string]any{"kind": kind}

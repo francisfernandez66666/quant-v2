@@ -82,6 +82,16 @@
           {{ loadingLibrary ? '加载中...' : '刷新' }}
         </button>
       </div>
+      <!-- 运行中内置形态战法（引擎常驻，不经战法库文件）：一键历史回放（§用户反馈） -->
+      <div class="builtin-patterns" style="margin:8px 0 12px">
+        <div style="font-size:13px;color:var(--muted,#888);margin-bottom:6px">
+          运行中内置形态战法（实盘常驻，点「回测」跑历史日K回放，结果进「回测」tab）：
+        </div>
+        <button v-for="b in builtinPatterns" :key="b.id" class="btn-backtest"
+                style="margin-right:8px" @click="doLibraryBacktest(b)">
+          回测·{{ b.name }}
+        </button>
+      </div>
       <div v-if="library.length === 0" class="empty">暂无已应用因子战法。审批通过的因子候选会自动加入战法库并注入 8a/8b 实盘。</div>
       <div v-else class="library-list">
         <div v-for="s in library" :key="s.id" class="library-card">
@@ -220,7 +230,7 @@
               {{ j.kind === 'nightly' ? '夜间全量' : (j.kind === 'library' ? '战法库' : '单候选') }}
             </span>
             <span v-if="j.kind === 'candidate'" class="bt-cand">候选 #{{ j.candidate_id }}</span>
-            <span v-else-if="j.kind === 'library'" class="bt-cand">规则 {{ j.candidate_id }}</span>
+            <span v-else-if="j.kind === 'library'" class="bt-cand">{{ builtinLabel(j.candidate_id) }}</span>
             <span :class="['tag', 'bt-status', 'status-' + (j.status === 'done' ? 'applied' : (j.status === 'error' ? 'rejected' : 'proposed'))]">
               {{ btStatusLabel(j.status) }}
             </span>
@@ -920,6 +930,19 @@ async function doResumeBacktest(id) {
 
 // ── 阶段3.4 战法库回测入口 ──
 let libPollTimer = null
+
+// 运行中内置形态战法（与后端 builtinStrategies 的序号映射一致）
+const builtinPatterns = [
+  { id: 'double_bump', name: '双响炮' },
+  { id: 'dragon', name: '龙头' },
+  { id: 'dragon_return', name: '龙回头' },
+  { id: 'n_shape', name: 'N形（日K近似）' },
+]
+/** 内置战法的回测任务序号 → 显示名（901-904 与后端约定一致） */
+function builtinLabel(num) {
+  const m = { 901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形' }
+  return m[num] || ('规则 ' + num)
+}
 /** 对战法库一条规则发起历史回放回测（异步），完成后在「回测」tab 展示汇总报告 */
 async function doLibraryBacktest(s) {
   if (!confirm(`回测战法「${s.name || s.id}」？（历史日K回放，结果进「回测」tab）`)) return
