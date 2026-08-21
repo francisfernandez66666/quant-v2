@@ -14,8 +14,8 @@ import (
 )
 
 // d1BoostDragonMD 构造龙头"准满分级"行情：封板 + 溢价 + 5日强趋势，无板块上下文时
-// 总分 ≈62（brief 观察档，差一步进 full_chain ≥70）。Volume/Amount 取自最后一根日K。
-// English: d1BoostDragonMD builds a dragon "near-full-score" market: sealed limit-up + premium + 5-day strong trend; without sector context the total is ≈62 (brief observation tier, one step short of full_chain >=70). Volume/Amount come from the last daily K-line.
+// 总分 ≈62（已 ≥60 放宽后买入门槛）。Volume/Amount 取自最后一根日K。
+// English: d1BoostDragonMD builds a dragon "near-full-score" market: sealed limit-up + premium + 5-day strong trend; without sector context the total is ≈62 (already above the relaxed 60 buy gate). Volume/Amount come from the last daily K-line.
 func d1BoostDragonMD() *strategy_engine.StockMarketData {
 	base := time.Now()
 	ks := make([]data.KLine, 10)
@@ -35,8 +35,8 @@ func d1BoostDragonMD() *strategy_engine.StockMarketData {
 }
 
 // TestD1BoostNearMissCrossesBuyGate 软加成单元：龙头 63 分 + D1=30（0~40 制）
-// → 63×1.1125≈70.1 ≥70 → 提升为 full_chain/Pass，跨过买入门槛，且加成量被记录。
-// English: TestD1BoostNearMissCrossesBuyGate soft-boost unit: dragon 63 + D1=30 (0~40 scale) → 63×1.1125≈70.1 >=70 → raised to full_chain/Pass, crossing the buy gate, and the boost amount is recorded.
+// → 63×1.1125≈70.1 ≥60 → 提升为 full_chain/Pass，跨过买入门槛，且加成量被记录。
+// English: TestD1BoostNearMissCrossesBuyGate soft-boost unit: dragon 63 + D1=30 (0~40 scale) → 63×1.1125≈70.1 >=60 → raised to full_chain/Pass, crossing the buy gate, and the boost amount is recorded.
 func TestD1BoostNearMissCrossesBuyGate(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
@@ -117,8 +117,9 @@ func TestD1BoostDisabledNoOp(t *testing.T) {
 }
 
 // TestD1BoostDragonEndToEnd 端到端：龙头真实评分 ≈62（brief/watch）时，
-// 不加成只发 watch；D1=40 软加成后跨过 70 → 升级为 buy 信号。
-// English: TestD1BoostDragonEndToEnd end-to-end: with a real dragon score of ≈62 (brief/watch), only a watch is emitted without the boost; after the soft boost of D1=40 the score crosses 70 → upgraded to a buy signal.
+// 不加成时：dragon ≈62 已 ≥60（买入层级放宽到 60）→ 直接发 buy；D1=40 软加成进一步放大（仅验证加成路径仍通）。
+// English: without the boost, a dragon ≈62 already clears the relaxed buy gate (≥60) → buy emitted
+// directly; with D1=40 the soft boost still scales it further (verifies the boost path remains live).
 func TestD1BoostDragonEndToEnd(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())
@@ -127,15 +128,15 @@ func TestD1BoostDragonEndToEnd(t *testing.T) {
 
 	pool := map[string]*strategy_engine.StockMarketData{"300000": d1BoostDragonMD()}
 
-	// 对照组：无 D1（Score=0）→ 保持 brief → 仅 watch
-	// English: Control group: no D1 (Score=0) → stays brief → only watch.
+	// 对照组：无 D1（Score=0）→ dragon 62 ≥60（放宽后买入层级）→ 直接 buy
+	// English: Control group: no D1 (Score=0) → dragon 62 ≥60 (relaxed buy gate) → buy directly.
 	_, sigsNo := a.ScorePool([]string{"300000"}, pool, map[string]D1Score{}, "")
-	if !hasDragonAction(sigsNo, "300000", "watch") {
-		t.Fatalf("无 D1 加成时应为 dragon watch(brief), got %+v", sigsNo)
+	if !hasDragonAction(sigsNo, "300000", "buy") {
+		t.Fatalf("放宽到60后 dragon 62 无加成也应发 buy, got %+v", sigsNo)
 	}
 
-	// D1=40 → 62.3×1.15≈71.6 ≥70 → full_chain → buy
-	// English: D1=40 → 62.3×1.15≈71.6 >=70 → full_chain → buy.
+	// D1=40 → 62.3×1.15≈71.6（软加成路径仍在）→ full_chain → buy
+	// English: D1=40 → 62.3×1.15≈71.6 (soft-boost path still live) → full_chain → buy.
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: dragon.New(cfg)}})

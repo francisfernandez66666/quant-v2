@@ -1047,17 +1047,17 @@ func (a *Agent) applyD1Boost(t strategy.SignalType, eval *strategy.Evaluation, d
 }
 
 // d1BoostTiers 返回非 N 战法的级别重判函数，门槛与 strategies/* 评分实现保持一致：
-//   - dragon / double_bump：≥70 full_chain(买入)，≥50 brief(观察)
+//   - dragon / double_bump：≥60 full_chain(买入，放宽层级统一到60)，≥50 brief(观察)
 //   - dragon_return：≥85 accelerate，≥75 main，≥60 first（P1/P2/P3_5）
 //
 // English: returns the level re-derivation for non-N strategies, matching the thresholds in
-// strategies/*: dragon/double-bump ≥70 full_chain (buy) / ≥50 brief (watch); dragon-return
-// ≥85 accelerate / ≥75 main / ≥60 first (P1/P2/P3_5).
+// strategies/*: dragon/double-bump ≥60 full_chain (buy, relaxed to 60) / ≥50 brief (watch);
+// dragon-return ≥85 accelerate / ≥75 main / ≥60 first (P1/P2/P3_5).
 func d1BoostTiers(t strategy.SignalType) (func(score float64) (string, bool), bool) {
 	switch t {
 	case strategy.SignalDragon, strategy.SignalDoubleBump:
 		return func(s float64) (string, bool) {
-			if s >= 70 {
+			if s >= 60 {
 				return "full_chain", true
 			}
 			if s >= 50 {

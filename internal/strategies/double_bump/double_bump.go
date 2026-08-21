@@ -213,11 +213,12 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	log.Printf("[double_bump] %s 今日价=%.2f chg=%.2f%% K线n=%d 最后一根日期=%v 量=%.0f 20日均量=%.0f 二突?volScore=%.0f adjustScore=%.0f maScore=%.0f total=%.0f upSession=%v",
 		code, si.Price, si.ChangePct, n, kLines[n-1].Date, kLines[n-1].Volume, avgVol, volScore, adjustScore, maScore, math.Min(volScore+adjustScore+maScore, 100), upSession)
 
-	// 总分封顶 100；≥70 → full_chain（买入），≥50 → brief（观察）（Cap total at 100; ≥70 full_chain (buy), ≥50 brief (watch)）
+	// 总分封顶 100；≥60 → full_chain（买入，放宽层级统一到60），≥50 → brief（观察）
+	// （Cap total at 100; ≥60 full_chain (buy, relaxed to 60), ≥50 brief (watch)）
 	total := math.Min(volScore+adjustScore+maScore, 100)
 	pass := total >= 50
 	level := "watch"
-	if total >= 70 {
+	if total >= 60 {
 		level = "full_chain"
 		pass = true
 	} else if total >= 50 {

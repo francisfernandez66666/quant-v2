@@ -156,8 +156,9 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	total := math.Min(f1+f2+f3+f4, 100)
 	pass := total >= 50
 	level := "watch"
-	// 总分 ≥70 → full_chain（完整链，买入）；≥50 → brief（半确认，观察）（Total ≥70 → full_chain (buy); ≥50 → brief (watch)）
-	if total >= 70 {
+	// 总分 ≥60 → full_chain（完整链，买入；放宽买入层级统一到60）；≥50 → brief（半确认，观察）
+	// English: total ≥60 → full_chain (buy; relaxed gate unified to 60); ≥50 → brief (watch)
+	if total >= 60 {
 		level = "full_chain"
 		pass = true
 	} else if total >= 50 {

@@ -84,7 +84,7 @@
         <span class="col-chg">持仓盈亏</span>
         <span class="col-sig" title="有策略信号">⚡</span>
         <span class="col-score" title="N形≥60可操作">N</span>
-        <span class="col-score" title="龙头≥70买入">龙</span>
+        <span class="col-score" title="龙头≥60买入">龙</span>
         <span class="col-score" title="动量≥50关注">量</span>
         <span class="col-sl">止盈/止损</span>
         <span class="col-sl" title="移动止盈基准（阶段最高价）">移动止盈</span>
@@ -110,7 +110,7 @@
         <span :class="['col-score', (h.n_score||0) >= 60 ? 'strong' : ((h.n_score||0) > 0 ? 'watch' : '')]" data-label="N形">
           {{ (h.n_score || 0) > 0 ? h.n_score.toFixed(0) : '—' }}
         </span>
-        <span :class="['col-score', (h.dragon_score||0) >= 70 ? 'strong' : ((h.dragon_score||0) >= 50 ? 'watch' : '')]" data-label="龙头">
+        <span :class="['col-score', (h.dragon_score||0) >= 60 ? 'strong' : ((h.dragon_score||0) >= 50 ? 'watch' : '')]" data-label="龙头">
           {{ (h.dragon_score || 0) > 0 ? h.dragon_score.toFixed(0) : '—' }}
         </span>
         <span :class="['col-score', (h.m_score||0) >= 50 ? 'watch' : '']" data-label="动量">
@@ -282,7 +282,7 @@
       <span class="lg-sep">|</span>
       <span class="lg-item">止盈+8% / 止损-5%</span>
       <span class="lg-sep">|</span>
-      <span>N≥60可买 龙≥70买 量≥50关注</span>
+      <span>N≥60可买 龙≥60买 量≥50关注</span>
     </div>
     </div>
 

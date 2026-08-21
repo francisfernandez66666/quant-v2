@@ -57,7 +57,7 @@
     <div class="card" style="margin-top: 14px;">
       <div class="card-header">
         <span>📊 个股评分排名</span>
-        <span class="card-sub">N形≥60 / 龙头≥70 / 双凸≥70 / 回头≥60 / 动量≥50</span>
+        <span class="card-sub">N形≥60 / 龙头≥60 / 双凸≥60 / 回头≥60 / 动量≥50</span>
       </div>
       <div class="eval-table" v-if="evals.length">
         <!-- 表头：每列可点击排序，title 提示对应战法门槛 -->
@@ -67,8 +67,8 @@
           <span class="ev-price sortable" @click="setSort('price')">现价{{ sortArrow('price') }}</span>
           <span class="ev-chg sortable" @click="setSort('change_pct')">涨跌{{ sortArrow('change_pct') }}</span>
           <span class="ev-n sortable" @click="setSort('n_score')" title="N形≥60可操作">N≥60{{ sortArrow('n_score') }}</span>
-          <span class="ev-dragon sortable" @click="setSort('dragon_score')" title="龙头≥70买入,≥50观察">龙≥70{{ sortArrow('dragon_score') }}</span>
-          <span class="ev-db sortable" @click="setSort('db_score')" title="双凸≥70买入,50-70观察">凸≥70{{ sortArrow('db_score') }}</span>
+          <span class="ev-dragon sortable" @click="setSort('dragon_score')" title="龙头≥60买入,≥50观察">龙≥60{{ sortArrow('dragon_score') }}</span>
+          <span class="ev-db sortable" @click="setSort('db_score')" title="双凸≥60买入,50-60观察">凸≥60{{ sortArrow('db_score') }}</span>
           <span class="ev-dr sortable" @click="setSort('dr_score')" title="龙回头≥60首次入场">回≥60{{ sortArrow('dr_score') }}</span>
           <span class="ev-m sortable" @click="setSort('m_score')" title="动量≥50值得看">量≥50{{ sortArrow('m_score') }}</span>
         </div>
@@ -97,7 +97,7 @@
         <span class="lg-pass">≥门槛 达标</span>
         <span class="lg-low">&lt;门槛 偏低</span>
         <span class="lg-sep">|</span>
-        <span class="lg-item">N形≥60操作, 龙头≥70买入/≥50观察, 双凸≥70买入/50-70观察, 回头≥60入场, 动量≥50关注</span>
+        <span class="lg-item">N形≥60操作, 龙头≥60买入/≥50观察, 双凸≥60买入/50-60观察, 回头≥60入场, 动量≥50关注</span>
       <span class="lg-sep">|</span>
       <span class="lg-item">点击表头排序</span>
       </div>
@@ -192,7 +192,7 @@ function rowClass(e) {
   // 任一分维度达强势阈值即整行高亮 (highlight the whole row when any dimension reaches the strong threshold)
   const strong = (e.n_score || 0) >= 80 || (e.dragon_score || 0) >= 80 || (e.db_score || 0) >= 80 || (e.dr_score || 0) >= 80 || (e.m_score || 0) >= 70
   if (strong) return 'ev-row strong'
-  const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 70 || (e.db_score || 0) >= 70 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
+  const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 60 || (e.db_score || 0) >= 60 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
   if (watch) return 'ev-row watch'
   return 'ev-row'
 }
