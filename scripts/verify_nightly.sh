@@ -38,5 +38,19 @@ echo "" | tee -a "$LOG"
 echo "--- [5] 内存使用 ---" | tee -a "$LOG"
 ssh -o ConnectTimeout=30 "$HOST" "free -m | head -2; echo '--- research 子进程峰值 ---'; ps -eo rss,comm | grep -E 'research|dataload' | sort -rn | head -3" 2>&1 | tee -a "$LOG"
 
+# 6) 任务队列排空检查（子系统统一改造）：活跃任务数 + 最近终态。
+echo "" | tee -a "$LOG"
+echo "--- [6] 任务队列 ---" | tee -a "$LOG"
+ssh -o ConnectTimeout=30 "$HOST" "python3 << 'PYEOF'
+import sqlite3
+db = sqlite3.connect('file:/var/lib/quant-trading-v2/trading.db?mode=ro', uri=True, timeout=5)
+c = db.cursor()
+active = c.execute(\"SELECT id,type,priority,status,progress,updated_at FROM research_tasks WHERE status IN ('queued','running','paused','preempted') ORDER BY id\").fetchall()
+print('活跃任务:', active if active else '无（已全部排空）')
+last = c.execute(\"SELECT type,status,progress,error,updated_at FROM research_tasks ORDER BY updated_at DESC LIMIT 1\").fetchone()
+print('最近终态:', last)
+db.close()
+PYEOF" 2>&1 | tee -a "$LOG"
+
 echo "" | tee -a "$LOG"
 echo "===== $(date '+%F %T') 验证结束 =====" | tee -a "$LOG"

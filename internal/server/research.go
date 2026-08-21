@@ -2,6 +2,7 @@
 package server
 
 import (
+	"quant-trading-v2/internal/store"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -144,7 +145,43 @@ func (s *Server) handleResearchCandidates(w http.ResponseWriter, r *http.Request
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"candidates": cands})
+	// 通用回测证据（§8.6-B）：factor 候选看 B4 回填的 avg_excess；pattern 候选的
+	// 回放结果在任务行 result_text——统一按"两类型最新任务是否 done"判定已测，
+	// 并把回放汇总文本附带给前端展示（否则形态候选永远显示"未测"）。
+	type btEvidence struct {
+		Done bool   `json:"backtest_done"`
+		Text string `json:"backtest_result_text,omitempty"`
+	}
+	evid := map[int64]btEvidence{}
+	for _, c := range cands {
+		var best *store.ResearchTask
+		for _, typ := range []string{store.TaskBacktestCandidate, store.TaskBacktestStrategy} {
+			t, err := s.researchDB.LatestTaskByRef(typ, c.ID)
+			if err == nil && t != nil && (best == nil || t.ID > best.ID) {
+				best = t
+			}
+		}
+		if best != nil && best.Status == store.TaskDone {
+			evid[c.ID] = btEvidence{Done: true, Text: best.ResultText}
+		}
+	}
+	out := make([]map[string]any, 0, len(cands))
+	for _, c := range cands {
+		m := map[string]any{
+			"id": c.ID, "kind": c.Kind, "status": c.Status,
+			"factors": c.Factors, "weights": c.Weights, "metric": c.Metric,
+			"ic_mean": c.ICMean, "ir": c.IR, "avg_excess": c.AvgExcess,
+			"horizon": c.Horizon, "reason": c.Reason, "created_at": c.CreatedAt,
+		}
+		if ev, ok := evid[c.ID]; ok {
+			m["backtest_done"] = true
+			if ev.Text != "" {
+				m["backtest_result_text"] = ev.Text
+			}
+		}
+		out = append(out, m)
+	}
+	writeJSON(w, 200, map[string]any{"candidates": out})
 }
 
 // handleResearchApprove 处理 POST /api/research/candidates/{id}/approve：审批通过并应用权重。

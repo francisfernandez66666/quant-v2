@@ -236,3 +236,75 @@ func TestResearchLibraryEndpoints(t *testing.T) {
 		t.Fatalf("删除后战法库应为空, got %d", len(empty.Library))
 	}
 }
+
+// TestCandidateBacktestRouting §8.6-B 路由：factor 候选 → backtest_candidate(B4)；
+// pattern 候选 → backtest_strategy(payload 带 candidate_id)；同 ref 重复点击幂等；
+// 列表接口对 pattern 候选附带回测证据（backtest_done/result_text）。
+func TestCandidateBacktestRouting(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+
+	fid, _ := db.SaveCandidate(&store.Candidate{Kind: "factor", Status: "proposed",
+		Factors: `["Mom20"]`, Weights: `{}`})
+	pid, _ := db.SaveCandidate(&store.Candidate{Kind: "pattern", Status: "proposed",
+		Factors: `[{"factor":"Brk20","min":0.5,"max":1.5}]`, Weights: `{}`})
+
+	post := func(cid int64) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/research/candidates/"+itoa(cid)+"/backtest", nil)
+		req.SetPathValue("id", itoa(cid))
+		s.handleCandidateBacktest(rr, req)
+		return rr
+	}
+
+	if rr := post(fid); rr.Code != 202 {
+		t.Fatalf("factor 回测状态码=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr := post(pid); rr.Code != 202 {
+		t.Fatalf("pattern 回测状态码=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	tf, err := db.LatestTaskByRef(store.TaskBacktestCandidate, fid)
+	if err != nil || tf == nil || tf.Type != store.TaskBacktestCandidate || tf.Priority != "high" {
+		t.Fatalf("factor 任务错误: %+v err=%v", tf, err)
+	}
+	tp, err := db.LatestTaskByRef(store.TaskBacktestStrategy, pid)
+	if err != nil || tp == nil {
+		t.Fatalf("pattern 任务缺失: err=%v", err)
+	}
+	if tp.Type != store.TaskBacktestStrategy || tp.Priority != "high" {
+		t.Fatalf("pattern 类型/优先级错误: %+v", tp)
+	}
+	var p map[string]any
+	if json.Unmarshal([]byte(tp.Payload), &p) != nil || p["candidate_id"].(float64) != float64(pid) {
+		t.Fatalf("payload 应含 candidate_id: %s", tp.Payload)
+	}
+
+	// 幂等：重复发起不新增行
+	before, _ := db.ListResearchTasks()
+	post(fid)
+	after, _ := db.ListResearchTasks()
+	if len(before) != len(after) {
+		t.Fatalf("重复发起产生新任务: %d→%d", len(before), len(after))
+	}
+
+	// 列表证据：模拟 pattern 任务 done → 候选列表 backtest_done=true + result_text
+	db.UpdateTaskRunState(tp.ID, store.TaskDone, "100%", 0, "胜率 55.2%", "")
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/research/candidates", nil)
+	s.handleResearchCandidates(rr, req)
+	var body struct {
+		Candidates []struct {
+			ID              int64  `json:"id"`
+			BacktestDone    bool   `json:"backtest_done"`
+			BacktestText    string `json:"backtest_result_text"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析列表失败: %v", err)
+	}
+	for _, c := range body.Candidates {
+		if c.ID == pid && (!c.BacktestDone || c.BacktestText == "") {
+			t.Fatalf("pattern 候选证据缺失: %+v", c)
+		}
+	}
+}
