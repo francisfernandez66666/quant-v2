@@ -148,6 +148,13 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 	if len(events) == 0 {
 		return nil, fmt.Errorf("无合成事件（区间 %s-%s，minLimitUps=%d）", opts.Start, opts.End, opts.MinLimitUps)
 	}
+	// 进度反馈提前（§8.6-A）：合成完成即回报 0%——首个事件前还有整窗装配（分钟级），
+	// 没有这一行前端进度条会全程空窗，观感即"卡死"。
+	// English: emit an immediate 0% progress right after synthesis; the first window assembly takes
+	// minutes and without this the frontend bar sits empty the whole time.
+	if opts.OnProgress != nil && len(events) > 0 {
+		opts.OnProgress(0, len(events))
+	}
 
 	// 收集事件相关股票代码
 	codeSet := make(map[string]bool)

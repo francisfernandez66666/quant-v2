@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"strconv"
+	"encoding/json"
 	"time"
 
 	"quant-trading-v2/internal/config"
@@ -394,11 +396,16 @@ type Options struct {
 	DBPath    string
 	Start     string
 	End       string
-	Strategy  string // double_bump|dragon|dragon_return|n_shape|factor|pattern
+	Strategy  string // double_bump|dragon|dragon_return|n_shape|factor|pattern|all
 	MaxStocks int    // 最多回测股票数（0=全部）
 	D1Score   float64
 	Industry  bool
 	DataDir   string // 战法库目录（applied_factors.json / applied_patterns.json 所在）
+	// CandidateID > 0 且 Strategy=pattern 时：直接从候选行构造单条形态规则回放，
+	// 不依赖 applied_patterns.json（待审批候选也有回测通道，§8.6-B）。
+	// English: when set with Strategy=pattern, build one rule from the candidate row itself —
+	// proposed candidates get a replay path without requiring library approval.
+	CandidateID int64
 }
 
 // DefaultDB 研究库默认路径：QUANT_DATA_DIR 优先，否则 ~/.quant-trading-v2/trading.db
@@ -568,7 +575,35 @@ func (o *Options) Run() error {
 	// English: "all" replays every enabled factor AND pattern rule in one pass — used by the nightly
 	// library_replay step so auto-research regression-tests live strategies nightly.
 	var ads []adapter
-	if strings.EqualFold(o.Strategy, "all") {
+	if o.CandidateID > 0 && strings.EqualFold(o.Strategy, "pattern") {
+		// 候选直读模式（§8.6-B）：候选 Factors JSON 即 []PatternCond（与 ApplyPatternRule 同映射），
+		// 构造单条规则走与实盘一致的 Evaluate 回放；战法库为空/未审批均不影响。
+		// English: candidate-direct mode — build a single rule from the candidate row and replay it.
+		c, cerr := db.CandidateByID(o.CandidateID)
+		if cerr != nil {
+			return fmt.Errorf("读取候选 #%d 失败: %w", o.CandidateID, cerr)
+		}
+		var conds []research.PatternCond
+		if jerr := json.Unmarshal([]byte(c.Factors), &conds); jerr != nil {
+			return fmt.Errorf("解析候选条件失败: %w", jerr)
+		}
+		if len(conds) == 0 {
+			log.Printf("候选 #%d 无条件集，跳过回放", c.ID)
+			return nil
+		}
+		rule := &pattern.ActivePattern{
+			ID:     "pat_" + strconv.FormatInt(c.ID, 10),
+			Name:   "形态战法#" + strconv.FormatInt(c.ID, 10),
+			CandID: c.ID,
+		}
+		for _, cd := range conds {
+			rule.Conds = append(rule.Conds, pattern.Cond{Factor: cd.Factor, Min: cd.Min, Max: cd.Max})
+		}
+		ps := pattern.New()
+		ps.SetRules([]*pattern.ActivePattern{rule})
+		ads = []adapter{&ruleEvalAdapter{name: rule.Name, ps: ps}}
+		log.Printf("候选直读回放：%s 条件=%d", rule.Name, len(rule.Conds))
+	} else if strings.EqualFold(o.Strategy, "all") {
 		fa, ferr := loadRuleAdapters("factor", o.DataDir)
 		if ferr != nil {
 			return ferr

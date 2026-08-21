@@ -303,8 +303,17 @@ func apiStatusOf(s string) string {
 
 // taskToLegacyJob 把队列行映射为旧 BacktestJob 形状（前端契约兼容）。
 func taskToLegacyJob(t store.ResearchTask) store.BacktestJob {
+	kind := backtestTaskKinds[t.Type]
+	// §8.6-B：形态候选回放任务的 payload 带 candidate_id——对外映射回 kind=candidate，
+	// 前端"候选 #N"标签/取消键/续跑键语义才正确（否则会显示成"规则 N"）。
+	var p map[string]any
+	if json.Unmarshal([]byte(t.Payload), &p) == nil {
+		if _, ok := p["candidate_id"]; ok {
+			kind = "candidate"
+		}
+	}
 	return store.BacktestJob{
-		Kind:        backtestTaskKinds[t.Type],
+		Kind:        kind,
 		CandidateID: t.RefID,
 		Status:      apiStatusOf(t.Status),
 		Progress:    t.Progress,
@@ -360,6 +369,14 @@ func (s *Server) handleCandidateBacktest(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		writeError(w, 400, "无效 id")
 		return
+	}
+	// §8.6-B 按候选 kind 路由：pattern 候选走战法库回放引擎（btreplay 候选直读模式，
+	// 不依赖审批入库）；factor 及其他仍走 B4 全链路。前端端点保持不变。
+	if s.researchDB != nil {
+		if cand, cerr := s.researchDB.CandidateByID(id); cerr == nil && cand != nil && cand.Kind == "pattern" {
+			s.enqueuePatternCandidateBacktest(w, r, id)
+			return
+		}
 	}
 	q := r.URL.Query()
 	payload := map[string]any{}
@@ -440,15 +457,6 @@ func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 202, map[string]any{"status": "queued"})
-}
-
-// latestBacktestTask 取某 id 对应的最新回测任务行（自动识别候选/战法库键空间）。
-func (s *Server) latestBacktestTask(id int64) (*store.ResearchTask, error) {
-	if s.researchDB == nil {
-		return nil, fmt.Errorf("研究库未接入")
-	}
-	typ, ref := resolveBacktestRef(id)
-	return s.researchDB.LatestTaskByRef(typ, ref)
 }
 
 // handleBacktestCancel 处理 POST /api/research/backtest/{id}/cancel：
@@ -597,4 +605,54 @@ func (s *Server) handleBacktestList(w http.ResponseWriter, r *http.Request) {
 		jobs = append(jobs, taskToLegacyJob(t))
 	}
 	writeJSON(w, 200, map[string]any{"jobs": jobs})
+}
+
+// enqueuePatternCandidateBacktest 形态候选回测入口（§8.6-B）：入队 backtest_strategy
+// 高优先级任务（payload 带 candidate_id），worker 经 run-task → btreplay 候选直读模式
+// 回放该候选条件集；汇总报告落 result_text，「回测」tab 展示。
+// English: enqueues a high-priority strategy-replay task for a pattern candidate (candidate-direct
+// btreplay mode); the summary lands in result_text for the backtest tab.
+func (s *Server) enqueuePatternCandidateBacktest(w http.ResponseWriter, r *http.Request, id int64) {
+	q := r.URL.Query()
+	payload := map[string]any{"kind": "pattern", "candidate_id": id}
+	if v := q.Get("start"); v != "" {
+		payload["start"] = v
+	}
+	if v := q.Get("end"); v != "" {
+		payload["end"] = v
+	}
+	taskID, t, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, id, payload)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	status := "queued"
+	if t != nil {
+		status = apiStatusOf(t.Status)
+	}
+	writeJSON(w, 202, map[string]any{"status": status, "task_id": taskID, "job": map[string]any{
+		"candidate_id": id, "status": status, "progress": "0%",
+	}})
+}
+
+// latestBacktestTask 取某 id 对应的最新回测任务行：普通 id 同时可能命中
+// backtest_candidate（B4）与 backtest_strategy（形态候选回放，§8.6-B），取最新者；
+// 战法库合成键(≥1e9)仍按规则序号解析。
+// English: resolves the newest task across both types for plain ids; library synthetic keys
+// (>=1e9) still resolve by rule number.
+func (s *Server) latestBacktestTask(id int64) (*store.ResearchTask, error) {
+	if s.researchDB == nil {
+		return nil, fmt.Errorf("研究库未接入")
+	}
+	if id >= 1_000_000_000 {
+		return s.researchDB.LatestTaskByRef(store.TaskBacktestStrategy, id-1_000_000_000)
+	}
+	var best *store.ResearchTask
+	for _, typ := range []string{store.TaskBacktestCandidate, store.TaskBacktestStrategy} {
+		t, err := s.researchDB.LatestTaskByRef(typ, id)
+		if err == nil && t != nil && (best == nil || t.ID > best.ID) {
+			best = t
+		}
+	}
+	return best, nil
 }

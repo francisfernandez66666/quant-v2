@@ -74,14 +74,15 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 		// 二期：进程内调用 btreplay（bt_strategy 已并入 research 二进制）。
 		// English: phase-2 — in-process replay via internal/btreplay.
 		o := &btreplay.Options{
-			DBPath:    dbPath,
-			DataDir:   payloadStr(p, "datadir", dataDirOf(dbPath)),
-			Start:     payloadStr(p, "start", "20230101"),
-			End:       payloadStr(p, "end", today()),
-			Strategy:  payloadStr(p, "kind", "factor"),
-			MaxStocks: payloadIntDef(p, "maxstocks", 300),
-			D1Score:   float64(payloadInt(p, "d1", 20)),
-			Industry:  payloadStr(p, "industry", "") == "true",
+			DBPath:      dbPath,
+			DataDir:     payloadStr(p, "datadir", dataDirOf(dbPath)),
+			Start:       payloadStr(p, "start", "20230101"),
+			End:         payloadStr(p, "end", today()),
+			Strategy:    payloadStr(p, "kind", "factor"),
+			MaxStocks:   payloadIntDef(p, "maxstocks", 300),
+			D1Score:     float64(payloadInt(p, "d1", 20)),
+			Industry:    payloadStr(p, "industry", "") == "true",
+			CandidateID: payloadInt(p, "candidate_id", 0), // 形态候选直读回放（§8.6-B）
 		}
 		if err := o.Run(); err != nil {
 			log.Fatalf("战法库回放失败: %v", err)

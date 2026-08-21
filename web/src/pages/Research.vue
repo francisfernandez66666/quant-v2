@@ -189,7 +189,7 @@
           <select v-model="btPickId" class="bt-select" :disabled="btLoading">
             <option :value="0" disabled>选择待审批因子候选</option>
             <option v-for="c in btCandidates" :key="c.id" :value="c.id">
-              #{{ c.id }} 因子战法（IC {{ fmt(c.ic_mean) }}，IR {{ fmt(c.ir) }}）
+              #{{ c.id }} {{ c.kind === 'pattern' ? '形态战法' : '因子战法' }}（{{ c.kind === 'pattern' ? ('触发 ' + (c.triggers ?? '-')) : ('IC ' + fmt(c.ic_mean) + '，IR ' + fmt(c.ir)) }}）
             </option>
           </select>
           <button
@@ -1079,8 +1079,9 @@ function jobPct(j) {
 
 /** 可发起回测的候选：待审批的因子战法候选（回测 tab 任务添加下拉） */
 /** Candidates available for backtest: proposed factor candidates (task-add dropdown) */
+// 可发起回测的候选：待审批的因子/形态候选（§8.6-B 形态走战法库回放引擎，端点相同）
 const btCandidates = computed(() =>
-  candidates.value.filter(c => c.kind === 'factor' && c.status === 'proposed')
+  candidates.value.filter(c => (c.kind === 'factor' || c.kind === 'pattern') && c.status === 'proposed')
 )
 
 // 挂载时加载一次；KeepAlive 缓存激活时刷新（切换 tab 回来自动同步最新候选）

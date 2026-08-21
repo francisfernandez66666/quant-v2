@@ -130,6 +130,16 @@ func (d *DB) ClaimResearchTask(id int64) (bool, error) {
 	return n > 0, nil
 }
 
+// UpdateTaskClaimed 认领启动标记：status=running、progress 预写 1%（§8.6-A 装配期不再空窗），
+// 刻意不触碰 error——续跑场景下保留上次中断原因，直到本次运行产出新终态。
+// English: claim marker — flips to running with a 1% baseline; deliberately leaves error untouched
+// so a resumed task keeps its previous interruption reason until a new terminal state lands.
+func (d *DB) UpdateTaskClaimed(id int64) error {
+	_, err := d.db.Exec(`UPDATE research_tasks SET status='running', progress='1%', updated_at=?
+		WHERE id=?`, nowStr(), id)
+	return err
+}
+
 // GetResearchTask 按 ID 取一条。
 func (d *DB) GetResearchTask(id int64) (*ResearchTask, error) {
 	row := d.db.QueryRow(`SELECT `+researchTaskCols+` FROM research_tasks WHERE id=?`, id)

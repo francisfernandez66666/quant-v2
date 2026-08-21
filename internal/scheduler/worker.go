@@ -136,6 +136,8 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 		}
 		return
 	}
+	// 认领即预写 1% 基线（§8.6-A）：子进程起步装配期（分钟级）进度条不再空窗。
+	_ = db.UpdateTaskClaimed(next.ID)
 	go s.runTask(db, cfg, cp)
 }
 
