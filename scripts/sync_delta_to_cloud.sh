@@ -20,6 +20,8 @@
 #   LOCAL_DB         本地研究库路径（默认 ~/.quant-trading-v2/trading.db）
 #   PYDATA_PORT      本地 pydata sidecar 端口（默认 8787）
 #   CLOUD_BIN        云端 dataload 路径（默认 /opt/quant/dataload）
+#   DATALOAD_BIN     本地 dataload 二进制路径（launchd 安装副本场景直指定，免编译）
+#   PYDATA_SERVER    pydata server.py 路径（同上；缺省用仓库内 $ROOT/cmd/pydata/server.py）
 #   ADJFACTOR_ENABLED 是否每日补复权因子（默认 0=跳过；首次补齐后基本无新数据）
 set -euo pipefail
 
@@ -40,6 +42,25 @@ SCP="scp -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
+# remote_retry 远程操作重试包装：云端夜间研究满负荷时 sshd 会瞬时 banner 超时
+# （今日两度实遇——预检过了、中途读库仍可能撞上），3 次 × 30s；全败才返回非零，
+# 让 set -e 终止（delta 已保留，直接重跑安全）。
+# English: retry wrapper for every remote call — sshd banner timeouts recur while the nightly
+# research saturates the box; 3 tries x 30s before giving up (idempotent rerun-safe).
+remote_retry() {
+    local desc="$1"; shift
+    local attempt
+    for attempt in 1 2 3; do
+        if "$@"; then
+            return 0
+        fi
+        log "远程操作失败(第${attempt}/3次): ${desc}，30s 后重试..."
+        sleep 30
+    done
+    log "远程操作连续 3 次失败: ${desc}"
+    return 1
+}
+
 # ── 0. 前置检查 ──
 log "[0/6] 前置检查..."
 [ -f "$LOCAL_DB" ] || { log "本地库不存在: $LOCAL_DB"; exit 1; }
@@ -54,8 +75,14 @@ for i in 1 2 3; do
 done
 [ "$SSH_OK" = "1" ] || { log "SSH 连续 3 次不可达: $SERVER_USER@$SERVER_IP"; exit 1; }
 
-# dataload 二进制：优先已有，否则现场编译
-DATALOAD="$(command -v dataload || true)"
+# dataload 二进制：DATALOAD_BIN 环境变量优先（launchd agent 场景：运行时副本在
+# Application Support 下，不依赖仓库/Go），其次 PATH、/tmp/dataload-local，最后现场编译。
+# English: dataload resolution — DATALOAD_BIN wins (agent scenario), then PATH,
+# /tmp/dataload-local, and finally an in-repo go build as last resort.
+DATALOAD="${DATALOAD_BIN:-}"
+if [ -z "$DATALOAD" ]; then
+    DATALOAD="$(command -v dataload || true)"
+fi
 [ -z "$DATALOAD" ] && [ -x /tmp/dataload-local ] && DATALOAD=/tmp/dataload-local
 if [ -z "$DATALOAD" ]; then
     log "编译本地 dataload..."
@@ -69,7 +96,7 @@ mkdir -p "$DELTA_TMP"
 log "[1/6] 检查本地 pydata sidecar (:${PYDATA_PORT})..."
 if ! lsof -iTCP:"$PYDATA_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     log "启动 pydata sidecar..."
-    nohup python3 "$ROOT/cmd/pydata/server.py" --host 127.0.0.1 --port "$PYDATA_PORT" \
+    nohup python3 "${PYDATA_SERVER:-$ROOT/cmd/pydata/server.py}" --host 127.0.0.1 --port "$PYDATA_PORT" \
         >"$DELTA_TMP/pydata.log" 2>&1 &
     for i in $(seq 1 30); do
         curl -s --max-time 2 "http://127.0.0.1:${PYDATA_PORT}/health" >/dev/null 2>&1 && break
@@ -89,7 +116,7 @@ fi
 
 # ── 3. 读云端各表 max 日期 ──
 log "[3/6] 读云端各表 max 日期..."
-CLOUD_MAX_JSON=$($SSH "python3 << 'PYEOF'
+CLOUD_MAX_JSON=$(remote_retry "读云端各表 max" $SSH "python3 << 'PYEOF'
 import sqlite3, json
 db = sqlite3.connect('file:${QUANT_DATA_DIR}/trading.db?mode=ro', uri=True, timeout=10)
 out = {}
@@ -127,14 +154,15 @@ fi
 
 # ── 5. 上传 + 云端导入 ──
 log "[5/6] 上传并云端导入..."
-$SCP "$DELTA_FILE" "$SERVER_USER@$SERVER_IP:/tmp/" || { log "scp 失败（delta 已保留: $DELTA_FILE）"; exit 1; }
-$SSH "$CLOUD_BIN --db ${QUANT_DATA_DIR}/trading.db import-delta --file /tmp/$(basename "$DELTA_FILE")" \
+remote_retry "scp 上传 delta" $SCP "$DELTA_FILE" "$SERVER_USER@$SERVER_IP:/tmp/" \
+    || { log "scp 失败（delta 已保留: $DELTA_FILE）"; exit 1; }
+remote_retry "云端 import-delta" $SSH "$CLOUD_BIN --db ${QUANT_DATA_DIR}/trading.db import-delta --file /tmp/$(basename "$DELTA_FILE")" \
     || { log "云端 import 失败（delta 已保留: $DELTA_FILE）"; exit 1; }
-$SSH "rm -f /tmp/$(basename "$DELTA_FILE")"
+remote_retry "清理云端临时文件" $SSH "rm -f /tmp/$(basename "$DELTA_FILE")"
 
 # ── 6. 校验输出 ──
 log "[6/6] 校验..."
-AFTER=$($SSH "python3 << 'PYEOF'
+AFTER=$(remote_retry "同步后校验读云端 max" $SSH "python3 << 'PYEOF'
 import sqlite3, json
 db = sqlite3.connect('file:${QUANT_DATA_DIR}/trading.db?mode=ro', uri=True, timeout=10)
 out = {}

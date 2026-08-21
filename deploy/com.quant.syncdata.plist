@@ -5,7 +5,7 @@
        cp deploy/com.quant.syncdata.plist ~/Library/LaunchAgents/
        # 先改 SERVER_IP 为实际值
        launchctl load ~/Library/LaunchAgents/com.quant.syncdata.plist
-     验证：launchctl list | grep quant.syncdata；日志 tail -f /tmp/quant_sync.log
+     验证：launchctl list | grep quant.syncdata；日志 tail -f /Users/zhangzifei/Library/Logs/quant_sync.log
      手动触发一次：launchctl start com.quant.syncdata
 -->
 <plist version="1.0">
@@ -31,8 +31,8 @@
     <key>Hour</key><integer>15</integer>
     <key>Minute</key><integer>20</integer>
   </dict>
-  <key>StandardOutPath</key><string>/tmp/quant_sync.log</string>
-  <key>StandardErrorPath</key><string>/tmp/quant_sync_err.log</string>
+  <key>StandardOutPath</key><string>/Users/zhangzifei/Library/Logs/quant_sync.log</string>
+  <key>StandardErrorPath</key><string>/Users/zhangzifei/Library/Logs/quant_sync_err.log</string>
   <key>RunAtLoad</key><false/>
 </dict>
 </plist>
