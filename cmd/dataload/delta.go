@@ -50,14 +50,34 @@ type deltaLine struct {
 }
 
 // cmdExportDelta 导出增量：SELECT 各表 date_col > since 的行（元数据表全量），写 gzip JSONL。
-// 用法：dataload --db <本地库> export-delta --since 20260820 --out /tmp/delta.jsonl.gz
+// 两种起点模式（二选一，同时给时 --fill-from 优先）：
+//   - --since YYYYMMDD：全部日期表统一门槛；
+//   - --fill-from <目标库>：逐表读目标库 MAX(date_col) 作为该表起点（"补齐"语义——目标缺多少补多少，
+//     目标空表全量导出）。适合首次同步/历史缺口修补（如本地 adj_factor 缺失而云端齐全）。
+//
+// 用法：dataload --db <源库> export-delta --since 20260820 | --fill-from <目标库> --out /tmp/delta.jsonl.gz
 // English: exports deltas — rows with date_col > since per table (metadata tables in full) into a
-// gzipped JSONL file.
+// gzipped JSONL file. Two start-point modes: a single --since for all tables, or --fill-from <targetDB>
+// which reads each table's MAX(date_col) from the target DB (gap-fill semantics; empty target tables
+// export in full).
 func cmdExportDelta(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("export-delta", flag.ExitOnError)
-	since := fs.String("since", "", "起始日期 YYYYMMDD（该日之后的数据导出；空=全量）")
+	since := fs.String("since", "", "起始日期 YYYYMMDD（该日之后的数据导出；空=配合 --fill-from 或全量）")
+	fillFrom := fs.String("fill-from", "", "目标库路径（逐表读其 MAX(date_col) 作为该表增量起点，补齐语义）")
 	out := fs.String("out", "/tmp/delta.jsonl.gz", "输出文件（gzip JSONL）")
 	fs.Parse(args)
+
+	// fill-from 模式：打开目标库，逐表取 max（只读）。
+	// English: fill-from mode — open the target DB read-only and take per-table max dates.
+	var target *store.DB
+	if *fillFrom != "" {
+		var err error
+		target, err = store.Open(*fillFrom)
+		if err != nil {
+			log.Fatalf("打开目标库失败: %v", err)
+		}
+		defer target.Close()
+	}
 
 	f, err := os.Create(*out)
 	if err != nil {
@@ -76,12 +96,36 @@ func cmdExportDelta(db *store.DB, args []string) {
 			continue
 		}
 		q := fmt.Sprintf("SELECT %s FROM %s", quoteCols(cols), t.name)
-		args := []any{}
-		if t.dateCol != "" && *since != "" {
+		qargs := []any{}
+		switch {
+		case t.dateCol != "" && target != nil:
+			// 补齐语义：以目标库该表 max 为起点（空表 → max="" → 全量导出）。
+			// 日期列按表而异（行情=trade_date，财务=end_date），直接按 dateCol 查询。
+			// English: gap-fill — start after the target table's max (empty table → full dump). The date
+			// column differs per table (bars=trade_date, financials=end_date), so query by dateCol.
+			mrows, err := target.QueryRows(
+				fmt.Sprintf("SELECT COALESCE(MAX(%s),'') AS m FROM %s", t.dateCol, t.name))
+			if err != nil {
+				log.Fatalf("读目标库 %s max 失败: %v", t.name, err)
+			}
+			tmax := ""
+			if len(mrows) > 0 {
+				if v, ok := mrows[0]["m"].(string); ok {
+					tmax = v
+				}
+			}
+			if tmax == "" {
+				log.Printf("[export-delta] %s: 目标库为空 → 全量导出", t.name)
+			} else {
+				q += fmt.Sprintf(" WHERE %s > ?", t.dateCol)
+				qargs = append(qargs, tmax)
+				log.Printf("[export-delta] %s: 目标 max=%s → 导出其后增量", t.name, tmax)
+			}
+		case t.dateCol != "" && *since != "":
 			q += fmt.Sprintf(" WHERE %s > ?", t.dateCol)
-			args = append(args, *since)
+			qargs = append(qargs, *since)
 		}
-		rows, err := db.QueryRows(q, args...)
+		rows, err := db.QueryRows(q, qargs...)
 		if err != nil {
 			log.Fatalf("读取 %s 失败: %v", t.name, err)
 		}

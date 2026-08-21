@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 本地 baostock 每日自动下载→上传云端（阶段2.3，设计见 docs/DATA_SYNC_SCRIPT.md 第四节）。
+     安装：
+       cp deploy/com.quant.syncdata.plist ~/Library/LaunchAgents/
+       # 先改 SERVER_IP 为实际值
+       launchctl load ~/Library/LaunchAgents/com.quant.syncdata.plist
+     验证：launchctl list | grep quant.syncdata；日志 tail -f /tmp/quant_sync.log
+     手动触发一次：launchctl start com.quant.syncdata
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.quant.syncdata</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/zhangzifei/Desktop/quant-trading-v2/scripts/sync_delta_to_cloud.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- 云端公网 IP（部署时替换）-->
+    <key>SERVER_IP</key><string>43.108.86.140</string>
+    <key>SERVER_USER</key><string>root</string>
+    <!-- 复权因子每日补齐默认关（首次已从云端快照补齐）；需要时改 1 -->
+    <key>ADJFACTOR_ENABLED</key><string>0</string>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+  </dict>
+  <!-- 每个交易日 15:20 触发（A 股 15:00 收盘后）；周末/节假日 dataload 无新交易日自动跳过 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>15</integer>
+    <key>Minute</key><integer>20</integer>
+  </dict>
+  <key>StandardOutPath</key><string>/tmp/quant_sync.log</string>
+  <key>StandardErrorPath</key><string>/tmp/quant_sync_err.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
