@@ -213,6 +213,14 @@
             {{ btLoading ? '加载中...' : '刷新列表' }}
           </button>
         </div>
+        <!-- 内置形态战法一键回测（与战法库 tab 同一入口/同一处理函数，双 tab 均可发起） -->
+        <div class="bt-add-row" style="margin-top:8px">
+          <span style="font-size:12px;color:var(--muted,#888)">内置形态战法：</span>
+          <button v-for="b in builtinPatterns" :key="'bt-' + b.id" class="btn-backtest"
+                  style="margin-right:8px" @click="doLibraryBacktest(b)">
+            回测·{{ b.name }}
+          </button>
+        </div>
         <div class="bt-add-hint">
           任务统一走研究队列：手动回测为高优先级，夜间自动研究为低优先级；高优先级到来会自动让路（被抢占任务断点续跑）。所有任务仅在盘后窗口执行——盘中提交会显示"排队中·盘后执行"。断点持久化，中断/重启后重跑只计算剩余事件；页面刷新后排队/运行中任务自动恢复轮询，可暂停/取消。
         </div>
@@ -1230,6 +1238,7 @@ function stopPolling() {
 .btn-backtest:hover { background: rgba(255,152,0,0.22); }
 .btn-backtest:disabled { opacity: 0.5; cursor: wait; }
  .bt-result { font-size: 12px; font-weight: 600; align-self: center; }
+ .bt-lib-result { white-space: pre-wrap; line-height: 1.7; font-weight: 500; }
  .bt-result.pos { color: #4caf50; }
  .bt-result.neg { color: #FF4D4F; }
  .bt-progress { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; width: 220px; }

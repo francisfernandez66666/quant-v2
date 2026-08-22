@@ -33,16 +33,53 @@ var taskProgressRe = regexp.MustCompile(`(?:任务|回测|发现)进度 (\d+)%`)
 // avgExcessRe 匹配 B4 回测 CLI 的平均超额（done 后写 result_num）。
 var avgExcessRe = regexp.MustCompile(`平均超额=(-?\d+(?:\.\d+)?)`)
 
-// btSummaryRe 匹配战法库回放汇总块（胜率/盈亏比等行集合，done 后拼 result_text）。
-var btSummaryRe = regexp.MustCompile(`(?m)^(触发信号数|胜率|平均盈利|平均亏损|盈亏比|平均持仓天数):.*$`)
+// 回放汇总报告解析：btreplay printReport 每个战法输出一个 ===== 包围的块，
+// 头行为「战法历史回测: <名>（N 只股票）」。旧实现抓指标行丢名字，多战法块无法区分。
+var (
+	btNameRe    = regexp.MustCompile(`(?m)^战法历史回测: (.+?)（`)
+	btTriggerRe = regexp.MustCompile(`(?m)^触发信号数: (\d+)`)
+	btWinRe     = regexp.MustCompile(`(?m)^胜率: (\d+(?:\.\d+)?)%`)
+	btPfRe      = regexp.MustCompile(`(?m)^盈亏比: (\d+(?:\.\d+)?)`)
+	btHoldRe    = regexp.MustCompile(`(?m)^平均持仓天数: (\d+(?:\.\d+)?)`)
+)
 
-// parseBtSummary 从 bt_strategy 输出提取汇总行拼接为报告文本。
+// parseBtSummary 按 ===== 分隔块解析回放汇总，每个战法一行、冠以名称标签：
+// 【双响炮】胜率 47.78% 盈亏比 1.31 触发 270 持仓 1.0天
+// English: one labeled line per strategy block, e.g. 【双响炮】win 47.78% PF 1.31 ...
 func parseBtSummary(out string) string {
-	lines := btSummaryRe.FindAllString(out, -1)
-	if len(lines) == 0 {
+	blocks := strings.Split(out, "==============================================")
+	var rows []string
+	for _, blk := range blocks {
+		var name string
+		if m := btNameRe.FindStringSubmatch(blk); len(m) == 2 {
+			name = strings.TrimSpace(m[1])
+		}
+		if name == "" || !strings.Contains(blk, "胜率:") && !strings.Contains(blk, "无触发信号") {
+			continue // 分隔线之间的非报告文本（进度行等）
+		}
+		if strings.Contains(blk, "无触发信号") {
+			rows = append(rows, fmt.Sprintf("【%s】无触发信号", name))
+			continue
+		}
+		row := fmt.Sprintf("【%s】", name)
+		if m := btWinRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("胜率 %s%% ", m[1])
+		}
+		if m := btPfRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("盈亏比 %s ", m[1])
+		}
+		if m := btTriggerRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("触发 %s ", m[1])
+		}
+		if m := btHoldRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf("持仓 %s天", m[1])
+		}
+		rows = append(rows, strings.TrimSpace(row))
+	}
+	if len(rows) == 0 {
 		return "无触发信号"
 	}
-	return strings.Join(lines, "；")
+	return strings.Join(rows, "\n")
 }
 
 // openStore 懒加载队列库句柄；首次打开执行启动恢复（崩溃遗留 running→preempted 自动续跑）。
