@@ -619,7 +619,11 @@ func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 				ap.Conds = append(ap.Conds, pattern.Cond{Factor: cd.Factor, Min: cd.Min, Max: cd.Max})
 			}
 			ad := &ruleEvalAdapter{name: ap.Name, ruleID: ap.ID,
-				ps: func() *pattern.PatternStrategy { p := pattern.New(); p.SetRules([]*pattern.ActivePattern{ap}); return p }()}
+				ps: func() *pattern.PatternStrategy {
+					p := pattern.New()
+					p.SetRules([]*pattern.ActivePattern{ap})
+					return p
+				}()}
 			if e.ExitTrailPct > 0 {
 				ad.trailOverride = &e.ExitTrailPct
 			}
