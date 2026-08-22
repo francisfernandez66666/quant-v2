@@ -427,6 +427,19 @@ func DefaultDataDir() string {
 	return filepath.Join(home, ".quant-trading-v2")
 }
 
+// strategyNeedsIndustry 判断战法是否依赖行业板块数据：dragon 的 F2 共振/溢价对标、
+// dragon_return 的"板块前2+RPS"前提都吃板块输入。无板块数据时两者理论上限≈62~65，
+// 恒低于 70/Pass 触发线——回放必须自动装配行业涨幅，否则这两法永远零触发。
+// English: dragon/dragon_return need sector context; without it their max score stays under
+// the trigger line, so replay auto-enables industry assembly whenever they are selected.
+func strategyNeedsIndustry(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "dragon", "dragon_return":
+		return true
+	}
+	return false
+}
+
 // newAdapter 根据参数构建对应战法适配器。
 // 关键：必须给策略注入 config.Manager（否则 strategyCfg() 返回全零配置，
 // 所有权重/倍数为 0，导致 total 恒 0、永不触发）。这里用 NewManager("") 取得出厂默认配置。
@@ -575,6 +588,15 @@ func (o *Options) Run() error {
 	// English: "all" replays every enabled factor AND pattern rule in one pass — used by the nightly
 	// library_replay step so auto-research regression-tests live strategies nightly.
 	var ads []adapter
+	// 行业板块装配开关：显式 Industry 或任一入选战法依赖板块（见 strategyNeedsIndustry）。
+	useIndustry := o.Industry
+	needsInd := func(names ...string) {
+		for _, n := range names {
+			if strategyNeedsIndustry(n) {
+				useIndustry = true
+			}
+		}
+	}
 	if o.CandidateID > 0 && strings.EqualFold(o.Strategy, "pattern") {
 		// 候选直读模式（§8.6-B）：候选 Factors JSON 即 []PatternCond（与 ApplyPatternRule 同映射），
 		// 构造单条规则走与实盘一致的 Evaluate 回放；战法库为空/未审批均不影响。
@@ -616,8 +638,10 @@ func (o *Options) Run() error {
 		// 四大手写战法一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape）：
 		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。
 		// English: include the four hand-written strategies in the all-replay as well.
-		for _, name := range []string{"double_bump", "dragon", "dragon_return", "n_shape"} {
-			ad, aerr := newAdapter(name, o.Industry, o.D1Score)
+		builtins := []string{"double_bump", "dragon", "dragon_return", "n_shape"}
+		needsInd(builtins...)
+		for _, name := range builtins {
+			ad, aerr := newAdapter(name, useIndustry, o.D1Score)
 			if aerr != nil {
 				return aerr
 			}
@@ -640,7 +664,8 @@ func (o *Options) Run() error {
 		}
 		log.Printf("战法库已加载 %d 条启用规则", len(ads))
 	} else {
-		ad, err := newAdapter(o.Strategy, o.Industry, o.D1Score)
+		needsInd(o.Strategy)
+		ad, err := newAdapter(o.Strategy, useIndustry, o.D1Score)
 		if err != nil {
 			return err
 		}
@@ -650,7 +675,7 @@ func (o *Options) Run() error {
 	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
 	indMap := map[string]string{}
 	industryChg := map[string]map[string]float64{} // code -> date -> ChangePct
-	if o.Industry {
+	if useIndustry {
 		if m, err := db.Industries(); err == nil {
 			indMap = m
 		}
