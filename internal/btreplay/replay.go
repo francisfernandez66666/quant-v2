@@ -83,7 +83,7 @@ type doubleBumpAdapter struct {
 }
 
 // Name 战法名（回测报告分组键）。
-func (a *doubleBumpAdapter) Name() string { return "DoubleBump" }
+func (a *doubleBumpAdapter) Name() string { return "双响炮" }
 
 // Trigger 纯日K完整回放：复用实盘 EvaluateReal 判定（≥10 根 K 线且总分≥70 触发），
 // 入场评分明细带阶段最高价（移动止盈基准）。
@@ -136,7 +136,7 @@ type dragonReturnAdapter struct {
 }
 
 // Name 战法名（回测报告分组键）。
-func (a *dragonReturnAdapter) Name() string { return "DragonReturn" }
+func (a *dragonReturnAdapter) Name() string { return "龙回头" }
 
 // Trigger 日K派生 StockData 后走实盘 Evaluate（≥30 根 K 线）；入场明细带阶段最高价。
 func (a *dragonReturnAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[string]float64, bool) {
@@ -182,7 +182,7 @@ type nShapeAdapter struct {
 }
 
 // Name 战法名（回测报告分组键）。
-func (a *nShapeAdapter) Name() string { return "NShape" }
+func (a *nShapeAdapter) Name() string { return "N形" }
 
 // Trigger 用日K近似构造 n_shape 的评分输入：WaveA=前一交易日，IntradayB=当日近似，
 // Ctx 只注入规则 D1 分（无 LLM/板块/事件数据）。仅 full_chain（D1>0 且总分≥60）触发。
@@ -261,7 +261,7 @@ type dragonAdapter struct {
 }
 
 // Name 战法名（回测报告分组键）。
-func (a *dragonAdapter) Name() string { return "Dragon" }
+func (a *dragonAdapter) Name() string { return "龙头" }
 
 // Trigger 复用实盘 EvaluateReal（≥5 根 K 线且总分≥70 触发）；行业涨幅近似板块共振，
 // 入场明细带封板价（炸板回落基准）与阶段最高价。
