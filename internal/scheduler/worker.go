@@ -7,14 +7,15 @@
 package scheduler
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -423,21 +424,41 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	timeout := time.Duration(cfg.StepTimeoutMin) * time.Minute
 	if timeout <= 0 {
 		timeout = 90 * time.Minute
+		// 战法库全量回放合法耗时较长且过程有进度输出——未显式配置时放宽至 3h，
+		// 显式配置 StepTimeoutMin 时以配置为准。English: replay tasks default to 3h unless configured.
+		if tk.Type == store.TaskBacktestStrategy {
+			timeout = 3 * time.Hour
+		}
 	}
 	runCtx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, bin, args...)
 	cmd.Dir = dirOfDB(cfg)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		fail("打开子进程输出失败: " + err.Error())
+
+	// 输出文件化（架构修复，根除管道死锁）：子进程 stdout/stderr 直写每任务日志文件。
+	// 旧"StdoutPipe+扫描协程"链路一旦消费端停摆（journald 抖动/诊断性 QUIT 巨量输出），
+	// 64KB 管道灌满 → 子进程冻结在 write → 零进度 → 看门狗误杀（#16 实录）。
+	// 写文件永不阻塞；worker 以尾随方式增量解析进度，完整日志同时留存排障。
+	// English: file-based output — the child writes to a per-task log file (never blocks), and the
+	// worker tails it incrementally for progress parsing; full log kept on disk for debugging.
+	logDir := filepath.Join(filepath.Dir(func() string {
+		p := cfg.DB
+		if p == "" {
+			p = defaultDB()
+		}
+		return p
+	}()), "task_logs")
+	_ = os.MkdirAll(logDir, 0o755)
+	logPath := filepath.Join(logDir, fmt.Sprintf("task_%d.log", tk.ID))
+	lf, lerr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if lerr != nil {
+		fail("创建任务日志失败: " + lerr.Error())
 		return
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		fail("打开子进程错误输出失败: " + err.Error())
-		return
-	}
+	defer lf.Close()
+	cmd.Stdout = lf
+	cmd.Stderr = lf
+
 	if err := cmd.Start(); err != nil {
 		fail("启动子进程失败: " + err.Error())
 		return
@@ -451,39 +472,94 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		cancel()
 	}
 
-	// 输出收集 + 进度解析（stdout/stderr 合并按行处理）
+	// 输出收集 + 进度解析：尾随任务日志文件（2s 周期，断行缓存跨读拼接）
 	var rs struct {
 		mu       sync.Mutex
 		out      bytes.Buffer
 		progress string
+		off      int64
+		carry    string
 	}
-	scan := func(r io.Reader) {
-		br := bufio.NewReader(r)
-		for {
-			line, rerr := br.ReadString('\n')
-			if len(line) > 0 {
-				rs.mu.Lock()
-				rs.out.WriteString(line)
-				rs.mu.Unlock()
-				log.Printf("[task#%d:%s] %s", tk.ID, tk.Type,
-					strings.TrimRight(line, "\r\n"))
-				if m := taskProgressRe.FindStringSubmatch(line); len(m) == 2 {
-					rs.mu.Lock()
-					rs.progress = m[1] + "%"
-					rs.mu.Unlock()
-					s.mu.Lock()
-					s.lastProgress = time.Now().Unix()
-					s.mu.Unlock()
-					_ = db.UpdateTaskRunState(tk.ID, store.TaskRunning, m[1]+"%", 0, "", "")
-				}
-			}
-			if rerr != nil {
-				return
-			}
+	handleLine := func(line string) {
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return
+		}
+		rs.mu.Lock()
+		rs.out.WriteString(line)
+		rs.out.WriteString("\n")
+		rs.mu.Unlock()
+		log.Printf("[task#%d:%s] %s", tk.ID, tk.Type, line)
+		if m := taskProgressRe.FindStringSubmatch(line); len(m) == 2 {
+			rs.mu.Lock()
+			rs.progress = m[1] + "%"
+			rs.mu.Unlock()
+			s.mu.Lock()
+			s.lastProgress = time.Now().Unix()
+			s.mu.Unlock()
+			_ = db.UpdateTaskRunState(tk.ID, store.TaskRunning, m[1]+"%", 0, "", "")
 		}
 	}
-	done := make(chan struct{})
-	go func() { scan(stdout); scan(stderr); close(done) }()
+	tailFile := func() {
+		lr, err := os.Open(logPath)
+		if err != nil {
+			return
+		}
+		defer lr.Close()
+		rs.mu.Lock()
+		off := rs.off
+		rs.mu.Unlock()
+		st, serr := lr.Stat()
+		if serr != nil || st.Size() <= off {
+			return
+		}
+		if _, err := lr.Seek(off, 0); err != nil {
+			return
+		}
+		data := make([]byte, st.Size()-off)
+		n, _ := io.ReadFull(lr, data)
+		chunk := rs.carry + string(data[:n])
+		lines := strings.Split(chunk, "\n")
+		rs.mu.Lock()
+		rs.carry = lines[len(lines)-1]
+		rs.off += int64(n)
+		rs.mu.Unlock()
+		for _, ln := range lines[:len(lines)-1] {
+			handleLine(ln)
+		}
+	}
+	tailStop := make(chan struct{})
+	tailDone := make(chan struct{})
+	go func() {
+		defer close(tailDone)
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-tailStop:
+				tailFile() // 收尾冲刷最后一段（含无换行的尾部）
+				for {      // 持续读到 EOF 稳定，确保汇总数据完整
+					rs.mu.Lock()
+					off := rs.off
+					beforeOut := rs.out.Len()
+					rs.mu.Unlock()
+					st, serr := os.Stat(logPath)
+					if serr != nil || st.Size() <= int64(off) {
+						return
+					}
+					tailFile()
+					rs.mu.Lock()
+					afterOut := rs.out.Len()
+					rs.mu.Unlock()
+					if afterOut == beforeOut && rs.off == off {
+						return
+					}
+				}
+			case <-t.C:
+				tailFile()
+			}
+		}
+	}()
 
 	// 控制标志轮询（~2s）：API 只写 control 列，这里消费并转成进程信号。
 	quit := make(chan struct{})
@@ -579,9 +655,9 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	}
 
 	waitErr := cmd.Wait()
-	<-done
-	close(quit)
-	cancel() // 唤醒可能阻塞在 select 的轮询 goroutine
+	close(tailStop)
+	<-tailDone
+	cancel() // 唤醒可能阻塞在 select 的控制轮询 goroutine
 
 	rs.mu.Lock()
 	progress := rs.progress
