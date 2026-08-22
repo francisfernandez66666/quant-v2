@@ -48,35 +48,34 @@ func cfgSamples(fakeBin, db string) config.SchedulerConfig {
 func TestNightlyEligible(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	cfg := cfgSamples("fake", "/tmp/x.db")
-	tue := time.Date(2026, 8, 18, 16, 0, 0, 0, loc) // 周二 16:00 盘后
-	if !NightlyEligible(tue, cfg) {
-		t.Error("工作日盘后 16:00 应可启动夜间作业")
+
+	// 会话模型驱动（无写死钟点）：盘前/上午盘/午前/下午盘 → 禁止；盘后/休市 → 允许
+	// English: session-model driven — blocked in premarket/trading windows, allowed after close/closed.
+	cases := []struct {
+		t    time.Time
+		want bool
+		note string
+	}{
+		{time.Date(2026, 8, 18, 16, 0, 0, 0, loc), true, "周二16:00 盘后"},
+		{time.Date(2026, 8, 18, 10, 0, 0, 0, loc), false, "周二10:00 上午盘"},
+		{time.Date(2026, 8, 18, 15, 5, 0, 0, loc), true, "周二15:05 收盘即盘后"},
+		{time.Date(2026, 8, 18, 9, 0, 0, 0, loc), false, "周二09:00 盘前（归 quant 新闻归因）"},
+		{time.Date(2026, 8, 18, 12, 0, 0, 0, loc), false, "周二12:00 午前"},
+		{time.Date(2026, 8, 19, 2, 0, 0, 0, loc), true, "周三02:00 凌晨休市"},
+		{time.Date(2026, 8, 22, 16, 0, 0, 0, loc), true, "周六16:00"},
+		{time.Date(2026, 8, 22, 10, 0, 0, 0, loc), true, "周六上午10:00（非交易日无盘中，实录回归）"},
 	}
-	morning := time.Date(2026, 8, 18, 10, 0, 0, 0, loc) // 周二 10:00 盘中
-	if NightlyEligible(morning, cfg) {
-		t.Error("盘中 10:00 不应启动夜间作业")
+	for _, tc := range cases {
+		if got := NightlyEligible(tc.t, cfg); got != tc.want {
+			t.Errorf("%s: got %v want %v", tc.note, got, tc.want)
+		}
 	}
-	early := time.Date(2026, 8, 18, 15, 10, 0, 0, loc) // 15:10 盘后但未到 15:30
-	if NightlyEligible(early, cfg) {
-		t.Error("15:10 未到启动时间(15:30)，不应启动")
-	}
-	sat := time.Date(2026, 8, 22, 16, 0, 0, 0, loc) // 周六 16:00
-	if !NightlyEligible(sat, cfg) {
-		t.Error("周末 16:00 应可启动夜间作业")
-	}
-	// 非交易日全天可跑（2026-08-22 实录：周六上午点回测被干等到 15:30，违背"保护盘中"本意）
-	satAm := time.Date(2026, 8, 22, 10, 0, 0, 0, loc)
-	if !NightlyEligible(satAm, cfg) {
-		t.Error("非交易日上午 10:00 无盘中概念，应允许执行研究")
-	}
-	// 自定义交易日启动时间 20:00
+
+	// StartHHMM 已废弃：盘后时段不受自定义启动时刻拦截
 	cfg2 := cfg
 	cfg2.Nightly.StartHHMM = 2000
-	if NightlyEligible(time.Date(2026, 8, 18, 18, 0, 0, 0, loc), cfg2) {
-		t.Error("自定义启动时间 20:00，18:00 不应启动")
-	}
-	if !NightlyEligible(time.Date(2026, 8, 18, 20, 1, 0, 0, loc), cfg2) {
-		t.Error("20:01 应启动")
+	if !NightlyEligible(time.Date(2026, 8, 18, 18, 0, 0, 0, loc), cfg2) {
+		t.Error("18:00 已是盘后，StartHHMM=2000 不应再拦截")
 	}
 }
 

@@ -4,7 +4,7 @@
 //   - quant(API) 与夜间作业只把任务写入 trading.db 的 research_tasks 队列；
 //     本服务是唯一出队执行者——单飞由架构保证，不再有第二个编排者；
 //   - 交易时段硬门控（需求#4）：NightlyEligible 对一切任务生效（含手动 high）——
-//     绝不进入 A 股活跃时段；交易日盘后(StartHHMM)起可跑，非交易日全天可跑；
+//     绝不进入 A 股活跃时段；盘后/休市归研究，无写死钟点；
 //   - 优先级抢占（决策#1）：high 入队时若 low 在跑 → kill 当前子进程并标 preempted
 //     （断点缓存有效，自动回队首续跑）；
 //   - 资源治理（需求#5）：所有研究子进程继承本服务的 cgroup 限流
@@ -302,21 +302,23 @@ func dirOfDB(cfg config.SchedulerConfig) string {
 }
 
 // NightlyEligible 纯函数：当前时刻是否允许执行任何研究任务（含手动 high）。
-// 硬约束只有一条：绝不进入 A 股活跃交易时段（需求#4 的本意是保护盘中）。
-// 启动时刻阈值仅对交易日生效（15:30 收盘数据就绪后再跑）；非交易日/节假日
-// 没有"盘中"概念，全天允许——否则周六上午点回测要干等到 15:30，违背直觉。
-// （WeekendStartHHMM 配置保留但不再作为门控，见下方说明。）
-// English: the only hard constraint is staying out of active A-share sessions; the start-time
-// threshold applies to trading days only (post-close data readiness). Non-trading days allow
-// research all day — a Saturday-morning manual backtest must not wait until 15:30.
+// 门控完全由系统会话模型驱动（data.CurrentSession），不含任何写死钟点：
+//   - 盘前/上午盘/午前/下午盘 → 禁止（这段时间归 quant：新闻归因流水线 + 近实时打分）
+//   - 盘后(15:00 收盘后)/休市(周末·节假日·凌晨) → 允许
+//
+// 与 quant 自身的时段判断共用同一谓词集合，两边永远一致，不会出现"日历说休市、
+// 时钟却拦着"的错位。cfg 参数保留以兼容调用方与测试（门控不再消费钟点配置，
+// Nightly.StartHHMM / WeekendStartHHMM 已废弃）。
+// English: gate driven purely by the session model — blocked during premarket/trading windows
+// (quant owns those), allowed after close and on closed days. No hardcoded clock times.
 func NightlyEligible(now time.Time, cfg config.SchedulerConfig) bool {
-	if data.IsActiveSession(now) {
+	_ = cfg // 会话化后不再消费钟点配置（kept for call-site stability）
+	switch data.CurrentSession(now) {
+	case data.SessionAfterMarket, data.SessionClosed:
+		return true
+	default: // 盘前/上午盘/午前/下午盘：归 quant
 		return false
 	}
-	if data.IsTradingDay(now) {
-		return now.Hour()*100+now.Minute() >= cfg.Nightly.StartHHMM
-	}
-	return true // 非交易日：全天可跑（no sessions on weekends/holidays）
 }
 
 // TradingDataloadDue 纯函数：交易时段是否应触发一轮增量下载（按间隔节流）。
