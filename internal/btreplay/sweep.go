@@ -53,6 +53,7 @@ type sweepTrigger struct {
 // sweepResult 单个组合的单战法汇总。
 type sweepResult struct {
 	Name           string
+	Kind           string  // 规则 ID（fac_N/pat_N）；内置战法为空
 	Trail          float64 `json:"trail_pct"`
 	Hold           int     `json:"hold_days"`
 	MinScore       float64 `json:"min_score"`
@@ -142,12 +143,19 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		}
 		total += len(perAdCombos[ai])
 	}
+	// 规则 ID 提取（ruleEvalAdapter 实现 kindProvider；内置战法无 → 空）
+	kindOf := func(ai int) string {
+		if kp, ok := ads[ai].(kindProvider); ok {
+			return kp.Kind()
+		}
+		return ""
+	}
 	var all []sweepResult
 	done := 0
 	lastPct := -10
 	for ai, ad := range ads {
 		for _, cb := range perAdCombos[ai] {
-			all = append(all, simulateCombo(ad.Name(), triggers[ai], klines, cb.trail, cb.hold, cb.score))
+			all = append(all, simulateCombo(ad.Name(), kindOf(ai), triggers[ai], klines, cb.trail, cb.hold, cb.score))
 			done++
 			if pct := done * 100 / total; pct >= lastPct+10 { // 每 10% 进度行（worker 尾随喂狗）
 				lastPct = pct
@@ -248,9 +256,9 @@ func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KL
 // 指标聚合与 summarize() 同口径（胜率/平均盈亏/盈亏比/平均持仓）。
 // English: one combo simulation — score filter, greedy non-overlapping entries per stock,
 // uniform trailing+timeout exit; metrics aggregated exactly like summarize().
-func simulateCombo(name string, trigs []sweepTrigger, klines map[string][]data.KLine,
+func simulateCombo(name, kind string, trigs []sweepTrigger, klines map[string][]data.KLine,
 	trailPct float64, maxHold int, minScore float64) sweepResult {
-	res := sweepResult{Name: name, Trail: trailPct, Hold: maxHold, MinScore: minScore}
+	res := sweepResult{Name: name, Kind: kind, Trail: trailPct, Hold: maxHold, MinScore: minScore}
 	nextFree := map[string]int{} // code -> 可再入场的最早下标
 	var winSum, lossSum float64
 	for _, t := range trigs {
@@ -345,7 +353,7 @@ func rankedJSON(all *[]sweepResult, order []int) []map[string]any {
 	for pos, idx := range order {
 		r := (*all)[idx]
 		out = append(out, map[string]any{
-			"rank": pos + 1, "strategy": r.Name,
+			"rank": pos + 1, "strategy": r.Name, "strategy_kind": r.Kind,
 			"params":   map[string]any{"trail_pct": r.Trail, "hold_days": r.Hold, "min_score": r.MinScore},
 			"win_rate": r.WinRate, "profit_factor": r.ProfitFactor,
 			"trigger_count": r.Count, "avg_hold_days": r.AvgHold,

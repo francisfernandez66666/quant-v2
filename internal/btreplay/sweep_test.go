@@ -79,11 +79,11 @@ func TestSimulateComboFilterAndOverlap(t *testing.T) {
 		{code: "600000", sigIdx: 7, entry: 105, score: 40, highest: 105}, // 门槛 50 → 过滤
 		{code: "600000", sigIdx: 7, entry: 105, score: 60, highest: 105},
 	}
-	res := simulateCombo("测试", trigs[:2], kls, 8, 30, 0)
+	res := simulateCombo("测试", "", trigs[:2], kls, 8, 30, 0)
 	if res.Count != 1 {
 		t.Fatalf("重叠过滤失败 count=%d", res.Count)
 	}
-	res2 := simulateCombo("测试", trigs, kls, 8, 30, 50)
+	res2 := simulateCombo("测试", "", trigs, kls, 8, 30, 50)
 	if res2.Count != 2 { // #3 被 50 门槛过滤，#4 通过且与首笔已平仓不重叠
 		t.Fatalf("门槛过滤失败 count=%d", res2.Count)
 	}
@@ -91,7 +91,7 @@ func TestSimulateComboFilterAndOverlap(t *testing.T) {
 		t.Fatalf("指标聚合异常: %+v", res2)
 	}
 	// 无分维度（score=-1）不被门槛过滤
-	res3 := simulateCombo("形态", []sweepTrigger{{code: "600000", sigIdx: 0, entry: 110, score: -1, highest: 100}},
+	res3 := simulateCombo("形态", "pat_9", []sweepTrigger{{code: "600000", sigIdx: 0, entry: 110, score: -1, highest: 100}},
 		kls, 8, 30, 80)
 	if res3.Count != 1 {
 		t.Fatalf("无分战法被误过滤")

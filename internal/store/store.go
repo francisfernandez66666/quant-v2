@@ -125,6 +125,23 @@ func (d *DB) migrate() error {
 			horizon INTEGER,
 			reason TEXT
 		)`,
+		// 参数扫参结果（§P2-c）：optimize 任务 TOP-N 排名，审批后转规则级参数覆盖。
+		// English: parameter-sweep rankings per task; approvals become rule-level overrides.
+		`CREATE TABLE IF NOT EXISTS optimization_results (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_id INTEGER NOT NULL,
+			rank INTEGER NOT NULL,
+			strategy TEXT NOT NULL,
+			strategy_kind TEXT DEFAULT '',
+			params TEXT NOT NULL,
+			objective TEXT DEFAULT '',
+			win_rate REAL DEFAULT 0,
+			profit_factor REAL DEFAULT 0,
+			avg_hold_days REAL DEFAULT 0,
+			trigger_count INTEGER DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+		)`,
 		// 板块历史（E5）：按行业聚合的板块日线（离线重建），供形态战法回测与因子环境分组。
 		// English: sector daily history (E5) — per-industry aggregated board daily bars, rebuilt offline
 		// from daily+stk_limit, used for pattern backtests and factor environment grouping.
@@ -317,6 +334,7 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_stklimit_date ON stk_limit(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_fina_code ON fina_indicator(ts_code)`,
 		`CREATE INDEX IF NOT EXISTS idx_sector_date ON sector_history(trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_optres_task ON optimization_results(task_id)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {

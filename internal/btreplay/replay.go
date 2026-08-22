@@ -479,13 +479,20 @@ func newAdapter(name string, industry bool, d1 float64) (adapter, error) {
 // interpretation), identical to the 8a/8b live path. Exits use the generic trailing-stop + timeout,
 // matching the live fallback for unknown strategies. One adapter per enabled rule; results group by name.
 type ruleEvalAdapter struct {
-	name string // 规则显示名（如 "因子战法#1"）
-	fs   *factor.FactorStrategy
-	ps   *pattern.PatternStrategy
+	name   string // 规则显示名（如 "因子战法#1"）
+	ruleID string // 规则唯一 ID（fac_<n>/pat_<n>；扫参审批回写参数覆盖的定位键）
+	fs     *factor.FactorStrategy
+	ps     *pattern.PatternStrategy
 }
 
 // Name 返回规则显示名（如"因子战法#1"/"形态战法#2"），作为回测报告的分组键。
 func (a *ruleEvalAdapter) Name() string { return a.name }
+
+// kindProvider 可选接口：返回规则 ID（内置战法无此实现）。
+type kindProvider interface{ Kind() string }
+
+// Kind 返回规则唯一 ID（fac_<n>/pat_<n>），扫参排名落库与审批定位用。
+func (a *ruleEvalAdapter) Kind() string { return a.ruleID }
 
 // Trigger 用截止当日（含）的日K构造 StockMarketData，走实盘 Evaluate 判定是否触发买入。
 // English: builds StockMarketData from bars up to the day and runs the live Evaluate as the trigger.
@@ -560,7 +567,7 @@ func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 		for _, r := range rules {
 			fs := factor.New()
 			fs.SetRules([]*factor.ActiveRule{r})
-			out = append(out, &ruleEvalAdapter{name: r.Name, fs: fs})
+			out = append(out, &ruleEvalAdapter{name: r.Name, ruleID: r.ID, fs: fs})
 		}
 		return out, nil
 	case "pattern", "pattern_rules", "applied_patterns":
@@ -572,7 +579,7 @@ func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 		for _, r := range rules {
 			ps := pattern.New()
 			ps.SetRules([]*pattern.ActivePattern{r})
-			out = append(out, &ruleEvalAdapter{name: r.Name, ps: ps})
+			out = append(out, &ruleEvalAdapter{name: r.Name, ruleID: r.ID, ps: ps})
 		}
 		return out, nil
 	}
@@ -620,7 +627,7 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 		}
 		ps := pattern.New()
 		ps.SetRules([]*pattern.ActivePattern{rule})
-		ads = []adapter{&ruleEvalAdapter{name: rule.Name, ps: ps}}
+		ads = []adapter{&ruleEvalAdapter{name: rule.Name, ruleID: rule.ID, ps: ps}}
 		log.Printf("候选直读回放：%s 条件=%d", rule.Name, len(rule.Conds))
 	} else if strings.EqualFold(o.Strategy, "all") {
 		fa, ferr := loadRuleAdapters("factor", o.DataDir)

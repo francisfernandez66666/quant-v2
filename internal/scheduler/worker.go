@@ -90,6 +90,34 @@ func parseBtSummary(out string) string {
 	return strings.Join(rows, "\n")
 }
 
+// sweepJSONRe 匹配子进程输出的机器可读扫参结果行。
+var sweepJSONRe = regexp.MustCompile(`(?m)^SWEEP_JSON:(\{.*\})\s*$`)
+
+// saveSweepResults 解析 optimize 任务输出的 SWEEP_JSON，把排名落 optimization_results。
+// 失败只记日志不回滚任务状态——排名表是展示/审批增强，主结果在 result_text 已保底。
+// English: parses SWEEP_JSON and persists rankings; failures are logged without failing the task.
+func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
+	m := sweepJSONRe.FindStringSubmatch(out)
+	if len(m) != 2 {
+		return
+	}
+	var payload struct {
+		Objective string           `json:"objective"`
+		Total     int              `json:"total"`
+		Results   []map[string]any `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(m[1]), &payload); err != nil {
+		log.Printf("[scheduler] 任务 #%d SWEEP_JSON 解析失败: %v", taskID, err)
+		return
+	}
+	if err := db.SaveOptimizationResults(taskID, payload.Objective, payload.Results); err != nil {
+		log.Printf("[scheduler] 任务 #%d 扫参排名落库失败: %v", taskID, err)
+		return
+	}
+	log.Printf("[scheduler] 任务 #%d 扫参排名已落库：%d 条（目标 %s）",
+		taskID, len(payload.Results), payload.Objective)
+}
+
 // openStore 懒加载队列库句柄；首次打开执行启动恢复（崩溃遗留 running→preempted 自动续跑）。
 func (s *Scheduler) openStore(cfg config.SchedulerConfig) *store.DB {
 	s.mu.Lock()
@@ -742,8 +770,11 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			}
 		case store.TaskBacktestStrategy:
 			if m := strings.SplitN(fullOut, "参数优化目标:", 2); len(m) == 2 {
-				// §P2 扫参任务：报告段（目标/排名/SWEEP_JSON）原样作为 result_text
-				resultText = "参数优化目标:" + strings.SplitN(m[1], "\nSWEEP_JSON:", 2)[0]
+				// §P2 扫参任务：报告段（目标/排名）作为 result_text；
+				// SWEEP_JSON 解析后 TOP-N 落 optimization_results（「优化结果」页数据源）。
+				report := strings.SplitN(m[1], "\nSWEEP_JSON:", 2)
+				resultText = "参数优化目标:" + report[0]
+				s.saveSweepResults(db, tk.ID, m[1])
 			} else {
 				resultText = parseBtSummary(fullOut)
 			}
