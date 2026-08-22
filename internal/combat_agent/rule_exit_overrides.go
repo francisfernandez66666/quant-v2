@@ -77,3 +77,14 @@ func ruleExitParamsFor(strategy string) *ruleExitOverride {
 	}
 	return &ov
 }
+
+// RuleExitOverrideFor 导出查询：按持仓 Strategy 字符串取规则级出场覆盖（供引擎层测试/诊断）。
+// ok=false 表示无覆盖，调用方回退全局默认。
+// English: exported lookup for rule-level exit overrides by strategy string.
+func RuleExitOverrideFor(strategyName string) (trailPct float64, holdDays int, ok bool) {
+	ov := ruleExitParamsFor(strategyName)
+	if ov == nil {
+		return 0, 0, false
+	}
+	return ov.trailPct, ov.holdDays, true
+}
