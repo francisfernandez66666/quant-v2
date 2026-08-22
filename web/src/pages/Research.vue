@@ -82,19 +82,57 @@
           {{ loadingLibrary ? '加载中...' : '刷新' }}
         </button>
       </div>
-      <!-- 运行中内置形态战法（引擎常驻，不经战法库文件）：一键历史回放（§用户反馈） -->
-      <div class="builtin-patterns" style="margin:8px 0 12px">
-        <div style="font-size:13px;color:var(--muted,#888);margin-bottom:6px">
-          运行中内置形态战法（实盘常驻，点「回测」跑历史日K回放，结果进「回测」tab）：
+      <!-- §P1-c 横排四卡：内置形态战法（名称+最新回测摘要；点击定位到下方列表行并展开详情） -->
+      <div class="builtin-cards">
+        <div v-for="b in builtinPatterns" :key="'card-' + b.id" class="bcard"
+             :class="{ active: expandedStrategy === 'bt:' + b.id }"
+             @click="selectStrategy('bt:' + b.id)">
+          <div class="bcard-name">{{ b.name }}</div>
+          <div class="bcard-sub">{{ summarizeJob(latestLibJob(b.id, -1)) }}</div>
         </div>
-        <button v-for="b in builtinPatterns" :key="b.id" class="btn-backtest"
-                style="margin-right:8px" @click="doLibraryBacktest(b)">
-          回测·{{ b.name }}
-        </button>
       </div>
-      <div v-if="library.length === 0" class="empty">暂无已应用因子战法。审批通过的因子候选会自动加入战法库并注入 8a/8b 实盘。</div>
-      <div v-else class="library-list">
-        <div v-for="s in library" :key="s.id" class="library-card">
+
+      <!-- §P1-c 统一列表·组1：内置形态战法（引擎常驻，不经库文件） -->
+      <div class="lib-group-title">内置形态战法（{{ builtinPatterns.length }}）</div>
+      <div class="library-list">
+        <div v-for="b in builtinPatterns" :key="'bt-' + b.id"
+             :ref="el => setStrategyRef('bt:' + b.id)" class="library-card lib-builtin">
+          <div class="lib-head">
+            <span class="lib-name">{{ b.name }}</span>
+            <span class="tag tag-kind kind-factor">内置</span>
+            <span class="tag status-applied">实盘常驻</span>
+            <span class="lib-time">最新: {{ summarizeJob(latestLibJob(b.id, -1)) }}</span>
+          </div>
+          <div class="lib-actions">
+            <button class="btn-backtest" @click="doLibraryBacktest(b)">回测此战法</button>
+            <button class="btn-toggle" @click="selectStrategy('bt:' + b.id)">
+              {{ expandedStrategy === 'bt:' + b.id ? '收起详情' : '详情' }}
+            </button>
+          </div>
+          <!-- 展开详情：运行中进度条 / 最近一次完整汇总报告 -->
+          <div class="lib-detail" v-if="expandedStrategy === 'bt:' + b.id">
+            <div class="lib-detail-text dim" v-if="!latestLibJob(b.id, -1)">
+              尚未回测——点「回测此战法」发起历史日K回放（结果进「回测」tab）
+            </div>
+            <template v-else>
+              <div class="bt-progress" v-if="['running','queued','interrupted'].includes(latestLibJob(b.id,-1).status)">
+                <div class="bt-progress-bar"><div class="bt-progress-fill" :style="{ width: jobPct(latestLibJob(b.id,-1)) }"></div></div>
+                <span class="bt-progress-label">{{ jobPct(latestLibJob(b.id,-1)) }}</span>
+              </div>
+              <pre class="lib-detail-text" v-else-if="latestLibJob(b.id,-1).result_text">{{ latestLibJob(b.id,-1).result_text }}</pre>
+              <div class="lib-detail-text dim" v-else-if="latestLibJob(b.id,-1).status === 'error'">上次回测失败：{{ latestLibJob(b.id,-1).error }}</div>
+              <div class="lib-detail-text dim" v-else>暂无已完成回测报告</div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- §P1-c 统一列表·组2/3：因子战法 / 形态战法（同一卡片体，按 kind 分组渲染） -->
+      <div v-if="ruleGroups.length === 0" class="empty">暂无已应用因子/形态战法。审批通过的候选会自动加入战法库并注入实盘。</div>
+      <template v-for="g in ruleGroups" :key="'g-' + g.key">
+        <div class="lib-group-title">{{ g.title }}（{{ g.items.length }}）</div>
+        <div class="library-list">
+        <div v-for="s in g.items" :key="g.key + ':' + s.id" class="library-card">
           <div class="lib-head">
             <span class="lib-name" v-if="!editingName[s.id]">{{ s.name }}</span>
             <input
@@ -108,7 +146,7 @@
             <span :class="['tag', 'tag-kind', s.kind === 'pattern' ? 'kind-pattern' : 'kind-factor']">{{ s.kind === 'pattern' ? '形态' : '因子' }}</span>
             <span :class="['tag', s.enabled ? 'status-applied' : 'status-rejected']">{{ s.enabled ? '已启用' : '已停用' }}</span>
             <span class="lib-id">{{ s.id }}</span>
-            <span class="lib-time">{{ s.applied_at }}</span>
+            <span class="lib-time">{{ s.applied_at }}｜最新: {{ summarizeJob(latestLibJob(s.kind, ruleNum(s.id))) }}</span>
           </div>
           <!-- 因子战法：因子方向 + 权重；形态战法：条件集 -->
           <div class="lib-factors">
@@ -154,10 +192,19 @@
             </button>
             <!-- 阶段3.4 战法库回测入口：对该规则跑历史回放回测（结果进「回测」tab） -->
             <button class="btn-backtest" @click="doLibraryBacktest(s)">回测此战法</button>
+            <button class="btn-toggle" @click="selectStrategy('rule:' + s.id)">
+              {{ expandedStrategy === 'rule:' + s.id ? '收起详情' : '详情' }}
+            </button>
             <button class="btn-reject" @click="removeLibrary(s)">删除</button>
           </div>
+          <!-- §P1-c 展开详情：该规则最近一次完整汇总报告 -->
+          <div class="lib-detail" v-if="expandedStrategy === 'rule:' + s.id">
+            <pre class="lib-detail-text" v-if="latestLibJob(s.kind, ruleNum(s.id)) && latestLibJob(s.kind, ruleNum(s.id)).result_text">{{ latestLibJob(s.kind, ruleNum(s.id)).result_text }}</pre>
+            <div class="lib-detail-text dim" v-else>暂无回测报告——点「回测此战法」发起</div>
+          </div>
         </div>
-      </div>
+        </div>
+      </template>
     </div>
     </template>
 
@@ -947,6 +994,50 @@ async function doResumeBacktest(id) {
 // ── 阶段3.4 战法库回测入口 ──
 let libPollTimer = null
 
+// ═══ §P1-c 战法库统一列表：分组 / 定位展开 / 最新回测挂载 ═══
+const expandedStrategy = ref('')          // 当前展开详情的战法（'bt:<id>' 内置 / 'rule:<id>' 库规则）
+const strategyRefs = {}                   // 列表行 DOM 引用（横排四卡点击后平滑定位用）
+function setStrategyRef(key) { return el => { if (el) strategyRefs[key] = el } }
+/** 点卡片/详情键：切换展开，并平滑滚动到对应列表行 */
+function selectStrategy(key) {
+  expandedStrategy.value = expandedStrategy.value === key ? '' : key
+  const el = strategyRefs[key]
+  if (expandedStrategy.value && el && el.scrollIntoView) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
+}
+const libGroupFactors = computed(() => library.value.filter(s => s.kind !== 'pattern'))
+const libGroupPatterns = computed(() => library.value.filter(s => s.kind === 'pattern'))
+const ruleGroups = computed(() => [
+  { key: 'factor', title: '因子战法', items: libGroupFactors.value },
+  { key: 'pattern', title: '形态战法', items: libGroupPatterns.value },
+].filter(g => g.items.length))
+/** 规则 ID（fac_12/pat_7）→ 序号；解析失败返回 -1（latestLibJob 里忽略序号过滤） */
+function ruleNum(id) {
+  const n = parseInt(String(id || '').replace(/^[a-z]+_/, ''), 10)
+  return Number.isFinite(n) ? n : -1
+}
+/** 某战法最近一次库回放任务：sk=内置战法名或 'factor'/'pattern'；num<0 时不过滤序号（内置用） */
+function latestLibJob(sk, num) {
+  let best = null
+  for (const j of backtestJobs.value) {
+    if (j.kind !== 'library' || (j.strategy_kind || '') !== sk) continue
+    if (num >= 0 && j.candidate_id !== num) continue
+    if (!best || (j.id || 0) > (best.id || 0)) best = j
+  }
+  return best
+}
+/** 任务 → 一句话摘要（卡片副标题/行尾"最新:"），多战法报告取首行并去掉标签括号 */
+function summarizeJob(j) {
+  if (!j) return '未回测'
+  if (j.status === 'running') return '回测中 ' + jobPct(j)
+  if (j.status === 'queued') return '排队中·盘后执行'
+  if (j.status === 'interrupted') return '已中断·可续跑'
+  if (j.status === 'error') return '回测失败'
+  const line = (j.result_text || '').split('\n')[0] || ''
+  return line.replace(/^【[^】]*】/, '').trim() || '已完成'
+}
+
 // 运行中内置形态战法（与后端 builtinStrategies 的序号映射一致）
 const builtinPatterns = [
   { id: 'double_bump', name: '双响炮' },
@@ -1239,6 +1330,19 @@ function stopPolling() {
 .btn-backtest:disabled { opacity: 0.5; cursor: wait; }
  .bt-result { font-size: 12px; font-weight: 600; align-self: center; }
  .bt-lib-result { white-space: pre-wrap; line-height: 1.7; font-weight: 500; }
+ /* §P1-c 横排四卡 + 分组标题 + 详情面板 */
+ .builtin-cards { display:flex; gap:10px; margin:8px 0 4px; flex-wrap:wrap; }
+ .bcard { flex:1 1 140px; min-width:130px; border:1px solid var(--border,#e5e7eb); border-radius:8px;
+          padding:8px 10px; cursor:pointer; transition:border-color .15s, box-shadow .15s; }
+ .bcard:hover { border-color:#3b82f6; }
+ .bcard.active { border-color:#3b82f6; box-shadow:0 0 0 2px rgba(59,130,246,.15); }
+ .bcard-name { font-weight:700; font-size:13px; }
+ .bcard-sub { font-size:11px; color:var(--muted,#888); margin-top:4px;
+              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+ .lib-group-title { font-size:13px; font-weight:700; color:var(--muted,#666); margin:14px 0 6px; }
+ .lib-detail { margin-top:8px; padding:8px 10px; background:var(--bg,#f8fafc); border-radius:6px; }
+ .lib-detail-text { font-size:12px; margin:0; white-space:pre-wrap; word-break:break-all; font-family:inherit; line-height:1.7; }
+ .lib-detail-text.dim { color:var(--muted,#888); }
  .bt-result.pos { color: #4caf50; }
  .bt-result.neg { color: #FF4D4F; }
  .bt-progress { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; width: 220px; }

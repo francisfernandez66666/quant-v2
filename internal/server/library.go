@@ -312,18 +312,24 @@ func taskToLegacyJob(t store.ResearchTask) store.BacktestJob {
 			kind = "candidate"
 		}
 	}
+	// §P1-c：透出回放子类型（内置战法名 / factor / pattern），前端按战法挂最新结果、失败重跑重建 ID。
+	sk := ""
+	if ks, ok := p["kind"].(string); ok {
+		sk = strings.ToLower(strings.TrimSpace(ks))
+	}
 	return store.BacktestJob{
-		ID:          t.ID,
-		Kind:        kind,
-		CandidateID: t.RefID,
-		Status:      apiStatusOf(t.Status),
-		Progress:    t.Progress,
-		AvgExcess:   t.ResultNum,
-		Error:       t.Error,
-		ResultText:  t.ResultText,
-		StartedAt:   t.StartedAt,
-		FinishedAt:  t.FinishedAt,
-		UpdatedAt:   t.UpdatedAt,
+		ID:           t.ID,
+		Kind:         kind,
+		CandidateID:  t.RefID,
+		StrategyKind: sk,
+		Status:       apiStatusOf(t.Status),
+		Progress:     t.Progress,
+		AvgExcess:    t.ResultNum,
+		Error:        t.Error,
+		ResultText:   t.ResultText,
+		StartedAt:    t.StartedAt,
+		FinishedAt:   t.FinishedAt,
+		UpdatedAt:    t.UpdatedAt,
 	}
 }
 
