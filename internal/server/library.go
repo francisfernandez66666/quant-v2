@@ -313,6 +313,7 @@ func taskToLegacyJob(t store.ResearchTask) store.BacktestJob {
 		}
 	}
 	return store.BacktestJob{
+		ID:          t.ID,
 		Kind:        kind,
 		CandidateID: t.RefID,
 		Status:      apiStatusOf(t.Status),
@@ -577,9 +578,23 @@ func (s *Server) handleBacktestStatus(w http.ResponseWriter, r *http.Request) {
 	if tp, terr := time.Parse("2006-01-02 15:04:05", started); terr == nil {
 		_ = tp
 	}
-	_, ref := resolveBacktestRef(id)
+	ref := t.RefID
+	respKind := backtestTaskKinds[t.Type]
+	if respKind == "library" {
+		// §8.6-B：形态候选回放对外映射回 candidate；内置战法保持 library+固定序号
+		var p map[string]any
+		if json.Unmarshal([]byte(t.Payload), &p) == nil {
+			if _, ok := p["candidate_id"]; ok {
+				respKind = "candidate"
+			}
+		}
+	}
+	if respKind == "candidate" {
+		_, ref = resolveBacktestRef(id)
+	}
 	writeJSON(w, 200, map[string]any{
 		"candidate_id": ref,
+		"kind":         respKind,
 		"status":       apiStatusOf(t.Status),
 		"progress":     t.Progress,
 		"avg_excess":   t.ResultNum,

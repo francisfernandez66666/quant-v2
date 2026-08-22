@@ -230,7 +230,7 @@
               {{ j.kind === 'nightly' ? '夜间全量' : (j.kind === 'library' ? '战法库' : '单候选') }}
             </span>
             <span v-if="j.kind === 'candidate'" class="bt-cand">候选 #{{ j.candidate_id }}</span>
-            <span v-else-if="j.kind === 'library'" class="bt-cand">{{ builtinLabel(j.candidate_id) }}</span>
+            <span v-else-if="j.kind === 'library'" class="bt-cand">{{ libraryJobLabel(j) }}</span>
             <span :class="['tag', 'bt-status', 'status-' + (j.status === 'done' ? 'applied' : (j.status === 'error' ? 'rejected' : 'proposed'))]">
               {{ btStatusLabel(j.status) }}
             </span>
@@ -276,7 +276,7 @@
               class="btn-backtest bt-ctl bt-danger"
               @click="doCancelBacktest(ctrlId(j))"
             >取消</button>
-            <!-- 重新回测/续跑：仅在非活跃状态出现（queued 排队中不重复发起） -->
+            <!-- 重新回测/续跑：候选与库规则/内置战法均支持（失败/中断后重跑，queued 不重复发起） -->
             <button
               v-else-if="j.kind === 'candidate' && j.status !== 'queued'"
               class="btn-backtest"
@@ -284,6 +284,13 @@
               @click="doBacktestById(j.candidate_id)"
             >
               {{ j.status === 'interrupted' ? '续跑（断点续传）' : (backtestLoading[j.candidate_id] ? '回测中...' : '重新回测') }}
+            </button>
+            <button
+              v-else-if="j.kind === 'library' && j.strategy_kind && j.status !== 'queued'"
+              class="btn-backtest"
+              @click="rerunLibrary(j)"
+            >
+              {{ j.status === 'interrupted' ? '重跑（断点续传）' : '重新回测' }}
             </button>
           </div>
         </div>
@@ -948,6 +955,25 @@ function queueHint(j) {
   return ahead > 0
     ? `排队中：前方还有 ${ahead} 个任务，将按优先级依次执行`
     : '已加入队列，将在非交易时段自动执行（交易日盘后起 / 非交易日全天；绝不进入盘中）'
+}
+
+/** 库回放任务显示名：内置战法序号→名称；ref 0=夜间全量回放（库规则+四大内置） */
+function libraryJobLabel(j) {
+  if (j.candidate_id === 0) return '夜间全量回放'
+  return builtinLabel(j.candidate_id)
+}
+
+/** 失败/中断的库回放任务重跑：内置战法按名直发；库规则按 strategy_kind 重建 fac_/pat_ ID */
+async function rerunLibrary(j) {
+  const sk = j.strategy_kind
+  const id = ['double_bump', 'dragon', 'dragon_return', 'n_shape'].includes(sk)
+    ? sk
+    : (sk === 'factor' ? 'fac_' : 'pat_') + j.candidate_id
+  try {
+    await api.backtestLibraryRule(id, {})
+    startLibPoll()
+    await loadBacktests()
+  } catch (e) { alert('发起失败: ' + (e.message || e)) }
 }
 
 /** 内置战法的回测任务序号 → 显示名（901-904 与后端约定一致） */

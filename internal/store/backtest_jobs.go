@@ -23,6 +23,8 @@ type BacktestJob struct {
 	// ResultText 战法库回测的汇总报告文本（阶段3.4：胜率/盈亏比等，done 后回填，前端直接展示）。
 	// English: the library-backtest summary report text (win rate / profit factor…, backfilled on done).
 	ResultText string `json:"result_text,omitempty"`
+	// StrategyKind 回放子类型（factor/pattern/内置战法名），供前端失败重跑重建规则 ID。
+	StrategyKind string `json:"strategy_kind,omitempty"`
 	StartedAt  string `json:"started_at"`  // 开始时间 YYYY-MM-DD HH:MM:SS
 	FinishedAt string `json:"finished_at"` // 结束时间（done/error/interrupted 时）
 	UpdatedAt  string `json:"updated_at"`  // 最近更新时间
