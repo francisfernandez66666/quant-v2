@@ -124,11 +124,33 @@
                   <span v-else style="color:var(--muted,#888)">待审批</span>
                 </td>
                 <td style="white-space:nowrap">
+                  <button class="btn-toggle" style="margin-right:6px" @click="toggleOptDetail(r.id)">
+                    {{ optDetailOpen === r.id ? '收起' : '详情' }}
+                  </button>
                   <template v-if="r.status === 'pending'">
-                    <button v-if="r.strategy_kind" class="btn-toggle" @click="approveOpt(r)">加入战法库</button>
-                    <span v-else style="font-size:12px;color:var(--muted,#888)">设置页调整</span>
+                    <button v-if="r.strategy_kind || r.strategy === '龙回头'" class="btn-toggle"
+                            @click="approveOpt(r)">{{ r.strategy_kind ? '加入战法库' : '应用参数' }}</button>
+                    <span v-else :title="'该战法的出场结构是固定止盈/硬止损，暂无移动止盈/持仓天数旋钮'"
+                          style="font-size:12px;color:var(--muted,#888)">设置页调整</span>
                     <button class="btn-reject" style="margin-left:6px" @click="rejectOpt(r)">淘汰</button>
                   </template>
+                </td>
+              </tr>
+              <!-- §过程数据明细：胜/负/平均盈亏/平均持仓（点「详情」展开） -->
+              <tr v-if="optDetailOpen === r.id">
+                <td></td>
+                <td colspan="9" style="background:var(--bg,#f8fafc)">
+                  <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px;padding:4px 0">
+                    <span>盈利 <b class="pos">{{ r.win }}</b> 笔</span>
+                    <span>亏损 <b class="neg">{{ r.loss }}</b> 笔</span>
+                    <span>平均盈利 <b class="pos">+{{ fmtNum(r.avg_win_pct, 2) }}%</b></span>
+                    <span>平均亏损 <b class="neg">{{ fmtNum(r.avg_loss_pct, 2) }}%</b></span>
+                    <span>平均持仓 <b>{{ fmtNum(r.avg_hold_days, 1) }}</b> 天</span>
+                    <span>目标函数值 <b>{{ fmtNum(r.profit_factor, 2) }}</b></span>
+                  </div>
+                  <div style="font-size:11px;color:var(--muted,#888);padding-bottom:2px">
+                    出场规则统一为「阶段高点回撤 {{ fmtNum(r.params.trail_pct) }}% 止盈 + 最长持仓 {{ fmtNum(r.params.hold_days) }} 天超期」；门槛仅对有连续入场分的战法生效。
+                  </div>
                 </td>
               </tr>
             </tbody>
@@ -1086,6 +1108,10 @@ const optTasks = ref([])                // 寻优任务分组列表
 const loadingOpts = ref(false)
 const optLaunching = ref(false)
 
+const optDetailOpen = ref(0) // 当前展开详情的排名行 id（0=无）
+function toggleOptDetail(id) {
+  optDetailOpen.value = optDetailOpen.value === id ? 0 : id
+}
 function objLabel(o) {
   return { profitfactor: '盈亏比', profitFactor: '盈亏比', winrate: '胜率', winRate: '胜率', avgwin: '平均盈利', avgWin: '平均盈利' }[o] || (o || '-')
 }

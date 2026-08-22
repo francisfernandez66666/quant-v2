@@ -348,6 +348,11 @@ func (d *DB) migrate() error {
 		{"daily_basic", "is_st", "ALTER TABLE daily_basic ADD COLUMN is_st INTEGER"},
 		// 阶段3.4 战法库回测：done 任务的汇总报告文本（胜率/盈亏比等，前端直接展示）
 		{"backtest_jobs", "result_text", "ALTER TABLE backtest_jobs ADD COLUMN result_text TEXT DEFAULT ''"},
+		// §P2 过程数据：扫参排名行的胜/负/平均盈亏明细（详情展开展示）
+		{"optimization_results", "win", "ALTER TABLE optimization_results ADD COLUMN win INTEGER DEFAULT 0"},
+		{"optimization_results", "loss", "ALTER TABLE optimization_results ADD COLUMN loss INTEGER DEFAULT 0"},
+		{"optimization_results", "avg_win_pct", "ALTER TABLE optimization_results ADD COLUMN avg_win_pct REAL DEFAULT 0"},
+		{"optimization_results", "avg_loss_pct", "ALTER TABLE optimization_results ADD COLUMN avg_loss_pct REAL DEFAULT 0"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

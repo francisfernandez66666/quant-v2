@@ -356,6 +356,8 @@ func rankedJSON(all *[]sweepResult, order []int) []map[string]any {
 			"rank": pos + 1, "strategy": r.Name, "strategy_kind": r.Kind,
 			"params":   map[string]any{"trail_pct": r.Trail, "hold_days": r.Hold, "min_score": r.MinScore},
 			"win_rate": r.WinRate, "profit_factor": r.ProfitFactor,
+			"win": r.Win, "loss": r.Loss,
+			"avg_win_pct": r.AvgWinPct, "avg_loss_pct": r.AvgLossPct,
 			"trigger_count": r.Count, "avg_hold_days": r.AvgHold,
 		})
 	}

@@ -26,6 +26,10 @@ type OptimizationResult struct {
 	Objective    string      `json:"objective"`
 	WinRate      float64     `json:"win_rate"`
 	ProfitFactor float64     `json:"profit_factor"`
+	Win          int         `json:"win"`
+	Loss         int         `json:"loss"`
+	AvgWinPct    float64     `json:"avg_win_pct"`
+	AvgLossPct   float64     `json:"avg_loss_pct"`
 	AvgHoldDays  float64     `json:"avg_hold_days"`
 	TriggerCount int         `json:"trigger_count"`
 	Status       string      `json:"status"` // pending | approved | rejected
@@ -61,8 +65,8 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 	}
 	stmt, err := tx.Prepare(`INSERT INTO optimization_results
 		(task_id, rank, strategy, strategy_kind, params, objective, win_rate, profit_factor,
-		 avg_hold_days, trigger_count, status, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?, 'pending', ?)`)
+		 win, loss, avg_win_pct, avg_loss_pct, avg_hold_days, trigger_count, status, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`)
 	if err != nil {
 		return err
 	}
@@ -77,8 +81,12 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 		pf, _ := r["profit_factor"].(float64)
 		avgHold, _ := r["avg_hold_days"].(float64)
 		count, _ := r["trigger_count"].(float64)
+		win, _ := r["win"].(float64)
+		loss, _ := r["loss"].(float64)
+		avgWin, _ := r["avg_win_pct"].(float64)
+		avgLoss, _ := r["avg_loss_pct"].(float64)
 		if _, err := stmt.Exec(taskID, int(rank), strategy, sk, string(params), objective,
-			winRate, pf, avgHold, int(count), now); err != nil {
+			winRate, pf, int(win), int(loss), avgWin, avgLoss, avgHold, int(count), now); err != nil {
 			return err
 		}
 	}
@@ -122,14 +130,16 @@ func (d *DB) ListOptimizations(limit int) ([]map[string]any, error) {
 }
 
 var optColumns = `id, task_id, rank, strategy, strategy_kind, params, objective,
-	win_rate, profit_factor, avg_hold_days, trigger_count, status, created_at`
+	win_rate, profit_factor, win, loss, avg_win_pct, avg_loss_pct, avg_hold_days,
+	trigger_count, status, created_at`
 
 // scanOptRow 读一行排名记录。
 func scanOptRow(scan func(...any) error) (*OptimizationResult, error) {
 	var r OptimizationResult
 	var sk, obj sql.NullString
 	if err := scan(&r.ID, &r.TaskID, &r.Rank, &r.Strategy, &sk, &r.ParamsJSON, &obj,
-		&r.WinRate, &r.ProfitFactor, &r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt); err != nil {
+		&r.WinRate, &r.ProfitFactor, &r.Win, &r.Loss, &r.AvgWinPct, &r.AvgLossPct,
+		&r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt); err != nil {
 		return nil, err
 	}
 	r.StrategyKind = sk.String

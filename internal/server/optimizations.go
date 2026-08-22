@@ -11,6 +11,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -78,11 +79,19 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 		writeError(w, 404, "排名记录不存在")
 		return
 	}
+	p := row.Params
 	if row.StrategyKind == "" {
-		writeError(w, 400, "内置战法参数暂不支持一键入库——请在设置页手动调整对应战法配置")
+		// §内置战法一键应用：仅龙回头具备语义一致的出场旋钮
+		// （trailing_drawback=移动止盈回撤%、max_hold_days=超期天数）；
+		// 其余内置的出场结构是固定止盈/硬止损，硬填会把回撤止盈错配成固定止盈，明确拒绝。
+		if err := s.applyBuiltinOptParams(row); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+		_ = s.researchDB.UpdateOptimizationStatus(id, "approved")
+		writeJSON(w, 200, map[string]any{"status": "approved", "id": id})
 		return
 	}
-	p := row.Params
 	if err := research.ApplyOptimizationParams(s.researchDir, row.StrategyKind,
 		p.TrailPct, p.HoldDays, p.MinScore); err != nil {
 		writeError(w, 500, err.Error())
@@ -118,4 +127,27 @@ func (s *Server) reloadRulesByKind(kind string) {
 	} else if len(kind) >= 4 && kind[:4] == "pat_" {
 		c.ReloadPatternRules(s.researchDir)
 	}
+}
+
+// applyBuiltinOptParams 内置战法的一键应用（§P2 用户反馈）：把扫参冠军参数写进 config.json。
+// 仅龙回头完整映射（移动止盈回撤 + 最长持仓）；落盘后引擎主循环每轮 HotReload 自动生效。
+// English: applies sweep params onto a builtin strategy's config (only DragonReturn maps
+// semantically today); persisted via the manager and hot-applied by the engine's per-cycle reload.
+func (s *Server) applyBuiltinOptParams(row *store.OptimizationResult) error {
+	if row.Strategy != "龙回头" {
+		return fmt.Errorf("「%s」暂无可一键应用的出场参数（仅龙回头支持移动止盈/持仓天数映射）——请在设置页调整", row.Strategy)
+	}
+	cfg := s.cfg.GetStrategyConfig()
+	if cfg == nil {
+		return fmt.Errorf("策略配置未初始化")
+	}
+	p := row.Params
+	if p.TrailPct > 0 {
+		cfg.DragonReturn.TrailingDrawback = p.TrailPct
+	}
+	if p.HoldDays > 0 {
+		cfg.DragonReturn.MaxHoldDays = p.HoldDays
+	}
+	s.cfg.SetStrategyConfig(cfg)
+	return nil
 }
