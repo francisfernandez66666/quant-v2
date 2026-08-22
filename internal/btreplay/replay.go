@@ -107,9 +107,10 @@ func (a *doubleBumpAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (
 	if eval == nil || !eval.Pass || eval.TotalScore < 70 {
 		return nil, false
 	}
-	// 入场评分明细：阶段最高价（移动止盈基准）
+	// 入场评分明细：阶段最高价（移动止盈基准）+ 总分（扫参门槛过滤）
 	meta := map[string]float64{
 		"highest_price": last.Close,
+		"score":         eval.TotalScore,
 	}
 	return meta, true
 }
@@ -151,9 +152,10 @@ func (a *dragonReturnAdapter) Trigger(klines []data.KLine, prevClose, _ float64)
 	if err != nil || eval == nil || !eval.Pass {
 		return nil, false
 	}
-	// 入场评分明细：阶段最高价（移动止盈/破位基准）
+	// 入场评分明细：阶段最高价（移动止盈/破位基准）+ 总分（扫参门槛过滤）
 	meta := map[string]float64{
 		"highest_price": sd.HighestPrice,
+		"score":         eval.TotalScore,
 	}
 	return meta, true
 }
@@ -230,6 +232,7 @@ func (a *nShapeAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[
 	meta := map[string]float64{
 		"limit_price":   last.Close,
 		"highest_price": last.High,
+		"score":         eval.TotalScore,
 	}
 	return meta, true
 }
@@ -287,10 +290,11 @@ func (a *dragonAdapter) Trigger(klines []data.KLine, prevClose, industryChg floa
 	if eval == nil || !eval.Pass || eval.TotalScore < 70 {
 		return nil, false
 	}
-	// 入场评分明细：封板价（炸板回落基准）
+	// 入场评分明细：封板价（炸板回落基准）+ 总分（扫参模式门槛过滤用）
 	meta := map[string]float64{
 		"limit_price":   last.Close,
 		"highest_price": last.Close,
+		"score":         eval.TotalScore,
 	}
 	return meta, true
 }
@@ -401,6 +405,10 @@ type Options struct {
 	D1Score   float64
 	Industry  bool
 	DataDir   string // 战法库目录（applied_factors.json / applied_patterns.json 所在）
+	// Sweep 非 nil 时进入参数扫参模式（§P2）：全库战法 × 出场/门槛参数网格自动寻优，
+	// 触发一次性预计算 + 逐组合廉价统一出场模拟，产出排名表与 SWEEP_JSON。
+	// English: when set, run the parameter sweep optimizer (see sweep.go).
+	Sweep *SweepConfig
 	// CandidateID > 0 且 Strategy=pattern 时：直接从候选行构造单条形态规则回放，
 	// 不依赖 applied_patterns.json（待审批候选也有回测通道，§8.6-B）。
 	// English: when set with Strategy=pattern, build one rule from the candidate row itself —
@@ -497,8 +505,13 @@ func (a *ruleEvalAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (ma
 	if err != nil || eval == nil || !eval.Pass {
 		return nil, false
 	}
-	// 入场评分明细：阶段最高价基准（Exit 中逐日抬高）
-	return map[string]float64{"highest_price": last.Close}, true
+	// 入场评分明细：阶段最高价基准（Exit 中逐日抬高）。
+	// score：因子规则带复合总分供扫参门槛过滤；形态规则是区间命中、无连续分 → -1 标记跳过该维。
+	sc := -1.0
+	if a.fs != nil {
+		sc = eval.TotalScore
+	}
+	return map[string]float64{"highest_price": last.Close, "score": sc}, true
 }
 
 // Exit 通用移动止盈 + 超期离场（与 combat_agent.genericTrailingExit 同口径）：
@@ -566,6 +579,99 @@ func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 	return nil, fmt.Errorf("未知战法库类型: %s", kind)
 }
 
+// buildAdapters 按 Options 构建回放适配器集合：形态候选直读 / all 全库（库规则+四大内置）/
+// factor|pattern 单库类型 / 单战法。返回适配器列表与行业板块装配开关
+// （显式 Industry 或任一入选战法依赖板块，见 strategyNeedsIndustry）。
+// English: builds the adapter set per mode and reports whether sector data must be assembled.
+func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
+	var ads []adapter
+	// 行业板块装配开关：显式 Industry 或任一入选战法依赖板块（见 strategyNeedsIndustry）。
+	useIndustry := o.Industry
+	needsInd := func(names ...string) {
+		for _, n := range names {
+			if strategyNeedsIndustry(n) {
+				useIndustry = true
+			}
+		}
+	}
+	if o.CandidateID > 0 && strings.EqualFold(o.Strategy, "pattern") {
+		// 候选直读模式（§8.6-B）：候选 Factors JSON 即 []PatternCond（与 ApplyPatternRule 同映射），
+		// 构造单条规则走与实盘一致的 Evaluate 回放；战法库为空/未审批均不影响。
+		// English: candidate-direct mode — build a single rule from the candidate row and replay it.
+		c, cerr := db.CandidateByID(o.CandidateID)
+		if cerr != nil {
+			return nil, false, fmt.Errorf("读取候选 #%d 失败: %w", o.CandidateID, cerr)
+		}
+		var conds []research.PatternCond
+		if jerr := json.Unmarshal([]byte(c.Factors), &conds); jerr != nil {
+			return nil, false, fmt.Errorf("解析候选条件失败: %w", jerr)
+		}
+		if len(conds) == 0 {
+			log.Printf("候选 #%d 无条件集，跳过回放", c.ID)
+			return nil, false, nil
+		}
+		rule := &pattern.ActivePattern{
+			ID:     "pat_" + strconv.FormatInt(c.ID, 10),
+			Name:   "形态战法#" + strconv.FormatInt(c.ID, 10),
+			CandID: c.ID,
+		}
+		for _, cd := range conds {
+			rule.Conds = append(rule.Conds, pattern.Cond{Factor: cd.Factor, Min: cd.Min, Max: cd.Max})
+		}
+		ps := pattern.New()
+		ps.SetRules([]*pattern.ActivePattern{rule})
+		ads = []adapter{&ruleEvalAdapter{name: rule.Name, ps: ps}}
+		log.Printf("候选直读回放：%s 条件=%d", rule.Name, len(rule.Conds))
+	} else if strings.EqualFold(o.Strategy, "all") {
+		fa, ferr := loadRuleAdapters("factor", o.DataDir)
+		if ferr != nil {
+			return nil, false, ferr
+		}
+		pa, perr := loadRuleAdapters("pattern", o.DataDir)
+		if perr != nil {
+			return nil, false, perr
+		}
+		ads = append(fa, pa...)
+		// 四大手写战法一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape）：
+		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。
+		// English: include the four hand-written strategies in the all-replay as well.
+		builtins := []string{"double_bump", "dragon", "dragon_return", "n_shape"}
+		needsInd(builtins...)
+		for _, name := range builtins {
+			ad, aerr := newAdapter(name, useIndustry, o.D1Score)
+			if aerr != nil {
+				return nil, false, aerr
+			}
+			ads = append(ads, ad)
+		}
+		if len(ads) == 0 {
+			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
+			return nil, false, nil
+		}
+		log.Printf("all 回放：%d 条库规则（factor=%d pattern=%d）+ 四大手写战法",
+			len(fa)+len(pa), len(fa), len(pa))
+	} else if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
+		ra, rerr := loadRuleAdapters(o.Strategy, o.DataDir)
+		if rerr != nil {
+			return nil, false, rerr
+		}
+		ads = ra
+		if len(ads) == 0 {
+			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
+			return nil, false, nil
+		}
+		log.Printf("战法库已加载 %d 条启用规则", len(ads))
+	} else {
+		needsInd(o.Strategy)
+		ad, aerr := newAdapter(o.Strategy, useIndustry, o.D1Score)
+		if aerr != nil {
+			return nil, false, aerr
+		}
+		ads = []adapter{ad}
+	}
+	return ads, useIndustry, nil
+}
+
 // Run 执行回放回测主流程（汇总报告打印到 stdout，供 worker 解析 result_text）。
 func (o *Options) Run() error {
 	db, err := store.Open(o.DBPath)
@@ -587,91 +693,12 @@ func (o *Options) Run() error {
 	// 让自动研究每晚对现行战法做一次实盘口径的胜率/盈亏比回归验证。
 	// English: "all" replays every enabled factor AND pattern rule in one pass — used by the nightly
 	// library_replay step so auto-research regression-tests live strategies nightly.
-	var ads []adapter
-	// 行业板块装配开关：显式 Industry 或任一入选战法依赖板块（见 strategyNeedsIndustry）。
-	useIndustry := o.Industry
-	needsInd := func(names ...string) {
-		for _, n := range names {
-			if strategyNeedsIndustry(n) {
-				useIndustry = true
-			}
-		}
-	}
-	if o.CandidateID > 0 && strings.EqualFold(o.Strategy, "pattern") {
-		// 候选直读模式（§8.6-B）：候选 Factors JSON 即 []PatternCond（与 ApplyPatternRule 同映射），
-		// 构造单条规则走与实盘一致的 Evaluate 回放；战法库为空/未审批均不影响。
-		// English: candidate-direct mode — build a single rule from the candidate row and replay it.
-		c, cerr := db.CandidateByID(o.CandidateID)
-		if cerr != nil {
-			return fmt.Errorf("读取候选 #%d 失败: %w", o.CandidateID, cerr)
-		}
-		var conds []research.PatternCond
-		if jerr := json.Unmarshal([]byte(c.Factors), &conds); jerr != nil {
-			return fmt.Errorf("解析候选条件失败: %w", jerr)
-		}
-		if len(conds) == 0 {
-			log.Printf("候选 #%d 无条件集，跳过回放", c.ID)
-			return nil
-		}
-		rule := &pattern.ActivePattern{
-			ID:     "pat_" + strconv.FormatInt(c.ID, 10),
-			Name:   "形态战法#" + strconv.FormatInt(c.ID, 10),
-			CandID: c.ID,
-		}
-		for _, cd := range conds {
-			rule.Conds = append(rule.Conds, pattern.Cond{Factor: cd.Factor, Min: cd.Min, Max: cd.Max})
-		}
-		ps := pattern.New()
-		ps.SetRules([]*pattern.ActivePattern{rule})
-		ads = []adapter{&ruleEvalAdapter{name: rule.Name, ps: ps}}
-		log.Printf("候选直读回放：%s 条件=%d", rule.Name, len(rule.Conds))
-	} else if strings.EqualFold(o.Strategy, "all") {
-		fa, ferr := loadRuleAdapters("factor", o.DataDir)
-		if ferr != nil {
-			return ferr
-		}
-		pa, perr := loadRuleAdapters("pattern", o.DataDir)
-		if perr != nil {
-			return perr
-		}
-		ads = append(fa, pa...)
-		// 四大手写战法一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape）：
-		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。
-		// English: include the four hand-written strategies in the all-replay as well.
-		builtins := []string{"double_bump", "dragon", "dragon_return", "n_shape"}
-		needsInd(builtins...)
-		for _, name := range builtins {
-			ad, aerr := newAdapter(name, useIndustry, o.D1Score)
-			if aerr != nil {
-				return aerr
-			}
-			ads = append(ads, ad)
-		}
-		if len(ads) == 0 {
-			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
-			return nil
-		}
-		log.Printf("all 回放：%d 条库规则（factor=%d pattern=%d）+ 四大手写战法",
-			len(fa)+len(pa), len(fa), len(pa))
-	} else if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
-		ads, err = loadRuleAdapters(o.Strategy, o.DataDir)
-		if err != nil {
-			return err
-		}
-		if len(ads) == 0 {
-			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
-			return nil
-		}
-		log.Printf("战法库已加载 %d 条启用规则", len(ads))
-	} else {
-		needsInd(o.Strategy)
-		ad, err := newAdapter(o.Strategy, useIndustry, o.D1Score)
-		if err != nil {
-			return err
-		}
-		ads = []adapter{ad}
+	ads, useIndustry, berr := o.buildAdapters(db)
+	if berr != nil {
+		return berr
 	}
 
+	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
 	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
 	indMap := map[string]string{}
 	industryChg := map[string]map[string]float64{} // code -> date -> ChangePct
@@ -695,6 +722,12 @@ func (o *Options) Run() error {
 			code := strings.Split(tsCode, ".")[0]
 			industryChg[code] = byDate
 		}
+	}
+
+	// §P2 参数扫参模式：触发一次性预计算 + 逐组合廉价模拟统一出场（见 sweep.go）。
+	// English: sweep mode — pre-compute triggers once, then cheaply simulate each param combo.
+	if o.Sweep != nil {
+		return o.runSweep(db, codes, ads, industryChg)
 	}
 
 	// 逐 adapter 回放（多规则时按规则分组统计；单战法仅一条）。

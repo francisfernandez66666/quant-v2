@@ -84,6 +84,15 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 			Industry:    payloadStr(p, "industry", "") == "true",
 			CandidateID: payloadInt(p, "candidate_id", 0), // 形态候选直读回放（§8.6-B）
 		}
+		// §P2 参数优化任务：payload kind=optimize → 全库扫参模式（网格系统自动推导）。
+		// English: kind=optimize → cross-library parameter sweep (auto-derived grid).
+		if o.Strategy == "optimize" {
+			o.Strategy = "all"
+			o.Sweep = &btreplay.SweepConfig{
+				Objective: payloadStr(p, "objective", ""),
+				TopN:      int(payloadInt(p, "top_n", 0)),
+			}
+		}
 		if err := o.Run(); err != nil {
 			log.Fatalf("战法库回放失败: %v", err)
 		}

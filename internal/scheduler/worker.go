@@ -741,7 +741,12 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 				resultNum, _ = strconv.ParseFloat(m[1], 64)
 			}
 		case store.TaskBacktestStrategy:
-			resultText = parseBtSummary(fullOut)
+			if m := strings.SplitN(fullOut, "参数优化目标:", 2); len(m) == 2 {
+				// §P2 扫参任务：报告段（目标/排名/SWEEP_JSON）原样作为 result_text
+				resultText = "参数优化目标:" + strings.SplitN(m[1], "\nSWEEP_JSON:", 2)[0]
+			} else {
+				resultText = parseBtSummary(fullOut)
+			}
 		}
 	}
 	if err := db.UpdateTaskRunState(tk.ID, status, progress, resultNum, resultText, errMsg); err != nil {
