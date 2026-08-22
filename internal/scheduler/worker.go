@@ -33,6 +33,11 @@ var taskProgressRe = regexp.MustCompile(`(?:任务|回测|发现)进度 (\d+)%`)
 // avgExcessRe 匹配 B4 回测 CLI 的平均超额（done 后写 result_num）。
 var avgExcessRe = regexp.MustCompile(`平均超额=(-?\d+(?:\.\d+)?)`)
 
+// btNameZh 内置战法适配器英文名 → 中文显示名（与前端 builtinPatterns/序号映射一致）。
+var btNameZh = map[string]string{
+	"DoubleBump": "双响炮", "Dragon": "龙头", "DragonReturn": "龙回头", "NShape": "N形",
+}
+
 // 回放汇总报告解析：btreplay printReport 每个战法输出一个 ===== 包围的块，
 // 头行为「战法历史回测: <名>（N 只股票）」。旧实现抓指标行丢名字，多战法块无法区分。
 var (
@@ -53,6 +58,9 @@ func parseBtSummary(out string) string {
 		var name string
 		if m := btNameRe.FindStringSubmatch(blk); len(m) == 2 {
 			name = strings.TrimSpace(m[1])
+			if zh, ok := btNameZh[name]; ok {
+				name = zh
+			}
 		}
 		if name == "" || !strings.Contains(blk, "胜率:") && !strings.Contains(blk, "无触发信号") {
 			continue // 分隔线之间的非报告文本（进度行等）
