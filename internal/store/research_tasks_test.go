@@ -157,3 +157,29 @@ func TestMigrateBacktestJobsToTasks(t *testing.T) {
 		t.Fatalf("二次迁移产生回填: %d → %d", len(tasks), len(tasks2))
 	}
 }
+
+// TestD1ScoresUpsertAndQuery D1 评分历史：幂等覆盖 + 按日期读取。
+func TestD1ScoresUpsertAndQuery(t *testing.T) {
+	db := testDB(t)
+	rows := []D1ScoreRow{
+		{Code: "300750", Score: 32.5, Blocked: false, Reason: "中标利好"},
+		{Code: "600519", Score: 8.0, Blocked: true, Reason: "业绩利空"},
+	}
+	if err := db.UpsertD1Scores("2026-08-22", rows); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	// 同键覆盖（保留最新一轮）
+	if err := db.UpsertD1Scores("2026-08-22", []D1ScoreRow{{Code: "300750", Score: 35}}); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	got, err := db.D1ScoresByDate("2026-08-22")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(got) != 2 || got["300750"] != 35 || got["600519"] != 8 {
+		t.Fatalf("结果错误: %+v", got)
+	}
+	if other, _ := db.D1ScoresByDate("2026-08-21"); len(other) != 0 {
+		t.Fatalf("日期隔离失败: %+v", other)
+	}
+}

@@ -2338,6 +2338,24 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.lastD1Scores = d1Scores
 	e.d1RetryQueue = nextRetry
 	e.mu.Unlock()
+
+	// 历史 D1 方案B·攒数据：本轮真实 LLM 评分按日落库 d1_scores（幂等覆盖），
+	// 攒够数据后 N 形回放按触发日 JOIN 当日真实分。重试占位（RetryPending，分数 0）
+	// 不入库；落库失败仅记日志，绝不影响打分主流程。
+	// English: persist this round's real LLM D1 scores per day (idempotent) so N-shape replay can
+	// later join the real trigger-day score. Retry placeholders are skipped; failures only log.
+	if e.realStore != nil && len(d1Scores) > 0 {
+		rows := make([]store.D1ScoreRow, 0, len(d1Scores))
+		for code, d := range d1Scores {
+			if d.RetryPending {
+				continue
+			}
+			rows = append(rows, store.D1ScoreRow{Code: code, Score: d.Score, Blocked: d.Blocked, Reason: d.Reason})
+		}
+		if err := e.realStore.UpsertD1Scores(time.Now().Format("2006-01-02"), rows); err != nil {
+			log.Printf("[engine] D1 评分落库失败(不影响主流程): %v", err)
+		}
+	}
 	_d1T := time.Since(_stepD1)
 
 	// 8a. 打分池 PE 预取（N 形 D3 超跌评分；东财 clist f9，TTL 缓存降低限流压力）。

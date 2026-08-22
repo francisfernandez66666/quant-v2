@@ -192,6 +192,20 @@ func (d *DB) migrate() error {
 			finished_at TEXT DEFAULT '',
 			updated_at TEXT NOT NULL
 		)`,
+		// D1 评分历史（§历史D1方案B）：盘中 LLM 打标的 (日期,股票,评分) 落库，
+		// 攒够数据后 N 形回放按触发日 JOIN 当日真实 D1 分，替代固定规则分近似。
+		// English: D1 score history — intraday LLM scores persisted per (date, code) so N-shape
+		// replay can JOIN the real score of the trigger day instead of a fixed rule-score proxy.
+		`CREATE TABLE IF NOT EXISTS d1_scores (
+			date TEXT NOT NULL,
+			code TEXT NOT NULL,
+			score REAL NOT NULL DEFAULT 0,
+			blocked INTEGER NOT NULL DEFAULT 0,
+			reason TEXT DEFAULT '',
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (date, code)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_d1_date ON d1_scores(date)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_state ON research_tasks(status, priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_chain ON research_tasks(chain_day)`,
 		// 研究窗口级断点（二期）：discover-factors 各阶段按窗口缓存装配产物（IC 行等），
