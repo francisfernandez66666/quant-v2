@@ -383,6 +383,15 @@ func main() {
 			case <-scoreLoopCtx.Done():
 				return
 			case <-tick.C:
+				// §性能 非交易时段降频：打分/退出检查内部本就有会话闸（直接 return），
+				// 但 5s 空转唤醒本身也费 CPU——休市/盘后把节拍降到 60s，开盘自动恢复 5s。
+				// English: off-hours backoff — slow the scoring heartbeat to 60s when the market is
+				// closed (the cycle body would early-return anyway); restore 5s intraday automatically.
+				if !data.IsActiveSession(time.Now()) {
+					tick.Reset(60 * time.Second)
+					continue
+				}
+				tick.Reset(5 * time.Second) // 开盘：恢复 5s 近实时节拍
 				for _, e := range registry.All() {
 					e.RunScoringLoopOnce(scoreLoopCtx)
 				}

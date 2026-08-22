@@ -34,8 +34,14 @@ LimitNOFILE=65535
 Nice=10
 CPUWeight=8
 CPUQuota=100%
-MemoryHigh=700M
-MemoryMax=1G
+# §2026-08-23 内存总闸配套：硬限之和必须 < 物理 1.6G（此前 research 1G + quant 900M = 1.9G，
+# 双侧冲高吸干 swap → 整机僵死 → OOM 重启 → 排水重跑的 crash loop，实录见 PROGRESS）。
+# MemorySwapMax 限制研究侧 swap 配额：宁可本任务 OOM 重跑（有断点），绝不拖垮 SSH/caddy/quant。
+# English: hard limits must sum below physical RAM; SwapMax caps the research side's swap share so a
+# runaway task gets OOM-killed (checkpoints make reruns cheap) instead of thrashing the whole box.
+MemoryHigh=500M
+MemoryMax=650M
+MemorySwapMax=256M
 IOSchedulingClass=idle
 
 Environment=TZ=Asia/Shanghai

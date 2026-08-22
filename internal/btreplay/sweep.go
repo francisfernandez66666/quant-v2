@@ -40,6 +40,10 @@ var (
 // sweepMinTrades 进入排名的最低触发数——几笔交易 100% 胜率的组合没有统计意义。
 const sweepMinTrades = 20
 
+// sweepMaxCacheStocks 扫参 K 线缓存的全局护栏：防止 CLI 直跑（MaxStocks=0=全市场）
+// 把研究侧 cgroup 挤爆。English: hard cap on the sweep kline cache.
+const sweepMaxCacheStocks = 500
+
 // sweepTrigger 预计算的入场事件（与出场参数无关，只算一次）。
 type sweepTrigger struct {
 	ad      int     // adapter 序号
@@ -88,6 +92,11 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		len(ads), len(sweepTrail), len(sweepHold), len(sweepScore), objName)
 
 	// ── 1) K 线一次性载入内存（300 只 × 数年日线 ≈ 几十 MB，cgroup 内安全）──
+	// 内存护栏：CLI 直跑未传 MaxStocks 时兜底截断——扫参的 K 线全量缓存必须受控，
+	// 否则全市场数千只会把研究侧 cgroup 挤爆（2026-08-23 整机僵死教训）。
+	if len(codes) > sweepMaxStocksLimit(o.MaxStocks) {
+		codes = codes[:sweepMaxStocksLimit(o.MaxStocks)]
+	}
 	klines := make(map[string][]data.KLine, len(codes))
 	for _, tsCode := range codes {
 		bars, err := db.RawBars(tsCode, o.Start, o.End)
@@ -362,4 +371,16 @@ func rankedJSON(all *[]sweepResult, order []int) []map[string]any {
 		})
 	}
 	return out
+}
+
+// sweepMaxStocksLimit 生效股票池上限：显式 MaxStocks 与全局护栏取小（至少 50 保底可用）。
+func sweepMaxStocksLimit(maxStocks int) int {
+	limit := maxStocks
+	if limit <= 0 || limit > sweepMaxCacheStocks {
+		limit = sweepMaxCacheStocks
+	}
+	if limit < 50 {
+		limit = 50
+	}
+	return limit
 }

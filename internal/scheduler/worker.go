@@ -195,13 +195,70 @@ func (s *Scheduler) preemptCurrent(reason string) {
 	}
 }
 
-// tryStartNext 空闲则出队下一个任务并启动（带盘后门控）。任务完成后的自驱排水入口，
+// memGateMB 内存总闸阈值（可经 rules.scheduler.min_free_mem_mb 覆盖，默认 400）：
+// 系统 MemAvailable 低于该值时一律不出队——研究任务再重要也不能把整机挤进
+// swap 死锁（2026-08-23 实录：discover_factors 峰值 + quant 并发 → SSH/HTTPS 全僵死，
+// OOM 重启 → 排水重跑 → 再 OOM 的 crash loop）。English: global memory gate — when system
+// MemAvailable drops below the threshold, no task is dequeued (everything stays queued).
+const memGateDefaultMB = 400
+
+// readMemAvailableMB 读 /proc/meminfo 的 MemAvailable（KB→MB）；读取失败返回 -1（闸门放行，
+// 不因读数失败卡死队列）。Linux 专用路径；非 Linux（本地 darwin 开发）返回 -1 直接放行。
+func readMemAvailableMB() int {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "MemAvailable:") {
+			f := strings.Fields(strings.TrimPrefix(line, "MemAvailable:"))
+			if len(f) >= 1 {
+				if kb, e := strconv.ParseInt(f[0], 10, 64); e == nil {
+					return int(kb / 1024)
+				}
+			}
+			return -1
+		}
+	}
+	return -1
+}
+
+// memGateOpen 内存总闸判定：MemAvailable ≥ 阈值（或无法读取）时放行。
+// English: gate passes when MemAvailable is above the threshold (or unreadable).
+func memGateOpen(cfg config.SchedulerConfig) bool {
+	thresh := cfg.MinFreeMemMB
+	if thresh <= 0 {
+		thresh = memGateDefaultMB
+	}
+	return memGateDecide(readMemAvailableMB(), thresh)
+}
+
+// memGateDecide 纯决策：avail<0（无法读数）放行不卡队；其余按阈值比较。
+func memGateDecide(availMB, threshMB int) bool {
+	if availMB < 0 {
+		return true
+	}
+	return availMB >= threshMB
+}
+
+// tryStartNext 空闲则出队下一个任务并启动（带盘后门控+内存总闸）。任务完成后的自驱排水入口，
 // 不依赖 30s tick，长队列可在夜班窗口内连续消费。
-// English: dequeues and starts the next task when idle (after-hours gated). Self-draining entry so a
-// long queue drains continuously without waiting for ticks.
+// English: dequeues and starts the next task when idle (after-hours + memory gated). Self-draining.
 func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	if !s.drainAllowed(db, cfg) {
 		return // 盘后硬门控（需求#4）：未到窗口且无遗留续跑时不出队
+	}
+	if !memGateOpen(cfg) {
+		// 内存总闸：系统可用内存不足——一切任务留队等待，绝不与量化主程序/系统抢内存。
+		log.Printf("[scheduler] 内存总闸拦截：MemAvailable=%dMB < %dMB，本轮不出队（任务留队）",
+			readMemAvailableMB(), func() int {
+				t := cfg.MinFreeMemMB
+				if t <= 0 {
+					return memGateDefaultMB
+				}
+				return t
+			}())
+		return
 	}
 	next, err := db.DequeueHighestTask()
 	if err != nil || next == nil {

@@ -163,6 +163,9 @@ type SchedulerConfig struct {
 	// daemon periodically GC+FreeOSMemory itself and defensively kills leftover research/discover child
 	// processes, so research never lingers during trading hours (leaving RAM to the quant engine).
 	TrimIntervalMin int `json:"trim_interval_min"`
+	// MinFreeMemMB 内存总闸阈值(MB)：系统可用内存低于该值时调度器不出队，任务留队列。
+	// English: memory gate — tasks stay queued when system MemAvailable drops below this.
+	MinFreeMemMB int `json:"min_free_mem_mb"`
 }
 
 // NightlyConfig 夜间研究作业配置（盘后/周末触发）。
