@@ -123,6 +123,11 @@ func (dc *DataCoordinator) NewsSourceHealth() map[string]bool {
 	}
 }
 func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
+	// 空代码防御（§门控配套）：上游对空代码必然失败并刷错误日志
+	// （周六实录：每秒数行"新浪/东财行情失败 ()"），直接本地拒绝。
+	if code == "" {
+		return nil, fmt.Errorf("空股票代码")
+	}
 	si, err := dc.eastMoney.GetSinaQuote(code)
 	if err == nil && si != nil && si.Price > 0 {
 		return si, nil
