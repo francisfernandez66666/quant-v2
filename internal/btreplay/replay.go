@@ -696,7 +696,13 @@ func (o *Options) Run() error {
 			klines := toDataKLine(bars)
 			trades = append(trades, o.backtestStock(code, klines, ad, industryChg[code])...)
 		}
-		summaries = append(summaries, summarize(trades))
+		sm := summarize(trades)
+		if sm.Name == "" {
+			// 零触发时 summarize 拿不到交易行，名字会空——报告头变成"战法历史回测: （N 只股票）"。
+			// English: zero-trigger adapters have no trade row to carry the name; backfill it.
+			sm.Name = ad.Name()
+		}
+		summaries = append(summaries, sm)
 	}
 	printReports(summaries, len(codes))
 	return nil
