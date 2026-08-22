@@ -206,7 +206,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	payload := map[string]any{
 		"objective": obj,
 		"total":     total,
-		"results":   rankedJSON(&all, qualifying),
+		"results":   rankedJSON(&all, rank), // 与展示一致：只落 TOP-N（rank 已截断）
 	}
 	if bj, jerr := json.Marshal(payload); jerr == nil {
 		fmt.Printf("SWEEP_JSON:%s\n", bj)
