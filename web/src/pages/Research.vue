@@ -1056,7 +1056,10 @@ async function restoreRunningBacktests() {
     const res = await api.fetchRunningBacktests()
     const jobs = (res && res.jobs) || []
     for (const j of jobs) {
-      // queued 同样恢复轮询：任务在盘后被 worker 拉起时，前端能自动切到运行态并接续进度条
+      // queued 同样恢复轮询：任务在盘后被 worker 拉起时，前端能自动切到运行态并接续进度条。
+      // 仅候选任务走逐 id 轮询+弹窗——库回放/内置战法任务由列表轮询(startLibPoll/loadBacktests)
+      // 展示进度，避免合成 id=0 的"候选 #0"假轮询与误导性失败弹窗。
+      if (j.kind !== 'candidate') continue
       if (j.status !== 'running' && j.status !== 'queued') continue
       const cand = candidates.value.find(x => x.id === j.candidate_id)
       const c = cand || { id: j.candidate_id, kind: 'factor' }
