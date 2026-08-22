@@ -3,8 +3,8 @@
 // 子系统统一改造后的编排模型（详见 docs/RESEARCH_TASK_QUEUE_PLAN.md）：
 //   - quant(API) 与夜间作业只把任务写入 trading.db 的 research_tasks 队列；
 //     本服务是唯一出队执行者——单飞由架构保证，不再有第二个编排者；
-//   - 盘后硬门控（需求#4）：NightlyEligible 对一切任务生效，含手动 high 任务。
-//     交易时段绝不执行研究，只保留 dataload 增量下载通道，盘中 CPU 让给量化主程序；
+//   - 交易时段硬门控（需求#4）：NightlyEligible 对一切任务生效（含手动 high）——
+//     绝不进入 A 股活跃时段；交易日盘后(StartHHMM)起可跑，非交易日全天可跑；
 //   - 优先级抢占（决策#1）：high 入队时若 low 在跑 → kill 当前子进程并标 preempted
 //     （断点缓存有效，自动回队首续跑）；
 //   - 资源治理（需求#5）：所有研究子进程继承本服务的 cgroup 限流
@@ -17,8 +17,8 @@
 // English: sole consumer of the research task queue (standalone quant-research service).
 // After the unified-subsystem refactor, quant(API) and the nightly chain only enqueue into
 // research_tasks; this daemon is the single executor — single-flight is architectural. A hard
-// after-hours gate applies to every task including manual high-priority ones; trading sessions keep
-// only the incremental-dataload lane. High-priority arrival kills a running low-priority child
+// session gate applies to every task including manual high-priority ones — never during A-share
+// trading hours; trading days start post-close, non-trading days allow research all day. High-priority arrival kills a running low-priority child
 // (preempted, auto-requeued). Children inherit this unit's cgroup caps so research never saturates
 // the box.
 package scheduler
@@ -302,26 +302,21 @@ func dirOfDB(cfg config.SchedulerConfig) string {
 }
 
 // NightlyEligible 纯函数：当前时刻是否允许执行任何研究任务（含手动 high）。
-// 条件：非活跃时段 + 已达启动时间（交易日 StartHHMM / 周末 WeekendStartHHMM）。
-// 这是盘后硬门控的单一事实源（需求#4）。
-// English: pure predicate — whether ANY research task may run now (manual included): inactive session
-// and past start time. The single source of truth for the hard after-hours gate.
+// 硬约束只有一条：绝不进入 A 股活跃交易时段（需求#4 的本意是保护盘中）。
+// 启动时刻阈值仅对交易日生效（15:30 收盘数据就绪后再跑）；非交易日/节假日
+// 没有"盘中"概念，全天允许——否则周六上午点回测要干等到 15:30，违背直觉。
+// （WeekendStartHHMM 配置保留但不再作为门控，见下方说明。）
+// English: the only hard constraint is staying out of active A-share sessions; the start-time
+// threshold applies to trading days only (post-close data readiness). Non-trading days allow
+// research all day — a Saturday-morning manual backtest must not wait until 15:30.
 func NightlyEligible(now time.Time, cfg config.SchedulerConfig) bool {
 	if data.IsActiveSession(now) {
 		return false
 	}
-	if now.Hour()*100+now.Minute() < nightStartHHMM(now, cfg) {
-		return false
-	}
-	return true
-}
-
-// nightStartHHMM 返回适用当日的启动时间：交易日 StartHHMM，周末 WeekendStartHHMM。
-func nightStartHHMM(now time.Time, cfg config.SchedulerConfig) int {
 	if data.IsTradingDay(now) {
-		return cfg.Nightly.StartHHMM
+		return now.Hour()*100+now.Minute() >= cfg.Nightly.StartHHMM
 	}
-	return cfg.Nightly.WeekendStartHHMM
+	return true // 非交易日：全天可跑（no sessions on weekends/holidays）
 }
 
 // TradingDataloadDue 纯函数：交易时段是否应触发一轮增量下载（按间隔节流）。

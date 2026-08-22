@@ -224,7 +224,7 @@
         暂无回测任务。选择上方候选发起全量回测，或等待夜间调度器产出。
       </div>
       <div v-else class="bt-list">
-        <div v-for="j in backtestJobs" :key="j.id" class="bt-card" :class="'bt-' + j.status">
+        <div v-for="j in backtestJobs" :key="(j.kind || 'candidate') + ':' + j.candidate_id" class="bt-card" :class="'bt-' + j.status">
           <div class="bt-head">
             <span :class="['tag', 'tag-kind', j.kind === 'nightly' ? '' : (j.kind === 'library' ? 'kind-pattern' : 'kind-factor')]">
               {{ j.kind === 'nightly' ? '夜间全量' : (j.kind === 'library' ? '战法库' : '单候选') }}
@@ -244,9 +244,9 @@
             </div>
             <span class="bt-progress-label">{{ jobPct(j) }}</span>
           </div>
-          <!-- 排队提示：研究子系统统一改造后所有回测只在盘后窗口执行（盘中硬门控） -->
+          <!-- 排队提示：盘后硬门控 + 前方排队计数（同级 FIFO，取同优先级 queued 在其之前的数量） -->
           <div class="bt-error" v-if="j.status === 'queued'" style="color: var(--muted, #888)">
-            已加入高优先级队列，将在今日盘后自动执行（交易时段绝不占用研究资源）
+            {{ queueHint(j) }}
           </div>
           <!-- 战法库回测结果：汇总报告文本（触发信号数/胜率/盈亏比等） -->
           <div class="bt-result bt-lib-result" v-if="j.status === 'done' && j.kind === 'library'">{{ j.result_text }}</div>
@@ -344,7 +344,7 @@
             <div class="detail-row"><span class="d-label">反推超额</span><span class="d-value">高分股比全市场平均多赚 {{ fmtPct(parseReason(c,'反推超额')) }}</span></div>
             <div class="detail-row"><span class="d-label">全样本 IR</span><span class="d-value">{{ fmt(c.ir) }}（参考）</span></div>
             <div class="detail-row"><span class="d-label">全样本 IC</span><span class="d-value">{{ fmt(c.ic_mean) }}（参考）</span></div>
-            <div class="detail-row"><span class="d-label">全链路回测</span><span class="d-value">{{ btTested(c) ? fmt(c.avg_excess) : '未测' }}</span></div>
+            <div class="detail-row"><span class="d-label">全链路回测</span><span class="d-value">{{ btTested(c) ? (c.backtest_result_text || fmt(c.avg_excess)) : '未测' }}</span></div>
           </details>
         </template>
 
@@ -704,9 +704,10 @@ function plainLines(c) {
   return lines
 }
 
-/** 回测是否真的做过（avg_excess=0 且 kind=factor 默认未做全链路回测） */
-/** Whether a full backtest was actually run (factor candidates default to none) */
+/** 回测是否真的做过：优先看后端通用证据 backtest_done（factor=B4 回填 /
+ *  pattern=回放任务 done），无该字段时回退旧口径 avg_excess≠0 */
 function btTested(c) {
+  if (typeof c.backtest_done === 'boolean') return c.backtest_done
   return c.avg_excess !== 0
 }
 
@@ -938,6 +939,17 @@ const builtinPatterns = [
   { id: 'dragon_return', name: '龙回头' },
   { id: 'n_shape', name: 'N形（日K近似）' },
 ]
+/** 排队提示文案：盘中提交→等待盘后窗口；窗口内排队→显示前方还有几个同类任务 */
+function queueHint(j) {
+  const ahead = backtestJobs.value.filter(x =>
+    x.status === 'running' ||
+    (x.status === 'queued' && (x.id || 0) < (j.id || 0))
+  ).length
+  return ahead > 0
+    ? `排队中：前方还有 ${ahead} 个任务，将按优先级依次执行`
+    : '已加入队列，将在非交易时段自动执行（交易日盘后起 / 非交易日全天；绝不进入盘中）'
+}
+
 /** 内置战法的回测任务序号 → 显示名（901-904 与后端约定一致） */
 function builtinLabel(num) {
   const m = { 901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形' }
@@ -1059,9 +1071,12 @@ async function loadBacktests() {
 /** 把单候选任务状态同步进任务列表（轮询期间回测 tab 进度条实时更新） */
 /** Merge a per-candidate job update into the task list (live progress on the backtest tab) */
 function syncJobIntoList(j) {
+  // kind 感知合并（§修复轮询克隆）：后端状态接口已回带 kind；旧调用方未带时按
+  // 'candidate' 回退。找不到同键行才 unshift——此前 kind 缺失导致每 5s 克隆一行。
   const jobs = backtestJobs.value.slice()
-  const idx = jobs.findIndex(x => x.kind === 'candidate' && x.candidate_id === j.candidate_id)
-  const merged = { ...(idx >= 0 ? jobs[idx] : {}), ...j }
+  const jk = j.kind || 'candidate'
+  const idx = jobs.findIndex(x => (x.kind || 'candidate') === jk && x.candidate_id === j.candidate_id)
+  const merged = { ...(idx >= 0 ? jobs[idx] : { id: j.task_id }), ...j, kind: jk }
   if (idx >= 0) jobs[idx] = merged
   else jobs.unshift(merged)
   backtestJobs.value = jobs

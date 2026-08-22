@@ -64,6 +64,11 @@ func TestNightlyEligible(t *testing.T) {
 	if !NightlyEligible(sat, cfg) {
 		t.Error("周末 16:00 应可启动夜间作业")
 	}
+	// 非交易日全天可跑（2026-08-22 实录：周六上午点回测被干等到 15:30，违背"保护盘中"本意）
+	satAm := time.Date(2026, 8, 22, 10, 0, 0, 0, loc)
+	if !NightlyEligible(satAm, cfg) {
+		t.Error("非交易日上午 10:00 无盘中概念，应允许执行研究")
+	}
 	// 自定义交易日启动时间 20:00
 	cfg2 := cfg
 	cfg2.Nightly.StartHHMM = 2000
