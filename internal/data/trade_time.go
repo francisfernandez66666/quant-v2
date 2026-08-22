@@ -297,3 +297,21 @@ func AddTradingDays(td string, n int) string {
 func IsTradingDay(t time.Time) bool {
 	return t.Weekday() != time.Saturday && t.Weekday() != time.Sunday
 }
+
+// DurationToNextActiveSession 距下一个活跃交易窗口（工作日 8:30 盘前开盘）的时长。
+// 非交易时段的唯一"闹钟"：休市/盘后循环据此一次性长眠，而不是空转节拍器。
+// English: duration until the next active session start (weekday 08:30 premarket open) —
+// the single alarm an after-hours loop needs to truly hibernate instead of busy-ticking.
+func DurationToNextActiveSession(now time.Time) time.Duration {
+	for add := 0; add <= 8; add++ { // 最多看一周（跨周末/长假）
+		day := now.AddDate(0, 0, add)
+		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
+			continue
+		}
+		start := time.Date(day.Year(), day.Month(), day.Day(), 8, 30, 0, 0, now.Location())
+		if start.After(now) {
+			return start.Sub(now)
+		}
+	}
+	return 15 * time.Minute // 理论不可达：兜底防时钟异常导致永久睡眠
+}

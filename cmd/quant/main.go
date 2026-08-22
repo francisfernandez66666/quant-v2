@@ -376,33 +376,42 @@ func main() {
 		<-scoreLoopCtx.Done()
 	}()
 	go func() {
-		tick := time.NewTicker(5 * time.Second)
-		defer tick.Stop()
+		// §性能 彻底休眠（用户要求）：非交易时段连节拍器都不转——一次性睡到下一个交易窗口，
+		// 醒来只归还内存（TrimAfterHoursIfDue 自带 15m 节流），再重新判定会话。
+		// 睡眠分段封顶 15 分钟：防时钟跳变/节假日边界导致永久沉睡；交易时段恢复 5s 近实时节拍。
+		// English: true hibernation off-hours — sleep straight through to the next active session
+		// (chunks capped at 15m for clock-safety), only trimming memory on wake; 5s cadence intraday.
+		const (
+			activeTick = 5 * time.Second
+			sleepChunk = 15 * time.Minute
+		)
+		timer := time.NewTimer(activeTick)
+		defer timer.Stop()
 		for {
 			select {
 			case <-scoreLoopCtx.Done():
 				return
-			case <-tick.C:
-				// §性能 非交易时段降频：打分/退出检查内部本就有会话闸（直接 return），
-				// 但 5s 空转唤醒本身也费 CPU——休市/盘后把节拍降到 60s，开盘自动恢复 5s。
-				// English: off-hours backoff — slow the scoring heartbeat to 60s when the market is
-				// closed (the cycle body would early-return anyway); restore 5s intraday automatically.
-				if !data.IsActiveSession(time.Now()) {
-					tick.Reset(60 * time.Second)
-					continue
-				}
-				tick.Reset(5 * time.Second) // 开盘：恢复 5s 近实时节拍
-				for _, e := range registry.All() {
-					e.RunScoringLoopOnce(scoreLoopCtx)
-				}
-				// 盘后内存释放：非活跃时段按节流间隔把常驻堆归还 OS，
-				// 让物理内存让给盘后 research 夜间作业（避免叠加 OOM）。
-				// English: after-hours memory trim — release the resident heap back to the OS on a
-				// throttled cadence so the nightly research job has the RAM it needs (no stacking OOM).
+			case <-timer.C:
+			}
+			if !data.IsActiveSession(time.Now()) {
 				for _, e := range registry.All() {
 					e.TrimAfterHoursIfDue(time.Now())
 				}
+				d := data.DurationToNextActiveSession(time.Now())
+				if d > sleepChunk {
+					d = sleepChunk
+				}
+				if d < time.Second {
+					d = time.Second
+				}
+				log.Printf("[main] 打分循环休眠 %s（至下个交易窗口）", d.Round(time.Second))
+				timer.Reset(d)
+				continue
 			}
+			for _, e := range registry.All() {
+				e.RunScoringLoopOnce(scoreLoopCtx)
+			}
+			timer.Reset(activeTick)
 		}
 	}()
 
