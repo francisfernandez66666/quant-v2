@@ -1311,4 +1311,23 @@ export async function setAdminLLMConfig(id, cfg) {
   return request('/api/admin/users/' + encodeURIComponent(id) + '/config/llm', { method: 'POST', data: cfg })
 }
 
+/** §P2-f 参数优化：入队全库扫参任务（objective: profitFactor|winRate|avgWin；盘后窗口执行）。
+ *  params 可选 {objective, start, end, top_n}；同 ref 幂等（已有排队/运行中返回现任务）。 */
+export async function enqueueOptimize(params) {
+  return request('/api/backtest/optimize', { method: 'POST', data: params || {} })
+}
 
+/** §P2-f 查询寻优结果列表（按任务倒序分组，含每行排名/参数/指标/审批状态） */
+export async function fetchOptimizations() {
+  return request('/api/research/optimizations')
+}
+
+/** §P2-f 审批一条寻优排名：规则级参数覆盖写 applied_*.json + 热重载实盘生效 */
+export async function approveOptimization(id) {
+  return request('/api/research/optimizations/' + id + '/approve', { method: 'POST' })
+}
+
+/** §P2-f 淘汰一条寻优排名 */
+export async function rejectOptimization(id) {
+  return request('/api/research/optimizations/' + id + '/reject', { method: 'POST' })
+}

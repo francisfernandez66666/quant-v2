@@ -37,6 +37,12 @@
 
     <!-- ══════════ Tab 1: 待审批候选 ══════════ -->
     <template v-if="activeTab === 'candidates'">
+    <!-- §P2-e 子 tab：形态候选 / 优化结果 -->
+    <div class="research-tabs" style="margin-bottom:8px">
+      <button :class="['tab', candSubTab === 'patterns' ? 'active' : '']" @click="candSubTab = 'patterns'">形态候选</button>
+      <button :class="['tab', candSubTab === 'optimize' ? 'active' : '']" @click="candSubTab = 'optimize'; loadOptimizations()">优化结果</button>
+    </div>
+    <template v-if="candSubTab === 'patterns'">
     <!-- 研究处理进度：数据准备度 + 候选产出状态 -->
     <div class="progress-panel" v-if="progress">
       <div class="progress-title">研究处理进度</div>
@@ -72,15 +78,82 @@
     </div>
     </template>
 
+    <!-- §P2-e 子视图：参数寻优结果（完整表格 + 一键入库） -->
+    <template v-else>
+    <div class="library-panel">
+      <div class="library-header">
+        <div class="library-title">参数寻优结果<span style="font-size:12px;color:var(--muted,#888)">（全库战法 × 止盈×持仓×门槛网格，盘后执行）</span></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select v-model="optObjective" class="bt-select" style="width:auto;padding:4px 8px">
+            <option value="profitFactor">目标：盈亏比</option>
+            <option value="winRate">目标：胜率</option>
+            <option value="avgWin">目标：平均盈利</option>
+          </select>
+          <button class="btn-backtest" @click="startOptimize" :disabled="optLaunching">
+            {{ optLaunching ? '已入队…' : '⚙ 发起全库寻优' }}
+          </button>
+          <button class="btn-refresh" @click="loadOptimizations">刷新</button>
+        </div>
+      </div>
+      <div v-if="loadingOpts" class="empty">加载中...</div>
+      <div v-else-if="optTasks.length === 0" class="empty">
+        暂无寻优结果——点右上「发起全库寻优」，任务进研究队列，完成后排名自动落库到这里。
+      </div>
+      <template v-else>
+        <div v-for="t in optTasks" :key="t.task_id">
+          <div class="lib-group-title">
+            任务 #{{ t.task_id }} · 目标 {{ objLabel(t.objective) }} · {{ (t.results||[]).length }} 条排名
+          </div>
+          <table class="opt-table">
+            <thead>
+              <tr><th>#</th><th>战法</th><th>止盈</th><th>持仓</th><th>门槛</th><th>胜率</th><th>盈亏比</th><th>触发</th><th>状态</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in t.results" :key="r.id">
+                <td>{{ r.rank }}</td>
+                <td>{{ r.strategy }}<span v-if="!r.strategy_kind" class="tag tag-kind kind-factor" style="margin-left:6px">内置</span></td>
+                <td>{{ fmtNum(r.params.trail_pct) }}%</td>
+                <td>{{ fmtNum(r.params.hold_days) }}天</td>
+                <td>{{ r.params.min_score ? fmtNum(r.params.min_score) : '—' }}</td>
+                <td>{{ fmtNum(r.win_rate, 1) }}%</td>
+                <td>{{ fmtNum(r.profit_factor, 2) }}</td>
+                <td>{{ r.trigger_count }}</td>
+                <td>
+                  <span v-if="r.status==='approved'" class="tag status-applied">已入库</span>
+                  <span v-else-if="r.status==='rejected'" style="color:var(--muted,#888)">已淘汰</span>
+                  <span v-else style="color:var(--muted,#888)">待审批</span>
+                </td>
+                <td style="white-space:nowrap">
+                  <template v-if="r.status === 'pending'">
+                    <button v-if="r.strategy_kind" class="btn-toggle" @click="approveOpt(r)">加入战法库</button>
+                    <span v-else style="font-size:12px;color:var(--muted,#888)">设置页调整</span>
+                    <button class="btn-reject" style="margin-left:6px" @click="rejectOpt(r)">淘汰</button>
+                  </template>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+    </div>
+    </template>
+    </template>
+
     <!-- ══════════ Tab 2: 战法库 ══════════ -->
     <template v-else-if="activeTab === 'library'">
     <!-- 战法库：已应用的因子战法（启用/禁用/删除/重命名 + 效果监测） -->
     <div class="library-panel">
       <div class="library-header">
         <div class="library-title">战法库（已应用因子战法）</div>
-        <button class="btn-refresh" @click="loadLibrary" :disabled="loadingLibrary">
-          {{ loadingLibrary ? '加载中...' : '刷新' }}
-        </button>
+        <div style="display:flex;gap:8px">
+          <!-- §P2-e 全库参数寻优入口：切到优化结果子页（发起/查看/审批） -->
+          <button class="btn-backtest" @click="activeTab = 'candidates'; candSubTab = 'optimize'; loadOptimizations()">
+            ⚙ 参数寻优
+          </button>
+          <button class="btn-refresh" @click="loadLibrary" :disabled="loadingLibrary">
+            {{ loadingLibrary ? '加载中...' : '刷新' }}
+          </button>
+        </div>
       </div>
       <!-- §P1-c 横排四卡：内置形态战法（名称+最新回测摘要；点击定位到下方列表行并展开详情） -->
       <div class="builtin-cards">
@@ -1006,6 +1079,68 @@ function selectStrategy(key) {
     el.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 }
+// ═══ §P2-e 参数寻优结果视图 ═══
+const candSubTab = ref('patterns')      // 候选 tab 子页：形态候选 | 优化结果
+const optObjective = ref('profitFactor') // 寻优目标
+const optTasks = ref([])                // 寻优任务分组列表
+const loadingOpts = ref(false)
+const optLaunching = ref(false)
+
+function objLabel(o) {
+  return { profitfactor: '盈亏比', profitFactor: '盈亏比', winrate: '胜率', winRate: '胜率', avgwin: '平均盈利', avgWin: '平均盈利' }[o] || (o || '-')
+}
+function fmtNum(v, digits) {
+  if (v === null || v === undefined || isNaN(v)) return '-'
+  const d = digits === undefined ? 0 : digits
+  return Number(v).toFixed(d)
+}
+/** 拉取寻优结果（切到优化结果子页时触发） */
+async function loadOptimizations() {
+  if (loadingOpts.value) return
+  loadingOpts.value = true
+  try {
+    const res = await api.fetchOptimizations()
+    optTasks.value = res.optimizations || []
+  } catch (e) {
+    console.warn('寻优结果加载失败', e)
+  } finally {
+    loadingOpts.value = false
+  }
+}
+/** 发起全库参数寻优（入队后提示去回测 tab 看进度；结果完成后回到本页刷新） */
+async function startOptimize() {
+  if (!confirm('发起全库战法参数寻优？\n目标：' + objLabel(optObjective.value) + '，盘后窗口执行，完成后排名出现在本页。')) return
+  try {
+    await api.enqueueOptimize({ objective: optObjective.value })
+    optLaunching.value = true
+    alert('已加入研究队列——进度可在「回测」tab 查看，完成后回到「优化结果」刷新。')
+  } catch (e) {
+    alert('发起失败: ' + (e.message || e))
+  }
+}
+/** 审批一条排名：参数覆盖写入该规则并热重载实盘 */
+async function approveOpt(r) {
+  const msg = '把参数应用到「' + r.strategy + '」？\n止盈 ' + fmtNum(r.params.trail_pct) + '% · 持仓 ' +
+    fmtNum(r.params.hold_days) + ' 天' + (r.params.min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') +
+    '\n审批后立即热重载生效。'
+  if (!confirm(msg)) return
+  try {
+    await api.approveOptimization(r.id)
+    r.status = 'approved'
+  } catch (e) {
+    alert('入库失败: ' + (e.message || e))
+  }
+}
+/** 淘汰一条排名 */
+async function rejectOpt(r) {
+  try {
+    await api.rejectOptimization(r.id)
+    r.status = 'rejected'
+  } catch (e) {
+    alert('操作失败: ' + (e.message || e))
+  }
+}
+
 const libGroupFactors = computed(() => library.value.filter(s => s.kind !== 'pattern'))
 const libGroupPatterns = computed(() => library.value.filter(s => s.kind === 'pattern'))
 const ruleGroups = computed(() => [
@@ -1343,6 +1478,11 @@ function stopPolling() {
  .lib-detail { margin-top:8px; padding:8px 10px; background:var(--bg,#f8fafc); border-radius:6px; }
  .lib-detail-text { font-size:12px; margin:0; white-space:pre-wrap; word-break:break-all; font-family:inherit; line-height:1.7; }
  .lib-detail-text.dim { color:var(--muted,#888); }
+ /* §P2-e 优化结果表格 */
+ .opt-table { width:100%; border-collapse:collapse; font-size:12px; margin-bottom:14px; }
+ .opt-table th, .opt-table td { padding:6px 8px; border-bottom:1px solid var(--border,#eee); text-align:left; }
+ .opt-table th { color:var(--muted,#666); font-weight:600; background:var(--bg,#f8fafc); }
+ .opt-table tr:hover td { background:rgba(59,130,246,.04); }
  .bt-result.pos { color: #4caf50; }
  .bt-result.neg { color: #FF4D4F; }
  .bt-progress { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; width: 220px; }
