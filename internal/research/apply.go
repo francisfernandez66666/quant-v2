@@ -77,6 +77,12 @@ type AppliedFactorEntry struct {
 	Win         int     `json:"win"`          // 触发后 Horizon 日收益为正次数
 	Loss        int     `json:"loss"`         // 触发后 Horizon 日收益为负次数
 	CumReturn   float64 `json:"cum_return"`   // 累计前向收益（% 或小数，由监控写入）
+
+	// §P2-d 规则级参数覆盖（扫参审批后写入；0=缺省用全局默认）。
+	// ExitTrailPct/ExitMaxHoldDays：回测 ruleEvalAdapter 立即生效；实盘出场接线见 v2 TODO。
+	// English: rule-level parameter overrides from sweep approvals (0 = use global defaults).
+	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`
+	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"`
 }
 
 // ApplyFactorRule 把审批通过的 factor 候选**追加**写入战法库 applied_factors.json（多战法共存），
@@ -350,6 +356,10 @@ type AppliedPatternEntry struct {
 	Win         int           `json:"win"`
 	Loss        int           `json:"loss"`
 	CumReturn   float64       `json:"cum_return"`
+
+	// §P2-d 规则级出场参数覆盖（扫参审批后写入；0=缺省全局默认）。形态无连续分，无门槛覆盖。
+	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`
+	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"`
 }
 
 // ApplyPatternRule 把审批通过的 pattern 候选**追加**写入战法库 applied_patterns.json（多形态共存，按候选 ID 幂等）。
@@ -573,4 +583,62 @@ func saveAppliedPatterns(dataDir string, entries []AppliedPatternEntry) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dataDir, "applied_patterns.json"), b, 0o644)
+}
+
+// ApplyOptimizationParams 把扫参审批的参数覆盖写入指定库规则（§P2-d）。
+// kind: "fac_<n>" / "pat_<n>"；params.MinScore>0 时覆盖因子规则的 buy_threshold；
+// TrailPct/HoldDays>0 时写规则级出场覆盖。任一字段为 0 表示保持现状。
+// English: persists sweep-approval overrides onto the library entry (factor: threshold+exits;
+// pattern: exits only). Zero fields are left untouched. Hot-reload is the caller's duty.
+func ApplyOptimizationParams(dataDir, kind string, trailPct float64, holdDays int, minScore float64) error {
+	if strings.HasPrefix(kind, "fac_") {
+		entries, err := ListAppliedFactorRules(dataDir)
+		if err != nil {
+			return err
+		}
+		hit := false
+		for i := range entries {
+			if entries[i].ID != kind {
+				continue
+			}
+			hit = true
+			if trailPct > 0 {
+				entries[i].ExitTrailPct = trailPct
+			}
+			if holdDays > 0 {
+				entries[i].ExitMaxHoldDays = holdDays
+			}
+			if minScore > 0 {
+				entries[i].BuyThreshold = minScore
+			}
+		}
+		if !hit {
+			return fmt.Errorf("战法库中不存在规则 %s", kind)
+		}
+		return saveAppliedFactors(dataDir, entries)
+	}
+	if strings.HasPrefix(kind, "pat_") {
+		entries, err := ListAppliedPatternRules(dataDir)
+		if err != nil {
+			return err
+		}
+		hit := false
+		for i := range entries {
+			if entries[i].ID != kind {
+				continue
+			}
+			hit = true
+			if trailPct > 0 {
+				entries[i].ExitTrailPct = trailPct
+			}
+			if holdDays > 0 {
+				entries[i].ExitMaxHoldDays = holdDays
+			}
+		}
+		if !hit {
+			return fmt.Errorf("战法库中不存在规则 %s", kind)
+		}
+		return saveAppliedPatterns(dataDir, entries)
+	}
+	return fmt.Errorf("内置战法暂不支持参数入库（%s）——请在设置页调整", kind)
 }

@@ -414,6 +414,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/research/library", s.authMiddleware(s.handleResearchLibrary))
 	// 阶段3.4 战法库回测入口：对战法库一条已应用规则跑历史回放回测（异步，结果进回测 tab）
 	s.mux.HandleFunc("POST /api/research/library/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleLibraryBacktest))
+	// §P2-f 参数优化：入队扫参 / 列表 / 审批（写规则覆盖+热重载）/ 淘汰
+	s.mux.HandleFunc("POST /api/backtest/optimize", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizeEnqueue))
+	s.mux.HandleFunc("GET /api/research/optimizations", s.authMiddleware(s.handleOptimizationList))
+	s.mux.HandleFunc("POST /api/research/optimizations/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationApprove))
+	s.mux.HandleFunc("POST /api/research/optimizations/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationReject))
 	s.mux.HandleFunc("POST /api/research/library/{id}/enable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("enable")))
 	s.mux.HandleFunc("POST /api/research/library/{id}/disable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("disable")))
 	s.mux.HandleFunc("POST /api/research/library/{id}/delete", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryDelete))

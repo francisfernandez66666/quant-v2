@@ -483,6 +483,9 @@ type ruleEvalAdapter struct {
 	ruleID string // 规则唯一 ID（fac_<n>/pat_<n>；扫参审批回写参数覆盖的定位键）
 	fs     *factor.FactorStrategy
 	ps     *pattern.PatternStrategy
+	// §P2-d 规则级出场覆盖（扫参审批写入 applied_*.json；nil=用全局默认 8%/15 天）。
+	trailOverride *float64
+	holdOverride  *int
 }
 
 // Name 返回规则显示名（如"因子战法#1"/"形态战法#2"），作为回测报告的分组键。
@@ -531,6 +534,15 @@ func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLin
 	if cost <= 0 || price <= 0 {
 		return nil, false
 	}
+	// §P2-d 规则级出场参数优先（扫参审批），缺省回退全局 8%/15 天。
+	trailLimit := 8.0
+	if a.trailOverride != nil && *a.trailOverride > 0 {
+		trailLimit = -*a.trailOverride
+	}
+	holdLimit := 15
+	if a.holdOverride != nil && *a.holdOverride > 0 {
+		holdLimit = *a.holdOverride
+	}
 	stageHigh := cost
 	if h, ok := ctx.EntryMeta["highest_price"]; ok && h > stageHigh {
 		stageHigh = h
@@ -539,14 +551,14 @@ func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLin
 		stageHigh = price
 		ctx.EntryMeta["highest_price"] = stageHigh // 抬高并随 ctx 持续到后续交易日
 	}
-	// 移动止盈：阶段高点回撤 8%（且曾盈利）→ 平仓保护利润
-	if trailPct := (price - stageHigh) / stageHigh * 100; trailPct <= -8 && stageHigh > cost {
+	// 移动止盈：阶段高点回撤达阈值（且曾盈利）→ 平仓保护利润
+	if trailPct := (price - stageHigh) / stageHigh * 100; trailPct <= trailLimit && stageHigh > cost {
 		return &strategy.ExitResult{Reason: "回撤止损(移动止盈)", Priority: strategy.P2}, true
 	}
-	// 超期：持仓超过 15 天强制离场
+	// 超期：持仓超上限强制离场
 	if ctx.EntryAt != "" {
 		if entryDate, err := time.Parse("2006-01-02", ctx.EntryAt); err == nil {
-			if days := int(ctx.Now.Sub(entryDate).Hours() / 24); days >= 15 {
+			if days := int(ctx.Now.Sub(entryDate).Hours() / 24); days >= holdLimit {
 				return &strategy.ExitResult{Reason: "持仓超期离场", Priority: strategy.P3}, true
 			}
 		}
@@ -559,27 +571,63 @@ func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLin
 func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 	switch strings.ToLower(kind) {
 	case "factor", "factor_rules", "applied_factors":
-		rules, err := research.LoadEnabledFactorRules(dataDir)
+		// §P2-d：直接读库条目以携带规则级出场覆盖（扫参审批后回测立即生效）；
+		// English: read library entries directly so sweep-approved exit overrides apply to replays.
+		entries, err := research.ListAppliedFactorRules(dataDir)
 		if err != nil {
 			return nil, err
 		}
-		out := make([]adapter, 0, len(rules))
-		for _, r := range rules {
-			fs := factor.New()
-			fs.SetRules([]*factor.ActiveRule{r})
-			out = append(out, &ruleEvalAdapter{name: r.Name, ruleID: r.ID, fs: fs})
+		out := make([]adapter, 0, len(entries))
+		for i := range entries {
+			e := &entries[i]
+			if !e.Enabled || len(e.Factors) == 0 {
+				continue
+			}
+			r := &factor.ActiveRule{
+				ID: e.ID, Name: e.Name, CandID: e.CandID,
+				Rule: factor.Rule{
+					Factors: e.Factors, Weights: e.Weights, Directions: e.Directions,
+					BuyThreshold: e.BuyThreshold,
+				},
+			}
+			ad := &ruleEvalAdapter{name: r.Name, ruleID: r.ID,
+				fs: func() *factor.FactorStrategy { f := factor.New(); f.SetRules([]*factor.ActiveRule{r}); return f }()}
+			if e.ExitTrailPct > 0 {
+				ad.trailOverride = &e.ExitTrailPct
+			}
+			if e.ExitMaxHoldDays > 0 {
+				h := e.ExitMaxHoldDays
+				ad.holdOverride = &h
+			}
+			out = append(out, ad)
 		}
 		return out, nil
 	case "pattern", "pattern_rules", "applied_patterns":
-		rules, err := research.LoadEnabledPatternRules(dataDir)
-		if err != nil {
-			return nil, err
+		// §P2-d：同因子分支，直读条目以携带扫参审批的出场覆盖。
+		pentries, perr := research.ListAppliedPatternRules(dataDir)
+		if perr != nil {
+			return nil, perr
 		}
-		out := make([]adapter, 0, len(rules))
-		for _, r := range rules {
-			ps := pattern.New()
-			ps.SetRules([]*pattern.ActivePattern{r})
-			out = append(out, &ruleEvalAdapter{name: r.Name, ruleID: r.ID, ps: ps})
+		out := make([]adapter, 0, len(pentries))
+		for i := range pentries {
+			e := &pentries[i]
+			if !e.Enabled || len(e.Conds) == 0 {
+				continue
+			}
+			ap := &pattern.ActivePattern{ID: e.ID, Name: e.Name, CandID: e.CandID}
+			for _, cd := range e.Conds {
+				ap.Conds = append(ap.Conds, pattern.Cond{Factor: cd.Factor, Min: cd.Min, Max: cd.Max})
+			}
+			ad := &ruleEvalAdapter{name: ap.Name, ruleID: ap.ID,
+				ps: func() *pattern.PatternStrategy { p := pattern.New(); p.SetRules([]*pattern.ActivePattern{ap}); return p }()}
+			if e.ExitTrailPct > 0 {
+				ad.trailOverride = &e.ExitTrailPct
+			}
+			if e.ExitMaxHoldDays > 0 {
+				h := e.ExitMaxHoldDays
+				ad.holdOverride = &h
+			}
+			out = append(out, ad)
 		}
 		return out, nil
 	}
