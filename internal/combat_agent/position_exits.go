@@ -241,6 +241,14 @@ func exitSignalFromResult(pos report.ExecLog, price float64, res *strategy.ExitR
 // English: generic exit fallback for manual/unknown positions — a trailing stop from the stage high plus
 // a timeout force-exit; threshold-based TP/SL stays with CheckPositionAlerts, this adds profit protection.
 func genericTrailingExit(ctx *strategy.ExitContext, now time.Time) *strategy.ExitResult {
+	return genericTrailingExitWith(ctx, now, 8, 15)
+}
+
+// genericTrailingExitWith 通用退出的参数化版本：trailPct=移动止盈回撤阈值(%)，
+// maxHoldDays=超期天数。§P2-d 实盘接线：因子/形态持仓按规则级覆盖执行（见 ruleExitParamsFor）。
+// English: parameterized generic exit — trailing threshold and max hold days injectable so
+// factor/pattern positions honor their sweep-approved rule-level overrides.
+func genericTrailingExitWith(ctx *strategy.ExitContext, now time.Time, trailPct float64, maxHoldDays int) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
 	if cost <= 0 || price <= 0 {
@@ -250,17 +258,17 @@ func genericTrailingExit(ctx *strategy.ExitContext, now time.Time) *strategy.Exi
 	if h, ok := ctx.EntryMeta["highest_price"]; ok && h > stageHigh {
 		stageHigh = h
 	}
-	// 移动止盈：阶段高点回撤 8%（且曾盈利）→ 减仓保护利润
-	trailPct := (price - stageHigh) / stageHigh * 100
-	if trailPct <= -8 && stageHigh > cost {
+	// 移动止盈：阶段高点回撤达阈值（且曾盈利）→ 减仓保护利润
+	trail := (price - stageHigh) / stageHigh * 100
+	if trail <= -trailPct && stageHigh > cost {
 		return &strategy.ExitResult{Reason: "回撤止损(移动止盈)", Priority: strategy.P2}
 	}
-	// 超期：持仓超过 15 天未完成形态，强制离场提醒
+	// 超期：持仓超过上限未完成形态，强制离场提醒
 	if ctx.EntryAt != "" {
 		entryDate, err := time.Parse("2006-01-02", ctx.EntryAt)
 		if err == nil {
 			days := int(now.Sub(entryDate).Hours() / 24)
-			if days >= 15 {
+			if days >= maxHoldDays {
 				return &strategy.ExitResult{Reason: "持仓超期离场", Priority: strategy.P3}
 			}
 		}
@@ -319,7 +327,20 @@ func (a *Agent) CheckPositionsExits(rpt *report.Report, quotes map[string]*data.
 		case exitStrategyDragonReturn:
 			res = dragon_return.CheckExit(ctx, &drCfg)
 		default:
-			res = genericTrailingExit(ctx, now)
+			// §P2-d 实盘接线：因子/形态战法持仓优先用规则级出场覆盖（扫参审批后热生效）
+			if ov := ruleExitParamsFor(pos.Strategy); ov != nil {
+				trail := ov.trailPct
+				if trail <= 0 {
+					trail = 8
+				}
+				hold := ov.holdDays
+				if hold <= 0 {
+					hold = 15
+				}
+				res = genericTrailingExitWith(ctx, now, trail, hold)
+			} else {
+				res = genericTrailingExit(ctx, now)
+			}
 		}
 
 		if res == nil {

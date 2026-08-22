@@ -347,13 +347,14 @@ func (a *Agent) ReloadFactorRules(dataDir string) {
 		return
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	for i := range a.runners {
 		if fs, ok := a.runners[i].Strategy.(*factorstrat.FactorStrategy); ok {
 			fs.SetRules(rules)
 			log.Printf("[combat_agent] 因子战法库已热重载: %d 条规则", len(rules))
 		}
 	}
+	a.mu.Unlock()
+	a.refreshExitOverrides(dataDir) // §P2-d：同步重建规则级出场覆盖（含形态库，避免单侧刷新互相覆盖）
 }
 
 // FactorStats 返回因子 runner 的各规则运行统计（效果监测）。
@@ -390,13 +391,37 @@ func (a *Agent) ReloadPatternRules(dataDir string) {
 		return
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	for i := range a.runners {
 		if ps, ok := a.runners[i].Strategy.(*patternstrat.PatternStrategy); ok {
 			ps.SetRules(rules)
 			log.Printf("[combat_agent] 形态战法库已热重载: %d 条规则", len(rules))
 		}
 	}
+	a.mu.Unlock()
+	a.refreshExitOverrides(dataDir)
+}
+
+// refreshExitOverrides 重建规则级出场覆盖注册表（§P2-d 实盘接线）。
+// 因子+形态两库合并刷新——注册表是全局单份，单库刷新必须双读，否则会清掉另一侧的覆盖。
+// English: rebuilds the exit-override registry from BOTH libraries (the registry is global;
+// single-side reloads must read both so the other side's overrides survive).
+func (a *Agent) refreshExitOverrides(dataDir string) {
+	fe, e1 := research.ListAppliedFactorRules(dataDir)
+	pe, e2 := research.ListAppliedPatternRules(dataDir)
+	if e1 != nil && e2 != nil {
+		log.Printf("[combat_agent] 出场覆盖注册表刷新失败: %v / %v", e1, e2)
+		return
+	}
+	if fe == nil {
+		fe = []research.AppliedFactorEntry{}
+	}
+	if pe == nil {
+		pe = []research.AppliedPatternEntry{}
+	}
+	SetRuleExitOverrides(fe, pe)
+	n := len(fe) + len(pe)
+	log.Printf("[combat_agent] 出场覆盖注册表已同步: 因子 %d 条 / 形态 %d 条", len(fe), len(pe))
+	_ = n
 }
 
 // PatternStats 返回形态 runner 的各规则运行统计（效果监测）。

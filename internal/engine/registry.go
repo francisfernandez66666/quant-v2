@@ -629,6 +629,20 @@ func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userI
 			}
 		}
 	}
+	// §P2-d 实盘接线：启动装配时同步规则级出场覆盖（扫参审批的止盈/超期对实盘生效）。
+	// English: seed the rule-level exit-override registry at startup assembly.
+	if fe, e1 := research.ListAppliedFactorRules(dataDir); e1 == nil {
+		pe, e2 := research.ListAppliedPatternRules(dataDir)
+		if e2 == nil {
+			if fe == nil {
+				fe = []research.AppliedFactorEntry{}
+			}
+			if pe == nil {
+				pe = []research.AppliedPatternEntry{}
+			}
+			combat_agent.SetRuleExitOverrides(fe, pe)
+		}
+	}
 	return runners
 }
 
