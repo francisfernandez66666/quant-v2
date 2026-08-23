@@ -13,6 +13,11 @@ import (
 // （Checks in order: hard stop-loss → formation failed at entry (phase=5) → post-14:57 close-out/take-profit by entry phase →
 // volume drain. Returns nil to hold, else an exit suggestion with reason and priority.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.ExitResult {
+	// §扫参统一出场（STRATEGY_OPTIMIZE_PLAN）：配置了 trailing_drawback_pct/max_hold_days
+	// 时优先执行——与扫参排名同口径；未配置(0)时完全走既有规则，行为零变更。
+	if res := strategy.ApplyTrailingHoldExit(ctx, cfg.TrailingDrawbackPct, cfg.MaxHoldDays); res != nil {
+		return res
+	}
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
 	// 成本或现价非法时无法评估，视为不退出（Cannot evaluate with invalid cost/price; hold）

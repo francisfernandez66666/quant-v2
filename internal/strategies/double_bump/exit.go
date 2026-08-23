@@ -12,6 +12,11 @@ import (
 // volume distribution (P1) → break below MA5 (P2) → take-profit (P2) → 8% trail stop (P2) → timeout (P3).）
 // 返回 nil 表示继续持有。（Returns nil to keep holding.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strategy.ExitResult {
+	// §扫参统一出场（STRATEGY_OPTIMIZE_PLAN）：配置了 trailing_drawback_pct/max_hold_days
+	// 时优先执行——与扫参排名同口径；未配置(0)时完全走既有规则，行为零变更。
+	if res := strategy.ApplyTrailingHoldExit(ctx, cfg.TrailingDrawbackPct, cfg.MaxHoldDays); res != nil {
+		return res
+	}
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
 	// 成本或现价非法时无法评估，视为不退出（Cannot evaluate with invalid cost/price; hold）

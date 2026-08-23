@@ -12,6 +12,11 @@ import (
 // take-profit → post-buy pullback (all/half) → broken-seal retreat → bad close on entry day → weak next-day open → timeout.）
 // 返回 nil 表示继续持有。（Returns nil to keep holding.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.ExitResult {
+	// §扫参统一出场（STRATEGY_OPTIMIZE_PLAN）：配置了 trailing_drawback_pct/max_hold_days
+	// 时优先执行——与扫参排名同口径；未配置(0)时完全走既有规则，行为零变更。
+	if res := strategy.ApplyTrailingHoldExit(ctx, cfg.TrailingDrawbackPct, cfg.MaxHoldDays); res != nil {
+		return res
+	}
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
 	// 成本或现价非法时无法评估，视为不退出（Cannot evaluate with invalid cost/price; hold）

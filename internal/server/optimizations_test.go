@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
@@ -38,7 +39,8 @@ func TestOptimizationEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s := &Server{researchDB: db, researchDir: dir}
+	cfgMgr := config.NewManager("")
+	s := &Server{researchDB: db, researchDir: dir, cfg: cfgMgr}
 	seedOptLib(t, dir)
 
 	if err := db.SaveOptimizationResults(990, "profitfactor", []map[string]any{
@@ -55,13 +57,17 @@ func TestOptimizationEndpoints(t *testing.T) {
 	rows, _ := db.OptimizationResultsByTask(990)
 	builtinID, ruleID := rows[0].ID, rows[1].ID
 
-	// ① 内置行（无 strategy_kind）审批 → 400
+	// ① 内置行（双响炮）审批：写统一出场旋钮到 config（§P2 反馈升级——四内置全支持）
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/approve", nil)
 	req.SetPathValue("id", itoa(builtinID))
 	s.handleOptimizationApprove(rr, req)
-	if rr.Code != 400 {
-		t.Fatalf("内置行应 400, got %d body=%s", rr.Code, rr.Body.String())
+	if rr.Code != 200 {
+		t.Fatalf("内置行应用参数失败 code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	gotCfg := cfgMgr.GetStrategyConfig()
+	if gotCfg.DoubleBump.TrailingDrawbackPct != 8 || gotCfg.DoubleBump.MaxHoldDays != 15 {
+		t.Fatalf("双响炮统一出场旋钮未写入: %+v", gotCfg.DoubleBump)
 	}
 
 	// ② 规则行审批 → 覆盖落 applied_factors.json + status=approved

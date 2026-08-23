@@ -74,9 +74,12 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 		// 二期：进程内调用 btreplay（bt_strategy 已并入 research 二进制）。
 		// English: phase-2 — in-process replay via internal/btreplay.
 		o := &btreplay.Options{
-			DBPath:      dbPath,
-			DataDir:     payloadStr(p, "datadir", dataDirOf(dbPath)),
-			Start:       payloadStr(p, "start", "20230101"),
+			DBPath:  dbPath,
+			DataDir: payloadStr(p, "datadir", dataDirOf(dbPath)),
+			// 默认起点对齐夜间研究窗口 20230801（§8.6-A）：裸默认 20200101 在 8 年区间上
+			// 合成/装配分钟级零反馈，且与候选回测(服务端显式 20230801)不一致——同类操作
+			// 不同时间窗会产出不可比的"胜率"，极易误导（2026-08-23 参数审计）。
+			Start:       payloadStr(p, "start", "20230801"),
 			End:         payloadStr(p, "end", today()),
 			Strategy:    payloadStr(p, "kind", "factor"),
 			MaxStocks:   payloadIntDef(p, "maxstocks", 300),

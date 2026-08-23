@@ -476,7 +476,7 @@ func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
 		kind = strings.ToLower(strings.TrimSpace(ruleID))
 	}
 	q := r.URL.Query()
-	payload := map[string]any{"kind": kind}
+	payload := map[string]any{"kind": kind, "start": "20230801"} // 默认与夜间窗口/候选回测对齐
 	if v := q.Get("start"); v != "" {
 		payload["start"] = v
 	}

@@ -448,6 +448,12 @@ type DragonConfig struct {
 	BuyDayCloseBelow       float64 `json:"buy_day_close_below"`        // 买入日收盘低于买入价比例止损
 	NextOpenIfBelow        float64 `json:"next_open_if_below"`         // 次日开盘低于此比例则卖出
 	TakeProfitPct          float64 `json:"take_profit_pct"`            // 止盈比例(%)，浮盈达此值落袋（默认 10）
+	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
+	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
+	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
+	// English: sweep-aligned trailing-stop %% and max-hold-days knobs; 0 = disabled (legacy rules only).
+	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
+	MaxHoldDays         int     `json:"max_hold_days,omitempty"`
 }
 
 // DoubleBumpConfig 双响炮战法参数：一突/二突放量倍数、调整周期、仓位比例等。
@@ -462,6 +468,12 @@ type DoubleBumpConfig struct {
 	MAWeight                  float64 `json:"ma_weight"`                    // 均线因子权重
 	VolumeWeight              float64 `json:"volume_weight"`                // 量能因子权重
 	DoubleBumpTakeProfitPct   float64 `json:"double_bump_take_profit_pct"`  // 双响炮止盈比例
+	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
+	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
+	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
+	// English: sweep-aligned trailing-stop %% and max-hold-days knobs; 0 = disabled (legacy rules only).
+	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
+	MaxHoldDays         int     `json:"max_hold_days,omitempty"`
 }
 
 // NShapeConfig N 形战法参数：D1~D4 评分阈值、旗形整理区间、突破量比等。
@@ -469,6 +481,12 @@ type DoubleBumpConfig struct {
 type NShapeConfig struct {
 	NPatternScoreThreshold float64 `json:"n_pattern_score_threshold"` // N 形形态总分阈值
 	HardStopLoss           float64 `json:"hard_stop_loss"`            // 硬止损比例
+	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
+	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
+	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
+	// English: sweep-aligned trailing-stop %% and max-hold-days knobs; 0 = disabled (legacy rules only).
+	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
+	MaxHoldDays         int     `json:"max_hold_days,omitempty"`
 }
 
 // DragonReturnConfig 龙回头战法参数：回调幅度、量缩比、止盈止损、持仓天数等。

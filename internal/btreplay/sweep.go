@@ -34,11 +34,39 @@ type SweepConfig struct {
 var (
 	sweepTrail = []float64{5, 8, 10, 12, 15}
 	sweepHold  = []int{5, 10, 15, 20, 30}
-	sweepScore = []float64{50, 60, 70, 80}
 )
 
 // sweepMinTrades 进入排名的最低触发数——几笔交易 100% 胜率的组合没有统计意义。
 const sweepMinTrades = 20
+
+// scoreQuantiles 从触发分数里取自适应阈值：p40/p60/p80/p95 分位数（去重升序）。
+// 样本不足或分布无区分度（全同分）返回 nil——调用方跳过门槛维。
+// 保证每档阈值都真实切分该战法的分数分布，而不是落在分布外产生完全相同的重复组合。
+// English: adaptive thresholds from trigger-score quantiles (p40/p60/p80/p95, deduped);
+// nil when there aren't enough samples or the distribution has no spread.
+func scoreQuantiles(scores []float64) []float64 {
+	if len(scores) < sweepMinTrades {
+		return nil
+	}
+	sorted := append([]float64(nil), scores...)
+	sort.Float64s(sorted)
+	pick := func(p float64) float64 {
+		idx := int(p * float64(len(sorted)-1))
+		v := sorted[idx]
+		return math.Round(v)
+	}
+	out := make([]float64, 0, 4)
+	for _, p := range []float64{0.40, 0.60, 0.80, 0.95} {
+		v := pick(p)
+		if v > 0 && (len(out) == 0 || out[len(out)-1] != v) {
+			out = append(out, v)
+		}
+	}
+	if len(out) < 2 {
+		return nil // 分布挤在一起（如全部顶格）——门槛维无意义，跳过
+	}
+	return out
+}
 
 // sweepMaxCacheStocks 扫参 K 线缓存的全局护栏：防止 CLI 直跑（MaxStocks=0=全市场）
 // 把研究侧 cgroup 挤爆。English: hard cap on the sweep kline cache.
@@ -88,8 +116,8 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	if topN <= 0 {
 		topN = 10
 	}
-	log.Printf("扫参启动：%d 战法 × 网格(止盈%d档×持仓%d档×门槛%d档) 目标=%s",
-		len(ads), len(sweepTrail), len(sweepHold), len(sweepScore), objName)
+	log.Printf("扫参启动：%d 战法 × 网格(止盈%d档×持仓%d档×门槛=各战法分数分位数自适应) 目标=%s",
+		len(ads), len(sweepTrail), len(sweepHold), objName)
 
 	// ── 1) K 线一次性载入内存（300 只 × 数年日线 ≈ 几十 MB，cgroup 内安全）──
 	// 内存护栏：CLI 直跑未传 MaxStocks 时兜底截断——扫参的 K 线全量缓存必须受控，
@@ -139,9 +167,19 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	perAdCombos := make([][]combo, len(ads))
 	total := 0
 	for ai := range ads {
+		// 门槛档位：有连续分的战法用其触发分数分位数（真实切分分布）；
+		// 无分（形态区间命中）或分布无区分度 → 只跑默认档 0。
 		scores := []float64{0}
 		if adScored[ai] {
-			scores = sweepScore
+			var scs []float64
+			for _, t := range triggers[ai] {
+				if t.score >= 0 {
+					scs = append(scs, t.score)
+				}
+			}
+			if q := scoreQuantiles(scs); len(q) > 0 {
+				scores = q
+			}
 		}
 		for _, t := range sweepTrail {
 			for _, h := range sweepHold {

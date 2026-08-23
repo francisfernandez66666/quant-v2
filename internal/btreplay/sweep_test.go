@@ -119,3 +119,32 @@ func abs(f float64) float64 {
 	}
 	return f
 }
+
+func TestScoreQuantilesAdaptive(t *testing.T) {
+	// 分布 60~95：p40/p60/p80/p95 应真实切分且各不相同
+	scores := make([]float64, 100)
+	for i := range scores {
+		scores[i] = float64(60 + i%36) // 60..95 循环
+	}
+	q := scoreQuantiles(scores)
+	if q == nil || len(q) < 2 {
+		t.Fatalf("应有自适应阈值: %v", q)
+	}
+	for i := 1; i < len(q); i++ {
+		if q[i] <= q[i-1] {
+			t.Fatalf("阈值应严格递增去重: %v", q)
+		}
+	}
+	// 样本不足 → nil（跳过门槛维）
+	if q := scoreQuantiles([]float64{70, 70, 70}); q != nil {
+		t.Fatalf("小样本应 nil: %v", q)
+	}
+	// 全同分（无区分度）→ nil：这正是"四档数据完全一样"的免疫机制
+	same := make([]float64, 50)
+	for i := range same {
+		same[i] = 85
+	}
+	if q := scoreQuantiles(same); q != nil {
+		t.Fatalf("无区分度分布应 nil: %v", q)
+	}
+}

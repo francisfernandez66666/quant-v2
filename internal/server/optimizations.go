@@ -81,9 +81,7 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 	}
 	p := row.Params
 	if row.StrategyKind == "" {
-		// §内置战法一键应用：仅龙回头具备语义一致的出场旋钮
-		// （trailing_drawback=移动止盈回撤%、max_hold_days=超期天数）；
-		// 其余内置的出场结构是固定止盈/硬止损，硬填会把回撤止盈错配成固定止盈，明确拒绝。
+		// §内置战法一键应用：四内置均写统一出场旋钮（trailing_drawback_pct/max_hold_days）
 		if err := s.applyBuiltinOptParams(row); err != nil {
 			writeError(w, 400, err.Error())
 			return
@@ -129,24 +127,36 @@ func (s *Server) reloadRulesByKind(kind string) {
 	}
 }
 
-// applyBuiltinOptParams 内置战法的一键应用（§P2 用户反馈）：把扫参冠军参数写进 config.json。
-// 仅龙回头完整映射（移动止盈回撤 + 最长持仓）；落盘后引擎主循环每轮 HotReload 自动生效。
-// English: applies sweep params onto a builtin strategy's config (only DragonReturn maps
-// semantically today); persisted via the manager and hot-applied by the engine's per-cycle reload.
+// applyBuiltinOptParams 内置战法的一键应用（§P2 反馈升级版）：四个手写战法全部支持——
+// 把扫参冠军的 移动止盈回撤% + 最长持仓天 写进各自 config 段的统一出场旋钮
+// （trailing_drawback_pct/max_hold_days，CheckExit 最前执行），落盘后引擎主循环每轮
+// HotReload 自动生效；语义与扫参排名的统一出场引擎完全同口径。原有个股规则（破板/
+// 止盈止损等）保持不动、仍在其后生效。min_score 不应用于内置（其入场门槛是内部评分结构）。
 func (s *Server) applyBuiltinOptParams(row *store.OptimizationResult) error {
-	if row.Strategy != "龙回头" {
-		return fmt.Errorf("「%s」暂无可一键应用的出场参数（仅龙回头支持移动止盈/持仓天数映射）——请在设置页调整", row.Strategy)
-	}
 	cfg := s.cfg.GetStrategyConfig()
 	if cfg == nil {
 		return fmt.Errorf("策略配置未初始化")
 	}
 	p := row.Params
-	if p.TrailPct > 0 {
-		cfg.DragonReturn.TrailingDrawback = p.TrailPct
+	apply := func(trail *float64, hold *int) {
+		if p.TrailPct > 0 {
+			*trail = p.TrailPct
+		}
+		if p.HoldDays > 0 {
+			*hold = p.HoldDays
+		}
 	}
-	if p.HoldDays > 0 {
-		cfg.DragonReturn.MaxHoldDays = p.HoldDays
+	switch row.Strategy {
+	case "双响炮":
+		apply(&cfg.DoubleBump.TrailingDrawbackPct, &cfg.DoubleBump.MaxHoldDays)
+	case "龙头":
+		apply(&cfg.Dragon.TrailingDrawbackPct, &cfg.Dragon.MaxHoldDays)
+	case "龙回头":
+		apply(&cfg.DragonReturn.TrailingDrawback, &cfg.DragonReturn.MaxHoldDays)
+	case "N形":
+		apply(&cfg.NShape.TrailingDrawbackPct, &cfg.NShape.MaxHoldDays)
+	default:
+		return fmt.Errorf("未知内置战法：%s", row.Strategy)
 	}
 	s.cfg.SetStrategyConfig(cfg)
 	return nil

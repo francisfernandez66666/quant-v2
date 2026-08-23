@@ -138,10 +138,10 @@
                     {{ optDetailOpen === r.id ? '收起' : '详情' }}
                   </button>
                   <template v-if="r.status === 'pending'">
-                    <button v-if="r.strategy_kind || r.strategy === '龙回头'" class="btn-toggle"
-                            @click="approveOpt(r)">{{ r.strategy_kind ? '加入战法库' : '应用参数' }}</button>
-                    <span v-else :title="'该战法的出场结构是固定止盈/硬止损，暂无移动止盈/持仓天数旋钮'"
-                          style="font-size:12px;color:var(--muted,#888)">设置页调整</span>
+                    <button v-if="r.strategy_kind" class="btn-toggle"
+                            @click="approveOpt(r)">加入战法库</button>
+                    <button v-else class="btn-toggle" @click="approveOpt(r)"
+                            title="写入该战法的移动止盈回撤%与最长持仓天（config 热生效，原有个股规则不变）">应用参数</button>
                     <button class="btn-reject" style="margin-left:6px" @click="rejectOpt(r)">淘汰</button>
                   </template>
                 </td>
