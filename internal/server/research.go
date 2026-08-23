@@ -2,16 +2,18 @@
 package server
 
 import (
-	"quant-trading-v2/internal/store"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"quant-trading-v2/internal/store"
 	"strconv"
 
 	"quant-trading-v2/internal/factor"
 	"quant-trading-v2/internal/research"
+	"sync"
+	"time"
 )
 
 // handleResearchFactors 处理 GET /api/research/factors：返回全部已注册因子的元数据
@@ -40,16 +42,45 @@ func (s *Server) handleResearchFactors(w http.ResponseWriter, r *http.Request) {
 // （handleResearchProgress serves GET /api/research/progress — the research DB data-loading and
 // research-task progress: stock counts, daily coverage, financial coverage, candidate counts and
 // how many stocks are research-ready. The auto-research page renders progress bars from this.）
+// progressCache 进度接口结果缓存：该接口含三次全表统计（daily 765万行 COUNT/GROUP BY），
+// 浏览器 30s 轮询 × 全表扫描曾参与把整机挤进内存枯竭（2026-08-23 实录）。
+// 60s 缓存对进度条展示完全够用。English: 60s cache — three full-table stats per poll was a wedge ingredient.
+var progressCache struct {
+	mu   sync.Mutex
+	at   time.Time
+	body map[string]any
+}
+
 func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) {
 	if s.researchDB == nil {
 		writeError(w, 503, "研究库未接入")
 		return
 	}
+	progressCache.mu.Lock()
+	if progressCache.body != nil && time.Since(progressCache.at) < 60*time.Second {
+		body := progressCache.body
+		progressCache.mu.Unlock()
+		writeJSON(w, 200, body)
+		return
+	}
+	progressCache.mu.Unlock()
+	body := s.computeResearchProgress(w)
+	if body == nil {
+		return
+	}
+	progressCache.mu.Lock()
+	progressCache.at, progressCache.body = time.Now(), body
+	progressCache.mu.Unlock()
+	writeJSON(w, 200, body)
+}
+
+// computeResearchProgress 真正的统计逻辑（原 handler 体，签名化以便缓存包装）。
+func (s *Server) computeResearchProgress(w http.ResponseWriter) map[string]any {
 	db := s.researchDB
 	stocks, err := db.StockCodes()
 	if err != nil {
 		writeError(w, 500, err.Error())
-		return
+		return nil
 	}
 	nStocks := len(stocks)
 
@@ -57,7 +88,7 @@ func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) 
 	dailyRows, err := db.Count("daily", "")
 	if err != nil {
 		writeError(w, 500, err.Error())
-		return
+		return nil
 	}
 	// 研究池：近一年（约 244 个交易日）有行情的股票数
 	ready := 0
@@ -65,20 +96,20 @@ func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) 
 		ready, err = db.ReadyStockCount()
 		if err != nil {
 			writeError(w, 500, err.Error())
-			return
+			return nil
 		}
 	}
 	// 财务覆盖（近一年有财报的股票数，作为因子可用性代理）
 	fin, err := db.Count("fina_indicator", "")
 	if err != nil {
 		writeError(w, 500, err.Error())
-		return
+		return nil
 	}
 	// 候选产出
 	cands, err := db.ListCandidates("")
 	if err != nil {
 		writeError(w, 500, err.Error())
-		return
+		return nil
 	}
 	applied, proposed := 0, 0
 	for _, c := range cands {
@@ -96,7 +127,7 @@ func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) 
 		readyPct = float64(ready) / float64(nStocks)
 	}
 	log.Printf("[research] progress: stocks=%d ready=%d daily_rows=%d fin=%d cands=%d", nStocks, ready, dailyRows, fin, len(cands))
-	writeJSON(w, 200, map[string]any{
+	return map[string]any{
 		"stocks":       nStocks,
 		"ready_stocks": ready,
 		"ready_pct":    readyPct,
@@ -107,7 +138,7 @@ func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) 
 		"proposed":     proposed,
 		"db_attached":  true,
 		"scheduler":    s.schedulerState(),
-	})
+	}
 }
 
 // schedulerState 读取 research_state.json 的最近步骤结果（阶段2.4 状态上报）：

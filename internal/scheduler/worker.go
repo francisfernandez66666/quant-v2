@@ -704,6 +704,14 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 				return
 			case <-t.C:
 			}
+			// §运行时熔断：任务跑着跑着把系统内存吃到危急线（如夜间排水撞上其他占用）
+			// ——主动抢占自己落 preempted，断点续跑；绝不拖垮 SSH/caddy/quant。
+			// 阈值=总闸一半（默认200MB）：入口闸放行后环境恶化时这里是最后一道防线。
+			if av := readMemAvailableMB(); av >= 0 && av < memGateDefaultMB/2 {
+				log.Printf("[scheduler] 运行时熔断：MemAvailable=%dMB < %dMB，抢占当前任务 #%d(%s) 留队续跑",
+					av, memGateDefaultMB/2, tk.ID, tk.Type)
+				s.preemptCurrent("系统内存危急(运行时熔断)")
+			}
 			c, err := db.ConsumeTaskControl(tk.ID)
 			if err != nil || c == "" {
 				continue
