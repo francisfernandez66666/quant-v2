@@ -15,6 +15,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# 敏感项从 /etc/quant.env 注入（HITHINK_FINANCE_API_KEY 等），文件缺失不报错
+EnvironmentFile=-/etc/quant.env
 Type=simple
 User=quant
 Group=quant
@@ -48,7 +50,7 @@ Environment=TZ=Asia/Shanghai
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
 Environment=PATH=/opt/quant:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # 单核执行：研究作业本就慢可接受，限制单核避免挤占 quant 主程序与 sshd
-Environment=GOMAXPROCS=1
+Environment=GOMAXPROCS=4
 
 # 加固：子进程（research/dataload）同样以 quant 用户运行
 NoNewPrivileges=true
