@@ -358,6 +358,7 @@ async function collectToWatchlist(s) {
     showFeedback('收藏失败: ' + e.message, 'err')
   }
 }
+// // 拉取信号列表（含去重键与状态过滤）
 async function load() {
   try { signals.value = await api.fetchSignals() } catch (_) {}
 }

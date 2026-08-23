@@ -416,10 +416,12 @@ const tradeDir = ref('add')           // add / trim / close
 const tradeTarget = ref(null)         // 目标持仓
 const tradeFormPrice = ref(0)         // 输入价格（0=用实时价）
 const tradeFormQty = ref(1)           // 输入手数（1手=100股）
+// // 模拟下单预览：按置信度×止损宽度折算建议股数
 const tradePreviewQty = computed(() => {
   const q = parseInt(tradeFormQty.value, 10)
   return isNaN(q) || q <= 0 ? 0 : q
 })
+// // 超卖校验：请求股数超过可用现金可买的上限时提示
 const tradeOverSell = computed(() =>
   tradeDir.value === 'trim' && tradeTarget.value && tradePreviewQty.value * 100 >= tradeTarget.value.qty
 )
@@ -457,6 +459,7 @@ function tradeSlippage(t) {
   const pct = (t.price - t.signal_price) / t.signal_price * 100
   return (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%'
 }
+// // 个股滑点配色：滑点越大越红
 function tradeSlippageCls(t) {
   if (t.side !== 'buy' || !(t.signal_price > 0)) return ''
   return t.price >= t.signal_price ? 'down' : 'up'
@@ -484,6 +487,7 @@ const filteredPositions = computed(() => {
   if (activePool.value === null) return positions.value
   return positions.value.filter(p => normPoolKey(p.strategy_type) === activePool.value)
 })
+// // 成交流水过滤（按当前 tab 的池/战法筛选）
 const filteredTrades = computed(() => {
   if (activePool.value === null) return trades.value
   return trades.value.filter(t => normPoolKey(t.strategy_type) === activePool.value)

@@ -156,14 +156,19 @@ const axisB = 16               // 底部时间刻度高度
 const plotT = 6                // 顶部留白
 // 价格区 / 成交量区 / MACD 区高度分配（MACD 约 32%，成交量约 18%）——随自适应高度联动
 const innerH = computed(() => viewH.value - plotT - axisB)
+// MACD 副图高度（主图高度的固定比例）
 const macdH = computed(() => Math.round(innerH.value * 0.32))
+// 成交量副图高度
 const volH = computed(() => Math.round(innerH.value * 0.18))
+// 主图（K线）高度 = 总高 - 两副图 - 间隔
 const mainH = computed(() => innerH.value - macdH.value - volH.value)
 // 分区边界 Y
 const priceBottom = computed(() => plotT + mainH.value)   // 价格区底（= 成交量区顶）
 const volTop = computed(() => priceBottom.value)          // 成交量区顶
+// 成交量副图顶部 y 坐标
 const volBottom = computed(() => volTop.value + volH.value)
 const macdTop = computed(() => volBottom.value)           // MACD 区顶
+// MACD 零轴 y 坐标
 const macdZero = computed(() => macdTop.value + macdH.value / 2)
 
 // ── 响应式状态 ──
@@ -175,6 +180,7 @@ const loading = ref(false)     // 加载中
 const error = ref('')          // 错误信息
 const lastClose = ref(0)       // 最新价
 const last = ref(0)            // 最新涨跌幅（%）
+// 图表标题名（允许父组件更新）
 const name = ref(props.name)
 const hover = ref(null)        // hover 状态
 const wrapRef = ref(null)      // 容器 DOM，用于宽度自适应
@@ -199,6 +205,7 @@ const viewH = computed(() => {
   const minH = Math.round(viewW.value * minRatio)
   return Math.max(base, minH)
 })
+// K线绘图区宽度 = 视宽 - 左右留白
 const plotW = computed(() => viewW.value - plotL - plotR)
 // 昨日涨跌标签上的门槛展示
 const prevLabel = computed(() => prevClose.value ? prevClose.value.toFixed(2) : '')
@@ -482,6 +489,7 @@ function fmtVol(v) {
   if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'
   return String(n)
 }
+// 成交额格式化（万/亿缩写）
 function fmtAmt(v) {
   const n = Number(v) || 0
   if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿'

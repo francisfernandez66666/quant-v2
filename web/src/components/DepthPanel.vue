@@ -101,21 +101,28 @@ const name = ref(props.name)
 
 // 实际档位数：后端 levels（免费源 5，十档接入后为 10）；无则按数组长度推导
 const levels = computed(() => Number(ob.value.levels) || Math.min(ob.value.bids?.length || 0, 5) || 5)
+// 实际展示的档位数（受可用档位与最大档数限制）
 const showLevels = computed(() => Math.min(levels.value, 10))
 
 // 卖盘渲染行：最上层为第 showLevels 档（卖五/卖十），向下递减到卖一。
 function askRows() { return Array.from({ length: showLevels.value }, (_, i) => i) }
+// 卖盘档位标签（从近到远）
 function askLabel(i) { return showLevels.value - i }
+// 卖盘档位索引换算
 function askIdx(i) { return showLevels.value - 1 - i }
 // 买盘渲染行：最上层为买一，向下递增到第 showLevels 档。
 function bidRows() { return Array.from({ length: showLevels.value }, (_, i) => i) }
+// 买盘档位标签
 function bidLabel(i) { return i + 1 }
+// 买盘档位索引换算
 function bidIdx(i) { return i }
 
+// 价格格式化（保留 2 位小数）
 function fmtPrice(v) {
   const n = Number(v) || 0
   return n ? n.toFixed(2) : '--'
 }
+// 量格式化（万/亿缩写）
 function fmtVol(v) {
   const n = Number(v) || 0
   if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'

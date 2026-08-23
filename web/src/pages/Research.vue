@@ -688,6 +688,7 @@ const tabs = [
   { key: 'backtests', label: '回测' },
   { key: 'settings', label: '设置' },
 ]
+// 当前子页 tab：candidates 待审批候选 / library 战法库 / backtests 回测 / settings 设置
 const activeTab = ref('candidates')
 // §白屏防御：渲染期异常不再静默卸载整树——顶部红条显示原因，页面其余部分继续可用。
 const renderError = ref('')
@@ -703,6 +704,7 @@ const backtestEnabled = ref(false) // 全量回测全局开关（保存到 rules
 
 /** 百分比显示（0~100 取整） */
 /** Percentage display (0~100, rounded) */
+// 小数→百分数文本（0.123→"12.3%"）
 function pct(v) {
   if (v === null || v === undefined || isNaN(v)) return 0
   return Math.min(100, Math.round(v * 100))
@@ -710,6 +712,7 @@ function pct(v) {
 
 /** 行数格式化：千分位 */
 /** Row count formatting with thousands separators */
+// 行数格式化（千分位）
 function fmtRows(v) {
   if (v === null || v === undefined || isNaN(v)) return '-'
   return Number(v).toLocaleString('zh-CN')
@@ -717,6 +720,7 @@ function fmtRows(v) {
 
 /** 加载研究处理进度 */
 /** Load the research processing progress */
+// 拉取研究数据准备度/候选产出进度（60s 服务端缓存接口）
 async function loadProgress() {
   try {
     const p = await api.fetchResearchProgress()
@@ -729,6 +733,7 @@ async function loadProgress() {
 
 /** 刷新全部（进度 + 候选） */
 /** Refresh both progress and candidate list */
+// 拉取进度+候选列表（tab 首次进入与轮询共用）
 async function loadAll() {
   loading.value = true
   await loadProgress()
@@ -738,10 +743,12 @@ async function loadAll() {
 
 /** 是否拥有研究审批权限（research_approve；admin 隐式拥有） */
 /** Whether the user may approve/reject research candidates (research_approve; admin implies all) */
+// 当前用户是否有研究审批权限（控制审批按钮显隐）
 const canApprove = api.hasPerm('research_approve')
 
 /** 状态显示文本 */
 /** Human-readable status label */
+// 候选状态中文映射（proposed/applied/rejected）
 function statusLabel(s) {
   const m = { proposed: '待审批', approved: '已审批', applied: '已应用', rejected: '已驳回' }
   return m[s] || s
@@ -749,6 +756,7 @@ function statusLabel(s) {
 
 /** 格式化指标：保留 4 位，空值显示 '-' */
 /** Format a metric to 4 decimals; '-' when empty */
+// 通用数字格式化（保留4位有效、去尾零）
 function fmt(v) {
   if (v === null || v === undefined || isNaN(v)) return '-'
   return Number(v).toFixed(4)
@@ -756,6 +764,7 @@ function fmt(v) {
 
 /** 指标正负样式类：正数绿、负数红 */
 /** Sign-based style class: positive green, negative red */
+// 按正负返回涨跌配色类名（pos/neg）
 function signClass(v) {
   if (v === null || v === undefined || isNaN(v)) return ''
   return Number(v) >= 0 ? 'pos' : 'neg'
@@ -763,6 +772,7 @@ function signClass(v) {
 
 /** 解析权重 JSON 为排序后的 [factorID, weight] 数组 */
 /** Parse the weights JSON into a sorted [factorID, weight] array */
+// 解析候选的因子权重表（weights JSON → [{id,weight}]）
 function weightList(c) {
   try {
     const w = JSON.parse(c.weights || '{}')
@@ -783,6 +793,7 @@ function weightList(c) {
 
 /** 解析盘口托/压单候选的 weights JSON（code → {orders, bid1, ask1}） */
 /** Parse depth-candidate weights JSON (code → {orders, bid1, ask1}) */
+// 候选验证深度摘要（样本内外IR等一句话）
 function depthSummary(c) {
   try {
     return JSON.parse(c.weights || '{}')
@@ -796,6 +807,7 @@ function depthSummary(c) {
 
 /** 候选类型中文名 */
 /** Human-readable candidate kind label */
+// 候选类型中文（factor 因子 / pattern 形态）
 function kindLabel(k) {
   const m = { factor: '因子战法', pattern: '形态战法', weights: '权重优化', depth: '盘口扫描' }
   return m[k] || k
@@ -807,6 +819,7 @@ const factorMeta = {}
 
 /** 拉取并缓存因子元数据（失败静默降级，仍可用 ID 兜底显示） */
 /** Fetch and cache factor metadata; silently degrade to ID on failure */
+// 拉取全量因子元数据（id→中文名/分类），用于候选因子列表展示
 async function loadFactorMeta() {
   try {
     const res = await api.fetchResearchFactors()
@@ -822,6 +835,7 @@ async function loadFactorMeta() {
 
 /** 因子 ID → 中文展示名（优先后端元数据，缺失回退 ID） */
 /** Factor ID → display name (backend metadata first, fallback to ID) */
+// 因子 ID → 中文显示名（未知名回退原 ID）
 function factorName(id) {
   const m = factorMeta[id]
   return (m && m.name) ? m.name : id
@@ -829,6 +843,7 @@ function factorName(id) {
 
 /** 取因子方向（factor 候选的 weights 是复合结构 {"directions":{...},"weights":{...}}） */
 /** Read factor directions from a factor candidate's composite weights */
+// 候选的因子方向表（看多/看空徽章用）
 function factorDirs(c) {
   try {
     const w = JSON.parse(c.weights || '{}')
@@ -841,6 +856,7 @@ function factorDirs(c) {
 
 /** 因子规则：合并方向 + 权重 + 中文名，按权重降序 */
 /** Factor rule rows: direction + weight + Chinese name, sorted by weight desc */
+// 候选的规则体（权重/方向/门槛）
 function factorRule(c) {
   const dirs = factorDirs(c)
   const wm = {}
@@ -862,6 +878,7 @@ function factorRule(c) {
 
 /** 从 reason 字符串提取数值（样本内IR / 样本外IR / 反推超额） */
 /** Extract a numeric value from the reason string */
+// 从候选 reason 字段提取指定键值（样本内IR/反推超额等）
 function parseReason(c, key) {
   const reason = c.reason || ''
   const pats = {
@@ -875,6 +892,7 @@ function parseReason(c, key) {
 
 /** 格式化百分数（反推超额是小数，如 0.1637 → +16.4%） */
 /** Format a ratio as a percentage (0.1637 → +16.4%) */
+// 小数→带符号百分数（+12.3% / -4.5%）
 function fmtPct(v) {
   if (v === null || v === undefined || isNaN(v)) return '-'
   const s = (v * 100).toFixed(1)
@@ -883,6 +901,7 @@ function fmtPct(v) {
 
 /** 总体结论：这条规律能不能用（大白话） */
 /** Overall verdict: should this rule be used (plain words) */
+// 候选综合判定文案（样本内/外 IR 与反推超额共同决定：靠谱/存疑/过拟合警报）
 function verdict(c) {
   const insample = parseReason(c, '样本内IR')
   const outsample = parseReason(c, '样本外IR')
@@ -899,6 +918,7 @@ function verdict(c) {
 
 /** 三条大白话验证结论 */
 /** Three plain-language verification conclusions */
+// 把候选 reason 展开成人话清单（前端解释区数据源）
 function plainLines(c) {
   const insample = parseReason(c, '样本内IR')
   const outsample = parseReason(c, '样本外IR')
@@ -921,6 +941,7 @@ function plainLines(c) {
 
 /** 回测是否真的做过：优先看后端通用证据 backtest_done（factor=B4 回填 /
  *  pattern=回放任务 done），无该字段时回退旧口径 avg_excess≠0 */
+// 候选是否已做过 B4 全链路回测（决定显示超额还是"未测"）
 function btTested(c) {
   if (typeof c.backtest_done === 'boolean') return c.backtest_done
   return c.avg_excess !== 0
@@ -928,6 +949,7 @@ function btTested(c) {
 
 /** 回测进度百分比（进度字符串 "45%" → 用于进度条宽度） */
 /** backtest progress percent ("45%" → progress-bar width) */
+// 候选回测任务进度百分比
 function btPct(id) {
   const p = backtestProgress.value[id]
   if (!p) return '0%'
@@ -937,6 +959,7 @@ function btPct(id) {
 
 /** 从后端加载候选列表 */
 /** Load the candidate list from the backend */
+// 拉取待审批候选列表
 async function loadData() {
   loading.value = true
   try {
@@ -959,6 +982,7 @@ async function loadData() {
 
 /** 审批通过并应用候选 */
 /** Approve a candidate and apply its weights */
+// 审批通过候选：入库 applied_*.json 并热重载实盘
 async function doApprove(c) {
   try {
     await api.approveResearchCandidate(c.id)
@@ -971,6 +995,7 @@ async function doApprove(c) {
 
 /** 驳回候选 */
 /** Reject a candidate */
+// 驳回候选（状态置 rejected，不再出现在待审批）
 async function doReject(c) {
   try {
     await api.rejectResearchCandidate(c.id)
@@ -986,6 +1011,7 @@ async function doReject(c) {
 
 /** 解析战法库条目的因子规则（方向 + 中文名） */
 /** Parse a library entry's factor rules (direction + Chinese name) */
+// 战法库条目的因子明细（含方向与权重，展示用）
 function ruleFactors(s) {
   const dirs = s.directions || {}
   const wm = s.weights || {}
@@ -1002,6 +1028,7 @@ function ruleFactors(s) {
 
 /** 形态条件显示文案：因子 ∈ [min, max) */
 /** Pattern condition label: factor ∈ [min, max) */
+// 形态条件转人话（"因子名 ∈ [min,max]"）
 function condLabel(c) {
   const name = factorName(c.factor || '')
   const min = (c.min !== undefined && c.min !== null) ? c.min : '-∞'
@@ -1011,6 +1038,7 @@ function condLabel(c) {
 
 /** 加载战法库 */
 /** Load the strategy library */
+// 拉取战法库（已应用因子/形态规则 + 运行统计）
 async function loadLibrary() {
   loadingLibrary.value = true
   try {
@@ -1027,6 +1055,7 @@ async function loadLibrary() {
 
 /** 启用/禁用战法库某条 */
 /** Enable/disable a library strategy */
+// 启用/停用某条战法（写库文件并热重载）
 async function toggleLibrary(s) {
   try {
     await api.setResearchLibraryEnabled(s.id, !s.enabled)
@@ -1039,6 +1068,7 @@ async function toggleLibrary(s) {
 
 /** 删除战法库某条 */
 /** Delete a library strategy */
+// 从战法库删除某条规则
 async function removeLibrary(s) {
   if (!confirm('确定删除战法 ' + s.name + ' ？删除后不再注入 8a/8b 实盘。')) return
   try {
@@ -1052,6 +1082,7 @@ async function removeLibrary(s) {
 
 /** 开始改名：进入编辑态 */
 /** Start rename: enter edit mode */
+// 进入改名编辑态
 function startRename(s) {
   editingName.value = { ...editingName.value, [s.id]: true }
   nameDraft.value = { ...nameDraft.value, [s.id]: s.name }
@@ -1059,6 +1090,7 @@ function startRename(s) {
 
 /** 保存改名 */
 /** Save the rename */
+// 保存战法新名称（回车/失焦触发）
 async function saveName(s) {
   const name = (nameDraft.value[s.id] || '').trim()
   editingName.value = { ...editingName.value, [s.id]: false }
@@ -1074,6 +1106,7 @@ async function saveName(s) {
 
 /** 加载全量回测全局开关 */
 /** Load the global full-backtest toggle */
+// 读取夜间全量回测开关状态
 async function loadBacktestToggle() {
   try {
     const res = await api.fetchBacktestToggle()
@@ -1085,6 +1118,7 @@ async function loadBacktestToggle() {
 
 /** 保存全量回测全局开关 */
 /** Save the global full-backtest toggle */
+// 保存夜间全量回测开关（写入 rules.scheduler.nightly.backtest_enabled）
 async function saveBacktestToggle() {
   try {
     await api.setBacktestToggle(backtestEnabled.value)
@@ -1100,6 +1134,7 @@ async function saveBacktestToggle() {
 
 /** 对指定候选触发全量回测并轮询进度 */
 /** Trigger a full backtest on a candidate and poll its progress */
+// 对候选发起 B4 全链路回测（异步入队，结果回填 avg_excess）
 async function doBacktest(c) {
   if (backtestPollers[c.id]) return // 已在轮询，防止重复启动（防重入）
   backtestLoading.value = { ...backtestLoading.value, [c.id]: true }
@@ -1122,6 +1157,7 @@ async function doBacktest(c) {
 }
 
 /** 阶段3.2 运行控制：取消（kill+interrupted，断点缓存可续跑） */
+// 取消该候选的回测任务（已算事件保留缓存）
 async function doCancelBacktest(id) {
   if (!confirm('取消候选 #' + id + ' 的回测？（已算完的事件保留缓存，续跑只算剩余）')) return
   try {
@@ -1130,6 +1166,7 @@ async function doCancelBacktest(id) {
   } catch (e) { alert('取消失败: ' + (e.message || e)) }
 }
 /** 阶段3.2 运行控制：暂停（SIGSTOP） */
+// 暂停回测任务（SIGSTOP，可恢复）
 async function doPauseBacktest(id) {
   try {
     await api.pauseBacktest(id)
@@ -1137,6 +1174,7 @@ async function doPauseBacktest(id) {
   } catch (e) { alert('暂停失败: ' + (e.message || e)) }
 }
 /** 阶段3.2 运行控制：继续（SIGCONT） */
+// 恢复已暂停的回测任务
 async function doResumeBacktest(id) {
   try {
     await api.resumeBacktest(id)
@@ -1150,8 +1188,10 @@ let libPollTimer = null
 // ═══ §P1-c 战法库统一列表：分组 / 定位展开 / 最新回测挂载 ═══
 const expandedStrategy = ref('')          // 当前展开详情的战法（'bt:<id>' 内置 / 'rule:<id>' 库规则）
 const strategyRefs = {}                   // 列表行 DOM 引用（横排四卡点击后平滑定位用）
+// 登记列表行 DOM 引用（横排卡片点击后平滑滚动定位）
 function setStrategyRef(key) { return el => { if (el) strategyRefs[key] = el } }
 /** 点卡片/详情键：切换展开，并平滑滚动到对应列表行 */
+// 点卡片/详情键：切换展开并滚动到对应战法行
 function selectStrategy(key) {
   expandedStrategy.value = expandedStrategy.value === key ? '' : key
   const el = strategyRefs[key]
@@ -1163,16 +1203,21 @@ function selectStrategy(key) {
 const candSubTab = ref('patterns')      // 候选 tab 子页：形态候选 | 优化结果
 const optObjective = ref('profitFactor') // 寻优目标
 const optTasks = ref([])                // 寻优任务分组列表
+// 寻优结果加载中标志（防重复请求）
 const loadingOpts = ref(false)
+// 寻优任务刚入队的提示态
 const optLaunching = ref(false)
 
 // ═══ §反馈：回测行参数显示 + 指标说明 + 规则化改进建议 ═══
 const showMetricHelp = ref(false)
+// 当前展开改进建议的回测任务 id（0=无）
 const adviceOpen = ref(0)
+// 切换某条回测任务的改进建议展开态
 function toggleAdvice(id) {
   adviceOpen.value = adviceOpen.value === id ? 0 : id
 }
 /** 入队参数解析成人话：区间/选股数/最小样本/每日上限 */
+// 把入队参数 JSON 转成一句话（区间·每次选几只·最少样本·池子大小）
 function jobParams(j) {
   if (!j.params_json) return ''
   try {
@@ -1190,6 +1235,7 @@ function jobParams(j) {
  * 逐行解析，按规则给出"怎么改这条战法"的可执行建议。
  * English: rule-based improvement advice parsed from the labeled replay summary.
  */
+// 结果择优解读：解析 result_text 逐战法按规则生成可执行调参建议
 function metricAdvices(j) {
   const out = []
   const lines = (j.result_text || '').split('\n')
@@ -1213,18 +1259,22 @@ function metricAdvices(j) {
 }
 
 const optDetailOpen = ref(0) // 当前展开详情的排名行 id（0=无）
+// 切换排名行的过程数据详情展开
 function toggleOptDetail(id) {
   optDetailOpen.value = optDetailOpen.value === id ? 0 : id
 }
+// 优化目标英文→中文标签
 function objLabel(o) {
   return { profitfactor: '盈亏比', profitFactor: '盈亏比', winrate: '胜率', winRate: '胜率', avgwin: '平均盈利', avgWin: '平均盈利' }[o] || (o || '-')
 }
+// 安全数字格式化（空值/NaN 显示 "-"）
 function fmtNum(v, digits) {
   if (v === null || v === undefined || isNaN(v)) return '-'
   const d = digits === undefined ? 0 : digits
   return Number(v).toFixed(d)
 }
 /** 拉取寻优结果（切到优化结果子页时触发） */
+// 拉取参数寻优结果（按任务倒序分组）
 async function loadOptimizations() {
   if (loadingOpts.value) return
   loadingOpts.value = true
@@ -1238,6 +1288,7 @@ async function loadOptimizations() {
   }
 }
 /** 发起全库参数寻优（入队后提示去回测 tab 看进度；结果完成后回到本页刷新） */
+// 发起全库战法参数寻优（入队后去回测 tab 看进度）
 async function startOptimize() {
   if (!confirm('发起全库战法参数寻优？\n目标：' + objLabel(optObjective.value) + '，盘后窗口执行，完成后排名出现在本页。')) return
   try {
@@ -1249,6 +1300,7 @@ async function startOptimize() {
   }
 }
 /** 审批一条排名：参数覆盖写入该规则并热重载实盘 */
+// 应用一条寻优排名：库规则写参数覆盖热重载 / 内置写 config 统一出场旋钮
 async function approveOpt(r) {
   const msg = '把参数应用到「' + r.strategy + '」？\n止盈 ' + fmtNum(r.params.trail_pct) + '% · 持仓 ' +
     fmtNum(r.params.hold_days) + ' 天' + ((r.params || {}).min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') +
@@ -1262,6 +1314,7 @@ async function approveOpt(r) {
   }
 }
 /** 淘汰一条排名 */
+// 淘汰一条寻优排名
 async function rejectOpt(r) {
   try {
     await api.rejectOptimization(r.id)
@@ -1271,18 +1324,23 @@ async function rejectOpt(r) {
   }
 }
 
+// 战法库-因子组（kind!==pattern）
 const libGroupFactors = computed(() => library.value.filter(s => s.kind !== 'pattern'))
+// 战法库-形态组（kind===pattern）
 const libGroupPatterns = computed(() => library.value.filter(s => s.kind === 'pattern'))
+// 统一列表分组渲染模型（空组自动隐藏）
 const ruleGroups = computed(() => [
   { key: 'factor', title: '因子战法', items: libGroupFactors.value },
   { key: 'pattern', title: '形态战法', items: libGroupPatterns.value },
 ].filter(g => g.items.length))
 /** 规则 ID（fac_12/pat_7）→ 序号；解析失败返回 -1（latestLibJob 里忽略序号过滤） */
+// 规则 ID（fac_12/pat_7）→ 序号（匹配回测任务用）
 function ruleNum(id) {
   const n = parseInt(String(id || '').replace(/^[a-z]+_/, ''), 10)
   return Number.isFinite(n) ? n : -1
 }
 /** 某战法最近一次库回放任务：sk=内置战法名或 'factor'/'pattern'；num<0 时不过滤序号（内置用） */
+// 某战法最近一次库回放任务（按 id 取最新）
 function latestLibJob(sk, num) {
   let best = null
   for (const j of backtestJobs.value) {
@@ -1293,6 +1351,7 @@ function latestLibJob(sk, num) {
   return best
 }
 /** 任务 → 一句话摘要（卡片副标题/行尾"最新:"），多战法报告取首行并去掉标签括号 */
+// 任务→一句话摘要（运行中带百分比/排队/失败/首行指标），卡片副标题用
 function summarizeJob(j) {
   if (!j) return '未回测'
   if (j.status === 'running') return '回测中 ' + jobPct(j)
@@ -1311,6 +1370,7 @@ const builtinPatterns = [
   { id: 'n_shape', name: 'N形（日K近似）' },
 ]
 /** 排队提示文案：盘中提交→等待盘后窗口；窗口内排队→显示前方还有几个同类任务 */
+// 排队提示文案：前方任务数或盘后执行说明
 function queueHint(j) {
   const ahead = backtestJobs.value.filter(x =>
     x.status === 'running' ||
@@ -1322,12 +1382,14 @@ function queueHint(j) {
 }
 
 /** 库回放任务显示名：内置战法序号→名称；ref 0=夜间全量回放（库规则+四大内置） */
+// 库回放任务显示名（内置序号映射/夜间全量）
 function libraryJobLabel(j) {
   if (j.candidate_id === 0) return '夜间全量回放'
   return builtinLabel(j.candidate_id)
 }
 
 /** 失败/中断的库回放任务重跑：内置战法按名直发；库规则按 strategy_kind 重建 fac_/pat_ ID */
+// 失败/中断的库回放重跑（内置按名直发，规则重建 fac_/pat_ ID）
 async function rerunLibrary(j) {
   const sk = j.strategy_kind
   const id = ['double_bump', 'dragon', 'dragon_return', 'n_shape'].includes(sk)
@@ -1341,11 +1403,13 @@ async function rerunLibrary(j) {
 }
 
 /** 内置战法的回测任务序号 → 显示名（901-904 与后端约定一致） */
+// 内置战法任务序号(901-904)→显示名
 function builtinLabel(num) {
   const m = { 901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形' }
   return m[num] || ('规则 ' + num)
 }
 /** 对战法库一条规则发起历史回放回测（异步），完成后在「回测」tab 展示汇总报告 */
+// 对战法库一条规则/内置战法发起历史回放回测（异步，结果进回测 tab）
 async function doLibraryBacktest(s) {
   if (!confirm(`回测战法「${s.name || s.id}」？（历史日K回放，结果进「回测」tab）`)) return
   try {
@@ -1356,6 +1420,7 @@ async function doLibraryBacktest(s) {
   } catch (e) { alert('发起失败: ' + (e.message || e)) }
 }
 /** 战法库回测轻量轮询：有 running/paused 的 library 任务时每 5s 刷新任务列表，全部结束即停 */
+// 库回测轻量轮询：存在进行中的 library 任务时每 5s 刷新
 function startLibPoll() {
   if (libPollTimer) return
   libPollTimer = setInterval(async () => {
@@ -1368,6 +1433,7 @@ function startLibPoll() {
 
 /** 轮询单个候选的回测任务状态（全量回测可能耗时较长；interval 唯一，防重复） */
 /** Poll a single candidate's backtest job (a full backtest can be slow; one interval per candidate) */
+// 单候选回测任务轮询（全量回测耗时较长，interval 唯一防重复）
 function pollBacktest(c) {
   const id = c.id
   if (backtestPollers[id]) return
@@ -1406,6 +1472,7 @@ function pollBacktest(c) {
 
 /** 清除某候选的轮询（interval 去重 + 卸载清理用） */
 /** Stop a candidate's polling (used for dedup and unmount cleanup) */
+// 清理指定候选的轮询定时器
 function clearPoll(id) {
   if (backtestPollers[id]) {
     clearInterval(backtestPollers[id])
@@ -1415,6 +1482,7 @@ function clearPoll(id) {
 
 /** 页面刷新/重新挂载后恢复运行中任务的轮询（刷新不再丢进度） */
 /** Restore polling for running jobs after a page refresh / remount (progress survives refreshes) */
+// 页面刷新后恢复进行中任务的轮询（只挂候选类，避免克隆行）
 async function restoreRunningBacktests() {
   try {
     const res = await api.fetchRunningBacktests()
@@ -1440,6 +1508,7 @@ async function restoreRunningBacktests() {
 
 /** 加载全部回测任务列表（回测 tab 进度查看） */
 /** Load all backtest jobs (backtest-tab progress view) */
+// 拉取全部回测任务（单候选+夜间+战法库，最新在前）
 async function loadBacktests() {
   btLoading.value = true
   try {
@@ -1463,6 +1532,7 @@ async function loadBacktests() {
 
 /** 把单候选任务状态同步进任务列表（轮询期间回测 tab 进度条实时更新） */
 /** Merge a per-candidate job update into the task list (live progress on the backtest tab) */
+// 状态接口增量合并进本地列表（按 kind+id 幂等，防轮询克隆行）
 function syncJobIntoList(j) {
   // kind 感知合并（§修复轮询克隆）：后端状态接口已回带 kind；旧调用方未带时按
   // 'candidate' 回退。找不到同键行才 unshift——此前 kind 缺失导致每 5s 克隆一行。
@@ -1477,6 +1547,7 @@ function syncJobIntoList(j) {
 
 /** 任务添加：按 ID 从候选列表找到对象并发起回测（回测 tab 的"重新回测"按钮复用） */
 /** Task-add: find the candidate by ID and launch its backtest (reused by the tab's "重新回测") */
+// 按候选 ID 发起全量回测（表单按钮入口）
 function doBacktestById(id) {
   const c = candidates.value.find(x => x.id === id)
   if (c) doBacktest(c)
@@ -1488,6 +1559,7 @@ function doBacktestById(id) {
  *  preempted：被高优先级任务抢占/会话终止——后端对外统一映射为 interrupted，这里仅防御。
  *  English: status labels — 'queued' means enqueued but waiting for the after-hours window;
  *  'preempted' is defensively mapped (the backend already exposes it as 'interrupted'). */
+// 任务状态中文（running 运行中/done 已完成/error 失败…）
 function btStatusLabel(s) {
   const m = {
     running: '运行中', paused: '已暂停', done: '已完成', error: '失败',
@@ -1496,12 +1568,14 @@ function btStatusLabel(s) {
   return m[s] || s
 }
 /** 运行控制接口的任务键：战法库任务用合成键（1e9+规则序号，与后端 libraryJobKey 对齐） */
+// 任务的队列控制键（取消/暂停/恢复按钮定位用）
 function ctrlId(j) {
   return j.kind === 'library' ? 1000000000 + j.candidate_id : j.candidate_id
 }
 
 /** 任务进度条宽度（任务对象版本，兼容无 progress 字段） */
 /** Job progress-bar width (job-object variant; tolerates a missing progress field) */
+// 任务进度百分比（缺省 100% 兜底）
 function jobPct(j) {
   const p = j.progress || '0%'
   const n = parseInt(p, 10)
@@ -1526,10 +1600,12 @@ onUnmounted(() => { stopPolling(); Object.keys(backtestPollers).forEach(clearPol
 // 定时轮询研究进度（30s）：dataload 期间进度条实时推进
 // Poll the research progress every 30s so the data-loading progress bar stays fresh
 let pollTimer = null
+// 启动全局轮询（进度/候选刷新）
 function startPolling() {
   if (pollTimer) return
   pollTimer = setInterval(loadProgress, 30000)
 }
+// 停止全局轮询（组件卸载时）
 function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
