@@ -142,8 +142,9 @@ func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 }
 
 // ApplyRealFill 成交回报应用到持仓：
-//  - 买入：首次建仓（成本=成交价）或加仓（合并加权平均成本），并更新最高价；
-//  - 卖出：减仓 qty；全部卖出后 qty<=0（下次全量对账/查询时清除）。
+//   - 买入：首次建仓（成本=成交价）或加仓（合并加权平均成本），并更新最高价；
+//   - 卖出：减仓 qty；全部卖出后 qty<=0（下次全量对账/查询时清除）。
+//
 // 成交回报同时写 fills 表。English: applies a gateway fill to the book: buys open/add with weighted
 // average cost, sells reduce qty (cleared when qty<=0); the fill row is also persisted.
 func (d *DB) ApplyRealFill(f RealFill) error {

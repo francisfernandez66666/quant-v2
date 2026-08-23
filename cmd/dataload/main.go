@@ -140,6 +140,9 @@ func main() {
 		// 增量导入：delta 文件按表 INSERT OR REPLACE 幂等合入（云端侧执行）。
 		// English: delta import — upserts the delta file per table (run on the cloud side).
 		cmdImportDelta(db, args[1:])
+	case "hithink-sync":
+		// §同花顺（新）主源同步：dump 拉取 → 流式解析 → ths_daily 幂等入库。
+		cmdHithinkSync(db, args[1:])
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}

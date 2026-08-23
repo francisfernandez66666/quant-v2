@@ -8,10 +8,10 @@ import (
 func seedSweepResults() []map[string]any {
 	return []map[string]any{
 		{"rank": 1.0, "strategy": "双响炮", "strategy_kind": "",
-			"params": map[string]any{"trail_pct": 5.0, "hold_days": 20.0, "min_score": 80.0},
+			"params":   map[string]any{"trail_pct": 5.0, "hold_days": 20.0, "min_score": 80.0},
 			"win_rate": 39.5, "profit_factor": 1.16, "avg_hold_days": 10.0, "trigger_count": 1238.0},
 		{"rank": 2.0, "strategy": "因子战法#1", "strategy_kind": "fac_1",
-			"params": map[string]any{"trail_pct": 15.0, "hold_days": 20.0, "min_score": 70.0},
+			"params":   map[string]any{"trail_pct": 15.0, "hold_days": 20.0, "min_score": 70.0},
 			"win_rate": 45.9, "profit_factor": 1.14, "avg_hold_days": 17.8, "trigger_count": 3765.0},
 	}
 }

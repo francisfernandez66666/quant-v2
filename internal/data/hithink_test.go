@@ -74,3 +74,26 @@ func TestHithinkKeyMissing(t *testing.T) {
 		t.Fatal("Key 缺失应返回错误")
 	}
 }
+
+func TestAdjMultiplierDirection(t *testing.T) {
+	// 纯现金分红：10派1 → ref=(10-0.1)=9.9 → 乘数=10/9.9≈1.0101（>1，与 baostock 递增口径一致）
+	m := AdjMultiplier(10, 0.1, 0, 0, 0)
+	if m <= 1 || (m-1.010101) > 0.001 {
+		t.Fatalf("分红乘数应>1: %v", m)
+	}
+	// 10送5：ref=10/1.5=6.667 → 乘数=1.5
+	m2 := AdjMultiplier(10, 0, 0.5, 0, 0)
+	if (m2 - 1.5) > 1e-9 {
+		t.Fatalf("送股乘数应=1.5: %v", m2)
+	}
+	// 10配3 配股价7：ref=(10+7*0.3)/1.3=9.3077 → 乘数≈1.0744
+	m3 := AdjMultiplier(10, 0, 0, 0.3, 7)
+	want3 := 10 / ((10 + 7*0.3) / 1.3)
+	if (m3 - want3) > 1e-9 {
+		t.Fatalf("配股乘数异常: %v want %v", m3, want3)
+	}
+	// 非法前收盘
+	if AdjMultiplier(0, 1, 0, 0, 0) != 1 {
+		t.Fatal("非法价应返回1")
+	}
+}

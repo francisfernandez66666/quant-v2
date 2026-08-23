@@ -142,6 +142,18 @@ func (d *DB) migrate() error {
 			status TEXT NOT NULL DEFAULT 'pending',
 			created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 		)`,
+		// 同花顺（新）日K（§HITHINK_DATA_SOURCE_PLAN）：主源回测行情，与旧 daily 物理分离。
+		`CREATE TABLE IF NOT EXISTS ths_daily (
+			ts_code TEXT NOT NULL,
+			trade_date TEXT NOT NULL,
+			open REAL DEFAULT 0,
+			high REAL DEFAULT 0,
+			low REAL DEFAULT 0,
+			close REAL DEFAULT 0,
+			vol REAL DEFAULT 0,
+			amount REAL DEFAULT 0,
+			PRIMARY KEY (ts_code, trade_date)
+		)`,
 		// 板块历史（E5）：按行业聚合的板块日线（离线重建），供形态战法回测与因子环境分组。
 		// English: sector daily history (E5) — per-industry aggregated board daily bars, rebuilt offline
 		// from daily+stk_limit, used for pattern backtests and factor environment grouping.
@@ -335,6 +347,14 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_fina_code ON fina_indicator(ts_code)`,
 		`CREATE INDEX IF NOT EXISTS idx_sector_date ON sector_history(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_optres_task ON optimization_results(task_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_ths_daily_date ON ths_daily(trade_date)`,
+		// 同花顺（新）累计后复权因子（事件换算生成，锚定衔接旧表基线）。
+		`CREATE TABLE IF NOT EXISTS ths_adj_factor (
+			ts_code TEXT NOT NULL,
+			trade_date TEXT NOT NULL,
+			factor REAL NOT NULL,
+			PRIMARY KEY (ts_code, trade_date)
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {
