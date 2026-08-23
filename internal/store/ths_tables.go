@@ -184,3 +184,31 @@ func (d *DB) ThsAllCodes() ([]string, error) {
 	}
 	return out, rows.Err()
 }
+
+// TestRouting 验证用（同包测试辅助）：构造双源数据。
+func setupRoutingFixture(d *DB) error {
+	if err := d.migrate(); err != nil {
+		return err
+	}
+	rows := []ThsDailyRow{
+		{TsCode: "000001.SZ", TradeDate: "20260820", Open: 10, High: 11, Low: 9.5, Close: 10.5, Vol: 100, Amount: 1050},
+		{TsCode: "000001.SZ", TradeDate: "20260821", Open: 10.5, High: 12, Low: 10.4, Close: 11.8, Vol: 120, Amount: 1380},
+	}
+	if _, err := d.UpsertThsDailyRows(rows); err != nil {
+		return err
+	}
+	// 旧表写入不同价格（可区分来源）
+	if _, err := d.db.Exec(`INSERT OR REPLACE INTO daily (ts_code, trade_date, open, high, low, close, vol, amount)
+		VALUES ('000001.SZ','20260820',99,99,99,99,999,999),
+		       ('000001.SZ','20260821',98,98,98,98,998,998)`); err != nil {
+		return err
+	}
+	// 因子逐日全覆盖（与物化保证一致：每个 ths_daily 日期都有因子行）
+	if _, err := d.UpsertThsAdjFactorRows([]ThsAdjFactorRow{
+		{TsCode: "000001.SZ", TradeDate: "20260820", Factor: 1.5},
+		{TsCode: "000001.SZ", TradeDate: "20260821", Factor: 1.5},
+	}); err != nil {
+		return err
+	}
+	return nil
+}
