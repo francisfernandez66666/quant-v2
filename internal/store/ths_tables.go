@@ -166,3 +166,21 @@ func (d *DB) LegacyAdjFactorAt(tsCode, date string) (float64, bool, error) {
 	}
 	return f.Float64, true, nil
 }
+
+// ThsAllCodes ths_daily 全部去重标的（复权因子逐日物化需遍历全代码——无事件标的也要
+// 物化恒等基线行，保证引擎级原子切换时任一代码都有完整因子覆盖）。
+func (d *DB) ThsAllCodes() ([]string, error) {
+	rows, err := d.db.Query(`SELECT DISTINCT ts_code FROM ths_daily ORDER BY ts_code`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err == nil {
+			out = append(out, c)
+		}
+	}
+	return out, rows.Err()
+}

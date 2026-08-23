@@ -84,6 +84,10 @@ func main() {
 	// 配置管理器：读取数据目录下的 config.json（策略/风控/情绪/LLM 等）
 	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
 
+	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN）：primary_source=hithink 时回测取数优先 ths_ 表。
+	store.PrimarySourceThsDaily = strings.EqualFold(cfgMgr.Rules.Data.PrimarySource, "hithink")
+	store.ThsFactorsReady = cfgMgr.Rules.Data.ThsFactorsReady
+
 	// LLM 配置优先级：环境变量 → 认证配置项 → 配置文件 → 默认值
 	llmCfg := llm.Config{}
 	llmCfg.APIKey = os.Getenv("LLM_API_KEY")

@@ -118,7 +118,14 @@ func cmdHithinkSyncAdjFactors(client *data.HithinkClient, db *store.DB, tmpPath,
 		return uerr
 	}
 
-	for code, evs := range events {
+	// 遍历 ths_daily 全部标的：有事件的做乘数展开，无事件的物化恒等基线行——
+	// 保证任一代码都有完整因子覆盖（引擎级原子切换的前提）。
+	allCodes, cerr := db.ThsAllCodes()
+	if cerr != nil {
+		log.Fatalf("读 ths 标的清单失败: %v", cerr)
+	}
+	for _, code := range allCodes {
+		evs := events[code]
 		sort.Slice(evs, func(i, j int) bool { return evs[i].ExDate < evs[j].ExDate })
 		dates, derr := db.ThsDatesSince(code, since)
 		if derr != nil || len(dates) == 0 {

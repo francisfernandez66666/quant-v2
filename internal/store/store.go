@@ -627,11 +627,30 @@ func (d *DB) ReadyStockCount() (int, error) {
 }
 
 // HfqBars 读取某股票 hfq 后复权日线（升序）。
+// PrimarySourceThsDaily 数据源路由开关：true 时 RawBars 优先读 ths_daily（同花顺（新）），
+// 该股无数据回退旧 daily 表。由 config data.primary_source 在启动时装配。
+// 注意：HfqBars 不受此开关影响——ths 复权因子尚在草稿态（对账门禁未过，见
+// docs/HITHINK_DATA_SOURCE_PLAN.md §6.3），hfq 仍走旧表直到门禁放行。
+var PrimarySourceThsDaily = false
+
+// ThsFactorsReady 同花顺复权因子对账门禁：true 时 HfqBars 走 ths_daily×ths_adj_factor；
+// false（默认）时 hfq 仍走旧表——门禁未过前禁止消费（docs/HITHINK_DATA_SOURCE_PLAN §6.3）。
+var ThsFactorsReady = false
+
 // 换算：hfq_close = close * adj_factor（基座因子在收益率/动量等比例型因子里自然抵消；
 // 价格类因子如 MA/52周高距在同一基准下自洽，不影响相对结论）。
 // （HfqBars reads a stock's hfq back-adjusted daily bars (ascending). hfq_close = close * adj_factor;
 // the base factor cancels in ratio-based factors and stays self-consistent for price factors.）
 func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
+	// §数据源路由：主源=hithink 且复权门禁通过 → ths 双表 join；
+	// 否则走旧表（baostock）——因子口径未定稿前绝不混用两套复权体系。
+	if PrimarySourceThsDaily && ThsFactorsReady {
+		var n int
+		if err := d.db.QueryRow(`SELECT COUNT(*) FROM ths_adj_factor WHERE ts_code=?`,
+			tsCode).Scan(&n); err == nil && n > 0 {
+			return d.thsHfqBars(tsCode, start, end)
+		}
+	}
 	query := `SELECT d.trade_date,
 		COALESCE(d.open,0), COALESCE(d.high,0), COALESCE(d.low,0), COALESCE(d.close,0),
 		COALESCE(d.vol,0), COALESCE(d.amount,0), COALESCE(a.adj_factor,1) AS adj
@@ -663,10 +682,65 @@ func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
 // RawBars 读取某股票未复权日线（升序），供回测按真实成交价撮合。
 // （RawBars reads a stock's unadjusted daily bars for realistic backtest fills.）
 func (d *DB) RawBars(tsCode, start, end string) ([]Bar, error) {
+	// §数据源路由：主源=同花顺（新）且该股有 ths 数据 → 读 ths_daily；
+	// 无数据回退旧 daily 表（缺口登记重试队列的 provenance 机制随 Phase E 补齐）。
+	if PrimarySourceThsDaily {
+		var n int
+		if err := d.db.QueryRow(`SELECT COUNT(*) FROM ths_daily WHERE ts_code=? AND trade_date<=?`,
+			tsCode, end).Scan(&n); err == nil && n > 0 {
+			return d.thsRawBars(tsCode, start, end)
+		}
+	}
 	query := `SELECT trade_date,
 		COALESCE(open,0), COALESCE(high,0), COALESCE(low,0), COALESCE(close,0),
 		COALESCE(vol,0), COALESCE(amount,0)
 		FROM daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date`
+	rows, err := d.db.Query(query, tsCode, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Bar
+	for rows.Next() {
+		var b Bar
+		if err := rows.Scan(&b.Date, &b.Open, &b.High, &b.Low, &b.Close, &b.Vol, &b.Amount); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// thsRawBars 读同花顺（新）日K（升序），形状与 RawBars 一致。
+func (d *DB) thsRawBars(tsCode, start, end string) ([]Bar, error) {
+	query := `SELECT trade_date,
+		COALESCE(open,0), COALESCE(high,0), COALESCE(low,0), COALESCE(close,0),
+		COALESCE(vol,0), COALESCE(amount,0)
+		FROM ths_daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date`
+	rows, err := d.db.Query(query, tsCode, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Bar
+	for rows.Next() {
+		var b Bar
+		if err := rows.Scan(&b.Date, &b.Open, &b.High, &b.Low, &b.Close, &b.Vol, &b.Amount); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// thsHfqBars 读同花顺（新）日K×因子的后复权序列（hfq_close = close × factor）。
+func (d *DB) thsHfqBars(tsCode, start, end string) ([]Bar, error) {
+	query := `SELECT b.trade_date,
+		COALESCE(b.open,0)*f.factor, COALESCE(b.high,0)*f.factor,
+		COALESCE(b.low,0)*f.factor, COALESCE(b.close,0)*f.factor,
+		COALESCE(b.vol,0), COALESCE(b.amount,0)
+		FROM ths_daily b JOIN ths_adj_factor f ON f.ts_code=b.ts_code AND f.trade_date=b.trade_date
+		WHERE b.ts_code=? AND b.trade_date>=? AND b.trade_date<=? ORDER BY b.trade_date`
 	rows, err := d.db.Query(query, tsCode, start, end)
 	if err != nil {
 		return nil, err

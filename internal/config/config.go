@@ -37,6 +37,7 @@ type Rules struct {
 	Paper      PaperConfig      `json:"paper"`         // 模拟盘/纸面交易配置
 	QMT        QMTConfig        `json:"qmt"`           // 国信 MiniQMT 实盘交易配置
 	Runtime    RuntimeConfig    `json:"runtime"`       // 运行时内存治理配置
+	Data       DataConfig       `json:"data"`          // 数据源配置（§HITHINK_DATA_SOURCE_PLAN）
 }
 
 // RuntimeConfig 运行时内存治理配置：盘后释放常驻服务内存，避免与夜间研究作业叠加触发 OOM。
@@ -137,6 +138,15 @@ func DefaultQMTConfig() QMTConfig {
 	}
 }
 
+// DataConfig 数据源配置（§HITHINK_DATA_SOURCE_PLAN）。
+// PrimarySource：回测/研究取数的主源——hithink=同花顺（新）ths_ 表优先、缺口回退 baostock 旧表；
+// baostock=完全走旧表（一键切回开关）。
+// ThsFactorsReady：同花顺复权因子对账门禁——未通过(false)时 HfqBars 仍走旧表。
+type DataConfig struct {
+	PrimarySource   string `json:"primary_source"`    // hithink(同花顺(新)优先) | baostock(旧表)
+	ThsFactorsReady bool   `json:"ths_factors_ready"` // 复权因子对账门禁（默认 false）
+}
+
 // SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
 // 交易时段：只做 dataload 增量下载（绝不回测/研究）；盘后/周末：跑完整夜间研究作业。
 // English: session-based research scheduler config (read by the standalone quant-research service).
@@ -166,6 +176,9 @@ type SchedulerConfig struct {
 	// MinFreeMemMB 内存总闸阈值(MB)：系统可用内存低于该值时调度器不出队，任务留队列。
 	// English: memory gate — tasks stay queued when system MemAvailable drops below this.
 	MinFreeMemMB int `json:"min_free_mem_mb"`
+	// §数据源路由（§HITHINK_DATA_SOURCE_PLAN）：研究/回测取数主源与复权门禁。
+	PrimarySource   string `json:"primary_source"`    // hithink | baostock（默认 baostock=旧表，安全）
+	ThsFactorsReady bool   `json:"ths_factors_ready"` // 复权对账门禁：通过后置 true，HfqBars 才走 ths 因子
 }
 
 // NightlyConfig 夜间研究作业配置（盘后/周末触发）。
@@ -194,10 +207,12 @@ type DataloadDuringTradeConfig struct {
 // English: returns factory-default research-scheduler config.
 func DefaultSchedulerConfig() SchedulerConfig {
 	return SchedulerConfig{
-		Enabled:     true,
-		ResearchBin: "research",
-		DataloadBin: "dataload",
-		PyURL:       "http://127.0.0.1:8787",
+		Enabled:         true,
+		ResearchBin:     "research",
+		DataloadBin:     "dataload",
+		PrimarySource:   "baostock", // 安全默认：旧表；对账门禁通过后配置切 hithink
+		ThsFactorsReady: false,
+		PyURL:           "http://127.0.0.1:8787",
 		Nightly: NightlyConfig{
 			StartHHMM:        1530,
 			WeekendStartHHMM: 1530,
@@ -891,12 +906,21 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 	var wrapper struct {
 		Rules struct {
 			Scheduler json.RawMessage `json:"scheduler"`
+			Data      struct {
+				PrimarySource   string  `json:"primary_source"`
+				ThsFactorsReady bool    `json:"ths_factors_ready"`
+				HithinkQPS      float64 `json:"hithink_qps"`
+			} `json:"data"`
 		} `json:"rules"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err != nil {
 		log.Printf("[scheduler] 解析配置 %s 失败(用默认): %v", path, err)
 		return def
 	}
+	if wrapper.Rules.Data.PrimarySource != "" {
+		def.PrimarySource = wrapper.Rules.Data.PrimarySource
+	}
+	def.ThsFactorsReady = wrapper.Rules.Data.ThsFactorsReady
 	raw := wrapper.Rules.Scheduler
 	if len(raw) == 0 || string(raw) == "null" {
 		return def

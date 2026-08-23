@@ -122,6 +122,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 // tick 单次调度检查：读配置 → 会话分派（盘后门控在 workerTick 内统一执行）。
 func (s *Scheduler) tick() {
 	cfg := config.LoadSchedulerConfig(s.cfgPath)
+	// §数据源路由装配（热生效）：primary_source=hithink 时回测取数优先 ths_ 表；
+	// 复权门禁独立开关——两者都通过前引擎不会混合两套复权体系。
+	store.PrimarySourceThsDaily = strings.EqualFold(cfg.PrimarySource, "hithink")
+	store.ThsFactorsReady = cfg.ThsFactorsReady
 	now := s.now()
 	if !cfg.Enabled {
 		s.preemptCurrent("调度器已禁用")
