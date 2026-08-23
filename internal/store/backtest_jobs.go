@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"time"
 )
+
 // BacktestJob 一条回测任务（持久化到 backtest_jobs）。
 // English: one backtest job (persisted in backtest_jobs).
 type BacktestJob struct {
@@ -25,6 +26,9 @@ type BacktestJob struct {
 	ResultText string `json:"result_text,omitempty"`
 	// StrategyKind 回放子类型（factor/pattern/内置战法名），供前端失败重跑重建规则 ID。
 	StrategyKind string `json:"strategy_kind,omitempty"`
+	// ParamsJSON 入队运行参数原文（start/end/top_k/min_stocks/maxstocks 等），
+	// 回测行展示"具体参数"用。English: raw enqueue params for the job's parameter display.
+	ParamsJSON string `json:"params_json,omitempty"`
 	StartedAt  string `json:"started_at"`  // 开始时间 YYYY-MM-DD HH:MM:SS
 	FinishedAt string `json:"finished_at"` // 结束时间（done/error/interrupted 时）
 	UpdatedAt  string `json:"updated_at"`  // 最近更新时间

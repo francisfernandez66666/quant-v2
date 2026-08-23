@@ -23,6 +23,11 @@
       </div>
     </div>
 
+    <!-- §白屏防御：渲染异常横幅 -->
+    <div v-if="renderError" style="background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:12px">
+      页面渲染出错（不影响其他标签页）：<code>{{ renderError }}</code>
+      <button class="btn-refresh" style="margin-left:8px" @click="renderError = ''">关闭</button>
+    </div>
     <!-- 子页切换：待审批候选 / 战法库 / 设置 -->
     <div class="research-tabs">
       <button
@@ -112,9 +117,9 @@
               <tr v-for="r in t.results" :key="r.id">
                 <td>{{ r.rank }}</td>
                 <td>{{ r.strategy }}<span v-if="!r.strategy_kind" class="tag tag-kind kind-factor" style="margin-left:6px">内置</span></td>
-                <td>{{ fmtNum(r.params.trail_pct) }}%</td>
-                <td>{{ fmtNum(r.params.hold_days) }}天</td>
-                <td>{{ r.params.min_score ? fmtNum(r.params.min_score) : '—' }}</td>
+                <td>{{ fmtNum((r.params || {}).trail_pct) }}%</td>
+                <td>{{ fmtNum((r.params || {}).hold_days) }}天</td>
+                <td>{{ (r.params || {}).min_score ? fmtNum(r.params.min_score) : '—' }}</td>
                 <td>{{ fmtNum(r.win_rate, 1) }}%</td>
                 <td>{{ fmtNum(r.profit_factor, 2) }}</td>
                 <td>{{ r.trigger_count }}</td>
@@ -149,7 +154,7 @@
                     <span>目标函数值 <b>{{ fmtNum(r.profit_factor, 2) }}</b></span>
                   </div>
                   <div style="font-size:11px;color:var(--muted,#888);padding-bottom:2px">
-                    出场规则统一为「阶段高点回撤 {{ fmtNum(r.params.trail_pct) }}% 止盈 + 最长持仓 {{ fmtNum(r.params.hold_days) }} 天超期」；门槛仅对有连续入场分的战法生效。
+                    出场规则统一为「阶段高点回撤 {{ fmtNum((r.params || {}).trail_pct) }}% 止盈 + 最长持仓 {{ fmtNum(r.params.hold_days) }} 天超期」；门槛仅对有连续入场分的战法生效。
                   </div>
                 </td>
               </tr>
@@ -268,6 +273,12 @@
           <!-- 规律验证：样本内外 IR / 反推超额 / 全样本 IR·IC / 全链路回测（候选表关联） -->
           <div class="lib-verify" v-if="s.kind === 'factor'">
             <div class="lib-verify-title">这条规律靠谱吗？（电脑验证过）</div>
+            <!-- §反馈：字段含义就地解释（避免黑话看不懂） -->
+            <div class="lib-verify-help">
+              <div><b>样本内 IR</b>：训练期里"每天按这个规律选股的排名"与"未来收益排名"的稳定相关强度。数值越稳定越好，&gt;0.5 算强。</div>
+              <div><b>样本外 IR</b>：把数据藏起一段（模型没见过的验证期）再做同样检验——这是最关键的数字：&gt;0.3 及格；若明显低于样本内，说明规律可能只是"背答案"（过拟合）。</div>
+              <div><b>反推超额</b>：故意反着做这条规律的历史收益超额。反向也赚钱=规律方向可疑；反向大亏=规律方向可信。</div>
+            </div>
             <div class="lib-verify-row">
               <span class="v-label">前瞻</span><span class="v-value">{{ s.horizon }} 个交易日</span>
               <span class="v-label">样本内 IR</span><span class="v-value">{{ fmt(parseReason(s,'样本内IR')) }}</span>
@@ -368,6 +379,21 @@
         </div>
       </div>
 
+      <!-- §反馈：指标说明折叠块——先教怎么看，再看结果 -->
+      <div class="bt-metrics-help">
+        <button class="btn-toggle" @click="showMetricHelp = !showMetricHelp">
+          {{ showMetricHelp ? '收起指标说明' : '📖 这些指标是什么意思？（点开看解释）' }}
+        </button>
+        <div v-if="showMetricHelp" class="lib-verify-help" style="margin-top:6px">
+          <div><b>触发信号数</b>：历史区间里该战法一共发出过多少次买入机会。太少(&lt;50)说明统计意义弱。</div>
+          <div><b>胜率</b>：赚钱笔数占比。短线战法 40%~50% 就不错——靠盈亏比赚钱，不必追求高胜率。</div>
+          <div><b>盈亏比</b>：平均每笔赚的 ÷ 平均每笔亏的。<b>&gt;1 才有意义</b>，&gt;1.2 算优秀；配合胜率的期望=胜率×均盈−(1−胜率)×均亏。</div>
+          <div><b>平均持仓天数</b>：资金占用效率。超短 1~3 天、波段 5~15 天；过长说明退出不果断。</div>
+          <div><b>回测超额</b>：相对基准(指数)的超额收益（B4 全链路口径），&gt;0 跑赢大盘。</div>
+          <div style="color:#0f172a"><b>怎么用</b>：单条结果只是"体检报告"——切到「待审批候选 → 优化结果」跑全库参数寻优，系统自动试出最优止盈/持仓/门槛组合并可一键应用。</div>
+        </div>
+      </div>
+
       <!-- 进度查看：全部回测任务（单候选 + 夜间全量，最新在前） -->
       <!-- Progress view: all backtest jobs (per-candidate + nightly, newest first) -->
       <div v-if="backtestJobs.length === 0" class="empty">
@@ -375,6 +401,11 @@
       </div>
       <div v-else class="bt-list">
         <div v-for="j in backtestJobs" :key="(j.kind || 'candidate') + ':' + j.candidate_id" class="bt-card" :class="'bt-' + j.status">
+          <!-- §反馈：具体参数就地展示（区间/选股数/最小样本），鼠标悬停看含义 -->
+          <div class="bt-params" v-if="jobParams(j)" style="font-size:11px;color:#64748b;margin-top:2px" :title="'开始/结束日期；选股数=每个事件买几只；最小样本=当日最少多少只股票有数据才构成事件'">
+            参数：{{ jobParams(j) }}
+            <span v-if="j.strategy_kind" style="margin-left:6px;color:#94a3b8">({{ j.strategy_kind }})</span>
+          </div>
           <div class="bt-head">
             <span :class="['tag', 'tag-kind', j.kind === 'nightly' ? '' : (j.kind === 'library' ? 'kind-pattern' : 'kind-factor')]">
               {{ j.kind === 'nightly' ? '夜间全量' : (j.kind === 'library' ? '战法库' : '单候选') }}
@@ -399,7 +430,22 @@
             {{ queueHint(j) }}
           </div>
           <!-- 战法库回测结果：汇总报告文本（触发信号数/胜率/盈亏比等） -->
-          <div class="bt-result bt-lib-result" v-if="j.status === 'done' && j.kind === 'library'">{{ j.result_text }}</div>
+          <div class="bt-result bt-lib-result" v-if="j.status === 'done' && j.kind === 'library'" style="white-space:pre-wrap">{{ j.result_text }}</div>
+          <!-- §反馈：结果择优解读 + 怎么改这条战法的规则化建议 -->
+          <template v-if="j.status === 'done' && j.kind === 'library' && metricAdvices(j).length">
+            <div style="margin-top:6px">
+              <button class="btn-toggle" style="font-size:11px" @click="toggleAdvice(j.id)">
+                {{ adviceOpen === j.id ? '收起改进建议' : '💡 改进建议（怎么调这条战法）' }}
+              </button>
+              <div v-if="adviceOpen === j.id" class="lib-verify-help" style="margin-top:6px">
+                <div v-for="(a, ai) in metricAdvices(j)" :key="ai" style="margin-bottom:4px">{{ a }}</div>
+                <div style="color:#0f172a;margin-top:4px">
+                  ▶ 下一步：切到「待审批候选 → 优化结果」发起全库参数寻优，系统网格搜索最优
+                  止盈%/持仓天/入场门槛并排名，选中后「加入战法库」即热生效。
+                </div>
+              </div>
+            </div>
+          </template>
           <div class="bt-result" v-if="j.status === 'done' && j.kind !== 'library'">
             回测超额 <b :class="signClass(j.avg_excess)">{{ fmt(j.avg_excess) }}</b>
           </div>
@@ -583,7 +629,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onActivated, onUnmounted } from 'vue' // Vue 组合式 API：响应式引用/计算属性/生命周期钩子
+import { ref, computed, onMounted, onActivated, onUnmounted, onErrorCaptured } from 'vue' // Vue 组合式 API：响应式引用/计算属性/生命周期钩子
 // Vue Composition API: reactive ref / computed / lifecycle hooks
 import * as api from '../api/index.js'           // 后端 API 调用封装（候选列表 / 审批 / 驳回）
 // backend API wrapper (candidate list / approve / reject)
@@ -638,6 +684,13 @@ const tabs = [
   { key: 'settings', label: '设置' },
 ]
 const activeTab = ref('candidates')
+// §白屏防御：渲染期异常不再静默卸载整树——顶部红条显示原因，页面其余部分继续可用。
+const renderError = ref('')
+onErrorCaptured((err) => {
+  renderError.value = String(err && err.message || err)
+  console.error('[Research] 渲染异常:', err)
+  return false // 阻断继续向上传播，保住已渲染内容
+})
 // active sub-tab
 const editingName = ref({}) // 战法 id → 是否在改名
 const nameDraft = ref({})   // 战法 id → 改名草稿
@@ -1108,6 +1161,52 @@ const optTasks = ref([])                // 寻优任务分组列表
 const loadingOpts = ref(false)
 const optLaunching = ref(false)
 
+// ═══ §反馈：回测行参数显示 + 指标说明 + 规则化改进建议 ═══
+const showMetricHelp = ref(false)
+const adviceOpen = ref(0)
+function toggleAdvice(id) {
+  adviceOpen.value = adviceOpen.value === id ? 0 : id
+}
+/** 入队参数解析成人话：区间/选股数/最小样本/每日上限 */
+function jobParams(j) {
+  if (!j.params_json) return ''
+  try {
+    const p = JSON.parse(j.params_json)
+    const parts = []
+    if (p.start) parts.push(p.start + '~' + (p.end || '今'))
+    if (p.top_k) parts.push('每次选 ' + p.top_k + ' 只')
+    if (p.min_stocks) parts.push('最少样本 ' + p.min_stocks)
+    if (p.maxstocks) parts.push('池子 ' + p.maxstocks + ' 只')
+    return parts.join(' · ')
+  } catch { return '' }
+}
+/**
+ * 结果择优解读：把 result_text 的【战法】胜率x% 盈亏比y 触发n 持仓d天
+ * 逐行解析，按规则给出"怎么改这条战法"的可执行建议。
+ * English: rule-based improvement advice parsed from the labeled replay summary.
+ */
+function metricAdvices(j) {
+  const out = []
+  const lines = (j.result_text || '').split('\n')
+  for (const line of lines) {
+    const m = line.match(/^【(.+?)】胜率 ([\d.]+)% 盈亏比 ([\d.]+) 触发 (\d+) 持仓 ([\d.]+)天/)
+    if (!m) continue
+    const [, name, wrS, pfS, nS, holdS] = m
+    const wr = parseFloat(wrS), pf = parseFloat(pfS), n = parseInt(nS, 10), hold = parseFloat(holdS)
+    // 期望收益粗判：每笔期望 ≈ 胜率×均盈 −(1−胜率)×均亏；用 盈亏比 与胜率合成
+    const ev = wr / 100 * pf - (1 - wr / 100)
+    const tips = []
+    if (n < 50) tips.push('触发仅 ' + n + ' 次，统计意义弱——扩大回测区间再下结论')
+    if (wr < 40) tips.push('胜率 ' + wr.toFixed(1) + '% 偏低：提高入场门槛（寻优里选门槛80）或叠加情绪/D1 过滤，宁缺毋滥')
+    if (pf < 1.0) tips.push('盈亏比 ' + pf.toFixed(2) + ' <1：平均亏损吃掉平均盈利——收紧止损（更早认错）或让利润奔跑（放宽止盈）')
+    else if (pf >= 1.2 && wr >= 45) tips.push('胜率与盈亏比均衡，具备小仓位实盘验证价值')
+    if (hold > 10) tips.push('平均持仓 ' + hold.toFixed(1) + ' 天偏长：缩短最大持仓天数，提高资金周转')
+    if (ev > 0.05 && tips.length === 0) tips.push('各项健康：期望为正且无短板——保持参数，控制单笔仓位即可')
+    out.push('【' + name + '】' + (tips.length ? tips.join('；') : '暂无明显短板'))
+  }
+  return out
+}
+
 const optDetailOpen = ref(0) // 当前展开详情的排名行 id（0=无）
 function toggleOptDetail(id) {
   optDetailOpen.value = optDetailOpen.value === id ? 0 : id
@@ -1147,7 +1246,7 @@ async function startOptimize() {
 /** 审批一条排名：参数覆盖写入该规则并热重载实盘 */
 async function approveOpt(r) {
   const msg = '把参数应用到「' + r.strategy + '」？\n止盈 ' + fmtNum(r.params.trail_pct) + '% · 持仓 ' +
-    fmtNum(r.params.hold_days) + ' 天' + (r.params.min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') +
+    fmtNum(r.params.hold_days) + ' 天' + ((r.params || {}).min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') +
     '\n审批后立即热重载生效。'
   if (!confirm(msg)) return
   try {
@@ -1491,6 +1590,8 @@ function stopPolling() {
 .btn-backtest:disabled { opacity: 0.5; cursor: wait; }
  .bt-result { font-size: 12px; font-weight: 600; align-self: center; }
  .bt-lib-result { white-space: pre-wrap; line-height: 1.7; font-weight: 500; }
+ .bt-metrics-help { margin-bottom:10px; }
+ .bt-params { color:#64748b; }
  /* §P1-c 横排四卡 + 分组标题 + 详情面板 */
  .builtin-cards { display:flex; gap:10px; margin:8px 0 4px; flex-wrap:wrap; }
  .bcard { flex:1 1 140px; min-width:130px; border:1px solid var(--border,#e5e7eb); border-radius:8px;
@@ -1501,14 +1602,20 @@ function stopPolling() {
  .bcard-sub { font-size:11px; color:var(--muted,#888); margin-top:4px;
               white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
  .lib-group-title { font-size:13px; font-weight:700; color:var(--muted,#666); margin:14px 0 6px; }
- .lib-detail { margin-top:8px; padding:8px 10px; background:var(--bg,#f8fafc); border-radius:6px; }
- .lib-detail-text { font-size:12px; margin:0; white-space:pre-wrap; word-break:break-all; font-family:inherit; line-height:1.7; }
- .lib-detail-text.dim { color:var(--muted,#888); }
+ /* §反馈：详情面板固定浅底深字——不再依赖主题变量（此前白底白字不可读） */
+ .lib-detail { margin-top:8px; padding:8px 10px; background:#f8fafc; border-radius:6px;
+               border:1px solid #e5e7eb; color:#1f2937; }
+ .lib-detail-text { font-size:12px; margin:0; white-space:pre-wrap; word-break:break-all;
+                    font-family:inherit; line-height:1.7; color:#1f2937 !important; }
+ .lib-detail-text.dim { color:#6b7280 !important; }
  /* §P2-e 优化结果表格 */
  .opt-table { width:100%; border-collapse:collapse; font-size:12px; margin-bottom:14px; }
  .opt-table th, .opt-table td { padding:6px 8px; border-bottom:1px solid var(--border,#eee); text-align:left; }
  .opt-table th { color:var(--muted,#666); font-weight:600; background:var(--bg,#f8fafc); }
  .opt-table tr:hover td { background:rgba(59,130,246,.04); }
+ .lib-verify-help { font-size:11px; color:#475569; background:#f1f5f9; border-radius:6px;
+                    padding:6px 8px; margin-bottom:6px; line-height:1.7; color:#334155 !important; }
+ .lib-verify-help b { color:#0f172a; }
  .bt-result.pos { color: #4caf50; }
  .bt-result.neg { color: #FF4D4F; }
  .bt-progress { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; width: 220px; }

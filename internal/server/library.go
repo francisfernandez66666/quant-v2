@@ -317,11 +317,14 @@ func taskToLegacyJob(t store.ResearchTask) store.BacktestJob {
 	if ks, ok := p["kind"].(string); ok {
 		sk = strings.ToLower(strings.TrimSpace(ks))
 	}
+	// §P3 反馈：透出入队运行参数原文——回测行展示"具体参数"（区间/选股数/最小样本等）。
+	pj, _ := json.Marshal(p)
 	return store.BacktestJob{
 		ID:           t.ID,
 		Kind:         kind,
 		CandidateID:  t.RefID,
 		StrategyKind: sk,
+		ParamsJSON:   string(pj),
 		Status:       apiStatusOf(t.Status),
 		Progress:     t.Progress,
 		AvgExcess:    t.ResultNum,
