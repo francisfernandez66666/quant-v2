@@ -57,6 +57,7 @@ func main() {
 	go func() {
 		<-stop
 		log.Println("[researchd] 收到退出信号，正在停止研究调度…")
+		sch.PreemptForShutdown() // §先标抢占再取消：运行任务落 preempted 断点续跑，不落 error
 		cancel()
 	}()
 

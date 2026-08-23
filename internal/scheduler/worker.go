@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -169,6 +170,18 @@ func (s *Scheduler) drainAllowed(db *store.DB, cfg config.SchedulerConfig) bool 
 		}
 	}
 	return false
+}
+
+// PreemptForShutdown 停机前置钩子（researchd 收到 SIGTERM 时最先调用）：把当前运行任务
+// 标记抢占态，使其终态落 preempted（断点续跑）而非 error。必须在取消调度 ctx 之前调用；
+// 与 Run 循环里的"服务退出"抢占互为双保险（D-state 子进程退出慢时存在竞态）。
+// English: shutdown pre-hook — mark sticky preemptReq so the running task lands 'preempted'.
+func (s *Scheduler) PreemptForShutdown() {
+	s.mu.Lock()
+	if s.busy {
+		s.preemptReq = true
+	}
+	s.mu.Unlock()
 }
 
 // preemptCurrent 抢占/终止当前运行中的子进程（标 preemptReq，等待 runner 落终态）。
@@ -590,6 +603,15 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	cmd.Stderr = lf
 
 	if err := cmd.Start(); err != nil {
+		// §停机语义修正：调度器停止（ctx 取消）导致的启动失败落 preempted 断点续跑，
+		// 而不是 error 终态——否则每次 systemctl restart 都会把排队任务打成永久错误
+		// （2026-08-23 实录：restart 后 #35 落 error 需手工回队）。
+		if base.Err() != nil || errors.Is(err, context.Canceled) {
+			errMsg := "调度器停止，断点续跑"
+			log.Printf("[scheduler] 任务 #%d 启动被停机打断 → preempted", tk.ID)
+			s.finishTask(db, cfg, &tk, store.TaskPreempted, errMsg)
+			return
+		}
 		fail("启动子进程失败: " + err.Error())
 		return
 	}
@@ -823,6 +845,10 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	case runCtx.Err() == context.DeadlineExceeded && base.Err() == nil:
 		status = store.TaskError
 		errMsg = fmt.Sprintf("单步超时(%v)被终止", timeout)
+	case base.Err() != nil:
+		// §停机语义修正：调度器 ctx 取消（SIGTERM/restart）→ preempted，断点续跑
+		status = store.TaskPreempted
+		errMsg = "调度器停止，断点缓存有效（下次启动自动回队续跑）"
 	case waitErr != nil:
 		status = store.TaskError
 		errMsg = waitErr.Error()
