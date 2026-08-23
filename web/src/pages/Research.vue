@@ -47,7 +47,9 @@
       <button :class="['tab', candSubTab === 'patterns' ? 'active' : '']" @click="candSubTab = 'patterns'">形态候选</button>
       <button :class="['tab', candSubTab === 'optimize' ? 'active' : '']" @click="candSubTab = 'optimize'; loadOptimizations()">优化结果</button>
     </div>
-    <template v-if="candSubTab === 'patterns'">
+    <!-- §白屏修复：v-show 常驻双分支（v-if 切换时的整树卸载/重挂载曾触发渲染期
+         TypeError 把应用打崩成白屏）——切 tab 变成纯显示开关，结构上消灭该类故障 -->
+    <div v-show="candSubTab === 'patterns'">
     <!-- 研究处理进度：数据准备度 + 候选产出状态 -->
     <div class="progress-panel" v-if="progress">
       <div class="progress-title">研究处理进度</div>
@@ -81,11 +83,10 @@
         </div>
       </div>
     </div>
-    </template>
+    </div>
 
     <!-- §P2-e 子视图：参数寻优结果（完整表格 + 一键入库） -->
-    <template v-else>
-    <div class="library-panel">
+    <div class="library-panel" v-show="candSubTab === 'optimize'">
       <div class="library-header">
         <div class="library-title">参数寻优结果<span style="font-size:12px;color:var(--muted,#888)">（全库战法 × 止盈×持仓×门槛网格，盘后执行）</span></div>
         <div style="display:flex;gap:8px;align-items:center">
@@ -114,7 +115,11 @@
               <tr><th>#</th><th>战法</th><th>止盈</th><th>持仓</th><th>门槛</th><th>胜率</th><th>盈亏比</th><th>触发</th><th>状态</th><th>操作</th></tr>
             </thead>
             <tbody>
-              <tr v-for="r in t.results" :key="r.id">
+              <!-- §白屏根因修复：详情行与主行必须在同一个 v-for 作用域内——
+                   此前详情 tr 写在 v-for 外却引用 r.id，编译回退 _ctx.r=undefined，
+                   切到本视图即抛 TypeError 卸载整树（白屏实录，无头复现定位） -->
+              <template v-for="r in t.results" :key="r.id">
+              <tr>
                 <td>{{ r.rank }}</td>
                 <td>{{ r.strategy }}<span v-if="!r.strategy_kind" class="tag tag-kind kind-factor" style="margin-left:6px">内置</span></td>
                 <td>{{ fmtNum((r.params || {}).trail_pct) }}%</td>
@@ -158,12 +163,12 @@
                   </div>
                 </td>
               </tr>
+              </template>
             </tbody>
           </table>
         </div>
       </template>
     </div>
-    </template>
     </template>
 
     <!-- ══════════ Tab 2: 战法库 ══════════ -->
@@ -688,7 +693,7 @@ const activeTab = ref('candidates')
 const renderError = ref('')
 onErrorCaptured((err) => {
   renderError.value = String(err && err.message || err)
-  console.error('[Research] 渲染异常:', err)
+  console.error('[Research] 渲染异常:', String((err && err.stack) || err))
   return false // 阻断继续向上传播，保住已渲染内容
 })
 // active sub-tab

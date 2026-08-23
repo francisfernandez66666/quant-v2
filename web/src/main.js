@@ -131,5 +131,9 @@ const router = createRouter({ history: createWebHashHistory(), routes })
 // mount('#app') 把根组件渲染进 index.html 中的 #app 元素。
 // mount('#app') renders the root component into the #app element of index.html.
 const app = createApp(App)
+// §白屏取证：全局错误处理器——记录出错阶段(info)与完整堆栈，便于无头环境定位
+app.config.errorHandler = (err, _inst, info) => {
+  console.error('VUE_ERR>>', info, String((err && err.stack) || err))
+}
 app.use(router)
 app.mount('#app')
