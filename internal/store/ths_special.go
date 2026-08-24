@@ -239,3 +239,81 @@ func b2i(b bool) int {
 	}
 	return 0
 }
+
+// ── 估值快照 / 财务指标（§E 因子输入扩充）──
+
+// ThsValuationRow 估值快照行。
+type ThsValuationRow struct {
+	TradeDate string
+	TsCode    string
+	PeTtm     *float64
+	PeMrq     *float64
+	PbMrq     *float64
+	PsTtm     *float64
+	PcfTtm    *float64
+}
+
+// UpsertThsValuations 批量幂等写入估值快照。
+func (d *DB) UpsertThsValuations(rows []ThsValuationRow) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ths_valuations_daily
+		(trade_date, ts_code, pe_ttm, pe_mrq, pb_mrq, ps_ttm, pcf_ttm) VALUES (?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for _, r := range rows {
+		res, err := stmt.Exec(r.TradeDate, r.TsCode, r.PeTtm, r.PeMrq, r.PbMrq, r.PsTtm, r.PcfTtm)
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}
+
+// ThsFinIndicatorRow 财务指标单行。
+type ThsFinIndicatorRow struct {
+	TsCode  string
+	Report  string // "2024-4"
+	Ability string // growth/profitability/solvency/operation/cash-flow
+	IndexID string
+	Value   *string // 上游原始精度字符串；null=未披露
+}
+
+// UpsertThsFinIndicators 批量幂等写入财务指标。
+func (d *DB) UpsertThsFinIndicators(rows []ThsFinIndicatorRow) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO ths_fin_indicators
+		(ts_code, report, ability, index_id, value) VALUES (?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	var n int64
+	for _, r := range rows {
+		res, err := stmt.Exec(r.TsCode, r.Report, r.Ability, r.IndexID, r.Value)
+		if err != nil {
+			return n, err
+		}
+		aff, _ := res.RowsAffected()
+		n += aff
+	}
+	return n, tx.Commit()
+}

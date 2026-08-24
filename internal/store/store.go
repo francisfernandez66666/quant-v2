@@ -409,6 +409,26 @@ func (d *DB) migrate() error {
 			keywords TEXT DEFAULT '[]',
 			PRIMARY KEY (trade_date, ts_code, tag_name)
 		)`,
+		// 同花顺（新）估值快照（五项指标，夜间批量入表）
+		`CREATE TABLE IF NOT EXISTS ths_valuations_daily (
+			trade_date TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			pe_ttm REAL,
+			pe_mrq REAL,
+			pb_mrq REAL,
+			ps_ttm REAL,
+			pcf_ttm REAL,
+			PRIMARY KEY (trade_date, ts_code)
+		)`,
+		// 同花顺（新）财务指标五类24项（ability 区分维度，index_id 为具名字段标识）
+		`CREATE TABLE IF NOT EXISTS ths_fin_indicators (
+			ts_code TEXT NOT NULL,
+			report TEXT NOT NULL,
+			ability TEXT NOT NULL,
+			index_id TEXT NOT NULL,
+			value TEXT,
+			PRIMARY KEY (ts_code, report, ability, index_id)
+		)`,
 		// 同花顺（新）累计后复权因子（事件换算生成，锚定衔接旧表基线）。
 		`CREATE TABLE IF NOT EXISTS ths_adj_factor (
 			ts_code TEXT NOT NULL,

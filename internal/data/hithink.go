@@ -562,3 +562,63 @@ func boardNumFromKey(k string) int {
 	}
 	return 0
 }
+
+// ── 财务指标五类 + 估值快照（§E 因子输入扩充）──
+
+// HithinkFinIndicators 财务指标（五类，value 为 string|null 保上游原始精度）。
+type HithinkFinIndicators struct {
+	ThsCode   string `json:"thscode"`
+	Report    string `json:"report"` // "2024-4" 格式
+	Abilities []struct {
+		Ability    string `json:"ability"` // growth/profitability/solvency/operation/cash-flow
+		Indicators []struct {
+			IndexID string  `json:"index_id"`
+			Value   *string `json:"value"`
+		} `json:"indicators"`
+	} `json:"abilities"`
+}
+
+// FinancialIndicators 单只标的双报告期财务指标。
+// report 格式 "yyyy-N"：N=1 一季报 / 2 中报 / 3 三季报 / 4 年报。
+// 文档：GET /api/a-share/financials/indicators
+func (c *HithinkClient) FinancialIndicators(thsCode, report string) (*HithinkFinIndicators, error) {
+	p := url.Values{}
+	p.Set("thscode", thsCode)
+	p.Set("report", report)
+	var out HithinkFinIndicators
+	if err := c.get("/api/a-share/financials/indicators", p, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// HithinkValuationItem 估值快照条目（五个估值指标）。
+type HithinkValuationItem struct {
+	ThsCode string   `json:"thscode"`
+	Ticker  string   `json:"ticker"`
+	Name    *string  `json:"name"`
+	PeTtm   *float64 `json:"pe_ttm"`
+	PeMrq   *float64 `json:"pe_mrq"`
+	PbMrq   *float64 `json:"pb_mrq"`
+	PsTtm   *float64 `json:"ps_ttm"`
+	PcfTtm  *float64 `json:"pcf_ttm"`
+}
+
+// ValuationsSnapshot 估值快照：thscodes 批量（单请求≤100 只）。
+// 文档：GET /api/a-share/valuations/snapshot
+func (c *HithinkClient) ValuationsSnapshot(thscodes []string) ([]HithinkValuationItem, error) {
+	if len(thscodes) > 100 {
+		return nil, fmt.Errorf("hithink: 估值快照单请求最多 100 只（当前 %d）", len(thscodes))
+	}
+	var out struct {
+		Timestamp int64                  `json:"timestamp"`
+		Total     int                    `json:"total"`
+		Item      []HithinkValuationItem `json:"item"`
+	}
+	p := url.Values{}
+	p.Set("thscodes", joinThsCodes(thscodes))
+	if err := c.get("/api/a-share/valuations/snapshot", p, &out); err != nil {
+		return nil, err
+	}
+	return out.Item, nil
+}

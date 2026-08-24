@@ -12,7 +12,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -45,6 +47,14 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	}
 	if *kind == "anomaly" {
 		cmdHithinkSyncAnomaly(client, db, *since)
+		return
+	}
+	if *kind == "valuations" {
+		cmdHithinkSyncValuations(client, db)
+		return
+	}
+	if *kind == "fin-indicators" {
+		cmdHithinkSyncFinIndicators(client, db, fs.Args())
 		return
 	}
 
@@ -329,4 +339,94 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// cmdHithinkSyncValuations 全市场估值快照批量入库（§E）。
+// 从 ths_daily 取全部标的，100 只/批分页调 API；trade_date=今日。
+func cmdHithinkSyncValuations(client *data.HithinkClient, db *store.DB) {
+	codes, cerr := db.ThsAllCodes()
+	if cerr != nil {
+		log.Fatalf("读标的清单失败: %v", cerr)
+	}
+	tradeDate := time.Now().Format("20060102")
+	total := 0
+	batchSize := 100
+	for i := 0; i < len(codes); i += batchSize {
+		end := i + batchSize
+		if end > len(codes) {
+			end = len(codes)
+		}
+		items, err := client.ValuationsSnapshot(codes[i:end])
+		if err != nil {
+			log.Printf("[hithink] 估值批次 %d-%d 失败(跳过): %v", i, end, err)
+			continue
+		}
+		var rows []store.ThsValuationRow
+		for _, it := range items {
+			rows = append(rows, store.ThsValuationRow{
+				TradeDate: tradeDate, TsCode: it.ThsCode,
+				PeTtm: it.PeTtm, PeMrq: it.PeMrq, PbMrq: it.PbMrq,
+				PsTtm: it.PsTtm, PcfTtm: it.PcfTtm,
+			})
+		}
+		if _, uerr := db.UpsertThsValuations(rows); uerr != nil {
+			log.Printf("[hithink] 估值写入失败(跳过): %v", uerr)
+			continue
+		}
+		total += len(rows)
+	}
+	log.Printf("[hithink] 估值快照同步完成：%d 只（trade_date=%s）", total, tradeDate)
+}
+
+// cmdHithinkSyncFinIndicators 财务指标同步：对 --codes 指定池内标的逐个拉取
+// 最近年报+最新季报的指标入库。codesFile 每行一个 ts_code。
+func cmdHithinkSyncFinIndicators(client *data.HithinkClient, db *store.DB, args []string) {
+	fs := flag.NewFlagSet("fin-indicators", flag.ExitOnError)
+	codesFile := fs.String("codes", "", "标的清单文件（每行一个 thscode，如 600519.SH）")
+	year := fs.Int("year", time.Now().Year(), "报告期年份")
+	reports := fs.String("reports", "1,4", "要拉取的报告期序号（逗号分隔：1一季报/2中报/3三季报/4年报）")
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("参数解析失败: %v", err)
+	}
+	if *codesFile == "" {
+		log.Fatal("--codes 必填（每行一个 thscode）")
+	}
+	content, err := os.ReadFile(*codesFile)
+	if err != nil {
+		log.Fatalf("读取标的文件失败: %v", err)
+	}
+	var codes []string
+	for _, ln := range strings.Split(string(content), "\n") {
+		c := strings.TrimSpace(ln)
+		if c != "" && !strings.HasPrefix(c, "#") {
+			codes = append(codes, c)
+		}
+	}
+	var repNums []string
+	for _, r := range strings.Split(*reports, ",") {
+		repNums = append(repNums, strings.TrimSpace(r))
+	}
+	total := 0
+	for _, code := range codes {
+		for _, rn := range repNums {
+			report := fmt.Sprintf("%d-%s", *year, rn)
+			fi, err := client.FinancialIndicators(code, report)
+			if err != nil {
+				continue // 无数据/未披露静默跳过
+			}
+			var rows []store.ThsFinIndicatorRow
+			for _, ab := range fi.Abilities {
+				for _, ind := range ab.Indicators {
+					rows = append(rows, store.ThsFinIndicatorRow{
+						TsCode: code, Report: report,
+						Ability: ab.Ability, IndexID: ind.IndexID, Value: ind.Value,
+					})
+				}
+			}
+			if _, uerr := db.UpsertThsFinIndicators(rows); uerr == nil {
+				total += len(rows)
+			}
+		}
+	}
+	log.Printf("[hithink] 财务指标同步完成：%d 条（%d 只 × %d 报告期）", total, len(codes), len(repNums))
 }
