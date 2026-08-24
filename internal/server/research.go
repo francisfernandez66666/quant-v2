@@ -127,6 +127,13 @@ func (s *Server) computeResearchProgress(w http.ResponseWriter) map[string]any {
 		readyPct = float64(ready) / float64(nStocks)
 	}
 	log.Printf("[research] progress: stocks=%d ready=%d daily_rows=%d fin=%d cands=%d", nStocks, ready, dailyRows, fin, len(cands))
+	// §数据源标识：前端徽标展示「同花顺（新）/ baostock」
+	ds := "baostock"
+	if s.cfg != nil {
+		if ps := s.cfg.Rules.Data.PrimarySource; ps == "hithink" {
+			ds = "同花顺（新）"
+		}
+	}
 	return map[string]any{
 		"stocks":       nStocks,
 		"ready_stocks": ready,
@@ -137,6 +144,7 @@ func (s *Server) computeResearchProgress(w http.ResponseWriter) map[string]any {
 		"applied":      applied,
 		"proposed":     proposed,
 		"db_attached":  true,
+		"data_source":  ds,
 		"scheduler":    s.schedulerState(),
 	}
 }

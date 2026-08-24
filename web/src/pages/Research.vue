@@ -52,7 +52,10 @@
     <div v-show="candSubTab === 'patterns'">
     <!-- 研究处理进度：数据准备度 + 候选产出状态 -->
     <div class="progress-panel" v-if="progress">
-      <div class="progress-title">研究处理进度</div>
+      <div class="progress-title">研究处理进度
+          <span v-if="progress.data_source" class="tag status-applied" style="margin-left:8px;font-size:11px"
+                :title="'回测/研究取数主源：' + progress.data_source">数据源: {{ progress.data_source }}</span>
+        </div>
       <div class="progress-grid">
         <!-- 数据准备度：近一年有行情的股票 / 全市场 -->
         <div class="progress-item">
