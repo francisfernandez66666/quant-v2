@@ -54,7 +54,9 @@ func cmdHithinkSync(db *store.DB, args []string) {
 		batch = append(batch, store.ThsDailyRow{
 			TsCode: row.ThsCode, TradeDate: row.Date,
 			Open: row.Open, High: row.High, Low: row.Low, Close: row.Close,
-			Vol: row.Volume, Amount: row.Turnover,
+			// 单位归一：THS 成交量单位为股，baostock 为手（1手=100股）——
+			// ÷100 对齐存量口径（2026-08-24 双源对账实录：平安银行 106,085,094 股 vs 1,060,851 手）。
+			Vol: row.Volume / 100, Amount: row.Turnover,
 		})
 		if len(batch) >= *batchSize {
 			n, uerr := db.UpsertThsDailyRows(batch)
