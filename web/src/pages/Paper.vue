@@ -57,7 +57,7 @@
         <div class="form-row">
           <label>重置后初始资金</label>
           <input v-model.number="resetToCapital" type="number" min="0" step="10000"
-                 placeholder="默认=当前累计投入" />
+                 placeholder="默认 100000" />
           <span class="static-val">元</span>
         </div>
         <div class="config-hint">不填则按当前累计投入总额重置。</div>
@@ -825,18 +825,12 @@ async function clearAllocs() {
 // 清盘重置：仅清仓并按配置初始资金重置，不修改自定义资金
 // Reset: liquidate everything and reset to the configured capital, without changing custom settings
 async function doResetV2() {
-  const msg = '确认清盘模拟盘？\n将平仓全部持仓、清除成交日志与净值曲线。'
-  if (!confirm(msg)) return
+  if (!confirm('确认清盘？\n将平仓全部持仓、清除成交日志与净值曲线。')) return
   try {
     const body = {}
     if (resetToCapital.value > 0) body.reset_to = resetToCapital.value
     if (resetMaxPos.value > 0) body.max_positions = resetMaxPos.value
-    await api.resetPaper(0, 0) // 兼容旧 API
-    // §v2：显式指定重置后初始资金（解决 Deposit 污染 InitialCapital 的 bug）
-    if (resetToCapital.value > 0) {
-      await fetch('/api/paper/reset', { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ reset_to: resetToCapital.value }) })
-    }
+    await api.paperResetV2(body)
     showResetModal.value = false
     resetToCapital.value = 0
     resetMaxPos.value = 0

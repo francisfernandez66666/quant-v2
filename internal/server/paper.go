@@ -359,11 +359,14 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 			pe.SetMaxPositions(req.MaxPositions)
 		}
 	} else {
-		// 清盘重置：如果指定了 reset_to，则把 cfg.InitialCapital 也重置为该值——
-		// 解决多次 Deposit 累加导致 cfg.InitialCapital 被污染、清盘后从错误基数起跳的 bug。
+		// §反馈修复 v3：普通清盘把 InitialCapital 重置为干净默认 10 万——
+		// 多次 Deposit 会累加污染 cfg.InitialCapital（10→300万），导致清盘后从
+		// 错误基数起跳。用户可通过 reset_to 显式指定其他金额。
+		resetAmount := 100000.0
 		if req.ResetTo > 0 {
-			pe.SetInitialCapital(req.ResetTo)
+			resetAmount = req.ResetTo
 		}
+		pe.SetInitialCapital(resetAmount)
 		pe.Reset()
 		if req.MaxPositions > 0 {
 			pe.SetMaxPositions(req.MaxPositions)

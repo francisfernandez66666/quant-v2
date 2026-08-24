@@ -1335,3 +1335,8 @@ export async function approveOptimization(id) {
 export async function rejectOptimization(id) {
   return request('/api/research/optimizations/' + id + '/reject', { method: 'POST' })
 }
+
+/** §v2 清盘：支持显式指定重置后初始资金（reset_to）与持仓上限 */
+export async function paperResetV2(body) {
+  return request('/api/paper/reset', { method: 'POST', data: body })
+}
