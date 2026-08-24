@@ -349,18 +349,23 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		InitialCapital float64 `json:"initial_capital"`
 		MaxPositions   int     `json:"max_positions"`
+		ResetTo        float64 `json:"reset_to"` // §反馈修复：清盘时显式指定重置后的初始资金
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.InitialCapital > 0 {
-		// 注入资金：增量加现金，保留持仓/净值/成交；设置可选上限
+		// 注入资金：增量加现金，保留持仓/净值/成交
 		pe.Deposit(req.InitialCapital)
 		if req.MaxPositions >= 0 {
 			pe.SetMaxPositions(req.MaxPositions)
 		}
 	} else {
-		// 清盘重置：不改资金/上限，仅清空重开
+		// 清盘重置：如果指定了 reset_to，则把 cfg.InitialCapital 也重置为该值——
+		// 解决多次 Deposit 累加导致 cfg.InitialCapital 被污染、清盘后从错误基数起跳的 bug。
+		if req.ResetTo > 0 {
+			pe.SetInitialCapital(req.ResetTo)
+		}
 		pe.Reset()
-		if req.MaxPositions >= 0 && req.InitialCapital == 0 && req.MaxPositions > 0 {
+		if req.MaxPositions > 0 {
 			pe.SetMaxPositions(req.MaxPositions)
 		}
 	}

@@ -22,20 +22,95 @@
         <span class="cap-badge" v-if="enabled" title="当前生效的持仓上限（经确认资金固化）">
           上限：{{ appliedMax > 0 ? appliedMax + ' 只' : '不设限' }}
         </span>
-        <input v-model="initialCapital" type="number" min="0" step="1000"
-               :disabled="!enabled" class="cap-input" placeholder="注入资金" :title="'当前累计投入 ' + fmt(initialCapital)" />
-        <input v-model="maxPos" type="number" min="0" step="1"
-               :disabled="!enabled" class="cap-input cap-max" placeholder="持仓上限" title="持仓上限（0=不设限，由资金决定持仓）" />
-        <button class="btn-confirm" :disabled="!enabled" @click="confirmDeposit">注入资金</button>
-        <button class="btn-reset" :disabled="!enabled" @click="doReset">清盘重置</button>
-        <button class="btn-config" :disabled="!enabled" title="分仓资金分配 + 每池持仓上限（与全局解耦可自定义）"
-                @click="openAllocModal">资金分配</button>
-        <button class="btn" :disabled="!enabled" title="全局与各池持仓上限（独立于资金设置）"
-                @click="openCapModal">仓位上限</button>
-        <button class="btn" :disabled="!enabled" title="清除每池自定义资金，恢复均分"
-                @click="clearAllocs">恢复均分</button>
+        <!-- §UI 重构：操作区收敛为三颗主按钮 + 一个统一设置弹窗 -->
+        <button class="btn-confirm" :disabled="!enabled" @click="showDepositModal = true"
+                title="向模拟盘增量注入资金">＋ 注入资金</button>
+        <button class="btn-config" :disabled="!enabled" @click="openSettingsModal"
+                title="资金分配 / 仓位上限 / 恢复均分">⚙ 设置</button>
+        <button class="btn-reset" :disabled="!enabled" @click="showResetModal = true"
+                title="清盘重置：平仓全部持仓并重置净值">清盘</button>
       </div>
     </div>
+
+    <!-- ── 注入资金弹窗 ── -->
+    <div class="modal-overlay" v-if="showDepositModal" @click.self="showDepositModal = false">
+      <div class="modal">
+        <div class="modal-title">注入资金</div>
+        <div class="form-row">
+          <label>金额（元）</label>
+          <input v-model.number="depositAmount" type="number" min="0" step="1000" placeholder="10000" />
+        </div>
+        <div class="modal-actions">
+          <button class="btn-cancel" @click="showDepositModal = false">取消</button>
+          <button class="btn-confirm" @click="confirmDeposit(); showDepositModal = false">确认注入</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 清盘弹窗（显式指定重置后初始资金，解决 Deposit 污染 InitialCapital 的 bug）── -->
+    <div class="modal-overlay" v-if="showResetModal" @click.self="showResetModal = false">
+      <div class="modal">
+        <div class="modal-title">⚠ 清盘重置</div>
+        <div class="config-hint" style="color:#e6a23c">
+          将平仓全部持仓、清除成交日志与净值曲线。
+        </div>
+        <div class="form-row">
+          <label>重置后初始资金</label>
+          <input v-model.number="resetToCapital" type="number" min="0" step="10000"
+                 placeholder="默认=当前累计投入" />
+          <span class="static-val">元</span>
+        </div>
+        <div class="config-hint">不填则按当前累计投入总额重置。</div>
+        <div class="form-row">
+          <label>持仓上限</label>
+          <input v-model.number="resetMaxPos" type="number" min="0" step="1" placeholder="0=不设限" />
+        </div>
+        <div class="modal-actions">
+          <button class="btn-cancel" @click="showResetModal = false">取消</button>
+          <button class="btn-reset" @click="doResetV2">确认清盘</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 统一设置弹窗（Tab：资金分配 | 仓位上限）── -->
+    <div class="modal-overlay" v-if="settingsOpen" @click.self="settingsOpen = false">
+      <div class="modal pool-config-modal">
+        <div class="modal-title">⚙ 设置</div>
+        <div class="settings-tabs">
+          <button :class="['tab', settingsTab === 'alloc' ? 'active' : '']" @click="settingsTab = 'alloc'">资金分配</button>
+          <button :class="['tab', settingsTab === 'caps' ? 'active' : '']" @click="settingsTab = 'caps'">仓位上限</button>
+        </div>
+        <!-- 资金分配 tab -->
+        <div v-show="settingsTab === 'alloc'">
+          <div class="config-hint">每池资金额（Σ ≈ 总现金守恒）。不影响仓位上限。</div>
+          <div v-for="p in pools" :key="'sa-' + p.key" class="pool-config-row">
+            <span class="pool-config-label">{{ p.label }}</span>
+            <input v-model.number="cfgAllocs[p.key]" type="number" min="0" step="1000" class="cfg-input"
+                   :placeholder="'当前 ¥' + fmt(p.cash)" />
+          </div>
+        </div>
+        <!-- 仓位上限 tab -->
+        <div v-show="settingsTab === 'caps'">
+          <div class="form-row">
+            <label>全局持仓上限</label>
+            <input v-model.number="cfgMaxPos" type="number" min="0" step="1" placeholder="0=不设限" />
+            <span class="static-val">（0=不设限）</span>
+          </div>
+          <div class="config-hint">每池持仓上限（0=不单独设限）。Σ ≤ 全局。不影响资金分配。</div>
+          <div v-for="p in pools" :key="'sc-' + p.key" class="pool-config-row">
+            <span class="pool-config-label">{{ p.label }}</span>
+            <input v-model.number="cfgCaps[p.key]" type="number" min="0" step="1" class="cfg-input cfg-cap"
+                   :placeholder="p.max_pos > 0 ? '当前 ' + p.max_pos : '不单独设限'" />
+          </div>
+        </div>
+        <div class="preview" v-if="cfgWarn">{{ cfgWarn }}</div>
+        <div class="modal-actions">
+          <button class="btn-cancel" @click="settingsOpen = false">取消</button>
+          <button class="btn-confirm" @click="saveSettings">保存</button>
+        </div>
+      </div>
+    </div>
+
 
     <!-- 分仓条：当前启用战法的资金池（可点按筛选持仓/成交，展示各池累计涨跌幅）
          (Strategy-pool allocation strip — clickable tabs that filter positions/fills and show each
@@ -418,8 +493,13 @@ const activePool = ref(null)     // 当前筛选的分仓（null=全部；池 ke
 const W = 900, H = 220           // 净值折线 SVG 画布尺寸
 let timer = null                 // 轮询定时器
 // ── 分仓配置弹窗（每池资金/上限自定义，与全局解耦，总和守恒）── (Pool-config modal)
-const allocOpen = ref(false)       // 资金分配弹窗
-const capOpen = ref(false)         // 仓位上限弹窗
+const showDepositModal = ref(false)
+const showResetModal = ref(false)
+const settingsOpen = ref(false)
+const settingsTab = ref('alloc')
+const depositAmount = ref(0)
+const resetToCapital = ref(0)
+const resetMaxPos = ref(0)
 const cfgMaxPos = ref(0)            // 弹窗内全局持仓上限
 const cfgAllocs = ref({})           // 每池目标资金额（key=策略类型；空=自动均分剩余）
 const cfgCaps = ref({})             // 每池持仓上限（key=策略类型；0=不单独设限）
@@ -672,45 +752,44 @@ async function confirmPoolReset() {
   } catch (e) { alert(e.message || '清盘失败') }
 }
 
-// 打开资金分配弹窗：回填各池当前现金（仅动资金，与仓位上限解耦）
-function openAllocModal() {
-  cfgAllocs.value = {}
-  pools.value.forEach(p => { cfgAllocs.value[p.key] = p.cash })
-  cfgWarn.value = ''
-  allocOpen.value = true
-}
-// 打开仓位上限弹窗：回填全局上限与各池上限
-function openCapModal() {
+// 打开统一设置弹窗：回填全部当前值
+function openSettingsModal() {
   cfgMaxPos.value = appliedMax.value > 0 ? appliedMax.value : 0
+  cfgAllocs.value = {}
   cfgCaps.value = {}
-  pools.value.forEach(p => { cfgCaps.value[p.key] = p.max_pos || 0 })
+  pools.value.forEach(p => {
+    cfgAllocs.value[p.key] = p.cash
+    cfgCaps.value[p.key] = p.max_pos || 0
+  })
+  settingsTab.value = 'alloc'
   cfgWarn.value = ''
-  capOpen.value = true
+  settingsOpen.value = true
 }
 
-// 保存资金分配：仅提交 pool_allocs（Σ池资金 ≤ 总现金守恒；不影响仓位上限）。
-async function savePoolAllocs() {
+// 统一保存设置：按当前 tab 只提交对应字段（互不影响）。
+async function saveSettings() {
   const totalCash = pools.value.reduce((s, p) => s + p.cash, 0)
-  const allocs = {}
-  let assigned = 0
-  pools.value.forEach(p => {
-    const n = parseFloat(cfgAllocs.value[p.key])
-    if (n > 0) { allocs[p.key] = n; assigned += n }
-  })
-  if (assigned > totalCash + 0.01) {
-    cfgWarn.value = `资金超额：Σ池资金 ¥${fmt(assigned)} > 总现金 ¥${fmt(totalCash)}，请调低`
-    allocOpen.value = true
+
+  if (settingsTab.value === 'alloc') {
+    const allocs = {}
+    let assigned = 0
+    pools.value.forEach(p => {
+      const n = parseFloat(cfgAllocs.value[p.key])
+      if (n > 0) { allocs[p.key] = n; assigned += n }
+    })
+    if (assigned > totalCash + 0.01) {
+      cfgWarn.value = `资金超额：Σ ¥${fmt(assigned)} > 总现金 ¥${fmt(totalCash)}`
+      return
+    }
+    try {
+      await api.configPaperPools(null, null, allocs)
+      settingsOpen.value = false
+      await load()
+    } catch (e) { alert(e.message || '保存失败') }
     return
   }
-  try {
-    await api.configPaperPools(-1, {}, allocs) // max_positions=-1=不触碰上限设置
-    allocOpen.value = false
-    await load()
-  } catch (e) { alert(e.message || '保存失败') }
-}
 
-// 保存仓位上限：仅提交 max_positions+pool_caps（Σ池上限≤全局守恒；不影响资金）。
-async function savePoolCaps() {
+  // caps tab
   const caps = {}
   let capSum = 0
   pools.value.forEach(p => {
@@ -719,15 +798,19 @@ async function savePoolCaps() {
   })
   const gCap = parseInt(cfgMaxPos.value, 10)
   if (gCap > 0 && capSum > gCap) {
-    cfgWarn.value = `持仓上限超额：Σ池上限 ${capSum} > 全局 ${gCap}，请调低各池或提高全局`
-    capOpen.value = true
+    cfgWarn.value = `Σ池上限 ${capSum} > 全局 ${gCap}`
     return
   }
   try {
-    await api.configPaperPools(gCap, caps, null) // allocs=null=不触碰资金设置
-    capOpen.value = false
+    await api.configPaperPools(gCap, caps, null)
+    settingsOpen.value = false
     await load()
   } catch (e) { alert(e.message || '保存失败') }
+}
+
+// 恢复均分：清除每池自定义资金。
+async function clearPoolAllocs() {
+  await api.configPaperPools(null, {}, {})
 }
 
 // 恢复均分：清除每池自定义资金（显式传空对象触发后端 ResetPoolAllocs）。
@@ -741,12 +824,24 @@ async function clearAllocs() {
 
 // 清盘重置：仅清仓并按配置初始资金重置，不修改自定义资金
 // Reset: liquidate everything and reset to the configured capital, without changing custom settings
-async function doReset() {
-  if (!confirm('清盘模拟盘？将按最后估值价平仓全部持仓并重置净值。此操作不影响真实持仓。')) return
+async function doResetV2() {
+  const msg = '确认清盘模拟盘？\n将平仓全部持仓、清除成交日志与净值曲线。'
+  if (!confirm(msg)) return
   try {
-    await api.resetPaper(0, 0)
+    const body = {}
+    if (resetToCapital.value > 0) body.reset_to = resetToCapital.value
+    if (resetMaxPos.value > 0) body.max_positions = resetMaxPos.value
+    await api.resetPaper(0, 0) // 兼容旧 API
+    // §v2：显式指定重置后初始资金（解决 Deposit 污染 InitialCapital 的 bug）
+    if (resetToCapital.value > 0) {
+      await fetch('/api/paper/reset', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ reset_to: resetToCapital.value }) })
+    }
+    showResetModal.value = false
+    resetToCapital.value = 0
+    resetMaxPos.value = 0
     await load()
-  } catch (e) { alert(e.message || '重置失败') }
+  } catch (e) { alert(e.message || '清盘失败') }
 }
 
 // ── 生命周期 ── (Lifecycle)

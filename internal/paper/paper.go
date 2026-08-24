@@ -1774,3 +1774,13 @@ var (
 type errMsg string
 
 func (e errMsg) Error() string { return string(e) }
+
+// SetInitialCapital 显式设定初始资金额（§反馈修复：配合 Reset 使用，
+// 解决多次 Deposit 累加导致 cfg.InitialCapital 被抬高后清盘基数不对的问题）。
+func (e *Engine) SetInitialCapital(v float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if v > 0 {
+		e.cfg.InitialCapital = v
+	}
+}
