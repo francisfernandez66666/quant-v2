@@ -47,6 +47,7 @@ var (
 	btWinRe     = regexp.MustCompile(`(?m)^胜率: (\d+(?:\.\d+)?)%`)
 	btPfRe      = regexp.MustCompile(`(?m)^盈亏比: (\d+(?:\.\d+)?)`)
 	btHoldRe    = regexp.MustCompile(`(?m)^平均持仓天数: (\d+(?:\.\d+)?)`)
+	btExpectRe  = regexp.MustCompile(`(?m)^期望收益: ([+-]\d+(?:\.\d+)?)%`)
 )
 
 // parseBtSummary 按 ===== 分隔块解析回放汇总，每个战法一行、冠以名称标签：
@@ -82,6 +83,9 @@ func parseBtSummary(out string) string {
 		}
 		if m := btHoldRe.FindStringSubmatch(blk); len(m) == 2 {
 			row += fmt.Sprintf("持仓 %s天", m[1])
+		}
+		if m := btExpectRe.FindStringSubmatch(blk); len(m) == 2 {
+			row += fmt.Sprintf(" 期望 %s%%", m[1])
 		}
 		rows = append(rows, strings.TrimSpace(row))
 	}

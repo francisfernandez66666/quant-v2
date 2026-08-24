@@ -460,6 +460,10 @@
           </template>
           <div class="bt-result" v-if="j.status === 'done' && j.kind !== 'library'">
             回测超额 <b :class="signClass(j.avg_excess)">{{ fmt(j.avg_excess) }}</b>
+            <em v-if="j.result_text && j.result_text.includes('期望')" style="margin-left:8px;font-size:11px;color:#64748b">
+              {{ j.result_text.match(/【[^】]*】.*?期望 ([+\-][\d.]+%)/)?.[1] || '' }}
+              期望
+            </em>
           </div>
           <div class="bt-error" v-if="j.status === 'error'">{{ j.error }}</div>
           <div class="bt-error" v-else-if="j.status === 'interrupted'">
