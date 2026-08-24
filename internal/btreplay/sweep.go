@@ -232,54 +232,71 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		}
 	}
 
-	// ── 4) 排名输出（有效组合按目标降序；触发不足者垫底仅列出）──
+	// ── §4 每战法取最优组合 → 跨战法排名（不同战法各出一行最优参数）──
 	for i := range all {
 		all[i].ObjectiveScore = objectiveValue(obj, &all[i])
 	}
-	qualifying := make([]int, 0, len(all))
-	weak := make([]int, 0)
+
+	// 按策略分组：每组内选 ObjectiveScore 最高的组合作为该战法的代表
+	stratBest := map[string]*sweepResult{}
+	var stratOrder []string
 	for i := range all {
-		if all[i].Count >= sweepMinTrades {
-			qualifying = append(qualifying, i)
-		} else {
-			weak = append(weak, i)
+		r := &all[i]
+		if r.Count < sweepMinTrades {
+			continue
+		}
+		if _, ok := stratBest[r.Name]; !ok {
+			stratOrder = append(stratOrder, r.Name)
+		}
+		if cur := stratBest[r.Name]; cur == nil || objectiveValue(obj, r) > objectiveValue(obj, cur) {
+			stratBest[r.Name] = r
 		}
 	}
-	sort.Slice(qualifying, func(a, b int) bool {
-		x, y := &all[qualifying[a]], &all[qualifying[b]]
-		if x.ObjectiveScore != y.ObjectiveScore {
-			return x.ObjectiveScore > y.ObjectiveScore
+
+	var ranked []*sweepResult
+	for _, name := range stratOrder {
+		sb := stratBest[name]
+		if sb != nil && sb.Count >= sweepMinTrades {
+			ranked = append(ranked, sb)
 		}
-		return x.Count > y.Count
+	}
+	sort.Slice(ranked, func(a, b int) bool {
+		sa, sbb := objectiveValue(obj, ranked[a]), objectiveValue(obj, ranked[b])
+		if sa != sbb {
+			return sa > sbb
+		}
+		return ranked[a].Count > ranked[b].Count
 	})
-	sort.Slice(weak, func(a, b int) bool { return all[weak[a]].Count > all[weak[b]].Count })
 
-	fmt.Printf("══════════════════════════════════════════════\n")
-	fmt.Printf("参数优化目标: %s | 组合总数 %d | 有效排名 %d（触发≥%d）\n",
-		objName, total, len(qualifying), sweepMinTrades)
-	rank := qualifying
-	if len(rank) > topN {
-		rank = rank[:topN]
-	}
-	for pos, idx := range rank {
-		r := &all[idx]
+	fmt.Printf("==============================================\n")
+	fmt.Printf("参数优化目标: %s | 组合总数 %d | 参与战法 %d（每战法取最优）\n",
+		objName, total, len(ranked))
+
+	var jsonResults []map[string]any
+	for pos, b := range ranked {
+		if pos >= topN {
+			break
+		}
 		fmt.Printf("#%d 【%s】止盈%.0f%% 持仓%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d 平均持仓%.1f天\n",
-			pos+1, r.Name, r.Trail, r.Hold, r.MinScore, r.WinRate, r.ProfitFactor, r.Expectancy, r.Count, r.AvgHold)
+			pos+1, b.Name, b.Trail, b.Hold, b.MinScore, b.WinRate, b.ProfitFactor, b.Expectancy, b.Count, b.AvgHold)
+		jsonResults = append(jsonResults, map[string]any{
+			"rank": pos + 1, "strategy": b.Name, "strategy_kind": b.Kind,
+			"params": map[string]any{"trail_pct": b.Trail, "hold_days": b.Hold, "min_score": b.MinScore},
+			"win_rate": b.WinRate, "profit_factor": b.ProfitFactor, "expectancy": b.Expectancy,
+			"win": b.Win, "loss": b.Loss,
+			"avg_win_pct": b.AvgWinPct, "avg_loss_pct": b.AvgLossPct,
+			"trigger_count": b.Count, "avg_hold_days": b.AvgHold,
+		})
 	}
-	if len(rank) == 0 {
-		fmt.Println("无达到最低触发数的组合——考虑扩大日期区间或股票池。")
+	if len(jsonResults) == 0 {
+		fmt.Println("无达到最低触发数的组合。")
 	}
 
-	// 机器可读行：worker 解析后落 optimization_results（§P2-c）
-	payload := map[string]any{
-		"objective": obj,
-		"total":     total,
-		"results":   rankedJSON(&all, rank), // 与展示一致：只落 TOP-N（rank 已截断）
-	}
+	payload := map[string]any{"objective": obj, "total": total, "results": jsonResults}
 	if bj, jerr := json.Marshal(payload); jerr == nil {
 		fmt.Printf("SWEEP_JSON:%s\n", bj)
 	}
-	fmt.Printf("══════════════════════════════════════════════\n")
+	fmt.Printf("==============================================\n")
 	return nil
 }
 
@@ -364,6 +381,8 @@ func simulateCombo(name, kind string, trigs []sweepTrigger, klines map[string][]
 	if lossSum != 0 {
 		res.ProfitFactor = winSum / -lossSum
 	}
+	wr := res.WinRate / 100
+	res.Expectancy = wr*res.AvgWinPct + (1-wr)*res.AvgLossPct
 	return res
 }
 
