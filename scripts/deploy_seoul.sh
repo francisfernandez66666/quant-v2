@@ -29,6 +29,7 @@ QUANT_DATA_DIR="${QUANT_DATA_DIR:-/var/lib/quant-trading-v2}"
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_DIR"
+# §SSH 加固：密钥登录+端口 28022（~/.ssh/config 有 Host 43.108.86.140 seoul 别名自动匹配）
 SSH="ssh -o StrictHostKeyChecking=accept-new $SERVER_USER@$SERVER_IP"
 SCP="scp -o StrictHostKeyChecking=accept-new"
 
