@@ -344,3 +344,117 @@ func (c *HithinkClient) Auction(thscodes []string, stage string) (*HithinkAuctio
 	}
 	return &out, nil
 }
+
+// ── 特色数据：涨跌停三池 / 连板天梯 / 个股异动（§P1 盘口升级）──
+
+// HithinkLimitUpItem 涨停池条目（含盘口级关键字段）。
+type HithinkLimitUpItem struct {
+	ThsCode             string  `json:"thscode"`
+	Ticker              string  `json:"ticker"`
+	Name                string  `json:"name"`
+	IsST                bool    `json:"is_st"`
+	IsNew               bool    `json:"is_new"`
+	LastPrice           float64 `json:"last_price"`
+	PriceChangeRatioPct float64 `json:"price_change_ratio_pct"`
+	LimitUpTime         string  `json:"limit_up_time"`     // 首次封板 HH:MM
+	LimitUpReason       *string `json:"limit_up_reason"`   // 涨停原因（可能 null）
+	ContinueDayText     string  `json:"continue_day_text"` // 如 "5天4板"
+	ContinueDayCnt      int     `json:"continue_day_cnt"`  // 连板数
+	SealMoney           float64 `json:"seal_money"`        // 当前封单额（元）
+	MaxSealMoney        float64 `json:"max_seal_money"`    // 峰值封单额（元）
+}
+
+// HithinkPoolPage 分页容器（三池共用形状）。
+type HithinkPoolPage struct {
+	Timestamp  int64 `json:"timestamp"`
+	Pagination struct {
+		Total int `json:"total"`
+		Pages int `json:"pages"`
+		Size  int `json:"size"`
+		Page  int `json:"page"`
+	} `json:"pagination"`
+	Item []HithinkLimitUpItem `json:"item"`
+}
+
+// LimitUpPool 涨停股票池（dateMs=0 取当日；自动翻页取尽）。
+// 文档：GET /api/a-share/special-data/limit-up-pool
+func (c *HithinkClient) LimitUpPool(dateMs int64) ([]HithinkLimitUpItem, error) {
+	return c.fetchPool("limit-up-pool", dateMs)
+}
+
+// LimitDownPool 跌停股票池。
+func (c *HithinkClient) LimitDownPool(dateMs int64) ([]HithinkLimitUpItem, error) {
+	return c.fetchPool("limit-down-pool", dateMs)
+}
+
+// LimitBreakPool 炸板股票池。
+func (c *HithinkClient) LimitBreakPool(dateMs int64) ([]HithinkLimitUpItem, error) {
+	return c.fetchPool("limit-break-pool", dateMs)
+}
+
+// fetchPool 三池通用翻页拉取。
+func (c *HithinkClient) fetchPool(name string, dateMs int64) ([]HithinkLimitUpItem, error) {
+	var all []HithinkLimitUpItem
+	for page := 1; ; page++ {
+		p := url.Values{}
+		p.Set("page", strconv.Itoa(page))
+		p.Set("size", "200")
+		if dateMs > 0 {
+			p.Set("date_ms", strconv.FormatInt(dateMs, 10))
+		}
+		var out HithinkPoolPage
+		if err := c.get("/api/a-share/special-data/"+name, p, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Item...)
+		if page >= out.Pagination.Pages || len(out.Item) == 0 {
+			return all, nil
+		}
+	}
+}
+
+// HithinkLadderBoard 连板天梯单板位条目。
+type HithinkLadderBoard struct {
+	ThsCode     string `json:"thscode"`
+	Ticker      string `json:"ticker"`
+	Name        string `json:"name"`
+	BoardNum    int    `json:"board_num"`
+	SealNextDay *bool  `json:"seal_nextday"`
+	SignLevel   int    `json:"sign_level"`
+}
+
+// LimitUpLadder 近 30 交易日连板天梯矩阵（无参数）。
+// 文档：GET /api/a-share/special-data/limit-up-ladder
+func (c *HithinkClient) LimitUpLadder() (json.RawMessage, error) {
+	var out json.RawMessage
+	if err := c.get("/api/a-share/special-data/limit-up-ladder", url.Values{}, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// HithinkAnomalyItem 个股异动原因条目。
+type HithinkAnomalyItem struct {
+	ThsCode         string   `json:"thscode"`
+	StockName       string   `json:"stock_name"`
+	TagName         string   `json:"tag_name"`
+	AnalysisContent string   `json:"analysis_content"`
+	KeywordList     []string `json:"keyword_list"`
+}
+
+// AnomalyForStocks 批量查询个股当日异动原因（≤50 只）。
+// 文档：GET /api/a-share/special-data/anomaly-analysis-stock
+func (c *HithinkClient) AnomalyForStocks(thscodes []string) ([]HithinkAnomalyItem, error) {
+	if len(thscodes) > 50 {
+		thscodes = thscodes[:50]
+	}
+	p := url.Values{}
+	p.Set("thscodes", joinThsCodes(thscodes))
+	var out struct {
+		Item []HithinkAnomalyItem `json:"item"`
+	}
+	if err := c.get("/api/a-share/special-data/anomaly-analysis-stock", p, &out); err != nil {
+		return nil, err
+	}
+	return out.Item, nil
+}

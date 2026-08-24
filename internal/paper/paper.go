@@ -165,19 +165,19 @@ type Trade struct {
 // English: an order-lifecycle record (one full signal→order→outcome audit entry), complementing
 // Trade (fills only) — rejected/partial attempts are kept too, so missed fills are reviewable.
 type Order struct {
-	ID          string    `json:"id"`                   // 订单号（ord_<seq>）
-	Code        string    `json:"code"`                 // 股票代码
-	Name        string    `json:"name"`                 // 股票名称
-	Strategy    string    `json:"strategy"`             // 战法名
-	StrategyType string   `json:"strategy_type,omitempty"` // 战法池类型
-	Side        string    `json:"side"`                 // buy / sell
-	Kind        string    `json:"kind"`                 // 来源：自动撮合/手动买入/自动清仓/自动减仓/手动卖出/手动减仓
-	SignalPrice float64   `json:"signal_price,omitempty"` // 信号价（参照）
-	Price       float64   `json:"price"`                // 成交价（rejected 时为 0）
-	Qty         int       `json:"qty"`                  // 成交数量（rejected 0；partial 为部分量）
-	Status      string    `json:"status"`               // filled=全部成交 / partial=部分成交 / rejected=已拒绝
-	Reason      string    `json:"reason,omitempty"`     // 拒绝原因或触发理由（告警文案）
-	CreatedAt   time.Time `json:"created_at"`           // 下单时间
+	ID           string    `json:"id"`                      // 订单号（ord_<seq>）
+	Code         string    `json:"code"`                    // 股票代码
+	Name         string    `json:"name"`                    // 股票名称
+	Strategy     string    `json:"strategy"`                // 战法名
+	StrategyType string    `json:"strategy_type,omitempty"` // 战法池类型
+	Side         string    `json:"side"`                    // buy / sell
+	Kind         string    `json:"kind"`                    // 来源：自动撮合/手动买入/自动清仓/自动减仓/手动卖出/手动减仓
+	SignalPrice  float64   `json:"signal_price,omitempty"`  // 信号价（参照）
+	Price        float64   `json:"price"`                   // 成交价（rejected 时为 0）
+	Qty          int       `json:"qty"`                     // 成交数量（rejected 0；partial 为部分量）
+	Status       string    `json:"status"`                  // filled=全部成交 / partial=部分成交 / rejected=已拒绝
+	Reason       string    `json:"reason,omitempty"`        // 拒绝原因或触发理由（告警文案）
+	CreatedAt    time.Time `json:"created_at"`              // 下单时间
 }
 
 // orderSeq 订单号自增（进程内唯一即可，重启从时间戳续）。
@@ -290,6 +290,7 @@ type Engine struct {
 	trades     []Trade
 	orders     []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
 	equity     []EquityPoint
+	hasFilled  bool    // 是否发生过任何成交：false 期间 Snapshot 不记净值点（无买入不应有净值曲线）
 	realized   float64 // 已实现盈亏累计
 	path       string
 	// 账本镜像回调（阶段1.2 两本账合一）：paper 为唯一真实账本，开仓/清仓经回调同步写
@@ -809,6 +810,7 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	}
 	e.pools[poolKey] = pool - cost
 	e.cash -= cost
+	e.hasFilled = true // §反馈修复：首笔成交起才开始记净值曲线
 	// 买入后计数：累计买入成本计入本池（卖出不减，收益仍记该池）。
 	// English: counted after buy — the buy cost accumulates to the pool (never reduced on sells, so
 	// P&L stays attributed to the pool).
@@ -955,6 +957,7 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	}
 	e.pools[poolKey] = pool - cost
 	e.cash -= cost
+	e.hasFilled = true // §反馈修复：首笔成交起才开始记净值曲线
 	// 加仓成本照记入该池，保证池累计表现不遗漏。
 	// English: the add-on cost accrues to the pool so its cumulative performance stays complete.
 	if e.poolPerf[poolKey] == nil {
@@ -1013,6 +1016,11 @@ func (e *Engine) MarkToMarket(quotes map[string]*data.StockInfo) {
 // cutting the pointless every-5s write (friendly to the small server's disk and CPU).
 func (e *Engine) Snapshot(now time.Time) {
 	if !e.cfg.Enabled {
+		return
+	}
+	// §反馈修复：从未成交过 → 不记录净值点（否则每天一个平线点，"没有买入也有净值曲线"）。
+	// 首笔成交后自动开始正常记录；Reset 清盘后回到不记录状态直到再成交。
+	if !e.hasFilled {
 		return
 	}
 	e.mu.Lock()
@@ -1382,6 +1390,7 @@ func (e *Engine) Reset() {
 	e.positions = make(map[string]*Position)
 	e.trades = nil
 	e.equity = nil
+	e.hasFilled = false // 清盘后回到"未成交不记净值"状态，直到再产生成交
 	e.realized = 0
 	e.poolPerf = make(map[string]*PoolPerf)
 	e.trimDone = make(map[string]string)

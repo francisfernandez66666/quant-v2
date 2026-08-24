@@ -294,26 +294,35 @@ func (s *Server) handlePaperPoolConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "模拟盘未启用")
 		return
 	}
-	var req struct {
-		MaxPositions int                `json:"max_positions"`
-		PoolCaps     map[string]int     `json:"pool_caps"`
-		PoolAllocs   map[string]float64 `json:"pool_allocs"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// §反馈解耦：三个字段按**是否出现在请求体**独立生效——资金分配与仓位上限
+	// 拆成两个前端弹窗后互不牵连（旧实现"未传 allocs 就恢复均分"会把只改上限
+	// 的操作误清自定义资金，2026-08-24 用户实录）。
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeError(w, 400, "无效请求体")
 		return
 	}
-	if req.MaxPositions >= 0 {
-		pe.SetMaxPositions(req.MaxPositions)
+	if v, ok := raw["max_positions"]; ok {
+		var mp int
+		if json.Unmarshal(v, &mp) == nil && mp >= 0 {
+			pe.SetMaxPositions(mp)
+		}
 	}
-	if len(req.PoolCaps) > 0 {
-		pe.SetPoolCaps(req.PoolCaps)
+	if v, ok := raw["pool_caps"]; ok {
+		var caps map[string]int
+		if json.Unmarshal(v, &caps) == nil && len(caps) > 0 {
+			pe.SetPoolCaps(caps)
+		}
 	}
-	if len(req.PoolAllocs) > 0 {
-		pe.SetPoolAllocs(req.PoolAllocs)
-	} else {
-		// 未指定资金分配 → 恢复均分（"清除自定义"语义，与前端"分仓配置"保存空分配一致）
-		pe.ResetPoolAllocs()
+	if v, ok := raw["pool_allocs"]; ok {
+		var allocs map[string]float64
+		if json.Unmarshal(v, &allocs) == nil {
+			if len(allocs) > 0 {
+				pe.SetPoolAllocs(allocs)
+			} else {
+				pe.ResetPoolAllocs() // 显式传空对象=清除自定义恢复均分
+			}
+		}
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }

@@ -540,10 +540,14 @@ export async function resetPaperPool(pool) {
  *  Σpool caps ≤ the global cap (checked on the frontend). */
 // 对应 POST /api/paper/pool/config，data: { max_positions, pool_caps, pool_allocs }
 export async function configPaperPools(maxPositions, poolCaps, poolAllocs) {
+  // §反馈解耦：三字段按"是否传入"独立生效——null=不触碰该类设置；
+  // poolAllocs 传空对象 {} 是有语义的（显式清除自定义恢复均分），不能与 null 混淆。
   const data = {}
-  if (maxPositions >= 0) data.max_positions = maxPositions
+  if (maxPositions !== null && maxPositions !== undefined && maxPositions >= 0) {
+    data.max_positions = maxPositions
+  }
   if (poolCaps && Object.keys(poolCaps).length) data.pool_caps = poolCaps
-  if (poolAllocs && Object.keys(poolAllocs).length) data.pool_allocs = poolAllocs
+  if (poolAllocs !== null && poolAllocs !== undefined) data.pool_allocs = poolAllocs
   return request('/api/paper/pool/config', { method: 'POST', data })
 }
 

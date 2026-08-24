@@ -348,6 +348,65 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_sector_date ON sector_history(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_optres_task ON optimization_results(task_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_ths_daily_date ON ths_daily(trade_date)`,
+		// 同花顺（新）盘口特色数据（§P1 盘口升级）：涨停/跌停/炸板三池。
+		`CREATE TABLE IF NOT EXISTS ths_limit_up_daily (
+			trade_date TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			name TEXT DEFAULT '',
+			is_st INTEGER DEFAULT 0,
+			is_new INTEGER DEFAULT 0,
+			price REAL DEFAULT 0,
+			pct_chg REAL DEFAULT 0,
+			first_seal_time TEXT DEFAULT '',
+			continue_cnt INTEGER DEFAULT 0,
+			continue_text TEXT DEFAULT '',
+			limit_reason TEXT DEFAULT '',
+			seal_money REAL DEFAULT 0,
+			max_seal_money REAL DEFAULT 0,
+			PRIMARY KEY (trade_date, ts_code)
+		)`,
+		`CREATE TABLE IF NOT EXISTS ths_limit_down_daily (
+			trade_date TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			name TEXT DEFAULT '',
+			price REAL DEFAULT 0,
+			pct_chg REAL DEFAULT 0,
+			first_limit_time TEXT DEFAULT '',
+			last_limit_time TEXT DEFAULT '',
+			turnover_ratio_pct REAL DEFAULT 0,
+			PRIMARY KEY (trade_date, ts_code)
+		)`,
+		`CREATE TABLE IF NOT EXISTS ths_break_pool_daily (
+			trade_date TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			name TEXT DEFAULT '',
+			price REAL DEFAULT 0,
+			pct_chg REAL DEFAULT 0,
+			open_times INTEGER DEFAULT 0,
+			turnover_ratio_pct REAL DEFAULT 0,
+			turnover REAL DEFAULT 0,
+			PRIMARY KEY (trade_date, ts_code)
+		)`,
+		// 连板天梯逐日切片（board_num=连板数；seal_nextday 空=未知）
+		`CREATE TABLE IF NOT EXISTS ths_ladder_daily (
+			trade_date TEXT NOT NULL,
+			board_num INTEGER NOT NULL,
+			ts_code TEXT NOT NULL,
+			name TEXT DEFAULT '',
+			seal_nextday INTEGER,
+			sign_level INTEGER DEFAULT 0,
+			PRIMARY KEY (trade_date, board_num, ts_code)
+		)`,
+		// 个股异动原因（当日批查落库，供 D1 辅证与消息推送）
+		`CREATE TABLE IF NOT EXISTS ths_anomaly_daily (
+			trade_date TEXT NOT NULL,
+			ts_code TEXT NOT NULL,
+			tag_name TEXT DEFAULT '',
+			name TEXT DEFAULT '',
+			analysis_content TEXT DEFAULT '',
+			keywords TEXT DEFAULT '[]',
+			PRIMARY KEY (trade_date, ts_code, tag_name)
+		)`,
 		// 同花顺（新）累计后复权因子（事件换算生成，锚定衔接旧表基线）。
 		`CREATE TABLE IF NOT EXISTS ths_adj_factor (
 			ts_code TEXT NOT NULL,
