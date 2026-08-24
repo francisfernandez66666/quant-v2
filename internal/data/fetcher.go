@@ -350,7 +350,7 @@ func (f *Fetcher) fetch() {
 }
 
 // inAuctionWindow 当前是否处于集合竞价注入窗口（9:15-9:26，Asia/Shanghai）。
-func inAuctionWindow(now time.Time) bool {
+func InAuctionWindow(now time.Time) bool {
 	m := now.Hour()*100 + now.Minute()
 	return m >= 915 && m <= 926
 }
@@ -358,7 +358,7 @@ func inAuctionWindow(now time.Time) bool {
 // maybeFetchAuction 竞价窗口内拉取全池竞价快照（一次请求）并缓存；
 // 非窗口/无 hithink 源时为 no-op。失败计数走源健康状态机。
 func (f *Fetcher) maybeFetchAuction(codes []string) {
-	if f.hithink == nil || !inAuctionWindow(time.Now()) || !f.hithinkState.available() {
+	if f.hithink == nil || !InAuctionWindow(time.Now()) || !f.hithinkState.available() {
 		return
 	}
 	snap, err := f.hithink.Auction(codes, "live")

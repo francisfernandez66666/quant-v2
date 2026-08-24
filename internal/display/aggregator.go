@@ -4,6 +4,7 @@
 package display
 
 import (
+	"quant-trading-v2/internal/data"
 	"sort"
 	"sync"
 
@@ -27,6 +28,7 @@ type DashboardData struct {
 	BearSignals  []combat_agent.Signal               `json:"bear_signals,omitempty"`  // 做空信号
 	AlertSignals []combat_agent.Signal               `json:"alert_signals,omitempty"` // 提醒信号（止盈/止损等）
 	FinalSignals []combat_agent.Signal               `json:"final_signals,omitempty"` // 冲突裁决后的最终信号
+	Auction      []data.HithinkAuctionItem           `json:"auction,omitempty"`       // 集合竞价快照（9:15-9:26 窗口内，§同花顺新源）
 	Scores       map[string]combat_agent.StockScores `json:"scores,omitempty"`        // 8a/8b 持续打分（自选/持仓）
 	L1Score      map[string]float64                  `json:"l1_score,omitempty"`      // L1 评分（按股票代码）
 	L1Blocked    map[string]bool                     `json:"l1_blocked,omitempty"`    // L1 阻断标记（按股票代码）
@@ -118,6 +120,20 @@ func (a *Aggregator) UpdateFast(scores map[string]combat_agent.StockScores, fast
 
 // Current 返回当前看板数据快照。
 // （Current returns the current dashboard data snapshot.）
+// SetAuction 写入集合竞价快照（打分循环在 9:15-9:26 窗口调用；空快照跳过以保留上次数据）。
+// English: stores the auction snapshot into the current dashboard (skipped when empty).
+func (a *Aggregator) SetAuction(items []data.HithinkAuctionItem) {
+	if len(items) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.current == nil {
+		a.current = &DashboardData{}
+	}
+	a.current.Auction = items
+}
+
 func (a *Aggregator) Current() *DashboardData {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

@@ -760,6 +760,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"l1_score":      data.L1Score,
 		"l1_blocked":    data.L1Blocked,
 		"long_enabled":  s.longOnFor(userID),
+		"auction":       data.Auction, // §同花顺（新）竞价快照（9:15-9:26 窗口内非空）
 		"short_enabled": s.shortOnFor(userID),
 	}
 	if data.Report != nil {

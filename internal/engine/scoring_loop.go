@@ -76,6 +76,23 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		return
 	}
 
+	// §同花顺（新）竞价窗口注入：9:15-9:26 把官方集合竞价快照写进看板——
+	// 抢筹幅度/量比/未匹配量是当日开盘强弱最早的信号；同时记录显著异动（|涨幅|≥3% 或量比≥5）。
+	if data.InAuctionWindow(time.Now()) {
+		if auction := f.AuctionSnapshot(); len(auction) > 0 {
+			items := make([]data.HithinkAuctionItem, 0, len(auction))
+			for _, it := range auction {
+				items = append(items, it)
+				if it.AuctionPct >= 3 || it.AuctionVolumeRatio >= 5 {
+					log.Printf("[engine] 竞价异动 %s(%s): 涨幅 %.2f%% 量比 %.1f 未匹配 %.0f",
+						it.ThsCode, it.Name, it.AuctionPct, it.AuctionVolumeRatio, it.AuctionUnmatched)
+				}
+			}
+			sort.Slice(items, func(i, j int) bool { return items[i].AuctionPct > items[j].AuctionPct })
+			e.agg.SetAuction(items)
+		}
+	}
+
 	// 优先取 fetcher 的 5s 实时快照作为行情来源与打分池候选（缺失的由 BuildScoringData 内部降级补齐）
 	var quotes map[string]*data.StockInfo
 	var snapCodes []string
