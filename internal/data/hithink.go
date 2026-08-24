@@ -53,6 +53,7 @@ type hithinkLimiter struct {
 	last     time.Time
 }
 
+// newHithinkLimiter 创建令牌桶限速器（qps<=0 时兜底 5）。
 func newHithinkLimiter(qps float64) *hithinkLimiter {
 	if qps <= 0 {
 		qps = 5
@@ -198,6 +199,7 @@ func (c *HithinkClient) TradingDays() ([]HithinkCalendarDay, error) {
 	return out.Item, nil
 }
 
+// joinThsCodes 代码列表→逗号分隔字符串（THS API 批量参数格式）。
 func joinThsCodes(codes []string) string {
 	s := ""
 	for i, c := range codes {
@@ -215,6 +217,7 @@ func ParseHithintMs(ms int64) string {
 	return t.Format("20060102")
 }
 
+// shanghaiLoc 加载 Asia/Shanghai 时区；加载失败回退固定 UTC+8。
 func shanghaiLoc() *time.Location {
 	loc, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
@@ -491,6 +494,7 @@ type HithinkLadderEntry struct {
 	SignLevel   int
 }
 
+// hithinkLadderResp 连板天梯 API 原始响应结构（矩阵形式，需展开为逐条记录）。
 type hithinkLadderResp struct {
 	Window struct {
 		Length   int      `json:"length"`

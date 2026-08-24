@@ -494,11 +494,17 @@ const W = 900, H = 220           // 净值折线 SVG 画布尺寸
 let timer = null                 // 轮询定时器
 // ── 分仓配置弹窗（每池资金/上限自定义，与全局解耦，总和守恒）── (Pool-config modal)
 const showDepositModal = ref(false)
+	// 清盘确认弹窗开关
 const showResetModal = ref(false)
+	// 统一设置弹窗（资金分配/仓位上限）开关
 const settingsOpen = ref(false)
+	// 设置弹窗当前 tab：alloc 资金分配 / caps 仓位上限
 const settingsTab = ref('alloc')
+	// 注入资金弹窗金额
 const depositAmount = ref(0)
+	// 清盘重置后的初始资金额（0=默认100000）
 const resetToCapital = ref(0)
+	// 清盘重置时的持仓上限（0=不设限）
 const resetMaxPos = ref(0)
 const cfgMaxPos = ref(0)            // 弹窗内全局持仓上限
 const cfgAllocs = ref({})           // 每池目标资金额（key=策略类型；空=自动均分剩余）

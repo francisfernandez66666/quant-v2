@@ -141,6 +141,7 @@ type HithinkAdjEvent struct {
 	AllotPrice float64 // 配股价
 }
 
+// thsDumpAdjRow 复权因子 dump 的 parquet 物理行结构（列名与官方 schema 一致）。
 type thsDumpAdjRow struct {
 	ThsCode          string  `parquet:"thscode"`
 	Ticker           string  `parquet:"ticker"`
