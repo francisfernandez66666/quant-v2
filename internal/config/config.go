@@ -35,7 +35,7 @@ type Rules struct {
 	Notify     NotifyConfig     `json:"notify"`        // 通知推送参数
 	Scheduler  SchedulerConfig  `json:"scheduler"`     // 研究调度器配置（quant-research 服务读取）
 	Paper      PaperConfig      `json:"paper"`         // 模拟盘/纸面交易配置
-	QMT        QMTConfig        `json:"qmt"`           // 国信 MiniQMT 实盘交易配置
+	QMT        QMTConfig        `json:"qmt"`           // 东莞证券 MiniQMT 实盘交易配置
 	Runtime    RuntimeConfig    `json:"runtime"`       // 运行时内存治理配置
 	Data       DataConfig       `json:"data"`          // 数据源配置（§HITHINK_DATA_SOURCE_PLAN）
 }
@@ -86,7 +86,7 @@ type QMTAdviceConfig struct {
 	HoldMinProfitPct float64 `json:"hold_min_profit_pct"`
 }
 
-// QMTConfig 国信 MiniQMT 实盘交易配置：把首尔侧的决策（信号/持仓建议）转发给国内 Windows 网关执行真实下单，
+// QMTConfig 东莞证券 MiniQMT 实盘交易配置：把首尔侧的决策（信号/持仓建议）转发给国内 Windows 网关执行真实下单，
 // 网关回报（成交/持仓/断线）经 /api/qmt/report 回传。与纸面账本（PaperConfig）完全独立（双账本并存）。
 // English: Guoxin MiniQMT live-trading config — forwards Seoul-side decisions (signals / position advice)
 // to the domestic Windows gateway for real orders; gateway reports (fills/positions/disconnect) come back

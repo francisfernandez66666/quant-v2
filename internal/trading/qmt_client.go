@@ -1,4 +1,4 @@
-// qmt_client.go — 国内 Windows 网关（国信 MiniQMT）HTTP 客户端。
+// qmt_client.go — 国内 Windows 网关（东莞证券 MiniQMT）HTTP 客户端。
 // 首尔侧调用网关 REST 接口（/order /cancel /state /health）执行真实下单/查询，
 // Bearer token 双向鉴权，超时 + 有限重试。下单幂等由上层以 signal_id 唯一键保证。
 // English: HTTP client for the domestic Windows gateway (Guoxin MiniQMT). Calls the gateway REST

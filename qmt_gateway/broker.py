@@ -3,7 +3,7 @@
 """qmt_gateway.broker — 交易通道抽象（AUTO_TRADING_PLAN M2）。
 
 - Broker 基类：定义 /order /cancel /state 对应的通道原语，回调注入 handler。
-- XtBroker：真实国信 MiniQMT（xtquant.xttrader.XtQuantTrader）封装 —— connect() 一次性建立，
+- XtBroker：真实东莞证券 MiniQMT（xtquant.xttrader.XtQuantTrader）封装 —— connect() 一次性建立，
   自实现自动重连循环（on_disconnected 触发即时回报给首尔后重连）；price_type=market 时下单前
   取最新实时盘口；下单前置校验（整手/仓位上限）。xtquant 为 Windows 专有库 → 延迟 import，
   Linux/macOS 无法安装时保持可导入（connect 时才报错）。
@@ -47,7 +47,7 @@ class Broker:
 
 
 class XtBroker(Broker):
-    """真实国信 MiniQMT 通道。xtquant 延迟 import；connect() 时初始化。"""
+    """真实东莞证券 MiniQMT 通道。xtquant 延迟 import；connect() 时初始化。"""
 
     def __init__(self, account, session_id=1, path="", reconnect_sec=5):
         self.account = account

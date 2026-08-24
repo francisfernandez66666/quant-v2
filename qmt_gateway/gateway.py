@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""qmt_gateway.gateway — 国信 MiniQMT 网关 REST 服务（AUTO_TRADING_PLAN M2）。
+"""qmt_gateway.gateway — 东莞证券 MiniQMT 网关 REST 服务（AUTO_TRADING_PLAN M2）。
 
 零第三方依赖（标准库 http.server）。接口与首尔侧 trading.QMTClient 契约一致：
   POST /order   {"signal_id","code","name","strategy","side","price_type","price","qty","amount","created_at"} → {"ok","order_id","err"}

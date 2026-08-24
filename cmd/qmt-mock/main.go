@@ -1,4 +1,4 @@
-// cmd/qmt-mock — 国信 MiniQMT 网关模拟器（AUTO_TRADING_PLAN M1 mock 网关）。
+// cmd/qmt-mock — 东莞证券 MiniQMT 网关模拟器（AUTO_TRADING_PLAN M1 mock 网关）。
 // 本地联调用：模拟 Windows 端网关的 /order /cancel /state /health REST 接口，
 // 下单后按 --delay 延时模拟成交，并把成交回报推送到首尔服务器 POST /api/qmt/report
 // （与 mock 网关同一进程内可选的 --webhook 模式）。用于端到端联调真实网关接入链路。

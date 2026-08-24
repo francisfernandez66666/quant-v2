@@ -1,5 +1,5 @@
 // Package trading — 实盘交易执行层（AUTO_TRADING_PLAN M1 首尔侧）。
-// 负责把首尔侧决策（信号/持仓建议）转发给国内 Windows 网关（国信 MiniQMT）执行真实下单，
+// 负责把首尔侧决策（信号/持仓建议）转发给国内 Windows 网关（东莞证券 MiniQMT）执行真实下单，
 // 并管理网关连接状态、熔断、幂等与本地订单状态。与纸面账本（paper/report.Report）完全独立。
 // English: live-trading execution layer (AUTO_TRADING_PLAN M1, Seoul side). Forwards Seoul-side decisions
 // (signals / position advice) to the domestic Windows gateway (Guoxin MiniQMT) for real orders, and

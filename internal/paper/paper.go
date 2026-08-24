@@ -223,6 +223,11 @@ type Stats struct {
 	SignalAmountPct   float64 `json:"signal_amount_pct"`   // 滑点成本占初始资金比（%）
 	TodayReturnPct    float64 `json:"today_return_pct"`    // 当日收益%
 	EquityCurvePoints int     `json:"equity_curve_points"` // 净值点数量
+	// §R2.2 绩效指标（净值序列计算）
+	SharpeRatio float64 `json:"sharpe_ratio,omitempty"`     // 年化夏普比率
+	MaxDrawdown float64 `json:"max_drawdown_pct,omitempty"` // 最大回撤%
+	Calmar      float64 `json:"calmar,omitempty"`           // Calmar 比率
+	Expectancy  float64 `json:"expectancy_pct,omitempty"`   // 每笔期望收益率%
 }
 
 // StrategyPoolState 一个战法资金池的展示快照（前端分仓条）。
@@ -1815,6 +1820,22 @@ func (e *Engine) statsFor(poolKey *string) Stats {
 	st.AvgSlippagePct = round2(st.AvgSlippagePct)
 	st.AvgLatencySec = math.Round(st.AvgLatencySec)
 	st.SignalAmountPct = round2(st.SignalAmountPct)
+
+	// §R2.2 绩效指标：从净值序列计算 Sharpe/最大回撤/Calmar
+	eq := make([]float64, 0, len(e.equity))
+	for _, ep := range e.equity {
+		eq = append(eq, ep.Value)
+	}
+	pm := computePerfMetrics(eq, 244)
+	st.SharpeRatio = math.Round(pm.Sharpe*100) / 100
+	st.MaxDrawdown = math.Round(pm.MaxDrawdown*100) / 100
+	st.Calmar = math.Round(pm.Calmar*100) / 100
+
+	// §期望收益：总收益率 ÷ 成交笔数 = 每笔平均收益率（简化版，够用于趋势判断）
+	if st.FilledBuys > 0 {
+		st.Expectancy = math.Round(st.TotalReturnPct/float64(st.FilledBuys)*100) / 100
+	}
+
 	return st
 }
 
