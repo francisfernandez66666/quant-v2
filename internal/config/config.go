@@ -143,8 +143,10 @@ func DefaultQMTConfig() QMTConfig {
 // baostock=完全走旧表（一键切回开关）。
 // ThsFactorsReady：同花顺复权因子对账门禁——未通过(false)时 HfqBars 仍走旧表。
 type DataConfig struct {
-	PrimarySource   string `json:"primary_source"`    // hithink(同花顺(新)优先) | baostock(旧表)
-	ThsFactorsReady bool   `json:"ths_factors_ready"` // 复权因子对账门禁（默认 false）
+	PrimarySource     string `json:"primary_source"`      // hithink(同花顺(新)优先) | baostock(旧表)
+	ThsFactorsReady   bool   `json:"ths_factors_ready"`   // 复权因子对账门禁（默认 false）
+	OptimizeEnabled   bool   `json:"optimize_enabled"`    // 夜间链自动追加全库寻优步骤（默认 false=推荐制手动触发）
+	OptimizeAutoApply bool   `json:"optimize_auto_apply"` // 择优结果自动应用（默认 false=推荐制需人工审批）
 }
 
 // SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
@@ -179,6 +181,7 @@ type SchedulerConfig struct {
 	// §数据源路由（§HITHINK_DATA_SOURCE_PLAN）：研究/回测取数主源与复权门禁。
 	PrimarySource   string `json:"primary_source"`    // hithink | baostock（默认 baostock=旧表，安全）
 	ThsFactorsReady bool   `json:"ths_factors_ready"` // 复权对账门禁：通过后置 true，HfqBars 才走 ths 因子
+	OptimizeEnabled bool   `json:"optimize_enabled"` // 夜间自动寻优开关（默认 true，推荐制）
 }
 
 // NightlyConfig 夜间研究作业配置（盘后/周末触发）。
@@ -212,6 +215,7 @@ func DefaultSchedulerConfig() SchedulerConfig {
 		DataloadBin:     "dataload",
 		PrimarySource:   "baostock", // 安全默认：旧表；对账门禁通过后配置切 hithink
 		ThsFactorsReady: false,
+		OptimizeEnabled: true, // §O1 夜间自动寻优默认开启（推荐制——结果需人工审批应用）
 		PyURL:           "http://127.0.0.1:8787",
 		Nightly: NightlyConfig{
 			StartHHMM:        1530,
@@ -909,6 +913,7 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 			Data      struct {
 				PrimarySource   string  `json:"primary_source"`
 				ThsFactorsReady bool    `json:"ths_factors_ready"`
+				OptimizeEnabled *bool   `json:"optimize_enabled"`
 				HithinkQPS      float64 `json:"hithink_qps"`
 			} `json:"data"`
 		} `json:"rules"`
@@ -916,6 +921,9 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 	if err := json.Unmarshal(data, &wrapper); err != nil {
 		log.Printf("[scheduler] 解析配置 %s 失败(用默认): %v", path, err)
 		return def
+	}
+	if wrapper.Rules.Data.OptimizeEnabled != nil {
+		def.OptimizeEnabled = *wrapper.Rules.Data.OptimizeEnabled
 	}
 	if wrapper.Rules.Data.PrimarySource != "" {
 		def.PrimarySource = wrapper.Rules.Data.PrimarySource
@@ -933,6 +941,9 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 	out := def
 	if v, ok := cfgBool(m, "enabled"); ok {
 		out.Enabled = v
+	}
+	if v, ok := cfgBool(m, "optimize_enabled"); ok {
+		out.OptimizeEnabled = v
 	}
 	if v, ok := cfgStr(m, "research_bin"); ok && v != "" {
 		out.ResearchBin = v

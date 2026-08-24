@@ -392,6 +392,11 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 		steps = insertAfter(steps, "discover_patterns", "library_replay")
 		log.Printf("[scheduler] 回测开关开启：夜间链追加 library_replay 任务（战法库因子+形态回放）")
 	}
+	// §O1 策略自优化引擎：夜间链追加全库参数寻优（默认开启，推荐制——结果需人工审批应用）
+	if cfg.OptimizeEnabled && !containsStep(steps, "optimize") {
+		steps = insertAfter(steps, "library_replay", "optimize")
+		log.Printf("[scheduler] 策略自优化引擎开启：夜间链追加 optimize 任务（全库参数寻优）")
+	}
 	for i, step := range steps {
 		typ, payload, ok := stepTask(step, cfg, today)
 		if !ok {
@@ -476,6 +481,10 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 		return store.TaskBacktestStrategy, mustJSON(map[string]any{
 			"kind": "all", "start": researchStart, "end": today, "maxstocks": 300,
 		}), true
+	case "optimize":
+		// §策略自优化引擎：全库寻优（贝叶斯搜索+细粒度网格），结果自动排名落库
+		p := map[string]any{"kind": "optimize", "start": researchStart, "end": today, "top_n": 20}
+		return store.TaskBacktestStrategy, mustJSON(p), true
 	case "list":
 		return store.TaskList, "{}", true
 	}

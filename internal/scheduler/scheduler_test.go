@@ -31,10 +31,12 @@ func mustConfig(t *testing.T, sc config.SchedulerConfig) string {
 // cfgSamples 供各测试复用的默认配置。
 func cfgSamples(fakeBin, db string) config.SchedulerConfig {
 	return config.SchedulerConfig{
-		Enabled:     true,
-		ResearchBin: fakeBin,
-		DataloadBin: fakeBin,
-		DB:          db,
+		Enabled:         true,
+		ResearchBin:     fakeBin,
+		DataloadBin:     fakeBin,
+		DB:              db,
+		PrimarySource:   "baostock", // 测试默认走旧表，不受数据源路由影响
+		OptimizeEnabled: false,      // 测试不含寻优步骤（有专门的测试覆盖）
 		Nightly: config.NightlyConfig{
 			StartHHMM:        1530,
 			WeekendStartHHMM: 1530,

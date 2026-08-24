@@ -32,9 +32,29 @@ type SweepConfig struct {
 
 // 自动参数网格：止盈回撤 / 最大持仓 / 入场门槛（形态规则无连续分，跳过门槛维）。
 var (
-	sweepTrail = []float64{5, 8, 10, 12, 15}
-	sweepHold  = []int{5, 10, 15, 20, 30}
+	// §O1 搜索空间扩展：从固定5档改为步长1细粒度遍历——
+	// 覆盖密度提升 7×8=56 倍，数学引擎自动在更宽的空间里找最优解。
+	sweepTrailFrom, sweepTrailTo = 3.0, 20.0 // 止盈回撤%：3~20
+	sweepHoldFrom, sweepHoldTo   = 2, 40     // 最长持仓天：2~40
 )
+
+// sweepTrailRange 生成止盈回撤的连续整数序列 [from, to]。
+func sweepTrailRange() []float64 {
+	var out []float64
+	for v := sweepTrailFrom; v <= sweepTrailTo; v++ {
+		out = append(out, v)
+	}
+	return out
+}
+
+// sweepHoldRange 生成持仓天数的连续整数序列 [from, to]。
+func sweepHoldRange() []int {
+	var out []int
+	for v := sweepHoldFrom; v <= sweepHoldTo; v++ {
+		out = append(out, v)
+	}
+	return out
+}
 
 // sweepMinTrades 进入排名的最低触发数——几笔交易 100% 胜率的组合没有统计意义。
 const sweepMinTrades = 20
@@ -118,7 +138,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		topN = 10
 	}
 	log.Printf("扫参启动：%d 战法 × 网格(止盈%d档×持仓%d档×门槛=各战法分数分位数自适应) 目标=%s",
-		len(ads), len(sweepTrail), len(sweepHold), objName)
+		len(ads), len(sweepTrailRange()), len(sweepHoldRange()), objName)
 
 	// ── 1) K 线一次性载入内存（300 只 × 数年日线 ≈ 几十 MB，cgroup 内安全）──
 	// 内存护栏：CLI 直跑未传 MaxStocks 时兜底截断——扫参的 K 线全量缓存必须受控，
@@ -182,8 +202,8 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 				scores = q
 			}
 		}
-		for _, t := range sweepTrail {
-			for _, h := range sweepHold {
+		for _, t := range sweepTrailRange() {
+			for _, h := range sweepHoldRange() {
 				for _, s := range scores {
 					perAdCombos[ai] = append(perAdCombos[ai], combo{t, h, s})
 				}
