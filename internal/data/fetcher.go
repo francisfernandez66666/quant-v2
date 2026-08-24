@@ -7,6 +7,7 @@ package data
 
 import (
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,6 +35,11 @@ type Fetcher struct {
 	baseStocks []string // 自选+持仓，无上限
 	hotStocks  []string // 热点板块个股，上限 60，随板块替换
 	stopCh     chan struct{}
+	// hithink 同花顺（新）官方源（最高优先级）：Key 缺失时为 nil，源链自动跳过。
+	hithink      *HithinkClient
+	hithinkState *HithinkSourceState
+	auctionMu    sync.Mutex
+	auction      map[string]*HithinkAuctionItem // 最新竞价快照（9:15-9:26 窗口内更新）
 }
 
 // allStocks 返回去重合并后的完整监控列表（base + hot）。
@@ -115,12 +121,19 @@ func (f *Fetcher) EnsureStock(code string) {
 func NewFetcher(stocks []string, api *MarketAPI, dc *DataCoordinator) *Fetcher {
 	ch := make(chan struct{})
 	close(ch) // 初始为"已停止"状态，Running() 返回 false
-	return &Fetcher{
+	f := &Fetcher{
 		api:        api,
 		dc:         dc,
 		baseStocks: stocks,
 		stopCh:     ch,
 	}
+	// §同花顺（新）最高优先源：环境变量缺 Key 时为 nil，源链行为与旧版完全一致。
+	if hc, herr := NewHithinkClient(); herr == nil {
+		f.hithink = hc
+		f.hithinkState = &HithinkSourceState{}
+		log.Printf("[fetcher] 同花顺（新）行情源已启用（最高优先级）")
+	}
+	return f
 }
 
 // Start 启动后台轮询协程（5 秒间隔）。
@@ -260,7 +273,28 @@ func (f *Fetcher) fetch() {
 
 	all := f.allStocks()
 
-	// 1. 新浪批量（单次请求全池），满足 新浪→同花顺→东财 降级链且避免单股限流拖慢 5s 循环
+	// 0. 同花顺（新）官方批量（§数据源优先级矩阵最高优先）：单次请求全池；
+	//    连续失败 5 次进入降级（跳过+10min探活），成功自动升回并清零计数。
+	if f.hithink != nil && f.hithinkState.available() {
+		if quotes, err := f.hithink.BatchQuotes(all); err == nil {
+			f.hithinkState.markSuccess()
+			for code, si := range quotes {
+				snapshot.Stocks[code] = si
+			}
+			if len(quotes) > 0 {
+				snapshot.Source = "同花顺（新）" // 主导来源标注（其余源仅补缺）
+			}
+		} else if firstDegraded := f.hithinkState.markFailure(); firstDegraded {
+			log.Printf("[fetcher] 同花顺（新）连续失败 %d 次进入降级，改走 同花顺（老）/sina/东财: %v",
+				hithinkFailThreshold, err)
+		}
+	}
+
+	// 0b. 竞价窗口（9:15-9:26）：同花顺（新）auction stage=live 注入——
+	//     抢筹幅度/量比是当日开盘强弱最早的官方信号；窗口外跳过。
+	f.maybeFetchAuction(all)
+
+	// 1. 新浪批量（单次请求全池），满足 同花顺（老）/sina/东财 降级链且避免单股限流拖慢 5s 循环
 	if f.api != nil {
 		for code, si := range f.api.GetSinaQuotes(all) {
 			if si != nil && si.Price > 0 {
@@ -313,4 +347,46 @@ func (f *Fetcher) fetch() {
 	f.mu.Lock()
 	f.snapshot = snapshot
 	f.mu.Unlock()
+}
+
+// inAuctionWindow 当前是否处于集合竞价注入窗口（9:15-9:26，Asia/Shanghai）。
+func inAuctionWindow(now time.Time) bool {
+	m := now.Hour()*100 + now.Minute()
+	return m >= 915 && m <= 926
+}
+
+// maybeFetchAuction 竞价窗口内拉取全池竞价快照（一次请求）并缓存；
+// 非窗口/无 hithink 源时为 no-op。失败计数走源健康状态机。
+func (f *Fetcher) maybeFetchAuction(codes []string) {
+	if f.hithink == nil || !inAuctionWindow(time.Now()) || !f.hithinkState.available() {
+		return
+	}
+	snap, err := f.hithink.Auction(codes, "live")
+	if err != nil {
+		f.hithinkState.markFailure()
+		return
+	}
+	out := make(map[string]*HithinkAuctionItem, len(snap.Item))
+	for i := range snap.Item {
+		it := &snap.Item[i]
+		code := strings.Split(it.ThsCode, ".")[0]
+		out[code] = it
+	}
+	f.auctionMu.Lock()
+	f.auction = out
+	f.auctionMu.Unlock()
+}
+
+// AuctionSnapshot 返回最新竞价快照副本（引擎打分循环消费；非窗口返回空 map）。
+func (f *Fetcher) AuctionSnapshot() map[string]HithinkAuctionItem {
+	f.auctionMu.Lock()
+	defer f.auctionMu.Unlock()
+	if len(f.auction) == 0 {
+		return nil
+	}
+	out := make(map[string]HithinkAuctionItem, len(f.auction))
+	for k, v := range f.auction {
+		out[k] = *v
+	}
+	return out
 }

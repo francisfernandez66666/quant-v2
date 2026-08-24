@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -223,3 +224,123 @@ func shanghaiLoc() *time.Location {
 }
 
 var _ = strconv.Itoa // 占位避免未用导入误报（strconv 供后续分页参数使用）
+
+// ── 行情采集集成（fetcher 最高优先源）──
+
+// hithinkFailThreshold 连续失败 N 次后标记降级（跳过该源，走后续降级链）。
+const hithinkFailThreshold = 5
+
+// hithinkProbeInterval 降级后的探活间隔（期间跳过请求，到点试一次）。
+const hithinkProbeInterval = 10 * time.Minute
+
+// HithinkSourceState 源健康状态（fetcher 持有；并发安全）。
+type HithinkSourceState struct {
+	mu        sync.Mutex
+	failCount int
+	degraded  bool
+	lastTry   time.Time
+}
+
+// available 判定本次是否可用：正常或降级探活到期。
+func (s *HithinkSourceState) available() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.degraded {
+		return true
+	}
+	return time.Since(s.lastTry) >= hithinkProbeInterval
+}
+
+// markSuccess 升回正常。
+func (s *HithinkSourceState) markSuccess() {
+	s.mu.Lock()
+	s.failCount, s.degraded = 0, false
+	s.mu.Unlock()
+}
+
+// markFailure 累计失败，达阈值进入降级。
+func (s *HithinkSourceState) markFailure() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failCount++
+	s.lastTry = time.Now()
+	if s.failCount >= hithinkFailThreshold && !s.degraded {
+		s.degraded = true
+		return true // 首次进入降级（调用方记日志/告警）
+	}
+	return false
+}
+
+// BatchQuotes 全池批量行情快照（StockInfo 形状，供 fetcher 直接消费）。
+// 代码归一为裸码（与 sina/东财路径一致）；Volume 单位=股（与 StockInfo 注释一致）。
+func (c *HithinkClient) BatchQuotes(codes []string) (map[string]*StockInfo, error) {
+	if len(codes) == 0 {
+		return map[string]*StockInfo{}, nil
+	}
+	snap, err := c.Snapshot(codes)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]*StockInfo, len(snap.Item))
+	for i := range snap.Item {
+		it := &snap.Item[i]
+		if it.LastPrice <= 0 {
+			continue
+		}
+		out[strings.Split(it.ThsCode, ".")[0]] = &StockInfo{
+			Code:      strings.Split(it.ThsCode, ".")[0],
+			Price:     it.LastPrice,
+			Open:      it.OpenPrice,
+			High:      it.HighPrice,
+			Low:       it.LowPrice,
+			Close:     it.PrevPrice,
+			Volume:    it.Volume,
+			Amount:    it.Turnover,
+			ChangePct: it.PriceChangeRatioPct,
+		}
+	}
+	return out, nil
+}
+
+// ── 集合竞价（§P1 竞价窗口注入打分循环）──
+
+// HithinkAuctionItem 竞价快照条目。
+type HithinkAuctionItem struct {
+	ThsCode            string  `json:"thscode"`
+	Ticker             string  `json:"ticker"`
+	Name               string  `json:"name"`
+	AuctionPrice       float64 `json:"auction_price"`
+	AuctionPct         float64 `json:"auction_pct"` // 竞价涨跌幅%
+	AuctionVolume      float64 `json:"auction_volume"`
+	AuctionAmount      float64 `json:"auction_amount"`
+	AuctionUnmatched   float64 `json:"auction_unmatched"`
+	AuctionTurnoverPct float64 `json:"auction_turnover_pct"`
+	AuctionVolumeRatio float64 `json:"auction_volume_ratio"` // 竞价量比
+	PreClosePrice      float64 `json:"pre_close_price"`
+	OpenPrice          float64 `json:"open_price"`
+	LastPrice          float64 `json:"last_price"`
+	FloatMarketCap     float64 `json:"float_market_cap"`
+}
+
+// HithinkAuctionSnapshot 竞价快照容器（含阶段与状态）。
+type HithinkAuctionSnapshot struct {
+	Timestamp    int64                `json:"timestamp"`
+	AuctionPhase string               `json:"auction_phase"`
+	DataStatus   string               `json:"data_status"`
+	Item         []HithinkAuctionItem `json:"item"`
+}
+
+// Auction 竞价快照：thscodes 批量；stage=live(实时)/final(终态)。
+// 文档：GET /api/a-share/auction/snapshot
+func (c *HithinkClient) Auction(thscodes []string, stage string) (*HithinkAuctionSnapshot, error) {
+	p := url.Values{}
+	p.Set("thscodes", joinThsCodes(thscodes))
+	if stage != "" {
+		p.Set("stage", stage)
+	}
+	var out HithinkAuctionSnapshot
+	if err := c.get("/api/a-share/auction/snapshot", p, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
