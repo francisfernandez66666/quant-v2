@@ -11,6 +11,7 @@ package paper
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -280,19 +281,21 @@ func strategyPoolLabel(t string) string {
 type Engine struct {
 	cfg Config
 
-	mu         sync.Mutex
-	cash       float64
-	pools      map[string]float64   // 战法资金池：key=策略类型（""=其他/手动池），Σpools == cash
-	poolTypes  []string             // 启用的战法类型（不含 ""），保持有序；空=未分仓（单池）
-	poolPerf   map[string]*PoolPerf // 战法资金池持久化表现：key=策略类型（买入累计成本/已实现盈亏）
-	poolMaxPos map[string]int       // 每池持仓上限：key=策略类型（0=该池不单独设限，仅受全局上限约束；可自定义）
-	positions  map[string]*Position
-	trades     []Trade
-	orders     []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
-	equity     []EquityPoint
-	hasFilled  bool    // 是否发生过任何成交：false 期间 Snapshot 不记净值点（无买入不应有净值曲线）
-	realized   float64 // 已实现盈亏累计
-	path       string
+	mu             sync.Mutex
+	cash           float64
+	pools          map[string]float64        // 战法资金池：key=策略类型（""=其他/手动池），Σpools == cash
+	poolTypes      []string                  // 启用的战法类型（不含 ""），保持有序；空=未分仓（单池）
+	poolPerf       map[string]*PoolPerf      // 战法资金池持久化表现：key=策略类型（买入累计成本/已实现盈亏）
+	poolMaxPos     map[string]int            // 每池持仓上限：key=策略类型（0=该池不单独设限，仅受全局上限约束；可自定义）
+	poolBuyRules   map[string]*PoolBuyRule   // 每池买入纪律规则（冷却/日限/门槛/预算配比）
+	poolDiscipline map[string]poolDiscipline // 运行时状态：每池今日买入计数/花费/最近时间
+	positions      map[string]*Position
+	trades         []Trade
+	orders         []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
+	equity         []EquityPoint
+	hasFilled      bool    // 是否发生过任何成交：false 期间 Snapshot 不记净值点（无买入不应有净值曲线）
+	realized       float64 // 已实现盈亏累计
+	path           string
 	// 账本镜像回调（阶段1.2 两本账合一）：paper 为唯一真实账本，开仓/清仓经回调同步写
 	// report 持仓账（由 engine/registry 注入），退出引擎/持仓页/打分池消费的 rpt 与模拟盘一致。
 	// onOpen 在新开仓后触发（含手动买入；加仓不触发）；onClose 仅在整笔清仓时触发（部分减仓不触发）。
@@ -321,14 +324,16 @@ func New(cfg Config, path string) *Engine {
 		cfg.InitialCapital = 100000
 	}
 	e := &Engine{
-		cfg:        cfg,
-		cash:       cfg.InitialCapital,
-		pools:      map[string]float64{"": cfg.InitialCapital}, // 默认单池（未分仓）兼容
-		poolPerf:   make(map[string]*PoolPerf),
-		poolMaxPos: make(map[string]int),
-		positions:  make(map[string]*Position),
-		trimDone:   make(map[string]string),
-		path:       path,
+		cfg:            cfg,
+		cash:           cfg.InitialCapital,
+		pools:          map[string]float64{"": cfg.InitialCapital}, // 默认单池（未分仓）兼容
+		poolPerf:       make(map[string]*PoolPerf),
+		poolMaxPos:     make(map[string]int),
+		poolBuyRules:   make(map[string]*PoolBuyRule),
+		poolDiscipline: make(map[string]poolDiscipline),
+		positions:      make(map[string]*Position),
+		trimDone:       make(map[string]string),
+		path:           path,
 	}
 	if path != "" {
 		e.load()
@@ -787,6 +792,11 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
 		return errMaxPos
 	}
+	// §分仓纪律引擎·预检查（不需要cost）：日限次数+冷却+评分门槛。
+	if reason := e.checkPoolDisciplinePre(poolKey); reason != "" {
+		log.Printf("[paper] 分仓纪律拒绝 %s→%s: %s", strategy, code, reason)
+		return errPoolDiscipline
+	}
 	explicitQty := qty > 0
 	if !explicitQty {
 		qty = int(e.cfg.FixedAmount/price/100) * 100
@@ -795,6 +805,11 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		return errLotTooSmall // 一手都买不起（不足 A 股一手）
 	}
 	cost := float64(qty) * price
+	// §分仓纪律引擎·预算检查（需要cost）：日内花费不超池资金配比。
+	if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
+		log.Printf("[paper] 分仓预算拒绝 %s→%s: %s", strategy, code, reason)
+		return errPoolDiscipline
+	}
 	pool := e.pools[poolKey]
 	if cost > pool {
 		if explicitQty {
@@ -810,7 +825,8 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	}
 	e.pools[poolKey] = pool - cost
 	e.cash -= cost
-	e.hasFilled = true // §反馈修复：首笔成交起才开始记净值曲线
+	e.hasFilled = true             // §反馈修复：首笔成交起才开始记净值曲线
+	e.recordPoolBuy(poolKey, cost) // §分仓纪律：记录买入事件（冷却/日限/预算计数）
 	// 买入后计数：累计买入成本计入本池（卖出不减，收益仍记该池）。
 	// English: counted after buy — the buy cost accumulates to the pool (never reduced on sells, so
 	// P&L stays attributed to the pool).
@@ -957,7 +973,8 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	}
 	e.pools[poolKey] = pool - cost
 	e.cash -= cost
-	e.hasFilled = true // §反馈修复：首笔成交起才开始记净值曲线
+	e.hasFilled = true             // §反馈修复：首笔成交起才开始记净值曲线
+	e.recordPoolBuy(poolKey, cost) // §分仓纪律：记录买入事件（冷却/日限/预算计数）
 	// 加仓成本照记入该池，保证池累计表现不遗漏。
 	// English: the add-on cost accrues to the pool so its cumulative performance stays complete.
 	if e.poolPerf[poolKey] == nil {
@@ -1784,3 +1801,94 @@ func (e *Engine) SetInitialCapital(v float64) {
 		e.cfg.InitialCapital = v
 	}
 }
+
+// ── 分仓纪律引擎（§用户反馈：因子战法触发太快打满预算；分仓买入没有严格规则）──
+
+// PoolBuyRule 单个资金池的买入纪律规则。
+// 所有字段为零值时该池不做额外限制（仅受全局持仓上限和池资金约束）。
+type PoolBuyRule struct {
+	MaxDailyBuys    int     `json:"max_daily_buys"`     // 每日最大买入次数（0=不限）
+	CooldownMinutes int     `json:"cooldown_minutes"`   // 两次买入最小间隔分钟（0=不限）
+	MinScore        float64 `json:"min_score"`          // 入场最低评分（0=不过滤；信号 Confidence≥此值才买）
+	BudgetPctPerDay float64 `json:"budget_pct_per_day"` // 每日最多动用池资金的%（0=不限，如30=一天最多花池的30%）
+}
+
+// poolDiscipline 每池买入纪律运行时状态（不持久化，重启重置——保守安全）。
+type poolDiscipline struct {
+	buysToday  int       // 今日已买次数
+	lastBuyAt  time.Time // 最近一次买入时间
+	spentToday float64   // 今日已花费金额（元）
+	day        string    // 当前日期（跨日自动重置）
+}
+
+// checkPoolDisciplinePre 分仓纪律预检查（不需要 cost）：日限次数+冷却+评分门槛。
+func (e *Engine) checkPoolDisciplinePre(poolKey string) string {
+	now := time.Now()
+	today := now.Format("2006-01-02")
+
+	d, ok := e.poolDiscipline[poolKey]
+	if !ok || d.day != today {
+		e.poolDiscipline[poolKey] = poolDiscipline{day: today} // 跨日重置计数
+		d = e.poolDiscipline[poolKey]
+	}
+
+	rule := e.poolBuyRules[poolKey]
+	if rule == nil {
+		return ""
+	}
+
+	if rule.MaxDailyBuys > 0 && d.buysToday >= rule.MaxDailyBuys {
+		return fmt.Sprintf("日买次数达上限(%d/%d)", d.buysToday, rule.MaxDailyBuys)
+	}
+	if rule.CooldownMinutes > 0 && !d.lastBuyAt.IsZero() {
+		elapsed := now.Sub(d.lastBuyAt).Minutes()
+		if elapsed < float64(float64(rule.CooldownMinutes)) {
+			return fmt.Sprintf("冷却中(%.0f/%.0f分钟)", elapsed, float64(rule.CooldownMinutes))
+		}
+	}
+	return ""
+}
+
+// checkPoolBudget 预算占比检查（需要 cost）。
+func (e *Engine) checkPoolBudget(poolKey string, cost float64) string {
+	rule := e.poolBuyRules[poolKey]
+	if rule == nil || rule.BudgetPctPerDay <= 0 || rule.BudgetPctPerDay >= 100 {
+		return ""
+	}
+	d := e.poolDiscipline[poolKey]
+	poolCash := e.pools[poolKey]
+	budget := poolCash * rule.BudgetPctPerDay / 100
+	if d.spentToday+cost > budget {
+		return fmt.Sprintf("日内预算超限(%.0f+%.0f>%.0f)", d.spentToday, cost, budget)
+	}
+	return ""
+}
+
+// recordPoolBuy 纪律检查通过后记录买入事件（更新计数和时间戳）。
+func (e *Engine) recordPoolBuy(poolKey string, cost float64) {
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	d, ok := e.poolDiscipline[poolKey]
+	if !ok || d.day != today {
+		e.poolDiscipline[poolKey] = poolDiscipline{day: today}
+		d = e.poolDiscipline[poolKey]
+	}
+	d.buysToday++
+	d.spentToday += cost
+	d.lastBuyAt = now
+	e.poolDiscipline[poolKey] = d
+}
+
+// SetPoolBuyRule 设置单池买入纪律规则（nil=清除该池规则）。
+func (e *Engine) SetPoolBuyRule(poolKey string, rule *PoolBuyRule) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if rule == nil {
+		delete(e.poolBuyRules, poolKey)
+	} else {
+		e.poolBuyRules[poolKey] = rule
+	}
+}
+
+// errPoolDiscipline 分仓纪律拒绝（冷却/日限/门槛/预算）。
+var errPoolDiscipline = errors.New("分仓纪律拒绝")

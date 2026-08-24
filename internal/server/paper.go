@@ -314,6 +314,28 @@ func (s *Server) handlePaperPoolConfig(w http.ResponseWriter, r *http.Request) {
 			pe.SetPoolCaps(caps)
 		}
 	}
+	if v, ok := raw["pool_rules"]; ok {
+		var rules map[string]struct {
+			MaxDailyBuys    int     `json:"max_daily_buys"`
+			CooldownMinutes int     `json:"cooldown_minutes"`
+			MinScore        float64 `json:"min_score"`
+			BudgetPctPerDay float64 `json:"budget_pct_per_day"`
+		}
+		if json.Unmarshal(v, &rules) == nil {
+			for pk, r := range rules {
+				if r.MaxDailyBuys > 0 || r.CooldownMinutes > 0 || r.MinScore > 0 || r.BudgetPctPerDay > 0 {
+					pe.SetPoolBuyRule(pk, &paper.PoolBuyRule{
+						MaxDailyBuys:    r.MaxDailyBuys,
+						CooldownMinutes: r.CooldownMinutes,
+						MinScore:        r.MinScore,
+						BudgetPctPerDay: r.BudgetPctPerDay,
+					})
+				} else {
+					pe.SetPoolBuyRule(pk, nil) // 清除规则
+				}
+			}
+		}
+	}
 	if v, ok := raw["pool_allocs"]; ok {
 		var allocs map[string]float64
 		if json.Unmarshal(v, &allocs) == nil {
