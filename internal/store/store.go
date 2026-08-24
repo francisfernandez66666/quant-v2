@@ -374,6 +374,8 @@ func (d *DB) migrate() error {
 			first_limit_time TEXT DEFAULT '',
 			last_limit_time TEXT DEFAULT '',
 			turnover_ratio_pct REAL DEFAULT 0,
+			open_times INTEGER DEFAULT 0,
+			turnover REAL DEFAULT 0,
 			PRIMARY KEY (trade_date, ts_code)
 		)`,
 		`CREATE TABLE IF NOT EXISTS ths_break_pool_daily (

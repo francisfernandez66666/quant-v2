@@ -22,8 +22,9 @@ import (
 // cmdHithinkSync 执行一次同花顺（新）日K同步。
 func cmdHithinkSync(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("hithink-sync", flag.ExitOnError)
-	kind := fs.String("kind", string(data.HithinkDumpDailyK10d), "dump 种类: daily-k-10d(增量) | daily-k(10年全量)")
+	kind := fs.String("kind", string(data.HithinkDumpDailyK10d), "种类: daily-k-10d|daily-k|adjustment-factors|pools|anomaly")
 	since := fs.String("since", "20230801", "只导入 trade_date >= since 的行（yyyyMMdd）")
+	dateF := fs.String("date", "", "pools/anomaly 数据交易日 yyyyMMdd（缺省=今日）")
 	tmpPath := fs.String("tmp", "/tmp/hithink_dump.parquet", "parquet 落盘临时路径")
 	batchSize := fs.Int("batch", 5000, "批量 upsert 行数")
 	if err := fs.Parse(args); err != nil {
@@ -36,6 +37,14 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	}
 	if *kind == string(data.HithinkDumpAdjFactors) {
 		cmdHithinkSyncAdjFactors(client, db, *tmpPath, *since, *batchSize)
+		return
+	}
+	if *kind == "pools" {
+		cmdHithinkSyncPools(client, db, *dateF)
+		return
+	}
+	if *kind == "anomaly" {
+		cmdHithinkSyncAnomaly(client, db, *since)
 		return
 	}
 
@@ -184,4 +193,140 @@ func prevStr(d string) string {
 		return d
 	}
 	return t.AddDate(0, 0, -1).Format("20060102")
+}
+
+// ── 盘口三池 + 连板天梯 + 异动（§P1 盘口升级）──
+
+// cmdHithinkSyncPools 盘后三池+连板天梯入库。
+// dateFlag 为 yyyyMMdd；缺省=今日（API 缺省当日）。
+func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag string) {
+	tradeDate := dateFlag
+	var dateMs int64
+	if tradeDate == "" {
+		tradeDate = time.Now().Format("20060102")
+	}
+	if t, err := time.ParseInLocation("20060102", tradeDate, time.Local); err == nil {
+		dateMs = t.UnixMilli()
+	}
+
+	up, err := client.LimitUpPool(dateMs)
+	if err != nil {
+		log.Fatalf("涨停池拉取失败: %v", err)
+	}
+	luRows := make([]store.ThsLimitUpRow, 0, len(up))
+	for _, it := range up {
+		luRows = append(luRows, store.ThsLimitUpRow{
+			TradeDate: tradeDate, TsCode: it.ThsCode, Name: it.Name,
+			IsST: it.IsST, IsNew: it.IsNew, Price: it.LastPrice,
+			PctChg: it.PriceChangeRatioPct, FirstSealTime: it.LimitUpTime,
+			ContinueCnt: it.ContinueDayCnt, ContinueText: it.ContinueDayText,
+			LimitReason: deref(it.LimitUpReason), SealMoney: it.SealMoney,
+			MaxSealMoney: it.MaxSealMoney,
+		})
+	}
+	n1, err := db.UpsertThsLimitUps(luRows)
+	if err != nil {
+		log.Fatalf("涨停池写入失败: %v", err)
+	}
+
+	dn, err := client.LimitDownPool(dateMs)
+	if err != nil {
+		log.Fatalf("跌停池拉取失败: %v", err)
+	}
+	dnMap := make(map[string]store.ThsPoolSimple, len(dn))
+	for _, it := range dn {
+		dnMap[it.ThsCode] = store.ThsPoolSimple{Name: it.Name, Price: it.LastPrice,
+			PctChg: it.PriceChangeRatioPct, TurnoverRatioPct: it.TurnoverRatioPct}
+	}
+	n2, err := db.UpsertThsSimplePool("ths_limit_down_daily", tradeDate, dnMap)
+	if err != nil {
+		log.Fatalf("跌停池写入失败: %v", err)
+	}
+
+	bk, err := client.LimitBreakPool(dateMs)
+	if err != nil {
+		log.Fatalf("炸板池拉取失败: %v", err)
+	}
+	bkMap := make(map[string]store.ThsPoolSimple, len(bk))
+	for _, it := range bk {
+		bkMap[it.ThsCode] = store.ThsPoolSimple{Name: it.Name, Price: it.LastPrice,
+			PctChg: it.PriceChangeRatioPct, OpenTimes: it.OpenTimes,
+			TurnoverRatioPct: it.TurnoverRatioPct, Turnover: it.Turnover}
+	}
+	n3, err := db.UpsertThsSimplePool("ths_break_pool_daily", tradeDate, bkMap)
+	if err != nil {
+		log.Fatalf("炸板池写入失败: %v", err)
+	}
+
+	lad, err := client.LimitUpLadderEntries()
+	if err != nil {
+		log.Fatalf("连板天梯拉取失败: %v", err)
+	}
+	ladRows := make([]store.ThsLadderRow, 0, len(lad))
+	for _, e := range lad {
+		ladRows = append(ladRows, store.ThsLadderRow{TradeDate: e.TradeDate,
+			BoardNum: e.BoardNum, TsCode: e.ThsCode, Name: e.Name,
+			SealNextDay: e.SealNextDay, SignLevel: e.SignLevel})
+	}
+	n4, err := db.UpsertThsLadder(ladRows)
+	if err != nil {
+		log.Fatalf("天梯写入失败: %v", err)
+	}
+
+	cnt, _ := db.LimitUpCountOnDate(tradeDate)
+	log.Printf("[hithink] 盘口同步完成(trade_date=%s)：涨停池 %d 行(当日家数 %d) / 跌停 %d / 炸板 %d / 天梯 %d",
+		tradeDate, n1, cnt, n2, n3, n4)
+}
+
+// cmdHithinkSyncAnomaly 当日全市场异动原因入库（D1 归因辅证 + 消息推送数据源）。
+func cmdHithinkSyncAnomaly(client *data.HithinkClient, db *store.DB, since string) {
+	items, err := client.AnomalyList(nil)
+	if err != nil {
+		log.Fatalf("异动列表拉取失败: %v", err)
+	}
+	tradeDate := time.Now().Format("20060102")
+	type row struct {
+		code, name, tag, content string
+		kw                       []string
+	}
+	rows := make([]row, 0, len(items))
+	for _, it := range items {
+		rows = append(rows, row{it.ThsCode, it.StockName, it.TagName, it.AnalysisContent, it.KeywordList})
+	}
+	n := 0
+	batchSize := 500
+	for start := 0; start < len(rows); start += batchSize {
+		endIdx := min(start+batchSize, len(rows))
+		batch := rows[start:endIdx]
+		items2 := make([]struct {
+			ThsCode         string
+			Name            string
+			TagName         string
+			AnalysisContent string
+			KeywordList     []string
+		}, 0, len(batch))
+		for _, r := range batch {
+			items2 = append(items2, struct {
+				ThsCode         string
+				Name            string
+				TagName         string
+				AnalysisContent string
+				KeywordList     []string
+			}{r.code, r.name, r.tag, r.content, r.kw})
+		}
+		c, uerr := db.UpsertThsAnomalies(tradeDate, items2)
+		if uerr != nil {
+			log.Fatalf("异动写入失败: %v", uerr)
+		}
+		n += int(c)
+	}
+	log.Printf("[hithink] 异动原因同步完成：%d 条（trade_date=%s）", n, tradeDate)
+}
+
+// deref 字符串指针解引用（nil → 空串）。
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

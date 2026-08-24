@@ -362,6 +362,10 @@ type HithinkLimitUpItem struct {
 	ContinueDayCnt      int     `json:"continue_day_cnt"`  // 连板数
 	SealMoney           float64 `json:"seal_money"`        // 当前封单额（元）
 	MaxSealMoney        float64 `json:"max_seal_money"`    // 峰值封单额（元）
+	// 炸板池专用字段（涨停/跌停池响应中缺省为零值，无碍）：
+	OpenTimes        int     `json:"open_times"`         // 开板次数
+	TurnoverRatioPct float64 `json:"turnover_ratio_pct"` // 换手率%
+	Turnover         float64 `json:"turnover"`           // 成交额
 }
 
 // HithinkPoolPage 分页容器（三池共用形状）。
@@ -457,4 +461,104 @@ func (c *HithinkClient) AnomalyForStocks(thscodes []string) ([]HithinkAnomalyIte
 		return nil, err
 	}
 	return out.Item, nil
+}
+
+// AnomalyList 当日全市场异动原因列表（tagCodes 空=全部；可选 LIMIT_UP/LIMIT_DOWN/SHARP_RISE/SHARP_FALL/RAPID_RALLY/RAPID_DECLINE）。
+// 文档：GET /api/a-share/special-data/anomaly-analysis-list（仅 REST）
+func (c *HithinkClient) AnomalyList(tagCodes []string) ([]HithinkAnomalyItem, error) {
+	p := url.Values{}
+	if len(tagCodes) > 0 {
+		p.Set("tag_codes", joinThsCodes(tagCodes))
+	}
+	var out struct {
+		Item []HithinkAnomalyItem `json:"item"`
+	}
+	if err := c.get("/api/a-share/special-data/anomaly-analysis-list", p, &out); err != nil {
+		return nil, err
+	}
+	return out.Item, nil
+}
+
+// ── 连板天梯结构化 ──
+
+// HithinkLadderEntry 天梯矩阵展开后的单条（日期×板位×标的）。
+type HithinkLadderEntry struct {
+	TradeDate   string // yyyyMMdd
+	BoardNum    int
+	ThsCode     string
+	Name        string
+	SealNextDay *bool // 次日是否续封（最近交易日恒 null）
+	SignLevel   int
+}
+
+type hithinkLadderResp struct {
+	Window struct {
+		Length   int      `json:"length"`
+		DateList []string `json:"date_list"` // yyyy-MM-dd
+	} `json:"window"`
+	Item []struct {
+		Boards map[string][]struct {
+			ThsCode     string `json:"thscode"`
+			Ticker      string `json:"ticker"`
+			Name        string `json:"name"`
+			BoardNum    int    `json:"board_num"`
+			SealNextDay *bool  `json:"seal_nextday"`
+			SignLevel   int    `json:"sign_level"`
+		} `json:"boards"`
+	} `json:"item"`
+}
+
+// LimitUpLadderEntries 天梯矩阵 → 展开条目（日期取 window.date_list 对应位）。
+func (c *HithinkClient) LimitUpLadderEntries() ([]HithinkLadderEntry, error) {
+	raw, err := c.LimitUpLadder()
+	if err != nil {
+		return nil, err
+	}
+	var resp hithinkLadderResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("hithink: 天梯解析失败: %w", err)
+	}
+	var out []HithinkLadderEntry
+	for _, it := range resp.Item {
+		for key, lst := range it.Boards {
+			boardNum := boardNumFromKey(key)
+			for _, b := range lst {
+				date := ""
+				if b.BoardNum-2 >= 0 && b.BoardNum-2 < len(resp.Window.DateList) {
+					idx := len(resp.Window.DateList) - 1 - (b.BoardNum - 2)
+					if idx >= 0 && idx < len(resp.Window.DateList) {
+						date = strings.ReplaceAll(resp.Window.DateList[idx], "-", "")
+					}
+				}
+				if date == "" && len(resp.Window.DateList) > 0 {
+					date = strings.ReplaceAll(resp.Window.DateList[len(resp.Window.DateList)-1], "-", "")
+				}
+				out = append(out, HithinkLadderEntry{
+					TradeDate: date, BoardNum: boardNum,
+					ThsCode: b.ThsCode, Name: b.Name,
+					SealNextDay: b.SealNextDay, SignLevel: b.SignLevel,
+				})
+			}
+		}
+	}
+	return out, nil
+}
+
+// boardNumFromKey 板位键 → 连板数（two_board=2 ... seven_over=7）。
+func boardNumFromKey(k string) int {
+	switch k {
+	case "two_board":
+		return 2
+	case "three_board":
+		return 3
+	case "four_board":
+		return 4
+	case "five_board":
+		return 5
+	case "six_board":
+		return 6
+	case "seven_over":
+		return 7
+	}
+	return 0
 }
