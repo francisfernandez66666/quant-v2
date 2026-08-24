@@ -91,12 +91,13 @@
     <!-- §P2-e 子视图：参数寻优结果（完整表格 + 一键入库） -->
     <div class="library-panel" v-show="candSubTab === 'optimize'">
       <div class="library-header">
-        <div class="library-title">参数寻优结果<span style="font-size:12px;color:var(--muted,#888)">（全库战法 × 止盈×持仓×门槛网格，盘后执行）</span></div>
+        <div class="library-title">参数寻优结果<span style="font-size:12px;color:var(--muted,#888)">（全库战法 × 止盈线×止损线×兜底天数×门槛，盘后执行）</span></div>
         <div style="display:flex;gap:8px;align-items:center">
           <select v-model="optObjective" class="bt-select" style="width:auto;padding:4px 8px">
             <option value="profitFactor">目标：盈亏比</option>
             <option value="winRate">目标：胜率</option>
             <option value="avgWin">目标：平均盈利</option>
+            <option value="expectancy">目标：期望收益</option>
           </select>
           <button class="btn-backtest" @click="startOptimize" :disabled="optLaunching">
             {{ optLaunching ? '已入队…' : '⚙ 发起全库寻优' }}
@@ -115,7 +116,7 @@
           </div>
           <table class="opt-table">
             <thead>
-              <tr><th>#</th><th>战法</th><th>止盈</th><th>持仓</th><th>门槛</th><th>胜率</th><th>盈亏比</th><th>期望</th><th>触发</th><th>状态</th><th>操作</th></tr>
+              <tr><th>#</th><th>战法</th><th>止盈线</th><th>止损线</th><th>兜底</th><th>门槛</th><th>胜率</th><th>盈亏比</th><th>期望</th><th>触发</th><th>状态</th><th>操作</th></tr>
             </thead>
             <tbody>
               <!-- §白屏根因修复：详情行与主行必须在同一个 v-for 作用域内——
@@ -125,7 +126,8 @@
               <tr>
                 <td>{{ r.rank }}</td>
                 <td>{{ r.strategy }}<span v-if="!r.strategy_kind" class="tag tag-kind kind-factor" style="margin-left:6px">内置</span></td>
-                <td>{{ fmtNum((r.params || {}).trail_pct) }}%</td>
+                <td>{{ fmtNum((r.params || {}).take_profit_pct) }}%</td>
+                <td>{{ fmtNum((r.params || {}).stop_loss_pct) }}%</td>
                 <td>{{ fmtNum((r.params || {}).hold_days) }}天</td>
                 <td>{{ (r.params || {}).min_score ? fmtNum(r.params.min_score) : '—' }}</td>
                 <td>{{ fmtNum(r.win_rate, 1) }}%</td>
@@ -147,7 +149,7 @@
                     <button v-if="r.strategy_kind" class="btn-toggle"
                             @click="approveOpt(r)">加入战法库</button>
                     <button v-else class="btn-toggle" @click="approveOpt(r)"
-                            title="写入该战法的移动止盈回撤%与最长持仓天（config 热生效，原有个股规则不变）">应用参数</button>
+                            title="写入该战法的止盈线%与止损线%（config 热生效，原有个股规则不变）">应用参数</button>
                     <button class="btn-reject" style="margin-left:6px" @click="rejectOpt(r)">淘汰</button>
                   </template>
                 </td>
@@ -155,7 +157,7 @@
               <!-- §过程数据明细：胜/负/平均盈亏/平均持仓（点「详情」展开） -->
               <tr v-if="optDetailOpen === r.id">
                 <td></td>
-                <td colspan="9" style="background:var(--bg,#f8fafc)">
+                <td colspan="10" style="background:var(--bg,#f8fafc)">
                   <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px;padding:4px 0">
                     <span>盈利 <b class="pos">{{ r.win }}</b> 笔</span>
                     <span>亏损 <b class="neg">{{ r.loss }}</b> 笔</span>
@@ -166,7 +168,7 @@
                     <span style="font-weight:700;color:#0f172a">每笔期望 <b>{{ fmtNum(r.expectancy, 2) >= 0 ? '+' : '' }}{{ fmtNum(r.expectancy, 2) }}%</b></span>
                   </div>
                   <div style="font-size:11px;color:var(--muted,#888);padding-bottom:2px">
-                    出场规则统一为「阶段高点回撤 {{ fmtNum((r.params || {}).trail_pct) }}% 止盈 + 最长持仓 {{ fmtNum(r.params.hold_days) }} 天超期」；门槛仅对有连续入场分的战法生效。
+                    出场规则：盈利达止盈线 {{ fmtNum((r.params || {}).take_profit_pct) }}% 即时卖出 + 亏损达止损线 {{ fmtNum((r.params || {}).stop_loss_pct) }}% 即时卖出 + 超 {{ fmtNum((r.params || {}).hold_days) }} 天兜底强制离场。
                   </div>
                 </td>
               </tr>
@@ -1276,7 +1278,7 @@ function toggleOptDetail(id) {
 }
 // 优化目标英文→中文标签
 function objLabel(o) {
-  return { profitfactor: '盈亏比', profitFactor: '盈亏比', winrate: '胜率', winRate: '胜率', avgwin: '平均盈利', avgWin: '平均盈利' }[o] || (o || '-')
+  return { profitfactor: '盈亏比', profitFactor: '盈亏比', winrate: '胜率', winRate: '胜率', avgwin: '平均盈利', avgWin: '平均盈利', expectancy: '期望收益' }[o] || (o || '-')
 }
 // 安全数字格式化（空值/NaN 显示 "-"）
 function fmtNum(v, digits) {
@@ -1313,9 +1315,9 @@ async function startOptimize() {
 /** 审批一条排名：参数覆盖写入该规则并热重载实盘 */
 // 应用一条寻优排名：库规则写参数覆盖热重载 / 内置写 config 统一出场旋钮
 async function approveOpt(r) {
-  const msg = '把参数应用到「' + r.strategy + '」？\n止盈 ' + fmtNum(r.params.trail_pct) + '% · 持仓 ' +
-    fmtNum(r.params.hold_days) + ' 天' + ((r.params || {}).min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') +
-    '\n审批后立即热重载生效。'
+  const msg = '把参数应用到「' + r.strategy + '」？\n止盈线 ' + fmtNum(r.params.take_profit_pct) + '% · 止损线 ' +
+    fmtNum(r.params.stop_loss_pct) + '% · 兜底 ' + fmtNum(r.params.hold_days) + ' 天' +
+    ((r.params || {}).min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') + '\n审批后立即热重载生效。'
   if (!confirm(msg)) return
   try {
     await api.approveOptimization(r.id)

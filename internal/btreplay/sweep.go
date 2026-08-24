@@ -30,30 +30,50 @@ type SweepConfig struct {
 	TopN      int    // 输出前 N 名，默认 10
 }
 
-// 自动参数网格：止盈回撤 / 最大持仓 / 入场门槛（形态规则无连续分，跳过门槛维）。
-var (
-	// §O1 搜索空间扩展：从固定5档改为步长1细粒度遍历——
-	// 覆盖密度提升 7×8=56 倍，数学引擎自动在更宽的空间里找最优解。
-	sweepTrailFrom, sweepTrailTo = 3.0, 20.0 // 止盈回撤%：3~20
-	sweepHoldFrom, sweepHoldTo   = 2, 40     // 最长持仓天：2~40
-)
+// 策略自有寻优池：每个战法独立设定止盈线/止损线/兜底天数的搜索范围（§用户反馈）。
+// 不同战法出发点不同，参数范围理应不同——波动突破需要宽止损，N形需要紧止损。
+// 未在表中的战法使用 defaultPool。
+// strategyPool 单个战法的独立寻优池：止盈线/止损线候选值 + 固定兜底天数。
+type strategyPool struct {
+	tpRange []float64 // 止盈线候选值%
+	slRange []float64 // 止损线候选值%
+	maxHold int       // 兜底天数（固定值，不搜索）
+}
 
-// sweepTrailRange 生成止盈回撤的连续整数序列 [from, to]。
-func sweepTrailRange() []float64 {
+// strategyPools 各战法独立寻优池（§用户反馈：分战法回测）。
+// 不同战法出发点不同，参数范围理应不同——波动突破需要宽止盈宽止损，
+// N形需要紧止损。键=战法显示名（与 adapter.Name() 一致），未命中走 defaultPool。
+var strategyPools = map[string]strategyPool{
+	"波动突破战法": {tpRange: stepRange(10, 30, 5), slRange: stepRange(5, 15, 2.5), maxHold: 30},
+	"双响炮":    {tpRange: stepRange(5, 15, 2.5), slRange: stepRange(3, 12, 3), maxHold: 25},
+	"龙头":     {tpRange: stepRange(3, 12, 3), slRange: stepRange(3, 10, 2), maxHold: 20},
+	"龙回头":    {tpRange: stepRange(5, 15, 2.5), slRange: stepRange(3, 10, 2), maxHold: 25},
+	"N形":     {tpRange: stepRange(3, 10, 2), slRange: stepRange(2, 6, 1), maxHold: 15},
+}
+
+// defaultPool 库规则（因子/形态战法）等未在 strategyPools 中登记的战法的默认寻优池。
+var defaultPool = strategyPool{
+	tpRange: stepRange(5, 25, 5),
+	slRange: stepRange(3, 12, 3),
+	maxHold: 30,
+}
+
+// stepRange 按 (起点, 终点, 步长) 生成连续候选值序列（步进形式搜索空间），
+// 保留两位小数规避浮点累加误差；终点含入（+0.001 容差）。
+func stepRange(from, to, step float64) []float64 {
 	var out []float64
-	for v := sweepTrailFrom; v <= sweepTrailTo; v++ {
-		out = append(out, v)
+	for v := from; v <= to+0.001; v += step {
+		out = append(out, math.Round(v*100)/100)
 	}
 	return out
 }
 
-// sweepHoldRange 生成持仓天数的连续整数序列 [from, to]。
-func sweepHoldRange() []int {
-	var out []int
-	for v := sweepHoldFrom; v <= sweepHoldTo; v++ {
-		out = append(out, v)
+// poolFor 返回战法对应的寻优池，未知战法返回 defaultPool。
+func poolFor(name string) strategyPool {
+	if p, ok := strategyPools[name]; ok {
+		return p
 	}
-	return out
+	return defaultPool
 }
 
 // sweepMinTrades 进入排名的最低触发数——几笔交易 100% 胜率的组合没有统计意义。
@@ -117,6 +137,7 @@ type sweepResult struct {
 	AvgLossPct     float64 `json:"avg_loss_pct"`
 	ProfitFactor   float64 `json:"profit_factor"`
 	Expectancy     float64 `json:"expectancy"`
+	StopLossPct    float64 `json:"stop_loss_pct"`
 	AvgHold        float64 `json:"avg_hold_days"`
 	ObjectiveScore float64 `json:"-"`
 }
@@ -129,20 +150,12 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	if obj == "" {
 		obj = "profitfactor"
 	}
-	objName := map[string]string{"profitfactor": "盈亏比", "winrate": "胜率", "avgwin": "平均盈利"}[obj]
+	objName := map[string]string{"profitfactor": "盈亏比", "winrate": "胜率", "avgwin": "平均盈利", "expectancy": "期望收益"}[obj]
 	if objName == "" {
-		return fmt.Errorf("未知优化目标: %s（可选 profitFactor/winRate/avgWin）", o.Sweep.Objective)
+		return fmt.Errorf("未知优化目标: %s（可选 profitFactor/winRate/avgWin/expectancy）", o.Sweep.Objective)
 	}
-	topN := o.Sweep.TopN
-	if topN <= 0 {
-		topN = 10
-	}
-	log.Printf("扫参启动：%d 战法 × 网格(止盈%d档×持仓%d档×门槛=各战法分数分位数自适应) 目标=%s",
-		len(ads), len(sweepTrailRange()), len(sweepHoldRange()), objName)
 
-	// ── 1) K 线一次性载入内存（300 只 × 数年日线 ≈ 几十 MB，cgroup 内安全）──
-	// 内存护栏：CLI 直跑未传 MaxStocks 时兜底截断——扫参的 K 线全量缓存必须受控，
-	// 否则全市场数千只会把研究侧 cgroup 挤爆（2026-08-23 整机僵死教训）。
+	// ── 1) K 线一次性载入内存 ──
 	if len(codes) > sweepMaxStocksLimit(o.MaxStocks) {
 		codes = codes[:sweepMaxStocksLimit(o.MaxStocks)]
 	}
@@ -156,44 +169,33 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		klines[code] = toDataKLine(bars)
 	}
 
-	// ── 2) 触发预计算：逐 adapter × 逐股 × 逐日（与 backtestStock 同口径）──
-	triggers := make([][]sweepTrigger, len(ads))
+	// ── 2) 逐战法独立优化 ──
 	for ai, ad := range ads {
-		var out []sweepTrigger
-		for code, kls := range klines {
-			out = append(out, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code])...)
-		}
-		sort.Slice(out, func(i, j int) bool { return out[i].sigIdx < out[j].sigIdx })
-		triggers[ai] = out
-		log.Printf("触发预算 %s：%d 个入场事件", ad.Name(), len(out))
-	}
+		fmt.Printf("\n══════════════════════════════════════════\n")
+		fmt.Printf("【%s】独立寻优\n", ad.Name())
+		fmt.Printf("══════════════════════════════════════════\n")
 
-	// ── 3) 组合枚举 + 廉价模拟 ──
-	type combo struct {
-		trail float64
-		hold  int
-		score float64
-	}
-	// 门槛维度仅对"有连续入场分"的战法展开（触发事件里出现过 score>=0）；
-	// 形态区间命中类无连续分 → 只跑默认门槛 0，避免无意义重复组合。
-	adScored := make([]bool, len(ads))
-	for ai := range ads {
-		for _, t := range triggers[ai] {
+		// 2a) 触发预计算
+		var trigs []sweepTrigger
+		for code, kls := range klines {
+			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code])...)
+		}
+		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })
+		log.Printf("触发预算 %s：%d 个入场事件", ad.Name(), len(trigs))
+
+		// 2b) 组合枚举
+		pool := poolFor(ad.Name())
+		scores := []float64{0}
+		hasScore := false
+		for _, t := range trigs {
 			if t.score >= 0 {
-				adScored[ai] = true
+				hasScore = true
 				break
 			}
 		}
-	}
-	perAdCombos := make([][]combo, len(ads))
-	total := 0
-	for ai := range ads {
-		// 门槛档位：有连续分的战法用其触发分数分位数（真实切分分布）；
-		// 无分（形态区间命中）或分布无区分度 → 只跑默认档 0。
-		scores := []float64{0}
-		if adScored[ai] {
+		if hasScore {
 			var scs []float64
-			for _, t := range triggers[ai] {
+			for _, t := range trigs {
 				if t.score >= 0 {
 					scs = append(scs, t.score)
 				}
@@ -202,100 +204,102 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 				scores = q
 			}
 		}
-		for _, t := range sweepTrailRange() {
-			for _, h := range sweepHoldRange() {
+		kind := ""
+		if kp, ok := ad.(kindProvider); ok {
+			kind = kp.Kind()
+		}
+		type combo struct{ tp, sl, score float64 }
+		var combos []combo
+		for _, tp := range pool.tpRange {
+			for _, sl := range pool.slRange {
 				for _, s := range scores {
-					perAdCombos[ai] = append(perAdCombos[ai], combo{t, h, s})
+					combos = append(combos, combo{tp, sl, s})
 				}
 			}
 		}
-		total += len(perAdCombos[ai])
-	}
-	// 规则 ID 提取（ruleEvalAdapter 实现 kindProvider；内置战法无 → 空）
-	kindOf := func(ai int) string {
-		if kp, ok := ads[ai].(kindProvider); ok {
-			return kp.Kind()
-		}
-		return ""
-	}
-	var all []sweepResult
-	done := 0
-	lastPct := -10
-	for ai, ad := range ads {
-		for _, cb := range perAdCombos[ai] {
-			all = append(all, simulateCombo(ad.Name(), kindOf(ai), triggers[ai], klines, cb.trail, cb.hold, cb.score))
-			done++
-			if pct := done * 100 / total; pct >= lastPct+10 { // 每 10% 进度行（worker 尾随喂狗）
-				lastPct = pct
+		fmt.Printf("参数组合：%d 组（止盈%d档×止损%d档×门槛%d档）\n",
+			len(combos), len(pool.tpRange), len(pool.slRange), len(scores))
+
+		// 2c) 逐组合回测
+		var results []sweepResult
+		for ci, cb := range combos {
+			r := simulateCombo(ad, kind, o, klines, industryChg, cb.tp, cb.sl, pool.maxHold, cb.score)
+			r.ObjectiveScore = objectiveValue(obj, &r)
+			results = append(results, r)
+			pct := (ci + 1) * 100 / len(combos)
+			if pct > ci*100/len(combos) && pct%10 == 0 {
 				fmt.Printf("参数优化进度 %d%%\n", pct)
 			}
 		}
+
+		// 2d) 战法内排名
+		best := &results[0]
+		for i := 1; i < len(results); i++ {
+			if objectiveValue(obj, &results[i]) > objectiveValue(obj, best) {
+				best = &results[i]
+			}
+		}
+		fmt.Printf("★ 最优：止盈%.0f%% 止损%.0f%% 兜底%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
+			best.Trail, best.StopLossPct, best.Hold, best.MinScore, best.WinRate, best.ProfitFactor, best.Expectancy, best.Count)
+
+		// 2e) 网格输出
+		fmt.Println("\n止盈×止损网格（期望收益%）:")
+		tps := make([]float64, 0, len(pool.tpRange))
+		for _, t := range pool.tpRange {
+			tps = append(tps, t)
+		}
+		sort.Float64s(tps)
+		fmt.Printf("止盈线→")
+		for _, tp := range tps {
+			fmt.Printf("  %5.0f%%", tp)
+		}
+		fmt.Println()
+		sls := make([]float64, 0, len(pool.slRange))
+		for _, s := range pool.slRange {
+			sls = append(sls, s)
+		}
+		sort.Float64s(sls)
+		for _, sl := range sls {
+			fmt.Printf("止损%4.0f%%  ", sl)
+			for _, tp := range tps {
+				bestExp := math.Inf(-1)
+				for _, r := range results {
+					if r.Trail == tp && r.StopLossPct == sl && r.Expectancy > bestExp {
+						bestExp = r.Expectancy
+					}
+				}
+				if math.IsInf(bestExp, -1) {
+					fmt.Printf("   —  ")
+				} else {
+					fmt.Printf("%+5.2f%%", bestExp)
+				}
+			}
+			fmt.Println()
+		}
+
+		// 2f) 输出该战法的 SWEEP_JSON
+		jsonResult := map[string]any{
+			"rank": 1, "strategy": ad.Name(), "strategy_kind": kind,
+			"params":        map[string]any{"take_profit_pct": best.Trail, "stop_loss_pct": best.StopLossPct, "hold_days": best.Hold, "min_score": best.MinScore},
+			"win_rate":      best.WinRate,
+			"profit_factor": best.ProfitFactor,
+			"expectancy":    best.Expectancy,
+			"win":           best.Win, "loss": best.Loss,
+			"avg_win_pct":   best.AvgWinPct,
+			"avg_loss_pct":  best.AvgLossPct,
+			"trigger_count": best.Count,
+			"avg_hold_days": best.AvgHold,
+		}
+		payload := struct {
+			Strategy  string `json:"strategy"`
+			Objective string `json:"objective"`
+			Results   []any  `json:"results"`
+		}{ad.Name(), obj, []any{jsonResult}}
+		if bj, jerr := json.Marshal(payload); jerr == nil {
+			fmt.Printf("SWEEP_JSON:%s\n", bj)
+		}
 	}
 
-	// ── §4 每战法取最优组合 → 跨战法排名（不同战法各出一行最优参数）──
-	for i := range all {
-		all[i].ObjectiveScore = objectiveValue(obj, &all[i])
-	}
-
-	// 按策略分组：每组内选 ObjectiveScore 最高的组合作为该战法的代表
-	stratBest := map[string]*sweepResult{}
-	var stratOrder []string
-	for i := range all {
-		r := &all[i]
-		if r.Count < sweepMinTrades {
-			continue
-		}
-		if _, ok := stratBest[r.Name]; !ok {
-			stratOrder = append(stratOrder, r.Name)
-		}
-		if cur := stratBest[r.Name]; cur == nil || objectiveValue(obj, r) > objectiveValue(obj, cur) {
-			stratBest[r.Name] = r
-		}
-	}
-
-	var ranked []*sweepResult
-	for _, name := range stratOrder {
-		sb := stratBest[name]
-		if sb != nil && sb.Count >= sweepMinTrades {
-			ranked = append(ranked, sb)
-		}
-	}
-	sort.Slice(ranked, func(a, b int) bool {
-		sa, sbb := objectiveValue(obj, ranked[a]), objectiveValue(obj, ranked[b])
-		if sa != sbb {
-			return sa > sbb
-		}
-		return ranked[a].Count > ranked[b].Count
-	})
-
-	fmt.Printf("==============================================\n")
-	fmt.Printf("参数优化目标: %s | 组合总数 %d | 参与战法 %d（每战法取最优）\n",
-		objName, total, len(ranked))
-
-	var jsonResults []map[string]any
-	for pos, b := range ranked {
-		if pos >= topN {
-			break
-		}
-		fmt.Printf("#%d 【%s】止盈%.0f%% 持仓%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d 平均持仓%.1f天\n",
-			pos+1, b.Name, b.Trail, b.Hold, b.MinScore, b.WinRate, b.ProfitFactor, b.Expectancy, b.Count, b.AvgHold)
-		jsonResults = append(jsonResults, map[string]any{
-			"rank": pos + 1, "strategy": b.Name, "strategy_kind": b.Kind,
-			"params": map[string]any{"trail_pct": b.Trail, "hold_days": b.Hold, "min_score": b.MinScore},
-			"win_rate": b.WinRate, "profit_factor": b.ProfitFactor, "expectancy": b.Expectancy,
-			"win": b.Win, "loss": b.Loss,
-			"avg_win_pct": b.AvgWinPct, "avg_loss_pct": b.AvgLossPct,
-			"trigger_count": b.Count, "avg_hold_days": b.AvgHold,
-		})
-	}
-	if len(jsonResults) == 0 {
-		fmt.Println("无达到最低触发数的组合。")
-	}
-
-	payload := map[string]any{"objective": obj, "total": total, "results": jsonResults}
-	if bj, jerr := json.Marshal(payload); jerr == nil {
-		fmt.Printf("SWEEP_JSON:%s\n", bj)
-	}
 	fmt.Printf("==============================================\n")
 	return nil
 }
@@ -337,34 +341,32 @@ func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KL
 	return out
 }
 
-// simulateCombo 单组合模拟：门槛过滤 + 按 (ad,code) 贪心不重叠 + 统一出场。
-// 指标聚合与 summarize() 同口径（胜率/平均盈亏/盈亏比/平均持仓）。
-// English: one combo simulation — score filter, greedy non-overlapping entries per stock,
-// uniform trailing+timeout exit; metrics aggregated exactly like summarize().
-func simulateCombo(name, kind string, trigs []sweepTrigger, klines map[string][]data.KLine,
-	trailPct float64, maxHold int, minScore float64) sweepResult {
-	res := sweepResult{Name: name, Kind: kind, Trail: trailPct, Hold: maxHold, MinScore: minScore}
-	nextFree := map[string]int{} // code -> 可再入场的最早下标
+// simulateCombo 单组合模拟：用战法自身真实出场逻辑回测，不依赖统一出场公式。
+// 对每个组合，把参数应用到战法适配器，然后跑全量 backtestStock（真实的入场+出场），
+// 聚合胜率/盈亏比/期望收益等指标。
+// §用户反馈：分战法回测，每个战法用自己的出场逻辑，不搞统一公式。
+func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data.KLine,
+	industryChg map[string]map[string]float64, takeProfitPct float64, stopLossPct float64, maxHold int, minScore float64) sweepResult {
+	// 记录原始参数，组合完成后恢复
+	restore := applyComboParams(ad, takeProfitPct, stopLossPct, maxHold, minScore)
+	res := sweepResult{Name: ad.Name(), Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct, Hold: maxHold, MinScore: minScore}
 	var winSum, lossSum float64
-	for _, t := range trigs {
-		if minScore > 0 && t.score >= 0 && t.score < minScore {
-			continue // 门槛过滤（-1 标记=无分维度，不过滤）
-		}
-		if t.sigIdx < nextFree[t.code] {
-			continue // 同股同战法持仓期内不重复入场（与单组合回放语义一致）
-		}
-		exitJ, pnl := uniformExit(klines[t.code], t.sigIdx, t.entry, t.highest, trailPct, maxHold)
-		nextFree[t.code] = exitJ + 1
-		res.Count++
-		res.AvgHold += float64(exitJ - (t.sigIdx + 1))
-		if pnl > 0 {
-			res.Win++
-			winSum += pnl
-		} else {
-			res.Loss++
-			lossSum += pnl
+	for code, kls := range klines {
+		indByDate := industryChg[code]
+		trades := o.backtestStock(code, kls, ad, indByDate)
+		for _, t := range trades {
+			res.Count++
+			res.AvgHold += float64(t.HoldDays)
+			if t.PnlPct > 0 {
+				res.Win++
+				winSum += t.PnlPct
+			} else {
+				res.Loss++
+				lossSum += t.PnlPct
+			}
 		}
 	}
+	restore() // 恢复原始参数
 	if res.Count == 0 {
 		return res
 	}
@@ -386,13 +388,96 @@ func simulateCombo(name, kind string, trigs []sweepTrigger, klines map[string][]
 	return res
 }
 
-// uniformExit 统一出场引擎：阶段高点回撤 ≥trailPct%（且曾盈利）止盈离场；
-// 持仓 ≥maxHold 天超期离场；数据末尾强制结算。返回平仓日下标与收益率(%)。
-func uniformExit(kls []data.KLine, sigIdx int, entry, sigHigh, trailPct float64, maxHold int) (int, float64) {
+// applyComboParams 把组合参数应用到战法适配器，返回恢复函数。
+// 对于内置战法，修改 config 的出场旋钮；对于因子/形态规则，修改 ruleEvalAdapter 的字段。
+func applyComboParams(ad adapter, takeProfitPct, stopLossPct float64, maxHold int, minScore float64) func() {
+	switch a := ad.(type) {
+	case *doubleBumpAdapter:
+		old1, old2, old3 := a.cfg.TrailingDrawbackPct, a.cfg.DoubleBumpTakeProfitPct, a.cfg.MaxHoldDays
+		if takeProfitPct > 0 {
+			a.cfg.TrailingDrawbackPct = takeProfitPct
+		}
+		if stopLossPct > 0 {
+			a.cfg.DoubleBumpTakeProfitPct = stopLossPct
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() { a.cfg.TrailingDrawbackPct, a.cfg.DoubleBumpTakeProfitPct, a.cfg.MaxHoldDays = old1, old2, old3 }
+	case *dragonAdapter:
+		old1, old2 := a.cfg.TrailingDrawbackPct, a.cfg.MaxHoldDays
+		if takeProfitPct > 0 {
+			a.cfg.TrailingDrawbackPct = takeProfitPct
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() { a.cfg.TrailingDrawbackPct, a.cfg.MaxHoldDays = old1, old2 }
+	case *dragonReturnAdapter:
+		old1, old2, old3, old4 := a.cfg.TakeProfitPct, a.cfg.StopLossPct, a.cfg.MaxHoldDays, a.cfg.TrailingDrawback
+		if takeProfitPct > 0 {
+			a.cfg.TakeProfitPct = takeProfitPct / 100
+			a.cfg.TrailingDrawback = takeProfitPct
+		}
+		if stopLossPct > 0 {
+			a.cfg.StopLossPct = stopLossPct / 100
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() {
+			a.cfg.TakeProfitPct, a.cfg.StopLossPct, a.cfg.MaxHoldDays, a.cfg.TrailingDrawback = old1, old2, old3, old4
+		}
+	case *nShapeAdapter:
+		old1, old2, old3 := a.cfg.TrailingDrawbackPct, a.cfg.HardStopLoss, a.cfg.MaxHoldDays
+		if takeProfitPct > 0 {
+			a.cfg.TrailingDrawbackPct = takeProfitPct
+		}
+		if stopLossPct > 0 {
+			a.cfg.HardStopLoss = stopLossPct / 100
+		}
+		if maxHold > 0 {
+			a.cfg.MaxHoldDays = maxHold
+		}
+		return func() { a.cfg.TrailingDrawbackPct, a.cfg.HardStopLoss, a.cfg.MaxHoldDays = old1, old2, old3 }
+	case *ruleEvalAdapter:
+		old1, old2 := a.trailOverride, a.holdOverride
+		if takeProfitPct > 0 {
+			v := takeProfitPct
+			a.trailOverride = &v
+		}
+		if maxHold > 0 {
+			v := maxHold
+			a.holdOverride = &v
+		}
+		return func() { a.trailOverride, a.holdOverride = old1, old2 }
+	}
+	return func() {}
+}
+
+// uniformExit 统一出场引擎 v2（§用户反馈：到线就卖，不等天数）。
+//
+// 三个条件按优先级逐日检查：
+//  1. 止损线：亏损达 stopLossPct%（相对入场价）→ 立即卖出控制损失
+//  2. 止盈线：盈利达 takeProfitPct%（相对入场价）→ 锁定利润
+//  3. 移动止盈：从阶段高点回撤 trailPct%（且曾盈利）→ 保护已有利润
+//  4. 兜底：超过 maxHoldDays 天 → 强制离场
+//
+// 与旧版的区别：新增了独立的止损线和止盈线，不再只依赖移动止盈+超期。
+// maxHoldDays 是安全兜底而非主要出场方式。
+func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
+	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int) (int, float64) {
 	entryDay := sigIdx + 1
 	stageHigh := math.Max(entry, sigHigh)
 	lastJ := len(kls) - 1
-	pnlAt := func(j int) float64 { return (kls[j].Close - entry) / entry * 100 }
+
+	pnlAt := func(j int) float64 {
+		if entry <= 0 {
+			return 0
+		}
+		return (kls[j].Close - entry) / entry * 100
+	}
+
 	for j := entryDay + 1; j <= lastJ; j++ {
 		cur := kls[j].Close
 		if cur <= 0 {
@@ -401,12 +486,23 @@ func uniformExit(kls []data.KLine, sigIdx int, entry, sigHigh, trailPct float64,
 		if cur > stageHigh {
 			stageHigh = cur
 		}
-		dd := (cur - stageHigh) / stageHigh * 100
-		if stageHigh > entry && dd <= -trailPct {
-			return j, pnlAt(j)
+		pnlPct := (cur - entry) / entry * 100
+		days := j - entryDay
+
+		if stopLossPct > 0 && pnlPct <= -stopLossPct {
+			return j, pnlPct // 止损线：立即卖出控制损失
 		}
-		if j-entryDay >= maxHold {
-			return j, pnlAt(j)
+		if takeProfitPct > 0 && pnlPct >= takeProfitPct {
+			return j, pnlPct // 止盈线：锁定利润
+		}
+		if trailPct > 0 && stageHigh > entry {
+			dd := (cur - stageHigh) / stageHigh * 100
+			if dd <= -trailPct {
+				return j, pnlAt(j)
+			}
+		}
+		if days >= maxHoldDays {
+			return j, pnlPct
 		}
 	}
 	if lastJ > entryDay {
@@ -419,6 +515,8 @@ func uniformExit(kls []data.KLine, sigIdx int, entry, sigHigh, trailPct float64,
 // 零亏损且有盈利的组合按满分处理（否则 PF 字段保持 0 的"完美组合"会被排到末位）。
 func objectiveValue(obj string, r *sweepResult) float64 {
 	switch obj {
+	case "expectancy":
+		return r.Expectancy
 	case "winrate":
 		return r.WinRate
 	case "avgwin":

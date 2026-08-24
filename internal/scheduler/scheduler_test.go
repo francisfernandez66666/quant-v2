@@ -51,8 +51,9 @@ func TestNightlyEligible(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	cfg := cfgSamples("fake", "/tmp/x.db")
 
-	// 会话模型驱动（无写死钟点）：盘前/上午盘/午前/下午盘 → 禁止；盘后/休市 → 允许
-	// English: session-model driven — blocked in premarket/trading windows, allowed after close/closed.
+	// 统一口径（用户约定）：仅交易日交易窗口（9:15~收盘，含午休）禁止；其余全放行。
+	// English: unified rule — blocked only inside the trading-day window (9:15 to close, lunch incl.);
+	// everything else (nights, pre-open, weekends) is eligible.
 	cases := []struct {
 		t    time.Time
 		want bool
@@ -60,12 +61,14 @@ func TestNightlyEligible(t *testing.T) {
 	}{
 		{time.Date(2026, 8, 18, 16, 0, 0, 0, loc), true, "周二16:00 盘后"},
 		{time.Date(2026, 8, 18, 10, 0, 0, 0, loc), false, "周二10:00 上午盘"},
-		{time.Date(2026, 8, 18, 15, 5, 0, 0, loc), true, "周二15:05 收盘即盘后"},
-		{time.Date(2026, 8, 18, 9, 0, 0, 0, loc), false, "周二09:00 盘前（归 quant 新闻归因）"},
-		{time.Date(2026, 8, 18, 12, 0, 0, 0, loc), false, "周二12:00 午前"},
+		{time.Date(2026, 8, 18, 15, 5, 0, 0, loc), true, "周二15:05 收盘即放行"},
+		{time.Date(2026, 8, 18, 9, 0, 0, 0, loc), true, "周二09:00 盘前（窗口外放行）"},
+		{time.Date(2026, 8, 18, 9, 20, 0, 0, loc), false, "周二09:20 已开盘禁止"},
+		{time.Date(2026, 8, 18, 12, 0, 0, 0, loc), false, "周二12:00 午休仍在窗口内"},
+		{time.Date(2026, 8, 18, 14, 59, 0, 0, loc), false, "周二14:59 收盘前禁止"},
 		{time.Date(2026, 8, 19, 2, 0, 0, 0, loc), true, "周三02:00 凌晨休市"},
 		{time.Date(2026, 8, 22, 16, 0, 0, 0, loc), true, "周六16:00"},
-		{time.Date(2026, 8, 22, 10, 0, 0, 0, loc), true, "周六上午10:00（非交易日无盘中，实录回归）"},
+		{time.Date(2026, 8, 22, 10, 0, 0, 0, loc), true, "周六上午10:00（非交易日全天放行）"},
 	}
 	for _, tc := range cases {
 		if got := NightlyEligible(tc.t, cfg); got != tc.want {
@@ -306,8 +309,8 @@ func TestNightlyJobKilledAtTradingOpen(t *testing.T) {
 		return s.busy
 	}, "作业应已启动")
 
-	// 下一交易日周一 8:40 盘前 → 应 kill 作业
-	now = time.Date(2026, 8, 24, 8, 40, 0, 0, loc)
+	// 下一交易日周一 9:20（已进入交易窗口 9:15~收盘）→ 应 kill 作业
+	now = time.Date(2026, 8, 24, 9, 20, 0, 0, loc)
 	s.tick()
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()

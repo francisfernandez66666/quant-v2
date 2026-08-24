@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 
 	"quant-trading-v2/internal/research"
@@ -91,7 +92,7 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := research.ApplyOptimizationParams(s.researchDir, row.StrategyKind,
-		p.TrailPct, p.HoldDays, p.MinScore); err != nil {
+		p.TakeProfitPct, p.StopLossPct, p.HoldDays, p.MinScore); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
@@ -116,8 +117,25 @@ func (s *Server) handleOptimizationReject(w http.ResponseWriter, r *http.Request
 
 // reloadRulesByKind 按规则 ID 前缀热重载对应的战法库（审批后实盘即时生效）。
 func (s *Server) reloadRulesByKind(kind string) {
-	c := s.ctrlFor("") // 注册表模式取默认控制器；单引擎模式即全局 ctrl
+	// 取第一个可用引擎（注册表模式或单引擎模式均可）。
+	// 注意：ctrlFor("") 在注册表模式下会返回带 nil 值的接口（Go 经典陷阱），
+	// 所以改用 AllControllers 取第一个非 nil 引擎。
+	var c EngineController
+	if s.registry != nil {
+		for _, cc := range s.registry.AllControllers() {
+			if cc != nil {
+				c = cc
+				break
+			}
+		}
+	} else {
+		c = s.ctrl
+	}
 	if c == nil {
+		return
+	}
+	// 二次防护：反射检查底层值是否非 nil，避免 *Engine 转 interface 的非 nil 陷阱。
+	if reflect.ValueOf(c).Kind() == reflect.Ptr && reflect.ValueOf(c).IsNil() {
 		return
 	}
 	if len(kind) >= 4 && kind[:4] == "fac_" {
@@ -139,8 +157,8 @@ func (s *Server) applyBuiltinOptParams(row *store.OptimizationResult) error {
 	}
 	p := row.Params
 	apply := func(trail *float64, hold *int) {
-		if p.TrailPct > 0 {
-			*trail = p.TrailPct
+		if p.TakeProfitPct > 0 {
+			*trail = p.TakeProfitPct
 		}
 		if p.HoldDays > 0 {
 			*hold = p.HoldDays
@@ -149,12 +167,24 @@ func (s *Server) applyBuiltinOptParams(row *store.OptimizationResult) error {
 	switch row.Strategy {
 	case "双响炮":
 		apply(&cfg.DoubleBump.TrailingDrawbackPct, &cfg.DoubleBump.MaxHoldDays)
+		if p.StopLossPct > 0 {
+			cfg.DoubleBump.DoubleBumpTakeProfitPct = p.StopLossPct
+		}
 	case "龙头":
 		apply(&cfg.Dragon.TrailingDrawbackPct, &cfg.Dragon.MaxHoldDays)
 	case "龙回头":
 		apply(&cfg.DragonReturn.TrailingDrawback, &cfg.DragonReturn.MaxHoldDays)
+		if p.StopLossPct > 0 {
+			cfg.DragonReturn.StopLossPct = p.StopLossPct
+		}
+		if p.TakeProfitPct > 0 {
+			cfg.DragonReturn.TakeProfitPct = p.TakeProfitPct
+		}
 	case "N形":
 		apply(&cfg.NShape.TrailingDrawbackPct, &cfg.NShape.MaxHoldDays)
+		if p.StopLossPct > 0 {
+			cfg.NShape.HardStopLoss = p.StopLossPct / 100
+		}
 	default:
 		return fmt.Errorf("未知内置战法：%s", row.Strategy)
 	}

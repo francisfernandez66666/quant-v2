@@ -214,6 +214,20 @@ func IsActiveSession(now time.Time) bool {
 	}
 }
 
+// IsTradingWindow 交易日交易窗口（开盘 9:15 ~ 收盘 TradeClose，含午休）：研究任务禁止窗口。
+// 与用户约定口径一致——除交易日交易窗口外（盘前凌晨/盘后/周末全天），研究调度一律放行。
+// 直接复用 defaultTradeTime 的 FullOpen/TradeClose 字段，不另设钟点。
+// English: trading-day window [FullOpen, TradeClose) incl. lunch break — the only period where
+// research tasks are blocked; nights, pre-open and weekends are all eligible for research.
+func IsTradingWindow(now time.Time) bool {
+	wd := now.Weekday()
+	if wd == time.Saturday || wd == time.Sunday {
+		return false // 周末非交易日：全天允许
+	}
+	m := now.Hour()*100 + now.Minute()
+	return m >= defaultTradeTime.FullOpen && m < defaultTradeTime.TradeClose
+}
+
 // CurrentSession 返回当前市场时段。
 func CurrentSession(now time.Time) MarketSession {
 	wd := now.Weekday()

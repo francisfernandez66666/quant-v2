@@ -8,10 +8,10 @@ import (
 func seedSweepResults() []map[string]any {
 	return []map[string]any{
 		{"rank": 1.0, "strategy": "双响炮", "strategy_kind": "",
-			"params":   map[string]any{"trail_pct": 5.0, "hold_days": 20.0, "min_score": 80.0},
+			"params":   map[string]any{"take_profit_pct": 5.0, "stop_loss_pct": 8.0, "hold_days": 20.0, "min_score": 80.0},
 			"win_rate": 39.5, "profit_factor": 1.16, "avg_hold_days": 10.0, "trigger_count": 1238.0},
 		{"rank": 2.0, "strategy": "因子战法#1", "strategy_kind": "fac_1",
-			"params":   map[string]any{"trail_pct": 15.0, "hold_days": 20.0, "min_score": 70.0},
+			"params":   map[string]any{"take_profit_pct": 15.0, "stop_loss_pct": 10.0, "hold_days": 20.0, "min_score": 70.0},
 			"win_rate": 45.9, "profit_factor": 1.14, "avg_hold_days": 17.8, "trigger_count": 3765.0},
 	}
 }
@@ -38,7 +38,8 @@ func TestOptimizationResultsCRUD(t *testing.T) {
 	if len(rows) != 2 || rows[0].Rank != 1 || rows[0].Strategy != "双响炮" {
 		t.Fatalf("rows=%+v", rows[0])
 	}
-	if rows[0].Params.TrailPct != 5 || rows[0].Params.HoldDays != 20 || rows[0].Params.MinScore != 80 {
+	if rows[0].Params.TakeProfitPct != 5 || rows[0].Params.StopLossPct != 8 ||
+		rows[0].Params.HoldDays != 20 || rows[0].Params.MinScore != 80 {
 		t.Fatalf("params 解析错误: %+v", rows[0].Params)
 	}
 	if rows[0].Status != "pending" || rows[0].Objective != "profitfactor" {

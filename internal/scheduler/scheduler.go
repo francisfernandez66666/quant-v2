@@ -131,8 +131,8 @@ func (s *Scheduler) tick() {
 		s.preemptCurrent("调度器已禁用")
 		return
 	}
-	if data.IsActiveSession(now) {
-		// 交易时段：终止遗留任务（标 preempted 次日自动续跑）+ 内存治理 + 增量下载（只下载不研究）
+	if data.IsTradingWindow(now) {
+		// 交易日交易窗口：终止遗留任务（标 preempted 次日自动续跑）+ 内存治理 + 增量下载（只下载不研究）
 		s.preemptCurrent("交易时段开始")
 		s.trimInSession(cfg, now)
 		s.maybeTradingDataload(cfg, now)
@@ -317,12 +317,9 @@ func dirOfDB(cfg config.SchedulerConfig) string {
 // (quant owns those), allowed after close and on closed days. No hardcoded clock times.
 func NightlyEligible(now time.Time, cfg config.SchedulerConfig) bool {
 	_ = cfg // 会话化后不再消费钟点配置（kept for call-site stability）
-	switch data.CurrentSession(now) {
-	case data.SessionAfterMarket, data.SessionClosed:
-		return true
-	default: // 盘前/上午盘/午前/下午盘：归 quant
-		return false
-	}
+	// §统一口径（用户约定）：交易日交易窗口（9:15~收盘）禁止，其余全放行——
+	// 盘前凌晨/盘后/周末全天均可研究。直接复用 data.IsTradingWindow。
+	return !data.IsTradingWindow(now)
 }
 
 // TradingDataloadDue 纯函数：交易时段是否应触发一轮增量下载（按间隔节流）。

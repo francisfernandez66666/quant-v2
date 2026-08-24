@@ -82,6 +82,7 @@ type AppliedFactorEntry struct {
 	// ExitTrailPct/ExitMaxHoldDays：回测 ruleEvalAdapter 立即生效；实盘出场接线见 v2 TODO。
 	// English: rule-level parameter overrides from sweep approvals (0 = use global defaults).
 	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`
+	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"`
 	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"`
 }
 
@@ -359,6 +360,7 @@ type AppliedPatternEntry struct {
 
 	// §P2-d 规则级出场参数覆盖（扫参审批后写入；0=缺省全局默认）。形态无连续分，无门槛覆盖。
 	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`
+	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"`
 	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"`
 }
 
@@ -590,7 +592,7 @@ func saveAppliedPatterns(dataDir string, entries []AppliedPatternEntry) error {
 // TrailPct/HoldDays>0 时写规则级出场覆盖。任一字段为 0 表示保持现状。
 // English: persists sweep-approval overrides onto the library entry (factor: threshold+exits;
 // pattern: exits only). Zero fields are left untouched. Hot-reload is the caller's duty.
-func ApplyOptimizationParams(dataDir, kind string, trailPct float64, holdDays int, minScore float64) error {
+func ApplyOptimizationParams(dataDir, kind string, takeProfitPct, stopLossPct float64, holdDays int, minScore float64) error {
 	if strings.HasPrefix(kind, "fac_") {
 		entries, err := ListAppliedFactorRules(dataDir)
 		if err != nil {
@@ -602,8 +604,11 @@ func ApplyOptimizationParams(dataDir, kind string, trailPct float64, holdDays in
 				continue
 			}
 			hit = true
-			if trailPct > 0 {
-				entries[i].ExitTrailPct = trailPct
+			if takeProfitPct > 0 {
+				entries[i].ExitTrailPct = takeProfitPct
+			}
+			if stopLossPct > 0 {
+				entries[i].ExitStopLossPct = stopLossPct
 			}
 			if holdDays > 0 {
 				entries[i].ExitMaxHoldDays = holdDays
@@ -628,8 +633,11 @@ func ApplyOptimizationParams(dataDir, kind string, trailPct float64, holdDays in
 				continue
 			}
 			hit = true
-			if trailPct > 0 {
-				entries[i].ExitTrailPct = trailPct
+			if takeProfitPct > 0 {
+				entries[i].ExitTrailPct = takeProfitPct
+			}
+			if stopLossPct > 0 {
+				entries[i].ExitStopLossPct = stopLossPct
 			}
 			if holdDays > 0 {
 				entries[i].ExitMaxHoldDays = holdDays

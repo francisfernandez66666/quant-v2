@@ -137,6 +137,12 @@ func (d *DB) migrate() error {
 			objective TEXT DEFAULT '',
 			win_rate REAL DEFAULT 0,
 			profit_factor REAL DEFAULT 0,
+			win INTEGER DEFAULT 0,
+			loss INTEGER DEFAULT 0,
+			avg_win_pct REAL DEFAULT 0,
+			avg_loss_pct REAL DEFAULT 0,
+			expectancy REAL DEFAULT 0,
+			stop_loss REAL DEFAULT 0,
 			avg_hold_days REAL DEFAULT 0,
 			trigger_count INTEGER DEFAULT 0,
 			status TEXT NOT NULL DEFAULT 'pending',
@@ -455,6 +461,7 @@ func (d *DB) migrate() error {
 		{"optimization_results", "avg_win_pct", "ALTER TABLE optimization_results ADD COLUMN avg_win_pct REAL DEFAULT 0"},
 		{"optimization_results", "avg_loss_pct", "ALTER TABLE optimization_results ADD COLUMN avg_loss_pct REAL DEFAULT 0"},
 		{"optimization_results", "expectancy", "ALTER TABLE optimization_results ADD COLUMN expectancy REAL DEFAULT 0"},
+		{"optimization_results", "stop_loss", "ALTER TABLE optimization_results ADD COLUMN stop_loss REAL DEFAULT 0"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

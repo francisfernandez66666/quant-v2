@@ -39,15 +39,23 @@ type OptimizationResult struct {
 
 // SweepParams 扫参组合参数（与 SWEEP_JSON 的 params 对象对应）。
 type SweepParams struct {
-	TrailPct float64 `json:"trail_pct"`
-	HoldDays int     `json:"hold_days"`
-	MinScore float64 `json:"min_score"`
+	TakeProfitPct float64 `json:"take_profit_pct"`
+	StopLossPct   float64 `json:"stop_loss_pct"`
+	HoldDays      int     `json:"hold_days"`
+	MinScore      float64 `json:"min_score"`
 }
 
 // ParseSweepParams 从 params JSON 解析（容错：空/坏 JSON 返回零值）。
 func ParseSweepParams(s string) SweepParams {
 	var p SweepParams
 	_ = json.Unmarshal([]byte(s), &p)
+	// 向后兼容：旧格式 {trail_pct} → 新格式 {take_profit_pct}
+	if p.TakeProfitPct == 0 {
+		var old struct{ TrailPct float64 `json:"trail_pct"` }
+		if json.Unmarshal([]byte(s), &old) == nil && old.TrailPct > 0 {
+			p.TakeProfitPct = old.TrailPct
+		}
+	}
 	return p
 }
 
@@ -66,8 +74,8 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 	}
 	stmt, err := tx.Prepare(`INSERT INTO optimization_results
 		(task_id, rank, strategy, strategy_kind, params, objective, win_rate, profit_factor,
-		 win, loss, avg_win_pct, avg_loss_pct, expectancy, avg_hold_days, trigger_count, status, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`)
+		 win, loss, avg_win_pct, avg_loss_pct, expectancy, stop_loss, avg_hold_days, trigger_count, status, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`)
 	if err != nil {
 		return err
 	}
@@ -87,8 +95,9 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 		avgWin, _ := r["avg_win_pct"].(float64)
 		avgLoss, _ := r["avg_loss_pct"].(float64)
 		expectancy, _ := r["expectancy"].(float64)
+		stopLoss, _ := r["stop_loss_pct"].(float64)
 		if _, err := stmt.Exec(taskID, int(rank), strategy, sk, string(params), objective,
-			winRate, pf, int(win), int(loss), avgWin, avgLoss, expectancy, avgHold, int(count), now); err != nil {
+			winRate, pf, int(win), int(loss), avgWin, avgLoss, expectancy, stopLoss, avgHold, int(count), now); err != nil {
 			return err
 		}
 	}
@@ -131,21 +140,27 @@ func (d *DB) ListOptimizations(limit int) ([]map[string]any, error) {
 	return out, nil
 }
 
+// optColumns 排名表查询列清单（与 scanOptRow 的 Scan 顺序一一对应，
+// 新增列时两处必须同步修改）。
 var optColumns = `id, task_id, rank, strategy, strategy_kind, params, objective,
 	win_rate, profit_factor, win, loss, avg_win_pct, avg_loss_pct, expectancy,
-	avg_hold_days, trigger_count, status, created_at`
+	stop_loss, avg_hold_days, trigger_count, status, created_at`
 
 // scanOptRow 读一行排名记录。
 func scanOptRow(scan func(...any) error) (*OptimizationResult, error) {
 	var r OptimizationResult
 	var sk, obj sql.NullString
+	var sl sql.NullFloat64
 	if err := scan(&r.ID, &r.TaskID, &r.Rank, &r.Strategy, &sk, &r.ParamsJSON, &obj,
 		&r.WinRate, &r.ProfitFactor, &r.Win, &r.Loss, &r.AvgWinPct, &r.AvgLossPct,
-		&r.Expectancy, &r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt); err != nil {
+		&r.Expectancy, &sl, &r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt); err != nil {
 		return nil, err
 	}
 	r.StrategyKind = sk.String
 	r.Params = ParseSweepParams(r.ParamsJSON)
+	if sl.Valid && r.Params.StopLossPct == 0 {
+		r.Params.StopLossPct = sl.Float64
+	}
 	r.Objective = obj.String
 	return &r, nil
 }
