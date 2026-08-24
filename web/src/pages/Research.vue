@@ -115,7 +115,7 @@
           </div>
           <table class="opt-table">
             <thead>
-              <tr><th>#</th><th>战法</th><th>止盈</th><th>持仓</th><th>门槛</th><th>胜率</th><th>盈亏比</th><th>触发</th><th>状态</th><th>操作</th></tr>
+              <tr><th>#</th><th>战法</th><th>止盈</th><th>持仓</th><th>门槛</th><th>胜率</th><th>盈亏比</th><th>期望</th><th>触发</th><th>状态</th><th>操作</th></tr>
             </thead>
             <tbody>
               <!-- §白屏根因修复：详情行与主行必须在同一个 v-for 作用域内——
@@ -130,6 +130,9 @@
                 <td>{{ (r.params || {}).min_score ? fmtNum(r.params.min_score) : '—' }}</td>
                 <td>{{ fmtNum(r.win_rate, 1) }}%</td>
                 <td>{{ fmtNum(r.profit_factor, 2) }}</td>
+                <td :style="fmtNum(r.expectancy,2) !== '-' ? (r.expectancy >= 0 ? 'color:#22c55e;font-weight:700' : 'color:#ef4444;font-weight:700') : ''">
+                  {{ fmtNum(r.expectancy, 2) }}%
+                </td>
                 <td>{{ r.trigger_count }}</td>
                 <td>
                   <span v-if="r.status==='approved'" class="tag status-applied">已入库</span>
@@ -160,6 +163,7 @@
                     <span>平均亏损 <b class="neg">{{ fmtNum(r.avg_loss_pct, 2) }}%</b></span>
                     <span>平均持仓 <b>{{ fmtNum(r.avg_hold_days, 1) }}</b> 天</span>
                     <span>目标函数值 <b>{{ fmtNum(r.profit_factor, 2) }}</b></span>
+                    <span style="font-weight:700;color:#0f172a">每笔期望 <b>{{ fmtNum(r.expectancy, 2) >= 0 ? '+' : '' }}{{ fmtNum(r.expectancy, 2) }}%</b></span>
                   </div>
                   <div style="font-size:11px;color:var(--muted,#888);padding-bottom:2px">
                     出场规则统一为「阶段高点回撤 {{ fmtNum((r.params || {}).trail_pct) }}% 止盈 + 最长持仓 {{ fmtNum(r.params.hold_days) }} 天超期」；门槛仅对有连续入场分的战法生效。

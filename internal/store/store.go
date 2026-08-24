@@ -454,6 +454,7 @@ func (d *DB) migrate() error {
 		{"optimization_results", "loss", "ALTER TABLE optimization_results ADD COLUMN loss INTEGER DEFAULT 0"},
 		{"optimization_results", "avg_win_pct", "ALTER TABLE optimization_results ADD COLUMN avg_win_pct REAL DEFAULT 0"},
 		{"optimization_results", "avg_loss_pct", "ALTER TABLE optimization_results ADD COLUMN avg_loss_pct REAL DEFAULT 0"},
+		{"optimization_results", "expectancy", "ALTER TABLE optimization_results ADD COLUMN expectancy REAL DEFAULT 0"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

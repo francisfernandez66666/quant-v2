@@ -931,6 +931,7 @@ type summary struct {
 	AvgWinPct    float64
 	AvgLossPct   float64
 	ProfitFactor float64
+	Expectancy   float64 // 每笔交易期望收益率%（正=正期望策略）
 	AvgHold      float64
 }
 
@@ -966,6 +967,9 @@ func summarize(trades []trade) *summary {
 	if lossSum != 0 {
 		s.ProfitFactor = winSum / -lossSum
 	}
+	// §期望收益：每笔交易的数学期望 E = P(赢)×均盈 + P(亏)×均亏（正=正期望策略）
+	wr := s.WinRate / 100
+	s.Expectancy = wr*s.AvgWinPct + (1-wr)*s.AvgLossPct
 	s.AvgHold = float64(holdSum) / float64(s.Count)
 	return s
 }
@@ -984,6 +988,7 @@ func printReport(s *summary, name string, stockCount int) {
 	fmt.Printf("平均盈利: +%.2f%%\n", s.AvgWinPct)
 	fmt.Printf("平均亏损: %.2f%%\n", s.AvgLossPct)
 	fmt.Printf("盈亏比: %.2f\n", s.ProfitFactor)
+	fmt.Printf("期望收益: %+.2f%%\n", s.Expectancy)
 	fmt.Printf("平均持仓天数: %.1f\n", s.AvgHold)
 	fmt.Println("==============================================")
 }

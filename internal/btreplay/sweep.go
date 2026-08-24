@@ -96,6 +96,7 @@ type sweepResult struct {
 	AvgWinPct      float64 `json:"avg_win_pct"`
 	AvgLossPct     float64 `json:"avg_loss_pct"`
 	ProfitFactor   float64 `json:"profit_factor"`
+	Expectancy     float64 `json:"expectancy"`
 	AvgHold        float64 `json:"avg_hold_days"`
 	ObjectiveScore float64 `json:"-"`
 }
@@ -242,8 +243,8 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	}
 	for pos, idx := range rank {
 		r := &all[idx]
-		fmt.Printf("#%d 【%s】止盈%.0f%% 持仓%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 触发%d 平均持仓%.1f天\n",
-			pos+1, r.Name, r.Trail, r.Hold, r.MinScore, r.WinRate, r.ProfitFactor, r.Count, r.AvgHold)
+		fmt.Printf("#%d 【%s】止盈%.0f%% 持仓%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d 平均持仓%.1f天\n",
+			pos+1, r.Name, r.Trail, r.Hold, r.MinScore, r.WinRate, r.ProfitFactor, r.Expectancy, r.Count, r.AvgHold)
 	}
 	if len(rank) == 0 {
 		fmt.Println("无达到最低触发数的组合——考虑扩大日期区间或股票池。")

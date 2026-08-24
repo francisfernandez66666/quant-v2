@@ -26,6 +26,7 @@ type OptimizationResult struct {
 	Objective    string      `json:"objective"`
 	WinRate      float64     `json:"win_rate"`
 	ProfitFactor float64     `json:"profit_factor"`
+	Expectancy   float64     `json:"expectancy"`
 	Win          int         `json:"win"`
 	Loss         int         `json:"loss"`
 	AvgWinPct    float64     `json:"avg_win_pct"`
@@ -65,8 +66,8 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 	}
 	stmt, err := tx.Prepare(`INSERT INTO optimization_results
 		(task_id, rank, strategy, strategy_kind, params, objective, win_rate, profit_factor,
-		 win, loss, avg_win_pct, avg_loss_pct, avg_hold_days, trigger_count, status, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`)
+		 win, loss, avg_win_pct, avg_loss_pct, expectancy, avg_hold_days, trigger_count, status, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`)
 	if err != nil {
 		return err
 	}
@@ -85,8 +86,9 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 		loss, _ := r["loss"].(float64)
 		avgWin, _ := r["avg_win_pct"].(float64)
 		avgLoss, _ := r["avg_loss_pct"].(float64)
+		expectancy, _ := r["expectancy"].(float64)
 		if _, err := stmt.Exec(taskID, int(rank), strategy, sk, string(params), objective,
-			winRate, pf, int(win), int(loss), avgWin, avgLoss, avgHold, int(count), now); err != nil {
+			winRate, pf, int(win), int(loss), avgWin, avgLoss, expectancy, avgHold, int(count), now); err != nil {
 			return err
 		}
 	}
@@ -130,8 +132,8 @@ func (d *DB) ListOptimizations(limit int) ([]map[string]any, error) {
 }
 
 var optColumns = `id, task_id, rank, strategy, strategy_kind, params, objective,
-	win_rate, profit_factor, win, loss, avg_win_pct, avg_loss_pct, avg_hold_days,
-	trigger_count, status, created_at`
+	win_rate, profit_factor, win, loss, avg_win_pct, avg_loss_pct, expectancy,
+	avg_hold_days, trigger_count, status, created_at`
 
 // scanOptRow 读一行排名记录。
 func scanOptRow(scan func(...any) error) (*OptimizationResult, error) {
@@ -139,7 +141,7 @@ func scanOptRow(scan func(...any) error) (*OptimizationResult, error) {
 	var sk, obj sql.NullString
 	if err := scan(&r.ID, &r.TaskID, &r.Rank, &r.Strategy, &sk, &r.ParamsJSON, &obj,
 		&r.WinRate, &r.ProfitFactor, &r.Win, &r.Loss, &r.AvgWinPct, &r.AvgLossPct,
-		&r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt); err != nil {
+		&r.Expectancy, &r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt); err != nil {
 		return nil, err
 	}
 	r.StrategyKind = sk.String
