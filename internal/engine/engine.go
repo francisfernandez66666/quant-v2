@@ -577,8 +577,10 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		amount = 10000
 	}
 	qty := int(amount/price/100) * 100
+	// §R0.7 修复：高价股不足一手时不再强凑 1 手（旧逻辑 qty=100 导致订单金额超预算数倍）
 	if qty <= 0 {
-		qty = 100
+		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
+		return
 	}
 	// 信号 ID 缺失时用 code@auto 兜底（幂等键仍需唯一）。
 	id := sig.ID

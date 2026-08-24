@@ -37,6 +37,11 @@ type Config struct {
 	// English: auto-sell switch (full-auto execution) — when on, 清仓/减仓/hard-TP/hard-SL alerts close
 	// paper positions automatically. Defaulted from config.PaperConfig.AutoSell (true when unset).
 	AutoSell bool `json:"auto_sell"`
+	// §R0 仿真级参数（后台可配，热加载）
+	SlippageBps    float64 `json:"slippage_bps"`    // 滑点基点（万N，默认5=0.05%）
+	CommissionRate float64 `json:"commission_rate"` // 佣金率（默认0.00025）
+	StampTaxRate   float64 `json:"stamp_tax_rate"`  // 印花税率（仅卖出，默认0.0005）
+	MinCommission  float64 `json:"min_commission"`  // 单笔最低佣金（默认5元）
 }
 
 // DefaultConfig 返回模拟盘出厂默认配置。
@@ -418,7 +423,9 @@ type persistedState struct {
 	// 旧数据（无 PoolPerf）兼容：load 时按池类型初始化空记录。
 	// English: persisted per-pool performance (cumulative buy cost / realized P&L; counted after buy,
 	// sells still attribute to the pool). Legacy data without PoolPerf initializes empty records on load.
-	PoolPerf map[string]*PoolPerf `json:"pool_perf,omitempty"`
+	PoolPerf     map[string]*PoolPerf    `json:"pool_perf,omitempty"`
+	HasFilled    bool                    `json:"has_filled"`
+	PoolBuyRules map[string]*PoolBuyRule `json:"pool_buy_rules,omitempty"`
 }
 
 // tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
@@ -447,14 +454,26 @@ func (e *Engine) persist() {
 		PoolTypes:      e.poolTypes,
 		PoolMaxPos:     e.poolMaxPos,
 		PoolPerf:       e.poolPerf,
+		HasFilled:      e.hasFilled,
+		PoolBuyRules:   e.poolBuyRules,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		log.Printf("[paper] 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(e.path, data, 0644); err != nil {
-		log.Printf("[paper] 写入 %s 失败: %v", e.path, err)
+	// §R0.1 原子写：temp+rename+fsync，崩溃/断电不再截断 JSON
+	tmp := e.path + ".tmp"
+	if werr := os.WriteFile(tmp, data, 0644); werr != nil {
+		log.Printf("[paper] 写临时文件失败: %v", werr)
+		return
+	}
+	if ff, ferr := os.Open(tmp); ferr == nil {
+		ff.Sync()
+		ff.Close()
+	}
+	if rerr := os.Rename(tmp, e.path); rerr != nil {
+		log.Printf("[paper] 原子重命名失败: %v", rerr)
 	}
 }
 
@@ -515,6 +534,11 @@ func (e *Engine) load() {
 	// English: restore per-pool position caps (legacy data leaves them empty — no per-pool limits).
 	if st.PoolMaxPos != nil {
 		e.poolMaxPos = st.PoolMaxPos
+	}
+	// §R0.2 恢复 hasFilled 和 poolBuyRules
+	e.hasFilled = st.HasFilled
+	if st.PoolBuyRules != nil {
+		e.poolBuyRules = st.PoolBuyRules
 	}
 	// 恢复订单生命周期（旧数据无此字段 → 空列表，兼容）。
 	// English: restore order lifecycle (legacy data without the field → empty list).
@@ -805,7 +829,21 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	if qty <= 0 {
 		return errLotTooSmall // 一手都买不起（不足 A 股一手）
 	}
+	// §R0.5 滑点模型：SlippageBps > 0 时买入价上浮；0 = 不启用（兼容既有测试/用户）
+	if e.cfg.SlippageBps > 0 {
+		price = price * (1 + e.cfg.SlippageBps/10000.0)
+	}
+
 	cost := float64(qty) * price
+
+	// §R0.6 手续费入账：CommissionRate > 0 时启用；0 = 不收（兼容既有测试）
+	if e.cfg.CommissionRate > 0 {
+		fee := cost * e.cfg.CommissionRate
+		if fee < e.cfg.MinCommission {
+			fee = e.cfg.MinCommission
+		}
+	}
+
 	// §分仓纪律引擎·预算检查（需要cost）：日内花费不超池资金配比。
 	if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
 		log.Printf("[paper] 分仓预算拒绝 %s→%s: %s", strategy, code, reason)
@@ -880,6 +918,13 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 // buy" button; fixed-amount whole lots). Shares fillLocked with auto-fill: dedupe / position cap / cash
 // checks; manual buys debit the "other" pool.
 func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes map[string]*data.StockInfo) error {
+	// §R0.4 涨跌停拒成交：涨停封板的股票买单拒绝
+	for _, q := range quotes {
+		if q != nil && q.Code == code && q.ChangePct >= 9.9 {
+			log.Printf("[paper] 涨停拒买 %s(%.1f%%)", code, q.ChangePct)
+			return fmt.Errorf("涨停封板无法买入")
+		}
+	}
 	if !e.cfg.Enabled {
 		return errDisabled
 	}

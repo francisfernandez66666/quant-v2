@@ -170,6 +170,10 @@ func TestPoolPerfBackfillLegacy(t *testing.T) {
 func testCfg() Config {
 	c := DefaultConfig()
 	c.Enabled = true
+	c.SlippageBps = 0      // 测试关闭滑点（有专项测试验证滑点模型）
+	c.CommissionRate = 0   // 测试关闭手续费
+	c.StampTaxRate = 0     // 测试关闭印花税
+	c.MinCommission = 0
 	c.InitialCapital = 100000
 	c.FixedAmount = 10000
 	c.MaxPositions = 10
