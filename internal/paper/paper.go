@@ -185,6 +185,7 @@ type Order struct {
 // English: in-process order sequence; restarts reseed from the timestamp.
 var orderSeq atomic.Int64
 
+// newOrderID 生成全局唯一订单 ID（格式 ORD + 纳秒时间戳）。
 func newOrderID() string {
 	return fmt.Sprintf("ord_%d_%d", time.Now().Unix(), orderSeq.Add(1))
 }
@@ -1772,6 +1773,7 @@ func (e *Engine) statsFor(poolKey *string) Stats {
 	return st
 }
 
+// round2 四舍五入到分（两位小数），避免浮点尾差导致金额不一致。
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
 // 撮合错误定义：全部为中文可读消息，直接透传给前端弹窗/接口返回。
@@ -1790,6 +1792,7 @@ var (
 // （errMsg lets a plain string act as an error without a dedicated type per case.）
 type errMsg string
 
+// Error 实现 error 接口（errMsg 为字符串类型的轻量错误包装）。
 func (e errMsg) Error() string { return string(e) }
 
 // SetInitialCapital 显式设定初始资金额（§反馈修复：配合 Reset 使用，
