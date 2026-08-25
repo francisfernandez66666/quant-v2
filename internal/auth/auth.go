@@ -93,6 +93,9 @@ type ConfigEntry struct {
 type DB struct {
 	Users   []User        `json:"users"`   // 全部用户列表
 	Configs []ConfigEntry `json:"configs"` // 用户/系统级配置项列表
+	// SchemaVersion §A1 库结构版本：兼容迁移只跑一次。此前迁移每次启动无条件把
+	// Enabled=false 改回 true——管理员禁用的账号重启即复活，封禁形同虚设。
+	SchemaVersion int `json:"schema_version,omitempty"`
 }
 
 // Manager 用户与登录认证管理器。
@@ -130,68 +133,81 @@ func (m *Manager) Init() error {
 	if err == nil {
 		m.db = &DB{}
 		if e := json.Unmarshal(data, m.db); e != nil {
-			// 数据库文件损坏：回退为空库，避免启动崩溃
-			m.db = &DB{}
+			// §A6 损坏保护（fail-closed）：坏文件改名保留并拒绝启动，绝不静默清空用户库——
+			// 清空会让 IsInitialized 归零、/setup 重新敞开被匿名者抢占重建 admin。
+			// English: corrupt auth.json is preserved (renamed) and startup FAILS instead of
+			// silently wiping all accounts, which would reopen /setup for a takeover.
+			ts := time.Now().Format("20060102-150405")
+			_ = os.Rename(m.dbPath, m.dbPath+".corrupt-"+ts)
+			return fmt.Errorf(
+				"auth.json 解析失败已备份为 %s.corrupt-%s；拒绝以空库启动（防止 /setup 被抢占）。"+
+					"确认备份后可删除该文件重新初始化", m.dbPath, ts)
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("read auth db: %w", err)
 	} else {
-		// 首次运行：创建空库并落盘
-		m.db = &DB{}
+		// 首次运行：创建空库并落盘（§A1 新库即标记当前版本，永不进兼容迁移分支）
+		m.db = &DB{SchemaVersion: 1}
 		return m.save()
 	}
 
-	// 兼容迁移：老库没有 Role/Enabled/Perms 字段，需补齐默认值并提升 admin
-	// （Compatibility migration: legacy dbs lack Role/Enabled/Perms; backfill defaults and promote admin.）
+	// 兼容迁移：老库没有 Role/Enabled/Perms 字段，需补齐默认值并提升 admin。
+	// §A1 修复：迁移只在 SchemaVersion<1 时执行一次——此前每次启动都强制 Enabled=true，
+	// SetEnabled(false) 的封禁在重启后失效。新库版本≥1 永不再进此分支。
+	// English: one-time legacy migration gated by SchemaVersion so disabled accounts stay disabled.
 	migrated := false
 	adminPromoted := false
-	for i := range m.db.Users {
-		u := &m.db.Users[i]
-		if u.Role == "" {
-			u.Role = RoleUser
-			migrated = true
-		}
-		if !u.Enabled && u.ID != "" {
-			u.Enabled = true
-			migrated = true
-		}
-		if u.Username == "admin" && u.Role != RoleAdmin && !adminPromoted {
-			u.Role = RoleAdmin
-			adminPromoted = true
-			migrated = true
-		}
-		if u.Perms == nil {
-			u.Perms = []string{}
-		}
-	}
-	// 无任何 admin 时，把最早创建的非临时用户提升为管理员，保证系统始终可管理
-	// （If no admin exists, promote the earliest non-temp user so the system stays manageable.）
-	if !adminPromoted {
+	if m.db.SchemaVersion < 1 {
 		for i := range m.db.Users {
 			u := &m.db.Users[i]
-			if u.Role == RoleAdmin {
+			if u.Role == "" {
+				u.Role = RoleUser
+				migrated = true
+			}
+			if !u.Enabled && u.ID != "" {
+				u.Enabled = true
+				migrated = true
+			}
+			if u.Username == "admin" && u.Role != RoleAdmin && !adminPromoted {
+				u.Role = RoleAdmin
 				adminPromoted = true
-				break
+				migrated = true
+			}
+			if u.Perms == nil {
+				u.Perms = []string{}
 			}
 		}
-	}
-	if !adminPromoted {
-		var earliest *User
-		for i := range m.db.Users {
-			u := &m.db.Users[i]
-			if strings.HasPrefix(u.ID, "tmp_") || u.Username == "" {
-				continue
-			}
-			if earliest == nil || u.CreatedAt < earliest.CreatedAt {
-				earliest = u
+		// 无任何 admin 时，把最早创建的非临时用户提升为管理员，保证系统始终可管理
+		// （If no admin exists, promote the earliest non-temp user so the system stays manageable.）
+		if !adminPromoted {
+			for i := range m.db.Users {
+				u := &m.db.Users[i]
+				if u.Role == RoleAdmin {
+					adminPromoted = true
+					break
+				}
 			}
 		}
-		if earliest != nil {
-			earliest.Role = RoleAdmin
-			adminPromoted = true
-			migrated = true
+		if !adminPromoted {
+			var earliest *User
+			for i := range m.db.Users {
+				u := &m.db.Users[i]
+				if strings.HasPrefix(u.ID, "tmp_") || u.Username == "" {
+					continue
+				}
+				if earliest == nil || u.CreatedAt < earliest.CreatedAt {
+					earliest = u
+				}
+			}
+			if earliest != nil {
+				earliest.Role = RoleAdmin
+				adminPromoted = true
+				migrated = true
+			}
 		}
-	}
+		m.db.SchemaVersion = 1
+		migrated = true
+	} // §A1 end SchemaVersion<1
 	if migrated {
 		if err := m.save(); err != nil {
 			return fmt.Errorf("migrate auth db: %w", err)
@@ -207,8 +223,17 @@ func (m *Manager) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.dbPath, data, 0644)
+	// §A3 0600：auth.json 含令牌与密码哈希，同机其他用户不可读
+	return os.WriteFile(m.dbPath, data, 0o600)
 }
+
+// tokenTTL §A3 访问令牌有效期：注册/创建默认 30 天，登录成功滑动续期。
+// 此前 TokenExp=0 永不过期且明文存 0644 文件——一次泄漏终身有效。
+// （不选"登录轮换新令牌"：会踢掉 APK 等其他已登录设备；滑动续期兼顾安全与多端。）
+const tokenTTL = 30 * 24 * time.Hour
+
+// newTokenExpiry 返回新的令牌过期时间戳。
+func newTokenExpiry() int64 { return time.Now().Add(tokenTTL).Unix() }
 
 // generateToken 生成 32 字节随机令牌的十六进制字符串（密码学安全随机源）。
 // （generateToken produces a hex string of a 32-byte random token from a cryptographic RNG.）
@@ -251,8 +276,8 @@ func (m *Manager) Register(username, password string) (*User, error) {
 		Username:     username,
 		PasswordHash: string(hash),
 		Token:        token,
-		TokenExp:     0,        // 0 表示令牌永不过期
-		Role:         RoleUser, // 注册用户默认为普通用户
+		TokenExp:     newTokenExpiry(), // §A3 默认 30 天（此前永不过期）
+		Role:         RoleUser,         // 注册用户默认为普通用户
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
 	}
@@ -297,10 +322,11 @@ func (m *Manager) CreateTemp(duration time.Duration) (*User, error) {
 // （Login verifies username+password and returns the matching user. Temp accounts have no password
 // hash, so password login is forbidden for them.）
 func (m *Manager) Login(username, password string) (*User, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	for _, u := range m.db.Users {
+	for i := range m.db.Users {
+		u := &m.db.Users[i]
 		if u.Username == username {
 			if u.PasswordHash == "" {
 				return nil, fmt.Errorf("cannot login with temp account")
@@ -314,10 +340,61 @@ func (m *Manager) Login(username, password string) (*User, error) {
 			if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
 				return nil, fmt.Errorf("wrong password")
 			}
-			return &u, nil
+			// §A3 滑动续期：剩余有效期不足一个完整周期时续满（活跃账号不过期；
+			// 写锁+落盘，多端共享同一令牌不受影响）。
+			if u.TokenExp > 0 && u.TokenExp-time.Now().Unix() < int64(tokenTTL/time.Second) {
+				u.TokenExp = newTokenExpiry()
+				if err := m.save(); err != nil {
+					return nil, err
+				}
+			}
+			return u, nil
 		}
 	}
 	return nil, fmt.Errorf("user not found")
+}
+
+// SetupInitialAdmin §A6 原子首次初始化：检查-创建-标记在同一临界区完成，
+// 杜绝 IsInitialized 与 CreateUser 之间的 TOCTOU（并发双 /setup 产生两个 admin）。
+// English: atomic first-run setup — the initialized-check, admin creation and marker land in one
+// critical section, closing the TOCTOU window that allowed duplicate admins.
+func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.db.Configs {
+		if c.Key == "initialized" {
+			return nil, fmt.Errorf("already initialized")
+		}
+	}
+	for i := range m.db.Users {
+		if u := &m.db.Users[i]; u.Role == RoleAdmin && !strings.HasPrefix(u.ID, "tmp_") {
+			return nil, fmt.Errorf("already initialized")
+		}
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+	token, err := generateToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate token: %w", err)
+	}
+	user := User{
+		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
+		Username:     username,
+		PasswordHash: string(hash),
+		Token:        token,
+		TokenExp:     newTokenExpiry(),
+		Role:         RoleAdmin,
+		Enabled:      true,
+		CreatedAt:    time.Now().Unix(),
+	}
+	m.db.Users = append(m.db.Users, user)
+	m.db.Configs = append(m.db.Configs, ConfigEntry{UserID: user.ID, Key: "initialized", Value: "1"})
+	if err := m.save(); err != nil {
+		return nil, err
+	}
+	return &user, nil
 }
 
 // ValidateToken 校验令牌是否有效并返回对应未过期用户。
@@ -570,6 +647,7 @@ func (m *Manager) CreateUser(username, password, role string, perms []string, ex
 		Username:     username,
 		PasswordHash: string(hash),
 		Token:        token,
+		TokenExp:     newTokenExpiry(), // §A3 默认 30 天
 		Role:         role,
 		Perms:        perms,
 		Enabled:      true,

@@ -96,6 +96,7 @@ type Server struct {
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
 	runtimeURL string     // 运行时实际使用的 API 地址
+	limiter    ipLimiter  // §A4 匿名端点 IP 频控（register/temp/login/setup）
 
 	calMu         sync.Mutex // 保护日历缓存的互斥锁
 	macroCache    []data.MacroEvent
@@ -539,8 +540,13 @@ type registerReq struct {
 // handleRegister 处理 POST /auth/register：创建用户并返回 token 与用户 ID。
 // 用户名/密码缺失返回 400；用户名已存在返回 409。
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	// §A4 频控：注册 5 次/分/IP（此前匿名无限调用可灌爆用户库+枚举用户名）
+	if !s.limiter.allow(clientIP(r), 5, time.Minute) {
+		writeError(w, 429, "too many attempts")
+		return
+	}
 	var req registerReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
@@ -562,6 +568,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 // handleTemp 处理 POST /auth/temp：创建有效期 14 天的临时演示账号，返回 token/ID/过期时间。
 func (s *Server) handleTemp(w http.ResponseWriter, r *http.Request) {
+	if !s.limiter.allow(clientIP(r), 5, time.Minute) { // §A4
+		writeError(w, 429, "too many attempts")
+		return
+	}
 	user, err := s.auth.CreateTemp(14 * 24 * time.Hour)
 	if err != nil {
 		writeError(w, 500, "create temp account failed")
@@ -581,10 +591,15 @@ type loginReq struct {
 }
 
 // handleLogin 处理 POST /auth/login（/api/auth/login 同路由）：校验凭据并返回 token/ID/账号名。
-// 凭据错误返回 401。
+// 凭据错误返回 401。§A4 频控 10 次/分/IP（防撞库+bcrypt CPU 放大 DoS）；
+// 错误文案统一 "invalid credentials"（此前区分"用户不存在/密码错"可枚举用户名）。
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.limiter.allow(clientIP(r), 10, time.Minute) {
+		writeError(w, 429, "too many attempts")
+		return
+	}
 	var req loginReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
@@ -595,7 +610,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	user, err := s.auth.Login(req.Username, req.Password)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		// §A4 统一文案：不区分"用户不存在/密码错"，阻断用户名枚举
+		writeError(w, 401, "invalid credentials")
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{
@@ -626,15 +642,16 @@ type setupReq struct {
 
 // handleSetupSubmit 处理 POST /setup：完成首次初始化。
 // 创建管理员账号，将非空的 LLM/Tushare 配置写入用户配置，并标记系统已初始化。
-// 已初始化时返回 400 拒绝重复配置。
+// §A6 改造：检查-创建-标记经 Manager.SetupInitialAdmin 原子完成（此前 IsInitialized 与
+// CreateUser 之间存在 TOCTOU，并发双请求可产生两个 admin）；已初始化返回 400。
 func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
-	if s.auth.IsInitialized() {
-		writeError(w, 400, "already initialized")
+	if !s.limiter.allow(clientIP(r), 5, time.Minute) {
+		writeError(w, 429, "too many attempts")
 		return
 	}
 
 	var req setupReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
@@ -644,9 +661,13 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.auth.CreateUser(req.Username, req.Password, auth.RoleAdmin, nil, 0)
+	user, err := s.auth.SetupInitialAdmin(req.Username, req.Password)
 	if err != nil {
-		writeError(w, 409, err.Error())
+		if strings.Contains(err.Error(), "already initialized") {
+			writeError(w, 409, "already initialized")
+			return
+		}
+		writeError(w, 500, err.Error())
 		return
 	}
 
@@ -659,12 +680,57 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 	if req.TushareToken != "" {
 		s.auth.SetConfig(user.ID, "tushare_token", req.TushareToken)
 	}
-	s.auth.MarkInitialized()
 
 	writeJSON(w, 200, map[string]interface{}{
 		"token": user.Token,
 		"id":    user.ID,
 	})
+}
+
+// ── §A4 匿名端点 IP 频控 ────────────────────────────────────────────────
+// register/temp/login/setup 完全开放且无频控：可被脚本灌号+撞库。进程内滑动窗口
+// 计数器（单实例部署足够；多实例需外置网关）。
+
+type ipLimiter struct {
+	mu   sync.Mutex
+	hits map[string][]time.Time
+}
+
+// allow 滑动窗口判定：window 内该 IP 已达 max 次则拒绝。
+func (l *ipLimiter) allow(ip string, max int, window time.Duration) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.hits == nil {
+		l.hits = make(map[string][]time.Time)
+	}
+	recent := l.hits[ip][:0]
+	for _, t := range l.hits[ip] {
+		if now.Sub(t) < window {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= max {
+		l.hits[ip] = recent
+		return false
+	}
+	l.hits[ip] = append(recent, now)
+	return true
+}
+
+// clientIP 提取请求来源 IP（X-Forwarded-First 优先——Caddy 反代场景）。
+func clientIP(r *http.Request) string {
+	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+		if i := strings.IndexByte(xf, ','); i > 0 {
+			return strings.TrimSpace(xf[:i])
+		}
+		return strings.TrimSpace(xf)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // ── API middleware ──
@@ -1010,11 +1076,35 @@ type updatePositionReq struct {
 	Name          *string  `json:"name,omitempty"`
 }
 
+// ownsPosition §A2 归属校验：持仓记录属于当前登录用户（或 admin 全权）才可写。
+// 此前三写接口（update/delete/exit）只认路径 id 不看归属——任意注册用户可改/删/
+// 平仓他人持仓（IDOR）。空 UserID 的系统级记录仅 admin 可动。
+// English: ownership gate for the position write APIs — closes an IDOR where any logged-in
+// user could mutate another account's positions.
+func (s *Server) ownsPosition(r *http.Request, id string) bool {
+	u := userFromContext(r)
+	if u == nil {
+		return false
+	}
+	if u.Role == auth.RoleAdmin {
+		return true
+	}
+	log := s.rpt.FindBySignalID(id)
+	if log == nil {
+		return true // 不存在：放行让下游自行处理，不提前泄露存在性
+	}
+	return log.UserID != "" && log.UserID == u.ID // 空 UserID=系统级记录，仅 admin 可动
+}
+
 // handleUpdatePosition 处理 PUT /api/positions/{id}：按 ID 更新持仓的止盈/止损/名称字段。
 func (s *Server) handleUpdatePosition(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.ownsPosition(r, id) {
+		writeError(w, 403, "not your position")
+		return
+	}
 	var req updatePositionReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
@@ -1032,23 +1122,31 @@ func (s *Server) handleUpdatePosition(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-// handleDeletePosition 处理 DELETE /api/positions/{id}：软删除指定持仓记录。
-func (s *Server) handleDeletePosition(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	s.rpt.Delete(id)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
-}
-
 // exitPositionReq 平仓请求体：平仓价格。
 type exitPositionReq struct {
 	ExitPrice float64 `json:"exit_price"`
 }
 
+// handleDeletePosition 处理 DELETE /api/positions/{id}：软删除指定持仓记录。
+func (s *Server) handleDeletePosition(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.ownsPosition(r, id) { // §A2
+		writeError(w, 403, "not your position")
+		return
+	}
+	s.rpt.Delete(id)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
 // handleExitPosition 处理 POST /api/positions/{id}/exit：按平仓价计算盈亏并标记止盈/止损。
 func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.ownsPosition(r, id) { // §A2
+		writeError(w, 403, "not your position")
+		return
+	}
 	var req exitPositionReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}

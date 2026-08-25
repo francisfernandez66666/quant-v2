@@ -3,6 +3,8 @@ package auth
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -145,7 +147,8 @@ func TestInitializedFlow(t *testing.T) {
 	}
 }
 
-// TestCorruptDB 破坏的 auth.json 应回退为空库而非崩溃。
+// TestCorruptDB §A6 损坏的 auth.json：坏文件改名保留 + Init 报错拒绝启动
+// （fail-closed——静默清空会让 /setup 重新敞开被抢占接管）。
 func TestCorruptDB(t *testing.T) {
 	dir := t.TempDir()
 	target := &Manager{dataDir: dir, dbPath: dir + "/auth.json"}
@@ -154,11 +157,20 @@ func TestCorruptDB(t *testing.T) {
 	_ = os.WriteFile(target.dbPath, write, 0644)
 
 	m := NewManager(dir)
-	if err := m.Init(); err != nil {
-		t.Fatalf("损坏库 Init 不应报错: %v", err)
+	err := m.Init()
+	if err == nil {
+		t.Fatal("损坏库 Init 应报错（fail-closed）")
 	}
-	if m.db == nil {
-		t.Fatal("损坏库应回退为空库")
+	if !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("错误信息应说明备份位置, got %v", err)
+	}
+	// 坏文件已改名保留，可人工恢复
+	if _, statErr := os.Stat(dir + "/auth.json"); statErr == nil {
+		t.Fatal("损坏文件应已改名移走")
+	}
+	matches, _ := filepath.Glob(dir + "/auth.json.corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("应保留一份 corrupt 备份, got %v", matches)
 	}
 }
 
@@ -353,5 +365,69 @@ func TestUserExpiry(t *testing.T) {
 	}
 	if err := m.SetExpiry(adm.ID, 30); err == nil {
 		t.Fatal("管理员不应允许设置有限有效期")
+	}
+}
+
+// TestDisabledAccountStaysDisabled §A1：管理员禁用的账号重启后必须保持禁用
+// （旧迁移每次启动强制 Enabled=true，封禁形同虚设）。
+func TestDisabledAccountStaysDisabled(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	if err := m.Init(); err != nil {
+		t.Fatal(err)
+	}
+	u, err := m.CreateUser("bob", "pw", RoleUser, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetEnabled(u.ID, false); err != nil {
+		t.Fatal(err)
+	}
+
+	m2 := NewManager(dir)
+	if err := m2.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if got := m2.ValidateToken(u.Token); got != nil {
+		t.Fatal("重启后禁用账号的令牌应仍失效")
+	}
+	for _, x := range m2.db.Users {
+		if x.ID == u.ID && x.Enabled {
+			t.Fatal("重启后禁用账号不得被迁移复活")
+		}
+	}
+	// 禁用用户登录同样拒绝
+	if _, err := m2.Login("bob", "pw"); err == nil {
+		t.Fatal("禁用账号登录应失败")
+	}
+}
+
+// TestTokenExpiryAndSlidingRenewal §A3：新令牌默认 30 天；登录滑动续期。
+func TestTokenExpiryAndSlidingRenewal(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	_ = m.Init()
+	u, err := m.Register("carol", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Now().Add(tokenTTL).Unix()
+	if u.TokenExp == 0 || u.TokenExp < want-60 || u.TokenExp > want+60 {
+		t.Fatalf("注册令牌应约 30 天过期, got %d (want≈%d)", u.TokenExp, want)
+	}
+	// 手动把剩余有效期压到 1 小时 → 登录后续满
+	m.mu.Lock()
+	u.TokenExp = time.Now().Add(time.Hour).Unix()
+	m.mu.Unlock()
+	if _, err := m.Login("carol", "pw"); err != nil {
+		t.Fatal(err)
+	}
+	fresh := m.ValidateToken(u.Token)
+	if fresh == nil {
+		t.Fatal("登录续期后令牌应有效")
+	}
+	got := fresh.TokenExp
+	if got < want-60 || got > want+60 {
+		t.Fatalf("登录后令牌应续满 30 天, got %d", got)
 	}
 }
