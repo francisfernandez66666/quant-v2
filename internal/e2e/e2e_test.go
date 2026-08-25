@@ -521,7 +521,7 @@ func TestEndToEndFullPipeline(t *testing.T) {
 		//    因此此处断言：凡产出的 N 形做多信号必须带一突/二突标记（证明走打标路径，而非绕过闸门）。
 		var nSig int
 		for _, s := range dash.FinalSignals {
-			if s.Strategy == "n_shape" && s.Direction == "做多" {
+			if (s.Strategy == "N形" || s.Strategy == "n_shape") && s.Direction == "做多" {
 				nSig++
 				t.Logf("N形信号 %s(%s) 分=%.0f tag=%s %s", s.Code, s.Name, s.Confidence*100, s.Tag, s.Reason)
 				if s.Tag != "一突" && s.Tag != "二突" {

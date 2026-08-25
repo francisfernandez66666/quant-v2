@@ -182,11 +182,15 @@ func (failStrategy) GenerateSignal(string, *strategy.Evaluation) (*strategy.Sign
 	return nil, nil
 }
 
-// TestScorePoolMomentumSignal 验证 Q2：四战法均不通过但动量分达阈值时，ScorePool 补发动量 watch 信号。
-// English: TestScorePoolMomentumSignal verifies Q2: when all four strategies fail but the momentum score reaches the threshold, ScorePool re-emits a momentum watch signal.
+// TestScorePoolMomentumSignal 验证 Q2：四战法均不通过但动量分达阈值时，ScorePool 补发动量信号。
+// §动量入模拟盘：≥ 买入阈值(默认75) → buy（带 StrategyType=momentum 归动量池）；
+// 观察阈值 ≤ 分 < 买入阈值 → watch。
+// English: verifies Q2 — buy at/above the buy threshold (StrategyType=momentum, routed to the paper
+// momentum pool), watch between thresholds.
 func TestScorePoolMomentumSignal(t *testing.T) {
 	mc := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
 	mc.Momentum.SignalThreshold = 60
+	mc.Momentum.BuySignalThreshold = 75
 	a := New(mc)
 	a.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: failStrategy{}}})
 
@@ -205,8 +209,25 @@ func TestScorePoolMomentumSignal(t *testing.T) {
 	if !sc.MomentumValid {
 		t.Fatalf("强多头数据应判为动量数据完整")
 	}
-	if len(sigs) != 1 || sigs[0].Strategy != "动量" || sigs[0].Action != "watch" {
-		t.Fatalf("应补发动量watch信号, got %+v", sigs)
+	// 动量分 ≥75 → buy 级信号，携带 StrategyType=momentum（模拟盘归动量池）
+	// English: score >=75 → buy signal carrying StrategyType=momentum.
+	if len(sigs) != 1 || sigs[0].Strategy != "动量" || sigs[0].Action != "buy" {
+		t.Fatalf("动量%d≥买入阈值75应发buy信号, got %+v", int(sc.MomentumScore), sigs)
+	}
+	if sigs[0].StrategyType != "momentum" {
+		t.Fatalf("动量buy信号应携带 StrategyType=momentum, got %q", sigs[0].StrategyType)
+	}
+
+	// 买入阈值抬到分数之上 → 回落为 watch 档
+	// English: raising the buy threshold above the score downgrades to the watch tier.
+	mc2 := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
+	mc2.Momentum.SignalThreshold = 60
+	mc2.Momentum.BuySignalThreshold = 99
+	a2 := New(mc2)
+	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: failStrategy{}}})
+	_, sigsWatch := a2.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": md}, nil, "")
+	if len(sigsWatch) != 1 || sigsWatch[0].Action != "watch" {
+		t.Fatalf("低于买入阈值应回落watch, got %+v", sigsWatch)
 	}
 }
 

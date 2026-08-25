@@ -41,9 +41,10 @@ func New(cfg *config.Manager, matcher *data.EventMatcher) *NShapeStrategy {
 	}
 }
 
-// Name 返回策略中文名称"N形超短"。（Name returns the strategy display name "N形超短".）
-func (n *NShapeStrategy) Name() string {
-	return "N形超短"
+// Name 返回策略中文名称"N形"（§名称规整：与配置白名单/模拟盘池名统一，旧名"N形超短"作别名兼容）。
+// （Name returns the strategy display name "N形"; the legacy "N形超短" is accepted as an alias.）
+func (s *NShapeStrategy) Name() string {
+	return "N形"
 }
 
 // Type 返回信号类型标识 SignalNShape。（Type returns the signal type SignalNShape.）

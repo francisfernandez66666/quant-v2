@@ -60,7 +60,7 @@ func runMomentumPool(t *testing.T, cfg *config.StrategyConfig, mds ...*strategy_
 		_, sigs := a.ScorePool([]string{"600901"}, pool, map[string]D1Score{}, "")
 		hit := false
 		for _, s := range sigs {
-			if s.Code == "600901" && s.Strategy == "dragon" && s.Action == "buy" {
+			if s.Code == "600901" && s.Strategy == "龙头" && s.Action == "buy" {
 				hit = true
 			}
 		}

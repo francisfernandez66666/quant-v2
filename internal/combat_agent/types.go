@@ -11,6 +11,7 @@ import (
 
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/sector_agent"
+	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -89,13 +90,12 @@ type Signal struct {
 	// strategy rule for effectiveness monitoring. Populated only for multi-rule strategies (factor library).
 	StrategyID string `json:"strategy_id,omitempty"`
 
-	// StrategyType 战法来源类型（runner 类型：dragon/double_bump/n_shape/dragon_return/factor/pattern）。
+	// StrategyType 战法来源类型（runner 类型：dragon/double_bump/n_shape/dragon_return/momentum/factor 规则ID/pattern 规则ID）。
 	// 用于模拟盘战法分仓：paper 引擎据此把信号归入对应战法资金池（buy 只扣本池现金）。
-	// 仅 8a/8b 战法信号填充；watch 级信号（龙头识别/预期差/动量等）为空，走"其他池"。
-	// English: source strategy type (runner type: dragon/double_bump/n_shape/dragon_return/factor/pattern).
-	// Used by the paper engine's strategy-pool allocation: a buy signal debits only its own strategy's
-	// cash pool. Populated for 8a/8b strategy signals; watch-level signals (leader/expectation-gap/
-	// momentum) are empty and fall into the "other" pool.
+	// §动量入模拟盘：momentum 信号（watch/buy）统一携带 "momentum"，归动量池。
+	// English: source strategy type (dragon/double_bump/n_shape/dragon_return/momentum/factor rule ID/
+	// pattern rule ID) used by the paper engine's strategy-pool allocation. Momentum signals now carry
+	// "momentum" so their buys route to the momentum pool.
 	StrategyType string `json:"strategy_type,omitempty"`
 
 	// D1 事件信息（新闻归因/LLM 分析，区别于策略 Reason）：
@@ -146,4 +146,47 @@ type NDiag struct {
 	Tag    string  `json:"tag,omitempty"`    // 信号标记（一突/二突）
 	Pass   bool    `json:"pass"`             // 本轮是否 Pass
 	Reason string  `json:"reason,omitempty"` // 拦截原因（d1=0/total_below/emotion 等）
+}
+
+// ── §战法名称规整：全链路唯一口径 ──
+//
+// 历史上 Signal.Strategy 混用英文 runner 类型（dragon/double_bump/n_shape/dragon_return）
+// 与中文名（动量/龙头识别/预期差/因子战法#N），模拟盘池名又是第三套（poolkey.go）。
+// 现统一：规范展示名 = 龙头 / 双响炮 / N形 / 龙回头 / 动量；规则池沿用规则名（fac_N 的库名）。
+// English: canonical display-name registry — signals, paper pools, UI and configs share one naming
+// scheme; rule pools keep their library names.
+
+// StrategyDisplayName 战法类型 → 规范展示名。未知类型原样返回。
+func StrategyDisplayName(t string) string {
+	switch strategy.SignalType(t) {
+	case strategy.SignalDragon:
+		return "龙头"
+	case strategy.SignalDoubleBump:
+		return "双响炮"
+	case strategy.SignalNShape:
+		return "N形"
+	case strategy.SignalDragonReturn:
+		return "龙回头"
+	case strategy.SignalMomentum:
+		return "动量"
+	}
+	return t
+}
+
+// NormalizeStrategyName 任意别名（英文名/旧中文变体）→ 规范展示名。无法识别原样返回
+// （因子/形态规则名、龙头识别等特例不受影响）。
+func NormalizeStrategyName(name string) string {
+	switch name {
+	case "dragon", "龙头":
+		return "龙头"
+	case "double_bump", "DoubleBump", "双响炮", "双突破", "双凸":
+		return "双响炮"
+	case "n_shape", "NShape", "N形超短", "N字型", "N字":
+		return "N形"
+	case "dragon_return", "DragonReturn", "龙回头":
+		return "龙回头"
+	case "momentum", "Momentum", "动量":
+		return "动量"
+	}
+	return name
 }

@@ -273,17 +273,21 @@ func LibraryLabelResolver(dataDir string) func(string) string {
 }
 
 // ActivePaperPoolTypes 构建"当前启用战法"资金池类型列表：
-// 4 形态战法恒启用；factor/pattern 视 research 是否有启用规则才计入（当前唯一因子规则=波动突破 → factor 池激活）。
+// 5 基础战法（四形态+动量）恒启用；factor/pattern 视 research 是否有启用规则才计入
+// （当前唯一因子规则=波动突破 → factor 池激活）。§动量入模拟盘：momentum 池随基础类型
+// 恒开立，动量 buy 信号自动归池撮合。
 // 供 quant 启动与战法库热加载注入 registry.SetPaperPools（分仓防单战法垄断）。
-// English: builds the "currently enabled strategies" pool-type list — the four pattern strategies are
-// always on; factor/pattern join only when the research store has enabled rules (the sole enabled rule
-// today, 波动突破, activates the factor pool). Feeds registry.SetPaperPools at startup and hot reload.
+// English: builds the "currently enabled strategies" pool-type list — the four pattern strategies plus
+// momentum are always on; factor/pattern join only when the research store has enabled rules (the sole
+// enabled rule today, 波动突破, activates the factor pool). Feeds registry.SetPaperPools at startup
+// and hot reload.
 func ActivePaperPoolTypes(dataDir string) []string {
 	types := []string{
 		string(strategy.SignalDragon),
 		string(strategy.SignalDoubleBump),
 		string(strategy.SignalNShape),
 		string(strategy.SignalDragonReturn),
+		string(strategy.SignalMomentum),
 	}
 	// §C 规则细分池：每条启用规则独立成池（fac_1/pat_2 即池 key），不再用聚合池。
 	// 信号端 StrategyType 已改填规则 ID（combat_agent.libraryIDFromMeta），归池一一对应；

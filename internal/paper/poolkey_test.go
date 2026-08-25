@@ -20,6 +20,12 @@ func TestPoolKeyForStrategy(t *testing.T) {
 		{"龙头", "", "dragon"},
 		{"N形", "", "n_shape"},
 		{"龙回头", "", "dragon_return"},
+		{"动量", "", "momentum"}, // §动量入模拟盘
+		// §名称规整：中英别名同口径
+		{"N形超短", "", "n_shape"},
+		{"双突破", "", "double_bump"},
+		{"dragon", "", "dragon"},
+		{"momentum", "", "momentum"},
 		{"未知战法", "", ""},              // 无法识别 → 其他池（调用方不得下发）
 		{"随便什么名", "fac_99", "fac_99"}, // kind 前缀压过显示名
 	}

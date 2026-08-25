@@ -105,7 +105,7 @@ func dbScorePool(t *testing.T, md *strategy_engine.StockMarketData) []Signal {
 func TestDoubleBumpWaitForSecondWave(t *testing.T) {
 	sigs := dbScorePool(t, mkDBWaveMD(11.2, 2_000_000)) // 仅一突
 	for _, s := range sigs {
-		if s.Code == "600900" && s.Strategy == "double_bump" && s.Action == "buy" {
+		if s.Code == "600900" && s.Strategy == "双响炮" && s.Action == "buy" {
 			t.Fatalf("未到第二波不应发双响炮买入信号, got %+v", s)
 		}
 	}
@@ -127,7 +127,7 @@ func TestDoubleBumpConfirmSecondWave(t *testing.T) {
 
 	found := false
 	for _, s := range sigs {
-		if s.Code == "600900" && s.Strategy == "double_bump" {
+		if s.Code == "600900" && s.Strategy == "双响炮" {
 			if s.Action != "buy" {
 				t.Fatalf("到达第二波应发买入信号, got %+v", s)
 			}

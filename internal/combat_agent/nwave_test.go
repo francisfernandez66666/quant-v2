@@ -148,7 +148,7 @@ func TestScorePoolN1BreakoutEmit(t *testing.T) {
 
 	found := false
 	for _, s := range sigs {
-		if s.Code == "600899" && s.Strategy == "n_shape" && s.Action == "buy" && s.Tag == "一突" {
+		if s.Code == "600899" && s.Strategy == "N形" && s.Action == "buy" && s.Tag == "一突" {
 			found = true
 		}
 	}
@@ -174,7 +174,7 @@ func TestScorePoolN1LowTotalSuppressed(t *testing.T) {
 	_, sigs := a.ScorePool([]string{"600899"}, pool, d1Scores, "")
 
 	for _, s := range sigs {
-		if s.Code == "600899" && s.Strategy == "n_shape" && (s.Tag == "一突" || s.Action == "buy") {
+		if s.Code == "600899" && s.Strategy == "N形" && (s.Tag == "一突" || s.Action == "buy") {
 			t.Fatalf("总分<60 时一突不应发 buy 信号, got %+v", s)
 		}
 	}
@@ -192,7 +192,7 @@ func TestScorePoolN1NoD1Suppressed(t *testing.T) {
 
 	_, sigs := a.ScorePool([]string{"600899"}, pool, d1Scores, "")
 	for _, s := range sigs {
-		if s.Code == "600899" && s.Strategy == "n_shape" {
+		if s.Code == "600899" && s.Strategy == "N形" {
 			t.Fatalf("D1=0 不应发 N 形买入信号, got %+v", s)
 		}
 	}

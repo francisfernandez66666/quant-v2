@@ -441,6 +441,11 @@ type MomentumConfig struct {
 	MACDWeight        float64 `json:"macd_weight"`         // MACD分权重（0~100）
 	TrendWeight       float64 `json:"trend_weight"`        // 走势分权重（0~100）
 	SignalThreshold   float64 `json:"signal_threshold"`    // 动量分触发信号阈值（默认 60）
+	// BuySignalThreshold 动量买入阈值：动量分 ≥ 此值且数据有效时发 buy 级信号（进模拟盘自动撮合，
+	// 归动量池）。默认 75（高于 watch 阈值 60 一档，避免动量信号大量直接转买单）；≤0 时回退默认。
+	// English: momentum BUY threshold — score at/above this (with valid data) emits a buy signal that
+	// the paper engine auto-fills into the momentum pool. Default 75; <=0 falls back to default.
+	BuySignalThreshold float64 `json:"buy_signal_threshold"`
 	// MomentumGateEnabled 动量分"提升才提醒"门槛开关：开启后仅当动量分明显提升时
 	// 才放行 double_bump/龙头/龙回头 战法信号（N 形不套用）。可热更新，前端 Settings 动量分组内开关控制。
 	// English: momentum-gate switch — when on, only a meaningful momentum-score improvement lets the
@@ -1140,6 +1145,7 @@ func defaultStrategyConfig() StrategyConfig {
 			MACDWeight:          30,
 			TrendWeight:         30,
 			SignalThreshold:     60,
+			BuySignalThreshold:  75,  // 动量买入阈值：≥75 发 buy 进模拟盘动量池（§动量入模拟盘）
 			MomentumGateEnabled: true, // 动量"提升才提醒"默认开启
 			MomentumDeltaTol:    5,
 		},

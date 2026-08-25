@@ -613,3 +613,35 @@ func TestAddToPoolPosition(t *testing.T) {
 		t.Errorf("加权均价应为 11, 实际 %.2f", got)
 	}
 }
+
+// TestMomentumPoolRouting 验证 §动量入模拟盘：momentum buy 信号归动量池撮合，
+// 池现金扣减、池持仓统计正确；未开 momentum 池时安全跳过（不留仓）。
+// English: verifies momentum buy signals route to the momentum pool (cash debited, stats correct);
+// without the pool the signal is safely skipped.
+func TestMomentumPoolRouting(t *testing.T) {
+	c := testCfg()
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape", "momentum"})
+	now := time.Now()
+	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10}}
+	sig := combat_agent.Signal{
+		Code: "600000.SH", Name: "浦发", Strategy: "动量", StrategyType: "momentum",
+		Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now,
+	}
+	e.OnSignals([]combat_agent.Signal{sig}, quotes)
+	ns := e.PoolStats("momentum")
+	if ns.OpenPositions != 1 {
+		t.Fatalf("动量buy应归动量池开仓, 实际 %d", ns.OpenPositions)
+	}
+	if e.PoolStats("n_shape").OpenPositions != 0 {
+		t.Fatal("n_shape 池不应受动量信号影响")
+	}
+
+	// 未开 momentum 池 → 跳过
+	e2 := New(c, "")
+	e2.SetStrategyPools([]string{"n_shape"})
+	e2.OnSignals([]combat_agent.Signal{sig}, quotes)
+	if len(e2.Positions()) != 0 {
+		t.Fatalf("未开动量池时不应建仓, 实际 %d", len(e2.Positions()))
+	}
+}

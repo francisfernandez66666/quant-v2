@@ -18,6 +18,7 @@ const (
 	SignalShortSkeleton SignalType = "short_skeleton" // 做空骨架（Short-sell skeleton）
 	SignalFactor        SignalType = "factor"         // 因子战法（E6：自动发现的因子组合，实盘信号）（Factor strategy, E6）
 	SignalPattern       SignalType = "pattern"        // 形态战法（F3：自动发现的形态模板，实盘信号）（Pattern strategy, F3）
+	SignalMomentum      SignalType = "momentum"       // 动量（量价齐升观察/买入，§动量入模拟盘）
 )
 
 // TradeAction 交易动作类型。（TradeAction is a trade action type.）

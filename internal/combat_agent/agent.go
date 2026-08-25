@@ -870,11 +870,17 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 		if sigID != "" && (runner.Type == strategy.SignalFactor || runner.Type == strategy.SignalPattern) {
 			poolType = sigID
 		}
+		// §名称规整：内置战法未显式命名时用规范展示名（龙头/双响炮/N形/龙回头），
+		// 不再回退英文 runner 类型；库规则沿用规则名。
+		displayName := sig.StrategyName
+		if displayName == "" {
+			displayName = StrategyDisplayName(string(runner.Type))
+		}
 		sigs = append(sigs, Signal{
 			ID:           seqID(),
 			Code:         code,
 			Name:         orDefault(sig.Name, md.Name),
-			Strategy:     orDefault(sig.StrategyName, string(runner.Type)),
+			Strategy:     displayName,
 			StrategyID:   sigID,
 			StrategyType: poolType,
 			Direction:    direction,
@@ -895,26 +901,34 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	sc.MomentumValid = momentumValid
 	sc.SignalActive = len(sigs) > 0
 
-	// Q2: 动量分达到阈值且四战法均未出信号时，补一条 watch 观察信号
-	// （量价齐升/资金流入但战法形态未确认，仅观察不自动交易）
+	// Q2: 动量分达到阈值且四战法均未出信号时，补一条动量信号（§动量入模拟盘）：
+	//   ≥ 买入阈值 → Action=buy（进模拟盘自动撮合，归 momentum 池）
+	//   ≥ 观察阈值但 < 买入阈值 → Action=watch（仅观察不自动交易）
 	// 门控 sc.MomentumValid：竞价/盘前今日成交量=0 时动量数据不完整（无真实成交），
-	// 不发存量历史数据凑出来的动量 watch，等 9:30 实盘有成交量后再出。
-	// English: Q2 — when momentum reaches the threshold but none of the four strategies fired, emit a
-	// watch-only signal (volume/price rising but pattern unconfirmed, no auto trade). Gated on MomentumValid
-	// because pre-open volume of 0 makes momentum data incomplete; wait for real volume after 09:30.
+	// 不发存量历史数据凑出来的动量信号，等 9:30 实盘有成交量后再出。
+	// English: Q2 — when momentum reaches the threshold but no other strategy fired, emit a momentum
+	// signal: buy at/above the buy threshold (auto-filled into the paper momentum pool), watch between
+	// the watch and buy thresholds. Gated on MomentumValid (pre-open volume of 0 = incomplete data).
 	if len(sigs) == 0 && sc.MomentumValid && sc.MomentumScore >= a.momentumSignalThreshold() {
+		action := "watch"
+		reasonPrefix := ""
+		if sc.MomentumScore >= a.momentumBuySignalThreshold() {
+			action = "buy"
+			reasonPrefix = fmt.Sprintf("强动量%.0f≥%.0f ", sc.MomentumScore, a.momentumBuySignalThreshold())
+		}
 		sigs = append(sigs, Signal{
-			ID:          seqID(),
-			Code:        code,
-			Name:        md.Name,
-			Strategy:    "动量",
-			Direction:   direction,
-			Action:      "watch",
-			Price:       md.Price,
-			Confidence:  sc.MomentumScore / 100.0,
-			Reason:      fmt.Sprintf("动量%.0f 量价齐升(MA+MACD+走势)", sc.MomentumScore),
-			Sector:      sectorName,
-			GeneratedAt: now,
+			ID:           seqID(),
+			Code:         code,
+			Name:         md.Name,
+			Strategy:     StrategyDisplayName(string(strategy.SignalMomentum)),
+			StrategyType: string(strategy.SignalMomentum),
+			Direction:    direction,
+			Action:       action,
+			Price:        md.Price,
+			Confidence:   sc.MomentumScore / 100.0,
+			Reason:       fmt.Sprintf("%s动量%.0f 量价齐升(MA+MACD+走势)", reasonPrefix, sc.MomentumScore),
+			Sector:       sectorName,
+			GeneratedAt:  now,
 		})
 		sc.SignalActive = true
 	} else if len(sigs) == 0 && sc.MomentumScore >= a.momentumSignalThreshold() && !sc.MomentumValid {
@@ -1012,6 +1026,21 @@ func (a *Agent) momentumSignalThreshold() float64 {
 		return 60
 	}
 	return w.SignalThreshold
+}
+
+// momentumBuySignalThreshold 读取动量买入阈值（默认 75，且不低于 watch 阈值）。
+// §动量入模拟盘：≥此值发 buy 级信号进模拟盘动量池自动撮合；≤0 回退默认。
+// English: reads the momentum BUY threshold (default 75, never below the watch threshold; <=0 falls
+// back). At/above it a buy signal is emitted and auto-filled into the paper momentum pool.
+func (a *Agent) momentumBuySignalThreshold() float64 {
+	w := a.momentumWeights()
+	if w.BuySignalThreshold <= 0 {
+		return 75
+	}
+	if w.BuySignalThreshold < a.momentumSignalThreshold() {
+		return a.momentumSignalThreshold()
+	}
+	return w.BuySignalThreshold
 }
 
 // momentumGateEnabled 读取动量分"提升才提醒"门槛开关（默认开）。

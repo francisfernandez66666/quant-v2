@@ -618,11 +618,15 @@ function tradeSlippageCls(t) {
   if (t.side !== 'buy' || !(t.signal_price > 0)) return ''
   return t.price >= t.signal_price ? 'down' : 'up'
 }
-// 战法池展示名（空=其他/手动；与后端 strategyPoolLabel 保持一致。§命名纠错：dragon=龙头）
+// 战法池展示名（空=其他/手动；与后端 strategyPoolLabel 保持一致。§命名纠错：dragon=龙头。
+// §名称规整：n_shape 统一"N形"，新增 momentum=动量）
 function poolLabel(k) {
   if (!k) return '其他/手动'
-  const labels = { dragon: '龙头', double_bump: '双响炮', n_shape: 'N形超短', dragon_return: '龙回头' }
-  return labels[k] || k
+  const labels = { dragon: '龙头', double_bump: '双响炮', n_shape: 'N形', dragon_return: '龙回头', momentum: '动量' }
+  if (labels[k]) return labels[k]
+  if (/^fac_/.test(k)) return '因子·' + k
+  if (/^pat_/.test(k)) return '形态·' + k
+  return k
 }
 
 // 池 key 规范化：空串（其他/手动池）映射为占位 '__other__'，避免与"全部(null)"冲突。

@@ -16,22 +16,26 @@ import (
 // §C 规则细分池：库规则的 kind（fac_1/pat_2）**本身就是池 key**——每条规则独立寻优、
 // 独立资金池、独立纪律；内置战法按显示名映射到类型池；无法识别返回 ""（其他/手动池，
 // 调用方不应向该池下发纪律）。旧 factor/pattern 聚合池仅承载存量持仓，不再新建。
+// §名称规整：接受中英别名（N形超短/双突破/dragon 等），与 combat_agent.NormalizeStrategyName
+// 同一口径；新增 momentum 池（§动量入模拟盘）。
 // English: maps an optimization row's (strategy name, strategy_kind) to a paper pool key;
 // since Phase C the library rule ID IS the pool key (per-rule pools); builtins map by display
-// name; returns "" (other/manual pool) when unrecognizable.
+// name (aliases accepted); returns "" (other/manual pool) when unrecognizable.
 func PoolKeyForStrategy(strategy, kind string) string {
 	if len(kind) >= 4 && (kind[:4] == "fac_" || kind[:4] == "pat_") {
 		return kind // 规则粒度池：fac_1/fac_2/pat_3 各自独立
 	}
 	switch strategy {
-	case "双响炮":
+	case "双响炮", "双突破", "双凸", "double_bump":
 		return "double_bump"
-	case "龙头":
+	case "龙头", "dragon":
 		return "dragon"
-	case "N形":
+	case "N形", "N形超短", "N字型", "n_shape":
 		return "n_shape"
-	case "龙回头":
+	case "龙回头", "dragon_return":
 		return "dragon_return"
+	case "动量", "momentum":
+		return "momentum"
 	}
 	return ""
 }

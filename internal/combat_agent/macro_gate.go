@@ -133,17 +133,20 @@ func applyMacroGate(sigs []Signal, gateActive bool, cfg config.MacroGateConfig) 
 	for i := range sigs {
 		s := &sigs[i]
 		isBuy := s.Action == "buy" || s.Action == "买入"
-		// 动量 watch 观察信号（Strategy="动量"，Action=watch）：门控日拦截
-		// English: momentum watch signals (Strategy="动量", action watch) are blocked on gate days.
+		// 动量信号（watch 拦截；buy 落入下方通用置信度降级）：门控日整体收紧
+		// English: momentum watch is blocked on gate days; momentum buys fall through to the generic
+		// confidence downgrade below.
 		if s.Strategy == "动量" && s.Action == "watch" {
 			if blockMomentum {
 				s.Reason = "宏观利空(交割日)整体降级: " + s.Reason
 			}
 			continue
 		}
-		// N 形超短：门控日一律降级 watch
-		// English: N-shape ultra-short is always downgraded to watch on gate days.
-		if s.Strategy == string(strategy.SignalNShape) && blockN {
+		// N 形超短：门控日一律降级 watch。§名称规整：Signal.Strategy 已统一中文规范名，
+		// 兼容旧数据/旧路径里的英文类型名，双向归一再比较。
+		// English: N-shape ultra-short is always downgraded to watch on gate days; compare via the
+		// canonical display name (aliases normalized both ways).
+		if NormalizeStrategyName(s.Strategy) == NormalizeStrategyName(string(strategy.SignalNShape)) && blockN {
 			if isBuy {
 				s.Action = "watch"
 				s.Reason = "宏观利空(交割日)拦截N形超短: " + s.Reason

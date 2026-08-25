@@ -194,7 +194,7 @@ func TestD1BlockedVetoesAllSignals(t *testing.T) {
 // English: hasDragonAction reports whether the signal list contains a dragon signal for a given stock with the given action.
 func hasDragonAction(sigs []Signal, code, action string) bool {
 	for _, s := range sigs {
-		if s.Code == code && s.Strategy == "dragon" && s.Action == action {
+		if s.Code == code && s.Strategy == "龙头" && s.Action == action {
 			return true
 		}
 	}
