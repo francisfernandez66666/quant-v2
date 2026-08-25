@@ -719,6 +719,18 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		} else {
 			continue
 		}
+		// §R0.4b 涨停封板拒买（自动信号路径，与手动 Buy 同守卫）：
+		// 封板股买单在现实中几乎无法排队成交——002412 实录：4 连板 09:30 首封，
+		// 龙头识别 10:15 发信号被瞬间以涨停价撮合，制造"买后必涨"的虚假胜率。
+		// 以实时涨幅 ≥9.9% 近似封板判定（与手动 Buy 口径一致）；订单留痕 rejected。
+		if q := quotes[s.Code]; q != nil && q.ChangePct >= 9.9 {
+			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+				StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
+				SignalPrice: s.Price, Status: "rejected",
+				Reason: fmt.Sprintf("涨停封板无法买入(%.1f%%)", q.ChangePct), CreatedAt: now})
+			log.Printf("[paper] 涨停拒买(自动) %s(%s) %.1f%%——封板股买单不撮合", s.Code, s.Name, q.ChangePct)
+			continue
+		}
 		// 每池持仓上限（与全局上限解耦，可自定义）：该池已持仓数 ≥ 池上限时跳过该信号。
 		// 池上限 0 = 该池不单独设限（仅受全局上限约束）；Σ池上限 ≤ 全局上限（前端配置时守恒校验）。
 		// English: per-pool position cap (decoupled from the global cap, customizable) — skip the signal

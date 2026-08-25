@@ -259,6 +259,7 @@
         <div class="table-header">
           <span class="col-code">代码</span>
           <span class="col-name">名称</span>
+          <span class="col-time" title="信号撮合时间；悬浮显示信号发出时间与延迟（§买入点可追溯）">买入时间</span>
           <span class="col-num">数量</span>
           <span class="col-price">成本价</span>
           <span class="col-price">现价</span>
@@ -274,6 +275,10 @@
           <div class="table-row" @click="onRowTap(p)">
             <span class="col-code" data-label="代码">{{ p.code }}</span>
             <span class="col-name" data-label="名称">{{ p.name }}</span>
+            <span class="col-time" data-label="买入时间"
+                  :title="'信号发出 ' + fmtTime(p.signal_at) + ' · 撮合成交 ' + fmtTime(p.filled_at)">
+              {{ fmtTime(p.filled_at || p.signal_at) }}
+            </span>
             <span class="col-num" data-label="数量">{{ p.qty }}</span>
             <span class="col-price" data-label="成本价">{{ p.cost_price.toFixed(2) }}</span>
             <span class="col-price" data-label="现价">{{ (p.mark || 0).toFixed(2) }}</span>
@@ -591,8 +596,14 @@ const gridLines = computed(() => [1, 2, 3].map(k => ({ y: (H / 4) * k })))
 // ── 工具函数 ── (Helpers)
 // 数字格式化：千分位 + 两位小数（thousands separator, two decimals）
 function fmt(v) { return (v ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }
-// 时间格式化：MM-DD HH:MM（time formatting）
-function fmtTime(t) { return t ? t.slice(5, 16) : '—' }
+// 时间格式化：MM-DD HH:mm:ss（§买入点可追溯；ISO 串优先 Date 解析，异常回退截断）
+function fmtTime(t) {
+  if (!t) return '—'
+  const d = new Date(t)
+  if (isNaN(d)) return t.slice(5, 16)
+  const p2 = n => String(n).padStart(2, '0')
+  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+}
 // 涨跌颜色类：非负红（A股习惯红涨），负绿（positive = red per A-share convention）
 function pnlCls(v) { return v >= 0 ? 'up' : 'down' }
 // 单笔成交滑点%：（成交价 - 信号价）/ 信号价（仅买入有信号价参照；卖出/无信号价显示 —）
@@ -989,9 +1000,9 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 
 /* ── 数据表（div-grid，照搬真实持仓页）── (div-grid, ported from the real positions page) */
 .positions-table { background: #16162a; border-radius: 8px; overflow-x: auto; font-size: 13px; white-space: nowrap; }
-.table-header, .table-row { display: flex; align-items: center; padding: 9px 14px; gap: 0; min-width: 1140px; }
+.table-header, .table-row { display: flex; align-items: center; padding: 9px 14px; gap: 0; min-width: 1240px; }
 .table-header { background: #22223a; color: #8fa3bf; font-weight: 600; }
-.pos-row-group { border-bottom: 1px solid #22223a; min-width: 1140px; }
+.pos-row-group { border-bottom: 1px solid #22223a; min-width: 1240px; }
 .pos-row-group:last-child { border-bottom: none; }
 .table-row:hover { background: rgba(255, 255, 255, 0.03); }
 .col-code  { flex: 1; color: #4fc3f7; text-align: center; }
