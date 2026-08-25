@@ -155,9 +155,17 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 		log.Printf("东财行情失败 (%s): %v", code, emErr)
 	}
 
-	// 三级源全部失败，兜底返回新浪的错误信息（优先级最高的源）
-	// English: All three sources failed; fall back to Sina's error info (highest-priority source).
-	return si, err
+	// §D3 修复：三级源全部失败时不再返回 (nil/零值, nil) 脏快照——此前新浪返回空行时
+	// si=nil,err=nil 直通 fetcher 写入 5s 快照、前端显示 0.00 元。现统一返回明确错误。
+	// English: D3 fix — when all three sources fail, never return a zero-value snapshot with a
+	// nil error (it flowed straight into the 5s snapshot and rendered 0.00 on the frontend).
+	if si != nil && si.Price > 0 {
+		return si, err
+	}
+	if err == nil {
+		err = fmt.Errorf("全部行情源失败 (%s)", code)
+	}
+	return nil, err
 }
 
 // GetKLine 获取 K 线数据。新浪日线 → 东财

@@ -407,21 +407,47 @@ func findEventForCode(code string, md *strategy_engine.StockMarketData, events [
 	return ""
 }
 
-// stockMatch 判断事件关联股票串 s 是否与 代码/名称 命中。
-// s 可能形态：纯名称("招金黄金")、名称(代码)("招金黄金(600540)")、名称|代码("招金黄金|600540")。
+// stockMatch 判断事件关联股票串 s 是否与 目标股票 命中。
+// §D5 修复：精确匹配，兼容三种形态——CleanedStocks 的 "名称|代码"、RelatedStocks 的
+// "名称(代码)" 与纯名称/纯代码。有代码段时代码精确比对（去交易所后缀）；否则名称全等。
+// 旧实现双向 strings.Contains 让名称碎片（如事件关联"国电"）同时命中
+// "国电电力/国电南瑞"，findEventForCode 取首个命中即返回，事件张冠李戴
+// 直接污染 D1 分数并传导到买入信号。
+// English: D5 fix — exact matching across three shapes ("name|code" from the cleaner,
+// "name(code)" injected by sector propagation, and bare name/code). Code segments compare
+// exactly (suffix-insensitive), names verbatim. The old bidirectional Contains let fragments
+// like "国电" mis-hit 国电电力 vs 国电南瑞, corrupting D1 scores and downstream buy signals.
 func stockMatch(s, code string, md *strategy_engine.StockMarketData) bool {
 	if s == "" {
 		return false
 	}
-	if strings.Contains(s, code) || strings.Contains(code, s) {
+	name, scode := s, ""
+	switch {
+	case strings.IndexByte(s, '|') >= 0:
+		i := strings.IndexByte(s, '|')
+		name, scode = s[:i], s[i+1:]
+	case strings.IndexByte(s, '(') > 0 && strings.HasSuffix(s, ")"):
+		i := strings.IndexByte(s, '(')
+		name, scode = s[:i], s[i+1:len(s)-1]
+	}
+	if scode != "" && code != "" && bareCode(scode) == bareCode(code) {
 		return true
 	}
-	if md != nil && md.Name != "" {
-		if strings.Contains(s, md.Name) || strings.Contains(md.Name, s) {
-			return true
-		}
+	if name != "" && code != "" && name == code {
+		return true // s 本身就是代码
+	}
+	if name != "" && md != nil && md.Name != "" && name == md.Name {
+		return true
 	}
 	return false
+}
+
+// bareCode 去掉交易所后缀（600540.SH → 600540）。
+func bareCode(c string) string {
+	if i := strings.IndexByte(c, '.'); i >= 0 {
+		return c[:i]
+	}
+	return c
 }
 
 // minInt 返回两个整数中的较小值。

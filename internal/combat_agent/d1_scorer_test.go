@@ -292,3 +292,22 @@ func TestBatchScoreNoSubstantiveEventZeroed(t *testing.T) {
 		t.Fatalf("600002 无任何事件应强制归 0, got %+v", s)
 	}
 }
+
+// TestStockMatchExactNoFragment §D5 回归：名称碎片不得误命中——"国电"只应精确匹配
+// 名称/代码，不再双向 Contains 同时命中 国电电力/国电南瑞。
+func TestStockMatchExactNoFragment(t *testing.T) {
+	fragment := "国电"
+	if stockMatch(fragment, "600795", &strategy_engine.StockMarketData{Name: "国电电力"}) {
+		t.Fatal("碎片'国电'不应命中'国电电力'(精确匹配)")
+	}
+	// 精确形态仍然命中
+	if !stockMatch("国电电力|600795", "600795.SH", &strategy_engine.StockMarketData{Name: "国电电力"}) {
+		t.Fatal("名称|代码 应跨后缀精确命中")
+	}
+	if !stockMatch("国电电力(600795)", "600795", nil) {
+		t.Fatal("名称(代码) 形态应按代码命中")
+	}
+	if !stockMatch("600795", "600795", nil) {
+		t.Fatal("纯代码形态应命中")
+	}
+}

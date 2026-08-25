@@ -194,6 +194,18 @@ func secID(code string) string {
 	return "0." + code
 }
 
+// indexSecID 指数专用 secid：上证指数等以 000 开头的指数在东财属沪市 "1."，
+// 与个股映射规则不同；深证指数 399xxx 属深市 "0."。
+// English: index-specific secid — SH indexes like 000001 use the "1." prefix (unlike stocks),
+// SZ indexes 399xxx use "0.".
+func indexSecID(code string) string {
+	code = stripSuffix(code)
+	if strings.HasPrefix(code, "399") {
+		return "0." + code
+	}
+	return "1." + code
+}
+
 // ── Sina 实时行情（CSV 格式） ──
 
 // sinaQuoteURL 返回新浪财经实时行情 URL。
@@ -872,7 +884,11 @@ func parseSinaKLine(body []byte) ([]KLine, error) {
 // code 为股票代码，period 为周期（101=日线，102=周线，103=月线），count 为根数。
 // GetKLine fetches EastMoney K-lines; period 101=day,102=week,103=month.
 func (m *MarketAPI) GetKLine(code, period string, count int) ([]KLine, error) {
-	sid := secID(code)
+	return m.klineBySecID(secID(code), period, count)
+}
+
+// klineBySecID 按给定 secid 拉 K 线（个股/指数共用；§D1 指数 MA20 用指数 secid）。
+func (m *MarketAPI) klineBySecID(sid, period string, count int) ([]KLine, error) {
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/kline/get?secid=%s&klt=%s&lmt=%d&fqt=1", sid, period, count)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
@@ -1374,8 +1390,11 @@ func shortDate(s string) string {
 // GetIndexData returns the SH index price, its MA20, and the market-wide
 // up/down counts for sentiment gauging.
 func (m *MarketAPI) GetIndexData() (indexPrice float64, ma20 float64, upCount, downCount int, err error) {
-	// 获取上证指数实时行情
-	sid := secID("000001")
+	// §D1 修复：上证指数必须用沪市前缀 "1.000001"——secID("000001") 会生成深市
+	// 前缀 "0.000001"，取到的是平安银行而非上证指数（点位/涨跌全错）。
+	// English: D1 fix — the SH index must use the explicit "1.000001" secid; secID() maps
+	// 000001 to the SZ prefix which returns Ping An Bank instead of the index.
+	sid := indexSecID("000001")
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f58,f169,f170,f171", sid)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
@@ -1400,9 +1419,9 @@ func (m *MarketAPI) GetIndexData() (indexPrice float64, ma20 float64, upCount, d
 	}
 	indexPrice = raw.Data.F43 / 100
 
-	// 获取上证指数日 K 线计算 MA20
-	klines, err := m.GetKLine("000001", "101", 30)
-	if err == nil && len(klines) >= 20 {
+	// §D1 修复：MA20 同样必须用指数 secid（此前 GetKLine("000001") 取到平安银行的均线）
+	klines, kerr := m.klineBySecID(indexSecID("000001"), "101", 30)
+	if kerr == nil && len(klines) >= 20 {
 		sum := 0.0
 		start := len(klines) - 20
 		if start < 0 {

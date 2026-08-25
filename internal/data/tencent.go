@@ -202,6 +202,10 @@ func parseTencentKLine(rows [][]string, isMinute bool) ([]KLine, error) {
 		high := toFloat64(r[3])
 		low := toFloat64(r[4])
 		volume := toFloat64(r[5])
+		// §D2 修复：腾讯 K 线成交量单位为手，×100 换算为股——与新浪/东财口径一致。
+		// 此前原样入库，作为兜底源时量比类评分失真百倍（对比：东财 F47×100、
+		// 腾讯实时行情 vol×100 均已换算）。
+		volume *= 100
 		// 校验数值有效，跳过脏数据行
 		if open <= 0 || high <= 0 || low <= 0 || close <= 0 {
 			continue
