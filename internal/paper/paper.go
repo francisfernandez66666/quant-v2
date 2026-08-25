@@ -17,6 +17,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,25 @@ import (
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 )
+
+// limitUpPct §R6 分板块涨停封板近似阈值（实时涨幅 ≥ 该值视为封板拒买）。
+// 主板 10%（9.9 容差）、创业板/科创板 20cm（19.9）、北交所 30%（29.9）；
+// 名称含 ST（含 *ST，大小写不敏感）按 5% 档（4.9）。code 形如 "600519.SH" 或裸码均可。
+// English: board-aware limit-up threshold for the sealed-board buy guard — main board ~10%,
+// ChiNext/STAR 20%, BSE 30%, ST (name contains "ST") 5%.
+func limitUpPct(code, name string) float64 {
+	if strings.Contains(strings.ToUpper(name), "ST") {
+		return 4.9
+	}
+	head := strings.Split(code, ".")[0]
+	switch {
+	case strings.HasPrefix(head, "30"), strings.HasPrefix(head, "68"):
+		return 19.9
+	case strings.HasPrefix(head, "4"), strings.HasPrefix(head, "8"), strings.HasPrefix(head, "92"):
+		return 29.9
+	}
+	return 9.9
+}
 
 // Config 模拟盘配置（rules.paper）。
 // English: paper-trading config (rules.paper).
@@ -45,7 +65,11 @@ type Config struct {
 }
 
 // DefaultConfig 返回模拟盘出厂默认配置。
-// English: returns the paper engine's factory-default config.
+// §R11 费率给真实默认值（此前注释称默认万2.5/最低5元但实际全 0，净值系统性虚高）：
+// 佣金=max(成交额×0.025%,5元)、印花税卖出 0.05%、滑点 5bp。config.json 可覆盖；
+// 测试经 testCfg() 显式置零保持确定性。
+// English: factory defaults now carry realistic A-share fees (commission max(rate,¥5), stamp tax on
+// sells only, slippage) instead of silent zeros; config-overridable, tests zero them explicitly.
 func DefaultConfig() Config {
 	return Config{
 		Enabled:        false,
@@ -53,6 +77,10 @@ func DefaultConfig() Config {
 		MaxPositions:   0,
 		InitialCapital: 100000,
 		AutoSell:       true,
+		SlippageBps:    5,
+		CommissionRate: 0.00025,
+		StampTaxRate:   0.0005,
+		MinCommission:  5,
 	}
 }
 
@@ -163,7 +191,39 @@ type Trade struct {
 	// LatencySec 信号发出→成交 的秒数（买入时记录；量化信号时效性）。
 	// English: seconds from signal generation to fill (recorded on buys; quantifies signal timeliness).
 	LatencySec int64  `json:"latency_sec,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	// Fee 本笔成交费用（佣金+印花税，§R1/R2 费用入账审计字段；0=未收费）。
+	// English: fees charged on this fill (commission + stamp tax; audit field for fee accounting).
+	Fee     float64 `json:"fee,omitempty"`
+	Reason  string  `json:"reason,omitempty"`
+}
+
+// ── §R1/R2 费用模型（A股口径）───────────────────────────────────────────
+// 佣金 = max(成交额 × CommissionRate, MinCommission)；印花税 = 卖出成交额 × StampTaxRate（仅卖出，
+// 无最低）；费率 ≤0 视为不收（兼容既有测试/用户配置）。须持锁调用（读 cfg 快照语义）。
+
+func (e *Engine) buyFeeLocked(cost float64) float64 {
+	if e.cfg.CommissionRate <= 0 {
+		return 0
+	}
+	fee := cost * e.cfg.CommissionRate
+	if e.cfg.MinCommission > 0 && fee < e.cfg.MinCommission {
+		fee = e.cfg.MinCommission
+	}
+	return fee
+}
+
+func (e *Engine) sellFeeLocked(proceeds float64) float64 {
+	fee := 0.0
+	if e.cfg.CommissionRate > 0 {
+		fee = proceeds * e.cfg.CommissionRate
+		if e.cfg.MinCommission > 0 && fee < e.cfg.MinCommission {
+			fee = e.cfg.MinCommission
+		}
+	}
+	if e.cfg.StampTaxRate > 0 {
+		fee += proceeds * e.cfg.StampTaxRate
+	}
+	return fee
 }
 
 // Order 订单生命周期记录（阶段1.3）：一次"信号→订单→结果"的完整审计条目，
@@ -698,18 +758,30 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 			continue
 		}
 		// 自定义持仓上限：>0 时封顶；0（默认）不设限，持仓数由本金/现金余额自然决定。
-		// English: custom position cap — enforced only when > 0; 0 (default) means unlimited, with the
-		// position count naturally bounded by the capital / cash balance.
+		// §R4 修复：此前 return 掐断整个循环——达上限后排在后面的买入/止损卖出信号被整体丢弃。
+		// 改为跳过该买单并留痕，继续处理后续信号。
+		// English: R4 fix — the cap used to `return`, aborting the whole loop and silently dropping
+		// every later buy AND stop-loss sell; now it skips this buy with an audit record and continues.
 		if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
-			return
+			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+				StrategyType: s.StrategyType, Side: "buy", Kind: "自动撮合",
+				SignalPrice: s.Price, Status: "rejected",
+				Reason: fmt.Sprintf("持仓数达上限(%d)", e.cfg.MaxPositions), CreatedAt: now})
+			continue
 		}
-		// 战法分池：按信号 StrategyType 归池；类型未启用（无对应池）时跳过该信号，
-		// 空类型（watch/手动）走"其他池"。池扣款由 fillLocked 完成。
-		// English: strategy pooling — the signal debits its own pool by StrategyType; a type without a
-		// pool (disabled) is skipped, and empty types (watch/manual) fall into the "other" pool.
+		// 战法分池：按信号 StrategyType 归池；类型未启用（无对应池）时显式拒绝留痕。
+		// §R10 修复：此前静默 continue 无任何痕迹，而 fillLocked 对缺失池读零值现金会误报
+		// "可用资金不足"（线上实证：池改名过渡期 factor vs fac_1 一天误拒 49 笔）。
+		// English: R10 fix — an unmatched StrategyType (e.g. renamed pool) is now rejected with an
+		// audit record instead of being silently skipped or mis-read as a zero-cash pool.
 		poolKey := s.StrategyType
 		if poolKey != "" {
 			if _, ok := e.pools[poolKey]; !ok {
+				e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+					StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
+					SignalPrice: s.Price, Status: "rejected",
+					Reason: fmt.Sprintf("战法池未启用(%s)", poolKey), CreatedAt: now})
+				log.Printf("[paper] 池键失配拒绝 %s(%s): 类型 %s 无对应启用池", s.Code, s.Name, poolKey)
 				continue
 			}
 		}
@@ -725,8 +797,8 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// §R0.4b 涨停封板拒买（自动信号路径，与手动 Buy 同守卫）：
 		// 封板股买单在现实中几乎无法排队成交——002412 实录：4 连板 09:30 首封，
 		// 龙头识别 10:15 发信号被瞬间以涨停价撮合，制造"买后必涨"的虚假胜率。
-		// 以实时涨幅 ≥9.9% 近似封板判定（与手动 Buy 口径一致）；订单留痕 rejected。
-		if q := quotes[s.Code]; q != nil && q.ChangePct >= 9.9 {
+		// 以实时涨幅近似封板判定；§R6 分板块幅度：主板/ST≈10%/5%、创业科创 20cm、北交 30%。
+		if q := quotes[s.Code]; q != nil && q.ChangePct >= limitUpPct(s.Code, s.Name) {
 			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 				StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
 				SignalPrice: s.Price, Status: "rejected",
@@ -742,7 +814,7 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
 			continue
 		}
-		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason); err != nil {
+		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 			// 订单留痕：买入被拒（现金不足/超上限/池上限/买不起一手）。
 			// English: order audit — the buy was rejected (cash short / cap / pool cap / can't afford a lot).
@@ -840,7 +912,7 @@ func (e *Engine) poolPositionCountLocked(poolKey string) int {
 // each other. qty > 0 is an explicit lot count (manual buy/add, fails when exceeding the pool balance);
 // qty <= 0 auto-sizes to FixedAmount in whole lots, shrinking to the largest affordable lot on a
 // shortfall (skipping below one lot).
-func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string) error {
+func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice float64, signalAt, now time.Time, price float64, qty int, reason string, confidence float64) error {
 	// 每池持仓上限（与全局上限解耦，可自定义）：该池新开仓达到池上限即拒绝。
 	// 池上限 0 = 该池不单独设限；加仓（已持仓）不在此路径（走 addToPositionLocked）。
 	// English: per-pool position cap (decoupled from the global cap, customizable) — a new open in this
@@ -850,7 +922,8 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		return errMaxPos
 	}
 	// §分仓纪律引擎·预检查（不需要cost）：日限次数+冷却+评分门槛。
-	if reason := e.checkPoolDisciplinePre(poolKey); reason != "" {
+	// §R7 MinScore 真正生效：confidence 由信号传入（手动买入传 1.0 = 用户自主决策放行）。
+	if reason := e.checkPoolDisciplinePre(poolKey, confidence); reason != "" {
 		log.Printf("[paper] 分仓纪律拒绝 %s→%s: %s", strategy, code, reason)
 		return errPoolDiscipline
 	}
@@ -867,52 +940,55 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	}
 
 	cost := float64(qty) * price
+	// §R1 手续费入账（修复：此前 fee 算完即丢，佣金从未扣减现金）：买入总支出=本金+佣金，
+	// 池扣款与持仓成本均按含费口径。English: the buy fee is now actually debited — total outlay =
+	// principal + commission; pool debit and position cost are fee-inclusive.
+	fee := e.buyFeeLocked(cost)
 
-	// §R0.6 手续费入账：CommissionRate > 0 时启用；0 = 不收（兼容既有测试）
-	if e.cfg.CommissionRate > 0 {
-		fee := cost * e.cfg.CommissionRate
-		if fee < e.cfg.MinCommission {
-			fee = e.cfg.MinCommission
-		}
-	}
-
-	// §分仓纪律引擎·预算检查（需要cost）：日内花费不超池资金配比。
+	// §分仓纪律引擎·预算检查（需要cost）：日内花费不超池资金配比（按本金口径计数）。
 	if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
 		log.Printf("[paper] 分仓预算拒绝 %s→%s: %s", strategy, code, reason)
 		return errPoolDiscipline
 	}
 	pool := e.pools[poolKey]
-	if cost > pool {
+	if cost+fee > pool {
 		if explicitQty {
-			return errCash // 手动指定手数超出池内资金，不静默缩减
+			return errCash // 手动指定手数超出池内资金（含费），不静默缩减
 		}
-		// 自动金额现金不足：按池内剩余现金缩减到整手；缩减后仍买不起一手则跳过
-		// English: auto-amount cash short — shrink to the largest whole lot within the pool balance.
-		qty = int(pool/price/100) * 100
+		// 自动金额现金不足：按池内剩余现金（预留佣金）缩减到整手；缩减后仍买不起一手则跳过
+		// English: auto-amount cash short — shrink to the largest whole lot within the pool balance,
+		// reserving commission headroom.
+		avail := pool
+		if e.cfg.CommissionRate > 0 && e.cfg.CommissionRate < 1 {
+			avail = pool / (1 + e.cfg.CommissionRate)
+		}
+		qty = int(avail/price/100) * 100
 		if qty <= 0 {
 			return errCash
 		}
 		cost = float64(qty) * price
+		fee = e.buyFeeLocked(cost)
 	}
-	e.pools[poolKey] = pool - cost
-	e.cash -= cost
+	e.pools[poolKey] = pool - cost - fee
+	e.cash -= cost + fee
 	e.hasFilled = true             // §反馈修复：首笔成交起才开始记净值曲线
 	e.recordPoolBuy(poolKey, cost) // §分仓纪律：记录买入事件（冷却/日限/预算计数）
-	// 买入后计数：累计买入成本计入本池（卖出不减，收益仍记该池）。
-	// English: counted after buy — the buy cost accumulates to the pool (never reduced on sells, so
-	// P&L stays attributed to the pool).
+	// 买入后计数：累计买入成本计入本池（卖出不减，收益仍记该池）。按本金口径（不含费）。
+	// English: counted after buy — the buy principal accumulates to the pool (never reduced on sells,
+	// so P&L stays attributed to the pool).
 	if e.poolPerf[poolKey] == nil {
 		e.poolPerf[poolKey] = &PoolPerf{}
 	}
 	e.poolPerf[poolKey].Cost += cost
+	totalCost := cost + fee
 	e.positions[code] = &Position{
 		Code:         code,
 		Name:         name,
 		Strategy:     strategy,
 		StrategyType: poolKey,
 		Qty:          qty,
-		CostPrice:    price,
-		Cost:         cost,
+		CostPrice:    totalCost / float64(qty),
+		Cost:         totalCost,
 		SignalPrice:  signalPrice,
 		SignalAt:     signalAt,
 		FilledAt:     now,
@@ -937,10 +1013,11 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		Amount:       cost,
 		Time:         now,
 		LatencySec:   latency,
+		Fee:          fee,
 		Reason:       reason,
 	})
-	log.Printf("[paper] 模拟买入 %s(%s) %d股 @%.2f 信号价%.2f 延迟%ds",
-		code, name, qty, price, signalPrice, latency)
+	log.Printf("[paper] 模拟买入 %s(%s) %d股 @%.2f 信号价%.2f 延迟%ds 费%.2f",
+		code, name, qty, price, signalPrice, latency, fee)
 	return nil
 }
 
@@ -959,12 +1036,11 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 // English: pool-aware manual buy; empty poolKey = the "other" pool (legacy behavior).
 // A nonexistent target pool falls back to the other pool with a log note.
 func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice float64, quotes map[string]*data.StockInfo) error {
-	// §R0.4 涨跌停拒成交：涨停封板的股票买单拒绝
-	for _, q := range quotes {
-		if q != nil && q.Code == code && q.ChangePct >= 9.9 {
-			log.Printf("[paper] 涨停拒买 %s(%.1f%%)", code, q.ChangePct)
-			return fmt.Errorf("涨停封板无法买入")
-		}
+	// §R0.4 涨跌停拒成交：涨停封板的股票买单拒绝。§R5/R6 修复：改按 code 直接取键
+	// （此前遍历比对 q.Code==code，调用方未填 Code 字段时守卫静默失效）+ 分板块幅度。
+	if q := quotes[code]; q != nil && q.ChangePct >= limitUpPct(code, name) {
+		log.Printf("[paper] 涨停拒买 %s(%.1f%%)", code, q.ChangePct)
+		return fmt.Errorf("涨停封板无法买入")
 	}
 	if !e.cfg.Enabled {
 		return errDisabled
@@ -993,7 +1069,7 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 	if poolKey != "" {
 		reason = "手动模拟买入(归" + poolKey + ")"
 	}
-	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, reason); err != nil {
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, reason, 1.0); err != nil {
 		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
@@ -1022,6 +1098,12 @@ func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, 
 // BuyExInPool BuyEx 的池感知版本（§用户要求：信号页模拟买入归入信号原战法池）。
 // poolKey 为空 = 其他池（纯手动旧行为）；指向不存在的池回退其他池并记日志。
 func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, price float64, qty int, quotes map[string]*data.StockInfo) error {
+	// §R5 修复：BuyEx 此前完全无涨停检查，可用任意价格买入封板股（与自动/手动口径不一致）。
+	// 行情快照可用时按 §R6 分板块幅度守卫；纯手输价（无行情）不拦——用户可能补记一笔真实世界的委托。
+	if q := quotes[code]; q != nil && q.ChangePct >= limitUpPct(code, name) {
+		log.Printf("[paper] 涨停拒买(手输价) %s(%.1f%%)", code, q.ChangePct)
+		return fmt.Errorf("涨停封板无法买入")
+	}
 	if !e.cfg.Enabled {
 		return errDisabled
 	}
@@ -1053,7 +1135,7 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 	if poolKey != "" {
 		reason = "手动模拟买入(归" + poolKey + ")"
 	}
-	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, reason); err != nil {
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, reason, 1.0); err != nil {
 		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
@@ -1078,14 +1160,20 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	if qty <= 0 {
 		return errLotTooSmall
 	}
+	// §R8 统一口径：加仓与首买同模型——滑点上浮、佣金(含最低)入账；此前加仓零费用零滑点，
+	// 同一票加仓比首买"便宜"，成本口径失真。
+	if e.cfg.SlippageBps > 0 {
+		price = price * (1 + e.cfg.SlippageBps/10000.0)
+	}
 	cost := float64(qty) * price
+	fee := e.buyFeeLocked(cost)
 	poolKey := p.StrategyType // 加仓归原持仓池
 	pool := e.pools[poolKey]
-	if cost > pool {
+	if cost+fee > pool {
 		return errCash
 	}
-	e.pools[poolKey] = pool - cost
-	e.cash -= cost
+	e.pools[poolKey] = pool - cost - fee
+	e.cash -= cost + fee
 	e.hasFilled = true             // §反馈修复：首笔成交起才开始记净值曲线
 	e.recordPoolBuy(poolKey, cost) // §分仓纪律：记录买入事件（冷却/日限/预算计数）
 	// 加仓成本照记入该池，保证池累计表现不遗漏。
@@ -1094,7 +1182,7 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 		e.poolPerf[poolKey] = &PoolPerf{}
 	}
 	e.poolPerf[poolKey].Cost += cost
-	p.Cost += cost
+	p.Cost += cost + fee
 	p.Qty += qty
 	p.CostPrice = p.Cost / float64(p.Qty)
 	p.Mark = price
@@ -1109,6 +1197,7 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 		Qty:          qty,
 		Amount:       cost,
 		Time:         time.Now(),
+		Fee:          fee,
 		Reason:       reason,
 	})
 	log.Printf("[paper] 模拟加仓 %s(%s) +%d股 @%.2f 现持%d股 均价%.3f 池=%s", code, name, qty, price, p.Qty, p.CostPrice, strategyPoolLabel(poolKey))
@@ -1252,26 +1341,53 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 	return err
 }
 
+// sellCheckT1Locked §R3 T+1 约束（A 股规则：当日买入次日方可卖出）——两个卖出入口共用。
+// FilledAt 为零值（旧数据）视为可卖（向后兼容）。
+// English: T+1 guard shared by both sell entry points — shares bought today cannot be sold until the
+// next trading day; zero FilledAt (legacy data) stays sellable.
+func (e *Engine) sellCheckT1Locked(p *Position) error {
+	if !canSellToday(p.FilledAt, time.Now()) {
+		log.Printf("[paper] T+1拦截 %s(%s) 当日买入不可卖", p.Code, p.Name)
+		return errTPlusOne
+	}
+	return nil
+}
+
+// applySellPriceLocked §R2 卖出滑点下浮成交（与买入上浮对称；0=不启用）。
+// English: applies sell-side slippage (price marked down, symmetric to the buy-side markup).
+func (e *Engine) applySellPriceLocked(price float64) float64 {
+	if e.cfg.SlippageBps > 0 {
+		return price * (1 - e.cfg.SlippageBps/10000.0)
+	}
+	return price
+}
+
 // sellQtyLocked 按股数部分减仓：回池、结算已实现盈亏、追加卖出记录（须持锁调用）。
 // 手动减仓与自动减仓（阶段1.1 卖出信号半仓）共用；不触发清仓镜像（report 账记录保留至整笔平仓）。
+// §R3 T+1：当日买入拒绝减仓。§R2 费用：卖出价下浮滑点、佣金(含最低)+印花税从所得中扣除。
 // English: trims by share count — pool return, realized P&L, extra sell fill (caller must hold the lock).
-// Shared by manual trims and auto trims (sell-signal half exits); does NOT fire the close mirror (the
-// report-book record stays until the full close).
+// Shared by manual trims and auto trims; does NOT fire the close mirror. R3: T+1 enforced; R2: sell-side
+// slippage + commission(min) + stamp tax are deducted from proceeds.
 func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason string) error {
-	proceeds := price * float64(qty)
+	if err := e.sellCheckT1Locked(p); err != nil {
+		return err
+	}
+	price = e.applySellPriceLocked(price)
+	gross := price * float64(qty)
+	fee := e.sellFeeLocked(gross)
+	net := gross - fee
 	// 减仓收益回原战法池（按持仓记录的类型；空=其他池）。
 	// English: trim proceeds return to the position's own strategy pool (per its recorded type; empty =
 	// the other pool).
-	e.pools[p.StrategyType] += proceeds
-	e.cash += proceeds
-	e.realized += (price - p.CostPrice) * float64(qty)
-	// 卖出结算：已实现盈亏计入本池（卖出仍记分仓资金池，跨重启保留）。
-	// English: sale settlement — realized P&L credits the position's own pool (sells still attribute
-	// to the pool, persisted across restarts).
+	e.pools[p.StrategyType] += net
+	e.cash += net
+	e.realized += net - p.CostPrice*float64(qty)
+	// 卖出结算：已实现盈亏计入本池（卖出仍记分仓资金池，跨重启保留）。按净额口径。
+	// English: sale settlement — realized P&L credits the position's own pool on a net basis.
 	if e.poolPerf[p.StrategyType] == nil {
 		e.poolPerf[p.StrategyType] = &PoolPerf{}
 	}
-	e.poolPerf[p.StrategyType].Realized += (price - p.CostPrice) * float64(qty)
+	e.poolPerf[p.StrategyType].Realized += net - p.CostPrice*float64(qty)
 	p.Qty -= qty
 	e.trades = append(e.trades, Trade{
 		Code:         p.Code,
@@ -1281,34 +1397,41 @@ func (e *Engine) sellQtyLocked(p *Position, price float64, qty int, reason strin
 		Side:         "sell",
 		Price:        price,
 		Qty:          qty,
-		Amount:       proceeds,
+		Amount:       gross,
 		Time:         time.Now(),
+		Fee:          fee,
 		Reason:       reason,
 	})
-	log.Printf("[paper] 模拟减仓 %s(%s) -%d股 @%.2f 剩余%d股 原因=%s", p.Code, p.Name, qty, price, p.Qty, reason)
+	log.Printf("[paper] 模拟减仓 %s(%s) -%d股 @%.2f 剩余%d股 费%.2f 原因=%s", p.Code, p.Name, qty, price, p.Qty, fee, reason)
 	e.persist()
 	return nil
 }
 
 // sellAllLocked 清仓单一持仓：回池、结算已实现盈亏、追加卖出记录，并触发清仓镜像
 // （阶段1.2 两本账合一：report 账对应记录同步平仓；须持锁调用）。
+// §R3 T+1：当日买入拒绝清仓。§R2 费用：卖出价下浮滑点、佣金(含最低)+印花税从所得中扣除。
 // English: closes a single position — pool return, realized P&L, extra sell fill, plus the close mirror
-// (unified books: the report-book record is closed in sync; caller must hold the lock).
+// (unified books; caller must hold the lock). R3: T+1 enforced; R2: slippage + fees deducted.
 func (e *Engine) sellAllLocked(p *Position, price float64, reason string) error {
-	proceeds := price * float64(p.Qty)
+	if err := e.sellCheckT1Locked(p); err != nil {
+		return err
+	}
+	price = e.applySellPriceLocked(price)
+	gross := price * float64(p.Qty)
+	fee := e.sellFeeLocked(gross)
+	net := gross - fee
 	// 卖出收益回原战法池（按持仓记录的类型；空=其他池）。
 	// English: sale proceeds return to the position's own strategy pool (per its recorded type; empty =
 	// the other pool).
-	e.pools[p.StrategyType] += proceeds
-	e.cash += proceeds
-	e.realized += proceeds - p.Cost
-	// 清仓结算：已实现盈亏计入本池（卖出仍记分仓资金池，跨重启保留）。
-	// English: close settlement — realized P&L credits the position's own pool (sells still attribute
-	// to the pool, persisted across restarts).
+	e.pools[p.StrategyType] += net
+	e.cash += net
+	e.realized += net - p.Cost
+	// 清仓结算：已实现盈亏计入本池（卖出仍记分仓资金池，跨重启保留）。按净额口径。
+	// English: close settlement — realized P&L credits the position's own pool on a net basis.
 	if e.poolPerf[p.StrategyType] == nil {
 		e.poolPerf[p.StrategyType] = &PoolPerf{}
 	}
-	e.poolPerf[p.StrategyType].Realized += proceeds - p.Cost
+	e.poolPerf[p.StrategyType].Realized += net - p.Cost
 	qty := p.Qty
 	e.trades = append(e.trades, Trade{
 		Code:         p.Code,
@@ -1318,11 +1441,12 @@ func (e *Engine) sellAllLocked(p *Position, price float64, reason string) error 
 		Side:         "sell",
 		Price:        price,
 		Qty:          p.Qty,
-		Amount:       proceeds,
+		Amount:       gross,
 		Time:         time.Now(),
+		Fee:          fee,
 		Reason:       reason,
 	})
-	log.Printf("[paper] 模拟卖出 %s(%s) %d股 @%.2f 盈亏%.2f 原因=%s", p.Code, p.Name, p.Qty, price, proceeds-p.Cost, reason)
+	log.Printf("[paper] 模拟卖出 %s(%s) %d股 @%.2f 盈亏%.2f 费%.2f 原因=%s", p.Code, p.Name, p.Qty, price, net-p.Cost, fee, reason)
 	delete(e.positions, p.Code)
 	// 清仓镜像（阶段1.2）：report 账对应记录同步平仓（pap_<code> 稳定键）。
 	// English: close mirror (unified books) — the report-book record closes in sync (stable key pap_<code>).
@@ -1498,6 +1622,26 @@ func (e *Engine) Reconfigure(initialCapital float64, maxPositions int) {
 	}
 	if maxPositions >= 0 {
 		e.cfg.MaxPositions = maxPositions
+	}
+	// §R9 留痕修复：清存量持仓必须写审计订单并镜像平仓——此前静默清空，
+	// 线上实证出现"早间 7 笔成交凭空变 2 笔持仓"无法追溯的事故。
+	// English: R9 fix — clearing holdings now writes audit orders and fires the close mirror; the
+	// silent wipe previously made positions vanish without a trace (confirmed in production).
+	cleared := make([]*Position, 0, len(e.positions))
+	for _, p := range e.positions {
+		cleared = append(cleared, p)
+	}
+	for _, p := range cleared {
+		price := p.Mark
+		if price <= 0 {
+			price = p.CostPrice
+		}
+		qty := p.Qty
+		e.recordOrderLocked(Order{Code: p.Code, Name: p.Name, Strategy: p.Strategy,
+			StrategyType: p.StrategyType, Side: "sell", Kind: "重配资金清仓",
+			Price: price, Qty: qty, Status: "filled", Reason: "确认资金/改上限清存量", CreatedAt: time.Now()})
+		e.mirrorCloseLocked(p.Code, price, float64(qty), "模拟盘重配资金")
+		log.Printf("[paper] 重配资金清仓留痕 %s(%s) %d股 @%.2f", p.Code, p.Name, qty, price)
 	}
 	e.cash = e.cfg.InitialCapital
 	e.positions = make(map[string]*Position)
@@ -1923,6 +2067,7 @@ var (
 	errMaxPos      = errMsg("已达持仓数量上限")
 	errLotTooSmall = errMsg("资金不足以买入一手")
 	errCash        = errMsg("可用资金不足")
+	errTPlusOne    = errMsg("T+1限制：当日买入次日方可卖出")
 )
 
 // errMsg 让普通字符串可充当 error，避免为每个错误单独建类型。
@@ -1962,7 +2107,12 @@ type poolDiscipline struct {
 }
 
 // checkPoolDisciplinePre 分仓纪律预检查（不需要 cost）：日限次数+冷却+评分门槛。
-func (e *Engine) checkPoolDisciplinePre(poolKey string) string {
+// §R7 修复：MinScore 此前从未被读取（寻优管线持续写入的门槛静默放行）。confidence 为信号
+// 置信度（0~1）；手动买入传 1.0（用户自主决策，不受评分门槛约束）。
+// 口径兼容：MinScore>1 视为百分制评分（对比 confidence×100），≤1 视为 0~1 置信度。
+// English: pool-discipline pre-check (daily count + cooldown + score gate). R7 fix: MinScore is now
+// actually enforced — MinScore>1 is treated as a 0-100 scale vs confidence×100, otherwise 0-1.
+func (e *Engine) checkPoolDisciplinePre(poolKey string, confidence float64) string {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 
@@ -1984,6 +2134,15 @@ func (e *Engine) checkPoolDisciplinePre(poolKey string) string {
 		elapsed := now.Sub(d.lastBuyAt).Minutes()
 		if elapsed < float64(float64(rule.CooldownMinutes)) {
 			return fmt.Sprintf("冷却中(%.0f/%.0f分钟)", elapsed, float64(rule.CooldownMinutes))
+		}
+	}
+	if rule.MinScore > 0 && confidence < 1 { // 手动买入(=1.0)不受评分门槛约束
+		score := confidence
+		if rule.MinScore > 1 {
+			score = confidence * 100
+		}
+		if score < rule.MinScore {
+			return fmt.Sprintf("评分低于门槛(%.0f<%.0f)", score, rule.MinScore)
 		}
 	}
 	return ""

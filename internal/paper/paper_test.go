@@ -2,7 +2,9 @@ package paper
 
 import (
 	"encoding/json"
+	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,6 +133,7 @@ func TestPoolPerfBackfillLegacy(t *testing.T) {
 		{Code: "600000.SH", Name: "浦发", Strategy: "因子", StrategyType: "factor", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
 		{Code: "000001.SZ", Name: "平安", Strategy: "因子", StrategyType: "factor", Direction: "做多", Action: "buy", Price: 5, GeneratedAt: now},
 	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}, "000001.SZ": {Price: 5}})
+	t1Ready(e) // §R3 T+1
 	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
 		t.Fatalf("卖出失败: %v", err)
 	}
@@ -277,12 +280,26 @@ func TestMarkToMarketAndSnapshot(t *testing.T) {
 	}
 }
 
+
+// t1Ready §R3 测试辅助：把全部持仓 FilledAt 回拨到 25 小时前，模拟"次日卖出"绕过 T+1。
+// English: test helper — backdates every position's FilledAt by 25h to simulate next-day selling
+// past the T+1 gate.
+func t1Ready(e *Engine) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	y := time.Now().Add(-25 * time.Hour)
+	for _, p := range e.positions {
+		p.FilledAt = y
+	}
+}
+
 func TestSellAndReset(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
 	e.OnSignals([]combat_agent.Signal{
 		{Code: "600000.SH", Name: "浦发", Strategy: "N形", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
 	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	t1Ready(e) // §R3 T+1：模拟次日卖出
 	// 12 元卖出：盈利 2000
 	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
 		t.Fatalf("卖出失败: %v", err)
@@ -419,6 +436,7 @@ func TestPoolPerfTracksReturn(t *testing.T) {
 	if ns.ReturnPct != 20 {
 		t.Errorf("n_shape 总涨跌幅应为 20%%, 实际 %.2f%%", ns.ReturnPct)
 	}
+	t1Ready(e) // §R3 T+1：模拟次日卖出
 	// 12 元卖出 → 已实现 +2000，成本保留 10000，总涨跌幅仍 +20%（卖出仍记本池）
 	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
 		t.Fatalf("卖出失败: %v", err)
@@ -452,6 +470,7 @@ func TestPoolPerfPersists(t *testing.T) {
 	e.OnSignals([]combat_agent.Signal{
 		{Code: "600000.SH", Name: "浦发", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 9.8, GeneratedAt: now},
 	}, map[string]*data.StockInfo{"600000.SH": {Price: 10.0}})
+	t1Ready(e) // §R3 T+1：模拟次日卖出
 	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
 		t.Fatalf("卖出失败: %v", err)
 	}
@@ -643,5 +662,182 @@ func TestMomentumPoolRouting(t *testing.T) {
 	e2.OnSignals([]combat_agent.Signal{sig}, quotes)
 	if len(e2.Positions()) != 0 {
 		t.Fatalf("未开动量池时不应建仓, 实际 %d", len(e2.Positions()))
+	}
+}
+
+// TestFeesCharged §R1/R2 费用入账：买入扣佣金(含最低5元)、持仓成本含费、
+// 卖出扣佣金+印花税且滑点下浮、Trade.Fee 留痕。
+// English: fee accounting end-to-end — commission debited on buys (min ¥5), cost is fee-inclusive,
+// sells pay commission+stamp tax with slippage marked down, and Trade.Fee records it all.
+func TestFeesCharged(t *testing.T) {
+	c := DefaultConfig() // §R11 出厂默认即真实费率
+	c.Enabled = true
+	c.InitialCapital = 1000000
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape"})
+	now := time.Now()
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	p := e.positions["600000.SH"]
+	if p == nil {
+		t.Fatal("应建仓")
+	}
+	// FixedAmount=10000 @10元 → 1000股；滑点5bp后价 10.005，本金 10005；
+	// 佣金 max(10005×0.00025,5)=5（最低档生效）→ 含费成本 10010
+	if math.Abs(p.Cost-10010) > 0.01 {
+		t.Errorf("持仓成本应为本金10005+最低佣金5=10010, 实际 %.2f", p.Cost)
+	}
+	lastBuy := e.trades[len(e.trades)-1]
+	if math.Abs(lastBuy.Fee-5) > 1e-9 {
+		t.Errorf("买单 Fee 应为 5, 实际 %.2f", lastBuy.Fee)
+	}
+	// 次日以 12 元清仓：滑点下浮后 11.994 → 毛得 11994；
+	// 费用=佣金 max(11994×0.00025,5)=5 + 印花税 11994×0.0005≈6 → 净约 11983
+	t1Ready(e)
+	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("卖出失败: %v", err)
+	}
+	lastSell := e.trades[len(e.trades)-1]
+	if want := 11.0; math.Abs(lastSell.Fee-want) > 0.01 {
+		t.Errorf("卖单 Fee 应约为佣金5+印花税6=%.2f, 实际 %.2f", want, lastSell.Fee)
+	}
+	wantRealized := float64(11994-11) - 10010
+	if math.Abs(e.realized-wantRealized) > 0.01 {
+		t.Errorf("已实现盈亏应按净额口径 %.2f, 实际 %.2f", wantRealized, e.realized)
+	}
+}
+
+// TestT1BlocksSameDaySell §R3 T+1：当日买入当日卖被拒绝，次日可卖。
+// English: T+1 gate — same-day sell after buy is rejected; next-day sell goes through.
+func TestT1BlocksSameDaySell(t *testing.T) {
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"n_shape"})
+	now := time.Now()
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "浦发", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}})
+	if err == nil || !strings.Contains(err.Error(), "T+1") {
+		t.Fatalf("当日买入当日卖应被 T+1 拦截, got %v", err)
+	}
+	if len(e.positions) != 1 {
+		t.Fatal("被拦截后持仓应保留")
+	}
+	t1Ready(e)
+	if err := e.Sell("600000.SH", map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("次日卖出应放行, got %v", err)
+	}
+}
+
+// TestMaxPositionsContinueProcessing §R4 回归：达持仓上限后，后续止损/清仓信号仍必须被执行。
+// English: R4 regression — after the position cap is hit, later stop-loss/close signals must still run.
+func TestMaxPositionsContinueProcessing(t *testing.T) {
+	c := testCfg()
+	c.MaxPositions = 1
+	e := New(c, "")
+	e.SetStrategyPools([]string{"n_shape", "dragon"})
+	now := time.Now()
+	q := map[string]*data.StockInfo{
+		"600000.SH": {Price: 10},
+		"000001.SZ": {Price: 20},
+	}
+	// 第一笔建仓占满上限；第二笔买入应被拒并留痕
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "A", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+	}, q)
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "000001.SZ", Name: "B", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 20, GeneratedAt: now},
+	}, q)
+	if _, held := e.positions["000001.SZ"]; held {
+		t.Fatal("达上限后第二笔不应建仓")
+	}
+	found := false
+	for _, o := range e.Orders() {
+		if o.Code == "000001.SZ" && o.Status == "rejected" && strings.Contains(o.Reason, "持仓数达上限") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("超限买单应有 rejected 审计留痕")
+	}
+	// 关键回归：随后的止损信号必须仍被执行（旧代码 return 直接吞掉）
+	t1Ready(e)
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "A", Direction: "提醒", Action: "止损", AlertType: "止损"},
+	}, q)
+	if len(e.positions) != 0 {
+		t.Fatal("达上限后止损信号应正常执行(旧实现被 return 吞掉)")
+	}
+}
+
+// TestLimitUpByBoard §R6 分板块封板幅度：主板10%、创业科创20cm、ST 5%。
+// English: board-aware sealed-board thresholds — main 10%, ChiNext/STAR 20%, ST 5%.
+func TestLimitUpByBoard(t *testing.T) {
+	if limitUpPct("600000.SH", "浦发银行") != 9.9 {
+		t.Fatal("主板应为 9.9")
+	}
+	if limitUpPct("300750.SZ", "宁德时代") != 19.9 {
+		t.Fatal("创业板应为 19.9")
+	}
+	if limitUpPct("688160.SH", "") != 19.9 {
+		t.Fatal("科创板应为 19.9")
+	}
+	if limitUpPct("002084.SH", "*ST海工") != 4.9 {
+		t.Fatal("ST 应为 4.9")
+	}
+	if limitUpPct("920001.BJ", "北交所") != 29.9 {
+		t.Fatal("北交所应为 29.9")
+	}
+	// 创业板涨 15% 未封板 → 可买；主板涨 10% 封板 → 拒
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"n_shape"})
+	now := time.Now()
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "300001.SZ", Name: "创板股", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"300001.SZ": {Price: 11.5, ChangePct: 15}})
+	if len(e.positions) != 1 {
+		t.Fatal("创业板涨15%(未及19.9)不应误拒")
+	}
+	e2 := New(testCfg(), "")
+	e2.SetStrategyPools([]string{"dragon"})
+	e2.OnSignals([]combat_agent.Signal{
+		{Code: "600519.SH", Name: "茅台", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 1500, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600519.SH": {Price: 1650, ChangePct: 10.02}})
+	if len(e2.positions) != 0 {
+		t.Fatal("主板涨10.02%(封板)应拒买")
+	}
+}
+
+// TestPoolMinScoreEnforced §R7 MinScore 生效：自动信号低于门槛被拒，手动买入不受门槛约束。
+// English: MinScore is enforced for auto signals below the threshold; manual buys bypass the gate.
+func TestPoolMinScoreEnforced(t *testing.T) {
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"dragon"})
+	rule := &PoolBuyRule{MinScore: 60}
+	e.SetPoolBuyRule("dragon", rule)
+	now := time.Now()
+	sig := combat_agent.Signal{
+		Code: "600000.SH", Name: "低分", Strategy: "龙头", StrategyType: "dragon",
+		Direction: "做多", Action: "buy", Price: 10, Confidence: 0.5, GeneratedAt: now,
+	}
+	e.OnSignals([]combat_agent.Signal{sig}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	if len(e.positions) != 0 {
+		t.Fatal("评分50<门槛60的自动信号不应建仓")
+	}
+	// 高分信号放行
+	sig2 := sig
+	sig2.Code = "600001.SH"
+	sig2.Confidence = 0.7
+	e.OnSignals([]combat_agent.Signal{sig2}, map[string]*data.StockInfo{"600001.SH": {Price: 10}})
+	if len(e.positions) != 1 {
+		t.Fatal("评分70≥门槛60应建仓")
+	}
+	// 手动买入不受门槛约束（confidence 语义上=用户自主决策）
+	e3 := New(testCfg(), "")
+	e3.SetStrategyPools([]string{"dragon"})
+	e3.SetPoolBuyRule("dragon", &PoolBuyRule{MinScore: 99})
+	if err := e3.BuyInPool("600000.SH", "手动", "龙头", "dragon", 10, map[string]*data.StockInfo{"600000.SH": {Price: 10}}); err != nil {
+		t.Fatalf("手动买入不受 MinScore 约束, got %v", err)
 	}
 }

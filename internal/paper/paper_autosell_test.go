@@ -75,6 +75,7 @@ func TestOnSignalsAutoClose(t *testing.T) {
 		closedCode, closedReason = code, reason
 	})
 	buyFill(t, e)
+	t1Ready(e) // §R3 T+1：模拟次日卖出
 
 	sig := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头",
 		Direction: "提醒", Action: "卖出", AlertType: "清仓", Reason: "炸板全出"}
@@ -103,6 +104,7 @@ func TestOnSignalsAutoClose(t *testing.T) {
 func TestOnSignalsAutoTrimOnceDaily(t *testing.T) {
 	e := sellTestEngine(t, true)
 	buyFill(t, e)
+	t1Ready(e) // §R3 T+1：模拟次日卖出
 
 	sig := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头",
 		Direction: "提醒", Action: "卖出", AlertType: "减仓", Reason: "移动止盈"}
@@ -123,6 +125,7 @@ func TestOnSignalsHardTPSLCloses(t *testing.T) {
 	for _, at := range []string{"止盈", "止损"} {
 		e := sellTestEngine(t, true)
 		buyFill(t, e)
+		t1Ready(e) // §R3 T+1
 		sig := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头",
 			Direction: "提醒", Action: at, AlertType: at}
 		e.OnSignals([]combat_agent.Signal{sig}, quotesOf(12))
