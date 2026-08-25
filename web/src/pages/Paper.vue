@@ -8,6 +8,15 @@
   virtual positions; normal users keep a manual book (buy/add/trim typed price and lots, static storage &
   view). The page shows the strategy-pool allocation, positions & fill log (div-grid + K-line expand +
   mobile bottom action sheet), an equity curve and signal-quality stats.
+
+  【核心数据流】页面挂载先拉一次全量状态，之后每 15s 轮询刷新（现价/净值随实时行情变化）；
+  分仓 tab 仅做前端筛选（持仓/成交/订单/统计卡随选中池联动），交易动作提交成功后统一重拉全量。
+  分仓池现金扣减由后端撮合完成（fillLocked），前端只展示池快照与守恒校验提示。
+  【后端接口】fetchPaperState（开关/统计/分仓快照）；fetchPaperPositions / fetchPaperTrades /
+  fetchPaperOrders / fetchPaperEquity（持仓·成交·订单·净值四类流水）；buyPaperPosition /
+  sellPaperPosition（手动加减仓，BuyEx 自动合并持仓）；resetPaper（注入资金=增量加现金不清仓）；
+  paperResetV2（清盘重置，可指定重置后初始资金）；resetPaperPool（单池清盘）；
+  configPaperPools（资金分配 / 仓位上限 / §A3 每池买入纪律三组配置共用入口）。
 -->
 <template>
   <div class="paper-page">
@@ -547,6 +556,7 @@ function poolCurrentRule(key) {
   return !!(p && p.buy_rule && (p.buy_rule.max_daily_buys || p.buy_rule.cooldown_minutes ||
     p.buy_rule.min_score || p.buy_rule.budget_pct_per_day))
 }
+/** 该池当前生效纪律的可读文本（如「限3次/冷却30分/分≥70/预算20%」），未设置返回空串。 */
 function poolCurrentRuleText(key) {
   const p = pools.value.find(x => x.key === key)
   const r = p && p.buy_rule

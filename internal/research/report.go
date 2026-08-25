@@ -114,6 +114,8 @@ type layerJSON struct {
 	MeanReturn *float64
 }
 
+// MarshalJSON 自定义 JSON 输出：把内部均值等字段按前端约定格式序列化
+// （空指针字段输出 null，避免 0 值伪装成真实统计）。
 func (r *FactorReport) MarshalJSON() ([]byte, error) {
 	j := struct {
 		ID           string

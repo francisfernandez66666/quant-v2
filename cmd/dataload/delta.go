@@ -37,16 +37,16 @@ var deltaTables = []deltaTable{
 	{"fina_indicator", "end_date"},
 	{"income", "end_date"},
 	{"cashflow", "end_date"},
-	{"stocks", ""},     // 元数据小表全量（INSERT OR REPLACE 幂等）
-	{"trade_cal", ""},  // 交易日历全量
+	{"stocks", ""},    // 元数据小表全量（INSERT OR REPLACE 幂等）
+	{"trade_cal", ""}, // 交易日历全量
 }
 
 // deltaLine delta 文件的一行：一张表的列名 + 行数组（与 cols 一一对应，NULL=null）。
 // English: one delta-file line — a table's columns plus row arrays (aligned with cols; NULL as null).
 type deltaLine struct {
-	Table string        `json:"table"`
-	Cols  []string      `json:"cols"`
-	Rows  [][]any       `json:"rows"`
+	Table string   `json:"table"`
+	Cols  []string `json:"cols"`
+	Rows  [][]any  `json:"rows"`
 }
 
 // cmdExportDelta 导出增量：SELECT 各表 date_col > since 的行（元数据表全量），写 gzip JSONL。

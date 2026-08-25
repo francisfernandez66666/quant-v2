@@ -32,9 +32,9 @@ func r0(v float64) float64 { return math.Round(v) }
 // fixSignal 适配前端信号格式的结构体。
 // 将内部 combat_agent.Signal 转换为前端期望的字段名和格式。
 type fixSignal struct {
-	Code         string  `json:"code"`          // 股票代码
-	Name         string  `json:"name"`          // 股票名称
-	Strategy     string  `json:"strategy"`      // 触发策略
+	Code     string `json:"code"`     // 股票代码
+	Name     string `json:"name"`     // 股票名称
+	Strategy string `json:"strategy"` // 触发策略
 	// §C 归属字段：信号所属战法资金池（dragon/double_bump/…/fac_1/pat_2）与库规则 ID。
 	// 前端据此决定是否显示「模拟买入」（非战法信号不可买）并把买入归入对应池。
 	StrategyType string  `json:"strategy_type,omitempty"`

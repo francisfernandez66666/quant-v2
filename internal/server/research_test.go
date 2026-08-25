@@ -294,9 +294,9 @@ func TestCandidateBacktestRouting(t *testing.T) {
 	s.handleResearchCandidates(rr, req)
 	var body struct {
 		Candidates []struct {
-			ID              int64  `json:"id"`
-			BacktestDone    bool   `json:"backtest_done"`
-			BacktestText    string `json:"backtest_result_text"`
+			ID           int64  `json:"id"`
+			BacktestDone bool   `json:"backtest_done"`
+			BacktestText string `json:"backtest_result_text"`
 		} `json:"candidates"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {

@@ -3,6 +3,13 @@
   Watchlist page Watchlist.vue
   展示用户自选股列表，含多维评分（N形/龙头/双凸/龙回头/动量），支持添加/删除/排序
   Shows the user's watchlist with multi-dimension scores (N-shape/dragon/double-bump/dragon-return/momentum), supporting add/remove/sort
+
+  【页面职责】自选股打分池管理：维护个人自选池的增删，实时呈现五维战法评分与排名
+  （表头可排序、达标/强势行高亮），行内可展开分时图与盘口五档；移动端点击整行弹出底部操作菜单。
+  【数据流】进入页面先读 localStorage 缓存秒开 → 快照+自选列表+评分三接口并发合并渲染 →
+  每 30 秒轮询刷新；非交易时段跳过刷新保留旧数据；列表任何变化经深度监听自动回写本地缓存。
+  【后端接口】status（交易时段判断）/ snapshot（热门快照兜底行情）/ watchlist（自选增删查，
+  由后端实时行情回填权威名称/现价/涨跌幅）/ evaluations（五维评分）。
 -->
 <template>
   <div class="watchlist-page">
@@ -399,6 +406,7 @@ function sheetRemove() {
   remove(code)
 }
 
+/** 挂载生命周期：先读本地缓存秒开，再拉取最新数据并启动 30 秒轮询保持实时评分 */
 onMounted(() => {
   // 先读缓存秒开，再拉取最新，并 30s 轮询
   // Read the cache for an instant open, fetch fresh data, then poll every 30s

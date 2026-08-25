@@ -132,8 +132,16 @@ const router = createRouter({ history: createWebHashHistory(), routes })
 // mount('#app') renders the root component into the #app element of index.html.
 const app = createApp(App)
 // §白屏取证：全局错误处理器——记录出错阶段(info)与完整堆栈，便于无头环境定位
+// 全局错误处理器：任何组件内未捕获异常都会进入这里，
+// 打印出错阶段（info，如 render/setup/watcher 回调）与完整堆栈，
+// 便于在无头环境 / APK WebView 里通过 logcat 定位白屏根因。
 app.config.errorHandler = (err, _inst, info) => {
   console.error('VUE_ERR>>', info, String((err && err.stack) || err))
 }
+// 安装路由插件：此后各页面组件可通过 <router-view> / useRouter 使用路由能力
 app.use(router)
+// 挂载到 #app：渲染完成即应用启动结束；
+// 后续页面切换由 vue-router 驱动，全局轮询 / SSE / 登录态管理集中在 App.vue。
+// 说明：本项目未引入 Pinia 等状态库——跨页共享数据集中在 api/index.js 的模块级
+// 变量（登录态、会话期号、SSE 连接）与各页面自身状态中。
 app.mount('#app')

@@ -14,7 +14,9 @@
     With search: cross-batch aggregation match (by stock name/code/sector), grouped by batch
 -->
 <template>
+  <!-- 弹窗遮罩层：visible 控制整体显隐；@click.self 保证只有点击遮罩空白处才派发 close，点内容区不误关 -->
   <div v-if="visible" class="log-overlay" @click.self="close">
+    <!-- 弹窗主体容器：头部 / 类型 tab / 日志内容区纵向排布 -->
     <div class="log-modal">
       <!-- 弹窗头部：标题 + 关闭按钮 -->
       <div class="log-header">

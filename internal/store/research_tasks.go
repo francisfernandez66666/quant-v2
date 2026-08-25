@@ -72,9 +72,9 @@ type ResearchTask struct {
 	// （秒级 updated_at 在同秒内无法区分先后，专用单调序列才可靠）。
 	RequeueSeq int64  `json:"requeue_seq,omitempty"`
 	CreatedAt  string `json:"created_at"`
-	StartedAt  string  `json:"started_at,omitempty"`
-	FinishedAt string  `json:"finished_at,omitempty"`
-	UpdatedAt  string  `json:"updated_at"`
+	StartedAt  string `json:"started_at,omitempty"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	UpdatedAt  string `json:"updated_at"`
 }
 
 // nowStr 当前本地时间串（统一格式，与既有表一致）。

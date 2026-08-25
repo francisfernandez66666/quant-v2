@@ -1,8 +1,8 @@
 package server
 
 import (
-	"net/http/httptest"
 	"encoding/json"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
@@ -14,7 +14,7 @@ func TestOptimizationsJSONShape(t *testing.T) {
 	defer db.Close()
 	_ = db.SaveOptimizationResults(990, "profitfactor", []map[string]any{
 		{"rank": 1.0, "strategy": "双响炮", "strategy_kind": "",
-			"params": map[string]any{"trail_pct": 5.0, "hold_days": 20.0, "min_score": 80.0},
+			"params":   map[string]any{"trail_pct": 5.0, "hold_days": 20.0, "min_score": 80.0},
 			"win_rate": 39.4, "profit_factor": 1.25, "win": 356.0, "loss": 548.0,
 			"avg_win_pct": 7.1, "avg_loss_pct": -5.3, "avg_hold_days": 9.9, "trigger_count": 904.0},
 	})

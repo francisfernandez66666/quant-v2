@@ -15,6 +15,7 @@
 -->
 <template>
   <div class="depth-panel">
+    <!-- 工具栏：标的名称 + 盘口时间与数据源标识 + 手动刷新按钮 -->
     <div class="depth-toolbar">
       <span class="depth-title">{{ ob.name || code }} · 盘口</span>
       <span v-if="ob.time" class="depth-time">{{ ob.time }} <i v-if="ob.source" class="src">{{ ob.source }}</i></span>
@@ -24,6 +25,7 @@
     <div v-if="loading" class="depth-state">加载中…</div>
     <div v-else-if="error" class="depth-state">{{ error }}</div>
 
+    <!-- 盘口主视图：拿到买卖档位数据后才渲染（加载中/错误态之外）；档位行数由后端 levels 决定 -->
     <template v-else-if="ob.bids && ob.bids.length">
       <div class="depth-body">
         <!-- 卖盘（倒序：卖五在最上，卖一贴近现价） -->

@@ -4,6 +4,19 @@
   展示优化器产出的候选列表，支持审批通过（应用权重）/ 驳回。
   Shows optimizer-produced candidates with approve (apply weights) / reject actions.
 -->
+<!--
+  ═══ 全量中文注释补充：页面职责 / 核心数据流 / 后端接口 ═══
+  页面职责：自动研究闭环工作台——① 待审批候选：因子/形态规则的可解释展示（玩法说明 + 样本内/外 IR、反推超额等验证指标的大白话结论）与审批下发；
+  ② 参数寻优中心：止盈×止损×持仓天×门槛 步进网格的分战法寻优结果（chips 视图 + 冠军卡 + 止盈止损热力网格 + 批次淘汰赛明细），
+     审批通过会把冠军参数写入对应战法的出场旋钮（config 热生效），并把 min_score 同步写入对应模拟盘池纪律；
+  ③ 战法库：已应用规则的启用/停用/改名/删除与效果监测（信号胜负、累计前向收益、回测超额）；
+  ④ 回测任务中心：全量回测/战法库回放的发起、进度轮询、暂停/继续/取消与断点续跑；⑤ 研究调度设置（夜间发现后是否追加全量回测）。
+  核心数据流：research 引擎产出候选 → 前端展示验证结论 → 持 research_approve 权限者审批 → 规则落库并热注入实盘；
+  寻优/回测任务统一入研究队列（手动高优先级、夜间低优先级，仅盘后窗口执行，被抢占任务断点续跑），前端 5s/30s 轮询进度并在页面刷新后恢复轮询。
+  交互的后端接口（经 ../api 封装）：fetchResearchProgress / fetchResearchCandidates / approve·rejectResearchCandidate / fetchResearchFactors /
+  fetchResearchLibrary 及启用·删除·改名 / backtestResearchCandidate / backtestLibraryRule / fetchAllBacktests / pause·resume·cancelBacktest /
+  fetchRunningBacktests / fetchBacktestStatus / fetchOptimizations / enqueueOptimize / approve·rejectOptimization / fetchSweepPools / saveSweepPool / fetchPaperState / configPaperPools。
+-->
 <template>
   <div class="research-page">
     <div class="page-header">
@@ -118,6 +131,7 @@
         </button>
       </div>
 
+      <!-- 寻优结果加载态 / 空态引导（空态引导用户到右上角发起全库寻优） -->
       <div v-if="loadingOpts" class="empty">加载中...</div>
       <div v-else-if="!optCur" class="empty">
         暂无寻优结果——点右上「发起全库寻优」，任务进研究队列，完成后排名自动落库到这里。
@@ -143,6 +157,8 @@
               ⚙ 参数池 / 池纪律
             </button>
           </div>
+          <!-- 冠军参数四件套（止盈/止损/持仓/门槛）+ 三种口径绩效对照：
+               寻优目标值（胜率/盈亏比/期望）→ 实盘口径复核（冠军参数注入真实出场逻辑后的整库回放）→ 对应模拟盘资金池实测 -->
           <div class="oc-grid">
             <div class="oc-item"><label>止盈线</label><b>{{ fmtNum((optCur.params||{}).take_profit_pct) }}%</b></div>
             <div class="oc-item"><label>止损线</label><b>{{ fmtNum((optCur.params||{}).stop_loss_pct) }}%</b></div>
@@ -345,6 +361,7 @@
               </span>
             </template>
           </div>
+          <!-- 运行统计：注入实盘后的信号数与胜负计数、累计前向收益、回测超额（正绿负红） -->
           <div class="lib-stats">
             <span class="stat">信号 <b>{{ s.signal_count }}</b></span>
             <span class="stat">胜 <b class="pos">{{ s.win }}</b></span>
@@ -374,6 +391,7 @@
               </span>
             </div>
           </div>
+          <!-- 库管理操作（需 research_approve 权限）：启停即时热重载 / 发起历史回放回测 / 展开详情 / 删除即退出实盘 -->
           <div class="lib-actions" v-if="canApprove">
             <button class="btn-toggle" @click="toggleLibrary(s)">
               {{ s.enabled ? '停用' : '启用' }}
@@ -528,6 +546,7 @@
               </div>
             </div>
           </template>
+          <!-- 单候选/夜间任务的结论行：B4 口径回测超额（正负配色），并从汇总报告文本中抽取期望收益片段 -->
           <div class="bt-result" v-if="j.status === 'done' && j.kind !== 'library'">
             回测超额 <b :class="signClass(j.avg_excess)">{{ fmt(j.avg_excess) }}</b>
             <em v-if="j.result_text && j.result_text.includes('期望')" style="margin-left:8px;font-size:11px;color:#64748b">
@@ -535,6 +554,7 @@
               期望
             </em>
           </div>
+          <!-- 失败原因展示；中断态提示可断点续跑（已算完的事件保留缓存，重跑只算剩余） -->
           <div class="bt-error" v-if="j.status === 'error'">{{ j.error }}</div>
           <div class="bt-error" v-else-if="j.status === 'interrupted'">
             {{ j.error || '任务中断，可重新发起续跑（断点缓存仍有效，重跑只计算剩余事件）' }}
@@ -587,6 +607,7 @@
     <!-- 候选卡片列表 -->
     <div v-if="activeTab === 'candidates' && candidates.length > 0" class="candidate-list">
       <div v-for="c in candidates" :key="c.id" class="candidate-card">
+        <!-- 候选头：编号 + 类型徽标（因子/形态/权重/盘口）+ 状态徽标 + 产出时间 -->
         <div class="cand-header">
           <span class="cand-id">#{{ c.id }}</span>
           <span :class="['tag', 'tag-kind', 'kind-' + c.kind]">{{ kindLabel(c.kind) }}</span>
@@ -657,6 +678,7 @@
               <span class="metric-value">{{ c.horizon }}</span>
             </div>
           </div>
+          <!-- 权重 chips：优化器给各因子分配的打分权重（降序展示），审批后即实盘选股权重 -->
           <div class="weights-row" v-if="weightList(c).length">
             <span class="weight-chip" v-for="w in weightList(c)" :key="w[0]">
               <span class="weight-fid">{{ w[0] }}</span>
@@ -1329,6 +1351,7 @@ const optCurHeat = computed(() => {
     return { tps, sls, map }
   } catch { return empty }
 })
+/** 读取热力格值：tp|sl 复合键查表，无数据返回 null（格内显示"—"） */
 function heatVal(tp, sl) {
   const v = optCurHeat.value.map[tp + '|' + sl]
   return (v === undefined || v === null) ? null : v

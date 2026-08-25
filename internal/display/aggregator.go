@@ -134,6 +134,7 @@ func (a *Aggregator) SetAuction(items []data.HithinkAuctionItem) {
 	a.current.Auction = items
 }
 
+// Current 返回看板聚合数据快照（读锁拷贝语义，供 /api/dashboard 与 SSE 广播消费）。
 func (a *Aggregator) Current() *DashboardData {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

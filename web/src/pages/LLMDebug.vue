@@ -3,6 +3,13 @@
   LLM analysis debug page LLMDebug.vue
   展示 LLM 新闻分析管线两阶段结果：Stage1 关键词初筛 + Stage2 LLM 深度分析
   Shows the two-stage results of the LLM news analysis pipeline: Stage1 keyword pre-filter + Stage2 LLM deep analysis
+
+  【页面职责】LLM 调试诊断：还原每轮新闻分析管线的中间过程——Stage1 初筛逐条标注通过/过滤、
+  Stage2 深度分析产出的事件卡片（方向/评分/关联板块与个股/上下游传导/影响等级/事件类型/判定理由），
+  用于核对 LLM 分析质量与初筛召回。
+  【数据流】挂载时拉取当日全量轮次记录并默认展示最新一轮；页面无自动轮询，依赖手动刷新按钮；
+  后端返回 no_engine 时映射为"Agent 未就绪"空态，空记录映射为"暂无数据"空态。
+  【后端接口】stage records（当日轮次诊断记录：原始标题、selected_idx 通过索引、Stage2 事件列表等）。
 -->
 <template>
   <div class="llm-debug-page">

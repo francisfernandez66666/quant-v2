@@ -62,7 +62,9 @@ func ParseSweepParams(s string) SweepParams {
 	_ = json.Unmarshal([]byte(s), &p)
 	// 向后兼容：旧格式 {trail_pct} → 新格式 {take_profit_pct}
 	if p.TakeProfitPct == 0 {
-		var old struct{ TrailPct float64 `json:"trail_pct"` }
+		var old struct {
+			TrailPct float64 `json:"trail_pct"`
+		}
 		if json.Unmarshal([]byte(s), &old) == nil && old.TrailPct > 0 {
 			p.TakeProfitPct = old.TrailPct
 		}

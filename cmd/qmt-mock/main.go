@@ -66,12 +66,12 @@ type pos struct {
 // book 网关内存账本。
 // （book is the gateway in-memory book.）
 type book struct {
-	mu       sync.Mutex
-	orders   map[string]*order
+	mu        sync.Mutex
+	orders    map[string]*order
 	positions map[string]*pos
-	signal   map[string]string // signal_id → order_id（幂等索引）
-	account  string
-	nextID   int
+	signal    map[string]string // signal_id → order_id（幂等索引）
+	account   string
+	nextID    int
 }
 
 func newBook(account string) *book {

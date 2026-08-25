@@ -2,6 +2,13 @@
   热点页面 Hotspot.vue (Hotspot page)
   展示热点板块（含异动原因弹窗）、全市场个股评分排名、宏观日历、IPO日历、热点资讯
   Shows hot sectors (with reason modal), market-wide stock score rankings, macro calendar, IPO calendar, hot news
+
+  【页面职责】热点页：板块涨幅榜（卡片含评分/涨幅/涨停家数/资金净流入，点击查看异动原因与触发新闻）、
+  全市场个股五维战法评分排名（表头可排序、达标高亮）、宏观/IPO 日历、热点资讯流与手动 LLM 补推入口。
+  【数据流】挂载时容错串行加载（单接口失败不影响其余区块）→ 每 5 秒轮询 + SSE 推送刷新；
+  页面不可见时暂停轮询；板块数据优先取当日最新一轮轮次记录，无记录时回退实时热点接口。
+  【后端接口】status（交易时段判断）/ evaluations（全市场五维评分）/ sector_hot_records（板块轮次记录）/
+  sector_hot（当前热点板块）/ news（资讯+日历）/ ipo_calendar / reanalyze_news（手动补推新闻分析）。
 -->
 <template>
   <div class="hotspot-page">
@@ -382,6 +389,7 @@ async function onReanalyze() {
   }
 }
 
+/** 挂载生命周期：先加载一次数据，再启动 5 秒轮询、页面可见性监听与 SSE 订阅 */
 onMounted(() => {
   load()
   // 每 5 秒轮询一次热点数据；页面不可见时暂停轮询 (poll hotspot every 5s; pause when hidden)
@@ -403,6 +411,7 @@ onMounted(() => {
   api.connectSSE()
   unsubSSE = api.onSSE(handleSSE)
 })
+/** 卸载生命周期：清理轮询定时器、可见性监听与 SSE 订阅，防止内存泄漏 */
 onUnmounted(() => {
   // 清理定时器与 SSE 订阅 (clear the timer and SSE subscription)
   if (timer) clearInterval(timer)

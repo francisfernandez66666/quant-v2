@@ -46,10 +46,10 @@ type OrderResult struct {
 // GatewayState 网关状态快照（/state）。
 // English: gateway state snapshot (/state).
 type GatewayState struct {
-	Connected bool                     `json:"connected"` // QMT 是否在线
-	Account   string                   `json:"account"`   // 资金账号
-	Positions []store.RealPosition     `json:"positions"` // 网关侧全部持仓（对账源）
-	Orders    []store.RealOrder        `json:"orders"`    // 网关侧委托
+	Connected bool                 `json:"connected"` // QMT 是否在线
+	Account   string               `json:"account"`   // 资金账号
+	Positions []store.RealPosition `json:"positions"` // 网关侧全部持仓（对账源）
+	Orders    []store.RealOrder    `json:"orders"`    // 网关侧委托
 }
 
 // Executor 下单执行器接口：屏蔽真实网关与 mock/降级实现差异。

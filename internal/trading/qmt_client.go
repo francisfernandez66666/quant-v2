@@ -144,10 +144,10 @@ func (c *QMTClient) State() (*GatewayState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	var raw struct {
-		Connected bool                   `json:"connected"`
-		Account   string                 `json:"account"`
-		Positions []store.RealPosition   `json:"positions"`
-		Orders    []store.RealOrder      `json:"orders"`
+		Connected bool                 `json:"connected"`
+		Account   string               `json:"account"`
+		Positions []store.RealPosition `json:"positions"`
+		Orders    []store.RealOrder    `json:"orders"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/state", nil, &raw); err != nil {
 		return nil, err

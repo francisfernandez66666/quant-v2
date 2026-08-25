@@ -26,8 +26,8 @@ func testDB(t *testing.T) *store.DB {
 }
 
 // TestAdviseAddAndHold 验证加仓/格局判定：
-//  - 有信号且回撤可控 → 加仓；
-//  - 盈利但无信号（加仓要求信号活跃）→ 只格局。
+//   - 有信号且回撤可控 → 加仓；
+//   - 盈利但无信号（加仓要求信号活跃）→ 只格局。
 func TestAdviseAddAndHold(t *testing.T) {
 	db := testDB(t)
 	// 两个持仓：600000 有信号且回撤小 → 加仓；000001 盈利无信号 → 格局
@@ -51,19 +51,19 @@ func TestAdviseAddAndHold(t *testing.T) {
 		"000001": {Code: "000001", SignalActive: false},
 	}
 	in := AdviceInput{
-		Agent:        nil, // 卖出侧函数需真实 Agent，加仓/格局路径不依赖（nil 时直接跳过卖出侧）
-		MarketAPI:    nil,
-		Positions:    positions,
+		Agent:     nil, // 卖出侧函数需真实 Agent，加仓/格局路径不依赖（nil 时直接跳过卖出侧）
+		MarketAPI: nil,
+		Positions: positions,
 		Quotes: map[string]*data.StockInfo{
 			"600000": {Code: "600000", Price: 10.8}, // 回撤 (10.8-11)/11 = -1.8% 可控
 			"000001": {Code: "000001", Price: 52},   // 盈利 4%
 		},
-		DayKLines:  nil,
-		Scores:     scores,
-		MD:         nil,
-		D1Scores:   nil,
+		DayKLines:    nil,
+		Scores:       scores,
+		MD:           nil,
+		D1Scores:     nil,
 		EmotionPhase: "高潮",
-		Cfg:        cfg,
+		Cfg:          cfg,
 	}
 	advices := Advise(in)
 	if len(advices) != 2 {
@@ -195,8 +195,12 @@ func indexOf(s, sub string) int {
 // （failingExecutor simulates an unreachable gateway.）
 type failingExecutor struct{}
 
-func (failingExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) { return nil, context.DeadlineExceeded }
-func (failingExecutor) PlaceSell(req OrderRequest) (*OrderResult, error) { return nil, context.DeadlineExceeded }
-func (failingExecutor) Cancel(orderID string) error                      { return context.DeadlineExceeded }
-func (failingExecutor) State() (*GatewayState, error)                    { return nil, context.DeadlineExceeded }
-func (failingExecutor) Health() (bool, error)                            { return false, context.DeadlineExceeded }
+func (failingExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) {
+	return nil, context.DeadlineExceeded
+}
+func (failingExecutor) PlaceSell(req OrderRequest) (*OrderResult, error) {
+	return nil, context.DeadlineExceeded
+}
+func (failingExecutor) Cancel(orderID string) error   { return context.DeadlineExceeded }
+func (failingExecutor) State() (*GatewayState, error) { return nil, context.DeadlineExceeded }
+func (failingExecutor) Health() (bool, error)         { return false, context.DeadlineExceeded }

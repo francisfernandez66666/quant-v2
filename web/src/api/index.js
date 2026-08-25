@@ -166,6 +166,8 @@ export function hasPerm(perm) {
 /**
  * 拉取并缓存当前登录用户信息（角色/权限位）
  * Fetches and caches the current user's profile (role / permission bits)
+ * 对应后端 GET /api/auth/me；成功后把 role/perms 写回 localStorage，
+ * 供 isAdmin()/hasPerm() 在换账号后读到最新权限
  * @returns {Promise<object>} { id, username, role, perms, enabled }
  */
 export async function refreshMe() {
@@ -308,6 +310,7 @@ async function request(path, opts = {}) {
  * @param {string} username - username
  * @param {string} password - 密码
  * @param {string} password - password
+ * 对应后端 POST /api/auth/login，请求体 { username, password }
  * @returns {Promise<object>} { token, account, expires_at }
  */
 export async function login(username, password) {
@@ -389,6 +392,9 @@ export async function fetchStatus() {
 // 获取仪表盘汇总数据（含按战法分组的胜率统计）
 // 对应 GET /api/dashboard，返回 { report_stats: { by_strategy: {...} }, ... }；
 // by_strategy 按战法聚合胜率/平均盈亏/盈亏比，用于绩效归因展示。
+/**
+ * 获取仪表盘汇总数据 · 对应后端 GET /api/dashboard
+ */
 export async function fetchDashboard() {
   return request('/api/dashboard')
 }
@@ -397,6 +403,9 @@ export async function fetchDashboard() {
 // Fetch engine health status
 // 对应 GET /api/engine_health，返回各子系统连通性
 // Maps to GET /api/engine_health, returns connectivity of each subsystem
+/**
+ * 获取流程引擎子系统健康状况 · 对应后端 GET /api/engine_health
+ */
 export async function fetchEngineHealth() {
   return request('/api/engine_health')
 }
@@ -493,6 +502,7 @@ export async function fetchPaperTrades() {
 
 /** 模拟盘：订单生命周期记录（信号→订单→成交/拒绝 全留痕，最新在前） */
 /** Paper order-lifecycle records (signal→order→outcome audit, newest first) */
+// 对应 GET /api/paper/orders，返回当日全部订单生命周期留痕记录（最新在前）
 export async function fetchPaperOrders() {
   return request('/api/paper/orders')
 }
@@ -713,6 +723,7 @@ export async function fetchIPOCalendar() {
  *       so special characters in the code do not break the request.
  * @param {string} code - 股票代码
  * @param {string} code - the stock code
+ * 对应后端 GET /api/stock/lookup?code=...，返回个股名称/现价等基础信息
  */
 export async function fetchStockLookup(code) {
   return request('/api/stock/lookup?code=' + encodeURIComponent(code))
@@ -726,6 +737,7 @@ export async function fetchStockLookup(code) {
  * Fetch news
  * @param {boolean} [all] - 是否获取全部（含历史）资讯；true 时追加 ?all=true 查询参数
  * @param {boolean} [all] - whether to fetch all (including historical) news; appends ?all=true when true
+ * 对应后端 GET /api/news（all=true 时追加 ?all=true，返回含历史的全部资讯）
  */
 export async function fetchNews(all) {
   return request(all ? '/api/news?all=true' : '/api/news')
@@ -738,6 +750,7 @@ export async function fetchNews(all) {
  * A remedy for when upstream LLM flakiness during the morning/intraday caused a whole batch to be left unanalyzed.
  * 异步执行，返回 202 表示已触发。
  * Runs asynchronously; a 202 response means it has been triggered.
+ * 对应后端 POST /api/news/reanalyze
  */
 export async function reanalyzeNews() {
   return request('/api/news/reanalyze', { method: 'POST' })
@@ -1023,6 +1036,9 @@ export async function toggleNewsShowAll(enabled) {
 // Maps to GET /api/data_source_health
 // 返回 { eastmoney: true|false, sina: true|false, tencent: true|false, ths: true|false }
 // (由 DataCoordinator.HealthCheck 返回，包含东财/新浪/腾讯/同花顺四大数据源的健康探测结果)
+/**
+ * 获取行情数据源健康探测结果 · 对应后端 GET /api/data_source_health
+ */
 export async function fetchDataSourceHealth() {
   return request('/api/data_source_health')
 }
@@ -1030,6 +1046,9 @@ export async function fetchDataSourceHealth() {
 // 对应 GET /api/news_source_health，返回新闻源健康探测结果
 // Maps to GET /api/news_source_health
 // 返回 { cainanshe: true|false, kuaixun: true|false }
+/**
+ * 获取新闻源健康探测结果 · 对应后端 GET /api/news_source_health
+ */
 export async function fetchNewsSourceHealth() {
   return request('/api/news_source_health')
 }
@@ -1055,7 +1074,8 @@ export async function fetchConsultHistory() {
   return request('/api/consult/history')
 }
 
-/** Clear today's consultation chat history */
+/** 清空当日咨询对话历史 · 对应后端 DELETE /api/consult/history
+ *  Clear today's consultation chat history */
 // 对应 DELETE /api/consult/history，清空当日咨询对话
 // Maps to DELETE /api/consult/history; clears today's consultation messages
 export async function clearConsultHistory() {
@@ -1325,37 +1345,44 @@ export async function setAdminLLMConfig(id, cfg) {
 }
 
 /** §P2-f 参数优化：入队全库扫参任务（objective: profitFactor|winRate|avgWin；盘后窗口执行）。
- *  params 可选 {objective, start, end, top_n}；同 ref 幂等（已有排队/运行中返回现任务）。 */
+ *  params 可选 {objective, start, end, top_n}；同 ref 幂等（已有排队/运行中返回现任务）。
+ *  对应后端 POST /api/backtest/optimize。 */
 export async function enqueueOptimize(params) {
   return request('/api/backtest/optimize', { method: 'POST', data: params || {} })
 }
 
-/** §P2-f 查询寻优结果列表（按任务倒序分组，含每行排名/参数/指标/审批状态） */
+/** §P2-f 查询寻优结果列表（按任务倒序分组，含每行排名/参数/指标/审批状态）
+ *  对应后端 GET /api/research/optimizations */
 export async function fetchOptimizations() {
   return request('/api/research/optimizations')
 }
 
-/** §D1 各战法寻优参数池：列出全部自定义四维步进配置（未配置战法走引擎默认池） */
+/** §D1 各战法寻优参数池：列出全部自定义四维步进配置（未配置战法走引擎默认池）
+ *  对应后端 GET /api/research/sweep-pools */
 export async function fetchSweepPools() {
   return request('/api/research/sweep-pools')
 }
 
-/** §D1 保存单战法四维步进搜索空间（服务端校验组合数护栏，超 10 万拒绝） */
+/** §D1 保存单战法四维步进搜索空间（服务端校验组合数护栏，超 10 万拒绝）
+ *  对应后端 PUT /api/research/sweep-pools，body 为单战法配置对象 */
 export async function saveSweepPool(cfg) {
   return request('/api/research/sweep-pools', { method: 'PUT', data: cfg })
 }
 
-/** §P2-f 审批一条寻优排名：规则级参数覆盖写 applied_*.json + 热重载实盘生效 */
+/** §P2-f 审批一条寻优排名：规则级参数覆盖写 applied_*.json + 热重载实盘生效
+ *  对应后端 POST /api/research/optimizations/{id}/approve */
 export async function approveOptimization(id) {
   return request('/api/research/optimizations/' + id + '/approve', { method: 'POST' })
 }
 
-/** §P2-f 淘汰一条寻优排名 */
+/** §P2-f 淘汰一条寻优排名
+ *  对应后端 POST /api/research/optimizations/{id}/reject */
 export async function rejectOptimization(id) {
   return request('/api/research/optimizations/' + id + '/reject', { method: 'POST' })
 }
 
-/** §v2 清盘：支持显式指定重置后初始资金（reset_to）与持仓上限 */
+/** §v2 清盘：支持显式指定重置后初始资金（reset_to）与持仓上限
+ *  对应后端 POST /api/paper/reset（body 原样透传后端，与 resetPaper() 共用同一路由） */
 export async function paperResetV2(body) {
   return request('/api/paper/reset', { method: 'POST', data: body })
 }

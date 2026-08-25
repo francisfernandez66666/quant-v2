@@ -4,6 +4,17 @@
   展示所有策略评级信号，支持按等级筛选、查看 D1-D4 子维度评分、确认买入/忽略操作
   Lists all strategy-rated signals with level filtering, D1-D4 sub-dimension scores, and confirm buy/ignore actions
 -->
+<!--
+  ═══ 全量中文注释补充：页面职责 / 核心数据流 / 后端接口 ═══
+  页面职责：实盘信号工作台——做多/做空/提醒类信号的统一流水。等级三档（可开仓/观察/静默）+ 总分 + D1~D4 子维度评分透视；
+  支持等级×战法名称双维筛选、行内展开分时图与五档盘口、真实买入二次确认、忽略、一键收藏自选股，以及移动端底部操作菜单。
+  模拟盘联动：「模拟买入」仅在模拟盘开启且信号可归属到某个战法资金池时显示（规则 ID fac_/pat_ 前缀即池 key，
+  或四大内置战法类型）；成交后按 strategy_id 归入对应战法池记账——可自填价格/手数"搬运持仓"，留空价格按实时价撮合。
+  核心数据流：后端扫描引擎产出信号 → 首载全量拉取 → SSE 推送（新信号/扫描完成）实时补拉，5 秒轮询兜底且页面隐藏即暂停 →
+  买入/忽略经确认弹窗提交后刷新列表保持一致。
+  交互的后端接口（经 ../api 封装）：fetchSignals 信号流 / actionSignal 提交买入·忽略 / addWatchlist 收藏自选 /
+  fetchPaperState 探测模拟盘开关 / buyPaperPosition 模拟买入归池 / connectSSE + onSSE 订阅后端推送。
+-->
 <template>
   <div class="signals-page">
     <!-- 页头：标题 + 等级筛选按钮（Header: title + level filter buttons）-->
@@ -25,10 +36,12 @@
         <button class="btn-log" @click="showLog = true">📋 日志</button>
       </div>
     </div>
+    <!-- 日志弹窗：查看引擎扫描批次与 LLM 归因批次的运行日志 -->
     <LogModal :visible="showLog" @close="showLog = false" />
 
     <!-- 信号列表表格（Signal table）-->
     <div class="signals-table">
+      <!-- 表头列语义：总分=策略四维加权后的综合分；D1~D4 为子维度分（悬停胶囊看判定依据）；「分时」可展开同屏对照盘口 -->
       <div class="table-header">
         <span class="col-code">代码</span>
         <span class="col-name">名称</span>
@@ -45,6 +58,7 @@
       <div class="table-row" @click="onRowTap(s)">
         <span class="col-code" data-label="代码">{{ s.code }}</span>
         <span class="col-name" data-label="名称">{{ s.name || '-' }}</span>
+        <!-- 最新价与涨跌幅（涨红跌绿） -->
         <span class="col-price" data-label="现价/涨跌">
           <span class="px-price">¥{{ (s.price || 0).toFixed(2) }}</span>
           <span :class="['px-chg', (s.change_pct || 0) >= 0 ? 'up' : 'down']">
@@ -53,11 +67,13 @@
         </span>
         <span class="col-strategy" data-label="策略">{{ s.strategy }}</span>
         <span class="col-score" data-label="总分">{{ s.total_score?.toFixed(0) }}</span>
+        <!-- 等级徽章：优先展示交易/观望结论，否则回落到提醒档位（可开仓/观察/静默） -->
         <span class="col-level" data-label="等级">
           <span :class="['tag', s.remind_level]">
             {{ s.level === '交易' ? '交易' : s.level === '观望' ? '观望' : s.remind_level === 'strong' ? '可开仓' : s.remind_level === 'observe' ? '观察' : '静默' }}
           </span>
         </span>
+        <!-- D1 事件子分（含 LLM 事件解释与负面拦截标记）+ D2/D3/D4 子维度分；悬停查看各维度判定理由 -->
         <span class="col-detail" data-label="D1/D2/D3/D4">
           <span class="d-pill d1"
                 :title="'D1事件: ' + (s.d1_reason || s.d1_event || '无事件') + (s.d1_blocked ? '（负面拦截）' : '')">
@@ -108,6 +124,7 @@
         <!-- 模拟盘买入（移动端菜单）：仅在模拟盘启用时显示，按实时价成交（mobile menu paper buy: only when paper trading is enabled, fills at live price）-->
         <button v-if="sheetSignal.can_open && paperOn && hasStrategyPool(sheetSignal)" class="sheet-btn sheet-paper" @click="sheetPaperBuy"
                 title="模拟买入归入该信号所属战法资金池（非战法信号不可买）">模拟买入</button>
+        <!-- 其余操作项：忽略 / 收藏 / 分时切换 / 取消 -->
         <button v-if="sheetSignal.action === 'buy'" class="sheet-btn" @click="sheetIgnore">忽略</button>
         <button v-if="!sheetSignal.can_open && sheetSignal.action !== 'buy'" class="sheet-btn" @click="sheetCollect">收藏</button>
         <button class="sheet-btn" @click="sheetKline">{{ klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时' }}</button>
@@ -299,21 +316,29 @@ function hasStrategyPool(s) {
   return !!s.strategy_type
 }
 
+/**
+ * 模拟盘买入主流程：弹窗采集买入价与手数 → 校验 → 二次确认 → 调后端按战法资金池归集记账。
+ * 价格留空/无效时不传价，由后端按实时价撮合；strategy_id/strategy_type 用于映射战法池。
+ */
 async function paperBuy(s) {
+  // 弹窗输入：价格为空表示跟随实时价；手数以"手"为单位（1 手 = 100 股）
   const priceStr = prompt('输入买入价（元，留空用实时价）：', s.price || s.close || '')
   const qtyStr = prompt('输入买入手数（1 手 = 100 股）：', '1')
   if (qtyStr === null || priceStr === null) return // 用户取消
   const qty = parseInt(qtyStr, 10)
   const price = parseFloat(priceStr)
+  // 手数必须为正整数，否则中止本次买入
   if (isNaN(qty) || qty <= 0) {
     alert('买入手数无效，请填写正整数')
     return
   }
+  // 未填有效价 → 按"实时价成交"话术二次确认；填了 → 按指定价确认
   if (isNaN(price) || price <= 0) {
     if (!confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手？将按实时价成交。`)) return
   } else {
     if (!confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手 @${price.toFixed(2)}？`)) return
   }
+  // 下单归池：依次传 代码/名称/所属战法/参考价/指定价(0=按实时价)/手数/战法类型/规则 ID——后端据此把这笔持仓记入对应战法资金池
   try {
     await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty, s.strategy_type || '', s.strategy_id || '')
     alert(`已模拟买入 ${s.code} ${qty} 手`)
@@ -424,9 +449,9 @@ onUnmounted(() => {
   if (visHandler) document.removeEventListener('visibilitychange', visHandler)
   if (unsubSSE) unsubSSE()
 })
-</script>
 
-
+// §修复：showFeedback 此前物理位置在脚本块结束标签之后（SFC 编译器忽略块外内容），
+// 收藏操作的轻提示实际不可达。现移回 script 块内正常注册（注释中不得出现字面闭合标签）。
 /** 显示临时反馈文字，2.5 秒后消失 */
 /** Show temporary feedback text that disappears after 2.5 seconds */
 function showFeedback(msg, type) {
@@ -440,6 +465,9 @@ function showFeedback(msg, type) {
   }
   setTimeout(() => { div.remove() }, 2500)
 }
+</script>
+
+
 <style scoped>
 .signals-page { max-width: 1200px; }
 .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }

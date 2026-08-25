@@ -89,6 +89,7 @@
         <div class="trade-time" v-if="inTradeTime !== null">
           {{ inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后' }}
         </div>
+        <!-- 顶部右侧操作区：做空开关 / 通知测试 / 退出登录 -->
         <div class="topbar-right">
           <!-- 做空开关：v-model 绑定 shortEnabled，切换时调用 onShortToggle 持久化 -->
           <label class="short-toggle" :class="{ active: shortEnabled }">
@@ -113,6 +114,7 @@
     </main>
 
     <!-- Toast 消息容器：按添加顺序堆叠展示，type 决定样式（info/warning/success/err） -->
+    <!-- Toast 全局提示容器：App 层所有接口成功/失败反馈都经 addToast 在此堆叠展示 -->
     <div class="toast-container">
       <div v-for="(t, i) in toasts" :key="i" :class="['toast', t.type]">{{ t.msg }}</div>
     </div>

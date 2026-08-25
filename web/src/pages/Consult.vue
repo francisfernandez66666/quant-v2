@@ -4,6 +4,14 @@
   Multi-turn LLM stock consultation: chat bubbles + message input + inline API Key config
   对话历史保存在后端（consult_history.json），跨交易日自动清空
   Conversation history is kept on the backend (consult_history.json) and cleared each trading day
+
+  【页面职责】个股咨询：与 AI 顾问多轮对话问答；开启"专业模式"后提问会由后端注入该股实测行情上下文
+  （现价/资金净流入/大单明细/均线/MACD/策略信号），盘中每 15 分钟限流一次、盘前盘后不限；
+  LLM 未配置时内联展示 API Key 配置表单，保存成功后自动折叠。
+  【数据流】挂载时先探测 LLM 配置（回填表单并判断是否已配置）→ 加载专业模式开关 → 拉取当日对话历史；
+  发送消息采用"乐观上屏 + 后端持久化"模式，失败以 AI 气泡提示错误并按需展开配置表单。
+  【后端接口】consult chat（发送咨询）/ consult history（当日历史查询与清空）/
+  consult pro-mode（专业模式开关读写）/ llm config（LLM 地址/Key/模型配置读写）。
 -->
 <template>
   <div class="consult-page">

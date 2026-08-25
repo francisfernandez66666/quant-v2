@@ -2,6 +2,14 @@
   仪表盘 Dashboard.vue (Dashboard page)
   首页概览：信号统计卡片、热门个股快照、宏观/IPO日历、热门板块、资讯、策略信号列表、系统运行状态
   Home overview: signal stat cards, hot stock snapshot, macro/IPO calendars, hot sectors, news, signals, system status
+
+  【页面职责】看板首页：聚合新闻事件流（资讯 + 宏观/IPO 日历）、板块热度（热门板块涨幅与资金净流入）、
+  信号强度分布（强信号/观察中/静默）、按战法胜率统计以及数据源/流程引擎健康状态，作为全局盘面感知入口。
+  【数据流】挂载时并发拉取全部区块数据 → 每 5 秒定时轮询兜底 + 后端 SSE 实时推送即时刷新；
+  页面切后台时暂停轮询、切回前台立即补拉一次，避免对行情/资讯数据源形成请求洪峰。
+  【后端接口】signals（策略信号）/ status（服务状态含 scan_stats 与快照规模）/ news（资讯+日历）/
+  sector_hot（热门板块）/ hot_snapshot（热门个股快照）/ ipo_calendar（IPO 日历）/ dashboard（战法胜率报表），
+  外加数据源健康、新闻源健康、引擎健康三个探测接口（仅首次挂载拉取一次）。
 -->
 <template>
   <div class="dashboard">

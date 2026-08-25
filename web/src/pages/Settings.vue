@@ -4,6 +4,16 @@
   包含服务器连接、通知、账户信息、LLM 配置、系统信息等设置项
   Contains server connection, notifications, account info, LLM config, system info and other settings
 -->
+<!--
+  ═══ 全量中文注释补充：页面职责 / 核心数据流 / 后端接口 ═══
+  页面职责：系统设置中心——服务器连接与在线探测、通知授权测试（浏览器通知/提示音）、账户信息（账号+令牌脱敏展示）、
+  LLM 配置（多 Key 轮询池 + 主模型 + 分类专用模型 + 归因批并发度，保存后端即热重建客户端，未配置自动降级关键词过滤）、
+  五大战法参数分组配置（龙头 / 双响炮 / N 形 / 龙回头 / 动量分权重，动量组含"提升才提醒"门控开关）、资讯显示开关、系统信息。
+  核心数据流：挂载时按序回读后端现状并回填表单（在线探测 → 已存 LLM 配置 → 五战法参数 → 资讯开关）；
+  各卡片独立保存：LLM 配置写回即触发热重建；战法参数整包写回后端配置；资讯开关切换即时同步。保存结果以行内反馈条提示成败。
+  交互的后端接口（经 ../api 封装）：fetchStatus 在线探测 / fetchLLMConfig + setLLMConfig LLM 配置读写（保存触发热重建）/
+  fetchStrategyConfig + setStrategyConfig 战法参数读写 / fetchNewsShowAllStatus + toggleNewsShowAll 资讯显示开关。
+-->
 <template>
   <div class="settings-page">
     <h2>设置</h2>
@@ -27,10 +37,12 @@
     <!-- 通知设置（Notification settings）-->
     <div class="setting-card">
       <div class="setting-header">通知设置</div>
+      <!-- 浏览器通知：请求系统授权并立即发一条测试通知，验证提醒链路是否打通 -->
       <div class="setting-row">
         <label>浏览器通知</label>
         <button class="btn-test" @click="requestNotify">授权并测试</button>
       </div>
+      <!-- 声音提醒：用 WebAudio 现场合成一段短促正弦音试听 -->
       <div class="setting-row">
         <label>声音提醒</label>
         <button class="btn-test" @click="playTest">测试声音</button>
@@ -48,6 +60,7 @@
         <label>账号</label>
         <span class="account">{{ account }}</span>
       </div>
+      <!-- 登录令牌仅脱敏展示前 20 位，完整值保存在本地 localStorage -->
       <div class="setting-row">
         <label>令牌</label>
         <span class="status offline">{{ token ? token.slice(0, 20) + '...' : '未登录' }}</span>
@@ -57,26 +70,32 @@
     <!-- LLM 配置（LLM configuration）-->
     <div class="setting-card">
       <div class="setting-header">LLM 配置</div>
+      <!-- LLM 服务地址：OpenAI 兼容接口根路径 -->
       <div class="setting-row">
         <label>API URL</label>
         <input v-model="llmApiUrl" placeholder="https://api.openai.com/v1" />
       </div>
+      <!-- 多个 Key 每行一个：后端组建轮询池分摊配额、规避单 Key 限流 -->
       <div class="setting-row">
         <label>API Key(s)</label>
         <textarea v-model="llmApiKeys" rows="4" placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" class="api-keys-input"></textarea>
       </div>
+      <!-- 主模型：新闻归因/摘要等主力调用走这里 -->
       <div class="setting-row">
         <label>模型</label>
         <input v-model="llmModel" placeholder="gpt-4o-mini" />
       </div>
+      <!-- 分类专用模型：高频轻量分类（Stage0/1 初筛）走更便宜的模型，留空回落主模型 -->
       <div class="setting-row">
         <label>分类专用模型</label>
         <input v-model="llmClassifierModel" placeholder="留空则用主模型" />
       </div>
+      <!-- 归因批并发度：新闻归因批量任务的并发上限，调大提速但更易触发供应商限流 -->
       <div class="setting-row">
         <label>归因批并发度</label>
         <input v-model.number="llmBatchConcurrency" type="number" min="1" max="16" placeholder="4" />
       </div>
+      <!-- 配置状态：未配置时自动降级为关键词过滤，不影响主流程 -->
       <div class="setting-row">
         <label>状态</label>
         <span :class="['status', llmConfigured ? 'online' : 'offline']">
@@ -105,6 +124,7 @@
                placeholder="0" />
       </div>
     </div>
+    <!-- 统一保存入口：把五组战法参数一次性写回后端配置；权重约束见各组标题提示 -->
     <div class="setting-card">
       <div class="setting-header">战法参数</div>
       <div class="setting-row">
@@ -205,56 +225,63 @@ const strategyGroups = [
   {
     key: 'dragon', title: '龙头战法（权重合计≤1）',
     fields: [
-      { k: 'f1_seal_weight', label: 'F1 首封权重', step: 0.05 },
-      { k: 'f2_resonance_weight', label: 'F2 共振权重', step: 0.05 },
-      { k: 'f3_premium_weight', label: 'F3 溢价权重', step: 0.05 },
-      { k: 'f4_rs_weight', label: 'F4 强度权重', step: 0.05 },
-      { k: 'pullback_max_pct', label: '最大回撤%', step: 0.01 },
-      { k: 'breaker_sell_half_pct', label: '炸板减半%', step: 0.01 },
-      { k: 'breaker_sell_all_pct', label: '炸板清仓%', step: 0.01 },
-      { k: 'buy_pullback_sell_half_pct', label: '买入回撤减半%', step: 0.01 },
-      { k: 'buy_pullback_sell_all_pct', label: '买入回撤清仓%', step: 0.01 },
-      { k: 'buy_day_close_below', label: '买入日收盘低于%', step: 0.01 },
-      { k: 'next_open_if_below', label: '次日开盘低于%', step: 0.01 },
-      { k: 'take_profit_pct', label: '止盈%', step: 1 },
+      // ── 打分权重：四因子加权合成本战法总分（建议合计 ≤ 1）──
+      { k: 'f1_seal_weight', label: 'F1 首封权重', step: 0.05 },        // F1 首板封单强度占比
+      { k: 'f2_resonance_weight', label: 'F2 共振权重', step: 0.05 },   // F2 板块/题材共振占比
+      { k: 'f3_premium_weight', label: 'F3 溢价权重', step: 0.05 },     // F3 竞价溢价占比
+      { k: 'f4_rs_weight', label: 'F4 强度权重', step: 0.05 },          // F4 相对强度占比
+      // ── 持仓风控与出场线 ──
+      { k: 'pullback_max_pct', label: '最大回撤%', step: 0.01 },        // 持仓期容忍的最大回撤，超过视为走势转弱
+      { k: 'breaker_sell_half_pct', label: '炸板减半%', step: 0.01 },   // 盘中炸板回落达此深度先减半仓锁利润
+      { k: 'breaker_sell_all_pct', label: '炸板清仓%', step: 0.01 },    // 炸板进一步恶化达此深度全部离场
+      { k: 'buy_pullback_sell_half_pct', label: '买入回撤减半%', step: 0.01 }, // 买入后回落到此深度减半仓
+      { k: 'buy_pullback_sell_all_pct', label: '买入回撤清仓%', step: 0.01 },  // 回落继续加深则清仓认错
+      { k: 'buy_day_close_below', label: '买入日收盘低于%', step: 0.01 },      // 买入当日收盘跌幅破此线的风控触发点
+      { k: 'next_open_if_below', label: '次日开盘低于%', step: 0.01 },         // 次日开盘低于此幅度直接止损离场
+      { k: 'take_profit_pct', label: '止盈%', step: 1 },                       // 涨幅达标即止盈落袋
     ],
   },
   {
     key: 'double_bump', title: '双响炮战法',
     fields: [
-      { k: 'first_break_volume_multiple', label: '一突量比', step: 0.1 },
-      { k: 'second_break_volume_multiple', label: '二突量比', step: 0.1 },
-      { k: 'adjust_vol_ratio_max', label: '调整量比上限', step: 0.5 },
-      { k: 'position_weight', label: '调整深度权重', step: 0.05 },
-      { k: 'ma_weight', label: '均线权重', step: 0.05 },
-      { k: 'volume_weight', label: '量能权重', step: 0.05 },
+      // ── 形态认定：两波突破的量能门槛 + 波间缩量调整标准 ──
+      { k: 'first_break_volume_multiple', label: '一突量比', step: 0.1 },       // 第一波突破要求的量比倍数（放量确认）
+      { k: 'second_break_volume_multiple', label: '二突量比', step: 0.1 },      // 第二波突破要求的量比倍数
+      { k: 'adjust_vol_ratio_max', label: '调整量比上限', step: 0.5 },          // 两波之间调整期允许的最大量比（必须缩量）
+      // ── 形态打分权重：调整质量/均线形态/量能三要素加权 ──
+      { k: 'position_weight', label: '调整深度权重', step: 0.05 },              // 调整深度项在形态分中的占比
+      { k: 'ma_weight', label: '均线权重', step: 0.05 },                        // 均线排列项占比
+      { k: 'volume_weight', label: '量能权重', step: 0.05 },                    // 量能配合项占比
+      // 止盈线：涨幅达到即止盈
       { k: 'double_bump_take_profit_pct', label: '止盈%', step: 0.01 },
     ],
   },
   {
     key: 'n_shape', title: 'N 形战法',
     fields: [
-      { k: 'n_pattern_score_threshold', label: 'N 形态分阈值', step: 1 },
-      { k: 'hard_stop_loss', label: '硬止损%', step: 0.01 },
+      { k: 'n_pattern_score_threshold', label: 'N 形态分阈值', step: 1 },  // N 形态综合分达到该阈值才放行信号（入场门槛）
+      { k: 'hard_stop_loss', label: '硬止损%', step: 0.01 },               // 触及即无条件离场的硬止损线
     ],
   },
   {
     key: 'dragon_return', title: '龙回头战法',
     fields: [
-      { k: 'stop_loss_pct', label: '止损%', step: 0.01 },
-      { k: 'take_profit_pct', label: '止盈%', step: 0.01 },
-      { k: 'max_hold_days', label: '最长持仓天数', step: 1 },
-      { k: 'target1_multiplier', label: '目标1倍数', step: 0.05 },
-      { k: 'target2_multiplier', label: '目标2倍数', step: 0.05 },
-      { k: 'trailing_drawback', label: '移动止损回撤%', step: 0.01 },
+      // ── 出场体系：固定止盈止损 + 时间兜底 + 分批目标位 + 移动止损 ──
+      { k: 'stop_loss_pct', label: '止损%', step: 0.01 },            // 固定止损幅度
+      { k: 'take_profit_pct', label: '止盈%', step: 0.01 },          // 固定止盈幅度
+      { k: 'max_hold_days', label: '最长持仓天数', step: 1 },        // 超时强制离场的时间兜底
+      { k: 'target1_multiplier', label: '目标1倍数', step: 0.05 },   // 第一目标位（相对基准涨幅的倍数），到位减部分仓
+      { k: 'target2_multiplier', label: '目标2倍数', step: 0.05 },   // 第二目标位，到位后剩余仓位走移动止损
+      { k: 'trailing_drawback', label: '移动止损回撤%', step: 0.01 }, // 浮盈回撤超此幅度即移动止损离场
     ],
   },
   {
      key: 'momentum', title: '动量分权重（合计建议=100）',
      fields: [
-       { k: 'volume_price_weight', label: '量价权重', step: 5 },
-       { k: 'macd_weight', label: 'MACD权重', step: 5 },
-       { k: 'trend_weight', label: '走势权重', step: 5 },
+       // ── 动量合成分的三因子占比（三项合计建议=100）──
+       { k: 'volume_price_weight', label: '量价权重', step: 5 },   // 量价配合项在动量分中的占比
+       { k: 'macd_weight', label: 'MACD权重', step: 5 },          // MACD 动能项占比
+       { k: 'trend_weight', label: '走势权重', step: 5 },         // 走势形态项占比
        // 动量"提升才提醒"开关：开启后仅当动量分提升(或回落≤容忍差)才放行 双响炮/龙头/龙回头 战法信号；N形不受影响
        // Momentum "improvement-only" toggle: when on, double-bump / dragon / dragon-return signals only
        // pass when the momentum score improved (or fell within tolerance); N-shape is unaffected.
@@ -270,9 +297,11 @@ const strategyGroups = [
 /** 保存战法参数到后端并持久化 */
 /** Save the strategy parameters to the backend for persistence */
 async function saveStrategy() {
+  // 进入保存态并清空上次反馈（按钮禁用防重复提交）
   strategySaving.value = true
   strategyMsg.value = ''
   try {
+    // 五组参数整包提交后端写回配置
     await api.setStrategyConfig(strategyCfg.value)
     strategyMsg.value = '战法参数已保存，热更新即时生效'
     strategyMsgType.value = 'ok'
@@ -351,7 +380,9 @@ async function saveLLM() {
   try {
     // 调用后端接口保存 LLM 配置
     // Call the backend endpoint to save the LLM config
+    // 保存即触发热重建：后端用新配置原地重建 LLM 客户端（多 Key 轮询池），无需重启进程
     await api.setLLMConfig({
+      // Key 列表：兼容换行/逗号分隔，去首尾空白并丢弃空项
       api_keys: llmApiKeys.value.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
       api_url: llmApiUrl.value,
       model: llmModel.value,

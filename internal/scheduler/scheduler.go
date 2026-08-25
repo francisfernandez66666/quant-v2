@@ -92,10 +92,10 @@ func New(dataDir, cfgPath, statePath string) *Scheduler {
 		statePath = filepath.Join(dataDir, "research_state.json")
 	}
 	return &Scheduler{
-		cfgPath:  cfgPath,
+		cfgPath:   cfgPath,
 		statePath: statePath,
-		now:      time.Now,
-		failCool: make(map[int64]time.Time),
+		now:       time.Now,
+		failCool:  make(map[int64]time.Time),
 	}
 }
 

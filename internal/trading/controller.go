@@ -21,15 +21,15 @@ import (
 type Controller struct {
 	mu sync.RWMutex
 
-	exec    Executor        // 下单执行器（真实网关 / noop）
-	store   *store.DB       // 研究库（real_positions/orders/fills 落库）
-	cfg     config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
-	userID  string          // 归属账号（多账号模式下各引擎独立控制器）
+	exec   Executor         // 下单执行器（真实网关 / noop）
+	store  *store.DB        // 研究库（real_positions/orders/fills 落库）
+	cfg    config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
+	userID string           // 归属账号（多账号模式下各引擎独立控制器）
 
 	// 熔断状态：tripped=true 表示网关失联/心跳超时，暂停一切新下单
-	tripped   bool
-	tripAt    time.Time
-	tripReason string
+	tripped      bool
+	tripAt       time.Time
+	tripReason   string
 	lastHealthAt time.Time // 最近一次健康探测时间（节流）
 	lastHealthy  bool
 	lastFailAt   time.Time // 最近一次失败探测时间（熔断判定窗口用）
@@ -182,8 +182,9 @@ func (c *Controller) HealthCheck() {
 }
 
 // PlaceOrder 下单（幂等 + 熔断前置校验）。
-//  - 熔断中：拒绝新下单并返回错误；
-//  - signal_id 已在 orders 表：返回已存在（幂等，不重复下单）。
+//   - 熔断中：拒绝新下单并返回错误；
+//   - signal_id 已在 orders 表：返回已存在（幂等，不重复下单）。
+//
 // English: PlaceOrder places an order with idempotency and breaker pre-checks — rejects while tripped,
 // and a signal_id already in the orders table short-circuits (idempotent, never double-sends).
 func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {

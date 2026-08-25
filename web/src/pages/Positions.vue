@@ -3,6 +3,15 @@
   Holdings management page Positions.vue
   显示所有持仓股票，支持新增/编辑/删除，展示当日涨跌、持仓盈亏、多维评分、止盈止损线
   Lists all held stocks with add/edit/delete, showing daily change, position P&L, multi-dimension scores, and take-profit/stop-loss lines
+
+  【核心数据流】进入页面前先读 localStorage 缓存实现秒开，随后拉取后端最新数据并每 30s 轮询；
+  纸面账本的增删改即时回写后端（批次明细以后端为准，整表同步时不携带 lots，防止覆盖误清加仓历史）。
+  实盘账本只读展示 QMT 网关回报的对账持仓（real_positions），manual 模式下经前端二次确认后才
+  下发真实委托；SSE 推送实时刷新持仓建议与网关熔断状态。
+  【后端接口】fetchStatus / fetchHoldings / updateHoldings（纸面读写）；addHoldingLot /
+  sellHoldingLot / setHoldingCost / closeHolding（加减仓·改成本·清仓，均返回最新持仓行供原地替换）；
+  fetchStockLookup（代码反查名称与现价）；fetchQMTState / fetchRealPositions / executeRealAction
+  （实盘网关状态·对账持仓·真实委托下发）；onSSE（real_advice / qmt_report 实时推送订阅）。
 -->
 <template>
   <div class="positions-page">
@@ -159,6 +168,8 @@
         <button class="sheet-btn sheet-cancel" @click="sheetHolding = null">取消</button>
       </div>
     </div>
+    <!-- 加减仓弹窗：标题栏内切换加仓/减仓方向；输入成交价与数量，实时预览加仓后的总持仓/平均成本，
+         或减仓后的剩余股数（超卖时标红并禁止提交） -->
     <div class="modal-overlay" v-if="showLot" @click.self="showLot = false">
       <div class="modal">
         <div class="modal-title">
@@ -1234,6 +1245,7 @@ function sheetClose() {
   padding: 8px 20px; border-radius: 6px; border: none;
   background: #FF4D4F; color: #fff; font-size: 14px; cursor: pointer;
 }
+/* 底部图例说明（Legend） */
 .legend {
   margin-top: 12px; padding: 6px 12px; font-size: 14px; color: #666;
   background: #1a1a2e; border-radius: 6px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;

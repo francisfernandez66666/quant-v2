@@ -173,9 +173,9 @@ func TestPoolPerfBackfillLegacy(t *testing.T) {
 func testCfg() Config {
 	c := DefaultConfig()
 	c.Enabled = true
-	c.SlippageBps = 0      // 测试关闭滑点（有专项测试验证滑点模型）
-	c.CommissionRate = 0   // 测试关闭手续费
-	c.StampTaxRate = 0     // 测试关闭印花税
+	c.SlippageBps = 0    // 测试关闭滑点（有专项测试验证滑点模型）
+	c.CommissionRate = 0 // 测试关闭手续费
+	c.StampTaxRate = 0   // 测试关闭印花税
 	c.MinCommission = 0
 	c.InitialCapital = 100000
 	c.FixedAmount = 10000
@@ -279,7 +279,6 @@ func TestMarkToMarketAndSnapshot(t *testing.T) {
 		t.Fatalf("同日净值点应去重为 1, 实际 %d", len(eq))
 	}
 }
-
 
 // t1Ready §R3 测试辅助：把全部持仓 FilledAt 回拨到 25 小时前，模拟"次日卖出"绕过 T+1。
 // English: test helper — backdates every position's FilledAt by 25h to simulate next-day selling

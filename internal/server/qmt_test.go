@@ -118,13 +118,13 @@ func TestHandleQMTReportOrder(t *testing.T) {
 // English: exchange-suffix completion for bare codes.
 func TestNormalizeTsCode(t *testing.T) {
 	cases := map[string]string{
-		"600000":      "600000.SH",
-		"000001":      "000001.SZ",
-		"300750":      "300750.SZ",
-		"830799":      "830799.BJ",
-		"688001":      "688001.SH",
-		"600000.SH":   "600000.SH",
-		"000001.SZ":   "000001.SZ",
+		"600000":    "600000.SH",
+		"000001":    "000001.SZ",
+		"300750":    "300750.SZ",
+		"830799":    "830799.BJ",
+		"688001":    "688001.SH",
+		"600000.SH": "600000.SH",
+		"000001.SZ": "000001.SZ",
 	}
 	for in, want := range cases {
 		if got := normalizeTsCode(in); got != want {

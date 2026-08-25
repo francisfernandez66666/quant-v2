@@ -4,6 +4,15 @@
   账号开通、角色/权限配置、改密、启禁用、以及为他人账号代配战法参数。
   Create accounts, set role/perms, reset passwords, enable/disable,
   and configure per-account strategy params on behalf of users.
+
+  【核心数据流】挂载即拉取全部账号与系统权限位定义；列表上的角色/权限/启停等操作采用
+  「请求成功后就地改本地对象」的乐观更新，失败时提示并回滚；代配战法参数在打开弹层时按
+  目标账号拉取配置回填表单，保存后该账号运行中的策略热更新即时生效。
+  注：QMT 网关状态展示与实盘下单入口在持仓页的「实盘持仓」tab，不在本页。
+  【后端接口】fetchAdminUsers（账号列表 + 权限位定义）；createAdminUser（开户）；
+  setAdminUserRole / setAdminUserPerms / setAdminUserPassword / setAdminUserEnabled /
+  setAdminUserExpiry（改角色·权限·密码·启禁用·有效期）；deleteAdminUser（删号）；
+  fetchAdminStrategyConfig / setAdminStrategyConfig（按账号读写战法参数）。
 -->
 <template>
   <div class="admin-page">
@@ -130,7 +139,10 @@
 </template>
 
 <script setup>
+// ── 依赖导入 ──
+// Vue 组合式 API：ref 响应式状态 + onMounted 生命周期钩子
 import { ref, onMounted } from 'vue'
+// 后端管理接口封装：用户 CRUD、角色/权限/密码/有效期设置、按账号代配战法参数
 import * as api from '../api/index.js'
 
 // ── 状态 ──
@@ -159,6 +171,8 @@ const strategyMsg = ref('')
 const strategyMsgType = ref('ok')
 
 // 战法参数分组定义（与 Settings.vue 一致）
+// 该数组驱动弹层表单的 v-for 渲染：key 即参数对象的命名空间，fields 声明各字段的标签/步长/
+// 控件类型（type=switch 渲染为开关，其余为数字输入）；新增战法或字段只需在此追加，无需改模板。
 const strategyGroups = [
   {
     key: 'dragon', title: '龙头战法（权重合计≤1）',
@@ -406,6 +420,7 @@ onMounted(loadUsers)
 </script>
 
 <style scoped>
+/* ── 页面骨架与卡片表单 ── */
 .admin-page { max-width: 900px; }
 .admin-page h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
 .card { background: #1a1a2e; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
@@ -428,6 +443,7 @@ onMounted(loadUsers)
 }
 .field-hint { font-size: 12px; color: #666; }
 
+/* ── 主按钮 ── */
 .btn-primary {
   padding: 6px 16px; border-radius: 4px; border: 1px solid #FF4D4F;
   background: transparent; color: #FF4D4F; cursor: pointer; font-size: 14px;
@@ -435,6 +451,7 @@ onMounted(loadUsers)
 .btn-primary:hover { background: rgba(255,77,79,0.1); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* ── 用户列表（行式卡片：左侧账号信息 + 右侧操作按钮组）── */
 .user-table { display: flex; flex-direction: column; gap: 10px; }
 .user-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -458,10 +475,12 @@ onMounted(loadUsers)
 .btn-mini.btn-danger:hover { background: rgba(255,77,79,0.15); color: #ff9a9a; }
 .btn-mini.btn-danger:disabled { opacity: 0.4; }
 
+/* ── 操作结果反馈文案（ok 绿 / err 红）── */
 .feedback { font-size: 13px; margin-left: 10px; }
 .feedback.ok { color: #4caf50; }
 .feedback.err { color: #FF4D4F; }
 
+/* ── 代配战法参数弹层 ── */
 .modal-mask {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6);
   display: flex; align-items: center; justify-content: center; z-index: 100;
@@ -476,6 +495,7 @@ onMounted(loadUsers)
 .group-card { padding: 12px; }
 .modal-footer { margin-top: 14px; display: flex; align-items: center; gap: 10px; }
 
+/* ── iOS 风格开关（布尔型战法参数，如动量闸门）── */
 .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .slider {
@@ -489,6 +509,7 @@ onMounted(loadUsers)
 .switch input:checked + .slider { background: #FF4D4F; }
 .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
 
+/* ── 移动端适配 ── */
 @media (max-width: 768px) {
   .form-grid { grid-template-columns: 1fr; }
   .user-row { flex-direction: column; align-items: flex-start; }

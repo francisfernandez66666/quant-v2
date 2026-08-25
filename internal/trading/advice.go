@@ -46,18 +46,18 @@ type PositionAdvice struct {
 // AdviceInput 持仓分析入参（由引擎每轮组装传入）。
 // English: AdviceInput aggregates the inputs for one advice round (assembled by the engine per cycle).
 type AdviceInput struct {
-	Agent      *combat_agent.Agent                          // 战法代理（卖出侧决策函数复用）
-	MarketAPI  *data.MarketAPI                              // 行情 API（实时报价）
-	Positions  []store.RealPosition                          // 实盘持仓（real_positions）
-	Quotes     map[string]*data.StockInfo                    // 实时行情（纯数字 code → 快照）
-	DayKLines  map[string][]data.KLine                       // 日K（纯数字 code → 日K）
-	Scores     map[string]combat_agent.StockScores           // 8a/8b 打分（SignalActive 加仓条件）
-	MD         map[string]*strategy_engine.StockMarketData   // 行情数据（卖点评估）
-	D1Scores   map[string]combat_agent.D1Score               // D1 评分（卖点评估）
+	Agent        *combat_agent.Agent                         // 战法代理（卖出侧决策函数复用）
+	MarketAPI    *data.MarketAPI                             // 行情 API（实时报价）
+	Positions    []store.RealPosition                        // 实盘持仓（real_positions）
+	Quotes       map[string]*data.StockInfo                  // 实时行情（纯数字 code → 快照）
+	DayKLines    map[string][]data.KLine                     // 日K（纯数字 code → 日K）
+	Scores       map[string]combat_agent.StockScores         // 8a/8b 打分（SignalActive 加仓条件）
+	MD           map[string]*strategy_engine.StockMarketData // 行情数据（卖点评估）
+	D1Scores     map[string]combat_agent.D1Score             // D1 评分（卖点评估）
 	ShortEnabled bool                                        // 是否做空模式（卖点评估范围）
 	EmotionPhase string                                      // 情绪阶段（退潮/背离 → 减仓）
-	BearReasons map[string]string                            // 利空归因（code → 原因）
-	Cfg         config.QMTConfig                             // QMT 配置（加仓/格局阈值）
+	BearReasons  map[string]string                           // 利空归因（code → 原因）
+	Cfg          config.QMTConfig                            // QMT 配置（加仓/格局阈值）
 }
 
 // Advise 生成实盘持仓处理建议：卖出侧（复用）→ 加仓 → 格局，按 action 排序输出。

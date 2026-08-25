@@ -181,7 +181,7 @@ type SchedulerConfig struct {
 	// §数据源路由（§HITHINK_DATA_SOURCE_PLAN）：研究/回测取数主源与复权门禁。
 	PrimarySource   string `json:"primary_source"`    // hithink | baostock（默认 baostock=旧表，安全）
 	ThsFactorsReady bool   `json:"ths_factors_ready"` // 复权对账门禁：通过后置 true，HfqBars 才走 ths 因子
-	OptimizeEnabled bool   `json:"optimize_enabled"` // 夜间自动寻优开关（默认 true，推荐制）
+	OptimizeEnabled bool   `json:"optimize_enabled"`  // 夜间自动寻优开关（默认 true，推荐制）
 }
 
 // NightlyConfig 夜间研究作业配置（盘后/周末触发）。
@@ -1145,7 +1145,7 @@ func defaultStrategyConfig() StrategyConfig {
 			MACDWeight:          30,
 			TrendWeight:         30,
 			SignalThreshold:     60,
-			BuySignalThreshold:  75,  // 动量买入阈值：≥75 发 buy 进模拟盘动量池（§动量入模拟盘）
+			BuySignalThreshold:  75,   // 动量买入阈值：≥75 发 buy 进模拟盘动量池（§动量入模拟盘）
 			MomentumGateEnabled: true, // 动量"提升才提醒"默认开启
 			MomentumDeltaTol:    5,
 		},

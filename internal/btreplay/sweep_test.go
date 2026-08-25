@@ -142,7 +142,7 @@ func TestApplyComboParamsUnknownAdapterSafe(t *testing.T) {
 // fakeAdapter 仅实现 adapter 接口的最小桩，用于未知类型的健壮性验证。
 type fakeAdapter struct{}
 
-func (fakeAdapter) Name() string { return "fake" }
+func (fakeAdapter) Name() string        { return "fake" }
 func (fakeAdapter) Description() string { return "" }
 func (fakeAdapter) Trigger(_ []data.KLine, _, _ float64) (map[string]float64, bool) {
 	return nil, false

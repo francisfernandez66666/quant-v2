@@ -3,6 +3,13 @@
   Message center page MsgCenter.vue
   展示所有提醒/告警消息，支持按等级过滤（命中提醒/策略信号/止盈止损/持仓提示）
   Shows all reminder/alert messages with level filtering (hit reminders / strategy signals / take-profit & stop-loss / holding tips)
+
+  【页面职责】消息中心：交易信号、止盈止损、命中提醒等告警去重后的统一收件箱；按等级一级筛选，
+  交易信号再按战法策略二级分类（下拉，避免战法过多时按钮行爆炸）；卖出类告警可一键按实时价模拟卖出。
+  【删除与墓碑机制】手工删除单条或清空全部都会调用后端接口落库记为"墓碑"：当日已被删除的消息在
+  后续轮询/SSE 刷新中不再重新出现，避免同一条告警反复"复活"；前端删除成功后立即重拉列表保持一致。
+  【数据流】挂载时拉取一次 → 每 15 秒轮询兜底 + SSE 推送即时刷新；日历类消息在前端过滤不展示。
+  【后端接口】alerts（列表查询 / 单条删除 id / 全部清空）、paper sell（按实时价模拟卖出指定持仓）。
 -->
 <template>
   <div class="msg-page">

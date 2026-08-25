@@ -14,7 +14,7 @@ import (
 // configureSysProcAttr 启动前设置进程组与父死信号。
 func configureSysProcAttr(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:   true,             // 独立进程组：支持整组击杀
+		Setpgid:   true,            // 独立进程组：支持整组击杀
 		Pdeathsig: syscall.SIGKILL, // 父进程死亡 → 内核杀子进程
 	}
 }

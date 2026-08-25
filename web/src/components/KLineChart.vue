@@ -20,6 +20,7 @@
 -->
 <template>
   <div class="kline-chart">
+    <!-- 工具栏：标的名称 + 现价/涨跌幅摘要（红涨绿跌）+ 手动刷新按钮 -->
     <div class="kline-toolbar">
       <span class="kline-title">
         {{ name || code }} · 分时
@@ -265,6 +266,12 @@ const timeAxis = computed(() => {
 
 // ── 数据构建 ──
 // ── Geometry building ──
+/**
+ * 按当前容器宽度重算全部分时图元坐标（纯几何换算，不重新请求数据）
+ * 流程：生成带 x/y 坐标的分时点 → 价格线/均价线 → 成交量柱 → MACD 柱与 DIF/DEA 线，
+ * 最后回填工具栏展示的最新价与相对昨收的涨跌幅。
+ * 容器宽度变化（refit）后再次调用即可完成自适应重绘。
+ */
 // 按当前宽度重算分时几何坐标（不重新请求），并刷新价格线/均价线/成交量/MACD 图元与最新价
 function build() {
   const data = raw.value
@@ -421,6 +428,11 @@ function refit() {
 
 // ── 加载 ──
 // ── Load ──
+/**
+ * 拉取分时数据并重建图表：请求 /api/minute 成功后回填昨收价与股票名称，
+ * 调用 build() 重算全部图元坐标；失败把错误文案写入 error 展示错误态。
+ * 工具栏"刷新"按钮、挂载初始化、code 变化 watch 都会触发本方法。
+ */
 // 拉取分时数据并回填昨收/名称，随后重建全部图元坐标；失败写入 error 展示错误态
 async function load() {
   loading.value = true

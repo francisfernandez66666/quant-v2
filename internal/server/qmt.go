@@ -261,18 +261,18 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var ev struct {
-		Type      string             `json:"type"`
-		OrderID   string             `json:"order_id"`
-		Code      string             `json:"code"`
-		Side      string             `json:"side"`
-		Status    string             `json:"status"`
-		Price     float64            `json:"price"`
-		Qty       int                `json:"qty"`
-		Amount    float64            `json:"amount"`
-		TradedAt  string             `json:"traded_at"`
-		SignalID  string             `json:"signal_id"`
+		Type      string               `json:"type"`
+		OrderID   string               `json:"order_id"`
+		Code      string               `json:"code"`
+		Side      string               `json:"side"`
+		Status    string               `json:"status"`
+		Price     float64              `json:"price"`
+		Qty       int                  `json:"qty"`
+		Amount    float64              `json:"amount"`
+		TradedAt  string               `json:"traded_at"`
+		SignalID  string               `json:"signal_id"`
 		Positions []store.RealPosition `json:"positions"`
-		At        string             `json:"at"`
+		At        string               `json:"at"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 		writeError(w, 400, "invalid report body")
