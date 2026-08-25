@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
 )
@@ -406,7 +407,7 @@ func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
 // English: idempotently enqueues today's nightly step chain (low priority). The queue itself is the
 // checkpoint — restarts resume naturally; leftover chains from prior days drain first by chain_day.
 func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfig, now time.Time) {
-	today := now.Format("20060102")
+	today := cntime.DayCompactOf(now) // §TZ1 北京日历定链日
 	has, err := db.ChainHasTasks(today)
 	if err != nil || has {
 		return

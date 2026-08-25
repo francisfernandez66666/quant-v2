@@ -12,6 +12,8 @@ package paper
 import (
 	"math"
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // ── R1.5 T+1 约束 ──
@@ -20,7 +22,7 @@ import (
 // FilledAt 为成交时间戳，与 now 同日则不可卖。
 // English: T+1 rule — shares bought today cannot be sold until the next trading day.
 func canSellToday(filledAt time.Time, now time.Time) bool {
-	return filledAt.Format("2006-01-02") != now.Format("2006-01-02")
+	return cntime.DayOf(filledAt) != cntime.DayOf(now) // §TZ1 北京日历判 T+1
 }
 
 // ── R1.4 清仓后再入场冷却 ──

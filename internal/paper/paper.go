@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 )
@@ -190,11 +191,11 @@ type Trade struct {
 	Time         time.Time `json:"time"`
 	// LatencySec 信号发出→成交 的秒数（买入时记录；量化信号时效性）。
 	// English: seconds from signal generation to fill (recorded on buys; quantifies signal timeliness).
-	LatencySec int64  `json:"latency_sec,omitempty"`
+	LatencySec int64 `json:"latency_sec,omitempty"`
 	// Fee 本笔成交费用（佣金+印花税，§R1/R2 费用入账审计字段；0=未收费）。
 	// English: fees charged on this fill (commission + stamp tax; audit field for fee accounting).
-	Fee     float64 `json:"fee,omitempty"`
-	Reason  string  `json:"reason,omitempty"`
+	Fee    float64 `json:"fee,omitempty"`
+	Reason string  `json:"reason,omitempty"`
 }
 
 // ── §R1/R2 费用模型（A股口径）───────────────────────────────────────────
@@ -369,12 +370,12 @@ type Engine struct {
 	extraPoolKeys map[string]bool
 	labelFn       func(string) string
 	positions     map[string]*Position
-	trades         []Trade
-	orders         []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
-	equity         []EquityPoint
-	hasFilled      bool    // 是否发生过任何成交：false 期间 Snapshot 不记净值点（无买入不应有净值曲线）
-	realized       float64 // 已实现盈亏累计
-	path           string
+	trades        []Trade
+	orders        []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
+	equity        []EquityPoint
+	hasFilled     bool    // 是否发生过任何成交：false 期间 Snapshot 不记净值点（无买入不应有净值曲线）
+	realized      float64 // 已实现盈亏累计
+	path          string
 	// 账本镜像回调（阶段1.2 两本账合一）：paper 为唯一真实账本，开仓/清仓经回调同步写
 	// report 持仓账（由 engine/registry 注入），退出引擎/持仓页/打分池消费的 rpt 与模拟盘一致。
 	// onOpen 在新开仓后触发（含手动买入；加仓不触发）；onClose 仅在整笔清仓时触发（部分减仓不触发）。
@@ -877,7 +878,7 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 		e.sellAllLocked(p, price, reason)
 		e.recordOrderLocked(func() Order { o := mkOrder("filled", qty); o.Price = price; return o }())
 	case "trim":
-		today := time.Now().Format("20060102")
+		today := cntime.DayCompactOf(time.Now()) // §TZ1
 		if e.trimDone[s.Code] == today {
 			return
 		}
@@ -1244,7 +1245,7 @@ func (e *Engine) Snapshot(now time.Time) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	date := now.Format("2006-01-02")
+	date := cntime.DayOf(now) // §TZ1
 	mv := e.marketValueLocked()
 	val := e.cash + mv
 	if len(e.equity) > 0 && e.equity[len(e.equity)-1].Date == date {
@@ -2114,7 +2115,7 @@ type poolDiscipline struct {
 // actually enforced — MinScore>1 is treated as a 0-100 scale vs confidence×100, otherwise 0-1.
 func (e *Engine) checkPoolDisciplinePre(poolKey string, confidence float64) string {
 	now := time.Now()
-	today := now.Format("2006-01-02")
+	today := cntime.DayOf(now) // §TZ1
 
 	d, ok := e.poolDiscipline[poolKey]
 	if !ok || d.day != today {
@@ -2166,7 +2167,7 @@ func (e *Engine) checkPoolBudget(poolKey string, cost float64) string {
 // recordPoolBuy 纪律检查通过后记录买入事件（更新计数和时间戳）。
 func (e *Engine) recordPoolBuy(poolKey string, cost float64) {
 	now := time.Now()
-	today := now.Format("2006-01-02")
+	today := cntime.DayOf(now) // §TZ1
 	d, ok := e.poolDiscipline[poolKey]
 	if !ok || d.day != today {
 		e.poolDiscipline[poolKey] = poolDiscipline{day: today}

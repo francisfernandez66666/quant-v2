@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
@@ -332,7 +333,8 @@ func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInf
 // trading day (exports the day's fills + daily snapshot to the research DB). One export per day per
 // account; store unique keys keep the write idempotent.
 func (r *Registry) checkDayClose(userID string, pe *paper.Engine, now time.Time) {
-	if !data.IsTradingDay(now) || now.Hour() < 15 {
+	cn := cntime.In(now) // §TZ1 北京 15 点为界（宿主机 Local 曾致 UTC 主机判定漂移 8 小时）
+	if !data.IsTradingDay(cn) || cn.Hour() < 15 {
 		return
 	}
 	day := now.Format("2006-01-02")

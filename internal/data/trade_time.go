@@ -3,7 +3,11 @@
 // 时间窗口参数可通过 SetTradeTimeConfig 覆盖，默认与 A 股一致。
 package data
 
-import "time"
+import (
+	"time"
+
+	"quant-trading-v2/internal/cntime"
+)
 
 // TradeTimeConfig 交易时段参数，所有值均为 HHMM 整数格式。
 type TradeTimeConfig struct {
@@ -70,6 +74,7 @@ func SetTradeTimeConfig(cfg TradeTimeConfig) {
 
 // IsTradeTime 判断当前是否为交易时段。
 func IsTradeTime(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -80,6 +85,7 @@ func IsTradeTime(now time.Time) bool {
 
 // IsFullTradingHours 判断当前是否在完整的交易覆盖范围内。
 func IsFullTradingHours(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -90,12 +96,14 @@ func IsFullTradingHours(now time.Time) bool {
 
 // IsPreOpen 判断是否为集合竞价时段。
 func IsPreOpen(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	m := now.Hour()*100 + now.Minute()
 	return m >= defaultTradeTime.PreOpenStart && m < defaultTradeTime.PreOpenEnd
 }
 
 // IsMorningHighFreq 早盘高频率窗口（从集合竞价 9:15 起高频扫描，评分按 70 分起步）。
 func IsMorningHighFreq(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -106,6 +114,7 @@ func IsMorningHighFreq(now time.Time) bool {
 
 // IsMidFreqWindow 早盘中频窗口（9:45-10:00，早盘高频扫描的次级节奏）。
 func IsMidFreqWindow(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -116,6 +125,7 @@ func IsMidFreqWindow(now time.Time) bool {
 
 // IsAfternoonHighFreq 午后高频率窗口。
 func IsAfternoonHighFreq(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -140,6 +150,7 @@ func ScanInterval(now time.Time, highFreqSec, midFreqSec, afternoonFreqSec, norm
 
 // IsPreMarket 盘前时段 8:30-9:15（可配置）。
 func IsPreMarket(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -150,6 +161,7 @@ func IsPreMarket(now time.Time) bool {
 
 // IsPreAfternoon 午盘前时段 11:30-13:00。
 func IsPreAfternoon(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -160,6 +172,7 @@ func IsPreAfternoon(now time.Time) bool {
 
 // IsAfterMarket 盘后时段 15:00-次日8:30。
 func IsAfterMarket(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false
@@ -206,6 +219,7 @@ func (s MarketSession) String() string {
 // these windows (after-market / closed) the 5s quote fetcher and real-time trigger should
 // pause to avoid wasteful polling.
 func IsActiveSession(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	switch CurrentSession(now) {
 	case SessionPreMarket, SessionMorningTrade, SessionPreAfternoon, SessionAfternoonTrade:
 		return true
@@ -220,6 +234,7 @@ func IsActiveSession(now time.Time) bool {
 // English: trading-day window [FullOpen, TradeClose) incl. lunch break — the only period where
 // research tasks are blocked; nights, pre-open and weekends are all eligible for research.
 func IsTradingWindow(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return false // 周末非交易日：全天允许
@@ -230,6 +245,7 @@ func IsTradingWindow(now time.Time) bool {
 
 // CurrentSession 返回当前市场时段。
 func CurrentSession(now time.Time) MarketSession {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return SessionClosed
@@ -255,6 +271,7 @@ func CurrentSession(now time.Time) MarketSession {
 // 非交易日返回 true（此时同样不应产生基于实盘数据的交易信号）。
 // 用于盘前压制战法信号：只更新评分，不发布买入/watch 信号。
 func BeforeOpenTrade(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	if now.Weekday() == time.Saturday || now.Weekday() == time.Sunday {
 		return true
 	}
@@ -263,6 +280,7 @@ func BeforeOpenTrade(now time.Time) bool {
 
 // NextTradeOpen 返回距离下一个交易时段开盘的等待时长。
 func NextTradeOpen(now time.Time) time.Duration {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	for i := 0; i < 7; i++ {
 		t := now.AddDate(0, 0, i)
 		if t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
@@ -284,6 +302,7 @@ func NextTradeOpen(now time.Time) time.Duration {
 // TradingDayDate 返回当前交易日日期 YYYYMMDD。
 // 周末退回到上一周五，节假日暂不处理（后续可扩展）。
 func TradingDayDate(now time.Time) string {
+	now = cntime.In(now) // §TZ1 北京时区统一
 	t := now
 	for t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
 		t = t.AddDate(0, 0, -1)
@@ -293,7 +312,7 @@ func TradingDayDate(now time.Time) string {
 
 // AddTradingDays 将日期往后推 n 个交易日，返回 YYYYMMDD。
 func AddTradingDays(td string, n int) string {
-	t, err := time.Parse("20060102", td)
+	t, err := time.ParseInLocation("20060102", td, cntime.Loc)
 	if err != nil {
 		return td
 	}
@@ -309,6 +328,7 @@ func AddTradingDays(td string, n int) string {
 
 // IsTradingDay 判断给定日期是否为交易日（仅检查周末）。
 func IsTradingDay(t time.Time) bool {
+	t = cntime.In(t) // §TZ1
 	return t.Weekday() != time.Saturday && t.Weekday() != time.Sunday
 }
 
@@ -317,6 +337,7 @@ func IsTradingDay(t time.Time) bool {
 // English: duration until the next active session start (weekday 08:30 premarket open) —
 // the single alarm an after-hours loop needs to truly hibernate instead of busy-ticking.
 func DurationToNextActiveSession(now time.Time) time.Duration {
+	now = cntime.In(now)            // §TZ1 北京时区统一
 	for add := 0; add <= 8; add++ { // 最多看一周（跨周末/长假）
 		day := now.AddDate(0, 0, add)
 		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
