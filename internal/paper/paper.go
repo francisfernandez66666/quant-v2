@@ -945,6 +945,15 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 // buy" button; fixed-amount whole lots). Shares fillLocked with auto-fill: dedupe / position cap / cash
 // checks; manual buys debit the "other" pool.
 func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes map[string]*data.StockInfo) error {
+	return e.BuyInPool(code, name, strategy, "", signalPrice, quotes)
+}
+
+// BuyInPool 手动买入的池感知版本（§用户要求：信号页模拟买入归入信号原战法池，
+// 只有纯手动/无归属才落"其他池"）。poolKey 为空 = 其他池（旧行为）。
+// poolKey 指向不存在的池时回退其他池（避免现金无归处），并在日志注明。
+// English: pool-aware manual buy; empty poolKey = the "other" pool (legacy behavior).
+// A nonexistent target pool falls back to the other pool with a log note.
+func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice float64, quotes map[string]*data.StockInfo) error {
 	// §R0.4 涨跌停拒成交：涨停封板的股票买单拒绝
 	for _, q := range quotes {
 		if q != nil && q.Code == code && q.ChangePct >= 9.9 {
@@ -969,14 +978,24 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 	} else {
 		return errNoQuote
 	}
-	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, "手动模拟买入"); err != nil {
-		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+	if _, ok := e.pools[poolKey]; !ok {
+		if poolKey != "" {
+			log.Printf("[paper] 目标池 %s 不存在，手动买入回退其他池 (%s)", poolKey, code)
+		}
+		poolKey = ""
+	}
+	reason := "手动模拟买入"
+	if poolKey != "" {
+		reason = "手动模拟买入(归" + poolKey + ")"
+	}
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, 0, reason); err != nil {
+		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
 	}
-	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 		Kind: "手动买入", SignalPrice: signalPrice, Price: price, Qty: e.positions[code].Qty,
-		Status: "filled", Reason: "手动模拟买入"})
+		Status: "filled", Reason: reason})
 	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil
@@ -992,6 +1011,12 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 // Manual buys debit the "other" pool and never crowd a strategy pool. An already-held code merges as an
 // add-on (quantity added, cost averaged, extra fill appended).
 func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, qty int, quotes map[string]*data.StockInfo) error {
+	return e.BuyExInPool(code, name, strategy, "", signalPrice, price, qty, quotes)
+}
+
+// BuyExInPool BuyEx 的池感知版本（§用户要求：信号页模拟买入归入信号原战法池）。
+// poolKey 为空 = 其他池（纯手动旧行为）；指向不存在的池回退其他池并记日志。
+func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, price float64, qty int, quotes map[string]*data.StockInfo) error {
 	if !e.cfg.Enabled {
 		return errDisabled
 	}
@@ -1013,14 +1038,24 @@ func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, 
 			return errNoQuote
 		}
 	}
-	if err := e.fillLocked("", code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, "手动模拟买入"); err != nil {
-		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+	if _, ok := e.pools[poolKey]; !ok {
+		if poolKey != "" {
+			log.Printf("[paper] 目标池 %s 不存在，手动买入回退其他池 (%s)", poolKey, code)
+		}
+		poolKey = ""
+	}
+	reason := "手动模拟买入"
+	if poolKey != "" {
+		reason = "手动模拟买入(归" + poolKey + ")"
+	}
+	if err := e.fillLocked(poolKey, code, name, strategy, signalPrice, time.Now(), time.Now(), price, qty, reason); err != nil {
+		e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 			Kind: "手动买入", SignalPrice: signalPrice, Status: "rejected", Reason: fmt.Sprintf("%v", err)})
 		return err
 	}
-	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, Side: "buy",
+	e.recordOrderLocked(Order{Code: code, Name: name, Strategy: strategy, StrategyType: poolKey, Side: "buy",
 		Kind: "手动买入", SignalPrice: signalPrice, Price: price, Qty: e.positions[code].Qty,
-		Status: "filled", Reason: "手动模拟买入"})
+		Status: "filled", Reason: reason})
 	e.mirrorOpenLocked(e.positions[code]) // 手动买入同样镜像开仓（两本账合一）
 	e.persist()
 	return nil

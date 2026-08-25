@@ -508,11 +508,17 @@ export async function fetchPaperEquity() {
  *  price=0 回退实时价；qty<=0 回退固定金额整手（旧行为）。 */
 /** Paper trading: manual buy (signal-page "paper buy" button). qty>0 fills the typed price/lots (static
  *  bookkeeping), price=0 falls back to the live quote; qty<=0 falls back to fixed-amount whole lots. */
-// 对应 POST /api/paper/buy，data: { code, name, strategy, signal_price, price, qty }
-export async function buyPaperPosition(code, name, strategy, signalPrice, price, qty) {
+// 对应 POST /api/paper/buy，data: { code, name, strategy, strategy_type, strategy_id, signal_price, price, qty }
+// §C 归属字段：信号页模拟买入传原信号的 strategy_type/strategy_id，买入归入对应战法资金池；
+// 纯手动（持仓页）不传 → 其他池（旧行为）。
+export async function buyPaperPosition(code, name, strategy, signalPrice, price, qty, strategyType, strategyId) {
   return request('/api/paper/buy', {
     method: 'POST',
-    data: { code, name, strategy, signal_price: signalPrice || 0, price: price || 0, qty: qty || 0 },
+    data: {
+      code, name, strategy,
+      strategy_type: strategyType || '', strategy_id: strategyId || '',
+      signal_price: signalPrice || 0, price: price || 0, qty: qty || 0,
+    },
   })
 }
 

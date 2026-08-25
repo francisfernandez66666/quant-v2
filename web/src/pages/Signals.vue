@@ -83,7 +83,8 @@
           <button v-else-if="s.action === 'buy'" class="btn-ignore" @click.stop="confirmTrade(s, 'ignore')">忽略</button>
           <span v-else class="text-muted">—</span>
           <!-- 模拟盘买入：后端启用模拟盘时显示，按实时价自动撮合（Paper buy: shown when paper trading is enabled, fills at the live price）-->
-          <button v-if="paperOn && s.can_open" class="btn-paper" @click.stop="paperBuy(s)">模拟买入</button>
+          <button v-if="paperOn && s.can_open && hasStrategyPool(s)" class="btn-paper" @click.stop="paperBuy(s)"
+                  title="模拟买入归入该信号所属战法资金池（非战法信号不可买）">模拟买入</button>
           <!-- 收藏/加入自选股按钮：一键将信号股票代码加入自选股列表（Add to watchlist button: one-click add signal's code to watchlist）-->
           <button v-if="!s.can_open && s.action !== 'buy'" class="btn-collect" @click.stop="collectToWatchlist(s)">收藏</button>
         </span>
@@ -105,7 +106,8 @@
         <div class="sheet-title">{{ sheetSignal.code }} {{ sheetSignal.name || '' }} · {{ sheetSignal.strategy }}</div>
         <button v-if="sheetSignal.can_open" class="sheet-btn sheet-danger" @click="sheetBuy">买入</button>
         <!-- 模拟盘买入（移动端菜单）：仅在模拟盘启用时显示，按实时价成交（mobile menu paper buy: only when paper trading is enabled, fills at live price）-->
-        <button v-if="sheetSignal.can_open && paperOn" class="sheet-btn sheet-paper" @click="sheetPaperBuy">模拟买入</button>
+        <button v-if="sheetSignal.can_open && paperOn && hasStrategyPool(sheetSignal)" class="sheet-btn sheet-paper" @click="sheetPaperBuy"
+                title="模拟买入归入该信号所属战法资金池（非战法信号不可买）">模拟买入</button>
         <button v-if="sheetSignal.action === 'buy'" class="sheet-btn" @click="sheetIgnore">忽略</button>
         <button v-if="!sheetSignal.can_open && sheetSignal.action !== 'buy'" class="sheet-btn" @click="sheetCollect">收藏</button>
         <button class="sheet-btn" @click="sheetKline">{{ klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时' }}</button>
@@ -288,6 +290,15 @@ function sheetBuy() {
 /** 模拟盘买入：输入买入价+买入手数后按用户指定记账（普通用户"搬运持仓"；留空价格用实时价）。
  *  English: paper buy — fill the typed price and lot count (normal users' "copy real positions";
  *  an empty price uses the live quote). */
+/** §C 非战法信号不可买：仅当信号可归属到某个战法资金池时才提供模拟买入。
+ *  规则 ID（fac_/pat_ 前缀）即池 key；否则看类型字段（四大内置）；都无 → 不可买。 */
+function hasStrategyPool(s) {
+  if (!s) return false
+  const id = s.strategy_id || ''
+  if (id.startsWith('fac_') || id.startsWith('pat_')) return true
+  return !!s.strategy_type
+}
+
 async function paperBuy(s) {
   const priceStr = prompt('输入买入价（元，留空用实时价）：', s.price || s.close || '')
   const qtyStr = prompt('输入买入手数（1 手 = 100 股）：', '1')
@@ -304,7 +315,7 @@ async function paperBuy(s) {
     if (!confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手 @${price.toFixed(2)}？`)) return
   }
   try {
-    await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty)
+    await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty, s.strategy_type || '', s.strategy_id || '')
     alert(`已模拟买入 ${s.code} ${qty} 手`)
   } catch (e) {
     alert(e.message || '模拟买入失败')

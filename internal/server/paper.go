@@ -117,23 +117,33 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 		SignalPrice float64 `json:"signal_price"`
 		Price       float64 `json:"price"` // 用户输入的买入价（>0 生效）
 		Qty         int     `json:"qty"`   // 用户输入的买入手数（>0 生效；<=0 回退固定金额）
+		// §C 归属字段：信号页模拟买入携带原信号的战法池/库规则 ID，
+		// 买入归入对应资金池（非空且池存在时）；纯手动不传 → 其他池（旧行为）。
+		StrategyType string `json:"strategy_type,omitempty"`
+		StrategyID   string `json:"strategy_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, 400, "缺少股票代码")
 		return
+	}
+	// 归属解析：规则 ID（fac_/pat_ 前缀）优先即池 key；否则用类型字段；
+	// 都为空 = 纯手动 → 其他池。引擎侧对不存在的池还会二次回退兜底。
+	poolKey := req.StrategyType
+	if len(req.StrategyID) >= 4 && (req.StrategyID[:4] == "fac_" || req.StrategyID[:4] == "pat_") {
+		poolKey = req.StrategyID
 	}
 	quotes := s.liveQuotes(req.Code)
 	if req.Qty > 0 {
 		// 输入价格+手数：按用户指定记账（price=0 时用实时价，仍按指定手数）
 		// English: typed price + lots: fills as specified (price=0 falls back to the live quote but
 		// still respects the typed lot count).
-		if err := pe.BuyEx(req.Code, req.Name, req.Strategy, req.SignalPrice, req.Price, req.Qty, quotes); err != nil {
+		if err := pe.BuyExInPool(req.Code, req.Name, req.Strategy, poolKey, req.SignalPrice, req.Price, req.Qty, quotes); err != nil {
 			writeError(w, 400, err.Error())
 			return
 		}
 	} else {
 		// 旧行为：固定金额整手，实时价成交
-		if err := pe.Buy(req.Code, req.Name, req.Strategy, req.SignalPrice, quotes); err != nil {
+		if err := pe.BuyInPool(req.Code, req.Name, req.Strategy, poolKey, req.SignalPrice, quotes); err != nil {
 			writeError(w, 400, err.Error())
 			return
 		}

@@ -35,6 +35,10 @@ type fixSignal struct {
 	Code         string  `json:"code"`          // 股票代码
 	Name         string  `json:"name"`          // 股票名称
 	Strategy     string  `json:"strategy"`      // 触发策略
+	// §C 归属字段：信号所属战法资金池（dragon/double_bump/…/fac_1/pat_2）与库规则 ID。
+	// 前端据此决定是否显示「模拟买入」（非战法信号不可买）并把买入归入对应池。
+	StrategyType string  `json:"strategy_type,omitempty"`
+	StrategyID   string  `json:"strategy_id,omitempty"`
 	TotalScore   float64 `json:"total_score"`   // 总分（0~100）
 	RemindLevel  string  `json:"remind_level"`  // 提醒级别：strong/observe/mute
 	Level        string  `json:"level"`         // 固定"交易"
@@ -87,6 +91,8 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			Code:         s.Code,
 			Name:         s.Name,
 			Strategy:     s.Strategy,
+			StrategyType: s.StrategyType,
+			StrategyID:   s.StrategyID,
 			TotalScore:   s.Confidence * 100,
 			RemindLevel:  scoreToRemindLevel(s.Confidence),
 			Level:        "交易",
