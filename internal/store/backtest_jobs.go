@@ -140,11 +140,14 @@ func (d *DB) MarkRunningInterrupted() (int, error) {
 }
 
 // GetBacktestEventResult 读取某候选某事件的断点缓存（result_json）；无缓存返回 ("", false, nil)。
-// English: reads a candidate's event-result checkpoint; returns ("", false, nil) when uncached.
-func (d *DB) GetBacktestEventResult(candidateID int64, date, industry string) (string, bool, error) {
+// ruleFP §GAP 二.3#5 规则参数指纹：键组成部分——改参后旧缓存自动失效（不再命中）。
+// English: reads a candidate's event-result checkpoint; the rule fingerprint is part of the key so a
+// parameter change invalidates stale cache automatically.
+func (d *DB) GetBacktestEventResult(candidateID int64, date, industry, ruleFP string) (string, bool, error) {
 	var js string
 	err := d.db.QueryRow(`SELECT result_json FROM backtest_event_results
-		WHERE candidate_id=? AND event_date=? AND industry=?`, candidateID, date, industry).Scan(&js)
+		WHERE candidate_id=? AND event_date=? AND industry=? AND COALESCE(rule_fp,'')=?`,
+		candidateID, date, industry, ruleFP).Scan(&js)
 	if err == sql.ErrNoRows {
 		return "", false, nil
 	}
@@ -155,12 +158,15 @@ func (d *DB) GetBacktestEventResult(candidateID int64, date, industry string) (s
 }
 
 // UpsertBacktestEventResult 写入某候选某事件的断点缓存（完整 EventResult JSON，重跑覆盖）。
-// English: upserts a candidate's per-event checkpoint (full EventResult JSON; reruns overwrite).
-func (d *DB) UpsertBacktestEventResult(candidateID int64, date, industry, resultJSON string) error {
-	_, err := d.db.Exec(`INSERT INTO backtest_event_results (candidate_id, event_date, industry, result_json)
-		VALUES (?,?,?,?)
-		ON CONFLICT(candidate_id, event_date, industry) DO UPDATE SET result_json=excluded.result_json`,
-		candidateID, date, industry, resultJSON)
+// 携带规则指纹：同键不同指纹直接覆盖 result_json 与指纹（旧行不残留混用）。
+// English: upserts a candidate's per-event checkpoint with its rule fingerprint; a different fingerprint
+// on the same key overwrites both json and fingerprint (no stale mixing).
+func (d *DB) UpsertBacktestEventResult(candidateID int64, date, industry, ruleFP, resultJSON string) error {
+	_, err := d.db.Exec(`INSERT INTO backtest_event_results (candidate_id, event_date, industry, rule_fp, result_json)
+		VALUES (?,?,?,?,?)
+		ON CONFLICT(candidate_id, event_date, industry) DO UPDATE SET
+			rule_fp=excluded.rule_fp, result_json=excluded.result_json`,
+		candidateID, date, industry, ruleFP, resultJSON)
 	return err
 }
 

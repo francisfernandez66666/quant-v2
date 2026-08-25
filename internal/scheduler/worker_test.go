@@ -36,11 +36,11 @@ esac
 	cfgPath := mustConfig(t, cfg)
 	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
 	loc := time.FixedZone("CST", 8*3600)
-	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) } // 周六 16:00 盘后
+	s.setNow(func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) }) // 周六 16:00 盘后
 
 	// 第一次 tick：入队并启动夜间链（dataload，low，长睡）
 	s.tick()
-	waitFor(t, 5*time.Second, func() bool { return s.busy }, "low 任务应已启动")
+	waitFor(t, 5*time.Second, func() bool { return s.busyLocked() }, "low 任务应已启动")
 
 	qdb, err := store.Open(dbPath)
 	if err != nil {
@@ -77,9 +77,9 @@ esac
 	}
 
 	// 收尾：切到交易时段杀掉重新拉起的 low 子进程，不留孤儿
-	s.now = func() time.Time { return time.Date(2026, 8, 24, 10, 0, 0, 0, loc) }
+	s.setNow(func() time.Time { return time.Date(2026, 8, 24, 10, 0, 0, 0, loc) })
 	s.tick()
-	waitFor(t, 5*time.Second, func() bool { return !s.busy }, "交易时段应终止遗留任务")
+	waitFor(t, 5*time.Second, func() bool { return !s.busyLocked() }, "交易时段应终止遗留任务")
 }
 
 // TestWorkerDrainsQueueContinuously 多任务链不依赖 30s tick 连续排空。
@@ -95,8 +95,7 @@ func TestWorkerDrainsQueueContinuously(t *testing.T) {
 	cfgPath := mustConfig(t, cfg)
 	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
 	loc := time.FixedZone("CST", 8*3600)
-	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) }
-
+	s.setNow(func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) })
 	s.tick() // 仅此一次 tick：排水应由任务完成后的 tryStartNext 自驱完成
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
@@ -117,7 +116,7 @@ func TestManualHighQueuedDuringSession(t *testing.T) {
 	cfgPath := mustConfig(t, cfgSamples(fake, dbPath))
 	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
 	loc := time.FixedZone("CST", 8*3600)
-	s.now = func() time.Time { return time.Date(2026, 8, 18, 10, 0, 0, 0, loc) } // 周二盘中
+	s.setNow(func() time.Time { return time.Date(2026, 8, 18, 10, 0, 0, 0, loc) }) // 周二盘中
 
 	qdb, err := store.Open(dbPath)
 	if err != nil {
@@ -141,7 +140,7 @@ func TestManualHighQueuedDuringSession(t *testing.T) {
 		}
 		t.Fatalf("盘中手动任务应保持 queued, 实际 %q", status)
 	}
-	if s.busy {
+	if s.busyLocked() {
 		t.Fatal("盘中不应启动任何研究子进程")
 	}
 	_ = config.DefaultSchedulerConfig // 引用防 unused（cfgSamples 已覆盖默认）
@@ -198,7 +197,7 @@ esac
 	cfgPath := mustConfig(t, cfg)
 	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
 	loc := time.FixedZone("CST", 8*3600)
-	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) } // 周六盘后
+	s.setNow(func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) }) // 周六盘后
 
 	qdb, err := store.Open(dbPath)
 	if err != nil {
@@ -258,7 +257,7 @@ esac
 	if a1 == nil || a1.RequeueSeq != 1 {
 		t.Fatalf("首次失败后 requeue_seq 应为 1, got %+v", a1)
 	}
-	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 10, 0, 0, loc) }
+	s.setNow(func() time.Time { return time.Date(2026, 8, 22, 16, 10, 0, 0, loc) })
 	s.tick()
 	waitFor(t, 15*time.Second, func() bool {
 		tk, _ := qdb.GetResearchTask(failID)

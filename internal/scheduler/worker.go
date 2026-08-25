@@ -186,7 +186,7 @@ func (s *Scheduler) openStore(cfg config.SchedulerConfig) *store.DB {
 // （续跑排水，见 workerTick 注释）。English: dequeue permission — always inside the evening
 // window; outside it only to drain preempted leftovers.
 func (s *Scheduler) drainAllowed(db *store.DB, cfg config.SchedulerConfig) bool {
-	if NightlyEligible(s.now(), cfg) {
+	if NightlyEligible(s.nowTime(), cfg) {
 		return true
 	}
 	leftovers, err := db.ActiveResearchTasks()
@@ -309,7 +309,7 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	// §失败重排队防自旋：刚失败回队尾的任务在冷却期内不出队（队列非空时其他任务先行，
 	// 空队时空转间隔=冷却窗），避免快速失败任务烧 CPU。成功/取消后清除记录。
 	s.mu.Lock()
-	if failAt, cooling := s.failCool[next.ID]; cooling && s.now().Sub(failAt) < failRetryCooldown {
+	if failAt, cooling := s.failCool[next.ID]; cooling && s.nowTime().Sub(failAt) < failRetryCooldown {
 		s.mu.Unlock()
 		return
 	}
@@ -318,7 +318,7 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	// 必须等到盘后窗口——否则"有遗留"会变成绕过门控的后门。
 	// English: outside the window only preempted rows may run; plain queued (incl. fresh manual
 	// submissions) must wait — otherwise leftovers become a gate bypass.
-	if !NightlyEligible(s.now(), cfg) && next.Status != store.TaskPreempted {
+	if !NightlyEligible(s.nowTime(), cfg) && next.Status != store.TaskPreempted {
 		return
 	}
 	s.mu.Lock()
@@ -970,7 +970,7 @@ func (s *Scheduler) noteFailure(taskID int64) {
 	if s.failCool == nil {
 		s.failCool = make(map[int64]time.Time)
 	}
-	s.failCool[taskID] = s.now()
+	s.failCool[taskID] = s.nowTime()
 	s.mu.Unlock()
 }
 

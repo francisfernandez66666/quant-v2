@@ -300,17 +300,18 @@ func NextTradeOpen(now time.Time) time.Duration {
 }
 
 // TradingDayDate 返回当前交易日日期 YYYYMMDD。
-// 周末退回到上一周五，节假日暂不处理（后续可扩展）。
+// 周末退回到上一周五；§GAP3.1 法定节假日/临时休市经交易日历同步回退。
 func TradingDayDate(now time.Time) string {
 	now = cntime.In(now) // §TZ1 北京时区统一
 	t := now
-	for t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+	for t.Weekday() == time.Saturday || t.Weekday() == time.Sunday ||
+		isClosedDay(t.Format("20060102")) {
 		t = t.AddDate(0, 0, -1)
 	}
 	return t.Format("20060102")
 }
 
-// AddTradingDays 将日期往后推 n 个交易日，返回 YYYYMMDD。
+// AddTradingDays 将日期往后推 n 个交易日，返回 YYYYMMDD（周末与已加载的休市日均跳过）。
 func AddTradingDays(td string, n int) string {
 	t, err := time.ParseInLocation("20060102", td, cntime.Loc)
 	if err != nil {
@@ -319,17 +320,21 @@ func AddTradingDays(td string, n int) string {
 	added := 0
 	for added < n {
 		t = t.AddDate(0, 0, 1)
-		if t.Weekday() != time.Saturday && t.Weekday() != time.Sunday {
+		if t.Weekday() != time.Saturday && t.Weekday() != time.Sunday &&
+			!isClosedDay(t.Format("20060102")) {
 			added++
 		}
 	}
 	return t.Format("20060102")
 }
 
-// IsTradingDay 判断给定日期是否为交易日（仅检查周末）。
+// IsTradingDay 判断给定日期是否为交易日（周末 + §GAP3.1 交易日历休市日）。
 func IsTradingDay(t time.Time) bool {
 	t = cntime.In(t) // §TZ1
-	return t.Weekday() != time.Saturday && t.Weekday() != time.Sunday
+	if t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+		return false
+	}
+	return !isClosedDay(t.Format("20060102"))
 }
 
 // DurationToNextActiveSession 距下一个活跃交易窗口（工作日 8:30 盘前开盘）的时长。
@@ -337,10 +342,11 @@ func IsTradingDay(t time.Time) bool {
 // English: duration until the next active session start (weekday 08:30 premarket open) —
 // the single alarm an after-hours loop needs to truly hibernate instead of busy-ticking.
 func DurationToNextActiveSession(now time.Time) time.Duration {
-	now = cntime.In(now)            // §TZ1 北京时区统一
-	for add := 0; add <= 8; add++ { // 最多看一周（跨周末/长假）
+	now = cntime.In(now)             // §TZ1 北京时区统一
+	for add := 0; add <= 14; add++ { // 最多看两周（跨周末/长假，§GAP3.1 含休市日）
 		day := now.AddDate(0, 0, add)
-		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
+		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday ||
+			isClosedDay(day.Format("20060102")) {
 			continue
 		}
 		start := time.Date(day.Year(), day.Month(), day.Day(), 8, 30, 0, 0, now.Location())

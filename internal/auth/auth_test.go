@@ -42,16 +42,19 @@ func TestRegisterLoginValidate(t *testing.T) {
 		t.Error("Login(错误密码) 应失败")
 	}
 
-	// 令牌校验
-	if got := m.ValidateToken(u.Token); got == nil || got.Username != "tester" {
-		t.Error("ValidateToken 应返回对应用户")
+	// 令牌校验（§GAP6.2 登录轮换：以登录返回的原始令牌为准）
+	if got := m.ValidateToken(lu.Token); got == nil || got.Username != "tester" {
+		t.Error("ValidateToken 应返回对应用户(登录轮换后的令牌)")
+	}
+	if got := m.ValidateToken(u.Token); got != nil {
+		t.Error("注册令牌在登录轮换后应失效")
 	}
 	if got := m.ValidateToken("bogus"); got != nil {
 		t.Error("ValidateToken(bogus) 应返回 nil")
 	}
-	// UserToken 查询
-	if m.UserToken("tester") != u.Token {
-		t.Error("UserToken 应返回注册令牌")
+	// UserToken 查询（内存缓存 = 最近一次签发的原始令牌）
+	if m.UserToken("tester") != lu.Token {
+		t.Error("UserToken 应返回最近签发令牌")
 	}
 }
 
@@ -83,7 +86,7 @@ func TestCreateTemp(t *testing.T) {
 	// 过期后令牌失效：手动把 TokenExp 改到过去
 	m.mu.Lock()
 	for i := range m.db.Users {
-		if m.db.Users[i].Token == u.Token {
+		if m.db.Users[i].Username == u.Username {
 			m.db.Users[i].TokenExp = time.Now().Add(-time.Second).Unix()
 		}
 	}
@@ -325,7 +328,7 @@ func TestUserExpiry(t *testing.T) {
 	if err != nil || lu == nil {
 		t.Fatalf("未到期应可登录: %v", err)
 	}
-	if v := m.ValidateToken(u.Token); v == nil {
+	if v := m.ValidateToken(lu.Token); v == nil {
 		t.Fatal("未到期令牌应有效")
 	}
 
@@ -339,7 +342,7 @@ func TestUserExpiry(t *testing.T) {
 	if _, err := m.Login("alice_exp", "pw1"); err == nil {
 		t.Fatal("过期账号不应允许登录")
 	}
-	if v := m.ValidateToken(u.Token); v != nil {
+	if v := m.ValidateToken(lu.Token); v != nil {
 		t.Fatal("过期账号令牌应失效")
 	}
 
@@ -347,7 +350,7 @@ func TestUserExpiry(t *testing.T) {
 	if err := m.SetExpiry(u.ID, 30); err != nil {
 		t.Fatalf("SetExpiry(30): %v", err)
 	}
-	if v := m.ValidateToken(u.Token); v == nil {
+	if v := m.ValidateToken(lu.Token); v == nil {
 		t.Fatal("续期后令牌应恢复有效")
 	}
 	// 设 0 → 永久
@@ -415,16 +418,20 @@ func TestTokenExpiryAndSlidingRenewal(t *testing.T) {
 	if u.TokenExp == 0 || u.TokenExp < want-60 || u.TokenExp > want+60 {
 		t.Fatalf("注册令牌应约 30 天过期, got %d (want≈%d)", u.TokenExp, want)
 	}
-	// 手动把剩余有效期压到 1 小时 → 登录后续满
+	// 手动把剩余有效期压到 1 小时 → §GAP6.2 登录即轮换并签发全新 30 天令牌
 	m.mu.Lock()
 	u.TokenExp = time.Now().Add(time.Hour).Unix()
 	m.mu.Unlock()
-	if _, err := m.Login("carol", "pw"); err != nil {
+	lu, err := m.Login("carol", "pw")
+	if err != nil {
 		t.Fatal(err)
 	}
-	fresh := m.ValidateToken(u.Token)
+	if lu.Token == "" || lu.Token == u.Token {
+		t.Fatal("登录应轮换出全新原始令牌")
+	}
+	fresh := m.ValidateToken(lu.Token)
 	if fresh == nil {
-		t.Fatal("登录续期后令牌应有效")
+		t.Fatal("登录轮换后的令牌应有效")
 	}
 	got := fresh.TokenExp
 	if got < want-60 || got > want+60 {

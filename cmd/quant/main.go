@@ -89,6 +89,9 @@ func main() {
 	store.PrimarySourceThsDaily = strings.EqualFold(cfgMgr.Rules.Data.PrimarySource, "hithink")
 	store.ThsFactorsReady = cfgMgr.Rules.Data.ThsFactorsReady
 
+	// §GAP3.1 运行时交易日历：后台拉取法定节假日/临时休市日（失败按周末口径兜底，不阻断启动）。
+	data.LoadTradingCalendarAsync()
+
 	// LLM 配置优先级：环境变量 → 认证配置项 → 配置文件 → 默认值
 	llmCfg := llm.Config{}
 	llmCfg.APIKey = os.Getenv("LLM_API_KEY")

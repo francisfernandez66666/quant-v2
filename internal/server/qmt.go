@@ -89,7 +89,8 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 200, "real book not available")
 		return
 	}
-	positions, err := db.RealPositions()
+	// §GAP1.10 按账号过滤（遗留全局行 user_id='' 对所有人可见，兼容存量部署）
+	positions, err := db.RealPositionsForUser(userIDFor(r))
 	if err != nil {
 		writeError(w, 500, "read real positions: "+err.Error())
 		return
@@ -273,6 +274,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		SignalID  string               `json:"signal_id"`
 		Positions []store.RealPosition `json:"positions"`
 		At        string               `json:"at"`
+		UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
 	}
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 		writeError(w, 400, "invalid report body")
@@ -282,7 +284,19 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 
 	switch ev.Type {
 	case "positions":
-		// 全量对账：upsert 覆盖 + 移除已不在集合内的持仓
+		// 全量对账：upsert 覆盖 + 移除已不在集合内的持仓。
+		// §GAP1.10 持仓行打归属账号（网关未配 user_id 时回落回报 URL 归属账号）。
+		if ev.UserID != "" {
+			for i := range ev.Positions {
+				if ev.Positions[i].UserID == "" {
+					ev.Positions[i].UserID = ev.UserID
+				}
+			}
+		} else if uid != "" {
+			for i := range ev.Positions {
+				ev.Positions[i].UserID = uid
+			}
+		}
 		if n, err := db.UpsertRealPositions(ev.Positions); err != nil {
 			writeError(w, 500, "reconcile positions: "+err.Error())
 			return

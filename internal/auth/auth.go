@@ -7,6 +7,8 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -105,14 +107,24 @@ type Manager struct {
 	dataDir string       // 数据存储目录
 	dbPath  string       // auth.json 数据库文件路径
 	db      *DB          // 内存中的认证数据库
+	// rawTokens §GAP6.2 token 哈希存储的运行时补充：最近签发的原始令牌仅存进程内存
+	//（落盘的是 SHA-256 哈希），重启后清空——客户端需重新登录获取新令牌。
+	rawTokens map[string]string // userID → 最近签发原始令牌（不落盘）
+}
+
+// hashToken 令牌哈希：SHA-256 hex。落盘只存哈希，泄露 auth.json 不再等于接管全部账号。
+func hashToken(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }
 
 // NewManager 创建认证管理器实例。
 // （NewManager creates an authentication manager instance.）
 func NewManager(dataDir string) *Manager {
 	return &Manager{
-		dataDir: dataDir,
-		dbPath:  filepath.Join(dataDir, "auth.json"),
+		dataDir:   dataDir,
+		dbPath:    filepath.Join(dataDir, "auth.json"),
+		rawTokens: make(map[string]string),
 	}
 }
 
@@ -275,16 +287,18 @@ func (m *Manager) Register(username, password string) (*User, error) {
 		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
 		Username:     username,
 		PasswordHash: string(hash),
-		Token:        token,
+		Token:        hashToken(token), // §GAP6.2 落盘哈希
 		TokenExp:     newTokenExpiry(), // §A3 默认 30 天（此前永不过期）
 		Role:         RoleUser,         // 注册用户默认为普通用户
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
 	}
 	m.db.Users = append(m.db.Users, user)
+	m.rawTokens[user.ID] = token // 原始令牌仅内存，供本次响应返回
 	if err := m.save(); err != nil {
 		return nil, err
 	}
+	user.Token = token // 返回副本携带原始令牌（落盘为哈希）
 	return &user, nil
 }
 
@@ -304,16 +318,18 @@ func (m *Manager) CreateTemp(duration time.Duration) (*User, error) {
 	user := User{
 		ID:        fmt.Sprintf("tmp_%d", time.Now().UnixNano()),
 		Username:  fmt.Sprintf("temp_%s", token[:8]),
-		Token:     token,
+		Token:     hashToken(token),                // §GAP6.2 落盘哈希
 		TokenExp:  time.Now().Add(duration).Unix(), // 令牌过期时间
 		Role:      RoleUser,
 		Enabled:   true,
 		CreatedAt: time.Now().Unix(),
 	}
 	m.db.Users = append(m.db.Users, user)
+	m.rawTokens[user.ID] = token
 	if err := m.save(); err != nil {
 		return nil, err
 	}
+	user.Token = token // 响应返回原始令牌
 	return &user, nil
 }
 
@@ -340,15 +356,22 @@ func (m *Manager) Login(username, password string) (*User, error) {
 			if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
 				return nil, fmt.Errorf("wrong password")
 			}
-			// §A3 滑动续期：剩余有效期不足一个完整周期时续满（活跃账号不过期；
-			// 写锁+落盘，多端共享同一令牌不受影响）。
-			if u.TokenExp > 0 && u.TokenExp-time.Now().Unix() < int64(tokenTTL/time.Second) {
-				u.TokenExp = newTokenExpiry()
-				if err := m.save(); err != nil {
-					return nil, err
-				}
+			// §GAP6.2 登录即轮换令牌（旧令牌立即失效）+ 哈希落盘：响应副本携带原始令牌。
+			// English: §GAP6.2 rotate the token on every login (old one invalidated immediately);
+			// only the SHA-256 hash is persisted, and the returned copy carries the raw token.
+			raw, err := generateToken()
+			if err != nil {
+				return nil, fmt.Errorf("generate token: %w", err)
 			}
-			return u, nil
+			u.Token = hashToken(raw)
+			u.TokenExp = newTokenExpiry()
+			m.rawTokens[u.ID] = raw
+			if err := m.save(); err != nil {
+				return nil, err
+			}
+			resp := *u
+			resp.Token = raw
+			return &resp, nil
 		}
 	}
 	return nil, fmt.Errorf("user not found")
@@ -383,7 +406,7 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
 		Username:     username,
 		PasswordHash: string(hash),
-		Token:        token,
+		Token:        hashToken(token), // §GAP6.2 落盘哈希
 		TokenExp:     newTokenExpiry(),
 		Role:         RoleAdmin,
 		Enabled:      true,
@@ -391,9 +414,11 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 	}
 	m.db.Users = append(m.db.Users, user)
 	m.db.Configs = append(m.db.Configs, ConfigEntry{UserID: user.ID, Key: "initialized", Value: "1"})
+	m.rawTokens[user.ID] = token
 	if err := m.save(); err != nil {
 		return nil, err
 	}
+	user.Token = token // 响应返回原始令牌
 	return &user, nil
 }
 
@@ -402,11 +427,22 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 // （ValidateToken checks whether a token is valid and returns the matching, still-valid user.
 // If TokenExp>0 and the expiry has passed, it returns nil.）
 func (m *Manager) ValidateToken(token string) *User {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	for _, u := range m.db.Users {
-		if u.Token == token {
+	if token == "" {
+		return nil
+	}
+	presented := hashToken(token)
+	for i := range m.db.Users {
+		u := &m.db.Users[i]
+		if u.Token == "" {
+			continue
+		}
+		// §GAP6.2 常量时间比较；存量明文令牌（auth.json 旧数据）直接比对命中后原地升级哈希
+		matchHash := subtle.ConstantTimeCompare([]byte(u.Token), []byte(presented)) == 1
+		matchPlain := !matchHash && subtle.ConstantTimeCompare([]byte(u.Token), []byte(token)) == 1
+		if matchHash || matchPlain {
 			if u.TokenExp > 0 && time.Now().Unix() > u.TokenExp {
 				return nil
 			}
@@ -416,20 +452,31 @@ func (m *Manager) ValidateToken(token string) *User {
 			if !u.Enabled {
 				return nil
 			}
-			return &u
+			if matchPlain {
+				u.Token = presented
+				if err := m.save(); err != nil {
+					log.Printf("[auth] 令牌哈希迁移落盘失败: %v", err)
+				}
+			}
+			m.rawTokens[u.ID] = token // 内存补记原始令牌（UserToken 消费）
+			cp := *u
+			cp.Token = ""
+			return &cp
 		}
 	}
 	return nil
 }
 
-// UserToken 返回指定用户名当前 token；用户不存在或无 token 时返回空串。
-// （UserToken returns the current token of a username, or an empty string if the user is missing or has none.）
+// UserToken 返回指定用户名当前原始令牌（仅内存缓存；进程重启后为空，需重新登录）。
+// 用户不存在或无内存缓存的原始令牌时返回空串。
+// （UserToken returns the current RAW token of a username from the in-memory cache only;
+// after a process restart it is empty and the client must log in again.）
 func (m *Manager) UserToken(username string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, u := range m.db.Users {
 		if u.Username == username {
-			return u.Token
+			return m.rawTokens[u.ID]
 		}
 	}
 	return ""
@@ -570,7 +617,8 @@ func (m *Manager) ChangePassword(userID, newPassword string) error {
 	}
 	return m.updateUser(userID, func(u *User) error {
 		u.PasswordHash = string(hash)
-		u.Token = token
+		u.Token = hashToken(token) // §GAP6.2 重签令牌落盘哈希（旧 token 立即失效）
+		delete(m.rawTokens, userID)
 		return nil
 	})
 }

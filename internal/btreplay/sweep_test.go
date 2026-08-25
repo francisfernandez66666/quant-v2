@@ -33,12 +33,13 @@ func TestUniformExitV2Trailing(t *testing.T) {
 	closes := []float64{100, 105, 110, 115, 120, 118, 112, 108}
 	kls := mkKLine(closes)
 	exitJ, pnl := uniformExitV2(kls, 0, 100, 100, 0, 0, 8, 30)
-	// j=6 cur=112 阶段高 120 回撤 -6.7% 未触发；j=7 cur=108 回撤 -10% 触发，pnl=(108-100)/100=+8%
+	// j=6 cur=112 阶段高 120 回撤 -6.7% 未触发；j=7 cur=108 回撤 -10% 触发。
+	// §GAP4.1 净额口径：pnl 含双边滑点+佣金+印花税（≈8% - 0.21% ≈ 7.79）
 	if exitJ != 7 {
 		t.Fatalf("exitJ=%d want 7", exitJ)
 	}
-	if want := float64(8); abs(pnl-want) > 0.01 {
-		t.Fatalf("pnl=%.2f want %.2f", pnl, want)
+	if want := costRoundTripPnl(100, 108); abs(pnl-want) > 0.01 {
+		t.Fatalf("pnl=%.2f want %.2f(净额)", pnl, want)
 	}
 }
 
@@ -47,12 +48,12 @@ func TestUniformExitV2TakeProfit(t *testing.T) {
 	closes := []float64{100, 104, 109, 112, 115}
 	kls := mkKLine(closes)
 	exitJ, pnl := uniformExitV2(kls, 0, 100, 100, 8, 0, 0, 30)
-	// j=2 cur=109 → pnl=+9% ≥ 8% 触发
+	// j=2 cur=109 → 触发止盈（净额口径见 §GAP4.1）
 	if exitJ != 2 {
 		t.Fatalf("exitJ=%d want 2", exitJ)
 	}
-	if want := float64(9); abs(pnl-want) > 0.01 {
-		t.Fatalf("pnl=%.2f want %.2f", pnl, want)
+	if want := costRoundTripPnl(100, 109); abs(pnl-want) > 0.01 {
+		t.Fatalf("pnl=%.2f want %.2f(净额)", pnl, want)
 	}
 }
 
@@ -61,12 +62,12 @@ func TestUniformExitV2StopLoss(t *testing.T) {
 	closes := []float64{100, 98, 95, 94, 96}
 	kls := mkKLine(closes)
 	exitJ, pnl := uniformExitV2(kls, 0, 100, 100, 20, 5, 8, 30)
-	// 循环自 j=entryDay+1=2 起：j=2 cur=95 → pnl=-5% ≤ -5% 立即触发
+	// 循环自 j=entryDay+1=2 起：j=2 cur=95 → 立即触发（净额口径见 §GAP4.1）
 	if exitJ != 2 {
 		t.Fatalf("exitJ=%d want 2", exitJ)
 	}
-	if abs(pnl-(-5)) > 0.01 {
-		t.Fatalf("pnl=%.2f want -5", pnl)
+	if want := costRoundTripPnl(100, 95); abs(pnl-want) > 0.01 {
+		t.Fatalf("pnl=%.2f want %.2f(净额)", pnl, want)
 	}
 }
 

@@ -522,6 +522,8 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 	splitIdx := int(float64(len(dates)) * opts.SplitPct)
 	winDays := windowDays
 	chunks := windowChunks(dates, winDays)
+	// §GAP 二.3#4 真 hold-out：寻优只用样本内窗口（≤splitIdx），样本外留作第 4 步验证
+	inChunks := windowChunks(dates[:splitIdx+1], winDays)
 
 	// 窗口级断点（二期）：resume_key 绑定区间+参数+股票池；被抢占后重入，
 	// 预筛/贪心/分段IR/反推各阶段命中窗口直接复用，不再重装配。
@@ -530,12 +532,12 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 	rk := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes)
 	log.Printf("[discover] 断点key=%s 窗口数=%d（中断续跑跳过已完成窗口）", rk, len(chunks))
 
-	// 1) 单因子预筛：每窗口装配一次（含全部候选因子），一次性算所有因子的全区间 |IR|
+	// 1) 单因子预筛：每窗口装配一次（含全部候选因子），§GAP 二.3#4 只算样本内（≤split）|IR|
 	// （比逐因子重新装配窗口快约「因子数」倍）。进度带 5%–35%。
-	// English: single-factor pre-screen (progress band 5–35%).
+	// English: single-factor pre-screen (progress band 5–35%), in-sample only.
 	var pre []string
 	preCk := &winCkpt{db: db, resumeKey: rk, stage: "pre"}
-	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, chunks, dates, preCk, newStageProgress(5, 35, len(chunks)))
+	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1], preCk, newStageProgress(5, 35, len(inChunks)))
 	for _, fid := range opts.Factors {
 		rows := allIC[fid]
 		if len(rows) < opts.MinDays {
@@ -568,11 +570,11 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 		if len(cands) == 0 {
 			break
 		}
-		// 每窗口装配一次，算所有候选子集（base+各 cand）的复合 IC（提速）
+		// 每窗口装配一次，算所有候选子集（base+各 cand）的复合 IC（提速；§GAP 二.3#4 样本内）
 		bestFid := ""
 		bestCandIR := bestIR
 		// 断点 stage 含 base 标识：贪心每步 base 集不同，各自成槽（stage embeds the base set）。
-		subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, chunks, dates,
+		subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1],
 			&winCkpt{db: db, resumeKey: rk, stage: "greedy|" + strings.Join(selected, "+")})
 		for _, fid := range cands {
 			ir := absf(IR(subsetIC[fid]))
@@ -608,7 +610,8 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 		Factors: selected, Horizon: opts.Horizon, MinStocks: opts.MinStocks,
 		Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
 		GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
-	}, chunks, dates)
+		End: dates[splitIdx],
+	}, inChunks, dates[:splitIdx+1])
 	res.Factors = selected
 	res.Directions = dirs
 	res.Weights = opt.Weights

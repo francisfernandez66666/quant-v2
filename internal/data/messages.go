@@ -72,7 +72,7 @@ func (s *MessageStore) persist() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(s.path, raw, 0644); err != nil {
+	if err := atomicWrite(s.path, raw, 0644); err != nil {
 		log.Printf("[messages] 写入失败: %v", err)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 )
@@ -201,7 +202,8 @@ func TestOrderLifecycle(t *testing.T) {
 	if p.Status != "filled" || p.Qty != 1000 || p.Price != 10 {
 		t.Fatalf("成交应留 filled 订单: %+v", p)
 	}
-	// 减仓 → partial
+	// 减仓 → partial（§GAP1.9：T+1 生效后须模拟次日，旧实现当日即可减仓是 bug 依赖）
+	t1Ready(e)
 	trim := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头",
 		Direction: "提醒", Action: "卖出", AlertType: "减仓"}
 	e.OnSignals([]combat_agent.Signal{trim}, quotesOf(11))
@@ -214,4 +216,57 @@ func TestOrderLifecycle(t *testing.T) {
 	if all[0].CreatedAt.Before(all[len(all)-1].CreatedAt) {
 		t.Fatal("Orders() 应按时间倒序")
 	}
+}
+
+// TestAutoSellT1RejectedNotFakeFilled §GAP1.9 回归：T+1 拦截自动卖出时——
+// ① 清仓不得落假 filled 订单（旧实现忽略 error，账实不符）；
+// ② 减仓不得落假 partial 订单且不得置 trimDone（否则当日真正减仓窗口被永久跳过）。
+// English: §GAP1.9 regression — when T+1 blocks an auto-sell: no fake "filled"/"partial" order,
+// and trimDone must stay unset so a later same-day trim can still go through.
+func TestAutoSellT1RejectedNotFakeFilled(t *testing.T) {
+	t.Run("清仓被拒留 rejected", func(t *testing.T) {
+		e := sellTestEngine(t, true)
+		buyFill(t, e)
+		sig := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头",
+			Direction: "提醒", Action: "卖出", AlertType: "清仓"}
+		tradesBefore := len(e.trades) // 买入本身已产生一条成交，被拒卖出不得再新增
+		e.OnSignals([]combat_agent.Signal{sig}, quotesOf(11))
+		if p := e.positions["300001"]; p == nil || p.Qty != 1000 {
+			t.Fatal("T+1 拦截后持仓应保留")
+		}
+		last := e.orders[len(e.orders)-1]
+		if last.Status != "rejected" || last.Side != "sell" {
+			t.Fatalf("被拒清仓应留 rejected 卖单, got %+v", last)
+		}
+		if len(e.trades) != tradesBefore {
+			t.Fatalf("被拒清仓不应产生成交记录: %d → %d", tradesBefore, len(e.trades))
+		}
+		// 次日（回拨 FilledAt）重发同信号 → 正常全平
+		t1Ready(e)
+		e.OnSignals([]combat_agent.Signal{sig}, quotesOf(11))
+		if _, held := e.positions["300001"]; held {
+			t.Fatal("次日重发清仓应成交")
+		}
+	})
+
+	t.Run("减仓被拒不置trimDone", func(t *testing.T) {
+		e := sellTestEngine(t, true)
+		buyFill(t, e)
+		sig := combat_agent.Signal{Code: "300001", Name: "测试股", Strategy: "龙头",
+			Direction: "提醒", Action: "卖出", AlertType: "减仓"}
+		e.OnSignals([]combat_agent.Signal{sig}, quotesOf(10.5))
+		last := e.orders[len(e.orders)-1]
+		if last.Status != "rejected" {
+			t.Fatalf("被拒减仓应留 rejected 订单, got %+v", last)
+		}
+		if e.trimDone["300001"] == cntime.DayCompactOf(time.Now()) {
+			t.Fatal("被拒减仓不应置 trimDone（否则当日后续减仓机会被跳过）")
+		}
+		// 同日稍后（模拟 T+1 解除）再发 → 应能正常减仓
+		t1Ready(e)
+		e.OnSignals([]combat_agent.Signal{sig}, quotesOf(10.5))
+		if p := e.positions["300001"]; p == nil || p.Qty != 500 {
+			t.Fatalf("解除 T+1 后减仓应执行, got %+v", e.positions["300001"])
+		}
+	})
 }

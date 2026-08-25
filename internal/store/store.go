@@ -473,6 +473,15 @@ func (d *DB) migrate() error {
 		{"optimization_results", "stop_loss", "ALTER TABLE optimization_results ADD COLUMN stop_loss REAL DEFAULT 0"},
 		// §D 热力网格：每战法冠军行携带 止盈×止损 最优期望压缩网格（JSON，前端渲染用）
 		{"optimization_results", "grid_json", "ALTER TABLE optimization_results ADD COLUMN grid_json TEXT DEFAULT ''"},
+		// §GAP1.10 实盘账本多租户：持仓行归属账号（网关回报 user_id 写入；空串=遗留全局行，所有人可见）
+		{"real_positions", "user_id", "ALTER TABLE real_positions ADD COLUMN user_id TEXT DEFAULT ''"},
+		// §GAP 二.3#5 回测断点缓存规则指纹：改参后旧缓存自动失效
+		{"backtest_event_results", "rule_fp", "ALTER TABLE backtest_event_results ADD COLUMN rule_fp TEXT DEFAULT ''"},
+		// §GAP4.5 寻优排名风险调整指标：夏普/最大回撤/年化/卡玛
+		{"optimization_results", "sharpe", "ALTER TABLE optimization_results ADD COLUMN sharpe REAL DEFAULT 0"},
+		{"optimization_results", "max_drawdown_pct", "ALTER TABLE optimization_results ADD COLUMN max_drawdown_pct REAL DEFAULT 0"},
+		{"optimization_results", "annual_return_pct", "ALTER TABLE optimization_results ADD COLUMN annual_return_pct REAL DEFAULT 0"},
+		{"optimization_results", "calmar", "ALTER TABLE optimization_results ADD COLUMN calmar REAL DEFAULT 0"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

@@ -27,12 +27,12 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
-// limitUpPct §R6 分板块涨停封板近似阈值（实时涨幅 ≥ 该值视为封板拒买）。
+// LimitUpPct §R6 分板块涨停封板近似阈值（实时涨幅 ≥ 该值视为封板拒买）。
 // 主板 10%（9.9 容差）、创业板/科创板 20cm（19.9）、北交所 30%（29.9）；
 // 名称含 ST（含 *ST，大小写不敏感）按 5% 档（4.9）。code 形如 "600519.SH" 或裸码均可。
 // English: board-aware limit-up threshold for the sealed-board buy guard — main board ~10%,
 // ChiNext/STAR 20%, BSE 30%, ST (name contains "ST") 5%.
-func limitUpPct(code, name string) float64 {
+func LimitUpPct(code, name string) float64 {
 	if strings.Contains(strings.ToUpper(name), "ST") {
 		return 4.9
 	}
@@ -799,7 +799,7 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// 封板股买单在现实中几乎无法排队成交——002412 实录：4 连板 09:30 首封，
 		// 龙头识别 10:15 发信号被瞬间以涨停价撮合，制造"买后必涨"的虚假胜率。
 		// 以实时涨幅近似封板判定；§R6 分板块幅度：主板/ST≈10%/5%、创业科创 20cm、北交 30%。
-		if q := quotes[s.Code]; q != nil && q.ChangePct >= limitUpPct(s.Code, s.Name) {
+		if q := quotes[s.Code]; q != nil && q.ChangePct >= LimitUpPct(s.Code, s.Name) {
 			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 				StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
 				SignalPrice: s.Price, Status: "rejected",
@@ -875,7 +875,19 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 	switch act {
 	case "close":
 		qty := p.Qty
-		e.sellAllLocked(p, price, reason)
+		// §GAP1.9 修复：卖出被拒（如 T+1 当日买当日卖拦截）不得落假 filled 订单——
+		// 此前忽略 sellAllLocked 的 error，账实不符；现按买入路径同款 rejected 留痕。
+		// English: §GAP1.9 fix — a rejected close (e.g. T+1 same-day-sell block) must not be recorded
+		// as "filled"; audit it as rejected like the buy path does.
+		if err := e.sellAllLocked(p, price, reason); err != nil {
+			e.recordOrderLocked(func() Order {
+				o := mkOrder("rejected", qty)
+				o.Reason = "自动清仓被拒:" + err.Error()
+				return o
+			}())
+			log.Printf("[paper] 自动清仓被拒 %s(%s): %v", s.Code, s.Name, err)
+			return
+		}
 		e.recordOrderLocked(func() Order { o := mkOrder("filled", qty); o.Price = price; return o }())
 	case "trim":
 		today := cntime.DayCompactOf(time.Now()) // §TZ1
@@ -886,7 +898,19 @@ func (e *Engine) autoSellLocked(s *combat_agent.Signal, act string, quotes map[s
 		if half <= 0 {
 			return // 持仓不足两手无法半仓减仓，等清仓类信号处理
 		}
-		e.sellQtyLocked(p, price, half, reason)
+		// §GAP1.9 修复：trim 被拒时同样不落假 partial 订单，且不得置 trimDone——
+		// 否则当日真正可减仓的窗口（如次日）被永久跳过。
+		// English: §GAP1.9 fix — a rejected trim must not record a fake "partial" order nor set trimDone,
+		// which would permanently skip later valid trim windows on the same day.
+		if err := e.sellQtyLocked(p, price, half, reason); err != nil {
+			e.recordOrderLocked(func() Order {
+				o := mkOrder("rejected", half)
+				o.Reason = "自动减仓被拒:" + err.Error()
+				return o
+			}())
+			log.Printf("[paper] 自动减仓被拒 %s(%s): %v", s.Code, s.Name, err)
+			return
+		}
 		e.recordOrderLocked(func() Order { o := mkOrder("partial", half); o.Price = price; return o }())
 		e.trimDone[s.Code] = today
 	}
@@ -1039,7 +1063,7 @@ func (e *Engine) Buy(code, name, strategy string, signalPrice float64, quotes ma
 func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice float64, quotes map[string]*data.StockInfo) error {
 	// §R0.4 涨跌停拒成交：涨停封板的股票买单拒绝。§R5/R6 修复：改按 code 直接取键
 	// （此前遍历比对 q.Code==code，调用方未填 Code 字段时守卫静默失效）+ 分板块幅度。
-	if q := quotes[code]; q != nil && q.ChangePct >= limitUpPct(code, name) {
+	if q := quotes[code]; q != nil && q.ChangePct >= LimitUpPct(code, name) {
 		log.Printf("[paper] 涨停拒买 %s(%.1f%%)", code, q.ChangePct)
 		return fmt.Errorf("涨停封板无法买入")
 	}
@@ -1101,7 +1125,7 @@ func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, 
 func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, price float64, qty int, quotes map[string]*data.StockInfo) error {
 	// §R5 修复：BuyEx 此前完全无涨停检查，可用任意价格买入封板股（与自动/手动口径不一致）。
 	// 行情快照可用时按 §R6 分板块幅度守卫；纯手输价（无行情）不拦——用户可能补记一笔真实世界的委托。
-	if q := quotes[code]; q != nil && q.ChangePct >= limitUpPct(code, name) {
+	if q := quotes[code]; q != nil && q.ChangePct >= LimitUpPct(code, name) {
 		log.Printf("[paper] 涨停拒买(手输价) %s(%.1f%%)", code, q.ChangePct)
 		return fmt.Errorf("涨停封板无法买入")
 	}

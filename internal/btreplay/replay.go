@@ -22,6 +22,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -535,7 +536,11 @@ func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLin
 		return nil, false
 	}
 	// §P2-d 规则级出场参数优先（扫参审批），缺省回退全局 8%/15 天。
-	trailLimit := 8.0
+	// §GAP2.2 修复：缺省 trailLimit 必须是负号语义（回撤达 -8% 才触发），与实盘
+	// genericTrailingExitWith（combat_agent/position_exits.go: trail <= -trailPct）同口径。
+	// 旧实现缺省 +8.0：stageHigh 先抬含现价 → trail 恒 ≤0 → 任何曾盈利持仓当日即被"移动止盈"平仓，
+	// 未获扫参覆盖的库规则夜间回放胜率/持仓天数严重失真。
+	trailLimit := -8.0
 	if a.trailOverride != nil && *a.trailOverride > 0 {
 		trailLimit = -*a.trailOverride
 	}
@@ -803,7 +808,9 @@ func (o *Options) Run() error {
 				fmt.Printf("回测进度 %d%%\n", pct)
 			}
 			code := strings.Split(tsCode, ".")[0] // 000001.SZ -> 000001
-			bars, err := db.RawBars(tsCode, o.Start, o.End)
+			// §GAP4 复权价回放：HfqBars 后复权序列——除权缺口不再被误判为真实暴跌
+			// （RawBars 口径下移动止损/破位在除权日假触发、盈亏被扭曲）。
+			bars, err := db.HfqBars(tsCode, o.Start, o.End)
 			if err != nil {
 				continue
 			}
@@ -869,6 +876,11 @@ func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, in
 		if entry <= 0 {
 			continue
 		}
+		// §GAP4.2 开盘即封板不可成交：一字板/秒板买单现实中排队无望，跳过该笔
+		// （打板类战法此前默认必成交，产生系统性乐观偏差）。
+		if costOpenAtLimitUp(code, klines[i].Close, entry) {
+			continue
+		}
 		// 逐日平仓模拟：从入场次日（i+2）起跑 CheckExit
 		t := o.simulateExit(code, klines, i+1, entry, meta, ad)
 		if t != nil {
@@ -903,7 +915,8 @@ func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, e
 			return &trade{
 				Strategy: ad.Name(), Code: code, Date: klines[entryIdx].Date.Format("20060102"),
 				HoldDays: j - entryIdx, Entry: entry, Exit: cur,
-				PnlPct: (cur - entry) / entry * 100, Reason: res.Reason,
+				// §GAP4.1 净额口径：双边滑点+双边佣金+卖出印花税一次性计入收益率
+				PnlPct: costRoundTripPnl(entry, cur), Reason: res.Reason,
 			}
 		}
 	}
@@ -915,7 +928,7 @@ func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, e
 	return &trade{
 		Strategy: ad.Name(), Code: code, Date: klines[entryIdx].Date.Format("20060102"),
 		HoldDays: len(klines) - 1 - entryIdx, Entry: entry, Exit: last,
-		PnlPct: (last - entry) / entry * 100, Reason: "区间结束强制结算",
+		PnlPct: costRoundTripPnl(entry, last), Reason: "区间结束强制结算",
 	}
 }
 
@@ -933,6 +946,12 @@ type summary struct {
 	ProfitFactor float64
 	Expectancy   float64 // 每笔交易期望收益率%（正=正期望策略）
 	AvgHold      float64
+
+	// §GAP4.5 风险调整指标（此前全系统零实现）
+	Sharpe          float64 `json:"sharpe"`            // 年化夏普（逐笔净额收益）
+	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`  // 复利净值最大回撤%（正数）
+	AnnualReturnPct float64 `json:"annual_return_pct"` // 复利年化收益%
+	Calmar          float64 `json:"calmar"`            // 卡玛 = |年化/MDD|
 }
 
 // summarize 汇总所有交易的胜率/盈亏指标。
@@ -971,6 +990,20 @@ func summarize(trades []trade) *summary {
 	wr := s.WinRate / 100
 	s.Expectancy = wr*s.AvgWinPct + (1-wr)*s.AvgLossPct
 	s.AvgHold = float64(holdSum) / float64(s.Count)
+
+	// §GAP4.5 风险调整指标：按入场日排序后计算（多股票交错入账，净值曲线需时间序）
+	ord := make([]int, len(trades))
+	for i := range ord {
+		ord[i] = i
+	}
+	sort.Slice(ord, func(a, b int) bool { return trades[ord[a]].Date < trades[ord[b]].Date })
+	pnls := make([]float64, len(trades))
+	dates := make([]string, len(trades))
+	for k, idx := range ord {
+		pnls[k] = trades[idx].PnlPct
+		dates[k] = trades[idx].Date
+	}
+	s.Sharpe, s.MaxDrawdownPct, s.AnnualReturnPct, s.Calmar = perfMetrics(pnls, dates)
 	return s
 }
 
@@ -990,6 +1023,9 @@ func printReport(s *summary, name string, stockCount int) {
 	fmt.Printf("盈亏比: %.2f\n", s.ProfitFactor)
 	fmt.Printf("期望收益: %+.2f%%\n", s.Expectancy)
 	fmt.Printf("平均持仓天数: %.1f\n", s.AvgHold)
+	// §GAP4.5 风险调整指标
+	fmt.Printf("夏普: %.2f | 最大回撤: %.2f%% | 年化: %+.2f%% | 卡玛: %.2f\n",
+		s.Sharpe, s.MaxDrawdownPct, s.AnnualReturnPct, s.Calmar)
 	fmt.Println("==============================================")
 }
 

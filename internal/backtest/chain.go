@@ -10,6 +10,7 @@ package backtest
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math"
 	"sort"
@@ -38,6 +39,39 @@ type SignalRule struct {
 	TopK       int                // 每事件选股数
 	MinStocks  int                // 当日有效样本下限
 	MinCover   float64            // 因子覆盖要求（0~1，缺失占比过高则剔除）
+}
+
+// Fingerprint 规则参数指纹（§GAP 二.3#5）：因子集合/方向/权重/TopK/MinStocks/MinCover 的
+// 规范化序列化哈希。作为 backtest_event_results 断点缓存键的组成部分——此前缓存 key 不含参数，
+// 同一候选改参重跑会命中旧结果，产出新旧混杂的报告。
+// English: canonical fingerprint of the rule parameters, part of the event-result cache key so a
+// parameter change on the same candidate can no longer serve stale cached results.
+func (r SignalRule) Fingerprint() string {
+	factors := append([]string(nil), r.Factors...)
+	sort.Strings(factors)
+	keys := make([]string, 0, len(r.Directions)+len(r.Weights))
+	dirs := make(map[string]int, len(r.Directions))
+	wts := make(map[string]float64, len(r.Weights))
+	for k, v := range r.Directions {
+		keys = append(keys, "d:"+k)
+		dirs[k] = v
+	}
+	for k, v := range r.Weights {
+		keys = append(keys, "w:"+k)
+		wts[k] = v
+	}
+	sort.Strings(keys)
+	h := fnv.New64a()
+	fmt.Fprintf(h, "f=%v;", factors)
+	for _, k := range keys {
+		if k[0] == 'd' {
+			fmt.Fprintf(h, "%s=%d;", k, dirs[k[2:]])
+		} else {
+			fmt.Fprintf(h, "%s=%.6f;", k, wts[k[2:]])
+		}
+	}
+	fmt.Fprintf(h, "topk=%d;minstocks=%d;mincover=%.4f", r.TopK, r.MinStocks, r.MinCover)
+	return fmt.Sprintf("%016x", h.Sum64())
 }
 
 // DefaultRule 返回默认信号规则（7 大类精选 + 合理方向）。
@@ -200,10 +234,12 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 			continue
 		}
 		// 断点续跑：整窗命中缓存则跳过装配（省内存也省时间）。
-		if opts.CandidateID > 0 && allEventsCached(db, opts.CandidateID, winEvents) {
+		// §GAP 二.3#5：缓存键携带规则参数指纹，改参后旧缓存自动失效。
+		ruleFP := opts.Rule.Fingerprint()
+		if opts.CandidateID > 0 && allEventsCached(db, opts.CandidateID, ruleFP, winEvents) {
 			for _, e := range winEvents {
 				var er EventResult
-				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry); err == nil && ok {
+				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP); err == nil && ok {
 					if json.Unmarshal([]byte(js), &er) == nil {
 						rep.Events = append(rep.Events, er)
 						rep.TotalEvents++
@@ -241,7 +277,7 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 			var er EventResult
 			cached := false
 			if opts.CandidateID > 0 {
-				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry); err == nil && ok {
+				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP); err == nil && ok {
 					if json.Unmarshal([]byte(js), &er) == nil {
 						cached = true
 					}
@@ -251,7 +287,7 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 				er = evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons)
 				if opts.CandidateID > 0 {
 					if js, err := json.Marshal(er); err == nil {
-						if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, string(js)); err != nil {
+						if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP, string(js)); err != nil {
 							log.Printf("backtest: 缓存事件结果失败 cand=%d %s/%s: %v", opts.CandidateID, e.Date, e.Industry, err)
 						}
 					}
@@ -283,9 +319,10 @@ func filterEvents(events []SectorEvent, start, end string) []SectorEvent {
 }
 
 // allEventsCached 判断窗口内全部事件是否都有断点缓存（决定该窗是否可跳过装配）。
-func allEventsCached(db *store.DB, candID int64, winEvents []SectorEvent) bool {
+// ruleFP 参与键匹配：规则参数变更后窗口视为未缓存，强制重算（不再复用旧参结果）。
+func allEventsCached(db *store.DB, candID int64, ruleFP string, winEvents []SectorEvent) bool {
 	for _, e := range winEvents {
-		if _, ok, err := db.GetBacktestEventResult(candID, e.Date, e.Industry); err != nil || !ok {
+		if _, ok, err := db.GetBacktestEventResult(candID, e.Date, e.Industry, ruleFP); err != nil || !ok {
 			return false
 		}
 	}
@@ -411,7 +448,12 @@ func evalEvent(panels map[string]*stockData, bench []store.Bar, benchIdx map[str
 			EntryDate: sd.Series.Dates[c.next], EntryPrice: entryPrice,
 			Returns: map[int]float64{}, Excess: map[int]float64{},
 		}
-		bj := firstAfter(benchIdx, e.Date)
+		// §GAP 二.3#3 基准窗对齐：个股收益窗从"事件次日开盘"起算（entry=c.next Open），
+		// 基准窗必须同为"首个严格晚于事件日的交易日开盘"起算——旧 firstAfter 含事件日本身，
+		// 基准多算一天行情，超额收益被系统性抬高/压低一天。
+		// English: benchmark window must start at the first trading day STRICTLY after the event date,
+		// matching the stock entry at next-day open (the old >=d semantics included the event day itself).
+		bj := firstStrictlyAfter(benchIdx, e.Date)
 		for _, h := range horizons {
 			fi := c.next + h
 			if fi >= sd.Series.Len() || sd.Series.CloseHfq[fi] <= 0 {
@@ -446,11 +488,12 @@ func evalEvent(panels map[string]*stockData, bench []store.Bar, benchIdx map[str
 	return er
 }
 
-// firstAfter 返回日期 d 之后（含 d）第一个基准交易日下标；无则 -1。
-func firstAfter(idx map[string]int, d string) int {
+// firstStrictlyAfter 返回日期 d 之后（严格不含 d）第一个基准交易日下标；无则 -1。
+// §GAP 二.3#3 基准窗对齐：个股从事件次日开盘入场，基准窗同口径（旧实现含事件日，错位一天）。
+func firstStrictlyAfter(idx map[string]int, d string) int {
 	best := ""
 	for k := range idx {
-		if k >= d && (best == "" || k < best) {
+		if k > d && (best == "" || k < best) {
 			best = k
 		}
 	}

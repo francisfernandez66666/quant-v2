@@ -140,6 +140,12 @@ type sweepResult struct {
 	StopLossPct    float64 `json:"stop_loss_pct"`
 	AvgHold        float64 `json:"avg_hold_days"`
 	ObjectiveScore float64 `json:"-"`
+
+	// §GAP4.5 风险调整指标（随 SWEEP_JSON 落库展示）
+	Sharpe          float64 `json:"sharpe"`
+	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`
+	AnnualReturnPct float64 `json:"annual_return_pct"`
+	Calmar          float64 `json:"calmar"`
 }
 
 // runSweep 扫参主流程。codes 为裸码列表；industryChg 与普通回放同构。
@@ -161,7 +167,8 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	}
 	klines := make(map[string][]data.KLine, len(codes))
 	for _, tsCode := range codes {
-		bars, err := db.RawBars(tsCode, o.Start, o.End)
+		// §GAP4 复权价：扫参与回放同用 HfqBars（除权缺口不再污染形态/止损判定）
+		bars, err := db.HfqBars(tsCode, o.Start, o.End)
 		if err != nil || len(bars) < 15 {
 			continue
 		}
@@ -287,7 +294,10 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 
 		// 2f) 止盈×止损热力网格（格值=该格跨持仓/门槛的最优期望）+ 批次冠军明细
 		type gridCell struct {
-			Tp, Sl     float64 `json:"tp"`
+			// §GAP 修复：Sl 原误标 json:"tp" 与 Tp 冲突，序列化后 sl 恒缺失——
+			// 前端热力网格（Research.vue optCurHeat 按 tp|sl 复合键查表）sl 维度全为 0。
+			Tp         float64 `json:"tp"`
+			Sl         float64 `json:"sl"`
 			Expectancy float64 `json:"expectancy"`
 			Triggers   int     `json:"triggers"`
 		}
@@ -425,12 +435,16 @@ func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data
 	restore := applyComboParams(ad, takeProfitPct, stopLossPct, maxHold, minScore)
 	res := sweepResult{Name: ad.Name(), Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct, Hold: maxHold, MinScore: minScore}
 	var winSum, lossSum float64
+	var pnls []float64
+	var dates []string
 	for code, kls := range klines {
 		indByDate := industryChg[code]
 		trades := o.backtestStock(code, kls, ad, indByDate)
 		for _, t := range trades {
 			res.Count++
 			res.AvgHold += float64(t.HoldDays)
+			pnls = append(pnls, t.PnlPct)
+			dates = append(dates, t.Date)
 			if t.PnlPct > 0 {
 				res.Win++
 				winSum += t.PnlPct
@@ -441,24 +455,7 @@ func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data
 		}
 	}
 	restore() // 恢复原始参数
-	if res.Count == 0 {
-		return res
-	}
-	res.AvgHold /= float64(res.Count)
-	if res.Win > 0 {
-		res.AvgWinPct = winSum / float64(res.Win)
-	}
-	if res.Loss > 0 {
-		res.AvgLossPct = lossSum / float64(res.Loss)
-	}
-	if res.Win+res.Loss > 0 {
-		res.WinRate = float64(res.Win) / float64(res.Win+res.Loss) * 100
-	}
-	if lossSum != 0 {
-		res.ProfitFactor = winSum / -lossSum
-	}
-	wr := res.WinRate / 100
-	res.Expectancy = wr*res.AvgWinPct + (1-wr)*res.AvgLossPct
+	finalizeResult(&res, winSum, lossSum, pnls, dates)
 	return res
 }
 
@@ -549,7 +546,8 @@ func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 		if entry <= 0 {
 			return 0
 		}
-		return (kls[j].Close - entry) / entry * 100
+		// §GAP4.1 净额口径（滑点+佣金+印花税），与 replay 回放同模型
+		return costRoundTripPnl(entry, kls[j].Close)
 	}
 
 	for j := entryDay + 1; j <= lastJ; j++ {
@@ -560,7 +558,7 @@ func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 		if cur > stageHigh {
 			stageHigh = cur
 		}
-		pnlPct := (cur - entry) / entry * 100
+		pnlPct := costRoundTripPnl(entry, cur)
 		days := j - entryDay
 
 		if stopLossPct > 0 && pnlPct <= -stopLossPct {
@@ -663,6 +661,8 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 		Hold: maxHold, MinScore: minScore}
 	nextFree := map[string]int{} // code -> 可再入场最早下标（同股持仓期内不重复入场）
 	var winSum, lossSum float64
+	var pnls []float64
+	var dates []string
 	for _, t := range trigs {
 		if minScore > 0 && t.score >= 0 && t.score < minScore {
 			continue // 门槛过滤（score=-1 标记=无分维度，不过滤）
@@ -675,6 +675,8 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 		nextFree[t.code] = exitJ + 1
 		res.Count++
 		res.AvgHold += float64(exitJ - (t.sigIdx + 1))
+		pnls = append(pnls, pnl)
+		dates = append(dates, klines[t.code][t.sigIdx+1].Date.Format("20060102"))
 		if pnl > 0 {
 			res.Win++
 			winSum += pnl
@@ -683,12 +685,13 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 			lossSum += pnl
 		}
 	}
-	finalizeResult(&res, winSum, lossSum)
+	finalizeResult(&res, winSum, lossSum, pnls, dates)
 	return res
 }
 
-// finalizeResult 由胜负计数与盈亏和聚合出 胜率/均盈/均亏/盈亏比/期望（两种模拟共用口径）。
-func finalizeResult(res *sweepResult, winSum, lossSum float64) {
+// finalizeResult 由胜负计数与盈亏和聚合出 胜率/均盈/均亏/盈亏比/期望/风险调整指标
+// （两种模拟共用口径；pnls/dates 为按发生序的逐笔净额收益与入场日）。
+func finalizeResult(res *sweepResult, winSum, lossSum float64, pnls []float64, dates []string) {
 	if res.Count == 0 {
 		return
 	}
@@ -707,6 +710,7 @@ func finalizeResult(res *sweepResult, winSum, lossSum float64) {
 	}
 	wr := res.WinRate / 100
 	res.Expectancy = wr*res.AvgWinPct + (1-wr)*res.AvgLossPct
+	res.Sharpe, res.MaxDrawdownPct, res.AnnualReturnPct, res.Calmar = perfMetrics(pnls, dates)
 }
 
 // stepRangeF 浮点步进序列（止盈/止损/门槛维），含起终点；非法输入回退单档。

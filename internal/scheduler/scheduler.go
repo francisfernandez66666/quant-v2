@@ -50,7 +50,10 @@ const researchStart = "20230801"
 type Scheduler struct {
 	cfgPath   string // config.json 路径
 	statePath string // research_state.json 路径（展示兼容状态）
-	now       func() time.Time
+	// nowFn 可注入时钟：测试用 setNow 替换。§flaky 修复——字段自身以 nowMu 保护，
+	// 此前后台排水 goroutine（tryStartNext 自驱）与测试改写 s.now 存在数据竞争。
+	nowMu sync.RWMutex
+	nowFn func() time.Time
 
 	mu            sync.Mutex
 	baseCtx       context.Context     // 服务级上下文（退出时取消当前子进程）
@@ -94,9 +97,29 @@ func New(dataDir, cfgPath, statePath string) *Scheduler {
 	return &Scheduler{
 		cfgPath:   cfgPath,
 		statePath: statePath,
-		now:       time.Now,
+		nowFn:     time.Now,
 		failCool:  make(map[int64]time.Time),
 	}
+}
+
+// nowTime 返回当前时间（可注入时钟，读侧经 nowMu 保护）。
+// English: nowTime returns the (injectable) current time; reads are guarded by nowMu.
+func (s *Scheduler) nowTime() time.Time {
+	s.nowMu.RLock()
+	defer s.nowMu.RUnlock()
+	if s.nowFn == nil {
+		return time.Now()
+	}
+	return s.nowFn()
+}
+
+// setNow 注入测试时钟（写侧经 nowMu 保护，消除与后台排水 goroutine 的数据竞争）。
+// English: setNow injects a test clock (writes guarded by nowMu, racing no more with the
+// self-drain goroutines).
+func (s *Scheduler) setNow(f func() time.Time) {
+	s.nowMu.Lock()
+	defer s.nowMu.Unlock()
+	s.nowFn = f
 }
 
 // Run 启动调度循环，直到 ctx 取消。
@@ -130,7 +153,7 @@ func (s *Scheduler) tick() {
 	// 复权门禁独立开关——两者都通过前引擎不会混合两套复权体系。
 	store.PrimarySourceThsDaily = strings.EqualFold(cfg.PrimarySource, "hithink")
 	store.ThsFactorsReady = cfg.ThsFactorsReady
-	now := s.now()
+	now := s.nowTime()
 	if !cfg.Enabled {
 		s.preemptCurrent("调度器已禁用")
 		return

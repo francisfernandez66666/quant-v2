@@ -35,4 +35,11 @@ type Config struct {
 	// combined calls and other cheap classification/screening). A lighter/faster model here speeds up
 	// classification throughput; when empty, the main model is used and behavior is unchanged.）
 	ClassifierModel string
+
+	// §GAP5.1 成本治理：当日调用次数 / token 总量预算（0=不设限）。任一超限后当日
+	// 所有新请求被熔断拒绝（次日自动恢复），杜绝 LLM 账单失控。
+	// English: §GAP5.1 cost governance — daily call/token budgets (0 = unlimited); once exceeded,
+	// new requests are rejected until the next day.
+	DailyCallBudget  int64
+	DailyTokenBudget int64
 }

@@ -384,9 +384,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
 	// 实盘交易（AUTO_TRADING_PLAN M1）：持仓页实盘 tab 拉真实持仓/建议/执行 + 网关回报/状态。
 	// English: live trading (AUTO_TRADING_PLAN M1) — live tab real positions/advice/execute + gateway report/state.
-	s.mux.HandleFunc("GET /api/positions/real", s.authMiddleware(s.handleRealPositions))
-	s.mux.HandleFunc("GET /api/positions/advice", s.authMiddleware(s.handleRealAdvice))
-	s.mux.HandleFunc("POST /api/positions/execute", s.authMiddleware(s.handleExecuteAction))
+	// §GAP1.8/1.10 实盘端点收权：实盘账本/建议/手动执行仅 admin（单一实盘账户归属老板账号，
+	// 堵住"任意登录用户看同一份实盘持仓/临时账号触发真实下单"的越权面）。
+	// English: §GAP1.8/1.10 — real-book endpoints are admin-only (single live account owned by the
+	// admin), closing the any-user-reads-real-positions / temp-account-fires-orders surface.
+	s.mux.HandleFunc("GET /api/positions/real", s.adminMiddleware(s.handleRealPositions))
+	s.mux.HandleFunc("GET /api/positions/advice", s.adminMiddleware(s.handleRealAdvice))
+	s.mux.HandleFunc("POST /api/positions/execute", s.adminMiddleware(s.handleExecuteAction))
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
 	s.mux.HandleFunc("GET /api/qmt/state", s.authMiddleware(s.handleQMTState))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))

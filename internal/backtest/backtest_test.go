@@ -234,3 +234,42 @@ func indexStr(s, sub string) int {
 	}
 	return -1
 }
+
+// TestSignalRuleFingerprint §GAP 二.3#5 回归：规则参数指纹——
+// 同参数同指纹；任一参数（权重/方向/TopK/因子集）变化指纹必变（缓存失效依据）。
+func TestSignalRuleFingerprint(t *testing.T) {
+	base := SignalRule{
+		Factors:    []string{"EP_ttm", "ROE", "Mom20"},
+		Directions: map[string]int{"EP_ttm": 1},
+		Weights:    map[string]float64{"ROE": 1.5},
+		TopK:       5, MinStocks: 10, MinCover: 0.5,
+	}
+	fp1 := base.Fingerprint()
+	if fp1 != base.Fingerprint() {
+		t.Fatal("同参数指纹应稳定")
+	}
+	// 因子顺序无关
+	reordered := base
+	reordered.Factors = []string{"Mom20", "EP_ttm", "ROE"}
+	if reordered.Fingerprint() != fp1 {
+		t.Fatal("因子集合相同（顺序不同）指纹应一致")
+	}
+	// 权重变化 → 指纹变化
+	w := base
+	w.Weights = map[string]float64{"ROE": 2.0}
+	if w.Fingerprint() == fp1 {
+		t.Fatal("权重变化指纹应变化")
+	}
+	// TopK 变化 → 指纹变化
+	k := base
+	k.TopK = 10
+	if k.Fingerprint() == fp1 {
+		t.Fatal("TopK 变化指纹应变化")
+	}
+	// 方向变化 → 指纹变化
+	d := base
+	d.Directions = map[string]int{"EP_ttm": -1}
+	if d.Fingerprint() == fp1 {
+		t.Fatal("方向变化指纹应变化")
+	}
+}

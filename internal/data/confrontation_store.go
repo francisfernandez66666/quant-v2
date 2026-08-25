@@ -66,7 +66,7 @@ func (s *ConfrontationStore) persist() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(s.path, raw, 0644); err != nil {
+	if err := atomicWrite(s.path, raw, 0644); err != nil {
 		log.Printf("[confront] 写入失败: %v", err)
 	}
 }

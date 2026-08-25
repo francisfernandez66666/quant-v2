@@ -1667,6 +1667,13 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 	user := userFromContext(r)
 	ctrl := s.qmtCtrlFor(user.ID)
 	if ctrl != nil && ctrl.Enabled() && ctrl.Mode() == "manual" {
+		// §GAP1.8（A5）：实盘下单分支独立权限位——仅 admin 可触发真实下单；
+		// 模拟买入等其余分支不受影响（普通用户仍可用）。
+		// English: §GAP1.8 (A5) — the live-order branch requires admin; other branches unaffected.
+		if user == nil || !user.IsAdmin() {
+			writeError(w, 403, "admin required for live orders")
+			return
+		}
 		if req.Code == "" {
 			writeError(w, 400, "code required")
 			return

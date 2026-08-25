@@ -114,6 +114,25 @@ type QMTConfig struct {
 	TimeoutSec int `json:"timeout_sec"`
 	// MissHeartbeatSec 心跳超时秒数：网关 /health 连续失联超过该值 → 熔断暂停下单并告警（默认 120）。
 	MissHeartbeatSec int `json:"miss_heartbeat_sec"`
+	// DailyMaxBuys 单日累计买入笔数上限（§GAP1.4 实盘买入纪律；0=不设限，默认 20）。
+	// 与模拟盘 PoolBuyRule.MaxDailyBuys 同语义：防止单日信号风暴打满资金。
+	// English: max buy orders per day for the real book (0 = unlimited, default 20) — mirrors the
+	// paper book's MaxDailyBuys discipline against signal storms.
+	DailyMaxBuys int `json:"daily_max_buys"`
+	// DailyBudgetAmount 单日累计买入金额预算（元；0=不设限，默认 100000）。
+	// 按当日已报买单 Price×Qty 累计，超出后拒绝新买入（卖出不受影响）。
+	// English: daily buy budget in yuan (0 = unlimited, default 100000); accumulates today's placed
+	// buy orders (Price×Qty) and rejects new buys past the cap (sells unaffected).
+	DailyBudgetAmount float64 `json:"daily_budget_amount"`
+	// AutoSell 实盘卖出自动化开关（§GAP1.1，默认开启）：mode=auto 时，止损级建议
+	// （止损/清仓类）自动全仓卖出，止盈/减仓保持提醒半自动。signal_id 按日幂等防重。
+	// English: auto-sell switch for the real book (default on): in auto mode, stop-loss-class advice
+	// closes the position automatically; TP/trim stay reminder-only. Idempotent per day via signal_id.
+	AutoSell bool `json:"auto_sell"`
+	// Blacklist §GAP1.7 下单黑名单（纯数字或带后缀代码均可）：命中即拒绝下单。
+	// 引擎每轮把 Theme.BlackList 一并同步进来；也可在 qmt 段单独配置。
+	// English: §GAP1.7 order blacklist; the engine merges Theme.BlackList in every cycle.
+	Blacklist []string `json:"blacklist,omitempty"`
 	// Advice 持仓处理分析层（实盘持仓）规则参数。
 	Advice QMTAdviceConfig `json:"advice"`
 }
@@ -122,14 +141,17 @@ type QMTConfig struct {
 // English: returns factory-default QMT live-trading config: disabled, manual mode, market price.
 func DefaultQMTConfig() QMTConfig {
 	return QMTConfig{
-		Enabled:          false,
-		Mode:             "manual",
-		PriceType:        "market",
-		FixedAmount:      10000,
-		MaxPositions:     10,
-		InitialCapital:   100000,
-		TimeoutSec:       10,
-		MissHeartbeatSec: 120,
+		Enabled:           false,
+		Mode:              "manual",
+		PriceType:         "market",
+		FixedAmount:       10000,
+		MaxPositions:      10,
+		InitialCapital:    100000,
+		TimeoutSec:        10,
+		MissHeartbeatSec:  120,
+		DailyMaxBuys:      20,
+		DailyBudgetAmount: 100000,
+		AutoSell:          true,
 		Advice: QMTAdviceConfig{
 			AddReopenDrawdownPct: -5,
 			AddSignalActive:      true,
@@ -330,6 +352,11 @@ type LLMConfig struct {
 	// other cheap screening). A lighter/faster model speeds classification while the main model stays on
 	// deep work (D1/Stage2); empty falls back to the main model.
 	ClassifierModel string `json:"classifier_model"`
+
+	// §GAP5.1 成本治理：当日调用次数 / token 总量预算（0=不设限）。超限后当日新请求熔断，
+	// 次日自动恢复。LLM 是系统最大可变成本，此前用量完全不可见、无任何上限。
+	DailyCallBudget  int64 `json:"daily_call_budget"`
+	DailyTokenBudget int64 `json:"daily_token_budget"`
 }
 
 // StreamingEnabled 返回流式响应是否启用：未显式配置（nil）时默认开启。

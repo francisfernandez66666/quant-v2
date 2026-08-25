@@ -162,3 +162,177 @@ func TestAutoPlaceIdempotent(t *testing.T) {
 		t.Fatalf("idempotent: expected 1 gateway call, got %d", len(*orders))
 	}
 }
+
+// TestAutoPlaceSkipsSealedLimitUp §GAP1.5 回归：涨停封板股 auto 模式拒买（与模拟盘同款分板块守卫）。
+// 002412 实录：4 连板封板后龙头识别仍发 buy → 现实中买单无法排队成交。
+// English: §GAP1.5 regression — autoPlace must skip sealed limit-up boards (board-aware, same as paper).
+func TestAutoPlaceSkipsSealedLimitUp(t *testing.T) {
+	t.Run("主板10cm封板拒买", func(t *testing.T) {
+		e, _, _, orders := newQMTEngine(t, nil)
+		sig := combat_agent.Signal{ID: "S-LU", Code: "000001", Name: "平安", Strategy: "龙头", Direction: "做多", Price: 10}
+		// 涨幅 9.95% ≥ 主板阈值 9.9% → 拒买
+		e.autoPlace(sig, map[string]*data.StockInfo{"000001": {Code: "000001", Price: 10, ChangePct: 9.95}})
+		if len(*orders) != 0 {
+			t.Fatalf("主板封板应拒买, got %d orders", len(*orders))
+		}
+		// 涨幅 9.5%（未封板）→ 放行
+		e.autoPlace(sig, map[string]*data.StockInfo{"000001": {Code: "000001", Price: 10, ChangePct: 9.5}})
+		if len(*orders) != 1 {
+			t.Fatalf("未封板应放行, got %d orders", len(*orders))
+		}
+	})
+	t.Run("创业20cm未封板不误拒", func(t *testing.T) {
+		// 预算提到 20000：105 元×一手=10500，避免被 §R0.7 高价股预算守卫先拦（与 TestAutoPlacePriceFromLive 同理）
+		e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.FixedAmount = 20000 })
+		sig := combat_agent.Signal{ID: "S-CYB", Code: "300750", Name: "宁德", Strategy: "龙头", Direction: "做多", Price: 100}
+		// 创业板 19.5% 涨幅 < 19.9 阈值 → 不误拒
+		e.autoPlace(sig, map[string]*data.StockInfo{"300750": {Code: "300750", Price: 105, ChangePct: 19.5}})
+		if len(*orders) != 1 {
+			t.Fatalf("创业板 19.5%% 未达 19.9%% 不应拒买, got %d orders", len(*orders))
+		}
+	})
+}
+
+// TestAutoPlaceSkipsST §GAP1.6 回归：ST 股 auto 下单被 Controller 守卫拦截（信号层漏网时兜底）。
+func TestAutoPlaceSkipsST(t *testing.T) {
+	e, _, _, orders := newQMTEngine(t, nil)
+	sig := combat_agent.Signal{ID: "S-ST", Code: "600000", Name: "*ST测试", Strategy: "龙头", Direction: "做多", Price: 10}
+	e.autoPlace(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}})
+	if len(*orders) != 0 {
+		t.Fatalf("ST 股应被拒绝下单, got %d orders", len(*orders))
+	}
+}
+
+// TestAutoPlaceDailyCap §GAP1.4 回归：单日买入笔数达上限后 auto 不再下单。
+func TestAutoPlaceDailyCap(t *testing.T) {
+	e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.DailyMaxBuys = 2 })
+	for i, id := range []string{"C1", "C2", "C3"} {
+		sig := combat_agent.Signal{ID: id, Code: "60000" + string(rune('0'+i)), Name: "股" + id, Strategy: "龙头", Direction: "做多", Price: 10}
+		e.autoPlace(sig, map[string]*data.StockInfo{sig.Code: {Code: sig.Code, Price: 10}})
+	}
+	if len(*orders) != 2 {
+		t.Fatalf("daily_max_buys=2 应只下 2 单, got %d", len(*orders))
+	}
+}
+
+// TestAutoExecuteRealSells §GAP1.1 回归：止损级建议自动全仓卖出（幂等键按码+类+日）；
+// 止盈/减仓/加仓建议不触发自动卖。
+func TestAutoExecuteRealSells(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.AutoSell = true })
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10, Amount: 5000, Strategy: "龙头"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctrl := e.QMTController()
+	advices := []trading.PositionAdvice{
+		{Code: "600000", TsCode: "600000.SH", Action: "止损", Level: "高", RefPrice: 9.0, Reason: "破位止损"},
+	}
+	e.autoExecuteRealSells(ctrl, db, advices)
+	if len(*orders) != 1 {
+		t.Fatalf("止损建议应自动卖出 1 单, got %d", len(*orders))
+	}
+	o := (*orders)[0]
+	if o["side"] != "卖出" || o["qty"].(float64) != 500 {
+		t.Fatalf("应全仓卖出 500 股: %+v", o)
+	}
+	// 同日重发 → signal_id 幂等命中，不再下单
+	e.autoExecuteRealSells(ctrl, db, advices)
+	if len(*orders) != 1 {
+		t.Fatalf("同日同类卖单应幂等防重, got %d", len(*orders))
+	}
+	// 非止损类不触发
+	tp := []trading.PositionAdvice{{Code: "600000", TsCode: "600000.SH", Action: "止盈", Level: "高", RefPrice: 12}}
+	e.autoExecuteRealSells(ctrl, db, tp)
+	if len(*orders) != 1 {
+		t.Fatalf("止盛建议不应自动卖出, got %d", len(*orders))
+	}
+}
+
+// TestAutoSellDisabledSkips §GAP1.1：auto_sell=false 时止损建议仅提醒不下单。
+func TestAutoSellDisabledSkips(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.AutoSell = false })
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	advices := []trading.PositionAdvice{{Code: "600000", TsCode: "600000.SH", Action: "止损", RefPrice: 9}}
+	e.autoExecuteRealSells(e.QMTController(), db, advices)
+	if len(*orders) != 0 {
+		t.Fatalf("auto_sell=false 不应下单, got %d", len(*orders))
+	}
+}
+
+// TestM8RealDrawdown §GAP1.2 回归：组合市值自峰值回撤超阈值 → 全部持仓自动卖出（m8 类别幂等）；
+// 回撤未达阈值不触发；未启用（m8_enabled=false）不触发。
+func TestM8RealDrawdown(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, nil)
+	// 两只持仓：成本 5 元 ×1000 股 ×2
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "A", Qty: 1000, CostPrice: 5},
+		{TsCode: "000001.SZ", Name: "B", Qty: 1000, CostPrice: 5},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 装配 cfgMgr：M8 启用、阈值 -20%
+	mgr := config.NewManager("")
+	mgr.Rules.RiskCtrl.M8Enabled = true
+	mgr.Rules.RiskCtrl.M8PortfolioDrawdownPct = -20
+	e.SetCfgMgr(mgr)
+
+	positions := mustPositions(t, db)
+	quotes := map[string]*data.StockInfo{"600000": {Price: 6}, "000001": {Price: 6}} // 组合 12000
+
+	// 未达峰值前：峰值随市值抬升（12000），无回撤 → 不触发
+	e.checkM8RealDrawdown(e.QMTController(), db, positions, quotes)
+	if len(*orders) != 0 {
+		t.Fatalf("峰值抬升期不应触发, got %d orders", len(*orders))
+	}
+	// 模拟曾涨到 8 元（组合 16000 峰值），现回落到 6 元（12000，回撤 -25% ≤ -20%）→ 触发清仓
+	e.mu.Lock()
+	e.m8PeakTotal = 16000
+	e.mu.Unlock()
+	e.checkM8RealDrawdown(e.QMTController(), db, positions, quotes)
+	if len(*orders) != 2 {
+		t.Fatalf("回撤 -25%% 应全部卖出 2 单, got %d", len(*orders))
+	}
+	for _, o := range *orders {
+		if o["side"] != "卖出" {
+			t.Fatalf("M8 应为卖出单: %+v", o)
+		}
+	}
+	// 同日重发 → 幂等防重不再下单
+	e.checkM8RealDrawdown(e.QMTController(), db, positions, quotes)
+	if len(*orders) != 2 {
+		t.Fatalf("M8 同日应幂等防重, got %d", len(*orders))
+	}
+
+	// 未启用 M8：新引擎不触发
+	e2, db2, _, orders2 := newQMTEngine(t, nil)
+	mgr2 := config.NewManager("")
+	mgr2.Rules.RiskCtrl.M8Enabled = false
+	e2.SetCfgMgr(mgr2)
+	if _, err := db2.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "A", Qty: 1000, CostPrice: 5},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e2.mu.Lock()
+	e2.m8PeakTotal = 16000
+	e2.mu.Unlock()
+	e2.checkM8RealDrawdown(e2.QMTController(), db2, mustPositions(t, db2),
+		map[string]*data.StockInfo{"600000": {Price: 3}})
+	if len(*orders2) != 0 {
+		t.Fatalf("m8_enabled=false 不应触发, got %d", len(*orders2))
+	}
+}
+
+func mustPositions(t *testing.T, db *store.DB) []store.RealPosition {
+	t.Helper()
+	ps, err := db.RealPositions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ps
+}

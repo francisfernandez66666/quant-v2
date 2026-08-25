@@ -420,7 +420,7 @@ func SaveCalendarCache(filePath string, events []MacroEvent) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filePath, data, 0644)
+	return atomicWrite(filePath, data, 0644)
 }
 
 // LoadCalendarCache 从文件加载日历缓存（仅当天有效）

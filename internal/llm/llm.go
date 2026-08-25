@@ -32,6 +32,13 @@ type Client struct {
 	idleTimeout      time.Duration // 流式下相邻分片空闲阈值（超过视为卡死）
 	batchConcurrency int           // 批量分析最大并发批次（默认 8）
 	classifierModel  string        // 可选分类专用模型（Stage0/1 等快速分类/初筛，空则用主模型）
+
+	// §GAP5.1 成本治理：当日调用/token 计数与预算熔断。计数原子维护，跨日自动归零。
+	usageDay    atomic.Int64 // 当日戳 yyyymmdd（变更即重置计数）
+	usageCalls  atomic.Int64 // 当日已发请求数
+	usageTokens atomic.Int64 // 当日 prompt+completion token 总量
+	callBudget  atomic.Int64 // 日调用预算（0=不设限）
+	tokenBudget atomic.Int64 // 日 token 预算（0=不设限）
 }
 
 // DefaultBatchConcurrency 未显式配置时的批量分析默认并发批次。
@@ -131,7 +138,7 @@ func New(cfg Config) *Client {
 	if len(keys) > 0 {
 		first = keys[0]
 	}
-	return &Client{
+	c := &Client{
 		httpClient: &http.Client{
 			Timeout:   totalTimeout,
 			Transport: transport,
@@ -144,6 +151,72 @@ func New(cfg Config) *Client {
 		idleTimeout:      cfg.StreamIdleTimeout,
 		batchConcurrency: bc,
 		classifierModel:  cfg.ClassifierModel,
+	}
+	c.usageDay.Store(llmToday())
+	c.callBudget.Store(cfg.DailyCallBudget)
+	c.tokenBudget.Store(cfg.DailyTokenBudget)
+	return c
+}
+
+// SetBudgets §GAP5.1 配置当日预算（热更新；0=不设限）。
+// English: SetBudgets hot-updates the daily call/token budgets (0 = unlimited).
+func (c *Client) SetBudgets(dailyCalls, dailyTokens int64) {
+	c.callBudget.Store(dailyCalls)
+	c.tokenBudget.Store(dailyTokens)
+}
+
+// llmToday 返回本地日期戳 yyyymmdd（预算跨日归零依据）。
+func llmToday() int64 {
+	t := time.Now()
+	return int64(t.Year())*10000 + int64(t.Month())*100 + int64(t.Day())
+}
+
+// rollUsageDay 跨日归零计数（CAS 保证只由翻日者清一次）。
+func (c *Client) rollUsageDay() {
+	today := llmToday()
+	for {
+		d := c.usageDay.Load()
+		if d == today {
+			return
+		}
+		if c.usageDay.CompareAndSwap(d, today) {
+			c.usageCalls.Store(0)
+			c.usageTokens.Store(0)
+		}
+	}
+}
+
+// preFlight §GAP5.1 预算熔断检查 + 计一次调用。超限返回错误（当日不再发新请求）。
+func (c *Client) preFlight() error {
+	c.rollUsageDay()
+	if b := c.callBudget.Load(); b > 0 && c.usageCalls.Load() >= b {
+		return fmt.Errorf("LLM 日调用预算已用尽(%d 次)，次日自动恢复", b)
+	}
+	if b := c.tokenBudget.Load(); b > 0 && c.usageTokens.Load() >= b {
+		return fmt.Errorf("LLM 日 token 预算已用尽(%d)，次日自动恢复", b)
+	}
+	c.usageCalls.Add(1)
+	return nil
+}
+
+// recordUsage 累加单次响应的 token 用量（usage 缺失时按内容长度粗估，防漏计）。
+func (c *Client) recordUsage(prompt, completion int64) {
+	if prompt <= 0 && completion <= 0 {
+		return
+	}
+	c.rollUsageDay()
+	c.usageTokens.Add(prompt + completion)
+}
+
+// UsageStats 当日用量快照（/api/llm-debug 与成本观测消费）。
+func (c *Client) UsageStats() map[string]int64 {
+	c.rollUsageDay()
+	return map[string]int64{
+		"day":          c.usageDay.Load(),
+		"calls":        c.usageCalls.Load(),
+		"tokens":       c.usageTokens.Load(),
+		"call_budget":  c.callBudget.Load(),
+		"token_budget": c.tokenBudget.Load(),
 	}
 }
 
@@ -178,6 +251,14 @@ type ChatResponse struct {
 	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
+	Usage llmUsage `json:"usage"` // §GAP5.1 token 用量（成本治理）
+}
+
+// llmUsage 单次请求的 token 用量元数据（OpenAI 兼容口径）。
+type llmUsage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
 }
 
 // Chat 向 SiliconFlow API 发送对话请求。先传入 system 提示词（设定角色和输出格式），再传入 user 问题。
@@ -243,8 +324,13 @@ func (c *Client) ChatMessages(messages []Message) (string, error) {
 }
 
 // do 发起单次对话请求：优先流式解析，特定失败场景回落到非流式一次性取回。
-// （do sends one chat request: it prefers streaming, falling back to one-shot non-streaming in specific failures.）
+// §GAP5.1 入口处执行日预算熔断检查（超限当日拒绝，次日自动恢复）。
+// （do sends one chat request: it prefers streaming, falling back to one-shot non-streaming in specific failures.
+// The daily-budget circuit breaker runs at the entry.）
 func (c *Client) do(req ChatRequest) (string, error) {
+	if err := c.preFlight(); err != nil {
+		return "", err
+	}
 	if c.streaming {
 		content, streamErr := c.streamChat(req)
 		if streamErr == nil {
@@ -290,6 +376,7 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 
 	var sb strings.Builder
 	var lastTime = time.Now()
+	var lastUsage *llmUsage // §GAP5.1 记录流中最后一次出现的用量元数据
 	for sc.Scan() {
 		now := time.Now()
 		if now.Sub(lastTime) > c.idleTimeout {
@@ -309,6 +396,9 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
+		if chunk.Usage != nil {
+			lastUsage = chunk.Usage
+		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
@@ -321,7 +411,31 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 	if strings.TrimSpace(content) == "" {
 		return "", fmt.Errorf("no response from LLM")
 	}
+	// §GAP5.1 用量入账：优先 usage 元数据，缺失时按内容长度粗估（4 字符≈1 token）
+	if lastUsage != nil && (lastUsage.PromptTokens > 0 || lastUsage.CompletionTokens > 0) {
+		c.recordUsage(lastUsage.PromptTokens, lastUsage.CompletionTokens)
+	} else {
+		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(content))
+	}
 	return content, nil
+}
+
+// reqMessagesText 拼接请求消息文本（token 粗估用）。
+func reqMessagesText(req ChatRequest) string {
+	var sb strings.Builder
+	for _, m := range req.Messages {
+		sb.WriteString(m.Content)
+	}
+	return sb.String()
+}
+
+// estimateTokens 按长度粗估 token 数（英文 ≈4 字符/token；中文按 1.5 字符/token 折中）。
+func estimateTokens(s string) int64 {
+	n := len([]rune(s))
+	if n == 0 {
+		return 0
+	}
+	return int64(n / 3)
 }
 
 // chatCompletionChunk 流式响应单分片（只取需要的字段）。
@@ -332,6 +446,7 @@ type chatCompletionChunk struct {
 			Content string `json:"content"`
 		} `json:"delta"`
 	} `json:"choices"`
+	Usage *llmUsage `json:"usage"` // §GAP5.1 末分片常携带用量元数据
 }
 
 // nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用）。
@@ -353,6 +468,12 @@ func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
 	}
 	if len(chatResp.Choices) == 0 {
 		return "", fmt.Errorf("no response from LLM")
+	}
+	// §GAP5.1 用量入账（非流式响应自带 usage；缺失按内容粗估）
+	if chatResp.Usage.PromptTokens > 0 || chatResp.Usage.CompletionTokens > 0 {
+		c.recordUsage(chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+	} else {
+		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(chatResp.Choices[0].Message.Content))
 	}
 	return chatResp.Choices[0].Message.Content, nil
 }

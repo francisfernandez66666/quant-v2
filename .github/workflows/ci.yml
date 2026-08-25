@@ -1,0 +1,61 @@
+# CI — 持续集成门禁（§GAP7.3）
+# 此前仓库无任何 CI：gofmt/vet/test/-race/pytest 无强制门禁，flaky 测试无兜底捕获。
+# English: CI gates — gofmt/vet/build + full go test (-race on this runner) + Python gateway pytest.
+name: ci
+
+on:
+  push:
+    branches: [main, enhanced]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt（格式检查，输出 diff）
+        run: |
+          test -z "$(gofmt -l internal cmd)" || {
+            echo "以下文件未格式化："
+            gofmt -l internal cmd
+            exit 1
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race)
+        # -race 全量：调度器/引擎等并发包的历史数据竞争靠它兜底捕获
+        run: go test ./... -count=1 -race
+
+  python-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # qmt_gateway/requirements.txt 仅注释（xtquant 为 Windows 专属，PyPI 不可装）
+          pip install pytest
+
+      - name: pytest（qmt_gateway 资金安全回归）
+        working-directory: qmt_gateway
+        run: python -m pytest tests/ -q
+
+      - name: pydata server 语法检查
+        run: python -m py_compile cmd/pydata/server.py scripts/bj_reinject.py scripts/export_fina_sql.py scripts/load_finance.py

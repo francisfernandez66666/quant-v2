@@ -9,9 +9,11 @@ package trading
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
 )
@@ -181,12 +183,15 @@ func (c *Controller) HealthCheck() {
 	}
 }
 
-// PlaceOrder 下单（幂等 + 熔断前置校验）。
+// PlaceOrder 下单（幂等 + 熔断 + 前置守卫）。
 //   - 熔断中：拒绝新下单并返回错误；
+//   - 前置守卫（ST/单日纪律/白名单/仓位上限）全部通过后才落库占位——不打算下的单绝不写 orders 表，
+//     避免被拒订单留下幽灵行污染当日统计；
 //   - signal_id 已在 orders 表：返回已存在（幂等，不重复下单）。
 //
-// English: PlaceOrder places an order with idempotency and breaker pre-checks — rejects while tripped,
-// and a signal_id already in the orders table short-circuits (idempotent, never double-sends).
+// English: PlaceOrder places an order with idempotency, breaker and pre-checks — rejects while tripped;
+// all guards (ST / daily discipline / whitelist / position cap) run BEFORE the pending ticket is
+// persisted so rejected orders never leave phantom rows; a signal_id already in the table short-circuits.
 func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 	if c.Tripped() {
 		return nil, fmt.Errorf("qmt circuit-breaker open: %s", c.tripReasonLocked())
@@ -201,21 +206,29 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 		return nil, fmt.Errorf("qmt store not set")
 	}
 
-	// 幂等：同一 signal_id 不重复下单
-	existed, err := c.store.UpsertRealOrder(store.RealOrder{
-		SignalID:  req.SignalID,
-		Code:      req.Code,
-		Side:      req.Side,
-		Status:    "已报",
-		Price:     req.Price,
-		Qty:       req.Qty,
-		CreatedAt: req.CreatedAt,
-	})
-	if err != nil {
-		return nil, err
+	// §GAP1.6 ST/退市风险警示股一律拒绝下单（auto/manual 全路径统一收口；
+	// 与信号层 combat_agent.IsSTStock 同一判定，堵住 ScanLimitUp 直出信号与手动单绕过）。
+	// English: ST/delisting-risk stocks are rejected on every path (auto & manual), using the same
+	// combat_agent.IsSTStock check as the signal layer — closing the ScanLimitUp / manual-order bypass.
+	if combat_agent.IsSTStock(req.Name) {
+		return nil, fmt.Errorf("ST/退市风险股禁止下单: %s", req.Name)
 	}
-	if existed {
-		return &OrderResult{OK: false, Err: "duplicate signal_id (already ordered)"}, nil
+
+	// §GAP1.7 黑名单接线：命中 qmt.blacklist（含引擎同步的 Theme.BlackList）即拒绝。
+	// 纯数字与带后缀代码双向归一比对。English: §GAP1.7 blacklist wiring — normalized both ways.
+	if blacklisted(cfg.Blacklist, req.Code) {
+		return nil, fmt.Errorf("黑名单股票禁止下单: %s", req.Code)
+	}
+
+	// §GAP1.3/1.4 买入纪律预检（卖出不受限）：单日买入笔数上限、单日买入预算、近似可用资金。
+	amount := req.Amount
+	if amount <= 0 {
+		amount = req.Price * float64(req.Qty)
+	}
+	if req.Side == SideBuy {
+		if err := c.checkBuyDiscipline(cfg, req.SignalID, amount); err != nil {
+			return nil, err
+		}
 	}
 
 	// 白名单过滤：strategies 非空且不含该策略时拒绝
@@ -243,6 +256,26 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 		}
 	}
 
+	// 幂等：同一 signal_id 不重复下单。
+	// §GAP 修复：占位行 order_id 用 "pend:<signal_id>"——此前恒为空串，与 order_id 主键冲突，
+	// 第二笔起的新单被 INSERT OR IGNORE 误判为重复（静默不下单），网关单号回填也永不命中。
+	existed, err := c.store.UpsertRealOrder(store.RealOrder{
+		OrderID:   "pend:" + req.SignalID,
+		SignalID:  req.SignalID,
+		Code:      req.Code,
+		Side:      req.Side,
+		Status:    "已报",
+		Price:     req.Price,
+		Qty:       req.Qty,
+		CreatedAt: req.CreatedAt,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if existed {
+		return &OrderResult{OK: false, Err: "duplicate signal_id (already ordered)"}, nil
+	}
+
 	if req.PriceType == "" {
 		req.PriceType = cfg.PriceType
 		if req.PriceType == "" {
@@ -259,13 +292,89 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 回填网关委托单号并更新状态
+	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）
 	if res.OrderID != "" {
-		if err := c.store.UpdateRealOrderStatus(res.OrderID, "已报"); err != nil {
-			log.Printf("[trading] update order status: %v", err)
+		if err := c.store.UpdateRealOrderBySignalID(req.SignalID, res.OrderID, "已报"); err != nil {
+			log.Printf("[trading] backfill order id: %v", err)
 		}
 	}
 	return res, nil
+}
+
+// blacklisted §GAP1.7 黑名单比对：条目与请求代码均剥离后缀后按纯数字前缀匹配。
+// English: blacklisted matches after stripping exchange suffixes on both sides.
+func blacklisted(list []string, code string) bool {
+	if len(list) == 0 || code == "" {
+		return false
+	}
+	pure := func(c string) string {
+		if i := strings.IndexByte(c, '.'); i > 0 {
+			c = c[:i]
+		}
+		return strings.TrimSpace(c)
+	}
+	pc := pure(code)
+	for _, item := range list {
+		if pi := pure(item); pi != "" && pi == pc {
+			return true
+		}
+	}
+	return false
+}
+
+// checkBuyDiscipline §GAP1.3/1.4 买入纪律预检：单日买入笔数上限、单日买入预算、近似可用资金。
+// 数据源为本地 real_orders/real_positions 账本（崩溃安全，重启不丢当日累计）；
+// selfSignalID 排除自身（幂等重试场景下占位行可能已存在）；守卫先于 UpsertRealOrder 执行，
+// 被拒订单不落库、不污染当日统计。
+// 可用资金 ≈ InitialCapital − Σ持仓成本市值 − 当日已报买单金额（近似口径，
+// 精确券商可用余额待 M2 网关协议扩展 query_cash 后接入）。
+// English: buy-discipline precheck — daily buy-count cap, daily budget and an estimated available-cash
+// check, derived from the local real book (crash-safe). selfSignalID excludes the ticket itself
+// (idempotent retries); guards run BEFORE UpsertRealOrder so rejected orders never pollute the sums.
+// Exact broker cash lands with the M2 protocol extension (query_cash).
+func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID string, amount float64) error {
+	if c.store == nil {
+		return nil
+	}
+	orders, err := c.store.RealOrders()
+	if err != nil {
+		return fmt.Errorf("read real orders: %w", err)
+	}
+	today := time.Now().Format("2006-01-02")
+	buys := 0
+	spent := 0.0
+	for _, o := range orders {
+		if o.Side != SideBuy || o.SignalID == selfSignalID {
+			continue
+		}
+		at, perr := time.Parse(time.RFC3339, o.CreatedAt)
+		if perr != nil || at.Format("2006-01-02") != today {
+			continue
+		}
+		buys++
+		spent += o.Price * float64(o.Qty)
+	}
+	if cfg.DailyMaxBuys > 0 && buys >= cfg.DailyMaxBuys {
+		return fmt.Errorf("单日买入笔数达上限 %d（今日已报 %d 笔）", cfg.DailyMaxBuys, buys)
+	}
+	if cfg.DailyBudgetAmount > 0 && spent+amount > cfg.DailyBudgetAmount {
+		return fmt.Errorf("单日买入预算不足: 已报 %.0f + 本次 %.0f > 预算 %.0f", spent, amount, cfg.DailyBudgetAmount)
+	}
+	if cfg.InitialCapital > 0 {
+		pos, err := c.store.RealPositions()
+		if err != nil {
+			return fmt.Errorf("read real positions: %w", err)
+		}
+		held := 0.0
+		for _, p := range pos {
+			held += p.CostPrice * float64(p.Qty)
+		}
+		if avail := cfg.InitialCapital - held - spent; amount > avail {
+			return fmt.Errorf("可用资金不足: 预估可用 %.0f（本金%.0f−持仓成本%.0f−今日已报%.0f）< 本次 %.0f",
+				avail, cfg.InitialCapital, held, spent, amount)
+		}
+	}
+	return nil
 }
 
 // Reconcile 从网关拉取全量持仓/委托并落库（对账）。网关不可达时返回错误（不落库）。

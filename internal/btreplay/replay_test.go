@@ -2,9 +2,11 @@ package btreplay
 
 import (
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
+	"quant-trading-v2/internal/strategy"
 )
 
 // TestSummarize 验证胜率/平均盈亏/盈亏比/平均持仓的统计口径。
@@ -94,4 +96,53 @@ func TestToDataKLine(t *testing.T) {
 	if out[0].Close != 1.5 || out[0].Volume != 100 {
 		t.Fatalf("Close/Volume=%f/%f, want 1.5/100", out[0].Close, out[0].Volume)
 	}
+}
+
+// TestRuleEvalAdapterExitTrailingSign §GAP2.2 回归：库规则缺省出场必须是负号语义
+// （从阶段高点回撤达 8% 才触发），与实盘 genericTrailingExitWith 同口径。
+// 旧实现缺省 +8.0：任何曾盈利的持仓当日即被"移动止盈"平仓（持仓≈1天）。
+// English: regression for §GAP2.2 — the rule adapter's default exit must require an actual
+// drawdown (≤ -8% from stage high), matching the live genericTrailingExitWith semantics.
+func TestRuleEvalAdapterExitTrailingSign(t *testing.T) {
+	a := &ruleEvalAdapter{name: "测试规则", ruleID: "fac_1"}
+	now := time.Date(2026, 8, 25, 15, 0, 0, 0, time.Local)
+
+	t.Run("曾盈利未回撤不触发", func(t *testing.T) {
+		ctx := &strategy.ExitContext{
+			CostPrice: 100, CurPrice: 105, // 浮盈且创新高：旧实现此处立即平仓
+			EntryMeta: map[string]float64{}, Now: now,
+		}
+		if res, exited := a.Exit(ctx, nil); exited {
+			t.Fatalf("浮盈未回撤不应触发移动止盈, got %+v", res)
+		}
+	})
+
+	t.Run("缺省回撤达8%触发", func(t *testing.T) {
+		ctx := &strategy.ExitContext{
+			CostPrice: 100, CurPrice: 108,
+			EntryMeta: map[string]float64{"highest_price": 120}, // 从高点回撤 -10%
+			Now:       now,
+		}
+		res, exited := a.Exit(ctx, nil)
+		if !exited || res == nil || res.Reason != "回撤止损(移动止盈)" {
+			t.Fatalf("回撤-10%% 应触发移动止盈, got %v %v", res, exited)
+		}
+	})
+
+	t.Run("覆盖参数按审批值生效", func(t *testing.T) {
+		trail := 15.0
+		aa := &ruleEvalAdapter{name: "测试规则", ruleID: "fac_1", trailOverride: &trail}
+		ctx := &strategy.ExitContext{
+			CostPrice: 100, CurPrice: 95,
+			EntryMeta: map[string]float64{"highest_price": 110}, // 回撤 -13.6%，未达 -15%
+			Now:       now,
+		}
+		if _, exited := aa.Exit(ctx, nil); exited {
+			t.Fatalf("回撤-13.6%% 未达 -15%% 不应触发")
+		}
+		ctx.CurPrice = 92 // 回撤 -16.4% ≤ -15%
+		if _, exited := aa.Exit(ctx, nil); !exited {
+			t.Fatalf("回撤-16.4%% 应触发")
+		}
+	})
 }

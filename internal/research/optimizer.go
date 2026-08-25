@@ -27,6 +27,14 @@ type OptimizeOpts struct {
 	// English: guard: |IR| lower bound (default 0.3).
 	GuardMinDays int // 护栏：有效日下限（默认 20）
 	// English: guard: minimum valid-day count (default 20).
+
+	// §GAP 二.3#4 真 hold-out：寻优只在 [Start,End] 样本内区间评估（空=全区间，向后兼容）。
+	// 样本外区间仅用于验证报告，绝不参与坐标上升——此前权重在全区间（含所谓样本外）寻优，
+	// hold-out 只是描述性分段、形同虚设。
+	// English: true hold-out — coordinate ascent only sees the in-sample window; the out-of-sample
+	// segment is reserved for validation reporting only.
+	Start string
+	End   string
 }
 
 // OptResult 优化结果。
@@ -116,10 +124,10 @@ func OptimizeWeights(panels []*Panel, opts OptimizeOpts) OptResult {
 	return best
 }
 
-// evaluate 计算给定权重下的 IC 统计。
-// English: evaluate computes the IC statistics for the given weights.
+// evaluate 计算给定权重下的 IC 统计（§GAP 二.3#4：限定 [Start,End] 样本内区间）。
+// English: evaluate computes the IC statistics for the given weights within the in-sample window.
 func evaluate(panels []*Panel, opts OptimizeOpts, w map[string]float64) OptResult {
-	rows := CompositeIC(panels, opts.Factors, w, opts.Horizon, opts.MinStocks)
+	rows := CompositeICRange(panels, opts.Factors, w, opts.Horizon, opts.MinStocks, opts.Start, opts.End)
 	return OptResult{
 		ICMean: meanIC(rows), ICStd: stdIC(rows), IR: IR(rows), NDays: len(rows),
 	}

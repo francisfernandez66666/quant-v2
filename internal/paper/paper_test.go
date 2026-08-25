@@ -773,19 +773,19 @@ func TestMaxPositionsContinueProcessing(t *testing.T) {
 // TestLimitUpByBoard §R6 分板块封板幅度：主板10%、创业科创20cm、ST 5%。
 // English: board-aware sealed-board thresholds — main 10%, ChiNext/STAR 20%, ST 5%.
 func TestLimitUpByBoard(t *testing.T) {
-	if limitUpPct("600000.SH", "浦发银行") != 9.9 {
+	if LimitUpPct("600000.SH", "浦发银行") != 9.9 {
 		t.Fatal("主板应为 9.9")
 	}
-	if limitUpPct("300750.SZ", "宁德时代") != 19.9 {
+	if LimitUpPct("300750.SZ", "宁德时代") != 19.9 {
 		t.Fatal("创业板应为 19.9")
 	}
-	if limitUpPct("688160.SH", "") != 19.9 {
+	if LimitUpPct("688160.SH", "") != 19.9 {
 		t.Fatal("科创板应为 19.9")
 	}
-	if limitUpPct("002084.SH", "*ST海工") != 4.9 {
+	if LimitUpPct("002084.SH", "*ST海工") != 4.9 {
 		t.Fatal("ST 应为 4.9")
 	}
-	if limitUpPct("920001.BJ", "北交所") != 29.9 {
+	if LimitUpPct("920001.BJ", "北交所") != 29.9 {
 		t.Fatal("北交所应为 29.9")
 	}
 	// 创业板涨 15% 未封板 → 可买；主板涨 10% 封板 → 拒

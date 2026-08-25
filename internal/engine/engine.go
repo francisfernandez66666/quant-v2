@@ -68,7 +68,11 @@ type Engine struct {
 	longEnabled  bool            // 利好开关（做多分支）
 	shortEnabled bool            // 利空开关（做空分支）
 
+	m8PeakTotal float64 // §GAP1.2 实盘组合市值峰值（M8 回撤兜底基线；e.mu 保护，平仓后归零重计）
+
 	asyncBusy int32 // 盘前异步引擎运行标记（忙锁，避免异步 run 重入）
+
+	clockFn func() time.Time // §可注入时钟：默认 time.Now；e2e 固定交易时段用（SetClock）
 
 	debugInfo    *newsagent.DebugInfo  // 最近一轮流水线的调试数据（/api/debug 展示）
 	stageRecords []newsagent.DebugInfo // 当日全量轮次记录（固化到磁盘）
@@ -460,10 +464,18 @@ func (e *Engine) syncAccountConfig() {
 		}
 	}
 	// QMT 实盘配置热同步：每轮从配置管理器读取，控制器据此切换 enabled/mode/参数（5s 生效）。
-	// English: hot-sync the QMT live config each cycle from the manager; the controller flips
-	// enabled/mode/params accordingly (5s latency).
+	// §GAP1.7 黑名单接线：Theme.BlackList 一并同步进下单守卫（此前仅死代码 risk.go 消费）。
+	// English: hot-sync the QMT live config each cycle; Theme.BlackList rides along into the order guard.
 	if c := e.QMTController(); c != nil {
-		c.UpdateConfig(cfgMgr.GetRulesFor(userID).QMT)
+		rules := cfgMgr.GetRulesFor(userID)
+		q := rules.QMT
+		q.Blacklist = append(q.Blacklist, rules.Theme.BlackList...)
+		c.UpdateConfig(q)
+	}
+	// §GAP5.1 LLM 成本治理：日预算热同步（0=不设限）。
+	if c := e.LLMClient(); c != nil {
+		lc := cfgMgr.GetRulesFor(userID).LLM
+		c.SetBudgets(lc.DailyCallBudget, lc.DailyTokenBudget)
 	}
 }
 
@@ -570,6 +582,15 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		price = si.Price
 	}
 	if price <= 0 {
+		return
+	}
+	// §GAP1.5 涨停封板拒买（与模拟盘 paper.LimitUpPct 同款分板块守卫）：
+	// 封板股买单现实中几乎无法排队成交，auto 模式直接报单只会买在炸板瞬间或制造虚假成交。
+	// English: §GAP1.5 sealed-board buy guard (same board-aware rule as the paper book) — a buy order
+	// against a sealed limit-up board is practically unfillable; skip instead of firing at the blast.
+	if si := live[sig.Code]; si != nil && si.ChangePct >= paper.LimitUpPct(sig.Code, sig.Name) {
+		log.Printf("[qmt] %s(%s) 涨停封板 %.1f%%≥%.1f%% 拒买跳过", sig.Code, sig.Name,
+			si.ChangePct, paper.LimitUpPct(sig.Code, sig.Name))
 		return
 	}
 	amount := cfg.FixedAmount
@@ -1841,6 +1862,33 @@ func (e *Engine) SetSectorSource(ths *data.THSClient) {
 	e.mu.Unlock()
 }
 
+// LLMClient 返回当前 LLM 客户端（可空）。
+func (e *Engine) LLMClient() *llm.Client {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.llmClient
+}
+
+// SetClock 注入时钟（e2e 固定交易时段用）；nil 恢复真实时间。
+// 修复：主循环/近实时循环的"盘前抑制信号"门控此前读真实 time.Now——
+// 凌晨跑 e2e 时全部信号被抑制（日期/时刻漂移型 flaky 根因）。
+func (e *Engine) SetClock(fn func() time.Time) {
+	e.mu.Lock()
+	e.clockFn = fn
+	e.mu.Unlock()
+}
+
+// nowTime 引擎统一时钟读取。
+func (e *Engine) nowTime() time.Time {
+	e.mu.RLock()
+	fn := e.clockFn
+	e.mu.RUnlock()
+	if fn == nil {
+		return time.Now()
+	}
+	return fn()
+}
+
 // SetLLMClient 热重建 LLM 客户端（前端改配置时调用）。§E8 同上：锁外透传。
 func (e *Engine) SetLLMClient(c *llm.Client) {
 	e.mu.Lock()
@@ -2539,7 +2587,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// volume or latest price, so momentum/volume-price strategies would false-fire on stale daily bars
 	// (same gate as the near-realtime loop's BeforeOpenTrade). News attribution / D1 scoring still run;
 	// only buy/watch signals are held back.
-	if data.BeforeOpenTrade(time.Now()) {
+	if data.BeforeOpenTrade(e.nowTime()) {
 		bullSignals = nil
 		bearSignals = nil
 	}

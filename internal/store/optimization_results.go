@@ -36,6 +36,12 @@ type OptimizationResult struct {
 	Status       string      `json:"status"` // pending | approved | rejected
 	CreatedAt    string      `json:"created_at"`
 	GridJSON     string      `json:"grid_json,omitempty"` // §D3 止盈×止损热力网格（冠军行携带）
+
+	// §GAP4.5 风险调整指标（SWEEP_JSON 带出落库，前端寻优行展示）
+	Sharpe          float64 `json:"sharpe"`
+	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`
+	AnnualReturnPct float64 `json:"annual_return_pct"`
+	Calmar          float64 `json:"calmar"`
 	// PoolStats 该战法对应模拟盘资金池的实测绩效（§B 列表接口运行时附加，不落库；
 	// nil=无对应池或引擎不可用）。前端与回测指标并排对比。
 	PoolStats *PoolLiveStats `json:"pool_stats,omitempty"`
@@ -87,8 +93,9 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 	}
 	stmt, err := tx.Prepare(`INSERT INTO optimization_results
 		(task_id, rank, strategy, strategy_kind, params, objective, win_rate, profit_factor,
-		 win, loss, avg_win_pct, avg_loss_pct, expectancy, stop_loss, avg_hold_days, trigger_count, status, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?)`)
+		 win, loss, avg_win_pct, avg_loss_pct, expectancy, stop_loss, avg_hold_days, trigger_count,
+		 sharpe, max_drawdown_pct, annual_return_pct, calmar, status, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)`)
 	if err != nil {
 		return err
 	}
@@ -109,8 +116,13 @@ func (d *DB) SaveOptimizationResults(taskID int64, objective string, results []m
 		avgLoss, _ := r["avg_loss_pct"].(float64)
 		expectancy, _ := r["expectancy"].(float64)
 		stopLoss, _ := r["stop_loss_pct"].(float64)
+		sharpe, _ := r["sharpe"].(float64)
+		maxDD, _ := r["max_drawdown_pct"].(float64)
+		annualRet, _ := r["annual_return_pct"].(float64)
+		calmar, _ := r["calmar"].(float64)
 		if _, err := stmt.Exec(taskID, int(rank), strategy, sk, string(params), objective,
-			winRate, pf, int(win), int(loss), avgWin, avgLoss, expectancy, stopLoss, avgHold, int(count), now); err != nil {
+			winRate, pf, int(win), int(loss), avgWin, avgLoss, expectancy, stopLoss, avgHold, int(count),
+			sharpe, maxDD, annualRet, calmar, now); err != nil {
 			return err
 		}
 	}
@@ -157,7 +169,9 @@ func (d *DB) ListOptimizations(limit int) ([]map[string]any, error) {
 // 新增列时两处必须同步修改）。
 var optColumns = `id, task_id, rank, strategy, strategy_kind, params, objective,
 	win_rate, profit_factor, win, loss, avg_win_pct, avg_loss_pct, expectancy,
-	stop_loss, avg_hold_days, trigger_count, status, created_at, grid_json`
+	stop_loss, avg_hold_days, trigger_count,
+	sharpe, max_drawdown_pct, annual_return_pct, calmar,
+	status, created_at, grid_json`
 
 // scanOptRow 读一行排名记录。
 func scanOptRow(scan func(...any) error) (*OptimizationResult, error) {
@@ -167,7 +181,9 @@ func scanOptRow(scan func(...any) error) (*OptimizationResult, error) {
 	var grid sql.NullString
 	if err := scan(&r.ID, &r.TaskID, &r.Rank, &r.Strategy, &sk, &r.ParamsJSON, &obj,
 		&r.WinRate, &r.ProfitFactor, &r.Win, &r.Loss, &r.AvgWinPct, &r.AvgLossPct,
-		&r.Expectancy, &sl, &r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt, &grid); err != nil {
+		&r.Expectancy, &sl, &r.AvgHoldDays, &r.TriggerCount,
+		&r.Sharpe, &r.MaxDrawdownPct, &r.AnnualReturnPct, &r.Calmar,
+		&r.Status, &r.CreatedAt, &grid); err != nil {
 		return nil, err
 	}
 	r.GridJSON = grid.String

@@ -28,9 +28,14 @@ func DetectEmotionPhase(snap *MarketSnapshot, cfg *config.EmotionConfig) string 
 		if si.ChangePct >= 9.5 {
 			limitUpCnt++
 		}
-		// 触及涨停但未封住：最高>=9.5% 但当前涨幅<5%
-		// English: Touched limit-up but not sealed: high>=9.5% but current change<5%.
-		if si.High >= 9.5 && si.ChangePct < 5.0 {
+		// 触及涨停但未封住：盘中最高涨幅>=9.5%（按现价+涨跌幅反推昨收折算）但当前涨幅<5%。
+		// §GAP2.1 修复：原实现把当日最高价（元）直接与 9.5 比较——高价股恒触发、低价股永不触发。
+		// StockInfo 无昨收字段，用 price/(1+changePct/100) 反推；行情缺失（价格无效）时跳过该股炸板判定。
+		// English: Touched limit-up but failed to seal: intraday high gain >=9.5% (derived from
+		// price+changePct back-computed prior close) while current change <5%.
+		// English: §GAP2.1 fix — the old code compared the day-high PRICE (yuan) against 9.5, which always
+		// fired for high-priced stocks and never for low-priced ones.
+		if hiGain := intradayHighGainPct(si); hiGain >= 9.5 && si.ChangePct < 5.0 {
 			blastCnt++
 		}
 	}
@@ -65,6 +70,21 @@ func DetectEmotionPhase(snap *MarketSnapshot, cfg *config.EmotionConfig) string 
 		return "背离"
 	}
 	return "启动"
+}
+
+// intradayHighGainPct 由现价+涨跌幅反推昨收，计算盘中最高价相对昨收的涨幅（%）。
+// 行情无效（现价≤0 / 最高价≤0 / 反推结果非正）返回 0（视为未触及涨停，不参与炸板计数）。
+// English: intradayHighGainPct back-computes the prior close from price+changePct and returns the
+// day-high gain over it (%). Returns 0 for invalid quotes (treated as not touching limit-up).
+func intradayHighGainPct(si *StockInfo) float64 {
+	if si == nil || si.Price <= 0 || si.High <= 0 || si.ChangePct <= -100 {
+		return 0
+	}
+	prevClose := si.Price / (1 + si.ChangePct/100)
+	if prevClose <= 0 {
+		return 0
+	}
+	return (si.High - prevClose) / prevClose * 100
 }
 
 // DetectEmotionPhaseV2 基于真实涨停池判定市场情绪阶段（升级版）。

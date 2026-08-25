@@ -162,6 +162,11 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 		stockTracker, wlMgr, sse, llmClient, thsClient, tmp)
 	eng.SetScanner(scanner)
 	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
+	// §时钟注入：固定在交易日 10:30（fixture 新闻日期同日）——
+	// 此前读真实 time.Now，凌晨/盘前跑测试时主循环"盘前抑制"把全部信号清空（时刻漂移 flaky）。
+	fixed := time.Date(2026, 8, 4, 10, 30, 0, 0,
+		time.FixedZone("CST", 8*3600))
+	eng.SetClock(func() time.Time { return fixed })
 
 	t.Cleanup(func() { srv.Close() })
 	return &testRig{

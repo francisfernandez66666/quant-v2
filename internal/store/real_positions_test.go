@@ -131,3 +131,36 @@ func TestApplyRealFillEdge(t *testing.T) {
 		t.Fatalf("fills 应 4 条，got %d", len(fills))
 	}
 }
+
+// TestRealPositionsForUser §GAP1.10 回归：持仓按归属账号过滤；
+// 遗留全局行（user_id=”）对所有人可见；UpsertRealPositions 写入 user_id。
+func TestRealPositionsForUser(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Name: "A", Qty: 100, UserID: "u_boss"},
+		{TsCode: "000001.SZ", Name: "B", Qty: 200}, // 遗留全局行
+	}); err != nil {
+		t.Fatal(err)
+	}
+	boss, err := db.RealPositionsForUser("u_boss")
+	if err != nil || len(boss) != 2 {
+		t.Fatalf("归属账号应看到 自己的+遗留行 = 2, got %d err=%v", len(boss), err)
+	}
+	other, err := db.RealPositionsForUser("u_other")
+	if err != nil || len(other) != 1 {
+		t.Fatalf("其他账号应只看到遗留全局行 1 条, got %d err=%v", len(other), err)
+	}
+	if other[0].TsCode != "000001.SZ" {
+		t.Fatalf("其他账号可见的应为遗留行, got %s", other[0].TsCode)
+	}
+	// 对账重写带 user_id → 归属更新
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "000001.SZ", Name: "B", Qty: 200, UserID: "u_boss"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	other2, _ := db.RealPositionsForUser("u_other")
+	if len(other2) != 0 {
+		t.Fatalf("遗留行归属更新后其他账号应不可见, got %d", len(other2))
+	}
+}

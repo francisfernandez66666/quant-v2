@@ -25,6 +25,9 @@ type RealPosition struct {
 	Strategy     string  `json:"strategy"`
 	SignalID     string  `json:"signal_id"`
 	UpdatedAt    string  `json:"updated_at"`
+	// UserID §GAP1.10 多租户归属：网关回报 user_id 写入；空串=遗留全局行（对所有人可见，
+	// 兼容单老板存量部署）。English: §GAP1.10 owner account; empty = legacy global row.
+	UserID string `json:"user_id,omitempty"`
 }
 
 // RealOrder 实盘委托单行（signal_id 为幂等键）。
@@ -68,14 +71,15 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 			p.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 		}
 		_, err := tx.Exec(`INSERT INTO real_positions
-			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code) DO UPDATE SET
 				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
 				amount=excluded.amount, strategy=excluded.strategy, updated_at=excluded.updated_at,
+				user_id=excluded.user_id,
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
-			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt)
+			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
 		if err != nil {
 			return 0, fmt.Errorf("upsert real position %s: %w", p.TsCode, err)
 		}
@@ -113,7 +117,7 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 // （RealPositions returns every live position for the decision layer.）
 func (d *DB) RealPositions() ([]RealPosition, error) {
 	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at FROM real_positions ORDER BY ts_code`)
+		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions ORDER BY ts_code`)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +126,29 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 	for rows.Next() {
 		var p RealPosition
 		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt); err != nil {
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// RealPositionsForUser §GAP1.10 按账号过滤实盘持仓：返回 user_id 匹配或遗留全局行（user_id=”）。
+// English: §GAP1.10 — positions owned by the account plus legacy global (empty user_id) rows.
+func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
+	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
+		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions
+		WHERE user_id = '' OR user_id = ? ORDER BY ts_code`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RealPosition
+	for rows.Next() {
+		var p RealPosition
+		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -231,6 +257,18 @@ func (d *DB) UpsertRealOrder(o RealOrder) (bool, error) {
 // （UpdateRealOrderStatus updates an order's status.）
 func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 	_, err := d.db.Exec(`UPDATE orders SET status=? WHERE order_id=?`, status, orderID)
+	return err
+}
+
+// UpdateRealOrderBySignalID 下单回填：把 pend:<signal_id> 占位行的 order_id 替换为网关真实委托号并更新状态。
+// §GAP 修复：此前占位行 order_id 恒为空串，与 order_id 主键冲突导致第二笔起的新单被
+// INSERT OR IGNORE 误判为重复（静默不下单），且按网关单号 UPDATE 也永不命中。
+// English: backfills the pending ticket (keyed by signal_id) with the gateway-assigned order id.
+// English: §GAP fix — placeholder rows previously stored an empty order_id, colliding on the primary
+// key so every later new order was swallowed as a "duplicate", and the status update by gateway id
+// never matched.
+func (d *DB) UpdateRealOrderBySignalID(signalID, orderID, status string) error {
+	_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=?`, orderID, status, signalID)
 	return err
 }
 

@@ -92,7 +92,7 @@ func (w *WatchlistManager) Remove(userID, code string) bool {
 // save writes the watchlist to the given file.
 func (w *WatchlistManager) save(path string, list []string) {
 	data, _ := json.MarshalIndent(list, "", "  ")
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := atomicWrite(path, data, 0644); err != nil {
 		log.Printf("[watchlist] 保存失败: %v", err)
 	}
 }

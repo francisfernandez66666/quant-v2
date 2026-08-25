@@ -189,7 +189,7 @@ func (t *StockTracker) save() {
 		log.Printf("[stock_tracker] 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(t.path, data, 0644); err != nil {
+	if err := atomicWrite(t.path, data, 0644); err != nil {
 		log.Printf("[stock_tracker] 写入失败: %v", err)
 	}
 }

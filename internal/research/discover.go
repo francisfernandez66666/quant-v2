@@ -125,14 +125,14 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 	splitIdx := int(float64(len(dates)) * opts.SplitPct)
 	splitDate := dates[splitIdx]
 
-	// 1) 单因子预筛：算每个候选因子的全区间 |IR|，保留有效因子
+	// 1) 单因子预筛：§GAP 二.3#4 只看样本内（≤splitDate）|IR|，保留有效因子
 	var pre []string
 	for _, fid := range opts.Factors {
 		rows := ICByDate(panels, fid, opts.Horizon, opts.MinStocks)
 		if len(rows) < opts.MinDays {
 			continue
 		}
-		ir := absf(IR(rows))
+		ir := absf(IR(rowsUntil(rows, splitDate)))
 		if isNaN(ir) || ir < 0.05 {
 			continue
 		}
@@ -155,13 +155,13 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 			if selectedSet[fid] {
 				continue
 			}
-			// 候选集 = selected + fid，等权评估全区间 IR
+			// 候选集 = selected + fid，等权评估样本内 IR（§GAP 二.3#4 真 hold-out）
 			candFactors := append(append([]string{}, selected...), fid)
 			w := map[string]float64{}
 			for _, f := range candFactors {
 				w[f] = 1.0
 			}
-			rows := CompositeICRange(panels, candFactors, w, opts.Horizon, opts.MinStocks, "", "")
+			rows := CompositeICRange(panels, candFactors, w, opts.Horizon, opts.MinStocks, "", splitDate)
 			ir := absf(IR(rows))
 			if isNaN(ir) {
 				continue
@@ -191,11 +191,12 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 			dirs[fid] = 1
 		}
 	}
-	// 权重优化：坐标上升最大化复合 |IR|（复用 OptimizeWeights 的核心评估）
+	// 权重优化：坐标上升最大化复合 |IR|（§GAP 二.3#4 只喂样本内，样本外留作验证）
 	opt := OptimizeWeights(panels, OptimizeOpts{
 		Factors: selected, Horizon: opts.Horizon, MinStocks: opts.MinStocks,
 		Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
 		GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
+		End: splitDate,
 	})
 	res.Factors = selected
 	res.Directions = dirs
@@ -232,6 +233,20 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 		res.PassGuard = false
 	}
 	return res
+}
+
+// rowsUntil 返回 date ≤ end 的 IC 行子集（§GAP 二.3#4 样本内切分辅助；end 为空=原样返回）。
+func rowsUntil(rows []ICRow, end string) []ICRow {
+	if end == "" {
+		return rows
+	}
+	out := make([]ICRow, 0, len(rows))
+	for _, r := range rows {
+		if r.Date <= end {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // compositeIRInRange 计算复合权重在某日期范围内的 |IR|。

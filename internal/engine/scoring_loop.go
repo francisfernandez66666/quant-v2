@@ -6,12 +6,15 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 	"quant-trading-v2/internal/trading"
@@ -195,7 +198,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// and at lunch quotes are frozen at 11:30 while the today-bar timestamp is time.Now(), so strategies like
 	// double-bump treat lunch as a live new bar. Suppressing signals in both windows is therefore consistent.
 	// The prevPass reset is handled naturally by filterTransitionSignals: the first Pass after 9:30/13:00 re-flips.
-	if data.BeforeOpenTrade(time.Now()) || data.IsPreAfternoon(time.Now()) {
+	if data.BeforeOpenTrade(e.nowTime()) || data.IsPreAfternoon(e.nowTime()) {
 		sigs = nil
 	}
 
@@ -476,6 +479,17 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		EmotionPhase: emotionPhase,
 		Cfg:          ctrl.Config(),
 	})
+
+	// §GAP1.2 M8 组合回撤熔断（risk.M8Check 口径接线）：实盘组合市值自峰值回撤超阈值 → 全部自动卖出。
+	// 此前 M8Check 是死代码；现接入实盘链路（峰值随进程内存续，平仓后基线归零）。
+	e.checkM8RealDrawdown(ctrl, realStore, positions, exitQuotes)
+
+	// §GAP1.1 实盘卖出自动化：mode=auto 且 qmt.auto_sell 开启时，止损级建议自动全仓卖出。
+	// signal_id 按"码+类+日"幂等——orders 表唯一键天然防重，跨重启/跨轮次不会二次下单。
+	if len(advices) > 0 {
+		e.autoExecuteRealSells(ctrl, realStore, advices)
+	}
+
 	if len(advices) == 0 || sse == nil {
 		return
 	}
@@ -485,4 +499,134 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		"tripped": ctrl.Tripped(),
 		"time":    time.Now().Format("15:04:05"),
 	})
+}
+
+// realSellSignalID 实盘自动卖出的幂等键：sell:<纯代码>:<类别>:<交易日>。
+// orders 表 signal_id 唯一键天然防重：同码同类当日只下一单（跨重启/跨轮次安全）。
+func realSellSignalID(tsCode, class string) string {
+	return fmt.Sprintf("sell:%s:%s:%s", pureTsCode(tsCode), class, data.TradingDayDate(time.Now()))
+}
+
+// pureTsCode 剥离交易所后缀。
+func pureTsCode(tsCode string) string {
+	for _, suf := range []string{".SH", ".SZ", ".BJ"} {
+		if i := strings.LastIndex(tsCode, suf); i > 0 {
+			return tsCode[:i]
+		}
+	}
+	return tsCode
+}
+
+// sellRealPosition 通过控制器对单一实盘持仓下卖出单。行情缺失时跳过（宁可不卖不以错价报单）。
+func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, price float64, class, reason string) error {
+	cfg := ctrl.Config()
+	qty := p.Qty
+	if qty <= 0 || price <= 0 {
+		return nil
+	}
+	res, err := ctrl.PlaceOrder(trading.OrderRequest{
+		SignalID:  realSellSignalID(p.TsCode, class),
+		Code:      p.TsCode,
+		Name:      p.Name,
+		Strategy:  p.Strategy,
+		Side:      trading.SideSell,
+		PriceType: cfg.PriceType,
+		Price:     price,
+		Qty:       qty,
+		Amount:    price * float64(qty),
+		CreatedAt: time.Now().Format(time.RFC3339),
+	})
+	if err != nil {
+		log.Printf("[qmt] 自动卖出 %s(%s) 失败: %v", p.TsCode, p.Name, err)
+		return err
+	}
+	if res != nil && !res.OK && strings.Contains(res.Err, "duplicate") {
+		return nil // 当日已下过同类卖单（幂等命中），静默
+	}
+	log.Printf("[qmt] 自动卖出 %s(%s) %d股 @%.2f 类别=%s 原因=%s → %+v",
+		p.TsCode, p.Name, qty, price, class, reason, res)
+	return nil
+}
+
+// autoExecuteRealSells §GAP1.1 止损级建议自动全仓卖出（qmt.auto_sell + mode=auto）。
+// 仅 Action=止损 触发（止盈/减仓保持提醒半自动，由前端确认执行）；行情缺失跳过。
+func (e *Engine) autoExecuteRealSells(ctrl *trading.Controller, realStore *store.DB, advices []trading.PositionAdvice) {
+	if realStore == nil || !ctrl.Enabled() || ctrl.Mode() != "auto" || !ctrl.Config().AutoSell {
+		return
+	}
+	positions, err := realStore.RealPositions()
+	if err != nil || len(positions) == 0 {
+		return
+	}
+	byCode := make(map[string]store.RealPosition, len(positions))
+	for _, p := range positions {
+		byCode[pureTsCode(p.TsCode)] = p
+	}
+	for _, a := range advices {
+		if a.Action != "止损" {
+			continue
+		}
+		p, ok := byCode[a.Code]
+		if !ok || a.RefPrice <= 0 {
+			continue
+		}
+		_ = e.sellRealPosition(ctrl, p, a.RefPrice, "止损", a.Reason)
+	}
+}
+
+// checkM8RealDrawdown §GAP1.2 M8 组合回撤兜底（risk.M8Check 口径接线到实盘）：
+// 每轮用实时快照计算实盘组合总市值（缺行情的持仓按成本价兜底计入），维护进程内峰值；
+// 回撤超 rules.risk_ctrl.m8_portfolio_drawdown_pct 且 m8_enabled 时全部持仓自动卖出
+// （类别 m8，按日幂等）。平仓后（无有效市值）峰值归零重新累计。
+func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.DB, positions []store.RealPosition, quotes map[string]*data.StockInfo) {
+	if realStore == nil || len(positions) == 0 {
+		return
+	}
+	e.mu.RLock()
+	cfgMgr := e.cfgMgr
+	userID := e.userID
+	peak := e.m8PeakTotal
+	e.mu.RUnlock()
+	if cfgMgr == nil {
+		return
+	}
+	rc := cfgMgr.GetRulesFor(userID).RiskCtrl
+	if !rc.M8Enabled || rc.M8PortfolioDrawdownPct >= 0 {
+		return // 未启用或阈值配置非法（应为负值）
+	}
+	total := 0.0
+	for _, p := range positions {
+		price := p.CostPrice
+		if q := quotes[pureTsCode(p.TsCode)]; q != nil && q.Price > 0 {
+			price = q.Price // 缺行情的持仓按成本价兜底，保证估值连续
+		}
+		total += price * float64(p.Qty)
+	}
+	if total <= 0 {
+		return
+	}
+	newPeak := peak
+	if total > peak {
+		newPeak = total
+	}
+	if newPeak != peak {
+		e.mu.Lock()
+		e.m8PeakTotal = newPeak
+		e.mu.Unlock()
+		peak = newPeak
+	}
+	// 组合回撤触发判定（与 risk.Engine.M8Check 同式：drawdown 为负值）
+	drawdown := (total - peak) / peak * 100
+	if drawdown > rc.M8PortfolioDrawdownPct {
+		return
+	}
+	log.Printf("[qmt] M8 兜底触发: 组合市值 %.0f 自峰值 %.0f 回撤 %.1f%% ≤ 阈值 %.1f%% —— 全部自动卖出",
+		total, peak, drawdown, rc.M8PortfolioDrawdownPct)
+	for _, p := range positions {
+		price := p.CostPrice
+		if q := quotes[pureTsCode(p.TsCode)]; q != nil && q.Price > 0 {
+			price = q.Price
+		}
+		_ = e.sellRealPosition(ctrl, p, price, "m8", fmt.Sprintf("M8组合回撤%.1f%%兜底清仓", drawdown))
+	}
 }

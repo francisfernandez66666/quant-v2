@@ -60,7 +60,7 @@ func (s *ConsultStore) persist() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(s.path, raw, 0644); err != nil {
+	if err := atomicWrite(s.path, raw, 0644); err != nil {
 		log.Printf("[consult] 写入失败: %v", err)
 	}
 }

@@ -183,7 +183,7 @@ func TestNightlyBacktestStepInserted(t *testing.T) {
 	statePath := filepath.Join(dir, "research_state.json")
 	s := New(dir, cfgPath, statePath)
 	loc := time.FixedZone("CST", 8*3600)
-	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) } // 周六
+	s.setNow(func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) }) // 周六
 
 	s.tick()
 	waitFor(t, 5*time.Second, func() bool {
@@ -264,6 +264,16 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 	t.Fatalf("超时: %s", msg)
 }
 
+// busyLocked 竞争安全读取 busy 标志（§flaky 修复：后台排水 goroutine 在 s.mu 锁内写 busy，
+// 测试轮询必须持锁读，否则 -race 报数据竞争且偶发误判）。
+// English: race-safe read of the busy flag — the self-drain goroutine writes it under s.mu,
+// so test polls must lock too.
+func (s *Scheduler) busyLocked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.busy
+}
+
 func TestNightlyJobRunsAndCompletes(t *testing.T) {
 	t.Setenv("FAKE_SLEEP", "0")
 	logPath := filepath.Join(t.TempDir(), "fake.log")
@@ -275,7 +285,7 @@ func TestNightlyJobRunsAndCompletes(t *testing.T) {
 	statePath := filepath.Join(dir, "research_state.json")
 	s := New(dir, cfgPath, statePath)
 	loc := time.FixedZone("CST", 8*3600)
-	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) } // 周六 16:00
+	s.setNow(func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) }) // 周六 16:00
 
 	s.tick()
 	waitFor(t, 5*time.Second, func() bool {
@@ -300,8 +310,7 @@ func TestNightlyJobKilledAtTradingOpen(t *testing.T) {
 	s := New(dir, cfgPath, statePath)
 	loc := time.FixedZone("CST", 8*3600)
 	now := time.Date(2026, 8, 22, 16, 0, 0, 0, loc) // 周六 16:00
-	s.now = func() time.Time { return now }
-
+	s.setNow(func() time.Time { return now })
 	s.tick()
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
@@ -333,8 +342,7 @@ func TestTradingDataloadThrottled(t *testing.T) {
 	s := New(dir, cfgPath, statePath)
 	loc := time.FixedZone("CST", 8*3600)
 	now := time.Date(2026, 8, 18, 10, 0, 0, 0, loc) // 周二 10:00 盘中
-	s.now = func() time.Time { return now }
-
+	s.setNow(func() time.Time { return now })
 	// 交易时段 dataload 为异步 goroutine，用轮询等待计数到位（避免竞态）。
 	s.tick()
 	waitFor(t, 5*time.Second, func() bool { return callCount(t, logPath) == 1 },
@@ -381,8 +389,7 @@ func TestNightlyCrossDayReplacesJob(t *testing.T) {
 	s := New(dir, cfgPath, statePath)
 	loc := time.FixedZone("CST", 8*3600)
 	now := time.Date(2026, 8, 21, 16, 0, 0, 0, loc) // 周五 16:00 盘后
-	s.now = func() time.Time { return now }
-
+	s.setNow(func() time.Time { return now })
 	s.tick()
 	waitFor(t, 5*time.Second, func() bool {
 		s.mu.Lock()
@@ -412,7 +419,7 @@ func TestRunCancelsJob(t *testing.T) {
 	statePath := filepath.Join(dir, "research_state.json")
 	s := New(dir, cfgPath, statePath)
 	loc := time.FixedZone("CST", 8*3600)
-	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) } // 周六
+	s.setNow(func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) }) // 周六
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go s.Run(ctx)
