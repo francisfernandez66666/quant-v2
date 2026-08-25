@@ -3,15 +3,20 @@
 """qmt_gateway.handler — 回报处理（AUTO_TRADING_PLAN M2）。
 
 从真实通道（xtquant on_stock_order / on_stock_trade / on_disconnected）或 mock 通道收取事件，
-写本地 SQLite（store）→ 即时 POST 首尔 POST /api/qmt/report（Bearer 鉴权，超时+有限重试）。
+写本地 SQLite（store）→ 经 outbox 队列由后台专职线程推给首尔 POST /api/qmt/report
+（Bearer 鉴权，超时+有限重试；失败滞留 outbox 无限重试，不丢事件）。
 
-xtquant 回调签名：on_stock_order(order)、on_stock_trade(trade)、on_disconnected()。
-未接 xtquant 时这些方法可被 mock 通道直接调用（鸭子类型）。
-（English: report handling for M2 — receives events from the real channel (xtquant callbacks) or the
-mock channel, writes the local SQLite book, then POSTs each event to Seoul POST /api/qmt/report
-(Bearer auth, timeout + limited retries).）
+§G9 改造：回报推送不再跑在 xtquant 回调线程里（此前最长阻塞 ~37s 且失败即丢），
+回调只入队，发送由独立线程按序完成。
+§G5 改造：on_positions 空快照守卫——未连接/数据未同步时的空持仓不再触发对账清空，
+连续 ≥2 次空快照且本地确有持仓时才接受"全平"语义。
+（English: report handling — callbacks only enqueue; a dedicated sender thread drains the outbox
+in order with bounded retries, so slow Seoul never blocks channel callbacks nor loses events.
+Empty position snapshots are ignored (with warning) unless seen twice consecutively.）
 """
+import collections
 import logging
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -50,18 +55,61 @@ def json_dumps(o):
 
 
 class ReportHandler:
-    """回报处理器：写库 + 推送首尔。"""
+    """回报处理器：写库 + outbox 异步推送首尔。"""
 
-    def __init__(self, store, report_url, report_token, user_id=""):
+    def __init__(self, store, report_url, report_token, user_id="", max_outbox=5000):
         self.store = store
         self.report_url = report_url
         self.report_token = report_token
         self.user_id = user_id
         self.disconnected = False
+        # §G5 连续空快照计数（对账清空守卫）
+        self._empty_snaps = 0
+        # §G9 outbox：回调入队、后台线程按序发送
+        self._outbox = collections.deque()
+        self._outbox_cv = threading.Condition()
+        self._stop = threading.Event()
+        self._sender_thread = None
+        self._max_outbox = max_outbox
+
+    def start_sender(self):
+        if self._sender_thread is not None:
+            return
+        self._sender_thread = threading.Thread(
+            target=self._send_loop, name="report-sender", daemon=True)
+        self._sender_thread.start()
+
+    def stop_sender(self):
+        self._stop.set()
+        with self._outbox_cv:
+            self._outbox_cv.notify_all()
+
+    def _send_loop(self):
+        backoff = 2
+        while not self._stop.is_set():
+            item = None
+            with self._outbox_cv:
+                while not self._outbox and not self._stop.is_set():
+                    self._outbox_cv.wait(timeout=1)
+                if self._outbox:
+                    item = self._outbox[0]
+            if item is None:
+                continue
+            ok = post_report(self.report_url, self.report_token, item)
+            if ok:
+                with self._outbox_cv:
+                    self._outbox.popleft()
+                    self._outbox_cv.notify_all()
+                backoff = 2
+            else:
+                # 滞留队首无限重试：交易回报不允许静默丢失
+                time.sleep(min(backoff, 30))
+                backoff *= 2
 
     # ── xtquant 回调 / mock 直调 ──
     def on_stock_order(self, order):
-        """委托回报（xtquant order 对象）。"""
+        """委托回报（xtquant order 对象）。at/created_at 双字段兼容首尔契约。"""
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
         self.on_order({
             "order_id": str(getattr(order, "order_id", "")),
             "signal_id": getattr(order, "remark", "") or "",
@@ -70,7 +118,8 @@ class ReportHandler:
             "status": self._status(getattr(order, "order_status", "")),
             "price": float(getattr(order, "price", 0) or 0),
             "qty": int(getattr(order, "order_volume", 0) or 0),
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "created_at": ts,
+            "at": ts,
         })
 
     def on_stock_trade(self, trade):
@@ -108,13 +157,31 @@ class ReportHandler:
         self._push({"type": "order", **ev})
 
     def on_trade(self, ev):
-        self.store.apply_fill(ev)
+        pos, is_dup = self.store.apply_fill(ev)
+        if is_dup:
+            log.warning("[handler] duplicate trade replay ignored: %s %s %s@%s x%s",
+                        ev.get("order_id"), ev.get("side"), ev.get("code"),
+                        ev.get("price"), ev.get("qty"))
+            return
         self._push({"type": "trade", **ev})
 
     def on_positions(self, positions):
+        """全量对账 + 推送。§G5：空快照守卫——只有连续两次空快照且本地有持仓才接受清空。"""
+        if not positions:
+            held = len(self.store.list_positions())
+            self._empty_snaps += 1
+            if held == 0:
+                return  # 本来就无持仓，无事可做
+            if self._empty_snaps < 2:
+                log.warning("[handler] empty positions snapshot #%d — reconcile skipped "
+                            "(防通道异常清空账本)", self._empty_snaps)
+                return
+            log.warning("[handler] two consecutive empty snapshots — accepting full clear")
+        else:
+            self._empty_snaps = 0
         n = self.store.reconcile_positions(positions)
         log.info("[handler] reconciled %d positions", n)
-        self._push({"type": "positions", "positions": positions})
+        self._push({"type": "positions", "positions": list(positions)})
 
     def push_disconnect(self):
         self.on_disconnected()
@@ -123,7 +190,13 @@ class ReportHandler:
         if not self.report_url:
             return
         payload["user_id"] = self.user_id
-        post_report(self.report_url, self.report_token, payload)
+        with self._outbox_cv:
+            if len(self._outbox) >= self._max_outbox:
+                dropped = self._outbox.popleft()
+                log.error("[handler] outbox overflow (%d), dropping oldest event type=%s",
+                          self._max_outbox, dropped.get("type"))
+            self._outbox.append(payload)
+            self._outbox_cv.notify_all()
 
 
 def periodic_reconcile(handler, broker, interval_sec=60, stop=None):

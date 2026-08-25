@@ -4,13 +4,16 @@
 
 - Broker 基类：定义 /order /cancel /state 对应的通道原语，回调注入 handler。
 - XtBroker：真实东莞证券 MiniQMT（xtquant.xttrader.XtQuantTrader）封装 —— connect() 一次性建立，
-  自实现自动重连循环（on_disconnected 触发即时回报给首尔后重连）；price_type=market 时下单前
-  取最新实时盘口；下单前置校验（整手/仓位上限）。xtquant 为 Windows 专有库 → 延迟 import，
-  Linux/macOS 无法安装时保持可导入（connect 时才报错）。
-- MockBroker：内存账本模拟（等价于 Go cmd/qmt-mock），用于无 Windows 环境的端到端联调。
-  （English: trading-channel abstraction for M2 — Broker base defines the channel primitives;
-  XtBroker wraps the real Guoxin MiniQMT (xtquant) with auto-reconnect and pre-fill market price;
-  MockBroker is an in-memory simulation for end-to-end testing without Windows.）
+  自实现自动重连循环；§G3 断线经回调适配器复位 _connected（此前断线后永不重连、/state 谎报在线）；
+  §G6 price_type 映射 xtconstant 数值常量（此前传字符串疑似全部废单），market=对手方最优价
+  （与首尔侧 trading.QMTClient 契约一致，分沪深市场取常量）；
+  §G4 order_stock 返回的本地 seq 以 "seq:<n>" 不透明串返回并维护 seq→交易所委托号映射，
+  回调回报真实委托号后自动替换（store.upsert_order 占位替换规则），撤单先解析映射。
+  xtquant 为 Windows 专有库 → 延迟 import，Linux/macOS 保持可导入（connect 时才报错）。
+- MockBroker：内存账本模拟（等价 Go cmd/qmt-mock）。§修复撤单竞态：已撤订单不再被延迟成交线程
+  强改成已成/改持仓。
+  （English: trading-channel abstraction — XtBroker wraps MiniQMT with disconnect-aware reconnect,
+  xtconstant price-type mapping and seq→exchange-id resolution; MockBroker is an in-memory twin.）
 """
 import logging
 import threading
@@ -31,19 +34,49 @@ class Broker:
 
     def place_order(self, req):
         """下单。req: dict（signal_id/code/name/strategy/side/price_type/price/qty/amount/created_at）。
-        返回 (ok:bool, order_id:str, err:str)。"""
+        返回 (ok:bool, order_ref:str, err:str)。order_ref 为不透明串（mock 单号或 "seq:<n>"）。"""
         raise NotImplementedError
 
     def cancel(self, order_id):
+        """撤单。返回 (ok:bool, err:str)。order_ref 无法解析为交易所委托号时返回失败原因。"""
         raise NotImplementedError
 
     def query_positions(self):
-        """返回持仓列表 [{ts_code,name,qty,cost_price,amount,highest_price,...}]。"""
+        """返回持仓列表 [{ts_code,name,qty,cost_price,amount,highest_price,...}]。可能为空列表
+        （未连接/数据未同步——调用方必须按"不可信快照"处理，禁止据此清账）。"""
         raise NotImplementedError
 
     def subscribe(self):
         """订阅成交/委托/断线回调（真实通道）。"""
         pass
+
+
+class _CallbackAdapter:
+    """§G3/G4 回调适配器：断线通知同时复位 broker._connected；委托回报回填 seq→交易所委托号。
+
+    其余回调方法委托给内部 handler（鸭子类型，xtquant 只调它认识的方法）。
+    """
+
+    def __init__(self, broker, inner):
+        self._broker = broker
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def on_disconnected(self):
+        self._broker.mark_disconnected()
+        try:
+            self._inner.on_disconnected()
+        except Exception:  # noqa: BLE001
+            log.exception("[adapter] inner on_disconnected failed")
+
+    def on_stock_order(self, order):
+        try:
+            self._broker.record_exchange_order_id(order)
+        except Exception:  # noqa: BLE001
+            log.exception("[adapter] record exchange order_id failed")
+        self._inner.on_stock_order(order)
 
 
 class XtBroker(Broker):
@@ -59,6 +92,10 @@ class XtBroker(Broker):
         self._connected = False
         self._lock = threading.Lock()
         self.handler = None  # ReportHandler，回调注入
+        # §G4 seq ↔ signal_id ↔ 交易所委托号 映射
+        self._seq_signal = {}       # seq(str) -> signal_id
+        self._signal_seq = {}       # signal_id -> seq(str)
+        self._seq_exchange = {}     # seq(str) -> 交易所委托号(str)
 
     def _import_xtquant(self):
         """延迟导入 xtquant（Windows 专有库）。"""
@@ -70,6 +107,27 @@ class XtBroker(Broker):
                 "xtquant 不可用（仅 Windows 云主机可安装）。本环境请用 MockBroker 联调。: %s" % e
             )
         return XtQuantTrader
+
+    @staticmethod
+    def price_type_const(price_type, code):
+        """§G6 price_type → xtconstant 数值常量。
+
+        limit → FIX_PRICE(11)；market → 对手方最优价格委托（契约语义=对手价），
+        沪市取 MARKET_PEER_PRICE_FIRST_SH(44)、深市取 MARKET_PEER_PRICE_FIRST(14)。
+        常量名缺失时用文档数值兜底；有 xtconstant 时以库值为准。
+        """
+        fix, peer_sh, peer_sz = 11, 44, 14
+        try:
+            from xtquant import xtconstant  # noqa: PLC0415
+            fix = getattr(xtconstant, "FIX_PRICE", fix)
+            peer_sh = getattr(xtconstant, "MARKET_PEER_PRICE_FIRST_SH", peer_sh)
+            peer_sz = getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", peer_sz)
+        except Exception:  # noqa: BLE001 — 无 xtquant 环境（mock/测试）
+            pass
+        if str(price_type or "").lower() == "limit":
+            return int(fix)
+        head = str(code or "").split(".")[0]
+        return int(peer_sh) if head.startswith("6") else int(peer_sz)
 
     def connect(self):
         """connect() 一次性建立 + 自实现自动重连循环。"""
@@ -86,11 +144,35 @@ class XtBroker(Broker):
             self._trader = trader
             self._xt = XtQuantTrader
             self._connected = True
+        # §G3 注册适配器而非裸 handler：断线即复位 _connected，重连循环得以触发
         if self.handler:
-            trader.register_callback(self.handler)
+            trader.register_callback(_CallbackAdapter(self, self.handler))
         trader.subscribe(self.account)
         log.info("[broker] connected account=%s", self.account)
         return True
+
+    def mark_disconnected(self):
+        """§G3 断线复位：让 is_connected()/connect_loop 立即反映真实通道状态。"""
+        with self._lock:
+            was = self._connected
+            self._connected = False
+        if was:
+            log.warning("[broker] channel marked disconnected — reconnect loop will re-establish")
+
+    def record_exchange_order_id(self, order):
+        """§G4 由回调适配器调用：remark(signal_id) 关联出 seq→交易所委托号映射。"""
+        remark = getattr(order, "remark", "") or ""
+        oid = str(getattr(order, "order_id", "") or "")
+        if not remark or not oid:
+            return
+        with self._lock:
+            seq = self._signal_seq.get(remark)
+            if seq:
+                prev = self._seq_exchange.get(seq)
+                if prev and prev != oid:
+                    log.warning("[broker] exchange order_id changed for signal=%s: %s -> %s",
+                                remark, prev, oid)
+                self._seq_exchange[seq] = oid
 
     def is_connected(self):
         return self._connected
@@ -98,33 +180,53 @@ class XtBroker(Broker):
     def place_order(self, req):
         if not self._connected:
             return False, "", "not connected"
-        price = req.get("price", 0.0)
-        # price_type=market 时下单前取最新实时盘口
-        if req.get("price_type") == "market":
-            tick = self._trader.query_stock_quote(req.get("code", ""))
-            if tick and getattr(tick, "lastPrice", 0) > 0:
-                price = tick.lastPrice
+        code = req.get("code", "")
+        price = float(req.get("price", 0) or 0)
         side = req.get("side", "")
         order_type = 1101 if side == "买入" else 1102  # xtquant: 1101=买, 1102=卖
-        seq = self._trader.order_stock(
-            self.account,
-            req.get("code", ""),
-            order_type,
-            int(req.get("qty", 0)),
-            "limit" if req.get("price_type") == "limit" else "market",
-            price,
-            req.get("strategy", ""),
-            req.get("signal_id", ""),
-        )
+        pt_const = self.price_type_const(req.get("price_type"), code)
+        signal_id = req.get("signal_id", "")
+        with self._lock:
+            seq = self._trader.order_stock(
+                self.account,
+                code,
+                order_type,
+                int(req.get("qty", 0)),
+                pt_const,
+                price,
+                req.get("strategy", ""),
+                signal_id,
+            )
         if seq <= 0:
             return False, "", "order_stock failed (seq=%s)" % seq
-        return True, str(seq), ""
+        seq_s = str(seq)
+        with self._lock:
+            self._seq_signal[seq_s] = signal_id
+            if signal_id:
+                self._signal_seq[signal_id] = seq_s
+        # §G4 返回不透明 "seq:<n>" 引用：首尔可凭此撤单（映射解析）；真实委托号由回报回填
+        return True, "seq:%s" % seq_s, ""
 
     def cancel(self, order_id):
         if not self._connected:
-            return False
-        self._trader.cancel_order_stock(self.account, int(order_id))
-        return True
+            return False, "not connected"
+        oid = str(order_id or "")
+        if oid.startswith(("seq:", "SEQ:", "pending:")):
+            seq = oid.split(":", 1)[1]
+            with self._lock:
+                mapped = self._seq_exchange.get(seq)
+            if not mapped:
+                return False, "交易所委托号尚未回报，暂不可撤（seq=%s）" % seq
+            oid = mapped
+        try:
+            n = int(oid)
+        except ValueError:
+            return False, "invalid order_id: %r" % order_id
+        try:
+            self._trader.cancel_order_stock(self.account, n)
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+        return True, ""
 
     def query_positions(self):
         if not self._connected:
@@ -166,13 +268,15 @@ class MockBroker(Broker):
         self._connected = True
         return True
 
+    def mark_disconnected(self):
+        self._connected = False
+
     def is_connected(self):
         return self._connected
 
     def _next_order_id(self):
-        with self._lock:
-            self._next_id += 1
-            return "MOCK%06d" % self._next_id
+        self._next_id += 1
+        return "MOCK%06d" % self._next_id
 
     def place_order(self, req):
         with self._lock:
@@ -186,21 +290,30 @@ class MockBroker(Broker):
 
         def _fill():
             time.sleep(self.delay_sec)
-            self._apply_fill(order, req.get("price", 0.0))
-            order["status"] = "已成"
+            filled_snapshot = None
+            with self._lock:
+                o = self._orders.get(order_id)
+                # §修复撤单竞态：已撤/已删订单不再延迟成交、不改持仓、不回调
+                if o is None or o.get("status") != "已报":
+                    return
+                o["status"] = "已成"
+                self._apply_fill_locked(order, req.get("price", 0.0))
+                filled_snapshot = dict(o)
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
             if self.handler:
                 self.handler.on_order({
                     "order_id": order_id, "signal_id": order.get("signal_id", ""),
                     "code": order.get("code"), "side": order.get("side"),
                     "status": "已成", "price": order.get("price", 0.0),
                     "qty": order.get("qty", 0),
-                    "created_at": order.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                    "created_at": filled_snapshot.get("created_at") or ts,
+                    "at": ts,
                 })
                 self.handler.on_trade({
                     "order_id": order_id, "code": order.get("code"), "side": order.get("side"),
                     "price": order.get("price", 0.0), "qty": order.get("qty", 0),
                     "amount": float(order.get("qty", 0)) * float(order.get("price", 0)),
-                    "traded_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                    "traded_at": ts,
                     "signal_id": order.get("signal_id", ""),
                 })
 
@@ -209,35 +322,40 @@ class MockBroker(Broker):
 
     def cancel(self, order_id):
         with self._lock:
-            o = self._orders.get(order_id)
-            if o and o["status"] == "已报":
+            o = self._orders.get(str(order_id))
+            if o is None:
+                return False, "order not found"
+            if o["status"] == "已成":
+                return False, "order already filled"
+            if o["status"] == "已报":
                 o["status"] = "已撤"
-        return True
+                return True, ""
+            return False, "order in state %s" % o["status"]
 
-    def _apply_fill(self, order, price):
+    def _apply_fill_locked(self, order, price):
+        """调用方须持 _lock。"""
         code = order.get("code", "")
-        with self._lock:
-            p = self._positions.get(code)
-            if order.get("side") == "买入":
-                if p is None:
-                    p = {"ts_code": code, "name": order.get("name", ""), "qty": 0,
-                         "cost_price": 0.0, "amount": 0.0, "highest_price": price}
-                    self._positions[code] = p
-                qty = int(order.get("qty", 0))
-                new_qty = p["qty"] + qty
-                p["cost_price"] = (p["qty"] * p["cost_price"] + qty * price) / new_qty
-                p["qty"] = new_qty
-                p["amount"] = new_qty * price
-                p["highest_price"] = max(p["highest_price"], price)
+        p = self._positions.get(code)
+        if order.get("side") == "买入":
+            if p is None:
+                p = {"ts_code": code, "name": order.get("name", ""), "qty": 0,
+                     "cost_price": 0.0, "amount": 0.0, "highest_price": price}
+                self._positions[code] = p
+            qty = int(order.get("qty", 0))
+            new_qty = p["qty"] + qty
+            p["cost_price"] = (p["qty"] * p["cost_price"] + qty * price) / new_qty
+            p["qty"] = new_qty
+            p["amount"] = new_qty * price
+            p["highest_price"] = max(p["highest_price"], price)
+        else:
+            if p is None:
+                return
+            remain = p["qty"] - int(order.get("qty", 0))
+            if remain <= 0:
+                del self._positions[code]
             else:
-                if p is None:
-                    return
-                remain = p["qty"] - int(order.get("qty", 0))
-                if remain <= 0:
-                    del self._positions[code]
-                else:
-                    p["qty"] = remain
-                    p["amount"] = remain * price
+                p["qty"] = remain
+                p["amount"] = remain * price
 
     def query_positions(self):
         with self._lock:

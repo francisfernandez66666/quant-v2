@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +23,8 @@ from broker import MockBroker, XtBroker, build_broker  # noqa: E402
 from handler import ReportHandler, post_report  # noqa: E402
 from gateway import Gateway, _Handler  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
+
+CN_TZ = timezone(timedelta(hours=8))
 
 
 def new_store():
@@ -79,7 +82,98 @@ class TestStore(unittest.TestCase):
                                  "side": "买入", "status": "已成", "price": 10, "qty": 100,
                                  "created_at": "t2"})
         self.assertFalse(is_new)
-        self.assertEqual(s.order_by_signal("S1")["order_id"], "B")
+        # §G2 新语义：首个真实 order_id 固化不被覆盖；status 照常刷新
+        row = s.order_by_signal("S1")
+        self.assertEqual(row["order_id"], "A")
+        self.assertEqual(row["status"], "已成")
+
+    def test_claim_settle_release(self):
+        """§G1 占位式幂等：claim 原子抢占、占位阻塞重复下单、settle 回填、release 释放。"""
+        s = new_store()
+        draft = {"signal_id": "S9", "code": "000001.SZ", "side": "买入",
+                 "price": 10.0, "qty": 100, "created_at": "t"}
+        claimed, existing = s.claim_order(draft)
+        self.assertTrue(claimed)
+        self.assertIsNone(existing)
+        # 二次 claim → 抢不到，返回 pending 占位行
+        claimed2, existing2 = s.claim_order(draft)
+        self.assertFalse(claimed2)
+        self.assertEqual(existing2["status"], "pending")
+        # settle 回填真实委托号
+        s.upsert_order({"order_id": "seq:12", "signal_id": "S9", "code": "000001.SZ",
+                        "side": "买入", "status": "已报", "price": 10, "qty": 100,
+                        "created_at": "t"})
+        self.assertEqual(s.order_by_signal("S9")["order_id"], "seq:12")
+        # 回报交易所委托号 → 替换 seq 占位引用（一次）
+        s.upsert_order({"order_id": "2026082500001", "signal_id": "S9", "status": "已成"})
+        row = s.order_by_signal("S9")
+        self.assertEqual(row["order_id"], "2026082500001")
+        self.assertEqual(row["status"], "已成")
+        # 再来一条不同委托号的回报 → 不覆盖首个真实号
+        s.upsert_order({"order_id": "OTHER", "signal_id": "S9", "status": "已成"})
+        self.assertEqual(s.order_by_signal("S9")["order_id"], "2026082500001")
+        # release：仅删未结算 pending
+        d2 = dict(draft, signal_id="S10")
+        claimed3, _ = s.claim_order(d2)
+        self.assertTrue(claimed3)
+        s.release_pending("S10")
+        self.assertIsNone(s.order_by_signal("S10"))
+
+    def test_apply_fill_duplicate_replay(self):
+        """§G10 成交去重：时间窗内同 (order_id,side,price,qty) 重放不改持仓。"""
+        s = new_store()
+        f = {"order_id": "X1", "code": "600519.SH", "side": "买入", "price": 10, "qty": 100,
+             "amount": 1000, "traded_at": datetime.now(CN_TZ).strftime("%Y-%m-%dT%H:%M:%S"),
+             "signal_id": "S1"}
+        pos, dup = s.apply_fill(f)
+        self.assertFalse(dup)
+        self.assertEqual(pos["qty"], 100)
+        pos2, dup2 = s.apply_fill(dict(f))
+        self.assertTrue(dup2)
+        p = s.list_positions()[0]
+        self.assertEqual(p["qty"], 100)  # 未翻倍
+
+    def test_empty_positions_snapshot_guard(self):
+        """§G5：单次空快照不清账本；连续两次才接受清空。"""
+        s = new_store()
+        h = ReportHandler(s, "", "")
+        s.upsert_position({"ts_code": "600519.SH", "qty": 100, "cost_price": 1500})
+        h.on_positions([])  # 第 1 次：跳过
+        self.assertEqual(len(s.list_positions()), 1)
+        h.on_positions([])  # 第 2 次：接受清空
+        self.assertEqual(s.list_positions(), [])
+
+
+class TestLotRule(unittest.TestCase):
+    def test_lot_rule_by_board(self):
+        from gateway import lot_rule
+        self.assertEqual(lot_rule("600519.SH", "买入"), (100, 100))
+        self.assertEqual(lot_rule("000001.SZ", "买入"), (100, 100))
+        self.assertEqual(lot_rule("300750.SZ", "买入"), (200, 1))
+        self.assertEqual(lot_rule("688160.SH", "买入"), (200, 1))
+
+    def test_zero_lot_sell_allowed_by_gateway(self):
+        """卖出允许零股（送转股清仓）：网关层放行，不按买入整手规则拦截。"""
+        fd, dbpath = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(dbpath)
+        gw = Gateway({
+            "listen": "127.0.0.1:0", "token": "tk", "broker": "mock", "account": "M",
+            "db": dbpath, "report_url": "", "reconcile_sec": 0,
+            "seed": [{"ts_code": "600519.SH", "name": "贵州茅台", "qty": 100,
+                      "cost_price": 1500, "highest_price": 1500}],
+        })
+        try:
+            status, body = gw._do_order({
+                "signal_id": "SL1", "code": "600519.SH", "side": "卖出",
+                "price_type": "limit", "price": 1500, "qty": 50, "created_at": "t",
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(body["ok"])
+            # 50 股零股卖单已受理
+            self.assertTrue(gw.store.order_by_signal("SL1"))
+        finally:
+            gw.stop()
 
 
 class TestIdempotency(unittest.TestCase):
@@ -234,8 +328,56 @@ class TestGatewayHTTP(unittest.TestCase):
         self.assertTrue(state["connected"])
         self.assertEqual(len(state["orders"]), 1)
         self.assertEqual(state["orders"][0]["status"], "已成")
+        self.assertEqual(state["orders"][0]["order_id"], order_id)
         self.assertEqual(state["positions"][0]["ts_code"], "600519.SH")
         self.assertEqual(state["positions"][0]["qty"], 100)
+
+    def test_empty_signal_id_rejected(self):
+        """§G2 空 signal_id 一律 400，不进入下单路径。"""
+        status, body = self._req("POST", "/order", {
+            "signal_id": "", "code": "600519.SH", "side": "买入", "price": 1510,
+            "qty": 100, "created_at": "t",
+        })
+        self.assertEqual(status, 400)
+        # 未产生任何订单
+        _, state = self._req("GET", "/state")
+        self.assertEqual(len(state["orders"]), 0)
+
+    def test_sci_board_lot_rules(self):
+        """§G7 科创板最低 200 股；主板整手。"""
+        # 688xxx 150 股 → 拒
+        status, _ = self._req("POST", "/order", {
+            "signal_id": "SC1", "code": "688160.SH", "side": "买入", "price": 50,
+            "qty": 150, "created_at": "t",
+        })
+        self.assertEqual(status, 400)
+        # 688xxx 250 股 → 过
+        status2, body2 = self._req("POST", "/order", {
+            "signal_id": "SC2", "code": "688160.SH", "side": "买入", "price": 50,
+            "qty": 250, "created_at": "t",
+        })
+        self.assertEqual(status2, 200)
+        self.assertTrue(body2["ok"])
+
+    def test_cancel_unknown_returns_err(self):
+        """撤单结果不再恒 ok：未知委托返回错误。"""
+        status, body = self._req("POST", "/cancel", {"order_id": "MOCK999999"})
+        self.assertEqual(status, 409)
+        self.assertFalse(body["ok"])
+
+    def test_health_reports_broker_state(self):
+        status, body = self._req("GET", "/health", token="")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertIn("broker_connected", body)
+
+    def test_bad_types_rejected_cleanly(self):
+        """§G8 入参类型前置校验：非法类型返回 400 JSON 而非断连。"""
+        status, body = self._req("POST", "/order", {
+            "signal_id": "T1", "code": "600519.SH", "side": "买入",
+            "price": "abc", "qty": "xyz", "created_at": "t",
+        })
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

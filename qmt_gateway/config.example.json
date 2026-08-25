@@ -3,6 +3,7 @@
   "token": "change-me",
   "broker": "mock",
   "account": "MOCK0001",
+  "user_id": "",
   "db": "qmt_gateway/data.db",
   "report_url": "http://127.0.0.1:8080",
   "report_token": "change-me",

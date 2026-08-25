@@ -3,17 +3,47 @@
 """qmt_gateway.store — 网关本地 SQLite 账本（AUTO_TRADING_PLAN M2）。
 
 三表与首尔侧 Go store（real_positions/orders/fills）字段对齐，作为断线时的本地缓存与
-幂等去重依据；联机后把增量事件（trade/order/positions/disconnect）即时推给首尔 /api/qmt/report。
+幂等去重依据；联机后把增量事件（trade/order/positions/disconnect）经 outbox 推给首尔
+POST /api/qmt/report。
 
-线程安全：每线程独立连接（check_same_thread=False + 锁序列化写），配合 ThreadingHTTPServer 并发。
-（English: local SQLite book aligned with the Seoul-side Go store (real_positions/orders/fills) —
-the offline cache and idempotency source; incremental events (trade/order/positions/disconnect) are
-pushed to Seoul POST /api/qmt/report as they occur. Thread-safe: per-thread connection plus a write lock.）
+线程安全：单连接 + 全部读写统一持 RLock（ThreadingHTTPServer 每连接一线程并发访问）。
+§R1 幂等占位（G1/G2）：claim_order 以 signal_id UNIQUE 先插 pending 占位再下单——
+原子抢占，杜绝 check→place→record 窗口内的重复真实下单与崩溃后重下；
+首个非占位 order_id 一旦落库不再被覆盖（回调回报的交易所委托号只做一次替换）。
+§G10 成交去重：fills 按 (order_id,side,price,qty) 在时间窗内判重，防通道重放导致持仓翻倍。
+（English: local SQLite book aligned with the Seoul-side Go store. Single connection guarded by an
+RLock for ALL reads/writes. Claim-before-place idempotency on orders.signal_id UNIQUE prevents
+duplicate real orders across concurrent retries and crashes; the first real order_id wins and is
+never overwritten. Trade fills are de-duplicated in a sliding time window against channel replays.）
 """
 import json
 import os
 import sqlite3
 import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+# 占位 order_id 前缀：pending:<signal_id>（下单前占位）；真实委托号落库后不可被占位值覆盖
+CN_TZ = timezone(timedelta(hours=8))
+FILL_DEDUP_WINDOW_SEC = 120
+
+
+def is_placeholder_order_id(oid):
+    """空串/pending:/seq: 视为占位，允许被真实交易所委托号替换。"""
+    if not oid:
+        return True
+    return oid.startswith("pending:") or oid.startswith("seq:")
+
+
+def order_id_rank(oid):
+    """§G4 委托引用等级：pending(0) < seq(1) < 交易所真实委托号(2)。只允许升级替换。"""
+    if not oid:
+        return 0
+    if oid.startswith("pending:"):
+        return 0
+    if oid.startswith("seq:"):
+        return 1
+    return 2
 
 
 class Store:
@@ -26,90 +56,167 @@ class Store:
         need_init = not os.path.exists(path)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        if need_init:
-            self._init_schema()
+        with self._lock:
+            if need_init:
+                self._init_schema()
+            else:
+                self._migrate_schema()
 
     def _init_schema(self):
+        cur = self._conn.cursor()
+        cur.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS real_positions (
+                ts_code       TEXT PRIMARY KEY,
+                name          TEXT,
+                qty           INTEGER,
+                cost_price    REAL,
+                amount        REAL,
+                highest_price REAL,
+                strategy      TEXT,
+                signal_id     TEXT,
+                updated_at    TEXT
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id   TEXT PRIMARY KEY,
+                signal_id  TEXT UNIQUE,
+                code       TEXT,
+                side       TEXT,
+                status     TEXT,
+                price      REAL,
+                qty        INTEGER,
+                created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS fills (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id  TEXT,
+                code      TEXT,
+                side      TEXT,
+                price     REAL,
+                qty       INTEGER,
+                amount    REAL,
+                traded_at TEXT,
+                signal_id TEXT
+            );
+            """
+        )
+        self._conn.commit()
+
+    def _migrate_schema(self):
+        """老库兼容：无破坏性变更即跳过（当前 schema 与初版一致）。"""
+        return
+
+    # ── orders ──
+    def claim_order(self, draft):
+        """§G1 原子占位：以 signal_id 抢占一个 pending 行。
+
+        返回 (claimed:bool, existing:dict|None)。已存在时返回既有行（含 pending 占位），
+        调用方据此实现幂等或拒绝进行中请求。崩溃残留的 pending 行会永久阻塞该 signal_id
+        （安全侧失效：宁可拒绝也不重复真实下单），启动时由 Gateway 打警告日志。
+        """
+        sid = draft.get("signal_id", "")
         with self._lock:
-            cur = self._conn.cursor()
-            cur.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS real_positions (
-                    ts_code       TEXT PRIMARY KEY,
-                    name          TEXT,
-                    qty           INTEGER,
-                    cost_price    REAL,
-                    amount        REAL,
-                    highest_price REAL,
-                    strategy      TEXT,
-                    signal_id     TEXT,
-                    updated_at    TEXT
-                );
-                CREATE TABLE IF NOT EXISTS orders (
-                    order_id   TEXT PRIMARY KEY,
-                    signal_id  TEXT UNIQUE,
-                    code       TEXT,
-                    side       TEXT,
-                    status     TEXT,
-                    price      REAL,
-                    qty        INTEGER,
-                    created_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS fills (
-                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_id  TEXT,
-                    code      TEXT,
-                    side      TEXT,
-                    price     REAL,
-                    qty       INTEGER,
-                    amount    REAL,
-                    traded_at TEXT,
-                    signal_id TEXT
-                );
-                """
+            cur = self._conn.execute(
+                """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(signal_id) DO NOTHING""",
+                (
+                    "pending:" + sid,
+                    sid,
+                    draft.get("code", ""),
+                    draft.get("side", ""),
+                    "pending",
+                    float(draft.get("price", 0) or 0),
+                    int(draft.get("qty", 0) or 0),
+                    draft.get("created_at", "") or _now_cn(),
+                ),
+            )
+            if cur.rowcount == 0:
+                row = self._conn.execute(
+                    "SELECT * FROM orders WHERE signal_id = ?", (sid,)
+                ).fetchone()
+                self._conn.commit()
+                return False, (dict(row) if row else None)
+            self._conn.commit()
+            return True, None
+
+    def release_pending(self, signal_id):
+        """下单失败时释放 pending 占位，允许后续重试。仅删未结算的占位行。"""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM orders WHERE signal_id = ? AND status = 'pending'",
+                (signal_id,),
             )
             self._conn.commit()
 
-    # ── orders ──
-    def order_by_signal(self, signal_id):
-        """按 signal_id 查委托（幂等键）。"""
-        cur = self._conn.execute("SELECT * FROM orders WHERE signal_id = ?", (signal_id,))
-        return cur.fetchone()
-
     def upsert_order(self, order):
-        """插入/更新委托（signal_id 冲突时更新 order_id/status）。返回是否新订单。"""
+        """插入/更新委托。返回是否新订单。
+
+        §G2 语义：status/price/qty/created_at 随最新事件刷新；order_id 只在「存量是占位
+        且新值是真实委托号」时替换一次（pending:→seq:→交易所委托号），真实委托号互不覆盖。
+        """
+        sid = order.get("signal_id", "")
+        new_oid = str(order.get("order_id", "") or "")
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT 1 FROM orders WHERE signal_id = ?", (order["signal_id"],)
-            )
-            is_new = cur.fetchone() is None
+            row = self._conn.execute(
+                "SELECT * FROM orders WHERE signal_id = ?", (sid,)
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        new_oid or ("pending:" + sid),
+                        sid,
+                        order.get("code", ""),
+                        order.get("side", ""),
+                        order.get("status", ""),
+                        float(order.get("price", 0) or 0),
+                        int(order.get("qty", 0) or 0),
+                        order.get("created_at", ""),
+                    ),
+                )
+                self._conn.commit()
+                return True
+            final_oid = row["order_id"]
+            if order_id_rank(new_oid) > order_id_rank(final_oid):
+                final_oid = new_oid
             self._conn.execute(
-                """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at)
-                   VALUES(?,?,?,?,?,?,?,?)
-                   ON CONFLICT(signal_id) DO UPDATE SET
-                     order_id=excluded.order_id, status=excluded.status, price=excluded.price,
-                     qty=excluded.qty, created_at=excluded.created_at""",
+                """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?
+                   WHERE signal_id=?""",
                 (
-                    order.get("order_id", ""),
-                    order["signal_id"],
-                    order.get("code", ""),
-                    order.get("side", ""),
-                    order.get("status", ""),
-                    order.get("price", 0.0),
-                    order.get("qty", 0),
-                    order.get("created_at", ""),
+                    final_oid,
+                    order.get("status", row["status"]),
+                    float(order.get("price", 0) or row["price"] or 0),
+                    int(order.get("qty", 0) or 0) or row["qty"] or 0,
+                    order.get("created_at", "") or row["created_at"],
+                    sid,
                 ),
             )
             self._conn.commit()
-            return is_new
+            return False
+
+    def order_by_signal(self, signal_id):
+        """按 signal_id 查委托（幂等键）。"""
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM orders WHERE signal_id = ?", (signal_id,))
+            return cur.fetchone()
 
     def order_by_id(self, order_id):
-        cur = self._conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
-        return cur.fetchone()
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
+            return cur.fetchone()
 
     def list_orders(self):
-        cur = self._conn.execute("SELECT * FROM orders ORDER BY created_at DESC")
-        return [dict(r) for r in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM orders ORDER BY created_at DESC")
+            return [dict(r) for r in cur.fetchall()]
+
+    def list_pending(self):
+        """全部未结算占位行（进程重启后仍 pending = 经历过下单窗口 crash，需人工确认）。"""
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM orders WHERE status = 'pending'")
+            return [dict(r) for r in cur.fetchall()]
 
     # ── positions ──
     def upsert_position(self, p):
@@ -137,10 +244,33 @@ class Store:
             )
             self._conn.commit()
 
+    def _fill_is_duplicate(self, f, cutoff):
+        """§G10 时间窗内相同 (order_id,side,price,qty) 视为通道重放。"""
+        if not f.get("order_id"):
+            return False
+        cur = self._conn.execute(
+            """SELECT 1 FROM fills
+               WHERE order_id = ? AND side = ? AND price = ? AND qty = ? AND traded_at >= ?
+               LIMIT 1""",
+            (f["order_id"], f.get("side", ""), float(f.get("price", 0) or 0),
+             int(f.get("qty", 0) or 0), cutoff),
+        )
+        return cur.fetchone() is not None
+
     def apply_fill(self, f):
-        """成交应用到持仓（买=加仓加权成本；卖=减仓/清仓删行）。返回更新后的持仓 dict 或 None。"""
+        """成交应用到持仓（买=加仓加权成本；卖=减仓/清仓删行）。
+
+        返回 (position_dict|None, is_duplicate:bool)。重复回报不改动持仓、不重复入 fills。
+        """
         fill_side = f.get("side", "")
+        cutoff = (datetime.now(CN_TZ) - timedelta(seconds=FILL_DEDUP_WINDOW_SEC)).strftime(
+            "%Y-%m-%dT%H:%M:%S")
         with self._lock:
+            if self._fill_is_duplicate(f, cutoff):
+                row = self._conn.execute(
+                    "SELECT * FROM real_positions WHERE ts_code = ?", (f["code"],)
+                ).fetchone()
+                return (dict(row) if row else None), True
             row = self._conn.execute(
                 "SELECT * FROM real_positions WHERE ts_code = ?", (f["code"],)
             ).fetchone()
@@ -164,15 +294,9 @@ class Store:
                            WHERE ts_code=?""",
                         (new_qty, new_cost, new_qty * f["price"], highest, f.get("traded_at", ""), f["code"]),
                     )
-                self._conn.execute(
-                    """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (f.get("order_id", ""), f["code"], fill_side, f["price"], f["qty"],
-                     f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", "")),
-                )
             else:
                 if row is None:
-                    return None
+                    return None, False
                 remain = row["qty"] - f["qty"]
                 if remain <= 0:
                     self._conn.execute(
@@ -184,27 +308,31 @@ class Store:
                            WHERE ts_code=?""",
                         (remain, remain * f["price"], f.get("traded_at", ""), f["code"]),
                     )
-                self._conn.execute(
-                    """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (f.get("order_id", ""), f["code"], fill_side, f["price"], f["qty"],
-                     f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", "")),
-                )
+            self._conn.execute(
+                """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (f.get("order_id", ""), f["code"], fill_side, f["price"], f["qty"],
+                 f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", "")),
+            )
             self._conn.commit()
             cur = self._conn.execute(
                 "SELECT * FROM real_positions WHERE ts_code = ?", (f["code"],)
             )
             row = cur.fetchone()
-            return dict(row) if row else None
+            return (dict(row) if row else None), False
 
     def list_positions(self):
-        cur = self._conn.execute(
-            "SELECT * FROM real_positions ORDER BY amount DESC"
-        )
-        return [dict(r) for r in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM real_positions ORDER BY amount DESC"
+            )
+            return [dict(r) for r in cur.fetchall()]
 
     def reconcile_positions(self, positions):
-        """全量对账：upsert 全部 + 删除不在集合内的持仓。返回新持仓数量。"""
+        """全量对账：upsert 全部 + 删除不在集合内的持仓。返回新持仓数量。
+
+        注意：空集合的删除语义由调用方（handler.on_positions）守卫——连续空快照才接受清空。
+        """
         codes = set()
         with self._lock:
             for p in positions:
@@ -224,6 +352,10 @@ class Store:
     def close(self):
         with self._lock:
             self._conn.close()
+
+
+def _now_cn():
+    return time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
 def json_default(o):
