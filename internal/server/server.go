@@ -416,6 +416,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/research/library/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleLibraryBacktest))
 	// §P2-f 参数优化：入队扫参 / 列表 / 审批（写规则覆盖+热重载）/ 淘汰
 	s.mux.HandleFunc("POST /api/backtest/optimize", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizeEnqueue))
+	// §D1 各战法独立寻优参数池：列表 + 保存（审批权限，服务端组合数护栏校验）
+	s.mux.HandleFunc("GET /api/research/sweep-pools", s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolList))
+	s.mux.HandleFunc("PUT /api/research/sweep-pools", s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolUpsert))
 	s.mux.HandleFunc("GET /api/research/optimizations", s.authMiddleware(s.handleOptimizationList))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationApprove))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationReject))

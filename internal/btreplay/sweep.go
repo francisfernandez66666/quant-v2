@@ -169,13 +169,23 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		klines[code] = toDataKLine(bars)
 	}
 
-	// ── 2) 逐战法独立优化 ──
+	// ── 2) 逐战法独立优化：四维步进网格 → 分批护栏 → 批冠军淘汰赛 → 冠军实盘口径复核 ──
+	// §OPTIMIZE_POOL_INTEGRATION_PLAN D2：
+	//   搜索空间 = 止盈线% × 止损线% × 持仓天数 × 门槛分数（sweep_pool_configs 可自定义，
+	//   未配置走内置默认池）；网格扫参统一用 uniformExitV2 轻量出场（触发预计算一次，
+	//   分数过滤在触发上做，不重跑 Trigger）；全组合按批(≤5000)切分，批内取最优为批冠军，
+	//   批冠军间按目标函数 PK 出全局冠军；冠军再经真实 adapter.Exit 回放一遍复核并标注。
 	for ai, ad := range ads {
 		fmt.Printf("\n══════════════════════════════════════════\n")
 		fmt.Printf("【%s】独立寻优\n", ad.Name())
 		fmt.Printf("══════════════════════════════════════════\n")
 
-		// 2a) 触发预计算
+		kind := ""
+		if kp, ok := ad.(kindProvider); ok {
+			kind = kp.Kind()
+		}
+
+		// 2a) 触发预计算（入场与出场参数无关，一次算完全程复用）
 		var trigs []sweepTrigger
 		for code, kls := range klines {
 			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code])...)
@@ -183,9 +193,16 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })
 		log.Printf("触发预算 %s：%d 个入场事件", ad.Name(), len(trigs))
 
-		// 2b) 组合枚举
-		pool := poolFor(ad.Name())
-		scores := []float64{0}
+		// 2b) 搜索空间解析：DB 配置优先，回退内置默认池
+		poolCfg := defaultPoolConfig(ad.Name())
+		if c, err := db.GetSweepPoolConfig(ad.Name()); err == nil && c != nil {
+			poolCfg = c // 用户自定义覆盖（PUT /api/research/sweep-pools）
+		}
+		tps := stepRangeF(poolCfg.TpFrom, poolCfg.TpTo, poolCfg.TpStep)
+		sls := stepRangeF(poolCfg.SlFrom, poolCfg.SlTo, poolCfg.SlStep)
+		holds := stepRangeI(poolCfg.HoldFrom, poolCfg.HoldTo, poolCfg.HoldStep)
+
+		// 门槛维：有连续入场分的战法用用户配置区间；无分战法只跑 0 档（配置无效自动降级）
 		hasScore := false
 		for _, t := range trigs {
 			if t.score >= 0 {
@@ -193,91 +210,132 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 				break
 			}
 		}
+		scores := []float64{0}
 		if hasScore {
-			var scs []float64
-			for _, t := range trigs {
-				if t.score >= 0 {
-					scs = append(scs, t.score)
-				}
-			}
-			if q := scoreQuantiles(scs); len(q) > 0 {
-				scores = q
-			}
+			scores = stepRangeF(poolCfg.ScoreFrom, poolCfg.ScoreTo, poolCfg.ScoreStep)
 		}
-		kind := ""
-		if kp, ok := ad.(kindProvider); ok {
-			kind = kp.Kind()
+
+		// 2c) 全组合枚举（指数级：|tp|×|sl|×|hold|×|score|，护栏由保存端校验 ≤10万）
+		type combo4 struct {
+			tp, sl, score float64
+			hold          int
 		}
-		type combo struct{ tp, sl, score float64 }
-		var combos []combo
-		for _, tp := range pool.tpRange {
-			for _, sl := range pool.slRange {
-				for _, s := range scores {
-					combos = append(combos, combo{tp, sl, s})
+		var combos []combo4
+		for _, tp := range tps {
+			for _, sl := range sls {
+				for _, h := range holds {
+					for _, s := range scores {
+						combos = append(combos, combo4{tp, sl, s, h})
+					}
 				}
 			}
 		}
-		fmt.Printf("参数组合：%d 组（止盈%d档×止损%d档×门槛%d档）\n",
-			len(combos), len(pool.tpRange), len(pool.slRange), len(scores))
+		fmt.Printf("搜索空间：%d 组合（止盈%d档×止损%d档×持仓%d档×门槛%d档）\n",
+			len(combos), len(tps), len(sls), len(holds), len(scores))
 
-		// 2c) 逐组合回测
-		var results []sweepResult
-		for ci, cb := range combos {
-			r := simulateCombo(ad, kind, o, klines, industryChg, cb.tp, cb.sl, pool.maxHold, cb.score)
-			r.ObjectiveScore = objectiveValue(obj, &r)
-			results = append(results, r)
-			pct := (ci + 1) * 100 / len(combos)
-			if pct > ci*100/len(combos) && pct%10 == 0 {
-				fmt.Printf("参数优化进度 %d%%\n", pct)
+		// 2d) 分批锦标赛：每批 ≤5000 全量模拟出批冠军，批冠军间 PK 出全局冠军
+		const batchSize = 5000                     // §护栏：单批组合上限（分批全量模拟，非抽样）
+		var champions []sweepResult                // champions[bi] = 第 bi 批冠军（值语义，避免切片扩容指针失效）
+		all := make([]sweepResult, 0, len(combos)) // 全量留存供热力网格聚合（10万条 ≈ 12MB）
+		done := 0
+		lastPct := -10
+		for bi := 0; bi*batchSize < len(combos); bi++ {
+			lo, hi := bi*batchSize, min((bi+1)*batchSize, len(combos))
+			bestInBatch := sweepResult{}
+			hasChamp := false
+			for ci := lo; ci < hi; ci++ {
+				cb := combos[ci]
+				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score)
+				r.ObjectiveScore = objectiveValue(obj, &r)
+				all = append(all, r)
+				cur := &all[len(all)-1]
+				if !hasChamp || betterOf(obj, cur, &bestInBatch) == cur {
+					bestInBatch = *cur
+					hasChamp = true
+				}
+				done++
+				if pct := done * 100 / len(combos); pct >= lastPct+10 {
+					lastPct = pct
+					fmt.Printf("参数优化进度 %d%%（第%d/%d批）\n", pct, bi+1, (len(combos)+batchSize-1)/batchSize)
+				}
+			}
+			if hasChamp {
+				champions = append(champions, bestInBatch)
 			}
 		}
-
-		// 2d) 战法内排名
-		best := &results[0]
-		for i := 1; i < len(results); i++ {
-			if objectiveValue(obj, &results[i]) > objectiveValue(obj, best) {
-				best = &results[i]
+		if len(all) == 0 {
+			fmt.Println("无有效组合。")
+			continue
+		}
+		// 批冠军终选（平局以触发数多者胜——与 betterOf 同口径）
+		global := champions[0]
+		for i := 1; i < len(champions); i++ {
+			if betterOf(obj, &champions[i], &global) == &champions[i] {
+				global = champions[i]
 			}
 		}
-		fmt.Printf("★ 最优：止盈%.0f%% 止损%.0f%% 兜底%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
+		best := &global
+
+		// 2e) 冠军实盘口径复核：真实 adapter.Exit 注入冠军参数后整库回放一遍。
+		// 网格用统一出场引擎保证四维梯度有效；复核让落地数字与实盘同口径、两种口径都留档。
+		verify := verifyChampion(ad, kind, o, klines, industryChg,
+			best.Trail, best.StopLossPct, best.Hold)
+		fmt.Printf("★ 冠军：止盈%.0f%% 止损%.0f%% 持仓%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
 			best.Trail, best.StopLossPct, best.Hold, best.MinScore, best.WinRate, best.ProfitFactor, best.Expectancy, best.Count)
+		fmt.Printf("✓ 实盘口径复核：胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
+			verify.WinRate, verify.ProfitFactor, verify.Expectancy, verify.Count)
 
-		// 2e) 网格输出
-		fmt.Println("\n止盈×止损网格（期望收益%）:")
-		tps := make([]float64, 0, len(pool.tpRange))
-		for _, t := range pool.tpRange {
-			tps = append(tps, t)
+		// 2f) 止盈×止损热力网格（格值=该格跨持仓/门槛的最优期望）+ 批次冠军明细
+		type gridCell struct {
+			Tp, Sl     float64 `json:"tp"`
+			Expectancy float64 `json:"expectancy"`
+			Triggers   int     `json:"triggers"`
 		}
-		sort.Float64s(tps)
+		gridMap := map[[2]float64]*gridCell{}
+		for i := range all {
+			r := &all[i]
+			key := [2]float64{r.Trail, r.StopLossPct}
+			g := gridMap[key]
+			if g == nil {
+				g = &gridCell{Tp: key[0], Sl: key[1], Expectancy: math.Inf(-1)}
+				gridMap[key] = g
+			}
+			if r.Expectancy > g.Expectancy {
+				g.Expectancy = r.Expectancy
+				g.Triggers = r.Count
+			}
+		}
+		grid := make([]gridCell, 0, len(gridMap))
+		for _, g := range gridMap {
+			grid = append(grid, *g)
+		}
+		sort.Slice(grid, func(a, b int) bool {
+			if grid[a].Tp != grid[b].Tp {
+				return grid[a].Tp < grid[b].Tp
+			}
+			return grid[a].Sl < grid[b].Sl
+		})
+
+		// 控制台热力图（人读）
+		fmt.Println("\n止盈×止损网格（跨持仓/门槛最优期望%）:")
 		fmt.Printf("止盈线→")
 		for _, tp := range tps {
 			fmt.Printf("  %5.0f%%", tp)
 		}
 		fmt.Println()
-		sls := make([]float64, 0, len(pool.slRange))
-		for _, s := range pool.slRange {
-			sls = append(sls, s)
-		}
-		sort.Float64s(sls)
 		for _, sl := range sls {
 			fmt.Printf("止损%4.0f%%  ", sl)
 			for _, tp := range tps {
-				bestExp := math.Inf(-1)
-				for _, r := range results {
-					if r.Trail == tp && r.StopLossPct == sl && r.Expectancy > bestExp {
-						bestExp = r.Expectancy
-					}
-				}
-				if math.IsInf(bestExp, -1) {
-					fmt.Printf("   —  ")
+				if g, ok := gridMap[[2]float64{tp, sl}]; ok && !math.IsInf(g.Expectancy, -1) {
+					fmt.Printf("%+5.2f%%", g.Expectancy)
 				} else {
-					fmt.Printf("%+5.2f%%", bestExp)
+					fmt.Printf("   —  ")
 				}
 			}
 			fmt.Println()
 		}
 
-		// 2f) 输出该战法的 SWEEP_JSON
+		// 2g) 输出该战法 SWEEP_JSON（worker 解析落库：冠军行 + grid/batches 附带信息）
 		jsonResult := map[string]any{
 			"rank": 1, "strategy": ad.Name(), "strategy_kind": kind,
 			"params":        map[string]any{"take_profit_pct": best.Trail, "stop_loss_pct": best.StopLossPct, "hold_days": best.Hold, "min_score": best.MinScore},
@@ -289,12 +347,28 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			"avg_loss_pct":  best.AvgLossPct,
 			"trigger_count": best.Count,
 			"avg_hold_days": best.AvgHold,
+			// 实盘口径复核数字（前端冠军卡展示，与网格口径并列）
+			"verify_win_rate":      verify.WinRate,
+			"verify_profit_factor": verify.ProfitFactor,
+			"verify_expectancy":    verify.Expectancy,
+			"verify_trigger_count": verify.Count,
+		}
+		batchList := make([]map[string]any, 0, len(champions))
+		for i, ch := range champions {
+			batchList = append(batchList, map[string]any{
+				"batch": i + 1,
+				"tp":    ch.Trail, "sl": ch.StopLossPct,
+				"hold_days": ch.Hold, "min_score": ch.MinScore,
+				"objective": ch.ObjectiveScore,
+			})
 		}
 		payload := struct {
-			Strategy  string `json:"strategy"`
-			Objective string `json:"objective"`
-			Results   []any  `json:"results"`
-		}{ad.Name(), obj, []any{jsonResult}}
+			Strategy  string           `json:"strategy"`
+			Objective string           `json:"objective"`
+			Batches   []map[string]any `json:"batches,omitempty"`
+			Grid      []gridCell       `json:"grid,omitempty"`
+			Results   []any            `json:"results"`
+		}{ad.Name(), obj, batchList, grid, []any{jsonResult}}
 		if bj, jerr := json.Marshal(payload); jerr == nil {
 			fmt.Printf("SWEEP_JSON:%s\n", bj)
 		}
@@ -559,4 +633,133 @@ func sweepMaxStocksLimit(maxStocks int) int {
 		limit = 50
 	}
 	return limit
+}
+
+// ── §D2 四维锦标赛寻优的辅助件 ──
+
+// betterOf 两结果按目标函数 PK（淘汰赛比较子）；平局以触发数多者胜（小样本让位）。
+func betterOf(obj string, a, b *sweepResult) *sweepResult {
+	va, vb := objectiveValue(obj, a), objectiveValue(obj, b)
+	if va != vb {
+		if va > vb {
+			return a
+		}
+		return b
+	}
+	if a.Count >= b.Count {
+		return a
+	}
+	return b
+}
+
+// simulateUniform 网格扫参专用轻量模拟：预计算触发 + uniformExitV2 统一出场。
+// 触发与出场参数无关 → 只在此处按门槛过滤/贪心不重叠/逐日出场扫描，
+// 单组合成本 O(触发数×平均持仓天数)，万级组合秒~分钟级完成。
+// English: grid-mode lightweight simulation — precomputed triggers filtered by threshold,
+// greedy non-overlapping entries, daily uniform exit walk; thousands of combos in seconds.
+func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string][]data.KLine,
+	takeProfitPct, stopLossPct float64, maxHold int, minScore float64) sweepResult {
+	res := sweepResult{Name: name, Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct,
+		Hold: maxHold, MinScore: minScore}
+	nextFree := map[string]int{} // code -> 可再入场最早下标（同股持仓期内不重复入场）
+	var winSum, lossSum float64
+	for _, t := range trigs {
+		if minScore > 0 && t.score >= 0 && t.score < minScore {
+			continue // 门槛过滤（score=-1 标记=无分维度，不过滤）
+		}
+		if t.sigIdx < nextFree[t.code] {
+			continue
+		}
+		exitJ, pnl := uniformExitV2(klines[t.code], t.sigIdx, t.entry, t.highest,
+			takeProfitPct, stopLossPct, 0, maxHold)
+		nextFree[t.code] = exitJ + 1
+		res.Count++
+		res.AvgHold += float64(exitJ - (t.sigIdx + 1))
+		if pnl > 0 {
+			res.Win++
+			winSum += pnl
+		} else {
+			res.Loss++
+			lossSum += pnl
+		}
+	}
+	finalizeResult(&res, winSum, lossSum)
+	return res
+}
+
+// finalizeResult 由胜负计数与盈亏和聚合出 胜率/均盈/均亏/盈亏比/期望（两种模拟共用口径）。
+func finalizeResult(res *sweepResult, winSum, lossSum float64) {
+	if res.Count == 0 {
+		return
+	}
+	res.AvgHold /= float64(res.Count)
+	if res.Win > 0 {
+		res.AvgWinPct = winSum / float64(res.Win)
+	}
+	if res.Loss > 0 {
+		res.AvgLossPct = lossSum / float64(res.Loss)
+	}
+	if res.Win+res.Loss > 0 {
+		res.WinRate = float64(res.Win) / float64(res.Win+res.Loss) * 100
+	}
+	if lossSum != 0 {
+		res.ProfitFactor = winSum / -lossSum
+	}
+	wr := res.WinRate / 100
+	res.Expectancy = wr*res.AvgWinPct + (1-wr)*res.AvgLossPct
+}
+
+// stepRangeF 浮点步进序列（止盈/止损/门槛维），含起终点；非法输入回退单档。
+func stepRangeF(from, to, step float64) []float64 {
+	if step <= 0 || to < from {
+		return []float64{from}
+	}
+	out := make([]float64, 0, int((to-from)/step)+1)
+	for v := from; v <= to+0.001; v += step {
+		out = append(out, math.Round(v*100)/100)
+	}
+	return out
+}
+
+// verifyChampion 冠军实盘口径复核：把冠军参数注入该战法真实 adapter.Exit 后整库回放一遍。
+// 直接复用 simulateCombo（applyComboParams 注入+恢复、backtestStock 走战法原生出场逻辑）。
+func verifyChampion(ad adapter, kind string, o *Options, klines map[string][]data.KLine,
+	industryChg map[string]map[string]float64, tp, sl float64, holdDays int) sweepResult {
+	return simulateCombo(ad, kind, o, klines, industryChg, tp, sl, holdDays, 0)
+}
+
+// stepRangeI 整数步进序列（持仓天数维），含起终点；非法输入回退单档。
+func stepRangeI(from, to, step int) []int {
+	if step <= 0 || to < from {
+		return []int{from}
+	}
+	out := make([]int, 0, (to-from)/step+1)
+	for v := from; v <= to; v += step {
+		out = append(out, v)
+	}
+	return out
+}
+
+// defaultPoolConfig 内置默认池 → DB 配置结构（引擎侧统一消费 SweepPoolConfig；
+// 步长由相邻两档差值推导，单档维度按 1 计）。门槛默认 40~95 步进 5。
+func defaultPoolConfig(name string) *store.SweepPoolConfig {
+	p := poolFor(name)
+	derive := func(r []float64) (from, to, step float64) {
+		if len(r) == 0 {
+			return 0, 0, 1
+		}
+		if len(r) == 1 {
+			return r[0], r[0], 1
+		}
+		return r[0], r[len(r)-1], r[1] - r[0]
+	}
+	tpFrom, tpTo, tpStep := derive(p.tpRange)
+	slFrom, slTo, slStep := derive(p.slRange)
+	return &store.SweepPoolConfig{
+		Strategy: name,
+		TpFrom:   tpFrom, TpTo: tpTo, TpStep: tpStep,
+		SlFrom: slFrom, SlTo: slTo, SlStep: slStep,
+		HoldFrom: 2, HoldTo: p.maxHold, HoldStep: 2,
+		ScoreFrom: 40, ScoreTo: 95, ScoreStep: 5,
+	}
 }

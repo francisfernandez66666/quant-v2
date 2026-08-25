@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"strconv"
 
+	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
@@ -57,11 +58,29 @@ func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
 const optTaskRefID int64 = 990
 
 // handleOptimizationList 处理 GET /api/research/optimizations。
+// §B 每行附加「模拟盘实测」：按 战法→池 映射取池级真实绩效（胜率/期望/成交笔数），
+// 前端与回测最优并排对比——回测冠军是否在模拟盘复现一眼可见。
 func (s *Server) handleOptimizationList(w http.ResponseWriter, r *http.Request) {
 	list, err := s.researchDB.ListOptimizations(20)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	pe := s.paperEngineFor(requestUserID(r))
+	for _, task := range list {
+		results, _ := task["results"].([]*store.OptimizationResult)
+		for _, row := range results {
+			poolKey := paper.PoolKeyForStrategy(row.Strategy, row.StrategyKind)
+			if poolKey == "" || pe == nil {
+				continue // 其他池（手动/兜底）不下发也不回显
+			}
+			st := pe.PoolStats(poolKey)
+			row.PoolStats = &store.PoolLiveStats{
+				WinRatePct: st.WinRatePct,
+				Expectancy: st.Expectancy,
+				FilledBuys: st.FilledBuys,
+			}
+		}
 	}
 	writeJSON(w, 200, map[string]any{"optimizations": list})
 }
@@ -87,6 +106,9 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 			writeError(w, 400, err.Error())
 			return
 		}
+		// §A2 寻优门槛下发池纪律（用户拍板）：内置信号 Confidence 即 D1 分，
+		// 与寻优的分位门槛同口径——写入对应战法池 MinScore，模拟盘入场按最优门槛过滤。
+		s.applyPoolMinScore(requestUserID(r), row)
 		_ = s.researchDB.UpdateOptimizationStatus(id, "approved")
 		writeJSON(w, 200, map[string]any{"status": "approved", "id": id})
 		return
@@ -98,7 +120,23 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 	}
 	_ = s.researchDB.UpdateOptimizationStatus(id, "approved")
 	s.reloadRulesByKind(row.StrategyKind) // 热重载对应库文件，实盘即时生效
+	// §A2 库规则行同样把门槛下发 factor/pattern 池纪律（模拟盘入场同步过滤）
+	s.applyPoolMinScore(requestUserID(r), row)
 	writeJSON(w, 200, map[string]any{"status": "approved", "id": id})
+}
+
+// applyPoolMinScore 把寻优排名行的门槛分数写入对应模拟盘战法池的买入纪律（§A2）。
+// 映射失败（未知战法→"" 其他池）静默跳过——其他池是手动/兜底池，不自动改纪律。
+// English: pushes an optimization row's min_score into the matching paper pool's buy discipline;
+// silently skips unmappable strategies — the "other" pool is manual/fallback and never auto-tuned.
+func (s *Server) applyPoolMinScore(userID string, row *store.OptimizationResult) {
+	poolKey := paper.PoolKeyForStrategy(row.Strategy, row.StrategyKind)
+	if poolKey == "" {
+		return
+	}
+	if pe := s.paperEngineFor(userID); pe != nil {
+		pe.ApplyPoolMinScore(poolKey, row.Params.MinScore)
+	}
 }
 
 // handleOptimizationReject 处理 POST /api/research/optimizations/{id}/reject。

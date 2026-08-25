@@ -88,10 +88,10 @@
     </div>
     </div>
 
-    <!-- §P2-e 子视图：参数寻优结果（完整表格 + 一键入库） -->
+    <!-- §D3 子视图：参数寻优结果——分战法 tab（chips）+ 冠军卡 + 热力网格 + 参数池/纪律编辑 -->
     <div class="library-panel" v-show="candSubTab === 'optimize'">
       <div class="library-header">
-        <div class="library-title">参数寻优结果<span style="font-size:12px;color:var(--muted,#888)">（全库战法 × 止盈线×止损线×兜底天数×门槛，盘后执行）</span></div>
+        <div class="library-title">参数寻优中心<span style="font-size:12px;color:var(--muted,#888)">（每战法独立寻优池：止盈×止损×持仓×门槛 步进网格，批内选优+批间 PK）</span></div>
         <div style="display:flex;gap:8px;align-items:center">
           <select v-model="optObjective" class="bt-select" style="width:auto;padding:4px 8px">
             <option value="profitFactor">目标：盈亏比</option>
@@ -105,80 +105,148 @@
           <button class="btn-refresh" @click="loadOptimizations">刷新</button>
         </div>
       </div>
+
+      <!-- 战法 chips（仿模拟盘分仓条）：名称 + 最优期望徽标 -->
+      <div class="opt-chips" v-if="optStrategies.length">
+        <button v-for="s in optStrategies" :key="s.key"
+                :class="['tab', 'opt-chip', optSelected === s.key ? 'active' : '']"
+                @click="optSelected = s.key">
+          {{ s.label }}
+          <em :style="(s.bestExp ?? 0) >= 0 ? 'color:#22c55e' : 'color:#ef4444'">
+            {{ s.bestExp !== null ? ((s.bestExp >= 0 ? '+' : '') + fmtNum(s.bestExp, 2) + '%') : '' }}
+          </em>
+        </button>
+      </div>
+
       <div v-if="loadingOpts" class="empty">加载中...</div>
-      <div v-else-if="optTasks.length === 0" class="empty">
+      <div v-else-if="!optCur" class="empty">
         暂无寻优结果——点右上「发起全库寻优」，任务进研究队列，完成后排名自动落库到这里。
       </div>
+
+      <!-- ══ 选中战法的详情视图 ══ -->
       <template v-else>
-        <div v-for="t in optTasks" :key="t.task_id">
-          <div class="lib-group-title">
-            任务 #{{ t.task_id }} · 目标 {{ objLabel(t.objective) }} · {{ (t.results||[]).length }} 条排名
+        <!-- 冠军卡：四参数 + 回测指标 + 实盘口径复核 + 模拟盘实测 -->
+        <div class="opt-champion">
+          <div class="oc-head">
+            <span class="oc-name">{{ optCur.strategy }}</span>
+            <span v-if="!optCur.strategy_kind" class="tag tag-kind kind-factor">内置</span>
+            <span class="tag" v-if="optCur.status==='approved'" style="background:#22c55e;color:#fff">已应用</span>
+            <span class="tag" v-else-if="optCur.status==='rejected'" style="background:#666;color:#fff">已淘汰</span>
+            <span v-else style="flex:1"></span>
+            <template v-if="optCur.status === 'pending'">
+              <button v-if="optCur.strategy_kind" class="btn-toggle" @click="approveOpt(optCur)">加入战法库</button>
+              <button v-else class="btn-toggle" @click="approveOpt(optCur)"
+                      title="写入该战法的止盈线/止损线/持仓天（config 热生效），门槛同步下发对应资金池纪律">应用参数</button>
+              <button class="btn-reject" style="margin-left:6px" @click="rejectOpt(optCur)">淘汰</button>
+            </template>
+            <button class="btn-toggle" style="margin-left:auto" @click="toggleDrawer">
+              ⚙ 参数池 / 池纪律
+            </button>
           </div>
-          <table class="opt-table">
+          <div class="oc-grid">
+            <div class="oc-item"><label>止盈线</label><b>{{ fmtNum((optCur.params||{}).take_profit_pct) }}%</b></div>
+            <div class="oc-item"><label>止损线</label><b>{{ fmtNum((optCur.params||{}).stop_loss_pct) }}%</b></div>
+            <div class="oc-item"><label>持仓天数</label><b>{{ fmtNum((optCur.params||{}).hold_days) }}天</b></div>
+            <div class="oc-item"><label>门槛分数</label><b>{{ (optCur.params||{}).min_score ? fmtNum(optCur.params.min_score) : '—' }}</b></div>
+            <div class="oc-item"><label>胜率</label><b>{{ fmtNum(optCur.win_rate,1) }}%</b></div>
+            <div class="oc-item"><label>盈亏比</label><b>{{ fmtNum(optCur.profit_factor,2) }}</b></div>
+            <div class="oc-item"><label>期望收益</label>
+              <b :style="optCur.expectancy >= 0 ? 'color:#22c55e' : 'color:#ef4444'">{{ fmtNum(optCur.expectancy,2) }}%</b></div>
+            <div class="oc-item" title="冠军参数注入该战法真实出场逻辑后的整库回放数字（与实盘同口径）">
+              <label>实盘复核</label>
+              <b v-if="optCur.verify_expectancy !== undefined">{{ fmtNum(optCur.verify_win_rate,1) }}% / {{ fmtNum(optCur.verify_profit_factor,2) }} / {{ fmtNum(optCur.verify_expectancy,2) }}%</b>
+              <b v-else>—</b>
+            </div>
+            <div class="oc-item" v-if="optCur.pool_stats" title="对应模拟盘资金池实测">
+              <label>模拟盘实测</label>
+              <b>{{ fmtNum(optCur.pool_stats.win_rate_pct,1) }}% / {{ optCur.pool_stats.expectancy >= 0 ? '+' : '' }}{{ fmtNum(optCur.pool_stats.expectancy,2) }}% / {{ optCur.pool_stats.filled_buys }}笔</b>
+            </div>
+          </div>
+          <div class="oc-note">出场规则：盈利达止盈线即时卖 + 亏损达止损线即时卖 + 超持仓天兜底离场；门槛仅对有连续入场分的战法生效。</div>
+        </div>
+
+        <!-- 止盈×止损热力网格（格值=跨持仓/门槛最优期望，颜色=正负深浅） -->
+        <div class="lib-group-title" style="margin-top:10px">止盈×止损 热力网格<span style="font-size:11px;color:var(--muted,#888)">（格值 %：该格跨持仓/门槛最优期望；点击格高亮）</span></div>
+        <div v-if="optCurHeat.rows.length" style="overflow-x:auto">
+          <table class="heat-table">
             <thead>
-              <tr><th>#</th><th>战法</th><th>止盈线</th><th>止损线</th><th>兜底</th><th>门槛</th><th>胜率</th><th>盈亏比</th><th>期望</th><th>触发</th><th>状态</th><th>操作</th></tr>
+              <tr><th>止盈\止损</th><th v-for="sl in optCurHeat.sls" :key="'h'+sl">{{ fmtNum(sl) }}%</th></tr>
             </thead>
             <tbody>
-              <!-- §白屏根因修复：详情行与主行必须在同一个 v-for 作用域内——
-                   此前详情 tr 写在 v-for 外却引用 r.id，编译回退 _ctx.r=undefined，
-                   切到本视图即抛 TypeError 卸载整树（白屏实录，无头复现定位） -->
-              <template v-for="r in t.results" :key="r.id">
-              <tr>
-                <td>{{ r.rank }}</td>
-                <td>{{ r.strategy }}<span v-if="!r.strategy_kind" class="tag tag-kind kind-factor" style="margin-left:6px">内置</span></td>
-                <td>{{ fmtNum((r.params || {}).take_profit_pct) }}%</td>
-                <td>{{ fmtNum((r.params || {}).stop_loss_pct) }}%</td>
-                <td>{{ fmtNum((r.params || {}).hold_days) }}天</td>
-                <td>{{ (r.params || {}).min_score ? fmtNum(r.params.min_score) : '—' }}</td>
-                <td>{{ fmtNum(r.win_rate, 1) }}%</td>
-                <td>{{ fmtNum(r.profit_factor, 2) }}</td>
-                <td :style="fmtNum(r.expectancy,2) !== '-' ? (r.expectancy >= 0 ? 'color:#22c55e;font-weight:700' : 'color:#ef4444;font-weight:700') : ''">
-                  {{ fmtNum(r.expectancy, 2) }}%
-                </td>
-                <td>{{ r.trigger_count }}</td>
-                <td>
-                  <span v-if="r.status==='approved'" class="tag status-applied">已入库</span>
-                  <span v-else-if="r.status==='rejected'" style="color:var(--muted,#888)">已淘汰</span>
-                  <span v-else style="color:var(--muted,#888)">待审批</span>
-                </td>
-                <td style="white-space:nowrap">
-                  <button class="btn-toggle" style="margin-right:6px" @click="toggleOptDetail(r.id)">
-                    {{ optDetailOpen === r.id ? '收起' : '详情' }}
-                  </button>
-                  <template v-if="r.status === 'pending'">
-                    <button v-if="r.strategy_kind" class="btn-toggle"
-                            @click="approveOpt(r)">加入战法库</button>
-                    <button v-else class="btn-toggle" @click="approveOpt(r)"
-                            title="写入该战法的止盈线%与止损线%（config 热生效，原有个股规则不变）">应用参数</button>
-                    <button class="btn-reject" style="margin-left:6px" @click="rejectOpt(r)">淘汰</button>
-                  </template>
+              <tr v-for="tp in optCurHeat.tps" :key="'r'+tp">
+                <th>{{ fmtNum(tp) }}%</th>
+                <td v-for="sl in optCurHeat.sls" :key="'c'+tp+'-'+sl"
+                    :style="{ background: heatColor(heatVal(tp, sl)) }"
+                    :title="'止盈' + tp + '% / 止损' + sl + '%'">
+                  {{ heatVal(tp, sl) !== null ? fmtNum(heatVal(tp, sl), 2) : '—' }}
                 </td>
               </tr>
-              <!-- §过程数据明细：胜/负/平均盈亏/平均持仓（点「详情」展开） -->
-              <tr v-if="optDetailOpen === r.id">
-                <td></td>
-                <td colspan="10" style="background:var(--bg,#f8fafc)">
-                  <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px;padding:4px 0">
-                    <span>盈利 <b class="pos">{{ r.win }}</b> 笔</span>
-                    <span>亏损 <b class="neg">{{ r.loss }}</b> 笔</span>
-                    <span>平均盈利 <b class="pos">+{{ fmtNum(r.avg_win_pct, 2) }}%</b></span>
-                    <span>平均亏损 <b class="neg">{{ fmtNum(r.avg_loss_pct, 2) }}%</b></span>
-                    <span>平均持仓 <b>{{ fmtNum(r.avg_hold_days, 1) }}</b> 天</span>
-                    <span>目标函数值 <b>{{ fmtNum(r.profit_factor, 2) }}</b></span>
-                    <span style="font-weight:700;color:#0f172a">每笔期望 <b>{{ fmtNum(r.expectancy, 2) >= 0 ? '+' : '' }}{{ fmtNum(r.expectancy, 2) }}%</b></span>
-                  </div>
-                  <div style="font-size:11px;color:var(--muted,#888);padding-bottom:2px">
-                    出场规则：盈利达止盈线 {{ fmtNum((r.params || {}).take_profit_pct) }}% 即时卖出 + 亏损达止损线 {{ fmtNum((r.params || {}).stop_loss_pct) }}% 即时卖出 + 超 {{ fmtNum((r.params || {}).hold_days) }} 天兜底强制离场。
-                  </div>
-                </td>
-              </tr>
-              </template>
             </tbody>
           </table>
+        </div>
+        <div v-else class="empty" style="padding:8px">本行无网格数据（旧任务产物，重新寻优后生成）。</div>
+
+        <!-- 批次冠军明细（淘汰赛过程，折叠） -->
+        <details v-if="optCurBatches.length" style="margin-top:8px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--muted,#888)">批次冠军明细（{{ optCurBatches.length }} 批淘汰赛过程）</summary>
+          <table class="opt-table" style="margin-top:6px">
+            <thead><tr><th>批</th><th>止盈%</th><th>止损%</th><th>持仓天</th><th>门槛</th><th>目标值</th></tr></thead>
+            <tbody>
+              <tr v-for="b in optCurBatches" :key="'b'+b.batch">
+                <td>#{{ b.batch }}</td><td>{{ fmtNum(b.tp) }}</td><td>{{ fmtNum(b.sl) }}</td>
+                <td>{{ fmtNum(b.hold_days) }}</td><td>{{ fmtNum(b.min_score) }}</td>
+                <td>{{ fmtNum(b.objective, 3) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </details>
+
+        <!-- ⚙ 设置抽屉：寻优参数池 + 对应资金池买入纪律（§A3 自动研究侧入口） -->
+        <div v-if="optDrawerOpen" class="opt-drawer">
+          <div class="lib-group-title">该战法寻优参数池（步进搜索空间，保存后下次寻优生效）</div>
+          <div class="drawer-grid4">
+            <label>止盈起<input v-model.number="cfgSweep.tp_from" type="number" step="1"></label>
+            <label>止盈终<input v-model.number="cfgSweep.tp_to" type="number" step="1"></label>
+            <label>步长<input v-model.number="cfgSweep.tp_step" type="number" step="1" min="0.5"></label>
+          </div>
+          <div class="drawer-grid4">
+            <label>止损起<input v-model.number="cfgSweep.sl_from" type="number" step="1"></label>
+            <label>止损终<input v-model.number="cfgSweep.sl_to" type="number" step="1"></label>
+            <label>步长<input v-model.number="cfgSweep.sl_step" type="number" step="1" min="0.5"></label>
+          </div>
+          <div class="drawer-grid4">
+            <label>持仓起(天)<input v-model.number="cfgSweep.hold_from" type="number" step="1"></label>
+            <label>持仓终(天)<input v-model.number="cfgSweep.hold_to" type="number" step="1"></label>
+            <label>步长(天)<input v-model.number="cfgSweep.hold_step" type="number" step="1" min="1"></label>
+          </div>
+          <div class="drawer-grid4">
+            <label>门槛起<input v-model.number="cfgSweep.score_from" type="number" step="5"></label>
+            <label>门槛终<input v-model.number="cfgSweep.score_to" type="number" step="5"></label>
+            <label>步长<input v-model.number="cfgSweep.score_step" type="number" step="1" min="1"></label>
+          </div>
+          <div style="font-size:12px;margin:6px 0">
+            预估组合数 <b>{{ sweepComboEstimate.toLocaleString() }}</b>（引擎按 ≤5000/批 分批全量模拟后批冠军 PK）
+            <span v-if="sweepComboEstimate > 100000" style="color:#ef4444">超上限 100000，请放宽步长</span>
+          </div>
+          <button class="btn-confirm" @click="saveSweepPool">保存参数池</button>
+
+          <div class="lib-group-title" style="margin-top:14px">对应资金池买入纪律（模拟盘实时生效）</div>
+          <div class="drawer-grid4">
+            <label>日限买<input v-model.number="cfgRule.max_daily_buys" type="number" min="0" step="1"></label>
+            <label>冷却(分)<input v-model.number="cfgRule.cooldown_minutes" type="number" min="0" step="5"></label>
+            <label>最低分<input v-model.number="cfgRule.min_score" type="number" min="0" max="100" step="1"></label>
+            <label>日预算%<input v-model.number="cfgRule.budget_pct_per_day" type="number" min="0" max="100" step="5"></label>
+          </div>
+          <div style="font-size:11px;color:var(--muted,#888);margin:4px 0">
+            目标池：<b>{{ optCurPoolKey || '（未知战法不下发）' }}</b>；全零=清除该池纪律。寻优审批会自动把门槛写入此处的「最低评分」。
+          </div>
+          <button class="btn-confirm" @click="savePoolDiscipline">保存池纪律</button>
         </div>
       </template>
     </div>
     </template>
+
+    <!-- ══════════ Tab 2: 战法库 ══════════ -->
 
     <!-- ══════════ Tab 2: 战法库 ══════════ -->
     <template v-else-if="activeTab === 'library'">
@@ -1221,6 +1289,144 @@ const loadingOpts = ref(false)
 // 寻优任务刚入队的提示态
 const optLaunching = ref(false)
 
+// ── §D3 分战法 tab 视图 ──
+const optSelected = ref('')             // 当前选中的战法 key（strategy_kind || strategy）
+const optDrawerOpen = ref(false)        // 设置抽屉（参数池 + 池纪律）开关
+const cfgSweep = ref({})                // 参数池编辑器绑定（四组 from/to/step）
+const cfgRule = ref({})                 // 池纪律编辑器绑定（四字段）
+
+/** 战法 chips 数据源：最新一次任务的全部战法行（key/label/最优期望徽标）。 */
+const optStrategies = computed(() => {
+  if (!optTasks.value.length) return []
+  const rows = optTasks.value[0].results || []
+  return rows.map(r => ({
+    key: r.strategy_kind || r.strategy,
+    label: r.strategy,
+    bestExp: (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null,
+  }))
+})
+
+/** 当前选中战法的最新一行排名（跨任务取最新，含 grid_json/pool_stats/verify_* 附加数据）。 */
+const optCur = computed(() => {
+  for (const t of optTasks.value) {
+    const hit = (t.results || []).find(r => (r.strategy_kind || r.strategy) === optSelected.value)
+    if (hit) return { ...hit, task_id: t.task_id }
+  }
+  return null
+})
+
+/** 热力网格解析：grid_json → {tps[], sls[], map}（tp,sl → 最优期望）。 */
+const optCurHeat = computed(() => {
+  const empty = { tps: [], sls: [], map: {} }
+  if (!optCur.value || !optCur.value.grid_json) return empty
+  try {
+    const extra = JSON.parse(optCur.value.grid_json)
+    const cells = extra.grid || []
+    const tps = [...new Set(cells.map(c => Number(c.tp)))].sort((a, b) => a - b)
+    const sls = [...new Set(cells.map(c => Number(c.sl)))].sort((a, b) => a - b)
+    const map = {}
+    cells.forEach(c => { map[c.tp + '|' + c.sl] = c.expectancy })
+    return { tps, sls, map }
+  } catch { return empty }
+})
+function heatVal(tp, sl) {
+  const v = optCurHeat.value.map[tp + '|' + sl]
+  return (v === undefined || v === null) ? null : v
+}
+/** 热力格颜色：期望越高越绿、越低越红，零附近中性。 */
+function heatColor(exp) {
+  if (exp === null || exp === undefined) return 'transparent'
+  const clamped = Math.max(-5, Math.min(5, exp))
+  const alpha = 0.12 + Math.abs(clamped) / 5 * 0.55
+  return clamped >= 0 ? `rgba(34,197,94,${alpha.toFixed(2)})` : `rgba(239,68,68,${alpha.toFixed(2)})`
+}
+
+/** 批次冠军明细（淘汰赛过程）。 */
+const optCurBatches = computed(() => {
+  if (!optCur.value || !optCur.value.grid_json) return []
+  try { return JSON.parse(optCur.value.grid_json).batches || [] } catch { return [] }
+})
+
+/** 当前战法对应的模拟盘池 key（与后端 PoolKeyForStrategy 同口径的前端映射）。 */
+const optCurPoolKey = computed(() => {
+  if (!optCur.value) return ''
+  if ((optCur.value.strategy_kind || '').startsWith('fac_')) return 'factor'
+  if ((optCur.value.strategy_kind || '').startsWith('pat_')) return 'pattern'
+  return ({ '双响炮': 'double_bump', '龙头': 'dragon', 'N形': 'n_shape', '龙回头': 'dragon_return' })[optCur.value.strategy] || ''
+})
+
+/** 参数池组合数实时预估（四维档数乘积；与后端 ComboCount 同公式）。 */
+const sweepComboEstimate = computed(() => {
+  const c = cfgSweep.value
+  const nF = (f, t, s) => (s > 0 && t >= f) ? Math.round((t - f) / s) + 1 : 1
+  const nI = (f, t, s) => (s > 0 && t >= f) ? Math.floor((t - f) / s) + 1 : 1
+  return nF(+c.tp_from||0, +c.tp_to||0, +c.tp_step||0) *
+         nF(+c.sl_from||0, +c.sl_to||0, +c.sl_step||0) *
+         nI(+c.hold_from||0, +c.hold_to||0, +c.hold_step||0) *
+         nF(+c.score_from||0, +c.score_to||0, +c.score_step||0)
+})
+
+/** 打开设置抽屉：拉取已保存配置（无则用通用默认），池纪律预填当前生效值。 */
+async function toggleDrawer() {
+  if (optDrawerOpen.value) { optDrawerOpen.value = false; return }
+  // 默认空间（未配置过的战法走这套）
+  cfgSweep.value = {
+    tp_from: 5, tp_to: 30, tp_step: 5,
+    sl_from: 3, sl_to: 15, sl_step: 3,
+    hold_from: 2, hold_to: 30, hold_step: 2,
+    score_from: 40, score_to: 95, score_step: 5,
+  }
+  try {
+    const res = await api.fetchSweepPools()
+    const mine = (res.pools || []).find(p => p.strategy === (optCur.value ? optCur.value.strategy : ''))
+    if (mine) cfgSweep.value = { ...cfgSweep.value, ...mine,
+      tp_from: mine.tp_from, tp_to: mine.tp_to, tp_step: mine.tp_step,
+      sl_from: mine.sl_from, sl_to: mine.sl_to, sl_step: mine.sl_step,
+      hold_from: mine.hold_from, hold_to: mine.hold_to, hold_step: mine.hold_step,
+      score_from: mine.score_from, score_to: mine.score_to, score_step: mine.score_step }
+  } catch { /* 静默降级用默认 */ }
+  // 池纪律预填：从模拟盘池快照读当前生效规则
+  cfgRule.value = { max_daily_buys: 0, cooldown_minutes: 0, min_score: 0, budget_pct_per_day: 0 }
+  try {
+    const ps = await api.fetchPaperState()
+    const pk = optCurPoolKey.value
+    const pool = ((ps.strategy_pools) || []).find(p => p.key === pk)
+    if (pool && pool.buy_rule) cfgRule.value = {
+      max_daily_buys: pool.buy_rule.max_daily_buys || 0,
+      cooldown_minutes: pool.buy_rule.cooldown_minutes || 0,
+      min_score: pool.buy_rule.min_score || 0,
+      budget_pct_per_day: pool.buy_rule.budget_pct_per_day || 0,
+    }
+  } catch { /* 模拟盘不可用时静默 */ }
+  optDrawerOpen.value = true
+}
+
+/** 保存该战法参数池（服务端护栏校验组合数上限）。 */
+async function saveSweepPool() {
+  if (!optCur.value) return
+  try {
+    const res = await api.saveSweepPool({ strategy: optCur.value.strategy, ...cfgSweep.value })
+    alert(`参数池已保存——预估 ${Number(res.combos).toLocaleString()} 组合`)
+  } catch (e) { alert('保存失败: ' + (e.message || e)) }
+}
+
+/** 保存对应资金池买入纪律（全零=清除；复用 paper pool/config API 的 pool_rules）。 */
+async function savePoolDiscipline() {
+  const pk = optCurPoolKey.value
+  if (!pk) { alert('未知战法无法映射资金池'); return }
+  const r = cfgRule.value
+  const rule = {
+    max_daily_buys: parseInt(r.max_daily_buys, 10) || 0,
+    cooldown_minutes: parseInt(r.cooldown_minutes, 10) || 0,
+    min_score: parseFloat(r.min_score) || 0,
+    budget_pct_per_day: parseFloat(r.budget_pct_per_day) || 0,
+  }
+  try {
+    await api.configPaperPools(null, null, null, { [pk]: rule })
+    alert('池纪律已保存并即时生效')
+  } catch (e) { alert('保存失败: ' + (e.message || e)) }
+}
+
 // ═══ §反馈：回测行参数显示 + 指标说明 + 规则化改进建议 ═══
 const showMetricHelp = ref(false)
 // 当前展开改进建议的回测任务 id（0=无）
@@ -1705,6 +1911,26 @@ function stopPolling() {
  /* §P2-e 优化结果表格 */
  .opt-table { width:100%; border-collapse:collapse; font-size:12px; margin-bottom:14px; }
  .opt-table th, .opt-table td { padding:6px 8px; border-bottom:1px solid var(--border,#eee); text-align:left; }
+.opt-live { display:flex; flex-direction:column; gap:1px; font-size:11px; white-space:nowrap; }
+/* §D3 分战法 tab 视图 */
+.opt-chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+.opt-chip { padding:5px 14px; font-size:13px; border-radius:16px; border:1px solid var(--border,#ddd); background:transparent; cursor:pointer; }
+.opt-chip.active { background:#0f172a; color:#fff; border-color:#0f172a; }
+.opt-chip em { font-style:normal; margin-left:6px; font-size:12px; font-weight:700; }
+.opt-champion { border:1px solid var(--border,#eee); border-radius:10px; padding:12px 14px; margin-bottom:8px; }
+.oc-head { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+.oc-name { font-size:16px; font-weight:800; color:#0f172a; }
+.oc-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:8px 14px; }
+.oc-item label { display:block; font-size:11px; color:var(--muted,#888); }
+.oc-item b { font-size:15px; color:#0f172a; }
+.oc-note { font-size:11px; color:var(--muted,#888); margin-top:10px; }
+.heat-table { border-collapse:collapse; font-size:11px; }
+.heat-table th, .heat-table td { border:1px solid var(--border,#e5e7eb); padding:4px 8px; text-align:center; min-width:52px; }
+.heat-table thead th { background:var(--bg,#f8fafc); }
+.opt-drawer { border:1px dashed var(--border,#cbd5e1); border-radius:10px; padding:12px 14px; margin-top:10px; background:var(--bg,#fafafa); }
+.drawer-grid4 { display:grid; grid-template-columns:repeat(3,1fr); gap:6px 12px; margin-bottom:8px; }
+.drawer-grid4 label { display:flex; flex-direction:column; gap:2px; font-size:11px; color:var(--muted,#666); }
+.drawer-grid4 input { padding:4px 8px; border-radius:6px; border:1px solid var(--border,#ddd); font-size:12px; width:100%; }
  .opt-table th { color:var(--muted,#666); font-weight:600; background:var(--bg,#f8fafc); }
  .opt-table tr:hover td { background:rgba(59,130,246,.04); }
  .lib-verify-help { font-size:11px; color:#475569; background:#f1f5f9; border-radius:6px;

@@ -119,7 +119,8 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 		var payload struct {
 			Strategy  string           `json:"strategy"`
 			Objective string           `json:"objective"`
-			Total     int              `json:"total"`
+			Batches   []map[string]any `json:"batches"`
+			Grid      []map[string]any `json:"grid"`
 			Results   []map[string]any `json:"results"`
 		}
 		if err := json.Unmarshal([]byte(m[1]), &payload); err != nil {
@@ -129,6 +130,15 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 		if err := db.SaveOptimizationResults(taskID, payload.Objective, payload.Results); err != nil {
 			log.Printf("[scheduler] 任务 #%d 扫参排名落库失败: %v", taskID, err)
 			continue
+		}
+		// §D2 冠军行附带信息（热力网格 + 批次冠军明细）回写 grid_json，前端详情渲染源
+		if len(payload.Grid) > 0 || len(payload.Batches) > 0 {
+			if extra, jerr := json.Marshal(map[string]any{
+				"grid": payload.Grid, "batches": payload.Batches,
+			}); jerr == nil && len(payload.Results) > 0 {
+				strategy, _ := payload.Results[0]["strategy"].(string)
+				_ = db.UpdateOptimizationGrid(taskID, strategy, string(extra))
+			}
 		}
 		log.Printf("[scheduler] 任务 #%d 扫参排名已落库：%s %d 条（目标 %s）",
 			taskID, payload.Strategy, len(payload.Results), payload.Objective)

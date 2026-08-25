@@ -235,12 +235,11 @@ type Stats struct {
 // 收益仍记该池），卖出按实现盈亏累计，浮动盈亏按当前持仓现价估算；
 // 总涨跌幅 = (已实现 + 浮动) / 累计买入成本。Stats 为该池独立的绩效/信号质量汇总（前端
 // 切换到该池 tab 时，页顶统计卡/信号质量卡据此展示，与全局统计并列）。
+// BuyRule 为该池当前生效的买入纪律（§A3 前端预填；nil=未设置纪律，仅受全局约束）。
 // English: one strategy cash pool's display snapshot (frontend allocation strip).
-// Cost/Realized/Floating/ReturnPct are the pool's persisted cumulative performance: buys accumulate
-// cost (never reduced on sells — P&L stays attributed to the pool), sells accumulate realized P&L,
-// floating P&L is marked from the open positions; total return = (realized + floating) / cumulative cost.
-// Stats is the pool's own performance/signal-quality summary (the top stat cards & quality cards render
-// from it when this pool tab is selected, alongside the global stats).
+// Cost/Realized/Floating/ReturnPct are the pool's persisted cumulative performance; Stats is the
+// pool's own performance/signal-quality summary. BuyRule is the pool's active buy discipline
+// (§A3 frontend prefill; nil = no discipline set).
 type StrategyPoolState struct {
 	Key       string  `json:"key"`       // 策略类型（""=其他/手动池）
 	Label     string  `json:"label"`     // 展示名
@@ -256,6 +255,8 @@ type StrategyPoolState struct {
 	Floating  float64 `json:"floating"`   // 浮动盈亏（当前持仓市值 - 成本）
 	ReturnPct float64 `json:"return_pct"` // 总涨跌幅（%）= (已实现+浮动)/累计成本
 	Stats     Stats   `json:"stats"`      // 该池独立绩效/信号质量汇总（前端分仓 tab 统计卡用）
+	// BuyRule 该池当前生效的买入纪律快照（nil=未设置）。§A3 分仓设置弹窗预填用。
+	BuyRule *PoolBuyRule `json:"buy_rule,omitempty"`
 }
 
 // PoolPerf 一个战法资金池的持久化表现（成本基准 + 已实现盈亏）。
@@ -1398,6 +1399,7 @@ func (e *Engine) StrategyPools() []StrategyPoolState {
 			Floating:  round2(floating),
 			ReturnPct: round2(retPct),
 			Stats:     e.statsFor(&k),
+			BuyRule:   e.poolBuyRules[k],
 		})
 	}
 	return out
@@ -1948,7 +1950,8 @@ func (e *Engine) recordPoolBuy(poolKey string, cost float64) {
 	e.poolDiscipline[poolKey] = d
 }
 
-// SetPoolBuyRule 设置单池买入纪律规则（nil=清除该池规则）。
+// SetPoolBuyRule 设置单池买入纪律规则（nil=清除该池规则）。持久化。
+// §A1 修复：此前缺 persist() 导致 API 下发的纪律重启即丢（与 SetPoolCaps/Allocs 不一致）。
 func (e *Engine) SetPoolBuyRule(poolKey string, rule *PoolBuyRule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1957,6 +1960,7 @@ func (e *Engine) SetPoolBuyRule(poolKey string, rule *PoolBuyRule) {
 	} else {
 		e.poolBuyRules[poolKey] = rule
 	}
+	e.persist()
 }
 
 // errPoolDiscipline 分仓纪律拒绝（冷却/日限/门槛/预算）。

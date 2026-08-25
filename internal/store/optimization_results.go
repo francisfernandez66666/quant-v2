@@ -35,6 +35,17 @@ type OptimizationResult struct {
 	TriggerCount int         `json:"trigger_count"`
 	Status       string      `json:"status"` // pending | approved | rejected
 	CreatedAt    string      `json:"created_at"`
+	GridJSON     string      `json:"grid_json,omitempty"` // §D3 止盈×止损热力网格（冠军行携带）
+	// PoolStats 该战法对应模拟盘资金池的实测绩效（§B 列表接口运行时附加，不落库；
+	// nil=无对应池或引擎不可用）。前端与回测指标并排对比。
+	PoolStats *PoolLiveStats `json:"pool_stats,omitempty"`
+}
+
+// PoolLiveStats 寻优行关联的模拟盘池实测摘要（§B：回测最优 vs 模拟盘验证）。
+type PoolLiveStats struct {
+	WinRatePct float64 `json:"win_rate_pct"` // 已平仓胜率%
+	Expectancy float64 `json:"expectancy"`   // 每笔期望收益%
+	FilledBuys int     `json:"filled_buys"`  // 已撮合买入笔数（样本量参考）
 }
 
 // SweepParams 扫参组合参数（与 SWEEP_JSON 的 params 对象对应）。
@@ -144,18 +155,20 @@ func (d *DB) ListOptimizations(limit int) ([]map[string]any, error) {
 // 新增列时两处必须同步修改）。
 var optColumns = `id, task_id, rank, strategy, strategy_kind, params, objective,
 	win_rate, profit_factor, win, loss, avg_win_pct, avg_loss_pct, expectancy,
-	stop_loss, avg_hold_days, trigger_count, status, created_at`
+	stop_loss, avg_hold_days, trigger_count, status, created_at, grid_json`
 
 // scanOptRow 读一行排名记录。
 func scanOptRow(scan func(...any) error) (*OptimizationResult, error) {
 	var r OptimizationResult
 	var sk, obj sql.NullString
 	var sl sql.NullFloat64
+	var grid sql.NullString
 	if err := scan(&r.ID, &r.TaskID, &r.Rank, &r.Strategy, &sk, &r.ParamsJSON, &obj,
 		&r.WinRate, &r.ProfitFactor, &r.Win, &r.Loss, &r.AvgWinPct, &r.AvgLossPct,
-		&r.Expectancy, &sl, &r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt); err != nil {
+		&r.Expectancy, &sl, &r.AvgHoldDays, &r.TriggerCount, &r.Status, &r.CreatedAt, &grid); err != nil {
 		return nil, err
 	}
+	r.GridJSON = grid.String
 	r.StrategyKind = sk.String
 	r.Params = ParseSweepParams(r.ParamsJSON)
 	if sl.Valid && r.Params.StopLossPct == 0 {

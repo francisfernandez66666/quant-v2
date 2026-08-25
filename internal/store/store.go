@@ -148,6 +148,15 @@ func (d *DB) migrate() error {
 			status TEXT NOT NULL DEFAULT 'pending',
 			created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 		)`,
+		// §D1 各战法独立寻优参数池：四维步进搜索空间（未配置走代码内置默认池）
+		`CREATE TABLE IF NOT EXISTS sweep_pool_configs (
+			strategy TEXT PRIMARY KEY,
+			tp_from REAL, tp_to REAL, tp_step REAL,
+			sl_from REAL, sl_to REAL, sl_step REAL,
+			hold_from INTEGER, hold_to INTEGER, hold_step INTEGER,
+			score_from REAL, score_to REAL, score_step REAL,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+		)`,
 		// 同花顺（新）日K（§HITHINK_DATA_SOURCE_PLAN）：主源回测行情，与旧 daily 物理分离。
 		`CREATE TABLE IF NOT EXISTS ths_daily (
 			ts_code TEXT NOT NULL,
@@ -462,6 +471,8 @@ func (d *DB) migrate() error {
 		{"optimization_results", "avg_loss_pct", "ALTER TABLE optimization_results ADD COLUMN avg_loss_pct REAL DEFAULT 0"},
 		{"optimization_results", "expectancy", "ALTER TABLE optimization_results ADD COLUMN expectancy REAL DEFAULT 0"},
 		{"optimization_results", "stop_loss", "ALTER TABLE optimization_results ADD COLUMN stop_loss REAL DEFAULT 0"},
+		// §D 热力网格：每战法冠军行携带 止盈×止损 最优期望压缩网格（JSON，前端渲染用）
+		{"optimization_results", "grid_json", "ALTER TABLE optimization_results ADD COLUMN grid_json TEXT DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

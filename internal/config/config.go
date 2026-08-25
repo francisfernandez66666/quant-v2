@@ -985,6 +985,11 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 			out.DataloadDuringTrade.IntervalMinutes = v
 		}
 	}
+	// 单步超时（分钟）：此前漏解析导致配置值永远不生效、worker 恒走 90min 兜底，
+	// discover_factors 全市场窗口在 90min 处被误杀（实录 #45/#66 两次超时）。
+	if v, ok := cfgInt(m, "step_timeout_min"); ok {
+		out.StepTimeoutMin = v
+	}
 	if v, ok := cfgInt(m, "trim_interval_min"); ok {
 		out.TrimIntervalMin = v
 	}

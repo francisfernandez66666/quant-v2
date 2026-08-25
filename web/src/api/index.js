@@ -538,9 +538,11 @@ export async function resetPaperPool(pool) {
 /** Paper trading: pool-level config (global position cap + per-pool caps/cash allocation, decoupled
  *  from the global capital/cap and customizable). Conservation: Σpool cash = total cash,
  *  Σpool caps ≤ the global cap (checked on the frontend). */
-// 对应 POST /api/paper/pool/config，data: { max_positions, pool_caps, pool_allocs }
-export async function configPaperPools(maxPositions, poolCaps, poolAllocs) {
-  // §反馈解耦：三字段按"是否传入"独立生效——null=不触碰该类设置；
+// 对应 POST /api/paper/pool/config，data: { max_positions, pool_caps, pool_rules, pool_allocs }
+// §A3 新增 poolRules：每池买入纪律 {key:{max_daily_buys,cooldown_minutes,min_score,budget_pct_per_day}}；
+// 传 {} 有语义（清空全部池规则）；null/undefined = 不触碰纪律设置。
+export async function configPaperPools(maxPositions, poolCaps, poolAllocs, poolRules) {
+  // §反馈解耦：各字段按"是否传入"独立生效——null=不触碰该类设置；
   // poolAllocs 传空对象 {} 是有语义的（显式清除自定义恢复均分），不能与 null 混淆。
   const data = {}
   if (maxPositions !== null && maxPositions !== undefined && maxPositions >= 0) {
@@ -548,6 +550,7 @@ export async function configPaperPools(maxPositions, poolCaps, poolAllocs) {
   }
   if (poolCaps && Object.keys(poolCaps).length) data.pool_caps = poolCaps
   if (poolAllocs !== null && poolAllocs !== undefined) data.pool_allocs = poolAllocs
+  if (poolRules !== null && poolRules !== undefined) data.pool_rules = poolRules
   return request('/api/paper/pool/config', { method: 'POST', data })
 }
 
@@ -1324,6 +1327,16 @@ export async function enqueueOptimize(params) {
 /** §P2-f 查询寻优结果列表（按任务倒序分组，含每行排名/参数/指标/审批状态） */
 export async function fetchOptimizations() {
   return request('/api/research/optimizations')
+}
+
+/** §D1 各战法寻优参数池：列出全部自定义四维步进配置（未配置战法走引擎默认池） */
+export async function fetchSweepPools() {
+  return request('/api/research/sweep-pools')
+}
+
+/** §D1 保存单战法四维步进搜索空间（服务端校验组合数护栏，超 10 万拒绝） */
+export async function saveSweepPool(cfg) {
+  return request('/api/research/sweep-pools', { method: 'PUT', data: cfg })
 }
 
 /** §P2-f 审批一条寻优排名：规则级参数覆盖写 applied_*.json + 热重载实盘生效 */
