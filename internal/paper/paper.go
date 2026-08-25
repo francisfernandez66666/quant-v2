@@ -267,21 +267,19 @@ type PoolPerf struct {
 }
 
 // strategyPoolLabel 战法池类型 → 展示名。
-// English: strategy-pool type → display label.
+// §命名纠错：dragon=龙头、dragon_return=龙回头（与配置段/回测战法名统一——
+// 旧版把 dragon 标成"龙回头"造成用户看到两个龙回头却没有龙头的困惑）。
+// English: strategy-pool type → display label; dragon="龙头", dragon_return="龙回头".
 func strategyPoolLabel(t string) string {
 	switch t {
 	case "dragon":
-		return "龙回头"
+		return "龙头"
 	case "double_bump":
 		return "双响炮"
 	case "n_shape":
 		return "N形超短"
 	case "dragon_return":
-		return "龙回头中线"
-	case "factor":
-		return "因子战法"
-	case "pattern":
-		return "形态战法"
+		return "龙回头"
 	}
 	return "其他"
 }

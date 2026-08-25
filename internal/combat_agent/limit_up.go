@@ -372,6 +372,12 @@ func (a *Agent) ScanLimitUp(input ScanInput) []Signal {
 				Code:        l.Stock.Code,
 				Name:        l.Stock.Name,
 				Strategy:    "龙头识别",
+				// §C 归属修正：龙头识别就是 dragon 战法的实盘主循环路径，此前缺
+				// StrategyType 导致买入全部落"其他池"（002412 实录）——现在归入龙头池，
+				// 分仓纪律/寻优门槛下发/池级实测统计随之生效。
+				// English: leader-ID is dragon's live main-loop path; missing StrategyType used to dump
+				// its buys into the "other" pool (002412 case) — now routed to the dragon pool.
+				StrategyType: "dragon",
 				Direction:   "做多",
 				Action:      action,
 				Price:       l.Stock.Price,

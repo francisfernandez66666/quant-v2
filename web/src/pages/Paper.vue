@@ -618,10 +618,10 @@ function tradeSlippageCls(t) {
   if (t.side !== 'buy' || !(t.signal_price > 0)) return ''
   return t.price >= t.signal_price ? 'down' : 'up'
 }
-// 战法池展示名（空=其他/手动；与后端 strategyPoolLabel 保持一致）
+// 战法池展示名（空=其他/手动；与后端 strategyPoolLabel 保持一致。§命名纠错：dragon=龙头）
 function poolLabel(k) {
   if (!k) return '其他/手动'
-  const labels = { dragon: '龙回头', double_bump: '双响炮', n_shape: 'N形超短', dragon_return: '龙回头中线', factor: '因子战法', pattern: '形态战法' }
+  const labels = { dragon: '龙头', double_bump: '双响炮', n_shape: 'N形超短', dragon_return: '龙回头' }
   return labels[k] || k
 }
 
