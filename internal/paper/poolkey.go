@@ -1,6 +1,11 @@
 package paper
 
-// poolkey.go 战法 → 资金池 key 映射（§OPTIMIZE_POOL_INTEGRATION_PLAN A1）。
+import (
+	"log"
+	"math"
+)
+
+// poolkey.go 战法 → 资金池 key 映射（§OPTIMIZE_POOL_INTEGRATION_PLAN A1/C）。
 //
 // 寻优排名行的 (strategy 显示名, strategy_kind) 与模拟盘战法池是两套标识：
 // 排名行 strategy="双响炮" kind=""（内置）/ strategy="因子战法#1" kind="fac_1"（库规则），
@@ -8,17 +13,15 @@ package paper
 // 审批下发池纪律、寻优页回显池实测都依赖这层映射；纯字符串逻辑独立成文件便于单测。
 
 // PoolKeyForStrategy 把寻优排名行的 (strategy, strategy_kind) 映射为模拟盘池 key。
-// 优先按 kind 前缀判定（库规则权威）；kind 为空时按内置战法显示名映射；
-// 无法识别返回 ""（其他/手动池——调用方不应向该池下发纪律）。
+// §C 规则细分池：库规则的 kind（fac_1/pat_2）**本身就是池 key**——每条规则独立寻优、
+// 独立资金池、独立纪律；内置战法按显示名映射到类型池；无法识别返回 ""（其他/手动池，
+// 调用方不应向该池下发纪律）。旧 factor/pattern 聚合池仅承载存量持仓，不再新建。
 // English: maps an optimization row's (strategy name, strategy_kind) to a paper pool key;
-// kind prefix wins (library rules are authoritative), falls back to builtin display names;
-// returns "" (other/manual pool) when unrecognizable — callers must not push discipline to it.
+// since Phase C the library rule ID IS the pool key (per-rule pools); builtins map by display
+// name; returns "" (other/manual pool) when unrecognizable.
 func PoolKeyForStrategy(strategy, kind string) string {
-	switch {
-	case len(kind) >= 4 && kind[:4] == "fac_":
-		return "factor"
-	case len(kind) >= 4 && kind[:4] == "pat_":
-		return "pattern"
+	if len(kind) >= 4 && (kind[:4] == "fac_" || kind[:4] == "pat_") {
+		return kind // 规则粒度池：fac_1/fac_2/pat_3 各自独立
 	}
 	switch strategy {
 	case "双响炮":
@@ -31,6 +34,11 @@ func PoolKeyForStrategy(strategy, kind string) string {
 		return "dragon_return"
 	}
 	return ""
+}
+
+// IsRulePoolKey 判断池 key 是否为规则细分池（fac_/pat_ 前缀）。
+func IsRulePoolKey(key string) bool {
+	return len(key) >= 4 && (key[:4] == "fac_" || key[:4] == "pat_")
 }
 
 // ApplyPoolMinScore 把寻优门槛合并进指定池的买入纪律（只改 MinScore 字段，其余保留；
@@ -58,4 +66,87 @@ func (e *Engine) ApplyPoolMinScore(poolKey string, minScore float64) {
 		e.poolBuyRules[poolKey] = rule
 	}
 	e.persist()
+}
+
+// ── §C 规则细分池：开池 + 动态标签 ──
+
+// ensurePoolMinFrac 新规则池从总现金划拨的比例（等比缩其余池，守恒不破）。
+const ensurePoolMinFrac = 0.05
+
+// ensurePoolFloor 新池保底最低金额（元）：总现金太小也至少给这个数，避免 0 元池永远买不起 1 手。
+const ensurePoolFloor = 1000.0
+
+// EnsurePool 为新审批的库规则开立独立资金池（幂等；已存在直接返回 false）。
+// 资金来源=从所有现有池**等比**划拨（Σ池现金=总现金守恒），新池拿
+// max(总现金×5%, ¥1000) 且不超过总现金×25%（防止首个规则池吸走过多）。
+// 同时把 key 追加进 poolTypes（展示/重建可见），并持久化。
+// English: creates a dedicated cash pool for a newly approved library rule (idempotent).
+// Funds are carved proportionally from existing pools (conservation preserved); the new pool
+// gets max(5% of total, ¥1000) capped at 25%. The key joins poolTypes and state persists.
+func (e *Engine) EnsurePool(key string) bool {
+	if key == "" {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.pools[key]; ok {
+		return false // 已存在（含存量聚合池 factor/pattern）
+	}
+	total := 0.0
+	for _, v := range e.pools {
+		total += v
+	}
+	if total <= 0 {
+		return false
+	}
+	give := math.Max(ensurePoolFloor, total*ensurePoolMinFrac)
+	if cap := total * 0.25; give > cap {
+		give = cap
+	}
+	scale := (total - give) / total
+	for k, v := range e.pools {
+		e.pools[k] = v * scale
+	}
+	e.pools[key] = give
+	if !containsStr(e.poolTypes, key) {
+		e.poolTypes = append(e.poolTypes, key)
+	}
+	if e.extraPoolKeys == nil {
+		e.extraPoolKeys = map[string]bool{}
+	}
+	e.extraPoolKeys[key] = true
+	log.Printf("[paper] 规则细分池已开立：%s 划拨 %.0f 元（总现金 %.0f 等比缩放）", key, give, total)
+	e.persist()
+	return true
+}
+
+func containsStr(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// SetPoolLabelResolver 注入规则 ID → 显示名 解析器（server 用战法库名字表装配；
+// 未注入或查不到时回退 key 本身）。供 fac_1/pat_2 等动态池展示。
+func (e *Engine) SetPoolLabelResolver(fn func(string) string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.labelFn = fn
+}
+
+// poolLabelOf 池 key → 展示名：基础类型走静态表；规则池走解析器；兜底 key 本身。
+// （strategyPoolLabel 对未识别 key 返回 "其他"，据此区分是否命中基础类型。）
+func (e *Engine) poolLabelOf(key string) string {
+	if l := strategyPoolLabel(key); l != "其他" || key == "" {
+		return l
+	}
+	if e.labelFn != nil {
+		if l := e.labelFn(key); l != "" {
+			return l
+		}
+	}
+	return key
 }

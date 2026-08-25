@@ -104,20 +104,26 @@
                    :placeholder="p.max_pos > 0 ? '当前 ' + p.max_pos : '不单独设限'" />
           </div>
         </div>
-        <!-- 买入纪律 tab（§A3）：每池四字段，全零=该池不设额外限制 -->
+        <!-- 买入纪律 tab（§A3）：下拉选池 → 只渲染该池四字段（战法越挖越多也不撑爆弹窗） -->
         <div v-show="settingsTab === 'rules'">
           <div class="config-hint">
-            每池买入纪律：日限次数 / 冷却分钟 / 最低评分 / 日预算%。
-            全 0 = 不设限；寻优审批会自动把门槛写入对应池的「最低评分」。
+            每池买入纪律：日限次数 / 冷却分钟 / 最低评分 / 日预算%。全 0 = 不设限；
+            寻优审批会自动把门槛写入对应池的「最低评分」。
           </div>
-          <div v-for="p in pools" :key="'sr-' + p.key" class="pool-rules-row">
-            <div class="pool-rules-head">{{ p.label }}</div>
-            <div class="pool-rules-grid">
-              <label>日限买<input v-model.number="cfgRules[p.key].max_daily_buys" type="number" min="0" step="1" placeholder="0=不限" /></label>
-              <label>冷却(分)<input v-model.number="cfgRules[p.key].cooldown_minutes" type="number" min="0" step="5" placeholder="0=不限" /></label>
-              <label>最低分<input v-model.number="cfgRules[p.key].min_score" type="number" min="0" max="100" step="1" placeholder="0=不过滤" /></label>
-              <label>日预算%<input v-model.number="cfgRules[p.key].budget_pct_per_day" type="number" min="0" max="100" step="5" placeholder="0=不限" /></label>
-            </div>
+          <div class="pool-rules-row">
+            <select v-model="cfgRuleSel" class="cfg-select">
+              <option v-for="p in pools" :key="'sel-' + p.key" :value="p.key">{{ p.label }}</option>
+            </select>
+            <template v-if="cfgRules[cfgRuleSel]">
+              <div class="pool-rules-head">{{ poolLabel(cfgRuleSel) }}<span class="rules-now"
+                    v-if="poolCurrentRule(cfgRuleSel)">（当前生效：{{ poolCurrentRuleText(cfgRuleSel) }}）</span></div>
+              <div class="pool-rules-grid">
+                <label>日限买<input v-model.number="cfgRules[cfgRuleSel].max_daily_buys" type="number" min="0" step="1" placeholder="0=不限" /></label>
+                <label>冷却(分)<input v-model.number="cfgRules[cfgRuleSel].cooldown_minutes" type="number" min="0" step="5" placeholder="0=不限" /></label>
+                <label>最低分<input v-model.number="cfgRules[cfgRuleSel].min_score" type="number" min="0" max="100" step="1" placeholder="0=不过滤" /></label>
+                <label>日预算%<input v-model.number="cfgRules[cfgRuleSel].budget_pct_per_day" type="number" min="0" max="100" step="5" placeholder="0=不限" /></label>
+              </div>
+            </template>
           </div>
         </div>
         <div class="preview" v-if="cfgWarn">{{ cfgWarn }}</div>
@@ -527,7 +533,21 @@ const cfgMaxPos = ref(0)            // 弹窗内全局持仓上限
 const cfgAllocs = ref({})           // 每池目标资金额（key=策略类型；空=自动均分剩余）
 const cfgCaps = ref({})             // 每池持仓上限（key=策略类型；0=不单独设限）
 const cfgRules = ref({})            // §A3 每池买入纪律（key→四字段；全零=清除该池规则）
+const cfgRuleSel = ref('')          // §A3 纪律 tab 当前选中的池 key（下拉切换，只渲染单池）
 const cfgWarn = ref('')             // 守恒校验提示（Σ资金/Σ上限超限时警示）
+
+/** 该池后端当前生效的纪律规则（预填对照）。 */
+function poolCurrentRule(key) {
+  const p = pools.value.find(x => x.key === key)
+  return !!(p && p.buy_rule && (p.buy_rule.max_daily_buys || p.buy_rule.cooldown_minutes ||
+    p.buy_rule.min_score || p.buy_rule.budget_pct_per_day))
+}
+function poolCurrentRuleText(key) {
+  const p = pools.value.find(x => x.key === key)
+  const r = p && p.buy_rule
+  if (!r) return ''
+  return `限${r.max_daily_buys||'∞'}次/冷却${r.cooldown_minutes||0}分/分≥${r.min_score||0}/预算${r.budget_pct_per_day||0}%`
+}
 
 // ── 分时展开 / 移动端 sheet（照搬真实持仓页）── (K-line expand / mobile sheet, ported from Positions)
 const klineOpen = ref(new Set())      // 已展开分时的行键集合（持仓=code，成交='trade_'+i）
@@ -793,6 +813,9 @@ function openSettingsModal() {
       budget_pct_per_day: (p.buy_rule && p.buy_rule.budget_pct_per_day) || 0,
     }
   })
+  // §A3 下拉默认选第一个池（跳过"其他"池优先展示战法池）
+  const firstStrategy = pools.value.find(p => p.key !== '')
+  cfgRuleSel.value = firstStrategy ? firstStrategy.key : (pools.value[0] ? pools.value[0].key : '')
   settingsTab.value = 'alloc'
   cfgWarn.value = ''
   settingsOpen.value = true
@@ -1019,9 +1042,12 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .pool-config-label { width: 90px; color: #b388ff; font-weight: 600; font-size: 13px; flex-shrink: 0; }
 .cfg-input { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid #333; background: #0f0f23; color: #e0e0e0; font-size: 13px; outline: none; min-width: 0; }
 .cfg-input:focus { border-color: #FF4D4F; }
-/* §A3 买入纪律 tab：每池一行头部 + 2×2 字段网格 */
-.pool-rules-row { margin-bottom: 10px; padding: 8px; border: 1px solid #2a2a4a; border-radius: 8px; }
+/* §A3 买入纪律 tab：下拉选池 + 单池 2×2 字段网格（避免随战法增多无限平铺） */
+.cfg-select { width:100%; padding:6px 10px; border-radius:6px; border:1px solid #333; background:#0f0f23; color:#e0e0e0; font-size:13px; outline:none; margin-bottom:8px; }
+.cfg-select:focus { border-color:#FF4D4F; }
+.pool-rules-row { margin-bottom: 10px; padding: 10px; border: 1px solid #2a2a4a; border-radius: 8px; }
 .pool-rules-head { color: #b388ff; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.rules-now { color:#888; font-weight:400; font-size:11px; margin-left:6px; }
 .pool-rules-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
 .pool-rules-grid label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #aaa; }
 .pool-rules-grid input { width: 70px; padding: 4px 8px; border-radius: 6px; border: 1px solid #333; background: #0f0f23; color: #e0e0e0; font-size: 12px; outline: none; }

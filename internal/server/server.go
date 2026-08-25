@@ -129,6 +129,9 @@ type EngineRegistry interface {
 	// English: updates the global strategy pool-type template and syncs every account's paper book
 	// (allocation; used on hot reload).
 	SetPaperPools(types []string)
+	// SetPaperLabelResolver §C 注入规则池 ID→显示名 解析器（fac_1→"因子战法#1"），
+	// 同步到全部已建账号并供懒加载引擎继承。English: injects the rule-pool label resolver.
+	SetPaperLabelResolver(fn func(string) string)
 }
 
 // SetEngineRegistry 设置多账号引擎注册表（懒加载/按配置指纹共享）。
@@ -1173,6 +1176,14 @@ func splitLLMKeys(raw string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// requestUserIDSafe requestUserID 的 nil 安全版：测试可直传 nil request。
+func requestUserIDSafe(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return requestUserID(r)
 }
 
 // requestUserID 从请求上下文取出当前登录用户 ID；未认证返回空串（走全局配置）。

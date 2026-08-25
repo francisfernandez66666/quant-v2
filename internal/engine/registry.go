@@ -110,6 +110,8 @@ type Registry struct {
 	// 每个战法池只扣自己战法的预算（防波动突破垄断）。English: strategy pooling — the global
 	// pool-type template (injected from engine.ActivePoolTypes); each account's paper splits cash by it.
 	paperPoolTypes []string
+	// paperLabelFn §C 规则池 ID→显示名 解析器（新账号懒加载引擎继承）
+	paperLabelFn func(string) string
 	// 自动撮合账号判定：仅返回 true 的账号参与按战法自动建仓/自动估值（admin）；
 	// 普通用户的模拟盘纯手动 + 静态存储，不联动任何自动行为。nil = 默认全部自动（兼容旧行为）。
 	// English: auto-paper account check — only accounts returning true get strategy-driven auto-fills
@@ -232,6 +234,9 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	// English: a new account inherits the global strategy pool template (allocation against monopolies).
 	if len(r.paperPoolTypes) > 0 {
 		pe.SetStrategyPools(r.paperPoolTypes)
+	}
+	if r.paperLabelFn != nil {
+		pe.SetPoolLabelResolver(r.paperLabelFn)
 	}
 	r.papers[userID] = pe
 	r.mu.Unlock()
@@ -385,6 +390,23 @@ func (r *Registry) SetPaperPools(types []string) {
 	r.mu.Unlock()
 	for _, pe := range pes {
 		pe.SetStrategyPools(types)
+	}
+}
+
+// SetPaperLabelResolver 注入规则池 ID → 显示名 解析器（§C 规则细分池：fac_1→"因子战法#1"）。
+// 同步到所有已建账号引擎并记住，供后续懒加载的新账号引擎继承。
+// English: injects the rule-pool id→label resolver into every existing paper engine and remembers it
+// for lazily created ones.
+func (r *Registry) SetPaperLabelResolver(fn func(string) string) {
+	r.mu.Lock()
+	r.paperLabelFn = fn
+	pes := make([]*paper.Engine, 0, len(r.papers))
+	for _, pe := range r.papers {
+		pes = append(pes, pe)
+	}
+	r.mu.Unlock()
+	for _, pe := range pes {
+		pe.SetPoolLabelResolver(fn)
 	}
 }
 

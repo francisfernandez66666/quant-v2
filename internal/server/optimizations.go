@@ -66,7 +66,7 @@ func (s *Server) handleOptimizationList(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	pe := s.paperEngineFor(requestUserID(r))
+	pe := s.paperEngineFor(requestUserIDSafe(r))
 	for _, task := range list {
 		results, _ := task["results"].([]*store.OptimizationResult)
 		for _, row := range results {

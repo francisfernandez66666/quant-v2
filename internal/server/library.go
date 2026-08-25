@@ -248,6 +248,28 @@ func (s *Server) reloadLibraries() {
 		c.ReloadPatternRules(s.researchDir)
 	}
 	s.registry.SetPaperPools(ActivePaperPoolTypes(s.researchDir))
+	// §C 规则池显示名同步（改名/新增后前端分仓条立即用新名字）
+	s.registry.SetPaperLabelResolver(LibraryLabelResolver(s.researchDir))
+}
+
+// LibraryLabelResolver 构建规则池 ID → 显示名 解析器（含停用规则——历史持仓仍需可读名）。
+// English: builds a rule-pool id→label resolver from the applied library files (disabled included
+// so legacy holdings keep readable names).
+func LibraryLabelResolver(dataDir string) func(string) string {
+	names := map[string]string{}
+	if dataDir != "" {
+		if es, err := research.ListAppliedFactorRules(dataDir); err == nil {
+			for _, e := range es {
+				names[e.ID] = e.Name
+			}
+		}
+		if ps, err := research.ListAppliedPatternRules(dataDir); err == nil {
+			for _, p := range ps {
+				names[p.ID] = p.Name
+			}
+		}
+	}
+	return func(id string) string { return names[id] }
 }
 
 // ActivePaperPoolTypes 构建"当前启用战法"资金池类型列表：
@@ -263,12 +285,23 @@ func ActivePaperPoolTypes(dataDir string) []string {
 		string(strategy.SignalNShape),
 		string(strategy.SignalDragonReturn),
 	}
+	// §C 规则细分池：每条启用规则独立成池（fac_1/pat_2 即池 key），不再用聚合池。
+	// 信号端 StrategyType 已改填规则 ID（combat_agent.libraryIDFromMeta），归池一一对应；
+	// 池集合变更时 rebuildPoolsLocked 均分重排（与基础类型启停同语义）。
 	if dataDir != "" {
-		if rules, err := research.LoadEnabledFactorRules(dataDir); err == nil && len(rules) > 0 {
-			types = append(types, string(strategy.SignalFactor))
+		if rules, err := research.LoadEnabledFactorRules(dataDir); err == nil {
+			for _, r := range rules {
+				if r.ID != "" {
+					types = append(types, r.ID)
+				}
+			}
 		}
-		if pats, err := research.LoadEnabledPatternRules(dataDir); err == nil && len(pats) > 0 {
-			types = append(types, string(strategy.SignalPattern))
+		if pats, err := research.LoadEnabledPatternRules(dataDir); err == nil {
+			for _, p := range pats {
+				if p.ID != "" {
+					types = append(types, p.ID)
+				}
+			}
 		}
 	}
 	return types

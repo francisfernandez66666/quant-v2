@@ -3,21 +3,25 @@ package paper
 import (
 	"path/filepath"
 	"testing"
+	"time"
+
+	"quant-trading-v2/internal/combat_agent"
+	data "quant-trading-v2/internal/data"
 )
 
 // ── §OPTIMIZE_POOL_INTEGRATION_PLAN A1：战法→池 key 映射 + 门槛合并 + 纪律持久化 ──
 
 func TestPoolKeyForStrategy(t *testing.T) {
-	// 库规则前缀优先（kind 权威，显示名只是辅助）
+	// §C 规则细分池：库规则的 kind 本身就是池 key（fac_1/pat_2 各自独立）
 	cases := []struct{ strategy, kind, want string }{
-		{"因子战法#1", "fac_1", "factor"},
-		{"形态战法#2", "pat_2", "pattern"},
+		{"因子战法#1", "fac_1", "fac_1"},
+		{"形态战法#2", "pat_2", "pat_2"},
 		{"双响炮", "", "double_bump"},
 		{"龙头", "", "dragon"},
 		{"N形", "", "n_shape"},
 		{"龙回头", "", "dragon_return"},
-		{"未知战法", "", ""},        // 无法识别 → 其他池（调用方不得下发）
-		{"随便什么名", "fac_99", "factor"}, // kind 前缀压过显示名
+		{"未知战法", "", ""},              // 无法识别 → 其他池（调用方不得下发）
+		{"随便什么名", "fac_99", "fac_99"}, // kind 前缀压过显示名
 	}
 	for _, c := range cases {
 		if got := PoolKeyForStrategy(c.strategy, c.kind); got != c.want {
@@ -87,4 +91,79 @@ func TestSetPoolBuyRulePersistedAcrossReload(t *testing.T) {
 	if !found {
 		t.Fatal("重启后未找到 double_bump 池")
 	}
+}
+
+func TestEnsurePoolConservation(t *testing.T) {
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"dragon", "n_shape"})
+	totalBefore := 0.0
+	for _, p := range e.StrategyPools() {
+		totalBefore += p.Cash
+	}
+	if !e.EnsurePool("fac_1") {
+		t.Fatal("开池失败")
+	}
+	if e.EnsurePool("fac_1") {
+		t.Fatal("重复开池应返回 false")
+	}
+	ps := e.StrategyPools()
+	totalAfter := 0.0
+	var fac = 0.0
+	var found bool
+	for _, p := range ps {
+		totalAfter += p.Cash
+		if p.Key == "fac_1" {
+			fac, found = p.Cash, true
+		}
+	}
+	if !found {
+		t.Fatal("新池未出现在快照")
+	}
+	if abs(totalBefore-totalAfter) > 0.01 {
+		t.Fatalf("守恒破坏: before=%.2f after=%.2f", totalBefore, totalAfter)
+	}
+	minFloor := totalBefore * 0.05
+	if fac < ensurePoolFloor-0.01 || fac < minFloor-0.01 {
+		t.Fatalf("新池资金低于保底: %.2f (floor=%.0f, 5%%=%.2f)", fac, ensurePoolFloor, minFloor)
+	}
+}
+
+func TestRulePoolSignalRoutingAndLabel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "paper_state.json")
+	e := New(testCfg(), path)
+	e.SetStrategyPools([]string{"fac_1"})
+	// 标签解析器：fac_1 → 因子战法#1；未知回退 key 本身
+	e.SetPoolLabelResolver(func(id string) string {
+		if id == "fac_1" {
+			return "因子战法#1"
+		}
+		return ""
+	})
+	now := time.Now()
+	e.OnSignals([]combat_agent.Signal{
+		{Code: "600000.SH", Name: "A", StrategyType: "fac_1", StrategyID: "fac_1",
+			Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
+	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	found := false
+	for _, p := range e.StrategyPools() {
+		if p.Key == "fac_1" {
+			found = true
+			if p.Label != "因子战法#1" {
+				t.Fatalf("标签未解析: %q", p.Label)
+			}
+			if p.Positions != 1 {
+				t.Fatalf("信号未归入 fac_1 池: positions=%d", p.Positions)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("fac_1 池缺失")
+	}
+}
+
+func abs(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
 }

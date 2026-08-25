@@ -48,11 +48,12 @@ func orDefault(a, b string) string {
 	return b
 }
 
-// strategyIDFromMeta 从策略信号的 Meta["strategy_id"]（候选 ID）转成战法库规则 ID "fac_<id>"。
-// 无 strategy_id 或 ≤0 返回空串（非因子战法库信号）。
-// English: converts a strategy signal's Meta["strategy_id"] (candidate ID) into the library rule ID
-// "fac_<id>". Empty when absent/≤0 (non-library signals).
-func strategyIDFromMeta(sig *strategy.Signal) string {
+// libraryIDFromMeta 从策略信号的 Meta["strategy_id"]（候选 ID）转成战法库规则 ID。
+// 前缀按 runner 类型区分：factor→"fac_<id>"、pattern→"pat_<id>"（§C 修复：旧版形态信号
+// 也被硬编码 fac_ 前缀，效果监测/细分池归属全错）。无 strategy_id 或 ≤0 返回空串。
+// English: converts Meta["strategy_id"] (candidate ID) into the library rule ID, prefixed by
+// runner type (fac_/pat_). Empty when absent/≤0.
+func libraryIDFromMeta(sig *strategy.Signal, t strategy.SignalType) string {
 	if sig == nil {
 		return ""
 	}
@@ -60,7 +61,11 @@ func strategyIDFromMeta(sig *strategy.Signal) string {
 	if !ok || v <= 0 {
 		return ""
 	}
-	return "fac_" + strconv.FormatInt(int64(v), 10)
+	prefix := "fac_"
+	if t == strategy.SignalPattern {
+		prefix = "pat_"
+	}
+	return prefix + strconv.FormatInt(int64(v), 10)
 }
 
 // strategyLabel 战法类型 → 日志用简称。
@@ -857,13 +862,21 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 				sigReason = "待盘中确认: " + sigReason
 			}
 		}
+		// §C 规则细分池：库规则信号（factor/pattern runner）的 StrategyID 即模拟盘
+		// 资金池 key（fac_1/pat_2 各自独立分仓与纪律）；StrategyType 同步改填规则 ID，
+		// paper.OnSignals 按它归池——未开池的规则信号安全跳过（不入仓）。
+		sigID := libraryIDFromMeta(sig, runner.Type)
+		poolType := string(runner.Type)
+		if sigID != "" && (runner.Type == strategy.SignalFactor || runner.Type == strategy.SignalPattern) {
+			poolType = sigID
+		}
 		sigs = append(sigs, Signal{
 			ID:           seqID(),
 			Code:         code,
 			Name:         orDefault(sig.Name, md.Name),
 			Strategy:     orDefault(sig.StrategyName, string(runner.Type)),
-			StrategyID:   strategyIDFromMeta(sig),
-			StrategyType: string(runner.Type),
+			StrategyID:   sigID,
+			StrategyType: poolType,
 			Direction:    direction,
 			Action:       action,
 			Tag:          nShapeTag(eval),

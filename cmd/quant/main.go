@@ -289,6 +289,8 @@ func main() {
 	// paper is manual-only and static. Also injects the enabled-strategy pool template (allocation).
 	registry.SetAutoPaperCheck(authMgr.IsAdmin)
 	registry.SetPaperPools(server.ActivePaperPoolTypes(dataDir))
+	// §C 规则细分池显示名解析器：fac_1/pat_2 → "因子战法#1" 等（分仓条可读）
+	registry.SetPaperLabelResolver(server.LibraryLabelResolver(dataDir))
 	// 盘后落库：每个交易日收盘后把模拟盘当日成交 + 每日快照导出研究库，供自动研究消费。
 	// English: post-close export — after each trading-day close, the paper day's fills + daily snapshot
 	// are exported to the research DB for auto-research.

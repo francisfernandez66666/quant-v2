@@ -301,7 +301,11 @@ type Engine struct {
 	poolMaxPos     map[string]int            // 每池持仓上限：key=策略类型（0=该池不单独设限，仅受全局上限约束；可自定义）
 	poolBuyRules   map[string]*PoolBuyRule   // 每池买入纪律规则（冷却/日限/门槛/预算配比）
 	poolDiscipline map[string]poolDiscipline // 运行时状态：每池今日买入计数/花费/最近时间
-	positions      map[string]*Position
+	// §C 规则细分池：fac_1/pat_2 等 EnsurePool 开立的动态池 key 集合（SetStrategyPools
+	// 重建时必须合并保留，否则配置同步会把规则池冲掉）；labelFn 解析规则 ID → 显示名。
+	extraPoolKeys map[string]bool
+	labelFn       func(string) string
+	positions     map[string]*Position
 	trades         []Trade
 	orders         []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
 	equity         []EquityPoint
@@ -343,6 +347,7 @@ func New(cfg Config, path string) *Engine {
 		poolMaxPos:     make(map[string]int),
 		poolBuyRules:   make(map[string]*PoolBuyRule),
 		poolDiscipline: make(map[string]poolDiscipline),
+		extraPoolKeys:  make(map[string]bool),
 		positions:      make(map[string]*Position),
 		trimDone:       make(map[string]string),
 		path:           path,
@@ -545,6 +550,12 @@ func (e *Engine) load() {
 	e.hasFilled = st.HasFilled
 	if st.PoolBuyRules != nil {
 		e.poolBuyRules = st.PoolBuyRules
+	}
+	// §C 从持久化的 poolTypes 还原规则细分池标记（fac_/pat_ 前缀）
+	for _, k := range e.poolTypes {
+		if IsRulePoolKey(k) {
+			e.extraPoolKeys[k] = true
+		}
 	}
 	// 恢复订单生命周期（旧数据无此字段 → 空列表，兼容）。
 	// English: restore order lifecycle (legacy data without the field → empty list).
@@ -1283,14 +1294,22 @@ func (e *Engine) SetStrategyPools(types []string) {
 	defer e.mu.Unlock()
 	// 规范化排序比较，集合比较与输入顺序无关
 	// English: normalized sorted comparison makes the set comparison order-insensitive.
-	sorted := append([]string(nil), types...)
+	// §C 合并保留规则细分池（fac_1/pat_2…）——引擎配置同步只管基础类型，
+	// 规则池由 EnsurePool 生命周期管理，重建/比较时都必须并入集合。
+	merged := append([]string(nil), types...)
+	for k := range e.extraPoolKeys {
+		if !containsStr(merged, k) {
+			merged = append(merged, k)
+		}
+	}
+	sorted := append([]string(nil), merged...)
 	sort.Strings(sorted)
 	cur := append([]string(nil), e.poolTypes...)
 	sort.Strings(cur)
 	if equalStrings(sorted, cur) {
 		return // 集合未变：保留各池现金
 	}
-	e.poolTypes = append([]string(nil), types...)
+	e.poolTypes = merged
 	e.rebuildPoolsLocked()
 	log.Printf("[paper] 战法资金池已按 %v 均分：每池 %.2f", e.poolTypes, e.pools[""])
 }
@@ -1389,7 +1408,7 @@ func (e *Engine) StrategyPools() []StrategyPoolState {
 		}
 		out = append(out, StrategyPoolState{
 			Key:       k,
-			Label:     strategyPoolLabel(k),
+			Label:     e.poolLabelOf(k),
 			Cash:      cash,
 			RatioPct:  ratio,
 			Positions: cnt,
