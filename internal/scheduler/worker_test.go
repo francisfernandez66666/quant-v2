@@ -173,3 +173,99 @@ func TestLibraryReplayStepMappedAndInserted(t *testing.T) {
 		}
 	}
 }
+
+// TestFailedTaskRequeuesAtTail §失败重排队：任务失败不落 error 终态——
+// 自动回队尾（先于它入队的健康任务 B/C 先跑），error 列留失败原因，
+// 冷却期内不重启；冷却过后自动重试，不设上限。
+// English: a failed task re-enqueues at the queue TAIL — healthier tasks enqueued before it run
+// first; the failure reason is recorded; a cooldown gates the retry (no cap).
+func TestFailedTaskRequeuesAtTail(t *testing.T) {
+	t.Setenv("FAKE_LOG", filepath.Join(t.TempDir(), "fake.log"))
+	dir := t.TempDir()
+	// 假二进制：run-task 时带 "--fail" 参数的退出 2（模拟失败），否则立即成功。
+	script := filepath.Join(dir, "fakebin.sh")
+	content := `#!/bin/sh
+echo "FAKE $@" >> "$FAKE_LOG"
+case "$*" in
+  *run-task*) case "$*" in *"--task-id 1"*) exit 2 ;; *) exit 0 ;; esac ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, "trading.db")
+	cfg := cfgSamples(script, dbPath)
+	cfgPath := mustConfig(t, cfg)
+	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
+	loc := time.FixedZone("CST", 8*3600)
+	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 0, 0, 0, loc) } // 周六盘后
+
+	qdb, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("打开队列: %v", err)
+	}
+	defer qdb.Close()
+
+	// 入队顺序：A(会失败) → B、C（健康）。payload 带 "fail":true 让假二进制区分。
+	mk := func(ref int64, fail bool) *store.ResearchTask {
+		p := `{}`
+		if fail {
+			p = `{"fail": true}`
+		}
+		return &store.ResearchTask{
+			Type: store.TaskBacktestCandidate, RefID: ref,
+			Priority: "high", Payload: p,
+		}
+	}
+	failID, err := qdb.EnqueueResearchTask(mk(1, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	okB, err := qdb.EnqueueResearchTask(mk(2, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	okC, err := qdb.EnqueueResearchTask(mk(3, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.tick() // A 启动并失败 → 回队尾；自驱排水应继续跑完 B、C
+	waitFor(t, 15*time.Second, func() bool {
+		b, _ := qdb.GetResearchTask(okB)
+		c, _ := qdb.GetResearchTask(okC)
+		return b != nil && c != nil && b.Status == store.TaskDone && c.Status == store.TaskDone
+	}, "健康任务 B、C 应先于 A 的重试完成")
+
+	a, _ := qdb.GetResearchTask(failID)
+	if a == nil || a.Status != store.TaskQueued {
+		t.Fatalf("失败任务应回 queued(而非 error 终态), got %+v", a)
+	}
+	if !strings.Contains(a.Error, "运行失败") {
+		t.Fatalf("error 列应保留失败原因, got %q", a.Error)
+	}
+	// A 在冷却期内：不应已重试（若已重试其 status 会变 running）
+	s.mu.Lock()
+	busyNow := s.busy
+	s.mu.Unlock()
+	if busyNow {
+		t.Fatal("冷却期内不应启动重试")
+	}
+
+	// 冷却过期 → A 自动重试（再次失败→再次回队；不设上限）。
+	// 用单调 requeue_seq 判定重试发生过：首次失败=1，二次失败回队=2。
+	a1, _ := qdb.GetResearchTask(failID)
+	if a1 == nil || a1.RequeueSeq != 1 {
+		t.Fatalf("首次失败后 requeue_seq 应为 1, got %+v", a1)
+	}
+	s.now = func() time.Time { return time.Date(2026, 8, 22, 16, 10, 0, 0, loc) }
+	s.tick()
+	waitFor(t, 15*time.Second, func() bool {
+		tk, _ := qdb.GetResearchTask(failID)
+		return tk != nil && tk.RequeueSeq >= 2 && tk.Status == store.TaskQueued
+	}, "冷却过期后失败任务应重试并二次回队")
+	a2, _ := qdb.GetResearchTask(failID)
+	if !strings.Contains(a2.Error, "运行失败") {
+		t.Fatalf("error 列应保留最后一次失败原因, got %q", a2.Error)
+	}
+}

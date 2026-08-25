@@ -492,6 +492,13 @@ func (d *DB) migrate() error {
 	if err := d.migrateBacktestJobsToTasks(); err != nil {
 		return fmt.Errorf("store migrate backtest_jobs→research_tasks: %w", err)
 	}
+	// §失败重排队：requeue_seq 单调尾键列（旧库增量迁移，幂等）。
+	// English: failure-requeue tail-key column, added to pre-existing DBs idempotently.
+	if ok, err := d.hasColumn("research_tasks", "requeue_seq"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN requeue_seq INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.requeue_seq: %w", err)
+		}
+	}
 	return nil
 }
 

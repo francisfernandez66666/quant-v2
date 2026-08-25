@@ -65,7 +65,10 @@ type Scheduler struct {
 	lastProgress  int64               // unix 秒，最近一次进度行（看门狗用）
 	tradingDLBusy bool                // 交易时段 dataload 是否在跑（防重叠）
 	lastTrim      time.Time           // 盘中内存释放最近一次执行时间（节流用）
-	state         stateFile
+	// failCool §失败重排队防自旋：taskID → 最近一次失败时间。失败任务自动回队尾，
+	// 空队时会立即再次被取到——冷却期内不出队，避免快速失败的任务烧 CPU。
+	failCool map[int64]time.Time
+	state    stateFile
 }
 
 // stateFile 展示兼容状态：交易时段下载节流时间戳 + 最近任务结果上报（前端可见）。
@@ -89,9 +92,10 @@ func New(dataDir, cfgPath, statePath string) *Scheduler {
 		statePath = filepath.Join(dataDir, "research_state.json")
 	}
 	return &Scheduler{
-		cfgPath:   cfgPath,
+		cfgPath:  cfgPath,
 		statePath: statePath,
-		now:       time.Now,
+		now:      time.Now,
+		failCool: make(map[int64]time.Time),
 	}
 }
 

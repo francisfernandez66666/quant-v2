@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -304,6 +305,14 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	if err != nil || next == nil {
 		return
 	}
+	// §失败重排队防自旋：刚失败回队尾的任务在冷却期内不出队（队列非空时其他任务先行，
+	// 空队时空转间隔=冷却窗），避免快速失败任务烧 CPU。成功/取消后清除记录。
+	s.mu.Lock()
+	if failAt, cooling := s.failCool[next.ID]; cooling && s.now().Sub(failAt) < failRetryCooldown {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
 	// 窗口外排水限制：仅 preempted（被抢占遗留）可续跑；普通 queued（含手动新提交）
 	// 必须等到盘后窗口——否则"有遗留"会变成绕过门控的后门。
 	// English: outside the window only preempted rows may run; plain queued (incl. fresh manual
@@ -565,7 +574,15 @@ func (s *Scheduler) taskCommand(cfg config.SchedulerConfig, tk *store.ResearchTa
 func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.ResearchTask) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[scheduler] 任务 #%d panic: %v", tk.ID, r)
+			// §S2 修复：panic 后任务此前永远停留 running（直到进程重启才被捞回），
+			// 期间夜间链 Done 永不置位。现落失败重排队终态并走链收尾。
+			log.Printf("[scheduler] 任务 #%d panic: %v\n%s", tk.ID, r, stackTrace())
+			errMsg := fmt.Sprintf("worker panic: %v", r)
+			if e := db.RequeueFailedTask(tk.ID, errMsg); e != nil {
+				log.Printf("[scheduler] 任务 #%d panic 后回队落库失败: %v", tk.ID, e)
+			}
+			s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
+			s.noteFailure(tk.ID)
 		}
 		s.mu.Lock()
 		s.busy = false
@@ -589,9 +606,12 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	log.Printf("[scheduler] 任务 #%d(%s prio=%s ref=%d chain=%s/%d) 启动",
 		tk.ID, tk.Type, tk.Priority, tk.RefID, tk.ChainDay, tk.ChainSeq)
 
+	// §失败重排队：失败不再落 error 终态——回队尾（updated_at 尾键沉底），不设重试上限；
+	// error 列保留最后失败原因。冷却窗防快速失败自旋。
 	fail := func(errMsg string) {
-		log.Printf("[scheduler] 任务 #%d(%s) 失败: %s", tk.ID, tk.Type, errMsg)
-		_ = db.UpdateTaskRunState(tk.ID, store.TaskError, "", 0, "", errMsg)
+		log.Printf("[scheduler] 任务 #%d(%s) 失败→回队尾重试: %s", tk.ID, tk.Type, errMsg)
+		_ = db.RequeueFailedTask(tk.ID, errMsg)
+		s.noteFailure(tk.ID)
 		s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
 	}
 
@@ -613,6 +633,8 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, bin, args...)
 	cmd.Dir = dirOfDB(cfg)
+	// §S1 孤儿防护：独立进程组 + Linux Pdeathsig（父死内核杀子），抢占/超时整组击杀
+	configureSysProcAttr(cmd)
 
 	// 输出文件化（架构修复，根除管道死锁）：子进程 stdout/stderr 直写每任务日志文件。
 	// 旧"StdoutPipe+扫描协程"链路一旦消费端停摆（journald 抖动/诊断性 QUIT 巨量输出），
@@ -810,9 +832,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 				s.mu.Lock()
 				s.cancelReq = true
 				s.mu.Unlock()
-				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
+				killProcessGroup(cmd)
 			}
 		}
 	}()
@@ -841,7 +861,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 					s.mu.Unlock()
 					if stalled {
 						log.Printf("[scheduler] 任务 #%d 进度停滞>%dm，看门狗终止", tk.ID, stallSecs/60)
-						_ = cmd.Process.Kill()
+						killProcessGroup(cmd)
 						return
 					}
 				}
@@ -864,6 +884,8 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	}
 
 	// 终态判定（优先级：抢占 > 用户取消 > 单步超时 > 运行错误 > 成功）
+	// §失败重排队：超时/运行错误不再落 error 终态——统一回队尾重试（不设上限），
+	// error 列记最后一次原因；仅用户取消保持终态。
 	status := store.TaskDone
 	errMsg := ""
 	var resultNum float64
@@ -879,15 +901,15 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		status = store.TaskCancelled
 		errMsg = "用户取消"
 	case runCtx.Err() == context.DeadlineExceeded && base.Err() == nil:
-		status = store.TaskError
-		errMsg = fmt.Sprintf("单步超时(%v)被终止", timeout)
+		status = store.TaskFailedRetry
+		errMsg = fmt.Sprintf("单步超时(%v)，已回队尾重试", timeout)
 	case base.Err() != nil:
 		// §停机语义修正：调度器 ctx 取消（SIGTERM/restart）→ preempted，断点续跑
 		status = store.TaskPreempted
 		errMsg = "调度器停止，断点缓存有效（下次启动自动回队续跑）"
 	case waitErr != nil:
-		status = store.TaskError
-		errMsg = waitErr.Error()
+		status = store.TaskFailedRetry
+		errMsg = fmt.Sprintf("运行失败(%v)，已回队尾重试", waitErr)
 	}
 	if status == store.TaskDone {
 		switch tk.Type {
@@ -912,14 +934,55 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			}
 		}
 	}
-	if err := db.UpdateTaskRunState(tk.ID, status, progress, resultNum, resultText, errMsg); err != nil {
-		log.Printf("[scheduler] 任务 #%d 终态落库失败: %v", tk.ID, err)
+	// 先落运行终态，再做状态翻转（顺序不可换：Requeue* 的 WHERE 依赖前置状态，
+	// 且翻转后不得再被 Update 覆盖回去——否则盘后门控会把 preempted 无限重启）。
+	if status != store.TaskFailedRetry {
+		if err := db.UpdateTaskRunState(tk.ID, status, progress, resultNum, resultText, errMsg); err != nil {
+			log.Printf("[scheduler] 任务 #%d 终态落库失败: %v", tk.ID, err)
+		}
 	}
 	if status == store.TaskPreempted {
 		_ = db.RequeueTask(tk.ID) // preempted → queued（队首优先级由出队排序保证）
 	}
+	if status == store.TaskFailedRetry {
+		// §失败重排队：回队尾（updated_at 沉底），error 列留最后失败原因，冷却后重试。
+		// 状态落库交给 RequeueFailedTask 一步完成（避免中间态被 peek 到）。
+		if err := db.RequeueFailedTask(tk.ID, errMsg); err != nil {
+			log.Printf("[scheduler] 任务 #%d 失败回队落库失败: %v", tk.ID, err)
+			_ = db.UpdateTaskRunState(tk.ID, store.TaskError, "", 0, "", errMsg)
+		}
+		s.noteFailure(tk.ID)
+	} else if status == store.TaskDone || status == store.TaskCancelled {
+		s.clearFailure(tk.ID) // 成功/取消清除冷却记录
+	}
 	log.Printf("[scheduler] 任务 #%d(%s) -> %s%s", tk.ID, tk.Type, status, tailOf(errMsg))
 	s.finishTask(db, cfg, &tk, status, errMsg)
+}
+
+// failRetryCooldown §失败重排队防自旋冷却窗：刚失败回队的任务在此窗口内不出队。
+// English: cooldown window before a requeued failed task may start again (anti busy-spin).
+const failRetryCooldown = 5 * time.Minute
+
+// noteFailure 记录任务失败时间（冷却起点）。
+func (s *Scheduler) noteFailure(taskID int64) {
+	s.mu.Lock()
+	if s.failCool == nil {
+		s.failCool = make(map[int64]time.Time)
+	}
+	s.failCool[taskID] = s.now()
+	s.mu.Unlock()
+}
+
+// clearFailure 成功/取消后清除冷却记录（并防 map 慢性增长）。
+func (s *Scheduler) clearFailure(taskID int64) {
+	s.mu.Lock()
+	delete(s.failCool, taskID)
+	s.mu.Unlock()
+}
+
+// stackTrace 当前 goroutine 堆栈（panic 日志用）。
+func stackTrace() string {
+	return string(debug.Stack())
 }
 
 // finishTask 任务收尾：展示状态上报 + 链治理（AbortOnError 取消同链剩余；链排空置 Done）。
@@ -931,13 +994,17 @@ func (s *Scheduler) finishTask(db *store.DB, cfg config.SchedulerConfig, tk *sto
 		disp = "interrupted"
 	case store.TaskPaused:
 		disp = "paused"
+	case store.TaskFailedRetry:
+		disp = "retrying" // §失败重排队：对外展示重试中（任务仍在队列）
 	}
 	s.recordStepState(tk.Type, disp, errMsg)
 
 	if tk.ChainDay == "" {
 		return
 	}
-	if status == store.TaskError && cfg.Nightly.AbortOnError {
+	// §失败重排队：链步骤失败同样触发 AbortOnError——失败步骤回队尾重试直至成功，
+	// 后续步骤取消（避免用残缺数据继续跑；次日链自动重建）。
+	if (status == store.TaskError || status == store.TaskFailedRetry) && cfg.Nightly.AbortOnError {
 		if n, err := db.CancelChainTasks(tk.ChainDay); err == nil && n > 0 {
 			log.Printf("[scheduler] AbortOnError：取消同链 %s 剩余 %d 个任务", tk.ChainDay, n)
 		}

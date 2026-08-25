@@ -40,6 +40,9 @@ const (
 	TaskError     = "error"
 	TaskCancelled = "cancelled" // 用户取消：终态，不自动重跑
 	TaskPreempted = "preempted" // 系统抢占/重启遗留：自动回队首续跑
+	// TaskFailedRetry §失败重排队：worker 内部伪状态——落库前立即经 RequeueFailedTask
+	// 转为 queued（队尾），不持久化该字面值。error 列保留失败原因。
+	TaskFailedRetry = "failed_retry"
 )
 
 // 控制标志（control 列取值；worker 消费后清空）。
@@ -65,7 +68,10 @@ type ResearchTask struct {
 	ChainDay   string  `json:"chain_day,omitempty"`
 	ChainSeq   int     `json:"chain_seq"`
 	Control    string  `json:"control,omitempty"`
-	CreatedAt  string  `json:"created_at"`
+	// RequeueSeq §失败重排队尾键：失败重入队时取全局 max+1，出队按它 ASC 沉底
+	// （秒级 updated_at 在同秒内无法区分先后，专用单调序列才可靠）。
+	RequeueSeq int64  `json:"requeue_seq,omitempty"`
+	CreatedAt  string `json:"created_at"`
 	StartedAt  string  `json:"started_at,omitempty"`
 	FinishedAt string  `json:"finished_at,omitempty"`
 	UpdatedAt  string  `json:"updated_at"`
@@ -97,15 +103,18 @@ func (d *DB) EnqueueResearchTask(t *ResearchTask) (int64, error) {
 }
 
 // DequeueHighestTask 取下一个应执行的任务（不出队，仅查询）：high 先于 low；
-// 同级内 preempted（自动续跑）排最前，其余按 chain_day → chain_seq → id FIFO。
-// 无可运行任务返回 (nil, nil)。English: peeks the next runnable task — high before low;
-// within a class preempted first, then chain_day/chain_seq/id FIFO. (nil, nil) when idle.
+// 同级内 preempted（自动续跑）排最前，其余按 chain_day → chain_seq → requeue_seq → id FIFO。
+// §失败重排队：requeue_seq 单调递增作为尾键——失败重新入队取全局 max+1 沉到同类末尾，
+// 不设重试上限；其他任务先行消化，空队时按冷却间隔慢速重试。（秒级时间串同秒并列不可靠，
+// 故用专用单调列。）无新任务返回 (nil, nil)。
+// English: peeks the next runnable task — high before low; preempted first; then FIFO with the
+// monotonic requeue_seq as the tail key so failed-and-requeued tasks sink to the back (no retry cap).
 func (d *DB) DequeueHighestTask() (*ResearchTask, error) {
 	row := d.db.QueryRow(`SELECT ` + researchTaskCols + ` FROM research_tasks
 		WHERE status IN ('` + TaskQueued + `','` + TaskPreempted + `')
 		ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END,
 			CASE status WHEN '` + TaskPreempted + `' THEN 0 ELSE 1 END,
-			chain_day ASC, chain_seq ASC, id ASC LIMIT 1`)
+			chain_day ASC, chain_seq ASC, requeue_seq ASC, id ASC LIMIT 1`)
 	t, err := scanResearchTask(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -217,6 +226,22 @@ func (d *DB) RequeueTask(id int64) error {
 	return err
 }
 
+// RequeueFailedTask §失败重排队：失败任务自动重新入队——排队尾（出队排序以 updated_at 为
+// 尾键，刷新即沉底），不设重试上限；error 列保留最后一次失败原因供前端展示，
+// progress/finished_at 清空等待下次运行。
+// English: re-enqueues a failed task at the queue tail (updated_at is the tail key in the dequeue
+// ordering; refreshed on requeue). No retry cap; the error column keeps the last failure reason.
+func (d *DB) RequeueFailedTask(id int64, errMsg string) error {
+	if len(errMsg) > 500 {
+		errMsg = errMsg[:500]
+	}
+	_, err := d.db.Exec(`UPDATE research_tasks SET status='queued', progress='', error=?,
+		finished_at='', updated_at=?,
+		requeue_seq=(SELECT COALESCE(MAX(requeue_seq),0)+1 FROM research_tasks)
+		WHERE id=?`, errMsg, nowStr(), id)
+	return err
+}
+
 // CancelChainTasks 把某夜间链的剩余 queued 任务全部置 cancelled（AbortOnError 用）。
 // English: cancels every queued sibling of a nightly chain (AbortOnError semantics).
 func (d *DB) CancelChainTasks(chainDay string) (int64, error) {
@@ -285,6 +310,7 @@ func (d *DB) ResetStaleRunningTasks() (int64, error) {
 const researchTaskCols = `id, type, ref_id, priority, status, progress,
 		COALESCE(result_num,0), COALESCE(result_text,''), COALESCE(error,''), payload,
 		COALESCE(chain_day,''), COALESCE(chain_seq,0), COALESCE(control,''),
+		COALESCE(requeue_seq,0),
 		created_at, COALESCE(started_at,''), COALESCE(finished_at,''), updated_at`
 
 // scanResearchTask 从一行扫描出 ResearchTask（QueryRow 与 Rows 共用）。
@@ -292,7 +318,7 @@ func scanResearchTask(s rowScanner) (*ResearchTask, error) {
 	var t ResearchTask
 	if err := s.Scan(&t.ID, &t.Type, &t.RefID, &t.Priority, &t.Status, &t.Progress,
 		&t.ResultNum, &t.ResultText, &t.Error, &t.Payload,
-		&t.ChainDay, &t.ChainSeq, &t.Control,
+		&t.ChainDay, &t.ChainSeq, &t.Control, &t.RequeueSeq,
 		&t.CreatedAt, &t.StartedAt, &t.FinishedAt, &t.UpdatedAt); err != nil {
 		return nil, err
 	}
