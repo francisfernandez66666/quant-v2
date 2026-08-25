@@ -876,17 +876,18 @@ func (e *Engine) persistStageRecords() {
 	if e.stageRecPath == "" {
 		return
 	}
+	// §E6 RLock 内值级快照：此前只拷切片头，锁外 Marshal 遍历与写方共享的底层数组（一触即溃模式）
 	e.mu.RLock()
-	f := stageRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: e.stageRecords}
+	recs := make([]newsagent.DebugInfo, len(e.stageRecords))
+	copy(recs, e.stageRecords)
 	e.mu.RUnlock()
+	f := stageRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: recs}
 	raw, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		log.Printf("[engine] stage_records 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(e.stageRecPath, raw, 0644); err != nil {
-		log.Printf("[engine] stage_records 写入失败: %v", err)
-	}
+	mustAtomicWrite("stage_records", e.stageRecPath, raw)
 }
 
 // GetStageRecords 返回当日全量 Stage 轮次记录（供复盘 / 策略侧实时调取）。
@@ -923,17 +924,18 @@ func (e *Engine) persistSignalRecords() {
 	if e.signalRecPath == "" {
 		return
 	}
+	// §E6 同上：值级快照
 	e.mu.RLock()
-	f := signalRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: e.signalRecords}
+	recsSig := make([]combat_agent.SignalLog, len(e.signalRecords))
+	copy(recsSig, e.signalRecords)
 	e.mu.RUnlock()
+	f := signalRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: recsSig}
 	raw, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		log.Printf("[engine] signal_records 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(e.signalRecPath, raw, 0644); err != nil {
-		log.Printf("[engine] signal_records 写入失败: %v", err)
-	}
+	mustAtomicWrite("signal_records", e.signalRecPath, raw)
 }
 
 // GetSignalLogs 返回当日全量信号批次记录（供前端"信号日志"弹窗按批次展示）。
@@ -1028,17 +1030,18 @@ func (e *Engine) persistHotRecords() {
 	if e.hotRecPath == "" {
 		return
 	}
+	// §E6 同上：值级快照
 	e.mu.RLock()
-	f := hotRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: e.hotRecords}
+	recsHot := make([]data.HotRecord, len(e.hotRecords))
+	copy(recsHot, e.hotRecords)
 	e.mu.RUnlock()
+	f := hotRecordFile{TradingDay: data.TradingDayDate(time.Now()), Records: recsHot}
 	raw, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		log.Printf("[engine] hot_records 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(e.hotRecPath, raw, 0644); err != nil {
-		log.Printf("[engine] hot_records 写入失败: %v", err)
-	}
+	mustAtomicWrite("hot_records", e.hotRecPath, raw)
 }
 
 // GetHotRecords 返回当日全量热点板块轮次记录（供前端展示）。
@@ -1822,11 +1825,13 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 }
 
 // SetScanner 设置板块扫描器（线程安全，透传给策略引擎）。
+// §E8 修复：锁内只换引用，子模块同步放锁外——与 SetEmotionConfig/SetNotifier 的快照模式一致，
+// 避免持 e.mu 调外部对象形成锁序隐患。
 func (e *Engine) SetScanner(scanner *data.SectorScanner) {
 	e.mu.Lock()
 	e.scanner = scanner
-	e.strategy.SetScanner(scanner)
 	e.mu.Unlock()
+	e.strategy.SetScanner(scanner)
 }
 
 // SetSectorSource 设置同花顺出口（板块名单/行情表）。
@@ -1836,12 +1841,12 @@ func (e *Engine) SetSectorSource(ths *data.THSClient) {
 	e.mu.Unlock()
 }
 
-// SetLLMClient 热重建 LLM 客户端（前端改配置时调用）。
+// SetLLMClient 热重建 LLM 客户端（前端改配置时调用）。§E8 同上：锁外透传。
 func (e *Engine) SetLLMClient(c *llm.Client) {
 	e.mu.Lock()
 	e.llmClient = c
-	e.newsAgent.SetLLMClient(c)
 	e.mu.Unlock()
+	e.newsAgent.SetLLMClient(c)
 }
 
 // ── 利好/利空开关 ──
@@ -2176,12 +2181,21 @@ func logDroppedFromPool(shown, valid []newsagent.NewsEvent) int {
 
 // TryAsyncRun 尝试异步触发一次引擎 run（盘前用）：已有异步 run 进行中则返回 false 跳过本轮，
 // 避免多 goroutine 并发重入导致状态互相覆盖；其余时段仍由主循环同步调用 Run。
+// §E1 修复：goroutine 加 panic recovery——主流水线（LLM 解析/策略扫描/板块传播）任何未预期
+// panic 此前会直接杀死整个交易进程，现降级为跳过本轮并留完整堆栈日志。
+// English: E1 fix — the async Run goroutine now recovers from panics (full stack logged) instead of
+// crashing the whole trading process; the cycle is simply skipped and asyncBusy is still released.
 func (e *Engine) TryAsyncRun(ctx context.Context, since time.Time) bool {
 	if !atomic.CompareAndSwapInt32(&e.asyncBusy, 0, 1) {
 		return false
 	}
 	go func() {
-		defer atomic.StoreInt32(&e.asyncBusy, 0)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[engine] 异步Run panic(本轮跳过): %v\n%s", r, debug.Stack())
+			}
+			atomic.StoreInt32(&e.asyncBusy, 0)
+		}()
 		e.Run(ctx, since)
 	}()
 	return true
@@ -2253,9 +2267,15 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	_poolT := time.Since(_stepPool)
 
 	// 8c. 情绪阶段（供 N 形评分硬闸）+ 8a/8b 持续打分输出容器
+	// §E2 修复：emotionCfg/llmClient 与热更新写方（SetEmotionConfig/SetLLMClient）构成数据竞争，
+	// 统一改为 RLock 快照后使用。
+	e.mu.RLock()
+	emotionCfg := e.emotionCfg
+	llmClient := e.llmClient
+	e.mu.RUnlock()
 	emotionPhase := ""
-	if e.emotionCfg != nil {
-		emotionPhase = data.DetectEmotionPhaseV2(pool, 0, 0, e.emotionCfg)
+	if emotionCfg != nil {
+		emotionPhase = data.DetectEmotionPhaseV2(pool, 0, 0, emotionCfg)
 	}
 	e.mu.Lock()
 	e.lastEmotionPhase = emotionPhase
@@ -2301,7 +2321,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// grade fairly. LLM failures are NEVER padded (no prior-round fallback, no plain-0 placeholder): they are
 	// marked RetryPending and merged back into the retry queue for a fresh LLM call next round.
 	_stepD1 := time.Now()
-	d1Scorer := combat_agent.NewD1Scorer(e.llmClient, "")
+	d1Scorer := combat_agent.NewD1Scorer(llmClient, "")
 	e.mu.RLock()
 	retries := e.d1MaxRetries
 	e.mu.RUnlock()
@@ -2394,21 +2414,25 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	}
 
 	// 10b. 涨停池增强：龙头识别 + 涨停分类 + 预期差（并入做多信号流）
+	// §E4 修复：此前不受 LongEnabled 门控——关掉做多开关后龙头识别仍发 buy 并进模拟盘建仓。
+	// 关闭时整体跳过（含 watch：用户已明确表达不关注做多侧）。
 	var gapCodes []string
 	for code := range newsBriefs {
 		gapCodes = append(gapCodes, code)
 	}
-	limitSignals := e.combatAgent.ScanLimitUp(combat_agent.ScanInput{
-		LimitUpPool:      pool,
-		IndividualStocks: gapCodes,
-		MarketData:       sr.MarketData,
-		L1Blocked:        sr.L1Blocked,
-		News:             newsBriefs,
-		Scores:           stockScores,
-		EmotionPhase:     emotionPhase,
-		PE:               peScores,
-	})
-	bullSignals = append(bullSignals, limitSignals...)
+	if e.LongEnabled() {
+		limitSignals := e.combatAgent.ScanLimitUp(combat_agent.ScanInput{
+			LimitUpPool:      pool,
+			IndividualStocks: gapCodes,
+			MarketData:       sr.MarketData,
+			L1Blocked:        sr.L1Blocked,
+			News:             newsBriefs,
+			Scores:           stockScores,
+			EmotionPhase:     emotionPhase,
+			PE:               peScores,
+		})
+		bullSignals = append(bullSignals, limitSignals...)
+	}
 
 	// 11. 利空开关开 → 做空分支
 	var bearSignals []combat_agent.Signal
@@ -2695,8 +2719,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		if pool != nil {
 			payload["zt_pool"] = fmt.Sprintf("%d", len(pool))
 		}
-		if e.emotionCfg != nil {
-			payload["emotion"] = data.DetectEmotionPhaseV2(pool, 0, 0, e.emotionCfg)
+		if emotionCfg != nil { // §E2 复用本轮 RLock 快照
+			payload["emotion"] = data.DetectEmotionPhaseV2(pool, 0, 0, emotionCfg)
 		}
 		e.sse.Broadcast(payload)
 	}
@@ -3375,6 +3399,8 @@ func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
 
 // applyEventDecay 板块事件衰减：同板块同方向事件在 H 小时内重复出现时，
 // Score 乘以 0.5^(H/4)（1h→0.84, 2h→0.71, 4h→0.50, 8h→0.25），弱化重复消息。
+// §E 修复：map 加锁（结构体注释声明 mu 保护全部可变字段，此字段是历史例外——并发
+// 手动触发/测试即 fatal concurrent map read/write）+ 清理 >24h 过期键防慢性泄漏。
 func (e *Engine) applyEventDecay(events []newsagent.NewsEvent) {
 	now := time.Now()
 	for i := range events {
@@ -3383,6 +3409,7 @@ func (e *Engine) applyEventDecay(events []newsagent.NewsEvent) {
 			continue
 		}
 		key := strings.Join(ev.Sectors, "+") + "|" + ev.Direction
+		e.mu.Lock()
 		if last, ok := e.sectorEventTimes[key]; ok {
 			hours := now.Sub(last).Hours()
 			if hours > 0 && hours < 24 {
@@ -3390,7 +3417,14 @@ func (e *Engine) applyEventDecay(events []newsagent.NewsEvent) {
 				log.Printf("[engine] 事件衰减 %s(%s): 距上次%.1fh, score→%.2f", key, ev.Title, hours, ev.Score)
 			}
 		}
+		// 惰性清理：衰减窗口仅 24h，过期条目已无作用
+		for k, t := range e.sectorEventTimes {
+			if now.Sub(t).Hours() >= 24 {
+				delete(e.sectorEventTimes, k)
+			}
+		}
 		e.sectorEventTimes[key] = now
+		e.mu.Unlock()
 	}
 }
 

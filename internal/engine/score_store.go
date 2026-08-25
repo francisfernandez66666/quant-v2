@@ -7,6 +7,7 @@ package engine
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"sync"
 
@@ -67,11 +68,11 @@ func (s *scoreStore) Save(day string, scores map[string]combat_agent.StockScores
 
 	raw, err := json.MarshalIndent(scoreStoreFile{TradingDay: day, Scores: scores}, "", "  ")
 	if err != nil {
+		log.Printf("[engine] scores 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(s.path, raw, 0644); err != nil {
-		return
-	}
+	// §E3 原子写：防 crash/OOM 截断（此前失败静默 return，磁盘满无感知）
+	mustAtomicWrite("scores", s.path, raw)
 }
 
 // Load 读取磁盘打分记录（跨交易日保留最近一次，前端由新轮次覆盖）。

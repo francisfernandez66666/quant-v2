@@ -221,6 +221,10 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 		r.mu.Unlock()
 		return nil
 	}
+	r.mu.Unlock()
+
+	// §E9 修复：磁盘恢复 IO（paper.New 读 paper.json）此前发生在全局锁内，会卡住所有账号
+	// 的 5s 调度路径；改为锁外构建、重取锁二次检查后再注册。
 	cfg := r.opts.Paper.Cfg()
 	pe := paper.New(cfg, r.paperPath(userID))
 	// 两本账合一（阶段1.2）：paper 为唯一真实账本，开仓/清仓镜像写 report 持仓账，
@@ -237,6 +241,11 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	}
 	if r.paperLabelFn != nil {
 		pe.SetPoolLabelResolver(r.paperLabelFn)
+	}
+	r.mu.Lock()
+	if cur, ok := r.papers[userID]; ok { // 并发双构建：先到者胜
+		r.mu.Unlock()
+		return cur
 	}
 	r.papers[userID] = pe
 	r.mu.Unlock()
@@ -333,12 +342,16 @@ func (r *Registry) checkDayClose(userID string, pe *paper.Engine, now time.Time)
 		r.mu.Unlock()
 		return
 	}
-	r.paperExportDay[userID] = day
 	hook := r.dayCloseHook
 	r.mu.Unlock()
+	// §E7 修复：先执行 hook 成功后再记账——此前先占坑后执行，DB 抖动一次该账号当日
+	// 研究数据即缺失且当天永不重试。导出本身幂等（store 唯一键兜底），重跑安全。
 	if hook != nil {
 		hook(userID, pe)
 	}
+	r.mu.Lock()
+	r.paperExportDay[userID] = day
+	r.mu.Unlock()
 }
 
 // SetDayCloseExport 注入盘后导出回调（main 接线 server.ExportPaperToResearch：把模拟盘当日成交与
@@ -471,6 +484,17 @@ func (r *Registry) GetOrCreate(userID string) *Engine {
 	// 无匹配共享引擎 → 构建新引擎（构建在锁外，避免持锁做耗时工作）
 	e := r.build(userID)
 	r.mu.Lock()
+	// §E5 修复：构建期间同指纹用户 B 可能已先注册——二次检查，丢弃重复引擎，
+	// 否则相同配置算两遍且两引擎流水线各自为政。
+	if cur, ok := r.cores[fp]; ok {
+		r.byUser[userID] = cur
+		r.initDone[userID] = true
+		r.initProg[userID] = &InitStage{Stage: "ready", Percent: 100, EtaSec: 0}
+		r.registerUser(cur, userID)
+		r.mu.Unlock()
+		log.Printf("[registry] 同指纹引擎已被并发构建，复用现有实例 (user=%s fp=%s)", userID, fp[:12])
+		return cur
+	}
 	r.cores[fp] = e
 	r.byUser[userID] = e
 	r.initDone[userID] = true

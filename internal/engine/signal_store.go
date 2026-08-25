@@ -175,9 +175,8 @@ func (s *signalStore) save() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(s.path, raw, 0644); err != nil {
-		log.Printf("[engine] signal_store 写入失败: %v", err)
-	}
+	// §E3 原子写：固化信号/墓碑是 autoPlace 幂等依据，截断=假信号复活可再次下单
+	mustAtomicWrite("signals_today", s.path, raw)
 }
 
 // mergeSignals 合并当前轮信号与当日固化信号（固化集合在前，冲突由聚合器按 code 去重裁决）。
