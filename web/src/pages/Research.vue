@@ -167,7 +167,7 @@
 
         <!-- 止盈×止损热力网格（格值=跨持仓/门槛最优期望，颜色=正负深浅） -->
         <div class="lib-group-title" style="margin-top:10px">止盈×止损 热力网格<span style="font-size:11px;color:var(--muted,#888)">（格值 %：该格跨持仓/门槛最优期望；点击格高亮）</span></div>
-        <div v-if="optCurHeat.rows.length" style="overflow-x:auto">
+        <div v-if="optCurHeat.tps.length" style="overflow-x:auto">
           <table class="heat-table">
             <thead>
               <tr><th>止盈\止损</th><th v-for="sl in optCurHeat.sls" :key="'h'+sl">{{ fmtNum(sl) }}%</th></tr>
@@ -1335,7 +1335,7 @@ function heatVal(tp, sl) {
 }
 /** 热力格颜色：期望越高越绿、越低越红，零附近中性。 */
 function heatColor(exp) {
-  if (exp === null || exp === undefined) return 'transparent'
+  if (exp === null || exp === undefined || isNaN(Number(exp))) return 'transparent'
   const clamped = Math.max(-5, Math.min(5, exp))
   const alpha = 0.12 + Math.abs(clamped) / 5 * 0.55
   return clamped >= 0 ? `rgba(34,197,94,${alpha.toFixed(2)})` : `rgba(239,68,68,${alpha.toFixed(2)})`
