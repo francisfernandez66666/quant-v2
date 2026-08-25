@@ -229,13 +229,13 @@ func TestEndToEndFullPipeline(t *testing.T) {
 	}
 
 	t.Run("LLM调用覆盖", func(t *testing.T) {
-		if len(rig.calls.stage0) == 0 {
+		if rig.calls.lenOf("stage0") == 0 {
 			t.Error("Stage0/1合并(质检) LLM 未被调用")
 		}
-		if len(rig.calls.stage2) < 2 {
-			t.Errorf("Stage2 深度分析 LLM 调用次数 <2, got %d (个股批次+板块批次)", len(rig.calls.stage2))
+		if rig.calls.lenOf("stage2") < 2 {
+			t.Errorf("Stage2 深度分析 LLM 调用次数 <2, got %d (个股批次+板块批次)", rig.calls.lenOf("stage2"))
 		}
-		if len(rig.calls.d1) == 0 {
+		if rig.calls.lenOf("d1") == 0 {
 			t.Error("D1 批量评分 LLM 未被调用")
 		}
 	})
@@ -491,12 +491,12 @@ func TestEndToEndFullPipeline(t *testing.T) {
 	t.Run("N形D1链路", func(t *testing.T) {
 		// 链路验证：D1 评分(LLM) → buildCtx 透传 → calcD1(d1>0) 进入总分 → 闸门(D1>0 且 Total≥60) → 信号。
 		// 改前 buildCtx 不读 D1Scores，d1 恒 0 永不进入总分/永不 Valid；改后 mock D1=0.3 应使 300308 的 NScore>0。
-		if len(rig.calls.d1) == 0 {
+		if rig.calls.lenOf("d1") == 0 {
 			t.Error("D1 批量评分 LLM 未被调用（链路在 D1Scorer 处断裂）")
 		}
 		// 1) 300308 应被 D1 评分（mock 返回非零分）
 		d1Found := false
-		for _, d1call := range rig.calls.d1 {
+		for _, d1call := range rig.calls.snapshot("d1") {
 			if strings.Contains(d1call, "300308") {
 				d1Found = true
 				break

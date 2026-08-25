@@ -4,25 +4,31 @@ package newsagent
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/llm"
 )
 
 // mockIPOTransport 提供东财新股日历 mock（宇树科技 688836 明日上市）。
+// 上市日期用相对日期（明天）：parseEastMoneyIPO 只保留今日及以后的记录，
+// 写死的历史日期会随时间腐烂（20260819 实录：测试跑过 fixture 日期后集体失效）。
 type mockIPOTransport struct{}
 
 func (m *mockIPOTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 仅拦截东财 IPO 日历，其余返回空
 	if strings.Contains(req.URL.Host, "eastmoney.com") && strings.Contains(req.URL.RawQuery, "IPOAPPLY") {
-		body := `{"success":true,"result":{"data":[
-			{"SECURITY_CODE":"688836","SECURITY_NAME":"宇树科技","APPLY_DATE":"20260818","ISSUE_PRICE":150.80,"LISTING_DATE":"20260819","SECURITY_MARKET_ABBR":"科创板"}
-		]}}`
+		tomorrow := time.Now().AddDate(0, 0, 1).Format("20060102")
+		apply := time.Now().Format("20060102")
+		body := fmt.Sprintf(`{"success":true,"result":{"data":[
+			{"SECURITY_CODE":"688836","SECURITY_NAME":"宇树科技","APPLY_DATE":%q,"ISSUE_PRICE":150.80,"LISTING_DATE":%q,"SECURITY_MARKET_ABBR":"科创板"}
+		]}}`, apply, tomorrow)
 		return &http.Response{
 			StatusCode: 200, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)),
 		}, nil

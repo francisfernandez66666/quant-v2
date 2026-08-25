@@ -68,16 +68,16 @@ func TestD1RetryQueueAcrossRuns(t *testing.T) {
 	if !ok {
 		t.Fatalf("第一轮 300308 无 D1 记录")
 	}
-	t.Logf("第一轮(Normal) 300308 D1=%.2f RetryPending=%v D1调用=%d", sc1.Score, sc1.RetryPending, len(rig.calls.d1))
+	t.Logf("第一轮(Normal) 300308 D1=%.2f RetryPending=%v D1调用=%d", sc1.Score, sc1.RetryPending, rig.calls.lenOf("d1"))
 	if sc1.Score <= 0 || sc1.RetryPending {
 		t.Fatalf("第一轮 300308 D1 应>0 且非 RetryPending, got %+v", sc1)
 	}
-	firstD1Calls := len(rig.calls.d1)
+	firstD1Calls := rig.calls.lenOf("d1")
 
 	// ── 第二轮：mock D1 返回 500 → 标记 RetryPending，并入重试队列（不回退上一轮）──
-	rig.calls.failD1 = true
+	rig.calls.SetFailD1(true)
 	rig.eng.Run(context.Background(), since)
-	if len(rig.calls.d1) <= firstD1Calls {
+	if rig.calls.lenOf("d1") <= firstD1Calls {
 		t.Fatal("第二轮 D1 LLM 未被调用（失败重试路径未触发）")
 	}
 	d1s2 := rig.eng.LastD1Scores()
@@ -85,7 +85,7 @@ func TestD1RetryQueueAcrossRuns(t *testing.T) {
 	if !ok {
 		t.Fatalf("第二轮 300308 无 D1 记录")
 	}
-	t.Logf("第二轮(Fail) 300308 D1=%.2f RetryPending=%v D1调用=%d (新增%d次失败)", sc2.Score, sc2.RetryPending, len(rig.calls.d1), len(rig.calls.d1)-firstD1Calls)
+	t.Logf("第二轮(Fail) 300308 D1=%.2f RetryPending=%v D1调用=%d (新增%d次失败)", sc2.Score, sc2.RetryPending, rig.calls.lenOf("d1"), rig.calls.lenOf("d1")-firstD1Calls)
 	if sc2.Score != 0 || !sc2.RetryPending {
 		t.Fatalf("第二轮 D1 失败应标记 RetryPending 且 Score=0（不回退上一轮）, got %+v", sc2)
 	}
@@ -94,14 +94,14 @@ func TestD1RetryQueueAcrossRuns(t *testing.T) {
 	}
 
 	// ── 第三轮：mock 恢复 → 300308 经重试队列重新调 LLM → D1 恢复、退出重试队列 ──
-	rig.calls.failD1 = false
+	rig.calls.SetFailD1(false)
 	rig.eng.Run(context.Background(), since)
 	d1s3 := rig.eng.LastD1Scores()
 	sc3, ok := d1s3["300308"]
 	if !ok {
 		t.Fatalf("第三轮 300308 无 D1 记录")
 	}
-	t.Logf("第三轮(Recover) 300308 D1=%.2f RetryPending=%v D1调用=%d", sc3.Score, sc3.RetryPending, len(rig.calls.d1))
+	t.Logf("第三轮(Recover) 300308 D1=%.2f RetryPending=%v D1调用=%d", sc3.Score, sc3.RetryPending, rig.calls.lenOf("d1"))
 	if sc3.Score <= 0 || sc3.RetryPending {
 		t.Fatalf("第三轮 300308 D1 应恢复>0 且退出重试状态, got %+v", sc3)
 	}

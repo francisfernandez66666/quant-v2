@@ -304,17 +304,17 @@ func newLatencyLLM(profile *LatencyProfile, metrics *simMetrics) (*httptest.Serv
 		var stage int
 		switch {
 		case strings.Contains(system, "股票投资顾问"):
-			calls.consult = append(calls.consult, system)
+			calls.record("consult", system)
 			content = "已收到咨询。"
 			metrics.addOther(profile.llmDuration(20))
 		case strings.Contains(system, "质检与价值判断"):
-			calls.stage0 = append(calls.stage0, user)
+			calls.record("stage0", user)
 			content = mockStage0JSON(user)
 			stage = profile.Stage0Tokens
 			metrics.addStage0(profile.llmDuration(stage))
 		case strings.Contains(system, "D1事件评分"):
-			calls.d1 = append(calls.d1, user)
-			if calls.failD1 {
+			calls.record("d1", user)
+			if calls.IsFailD1() {
 				http.Error(w, "mock D1 failure", 500)
 				return
 			}
@@ -322,7 +322,7 @@ func newLatencyLLM(profile *LatencyProfile, metrics *simMetrics) (*httptest.Serv
 			stage = profile.D1Tokens
 			metrics.addD1(profile.llmDuration(stage))
 		case strings.Contains(system, "热点分析专家"):
-			calls.stage2 = append(calls.stage2, user)
+			calls.record("stage2", user)
 			content = mockStage2JSON(user)
 			stage = profile.Stage2Tokens
 			metrics.addStage2(profile.llmDuration(stage))

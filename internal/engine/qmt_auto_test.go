@@ -131,8 +131,10 @@ func TestAutoPlaceSkipsTripped(t *testing.T) {
 }
 
 // TestAutoPlacePriceFromLive 现价优先于信号触发价。
+// §R0.7 后高价股不强凑一手：105 元×100 股=10500 > 旧默认预算 10000 会被正确跳过——
+// 测试预算提高到 20000 以继续验证"现价优先"语义（qty = 20000/105 → 190 → 整手 100）。
 func TestAutoPlacePriceFromLive(t *testing.T) {
-	e, _, _, orders := newQMTEngine(t, nil)
+	e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.FixedAmount = 20000 })
 	sig := combat_agent.Signal{ID: "S1", Code: "300750", Name: "宁德", Strategy: "龙头", Direction: "做多", Price: 100}
 	e.autoPlace(sig, map[string]*data.StockInfo{"300750": {Code: "300750", Price: 105}})
 	if len(*orders) != 1 {
@@ -145,7 +147,7 @@ func TestAutoPlacePriceFromLive(t *testing.T) {
 	if o["price"].(float64) != 105 {
 		t.Fatalf("should use live price 105, got %v", o["price"])
 	}
-	if o["qty"].(float64) != 100 { // 10000/105 → 95 → 不足一手兜底 100
+	if o["qty"].(float64) != 100 { // 20000/105=190 股 → 整手取整 100
 		t.Fatalf("qty floor to one lot: %v", o["qty"])
 	}
 }

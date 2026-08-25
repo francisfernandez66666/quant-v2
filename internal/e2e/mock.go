@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -293,12 +294,21 @@ func (t *fixtureTransport) emLimitUpPool(req *http.Request) (*http.Response, err
 }
 
 // emIPO 东财新股日历。
+// §日期防腐：parseEastMoneyIPO 只保留今日及以后上市的新股——fixture 快照日期会腐烂
+// （20260819 实录：8/4 摄取的快照 8/19 后全被过滤，IPO 日历事件归零）。这里把每条
+// 记录的日期改写为 申购=今天 / 上市=明天，保持"当日真实条数"的数据驱动语义不变。
 func (t *fixtureTransport) emIPO(req *http.Request) (*http.Response, error) {
+	today := time.Now().Format("20060102")
+	tomorrow := time.Now().AddDate(0, 0, 1).Format("20060102")
 	data := make([]map[string]interface{}, 0, len(t.fix.IPO))
 	for _, s := range t.fix.IPO {
+		listing := tomorrow
+		if s.ListingDate >= today { // 未来日期保留原值（测试显式控制过期场景）
+			listing = s.ListingDate
+		}
 		data = append(data, map[string]interface{}{
 			"SECURITY_CODE": s.Code, "SECURITY_NAME": s.Name,
-			"APPLY_DATE": s.IPODate, "ISSUE_PRICE": s.IssuePrice, "LISTING_DATE": s.ListingDate,
+			"APPLY_DATE": today, "ISSUE_PRICE": s.IssuePrice, "LISTING_DATE": listing,
 		})
 	}
 	return t.json(map[string]interface{}{
@@ -471,6 +481,8 @@ func response(code int, contentType string, body []byte) *http.Response {
 
 // llmCalls 记录 mock LLM 的调用类型与请求文本。
 type llmCalls struct {
+	mu sync.Mutex // §-race：handler goroutine 写、测试 goroutine 读，必须互斥
+
 	stage0 []string
 	stage2 []string
 	d1     []string
@@ -482,7 +494,82 @@ type llmCalls struct {
 	consultMsgs [][]roleMsg
 
 	// failD1 置为 true 后，mock 对 D1 评分请求返回 500，用于验证 D1 失败标记待重试并入重试队列。
+	// 经 SetFailD1/读取器访问（加锁）；测试直接赋值已改为 SetFailD1。
 	failD1 bool
+}
+
+// record 追加一条记录（加锁）。
+func (c *llmCalls) record(kind, v string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch kind {
+	case "stage0":
+		c.stage0 = append(c.stage0, v)
+	case "stage2":
+		c.stage2 = append(c.stage2, v)
+	case "d1":
+		c.d1 = append(c.d1, v)
+	case "consult":
+		c.consult = append(c.consult, v)
+	}
+}
+
+// recordMsgs 追加一组消息记录（加锁）。
+func (c *llmCalls) recordMsgs(msgs []roleMsg) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.consultMsgs = append(c.consultMsgs, msgs)
+}
+
+// lenOf 某类记录的当前长度（加锁快照）。
+func (c *llmCalls) lenOf(kind string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch kind {
+	case "stage0":
+		return len(c.stage0)
+	case "stage2":
+		return len(c.stage2)
+	case "d1":
+		return len(c.d1)
+	case "consult":
+		return len(c.consult)
+	}
+	return 0
+}
+
+// SetFailD1 设置 D1 失败开关（加锁；测试与 handler 异步可见）。
+func (c *llmCalls) SetFailD1(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failD1 = v
+}
+
+// snapshot 返回某类记录的副本（加锁；测试遍历用）。
+func (c *llmCalls) snapshot(kind string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var src []string
+	switch kind {
+	case "stage0":
+		src = c.stage0
+	case "stage2":
+		src = c.stage2
+	case "d1":
+		src = c.d1
+	case "consult":
+		src = c.consult
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
+// IsFailD1 读取 D1 失败开关（加锁）。
+func (c *llmCalls) IsFailD1() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failD1
 }
 
 // roleContent 咨询请求中的一条消息（role + content）。
@@ -520,19 +607,19 @@ func newMockLLMServer() (*httptest.Server, *llmCalls) {
 		switch {
 		case strings.Contains(system, "股票投资顾问"):
 			// 股票咨询：记录注入的 system prompt（专业模式含实时行情上下文）与完整消息序列，返回确定性回复。
-			calls.consult = append(calls.consult, system)
+			calls.record("consult", system)
 			msgs := make([]roleMsg, 0, len(req.Messages))
 			for _, m := range req.Messages {
 				msgs = append(msgs, roleMsg{Role: m.Role, Content: m.Content})
 			}
-			calls.consultMsgs = append(calls.consultMsgs, msgs)
+			calls.recordMsgs(msgs)
 			content = "已收到您的咨询。根据实测数据：卧龙电驱今日主力净流入-22200万元，现价36.86元，涨跌幅3.34%。请注意当前行情仅供分析参考，不构成投资建议。"
 		case strings.Contains(system, "质检与价值判断"):
-			calls.stage0 = append(calls.stage0, user)
+			calls.record("stage0", user)
 			content = mockStage0JSON(user)
 		case strings.Contains(system, "D1事件评分"):
-			calls.d1 = append(calls.d1, user)
-			if calls.failD1 {
+			calls.record("d1", user)
+			if calls.IsFailD1() {
 				// 模拟 D1 LLM 整批失败（500）：BatchScore 轮询重试失败后标记 RetryPending，
 				// 失败股并入重试队列，下轮重新调 LLM（不回退上一轮评分、不归0兜底）
 				http.Error(w, "mock D1 LLM failure", 500)
@@ -540,7 +627,7 @@ func newMockLLMServer() (*httptest.Server, *llmCalls) {
 			}
 			content = mockD1JSON(user)
 		case strings.Contains(system, "热点分析专家"):
-			calls.stage2 = append(calls.stage2, user)
+			calls.record("stage2", user)
 			content = mockStage2JSON(user)
 		default:
 			content = "[]"
