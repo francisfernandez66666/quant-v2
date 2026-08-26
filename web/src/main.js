@@ -43,6 +43,9 @@ import Watchlist from './pages/Watchlist.vue'
 // 持仓页：持仓列表与可用资金管理
 // Positions page: holdings list and available-cash management
 import Positions from './pages/Positions.vue'
+// 量化交易页：实盘链路状态、仓位纪律与战法白名单控制
+// Quant page: live link status, position discipline and strategy whitelist control
+import Quant from './pages/Quant.vue'
 // 板块热点页：当日热门板块及轮次记录
 // Hotspot page: today's hot sectors and rotation records
 import Hotspot from './pages/Hotspot.vue'
@@ -88,6 +91,9 @@ const routes = [
   // 持仓：查看 / 更新持仓与可用资金
   // Positions: view / update holdings and available cash
   { path: '/positions', component: Positions },
+  // 量化交易：实盘链路开关、仓位纪律与战法白名单
+  // Quant: live link switch, position discipline and strategy whitelist
+  { path: '/quant', component: Quant },
   // 热点：板块热点与轮次快照
   // Hotspot: sector hotspots and rotation snapshots
   { path: '/hotspot', component: Hotspot },

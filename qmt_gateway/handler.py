@@ -14,7 +14,6 @@
 in order with bounded retries, so slow Seoul never blocks channel callbacks nor loses events.
 Empty position snapshots are ignored (with warning) unless seen twice consecutively.）
 """
-import collections
 import logging
 import threading
 import time
@@ -24,6 +23,7 @@ import urllib.error
 log = logging.getLogger("qmt_gateway.handler")
 
 RETRY_DELAYS = [1, 2, 4]  # 秒，指数退避
+HEARTBEAT_SEC = 60        # §ROBUST 上行心跳间隔（尽力而为，不入持久化队列）
 
 
 def post_report(base_url, token, payload, retries=3):
@@ -65,11 +65,13 @@ class ReportHandler:
         self.disconnected = False
         # §G5 连续空快照计数（对账清空守卫）
         self._empty_snaps = 0
-        # §G9 outbox：回调入队、后台线程按序发送
-        self._outbox = collections.deque()
+        # §ROBUST outbox 改为 store 持久化队列（崩溃/重启续发，不丢回报）；
+        # _pending 仅作 sender 唤醒信号。max_outbox 转义为落库行数上限。
         self._outbox_cv = threading.Condition()
+        self._pending = 0
         self._stop = threading.Event()
         self._sender_thread = None
+        self._heartbeat_thread = None
         self._max_outbox = max_outbox
 
     def start_sender(self):
@@ -78,6 +80,10 @@ class ReportHandler:
         self._sender_thread = threading.Thread(
             target=self._send_loop, name="report-sender", daemon=True)
         self._sender_thread.start()
+        # §ROBUST 上行心跳：无交易时段也周期证明回程连通（首尔侧刷新 last_report_at）
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="report-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
 
     def stop_sender(self):
         self._stop.set()
@@ -85,26 +91,43 @@ class ReportHandler:
             self._outbox_cv.notify_all()
 
     def _send_loop(self):
+        """持久化 outbox 消费循环：按序取最旧一条 → 发送 → 成功出队；失败指数退避无限重试。
+        进程重启后自动从库里续发上次未完成的回报（配合首尔幂等，重发安全）。"""
         backoff = 2
         while not self._stop.is_set():
-            item = None
-            with self._outbox_cv:
-                while not self._outbox and not self._stop.is_set():
-                    self._outbox_cv.wait(timeout=1)
-                if self._outbox:
-                    item = self._outbox[0]
+            item = self.store.outbox_oldest()
             if item is None:
-                continue
-            ok = post_report(self.report_url, self.report_token, item)
-            if ok:
                 with self._outbox_cv:
-                    self._outbox.popleft()
-                    self._outbox_cv.notify_all()
+                    self._pending = 0
+                    while not self._stop.is_set() and self._pending == 0 \
+                            and self.store.outbox_count() == 0:
+                        self._outbox_cv.wait(timeout=1)
+                continue
+            oid, payload = item
+            if payload is None:  # 坏行（不可解析）：丢弃防卡队
+                log.error("[handler] outbox row %s unparsable — dropped", oid)
+                self.store.outbox_delete(oid)
+                continue
+            if post_report(self.report_url, self.report_token, payload):
+                self.store.outbox_delete(oid)
                 backoff = 2
             else:
                 # 滞留队首无限重试：交易回报不允许静默丢失
                 time.sleep(min(backoff, 30))
                 backoff *= 2
+
+    def _heartbeat_loop(self):
+        """上行心跳：每 60s 尽力而为发一条 type=heartbeat（不入持久化队列，
+        失败只告警——它承载的是「回程连通性」信号而非交易数据）。"""
+        while not self._stop.is_set():
+            if self._stop.wait(HEARTBEAT_SEC):
+                return
+            if not self.report_url:
+                continue
+            ok = post_report(self.report_url, self.report_token,
+                             {"type": "heartbeat", "user_id": self.user_id}, retries=1)
+            if not ok:
+                log.warning("[handler] heartbeat push failed (uplink degraded)")
 
     # ── xtquant 回调 / mock 直调 ──
     def on_stock_order(self, order):
@@ -190,12 +213,13 @@ class ReportHandler:
         if not self.report_url:
             return
         payload["user_id"] = self.user_id
+        # §ROBUST 先落库后发送：崩溃/重启不丢回报；超上限删最旧（极端保护）
+        self.store.outbox_enqueue(payload)
+        dropped = self.store.outbox_trim(self._max_outbox)
+        if dropped:
+            log.error("[handler] durable outbox overflow, dropped %d oldest events", dropped)
         with self._outbox_cv:
-            if len(self._outbox) >= self._max_outbox:
-                dropped = self._outbox.popleft()
-                log.error("[handler] outbox overflow (%d), dropping oldest event type=%s",
-                          self._max_outbox, dropped.get("type"))
-            self._outbox.append(payload)
+            self._pending += 1
             self._outbox_cv.notify_all()
 
 

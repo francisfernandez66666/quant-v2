@@ -654,6 +654,10 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		return
 	}
 	amount := cfg.FixedAmount
+	// §QUANT-TAB 每战法仓位大小：该战法配置了正数金额则覆盖全局 fixed_amount（量化交易页可配）
+	if v := cfg.StrategyAmounts[sig.Strategy]; v > 0 {
+		amount = v
+	}
 	if amount <= 0 {
 		amount = 10000
 	}

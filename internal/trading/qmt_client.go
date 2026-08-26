@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -30,17 +31,30 @@ type QMTClient struct {
 }
 
 // NewQMTClient 创建网关客户端。
-// English: NewQMTClient builds a gateway client.
+// Transport 细粒度超时（§ROBUST）：跨网链路故障常表现为「连接挂起」而非快速失败——
+// 拨号 5s / TLS 握手 5s / 响应头独立限时，避免整体 Timeout 之前长时间占用探测与下单路径。
+// English: NewQMTClient builds the gateway client with fine-grained transport timeouts so that a
+// hanging cross-border link fails fast on dial/TLS instead of stalling until the overall timeout.
 func NewQMTClient(baseURL, token string, timeout time.Duration, retries int) *QMTClient {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: timeout,
 	}
 	return &QMTClient{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		token:      token,
 		timeout:    timeout,
 		retries:    retries,
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: &http.Client{Timeout: timeout, Transport: transport},
 	}
 }
 
@@ -123,6 +137,11 @@ func (c *QMTClient) order(req OrderRequest) (*OrderResult, error) {
 		cancel()
 		if err != nil {
 			lastErr = err
+			// §ROBUST 线性退避（250ms×序号）：跨网瞬断时紧背靠背重试只会三连败，
+			// 给链路一点喘息；下单幂等由 signal_id 唯一键保证，重试安全。
+			if i+1 < attempts {
+				time.Sleep(time.Duration(250*(i+1)) * time.Millisecond)
+			}
 			continue
 		}
 		return &OrderResult{OK: out.OK, OrderID: out.OrderID, Err: out.Err}, nil
@@ -138,9 +157,18 @@ func (c *QMTClient) Cancel(orderID string) error {
 	return c.do(ctx, http.MethodPost, "/cancel", map[string]string{"order_id": orderID}, nil)
 }
 
-// State 查询网关状态与持仓（对账源）。
-// English: queries gateway state and positions (reconciliation source).
+// State 查询网关状态与持仓（对账源）。失败自动重试一次（§ROBUST：对账是周期任务，
+// 单次网络抖动不值得让整轮对账失败）。
 func (c *QMTClient) State() (*GatewayState, error) {
+	st, err := c.stateOnce()
+	if err != nil {
+		time.Sleep(400 * time.Millisecond)
+		return c.stateOnce()
+	}
+	return st, nil
+}
+
+func (c *QMTClient) stateOnce() (*GatewayState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	var raw struct {
@@ -170,7 +198,20 @@ func (c *QMTClient) State() (*GatewayState, error) {
 // parser dropped broker_connected, so "Python alive but xtquant channel dead" looked healthy — the
 // breaker never tripped and new orders kept hitting gateway 503s while ghost placeholders piled up
 // in Seoul. Legacy gateways without the field now fail closed (fail-safe); upgrade qmt_gateway accordingly.
+// Health 探测网关健康（失败自动重探一次，§ROBUST：跨网探测抖动缓冲，避免单次
+// 丢包就计入熔断窗口/触发告警）。语义见 healthOnce 注释。
+// English: probes gateway health with a single automatic re-probe on error to absorb
+// transient cross-border jitter.
 func (c *QMTClient) Health() (bool, error) {
+	ok, err := c.healthOnce()
+	if err != nil {
+		time.Sleep(400 * time.Millisecond)
+		return c.healthOnce()
+	}
+	return ok, nil
+}
+
+func (c *QMTClient) healthOnce() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	var out struct {

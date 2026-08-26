@@ -181,6 +181,7 @@
         <span>快照 {{ scanStats.total_stocks || 0 }}股 / {{ scanStats.hot_sector_count || 0 }}板块</span>
         <span>原始 {{ scanStats.raw_signals || 0 }} → 最终 {{ scanStats.final_signals || 0 }}</span>
         <span>流程引擎：新闻抓取{{ engineHealth.news_agent ? "●" : "○" }} 策略引擎{{ engineHealth.strategy_engine ? "●" : "○" }} 板块验证{{ engineHealth.sector_agent ? "●" : "○" }} 战法扫描{{ engineHealth.combat_agent ? "●" : "○" }} LLM{{ engineHealth.llm ? "●" : "○" }} 同花顺{{ engineHealth.ths ? "●" : "○" }} 聚合器{{ engineHealth.aggregator ? "●" : "○" }}</span>
+        <span v-if="qmtLine">实盘链路：{{ qmtLine }}</span>
       </div>
     </div>
   </div>
@@ -204,10 +205,42 @@ const dataSourceHealth = ref({})      // 数据源健康状况（东财/新浪/�
 const newsSourceHealth = ref({})      // 新闻源健康状况（财联社/同花顺/新浪）
 const engineHealth = ref({})          // 流程引擎子系统健康状况
 const strategyStats = ref({})         // 按战法分组的胜率统计（来自 /api/dashboard 的 report_stats.by_strategy）
+const qmtState = ref(null)            // 实盘互通健康快照（首尔→广州探测 + 广州回报新鲜度，/api/qmt/state）
 
 let timer = null                      // 定时轮询句柄 (polling timer handle)
 let sseUnsub = null                   // SSE 取消订阅函数 (SSE unsubscribe function)
 let visibilityHandler = null         // 页面可见性切换回调（暂停/恢复轮询）
+let qmtTimer = null                   // 实盘互通状态轮询句柄（15s，独立于主轮询）
+
+// ── 实盘互通健康行文案 ──
+// 形如：● 43ms 手动 正常 回报12s前 / ○ 120ms 自动 ⚠熔断:网关心跳连续失联超过2m0s
+/** 把后端时间戳格式化为"x秒前/x分钟前/x小时前"；零值时间(0001-01-01)表示从未发生，返回空串 */
+function fmtAgo(ts) {
+  if (!ts || String(ts).startsWith('0001')) return ''
+  const sec = Math.floor((Date.now() - new Date(ts).getTime()) / 1000)
+  if (!Number.isFinite(sec) || sec < 0) return ''
+  if (sec < 60) return sec + 's前'
+  if (sec < 3600) return Math.floor(sec / 60) + 'm前'
+  return Math.floor(sec / 3600) + 'h前'
+}
+
+const qmtLine = computed(() => {
+  const s = qmtState.value
+  if (!s || !s.enabled) return ''
+  const parts = []
+  parts.push(s.last_probe_ok ? '●' : '○')
+  if (s.last_latency_ms > 0) parts.push(s.last_latency_ms + 'ms')
+  parts.push(s.mode === 'auto' ? '自动' : '手动')
+  parts.push(s.tripped ? ('⚠熔断' + (s.trip_reason ? ':' + s.trip_reason : '')) : '正常')
+  const ra = fmtAgo(s.last_report_at)
+  if (ra) parts.push('回报' + ra)
+  return parts.join(' ')
+})
+
+/** 拉取实盘互通快照；未接入实盘(enabled=false)时行自动隐藏 */
+async function loadQMT() {
+  try { qmtState.value = await api.fetchQMTState() } catch (e) { /* 接口异常不影响整页 */ }
+}
 
 // ── 计算属性 ── (Computed properties)
 /** 扫描统计字段快捷引用（服务端状态里的 scan_stats 子对象，未返回时兜底为空对象） (Shortcut to scan_stats sub-object in server status; falls back to {} when absent) */
@@ -336,6 +369,9 @@ function handleSSE(msg) {
 onMounted(() => {
   load()
   timer = setInterval(load, 5000)
+  // 实盘互通状态：独立 15s 轮询（后端探测本身有 miss_heartbeat/2 节流，这里只是读快照）
+  loadQMT()
+  qmtTimer = setInterval(loadQMT, 15000)
   // 订阅后端 SSE 事件 (subscribe to backend SSE events)
   api.connectSSE()
   sseUnsub = api.onSSE(handleSSE)
@@ -343,10 +379,15 @@ onMounted(() => {
   visibilityHandler = () => {
     if (document.hidden) {
       if (timer) { clearInterval(timer); timer = null }
+      if (qmtTimer) { clearInterval(qmtTimer); qmtTimer = null }
     } else {
       if (!timer) {
         load()
         timer = setInterval(load, 5000)
+      }
+      if (!qmtTimer) {
+        loadQMT()
+        qmtTimer = setInterval(loadQMT, 15000)
       }
     }
   }
@@ -362,6 +403,7 @@ onMounted(() => {
 onUnmounted(() => {
   // 清理定时器与订阅，避免泄漏 (clear the timer and subscription to avoid leaks)
   if (timer) clearInterval(timer)
+  if (qmtTimer) clearInterval(qmtTimer)
   if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler)
   if (sseUnsub) sseUnsub()
 })

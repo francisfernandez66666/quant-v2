@@ -112,6 +112,9 @@ type QMTConfig struct {
 	InitialCapital float64 `json:"initial_capital"`
 	// Strategies 转发策略白名单（空=全部）。
 	Strategies []string `json:"strategies"`
+	// StrategyAmounts 每战法单票金额覆盖（元）：键=战法名（与 strategies 白名单同源），
+	// 缺省或 <=0 时回落全局 fixed_amount。供量化交易页「每个战法独立仓位大小」。
+	StrategyAmounts map[string]float64 `json:"strategy_amounts,omitempty"`
 	// TimeoutSec 下单请求超时秒数（默认 10）。
 	TimeoutSec int `json:"timeout_sec"`
 	// MissHeartbeatSec 心跳超时秒数：网关 /health 连续失联超过该值 → 熔断暂停下单并告警（默认 120）。
@@ -739,6 +742,27 @@ func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
 	}
 	r := m.userRules(userID)
 	r.LLM = *cfg
+	m.saveUserRules(userID, r)
+}
+
+// GetQMTConfigFor 返回指定账号的 QMT 实盘配置（账号级覆盖优先，否则全局）。
+// English: returns the account's QMT live-trading config (per-user override wins, else global).
+func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
+	return &m.userRules(userID).QMT
+}
+
+// SetQMTConfigFor 更新指定账号的 QMT 实盘配置并持久化（账号级覆盖，5s 热加载生效）。
+// 调用方负责校验取值合法性（mode/price_type 枚举、白名单过滤等），这里只做落库。
+// English: persists the account's QMT live-trading config override (hot-reloaded within 5s);
+// callers must validate enum/whitelist values — this method only stores.
+func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
+	if m.store == nil || userID == "" {
+		m.Rules.QMT = *cfg
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	r.QMT = *cfg
 	m.saveUserRules(userID, r)
 }
 

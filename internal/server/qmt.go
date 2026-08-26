@@ -12,7 +12,9 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -291,6 +293,10 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctrl := s.qmtCtrlFor(uid)
+	if ctrl != nil {
+		// 上行通道新鲜度：任何回报到达都刷新 last_report_at（互通健康展示用）
+		ctrl.SetLastReport(ev.Type)
+	}
 
 	switch ev.Type {
 	case "positions":
@@ -342,6 +348,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			ctrl.SetTripped("网关断线回报（disconnect）")
 		}
 		log.Printf("[trading] 网关断线回报，实盘下单已熔断")
+	case "heartbeat":
+		// §ROBUST 上行心跳：last_report_at 已在 switch 前统一刷新——它就是心跳的全部意义
+		// （无交易时段证明 广州→首尔 回程连通），无任何账本副作用。
 	default:
 		writeError(w, 400, "unknown report type")
 		return
@@ -362,19 +371,388 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
-// handleQMTState 返回网关连接/熔断/持仓状态（GET /api/qmt/state）。
-// English: returns gateway connectivity / breaker / holdings (GET /api/qmt/state).
+// knownStrategies 实盘战法白名单全集（与 internal/strategy SignalType 常量对齐）。
+// English: the full set of strategies selectable in the live whitelist (mirrors strategy.SignalType).
+var knownStrategies = []string{"dragon", "double_bump", "n_shape", "dragon_return"}
+
+// handleGetQMTConfig 处理 GET /api/config/qmt：返回当前账号实盘配置。
+// token 只回脱敏形态（§GAP2-W2 同口径），提交脱敏哨兵或空串时后端保持原值。
+// English: GET /api/config/qmt returns the account's live-trading config with the token masked.
+func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.GetQMTConfigFor(userIDFor(r))
+	tokenMasked := ""
+	if cfg.Token != "" {
+		tokenMasked = maskSecret(cfg.Token)
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"enabled":             cfg.Enabled,
+		"mode":                cfg.Mode,
+		"gateway_url":         cfg.GatewayURL,
+		"token_masked":        tokenMasked,
+		"price_type":          cfg.PriceType,
+		"fixed_amount":        cfg.FixedAmount,
+		"max_positions":       cfg.MaxPositions,
+		"initial_capital":     cfg.InitialCapital,
+		"strategies":          cfg.Strategies,
+		"strategy_amounts":    cfg.StrategyAmounts,
+		"daily_max_buys":      cfg.DailyMaxBuys,
+		"daily_budget_amount": cfg.DailyBudgetAmount,
+		"auto_sell":           cfg.AutoSell,
+		"miss_heartbeat_sec":  cfg.MissHeartbeatSec,
+		"known_strategies":    knownStrategies,
+	})
+}
+
+// setQMTConfigReq 局部更新请求：指针字段=「本次要改的」，nil=保持不变。
+type setQMTConfigReq struct {
+	Enabled           *bool               `json:"enabled"`
+	Mode              *string             `json:"mode"`
+	GatewayURL        *string             `json:"gateway_url"`
+	Token             *string             `json:"token"`
+	PriceType         *string             `json:"price_type"`
+	FixedAmount       *float64            `json:"fixed_amount"`
+	MaxPositions      *int                `json:"max_positions"`
+	InitialCapital    *float64            `json:"initial_capital"`
+	Strategies        *[]string           `json:"strategies"`
+	StrategyAmounts   *map[string]float64 `json:"strategy_amounts"`
+	DailyMaxBuys      *int                `json:"daily_max_buys"`
+	DailyBudgetAmount *float64            `json:"daily_budget_amount"`
+	AutoSell          *bool               `json:"auto_sell"`
+	MissHeartbeatSec  *int                `json:"miss_heartbeat_sec"`
+}
+
+// handleSetQMTConfig 处理 POST /api/config/qmt：局部合并保存当前账号实盘配置并热加载生效。
+// 校验：mode/price_type 枚举；gateway_url 走 §GAP2-W2 外呼校验；白名单过滤到已知战法
+// （空数组=全部允许，与引擎语义一致）；数值参数做范围钳制。token 提交脱敏哨兵/空串则不变。
+func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
+	var req setQMTConfigReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	cfg := *(s.cfg.GetQMTConfigFor(userIDFor(r)))
+
+	if req.Mode != nil {
+		m := strings.TrimSpace(*req.Mode)
+		if m != "manual" && m != "auto" {
+			writeError(w, 400, "mode 仅允许 manual/auto")
+			return
+		}
+		cfg.Mode = m
+	}
+	if req.PriceType != nil {
+		p := strings.TrimSpace(*req.PriceType)
+		if p != "market" && p != "limit" {
+			writeError(w, 400, "price_type 仅允许 market/limit")
+			return
+		}
+		cfg.PriceType = p
+	}
+	if req.GatewayURL != nil {
+		u := strings.TrimSpace(*req.GatewayURL)
+		if u != "" && u != cfg.GatewayURL {
+			if err := validatePublicURL(u); err != nil {
+				writeError(w, 400, "gateway_url "+err.Error())
+				return
+			}
+		}
+		cfg.GatewayURL = u
+	}
+	if req.Token != nil && *req.Token != "" && !isMaskedSecret(*req.Token) {
+		cfg.Token = strings.TrimSpace(*req.Token)
+	}
+	if req.Enabled != nil {
+		cfg.Enabled = *req.Enabled
+	}
+	if req.AutoSell != nil {
+		cfg.AutoSell = *req.AutoSell
+	}
+	if req.FixedAmount != nil {
+		if *req.FixedAmount < 0 {
+			writeError(w, 400, "fixed_amount 不能为负")
+			return
+		}
+		cfg.FixedAmount = *req.FixedAmount
+	}
+	if req.InitialCapital != nil {
+		if *req.InitialCapital < 0 {
+			writeError(w, 400, "initial_capital 不能为负")
+			return
+		}
+		cfg.InitialCapital = *req.InitialCapital
+	}
+	if req.MaxPositions != nil {
+		if *req.MaxPositions < 1 || *req.MaxPositions > 50 {
+			writeError(w, 400, "max_positions 超出范围（1-50）")
+			return
+		}
+		cfg.MaxPositions = *req.MaxPositions
+	}
+	if req.DailyMaxBuys != nil {
+		if *req.DailyMaxBuys < 0 {
+			writeError(w, 400, "daily_max_buys 不能为负")
+			return
+		}
+		cfg.DailyMaxBuys = *req.DailyMaxBuys
+	}
+	if req.DailyBudgetAmount != nil {
+		if *req.DailyBudgetAmount < 0 {
+			writeError(w, 400, "daily_budget_amount 不能为负")
+			return
+		}
+		cfg.DailyBudgetAmount = *req.DailyBudgetAmount
+	}
+	if req.MissHeartbeatSec != nil {
+		if *req.MissHeartbeatSec < 30 || *req.MissHeartbeatSec > 3600 {
+			writeError(w, 400, "miss_heartbeat_sec 超出范围（30-3600 秒）")
+			return
+		}
+		cfg.MissHeartbeatSec = *req.MissHeartbeatSec
+	}
+	if req.Strategies != nil {
+		seen := map[string]bool{}
+		out := make([]string, 0, len(*req.Strategies))
+		for _, v := range *req.Strategies {
+			v = strings.TrimSpace(v)
+			if v == "" || seen[v] {
+				continue
+			}
+			known := false
+			for _, k := range knownStrategies {
+				if v == k {
+					known = true
+					break
+				}
+			}
+			if !known {
+				writeError(w, 400, "未知战法: "+v)
+				return
+			}
+			seen[v] = true
+			out = append(out, v)
+		}
+		cfg.Strategies = out // 空数组 = 不设白名单（全部允许）
+	}
+	if req.StrategyAmounts != nil {
+		out := map[string]float64{}
+		for k, v := range *req.StrategyAmounts {
+			k = strings.TrimSpace(k)
+			if k == "" {
+				continue
+			}
+			known := false
+			for _, s := range knownStrategies {
+				if k == s {
+					known = true
+					break
+				}
+			}
+			if !known {
+				writeError(w, 400, "未知战法: "+k)
+				return
+			}
+			if v < 0 || v > 1000000 {
+				writeError(w, 400, "战法仓位大小超出范围（0-1000000）: "+k)
+				return
+			}
+			if v > 0 { // 0/负数=清除该战法覆盖，回落全局 fixed_amount
+				out[k] = v
+			}
+		}
+		cfg.StrategyAmounts = out
+	}
+
+	s.cfg.SetQMTConfigFor(userIDFor(r), &cfg)
+	log.Printf("[trading] qmt 配置已更新: enabled=%v mode=%s price=%s max_pos=%d fixed=%.0f strategies=%v",
+		cfg.Enabled, cfg.Mode, cfg.PriceType, cfg.MaxPositions, cfg.FixedAmount, cfg.Strategies)
+	writeJSON(w, 200, map[string]string{"ok": "1"})
+}
+
+// handleQMTState 返回网关互通健康快照（GET /api/qmt/state）。
+// 下行=首尔探测广州网关（时延/最近探测），上行=网关回报到首尔的新鲜度；含熔断详情。
+// English: returns the connectivity snapshot (downlink probe latency/state, uplink report
+// freshness, breaker details) for the dashboard system row and the quant page.
 func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.qmtCtrlFor(userIDFor(r))
-	writeJSON(w, 200, map[string]interface{}{
-		"enabled": ctrl != nil && ctrl.Enabled(),
-		"mode":    ctrlMode(ctrl),
-		"tripped": ctrl != nil && ctrl.Tripped(),
-		"gateway_url": func() string {
-			if ctrl == nil {
-				return ""
+	if ctrl == nil {
+		// 未接入实盘：保留旧字段形状，前端据此隐藏实盘区块。
+		writeJSON(w, 200, map[string]interface{}{
+			"enabled": false, "mode": "manual", "tripped": false, "gateway_url": "",
+		})
+		return
+	}
+	writeJSON(w, 200, ctrl.Snapshot())
+}
+
+// qmtStrategyOf 从 signal_id 解析战法归属：buy:<码>:<战法>:<日> → 战法名；其余（sell:/manual@）→ manual。
+// 卖出盈亏按持仓当前的入场战法归因（重放状态维护），卖出自身 signal_id 里的类目是退出原因而非来源战法。
+// English: derives the strategy tag from a buy signal_id; sells are attributed to the position's
+// entry strategy tracked during replay (the sell key encodes exit class, not origin strategy).
+func qmtStrategyOf(signalID string) string {
+	if strings.HasPrefix(signalID, "buy:") {
+		parts := strings.Split(signalID, ":")
+		if len(parts) >= 3 && parts[2] != "" {
+			return parts[2]
+		}
+	}
+	return "manual"
+}
+
+// handleQMTTrades 处理 GET /api/qmt/trades：交易流水 + 整体盈亏 + 按战法归因统计。
+// 盈亏口径：
+//   - 已实现：按时间升序重放全部成交（加权成本法），卖出对 (卖价-加权成本)×数量 累计；
+//   - 浮动：real_positions 的 市值-数量×成本（市值为最近一次网关对账快照）；
+//   - 总盈亏 = 已实现 + 浮动；胜/亏按单笔卖出 pnl 正负计数。
+//
+// 飞轮数据面：by_strategy 即「research 出战法 → 信号 → 实盘结果」回流评估的输入源，
+// research 侧可直接读同一 researchDB 的 fills/orders 表或消费本端点。
+// English: GET /api/qmt/trades — fill ledger, overall PnL (realized via weighted-cost replay,
+// unrealized from the live book) and per-strategy attribution feeding the research flywheel.
+func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
+	uid := userIDFor(r)
+	db := s.researchDB
+	if db == nil {
+		writeError(w, 200, "real book not available")
+		return
+	}
+	allFills, err := db.RealFills()
+	if err != nil {
+		writeError(w, 500, "read fills: "+err.Error())
+		return
+	}
+	// 归属过滤：空 user_id = 遗留全局行，对所有人可见（§GAP1.10 口径）
+	fills := make([]store.RealFill, 0, len(allFills))
+	for _, f := range allFills {
+		if f.UserID == "" || f.UserID == uid {
+			fills = append(fills, f)
+		}
+	}
+	sort.Slice(fills, func(i, j int) bool { return fills[i].TradedAt < fills[j].TradedAt })
+
+	type posState struct {
+		qty      int
+		cost     float64
+		strategy string
+	}
+	stratState := map[string]*posState{}
+	type stratStat struct {
+		Buys     float64 `json:"buys"`
+		Sells    float64 `json:"sells"`
+		Realized float64 `json:"realized_pnl"`
+		Count    int     `json:"trade_count"`
+	}
+	byStrat := map[string]*stratStat{}
+	statFor := func(k string) *stratStat {
+		v := byStrat[k]
+		if v == nil {
+			v = &stratStat{}
+			byStrat[k] = v
+		}
+		return v
+	}
+
+	realized := 0.0
+	wins, losses := 0, 0
+	for _, f := range fills {
+		ps := stratState[f.Code]
+		if ps == nil {
+			ps = &posState{}
+			stratState[f.Code] = ps
+		}
+		amt := f.Price * float64(f.Qty)
+		switch f.Side {
+		case "买入":
+			newQty := ps.qty + f.Qty
+			if newQty > 0 {
+				ps.cost = (ps.cost*float64(ps.qty) + amt) / float64(newQty)
 			}
-			return ctrl.Config().GatewayURL
-		}(),
+			ps.qty = newQty
+			ps.strategy = qmtStrategyOf(f.SignalID)
+			buyStat := statFor(ps.strategy)
+			buyStat.Buys += amt
+			buyStat.Count++
+		case "卖出":
+			sellQty := f.Qty
+			if sellQty > ps.qty {
+				sellQty = ps.qty // 超卖钳制（与 ApplyRealFill 同口径）
+			}
+			pnl := (f.Price - ps.cost) * float64(sellQty)
+			realized += pnl
+			if pnl >= 0 {
+				wins++
+			} else {
+				losses++
+			}
+			k := ps.strategy
+			if k == "" {
+				k = "manual"
+			}
+			sellStat := statFor(k)
+			sellStat.Sells += amt
+			sellStat.Realized += pnl
+			sellStat.Count++
+			ps.qty -= sellQty
+		}
+	}
+
+	positions, err := db.RealPositionsForUser(uid)
+	if err != nil {
+		writeError(w, 500, "read positions: "+err.Error())
+		return
+	}
+	unrealized := 0.0
+	for _, p := range positions {
+		unrealized += p.Amount - float64(p.Qty)*p.CostPrice
+	}
+
+	// 流水倒序输出最近 100 笔并附战法标签
+	outFills := make([]map[string]interface{}, 0, len(fills))
+	start := 0
+	if len(fills) > 100 {
+		start = len(fills) - 100
+	}
+	for i := len(fills) - 1; i >= start; i-- {
+		f := fills[i]
+		strat := stratState[f.Code]
+		tag := "manual"
+		if f.Side == "买入" {
+			tag = qmtStrategyOf(f.SignalID)
+		} else if strat != nil && strat.strategy != "" {
+			tag = strat.strategy
+		}
+		outFills = append(outFills, map[string]interface{}{
+			"order_id": f.OrderID, "code": f.Code, "side": f.Side, "price": f.Price,
+			"qty": f.Qty, "amount": f.Amount, "traded_at": f.TradedAt,
+			"signal_id": f.SignalID, "strategy": tag,
+		})
+	}
+
+	stratList := make([]map[string]interface{}, 0, len(byStrat))
+	names := make([]string, 0, len(byStrat))
+	for k := range byStrat {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		st := byStrat[k]
+		stratList = append(stratList, map[string]interface{}{
+			"strategy":     k,
+			"buys":         math.Round(st.Buys*100) / 100,
+			"sells":        math.Round(st.Sells*100) / 100,
+			"realized_pnl": math.Round(st.Realized*100) / 100,
+			"trade_count":  st.Count,
+		})
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"summary": map[string]interface{}{
+			"realized_pnl":   math.Round(realized*100) / 100,
+			"unrealized_pnl": math.Round(unrealized*100) / 100,
+			"total_pnl":      math.Round((realized+unrealized)*100) / 100,
+			"trade_count":    len(fills),
+			"wins":           wins,
+			"losses":         losses,
+		},
+		"by_strategy": stratList,
+		"fills":       outFills,
 	})
 }

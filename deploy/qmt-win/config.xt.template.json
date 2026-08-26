@@ -1,0 +1,16 @@
+{
+  "listen": "0.0.0.0:8789",
+  "token": "__TOKEN__",
+  "broker": "mock",
+  "account": "__ACCOUNT__",
+  "user_id": "",
+  "db": "data.db",
+  "report_url": "https://quant-trading.top",
+  "report_token": "__TOKEN__",
+  "reconcile_sec": 60,
+  "max_positions": 10,
+  "seed": [],
+  "xt_path": "__XT_PATH__",
+  "session_id": 1,
+  "reconnect_sec": 5
+}

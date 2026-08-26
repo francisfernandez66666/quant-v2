@@ -52,6 +52,10 @@
         <router-link to="/positions" class="nav-item" active-class="active" @click="menuOpen = false">
           <span class="nav-icon">💼</span> 持仓
         </router-link>
+        <!-- 量化交易：实盘链路开关/仓位纪律/战法白名单（§QUANT-TAB 新增入口） -->
+        <router-link to="/quant" class="nav-item" active-class="active" @click="menuOpen = false">
+          <span class="nav-icon">📈</span> 量化交易
+        </router-link>
         <router-link to="/paper" class="nav-item" active-class="active" @click="menuOpen = false" v-if="paperEnabled">
           <span class="nav-icon">🧪</span> 模拟盘
         </router-link>
@@ -131,13 +135,19 @@
         <input v-model="serverUrl" placeholder="留空表示使用当前域名" />
       </div>
       <!-- 账号 / 密码：登录凭据；密码框回车可直接触发登录 -->
+      <!-- 账号：显式关闭自动大写/纠错/拼写（部分移动浏览器与 IME 会对无属性输入框做首字母大写或组合拦截） -->
       <div class="form-group">
         <label>账号</label>
-        <input v-model="username" placeholder="输入账号" />
+        <input v-model="username" placeholder="输入账号" autocomplete="username"
+               autocapitalize="off" autocorrect="off" spellcheck="false" lang="en"
+               style="text-transform:none" />
       </div>
+      <!-- 密码：同上防御属性；回车直接登录 -->
       <div class="form-group">
         <label>密码</label>
-        <input v-model="password" type="password" placeholder="输入密码" @keyup.enter="handleLogin" />
+        <input v-model="password" type="password" placeholder="输入密码" autocomplete="current-password"
+               autocapitalize="off" autocorrect="off" spellcheck="false" lang="en"
+               style="text-transform:none" @keyup.enter="handleLogin" />
       </div>
       <!-- §D7-B 注册已关闭：账号由管理员后台创建，登录页保持纯登录形态 -->
       <button class="btn-login" @click="handleLogin" :disabled="logging">

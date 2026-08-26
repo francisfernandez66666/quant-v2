@@ -359,6 +359,10 @@ func (d *DB) migrate() error {
 		)`,
 		// §W3-b 成交回报幂等唯一键：同一委托+同一回报时间戳+同价同量只入账一次，
 		// 根除 outbox 重试遇响应丢失时的双倍记账（首尔侧此前零幂等）。
+		// ⚠️ 建唯一索引前必须先去重历史行——生产 fills 已有 outbox 重试造成的重复记录，
+		// 直接建索引会因冲突失败导致迁移中断、服务起不来。保留每组最早一条（MIN(rowid)）。
+		`DELETE FROM fills WHERE rowid NOT IN (
+			SELECT MIN(rowid) FROM fills GROUP BY order_id, traded_at, price, qty)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_idem ON fills(order_id, traded_at, price, qty)`,
 		// 常用查询索引（主键外的补充加速）
 		`CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(trade_date)`,

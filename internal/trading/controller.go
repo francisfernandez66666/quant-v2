@@ -38,6 +38,14 @@ type Controller struct {
 	lastHealthy  bool
 	lastFailAt   time.Time // 最近一次失败探测时间（熔断判定窗口用）
 
+	// 互通健康展示数据（仪表盘-系统）：下行=首尔探测广州网关，上行=广州网关回报到首尔。
+	lastLatencyMs  int64     // 最近一次健康探测往返时延（毫秒）
+	lastReportAt   time.Time // 最近一次收到网关回报时间（上行通道新鲜度）
+	lastReportKind string    // 最近一次回报类型（trade/order/positions/disconnect）
+
+	// §ROBUST 早期预警：健康→失败的首跳立即告警（区别于熔断的 high 级），恢复后复位。
+	warnedUnhealthy bool
+
 	// 通知回调（告警熔断/恢复）：由上层注入（SSE/notify）。
 	onAlert func(level, title, content string)
 }
@@ -97,6 +105,55 @@ func (c *Controller) TripInfo() (tripped bool, reason string, at time.Time) {
 	return c.tripped, c.tripReason, c.tripAt
 }
 
+// SetLastReport 记录最近一次网关回报（上行通道 广州→首尔 的新鲜度证据，供 /api/qmt/state
+// 与仪表盘-系统互通健康行展示；kind ∈ trade/order/positions/disconnect）。
+// English: records the latest gateway report kind/time — evidence of the uplink (gateway→Seoul)
+// freshness, surfaced via /api/qmt/state and the dashboard system row.
+func (c *Controller) SetLastReport(kind string) {
+	c.mu.Lock()
+	c.lastReportAt = time.Now()
+	c.lastReportKind = kind
+	c.mu.Unlock()
+}
+
+// StateSnapshot 互通健康快照：下行（首尔探测网关）+ 上行（网关回报到首尔）两侧状态，
+// 供 /api/qmt/state、仪表盘系统行与量化交易页消费。零值时间表示"从未发生"。
+// English: connectivity snapshot for the dashboard/system row and quant page — downlink probe
+// state plus uplink report freshness; zero times mean "never happened".
+type StateSnapshot struct {
+	Enabled        bool      `json:"enabled"`
+	Mode           string    `json:"mode"`
+	Tripped        bool      `json:"tripped"`
+	TripReason     string    `json:"trip_reason"`
+	TripAt         time.Time `json:"trip_at"`
+	GatewayURL     string    `json:"gateway_url"`
+	LastProbeAt    time.Time `json:"last_probe_at"`
+	LastProbeOK    bool      `json:"last_probe_ok"`
+	LastLatencyMs  int64     `json:"last_latency_ms"`
+	LastReportAt   time.Time `json:"last_report_at"`
+	LastReportKind string    `json:"last_report_kind"`
+}
+
+// Snapshot 返回当前互通健康快照（纯读，不加锁副作用）。
+// （Snapshot returns the current connectivity snapshot; read-only.）
+func (c *Controller) Snapshot() StateSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return StateSnapshot{
+		Enabled:        c.cfg.Enabled,
+		Mode:           c.cfg.Mode,
+		Tripped:        c.tripped,
+		TripReason:     c.tripReason,
+		TripAt:         c.tripAt,
+		GatewayURL:     c.cfg.GatewayURL,
+		LastProbeAt:    c.lastHealthAt,
+		LastProbeOK:    c.lastHealthy,
+		LastLatencyMs:  c.lastLatencyMs,
+		LastReportAt:   c.lastReportAt,
+		LastReportKind: c.lastReportKind,
+	}
+}
+
 // setTripped 置/解熔断并告警（仅在状态变化时触发一次）。
 // English: setTripped flips the breaker and alerts once per state change.
 func (c *Controller) setTripped(tripped bool, reason string) {
@@ -152,7 +209,11 @@ func (c *Controller) HealthCheck() {
 	c.lastHealthAt = time.Now()
 	c.mu.Unlock()
 
+	started := time.Now()
 	ok, err := c.exec.Health()
+	c.mu.Lock()
+	c.lastLatencyMs = time.Since(started).Milliseconds()
+	c.mu.Unlock()
 	c.mu.RLock()
 	cfg2 := c.cfg
 	c.mu.RUnlock()
@@ -165,6 +226,7 @@ func (c *Controller) HealthCheck() {
 			// 正常：刷新健康标记（熔断时保持 tripped 直到心跳持续恢复）
 			c.mu.Lock()
 			c.lastHealthy = true
+			c.warnedUnhealthy = false
 			c.mu.Unlock()
 		} else {
 			c.setTripped(false, "")
@@ -173,15 +235,36 @@ func (c *Controller) HealthCheck() {
 	}
 	// 探测失败：连续失败超过 miss 窗口才真正熔断
 	c.mu.Lock()
+	prevHealthy := c.lastHealthy
 	lastFail := c.lastFailAt
 	c.lastFailAt = time.Now()
 	c.lastHealthy = false
+	firstFailAfterHealthy := prevHealthy && !c.warnedUnhealthy
+	if firstFailAfterHealthy {
+		c.warnedUnhealthy = true // 首跳告警只发一次，直到恢复
+	}
 	c.mu.Unlock()
+	if firstFailAfterHealthy {
+		// §ROBUST 早期预警：不等熔断，健康→失败的第一次跳变立即提醒（medium 级）
+		c.fireOnAlert("medium", "QMT 网关探测失败",
+			fmt.Sprintf("最近一次 /health 探测失败: %v（连续失联将熔断暂停下单）", err))
+	}
 	if lastFail.IsZero() {
 		return
 	}
 	if time.Since(lastFail) >= miss {
 		c.setTripped(true, "网关心跳连续失联超过 "+miss.String())
+	}
+}
+
+// fireOnAlert 触发上层告警回调（可空安全）。
+// （fireOnAlert invokes the injected alert callback if present.）
+func (c *Controller) fireOnAlert(level, title, content string) {
+	c.mu.RLock()
+	cb := c.onAlert
+	c.mu.RUnlock()
+	if cb != nil {
+		cb(level, title, content)
 	}
 }
 

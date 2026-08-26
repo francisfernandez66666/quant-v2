@@ -471,11 +471,36 @@ export async function executeRealAction(data) {
   return request('/api/positions/execute', { method: 'POST', data })
 }
 
-/** 实盘：网关连接/熔断/模式状态 */
-/** Live: gateway connectivity / breaker / mode status */
-// 对应 GET /api/qmt/state，返回 { enabled, mode, tripped, gateway_url }
+/** 实盘：互通健康快照（下行探测时延/上行回报新鲜度/熔断详情） */
+/** Live: connectivity snapshot (downlink probe latency / uplink report freshness / breaker) */
+// 对应 GET /api/qmt/state，返回 { enabled, mode, tripped, trip_reason, trip_at, gateway_url,
+//   last_probe_at, last_probe_ok, last_latency_ms, last_report_at, last_report_kind }
 export async function fetchQMTState() {
   return request('/api/qmt/state')
+}
+
+/** 实盘配置：当前账号的实盘参数与战法白名单（token 脱敏回显） */
+/** Live config: account's trading params and strategy whitelist (token masked) */
+// 对应 GET /api/config/qmt，返回 { enabled, mode, gateway_url, token_masked, price_type,
+//   fixed_amount, max_positions, initial_capital, strategies, daily_max_buys,
+//   daily_budget_amount, auto_sell, miss_heartbeat_sec, known_strategies }
+export async function fetchQMTConfig() {
+  return request('/api/config/qmt')
+}
+
+/** 实盘配置保存：局部更新（仅传需要修改的字段，后端校验后热加载生效） */
+/** Save live config: partial update — only send changed fields; backend validates then hot-reloads */
+// 对应 POST /api/config/qmt；token 留空或传脱敏哨兵=保持原值
+export async function updateQMTConfig(data) {
+  return request('/api/config/qmt', { method: 'POST', data })
+}
+
+/** 实盘交易流水与整体盈亏（已实现/浮动/按战法归因） */
+/** Live trade ledger and overall PnL (realized / unrealized / per-strategy attribution) */
+// 对应 GET /api/qmt/trades，返回 { summary:{realized_pnl, unrealized_pnl, total_pnl,
+//   trade_count, wins, losses}, by_strategy:[...], fills:[...最近100笔倒序] }
+export async function fetchQMTTrades() {
+  return request('/api/qmt/trades')
 }
 
 /** 模拟盘：总开关与绩效/信号质量统计 */

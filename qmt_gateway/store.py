@@ -61,6 +61,14 @@ class Store:
                 self._init_schema()
             else:
                 self._migrate_schema()
+            # §ROBUST 持久化 outbox：回报先落库再发送，崩溃/重启后自动续发（新老库都建）
+            self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS outbox (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload    TEXT NOT NULL,
+                    created_at TEXT
+                )""")
+            self._conn.commit()
 
     def _init_schema(self):
         cur = self._conn.cursor()
@@ -352,6 +360,55 @@ class Store:
     def close(self):
         with self._lock:
             self._conn.close()
+
+    # ── §ROBUST 持久化 outbox（回报队列）──
+    # 事件先落库再发送：进程崩溃/重启后由 sender 续发，杜绝内存队列丢回报。
+    # fills 表幂等 + 首尔 ApplyRealFill 幂等兜底，重发安全（重复投递被唯一键拦截）。
+
+    def outbox_enqueue(self, payload):
+        """回报事件入队，返回行 id。payload 为可 JSON 序列化 dict。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO outbox(payload, created_at) VALUES(?,?)",
+                (json.dumps(payload, ensure_ascii=False, default=json_default),
+                 time.strftime("%Y-%m-%dT%H:%M:%S+08:00")))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def outbox_oldest(self):
+        """取最旧一条待发回报。返回 (id, payload) 或 None（队空）。坏行返回 (id, None)。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, payload FROM outbox ORDER BY id LIMIT 1").fetchone()
+            if row is None:
+                return None
+            try:
+                return row["id"], json.loads(row["payload"])
+            except ValueError:
+                return row["id"], None
+
+    def outbox_delete(self, oid):
+        """发送成功后出队。"""
+        with self._lock:
+            self._conn.execute("DELETE FROM outbox WHERE id=?", (oid,))
+            self._conn.commit()
+
+    def outbox_trim(self, cap):
+        """超上限删最旧（首尔长期失联的极端保护）。返回删除条数；positions 每 60s 一条，
+        cap=20000 约两周量。English: drops oldest rows past cap; returns deleted count."""
+        with self._lock:
+            n = self._conn.execute("SELECT COUNT(*) AS c FROM outbox").fetchone()["c"]
+            if n <= cap:
+                return 0
+            self._conn.execute(
+                "DELETE FROM outbox WHERE id IN "
+                "(SELECT id FROM outbox ORDER BY id LIMIT ?)", (n - cap,))
+            self._conn.commit()
+            return n - cap
+
+    def outbox_count(self):
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) AS c FROM outbox").fetchone()["c"]
 
 
 def _now_cn():

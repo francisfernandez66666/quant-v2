@@ -339,6 +339,10 @@ func (s *Server) registerRoutes() {
 	// 引擎与新闻管线的客户端（归因上下文外送/计费劫持），故写权限收敛到 admin；普通用户 GET 只读。
 	s.mux.HandleFunc("POST /api/config/llm", s.adminMiddleware(s.handleSetLLMConfig))
 
+	// QMT 实盘配置：读=登录账号只读自己的；写=admin（实盘资金参数属高危面，与 LLM 同口径收敛）
+	s.mux.HandleFunc("GET /api/config/qmt", s.authMiddleware(s.handleGetQMTConfig))
+	s.mux.HandleFunc("POST /api/config/qmt", s.adminMiddleware(s.handleSetQMTConfig))
+
 	// 模拟盘（纸面交易）：独立于真实持仓，实时价撮合 + 净值曲线 + 信号质量统计
 	s.mux.HandleFunc("GET /api/paper/state", s.authMiddleware(s.handlePaperState))
 	s.mux.HandleFunc("GET /api/paper/positions", s.authMiddleware(s.handlePaperPositions))
@@ -401,6 +405,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/positions/execute", s.adminMiddleware(s.handleExecuteAction))
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
 	s.mux.HandleFunc("GET /api/qmt/state", s.authMiddleware(s.handleQMTState))
+	s.mux.HandleFunc("GET /api/qmt/trades", s.authMiddleware(s.handleQMTTrades))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
 	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
 	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))
