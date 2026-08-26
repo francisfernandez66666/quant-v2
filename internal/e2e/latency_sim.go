@@ -125,26 +125,38 @@ func (m *simMetrics) addQuote(d time.Duration) {
 	m.quoteN++
 	m.mu.Unlock()
 }
+
+// addNews 记一笔新闻源注入时延（线程安全）。
 func (m *simMetrics) addNews(d time.Duration) { m.mu.Lock(); m.newsMs += d; m.newsN++; m.mu.Unlock() }
+
+// addBoard 记一笔板块行情注入时延。
 func (m *simMetrics) addBoard(d time.Duration) {
 	m.mu.Lock()
 	m.boardMs += d
 	m.boardN++
 	m.mu.Unlock()
 }
+
+// addStage0 记一笔 Stage0 合并分类注入时延。
 func (m *simMetrics) addStage0(d time.Duration) {
 	m.mu.Lock()
 	m.stage0Ms += d
 	m.stage0N++
 	m.mu.Unlock()
 }
+
+// addStage2 记一笔 Stage2 深度分析注入时延。
 func (m *simMetrics) addStage2(d time.Duration) {
 	m.mu.Lock()
 	m.stage2Ms += d
 	m.stage2N++
 	m.mu.Unlock()
 }
+
+// addD1 记一笔 D1 评分注入时延。
 func (m *simMetrics) addD1(d time.Duration) { m.mu.Lock(); m.d1Ms += d; m.d1N++; m.mu.Unlock() }
+
+// addOther 记一笔其余环节（触发/聚合等）注入时延。
 func (m *simMetrics) addOther(d time.Duration) {
 	m.mu.Lock()
 	m.otherMs += d
