@@ -28,6 +28,15 @@ quant-trading.top {
 	handle {
 		root * /var/www/quant-web
 		file_server
+		# §GAP-20260826 缓存策略：index.html 必须 no-cache——它是 SPA 的入口，
+		# 浏览器/中间代理若启发式缓存旧 index.html（仅 ETag/Last-Modified 无显式头时会发生），
+		# 部署新版后用户仍加载旧 JS bundle，出现"新功能不存在/数据展示口径陈旧"的假故障
+		# （实录：规则细分池上线后 Web 用户看不到因子分仓 chip）。
+		# 带 hash 的 /assets/* 内容不可变，可放心长缓存 immutable。
+		@html path /
+		header @html Cache-Control "no-cache, must-revalidate"
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
 	}
 
 	# 请求体上限（新闻原文/LLM 咨询可能较大）

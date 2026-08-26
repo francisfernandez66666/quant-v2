@@ -95,10 +95,22 @@ echo "[5/5] 打包 APK (${MODE})..."
 export JAVA_HOME="$JAVA_HOME_DIR"
 export ANDROID_HOME="$ANDROID_SDK"
 if [ "$MODE" = "release" ]; then
-    # 签名配置：keystore 默认用 mobile/keystore.jks，密码默认 QzK8mXp2vL5nT9aR
-    # （通过环境变量传给 Gradle，不再追加 gradle.properties，避免重复堆积）
+    # 签名配置：keystore 默认 mobile/keystore.jks。
+    # §GAP2-W1（P0）：密码不再有任何硬编码默认值——旧默认口令已随 gradle.properties 入 git 泄漏，
+    # 必须通过环境变量 MOBILE_KEYSTORE_PASS 提供；首次生成新 keystore 时自动创建随机强口令
+    # 并保存到本地不入库的 mobile/keystore.pass（chmod 600）。
     KS="${MOBILE_KEYSTORE:-$APP_DIR/mobile/keystore.jks}"
-    KSPASS="${MOBILE_KEYSTORE_PASS:-QzK8mXp2vL5nT9aR}"
+    PASSFILE="$APP_DIR/mobile/keystore.pass"
+    if [ -n "$MOBILE_KEYSTORE_PASS" ]; then
+        KSPASS="$MOBILE_KEYSTORE_PASS"
+    elif [ -f "$PASSFILE" ] && [ "$KS" = "$APP_DIR/mobile/keystore.jks" ]; then
+        # 复用首跑生成的随机口令（文件仅本机，已被 .gitignore 覆盖）
+        KSPASS="$(cat "$PASSFILE")"
+    else
+        KSPASS="$(openssl rand -base64 24 | tr -d '\n')"
+        umask 177; printf '%s' "$KSPASS" > "$PASSFILE"; umask 022
+        echo "      已生成随机签名口令 → $PASSFILE（请离线另存一份；切勿提交仓库）"
+    fi
     if [ ! -f "$KS" ]; then
         echo "      生成自签名 keystore: $KS"
         "$JAVA_HOME/bin/keytool" -genkeypair -v \
@@ -106,11 +118,19 @@ if [ "$MODE" = "release" ]; then
             -keyalg RSA -keysize 2048 -validity 3650 \
             -dname "CN=liangzai, OU=quant, O=quant, L=Beijing, ST=Beijing, C=CN"
     fi
-    export ORG_GRADLE_PROJECT_android_injected_signing_store_file="$KS"
-    export ORG_GRADLE_PROJECT_android_injected_signing_store_password="$KSPASS"
-    export ORG_GRADLE_PROJECT_android_injected_signing_key_alias="quant"
-    export ORG_GRADLE_PROJECT_android_injected_signing_key_password="$KSPASS"
-    ./gradlew assembleRelease
+    # §GAP2-W1 签名传参：android.injected.signing.* 是带点号的属性名，无法经环境变量表达
+    # （ORG_GRADLE_PROJECT_ 下划线变体会被 Gradle 当成另一个属性导致静默不签名），
+    # 必须用 -P 点号原样传入；属性仅本次构建生效，不落任何文件。
+    # English: §GAP2-W1 signing args — the dotted android.injected.signing.* property names cannot be
+    # expressed via environment variables (the underscore variant becomes a different, ignored
+    # property, yielding a silently unsigned APK); pass them verbatim with -P for this invocation only.
+    SIGN_ARGS=(
+        -Pandroid.injected.signing.store.file="$KS"
+        -Pandroid.injected.signing.store.password="$KSPASS"
+        -Pandroid.injected.signing.key.alias=quant
+        -Pandroid.injected.signing.key.password="$KSPASS"
+    )
+    ./gradlew assembleRelease "${SIGN_ARGS[@]}"
     OUT="app/build/outputs/apk/release/app-release.apk"
 else
     ./gradlew assembleDebug

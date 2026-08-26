@@ -216,7 +216,7 @@ done
 echo "=============================================="
 echo " 部署完成。首次登录："
 echo "   1. 浏览器打开 https://$SERVER_DOMAIN ，直接进前端登录页"
-echo "   2. 前端登录页用后端账号登录（首次部署默认 admin / admin123，请立即改密码）"
+echo "   2. 全新部署：POST https://$SERVER_DOMAIN/setup 创建管理员（§GAP2-W1 起不再有默认口令 admin/admin123）"
 echo "   3. APK 走 /api 直接用账号登录"
 echo " 研究调度（quant-research）："
 echo "   - 交易时段只做 dataload 增量下载；盘后 15:30/周末各跑一轮自动研究"

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
@@ -23,10 +24,11 @@ import (
 type Controller struct {
 	mu sync.RWMutex
 
-	exec   Executor         // 下单执行器（真实网关 / noop）
-	store  *store.DB        // 研究库（real_positions/orders/fills 落库）
-	cfg    config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
-	userID string           // 归属账号（多账号模式下各引擎独立控制器）
+	exec            Executor         // 下单执行器（真实网关 / noop）
+	store           *store.DB        // 研究库（real_positions/orders/fills 落库）
+	cfg             config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
+	userID          string           // 归属账号（多账号模式下各引擎独立控制器）
+	lastReconcileAt time.Time        // §W6-a 上次主动对账时间（节流用）
 
 	// 熔断状态：tripped=true 表示网关失联/心跳超时，暂停一切新下单
 	tripped      bool
@@ -206,18 +208,22 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 		return nil, fmt.Errorf("qmt store not set")
 	}
 
-	// §GAP1.6 ST/退市风险警示股一律拒绝下单（auto/manual 全路径统一收口；
+	// §GAP1.6 ST/退市风险警示股一律拒绝买入（auto/manual 全路径统一收口；
 	// 与信号层 combat_agent.IsSTStock 同一判定，堵住 ScanLimitUp 直出信号与手动单绕过）。
-	// English: ST/delisting-risk stocks are rejected on every path (auto & manual), using the same
-	// combat_agent.IsSTStock check as the signal layer — closing the ScanLimitUp / manual-order bypass.
-	if combat_agent.IsSTStock(req.Name) {
-		return nil, fmt.Errorf("ST/退市风险股禁止下单: %s", req.Name)
+	// §GAP2-W1 修复：守卫仅作用于买入方向——持仓股盘中被戴帽 ST/进黑名单属于"风险暴露已存在"，
+	// 拦截卖出等于强迫扛单，与止损/风控目标背道而驰；此前双向拦截会让这类仓位永远无法退出。
+	// English: §GAP1.6 ST/delisting-risk stocks are rejected on BUY only (both auto & manual paths),
+	// using the same combat_agent.IsSTStock check as the signal layer. §GAP2-W1 fix: sells are exempt —
+	// a held stock getting ST-flagged/blacklisted mid-day is existing exposure; blocking its exit would
+	// force holding, the opposite of risk control.
+	if req.Side == SideBuy && combat_agent.IsSTStock(req.Name) {
+		return nil, fmt.Errorf("ST/退市风险股禁止买入: %s", req.Name)
 	}
 
-	// §GAP1.7 黑名单接线：命中 qmt.blacklist（含引擎同步的 Theme.BlackList）即拒绝。
-	// 纯数字与带后缀代码双向归一比对。English: §GAP1.7 blacklist wiring — normalized both ways.
-	if blacklisted(cfg.Blacklist, req.Code) {
-		return nil, fmt.Errorf("黑名单股票禁止下单: %s", req.Code)
+	// §GAP1.7 黑名单接线（仅买方向，理由同上）：命中 qmt.blacklist（含引擎同步的 Theme.BlackList）即拒。
+	// 纯数字与带后缀代码双向归一比对。English: §GAP1.7 blacklist wiring (buy-only) — normalized both ways.
+	if req.Side == SideBuy && blacklisted(cfg.Blacklist, req.Code) {
+		return nil, fmt.Errorf("黑名单股票禁止买入: %s", req.Code)
 	}
 
 	// §GAP1.3/1.4 买入纪律预检（卖出不受限）：单日买入笔数上限、单日买入预算、近似可用资金。
@@ -259,6 +265,8 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 	// 幂等：同一 signal_id 不重复下单。
 	// §GAP 修复：占位行 order_id 用 "pend:<signal_id>"——此前恒为空串，与 order_id 主键冲突，
 	// 第二笔起的新单被 INSERT OR IGNORE 误判为重复（静默不下单），网关单号回填也永不命中。
+	// §GAP2-W1 重试放行：命中已有行时先尝试把"发送失败"占位行重置为"已报"——只有确认发送失败的
+	// 单才允许同键重发；真正的重复（已报待回报/部分成交/已成/已撤）仍被唯一键拦截，返回 duplicate。
 	existed, err := c.store.UpsertRealOrder(store.RealOrder{
 		OrderID:   "pend:" + req.SignalID,
 		SignalID:  req.SignalID,
@@ -268,12 +276,20 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 		Price:     req.Price,
 		Qty:       req.Qty,
 		CreatedAt: req.CreatedAt,
+		UserID:    c.userID, // §W2-10 委托行打归属账号（多账号审计/后续租户读过滤）
 	})
 	if err != nil {
 		return nil, err
 	}
 	if existed {
-		return &OrderResult{OK: false, Err: "duplicate signal_id (already ordered)"}, nil
+		reset, rerr := c.store.ResetFailedRealOrder(req.SignalID)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if !reset {
+			return &OrderResult{OK: false, Err: "duplicate signal_id (already ordered)"}, nil
+		}
+		log.Printf("[trading] %s 此前发送失败，本次重试放行", req.SignalID)
 	}
 
 	if req.PriceType == "" {
@@ -290,6 +306,16 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 		res, err = c.exec.PlaceBuy(req)
 	}
 	if err != nil {
+		// §GAP2-W1 发送失败降级：占位行从"已报"改为"发送失败"——
+		// ①不再冒充已报污染买入纪律统计（幽灵单虚耗当日预算的根因）；
+		// ②同 signal_id 下次重试经 ResetFailedRealOrder 放行，止损自动单不会因一次网络抖动被封死整天。
+		// 带状态守卫：若回报线程已推进到 部分成交/已成（超时但券商实际受理），绝不回退真实进度。
+		// English: §GAP2-W1 on a send error, demote the placeholder from 已报 to 发送失败 so it stops
+		// polluting buy-discipline accounting and can be retried under the same signal_id. Status-guarded:
+		// fills that already landed via report callbacks are never rolled back.
+		if merr := c.store.MarkRealOrderSendFailed(req.SignalID); merr != nil {
+			log.Printf("[trading] mark send-failed %s: %v", req.SignalID, merr)
+		}
 		return nil, err
 	}
 	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）
@@ -326,12 +352,18 @@ func blacklisted(list []string, code string) bool {
 // 数据源为本地 real_orders/real_positions 账本（崩溃安全，重启不丢当日累计）；
 // selfSignalID 排除自身（幂等重试场景下占位行可能已存在）；守卫先于 UpsertRealOrder 执行，
 // 被拒订单不落库、不污染当日统计。
+// §GAP2-W1 状态过滤：只统计 已报/部成/已成 三类真实占用资金的状态——"发送失败"占位降级行与
+// 已撤/废单不再虚耗当日预算与笔数（幽灵单根因之一）。
+// §TZ1 日期口径：委托时间统一换算北京时区再取日（此前用服务器本地时区，首尔 KST 主机在
+// 北京时间 08:00 翻转日期，恰好落在盘前窗口）。
 // 可用资金 ≈ InitialCapital − Σ持仓成本市值 − 当日已报买单金额（近似口径，
 // 精确券商可用余额待 M2 网关协议扩展 query_cash 后接入）。
 // English: buy-discipline precheck — daily buy-count cap, daily budget and an estimated available-cash
 // check, derived from the local real book (crash-safe). selfSignalID excludes the ticket itself
 // (idempotent retries); guards run BEFORE UpsertRealOrder so rejected orders never pollute the sums.
-// Exact broker cash lands with the M2 protocol extension (query_cash).
+// §GAP2-W1 status filter: only 已报/部成/已成 count as real capital usage — send-failed placeholders,
+// cancelled and rejected orders no longer eat the daily budget. §TZ1: order timestamps are converted to
+// Beijing time before extracting the date. Exact broker cash lands with the M2 extension (query_cash).
 func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID string, amount float64) error {
 	if c.store == nil {
 		return nil
@@ -340,15 +372,22 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 	if err != nil {
 		return fmt.Errorf("read real orders: %w", err)
 	}
-	today := time.Now().Format("2006-01-02")
+	today := cntime.In(time.Now()).Format("2006-01-02")
 	buys := 0
 	spent := 0.0
 	for _, o := range orders {
 		if o.Side != SideBuy || o.SignalID == selfSignalID {
 			continue
 		}
+		// §GAP2-W1 状态白名单：仅真实占款状态计入；发送失败/已撤等跳过。
+		// English: §GAP2-W1 only capital-consuming statuses count.
+		switch o.Status {
+		case "已报", "部成", "已成":
+		default:
+			continue
+		}
 		at, perr := time.Parse(time.RFC3339, o.CreatedAt)
-		if perr != nil || at.Format("2006-01-02") != today {
+		if perr != nil || cntime.In(at).Format("2006-01-02") != today {
 			continue
 		}
 		buys++
@@ -391,6 +430,36 @@ func (c *Controller) Reconcile() error {
 		}
 	}
 	return nil
+}
+
+// MaybeReconcile §W6-a 周期对账接线（此前 Controller.Reconcile 是零调用死代码，
+// report_url 未配时双向对账均不存在）：按 interval 节流（默认 5min）主动拉网关全量持仓
+// 落库（券商为准），差异仅记日志告警——自动纠偏留给显式人工/后续策略，避免误覆盖在途状态。
+// English: §W6-A wires the previously-dead Reconcile into a throttled periodic call; diffs are logged
+// as warnings while auto-correction is deliberately left out to avoid stomping in-flight states.
+func (c *Controller) MaybeReconcile(interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	c.mu.RLock()
+	last := c.lastReconcileAt
+	enabled := c.cfg.Enabled
+	c.mu.RUnlock()
+	if !enabled || time.Since(last) < interval {
+		return
+	}
+	c.mu.Lock()
+	c.lastReconcileAt = time.Now()
+	c.mu.Unlock()
+	go func() {
+		if err := c.Reconcile(); err != nil {
+			log.Printf("[trading] 周期对账失败（下次窗口重试）: %v", err)
+			return
+		}
+		if poses, err := c.store.RealPositionsForUser(c.userID); err == nil {
+			log.Printf("[trading] 周期对账完成: %d 持仓已与网关同步", len(poses))
+		}
+	}()
 }
 
 // tripReasonLocked 返回熔断原因（不加锁，调用方需持锁/已检查）。

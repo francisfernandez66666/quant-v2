@@ -10,6 +10,8 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 )
 
@@ -41,6 +43,7 @@ type RealOrder struct {
 	Price     float64 `json:"price"`
 	Qty       int     `json:"qty"`
 	CreatedAt string  `json:"created_at"`
+	UserID    string  `json:"user_id,omitempty"` // §W2-10 归属账号（空=遗留全局行）
 }
 
 // RealFill 实盘成交回报行。
@@ -55,6 +58,7 @@ type RealFill struct {
 	Amount   float64 `json:"amount"`
 	TradedAt string  `json:"traded_at"`
 	SignalID string  `json:"signal_id"`
+	UserID   string  `json:"user_id,omitempty"` // §W2-10 归属账号
 }
 
 // UpsertRealPositions 全量对账写入：以网关推送的持仓集合为准，逐条 upsert 并移除已不在集合内的旧持仓。
@@ -224,9 +228,16 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID); err != nil {
+	// §W2-10 流水行打归属账号；§W3-b 幂等唯一键 (order_id,traded_at,price,qty)：
+	// 网关 outbox 对同笔回报重试时，唯一索引冲突 → 视为已入账的重复投递，整体事务回滚并返回幂等成功，
+	// 持仓数量不再被二次累加（此前首尔侧零幂等，响应丢失即双倍记账）。
+	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: fills.order_id") {
+			log.Printf("[store] fills 幂等命中(重复回报): order=%s traded_at=%s qty=%d", f.OrderID, f.TradedAt, f.Qty)
+			return tx.Rollback()
+		}
 		return err
 	}
 	return tx.Commit()
@@ -236,10 +247,11 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 // 返回 (是否已存在, 错误)。English: upserts an order; a signal_id conflict means the order already
 // exists (idempotent — never double-sends). Returns (alreadyExisted, err).
 func (d *DB) UpsertRealOrder(o RealOrder) (bool, error) {
+	// §W2-10 租户列：委托行打归属账号（存量行为空串=遗留全局）
 	res, err := d.db.Exec(`INSERT OR IGNORE INTO orders
-		(order_id, signal_id, code, side, status, price, qty, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt)
+		(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID)
 	if err != nil {
 		return false, err
 	}
@@ -270,6 +282,45 @@ func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 func (d *DB) UpdateRealOrderBySignalID(signalID, orderID, status string) error {
 	_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=?`, orderID, status, signalID)
 	return err
+}
+
+// MarkRealOrderSendFailed §GAP2-W1 占位行降级：下单请求发送失败（网关超时/5xx/断连）时把占位行
+// 从"已报"改为"发送失败"。带 status='已报' 守卫——若回报线程已把该单推进到 部分成交/已成 等状态
+// （客户端超时但券商实际受理的场景），绝不回退真实进度，只降级仍停留在"已报"假象的行。
+// 效果：①买入纪律统计不再把幽灵单计入当日预算/笔数；②同一 signal_id 重试可经
+// ResetFailedRealOrder 放行，止损类自动单不会因首次网络抖动被封死一整天。
+// English: §GAP2-W1 demotes a placeholder order from 已报 to 发送失败 after a send failure
+// (gateway timeout / 5xx / disconnect). Guarded on status='已报' so fills that already arrived via
+// report callbacks (broker accepted despite our timeout) are never rolled back. Effects: failed sends
+// no longer pollute daily budget/count, and retrying the same signal_id is allowed via
+// ResetFailedRealOrder — auto stop-losses can no longer be bricked for the whole day by one network blip.
+func (d *DB) MarkRealOrderSendFailed(signalID string) error {
+	res, err := d.db.Exec(`UPDATE orders SET status='发送失败' WHERE signal_id=? AND status='已报'`, signalID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("[store] 委托 %s 发送失败，占位行已降级（可重试）", signalID)
+	}
+	return nil
+}
+
+// ResetFailedRealOrder §GAP2-W1 失败重试放行：把指定 signal_id 的"发送失败"行重置为"已报"。
+// 仅当行存在且状态恰为"发送失败"时生效并返回 true；其余状态（已报/部分成交/已成/已撤）原样保留
+// 并返回 false——即真正的重复下单仍然被唯一键拦截，只有确认失败过的单才允许再发一次。
+// English: §GAP2-W1 retry gate — resets a 发送失败 ticket back to 已报 so the same signal_id may be
+// re-sent. Returns true only when a failed row was actually reset; genuine duplicates (already
+// reported/filled/cancelled) stay untouched and return false.
+func (d *DB) ResetFailedRealOrder(signalID string) (bool, error) {
+	res, err := d.db.Exec(`UPDATE orders SET status='已报' WHERE signal_id=? AND status='发送失败'`, signalID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // RealOrders 返回全部实盘委托单（倒序）。

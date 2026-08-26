@@ -160,7 +160,14 @@ func runFull(db *store.DB, token, start, end string) error {
 	if err := runDaily(db, token, start, end); err != nil {
 		return err
 	}
-	return loadFinancial(db, token, start, end)
+	if err := loadFinancial(db, token, start, end); err != nil {
+		return err
+	}
+	// §W4-c 批量装载收尾：TRUNCATE WAL，防 -wal 滞留膨胀（小盘 VPS 磁盘治理）
+	if err := db.Checkpoint(); err != nil {
+		log.Printf("[dataload] wal_checkpoint: %v", err)
+	}
+	return nil
 }
 
 // loadMeta 装载股票基础信息与交易日历（全量幂等）。

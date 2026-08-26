@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -45,13 +47,13 @@ type EngineController interface {
 	NewsShowAll() bool
 	ReanalyzeNews() (map[string]int, error)
 	TestAttribution(title, digest string) ([]newsagent.NewsEvent, error)
-	GetMessages() []data.MessageItem
+	GetMessagesFor(userID string) []data.MessageItem // §GAP2-W2 按账号可见（公共∪本人私有）
 	ClearMessages()
 	DeleteMessage(id string)
 	RefreshMessageName(code, name string)
 	ConsultLLM(userID, userMsg string, proMode bool) (string, error)
-	GetConsultHistory() []data.ConsultMessage
-	ClearConsultHistory()
+	GetConsultHistoryFor(userID string) []data.ConsultMessage // §GAP2-W2 按账号隔离的咨询历史
+	ClearConsultHistoryFor(userID string)                     // §GAP2-W2 只清本人的
 	// DashboardData 返回该账号/引擎的当前看板快照（信号/评分/新闻事件/开关状态等）。
 	// English: returns the current dashboard snapshot for this account/engine (signals/scores/news/toggles).
 	DashboardData() *display.DashboardData
@@ -299,6 +301,7 @@ func (s *Server) registerRoutes() {
 
 	// 用户/账号管理（仅 admin）
 	s.mux.HandleFunc("GET /api/admin/users", s.adminMiddleware(s.handleListUsers))
+	// §D7-B 注册已关闭，邀请码端点随之下线（auth 层能力保留以备将来重开）
 	s.mux.HandleFunc("POST /api/admin/users", s.adminMiddleware(s.handleCreateUser))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/role", s.adminMiddleware(s.handleSetUserRole))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/perms", s.adminMiddleware(s.handleSetUserPerms))
@@ -325,11 +328,16 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/short/toggle", s.authMiddleware(s.handleShortToggle))
 	s.mux.HandleFunc("GET /api/short/status", s.authMiddleware(s.handleShortStatus))
 	s.mux.HandleFunc("GET /api/config/strategy", s.authMiddleware(s.handleGetStrategyConfig))
-	s.mux.HandleFunc("POST /api/config/strategy", s.authMiddleware(s.handleSetStrategyConfig))
+	// §GAP2-W2 权限收口：全局战法参数影响所有账号的实盘/模拟决策，写权限收敛到 admin
+	// （此前任意 14 天临时账号可改全局止盈止损）。English: §GAP2-W2 — global strategy writes are admin-only.
+	s.mux.HandleFunc("POST /api/config/strategy", s.adminMiddleware(s.handleSetStrategyConfig))
 	s.mux.HandleFunc("GET /api/config/d1", s.authMiddleware(s.handleGetD1Config))
-	s.mux.HandleFunc("POST /api/config/d1", s.authMiddleware(s.handleSetD1Config))
+	// §GAP2-W2 权限收口：D1 规则同为全局决策面，写权限收敛到 admin。
+	s.mux.HandleFunc("POST /api/config/d1", s.adminMiddleware(s.handleSetD1Config))
 	s.mux.HandleFunc("GET /api/config/llm", s.authMiddleware(s.handleGetLLMConfig))
-	s.mux.HandleFunc("POST /api/config/llm", s.authMiddleware(s.handleSetLLMConfig))
+	// §GAP2-W2 权限收口（P1-3）：普通用户保存自己的 LLM 配置会经 llmRecreate 热替换【全部账号】
+	// 引擎与新闻管线的客户端（归因上下文外送/计费劫持），故写权限收敛到 admin；普通用户 GET 只读。
+	s.mux.HandleFunc("POST /api/config/llm", s.adminMiddleware(s.handleSetLLMConfig))
 
 	// 模拟盘（纸面交易）：独立于真实持仓，实时价撮合 + 净值曲线 + 信号质量统计
 	s.mux.HandleFunc("GET /api/paper/state", s.authMiddleware(s.handlePaperState))
@@ -402,9 +410,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/stage-records", s.authMiddleware(s.handleStageRecords))
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
-	s.mux.HandleFunc("GET /api/research/progress", s.authMiddleware(s.handleResearchProgress))
+	s.mux.HandleFunc("GET /api/research/progress", s.permMiddleware(auth.PermResearchApprove, s.handleResearchProgress))
 	s.mux.HandleFunc("GET /api/research/factors", s.authMiddleware(s.handleResearchFactors))
-	s.mux.HandleFunc("GET /api/research/candidates", s.authMiddleware(s.handleResearchCandidates))
+	s.mux.HandleFunc("GET /api/research/candidates", s.permMiddleware(auth.PermResearchApprove, s.handleResearchCandidates))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleResearchApprove))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleResearchReject))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest))
@@ -416,10 +424,10 @@ func (s *Server) registerRoutes() {
 	// 回测任务中心：运行中任务列表（前端刷新后恢复轮询）+ 全部任务列表（回测 tab 进度查看，含夜间全量）
 	// English: backtest task center — running-job list (for frontend polling recovery after a refresh)
 	// and the full job list (backtest tab progress view, including nightly runs).
-	s.mux.HandleFunc("GET /api/research/backtest/running", s.authMiddleware(s.handleBacktestRunning))
-	s.mux.HandleFunc("GET /api/research/backtest/list", s.authMiddleware(s.handleBacktestList))
+	s.mux.HandleFunc("GET /api/research/backtest/running", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestRunning))
+	s.mux.HandleFunc("GET /api/research/backtest/list", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestList))
 	// 战法库（因子战法）：列出已应用 + 启用/禁用/删除 + 重命名 + 效果监测 + 全量回测全局开关
-	s.mux.HandleFunc("GET /api/research/library", s.authMiddleware(s.handleResearchLibrary))
+	s.mux.HandleFunc("GET /api/research/library", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibrary))
 	// 阶段3.4 战法库回测入口：对战法库一条已应用规则跑历史回放回测（异步，结果进回测 tab）
 	s.mux.HandleFunc("POST /api/research/library/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleLibraryBacktest))
 	// §P2-f 参数优化：入队扫参 / 列表 / 审批（写规则覆盖+热重载）/ 淘汰
@@ -427,7 +435,7 @@ func (s *Server) registerRoutes() {
 	// §D1 各战法独立寻优参数池：列表 + 保存（审批权限，服务端组合数护栏校验）
 	s.mux.HandleFunc("GET /api/research/sweep-pools", s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolList))
 	s.mux.HandleFunc("PUT /api/research/sweep-pools", s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolUpsert))
-	s.mux.HandleFunc("GET /api/research/optimizations", s.authMiddleware(s.handleOptimizationList))
+	s.mux.HandleFunc("GET /api/research/optimizations", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationList))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationApprove))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationReject))
 	s.mux.HandleFunc("POST /api/research/library/{id}/enable", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryToggle("enable")))
@@ -522,8 +530,15 @@ func (s *Server) GetServeMux() *http.ServeMux { return s.mux }
 func (s *Server) GetAuthManager() *auth.Manager { return s.auth }
 
 // writeJSON 以 JSON 格式写入响应：设置 Content-Type、状态码并编码序列化 v。
+// §GAP-20260826 补 Cache-Control: no-store：行情/信号类接口数据每 5s 变化，禁止任何缓存——
+// Android WebView 与运营商透明代理对无缓存头的 GET JSON 可能启发式缓存，导致 APK 端
+// 「股价不自动刷新/显示陈旧价」。所有 JSON API 统一走本函数出口，一处设置全站生效。
+// English: writeJSON emits JSON with Content-Type, status code and Cache-Control: no-store.
+// English: Quote/signal payloads change every 5s; without explicit no-store, Android WebView and
+// English: carrier transparent proxies may heuristically cache GET JSON, freezing prices on the APK.
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
@@ -535,57 +550,21 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // ── Auth handlers ──
 
-// registerReq 注册请求体：用户名 + 密码。
-type registerReq struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
 // handleRegister 处理 POST /auth/register：创建用户并返回 token 与用户 ID。
 // 用户名/密码缺失返回 400；用户名已存在返回 409。
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
-	// §A4 频控：注册 5 次/分/IP（此前匿名无限调用可灌爆用户库+枚举用户名）
-	if !s.limiter.allow(clientIP(r), 5, time.Minute) {
-		writeError(w, 429, "too many attempts")
-		return
-	}
-	var req registerReq
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
-		writeError(w, 400, "invalid request body")
-		return
-	}
-	if req.Username == "" || req.Password == "" {
-		writeError(w, 400, "username and password required")
-		return
-	}
-
-	user, err := s.auth.Register(req.Username, req.Password)
-	if err != nil {
-		writeError(w, 409, err.Error())
-		return
-	}
-	writeJSON(w, 201, map[string]interface{}{
-		"token": user.Token,
-		"id":    user.ID,
-	})
+	// §D7-B 自助注册已关闭（owner 2026-08-26 拍板）：公网部署下匿名开户是隔离体系的天窗，
+	// 账号一律由管理员在后台"用户管理"页创建后线下交付账密。
+	// English: self-registration disabled by decision D7-B — accounts are admin-created only.
+	writeError(w, 403, "注册已关闭：账号由管理员在后台创建，请联系管理员")
 }
 
 // handleTemp 处理 POST /auth/temp：创建有效期 14 天的临时演示账号，返回 token/ID/过期时间。
+// §GAP2-W2：临时号同样必须携带有效邀请码——匿名领 token 是隔离违例的头号放大器，此处关闸。
 func (s *Server) handleTemp(w http.ResponseWriter, r *http.Request) {
-	if !s.limiter.allow(clientIP(r), 5, time.Minute) { // §A4
-		writeError(w, 429, "too many attempts")
-		return
-	}
-	user, err := s.auth.CreateTemp(14 * 24 * time.Hour)
-	if err != nil {
-		writeError(w, 500, "create temp account failed")
-		return
-	}
-	writeJSON(w, 201, map[string]interface{}{
-		"token":      user.Token,
-		"id":         user.ID,
-		"expires_at": user.TokenExp,
-	})
+	// §D7-B 匿名临时号与注册同批关闭——此前匿名领 14 天 token 是隔离违例的头号放大器。
+	// English: anonymous temp accounts are closed together with registration (decision D7-B).
+	writeError(w, 403, "注册已关闭：临时账号功能已停用，请联系管理员创建正式账号")
 }
 
 // loginReq 登录请求体：用户名 + 密码。
@@ -598,7 +577,7 @@ type loginReq struct {
 // 凭据错误返回 401。§A4 频控 10 次/分/IP（防撞库+bcrypt CPU 放大 DoS）；
 // 错误文案统一 "invalid credentials"（此前区分"用户不存在/密码错"可枚举用户名）。
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if !s.limiter.allow(clientIP(r), 10, time.Minute) {
+	if !s.limiter.allow("login|"+clientIP(r), 10, time.Minute) {
 		writeError(w, 429, "too many attempts")
 		return
 	}
@@ -649,7 +628,7 @@ type setupReq struct {
 // §A6 改造：检查-创建-标记经 Manager.SetupInitialAdmin 原子完成（此前 IsInitialized 与
 // CreateUser 之间存在 TOCTOU，并发双请求可产生两个 admin）；已初始化返回 400。
 func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
-	if !s.limiter.allow(clientIP(r), 5, time.Minute) {
+	if !s.limiter.allow("setup|"+clientIP(r), 5, time.Minute) {
 		writeError(w, 429, "too many attempts")
 		return
 	}
@@ -722,17 +701,89 @@ func (l *ipLimiter) allow(ip string, max int, window time.Duration) bool {
 	return true
 }
 
-// clientIP 提取请求来源 IP（X-Forwarded-First 优先——Caddy 反代场景）。
-func clientIP(r *http.Request) string {
-	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-		if i := strings.IndexByte(xf, ','); i > 0 {
-			return strings.TrimSpace(xf[:i])
-		}
-		return strings.TrimSpace(xf)
+// ── §GAP2-W1 客户端 IP 提取（可信代理收口）─────────────────────────────────────
+// 旧实现无条件信任 X-Forwarded-For 第一个值——公网直连 8080 的攻击者可随请求伪造该头，
+// 每次都伪装成全新 IP，register/temp/login/setup 的匿名限流全部失效（撞库+灌号+内存放大）。
+// 新语义：
+//   1. TCP 对端（RemoteAddr）不在可信代理网段内 → 直接采用对端 IP，完全无视 XFF（不可伪造）；
+//   2. 对端是可信代理（同机 Caddy 反代的 127.0.0.1 等）→ 从 XFF 自右向左跳过可信跳，
+//      取第一个不可信地址作为真实客户端 IP（标准 XFF 解析方向）；
+//   3. 全部条目均可信/解析失败 → 回退对端 IP。
+// 可信网段默认覆盖环回 + 内网段（Caddy 与应用同机的部署形态），可用环境变量
+// QUANT_TRUSTED_PROXIES 覆盖（逗号分隔 CIDR）。
+// English: §GAP2-W1 client-IP extraction with trusted-proxy handling. The old code blindly trusted
+// the first X-Forwarded-For value, so direct-to-8080 attackers could rotate fake IPs per request and
+// defeat every anonymous rate limit. Now: untrusted peer → use peer address only; trusted proxy →
+// walk XFF right-to-left skipping trusted hops; QUANT_TRUSTED_PROXIES overrides the default CIDR set.
+
+var trustedProxyCIDRs = func() []*net.IPNet {
+	cidrs := []string{
+		"127.0.0.0/8", "::1/128", // 环回（Caddy 同机反代）
+		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", // RFC1918 内网
+		"169.254.0.0/16", "fe80::/10", // 链路本地
 	}
+	if env := os.Getenv("QUANT_TRUSTED_PROXIES"); env != "" {
+		cidrs = strings.Split(env, ",")
+	}
+	var out []*net.IPNet
+	for _, c := range cidrs {
+		c = strings.TrimSpace(c)
+		if _, ipnet, err := net.ParseCIDR(c); err == nil {
+			out = append(out, ipnet)
+		} else {
+			log.Printf("[server] QUANT_TRUSTED_PROXIES 条目无效，已忽略: %q (%v)", c, err)
+		}
+	}
+	return out
+}()
+
+// isTrustedProxy 判断给定 IP 是否属于可信代理网段。
+// English: reports whether the IP falls within a trusted proxy CIDR.
+func isTrustedProxy(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, n := range trustedProxyCIDRs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientFromXFF 从 X-Forwarded-For 中自右向左取第一个不可信地址（真实客户端）。
+// 全部可信或无有效条目时返回空串，由调用方回退 RemoteAddr。
+// English: picks the right-most untrusted (real client) entry from XFF; "" when nothing usable.
+func clientFromXFF(xff string) string {
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		cand := strings.TrimSpace(parts[i])
+		if cand == "" {
+			continue
+		}
+		if !isTrustedProxy(cand) {
+			return cand
+		}
+	}
+	return ""
+}
+
+// clientIP 提取请求来源 IP（§GAP2-W1 可信代理收口版，语义见上方块注释）。
+func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	// 直连（非可信代理）：XFF 是攻击者可控的任意字符串，一律不采信。
+	if !isTrustedProxy(host) {
+		return host
+	}
+	// 经可信代理转发：解析 XFF 取真实客户端；拿不到则退回代理自身地址（限流粒度降级但安全）。
+	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+		if client := clientFromXFF(xf); client != "" {
+			return client
+		}
 	}
 	return host
 }
@@ -1243,12 +1294,14 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	var apiKeys []string
 	uid := requestUserID(r)
 	if v, ok := s.auth.GetConfig(uid, "llm_api_keys"); ok && v != "" {
-		apiKeys = splitLLMKeys(v)
+		for _, k := range splitLLMKeys(v) {
+			apiKeys = append(apiKeys, maskSecret(k)) // §GAP2-W2 脱敏回显
+		}
 	}
 	if len(apiKeys) == 0 {
 		// 兼容旧单 key 配置
 		if v, ok := s.auth.GetConfig(uid, "llm_api_key"); ok && v != "" {
-			apiKeys = []string{v}
+			apiKeys = []string{maskSecret(v)}
 		}
 	}
 	writeJSON(w, 200, map[string]interface{}{
@@ -1298,6 +1351,55 @@ func requestUserID(r *http.Request) string {
 	return u.ID
 }
 
+// maskSecret §GAP2-W2 密钥脱敏（P2-4）：保留前 4 后 4，中段以 … 掩盖；短密钥全掩。
+// English: masks a secret, keeping first/last 4 chars; short secrets are fully masked.
+func maskSecret(k string) string {
+	k = strings.TrimSpace(k)
+	if k == "" {
+		return ""
+	}
+	if len(k) < 12 {
+		return "***"
+	}
+	return k[:4] + "…" + k[len(k)-4:]
+}
+
+// isMaskedSecret 判断提交值是否为脱敏哨兵（GET 回显形态）——是则保持原值不变。
+// English: reports whether the submitted value is a masked sentinel echoed from GET.
+func isMaskedSecret(k string) bool {
+	return k == "***" || strings.Contains(k, "…")
+}
+
+// validatePublicURL §GAP2-W2 外呼 URL 校验（scrm P1-f 同源思路）：
+// 仅允许 http/https；域名解析后逐 IP 拒绝环回/私网/链路本地(含云元数据)/未指定/组播，
+// 解析失败一律拒绝（fail-closed）。用于 LLM api_url 与通知 webhook 等服务器外呼地址。
+// English: validates an outbound URL: http(s) only, and every resolved IP must not be
+// loopback/private/link-local/unspecified/multicast; resolution failure rejects (fail-closed).
+func validatePublicURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("URL 解析失败")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("仅允许 http/https")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("缺少主机名")
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("主机解析失败: %v", err)
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+			return fmt.Errorf("禁止指向内网/保留地址: %s", ip)
+		}
+	}
+	return nil
+}
+
 // handleSetLLMConfig 处理 POST /api/config/llm：保存当前账号的 LLM 配置并热重建客户端。
 // 依次执行：APIURL+Model 写入当前账号配置 → APIKey 写入 auth 配置 → 触发 llmRecreate
 // 回调重建客户端 → 记录运行时实际生效的 model（空值兜底为默认模型）。
@@ -1319,14 +1421,41 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		ClassifierModel:  req.ClassifierModel,
 	})
 
-	// 保存 APIKey 到 auth config（按账号隔离）
-	if req.APIKey != "" {
+	// §GAP2-W2 出呼地址校验（SSRF 面收口）：非法直接拒绝，不落任何配置
+	if req.APIURL != "" {
+		if err := validatePublicURL(req.APIURL); err != nil {
+			writeError(w, 400, "api_url "+err.Error())
+			return
+		}
+	}
+
+	// 保存 APIKey 到 auth config（按账号隔离）；§GAP2-W2 脱敏哨兵不覆盖原值
+	if req.APIKey != "" && !isMaskedSecret(req.APIKey) {
 		s.auth.SetConfig(uid, "llm_api_key", req.APIKey)
 	}
 
-	// 保存多 API 密钥到 auth config（逗号分隔）；为空时维持现状
+	// 保存多 API 密钥到 auth config（逗号分隔）；为空时维持现状；
+	// §GAP2-W2 逐位处理脱敏哨兵——提交 "sk-…abcd" 形态的槽位保留库中原值
 	if len(req.APIKeys) > 0 {
-		s.auth.SetConfig(uid, "llm_api_keys", strings.Join(req.APIKeys, ","))
+		existing := ""
+		if v, ok := s.auth.GetConfig(uid, "llm_api_keys"); ok {
+			existing = v
+		}
+		old := splitLLMKeys(existing)
+		out := make([]string, 0, len(req.APIKeys))
+		for i, k := range req.APIKeys {
+			switch {
+			case isMaskedSecret(k) && i < len(old):
+				out = append(out, old[i]) // 哨兵 → 原值
+			case isMaskedSecret(k):
+				// 哨兵但无对应原值（异常提交）：跳过，避免把掩码存成真钥
+			default:
+				out = append(out, k)
+			}
+		}
+		if len(out) > 0 {
+			s.auth.SetConfig(uid, "llm_api_keys", strings.Join(out, ","))
+		}
 	}
 
 	// 热重建 LLM 客户端（如果提供了回调）
@@ -1503,12 +1632,14 @@ func (s *Server) handleSetConsultProMode(w http.ResponseWriter, r *http.Request)
 
 // handleConsultHistory 处理 GET /api/consult/history：返回当日咨询对话历史。
 func (s *Server) handleConsultHistory(w http.ResponseWriter, r *http.Request) {
-	c := s.ctrlFor(requestUserID(r))
+	uid := requestUserID(r)
+	c := s.ctrlFor(uid)
 	if c == nil {
 		writeJSON(w, 200, []data.ConsultMessage{})
 		return
 	}
-	h := c.GetConsultHistory()
+	// §GAP2-W2 只返回本人账号目录下的咨询历史
+	h := c.GetConsultHistoryFor(uid)
 	if h == nil {
 		h = []data.ConsultMessage{}
 	}
@@ -1517,8 +1648,9 @@ func (s *Server) handleConsultHistory(w http.ResponseWriter, r *http.Request) {
 
 // handleClearConsultHistory 处理 DELETE /api/consult/history：清空当日咨询对话。
 func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Request) {
-	if c := s.ctrlFor(requestUserID(r)); c != nil {
-		c.ClearConsultHistory()
+	uid := requestUserID(r)
+	if c := s.ctrlFor(uid); c != nil {
+		c.ClearConsultHistoryFor(uid) // §GAP2-W2 只清本人账号的历史
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }

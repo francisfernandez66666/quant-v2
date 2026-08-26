@@ -13,18 +13,25 @@ import (
 
 // MessageItem 消息中心单条消息（与前端 /api/alerts 结构一致）。
 // ID 为稳定去重键（如 600519@止盈 / hold@SIGxxx），供手工删除定位。
+// §GAP2-W2 账户隔离：Scope 标记消息可见范围——""=公共（交易信号等全账号共享），
+// 非空=仅该 userID 可见（持仓提示/止盈止损等由个人持仓派生的私有消息，
+// 私有消息 ID 统一带 "u<uid>|" 前缀避免跨账号去重键碰撞）。
+// English: §GAP2-W2 account isolation — Scope marks visibility: ""=public (trade signals shared by
+// all accounts), non-empty=visible only to that userID (private position-derived alerts; private IDs
+// carry a "u<uid>|" prefix to avoid cross-account dedup-key collisions).
 type MessageItem struct {
-	ID          string    `json:"id"`           // 稳定去重键
-	Code        string    `json:"code"`         // 股票代码
-	Name        string    `json:"name"`         // 股票名称
-	Level       string    `json:"level"`        // 级别（如 止盈/止损/提示）
-	Action      string    `json:"action"`       // 动作
-	Strategy    string    `json:"strategy"`     // 关联策略
-	Time        string    `json:"time"`         // 触发时间字符串
-	Title       string    `json:"title"`        // 标题
-	Body        string    `json:"body"`         // 正文
-	Direction   string    `json:"direction"`    // 方向（利好/利空）
-	GeneratedAt time.Time `json:"generated_at"` // 生成时间
+	ID          string    `json:"id"`              // 稳定去重键
+	Code        string    `json:"code"`            // 股票代码
+	Name        string    `json:"name"`            // 股票名称
+	Level       string    `json:"level"`           // 级别（如 止盈/止损/提示）
+	Action      string    `json:"action"`          // 动作
+	Strategy    string    `json:"strategy"`        // 关联策略
+	Time        string    `json:"time"`            // 触发时间字符串
+	Title       string    `json:"title"`           // 标题
+	Body        string    `json:"body"`            // 正文
+	Direction   string    `json:"direction"`       // 方向（利好/利空）
+	GeneratedAt time.Time `json:"generated_at"`    // 生成时间
+	Scope       string    `json:"scope,omitempty"` // 可见范围（""=公共；uid=私有）
 }
 
 // messageFile 消息中心持久化文件结构。
@@ -110,6 +117,7 @@ func (s *MessageStore) Sync(items []MessageItem) {
 			kept.Body = it.Body
 			kept.Direction = it.Direction
 			kept.GeneratedAt = it.GeneratedAt
+			kept.Scope = it.Scope // §GAP2-W2 刷新时保留最新作用域归属
 			s.file.Messages[idx] = kept
 			continue
 		}
@@ -117,6 +125,23 @@ func (s *MessageStore) Sync(items []MessageItem) {
 		byKey[it.ID] = len(s.file.Messages) - 1
 	}
 	s.persist()
+}
+
+// ListVisible 返回指定账号可见的消息：公共（Scope=="")∪ 本人私有（Scope==uid）。
+// §GAP2-W2 消息中心账户隔离的读侧收口——朋友看不到 owner 的持仓提醒，反之亦然；
+// 交易信号等公共消息全员共享（owner 决策 D3：仪表盘/信号类数据通用）。
+// English: §GAP2-W2 read-side isolation — returns public ∪ own-private messages; friends never see
+// the owner's position-derived alerts and vice versa, while trade signals stay shared (decision D3).
+func (s *MessageStore) ListVisible(userID string) []MessageItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]MessageItem, 0, len(s.file.Messages))
+	for _, m := range s.file.Messages {
+		if m.Scope == "" || m.Scope == userID {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // RefreshNameByCode 按代码刷新股票名称：把 Code 匹配的全部消息 Name 覆盖为最新权威名。

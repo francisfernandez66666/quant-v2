@@ -152,6 +152,33 @@ func bsRunDaily(db *store.DB, c *data.BaostockClient, start, end string) error {
 	return nil
 }
 
+// clampEndToLastClosedDay §W3-a 半根K线防线（数据正确性 P0）：
+// 盘中（北京时间 <15:00 的交易日）增量下载时，akshare 新浪降级链会返回"当日未收盘 bar"
+// （close=现价、volume=半日量）。该行入库后 MaxTradeDate=今天，当晚正常装载从"明天"续传，
+// 当天真实 OHLCV 永不回填——脏数据静默进入因子装配/回测/寻优。故在请求侧把 end 收敛到
+// 上一个已收盘日：end==今日 且 当前<15:00(北京) → end 前移一天；再由 nextDay/断点语义保证
+// 收盘后的正常装载能补上今天。周末/节假日天然不触发（end<today）。
+// English: §W3-a half-bar guard — during intraday incremental loads the akshare fallback returns an
+// unfinished today-bar which permanently blocks tonight's real refill via the MaxTradeDate checkpoint.
+// Clamp `end` to yesterday when requesting today before Beijing 15:00.
+func clampEndToLastClosedDay(end string) string {
+	loc := time.FixedZone("CST", 8*3600)
+	now := time.Now().In(loc)
+	today := now.Format("2006-01-02")
+	if end != today {
+		return end
+	}
+	if h := now.Hour()*60 + now.Minute(); h >= 15*60 {
+		return end // 收盘后：当日 bar 已完整，允许写入
+	}
+	yest := now.AddDate(0, 0, -1)
+	for yest.Weekday() == time.Saturday || yest.Weekday() == time.Sunday {
+		yest = yest.AddDate(0, 0, -1)
+	}
+	log.Printf("[dataload] 盘中半根K线防线: end %s → %s（收盘后自动补当日）", end, yest.Format("2006-01-02"))
+	return yest.Format("2006-01-02")
+}
+
 // bsLoadStockTables 装载单只股票的行情类四表，返回插入行数。
 // （bsLoadStockTables loads one stock's four bar-like tables, returning inserted rows.）
 func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end string) (int, error) {
@@ -166,6 +193,7 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 			return 0, nil // 已最新，跳过
 		}
 	}
+	end = clampEndToLastClosedDay(end) // §W3-a 半根K线防线
 	bsCode := data.TsCodeToBS(code)
 	isoFrom, isoEnd := toISO(from), toISO(end)
 

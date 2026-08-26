@@ -22,7 +22,8 @@ func TestJPushAuthHeader(t *testing.T) {
 // TestJPushBuildPayload 验证 payload 结构：platform=all、alias 定位、标题/内容、通知渠道。
 func TestJPushBuildPayload(t *testing.T) {
 	g := NewJPushGateway("app123", "sec456", "quant_owner")
-	data := g.buildPayload("清仓提醒", "000001 触发清仓")
+	// §GAP2-W2：默认别名路由（msg.Alias 为空 → 网关配置别名）
+	data := g.buildPayload(Message{Title: "清仓提醒"}, "000001 触发清仓")
 	var p struct {
 		Platform string `json:"platform"`
 		Audience struct {
@@ -110,5 +111,33 @@ func TestJPushDefaultAlias(t *testing.T) {
 	g := NewJPushGateway("app", "sec", "")
 	if g.Alias != "quant_owner" {
 		t.Fatalf("alias=%q, want quant_owner", g.Alias)
+	}
+}
+
+// TestJPushAliasRouting §GAP2-W2 回归：私有告警的 msg.Alias 覆盖网关默认别名——
+// 归属账号的止损提醒直达本人设备，不再全员打向 quant_owner。
+func TestJPushAliasRouting(t *testing.T) {
+	g := NewJPushGateway("app123", "sec456", "quant_owner")
+	decodeAlias := func(data []byte) string {
+		var p struct {
+			Audience struct {
+				Alias []string `json:"alias"`
+			} `json:"audience"`
+		}
+		if err := json.Unmarshal(data, &p); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(p.Audience.Alias) != 1 {
+			t.Fatalf("expect 1 alias, got %v", p.Audience.Alias)
+		}
+		return p.Audience.Alias[0]
+	}
+	// 空覆盖 → 默认 quant_owner
+	if got := decodeAlias(g.buildPayload(Message{Title: "t"}, "c")); got != "quant_owner" {
+		t.Fatalf("默认别名: got %q", got)
+	}
+	// 私有告警 → 归属账号别名（u_123 的设备）
+	if got := decodeAlias(g.buildPayload(Message{Title: "t", Alias: "u_123"}, "c")); got != "u_123" {
+		t.Fatalf("私有告警应路由到归属账号别名, got %q", got)
 	}
 }

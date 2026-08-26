@@ -57,18 +57,16 @@ func main() {
 	dataDir := getDataDir()
 	os.MkdirAll(dataDir, 0755)
 
-	// 认证管理：初始化用户库，首次启动时创建默认管理员账号 admin / admin123
+	// 认证管理：初始化用户库。§GAP2-W1 移除"首次启动自动创建 admin/admin123"——
+	// 全世界都知道的弱口令在公网等于无门；现在全新部署必须走 POST /setup 原子初始化
+	// （SetupInitialAdmin 单临界区完成检查+建号+标记，防并发双 admin），由部署者自设强口令。
+	// 存量部署不受影响：已有用户的库 IsInitialized()==true，行为与此前一致。
 	authMgr := auth.NewManager(dataDir)
 	if err := authMgr.Init(); err != nil {
 		log.Fatalf("auth init: %v", err)
 	}
 	if !authMgr.IsInitialized() {
-		u, err := authMgr.CreateUser("admin", "admin123", auth.RoleAdmin, nil, 0)
-		if err != nil {
-			log.Fatalf("create default admin: %v", err)
-		}
-		log.Printf("首次启动, 已创建默认管理员账号 admin / admin123 (token=%s)", u.Token[:16]+"...")
-		authMgr.MarkInitialized()
+		log.Printf("全新部署：请打开 http://<host>:8080/setup 创建管理员账号（不再提供默认口令 admin/admin123）")
 	}
 
 	// 行情客户端：东财行情 API + 同花顺板块出口（板块列表/涨跌幅/主力净流入）
@@ -344,7 +342,7 @@ func main() {
 	}
 	ln := pickListener(addr, 20)
 	if ln == nil {
-		log.Fatalf("HTTP 监听失败 %s: 连续 20 个端口均被占用", addr)
+		log.Fatalf("HTTP 监听失败 %s: 端口被占用（§W4-b fail-fast：拒绝顺延端口避免双实例写同一数据目录；请排查残留进程）", addr)
 	}
 	bound := ln.Addr().String()
 	log.Printf("[main] HTTP 服务已绑定 %s (来源 %s)", bound, addr)
@@ -378,6 +376,13 @@ func main() {
 		defer cancel()
 		_ = hs.Shutdown(shutdownCtx)
 		trigCancel()
+		// §W3-c 根修：旧实现此处 os.Exit(0) 直接跳过 main 的全部 defer——
+		// nAgent.Stop/fetcher.Stop 永不执行（注释宣称"最终落盘"与实现相反），
+		// 非原子写状态文件可能被拦腰截断。改为显式执行关键 Stop 后再退出，
+		// 与 defer 链语义对齐（scoreLoopCancel 等由 ctx 派生自动生效）。
+		fetcher.Stop()
+		nAgent.Stop()
+		log.Println("[main] 优雅停机完成")
 		os.Exit(0)
 	}()
 
@@ -596,20 +601,22 @@ func getDataDir() string {
 	return filepath.Join(home, ".quant-trading-v2")
 }
 
-// pickListener 尝试监听 baseAddr；若端口被占用则自动顺延到下一个端口（最多 maxTries 次），
-// 返回成功绑定的监听器；均失败返回 nil。
-// English: tries to listen on baseAddr; when the port is taken it rolls over to the next port
-// (up to maxTries times) and returns the first successfully bound listener, or nil if all fail.
+// pickListener §W4-b fail-fast 化：仅尝试绑定 baseAddr 本身；端口被占用即返回 nil 由调用方
+// 致命退出（systemd 5s 后重启）。旧实现自动顺延端口的副作用是：stale 旧实例占住 8080 时，
+// 新实例静默绑到 8081"正常启动"，两套引擎同时写同一 trading.db 且 Caddy 仍指向旧实例——
+// split-brain 极难察觉。单实例保证已由 systemd 承担，应用层应快速失败暴露问题。
+// English: §W4-b fail-fast binding — a taken port now aborts startup (systemd restarts) instead of
+// silently rolling to the next port, which previously allowed two engines writing the same DB while
+// Caddy kept hitting the stale one.
 func pickListener(baseAddr string, maxTries int) net.Listener {
-	addr := baseAddr
-	for i := 0; i < maxTries; i++ {
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			return ln
-		}
-		addr = bumpPort(addr)
+	_ = maxTries // 兼容旧调用方签名（语义已改为只试一次）
+	ln, err := net.Listen("tcp", baseAddr)
+	if err != nil {
+		log.Printf("[main] 端口绑定失败 %s: %v（可能存在残留进程；拒绝顺延端口以避免双实例写同一数据目录）",
+			baseAddr, err)
+		return nil
 	}
-	return nil
+	return ln
 }
 
 // bumpPort 将 host:port 地址中的端口号 +1（如 :8080 -> :8081）；解析失败时原样返回。

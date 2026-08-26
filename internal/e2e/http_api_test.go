@@ -234,7 +234,8 @@ func TestHTTPConsultProModeAPI(t *testing.T) {
 	}
 
 	// 另一用户（tester2）读回仍为关（按用户隔离，开关落盘 auth.json）
-	if _, err := hr.rig.auth.Register("tester2", "tester123"); err != nil {
+	inv2, _ := hr.rig.auth.CreateInvite()
+	if _, err := hr.rig.auth.Register("tester2", "tester123", inv2); err != nil {
 		t.Fatalf("register tester2: %v", err)
 	}
 	token2 := hr.rig.auth.UserToken("tester2")

@@ -55,7 +55,8 @@
         <router-link to="/paper" class="nav-item" active-class="active" @click="menuOpen = false" v-if="paperEnabled">
           <span class="nav-icon">🧪</span> 模拟盘
         </router-link>
-        <router-link to="/settings" class="nav-item" active-class="active" @click="menuOpen = false">
+        <!-- §GAP2-W2 权限收口：全局策略/D1/LLM 写权限已收敛到 admin，普通用户隐藏设置入口 -->
+        <router-link to="/settings" class="nav-item" active-class="active" @click="menuOpen = false" v-if="canAdmin">
           <span class="nav-icon">⚙</span> 设置
         </router-link>
         <router-link to="/llm-debug" class="nav-item" active-class="active" @click="menuOpen = false">
@@ -138,7 +139,7 @@
         <label>密码</label>
         <input v-model="password" type="password" placeholder="输入密码" @keyup.enter="handleLogin" />
       </div>
-      <!-- 登录按钮：登录中显示“登录中...”并禁用，防止重复提交 -->
+      <!-- §D7-B 注册已关闭：账号由管理员后台创建，登录页保持纯登录形态 -->
       <button class="btn-login" @click="handleLogin" :disabled="logging">
         {{ logging ? '登录中...' : '登录' }}
       </button>

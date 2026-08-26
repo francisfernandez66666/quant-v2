@@ -438,9 +438,12 @@ func (s *Server) handleFixEngineHealth(w http.ResponseWriter, r *http.Request) {
 // 数据来源：消息中心持久化存储（引擎每轮同步 止盈/止损/策略信号/持仓提示）。
 // 未接入引擎时回退到实时看板 + 持仓日志。结果按时间倒序排列。
 func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
-	ctrl := s.ctrlFor(requestUserID(r))
+	uid := requestUserID(r)
+	ctrl := s.ctrlFor(uid)
 	if ctrl != nil {
-		msgs := ctrl.GetMessages()
+		// §GAP2-W2 账户隔离读侧：只返回 公共 ∪ 本人私有 的消息，
+		// 朋友的持仓止盈止损提醒不再混入 owner 视图（反之亦然）。
+		msgs := ctrl.GetMessagesFor(uid)
 		if msgs == nil {
 			msgs = []data.MessageItem{}
 		}
@@ -1383,9 +1386,11 @@ const newsTTL = 30 * time.Second
 
 func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "true"
-	cacheKey := "all"
+	// §GAP2-W2 缓存键加入 userID（I-7 根修）：旧键只有 "all"/""，30s 内 B 会拿到
+	// 以 A 引擎状态生成的合并视图（跨账号响应串号）。
+	cacheKey := "all|" + requestUserID(r)
 	if !all {
-		cacheKey = ""
+		cacheKey = "|" + requestUserID(r)
 	}
 
 	// TTL 缓存：30s 内命中直接返回上次 JSON 响应（原始新闻流 + 事件合并结果均被缓存）

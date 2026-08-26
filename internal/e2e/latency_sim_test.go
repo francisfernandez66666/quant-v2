@@ -79,7 +79,8 @@ func newRehearsalRig(t *testing.T, fix *Fixture, profile *LatencyProfile, metric
 	if err := authMgr.Init(); err != nil {
 		t.Fatalf("auth init: %v", err)
 	}
-	if _, err := authMgr.Register("tester", "tester123"); err != nil {
+	invCode, _ := authMgr.CreateInvite()
+	if _, err := authMgr.Register("tester", "tester123", invCode); err != nil {
 		t.Fatalf("auth register: %v", err)
 	}
 

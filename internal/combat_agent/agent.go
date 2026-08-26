@@ -630,18 +630,21 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	if ds, ok := input.D1Scores[code]; ok {
 		d1 = &ds
 	}
-	// C1 负面硬 veto：D1 命中负面过滤（立案/减持/质押/解禁等）的个股，
-	// 任何战法都不产生做多信号（记分保留，仅拦截信号）。
-	// English: C1 negative hard-veto — a stock whose D1 tripped the negative filter produces no
-	// buy signal from any strategy (scores are still recorded; only signals are withheld).
-	if d1 != nil && d1.Blocked {
+	// §W5-v3 LLM 解耦（owner 口径）：负面过滤不再硬拦截任何战法的信号产生——
+	// LLM 打分对非 N 战法只做参考标注；Blocked 个股的信号照常产出，
+	// 在 evalAll 收尾统一追加 "⚠️LLM利空提示" 到 Reason，由执行层利空冷却守卫把关真金下单。
+	// N 形自身的 D1 硬闸不受影响（scorer 内部实现）。此处仅保留打分占位与日志。
+	// English: §W5-v3 LLM decoupling — the negative filter no longer vetoes signal generation for
+	// non-N strategies; blocked stocks still produce signals annotated with an LLM-caution suffix,
+	// while real-money protection moves to the execution-layer fresh-bearish guard.
+	llmBlocked := d1 != nil && d1.Blocked
+	if llmBlocked {
 		if input.Scores == nil {
 			input.Scores = make(map[string]StockScores)
 		}
 		scb := StockScores{Code: code, DataGaps: make(map[string]bool), UpdatedAt: now}
 		input.Scores[code] = scb
-		log.Printf("[combat_agent] D1 负面拦截 %s: %s", code, d1.Reason)
-		return nil
+		log.Printf("[combat_agent] D1 负面提示(不拦截) %s: %s", code, d1.Reason)
 	}
 	eventDesc := strings.Join(newsTitlesOf(input.News, code), "；")
 	// PE 由上层 Engine 预取填充（input.PE 为空表示该股无 PE，N 形 D3 走斐波那契兜底）
@@ -964,6 +967,26 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	}
 	log.Printf("[combat_agent] 评分 %s(%s) 龙=%.0f 双=%.0f N=%.0f 回=%.0f 动量=%.0f 命中=%v%s",
 		code, md.Name, sc.DragonScore, sc.DoubleBumpScore, sc.NScore, sc.DragonReturnScore, sc.MomentumScore, sc.SignalActive, unSigNote)
+	// §W5-v3 LLM 参考标注收口：非 N 战法信号统一携带 d1_ref 参考分（Meta，浮点）；
+	// Blocked 个股在 Reason 尾部追加"⚠️LLM利空提示"——信息不丢，但不改写级别、不拦截信号。
+	// English: §W5-v3 — non-N signals carry a d1_ref reference score; blocked stocks get an
+	// LLM-caution suffix on Reason without any level rewrite or veto.
+	if len(sigs) > 0 {
+		for i := range sigs {
+			if sigs[i].StrategyType == string(strategy.SignalNShape) {
+				continue // N 形由自身硬闸消费 D1，无需参考标注
+			}
+			if d1 != nil {
+				if sigs[i].Meta == nil {
+					sigs[i].Meta = make(map[string]float64)
+				}
+				sigs[i].Meta["d1_ref"] = d1.Score
+				if llmBlocked && !strings.Contains(sigs[i].Reason, "LLM利空提示") {
+					sigs[i].Reason += " ⚠️LLM利空提示:" + d1.Reason
+				}
+			}
+		}
+	}
 	return sigs
 }
 
@@ -1083,34 +1106,29 @@ func (a *Agent) doubleBumpConfig() config.DoubleBumpConfig {
 // re-derived from each strategy's own thresholds so strong-event stocks clear their buy gate. The raw
 // total and boost delta are recorded in Details["d1_raw"]/["d1_boost"] for transparency. N-shape keeps
 // its own independent D1 hard gate and is skipped.
+// applyD1Boost §W5-v3 标注化改造（owner 口径：LLM 不参与非 N 战法信号产生）：
+// 只把"D1 参考分/旧公式理论加成值"写入 Details 供前端展示，绝不修改 TotalScore/Pass/Level——
+// 信号的观察与买入级别完全由原始量价分数决定。函数名保留以减少调用方改动。
+// English: §W5-v3 annotation-only — records the reference D1 score / theoretical boost into Details
+// for display; never mutates TotalScore/Pass/Level, so raw price-volume scores alone decide levels.
 func (a *Agent) applyD1Boost(t strategy.SignalType, eval *strategy.Evaluation, d1 *D1Score) {
 	a.mu.RLock()
 	cfg := a.d1Boost
 	a.mu.RUnlock()
-	if cfg.BoostWeight <= 0 || d1 == nil || d1.Blocked || d1.Score < cfg.BoostThreshold {
-		return
-	}
-	tiers, ok := d1BoostTiers(t)
-	if !ok {
-		return
-	}
-	boosted := eval.TotalScore * (1 + cfg.BoostWeight*d1.Score/40)
-	if boosted > 100 {
-		boosted = 100
-	}
-	if boosted <= eval.TotalScore {
+	if d1 == nil || d1.Blocked {
 		return
 	}
 	if eval.Details == nil {
 		eval.Details = make(map[string]float64)
 	}
-	eval.Details["d1_raw"] = eval.TotalScore
-	eval.Details["d1_boost"] = boosted - eval.TotalScore
-	eval.TotalScore = boosted
-	if level, pass := tiers(boosted); pass {
-		eval.Pass = true
-		eval.Level = level
+	eval.Details["d1_ref"] = d1.Score // 参考分（展示层）
+	if cfg.BoostWeight > 0 && d1.Score >= cfg.BoostThreshold {
+		ref := eval.TotalScore * (cfg.BoostWeight * d1.Score / 40) * 100 // 旧公式理论增量（百分点），仅供对照
+		if ref > 0 {
+			eval.Details["d1_ref_boost"] = ref
+		}
 	}
+	_ = t
 }
 
 // d1BoostTiers 返回非 N 战法的级别重判函数，门槛与 strategies/* 评分实现保持一致：

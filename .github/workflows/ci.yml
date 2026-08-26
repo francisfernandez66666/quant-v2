@@ -9,6 +9,20 @@ on:
   pull_request:
 
 jobs:
+  # §GAP2-W1 密钥泄漏扫描门禁：keystore 口令曾明文入库（mobile/gradle.properties），
+  # gitleaks 全量扫描历史与工作区，防止同类事故再次入库。
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks 需要完整历史才能扫描全部提交
+
+      - name: gitleaks（密钥泄漏扫描）
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   go:
     runs-on: ubuntu-latest
     steps:

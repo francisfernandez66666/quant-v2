@@ -83,7 +83,10 @@ def _bs_query(fn, *args, **kwargs):
         try:
             rs = _bs_call(fn, *args, **kwargs).result(timeout=_QUERY_TIMEOUT)
         except concurrent.futures.TimeoutError:
-            _bs_relogin()  # 踢掉卡死连接，僵尸线程随连接关闭退出
+            # §W3-a 锁外重连：relogin 内含 sleep(1)，持锁执行会让所有等待方多卡 1s+；
+            # 放到锁外异步执行（连接对象替换是原子赋值），本请求照常抛超时。
+            import threading
+            threading.Thread(target=_bs_relogin, daemon=True).start()
             raise RuntimeError("baostock query timeout (%ds)" % _QUERY_TIMEOUT)
         if rs.error_code != "0":
             # 网络/连接类错误：重新 login 后重试一次
@@ -364,13 +367,10 @@ def r_adjust_factor(params):
         rows, fields = _bs_query(bs.query_adjust_factor, code=code, start_date=start, end_date=end)
         return _to_csv(fields, rows)
     except Exception:
-        dates = _ak_sina_dates(code, start, end)
-        fields = ["dividOperateDate", "backAdjustFactor", "adjustFactor", "dividPreNoticeDate",
-                  "dividCashPsBeforeTax", "dividStocksPsBeforeTax", "dividTaxRate",
-                  "dividCashPsAfterTax", "dividStocksPsAfterTax", "dividCashTotalAmt",
-                  "dividStocksTotalAmt", "dividRemark"]
-        rows = [[d, "1", "1", "", "", "", "", "", "", "", "", ""] for d in dates]
-        return _to_csv(fields, rows)
+        # §W3-a 投毒修复：旧降级写 factor=1——分红股的 HfqBars 直接乘 1，后复权价静默错误，
+        # 污染因子装配与回测。改为返回空 CSV：dataload 对空结果按"本票跳过"处理，
+        # 后续轮次 baostock 恢复后自动补真因子。
+        return _to_csv(["dividOperateDate", "backAdjustFactor"], [])
 
 
 def _fina(params, fn, name):

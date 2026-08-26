@@ -6,6 +6,7 @@ package engine
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -77,8 +78,11 @@ func TestAutoPlacePlacesOrder(t *testing.T) {
 		t.Fatalf("expected 1 order, got %d", len(*orders))
 	}
 	o := (*orders)[0]
-	if o["signal_id"] != "SIG1" {
-		t.Fatalf("signal_id: %v", o["signal_id"])
+	// §GAP2-W1 确定性幂等键：buy:<纯代码>:<战法>:<交易日>——不再使用每轮重生成的 sig.ID，
+	// 同股同战法当日重复触发/重启重放全部被 orders 表唯一键拦截。
+	wantID := fmt.Sprintf("buy:600000:龙头:%s", data.TradingDayDate(time.Now()))
+	if o["signal_id"] != wantID {
+		t.Fatalf("signal_id: got %v want %v", o["signal_id"], wantID)
 	}
 	if o["code"] != "600000.SH" {
 		t.Fatalf("code should get .SH suffix, got %v", o["code"])
@@ -335,4 +339,39 @@ func mustPositions(t *testing.T, db *store.DB) []store.RealPosition {
 		t.Fatal(err)
 	}
 	return ps
+}
+
+// TestM8PeakResetsWhenFlat §GAP2-W1 回归（资损级）：空仓时 M8 峰值基线必须归零。
+// 旧实现提前 return 从不重置 m8PeakTotal——峰值 16 万全平后再建仓 1 万，
+// 回撤判定 (10000-16000)/16000=-37.5% 直接命中 -20% 阈值，新仓位被立刻连环强平。
+func TestM8PeakResetsWhenFlat(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, nil)
+	mgr := config.NewManager("")
+	mgr.Rules.RiskCtrl.M8Enabled = true
+	mgr.Rules.RiskCtrl.M8PortfolioDrawdownPct = -20
+	e.SetCfgMgr(mgr)
+
+	// 空仓调用 → 进程内陈旧峰值归零
+	e.mu.Lock()
+	e.m8PeakTotal = 16000
+	e.mu.Unlock()
+	e.checkM8RealDrawdown(e.QMTController(), db, nil, nil)
+	e.mu.RLock()
+	peak := e.m8PeakTotal
+	e.mu.RUnlock()
+	if peak != 0 {
+		t.Fatalf("空仓应把 M8 峰值基线归零, got %v", peak)
+	}
+
+	// 归零后重建仓：市值 10000 直接成为新峰值，不存在对陈旧峰值的"回撤" → 不触发清仓
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "A", Qty: 1000, CostPrice: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.checkM8RealDrawdown(e.QMTController(), db, mustPositions(t, db),
+		map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}})
+	if len(*orders) != 0 {
+		t.Fatalf("重建仓不应被陈旧峰值误判回撤而强平, got %d orders", len(*orders))
+	}
 }

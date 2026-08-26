@@ -161,16 +161,25 @@ func (c *QMTClient) State() (*GatewayState, error) {
 }
 
 // Health 探测网关健康。
-// （Health pings gateway /health.）
+// §GAP2-W1 语义修复：同时要求 ok=true 与 broker_connected=true——旧实现只解析 {ok,ts}，
+// 把 broker_connected 字段直接丢弃；"Python 进程活着但 xtquant 通道已断"的场景会误判健康，
+// 熔断不触发，新单连续打进 503 并批量制造幽灵占位行（网关侧 /order 会拒绝，但首尔侧已落库计预算）。
+// 对旧版网关（无该字段）保持兼容：字段缺省 false 会触发熔断——这是安全侧失效（fail-safe），
+// 部署侧应同步升级 qmt_gateway。
+// English: §GAP2-W1 semantic fix: health requires BOTH ok=true and broker_connected=true. The old
+// parser dropped broker_connected, so "Python alive but xtquant channel dead" looked healthy — the
+// breaker never tripped and new orders kept hitting gateway 503s while ghost placeholders piled up
+// in Seoul. Legacy gateways without the field now fail closed (fail-safe); upgrade qmt_gateway accordingly.
 func (c *QMTClient) Health() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	var out struct {
-		OK bool   `json:"ok"`
-		TS string `json:"ts"`
+		OK              bool   `json:"ok"`
+		BrokerConnected bool   `json:"broker_connected"`
+		TS              string `json:"ts"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/health", nil, &out); err != nil {
 		return false, err
 	}
-	return out.OK, nil
+	return out.OK && out.BrokerConnected, nil
 }

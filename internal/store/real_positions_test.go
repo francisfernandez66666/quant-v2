@@ -164,3 +164,35 @@ func TestRealPositionsForUser(t *testing.T) {
 		t.Fatalf("遗留行归属更新后其他账号应不可见, got %d", len(other2))
 	}
 }
+
+// TestApplyRealFillIdempotent §W3-b 回归：同一笔回报（同 order_id/traded_at/price/qty）重复投递时，
+// 幂等唯一键命中 → 整体 no-op，持仓数量不被二次累加（根除 outbox 重试双倍记账）。
+func TestApplyRealFillIdempotent(t *testing.T) {
+	db := testDB(t)
+	f := RealFill{OrderID: "O-IDEM", Code: "600519.SH", Side: "买入", Price: 10, Qty: 100,
+		Amount: 1000, TradedAt: "2026-08-26T10:00:00+08:00", SignalID: "S1", UserID: "u_x"}
+	if err := db.ApplyRealFill(f); err != nil {
+		t.Fatalf("first fill: %v", err)
+	}
+	p, _ := db.RealPositionByCode("600519.SH")
+	if p.Qty != 100 {
+		t.Fatalf("首笔后持仓应 100, got %d", p.Qty)
+	}
+	// 同一笔重放：唯一键冲突 → 幂等成功（err==nil）且持仓不变
+	if err := db.ApplyRealFill(f); err != nil {
+		t.Fatalf("duplicate fill 应幂等成功而非报错: %v", err)
+	}
+	p, _ = db.RealPositionByCode("600519.SH")
+	if p.Qty != 100 {
+		t.Fatalf("重放后持仓仍应 100, got %d", p.Qty)
+	}
+	// 真正的新成交（不同回报时间戳）正常累加
+	f2 := f
+	f2.TradedAt = "2026-08-26T10:01:00+08:00"
+	if err := db.ApplyRealFill(f2); err != nil {
+		t.Fatalf("second distinct fill: %v", err)
+	}
+	if p, _ = db.RealPositionByCode("600519.SH"); p.Qty != 200 {
+		t.Fatalf("新成交应累加到 200, got %d", p.Qty)
+	}
+}

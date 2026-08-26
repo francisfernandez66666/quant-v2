@@ -53,13 +53,19 @@ type jpushPayload struct {
 }
 
 // buildPayload 构造极光推送请求体（标题+内容，走 Android 自定义通知渠道）。
-func (g *JPushGateway) buildPayload(title, content string) []byte {
+// §GAP2-W2 别名路由：msg.Alias 非空时覆盖默认别名——私有告警直达归属账号设备，
+// 不再全员打向 quant_owner 单别名（朋友的止损提醒误推 owner 手机的历史缺陷）。
+func (g *JPushGateway) buildPayload(msg Message, content string) []byte {
 	var p jpushPayload
 	p.Platform = "all"
-	p.Audience.Alias = []string{g.Alias}
+	alias := g.Alias
+	if msg.Alias != "" {
+		alias = msg.Alias // §GAP2-W2 归属账号别名优先
+	}
+	p.Audience.Alias = []string{alias}
 	p.Notification.Alert = content
 	p.Notification.Android.Alert = content
-	p.Notification.Android.Title = title
+	p.Notification.Android.Title = msg.Title
 	p.Notification.Android.ChannelID = "quant_signals"
 	p.Notification.Android.Priority = 1
 	p.Options.TimeToLive = 86400 // 1 天离线保留
@@ -80,7 +86,7 @@ func (g *JPushGateway) Send(msg Message) error {
 	if url == "" {
 		url = "https://api.jpush.cn/v3/push"
 	}
-	body := g.buildPayload(msg.Title, msg.Content)
+	body := g.buildPayload(msg, msg.Content)
 	if body == nil {
 		return fmt.Errorf("极光推送 payload 构造失败")
 	}

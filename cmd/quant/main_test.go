@@ -123,7 +123,8 @@ func newTestAuthManager(t *testing.T) *auth.Manager {
 	if err := m.Init(); err != nil {
 		t.Fatalf("auth init: %v", err)
 	}
-	_, err := m.Register("testuser", "testpass")
+	invCode, _ := m.CreateInvite()
+	_, err := m.Register("testuser", "testpass", invCode)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -690,24 +691,18 @@ func TestBumpPort(t *testing.T) {
 	}
 }
 
-// TestPickListenerPortSwitch 验证端口被占用时自动顺延到下一个空闲端口：
-// 先占用 8090，再调用 pickListener(":8090", 3) 应返回 8091 的监听器。
-// English: verifies the auto port-switch — occupy 8090 first, then pickListener(":8090", 3)
-// must roll over and bind :8091.
-func TestPickListenerPortSwitch(t *testing.T) {
+// TestPickListenerFailFast §W4-b 回归：端口被占用时必须返回 nil（fail-fast），
+// 绝不允许顺延端口——旧自动顺延会让 stale 进程占 8080 时新实例静默绑 8081，
+// 双引擎同写 trading.db 且 Caddy 仍指向旧实例（split-brain）。
+func TestPickListenerFailFast(t *testing.T) {
 	block, err := net.Listen("tcp", ":8090")
 	if err != nil {
 		t.Skipf("无法占用测试端口 8090: %v", err)
 	}
 	defer block.Close()
 
-	ln := pickListener(":8090", 3)
-	if ln == nil {
-		t.Fatal("pickListener 返回 nil，应顺延到空闲端口")
-	}
-	defer ln.Close()
-	bound := ln.Addr().String()
-	if want := ":8091"; bound != want && bound != "[::]:8091" {
-		t.Errorf("应顺延到 :8091, 实际绑定 %s", bound)
+	if ln := pickListener(":8090", 3); ln != nil {
+		ln.Close()
+		t.Fatal("端口被占用应 fail-fast 返回 nil，而非顺延绑定")
 	}
 }

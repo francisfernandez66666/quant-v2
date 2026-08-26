@@ -116,14 +116,11 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		trackedCodes(e.stockTracker.GetActiveByDirection(td, "利好")),
 		trackedCodes(e.stockTracker.GetActiveByDirection(td, "利空")),
 	)
+	// §W5-v3 准入放开：快照热点股全部纳入打分池，不再要求"已有 D1 记录"——
+	// 该门槛原是防无新闻支撑误发信号的连坐闸；解耦后非 N 战法不消费 D1（N 形评分时无 D1 自然得 0 分
+	// 不出信号），外层门槛失去存在意义且会延迟新热点进入近实时监控。
 	if len(snapCodes) > 0 {
-		var ctxCodes []string
-		for _, code := range snapCodes {
-			if _, ok := d1Scores[code]; ok {
-				ctxCodes = append(ctxCodes, code)
-			}
-		}
-		pool = mergeCodes(pool, ctxCodes)
+		pool = mergeCodes(pool, snapCodes)
 	}
 	if len(pool) == 0 {
 		return
@@ -445,9 +442,27 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 
 	// 熔断健康探测（节流：miss_heartbeat_sec/2）
 	ctrl.HealthCheck()
+	// §W6-a 周期对账（默认 5min 节流）：首尔侧主动拉网关持仓落库，终结"双向对账均不存在"的盲区
+	ctrl.MaybeReconcile(5 * time.Minute)
 
-	positions, err := realStore.RealPositions()
+	// §GAP2-W2 实盘建议定向化（I-4）：只读主账号（=QMT 归属账号，实盘仅 admin 开启）的持仓，
+	// SSE 只推给该账号——admin 真实持仓代码/数量/买卖建议不再每 5s 广播给所有在线用户。
+	sendTo := e.primaryMember()
+	positions, err := realStore.RealPositionsForUser(sendTo)
 	if err != nil || len(positions) == 0 {
+		// §GAP2-W1 平仓归零（资损级修复）：空仓时把 M8 组合回撤的进程内峰值基线清零。
+		// 旧实现提前 return 且从不重置 m8PeakTotal——注释宣称"平仓后基线归零"但代码没做，
+		// 后果：峰值 16 万 → 全平 → 再建仓 10 万时回撤判定 (10-16)/16=-37.5% 直接命中阈值，
+		// 新仓位被立刻整体强平；用户再入场再触发，死亡螺旋直到进程重启。归零后新基线从当前市值起算。
+		// English: §GAP2-W1 reset-on-flat: when the book is empty, clear the in-process M8 drawdown
+		// peak. The old early-return never reset m8PeakTotal despite the comment claiming it did —
+		// after a full liquidation, any re-entry was instantly "in drawdown" vs the stale peak and got
+		// force-liquidated again, looping until restart.
+		if err == nil && len(positions) == 0 {
+			e.mu.Lock()
+			e.m8PeakTotal = 0
+			e.mu.Unlock()
+		}
 		return
 	}
 
@@ -490,10 +505,11 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		e.autoExecuteRealSells(ctrl, realStore, advices)
 	}
 
-	if len(advices) == 0 || sse == nil {
+	if len(advices) == 0 || sse == nil || sendTo == "" {
 		return
 	}
-	sse.Broadcast(map[string]interface{}{
+	// §GAP2-W2 定向推送替代全员广播
+	sse.BroadcastTo(sendTo, map[string]interface{}{
 		"type":    "real_advice",
 		"advices": advices,
 		"tripped": ctrl.Tripped(),
@@ -541,6 +557,12 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		return err
 	}
 	if res != nil && !res.OK && strings.Contains(res.Err, "duplicate") {
+		// §GAP2-W1 语义更新：duplicate 现在只可能意味着"当日同类卖单已真实报出"
+		// （发送失败的单会经 MarkRealOrderSendFailed→ResetFailedRealOrder 放行重试，
+		// 不再以 duplicate 形态出现），因此幂等命中=目标已达成，静默返回是正确行为。
+		// English: §GAP2-W1 semantics: duplicate now strictly means "this day's same-class sell was
+		// genuinely sent" — failed sends are retried via the send-failed demotion path instead of
+		// surfacing as duplicates, so an idempotent hit equals mission accomplished.
 		return nil // 当日已下过同类卖单（幂等命中），静默
 	}
 	log.Printf("[qmt] 自动卖出 %s(%s) %d股 @%.2f 类别=%s 原因=%s → %+v",
@@ -577,9 +599,17 @@ func (e *Engine) autoExecuteRealSells(ctrl *trading.Controller, realStore *store
 // checkM8RealDrawdown §GAP1.2 M8 组合回撤兜底（risk.M8Check 口径接线到实盘）：
 // 每轮用实时快照计算实盘组合总市值（缺行情的持仓按成本价兜底计入），维护进程内峰值；
 // 回撤超 rules.risk_ctrl.m8_portfolio_drawdown_pct 且 m8_enabled 时全部持仓自动卖出
-// （类别 m8，按日幂等）。平仓后（无有效市值）峰值归零重新累计。
+// （类别 m8，按日幂等）。§GAP2-W1：空仓入口真正把峰值归零重新累计（旧实现注释宣称
+// 归零实际提前 return 从不重置——清仓后再入场会被陈旧峰值立即判定回撤并连环强平）。
 func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.DB, positions []store.RealPosition, quotes map[string]*data.StockInfo) {
 	if realStore == nil || len(positions) == 0 {
+		// §GAP2-W1 双保险归零：本函数被独立调用（如未来其他链路）时空仓同样清零基线。
+		// English: §GAP2-W1 belt-and-braces: standalone callers also see the peak reset when flat.
+		if len(positions) == 0 {
+			e.mu.Lock()
+			e.m8PeakTotal = 0
+			e.mu.Unlock()
+		}
 		return
 	}
 	e.mu.RLock()

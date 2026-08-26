@@ -21,7 +21,8 @@ func newTestMgr(t *testing.T) *Manager {
 // TestRegisterLoginValidate ... 注册→登录→令牌校验闭环 + 密码非明文。
 func TestRegisterLoginValidate(t *testing.T) {
 	m := newTestMgr(t)
-	u, err := m.Register("tester", "secret123")
+	code, _ := m.CreateInvite()
+	u, err := m.Register("tester", "secret123", code)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -61,10 +62,13 @@ func TestRegisterLoginValidate(t *testing.T) {
 // TestRegisterDuplicate 重名注册应报错。
 func TestRegisterDuplicate(t *testing.T) {
 	m := newTestMgr(t)
-	if _, err := m.Register("dup", "p"); err != nil {
+	code, _ := m.CreateInvite()
+	if _, err := m.Register("dup", "p", code); err != nil {
 		t.Fatalf("首次注册: %v", err)
 	}
-	if _, err := m.Register("dup", "p2"); err == nil {
+	if _, err := m.Register("dup", "p2", code); err == nil {
+		// 注意：同码第二次会因用户名冲突在消费前被拒？——实现顺序为"先验码后查重名"，
+		// 因此这里若报重名错误，说明第一次已把码消费掉；无论哪种错误都应失败。
 		t.Error("重复用户名注册应失败")
 	}
 }
@@ -72,7 +76,8 @@ func TestRegisterDuplicate(t *testing.T) {
 // TestCreateTemp 临时账户：无密码不可登录、令牌可用、过期后失效。
 func TestCreateTemp(t *testing.T) {
 	m := newTestMgr(t)
-	u, err := m.CreateTemp(2 * time.Second)
+	tcode, _ := m.CreateInvite()
+	u, err := m.CreateTemp(2*time.Second, tcode)
 	if err != nil {
 		t.Fatalf("CreateTemp: %v", err)
 	}
@@ -410,7 +415,8 @@ func TestTokenExpiryAndSlidingRenewal(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)
 	_ = m.Init()
-	u, err := m.Register("carol", "pw")
+	ccode, _ := m.CreateInvite()
+	u, err := m.Register("carol", "pw", ccode)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,7 @@
 package trading
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -147,5 +148,130 @@ func TestGuardBlacklist(t *testing.T) {
 	if _, err := ctrl.PlaceOrder(OrderRequest{SignalID: "BL-OK", Code: "600000.SH", Name: "浦发",
 		Side: SideBuy, Price: 10, Qty: 100, Amount: 1000, CreatedAt: time.Now().Format(time.RFC3339)}); err != nil {
 		t.Fatalf("非黑名单不应被拒: %v", err)
+	}
+}
+
+// ── §GAP2-W1 发送失败降级与重试放行 ─────────────────────────────────────────────
+
+// flakyStub 可控失败的假网关：fail=true 时 PlaceBuy 返回网络错误，模拟网关超时/断连。
+// English: flakyStub is a controllable fake gateway: with fail=true PlaceBuy returns a network
+// error, simulating a gateway timeout / disconnect.
+type flakyStub struct {
+	guardStub
+	fail bool
+}
+
+func (f *flakyStub) PlaceBuy(req OrderRequest) (*OrderResult, error) {
+	f.calls++
+	if f.fail {
+		return nil, fmt.Errorf("gateway timeout")
+	}
+	return &OrderResult{OK: true, OrderID: "GW-R"}, nil
+}
+
+// TestSendFailedRetryAndBudgetExclusion §GAP2-W1 回归：
+// ①下单发送失败 → 占位行降级"发送失败"，不再计入当日预算（幽灵单不再虚耗额度）；
+// ②同一 signal_id 在发送失败后重试放行并成功；③成功后再发同键仍被 duplicate 拦截；
+// ④状态守卫：已成/已报等真实进度绝不会被误降级。
+func TestSendFailedRetryAndBudgetExclusion(t *testing.T) {
+	db := testDB(t)
+	stub := &flakyStub{}
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.DailyBudgetAmount = 3000 // 预算两笔：幽灵单若被计入（R1 失败 1000 + R2 成功 1000），R3 重试的 1000 会超限被拒
+	ctrl := NewController(stub, db, "u_sf", cfg, nil)
+
+	mk := func(id string) OrderRequest {
+		return OrderRequest{SignalID: id, Code: "600000.SH", Name: "浦发", Strategy: "龙头",
+			Side: SideBuy, PriceType: "market", Price: 10, Qty: 100, Amount: 1000,
+			CreatedAt: time.Now().Format(time.RFC3339)}
+	}
+
+	// ① 首次发送失败：返回 err 且占位行降级为"发送失败"
+	stub.fail = true
+	if _, err := ctrl.PlaceOrder(mk("R1")); err == nil {
+		t.Fatalf("网关故障时下单应报错")
+	}
+	os, err := db.RealOrders()
+	if err != nil || len(os) != 1 || os[0].Status != "发送失败" {
+		t.Fatalf("占位行应降级为发送失败: %+v err=%v", os, err)
+	}
+
+	// ② 幽灵单不计入预算：同日第二笔 1000 元应放行（旧实现 spent=1000+1000>1500 会被拒）
+	stub.fail = false
+	res, err := ctrl.PlaceOrder(mk("R2"))
+	if err != nil || res == nil || !res.OK {
+		t.Fatalf("发送失败的单不应占用预算，第二笔应成功: %+v err=%v", res, err)
+	}
+
+	// ④ 状态守卫：把 R2 手工推进为"已成"，再制造一次同键请求不应把它回退为已报/重发
+	if err := db.UpdateRealOrderBySignalID("R2", "GW-R", "已成"); err != nil {
+		t.Fatal(err)
+	}
+	stub.calls = 0
+	res, err = ctrl.PlaceOrder(mk("R2"))
+	if err != nil || res.OK || !strings.Contains(res.Err, "duplicate") {
+		t.Fatalf("已成订单同键重发应 duplicate: %+v err=%v", res, err)
+	}
+	if stub.calls != 0 {
+		t.Fatalf("已成订单不应触发真实发送, calls=%d", stub.calls)
+	}
+	if os, _ = db.RealOrders(); os[0].SignalID == "R2" && os[0].Status != "已成" {
+		t.Fatalf("已成状态不应被降级: %+v", os[0])
+	}
+
+	// ③ 失败后同键重试放行：R3 首发失败 → 重置 → 同键重试成功
+	stub.fail = true
+	if _, err := ctrl.PlaceOrder(mk("R3")); err == nil {
+		t.Fatalf("R3 首次应失败")
+	}
+	stub.fail = false
+	calls := stub.calls
+	res, err = ctrl.PlaceOrder(mk("R3"))
+	if err != nil || !res.OK {
+		t.Fatalf("发送失败后同键重试应放行: %+v err=%v", res, err)
+	}
+	if stub.calls != calls+1 {
+		t.Fatalf("重试应真实到达网关")
+	}
+}
+
+// TestGuardSellExemptsSTAndBlacklist §GAP2-W1 回归：ST/黑名单守卫仅拦买入方向——
+// 已持仓股盘中戴帽 ST 或进黑名单后，卖出（止损/清仓）必须照常放行；买入仍被拒。
+func TestGuardSellExemptsSTAndBlacklist(t *testing.T) {
+	db := testDB(t)
+	g := &guardStub{}
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.Blacklist = []string{"000001"}
+	ctrl := NewController(g, db, "u_se", cfg, nil)
+
+	sellReq := func(name, code string) OrderRequest {
+		return OrderRequest{SignalID: "SELL-" + code, Code: code, Name: name, Strategy: "龙头",
+			Side: SideSell, PriceType: "market", Price: 10, Qty: 100, Amount: 1000,
+			CreatedAt: time.Now().Format(time.RFC3339)}
+	}
+	buyReqNamed := func(name, code, id string) OrderRequest {
+		return OrderRequest{SignalID: id, Code: code, Name: name, Strategy: "龙头",
+			Side: SideBuy, PriceType: "market", Price: 10, Qty: 100, Amount: 1000,
+			CreatedAt: time.Now().Format(time.RFC3339)}
+	}
+
+	// ST 股：买拒 / 卖放行
+	if _, err := ctrl.PlaceOrder(buyReqNamed("*ST海工", "600601.SH", "B-ST")); err == nil {
+		t.Fatalf("ST 股买入应被拒")
+	}
+	if g.calls != 0 {
+		t.Fatalf("ST 买入被拒不应触达网关, calls=%d", g.calls)
+	}
+	if _, err := ctrl.PlaceOrder(sellReq("*ST海工", "600601.SH")); err != nil {
+		t.Fatalf("ST 股卖出应豁免守卫放行: %v", err)
+	}
+	// 黑名单股：买拒 / 卖放行
+	if _, err := ctrl.PlaceOrder(buyReqNamed("平安银行", "000001.SZ", "B-BL")); err == nil {
+		t.Fatalf("黑名单股买入应被拒")
+	}
+	if _, err := ctrl.PlaceOrder(sellReq("平安银行", "000001.SZ")); err != nil {
+		t.Fatalf("黑名单股卖出应豁免守卫放行: %v", err)
 	}
 }

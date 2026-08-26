@@ -2,6 +2,8 @@
 package research
 
 import (
+	"quant-trading-v2/internal/data"
+
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -38,7 +40,7 @@ func ApplyWeights(dataDir string, c *store.Candidate) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dataDir, "applied_rules.json"), b, 0o644)
+	return data.AtomicWrite(filepath.Join(dataDir, "applied_rules.json"), b, 0o644) // §W3-c
 }
 
 // FactorRule 实盘因子战法规则（E6），由审批通过的 factor 候选落盘，供引擎 runner 注入。
@@ -334,7 +336,7 @@ func saveAppliedFactors(dataDir string, entries []AppliedFactorEntry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dataDir, "applied_factors.json"), b, 0o644)
+	return data.AtomicWrite(filepath.Join(dataDir, "applied_factors.json"), b, 0o644) // §W3-c 审批产物丢失需重跑寻优+审批
 }
 
 // AppliedPatternRule 实盘形态模板规则（F3）。复用本包 pattern.go 的 PatternCond。
@@ -584,7 +586,7 @@ func saveAppliedPatterns(dataDir string, entries []AppliedPatternEntry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dataDir, "applied_patterns.json"), b, 0o644)
+	return data.AtomicWrite(filepath.Join(dataDir, "applied_patterns.json"), b, 0o644) // §W3-c
 }
 
 // ApplyOptimizationParams 把扫参审批的参数覆盖写入指定库规则（§P2-d）。

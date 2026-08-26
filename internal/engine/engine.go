@@ -64,6 +64,8 @@ type Engine struct {
 	scanner      *data.SectorScanner     // 板块扫描器（板块名单索引，板块验真与归因校验依赖）
 
 	userID       string          // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/scores）
+	members      []string        // §GAP2-W2 共享引擎服务的账号全集（registry 注入；私有消息/SSE 扇出依据）
+	accountsRoot string          // §GAP2-W2 <dataDir>/accounts 根（私有文件按账号寻址）
 	cfgMgr       *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
 	longEnabled  bool            // 利好开关（做多分支）
 	shortEnabled bool            // 利空开关（做空分支）
@@ -83,12 +85,14 @@ type Engine struct {
 	signalStore   *signalStore             // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
 	// English: pinned per-day signal store (latest Pass per code@strategy, restored across restarts)
 
-	msgStore      *data.MessageStore       // 消息中心持久化存储
-	consultStore  *data.ConsultStore       // 股票咨询对话持久化存储（跨交易日清空）
-	confrontStore *data.ConfrontationStore // 政策反制事件持久化存储（跨交易日清空）
-	notifier      *notify.Notifier         // 推送器（桌面/Webhook；P1 清仓强提醒用）
-	hotRecords    []data.HotRecord         // 当日热点板块轮次记录（固化到磁盘）
-	hotRecPath    string                   // 热点板块记录持久化文件路径
+	msgStore      *data.MessageStore            // 消息中心持久化存储
+	consultStore  *data.ConsultStore            // 股票咨询对话持久化存储（跨交易日清空；accountsRoot 未注入时的共享回退）
+	consultMu     sync.Mutex                    // §GAP2-W2 保护 consultByUser 懒加载
+	consultByUser map[string]*data.ConsultStore // §GAP2-W2 按账号隔离的咨询历史（accountsRoot/<uid>/consult_history.json）
+	confrontStore *data.ConfrontationStore      // 政策反制事件持久化存储（跨交易日清空）
+	notifier      *notify.Notifier              // 推送器（桌面/Webhook；P1 清仓强提醒用）
+	hotRecords    []data.HotRecord              // 当日热点板块轮次记录（固化到磁盘）
+	hotRecPath    string                        // 热点板块记录持久化文件路径
 
 	sectorEventTimes map[string]time.Time  // 板块事件时间戳（重复事件衰减状态）
 	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
@@ -369,6 +373,7 @@ func New(
 		signalStore:      newSignalStore(signalStorePath),
 		msgStore:         data.NewMessageStore(msgPath),
 		consultStore:     data.NewConsultStore(consultPath),
+		consultByUser:    make(map[string]*data.ConsultStore),
 		confrontStore:    data.NewConfrontationStore(confrontPath),
 		hotRecords:       loadHotRecords(hotRecPath),
 		hotRecPath:       hotRecPath,
@@ -399,6 +404,61 @@ func (e *Engine) SetUserID(userID string) {
 	e.mu.Lock()
 	e.userID = userID
 	e.mu.Unlock()
+}
+
+// §GAP2-W2 账户隔离：共享引擎的成员账号列表与私有状态根目录。
+// 指纹相同的多个账号复用同一计算引擎（战法只算一遍），但"谁的持仓提醒/咨询历史"必须按账号隔离——
+// members 由 registry.registerUser 注入（去重后的服务账号全集），是私有消息生成与 SSE 定向扇出的依据；
+// accountsRoot（<dataDir>/accounts）用于把咨询历史等私有文件寻址到各自账号目录，
+// 根除"共享组全部状态落首建者目录"的历史缺陷（I-1/I-2）。
+// English: §GAP2-W2 — members are the accounts served by this (possibly shared) engine, injected by
+// the registry; they drive per-user private alert generation and targeted SSE fan-out. accountsRoot
+// addresses private files (consult history) into each account's own directory, fixing the legacy
+// "everything lands in the first builder's folder" defect.
+func (e *Engine) SetMembers(ids []string) {
+	e.mu.Lock()
+	cp := append([]string(nil), ids...)
+	sort.Strings(cp)
+	e.members = cp
+	// 单成员引擎同时固定 userID：恢复 syncAccountConfig / 定向推送的账号语义
+	// （此前 SetUserID 从未被调用，账号级配置热同步永不生效）。
+	if len(cp) == 1 {
+		e.userID = cp[0]
+	}
+	e.mu.Unlock()
+}
+
+// SetAccountsRoot 注入 <dataDir>/accounts 根目录（私有状态按账号寻址）。
+func (e *Engine) SetAccountsRoot(dir string) {
+	e.mu.Lock()
+	e.accountsRoot = dir
+	e.mu.Unlock()
+}
+
+// memberIDs 返回本引擎服务的账号列表（快照）；无成员时回退 userID（兼容独占引擎旧路径）。
+func (e *Engine) memberIDs() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.members) > 0 {
+		return append([]string(nil), e.members...)
+	}
+	if e.userID != "" {
+		return []string{e.userID}
+	}
+	// 无成员且无 userID（旧装配/e2e）：回退单 "" 账号，保持 ListFor("") 的全局语义
+	return []string{""}
+}
+
+// primaryMember 返回主账号（首个成员）：实盘账本/QMT 控制器等"单一归属"资源的默认主体。
+// English: primaryMember returns the first member — the default owner for single-owner resources
+// (live book / QMT controller).
+func (e *Engine) primaryMember() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.members) > 0 {
+		return e.members[0]
+	}
+	return e.userID
 }
 
 // UserID 返回本引擎所属账号 ID。
@@ -603,11 +663,21 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
 		return
 	}
-	// 信号 ID 缺失时用 code@auto 兜底（幂等键仍需唯一）。
-	id := sig.ID
-	if id == "" {
-		id = sig.Code + "@auto"
-	}
+	// §GAP2-W1 确定性幂等键（资损级修复）：实盘买入 signal_id 改为 buy:<纯代码>:<战法>:<交易日>。
+	// 旧实现直接用 sig.ID（seqID="SIG"+UnixNano，每轮扫描重新生成）——主循环每 ~5 分钟重扫一次，
+	// 同一股票只要持续满足条件就会拿到全新 signal_id 反复真实下单，直到烧满 daily_max_buys/预算；
+	// 且 prevBullBuy 去重状态是纯内存态，盘中重启首轮把全部当前 Pass 信号当"新翻转"重放。
+	// 新键与卖出键 sell:<码>:<类>:<日> 同构：orders 表 signal_id 唯一键天然防重——
+	// 跨轮次重复触发、近实时+主循环双通道叠加、进程重启重放，全部被数据库唯一约束拦截；
+	// 同股同战法当日至多一笔买单，与单日笔数/预算纪律的语义一致。
+	// English: §GAP2-W1 deterministic idempotency key (capital-loss-grade fix): the live BUY signal_id
+	// becomes buy:<pureCode>:<strategy>:<tradingDay>. The old code reused sig.ID ("SIG"+UnixNano,
+	// regenerated every scan round), so a stock persistently satisfying its strategy re-fired a fresh
+	// real order every ~5 minutes until the daily caps burned; the in-memory prevBullBuy dedup also
+	// replayed everything as "new flips" after an intraday restart. Mirroring the sell key, the DB
+	// unique constraint now blocks all repeats across rounds/channels/restarts — at most one buy per
+	// (stock, strategy, day), consistent with the daily-count/budget discipline.
+	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), sig.Strategy, data.TradingDayDate(time.Now()))
 	res, err := ctrl.PlaceOrder(trading.OrderRequest{
 		SignalID:  id,
 		Code:      withSuffix(sig.Code),
@@ -1128,12 +1198,23 @@ func (e *Engine) captureHotRecord(sr *strategy_engine.StrategyResult) {
 
 // ── 消息中心 ──
 
-// GetMessages 返回消息中心全部消息（按生成时间倒序）。
+// GetMessages 返回消息中心全部消息（按生成时间倒序）——引擎内部/调试用，含他人私有消息，
+// HTTP 展示一律走 GetMessagesFor(uid)（§GAP2-W2 账户隔离读侧）。
 func (e *Engine) GetMessages() []data.MessageItem {
 	if e.msgStore == nil {
 		return nil
 	}
 	return e.msgStore.List()
+}
+
+// GetMessagesFor 返回指定账号可见的消息（公共 ∪ 本人私有）——§GAP2-W2 消息中心读侧收口，
+// 朋友看不到 owner 的持仓止盈止损提醒，反之亦然；交易信号等公共消息全员共享（决策 D3）。
+// English: §GAP2-W2 read-side isolation — public ∪ own-private messages for the requesting account.
+func (e *Engine) GetMessagesFor(userID string) []data.MessageItem {
+	if e.msgStore == nil {
+		return nil
+	}
+	return e.msgStore.ListVisible(userID)
 }
 
 // ClearMessages 清空消息中心全部消息。
@@ -1210,8 +1291,8 @@ func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error
 
 	// 历史：仅取最近 consultHistoryLimit 条（正序）。
 	messages := make([]llm.Message, 0, consultHistoryLimit+2)
-	if e.consultStore != nil {
-		hist := e.consultStore.List()
+	if store := e.consultStoreFor(userID); store != nil {
+		hist := store.List()
 		if len(hist) > consultHistoryLimit {
 			hist = hist[len(hist)-consultHistoryLimit:]
 		}
@@ -1238,10 +1319,10 @@ func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error
 	trusted := collectTrustedNumbers(append([]string{system, userMsg}, histTexts...)...)
 	reply = auditNumbers(reply, trusted)
 
-	// 对话历史落盘：用户提问 + 模型回复
-	if e.consultStore != nil {
-		e.consultStore.Append("user", userMsg)
-		e.consultStore.Append("assistant", reply)
+	// 对话历史落盘：用户提问 + 模型回复（§GAP2-W2 写入本人账号目录）
+	if store := e.consultStoreFor(userID); store != nil {
+		store.Append("user", userMsg)
+		store.Append("assistant", reply)
 	}
 	return reply, nil
 }
@@ -1503,19 +1584,41 @@ func consultMATrend(kl []data.KLine) string {
 	return "均线空头排列"
 }
 
-// GetConsultHistory 返回当日咨询对话历史。
-func (e *Engine) GetConsultHistory() []data.ConsultMessage {
-	if e.consultStore == nil {
-		return nil
+// consultStoreFor 返回指定账号的咨询历史存储（§GAP2-W2 I-1 私有状态按账号寻址）：
+// accountsRoot 注入时落 accounts/<uid>/consult_history.json（各自目录互不可见），
+// 未注入（旧部署/测试）回退引擎级共享 store 保持兼容。懒加载并发安全。
+// English: per-account consult history store under accounts/<uid>/; falls back to the shared engine
+// store when accountsRoot isn't injected (legacy deploys/tests). Lazily built, concurrency-safe.
+func (e *Engine) consultStoreFor(userID string) *data.ConsultStore {
+	if userID == "" {
+		return e.consultStore
 	}
-	return e.consultStore.List()
+	e.mu.RLock()
+	root := e.accountsRoot
+	e.mu.RUnlock()
+	if root == "" {
+		return e.consultStore
+	}
+	e.consultMu.Lock()
+	defer e.consultMu.Unlock()
+	if st, ok := e.consultByUser[userID]; ok {
+		return st
+	}
+	dir := filepath.Join(root, userID)
+	_ = os.MkdirAll(dir, 0755)
+	st := data.NewConsultStore(filepath.Join(dir, "consult_history.json"))
+	e.consultByUser[userID] = st
+	return st
 }
 
-// ClearConsultHistory 清空当日咨询对话历史。
-func (e *Engine) ClearConsultHistory() {
-	if e.consultStore != nil {
-		e.consultStore.Clear()
-	}
+// GetConsultHistory 返回指定账号的当日咨询对话历史（§GAP2-W2 账户隔离）。
+func (e *Engine) GetConsultHistoryFor(userID string) []data.ConsultMessage {
+	return e.consultStoreFor(userID).List()
+}
+
+// ClearConsultHistory 清空指定账号的当日咨询对话历史（§GAP2-W2 只清本人的）。
+func (e *Engine) ClearConsultHistoryFor(userID string) {
+	e.consultStoreFor(userID).Clear()
 }
 
 // buildPolicyRetaliationSignals 将政策反制事件转为可展示信号：
@@ -1714,53 +1817,58 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 		})
 	}
 
-	// 利空板块持仓提醒：扫描当前持仓,凡命中本轮利空板块领跌股/利空个股的,提醒"卖出"。
-	// 仅在存在利空依据时触发；不出做空战法信号、不自动平仓。
+	// §GAP2-W2 账户隔离（I-3）：持仓派生消息改为逐成员私有生成——
+	// 旧实现用无过滤 rpt.HeldPositions()/List() 把【所有人】的持仓止盈止损并进共享消息中心，
+	// 朋友能看到 owner 的仓位与成本，反之亦然。现在公共区只保留交易信号/策略信号（D3 共享口径），
+	// 私有区按 memberIDs 逐账号用 ListFor(uid) 生成，Scope=uid 且 ID 加 "u<uid>|" 前缀防跨账号碰撞。
+	// English: §GAP2-W2 — position-derived alerts are now generated per member from ListFor(uid) with
+	// Scope=uid and a "u<uid>|" ID prefix; public items (trade/policy signals) stay shared per D3.
 	if sr != nil {
 		bearCodes := bearHitCodes(sr)
-		held := e.rpt.HeldPositions()
 		now := time.Now()
-		for _, pos := range held {
-			if bearCodes[pos.Code] {
-				reason := fmt.Sprintf("持仓 %s(%s) 命中利空板块,建议考虑减仓/卖出", pos.Name, pos.Code)
+		for _, uid := range e.memberIDs() {
+			for _, pos := range e.rpt.HeldPositionsFor(uid) {
+				if bearCodes[pos.Code] {
+					items = append(items, data.MessageItem{
+						ID:          fmt.Sprintf("u%s|bearhold@%s", uid, pos.Code),
+						Scope:       uid,
+						Code:        pos.Code,
+						Name:        pos.Name,
+						Level:       "利空提示",
+						Action:      "卖出",
+						Strategy:    pos.Strategy,
+						Time:        now.Format("15:04:05"),
+						Title:       fmt.Sprintf("利空提示 %s", pos.Code),
+						Body:        fmt.Sprintf("持仓 %s(%s) 命中利空板块,建议考虑减仓/卖出", pos.Name, pos.Code),
+						Direction:   "利空",
+						GeneratedAt: now,
+					})
+				}
+			}
+			for _, l := range e.rpt.ListFor(uid) {
+				if l.Status != "持仓中" && l.ExitAt == nil {
+					continue
+				}
+				pct := ""
+				if l.ProfitPct != nil {
+					pct = fmt.Sprintf("%.1f%%", *l.ProfitPct)
+				}
 				items = append(items, data.MessageItem{
-					ID:          "bearhold@" + pos.Code,
-					Code:        pos.Code,
-					Name:        pos.Name,
-					Level:       "利空提示",
-					Action:      "卖出",
-					Strategy:    pos.Strategy,
-					Time:        now.Format("15:04:05"),
-					Title:       fmt.Sprintf("利空提示 %s", pos.Code),
-					Body:        reason,
-					Direction:   "利空",
-					GeneratedAt: now,
+					ID:          fmt.Sprintf("u%s|hold@%s", uid, l.SignalID),
+					Scope:       uid,
+					Code:        l.Code,
+					Name:        orName(l.Name, e.authoritativeName(l.Code), l.Code),
+					Level:       "持仓提示",
+					Action:      l.Status,
+					Strategy:    l.Strategy,
+					Time:        l.EntryAt.Format("15:04:05"),
+					Title:       fmt.Sprintf("%s %s", l.Status, l.Code),
+					Body:        fmt.Sprintf("策略:%s 入场:%.2f %s", l.Strategy, l.EntryPrice, pct),
+					Direction:   l.Direction,
+					GeneratedAt: l.EntryAt,
 				})
 			}
 		}
-	}
-
-	for _, l := range e.rpt.List() {
-		if l.Status != "持仓中" && l.ExitAt == nil {
-			continue
-		}
-		pct := ""
-		if l.ProfitPct != nil {
-			pct = fmt.Sprintf("%.1f%%", *l.ProfitPct)
-		}
-		items = append(items, data.MessageItem{
-			ID:          "hold@" + l.SignalID,
-			Code:        l.Code,
-			Name:        orName(l.Name, e.authoritativeName(l.Code), l.Code),
-			Level:       "持仓提示",
-			Action:      l.Status,
-			Strategy:    l.Strategy,
-			Time:        l.EntryAt.Format("15:04:05"),
-			Title:       fmt.Sprintf("%s %s", l.Status, l.Code),
-			Body:        fmt.Sprintf("策略:%s 入场:%.2f %s", l.Strategy, l.EntryPrice, pct),
-			Direction:   l.Direction,
-			GeneratedAt: l.EntryAt,
-		})
 	}
 	// P1 强提醒：本轮新产生的 清仓/止损 告警，首次出现时走桌面通知 + Webhook 推送。
 	// 依据消息去重键（code@level）判新：已在消息中心存在则说明前几轮已提醒过，不再重复推送。
@@ -1771,19 +1879,28 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 	e.msgStore.Sync(items)
 }
 
-// pushSSEMessages 把本轮新增的关键消息经 SSE 定向推送给本账号前端（账号隔离）。
-// 仅推送止盈/止损/清仓/交易信号等关键级别，且只在消息中心首次出现时推送（按去重键判新），
-// 避免 5s 循环对同一消息反复推送。前端收到 message 事件后弹系统通知并刷新消息中心。
+// messageVisibleExisting 构建指定作用域的"已存在键"集合（判新去重用）：
+// 公共项对照公共可见集，私有项对照该账号可见集。
+// English: builds the existing-key set for one item's scope (public vs that user's visible view).
+func (e *Engine) messageVisibleExisting(scope string) map[string]bool {
+	existing := make(map[string]bool)
+	for _, m := range e.msgStore.ListVisible(scope) {
+		existing[m.ID] = true
+	}
+	return existing
+}
+
+// pushSSEMessages 把本轮新增的关键消息经 SSE 定向推送（§GAP2-W2 按作用域路由）：
+// 私有消息（Scope=uid）只推给该账号；公共消息扇出给本引擎服务的全部账号前端。
+// 仅推送止盈/止损/清仓/交易信号等关键级别，且只在消息中心首次出现时推送（按作用域判新）。
+// English: routes critical messages over SSE — private items go to their owner only; public ones fan
+// out to every account served by this engine; deduped per scope on first appearance.
 func (e *Engine) pushSSEMessages(items []data.MessageItem) {
 	if e.sse == nil {
 		return
 	}
-	existing := make(map[string]bool)
-	for _, m := range e.msgStore.List() {
-		existing[m.ID] = true
-	}
+	members := e.memberIDs()
 	for _, it := range items {
-		// 关键级别才推送：止盈/止损/清仓/交易信号
 		critical := it.Level == "止盈" || it.Level == "止损" || it.Level == "清仓" || it.Level == "交易信号"
 		if !critical {
 			continue
@@ -1792,13 +1909,25 @@ func (e *Engine) pushSSEMessages(items []data.MessageItem) {
 		if key == "" {
 			key = it.Code + "@" + it.Level
 		}
-		if existing[key] {
+		if e.messageVisibleExisting(it.Scope)[key] {
 			continue
 		}
-		e.sse.BroadcastTo(e.userID, map[string]interface{}{
+		payload := map[string]interface{}{
 			"type": "message",
 			"item": it,
-		})
+		}
+		if it.Scope != "" {
+			e.sse.BroadcastTo(it.Scope, payload)
+			continue
+		}
+		// 公共关键消息：扇出全部成员；无成员信息时回退 userID（独占引擎旧语义）
+		if len(members) == 0 {
+			e.sse.BroadcastTo(e.userID, payload)
+			continue
+		}
+		for _, uid := range members {
+			e.sse.BroadcastTo(uid, payload)
+		}
 	}
 }
 
@@ -1816,10 +1945,6 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 	if nt == nil {
 		return
 	}
-	existing := make(map[string]bool)
-	for _, m := range e.msgStore.List() {
-		existing[m.ID] = true
-	}
 	for _, it := range items {
 		switch it.Level {
 		case "清仓", "止损", "止盈", "交易信号":
@@ -1830,7 +1955,9 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 		if key == "" {
 			key = it.Code + "@" + it.Level
 		}
-		if existing[key] {
+		// §GAP2-W2 按作用域判新：私有告警对照本人可见集，公共告警对照公共集——
+		// 避免不同账号的同键消息互相"顶掉"首次推送时机。
+		if e.messageVisibleExisting(it.Scope)[key] {
 			continue
 		}
 		title := fmt.Sprintf("%s %s(%s)", it.Level, it.Name, it.Code)
@@ -1838,6 +1965,9 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 			Level:   notify.LevelHigh,
 			Title:   title,
 			Content: it.Body,
+			// §GAP2-W2 别名路由：私有告警推给归属账号的设备别名（quant_<uid>），
+			// 公共信号保持默认别名（owner 手机）——朋友的止损提醒不再打到 owner 手机上。
+			Alias: it.Scope,
 		}
 		nt.Push(msg)
 		// 同步转发到外部推送网关（若已配置），让关键提醒触达 APK 后台/离线场景
@@ -2275,6 +2405,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 同步本账号配置（做多/做空开关 + 战法参数），保证账号内各设备一致
 	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
 	e.syncAccountConfig()
+
 	// 0-6. 新闻流水线：拉取→Stage0/1/2→固化→阈值→聚簇→衰减→归因验真传播
 	pOut := e.produceNews(ctx, since)
 	rawNews, st0, events, valid := pOut.rawNews, pOut.st0, pOut.events, pOut.valid

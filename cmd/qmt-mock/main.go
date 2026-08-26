@@ -199,10 +199,13 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// /health 健康探测。
-	// （/health liveness probe.）
+	// /health 健康探测。§GAP2-W1 补 broker_connected=true：真实 qmt_gateway 的 /health 带该字段
+	// （反映 xtquant 通道状态），首尔侧 Health() 现在要求 ok && broker_connected 才算健康；
+	// mock 必须对齐契约，否则全链路联调会因"通道未连"被熔断。
+	// （/health liveness probe. §GAP2-W1 adds broker_connected=true to mirror the real gateway
+	// contract; Seoul's Health() requires ok && broker_connected since the W1 fix.）
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]interface{}{"ok": true, "ts": time.Now().Format(time.RFC3339)})
+		writeJSON(w, map[string]interface{}{"ok": true, "broker_connected": true, "ts": time.Now().Format(time.RFC3339)})
 	})
 
 	// /state 网关状态与持仓/委托（对账源）。

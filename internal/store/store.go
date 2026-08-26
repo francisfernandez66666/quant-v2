@@ -34,7 +34,8 @@ func Open(dbPath string) (*DB, error) {
 	// busy_timeout 避免多进程（dataload 与回测）并发写时报 database is locked；
 	// WAL 提升并发读写吞吐。English: busy_timeout avoids "database is locked" across the
 	// dataload/backtest processes; WAL boosts concurrent read/write throughput.
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)")
+	// §W4-c journal_size_limit：WAL 收尾后自动截断到 64MB，防夜间大批量装载后 -wal 滞留膨胀
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(67108864)")
 	if err != nil {
 		return nil, fmt.Errorf("store open %s: %v", dbPath, err)
 	}
@@ -341,6 +342,7 @@ func (d *DB) migrate() error {
 			qty INTEGER NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
+
 		// 实盘成交回报：网关成交事件逐条落库（对账/研究用）。
 		// English: real fill reports — one row per gateway trade event (reconciliation/research).
 		`CREATE TABLE IF NOT EXISTS fills (
@@ -352,8 +354,12 @@ func (d *DB) migrate() error {
 			qty INTEGER NOT NULL,
 			amount REAL NOT NULL,
 			traded_at TEXT NOT NULL,
-			signal_id TEXT DEFAULT ''
+			signal_id TEXT DEFAULT '',
+			user_id TEXT DEFAULT ''
 		)`,
+		// §W3-b 成交回报幂等唯一键：同一委托+同一回报时间戳+同价同量只入账一次，
+		// 根除 outbox 重试遇响应丢失时的双倍记账（首尔侧此前零幂等）。
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_idem ON fills(order_id, traded_at, price, qty)`,
 		// 常用查询索引（主键外的补充加速）
 		`CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_db_date ON daily_basic(trade_date)`,
@@ -475,6 +481,9 @@ func (d *DB) migrate() error {
 		{"optimization_results", "grid_json", "ALTER TABLE optimization_results ADD COLUMN grid_json TEXT DEFAULT ''"},
 		// §GAP1.10 实盘账本多租户：持仓行归属账号（网关回报 user_id 写入；空串=遗留全局行，所有人可见）
 		{"real_positions", "user_id", "ALTER TABLE real_positions ADD COLUMN user_id TEXT DEFAULT ''"},
+		// §W2-10 委托/成交流水补租户列：回报写入时打归属账号；存量行空串=遗留全局，读侧兼容
+		{"orders", "user_id", "ALTER TABLE orders ADD COLUMN user_id TEXT DEFAULT ''"},
+		{"fills", "user_id", "ALTER TABLE fills ADD COLUMN user_id TEXT DEFAULT ''"},
 		// §GAP 二.3#5 回测断点缓存规则指纹：改参后旧缓存自动失效
 		{"backtest_event_results", "rule_fp", "ALTER TABLE backtest_event_results ADD COLUMN rule_fp TEXT DEFAULT ''"},
 		// §GAP4.5 寻优排名风险调整指标：夏普/最大回撤/年化/卡玛
@@ -1061,4 +1070,16 @@ func (d *DB) DebugCount() {
 		}
 		log.Printf("[store] %s: %d 行", t, n)
 	}
+}
+
+// Checkpoint §W4-c WAL 例行收口：TRUNCATE 模式把 -wal 文件清零并回主库。
+// 夜间链/批量装载结束后调用一次，防 -wal 长期膨胀挤占小盘 VPS 磁盘；
+// 失败仅记日志不中断调用方。English: truncates the WAL after heavy batch writes.
+func (d *DB) Checkpoint() error {
+	var ign, logN, ckpt int
+	if err := d.db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&ign, &logN, &ckpt); err != nil {
+		return err
+	}
+	log.Printf("[store] wal_checkpoint(TRUNCATE): frames=%d→%d", logN, ckpt)
+	return nil
 }

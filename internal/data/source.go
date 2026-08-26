@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +53,10 @@ type DataCoordinator struct {
 	ipoCache   []IPOEvent // 新股日历缓存
 	ipoCacheAt time.Time  // 新股日历缓存写入时间（5min TTL）
 	// English: ipoCache: IPO-calendar cache; ipoCacheAt: cache write time (5min TTL).
+
+	ipoRefreshing atomic.Bool // IPO 日历刷新进行中标志（防 TTL 到期瞬间多调用方并发重复刷新）
+	// English: ipoRefreshing: an IPO-calendar refresh is in flight (prevents concurrent
+	// English: duplicate refreshes when multiple callers hit the expired-TTL path at once).
 }
 
 // cachedSectorStocks 板块成分股缓存条目。
@@ -513,25 +518,66 @@ func truncateStr(s string, maxLen int) string {
 // English: RefreshIPOCalendar refreshes the IPO-calendar cache. THS (rich sectors) → EastMoney.
 // RefreshIPOCalendar refreshes the IPO-calendar cache (5min TTL),
 // populating from EastMoney then enriching each record's sector.
+//
+// §GAP-20260826 行情卡顿根修：旧实现全程持有 dc.mu（保护行情降级链/板块缓存的同一把全局锁）
+// 执行东财日历拉取 + enrichIPOSector 逐条串行 HTTP——一次慢刷新（数秒~数十秒）会阻塞所有
+// goroutine 的 GetQuote/GetKLine/GetSectors，fetcher 5s 节拍被卡死 → 前端股价冻结/刷新极慢。
+// 新实现三段式：①锁内仅做 TTL 快检；②网络取数与板块丰富全部在锁外；③锁内只做指针换装(O(1))。
+// 另加 atomic 防并发刷新风暴 + 失败 60s 负缓存（旧实现失败不推进 TTL，上游故障时每个请求都重打全量接口）。
+// English: Root fix for quote latency: the old version held dc.mu (the same global lock guarding the
+// English: quote fallback chain / sector caches) while doing the EastMoney calendar fetch plus a serial
+// English: per-IPO enrichment — one slow refresh stalled every GetQuote/GetKLine/GetSectors caller and
+// English: froze the fetcher's 5s cadence. Now: ① TTL fast-path under lock; ② all network IO outside the
+// English: lock; ③ O(1) pointer swap under lock. Plus an atomic in-flight guard against refresh storms and
+// English: a 60s negative cache on failure (the old code left ipoCacheAt untouched, so an upstream outage
+// English: re-hit the full API on every single request).
 func (dc *DataCoordinator) RefreshIPOCalendar() {
+	// ① 快路径：TTL 未到期直接返回（锁内只读两个时间字段，零网络）。
+	// English: ① Fast path: return immediately when the cache is still fresh (lock held only to read two fields, zero network).
 	dc.mu.Lock()
-	defer dc.mu.Unlock()
-
 	if !dc.ipoCacheAt.IsZero() && time.Since(dc.ipoCacheAt) < 5*time.Minute {
+		dc.mu.Unlock()
 		return
 	}
+	dc.mu.Unlock()
 
-	if dc.eastMoney != nil {
-		list, err := dc.eastMoney.GetEastMoneyIPOCalendar()
-		if err == nil && len(list) > 0 {
-			dc.enrichIPOSector(list)
-			dc.ipoCache = list
-			dc.ipoCacheAt = time.Now()
-			log.Printf("IPO日历: 东财加载 %d 条", len(list))
-			return
-		}
-		log.Printf("IPO日历 东财 失败: %v", err)
+	// 防并发：同一时刻只允许一个刷新在跑，其余调用方直接放弃（它们下轮自然拿到新缓存或再触发）。
+	// English: Single-flight guard: only one refresh runs at a time; concurrent callers bail out and
+	// English: will observe the refreshed cache on a subsequent call.
+	if !dc.ipoRefreshing.CompareAndSwap(false, true) {
+		return
 	}
+	defer dc.ipoRefreshing.Store(false)
+
+	// ② 网络取数 + 板块丰富：全部在 dc.mu 之外执行，绝不阻塞行情链路。
+	// English: ② Network fetch + sector enrichment run entirely outside dc.mu, never blocking the quote path.
+	var list []IPOEvent
+	if dc.eastMoney != nil {
+		l, err := dc.eastMoney.GetEastMoneyIPOCalendar()
+		if err == nil && len(l) > 0 {
+			list = l
+		} else if err != nil {
+			log.Printf("IPO日历 东财 失败: %v", err)
+		}
+	}
+	if len(list) == 0 {
+		// 失败负缓存：推进 TTL 60s，避免上游故障期间每个请求都重打全量日历接口。
+		// English: Negative cache on failure: advance the TTL by 60s so an upstream outage doesn't
+		// English: turn every request into a full calendar refetch.
+		dc.mu.Lock()
+		dc.ipoCacheAt = time.Now().Add(-5*time.Minute + 60*time.Second)
+		dc.mu.Unlock()
+		return
+	}
+	dc.enrichIPOSector(list)
+
+	// ③ 发布：锁内只做指针换装与 TTL 推进（O(1)，微秒级）。
+	// English: ③ Publish: pointer swap + TTL bump under the lock (O(1), microseconds).
+	dc.mu.Lock()
+	dc.ipoCache = list
+	dc.ipoCacheAt = time.Now()
+	dc.mu.Unlock()
+	log.Printf("IPO日历: 东财加载 %d 条", len(list))
 }
 
 // enrichIPOSector 为新股日历事件补充所属行业板块。

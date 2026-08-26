@@ -241,6 +241,8 @@ init_server() {
 		log_summary "  系统已初始化，尝试登录..."
 		# 尝试默认管理员
 		local login_resp
+		# §GAP2-W1：服务端已移除默认口令自动创建，admin/admin123 探测仅保留对存量旧部署的兼容，
+		# 新部署一律走 USERNAME/PASSWORD 环境变量提供的凭据。
 		for cred in '{"username":"admin","password":"admin123"}' "{\"username\":\"${USERNAME}\",\"password\":\"${PASSWORD}\"}"; do
 			login_resp=$(curl -s --max-time 5 -X POST "${BASE_URL}/auth/login" \
 				-H "Content-Type: application/json" -d "$cred" 2>/dev/null)

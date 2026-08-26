@@ -4,16 +4,25 @@
 // （与 engine/atomic_write.go 同款实现；独立成包避免 data↔engine 循环依赖。）
 package data
 
-import "os"
+import (
+	"os"
 
+	"quant-trading-v2/internal/fileutil"
+)
+
+// AtomicWrite §W3-c 统一原子写（导出）：同目录唯一临时文件 + 写后 fsync + rename 覆盖 + 目录 fsync。
+// 相比旧版（固定 .tmp 名、无 fsync）修复两点：
+//  1. 固定临时名在双进程（quant 与 researchd 共享 config.json）并发写时互相踩踏，
+//     rename 出交错内容——改为 CreateTemp 唯一名；
+//  2. 掉电/强杀场景 rename 后内容可能未落盘——写入后 fsync 文件，rename 后 fsync 目录。
+//
+// English: §W3-c unified atomic write: unique temp file in the same dir + fsync(file) before rename
+// + fsync(dir) after — fixes cross-process .tmp stomping and post-crash durability.
+func AtomicWrite(path string, raw []byte, perm os.FileMode) error {
+	return fileutil.AtomicWrite(path, raw, perm)
+}
+
+// atomicWrite 包内既有调用方兼容包装。
 func atomicWrite(path string, raw []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, perm); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return AtomicWrite(path, raw, perm)
 }

@@ -9,7 +9,9 @@
 //     （断点缓存有效，自动回队首续跑）；
 //   - 资源治理（需求#5）：所有研究子进程继承本服务的 cgroup 限流
 //     （quant-research.service：Nice=10 / CPUQuota=100% 单核 / MemoryHigh=700M /
-//     IOSchedulingClass=idle / GOMAXPROCS=1），数据层统一窗口分块装配，不吃满机器。
+//     IOSchedulingClass=idle / GOMAXPROCS=4 配合 CPUQuota=100% 单核），数据层统一窗口分块装配，不吃满机器。
+//     【2026-08-26 勘误】注释曾写 GOMAXPROCS=1，与 deploy/quant-research.service 的 Environment=GOMAXPROCS=4 不符，已对齐；
+//     实际语义=4 个 P 共享单核配额（parquet 解析并行需要），非单核单 P。
 //
 // research_state.json 仅作展示兼容（最近步骤结果、交易时段下载节流时间戳）；
 // 任务断点状态已由队列表接管，跨重启天然恢复。
@@ -255,7 +257,7 @@ func (s *Scheduler) saveState() {
 		log.Printf("[scheduler] 状态序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(s.statePath, raw, 0644); err != nil {
+	if err := data.AtomicWrite(s.statePath, raw, 0644); err != nil { // §W3-c 原子写收口
 		log.Printf("[scheduler] 状态写入失败: %v", err)
 	}
 }
@@ -344,8 +346,15 @@ func dirOfDB(cfg config.SchedulerConfig) string {
 // (quant owns those), allowed after close and on closed days. No hardcoded clock times.
 func NightlyEligible(now time.Time, cfg config.SchedulerConfig) bool {
 	_ = cfg // 会话化后不再消费钟点配置（kept for call-site stability）
-	// §统一口径（用户约定）：交易日交易窗口（9:15~收盘）禁止，其余全放行——
-	// 盘前凌晨/盘后/周末全天均可研究。直接复用 data.IsTradingWindow。
+	// §统一口径（用户约定）：交易日交易窗口（9:15~收盘）禁止，其余全放行。
+	// §W4-a 盘前门（GAP-20260826）：补拦 8:30~9:15 盘前段——该时段是 quant 新闻归因
+	// LLM 流水线"跑完即排"的冲刺期，恰是资源最紧张时刻；此前文档声称 8:30 自动终止
+	// 遗留作业但实现只拦 9:15 起的窗口，形成竞争敞口。现以 CurrentSession 精确覆盖。
+	// English: §W4-a premarket gate — also block the 8:30–9:15 premarket session, closing the
+	// documented-but-unimplemented window that competed with quant's morning sprint.
+	if data.CurrentSession(now) == data.SessionPreMarket {
+		return false
+	}
 	return !data.IsTradingWindow(now)
 }
 

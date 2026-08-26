@@ -132,3 +132,39 @@ func TestNormalizeTsCode(t *testing.T) {
 		}
 	}
 }
+
+// TestQMTReportAuthzGatewayTokenOnly §GAP2-W1 回归（P0 收权）：POST /api/qmt/report 只认网关 token。
+// 旧实现优先接受任意合法用户 token——叠加 /auth/temp 匿名领号，公网任何人都能伪造成交回报或
+// 用空数组 positions 清空 real_positions 全表（资损级数据面）。现断言：
+// ①合法用户 token → 401；②空 token → 401；③配置的网关 token → 通过中间件进入业务层
+// （本测试环境无 real book，业务层返回 500 "real book not available"，恰好证明已穿过鉴权）。
+func TestQMTReportAuthzGatewayTokenOnly(t *testing.T) {
+	s, admin := newAdminTestServer(t)
+	s.cfg.Rules.QMT.Token = "gw-secret-123" // 全局 QMT 网关 token（GetRulesFor 对无覆盖账号回落全局）
+	handler := s.qmtReportMiddleware(s.handleQMTReport)
+
+	mk := func(token string) int {
+		body := `{"type":"trade","order_id":"OA","code":"600519.SH","side":"买入","price":10,"qty":100,` +
+			`"amount":1000,"traded_at":"2026-08-26T10:00:00+08:00","signal_id":"SA"}`
+		rr := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body))
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		handler(rr, r)
+		return rr.Code
+	}
+
+	// ① 合法用户 token 也必须被拒（旧实现此处放行 = 漏洞本体）
+	if code := mk(admin.Token); code != http.StatusUnauthorized {
+		t.Fatalf("用户 token 访问网关回报端点应 401, got %d", code)
+	}
+	// ② 空 token → 401
+	if code := mk(""); code != http.StatusUnauthorized {
+		t.Fatalf("缺失 token 应 401, got %d", code)
+	}
+	// ③ 网关 token 放行：到达业务层（测试库未注入 real book → 500 属预期的"已过鉴权"信号）
+	if code := mk("gw-secret-123"); code == http.StatusUnauthorized || code == http.StatusForbidden {
+		t.Fatalf("网关 token 应通过鉴权, got %d", code)
+	}
+}

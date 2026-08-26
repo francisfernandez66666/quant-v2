@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"sync"
+
+	"quant-trading-v2/internal/fileutil"
 )
 
 // LaodengConfig Laodeng 评分系统配置。
@@ -924,7 +926,9 @@ func (m *Manager) Save() {
 		log.Printf("[config] 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(m.path, data, 0644); err != nil {
+	// §W3-c 统一原子写（fsync+唯一临时名）：config.json 由 quant 与 researchd 双进程写，
+	// 固定 .tmp 名会互相踩踏；截断则全部账号配置回退默认。
+	if err := fileutil.AtomicWrite(m.path, data, 0644); err != nil {
 		log.Printf("[config] 写入失败: %v", err)
 		return
 	}

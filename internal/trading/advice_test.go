@@ -113,7 +113,8 @@ func TestControllerTripAndIdempotent(t *testing.T) {
 		calls++
 		switch r.URL.Path {
 		case "/health":
-			w.Write([]byte(`{"ok":true,"ts":"now"}`))
+			// §GAP2-W1 契约对齐：Health() 现要求 ok && broker_connected（与真实网关一致）。
+			w.Write([]byte(`{"ok":true,"broker_connected":true,"ts":"now"}`))
 		case "/order":
 			w.Write([]byte(`{"ok":true,"order_id":"GW1"}`))
 		case "/state":

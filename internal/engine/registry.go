@@ -282,6 +282,14 @@ func (r *Registry) registerUser(e *Engine, userID string) {
 	if !seen {
 		r.coreUsers[e] = append(r.coreUsers[e], userID)
 	}
+	// §GAP2-W2 成员接线（I-2 根修）：把服务账号全集注入引擎——
+	// ①私有消息/SSE 扇出按成员路由；②单成员引擎同步固化 userID，恢复账号级配置热同步
+	// （此前 Engine.SetUserID 从未被调用，syncAccountConfig 对所有引擎恒跳过）；
+	// ③注入 accountsRoot，私有文件（咨询历史）按账号目录寻址。
+	e.SetMembers(r.coreUsers[e])
+	if r.opts.DataDir != "" {
+		e.SetAccountsRoot(filepath.Join(r.opts.DataDir, "accounts"))
+	}
 }
 
 // dispatchPaperSignals 把本轮翻转信号分发给共享引擎服务的账号中"参与自动撮合"的模拟盘

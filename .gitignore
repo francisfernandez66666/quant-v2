@@ -63,3 +63,6 @@ mobile/app/src/main/assets/
 
 # go build ./cmd/research 产物（与包目录同名的本地构建二进制）
 /research
+
+# §GAP2-W1 签名口令文件（随机生成，仅本机）
+mobile/keystore.pass

@@ -1,8 +1,11 @@
-// C1 D1 软加成与负面硬 veto 测试。
-// English: C1 D1 soft boost and negative hard-veto tests.
+// §W5-v3 LLM 解耦测试：非 N 战法的 D1 只做参考标注（不改级别/不拦截信号），
+// 负面过滤降级为 Reason 提示；N 形自身硬闸不受影响（见 n_shape 包测试）。
+// English: §W5-v3 LLM decoupling tests — D1 is annotation-only for non-N strategies (no level rewrite,
+// no veto); the negative filter degrades to a Reason caution. N-shape's own hard gate is unaffected.
 package combat_agent
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -34,49 +37,43 @@ func d1BoostDragonMD() *strategy_engine.StockMarketData {
 	}
 }
 
-// TestD1BoostNearMissCrossesBuyGate 软加成单元：龙头 63 分 + D1=30（0~40 制）
-// → 63×1.1125≈70.1 ≥60 → 提升为 full_chain/Pass，跨过买入门槛，且加成量被记录。
-// English: TestD1BoostNearMissCrossesBuyGate soft-boost unit: dragon 63 + D1=30 (0~40 scale) → 63×1.1125≈70.1 >=60 → raised to full_chain/Pass, crossing the buy gate, and the boost amount is recorded.
-func TestD1BoostNearMissCrossesBuyGate(t *testing.T) {
+// TestD1BoostAnnotationOnly §W5-v3：龙头 63 分 + D1=30 —— 级别完全由原始分决定（保持 brief/false），
+// 仅写入参考分 d1_ref 与理论加成对照值 d1_ref_boost。
+// English: §W5-v3 — level stays untouched; only reference annotations are recorded.
+func TestD1BoostAnnotationOnly(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 63, Pass: false, Level: "brief", Confidence: 0.6, Details: map[string]float64{}}
 	a.applyD1Boost(strategy.SignalDragon, eval, &D1Score{Score: 30, Blocked: false})
-	if !eval.Pass || eval.Level != "full_chain" {
-		t.Fatalf("63分+D1=30 应提升为 full_chain/pass, got level=%s pass=%v total=%.2f", eval.Level, eval.Pass, eval.TotalScore)
+	if eval.Pass || eval.Level != "brief" || eval.TotalScore != 63 {
+		t.Fatalf("§W5-v3 级别不得被 D1 改写, got level=%s pass=%v total=%.2f", eval.Level, eval.Pass, eval.TotalScore)
 	}
-	if eval.Details["d1_raw"] != 63 {
-		t.Fatalf("应记录原始总分 d1_raw=63, got %v", eval.Details["d1_raw"])
-	}
-	if eval.Details["d1_boost"] <= 0 {
-		t.Fatalf("应记录加成量 d1_boost>0, got %v", eval.Details["d1_boost"])
+	if eval.Details["d1_ref"] != 30 {
+		t.Fatalf("应记录参考分 d1_ref=30, got %v", eval.Details["d1_ref"])
 	}
 }
 
-// TestD1BoostDragonReturnFirst 龙回头 56 分 + D1=20 → 56×1.075≈60.2 ≥60 → 提升为 first/Pass。
-// English: TestD1BoostDragonReturnFirst dragon-return 56 + D1=20 → 56×1.075≈60.2 >=60 → raised to first/Pass.
-func TestD1BoostDragonReturnFirst(t *testing.T) {
+// TestD1BoostNoLevelRewriteAnyTier §W5-v3：任意战法层级都不因 D1 改写（龙回头样例）。
+// English: §W5-v3 no tier rewrite for any strategy (dragon-return sample).
+func TestD1BoostNoLevelRewriteAnyTier(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 56, Pass: false, Level: "none", Confidence: 0.5, Details: map[string]float64{}}
 	a.applyD1Boost(strategy.SignalDragonReturn, eval, &D1Score{Score: 20, Blocked: false})
-	if !eval.Pass || eval.Level != "first" {
-		t.Fatalf("56分+D1=20 应提升为 first/pass, got level=%s pass=%v total=%.2f", eval.Level, eval.Pass, eval.TotalScore)
+	if eval.Pass || eval.Level != "none" || eval.TotalScore != 56 {
+		t.Fatalf("§W5-v3 龙回头级别不应被改写, got level=%s pass=%v total=%.2f", eval.Level, eval.Pass, eval.TotalScore)
 	}
 }
 
-// TestD1BoostCapAt100 加成封顶 100：90 分 + D1=40 → 90×1.15=103.5 → 截断到 100 且仍为买入档。
-// English: TestD1BoostCapAt100 boost caps at 100: 90 + D1=40 → 90×1.15=103.5 → truncated to 100 and still the buy tier.
-func TestD1BoostCapAt100(t *testing.T) {
+// TestD1BoostNeverMutatesScoreEvenHighD1 §W5-v3：高分+满分 D1 也不改总分（旧封顶语义废除）。
+// English: §W5-v3 the score is never mutated even with a maxed D1 (legacy cap semantics removed).
+func TestD1BoostNeverMutatesScoreEvenHighD1(t *testing.T) {
 	a := New(config.NewManager("").GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	eval := &strategy.Evaluation{TotalScore: 90, Pass: true, Level: "full_chain", Confidence: 0.9, Details: map[string]float64{}}
 	a.applyD1Boost(strategy.SignalDoubleBump, eval, &D1Score{Score: 40, Blocked: false})
-	if eval.TotalScore != 100 {
-		t.Fatalf("加成应封顶 100, got %.2f", eval.TotalScore)
-	}
-	if eval.Level != "full_chain" || !eval.Pass {
-		t.Fatalf("封顶后应保持 full_chain/pass, got %s/%v", eval.Level, eval.Pass)
+	if eval.TotalScore != 90 || !eval.Pass || eval.Level != "full_chain" {
+		t.Fatalf("总分应保持 90 不变, got %.2f/%v/%s", eval.TotalScore, eval.Pass, eval.Level)
 	}
 }
 
@@ -159,10 +156,11 @@ func (f *fakeAlwaysPass) GenerateSignal(code string, _ *strategy.Evaluation) (*s
 	return &strategy.Signal{Action: "buy", Name: code, Confidence: 0.8}, nil
 }
 
-// TestD1BlockedVetoesAllSignals 负面硬 veto：D1.Blocked=true 时该股任何战法都不产信号；
-// 对照组（未 blocked）正常产出。
-// English: TestD1BlockedVetoesAllSignals negative hard veto: when D1.Blocked=true no strategy produces signals for that stock; the control group (not blocked) produces them normally.
-func TestD1BlockedVetoesAllSignals(t *testing.T) {
+// TestD1BlockedAnnotatesButNotVetoes §W5-v3：Blocked 个股的信号照常产出，
+// Reason 带 "⚠️LLM利空提示" 后缀；对照组（未 blocked）无该后缀。
+// English: §W5-v3 blocked stocks still emit signals annotated with an LLM-caution suffix;
+// the control group has none.
+func TestD1BlockedAnnotatesButNotVetoes(t *testing.T) {
 	cfg := config.NewManager("")
 	a := New(cfg.GetStrategyConfig())
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
@@ -172,14 +170,17 @@ func TestD1BlockedVetoesAllSignals(t *testing.T) {
 
 	_, sigs := a.ScorePool([]string{"300000"}, pool,
 		map[string]D1Score{"300000": {Code: "300000", Score: 30, Blocked: true, Reason: "立案调查"}}, "")
-	for _, s := range sigs {
-		if s.Code == "300000" {
-			t.Fatalf("D1 负面 blocked 应拦截所有战法信号, got %+v", s)
+	found := 0
+	for _, sg := range sigs {
+		if sg.Code == "300000" && strings.Contains(sg.Reason, "LLM利空提示") {
+			found++
 		}
 	}
+	if found == 0 {
+		t.Fatalf("blocked 个股应产出带利空提示后缀的信号, got %+v", sigs)
+	}
 
-	// 对照组：未 blocked 时正常产出 dragon buy
-	// English: Control group: when not blocked, a dragon buy is produced normally.
+	// 对照组：未 blocked 无后缀且正常产出 dragon buy
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: &fakeAlwaysPass{}}})
@@ -187,6 +188,11 @@ func TestD1BlockedVetoesAllSignals(t *testing.T) {
 		map[string]D1Score{"300000": {Code: "300000", Score: 30, Blocked: false}}, "")
 	if !hasDragonAction(sigs2, "300000", "buy") {
 		t.Fatalf("对照组应正常产出 dragon buy, got %+v", sigs2)
+	}
+	for _, sg := range sigs2 {
+		if strings.Contains(sg.Reason, "LLM利空提示") {
+			t.Fatalf("未 blocked 不应有利空提示后缀: %+v", sg)
+		}
 	}
 }
 

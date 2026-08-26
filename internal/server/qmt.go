@@ -9,6 +9,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -21,21 +22,22 @@ import (
 )
 
 // qmtReportMiddleware 认证网关回报（POST /api/qmt/report）：
-// 优先接受合法用户 token；否则接受 QMT 网关 Bearer token（qmt.token，配置在账号 QMT 配置里），
+// §GAP2-W1 收权修复（P0）：只接受 QMT 网关 Bearer token（qmt.token，配置在账号 QMT 配置里），
 // 并解析为持有该 token 的账号（供 SSE 定向推送 / 熔断控制器使用）。
-// English: authenticates gateway reports (POST /api/qmt/report). Accepts a valid user token first;
-// otherwise accepts the QMT gateway Bearer token (qmt.token, stored in an account's QMT config) and
-// resolves it to the owning account (for SSE routing / breaker controller).
+// 旧实现"优先接受任意合法用户 token"——而 /auth/temp 匿名即可领取 14 天有效 token，
+// 等于公网任何人都能伪造 trade/positions 回报：空数组 positions 直接清空 real_positions 全表、
+// 伪造成交可改写他人账本（资损级数据面）。现一律 401，仅网关 token 放行。
+// English: §GAP2-W1 (P0) authz fix for POST /api/qmt/report: ONLY the QMT gateway Bearer token
+// (qmt.token in an account's QMT config) is accepted, resolved to the owning account. The old
+// "accept any valid user token first" behavior — combined with the anonymous /auth/temp endpoint —
+// let anyone on the internet forge fills or wipe the whole real_positions table with an empty
+// positions array. Everything else gets 401.
 func (s *Server) qmtReportMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		token = strings.TrimSpace(token)
 		if token == "" {
 			writeError(w, 401, "missing authorization token")
-			return
-		}
-		if u := s.auth.ValidateToken(token); u != nil {
-			next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, u)))
 			return
 		}
 		if uid := s.userForQMTToken(token); uid != "" {
@@ -48,13 +50,21 @@ func (s *Server) qmtReportMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // userForQMTToken 返回持有给定 QMT 网关 token 的账号 ID（遍历账号的 QMT 配置）；无匹配返回空串。
+// §GAP2-W1 比对方式改为 subtle.ConstantTimeCompare（常量时间），与 auth.go 的 token 校验同口径，
+// 消除字节级时序侧信道；同时跳过未配置 token 的账号（空串配置不应匹配空请求头之外的任何值）。
 // English: returns the account ID whose QMT config carries the given gateway token; "" when none.
+// §GAP2-W1: comparison switched to subtle.ConstantTimeCompare (constant-time, same as auth.go),
+// removing the byte-level timing side channel; accounts without a configured token are skipped.
 func (s *Server) userForQMTToken(token string) string {
 	if s.cfg == nil || token == "" {
 		return ""
 	}
 	for _, u := range s.auth.ListUsers() {
-		if s.cfg.GetRulesFor(u.ID).QMT.Token == token {
+		cfgToken := s.cfg.GetRulesFor(u.ID).QMT.Token
+		if cfgToken == "" {
+			continue // 未配置网关 token 的账号不参与比对（避免空值误配）
+		}
+		if subtle.ConstantTimeCompare([]byte(cfgToken), []byte(token)) == 1 {
 			return u.ID
 		}
 	}
@@ -309,6 +319,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 				OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
 				Side: ev.Side, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
 				CreatedAt: ev.At,
+				UserID:    uid, // §W2-10 委托行打归属账号
 			}); err != nil {
 				log.Printf("[trading] upsert order: %v", err)
 			}
@@ -318,6 +329,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		if err := db.ApplyRealFill(store.RealFill{
 			OrderID: ev.OrderID, Code: ev.Code, Side: ev.Side, Price: ev.Price,
 			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: ev.SignalID,
+			UserID: uid, // §W2-10 成交流水打归属账号（幂等键冲突时整体回滚，持仓不重复累加）
 		}); err != nil {
 			writeError(w, 500, "apply fill: "+err.Error())
 			return

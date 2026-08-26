@@ -11,15 +11,19 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	dataio "quant-trading-v2/internal/data"
 )
 
 // User 用户账号记录。
@@ -95,6 +99,9 @@ type ConfigEntry struct {
 type DB struct {
 	Users   []User        `json:"users"`   // 全部用户列表
 	Configs []ConfigEntry `json:"configs"` // 用户/系统级配置项列表
+	// §GAP2-W2 邀请码注册（owner 决策 D7）：公网开放注册/临时号是隔离违例的放大器，
+	// 改为管理员签发、一次性使用的邀请码制。English: §GAP2-W2 invite-code registration (decision D7).
+	Invites map[string]*Invite `json:"invites,omitempty"`
 	// SchemaVersion §A1 库结构版本：兼容迁移只跑一次。此前迁移每次启动无条件把
 	// Enabled=false 改回 true——管理员禁用的账号重启即复活，封禁形同虚设。
 	SchemaVersion int `json:"schema_version,omitempty"`
@@ -231,12 +238,13 @@ func (m *Manager) Init() error {
 // save 将内存数据库序列化为 JSON 并写入 auth.json。
 // （save serializes the in-memory DB to JSON and writes it to auth.json.）
 func (m *Manager) save() error {
-	data, err := json.MarshalIndent(m.db, "", "  ")
+	dataBytes, err := json.MarshalIndent(m.db, "", "  ")
 	if err != nil {
 		return err
 	}
 	// §A3 0600：auth.json 含令牌与密码哈希，同机其他用户不可读
-	return os.WriteFile(m.dbPath, data, 0o600)
+	// §W3-c 统一原子写（fsync+唯一临时名）：auth.json 截断=全员无法登录，必须最坚固
+	return dataio.AtomicWrite(m.dbPath, dataBytes, 0o600)
 }
 
 // tokenTTL §A3 访问令牌有效期：注册/创建默认 30 天，登录成功滑动续期。
@@ -261,9 +269,85 @@ func generateToken() (string, error) {
 // 用户名重复时报错；密码以 bcrypt 哈希存储，同时生成访问令牌。
 // （Register creates a new user and returns the generated record. Duplicate usernames error out;
 // the password is stored as a bcrypt hash and an access token is generated.）
-func (m *Manager) Register(username, password string) (*User, error) {
+// ErrInvalidInvite 邀请码无效/已用的哨兵错误：HTTP 层据此返回 403（与 temp 端点口径一致），
+// 其余注册错误（如用户名冲突）仍走 409。
+// English: sentinel for invite failures so the HTTP layer can map them to 403.
+var ErrInvalidInvite = errors.New("邀请码无效或已被使用")
+
+// Invite 邀请码：管理员签发、一次性使用；记录使用者便于审计。
+// English: an invite code issued by admin, single-use, with usage audit fields.
+type Invite struct {
+	Code      string `json:"code"`              // 邀请码（QT+16hex）
+	CreatedAt int64  `json:"created_at"`        // 签发时间
+	UsedBy    string `json:"used_by,omitempty"` // 使用者账号 ID（空=未用）
+	UsedAt    int64  `json:"used_at,omitempty"` // 使用时间
+}
+
+// CreateInvite 签发一个新邀请码（仅 admin 路径调用）。
+// English: issues a fresh single-use invite code.
+func (m *Manager) CreateInvite() (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	code := "QT" + hex.EncodeToString(buf)
+	if m.db.Invites == nil {
+		m.db.Invites = make(map[string]*Invite)
+	}
+	m.db.Invites[code] = &Invite{Code: code, CreatedAt: time.Now().Unix()}
+	if err := m.save(); err != nil {
+		return "", err
+	}
+	return code, nil
+}
+
+// ListInvites 返回全部邀请码（含已用的，供管理页审计）。
+func (m *Manager) ListInvites() []*Invite {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Invite, 0, len(m.db.Invites))
+	for _, v := range m.db.Invites {
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+// consumeInviteLocked 校验并消费邀请码（须持写锁）：不存在/已用即拒绝。
+// English: validates and consumes an invite code; caller must hold the write lock.
+func (m *Manager) consumeInviteLocked(code string) error {
+	if code == "" {
+		return fmt.Errorf("%w: 邀请码必填", ErrInvalidInvite)
+	}
+	inv, ok := m.db.Invites[code]
+	if !ok {
+		return fmt.Errorf("%w: 无效", ErrInvalidInvite)
+	}
+	if inv.UsedBy != "" {
+		return fmt.Errorf("%w: 已被使用", ErrInvalidInvite)
+	}
+	return nil
+}
+
+// markInviteUsedLocked 标记邀请码已被 userID 使用（须持写锁）。
+func (m *Manager) markInviteUsedLocked(code, userID string) {
+	if inv, ok := m.db.Invites[code]; ok {
+		inv.UsedBy = userID
+		inv.UsedAt = time.Now().Unix()
+	}
+}
+
+// Register 注册永久账号。§GAP2-W2：必须携带有效且未使用的邀请码（一次性消费）。
+func (m *Manager) Register(username, password, inviteCode string) (*User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// §GAP2-W2 先验邀请码（失败不落任何状态）
+	if err := m.consumeInviteLocked(inviteCode); err != nil {
+		return nil, err
+	}
 
 	// 用户名唯一性校验
 	for _, u := range m.db.Users {
@@ -294,7 +378,8 @@ func (m *Manager) Register(username, password string) (*User, error) {
 		CreatedAt:    time.Now().Unix(),
 	}
 	m.db.Users = append(m.db.Users, user)
-	m.rawTokens[user.ID] = token // 原始令牌仅内存，供本次响应返回
+	m.rawTokens[user.ID] = token                // 原始令牌仅内存，供本次响应返回
+	m.markInviteUsedLocked(inviteCode, user.ID) // §GAP2-W2 邀请码一次性消费
 	if err := m.save(); err != nil {
 		return nil, err
 	}
@@ -306,9 +391,15 @@ func (m *Manager) Register(username, password string) (*User, error) {
 // 临时账户无密码（不可登录），仅持有令牌，到期后令牌校验自动失效。
 // （CreateTemp creates a temporary account valid for duration. Temp accounts have no password
 // (cannot log in) and only hold a token, which auto-expires for validation once lapsed.）
-func (m *Manager) CreateTemp(duration time.Duration) (*User, error) {
+// CreateTemp 创建临时演示账号。§GAP2-W2：同样必须携带有效邀请码——
+// 匿名领 14 天 token 是公网隔离违例的头号放大器（W1 已封 qmt report 滥用面，此处关闸门）。
+func (m *Manager) CreateTemp(duration time.Duration, inviteCode string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if err := m.consumeInviteLocked(inviteCode); err != nil {
+		return nil, err
+	}
 
 	token, err := generateToken()
 	if err != nil {
@@ -325,6 +416,7 @@ func (m *Manager) CreateTemp(duration time.Duration) (*User, error) {
 		CreatedAt: time.Now().Unix(),
 	}
 	m.db.Users = append(m.db.Users, user)
+	m.markInviteUsedLocked(inviteCode, user.ID) // §GAP2-W2
 	m.rawTokens[user.ID] = token
 	if err := m.save(); err != nil {
 		return nil, err
@@ -694,7 +786,7 @@ func (m *Manager) CreateUser(username, password, role string, perms []string, ex
 		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
 		Username:     username,
 		PasswordHash: string(hash),
-		Token:        token,
+		Token:        hashToken(token), // §GAP6.2 落盘哈希（§GAP2-W1 补齐：CreateUser 此前是唯一漏掉哈希的签发路径）
 		TokenExp:     newTokenExpiry(), // §A3 默认 30 天
 		Role:         role,
 		Perms:        perms,
@@ -705,10 +797,15 @@ func (m *Manager) CreateUser(username, password, role string, perms []string, ex
 		user.ExpiresAt = time.Now().AddDate(0, 0, expiresDays).Unix()
 	}
 	m.db.Users = append(m.db.Users, user)
+	m.rawTokens[user.ID] = token // §GAP2-W1 原始令牌仅内存（对齐 Register/Login 的哈希化口径）
 	if err := m.save(); err != nil {
 		return nil, err
 	}
-	return &user, nil
+	// §GAP2-W1 返回携带原始令牌的副本：auth.json 只存哈希，调用方（如管理员开户）仍能拿到
+	// 原始令牌一次性交付用户；此后 ValidateToken 只认原始值的 SHA-256。
+	out := user
+	out.Token = token
+	return &out, nil
 }
 
 // DeleteUser 删除指定用户（管理员账号不可删除）。
