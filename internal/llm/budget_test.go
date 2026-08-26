@@ -2,8 +2,11 @@
 package llm
 
 import (
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBudgetCircuitBreaker(t *testing.T) {
@@ -54,5 +57,64 @@ func TestRecordUsageEstimate(t *testing.T) {
 	// 粗估口径：30 字符 ≈ 10 token
 	if got := estimateTokens(strings.Repeat("a", 30)); got != 10 {
 		t.Fatalf("estimateTokens(30 字符) 应为 10, got %d", got)
+	}
+}
+
+// TestPickKeySkipsCooling §S6 回归：冷却中的 key 被跳过；全部冷却时降级仍返回可用 key。
+func TestPickKeySkipsCooling(t *testing.T) {
+	c := New(Config{APIKeys: []string{"K0", "K1", "K2"}})
+	c.keyCoolUntil = make([]atomic.Int64, 3)
+	c.keyCoolUntil[1].Store(time.Now().Add(time.Minute).Unix()) // K1 冷却中
+	c.keyCoolUntil[2].Store(time.Now().Add(time.Minute).Unix()) // K2 冷却中
+	got := map[string]bool{}
+	for i := 0; i < 10; i++ {
+		got[c.pickKey()] = true
+	}
+	if got["K1"] || got["K2"] {
+		t.Fatalf("冷却中的 key 不应被选中: %v", got)
+	}
+	if !got["K0"] {
+		t.Fatal("健康 key K0 应被选中")
+	}
+	// 全部冷却 → 降级仍返回某 key
+	c.keyCoolUntil[0].Store(time.Now().Add(time.Minute).Unix())
+	if c.pickKey() == "" {
+		t.Fatal("全部冷却时应降级返回轮询 key")
+	}
+}
+
+// TestMarkKeyStatus §S6 回归：401 长冷却、429 按 Retry-After。
+func TestMarkKeyStatus(t *testing.T) {
+	c := New(Config{APIKeys: []string{"A", "B"}})
+	c.keyCoolUntil = make([]atomic.Int64, 2)
+	now := time.Now().Unix()
+	c.markKeyStatus("B", 429, 30*time.Second)
+	if c.keyCoolUntil[1].Load() <= now {
+		t.Fatal("429 应给 B 记冷却")
+	}
+	c.markKeyStatus("B", 401, 0)
+	if c.keyCoolUntil[1].Load() <= now+int64(20*time.Second/time.Second) {
+		t.Fatalf("401 应记长冷却(%s), until=%d", keyCoolAuthFail, c.keyCoolUntil[1].Load())
+	}
+	// 200 不标记
+	before := c.keyCoolUntil[0].Load()
+	c.markKeyStatus("A", 200, 0)
+	if c.keyCoolUntil[0].Load() != before {
+		t.Fatal("成功响应不应触发冷却")
+	}
+}
+
+// TestParseRetryAfter Retry-After 头解析（秒数与 HTTP 日期两种形态）。
+func TestParseRetryAfter(t *testing.T) {
+	if d := parseRetryAfter("30"); d != 30*time.Second {
+		t.Fatalf("秒数形态解析错误: %v", d)
+	}
+	future := time.Now().Add(45 * time.Second).UTC().Format(http.TimeFormat)
+	d := parseRetryAfter(future)
+	if d <= 20*time.Second || d > 60*time.Second {
+		t.Fatalf("HTTP 日期形态解析异常: %v", d)
+	}
+	if parseRetryAfter("") != 0 || parseRetryAfter("junk") != 0 {
+		t.Fatal("缺失/非法应返回 0")
 	}
 }

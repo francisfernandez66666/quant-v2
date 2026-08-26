@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -34,11 +35,12 @@ type Client struct {
 	classifierModel  string        // 可选分类专用模型（Stage0/1 等快速分类/初筛，空则用主模型）
 
 	// §GAP5.1 成本治理：当日调用/token 计数与预算熔断。计数原子维护，跨日自动归零。
-	usageDay    atomic.Int64 // 当日戳 yyyymmdd（变更即重置计数）
-	usageCalls  atomic.Int64 // 当日已发请求数
-	usageTokens atomic.Int64 // 当日 prompt+completion token 总量
-	callBudget  atomic.Int64 // 日调用预算（0=不设限）
-	tokenBudget atomic.Int64 // 日 token 预算（0=不设限）
+	usageDay     atomic.Int64 // 当日戳 yyyymmdd（变更即重置计数）
+	usageCalls   atomic.Int64 // 当日已发请求数
+	usageTokens  atomic.Int64 // 当日 prompt+completion token 总量
+	callBudget   atomic.Int64 // 日调用预算（0=不设限）
+	tokenBudget  atomic.Int64 // 日 token 预算（0=不设限）
+	keyCoolUntil []atomic.Int64
 }
 
 // DefaultBatchConcurrency 未显式配置时的批量分析默认并发批次。
@@ -155,7 +157,78 @@ func New(cfg Config) *Client {
 	c.usageDay.Store(llmToday())
 	c.callBudget.Store(cfg.DailyCallBudget)
 	c.tokenBudget.Store(cfg.DailyTokenBudget)
+	// §S6 多 key 健康度：每 key 独立冷却槽
+	c.keyCoolUntil = make([]atomic.Int64, len(keys))
 	return c
+}
+
+// key 冷却时长（§S6）：401/403=鉴权失效长冷却；429=限流按 Retry-After（缺省 60s）；5xx=短冷却。
+const (
+	keyCoolAuthFail = 30 * time.Minute
+	keyCoolRateLim  = 60 * time.Second
+	keyCoolServer   = 10 * time.Second
+)
+
+// pickKey §S6 健康感知选 key：轮询起点随机化后跳过冷却中的 key；
+// 全部冷却时仍返回轮询 key（降级可用优先于拒绝请求）。
+func (c *Client) pickKey() string {
+	if len(c.apiKeys) <= 1 {
+		return c.apiKey
+	}
+	now := time.Now().Unix()
+	start := atomic.AddUint64(&c.keyIdx, 1)
+	for i := uint64(0); i < uint64(len(c.apiKeys)); i++ {
+		idx := (start + i) % uint64(len(c.apiKeys))
+		if c.keyCoolUntil[idx].Load() <= now {
+			return c.apiKeys[idx]
+		}
+	}
+	return c.apiKeys[start%uint64(len(c.apiKeys))]
+}
+
+// markKeyStatus §S6 按响应状态给 key 记冷却：401/403 长冷却、429 读 Retry-After、5xx 短冷却。
+func (c *Client) markKeyStatus(key string, status int, retryAfter time.Duration) {
+	if len(c.apiKeys) <= 1 {
+		return // 单 key 无可回避，标记无意义
+	}
+	var cool time.Duration
+	switch {
+	case status == 401 || status == 403:
+		cool = keyCoolAuthFail
+	case status == 429:
+		cool = keyCoolRateLim
+		if retryAfter > 0 {
+			cool = retryAfter
+		}
+	case status >= 500:
+		cool = keyCoolServer
+	default:
+		return
+	}
+	for i, k := range c.apiKeys {
+		if k == key {
+			until := time.Now().Add(cool).Unix()
+			c.keyCoolUntil[i].Store(until)
+			log.Printf("[llm] key#%d 进入冷却 %s（HTTP %d）", i, cool, status)
+			return
+		}
+	}
+}
+
+// parseRetryAfter 解析 Retry-After 头（秒数或 HTTP 日期），非法/缺失返回 0。
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // SetBudgets §GAP5.1 配置当日预算（热更新；0=不设限）。
@@ -218,17 +291,6 @@ func (c *Client) UsageStats() map[string]int64 {
 		"call_budget":  c.callBudget.Load(),
 		"token_budget": c.tokenBudget.Load(),
 	}
-}
-
-// authKey 返回当前请求使用的 API 密钥：多 key 时原子轮询分发（并发请求均匀落到不同
-// key，突破单 key 限流）；单 key 时始终返回唯一 key（零额外开销）。
-// （authKey returns the API key for the current request: round-robins across apiKeys with an
-// atomic counter so concurrent requests spread over different keys; single-key falls through.）
-func (c *Client) authKey() string {
-	if len(c.apiKeys) <= 1 {
-		return c.apiKey
-	}
-	return c.apiKeys[atomic.AddUint64(&c.keyIdx, 1)%uint64(len(c.apiKeys))]
 }
 
 // Message 对话消息，包含角色和内容。
@@ -359,10 +421,9 @@ type chatCompletionRequest struct {
 
 // streamChat 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
 // 只累加 delta.content（忽略 reasoning_content 思维链），遇 [DONE] 结束；
-// 相邻分片空闲超过 idleTimeout 判定为卡死返回错误。
-// （streamChat reads the full SSE streaming response and returns the accumulated content. Only
-// delta.content is accumulated (reasoning_content is ignored); [DONE] ends the stream; idle gaps beyond
-// idleTimeout are treated as a stall and return an error.）
+// §S5 根修：扫描在独立 goroutine 进行，外层 select 持空闲 ticker——
+// 此前空闲检查只在读到新行时执行，服务端真卡死时 Scan() 永久阻塞、idleTimeout 永不触发
+// （仅剩 http.Client 总超时兜底）；现在无论是否阻塞，空闲阈值到点即关连接返回错误。
 func (c *Client) streamChat(req ChatRequest) (string, error) {
 	body, err := c.post(req, true, 0)
 	if err != nil {
@@ -370,54 +431,72 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 	}
 	defer body.Close()
 
-	sc := bufio.NewScanner(body)
-	sc.Buffer(make([]byte, 1024*1024), 4*1024*1024) // 首分片可能携带完整 usage 元数据，行可能很大
-	sc.Split(bufio.ScanLines)
+	type streamOut struct {
+		content string
+		usage   *llmUsage
+		err     error
+	}
+	out := make(chan streamOut, 1)
 
-	var sb strings.Builder
-	var lastTime = time.Now()
-	var lastUsage *llmUsage // §GAP5.1 记录流中最后一次出现的用量元数据
-	for sc.Scan() {
-		now := time.Now()
-		if now.Sub(lastTime) > c.idleTimeout {
-			return "", fmt.Errorf("流式响应空闲超时(%s): 模型疑似卡死", c.idleTimeout)
-		}
-		lastTime = now
+	go func() {
+		sc := bufio.NewScanner(body)
+		sc.Buffer(make([]byte, 1024*1024), 4*1024*1024) // 首分片可能携带完整 usage 元数据，行可能很大
+		sc.Split(bufio.ScanLines)
 
-		line := strings.TrimSpace(sc.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
+		var sb strings.Builder
+		var lastUsage *llmUsage
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				break
+			}
+			var chunk chatCompletionChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
+			}
+			if chunk.Usage != nil {
+				lastUsage = chunk.Usage
+			}
+			if len(chunk.Choices) == 0 {
+				continue
+			}
+			sb.WriteString(chunk.Choices[0].Delta.Content)
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
+		if serr := sc.Err(); serr != nil {
+			out <- streamOut{err: fmt.Errorf("流式读取失败: %w", serr)}
+			return
 		}
-		var chunk chatCompletionChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
+		content := sb.String()
+		if strings.TrimSpace(content) == "" {
+			out <- streamOut{err: fmt.Errorf("no response from LLM")}
+			return
 		}
-		if chunk.Usage != nil {
-			lastUsage = chunk.Usage
-		}
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-		sb.WriteString(chunk.Choices[0].Delta.Content)
+		out <- streamOut{content: content, usage: lastUsage}
+	}()
+
+	idle := time.NewTicker(c.idleTimeout)
+	defer idle.Stop()
+	var res streamOut
+	select {
+	case res = <-out:
+	case <-idle.C:
+		body.Close() // 关连接解除 goroutine 的 Scan 阻塞（其结果发入带缓冲 channel 后自然退出）
+		return "", fmt.Errorf("流式响应空闲超时(%s): 模型疑似卡死", c.idleTimeout)
 	}
-	if err := sc.Err(); err != nil {
-		return "", err
+	if res.err != nil {
+		return "", res.err
 	}
-	content := sb.String()
-	if strings.TrimSpace(content) == "" {
-		return "", fmt.Errorf("no response from LLM")
-	}
-	// §GAP5.1 用量入账：优先 usage 元数据，缺失时按内容长度粗估（4 字符≈1 token）
-	if lastUsage != nil && (lastUsage.PromptTokens > 0 || lastUsage.CompletionTokens > 0) {
-		c.recordUsage(lastUsage.PromptTokens, lastUsage.CompletionTokens)
+	// §GAP5.1 用量入账：优先 usage 元数据，缺失时按内容长度粗估（≈3 字符/token）
+	if res.usage != nil && (res.usage.PromptTokens > 0 || res.usage.CompletionTokens > 0) {
+		c.recordUsage(res.usage.PromptTokens, res.usage.CompletionTokens)
 	} else {
-		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(content))
+		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(res.content))
 	}
-	return content, nil
+	return res.content, nil
 }
 
 // reqMessagesText 拼接请求消息文本（token 粗估用）。
@@ -427,6 +506,18 @@ func reqMessagesText(req ChatRequest) string {
 		sb.WriteString(m.Content)
 	}
 	return sb.String()
+}
+
+// jitterBackoff §S6 给退避时长加 ±20% 抖动：多实例/多批同时失败时避免同步重试风暴。
+func jitterBackoff(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	j := base / 5
+	if j > 0 {
+		base += time.Duration(rand.Int63n(int64(2*j))) - j
+	}
+	return base
 }
 
 // estimateTokens 按长度粗估 token 数（英文 ≈4 字符/token；中文按 1.5 字符/token 折中）。
@@ -499,7 +590,8 @@ func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadClose
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+c.authKey())
+	key := c.pickKey() // §S6 健康感知选 key
+	httpReq.Header.Set("Authorization", "Bearer "+key)
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -508,7 +600,8 @@ func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadClose
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		// §S6 健康度记忆：按状态给该 key 记冷却（429 优先读 Retry-After）
+		c.markKeyStatus(key, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")))
 		return nil, fmt.Errorf("LLM API 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	return resp.Body, nil
@@ -834,7 +927,7 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 		lastErr = err
 		log.Printf("LLM[%d] 调用/解析失败(第%d/%d次): %v", len(titles), attempt, maxAttempts, err)
 		if attempt < maxAttempts {
-			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+			time.Sleep(jitterBackoff(time.Duration(1<<uint(attempt)) * time.Second))
 		}
 	}
 	if !ok {

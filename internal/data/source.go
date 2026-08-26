@@ -173,8 +173,22 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 // GetKLine fetches K-lines: Sina daily first, then EastMoney.
 func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, error) {
 	if period == "101" {
+		// §GAP3.6 日线降级链补全（原仅 新浪→东财 两级）：新浪 → 腾讯 → 同花顺 → 东财，
+		// 腾讯日K客户端此前已实现但未接入，作为新浪被 IP 封禁时的主力兜底。
 		if klines, err := dc.eastMoney.GetSinaKLine(code, count); err == nil && len(klines) > 0 {
 			return klines, nil
+		}
+		if klines, err := dc.eastMoney.GetTencentKLine(code, count); err == nil && len(klines) > 0 {
+			return klines, nil
+		}
+		if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+			thsKL, thsErr := dc.ths.GetTHSKLine(code)
+			if thsErr == nil && len(thsKL) > 0 {
+				return thsKL, nil
+			} else if thsErr != nil {
+				dc.thsDeadline = time.Now().Add(60 * time.Second)
+				log.Printf("同花顺日线失败 (%s): %v, 熔断60s", code, thsErr)
+			}
 		}
 	}
 

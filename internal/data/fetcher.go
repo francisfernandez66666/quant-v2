@@ -6,9 +6,13 @@
 package data
 
 import (
+	"encoding/json"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +44,16 @@ type Fetcher struct {
 	hithinkState *HithinkSourceState
 	auctionMu    sync.Mutex
 	auction      map[string]*HithinkAuctionItem // 最新竞价快照（9:15-9:26 窗口内更新）
+
+	// §GAP3.2 快照落盘：dataDir 非空时，活跃时段每 ~30s 把最新快照原子写 snapshot_latest.json，
+	// 同交易日启动时恢复——重启不再丢失当日快照（尤其竞价窗口数据）。
+	dataDir string
+	// §GAP3.3 盘中延迟监控：最近一次成功采集 unix 秒；Staleness() 供健康检查/告警消费。
+	lastOK atomic.Int64
+	// 陈旧告警节流（unix 秒）
+	lastStaleWarn atomic.Int64
+	// 落盘节拍计数
+	persistTick int
 }
 
 // allStocks 返回去重合并后的完整监控列表（base + hot）。
@@ -256,6 +270,11 @@ func (f *Fetcher) loop() {
 				}()
 				f.fetch()
 			}()
+			// §GAP3.3 盘中延迟告警：快照陈旧超 60s 说明上游源整体异常（节流 1 条/分钟）
+			if s := f.Staleness(); s > 60*time.Second && time.Now().Unix()-f.lastStaleWarn.Load() >= 60 {
+				f.lastStaleWarn.Store(time.Now().Unix())
+				log.Printf("[fetcher] 警告: 快照已陈旧 %s，上游行情源可能整体异常", s.Round(time.Second))
+			}
 		}
 	}
 }
@@ -347,6 +366,78 @@ func (f *Fetcher) fetch() {
 	f.mu.Lock()
 	f.snapshot = snapshot
 	f.mu.Unlock()
+	f.lastOK.Store(time.Now().Unix())
+	f.persistSnapshotMaybe(snapshot)
+}
+
+// SetDataDir §GAP3.2 启用快照落盘（启动时调用一次）。
+func (f *Fetcher) SetDataDir(dir string) {
+	f.mu.Lock()
+	f.dataDir = dir
+	f.mu.Unlock()
+}
+
+// persistSnapshotMaybe 落盘节拍：每 6 拍（≈30s）原子写一次 snapshot_latest.json；
+// 失败仅记日志不阻断采集。English: throttled atomic persistence of the latest snapshot.
+func (f *Fetcher) persistSnapshotMaybe(snapshot *MarketSnapshot) {
+	f.mu.RLock()
+	dir := f.dataDir
+	f.mu.RUnlock()
+	if dir == "" {
+		return
+	}
+	f.persistTick++
+	if f.persistTick%6 != 1 { // 首拍即写，其后每 6 拍一写
+		return
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		return
+	}
+	path := filepath.Join(dir, "snapshot_latest.json")
+	tmp := path + ".tmp"
+	if werr := os.WriteFile(tmp, raw, 0644); werr == nil {
+		if rerr := os.Rename(tmp, path); rerr != nil {
+			_ = os.Remove(tmp)
+			log.Printf("[fetcher] 快照落盘失败: %v", rerr)
+		}
+	} else {
+		log.Printf("[fetcher] 快照落盘失败: %v", werr)
+	}
+}
+
+// LoadPersistedSnapshot 同交易日启动恢复：读回上次落盘快照（当日有效，跨日丢弃）。
+// English: restores the persisted snapshot on startup when it belongs to today's trading day.
+func (f *Fetcher) LoadPersistedSnapshot(dir string) {
+	raw, err := os.ReadFile(filepath.Join(dir, "snapshot_latest.json"))
+	if err != nil {
+		return
+	}
+	var snap MarketSnapshot
+	if json.Unmarshal(raw, &snap) != nil || len(snap.Stocks) == 0 {
+		return
+	}
+	if TradingDayDate(snap.Time) != TradingDayDate(time.Now()) {
+		log.Printf("[fetcher] 忽略跨日持久化快照(%s)", snap.Time.Format("2006-01-02"))
+		return
+	}
+	f.mu.Lock()
+	if f.snapshot == nil || f.snapshot.Time.Before(snap.Time) {
+		f.snapshot = &snap
+	}
+	f.mu.Unlock()
+	f.lastOK.Store(snap.Time.Unix())
+	log.Printf("[fetcher] 已恢复持久化快照: %d 只 (%s)", len(snap.Stocks), snap.Time.Format("15:04:05"))
+}
+
+// Staleness §GAP3.3 快照陈旧度：距最近一次成功采集的时长；从未采集返回 0。
+// 盘中该值持续 > 30s 说明上游源整体异常——供健康检查/告警消费。
+func (f *Fetcher) Staleness() time.Duration {
+	ts := f.lastOK.Load()
+	if ts == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(ts, 0))
 }
 
 // inAuctionWindow 当前是否处于集合竞价注入窗口（9:15-9:26，Asia/Shanghai）。

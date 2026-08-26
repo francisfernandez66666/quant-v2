@@ -92,8 +92,9 @@ func (n *Notifier) SetGateway(g PushGateway) {
 
 // PushGateway 若已配置，把消息投递给推送网关；未启用则直接返回。
 // 供关键提醒（清仓/止损/交易信号）在 Webhook 之外再触达 APK 后台。
+// §GAP5.2 投递失败进 outbox 补投队列（指数退避，5 次后死信）。
 // （PushGateway forwards the message to the configured gateway if present; no-op when disabled.
-// Used so critical alerts also reach the APK in the background, beyond the Webhook path.）
+// Failures land in the outbox retry queue.）
 func (n *Notifier) PushGateway(msg Message) {
 	n.mu.RLock()
 	g := n.gateway
@@ -103,7 +104,21 @@ func (n *Notifier) PushGateway(msg Message) {
 	}
 	go func() {
 		if err := g.Send(msg); err != nil {
-			log.Printf("[notify] 推送网关错误: %v", err)
+			log.Printf("[notify] 推送网关错误: %v（进入补投队列）", err)
+			n.outbox.enqueue("gateway", msg, deliverGateway(n))
 		}
 	}()
+}
+
+// deliverGateway 返回网关投递函数（首次发送与 outbox 补投共用）。
+func deliverGateway(n *Notifier) func(string, Message) error {
+	return func(_ string, m Message) error {
+		n.mu.RLock()
+		g := n.gateway
+		n.mu.RUnlock()
+		if g == nil {
+			return nil // 网关已下线：视为成功出队
+		}
+		return g.Send(m)
+	}
 }

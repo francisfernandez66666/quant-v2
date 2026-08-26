@@ -267,6 +267,10 @@ func DefaultSchedulerConfig() SchedulerConfig {
 type NotifyConfig struct {
 	WebhookURLs []string   `json:"webhook_urls,omitempty"` // Webhook 地址列表（空则只走桌面/SSE）
 	Push        PushConfig `json:"push,omitempty"`         // 外部推送网关配置（APK 后台/离线触达）
+	// §GAP5.2 静默时段："HH:MM"~"HH:MM"（可跨午夜，如 22:00~08:00）；任一为空=不启用。
+	// 窗口内仅高级别（LevelHigh：交易信号/清仓/止损）放行，低/中级别本地日志留痕不推送。
+	QuietStart string `json:"quiet_start,omitempty"`
+	QuietEnd   string `json:"quiet_end,omitempty"`
 }
 
 // PushConfig 外部推送网关配置。

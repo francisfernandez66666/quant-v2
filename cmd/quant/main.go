@@ -225,6 +225,11 @@ func main() {
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
 	notifier := notify.New()
 	notifier.SetWebhooks(cfgMgr.GetNotifyConfig().WebhookURLs)
+	// §GAP5.2 静默时段：窗口内仅高级别（交易信号/清仓/止损）放行，低中级别留痕跳过
+	if nc := cfgMgr.GetNotifyConfig(); nc.QuietStart != "" && nc.QuietEnd != "" {
+		notifier.SetQuietHours(nc.QuietStart, nc.QuietEnd)
+		log.Printf("[main] 通知静默时段已启用: %s ~ %s（仅高级别放行）", nc.QuietStart, nc.QuietEnd)
+	}
 	// 外部推送网关：config.json notify.push 启用时，把关键提醒转发到推送服务，
 	// 实现 APK 后台/离线的系统通知触达。provider=jpush 走极光 REST API（AppKey+Secret+Alias），
 	// 否则走通用 webhook 网关（URL 指向接收 JSON 的推送地址）。
@@ -244,6 +249,9 @@ func main() {
 	baseStocks := append(wlMgr.All(), rpt.HeldPositionCodes()...)
 	dc := data.NewDataCoordinator(marketAPI, thsClient) // 统一行情源：新浪→同花顺→东财 三级降级链
 	fetcher := data.NewFetcher(baseStocks, marketAPI, dc)
+	// §GAP3.2/3.3 快照落盘（同日重启恢复）+ 盘中陈旧度告警
+	fetcher.SetDataDir(dataDir)
+	fetcher.LoadPersistedSnapshot(dataDir)
 	go fetcher.Start()
 	defer fetcher.Stop()
 	srv.SetFetcher(fetcher) // 报价接口优先读 5s 快照，缺失再降级拉取

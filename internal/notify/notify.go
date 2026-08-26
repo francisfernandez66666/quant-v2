@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"quant-trading-v2/internal/strategy"
 )
@@ -38,20 +39,74 @@ type Notifier struct {
 	wsClients   map[string]chan Message // WS 客户端 ID → 消息通道
 	webhookURLs []string                // Webhook HTTP 回调地址列表
 	gateway     PushGateway             // 外部推送网关（极光/个推/通用 REST，APK 后台/离线触达）
+
+	// §GAP5.2 静默时段（"HH:MM" 分钟数，<0 = 未启用；可跨午夜）：窗口内仅 LevelHigh 放行，
+	// 低/中级别本地留痕不推送。English: quiet-hours gate — only LevelHigh passes inside the window.
+	quietStart int
+	quietEnd   int
+
+	outbox *Outbox // §GAP5.2 失败补投队列
 }
 
 // New 创建推送器实例。（Creates a Notifier instance.）
 func New() *Notifier {
 	return &Notifier{
-		wsClients: make(map[string]chan Message),
+		wsClients:  make(map[string]chan Message),
+		quietStart: -1,
+		quietEnd:   -1,
+		outbox:     &Outbox{},
 	}
 }
 
+// SetQuietHours §GAP5.2 设置静默时段（"HH:MM"，任一为空=关闭）。可跨午夜（22:00~08:00）。
+// English: configures quiet hours; either bound empty disables the window.
+func (n *Notifier) SetQuietHours(start, end string) {
+	s, ok1 := parseHM(start)
+	e, ok2 := parseHM(end)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !ok1 || !ok2 {
+		n.quietStart, n.quietEnd = -1, -1
+		return
+	}
+	n.quietStart, n.quietEnd = s, e
+}
+
+// parseHM 解析 "HH:MM" 为当日分钟数；非法返回 (0,false)。
+func parseHM(s string) (int, bool) {
+	var h, m int
+	if n, err := fmt.Sscanf(s, "%d:%d", &h, &m); err != nil || n != 2 || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+// inQuietHours 当前时刻是否处于静默窗口（支持跨午夜区间）。
+func (n *Notifier) inQuietHours(now time.Time) bool {
+	n.mu.RLock()
+	s, e := n.quietStart, n.quietEnd
+	n.mu.RUnlock()
+	if s < 0 || e < 0 {
+		return false
+	}
+	cur := now.Hour()*60 + now.Minute()
+	if s <= e {
+		return cur >= s && cur < e
+	}
+	return cur >= s || cur < e // 跨午夜（如 22:00~08:00）
+}
+
 // Push 向所有 WS 客户端和 Webhook 地址推送消息（非阻塞）。
-// WS 客户端通道已满时直接丢弃该消息（防止慢消费者阻塞推送方）；Webhook 为异步 goroutine 发送。
-// （Push delivers a message to all WS clients and Webhook URLs non-blockingly; drops when a WS channel is
-// full and sends to each Webhook in an async goroutine.）
+// §GAP5.2 静默时段内仅 LevelHigh 放行（交易信号/清仓/止损），低中级别留痕跳过；
+// WS 客户端通道已满时直接丢弃该消息（防止慢消费者阻塞推送方）；Webhook 为异步 goroutine 发送，
+// 失败进 outbox 补投队列。
+// （Push delivers a message to all WS clients and Webhook URLs non-blockingly; quiet hours pass only
+// LevelHigh; drops when a WS channel is full and sends to each Webhook async — failures land in the outbox.）
 func (n *Notifier) Push(msg Message) {
+	if msg.Level < LevelHigh && n.inQuietHours(time.Now()) {
+		log.Printf("[notify] 静默时段抑制 level=%d title=%q", msg.Level, msg.Title)
+		return
+	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
@@ -64,8 +119,17 @@ func (n *Notifier) Push(msg Message) {
 	}
 
 	for _, url := range n.webhookURLs {
-		go n.postWebhook(url, msg)
+		go func(u string) {
+			if err := n.postWebhook(u, msg); err != nil {
+				n.outbox.enqueue("webhook:"+u, msg, deliverWebhook(n, u))
+			}
+		}(url)
 	}
+}
+
+// deliverWebhook 返回指定 URL 的投递函数（首次发送与 outbox 补投共用同一实现）。
+func deliverWebhook(n *Notifier, url string) func(string, Message) error {
+	return func(_ string, m Message) error { return n.postWebhook(url, m) }
 }
 
 // PushSignal 根据信号优先级自动选择告警级别并推送。
@@ -157,13 +221,21 @@ func (n *Notifier) UnregisterWS(id string) {
 	n.mu.Unlock()
 }
 
-// postWebhook 向单个 Webhook 地址发送 POST 请求（goroutine 内调用）。（Posts a message to a single Webhook URL, called inside a goroutine.）
-func (n *Notifier) postWebhook(url string, msg Message) {
+// postWebhook 向单个 Webhook 地址发送 POST 请求（带 10s 超时，防慢端点堆积 goroutine）。
+// 失败返回错误（由调用方决定是否进 outbox 补投）。
+func (n *Notifier) postWebhook(url string, msg Message) error {
 	data, _ := json.Marshal(msg)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+	client := &http.Client{Timeout: 10 * time.Second} // §GAP5.2 此前 http.Post 无超时
+	resp, err := client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
 		log.Printf("webhook post error: %v", err)
-		return
+		return err
 	}
 	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		err := fmt.Errorf("webhook non-2xx: %d", resp.StatusCode)
+		log.Printf("webhook post error: %v", err)
+		return err
+	}
+	return nil
 }
