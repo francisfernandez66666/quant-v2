@@ -4,7 +4,7 @@
 // 全站使用 TDesign React 组件 + 暗色主题（ConfigProvider theme="dark"）。
 import React, { useState, useEffect, useRef } from 'react'
 import { NavLink, Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
-import { ConfigProvider, Layout, Menu, Switch, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
+import { ConfigProvider, Menu, Switch, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
 import * as api from './api/index.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
@@ -262,52 +262,77 @@ export default function App() {
 
   return (
     <ConfigProvider theme="dark">
-      <Layout style={{ minHeight: '100vh' }}>
-        <Layout.Header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', height: 56, borderBottom: '1px solid #333' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
-            <span>{inTradeTime !== null && (inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后')}</span>
-            <span className="muted">{serverOnline ? '服务在线' : '离线'}</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <Switch value={shortEnabled} onChange={onShortToggle} />
-            <span className="muted">{shortEnabled ? '做多+空' : '仅做多'}</span>
-            <Button theme="default" variant="outline" size="small" onClick={() => {
-              const sent = sendNotify('量仔期货', '通知测试成功')
-              MessagePlugin.info('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')))
-            }}>🔔</Button>
-            <Button theme="default" variant="outline" size="small" onClick={logout}>退出</Button>
-          </div>
-        </Layout.Header>
-        <Layout style={{ display: 'flex' }}>
-          <aside style={{ width: 210, background: '#232323', borderRight: '1px solid #333', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
-            <div className="brand-logo">量仔期货</div>
-            <div style={{ flex: 1, overflowY: 'auto' }}>
-              <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} options={menuOptions} style={{ width: '100%', background: 'transparent', borderRight: 'none' }} />
+      {!loggedIn ? (
+        <div className="login-page">
+          <div className="login-box">
+            <h1>量仔期货</h1>
+            <p className="subtitle">量化交易辅助工具</p>
+            <div className="form-group">
+              <label>服务器地址</label>
+              <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
             </div>
-            <div className="sidebar-footer">
-              <div className="account-name">{account}</div>
+            <div className="form-group">
+              <label>账号</label>
+              <Input value={username} onChange={(v) => setUsername(v)} placeholder="输入账号" />
             </div>
-          </aside>
-          <Layout.Content style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
-            <Routes>
-              <Route path="/" element={<Navigate to="/dashboard" replace />} />
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/signals" element={<Signals />} />
-              <Route path="/watchlist" element={<Watchlist />} />
-              <Route path="/positions" element={<Positions />} />
-              <Route path="/quant" element={<Quant />} />
-              <Route path="/hotspot" element={<Hotspot />} />
-              <Route path="/msgcenter" element={<MsgCenter />} />
-              <Route path="/settings" element={<Settings />} />
-              <Route path="/llm-debug" element={<LLMDebug />} />
-              <Route path="/consult" element={<Consult />} />
-              <Route path="/research" element={<Research />} />
-              <Route path="/admin" element={<Admin />} />
-              <Route path="/paper" element={<Paper />} />
-            </Routes>
-          </Layout.Content>
-        </Layout>
-      </Layout>
+            <div className="form-group">
+              <label>密码</label>
+              <Input type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码" onEnter={handleLogin} />
+            </div>
+            <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
+            {loginError && <p className="login-error">{loginError}</p>}
+          </div>
+        </div>
+      ) : (
+        <div className="app-shell">
+          <header className="app-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
+              <div className="hamburger" onClick={() => setMenuOpen((o) => !o)}><span></span><span></span><span></span></div>
+              <span>{inTradeTime !== null && (inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后')}</span>
+              <span className="muted">{serverOnline ? '服务在线' : '离线'}</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <Switch value={shortEnabled} onChange={onShortToggle} />
+              <span className="muted">{shortEnabled ? '做多+空' : '仅做多'}</span>
+              <Button theme="default" variant="outline" size="small" onClick={() => {
+                const sent = sendNotify('量仔期货', '通知测试成功')
+                MessagePlugin.info('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')))
+              }}>🔔</Button>
+              <Button theme="default" variant="outline" size="small" onClick={logout}>退出</Button>
+            </div>
+          </header>
+          <div className="app-body">
+            <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
+              <div className="brand-logo">量仔期货</div>
+              <div style={{ flex: 1, overflowY: 'auto' }}>
+                <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} options={menuOptions} style={{ width: '100%', background: 'transparent', borderRight: 'none' }} />
+              </div>
+              <div className="sidebar-footer">
+                <div className="account-name">{account}</div>
+              </div>
+            </aside>
+            {menuOpen && <div className="sidebar-overlay" onClick={() => setMenuOpen(false)} />}
+            <main className="app-main">
+              <Routes>
+                <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/signals" element={<Signals />} />
+                <Route path="/watchlist" element={<Watchlist />} />
+                <Route path="/positions" element={<Positions />} />
+                <Route path="/quant" element={<Quant />} />
+                <Route path="/hotspot" element={<Hotspot />} />
+                <Route path="/msgcenter" element={<MsgCenter />} />
+                <Route path="/settings" element={<Settings />} />
+                <Route path="/llm-debug" element={<LLMDebug />} />
+                <Route path="/consult" element={<Consult />} />
+                <Route path="/research" element={<Research />} />
+                <Route path="/admin" element={<Admin />} />
+                <Route path="/paper" element={<Paper />} />
+              </Routes>
+            </main>
+          </div>
+        </div>
+      )}
     </ConfigProvider>
   )
 }
