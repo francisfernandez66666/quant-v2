@@ -275,7 +275,7 @@ export default function Settings() {
       <Card title="账户信息" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>账号</span>
-          <span style={{ color: '#eee' }}>{account}</span>
+          <span style={{ color: '#1a1a1a' }}>{account}</span>
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>令牌</span>

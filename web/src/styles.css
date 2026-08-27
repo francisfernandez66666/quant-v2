@@ -1,11 +1,11 @@
-/* 全局样式：仅保留重置、深色主题令牌、应用外壳布局（含响应式）、页面容器与少量通用工具类。
-   组件级样式一律交给 TDesign；页面不再引入各自 .css，避免全局类名互相覆盖。 */
+/* 全局样式（浅色 UI）：重置、浅色令牌、应用外壳布局（含响应式）、页面容器与少量通用工具类。
+   组件级样式交给 TDesign 浅色主题；页面不再引入各自 .css，避免全局类名互相覆盖。 */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body, #app { height: 100%; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  background: #181818;            /* TDesign 暗色默认背景 */
-  color: #e6e6e6;
+  background: #f5f5f5;
+  color: #1a1a1a;
   -webkit-tap-highlight-color: transparent;
   font-size: 14px;
 }
@@ -14,23 +14,23 @@ body {
 .app-shell { display: flex; flex-direction: column; height: 100vh; width: 100vw; overflow: hidden; }
 .app-header {
   flex-shrink: 0; height: 56px; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 16px; background: #232323; border-bottom: 1px solid #333; gap: 12px;
+  padding: 0 16px; background: #fff; border-bottom: 1px solid #e7e7e7; gap: 12px;
 }
 .app-body { flex: 1; display: flex; min-height: 0; width: 100%; }
 .app-aside {
-  width: 210px; flex-shrink: 0; background: #232323; border-right: 1px solid #333;
+  width: 210px; flex-shrink: 0; background: #fff; border-right: 1px solid #e7e7e7;
   display: flex; flex-direction: column; overflow: hidden;
 }
 .app-main { flex: 1; min-width: 0; overflow: auto; }
 
 /* 侧边栏品牌与底部信息 */
-.brand-logo { padding: 18px 16px; font-size: 18px; font-weight: 700; color: #e34d59; border-bottom: 1px solid #333; }
-.sidebar-footer { padding: 12px 16px; border-top: 1px solid #333; }
-.account-name { font-size: 13px; color: #e6e6e6; }
+.brand-logo { padding: 18px 16px; font-size: 18px; font-weight: 700; color: #e34d59; border-bottom: 1px solid #eee; }
+.sidebar-footer { padding: 12px 16px; border-top: 1px solid #eee; }
+.account-name { font-size: 13px; color: #1a1a1a; }
 
 /* 移动端汉堡按钮 + 遮罩（默认隐藏，窄屏显示） */
 .hamburger { display: none; width: 28px; height: 28px; cursor: pointer; flex-direction: column; justify-content: center; gap: 5px; }
-.hamburger span { display: block; height: 2px; width: 22px; background: #bbb; border-radius: 1px; }
+.hamburger span { display: block; height: 2px; width: 22px; background: #666; border-radius: 1px; }
 .sidebar-overlay { display: none; }
 
 /* 页面内容统一内边距容器（各页根节点使用 className="page"） */
@@ -46,15 +46,15 @@ body {
 .toolbar .spacer { flex: 1; }
 
 /* ====== 登录页（唯一保留的少量自定义样式） ====== */
-.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #f0f2f5; }
 .login-box {
-  background: #232323; padding: 40px 28px; border-radius: 12px; width: 90%; max-width: 380px;
-  box-shadow: 0 8px 40px rgba(0,0,0,0.4);
+  background: #fff; padding: 40px 28px; border-radius: 12px; width: 90%; max-width: 380px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.08); border: 1px solid #eee;
 }
 .login-box h1 { font-size: 26px; margin-bottom: 4px; color: #e34d59; text-align: center; }
 .login-box .subtitle { color: #999; margin-bottom: 24px; font-size: 13px; text-align: center; }
 .form-group { margin-bottom: 14px; }
-.form-group label { display: block; font-size: 12px; color: #999; margin-bottom: 5px; }
+.form-group label { display: block; font-size: 12px; color: #666; margin-bottom: 5px; }
 .login-error { color: #e34d59; font-size: 13px; margin-top: 12px; text-align: center; }
 
 /* ====== 响应式：窄屏（手机/小平板）====== */
@@ -62,10 +62,10 @@ body {
   .hamburger { display: flex; }
   .app-aside {
     position: fixed; top: 0; bottom: 0; left: 0; z-index: 200;
-    transform: translateX(-100%); transition: transform 0.25s ease; box-shadow: 2px 0 12px rgba(0,0,0,0.5);
+    transform: translateX(-100%); transition: transform 0.25s ease; box-shadow: 2px 0 12px rgba(0,0,0,0.15);
   }
   .app-aside.open { transform: translateX(0); }
-  .sidebar-overlay { display: block; position: fixed; inset: 0; z-index: 190; background: rgba(0,0,0,0.5); }
+  .sidebar-overlay { display: block; position: fixed; inset: 0; z-index: 190; background: rgba(0,0,0,0.45); }
   .app-main { overflow: auto; }
   .page { padding: 12px; }
   .app-header { padding: 0 12px; }

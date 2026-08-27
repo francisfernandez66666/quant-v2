@@ -1,7 +1,7 @@
 // ── 根组件 App.jsx ──
 // 主布局：侧边栏导航（TDesign Menu）+ 顶部栏（TDesign Header）+ 内容区（Routes）；未登录显示登录页。
 // 全局逻辑：登录态恢复、15s 状态轮询、SSE 推送订阅、做空开关、通知测试、Toast 提示。
-// 全站使用 TDesign React 组件 + 暗色主题（ConfigProvider theme="dark"）。
+// 全站使用 TDesign React 组件 + 浅色主题（默认，不设置 theme 即为浅色）。
 import React, { useState, useEffect, useRef } from 'react'
 import { NavLink, Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
 import { ConfigProvider, Menu, Switch, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
@@ -206,7 +206,7 @@ export default function App() {
   // ── 登录页 ──
   if (!loggedIn) {
     return (
-      <ConfigProvider theme="dark">
+      <ConfigProvider>
         <div className="login-page">
           <div className="login-box t-card">
             <h1>量仔期货</h1>
@@ -250,7 +250,7 @@ export default function App() {
   ].filter(Boolean)
 
   return (
-    <ConfigProvider theme="dark">
+    <ConfigProvider>
       {!loggedIn ? (
         <div className="login-page">
           <div className="login-box">
@@ -294,7 +294,7 @@ export default function App() {
             <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
               <div className="brand-logo">量仔期货</div>
               <div style={{ flex: 1, overflowY: 'auto' }}>
-                <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
+                <Menu theme="light" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
                   {navItems.map((it) => (
                     <Menu.MenuItem key={it.to} value={it.to}>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>

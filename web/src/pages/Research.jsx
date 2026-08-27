@@ -711,7 +711,7 @@ export default function Research() {
       if (row.status === 'running' || row.status === 'paused' || row.status === 'queued') {
         return (
           <div>
-            <div style={{ height: 6, background: '#333', borderRadius: 3, overflow: 'hidden' }}>
+            <div style={{ height: 6, background: '#e7e7e7', borderRadius: 3, overflow: 'hidden' }}>
               <div style={{ width: jobPct(row), height: '100%', background: '#4caf50' }} />
             </div>
             <span style={{ fontSize: 11, color: '#aaa' }}>{jobPct(row)}</span>
@@ -799,7 +799,7 @@ export default function Research() {
                 </Tag>
               ))}
             </div>
-            <div style={{ fontSize: 13, color: '#bbb', lineHeight: 1.7, margin: '4px 0' }}>
+            <div style={{ fontSize: 13, color: '#666666', lineHeight: 1.7, margin: '4px 0' }}>
               玩法：每天给所有股票按上面 {factorRule(c).length} 个指标打分，分数最高的前一批会被标记为「值得买」，赌它们接下来 {c.horizon} 个交易日能涨。
               {factorRule(c).some((f) => f.dir < 0) && <span> 注意：带「看空」的指标是反着用的——这项数值越高，反而越说明不该买。</span>}
             </div>
@@ -807,13 +807,13 @@ export default function Research() {
             <div style={{ margin: '6px 0' }}>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 <Tag theme={verdict(c).ok ? 'success' : 'danger'}>{verdict(c).ok ? '✅ 可以试试' : '⚠️ 建议别用'}</Tag>
-                <span style={{ fontSize: 13, color: '#bbb' }}>{verdict(c).text}</span>
+                <span style={{ fontSize: 13, color: '#666666' }}>{verdict(c).text}</span>
               </div>
               {plainLines(c).map((l, i) => (
-                <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#bbb', margin: '4px 0' }}><span style={{ color: '#888' }}>{i + 1}.</span><span>{l}</span></div>
+                <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#666666', margin: '4px 0' }}><span style={{ color: '#888' }}>{i + 1}.</span><span>{l}</span></div>
               ))}
             </div>
-            <details style={{ border: '1px solid #333', borderRadius: 6, padding: 8, marginTop: 6 }}>
+            <details style={{ border: '1px solid #e7e7e7', borderRadius: 6, padding: 8, marginTop: 6 }}>
               <summary style={{ cursor: 'pointer' }}>想看具体数字？展开</summary>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>样本内测试</span><span>前一段历史回放：IR {fmt(parseReason(c, '样本内IR'))}</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>样本外测试</span><span>另一段没用过的历史回放：IR {fmt(parseReason(c, '样本外IR'))}</span></div>
@@ -868,7 +868,7 @@ export default function Research() {
             )}
             {backtestLoading[c.id] && (
               <div style={{ flex: 1, minWidth: 160 }}>
-                <div style={{ height: 6, background: '#333', borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{ height: 6, background: '#e7e7e7', borderRadius: 3, overflow: 'hidden' }}>
                   <div style={{ width: btPct(c.id), height: '100%', background: '#4caf50' }} />
                 </div>
                 <span style={{ fontSize: 11, color: '#aaa' }}>全链路回测 {backtestProgress[c.id] || '0%'}</span>
@@ -984,7 +984,7 @@ export default function Research() {
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(200px,1fr))', gap: 12 }}>
                       <div>
                         <div style={{ fontSize: 12, color: '#888' }}>数据准备度（近一年有行情 / 全市场）</div>
-                        <div style={{ height: 8, background: '#2a2a3e', borderRadius: 4, overflow: 'hidden', marginTop: 4 }}>
+                        <div style={{ height: 8, background: '#eef0f3', borderRadius: 4, overflow: 'hidden', marginTop: 4 }}>
                           <div style={{ width: pct(progress.ready_pct) + '%', height: '100%', background: 'linear-gradient(90deg,#4caf50,#64b5f6)' }} />
                         </div>
                         <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>{progress.ready_stocks} / {progress.stocks} 只（{pct(progress.ready_pct)}%）</div>

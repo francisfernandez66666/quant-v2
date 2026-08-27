@@ -291,7 +291,7 @@ export default function Hotspot() {
         {sectors.length ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12 }}>
             {sectors.map((s) => (
-              <Card key={s.code} bordered={false} style={{ cursor: 'pointer', background: '#12121e', border: '1px solid #2a2a3e' }} onClick={() => setReasonTarget(s)}>
+              <Card key={s.code} bordered={false} style={{ cursor: 'pointer', background: '#12121e', border: '1px solid #eef0f3' }} onClick={() => setReasonTarget(s)}>
                 <div style={{ fontSize: 14, fontWeight: 600, color: '#e0e0e0' }}>{s.name}</div>
                 {s.reason && <div style={{ fontSize: 11, color: '#888', marginTop: 4, minHeight: 28, overflow: 'hidden' }}>{shortReason(s.reason)}</div>}
                 <div style={{ fontSize: 16, fontWeight: 700, color: '#FAAD14', marginTop: 4 }}>{Math.round((s.score || 0) * 100)}分</div>
@@ -323,7 +323,7 @@ export default function Hotspot() {
               <div>
                 <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻（{reasonTarget.news_titles.length}条）</div>
                 {reasonTarget.news_titles.map((t, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#ddd', padding: '2px 0' }}>
+                  <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#666666', padding: '2px 0' }}>
                     <span style={{ color: '#888' }}>{i + 1}.</span>
                     <span>{t}</span>
                   </div>

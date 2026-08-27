@@ -268,7 +268,7 @@ export default function Dashboard() {
 
           {newsItems.length > 0 && <SectionLabel>📰 资讯</SectionLabel>}
           {newsItems.slice(0, 15).map((n, i) => (
-            <div key={'n' + i} style={{ padding: '6px 0', borderBottom: '1px solid #333' }}>
+            <div key={'n' + i} style={{ padding: '6px 0', borderBottom: '1px solid #e7e7e7' }}>
               <div style={{ display: 'flex', gap: 8, fontSize: 13 }}>
                 <span className="muted">{fmtNewsTime(n.datetime)}</span>
                 <span>{n.title}</span>
@@ -316,5 +316,5 @@ function SectionLabel({ children }) {
 }
 // 分隔线
 function Divider() {
-  return <div style={{ height: 1, background: '#333', margin: '10px 0' }} />
+  return <div style={{ height: 1, background: '#e7e7e7', margin: '10px 0' }} />
 }

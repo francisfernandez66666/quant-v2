@@ -18,10 +18,10 @@ const deaColor = '#5b8ff9'
 const avgColor = '#f0b90b'
 const priceColor = '#7cd6ff'
 const C = {
-  bg: '#101828',
-  grid: '#2a3a55',
-  panel: '#24334d',
-  axisTxt: '#7d8fab',
+  bg: '#f7f8fa',
+  grid: '#e3e8ef',
+  panel: '#e3e8ef',
+  axisTxt: '#5b6b85',
   prev: '#f0b90b',
   cross: '#f0b90b',
   dot: '#7cb3ff',
@@ -326,8 +326,8 @@ export default function KLineChart({
 
       const tipX = Math.min(Math.max(hover.x - 84, axisL), viewW - 168)
       const tipW = 168, tipH = 92, tipY = 4
-      ctx.fillStyle = '#0a0f1c'
-      ctx.strokeStyle = '#2e4161'
+      ctx.fillStyle = '#f7f8fa'
+      ctx.strokeStyle = '#e3e8ef'
       ctx.fillRect(tipX, tipY, tipW, tipH)
       ctx.strokeRect(tipX, tipY, tipW, tipH)
       ctx.textAlign = 'left'

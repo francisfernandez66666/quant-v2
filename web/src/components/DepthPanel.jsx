@@ -6,10 +6,10 @@ import './DepthPanel.css'
 
 // 配色（与 Vue 源完全一致）
 const C = {
-  bg: '#101828',
-  lv: '#7d8fab',
-  vol: '#b8c7dd',
-  nowBg: '#16223a',
+  bg: '#f7f8fa',
+  lv: '#5b6b85',
+  vol: '#5b6b85',
+  nowBg: '#eef2f7',
   now: '#e8f0fe',
   ask: '#3ddc84',   // 卖盘绿
   bid: '#ff6b5a',   // 买盘红
@@ -156,7 +156,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
       const cy = y + rowH / 2
       // 高亮最优档
       if (r.best) {
-        ctx.fillStyle = 'rgba(255,255,255,0.04)'
+        ctx.fillStyle = 'rgba(0,0,0,0.03)'
         ctx.fillRect(col1, y, W - col1 * 2, rowH)
       }
       if (r.now) {

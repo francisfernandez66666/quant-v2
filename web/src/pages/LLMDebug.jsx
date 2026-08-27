@@ -303,9 +303,9 @@ function LogModal({ visible, onClose }) {
                           {llmData.stage1_mode === 'llm' ? 'LLM' : '关键词'}
                         </span>
                       </div>
-                      <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#eee' }}>{llmData.raw_count}</span></div>
-                      <div style={summaryItemStyle}><span className="muted">筛选后</span><span style={{ color: '#eee' }}>{llmData.selected_count}</span></div>
-                      <div style={summaryItemStyle}><span className="muted">分析时间</span><span style={{ color: '#eee' }}>{fmtTime(llmData.process_time)}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#1a1a1a' }}>{llmData.raw_count}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">筛选后</span><span style={{ color: '#1a1a1a' }}>{llmData.selected_count}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">分析时间</span><span style={{ color: '#1a1a1a' }}>{fmtTime(llmData.process_time)}</span></div>
                     </div>
 
                     <SectionLabel>Stage1 · 新闻初筛</SectionLabel>
@@ -392,9 +392,9 @@ function LogModal({ visible, onClose }) {
                 {sigData && (
                   <>
                     <div style={summaryBarStyle}>
-                      <div style={summaryItemStyle}><span className="muted">批次时间</span><span style={{ color: '#eee' }}>{fmtTime(sigData.process_time)}</span></div>
-                      <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#eee' }}>{sigData.raw_count}</span></div>
-                      <div style={summaryItemStyle}><span className="muted">信号数</span><span style={{ color: '#eee' }}>{sigData.signals.length}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">批次时间</span><span style={{ color: '#1a1a1a' }}>{fmtTime(sigData.process_time)}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#1a1a1a' }}>{sigData.raw_count}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">信号数</span><span style={{ color: '#1a1a1a' }}>{sigData.signals.length}</span></div>
                     </div>
                     {sigFiltered.length > 0 ? (
                       <Table
@@ -539,9 +539,9 @@ export default function LLMDebug() {
                   {data.stage1_mode === 'llm' ? 'LLM' : '关键词'}
                 </span>
               </div>
-              <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#eee' }}>{data.raw_count}</span></div>
-              <div style={summaryItemStyle}><span className="muted">筛选后</span><span style={{ color: '#eee' }}>{data.selected_count}</span></div>
-              <div style={summaryItemStyle}><span className="muted">分析时间</span><span style={{ color: '#eee' }}>{formatTime(data.process_time)}</span></div>
+              <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#1a1a1a' }}>{data.raw_count}</span></div>
+              <div style={summaryItemStyle}><span className="muted">筛选后</span><span style={{ color: '#1a1a1a' }}>{data.selected_count}</span></div>
+              <div style={summaryItemStyle}><span className="muted">分析时间</span><span style={{ color: '#1a1a1a' }}>{formatTime(data.process_time)}</span></div>
             </div>
           </Card>
 

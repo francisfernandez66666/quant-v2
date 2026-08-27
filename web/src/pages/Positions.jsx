@@ -431,11 +431,11 @@ export default function Positions() {
     { colKey: 'cur_price', title: '现价', width: 80, cell: ({ row }) => (row.cur_price != null ? '¥' + Number(row.cur_price).toFixed(2) : '-') },
     { colKey: 'change_pct', title: '当日涨跌', width: 90, cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
     { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, cell: ({ row }) => <span style={{ color: (row.pnl_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.pnl_pct || 0) > 0 ? '+' : ''}{(row.pnl_pct || 0).toFixed(2)}%</span> },
-    { colKey: 'signal', title: '信号', width: 50, cell: ({ row }) => row.signal_active ? <span title="有策略信号">⚡</span> : <span style={{ color: '#333' }}>—</span> },
+    { colKey: 'signal', title: '信号', width: 50, cell: ({ row }) => row.signal_active ? <span title="有策略信号">⚡</span> : <span style={{ color: '#e7e7e7' }}>—</span> },
     { colKey: 'n_score', title: 'N', width: 55, cell: ({ row }) => { const v = row.n_score || 0; const c = v >= 60 ? '#e34d59' : v > 0 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
     { colKey: 'dragon_score', title: '龙', width: 55, cell: ({ row }) => { const v = row.dragon_score || 0; const c = v >= 60 ? '#e34d59' : v >= 50 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
     { colKey: 'm_score', title: '量', width: 55, cell: ({ row }) => { const v = row.m_score || 0; const c = v >= 50 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
-    { colKey: 'sl', title: '止盈/止损', width: 110, cell: ({ row }) => <span><span style={{ color: '#e34d59' }}>+{(row.take_profit_pct || 8).toFixed(1)}%</span><span style={{ color: '#333' }}> / </span><span style={{ color: '#00a870' }}>-{(row.stop_loss_pct || 5).toFixed(1)}%</span></span> },
+    { colKey: 'sl', title: '止盈/止损', width: 110, cell: ({ row }) => <span><span style={{ color: '#e34d59' }}>+{(row.take_profit_pct || 8).toFixed(1)}%</span><span style={{ color: '#e7e7e7' }}> / </span><span style={{ color: '#00a870' }}>-{(row.stop_loss_pct || 5).toFixed(1)}%</span></span> },
     { colKey: 'highest', title: '移动止盈', width: 90, cell: ({ row }) => row.highest_price > 0 ? <span style={{ color: row.highest_price > (row.cost_price || 0) ? '#e34d59' : '#b388ff' }}>¥{row.highest_price.toFixed(2)}</span> : '—' },
     { colKey: 'kline', title: '分时', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{klineOpen.has(row.code) ? '收起' : '分时'}</Button> },
     { colKey: 'actions', title: '操作', width: 230, cell: ({ row }) => (
@@ -458,7 +458,7 @@ export default function Positions() {
     { colKey: 'cur_price', title: '现价', width: 90, cell: ({ row }) => curPrice(row) ? '¥' + curPrice(row).toFixed(2) : '—' },
     { colKey: 'pnl', title: '持仓盈亏', width: 90, cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
     { colKey: 'highest_price', title: '最高价', width: 90, cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
-    { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: '#333' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
+    { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: '#e7e7e7' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
     { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
         <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'add') }}>加仓</Button>
@@ -666,7 +666,7 @@ export default function Positions() {
             <span>时间</span><span>价格</span><span>数量</span><span>金额</span>
           </div>
           {(lotsTarget?.lots || []).map((lot, i) => (
-            <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, fontSize: 13, borderBottom: '1px solid #333', padding: '4px 0' }}>
+            <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, fontSize: 13, borderBottom: '1px solid #e7e7e7', padding: '4px 0' }}>
               <span className="muted">{(lot.at || '').replace('T', ' ').slice(0, 19)}</span>
               <span>¥{lot.price?.toFixed(3)}</span>
               <span>{lot.quantity}</span>

@@ -180,8 +180,8 @@ export default function Consult() {
             <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>{m.role === 'user' ? '我' : 'AI 顾问'}</div>
             <div style={{
               ...bubbleStyle,
-              background: m.role === 'user' ? '#0052d9' : '#2a2a2a',
-              color: m.role === 'user' ? '#fff' : '#eee',
+              background: m.role === 'user' ? '#0052d9' : '#f4f4f5',
+              color: m.role === 'user' ? '#fff' : '#1a1a1a',
             }}>{m.content}</div>
             {m.time && <div className="muted" style={{ fontSize: 12, marginTop: 2, textAlign: m.role === 'user' ? 'right' : 'left' }}>{fmtTime(m.time)}</div>}
           </div>
@@ -189,7 +189,7 @@ export default function Consult() {
         {loading && (
           <div style={{ alignSelf: 'flex-start' }}>
             <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>AI 顾问</div>
-            <div style={{ ...bubbleStyle, background: '#2a2a2a', color: '#eee' }}>思考中...</div>
+            <div style={{ ...bubbleStyle, background: '#f4f4f5', color: '#1a1a1a' }}>思考中...</div>
           </div>
         )}
       </div>

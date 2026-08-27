@@ -274,7 +274,7 @@ export default function Signals() {
   function sheetBtnStyle(color) {
     return {
       width: '100%', padding: 14, borderRadius: 8, border: 'none',
-      background: '#0f0f23', color, fontSize: 16, cursor: 'pointer', marginBottom: 8, textAlign: 'center',
+      background: '#f4f4f5', color, fontSize: 16, cursor: 'pointer', marginBottom: 8, textAlign: 'center',
     }
   }
 
@@ -326,7 +326,7 @@ export default function Signals() {
             width: '100%', background: '#1a1a2e', borderRadius: '14px 14px 0 0',
             padding: '10px 12px calc(10px + env(safe-area-inset-bottom, 0px))',
           }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ fontSize: 14, color: '#999', textAlign: 'center', padding: '8px 0 12px', borderBottom: '1px solid #2a2a3e', marginBottom: 8 }}>
+            <div style={{ fontSize: 14, color: '#999', textAlign: 'center', padding: '8px 0 12px', borderBottom: '1px solid #eef0f3', marginBottom: 8 }}>
               {sheetSignal.code} {sheetSignal.name || ''} · {sheetSignal.strategy}
             </div>
             {sheetSignal.can_open && (
@@ -344,7 +344,7 @@ export default function Signals() {
             <button style={sheetBtnStyle('#4fc3f7')} onClick={() => { toggleKline(sheetSignal.code); setSheetSignal(null) }}>
               {klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时'}
             </button>
-            <button style={{ ...sheetBtnStyle('#888'), background: '#2a2a3e' }} onClick={() => setSheetSignal(null)}>取消</button>
+            <button style={{ ...sheetBtnStyle('#888'), background: '#eef0f3' }} onClick={() => setSheetSignal(null)}>取消</button>
           </div>
         </div>
       )}
