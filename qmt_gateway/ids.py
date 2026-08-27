@@ -34,6 +34,7 @@ class Idempotency:
         sid = draft.get("signal_id", "")
         if not sid:
             return False, None
+        # 委托 store 做 SQLite 原子抢占；抢不到说明已被处理/进行中
         claimed, existing = self.store.claim_order(draft)
         if not claimed:
             log.info("[ids] signal_id=%s already claimed (status=%s)",
@@ -47,7 +48,7 @@ class Idempotency:
             log.info("[ids] signal_id=%s settled onto existing row", order.get("signal_id"))
         return is_new
 
-    # 兼容旧调用名
+    # 兼容旧调用名：record 作为 settle 的别名保留
     record = settle
 
     def release(self, signal_id):

@@ -679,7 +679,7 @@ export default function Paper() {
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 12 }}>
           <span style={{ color: '#888', fontSize: 13 }}>分仓资金池</span>
           <Tag
-            style={{ cursor: 'pointer', background: activePool === null ? '#eef0f3' : undefined, color: activePool === null ? '#0052d9' : undefined }}
+            style={{ cursor: 'pointer', background: activePool === null ? '#1d4ed8' : undefined, color: activePool === null ? '#ffffff' : undefined, borderColor: activePool === null ? '#1d4ed8' : undefined }}
             onClick={() => setActivePool(null)}
           >
             全部（{positions.length} 仓）
@@ -690,7 +690,7 @@ export default function Paper() {
             return (
               <Tag
                 key={p.key}
-                style={{ cursor: 'pointer', background: active ? '#eef0f3' : undefined, color: active ? '#0052d9' : undefined }}
+                style={{ cursor: 'pointer', background: active ? '#1d4ed8' : undefined, color: active ? '#ffffff' : undefined, borderColor: active ? '#1d4ed8' : undefined }}
                 onClick={() => setActivePool(active ? null : key)}
               >
                 {p.label} <span style={{ color: p.return_pct >= 0 ? UP : DOWN }}>{(p.return_pct >= 0 ? '+' : '') + p.return_pct.toFixed(2)}%</span> · ¥{fmt(p.cash)} · {p.ratio_pct.toFixed(1)}%·{p.positions}仓

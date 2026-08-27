@@ -107,7 +107,10 @@ export default function KLineChart({
           return
         }
         if (pts.length === 0) {
-          if (!cancelled) setRaw([])
+          if (!cancelled) {
+            setRaw([])
+            if (data && data.error) setError(data.error)
+          }
           return
         }
         if (cancelled) return
@@ -435,6 +438,7 @@ export default function KLineChart({
             if (!pts) { setError('分时数据格式异常'); return }
             setRaw(pts); setPrevClose(Number(data.prev_close) || 0)
             if (data.name) setDispName(data.name)
+            if (pts.length === 0 && data && data.error) setError(data.error)
           }).catch((e) => setError(e && e.message ? e.message : '分时加载失败')).finally(() => setLoading(false))
         }}>刷新</button>
       </div>

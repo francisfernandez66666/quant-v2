@@ -8,13 +8,14 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Form, Input, Switch, Button, Tag, Table, MessagePlugin, DialogPlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 
-// 已知战法枚举：value 为后端标识，label 为前端展示名称（全部开启即表示不设白名单）
-const KNOWN_STRATEGIES = [
-  { value: 'dragon', label: '龙头战法 Dragon' },
-  { value: 'double_bump', label: '双响炮 DoubleBump' },
-  { value: 'n_shape', label: 'N形超短 NShape' },
-  { value: 'dragon_return', label: '龙回头(中线) DragonReturn' },
-]
+// 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
+// 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
+const KIND_LABELS = {
+  form: '形态战法（内置）',
+  factor: '因子战法',
+  pattern: '形态自动发现战法',
+}
+const KIND_ORDER = ['form', 'factor', 'pattern']
 
 // 涨跌配色（红涨绿跌）：盈亏 >=0 用红色，<0 用绿色
 function pnlColor(v) {
@@ -56,7 +57,7 @@ export default function Quant() {
     daily_max_buys: 20, daily_budget_amount: 100000, miss_heartbeat_sec: 120,
   })
   const [tokenInput, setTokenInput] = useState('')
-  const [knownStrategies, setKnownStrategies] = useState([...KNOWN_STRATEGIES.map((s) => s.value)])
+  const [strategyList, setStrategyList] = useState([])
   const [strategyOn, setStrategyOn] = useState({})
   const [strategyDirty, setStrategyDirty] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -66,13 +67,21 @@ export default function Quant() {
   const stateTimer = useRef(null)
   const tradesTimer = useRef(null)
 
-  const strategyRows = useMemo(() => KNOWN_STRATEGIES.filter((s) => knownStrategies.includes(s.value)), [knownStrategies])
-  const allStrategyOn = useMemo(() => strategyRows.every((s) => strategyOn[s.value]), [strategyRows, strategyOn])
+  // 按 kind 分组（form → factor → pattern），便于分别展示"形态战法 / 因子战法"
+  const strategyGroups = useMemo(() => {
+    const g = { form: [], factor: [], pattern: [] }
+    strategyList.forEach((s) => {
+      const k = g[s.kind] ? s.kind : 'form'
+      g[k].push(s)
+    })
+    return KIND_ORDER.map((kind) => ({ kind, label: KIND_LABELS[kind] || kind, items: g[kind] })).filter((x) => x.items.length)
+  }, [strategyList])
+  const allStrategyOn = useMemo(() => strategyList.length > 0 && strategyList.every((s) => strategyOn[s.id]), [strategyList, strategyOn])
   const strategyHint = useMemo(() => {
-    const onCount = strategyRows.filter((s) => strategyOn[s.value]).length
+    const onCount = strategyList.filter((s) => strategyOn[s.id]).length
     if (allStrategyOn) return '当前：全部允许'
-    return `当前：${onCount}/${strategyRows.length} 允许进入实盘`
-  }, [strategyRows, strategyOn, allStrategyOn])
+    return `当前：${onCount}/${strategyList.length} 允许进入实盘`
+  }, [strategyList, strategyOn, allStrategyOn])
 
   // 金额格式化：正数补 + 号并保留两位小数
   function fmtMoney(v) {
@@ -99,14 +108,22 @@ export default function Quant() {
       daily_max_buys: c.daily_max_buys ?? 20, daily_budget_amount: c.daily_budget_amount ?? 100000,
       miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
     })
-    if (Array.isArray(c.known_strategies) && c.known_strategies.length) setKnownStrategies(c.known_strategies)
+    // 后端 known_strategies 可能为对象数组 [{id,name,kind}]（新）或纯 ID 数组（旧），统一归一
+    let list = []
+    if (Array.isArray(c.known_strategies)) {
+      list = c.known_strategies.map((x) => {
+        if (typeof x === 'string') return { id: x, name: x, kind: 'form' }
+        return { id: x.id, name: x.name || x.id, kind: x.kind || 'form' }
+      })
+    }
+    setStrategyList(list)
     const wl = Array.isArray(c.strategies) ? c.strategies : []
     const on = {}
-    knownStrategies.forEach((v) => { on[v] = wl.length === 0 || wl.includes(v) })
+    list.forEach((v) => { on[v.id] = wl.length === 0 || wl.includes(v.id) })
     setStrategyOn(on)
     const sa = c.strategy_amounts || {}
     const ai = {}
-    knownStrategies.forEach((v) => { ai[v] = sa[v] ?? '' })
+    list.forEach((v) => { ai[v.id] = sa[v.id] ?? '' })
     setAmountsInput(ai)
     setStrategyDirty(false)
   }
@@ -174,13 +191,13 @@ export default function Quant() {
     }, '仓位纪律已保存')
   }
 
-  // 保存战法白名单与自定义金额：全部开启时传空数组表示不设白名单
+  // 保存战法白名单与自定义金额：全部开启时传空数组表示不设白名单（含因子/形态战法）
   async function saveStrategies() {
-    const values = strategyRows.filter((s) => strategyOn[s.value]).map((s) => s.value)
+    const values = strategyList.filter((s) => strategyOn[s.id]).map((s) => s.id)
     const amounts = {}
-    for (const v of knownStrategies) {
-      const n = parseFloat(amountsInput[v])
-      if (!Number.isNaN(n) && n > 0) amounts[v] = n
+    for (const v of strategyList) {
+      const n = parseFloat(amountsInput[v.id])
+      if (!Number.isNaN(n) && n > 0) amounts[v.id] = n
     }
     return patch(
       { strategies: allStrategyOn ? [] : values, strategy_amounts: amounts },
@@ -203,13 +220,14 @@ export default function Quant() {
     }
   }, [])
 
-  // 执行模式 / 委托价格 的分段切换按钮样式工厂：active 为当前选中项
+  // 执行模式 / 委托价格 的分段切换按钮样式工厂：active 为当前选中项（高饱和蓝，避免选中态过浅）
   const segBtn = (active) => ({
     marginRight: 8,
     padding: '5px 14px', borderRadius: 6, fontSize: 13, cursor: 'pointer',
-    border: active ? '1px solid #b388ff' : '1px solid #eef0f3',
-    color: active ? '#b388ff' : '#999',
-    background: active ? 'rgba(179,136,255,0.1)' : 'transparent',
+    border: active ? '1px solid #1d4ed8' : '1px solid #cfd9ec',
+    color: active ? '#ffffff' : '#5a6b86',
+    background: active ? '#1d4ed8' : 'transparent',
+    fontWeight: active ? 600 : 400,
   })
 
   // 分战法盈亏表列定义：realized_pnl 按涨跌配色渲染
@@ -338,19 +356,28 @@ export default function Quant() {
       </Card>
 
       <Card title="战法开关" style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, color: '#666', marginBottom: 12 }}>关闭的战法信号不会进入实盘链路（模拟盘不受影响）；全部开启 = 不设白名单</div>
-        {strategyRows.map((s) => (
-          <div key={s.value} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '9px 4px', borderBottom: '1px solid #ededed' }}>
-            <div>
-              <div style={{ fontSize: 13, color: '#666666' }}>{s.label}</div>
-              <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#555', marginTop: 2 }}>{s.value}</div>
+        <div style={{ fontSize: 11, color: '#666', marginBottom: 12 }}>关闭的战法信号不会进入实盘链路（模拟盘不受影响）；全部开启 = 不设白名单。因子/形态战法需先在「自动研究」页审批应用后才会出现在此处。</div>
+        {strategyGroups.length === 0 ? (
+          <div style={{ color: '#666', fontSize: 13, padding: '8px 2px' }}>暂无可用战法</div>
+        ) : strategyGroups.map((grp) => (
+          <div key={grp.kind} style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#1d4ed8', margin: '4px 0 6px', paddingLeft: 4, borderLeft: '3px solid #1d4ed8' }}>
+              {grp.label}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, justifyContent: 'flex-end' }}>
-              <Input style={{ width: 100 }} type="number" min={0} step={500} value={amountsInput[s.value] ?? ''} placeholder="全局"
-                onChange={(v) => setAmountsInput({ ...amountsInput, [s.value]: v })} />
-              <span style={{ fontSize: 11, color: '#666' }}>元/次</span>
-              <Switch value={!!strategyOn[s.value]} onChange={(v) => { setStrategyOn({ ...strategyOn, [s.value]: v }); markStrategyDirty() }} />
-            </div>
+            {grp.items.map((s) => (
+              <div key={s.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '9px 4px', borderBottom: '1px solid #ededed' }}>
+                <div>
+                  <div style={{ fontSize: 13, color: '#333' }}>{s.name}</div>
+                  <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#555', marginTop: 2 }}>{s.id}</div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, justifyContent: 'flex-end' }}>
+                  <Input style={{ width: 100 }} type="number" min={0} step={500} value={amountsInput[s.id] ?? ''} placeholder="全局"
+                    onChange={(v) => setAmountsInput({ ...amountsInput, [s.id]: v })} />
+                  <span style={{ fontSize: 11, color: '#666' }}>元/次</span>
+                  <Switch value={!!strategyOn[s.id]} onChange={(v) => { setStrategyOn({ ...strategyOn, [s.id]: v }); markStrategyDirty() }} />
+                </div>
+              </div>
+            ))}
           </div>
         ))}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'flex-end', marginTop: 10 }}>

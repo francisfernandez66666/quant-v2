@@ -35,6 +35,7 @@ export default function App() {
   const [account, setAccount] = useState('')
   const [serverOnline, setServerOnline] = useState(false)
   const [inTradeTime, setInTradeTime] = useState(null)
+  const [activeWindow, setActiveWindow] = useState(null)
   const [signalCount, setSignalCount] = useState(0)
   const [alertCount, setAlertCount] = useState(0)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -111,6 +112,7 @@ export default function App() {
       setServerOnline(true)
       setSignalCount(st.signal_count || 0)
       setInTradeTime(st.in_trade_time)
+      setActiveWindow(st.active)
     } catch (_) { setServerOnline(false) }
     try {
       const alerts = await api.fetchAlerts()
@@ -282,8 +284,8 @@ export default function App() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
               {/* 汉堡按钮：点击切换侧边栏显隐（移动端抽屉式） */}
               <div className="hamburger" onClick={() => setMenuOpen((o) => !o)}><span></span><span></span><span></span></div>
-              {/* 交易时段指示：inTradeTime 为 true 显示"交易时段"，false 显示"盘前/盘后" */}
-              <span>{inTradeTime !== null && (inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后')}</span>
+              {/* 量化活跃窗口指示：active=true 表示交易日 9:15-15:30 首尔服务器活跃；否则静默释放性能 */}
+              <span>{activeWindow !== null && (activeWindow ? '🟢 量化活跃 9:15-15:30' : '🌙 静默释放')}</span>
               {/* 后端服务连通状态文字提示 */}
               <span className="muted">{serverOnline ? '服务在线' : '离线'}</span>
             </div>

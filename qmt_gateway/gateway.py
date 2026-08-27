@@ -39,8 +39,10 @@ from ids import Idempotency  # noqa: E402
 from broker import build_broker  # noqa: E402
 from handler import ReportHandler, periodic_reconcile  # noqa: E402
 
+# 模块级日志器
 log = logging.getLogger("qmt_gateway")
 
+# 默认配置：可被外部 config JSON 覆盖；report_url 留空则不推送首尔
 DEFAULT_CONFIG = {
     "listen": "0.0.0.0:8789",
     "token": "change-me",
@@ -92,6 +94,7 @@ def lot_rule(code, side):
 class Gateway:
     def __init__(self, cfg):
         self.cfg = cfg
+        # 组装四大核心组件：本地账本 / 幂等守卫 / 交易通道 / 回报处理器
         self.store = Store(cfg["db"])
         self.ids = Idempotency(self.store)
         self.broker = build_broker(cfg)
@@ -130,6 +133,7 @@ class Gateway:
         self.handler.stop_sender()
 
     def _connect_loop(self):
+        # 后台重连线程：通道断开时持续重试 connect()，直到进程停止
         while not self._stop.is_set():
             if not self.broker.is_connected():
                 try:
@@ -170,6 +174,7 @@ class Gateway:
         return 404, {"ok": False, "err": "not found"}
 
     def _do_order(self, body):
+        # 下单主流程：参数校验 → 幂等占位 → 真实下单 → 回填
         req = body or {}
         code = str(req.get("code", "") or "")
         try:
@@ -188,6 +193,7 @@ class Gateway:
             return 400, {"ok": False, "err": "signal_id required"}
 
         side = req.get("side", "")
+        # 按板块取申报单位规则后做整手校验
         min_qty, step = lot_rule(code, side)
         if side == "卖出":
             if qty < 1:
@@ -213,6 +219,7 @@ class Gateway:
             "created_at": req.get("created_at") or "",
         }
         claimed, existing = self.ids.claim(draft)
+        # 没抢到占位 = 已下过（幂等返回）或正在下单中（409 防并发穿透）
         if not claimed:
             existing = existing or {}
             oid = existing.get("order_id") or ""
@@ -235,6 +242,7 @@ class Gateway:
         return 200, {"ok": True, "order_id": order_ref, "err": ""}
 
     def _do_cancel(self, body):
+        # 撤单：校验引用后委托给 broker，结果如实返回（失败不让首尔误判成功）
         order_ref = str((body or {}).get("order_id", "") or "")
         if not order_ref:
             return 400, {"ok": False, "err": "order_id required"}
@@ -255,10 +263,12 @@ class Gateway:
         }
 
 
-class _Handler(BaseHTTPRequestHandler):
-    gateway = None  # 类级注入，跨实例共享（ThreadingHTTPServer 每连接新建 handler）
+    class _Handler(BaseHTTPRequestHandler):
+        # 类级注入网关实例，使每个连接的处理器都能访问同一 Gateway（ThreadingHTTPServer 每连接新建 handler）
+        gateway = None  # 类级注入，跨实例共享（ThreadingHTTPServer 每连接新建 handler）
 
     def _auth_ok(self):
+        # Bearer token 双向鉴权：比对请求头与配置 token
         auth = self.headers.get("Authorization", "")
         token = self.gateway.cfg.get("token", "")
         return auth == "Bearer " + token
@@ -272,10 +282,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _dispatch(self):
+        # 统一分发入口：解析路径/读取 JSON 体 → 鉴权 → 交由 Gateway.handle 处理
         parsed = urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         body = None
         if length > 0:
+            # 有请求体时按长度读取并解析 JSON；解析失败返回 400
             raw = self.rfile.read(length)
             try:
                 body = json.loads(raw.decode("utf-8"))
@@ -302,8 +314,9 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="MiniQMT gateway (M2)")
+    def main(argv=None):
+        # 命令行入口：解析参数 → 装载配置 → 启动 HTTP 服务与网关后台线程
+        ap = argparse.ArgumentParser(description="MiniQMT gateway (M2)")
     ap.add_argument("-c", "--config", default="", help="config JSON path")
     ap.add_argument("--listen", default="", help="override listen addr")
     ap.add_argument("--verbose", action="store_true")

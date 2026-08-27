@@ -19,9 +19,58 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
+
+// knownStrategyInfo 实盘战法白名单中的单条战法元信息（供前端分组展示与切换）。
+// kind 取值：form=内置形态战法，factor=因子战法（fac_*），pattern=形态自动发现战法（pat_*）。
+type knownStrategyInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+}
+
+// knownStrategyList 返回实盘战法白名单全集：内置四形态战法 + 已应用的因子/形态战法（fac_*/pat_*）。
+// 因子/形态战法审批注入 applied_factors.json / applied_patterns.json 后即出现在实盘准入列表，
+// 可独立开关并参与实盘量化交易（与模拟盘分池口径一致）。
+// English: the full live-whitelist — the four built-in form strategies plus any approved
+// factor/pattern rules (fac_*/pat_*) loaded from applied_*.json, each toggleable for live trading.
+func (s *Server) knownStrategyList() []knownStrategyInfo {
+	list := []knownStrategyInfo{
+		{ID: "dragon", Name: "龙头战法 Dragon", Kind: "form"},
+		{ID: "double_bump", Name: "双响炮 DoubleBump", Kind: "form"},
+		{ID: "n_shape", Name: "N形超短 NShape", Kind: "form"},
+		{ID: "dragon_return", Name: "龙回头(中线) DragonReturn", Kind: "form"},
+	}
+	if s.researchDir != "" {
+		if es, err := research.ListAppliedFactorRules(s.researchDir); err == nil {
+			for _, e := range es {
+				if e.Enabled {
+					list = append(list, knownStrategyInfo{ID: e.ID, Name: e.Name, Kind: "factor"})
+				}
+			}
+		}
+		if ps, err := research.ListAppliedPatternRules(s.researchDir); err == nil {
+			for _, p := range ps {
+				if p.Enabled {
+					list = append(list, knownStrategyInfo{ID: p.ID, Name: p.Name, Kind: "pattern"})
+				}
+			}
+		}
+	}
+	return list
+}
+
+// knownStrategyIDSet 返回白名单战法 ID 集合，供保存时校验未知战法。
+func (s *Server) knownStrategyIDSet() map[string]bool {
+	set := map[string]bool{}
+	for _, k := range s.knownStrategyList() {
+		set[k.ID] = true
+	}
+	return set
+}
 
 // qmtReportMiddleware 认证网关回报（POST /api/qmt/report）：
 // §GAP2-W1 收权修复（P0）：只接受 QMT 网关 Bearer token（qmt.token，配置在账号 QMT 配置里），
@@ -374,10 +423,6 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
-// knownStrategies 实盘战法白名单全集（与 internal/strategy SignalType 常量对齐）。
-// English: the full set of strategies selectable in the live whitelist (mirrors strategy.SignalType).
-var knownStrategies = []string{"dragon", "double_bump", "n_shape", "dragon_return"}
-
 // handleGetQMTConfig 处理 GET /api/config/qmt：返回当前账号实盘配置。
 // token 只回脱敏形态（§GAP2-W2 同口径），提交脱敏哨兵或空串时后端保持原值。
 // English: GET /api/config/qmt returns the account's live-trading config with the token masked.
@@ -402,7 +447,7 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		"daily_budget_amount": cfg.DailyBudgetAmount,
 		"auto_sell":           cfg.AutoSell,
 		"miss_heartbeat_sec":  cfg.MissHeartbeatSec,
-		"known_strategies":    knownStrategies,
+		"known_strategies":    s.knownStrategyList(),
 	})
 }
 
@@ -515,19 +560,13 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	if req.Strategies != nil {
 		seen := map[string]bool{}
 		out := make([]string, 0, len(*req.Strategies))
+		knownSet := s.knownStrategyIDSet()
 		for _, v := range *req.Strategies {
 			v = strings.TrimSpace(v)
 			if v == "" || seen[v] {
 				continue
 			}
-			known := false
-			for _, k := range knownStrategies {
-				if v == k {
-					known = true
-					break
-				}
-			}
-			if !known {
+			if !knownSet[v] {
 				writeError(w, 400, "未知战法: "+v)
 				return
 			}
@@ -538,19 +577,13 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.StrategyAmounts != nil {
 		out := map[string]float64{}
+		knownSet := s.knownStrategyIDSet()
 		for k, v := range *req.StrategyAmounts {
 			k = strings.TrimSpace(k)
 			if k == "" {
 				continue
 			}
-			known := false
-			for _, s := range knownStrategies {
-				if k == s {
-					known = true
-					break
-				}
-			}
-			if !known {
+			if !knownSet[k] {
 				writeError(w, 400, "未知战法: "+k)
 				return
 			}

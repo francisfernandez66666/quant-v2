@@ -259,8 +259,16 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 		klines, err = s.market.GetTencentMinuteKLine(code, scale, count)
 	}
 	if err != nil || len(klines) == 0 {
+		reason := "该标的暂无分时数据"
+		if err != nil {
+			reason = "分时获取失败：" + err.Error()
+		} else if s.dc == nil && s.market == nil {
+			reason = "行情数据源未初始化（服务未接入行情链路）"
+		} else if !data.IsTradingWindow(time.Now()) && !data.IsActiveSession(time.Now()) {
+			reason = "非交易时段：无当日分时行情，开盘后自动恢复"
+		}
 		log.Printf("[server] /api/minute %s 获取失败: %v", code, err)
-		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "prev_close": 0, "points": []fixMinutePoint{}})
+		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "prev_close": 0, "points": []fixMinutePoint{}, "error": reason})
 		return
 	}
 
@@ -386,21 +394,19 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		finalCount = len(dash.FinalSignals)
 	}
 	now := time.Now()
-	// 交易时段判定：1=早盘(9:00-11:30)，3=午盘(13:00-15:00)，0=盘前，2=午间休市/盘后
-	switch {
-	case now.Hour() >= 9 && now.Hour() < 11 || (now.Hour() == 11 && now.Minute() < 30):
-		session = 1
-	case now.Hour() >= 13 && now.Hour() < 15:
-		session = 3
-	case now.Hour() < 9:
-		session = 0
-	default:
-		session = 2
-	}
+	// 交易时段判定统一走 data 包（含周末/休市）：9:15 集合竞价开盘，15:30 收盘后进入静默释放期。
+	// session 枚举：0=盘前 1=上午盘 2=午间 3=下午盘 4=盘后 5=休市。
+	// in_trade_time = 上午/下午交易时段；active = 完整活跃覆盖窗 9:15~15:30（首尔服务器此间活跃、其余静默释放性能）。
+	cur := data.CurrentSession(now)
+	session = int(cur)
+	inTrade := cur == data.SessionMorningTrade || cur == data.SessionAfternoonTrade
+	active := data.IsFullTradingHours(now)
 	writeJSON(w, 200, map[string]interface{}{
 		"uptime":        uptime,
 		"session":       session,
-		"in_trade_time": session == 1 || session == 3,
+		"session_label": cur.String(),
+		"in_trade_time": inTrade,
+		"active":        active,
 		"signal_count":  finalCount,
 		"scan_stats": map[string]interface{}{
 			"total_stocks":     rawCount,

@@ -28,6 +28,7 @@ CN_TZ = timezone(timedelta(hours=8))
 
 
 def new_store():
+    # 创建临时 SQLite 文件并立即删除，得到“存在路径但空库”的 Store（测试隔离用）
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     os.unlink(path)
@@ -277,6 +278,7 @@ class TestGatewayHTTP(unittest.TestCase):
         self.server.server_close()
 
     def _req(self, method, path, body=None, token="tk"):
+        # 构造一次本地 HTTP 请求，带 JSON 体与 Bearer 鉴权，返回 (status, json)
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)

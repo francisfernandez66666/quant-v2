@@ -66,3 +66,6 @@ mobile/app/src/main/assets/
 
 # §GAP2-W1 签名口令文件（随机生成，仅本机）
 mobile/keystore.pass
+
+# §安全：QMT 网关本地配置（含 token/账户，禁止入库）
+qmt_gateway/config.xt.json

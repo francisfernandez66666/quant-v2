@@ -28,10 +28,12 @@ HEARTBEAT_SEC = 60        # §ROBUST 上行心跳间隔（尽力而为，不入�
 
 def post_report(base_url, token, payload, retries=3):
     """推送一条回报到首尔 /api/qmt/report。失败按退避重试。返回 bool。"""
+    # 拼接首尔上报地址并序列化 payload 为 JSON 字节流
     url = base_url.rstrip("/") + "/api/qmt/report"
     data = json_dumps(payload).encode("utf-8")
     last_err = None
     for attempt in range(max(1, retries)):
+        # 构造 POST 请求，带 JSON 头与 Bearer 鉴权
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + token)
@@ -62,6 +64,7 @@ class ReportHandler:
         self.report_url = report_url
         self.report_token = report_token
         self.user_id = user_id
+        # 断线标记：供首尔侧感知通道状态
         self.disconnected = False
         # §G5 连续空快照计数（对账清空守卫）
         self._empty_snaps = 0
@@ -93,6 +96,7 @@ class ReportHandler:
     def _send_loop(self):
         """持久化 outbox 消费循环：按序取最旧一条 → 发送 → 成功出队；失败指数退避无限重试。
         进程重启后自动从库里续发上次未完成的回报（配合首尔幂等，重发安全）。"""
+        # backoff：失败重试退避基数，每失败一次翻倍（封顶 30s）
         backoff = 2
         while not self._stop.is_set():
             item = self.store.outbox_oldest()
@@ -167,12 +171,14 @@ class ReportHandler:
     @staticmethod
     def _status(code):
         """xtquant 委托状态码 → 中文（简化为 已报/已成/已撤/已废）。"""
+        # xtquant 状态码常量映射表：键为数字状态码，值为中文语义
         m = {48: "未报", 49: "待报", 50: "已报", 51: "已报待撤", 52: "部成待撤", 53: "部撤",
              54: "已撤", 55: "部成", 56: "已成", 57: "废单", 255: "未知"}
         return m.get(int(code or 0), "已报")
 
     # ── 事件落库 + 推送 ──
     def on_order(self, ev):
+        # 无 signal_id 的委托忽略（无法归因/幂等）；否则落库并推送首尔
         if not ev.get("signal_id"):
             log.info("[handler] order without signal_id, skip: %s", ev)
             return
@@ -180,6 +186,7 @@ class ReportHandler:
         self._push({"type": "order", **ev})
 
     def on_trade(self, ev):
+        # 成交先落库并去重；重复重放不推送，避免持仓翻倍
         pos, is_dup = self.store.apply_fill(ev)
         if is_dup:
             log.warning("[handler] duplicate trade replay ignored: %s %s %s@%s x%s",
@@ -210,6 +217,7 @@ class ReportHandler:
         self.on_disconnected()
 
     def _push(self, payload):
+        # 未配置上报地址则直接丢弃（本地联调场景）
         if not self.report_url:
             return
         payload["user_id"] = self.user_id

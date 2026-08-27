@@ -78,3 +78,60 @@ body {
 @media (min-width: 1600px) {
   .app-main .page > * { max-width: 1500px; }
 }
+
+/* ============================================================
+   主题增强：提升整体饱和度与选中态对比度（防止选中 tab/按钮过浅刺眼）。
+   通过覆盖 TDesign 品牌色阶梯实现，组件级选中态自动跟随。
+   ============================================================ */
+:root {
+  /* 主品牌色改为更鲜明的蓝，提升所有 primary 按钮/链接/选中的辨识度 */
+  --td-brand-color: #1d4ed8;
+  --td-brand-color-hover: #2f5fe0;
+  --td-brand-color-active: #1438a6;
+  --td-brand-color-focus: #c7d4ff;
+  /* 选中态浅色底：由原本极淡的 #f2f3ff 提升为更饱和的蓝调，缓解"选中像没选" */
+  --td-brand-color-light: #d6e1ff;
+  --td-brand-color-light-hover: #c2d2ff;
+  /* 品牌色阶梯整体微调，使浅色档也具备可见饱和度 */
+  --td-brand-color-1: #eef2ff;
+  --td-brand-color-2: #d6e1ff;
+  --td-brand-color-3: #b3c6ff;
+  --td-brand-color-4: #8aa6ff;
+  --td-brand-color-5: #5f80f7;
+  --td-brand-color-6: #3563e9;
+  --td-brand-color-7: #1d4ed8;
+  --td-brand-color-8: #1438a6;
+  --td-brand-color-9: #0f2a7a;
+  --td-brand-color-10: #0a1a4d;
+  /* 成功/警示色也略提饱和，避免通篇发灰 */
+  --td-success-color: #00a870;
+  --td-warning-color: #e37318;
+  --td-error-color: #e34d59;
+}
+
+/* 侧边栏选中项：实色品牌底 + 白字，高对比、不刺眼 */
+.app-aside .t-menu__item.t-is-active,
+.app-aside .t-menu__item.t-is-active.t-is-opened,
+.app-aside .t-menu__item.t-is-active:not(.t-is-opened) {
+  background-color: var(--td-brand-color) !important;
+  color: #ffffff !important;
+}
+.app-aside .t-menu__item.t-is-active .t-icon { color: #ffffff !important; }
+.app-aside .t-menu__item:hover:not(.t-is-active) {
+  background-color: var(--td-brand-color-light) !important;
+}
+
+/* 表格选中行高对比 */
+.t-table__row--active > td,
+.t-table tr.t-is-active > td { background-color: var(--td-brand-color-light) !important; }
+
+/* Tabs 选中标签：底部指示与文字更鲜明 */
+.t-tabs__nav-item.t-is-active { color: var(--td-brand-color) !important; font-weight: 600; }
+.t-tabs__bar.t-is-top::after,
+.t-tabs__nav-item.t-is-active::after { background-color: var(--td-brand-color) !important; }
+
+/* 全局画布与侧栏底色略提饱和，避免大面空白发灰 */
+body { background: #e8eefb; }
+.app-aside { background: #eef3fd; border-right: 1px solid #c9d8f5; }
+.app-header { border-bottom: 1px solid #d4e0f4; }
+.t-card { border-color: #cdddf6 !important; box-shadow: 0 1px 6px rgba(29, 78, 216, 0.10) !important; }

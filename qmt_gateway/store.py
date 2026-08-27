@@ -24,8 +24,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 # 占位 order_id 前缀：pending:<signal_id>（下单前占位）；真实委托号落库后不可被占位值覆盖
-CN_TZ = timezone(timedelta(hours=8))
-FILL_DEDUP_WINDOW_SEC = 120
+CN_TZ = timezone(timedelta(hours=8))  # 北京时间（UTC+8），用于时间戳字段统一
+FILL_DEDUP_WINDOW_SEC = 120  # 成交去重时间窗（秒）
 
 
 def is_placeholder_order_id(oid):
@@ -51,6 +51,7 @@ class Store:
 
     def __init__(self, path):
         self.path = path
+        # 全部读写统一持 RLock，保证多线程并发安全
         self._lock = threading.RLock()
         # 已存在的库不再建表（保留数据）
         need_init = not os.path.exists(path)
@@ -122,8 +123,10 @@ class Store:
         调用方据此实现幂等或拒绝进行中请求。崩溃残留的 pending 行会永久阻塞该 signal_id
         （安全侧失效：宁可拒绝也不重复真实下单），启动时由 Gateway 打警告日志。
         """
+        # 取出幂等键 signal_id，作为占位行的唯一约束
         sid = draft.get("signal_id", "")
         with self._lock:
+            # 以 signal_id UNIQUE 做原子 INSERT；冲突则啥也不做（占位失败=已被抢占）
             cur = self._conn.execute(
                 """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at)
                    VALUES(?,?,?,?,?,?,?,?)
@@ -163,9 +166,11 @@ class Store:
         §G2 语义：status/price/qty/created_at 随最新事件刷新；order_id 只在「存量是占位
         且新值是真实委托号」时替换一次（pending:→seq:→交易所委托号），真实委托号互不覆盖。
         """
+        # 取 signal_id 与待写入的 order_id（可能是占位串或真实委托号）
         sid = order.get("signal_id", "")
         new_oid = str(order.get("order_id", "") or "")
         with self._lock:
+            # 查现存行：无则插入新订单，有则按等级规则升级 order_id
             row = self._conn.execute(
                 "SELECT * FROM orders WHERE signal_id = ?", (sid,)
             ).fetchone()
@@ -186,6 +191,7 @@ class Store:
                 )
                 self._conn.commit()
                 return True
+            # 仅在「新引用等级高于存量（占位→seq→真实号）」时才替换 order_id，真实号互不覆盖
             final_oid = row["order_id"]
             if order_id_rank(new_oid) > order_id_rank(final_oid):
                 final_oid = new_oid
@@ -270,10 +276,12 @@ class Store:
 
         返回 (position_dict|None, is_duplicate:bool)。重复回报不改动持仓、不重复入 fills。
         """
+        # 取成交方向，并计算去重时间窗下界（早于该时间的重放允许）
         fill_side = f.get("side", "")
         cutoff = (datetime.now(CN_TZ) - timedelta(seconds=FILL_DEDUP_WINDOW_SEC)).strftime(
             "%Y-%m-%dT%H:%M:%S")
         with self._lock:
+            # 先判重：窗口内相同 (order_id,side,price,qty) 视为通道重放，直接返回不改动
             if self._fill_is_duplicate(f, cutoff):
                 row = self._conn.execute(
                     "SELECT * FROM real_positions WHERE ts_code = ?", (f["code"],)
@@ -341,10 +349,12 @@ class Store:
 
         注意：空集合的删除语义由调用方（handler.on_positions）守卫——连续空快照才接受清空。
         """
+        # 收集本次对账中的全部 ts_code，作为“应保留”集合
         codes = set()
         with self._lock:
             for p in positions:
                 codes.add(p["ts_code"])
+                # 逐条 upsert 持仓
                 self.upsert_position(p)
             placeholders = ",".join("?" * len(codes))
             if placeholders:
