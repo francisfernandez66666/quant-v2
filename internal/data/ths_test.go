@@ -1,3 +1,4 @@
+// ths_test.go — 同花顺实时行情解析单元测试：验证昨收推算、异常值保护及字段布局。
 package data
 
 import (
@@ -5,6 +6,7 @@ import (
 	"testing"
 )
 
+// toJSONArray 将任意切片序列化为 JSON 数组字符串（测试辅助）。
 func toJSONArray(v []interface{}) string {
 	b, err := json.Marshal(v)
 	if err != nil {

@@ -7,8 +7,8 @@ package indicator
 type KDJPoint struct {
 	RSV float64 // 未成熟随机值
 	// English: RSV is the immature stochastic value.
-	K float64
-	D float64
+	K float64 // K 值（慢速随机，由 RSV 平滑递推）
+	D float64 // D 值（慢速随机，由 K 平滑递推）
 	J float64 // J = 3K − 2D
 }
 

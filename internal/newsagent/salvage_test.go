@@ -1,3 +1,4 @@
+// salvage_test.go — Stage0 批量响应两段式/逐对象 JSON 抢救解析（salvageStage0Objects）的单元测试。
 package newsagent
 
 import (

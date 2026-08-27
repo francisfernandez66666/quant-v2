@@ -1,3 +1,4 @@
+// enrich.go — 新闻正文并发抓取回填（EnrichContents）：抓取失败保留原摘要、不阻断归因流水线。
 package newsagent
 
 import (

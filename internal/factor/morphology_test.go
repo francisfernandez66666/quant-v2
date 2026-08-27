@@ -26,6 +26,7 @@ func mkMorphSeries() *StockSeries {
 	return s
 }
 
+// TestVolSurge 验证放量倍数算子：预热期 NaN，后半段放量后相对 20 日均量比值合理。
 func TestVolSurge(t *testing.T) {
 	s := mkMorphSeries()
 	vals := volSurge(s)
@@ -43,6 +44,7 @@ func TestVolSurge(t *testing.T) {
 	}
 }
 
+// TestVolShrink 验证缩量比算子：预热期 NaN，恒量段 5 日均量/20 日均量比值约 1。
 func TestVolShrink(t *testing.T) {
 	s := mkMorphSeries()
 	vals := volShrink(s)
@@ -56,6 +58,7 @@ func TestVolShrink(t *testing.T) {
 	}
 }
 
+// TestPriceBreakout 验证新高突破算子：预热期 NaN，后半段持续创新高产生突破信号。
 func TestPriceBreakout(t *testing.T) {
 	s := mkMorphSeries()
 	vals := priceBreakout(20)(s)
@@ -75,6 +78,7 @@ func TestPriceBreakout(t *testing.T) {
 	}
 }
 
+// TestDrawdown20 验证 20 日回撤算子：预热期 NaN，创新高后回撤趋近 0。
 func TestDrawdown20(t *testing.T) {
 	s := mkMorphSeries()
 	vals := drawdown20(s)
@@ -94,6 +98,7 @@ func TestDrawdown20(t *testing.T) {
 	}
 }
 
+// TestBullAlign 验证均线多头排列算子：预热期 NaN，上涨趋势段出现多头排列信号。
 func TestBullAlign(t *testing.T) {
 	s := mkMorphSeries()
 	vals := bullAlign(s)

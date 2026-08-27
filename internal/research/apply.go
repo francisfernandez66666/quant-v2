@@ -48,13 +48,20 @@ func ApplyWeights(dataDir string, c *store.Candidate) error {
 // （FactorRule is the live factor-strategy rule (E6), persisted from an approved factor candidate and
 // injected into the engine runner.）
 type FactorRule struct {
-	Factors      []string           `json:"factors"`
-	Weights      map[string]float64 `json:"weights"`
-	Directions   map[string]int     `json:"directions"`
-	BuyThreshold float64            `json:"buy_threshold"`
-	Horizon      int                `json:"horizon"`
-	IR           float64            `json:"ir"`
-	Excess       float64            `json:"excess"`
+	// 因子 ID 列表（复合分的组成因子）
+	Factors []string `json:"factors"`
+	// factorID → 权重（L1 归一化）
+	Weights map[string]float64 `json:"weights"`
+	// factorID → 方向（+1 看多 / -1 看空）
+	Directions map[string]int `json:"directions"`
+	// 触发阈值：复合分高于此值才产生买入信号
+	BuyThreshold float64 `json:"buy_threshold"`
+	// 前瞻天数
+	Horizon int `json:"horizon"`
+	// 全样本 IR
+	IR float64 `json:"ir"`
+	// 回测超额（avg_excess）
+	Excess float64 `json:"excess"`
 }
 
 // AppliedFactorEntry 战法库中的一条已应用因子战法（E6 + 战法库）。

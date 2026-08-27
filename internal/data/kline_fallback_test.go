@@ -1,3 +1,4 @@
+// kline_fallback_test.go — 腾讯/同花顺 K线解析单元测试：验证字段序、分钟K时间格式、脏数据剔除与降级链防护。
 package data
 
 import (

@@ -1,3 +1,4 @@
+// trade_time_test_hibernate_test.go — 下一活跃交易时段时长单元测试：覆盖盘后、跨周末及开盘前边界。
 package data
 
 import (
@@ -5,6 +6,7 @@ import (
 	"time"
 )
 
+// TestDurationToNextActiveSession 验证下一活跃交易时段时长的跨周末/盘后/盘前边界计算。
 func TestDurationToNextActiveSession(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	// 周三 20:00 → 次日 8:30 = 12.5h

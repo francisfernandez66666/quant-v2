@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// TestSnapshotPersistAndRestore 验证快照原子落盘、同交易日新实例恢复及陈旧度计算。
 func TestSnapshotPersistAndRestore(t *testing.T) {
 	dir := t.TempDir()
 	f := NewFetcher([]string{"600000"}, &MarketAPI{}, nil)
@@ -32,6 +33,7 @@ func TestSnapshotPersistAndRestore(t *testing.T) {
 	}
 }
 
+// TestSnapshotCrossDayDropped 验证跨交易日快照不被新实例恢复。
 func TestSnapshotCrossDayDropped(t *testing.T) {
 	dir := t.TempDir()
 	f := NewFetcher(nil, &MarketAPI{}, nil)
@@ -44,6 +46,7 @@ func TestSnapshotCrossDayDropped(t *testing.T) {
 	}
 }
 
+// TestStalenessZeroWhenNeverFetched 验证从未采集时 Staleness 返回 0。
 func TestStalenessZeroWhenNeverFetched(t *testing.T) {
 	f := NewFetcher(nil, &MarketAPI{}, nil)
 	if f.Staleness() != 0 {

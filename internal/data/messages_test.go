@@ -1,3 +1,4 @@
+// messages_test.go — 消息中心持久化单元测试：验证按代码刷新名称、清除做空方向消息及墓碑/隔离逻辑。
 package data
 
 import (

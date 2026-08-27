@@ -1,3 +1,4 @@
+// KDJ 指标单元测试：校验 RSV/K/D/J 序列、J=3K−2D 恒等式与中性区间 RSV=50。
 package indicator
 
 import (

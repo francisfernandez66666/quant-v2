@@ -30,9 +30,12 @@ type PushGateway interface {
 // （WebhookGateway posts each message to a configured URL. It is vendor-agnostic and suitable for a
 // self-hosted APK relay or a generic JSON push gateway; vendor channels can terminate at this URL.）
 type WebhookGateway struct {
-	URL       string        // 推送接收地址
-	Timeout   time.Duration // HTTP 请求超时（默认 5s）
-	UserAgent string        // 可选的 User-Agent 标识
+	// 推送接收地址
+	URL       string
+	// HTTP 请求超时（默认 5s）
+	Timeout   time.Duration
+	// 可选的 User-Agent 标识
+	UserAgent string
 }
 
 // NewWebhookGateway 创建通用推送网关，url 为推送接收地址。

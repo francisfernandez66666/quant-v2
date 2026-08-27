@@ -18,11 +18,16 @@ import (
 // addressed by a fixed alias (default quant_owner) that the APK sets on startup. The
 // appKey/masterSecret come from config — server-side only, never bundled into the APK.）
 type JPushGateway struct {
-	AppKey  string        // 极光 AppKey
-	Secret  string        // 极光 Master Secret（REST 鉴权）
-	Alias   string        // 推送目标别名（空则默认 quant_owner）
-	URL     string        // 极光推送地址（默认 https://api.jpush.cn/v3/push）
-	Timeout time.Duration // HTTP 超时（默认 5s）
+	// 极光 AppKey
+	AppKey  string
+	// 极光 Master Secret（REST 鉴权）
+	Secret  string
+	// 推送目标别名（空则默认 quant_owner）
+	Alias   string
+	// 极光推送地址（默认 https://api.jpush.cn/v3/push）
+	URL     string
+	// HTTP 超时（默认 5s）
+	Timeout time.Duration
 }
 
 // NewJPushGateway 创建极光推送网关。
@@ -35,20 +40,31 @@ func NewJPushGateway(appKey, secret, alias string) *JPushGateway {
 
 // jpushPayload 极光 v3 推送请求体（自定义推送，platform=all，audience 按别名定位设备）。
 type jpushPayload struct {
+	// 推送平台（apns/极光）
 	Platform string `json:"platform"`
+	// 推送目标（广播/别名/标签）
 	Audience struct {
+		// 别名
 		Alias []string `json:"alias"`
 	} `json:"audience"`
+	// 极光推送通知体
 	Notification struct {
+		// 通知正文
 		Alert   string `json:"alert"`
 		Android struct {
+			// 通知正文
 			Alert     string `json:"alert"`
+			// 通知标题
 			Title     string `json:"title"`
+			// 安卓渠道 ID
 			ChannelID string `json:"channel_id"`
+			// 优先级（Android）
 			Priority  int    `json:"priority"`
 		} `json:"android"`
 	} `json:"notification"`
+	// 安卓推送选项
 	Options struct {
+		// 离线保留时长(秒)
 		TimeToLive int64 `json:"time_to_live"`
 	} `json:"options"`
 }

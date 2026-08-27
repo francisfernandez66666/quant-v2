@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+// TestInviteCodeFlow 验证邀请码注册全链路：无码/错码/重码拒绝、有效码一次性消费、临时号同样需码。
 func TestInviteCodeFlow(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)

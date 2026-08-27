@@ -1,3 +1,4 @@
+// MACD 指标单元测试：校验 DIF/DEA/Bar、柱状恒等式 Bar=2×(DIF−DEA) 与边界。
 package indicator
 
 import (

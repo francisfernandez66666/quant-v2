@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// TestMessageScopeVisibility 验证消息中心账户隔离：公共全员可见、私有仅归属可见、Sync 刷新保留作用域。
 func TestMessageScopeVisibility(t *testing.T) {
 	s := NewMessageStore("")
 	now := time.Now()

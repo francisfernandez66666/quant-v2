@@ -29,16 +29,26 @@ import (
 // User 用户账号记录。
 // （User is a user account record.）
 type User struct {
-	ID           string   `json:"id"`                   // 用户唯一标识（u_ 前缀）
-	Username     string   `json:"username"`             // 登录用户名
-	PasswordHash string   `json:"password_hash"`        // bcrypt 密码哈希（临时账户为空）
-	Token        string   `json:"token,omitempty"`      // 认证令牌
-	TokenExp     int64    `json:"token_exp,omitempty"`  // 令牌过期 Unix 时间戳（0 表示永不过期）
-	Role         string   `json:"role,omitempty"`       // 角色：admin=管理员 / user=普通用户（空按 user 处理）
-	Perms        []string `json:"perms,omitempty"`      // 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
-	Enabled      bool     `json:"enabled,omitempty"`    // 账号是否启用（默认 true；禁用后登录/令牌失效）
-	CreatedAt    int64    `json:"created_at"`           // 创建时间 Unix 时间戳
-	ExpiresAt    int64    `json:"expires_at,omitempty"` // 账号有效期截止 Unix 时间戳（0=永久）
+	// 用户唯一标识（u_ 前缀）
+	ID           string   `json:"id"`
+	// 登录用户名
+	Username     string   `json:"username"`
+	// bcrypt 密码哈希（临时账户为空）
+	PasswordHash string   `json:"password_hash"`
+	// 认证令牌
+	Token        string   `json:"token,omitempty"`
+	// 令牌过期 Unix 时间戳（0 表示永不过期）
+	TokenExp     int64    `json:"token_exp,omitempty"`
+	// 角色：admin=管理员 / user=普通用户（空按 user 处理）
+	Role         string   `json:"role,omitempty"`
+	// 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
+	Perms        []string `json:"perms,omitempty"`
+	// 账号是否启用（默认 true；禁用后登录/令牌失效）
+	Enabled      bool     `json:"enabled,omitempty"`
+	// 创建时间 Unix 时间戳
+	CreatedAt    int64    `json:"created_at"`
+	// 账号有效期截止 Unix 时间戳（0=永久）
+	ExpiresAt    int64    `json:"expires_at,omitempty"`
 }
 
 // 角色常量。
@@ -89,21 +99,28 @@ func (u *User) IsAdmin() bool {
 // ConfigEntry 用户配置键值项。
 // （ConfigEntry is a user-config key-value entry.）
 type ConfigEntry struct {
-	Key    string `json:"key"`     // 配置键名
-	Value  string `json:"value"`   // 配置值
-	UserID string `json:"user_id"` // 所属用户 ID（系统级配置用 "system"）
+	// 配置键名
+	Key    string `json:"key"`
+	// 配置值
+	Value  string `json:"value"`
+	// 所属用户 ID（系统级配置用 "system"）
+	UserID string `json:"user_id"`
 }
 
 // DB 认证数据库结构（用户与配置列表）。
 // （DB is the authentication database structure: user and config lists.）
 type DB struct {
-	Users   []User        `json:"users"`   // 全部用户列表
-	Configs []ConfigEntry `json:"configs"` // 用户/系统级配置项列表
+	// 全部用户列表
+	Users   []User        `json:"users"`
+	// 用户/系统级配置项列表
+	Configs []ConfigEntry `json:"configs"`
 	// §GAP2-W2 邀请码注册（owner 决策 D7）：公网开放注册/临时号是隔离违例的放大器，
 	// 改为管理员签发、一次性使用的邀请码制。English: §GAP2-W2 invite-code registration (decision D7).
+	// 邀请码列表
 	Invites map[string]*Invite `json:"invites,omitempty"`
 	// SchemaVersion §A1 库结构版本：兼容迁移只跑一次。此前迁移每次启动无条件把
 	// Enabled=false 改回 true——管理员禁用的账号重启即复活，封禁形同虚设。
+	// 数据 schema 版本
 	SchemaVersion int `json:"schema_version,omitempty"`
 }
 
@@ -277,10 +294,14 @@ var ErrInvalidInvite = errors.New("邀请码无效或已被使用")
 // Invite 邀请码：管理员签发、一次性使用；记录使用者便于审计。
 // English: an invite code issued by admin, single-use, with usage audit fields.
 type Invite struct {
-	Code      string `json:"code"`              // 邀请码（QT+16hex）
-	CreatedAt int64  `json:"created_at"`        // 签发时间
-	UsedBy    string `json:"used_by,omitempty"` // 使用者账号 ID（空=未用）
-	UsedAt    int64  `json:"used_at,omitempty"` // 使用时间
+	// 邀请码（QT+16hex）
+	Code      string `json:"code"`
+	// 签发时间
+	CreatedAt int64  `json:"created_at"`
+	// 使用者账号 ID（空=未用）
+	UsedBy    string `json:"used_by,omitempty"`
+	// 使用时间
+	UsedAt    int64  `json:"used_at,omitempty"`
 }
 
 // CreateInvite 签发一个新邀请码（仅 admin 路径调用）。

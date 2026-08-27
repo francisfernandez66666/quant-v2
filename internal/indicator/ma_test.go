@@ -1,3 +1,4 @@
+// 均线（SMA/EMA）单元测试：与 golden 数据比对、手算校验与边界（窗口超长/空输入/参数非法）。
 package indicator
 
 import "testing"
@@ -62,4 +63,5 @@ func TestEMAEdge(t *testing.T) {
 	}
 }
 
+// isNaN 判断浮点是否为 NaN（v != v 仅对 NaN 成立），测试辅助。
 func isNaN(v float64) bool { return v != v }

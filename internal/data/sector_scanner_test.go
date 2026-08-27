@@ -1,3 +1,4 @@
+// sector_scanner_test.go — 板块扫描模糊匹配单元测试：验证 LLM 噪声板块名回退到包含/子串匹配真实板块及其代码。
 package data
 
 import (

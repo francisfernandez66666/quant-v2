@@ -1,3 +1,4 @@
+// classifier.go — Stage0/1 合并归因分类、关键词兜底初筛与 LLM 批量响应的容错解析（抗推理模型 JSON 抖动）。
 package newsagent
 
 import (
@@ -102,11 +103,14 @@ const combinedBodyLimit = 300
 // combinedJudge 合并调用的单条判定结果。（combinedJudge is one judgement produced by the combined call.）
 // English: combinedJudge is one judgement produced by the combined call.
 type combinedJudge struct {
-	Official bool // 是否为官方/权威来源（非机构观点/互动/海外盘面）
+	// 是否为官方/权威来源（非机构观点/互动/海外盘面）
+	Official bool
 	// English: whether from an official/authoritative source (not institution opinion / interactive / overseas tape)
-	Material bool // 是否有投资参考价值
+	// 是否有投资参考价值
+	Material bool
 	// English: whether it has investment reference value
-	CorrectedTitle string // 标题党校正标题（为空表示标题忠于正文）
+	// 标题党校正标题（为空表示标题忠于正文）
+	CorrectedTitle string
 	// English: clickbait-corrected title (empty means the title matches the body)
 }
 
@@ -203,9 +207,13 @@ var trailingJunkRe = regexp.MustCompile(`"\s*[\)']+\s*([,}\]]|$)`)
 // stage0Judge 单条 Stage0 判定对象结构体。（matches a single Stage0 judgement object shape.）
 // English: stage0Judge is the shape of a single Stage0 judgement object.
 type stage0Judge struct {
+	// 序号
 	Index     flexInt  `json:"index"`
+	// 分类（题材/行业/个股/板块）
 	Category  string   `json:"category"`
+	// 是否实质利好材料（区别于噪音）
 	Material  flexBool `json:"material"`
+	// 是否已做中性归零/校正
 	Corrected string   `json:"corrected_title"`
 }
 

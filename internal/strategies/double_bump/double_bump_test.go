@@ -1,3 +1,4 @@
+// 双凸战法单元测试：评分（EvaluateReal）、形态阶段（DetectPhase）、失效反转（CheckIDFReturn）、离场（CheckExit）等。
 package double_bump
 
 import (

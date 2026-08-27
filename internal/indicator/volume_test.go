@@ -1,3 +1,4 @@
+// 量能/收益率类指标单元测试：成交量 MA、store.Bar→序列 提取、简单/对数收益与滚动波动率。
 package indicator
 
 import (

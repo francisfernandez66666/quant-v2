@@ -266,6 +266,7 @@ func cmdScanDepth(db *store.DB, args []string) {
 	log.Printf("候选 #%d 已入库：%s", id, reason)
 }
 
+// supportCount 统计给定大单列表中"托单"（支撑大单）的数量。
 func supportCount(orders []data.BigOrder) int {
 	n := 0
 	for _, o := range orders {
@@ -276,6 +277,7 @@ func supportCount(orders []data.BigOrder) int {
 	return n
 }
 
+// sortedKeys 返回 map 的 key 升序切片（保证候选输出顺序确定性）。
 func sortedKeys(m map[string]depthPerStock) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -295,6 +297,7 @@ func localCode(code string) string {
 	return code
 }
 
+// sortedIDs 返回因子权重 map 的 key 升序切片（保证日志输出顺序确定性）。
 func sortedIDs(m map[string]float64) []string {
 	ids := make([]string, 0, len(m))
 	for k := range m {
@@ -304,6 +307,7 @@ func sortedIDs(m map[string]float64) []string {
 	return ids
 }
 
+// defaultFactorPool 返回默认因子池（7 大类精选因子，逗号分隔）。
 func defaultFactorPool() string {
 	return "EP_ttm,BP,ROE,YoyNetProfit,SUE,Mom20,STO20"
 }

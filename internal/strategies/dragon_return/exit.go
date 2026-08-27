@@ -1,3 +1,4 @@
+// 龙回头战法离场判定：止损/止盈T1T2/移动止损/破位/超期等出场逻辑（CheckExit）。
 package dragon_return
 
 import (

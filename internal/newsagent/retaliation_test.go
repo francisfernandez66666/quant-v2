@@ -1,3 +1,4 @@
+// retaliation_test.go — 涉外政策反制事件推导（DeriveRetaliation）的单元测试。
 package newsagent
 
 import (

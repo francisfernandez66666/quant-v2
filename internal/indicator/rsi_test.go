@@ -1,3 +1,4 @@
+// RSI 指标单元测试：校验 RSI14 与 golden 数据、单边市（全涨/全跌）与边界。
 package indicator
 
 import (

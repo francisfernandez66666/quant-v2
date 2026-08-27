@@ -26,11 +26,16 @@ const (
 // Message 推送消息体，包含级别、标题、正文和可选的信号对象。
 // （Message is a push payload with level, title, content and an optional signal object.）
 type Message struct {
-	Level   AlertLevel       `json:"level"`            // 告警级别
-	Title   string           `json:"title"`            // 消息标题
-	Content string           `json:"content"`          // 消息正文
-	Signal  *strategy.Signal `json:"signal,omitempty"` // 关联的策略信号（可选）
-	Alias   string           `json:"alias,omitempty"`  // §GAP2-W2 目标设备别名覆盖（空=网关默认别名；私有告警按归属账号路由）
+	// 告警级别
+	Level   AlertLevel       `json:"level"`
+	// 消息标题
+	Title   string           `json:"title"`
+	// 消息正文
+	Content string           `json:"content"`
+	// 关联的策略信号（可选）
+	Signal  *strategy.Signal `json:"signal,omitempty"`
+	// §GAP2-W2 目标设备别名覆盖（空=网关默认别名；私有告警按归属账号路由）
+	Alias   string           `json:"alias,omitempty"`
 }
 
 // Notifier 推送器，管理 WebSocket 客户端和 Webhook URL 列表。

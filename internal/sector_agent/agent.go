@@ -14,17 +14,28 @@ import (
 // （VerifiedSector is a verified sector: direction, score, RPS rank, constituent stocks and sector
 // phase (strengthening/sustaining/retreating/bouncing).）
 type VerifiedSector struct {
-	Name       string   `json:"name"`                  // 板块名称
-	Direction  string   `json:"direction"`             // 板块方向（利好/利空）
-	Score      float64  `json:"score"`                 // 板块评分
-	RPSRank    int      `json:"rps_rank,omitempty"`    // 板块 RPS 排名位次
-	RPS20      float64  `json:"rps20,omitempty"`       // 板块20日RPS（用于龙回头龙性判定）
-	Phase      string   `json:"phase,omitempty"`       // 板块状态：加强/持续/退潮/反弹
-	Flow       float64  `json:"flow,omitempty"`        // 主力净流入(元)
-	ChangePct  float64  `json:"change_pct,omitempty"`  // 板块当日涨跌幅(%)
-	LimitupCnt int      `json:"limitup_cnt,omitempty"` // 板块内涨停家数
-	Stocks     []string `json:"stocks,omitempty"`      // 评分靠前的可操作成分股代码
-	Reason     string   `json:"reason,omitempty"`      // 验证结论/理由
+	// 板块名称
+	Name       string   `json:"name"`
+	// 板块方向（利好/利空）
+	Direction  string   `json:"direction"`
+	// 板块评分
+	Score      float64  `json:"score"`
+	// 板块 RPS 排名位次
+	RPSRank    int      `json:"rps_rank,omitempty"`
+	// 板块20日RPS（用于龙回头龙性判定）
+	RPS20      float64  `json:"rps20,omitempty"`
+	// 板块状态：加强/持续/退潮/反弹
+	Phase      string   `json:"phase,omitempty"`
+	// 主力净流入(元)
+	Flow       float64  `json:"flow,omitempty"`
+	// 板块当日涨跌幅(%)
+	ChangePct  float64  `json:"change_pct,omitempty"`
+	// 板块内涨停家数
+	LimitupCnt int      `json:"limitup_cnt,omitempty"`
+	// 评分靠前的可操作成分股代码
+	Stocks     []string `json:"stocks,omitempty"`
+	// 验证结论/理由
+	Reason     string   `json:"reason,omitempty"`
 }
 
 // classifyPhase 板块状态机（抄自开源 sector_rotation 规则）：

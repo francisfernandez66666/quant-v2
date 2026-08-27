@@ -23,6 +23,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// defaultDB 默认研究 SQLite 库路径（~/.quant-trading-v2/trading.db）。
 var defaultDB = filepath.Join(os.Getenv("HOME"), ".quant-trading-v2", "trading.db")
 
 // main 解析命令行参数、打开研究库、组装回测选项后执行 B4 全链路回测，

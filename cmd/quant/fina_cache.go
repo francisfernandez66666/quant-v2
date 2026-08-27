@@ -15,16 +15,21 @@ import (
 // research DB, TTL-cached so the 5s scoring loop doesn't hammer the DB (financials update per report
 // period and barely change intraday).
 type finaCache struct {
+	// db 研究库句柄（读取 fina_indicator 表）
 	db *store.DB
 
-	mu    sync.Mutex
+	// mu 保护 cache 并发读写的互斥锁
+	mu sync.Mutex
+	// cache 各股最新财务指标缓存（键为 ts_code）
 	cache map[string]*cacheEntry
-	at    time.Time
+	// at 缓存刷新时间，用于 TTL 过期判断
+	at time.Time
 }
 
 // cacheEntry 一条财务缓存。
 // English: one financial cache entry.
 type cacheEntry struct {
+	// fina 该股最新报告期财务指标（nil 表示缺失/查库失败）
 	fina *strategy_engine.FinancialData
 }
 

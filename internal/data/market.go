@@ -523,6 +523,8 @@ func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
 	return out
 }
 
+// getEastMoneyQuote 通过东方财富 push2 单股接口拉取实时行情并填充 StockInfo。
+// 内部已走 EastMoneyLimiter 限流；失败时返回错误，由上层调用方决定降级策略。
 func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=%s", sid, stockQuoteFields)

@@ -1,3 +1,4 @@
+// analyzer_test.go — Stage2 后置校正（postProcess）与产业链差分事件（buildChainEvents）的单元测试。
 package newsagent
 
 import (

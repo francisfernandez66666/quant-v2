@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 
+# 模块级日志器：各 broker 统一记录连接/断线/回调异常
 log = logging.getLogger("qmt_gateway.broker")
 
 
@@ -58,10 +59,12 @@ class _CallbackAdapter:
     """
 
     def __init__(self, broker, inner):
+        # 记录被包装的 broker（用于断线复位）与真实 handler（用于事件转发）
         self._broker = broker
         self._inner = inner
 
     def __getattr__(self, name):
+        # 未显式定义的方法（如 on_stock_trade）统一转发给内部真实 handler
         return getattr(self._inner, name)
 
     def on_disconnected(self):
@@ -87,9 +90,11 @@ class XtBroker(Broker):
         self.session_id = session_id
         self.path = path  # xtquant 连接路径（Windows 上通常为 'extended' 或本地端口目录）
         self.reconnect_sec = reconnect_sec
+        # 以下为运行期状态：xt 类/交易对象/连接标志，初始均为空/未连
         self._xt = None
         self._trader = None
         self._connected = False
+        # 连接/下单/映射读写共用一把锁，保证多线程安全
         self._lock = threading.Lock()
         self.handler = None  # ReportHandler，回调注入
         # §G4 seq ↔ signal_id ↔ 交易所委托号 映射
@@ -132,22 +137,29 @@ class XtBroker(Broker):
     def connect(self):
         """connect() 一次性建立 + 自实现自动重连循环。"""
         XtQuantTrader = self._import_xtquant()
+        from xtquant.xttype import StockAccount
         with self._lock:
             if self._connected:
                 return True
             trader = XtQuantTrader(self.path, self.session_id)
             if trader.start() is not None:  # 0 表示启动成功
                 raise RuntimeError("XtQuantTrader.start() failed")
-            acc = trader.query_stock_account()
-            if acc is None:
-                raise RuntimeError("query_stock_account() failed — 确认已登录并连接交易")
+            if trader.connect() != 0:
+                raise RuntimeError("XtQuantTrader.connect() failed")
+            acc = StockAccount(self.account)
+            time.sleep(1.0)
+            asset = trader.query_stock_asset(acc)
+            if asset is None:
+                raise RuntimeError("query_stock_asset() returned None — 确认东莞 miniQMT 客户端已登录并连接交易")
+            # 资产查询成功即认为登录有效，固化账户对象/交易对象并置为已连接
+            self._acc = acc
             self._trader = trader
             self._xt = XtQuantTrader
             self._connected = True
         # §G3 注册适配器而非裸 handler：断线即复位 _connected，重连循环得以触发
         if self.handler:
             trader.register_callback(_CallbackAdapter(self, self.handler))
-        trader.subscribe(self.account)
+        trader.subscribe(acc)
         log.info("[broker] connected account=%s", self.account)
         return True
 
@@ -188,7 +200,7 @@ class XtBroker(Broker):
         signal_id = req.get("signal_id", "")
         with self._lock:
             seq = self._trader.order_stock(
-                self.account,
+                self._acc,
                 code,
                 order_type,
                 int(req.get("qty", 0)),
@@ -201,6 +213,7 @@ class XtBroker(Broker):
             return False, "", "order_stock failed (seq=%s)" % seq
         seq_s = str(seq)
         with self._lock:
+            # 维护 seq ↔ signal_id 双向映射，供撤单时反查
             self._seq_signal[seq_s] = signal_id
             if signal_id:
                 self._signal_seq[signal_id] = seq_s
@@ -211,6 +224,7 @@ class XtBroker(Broker):
         if not self._connected:
             return False, "not connected"
         oid = str(order_id or "")
+        # 撤单引用可能是 seq: 占位串，需先解析成真实交易所委托号
         if oid.startswith(("seq:", "SEQ:", "pending:")):
             seq = oid.split(":", 1)[1]
             with self._lock:
@@ -219,11 +233,12 @@ class XtBroker(Broker):
                 return False, "交易所委托号尚未回报，暂不可撤（seq=%s）" % seq
             oid = mapped
         try:
+            # 交易所委托号为整数；非法串直接失败
             n = int(oid)
         except ValueError:
             return False, "invalid order_id: %r" % order_id
         try:
-            self._trader.cancel_order_stock(self.account, n)
+            self._trader.cancel_order_stock(self._acc, n)
         except Exception as e:  # noqa: BLE001
             return False, str(e)
         return True, ""
@@ -231,9 +246,10 @@ class XtBroker(Broker):
     def query_positions(self):
         if not self._connected:
             return []
-        poss = self._trader.query_stock_positions(self.account)
+        poss = self._trader.query_stock_positions(self._acc)
         out = []
         for p in poss or []:
+            # 将 xtquant 持仓对象字段映射为网关统一持仓字典
             out.append({
                 "ts_code": getattr(p, "stock_code", ""),
                 "name": getattr(p, "stock_name", ""),
@@ -275,11 +291,13 @@ class MockBroker(Broker):
         return self._connected
 
     def _next_order_id(self):
+        # 自增生成 mock 委托号（MOCK 前缀 + 6 位序号），保证唯一
         self._next_id += 1
         return "MOCK%06d" % self._next_id
 
     def place_order(self, req):
         with self._lock:
+            # 生成 mock 委托号并落内存账本，状态先置“已报”
             order_id = self._next_order_id()
             order = dict(req)
             order["order_id"] = order_id
@@ -336,6 +354,7 @@ class MockBroker(Broker):
         """调用方须持 _lock。"""
         code = order.get("code", "")
         p = self._positions.get(code)
+        # 买入：加仓或新建，按加权成本更新持仓成本与最高价
         if order.get("side") == "买入":
             if p is None:
                 p = {"ts_code": code, "name": order.get("name", ""), "qty": 0,

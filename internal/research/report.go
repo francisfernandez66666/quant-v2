@@ -60,6 +60,7 @@ func Summarize(panels []*Panel, d factor.Def, start, end string, h, quantiles, m
 	}
 }
 
+// meanIC 计算逐日 IC 的均值（空切片返回 NaN）。
 func meanIC(rows []ICRow) float64 {
 	if len(rows) == 0 {
 		return nan()
@@ -71,6 +72,7 @@ func meanIC(rows []ICRow) float64 {
 	return s / float64(len(rows))
 }
 
+// stdIC 计算逐日 IC 的总体标准差（样本数<2 返回 NaN）。
 func stdIC(rows []ICRow) float64 {
 	if len(rows) < 2 {
 		return nan()
@@ -174,6 +176,7 @@ func renderHTML(reports []*FactorReport) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// abs 返回浮点数绝对值（HTML 报告排序用）。
 func abs(v float64) float64 {
 	if v < 0 {
 		return -v

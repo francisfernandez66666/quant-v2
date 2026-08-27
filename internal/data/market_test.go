@@ -1,3 +1,4 @@
+// market_test.go — 行情 API 单元测试：验证 PE 预取与 TTL 缓存命中、股票列表主源（新浪）与兜底（东财）。
 package data
 
 import (
@@ -29,6 +30,7 @@ type listMockTransport struct {
 	peCalls  int
 }
 
+// RoundTrip 实现 http.RoundTripper：按 host 与参数路由返回 mock 响应，并统计 PE 请求次数（测试辅助）。
 func (rt *listMockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Hostname()
 	switch {

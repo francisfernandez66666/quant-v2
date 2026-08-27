@@ -1,3 +1,4 @@
+// depth_test.go — 五档/十档盘口单元测试：验证盘口因子计算、大单（托单/压单）识别与时间字段解析。
 package data
 
 import (
@@ -18,6 +19,7 @@ func testDepth(price float64) *OrderBook {
 	return ob
 }
 
+// TestOrderBookPreallocatedTenLevels 验证盘口预分配十档，未填充档位保持零值。
 func TestOrderBookPreallocatedTenLevels(t *testing.T) {
 	ob := newOrderBook("600519", "贵州茅台")
 	if len(ob.Bids) != DepthLevels || len(ob.Asks) != DepthLevels {
@@ -32,6 +34,7 @@ func TestOrderBookPreallocatedTenLevels(t *testing.T) {
 	}
 }
 
+// TestOrderBookFactors 验证盘口五档因子（买/卖量、委比、价差、覆盖范围）计算正确。
 func TestOrderBookFactors(t *testing.T) {
 	price := 10.0
 	ob := testDepth(price)
@@ -69,6 +72,7 @@ func TestOrderBookFactors(t *testing.T) {
 	}
 }
 
+// TestOrderBookValidate 验证合法盘口通过校验、缺少买一价时报错。
 func TestOrderBookValidate(t *testing.T) {
 	ob := testDepth(10.0)
 	if err := ob.Validate(); err != nil {
@@ -81,6 +85,7 @@ func TestOrderBookValidate(t *testing.T) {
 	}
 }
 
+// TestExtractTencentTime 验证腾讯行情时间字段（索引30）提取为 HH:MM:SS，短字段返回空串。
 func TestExtractTencentTime(t *testing.T) {
 	fields := make([]string, 31)
 	fields[30] = "20260818104710"
@@ -154,6 +159,7 @@ func TestDetectBigOrders(t *testing.T) {
 	}
 }
 
+// filterByKind 按大单类型（托单/压单）过滤盘口大单列表（测试辅助函数）。
 func filterByKind(orders []BigOrder, kind BigOrderKind) []BigOrder {
 	var out []BigOrder
 	for _, o := range orders {

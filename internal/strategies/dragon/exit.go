@@ -1,3 +1,4 @@
+// 破局龙战法离场判定：止盈/买入回撤/炸板回落/尾盘/次日不及预期/超期等出场逻辑（CheckExit）。
 package dragon
 
 import (

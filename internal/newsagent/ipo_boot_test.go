@@ -21,6 +21,7 @@ import (
 // 写死的历史日期会随时间腐烂（20260819 实录：测试跑过 fixture 日期后集体失效）。
 type mockIPOTransport struct{}
 
+// RoundTrip 实现 http.RoundTripper：拦截东财 IPO 日历请求并返回 mock 新股数据（宇树科技明日上市）。
 func (m *mockIPOTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 仅拦截东财 IPO 日历，其余返回空
 	if strings.Contains(req.URL.Host, "eastmoney.com") && strings.Contains(req.URL.RawQuery, "IPOAPPLY") {
@@ -144,6 +145,7 @@ func TestBuildIPOBootEventsSkipsListed(t *testing.T) {
 // listedIPOTransport 返回已上市新股（ListStatus=L）。
 type listedIPOTransport struct{}
 
+// RoundTrip 实现 http.RoundTripper：返回已上市新股（ListStatus=L）的 mock 数据。
 func (m *listedIPOTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if strings.Contains(req.URL.Host, "eastmoney.com") && strings.Contains(req.URL.RawQuery, "IPOAPPLY") {
 		body := `{"success":true,"result":{"data":[

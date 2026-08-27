@@ -1,3 +1,4 @@
+// WorldQuant Alpha101 与 Alpha158 风格因子的单元测试（算子、动量/波动/流动性/反转）。
 package factor
 
 import (

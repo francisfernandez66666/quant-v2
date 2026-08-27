@@ -1,3 +1,4 @@
+// tracker_test.go — tracker 去重记账与未归因队列（入队/去重/上限/持久化/窗口裁剪）的单元测试。
 package newsagent
 
 import (

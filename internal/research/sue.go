@@ -44,9 +44,10 @@ func SingleQuarterNetProfitYoy(income []store.IncomeRow) []float64 {
 	return out
 }
 
+// prevQuarter 缓存"某 MMDD 对应的上年同期单季净利"，供按 end_date 计算同比时 O(1) 查表。
 type prevQuarter struct {
-	year string
-	val  float64
+	year string  // 该记录所属的财年（YYYY）
+	val  float64 // 该报告期的单季净利（累计差分得到）
 }
 
 // yearMinusOne 返回上一年（YYYY）。

@@ -9,6 +9,7 @@ import (
 	"quant-trading-v2/internal/cntime"
 )
 
+// TestTradingCalendarConsumption 验证注入休市日后，交易时段/交易日/下一活跃时段判定全链路消费。
 func TestTradingCalendarConsumption(t *testing.T) {
 	// 已知星期锚点：2026-08-25=周二（env 当日）、26=周三、27=周四、28=周五、29/30=周末、31=周一
 	loc := cntime.Loc

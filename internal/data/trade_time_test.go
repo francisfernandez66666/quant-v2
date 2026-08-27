@@ -1,3 +1,4 @@
+// trade_time_test.go — 交易时段判定单元测试：验证盘前、午休及盘中各时间窗口的边界判定。
 package data
 
 import (

@@ -1,3 +1,4 @@
+// llm_test.go — LLM 客户端批量/流式解析、容错清理与探活（Ping）的单元测试。
 package llm
 
 import (

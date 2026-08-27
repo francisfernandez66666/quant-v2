@@ -1,3 +1,4 @@
+// paginator.go — 多源新闻追回分页器（同花顺/财联社/新浪）：按单轮上限去重并写入未归因队列。
 package newsagent
 
 import (

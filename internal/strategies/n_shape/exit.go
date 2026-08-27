@@ -1,3 +1,4 @@
+// N 形超短战法离场判定：硬止损/形态失败/尾盘强平/量能衰竭等出场逻辑（CheckExit）。
 package n_shape
 
 import (

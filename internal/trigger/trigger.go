@@ -20,10 +20,14 @@ import (
 // Config 实时触发配置（对应 daban TriggerConf）。
 // （Config is the real-time trigger configuration, mirroring daban's TriggerConf.）
 type Config struct {
-	Sec      int           // 观测窗口（秒），默认 6
-	RaRate   float64       // 秒均涨幅阈值（%/s），默认 0.125
-	StockAmt float64       // 秒成交额阈值（元/s），默认 20万
-	Cooldown time.Duration // 同股触发冷却，默认 5 分钟
+	// 观测窗口（秒），默认 6
+	Sec      int
+	// 秒均涨幅阈值（%/s），默认 0.125
+	RaRate   float64
+	// 秒成交额阈值（元/s），默认 20万
+	StockAmt float64
+	// 同股触发冷却，默认 5 分钟
+	Cooldown time.Duration
 }
 
 // DefaultConfig 返回 daban 同款默认参数。
@@ -40,15 +44,24 @@ func DefaultConfig() Config {
 // Signal 实时触发信号。
 // （Signal is a real-time trigger signal.）
 type Signal struct {
-	Code      string    `json:"code"`       // 股票代码
-	Name      string    `json:"name"`       // 股票名称
-	Price     float64   `json:"price"`      // 当前价
-	ChangePct float64   `json:"change_pct"` // 当日涨跌幅（%）
-	SecRise   float64   `json:"sec_rise"`   // 窗口秒均涨幅（%/s）
-	SecAmt    float64   `json:"sec_amt"`    // 窗口秒成交额（元/s）
-	SecTurn   float64   `json:"sec_turn"`   // 窗口秒均换手（%/s）
-	Msg       string    `json:"msg"`        // 触发描述
-	At        time.Time `json:"at"`         // 触发时间
+	// 股票代码
+	Code      string    `json:"code"`
+	// 股票名称
+	Name      string    `json:"name"`
+	// 当前价
+	Price     float64   `json:"price"`
+	// 当日涨跌幅（%）
+	ChangePct float64   `json:"change_pct"`
+	// 窗口秒均涨幅（%/s）
+	SecRise   float64   `json:"sec_rise"`
+	// 窗口秒成交额（元/s）
+	SecAmt    float64   `json:"sec_amt"`
+	// 窗口秒均换手（%/s）
+	SecTurn   float64   `json:"sec_turn"`
+	// 触发描述
+	Msg       string    `json:"msg"`
+	// 触发时间
+	At        time.Time `json:"at"`
 }
 
 // tickState 单只股票的窗口滑动状态，记录上一 tick 的快照用于计算差分指标。

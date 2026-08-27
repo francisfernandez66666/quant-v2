@@ -1,3 +1,4 @@
+// ATR 指标单元测试：校验 ATR14/TrueRange 与 golden 数据，并覆盖首值、递推公式与边界。
 package indicator
 
 import (

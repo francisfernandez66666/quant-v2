@@ -51,6 +51,7 @@ func ATR14(highs, lows, closes []float64) []float64 {
 	return ATR(highs, lows, closes, 14)
 }
 
+// mathAbs 返回浮点绝对值，规避引入额外依赖。
 func mathAbs(v float64) float64 {
 	if v < 0 {
 		return -v

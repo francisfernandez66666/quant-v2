@@ -1,3 +1,4 @@
+// tracker.go — 新闻去重记账器 tracker：跨轮已见标题与未归因队列的持久化、交易日内窗口裁剪。
 package newsagent
 
 import (

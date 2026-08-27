@@ -102,11 +102,11 @@ func (s *StockSeries) Len() int {
 // Def 单个因子的定义与计算函数。
 // （Def is one factor's metadata and compute function.）
 type Def struct {
-	ID      string // 英文标识（registry 唯一）
-	Name    string // 中文名
-	Cat     Category
-	Desc    string
-	Compute func(*StockSeries) []float64
+	ID      string                       // 英文标识（registry 唯一）
+	Name    string                       // 中文名
+	Cat     Category                     // 因子所属大类（见 Category 常量）
+	Desc    string                       // 因子中文描述
+	Compute func(*StockSeries) []float64 // 因子计算函数（输出与序列等长，缺失/预热期为 NaN）
 }
 
 // 因子注册表（ID → Def），按 ID 排序提供全量列表。

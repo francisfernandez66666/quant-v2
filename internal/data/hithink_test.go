@@ -1,3 +1,4 @@
+// hithink_test.go — 同花顺客户端单元测试：验证信封解析、业务错误分类、限速惩罚与复权乘数方向。
 package data
 
 import (
@@ -9,6 +10,7 @@ import (
 	"time"
 )
 
+// TestHithinkEnvelopeAndErrors 验证信封解析、data 注入及业务错误（4001/2001/2003）分类。
 func TestHithinkEnvelopeAndErrors(t *testing.T) {
 	// 成功路径：信封解析 + data 注入
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +56,7 @@ func TestHithinkEnvelopeAndErrors(t *testing.T) {
 	HithinkBaseURL = old
 }
 
+// TestHithinkLimiterPenalize 验证限速器惩罚（间隔翻倍、上限 30s）退避行为。
 func TestHithinkLimiterPenalize(t *testing.T) {
 	l := newHithinkLimiter(1000)
 	before := l.interval
@@ -67,6 +70,7 @@ func TestHithinkLimiterPenalize(t *testing.T) {
 	}
 }
 
+// TestHithinkKeyMissing 验证缺少 API Key 时客户端构造返回错误。
 func TestHithinkKeyMissing(t *testing.T) {
 	os.Setenv(HithinkAPIKeyEnv, "")
 	defer os.Unsetenv(HithinkAPIKeyEnv)
@@ -75,6 +79,7 @@ func TestHithinkKeyMissing(t *testing.T) {
 	}
 }
 
+// TestAdjMultiplierDirection 验证分红/送股/配股复权乘数方向（>1 递增）及非法价返回 1。
 func TestAdjMultiplierDirection(t *testing.T) {
 	// 纯现金分红：10派1 → ref=(10-0.1)=9.9 → 乘数=10/9.9≈1.0101（>1，与 baostock 递增口径一致）
 	m := AdjMultiplier(10, 0.1, 0, 0, 0)

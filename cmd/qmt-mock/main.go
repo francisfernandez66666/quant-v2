@@ -39,41 +39,42 @@ import (
 // order 内存中的委托记录。
 // （order is an in-memory order record.）
 type order struct {
-	OrderID   string  `json:"order_id"`
-	SignalID  string  `json:"signal_id"`
-	Code      string  `json:"code"`
-	Name      string  `json:"name"`
-	Strategy  string  `json:"strategy"`
-	Side      string  `json:"side"`
-	Price     float64 `json:"price"`
-	Qty       int     `json:"qty"`
-	Amount    float64 `json:"amount"`
-	Status    string  `json:"status"` // 已报/已成/已撤
-	CreatedAt string  `json:"created_at"`
+	OrderID   string  `json:"order_id"`   // 全局唯一委托 ID（MOCK000001 递增）
+	SignalID  string  `json:"signal_id"`  // 关联的信号 ID（用于幂等去重）
+	Code      string  `json:"code"`       // 标的代码（ts_code，如 600519.SH）
+	Name      string  `json:"name"`       // 标的名称
+	Strategy  string  `json:"strategy"`   // 触发信号所属战法
+	Side      string  `json:"side"`       // 买卖方向（买入/卖出）
+	Price     float64 `json:"price"`      // 委托价格
+	Qty       int     `json:"qty"`        // 委托数量（股）
+	Amount    float64 `json:"amount"`     // 委托金额（Price×Qty）
+	Status    string  `json:"status"`     // 已报/已成/已撤
+	CreatedAt string  `json:"created_at"` // 委托创建时间（RFC3339）
 }
 
 // pos 内存中的持仓（按 ts_code 聚合，加权成本）。
 // （pos is an in-memory position aggregated by ts_code with weighted cost.）
 type pos struct {
-	TsCode       string  `json:"ts_code"`
-	Name         string  `json:"name"`
-	Qty          int     `json:"qty"`
-	CostPrice    float64 `json:"cost_price"`
-	Amount       float64 `json:"amount"`
-	HighestPrice float64 `json:"highest_price"`
+	TsCode       string  `json:"ts_code"`       // 标的代码（ts_code）
+	Name         string  `json:"name"`          // 标的名称
+	Qty          int     `json:"qty"`           // 当前持仓数量（股）
+	CostPrice    float64 `json:"cost_price"`    // 加权持仓成本价
+	Amount       float64 `json:"amount"`        // 当前持仓市值（Qty×现价）
+	HighestPrice float64 `json:"highest_price"` // 持仓期间最高价（用于回撤/止盈判断）
 }
 
 // book 网关内存账本。
 // （book is the gateway in-memory book.）
 type book struct {
-	mu        sync.Mutex
-	orders    map[string]*order
-	positions map[string]*pos
-	signal    map[string]string // signal_id → order_id（幂等索引）
-	account   string
-	nextID    int
+	mu        sync.Mutex       // 保护账本并发读写的互斥锁
+	orders    map[string]*order // 全部委托记录（键为 order_id）
+	positions map[string]*pos   // 持仓（键为 ts_code，加权成本聚合）
+	signal    map[string]string // signal_id → order_id 幂等索引（防止同信号重复下单）
+	account   string            // 模拟资金账号
+	nextID    int               // 委托 ID 自增计数器
 }
 
+// newBook 创建指定资金账号的内存账本（初始化订单/持仓映射与 signal→order 幂等索引）。
 func newBook(account string) *book {
 	return &book{
 		orders:    map[string]*order{},
@@ -84,6 +85,7 @@ func newBook(account string) *book {
 	}
 }
 
+// nextOrderID 在账本锁保护下生成全局自增的委托 ID（格式 MOCK000001）。
 func (b *book) nextOrderID() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -175,10 +177,13 @@ func (b *book) snapshotPositions() []map[string]interface{} {
 	return out
 }
 
+// round2 把 float64 四舍五入到 2 位小数（用于金额/价格展示对齐）。
 func round2(v float64) float64 {
 	return float64(int(v*100+0.5)) / 100
 }
 
+// main 启动 MiniQMT 模拟网关：解析命令行参数，初始化内存账本、HTTP 路由与鉴权中间件，
+// 监听 /health /state /order /cancel 接口，并把成交回报按 --delay 延时后推送回首尔服务器。
 func main() {
 	listen := flag.String("listen", ":8789", "网关监听地址")
 	token := flag.String("token", "mock-secret", "Bearer token（与首尔 qmt.token 一致）")
@@ -389,11 +394,13 @@ func postReport(base, token string, payload map[string]interface{}) error {
 	return nil
 }
 
+// writeJSON 以 JSON 编码写入 HTTP 响应，并设置 application/json 内容类型。
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// truncate 截断超长字符串（超过 n 字节追加 "..."），用于日志与错误信息裁剪。
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

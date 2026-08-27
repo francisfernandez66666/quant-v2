@@ -27,25 +27,35 @@ import (
 // LatencyProfile 采集到并用于注入的真实网络/LLM 延迟基线。
 type LatencyProfile struct {
 	// 数据回传速度：实时行情/资金流/涨停池等（指数、实时价、K线、资金流、板块行情、成分股、新股日历、龙虎榜）。
+	// 行情回传时延
 	Quote time.Duration
 	// 数据回传速度：新闻来源（财联社/同花顺/新浪滚动/文章正文）。
+	// 新闻回传时延
 	News time.Duration
 	// 数据回传速度：板块名单/成分股（同花顺板块页、全市场列表）。
+	// 板块回传时延
 	Board time.Duration
 
 	// LLM 调用速度：请求到达服务端 + 排队 + 首 token（不含正文传输）。
+	// LLM 首 token 时延
 	LLMFirstToken time.Duration
 	// LLM 结果回传速度：流式 token 速率（每 token 耗时，~45 tok/s → ~22ms/token）。
+	// LLM 每 token 时延
 	LLMPerToken time.Duration
 
 	// 各类 LLM 正文体积（token），用于按 LLMPerToken 折算回传时长。
+	// Stage0 token 数
 	Stage0Tokens int
+	// Stage2 token 数
 	Stage2Tokens int
+	// D1 token 数
 	D1Tokens     int
 
 	// Jitter 抖动比例(0~1)：实际延迟 ∈ base×(1, 1+Jitter)，模拟网络抖动。
+	// 抖动系数
 	Jitter float64
 	// ScaleFactor 时间缩放系数：默认 0.02 秒级跑完；1.0=真实彩排卡时间。
+	// 整体缩放系数
 	ScaleFactor float64
 
 	rng *rand.Rand
@@ -252,6 +262,7 @@ type latencyTransport struct {
 	metrics *simMetrics
 }
 
+// RoundTrip 按路由类别（新闻/板块/行情）注入网络回传时延并计量分项耗时。
 func (l *latencyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Hostname()
 

@@ -1,3 +1,4 @@
+// 7 大类因子单元测试：估值/成长/质量/规模/动量/波动率/流动性各公式与边界。
 package factor
 
 import (
@@ -185,6 +186,7 @@ func TestLiquidityFactors(t *testing.T) {
 	}
 }
 
+// itoa 将 0..25 映射为字母序号 a..z（测试辅助，构造日期占位）。
 func itoa(i int) string {
 	return string(rune('a' + i))
 }

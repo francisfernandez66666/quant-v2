@@ -1,3 +1,4 @@
+// emotion_test.go — 情绪阶段检测单元测试：验证六阶段情绪判定阈值，以及炸板率改用盘中最高涨幅口径的回归。
 package data
 
 import (
@@ -41,6 +42,7 @@ func poolOf(n, maxBoard int) []LimitUpStock {
 	return pool
 }
 
+// TestDetectEmotionPhaseV2 验证按涨停家数与连板高度阈值判定六阶段情绪（高潮/发酵/启动/冰点）。
 func TestDetectEmotionPhaseV2(t *testing.T) {
 	cfg := emotionCfgStub()
 	cases := []struct {

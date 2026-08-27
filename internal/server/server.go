@@ -694,9 +694,11 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 // register/temp/login/setup 完全开放且无频控：可被脚本灌号+撞库。进程内滑动窗口
 // 计数器（单实例部署足够；多实例需外置网关）。
 
+// ipLimiter 进程内滑动窗口频控器（单实例部署足够；多实例需外置网关）。
+// 用于 register/temp/login/setup 等匿名端点的防刷与防撞库。
 type ipLimiter struct {
 	mu   sync.Mutex
-	hits map[string][]time.Time
+	hits map[string][]time.Time // key=IP，value=该 IP 近期的请求时间戳序列
 }
 
 // allow 滑动窗口判定：window 内该 IP 已达 max 次则拒绝。

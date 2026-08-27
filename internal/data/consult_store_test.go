@@ -1,3 +1,4 @@
+// consult_store_test.go — 咨询对话存储单元测试：验证消息追加/正序读取、跨交易日清空与持久化落盘。
 package data
 
 import (

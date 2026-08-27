@@ -15,16 +15,25 @@ import (
 // SignalRecord 单条信号历史记录，包含时间、代码、策略、操作、评分等字段。
 // （SignalRecord is a single signal history record with time, code, strategy, action and scores.）
 type SignalRecord struct {
-	Time           time.Time // 信号时间
-	Code           string    // 股票代码
-	Name           string    // 股票名称
-	Strategy       string    // 触发策略
-	Action         string    // 操作（buy/sell 等）
-	Priority       int       // 优先级
-	Score          float64   // 综合评分
+	// 信号时间
+	Time           time.Time
+	// 股票代码
+	Code           string
+	// 股票名称
+	Name           string
+	// 触发策略
+	Strategy       string
+	// 操作（buy/sell 等）
+	Action         string
+	// 优先级
+	Priority       int
+	// 综合评分
+	Score          float64
 	D1, D2, D3, D4 float64   // 四个维度评分
-	Price          float64   // 信号价格
-	Level          string    // 提醒级别（strong/observe 等）
+	// 信号价格
+	Price          float64
+	// 提醒级别（strong/observe 等）
+	Level          string
 }
 
 // History 信号历史管理器，维护当日 CSV 文件写入和内存记录。

@@ -18,21 +18,36 @@ import (
 // DashboardData 看板数据，汇总所有模块的最新结果用于前端展示。
 // （DashboardData is the dashboard payload aggregating the latest results of all modules for the frontend.）
 type DashboardData struct {
-	NewsEvents   []newsagent.NewsEvent               `json:"news_events"`             // 新闻事件（事件归因产物）
-	HotSectors   []strategy_engine.SectorHot         `json:"hot_sectors"`             // 热点/利好板块
-	BearSectors  []strategy_engine.SectorHot         `json:"bear_sectors,omitempty"`  // 利空板块
-	BearStocks   []string                            `json:"bear_stocks,omitempty"`   // 利空个股代码列表
-	VerifiedBull []sector_agent.VerifiedSector       `json:"verified_bull,omitempty"` // 已通过板块验证的利好板块
-	VerifiedBear []sector_agent.VerifiedSector       `json:"verified_bear,omitempty"` // 已通过板块验证的利空板块
-	BullSignals  []combat_agent.Signal               `json:"bull_signals,omitempty"`  // 做多信号
-	BearSignals  []combat_agent.Signal               `json:"bear_signals,omitempty"`  // 做空信号
-	AlertSignals []combat_agent.Signal               `json:"alert_signals,omitempty"` // 提醒信号（止盈/止损等）
-	FinalSignals []combat_agent.Signal               `json:"final_signals,omitempty"` // 冲突裁决后的最终信号
-	Auction      []data.HithinkAuctionItem           `json:"auction,omitempty"`       // 集合竞价快照（9:15-9:26 窗口内，§同花顺新源）
-	Scores       map[string]combat_agent.StockScores `json:"scores,omitempty"`        // 8a/8b 持续打分（自选/持仓）
-	L1Score      map[string]float64                  `json:"l1_score,omitempty"`      // L1 评分（按股票代码）
-	L1Blocked    map[string]bool                     `json:"l1_blocked,omitempty"`    // L1 阻断标记（按股票代码）
-	Report       *report.Report                      `json:"-"`                       // 交易报表引用（不参与 JSON 序列化）
+	// 新闻事件（事件归因产物）
+	NewsEvents   []newsagent.NewsEvent               `json:"news_events"`
+	// 热点/利好板块
+	HotSectors   []strategy_engine.SectorHot         `json:"hot_sectors"`
+	// 利空板块
+	BearSectors  []strategy_engine.SectorHot         `json:"bear_sectors,omitempty"`
+	// 利空个股代码列表
+	BearStocks   []string                            `json:"bear_stocks,omitempty"`
+	// 已通过板块验证的利好板块
+	VerifiedBull []sector_agent.VerifiedSector       `json:"verified_bull,omitempty"`
+	// 已通过板块验证的利空板块
+	VerifiedBear []sector_agent.VerifiedSector       `json:"verified_bear,omitempty"`
+	// 做多信号
+	BullSignals  []combat_agent.Signal               `json:"bull_signals,omitempty"`
+	// 做空信号
+	BearSignals  []combat_agent.Signal               `json:"bear_signals,omitempty"`
+	// 提醒信号（止盈/止损等）
+	AlertSignals []combat_agent.Signal               `json:"alert_signals,omitempty"`
+	// 冲突裁决后的最终信号
+	FinalSignals []combat_agent.Signal               `json:"final_signals,omitempty"`
+	// 集合竞价快照（9:15-9:26 窗口内，§同花顺新源）
+	Auction      []data.HithinkAuctionItem           `json:"auction,omitempty"`
+	// 8a/8b 持续打分（自选/持仓）
+	Scores       map[string]combat_agent.StockScores `json:"scores,omitempty"`
+	// L1 评分（按股票代码）
+	L1Score      map[string]float64                  `json:"l1_score,omitempty"`
+	// L1 阻断标记（按股票代码）
+	L1Blocked    map[string]bool                     `json:"l1_blocked,omitempty"`
+	// 交易报表引用（不参与 JSON 序列化）
+	Report       *report.Report                      `json:"-"`
 }
 
 // Aggregator 看板数据聚合器，持有最新的 DashboardData 快照。

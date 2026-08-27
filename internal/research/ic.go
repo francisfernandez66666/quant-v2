@@ -9,6 +9,7 @@ import (
 // nan 返回 NaN。
 func nan() float64 { return math.NaN() }
 
+// isNaN 判断是否为 NaN（缺失/无效值统一标记）。
 func isNaN(v float64) bool { return math.IsNaN(v) }
 
 // ICRow 单日横截面 IC 结果。

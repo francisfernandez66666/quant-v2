@@ -296,30 +296,40 @@ func (c *Client) UsageStats() map[string]int64 {
 // Message 对话消息，包含角色和内容。
 // （Message is a chat message with a role and content.）
 type Message struct {
+	// 角色（system/user/assistant）
 	Role    string `json:"role"`
+	// 消息内容
 	Content string `json:"content"`
 }
 
 // ChatRequest 聊天补全请求体。
 // （ChatRequest is the chat-completion request body.）
 type ChatRequest struct {
+	// 模型名
 	Model    string    `json:"model"`
+	// 消息列表
 	Messages []Message `json:"messages"`
 }
 
 // ChatResponse 聊天补全响应体。
 // （ChatResponse is the chat-completion response body.）
 type ChatResponse struct {
+	// 候选回复
 	Choices []struct {
+		// 回复消息
 		Message Message `json:"message"`
 	} `json:"choices"`
-	Usage llmUsage `json:"usage"` // §GAP5.1 token 用量（成本治理）
+	// §GAP5.1 token 用量（成本治理）
+	Usage llmUsage `json:"usage"`
 }
 
 // llmUsage 单次请求的 token 用量元数据（OpenAI 兼容口径）。
 type llmUsage struct {
+	// 提示 token 数
 	PromptTokens     int64 `json:"prompt_tokens"`
+	// 补全 token 数
 	CompletionTokens int64 `json:"completion_tokens"`
+	// 总 token 数
 	TotalTokens      int64 `json:"total_tokens"`
 }
 
@@ -415,7 +425,9 @@ func (c *Client) do(req ChatRequest) (string, error) {
 // （chatCompletionRequest is the full request body sent upstream: ChatRequest plus streaming/max-tokens controls.）
 type chatCompletionRequest struct {
 	ChatRequest
+	// 是否流式
 	Stream    bool `json:"stream"`
+	// 最大生成 token
 	MaxTokens int  `json:"max_tokens,omitempty"`
 }
 
@@ -532,12 +544,16 @@ func estimateTokens(s string) int64 {
 // chatCompletionChunk 流式响应单分片（只取需要的字段）。
 // （chatCompletionChunk is a single streaming response chunk, keeping only the needed fields.）
 type chatCompletionChunk struct {
+	// 候选回复
 	Choices []struct {
+		// 流式增量内容
 		Delta struct {
+			// 消息内容
 			Content string `json:"content"`
 		} `json:"delta"`
 	} `json:"choices"`
-	Usage *llmUsage `json:"usage"` // §GAP5.1 末分片常携带用量元数据
+	// §GAP5.1 末分片常携带用量元数据
+	Usage *llmUsage `json:"usage"`
 }
 
 // nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用）。
@@ -645,26 +661,46 @@ func ConsultSystemPrompt() string { return consultSystemPrompt }
 // HotTopic 热点新闻结构化分析结果。
 // （HotTopic is the structured analysis result of a hot news item.）
 type HotTopic struct {
-	Title               string   `json:"title"`                // 新闻标题
-	Level               string   `json:"level"`                // 事件级别：板块 / 个股
-	Sentiment           string   `json:"sentiment"`            // 情感：正面 / 负面 / 中性
-	Score               float64  `json:"score"`                // 带符号强度：正=利好 负=利空 0=中性
-	ImpactLevel         string   `json:"impact_level"`         // 影响级别：高 / 中 / 低
-	EventType           string   `json:"event_type"`           // 事件类型：政策/财报/行业/公司/宏观/事件驱动
-	Urgency             string   `json:"urgency"`              // 紧急程度：立即 / 关注 / 观察
-	Direction           string   `json:"direction"`            // 方向：利好 / 利空 / 中性
-	Sectors             []string `json:"sectors"`              // 直接影响板块
-	UpstreamSectors     []string `json:"upstream_sectors"`     // 上游产业链受影响板块
-	DownstreamSectors   []string `json:"downstream_sectors"`   // 下游产业链受影响板块
-	RelatedStocks       []string `json:"related_stocks"`       // 关联个股名称或代码
-	UpstreamStocks      []string `json:"upstream_stocks"`      // 上游产业链关联个股（具体核心供应商）
-	DownstreamStocks    []string `json:"downstream_stocks"`    // 下游产业链关联个股（具体核心应用/终端）
-	Strategy            string   `json:"strategy"`             // 匹配战法：N形/龙头/双凸/龙回头/无
-	Reason              string   `json:"reason"`               // 简要分析理由
-	Region              string   `json:"region"`               // 事件来源地域：国内 / 海外
-	Relation            string   `json:"relation"`             // 海外事件与A股板块关系：对抗制裁/合作/不涉及
-	UpstreamDirection   string   `json:"upstream_direction"`   // 上游传导方向：利好/利空/中性
-	DownstreamDirection string   `json:"downstream_direction"` // 下游传导方向：利好/利空/中性
+	// 新闻标题
+	Title               string   `json:"title"`
+	// 事件级别：板块 / 个股
+	Level               string   `json:"level"`
+	// 情感：正面 / 负面 / 中性
+	Sentiment           string   `json:"sentiment"`
+	// 带符号强度：正=利好 负=利空 0=中性
+	Score               float64  `json:"score"`
+	// 影响级别：高 / 中 / 低
+	ImpactLevel         string   `json:"impact_level"`
+	// 事件类型：政策/财报/行业/公司/宏观/事件驱动
+	EventType           string   `json:"event_type"`
+	// 紧急程度：立即 / 关注 / 观察
+	Urgency             string   `json:"urgency"`
+	// 方向：利好 / 利空 / 中性
+	Direction           string   `json:"direction"`
+	// 直接影响板块
+	Sectors             []string `json:"sectors"`
+	// 上游产业链受影响板块
+	UpstreamSectors     []string `json:"upstream_sectors"`
+	// 下游产业链受影响板块
+	DownstreamSectors   []string `json:"downstream_sectors"`
+	// 关联个股名称或代码
+	RelatedStocks       []string `json:"related_stocks"`
+	// 上游产业链关联个股（具体核心供应商）
+	UpstreamStocks      []string `json:"upstream_stocks"`
+	// 下游产业链关联个股（具体核心应用/终端）
+	DownstreamStocks    []string `json:"downstream_stocks"`
+	// 匹配战法：N形/龙头/双凸/龙回头/无
+	Strategy            string   `json:"strategy"`
+	// 简要分析理由
+	Reason              string   `json:"reason"`
+	// 事件来源地域：国内 / 海外
+	Region              string   `json:"region"`
+	// 海外事件与A股板块关系：对抗制裁/合作/不涉及
+	Relation            string   `json:"relation"`
+	// 上游传导方向：利好/利空/中性
+	UpstreamDirection   string   `json:"upstream_direction"`
+	// 下游传导方向：利好/利空/中性
+	DownstreamDirection string   `json:"downstream_direction"`
 }
 
 // valueChainSection 产业链价值传导推理规则：决定事件归因到产业链上/下游的准确性。
@@ -1243,25 +1279,45 @@ var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
 // stage2Row Stage2 批量返回的单行（容错：index 兼容字符串）。
 // （stage2Row is one row of the Stage2 batch response (fault-tolerant: index also accepts strings).）
 type stage2Row struct {
+	// 序号
 	Index               flexInt       `json:"index"`
+	// 事件级别（个股/板块/行业/宏观）
 	Level               string        `json:"level"`
+	// 情绪（正面/负面/中性）
 	Sentiment           string        `json:"sentiment"`
+	// 置信/影响分
 	Score               flexibleFloat `json:"score"`
+	// 影响级别（高/中/低）
 	ImpactLevel         string        `json:"impact_level"`
+	// 事件类型
 	EventType           string        `json:"event_type"`
+	// 紧迫度
 	Urgency             string        `json:"urgency"`
+	// 方向（利好/利空）
 	Direction           string        `json:"direction"`
+	// 相关板块
 	Sectors             []string      `json:"sectors"`
+	// 上游板块
 	UpstreamSectors     []string      `json:"upstream_sectors"`
+	// 下游板块
 	DownstreamSectors   []string      `json:"downstream_sectors"`
+	// 相关个股
 	RelatedStocks       []string      `json:"related_stocks"`
+	// 上游个股
 	UpstreamStocks      []string      `json:"upstream_stocks"`
+	// 下游个股
 	DownstreamStocks    []string      `json:"downstream_stocks"`
+	// 策略建议
 	Strategy            string        `json:"strategy"`
+	// 归因理由
 	Reason              string        `json:"reason"`
+	// 地域（国内/海外）
 	Region              string        `json:"region"`
+	// 关联关系
 	Relation            string        `json:"relation"`
+	// 上游方向
 	UpstreamDirection   string        `json:"upstream_direction"`
+	// 下游方向
 	DownstreamDirection string        `json:"downstream_direction"`
 }
 
@@ -1398,8 +1454,10 @@ func minInt(a, b int) int {
 // SectorTag 解析后的板块标签，含置信度权重。
 // （SectorTag is a parsed sector tag with a confidence weight.）
 type SectorTag struct {
-	Name       string  // 板块名
-	Confidence float64 // 置信度 0~1（无后缀时=1.0）
+	// 板块名
+	Name       string
+	// 置信度 0~1（无后缀时=1.0）
+	Confidence float64
 }
 
 // ParseSectors 解析 LLM 返回的 sectors 列表。

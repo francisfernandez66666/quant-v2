@@ -171,6 +171,7 @@ type fakeGatewayOK struct{}
 
 func (fakeGatewayOK) Send(Message) error { return nil }
 
+// TestParseHM 验证 "HH:MM" 解析：正常时间转分钟数、非法值解析失败。
 func TestParseHM(t *testing.T) {
 	if v, ok := parseHM("22:05"); !ok || v != 22*60+5 {
 		t.Fatalf("parseHM(22:05)=%d,%v", v, ok)

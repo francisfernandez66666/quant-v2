@@ -1,3 +1,4 @@
+// 双凸战法离场判定：止盈/派发/破位/移动止损/超期等出场逻辑（CheckExit）。
 package double_bump
 
 import (

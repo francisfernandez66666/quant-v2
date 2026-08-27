@@ -1,3 +1,4 @@
+// BOLL 布林带单元测试：校验中/上/下轨、上下轨对称性与恒定序列三轨相等。
 package indicator
 
 import (

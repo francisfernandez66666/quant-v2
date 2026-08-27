@@ -43,10 +43,15 @@ type outboxItem struct {
 
 // outboxPersistItem 磁盘序列化形态（无函数字段）。deliverStr 可经 owner 重建投递函数。
 type outboxPersistItem struct {
+	// 消息类型
 	Kind       string    `json:"kind"`
+	// 消息内容
 	Msg        Message   `json:"msg"`
+	// 已投递尝试次数
 	Attempts   int       `json:"attempts"`
+	// 下次重试时间
 	NextAt     time.Time `json:"next_at"`
+	// 投递策略字符串
 	DeliverStr string    `json:"deliver_str"`
 }
 

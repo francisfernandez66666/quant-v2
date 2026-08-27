@@ -26,11 +26,16 @@ func New(cfg *config.Manager) *Engine {
 
 // CheckResult 风控检查结果。（CheckResult is the outcome of a risk check.）
 type CheckResult struct {
-	Pass     bool              `json:"pass"`     // 是否通过
-	Action   string            `json:"action"`   // 建议动作：pass/block/reduce/sell_all
-	Priority strategy.Priority `json:"priority"` // 关联优先级（仅阻断时有意义）
-	Reason   string            `json:"reason"`   // 阻断原因描述
-	Blocked  bool              `json:"blocked"`  // 是否被彻底阻断（不进入后续流程）
+	// 是否通过
+	Pass     bool              `json:"pass"`
+	// 建议动作：pass/block/reduce/sell_all
+	Action   string            `json:"action"`
+	// 关联优先级（仅阻断时有意义）
+	Priority strategy.Priority `json:"priority"`
+	// 阻断原因描述
+	Reason   string            `json:"reason"`
+	// 是否被彻底阻断（不进入后续流程）
+	Blocked  bool              `json:"blocked"`
 }
 
 // CheckSignal 对单个交易信号执行风控检查。

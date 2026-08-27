@@ -74,6 +74,8 @@ func (m *MarketAPI) GetLimitUpPool(date string) ([]LimitUpStock, error) {
 	return parseLimitUpPool(body)
 }
 
+// limitUpRaw 东方财富涨停池接口原始响应结构（仅取需要的字段）。
+// 价格字段 p 单位为"厘"（0.001 元），解析时需 ÷1000；其余字段含义见各字段注释。
 type limitUpRaw struct {
 	Data struct {
 		Pool []struct {

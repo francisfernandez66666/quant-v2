@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+// TestBudgetCircuitBreaker 验证日调用/token 预算熔断与预算 0 不设限。
 func TestBudgetCircuitBreaker(t *testing.T) {
 	c := New(Config{APIKey: "k", DailyCallBudget: 2})
 	// 模拟当日已用 2 次
@@ -30,6 +31,7 @@ func TestBudgetCircuitBreaker(t *testing.T) {
 	}
 }
 
+// TestUsageDayRoll 验证跨日用量计数归零、日戳更新为今日。
 func TestUsageDayRoll(t *testing.T) {
 	c := New(Config{APIKey: "k"})
 	c.usageDay.Store(llmToday() - 1)
@@ -44,6 +46,7 @@ func TestUsageDayRoll(t *testing.T) {
 	}
 }
 
+// TestRecordUsageEstimate 验证 token 累计与字符粗估口径。
 func TestRecordUsageEstimate(t *testing.T) {
 	c := New(Config{APIKey: "k"})
 	c.recordUsage(0, 0)

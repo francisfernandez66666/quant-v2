@@ -23,6 +23,8 @@ import (
 	"quant-trading-v2/internal/scheduler"
 )
 
+// main 研究调度服务入口：固定进程时区为 Asia/Shanghai，确定数据目录，启动 scheduler 调度循环，
+// 并在收到 SIGTERM/SIGINT 时优雅停机（先抢占遗留作业再取消，保证断点续跑）。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 

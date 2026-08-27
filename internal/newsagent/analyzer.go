@@ -1,3 +1,4 @@
+// analyzer.go — Stage2 深度分析（analyzeDeep）与产业链事件展开、档位归一及中性归零等后置校正。
 package newsagent
 
 import (

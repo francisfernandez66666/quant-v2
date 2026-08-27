@@ -1,3 +1,4 @@
+// agent.go — 新闻智能体核心编排：启动/拉取/Stage0-2 归因、固化事件与新闻持久化。
 package newsagent
 
 import (
@@ -313,9 +314,11 @@ func (a *Agent) BuildIPOFeedEvents(items []data.NewsItem) []NewsEvent {
 // （newsDB is the local persistence shape for news events, bucketed per trading day.）
 // English: newsDB is the local persistence shape for news events, bucketed per trading day.
 type newsDB struct {
-	TradingDay string `json:"trading_day"` // 交易日 YYYYMMDD
+	// 交易日 YYYYMMDD
+	TradingDay string `json:"trading_day"`
 	// English: trading day YYYYMMDD
-	Events []NewsEvent `json:"events"` // 事件列表
+	// 事件列表
+	Events []NewsEvent `json:"events"`
 	// English: event list
 }
 

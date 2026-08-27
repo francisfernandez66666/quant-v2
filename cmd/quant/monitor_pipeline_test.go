@@ -31,9 +31,13 @@ import (
 
 // stageRes 单个测试阶段的执行结果：阶段名、是否通过、耗时(毫秒)与详情描述。
 type stageRes struct {
-	name   string
-	pass   bool
-	ms     int64
+	// name 阶段标识名（如 1_EngineEvaluate）
+	name string
+	// pass 阶段是否通过
+	pass bool
+	// ms 阶段耗时（毫秒）
+	ms int64
+	// detail 阶段输出详情
 	detail string
 }
 
