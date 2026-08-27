@@ -1,11 +1,13 @@
 // ── 用户管理页 Admin.jsx（仅 admin 可见）──
 // Admin page (admin only): account creation, role/perm config, password reset,
 // enable/disable, expiry, and per-account strategy param delegation.
-import React, { useState, useEffect, useRef } from 'react'
-import { Button, Switch, Input, Select, DialogPlugin } from 'tdesign-react'
+import React, { useState, useEffect } from 'react'
+import {
+  Button, Switch, Input, InputNumber, Select, Dialog, DialogPlugin,
+  Table, Tag, Card, Form, Checkbox,
+} from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
-import './Admin.css'
 
 const PERM_LABELS = { research_approve: '研究审批' }
 
@@ -75,7 +77,7 @@ function permLabel(p) {
   return PERM_LABELS[p] || p
 }
 
-// 将时间戳格式化为 YYYY-MM-DD
+// 时间戳格式化为 YYYY-MM-DD
 function fmtTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts * 1000)
@@ -125,6 +127,13 @@ export default function Admin() {
   const [strategyMsg, setStrategyMsg] = useState('')
   const [strategyMsgType, setStrategyMsgType] = useState('ok')
 
+  // 重置密码弹窗状态
+  const [pwUser, setPwUser] = useState(null)
+  const [pwValue, setPwValue] = useState('')
+  // 设置有效期弹窗状态
+  const [expUser, setExpUser] = useState(null)
+  const [expDays, setExpDays] = useState(0)
+
   // 安全读取用户权限数组
   function uPerms(u) {
     return Array.isArray(u.perms) ? u.perms : []
@@ -173,26 +182,26 @@ export default function Admin() {
     }
   }
 
-  // 勾选/取消勾选用户权限
-  async function togglePerm(u, p, ev) {
-    const next = ev.target.checked
-      ? [...uPerms(u), p]
-      : uPerms(u).filter((x) => x !== p)
+  // 全量更新某用户权限位
+  async function setUserPerms(u, next) {
     try {
       await api.setAdminUserPerms(u.id, next)
       setUsers(users.map((x) => x.id === u.id ? { ...x, perms: next } : x))
     } catch (e) {
       showToast('权限更新失败: ' + (e.message || e), 'error')
-      ev.target.checked = !ev.target.checked
     }
   }
 
-  // 提示输入并重置用户密码
-  function askResetPassword(u) {
-    const pw = window.prompt('为 ' + u.username + ' 设置新密码（留空取消）')
-    if (!pw) return
-    api.setAdminUserPassword(u.id, pw)
-      .then(() => showToast(u.username + ' 密码已重置', 'success'))
+  // 勾选/取消勾选用户权限
+  function togglePerm(u, val) {
+    setUserPerms(u, val)
+  }
+
+  // 提交重置密码
+  function doResetPassword() {
+    if (!pwValue) { showToast('密码不能为空', 'warning'); return }
+    api.setAdminUserPassword(pwUser.id, pwValue)
+      .then(() => { showToast(pwUser.username + ' 密码已重置', 'success'); setPwUser(null) })
       .catch((e) => showToast('重置失败: ' + (e.message || e), 'error'))
   }
 
@@ -206,20 +215,22 @@ export default function Admin() {
     }
   }
 
-  // 提示设置账号有效期天数
+  // 打开设置有效期弹窗
   function askSetExpiry(u) {
     const cur = u.expires_at ? Math.ceil((u.expires_at * 1000 - Date.now()) / 86400000) : 0
-    const input = window.prompt(
-      '为 ' + u.username + ' 设置有效期天数（输入 0 表示永久；当前' + (u.expires_at ? '剩余约 ' + (cur > 0 ? cur : '已到期') + ' 天' : '永久') + '）：',
-      String(cur > 0 ? cur : 0)
-    )
-    if (input === null) return
-    const days = parseInt(input, 10)
-    if (isNaN(days) || days < 0) { window.alert('请输入非负整数天数'); return }
-    api.setAdminUserExpiry(u.id, days)
+    setExpUser(u)
+    setExpDays(cur > 0 ? cur : 0)
+  }
+
+  // 提交设置有效期
+  function doSetExpiry() {
+    if (isNaN(expDays) || expDays < 0) { showToast('请输入非负整数天数', 'warning'); return }
+    const days = expDays || 0
+    api.setAdminUserExpiry(expUser.id, days)
       .then(() => {
-        setUsers(users.map((x) => x.id === u.id ? { ...x, expires_at: days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0 } : x))
-        showToast(u.username + ' 有效期已更新', 'success')
+        setUsers(users.map((x) => x.id === expUser.id ? { ...x, expires_at: days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0 } : x))
+        showToast(expUser.username + ' 有效期已更新', 'success')
+        setExpUser(null)
       })
       .catch((e) => showToast('设置失败: ' + (e.message || e), 'error'))
   }
@@ -269,171 +280,187 @@ export default function Admin() {
     setStrategySaving(false)
   }
 
+  // 用户列表列定义
+  const userColumns = [
+    {
+      colKey: 'user', title: '用户', width: 220,
+      cell: ({ row }) => (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 15, fontWeight: 600 }}>{row.username}</span>
+            <Tag theme={row.role === 'admin' ? 'success' : 'primary'} variant="light">
+              {row.role === 'admin' ? '管理员' : '用户'}
+            </Tag>
+            {!row.enabled && <Tag theme="danger" variant="light">已禁用</Tag>}
+          </div>
+          <div style={{ fontSize: 12, color: '#888', marginTop: 4 }}>
+            ID: {row.id} · 创建于 {fmtTime(row.created_at)} · {expiryText(row)}
+          </div>
+        </div>
+      ),
+    },
+    {
+      colKey: 'perms', title: '权限', width: 220,
+      cell: ({ row }) => (
+        <Checkbox.Group
+          value={uPerms(row)}
+          disabled={row.role === 'admin'}
+          onChange={(val) => togglePerm(row, val)}
+        >
+          {allPerms.map((p) => (
+            <Checkbox key={p} value={p}>{permLabel(p)}</Checkbox>
+          ))}
+        </Checkbox.Group>
+      ),
+    },
+    {
+      colKey: 'ops', title: '操作', width: 360,
+      cell: ({ row }) => (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          <Button size="small" theme="default" onClick={() => toggleRole(row)}>
+            {row.role === 'admin' ? '降为普通用户' : '设为管理员'}
+          </Button>
+          <Button size="small" theme="default" onClick={() => { setPwUser(row); setPwValue('') }}>重置密码</Button>
+          <Button size="small" theme="default" disabled={row.role === 'admin'} onClick={() => toggleEnabled(row)}>
+            {row.enabled ? '禁用' : '启用'}
+          </Button>
+          <Button size="small" theme="default" disabled={row.role === 'admin'} onClick={() => askSetExpiry(row)}>设置有效期</Button>
+          <Button size="small" theme="primary" onClick={() => openStrategy(row)}>配战法参数</Button>
+          <Button size="small" theme="danger" disabled={row.role === 'admin'} onClick={() => askDeleteUser(row)}>删除</Button>
+        </div>
+      ),
+    },
+  ]
+
   useEffect(() => { loadUsers() }, [])
 
   return (
-    <div className="admin-page">
-      <h2>用户管理</h2>
+    <div>
+      <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>用户管理</h2>
 
-      <div className="card">
-        <div className="card-header">开通新账号</div>
-        <div className="form-grid">
-          <div className="form-row">
-            <label>用户名</label>
-            <input value={newUser.username} onChange={(e) => setNewUser({ ...newUser, username: e.target.value })} placeholder="登录名" />
-          </div>
-          <div className="form-row">
-            <label>初始密码</label>
-            <input value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })} placeholder="首次登录用" type="password" />
-          </div>
-          <div className="form-row">
-            <label>角色</label>
-            <select value={newUser.role} onChange={(e) => setNewUser({ ...newUser, role: e.target.value })}>
-              <option value="user">普通用户</option>
-              <option value="admin">管理员</option>
-            </select>
-          </div>
-          <div className="form-row">
-            <label>权限</label>
-            <div className="perm-checks">
+      <Card title="开通新账号" style={{ marginBottom: 12 }}>
+        <Form layout="vertical">
+          <Form.FormItem label="用户名">
+            <Input value={newUser.username} onChange={(v) => setNewUser({ ...newUser, username: v })} placeholder="登录名" />
+          </Form.FormItem>
+          <Form.FormItem label="初始密码">
+            <Input type="password" value={newUser.password} onChange={(v) => setNewUser({ ...newUser, password: v })} placeholder="首次登录用" />
+          </Form.FormItem>
+          <Form.FormItem label="角色">
+            <Select value={newUser.role} onChange={(v) => setNewUser({ ...newUser, role: v })} style={{ width: 200 }}>
+              <Select.Option value="user">普通用户</Select.Option>
+              <Select.Option value="admin">管理员</Select.Option>
+            </Select>
+          </Form.FormItem>
+          <Form.FormItem label="权限">
+            <Checkbox.Group value={newUser.perms} onChange={(val) => setNewUser({ ...newUser, perms: val })}>
               {allPerms.map((p) => (
-                <label key={p} className="perm-check">
-                  <input
-                    type="checkbox"
-                    checked={newUser.perms.indexOf(p) >= 0}
-                    onChange={(e) => {
-                      const perms = e.target.checked
-                        ? [...newUser.perms, p]
-                        : newUser.perms.filter((x) => x !== p)
-                      setNewUser({ ...newUser, perms })
-                    }}
-                  />
-                  {permLabel(p)}
-                </label>
+                <Checkbox key={p} value={p}>{permLabel(p)}</Checkbox>
               ))}
-            </div>
-          </div>
-          <div className="form-row">
-            <label>有效期</label>
-            <div className="expiry-row">
-              <input
-                type="number" min="0" placeholder="天数"
-                disabled={newUser.permanent}
+            </Checkbox.Group>
+          </Form.FormItem>
+          <Form.FormItem label="有效期">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <InputNumber
                 value={newUser.expiresDays}
-                onChange={(e) => setNewUser({ ...newUser, expiresDays: parseInt(e.target.value, 10) || 0 })}
+                min={0}
+                disabled={newUser.permanent}
+                onChange={(v) => setNewUser({ ...newUser, expiresDays: v || 0 })}
+                placeholder="天数"
+                style={{ width: 140 }}
               />
-              <label className="perm-check">
-                <input type="checkbox" checked={newUser.permanent} onChange={(e) => setNewUser({ ...newUser, permanent: e.target.checked })} /> 永久
-              </label>
+              <Switch value={newUser.permanent} onChange={(v) => setNewUser({ ...newUser, permanent: v })} />
+              <span style={{ fontSize: 13, color: '#888' }}>永久</span>
             </div>
-            <span className="field-hint">填天数表示到期后自动失效；勾选"永久"则不过期</span>
-          </div>
-        </div>
-        <button className="btn-primary" onClick={createUser} disabled={creating}>
+            <span style={{ fontSize: 12, color: '#888' }}>填天数表示到期后自动失效；开启"永久"则不过期</span>
+          </Form.FormItem>
+        </Form>
+        <Button theme="primary" loading={creating} onClick={createUser}>
           {creating ? '创建中...' : '创建账号'}
-        </button>
-        {createMsg && <span className={['feedback', createMsgType].join(' ')}>{createMsg}</span>}
-      </div>
+        </Button>
+        {createMsg && (
+          <span style={{ marginLeft: 10, fontSize: 13, color: createMsgType === 'ok' ? '#00a870' : '#e34d59' }}>{createMsg}</span>
+        )}
+      </Card>
 
-      {users.length > 0 && (
-        <div className="card">
-          <div className="card-header">账号列表</div>
-          <div className="user-table">
-            {users.map((u) => (
-              <div className="user-row" key={u.id}>
-                <div className="user-main">
-                  <div className="user-name">
-                    {u.username}
-                    <span className={['role-tag', u.role === 'admin' ? 'role-admin' : 'role-user'].join(' ')}>
-                      {u.role === 'admin' ? '管理员' : '用户'}
-                    </span>
-                    {!u.enabled && <span className="role-tag role-disabled">已禁用</span>}
-                  </div>
-                  <div className="user-meta">ID: {u.id} · 创建于 {fmtTime(u.created_at)} · {expiryText(u)}</div>
-                  <div className="perm-checks">
-                    {allPerms.map((p) => (
-                      <label key={p} className="perm-check">
-                        <input
-                          type="checkbox"
-                          checked={uPerms(u).indexOf(p) >= 0}
-                          disabled={u.role === 'admin'}
-                          onChange={(ev) => togglePerm(u, p, ev)}
-                        />
-                        {permLabel(p)}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-                <div className="user-actions">
-                  <button className="btn-mini" onClick={() => toggleRole(u)}>
-                    {u.role === 'admin' ? '降为普通用户' : '设为管理员'}
-                  </button>
-                  <button className="btn-mini" onClick={() => askResetPassword(u)}>重置密码</button>
-                  <button className="btn-mini" disabled={u.role === 'admin'} onClick={() => toggleEnabled(u)}>
-                    {u.enabled ? '禁用' : '启用'}
-                  </button>
-                  <button className="btn-mini" disabled={u.role === 'admin'} onClick={() => askSetExpiry(u)}>设置有效期</button>
-                  <button className="btn-mini" onClick={() => openStrategy(u)}>配战法参数</button>
-                  <button className="btn-mini btn-danger" disabled={u.role === 'admin'} onClick={() => askDeleteUser(u)}>删除</button>
-                </div>
-              </div>
+      <Card title="账号列表" style={{ marginBottom: 12 }}>
+        <Table
+          rowKey="id"
+          data={users}
+          columns={userColumns}
+          bordered={false}
+          size="medium"
+          pagination={{ defaultPageSize: 10, showJumper: true }}
+        />
+      </Card>
+
+      {/* 重置密码弹窗 */}
+      <Dialog
+        visible={!!pwUser}
+        header={pwUser ? '为 ' + pwUser.username + ' 重置密码' : '重置密码'}
+        onClose={() => setPwUser(null)}
+        onConfirm={doResetPassword}
+        confirmBtn="确定重置"
+      >
+        <Input type="password" value={pwValue} onChange={(v) => setPwValue(v)} placeholder="输入新密码（留空取消）" />
+      </Dialog>
+
+      {/* 设置有效期弹窗 */}
+      <Dialog
+        visible={!!expUser}
+        header={expUser ? '为 ' + expUser.username + ' 设置有效期' : '设置有效期'}
+        onClose={() => setExpUser(null)}
+        onConfirm={doSetExpiry}
+        confirmBtn="确定"
+      >
+        <div style={{ marginBottom: 8, fontSize: 13, color: '#888' }}>
+          输入天数（0 表示永久）{expUser && expUser.expires_at ? '；当前剩余约 ' + (expUser.expires_at ? Math.ceil((expUser.expires_at * 1000 - Date.now()) / 86400000) : 0) + ' 天' : '；当前永久'}
+        </div>
+        <InputNumber value={expDays} min={0} onChange={(v) => setExpDays(v || 0)} style={{ width: 200 }} />
+      </Dialog>
+
+      {/* 代配战法参数弹窗 */}
+      <Dialog
+        visible={!!activeUser}
+        header={activeUser ? '为 ' + activeUser.username + ' 配置战法参数' : '配置战法参数'}
+        onClose={closeStrategy}
+        onConfirm={saveStrategy}
+        confirmBtn={strategySaving ? '保存中...' : '保存该账号战法参数'}
+        width={560}
+        footer={strategySaving ? null : undefined}
+      >
+        {strategyGroups.map((group) => (
+          <Card key={group.key} title={group.title} style={{ marginBottom: 10 }}>
+            {group.fields.map((f) => (
+              <Form.FormItem key={f.k} label={f.label} style={{ marginBottom: 8 }}>
+                {f.type === 'switch' ? (
+                  <Switch
+                    value={!!(activeStrategy[group.key] && activeStrategy[group.key][f.k])}
+                    onChange={(v) => setActiveStrategy({
+                      ...activeStrategy,
+                      [group.key]: { ...activeStrategy[group.key], [f.k]: v },
+                    })}
+                  />
+                ) : (
+                  <InputNumber
+                    step={f.step || 'any'}
+                    value={(activeStrategy[group.key] && activeStrategy[group.key][f.k]) ?? ''}
+                    onChange={(v) => setActiveStrategy({
+                      ...activeStrategy,
+                      [group.key]: { ...activeStrategy[group.key], [f.k]: v },
+                    })}
+                    placeholder="0"
+                    style={{ width: 200 }}
+                  />
+                )}
+              </Form.FormItem>
             ))}
-          </div>
-        </div>
-      )}
-
-      {activeUser && (
-        <div className="modal-mask" onClick={closeStrategy}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <span>为 {activeUser.username} 配置战法参数</span>
-              <button className="btn-close" onClick={closeStrategy}>✕</button>
-            </div>
-            <div className="strategy-groups">
-              {strategyGroups.map((group) => (
-                <div key={group.key} className="card group-card">
-                  <div className="card-header">{group.title}</div>
-                  {group.fields.map((f) => (
-                    <div className="form-row" key={f.k}>
-                      <label title={f.hint || ''}>{f.label}</label>
-                      {f.type === 'switch' ? (
-                        <label className="switch">
-                          <input
-                            type="checkbox"
-                            checked={!!(activeStrategy[group.key] && activeStrategy[group.key][f.k])}
-                            onChange={(e) => setActiveStrategy({
-                              ...activeStrategy,
-                              [group.key]: { ...activeStrategy[group.key], [f.k]: e.target.checked },
-                            })}
-                          />
-                          <span className="slider"></span>
-                        </label>
-                      ) : (
-                        <input
-                          type="number"
-                          step={f.step || 'any'}
-                          placeholder="0"
-                          value={(activeStrategy[group.key] && activeStrategy[group.key][f.k]) ?? ''}
-                          onChange={(e) => setActiveStrategy({
-                            ...activeStrategy,
-                            [group.key]: { ...activeStrategy[group.key], [f.k]: parseFloat(e.target.value) },
-                          })}
-                        />
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ))}
-            </div>
-            <div className="modal-footer">
-              <button className="btn-primary" onClick={saveStrategy} disabled={strategySaving}>
-                {strategySaving ? '保存中...' : '保存该账号战法参数'}
-              </button>
-              {strategyMsg && <span className={['feedback', strategyMsgType].join(' ')}>{strategyMsg}</span>}
-            </div>
-          </div>
-        </div>
-      )}
+          </Card>
+        ))}
+        {strategyMsg && (
+          <span style={{ fontSize: 13, color: strategyMsgType === 'ok' ? '#00a870' : '#e34d59' }}>{strategyMsg}</span>
+        )}
+      </Dialog>
     </div>
   )
 }

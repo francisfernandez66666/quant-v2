@@ -1,8 +1,22 @@
 // ── 消息中心页面 MsgCenter.jsx ──
 // 展示所有提醒/告警消息，支持按等级过滤、交易信号二级战法分类、删除/清空、一键模拟卖出
+// 使用 TDesign React 组件（Card / Tag / Button / Select / Dialog）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
+import { Card, Tag, Button, Select, DialogPlugin, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import './MsgCenter.css'
+
+function confirmDialog(body, header = '确认') {
+  return new Promise((resolve) => {
+    const d = DialogPlugin.confirm({
+      header,
+      body,
+      theme: 'warning',
+      onConfirm: () => { d.hide(); resolve(true) },
+      onClose: () => { d.hide(); resolve(false) },
+    })
+  })
+}
 
 const filters = [
   { key: 'all', label: '全部' },
@@ -12,6 +26,15 @@ const filters = [
   { key: 'stop', label: '止盈止损' },
   { key: 'hold', label: '持仓提示' },
 ]
+
+// 涨跌配色（红涨绿跌）— 此处仅用于"收益/亏损"语义外的边框，按 Vue 原色映射
+function levelTagTheme(level) {
+  if (level === '止损' || level === '策略信号') return 'danger'
+  if (level === '交易信号') return 'success'
+  if (level === '止盈' || level === '加仓') return 'success'
+  if (level === '减仓') return 'warning'
+  return 'primary'
+}
 
 /**
  * 消息中心页面组件
@@ -56,24 +79,15 @@ export default function MsgCenter() {
     return list
   }, [alerts, activeFilter, activeStrategy])
 
-  // 根据消息等级与方向返回卡片样式类
-  function alertClass(a) {
-    if (a.level === '止损' || a.level === '策略信号') return 'alert-danger'
+  // 根据消息等级与方向返回卡片左边框颜色
+  function alertBorder(a) {
+    if (a.level === '止损' || a.level === '策略信号') return '#e34d59'
     if (a.level === '交易信号') {
-      return a.direction === '做空' || a.action === '卖出' ? 'alert-danger' : 'alert-success'
+      return a.direction === '做空' || a.action === '卖出' ? '#e34d59' : '#00a870'
     }
-    if (a.level === '止盈' || a.level === '加仓') return 'alert-success'
-    if (a.level === '减仓') return 'alert-warn'
-    return 'alert-info'
-  }
-
-  // 根据等级返回徽章样式类
-  function levelClass(level) {
-    if (level === '止损' || level === '策略信号') return 'level-danger'
-    if (level === '交易信号') return 'level-success'
-    if (level === '止盈' || level === '加仓') return 'level-success'
-    if (level === '减仓') return 'level-warn'
-    return 'level-info'
+    if (a.level === '止盈' || a.level === '加仓') return '#00a870'
+    if (a.level === '减仓') return '#FAAD14'
+    return '#4fc3f7'
   }
 
   // 提取消息对应的建议动作（买入/卖出/持有）
@@ -84,12 +98,11 @@ export default function MsgCenter() {
     return a.title && a.title.includes('卖出') ? '卖出' : (a.title && a.title.includes('买入')) ? '买入' : '持有'
   }
 
-  // 根据动作返回徽章样式类
-  function actionClass(a) {
+  function actionTagTheme(a) {
     const t = actionText(a)
-    if (t === '买入') return 'action-buy'
-    if (t === '卖出') return 'action-sell'
-    return 'action-hold'
+    if (t === '买入') return 'success'
+    if (t === '卖出') return 'danger'
+    return 'default'
   }
 
   // 加载消息列表并过滤掉日历类消息
@@ -102,11 +115,12 @@ export default function MsgCenter() {
 
   // 删除单条消息并刷新
   async function onDeleteOne(a) {
-    if (!window.confirm(`删除该消息？\n${a.title || ''}`)) return
+    const ok = await confirmDialog(`删除该消息？\n${a.title || ''}`, '删除消息')
+    if (!ok) return
     try {
       await api.deleteAlert(a.id)
       load()
-    } catch (_) {}
+    } catch (_) { MessagePlugin.error('删除失败') }
   }
 
   // 判断消息是否为卖出类提醒
@@ -116,23 +130,25 @@ export default function MsgCenter() {
 
   // 在模拟盘按实时价全仓卖出该消息对应持仓
   async function onPaperSell(a) {
-    if (!window.confirm(`模拟卖出 ${a.code} ${a.name || ''}？（按实时价全仓卖出）`)) return
+    const ok = await confirmDialog(`模拟卖出 ${a.code} ${a.name || ''}？（按实时价全仓卖出）`, '模拟卖出')
+    if (!ok) return
     try {
       await api.sellPaperPosition(a.code, 0)
-      window.alert(`${a.code} 模拟卖出成功`)
+      MessagePlugin.success(`${a.code} 模拟卖出成功`)
       load()
     } catch (e) {
-      window.alert('模拟卖出失败: ' + (e.message || e))
+      MessagePlugin.error('模拟卖出失败: ' + (e.message || e))
     }
   }
 
   // 清空全部消息
   async function onClearAll() {
-    if (!window.confirm('确定清空全部消息？(当日已删除的将不再自动出现)')) return
+    const ok = await confirmDialog('确定清空全部消息？(当日已删除的将不再自动出现)', '清空全部')
+    if (!ok) return
     try {
       await api.clearAlerts()
       load()
-    } catch (_) {}
+    } catch (_) { MessagePlugin.error('清空失败') }
   }
 
   // 挂载时加载消息、启动轮询并订阅 SSE；卸载时清理
@@ -150,54 +166,49 @@ export default function MsgCenter() {
 
   return (
     <div className="msg-page">
-      <div className="page-header">
-        <h2>消息中心</h2>
-        <div className="header-actions">
-          <button className="btn-clear" onClick={onClearAll}>清空全部</button>
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>消息中心</h2>
+          <Button theme="danger" variant="outline" size="small" onClick={onClearAll}>清空全部</Button>
         </div>
-      </div>
-      <div className="filter-row">
+      </Card>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
         {filters.map((f) => (
-          <button key={f.key}
-            className={['filter-btn', activeFilter === f.key ? 'active' : ''].join(' ')}
-            onClick={() => setActiveFilter(f.key)}>
+          <Button key={f.key} size="small" variant={activeFilter === f.key ? 'base' : 'outline'}
+            theme={activeFilter === f.key ? 'primary' : 'default'} onClick={() => setActiveFilter(f.key)}>
             {f.label}
-          </button>
+          </Button>
         ))}
       </div>
 
       {activeFilter === 'trade' && strategyOptions.length > 0 && (
-        <div className="filter-row strategy-row">
-          <span className="strategy-label">战法</span>
-          <select value={activeStrategy} className="strategy-select" title="按战法策略筛选交易信号"
-            onChange={(e) => setActiveStrategy(e.target.value)}>
-            <option value="all">全部战法</option>
-            {strategyOptions.map((s) => <option key={s} value={s}>{s}</option>)}
-          </select>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+          <span style={{ fontSize: 14, color: '#888' }}>战法</span>
+          <Select value={activeStrategy} onChange={(v) => setActiveStrategy(v)} size="small" style={{ width: 200 }}
+            options={[{ label: '全部战法', value: 'all' }, ...strategyOptions.map((s) => ({ label: s, value: s }))]} />
         </div>
       )}
 
-      <div className="msg-list">
-        {filteredAlerts.map((a, i) => (
-          <div key={a.id || i} className={['msg-card', alertClass(a)].join(' ')}>
-            <div className="msg-header">
-              <span className={['badge-level', levelClass(a.level)].join(' ')}>{a.level}</span>
-              <span className="msg-stock">{a.code} {a.name}</span>
-              <span className="msg-time">{a.time}</span>
-              <span className={['badge-action', actionClass(a)].join(' ')}>{actionText(a)}</span>
-              {isSellAlert(a) && (
-                <button className="btn-paper-sell" title="按实时价在模拟盘卖出该持仓" onClick={() => onPaperSell(a)}>模拟卖出</button>
-              )}
-              <button className="btn-del" title="删除该消息" onClick={() => onDeleteOne(a)}>✕</button>
-            </div>
-            <div className="msg-title">{a.title}</div>
-            <div className="msg-body">{a.body}</div>
+      {filteredAlerts.map((a, i) => (
+        <Card key={a.id || i} style={{ marginBottom: 8, borderLeft: `4px solid ${alertBorder(a)}` }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+            <Tag theme={levelTagTheme(a.level)} size="small">{a.level}</Tag>
+            <span style={{ fontFamily: 'monospace', color: '#4fc3f7', fontWeight: 600 }}>{a.code} {a.name}</span>
+            <span style={{ color: '#555', flex: 1, fontSize: 13 }}>{a.time}</span>
+            <Tag theme={actionTagTheme(a)} size="small" variant="light">{actionText(a)}</Tag>
+            {isSellAlert(a) && (
+              <Button size="small" variant="outline" theme="danger" onClick={() => onPaperSell(a)}>模拟卖出</Button>
+            )}
+            <Button size="small" variant="text" theme="default" onClick={() => onDeleteOne(a)}>✕</Button>
           </div>
-        ))}
-      </div>
+          <div style={{ fontSize: 14, color: '#e0e0e0', fontWeight: 600 }}>{a.title}</div>
+          <div style={{ fontSize: 13, color: '#999', marginTop: 4 }}>{a.body}</div>
+        </Card>
+      ))}
 
       {filteredAlerts.length === 0 && (
-        <div className="empty"><span className="empty-text">暂无消息</span></div>
+        <div style={{ textAlign: 'center', padding: 60, color: '#555' }}>暂无消息</div>
       )}
     </div>
   )

@@ -1,11 +1,13 @@
 // ── 策略信号页面 Signals.jsx ──
 // 展示所有策略评级信号，支持按等级/战法筛选、查看 D1-D4 子维度评分、
 // 确认买入/忽略操作、模拟买入归池、一键收藏自选、展开分时+盘口。
+// 使用 TDesign React 组件（Table / Card / Tag / Button / Dialog / Select）。
 import React, { useState, useEffect, useRef } from 'react'
+import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
-import { showToast } from '../ui.jsx'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
+import LogModal from '../components/LogModal.jsx'
 import './Signals.css'
 
 const FILTERS = [
@@ -31,6 +33,11 @@ function d1Tag(s) {
   return [base, score, blocked].filter(Boolean).join('')
 }
 
+// 涨跌配色（红涨绿跌）
+function chgColor(v) {
+  return (v || 0) >= 0 ? '#e34d59' : '#00a870'
+}
+
 /**
  * 策略信号页面组件
  * 展示策略评级信号，支持等级/战法筛选、D1-D4 维度展示、买入/忽略、模拟买入与日志。
@@ -43,7 +50,6 @@ export default function Signals() {
   const [activeStrategy, setActiveStrategy] = useState('all')
   const [showConfirm, setShowConfirm] = useState(false)
   const [showLog, setShowLog] = useState(false)
-  const [logData, setLogData] = useState(null)
   const [sheetSignal, setSheetSignal] = useState(null)
   const [paperOn, setPaperOn] = useState(false)
   const [tradeTarget, setTradeTarget] = useState({})
@@ -61,7 +67,8 @@ export default function Signals() {
 
   // 根据操作结果弹出成功/失败提示
   function showFeedback(msg, type) {
-    showToast(msg, type === 'ok' ? 'success' : 'error')
+    if (type === 'ok') MessagePlugin.success(msg)
+    else MessagePlugin.error(msg)
   }
 
   // 判断信号是否来自研究战法库（有独立资金池）
@@ -87,7 +94,7 @@ export default function Signals() {
       await load()
     } catch (e) {
       setShowConfirm(false)
-      showToast('操作失败: ' + e.message, 'error')
+      MessagePlugin.error('操作失败: ' + e.message)
     }
   }
 
@@ -151,17 +158,6 @@ export default function Signals() {
     try { setPaperOn(!!(await api.fetchPaperState()).enabled) } catch (_) {}
   }
 
-  // 打开信号批次日志弹窗并加载日志数据
-  async function openLog() {
-    setShowLog(true)
-    try {
-      const data = await api.fetchSignalLogs()
-      setLogData(data)
-    } catch (_) {
-      setLogData(null)
-    }
-  }
-
   // SSE 新信号或扫描到达时刷新列表
   function handleSSE(msg) {
     if (msg.signal || msg.type === 'scan') load()
@@ -191,161 +187,177 @@ export default function Signals() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  const columns = [
+    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'name', title: '名称', width: 100, cell: ({ row }) => row.name || '-' },
+    {
+      colKey: 'price', title: '现价/涨跌', width: 130,
+      cell: ({ row }) => (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <span>¥{(row.price || 0).toFixed(2)}</span>
+          <span style={{ color: chgColor(row.change_pct) }}>
+            {(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%
+          </span>
+        </div>
+      ),
+    },
+    { colKey: 'strategy', title: '策略', width: 90, cell: ({ row }) => row.strategy },
+    {
+      colKey: 'total_score', title: '总分', width: 70,
+      cell: ({ row }) => (row.total_score != null ? row.total_score.toFixed(0) : '—'),
+    },
+    {
+      colKey: 'level', title: '等级', width: 90,
+      cell: ({ row }) => {
+        const lv = row.level === '交易' ? '交易'
+          : row.level === '观望' ? '观望'
+          : row.remind_level === 'strong' ? '可开仓'
+          : row.remind_level === 'observe' ? '观察' : '静默'
+        const theme = row.remind_level === 'strong' ? 'danger' : row.remind_level === 'observe' ? 'warning' : 'default'
+        return <Tag theme={theme} size="small">{lv}</Tag>
+      },
+    },
+    {
+      colKey: 'detail', title: 'D1/D2/D3/D4', minWidth: 220,
+      cell: ({ row }) => (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span title={'D1事件: ' + (row.d1_reason || row.d1_event || '无事件') + (row.d1_blocked ? '（负面拦截）' : '')}
+            style={{ color: '#e34d59', background: 'rgba(227,77,89,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+            {row.d1_score && (row.d1_reason || row.d1_event)
+              ? <em style={{ fontStyle: 'normal' }}>{d1Tag(row)}</em>
+              : (row.d1 != null ? row.d1.toFixed(0) : '—')}
+          </span>
+          <span title={'D2: ' + (row.d2_desc || '')} style={{ color: '#FAAD14', background: 'rgba(250,173,20,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+            {row.d2 != null ? row.d2.toFixed(0) : '—'}{row.d2_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d2_desc)}</em>}
+          </span>
+          <span title={'D3: ' + (row.d3_desc || '')} style={{ color: '#4fc3f7', background: 'rgba(79,195,247,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+            {row.d3 != null ? row.d3.toFixed(0) : '—'}{row.d3_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d3_desc)}</em>}
+          </span>
+          <span title={'D4: ' + (row.d4_desc || '')} style={{ color: '#00a870', background: 'rgba(0,168,112,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+            {row.d4 != null ? row.d4.toFixed(0) : '—'}{row.d4_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d4_desc)}</em>}
+          </span>
+        </div>
+      ),
+    },
+    {
+      colKey: 'kline', title: '分时', width: 80,
+      cell: ({ row }) => (
+        <Button size="small" variant="outline" theme="primary"
+          onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>
+          {klineOpen.has(row.code) ? '收起' : '分时'}
+        </Button>
+      ),
+    },
+    {
+      colKey: 'action', title: '操作', width: 180,
+      cell: ({ row }) => (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {row.can_open ? (
+            <Button size="small" theme="danger" onClick={(e) => { e.stopPropagation(); confirmTrade(row, 'buy') }}>买入</Button>
+          ) : row.action === 'buy' ? (
+            <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); confirmTrade(row, 'ignore') }}>忽略</Button>
+          ) : (
+            <span style={{ color: '#555' }}>—</span>
+          )}
+          {paperOn && row.can_open && hasStrategyPool(row) && (
+            <Button size="small" variant="outline" theme="success" onClick={(e) => { e.stopPropagation(); paperBuy(row) }}
+              title="模拟买入归入该信号所属战法资金池（非战法信号不可买）">模拟买入</Button>
+          )}
+          {!row.can_open && row.action !== 'buy' && (
+            <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); collectToWatchlist(row) }}>收藏</Button>
+          )}
+        </div>
+      ),
+    },
+  ]
+
   return (
     <div className="signals-page">
-      <div className="page-header">
-        <h2>策略信号</h2>
-        <div className="filter-row">
-          {FILTERS.map((f) => (
-            <button key={f.key} className={'filter-btn' + (activeFilter === f.key ? ' active' : '')} onClick={() => setActiveFilter(f.key)}>
-              {f.label}
-            </button>
-          ))}
-          <select className="strategy-select" value={activeStrategy} onChange={(e) => setActiveStrategy(e.target.value)} title="按策略名称筛选">
-            <option value="all">全部策略</option>
-            {strategyOptions.map((st) => (
-              <option key={st} value={st}>{st}</option>
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>策略信号</h2>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {FILTERS.map((f) => (
+              <Button key={f.key} size="small" variant={activeFilter === f.key ? 'base' : 'outline'}
+                theme={activeFilter === f.key ? 'primary' : 'default'} onClick={() => setActiveFilter(f.key)}>
+                {f.label}
+              </Button>
             ))}
-          </select>
-          <button className="btn-log" onClick={openLog}>📋 日志</button>
-        </div>
-      </div>
-
-      <div className="signals-table">
-        <div className="table-header">
-          <span className="col-code">代码</span>
-          <span className="col-name">名称</span>
-          <span className="col-price">现价/涨跌</span>
-          <span className="col-strategy">策略</span>
-          <span className="col-score">总分</span>
-          <span className="col-level">等级</span>
-          <span className="col-detail">D1/D2/D3/D4</span>
-          <span className="col-kline">分时</span>
-          <span className="col-action">操作</span>
-        </div>
-        {filteredSignals.map((s) => (
-          <div key={s.code} className="table-row-group">
-            <div className="table-row" onClick={() => onRowTap(s)}>
-              <span className="col-code" data-label="代码">{s.code}</span>
-              <span className="col-name" data-label="名称">{s.name || '-'}</span>
-              <span className="col-price" data-label="现价/涨跌">
-                <span className="px-price">¥{(s.price || 0).toFixed(2)}</span>
-                <span className={'px-chg ' + ((s.change_pct || 0) >= 0 ? 'up' : 'down')}>
-                  {(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(2)}%
-                </span>
-              </span>
-              <span className="col-strategy" data-label="策略">{s.strategy}</span>
-              <span className="col-score" data-label="总分">{s.total_score?.toFixed(0)}</span>
-              <span className="col-level" data-label="等级">
-                <span className={'tag ' + s.remind_level}>
-                  {s.level === '交易' ? '交易' : s.level === '观望' ? '观望' : s.remind_level === 'strong' ? '可开仓' : s.remind_level === 'observe' ? '观察' : '静默'}
-                </span>
-              </span>
-              <span className="col-detail" data-label="D1/D2/D3/D4">
-                <span className="d-pill d1" title={'D1事件: ' + (s.d1_reason || s.d1_event || '无事件') + (s.d1_blocked ? '（负面拦截）' : '')}>
-                  {s.d1_score && (s.d1_reason || s.d1_event)
-                    ? <em>{d1Tag(s)}</em>
-                    : <span className="d1-none">{s.d1 ? s.d1.toFixed(0) : '—'}</span>}
-                </span>
-                <span className="d-pill d2" title={'D2: ' + (s.d2_desc || '')}>
-                  {s.d2 ? s.d2.toFixed(0) : '—'}{s.d2_desc && <em>{shortDesc(s.d2_desc)}</em>}
-                </span>
-                <span className="d-pill d3" title={'D3: ' + (s.d3_desc || '')}>
-                  {s.d3 ? s.d3.toFixed(0) : '—'}{s.d3_desc && <em>{shortDesc(s.d3_desc)}</em>}
-                </span>
-                <span className="d-pill d4" title={'D4: ' + (s.d4_desc || '')}>
-                  {s.d4 ? s.d4.toFixed(0) : '—'}{s.d4_desc && <em>{shortDesc(s.d4_desc)}</em>}
-                </span>
-              </span>
-              <span className="col-kline" data-label="分时">
-                <button className="btn-kline" onClick={(e) => { e.stopPropagation(); toggleKline(s.code) }} title={klineOpen.has(s.code) ? '收起分时' : '展开分时'}>
-                  {klineOpen.has(s.code) ? '收起' : '分时'}
-                </button>
-              </span>
-              <span className="col-action" data-label="操作">
-                {s.can_open
-                  ? <button className="btn-buy" onClick={(e) => { e.stopPropagation(); confirmTrade(s, 'buy') }}>买入</button>
-                  : s.action === 'buy'
-                    ? <button className="btn-ignore" onClick={(e) => { e.stopPropagation(); confirmTrade(s, 'ignore') }}>忽略</button>
-                    : <span className="text-muted">—</span>}
-                {paperOn && s.can_open && hasStrategyPool(s) && (
-                  <button className="btn-paper" onClick={(e) => { e.stopPropagation(); paperBuy(s) }} title="模拟买入归入该信号所属战法资金池（非战法信号不可买）">模拟买入</button>
-                )}
-                {!s.can_open && s.action !== 'buy' && (
-                  <button className="btn-collect" onClick={(e) => { e.stopPropagation(); collectToWatchlist(s) }}>收藏</button>
-                )}
-              </span>
-            </div>
-            {klineOpen.has(s.code) && (
-              <div className="col-kline-row">
-                <div className="kline-flex">
-                  <div className="kline-main"><KLineChart code={s.code} name={s.name} /></div>
-                  <div className="depth-side"><DepthPanel code={s.code} name={s.name} /></div>
-                </div>
-              </div>
-            )}
+            <Select value={activeStrategy} onChange={(v) => setActiveStrategy(v)} size="small" style={{ width: 160 }}
+              options={[{ label: '全部策略', value: 'all' }, ...strategyOptions.map((st) => ({ label: st, value: st }))]} />
+            <Button size="small" variant="outline" theme="primary" onClick={() => setShowLog(true)}>📋 日志</Button>
           </div>
-        ))}
-        {filteredSignals.length === 0 && <div className="empty">暂无信号</div>}
-      </div>
+        </div>
+      </Card>
+
+      <Card>
+        <Table
+          rowKey="code"
+          data={filteredSignals}
+          columns={columns}
+          size="small"
+          expandedRow={(row) => (
+            <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', flexWrap: 'wrap' }}>
+              <div style={{ flex: '1 1 auto', minWidth: 0 }}><KLineChart code={row.code} name={row.name} /></div>
+              <div style={{ flex: '0 0 300px' }}><DepthPanel code={row.code} name={row.name} /></div>
+            </div>
+          )}
+          expandedRowKeys={[...klineOpen]}
+          onExpandChange={(keys) => setKlineOpen(new Set(keys))}
+          onRowClick={(ctx) => onRowTap(ctx.row)}
+          pagination={{ pageSize: 10, showJumper: true, totalContent: true }}
+          empty="暂无信号"
+        />
+      </Card>
 
       {sheetSignal && (
-        <div className="sheet-overlay" onClick={() => setSheetSignal(null)}>
-          <div className="action-sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-title">{sheetSignal.code} {sheetSignal.name || ''} · {sheetSignal.strategy}</div>
-            {sheetSignal.can_open && <button className="sheet-btn sheet-danger" onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'buy') }}>买入</button>}
-            {sheetSignal.can_open && paperOn && hasStrategyPool(sheetSignal) && (
-              <button className="sheet-btn sheet-paper" onClick={() => { const s = sheetSignal; setSheetSignal(null); paperBuy(s) }}>模拟买入</button>
+        <div className="sheet-overlay" style={{
+          position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(0,0,0,0.6)',
+          display: 'flex', alignItems: 'flex-end',
+        }} onClick={() => setSheetSignal(null)}>
+          <div className="action-sheet" style={{
+            width: '100%', background: '#1a1a2e', borderRadius: '14px 14px 0 0',
+            padding: '10px 12px calc(10px + env(safe-area-inset-bottom, 0px))',
+          }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ fontSize: 14, color: '#999', textAlign: 'center', padding: '8px 0 12px', borderBottom: '1px solid #2a2a3e', marginBottom: 8 }}>
+              {sheetSignal.code} {sheetSignal.name || ''} · {sheetSignal.strategy}
+            </div>
+            {sheetSignal.can_open && (
+              <button style={sheetBtnStyle('#FF4D4F')} onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'buy') }}>买入</button>
             )}
-            {sheetSignal.action === 'buy' && <button className="sheet-btn" onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'ignore') }}>忽略</button>}
-            {!sheetSignal.can_open && sheetSignal.action !== 'buy' && <button className="sheet-btn" onClick={() => { const s = sheetSignal; setSheetSignal(null); collectToWatchlist(s) }}>收藏</button>}
-            <button className="sheet-btn" onClick={() => { toggleKline(sheetSignal.code); setSheetSignal(null) }}>{klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时'}</button>
-            <button className="sheet-btn sheet-cancel" onClick={() => setSheetSignal(null)}>取消</button>
+            {sheetSignal.can_open && paperOn && hasStrategyPool(sheetSignal) && (
+              <button style={sheetBtnStyle('#52c41a')} onClick={() => { const s = sheetSignal; setSheetSignal(null); paperBuy(s) }}>模拟买入</button>
+            )}
+            {sheetSignal.action === 'buy' && (
+              <button style={sheetBtnStyle('#4fc3f7')} onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'ignore') }}>忽略</button>
+            )}
+            {!sheetSignal.can_open && sheetSignal.action !== 'buy' && (
+              <button style={sheetBtnStyle('#4fc3f7')} onClick={() => { const s = sheetSignal; setSheetSignal(null); collectToWatchlist(s) }}>收藏</button>
+            )}
+            <button style={sheetBtnStyle('#4fc3f7')} onClick={() => { toggleKline(sheetSignal.code); setSheetSignal(null) }}>
+              {klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时'}
+            </button>
+            <button style={{ ...sheetBtnStyle('#888'), background: '#2a2a3e' }} onClick={() => setSheetSignal(null)}>取消</button>
           </div>
         </div>
       )}
 
-      {showConfirm && (
-        <div className="modal-overlay">
-          <div className="modal">
-            <h3>确认交易</h3>
-            <div className="modal-body">
-              <p><strong>{tradeTarget.code}</strong> {tradeTarget.name}</p>
-              <p>策略: {tradeTarget.strategy}</p>
-              <p>总分: {tradeTarget.total_score?.toFixed(0)}</p>
-              <p>价格: {tradeTarget.price ? '¥' + tradeTarget.price.toFixed(2) : '—'}</p>
-            </div>
-            <div className="modal-actions">
-              <button className="btn-cancel" onClick={() => setShowConfirm(false)}>取消</button>
-              {tradeAction === 'buy' && <button className="btn-buy" onClick={() => doAction('buy')}>确认买入</button>}
-              {tradeAction === 'ignore' && <button className="btn-ignore" onClick={() => doAction('ignore')}>忽略</button>}
-            </div>
-          </div>
-        </div>
-      )}
+      <Dialog visible={showConfirm} onClose={() => setShowConfirm(false)} header="确认交易"
+        onConfirm={() => doAction(tradeAction)} confirmBtn="确认" cancelBtn="取消">
+        <p><strong>{tradeTarget.code}</strong> {tradeTarget.name}</p>
+        <p>策略: {tradeTarget.strategy}</p>
+        <p>总分: {tradeTarget.total_score != null ? tradeTarget.total_score.toFixed(0) : '—'}</p>
+        <p>价格: {tradeTarget.price ? '¥' + tradeTarget.price.toFixed(2) : '—'}</p>
+      </Dialog>
 
-      {showLog && (
-        <div className="modal-overlay" onClick={() => setShowLog(false)}>
-          <div className="modal log-modal" onClick={(e) => e.stopPropagation()}>
-            <h3>扫描日志</h3>
-            <div className="modal-body">
-              {logData && Array.isArray(logData.batches) && logData.batches.length ? (
-                <div className="log-section">
-                  <h4>信号批次</h4>
-                  {logData.batches.map((b, i) => (
-                    <div className="log-item" key={i}>{JSON.stringify(b).slice(0, 200)}</div>
-                  ))}
-                </div>
-              ) : (
-                <p>暂无日志数据</p>
-              )}
-            </div>
-            <div className="modal-actions">
-              <button className="btn-cancel" onClick={() => setShowLog(false)}>关闭</button>
-            </div>
-          </div>
-        </div>
-      )}
+      <LogModal visible={showLog} onClose={() => setShowLog(false)} />
     </div>
   )
+}
+
+function sheetBtnStyle(color) {
+  return {
+    width: '100%', padding: 14, borderRadius: 8, border: 'none',
+    background: '#0f0f23', color, fontSize: 16, cursor: 'pointer', marginBottom: 8, textAlign: 'center',
+  }
 }

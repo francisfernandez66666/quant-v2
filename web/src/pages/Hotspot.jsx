@@ -1,6 +1,8 @@
 // ── 热点页面 Hotspot.jsx ──
-// 展示热点板块（含异动原因弹窗）、全市场个股评分排名、宏观日历、IPO日历、热点资讯
+// 展示热点板块（含异动原因弹窗）、全市场个股评分排名、宏观日历、IPO日历、热点资讯。
+// 全面使用 TDesign 组件：Card / Table / Dialog / Tag / Button。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
+import { Card, Table, Dialog, Tag, Button, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
 import './Hotspot.css'
@@ -20,6 +22,11 @@ function scoreClass(score, pass, strongMin) {
   if (pass) return 'ev-score pass'
   return 'ev-score'
 }
+function scoreColor(cls) {
+  if (cls.indexOf('strong') >= 0) return '#e34d59'
+  if (cls.indexOf('pass') >= 0) return '#FAAD14'
+  return '#555'
+}
 
 // 根据多维度评分决定个股行高亮样式
 function rowClass(e) {
@@ -28,6 +35,13 @@ function rowClass(e) {
   const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 60 || (e.db_score || 0) >= 60 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
   if (watch) return 'ev-row watch'
   return 'ev-row'
+}
+
+// 安全读取字段值
+function val(e, key) {
+  const v = e[key]
+  if (typeof v === 'string') return v || ''
+  return v || 0
 }
 
 /**
@@ -60,31 +74,19 @@ export default function Hotspot() {
 
   // 切换排序键或方向
   function setSort(key) {
-    if (sortKey === key) {
-      setSortDir(d => d * -1)
-    } else {
-      setSortKey(key)
-      setSortDir(-1)
-    }
+    if (sortKey === key) setSortDir((d) => d * -1)
+    else { setSortKey(key); setSortDir(-1) }
   }
-
   // 返回当前排序方向的箭头字符
   function sortArrow(key) {
     if (sortKey !== key) return ''
     return sortDir === -1 ? ' ▼' : ' ▲'
   }
 
-  // 安全读取字段值
-  function val(e, key) {
-    const v = e[key]
-    if (typeof v === 'string') return v || ''
-    return v || 0
-  }
-
   // 过滤非日历类资讯
-  const newsItems = useMemo(() => news.filter(n => n.source !== '宏观日历' && n.source !== '政策反制'), [news])
+  const newsItems = useMemo(() => news.filter((n) => n.source !== '宏观日历' && n.source !== '政策反制'), [news])
   // 过滤宏观日历与政策反制事件
-  const calendarEvents = useMemo(() => news.filter(n => n.source === '宏观日历' || n.source === '政策反制'), [news])
+  const calendarEvents = useMemo(() => news.filter((n) => n.source === '宏观日历' || n.source === '政策反制'), [news])
 
   // 根据上市日期计算 IPO 倒计时
   function ipoCountdown(c) {
@@ -114,16 +116,6 @@ export default function Hotspot() {
     }
     return s.length >= 16 ? s.slice(5, 16) : s
   }
-
-  // 计算当前评分列表中的最高维度分，用于进度条比例
-  const maxScore = useMemo(() => {
-    let m = 0
-    for (const e of evals) {
-      const t = Math.max(e.n_score || 0, e.dragon_score || 0, e.db_score || 0, e.dr_score || 0, e.m_score || 0)
-      if (t > m) m = t
-    }
-    return m || 100
-  }, [evals])
 
   // 按排序键计算展示列表，默认按最高维度分倒序
   const sortedEvals = useMemo(() => {
@@ -243,17 +235,83 @@ export default function Hotspot() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 板块卡片网格列
+  const sectorColumns = [
+    { colKey: 'name', title: '板块', width: 120 },
+    { colKey: 'reason', title: '异动原因', width: 200, ellipsis: true, cell: ({ row }) => row.reason ? <span style={{ color: '#4fc3f7' }}>{shortReason(row.reason)}</span> : null },
+    { colKey: 'score', title: '评分', width: 80, cell: ({ row }) => <span style={{ color: '#FAAD14' }}>{Math.round((row.score || 0) * 100)}分</span> },
+    { colKey: 'change_pct', title: '涨幅', width: 90, cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 700 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'meta', title: '涨停/流入', width: 180, cell: ({ row }) => (
+      <span style={{ color: '#666', fontSize: 13 }}>
+        {row.d1 > 0 && <Tag size="small" style={{ marginRight: 6 }}>D1 {row.d1.toFixed(0)}</Tag>}
+        <span>涨停 {row.limitup_cnt || 0}</span>
+        <span style={{ marginLeft: 8 }}>流入 {row.net_inflow ? (row.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
+      </span>
+    ) },
+  ]
+
+  // 个股评分排名列
+  const evalColumns = [
+    { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
+    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name || '-'}</span> },
+    { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
+    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreClass(row.n_score, row.n_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'dragon_score', title: '龙≥60', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => { const c = scoreClass(row.dragon_score, row.dragon_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'db_score', title: '凸≥60', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => { const c = scoreClass(row.db_score, row.db_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'dr_score', title: '回≥60', width: 70, sorter: (a, b) => (a.dr_score || 0) - (b.dr_score || 0), cell: ({ row }) => { const c = scoreClass(row.dr_score, row.dr_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dr_score > 0 ? row.dr_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'm_score', title: '量≥50', width: 70, sorter: (a, b) => (a.m_score || 0) - (b.m_score || 0), cell: ({ row }) => { const c = scoreClass(row.m_score, row.m_score >= 50, 70); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.m_score > 0 ? row.m_score.toFixed(0) : '—'}</span> } },
+  ]
+
+  // 宏观日历列
+  const calendarColumns = [
+    { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: '#888' }}>{row.date}</span> },
+    { colKey: 'title', title: '事件', cell: ({ row }) => <span style={{ color: '#e0e0e0' }}>{row.title}</span> },
+  ]
+  const calendarData = calendarEvents.map((c, i) => ({ id: 'c' + i, date: c.datetime ? c.datetime.slice(5, 10) : '', title: c.title }))
+
+  // IPO 日历列
+  const ipoColumns = [
+    { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: '#888' }}>{row.date}</span> },
+    { colKey: 'name', title: '名称', width: 160, cell: ({ row }) => <span style={{ color: '#e0e0e0' }}>{row.name}（{row.code}）</span> },
+    { colKey: 'price', title: '发行价', width: 90, cell: ({ row }) => row.issue_price ? <span style={{ color: '#4fc3f7' }}>¥{row.issue_price.toFixed(2)}</span> : null },
+    { colKey: 'status', title: '状态', width: 100, cell: ({ row }) => <Tag size="small" theme={row.statusTheme}>{row.status}</Tag> },
+  ]
+  const ipoData = ipoCalendar.map((c, i) => ({ id: 'ipo' + i, date: c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : ''), name: c.name, code: c.code, issue_price: c.issue_price, status: ipoCountdown(c), statusTheme: c.list_status === 'L' ? 'default' : 'warning' }))
+
+  // 资讯标签解析
+  function newsTags(n) {
+    const tags = []
+    if (n.sentiment) { const theme = n.sentiment === '正面' ? 'success' : n.sentiment === '负面' ? 'danger' : 'default'; tags.push({ text: n.sentiment, theme }) }
+    if (n.direction) { const theme = n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'; tags.push({ text: n.direction, theme }) }
+    if (n.impact_level) { const theme = n.impact_level === '高' ? 'warning' : n.impact_level === '中' ? 'primary' : 'default'; tags.push({ text: n.impact_level + '影响', theme }) }
+    return tags
+  }
+  // 资讯列
+  const newsColumns = [
+    { colKey: 'time', title: '时间', width: 100, cell: ({ row }) => <span style={{ color: '#888' }}>{row.time}</span> },
+    { colKey: 'title', title: '标题', cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.title}</span> },
+    { colKey: 'tags', title: '标签', width: 280, cell: ({ row }) => (
+      <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+        {row.tags.map((t, i) => <Tag key={i} size="small" theme={t.theme}>{t.text}</Tag>)}
+        {(row.sectors || []).map((sec) => <Tag key={'s' + sec} size="small" theme="primary" variant="light">{sec}</Tag>)}
+        {(row.stocks || []).map((stk) => <Tag key={'k' + stk} size="small" theme="warning" variant="light">{stk}</Tag>)}
+      </span>
+    ) },
+  ]
+  const newsData = newsItems.map((n, i) => ({ id: 'n' + i, time: fmtNewsTime(n.datetime), title: n.title, tags: newsTags(n), sectors: n.sectors, stocks: n.stocks }))
+
   return (
     <div className="hotspot-page">
-      <div className="card">
-        <div className="card-header">
+      <Card>
+        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
           <span>🔥 热点板块</span>
-          <button className="btn-log" onClick={openLog}>📋 日志</button>
+          <Button size="small" variant="outline" theme="primary" onClick={openLog}>📋 日志</Button>
         </div>
         {sectors.length ? (
           <div className="sector-grid">
             {sectors.map((s) => (
-              <div key={s.code} className="sector-card" onClick={() => setReasonTarget(s)}>
+              <Card key={s.code} className="sector-card" bordered={false} style={{ cursor: 'pointer' }} onClick={() => setReasonTarget(s)}>
                 <div className="sec-name">{s.name}</div>
                 {s.reason && <div className="sec-reason">{shortReason(s.reason)}</div>}
                 <div className="sec-score">{Math.round((s.score || 0) * 100)}分</div>
@@ -265,97 +323,66 @@ export default function Hotspot() {
                   <span>涨停 {s.limitup_cnt || 0}</span>
                   <span>流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
                 </div>
-              </div>
+              </Card>
             ))}
           </div>
         ) : (
           <div className="empty">暂无热点板块数据</div>
         )}
-      </div>
+      </Card>
 
-      {reasonTarget && (
-        <>
-          <div className="modal-overlay" onClick={() => setReasonTarget(null)}></div>
-          <div className="modal">
-            <div className="modal-header">{reasonTarget.name}</div>
-            <div className="modal-body">
-              <div className="modal-section">
-                <div className="modal-subtitle">板块异动原因</div>
-                <div className="modal-reason">{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
-              </div>
-              {reasonTarget.news_titles && reasonTarget.news_titles.length ? (
-                <div className="modal-section">
-                  <div className="modal-subtitle">触发新闻（{reasonTarget.news_titles.length}条）</div>
-                  {reasonTarget.news_titles.map((t, i) => (
-                    <div key={i} className="modal-news-item">
-                      <span className="modal-news-idx">{i + 1}.</span>
-                      <span className="modal-news-title">{t}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
+      {/* 板块异动原因弹窗 */}
+      <Dialog visible={!!reasonTarget} header={reasonTarget ? reasonTarget.name : ''} onClose={() => setReasonTarget(null)} confirmBtn="知道了" cancelBtn="">
+        {reasonTarget && (
+          <div>
+            <div className="modal-section">
+              <div className="modal-subtitle">板块异动原因</div>
+              <div className="modal-reason">{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
             </div>
-            <button className="modal-close" onClick={() => setReasonTarget(null)}>知道了</button>
-          </div>
-        </>
-      )}
-
-      {showLog && (
-        <>
-          <div className="modal-overlay" onClick={() => setShowLog(false)}></div>
-          <div className="modal" style={{ maxWidth: 480 }}>
-            <div className="modal-header">运行日志</div>
-            <div className="modal-body">
+            {reasonTarget.news_titles && reasonTarget.news_titles.length ? (
               <div className="modal-section">
-                <div className="modal-subtitle">信号批次 / 阶段记录</div>
-                <pre className="modal-reason" style={{ maxHeight: 180 }}>{logSignal || '暂无'}</pre>
+                <div className="modal-subtitle">触发新闻（{reasonTarget.news_titles.length}条）</div>
+                {reasonTarget.news_titles.map((t, i) => (
+                  <div key={i} className="modal-news-item">
+                    <span className="modal-news-idx">{i + 1}.</span>
+                    <span className="modal-news-title">{t}</span>
+                  </div>
+                ))}
               </div>
-              <div className="modal-section">
-                <div className="modal-subtitle">Stage 轮次记录</div>
-                <pre className="modal-reason" style={{ maxHeight: 180 }}>{logStage || '暂无'}</pre>
-              </div>
-            </div>
-            <button className="modal-close" onClick={() => setShowLog(false)}>关闭</button>
+            ) : null}
           </div>
-        </>
-      )}
+        )}
+      </Dialog>
 
-      <div className="card" style={{ marginTop: 14 }}>
-        <div className="card-header">
+      {/* 运行日志弹窗 */}
+      <Dialog visible={showLog} header="运行日志" onClose={() => setShowLog(false)} confirmBtn="关闭" cancelBtn="">
+        <div>
+          <div className="modal-section">
+            <div className="modal-subtitle">信号批次 / 阶段记录</div>
+            <pre className="modal-reason" style={{ maxHeight: 180 }}>{logSignal || '暂无'}</pre>
+          </div>
+          <div className="modal-section">
+            <div className="modal-subtitle">Stage 轮次记录</div>
+            <pre className="modal-reason" style={{ maxHeight: 180 }}>{logStage || '暂无'}</pre>
+          </div>
+        </div>
+      </Dialog>
+
+      {/* 个股评分排名 */}
+      <Card style={{ marginTop: 14 }}>
+        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
           <span>📊 个股评分排名</span>
           <span className="card-sub">N形≥60 / 龙头≥60 / 双凸≥60 / 回头≥60 / 动量≥50</span>
         </div>
         {evals.length ? (
-          <div className="eval-table">
-            <div className="ev-header">
-              <span className="ev-code sortable" onClick={() => setSort('code')}>代码{sortArrow('code')}</span>
-              <span className="ev-name sortable" onClick={() => setSort('name')}>名称{sortArrow('name')}</span>
-              <span className="ev-price sortable" onClick={() => setSort('price')}>现价{sortArrow('price')}</span>
-              <span className="ev-chg sortable" onClick={() => setSort('change_pct')}>涨跌{sortArrow('change_pct')}</span>
-              <span className="ev-n sortable" onClick={() => setSort('n_score')} title="N形≥60可操作">N≥60{sortArrow('n_score')}</span>
-              <span className="ev-dragon sortable" onClick={() => setSort('dragon_score')} title="龙头≥60买入,≥50观察">龙≥60{sortArrow('dragon_score')}</span>
-              <span className="ev-db sortable" onClick={() => setSort('db_score')} title="双凸≥60买入,50-60观察">凸≥60{sortArrow('db_score')}</span>
-              <span className="ev-dr sortable" onClick={() => setSort('dr_score')} title="龙回头≥60首次入场">回≥60{sortArrow('dr_score')}</span>
-              <span className="ev-m sortable" onClick={() => setSort('m_score')} title="动量≥50值得看">量≥50{sortArrow('m_score')}</span>
-            </div>
-            <div className="ev-body">
-              {sortedEvals.map((e) => (
-                <div key={e.code} className={rowClass(e)}>
-                  <span className="ev-code" data-label="代码">{e.code}</span>
-                  <span className="ev-name" data-label="名称">{e.name || '-'}</span>
-                  <span className="ev-price" data-label="现价">¥{(e.price || 0).toFixed(2)}</span>
-                  <span className={['ev-chg', (e.change_pct || 0) >= 0 ? 'up' : 'down'].join(' ')} data-label="涨跌">
-                    {(e.change_pct || 0) > 0 ? '+' : ''}{(e.change_pct || 0).toFixed(2)}%
-                  </span>
-                  <span className={scoreClass(e.n_score, e.n_pass, 80)} data-label="N形">{e.n_score > 0 ? e.n_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.dragon_score, e.dragon_pass, 80)} data-label="龙头">{e.dragon_score > 0 ? e.dragon_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.db_score, e.db_pass, 80)} data-label="双凸">{e.db_score > 0 ? e.db_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.dr_score, e.dr_pass, 80)} data-label="回头">{e.dr_score > 0 ? e.dr_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.m_score, e.m_pass, 70)} data-label="动量">{e.m_score > 0 ? e.m_score.toFixed(0) : '—'}</span>
-                </div>
-              ))}
-            </div>
-          </div>
+          <Table
+            data={sortedEvals}
+            columns={evalColumns}
+            rowKey="code"
+            size="small"
+            pagination={{ pageSize: 20, showJumper: true }}
+            rowClassName={({ row }) => rowClass(row)}
+          />
         ) : (
           <div className="empty"><span className="loading-dot"></span> 等待评估结果...</div>
         )}
@@ -368,68 +395,42 @@ export default function Hotspot() {
           <span className="lg-sep">|</span>
           <span className="lg-item">点击表头排序</span>
         </div>
-      </div>
+      </Card>
 
-      <div className="card" style={{ marginTop: 14 }}>
+      {/* 宏观日历 */}
+      <Card style={{ marginTop: 14 }}>
         <div className="card-header">📅 宏观日历</div>
-        <div className="hs-cal-scroll">
-          {calendarEvents.map((c, i) => (
-            <div key={'c' + i} className="hs-cal-item">
-              <span className="hs-cal-date">{c.datetime ? c.datetime.slice(5, 10) : ''}</span>
-              <span className="hs-cal-title">{c.title}</span>
-            </div>
-          ))}
-          {!calendarEvents.length && <div className="hs-cal-empty">暂无日历事件</div>}
-        </div>
-      </div>
+        {calendarData.length ? (
+          <Table data={calendarData} columns={calendarColumns} rowKey="id" size="small" pagination={false} maxHeight={200} />
+        ) : (
+          <div className="hs-cal-empty">暂无日历事件</div>
+        )}
+      </Card>
 
-      <div className="card" style={{ marginTop: 14 }}>
+      {/* IPO 日历 */}
+      <Card style={{ marginTop: 14 }}>
         <div className="card-header">📋 IPO日历</div>
-        <div className="hs-cal-scroll">
-          {ipoCalendar.map((c, i) => (
-            <div key={'ipo' + i} className="hs-cal-item">
-              <span className="hs-cal-date">{c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '')}</span>
-              <span className="hs-cal-title">{c.name}（{c.code}）</span>
-              {c.issue_price && <span className="cal-price">¥{c.issue_price.toFixed(2)}</span>}
-              <span className={['cal-status', c.list_status === 'L' ? 'cal-status-l' : 'cal-status-u'].join(' ')}>{ipoCountdown(c)}</span>
-            </div>
-          ))}
-          {!ipoCalendar.length && <div className="hs-cal-empty">暂无IPO日历</div>}
-        </div>
-      </div>
+        {ipoData.length ? (
+          <Table data={ipoData} columns={ipoColumns} rowKey="id" size="small" pagination={false} maxHeight={200} />
+        ) : (
+          <div className="hs-cal-empty">暂无IPO日历</div>
+        )}
+      </Card>
 
-      <div className="card" style={{ marginTop: 14 }}>
-        <div className="card-header">
-          📰 热点资讯
-          <div className="hs-actions">
-            <button className="btn-log" disabled={reanalyzing} onClick={onReanalyze}>
-              {reanalyzing ? '补推中…' : '🔁 手动补推'}
-            </button>
-          </div>
+      {/* 热点资讯 */}
+      <Card style={{ marginTop: 14 }}>
+        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
+          <span>📰 热点资讯</span>
+          <Button size="small" variant="outline" theme="primary" disabled={reanalyzing} onClick={onReanalyze}>
+            {reanalyzing ? '补推中…' : '🔁 手动补推'}
+          </Button>
         </div>
-        {newsItems.length ? (
-          <div className="hs-news-scroll">
-            {newsItems.map((n, i) => (
-              <div key={i} className="hs-news-item">
-                <div className="hs-news-head">
-                  <span className="hs-news-time">{fmtNewsTime(n.datetime)}</span>
-                  <span className="hs-news-title">{n.title}</span>
-                </div>
-                <div className="hs-news-tags">
-                  {n.sentiment && <span className={['tag', 'tag-sent-' + n.sentiment].join(' ')}>{n.sentiment}</span>}
-                  {n.direction && <span className={['tag', n.direction === '利好' ? 'tag-up' : n.direction === '利空' ? 'tag-down' : 'tag-neutral'].join(' ')}>{n.direction}</span>}
-                  {n.impact_level && <span className={['tag', 'tag-impact-' + n.impact_level].join(' ')}>{n.impact_level}影响</span>}
-                  {n.sectors && n.sectors.map((sec) => <span key={sec} className="sector-tag">{sec}</span>)}
-                  {n.stocks && n.stocks.map((stk) => <span key={stk} className="stock-tag">{stk}</span>)}
-                  {!n.sentiment && !n.direction && !(n.sectors && n.sectors.length) && <span className="tag-placeholder"></span>}
-                </div>
-              </div>
-            ))}
-          </div>
+        {newsData.length ? (
+          <Table data={newsData} columns={newsColumns} rowKey="id" size="small" pagination={false} maxHeight={400} />
         ) : (
           <div className="empty">暂无资讯</div>
         )}
-      </div>
+      </Card>
     </div>
   )
 }

@@ -1,9 +1,10 @@
 // ── 根组件 App.jsx ──
-// 主布局：侧边栏导航 + 顶部栏 + 内容区（Routes）；未登录显示登录页。
+// 主布局：侧边栏导航（TDesign Menu）+ 顶部栏（TDesign Header）+ 内容区（Routes）；未登录显示登录页。
 // 全局逻辑：登录态恢复、15s 状态轮询、SSE 推送订阅、做空开关、通知测试、Toast 提示。
+// 全站使用 TDesign React 组件 + 暗色主题（ConfigProvider theme="dark"）。
 import React, { useState, useEffect, useRef } from 'react'
-import { NavLink, Routes, Route, useNavigate, Navigate } from 'react-router-dom'
-import { Switch, Button } from 'tdesign-react'
+import { NavLink, Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
+import { ConfigProvider, Layout, Menu, Switch, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
 import * as api from './api/index.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
@@ -29,6 +30,7 @@ import Paper from './pages/Paper.jsx'
  */
 export default function App() {
   const navigate = useNavigate()
+  const location = useLocation()
   const [loggedIn, setLoggedIn] = useState(false)
   const [account, setAccount] = useState('')
   const [serverOnline, setServerOnline] = useState(false)
@@ -82,10 +84,11 @@ export default function App() {
       setLoggedIn(true)
       applyRoleGates()
       startPolling()
-      showToast('登录成功', 'success')
+      MessagePlugin.success('登录成功')
       requestPermission()
     } catch (e) {
       setLoginError(e.message || '登录失败')
+      MessagePlugin.error(e.message || '登录失败')
     } finally {
       setLogging(false)
     }
@@ -124,10 +127,10 @@ export default function App() {
     try {
       const res = await api.toggleShort(val)
       setShortEnabled(res.short_enabled || false)
-      showToast(res.short_enabled ? '做空已开启' : '做空已关闭', 'info')
+      MessagePlugin.info(res.short_enabled ? '做空已开启' : '做空已关闭')
     } catch (_) {
       setShortEnabled(!val)
-      showToast('做空开关切换失败', 'error')
+      MessagePlugin.error('做空开关切换失败')
     }
   }
 
@@ -169,7 +172,7 @@ export default function App() {
   // 全局认证过期事件回调：提示并安全退出
   function onAuthExpired() {
     if (!loggedIn) return
-    showToast('登录已过期，请重新登录', 'error')
+    MessagePlugin.error('登录已过期，请重新登录')
     logout()
   }
 
@@ -203,31 +206,29 @@ export default function App() {
   // ── 登录页 ──
   if (!loggedIn) {
     return (
-      <div className="app login-page">
-        <div className="login-box">
-          <h1>量仔期货</h1>
-          <p className="subtitle">量化交易辅助工具</p>
-          <div className="form-group">
-            <label>服务器地址</label>
-            <input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder="留空表示使用当前域名" />
+      <ConfigProvider theme="dark">
+        <div className="login-page">
+          <div className="login-box t-card">
+            <h1>量仔期货</h1>
+            <p className="subtitle">量化交易辅助工具</p>
+            <div className="form-group">
+              <label>服务器地址</label>
+              <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
+            </div>
+            <div className="form-group">
+              <label>账号</label>
+              <Input value={username} onChange={(v) => setUsername(v)} placeholder="输入账号" />
+            </div>
+            <div className="form-group">
+              <label>密码</label>
+              <Input type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码"
+                onEnter={handleLogin} />
+            </div>
+            <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
+            {loginError && <p className="login-error">{loginError}</p>}
           </div>
-          <div className="form-group">
-            <label>账号</label>
-            <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="输入账号"
-              autoComplete="username" autoCapitalize="off" autoCorrect="off" spellCheck={false} style={{ textTransform: 'none' }} />
-          </div>
-          <div className="form-group">
-            <label>密码</label>
-            <input value={password} type="password" onChange={(e) => setPassword(e.target.value)} placeholder="输入密码"
-              autoComplete="current-password" autoCapitalize="off" autoCorrect="off" spellCheck={false} style={{ textTransform: 'none' }}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleLogin() }} />
-          </div>
-          <button className="btn-login" onClick={handleLogin} disabled={logging}>
-            {logging ? '登录中...' : '登录'}
-          </button>
-          {loginError && <p className="login-error">{loginError}</p>}
         </div>
-      </div>
+      </ConfigProvider>
     )
   }
 
@@ -248,63 +249,65 @@ export default function App() {
     canAdmin ? { to: '/admin', icon: '👥', label: '用户管理' } : null,
   ].filter(Boolean)
 
+  const menuOptions = navItems.map((it) => ({
+    value: it.to,
+    label: (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        <span>{it.icon}</span>
+        <span>{it.label}</span>
+        {it.badge > 0 && <Badge count={it.badge} />}
+      </span>
+    ),
+  }))
+
   return (
-    <div className="app">
-      <div className="hamburger" onClick={() => setMenuOpen(!menuOpen)}>
-        <span></span><span></span><span></span>
-      </div>
-      {menuOpen && <div className="sidebar-overlay" onClick={() => setMenuOpen(false)}></div>}
-      <aside className={'sidebar' + (menuOpen ? ' open' : '')}>
-        <div className="logo">量仔期货</div>
-        <nav className="nav">
-          {navItems.map((it) => (
-            <NavLink key={it.to} to={it.to} className={({ isActive }) => 'nav-item' + (isActive ? ' active' : '')} onClick={() => setMenuOpen(false)}>
-              <span className="nav-icon">{it.icon}</span> {it.label}
-              {it.badge > 0 && <span className="badge">{it.badge}</span>}
-            </NavLink>
-          ))}
-        </nav>
-        <div className="sidebar-footer">
-          <div className={'server-status' + (serverOnline ? ' online' : '')}>
-            {serverOnline ? '服务在线' : '离线'}
+    <ConfigProvider theme="dark">
+      <Layout style={{ minHeight: '100vh' }}>
+        <Layout.Header className="app-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', height: 56 }}>
+          <div className="trade-time">
+            {inTradeTime !== null && (inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后')}
+            <span className={'server-status' + (serverOnline ? ' online' : '')} style={{ marginLeft: 12 }}>
+              {serverOnline ? '服务在线' : '离线'}
+            </span>
           </div>
-          <div className="account-name">{account}</div>
-        </div>
-      </aside>
-      <main className="main">
-        <div className="topbar">
-          {inTradeTime !== null && (
-            <div className="trade-time">{inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后'}</div>
-          )}
-          <div className="topbar-right">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <Switch value={shortEnabled} onChange={onShortToggle} />
-            <span className="muted" style={{ fontSize: 11 }}>{shortEnabled ? '做多+空' : '仅做多'}</span>
+            <span className="muted" style={{ fontSize: 12 }}>{shortEnabled ? '做多+空' : '仅做多'}</span>
             <Button theme="default" variant="outline" size="small" onClick={() => {
               const sent = sendNotify('量仔期货', '通知测试成功')
-              showToast('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')), 'info')
+              MessagePlugin.info('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')))
             }}>🔔</Button>
             <Button theme="default" variant="outline" size="small" onClick={logout}>退出</Button>
           </div>
-        </div>
-        <div className="content">
-          <Routes>
-            <Route path="/" element={<Navigate to="/dashboard" replace />} />
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/signals" element={<Signals />} />
-            <Route path="/watchlist" element={<Watchlist />} />
-            <Route path="/positions" element={<Positions />} />
-            <Route path="/quant" element={<Quant />} />
-            <Route path="/hotspot" element={<Hotspot />} />
-            <Route path="/msgcenter" element={<MsgCenter />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/llm-debug" element={<LLMDebug />} />
-            <Route path="/consult" element={<Consult />} />
-            <Route path="/research" element={<Research />} />
-            <Route path="/admin" element={<Admin />} />
-            <Route path="/paper" element={<Paper />} />
-          </Routes>
-        </div>
-      </main>
-    </div>
+        </Layout.Header>
+        <Layout style={{ display: 'flex' }}>
+          <aside className="app-sidebar">
+            <div className="logo">量仔期货</div>
+            <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} options={menuOptions} style={{ width: '100%' }} />
+            <div className="sidebar-footer">
+              <div className="account-name">{account}</div>
+            </div>
+          </aside>
+          <Layout.Content className="app-content">
+            <Routes>
+              <Route path="/" element={<Navigate to="/dashboard" replace />} />
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/signals" element={<Signals />} />
+              <Route path="/watchlist" element={<Watchlist />} />
+              <Route path="/positions" element={<Positions />} />
+              <Route path="/quant" element={<Quant />} />
+              <Route path="/hotspot" element={<Hotspot />} />
+              <Route path="/msgcenter" element={<MsgCenter />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route path="/llm-debug" element={<LLMDebug />} />
+              <Route path="/consult" element={<Consult />} />
+              <Route path="/research" element={<Research />} />
+              <Route path="/admin" element={<Admin />} />
+              <Route path="/paper" element={<Paper />} />
+            </Routes>
+          </Layout.Content>
+        </Layout>
+      </Layout>
+    </ConfigProvider>
   )
 }

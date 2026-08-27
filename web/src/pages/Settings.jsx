@@ -1,8 +1,11 @@
 // ── 设置页面 Settings.jsx ──
 // 服务器连接、通知、账户信息、LLM 配置、五大战法参数、资讯显示开关、系统信息
+// 使用 TDesign React 组件（Card / Input / InputNumber / Switch / Button / Tag）。
 import React, { useState, useEffect } from 'react'
+import { Card, Input, InputNumber, Switch, Button, Tag, Textarea } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
+import { showToast } from '../ui.jsx'
 import './Settings.css'
 
 const strategyGroups = [
@@ -86,27 +89,20 @@ export default function Settings() {
   const [llmBatchConcurrency, setLlmBatchConcurrency] = useState(4)
   const [llmConfigured, setLlmConfigured] = useState(false)
   const [llmSaving, setLlmSaving] = useState(false)
-  const [llmMsg, setLlmMsg] = useState('')
-  const [llmMsgType, setLlmMsgType] = useState('ok')
 
   const [strategyCfg, setStrategyCfg] = useState(emptyStrategy())
   const [strategySaving, setStrategySaving] = useState(false)
-  const [strategyMsg, setStrategyMsg] = useState('')
-  const [strategyMsgType, setStrategyMsgType] = useState('ok')
 
   const [newsShowAll, setNewsShowAll] = useState(false)
 
   // 保存战法参数配置
   async function saveStrategy() {
     setStrategySaving(true)
-    setStrategyMsg('')
     try {
       await api.setStrategyConfig(strategyCfg)
-      setStrategyMsg('战法参数已保存，热更新即时生效')
-      setStrategyMsgType('ok')
+      showToast('战法参数已保存，热更新即时生效', 'success')
     } catch (e) {
-      setStrategyMsg('保存失败: ' + (e.message || '未知错误'))
-      setStrategyMsgType('err')
+      showToast('保存失败: ' + (e.message || '未知错误'), 'error')
     }
     setStrategySaving(false)
   }
@@ -118,14 +114,14 @@ export default function Settings() {
       if (res && typeof res.news_show_all === 'boolean') setNewsShowAll(res.news_show_all)
     } catch (e) {
       setNewsShowAll(v => !v)
-      window.alert('切换失败: ' + (e.message || '未知错误'))
+      showToast('切换失败: ' + (e.message || '未知错误'), 'error')
     }
   }
 
   // 保存服务器地址到本地存储
   function saveServer() {
     api.setStoredServer(serverUrl)
-    window.alert('服务器地址已保存')
+    showToast('服务器地址已保存', 'success')
   }
 
   // 请求浏览器通知权限并发送测试通知
@@ -133,9 +129,9 @@ export default function Settings() {
     requestPermission().then(perm => {
       if (perm === 'granted') {
         sendNotify('量仔期货', '通知授权成功')
-        window.alert('通知授权成功')
+        showToast('通知授权成功', 'success')
       } else {
-        window.alert('通知被拒绝，请在系统设置中开启通知')
+        showToast('通知被拒绝，请在系统设置中开启通知', 'warning')
       }
     })
   }
@@ -155,7 +151,6 @@ export default function Settings() {
   // 保存 LLM API 地址、Key、模型与并发配置
   async function saveLLM() {
     setLlmSaving(true)
-    setLlmMsg('')
     try {
       await api.setLLMConfig({
         api_keys: llmApiKeys.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
@@ -165,11 +160,9 @@ export default function Settings() {
         batch_concurrency: llmBatchConcurrency,
       })
       setLlmConfigured(!!llmApiKeys)
-      setLlmMsg('LLM 配置已保存并热生效')
-      setLlmMsgType('ok')
+      showToast('LLM 配置已保存并热生效', 'success')
     } catch (e) {
-      setLlmMsg('保存失败: ' + (e.message || '未知错误'))
-      setLlmMsgType('err')
+      showToast('保存失败: ' + (e.message || '未知错误'), 'error')
     }
     setLlmSaving(false)
   }
@@ -196,12 +189,14 @@ export default function Settings() {
           setLlmModel(cfg.model || '')
           setLlmClassifierModel(cfg.classifier_model || '')
           if (cfg.batch_concurrency > 0) setLlmBatchConcurrency(cfg.batch_concurrency)
+          let keys = ''
           if (Array.isArray(cfg.api_keys) && cfg.api_keys.length) {
-            setLlmApiKeys(cfg.api_keys.join('\n'))
+            keys = cfg.api_keys.join('\n')
           } else if (cfg.api_key) {
-            setLlmApiKeys(cfg.api_key)
+            keys = cfg.api_key
           }
-          setLlmConfigured(!!(llmApiKeys || cfg.api_url))
+          setLlmApiKeys(keys)
+          setLlmConfigured(!!(keys || cfg.api_url))
         }
       } catch (_) {}
       try {
@@ -222,137 +217,136 @@ export default function Settings() {
     })()
   }, [])
 
+  const renderField = (group, f) => {
+    if (f.type === 'switch') {
+      return (
+        <Switch
+          value={!!strategyCfg[group.key][f.k]}
+          onChange={(v) => setStrategyField(group.key, f.k, v)}
+        />
+      )
+    }
+    return (
+      <InputNumber
+        value={strategyCfg[group.key][f.k] ?? 0}
+        onChange={(v) => setStrategyField(group.key, f.k, v)}
+        step={f.step || 1}
+        theme="column"
+        style={{ width: 200 }}
+      />
+    )
+  }
+
   return (
     <div className="settings-page">
       <h2>设置</h2>
 
-      <div className="setting-card">
-        <div className="setting-header">服务器连接</div>
+      <Card className="setting-card" title="服务器连接">
         <div className="setting-row">
           <label>服务器地址</label>
-          <input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder="http://localhost:8080" />
+          <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="http://localhost:8080" style={{ width: 280 }} />
         </div>
         <div className="setting-row">
           <label>连接状态</label>
-          <span className={['status', serverOnline ? 'online' : 'offline'].join(' ')}>
+          <Tag theme={serverOnline ? 'success' : 'default'} variant="light">
             {serverOnline ? '已连接' : '离线'}
-          </span>
+          </Tag>
         </div>
-        <button className="btn-save" onClick={saveServer}>保存</button>
-      </div>
+        <Button theme="primary" onClick={saveServer}>保存</Button>
+      </Card>
 
-      <div className="setting-card">
-        <div className="setting-header">通知设置</div>
+      <Card className="setting-card" title="通知设置">
         <div className="setting-row">
           <label>浏览器通知</label>
-          <button className="btn-test" onClick={requestNotify}>授权并测试</button>
+          <Button theme="default" variant="outline" onClick={requestNotify}>授权并测试</Button>
         </div>
         <div className="setting-row">
           <label>声音提醒</label>
-          <button className="btn-test" onClick={playTest}>测试声音</button>
+          <Button theme="default" variant="outline" onClick={playTest}>测试声音</Button>
         </div>
         <div className="setting-row">
           <label>macOS 通知</label>
-          <span className="status online">后台自动发送</span>
+          <Tag theme="success" variant="light">后台自动发送</Tag>
         </div>
-      </div>
+      </Card>
 
-      <div className="setting-card">
-        <div className="setting-header">账户信息</div>
+      <Card className="setting-card" title="账户信息">
         <div className="setting-row">
           <label>账号</label>
           <span className="account">{account}</span>
         </div>
         <div className="setting-row">
           <label>令牌</label>
-          <span className="status offline">{token ? token.slice(0, 20) + '...' : '未登录'}</span>
+          <Tag theme="default" variant="light">
+            {token ? token.slice(0, 20) + '...' : '未登录'}
+          </Tag>
         </div>
-      </div>
+      </Card>
 
-      <div className="setting-card">
-        <div className="setting-header">LLM 配置</div>
+      <Card className="setting-card" title="LLM 配置">
         <div className="setting-row">
           <label>API URL</label>
-          <input value={llmApiUrl} onChange={(e) => setLlmApiUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
+          <Input value={llmApiUrl} onChange={(v) => setLlmApiUrl(v)} placeholder="https://api.openai.com/v1" style={{ width: 280 }} />
         </div>
         <div className="setting-row">
           <label>API Key(s)</label>
-          <textarea value={llmApiKeys} onChange={(e) => setLlmApiKeys(e.target.value)} rows="4" placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" className="api-keys-input"></textarea>
+          <Textarea value={llmApiKeys} onChange={(v) => setLlmApiKeys(v)} placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" autosize={{ minRows: 4, maxRows: 8 }} style={{ width: 280 }} />
         </div>
         <div className="setting-row">
           <label>模型</label>
-          <input value={llmModel} onChange={(e) => setLlmModel(e.target.value)} placeholder="gpt-4o-mini" />
+          <Input value={llmModel} onChange={(v) => setLlmModel(v)} placeholder="gpt-4o-mini" style={{ width: 280 }} />
         </div>
         <div className="setting-row">
           <label>分类专用模型</label>
-          <input value={llmClassifierModel} onChange={(e) => setLlmClassifierModel(e.target.value)} placeholder="留空则用主模型" />
+          <Input value={llmClassifierModel} onChange={(v) => setLlmClassifierModel(v)} placeholder="留空则用主模型" style={{ width: 280 }} />
         </div>
         <div className="setting-row">
           <label>归因批并发度</label>
-          <input value={llmBatchConcurrency} onChange={(e) => setLlmBatchConcurrency(Number(e.target.value))} type="number" min="1" max="16" placeholder="4" />
+          <InputNumber value={llmBatchConcurrency} onChange={(v) => setLlmBatchConcurrency(v)} min={1} max={16} style={{ width: 200 }} />
         </div>
         <div className="setting-row">
           <label>状态</label>
-          <span className={['status', llmConfigured ? 'online' : 'offline'].join(' ')}>
+          <Tag theme={llmConfigured ? 'success' : 'default'} variant="light">
             {llmConfigured ? '已配置' : '未配置（降级为关键词过滤）'}
-          </span>
+          </Tag>
         </div>
-        <button className="btn-save" onClick={saveLLM} disabled={llmSaving}>{llmSaving ? '保存中...' : '保存'}</button>
-        {llmMsg && <span className={['feedback', llmMsgType].join(' ')}>{llmMsg}</span>}
-      </div>
+        <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
+      </Card>
 
       {strategyGroups.map((group) => (
-        <div className="setting-card" key={group.key}>
-          <div className="setting-header">{group.title}</div>
+        <Card className="setting-card" key={group.key} title={group.title}>
           {group.fields.map((f) => (
             <div className="setting-row" key={f.k}>
               <label title={f.hint || ''}>{f.label}</label>
-              {f.type === 'switch' ? (
-                <label className="switch">
-                  <input type="checkbox" checked={!!strategyCfg[group.key][f.k]} onChange={(e) => setStrategyField(group.key, f.k, e.target.checked)} />
-                  <span className="slider"></span>
-                </label>
-              ) : (
-                <input
-                  value={strategyCfg[group.key][f.k] ?? ''}
-                  onChange={(e) => setStrategyField(group.key, f.k, Number(e.target.value))}
-                  type={f.type || 'number'}
-                  step={f.type === 'number' ? (f.step || 'any') : undefined}
-                  placeholder="0"
-                />
-              )}
+              {renderField(group, f)}
             </div>
           ))}
-        </div>
+        </Card>
       ))}
 
-      <div className="setting-card">
-        <div className="setting-header">战法参数</div>
+      <Card className="setting-card" title="战法参数">
         <div className="setting-row">
           <label>说明</label>
           <span style={{ fontSize: 12, color: '#888' }}>参数保存后重启后端生效；权重请保持各策略合计 ≤ 1</span>
         </div>
-        <button className="btn-save" onClick={saveStrategy} disabled={strategySaving}>{strategySaving ? '保存中...' : '保存战法参数'}</button>
-        {strategyMsg && <span className={['feedback', strategyMsgType].join(' ')}>{strategyMsg}</span>}
-      </div>
+        <Button theme="primary" onClick={saveStrategy} loading={strategySaving}>保存战法参数</Button>
+      </Card>
 
-      <div className="setting-card">
-        <div className="setting-header">资讯显示</div>
+      <Card className="setting-card" title="资讯显示">
         <div className="setting-row">
           <label title="开启后弱档/中性资讯（|score|<0.25）也出现在资讯列表；关闭则仅显示有价值的强事件">显示全部资讯（含弱/中性）</label>
-          <label className="switch">
-            <input type="checkbox" checked={newsShowAll} onChange={(e) => { setNewsShowAll(e.target.checked); toggleNewsShowAll() }} />
-            <span className="slider"></span>
-          </label>
+          <Switch
+            value={newsShowAll}
+            onChange={(v) => { setNewsShowAll(v); toggleNewsShowAll() }}
+          />
         </div>
         <div className="setting-row">
           <label>说明</label>
           <span style={{ fontSize: 12, color: '#888' }}>该开关即时生效，不影响引擎打分（引擎始终按 |score|≥0.5 过滤）</span>
         </div>
-      </div>
+      </Card>
 
-      <div className="setting-card">
-        <div className="setting-header">系统</div>
+      <Card className="setting-card" title="系统">
         <div className="setting-row">
           <label>版本</label>
           <span>量仔期货 v1.1.0 桌面版</span>
@@ -361,7 +355,7 @@ export default function Settings() {
           <label>后端</label>
           <span>Go 1.22+ 单二进制</span>
         </div>
-      </div>
+      </Card>
     </div>
   )
 }

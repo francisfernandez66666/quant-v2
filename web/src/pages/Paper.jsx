@@ -2,19 +2,21 @@
 // Paper trading: account state, strategy pools, positions/fills/orders, equity curve,
 // manual buy/trim/close, deposit, pool/cap config, pool reset, full liquidation.
 import React, { useState, useEffect, useRef, useMemo } from 'react'
-import { DialogPlugin } from 'tdesign-react'
+import {
+  Button, Dialog, DialogPlugin, Table, Tag, Card, Form, InputNumber, Input, Select, Tabs,
+} from 'tdesign-react'
 import * as api from '../api/index.js'
+import { showToast } from '../ui.jsx'
 import './Paper.css'
 
+const UP = '#e34d59'   // 涨（A股习惯红）
+const DOWN = '#00a870' // 跌（绿）
+const clsColor = (c) => (c === 'up' ? UP : c === 'down' ? DOWN : undefined)
+
 // ── 本地分时图组件（替代 Vue KLineChart.vue）──
-/**
- * 简版分时图组件
- * @param {{code:string, name:string}} props
- */
 function KLineChart({ code, name }) {
   const [points, setPoints] = useState([])
   const [loading, setLoading] = useState(true)
-  // 加载并绘制最近 241 个 1 分钟收盘价连线
   useEffect(() => {
     let alive = true
     setLoading(true)
@@ -43,14 +45,9 @@ function KLineChart({ code, name }) {
 }
 
 // ── 本地盘口面板组件（替代 Vue DepthPanel.vue）──
-/**
- * 简版盘口面板组件
- * @param {{code:string, name:string}} props
- */
 function DepthPanel({ code, name }) {
   const [depth, setDepth] = useState(null)
   const [loading, setLoading] = useState(true)
-  // 加载买卖五档盘口
   useEffect(() => {
     let alive = true
     setLoading(true)
@@ -106,7 +103,7 @@ function fmtTime(t) {
   const p2 = (n) => String(n).padStart(2, '0')
   return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
 }
-// 根据盈亏返回 CSS 类名
+// 根据盈亏返回 up/down
 function pnlCls(v) { return v >= 0 ? 'up' : 'down' }
 // 计算买入成交价相对信号价的滑点
 function tradeSlippage(t) {
@@ -131,10 +128,20 @@ function poolLabel(k) {
 function normPoolKey(k) { return k || '__other__' }
 // 订单状态中文
 function orderStatusText(s) { return { filled: '全部成交', partial: '部分成交', rejected: '已拒绝' }[s] || s }
-// 订单状态样式类
-function orderStatusCls(s) { return { filled: 'buy', partial: 'hold', rejected: 'sell' }[s] || 'hold' }
+// 订单状态徽标主题
+function orderStatusTheme(s) { return { filled: 'success', partial: 'warning', rejected: 'danger' }[s] || 'default' }
 // 截断原因文本
 function shortReason(r) { if (!r) return '—'; return r.length > 18 ? r.slice(0, 18) + '…' : r }
+
+// 单卡统计
+function StatCard({ label, children }) {
+  return (
+    <Card bordered style={{ flex: '1 1 180px', minWidth: 160 }}>
+      <div style={{ fontSize: 12, color: '#888' }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 600, marginTop: 4 }}>{children}</div>
+    </Card>
+  )
+}
 
 /**
  * 模拟盘页面组件
@@ -237,6 +244,10 @@ export default function Paper() {
     return p ? p.label : ''
   }, [activePool, pools])
 
+  const posData = useMemo(() => filteredPositions.map((p) => ({ ...p, __key: p.code })), [filteredPositions])
+  const tradeData = useMemo(() => filteredTrades.map((t, i) => ({ ...t, __key: 'trade_' + i, __idx: i })), [filteredTrades])
+  const orderData = useMemo(() => filteredOrders.map((o, i) => ({ ...o, __key: o.id || ('o_' + i) })), [filteredOrders])
+
   function toggleKline(key) {
     setKlineOpen((prev) => {
       const next = new Set(prev)
@@ -272,27 +283,25 @@ export default function Paper() {
     if (!p) return
     const price = parseFloat(tradeFormPrice)
     const qty = parseInt(tradeFormQty, 10)
-    if (tradeDir !== 'close' && (isNaN(qty) || qty <= 0)) { window.alert('请输入有效的数量'); return }
+    if (tradeDir !== 'close' && (isNaN(qty) || qty <= 0)) { showToast('请输入有效的数量','warning'); return }
     try {
       if (tradeDir === 'add') {
         await api.buyPaperPosition(p.code, p.name || '', p.strategy || '', 0, price > 0 ? price : 0, qty)
-        window.alert(`已加仓 ${p.code} ${qty} 手`)
+        showToast(`已加仓 ${p.code} ${qty} 手`,'success')
       } else {
         await api.sellPaperPosition(p.code, price > 0 ? price : 0, tradeDir === 'close' ? 0 : qty)
-        window.alert(`已${tradeDir === 'close' ? '清仓' : '减仓'} ${p.code}`)
+        showToast(`已${tradeDir === 'close' ? '清仓' : '减仓'} ${p.code}`,'success')
       }
       setTradeModal(false)
       await load()
-    } catch (e) { window.alert(e.message || '操作失败') }
+    } catch (e) { showToast(e.message || '操作失败','error') }
   }
 
   // 加载模拟盘状态、持仓、成交、委托与净值曲线
   async function load() {
-    let en = false
     try {
       const st = await api.fetchPaperState()
-      en = !!st.enabled
-      setEnabled(en)
+      setEnabled(!!st.enabled)
       setIsAdmin(!!st.is_admin)
       if (st.initial_capital > 0 && !initialCapital) setInitialCapital(String(st.initial_capital))
       if (st.max_positions !== undefined && !maxPos) setMaxPos(st.max_positions > 0 ? String(st.max_positions) : '0')
@@ -300,7 +309,7 @@ export default function Paper() {
       setStats(st.stats || null)
       setPools(Array.isArray(st.strategy_pools) ? st.strategy_pools : [])
     } catch (_) {}
-    if (!en) return
+    if (!enabled) return
     try { setPositions(await api.fetchPaperPositions()) } catch (_) {}
     try { setTrades(await api.fetchPaperTrades()) } catch (_) {}
     try { setOrders(await api.fetchPaperOrders()) } catch (_) {}
@@ -310,7 +319,7 @@ export default function Paper() {
   // 确认注入资金并更新持仓上限
   async function confirmDeposit() {
     const amt = parseFloat(depositAmount)
-    if (!(amt > 0)) { window.alert('请输入有效的注入金额'); return }
+    if (!(amt > 0)) { showToast('请输入有效的注入金额','warning'); return }
     const mp = parseInt(maxPos, 10)
     const mpv = mp > 0 ? mp : 0
     const capHint = mpv > 0 ? '，持仓上限 ' + mpv + ' 只' : '（持仓上限不设限，由资金决定）'
@@ -322,7 +331,7 @@ export default function Paper() {
       setMaxPos(String(res.max_positions > 0 ? res.max_positions : 0))
       setAppliedMax(res.max_positions > 0 ? res.max_positions : 0)
       await load()
-    } catch (e) { window.alert(e.message || '注入失败') }
+    } catch (e) { showToast(e.message || '注入失败','error') }
   }
 
   // 清盘当前选中的分仓资金池
@@ -338,7 +347,7 @@ export default function Paper() {
     try {
       await api.resetPaperPool(activePool === '__other__' ? '' : activePool)
       await load()
-    } catch (e) { window.alert(e.message || '清盘失败') }
+    } catch (e) { showToast(e.message || '清盘失败','error') }
   }
 
   // 打开资金分配/仓位上限/买入纪律设置弹窗并回填当前配置
@@ -373,7 +382,7 @@ export default function Paper() {
       })
       if (assigned > totalCash + 0.01) { setCfgWarn(`资金超额：Σ ¥${fmt(assigned)} > 总现金 ¥${fmt(totalCash)}`); return }
       try { await api.configPaperPools(null, null, allocs); setSettingsOpen(false); await load() }
-      catch (e) { window.alert(e.message || '保存失败') }
+      catch (e) { showToast(e.message || '保存失败','error') }
       return
     }
     if (settingsTab === 'rules') {
@@ -388,7 +397,7 @@ export default function Paper() {
         }
       })
       try { await api.configPaperPools(null, null, null, rules); setSettingsOpen(false); await load() }
-      catch (e) { window.alert(e.message || '保存失败') }
+      catch (e) { showToast(e.message || '保存失败','error') }
       return
     }
     const caps = {}; let capSum = 0
@@ -399,15 +408,7 @@ export default function Paper() {
     const gCap = parseInt(cfgMaxPos, 10)
     if (gCap > 0 && capSum > gCap) { setCfgWarn(`Σ池上限 ${capSum} > 全局 ${gCap}`); return }
     try { await api.configPaperPools(gCap, caps, null); setSettingsOpen(false); await load() }
-    catch (e) { window.alert(e.message || '保存失败') }
-  }
-
-  // 清除自定义资金分配，恢复各池均分
-  async function clearAllocs() {
-    const ok = await confirmDialog('清除每池自定义资金并恢复均分？仓位上限不受影响。', '恢复均分')
-    if (!ok) return
-    try { await api.configPaperPools(null, {}, {}); await load() }
-    catch (e) { window.alert(e.message || '操作失败') }
+    catch (e) { showToast(e.message || '保存失败','error') }
   }
 
   // 清盘重置：平仓全部持仓、清除成交日志与净值曲线
@@ -421,7 +422,7 @@ export default function Paper() {
       await api.paperResetV2(body)
       setShowResetModal(false); setResetToCapital(0); setResetMaxPos(0)
       await load()
-    } catch (e) { window.alert(e.message || '清盘失败') }
+    } catch (e) { showToast(e.message || '清盘失败','error') }
   }
 
   // 挂载时加载模拟盘数据并启动 15s 轮询
@@ -431,440 +432,390 @@ export default function Paper() {
     return () => { if (timer.current) clearInterval(timer.current) }
   }, [])
 
+  // ── 列定义 ──
+  const posColumns = [
+    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'name', title: '名称', width: 100 },
+    { colKey: 'time', title: '买入时间', width: 160, cell: ({ row }) => (
+      <span title={'信号发出 ' + fmtTime(row.signal_at) + ' · 撮合成交 ' + fmtTime(row.filled_at)}>{fmtTime(row.filled_at || row.signal_at)}</span>
+    ) },
+    { colKey: 'qty', title: '数量', width: 70 },
+    { colKey: 'cost', title: '成本价', width: 90, cell: ({ row }) => (row.cost_price || 0).toFixed(2) },
+    { colKey: 'mark', title: '现价', width: 90, cell: ({ row }) => (row.mark || 0).toFixed(2) },
+    { colKey: 'pnl', title: '浮盈', width: 100, cell: ({ row }) => <span style={{ color: row.pnl >= 0 ? UP : DOWN }}>{fmt(row.pnl)}</span> },
+    { colKey: 'pnlPct', title: '浮盈%', width: 90, cell: ({ row }) => <span style={{ color: row.pnl >= 0 ? UP : DOWN }}>{fmt(row.pnl_pct)}%</span> },
+    { colKey: 'slip', title: '滑点', width: 90, cell: ({ row }) => <span style={{ color: row.slippage_pct >= 0 ? UP : DOWN }}>{fmt(row.slippage_pct)}%</span> },
+    { colKey: 'lat', title: '延迟', width: 70, cell: ({ row }) => row.latency_sec + 's' },
+    { colKey: 'pool', title: '池', width: 100, cell: ({ row }) => <Tag>{poolLabel(row.strategy_type)}</Tag> },
+    { colKey: 'kline', title: '分时', width: 80, cell: ({ row }) => (
+      <Button size="small" variant="text" onClick={(e) => { e.stopPropagation(); toggleKline(row.__key) }}>
+        {klineOpen.has(row.__key) ? '收起' : '分时'}
+      </Button>
+    ) },
+    { colKey: 'ops', title: '操作', width: 200, cell: ({ row }) => (
+      <div style={{ display: 'flex', gap: 6 }}>
+        <Button size="small" onClick={(e) => { e.stopPropagation(); openTrade(row, 'add') }}>加仓</Button>
+        <Button size="small" onClick={(e) => { e.stopPropagation(); openTrade(row, 'trim') }}>减仓</Button>
+        <Button size="small" theme="danger" onClick={(e) => { e.stopPropagation(); openTrade(row, 'close') }}>清仓</Button>
+      </div>
+    ) },
+  ]
+
+  const tradeColumns = [
+    { colKey: 'time', title: '时间', width: 160, cell: ({ row }) => fmtTime(row.time) },
+    { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
+    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'name', title: '名称', width: 100 },
+    { colKey: 'strategy', title: '战法', width: 100, cell: ({ row }) => <Tag>{row.strategy}</Tag> },
+    { colKey: 'qty', title: '数量', width: 70 },
+    { colKey: 'price', title: '价格', width: 90, cell: ({ row }) => (row.price || 0).toFixed(2) },
+    { colKey: 'amount', title: '金额', width: 100, cell: ({ row }) => fmt(row.amount) },
+    { colKey: 'slip', title: '滑点', width: 90, cell: ({ row }) => {
+      const c = tradeSlippageCls(row)
+      return <span style={c ? { color: clsColor(c) } : undefined}>{tradeSlippage(row)}</span>
+    } },
+    { colKey: 'lat', title: '延迟', width: 70, cell: ({ row }) => (row.side === 'buy' ? (row.latency_sec || 0) + 's' : '—') },
+    { colKey: 'kline', title: '分时', width: 80, cell: ({ row }) => (
+      <Button size="small" variant="text" onClick={(e) => { e.stopPropagation(); toggleKline(row.__key) }}>
+        {klineOpen.has(row.__key) ? '收起' : '分时'}
+      </Button>
+    ) },
+  ]
+
+  const orderColumns = [
+    { colKey: 'time', title: '时间', width: 160, cell: ({ row }) => fmtTime(row.created_at) },
+    { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
+    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'name', title: '名称', width: 100 },
+    { colKey: 'kind', title: '来源', width: 90, cell: ({ row }) => <Tag>{row.kind || '—'}</Tag> },
+    { colKey: 'status', title: '状态', width: 90, cell: ({ row }) => <Tag theme={orderStatusTheme(row.status)}>{orderStatusText(row.status)}</Tag> },
+    { colKey: 'qty', title: '数量', width: 70 },
+    { colKey: 'price', title: '成交价', width: 90, cell: ({ row }) => (row.price ? row.price.toFixed(2) : '—') },
+    { colKey: 'signal', title: '信号价', width: 90, cell: ({ row }) => (row.signal_price ? row.signal_price.toFixed(2) : '—') },
+    { colKey: 'reason', title: '说明', width: 160, ellipsis: true, cell: ({ row }) => <span title={row.reason || ''}>{shortReason(row.reason)}</span> },
+  ]
+
+  function renderKline(params) {
+    const row = params && params.row ? params.row : params
+    return (
+      <div className="kline-flex">
+        <div className="kline-main"><KLineChart code={row.code} name={row.name} /></div>
+        <div className="depth-side"><DepthPanel code={row.code} name={row.name} /></div>
+      </div>
+    )
+  }
+
   return (
-    <div className="paper-page">
-      <div className="page-header">
-        <h2>模拟盘</h2>
-        <div className="header-right">
-          {isAdmin && <span className="admin-badge" title="admin 账户的模拟盘支持回测与自动化交易联动">联动版</span>}
-          <span className={['enabled-badge', enabled ? 'on' : 'off'].join(' ')}>
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 600 }}>模拟盘</h2>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          {isAdmin && <Tag theme="warning" style={{ cursor: 'default' }}>联动版</Tag>}
+          <Tag theme={enabled ? 'success' : 'default'}>
             {enabled ? (isAdmin ? '自动撮合中' : '手动记账（静态）') : '未启用（rules.paper.enabled）'}
-          </span>
-          {enabled && (
-            <span className="cap-badge" title="当前生效的持仓上限（经确认资金固化）">
-              上限：{appliedMax > 0 ? appliedMax + ' 只' : '不设限'}
-            </span>
-          )}
-          <button className="btn-confirm" disabled={!enabled} onClick={() => setShowDepositModal(true)} title="向模拟盘增量注入资金">＋ 注入资金</button>
-          <button className="btn-config" disabled={!enabled} onClick={openSettingsModal} title="资金分配 / 仓位上限 / 恢复均分">⚙ 设置</button>
-          <button className="btn-reset" disabled={!enabled} onClick={() => setShowResetModal(true)} title="清盘重置：平仓全部持仓并重置净值">清盘</button>
+          </Tag>
+          {enabled && <Tag>上限：{appliedMax > 0 ? appliedMax + ' 只' : '不设限'}</Tag>}
+          <Button theme="primary" disabled={!enabled} onClick={() => setShowDepositModal(true)}>＋ 注入资金</Button>
+          <Button disabled={!enabled} onClick={openSettingsModal}>⚙ 设置</Button>
+          <Button theme="danger" disabled={!enabled} onClick={() => setShowResetModal(true)}>清盘</Button>
         </div>
       </div>
 
-      {showDepositModal && (
-        <div className="modal-overlay" onClick={() => setShowDepositModal(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-title">注入资金</div>
-            <div className="form-row">
-              <label>金额（元）</label>
-              <input type="number" min="0" step="1000" placeholder="10000" value={depositAmount} onChange={(e) => setDepositAmount(parseFloat(e.target.value) || 0)} />
-            </div>
-            <div className="modal-actions">
-              <button className="btn-cancel" onClick={() => setShowDepositModal(false)}>取消</button>
-              <button className="btn-confirm" onClick={() => { confirmDeposit(); setShowDepositModal(false) }}>确认注入</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* 注入资金弹窗 */}
+      <Dialog
+        visible={showDepositModal}
+        header="注入资金"
+        onClose={() => setShowDepositModal(false)}
+        onConfirm={() => { confirmDeposit(); setShowDepositModal(false) }}
+        confirmBtn="确认注入"
+      >
+        <Form layout="vertical">
+          <Form.FormItem label="金额（元）">
+            <InputNumber value={depositAmount} min={0} step={1000} placeholder="10000" onChange={(v) => setDepositAmount(v || 0)} style={{ width: 240 }} />
+          </Form.FormItem>
+        </Form>
+      </Dialog>
 
-      {showResetModal && (
-        <div className="modal-overlay" onClick={() => setShowResetModal(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-title">⚠ 清盘重置</div>
-            <div className="config-hint" style={{ color: '#e6a23c' }}>将平仓全部持仓、清除成交日志与净值曲线。</div>
-            <div className="form-row">
-              <label>重置后初始资金</label>
-              <input type="number" min="0" step="10000" placeholder="默认 100000" value={resetToCapital} onChange={(e) => setResetToCapital(parseFloat(e.target.value) || 0)} />
-              <span className="static-val">元</span>
-            </div>
-            <div className="config-hint">不填则按当前累计投入总额重置。</div>
-            <div className="form-row">
-              <label>持仓上限</label>
-              <input type="number" min="0" step="1" placeholder="0=不设限" value={resetMaxPos} onChange={(e) => setResetMaxPos(parseFloat(e.target.value) || 0)} />
-            </div>
-            <div className="modal-actions">
-              <button className="btn-cancel" onClick={() => setShowResetModal(false)}>取消</button>
-              <button className="btn-reset" onClick={doResetV2}>确认清盘</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* 清盘弹窗 */}
+      <Dialog
+        visible={showResetModal}
+        header="⚠ 清盘重置"
+        onClose={() => setShowResetModal(false)}
+        onConfirm={doResetV2}
+        confirmBtn="确认清盘"
+      >
+        <div style={{ color: '#e6a23c', marginBottom: 8 }}>将平仓全部持仓、清除成交日志与净值曲线。</div>
+        <Form layout="vertical">
+          <Form.FormItem label="重置后初始资金">
+            <InputNumber value={resetToCapital} min={0} step={10000} placeholder="默认 100000" onChange={(v) => setResetToCapital(v || 0)} style={{ width: 240 }} />
+            <span style={{ fontSize: 12, color: '#888' }}>元（不填则按当前累计投入总额重置）</span>
+          </Form.FormItem>
+          <Form.FormItem label="持仓上限">
+            <InputNumber value={resetMaxPos} min={0} step={1} placeholder="0=不设限" onChange={(v) => setResetMaxPos(v || 0)} style={{ width: 240 }} />
+          </Form.FormItem>
+        </Form>
+      </Dialog>
 
-      {settingsOpen && (
-        <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
-          <div className="modal pool-config-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-title">⚙ 设置</div>
-            <div className="settings-tabs">
-              <button className={['tab', settingsTab === 'alloc' ? 'active' : ''].join(' ')} onClick={() => setSettingsTab('alloc')}>资金分配</button>
-              <button className={['tab', settingsTab === 'caps' ? 'active' : ''].join(' ')} onClick={() => setSettingsTab('caps')}>仓位上限</button>
-              <button className={['tab', settingsTab === 'rules' ? 'active' : ''].join(' ')} onClick={() => setSettingsTab('rules')}>买入纪律</button>
+      {/* 统一设置弹窗 */}
+      <Dialog
+        visible={settingsOpen}
+        header="⚙ 设置"
+        onClose={() => setSettingsOpen(false)}
+        onConfirm={saveSettings}
+        confirmBtn="保存"
+        width={640}
+      >
+        <Tabs value={settingsTab} onChange={(v) => setSettingsTab(v)}>
+          <Tabs.TabPanel value="alloc" label="资金分配">
+            <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>每池资金额（Σ ≈ 总现金守恒）。不影响仓位上限。</div>
+            {pools.map((p) => (
+              <Form.FormItem key={'sa-' + p.key} label={p.label}>
+                <InputNumber
+                  value={cfgAllocs[p.key]}
+                  min={0} step={1000}
+                  placeholder={'当前 ¥' + fmt(p.cash)}
+                  onChange={(v) => setCfgAllocs({ ...cfgAllocs, [p.key]: v || 0 })}
+                  style={{ width: 240 }}
+                />
+              </Form.FormItem>
+            ))}
+          </Tabs.TabPanel>
+          <Tabs.TabPanel value="caps" label="仓位上限">
+            <Form.FormItem label="全局持仓上限（0=不设限）">
+              <InputNumber value={cfgMaxPos} min={0} step={1} placeholder="0=不设限" onChange={(v) => setCfgMaxPos(v || 0)} style={{ width: 240 }} />
+            </Form.FormItem>
+            <div style={{ fontSize: 12, color: '#888', margin: '8px 0' }}>每池持仓上限（0=不单独设限）。Σ ≤ 全局。不影响资金分配。</div>
+            {pools.map((p) => (
+              <Form.FormItem key={'sc-' + p.key} label={p.label}>
+                <InputNumber
+                  value={cfgCaps[p.key]}
+                  min={0} step={1}
+                  placeholder={p.max_pos > 0 ? '当前 ' + p.max_pos : '不单独设限'}
+                  onChange={(v) => setCfgCaps({ ...cfgCaps, [p.key]: v || 0 })}
+                  style={{ width: 240 }}
+                />
+              </Form.FormItem>
+            ))}
+          </Tabs.TabPanel>
+          <Tabs.TabPanel value="rules" label="买入纪律">
+            <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>
+              每池买入纪律：日限次数 / 冷却分钟 / 最低评分 / 日预算%。全 0 = 不设限；寻优审批会自动把门槛写入对应池的「最低评分」。
             </div>
-            {settingsTab === 'alloc' && (
+            <Select value={cfgRuleSel} onChange={(v) => setCfgRuleSel(v)} style={{ width: 240, marginBottom: 8 }}>
+              {pools.map((p) => <Select.Option key={'sel-' + p.key} value={p.key}>{p.label}</Select.Option>)}
+            </Select>
+            {cfgRules[cfgRuleSel] && (
               <div>
-                <div className="config-hint">每池资金额（Σ ≈ 总现金守恒）。不影响仓位上限。</div>
-                {pools.map((p) => (
-                  <div className="pool-config-row" key={'sa-' + p.key}>
-                    <span className="pool-config-label">{p.label}</span>
-                    <input type="number" min="0" step="1000" className="cfg-input"
-                      placeholder={'当前 ¥' + fmt(p.cash)}
-                      value={cfgAllocs[p.key] ?? ''}
-                      onChange={(e) => setCfgAllocs({ ...cfgAllocs, [p.key]: parseFloat(e.target.value) || 0 })} />
-                  </div>
-                ))}
+                <div style={{ marginBottom: 8 }}>
+                  {poolLabel(cfgRuleSel)}
+                  {poolCurrentRule(cfgRuleSel) && <span style={{ color: '#888' }}>（当前生效：{poolCurrentRuleText(cfgRuleSel)}）</span>}
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                  <Form.FormItem label="日限买">
+                    <InputNumber value={cfgRules[cfgRuleSel].max_daily_buys} min={0} step={1} placeholder="0=不限" onChange={(v) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], max_daily_buys: v || 0 } })} />
+                  </Form.FormItem>
+                  <Form.FormItem label="冷却(分)">
+                    <InputNumber value={cfgRules[cfgRuleSel].cooldown_minutes} min={0} step={5} placeholder="0=不限" onChange={(v) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], cooldown_minutes: v || 0 } })} />
+                  </Form.FormItem>
+                  <Form.FormItem label="最低分">
+                    <InputNumber value={cfgRules[cfgRuleSel].min_score} min={0} max={100} step={1} placeholder="0=不过滤" onChange={(v) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], min_score: v || 0 } })} />
+                  </Form.FormItem>
+                  <Form.FormItem label="日预算%">
+                    <InputNumber value={cfgRules[cfgRuleSel].budget_pct_per_day} min={0} max={100} step={5} placeholder="0=不限" onChange={(v) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], budget_pct_per_day: v || 0 } })} />
+                  </Form.FormItem>
+                </div>
               </div>
             )}
-            {settingsTab === 'caps' && (
-              <div>
-                <div className="form-row">
-                  <label>全局持仓上限</label>
-                  <input type="number" min="0" step="1" placeholder="0=不设限" value={cfgMaxPos} onChange={(e) => setCfgMaxPos(parseInt(e.target.value, 10) || 0)} />
-                  <span className="static-val">（0=不设限）</span>
-                </div>
-                <div className="config-hint">每池持仓上限（0=不单独设限）。Σ ≤ 全局。不影响资金分配。</div>
-                {pools.map((p) => (
-                  <div className="pool-config-row" key={'sc-' + p.key}>
-                    <span className="pool-config-label">{p.label}</span>
-                    <input type="number" min="0" step="1" className="cfg-input cfg-cap"
-                      placeholder={p.max_pos > 0 ? '当前 ' + p.max_pos : '不单独设限'}
-                      value={cfgCaps[p.key] ?? ''}
-                      onChange={(e) => setCfgCaps({ ...cfgCaps, [p.key]: parseInt(e.target.value, 10) || 0 })} />
-                  </div>
-                ))}
-              </div>
-            )}
-            {settingsTab === 'rules' && (
-              <div>
-                <div className="config-hint">
-                  每池买入纪律：日限次数 / 冷却分钟 / 最低评分 / 日预算%。全 0 = 不设限；
-                  寻优审批会自动把门槛写入对应池的「最低评分」。
-                </div>
-                <div className="pool-rules-row">
-                  <select className="cfg-select" value={cfgRuleSel} onChange={(e) => setCfgRuleSel(e.target.value)}>
-                    {pools.map((p) => <option key={'sel-' + p.key} value={p.key}>{p.label}</option>)}
-                  </select>
-                  {cfgRules[cfgRuleSel] && (
-                    <div>
-                      <div className="pool-rules-head">{poolLabel(cfgRuleSel)}{poolCurrentRule(cfgRuleSel) && <span className="rules-now">（当前生效：{poolCurrentRuleText(cfgRuleSel)}）</span>}</div>
-                      <div className="pool-rules-grid">
-                        <label>日限买<input type="number" min="0" step="1" placeholder="0=不限" value={cfgRules[cfgRuleSel].max_daily_buys} onChange={(e) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], max_daily_buys: parseInt(e.target.value, 10) || 0 } })} /></label>
-                        <label>冷却(分)<input type="number" min="0" step="5" placeholder="0=不限" value={cfgRules[cfgRuleSel].cooldown_minutes} onChange={(e) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], cooldown_minutes: parseInt(e.target.value, 10) || 0 } })} /></label>
-                        <label>最低分<input type="number" min="0" max="100" step="1" placeholder="0=不过滤" value={cfgRules[cfgRuleSel].min_score} onChange={(e) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], min_score: parseFloat(e.target.value) || 0 } })} /></label>
-                        <label>日预算%<input type="number" min="0" max="100" step="5" placeholder="0=不限" value={cfgRules[cfgRuleSel].budget_pct_per_day} onChange={(e) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], budget_pct_per_day: parseFloat(e.target.value) || 0 } })} /></label>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-            {cfgWarn && <div className="preview">{cfgWarn}</div>}
-            <div className="modal-actions">
-              <button className="btn-cancel" onClick={() => setSettingsOpen(false)}>取消</button>
-              <button className="btn-confirm" onClick={saveSettings}>保存</button>
-            </div>
-          </div>
-        </div>
-      )}
+          </Tabs.TabPanel>
+        </Tabs>
+        {cfgWarn && <div style={{ color: '#e6a23c', marginTop: 8 }}>{cfgWarn}</div>}
+      </Dialog>
 
+      {/* 分仓资金池条 */}
       {enabled && pools.length > 0 && (
-        <div className="pools-bar">
-          <div className="pools-title">分仓资金池</div>
-          <div className={['pool-chip', activePool === null ? 'active' : ''].join(' ')} onClick={() => setActivePool(null)}>
-            <span className="pool-label">全部</span>
-            <span className="pool-meta">{positions.length} 仓</span>
-          </div>
-          {pools.map((p) => (
-            <div key={p.key}
-              className={['pool-chip', activePool === normPoolKey(p.key) ? 'active' : '', !p.key ? 'other' : ''].join(' ')}
-              title={p.key || '其他/手动'}
-              onClick={() => setActivePool(activePool === normPoolKey(p.key) ? null : normPoolKey(p.key))}>
-              <span className="pool-label">{p.label}</span>
-              <span className={['pool-return', pnlCls(p.return_pct)].join(' ')}>
-                {(p.return_pct >= 0 ? '+' : '') + p.return_pct.toFixed(2)}%
-              </span>
-              <span className="pool-cash">¥{fmt(p.cash)}</span>
-              <span className="pool-meta">{p.ratio_pct.toFixed(1)}% · {p.positions} 仓</span>
-            </div>
-          ))}
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <span style={{ color: '#888', fontSize: 13 }}>分仓资金池</span>
+          <Tag
+            style={{ cursor: 'pointer', background: activePool === null ? '#2b2b44' : undefined, color: activePool === null ? '#fff' : undefined }}
+            onClick={() => setActivePool(null)}
+          >
+            全部（{positions.length} 仓）
+          </Tag>
+          {pools.map((p) => {
+            const key = normPoolKey(p.key)
+            const active = activePool === key
+            return (
+              <Tag
+                key={p.key}
+                style={{ cursor: 'pointer', background: active ? '#2b2b44' : undefined, color: active ? '#fff' : undefined }}
+                onClick={() => setActivePool(active ? null : key)}
+              >
+                {p.label} <span style={{ color: p.return_pct >= 0 ? UP : DOWN }}>{(p.return_pct >= 0 ? '+' : '') + p.return_pct.toFixed(2)}%</span> · ¥{fmt(p.cash)} · {p.ratio_pct.toFixed(1)}%·{p.positions}仓
+              </Tag>
+            )
+          })}
           {activePool !== null && (
-            <button className="btn-pool-reset" disabled={!enabled} onClick={confirmPoolReset}>清盘本池</button>
+            <Button size="small" theme="warning" disabled={!enabled} onClick={confirmPoolReset}>清盘本池</Button>
           )}
         </div>
       )}
 
+      {/* 统计范围标签 */}
       {enabled && activePool !== null && (
-        <div className="stats-scope"><span className="stats-scope-tag">统计范围：{activePoolLabel}</span></div>
+        <div style={{ marginBottom: 8 }}><Tag>统计范围：{activePoolLabel}</Tag></div>
       )}
+
+      {/* 绩效统计卡 */}
       {activeStats && (
-        <div className="stats-grid">
-          <div className="stat-card"><div className="stat-label">总资产</div><div className="stat-value">¥{fmt(activeStats.total_value)}</div></div>
-          <div className="stat-card">
-            <div className="stat-label">总收益</div>
-            <div className={['stat-value', activeStats.total_return_pct >= 0 ? 'up' : 'down'].join(' ')}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+          <StatCard label="总资产">¥{fmt(activeStats.total_value)}</StatCard>
+          <StatCard label="总收益">
+            <span style={{ color: activeStats.total_return_pct >= 0 ? UP : DOWN }}>
               {(activeStats.total_return_pct >= 0 ? '+' : '') + activeStats.total_return_pct.toFixed(2)}%
-              <em className="sub">基于累计投入 ¥{fmt(activeStats.initial_capital)}</em>
-            </div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-label">当日收益</div>
-            <div className={['stat-value', activeStats.today_return_pct >= 0 ? 'up' : 'down'].join(' ')}>
+            </span>
+            <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}> 基于累计投入 ¥{fmt(activeStats.initial_capital)}</em>
+          </StatCard>
+          <StatCard label="当日收益">
+            <span style={{ color: activeStats.today_return_pct >= 0 ? UP : DOWN }}>
               {(activeStats.today_return_pct >= 0 ? '+' : '') + activeStats.today_return_pct.toFixed(2)}%
-            </div>
-          </div>
-          <div className="stat-card"><div className="stat-label">现金</div><div className="stat-value">¥{fmt(activeStats.cash)}</div></div>
-          <div className="stat-card">
-            <div className="stat-label">持仓市值 / 已实现盈亏</div>
-            <div className="stat-value">
-              ¥{fmt(activeStats.market_value)}
-              <em className={['sub', activeStats.realized_pnl >= 0 ? 'up' : 'down'].join(' ')}>
-                {(activeStats.realized_pnl >= 0 ? '+' : '')}¥{fmt(activeStats.realized_pnl)}
-              </em>
-            </div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-label">已平仓胜率</div>
-            <div className="stat-value">{activeStats.win_rate_pct.toFixed(0)}% <em className="sub">/ {activeStats.open_positions}仓</em></div>
-          </div>
+            </span>
+          </StatCard>
+          <StatCard label="现金">¥{fmt(activeStats.cash)}</StatCard>
+          <StatCard label="持仓市值 / 已实现盈亏">
+            ¥{fmt(activeStats.market_value)}
+            <em style={{ fontSize: 12, color: activeStats.realized_pnl >= 0 ? UP : DOWN, fontStyle: 'normal' }}>
+              {' '}{(activeStats.realized_pnl >= 0 ? '+' : '')}¥{fmt(activeStats.realized_pnl)}
+            </em>
+          </StatCard>
+          <StatCard label="已平仓胜率">{activeStats.win_rate_pct.toFixed(0)}% <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}>/ {activeStats.open_positions}仓</em></StatCard>
         </div>
       )}
 
+      {/* 信号质量统计卡（仅联动版） */}
       {activeStats && isAdmin && (
-        <div className="stats-grid quality">
-          <div className="stat-card"><div className="stat-label">已撮合买入信号</div><div className="stat-value">{activeStats.filled_buys}</div></div>
-          <div className="stat-card">
-            <div className="stat-label">平均成交延迟</div>
-            <div className="stat-value">{activeStats.avg_latency_sec}s <em className="sub">最大 {activeStats.max_latency_sec}s</em></div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-label">平均滑点（成交 vs 信号价）</div>
-            <div className={['stat-value', activeStats.avg_slippage_pct >= 0 ? 'down' : 'up'].join(' ')}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+          <StatCard label="已撮合买入信号">{activeStats.filled_buys}</StatCard>
+          <StatCard label="平均成交延迟">{activeStats.avg_latency_sec}s <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}>最大 {activeStats.max_latency_sec}s</em></StatCard>
+          <StatCard label="平均滑点（成交 vs 信号价）">
+            <span style={{ color: activeStats.avg_slippage_pct >= 0 ? UP : DOWN }}>
               {(activeStats.avg_slippage_pct >= 0 ? '+' : '') + activeStats.avg_slippage_pct.toFixed(2)}%
-            </div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-label">滑点累计成本</div>
-            <div className={['stat-value', activeStats.slippage_cost >= 0 ? 'down' : 'up'].join(' ')}>
+            </span>
+          </StatCard>
+          <StatCard label="滑点累计成本">
+            <span style={{ color: activeStats.slippage_cost >= 0 ? UP : DOWN }}>
               {(activeStats.slippage_cost >= 0 ? '+' : '')}¥{fmt(activeStats.slippage_cost)}
-              <em className="sub">占初始 {activeStats.signal_amount_pct.toFixed(2)}%</em>
-            </div>
-          </div>
+            </span>
+            <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}> 占初始 {activeStats.signal_amount_pct.toFixed(2)}%</em>
+          </StatCard>
         </div>
       )}
 
+      {/* 净值曲线 */}
       {isAdmin && (
-        <div className="panel">
-          <div className="panel-title">净值曲线 <em className="sub">（{stats?.equity_curve_points || 0} 个交易日）</em></div>
+        <Card title={<span>净值曲线 <em style={{ color: '#888', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em></span>} style={{ marginBottom: 12 }}>
           {equity.length > 1 ? (
-            <svg className="equity-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+            <svg className="equity-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: H }}>
               <polyline points={linePoints} fill="none" stroke="#FF4D4F" strokeWidth="2" />
-              {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} className="grid-line" />)}
+              {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} style={{ stroke: '#2a2a3e' }} />)}
             </svg>
           ) : <div className="empty-hint">净值数据不足（自动撮合开启并产生成交后显示）</div>}
-        </div>
+        </Card>
       )}
 
-      <div className="tabs">
-        <button className={['tab', tab === 'positions' ? 'active' : ''].join(' ')} onClick={() => setTab('positions')}>
-          当前持仓 <em className="sub">{filteredPositions.length} 只</em>
-        </button>
-        <button className={['tab', tab === 'trades' ? 'active' : ''].join(' ')} onClick={() => setTab('trades')}>
-          成交日志 <em className="sub">{filteredTrades.length} 笔 · 近3月</em>
-        </button>
-        <button className={['tab', tab === 'orders' ? 'active' : ''].join(' ')} onClick={() => setTab('orders')}>
-          订单 <em className="sub">{filteredOrders.length} 笔</em>
-        </button>
-      </div>
-
-      {tab === 'positions' && (
-        <div className="panel">
-          <div className="panel-title">当前持仓 <em className="sub">{filteredPositions.length} 只</em></div>
-          {filteredPositions.length ? (
-            <div className="positions-table">
-              <div className="table-header">
-                <span className="col-code">代码</span><span className="col-name">名称</span>
-                <span className="col-time">买入时间</span><span className="col-num">数量</span>
-                <span className="col-price">成本价</span><span className="col-price">现价</span>
-                <span className="col-chg">浮盈</span><span className="col-chg">浮盈%</span>
-                <span className="col-chg">滑点</span><span className="col-num">延迟</span>
-                <span className="col-pool">池</span><span className="col-kline">分时</span>
-                <span className="col-actions">操作</span>
+      {/* 持仓 / 成交 / 订单 */}
+      <Tabs value={tab} onChange={(v) => setTab(v)} style={{ marginBottom: 8 }}>
+        <Tabs.TabPanel value="positions" label={`当前持仓 (${filteredPositions.length})`}>
+          <Card>
+            {posData.length ? (
+              <Table
+                rowKey="__key"
+                data={posData}
+                columns={posColumns}
+                expandedRow={renderKline}
+                expandedRowKeys={[...klineOpen]}
+                onExpandChange={(keys) => setKlineOpen(new Set(keys))}
+                onRowClick={({ row }) => onRowTap(row)}
+                bordered
+                size="small"
+              />
+            ) : (
+              <div className="empty-hint">
+                {isAdmin ? '暂无持仓（出现可开仓信号时按实时价自动买入）' : '暂无持仓（在信号页点「模拟买入」，或上方加仓/减仓管理已有持仓）'}
               </div>
-              {filteredPositions.map((p) => (
-                <div className="pos-row-group" key={p.code}>
-                  <div className="table-row" onClick={() => onRowTap(p)}>
-                    <span className="col-code" data-label="代码">{p.code}</span>
-                    <span className="col-name" data-label="名称">{p.name}</span>
-                    <span className="col-time" data-label="买入时间" title={'信号发出 ' + fmtTime(p.signal_at) + ' · 撮合成交 ' + fmtTime(p.filled_at)}>
-                      {fmtTime(p.filled_at || p.signal_at)}
-                    </span>
-                    <span className="col-num" data-label="数量">{p.qty}</span>
-                    <span className="col-price" data-label="成本价">{p.cost_price.toFixed(2)}</span>
-                    <span className="col-price" data-label="现价">{(p.mark || 0).toFixed(2)}</span>
-                    <span className={['col-chg', pnlCls(p.pnl)].join(' ')} data-label="浮盈">{fmt(p.pnl)}</span>
-                    <span className={['col-chg', pnlCls(p.pnl)].join(' ')} data-label="浮盈%">{fmt(p.pnl_pct)}%</span>
-                    <span className={['col-chg', pnlCls(p.slippage_pct)].join(' ')} data-label="滑点">{fmt(p.slippage_pct)}%</span>
-                    <span className="col-num" data-label="延迟">{p.latency_sec}s</span>
-                    <span className="col-pool" data-label="池"><span className="tag">{poolLabel(p.strategy_type)}</span></span>
-                    <span className="col-kline" data-label="分时">
-                      <button className="btn-kline" onClick={(e) => { e.stopPropagation(); toggleKline(p.code) }} title={klineOpen.has(p.code) ? '收起分时' : '展开分时'}>
-                        {klineOpen.has(p.code) ? '收起' : '分时'}
-                      </button>
-                    </span>
-                    <span className="col-actions" data-label="操作">
-                      <button className="btn-lot" onClick={(e) => { e.stopPropagation(); openTrade(p, 'add') }}>加仓</button>
-                      <button className="btn-cost" onClick={(e) => { e.stopPropagation(); openTrade(p, 'trim') }}>减仓</button>
-                      <button className="btn-sell" onClick={(e) => { e.stopPropagation(); openTrade(p, 'close') }}>清仓</button>
-                    </span>
-                  </div>
-                  {klineOpen.has(p.code) && (
-                    <div className="pos-kline-row">
-                      <div className="kline-flex">
-                        <div className="kline-main"><KLineChart code={p.code} name={p.name} /></div>
-                        <div className="depth-side"><DepthPanel code={p.code} name={p.name} /></div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="empty-hint">
-              {isAdmin ? '暂无持仓（出现可开仓信号时按实时价自动买入）' : '暂无持仓（在信号页点「模拟买入」，或上方加仓/减仓管理已有持仓）'}
-            </div>
-          )}
-        </div>
-      )}
-
-      {tab === 'trades' && (
-        <div className="panel">
-          <div className="panel-title">成交日志 <em className="sub">{filteredTrades.length} 笔 · 近3个月</em></div>
-          {filteredTrades.length ? (
-            <div className="positions-table">
-              <div className="table-header">
-                <span className="col-time">时间</span><span className="col-side">方向</span>
-                <span className="col-code">代码</span><span className="col-name">名称</span>
-                <span className="col-pool">战法</span><span className="col-num">数量</span>
-                <span className="col-price">价格</span><span className="col-price">金额</span>
-                <span className="col-chg">滑点</span><span className="col-num">延迟</span>
-                <span className="col-kline">分时</span>
-              </div>
-              {filteredTrades.map((t, i) => (
-                <div className="pos-row-group" key={i}>
-                  <div className="table-row" onClick={() => onTradeTap(t, i)}>
-                    <span className="col-time" data-label="时间">{fmtTime(t.time)}</span>
-                    <span className="col-side" data-label="方向"><span className={['tag', t.side === 'buy' ? 'buy' : 'sell'].join(' ')}>{t.side === 'buy' ? '买入' : '卖出'}</span></span>
-                    <span className="col-code" data-label="代码">{t.code}</span>
-                    <span className="col-name" data-label="名称">{t.name}</span>
-                    <span className="col-pool" data-label="战法"><span className="tag">{t.strategy}</span></span>
-                    <span className="col-num" data-label="数量">{t.qty}</span>
-                    <span className="col-price" data-label="价格">{t.price.toFixed(2)}</span>
-                    <span className="col-price" data-label="金额">{fmt(t.amount)}</span>
-                    <span className={['col-chg', tradeSlippageCls(t)].join(' ')} data-label="滑点">{tradeSlippage(t)}</span>
-                    <span className="col-num" data-label="延迟">{t.side === 'buy' ? (t.latency_sec || 0) + 's' : '—'}</span>
-                    <span className="col-kline" data-label="分时">
-                      <button className="btn-kline" onClick={(e) => { e.stopPropagation(); toggleKline('trade_' + i) }}>{klineOpen.has('trade_' + i) ? '收起' : '分时'}</button>
-                    </span>
-                  </div>
-                  {klineOpen.has('trade_' + i) && (
-                    <div className="pos-kline-row">
-                      <div className="kline-flex">
-                        <div className="kline-main"><KLineChart code={t.code} name={t.name} /></div>
-                        <div className="depth-side"><DepthPanel code={t.code} name={t.name} /></div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          ) : <div className="empty-hint">暂无成交记录</div>}
-        </div>
-      )}
-
-      {tab === 'orders' && (
-        <div className="panel">
-          <div className="panel-title">订单记录 <em className="sub">{filteredOrders.length} 笔 · 含被拒留痕</em></div>
-          {filteredOrders.length ? (
-            <div className="positions-table">
-              <div className="table-header">
-                <span className="col-time">时间</span><span className="col-side">方向</span>
-                <span className="col-code">代码</span><span className="col-name">名称</span>
-                <span className="col-pool">来源</span><span className="col-num">状态</span>
-                <span className="col-num">数量</span><span className="col-price">成交价</span>
-                <span className="col-price">信号价</span><span className="col-name">说明</span>
-              </div>
-              {filteredOrders.map((o, i) => (
-                <div className="table-row" key={o.id || i}>
-                  <span className="col-time" data-label="时间">{fmtTime(o.created_at)}</span>
-                  <span className="col-side" data-label="方向"><span className={['tag', o.side === 'buy' ? 'buy' : 'sell'].join(' ')}>{o.side === 'buy' ? '买入' : '卖出'}</span></span>
-                  <span className="col-code" data-label="代码">{o.code}</span>
-                  <span className="col-name" data-label="名称">{o.name}</span>
-                  <span className="col-pool" data-label="来源"><span className="tag">{o.kind || '—'}</span></span>
-                  <span className="col-num" data-label="状态"><span className={['tag', orderStatusCls(o.status)].join(' ')}>{orderStatusText(o.status)}</span></span>
-                  <span className="col-num" data-label="数量">{o.qty || '—'}</span>
-                  <span className="col-price" data-label="成交价">{o.price ? o.price.toFixed(2) : '—'}</span>
-                  <span className="col-price" data-label="信号价">{o.signal_price ? o.signal_price.toFixed(2) : '—'}</span>
-                  <span className="col-name" data-label="说明" title={o.reason || ''}>{shortReason(o.reason)}</span>
-                </div>
-              ))}
-            </div>
-          ) : <div className="empty-hint">暂无订单记录</div>}
-        </div>
-      )}
-
-      {sheetPos && (
-        <div className="sheet-overlay" onClick={() => setSheetPos(null)}>
-          <div className="action-sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-title">{sheetPos.code} {sheetPos.name}</div>
-            <button className="sheet-btn" onClick={sheetKline}>{klineOpen.has(sheetPos.code) ? '收起分时' : '展开分时'}</button>
-            <button className="sheet-btn" onClick={() => sheetTrade('add')}>加仓</button>
-            <button className="sheet-btn" onClick={() => sheetTrade('trim')}>减仓</button>
-            <button className="sheet-btn sheet-danger" onClick={() => sheetTrade('close')}>清仓</button>
-            <button className="sheet-btn sheet-cancel" onClick={() => setSheetPos(null)}>取消</button>
-          </div>
-        </div>
-      )}
-      {sheetTradeRow && (
-        <div className="sheet-overlay" onClick={() => setSheetTradeRow(null)}>
-          <div className="action-sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-title">{sheetTradeRow.code} {sheetTradeRow.name}</div>
-            <button className="sheet-btn" onClick={sheetTradeKline}>
-              {klineOpen.has('trade_' + sheetTradeRow.idx) ? '收起分时' : '展开分时'}
-            </button>
-            <button className="sheet-btn sheet-cancel" onClick={() => setSheetTradeRow(null)}>取消</button>
-          </div>
-        </div>
-      )}
-
-      {tradeModal && (
-        <div className="modal-overlay" onClick={() => setTradeModal(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-title">
-              {tradeDir === 'add' ? '加仓' : (tradeDir === 'trim' ? '减仓' : '清仓')}
-              {tradeTarget?.code} {tradeTarget?.name}
-            </div>
-            <div className="form-row">
-              <label>当前持仓</label>
-              <span className="static-val">{tradeTarget?.qty} 股 / 成本 ¥{tradeTarget?.cost_price?.toFixed(2)}</span>
-            </div>
-            <div className="form-row">
-              <label>价格</label>
-              <input type="number" step="0.001" placeholder="成交价格（留空用实时价）" value={tradeFormPrice} onChange={(e) => setTradeFormPrice(parseFloat(e.target.value) || 0)} />
-            </div>
-            <div className="form-row">
-              <label>{tradeDir === 'add' ? '加仓手数' : (tradeDir === 'trim' ? '减仓手数' : '清仓')}</label>
-              {tradeDir !== 'close'
-                ? <input type="number" step="1" placeholder="手数（1手=100股）" value={tradeFormQty} onChange={(e) => setTradeFormQty(parseInt(e.target.value, 10) || 1)} />
-                : <span className="static-val">{tradeTarget?.qty} 股（全部）</span>}
-            </div>
-            {tradeDir === 'trim' && tradePreviewQty > 0 && (
-              <div className="preview">减仓后：剩余 {tradeTarget.qty - tradePreviewQty * 100} 股</div>
             )}
-            <div className="modal-actions">
-              <button className="btn-cancel" onClick={() => setTradeModal(false)}>取消</button>
-              <button className={['btn-confirm', tradeDir === 'close' ? 'btn-confirm-sell' : ''].join(' ')} onClick={confirmTrade} disabled={tradeOverSell}>确定</button>
-            </div>
-          </div>
+          </Card>
+        </Tabs.TabPanel>
+        <Tabs.TabPanel value="trades" label={`成交日志 (${filteredTrades.length})`}>
+          <Card>
+            {tradeData.length ? (
+              <Table
+                rowKey="__key"
+                data={tradeData}
+                columns={tradeColumns}
+                expandedRow={renderKline}
+                expandedRowKeys={[...klineOpen]}
+                onExpandChange={(keys) => setKlineOpen(new Set(keys))}
+                onRowClick={({ row }) => onTradeTap(row, row.__idx)}
+                bordered
+                size="small"
+              />
+            ) : <div className="empty-hint">暂无成交记录</div>}
+          </Card>
+        </Tabs.TabPanel>
+        <Tabs.TabPanel value="orders" label={`订单 (${filteredOrders.length})`}>
+          <Card>
+            {orderData.length ? (
+              <Table rowKey="__key" data={orderData} columns={orderColumns} bordered size="small" />
+            ) : <div className="empty-hint">暂无订单记录</div>}
+          </Card>
+        </Tabs.TabPanel>
+      </Tabs>
+
+      {/* 移动端：持仓行操作菜单 */}
+      <Dialog visible={!!sheetPos} header={sheetPos ? sheetPos.code + ' ' + sheetPos.name : ''} onClose={() => setSheetPos(null)} footer={null}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <Button block onClick={sheetKline}>{sheetPos && klineOpen.has(sheetPos.code) ? '收起分时' : '展开分时'}</Button>
+          <Button block onClick={() => sheetTrade('add')}>加仓</Button>
+          <Button block onClick={() => sheetTrade('trim')}>减仓</Button>
+          <Button block theme="danger" onClick={() => sheetTrade('close')}>清仓</Button>
+          <Button block onClick={() => setSheetPos(null)}>取消</Button>
         </div>
-      )}
+      </Dialog>
+      {/* 移动端：成交行操作菜单 */}
+      <Dialog visible={!!sheetTradeRow} header={sheetTradeRow ? sheetTradeRow.code + ' ' + sheetTradeRow.name : ''} onClose={() => setSheetTradeRow(null)} footer={null}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <Button block onClick={sheetTradeKline}>
+            {sheetTradeRow && klineOpen.has('trade_' + sheetTradeRow.idx) ? '收起分时' : '展开分时'}
+          </Button>
+          <Button block onClick={() => setSheetTradeRow(null)}>取消</Button>
+        </div>
+      </Dialog>
+
+      {/* 交易弹窗：加仓 / 减仓 / 清仓 */}
+      <Dialog
+        visible={tradeModal}
+        header={(tradeDir === 'add' ? '加仓' : tradeDir === 'trim' ? '减仓' : '清仓') + (tradeTarget ? ' ' + tradeTarget.code + ' ' + tradeTarget.name : '')}
+        onClose={() => setTradeModal(false)}
+        onConfirm={confirmTrade}
+        confirmBtn={{ content: '确定', disabled: tradeOverSell, theme: tradeDir === 'close' ? 'danger' : 'primary' }}
+      >
+        <Form layout="vertical">
+          <Form.FormItem label="当前持仓">
+            <span>{tradeTarget?.qty} 股 / 成本 ¥{tradeTarget?.cost_price?.toFixed(2)}</span>
+          </Form.FormItem>
+          <Form.FormItem label="价格">
+            <InputNumber value={tradeFormPrice} step={0.001} placeholder="成交价格（留空用实时价）" onChange={(v) => setTradeFormPrice(v || 0)} style={{ width: 240 }} />
+          </Form.FormItem>
+          <Form.FormItem label={tradeDir === 'add' ? '加仓手数' : tradeDir === 'trim' ? '减仓手数' : '清仓'}>
+            {tradeDir !== 'close'
+              ? <InputNumber value={tradeFormQty} step={1} placeholder="手数（1手=100股）" onChange={(v) => setTradeFormQty(v || 1)} style={{ width: 240 }} />
+              : <span>{tradeTarget?.qty} 股（全部）</span>}
+          </Form.FormItem>
+          {tradeDir === 'trim' && tradePreviewQty > 0 && (
+            <div style={{ color: '#e6a23c' }}>减仓后：剩余 {tradeTarget.qty - tradePreviewQty * 100} 股</div>
+          )}
+        </Form>
+      </Dialog>
     </div>
   )
 }

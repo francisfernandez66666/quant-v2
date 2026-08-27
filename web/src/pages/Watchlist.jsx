@@ -1,8 +1,9 @@
 // ── 自选股页面 Watchlist.jsx ──
 // 展示自选股多维评分（N形/龙头/双凸/龙回头/动量），支持添加/删除/排序、展开分时+盘口。
+// 全面使用 TDesign 组件：Table / Card / Tag / Button / Input / Dialog。
 import React, { useState, useEffect, useRef } from 'react'
+import { Card, Table, Button, Input, Dialog, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
-import { showToast } from '../ui.jsx'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import './Watchlist.css'
@@ -29,6 +30,12 @@ function scoreClass(score, pass, strongMin) {
   if (pass) return 'ev-score pass'
   return 'ev-score'
 }
+// 评分颜色（红强/黄达标/灰偏低）
+function scoreColor(cls) {
+  if (cls.indexOf('strong') >= 0) return '#e34d59'
+  if (cls.indexOf('pass') >= 0) return '#FAAD14'
+  return '#555'
+}
 
 // 根据多维度评分决定整行高亮样式（强势/关注/普通）
 function rowClass(e) {
@@ -54,13 +61,9 @@ function val(e, key) {
 export default function Watchlist() {
   const [stocks, setStocks] = useState([])
   const [newCode, setNewCode] = useState('')
-  const [sortKey, setSortKey] = useState('')
-  const [sortDir, setSortDir] = useState(-1)
   const [adding, setAdding] = useState(false)
-  const [feedback, setFeedback] = useState('')
-  const [feedbackType, setFeedbackType] = useState('ok')
+  const [expandedKeys, setExpandedKeys] = useState([])
   const [sheetStock, setSheetStock] = useState(null)
-  const [klineOpenCode, setKlineOpenCode] = useState('')
   const timer = useRef(null)
 
   // 初始化：读取缓存、加载数据、启动 30s 轮询
@@ -75,42 +78,15 @@ export default function Watchlist() {
   // 自选股变动时持久化缓存
   useEffect(() => { persistCache(stocks) }, [stocks])
 
-  // 顶部反馈提示，2.5s 后自动消失
-  function showFeedback(msg, type) {
-    setFeedback(msg)
-    setFeedbackType(type || 'ok')
-    setTimeout(() => setFeedback(''), 2500)
-  }
-
   // 按当前排序键计算展示列表，无排序键时按最高维度分倒序
   const sortedEvals = (() => {
     const arr = [...stocks]
-    const sk = sortKey
-    if (!sk) {
-      return arr.sort((a, b) => {
-        const sa = Math.max(a.n_score || 0, a.dragon_score || 0, a.db_score || 0, a.dr_score || 0, a.m_score || 0)
-        const sb = Math.max(b.n_score || 0, b.dragon_score || 0, b.db_score || 0, b.dr_score || 0, b.m_score || 0)
-        return sb - sa
-      })
-    }
-    const dir = sortDir
     return arr.sort((a, b) => {
-      const va = val(a, sk)
-      const vb = val(b, sk)
-      if (typeof va === 'string') return va.localeCompare(vb) * dir
-      return (va - vb) * dir
+      const sa = Math.max(a.n_score || 0, a.dragon_score || 0, a.db_score || 0, a.dr_score || 0, a.m_score || 0)
+      const sb = Math.max(b.n_score || 0, b.dragon_score || 0, b.db_score || 0, b.dr_score || 0, b.m_score || 0)
+      return sb - sa
     })
   })()
-
-  // 切换排序键或排序方向
-  function setSort(key) {
-    if (sortKey === key) setSortDir((d) => d * -1)
-    else { setSortKey(key); setSortDir(-1) }
-  }
-  function sortArrow(key) {
-    if (sortKey !== key) return ''
-    return sortDir === -1 ? ' ▼' : ' ▲'
-  }
 
   // 加载自选行情、评估数据并合并快照信息
   async function load() {
@@ -172,10 +148,9 @@ export default function Watchlist() {
 
   // 添加新自选股代码并立即同步后端
   async function add() {
-    const code = newCode.trim()
+    const code = (newCode || '').trim()
     if (!code || adding) return
     setAdding(true)
-    setFeedback('')
     try {
       const res = await api.addWatchlist(code)
       setNewCode('')
@@ -195,8 +170,8 @@ export default function Watchlist() {
       } else if (!res || !res.duplicate) {
         setStocks((prev) => [...prev, { code, name: code, price: 0, change_pct: 0 }])
       }
-      showFeedback('已添加 ' + code, 'ok')
-    } catch (e) { showFeedback('添加失败: ' + e.message, 'err') }
+      MessagePlugin.success('已添加 ' + code)
+    } catch (e) { MessagePlugin.error('添加失败: ' + (e.message || '')) }
     setAdding(false)
   }
 
@@ -205,13 +180,13 @@ export default function Watchlist() {
     try {
       await api.removeWatchlist(code)
       setStocks((prev) => prev.filter((s) => s.code !== code))
-      showFeedback('已移除 ' + code, 'ok')
-    } catch (e) { showFeedback('删除失败: ' + e.message, 'err') }
+      MessagePlugin.success('已移除 ' + code)
+    } catch (e) { MessagePlugin.error('删除失败: ' + (e.message || '')) }
   }
 
   // 展开/收起指定代码的分时图
   function toggleKline(code) {
-    setKlineOpenCode((c) => (c === code ? '' : code))
+    setExpandedKeys((prev) => prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code])
   }
 
   function onRowTap(e) {
@@ -219,64 +194,53 @@ export default function Watchlist() {
     setSheetStock(e)
   }
 
+  const columns = [
+    { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
+    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name || '-'}</span> },
+    { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
+    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreClass(row.n_score, row.n_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'dragon_score', title: '龙≥70', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => { const c = scoreClass(row.dragon_score, row.dragon_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'db_score', title: '凸≥70', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => { const c = scoreClass(row.db_score, row.db_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'dr_score', title: '回≥60', width: 70, sorter: (a, b) => (a.dr_score || 0) - (b.dr_score || 0), cell: ({ row }) => { const c = scoreClass(row.dr_score, row.dr_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dr_score > 0 ? row.dr_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'm_score', title: '量≥50', width: 70, sorter: (a, b) => (a.m_score || 0) - (b.m_score || 0), cell: ({ row }) => { const c = scoreClass(row.m_score, row.m_pass, 70); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.m_score > 0 ? row.m_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'kline', title: 'K线', width: 80, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{expandedKeys.includes(row.code) ? '收起' : '分时'}</Button> },
+    { colKey: 'op', title: '操作', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); remove(row.code) }}>✕</Button> },
+  ]
+
   return (
     <div className="watchlist-page">
       <div className="page-header">
         <h2>自选股</h2>
         <div className="add-row">
-          <input value={newCode} placeholder="输入代码 (如 000001)" onChange={(e) => setNewCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') add() }} disabled={adding} />
-          <button onClick={add} className="btn-add" disabled={adding}>{adding ? '添加中…' : '添加'}</button>
-          {feedback && <span className={'feedback ' + feedbackType}>{feedback}</span>}
+          <Input value={newCode} placeholder="输入代码 (如 000001)" onChange={(v) => setNewCode(v)} onEnter={() => add()} disabled={adding} style={{ width: 200 }} />
+          <Button theme="primary" onClick={add} loading={adding}>{adding ? '添加中…' : '添加'}</Button>
         </div>
       </div>
 
-      {stocks.length > 0 && (
-        <div className="eval-table">
-          <div className="ev-header">
-            <span className="ev-code sortable" onClick={() => setSort('code')}>代码{sortArrow('code')}</span>
-            <span className="ev-name sortable" onClick={() => setSort('name')}>名称{sortArrow('name')}</span>
-            <span className="ev-price sortable" onClick={() => setSort('price')}>现价{sortArrow('price')}</span>
-            <span className="ev-chg sortable" onClick={() => setSort('change_pct')}>涨跌{sortArrow('change_pct')}</span>
-            <span className="ev-n sortable" onClick={() => setSort('n_score')} title="N形≥60可操作">N≥60{sortArrow('n_score')}</span>
-            <span className="ev-dragon sortable" onClick={() => setSort('dragon_score')} title="龙头≥70买入,≥50观察">龙≥70{sortArrow('dragon_score')}</span>
-            <span className="ev-db sortable" onClick={() => setSort('db_score')} title="双凸≥70买入,50-70观察">凸≥70{sortArrow('db_score')}</span>
-            <span className="ev-dr sortable" onClick={() => setSort('dr_score')} title="龙回头≥60首次入场">回≥60{sortArrow('dr_score')}</span>
-            <span className="ev-m sortable" onClick={() => setSort('m_score')} title="动量≥50值得看">量≥50{sortArrow('m_score')}</span>
-            <span className="ev-k">K线</span>
-            <span className="ev-act">操作</span>
-          </div>
-          <div className="ev-body">
-            {sortedEvals.map((e) => (
-              <div key={e.code} className="ev-row-group">
-                <div className={rowClass(e)} onClick={() => onRowTap(e)}>
-                  <span className="ev-code" data-label="代码">{e.code}</span>
-                  <span className="ev-name" data-label="名称">{e.name || '-'}</span>
-                  <span className="ev-price" data-label="现价">¥{(e.price || 0).toFixed(2)}</span>
-                  <span className={'ev-chg ' + ((e.change_pct || 0) >= 0 ? 'up' : 'down')} data-label="涨跌">
-                    {(e.change_pct || 0) > 0 ? '+' : ''}{(e.change_pct || 0).toFixed(2)}%
-                  </span>
-                  <span className={scoreClass(e.n_score, e.n_pass, 80)} data-label="N形">{e.n_score > 0 ? e.n_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.dragon_score, e.dragon_pass, 80)} data-label="龙头">{e.dragon_score > 0 ? e.dragon_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.db_score, e.db_pass, 80)} data-label="双凸">{e.db_score > 0 ? e.db_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.dr_score, e.dr_pass, 80)} data-label="回头">{e.dr_score > 0 ? e.dr_score.toFixed(0) : '—'}</span>
-                  <span className={scoreClass(e.m_score, e.m_pass, 70)} data-label="动量">{e.m_score > 0 ? e.m_score.toFixed(0) : '—'}</span>
-                  <span data-label="K线"><button className="btn-kline" onClick={(ev) => { ev.stopPropagation(); toggleKline(e.code) }} title={klineOpenCode === e.code ? '收起分时' : '展开分时'}>{klineOpenCode === e.code ? '收起' : '分时'}</button></span>
-                  <span data-label="操作"><button className="btn-remove" onClick={(ev) => { ev.stopPropagation(); remove(e.code) }}>✕</button></span>
-                </div>
-                {klineOpenCode === e.code && (
-                  <div className="ev-kline-row">
-                    <div className="kline-flex">
-                      <div className="kline-main"><KLineChart key={e.code} code={e.code} name={e.name} /></div>
-                      <div className="depth-side"><DepthPanel code={e.code} name={e.name} /></div>
-                    </div>
-                  </div>
-                )}
+      {stocks.length > 0 ? (
+        <Card>
+          <Table
+            data={sortedEvals}
+            columns={columns}
+            rowKey="code"
+            size="small"
+            pagination={false}
+            rowClassName={({ row }) => rowClass(row)}
+            expandOnRowClick={false}
+            expandedRowKeys={expandedKeys}
+            onExpandChange={(keys) => setExpandedKeys(keys)}
+            expandedRow={({ row }) => (
+              <div className="kline-flex">
+                <div className="kline-main"><KLineChart key={row.code} code={row.code} name={row.name} /></div>
+                <div className="depth-side"><DepthPanel code={row.code} name={row.name} /></div>
               </div>
-            ))}
-          </div>
-        </div>
+            )}
+          />
+        </Card>
+      ) : (
+        <div className="empty">暂无自选股，输入代码添加</div>
       )}
-      {stocks.length === 0 && <div className="empty">暂无自选股，输入代码添加</div>}
 
       <div className="legend">
         <span className="lg-strong">≥80 强势</span>
@@ -288,18 +252,20 @@ export default function Watchlist() {
         <span className="lg-item">点击表头排序</span>
       </div>
 
-      {sheetStock && (
-        <div className="sheet-overlay" onClick={() => setSheetStock(null)}>
-          <div className="action-sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-title">{sheetStock.code} {sheetStock.name || ''}</div>
-            <button className="sheet-btn" onClick={() => { toggleKline(sheetStock.code); setSheetStock(null) }}>
-              {klineOpenCode === sheetStock.code ? '收起分时' : '展开分时'}
-            </button>
-            <button className="sheet-btn sheet-danger" onClick={() => { const c = sheetStock.code; setSheetStock(null); remove(c) }}>删除</button>
-            <button className="sheet-btn sheet-cancel" onClick={() => setSheetStock(null)}>取消</button>
-          </div>
+      <Dialog
+        visible={!!sheetStock}
+        header={(sheetStock ? sheetStock.code : '') + ' ' + (sheetStock ? sheetStock.name || '' : '')}
+        onClose={() => setSheetStock(null)}
+        footer={false}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <Button theme="primary" variant="outline" onClick={() => { if (sheetStock) toggleKline(sheetStock.code); setSheetStock(null) }}>
+            {sheetStock && expandedKeys.includes(sheetStock.code) ? '收起分时' : '展开分时'}
+          </Button>
+          <Button theme="danger" variant="outline" onClick={() => { const c = sheetStock && sheetStock.code; setSheetStock(null); if (c) remove(c) }}>删除</Button>
+          <Button theme="default" onClick={() => setSheetStock(null)}>取消</Button>
         </div>
-      )}
+      </Dialog>
     </div>
   )
 }

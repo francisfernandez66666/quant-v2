@@ -1,7 +1,9 @@
 // ── 仪表盘页面 Dashboard.jsx ──
 // 聚合展示首页核心数据：策略信号统计、热门个股、宏观日历、IPO、热门板块、
 // 最新资讯、按战法胜率归因、数据源健康与实盘链路状态。
+// 使用 TDesign React 组件（Card / Table / Tag / Button / Dialog）。
 import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { Card, Table, Tag, Button, Dialog } from 'tdesign-react'
 import * as api from '../api/index.js'
 import LogModal from '../components/LogModal.jsx'
 import './Dashboard.css'
@@ -53,6 +55,11 @@ function fmtProfitFactor(pf) {
   return pf.toFixed(2)
 }
 
+// 涨跌百分比配色（红涨绿跌）
+function chgColor(v) {
+  return (v || 0) >= 0 ? '#e34d59' : '#00a870'
+}
+
 /**
  * 仪表盘页面组件
  * 聚合展示策略信号、热门个股、宏观日历、IPO、热门板块、数据源与引擎健康等。
@@ -87,6 +94,11 @@ export default function Dashboard() {
   const calendarEvents = useMemo(
     () => newsItems.filter((n) => n.source === '宏观日历' || n.source === '政策反制'),
     [newsItems]
+  )
+
+  const strategyRows = useMemo(
+    () => Object.entries(strategyStats || {}).map(([name, s]) => ({ name, ...s })),
+    [strategyStats]
   )
 
   const qmtLine = useMemo(() => {
@@ -168,98 +180,77 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  const stockColumns = [
+    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'name', title: '名称', width: 100 },
+    { colKey: 'sector', title: '板块', ellipsis: true, cell: ({ row }) => <span title={row.sector_reason || ''}>{row.sector || '—'}</span> },
+    { colKey: 'price', title: '现价', width: 90, cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
+    { colKey: 'change_pct', title: '涨跌', width: 100, cell: ({ row }) => (
+      <span style={{ color: chgColor(row.change_pct) }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span>
+    ) },
+  ]
+
+  const strategyColumns = [
+    { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => row.strategy || row.name },
+    { colKey: 'total', title: '样本', width: 70 },
+    { colKey: 'closed', title: '已平仓', width: 80 },
+    { colKey: 'win_rate', title: '胜率', width: 80, cell: ({ row }) => (
+      <span style={{ color: (row.win_rate || 0) >= 50 ? '#e34d59' : '#00a870' }}>{(row.win_rate || 0).toFixed(1)}%</span>
+    ) },
+    { colKey: 'avg_win_pct', title: '平均盈', width: 80, cell: ({ row }) => <span style={{ color: '#e34d59' }}>{(row.avg_win_pct || 0).toFixed(1)}%</span> },
+    { colKey: 'avg_loss_pct', title: '平均亏', width: 80, cell: ({ row }) => <span style={{ color: '#00a870' }}>{(row.avg_loss_pct || 0).toFixed(1)}%</span> },
+    { colKey: 'profit_factor', title: '盈亏比', width: 80, cell: ({ row }) => fmtProfitFactor(row.profit_factor) },
+    { colKey: 'holding', title: '持仓中', width: 70 },
+  ]
+
   return (
     <div className="dashboard">
-      <button className="btn-log" onClick={() => setShowLog(true)}>📋 日志</button>
-      <LogModal visible={showLog} onClose={() => setShowLog(false)} />
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+        <Button theme="default" variant="outline" onClick={() => setShowLog(true)}>📋 日志</Button>
+      </div>
 
       <div className="stats-row">
-        <div className="stat-card strong">
-          <div className="stat-num">{strongCount}</div>
-          <div className="stat-label">强信号</div>
-        </div>
-        <div className="stat-card observe">
-          <div className="stat-num">{observeCount}</div>
-          <div className="stat-label">观察中</div>
-        </div>
-        <div className="stat-card mute">
-          <div className="stat-num">{muteCount}</div>
-          <div className="stat-label">静默</div>
-        </div>
-        <div className="stat-card holding">
-          <div className="stat-num">{scanStats.total_stocks || snapshotStocks.length || 0}</div>
-          <div className="stat-label">监控个股</div>
-        </div>
+        <Card className="stat-card strong"><div className="stat-num">{strongCount}</div><div className="stat-label">强信号</div></Card>
+        <Card className="stat-card observe"><div className="stat-num">{observeCount}</div><div className="stat-label">观察中</div></Card>
+        <Card className="stat-card mute"><div className="stat-num">{muteCount}</div><div className="stat-label">静默</div></Card>
+        <Card className="stat-card holding"><div className="stat-num">{scanStats.total_stocks || snapshotStocks.length || 0}</div><div className="stat-label">监控个股</div></Card>
       </div>
 
       <div className="grid-2col">
-        <div className="card">
-          <div className="card-header">
-            <span>🔥 热门个股 <span className="badge-live">LIVE</span></span>
-            <span className="card-sub">{snapshotTime}</span>
-          </div>
+        <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>} style={{ marginBottom: 16 }}>
           {snapshotStocks.length ? (
-            <div className="stock-table">
-              <div className="st-header">
-                <span className="st-code">代码</span>
-                <span className="st-name">名称</span>
-                <span className="st-sector">板块</span>
-                <span className="st-price">现价</span>
-                <span className="st-chg">涨跌</span>
-              </div>
-              <div className="st-body">
-                {snapshotStocks.map((s) => (
-                  <div key={s.code} className="st-row">
-                    <span className="st-code">{s.code}</span>
-                    <span className="st-name">{s.name}</span>
-                    <span className="st-sector" title={s.sector_reason || ''}>{s.sector || '—'}</span>
-                    <span className="st-price">¥{(s.price || 0).toFixed(2)}</span>
-                    <span className={'st-chg ' + ((s.change_pct || 0) >= 0 ? 'up' : 'down')}>
-                      {(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(2)}%
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} />
           ) : (
             <div className="empty"><span className="loading-dot"></span> 等待行情数据...</div>
           )}
-        </div>
+          <div className="card-sub" style={{ marginTop: 8 }}>{snapshotTime}</div>
+        </Card>
 
-        <div className="card">
-          <div className="card-header">
-            <span>最新动态</span>
-            <span className="card-sub">{newsItems.length + hotSectors.length}条</span>
-          </div>
-
-          <div className="cal-section">
-            <div className="section-label">📅 宏观日历</div>
-            <div className="cal-scroll">
-              {calendarEvents.map((c, i) => (
-                <div key={'c' + i} className="cal-item">
-                  <span className="cal-date">{c.datetime ? c.datetime.slice(5, 10) : ''}</span>
-                  <span className="cal-title">{c.title}</span>
-                </div>
-              ))}
-              {!calendarEvents.length && <div className="cal-empty">暂无日历事件</div>}
-            </div>
+        <Card title="最新动态" style={{ marginBottom: 16 }}>
+          <div className="section-label">📅 宏观日历</div>
+          <div className="cal-scroll">
+            {calendarEvents.map((c, i) => (
+              <div key={'c' + i} className="cal-item">
+                <span className="cal-date">{c.datetime ? c.datetime.slice(5, 10) : ''}</span>
+                <span className="cal-title">{c.title}</span>
+              </div>
+            ))}
+            {!calendarEvents.length && <div className="cal-empty">暂无日历事件</div>}
           </div>
 
           <div className="section-divider"></div>
 
-          <div className="cal-section">
-            <div className="section-label">📋 IPO日历</div>
-            <div className="cal-scroll">
-              {ipoCalendar.map((c, i) => (
-                <div key={'ipo' + i} className="cal-item">
-                  <span className="cal-date">{c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '')}</span>
-                  <span className="cal-title">{c.name}（{c.code}）</span>
-                  {c.issue_price && <span className="cal-price">¥{c.issue_price.toFixed(2)}</span>}
-                  <span className={'cal-status ' + (c.list_status === 'L' ? 'cal-status-l' : 'cal-status-u')}>{ipoCountdown(c)}</span>
-                </div>
-              ))}
-              {!ipoCalendar.length && <div className="cal-empty">暂无IPO日历</div>}
-            </div>
+          <div className="section-label">📋 IPO日历</div>
+          <div className="cal-scroll">
+            {ipoCalendar.map((c, i) => (
+              <div key={'ipo' + i} className="cal-item">
+                <span className="cal-date">{c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '')}</span>
+                <span className="cal-title">{c.name}（{c.code}）</span>
+                {c.issue_price && <span className="cal-price">¥{c.issue_price.toFixed(2)}</span>}
+                <span className={'cal-status ' + (c.list_status === 'L' ? 'cal-status-l' : 'cal-status-u')}>{ipoCountdown(c)}</span>
+              </div>
+            ))}
+            {!ipoCalendar.length && <div className="cal-empty">暂无IPO日历</div>}
           </div>
 
           <div className="section-divider"></div>
@@ -269,7 +260,7 @@ export default function Dashboard() {
             <div className="sec-scroll">
               {hotSectors.slice(0, 5).map((s, i) => (
                 <div key={'s' + i} className="sec-row">
-                  <span className="sec-pct">{(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(1)}%</span>
+                  <span className="sec-pct" style={{ color: chgColor(s.change_pct) }}>{(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(1)}%</span>
                   <span className="sec-name">{s.name}</span>
                   <span className="sec-inflow">净流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
                 </div>
@@ -289,11 +280,11 @@ export default function Dashboard() {
                 </div>
                 <div className="news-tags-line">
                   {n.direction && (
-                    <span className={'tag ' + (n.direction === '利好' ? 'tag-up' : n.direction === '利空' ? 'tag-down' : 'tag-neutral')}>{n.direction}</span>
+                    <Tag theme={n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'} size="small">{n.direction}</Tag>
                   )}
-                  {n.impact_level && <span className={'tag tag-impact-' + n.impact_level}>{n.impact_level}影响</span>}
-                  {n.sectors?.length && n.sectors.map((sec) => <span key={sec} className="sector-tag">{sec}</span>)}
-                  {n.stocks?.length && n.stocks.map((stk) => <span key={stk} className="stock-tag">{stk}</span>)}
+                  {n.impact_level && <Tag size="small" variant="light">{'影响'}</Tag>}
+                  {n.sectors?.length && n.sectors.map((sec) => <Tag key={sec} size="small" theme="primary" variant="light">{sec}</Tag>)}
+                  {n.stocks?.length && n.stocks.map((stk) => <Tag key={stk} size="small" theme="warning" variant="light">{stk}</Tag>)}
                 </div>
               </div>
             ))}
@@ -301,41 +292,16 @@ export default function Dashboard() {
           {!newsItems.length && !hotSectors.length && !calendarEvents.length && (
             <div className="empty"><span className="loading-dot"></span> 等待数据...</div>
           )}
-        </div>
+        </Card>
       </div>
 
-      {strategyStats && Object.keys(strategyStats).length > 0 && (
-        <div className="card" style={{ marginTop: 16 }}>
-          <div className="card-header">按战法胜率</div>
-          <div className="strategy-table">
-            <div className="stg-header">
-              <span className="stg-strategy">战法</span>
-              <span className="stg-num">样本</span>
-              <span className="stg-num">已平仓</span>
-              <span className="stg-num">胜率</span>
-              <span className="stg-num">平均盈</span>
-              <span className="stg-num">平均亏</span>
-              <span className="stg-num">盈亏比</span>
-              <span className="stg-num">持仓中</span>
-            </div>
-            {Object.entries(strategyStats).map(([name, s]) => (
-              <div key={name} className="stg-row">
-                <span className="stg-strategy">{s.strategy || name}</span>
-                <span className="stg-num">{s.total}</span>
-                <span className="stg-num">{s.closed}</span>
-                <span className={'stg-num ' + (s.win_rate >= 50 ? 'up' : 'down')}>{(s.win_rate || 0).toFixed(1)}%</span>
-                <span className="stg-num up">{(s.avg_win_pct || 0).toFixed(1)}%</span>
-                <span className="stg-num down">{(s.avg_loss_pct || 0).toFixed(1)}%</span>
-                <span className="stg-num">{fmtProfitFactor(s.profit_factor)}</span>
-                <span className="stg-num">{s.holding}</span>
-              </div>
-            ))}
-          </div>
-        </div>
+      {strategyRows.length > 0 && (
+        <Card title="按战法胜率" style={{ marginTop: 16 }}>
+          <Table data={strategyRows} columns={strategyColumns} rowKey="name" size="small" pagination={false} />
+        </Card>
       )}
 
-      <div className="card" style={{ marginTop: 16 }}>
-        <div className="card-header">系统</div>
+      <Card title="系统" style={{ marginTop: 16 }}>
         <div className="status-row-inline">
           <span>运行 {status.uptime || '-'}</span>
           <span>数据源：东财{dataSourceHealth.eastmoney ? '●' : '○'} 新浪{dataSourceHealth.sina ? '●' : '○'} 腾讯{dataSourceHealth.tencent ? '●' : '○'} 同花顺{dataSourceHealth.ths ? '●' : '○'}</span>
@@ -345,7 +311,9 @@ export default function Dashboard() {
           <span>流程引擎：新闻抓取{engineHealth.news_agent ? '●' : '○'} 策略引擎{engineHealth.strategy_engine ? '●' : '○'} 板块验证{engineHealth.sector_agent ? '●' : '○'} 战法扫描{engineHealth.combat_agent ? '●' : '○'} LLM{engineHealth.llm ? '●' : '○'} 同花顺{engineHealth.ths ? '●' : '○'} 聚合器{engineHealth.aggregator ? '●' : '○'}</span>
           {qmtLine && <span>实盘链路：{qmtLine}</span>}
         </div>
-      </div>
+      </Card>
+
+      <LogModal visible={showLog} onClose={() => setShowLog(false)} />
     </div>
   )
 }

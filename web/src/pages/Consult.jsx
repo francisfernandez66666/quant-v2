@@ -1,7 +1,8 @@
 // ── 股票咨询页面 Consult.jsx ──
 // 提供与 LLM 的多轮对话能力，支持专业模式切换、LLM 配置、历史记录加载与清空。
+// 使用 TDesign React 组件（Card / Switch / Input / Textarea / Button / Tag）。
 import React, { useState, useEffect, useRef, useCallback } from 'react'
-import { Switch, Input, Textarea, Button } from 'tdesign-react'
+import { Card, Switch, Input, Textarea, Button, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 import './Consult.css'
@@ -154,23 +155,20 @@ export default function Consult() {
             <Switch value={proMode} disabled={proModeSaving} onChange={onToggleProMode} />
             专业模式
           </label>
-          <Button className="btn-clear" theme="default" variant="outline" onClick={onClear} disabled={loading}>🗑 清空对话</Button>
+          <Button theme="default" variant="outline" onClick={onClear} disabled={loading}>🗑 清空对话</Button>
         </div>
       </div>
 
       {!llmConfigured && (
-        <div className="llm-config">
-          <div className="llm-config-title">🔑 LLM 配置（首次使用请填写 API Key）</div>
+        <Card className="llm-config" title="🔑 LLM 配置（首次使用请填写 API Key）">
           <div className="llm-config-row">
             <Input value={cfgApiUrl} onChange={(v) => setCfgApiUrl(v)} placeholder="API 地址（如 https://api.siliconflow.cn/v1/chat/completions）" />
             <Input value={cfgApiKey} type="password" onChange={(v) => setCfgApiKey(v)} placeholder="API Key (sk-...)" />
             <Input value={cfgModel} onChange={(v) => setCfgModel(v)} placeholder="模型（如 THUDM/GLM-Z1-9B-0414）" />
-            <Button className="btn-save" theme="primary" onClick={saveLLM} disabled={llmSaving}>
-              {llmSaving ? '保存中...' : '保存'}
-            </Button>
+            <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
           </div>
-          {llmMsg && <p className={'llm-msg ' + (llmMsgType === 'ok' ? 'msg-ok' : 'msg-err')}>{llmMsg}</p>}
-        </div>
+          {llmMsg && <Tag theme={llmMsgType === 'ok' ? 'success' : 'danger'} variant="light" style={{ marginTop: 8 }}>{llmMsg}</Tag>}
+        </Card>
       )}
 
       <div ref={chatBox} className="chat-box">
@@ -203,7 +201,7 @@ export default function Consult() {
             }
           }}
         />
-        <Button className="btn-send" theme="primary" onClick={onSend} disabled={loading || !draft.trim()}>
+        <Button theme="primary" onClick={onSend} disabled={loading || !draft.trim()}>
           {loading ? '...' : '发送'}
         </Button>
       </div>
