@@ -335,7 +335,7 @@ export default function Admin() {
   useEffect(() => { loadUsers() }, [])
 
   return (
-    <div>
+    <div className="page">
       <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>用户管理</h2>
 
       <Card title="开通新账号" style={{ marginBottom: 12 }}>

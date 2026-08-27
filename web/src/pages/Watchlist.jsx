@@ -1,12 +1,11 @@
 // ── 自选股页面 Watchlist.jsx ──
 // 展示自选股多维评分（N形/龙头/双凸/龙回头/动量），支持添加/删除/排序、展开分时+盘口。
-// 全面使用 TDesign 组件：Table / Card / Tag / Button / Input / Dialog。
+// 纯 TDesign 组件（Table / Card / Tag / Button / Input / Dialog），无自定义 CSS。
 import React, { useState, useEffect, useRef } from 'react'
 import { Card, Table, Button, Input, Dialog, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
-import './Watchlist.css'
 
 const CACHE_KEY = 'wl_cache_v1'
 
@@ -23,30 +22,15 @@ function loadCache() {
   } catch (_) { return [] }
 }
 
-// 根据分数与阈值返回评分单元格的 CSS 类名
-function scoreClass(score, pass, strongMin) {
-  if (!score || score <= 0) return 'ev-score'
-  if (score >= strongMin) return 'ev-score strong'
-  if (pass) return 'ev-score pass'
-  return 'ev-score'
-}
-// 评分颜色（红强/黄达标/灰偏低）
-function scoreColor(cls) {
-  if (cls.indexOf('strong') >= 0) return '#e34d59'
-  if (cls.indexOf('pass') >= 0) return '#FAAD14'
-  return '#555'
+// 根据分数与阈值返回评分单元格的颜色样式
+function scoreStyle(score, pass, strongMin) {
+  if (!score || score <= 0) return { color: '#555', fontWeight: 600 }
+  if (score >= strongMin) return { color: '#e34d59', fontWeight: 600 }
+  if (pass) return { color: '#FAAD14', fontWeight: 600 }
+  return { color: '#555', fontWeight: 600 }
 }
 
-// 根据多维度评分决定整行高亮样式（强势/关注/普通）
-function rowClass(e) {
-  const strong = (e.n_score || 0) >= 80 || (e.dragon_score || 0) >= 80 || (e.db_score || 0) >= 80 || (e.dr_score || 0) >= 80 || (e.m_score || 0) >= 70
-  if (strong) return 'ev-row strong'
-  const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 70 || (e.db_score || 0) >= 70 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
-  if (watch) return 'ev-row watch'
-  return 'ev-row'
-}
-
-// 安全读取字段值，字符串默认空串，数字默认 0
+// 安全读取字段值
 function val(e, key) {
   const v = e[key]
   if (typeof v === 'string') return v || ''
@@ -199,24 +183,26 @@ export default function Watchlist() {
     { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name || '-'}</span> },
     { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
     { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
-    { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreClass(row.n_score, row.n_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'dragon_score', title: '龙≥70', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => { const c = scoreClass(row.dragon_score, row.dragon_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'db_score', title: '凸≥70', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => { const c = scoreClass(row.db_score, row.db_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'dr_score', title: '回≥60', width: 70, sorter: (a, b) => (a.dr_score || 0) - (b.dr_score || 0), cell: ({ row }) => { const c = scoreClass(row.dr_score, row.dr_pass, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dr_score > 0 ? row.dr_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'm_score', title: '量≥50', width: 70, sorter: (a, b) => (a.m_score || 0) - (b.m_score || 0), cell: ({ row }) => { const c = scoreClass(row.m_score, row.m_pass, 70); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.m_score > 0 ? row.m_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreStyle(row.n_score, row.n_pass, 80); return <span style={c}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'dragon_score', title: '龙≥70', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => { const c = scoreStyle(row.dragon_score, row.dragon_pass, 80); return <span style={c}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'db_score', title: '凸≥70', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => { const c = scoreStyle(row.db_score, row.db_pass, 80); return <span style={c}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'dr_score', title: '回≥60', width: 70, sorter: (a, b) => (a.dr_score || 0) - (b.dr_score || 0), cell: ({ row }) => { const c = scoreStyle(row.dr_score, row.dr_pass, 80); return <span style={c}>{row.dr_score > 0 ? row.dr_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'm_score', title: '量≥50', width: 70, sorter: (a, b) => (a.m_score || 0) - (b.m_score || 0), cell: ({ row }) => { const c = scoreStyle(row.m_score, row.m_pass, 70); return <span style={c}>{row.m_score > 0 ? row.m_score.toFixed(0) : '—'}</span> } },
     { colKey: 'kline', title: 'K线', width: 80, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{expandedKeys.includes(row.code) ? '收起' : '分时'}</Button> },
     { colKey: 'op', title: '操作', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); remove(row.code) }}>✕</Button> },
   ]
 
   return (
-    <div className="watchlist-page">
-      <div className="page-header">
-        <h2>自选股</h2>
-        <div className="add-row">
-          <Input value={newCode} placeholder="输入代码 (如 000001)" onChange={(v) => setNewCode(v)} onEnter={() => add()} disabled={adding} style={{ width: 200 }} />
-          <Button theme="primary" onClick={add} loading={adding}>{adding ? '添加中…' : '添加'}</Button>
+    <div className="page">
+      <Card style={{ marginBottom: 16 }}>
+        <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>自选股</h2>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <Input value={newCode} placeholder="输入代码 (如 000001)" onChange={(v) => setNewCode(v)} onEnter={() => add()} disabled={adding} style={{ width: 200 }} />
+            <Button theme="primary" onClick={add} loading={adding}>{adding ? '添加中…' : '添加'}</Button>
+          </div>
         </div>
-      </div>
+      </Card>
 
       {stocks.length > 0 ? (
         <Card>
@@ -226,30 +212,29 @@ export default function Watchlist() {
             rowKey="code"
             size="small"
             pagination={false}
-            rowClassName={({ row }) => rowClass(row)}
             expandOnRowClick={false}
             expandedRowKeys={expandedKeys}
             onExpandChange={(keys) => setExpandedKeys(keys)}
             expandedRow={({ row }) => (
-              <div className="kline-flex">
-                <div className="kline-main"><KLineChart key={row.code} code={row.code} name={row.name} /></div>
-                <div className="depth-side"><DepthPanel code={row.code} name={row.name} /></div>
+              <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', flexWrap: 'wrap' }}>
+                <div style={{ flex: '1 1 auto', minWidth: 0 }}><KLineChart key={row.code} code={row.code} name={row.name} /></div>
+                <div style={{ flex: '0 0 300px' }}><DepthPanel code={row.code} name={row.name} /></div>
               </div>
             )}
           />
         </Card>
       ) : (
-        <div className="empty">暂无自选股，输入代码添加</div>
+        <Card><div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无自选股，输入代码添加</div></Card>
       )}
 
-      <div className="legend">
-        <span className="lg-strong">≥80 强势</span>
-        <span className="lg-pass">≥门槛 达标</span>
-        <span className="lg-low">&lt;门槛 偏低</span>
-        <span className="lg-sep">|</span>
-        <span className="lg-item">N形≥60操作, 龙头≥70买入/≥50观察, 双凸≥70买入/50-70观察, 回头≥60入场, 动量≥50关注</span>
-        <span className="lg-sep">|</span>
-        <span className="lg-item">点击表头排序</span>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: '#888', marginTop: 12 }}>
+        <span style={{ color: '#e34d59' }}>≥80 强势</span>
+        <span style={{ color: '#FAAD14' }}>≥门槛 达标</span>
+        <span style={{ color: '#555' }}>&lt;门槛 偏低</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>N形≥60操作, 龙头≥70买入/≥50观察, 双凸≥70买入/50-70观察, 回头≥60入场, 动量≥50关注</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>点击表头排序</span>
       </div>
 
       <Dialog

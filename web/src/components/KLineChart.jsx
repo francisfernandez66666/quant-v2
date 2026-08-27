@@ -3,6 +3,7 @@
 // 支持容器自适应、hover 十字线与数据提示。
 import React, { useState, useEffect, useRef } from 'react'
 import * as api from '../api/index.js'
+import './KLineChart.css'
 
 // ── 布局常量（逻辑单位 = 实际像素，与 Vue 版一致）──
 const axisL = 50               // 左侧价格刻度宽度

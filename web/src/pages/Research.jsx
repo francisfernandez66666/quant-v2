@@ -8,7 +8,6 @@ import {
 } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
-import './Research.css'
 
 // 封装 tdesign 确认对话框为 Promise（与 Admin/Paper 保持一致）
 function confirmDialog(body, header = '确认') {
@@ -111,6 +110,10 @@ export default function Research() {
   function signClass(v) {
     if (v === null || v === undefined || isNaN(v)) return ''
     return Number(v) >= 0 ? 'pos' : 'neg'
+  }
+  function signColor(v) {
+    if (v === null || v === undefined || isNaN(v)) return '#aaa'
+    return Number(v) >= 0 ? '#e34d59' : '#00a870'
   }
   function fmtNum(v, digits) {
     if (v === null || v === undefined || isNaN(v)) return '-'
@@ -787,49 +790,49 @@ export default function Research() {
     return (
       <Card key={c.id} style={{ marginBottom: 12 }} title={<span>#{c.id} <Tag theme="primary">{kindLabel(c.kind)}</Tag> <Tag theme={c.status === 'proposed' ? 'warning' : 'success'}>{statusLabel(c.status)}</Tag> <span style={{ fontSize: 12, color: '#888' }}>{c.created_at}</span></span>}>
         {c.kind === 'factor' ? (
-          <div>
-            <div className="block-title">这条战法在做什么</div>
-            <div className="factors-row">
+           <div>
+            <div style={{ fontWeight: 600, margin: '6px 0', fontSize: 13 }}>这条战法在做什么</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, margin: '4px 0' }}>
               {factorRule(c).map((f) => (
                 <Tag key={f.id} style={{ margin: '2px 4px' }}>
-                  <span className={f.dir < 0 ? 'dir-short' : 'dir-long'}>{f.dir < 0 ? '看空' : '看多'}</span> {f.label} {f.weight.toFixed(2)}
+                  <span style={{ color: f.dir < 0 ? '#00a870' : '#e34d59' }}>{f.dir < 0 ? '看空' : '看多'}</span> {f.label} {f.weight.toFixed(2)}
                 </Tag>
               ))}
             </div>
-            <div className="factor-desc">
+            <div style={{ fontSize: 13, color: '#bbb', lineHeight: 1.7, margin: '4px 0' }}>
               玩法：每天给所有股票按上面 {factorRule(c).length} 个指标打分，分数最高的前一批会被标记为「值得买」，赌它们接下来 {c.horizon} 个交易日能涨。
               {factorRule(c).some((f) => f.dir < 0) && <span> 注意：带「看空」的指标是反着用的——这项数值越高，反而越说明不该买。</span>}
             </div>
-            <div className="block-title">这条规律靠谱吗？（电脑验证过）</div>
-            <div className="verify-plain">
-              <div className="plain-summary">
-                <span className={verdict(c).ok ? 'plain-badge good' : 'plain-badge bad'}>{verdict(c).ok ? '✅ 可以试试' : '⚠️ 建议别用'}</span>
-                <span className="plain-text">{verdict(c).text}</span>
+            <div style={{ fontWeight: 600, margin: '6px 0', fontSize: 13 }}>这条规律靠谱吗？（电脑验证过）</div>
+            <div style={{ margin: '6px 0' }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <Tag theme={verdict(c).ok ? 'success' : 'danger'}>{verdict(c).ok ? '✅ 可以试试' : '⚠️ 建议别用'}</Tag>
+                <span style={{ fontSize: 13, color: '#bbb' }}>{verdict(c).text}</span>
               </div>
               {plainLines(c).map((l, i) => (
-                <div key={i} className="plain-line"><span className="plain-num">{i + 1}.</span><span className="plain-body">{l}</span></div>
+                <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#bbb', margin: '4px 0' }}><span style={{ color: '#888' }}>{i + 1}.</span><span>{l}</span></div>
               ))}
             </div>
-            <details className="detail-block">
-              <summary>想看具体数字？展开</summary>
-              <div className="detail-row"><span className="d-label">样本内测试</span><span className="d-value">前一段历史回放：IR {fmt(parseReason(c, '样本内IR'))}</span></div>
-              <div className="detail-row"><span className="d-label">样本外测试</span><span className="d-value">另一段没用过的历史回放：IR {fmt(parseReason(c, '样本外IR'))}</span></div>
-              <div className="detail-row"><span className="d-label">反推超额</span><span className="d-value">高分股比全市场平均多赚 {fmtPct(parseReason(c, '反推超额'))}</span></div>
-              <div className="detail-row"><span className="d-label">全样本 IR</span><span className="d-value">{fmt(c.ir)}（参考）</span></div>
-              <div className="detail-row"><span className="d-label">全样本 IC</span><span className="d-value">{fmt(c.ic_mean)}（参考）</span></div>
-              <div className="detail-row"><span className="d-label">全链路回测</span><span className="d-value">{btTested(c) ? (c.backtest_result_text || fmt(c.avg_excess)) : '未测'}</span></div>
+            <details style={{ border: '1px solid #333', borderRadius: 6, padding: 8, marginTop: 6 }}>
+              <summary style={{ cursor: 'pointer' }}>想看具体数字？展开</summary>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>样本内测试</span><span>前一段历史回放：IR {fmt(parseReason(c, '样本内IR'))}</span></div>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>样本外测试</span><span>另一段没用过的历史回放：IR {fmt(parseReason(c, '样本外IR'))}</span></div>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>反推超额</span><span>高分股比全市场平均多赚 {fmtPct(parseReason(c, '反推超额'))}</span></div>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>全样本 IR</span><span>{fmt(c.ir)}（参考）</span></div>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>全样本 IC</span><span>{fmt(c.ic_mean)}（参考）</span></div>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>全链路回测</span><span>{btTested(c) ? (c.backtest_result_text || fmt(c.avg_excess)) : '未测'}</span></div>
             </details>
           </div>
         ) : (
           <div>
-            <div className="metric-row">
-              <div className="metric"><span className="metric-label">IR</span><span className={'metric-value ' + signClass(c.ir)}>{fmt(c.ir)}</span></div>
-              <div className="metric"><span className="metric-label">IC</span><span className={'metric-value ' + signClass(c.ic_mean)}>{fmt(c.ic_mean)}</span></div>
-              <div className="metric"><span className="metric-label">回测超额</span><span className={'metric-value ' + signClass(c.avg_excess)}>{fmt(c.avg_excess)}</span></div>
-              <div className="metric"><span className="metric-label">前瞻天数</span><span className="metric-value">{c.horizon}</span></div>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>IR</span><span style={{ color: signColor(c.ir), fontWeight: 600 }}>{fmt(c.ir)}</span></div>
+              <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>IC</span><span style={{ color: signColor(c.ic_mean), fontWeight: 600 }}>{fmt(c.ic_mean)}</span></div>
+              <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>回测超额</span><span style={{ color: signColor(c.avg_excess), fontWeight: 600 }}>{fmt(c.avg_excess)}</span></div>
+              <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>前瞻天数</span><span style={{ fontWeight: 600 }}>{c.horizon}</span></div>
             </div>
             {weightList(c).length > 0 && (
-              <div className="weights-row">
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, margin: '6px 0' }}>
                 {weightList(c).map((w) => (
                   <Tag key={w[0]} style={{ margin: '2px 4px' }}>{w[0]} {w[1].toFixed(3)}</Tag>
                 ))}
@@ -839,11 +842,11 @@ export default function Research() {
         )}
 
         {c.kind === 'depth' && (
-          <div className="depth-block">
+          <div style={{ marginTop: 8 }}>
             {Object.entries(depthSummary(c)).map(([code, s]) => (
-              <div key={code} className="depth-stock">
-                <span className="depth-code">{code}</span>
-                <span className="depth-touch">买1 {s.bid1} / 卖1 {s.ask1}</span>
+              <div key={code} style={{ margin: '4px 0' }}>
+                <span style={{ fontWeight: 600 }}>{code}</span>
+                <span className="muted" style={{ marginLeft: 8 }}>买1 {s.bid1} / 卖1 {s.ask1}</span>
                 {(s.orders || []).map((o) => (
                   <Tag key={o.level + o.kind} theme={o.kind === 'support' ? 'success' : 'danger'} style={{ margin: '2px' }}>
                     {o.kind === 'support' ? '托' : '压'}单 档{o.level} {o.price} / {o.volume}手 ({(o.share_pct * 100).toFixed(0)}%)
@@ -882,34 +885,34 @@ export default function Research() {
   function renderLibraryGroup(g) {
     return (
       <div key={g.key} style={{ marginBottom: 16 }}>
-        <div className="lib-group-title">{g.title}（{g.items.length}）</div>
+        <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>{g.title}（{g.items.length}）</div>
         {g.items.map((s) => {
           const expanded = expandedStrategy === 'rule:' + s.id
           return (
             <Card key={s.id} style={{ marginBottom: 10 }}>
-              <div className="lib-head">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 {editingName[s.id]
                   ? <Input value={nameDraft[s.id]} onChange={(v) => setNameDraft((d) => ({ ...d, [s.id]: v }))} onEnter={saveName(s)} onBlur={saveName(s)} style={{ width: 160 }} />
-                  : <b className="lib-name">{s.name}</b>}
+                  : <b>{s.name}</b>}
                 {canApprove && !editingName[s.id] && <Button size="small" variant="text" theme="primary" onClick={() => startRename(s)}>改名</Button>}
                 <Tag theme={s.kind === 'pattern' ? 'primary' : 'default'}>{s.kind === 'pattern' ? '形态' : '因子'}</Tag>
                 <Tag theme={s.enabled ? 'success' : 'default'}>{s.enabled ? '已启用' : '已停用'}</Tag>
                 <span style={{ fontSize: 11, color: '#777', marginLeft: 'auto' }}>{s.id}｜{s.applied_at}</span>
               </div>
-              <div className="lib-factors">
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
                 {s.kind === 'pattern'
                   ? (s.conds || []).map((c, i) => <Tag key={i} style={{ margin: '2px' }}>{condLabel(c)}</Tag>)
                   : ruleFactors(s).map((f) => (
                     <Tag key={f.id} style={{ margin: '2px' }}>
-                      <span className={f.dir < 0 ? 'dir-short' : 'dir-long'}>{f.dir < 0 ? '看空' : '看多'}</span> {f.label}
+                      <span style={{ color: f.dir < 0 ? '#00a870' : '#e34d59' }}>{f.dir < 0 ? '看空' : '看多'}</span> {f.label}
                     </Tag>
                   ))}
               </div>
-              <div className="lib-stats" style={{ fontSize: 12, color: '#aaa', marginTop: 6 }}>
+              <div style={{ fontSize: 12, color: '#aaa', marginTop: 6 }}>
                 <span>信号 <b>{s.signal_count}</b></span>
-                <span>胜 <b style={{ color: '#00a870' }}>{s.win}</b></span>
-                <span>负 <b style={{ color: '#e34d59' }}>{s.loss}</b></span>
-                <span>累计前向收益 <b style={{ color: s.cum_return >= 0 ? '#00a870' : '#e34d59' }}>{fmtPct(s.cum_return)}</b></span>
+                <span style={{ marginLeft: 8 }}>胜 <b style={{ color: '#00a870' }}>{s.win}</b></span>
+                <span style={{ marginLeft: 8 }}>负 <b style={{ color: '#e34d59' }}>{s.loss}</b></span>
+                <span style={{ marginLeft: 8 }}>累计前向收益 <b style={{ color: s.cum_return >= 0 ? '#00a870' : '#e34d59' }}>{fmtPct(s.cum_return)}</b></span>
               </div>
               {canApprove && (
                 <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -920,7 +923,7 @@ export default function Research() {
                 </div>
               )}
               {expanded && (
-                <pre className="lib-detail-text" style={{ marginTop: 8, fontSize: 12, color: '#ccc', whiteSpace: 'pre-wrap' }}>
+                <pre style={{ marginTop: 8, fontSize: 12, color: '#ccc', whiteSpace: 'pre-wrap' }}>
                   {latestLibJob(s.kind, ruleNum(s.id)) && latestLibJob(s.kind, ruleNum(s.id)).result_text
                     ? latestLibJob(s.kind, ruleNum(s.id)).result_text
                     : '暂无回测报告——点「回测此战法」发起'}
@@ -936,7 +939,7 @@ export default function Research() {
   // ===== 兜底渲染错误 =====
   if (renderError) {
     return (
-      <div className="research-page">
+      <div className="page">
         <div style={{ background: '#fef2f2', color: '#b91c1c', border: '1px solid #fecaca', borderRadius: 6, padding: '8px 12px', marginBottom: 8, fontSize: 12 }}>
           页面渲染出错（不影响其他标签页）：<code>{renderError}</code>
           <Button style={{ marginLeft: 8 }} size="small" onClick={() => setRenderError('')}>关闭</Button>
@@ -946,10 +949,10 @@ export default function Research() {
   }
 
   return (
-    <div className="research-page">
-      <div className="page-header">
+    <div className="page">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
         <h2>自动研究</h2>
-        <div className="header-right">
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <Select
             value={statusFilter}
             onChange={(v) => { setStatusFilter(v); loadData() }}
@@ -969,7 +972,7 @@ export default function Research() {
       <Tabs value={activeTab} onChange={(v) => setActiveTab(v)}>
         <Tabs.TabPanel value="candidates" label="待审批候选">
           <div style={{ marginTop: 12 }}>
-            <div className="research-tabs" style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
+              <div style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
               <Button variant={candSubTab === 'patterns' ? 'base' : 'outline'} size="small" onClick={() => setCandSubTab('patterns')}>形态候选</Button>
               <Button variant={candSubTab === 'optimize' ? 'base' : 'outline'} size="small" onClick={() => { setCandSubTab('optimize'); loadOptimizations() }}>优化结果</Button>
             </div>
@@ -978,19 +981,19 @@ export default function Research() {
               <div>
                 {progress && (
                   <Card style={{ marginBottom: 12 }} title={<span>研究处理进度 {progress.data_source && <Tag theme="success" size="small">数据源: {progress.data_source}</Tag>}</span>}>
-                    <div className="progress-grid">
-                      <div className="progress-item">
-                        <div className="progress-label">数据准备度（近一年有行情 / 全市场）</div>
-                        <div style={{ height: 8, background: '#2a2a3e', borderRadius: 4, overflow: 'hidden' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(200px,1fr))', gap: 12 }}>
+                      <div>
+                        <div style={{ fontSize: 12, color: '#888' }}>数据准备度（近一年有行情 / 全市场）</div>
+                        <div style={{ height: 8, background: '#2a2a3e', borderRadius: 4, overflow: 'hidden', marginTop: 4 }}>
                           <div style={{ width: pct(progress.ready_pct) + '%', height: '100%', background: 'linear-gradient(90deg,#4caf50,#64b5f6)' }} />
                         </div>
-                        <div className="progress-meta">{progress.ready_stocks} / {progress.stocks} 只（{pct(progress.ready_pct)}%）</div>
+                        <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>{progress.ready_stocks} / {progress.stocks} 只（{pct(progress.ready_pct)}%）</div>
                       </div>
-                      <div className="progress-item"><div className="progress-label">日线数据</div><div className="progress-meta">{fmtRows(progress.daily_rows)} 行</div></div>
-                      <div className="progress-item"><div className="progress-label">财务指标</div><div className="progress-meta">{fmtRows(progress.fin_rows)} 行</div></div>
-                      <div className="progress-item">
-                        <div className="progress-label">研究候选</div>
-                        <div className="progress-meta">
+                      <div><div style={{ fontSize: 12, color: '#888' }}>日线数据</div><div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>{fmtRows(progress.daily_rows)} 行</div></div>
+                      <div><div style={{ fontSize: 12, color: '#888' }}>财务指标</div><div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>{fmtRows(progress.fin_rows)} 行</div></div>
+                      <div>
+                        <div style={{ fontSize: 12, color: '#888' }}>研究候选</div>
+                        <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>
                           <Tag style={{ margin: '0 2px' }}>{progress.candidates} 条</Tag>
                           {progress.applied && <Tag theme="success" size="small" style={{ margin: '0 2px' }}>已应用 {progress.applied}</Tag>}
                           {progress.proposed && <Tag theme="warning" size="small" style={{ margin: '0 2px' }}>待审批 {progress.proposed}</Tag>}
@@ -1008,8 +1011,8 @@ export default function Research() {
 
             {candSubTab === 'optimize' && (
               <Card>
-                <div className="library-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-                  <div className="library-title">参数寻优中心<span style={{ fontSize: 12, color: '#888' }}>（每战法独立寻优池：止盈×止损×持仓×门槛 步进网格，批内选优+批间 PK）</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                    <div style={{ fontWeight: 600 }}>参数寻优中心<span style={{ fontSize: 12, color: '#888' }}>（每战法独立寻优池：止盈×止损×持仓×门槛 步进网格，批内选优+批间 PK）</span></div>
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                     <Select value={optObjective} onChange={(v) => setOptObjective(v)} style={{ width: 150 }} options={[
                       { label: '目标：盈亏比', value: 'profitFactor' },
@@ -1023,7 +1026,7 @@ export default function Research() {
                 </div>
 
                 {optStrategies.length > 0 && (
-                  <div className="opt-chips" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0' }}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '8px 0' }}>
                     {optStrategies.map((s) => (
                       <Button key={s.key} variant={optSelected === s.key ? 'base' : 'outline'} size="small" onClick={() => setOptSelected(s.key)}>
                         {s.label}
@@ -1040,7 +1043,7 @@ export default function Research() {
 
                 {!loadingOpts && optCur && (
                   <div style={{ marginTop: 8 }}>
-                    <Card title={<span className="oc-name">{optCur.strategy} {!optCur.strategy_kind && <Tag theme="default">内置</Tag>} {optCur.status === 'approved' && <Tag theme="success">已应用</Tag>} {optCur.status === 'rejected' && <Tag theme="default">已淘汰</Tag>}</span>}>
+                    <Card title={<span style={{ fontWeight: 600 }}>{optCur.strategy} {!optCur.strategy_kind && <Tag theme="default">内置</Tag>} {optCur.status === 'approved' && <Tag theme="success">已应用</Tag>} {optCur.status === 'rejected' && <Tag theme="default">已淘汰</Tag>}</span>}>
                       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
                         {optCur.status === 'pending' && (
                           <>
@@ -1052,7 +1055,7 @@ export default function Research() {
                         )}
                         <Button size="small" variant="outline" style={{ marginLeft: 'auto' }} onClick={toggleDrawer}>⚙ 参数池 / 池纪律</Button>
                       </div>
-                      <div className="oc-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))', gap: 8 }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))', gap: 8 }}>
                         <div><label>止盈线</label><b>{fmtNum((optCur.params || {}).take_profit_pct)}%</b></div>
                         <div><label>止损线</label><b>{fmtNum((optCur.params || {}).stop_loss_pct)}%</b></div>
                         <div><label>持仓天数</label><b>{fmtNum((optCur.params || {}).hold_days)}天</b></div>
@@ -1065,7 +1068,7 @@ export default function Research() {
                       </div>
                     </Card>
 
-                    <div className="lib-group-title" style={{ marginTop: 10 }}>止盈×止损 热力网格<span style={{ fontSize: 11, color: '#888' }}>（格值 %：该格跨持仓/门槛最优期望；点击格高亮）</span></div>
+                    <div style={{ marginTop: 10, fontWeight: 600, fontSize: 14 }}>止盈×止损 热力网格<span style={{ fontSize: 11, color: '#888' }}>（格值 %：该格跨持仓/门槛最优期望；点击格高亮）</span></div>
                     {optCurHeat.tps.length ? (
                       <Table data={heatData} columns={heatColumns} rowKey="tp" size="small" pagination={false} />
                     ) : <Card style={{ padding: 8 }}>本行无网格数据（旧任务产物，重新寻优后生成）。</Card>}
@@ -1105,23 +1108,23 @@ export default function Research() {
               </div>
             </Card>
 
-            <div className="builtin-cards" style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '8px 0' }}>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '8px 0' }}>
               {builtinPatterns.map((b) => (
                 <Card key={'card-' + b.id} style={{ flex: '1 1 140px', cursor: 'pointer', borderColor: expandedStrategy === 'bt:' + b.id ? '#4c8dff' : undefined }} onClick={() => selectStrategy('bt:' + b.id)}>
-                  <div className="bcard-name">{b.name}</div>
-                  <div className="bcard-sub" style={{ fontSize: 12, color: '#888' }}>{summarizeJob(latestLibJob(b.id, -1))}</div>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{b.name}</div>
+                  <div style={{ fontSize: 12, color: '#888' }}>{summarizeJob(latestLibJob(b.id, -1))}</div>
                 </Card>
               ))}
             </div>
 
-            <div className="lib-group-title">内置形态战法（{builtinPatterns.length}）</div>
+            <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>内置形态战法（{builtinPatterns.length}）</div>
             {builtinPatterns.map((b) => {
               const expanded = expandedStrategy === 'bt:' + b.id
               const job = latestLibJob(b.id, -1)
               return (
                 <Card key={'bt-' + b.id} ref={setStrategyRef('bt:' + b.id)} style={{ marginBottom: 10 }}>
-                  <div className="lib-head">
-                    <b className="lib-name">{b.name}</b>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <b style={{ fontSize: 13, fontWeight: 600 }}>{b.name}</b>
                     <Tag>内置</Tag>
                     <Tag theme="success">实盘常驻</Tag>
                     <span style={{ fontSize: 11, color: '#777', marginLeft: 'auto' }}>最新: {summarizeJob(job)}</span>
@@ -1196,8 +1199,8 @@ export default function Research() {
             <Card title="研究调度设置">
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <div style={{ flex: 1 }}>
-                  <div className="setting-label">全量回测全局开关</div>
-                  <div className="setting-desc" style={{ fontSize: 12, color: '#888' }}>开启后，夜间自动研究在发现因子候选后会追加一次 B4 全链路回测（回填回测超额）；关闭则只做发现、不做回测，省时省 CPU。</div>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>全量回测全局开关</div>
+                  <div style={{ fontSize: 12, color: '#888', marginTop: 4, lineHeight: 1.5 }}>开启后，夜间自动研究在发现因子候选后会追加一次 B4 全链路回测（回填回测超额）；关闭则只做发现、不做回测，省时省 CPU。</div>
                 </div>
                 <Switch value={backtestEnabled} onChange={(v) => { setBacktestEnabled(v); saveBacktestToggle() }} />
                 <Tag theme={backtestEnabled ? 'success' : 'default'}>{backtestEnabled ? '已开启' : '已关闭'}</Tag>
@@ -1209,7 +1212,7 @@ export default function Research() {
 
       {/* 寻优参数池 / 池纪律 设置弹窗 */}
       <Dialog visible={optDrawerOpen} onClose={() => setOptDrawerOpen(false)} header="参数池 / 池纪律" onConfirm={undefined}>
-        <div className="lib-group-title">该战法寻优参数池（步进搜索空间，保存后下次寻优生效）</div>
+        <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>该战法寻优参数池（步进搜索空间，保存后下次寻优生效）</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
           <label>止盈起<input type="number" step="1" value={cfgSweep.tp_from ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, tp_from: +e.target.value }))} /></label>
           <label>止盈终<input type="number" step="1" value={cfgSweep.tp_to ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, tp_to: +e.target.value }))} /></label>
@@ -1230,7 +1233,7 @@ export default function Research() {
         </div>
         <Button theme="primary" onClick={saveSweepPool}>保存参数池</Button>
 
-        <div className="lib-group-title" style={{ marginTop: 14 }}>对应资金池买入纪律（模拟盘实时生效）</div>
+        <div style={{ marginTop: 14, fontWeight: 600, fontSize: 14 }}>对应资金池买入纪律（模拟盘实时生效）</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8 }}>
           <label>日限买<input type="number" min="0" step="1" value={cfgRule.max_daily_buys ?? 0} onChange={(e) => setCfgRule((c) => ({ ...c, max_daily_buys: +e.target.value }))} /></label>
           <label>冷却(分)<input type="number" min="0" step="5" value={cfgRule.cooldown_minutes ?? 0} onChange={(e) => setCfgRule((c) => ({ ...c, cooldown_minutes: +e.target.value }))} /></label>

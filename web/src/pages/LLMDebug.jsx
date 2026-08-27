@@ -6,7 +6,6 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { Card, Table, Tag, Button, Dialog, Tabs, Input, Select } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
-import './LLMDebug.css'
 
 // 根据新闻/信号方向返回 TDesign Tag 主题
 function dirTheme(d) {
@@ -17,7 +16,7 @@ function dirTheme(d) {
 
 // 将标签数组渲染为一组 TDesign Tag
 function TagList({ items, kind }) {
-  if (!items || !items.length) return <span style={{ color: '#666' }}>—</span>
+  if (!items || !items.length) return <span className="muted">—</span>
   return (
     <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap' }}>
       {items.map((s, i) => (
@@ -26,6 +25,11 @@ function TagList({ items, kind }) {
     </span>
   )
 }
+
+const toolbarStyle = { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }
+const summaryBarStyle = { display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: 13, padding: '4px 0' }
+const summaryItemStyle = { display: 'flex', flexDirection: 'column', gap: 2 }
+const emptyStyle = { textAlign: 'center', color: '#888', padding: 24 }
 
 /**
  * 日志弹窗子组件（LLM 分析 / 信号批次）
@@ -217,11 +221,11 @@ function LogModal({ visible, onClose }) {
       colKey: 'impact', title: '影响', width: 80,
       cell: ({ row }) => row.impact_level
         ? <Tag size="small" theme={row.impact_level === '高' ? 'danger' : row.impact_level === '中' ? 'warning' : 'default'} variant="light">{row.impact_level}</Tag>
-        : <span style={{ color: '#666' }}>—</span>,
+        : <span className="muted">—</span>,
     },
     {
       colKey: 'type', title: '类型', width: 110,
-      cell: ({ row }) => row.event_type ? <Tag size="small" variant="light">{row.event_type}</Tag> : <span style={{ color: '#666' }}>—</span>,
+      cell: ({ row }) => row.event_type ? <Tag size="small" variant="light">{row.event_type}</Tag> : <span className="muted">—</span>,
     },
     { colKey: 'reason', title: '理由', ellipsis: true, minWidth: 160 },
   ]
@@ -240,10 +244,10 @@ function LogModal({ visible, onClose }) {
 
   return (
     <Dialog visible={visible} onClose={onClose} header="📋 日志" width="900px" footer={false}>
-      <div className="log-body-wrap">
+      <div>
         <Tabs value={activeTab} onChange={(v) => switchTab(v)}>
           <Tabs.TabPanel value="llm" label="LLM 分析">
-            <div className="log-toolbar">
+            <div className="toolbar" style={toolbarStyle}>
               <Input
                 value={llmQuery}
                 onChange={(v) => setLlmQuery(v)}
@@ -263,17 +267,17 @@ function LogModal({ visible, onClose }) {
             </div>
 
             {llmSearching ? (
-              <div className="search-view">
+              <div>
                 {!llmSearchGroups.length ? (
-                  <div className="log-empty">未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
+                  <div style={emptyStyle}>未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
                 ) : (
                   <>
-                    <div className="search-summary">共 {llmTotalHits} 条事件命中，跨 {llmSearchGroups.length} 个轮次</div>
+                    <div className="muted" style={{ marginBottom: 8 }}>共 {llmTotalHits} 条事件命中，跨 {llmSearchGroups.length} 个轮次</div>
                     {llmSearchGroups.map((g, gi) => (
-                      <div key={gi} className="search-group">
-                        <div className="search-group-head">
-                          <span className="search-batch">轮次 {fmtTime(g.time)}</span>
-                          <span className="search-count">命中 {g.items.length} 条</span>
+                      <div key={gi} style={{ marginBottom: 12 }}>
+                        <div style={{ display: 'flex', gap: 12, marginBottom: 4, fontSize: 13 }}>
+                          <span className="muted">轮次 {fmtTime(g.time)}</span>
+                          <span className="muted">命中 {g.items.length} 条</span>
                         </div>
                         <Table
                           data={g.items.map((ev, i) => ({ ...ev, _k: gi + '_' + i }))}
@@ -289,22 +293,22 @@ function LogModal({ visible, onClose }) {
               </div>
             ) : (
               <>
-                {llmNoData && <div className="log-empty">暂无 LLM 分析记录，等待下一轮扫描</div>}
+                {llmNoData && <div style={emptyStyle}>暂无 LLM 分析记录，等待下一轮扫描</div>}
                 {llmData && (
                   <>
-                    <div className="summary-bar">
-                      <div className="summary-item">
-                        <span className="summary-label">Stage1 模式</span>
-                        <span className={'summary-value ' + (llmData.stage1_mode === 'llm' ? 'tag-llm' : 'tag-keyword')}>
+                    <div style={summaryBarStyle}>
+                      <div style={summaryItemStyle}>
+                        <span className="muted">Stage1 模式</span>
+                        <span style={{ color: llmData.stage1_mode === 'llm' ? '#0052d9' : '#faad14', fontWeight: 600 }}>
                           {llmData.stage1_mode === 'llm' ? 'LLM' : '关键词'}
                         </span>
                       </div>
-                      <div className="summary-item"><span className="summary-label">原始条数</span><span className="summary-value">{llmData.raw_count}</span></div>
-                      <div className="summary-item"><span className="summary-label">筛选后</span><span className="summary-value">{llmData.selected_count}</span></div>
-                      <div className="summary-item"><span className="summary-label">分析时间</span><span className="summary-value">{fmtTime(llmData.process_time)}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#eee' }}>{llmData.raw_count}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">筛选后</span><span style={{ color: '#eee' }}>{llmData.selected_count}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">分析时间</span><span style={{ color: '#eee' }}>{fmtTime(llmData.process_time)}</span></div>
                     </div>
 
-                    <h3 className="section-title">Stage1 · 新闻初筛</h3>
+                    <SectionLabel>Stage1 · 新闻初筛</SectionLabel>
                     <Table
                       data={(llmData.raw_titles || []).map((t, i) => ({ idx: i + 1, title: t, sel: isSelected(i) }))}
                       columns={stage1Columns}
@@ -313,7 +317,7 @@ function LogModal({ visible, onClose }) {
                       pagination={false}
                     />
 
-                    <h3 className="section-title">Stage2 · LLM 分析结果</h3>
+                    <SectionLabel>Stage2 · LLM 分析结果</SectionLabel>
                     {llmData.stage2_events && llmData.stage2_events.length > 0 ? (
                       <Table
                         data={llmData.stage2_events.map((ev, i) => ({ ...ev, _k: i }))}
@@ -323,7 +327,7 @@ function LogModal({ visible, onClose }) {
                         pagination={{ pageSize: 10, showJumper: true }}
                       />
                     ) : (
-                      <div className="log-empty">Stage2 无分析结果</div>
+                      <div style={emptyStyle}>Stage2 无分析结果</div>
                     )}
                   </>
                 )}
@@ -332,7 +336,7 @@ function LogModal({ visible, onClose }) {
           </Tabs.TabPanel>
 
           <Tabs.TabPanel value="signal" label="信号批次">
-            <div className="log-toolbar">
+            <div className="toolbar" style={toolbarStyle}>
               <Input
                 value={sigQuery}
                 onChange={(v) => setSigQuery(v)}
@@ -358,17 +362,17 @@ function LogModal({ visible, onClose }) {
             </div>
 
             {sigSearching ? (
-              <div className="search-view">
+              <div>
                 {!sigSearchGroups.length ? (
-                  <div className="log-empty">未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
+                  <div style={emptyStyle}>未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
                 ) : (
                   <>
-                    <div className="search-summary">共 {sigTotalHits} 条信号命中，跨 {sigSearchGroups.length} 个批次</div>
+                    <div className="muted" style={{ marginBottom: 8 }}>共 {sigTotalHits} 条信号命中，跨 {sigSearchGroups.length} 个批次</div>
                     {sigSearchGroups.map((g, gi) => (
-                      <div key={gi} className="search-group">
-                        <div className="search-group-head">
-                          <span className="search-batch">批次 {fmtTime(g.time)}</span>
-                          <span className="search-count">命中 {g.items.length} 条</span>
+                      <div key={gi} style={{ marginBottom: 12 }}>
+                        <div style={{ display: 'flex', gap: 12, marginBottom: 4, fontSize: 13 }}>
+                          <span className="muted">批次 {fmtTime(g.time)}</span>
+                          <span className="muted">命中 {g.items.length} 条</span>
                         </div>
                         <Table
                           data={g.items.map((sg, i) => ({ ...sg, _k: gi + '_' + i }))}
@@ -384,13 +388,13 @@ function LogModal({ visible, onClose }) {
               </div>
             ) : (
               <>
-                {sigNoData && <div className="log-empty">暂无信号批次记录，等待下一轮扫描</div>}
+                {sigNoData && <div style={emptyStyle}>暂无信号批次记录，等待下一轮扫描</div>}
                 {sigData && (
                   <>
-                    <div className="summary-bar">
-                      <div className="summary-item"><span className="summary-label">批次时间</span><span className="summary-value">{fmtTime(sigData.process_time)}</span></div>
-                      <div className="summary-item"><span className="summary-label">原始条数</span><span className="summary-value">{sigData.raw_count}</span></div>
-                      <div className="summary-item"><span className="summary-label">信号数</span><span className="summary-value">{sigData.signals.length}</span></div>
+                    <div style={summaryBarStyle}>
+                      <div style={summaryItemStyle}><span className="muted">批次时间</span><span style={{ color: '#eee' }}>{fmtTime(sigData.process_time)}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#eee' }}>{sigData.raw_count}</span></div>
+                      <div style={summaryItemStyle}><span className="muted">信号数</span><span style={{ color: '#eee' }}>{sigData.signals.length}</span></div>
                     </div>
                     {sigFiltered.length > 0 ? (
                       <Table
@@ -401,7 +405,7 @@ function LogModal({ visible, onClose }) {
                         pagination={{ pageSize: 10, showJumper: true }}
                       />
                     ) : (
-                      <div className="log-empty">{sigData.signals.length ? '当前战法无匹配信号' : '本轮无信号产出'}</div>
+                      <div style={emptyStyle}>{sigData.signals.length ? '当前战法无匹配信号' : '本轮无信号产出'}</div>
                     )}
                   </>
                 )}
@@ -503,39 +507,41 @@ export default function LLMDebug() {
       colKey: 'impact', title: '影响', width: 80,
       cell: ({ row }) => row.impact_level
         ? <Tag size="small" theme={row.impact_level === '高' ? 'danger' : row.impact_level === '中' ? 'warning' : 'default'} variant="light">{row.impact_level}</Tag>
-        : <span style={{ color: '#666' }}>—</span>,
+        : <span className="muted">—</span>,
     },
     {
       colKey: 'type', title: '类型', width: 110,
-      cell: ({ row }) => row.event_type ? <Tag size="small" variant="light">{row.event_type}</Tag> : <span style={{ color: '#666' }}>—</span>,
+      cell: ({ row }) => row.event_type ? <Tag size="small" variant="light">{row.event_type}</Tag> : <span className="muted">—</span>,
     },
     { colKey: 'reason', title: '理由', ellipsis: true, minWidth: 160 },
   ]
 
   return (
-    <div className="llm-debug-page">
-      <div className="page-header">
-        <h2>LLM 分析诊断</h2>
-        <div className="header-right">
+    <div className="page">
+      <div className="toolbar" style={{ justifyContent: 'space-between', marginBottom: 16 }}>
+        <SectionLabel>LLM 分析诊断</SectionLabel>
+        <div style={{ display: 'flex', gap: 8 }}>
           <Button theme="default" variant="outline" onClick={() => setShowLog(true)}>📋 日志</Button>
           <Button theme="primary" onClick={loadData} loading={loading}>刷新</Button>
         </div>
       </div>
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
 
-      {noAgent && <div className="empty">Agent 未就绪</div>}
-      {!noAgent && noData && <div className="empty">暂无数据，等待下一轮扫描</div>}
+      {noAgent && <div style={emptyStyle}>Agent 未就绪</div>}
+      {!noAgent && noData && <div style={emptyStyle}>暂无数据，等待下一轮扫描</div>}
       {data && (
         <>
           <Card style={{ marginBottom: 16 }}>
-            <div className="summary-bar">
-              <div className="summary-item">
-                <span className="summary-label">Stage1 模式</span>
-                <span className={'summary-value tag-' + data.stage1_mode}>{data.stage1_mode === 'llm' ? 'LLM' : '关键词'}</span>
+            <div style={summaryBarStyle}>
+              <div style={summaryItemStyle}>
+                <span className="muted">Stage1 模式</span>
+                <span style={{ color: data.stage1_mode === 'llm' ? '#0052d9' : '#faad14', fontWeight: 600 }}>
+                  {data.stage1_mode === 'llm' ? 'LLM' : '关键词'}
+                </span>
               </div>
-              <div className="summary-item"><span className="summary-label">原始条数</span><span className="summary-value">{data.raw_count}</span></div>
-              <div className="summary-item"><span className="summary-label">筛选后</span><span className="summary-value">{data.selected_count}</span></div>
-              <div className="summary-item"><span className="summary-label">分析时间</span><span className="summary-value">{formatTime(data.process_time)}</span></div>
+              <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#eee' }}>{data.raw_count}</span></div>
+              <div style={summaryItemStyle}><span className="muted">筛选后</span><span style={{ color: '#eee' }}>{data.selected_count}</span></div>
+              <div style={summaryItemStyle}><span className="muted">分析时间</span><span style={{ color: '#eee' }}>{formatTime(data.process_time)}</span></div>
             </div>
           </Card>
 
@@ -559,11 +565,16 @@ export default function LLMDebug() {
                 pagination={{ pageSize: 10, showJumper: true }}
               />
             ) : (
-              <div className="empty">Stage2 无分析结果</div>
+              <div style={emptyStyle}>Stage2 无分析结果</div>
             )}
           </Card>
         </>
       )}
     </div>
   )
+}
+
+// 板块小标题
+function SectionLabel({ children }) {
+  return <div style={{ fontWeight: 600, margin: '8px 0 4px', fontSize: 13 }}>{children}</div>
 }

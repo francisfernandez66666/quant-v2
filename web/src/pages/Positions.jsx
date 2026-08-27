@@ -1,12 +1,11 @@
 // ── 持仓管理页面 Positions.jsx ──
 // 纸面持仓（增删改/加减仓/改成本/清仓/批次明细） + 实盘持仓（QMT 网关对账 + 手动下单）。
-// 全面使用 TDesign 组件：Tabs / TabPanel / Card / Table / Dialog / Form / Input / InputNumber / Button / Tag。
+// 纯 TDesign 组件（Tabs / TabPanel / Card / Table / Dialog / Form / Input / InputNumber / Button / Tag），无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
-import './Positions.css'
 
 const CACHE_KEY = 'pos_cache_v1'
 
@@ -148,22 +147,6 @@ export default function Positions() {
     }
     setPnlOffset(off)
     localStorage.setItem('pnl_offset', off.toString())
-  }
-
-  // 判断当前价是否触及止盈或止损线
-  function curReachedStop(h) {
-    if (!h.cur_price || !h.stop_loss) return false
-    return h.cur_price <= h.stop_loss || h.cur_price >= h.take_profit
-  }
-  // 根据涨跌/盈亏/信号/止损状态返回行样式
-  function rowClass(h) {
-    const chg = h.change_pct || 0
-    const pnl = h.pnl_pct || 0
-    if (h.signal_active) return 'table-row signal'
-    if (chg >= 5 || pnl >= 8) return 'table-row strong'
-    if (curReachedStop(h)) return 'table-row danger'
-    if (chg >= 3 || pnl >= 5 || chg <= -3 || pnl <= -5) return 'table-row watch'
-    return 'table-row'
   }
 
   // 加载纸面持仓、资金与已实现盈亏
@@ -357,11 +340,6 @@ export default function Positions() {
       if (data && Array.isArray(data.positions)) setRealPositions(data.positions)
     } catch (_) {}
   }
-  function realRowClass(p) {
-    if (adviceFor(p.ts_code)) return 'table-row signal'
-    if (p.cost_price > 0 && curPrice(p) && (p.cost_price - curPrice(p)) / p.cost_price <= -0.05) return 'table-row danger'
-    return 'table-row'
-  }
   function curPrice(p) { return (p.cur_price && p.cur_price > 0) ? p.cur_price : 0 }
   function realPnlPct(p) {
     if (!p.cost_price || p.cost_price <= 0 || !curPrice(p)) return 0
@@ -492,22 +470,22 @@ export default function Positions() {
   ]
 
   return (
-    <div className="positions-page">
-      <div className="page-header">
-        <h2>持仓管理</h2>
-        <div className="header-right">
-          <div className={'total-pnl ' + (totalPnl >= 0 ? 'up' : 'down')}>
-            总盈亏: {totalPnl >= 0 ? '+' : ''}¥{totalPnl.toFixed(2)}
-            <Button size="small" variant="outline" theme="default" onClick={resetPnl} style={{ marginLeft: 8 }}>清零</Button>
+    <div className="page">
+      <Card style={{ marginBottom: 16 }}>
+        <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>持仓管理</h2>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <div className={totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
+              总盈亏: {totalPnl >= 0 ? '+' : ''}¥{totalPnl.toFixed(2)}
+              <Button size="small" variant="outline" theme="default" onClick={resetPnl} style={{ marginLeft: 8 }}>清零</Button>
+            </div>
+            {!editingBalance
+              ? <div onClick={editBalanceStart} style={{ cursor: 'pointer' }}>可用资金: ¥{availableBalance.toFixed(2)} ✏️</div>
+              : <InputNumber value={balanceInputVal} min={0} step={0.01} onBlur={editBalanceSave} onEnter={editBalanceSave} onChange={(v) => setBalanceInputVal(Number(v) || 0)} style={{ width: 160 }} autoFocus />}
+            <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>
           </div>
-          {!editingBalance
-            ? <div className="balance" onClick={editBalanceStart}>可用资金: ¥{availableBalance.toFixed(2)} ✏️</div>
-            : <div className="balance-editing">
-                <InputNumber value={balanceInputVal} min={0} step={0.01} onBlur={editBalanceSave} onEnter={editBalanceSave} onChange={(v) => setBalanceInputVal(Number(v) || 0)} style={{ width: 160 }} autoFocus />
-              </div>}
-          <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>
         </div>
-      </div>
+      </Card>
 
       <Tabs value={bookTab} onChange={(v) => switchBook(v)}>
         <Tabs.TabPanel value="paper" label="纸面持仓">
@@ -519,55 +497,58 @@ export default function Positions() {
                 rowKey="code"
                 size="small"
                 pagination={false}
-                rowClassName={({ row }) => rowClass(row)}
                 expandOnRowClick={false}
                 expandedRowKeys={Array.from(klineOpen)}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
                 expandedRow={({ row }) => (
-                  <div className="kline-flex">
-                    <div className="kline-main"><KLineChart code={row.code} name={row.name} /></div>
-                    <div className="depth-side"><DepthPanel code={row.code} name={row.name} /></div>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', flexWrap: 'wrap' }}>
+                    <div style={{ flex: '1 1 auto', minWidth: 0 }}><KLineChart code={row.code} name={row.name} /></div>
+                    <div style={{ flex: '0 0 300px' }}><DepthPanel code={row.code} name={row.name} /></div>
                   </div>
                 )}
               />
             </Card>
           ) : (
-            <div className="empty">
-              <p>暂无持仓</p>
-              <p className="hint">点击右上角「新增持仓」手动添加，或通过信号页确认买入自动更新</p>
-            </div>
+            <Card>
+              <div style={{ padding: 24, textAlign: 'center' }}>
+                <p className="muted">暂无持仓</p>
+                <p className="muted">点击右上角「新增持仓」手动添加，或通过信号页确认买入自动更新</p>
+              </div>
+            </Card>
           )}
 
-          <div className="legend">
-            <span><span className="lg-dot up"></span>当日涨跌红涨绿跌</span>
-            <span className="lg-sep">|</span>
-            <span><span className="lg-dot warn"></span>持仓盈亏红赚绿亏</span>
-            <span className="lg-sep">|</span>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: '#888', marginTop: 12 }}>
+            <span>当日涨跌红涨绿跌</span>
+            <span style={{ color: '#555' }}>|</span>
+            <span>持仓盈亏红赚绿亏</span>
+            <span style={{ color: '#555' }}>|</span>
             <span>⚡ 有策略信号</span>
-            <span className="lg-sep">|</span>
-            <span className="lg-item">止盈+8% / 止损-5%</span>
-            <span className="lg-sep">|</span>
+            <span style={{ color: '#555' }}>|</span>
+            <span>止盈+8% / 止损-5%</span>
+            <span style={{ color: '#555' }}>|</span>
             <span>N≥60可买 龙≥60买 量≥50关注</span>
           </div>
         </Tabs.TabPanel>
 
         <Tabs.TabPanel value="real" label={realTripped ? '实盘持仓 !' : '实盘持仓'}>
-          <div className="real-book-bar">
-            <span className={'real-bar-item ' + (qmtState.enabled ? 'ok' : 'off')}>{qmtState.enabled ? '已启用' : '未启用'}</span>
-            <span className="real-bar-item">模式: {qmtState.mode || 'manual'}</span>
-            <span className={'real-bar-item ' + (qmtState.tripped ? 'bad' : 'ok')}>熔断: {qmtState.tripped ? '已熔断' : '正常'}</span>
-            {qmtState.gateway_url && <span className="real-bar-item dim">网关 {qmtState.gateway_url}</span>}
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+            <span style={{ color: qmtState.enabled ? '#00a870' : '#888' }}>{qmtState.enabled ? '已启用' : '未启用'}</span>
+            <span className="muted">模式: {qmtState.mode || 'manual'}</span>
+            <span style={{ color: qmtState.tripped ? '#e34d59' : '#00a870' }}>熔断: {qmtState.tripped ? '已熔断' : '正常'}</span>
+            {qmtState.gateway_url && <span className="muted">网关 {qmtState.gateway_url}</span>}
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
           </div>
 
           {!realPositions.length ? (
-            <div className="real-empty">
-              <p>{realEnabled ? '暂无实盘持仓' : '实盘未启用（config.toml 中 qmt.enabled=true 并配置网关）'}</p>
-              {realEnabled && <p className="hint">等待 QMT 网关回报 /api/qmt/report 推送持仓对账</p>}
-            </div>
+            <Card>
+              <div style={{ padding: 24, textAlign: 'center' }}>
+                <p className="muted">{realEnabled ? '暂无实盘持仓' : '实盘未启用（config.toml 中 qmt.enabled=true 并配置网关）'}</p>
+                {realEnabled && <p className="muted">等待 QMT 网关回报 /api/qmt/report 推送持仓对账</p>}
+              </div>
+            </Card>
           ) : (
             <Card>
-              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={false} rowClassName={({ row }) => realRowClass(row)} />
+              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={false} />
             </Card>
           )}
         </Tabs.TabPanel>
@@ -590,8 +571,10 @@ export default function Positions() {
       <Dialog visible={showAdd} header={editingIdx >= 0 ? '编辑持仓' : '新增持仓'} onClose={closeAdd} onConfirm={confirmAdd} confirmBtn="确定" cancelBtn="取消">
         <Form onSubmit={confirmAdd}>
           <Form.FormItem label="代码">
-            <Input value={formCode} disabled={editingIdx >= 0} placeholder="输入代码" onChange={(v) => { setFormCode(v); onCodeInput(v) }} />
-            {lookupName && <span className="lookup-result">{lookupName} ¥{(lookupPrice || 0).toFixed(2)}</span>}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <Input value={formCode} disabled={editingIdx >= 0} placeholder="输入代码" onChange={(v) => { setFormCode(v); onCodeInput(v) }} />
+              {lookupName && <span className="muted">{lookupName} ¥{(lookupPrice || 0).toFixed(2)}</span>}
+            </div>
           </Form.FormItem>
           <Form.FormItem label="成本价">
             <InputNumber value={formCost} min={0} step={0.001} placeholder="成本价" onChange={(v) => setFormCost(Number(v) || 0)} />
@@ -619,13 +602,17 @@ export default function Positions() {
       >
         <Form>
           <Form.FormItem label="当前数量">
-            <span className="static-val">{lotTarget?.quantity}</span>
-            <span style={{ width: 'auto', marginLeft: 12, color: '#888' }}>当前成本</span>
-            <span className="static-val">¥{lotTarget?.cost_price?.toFixed(2)}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <span>{lotTarget?.quantity}</span>
+              <span className="muted">当前成本</span>
+              <span>¥{lotTarget?.cost_price?.toFixed(2)}</span>
+            </div>
           </Form.FormItem>
           <Form.FormItem label="现价">
-            <span className="static-val">{lotCurrentPrice > 0 ? '¥' + lotCurrentPrice.toFixed(2) : '—'}</span>
-            {lotCurrentPrice > 0 && <Button size="small" variant="outline" theme="primary" style={{ marginLeft: 8 }} onClick={() => setLotFormPrice(lotCurrentPrice)}>按现价</Button>}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>{lotCurrentPrice > 0 ? '¥' + lotCurrentPrice.toFixed(2) : '—'}</span>
+              {lotCurrentPrice > 0 && <Button size="small" variant="outline" theme="primary" onClick={() => setLotFormPrice(lotCurrentPrice)}>按现价</Button>}
+            </div>
           </Form.FormItem>
           <Form.FormItem label={lotDir === 'add' ? '加仓价' : '减仓价'}>
             <InputNumber value={lotFormPrice} min={0} step={0.001} placeholder="成交价格（默认现价）" onChange={(v) => setLotFormPrice(Number(v) || 0)} />
@@ -634,10 +621,10 @@ export default function Positions() {
             <InputNumber value={lotFormQty} min={0} step={1} placeholder="成交数量" onChange={(v) => setLotFormQty(parseInt(v) || 0)} />
           </Form.FormItem>
           {lotPreviewQty > 0 && (
-            <div className="preview">
+            <div className="muted">
               {lotDir === 'add'
                 ? <>加仓后：共 {lotPreviewQty} 股 / 平均成本 ¥{lotPreviewCost.toFixed(3)}</>
-                : <span className={lotOverSell ? 'over-sell' : ''}>
+                : <span style={{ color: lotOverSell ? '#e34d59' : '#888' }}>
                     {lotOverSell ? '减仓数量超过持仓！' : `减仓后：剩余 ${lotPreviewQty} 股 / 平均成本 ¥${lotPreviewCost.toFixed(3)}`}
                   </span>}
             </div>
@@ -658,14 +645,14 @@ export default function Positions() {
       <Dialog visible={showClose} header={`清仓 ${closeTarget?.code} ${closeTarget?.name}`} onClose={() => setShowClose(false)} onConfirm={confirmCloseHolding} confirmBtn="确认清仓" cancelBtn="取消">
         <Form onSubmit={confirmCloseHolding}>
           <Form.FormItem label="当前持仓">
-            <span className="static-val">{closeTarget?.quantity} 股 / 成本 ¥{closeTarget?.cost_price?.toFixed(2)}</span>
+            <span>{closeTarget?.quantity} 股 / 成本 ¥{closeTarget?.cost_price?.toFixed(2)}</span>
           </Form.FormItem>
           <Form.FormItem label="清仓价">
             <InputNumber value={closeFormPrice} min={0} step={0.001} placeholder="清仓价格" onChange={(v) => { setCloseFormPrice(Number(v) || 0); closePriceInput() }} />
           </Form.FormItem>
           {closePreviewValid && (
-            <div className="preview">
-              清仓盈亏：<span className={closePnlAmount >= 0 ? 'pnl-up' : 'pnl-down'}>{closePnlAmount >= 0 ? '+' : ''}¥{closePnlAmount.toFixed(2)}</span>
+            <div className="muted">
+              清仓盈亏：<span style={{ color: closePnlAmount >= 0 ? '#e34d59' : '#00a870' }}>{closePnlAmount >= 0 ? '+' : ''}¥{closePnlAmount.toFixed(2)}</span>
               （{closePnlPct >= 0 ? '+' : ''}{closePnlPct.toFixed(2)}%）
             </div>
           )}
@@ -674,17 +661,19 @@ export default function Positions() {
 
       {/* 批次明细弹窗 */}
       <Dialog visible={showLots && !!lotsTarget} header={`加仓明细 ${lotsTarget?.code} ${lotsTarget?.name}`} onClose={() => setShowLots(false)} onConfirm={() => setShowLots(false)} confirmBtn="关闭" cancelBtn="">
-        <div className="lots-table">
-          <div className="lots-header"><span>时间</span><span>价格</span><span>数量</span><span>金额</span></div>
+        <div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, fontWeight: 600, fontSize: 13 }}>
+            <span>时间</span><span>价格</span><span>数量</span><span>金额</span>
+          </div>
           {(lotsTarget?.lots || []).map((lot, i) => (
-            <div className="lots-row" key={i}>
-              <span>{(lot.at || '').replace('T', ' ').slice(0, 19)}</span>
+            <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, fontSize: 13, borderBottom: '1px solid #333', padding: '4px 0' }}>
+              <span className="muted">{(lot.at || '').replace('T', ' ').slice(0, 19)}</span>
               <span>¥{lot.price?.toFixed(3)}</span>
               <span>{lot.quantity}</span>
               <span>¥{(lot.price * lot.quantity).toFixed(2)}</span>
             </div>
           ))}
-          <div className="lots-footer">合计：{lotsTarget?.quantity} 股 / 平均成本 ¥{lotsTarget?.cost_price?.toFixed(3)}</div>
+          <div style={{ marginTop: 8, fontSize: 13 }}>合计：{lotsTarget?.quantity} 股 / 平均成本 ¥{lotsTarget?.cost_price?.toFixed(3)}</div>
         </div>
       </Dialog>
 
@@ -692,7 +681,7 @@ export default function Positions() {
       <Dialog visible={!!realAction} header={`实盘${realAction ? realActionLabel(realAction.dir) : ''} ${realAction?.pos.ts_code} ${realAction?.pos.name}`} onClose={() => setRealAction(null)} onConfirm={confirmRealAction} confirmBtn={realSubmitting ? '下单中…' : '确认下单'} cancelBtn="取消">
         <Form onSubmit={confirmRealAction}>
           <Form.FormItem label="当前持仓">
-            <span className="static-val">{realAction?.pos.qty} 股 / 成本 ¥{realAction?.pos.cost_price?.toFixed(3)}</span>
+            <span>{realAction?.pos.qty} 股 / 成本 ¥{realAction?.pos.cost_price?.toFixed(3)}</span>
           </Form.FormItem>
           <Form.FormItem label="参考价">
             <InputNumber value={realFormPrice} min={0} step={0.001} placeholder="成交参考价" onChange={(v) => setRealFormPrice(Number(v) || 0)} />
@@ -704,7 +693,7 @@ export default function Positions() {
             <Input value={realFormStrategy} placeholder="策略名（可选）" onChange={(v) => setRealFormStrategy(v)} />
           </Form.FormItem>
           {realFormQty > 0 && realFormPrice > 0 && (
-            <div className="preview">预估金额：¥{(realFormQty * realFormPrice).toFixed(2)}</div>
+            <div className="muted">预估金额：¥{(realFormQty * realFormPrice).toFixed(2)}</div>
           )}
         </Form>
       </Dialog>

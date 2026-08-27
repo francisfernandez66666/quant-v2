@@ -1,0 +1,19 @@
+/* KLineChart 组件样式（仅本组件使用，避免全局污染） */
+.kline-chart { background: #181818; border: 1px solid #333; border-radius: 8px; padding: 8px; }
+.kline-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.kline-title { font-size: 13px; font-weight: 600; color: #e6e6e6; }
+.kline-summary { font-size: 12px; color: #888; }
+.kline-summary b { font-weight: 600; margin: 0 2px; }
+.kline-state { font-size: 12px; color: #888; padding: 12px; text-align: center; }
+.kline-wrap { width: 100%; }
+.kline-wrap canvas { display: block; width: 100%; }
+.btn-refresh {
+  margin-left: auto; padding: 2px 10px; border-radius: 4px; border: 1px solid #333;
+  background: transparent; color: #bbb; cursor: pointer; font-size: 12px;
+}
+.btn-refresh:hover:not(:disabled) { background: rgba(0,0,0,0.3); }
+.btn-refresh:disabled { opacity: 0.5; cursor: default; }
+.kline-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: #999; margin-top: 4px; }
+.kline-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.kline-legend i { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+.kline-legend.macd i { background: #f6b73c; }

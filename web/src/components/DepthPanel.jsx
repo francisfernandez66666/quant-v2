@@ -2,6 +2,7 @@
 // 展示个股买卖五档盘口、现价涨跌与委比/封单等派生因子，基于 Canvas 绘制。
 import React, { useState, useEffect, useRef } from 'react'
 import * as api from '../api/index.js'
+import './DepthPanel.css'
 
 // 配色（与 Vue 源完全一致）
 const C = {

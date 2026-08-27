@@ -5,7 +5,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Form, Input, Switch, Button, Tag, Table, MessagePlugin, DialogPlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
-import './Quant.css'
 
 const KNOWN_STRATEGIES = [
   { value: 'dragon', label: '龙头战法 Dragon' },
@@ -207,7 +206,7 @@ export default function Quant() {
   ]
 
   return (
-    <div className="quant-page">
+    <div className="page">
       <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>📈 量化交易</div>
       <div style={{ fontSize: 12, color: '#888', marginBottom: 14 }}>实盘链路参数、仓位纪律与战法白名单（保存后约 5 秒热加载生效）</div>
 

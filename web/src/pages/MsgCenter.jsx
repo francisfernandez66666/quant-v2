@@ -4,7 +4,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Tag, Button, Select, DialogPlugin, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
-import './MsgCenter.css'
 
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
@@ -165,7 +164,7 @@ export default function MsgCenter() {
   }, [])
 
   return (
-    <div className="msg-page">
+    <div className="page">
       <Card style={{ marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>消息中心</h2>

@@ -1,14 +1,13 @@
 // ── 策略信号页面 Signals.jsx ──
 // 展示所有策略评级信号，支持按等级/战法筛选、查看 D1-D4 子维度评分、
 // 确认买入/忽略操作、模拟买入归池、一键收藏自选、展开分时+盘口。
-// 使用 TDesign React 组件（Table / Card / Tag / Button / Dialog / Select）。
+// 纯 TDesign React（Card / Table / Tag / Button / Select / Dialog），无自定义 CSS。
 import React, { useState, useEffect, useRef } from 'react'
 import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import LogModal from '../components/LogModal.jsx'
-import './Signals.css'
 
 const FILTERS = [
   { key: 'all', label: '全部' },
@@ -257,7 +256,7 @@ export default function Signals() {
           ) : row.action === 'buy' ? (
             <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); confirmTrade(row, 'ignore') }}>忽略</Button>
           ) : (
-            <span style={{ color: '#555' }}>—</span>
+            <span className="muted">—</span>
           )}
           {paperOn && row.can_open && hasStrategyPool(row) && (
             <Button size="small" variant="outline" theme="success" onClick={(e) => { e.stopPropagation(); paperBuy(row) }}
@@ -271,10 +270,18 @@ export default function Signals() {
     },
   ]
 
+  // 移动端底部操作面板按钮统一样式
+  function sheetBtnStyle(color) {
+    return {
+      width: '100%', padding: 14, borderRadius: 8, border: 'none',
+      background: '#0f0f23', color, fontSize: 16, cursor: 'pointer', marginBottom: 8, textAlign: 'center',
+    }
+  }
+
   return (
-    <div className="signals-page">
+    <div className="page">
       <Card style={{ marginBottom: 16 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+        <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>策略信号</h2>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             {FILTERS.map((f) => (
@@ -311,11 +318,11 @@ export default function Signals() {
       </Card>
 
       {sheetSignal && (
-        <div className="sheet-overlay" style={{
+        <div style={{
           position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(0,0,0,0.6)',
           display: 'flex', alignItems: 'flex-end',
         }} onClick={() => setSheetSignal(null)}>
-          <div className="action-sheet" style={{
+          <div style={{
             width: '100%', background: '#1a1a2e', borderRadius: '14px 14px 0 0',
             padding: '10px 12px calc(10px + env(safe-area-inset-bottom, 0px))',
           }} onClick={(e) => e.stopPropagation()}>
@@ -353,11 +360,4 @@ export default function Signals() {
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
     </div>
   )
-}
-
-function sheetBtnStyle(color) {
-  return {
-    width: '100%', padding: 14, borderRadius: 8, border: 'none',
-    background: '#0f0f23', color, fontSize: 16, cursor: 'pointer', marginBottom: 8, textAlign: 'center',
-  }
 }

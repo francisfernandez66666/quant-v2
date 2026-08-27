@@ -1,11 +1,10 @@
 // ── 热点页面 Hotspot.jsx ──
 // 展示热点板块（含异动原因弹窗）、全市场个股评分排名、宏观日历、IPO日历、热点资讯。
-// 全面使用 TDesign 组件：Card / Table / Dialog / Tag / Button。
+// 全面使用 TDesign 组件：Card / Table / Dialog / Tag / Button，纯内联样式，无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Table, Dialog, Tag, Button, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
-import './Hotspot.css'
 
 // ── 工具函数 ──
 // 截断异动原因为简短描述
@@ -15,26 +14,12 @@ function shortReason(r) {
   return idx > 0 ? r.slice(0, idx) : r.slice(0, 18)
 }
 
-// 根据分数与阈值返回评分单元格 CSS 类
-function scoreClass(score, pass, strongMin) {
-  if (!score || score <= 0) return 'ev-score'
-  if (score >= strongMin) return 'ev-score strong'
-  if (pass) return 'ev-score pass'
-  return 'ev-score'
-}
-function scoreColor(cls) {
-  if (cls.indexOf('strong') >= 0) return '#e34d59'
-  if (cls.indexOf('pass') >= 0) return '#FAAD14'
+// 根据分数与阈值返回评分单元格颜色（红强 / 橙达标 / 灰偏低）
+function scoreColorF(score, pass, strongMin) {
+  if (!score || score <= 0) return '#555'
+  if (score >= strongMin) return '#e34d59'
+  if (pass) return '#FAAD14'
   return '#555'
-}
-
-// 根据多维度评分决定个股行高亮样式
-function rowClass(e) {
-  const strong = (e.n_score || 0) >= 80 || (e.dragon_score || 0) >= 80 || (e.db_score || 0) >= 80 || (e.dr_score || 0) >= 80 || (e.m_score || 0) >= 70
-  if (strong) return 'ev-row strong'
-  const watch = (e.n_score || 0) >= 60 || (e.dragon_score || 0) >= 60 || (e.db_score || 0) >= 60 || (e.dr_score || 0) >= 60 || (e.m_score || 0) >= 50
-  if (watch) return 'ev-row watch'
-  return 'ev-row'
 }
 
 // 安全读取字段值
@@ -76,11 +61,6 @@ export default function Hotspot() {
   function setSort(key) {
     if (sortKey === key) setSortDir((d) => d * -1)
     else { setSortKey(key); setSortDir(-1) }
-  }
-  // 返回当前排序方向的箭头字符
-  function sortArrow(key) {
-    if (sortKey !== key) return ''
-    return sortDir === -1 ? ' ▼' : ' ▲'
   }
 
   // 过滤非日历类资讯
@@ -256,11 +236,11 @@ export default function Hotspot() {
     { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name || '-'}</span> },
     { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
     { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
-    { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreClass(row.n_score, row.n_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'dragon_score', title: '龙≥60', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => { const c = scoreClass(row.dragon_score, row.dragon_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'db_score', title: '凸≥60', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => { const c = scoreClass(row.db_score, row.db_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'dr_score', title: '回≥60', width: 70, sorter: (a, b) => (a.dr_score || 0) - (b.dr_score || 0), cell: ({ row }) => { const c = scoreClass(row.dr_score, row.dr_score >= 60, 80); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.dr_score > 0 ? row.dr_score.toFixed(0) : '—'}</span> } },
-    { colKey: 'm_score', title: '量≥50', width: 70, sorter: (a, b) => (a.m_score || 0) - (b.m_score || 0), cell: ({ row }) => { const c = scoreClass(row.m_score, row.m_score >= 50, 70); return <span style={{ color: scoreColor(c), fontWeight: 600 }}>{row.m_score > 0 ? row.m_score.toFixed(0) : '—'}</span> } },
+    { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.n_score, row.n_score >= 60, 80), fontWeight: 600 }}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> },
+    { colKey: 'dragon_score', title: '龙≥60', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.dragon_score, row.dragon_score >= 60, 80), fontWeight: 600 }}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> },
+    { colKey: 'db_score', title: '凸≥60', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.db_score, row.db_score >= 60, 80), fontWeight: 600 }}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> },
+    { colKey: 'dr_score', title: '回≥60', width: 70, sorter: (a, b) => (a.dr_score || 0) - (b.dr_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.dr_score, row.dr_score >= 60, 80), fontWeight: 600 }}>{row.dr_score > 0 ? row.dr_score.toFixed(0) : '—'}</span> },
+    { colKey: 'm_score', title: '量≥50', width: 70, sorter: (a, b) => (a.m_score || 0) - (b.m_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.m_score, row.m_score >= 50, 70), fontWeight: 600 }}>{row.m_score > 0 ? row.m_score.toFixed(0) : '—'}</span> },
   ]
 
   // 宏观日历列
@@ -302,32 +282,32 @@ export default function Hotspot() {
   const newsData = newsItems.map((n, i) => ({ id: 'n' + i, time: fmtNewsTime(n.datetime), title: n.title, tags: newsTags(n), sectors: n.sectors, stocks: n.stocks }))
 
   return (
-    <div className="hotspot-page">
+    <div className="page">
       <Card>
-        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <span>🔥 热点板块</span>
           <Button size="small" variant="outline" theme="primary" onClick={openLog}>📋 日志</Button>
         </div>
         {sectors.length ? (
-          <div className="sector-grid">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12 }}>
             {sectors.map((s) => (
-              <Card key={s.code} className="sector-card" bordered={false} style={{ cursor: 'pointer' }} onClick={() => setReasonTarget(s)}>
-                <div className="sec-name">{s.name}</div>
-                {s.reason && <div className="sec-reason">{shortReason(s.reason)}</div>}
-                <div className="sec-score">{Math.round((s.score || 0) * 100)}分</div>
-                <div className={['sec-pct', (s.change_pct || 0) >= 0 ? 'up' : 'down'].join(' ')}>
+              <Card key={s.code} bordered={false} style={{ cursor: 'pointer', background: '#12121e', border: '1px solid #2a2a3e' }} onClick={() => setReasonTarget(s)}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: '#e0e0e0' }}>{s.name}</div>
+                {s.reason && <div style={{ fontSize: 11, color: '#888', marginTop: 4, minHeight: 28, overflow: 'hidden' }}>{shortReason(s.reason)}</div>}
+                <div style={{ fontSize: 16, fontWeight: 700, color: '#FAAD14', marginTop: 4 }}>{Math.round((s.score || 0) * 100)}分</div>
+                <div className={(s.change_pct || 0) >= 0 ? 'up' : 'down'} style={{ fontWeight: 700, marginTop: 2 }}>
                   {(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(2)}%
                 </div>
-                <div className="sec-meta">
-                  {(s.d1 || 0) > 0 && <span className="d1-badge">D1 {s.d1.toFixed(0)}</span>}
+                <div style={{ fontSize: 11, color: '#777', marginTop: 6 }}>
+                  {(s.d1 || 0) > 0 && <span style={{ display: 'inline-block', background: 'rgba(79,195,247,0.15)', color: '#4fc3f7', borderRadius: 4, padding: '1px 5px', marginRight: 6 }}>D1 {s.d1.toFixed(0)}</span>}
                   <span>涨停 {s.limitup_cnt || 0}</span>
-                  <span>流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
+                  <span style={{ marginLeft: 8 }}>流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
                 </div>
               </Card>
             ))}
           </div>
         ) : (
-          <div className="empty">暂无热点板块数据</div>
+          <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无热点板块数据</div>
         )}
       </Card>
 
@@ -335,17 +315,17 @@ export default function Hotspot() {
       <Dialog visible={!!reasonTarget} header={reasonTarget ? reasonTarget.name : ''} onClose={() => setReasonTarget(null)} confirmBtn="知道了" cancelBtn="">
         {reasonTarget && (
           <div>
-            <div className="modal-section">
-              <div className="modal-subtitle">板块异动原因</div>
-              <div className="modal-reason">{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>板块异动原因</div>
+              <div style={{ fontSize: 13, color: '#ccc', whiteSpace: 'pre-wrap' }}>{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
             </div>
             {reasonTarget.news_titles && reasonTarget.news_titles.length ? (
-              <div className="modal-section">
-                <div className="modal-subtitle">触发新闻（{reasonTarget.news_titles.length}条）</div>
+              <div>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻（{reasonTarget.news_titles.length}条）</div>
                 {reasonTarget.news_titles.map((t, i) => (
-                  <div key={i} className="modal-news-item">
-                    <span className="modal-news-idx">{i + 1}.</span>
-                    <span className="modal-news-title">{t}</span>
+                  <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#ddd', padding: '2px 0' }}>
+                    <span style={{ color: '#888' }}>{i + 1}.</span>
+                    <span>{t}</span>
                   </div>
                 ))}
               </div>
@@ -357,22 +337,22 @@ export default function Hotspot() {
       {/* 运行日志弹窗 */}
       <Dialog visible={showLog} header="运行日志" onClose={() => setShowLog(false)} confirmBtn="关闭" cancelBtn="">
         <div>
-          <div className="modal-section">
-            <div className="modal-subtitle">信号批次 / 阶段记录</div>
-            <pre className="modal-reason" style={{ maxHeight: 180 }}>{logSignal || '暂无'}</pre>
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>信号批次 / 阶段记录</div>
+            <pre style={{ fontSize: 12, color: '#ccc', background: '#12121e', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logSignal || '暂无'}</pre>
           </div>
-          <div className="modal-section">
-            <div className="modal-subtitle">Stage 轮次记录</div>
-            <pre className="modal-reason" style={{ maxHeight: 180 }}>{logStage || '暂无'}</pre>
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>Stage 轮次记录</div>
+            <pre style={{ fontSize: 12, color: '#ccc', background: '#12121e', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logStage || '暂无'}</pre>
           </div>
         </div>
       </Dialog>
 
       {/* 个股评分排名 */}
       <Card style={{ marginTop: 14 }}>
-        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <span>📊 个股评分排名</span>
-          <span className="card-sub">N形≥60 / 龙头≥60 / 双凸≥60 / 回头≥60 / 动量≥50</span>
+          <span className="muted">N形≥60 / 龙头≥60 / 双凸≥60 / 回头≥60 / 动量≥50</span>
         </div>
         {evals.length ? (
           <Table
@@ -381,45 +361,44 @@ export default function Hotspot() {
             rowKey="code"
             size="small"
             pagination={{ pageSize: 20, showJumper: true }}
-            rowClassName={({ row }) => rowClass(row)}
           />
         ) : (
-          <div className="empty"><span className="loading-dot"></span> 等待评估结果...</div>
+          <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待评估结果...</div>
         )}
-        <div className="legend">
-          <span className="lg-strong">≥80 强势</span>
-          <span className="lg-pass">≥门槛 达标</span>
-          <span className="lg-low">&lt;门槛 偏低</span>
-          <span className="lg-sep">|</span>
-          <span className="lg-item">N形≥60操作, 龙头≥60买入/≥50观察, 双凸≥60买入/50-60观察, 回头≥60入场, 动量≥50关注</span>
-          <span className="lg-sep">|</span>
-          <span className="lg-item">点击表头排序</span>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 11, color: '#888', marginTop: 10 }}>
+          <span style={{ color: '#e34d59' }}>≥80 强势</span>
+          <span style={{ color: '#FAAD14' }}>≥门槛 达标</span>
+          <span style={{ color: '#555' }}>&lt;门槛 偏低</span>
+          <span>|</span>
+          <span>N形≥60操作, 龙头≥60买入/≥50观察, 双凸≥60买入/50-60观察, 回头≥60入场, 动量≥50关注</span>
+          <span>|</span>
+          <span>点击表头排序</span>
         </div>
       </Card>
 
       {/* 宏观日历 */}
       <Card style={{ marginTop: 14 }}>
-        <div className="card-header">📅 宏观日历</div>
+        <div style={{ fontWeight: 600, marginBottom: 12 }}>📅 宏观日历</div>
         {calendarData.length ? (
           <Table data={calendarData} columns={calendarColumns} rowKey="id" size="small" pagination={false} maxHeight={200} />
         ) : (
-          <div className="hs-cal-empty">暂无日历事件</div>
+          <div className="muted" style={{ padding: 16, textAlign: 'center' }}>暂无日历事件</div>
         )}
       </Card>
 
       {/* IPO 日历 */}
       <Card style={{ marginTop: 14 }}>
-        <div className="card-header">📋 IPO日历</div>
+        <div style={{ fontWeight: 600, marginBottom: 12 }}>📋 IPO日历</div>
         {ipoData.length ? (
           <Table data={ipoData} columns={ipoColumns} rowKey="id" size="small" pagination={false} maxHeight={200} />
         ) : (
-          <div className="hs-cal-empty">暂无IPO日历</div>
+          <div className="muted" style={{ padding: 16, textAlign: 'center' }}>暂无IPO日历</div>
         )}
       </Card>
 
       {/* 热点资讯 */}
       <Card style={{ marginTop: 14 }}>
-        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <span>📰 热点资讯</span>
           <Button size="small" variant="outline" theme="primary" disabled={reanalyzing} onClick={onReanalyze}>
             {reanalyzing ? '补推中…' : '🔁 手动补推'}
@@ -428,7 +407,7 @@ export default function Hotspot() {
         {newsData.length ? (
           <Table data={newsData} columns={newsColumns} rowKey="id" size="small" pagination={false} maxHeight={400} />
         ) : (
-          <div className="empty">暂无资讯</div>
+          <div className="muted" style={{ padding: 16, textAlign: 'center' }}>暂无资讯</div>
         )}
       </Card>
     </div>

@@ -263,16 +263,14 @@ export default function App() {
   return (
     <ConfigProvider theme="dark">
       <Layout style={{ minHeight: '100vh' }}>
-        <Layout.Header className="app-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', height: 56 }}>
-          <div className="trade-time">
-            {inTradeTime !== null && (inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后')}
-            <span className={'server-status' + (serverOnline ? ' online' : '')} style={{ marginLeft: 12 }}>
-              {serverOnline ? '服务在线' : '离线'}
-            </span>
+        <Layout.Header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', height: 56, borderBottom: '1px solid #333' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
+            <span>{inTradeTime !== null && (inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后')}</span>
+            <span className="muted">{serverOnline ? '服务在线' : '离线'}</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <Switch value={shortEnabled} onChange={onShortToggle} />
-            <span className="muted" style={{ fontSize: 12 }}>{shortEnabled ? '做多+空' : '仅做多'}</span>
+            <span className="muted">{shortEnabled ? '做多+空' : '仅做多'}</span>
             <Button theme="default" variant="outline" size="small" onClick={() => {
               const sent = sendNotify('量仔期货', '通知测试成功')
               MessagePlugin.info('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')))
@@ -281,14 +279,16 @@ export default function App() {
           </div>
         </Layout.Header>
         <Layout style={{ display: 'flex' }}>
-          <aside className="app-sidebar">
-            <div className="logo">量仔期货</div>
-            <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} options={menuOptions} style={{ width: '100%' }} />
+          <aside style={{ width: 210, background: '#232323', borderRight: '1px solid #333', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+            <div className="brand-logo">量仔期货</div>
+            <div style={{ flex: 1, overflowY: 'auto' }}>
+              <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} options={menuOptions} style={{ width: '100%', background: 'transparent', borderRight: 'none' }} />
+            </div>
             <div className="sidebar-footer">
               <div className="account-name">{account}</div>
             </div>
           </aside>
-          <Layout.Content className="app-content">
+          <Layout.Content style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
             <Routes>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<Dashboard />} />

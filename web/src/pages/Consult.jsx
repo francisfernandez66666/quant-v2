@@ -5,7 +5,6 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { Card, Switch, Input, Textarea, Button, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
-import './Consult.css'
 
 // 将 ISO 时间格式化为 HH:mm:ss，用于消息气泡
 function fmtTime(t) {
@@ -13,6 +12,9 @@ function fmtTime(t) {
   const d = new Date(t)
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
+
+const chatBoxStyle = { flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }
+const bubbleStyle = { maxWidth: '80%', padding: '10px 12px', borderRadius: 8, fontSize: 14, lineHeight: 1.5, wordBreak: 'break-word' }
 
 /**
  * 股票咨询页面组件
@@ -147,11 +149,11 @@ export default function Consult() {
   }, [])
 
   return (
-    <div className="consult-page">
-      <div className="page-header">
-        <h2>股票咨询</h2>
-        <div className="header-right">
-          <label className="pro-mode" title="开启后咨询将注入该股全部实时行情（现价/净流入/大单明细/均线/MACD/策略信号）。盘中每 15 分钟限流一次，盘前盘后不限。">
+    <div className="page" style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 32px)' }}>
+      <div className="toolbar" style={{ justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+        <SectionLabel>股票咨询</SectionLabel>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <label className="muted" title="开启后咨询将注入该股全部实时行情（现价/净流入/大单明细/均线/MACD/策略信号）。盘中每 15 分钟限流一次，盘前盘后不限。" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
             <Switch value={proMode} disabled={proModeSaving} onChange={onToggleProMode} />
             专业模式
           </label>
@@ -160,40 +162,45 @@ export default function Consult() {
       </div>
 
       {!llmConfigured && (
-        <Card className="llm-config" title="🔑 LLM 配置（首次使用请填写 API Key）">
-          <div className="llm-config-row">
-            <Input value={cfgApiUrl} onChange={(v) => setCfgApiUrl(v)} placeholder="API 地址（如 https://api.siliconflow.cn/v1/chat/completions）" />
-            <Input value={cfgApiKey} type="password" onChange={(v) => setCfgApiKey(v)} placeholder="API Key (sk-...)" />
-            <Input value={cfgModel} onChange={(v) => setCfgModel(v)} placeholder="模型（如 THUDM/GLM-Z1-9B-0414）" />
+        <Card title="🔑 LLM 配置（首次使用请填写 API Key）" style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <Input value={cfgApiUrl} onChange={(v) => setCfgApiUrl(v)} placeholder="API 地址（如 https://api.siliconflow.cn/v1/chat/completions）" style={{ minWidth: 240, flex: 1 }} />
+            <Input value={cfgApiKey} type="password" onChange={(v) => setCfgApiKey(v)} placeholder="API Key (sk-...)" style={{ minWidth: 240, flex: 1 }} />
+            <Input value={cfgModel} onChange={(v) => setCfgModel(v)} placeholder="模型（如 THUDM/GLM-Z1-9B-0414）" style={{ minWidth: 200, flex: 1 }} />
             <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
           </div>
-          {llmMsg && <Tag theme={llmMsgType === 'ok' ? 'success' : 'danger'} variant="light" style={{ marginTop: 8 }}>{llmMsg}</Tag>}
+          {llmMsg && <div style={{ marginTop: 8 }}><Tag theme={llmMsgType === 'ok' ? 'success' : 'danger'} variant="light">{llmMsg}</Tag></div>}
         </Card>
       )}
 
-      <div ref={chatBox} className="chat-box">
-        {messages.length === 0 && <div className="chat-empty">开始咨询，向 AI 提问任意 A 股相关问题</div>}
+      <div ref={chatBox} style={chatBoxStyle}>
+        {messages.length === 0 && <div className="muted" style={{ textAlign: 'center', padding: 24 }}>开始咨询，向 AI 提问任意 A 股相关问题</div>}
         {messages.map((m, i) => (
-          <div key={i} className={'bubble ' + (m.role === 'user' ? 'bubble-user' : 'bubble-assistant')}>
-            <div className="bubble-name">{m.role === 'user' ? '我' : 'AI 顾问'}</div>
-            <div className="bubble-content">{m.content}</div>
-            {m.time && <div className="bubble-time">{fmtTime(m.time)}</div>}
+          <div key={i} style={{ alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start' }}>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>{m.role === 'user' ? '我' : 'AI 顾问'}</div>
+            <div style={{
+              ...bubbleStyle,
+              background: m.role === 'user' ? '#0052d9' : '#2a2a2a',
+              color: m.role === 'user' ? '#fff' : '#eee',
+            }}>{m.content}</div>
+            {m.time && <div className="muted" style={{ fontSize: 12, marginTop: 2, textAlign: m.role === 'user' ? 'right' : 'left' }}>{fmtTime(m.time)}</div>}
           </div>
         ))}
         {loading && (
-          <div className="bubble bubble-assistant bubble-loading">
-            <div className="bubble-name">AI 顾问</div>
-            <div className="bubble-content">思考中...</div>
+          <div style={{ alignSelf: 'flex-start' }}>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>AI 顾问</div>
+            <div style={{ ...bubbleStyle, background: '#2a2a2a', color: '#eee' }}>思考中...</div>
           </div>
         )}
       </div>
 
-      <div className="chat-input">
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, alignItems: 'flex-end' }}>
         <Textarea
           value={draft}
           onChange={(v) => setDraft(v)}
           placeholder="输入你想咨询的问题，Enter 发送，Shift+Enter 换行"
           autosize={{ minRows: 2, maxRows: 6 }}
+          style={{ flex: 1 }}
           onKeydown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
@@ -207,4 +214,9 @@ export default function Consult() {
       </div>
     </div>
   )
+}
+
+// 板块小标题
+function SectionLabel({ children }) {
+  return <div style={{ fontWeight: 600, margin: '8px 0 4px', fontSize: 13 }}>{children}</div>
 }

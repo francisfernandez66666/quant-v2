@@ -7,78 +7,12 @@ import {
 } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
-import './Paper.css'
+import KLineChart from '../components/KLineChart.jsx'
+import DepthPanel from '../components/DepthPanel.jsx'
 
 const UP = '#e34d59'   // 涨（A股习惯红）
 const DOWN = '#00a870' // 跌（绿）
 const clsColor = (c) => (c === 'up' ? UP : c === 'down' ? DOWN : undefined)
-
-// ── 本地分时图组件（替代 Vue KLineChart.vue）──
-function KLineChart({ code, name }) {
-  const [points, setPoints] = useState([])
-  const [loading, setLoading] = useState(true)
-  useEffect(() => {
-    let alive = true
-    setLoading(true)
-    api.fetchMinute(code, 1, 241).then((d) => {
-      if (alive) setPoints((d && d.points) || [])
-    }).catch(() => { if (alive) setPoints([]) })
-      .finally(() => { if (alive) setLoading(false) })
-    return () => { alive = false }
-  }, [code])
-  if (loading) return <div className="kline-loading">加载分时…</div>
-  if (!points.length) return <div className="kline-loading">暂无分时数据</div>
-  const W = 600, H = 180, pad = 8
-  const vals = points.map((p) => p.close)
-  const min = Math.min(...vals), max = Math.max(...vals)
-  const range = max - min || 1
-  const line = points.map((p, i) => {
-    const x = pad + (i / (points.length - 1)) * (W - 2 * pad)
-    const y = H - pad - ((p.close - min) / range) * (H - 2 * pad)
-    return x.toFixed(1) + ',' + y.toFixed(1)
-  }).join(' ')
-  return (
-    <svg className="equity-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: 180 }}>
-      <polyline points={line} fill="none" stroke="#FF4D4F" strokeWidth="1.5" />
-    </svg>
-  )
-}
-
-// ── 本地盘口面板组件（替代 Vue DepthPanel.vue）──
-function DepthPanel({ code, name }) {
-  const [depth, setDepth] = useState(null)
-  const [loading, setLoading] = useState(true)
-  useEffect(() => {
-    let alive = true
-    setLoading(true)
-    api.fetchDepth(code).then((d) => { if (alive) setDepth(d) }).catch(() => { if (alive) setDepth(null) })
-      .finally(() => { if (alive) setLoading(false) })
-    return () => { alive = false }
-  }, [code])
-  if (loading) return <div className="kline-loading">加载盘口…</div>
-  if (!depth) return <div className="kline-loading">暂无盘口数据</div>
-  const bids = depth.bids || []
-  const asks = depth.asks || []
-  return (
-    <div className="depth-panel">
-      <div className="depth-title">{depth.name || code} 盘口</div>
-      <div className="depth-cols">
-        <div className="depth-side-col">
-          <div className="depth-head">卖</div>
-          {asks.slice(0, 5).map((a, i) => (
-            <div className="depth-row" key={'a' + i}><span className="dn">{a.price?.toFixed(2)}</span><span className="dq">{a.volume}</span></div>
-          ))}
-        </div>
-        <div className="depth-side-col">
-          <div className="depth-head">买</div>
-          {bids.slice(0, 5).map((b, i) => (
-            <div className="depth-row" key={'b' + i}><span className="up">{b.price?.toFixed(2)}</span><span className="dq">{b.volume}</span></div>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
-}
 
 // 封装 tdesign 确认对话框为 Promise
 function confirmDialog(body, header = '确认') {
@@ -498,15 +432,15 @@ export default function Paper() {
   function renderKline(params) {
     const row = params && params.row ? params.row : params
     return (
-      <div className="kline-flex">
-        <div className="kline-main"><KLineChart code={row.code} name={row.name} /></div>
-        <div className="depth-side"><DepthPanel code={row.code} name={row.name} /></div>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ flex: '1 1 360px', minWidth: 300 }}><KLineChart code={row.code} name={row.name} /></div>
+        <div style={{ flex: '1 1 240px', minWidth: 240 }}><DepthPanel code={row.code} name={row.name} /></div>
       </div>
     )
   }
 
   return (
-    <div>
+    <div className="page">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
         <h2 style={{ fontSize: 18, fontWeight: 600 }}>模拟盘</h2>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -714,11 +648,11 @@ export default function Paper() {
       {isAdmin && (
         <Card title={<span>净值曲线 <em style={{ color: '#888', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em></span>} style={{ marginBottom: 12 }}>
           {equity.length > 1 ? (
-            <svg className="equity-chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: H }}>
+            <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: H }}>
               <polyline points={linePoints} fill="none" stroke="#FF4D4F" strokeWidth="2" />
               {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} style={{ stroke: '#2a2a3e' }} />)}
             </svg>
-          ) : <div className="empty-hint">净值数据不足（自动撮合开启并产生成交后显示）</div>}
+          ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>净值数据不足（自动撮合开启并产生成交后显示）</div>}
         </Card>
       )}
 
@@ -739,7 +673,7 @@ export default function Paper() {
                 size="small"
               />
             ) : (
-              <div className="empty-hint">
+              <div className="muted" style={{ padding: 24, textAlign: 'center' }}>
                 {isAdmin ? '暂无持仓（出现可开仓信号时按实时价自动买入）' : '暂无持仓（在信号页点「模拟买入」，或上方加仓/减仓管理已有持仓）'}
               </div>
             )}
@@ -759,14 +693,14 @@ export default function Paper() {
                 bordered
                 size="small"
               />
-            ) : <div className="empty-hint">暂无成交记录</div>}
+            ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无成交记录</div>}
           </Card>
         </Tabs.TabPanel>
         <Tabs.TabPanel value="orders" label={`订单 (${filteredOrders.length})`}>
           <Card>
             {orderData.length ? (
               <Table rowKey="__key" data={orderData} columns={orderColumns} bordered size="small" />
-            ) : <div className="empty-hint">暂无订单记录</div>}
+            ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无订单记录</div>}
           </Card>
         </Tabs.TabPanel>
       </Tabs>

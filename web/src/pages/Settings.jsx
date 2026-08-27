@@ -1,12 +1,11 @@
 // ── 设置页面 Settings.jsx ──
 // 服务器连接、通知、账户信息、LLM 配置、五大战法参数、资讯显示开关、系统信息
-// 使用 TDesign React 组件（Card / Input / InputNumber / Switch / Button / Tag）。
+// 使用 TDesign React 组件（Card / Input / InputNumber / Switch / Button / Tag / Textarea）。
 import React, { useState, useEffect } from 'react'
 import { Card, Input, InputNumber, Switch, Button, Tag, Textarea } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
-import './Settings.css'
 
 const strategyGroups = [
   {
@@ -69,6 +68,9 @@ const strategyGroups = [
 ]
 
 const emptyStrategy = () => ({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} })
+
+const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }
+const labelStyle = { width: 160, flexShrink: 0, color: '#999', fontSize: 13 }
 
 /**
  * 设置页面组件
@@ -238,16 +240,16 @@ export default function Settings() {
   }
 
   return (
-    <div className="settings-page">
-      <h2>设置</h2>
+    <div className="page">
+      <SectionLabel>设置</SectionLabel>
 
-      <Card className="setting-card" title="服务器连接">
-        <div className="setting-row">
-          <label>服务器地址</label>
+      <Card title="服务器连接" style={{ marginBottom: 16 }}>
+        <div style={rowStyle}>
+          <span style={labelStyle}>服务器地址</span>
           <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="http://localhost:8080" style={{ width: 280 }} />
         </div>
-        <div className="setting-row">
-          <label>连接状态</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>连接状态</span>
           <Tag theme={serverOnline ? 'success' : 'default'} variant="light">
             {serverOnline ? '已连接' : '离线'}
           </Tag>
@@ -255,57 +257,57 @@ export default function Settings() {
         <Button theme="primary" onClick={saveServer}>保存</Button>
       </Card>
 
-      <Card className="setting-card" title="通知设置">
-        <div className="setting-row">
-          <label>浏览器通知</label>
+      <Card title="通知设置" style={{ marginBottom: 16 }}>
+        <div style={rowStyle}>
+          <span style={labelStyle}>浏览器通知</span>
           <Button theme="default" variant="outline" onClick={requestNotify}>授权并测试</Button>
         </div>
-        <div className="setting-row">
-          <label>声音提醒</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>声音提醒</span>
           <Button theme="default" variant="outline" onClick={playTest}>测试声音</Button>
         </div>
-        <div className="setting-row">
-          <label>macOS 通知</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>macOS 通知</span>
           <Tag theme="success" variant="light">后台自动发送</Tag>
         </div>
       </Card>
 
-      <Card className="setting-card" title="账户信息">
-        <div className="setting-row">
-          <label>账号</label>
-          <span className="account">{account}</span>
+      <Card title="账户信息" style={{ marginBottom: 16 }}>
+        <div style={rowStyle}>
+          <span style={labelStyle}>账号</span>
+          <span style={{ color: '#eee' }}>{account}</span>
         </div>
-        <div className="setting-row">
-          <label>令牌</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>令牌</span>
           <Tag theme="default" variant="light">
             {token ? token.slice(0, 20) + '...' : '未登录'}
           </Tag>
         </div>
       </Card>
 
-      <Card className="setting-card" title="LLM 配置">
-        <div className="setting-row">
-          <label>API URL</label>
+      <Card title="LLM 配置" style={{ marginBottom: 16 }}>
+        <div style={rowStyle}>
+          <span style={labelStyle}>API URL</span>
           <Input value={llmApiUrl} onChange={(v) => setLlmApiUrl(v)} placeholder="https://api.openai.com/v1" style={{ width: 280 }} />
         </div>
-        <div className="setting-row">
-          <label>API Key(s)</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>API Key(s)</span>
           <Textarea value={llmApiKeys} onChange={(v) => setLlmApiKeys(v)} placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" autosize={{ minRows: 4, maxRows: 8 }} style={{ width: 280 }} />
         </div>
-        <div className="setting-row">
-          <label>模型</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>模型</span>
           <Input value={llmModel} onChange={(v) => setLlmModel(v)} placeholder="gpt-4o-mini" style={{ width: 280 }} />
         </div>
-        <div className="setting-row">
-          <label>分类专用模型</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>分类专用模型</span>
           <Input value={llmClassifierModel} onChange={(v) => setLlmClassifierModel(v)} placeholder="留空则用主模型" style={{ width: 280 }} />
         </div>
-        <div className="setting-row">
-          <label>归因批并发度</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>归因批并发度</span>
           <InputNumber value={llmBatchConcurrency} onChange={(v) => setLlmBatchConcurrency(v)} min={1} max={16} style={{ width: 200 }} />
         </div>
-        <div className="setting-row">
-          <label>状态</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>状态</span>
           <Tag theme={llmConfigured ? 'success' : 'default'} variant="light">
             {llmConfigured ? '已配置' : '未配置（降级为关键词过滤）'}
           </Tag>
@@ -314,48 +316,53 @@ export default function Settings() {
       </Card>
 
       {strategyGroups.map((group) => (
-        <Card className="setting-card" key={group.key} title={group.title}>
+        <Card key={group.key} title={group.title} style={{ marginBottom: 16 }}>
           {group.fields.map((f) => (
-            <div className="setting-row" key={f.k}>
-              <label title={f.hint || ''}>{f.label}</label>
+            <div style={rowStyle} key={f.k}>
+              <span style={{ ...labelStyle, width: 200 }} title={f.hint || ''}>{f.label}</span>
               {renderField(group, f)}
             </div>
           ))}
         </Card>
       ))}
 
-      <Card className="setting-card" title="战法参数">
-        <div className="setting-row">
-          <label>说明</label>
-          <span style={{ fontSize: 12, color: '#888' }}>参数保存后重启后端生效；权重请保持各策略合计 ≤ 1</span>
+      <Card title="战法参数" style={{ marginBottom: 16 }}>
+        <div style={rowStyle}>
+          <span style={labelStyle}>说明</span>
+          <span className="muted" style={{ fontSize: 12 }}>参数保存后重启后端生效；权重请保持各策略合计 ≤ 1</span>
         </div>
         <Button theme="primary" onClick={saveStrategy} loading={strategySaving}>保存战法参数</Button>
       </Card>
 
-      <Card className="setting-card" title="资讯显示">
-        <div className="setting-row">
-          <label title="开启后弱档/中性资讯（|score|<0.25）也出现在资讯列表；关闭则仅显示有价值的强事件">显示全部资讯（含弱/中性）</label>
+      <Card title="资讯显示" style={{ marginBottom: 16 }}>
+        <div style={rowStyle}>
+          <span style={{ ...labelStyle, width: 240 }} title="开启后弱档/中性资讯（|score|<0.25）也出现在资讯列表；关闭则仅显示有价值的强事件">显示全部资讯（含弱/中性）</span>
           <Switch
             value={newsShowAll}
             onChange={(v) => { setNewsShowAll(v); toggleNewsShowAll() }}
           />
         </div>
-        <div className="setting-row">
-          <label>说明</label>
-          <span style={{ fontSize: 12, color: '#888' }}>该开关即时生效，不影响引擎打分（引擎始终按 |score|≥0.5 过滤）</span>
+        <div style={rowStyle}>
+          <span style={labelStyle}>说明</span>
+          <span className="muted" style={{ fontSize: 12 }}>该开关即时生效，不影响引擎打分（引擎始终按 |score|≥0.5 过滤）</span>
         </div>
       </Card>
 
-      <Card className="setting-card" title="系统">
-        <div className="setting-row">
-          <label>版本</label>
+      <Card title="系统" style={{ marginBottom: 16 }}>
+        <div style={rowStyle}>
+          <span style={labelStyle}>版本</span>
           <span>量仔期货 v1.1.0 桌面版</span>
         </div>
-        <div className="setting-row">
-          <label>后端</label>
+        <div style={rowStyle}>
+          <span style={labelStyle}>后端</span>
           <span>Go 1.22+ 单二进制</span>
         </div>
       </Card>
     </div>
   )
+}
+
+// 板块小标题
+function SectionLabel({ children }) {
+  return <div style={{ fontWeight: 600, margin: '8px 0 4px', fontSize: 13 }}>{children}</div>
 }

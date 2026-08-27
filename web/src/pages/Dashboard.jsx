@@ -3,10 +3,9 @@
 // 最新资讯、按战法胜率归因、数据源健康与实盘链路状态。
 // 使用 TDesign React 组件（Card / Table / Tag / Button / Dialog）。
 import React, { useState, useEffect, useMemo, useRef } from 'react'
-import { Card, Table, Tag, Button, Dialog } from 'tdesign-react'
+import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
 import LogModal from '../components/LogModal.jsx'
-import './Dashboard.css'
 
 // 将时间戳格式化为相对时间（如 5s前 / 3m前 / 2h前）
 function fmtAgo(ts) {
@@ -204,105 +203,98 @@ export default function Dashboard() {
   ]
 
   return (
-    <div className="dashboard">
+    <div className="page">
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
         <Button theme="default" variant="outline" onClick={() => setShowLog(true)}>📋 日志</Button>
       </div>
 
-      <div className="stats-row">
-        <Card className="stat-card strong"><div className="stat-num">{strongCount}</div><div className="stat-label">强信号</div></Card>
-        <Card className="stat-card observe"><div className="stat-num">{observeCount}</div><div className="stat-label">观察中</div></Card>
-        <Card className="stat-card mute"><div className="stat-num">{muteCount}</div><div className="stat-label">静默</div></Card>
-        <Card className="stat-card holding"><div className="stat-num">{scanStats.total_stocks || snapshotStocks.length || 0}</div><div className="stat-label">监控个股</div></Card>
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        {[
+          { n: strongCount, l: '强信号', c: '#e34d59' },
+          { n: observeCount, l: '观察中', c: '#faad14' },
+          { n: muteCount, l: '静默', c: '#888' },
+          { n: (scanStats.total_stocks || snapshotStocks.length || 0), l: '监控个股', c: '#0052d9' },
+        ].map((s) => (
+          <Card key={s.l} style={{ flex: '1 1 150px' }}>
+            <div style={{ fontSize: 28, fontWeight: 700, color: s.c }}>{s.n}</div>
+            <div className="muted">{s.l}</div>
+          </Card>
+        ))}
       </div>
 
-      <div className="grid-2col">
-        <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>} style={{ marginBottom: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>}>
           {snapshotStocks.length ? (
             <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} />
           ) : (
-            <div className="empty"><span className="loading-dot"></span> 等待行情数据...</div>
+            <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待行情数据...</div>
           )}
-          <div className="card-sub" style={{ marginTop: 8 }}>{snapshotTime}</div>
+          <div className="muted" style={{ marginTop: 8 }}>{snapshotTime}</div>
         </Card>
 
-        <Card title="最新动态" style={{ marginBottom: 16 }}>
-          <div className="section-label">📅 宏观日历</div>
-          <div className="cal-scroll">
-            {calendarEvents.map((c, i) => (
-              <div key={'c' + i} className="cal-item">
-                <span className="cal-date">{c.datetime ? c.datetime.slice(5, 10) : ''}</span>
-                <span className="cal-title">{c.title}</span>
-              </div>
-            ))}
-            {!calendarEvents.length && <div className="cal-empty">暂无日历事件</div>}
-          </div>
-
-          <div className="section-divider"></div>
-
-          <div className="section-label">📋 IPO日历</div>
-          <div className="cal-scroll">
-            {ipoCalendar.map((c, i) => (
-              <div key={'ipo' + i} className="cal-item">
-                <span className="cal-date">{c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '')}</span>
-                <span className="cal-title">{c.name}（{c.code}）</span>
-                {c.issue_price && <span className="cal-price">¥{c.issue_price.toFixed(2)}</span>}
-                <span className={'cal-status ' + (c.list_status === 'L' ? 'cal-status-l' : 'cal-status-u')}>{ipoCountdown(c)}</span>
-              </div>
-            ))}
-            {!ipoCalendar.length && <div className="cal-empty">暂无IPO日历</div>}
-          </div>
-
-          <div className="section-divider"></div>
-
-          {hotSectors.length > 0 && <div className="section-label">🔥 热门板块</div>}
-          {hotSectors.length > 0 && (
-            <div className="sec-scroll">
-              {hotSectors.slice(0, 5).map((s, i) => (
-                <div key={'s' + i} className="sec-row">
-                  <span className="sec-pct" style={{ color: chgColor(s.change_pct) }}>{(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(1)}%</span>
-                  <span className="sec-name">{s.name}</span>
-                  <span className="sec-inflow">净流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
-                </div>
-              ))}
+        <Card title="最新动态">
+          <SectionLabel>📅 宏观日历</SectionLabel>
+          {calendarEvents.length ? calendarEvents.map((c, i) => (
+            <div key={'c' + i} style={{ display: 'flex', gap: 10, padding: '4px 0', fontSize: 13 }}>
+              <span className="muted">{c.datetime ? c.datetime.slice(5, 10) : ''}</span>
+              <span>{c.title}</span>
             </div>
-          )}
+          )) : <div className="muted">暂无日历事件</div>}
 
-          <div className="section-divider"></div>
+          <Divider />
 
-          {newsItems.length > 0 && <div className="section-label">📰 资讯</div>}
-          <div className="news-scroll">
-            {newsItems.slice(0, 15).map((n, i) => (
-              <div key={'n' + i} className="news-row">
-                <div className="news-head">
-                  <span className="news-time">{fmtNewsTime(n.datetime)}</span>
-                  <span className="news-title-text">{n.title}</span>
-                </div>
-                <div className="news-tags-line">
-                  {n.direction && (
-                    <Tag theme={n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'} size="small">{n.direction}</Tag>
-                  )}
-                  {n.impact_level && <Tag size="small" variant="light">{'影响'}</Tag>}
-                  {n.sectors?.length && n.sectors.map((sec) => <Tag key={sec} size="small" theme="primary" variant="light">{sec}</Tag>)}
-                  {n.stocks?.length && n.stocks.map((stk) => <Tag key={stk} size="small" theme="warning" variant="light">{stk}</Tag>)}
-                </div>
+          <SectionLabel>📋 IPO日历</SectionLabel>
+          {ipoCalendar.length ? ipoCalendar.map((c, i) => (
+            <div key={'ipo' + i} style={{ display: 'flex', gap: 8, padding: '4px 0', fontSize: 13, alignItems: 'center' }}>
+              <span className="muted">{c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : '')}</span>
+              <span>{c.name}（{c.code}）</span>
+              {c.issue_price && <span>¥{c.issue_price.toFixed(2)}</span>}
+              <Tag size="small" theme={c.list_status === 'L' ? 'success' : 'default'} style={{ marginLeft: 'auto' }}>{ipoCountdown(c)}</Tag>
+            </div>
+          )) : <div className="muted">暂无IPO日历</div>}
+
+          <Divider />
+
+          {hotSectors.length > 0 && <SectionLabel>🔥 热门板块</SectionLabel>}
+          {hotSectors.length > 0 && hotSectors.slice(0, 5).map((s, i) => (
+            <div key={'s' + i} style={{ display: 'flex', gap: 10, padding: '4px 0', fontSize: 13, alignItems: 'center' }}>
+              <span style={{ color: chgColor(s.change_pct), width: 64 }}>{(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(1)}%</span>
+              <span>{s.name}</span>
+              <span className="muted" style={{ marginLeft: 'auto' }}>净流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
+            </div>
+          ))}
+
+          <Divider />
+
+          {newsItems.length > 0 && <SectionLabel>📰 资讯</SectionLabel>}
+          {newsItems.slice(0, 15).map((n, i) => (
+            <div key={'n' + i} style={{ padding: '6px 0', borderBottom: '1px solid #333' }}>
+              <div style={{ display: 'flex', gap: 8, fontSize: 13 }}>
+                <span className="muted">{fmtNewsTime(n.datetime)}</span>
+                <span>{n.title}</span>
               </div>
-            ))}
-          </div>
+              <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+                {n.direction && <Tag theme={n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'} size="small">{n.direction}</Tag>}
+                {n.impact_level && <Tag size="small" variant="light">{n.impact_level}影响</Tag>}
+                {n.sectors?.length && n.sectors.map((sec) => <Tag key={sec} size="small" theme="primary" variant="light">{sec}</Tag>)}
+                {n.stocks?.length && n.stocks.map((stk) => <Tag key={stk} size="small" theme="warning" variant="light">{stk}</Tag>)}
+              </div>
+            </div>
+          ))}
           {!newsItems.length && !hotSectors.length && !calendarEvents.length && (
-            <div className="empty"><span className="loading-dot"></span> 等待数据...</div>
+            <div className="muted" style={{ padding: 16, textAlign: 'center' }}>等待数据...</div>
           )}
         </Card>
       </div>
 
       {strategyRows.length > 0 && (
-        <Card title="按战法胜率" style={{ marginTop: 16 }}>
+        <Card title="按战法胜率" style={{ marginBottom: 16 }}>
           <Table data={strategyRows} columns={strategyColumns} rowKey="name" size="small" pagination={false} />
         </Card>
       )}
 
-      <Card title="系统" style={{ marginTop: 16 }}>
-        <div className="status-row-inline">
+      <Card title="系统">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
           <span>运行 {status.uptime || '-'}</span>
           <span>数据源：东财{dataSourceHealth.eastmoney ? '●' : '○'} 新浪{dataSourceHealth.sina ? '●' : '○'} 腾讯{dataSourceHealth.tencent ? '●' : '○'} 同花顺{dataSourceHealth.ths ? '●' : '○'}</span>
           <span>新闻：财联社{newsSourceHealth.cainanshe ? '●' : '○'} 同花顺{newsSourceHealth.kuaixun ? '●' : '○'} 新浪{newsSourceHealth.sina ? '●' : '○'}</span>
@@ -316,4 +308,13 @@ export default function Dashboard() {
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
     </div>
   )
+}
+
+// 板块小标题
+function SectionLabel({ children }) {
+  return <div style={{ fontWeight: 600, margin: '8px 0 4px', fontSize: 13 }}>{children}</div>
+}
+// 分隔线
+function Divider() {
+  return <div style={{ height: 1, background: '#333', margin: '10px 0' }} />
 }
