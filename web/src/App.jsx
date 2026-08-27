@@ -249,17 +249,6 @@ export default function App() {
     canAdmin ? { to: '/admin', icon: '👥', label: '用户管理' } : null,
   ].filter(Boolean)
 
-  const menuOptions = navItems.map((it) => ({
-    value: it.to,
-    label: (
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-        <span>{it.icon}</span>
-        <span>{it.label}</span>
-        {it.badge > 0 && <Badge count={it.badge} />}
-      </span>
-    ),
-  }))
-
   return (
     <ConfigProvider theme="dark">
       {!loggedIn ? (
@@ -305,7 +294,17 @@ export default function App() {
             <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
               <div className="brand-logo">量仔期货</div>
               <div style={{ flex: 1, overflowY: 'auto' }}>
-                <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} options={menuOptions} style={{ width: '100%', background: 'transparent', borderRight: 'none' }} />
+                <Menu theme="dark" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
+                  {navItems.map((it) => (
+                    <Menu.MenuItem key={it.to} value={it.to}>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <span>{it.icon}</span>
+                        <span>{it.label}</span>
+                        {it.badge > 0 && <Badge count={it.badge} />}
+                      </span>
+                    </Menu.MenuItem>
+                  ))}
+                </Menu>
               </div>
               <div className="sidebar-footer">
                 <div className="account-name">{account}</div>
