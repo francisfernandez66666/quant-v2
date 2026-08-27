@@ -201,7 +201,7 @@ export default function MsgCenter() {
             )}
             <Button size="small" variant="text" theme="default" onClick={() => onDeleteOne(a)}>✕</Button>
           </div>
-          <div style={{ fontSize: 14, color: '#e0e0e0', fontWeight: 600 }}>{a.title}</div>
+          <div style={{ fontSize: 14, color: '#1a1a1a', fontWeight: 600 }}>{a.title}</div>
           <div style={{ fontSize: 13, color: '#999', marginTop: 4 }}>{a.body}</div>
         </Card>
       ))}

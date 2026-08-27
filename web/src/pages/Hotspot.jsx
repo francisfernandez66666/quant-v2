@@ -246,14 +246,14 @@ export default function Hotspot() {
   // 宏观日历列
   const calendarColumns = [
     { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: '#888' }}>{row.date}</span> },
-    { colKey: 'title', title: '事件', cell: ({ row }) => <span style={{ color: '#e0e0e0' }}>{row.title}</span> },
+    { colKey: 'title', title: '事件', cell: ({ row }) => <span style={{ color: '#1a1a1a' }}>{row.title}</span> },
   ]
   const calendarData = calendarEvents.map((c, i) => ({ id: 'c' + i, date: c.datetime ? c.datetime.slice(5, 10) : '', title: c.title }))
 
   // IPO 日历列
   const ipoColumns = [
     { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: '#888' }}>{row.date}</span> },
-    { colKey: 'name', title: '名称', width: 160, cell: ({ row }) => <span style={{ color: '#e0e0e0' }}>{row.name}（{row.code}）</span> },
+    { colKey: 'name', title: '名称', width: 160, cell: ({ row }) => <span style={{ color: '#1a1a1a' }}>{row.name}（{row.code}）</span> },
     { colKey: 'price', title: '发行价', width: 90, cell: ({ row }) => row.issue_price ? <span style={{ color: '#4fc3f7' }}>¥{row.issue_price.toFixed(2)}</span> : null },
     { colKey: 'status', title: '状态', width: 100, cell: ({ row }) => <Tag size="small" theme={row.statusTheme}>{row.status}</Tag> },
   ]
@@ -291,8 +291,8 @@ export default function Hotspot() {
         {sectors.length ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12 }}>
             {sectors.map((s) => (
-              <Card key={s.code} bordered={false} style={{ cursor: 'pointer', background: '#12121e', border: '1px solid #eef0f3' }} onClick={() => setReasonTarget(s)}>
-                <div style={{ fontSize: 14, fontWeight: 600, color: '#e0e0e0' }}>{s.name}</div>
+              <Card key={s.code} bordered={false} style={{ cursor: 'pointer', background: '#eef4fc', border: '1px solid #eef0f3' }} onClick={() => setReasonTarget(s)}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: '#1a1a1a' }}>{s.name}</div>
                 {s.reason && <div style={{ fontSize: 11, color: '#888', marginTop: 4, minHeight: 28, overflow: 'hidden' }}>{shortReason(s.reason)}</div>}
                 <div style={{ fontSize: 16, fontWeight: 700, color: '#FAAD14', marginTop: 4 }}>{Math.round((s.score || 0) * 100)}分</div>
                 <div className={(s.change_pct || 0) >= 0 ? 'up' : 'down'} style={{ fontWeight: 700, marginTop: 2 }}>
@@ -339,11 +339,11 @@ export default function Hotspot() {
         <div>
           <div style={{ marginBottom: 14 }}>
             <div style={{ fontWeight: 600, marginBottom: 6 }}>信号批次 / 阶段记录</div>
-            <pre style={{ fontSize: 12, color: '#ccc', background: '#12121e', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logSignal || '暂无'}</pre>
+            <pre style={{ fontSize: 12, color: '#ccc', background: '#eef4fc', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logSignal || '暂无'}</pre>
           </div>
           <div>
             <div style={{ fontWeight: 600, marginBottom: 6 }}>Stage 轮次记录</div>
-            <pre style={{ fontSize: 12, color: '#ccc', background: '#12121e', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logStage || '暂无'}</pre>
+            <pre style={{ fontSize: 12, color: '#ccc', background: '#eef4fc', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logStage || '暂无'}</pre>
           </div>
         </div>
       </Dialog>

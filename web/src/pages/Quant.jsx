@@ -333,24 +333,24 @@ export default function Quant() {
         {trades && trades.summary ? (
           <>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 10, marginBottom: 12 }}>
-              <div style={{ background: '#12121e', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+              <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
                 <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: pnlColor(trades.summary.total_pnl) }}>{fmtMoney(trades.summary.total_pnl)}</div>
                 <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>总盈亏</div>
               </div>
-              <div style={{ background: '#12121e', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+              <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
                 <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: pnlColor(trades.summary.realized_pnl) }}>{fmtMoney(trades.summary.realized_pnl)}</div>
                 <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>已实现</div>
               </div>
-              <div style={{ background: '#12121e', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+              <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
                 <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: pnlColor(trades.summary.unrealized_pnl) }}>{fmtMoney(trades.summary.unrealized_pnl)}</div>
                 <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>浮动盈亏</div>
               </div>
-              <div style={{ background: '#12121e', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
-                <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: '#e0e0e0' }}>{trades.summary.trade_count}</div>
+              <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+                <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: '#1a1a1a' }}>{trades.summary.trade_count}</div>
                 <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>成交笔数</div>
               </div>
-              <div style={{ background: '#12121e', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
-                <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: '#e0e0e0' }}>{trades.summary.wins}胜 / {trades.summary.losses}负</div>
+              <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+                <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: '#1a1a1a' }}>{trades.summary.wins}胜 / {trades.summary.losses}负</div>
                 <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>卖出胜负</div>
               </div>
             </div>
