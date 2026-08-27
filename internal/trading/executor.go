@@ -38,9 +38,9 @@ type OrderRequest struct {
 // OrderResult 下单返回（网关 → 首尔）。
 // English: order result (gateway → Seoul).
 type OrderResult struct {
-	OK      bool   `json:"ok"`       // 是否受理成功
-	OrderID string `json:"order_id"` // 网关委托单号
-	Err     string `json:"err,omitempty"`
+	OK      bool   `json:"ok"`            // 是否受理成功
+	OrderID string `json:"order_id"`      // 网关委托单号
+	Err     string `json:"err,omitempty"` // 错误信息
 }
 
 // GatewayState 网关状态快照（/state）。
@@ -68,8 +68,8 @@ type Executor interface {
 type NoopExecutor struct{}
 
 // PlaceBuy 空实现：返回未执行。
-func (NoopExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) {
-	return &OrderResult{OK: false, OrderID: "", Err: "qmt disabled (noop executor)"}, nil
+func (NoopExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) { // func
+	return &OrderResult{OK: false, OrderID: "", Err: "qmt disabled (noop executor)"}, nil // return
 }
 
 // PlaceSell 空实现：返回未执行。

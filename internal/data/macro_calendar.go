@@ -33,32 +33,42 @@ type MacroEvent struct {
 }
 
 // GenMacroEvents 生成指定年份的全部宏观事件
-// supplement 从 rules.json 读取的补充事件，会合并到结果中
+// supplement 自定义补充事件（§R3-8 P1-J 真实接线）：key=事件标题，
+// value="YYYY-MM-DD|impact[|duration]"（如 "2026-09-18|high|2"）；非法条目记日志跳过。
 // English: GenMacroEvents generates all macro events for a given year.
-// English: supplement holds custom events read from rules.json, merged into the result.
+// English: supplement holds custom events (key=title, value="date|impact[|duration]"); invalid
+// entries are logged and skipped.
 func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 	var events []MacroEvent
 
-	// FOMC 会议（2026年已知会议日期）
-	// English: FOMC meetings (known 2026 meeting dates).
-	fomcDates := []struct {
-		m, d int
-		note string
-	}{
-		{1, 28, "FOMC 1月议息会议"},
-		{3, 18, "FOMC 3月议息会议+点阵图+经济预测"},
-		{5, 6, "FOMC 5月议息会议"},
-		{6, 17, "FOMC 6月议息会议+点阵图+经济预测"},
-		{7, 29, "FOMC 7月议息会议"},
-		{9, 16, "FOMC 9月议息会议+点阵图+经济预测"},
-		{11, 5, "FOMC 11月议息会议"},
-		{12, 16, "FOMC 12月议息会议+点阵图+经济预测"},
-	}
-	for _, f := range fomcDates {
-		d := time.Date(year, time.Month(f.m), f.d, 0, 0, 0, 0, time.UTC)
-		events = append(events, MacroEvent{
-			Date: d, Title: f.note, Level: "fomc", Impact: "high", Duration: 3,
-		})
+	// FOMC 会议：仅 2026 有经核实的会议日期表。§R3-8 P1-J 年份门控——此前对任意 year
+	// 套用同一组月日，2027 起生成的日历全是错误日期。未知年份跳过 FOMC 并告警一次
+	// （宁可缺事件不可造事件）；NFP/交割日/PCE 为公式推导不受影响。
+	// English: R3-8 P1-J — the FOMC table is verified for 2026 only; other years skip FOMC with a
+	// warning instead of fabricating wrong dates.
+	if year == 2026 {
+		fomcDates := []struct {
+			m, d int
+			note string
+		}{
+			{1, 28, "FOMC 1月议息会议"},
+			{3, 18, "FOMC 3月议息会议+点阵图+经济预测"},
+			{5, 6, "FOMC 5月议息会议"},
+			{6, 17, "FOMC 6月议息会议+点阵图+经济预测"},
+			{7, 29, "FOMC 7月议息会议"},
+			{9, 16, "FOMC 9月议息会议+点阵图+经济预测"},
+			{11, 5, "FOMC 11月议息会议"},
+			{12, 16, "FOMC 12月议息会议+经济预测"},
+		}
+		for _, f := range fomcDates {
+			d := time.Date(year, time.Month(f.m), f.d, 0, 0, 0, 0, time.UTC)
+			events = append(events, MacroEvent{
+				Date: d, Title: f.note, Level: "fomc", Impact: "high", Duration: 3,
+			})
+		}
+	} else if !macroFomcWarned {
+		macroFomcWarned = true
+		log.Printf("[macro] %d 年无已核实 FOMC 日期表，本年跳过 FOMC 事件（NFP/交割日等公式事件不受影响）", year)
 	}
 
 	// 非农 (NFP): 每月第一个周五
@@ -117,18 +127,54 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 		})
 	}
 
-	// 合并 rules.json 补充事件
-	// English: Merge supplementary events from rules.json.
-	for title, impact := range supplement {
-		// supplement 格式: "date|impact|duration" 或 "date|impact"
-		// 简化处理: 直接使用 title 作为描述，impact 为级别
-		// English: supplement format: "date|impact|duration" or "date|impact".
-		// English: Simplified: use title directly as the description, impact as the level.
-		_ = title
-		_ = impact
+	// 合并自定义补充事件（§R3-8 P1-J 真实解析，此前入参被显式丢弃）：
+	// key=标题，value="YYYY-MM-DD|impact[|duration]"；level 统一记 custom。
+	// English: R3-8 P1-J — actually parse the supplement now: key=title,
+	// value="YYYY-MM-DD|impact[|duration]"; invalid entries are skipped with a log.
+	for title, spec := range supplement {
+		parts := strings.Split(spec, "|")
+		if len(parts) < 2 || parts[0] == "" || title == "" {
+			log.Printf("[macro] 补充事件格式非法（应为 标题→日期|impact[|duration]），跳过: %q → %q", title, spec)
+			continue
+		}
+		d, err := time.Parse("2006-01-02", strings.TrimSpace(parts[0]))
+		if err != nil {
+			log.Printf("[macro] 补充事件日期解析失败，跳过: %q → %q (%v)", title, spec, err)
+			continue
+		}
+		impact := strings.ToLower(strings.TrimSpace(parts[1]))
+		switch impact {
+		case "high", "medium", "low":
+		default:
+			impact = "medium"
+		}
+		duration := 2
+		if len(parts) >= 3 {
+			if n := atoiDefault(parts[2], 2); n > 0 && n <= 30 {
+				duration = n
+			}
+		}
+		events = append(events, MacroEvent{
+			Date: d, Title: title, Level: "custom", Impact: impact, Duration: duration,
+		})
 	}
 
 	return events
+}
+
+// macroFomcWarned 非核实年份的 FOMC 缺失告警只打一次（进程级节流）。
+var macroFomcWarned = false
+
+// atoiDefault 整数解析失败时返回默认值。
+func atoiDefault(s string, def int) int {
+	n := 0
+	for _, c := range strings.TrimSpace(s) {
+		if c < '0' || c > '9' {
+			return def
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 // AddGeopoliticalEvent 从新闻标题注入战争/地缘事件。

@@ -12,6 +12,35 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// TestQMTEndpointsUnavailableWithoutDB §白板修复回归：researchDB 未接入时，
+// 实盘族端点必须返回 503（前端 request() 据此走失败分支），绝不允许 200+{"error":…}——
+// 那会把错误体当成功数据渲染，Quant 页 trades.summary 为 undefined 直接 TypeError 白屏。
+func TestQMTEndpointsUnavailableWithoutDB(t *testing.T) {
+	s := &Server{} // researchDB 未接线（模拟主程序 store.Open 失败的降级形态）
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		h      func(w http.ResponseWriter, r *http.Request)
+	}{
+		{"trades", http.MethodGet, "/api/qmt/trades", s.handleQMTTrades},
+		{"real positions", http.MethodGet, "/api/positions/real", s.handleRealPositions},
+		{"real advice", http.MethodGet, "/api/positions/advice", s.handleRealAdvice},
+	}
+	for _, tc := range cases {
+		rr := httptest.NewRecorder()
+		tc.h(rr, httptest.NewRequest(tc.method, tc.path, nil))
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s: researchDB 缺失应返回 503, got %d body=%s", tc.name, rr.Code, rr.Body.String())
+		}
+		var body map[string]string
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil || body["error"] == "" {
+			t.Fatalf("%s: 响应应为 {\"error\":…} 形态: %s", tc.name, rr.Body.String())
+		}
+	}
+}
+
 // TestHandleQMTReportTrade 成交回报 → ApplyRealFill 落库 → handleRealPositions 可读回。
 // English: a trade report persists via ApplyRealFill and is readable back through handleRealPositions.
 func TestHandleQMTReportTrade(t *testing.T) {

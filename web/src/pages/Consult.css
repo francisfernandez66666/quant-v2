@@ -1,0 +1,73 @@
+/* ── 股票咨询页样式 Consult.css ──
+ * 定义对话消息气泡、专业模式开关、输入框、模型选择等样式。
+ */
+.consult-page { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; height: 100%; }
+.page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.page-header h2 { font-size: 18px; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+.pro-mode {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border-radius: 6px; border: 1px solid #b388ff;
+  background: rgba(179,136,255,0.08); color: #b388ff; font-size: 14px; cursor: pointer;
+}
+.pro-mode:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-clear {
+  padding: 6px 14px; border-radius: 6px; border: 1px solid #FF4D4F !important;
+  background: transparent; color: #FF4D4F; font-size: 14px; cursor: pointer;
+}
+.btn-clear:hover { background: rgba(255,77,79,0.1); }
+
+.llm-config { background: #1a1a2e; border: 1px solid #2a2a3e; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+.llm-config-title { font-size: 14px; color: #b388ff; margin-bottom: 8px; }
+.llm-config-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.llm-config-row input, .llm-config-row .t-input {
+  flex: 1; min-width: 140px; padding: 8px 10px; border-radius: 6px; border: 1px solid #333;
+  background: #0f0f23; color: #e0e0e0; font-size: 14px; outline: none;
+}
+.llm-config-row .t-input { padding: 0; }
+.llm-config-row .t-input__inner { padding: 8px 10px; }
+.llm-config-row input:focus, .llm-config-row .t-input--focused { border-color: #b388ff; }
+.btn-save {
+  padding: 8px 16px; border-radius: 6px; border: none; background: #b388ff;
+  color: #fff; font-size: 14px; cursor: pointer; white-space: nowrap;
+}
+.btn-save:disabled { opacity: 0.5; }
+.llm-msg { margin-top: 8px; font-size: 14px; }
+.msg-ok { color: #4caf50; }
+.msg-err { color: #FF4D4F; }
+
+.chat-box {
+  flex: 1; overflow-y: auto; background: #1a1a2e; border-radius: 8px;
+  border: 1px solid #2a2a3e; padding: 14px; display: flex; flex-direction: column; gap: 10px;
+  min-height: 300px; max-height: calc(100vh - 300px);
+}
+.chat-empty { text-align: center; color: #666; font-size: 14px; padding: 40px 0; }
+.bubble { max-width: 82%; padding: 10px 12px; border-radius: 8px; font-size: 14px; line-height: 1.5; }
+.bubble-name { font-size: 14px; color: #888; margin-bottom: 4px; }
+.bubble-user { align-self: flex-end; background: rgba(179,136,255,0.15); border: 1px solid #b388ff; }
+.bubble-user .bubble-name { text-align: right; }
+.bubble-assistant { align-self: flex-start; background: #0f0f23; border: 1px solid #333; }
+.bubble-content { white-space: pre-wrap; word-break: break-word; color: #e0e0e0; }
+.bubble-time { font-size: 14px; color: #666; margin-top: 4px; }
+.bubble-loading .bubble-content { color: #888; }
+
+.chat-input { display: flex; gap: 8px; margin-top: 12px; }
+.chat-input textarea, .chat-input .t-textarea__inner {
+  flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #333;
+  background: #1a1a2e; color: #e0e0e0; font-size: 14px; outline: none; resize: none;
+  font-family: inherit;
+}
+.chat-input .t-textarea__inner:focus { border-color: #FF4D4F; }
+.btn-send {
+  padding: 0 24px; border-radius: 8px; border: none; background: #FF4D4F;
+  color: #fff; font-size: 14px; cursor: pointer;
+}
+.btn-send:disabled { opacity: 0.5; }
+
+@media (max-width: 768px) {
+  .page-header { flex-wrap: wrap; gap: 8px; }
+  .header-right { flex-wrap: wrap; gap: 8px; }
+  .bubble { max-width: 90%; }
+  .bubble-content { font-size: 14px; }
+  .chat-box { max-height: calc(100vh - 340px); padding: 10px; }
+}

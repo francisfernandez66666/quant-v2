@@ -17,34 +17,34 @@ import (
 // OptimizationResult 一次扫参任务的单条排名行。
 type OptimizationResult struct {
 	ID           int64       `json:"id"`
-	TaskID       int64       `json:"task_id"`
-	Rank         int         `json:"rank"`
+	TaskID       int64       `json:"task_id"`                 // 所属扫参任务 ID
+	Rank         int         `json:"rank"`                    // 排名
 	Strategy     string      `json:"strategy"`                // 显示名：双响炮/因子战法#1/波动突破战法…
 	StrategyKind string      `json:"strategy_kind,omitempty"` // 规则 ID（fac_1/pat_2）或空（内置）
-	ParamsJSON   string      `json:"-"`
-	Params       SweepParams `json:"params"`
-	Objective    string      `json:"objective"`
-	WinRate      float64     `json:"win_rate"`
-	ProfitFactor float64     `json:"profit_factor"`
-	Expectancy   float64     `json:"expectancy"`
-	Win          int         `json:"win"`
-	Loss         int         `json:"loss"`
-	AvgWinPct    float64     `json:"avg_win_pct"`
-	AvgLossPct   float64     `json:"avg_loss_pct"`
-	AvgHoldDays  float64     `json:"avg_hold_days"`
-	TriggerCount int         `json:"trigger_count"`
-	Status       string      `json:"status"` // pending | approved | rejected
-	CreatedAt    string      `json:"created_at"`
-	GridJSON     string      `json:"grid_json,omitempty"` // §D3 止盈×止损热力网格（冠军行携带）
+	ParamsJSON   string      `json:"-"`                       // 参数JSON
+	Params       SweepParams `json:"params"`                  // 参数
+	Objective    string      `json:"objective"`               // 目标函数
+	WinRate      float64     `json:"win_rate"`                // 胜率
+	ProfitFactor float64     `json:"profit_factor"`           // 盈亏比
+	Expectancy   float64     `json:"expectancy"`              // 期望收益率
+	Win          int         `json:"win"`                     // 盈利次数
+	Loss         int         `json:"loss"`                    // 亏损次数
+	AvgWinPct    float64     `json:"avg_win_pct"`             // 平均盈利百分比
+	AvgLossPct   float64     `json:"avg_loss_pct"`            // 平均亏损百分比
+	AvgHoldDays  float64     `json:"avg_hold_days"`           // 平均持仓天数
+	TriggerCount int         `json:"trigger_count"`           // 触发次数
+	Status       string      `json:"status"`                  // pending | approved | rejected
+	CreatedAt    string      `json:"created_at"`              // 创建时间
+	GridJSON     string      `json:"grid_json,omitempty"`     // §D3 止盈×止损热力网格（冠军行携带）
 
 	// §GAP4.5 风险调整指标（SWEEP_JSON 带出落库，前端寻优行展示）
-	Sharpe          float64 `json:"sharpe"`
-	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`
-	AnnualReturnPct float64 `json:"annual_return_pct"`
-	Calmar          float64 `json:"calmar"`
+	Sharpe          float64 `json:"sharpe"`            // 夏普比率
+	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`  // 最大回撤百分比
+	AnnualReturnPct float64 `json:"annual_return_pct"` // 年化收益率百分比
+	Calmar          float64 `json:"calmar"`            // Calmar比率
 	// PoolStats 该战法对应模拟盘资金池的实测绩效（§B 列表接口运行时附加，不落库；
 	// nil=无对应池或引擎不可用）。前端与回测指标并排对比。
-	PoolStats *PoolLiveStats `json:"pool_stats,omitempty"`
+	PoolStats *PoolLiveStats `json:"pool_stats,omitempty"` // 池级实时统计
 }
 
 // PoolLiveStats 寻优行关联的模拟盘池实测摘要（§B：回测最优 vs 模拟盘验证）。
@@ -56,10 +56,10 @@ type PoolLiveStats struct {
 
 // SweepParams 扫参组合参数（与 SWEEP_JSON 的 params 对象对应）。
 type SweepParams struct {
-	TakeProfitPct float64 `json:"take_profit_pct"`
-	StopLossPct   float64 `json:"stop_loss_pct"`
-	HoldDays      int     `json:"hold_days"`
-	MinScore      float64 `json:"min_score"`
+	TakeProfitPct float64 `json:"take_profit_pct"` // 止盈百分比
+	StopLossPct   float64 `json:"stop_loss_pct"`   // Stop亏损次数Pct
+	HoldDays      int     `json:"hold_days"`       // 持仓天数
+	MinScore      float64 `json:"min_score"`       // Min评分
 }
 
 // ParseSweepParams 从 params JSON 解析（容错：空/坏 JSON 返回零值）。

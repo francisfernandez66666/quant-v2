@@ -1,3 +1,4 @@
+// Package engine 核心引擎：信号生产、打分池、板块传播、持仓退出、通知推送与 QMT 自动交易的 orchestration。
 package engine
 
 import (

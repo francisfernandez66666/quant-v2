@@ -9,6 +9,7 @@ package notify
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -71,7 +72,11 @@ func (g *WebhookGateway) Send(msg Message) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		log.Printf("[notify] 推送网关返回非 2xx: %d", resp.StatusCode)
+		// §R3-8 P1-D 非 2xx 必须返回错误：此前打日志后 return nil，失败不进 outbox 补投——
+		// 与 jpush.go 的失败语义（返回 error 进补投）不一致，同类通道两种结局。
+		err := fmt.Errorf("gateway HTTP %d", resp.StatusCode)
+		log.Printf("[notify] 推送网关返回非 2xx: %v（进入补投）", err)
+		return err
 	}
 	return nil
 }

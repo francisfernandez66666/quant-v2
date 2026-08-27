@@ -222,6 +222,8 @@ func main() {
 
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
 	notifier := notify.New()
+	// §R3-8 P1-D 补投队列持久化：进程重启后继续补投失败的止损/清仓提醒（此前纯内存即丢）。
+	notifier.SetOutboxPersistPath(filepath.Join(dataDir, "notify_outbox.json"))
 	notifier.SetWebhooks(cfgMgr.GetNotifyConfig().WebhookURLs)
 	// §GAP5.2 静默时段：窗口内仅高级别（交易信号/清仓/止损）放行，低中级别留痕跳过
 	if nc := cfgMgr.GetNotifyConfig(); nc.QuietStart != "" && nc.QuietEnd != "" {

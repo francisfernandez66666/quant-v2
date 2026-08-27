@@ -14,31 +14,31 @@ import (
 // PaperTradeRecord 一条模拟盘成交（研究库版本，独立于 internal/paper 避免包依赖环）。
 // English: one paper fill (research-DB flavor; keeps the store decoupled from internal/paper).
 type PaperTradeRecord struct {
-	UserID       string  `json:"user_id"`
-	Code         string  `json:"code"`
-	Name         string  `json:"name"`
-	Strategy     string  `json:"strategy"`
-	StrategyType string  `json:"strategy_type,omitempty"`
-	Side         string  `json:"side"` // buy / sell
-	Price        float64 `json:"price"`
-	SignalPrice  float64 `json:"signal_price,omitempty"`
-	LatencySec   float64 `json:"latency_sec,omitempty"`
-	Qty          int     `json:"qty"`
-	Amount       float64 `json:"amount"`
-	FilledAt     string  `json:"filled_at"`
-	Reason       string  `json:"reason,omitempty"`
+	UserID       string  `json:"user_id"`                 // 归属用户
+	Code         string  `json:"code"`                    // 代码
+	Name         string  `json:"name"`                    // 名称
+	Strategy     string  `json:"strategy"`                // 战法
+	StrategyType string  `json:"strategy_type,omitempty"` // 战法类型
+	Side         string  `json:"side"`                    // buy / sell
+	Price        float64 `json:"price"`                   // 价格
+	SignalPrice  float64 `json:"signal_price,omitempty"`  // 信号价
+	LatencySec   float64 `json:"latency_sec,omitempty"`   // 信号→成交延迟（秒）
+	Qty          int     `json:"qty"`                     // 数量
+	Amount       float64 `json:"amount"`                  // 成交额
+	FilledAt     string  `json:"filled_at"`               // 成交时间
+	Reason       string  `json:"reason,omitempty"`        // 原因
 }
 
 // PaperDailyRecord 一条模拟盘每日快照（研究库版本）。
 // English: one paper daily snapshot (research-DB flavor).
 type PaperDailyRecord struct {
-	UserID      string  `json:"user_id"`
-	Date        string  `json:"date"` // YYYY-MM-DD
-	Cash        float64 `json:"cash"`
-	MarketValue float64 `json:"market_value"`
-	TotalValue  float64 `json:"total_value"`
-	Realized    float64 `json:"realized"`
-	Positions   int     `json:"positions"`
+	UserID      string  `json:"user_id"`      // 归属用户
+	Date        string  `json:"date"`         // YYYY-MM-DD
+	Cash        float64 `json:"cash"`         // 现金
+	MarketValue float64 `json:"market_value"` // 市值
+	TotalValue  float64 `json:"total_value"`  // 总资产
+	Realized    float64 `json:"realized"`     // 已实现盈亏
+	Positions   int     `json:"positions"`    // 持仓数
 }
 
 // SavePaperTrades 批量写入模拟盘成交（盘后导出）。UNIQUE(user_id,code,side,filled_at) + INSERT OR
@@ -85,13 +85,13 @@ func (d *DB) SavePaperDaily(r PaperDailyRecord) error {
 // PaperTradeSummary 模拟盘成交聚合（按战法池类型 + 方向分组），研究侧信号质量汇总用。
 // English: aggregated paper fills (grouped by strategy-pool type + side) for research signal quality.
 type PaperTradeSummary struct {
-	StrategyType string  `json:"strategy_type"`
-	Side         string  `json:"side"`
-	Count        int     `json:"count"`
-	TotalAmount  float64 `json:"total_amount"`
-	AvgPrice     float64 `json:"avg_price"`
-	AvgSlippage  float64 `json:"avg_slippage"` // 平均滑点 %（成交价 vs 信号价）
-	AvgLatency   float64 `json:"avg_latency"`  // 平均延迟 秒
+	StrategyType string  `json:"strategy_type"` // 战法类型
+	Side         string  `json:"side"`          // 方向
+	Count        int     `json:"count"`         // 数量
+	TotalAmount  float64 `json:"total_amount"`  // Total成交额
+	AvgPrice     float64 `json:"avg_price"`     // Avg价格
+	AvgSlippage  float64 `json:"avg_slippage"`  // 平均滑点 %（成交价 vs 信号价）
+	AvgLatency   float64 `json:"avg_latency"`   // 平均延迟 秒
 }
 
 // PaperTradeSummaries 汇总 paper_trades（研究侧读取），按策略池类型+方向分组。

@@ -11,12 +11,12 @@ import (
 
 // ThsDailyRow ths_daily 单行。
 type ThsDailyRow struct {
-	TsCode    string // 完整代码 600519.SH
-	TradeDate string // yyyyMMdd
-	Open      float64
-	High      float64
-	Low       float64
-	Close     float64
+	TsCode    string  // 完整代码 600519.SH
+	TradeDate string  // yyyyMMdd
+	Open      float64 // 开盘价
+	High      float64 // 最高价
+	Low       float64 // 最低价
+	Close     float64 // 收盘价
 	Vol       float64 // 成交量（股）
 	Amount    float64 // 成交额（元）
 }
@@ -88,9 +88,9 @@ var _ = time.Now // 保持 time 引用（时间戳列扩展备用）
 
 // ThsAdjFactorRow ths_adj_factor 单行：某标的某交易日的累计后复权因子。
 type ThsAdjFactorRow struct {
-	TsCode    string
-	TradeDate string
-	Factor    float64
+	TsCode    string  // TS代码
+	TradeDate string  // 交易日期
+	Factor    float64 // 复权因子
 }
 
 // UpsertThsAdjFactorRows 批量幂等写入因子行。

@@ -7,10 +7,12 @@ package trading
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/store"
 )
 
 // guardServer 构造始终受理的假网关。
@@ -23,16 +25,19 @@ type guardStub struct {
 	calls int
 }
 
+// PlaceBuy PlaceBuy（Stub方法）。
 func (g *guardStub) PlaceBuy(req OrderRequest) (*OrderResult, error) {
 	g.calls++
 	return &OrderResult{OK: true, OrderID: "GW-X"}, nil
 }
 
+// PlaceSell PlaceSell（Stub方法）。
 func (g *guardStub) PlaceSell(req OrderRequest) (*OrderResult, error) {
 	g.calls++
 	return &OrderResult{OK: true, OrderID: "GW-S"}, nil
 }
 
+// Cancel Cancel（Stub方法）。
 func (g *guardStub) Cancel(orderID string) error { return nil }
 
 func (g *guardStub) State() (*GatewayState, error) { return &GatewayState{Connected: true}, nil }
@@ -161,6 +166,7 @@ type flakyStub struct {
 	fail bool
 }
 
+// PlaceBuy PlaceBuy（Stub方法）。
 func (f *flakyStub) PlaceBuy(req OrderRequest) (*OrderResult, error) {
 	f.calls++
 	if f.fail {
@@ -233,6 +239,158 @@ func TestSendFailedRetryAndBudgetExclusion(t *testing.T) {
 	}
 	if stub.calls != calls+1 {
 		t.Fatalf("重试应真实到达网关")
+	}
+}
+
+// ── §R3-1 P0-A/P0-B/P0-C 回归 ──────────────────────────────────────────────────
+
+// rejectStub 业务拒单假网关：仅首次下单返回 (OK=false, err=nil)，模拟网关 200+ok:false
+// （券商侧拒绝：资金不足/废单等）；此后放行（模拟资金腾挪后重试成功）。
+// English: business-rejection stub — the first PlaceBuy returns 200+ok:false with nil error,
+// later calls succeed (simulating funds freeing up for the retry).
+type rejectStub struct {
+	guardStub
+	callsSeen int
+}
+
+// PlaceBuy PlaceBuy（Stub方法）。
+func (rj *rejectStub) PlaceBuy(req OrderRequest) (*OrderResult, error) {
+	rj.calls++
+	rj.callsSeen++
+	if rj.callsSeen == 1 {
+		return &OrderResult{OK: false, Err: "资金不足"}, nil
+	}
+	return &OrderResult{OK: true, OrderID: "GW-" + req.SignalID}, nil
+}
+
+// TestBusinessRejectDemotesPlaceholder §R3-1 P0-A 回归：
+// ①业务拒单（200+ok:false）后占位行降级"发送失败"，不再以"已报"虚耗当日预算；
+// ②同 signal_id 重试经 ResetFailedRealOrder 放行；
+// ③拒单结果原样透传（res.OK=false + 原始 Err），调用方语义不变。
+func TestBusinessRejectDemotesPlaceholder(t *testing.T) {
+	db := testDB(t)
+	stub := &rejectStub{}
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.DailyBudgetAmount = 3000 // 三笔 1000：幽灵已报若计入预算（R1 已报+R2 成功），BR1 重试必被拒
+	ctrl := NewController(stub, db, "u_br", cfg, nil)
+
+	mk := func(id string) OrderRequest {
+		return OrderRequest{SignalID: id, Code: "600000.SH", Name: "浦发", Strategy: "龙头",
+			Side: SideBuy, PriceType: "market", Price: 10, Qty: 100, Amount: 1000,
+			CreatedAt: time.Now().Format(time.RFC3339)}
+	}
+
+	// ① 首次业务拒单：无 err、res.OK=false、占位行降级发送失败
+	res, err := ctrl.PlaceOrder(mk("BR1"))
+	if err != nil || res == nil || res.OK || res.Err != "资金不足" {
+		t.Fatalf("业务拒单应原样透传: res=%+v err=%v", res, err)
+	}
+	os, err := db.RealOrders()
+	if err != nil || len(os) != 1 || os[0].Status != "发送失败" {
+		t.Fatalf("占位行应降级为发送失败而非滞留已报: %+v err=%v", os, err)
+	}
+
+	// ② 幽灵行不占预算：第二笔 1000 应放行（旧实现 spent=1000 已报+1000 > 1500 被拒）
+	res2, err := ctrl.PlaceOrder(mk("BR2"))
+	if err == nil && res2.OK {
+		// 放行即证明降级生效
+	} else if err == nil && !res2.OK {
+		t.Fatalf("第二笔意外被业务拒单 stub 拒绝: %+v", res2)
+	} else {
+		t.Fatalf("降级后的占位行不应占用预算，第二笔应放行: %v", err)
+	}
+
+	// ③ 同键重试放行（ResetFailedRealOrder）
+	calls := stub.calls
+	res3, err := ctrl.PlaceOrder(mk("BR1"))
+	if err != nil || res3 == nil || !res3.OK {
+		t.Fatalf("发送失败降级后同键重试应放行: %+v err=%v", res3, err)
+	}
+	if stub.calls != calls+1 {
+		t.Fatalf("重试应真实到达网关")
+	}
+}
+
+// blockingStub 并发探针假网关：记录同时在 PlaceBuy 内的并发数。
+// English: blocking stub that tracks concurrent entries into PlaceBuy.
+type blockingStub struct {
+	guardStub
+	inFlight int32
+	maxSeen  int32
+	release  chan struct{} // 第二个请求在此等待，直到第一个完成
+}
+
+// PlaceBuy PlaceBuy（Stub方法）。
+func (b *blockingStub) PlaceBuy(req OrderRequest) (*OrderResult, error) {
+	n := atomic.AddInt32(&b.inFlight, 1)
+	for {
+		old := atomic.LoadInt32(&b.maxSeen)
+		if n <= old || atomic.CompareAndSwapInt32(&b.maxSeen, old, n) {
+			break
+		}
+	}
+	if b.release != nil && req.SignalID == "SER-2" {
+		<-b.release // SER-2 等 SER-1 出来才能进（串行化断言点）
+	}
+	time.Sleep(50 * time.Millisecond) // 制造重叠窗口
+	atomic.AddInt32(&b.inFlight, -1)
+	return &OrderResult{OK: true, OrderID: "GW-" + req.SignalID}, nil
+}
+
+// TestPlaceOrderSerialized §R3-1 P0-C 回归：并发下单串行化——
+// SER-1 在网关内停留期间 SER-2 不得进入 PlaceBuy（守卫→落库→下单 TOCTOU 窗口封死）。
+func TestPlaceOrderSerialized(t *testing.T) {
+	stub := &blockingStub{release: make(chan struct{})}
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.DailyBudgetAmount = 100000
+	ctrl := NewController(stub, testDB(t), "u_ser", cfg, nil)
+
+	mk := func(id string) OrderRequest {
+		return OrderRequest{SignalID: id, Code: "600000.SH", Name: "浦发", Strategy: "龙头",
+			Side: SideBuy, PriceType: "market", Price: 10, Qty: 100, Amount: 1000,
+			CreatedAt: time.Now().Format(time.RFC3339)}
+	}
+
+	done := make(chan struct{}, 2)
+	go func() { ctrl.PlaceOrder(mk("SER-1")); done <- struct{}{} }()
+	time.Sleep(20 * time.Millisecond) // 确保 SER-1 已先进入
+	go func() { ctrl.PlaceOrder(mk("SER-2")); done <- struct{}{} }()
+	close(stub.release) // SER-1 完成后放行 SER-2
+	<-done
+	<-done
+	if m := atomic.LoadInt32(&stub.maxSeen); m != 1 {
+		t.Fatalf("下单必须串行化: PlaceBuy 最大并发 %d, 期望 1", m)
+	}
+}
+
+// TestMaxPositionsFilteredByUser §R3-1 P0-B 回归：仓位上限按账号过滤——
+// 他账号持仓不占本账号 max_positions 名额。
+func TestMaxPositionsFilteredByUser(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "000001.SZ", Name: "他人持仓", Qty: 500, CostPrice: 10, Amount: 5000, UserID: "user_other"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.MaxPositions = 1
+	ctrl := NewController(guardServer(), db, "u_me", cfg, nil)
+	// user_other 已持 1 只，但过滤后本账号 0 持仓 → 应放行
+	if _, err := ctrl.PlaceOrder(buyReq("MP-1", 1000)); err != nil {
+		t.Fatalf("他账号持仓不应占用本账号上限名额: %v", err)
+	}
+	// 模拟 MP-1 成交回报落库（本账号持仓 1 只）
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10, Amount: 1000, UserID: "u_me"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 本账号再买第 2 只 → 达上限被拒
+	if _, err := ctrl.PlaceOrder(buyReq("MP-2", 1000)); err == nil || !strings.Contains(err.Error(), "max_positions") {
+		t.Fatalf("本账号达 max_positions 应被拒: %v", err)
 	}
 }
 

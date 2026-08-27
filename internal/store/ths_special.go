@@ -9,12 +9,12 @@ import (
 
 // ThsLimitUpRow 涨停池行。
 type ThsLimitUpRow struct {
-	TradeDate     string // yyyyMMdd
-	TsCode        string
-	Name          string
-	IsST          bool
-	IsNew         bool // 未开板新股
-	Price         float64
+	TradeDate     string  // yyyyMMdd
+	TsCode        string  // TS代码
+	Name          string  // 名称
+	IsST          bool    // 是否ST
+	IsNew         bool    // 未开板新股
+	Price         float64 // 价格
 	PctChg        float64 // 涨跌幅（已×100）
 	FirstSealTime string  // 首次封板 HH:MM
 	ContinueCnt   int     // 连板数
@@ -128,12 +128,12 @@ func (d *DB) UpsertThsSimplePool(table, tradeDate string, rows map[string]ThsPoo
 
 // ThsPoolSimple 三池简化行（跌停：open_times=0；炸板：open_times=开板次数）。
 type ThsPoolSimple struct {
-	Name             string
-	Price            float64
-	PctChg           float64
-	OpenTimes        int
-	TurnoverRatioPct float64
-	Turnover         float64
+	Name             string  // 名称
+	Price            float64 // 价格
+	PctChg           float64 // 涨跌幅
+	OpenTimes        int     // 开板次数
+	TurnoverRatioPct float64 // 换手率
+	Turnover         float64 // 成交额
 }
 
 // ThsLadderRows 连板天梯批量写入。
@@ -170,12 +170,12 @@ func (d *DB) UpsertThsLadder(rows []ThsLadderRow) (int64, error) {
 
 // ThsLadderRow 连板天梯物化行。
 type ThsLadderRow struct {
-	TradeDate   string
-	BoardNum    int
-	TsCode      string
-	Name        string
-	SealNextDay *bool
-	SignLevel   int
+	TradeDate   string // 交易日期
+	BoardNum    int    // 涨停家数
+	TsCode      string // TS代码
+	Name        string // 名称
+	SealNextDay *bool  // 次日是否封板
+	SignLevel   int    // 信号级别
 }
 
 // UpsertThsAnomalies 异动原因批量写入（keywords 序列化为 JSON 数组）。
@@ -244,13 +244,13 @@ func b2i(b bool) int {
 
 // ThsValuationRow 估值快照行。
 type ThsValuationRow struct {
-	TradeDate string
-	TsCode    string
-	PeTtm     *float64
-	PeMrq     *float64
-	PbMrq     *float64
-	PsTtm     *float64
-	PcfTtm    *float64
+	TradeDate string   // 交易日期
+	TsCode    string   // TS代码
+	PeTtm     *float64 // 市盈率 TTM
+	PeMrq     *float64 // 市盈率 MRQ
+	PbMrq     *float64 // 市净率 MRQ
+	PsTtm     *float64 // 市销率 TTM
+	PcfTtm    *float64 // 市现率 TTM
 }
 
 // UpsertThsValuations 批量幂等写入估值快照。
@@ -283,10 +283,10 @@ func (d *DB) UpsertThsValuations(rows []ThsValuationRow) (int64, error) {
 
 // ThsFinIndicatorRow 财务指标单行。
 type ThsFinIndicatorRow struct {
-	TsCode  string
-	Report  string // "2024-4"
-	Ability string // growth/profitability/solvency/operation/cash-flow
-	IndexID string
+	TsCode  string  // TS代码
+	Report  string  // "2024-4"
+	Ability string  // growth/profitability/solvency/operation/cash-flow
+	IndexID string  // 同花顺指标 ID
 	Value   *string // 上游原始精度字符串；null=未披露
 }
 

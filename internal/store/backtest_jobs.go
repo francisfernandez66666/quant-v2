@@ -23,15 +23,15 @@ type BacktestJob struct {
 	Error       string  `json:"error"`        // 失败原因（error 时）
 	// ResultText 战法库回测的汇总报告文本（阶段3.4：胜率/盈亏比等，done 后回填，前端直接展示）。
 	// English: the library-backtest summary report text (win rate / profit factor…, backfilled on done).
-	ResultText string `json:"result_text,omitempty"`
+	ResultText string `json:"result_text,omitempty"` // 结果文本
 	// StrategyKind 回放子类型（factor/pattern/内置战法名），供前端失败重跑重建规则 ID。
-	StrategyKind string `json:"strategy_kind,omitempty"`
+	StrategyKind string `json:"strategy_kind,omitempty"` // 战法Kind
 	// ParamsJSON 入队运行参数原文（start/end/top_k/min_stocks/maxstocks 等），
 	// 回测行展示"具体参数"用。English: raw enqueue params for the job's parameter display.
-	ParamsJSON string `json:"params_json,omitempty"`
-	StartedAt  string `json:"started_at"`  // 开始时间 YYYY-MM-DD HH:MM:SS
-	FinishedAt string `json:"finished_at"` // 结束时间（done/error/interrupted 时）
-	UpdatedAt  string `json:"updated_at"`  // 最近更新时间
+	ParamsJSON string `json:"params_json,omitempty"` // 参数JSON
+	StartedAt  string `json:"started_at"`            // 开始时间 YYYY-MM-DD HH:MM:SS
+	FinishedAt string `json:"finished_at"`           // 结束时间（done/error/interrupted 时）
+	UpdatedAt  string `json:"updated_at"`            // 最近更新时间
 }
 
 // UpsertBacktestJob 写入/更新一条回测任务（同一 kind+candidate_id 覆盖，重跑不产生重复行）。

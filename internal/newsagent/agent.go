@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -37,20 +38,48 @@ type Agent struct {
 	// English: IPO-boot analysis cache: trading-day:code -> analyzed
 	bootCacheDay string // bootCache 对应的交易日 YYYYMMDD
 	// English: the trading day YYYYMMDD that bootCache corresponds to
+
+	// hotMu §R3-8 P1-K 可变字段锁：llmClient/minScore 由 HTTP 热更线程写（SetLLMClient/
+	// SetMinScore）、异步 Run goroutine 读；bootCache 由手动 ReanalyzeNews 与异步 Run 并发读写。
+	// 此前三者完全无锁 = data race。慢路径（LLM 调用）一律先快照指针再放锁外。
+	hotMu sync.RWMutex
 }
 
 // SetLLMClient 设置 LLM 客户端。（Sets the LLM client.）
 // English: sets the LLM client.
-func (a *Agent) SetLLMClient(c *llm.Client) { a.llmClient = c }
+func (a *Agent) SetLLMClient(c *llm.Client) {
+	a.hotMu.Lock()
+	a.llmClient = c
+	a.hotMu.Unlock()
+}
+
+// llmClientSnapshot 锁内取当前 LLM 客户端指针（调用方在锁外使用）。
+// English: returns the current LLM client under RLock; use outside the lock.
+func (a *Agent) llmClientSnapshot() *llm.Client {
+	a.hotMu.RLock()
+	defer a.hotMu.RUnlock()
+	return a.llmClient
+}
+
+// currentMinScore 锁内读当前落盘过滤最低分。
+func (a *Agent) currentMinScore() float64 {
+	a.hotMu.RLock()
+	defer a.hotMu.RUnlock()
+	return a.minScore
+}
 
 // SetMinScore 设置落盘过滤最低分（|score| 低于该值的事件不落盘展示）。
 // （SetMinScore sets the minimum |score| for persistence; lower-scoring events are not stored.）
 // English: SetMinScore sets the minimum |score| for persistence; lower-scoring events are not stored.
-func (a *Agent) SetMinScore(v float64) { a.minScore = v }
+func (a *Agent) SetMinScore(v float64) {
+	a.hotMu.Lock()
+	a.minScore = v
+	a.hotMu.Unlock()
+}
 
 // MinScore 返回当前落盘过滤最低分。（MinScore returns the current minimum |score| for persistence.）
 // English: MinScore returns the current minimum |score| for persistence.
-func (a *Agent) MinScore() float64 { return a.minScore }
+func (a *Agent) MinScore() float64 { return a.currentMinScore() }
 
 // New 创建新闻智能体实例。（New creates a news agent instance.）
 // English: New creates a news agent instance.
@@ -319,8 +348,8 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 		if s < 0 {
 			s = -s
 		}
-		if s < a.minScore {
-			continue // 过滤中性/无价值噪音
+		if s < a.currentMinScore() {
+			continue // 过滤中性/无价值噪音（§R3-8 P1-K 锁内读）
 			// English: title-level dedup: keep only the first event with the same title
 		}
 		// 标题级去重：同标题事件仅保留第一条
@@ -654,7 +683,9 @@ func (a *Agent) buildIPOEvents() []NewsEvent {
 // Cache: analyzed IPO codes are recorded per trading day so the LLM is not re-invoked every round.）
 // English: BuildIPOBootEvents runs sector-level LLM deep analysis for soon-to-list IPOs (IPO boot events). Background: unlisted issuers like Unitree are absent from the stock DB and their industry cannot be found via the EastMoney interface, so the plain per-stock "new listing" event is skipped by attribution() (Level==stock) and never produces a robotics sector, nor does it propagate upstream/downstream beneficiaries (e.g. Wolong Electric Drive / Sanhua) into the scoring pool and D1 scoring context. So this function feeds each soon-to-list IPO title (within bootDays trading days, default 5) to the LLM for supply-chain hotspot analysis (AnalyzeHotTopic -> HotTopic), producing Level=sector events where Sectors = the concept sectors, Upstream/DownstreamStocks = upstream/downstream affected stocks, and Upstream/DownstreamSectors = upstream/downstream sectors. buildChainEvents then expands them into directional events; attribution() derives hot sectors, and the sectors' constituents / upstream-downstream stocks join the scoring pool for D1 scoring. Cache: analyzed items are recorded per trading-day+code so the LLM is not re-invoked every round.
 func (a *Agent) BuildIPOBootEvents() []NewsEvent {
-	if a.marketAPI == nil || a.llmClient == nil {
+	// §R3-8 P1-K 锁内快照：llmClient 由热更线程并发替换，先取指针再放锁外慢路径。
+	client := a.llmClientSnapshot()
+	if a.marketAPI == nil || client == nil {
 		return nil
 	}
 	now := time.Now()
@@ -662,10 +693,12 @@ func (a *Agent) BuildIPOBootEvents() []NewsEvent {
 
 	// 跨交易日重置缓存（bootAnalyzed: "交易日:代码" → 已分析）
 	// English: reset the cache on a new trading day (bootAnalyzed: "trading-day:code" -> analyzed)
+	a.hotMu.Lock()
 	if a.bootCacheDay != td {
 		a.bootCache = make(map[string]bool)
 		a.bootCacheDay = td
 	}
+	a.hotMu.Unlock()
 
 	list, err := a.marketAPI.GetEastMoneyIPOCalendar()
 	if err != nil {
@@ -694,10 +727,12 @@ func (a *Agent) BuildIPOBootEvents() []NewsEvent {
 			// English: skip listings beyond bootDays
 		}
 		key := td + ":" + ipo.Code
-		if a.bootCache[key] {
+		a.hotMu.RLock()
+		done := a.bootCache[key]
+		a.hotMu.RUnlock()
+		if done {
 			continue
 		}
-		a.bootCache[key] = true
 		title := fmt.Sprintf("%s(%s) 将于 %s 上市，请分析该新股上市对A股产业链的价值传导影响", ipo.Name, ipo.Code, listing)
 		targets = append(targets, bootTarget{code: ipo.Code, name: ipo.Name, title: title})
 		titles = append(titles, title)
@@ -708,11 +743,18 @@ func (a *Agent) BuildIPOBootEvents() []NewsEvent {
 
 	var out []NewsEvent
 	for i, t := range titles {
-		ht, err := a.llmClient.AnalyzeHotTopic(t)
+		ht, err := client.AnalyzeHotTopic(t)
 		if err != nil || ht == nil {
+			// §修复：此前 bootCache 在调 LLM 之前就写 true——LLM 失败 continue 后该 IPO 当天
+			// 永不重试（缓存次日才重置），与全系统"失败留队重试"原则相悖。现改为成功才记缓存，
+			// 失败的下一轮重新分析。English: the old code marked bootCache before the LLM call,
+			// so a failed analysis was never retried that day; mark only on success now.
 			log.Printf("[newsagent] IPO启动LLM分析失败(%s): %v", targets[i].code, err)
 			continue
 		}
+		a.hotMu.Lock()
+		a.bootCache[td+":"+targets[i].code] = true
+		a.hotMu.Unlock()
 		postProcess(ht)
 		// 强制板块级：IPO 启动是产业链事件，非个股
 		// English: force sector level: an IPO boot is a supply-chain event, not a stock-level one

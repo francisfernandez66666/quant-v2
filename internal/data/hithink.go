@@ -47,9 +47,14 @@ type HithinkEnvelope struct {
 }
 
 // hithinkLimiter 令牌桶限速器（QPS 可运行时下调以自适应 4001）。
+// §R3-8 P1-E 单向棘轮修复：interval 基准值在构造时记录；reward() 在请求成功后按半衰
+// 回收惩罚——此前 4001 风暴后 interval 永久停留在 ≤30s/请求直到进程重启，最高优先级
+// 数据源慢性自杀。English: R3-8 P1-E — penalties now decay back toward the base interval on
+// success (halving), instead of being a one-way ratchet stuck for the process lifetime.
 type hithinkLimiter struct {
 	mu       sync.Mutex
-	interval time.Duration
+	base     time.Duration // 构造时的标称间隔（恢复地板）
+	interval time.Duration // 当前生效间隔（惩罚后放大）
 	last     time.Time
 }
 
@@ -58,7 +63,8 @@ func newHithinkLimiter(qps float64) *hithinkLimiter {
 	if qps <= 0 {
 		qps = 5
 	}
-	return &hithinkLimiter{interval: time.Duration(float64(time.Second) / qps)}
+	iv := time.Duration(float64(time.Second) / qps)
+	return &hithinkLimiter{base: iv, interval: iv}
 }
 
 // wait 阻塞直到取得一个令牌；penalize 在收到 4001 时按倍数拉长间隔。
@@ -83,6 +89,20 @@ func (l *hithinkLimiter) wait(penalize bool) {
 	l.mu.Unlock()
 	if wait > 0 {
 		time.Sleep(wait)
+	}
+}
+
+// reward §R3-8 P1-E 成功后回收惩罚：当前间隔向基准减半收敛（≥基准即停）。
+// 在每次业务成功路径调用，4001 风暴过后限速自动逐步恢复到标称 QPS。
+// English: R3-8 P1-E — halve the current interval back toward base after successes.
+func (l *hithinkLimiter) reward() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.interval > l.base {
+		l.interval /= 2
+		if l.interval < l.base {
+			l.interval = l.base
+		}
 	}
 }
 
@@ -127,6 +147,7 @@ func (c *HithinkClient) get(path string, params url.Values, out any) error {
 	}
 	switch env.Code {
 	case 0:
+		c.limiter.reward() // §R3-8 P1-E：成功即回收限速惩罚
 		if out != nil && len(env.Data) > 0 {
 			if err := json.Unmarshal(env.Data, out); err != nil {
 				return fmt.Errorf("hithink: data 解析失败: %w", err)

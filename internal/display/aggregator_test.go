@@ -18,35 +18,39 @@ func mkSig(code, strategy string) combat_agent.Signal {
 	return combat_agent.Signal{Code: code, Strategy: strategy, GeneratedAt: time.Now()}
 }
 
-// TestUpdateFastPreservesDashboard 验证近实时更新（UpdateFast）不会破坏主循环写下的看板数据：
-// 主循环信号保留、分数刷新生效、近实时信号并入 BullSignals 与 FinalSignals。
+// TestUpdateFastPreservesDashboard 验证近实时更新（UpdateFast）的【替换】契约：
+// 生产调用方（scoring_loop）每次传 mergeSignals(emit, signalStore.List()) 全量集合——
+// 固化库已含主循环信号，因此替换不会丢主循环数据；并锁定 §R3-8 P1-B 防膨胀回归：
+// 连续多轮 UpdateFast 后 BullSignals 长度不得增长（旧 append 实现每轮翻倍堆积）。
 func TestUpdateFastPreservesDashboard(t *testing.T) {
 	a := New()
 	// 先由主循环写入完整看板
-	a.Update(&emptyResult{}, nil, nil, []combat_agent.Signal{mkSig("600000", "dragon")}, nil, nil,
+	main := mkSig("600000", "dragon")
+	a.Update(&emptyResult{}, nil, nil, []combat_agent.Signal{main}, nil, nil,
 		map[string]combat_agent.StockScores{"600000": {Code: "600000", DragonScore: 80}},
 		nil)
 
-	// 近实时循环 UpdateFast：刷新分数 + 合并近实时信号
+	// 近实时循环 UpdateFast：传"固化(含主循环) + 本轮新翻转"的全量集合（生产口径）
 	fast := []combat_agent.Signal{mkSig("000001", "n_shape")}
+	merged := append([]combat_agent.Signal{main}, fast...)
 	scores := map[string]combat_agent.StockScores{
 		"600000": {Code: "600000", DragonScore: 85, MomentumScore: 70, UpdatedAt: time.Now()},
 		"000001": {Code: "000001", NScore: 66, MomentumScore: 60, UpdatedAt: time.Now()},
 	}
-	a.UpdateFast(scores, fast, nil)
+	a.UpdateFast(scores, merged, nil)
 
 	cur := a.Current()
 	if cur == nil {
 		t.Fatal("current 应为非 nil")
 	}
-	// 主循环信号保留 + 近实时信号并入 BullSignals
 	if len(cur.BullSignals) != 2 {
-		t.Fatalf("BullSignals 应含主循环1+近实时1=2, got %d", len(cur.BullSignals))
+		t.Fatalf("BullSignals 应为主循环1+近实时1=2, got %d", len(cur.BullSignals))
 	}
-	// 近实时信号并入
+	// 分数刷新生效
 	if cur.Scores["600000"].DragonScore != 85 {
 		t.Fatalf("分数应更新为85, got %.0f", cur.Scores["600000"].DragonScore)
 	}
+	// 近实时信号并入 FinalSignals
 	foundFast := false
 	for _, s := range cur.FinalSignals {
 		if s.Code == "000001" {
@@ -55,6 +59,15 @@ func TestUpdateFastPreservesDashboard(t *testing.T) {
 	}
 	if !foundFast {
 		t.Fatal("近实时信号应进入 FinalSignals")
+	}
+
+	// §R3-8 P1-B 防膨胀回归：连续 100 轮传入同一全量集合，BullSignals 恒为 2 条。
+	// （旧实现：每轮 append 整份列表 → 102 条且持续翻倍。）
+	for i := 0; i < 100; i++ {
+		a.UpdateFast(scores, merged, nil)
+	}
+	if got := len(a.Current().BullSignals); got != 2 {
+		t.Fatalf("重复全量更新不得累积: 第100轮后 BullSignals=%d, 期望 2", got)
 	}
 }
 

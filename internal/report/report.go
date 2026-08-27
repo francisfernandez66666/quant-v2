@@ -10,6 +10,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"quant-trading-v2/internal/fileutil"
 )
 
 // Lot 表示一次加仓批次记录：开仓/加仓的价格、数量与时间。
@@ -640,7 +642,10 @@ func (r *Report) statsFor(userID string) (total, holding, win int, winRate, avgW
 
 // save 将当前 logs 以 JSON 格式写入持久化文件（路径由 r.path 指定）。
 // 若 path 为空字符串则跳过写入。写入失败时仅记录日志，不阻塞程序运行。
-// （save writes the logs to the JSON file; skips when path is empty and only logs on failure.）
+// §R3-4 P1-A 原子写：此前 os.WriteFile 直接覆盖——进程在写盘中途崩溃会截断整个持仓账本
+// （positions.json 损坏=全部历史丢失）。改走 fileutil.AtomicWrite（唯一临时名+fsync+rename），
+// 与 paper/auth/config 同一口径。English: R3-4 P1-A — atomic write via fileutil so a crash
+// mid-write can no longer truncate the position ledger.
 func (r *Report) save() {
 	if r.path == "" {
 		return
@@ -650,7 +655,7 @@ func (r *Report) save() {
 		log.Printf("[report] 序列化失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(r.path, data, 0644); err != nil {
+	if err := fileutil.AtomicWrite(r.path, data, 0644); err != nil {
 		log.Printf("[report] 写入失败: %v", err)
 	}
 }

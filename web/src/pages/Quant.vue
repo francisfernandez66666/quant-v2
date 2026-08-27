@@ -118,7 +118,7 @@
       <div class="card-header">交易流水与整体盈亏
         <span class="card-sub">已实现=加权成本重放；浮动=市值-成本×数量；30s 刷新</span>
       </div>
-      <template v-if="trades">
+      <template v-if="trades && trades.summary">
         <div class="chips">
           <div class="chip" :class="(trades.summary.total_pnl || 0) >= 0 ? 'up' : 'down'">
             <div class="chip-num">{{ fmtMoney(trades.summary.total_pnl) }}</div>
@@ -233,7 +233,12 @@ async function loadConfig() {
 
 /** 拉取交易流水与盈亏 */
 async function loadTrades() {
-  try { trades.value = await api.fetchQMTTrades() } catch (e) { /* 忽略，保留上次数据 */ }
+  try {
+    const t = await api.fetchQMTTrades()
+    // §白板修复：只接受带 summary 的合法载荷——后端异常时若返回 {error} 之类的对象，
+    // 直接赋值会让模板 trades.summary.xxx 对 undefined 取属性抛 TypeError，整页白屏。
+    if (t && t.summary) trades.value = t
+  } catch (e) { /* 忽略，保留上次数据 */ }
 }
 
 /** 盈亏金额格式化：带符号两位小数 */

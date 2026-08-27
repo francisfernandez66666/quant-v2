@@ -1,0 +1,59 @@
+/* Quant.jsx — 复刻 Quant.vue 的样式布局 */
+.quant-page { max-width: 900px; }
+.page-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; color: #e0e0e0; }
+.page-sub { font-size: 12px; color: #888; margin-bottom: 14px; }
+
+.link-card { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; padding: 12px 14px; margin-bottom: 14px; background: #1a1a2e; border-radius: 8px; border: 1px solid #2a2a3e; }
+.dot { font-size: 16px; line-height: 1; }
+.dot.ok { color: #4caf50; }
+.dot.bad { color: #666; }
+.mono { font-family: monospace; color: #4fc3f7; }
+.pill { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: rgba(255,255,255,0.08); }
+.pill.good { color: #4caf50; background: rgba(76,175,80,0.15); }
+.pill.warn { color: #FF4D4F; background: rgba(255,77,79,0.15); }
+.hint { font-size: 11px; color: #666; }
+
+.card { background: #1a1a2e; border-radius: 8px; padding: 14px; margin-bottom: 14px; border: 1px solid #2a2a3e; }
+.card-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; font-weight: 600; color: #ccc; margin-bottom: 12px; }
+.card-sub { font-size: 11px; color: #666; font-weight: 400; }
+
+.form-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; flex-wrap: wrap; }
+.lbl { width: 110px; flex-shrink: 0; font-size: 13px; color: #aaa; text-align: right; }
+.inp { background: #12121e; border: 1px solid #2a2a3e; border-radius: 6px; color: #e0e0e0; padding: 6px 9px; font-size: 13px; }
+.inp:focus { outline: none; border-color: #b388ff; }
+.inp.short { width: 90px; }
+.inp.wide { flex: 1; min-width: 240px; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 12px; color: #aaa; }
+.field .hint { font-size: 10px; }
+
+.seg { background: transparent; border: 1px solid #2a2a3e; color: #999; border-radius: 6px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+.seg.on { border-color: #b388ff; color: #b388ff; background: rgba(179,136,255,0.1); }
+
+.strategy-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 4px; border-bottom: 1px solid #22223a; }
+.strategy-row:last-of-type { border-bottom: none; }
+.st-name { font-size: 13px; color: #ddd; }
+.st-code { font-family: monospace; font-size: 11px; color: #555; margin-top: 2px; }
+.st-amount { display: flex; align-items: center; gap: 6px; flex: 1; justify-content: flex-end; }
+
+.chips { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.chip { background: #12121e; border-radius: 8px; padding: 10px; text-align: center; border: 1px solid #2a2a3e; }
+.chip-num { font-size: 18px; font-weight: 700; color: #e0e0e0; font-family: monospace; }
+.chip-lbl { font-size: 11px; color: #777; margin-top: 3px; }
+.up { color: #4caf50 !important; }
+.down { color: #FF4D4F !important; }
+
+.tbl { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.tbl th { text-align: left; color: #666; font-weight: 600; padding: 5px 6px; border-bottom: 1px solid #2a2a3e; }
+.tbl td { padding: 5px 6px; border-bottom: 1px solid #1a1a26; color: #ccc; }
+.tbl tr:last-child td { border-bottom: none; }
+.dim { color: #666; }
+.empty-tip { padding: 8px 2px; }
+
+.save-bar { display: flex; align-items: center; gap: 12px; justify-content: flex-end; margin-top: 10px; }
+
+@media (max-width: 768px) {
+  .lbl { text-align: left; width: 100%; }
+  .form-grid { grid-template-columns: 1fr; }
+}

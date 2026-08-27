@@ -75,8 +75,11 @@ func TestDoubleBumpWatcherNoVolumeBeforeOpen(t *testing.T) {
 // 双响炮第二波确认门与动量门槛（绕过真实 double_bump 的日K volScore 判断）。
 type fakeDoubleBumpStrategy struct{}
 
+// Name 返回测试桩战法名称 "fake_db"（伪双响炮）。
 func (fakeDoubleBumpStrategy) Name() string              { return "fake_db" }
+// Type 返回战法信号类型 SignalDoubleBump。
 func (fakeDoubleBumpStrategy) Type() strategy.SignalType { return strategy.SignalDoubleBump }
+// Evaluate 固定返回 full_chain Pass（volScore 隐含达标），用于隔离双响炮第二波确认门与动量门槛。
 func (fakeDoubleBumpStrategy) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{
 		Level: "full_chain", Pass: true, TotalScore: 80,
@@ -84,6 +87,7 @@ func (fakeDoubleBumpStrategy) Evaluate(string, interface{}) (*strategy.Evaluatio
 		Confidence: 0.7,
 	}, nil
 }
+// GenerateSignal 返回买入信号，故意留空 Price 以验证 evalAll 用 md.Price 兜底触发价。
 func (fakeDoubleBumpStrategy) GenerateSignal(code string, _ *strategy.Evaluation) (*strategy.Signal, error) {
 	// 故意不填 Price（=0），验证 evalAll 用 md.Price 兜底触发价（任务2）
 	return &strategy.Signal{Code: code, Name: "双凸", Action: strategy.ActionBuy, Confidence: 0.7, Reason: "full_chain"}, nil

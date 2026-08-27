@@ -8,7 +8,6 @@
 // independent Engine instance (aggregator, persistence, long/short toggles, strategy params), so
 // the backend computes per account and the frontend only fetches results — the same account sees
 // identical results on any device.
-
 package engine
 
 import (
@@ -44,30 +43,30 @@ import (
 // EngineOptions 注册表的共享依赖（数据源全局一份，所有账号引擎复用）。
 // English: shared dependencies for the registry — data sources are global and reused by every account engine.
 type EngineOptions struct {
-	MarketAPI    *data.MarketAPI
-	NewsAgent    *newsagent.Agent
-	StrategyEng  *strategy_engine.Engine
-	SectorAgent  *sector_agent.Agent
-	Scanner      *data.SectorScanner
-	Matcher      *data.EventMatcher
-	Rpt          *report.Report
-	StockTracker *data.StockTracker
-	WlMgr        *data.WatchlistManager
-	SSE          *server.SSEBroker
-	LLMClient    *llm.Client
-	THS          *data.THSClient
-	Fetcher      *data.Fetcher
-	CfgMgr       *config.Manager
-	DataDir      string
-	Notifier     *notify.Notifier
-	SectorTopN   int
-	D1MaxRetries int
-	Paper        *paper.Engine // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
+	MarketAPI    *data.MarketAPI         // 行情 API（全局共享）
+	NewsAgent    *newsagent.Agent        // 新闻归因代理（全局共享）
+	StrategyEng  *strategy_engine.Engine // 策略引擎（全局共享）
+	SectorAgent  *sector_agent.Agent     // 板块代理（全局共享）
+	Scanner      *data.SectorScanner     // 板块扫描器（全局共享）
+	Matcher      *data.EventMatcher      // 事件匹配器（全局共享）
+	Rpt          *report.Report          // 报告/镜像持仓账本（全局共享）
+	StockTracker *data.StockTracker      // 个股跟踪器（全局共享）
+	WlMgr        *data.WatchlistManager  // 自选股管理器（全局共享）
+	SSE          *server.SSEBroker       // SSE 推送 broker（全局共享）
+	LLMClient    *llm.Client             // LLM 客户端（全局共享）
+	THS          *data.THSClient         // 同花顺数据客户端（全局共享）
+	Fetcher      *data.Fetcher           // 数据获取器（全局共享）
+	CfgMgr       *config.Manager         // 配置管理器（全局共享）
+	DataDir      string                  // 数据目录根路径
+	Notifier     *notify.Notifier        // 通知推送器（全局共享）
+	SectorTopN   int                     // 主线板块纳入成分股数量
+	D1MaxRetries int                     // D1 评分 LLM 调用最大重试次数
+	Paper        *paper.Engine           // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
 	// 实盘账本（AUTO_TRADING_PLAN M1）：研究库句柄，供 QMT 控制器存取 real_positions/orders/fills。
 	// 与纸面账本完全独立。nil = 未接入实盘（QMT 链路整体禁用）。
 	// English: real book (AUTO_TRADING_PLAN M1) — research-DB handle for the QMT controller's
 	// real_positions/orders/fills access. Fully independent of the paper book. nil = no live chain.
-	RealStore *store.DB
+	RealStore *store.DB // 实盘数据库存储
 }
 
 // InitStage 引擎初始化进度阶段。
@@ -89,8 +88,8 @@ type InitStage struct {
 // instance, so the strategy is computed once and its results serve all matching accounts; the same
 // account on any device gets the same engine. Accounts with different fingerprints get their own.
 type Registry struct {
-	mu       sync.Mutex
-	opts     EngineOptions
+	mu       sync.Mutex            // 保护注册表字段的并发锁
+	opts     EngineOptions         // 共享依赖（全局一份）
 	cores    map[string]*Engine    // configFingerprint → Engine（共享计算引擎）
 	byUser   map[string]*Engine    // userID → Engine（账号归属引擎）
 	initDone map[string]bool       // userID → 是否已完成初始化
@@ -104,13 +103,13 @@ type Registry struct {
 	// 盘后落库：每账号导出日期记录（一天一次）+ 导出回调（main 注入 server.ExportPaperToResearch）。
 	// English: post-close export — per-account last-export date (once a day) + the export callback
 	// (wired by main to server.ExportPaperToResearch).
-	paperExportDay map[string]string
-	dayCloseHook   func(userID string, pe *paper.Engine)
+	paperExportDay map[string]string                     // userID → 最近盘后导出日期
+	dayCloseHook   func(userID string, pe *paper.Engine) // 盘后导出回调
 
 	// 战法分仓：全局资金池类型模板（engine.ActivePoolTypes 注入），新老账号模拟盘据此分池，
 	// 每个战法池只扣自己战法的预算（防波动突破垄断）。English: strategy pooling — the global
 	// pool-type template (injected from engine.ActivePoolTypes); each account's paper splits cash by it.
-	paperPoolTypes []string
+	paperPoolTypes []string // 启用的战法资金池类型列表
 	// paperLabelFn §C 规则池 ID→显示名 解析器（新账号懒加载引擎继承）
 	paperLabelFn func(string) string
 	// 自动撮合账号判定：仅返回 true 的账号参与按战法自动建仓/自动估值（admin）；
@@ -537,10 +536,13 @@ func (r *Registry) build(userID string) *Engine {
 	// 战法代理：按账号策略配置 + 独立 runner（runner 按账号读取配置）
 	sc := opts.CfgMgr.GetStrategyConfigFor(userID)
 	cAgent := combat_agent.New(sc)
+	// §P1-C 改用 per-user getter 装配 D1/ATR：引擎按账号指纹隔离后，其首建用户即 owner，
+	// 必须用该账号的覆盖值（而非全局 Rules），否则 build 阶段 D1/ATR 与后续 syncAccountConfig 不一致。
+	posCfg := opts.CfgMgr.GetRulesFor(userID).Position
 	cAgent.SetLaodengConfig(&opts.CfgMgr.Rules.Laodeng)
-	cAgent.SetPositionDailyDropPct(opts.CfgMgr.Rules.Position.DailyDropAlertPct)
-	cAgent.SetD1Config(opts.CfgMgr.GetD1Config())
-	cAgent.SetATRStop(opts.CfgMgr.Rules.Position.ATREnabled, opts.CfgMgr.Rules.Position.ATRStopMult)
+	cAgent.SetPositionDailyDropPct(posCfg.DailyDropAlertPct)
+	cAgent.SetD1Config(opts.CfgMgr.GetD1ConfigFor(userID))
+	cAgent.SetATRStop(posCfg.ATREnabled, posCfg.ATRStopMult)
 	cAgent.SetRunners(newAccountRunners(opts.CfgMgr, opts.Matcher, userID, opts.DataDir))
 	cAgent.SetShortEnabled(opts.CfgMgr.GetLongShortConfigFor(userID).ShortEnabled)
 	// 注入盘口因子回调：信号生成后对命中个股拉取买卖压力/封单量（免费五档，Level-2 可扩十档）。
@@ -798,19 +800,33 @@ func (r *Registry) refreshAll() {
 // D1 retries). Accounts with equal fingerprints share one compute engine (the strategy runs once).
 func (r *Registry) fingerprint(userID string) string {
 	opts := r.opts
+	// §P1-C 指纹补全：原指纹漏掉 D1 事件规则与 ATR 止损（均为账号级可覆盖项），
+	// 导致两账号 D1/ATR 不同却共享同一引擎 → 战法结果互相串味。此处纳入账号级 D1 与
+	// 持仓 ATR/跌幅阈值（均走 per-user getter），确保"配置不同则引擎不同"。
+	pos := opts.CfgMgr.GetRulesFor(userID).Position
 	type f struct {
 		Strategy  *config.StrategyConfig
 		Laodeng   *config.LaodengConfig
 		LongShort config.LongShortConfig
 		DailyDrop float64
 		D1Retry   int
+		D1        *config.D1Config
+		ATR       struct {
+			Enabled bool
+			Mult    float64
+		}
 	}
 	fp := f{
 		Strategy:  opts.CfgMgr.GetStrategyConfigFor(userID),
 		Laodeng:   &opts.CfgMgr.Rules.Laodeng,
 		LongShort: opts.CfgMgr.GetLongShortConfigFor(userID),
-		DailyDrop: opts.CfgMgr.Rules.Position.DailyDropAlertPct,
+		DailyDrop: pos.DailyDropAlertPct,
 		D1Retry:   opts.D1MaxRetries,
+		D1:        opts.CfgMgr.GetD1ConfigFor(userID),
+		ATR: struct {
+			Enabled bool
+			Mult    float64
+		}{pos.ATREnabled, pos.ATRStopMult},
 	}
 	b, err := json.Marshal(fp)
 	if err != nil {

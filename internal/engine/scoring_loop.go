@@ -502,7 +502,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	// §GAP1.1 实盘卖出自动化：mode=auto 且 qmt.auto_sell 开启时，止损级建议自动全仓卖出。
 	// signal_id 按"码+类+日"幂等——orders 表唯一键天然防重，跨重启/跨轮次不会二次下单。
 	if len(advices) > 0 {
-		e.autoExecuteRealSells(ctrl, realStore, advices)
+		e.autoExecuteRealSells(sendTo, ctrl, realStore, advices)
 	}
 
 	if len(advices) == 0 || sse == nil || sendTo == "" {
@@ -572,11 +572,16 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 
 // autoExecuteRealSells §GAP1.1 止损级建议自动全仓卖出（qmt.auto_sell + mode=auto）。
 // 仅 Action=止损 触发（止盈/减仓保持提醒半自动，由前端确认执行）；行情缺失跳过。
-func (e *Engine) autoExecuteRealSells(ctrl *trading.Controller, realStore *store.DB, advices []trading.PositionAdvice) {
+// §R3-1 P0-B 按账号过滤：此前读全表 RealPositions()——多账号部署下 A 账号的止损建议可能
+// 匹配到 byCode 映射里 B 账号的同名持仓并真实卖出（资损级）。与建议生成路径的
+// §GAP2-W2 收敛口径对齐，统一走 RealPositionsForUser(userID)。
+// English: R3-1 P0-B — filter positions by account: the old full-table RealPositions() could pair
+// account A's stop-loss advice with account B's same-code position and really sell it.
+func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, realStore *store.DB, advices []trading.PositionAdvice) {
 	if realStore == nil || !ctrl.Enabled() || ctrl.Mode() != "auto" || !ctrl.Config().AutoSell {
 		return
 	}
-	positions, err := realStore.RealPositions()
+	positions, err := realStore.RealPositionsForUser(userID)
 	if err != nil || len(positions) == 0 {
 		return
 	}

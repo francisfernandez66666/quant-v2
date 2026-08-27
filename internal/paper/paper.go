@@ -57,7 +57,7 @@ type Config struct {
 	// 告警直接在模拟盘自动平仓。由 config.PaperConfig.AutoSell 缺省填充（未配置=true）。
 	// English: auto-sell switch (full-auto execution) — when on, 清仓/减仓/hard-TP/hard-SL alerts close
 	// paper positions automatically. Defaulted from config.PaperConfig.AutoSell (true when unset).
-	AutoSell bool `json:"auto_sell"`
+	AutoSell bool `json:"auto_sell"` // 自动卖出
 	// §R0 仿真级参数（后台可配，热加载）
 	SlippageBps    float64 `json:"slippage_bps"`    // 滑点基点（万N，默认5=0.05%）
 	CommissionRate float64 `json:"commission_rate"` // 佣金率（默认0.00025）
@@ -90,24 +90,24 @@ func DefaultConfig() Config {
 // English: a paper position. SignalPrice is the reference signal price; CostPrice is the actual
 // fill price (live price).
 type Position struct {
-	Code     string `json:"code"`
-	Name     string `json:"name"`
-	Strategy string `json:"strategy"`
+	Code     string `json:"code"`     // 代码
+	Name     string `json:"name"`     // 名称
+	Strategy string `json:"strategy"` // 战法
 	// StrategyType 该持仓所属战法池类型（fillLocked 时由信号 StrategyType 记录；
 	// 卖出时收益按此回池。旧数据/手动买入为空 → 归"其他池"）。
 	// English: the strategy-pool type this position belongs to (recorded at fill from the signal's
 	// StrategyType; sale proceeds return to that pool on exit. Empty for legacy data / manual buys,
 	// which fall into the "other" pool).
-	StrategyType string    `json:"strategy_type,omitempty"`
-	Qty          int       `json:"qty"`
-	CostPrice    float64   `json:"cost_price"`
-	Cost         float64   `json:"cost"`
-	SignalPrice  float64   `json:"signal_price"`
-	SignalAt     time.Time `json:"signal_at"`
-	FilledAt     time.Time `json:"filled_at"`
+	StrategyType string    `json:"strategy_type,omitempty"` // 战法类型
+	Qty          int       `json:"qty"`                     // 数量
+	CostPrice    float64   `json:"cost_price"`              // 成本价
+	Cost         float64   `json:"cost"`                    // 成本
+	SignalPrice  float64   `json:"signal_price"`            // 信号价
+	SignalAt     time.Time `json:"signal_at"`               // 信号时间
+	FilledAt     time.Time `json:"filled_at"`               // 成交时间
 	// Mark 最近一次估值价（实时快照，前端展示现价/浮盈用）。
 	// English: last mark price from the live snapshot, for live P/L display.
-	Mark float64 `json:"mark"`
+	Mark float64 `json:"mark"` // 市值/标记价
 	// ATR 该股 ATR14（开仓信号携带，镜像写 report 账时供 C4/ATR 动态止损距离计算；
 	// 手动买入为 0 → 镜像回退固定百分比止损）。
 	// English: the stock's ATR14 carried by the opening signal — used by the report-book mirror for
@@ -176,26 +176,26 @@ func (p *Position) LatencySec() int64 {
 // Trade 一笔模拟成交记录（买入含信号价参照与延迟）。
 // English: one paper fill. Buys carry the reference signal price and latency.
 type Trade struct {
-	Code     string `json:"code"`
-	Name     string `json:"name"`
-	Strategy string `json:"strategy"`
+	Code     string `json:"code"`     // 代码
+	Name     string `json:"name"`     // 名称
+	Strategy string `json:"strategy"` // 战法
 	// StrategyType 该成交所属战法池类型（分池/盘后研究落库归类用；空=其他池/手动）。
 	// English: the strategy-pool type of this fill (for pooling and post-close research export; empty =
 	// the other pool / manual).
-	StrategyType string    `json:"strategy_type,omitempty"`
-	Side         string    `json:"side"` // buy / sell
-	Price        float64   `json:"price"`
-	SignalPrice  float64   `json:"signal_price,omitempty"`
-	Qty          int       `json:"qty"`
-	Amount       float64   `json:"amount"`
-	Time         time.Time `json:"time"`
+	StrategyType string    `json:"strategy_type,omitempty"` // 战法类型
+	Side         string    `json:"side"`                    // buy / sell
+	Price        float64   `json:"price"`                   // 价格
+	SignalPrice  float64   `json:"signal_price,omitempty"`  // 信号价
+	Qty          int       `json:"qty"`                     // 数量
+	Amount       float64   `json:"amount"`                  // 成交额
+	Time         time.Time `json:"time"`                    // 时间
 	// LatencySec 信号发出→成交 的秒数（买入时记录；量化信号时效性）。
 	// English: seconds from signal generation to fill (recorded on buys; quantifies signal timeliness).
-	LatencySec int64 `json:"latency_sec,omitempty"`
+	LatencySec int64 `json:"latency_sec,omitempty"` // 信号→成交延迟（秒）
 	// Fee 本笔成交费用（佣金+印花税，§R1/R2 费用入账审计字段；0=未收费）。
 	// English: fees charged on this fill (commission + stamp tax; audit field for fee accounting).
-	Fee    float64 `json:"fee,omitempty"`
-	Reason string  `json:"reason,omitempty"`
+	Fee    float64 `json:"fee,omitempty"`    // 本笔成交费用（佣金+印花税）
+	Reason string  `json:"reason,omitempty"` // 原因
 }
 
 // ── §R1/R2 费用模型（A股口径）───────────────────────────────────────────
@@ -261,20 +261,20 @@ func newOrderID() string {
 type EquityPoint struct {
 	Date  string  `json:"date"`  // YYYY-MM-DD
 	Value float64 `json:"value"` // 总资产 = 现金 + 持仓市值
-	Cash  float64 `json:"cash"`
+	Cash  float64 `json:"cash"`  // 现金
 }
 
 // Stats 绩效与信号质量汇总。
 // English: performance and signal-quality summary.
 type Stats struct {
-	InitialCapital float64 `json:"initial_capital"`
-	Cash           float64 `json:"cash"`
-	MarketValue    float64 `json:"market_value"`
-	TotalValue     float64 `json:"total_value"`
-	TotalReturnPct float64 `json:"total_return_pct"`
-	RealizedPnl    float64 `json:"realized_pnl"`
-	OpenPositions  int     `json:"open_positions"`
-	WinRatePct     float64 `json:"win_rate_pct"` // 已平仓胜率
+	InitialCapital float64 `json:"initial_capital"`  // 初始资金
+	Cash           float64 `json:"cash"`             // 现金
+	MarketValue    float64 `json:"market_value"`     // 市值
+	TotalValue     float64 `json:"total_value"`      // 总资产
+	TotalReturnPct float64 `json:"total_return_pct"` // 总收益率
+	RealizedPnl    float64 `json:"realized_pnl"`     // 已实现盈亏
+	OpenPositions  int     `json:"open_positions"`   // 持仓数
+	WinRatePct     float64 `json:"win_rate_pct"`     // 已平仓胜率
 	// 信号质量统计：买入信号→成交 的滑点与延迟
 	FilledBuys        int     `json:"filled_buys"`         // 已撮合的买入信号数
 	AvgSlippagePct    float64 `json:"avg_slippage_pct"`    // 平均滑点%（成交价相对信号价）
@@ -310,14 +310,14 @@ type StrategyPoolState struct {
 	// MaxPos 该池持仓上限（0=不单独设限，仅受全局上限约束；与全局解耦可自定义）。
 	// English: this pool's position cap (0 = no per-pool limit, only the global cap applies; decoupled
 	// from the global cap and customizable).
-	MaxPos    int     `json:"max_pos"`
+	MaxPos    int     `json:"max_pos"`    // 持仓上限
 	Cost      float64 `json:"cost"`       // 累计买入成本（按买入后计数，卖出不减）
 	Realized  float64 `json:"realized"`   // 已实现盈亏（卖出结算，仍记本池）
 	Floating  float64 `json:"floating"`   // 浮动盈亏（当前持仓市值 - 成本）
 	ReturnPct float64 `json:"return_pct"` // 总涨跌幅（%）= (已实现+浮动)/累计成本
 	Stats     Stats   `json:"stats"`      // 该池独立绩效/信号质量汇总（前端分仓 tab 统计卡用）
 	// BuyRule 该池当前生效的买入纪律快照（nil=未设置）。§A3 分仓设置弹窗预填用。
-	BuyRule *PoolBuyRule `json:"buy_rule,omitempty"`
+	BuyRule *PoolBuyRule `json:"buy_rule,omitempty"` // 该池买入纪律
 }
 
 // PoolPerf 一个战法资金池的持久化表现（成本基准 + 已实现盈亏）。
@@ -355,10 +355,10 @@ func strategyPoolLabel(t string) string {
 // English: the paper engine — virtual fill/mark/statistics, isolated from the real book.
 // path is the JSON persistence file (empty = in-memory only).
 type Engine struct {
-	cfg Config
+	cfg Config // 当前生效的模拟盘配置
 
-	mu             sync.Mutex
-	cash           float64
+	mu             sync.Mutex                // 保护引擎状态的互斥锁
+	cash           float64                   // 现金
 	pools          map[string]float64        // 战法资金池：key=策略类型（""=其他/手动池），Σpools == cash
 	poolTypes      []string                  // 启用的战法类型（不含 ""），保持有序；空=未分仓（单池）
 	poolPerf       map[string]*PoolPerf      // 战法资金池持久化表现：key=策略类型（买入累计成本/已实现盈亏）
@@ -367,15 +367,15 @@ type Engine struct {
 	poolDiscipline map[string]poolDiscipline // 运行时状态：每池今日买入计数/花费/最近时间
 	// §C 规则细分池：fac_1/pat_2 等 EnsurePool 开立的动态池 key 集合（SetStrategyPools
 	// 重建时必须合并保留，否则配置同步会把规则池冲掉）；labelFn 解析规则 ID → 显示名。
-	extraPoolKeys map[string]bool
+	extraPoolKeys map[string]bool // 规则细分池动态 key 集合
 	labelFn       func(string) string
-	positions     map[string]*Position
-	trades        []Trade
-	orders        []Order // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
-	equity        []EquityPoint
-	hasFilled     bool    // 是否发生过任何成交：false 期间 Snapshot 不记净值点（无买入不应有净值曲线）
-	realized      float64 // 已实现盈亏累计
-	path          string
+	positions     map[string]*Position // 持仓数
+	trades        []Trade              // trades
+	orders        []Order              // 订单生命周期（阶段1.3）：信号→订单→成交/拒绝 全留痕
+	equity        []EquityPoint        // equity
+	hasFilled     bool                 // 是否发生过任何成交：false 期间 Snapshot 不记净值点（无买入不应有净值曲线）
+	realized      float64              // 已实现盈亏累计
+	path          string               // path
 	// 账本镜像回调（阶段1.2 两本账合一）：paper 为唯一真实账本，开仓/清仓经回调同步写
 	// report 持仓账（由 engine/registry 注入），退出引擎/持仓页/打分池消费的 rpt 与模拟盘一致。
 	// onOpen 在新开仓后触发（含手动买入；加仓不触发）；onClose 仅在整笔清仓时触发（部分减仓不触发）。
@@ -391,7 +391,7 @@ type Engine struct {
 	// English: same-day trim dedup — code → "YYYYMMDD"; trim-type signals act at most once per code per
 	// trading day so repeated alerts can't keep halving the position. Full closes need no dedup (natural
 	// no-op once flat).
-	trimDone map[string]string
+	trimDone map[string]string // 当日减仓去重表（code → 交易日）
 }
 
 // New 创建模拟盘引擎并加载历史持久化数据。
@@ -786,15 +786,22 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 				continue
 			}
 		}
-		var price float64
-		if q, ok := quotes[s.Code]; ok && q != nil && q.Price > 0 {
-			price = q.Price
-		} else if s.Price > 0 {
-			// 行情缺失回退信号价（尽量避免该票长期滞留在参考价上；成交仍以实时优先）
-			price = s.Price
-		} else {
+		// §R3-3 P0-E 行情缺失一律拒绝撮合并留痕（对齐包头"不伪造成交"契约）：
+		// 此前行情缺失回退信号价成交——①以陈旧信号价制造虚假成交，污染净值/滑点统计/
+		// 盘后 paper_trades 研究落库；②下方涨停封板守卫依赖 quotes 命中，q==nil 时
+		// 整体短路，涨停恰好断流的股票可被虚拟买入。现无有效实时价即 rejected 留痕，
+		// 两个问题一并根除（能走到撮合的必然有行情，涨停守卫必然生效）。
+		// English: R3-3 P0-E — no valid live quote → reject with an audit record (per the package
+		// header contract "never fabricate fills"); also un-short-circuits the limit-up guard.
+		q, hasQuote := quotes[s.Code]
+		if !hasQuote || q == nil || q.Price <= 0 {
+			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+				StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
+				SignalPrice: s.Price, Status: "rejected",
+				Reason: "行情缺失跳过(不伪造成交)", CreatedAt: now})
 			continue
 		}
+		price := q.Price
 		// §R0.4b 涨停封板拒买（自动信号路径，与手动 Buy 同守卫）：
 		// 封板股买单在现实中几乎无法排队成交——002412 实录：4 连板 09:30 首封，
 		// 龙头识别 10:15 发信号被瞬间以涨停价撮合，制造"买后必涨"的虚假胜率。
@@ -1196,6 +1203,15 @@ func (e *Engine) addToPositionLocked(p *Position, code, name, strategy string, s
 	pool := e.pools[poolKey]
 	if cost+fee > pool {
 		return errCash
+	}
+	// §P1-I 分仓纪律一致性：手动加仓与首买、信号买入走同一套纪律——此前 addToPositionLocked
+	// 只 recordPoolBuy（记账）却跳过了冷却/日限/预算前置检查，导致同池加仓可绕过纪律闸门。
+	// 手动加仓 confidence=1.0，与手动买入一致不受评分门槛约束，但冷却/日限/预算仍生效。
+	if reason := e.checkPoolDisciplinePre(poolKey, 1.0); reason != "" {
+		return fmt.Errorf("%w: %s", errPoolDiscipline, reason)
+	}
+	if reason := e.checkPoolBudget(poolKey, cost); reason != "" {
+		return fmt.Errorf("%w: %s", errPoolDiscipline, reason)
 	}
 	e.pools[poolKey] = pool - cost - fee
 	e.cash -= cost + fee
@@ -1734,9 +1750,13 @@ func (e *Engine) ResetPool(key string) {
 		e.cash += proceeds
 	}
 	if e.poolPerf[key] != nil {
-		e.poolPerf[key].Cost = 0
-		e.poolPerf[key].Realized = 0
+		// §P1-I 一致性：单池清盘后该池累计表现（含胜率计数/成本/已实现）整块归零，
+		// 此前只清了 Cost/Realized，WinRate 等派生计数残留导致清盘后统计失真。
+		e.poolPerf[key] = &PoolPerf{}
 	}
+	// §P1-I 一致性：清掉该池当日纪律计数（次数/花费/冷却），否则同日再次清盘后
+	// 旧 spentToday/lastBuyAt 仍生效 → 预算/冷却误判把新开仓挡在门外。
+	delete(e.poolDiscipline, key)
 	// 清掉该池成交记录（该池已清盘，避免统计仍从全局日志累出信号数）
 	// English: drop the pool's fills (the pool is liquidated, so stats must not count its fills again).
 	if len(e.trades) > 0 {

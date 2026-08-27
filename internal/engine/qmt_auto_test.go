@@ -232,7 +232,7 @@ func TestAutoExecuteRealSells(t *testing.T) {
 	advices := []trading.PositionAdvice{
 		{Code: "600000", TsCode: "600000.SH", Action: "止损", Level: "高", RefPrice: 9.0, Reason: "破位止损"},
 	}
-	e.autoExecuteRealSells(ctrl, db, advices)
+	e.autoExecuteRealSells(e.UserID(), ctrl, db, advices)
 	if len(*orders) != 1 {
 		t.Fatalf("止损建议应自动卖出 1 单, got %d", len(*orders))
 	}
@@ -241,15 +241,34 @@ func TestAutoExecuteRealSells(t *testing.T) {
 		t.Fatalf("应全仓卖出 500 股: %+v", o)
 	}
 	// 同日重发 → signal_id 幂等命中，不再下单
-	e.autoExecuteRealSells(ctrl, db, advices)
+	e.autoExecuteRealSells(e.UserID(), ctrl, db, advices)
 	if len(*orders) != 1 {
 		t.Fatalf("同日同类卖单应幂等防重, got %d", len(*orders))
 	}
 	// 非止损类不触发
 	tp := []trading.PositionAdvice{{Code: "600000", TsCode: "600000.SH", Action: "止盈", Level: "高", RefPrice: 12}}
-	e.autoExecuteRealSells(ctrl, db, tp)
+	e.autoExecuteRealSells(e.UserID(), ctrl, db, tp)
 	if len(*orders) != 1 {
 		t.Fatalf("止盛建议不应自动卖出, got %d", len(*orders))
+	}
+}
+
+// TestAutoSellCrossAccountIsolation §R3-1 P0-B 回归：他账号持仓不得被本账号的
+// 止损建议匹配卖出——A 账号引擎对 600519 出止损建议，但该持仓归属 user_b，
+// autoExecuteRealSells 必须读不到（RealPositionsForUser 过滤），零下单。
+func TestAutoSellCrossAccountIsolation(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.AutoSell = true })
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600519.SH", Name: "茅台", Qty: 100, CostPrice: 1500, Amount: 150000, UserID: "user_b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	advices := []trading.PositionAdvice{
+		{Code: "600519", TsCode: "600519.SH", Action: "止损", Level: "高", RefPrice: 1400, Reason: "破位"},
+	}
+	e.autoExecuteRealSells(e.UserID(), e.QMTController(), db, advices)
+	if len(*orders) != 0 {
+		t.Fatalf("他账号持仓不应被本账号止损建议卖出, got %d orders", len(*orders))
 	}
 }
 
@@ -262,7 +281,7 @@ func TestAutoSellDisabledSkips(t *testing.T) {
 		t.Fatal(err)
 	}
 	advices := []trading.PositionAdvice{{Code: "600000", TsCode: "600000.SH", Action: "止损", RefPrice: 9}}
-	e.autoExecuteRealSells(e.QMTController(), db, advices)
+	e.autoExecuteRealSells(e.UserID(), e.QMTController(), db, advices)
 	if len(*orders) != 0 {
 		t.Fatalf("auto_sell=false 不应下单, got %d", len(*orders))
 	}

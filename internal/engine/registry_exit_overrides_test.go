@@ -13,6 +13,7 @@ import (
 	"quant-trading-v2/internal/config"
 )
 
+// TestNewAccountRunnersSeedsExitOverrides 创建AccountRunnersSeedsExitOverrides。
 func TestNewAccountRunnersSeedsExitOverrides(t *testing.T) {
 	dir := t.TempDir()
 	entry := map[string]any{

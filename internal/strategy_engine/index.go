@@ -1,3 +1,4 @@
+// Package strategy_engine 策略引擎库：K 线链处理、热点构建、动态附加实时 bar、索引维护等策略计算基础设施。
 package strategy_engine
 
 import (

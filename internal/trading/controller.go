@@ -9,7 +9,6 @@ package trading
 import (
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,7 +21,13 @@ import (
 // Controller 交易执行控制器。
 // English: Controller is the trade execution controller.
 type Controller struct {
-	mu sync.RWMutex
+	mu sync.RWMutex // 保护控制器状态字段的读写锁
+
+	// §R3-1 P0-C 下单互斥：PlaceOrder 的 守卫检查→占位落库→网关下单→单号回填 整段串行化。
+	// 此前三步之间存在 TOCTOU 窗口——两个不同 signal_id 的并发请求都能通过预算预检后
+	// 双双真实下单（超预算）；HTTP 手动入口与引擎自动入口并存时是现实资损风险。
+	// 只串行化下单路径（HealthCheck/StateSnapshot 等读路径不取该锁），单实盘账户场景无吞吐损失。
+	orderMu sync.Mutex // 下单路径互斥锁
 
 	exec            Executor         // 下单执行器（真实网关 / noop）
 	store           *store.DB        // 研究库（real_positions/orders/fills 落库）
@@ -31,11 +36,11 @@ type Controller struct {
 	lastReconcileAt time.Time        // §W6-a 上次主动对账时间（节流用）
 
 	// 熔断状态：tripped=true 表示网关失联/心跳超时，暂停一切新下单
-	tripped      bool
-	tripAt       time.Time
-	tripReason   string
+	tripped      bool      // 是否处于熔断状态
+	tripAt       time.Time // 熔断触发时间
+	tripReason   string    // 熔断原因
 	lastHealthAt time.Time // 最近一次健康探测时间（节流）
-	lastHealthy  bool
+	lastHealthy  bool      // 最近一次健康探测是否成功
 	lastFailAt   time.Time // 最近一次失败探测时间（熔断判定窗口用）
 
 	// 互通健康展示数据（仪表盘-系统）：下行=首尔探测广州网关，上行=广州网关回报到首尔。
@@ -44,10 +49,10 @@ type Controller struct {
 	lastReportKind string    // 最近一次回报类型（trade/order/positions/disconnect）
 
 	// §ROBUST 早期预警：健康→失败的首跳立即告警（区别于熔断的 high 级），恢复后复位。
-	warnedUnhealthy bool
+	warnedUnhealthy bool // 是否已发出过健康转失败早期预警
 
 	// 通知回调（告警熔断/恢复）：由上层注入（SSE/notify）。
-	onAlert func(level, title, content string)
+	onAlert func(level, title, content string) // 告警回调（可空）
 }
 
 // NewController 创建控制器。onAlert 可空。
@@ -121,17 +126,17 @@ func (c *Controller) SetLastReport(kind string) {
 // English: connectivity snapshot for the dashboard/system row and quant page — downlink probe
 // state plus uplink report freshness; zero times mean "never happened".
 type StateSnapshot struct {
-	Enabled        bool      `json:"enabled"`
-	Mode           string    `json:"mode"`
-	Tripped        bool      `json:"tripped"`
-	TripReason     string    `json:"trip_reason"`
-	TripAt         time.Time `json:"trip_at"`
-	GatewayURL     string    `json:"gateway_url"`
-	LastProbeAt    time.Time `json:"last_probe_at"`
-	LastProbeOK    bool      `json:"last_probe_ok"`
-	LastLatencyMs  int64     `json:"last_latency_ms"`
-	LastReportAt   time.Time `json:"last_report_at"`
-	LastReportKind string    `json:"last_report_kind"`
+	Enabled        bool      `json:"enabled"`          // 是否启用
+	Mode           string    `json:"mode"`             // 执行模式
+	Tripped        bool      `json:"tripped"`          // 是否熔断
+	TripReason     string    `json:"trip_reason"`      // 熔断原因
+	TripAt         time.Time `json:"trip_at"`          // 熔断触发时间
+	GatewayURL     string    `json:"gateway_url"`      // 网关地址
+	LastProbeAt    time.Time `json:"last_probe_at"`    // 最近一次探测时间
+	LastProbeOK    bool      `json:"last_probe_ok"`    // 最近一次探测是否成功
+	LastLatencyMs  int64     `json:"last_latency_ms"`  // 最近一次探测延迟毫秒
+	LastReportAt   time.Time `json:"last_report_at"`   // 最近一次上行回报时间
+	LastReportKind string    `json:"last_report_kind"` // 最近一次上行回报类型
 }
 
 // Snapshot 返回当前互通健康快照（纯读，不加锁副作用）。
@@ -278,6 +283,10 @@ func (c *Controller) fireOnAlert(level, title, content string) {
 // all guards (ST / daily discipline / whitelist / position cap) run BEFORE the pending ticket is
 // persisted so rejected orders never leave phantom rows; a signal_id already in the table short-circuits.
 func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
+	// §R3-1 P0-C 下单互斥：整段串行化（见结构体字段注释）。
+	c.orderMu.Lock()
+	defer c.orderMu.Unlock()
+
 	if c.Tripped() {
 		return nil, fmt.Errorf("qmt circuit-breaker open: %s", c.tripReasonLocked())
 	}
@@ -334,9 +343,11 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 		}
 	}
 
-	// 仓位上限校验：max_positions>0 且当前持仓数已达上限时，仅允许卖出
+	// 仓位上限校验：max_positions>0 且当前持仓数已达上限时，仅允许卖出。
+	// §R3-1 P0-B 按账号过滤：此前读全表 RealPositions()，多账号部署下 A 的持仓上限被 B 的
+	// 持仓占满（误拒）。与插入侧 §W2-10 的 UserID 盖章对齐，读取侧统一走 ForUser。
 	if cfg.MaxPositions > 0 && req.Side == SideBuy {
-		poses, err := c.store.RealPositions()
+		poses, err := c.store.RealPositionsForUser(c.userID)
 		if err != nil {
 			return nil, err
 		}
@@ -401,6 +412,21 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 		}
 		return nil, err
 	}
+	// §R3-1 P0-A 业务拒单兜底：网关返回 200+ok:false（券商侧拒绝：资金不足/废单等）时
+	// err 为 nil，旧实现直接落到"回填单号"分支——占位行永远停留"已报"，既虚耗当日买入纪律
+	// 预算（幽灵已报行），又永不满足 ResetFailedRealOrder 的重置条件（该 signal_id 整天封死）。
+	// 与 §GAP2-W1 的传输失败降级同口径处理：降级为"发送失败"，下次同键重试可放行。
+	// duplicate 形态在上方 existed 分支已经提前返回，不会进入这里。
+	// English: R3-1 P0-A — on a 200+ok:false business rejection (nil error), demote the placeholder
+	// from 已报 to 发送失败 so it stops polluting buy-discipline accounting and the same signal_id can
+	// be retried later; duplicates never reach here (handled above).
+	if res != nil && !res.OK {
+		if merr := c.store.MarkRealOrderSendFailed(req.SignalID); merr != nil {
+			log.Printf("[trading] mark send-failed (business reject) %s: %v", req.SignalID, merr)
+		}
+		log.Printf("[trading] %s 网关业务拒单: %s（占位行已降级发送失败，可重试）", req.SignalID, res.Err)
+		return res, nil
+	}
 	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）
 	if res.OrderID != "" {
 		if err := c.store.UpdateRealOrderBySignalID(req.SignalID, res.OrderID, "已报"); err != nil {
@@ -410,25 +436,12 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 	return res, nil
 }
 
-// blacklisted §GAP1.7 黑名单比对：条目与请求代码均剥离后缀后按纯数字前缀匹配。
-// English: blacklisted matches after stripping exchange suffixes on both sides.
+// blacklisted §GAP1.7 黑名单比对：统一委托给 config.CodeInBlacklist（§R3-8 P1-H 唯一权威实现，
+// 后缀剥离双向归一）。保留包内别名以兼容既有调用与测试。
+// English: §GAP1.7 blacklist check — delegates to the canonical config.CodeInBlacklist
+// (R3-8 P1-H) so the risk layer and the execution layer share one matching semantic.
 func blacklisted(list []string, code string) bool {
-	if len(list) == 0 || code == "" {
-		return false
-	}
-	pure := func(c string) string {
-		if i := strings.IndexByte(c, '.'); i > 0 {
-			c = c[:i]
-		}
-		return strings.TrimSpace(c)
-	}
-	pc := pure(code)
-	for _, item := range list {
-		if pi := pure(item); pi != "" && pi == pc {
-			return true
-		}
-	}
-	return false
+	return config.CodeInBlacklist(list, code)
 }
 
 // checkBuyDiscipline §GAP1.3/1.4 买入纪律预检：单日买入笔数上限、单日买入预算、近似可用资金。
@@ -499,17 +512,38 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 	return nil
 }
 
-// Reconcile 从网关拉取全量持仓/委托并落库（对账）。网关不可达时返回错误（不落库）。
-// English: Reconcile pulls full positions/orders from the gateway and persists them (reconciliation).
-// Returns an error (without persisting) when the gateway is unreachable.
+// Reconcile 从网关拉取全量持仓并落库（对账）。网关不可达时返回错误（不落库）。
+// §R3-8 P1-G 三处收口：
+//  1. 空快照守卫——网关 /state 在通道断连时也返回空列表（broker.py），不可信快照
+//     禁止清账：仅 Connected=true 时才接受"全平"语义；
+//  2. 清仓落库——此前 len==0 直接跳过，本地 real_positions 永不清除，陈旧行持续影响
+//     Advise/仓位上限；现走用户隔离的 ReconcilePositionsForUser 清理本账号行；
+//  3. 用户隔离——只动 本账号 ∪ 遗留全局 行，绝不清其他账号的 scoped 行。
+//
+// English: R3-8 P1-G — empty snapshots are only trusted when the gateway reports connected;
+// a fully-flat book now clears local rows via user-scoped reconciliation (legacy rows included,
+// other accounts' rows never touched).
 func (c *Controller) Reconcile() error {
 	st, err := c.exec.State()
 	if err != nil {
 		return err
 	}
-	if c.store != nil && len(st.Positions) > 0 {
-		if _, err := c.store.UpsertRealPositions(st.Positions); err != nil {
-			return err
+	if c.store == nil {
+		return nil
+	}
+	if len(st.Positions) == 0 && !st.Connected {
+		log.Printf("[trading] 对账跳过: 网关未连接且持仓快照为空（不可信，禁止清账）")
+		return nil
+	}
+	if _, err := c.store.ReconcilePositionsForUser(c.userID, st.Positions); err != nil {
+		return err
+	}
+	// 委托流水对账（此前 State 拉回即丢）：仅记日志差异告警，自动纠偏仍留给回报线程。
+	if len(st.Orders) > 0 {
+		local, _ := c.store.RealOrders()
+		if len(local) != len(st.Orders) {
+			log.Printf("[trading] 对账差异: 网关委托 %d 笔 vs 本地 %d 笔（以回报线程为准，仅告警）",
+				len(st.Orders), len(local))
 		}
 	}
 	return nil

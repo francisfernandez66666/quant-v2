@@ -9,6 +9,7 @@ import (
 	"testing"
 )
 
+// TestClientIPUntrustedPeerIgnoresXFF 客户端IPUntrustedPeerIgnoresXFF。
 func TestClientIPUntrustedPeerIgnoresXFF(t *testing.T) {
 	// 模拟公网直连 8080：对端是公网 IP，XFF 无论怎么伪造都必须被无视。
 	r := httptestReq("203.0.113.7:54321", "1.2.3.4, 8.8.8.8")
@@ -17,6 +18,7 @@ func TestClientIPUntrustedPeerIgnoresXFF(t *testing.T) {
 	}
 }
 
+// TestClientIPTrustedProxyWalksRightToLeft 客户端IPTrustedProxyWalksRight到Left。
 func TestClientIPTrustedProxyWalksRightToLeft(t *testing.T) {
 	// Caddy 同机反代：对端 127.0.0.1 可信，XFF="真实客户端, 中间跳(内网)" → 取最右不可信。
 	r := httptestReq("127.0.0.1:8080", "198.51.100.9, 10.0.0.3")
@@ -31,6 +33,7 @@ func TestClientIPTrustedProxyWalksRightToLeft(t *testing.T) {
 	}
 }
 
+// TestClientIPNoHeaderBehindProxy 客户端IPNoHeaderBehindProxy。
 func TestClientIPNoHeaderBehindProxy(t *testing.T) {
 	r := httptestReq("127.0.0.1:8080", "")
 	if got := clientIP(r); got != "127.0.0.1" {

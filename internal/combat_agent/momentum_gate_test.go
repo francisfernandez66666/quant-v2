@@ -16,11 +16,15 @@ import (
 // English: fakeDragonStrategy is a fake dragon strategy that always returns full_chain Pass, used to isolate the momentum "alert only on improvement" gate (the dragon strategy does not apply the double-bump second-wave confirmation gate, so the momentum gate can be tested cleanly).
 type fakeDragonStrategy struct{}
 
+// Name 返回测试桩战法名称 "fake_dragon"。
 func (fakeDragonStrategy) Name() string              { return "fake_dragon" }
+// Type 返回战法信号类型 SignalDragon。
 func (fakeDragonStrategy) Type() strategy.SignalType { return strategy.SignalDragon }
+// Evaluate 固定返回 full_chain Pass（TotalScore=80），用于隔离动量"提升才提醒"门槛。
 func (fakeDragonStrategy) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Level: "full_chain", Pass: true, TotalScore: 80, Confidence: 0.7}, nil
 }
+// GenerateSignal 返回龙头买入信号（Price=12.0）。
 func (fakeDragonStrategy) GenerateSignal(code string, _ *strategy.Evaluation) (*strategy.Signal, error) {
 	return &strategy.Signal{Code: code, Name: "龙头", Action: strategy.ActionBuy, Price: 12.0, Confidence: 0.7, Reason: "full_chain"}, nil
 }

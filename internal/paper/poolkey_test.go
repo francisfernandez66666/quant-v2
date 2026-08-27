@@ -1,3 +1,4 @@
+// Package paper 独立模拟盘（纸面交易）引擎：把策略信号按实时价撮合成虚拟持仓，产出净值曲线并记录滑点/延迟，与真实持仓完全隔离。
 package paper
 
 import (
@@ -36,6 +37,7 @@ func TestPoolKeyForStrategy(t *testing.T) {
 	}
 }
 
+// TestApplyPoolMinScoreMergeAndClear 应用池最小评分合并和Clear。
 func TestApplyPoolMinScoreMergeAndClear(t *testing.T) {
 	e := New(testCfg(), "")
 	e.SetStrategyPools([]string{"dragon"})
@@ -99,6 +101,7 @@ func TestSetPoolBuyRulePersistedAcrossReload(t *testing.T) {
 	}
 }
 
+// TestEnsurePoolConservation Ensure池Conservation。
 func TestEnsurePoolConservation(t *testing.T) {
 	e := New(testCfg(), "")
 	e.SetStrategyPools([]string{"dragon", "n_shape"})
@@ -134,6 +137,7 @@ func TestEnsurePoolConservation(t *testing.T) {
 	}
 }
 
+// TestRulePoolSignalRoutingAndLabel Rule池信号Routing和Label。
 func TestRulePoolSignalRoutingAndLabel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "paper_state.json")
 	e := New(testCfg(), path)

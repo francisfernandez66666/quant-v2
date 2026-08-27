@@ -1,3 +1,4 @@
+// Package scheduler 研究调度器：按交易时段/盘后/周末调度 dataload、回测、因子挖掘等研究任务，管理子进程生命周期。
 package scheduler
 
 import (
@@ -47,6 +48,7 @@ func cfgSamples(fakeBin, db string) config.SchedulerConfig {
 	}
 }
 
+// TestNightlyEligible NightlyEligible。
 func TestNightlyEligible(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	cfg := cfgSamples("fake", "/tmp/x.db")
@@ -86,6 +88,7 @@ func TestNightlyEligible(t *testing.T) {
 	}
 }
 
+// TestTradingDataloadDue TradingDataloadDue。
 func TestTradingDataloadDue(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	base := time.Date(2026, 8, 18, 10, 0, 0, 0, loc) // 周二 10:00 盘中
@@ -120,6 +123,7 @@ func TestTradingDataloadDue(t *testing.T) {
 	}
 }
 
+// TestLoadSchedulerConfigMerge 加载Scheduler配置合并。
 func TestLoadSchedulerConfigMerge(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -146,6 +150,7 @@ func TestLoadSchedulerConfigMerge(t *testing.T) {
 	}
 }
 
+// TestLoadSchedulerConfigBacktest 加载Scheduler配置Backtest。
 func TestLoadSchedulerConfigBacktest(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -172,12 +177,12 @@ func TestLoadSchedulerConfigBacktest(t *testing.T) {
 	}
 }
 
+// TestNightlyBacktestStepInserted NightlyBacktestStepInserted。
 func TestNightlyBacktestStepInserted(t *testing.T) {
 	t.Setenv("FAKE_SLEEP", "0")
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	fake := fakeScript(t, logPath)
 	db := filepath.Join(dir, "trading.db")
 	cfg := cfgSamples(fake, db)
 	cfg.Nightly.BacktestEnabled = true
@@ -199,8 +204,10 @@ func TestNightlyBacktestStepInserted(t *testing.T) {
 	if got := callCount(t, logPath); got != 3 {
 		t.Errorf("BacktestEnabled 应追加 backtest+library_replay 使调用次数=3, 实际 %d", got)
 	}
+	waitIdleAndSettle(t, s)
 }
 
+// TestInsertAfter InsertAfter。
 func TestInsertAfter(t *testing.T) {
 	got := insertAfter([]string{"a", "discover_factors", "c"}, "discover_factors", "backtest")
 	if len(got) != 4 || got[2] != "backtest" {
@@ -217,6 +224,7 @@ func TestInsertAfter(t *testing.T) {
 	}
 }
 
+// TestLoadSchedulerConfigMissing 加载Scheduler配置Missing。
 func TestLoadSchedulerConfigMissing(t *testing.T) {
 	got := config.LoadSchedulerConfig("/nonexistent/config.json")
 	if !got.Enabled {
@@ -224,18 +232,26 @@ func TestLoadSchedulerConfigMissing(t *testing.T) {
 	}
 }
 
-// fakeScript 生成一个可记录调用并可选 sleep 的假二进制。
-func fakeScript(t *testing.T, dir string) string {
+// fakeScript 生成一个可记录调用并可选 sleep 的假二进制；logPath 为该脚本的写入目标
+// （与调用方的 callCount 使用同一路径）。§flaky 根修（R3-8 P1-M）：日志路径直接烘焙进
+// 脚本内容——此前脚本运行时读进程级 $FAKE_LOG，而上一条测试遗留的后台 goroutine
+// （dataload/worker 排水协程）可能在本测试已改写 FAKE_LOG 后才执行其旧脚本，把调用行
+// 追加进【当前测试】的日志文件污染计数（全量跑挂、单跑过）。烘焙后跨测试零串扰。
+func fakeScript(t *testing.T, logPath string) string {
 	t.Helper()
-	script := filepath.Join(dir, "fakebin.sh")
-	content := `#!/bin/sh
-echo "FAKE $@" >> "$FAKE_LOG"
-if [ -n "$FAKE_SLEEP" ]; then sleep "$FAKE_SLEEP"; fi
-`
+	script := filepath.Join(filepath.Dir(logPath), "fakebin.sh")
+	content := "#!/bin/sh\n" +
+		"echo \"FAKE $@\" >> " + shQuote(logPath) + "\n" +
+		"if [ -n \"$FAKE_SLEEP\" ]; then exec sleep \"$FAKE_SLEEP\"; fi\n"
 	if err := os.WriteFile(script, []byte(content), 0755); err != nil {
 		t.Fatal(err)
 	}
 	return script
+}
+
+// shQuote 单引号包裹 shell 字符串（测试路径不含单引号，简单转义足够）。
+func shQuote(s string) string {
+	return "'" + s + "'"
 }
 
 func callCount(t *testing.T, logPath string) int {
@@ -266,6 +282,21 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 	t.Fatalf("超时: %s", msg)
 }
 
+// waitIdleAndSettle §flaky 根修（R3-8 P1-M）收尾助手：等待调度器全部后台作业结束
+// （busy + 交易时段下载通道均空闲），再沉降一小段让尾部的状态/日志落盘完成。
+// 背景：worker/dataload 的异步 goroutine 若在 t.TempDir() 清理之后仍写文件，
+// RemoveAll 报 "directory not empty" 直接判 FAIL——断言全过也挂，且只在全量跑时
+// 因前序测试拖慢时序而偶发。所有手动 tick 驱动后台作业的测试收尾都应调用本助手。
+func waitIdleAndSettle(t *testing.T, s *Scheduler) {
+	t.Helper()
+	waitFor(t, 30*time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return !s.busy && !s.tradingDLBusy
+	}, "后台作业应全部结束（TempDir 清理前）")
+	time.Sleep(250 * time.Millisecond)
+}
+
 // busyLocked 竞争安全读取 busy 标志（§flaky 修复：后台排水 goroutine 在 s.mu 锁内写 busy，
 // 测试轮询必须持锁读，否则 -race 报数据竞争且偶发误判）。
 // English: race-safe read of the busy flag — the self-drain goroutine writes it under s.mu,
@@ -276,12 +307,12 @@ func (s *Scheduler) busyLocked() bool {
 	return s.busy
 }
 
+// TestNightlyJobRunsAndCompletes NightlyJobRuns和Completes。
 func TestNightlyJobRunsAndCompletes(t *testing.T) {
 	t.Setenv("FAKE_SLEEP", "0")
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	fake := fakeScript(t, logPath)
 	db := filepath.Join(dir, "trading.db")
 	cfgPath := mustConfig(t, cfgSamples(fake, db))
 	statePath := filepath.Join(dir, "research_state.json")
@@ -298,14 +329,15 @@ func TestNightlyJobRunsAndCompletes(t *testing.T) {
 	if callCount(t, logPath) < 1 {
 		t.Errorf("假二进制应被调用至少一次, 实际 %d", callCount(t, logPath))
 	}
+	waitIdleAndSettle(t, s)
 }
 
+// TestNightlyJobKilledAtTradingOpen NightlyJobKilled在TradingOpen。
 func TestNightlyJobKilledAtTradingOpen(t *testing.T) {
-	t.Setenv("FAKE_SLEEP", "120") // 步骤长时间运行，方便观察 kill
+	t.Setenv("FAKE_SLEEP", "5") // 步骤长时间运行，方便观察 kill
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	fake := fakeScript(t, logPath)
 	db := filepath.Join(dir, "trading.db")
 	cfgPath := mustConfig(t, cfgSamples(fake, db))
 	statePath := filepath.Join(dir, "research_state.json")
@@ -328,14 +360,15 @@ func TestNightlyJobKilledAtTradingOpen(t *testing.T) {
 		defer s.mu.Unlock()
 		return !s.busy
 	}, "交易时段应终止夜间作业")
+	waitIdleAndSettle(t, s)
 }
 
+// TestTradingDataloadThrottled TradingDataloadThrottled。
 func TestTradingDataloadThrottled(t *testing.T) {
 	t.Setenv("FAKE_SLEEP", "0")
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	fake := fakeScript(t, logPath)
 	db := filepath.Join(dir, "trading.db")
 	cfg := cfgSamples(fake, db)
 	cfg.DataloadDuringTrade = config.DataloadDuringTradeConfig{Enabled: true, IntervalMinutes: 30}
@@ -376,15 +409,19 @@ func TestTradingDataloadThrottled(t *testing.T) {
 	if afterLast != ts1 {
 		t.Fatalf("盘后不应更新交易时段下载时间戳: %d vs %d", afterLast, ts1)
 	}
+
+	// §flaky 根修收尾：等待全部后台作业排空再返回——此前异步 dataload/worker goroutine
+	// 可能在 t.TempDir() 清理【之后】仍向日志文件写入（echo 重建文件），RemoveAll 报
+	// "directory not empty" 直接判 FAIL（断言全过也挂：全量跑挂、单跑过的真凶）。
+	waitIdleAndSettle(t, s)
 }
 
 // TestNightlyCrossDayReplacesJob 周五作业跨天仍在跑 → 周六 15:30 应被终止并启动周六作业（保证周末各一轮）。
 func TestNightlyCrossDayReplacesJob(t *testing.T) {
-	t.Setenv("FAKE_SLEEP", "120")
+	t.Setenv("FAKE_SLEEP", "5")
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	fake := fakeScript(t, logPath)
 	db := filepath.Join(dir, "trading.db")
 	cfgPath := mustConfig(t, cfgSamples(fake, db))
 	statePath := filepath.Join(dir, "research_state.json")
@@ -407,15 +444,21 @@ func TestNightlyCrossDayReplacesJob(t *testing.T) {
 		defer s.mu.Unlock()
 		return s.state.Day == "20260822" && s.busy
 	}, "周六 15:30 应替换为周六作业")
+
+	// §flaky 根修：120s 长睡的子进程仍在跑，必须显式终止再等排空，否则 TempDir 清理时
+	// 进程仍持有目录内文件 → "directory not empty" 判 FAIL。preemptCurrent 会 SIGKILL 子进程
+	// 并落终态使 busy 归位（仅置 cancelReq 无效——那是给控制轮询 goroutine 用的，测试直接置位
+	// 不会触发 killProcessGroup）。
+	s.preemptCurrent("测试收尾")
+	waitIdleAndSettle(t, s)
 }
 
 func TestRunCancelsJob(t *testing.T) {
 	// Run(ctx) 退出时应 kill 正在运行的作业（CommandContext 取消）
-	t.Setenv("FAKE_SLEEP", "120")
+	t.Setenv("FAKE_SLEEP", "5")
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	fake := fakeScript(t, logPath)
 	db := filepath.Join(dir, "trading.db")
 	cfgPath := mustConfig(t, cfgSamples(fake, db))
 	statePath := filepath.Join(dir, "research_state.json")

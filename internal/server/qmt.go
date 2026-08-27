@@ -98,7 +98,10 @@ func (s *Server) qmtCtrlFor(userID string) *trading.Controller {
 func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	db := s.researchDB
 	if db == nil {
-		writeError(w, 200, "real book not available")
+		// §白板修复：此前 writeError(w, 200, …) 返回 HTTP 200 + {"error":…}——前端 request()
+		// 只把非 2xx 当失败，成功路径把 {error} 塞给模板渲染 undefined 属性直接白屏。
+		// 错误必须配错误状态码，让前端 try/catch 生效。
+		writeError(w, http.StatusServiceUnavailable, "real book not available")
 		return
 	}
 	// §GAP1.10 按账号过滤（遗留全局行 user_id='' 对所有人可见，兼容存量部署）
@@ -130,12 +133,12 @@ func ctrlMode(c *trading.Controller) string {
 func (s *Server) handleRealAdvice(w http.ResponseWriter, r *http.Request) {
 	c := s.ctrlFor(userIDFor(r))
 	if c == nil {
-		writeError(w, 200, "engine not available")
+		writeError(w, http.StatusServiceUnavailable, "engine not available")
 		return
 	}
 	db := s.researchDB
 	if db == nil {
-		writeError(w, 200, "real book not available")
+		writeError(w, http.StatusServiceUnavailable, "real book not available")
 		return
 	}
 	positions, err := db.RealPositions()
@@ -612,7 +615,9 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
 	db := s.researchDB
 	if db == nil {
-		writeError(w, 200, "real book not available")
+		// §白板修复：同 handleRealPositions——200+{"error"} 会让前端把错误体当成功数据
+		// 渲染（trades.summary 为 undefined → TypeError → 整页白屏）。改 503 走前端失败分支。
+		writeError(w, http.StatusServiceUnavailable, "real book not available")
 		return
 	}
 	allFills, err := db.RealFills()

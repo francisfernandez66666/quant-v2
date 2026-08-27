@@ -12,10 +12,10 @@ import (
 
 // D1ScoreRow 一条 D1 评分落库行（与 combat_agent.D1Score 字段解耦，避免反向依赖）。
 type D1ScoreRow struct {
-	Code    string
-	Score   float64
-	Blocked bool
-	Reason  string
+	Code    string  // 代码
+	Score   float64 // 评分
+	Blocked bool    // 是否阻断
+	Reason  string  // 原因
 }
 
 // UpsertD1Scores 批量幂等写入某日期的 D1 评分（同 date+code 覆盖，保留最新一轮）。

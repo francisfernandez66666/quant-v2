@@ -199,9 +199,13 @@ type failingExecutor struct{}
 func (failingExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) {
 	return nil, context.DeadlineExceeded
 }
+
+// PlaceSell PlaceSell。
 func (failingExecutor) PlaceSell(req OrderRequest) (*OrderResult, error) {
 	return nil, context.DeadlineExceeded
 }
 func (failingExecutor) Cancel(orderID string) error   { return context.DeadlineExceeded }
 func (failingExecutor) State() (*GatewayState, error) { return nil, context.DeadlineExceeded }
-func (failingExecutor) Health() (bool, error)         { return false, context.DeadlineExceeded }
+
+// Health Health。
+func (failingExecutor) Health() (bool, error) { return false, context.DeadlineExceeded }

@@ -1,3 +1,4 @@
+// Package store 数据持久化层：封装 SQLite 读写，提供策略候选、回测、持仓、订单、研究任务等表的 CRUD。
 package store
 
 import (
@@ -16,6 +17,7 @@ func seedSweepResults() []map[string]any {
 	}
 }
 
+// TestOptimizationResultsCRUD OptimizationResultsCRUD。
 func TestOptimizationResultsCRUD(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"))

@@ -1,3 +1,4 @@
+// Package server HTTP API 服务器：为前端/网关提供 REST 接口、SSE 推送、量化研究、模拟盘、QMT 回报等路由。
 package server
 
 import (
@@ -9,6 +10,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// TestOptimizationsJSONShape OptimizationsJSONShape。
 func TestOptimizationsJSONShape(t *testing.T) {
 	db, _ := store.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer db.Close()

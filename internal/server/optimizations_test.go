@@ -32,6 +32,7 @@ func seedOptLib(t *testing.T, dir string) {
 	}
 }
 
+// TestOptimizationEndpoints OptimizationEndpoints。
 func TestOptimizationEndpoints(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "trading.db"))

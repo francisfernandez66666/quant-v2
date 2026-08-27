@@ -46,9 +46,9 @@ func (d *DB) IndustryConstituents(industry, date string) ([]string, error) {
 // LimitUpCountRow 区间涨停统计的一行：某交易日某行业的涨停家数。
 // English: one row of range limit-up stats — count per (trade-date, industry).
 type LimitUpCountRow struct {
-	Date     string
-	Industry string
-	Count    int
+	Date     string // 日期
+	Industry string // 行业
+	Count    int    // 数量
 }
 
 // LimitUpCountsRange 区间版涨停统计（性能关键）：单日版逐日查询在 742 个交易日上
@@ -80,6 +80,7 @@ func (d *DB) LimitUpCountsRange(start, end string) ([]LimitUpCountRow, error) {
 	return out, rows.Err()
 }
 
+// LimitUpCountsByIndustry 限制UpCounts按Industry（DB方法）。
 func (d *DB) LimitUpCountsByIndustry(date string) (map[string]int, error) {
 	rows, err := d.db.Query(`SELECT s.industry, COUNT(*) FROM daily dv
 		JOIN stk_limit l ON l.ts_code = dv.ts_code AND l.trade_date = dv.trade_date

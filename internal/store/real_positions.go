@@ -18,31 +18,31 @@ import (
 // RealPosition 实盘持仓行。
 // （RealPosition is one row of the live book.）
 type RealPosition struct {
-	TsCode       string  `json:"ts_code"`
-	Name         string  `json:"name"`
-	Qty          int     `json:"qty"`
-	CostPrice    float64 `json:"cost_price"`
-	Amount       float64 `json:"amount"`
-	HighestPrice float64 `json:"highest_price"`
-	Strategy     string  `json:"strategy"`
-	SignalID     string  `json:"signal_id"`
-	UpdatedAt    string  `json:"updated_at"`
+	TsCode       string  `json:"ts_code"`       // TS代码
+	Name         string  `json:"name"`          // 名称
+	Qty          int     `json:"qty"`           // 数量
+	CostPrice    float64 `json:"cost_price"`    // 成本价
+	Amount       float64 `json:"amount"`        // 成交额
+	HighestPrice float64 `json:"highest_price"` // 持仓以来最高价（加仓/格局判定用）
+	Strategy     string  `json:"strategy"`      // 战法
+	SignalID     string  `json:"signal_id"`     // 信号ID
+	UpdatedAt    string  `json:"updated_at"`    // 更新时间
 	// UserID §GAP1.10 多租户归属：网关回报 user_id 写入；空串=遗留全局行（对所有人可见，
 	// 兼容单老板存量部署）。English: §GAP1.10 owner account; empty = legacy global row.
-	UserID string `json:"user_id,omitempty"`
+	UserID string `json:"user_id,omitempty"` // 归属用户
 }
 
 // RealOrder 实盘委托单行（signal_id 为幂等键）。
 // （RealOrder is one live order ticket; signal_id is the idempotency key.）
 type RealOrder struct {
-	OrderID   string  `json:"order_id"`
-	SignalID  string  `json:"signal_id"`
-	Code      string  `json:"code"`
-	Side      string  `json:"side"`
-	Status    string  `json:"status"`
-	Price     float64 `json:"price"`
-	Qty       int     `json:"qty"`
-	CreatedAt string  `json:"created_at"`
+	OrderID   string  `json:"order_id"`          // 订单ID
+	SignalID  string  `json:"signal_id"`         // 信号ID
+	Code      string  `json:"code"`              // 代码
+	Side      string  `json:"side"`              // 方向
+	Status    string  `json:"status"`            // 状态
+	Price     float64 `json:"price"`             // 价格
+	Qty       int     `json:"qty"`               // 数量
+	CreatedAt string  `json:"created_at"`        // 创建时间
 	UserID    string  `json:"user_id,omitempty"` // §W2-10 归属账号（空=遗留全局行）
 }
 
@@ -50,14 +50,14 @@ type RealOrder struct {
 // （RealFill is one live fill report.）
 type RealFill struct {
 	ID       int64   `json:"id"`
-	OrderID  string  `json:"order_id"`
-	Code     string  `json:"code"`
-	Side     string  `json:"side"`
-	Price    float64 `json:"price"`
-	Qty      int     `json:"qty"`
-	Amount   float64 `json:"amount"`
-	TradedAt string  `json:"traded_at"`
-	SignalID string  `json:"signal_id"`
+	OrderID  string  `json:"order_id"`          // 订单ID
+	Code     string  `json:"code"`              // 代码
+	Side     string  `json:"side"`              // 方向
+	Price    float64 `json:"price"`             // 价格
+	Qty      int     `json:"qty"`               // 数量
+	Amount   float64 `json:"amount"`            // 成交额
+	TradedAt string  `json:"traded_at"`         // 成交时间
+	SignalID string  `json:"signal_id"`         // 信号ID
 	UserID   string  `json:"user_id,omitempty"` // §W2-10 归属账号
 }
 
@@ -109,6 +109,74 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 	}
 	var n int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM real_positions`).Scan(&n); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ReconcilePositionsForUser §R3-8 P1-G 用户隔离的全量对账写入（Controller.Reconcile 专用）：
+//   - 每行打 UserID 归属后 upsert；
+//   - 删除范围限定在 本账号行 ∪ 遗留全局行（user_id=”）——绝不动其他账号的 scoped 行
+//     （旧 UpsertRealPositions 空集合分支是 DELETE FROM real_positions 全表，多租户下是清库炸弹）；
+//   - pos 为空 = 网关全平，调用方必须已做「通道在线」守卫（网关 /state 断连时也返回空列表，
+//     不可信快照禁止清账）。
+//
+// English: R3-8 P1-G — user-scoped full reconciliation write: stamps ownership on every row,
+// deletes only this account's rows plus legacy global rows; never touches other accounts' rows.
+// An empty pos means "gateway flat" — the caller must have verified the channel is connected.
+func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, p := range pos {
+		if p.UpdatedAt == "" {
+			p.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+		}
+		if userID != "" {
+			p.UserID = userID
+		}
+		_, err := tx.Exec(`INSERT INTO real_positions
+			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(ts_code) DO UPDATE SET
+				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
+				amount=excluded.amount, strategy=excluded.strategy, signal_id=excluded.signal_id,
+				updated_at=excluded.updated_at, user_id=excluded.user_id,
+				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
+					THEN excluded.highest_price ELSE real_positions.highest_price END`,
+			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
+		if err != nil {
+			return 0, fmt.Errorf("reconcile real position %s: %w", p.TsCode, err)
+		}
+	}
+	// 清除本账号范围内已不在网关快照中的行（遗留空 user_id 行归 owner 账号管辖）。
+	if len(pos) == 0 {
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id = '' OR user_id = ?`, userID); err != nil {
+			return 0, err
+		}
+	} else {
+		codes := make([]any, 0, len(pos))
+		placeholders := ""
+		for i, p := range pos {
+			codes = append(codes, p.TsCode)
+			if i > 0 {
+				placeholders += ","
+			}
+			placeholders += "?"
+		}
+		q := `DELETE FROM real_positions WHERE ts_code NOT IN (` + placeholders + `) AND (user_id = '' OR user_id = ?)`
+		codes = append(codes, userID)
+		if _, err := tx.Exec(q, codes...); err != nil {
+			return 0, err
+		}
+	}
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM real_positions WHERE user_id = '' OR user_id = ?`, userID).Scan(&n); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

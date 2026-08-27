@@ -16,21 +16,20 @@ import (
 // 并标 preempted 自动回队首；high 随即执行完成。
 func TestWorkerPreemptsLowByHigh(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
 	// 本测试专用假二进制：dataload 直连调用长睡（模拟重任务），run-task 立即返回。
+	// §flaky 根修：日志路径烘焙进脚本（不再依赖进程级 $FAKE_LOG，跨测试零串扰）。
 	script := filepath.Join(dir, "fakebin.sh")
-	content := `#!/bin/sh
-echo "FAKE $@" >> "$FAKE_LOG"
-case "$*" in
-  *run-task*) ;;
-  *) [ -n "$FAKE_SLEEP" ] && sleep "$FAKE_SLEEP" ;;
-esac
-`
+	content := "#!/bin/sh\n" +
+		"echo \"FAKE $@\" >> '" + logPath + "'\n" +
+		"case \"$*\" in\n" +
+		"  *run-task*) ;;\n" +
+		"  *) [ -n \"$FAKE_SLEEP\" ] && exec sleep \"$FAKE_SLEEP\" ;;\n" +
+		"esac\n"
 	if err := os.WriteFile(script, []byte(content), 0755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("FAKE_SLEEP", "120")
+	t.Setenv("FAKE_SLEEP", "5")
 	dbPath := filepath.Join(dir, "trading.db")
 	cfg := cfgSamples(script, dbPath)
 	cfgPath := mustConfig(t, cfg)
@@ -80,15 +79,15 @@ esac
 	s.setNow(func() time.Time { return time.Date(2026, 8, 24, 10, 0, 0, 0, loc) })
 	s.tick()
 	waitFor(t, 5*time.Second, func() bool { return !s.busyLocked() }, "交易时段应终止遗留任务")
+	waitIdleAndSettle(t, s)
 }
 
 // TestWorkerDrainsQueueContinuously 多任务链不依赖 30s tick 连续排空。
 func TestWorkerDrainsQueueContinuously(t *testing.T) {
 	t.Setenv("FAKE_SLEEP", "0")
 	logPath := filepath.Join(t.TempDir(), "fake.log")
-	t.Setenv("FAKE_LOG", logPath)
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	fake := fakeScript(t, logPath)
 	dbPath := filepath.Join(dir, "trading.db")
 	cfg := cfgSamples(fake, dbPath)
 	cfg.Nightly.BacktestEnabled = true // 链含 3 个任务：dataload + backtest_nightly + library_replay
@@ -105,13 +104,15 @@ func TestWorkerDrainsQueueContinuously(t *testing.T) {
 	if got := callCount(t, logPath); got != 3 {
 		t.Fatalf("链应有 3 个任务被执行, 实际 %d", got)
 	}
+	waitIdleAndSettle(t, s)
 }
 
 // TestManualHighQueuedDuringSession 盘中入队的手动 high 任务不被执行（需求#4 盘后硬门控），
 // 状态保持 queued；到盘后才被消费。
 func TestManualHighQueuedDuringSession(t *testing.T) {
 	dir := t.TempDir()
-	fake := fakeScript(t, dir)
+	logPath := filepath.Join(dir, "fake.log")
+	fake := fakeScript(t, logPath)
 	dbPath := filepath.Join(dir, "trading.db")
 	cfgPath := mustConfig(t, cfgSamples(fake, dbPath))
 	s := New(dir, cfgPath, filepath.Join(dir, "research_state.json"))
@@ -144,6 +145,7 @@ func TestManualHighQueuedDuringSession(t *testing.T) {
 		t.Fatal("盘中不应启动任何研究子进程")
 	}
 	_ = config.DefaultSchedulerConfig // 引用防 unused（cfgSamples 已覆盖默认）
+	waitIdleAndSettle(t, s)
 }
 
 // TestLibraryReplayStepMappedAndInserted 回测开关开启时，夜间链应在 discover_patterns 后
@@ -179,16 +181,16 @@ func TestLibraryReplayStepMappedAndInserted(t *testing.T) {
 // English: a failed task re-enqueues at the queue TAIL — healthier tasks enqueued before it run
 // first; the failure reason is recorded; a cooldown gates the retry (no cap).
 func TestFailedTaskRequeuesAtTail(t *testing.T) {
-	t.Setenv("FAKE_LOG", filepath.Join(t.TempDir(), "fake.log"))
 	dir := t.TempDir()
+	logPath := filepath.Join(dir, "fake.log")
 	// 假二进制：run-task 时带 "--fail" 参数的退出 2（模拟失败），否则立即成功。
+	// §flaky 根修：日志路径烘焙进脚本。
 	script := filepath.Join(dir, "fakebin.sh")
-	content := `#!/bin/sh
-echo "FAKE $@" >> "$FAKE_LOG"
-case "$*" in
-  *run-task*) case "$*" in *"--task-id 1"*) exit 2 ;; *) exit 0 ;; esac ;;
-esac
-`
+	content := "#!/bin/sh\n" +
+		"echo \"FAKE $@\" >> '" + logPath + "'\n" +
+		"case \"$*\" in\n" +
+		"  *run-task*) case \"$*\" in *\"--task-id 1\"*) exit 2 ;; *) exit 0 ;; esac ;;\n" +
+		"esac\n"
 	if err := os.WriteFile(script, []byte(content), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -264,4 +266,5 @@ esac
 	if !strings.Contains(a2.Error, "运行失败") {
 		t.Fatalf("error 列应保留最后一次失败原因, got %q", a2.Error)
 	}
+	waitIdleAndSettle(t, s)
 }

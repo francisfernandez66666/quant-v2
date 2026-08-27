@@ -1,12 +1,14 @@
-// outbox_test.go — §GAP5.2 回归：静默时段门控（跨午夜）+ 补投队列重试与死信。
+// outbox_test.go — §GAP5.2 回归：静默时段门控（跨午夜）+ 补投队列重试与死信 + §R3-8 P1-D 持久化。
 package notify
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
+// TestQuietHoursWindow QuietHoursWindow。
 func TestQuietHoursWindow(t *testing.T) {
 	n := New()
 	n.SetQuietHours("22:00", "08:00")
@@ -30,6 +32,7 @@ func TestQuietHoursWindow(t *testing.T) {
 	}
 }
 
+// TestQuietHoursSuppressesLowOnly QuietHoursSuppressesLowOnly。
 func TestQuietHoursSuppressesLowOnly(t *testing.T) {
 	n := New()
 	n.SetQuietHours("00:00", "23:59") // 全天静默
@@ -58,6 +61,7 @@ func TestQuietHoursSuppressesLowOnly(t *testing.T) {
 	}
 }
 
+// TestOutboxRetriesThenDelivers OutboxRetriesThenDelivers。
 func TestOutboxRetriesThenDelivers(t *testing.T) {
 	o := &Outbox{}
 	calls := 0
@@ -106,7 +110,66 @@ func TestOutboxDeadLetter(t *testing.T) {
 
 type errFake struct{}
 
+// Error Error。
 func (errFake) Error() string { return "fake delivery failure" }
+
+// TestOutboxPersistsAcrossRestart §R3-8 P1-D 回归：入队即落盘、新实例加载续发——
+// 此前补投队列纯内存，进程重启丢全部待补投的止损/清仓提醒。
+func TestOutboxPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/outbox.json"
+
+	// 实例 1：入队一条必失败的关键提醒（持久化启用）
+	n1 := New()
+	n1.SetOutboxPersistPath(path)
+	n1.outbox.enqueue("gateway", Message{Level: LevelHigh, Title: "止损提醒"}, func(string, Message) error {
+		return errFake{}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("入队后应落盘: %v", err)
+	}
+
+	// 实例 2（模拟重启）：从文件恢复，且 gateway 通道可重建
+	n2 := New()
+	n2.SetGateway(&fakeGatewayOK{})
+	n2.SetOutboxPersistPath(path)
+	if got := n2.outbox.pendingLen(); got != 1 {
+		t.Fatalf("重启后应恢复 1 条待补投, got %d", got)
+	}
+
+	// 驱动到期重试 → 经重建的 deliverGateway 投递成功出队
+	n2.outbox.mu.Lock()
+	if len(n2.outbox.items) > 0 {
+		n2.outbox.items[0].nextAt = time.Now().Add(-time.Second)
+	}
+	n2.outbox.mu.Unlock()
+	n2.outbox.pump()
+	if n2.outbox.pendingLen() != 0 {
+		t.Fatalf("重建通道补投成功后应出队, pending=%d", n2.outbox.pendingLen())
+	}
+
+	// 未知通道标识的行应被安全丢弃（不误投）
+	bad := `[{"kind":"mystery","msg":{"level":3,"title":"x"},"attempts":1,"next_at":"2026-01-01T00:00:00Z","deliver_str":"mystery"}]`
+	p2 := dir + "/bad.json"
+	os.WriteFile(p2, []byte(bad), 0o600)
+	n3 := New()
+	n3.SetOutboxPersistPath(p2)
+	if n3.outbox.pendingLen() != 0 {
+		t.Fatal("未知通道的持久化行应被丢弃")
+	}
+}
+
+// fakeGatewayOK 恒成功的推送网关桩。
+type fakeGatewayOK struct{}
+
+func (fakeGatewayOK) Send(Message) error { return nil }
 
 func TestParseHM(t *testing.T) {
 	if v, ok := parseHM("22:05"); !ok || v != 22*60+5 {

@@ -22,7 +22,7 @@ import (
 // DB 历史数据存储句柄。
 // （DB wraps the research database handle.）
 type DB struct {
-	db *sql.DB
+	db *sql.DB // SQLite 数据库连接
 }
 
 // Open 打开（必要时创建）研究数据库并初始化表结构。
@@ -1018,7 +1018,7 @@ type Bar struct {
 // DailyBasic 每日指标行。
 // （DailyBasic is one row of per-day market indicators.）
 type DailyBasic struct {
-	Date         string
+	Date         string  // 日期
 	TurnoverRate float64 // 换手率(%)
 	VolumeRatio  float64 // 量比
 	PETTM        float64 // 市盈率 TTM
@@ -1058,7 +1058,7 @@ type FinaRow struct {
 // LimitRow 涨跌停价行。
 // （LimitRow is one row of limit-up/down prices.）
 type LimitRow struct {
-	Date string
+	Date string  // 日期
 	Up   float64 // 涨停价
 	Down float64 // 跌停价
 }

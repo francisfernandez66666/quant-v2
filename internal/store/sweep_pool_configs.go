@@ -19,19 +19,19 @@ type SweepPoolConfig struct {
 	TpFrom   float64 `json:"tp_from"`  // 止盈线起点%
 	TpTo     float64 `json:"tp_to"`    // 止盈线终点%（含）
 	TpStep   float64 `json:"tp_step"`  // 止盈线步长
-	SlFrom   float64 `json:"sl_from"`
-	SlTo     float64 `json:"sl_to"`
-	SlStep   float64 `json:"sl_step"`
+	SlFrom   float64 `json:"sl_from"`  // 止损起始
+	SlTo     float64 `json:"sl_to"`    // 止损结束
+	SlStep   float64 `json:"sl_step"`  // 止损步长
 	// 持仓天数回归搜索维度（§D）：组合的 max_hold 即该维取值，兜底语义由各维取值承担
-	HoldFrom int `json:"hold_from"`
-	HoldTo   int `json:"hold_to"`
-	HoldStep int `json:"hold_step"`
+	HoldFrom int `json:"hold_from"` // 持仓起始
+	HoldTo   int `json:"hold_to"`   // 持仓结束
+	HoldStep int `json:"hold_step"` // 持仓步长
 	// 门槛分数维：0~100；无连续分的战法引擎自动跳过该维（只跑 0 档）
-	ScoreFrom float64 `json:"score_from"`
-	ScoreTo   float64 `json:"score_to"`
-	ScoreStep float64 `json:"score_step"`
+	ScoreFrom float64 `json:"score_from"` // 评分起始
+	ScoreTo   float64 `json:"score_to"`   // 评分结束
+	ScoreStep float64 `json:"score_step"` // 评分步长
 
-	UpdatedAt string `json:"updated_at"`
+	UpdatedAt string `json:"updated_at"` // 更新时间
 }
 
 // ComboCount 计算该配置的组合总数（四维档数乘积；任一维非法按 1 档计）。

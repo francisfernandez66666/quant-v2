@@ -27,7 +27,7 @@ type QMTClient struct {
 	token      string        // Bearer token
 	timeout    time.Duration // 请求超时
 	retries    int           // 失败重试次数（幂等场景安全）
-	httpClient *http.Client
+	httpClient *http.Client  // HTTP 客户端
 }
 
 // NewQMTClient 创建网关客户端。

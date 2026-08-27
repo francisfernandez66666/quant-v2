@@ -43,20 +43,31 @@ type Notifier struct {
 
 	// §GAP5.2 静默时段（"HH:MM" 分钟数，<0 = 未启用；可跨午夜）：窗口内仅 LevelHigh 放行，
 	// 低/中级别本地留痕不推送。English: quiet-hours gate — only LevelHigh passes inside the window.
-	quietStart int
-	quietEnd   int
+	quietStart int // 静默开始分钟数（<0=未启用）
+	quietEnd   int // 静默结束分钟数（<0=未启用）
 
 	outbox *Outbox // §GAP5.2 失败补投队列
 }
 
 // New 创建推送器实例。（Creates a Notifier instance.）
 func New() *Notifier {
-	return &Notifier{
+	n := &Notifier{
 		wsClients:  make(map[string]chan Message),
 		quietStart: -1,
 		quietEnd:   -1,
 		outbox:     &Outbox{},
 	}
+	n.outbox.bindOwner(n) // §R3-8 P1-D：持久化条目重启后重建投递函数用
+	return n
+}
+
+// SetOutboxPersistPath 启用补投队列磁盘持久化（dataDir 下 outbox.json；须在首次推送前调用）。
+// English: enables outbox persistence (outbox.json under the data dir); call before first push.
+func (n *Notifier) SetOutboxPersistPath(path string) {
+	if n == nil || n.outbox == nil {
+		return
+	}
+	n.outbox.SetPersistPath(path)
 }
 
 // SetQuietHours §GAP5.2 设置静默时段（"HH:MM"，任一为空=关闭）。可跨午夜（22:00~08:00）。

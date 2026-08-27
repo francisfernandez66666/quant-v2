@@ -1,3 +1,4 @@
+// Package paper 独立模拟盘（纸面交易）引擎：把策略信号按实时价撮合成虚拟持仓，产出净值曲线并记录滑点/延迟，与真实持仓完全隔离。
 package paper
 
 import (
@@ -34,7 +35,7 @@ func TestPoolCapsDecoupled(t *testing.T) {
 	e.SetStrategyPools([]string{"n_shape", "dragon"})
 	e.SetPoolCaps(map[string]int{"n_shape": 2})
 	now := time.Now()
-	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10}, "000001.SZ": {Price: 5}, "000002.SZ": {Price: 8}}
+	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10}, "000001.SZ": {Price: 5}, "000002.SZ": {Price: 8}, "601000.SH": {Price: 6}, "601001.SH": {Price: 6}}
 	// 3 个 n_shape 信号：池上限 2 → 只买 2 个
 	e.OnSignals([]combat_agent.Signal{
 		{Code: "600000.SH", Name: "A", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10, GeneratedAt: now},
@@ -183,6 +184,7 @@ func testCfg() Config {
 	return c
 }
 
+// TestOnSignalsFillAtLivePrice 于SignalsFill在Live价格。
 func TestOnSignalsFillAtLivePrice(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -232,6 +234,7 @@ func TestOnSignalsFillAtLivePrice(t *testing.T) {
 	}
 }
 
+// TestSkipHeldAndNoQuote SkipHeld和NoQuote。
 func TestSkipHeldAndNoQuote(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -245,15 +248,16 @@ func TestSkipHeldAndNoQuote(t *testing.T) {
 	if len(e.Positions()) != 1 {
 		t.Fatalf("同票应去重, 实际 %d 仓", len(e.Positions()))
 	}
-	// 无行情信号：回退信号价成交
+	// §R3-3 P0-E：无行情信号一律拒绝撮合（不伪造成交）——此前会回退信号价虚拟成交。
 	e.OnSignals([]combat_agent.Signal{
 		{Code: "000001.SZ", Name: "平安", Strategy: "N形", Direction: "做多", Action: "buy", Price: 5, GeneratedAt: now},
 	}, map[string]*data.StockInfo{})
-	if len(e.Positions()) != 2 {
-		t.Fatalf("无行情应回退信号价成交, 实际 %d 仓", len(e.Positions()))
+	if len(e.Positions()) != 1 {
+		t.Fatalf("无行情应拒绝撮合, 实际 %d 仓（期望 1，去重后仍只有浦发）", len(e.Positions()))
 	}
 }
 
+// TestMarkToMarketAndSnapshot Mark到Market和Snapshot。
 func TestMarkToMarketAndSnapshot(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -292,6 +296,7 @@ func t1Ready(e *Engine) {
 	}
 }
 
+// TestSellAndReset Sell和重置。
 func TestSellAndReset(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -338,6 +343,7 @@ func TestSellAndReset(t *testing.T) {
 	}
 }
 
+// TestMaxPositions 最大Positions。
 func TestMaxPositions(t *testing.T) {
 	c := testCfg()
 	c.MaxPositions = 2

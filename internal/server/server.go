@@ -100,11 +100,11 @@ type Server struct {
 	runtimeURL string     // 运行时实际使用的 API 地址
 	limiter    ipLimiter  // §A4 匿名端点 IP 频控（register/temp/login/setup）
 
-	calMu         sync.Mutex // 保护日历缓存的互斥锁
-	macroCache    []data.MacroEvent
-	macroCacheDay string // 宏观日历缓存对应的日期（用于按天失效）
-	ipoCache      []data.IPOEvent
-	ipoCacheDay   string // IPO 日历缓存对应的日期（用于按天失效）
+	calMu         sync.Mutex        // 保护日历缓存的互斥锁
+	macroCache    []data.MacroEvent // 宏观日历事件缓存
+	macroCacheDay string            // 宏观日历缓存对应的日期（用于按天失效）
+	ipoCache      []data.IPOEvent   // IPO 事件缓存
+	ipoCacheDay   string            // IPO 日历缓存对应的日期（用于按天失效）
 
 	thsMu       sync.Mutex        // 保护同花顺板块兜底缓存的互斥锁
 	thsBoards   []data.SectorInfo // 同花顺 top 板块兜底缓存（LLM 无归因时使用）
@@ -201,7 +201,9 @@ func (s *Server) runtimeModel() string {
 	return s.cfg.GetLLMConfig().Model
 }
 
-// macroEvents 返回当日宏观日历事件（按天缓存，每天首次调用时生成）。
+// macroEvents 返回当日宏观事件日历（按天缓存，每天首次调用时生成）。
+// §R3-8 P1-J 接线：config.json 的 rules.calendar.events 作为补充事件并入
+// （key=标题，value=日期|impact），此前 supplement 入参恒传 nil 被丢弃。
 func (s *Server) macroEvents(now time.Time) []data.MacroEvent {
 	s.calMu.Lock()
 	defer s.calMu.Unlock()
@@ -209,7 +211,20 @@ func (s *Server) macroEvents(now time.Time) []data.MacroEvent {
 	if s.macroCacheDay == day && s.macroCache != nil {
 		return s.macroCache
 	}
-	s.macroCache = data.GenMacroEvents(now.Year(), nil)
+	supplement := map[string]string{}
+	if s.cfg != nil {
+		for _, ev := range s.cfg.Get().Calendar.Events {
+			if ev.Date == "" || ev.Title == "" {
+				continue
+			}
+			impact := ev.Impact
+			if impact == "" {
+				impact = "medium"
+			}
+			supplement[ev.Title] = ev.Date + "|" + impact
+		}
+	}
+	s.macroCache = data.GenMacroEvents(now.Year(), supplement)
 	s.macroCacheDay = day
 	return s.macroCache
 }

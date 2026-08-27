@@ -545,6 +545,11 @@ func parseTHSQuote(body []byte, code string) (*StockInfo, error) {
 		c = strings.TrimPrefix(c, "hs_")
 		c = strings.ReplaceAll(c, "1.", "")
 		c = strings.ReplaceAll(c, "0.", "")
+		// §R3-2 P0-D4 越界防御：清理后不足 6 位（脏数据/上游格式变化）直接跳过，
+		// 此前 c[len(c)-6:] 对短串会 slice bounds out of range panic 杀死整轮解析。
+		if len(c) < 6 {
+			continue
+		}
 		if !strings.HasSuffix(code, c[len(c)-6:]) {
 			continue
 		}

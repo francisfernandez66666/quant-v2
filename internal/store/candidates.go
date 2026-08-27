@@ -9,17 +9,17 @@ import (
 // （Candidate is one research candidate awaiting approval.）
 type Candidate struct {
 	ID        int64   `json:"id"`
-	CreatedAt string  `json:"created_at"`
-	Kind      string  `json:"kind"`    // weights | d1rule | factor | depth
-	Status    string  `json:"status"`  // proposed | approved | rejected | applied
-	Factors   string  `json:"factors"` // 因子 JSON 数组
-	Weights   string  `json:"weights"` // 权重 JSON 对象
-	Metric    float64 `json:"metric"`
-	ICMean    float64 `json:"ic_mean"`
+	CreatedAt string  `json:"created_at"` // 创建时间
+	Kind      string  `json:"kind"`       // weights | d1rule | factor | depth
+	Status    string  `json:"status"`     // proposed | approved | rejected | applied
+	Factors   string  `json:"factors"`    // 因子 JSON 数组
+	Weights   string  `json:"weights"`    // 权重 JSON 对象
+	Metric    float64 `json:"metric"`     // 指标
+	ICMean    float64 `json:"ic_mean"`    // IC均值
 	IR        float64 `json:"ir"`
-	AvgExcess float64 `json:"avg_excess"`
-	Horizon   int     `json:"horizon"`
-	Reason    string  `json:"reason"`
+	AvgExcess float64 `json:"avg_excess"` // 平均超额收益
+	Horizon   int     `json:"horizon"`    // 周期
+	Reason    string  `json:"reason"`     // 原因
 }
 
 // SaveCandidate 写入一条候选。

@@ -58,13 +58,21 @@ type Fetcher struct {
 
 // allStocks 返回去重合并后的完整监控列表（base + hot）。
 // 通过 map 去重，避免同一只股票被重复拉取。
-// allStocks returns the deduplicated full watch list (base + hot).
+// §R3-2 P0-D3 锁内读取：baseStocks/hotStocks 被 SetBaseStocks/UpdateHotStocks 并发写，
+// fetch 循环锁外遍历会读到撕裂的切片头。English: R3-2 P0-D3 — read both lists under RLock;
+// they are concurrently replaced by SetBaseStocks/UpdateHotStocks.
 func (f *Fetcher) allStocks() []string {
+	f.mu.RLock()
+	base := make([]string, len(f.baseStocks))
+	copy(base, f.baseStocks)
+	hot := make([]string, len(f.hotStocks))
+	copy(hot, f.hotStocks)
+	f.mu.RUnlock()
 	set := make(map[string]bool)
-	for _, s := range f.baseStocks {
+	for _, s := range base {
 		set[s] = true
 	}
-	for _, s := range f.hotStocks {
+	for _, s := range hot {
 		set[s] = true
 	}
 	r := make([]string, 0, len(set))
@@ -72,6 +80,14 @@ func (f *Fetcher) allStocks() []string {
 		r = append(r, s)
 	}
 	return r
+}
+
+// watchCounts 锁内返回 base/hot 两个监控池的当前长度（日志用）。
+// English: watchCounts returns the current base/hot pool sizes under RLock (for logs).
+func (f *Fetcher) watchCounts() (base, hot int) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.baseStocks), len(f.hotStocks)
 }
 
 // SetBaseStocks 设置自选+持仓监控列表（无上限）。
@@ -191,11 +207,23 @@ func (f *Fetcher) FetchOnce() {
 }
 
 // Snapshot 返回当前最新行情快照。
-// Snapshot returns the latest market snapshot.
+// §R3-2 P0-D2 拷贝返回：此前直接暴露内部 snapshot 指针，外部读者迭代 Stocks map 时
+// EnsureStock/fetch 会并发写入同一 map → fatal error（不可 recover）。现返回浅拷贝
+// （结构体 + map 逐键复制；StockInfo 本体按"存入后不可变"约定共享）。
+// English: R3-2 P0-D2 — return a shallow copy (struct + per-key map copy); readers no longer
+// touch the internal map that writers mutate.
 func (f *Fetcher) Snapshot() *MarketSnapshot {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.snapshot
+	if f.snapshot == nil {
+		return nil
+	}
+	cp := *f.snapshot
+	cp.Stocks = make(map[string]*StockInfo, len(f.snapshot.Stocks))
+	for k, v := range f.snapshot.Stocks {
+		cp.Stocks[k] = v
+	}
+	return &cp
 }
 
 // HotStocks 返回当前热点股票列表（副本）。
@@ -234,7 +262,9 @@ func (f *Fetcher) loop() {
 		}
 	}()
 	all := f.allStocks()
-	log.Printf("数据采集开始, 监控 %d 只股票(自选+持仓%d 热点%d), 来源 %s", len(all), len(f.baseStocks), len(f.hotStocks), f.dc.SourceName())
+	// §R3-2 P0-D3 锁内取数：启动日志不再锁外直读两个字段
+	baseN, hotN := f.watchCounts()
+	log.Printf("数据采集开始, 监控 %d 只股票(自选+持仓%d 热点%d), 来源 %s", len(all), baseN, hotN, f.dc.SourceName())
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 

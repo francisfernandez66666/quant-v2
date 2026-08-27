@@ -83,10 +83,16 @@ func (a *Aggregator) Update(
 	return a.current
 }
 
-// UpdateFast 近实时打分循环专用更新：只刷新 Scores 并把近实时信号并入最终信号，
+// UpdateFast 近实时打分循环专用更新：只刷新 Scores 并以传入集合【替换】做多信号，
 // 保留主循环产生的新闻/板块/验证数据不动（并发安全）。
-// （UpdateFast is for the near-real-time scoring loop: it only refreshes Scores and merges
-// fast signals into the final list, leaving main-loop news/sector/verification data intact (thread-safe).）
+// §R3-8 P1-B 替换语义修复：调用方（scoring_loop）每次传的都是全量集合
+// mergeSignals(emit, signalStore.List())——固化库本身已含主循环与近实时两路信号；
+// 此前无条件 append 到 cur.BullSignals 上，导致每 5s 把整份固化列表再叠一遍：
+// 一个交易日 ~4800 轮 × N 条固化信号 = 数万条重复条目涌入 FinalSignals 与前端
+// （内存与展示双重膨胀）。主循环路径（engine.go:2852）本就是全量替换口径，两侧一致。
+// English: R3-8 P1-B — the caller passes the FULL merged set each round (the pinned store already
+// contains both channels), so replace instead of appending onto the previous snapshot; the old
+// append re-stacked the whole pinned list every 5s cycle, ballooning memory and the frontend.
 func (a *Aggregator) UpdateFast(scores map[string]combat_agent.StockScores, fastSignals []combat_agent.Signal, rpt *report.Report) *DashboardData {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -95,8 +101,7 @@ func (a *Aggregator) UpdateFast(scores map[string]combat_agent.StockScores, fast
 	if cur == nil {
 		cur = &DashboardData{Report: rpt}
 	}
-	bull := append([]combat_agent.Signal{}, cur.BullSignals...)
-	bull = append(bull, fastSignals...)
+	bull := fastSignals // 全量替换（调用方已合并 固化+本轮）
 	final := resolveConflict(bull, cur.BearSignals, cur.AlertSignals, cur.L1Blocked)
 
 	a.current = &DashboardData{

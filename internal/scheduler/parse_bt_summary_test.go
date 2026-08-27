@@ -1,3 +1,4 @@
+// Package scheduler 研究调度器：按交易时段/盘后/周末调度 dataload、回测、因子挖掘等研究任务，管理子进程生命周期。
 package scheduler
 
 import (
@@ -5,6 +6,7 @@ import (
 	"testing"
 )
 
+// TestParseBtSummaryLabeled 解析BtSummaryLabeled。
 func TestParseBtSummaryLabeled(t *testing.T) {
 	out := "回测进度 30%\n" +
 		"==============================================\n" +

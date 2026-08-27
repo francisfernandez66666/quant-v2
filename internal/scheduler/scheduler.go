@@ -54,10 +54,10 @@ type Scheduler struct {
 	statePath string // research_state.json 路径（展示兼容状态）
 	// nowFn 可注入时钟：测试用 setNow 替换。§flaky 修复——字段自身以 nowMu 保护，
 	// 此前后台排水 goroutine（tryStartNext 自驱）与测试改写 s.now 存在数据竞争。
-	nowMu sync.RWMutex
+	nowMu sync.RWMutex // 保护 nowFn 的读写锁
 	nowFn func() time.Time
 
-	mu            sync.Mutex
+	mu            sync.Mutex          // 保护调度器状态的互斥锁
 	baseCtx       context.Context     // 服务级上下文（退出时取消当前子进程）
 	storeDB       *store.DB           // 队列表句柄（懒加载，进程内复用）
 	storeReset    bool                // 启动恢复是否已执行（running→preempted）
@@ -72,8 +72,8 @@ type Scheduler struct {
 	lastTrim      time.Time           // 盘中内存释放最近一次执行时间（节流用）
 	// failCool §失败重排队防自旋：taskID → 最近一次失败时间。失败任务自动回队尾，
 	// 空队时会立即再次被取到——冷却期内不出队，避免快速失败的任务烧 CPU。
-	failCool map[int64]time.Time
-	state    stateFile
+	failCool map[int64]time.Time // 任务失败冷却表（taskID → 最近失败时间）
+	state    stateFile           // 展示兼容状态文件
 }
 
 // stateFile 展示兼容状态：交易时段下载节流时间戳 + 最近任务结果上报（前端可见）。

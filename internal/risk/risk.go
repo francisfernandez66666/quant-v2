@@ -103,14 +103,12 @@ func (e *Engine) ResolveConflict(signals []strategy.Signal) *strategy.Signal {
 
 // checkBlacklist 检查股票代码是否在黑名单中。
 // 黑名单中的股票直接被阻断。
-// （checkBlacklist checks if a stock code is in the blacklist; blacklisted stocks are blocked outright.）
+// §R3-8 P1-H 统一口径：此前精确字符串相等——配置 `600519.SH` 时裸码请求被风控放行、
+// 却被执行层拦截（两套判定结论相反）。现与执行层共用 config.CodeInBlacklist 归一匹配。
+// （checkBlacklist checks the blacklist via the shared suffix-normalized matcher so the risk
+// layer and the execution layer reach the same verdict for any code form.）
 func (e *Engine) checkBlacklist(code string, cfg *config.Rules) bool {
-	for _, item := range cfg.Theme.BlackList {
-		if code == item {
-			return true
-		}
-	}
-	return false
+	return config.CodeInBlacklist(cfg.Theme.BlackList, code)
 }
 
 // checkCompliance 检查合规模式是否开启。

@@ -56,25 +56,25 @@ const (
 // English: one research task in the queue.
 type ResearchTask struct {
 	ID         int64   `json:"id"`
-	Type       string  `json:"type"`
-	RefID      int64   `json:"ref_id"`
-	Priority   string  `json:"priority"` // high | low
-	Status     string  `json:"status"`
-	Progress   string  `json:"progress"`
-	ResultNum  float64 `json:"result_num"`
-	ResultText string  `json:"result_text,omitempty"`
-	Error      string  `json:"error,omitempty"`
-	Payload    string  `json:"payload"` // JSON 运行参数（start/end/h/top_k/min_stocks/kind/maxstocks…）
-	ChainDay   string  `json:"chain_day,omitempty"`
-	ChainSeq   int     `json:"chain_seq"`
-	Control    string  `json:"control,omitempty"`
+	Type       string  `json:"type"`                  // 类型
+	RefID      int64   `json:"ref_id"`                // 关联ID
+	Priority   string  `json:"priority"`              // high | low
+	Status     string  `json:"status"`                // 状态
+	Progress   string  `json:"progress"`              // 进度
+	ResultNum  float64 `json:"result_num"`            // 结果数值
+	ResultText string  `json:"result_text,omitempty"` // 结果文本
+	Error      string  `json:"error,omitempty"`       // 错误信息
+	Payload    string  `json:"payload"`               // JSON 运行参数（start/end/h/top_k/min_stocks/kind/maxstocks…）
+	ChainDay   string  `json:"chain_day,omitempty"`   // 链日期
+	ChainSeq   int     `json:"chain_seq"`             // 链序号
+	Control    string  `json:"control,omitempty"`     // 控制字段
 	// RequeueSeq §失败重排队尾键：失败重入队时取全局 max+1，出队按它 ASC 沉底
 	// （秒级 updated_at 在同秒内无法区分先后，专用单调序列才可靠）。
-	RequeueSeq int64  `json:"requeue_seq,omitempty"`
-	CreatedAt  string `json:"created_at"`
-	StartedAt  string `json:"started_at,omitempty"`
-	FinishedAt string `json:"finished_at,omitempty"`
-	UpdatedAt  string `json:"updated_at"`
+	RequeueSeq int64  `json:"requeue_seq,omitempty"` // 重入队序号
+	CreatedAt  string `json:"created_at"`            // 创建时间
+	StartedAt  string `json:"started_at,omitempty"`  // 开始时间
+	FinishedAt string `json:"finished_at,omitempty"` // 完成时间
+	UpdatedAt  string `json:"updated_at"`            // 更新时间
 }
 
 // nowStr 当前本地时间串（统一格式，与既有表一致）。

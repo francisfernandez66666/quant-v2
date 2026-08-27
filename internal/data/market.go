@@ -597,11 +597,14 @@ func (m *MarketAPI) GetAuctionData(code string) (*StockInfo, error) {
 const sectorListFields = "f12,f14,f3,f20,f62,f104,f105,f184"
 
 // GetSectorList 获取东方财富行业板块行情列表。
-// 返回全量板块（约 300+），包含涨跌幅、成交额、涨停家数、主力净流入等。
-// GetSectorList fetches the EastMoney industry sector quote list (300+ sectors)
-// including change pct, turnover, limit-up count and main-capital inflow.
+// 返回全量板块（约 86 个行业 + 概念更多），包含涨跌幅、成交额、涨停家数、主力净流入等。
+// §R3-8 P1-L 分页截断修复：此前 pz=50 单页当全量用——东财行业板块约 86 个，
+// 板块扫描/热点评分/情绪面建立在残缺列表上且无任何告警。现 pz=500 一次取全，
+// 并在 total > 返回数时打警告日志（防御上游再变）。
+// English: R3-8 P1-L — the old pz=50 single page silently truncated the board list (~86
+// industry boards); now fetch pz=500 in one call and warn when total exceeds what came back.
 func (m *MarketAPI) GetSectorList() ([]SectorInfo, error) {
-	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=50&fs=m:90+t:2&fields=%s", sectorListFields)
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=500&fs=m:90+t:2&fields=%s", sectorListFields)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
@@ -613,7 +616,27 @@ func (m *MarketAPI) GetSectorList() ([]SectorInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("eastmoney sector list read: %v", err)
 	}
-	return parseSectorList(body)
+	sectors, err := parseSectorList(body)
+	if err == nil && len(sectors) > 0 {
+		if total := parseSectorListTotal(body); total > len(sectors) {
+			log.Printf("[market] 警告: 东财板块 total=%d 但仅取回 %d（分页参数需跟进）", total, len(sectors))
+		}
+	}
+	return sectors, err
+}
+
+// parseSectorListTotal 读取响应里的 data.total（解析失败返回 0，不阻断调用方）。
+// English: reads data.total from the response; 0 on any parse failure.
+func parseSectorListTotal(body []byte) int {
+	var raw struct {
+		Data *struct {
+			Total int `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil || raw.Data == nil {
+		return 0
+	}
+	return raw.Data.Total
 }
 
 // parseSectorList 解析东方财富板块列表 JSON。

@@ -1,3 +1,4 @@
+// Package notify 通知推送层：聚合桌面通知、SSE、Webhook、极光推送等通道，支持静默时段与重试出队。
 package notify
 
 import (

@@ -79,10 +79,25 @@ func NewDataCoordinator(api *MarketAPI, ths *THSClient) *DataCoordinator {
 	}
 }
 
-// GetQuote 获取个股实时行情。新浪 → 同花顺 → 东财
-// English: GetQuote fetches per-stock realtime quotes. Sina → THS → EastMoney.
-// GetQuote fetches a per-stock realtime quote down the chain Sina → THS → EastMoney,
-// tripping THS for 60s after each THS failure.
+// thsAvailable §R3-2 P0-D1 熔断状态锁内读取：thsDeadline 此前被 GetQuote/GetKLine/
+// GetMinuteKLine/GetSectors/GetSectorStocks 五条并发路径（fetcher 5s 循环 × HTTP handler ×
+// 打分循环）裸读写——data race 且熔断时间戳撕裂会导致熔断失效或提前熔断。统一走本封装。
+// English: R3-2 P0-D1 — locked read of the THS circuit-break deadline (previously read/written
+// unlocked from five concurrent paths).
+func (dc *DataCoordinator) thsAvailable() bool {
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
+	return dc.ths != nil && time.Now().After(dc.thsDeadline)
+}
+
+// tripThs §R3-2 P0-D1 熔断置位锁内写入（默认 60s，与历史口径一致）。
+// English: R3-2 P0-D1 — locked write that trips the THS breaker for d.
+func (dc *DataCoordinator) tripThs() {
+	dc.mu.Lock()
+	dc.thsDeadline = time.Now().Add(60 * time.Second)
+	dc.mu.Unlock()
+}
+
 // HealthCheck 探测所有行情源的可用性，委托给东财 MarketAPI 的健康检查。
 // English: HealthCheck probes the availability of all quote sources, delegating to the EastMoney MarketAPI health check.
 // （HealthCheck probes the availability of all market data sources, delegating to the EastMoney MarketAPI health check.）
@@ -127,6 +142,11 @@ func (dc *DataCoordinator) NewsSourceHealth() map[string]bool {
 		"sina":      sinaOk,
 	}
 }
+
+// GetQuote 获取个股实时行情：新浪 → 同花顺 → 东财 三级降级链，同花顺每失败一次熔断 60s。
+// 三级源全部失败时返回明确错误（不再返回零值脏快照，避免前端显示 0.00 元）。
+// English: GetQuote fetches a per-stock realtime quote down the chain Sina → THS → EastMoney,
+// tripping THS for 60s after each THS failure; returns an explicit error when all three fail.
 func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	// 空代码防御（§门控配套）：上游对空代码必然失败并刷错误日志
 	// （周六实录：每秒数行"新浪/东财行情失败 ()"），直接本地拒绝。
@@ -141,13 +161,13 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 		log.Printf("新浪行情失败 (%s): %v, 降级同花顺", code, err)
 	}
 
-	if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+	if dc.thsAvailable() {
 		thsSi, thsErr := dc.ths.GetQuote(code)
 		if thsErr == nil && thsSi != nil && thsSi.Price > 0 {
 			log.Printf("同花顺返回 %s 最新价 %.2f", code, thsSi.Price)
 			return thsSi, nil
 		} else if thsErr != nil {
-			dc.thsDeadline = time.Now().Add(60 * time.Second)
+			dc.tripThs()
 			log.Printf("同花顺失败 (%s): %v, 熔断60s", code, thsErr)
 		}
 	}
@@ -186,12 +206,12 @@ func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, er
 		if klines, err := dc.eastMoney.GetTencentKLine(code, count); err == nil && len(klines) > 0 {
 			return klines, nil
 		}
-		if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+		if dc.thsAvailable() {
 			thsKL, thsErr := dc.ths.GetTHSKLine(code)
 			if thsErr == nil && len(thsKL) > 0 {
 				return thsKL, nil
 			} else if thsErr != nil {
-				dc.thsDeadline = time.Now().Add(60 * time.Second)
+				dc.tripThs()
 				log.Printf("同花顺日线失败 (%s): %v, 熔断60s", code, thsErr)
 			}
 		}
@@ -213,12 +233,12 @@ func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLin
 		return klines, nil
 	}
 
-	if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+	if dc.thsAvailable() {
 		thsKL, thsErr := dc.ths.GetTHSMinuteKLine(code)
 		if thsErr == nil && len(thsKL) > 0 {
 			return thsKL, nil
 		} else if thsErr != nil {
-			dc.thsDeadline = time.Now().Add(60 * time.Second)
+			dc.tripThs()
 			log.Printf("同花顺分钟线失败 (%s): %v, 熔断60s", code, thsErr)
 		}
 	}
@@ -248,13 +268,13 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 	dc.mu.RUnlock()
 
 	var thsSectors []SectorInfo
-	if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+	if dc.thsAvailable() {
 		var thsErr error
 		thsSectors, thsErr = dc.ths.GetBoardList()
 		if thsErr == nil && len(thsSectors) > 0 {
 			log.Printf("GetSectors: 同花顺 (%d个板块)", len(thsSectors))
 		} else if thsErr != nil {
-			dc.thsDeadline = time.Now().Add(60 * time.Second)
+			dc.tripThs()
 			log.Printf("同花顺板块列表失败: %v, 熔断60s", thsErr)
 		}
 	}
@@ -339,7 +359,7 @@ func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]Stock
 	// 同花顺优先：东财被限流时板块成分股改走同花顺。
 	// English: THS-first: when EastMoney is rate-limited, sector constituents route to THS.
 	// THS-first: when EastMoney is rate-limited, sector constituents come from THS.
-	if dc.ths != nil && time.Now().After(dc.thsDeadline) {
+	if dc.thsAvailable() {
 		thsCode, thsName := dc.matchTHSBoardCode(sectorCode)
 		if thsCode == "" {
 			thsCode = sectorCode

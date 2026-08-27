@@ -18,6 +18,7 @@ import (
 // English: quoteMockTransport simulates the Eastmoney push2 stock/get endpoint returning fixed quotes (F43 unit is cents). Stocks are distinguished by secid: 600206 → 4379 cents (43.79), 600000 → 800 cents (8.00).
 type quoteMockTransport struct{}
 
+// RoundTrip 模拟东财 push2 stock/get，按 secid 返回固定行情（单位为分）。
 func (rt *quoteMockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !strings.Contains(req.URL.Hostname(), "push2.eastmoney.com") {
 		return nil, http.ErrHandlerTimeout
@@ -156,6 +157,7 @@ func TestCheckPositionAlerts_NoThreshold(t *testing.T) {
 // English: dailyDropTransport simulates a sharp same-day drop quote (F170=-700 → change -7.00%).
 type dailyDropTransport struct{}
 
+// RoundTrip 模拟东财 push2 stock/get 返回当日大跌行情（涨跌幅 -7.00%）。
 func (rt *dailyDropTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !strings.Contains(req.URL.Hostname(), "push2.eastmoney.com") {
 		return nil, http.ErrHandlerTimeout
