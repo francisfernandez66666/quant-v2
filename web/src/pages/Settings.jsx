@@ -7,6 +7,7 @@ import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
 
+// 五大战法参数分组定义：每个 group 含标题与字段列表（k=后端字段名, label=展示名, step=步进, type=控件类型, hint=悬浮说明）
 const strategyGroups = [
   {
     key: 'dragon', title: '龙头战法（权重合计≤1）',
@@ -67,10 +68,11 @@ const strategyGroups = [
   },
 ]
 
+// 生成空的战法参数字典（五大战法占位空对象），用于初始化/合并后端配置
 const emptyStrategy = () => ({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} })
 
-const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }
-const labelStyle = { width: 160, flexShrink: 0, color: '#999', fontSize: 13 }
+const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' } // 设置项行布局
+const labelStyle = { width: 160, flexShrink: 0, color: '#999', fontSize: 13 } // 设置项标签样式
 
 /**
  * 设置页面组件
@@ -154,8 +156,9 @@ export default function Settings() {
   async function saveLLM() {
     setLlmSaving(true)
     try {
-      await api.setLLMConfig({
-        api_keys: llmApiKeys.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
+          await api.setLLMConfig({
+            // 多 Key 支持：按换行或逗号拆分并去除空白，过滤空串
+            api_keys: llmApiKeys.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
         api_url: llmApiUrl,
         model: llmModel,
         classifier_model: llmClassifierModel,
@@ -219,6 +222,7 @@ export default function Settings() {
     })()
   }, [])
 
+  // 按字段类型渲染控件：switch 类型用 Switch，其余用 InputNumber（默认步进 1）
   const renderField = (group, f) => {
     if (f.type === 'switch') {
       return (
@@ -362,7 +366,7 @@ export default function Settings() {
   )
 }
 
-// 板块小标题
+// 板块小标题：设置页各区块的简短分组标题
 function SectionLabel({ children }) {
   return <div style={{ fontWeight: 600, margin: '8px 0 4px', fontSize: 13 }}>{children}</div>
 }

@@ -5,6 +5,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Tag, Button, Select, DialogPlugin, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 
+// 通用确认弹窗：返回 Promise<boolean>，确认 resolve(true)、关闭 resolve(false)
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
     const d = DialogPlugin.confirm({
@@ -17,6 +18,7 @@ function confirmDialog(body, header = '确认') {
   })
 }
 
+// 消息等级过滤选项：key 对应过滤逻辑，label 为按钮文案
 const filters = [
   { key: 'all', label: '全部' },
   { key: 'hit', label: '命中提醒' },
@@ -97,6 +99,7 @@ export default function MsgCenter() {
     return a.title && a.title.includes('卖出') ? '卖出' : (a.title && a.title.includes('买入')) ? '买入' : '持有'
   }
 
+  // 根据建议动作（买入/卖出/持有）返回操作标签的主题色
   function actionTagTheme(a) {
     const t = actionText(a)
     if (t === '买入') return 'success'
@@ -153,7 +156,7 @@ export default function MsgCenter() {
   // 挂载时加载消息、启动轮询并订阅 SSE；卸载时清理
   useEffect(() => {
     load()
-    timerRef.current = setInterval(load, 15000)
+    timerRef.current = setInterval(load, 15000) // 每 15s 轮询刷新消息列表
     api.connectSSE()
     unsubSSERef.current = api.onSSE(handleSSE)
     return () => {

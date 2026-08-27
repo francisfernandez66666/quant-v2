@@ -18,11 +18,21 @@ const C = {
   src: '#5b8ff9',
 }
 
+/**
+ * 格式化盘口价格为两位小数字符串，空/零值显示 "--"。
+ * @param {number} v 价格
+ * @returns {string}
+ */
 // 格式化价格，空值显示 --
 function fmtPrice(v) {
   const n = Number(v) || 0
   return n ? n.toFixed(2) : '--'
 }
+/**
+ * 格式化盘口量为中文单位（万），空/零值显示 "--"。
+ * @param {number} v 委托量
+ * @returns {string} 例如 "1.2万" / "--"
+ */
 // 格式化盘口量为中文单位
 function fmtVol(v) {
   const n = Number(v) || 0
@@ -123,8 +133,8 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     ctx.fillRect(0, 0, W, H)
 
     // 档位
-    const levels = Number(ob.levels) || Math.min(ob.bids.length || 0, 5) || 5
-    const showLevels = Math.min(levels, 10)
+    const levels = Number(ob.levels) || Math.min(ob.bids.length || 0, 5) || 5 // 档位数：接口给定，缺省取买卖盘前 5 档
+    const showLevels = Math.min(levels, 10) // 最多展示 10 档
 
     // 构建行：卖 high→low ... 现价 ... 买 low→high
     const rows = []
@@ -141,12 +151,12 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
       rows.push({ lv: '买' + label, price: b ? b.price : 0, vol: b ? b.volume : 0, color: C.bid, best: i === 0 })
     }
 
-    const factorH = factors ? 78 : 0
-    const rowH = (H - 8 - factorH) / rows.length
-    const col1 = 6, col1W = 56
+    const factorH = factors ? 78 : 0          // 底部派生因子区高度（无因子则为 0）
+    const rowH = (H - 8 - factorH) / rows.length // 每行高度（上下各留 4px）
+    const col1 = 6, col1W = 56                // 第一列（档位标签）起点与宽度
     const priceX = col1 + col1W
-    const priceW = (W - priceX) / 2
-    const volX = priceX + priceW
+    const priceW = (W - priceX) / 2           // 价格列占剩余宽度一半
+    const volX = priceX + priceW              // 量/涨跌幅列起点
 
     ctx.font = '14px monospace'
     ctx.textBaseline = 'middle'

@@ -32,27 +32,45 @@ function loadCache() {
  */
 export default function Positions() {
   const cache = loadCache()
+  // 纸面持仓列表
   const [holdings, setHoldings] = useState(cache.holdings)
+  // 已展开分时图的持仓代码集合
   const [klineOpen, setKlineOpen] = useState(new Set())
+  // 可用资金余额
   const [availableBalance, setAvailableBalance] = useState(cache.balance)
+  // 新增/编辑持仓弹窗显隐
   const [showAdd, setShowAdd] = useState(false)
+  // 盈亏显示偏移量（用于「清零」显示，持久化到 localStorage）
   const [pnlOffset, setPnlOffset] = useState(parseFloat(localStorage.getItem('pnl_offset') || '0'))
+  // 累计已实现盈亏
   const [totalRealizedPnl, setTotalRealizedPnl] = useState(0)
 
+  // 当前账本标签：paper=纸面持仓，real=实盘持仓
   const [bookTab, setBookTab] = useState('paper')
+  // QMT 网关状态（启用/模式/熔断/网关地址）
   const [qmtState, setQmtState] = useState({ enabled: false, mode: 'manual', tripped: false, gateway_url: '' })
+  // 实盘持仓列表
   const [realPositions, setRealPositions] = useState([])
+  // 实盘持仓建议映射（ts_code -> 建议）
   const [realAdvices, setRealAdvices] = useState({})
+  // 实盘是否启用
   const realEnabled = !!qmtState.enabled
+  // 实盘网关是否熔断（熔断后禁止下单）
   const realTripped = !!qmtState.tripped
+  // 当前实盘下单参数（持仓+方向）
   const [realAction, setRealAction] = useState(null)
+  // 实盘下单价格/数量/策略
   const [realFormPrice, setRealFormPrice] = useState(0)
   const [realFormQty, setRealFormQty] = useState(0)
   const [realFormStrategy, setRealFormStrategy] = useState('')
+  // 实盘下单提交中标记
   const [realSubmitting, setRealSubmitting] = useState(false)
+  // 实盘轮询定时器（30s）
   const realTimer = useRef(null)
 
+  // 编辑中的持仓下标（-1 表示新增）
   const [editingIdx, setEditingIdx] = useState(-1)
+  // 新增/编辑表单：代码、成本、数量、查得名称、查得现价、止盈%、止损%
   const [formCode, setFormCode] = useState('')
   const [formCost, setFormCost] = useState(0)
   const [formQty, setFormQty] = useState(0)
@@ -61,8 +79,11 @@ export default function Positions() {
   const [formTp, setFormTp] = useState(8)
   const [formSl, setFormSl] = useState(5)
 
+  // 加减仓弹窗状态与表单（方向 add/sell、成交价/量、现价、目标持仓）
   const [showLot, setShowLot] = useState(false)
+  // 改成本弹窗状态
   const [showCost, setShowCost] = useState(false)
+  // 批次明细弹窗状态
   const [showLots, setShowLots] = useState(false)
   const [lotTarget, setLotTarget] = useState(null)
   const [costTarget, setCostTarget] = useState(null)
@@ -73,6 +94,7 @@ export default function Positions() {
   const [lotCurrentPrice, setLotCurrentPrice] = useState(0)
   const [costFormPrice, setCostFormPrice] = useState(0)
 
+  // 清仓弹窗状态与表单（清仓价、预览盈亏金额/比例、预览是否有效）
   const [showClose, setShowClose] = useState(false)
   const [closeTarget, setCloseTarget] = useState(null)
   const [closeFormPrice, setCloseFormPrice] = useState(0)
@@ -80,11 +102,15 @@ export default function Positions() {
   const [closePnlPct, setClosePnlPct] = useState(0)
   const [closePreviewValid, setClosePreviewValid] = useState(false)
 
+  // 可用资金编辑状态与输入值
   const [editingBalance, setEditingBalance] = useState(false)
   const [balanceInputVal, setBalanceInputVal] = useState(0)
+  // 移动端操作面板对应的持仓
   const [sheetHolding, setSheetHolding] = useState(null)
 
+  // 纸面持仓轮询定时器（30s）
   const timer = useRef(null)
+  // SSE 订阅取消函数
   const unsubSSE = useRef(null)
 
   const totalPnl = useMemo(() => {
@@ -327,6 +353,7 @@ export default function Positions() {
     setBookTab(tab)
     if (tab === 'real') {
       loadReal()
+      // 进入实盘标签时启动 30s 轮询对账
       if (!realTimer.current) realTimer.current = setInterval(loadReal, 30000)
     } else if (realTimer.current) {
       clearInterval(realTimer.current); realTimer.current = null
@@ -351,6 +378,7 @@ export default function Positions() {
     if (realTripped) { MessagePlugin.warning('网关已熔断，暂停实盘下单'); return }
     setRealAction({ pos: p, dir })
     setRealFormPrice(curPrice(p) || p.cost_price || 0)
+    // 默认数量：加仓 100 股（一手），减仓则为持仓量（不超过一手）
     setRealFormQty(dir === 'add' ? 100 : Math.min(100, p.qty || 0))
     setRealFormStrategy('')
   }
@@ -375,6 +403,7 @@ export default function Positions() {
       })
       MessagePlugin.success((sell ? '卖出' : '买入') + '委托已提交 ' + a.pos.ts_code + ' ' + qty + ' 股' + (res.order_id ? '（单号 ' + res.order_id + '）' : ''))
       setRealAction(null)
+      // 委托提交后 2s 刷新实盘持仓，等待网关回报
       setTimeout(loadReal, 2000)
     } catch (e) { MessagePlugin.error('下单失败: ' + (e.message || '')) }
     finally { setRealSubmitting(false) }
@@ -397,9 +426,11 @@ export default function Positions() {
 
   // 挂载时加载持仓、启动轮询并订阅 SSE 实盘建议；卸载时清理
   useEffect(() => {
-    load(); timer.current = setInterval(load, 30000)
+    load(); timer.current = setInterval(load, 30000) // 每 30s 轮询纸面持仓
+    // 订阅 SSE：处理实盘建议推送与 QMT 回报/订单回报，触发对应刷新
     unsubSSE.current = api.onSSE((msg) => {
       if (!msg || !msg.type) return
+      // 实盘操作建议：按 ts_code 汇总成建议映射
       if (msg.type === 'real_advice' && Array.isArray(msg.advices)) {
         const m = {}
         for (const a of msg.advices) {
@@ -422,7 +453,8 @@ export default function Positions() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 纸面持仓列
+  // 纸面持仓表格列定义：代码、名称、数量、成本/现价、当日涨跌、持仓盈亏、
+  // 信号标记、N形/龙头/动量评分、止盈止损、移动止盈、分时与操作按钮
   const paperColumns = [
     { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name}</span> },
@@ -449,7 +481,7 @@ export default function Positions() {
     ) },
   ]
 
-  // 实盘持仓列
+  // 实盘持仓表格列定义：代码、名称、数量、成本/现价、持仓盈亏、最高价、建议标签与操作按钮
   const realColumns = [
     { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.ts_code}</span> },
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name}</span> },

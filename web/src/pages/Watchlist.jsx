@@ -43,17 +43,24 @@ function val(e, key) {
  * @returns {JSX.Element}
  */
 export default function Watchlist() {
+  // 自选股列表（含行情与各维度评分）
   const [stocks, setStocks] = useState([])
+  // 新增输入框代码
   const [newCode, setNewCode] = useState('')
+  // 添加请求进行中标记（防重复提交）
   const [adding, setAdding] = useState(false)
+  // 已展开分时图的代码列表
   const [expandedKeys, setExpandedKeys] = useState([])
+  // 移动端操作面板对应的自选股
   const [sheetStock, setSheetStock] = useState(null)
+  // 轮询定时器（30s）
   const timer = useRef(null)
 
   // 初始化：读取缓存、加载数据、启动 30s 轮询
   useEffect(() => {
     setStocks(loadCache())
     load()
+    // 每 30s 轮询刷新自选股行情与评分
     timer.current = setInterval(load, 30000)
     return () => { if (timer.current) clearInterval(timer.current) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -77,6 +84,7 @@ export default function Watchlist() {
     try {
       const st = await api.fetchStatus()
       const hasEmptyCode = stocks.some((s) => !s.code)
+      // 非交易时段且已有关联行情时跳过刷新，避免无谓请求
       if (!api.isTradingSession(st.session) && stocks.length && !hasEmptyCode) return
       api.setLastSession(st.session)
       const [snap, wl, ev] = await Promise.all([
@@ -178,6 +186,8 @@ export default function Watchlist() {
     setSheetStock(e)
   }
 
+  // 自选股表格列定义：代码、名称、现价、涨跌，以及 N形/龙头/双凸/龙回头/动量
+  // 五个维度评分（可排序），K线展开与删除操作
   const columns = [
     { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name || '-'}</span> },

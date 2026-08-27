@@ -68,12 +68,12 @@ export default function Hotspot() {
   // 过滤宏观日历与政策反制事件
   const calendarEvents = useMemo(() => news.filter((n) => n.source === '宏观日历' || n.source === '政策反制'), [news])
 
-  // 根据上市日期计算 IPO 倒计时
+  // 根据上市日期计算 IPO 倒计时（相对今天的天数差，含「今天/已上市/即将上市」）
   function ipoCountdown(c) {
     const ds = c.listing_date || c.ipo_date
     if (!ds) return c.list_status === 'L' ? '已上市' : '即将上市'
     const t = new Date(+ds.slice(0, 4), +ds.slice(4, 6) - 1, +ds.slice(6, 8))
-    const diff = Math.ceil((t - Date.now()) / 86400000)
+    const diff = Math.ceil((t - Date.now()) / 86400000) // 86400000 = 一天的毫秒数
     if (diff > 0) return `${diff}天后`
     if (diff === 0) return '📌今天'
     return `${-diff}天前`
@@ -168,10 +168,11 @@ export default function Hotspot() {
     if (reanalyzing) return
     setReanalyzing(true)
     try {
-      const res = await api.reanalyzeNews()
-      if (res && res.accepted !== false) {
-        setTimeout(() => load(), 1500)
-      }
+        const res = await api.reanalyzeNews()
+        if (res && res.accepted !== false) {
+          // 重新分析为异步任务，1.5s 后拉取一次最新结果
+          setTimeout(() => load(), 1500)
+        }
     } catch (_) {} finally {
       setReanalyzing(false)
     }
@@ -200,7 +201,7 @@ export default function Hotspot() {
       } else {
         if (!timerRef.current) {
           load()
-          timerRef.current = setInterval(load, 5000)
+    timerRef.current = setInterval(load, 5000) // 每 5s 轮询刷新热点/评分/新闻/IPO
         }
       }
     }
@@ -248,7 +249,7 @@ export default function Hotspot() {
     { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: '#888' }}>{row.date}</span> },
     { colKey: 'title', title: '事件', cell: ({ row }) => <span style={{ color: '#1a1a1a' }}>{row.title}</span> },
   ]
-  const calendarData = calendarEvents.map((c, i) => ({ id: 'c' + i, date: c.datetime ? c.datetime.slice(5, 10) : '', title: c.title }))
+  const calendarData = calendarEvents.map((c, i) => ({ id: 'c' + i, date: c.datetime ? c.datetime.slice(5, 10) : '', title: c.title })) // 取 MM-DD 作为日期列
 
   // IPO 日历列
   const ipoColumns = [
@@ -259,7 +260,7 @@ export default function Hotspot() {
   ]
   const ipoData = ipoCalendar.map((c, i) => ({ id: 'ipo' + i, date: c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : ''), name: c.name, code: c.code, issue_price: c.issue_price, status: ipoCountdown(c), statusTheme: c.list_status === 'L' ? 'default' : 'warning' }))
 
-  // 资讯标签解析
+  // 资讯标签解析：根据情绪/方向/影响等级生成 TDesign Tag 的 {text, theme} 列表
   function newsTags(n) {
     const tags = []
     if (n.sentiment) { const theme = n.sentiment === '正面' ? 'success' : n.sentiment === '负面' ? 'danger' : 'default'; tags.push({ text: n.sentiment, theme }) }

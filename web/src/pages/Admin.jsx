@@ -11,7 +11,7 @@ import { showToast } from '../ui.jsx'
 
 const PERM_LABELS = { research_approve: '研究审批' }
 
-// 战法参数分组定义（与 Vue 版 Settings/Admin 一致）
+// 战法参数分组定义（与 Vue 版 Settings/Admin 一致）；每个 group 的 fields 决定代配弹窗中展示的输入框与步长
 const strategyGroups = [
   {
     key: 'dragon', title: '龙头战法（权重合计≤1）',
@@ -85,12 +85,13 @@ function fmtTime(ts) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
-// 根据用户有效期生成中文说明
+// 根据用户有效期生成中文说明（永久 / 已到期 / 剩余天数）
 function expiryText(u) {
   if (!u.expires_at) return '有效期：永久'
   const now = Date.now()
   const exp = u.expires_at * 1000
   if (exp < now) return '有效期：已到期'
+  // 86400000 = 一天的毫秒数，用于换算剩余天数
   const days = Math.ceil((exp - now) / 86400000)
   return '有效期：' + fmtTime(u.expires_at) + '（剩 ' + days + ' 天）'
 }
@@ -228,7 +229,8 @@ export default function Admin() {
     const days = expDays || 0
     api.setAdminUserExpiry(expUser.id, days)
       .then(() => {
-        setUsers(users.map((x) => x.id === expUser.id ? { ...x, expires_at: days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0 } : x))
+        // 86400 = 一天的秒数；days 为 0 表示永久，有效期置 0
+      setUsers(users.map((x) => x.id === expUser.id ? { ...x, expires_at: days > 0 ? Math.floor(Date.now() / 1000) + days * 86400 : 0 } : x))
         showToast(expUser.username + ' 有效期已更新', 'success')
         setExpUser(null)
       })
@@ -280,7 +282,7 @@ export default function Admin() {
     setStrategySaving(false)
   }
 
-  // 用户列表列定义
+  // 用户列表表格列定义：用户信息 / 权限勾选 / 操作按钮组
   const userColumns = [
     {
       colKey: 'user', title: '用户', width: 220,

@@ -6,7 +6,7 @@ import { Card, Switch, Input, Textarea, Button, Tag } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
-// 将 ISO 时间格式化为 HH:mm:ss，用于消息气泡
+// 将 ISO 时间格式化为 HH:mm:ss，用于消息气泡展示
 function fmtTime(t) {
   if (!t) return ''
   const d = new Date(t)

@@ -14,7 +14,13 @@ const UP = '#e34d59'   // 涨（A股习惯红）
 const DOWN = '#00a870' // 跌（绿）
 const clsColor = (c) => (c === 'up' ? UP : c === 'down' ? DOWN : undefined)
 
-// 封装 tdesign 确认对话框为 Promise
+/**
+ * 封装 TDesign 确认对话框为 Promise。
+ * 弹出「警告」主题确认框，用户点击确认返回 true，关闭或取消返回 false。
+ * @param {string} body 弹窗正文内容
+ * @param {string} [header='确认'] 弹窗标题
+ * @returns {Promise<boolean>} 用户确认结果
+ */
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
     const d = DialogPlugin.confirm({
@@ -27,8 +33,19 @@ function confirmDialog(body, header = '确认') {
   })
 }
 
+/**
+ * 将数值格式化为带千分位、固定两位小数的中文本地化字符串。
+ * @param {number|string} v 原始数值（null/undefined 视为 0）
+ * @returns {string} 例如 "1,234.56"
+ */
 // 格式化为两位小数的中文数字
 const fmt = (v) => (v ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+/**
+ * 将时间戳格式化为 "MM-DD HH:mm:ss"（本地时区）。
+ * 无法解析时回退为字符串切片（取第 5~16 位）。
+ * @param {number|string} t 时间戳或日期字符串
+ * @returns {string} 格式化后的时间，空值返回 "—"
+ */
 // 格式化为 MM-DD HH:mm:ss
 function fmtTime(t) {
   if (!t) return '—'
@@ -37,18 +54,41 @@ function fmtTime(t) {
   const p2 = (n) => String(n).padStart(2, '0')
   return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
 }
+/**
+ * 根据盈亏数值返回涨跌标记，用于决定文字颜色。
+ * @param {number} v 盈亏值
+ * @returns {'up'|'down'} 非负返回 'up'，否则 'down'
+ */
 // 根据盈亏返回 up/down
 function pnlCls(v) { return v >= 0 ? 'up' : 'down' }
+/**
+ * 计算买入成交价相对信号价的滑点百分比（仅买入且信号价有效时）。
+ * @param {object} t 成交记录，需含 side/price/signal_price
+ * @returns {string} 形如 "+1.23%" 或 "—"（非买入/无信号价）
+ */
 // 计算买入成交价相对信号价的滑点
 function tradeSlippage(t) {
   if (t.side !== 'buy' || !(t.signal_price > 0)) return '—'
   const pct = (t.price - t.signal_price) / t.signal_price * 100
   return (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%'
 }
+/**
+ * 返回买入滑点的涨跌标记，用于滑点文字着色。
+ * 成交价高于信号价视为成本增加（down/绿），低于则视为节省（up/红）。
+ * @param {object} t 成交记录
+ * @returns {''|'up'|'down'} 无有效信号价时返回空串
+ */
 function tradeSlippageCls(t) {
   if (t.side !== 'buy' || !(t.signal_price > 0)) return ''
   return t.price >= t.signal_price ? 'down' : 'up'
 }
+/**
+ * 将资金池 key 翻译为中文展示标签。
+ * 已知 key（龙头/双响炮/N形/龙回头/动量）映射为对应中文；
+ * 以 fac_ / pat_ 开头的分别加「因子·」「形态·」前缀。
+ * @param {string} k 资金池 key（空视为"其他/手动"）
+ * @returns {string} 中文标签
+ */
 // 将资金池 key 翻译为中文标签
 function poolLabel(k) {
   if (!k) return '其他/手动'
@@ -58,15 +98,40 @@ function poolLabel(k) {
   if (/^pat_/.test(k)) return '形态·' + k
   return k
 }
+/**
+ * 规范化资金池 key：空 key 统一归为 "__other__" 一类，便于按池筛选。
+ * @param {string} k 原始 key
+ * @returns {string} 规范化后的 key
+ */
 // 规范化资金池 key，空 key 归为一类
 function normPoolKey(k) { return k || '__other__' }
+/**
+ * 将订单状态英文枚举翻译为中文文案。
+ * @param {string} s filled/partial/rejected 之一
+ * @returns {string} 中文状态文案
+ */
 // 订单状态中文
 function orderStatusText(s) { return { filled: '全部成交', partial: '部分成交', rejected: '已拒绝' }[s] || s }
+/**
+ * 返回订单状态对应的 TDesign Tag 主题色。
+ * @param {string} s 订单状态
+ * @returns {string} TDesign 主题名（success/warning/danger/default）
+ */
 // 订单状态徽标主题
 function orderStatusTheme(s) { return { filled: 'success', partial: 'warning', rejected: 'danger' }[s] || 'default' }
+/**
+ * 截断过长的订单说明文本，超过 18 字用省略号收尾（用于表格列展示）。
+ * @param {string} r 原始说明
+ * @returns {string} 截断后文本或"—"
+ */
 // 截断原因文本
 function shortReason(r) { if (!r) return '—'; return r.length > 18 ? r.slice(0, 18) + '…' : r }
 
+/**
+ * 单指标统计卡片：上方小灰字标签 + 下方大号数值。
+ * @param {string} label 卡片标题
+ * @param {React.ReactNode} children 数值内容
+ */
 // 单卡统计
 function StatCard({ label, children }) {
   return (
@@ -120,7 +185,7 @@ export default function Paper() {
   const [tradeFormPrice, setTradeFormPrice] = useState(0)
   const [tradeFormQty, setTradeFormQty] = useState(1)
 
-  const W = 900, H = 220
+  const W = 900, H = 220 // 净值曲线 SVG 的逻辑尺寸（viewBox 坐标，非真实像素）
   const timer = useRef(null)
 
   const tradePreviewQty = useMemo(() => {
@@ -154,6 +219,7 @@ export default function Paper() {
       return x.toFixed(1) + ',' + y.toFixed(1)
     }).join(' ')
   }, [equity])
+  // 净值曲线背景横向网格线：在画布 1/4、2/4、3/4 高度处（k=1,2,3）
   const gridLines = useMemo(() => [1, 2, 3].map((k) => ({ y: (H / 4) * k })), [])
 
   const filteredPositions = useMemo(() => {
@@ -204,6 +270,11 @@ export default function Paper() {
     toggleKline('trade_' + sheetTradeRow.idx); setSheetTradeRow(null)
   }
 
+  /**
+   * 打开加仓/减仓/清仓交易弹窗并回填标的与默认手数。
+   * @param {object} p 持仓记录（含 code/name/strategy/mark/qty）
+   * @param {'add'|'trim'|'close'} dir 交易方向
+   */
   function openTrade(p, dir) {
     setTradeTarget(p); setTradeDir(dir)
     setTradeFormPrice(p.mark || 0)
@@ -211,6 +282,12 @@ export default function Paper() {
     setTradeModal(true)
   }
 
+  /**
+   * 提交模拟盘加仓/减仓/清仓委托。
+   * add：调用 buyPaperPosition；trim/close：调用 sellPaperPosition（close 传 0 表示全平）。
+   * 成功后关闭弹窗并重新加载数据。
+   * @returns {Promise<void>}
+   */
   // 提交模拟盘加仓/减仓/清仓委托
   async function confirmTrade() {
     const p = tradeTarget
@@ -231,6 +308,11 @@ export default function Paper() {
     } catch (e) { showToast(e.message || '操作失败','error') }
   }
 
+  /**
+   * 加载模拟盘全部数据：先取开关/账户/资金池状态，
+   * 仅在 enabled 时再拉取持仓、成交、委托与净值曲线（各自 try/catch 互不阻断）。
+   * @returns {Promise<void>}
+   */
   // 加载模拟盘状态、持仓、成交、委托与净值曲线
   async function load() {
     try {
@@ -250,6 +332,11 @@ export default function Paper() {
     try { setEquity(await api.fetchPaperEquity()) } catch (_) {}
   }
 
+  /**
+   * 确认注入资金（增量计入现金，保留现有持仓/净值/成交）。
+   * 调用 resetPaper 并回填初始资金与持仓上限，然后重新加载。
+   * @returns {Promise<void>}
+   */
   // 确认注入资金并更新持仓上限
   async function confirmDeposit() {
     const amt = parseFloat(depositAmount)
@@ -268,6 +355,11 @@ export default function Paper() {
     } catch (e) { showToast(e.message || '注入失败','error') }
   }
 
+  /**
+   * 清盘当前选中的分仓资金池：按最后估值价平仓该池全部持仓并回补池现金，
+   * 清空该池累计涨跌幅；不影响其他池与全局净值/成交。
+   * @returns {Promise<void>}
+   */
   // 清盘当前选中的分仓资金池
   async function confirmPoolReset() {
     if (activePool === null) return
@@ -284,6 +376,10 @@ export default function Paper() {
     } catch (e) { showToast(e.message || '清盘失败','error') }
   }
 
+  /**
+   * 打开统一设置弹窗（资金分配/仓位上限/买入纪律），
+   * 将各资金池现有 cash/max_pos/buy_rule 回填到表单状态，并默认选中首个有效策略池。
+   */
   // 打开资金分配/仓位上限/买入纪律设置弹窗并回填当前配置
   function openSettingsModal() {
     setCfgMaxPos(appliedMax > 0 ? appliedMax : 0)
@@ -305,6 +401,14 @@ export default function Paper() {
     setSettingsOpen(true)
   }
 
+  /**
+   * 保存设置：根据当前标签页分别校验并提交
+   * - alloc：各池资金额之和不得超过总现金；
+   * - rules：逐池写入买入纪律（日限/冷却/最低分/日预算%）；
+   * - caps：各池上限之和不得超过全局上限。
+   * 失败以 Toast 提示，成功关闭弹窗并重新加载。
+   * @returns {Promise<void>}
+   */
   // 保存资金分配、仓位上限或买入纪律配置
   async function saveSettings() {
     const totalCash = pools.reduce((s, p) => s + p.cash, 0)
@@ -345,6 +449,11 @@ export default function Paper() {
     catch (e) { showToast(e.message || '保存失败','error') }
   }
 
+  /**
+   * 全局清盘重置：平仓全部持仓、清除成交日志与净值曲线。
+   * 可携带 reset_to（重置后初始资金）与 max_positions（持仓上限）参数。
+   * @returns {Promise<void>}
+   */
   // 清盘重置：平仓全部持仓、清除成交日志与净值曲线
   async function doResetV2() {
     const ok = await confirmDialog('确认清盘？\n将平仓全部持仓、清除成交日志与净值曲线。', '清盘重置')
@@ -362,7 +471,7 @@ export default function Paper() {
   // 挂载时加载模拟盘数据并启动 15s 轮询
   useEffect(() => {
     load()
-    timer.current = setInterval(load, 15000)
+    timer.current = setInterval(load, 15000) // 每 15 秒轮询刷新模拟盘数据
     return () => { if (timer.current) clearInterval(timer.current) }
   }, [])
 

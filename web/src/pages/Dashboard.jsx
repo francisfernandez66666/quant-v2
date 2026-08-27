@@ -65,23 +65,40 @@ function chgColor(v) {
  * @returns {JSX.Element}
  */
 export default function Dashboard() {
+  // 策略信号列表（来自后端扫描结果）
   const [signals, setSignals] = useState([])
+  // 引擎/扫描整体状态（含 uptime、scan_stats 等）
   const [status, setStatus] = useState({})
+  // 最新资讯与宏观日历事件
   const [newsItems, setNewsItems] = useState([])
+  // 热门板块列表
   const [hotSectors, setHotSectors] = useState([])
+  // 热门个股实时快照
   const [snapshotStocks, setSnapshotStocks] = useState([])
+  // 快照拉取时刻（仅用于展示）
   const [snapshotTime, setSnapshotTime] = useState('')
+  // IPO / 上市日历
   const [ipoCalendar, setIpoCalendar] = useState([])
+  // 日志弹窗显隐
   const [showLog, setShowLog] = useState(false)
+  // 各行情数据源健康状态（东财/新浪/腾讯/同花顺）
   const [dataSourceHealth, setDataSourceHealth] = useState({})
+  // 各新闻数据源健康状态（财联社/同花顺/新浪）
   const [newsSourceHealth, setNewsSourceHealth] = useState({})
+  // 流程引擎各模块健康状态
   const [engineHealth, setEngineHealth] = useState({})
+  // 按战法统计的胜率/盈亏比等归因数据
   const [strategyStats, setStrategyStats] = useState({})
+  // 实盘/QMT 链路状态
   const [qmtState, setQmtState] = useState(null)
 
+  // 主数据刷新定时器（每 5s 轮询）
   const timer = useRef(null)
+  // QMT 状态刷新定时器（每 15s 轮询）
   const qmtTimer = useRef(null)
+  // SSE 订阅取消函数
   const sseUnsub = useRef(null)
+  // 页面可见性变化处理函数引用
   const visibilityHandler = useRef(null)
 
   const scanStats = useMemo(() => status.scan_stats || {}, [status])
@@ -146,8 +163,10 @@ export default function Dashboard() {
   // 页面挂载：加载数据、启动定时刷新、订阅 SSE、监听可见性变化；卸载时清理
   useEffect(() => {
     load()
+    // 主数据每 5s 轮询刷新
     timer.current = setInterval(load, 5000)
     loadQMT()
+    // QMT 链路状态每 15s 轮询刷新
     qmtTimer.current = setInterval(loadQMT, 15000)
     api.connectSSE()
     sseUnsub.current = api.onSSE(handleSSE)
@@ -158,10 +177,12 @@ export default function Dashboard() {
       } else {
         if (!timer.current) {
           load()
+          // 恢复页面后重启主数据 5s 轮询
           timer.current = setInterval(load, 5000)
         }
         if (!qmtTimer.current) {
           loadQMT()
+          // 恢复页面后重启 QMT 15s 轮询
           qmtTimer.current = setInterval(loadQMT, 15000)
         }
       }
@@ -179,6 +200,7 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 热点个股表格列定义：代码、名称、板块（含原因 title 悬浮）、现价、涨跌幅
   const stockColumns = [
     { colKey: 'code', title: '代码', width: 90 },
     { colKey: 'name', title: '名称', width: 100 },
@@ -189,6 +211,7 @@ export default function Dashboard() {
     ) },
   ]
 
+  // 按战法归因表格列定义：战法、样本数、已平仓、胜率、平均盈亏、盈亏比、持仓中
   const strategyColumns = [
     { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => row.strategy || row.name },
     { colKey: 'total', title: '样本', width: 70 },

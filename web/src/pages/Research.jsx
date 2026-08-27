@@ -9,7 +9,7 @@ import {
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
-// 封装 tdesign 确认对话框为 Promise（与 Admin/Paper 保持一致）
+// 封装 tdesign 确认对话框为 Promise（与 Admin/Paper 保持一致）；用户确认时 resolve(true)，关闭时 resolve(false)
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
     const d = DialogPlugin.confirm({
@@ -87,7 +87,7 @@ export default function Research() {
     { id: 'n_shape', name: 'N形（日K近似）' },
   ]
 
-  // 轮询 / 计时器
+  // 轮询 / 计时器：backtestPollers 按候选 id 缓存单候选回测轮询；libPollTimer 为战法库回测轮询；pollTimer 为研究进度轮询
   const backtestPollers = useRef({})
   const libPollTimer = useRef(null)
   const pollTimer = useRef(null)
@@ -223,12 +223,14 @@ export default function Research() {
   }
 
   // ===== 进度 / 候选 =====
+  // 拉取研究处理进度（数据准备度、日线/财务行数、候选计数），更新进度卡片
   async function loadProgress() {
     try {
       const p = await api.fetchResearchProgress()
       if (p) setProgress(p)
     } catch (e) { console.error('Research 进度加载失败', e) }
   }
+  // 按当前状态筛选拉取研究候选列表；研究库未接入时进入 noDB 空状态
   async function loadData() {
     setLoading(true)
     try {
@@ -254,6 +256,7 @@ export default function Research() {
     const m = { proposed: '待审批', approved: '已审批', applied: '已应用', rejected: '已驳回' }
     return m[s] || s
   }
+  // 审批并通过接口应用某条研究候选（写回后端并热更新状态），权限不足时回退
   async function doApprove(c) {
     try {
       await api.approveResearchCandidate(c.id)
@@ -340,6 +343,7 @@ export default function Research() {
   }
 
   // ===== 单候选回测 + 轮询 =====
+  // 对单条候选发起全链路回测，并启动进度轮询；接口调用携带开始/结束日期、选股数与最小样本数
   async function doBacktest(c) {
     if (backtestPollers.current[c.id]) return
     setBacktestLoading((b) => ({ ...b, [c.id]: true }))
@@ -383,6 +387,7 @@ export default function Research() {
     } catch (e) { console.warn('寻优结果加载失败', e) }
     finally { setLoadingOpts(false) }
   }
+  // 发起全库战法参数寻优，提交目标函数后进入研究队列（盘后窗口执行）
   async function startOptimize() {
     if (!(await confirmDialog('发起全库战法参数寻优？\n目标：' + optObjectiveLabel(optObjective) + '，盘后窗口执行，完成后排名出现在本页。'))) return
     try {
@@ -581,6 +586,7 @@ export default function Research() {
   }
   function startLibPoll() {
     if (libPollTimer.current) return
+    // 每 5000ms = 5 秒轮询一次战法库回测任务，直至无运行中任务时停止
     libPollTimer.current = setInterval(async () => {
       await loadBacktests()
       const busy = backtestJobs.some((j) => j.kind === 'library' && (j.status === 'running' || j.status === 'paused' || j.status === 'queued'))
@@ -590,6 +596,7 @@ export default function Research() {
   function pollBacktest(c) {
     const id = c.id
     if (backtestPollers.current[id]) return
+    // 每 5000ms = 5 秒轮询一次单候选回测进度与结果，完成时回填超额收益并刷新战法库
     backtestPollers.current[id] = setInterval(async () => {
       try {
         const j = await api.fetchBacktestStatus(id)
@@ -637,6 +644,7 @@ export default function Research() {
       }
     } catch (e) { console.error('恢复运行中回测任务失败', e) }
   }
+  // 拉取全部回测任务并去重（按 kind:candidate_id），用于回测任务中心表格展示
   async function loadBacktests() {
     setBtLoading(true)
     try {
@@ -761,6 +769,7 @@ export default function Research() {
   }, [optCurHeat])
 
   // ===== 生命周期 =====
+  // 启动研究进度定时轮询（每 30000ms = 30 秒刷新一次处理进度）
   function startPolling() {
     if (pollTimer.current) return
     pollTimer.current = setInterval(loadProgress, 30000)
@@ -786,6 +795,7 @@ export default function Research() {
   }, [])
 
   // ===== 渲染片段 =====
+  // 渲染单条研究候选卡片：展示战法构成、电脑验证结论、关键指标与审批/回测操作按钮
   function renderCandidate(c) {
     return (
       <Card key={c.id} style={{ marginBottom: 12 }} title={<span>#{c.id} <Tag theme="primary">{kindLabel(c.kind)}</Tag> <Tag theme={c.status === 'proposed' ? 'warning' : 'success'}>{statusLabel(c.status)}</Tag> <span style={{ fontSize: 12, color: '#888' }}>{c.created_at}</span></span>}>
@@ -882,6 +892,7 @@ export default function Research() {
     )
   }
 
+  // 渲染战法库分组（因子战法 / 形态战法）：展示每个战法的名称、条件、收益统计与启停/回测/删除操作
   function renderLibraryGroup(g) {
     return (
       <div key={g.key} style={{ marginBottom: 16 }}>
@@ -1228,7 +1239,7 @@ export default function Research() {
           <label>步长<input type="number" step="1" min="1" value={cfgSweep.score_step ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, score_step: +e.target.value }))} /></label>
         </div>
         <div style={{ fontSize: 12, margin: '6px 0' }}>
-          预估组合数 <b>{sweepComboEstimate.toLocaleString()}</b>（引擎按 ≤5000/批 分批全量模拟后批冠军 PK）
+          预估组合数 <b>{sweepComboEstimate.toLocaleString()}</b>（引擎按 ≤5000 组合/批 分批全量模拟后批冠军 PK）
           {sweepComboEstimate > 100000 && <span style={{ color: '#e34d59' }}>超上限 100000，请放宽步长</span>}
         </div>
         <Button theme="primary" onClick={saveSweepPool}>保存参数池</Button>

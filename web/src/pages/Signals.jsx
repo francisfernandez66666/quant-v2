@@ -9,6 +9,7 @@ import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import LogModal from '../components/LogModal.jsx'
 
+// 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
 const FILTERS = [
   { key: 'all', label: '全部' },
   { key: 'strong', label: '可开仓' },
@@ -43,18 +44,31 @@ function chgColor(v) {
  * @returns {JSX.Element}
  */
 export default function Signals() {
+  // 策略信号列表
   const [signals, setSignals] = useState([])
+  // 已展开分时图的信号代码集合
   const [klineOpen, setKlineOpen] = useState(new Set())
+  // 当前等级筛选（all/strong/observe/mute）
   const [activeFilter, setActiveFilter] = useState('all')
+  // 当前战法筛选
   const [activeStrategy, setActiveStrategy] = useState('all')
+  // 买入/忽略确认弹窗显隐
   const [showConfirm, setShowConfirm] = useState(false)
+  // 日志弹窗显隐
   const [showLog, setShowLog] = useState(false)
+  // 移动端底部操作面板对应的信号
   const [sheetSignal, setSheetSignal] = useState(null)
+  // 模拟盘是否启用（决定是否显示「模拟买入」）
   const [paperOn, setPaperOn] = useState(false)
+  // 待确认交易的信号对象
   const [tradeTarget, setTradeTarget] = useState({})
+  // 待确认交易动作（buy/ignore）
   const [tradeAction, setTradeAction] = useState('')
+  // 主数据轮询定时器（5s）
   const timer = useRef(null)
+  // 页面可见性变化处理函数
   const visHandler = useRef(null)
+  // SSE 订阅取消函数
   const unsubSSE = useRef(null)
 
   const strategyOptions = Array.from(new Set(signals.map((s) => s.strategy).filter(Boolean)))
@@ -62,6 +76,7 @@ export default function Signals() {
   const filteredSignals = signals
     .filter((s) => (activeFilter !== 'all' ? s.remind_level === activeFilter : true))
     .filter((s) => (activeStrategy !== 'all' ? s.strategy === activeStrategy : true))
+    // 过滤掉「预期差」战法（非标准评级信号，不在列表展示）
     .filter((s) => s.strategy !== '预期差')
 
   // 根据操作结果弹出成功/失败提示
@@ -166,6 +181,7 @@ export default function Signals() {
   useEffect(() => {
     load()
     probePaper()
+    // 每 5s 轮询刷新信号列表
     timer.current = setInterval(load, 5000)
     visHandler.current = () => {
       if (document.hidden) {
@@ -186,6 +202,8 @@ export default function Signals() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 信号表格列定义：代码、名称、现价/涨跌、策略、总分、等级、
+  // D1-D4 维度评分、分时展开按钮、买入/忽略/模拟买入/收藏操作
   const columns = [
     { colKey: 'code', title: '代码', width: 90 },
     { colKey: 'name', title: '名称', width: 100, cell: ({ row }) => row.name || '-' },

@@ -1,11 +1,14 @@
 // ── 量化交易页 Quant.jsx ──
-// Quant trading page: live-trading link status, master switch / execution mode,
-// position discipline, and strategy whitelist. 30s trades + 10s link polling.
+// 页面用途：实盘链路总开关、执行方式、仓位纪律与战法白名单的统一管理界面。
+// 主要功能：查看首尔↔广州链路状态/熔断；配置总开关、执行模式、委托价格、心跳超时、网关与 Token；
+//          设定最大持仓/单票金额/预算等仓位纪律；按战法开关实盘准入并展示交易流水与归因盈亏。
+//          定时轮询：链路状态 10s 一次、交易流水 30s 一次；保存后约 5s 热加载生效。
 // 使用 TDesign React 组件（Card / Form / Input / Switch / Button / Tag / Table）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Form, Input, Switch, Button, Tag, Table, MessagePlugin, DialogPlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 
+// 已知战法枚举：value 为后端标识，label 为前端展示名称（全部开启即表示不设白名单）
 const KNOWN_STRATEGIES = [
   { value: 'dragon', label: '龙头战法 Dragon' },
   { value: 'double_bump', label: '双响炮 DoubleBump' },
@@ -13,11 +16,12 @@ const KNOWN_STRATEGIES = [
   { value: 'dragon_return', label: '龙回头(中线) DragonReturn' },
 ]
 
-// 涨跌配色（红涨绿跌）
+// 涨跌配色（红涨绿跌）：盈亏 >=0 用红色，<0 用绿色
 function pnlColor(v) {
   return (v || 0) >= 0 ? '#e34d59' : '#00a870'
 }
 
+// 通用确认弹窗：返回 Promise<boolean>，用户确认 resolve(true)、关闭 resolve(false)
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
     const d = DialogPlugin.confirm({
@@ -30,6 +34,19 @@ function confirmDialog(body, header = '确认') {
   })
 }
 
+/**
+ * 量化交易主页面组件。
+ * state：链路运行状态（enabled / 心跳 / 延迟 / 熔断等）。
+ * form：实盘链路与仓位纪律的可编辑表单数据（保存时整体回写后端）。
+ * tokenInput：鉴权 Token 明文输入，留空表示沿用原值。
+ * knownStrategies：后端已知的全部战法标识列表。
+ * strategyOn：各战法是否允许进入实盘的开关映射。
+ * strategyDirty：战法开关是否被改动（控制保存按钮可用性）。
+ * saving：保存中标志（禁用按钮、防重复提交）。
+ * trades：交易流水与整体/分战法盈亏汇总。
+ * amountsInput：各战法自定义单票金额（留空则用全局 fixed_amount）。
+ * 副作用：挂载时拉取配置/状态/流水，并以定时器轮询刷新。
+ */
 export default function Quant() {
   const [state, setState] = useState(null)
   const [form, setForm] = useState({
@@ -57,10 +74,12 @@ export default function Quant() {
     return `当前：${onCount}/${strategyRows.length} 允许进入实盘`
   }, [strategyRows, strategyOn, allStrategyOn])
 
+  // 金额格式化：正数补 + 号并保留两位小数
   function fmtMoney(v) {
     const n = Number(v) || 0
     return (n > 0 ? '+' : '') + n.toFixed(2)
   }
+  // 将秒级时间戳格式化为「x秒前 / x分前 / x小时前」
   function fmtAgo(ts) {
     if (!ts) return ''
     const sec = Math.floor((Date.now() - ts * 1000) / 1000)
@@ -69,6 +88,7 @@ export default function Quant() {
     return Math.floor(sec / 3600) + '小时前'
   }
 
+  // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启
   async function loadConfig() {
     const c = await api.fetchQMTConfig()
     setForm({
@@ -91,6 +111,7 @@ export default function Quant() {
     setStrategyDirty(false)
   }
 
+  // 拉取交易流水（含汇总与分战法/成交流水），仅在返回合法时更新
   async function loadTrades() {
     try {
       const t = await api.fetchQMTTrades()
@@ -98,12 +119,15 @@ export default function Quant() {
     } catch (_) {}
   }
 
+  // 拉取链路运行状态（心跳/延迟/熔断等）
   async function loadState() {
     try { setState(await api.fetchQMTState()) } catch (_) {}
   }
 
+  // 标记战法开关被改动
   function markStrategyDirty() { setStrategyDirty(true) }
 
+  // 通用保存：回写指定字段到后端，成功提示并重新拉取配置，失败提示错误
   async function patch(fields, okTip) {
     setSaving(true)
     try {
@@ -117,6 +141,7 @@ export default function Quant() {
     }
   }
 
+  // 保存实盘总开关：启用前需二次确认（将向网关下发真实交易指令）
   async function saveSwitches(v) {
     const next = v === undefined ? form.enabled : v
     if (next && !(await confirmDialog('确认启用实盘链路？启用后将按下方参数向广州网关传递真实交易指令。', '启用实盘链路'))) {
@@ -126,6 +151,7 @@ export default function Quant() {
     await patch({ enabled: next }, next ? '实盘链路已启用' : '实盘链路已停用')
   }
 
+  // 保存执行参数（模式/价格/自动卖出/网关/心跳/Token），切换全自动前需确认
   async function saveExec() {
     if (form.mode === 'auto' && !(await confirmDialog('确认切换为「全自动」？信号将不经人工确认直接下单（受熔断/纪律约束）。', '切换全自动'))) {
       setForm({ ...form, mode: 'manual' })
@@ -139,6 +165,7 @@ export default function Quant() {
     await patch(fields, '执行参数已保存')
   }
 
+  // 保存仓位纪律（最大持仓/单票金额/初始资金/日买笔数上限/日预算）
   async function saveCaps() {
     await patch({
       max_positions: form.max_positions, fixed_amount: form.fixed_amount,
@@ -147,6 +174,7 @@ export default function Quant() {
     }, '仓位纪律已保存')
   }
 
+  // 保存战法白名单与自定义金额：全部开启时传空数组表示不设白名单
   async function saveStrategies() {
     const values = strategyRows.filter((s) => strategyOn[s.value]).map((s) => s.value)
     const amounts = {}
@@ -162,17 +190,20 @@ export default function Quant() {
 
   useEffect(() => {
     loadState()
+    // 链路状态每 10s 轮询一次（心跳/延迟/熔断实时性要求高）
     stateTimer.current = setInterval(loadState, 10000)
     loadTrades()
+    // 交易流水每 30s 轮询一次（成交频率低，降低刷新压力）
     tradesTimer.current = setInterval(loadTrades, 30000)
     loadConfig().catch((e) => MessagePlugin.error('加载实盘配置失败：' + (e && e.message ? e.message : e)))
+    // 卸载时清除两个定时器，防止内存泄漏与重复请求
     return () => {
       if (stateTimer.current) clearInterval(stateTimer.current)
       if (tradesTimer.current) clearInterval(tradesTimer.current)
     }
   }, [])
 
-  // 执行模式 / 委托价格 的分段切换
+  // 执行模式 / 委托价格 的分段切换按钮样式工厂：active 为当前选中项
   const segBtn = (active) => ({
     marginRight: 8,
     padding: '5px 14px', borderRadius: 6, fontSize: 13, cursor: 'pointer',
@@ -181,6 +212,7 @@ export default function Quant() {
     background: active ? 'rgba(179,136,255,0.1)' : 'transparent',
   })
 
+  // 分战法盈亏表列定义：realized_pnl 按涨跌配色渲染
   const byStrategyColumns = [
     { colKey: 'strategy', title: '战法', width: 140 },
     { colKey: 'buys', title: '买入额', width: 110 },
@@ -192,6 +224,7 @@ export default function Quant() {
     { colKey: 'trade_count', title: '笔数', width: 80 },
   ]
 
+  // 成交流水表列定义：time 去掉 ISO 的 T 并截取至秒；side 买入红/卖出绿
   const fillsColumns = [
     { colKey: 'time', title: '时间', width: 130, cell: ({ row }) => (row.traded_at || '').replace('T', ' ').slice(5, 19) },
     { colKey: 'code', title: '代码', width: 90 },

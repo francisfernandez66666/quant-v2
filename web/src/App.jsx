@@ -233,6 +233,8 @@ export default function App() {
   }
 
   // ── 主界面 ──
+  // 根据权限（canResearch/canAdmin）与模拟盘开关（paperEnabled）动态生成侧边栏导航项，
+  // 过滤掉当前角色无权访问或功能未开启的入口，再交给下方 Menu 渲染
   const navItems = [
     { to: '/dashboard', icon: '📊', label: '仪表盘' },
     { to: '/signals', icon: '⚡', label: '信号', badge: signalCount },
@@ -251,6 +253,7 @@ export default function App() {
 
   return (
     <ConfigProvider>
+      {/* 安全兜底：理论上进入主布局时 loggedIn 必为 true，此处保留登录页分支以防状态竞态 */}
       {!loggedIn ? (
         <div className="login-page">
           <div className="login-box">
@@ -274,44 +277,57 @@ export default function App() {
         </div>
       ) : (
         <div className="app-shell">
+          {/* 顶部栏：左侧为汉堡菜单按钮 + 交易时段指示 + 服务在线状态，右侧为做空开关 + 通知测试 + 退出 */}
           <header className="app-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
+              {/* 汉堡按钮：点击切换侧边栏显隐（移动端抽屉式） */}
               <div className="hamburger" onClick={() => setMenuOpen((o) => !o)}><span></span><span></span><span></span></div>
+              {/* 交易时段指示：inTradeTime 为 true 显示"交易时段"，false 显示"盘前/盘后" */}
               <span>{inTradeTime !== null && (inTradeTime ? '🟢 交易时段' : '🔴 盘前/盘后')}</span>
+              {/* 后端服务连通状态文字提示 */}
               <span className="muted">{serverOnline ? '服务在线' : '离线'}</span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              {/* 做空开关：开启后允许"做多+做空"，关闭则"仅做多" */}
               <Switch value={shortEnabled} onChange={onShortToggle} />
               <span className="muted">{shortEnabled ? '做多+空' : '仅做多'}</span>
+              {/* 通知测试按钮：验证系统/原生通知通道是否可用 */}
               <Button theme="default" variant="outline" size="small" onClick={() => {
                 const sent = sendNotify('量仔期货', '通知测试成功')
                 MessagePlugin.info('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')))
               }}>🔔</Button>
+              {/* 退出登录 */}
               <Button theme="default" variant="outline" size="small" onClick={logout}>退出</Button>
             </div>
           </header>
           <div className="app-body">
+            {/* 侧边栏：品牌 logo + 导航菜单 + 底部当前账号；menuOpen 控制移动端抽屉展开 */}
             <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
               <div className="brand-logo">量仔期货</div>
               <div style={{ flex: 1, overflowY: 'auto' }}>
+                {/* 根据 navItems 渲染导航项，当前路由高亮；点击后跳转并收起抽屉 */}
                 <Menu theme="light" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
                   {navItems.map((it) => (
                     <Menu.MenuItem key={it.to} value={it.to}>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                         <span>{it.icon}</span>
                         <span>{it.label}</span>
+                        {/* 存在未读数量时展示角标（信号/消息数） */}
                         {it.badge > 0 && <Badge count={it.badge} />}
                       </span>
                     </Menu.MenuItem>
                   ))}
                 </Menu>
               </div>
+              {/* 侧边栏底部固定显示登录账号名 */}
               <div className="sidebar-footer">
                 <div className="account-name">{account}</div>
               </div>
             </aside>
+            {/* 移动端抽屉展开时，点击遮罩收起侧边栏 */}
             {menuOpen && <div className="sidebar-overlay" onClick={() => setMenuOpen(false)} />}
             <main className="app-main">
+              {/* 路由出口：根据 path 渲染对应页面组件；根路径重定向到仪表盘 */}
               <Routes>
                 <Route path="/" element={<Navigate to="/dashboard" replace />} />
                 <Route path="/dashboard" element={<Dashboard />} />

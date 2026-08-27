@@ -29,6 +29,11 @@ const C = {
   volDown: '#1fa747',
 }
 
+/**
+ * 格式化成交量/委托量为中文单位（亿/万）。
+ * @param {number} v 原始数值
+ * @returns {string} 例如 "1.23亿" / "4.5万" / "123"
+ */
 // 格式化成交量/委托量为中文单位
 function fmtVol(v) {
   const n = Number(v) || 0
@@ -36,6 +41,11 @@ function fmtVol(v) {
   if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'
   return String(n)
 }
+/**
+ * 格式化成交额为中文单位（亿/万）。
+ * @param {number} v 原始金额
+ * @returns {string} 例如 "1.23亿" / "4.5万"
+ */
 // 格式化成交额为中文单位
 function fmtAmt(v) {
   const n = Number(v) || 0
@@ -44,6 +54,11 @@ function fmtAmt(v) {
   return String(n)
 }
 
+/**
+ * 在 canvas 上批量绘制一条折线（移动到首点后依次 lineTo）。
+ * @param {CanvasRenderingContext2D} ctx 2D 绘图上下文
+ * @param {Array<[number,number]>} coords [[x,y], ...] 坐标数组
+ */
 // 在 canvas 上绘制折线
 function drawPolyline(ctx, coords) {
   if (!coords.length) return
@@ -145,7 +160,7 @@ export default function KLineChart({
     if (!cvs || raw.length === 0) return
 
     const dpr = window.devicePixelRatio || 1
-    const viewH = Math.max(height, Math.round(viewW * 0.55))
+    const viewH = Math.max(height, Math.round(viewW * 0.55)) // 画布高度：不低于传入 height，且按宽度 0.55 比例自适应
     cvs.width = Math.round(viewW * dpr)
     cvs.height = Math.round(viewH * dpr)
     cvs.style.width = viewW + 'px'
@@ -157,14 +172,14 @@ export default function KLineChart({
     ctx.fillRect(0, 0, viewW, viewH)
 
     const innerH = viewH - plotT - axisB
-    const macdH = Math.round(innerH * 0.32)
-    const volH = Math.round(innerH * 0.18)
-    const mainH = innerH - macdH - volH
+    const macdH = Math.round(innerH * 0.32) // MACD 区占内部高度 32%
+    const volH = Math.round(innerH * 0.18) // 成交量区占 18%
+    const mainH = innerH - macdH - volH    // 余下为主图（价格/均价）区
     const priceBottom = plotT + mainH
     const volTop = priceBottom
     const volBottom = volTop + volH
     const macdTop = volBottom
-    const macdZero = macdTop + macdH / 2
+    const macdZero = macdTop + macdH / 2   // MACD 零轴位于该区垂直中点
     const plotW = viewW - plotL - plotR
 
     // 价格区间（绕昨收对称，兜底防溢出）
@@ -187,8 +202,8 @@ export default function KLineChart({
     const priceY = (v) => plotT + (hi - v) / (hi - lo) * mainH
     const macdLineY = (v, maxAbs, half) => macdZero - (v / maxAbs) * half
 
-    const n = raw.length
-    const step = plotW / n
+    const n = raw.length            // 数据点总数（整日分时通常为 241 个分钟点）
+    const step = plotW / n           // 单个数据点占用的横向像素宽度
     const cxOf = (i) => plotL + step * i + step / 2
 
     // 分时点坐标
@@ -212,7 +227,7 @@ export default function KLineChart({
     let maxV = 0
     for (const p of raw) if (p.volume > maxV) maxV = p.volume
     if (maxV <= 0) maxV = 1
-    const vW = Math.max(1, step * 0.6)
+    const vW = Math.max(1, step * 0.6) // 成交量柱宽 = 单个点宽度的 60%，至少 1px
     const volBars = raw.map((p, i) => {
       const cx = cxOf(i)
       const h = (p.volume / maxV) * volH
@@ -305,7 +320,7 @@ export default function KLineChart({
     ctx.strokeStyle = deaColor
     drawPolyline(ctx, deaCoords)
 
-    // X 轴时间刻度（≤6 个）
+    // X 轴时间刻度（最多 6 个，均匀取点）
     ctx.fillStyle = C.axisTxt
     ctx.textAlign = 'center'
     const tcount = Math.min(6, n)

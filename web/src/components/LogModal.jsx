@@ -4,6 +4,11 @@ import React, { useState, useEffect, useMemo, useRef } from 'react'
 import * as api from '../api/index.js'
 import './LogModal.css'
 
+/**
+ * 将时间戳格式化为本地 "HH:mm:ss"，用于下拉选项与概要栏。
+ * @param {number|string} t 时间戳或日期字符串
+ * @returns {string} 格式化时间或 "-"
+ */
 // 将时间格式化为 HH:mm:ss，用于下拉选项与概要栏
 function fmtTime(t) {
   if (!t) return '-'
@@ -11,11 +16,23 @@ function fmtTime(t) {
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+/**
+ * 大小写不敏感地判断文本是否包含关键词（空白关键词视为不匹配）。
+ * @param {string} text 待检索文本
+ * @param {string} q 关键词
+ * @returns {boolean}
+ */
 function hasText(text, q) {
   if (!text || !q) return false
   return String(text).toUpperCase().includes(q)
 }
 
+/**
+ * 判断一条 LLM 事件是否命中搜索关键词（标题/理由/板块/关联股/清洗股）。
+ * @param {object} ev Stage2 事件对象
+ * @param {string} q 关键词
+ * @returns {boolean}
+ */
 function eventHit(ev, q) {
   if (!ev) return false
   if (hasText(ev.title, q)) return true
@@ -26,6 +43,12 @@ function eventHit(ev, q) {
   return false
 }
 
+/**
+ * 判断一条信号是否命中搜索关键词（代码/名称/板块/战法/理由）。
+ * @param {object} sg 信号对象
+ * @param {string} q 关键词
+ * @returns {boolean}
+ */
 function sigHit(sg, q) {
   if (!sg) return false
   if (hasText(sg.code, q)) return true
@@ -131,15 +154,22 @@ export default function LogModal({ visible, onClose }) {
     [sigSearchGroups]
   )
 
+  // 切换标签页：若目标标签尚无数据且两类记录都为空，则触发一次加载
   function switchTab(t) {
     setActiveTab(t)
     if ((t === 'llm' && llmData) || (t === 'signal' && sigData)) return
     if (!llmRecords.length && !sigRecords.length) load()
   }
 
+  /**
+   * 并行拉取 LLM 分析记录与信号批次日志（任一失败不影响另一部分展示）。
+   * 成功时回填对应 state；全部为空时标记 NoData。
+   * @returns {Promise<void>}
+   */
   async function load() {
     if (loading) return
     setLoading(true)
+    // 并发请求两类日志，使用 allSettled 避免一方失败阻断另一方
     const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs()])
     if (srRes.status === 'fulfilled' && Array.isArray(srRes.value) && srRes.value.length) {
       setLlmRecords(srRes.value)
@@ -167,11 +197,13 @@ export default function LogModal({ visible, onClose }) {
     setLoading(false)
   }
 
+  // 弹窗每次变为可见时重新拉取最新日志
   useEffect(() => {
     if (visible) load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible])
 
+  // 首次挂载且可见时拉取一次（与上面的 visible 监听互补，保证初始渲染即加载）
   useEffect(() => {
     if (visible && !firstLoad.current) {
       firstLoad.current = true

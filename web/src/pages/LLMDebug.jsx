@@ -7,14 +7,14 @@ import { Card, Table, Tag, Button, Dialog, Tabs, Input, Select } from 'tdesign-r
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
-// 根据新闻/信号方向返回 TDesign Tag 主题
+// 根据新闻/信号方向（利好/利空/中性）返回对应的 TDesign Tag 主题色
 function dirTheme(d) {
   if (d === '利好') return 'success'
   if (d === '利空') return 'danger'
   return 'warning'
 }
 
-// 将标签数组渲染为一组 TDesign Tag
+// 将标签数组渲染为一组 TDesign Tag；kind 为 'stock' 时使用 warning 主题区分个股标签
 function TagList({ items, kind }) {
   if (!items || !items.length) return <span className="muted">—</span>
   return (
@@ -26,9 +26,13 @@ function TagList({ items, kind }) {
   )
 }
 
+// 工具栏容器样式（搜索框 + 批次下拉 + 刷新按钮）
 const toolbarStyle = { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }
+// 顶部统计条样式：横向排列原始条数 / 筛选后 / 分析时间等指标
 const summaryBarStyle = { display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: 13, padding: '4px 0' }
+// 单个统计项：标签在上、数值在下
 const summaryItemStyle = { display: 'flex', flexDirection: 'column', gap: 2 }
+// 空数据占位样式
 const emptyStyle = { textAlign: 'center', color: '#888', padding: 24 }
 
 /**
@@ -194,6 +198,7 @@ function LogModal({ visible, onClose }) {
     value: i,
   }))
 
+  // Stage1 初筛表格列定义：序号 / 标题 / 是否通过筛选
   const stage1Columns = [
     { colKey: 'idx', title: '#', width: 60 },
     { colKey: 'title', title: '标题', ellipsis: true },
@@ -206,6 +211,7 @@ function LogModal({ visible, onClose }) {
       ),
     },
   ]
+  // Stage2 事件分析表格列定义：标题 / 方向 / 评分 / 板块 / 个股 / 上下游 / 影响 / 类型 / 理由
   const stage2Columns = [
     { colKey: 'title', title: '标题', ellipsis: true, minWidth: 160 },
     {
@@ -230,6 +236,7 @@ function LogModal({ visible, onClose }) {
     { colKey: 'reason', title: '理由', ellipsis: true, minWidth: 160 },
   ]
 
+  // 信号批次表格列定义：代码 / 名称 / 战法 / 方向 / 动作 / 置信 / 现价 / 板块 / 理由
   const signalColumns = [
     { colKey: 'code', title: '代码', width: 90 },
     { colKey: 'name', title: '名称', width: 100 },
@@ -480,6 +487,7 @@ export default function LLMDebug() {
   // 页面挂载时加载最新 Stage 记录
   useEffect(() => { loadData() }, [])
 
+  // Stage1 初筛表格列定义：序号 / 标题 / 是否通过筛选
   const stage1Columns = [
     { colKey: 'idx', title: '#', width: 60 },
     { colKey: 'title', title: '标题', ellipsis: true },
@@ -492,6 +500,7 @@ export default function LLMDebug() {
       ),
     },
   ]
+  // Stage2 事件分析表格列定义：标题 / 方向 / 评分 / 板块 / 个股 / 上下游 / 影响 / 类型 / 理由
   const stage2Columns = [
     { colKey: 'title', title: '标题', ellipsis: true, minWidth: 160 },
     {
