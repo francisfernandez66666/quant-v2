@@ -27,6 +27,10 @@ type RealPosition struct {
 	Strategy     string  `json:"strategy"`      // 战法
 	SignalID     string  `json:"signal_id"`     // 信号ID
 	UpdatedAt    string  `json:"updated_at"`    // 更新时间
+	// CurPrice §前端实盘持仓现价/盈亏展示用：由 handleRealPositions 装配实时行情快照填充，
+	// 网关回报本身不含实时价（仅 cost_price）。English: live price for the real-position table;
+	// filled from the quote snapshot by handleRealPositions, not carried in gateway reports.
+	CurPrice float64 `json:"cur_price"` // 实时现价（浮动盈亏计算用）
 	// UserID §GAP1.10 多租户归属：网关回报 user_id 写入；空串=遗留全局行（对所有人可见，
 	// 兼容单老板存量部署）。English: §GAP1.10 owner account; empty = legacy global row.
 	UserID string `json:"user_id,omitempty"` // 归属用户
@@ -257,14 +261,16 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID)
 	switch {
 	case err == sql.ErrNoRows:
-		// 首次成交：建仓（卖出空仓视为 no-op，仅记录 fills，不建行）
+		// 首次成交：建仓（卖出空仓视为 no-op，仅记录 fills，不建行）。
+	// §实盘账户隔离：INSERT 必须写入 user_id，将该持仓归属到来源成交的账号，
+	// 否则该持仓会落入 user_id='' 的遗留全局行，对所有账号可见，造成跨账号持仓泄漏。
 		err = nil
 		if f.Side == "买入" {
 			_, err = tx.Exec(`INSERT INTO real_positions
-				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				f.Code, "", f.Qty, f.Price, f.Price*float64(f.Qty), f.Price, "", f.SignalID,
-				time.Now().Format("2006-01-02 15:04:05"))
+				time.Now().Format("2006-01-02 15:04:05"), f.UserID)
 		}
 	case err == nil:
 		now := time.Now().Format("2006-01-02 15:04:05")
@@ -278,16 +284,19 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			if f.Price > hi {
 				hi = f.Price
 			}
+			// §实盘账户隔离：加仓时一并回写 user_id，确保归属字段不被旧行残值覆盖。
 			_, err = tx.Exec(`UPDATE real_positions SET qty=?, cost_price=?, amount=?,
-				highest_price=?, updated_at=? WHERE ts_code=?`,
-				newQty, newCost, newCost*float64(newQty), hi, now, f.Code)
+				highest_price=?, updated_at=?, user_id=? WHERE ts_code=?`,
+				newQty, newCost, newCost*float64(newQty), hi, now, f.UserID, f.Code)
 		} else {
 			newQty := p.Qty - f.Qty
 			if newQty < 0 {
 				newQty = 0
 			}
-			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=? WHERE ts_code=?`,
-				newQty, float64(newQty)*p.CostPrice, now, f.Code)
+			// §实盘账户隔离：减仓时同样回写 user_id（减仓不改变归属，但保持写路径一致，
+			// 防止历史上 user_id 为空的持仓在减仓后仍以全局行形态存在）。
+			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=? WHERE ts_code=?`,
+				newQty, float64(newQty)*p.CostPrice, now, f.UserID, f.Code)
 		}
 	}
 	if err != nil {

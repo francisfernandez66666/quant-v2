@@ -127,12 +127,71 @@ func (r *Report) LogSignalWithMeta(id, code, name, direction, strategy string, e
 	log.Printf("[report] 开仓记录: %s %s %s %.2f", strategy, code, name, entryPrice)
 }
 
+// LogSignalWithMetaUser 在 LogSignalWithMeta 基础上支持写入归属账号 userID。
+// 多账号部署下，模拟盘→report 镜像建仓必须带上 userID，否则 ExecLog.UserID 为空，
+// 跨账号按需按账号查询 report 持仓/出场评估时会串号（A 账号的纸面持仓被 B 账号的退出引擎消费）。
+// English: extends LogSignalWithMeta with the owning account's userID. Under multi-account deploy the
+// paper→report mirror open MUST carry userID, otherwise ExecLog.UserID stays empty and per-account
+// report queries (exit-engine consumption) cross wire between accounts.
+func (r *Report) LogSignalWithMetaUser(id, code, name, direction, strategy string, entryPrice, takeProfitPct, stopLossPct float64, meta map[string]float64, userID string) {
+	entryMeta := make(map[string]float64, len(meta)+1)
+	for k, v := range meta {
+		entryMeta[k] = v
+	}
+	if _, ok := entryMeta["highest_price"]; !ok {
+		entryMeta["highest_price"] = entryPrice
+	}
+	highest := entryPrice
+	if h, ok := entryMeta["highest_price"]; ok && h > 0 {
+		highest = h
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.logs = append(r.logs, ExecLog{
+		SignalID:      id,
+		UserID:        userID, // §多账号隔离：镜像建仓归属到具体账号
+		Code:          code,
+		Name:          name,
+		Direction:     direction,
+		Strategy:      strategy,
+		EntryAt:       time.Now(),
+		EntryPrice:    entryPrice,
+		Status:        "持仓中",
+		TakeProfitPct: takeProfitPct,
+		StopLossPct:   stopLossPct,
+		EntryMeta:     entryMeta,
+		HighestPrice:  highest,
+	})
+	r.save()
+	log.Printf("[report] 开仓记录: %s %s %s %.2f (user=%s)", strategy, code, name, entryPrice, userID)
+}
+
 // LogSignalWithMetaQty 在 LogSignalWithMeta 基础上支持指定开仓数量（C6 仓位管理）。
 // qty<=0 时使用默认 1。其余行为与 LogSignalWithMeta 一致。
 // English: extends LogSignalWithMeta with an explicit opening quantity (C6 position sizing); qty<=0
 // falls back to 1. Otherwise identical.
 func (r *Report) LogSignalWithMetaQty(id, code, name, direction, strategy string, entryPrice, takeProfitPct, stopLossPct float64, qty float64, meta map[string]float64) {
 	r.LogSignalWithMeta(id, code, name, direction, strategy, entryPrice, takeProfitPct, stopLossPct, meta)
+	if qty <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.logs {
+		if r.logs[i].SignalID == id {
+			r.logs[i].Quantity = qty
+			break
+		}
+	}
+	r.save()
+}
+
+// LogSignalWithMetaQtyUser 在 LogSignalWithMetaUser 基础上支持指定开仓数量并写入归属账号 userID。
+// 供模拟盘→report 镜像建仓使用：既带数量（C6 仓位管理），又带 userID（多账号隔离，防止串号）。
+// English: LogSignalWithMetaQtyUser = LogSignalWithMetaUser + explicit quantity + owning userID; used by
+// the paper→report mirror open so the record carries both its size and its account (no cross-wiring).
+func (r *Report) LogSignalWithMetaQtyUser(id, code, name, direction, strategy string, entryPrice, takeProfitPct, stopLossPct float64, qty float64, meta map[string]float64, userID string) {
+	r.LogSignalWithMetaUser(id, code, name, direction, strategy, entryPrice, takeProfitPct, stopLossPct, meta, userID)
 	if qty <= 0 {
 		return
 	}
@@ -512,17 +571,17 @@ func (r *Report) StatsFor(userID string) (total, holding, win int, winRate, avgW
 // 支撑"按战法归因"的绩效分析。ProfitFactor 为盈亏比（总盈利/总亏损绝对值），
 // 无亏损记录时为 0（避免除零，由调用方决定展示口径）。
 type StrategyStats struct {
-	Strategy     string  // 战法名称（对应 ExecLog.Strategy）
-	Total        int     // 计入统计的总记录数（不含已删除）
-	Closed       int     // 已平仓笔数（含赢/亏/平手）
-	Win          int     // 盈利笔数
-	Loss         int     // 亏损笔数
-	Draw         int     // 平手笔数（盈亏为 0）
-	Holding      int     // 仍在持仓中的笔数
-	WinRate      float64 // 胜率百分比（Win / (Win+Loss) * 100）
-	AvgWinPct    float64 // 平均盈利百分比（正数）
-	AvgLossPct   float64 // 平均亏损百分比（负数）
-	ProfitFactor float64 // 盈亏比（总盈利 / 总亏损绝对值），无亏损时为 0
+	Strategy     string  `json:"strategy"`      // 战法名称（对应 ExecLog.Strategy）
+	Total        int     `json:"total"`         // 计入统计的总记录数（不含已删除）
+	Closed       int     `json:"closed"`        // 已平仓笔数（含赢/亏/平手）
+	Win          int     `json:"win"`           // 盈利笔数
+	Loss         int     `json:"loss"`          // 亏损笔数
+	Draw         int     `json:"draw"`          // 平手笔数（盈亏为 0）
+	Holding      int     `json:"holding"`       // 仍在持仓中的笔数
+	WinRate      float64 `json:"win_rate"`      // 胜率百分比（Win / (Win+Loss) * 100）
+	AvgWinPct    float64 `json:"avg_win_pct"`   // 平均盈利百分比（正数）
+	AvgLossPct   float64 `json:"avg_loss_pct"`  // 平均亏损百分比（负数）
+	ProfitFactor float64 `json:"profit_factor"` // 盈亏比（总盈利 / 总亏损绝对值），无亏损时为 0
 }
 
 // StatsByStrategy 返回按战法分组的交易统计指标（胜率/平均盈/平均亏/盈亏比/样本数）。

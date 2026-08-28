@@ -65,6 +65,14 @@ export default function Research() {
   const [optLaunching, setOptLaunching] = useState(false)
   const [optSelected, setOptSelected] = useState('')
   const [optDrawerOpen, setOptDrawerOpen] = useState(false)
+  const [schedStatus, setSchedStatus] = useState(null) // 研究调度可见性快照（为何卡排队）
+  // 任务运行日志弹窗（前端直接看 researchd 落盘的 task_<id>.log，免去 SSH）
+  const [logOpen, setLogOpen] = useState(false)
+  const [logId, setLogId] = useState(0)
+  const [logContent, setLogContent] = useState('')
+  const [logExists, setLogExists] = useState(true)
+  const [logLoading, setLogLoading] = useState(false)
+  const logTimer = useRef(null)
   const [cfgSweep, setCfgSweep] = useState({})
   const [cfgRule, setCfgRule] = useState({})
   const [expandedStrategy, setExpandedStrategy] = useState('')
@@ -250,7 +258,38 @@ export default function Research() {
     setLoading(true)
     await loadProgress()
     await loadData()
+    await loadSchedStatus()
     setLoading(false)
+  }
+  // 读取研究调度可见性快照：让前端直接展示"为何卡排队"（禁用/交易时段/内存闸门/槽位占用）。
+  async function loadSchedStatus() {
+    try {
+      const res = await api.getSchedulerStatus()
+      setSchedStatus(res && res.ok ? res : null)
+    } catch (e) { setSchedStatus(null) }
+  }
+  // 打开任务运行日志弹窗：拉取 task_<id>.log，运行中的任务每 4s 自动刷新。
+  async function openLog(id) {
+    setLogId(id); setLogOpen(true); setLogLoading(true)
+    try {
+      const res = await api.getResearchTaskLog(id)
+      setLogExists(res && res.exists !== false)
+      setLogContent((res && res.log) || '')
+    } catch (e) {
+      setLogExists(false); setLogContent('')
+    } finally { setLogLoading(false) }
+    if (logTimer.current) clearInterval(logTimer.current)
+    logTimer.current = setInterval(async () => {
+      try {
+        const res = await api.getResearchTaskLog(id)
+        setLogExists(res && res.exists !== false)
+        setLogContent((res && res.log) || '')
+      } catch (e) { /* 静默，关闭时清理 */ }
+    }, 4000)
+  }
+  function closeLog() {
+    if (logTimer.current) { clearInterval(logTimer.current); logTimer.current = null }
+    setLogOpen(false)
   }
   function statusLabel(s) {
     const m = { proposed: '待审批', approved: '已审批', applied: '已应用', rejected: '已驳回' }
@@ -744,6 +783,7 @@ export default function Research() {
             <Button size="small" onClick={() => doBacktestById(row.candidate_id)}>{row.status === 'interrupted' ? '续跑' : '重新回测'}</Button>}
           {row.kind === 'library' && row.strategy_kind && row.status !== 'queued' && row.status !== 'running' && row.status !== 'paused' &&
             <Button size="small" onClick={() => rerunLibrary(row)}>{row.status === 'interrupted' ? '重跑' : '重新回测'}</Button>}
+          {row.id > 0 && <Button size="small" variant="outline" onClick={() => openLog(row.id)}>日志</Button>}
         </div>
       )
     } },
@@ -980,6 +1020,24 @@ export default function Research() {
         </div>
       </div>
 
+      {schedStatus && (
+        <div style={{
+          background: (schedStatus.reason || '').includes('拦截') || (schedStatus.reason || '').includes('禁用') ? '#fef2f2'
+            : schedStatus.busy ? '#eff6ff' : '#f0fdf4',
+          color: (schedStatus.reason || '').includes('拦截') || (schedStatus.reason || '').includes('禁用') ? '#b91c1c'
+            : schedStatus.busy ? '#1d4ed8' : '#15803d',
+          border: '1px solid',
+          borderColor: (schedStatus.reason || '').includes('拦截') || (schedStatus.reason || '').includes('禁用') ? '#fecaca'
+            : schedStatus.busy ? '#bfdbfe' : '#bbf7d0',
+          borderRadius: 6, padding: '8px 12px', marginBottom: 12, fontSize: 13
+        }}>
+          <b>研究调度状态</b>：{schedStatus.reason}
+          <span style={{ color: '#888', marginLeft: 8 }}>
+            （北京时间 {schedStatus.beijing_now} · 交易时段={schedStatus.in_trading_window ? '是' : '否'} · 内存可用 {schedStatus.mem_avail_mb}MB · 闸门={schedStatus.mem_gate_open ? '开' : '关'} · 槽位={schedStatus.busy ? '占用' : '空闲'}）
+          </span>
+        </div>
+      )}
+
       <Tabs value={activeTab} onChange={(v) => setActiveTab(v)}>
         <Tabs.TabPanel value="candidates" label="待审批候选">
           <div style={{ marginTop: 12 }}>
@@ -1074,7 +1132,7 @@ export default function Research() {
                         <div><label>胜率</label><b>{fmtNum(optCur.win_rate, 1)}%</b></div>
                         <div><label>盈亏比</label><b>{fmtNum(optCur.profit_factor, 2)}</b></div>
                         <div><label>期望收益</label><b style={optCur.expectancy >= 0 ? { color: '#00a870' } : { color: '#e34d59' }}>{fmtNum(optCur.expectancy, 2)}%</b></div>
-                        <div><label>实盘复核</label><b>{optCur.verify_expectancy !== undefined ? fmtNum(optCur.verify_win_rate, 1) + '% / ' + fmtNum(optCur.verify_profit_factor, 2) + ' / ' + fmtNum(optCur.verify_expectancy, 2) + '%' : '—'}</b></div>
+                        <div><label>实盘复核</label><b>{optCur.win_rate !== undefined ? fmtNum(optCur.win_rate, 1) + '% / ' + fmtNum(optCur.profit_factor, 2) + ' / ' + fmtNum(optCur.expectancy, 2) + '%' : '—'}</b></div>
                         {optCur.pool_stats && <div><label>模拟盘实测</label><b>{fmtNum(optCur.pool_stats.win_rate_pct, 1)}% / {optCur.pool_stats.expectancy >= 0 ? '+' : ''}{fmtNum(optCur.pool_stats.expectancy, 2)}% / {optCur.pool_stats.filled_buys}笔</b></div>}
                       </div>
                     </Card>
@@ -1257,6 +1315,23 @@ export default function Research() {
         <Button theme="primary" onClick={savePoolDiscipline}>保存池纪律</Button>
         <div style={{ marginTop: 12, textAlign: 'right' }}>
           <Button theme="default" onClick={() => setOptDrawerOpen(false)}>关闭</Button>
+        </div>
+      </Dialog>
+
+      {/* 任务运行日志弹窗：前端直接查看 researchd 落盘的 task_<id>.log，免去 SSH 翻服务器 */}
+      <Dialog visible={logOpen} onClose={closeLog} header={'任务运行日志 #' + logId} onConfirm={undefined}>
+        {logLoading && <div style={{ fontSize: 12, color: '#888' }}>加载中…</div>}
+        {!logLoading && !logExists && (
+          <div style={{ fontSize: 13, color: '#888' }}>暂无日志（任务尚未执行，或 researchd 未写入 task_logs）。</div>
+        )}
+        {!logLoading && logExists && (
+          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 420, overflow: 'auto', background: '#0d1117', color: '#c9d1d9', padding: 12, borderRadius: 6, fontSize: 12, lineHeight: 1.6 }}>
+            {logContent || '（日志为空）'}
+          </pre>
+        )}
+        <div style={{ fontSize: 11, color: '#888', marginTop: 6 }}>运行中任务每 4 秒自动刷新；关闭弹窗停止刷新。</div>
+        <div style={{ marginTop: 12, textAlign: 'right' }}>
+          <Button theme="default" onClick={closeLog}>关闭</Button>
         </div>
       </Dialog>
     </div>

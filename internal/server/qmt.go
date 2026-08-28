@@ -60,6 +60,20 @@ func (s *Server) knownStrategyList() []knownStrategyInfo {
 			}
 		}
 	}
+	// 波动突破战法（因子战法）是系统内置的因子策略入口：即便战法库尚未审批出启用规则，
+	// 也把它作为可选入口展示在实盘战法白名单，便于用户开启因子实盘；
+	// 真实规则经研究审批注入 applied_factors.json 后会以各自 fac_*/pat_* ID 接管并自动出现。
+	// 避免与已存在的因子/形态条目重复添加。
+	hasFactorEntry := false
+	for _, k := range list {
+		if k.Kind == "factor" || k.Kind == "pattern" {
+			hasFactorEntry = true
+			break
+		}
+	}
+	if !hasFactorEntry {
+		list = append(list, knownStrategyInfo{ID: "factor", Name: "波动突破战法", Kind: "factor"})
+	}
 	return list
 }
 
@@ -158,6 +172,14 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, 500, "read real positions: "+err.Error())
 		return
+	}
+	// §联调修复：装配实时现价（CurPrice）供前端实盘持仓"现价/浮动盈亏"列展示。
+	// 网关回报仅含 cost_price，实时价取自 fetcher 5s 快照（缺则按 TS 代码变换重试一次）。
+	// 不影响持久化（real_positions 仍按网关为准 upsert），仅响应层补充展示字段。
+	for i := range positions {
+		if si := s.quoteDisplay(positions[i].TsCode); si != nil && si.Price > 0 {
+			positions[i].CurPrice = si.Price
+		}
 	}
 	ctrl := s.qmtCtrlFor(userIDFor(r))
 	writeJSON(w, 200, map[string]interface{}{
@@ -352,24 +374,21 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 
 	switch ev.Type {
 	case "positions":
-		// 全量对账：upsert 覆盖 + 移除已不在集合内的持仓。
-		// §GAP1.10 持仓行打归属账号（网关未配 user_id 时回落回报 URL 归属账号）。
+		// 全量对账（按用户 reconcile）：以本次快照为准写入该账号持仓，并移除该账号范围内已不在
+		// 快照中的旧持仓。使用 ReconcilePositionsForUser 而非 UpsertRealPositions —— 后者是
+		// 全表覆盖（空快照会 DELETE FROM real_positions 清全表），多账号下会误删他人持仓、造成
+		// 跨账号持仓泄漏甚至误卖。按用户 reconcile 后，空快照只清空本账号（含遗留全局行），
+		// 绝不波及任何其它账号的数据。
+		// 归属账号优先级：网关显式携带的 user_id > 路由经 token 解析出的账号 uid。
+		owner := uid
 		if ev.UserID != "" {
-			for i := range ev.Positions {
-				if ev.Positions[i].UserID == "" {
-					ev.Positions[i].UserID = ev.UserID
-				}
-			}
-		} else if uid != "" {
-			for i := range ev.Positions {
-				ev.Positions[i].UserID = uid
-			}
+			owner = ev.UserID
 		}
-		if n, err := db.UpsertRealPositions(ev.Positions); err != nil {
+		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions); err != nil {
 			writeError(w, 500, "reconcile positions: "+err.Error())
 			return
 		} else {
-			log.Printf("[trading] 网关全量对账: %d 持仓", n)
+			log.Printf("[trading] 网关全量对账(用户=%s): %d 持仓", owner, n)
 		}
 	case "order":
 		if ev.OrderID != "" && ev.SignalID != "" {
@@ -496,16 +515,18 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.PriceType = p
 	}
-	if req.GatewayURL != nil {
-		u := strings.TrimSpace(*req.GatewayURL)
-		if u != "" && u != cfg.GatewayURL {
-			if err := validatePublicURL(u); err != nil {
-				writeError(w, 400, "gateway_url "+err.Error())
-				return
+		if req.GatewayURL != nil {
+			u := strings.TrimSpace(*req.GatewayURL)
+			if u != "" && u != cfg.GatewayURL {
+				// 网关为内部可信端点（本机/局域网），用宽松校验（允许环回/私网），
+				// 不能用公网外呼的 validatePublicURL（会拒绝 127.0.0.1/内网地址）。
+				if err := validateGatewayURL(u); err != nil {
+					writeError(w, 400, "gateway_url "+err.Error())
+					return
+				}
 			}
+			cfg.GatewayURL = u
 		}
-		cfg.GatewayURL = u
-	}
 	if req.Token != nil && *req.Token != "" && !isMaskedSecret(*req.Token) {
 		cfg.Token = strings.TrimSpace(*req.Token)
 	}

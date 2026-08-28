@@ -17,6 +17,23 @@ const KIND_LABELS = {
 }
 const KIND_ORDER = ['form', 'factor', 'pattern']
 
+// 本地缓存键：切换 tab 时先显示上次成功加载的配置，避免开关/参数瞬间跳回默认值
+const STORAGE_QMT_FORM = 'liangzai_qmt_form'
+
+function readCachedForm() {
+  try {
+    const raw = localStorage.getItem(STORAGE_QMT_FORM)
+    if (raw) return JSON.parse(raw)
+  } catch (_) {}
+  return null
+}
+
+function writeCachedForm(form) {
+  try {
+    localStorage.setItem(STORAGE_QMT_FORM, JSON.stringify(form))
+  } catch (_) {}
+}
+
 // 涨跌配色（红涨绿跌）：盈亏 >=0 用红色，<0 用绿色
 function pnlColor(v) {
   return (v || 0) >= 0 ? '#e34d59' : '#00a870'
@@ -50,7 +67,8 @@ function confirmDialog(body, header = '确认') {
  */
 export default function Quant() {
   const [state, setState] = useState(null)
-  const [form, setForm] = useState({
+  const cachedForm = readCachedForm()
+  const [form, setForm] = useState(cachedForm || {
     enabled: false, mode: 'manual', price_type: 'market', auto_sell: false,
     gateway_url: '', token_masked: '',
     fixed_amount: 10000, max_positions: 10, initial_capital: 100000,
@@ -88,10 +106,20 @@ export default function Quant() {
     const n = Number(v) || 0
     return (n > 0 ? '+' : '') + n.toFixed(2)
   }
-  // 将秒级时间戳格式化为「x秒前 / x分前 / x小时前」
+  // 将时间戳格式化为「x秒前 / x分前 / x小时前」。
+  // 兼容两种来源：后端 time.Time 默认序列化为 RFC3339 字符串（如 "2026-08-28T00:01:01Z"），
+  // 也可能是 Unix 秒级数字；统一归一后再计算，避免字符串做乘法得到 NaN。
   function fmtAgo(ts) {
     if (!ts) return ''
-    const sec = Math.floor((Date.now() - ts * 1000) / 1000)
+    let sec
+    if (typeof ts === 'string') {
+      const d = new Date(ts)
+      if (isNaN(d.getTime())) return ''
+      sec = Math.floor((Date.now() - d.getTime()) / 1000)
+    } else {
+      sec = Math.floor((Date.now() - ts * 1000) / 1000)
+    }
+    if (isNaN(sec) || sec < 0) return ''
     if (sec < 60) return sec + '秒前'
     if (sec < 3600) return Math.floor(sec / 60) + '分前'
     return Math.floor(sec / 3600) + '小时前'
@@ -100,14 +128,16 @@ export default function Quant() {
   // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启
   async function loadConfig() {
     const c = await api.fetchQMTConfig()
-    setForm({
+    const nextForm = {
       enabled: !!c.enabled, mode: c.mode || 'manual', price_type: c.price_type || 'market',
       auto_sell: !!c.auto_sell, gateway_url: c.gateway_url || '', token_masked: c.token_masked || '',
       fixed_amount: c.fixed_amount ?? 10000, max_positions: c.max_positions ?? 10,
       initial_capital: c.initial_capital ?? 100000,
       daily_max_buys: c.daily_max_buys ?? 20, daily_budget_amount: c.daily_budget_amount ?? 100000,
       miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
-    })
+    }
+    setForm(nextForm)
+    writeCachedForm(nextForm)
     // 后端 known_strategies 可能为对象数组 [{id,name,kind}]（新）或纯 ID 数组（旧），统一归一
     let list = []
     if (Array.isArray(c.known_strategies)) {
