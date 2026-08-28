@@ -270,7 +270,7 @@ class XtBroker(Broker):
         pass  # 回调已在 connect() 注册
 
     def query_asset(self):
-        """查询账户资产（可用资金/冻结/总资产/市值）。xtquant query_asset 返回 dict，
+        """查询账户资产（可用资金/冻结/总资产/市值）。xtquant query_asset 返回平铺 dict，
         字段名取 cash/frozen_cash/total_asset/market_value；未连接或异常返回 None。"""
         if not self._connected or self._trader is None:
             return None
@@ -278,13 +278,17 @@ class XtBroker(Broker):
             raw = self._trader.query_asset(self._acc)
             if not raw:
                 return None
-            # xtquant 可能返回 {..., 'asset': {...}} 或直接平铺字段；统一取可用结构
-            a = raw.get("asset", raw) if isinstance(raw, dict) else raw
+
+            def g(k, d=0.0):
+                if isinstance(raw, dict):
+                    return raw.get(k, d)
+                return getattr(raw, k, d)
+
             return {
-                "cash": float(getattr(a, "cash", 0) or 0),
-                "frozen_cash": float(getattr(a, "frozen_cash", 0) or 0),
-                "total_asset": float(getattr(a, "total_asset", 0) or 0),
-                "market_value": float(getattr(a, "market_value", 0) or 0),
+                "cash": float(g("cash") or 0),
+                "frozen_cash": float(g("frozen_cash") or 0),
+                "total_asset": float(g("total_asset") or 0),
+                "market_value": float(g("market_value") or 0),
             }
         except Exception as e:  # noqa: BLE001
             log.warning("[broker] query_asset failed: %s", e)
