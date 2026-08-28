@@ -4,8 +4,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
-import KLineChart from '../components/KLineChart.jsx'
-import DepthPanel from '../components/DepthPanel.jsx'
+import MinuteView from '../components/MinuteView.jsx'
 
 const CACHE_KEY = 'pos_cache_v1'
 
@@ -51,6 +50,8 @@ export default function Positions() {
   const [qmtState, setQmtState] = useState({ enabled: false, mode: 'manual', tripped: false, gateway_url: '' })
   // 实盘持仓列表
   const [realPositions, setRealPositions] = useState([])
+  // 实盘账户资产（广州 QMT 上报的可用资金/冻结/总值/市值）
+  const [realAccount, setRealAccount] = useState(null)
   // 实盘持仓建议映射（ts_code -> 建议）
   const [realAdvices, setRealAdvices] = useState({})
   // 实盘是否启用
@@ -365,6 +366,7 @@ export default function Positions() {
     try {
       const data = await api.fetchRealPositions()
       if (data && Array.isArray(data.positions)) setRealPositions(data.positions)
+      if (data && data.account) setRealAccount(data.account)
     } catch (_) {}
   }
   function curPrice(p) { return (p.cur_price && p.cur_price > 0) ? p.cur_price : 0 }
@@ -533,10 +535,7 @@ export default function Positions() {
                 expandedRowKeys={Array.from(klineOpen)}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
                 expandedRow={({ row }) => (
-                  <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', flexWrap: 'wrap' }}>
-                    <div style={{ flex: '1 1 auto', minWidth: 0 }}><KLineChart code={row.code} name={row.name} /></div>
-                    <div style={{ flex: '0 0 300px' }}><DepthPanel code={row.code} name={row.name} /></div>
-                  </div>
+                  <MinuteView code={row.code} name={row.name} />
                 )}
               />
             </Card>
@@ -568,6 +567,14 @@ export default function Positions() {
             <span className="muted">模式: {qmtState.mode || 'manual'}</span>
             <span style={{ color: qmtState.tripped ? '#e34d59' : '#00a870' }}>熔断: {qmtState.tripped ? '已熔断' : '正常'}</span>
             {qmtState.gateway_url && <span className="muted">网关 {qmtState.gateway_url}</span>}
+            {realAccount && (
+              <span style={{ color: '#4fc3f7', fontWeight: 600 }}>
+                可用资金 ¥{(realAccount.available_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            )}
+            {realAccount && realAccount.total_asset > 0 && (
+              <span className="muted">总值 ¥{(realAccount.total_asset || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            )}
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
           </div>
 

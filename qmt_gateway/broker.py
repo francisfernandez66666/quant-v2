@@ -47,6 +47,11 @@ class Broker:
         （未连接/数据未同步——调用方必须按"不可信快照"处理，禁止据此清账）。"""
         raise NotImplementedError
 
+    def query_asset(self):
+        """返回账户资产字典（可用资金/冻结资金/总资产/持仓市值），未连接或失败时返回 None。
+        （English: returns account asset dict or None. Keys: cash/frozen_cash/total_asset/market_value.）"""
+        raise NotImplementedError
+
     def subscribe(self):
         """订阅成交/委托/断线回调（真实通道）。"""
         pass
@@ -264,12 +269,34 @@ class XtBroker(Broker):
     def subscribe(self):
         pass  # 回调已在 connect() 注册
 
+    def query_asset(self):
+        """查询账户资产（可用资金/冻结/总资产/市值）。xtquant query_asset 返回 dict，
+        字段名取 cash/frozen_cash/total_asset/market_value；未连接或异常返回 None。"""
+        if not self._connected or self._trader is None:
+            return None
+        try:
+            raw = self._trader.query_asset(self._acc)
+            if not raw:
+                return None
+            # xtquant 可能返回 {..., 'asset': {...}} 或直接平铺字段；统一取可用结构
+            a = raw.get("asset", raw) if isinstance(raw, dict) else raw
+            return {
+                "cash": float(getattr(a, "cash", 0) or 0),
+                "frozen_cash": float(getattr(a, "frozen_cash", 0) or 0),
+                "total_asset": float(getattr(a, "total_asset", 0) or 0),
+                "market_value": float(getattr(a, "market_value", 0) or 0),
+            }
+        except Exception as e:  # noqa: BLE001
+            log.warning("[broker] query_asset failed: %s", e)
+            return None
+
 
 class MockBroker(Broker):
     """内存模拟通道：等价 Go cmd/qmt-mock（下单→延时模拟成交→回调 handler）。"""
 
-    def __init__(self, account="MOCK0001", delay_sec=1, seed=None):
+    def __init__(self, account="MOCK0001", delay_sec=1, seed=None, account_init=100000.0):
         self.account = account
+        self.account_init = account_init
         self.delay_sec = delay_sec
         self.handler = None
         self._lock = threading.RLock()
@@ -380,6 +407,18 @@ class MockBroker(Broker):
         with self._lock:
             return [dict(p) for p in sorted(
                 self._positions.values(), key=lambda x: x.get("amount", 0), reverse=True)]
+
+    def query_asset(self):
+        """mock 账户资产：可用资金 = 初始资金 - 持仓市值（模拟），冻结 0、市值=持仓汇总。"""
+        with self._lock:
+            mv = sum(p.get("amount", 0.0) for p in self._positions.values())
+            init = float(self.account_init) if hasattr(self, "account_init") else 100000.0
+            return {
+                "cash": max(init - mv, 0.0),
+                "frozen_cash": 0.0,
+                "total_asset": init,
+                "market_value": mv,
+            }
 
 
 def build_broker(cfg):

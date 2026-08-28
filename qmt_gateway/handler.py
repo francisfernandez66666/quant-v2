@@ -213,6 +213,12 @@ class ReportHandler:
         log.info("[handler] reconciled %d positions", n)
         self._push({"type": "positions", "positions": list(positions)})
 
+    def on_account(self, asset):
+        """账户资产回报（可用资金/冻结/总值/市值）。asset 为 None 时跳过（查询失败）。"""
+        if not asset:
+            return
+        self._push({"type": "account", "asset": dict(asset)})
+
     def push_disconnect(self):
         self.on_disconnected()
 
@@ -232,11 +238,13 @@ class ReportHandler:
 
 
 def periodic_reconcile(handler, broker, interval_sec=60, stop=None):
-    """周期全量对账：broker.query_positions() → handler.on_positions()。stop 事件可退出。"""
+    """周期全量对账：broker.query_positions() → handler.on_positions()；同时上报账户资产
+    （可用资金/冻结/总值/市值）→ handler.on_account()。stop 事件可退出。"""
     while not stop or not stop.is_set():
         time.sleep(interval_sec)
         try:
             if broker.is_connected():
                 handler.on_positions(broker.query_positions())
+                handler.on_account(broker.query_asset())
         except Exception as e:  # noqa: BLE001
             log.warning("[handler] periodic reconcile failed: %s", e)

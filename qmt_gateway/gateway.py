@@ -20,11 +20,29 @@ broker 由 config 选择（xt/mock）。回报经 outbox 后台线程推送（ha
 （English: zero-dependency REST gateway matching the Seoul-side QMTClient contract; Bearer auth;
 atomic claim-before-place idempotency on signal_id; board-aware lot rules; top-level dispatch
 exception guard; broker chosen by config (xt/mock); reports pushed via outbox thread.）
+
+====================================================================================
+安全加固（本文件）相关环境变量与运维须知（中文）：
+  - QUANT_GATEWAY_TOKEN       网关鉴权 token。优先从此环境变量读取，未设置才回退 config 明文。
+  - QUANT_GATEWAY_REPORT_TOKEN 推送首尔 /api/qmt/report 的 token，可选；缺省同 QUANT_GATEWAY_TOKEN。
+  - ALLOWED_IPS               逗号分隔的允许来源 IP（如决策机出口 IP）。非空时，/order、/cancel、
+                              /state 等敏感端点会校验来源 IP，不在白名单返回 403。
+  - QUANT_GATEWAY_TLS_CERT / QUANT_GATEWAY_TLS_KEY  两者均设置则启动 HTTPS，否则启动 HTTP。
+  - QUANT_GATEWAY_BIND        显式指定对外监听地址（如 0.0.0.0:8789）。未设置且配置为 0.0.0.0 时，
+                              自动收敛为 127.0.0.1 仅本机可访问。/health 仅允许本机回环访问。
+
+重要（需用户手动操作，脚本不代劳）：
+  1) 真实 token 轮换请在【券商端】手动完成，本仓库代码不做任何 token 改写/轮换。
+  2) 历史上若 config.xt.json 曾以明文提交过 token，请用 `git filter-repo` 清除仓库历史中的明文，
+     并在本地把该文件加入忽略/移出仓库；本改动不触碰 .gitignore 也不改 git 历史。
+====================================================================================
 """
 import argparse
+import hmac
 import json
 import logging
 import os
+import ssl
 import sys
 import threading
 import time
@@ -67,7 +85,26 @@ def load_config(path):
         with open(path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
         cfg.update(user_cfg)
-    if not cfg.get("report_token"):
+
+    # token 优先从环境变量 QUANT_GATEWAY_TOKEN 读取（脱离代码仓库，避免明文提交）；
+    # 环境变量未设置时回退到配置文件明文，并打印 warning 提示用户改用环境变量。
+    env_token = os.environ.get("QUANT_GATEWAY_TOKEN")
+    if env_token:
+        cfg["token"] = env_token
+    else:
+        cfg_token = cfg.get("token", "")
+        # 仅当配置里确实写了非默认 token 时才告警（默认占位 "change-me" 不告警）
+        if cfg_token and cfg_token != DEFAULT_CONFIG.get("token", ""):
+            log.warning(
+                "[gateway] token 来自配置文件明文（config），建议改用环境变量 QUANT_GATEWAY_TOKEN "
+                "以避免泄露；真实 token 请由用户在券商端手动轮换，并用 git filter-repo 清除历史明文"
+            )
+
+    # report_token 同理：优先环境变量 QUANT_GATEWAY_REPORT_TOKEN，否则回退 token
+    env_report_token = os.environ.get("QUANT_GATEWAY_REPORT_TOKEN")
+    if env_report_token:
+        cfg["report_token"] = env_report_token
+    elif not cfg.get("report_token"):
         cfg["report_token"] = cfg.get("token", "")
     return cfg
 
@@ -105,6 +142,8 @@ class Gateway:
         self._stop = threading.Event()
         self._reconcile_thread = None
         self._broker_thread = None
+        # 来源 IP 白名单（由 main 从环境变量 ALLOWED_IPS 注入；空列表表示不做 IP 限制，仅依赖 token）
+        self.allowed_ips = []
 
     def start(self):
         # §G1 启动检查：残留 pending 占位 = 上次进程在下单窗口内 crash，
@@ -146,6 +185,8 @@ class Gateway:
                     else:
                         log.warning("[gateway] post-connect empty positions snapshot — "
                                     "reconcile skipped (account data may not be synced yet)")
+                    # 连上即推一次账户资产（可用资金等），首尔侧即时展示
+                    self.handler.on_account(self.broker.query_asset())
                 except Exception as e:  # noqa: BLE001
                     log.warning("[gateway] broker connect failed: %s (retry %ss)", e,
                                 self.cfg.get("reconnect_sec", 5))
@@ -263,15 +304,50 @@ class Gateway:
         }
 
 
-    class _Handler(BaseHTTPRequestHandler):
-        # 类级注入网关实例，使每个连接的处理器都能访问同一 Gateway（ThreadingHTTPServer 每连接新建 handler）
-        gateway = None  # 类级注入，跨实例共享（ThreadingHTTPServer 每连接新建 handler）
+class _Handler(BaseHTTPRequestHandler):
+    # 类级注入网关实例，使每个连接的处理器都能访问同一 Gateway（ThreadingHTTPServer 每连接新建 handler）
+    gateway = None  # 类级注入，跨实例共享
+
+    # 本机回环地址集合：/health 仅对它们开放
+    _LOCAL_ADDRS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _real_ip(self):
+        """取对端真实 IP：优先取 X-Forwarded-For 首跳（经反向代理时还原真实客户端），否则取 socket 对端。"""
+        fwd = self.headers.get("X-Forwarded-For", "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        return self.client_address[0]
+
+    def _ip_allowed(self, path):
+        """按端点类型做 IP 访问控制，返回 (allowed, status, err)。
+
+        - /health：仅本机回环地址（127.0.0.1 / ::1）可访问，否则 403；
+        - 其它敏感端点：若配置了 ALLOWED_IPS 白名单，来源 IP 必须命中，否则 403。
+        """
+        # /health 用 socket 对端判断（经本机反向代理时连接来自 127.0.0.1，应放行）
+        if path == "/health":
+            if self.client_address[0] in self._LOCAL_ADDRS:
+                return True, 200, ""
+            return False, 403, "health endpoint is localhost-only"
+        # 其它端点：若启用 IP 白名单则校验（空列表表示不限制，仅依赖 token）
+        allowed = self.gateway.allowed_ips
+        ip = self._real_ip()
+        if allowed and ip not in allowed:
+            log.warning("[gateway] rejected %s %s from non-allowed IP %s",
+                        self.command, path, ip)
+            return False, 403, "source IP not allowed"
+        return True, 200, ""
 
     def _auth_ok(self):
-        # Bearer token 双向鉴权：比对请求头与配置 token
+        """Bearer token 双向鉴权（常量时间比较，防时序侧信道）。
+
+        校验用 token 优先来自环境变量 QUANT_GATEWAY_TOKEN，未设置时回退配置文件明文。
+        """
         auth = self.headers.get("Authorization", "")
         token = self.gateway.cfg.get("token", "")
-        return auth == "Bearer " + token
+        expected = "Bearer " + token
+        # hmac.compare_digest 对字符串做常量时间比较，避免 == 的短路时序泄露
+        return hmac.compare_digest(auth, expected)
 
     def _respond(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -282,8 +358,12 @@ class Gateway:
         self.wfile.write(data)
 
     def _dispatch(self):
-        # 统一分发入口：解析路径/读取 JSON 体 → 鉴权 → 交由 Gateway.handle 处理
+        # 统一分发入口：解析路径/读取 JSON 体 → IP 访问控制 → 鉴权 → 交由 Gateway.handle 处理
         parsed = urlparse(self.path)
+        # 先做 IP 访问控制（健康检查与敏感端点分别处理）
+        ok, status, err = self._ip_allowed(parsed.path)
+        if not ok:
+            return self._respond(status, {"ok": False, "err": err})
         length = int(self.headers.get("Content-Length") or 0)
         body = None
         if length > 0:
@@ -293,6 +373,7 @@ class Gateway:
                 body = json.loads(raw.decode("utf-8"))
             except ValueError:
                 return self._respond(400, {"ok": False, "err": "bad JSON body"})
+        # /health 免鉴权（但已受 IP 限制）；其余端点需 Bearer token
         if parsed.path != "/health" and not self._auth_ok():
             return self._respond(401, {"ok": False, "err": "unauthorized"})
         try:
@@ -314,14 +395,15 @@ class Gateway:
         pass
 
 
-    def main(argv=None):
-        # 命令行入口：解析参数 → 装载配置 → 启动 HTTP 服务与网关后台线程
-        ap = argparse.ArgumentParser(description="MiniQMT gateway (M2)")
+def main(argv=None):
+    # 命令行入口：解析参数 → 装载配置 → 启动 HTTP/HTTPS 服务与网关后台线程
+    ap = argparse.ArgumentParser(description="MiniQMT gateway (M2)")
     ap.add_argument("-c", "--config", default="", help="config JSON path")
     ap.add_argument("--listen", default="", help="override listen addr")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
+    # 尽早初始化日志，使配置阶段的环境变量告警也能输出
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -331,13 +413,53 @@ class Gateway:
     if args.listen:
         cfg["listen"] = args.listen
 
+    # —— 绑定地址收敛（防误暴露到 0.0.0.0）——
+    # 仅当显式指定 --listen 或 QUANT_GATEWAY_BIND 时才允许对外绑定；
+    # 否则若配置监听 0.0.0.0，自动收敛到 127.0.0.1 仅本机可访问。
+    bind_env = os.environ.get("QUANT_GATEWAY_BIND", "")
+    if bind_env:
+        cfg["listen"] = bind_env
+    else:
+        host = cfg["listen"].partition(":")[0]
+        if host in ("0.0.0.0", ""):
+            port = cfg["listen"].partition(":")[2] or "8789"
+            cfg["listen"] = "127.0.0.1:" + port
+            log.warning("[gateway] listen 原为 0.0.0.0，已自动收敛为 127.0.0.1 "
+                        "（如需对外，请设置 QUANT_GATEWAY_BIND=0.0.0.0:8789）")
+
+    # —— IP 白名单（敏感端点来源校验）——
+    # 环境变量 ALLOWED_IPS 为空则不限制（仅依赖 token）；非空则严格校验。
+    allowed_raw = os.environ.get("ALLOWED_IPS", "")
+    allowed_ips = [x.strip() for x in allowed_raw.split(",") if x.strip()] if allowed_raw else []
+    if allowed_ips:
+        log.info("[gateway] IP 白名单已启用，允许来源：%s", ", ".join(allowed_ips))
+    else:
+        log.warning("[gateway] 未设置 ALLOWED_IPS，敏感端点仅依赖 token 防护（建议配置决策机出口 IP）")
+
     gw = Gateway(cfg)
+    gw.allowed_ips = allowed_ips  # 注入白名单，供 _Handler 校验
     _Handler.gateway = gw
 
     host, _, port = cfg["listen"].partition(":")
     server = ThreadingHTTPServer((host, int(port)), _Handler)
-    log.info("[gateway] listening on %s (broker=%s account=%s report_url=%s)",
-             cfg["listen"], cfg.get("broker"), cfg.get("account"), cfg.get("report_url") or "(none)")
+
+    # —— 可选 TLS ——
+    # 仅当两个证书环境变量均设置才启用 HTTPS；否则 HTTP（已收敛到本机）。
+    cert = os.environ.get("QUANT_GATEWAY_TLS_CERT", "")
+    key = os.environ.get("QUANT_GATEWAY_TLS_KEY", "")
+    if cert and key:
+        tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.load_cert_chain(certfile=cert, keyfile=key)
+        server.socket = tls_ctx.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+        log.info("[gateway] TLS 已启用（HTTPS）")
+    else:
+        scheme = "http"
+        if allowed_ips:
+            log.warning("[gateway] 未启用 TLS，敏感流量为明文（建议配置 QUANT_GATEWAY_TLS_CERT/KEY）")
+
+    log.info("[gateway] listening on %s://%s (broker=%s account=%s report_url=%s)",
+             scheme, cfg["listen"], cfg.get("broker"), cfg.get("account"), cfg.get("report_url") or "(none)")
     gw.start()
     try:
         server.serve_forever()

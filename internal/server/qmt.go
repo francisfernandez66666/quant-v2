@@ -182,8 +182,11 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ctrl := s.qmtCtrlFor(userIDFor(r))
+	// §可用资金：广州实盘账户资产（可用/冻结/总值/市值），随持仓接口一并返回供前端展示。
+	acc, _ := db.GetRealAccount(userIDFor(r))
 	writeJSON(w, 200, map[string]interface{}{
 		"positions": positions,
+		"account":   acc,
 		"enabled":   ctrl != nil && ctrl.Enabled(),
 		"tripped":   ctrl != nil && ctrl.Tripped(),
 		"mode":      ctrlMode(ctrl),
@@ -359,6 +362,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		TradedAt  string               `json:"traded_at"`
 		SignalID  string               `json:"signal_id"`
 		Positions []store.RealPosition `json:"positions"`
+		Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
 		At        string               `json:"at"`
 		UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
 	}
@@ -419,6 +423,29 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			ctrl.SetTripped("网关断线回报（disconnect）")
 		}
 		log.Printf("[trading] 网关断线回报，实盘下单已熔断")
+	case "account":
+		// 账户资产回报（可用资金等）：归属优先级同 positions（网关 user_id > token 解析 uid）
+		owner := uid
+		if ev.UserID != "" {
+			owner = ev.UserID
+		}
+		if len(ev.Asset) == 0 {
+			writeError(w, 400, "empty account asset")
+			return
+		}
+		if err := db.UpsertRealAccount(store.RealAccount{
+			UserID:        owner,
+			AvailableCash: ev.Asset["cash"],
+			FrozenCash:    ev.Asset["frozen_cash"],
+			TotalAsset:    ev.Asset["total_asset"],
+			MarketValue:   ev.Asset["market_value"],
+			UpdatedAt:     time.Now().Format("2006-01-02 15:04:05"),
+		}); err != nil {
+			writeError(w, 500, "upsert account: "+err.Error())
+			return
+		}
+		log.Printf("[trading] 账户资产上报(用户=%s): 可用=%.2f 冻结=%.2f 总值=%.2f 市值=%.2f",
+			owner, ev.Asset["cash"], ev.Asset["frozen_cash"], ev.Asset["total_asset"], ev.Asset["market_value"])
 	case "heartbeat":
 		// §ROBUST 上行心跳：last_report_at 已在 switch 前统一刷新——它就是心跳的全部意义
 		// （无交易时段证明 广州→首尔 回程连通），无任何账本副作用。
