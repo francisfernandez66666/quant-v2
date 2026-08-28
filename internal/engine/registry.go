@@ -117,6 +117,11 @@ type Registry struct {
 	// English: auto-paper account check — only accounts returning true get strategy-driven auto-fills
 	// and auto-marks (admin); normal users' paper is purely manual + static. nil = all auto (legacy).
 	autoCheck func(userID string) bool
+	// §P1-4 管理员判定（与 autoCheck 同源，main 注入 auth.IsAdmin）：build 阶段透传给每账号引擎，
+	// 供 primaryMember 优先选择管理员成员作为实盘账本/QMT 控制器归属。
+	// English: P1-4 admin predicate (same source as autoCheck, wired from auth.IsAdmin) — forwarded to
+	// each account engine so primaryMember can prefer an admin owner.
+	isAdminFn func(userID string) bool
 }
 
 // NewRegistry 创建引擎注册表。
@@ -169,8 +174,8 @@ func (r *Registry) paperMirror(userID string) (func(paper.Position), func(string
 				return
 			}
 		}
-		if rpt.HasHolding(pos.Code) {
-			return // 已有同码记录（手动建仓/另一共享账号）幂等跳过
+		if rpt.HasHoldingFor(userID, pos.Code) {
+			return // 已有同码同账号记录，幂等跳过（按账号隔离，避免跨账号误判）
 		}
 		var sc *config.StrategyConfig
 		atrOn, atrMult := false, 0.0
@@ -288,6 +293,10 @@ func (r *Registry) registerUser(e *Engine, userID string) {
 	// （此前 Engine.SetUserID 从未被调用，syncAccountConfig 对所有引擎恒跳过）；
 	// ③注入 accountsRoot，私有文件（咨询历史）按账号目录寻址。
 	e.SetMembers(r.coreUsers[e])
+	// §P1-4 透传管理员判定，使 primaryMember 在多成员共享引擎中优先选择管理员账号。
+	if r.isAdminFn != nil {
+		e.SetIsAdminFn(r.isAdminFn)
+	}
 	if r.opts.DataDir != "" {
 		e.SetAccountsRoot(filepath.Join(r.opts.DataDir, "accounts"))
 	}
@@ -396,6 +405,14 @@ func (r *Registry) SetAutoPaperCheck(fn func(userID string) bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.autoCheck = fn
+}
+
+// SetAdminCheck §P1-4 注入管理员判定函数（main 用 auth.IsAdmin 装配），透传给各账号引擎。
+// English: P1-4 wires the admin predicate (from main's auth.IsAdmin) and forwards it to each engine.
+func (r *Registry) SetAdminCheck(fn func(userID string) bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.isAdminFn = fn
 }
 
 // SetPaperPools 设置全局战法资金池类型模板并同步到所有已建账号模拟盘。

@@ -24,6 +24,8 @@ type VerifiedSector struct {
 	RPSRank int `json:"rps_rank,omitempty"`
 	// 板块20日RPS（用于龙回头龙性判定）
 	RPS20 float64 `json:"rps20,omitempty"`
+	// 板块60日RPS（§P1-19 中长期相对强度，补全此前缺失字段）
+	RPS60 float64 `json:"rps60,omitempty"`
 	// 板块状态：加强/持续/退潮/反弹
 	Phase string `json:"phase,omitempty"`
 	// 主力净流入(元)
@@ -120,6 +122,7 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 				if ts.Name == s.Name {
 					vs.RPSRank = i + 1
 					vs.RPS20 = ts.RPS20
+					vs.RPS60 = ts.RPS60 // §P1-19 补全 60 日 RPS
 					break
 				}
 			}

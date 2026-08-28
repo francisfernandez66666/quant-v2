@@ -4,10 +4,13 @@
 package config
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"quant-trading-v2/internal/fileutil"
 )
@@ -614,13 +617,15 @@ type MacroGateConfig struct {
 	// 宏观门控放行买入最低置信度
 	MinConfidence float64 `json:"min_confidence"`
 	// BlockNShape 交割日是否对 N 形超短一律拦截（默认 true：超短对交割日波动最敏感）。
-	// English: whether N-shape ultra-short is always blocked on delivery days (default true — ultra-short is most sensitive to delivery-day swings).
+	// nil 表示使用默认 true；显式 false 才取消拦截。
+	// English: whether N-shape ultra-short is always blocked on delivery days (default true — ultra-short is most sensitive to delivery-day swings). nil means default true; only an explicit false disables it.
 	// 交割日是否拦截 N 形超短
-	BlockNShape bool `json:"block_n_shape"`
+	BlockNShape *bool `json:"block_n_shape,omitempty"`
 	// BlockMomentum 交割日是否拦截动量 watch 观察信号（默认 true）。
-	// English: whether the momentum watch signal is also blocked on delivery days (default true).
+	// nil 表示使用默认 true；显式 false 才取消拦截。
+	// English: whether the momentum watch signal is also blocked on delivery days (default true). nil means default true; only an explicit false disables it.
 	// 交割日是否拦截动量观察信号
-	BlockMomentum bool `json:"block_momentum"`
+	BlockMomentum *bool `json:"block_momentum,omitempty"`
 }
 
 // MomentumConfig 动量分权重配置（默认 量价40 + MACD30 + 走势30，合计≤100）。
@@ -1162,6 +1167,49 @@ func (m *Manager) Save() {
 		return
 	}
 	log.Printf("[config] 已保存配置文件: %s", m.path)
+}
+
+// Watch §P1-6 配置热重载：轮询配置文件（默认 30s），内容变更（sha256 比对）时自动调用 Load()
+// 重载全局 rules/d1，无需重启进程。ctx 取消即停止轮询。采用轮询而非 fsnotify 以避免引入额外依赖，
+// 且对网络挂载/容器卷等 inotify 不可靠场景更稳健。
+// English: P1-6 hot-reload — polls the config file (default 30s); on content change (sha256 compare)
+// it reloads global rules/d1 without a restart. Polling avoids extra deps and works on volumes where
+// inotify is unreliable. Stop on ctx cancellation.
+func (m *Manager) Watch(ctx context.Context, interval time.Duration) {
+	if m.path == "" {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	last := m.checksum()
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cur := m.checksum()
+				if cur == "" || cur == last {
+					continue
+				}
+				last = cur
+				m.Load()
+			}
+		}
+	}()
+}
+
+// checksum 返回配置文件的 sha256（用于变更检测）；文件不可读时返回空串。
+func (m *Manager) checksum() string {
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return string(sum[:])
 }
 
 // LoadSchedulerConfig 从配置文件读取 rules.scheduler（供独立研究服务 quant-research 使用）。

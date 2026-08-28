@@ -75,7 +75,7 @@ func (t *WaveTracker) Eval(code string, md *strategy_engine.StockMarketData) (le
 		return left, right
 	}
 	prev := md.KLines[len(md.KLines)-2]
-	prevHigh, prevLow, prevClose := prev.High, prev.Low, prev.Close
+	prevHigh, prevClose := prev.High, prev.Close
 	if prevHigh <= 0 || prevClose <= 0 {
 		return left, right
 	}
@@ -104,9 +104,17 @@ func (t *WaveTracker) Eval(code string, md *strategy_engine.StockMarketData) (le
 		st.highAfterArm = 0
 	}
 
-	// 一突条件：现价 > 前高×1.005 且 量比≥1.8（与 n_shape scorer 口径一致）
-	// First-break condition: price > yesterday-high x 1.005 and volume ratio >= 1.8 (aligned with the n_shape scorer).
-	isFirst := cur > prevHigh*firstBreakPct && cumVol > 0 && cumVol/math.Max(prevLow, 1) >= firstBreakRatio
+	// 一突条件：现价 > 前高×1.005 且 量比≥1.8（与 n_shape scorer 口径一致）。
+	// 量比 = 当日累计成交量(股) / 近20日日均成交量(股)，剔除今日未收盘K线避免未来函数。
+	// English: first-break condition: price > yesterday-high x 1.005 and volume ratio >= 1.8. Volume ratio
+	// is today's cumulative volume (shares) divided by the 20-day average daily volume (shares), excluding
+	// today's unfinished bar to avoid look-ahead bias.
+	avgDailyVol := avgVol(md.KLines[:len(md.KLines)-1], 20)
+	volRatio := 0.0
+	if avgDailyVol > 0 {
+		volRatio = (cumVol * 100) / avgDailyVol
+	}
+	isFirst := cur > prevHigh*firstBreakPct && cumVol > 0 && volRatio >= firstBreakRatio
 	if isFirst {
 		left = true
 		if !st.armed {

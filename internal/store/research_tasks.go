@@ -68,6 +68,10 @@ type ResearchTask struct {
 	ChainDay   string  `json:"chain_day,omitempty"`   // 链日期
 	ChainSeq   int     `json:"chain_seq"`             // 链序号
 	Control    string  `json:"control,omitempty"`     // 控制字段
+	// RetryCount §P1-11 失败重试累计次数：达到上限（retryCap）后任务转终态 error，不再自动重入队，
+	// 避免拉取型任务（如 dataload）无限重试打满队列/带宽。
+	// English: P1-11 cumulative failure retries; once it reaches the cap the task becomes terminal error.
+	RetryCount int `json:"retry_count"`
 	// RequeueSeq §失败重排队尾键：失败重入队时取全局 max+1，出队按它 ASC 沉底
 	// （秒级 updated_at 在同秒内无法区分先后，专用单调序列才可靠）。
 	RequeueSeq int64  `json:"requeue_seq,omitempty"` // 重入队序号
@@ -92,10 +96,10 @@ func (d *DB) EnqueueResearchTask(t *ResearchTask) (int64, error) {
 	now := nowStr()
 	res, err := d.db.Exec(`INSERT INTO research_tasks
 		(type, ref_id, priority, status, progress, result_num, result_text, error,
-		 payload, chain_day, chain_seq, control, created_at, started_at, finished_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 payload, chain_day, chain_seq, control, retry_count, created_at, started_at, finished_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.Type, t.RefID, t.Priority, t.Status, t.Progress, t.ResultNum, t.ResultText, t.Error,
-		t.Payload, t.ChainDay, t.ChainSeq, t.Control, now, t.StartedAt, t.FinishedAt, now)
+		t.Payload, t.ChainDay, t.ChainSeq, t.Control, t.RetryCount, now, t.StartedAt, t.FinishedAt, now)
 	if err != nil {
 		return 0, fmt.Errorf("enqueue research task: %w", err)
 	}
@@ -226,20 +230,61 @@ func (d *DB) RequeueTask(id int64) error {
 	return err
 }
 
-// RequeueFailedTask §失败重排队：失败任务自动重新入队——排队尾（出队排序以 updated_at 为
-// 尾键，刷新即沉底），不设重试上限；error 列保留最后一次失败原因供前端展示，
-// progress/finished_at 清空等待下次运行。
+// researchTaskRetryCap §P1-11 失败重试上限：达到后任务转终态 error，不再自动重入队，
+// 避免拉取型任务（如 dataload）无限重试打满队列/带宽。
+// English: P1-11 max retries — beyond it the task becomes terminal error instead of re-enqueuing.
+const researchTaskRetryCap = 5
+
+// RequeueFailedTask §P1-11 失败任务自动重新入队——排队尾（出队排序以 updated_at 为
+// 尾键，刷新即沉底）；重试计数 +1，达到上限（researchTaskRetryCap）后任务转终态 error，
+// 不再自动重入队（error 列保留最后一次失败原因供前端展示）；progress/finished_at 清空等待下次运行。
 // English: re-enqueues a failed task at the queue tail (updated_at is the tail key in the dequeue
-// ordering; refreshed on requeue). No retry cap; the error column keeps the last failure reason.
+// ordering; refreshed on requeue). The retry counter increments; once it reaches the cap the task
+// becomes terminal error instead of re-enqueuing. No infinite retry for fetch-type tasks.
 func (d *DB) RequeueFailedTask(id int64, errMsg string) error {
 	if len(errMsg) > 500 {
 		errMsg = errMsg[:500]
 	}
-	_, err := d.db.Exec(`UPDATE research_tasks SET status='queued', progress='', error=?,
+	var cur int
+	if err := d.db.QueryRow(`SELECT COALESCE(retry_count,0) FROM research_tasks WHERE id=?`, id).Scan(&cur); err != nil {
+		return err
+	}
+	cur++
+	// §P1-11 达到重试上限：转终态 error，停止自动重入队（拉取型任务防无限重试）。
+	if cur >= researchTaskRetryCap {
+		_, err := d.db.Exec(`UPDATE research_tasks SET status='error', retry_count=?, progress='',
+			error=?, finished_at=?, updated_at=? WHERE id=?`,
+			cur, "重试达到上限("+itoa(researchTaskRetryCap)+")："+errMsg, nowStr(), nowStr(), id)
+		return err
+	}
+	_, err := d.db.Exec(`UPDATE research_tasks SET status='queued', retry_count=?, progress='', error=?,
 		finished_at='', updated_at=?,
 		requeue_seq=(SELECT COALESCE(MAX(requeue_seq),0)+1 FROM research_tasks)
-		WHERE id=?`, errMsg, nowStr(), id)
+		WHERE id=?`, cur, errMsg, nowStr(), id)
 	return err
+}
+
+// itoa 小工具：避免为单一常量引入 strconv（重试上限文案用）。
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
 }
 
 // CancelChainTasks 把某夜间链的剩余 queued 任务全部置 cancelled（AbortOnError 用）。
@@ -310,7 +355,7 @@ func (d *DB) ResetStaleRunningTasks() (int64, error) {
 const researchTaskCols = `id, type, ref_id, priority, status, progress,
 		COALESCE(result_num,0), COALESCE(result_text,''), COALESCE(error,''), payload,
 		COALESCE(chain_day,''), COALESCE(chain_seq,0), COALESCE(control,''),
-		COALESCE(requeue_seq,0),
+		COALESCE(requeue_seq,0), COALESCE(retry_count,0),
 		created_at, COALESCE(started_at,''), COALESCE(finished_at,''), updated_at`
 
 // scanResearchTask 从一行扫描出 ResearchTask（QueryRow 与 Rows 共用）。
@@ -318,7 +363,7 @@ func scanResearchTask(s rowScanner) (*ResearchTask, error) {
 	var t ResearchTask
 	if err := s.Scan(&t.ID, &t.Type, &t.RefID, &t.Priority, &t.Status, &t.Progress,
 		&t.ResultNum, &t.ResultText, &t.Error, &t.Payload,
-		&t.ChainDay, &t.ChainSeq, &t.Control, &t.RequeueSeq,
+		&t.ChainDay, &t.ChainSeq, &t.Control, &t.RequeueSeq, &t.RetryCount,
 		&t.CreatedAt, &t.StartedAt, &t.FinishedAt, &t.UpdatedAt); err != nil {
 		return nil, err
 	}

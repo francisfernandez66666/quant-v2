@@ -78,10 +78,16 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 		if p.UpdatedAt == "" {
 			p.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 		}
+		// §P0-1 多租户：带归属账号的对账先声明遗留全局行，避免复合主键冲突产生重复行。
+		if p.UserID != "" {
+			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, p.UserID, p.TsCode); err != nil {
+				return 0, fmt.Errorf("claim legacy position %s: %w", p.TsCode, err)
+			}
+		}
 		_, err := tx.Exec(`INSERT INTO real_positions
 			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(ts_code) DO UPDATE SET
+			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
 				amount=excluded.amount, strategy=excluded.strategy, updated_at=excluded.updated_at,
 				user_id=excluded.user_id,
@@ -144,10 +150,17 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 		if userID != "" {
 			p.UserID = userID
 		}
+		// §P0-1 多租户主键：同一股票先声明遗留全局行，避免复合主键冲突产生重复行。
+		// English: claim any legacy global row for this account before upserting.
+		if userID != "" {
+			if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, userID, p.TsCode); err != nil {
+				return 0, fmt.Errorf("claim legacy position %s: %w", p.TsCode, err)
+			}
+		}
 		_, err := tx.Exec(`INSERT INTO real_positions
 			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(ts_code) DO UPDATE SET
+			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
 				amount=excluded.amount, strategy=excluded.strategy, signal_id=excluded.signal_id,
 				updated_at=excluded.updated_at, user_id=excluded.user_id,
@@ -158,9 +171,9 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 			return 0, fmt.Errorf("reconcile real position %s: %w", p.TsCode, err)
 		}
 	}
-	// 清除本账号范围内已不在网关快照中的行（遗留空 user_id 行归 owner 账号管辖）。
+	// 清除本账号范围内已不在网关快照中的行。
 	if len(pos) == 0 {
-		if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id = '' OR user_id = ?`, userID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id = ?`, userID); err != nil {
 			return 0, err
 		}
 	} else {
@@ -173,7 +186,7 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 			}
 			placeholders += "?"
 		}
-		q := `DELETE FROM real_positions WHERE ts_code NOT IN (` + placeholders + `) AND (user_id = '' OR user_id = ?)`
+		q := `DELETE FROM real_positions WHERE ts_code NOT IN (` + placeholders + `) AND user_id = ?`
 		codes = append(codes, userID)
 		if _, err := tx.Exec(q, codes...); err != nil {
 			return 0, err
@@ -233,13 +246,26 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 }
 
 // RealPositionByCode 返回单只实盘持仓（不存在返回 sql.ErrNoRows）。
+// ⚠️ 多账号部署下应使用 RealPositionByCodeForUser；本函数保留以兼容遗留单租户调用。
 // （RealPositionByCode returns one live position, sql.ErrNoRows when absent.）
 func (d *DB) RealPositionByCode(code string) (RealPosition, error) {
 	var p RealPosition
 	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at FROM real_positions WHERE ts_code=?`, code).
+		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions WHERE ts_code=?`, code).
 		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt)
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
+	return p, err
+}
+
+// RealPositionByCodeForUser §P0-3 按账号返回单只实盘持仓；遗留全局行（user_id=”）对查询账号可见。
+// English: user-scoped single position lookup; legacy global rows are visible to any caller.
+func (d *DB) RealPositionByCodeForUser(userID, code string) (RealPosition, error) {
+	var p RealPosition
+	err := d.db.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
+		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions
+		WHERE ts_code=? AND (user_id = '' OR user_id = ?)`, code, userID).
+		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID)
 	return p, err
 }
 
@@ -255,10 +281,18 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		return err
 	}
 	defer tx.Rollback()
+
+	// §P0-1 多租户：成交前先声明遗留全局行，防止后续 INSERT 产生重复。
+	if f.UserID != "" {
+		if _, err := tx.Exec(`UPDATE real_positions SET user_id=? WHERE ts_code=? AND user_id=''`, f.UserID, f.Code); err != nil {
+			return fmt.Errorf("claim legacy position before fill %s: %w", f.Code, err)
+		}
+	}
+
 	var p RealPosition
 	err = tx.QueryRow(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id FROM real_positions WHERE ts_code=?`, f.Code).
-		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID)
+		strategy, signal_id, user_id FROM real_positions WHERE ts_code=? AND (user_id='' OR user_id=?)`, f.Code, f.UserID).
+		Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID, &p.UserID)
 	switch {
 	case err == sql.ErrNoRows:
 		// 首次成交：建仓（卖出空仓视为 no-op，仅记录 fills，不建行）。
@@ -274,6 +308,11 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		}
 	case err == nil:
 		now := time.Now().Format("2006-01-02 15:04:05")
+		// 统一归属到本次成交账号（遗留空行被声明后 p.UserID 已等于 f.UserID）。
+		ownerID := f.UserID
+		if ownerID == "" {
+			ownerID = p.UserID
+		}
 		if f.Side == "买入" {
 			newQty := p.Qty + f.Qty
 			var newCost float64
@@ -286,8 +325,8 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			}
 			// §实盘账户隔离：加仓时一并回写 user_id，确保归属字段不被旧行残值覆盖。
 			_, err = tx.Exec(`UPDATE real_positions SET qty=?, cost_price=?, amount=?,
-				highest_price=?, updated_at=?, user_id=? WHERE ts_code=?`,
-				newQty, newCost, newCost*float64(newQty), hi, now, f.UserID, f.Code)
+				highest_price=?, updated_at=?, user_id=? WHERE ts_code=? AND (user_id='' OR user_id=?)`,
+				newQty, newCost, newCost*float64(newQty), hi, now, ownerID, f.Code, f.UserID)
 		} else {
 			newQty := p.Qty - f.Qty
 			if newQty < 0 {
@@ -295,8 +334,8 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			}
 			// §实盘账户隔离：减仓时同样回写 user_id（减仓不改变归属，但保持写路径一致，
 			// 防止历史上 user_id 为空的持仓在减仓后仍以全局行形态存在）。
-			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=? WHERE ts_code=?`,
-				newQty, float64(newQty)*p.CostPrice, now, f.UserID, f.Code)
+			_, err = tx.Exec(`UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=? WHERE ts_code=? AND (user_id='' OR user_id=?)`,
+				newQty, float64(newQty)*p.CostPrice, now, ownerID, f.Code, f.UserID)
 		}
 	}
 	if err != nil {
@@ -352,12 +391,17 @@ func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 // UpdateRealOrderBySignalID 下单回填：把 pend:<signal_id> 占位行的 order_id 替换为网关真实委托号并更新状态。
 // §GAP 修复：此前占位行 order_id 恒为空串，与 order_id 主键冲突导致第二笔起的新单被
 // INSERT OR IGNORE 误判为重复（静默不下单），且按网关单号 UPDATE 也永不命中。
+// §P0-2/P0-3 userID 为空时仅操作遗留全局行；非空时严格限定本账号，防止跨账号误更新。
 // English: backfills the pending ticket (keyed by signal_id) with the gateway-assigned order id.
 // English: §GAP fix — placeholder rows previously stored an empty order_id, colliding on the primary
 // key so every later new order was swallowed as a "duplicate", and the status update by gateway id
 // never matched.
-func (d *DB) UpdateRealOrderBySignalID(signalID, orderID, status string) error {
-	_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=?`, orderID, status, signalID)
+func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string) error {
+	if userID == "" {
+		_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=''`, orderID, status, signalID)
+		return err
+	}
+	_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=?`, orderID, status, signalID, userID)
 	return err
 }
 
@@ -366,13 +410,20 @@ func (d *DB) UpdateRealOrderBySignalID(signalID, orderID, status string) error {
 // （客户端超时但券商实际受理的场景），绝不回退真实进度，只降级仍停留在"已报"假象的行。
 // 效果：①买入纪律统计不再把幽灵单计入当日预算/笔数；②同一 signal_id 重试可经
 // ResetFailedRealOrder 放行，止损类自动单不会因首次网络抖动被封死一整天。
+// §P0-3 userID 限定本账号作用域。
 // English: §GAP2-W1 demotes a placeholder order from 已报 to 发送失败 after a send failure
 // (gateway timeout / 5xx / disconnect). Guarded on status='已报' so fills that already arrived via
 // report callbacks (broker accepted despite our timeout) are never rolled back. Effects: failed sends
 // no longer pollute daily budget/count, and retrying the same signal_id is allowed via
 // ResetFailedRealOrder — auto stop-losses can no longer be bricked for the whole day by one network blip.
-func (d *DB) MarkRealOrderSendFailed(signalID string) error {
-	res, err := d.db.Exec(`UPDATE orders SET status='发送失败' WHERE signal_id=? AND status='已报'`, signalID)
+func (d *DB) MarkRealOrderSendFailed(userID, signalID string) error {
+	var res sql.Result
+	var err error
+	if userID == "" {
+		res, err = d.db.Exec(`UPDATE orders SET status='发送失败' WHERE signal_id=? AND status='已报' AND user_id=''`, signalID)
+	} else {
+		res, err = d.db.Exec(`UPDATE orders SET status='发送失败' WHERE signal_id=? AND status='已报' AND user_id=?`, signalID, userID)
+	}
 	if err != nil {
 		return err
 	}
@@ -385,11 +436,18 @@ func (d *DB) MarkRealOrderSendFailed(signalID string) error {
 // ResetFailedRealOrder §GAP2-W1 失败重试放行：把指定 signal_id 的"发送失败"行重置为"已报"。
 // 仅当行存在且状态恰为"发送失败"时生效并返回 true；其余状态（已报/部分成交/已成/已撤）原样保留
 // 并返回 false——即真正的重复下单仍然被唯一键拦截，只有确认失败过的单才允许再发一次。
+// §P0-3 userID 限定本账号作用域。
 // English: §GAP2-W1 retry gate — resets a 发送失败 ticket back to 已报 so the same signal_id may be
 // re-sent. Returns true only when a failed row was actually reset; genuine duplicates (already
 // reported/filled/cancelled) stay untouched and return false.
-func (d *DB) ResetFailedRealOrder(signalID string) (bool, error) {
-	res, err := d.db.Exec(`UPDATE orders SET status='已报' WHERE signal_id=? AND status='发送失败'`, signalID)
+func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
+	var res sql.Result
+	var err error
+	if userID == "" {
+		res, err = d.db.Exec(`UPDATE orders SET status='已报' WHERE signal_id=? AND status='发送失败' AND user_id=''`, signalID)
+	} else {
+		res, err = d.db.Exec(`UPDATE orders SET status='已报' WHERE signal_id=? AND status='发送失败' AND user_id=?`, signalID, userID)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -403,8 +461,8 @@ func (d *DB) ResetFailedRealOrder(signalID string) (bool, error) {
 // RealOrders 返回全部实盘委托单（倒序）。
 // （RealOrders returns all live orders, newest first.）
 func (d *DB) RealOrders() ([]RealOrder, error) {
-	rows, err := d.db.Query(`SELECT order_id, signal_id, code, side, status, price, qty, created_at
-		FROM orders ORDER BY created_at DESC, order_id DESC`)
+	rows, err := d.db.Query(`SELECT order_id, signal_id, code, side, status, price, qty, created_at,
+		COALESCE(user_id,'') FROM orders ORDER BY created_at DESC, order_id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +470,28 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 	var out []RealOrder
 	for rows.Next() {
 		var o RealOrder
-		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt); err != nil {
+		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// RealOrdersForUser §P0-3 按账号返回实盘委托单；遗留全局行（user_id=”）对查询账号可见。
+// English: user-scoped live orders; legacy global rows are visible to any caller.
+func (d *DB) RealOrdersForUser(userID string) ([]RealOrder, error) {
+	rows, err := d.db.Query(`SELECT order_id, signal_id, code, side, status, price, qty, created_at,
+		COALESCE(user_id,'') FROM orders WHERE user_id = '' OR user_id = ?
+		ORDER BY created_at DESC, order_id DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RealOrder
+	for rows.Next() {
+		var o RealOrder
+		if err := rows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -444,13 +523,19 @@ func orderStatusRank(status string) int {
 // AdvanceRealOrderStatus §R4-4 带单调守卫的委托状态推进（按 signal_id 定位）：
 // 仅当回报状态的秩高于本地当前秩时才更新——修掉"回报 部成/已成/已撤 被 INSERT OR IGNORE
 // 静默吞掉、本地永远停留已报"的状态机断链（该断链会让自动撤单误撤已成交单，资损级前置）。
+// §P0-3 userID 限定本账号作用域；userID 为空时仅操作遗留全局行。
 // 返回 (是否实际更新, 错误)。
 // English: §R4-4 guarded status advance keyed by signal_id — updates only when the reported
 // status outranks the local one, fixing the silent-swallow hole where 部成/已成/已撤 reports
 // never landed (a prerequisite before any auto-cancel can be trusted).
-func (d *DB) AdvanceRealOrderStatus(signalID, status string) (bool, error) {
+func (d *DB) AdvanceRealOrderStatus(userID, signalID, status string) (bool, error) {
 	var cur string
-	err := d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=?`, signalID).Scan(&cur)
+	var err error
+	if userID == "" {
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=''`, signalID).Scan(&cur)
+	} else {
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=?`, signalID, userID).Scan(&cur)
+	}
 	if err == sql.ErrNoRows {
 		return false, nil // 本地无此单（如网侧重放的历史单）：交由调用方决定是否补插
 	}
@@ -460,7 +545,50 @@ func (d *DB) AdvanceRealOrderStatus(signalID, status string) (bool, error) {
 	if orderStatusRank(status) <= orderStatusRank(cur) {
 		return false, nil // 乱序/重放/回退：忽略
 	}
-	res, err := d.db.Exec(`UPDATE orders SET status=? WHERE signal_id=?`, status, signalID)
+	var res sql.Result
+	if userID == "" {
+		res, err = d.db.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=''`, status, signalID)
+	} else {
+		res, err = d.db.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=?`, status, signalID, userID)
+	}
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// UpdateRealOrderStatusMonotonic §P0-4 撤单路径单调状态机：仅当目标状态秩高于当前秩时才更新。
+// 防止"网关撤单响应晚于成交回报"时把 已成/已撤 回退为 已撤，或把部成回退为已报。
+// userID 为空时仅操作遗留全局行。
+// English: P0-4 monotonic cancel path — only updates when the target status outranks the current one,
+// preventing a late cancel response from downgrading a filled/cancelled order.
+func (d *DB) UpdateRealOrderStatusMonotonic(userID, orderID, status string) (bool, error) {
+	var cur string
+	var err error
+	if userID == "" {
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE order_id=? AND user_id=''`, orderID).Scan(&cur)
+	} else {
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE order_id=? AND user_id=?`, orderID, userID).Scan(&cur)
+	}
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if orderStatusRank(status) <= orderStatusRank(cur) {
+		return false, nil
+	}
+	var res sql.Result
+	if userID == "" {
+		res, err = d.db.Exec(`UPDATE orders SET status=? WHERE order_id=? AND user_id=''`, status, orderID)
+	} else {
+		res, err = d.db.Exec(`UPDATE orders SET status=? WHERE order_id=? AND user_id=?`, status, orderID, userID)
+	}
 	if err != nil {
 		return false, err
 	}

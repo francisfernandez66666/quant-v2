@@ -155,9 +155,10 @@ func industryInfluenceScore(industry string, industryCnt map[string]int, total i
 }
 
 // industryRankScore 板块内排名（同行业按涨停时间越早越靠前）：第1名10分，第2名7，第3名5，其余2。
-// industryRankScore scores the rank within an industry (earlier first-seal time ranks higher):
+// 入参 s 为当前股票，industryStocks 为按行业聚合的涨停股列表；返回当前股票在所属行业内的排名得分。
+// English: scores the rank of the given stock within its industry (earlier first-seal time ranks higher):
 // rank 1 = 10, rank 2 = 7, rank 3 = 5, others = 2.
-func industryRankScore(industry string, industryStocks map[string][]data.LimitUpStock) float64 {
+func industryRankScore(s data.LimitUpStock, industry string, industryStocks map[string][]data.LimitUpStock) float64 {
 	group, ok := industryStocks[industry]
 	if !ok {
 		return 2
@@ -165,9 +166,12 @@ func industryRankScore(industry string, industryStocks map[string][]data.LimitUp
 	// 已按首封时间升序（涨停池接口默认 sort=fbt:asc，但本地再确保一次）
 	// Already sorted by first-seal time ascending (pool API defaults to sort=fbt:asc, but enforce it again locally).
 	sort.Slice(group, func(i, j int) bool { return group[i].FirstSeal < group[j].FirstSeal })
-	for i := range group {
-		// 同行业内首封越早名次越高，前 3 名给 10/7/5 分，其余 2 分
-		// Within an industry, earlier seals rank higher; the top 3 get 10/7/5, the rest get 2.
+	for i, st := range group {
+		// 只给当前股票在组内的真实排名赋分；同行业内首封越早名次越高，前 3 名给 10/7/5 分，其余 2 分
+		// Only score the current stock's real rank within the group; earlier seals rank higher.
+		if st.Code != s.Code {
+			continue
+		}
 		switch i {
 		case 0:
 			return 10
@@ -202,7 +206,7 @@ func ScoreLeader(s data.LimitUpStock, industryCnt map[string]int, industryStocks
 	score += industryInfluenceScore(s.Industry, industryCnt, total) // 板块影响力 15
 	score += sealTimeScore(s.FirstSeal)                             // 首封时间 10
 	score += turnoverScore(s.Turnover)                              // 换手 10
-	score += industryRankScore(s.Industry, industryStocks)          // 板块排名 10
+	score += industryRankScore(s, s.Industry, industryStocks)       // 板块排名 10
 	score += 3                                                      // 舆情 5（缺省3，后续接入新闻情感）
 
 	// 评分理由摘要：连板数 + 封单占比 + 首封时间

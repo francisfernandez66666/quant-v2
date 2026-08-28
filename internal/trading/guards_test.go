@@ -211,7 +211,7 @@ func TestSendFailedRetryAndBudgetExclusion(t *testing.T) {
 	}
 
 	// ④ 状态守卫：把 R2 手工推进为"已成"，再制造一次同键请求不应把它回退为已报/重发
-	if err := db.UpdateRealOrderBySignalID("R2", "GW-R", "已成"); err != nil {
+	if err := db.UpdateRealOrderBySignalID("u_sf", "R2", "GW-R", "已成"); err != nil {
 		t.Fatal(err)
 	}
 	stub.calls = 0

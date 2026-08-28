@@ -115,12 +115,18 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// 快照里的热点/新闻池个股仅纳入主循环已评过分（存在于 lastD1Scores）的：它们已有事件/D1 上下文，
 	// 避免对无新闻支撑的热点股误发战法信号；持仓/自选/跟踪池始终纳入。
 	td := data.TradingDayDate(time.Now())
+	// §P1-2 按账号过滤持仓池与自选池：多账号共享 rpt/wlMgr 时只取本账号数据。
 	pool := mergeCodes(
-		e.rpt.HeldPositionCodes(),
-		e.wlMgr.All(),
-		trackedCodes(e.stockTracker.GetActiveByDirection(td, "利好")),
-		trackedCodes(e.stockTracker.GetActiveByDirection(td, "利空")),
+		e.rpt.HeldPositionCodesFor(e.userID),
+		e.wlMgr.List(e.userID),
 	)
+	// §P1-B nil stockTracker 防御：注册表/测试可能未注入跟踪池，避免 panic。
+	if e.stockTracker != nil {
+		pool = mergeCodes(pool,
+			trackedCodes(e.stockTracker.GetActiveByDirection(td, "利好")),
+			trackedCodes(e.stockTracker.GetActiveByDirection(td, "利空")),
+		)
+	}
 	// §W5-v3 准入放开：快照热点股全部纳入打分池，不再要求"已有 D1 记录"——
 	// 该门槛原是防无新闻支撑误发信号的连坐闸；解耦后非 N 战法不消费 D1（N 形评分时无 D1 自然得 0 分
 	// 不出信号），外层门槛失去存在意义且会延迟新热点进入近实时监控。
@@ -170,7 +176,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// are skipped; in long+short mode the whole pool is assessed with 做空 as the level badge.
 	sellCodes := pool
 	if !e.ShortEnabled() {
-		sellCodes = e.rpt.HeldPositionCodes()
+		sellCodes = e.rpt.HeldPositionCodesFor(e.userID)
 	}
 	sellSigs := e.combatAgent.AssessSellSide(sellCodes, md, d1Scores, scores, e.ShortEnabled())
 	if len(exitSigs) > 0 || len(alertSigs) > 0 || len(sellSigs) > 0 {
@@ -275,7 +281,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		// 展示信号 = 当日固化信号 + 本轮新翻转信号（固化信号未被新一轮评分替换前持续显示）
 		// English: displayed signals = pinned day signals + this round's newly-flipped signals.
 		e.agg.UpdateFast(scores, mergeSignals(emit, e.signalStore.List()), e.rpt)
-		e.scoreStore.Save(data.TradingDayDate(time.Now()), scores)
+		e.fastScoreStore.Save(data.TradingDayDate(time.Now()), scores)
 		// 本轮全部 Pass 信号并入 5s 监控池：让展示接口优先走批量快照（而非每票 TTL 兜底），
 		// 现价/涨跌幅真实且不加重上游逐票请求。
 		e.syncSignalPool(sigs, nil, nil)

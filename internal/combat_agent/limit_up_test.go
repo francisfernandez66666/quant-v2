@@ -80,6 +80,31 @@ func TestScoreLeaderWeights(t *testing.T) {
 	}
 }
 
+// TestIndustryRankScoreRealRank 验证板块排名按当前股票真实排名赋分，
+// 而非同板块所有股票都拿第一名 10 分。
+func TestIndustryRankScoreRealRank(t *testing.T) {
+	industryStocks := map[string][]data.LimitUpStock{
+		"AI": {
+			{Code: "600001", Name: "先封", FirstSeal: "09:25"},
+			{Code: "600002", Name: "次封", FirstSeal: "09:30"},
+			{Code: "600003", Name: "第三", FirstSeal: "09:35"},
+			{Code: "600004", Name: "最后", FirstSeal: "10:00"},
+		},
+	}
+	if got := industryRankScore(data.LimitUpStock{Code: "600001"}, "AI", industryStocks); got != 10 {
+		t.Errorf("第一名应得 10 分, got %v", got)
+	}
+	if got := industryRankScore(data.LimitUpStock{Code: "600002"}, "AI", industryStocks); got != 7 {
+		t.Errorf("第二名应得 7 分, got %v", got)
+	}
+	if got := industryRankScore(data.LimitUpStock{Code: "600003"}, "AI", industryStocks); got != 5 {
+		t.Errorf("第三名应得 5 分, got %v", got)
+	}
+	if got := industryRankScore(data.LimitUpStock{Code: "600004"}, "AI", industryStocks); got != 2 {
+		t.Errorf("第四名应得 2 分, got %v", got)
+	}
+}
+
 // TestAnalyzeLimitUpEmpty 验证空涨停池的兜底行为：总数 0、龙头列表为空。
 func TestAnalyzeLimitUpEmpty(t *testing.T) {
 	res := AnalyzeLimitUp(nil, nil)

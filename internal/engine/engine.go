@@ -70,8 +70,12 @@ type Engine struct {
 	ths          *data.THSClient         // 同花顺客户端（板块名单/行情表/实时报价降级）
 	scanner      *data.SectorScanner     // 板块扫描器（板块名单索引，板块验真与归因校验依赖）
 
-	userID       string          // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/scores）
-	members      []string        // §GAP2-W2 共享引擎服务的账号全集（registry 注入；私有消息/SSE 扇出依据）
+	userID  string   // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/scores）
+	members []string // §GAP2-W2 共享引擎服务的账号全集（registry 注入；私有消息/SSE 扇出依据）
+	// §P1-4 管理员判定函数（main 注入 auth.IsAdmin）：primaryMember 优先返回管理员成员，
+	// 确保 friends 共享引擎的实盘账本/QMT 控制器默认归属创建者/管理员，而非首个普通成员。
+	// English: P1-4 admin predicate (wired from main's auth.IsAdmin) — primaryMember prefers an admin.
+	isAdminFn    func(userID string) bool
 	accountsRoot string          // §GAP2-W2 <dataDir>/accounts 根（私有文件按账号寻址）
 	cfgMgr       *config.Manager // 配置管理器（按账号读取策略/D1/LLM/做多做空配置）（Config manager, reads per-account strategy/D1/LLM/long-short settings）
 	longEnabled  bool            // 利好开关（做多分支）
@@ -106,7 +110,8 @@ type Engine struct {
 	sectorConstTopN  int                   // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
 
 	fetcher          *data.Fetcher                                                       // 5s 实时行情采集器（近实时打分快照来源）
-	scoreStore       *scoreStore                                                         // 8a/8b 打分持久化（scores.json）
+	scoreStore       *scoreStore                                                         // 8a/8b 主循环打分持久化（scores.json）
+	fastScoreStore   *scoreStore                                                         // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
 	prevPass         map[string]map[string]bool                                          // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
 	prevBullBuy      map[string]map[string]bool                                          // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
 	lastD1Scores     map[string]combat_agent.D1Score                                     // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
@@ -350,10 +355,12 @@ func New(
 	stageRecPath := ""
 	msgPath := ""
 	scoreRecPath := ""
+	fastScoreRecPath := ""
 	if dataDir != "" {
 		stageRecPath = filepath.Join(dataDir, "stage_records.json")
 		msgPath = filepath.Join(dataDir, "messages.json")
 		scoreRecPath = filepath.Join(dataDir, "scores.json")
+		fastScoreRecPath = filepath.Join(dataDir, "scores_fast.json")
 	}
 	consultPath := ""
 	if dataDir != "" {
@@ -400,6 +407,7 @@ func New(
 		sectorEventTimes: make(map[string]time.Time),
 		sectorConstTopN:  20,
 		scoreStore:       newScoreStore(scoreRecPath),
+		fastScoreStore:   newScoreStore(fastScoreRecPath),
 		prevPass:         make(map[string]map[string]bool),
 		prevBullBuy:      make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
@@ -470,15 +478,32 @@ func (e *Engine) memberIDs() []string {
 }
 
 // primaryMember 返回主账号（首个成员）：实盘账本/QMT 控制器等"单一归属"资源的默认主体。
-// English: primaryMember returns the first member — the default owner for single-owner resources
-// (live book / QMT controller).
+// §P1-4 多成员时优先返回管理员成员（friends 共享引擎里主账号应是创建者/管理员），
+// 无管理员时回退首个成员，单成员/独占引擎回退 userID。
+// English: primaryMember returns the default owner for single-owner resources (live book / QMT
+// controller). P1-4 prefers an admin member when present; falls back to the first member, then userID.
 func (e *Engine) primaryMember() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if len(e.members) > 0 {
+		if e.isAdminFn != nil {
+			for _, m := range e.members {
+				if e.isAdminFn(m) {
+					return m
+				}
+			}
+		}
 		return e.members[0]
 	}
 	return e.userID
+}
+
+// SetIsAdminFn 注入管理员判定函数（main 用 auth.IsAdmin 装配），供 primaryMember 优先选择管理员成员。
+// English: wires the admin predicate (from main's auth.IsAdmin) so primaryMember can prefer an admin.
+func (e *Engine) SetIsAdminFn(fn func(userID string) bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.isAdminFn = fn
 }
 
 // UserID 返回本引擎所属账号 ID。
@@ -2444,9 +2469,15 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.pushFreshHotspots(valid)
 
 	// 7. 策略评估：归因 + 分流 + 评分池 + 行情数据（无事件时仅覆盖 持仓+自选 打分池）
-	// 自选取全部账号并集（引擎全局打分，不区分账号）。
-	positions := e.rpt.HeldPositionCodes()
-	watchlist := e.wlMgr.All()
+	// §P1-2 多账号隔离：持仓/自选按本账号过滤（共享引擎且 userID 为空时回退全局并集）。
+	positions := e.rpt.HeldPositionCodesFor(e.userID)
+	if e.userID == "" {
+		positions = e.rpt.HeldPositionCodes()
+	}
+	watchlist := e.wlMgr.List(e.userID)
+	if e.userID == "" {
+		watchlist = e.wlMgr.All()
+	}
 	_stepEval := time.Now()
 	sr := e.strategy.Evaluate(ctx, valid, positions, watchlist)
 	_evalT := time.Since(_stepEval)
@@ -2680,8 +2711,12 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	}
 
 	// 取当日仍在跟踪期内的个股池（按方向区分做多/做空）
-	trackedLong := e.stockTracker.GetActiveByDirection(td, "利好")
-	trackedShort := e.stockTracker.GetActiveByDirection(td, "利空")
+	var trackedLong, trackedShort []*data.TrackedStock
+	// §P1-B nil stockTracker 防御：未注入跟踪池时按空池处理，避免 panic。
+	if e.stockTracker != nil {
+		trackedLong = e.stockTracker.GetActiveByDirection(td, "利好")
+		trackedShort = e.stockTracker.GetActiveByDirection(td, "利空")
+	}
 
 	// 8a/8b 个股监测池 = 新闻个股 + 已跟踪个股 + 持仓 + 自选（去重）
 	longCodes := mergeCodes(trackedCodes(trackedLong), newLong, positions, watchlist)
@@ -2718,22 +2753,24 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 
 	// 将本轮的个股信号写入跟踪池：有效期至下一交易日（到期后自动移出监测池）
 	_stepTracker := time.Now()
-	expiry := data.AddTradingDays(td, 1)
-	for _, sig := range individualSignals {
-		// 按信号方向映射为跟踪池的 利好/利空 标记
-		dir := "利好"
-		if sig.Direction == "做空" {
-			dir = "利空"
+	if e.stockTracker != nil {
+		expiry := data.AddTradingDays(td, 1)
+		for _, sig := range individualSignals {
+			// 按信号方向映射为跟踪池的 利好/利空 标记
+			dir := "利好"
+			if sig.Direction == "做空" {
+				dir = "利空"
+			}
+			e.stockTracker.Add(sig.Code, sig.Name, dir, sig.Reason, td, expiry)
 		}
-		e.stockTracker.Add(sig.Code, sig.Name, dir, sig.Reason, td, expiry)
-	}
 
-	// 收拢本轮全部有信号的个股代码，通知跟踪池做当日轮次收尾（失效未命中的个股）
-	allSigCodes := make([]string, len(individualSignals))
-	for i, sig := range individualSignals {
-		allSigCodes[i] = sig.Code
+		// 收拢本轮全部有信号的个股代码，通知跟踪池做当日轮次收尾（失效未命中的个股）
+		allSigCodes := make([]string, len(individualSignals))
+		for i, sig := range individualSignals {
+			allSigCodes[i] = sig.Code
+		}
+		e.stockTracker.OnCycleDone(td, allSigCodes)
 	}
-	e.stockTracker.OnCycleDone(td, allSigCodes)
 
 	// 个股信号并入做多信号流统一展示/广播
 	bullSignals = append(bullSignals, individualSignals...)
@@ -2840,7 +2877,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	if len(sr.ScoringPool) > 0 {
 		sellCodes := sr.ScoringPool
 		if !e.ShortEnabled() {
-			sellCodes = e.rpt.HeldPositionCodes()
+			// §P1-2 多账号隔离：仅本账号持仓参与卖出侧评估（共享引擎 userID 为空时回退全局）。
+			sellCodes = e.rpt.HeldPositionCodesFor(e.userID)
+			if e.userID == "" {
+				sellCodes = e.rpt.HeldPositionCodes()
+			}
 		}
 		alertSignals = append(alertSignals, e.combatAgent.AssessSellSide(sellCodes, sr.MarketData, d1Scores, stockScores, e.ShortEnabled())...)
 	}

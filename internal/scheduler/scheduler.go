@@ -382,6 +382,38 @@ func defaultDB() string {
 	return filepath.Join(home, ".quant-trading-v2", "trading.db")
 }
 
+// cleanupTaskLogs §P1-12 任务日志轮转：删除 dir 中修改时间早于 maxAge 的 task_*.log 文件，
+// 防止调度器长期运行后 task_logs 无限膨胀占满磁盘。dir 不存在时安全跳过。
+// English: P1-12 rotates task logs — removes task_*.log files whose mtime is older than maxAge so the
+// long-running scheduler never fills the disk. A missing dir is a no-op.
+func cleanupTaskLogs(dir string, maxAge time.Duration) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "task_") || !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
+				log.Printf("[scheduler] 清理过期任务日志失败 %s: %v", name, err)
+			} else {
+				log.Printf("[scheduler] 已清理过期任务日志 %s", name)
+			}
+		}
+	}
+}
+
 // resolveBin 解析二进制路径：绝对/相对路径直接用，裸名先 PATH 再回退 researchd 同目录。
 func (s *Scheduler) resolveBin(name string) (string, error) {
 	if name == "" {

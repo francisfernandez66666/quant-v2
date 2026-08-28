@@ -279,7 +279,7 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	// 卖出侧校验：减仓数量不得超过当前持仓
 	if side == trading.SideSell {
 		if db := s.researchDB; db != nil {
-			if p, err := db.RealPositionByCode(normalizeTsCode(req.Code)); err == nil && p.Qty > 0 && qty > p.Qty {
+			if p, err := db.RealPositionByCodeForUser(uid, normalizeTsCode(req.Code)); err == nil && p.Qty > 0 && qty > p.Qty {
 				writeError(w, 400, "sell qty exceeds holding")
 				return
 			}
@@ -401,7 +401,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			// 静默吞掉、本地永远停留"已报"，撤单闭环/对账全部失真。现走单调守卫的
 			// AdvanceRealOrderStatus：秩高于本地才更新，乱序/重放/回退绝不覆盖真实进度。
 			// 本地无此单时（网侧重放等）回落原 INSERT OR IGNORE 行为补插。
-			advanced, err := db.AdvanceRealOrderStatus(ev.SignalID, ev.Status)
+			advanced, err := db.AdvanceRealOrderStatus(uid, ev.SignalID, ev.Status)
 			if err != nil {
 				log.Printf("[trading] advance order status: %v", err)
 			}

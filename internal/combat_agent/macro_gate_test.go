@@ -60,16 +60,44 @@ func TestApplyMacroGateNShape(t *testing.T) {
 	}
 }
 
-// TestApplyMacroGateMomentumWatch 交割日：动量 watch 观察信号拦截。
-// English: TestApplyMacroGateMomentumWatch on settlement day: momentum watch signals are blocked.
+// TestApplyMacroGateMomentumWatch 交割日：动量 watch 观察信号被拦截剔除。
+// English: TestApplyMacroGateMomentumWatch on settlement day: momentum watch signals are blocked and removed.
 func TestApplyMacroGateMomentumWatch(t *testing.T) {
 	cfg := config.MacroGateConfig{Enabled: true}
 	sigs := []Signal{
 		{Strategy: "动量", Action: "watch", Confidence: 0.6, Reason: "动量60 量价齐升"},
 	}
 	out := applyMacroGate(sigs, true, cfg)
-	if out[0].Reason == "" || !containsStr(out[0].Reason, "宏观利空") {
-		t.Fatalf("动量 watch 应被整体降级，实际 reason=%s", out[0].Reason)
+	if len(out) != 0 {
+		t.Fatalf("动量 watch 应被拦截剔除，实际剩余 %d 条信号", len(out))
+	}
+}
+
+// TestApplyMacroGateMomentumWatchExplicitPass 显式关闭 BlockMomentum 时动量 watch 放行。
+// English: TestApplyMacroGateMomentumWatchExplicitPass: momentum watch passes when BlockMomentum is explicitly false.
+func TestApplyMacroGateMomentumWatchExplicitPass(t *testing.T) {
+	falseVal := false
+	cfg := config.MacroGateConfig{Enabled: true, BlockMomentum: &falseVal}
+	sigs := []Signal{
+		{Strategy: "动量", Action: "watch", Confidence: 0.6, Reason: "动量60 量价齐升"},
+	}
+	out := applyMacroGate(sigs, true, cfg)
+	if len(out) != 1 || out[0].Action != "watch" {
+		t.Fatalf("显式关闭 BlockMomentum 时动量 watch 应放行，实际=%+v", out)
+	}
+}
+
+// TestApplyMacroGateNShapeExplicitPass 显式关闭 BlockNShape 时 N 形买入放行。
+// English: TestApplyMacroGateNShapeExplicitPass: N-shape buy passes when BlockNShape is explicitly false.
+func TestApplyMacroGateNShapeExplicitPass(t *testing.T) {
+	falseVal := false
+	cfg := config.MacroGateConfig{Enabled: true, BlockNShape: &falseVal}
+	sigs := []Signal{
+		testSignal(string(strategy.SignalNShape), "buy", 0.95),
+	}
+	out := applyMacroGate(sigs, true, cfg)
+	if len(out) != 1 || out[0].Action != "buy" {
+		t.Fatalf("显式关闭 BlockNShape 时 N 形买入应放行，实际=%+v", out)
 	}
 }
 

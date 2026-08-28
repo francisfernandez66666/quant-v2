@@ -89,27 +89,20 @@ class MainActivity : AppCompatActivity() {
             // 同时把 JS console.log 转发到 Android logcat（调试定位用）
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                // 每次页面开始加载即无条件写入默认服务器地址。
-                // WebView 内嵌资源运行在 appassets 源，若 localStorage 的 server_url 缺失或残留脏值
-                // （如历史版本的 https://www.quant-trading.top），前端 fetch 会打到无效主机而报
-                // "Failed to fetch"。这里保证请求永远指向当前默认地址。
-                // （Unconditionally persist the default server URL before any page load. Without it,
-                // stale/missing localStorage values make the frontend fetch an invalid host from the
-                // appassets origin, surfacing as "Failed to fetch".）
-                if (DEFAULT_SERVER_URL.isNotEmpty()) {
+                // §P1-14 服务器地址覆盖：仅在 localStorage 尚无有效地址时预填。
+                // 优先级：原生持久化（SharedPreferences server_url，移动端设置入口写入）> DEFAULT_SERVER_URL。
+                // 不强制覆盖用户已生效的自定义地址；历史脏值（非法域名）重置为上一优先级的地址。
+                // （Seed the server URL only when localStorage has no valid one. Precedence:
+                // native SharedPreferences override > DEFAULT_SERVER_URL, so a server address set via
+                // the mobile settings entry survives even if WebView localStorage is cleared.）
+                val prefs = getSharedPreferences("quant_prefs", MODE_PRIVATE)
+                val nativeUrl = prefs.getString("server_url", "") ?: ""
+                val seed = if (nativeUrl.isNotEmpty()) nativeUrl else DEFAULT_SERVER_URL
+                if (seed.isNotEmpty()) {
                     view.evaluateJavascript(
-                        "localStorage.setItem('liangzai_server_url','$DEFAULT_SERVER_URL');",
-                        null
-                    )
-                }
-            }
-
-            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
-                // 页面加载完成后再次确认默认地址已写入（部分机型 onPageStarted 时机过早，JS 尚未就绪）
-                if (DEFAULT_SERVER_URL.isNotEmpty()) {
-                    view.evaluateJavascript(
-                        "localStorage.setItem('liangzai_server_url','$DEFAULT_SERVER_URL');",
+                        "(function(){var v=localStorage.getItem('liangzai_server_url');" +
+                        "if(!v||!/^https?:\\/\\//i.test(v)){" +
+                        "localStorage.setItem('liangzai_server_url','" + seed.replace("'", "\\'") + "');}})();",
                         null
                     )
                 }
@@ -155,6 +148,24 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
         }, "AndroidNotify")
+
+        // 原生配置桥：前端 JS 调用 window.AndroidConfig.setServerUrl(url) 持久化服务器地址。
+        // 写入 SharedPreferences 并在 localStorage 同步，供前端 baseUrl() 立即生效。
+        // （Returns true when persisted; frontend may call this from the server-URL input to save a custom address.）
+        webView.addJavascriptInterface(object {
+            @android.webkit.JavascriptInterface
+            fun setServerUrl(url: String): Boolean {
+                val value = url.trim()
+                if (!java.util.regex.Pattern.matches("^https?://.+", value)) return false
+                getSharedPreferences("quant_prefs", MODE_PRIVATE)
+                    .edit().putString("server_url", value).apply()
+                webView.evaluateJavascript(
+                    "localStorage.setItem('liangzai_server_url','" + value.replace("'", "\\'") + "');",
+                    null
+                )
+                return true
+            }
+        }, "AndroidConfig")
 
         webView.loadUrl("https://appassets.androidplatform.net/index.html")
     }

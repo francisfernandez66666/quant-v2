@@ -183,3 +183,42 @@ func TestD1ScoresUpsertAndQuery(t *testing.T) {
 		t.Fatalf("日期隔离失败: %+v", other)
 	}
 }
+
+// TestTaskRetryCap §P1-11 失败重试上限：连续失败达上限后任务转终态 error，不再重新入队。
+func TestTaskRetryCap(t *testing.T) {
+	db := testDB(t)
+	id, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	for i := 1; i <= researchTaskRetryCap; i++ {
+		if err := db.RequeueFailedTask(id, "boom"); err != nil {
+			t.Fatalf("第 %d 次重入队: %v", i, err)
+		}
+		tk, err := db.GetResearchTask(id)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if i < researchTaskRetryCap {
+			if tk.Status != TaskQueued {
+				t.Fatalf("第 %d 次应仍为 queued, 实际 %s", i, tk.Status)
+			}
+			// 失败任务仍可被出队重试
+			next, _ := db.DequeueHighestTask()
+			if next == nil || next.ID != id {
+				t.Fatalf("第 %d 次失败任务应能出队重试", i)
+			}
+		} else {
+			if tk.Status != TaskError {
+				t.Fatalf("达上限应转 error, 实际 %s", tk.Status)
+			}
+			if tk.RetryCount != researchTaskRetryCap {
+				t.Fatalf("retry_count 应为 %d, 实际 %d", researchTaskRetryCap, tk.RetryCount)
+			}
+		}
+	}
+	// 终态 error 不再出队
+	if next, _ := db.DequeueHighestTask(); next != nil {
+		t.Fatalf("终态 error 不应出队, 取到 %v", next)
+	}
+}

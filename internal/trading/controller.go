@@ -407,7 +407,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		return nil, err
 	}
 	if existed {
-		reset, rerr := c.store.ResetFailedRealOrder(req.SignalID)
+		reset, rerr := c.store.ResetFailedRealOrder(c.userID, req.SignalID)
 		if rerr != nil {
 			return nil, rerr
 		}
@@ -438,7 +438,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		// English: §GAP2-W1 on a send error, demote the placeholder from 已报 to 发送失败 so it stops
 		// polluting buy-discipline accounting and can be retried under the same signal_id. Status-guarded:
 		// fills that already landed via report callbacks are never rolled back.
-		if merr := c.store.MarkRealOrderSendFailed(req.SignalID); merr != nil {
+		if merr := c.store.MarkRealOrderSendFailed(c.userID, req.SignalID); merr != nil {
 			log.Printf("[trading] mark send-failed %s: %v", req.SignalID, merr)
 		}
 		return nil, err
@@ -452,7 +452,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// from 已报 to 发送失败 so it stops polluting buy-discipline accounting and the same signal_id can
 	// be retried later; duplicates never reach here (handled above).
 	if res != nil && !res.OK {
-		if merr := c.store.MarkRealOrderSendFailed(req.SignalID); merr != nil {
+		if merr := c.store.MarkRealOrderSendFailed(c.userID, req.SignalID); merr != nil {
 			log.Printf("[trading] mark send-failed (business reject) %s: %v", req.SignalID, merr)
 		}
 		log.Printf("[trading] %s 网关业务拒单: %s（占位行已降级发送失败，可重试）", req.SignalID, res.Err)
@@ -460,7 +460,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	}
 	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）
 	if res.OrderID != "" {
-		if err := c.store.UpdateRealOrderBySignalID(req.SignalID, res.OrderID, "已报"); err != nil {
+		if err := c.store.UpdateRealOrderBySignalID(c.userID, req.SignalID, res.OrderID, "已报"); err != nil {
 			log.Printf("[trading] backfill order id: %v", err)
 		}
 	}
@@ -495,7 +495,7 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 	if c.store == nil {
 		return nil
 	}
-	orders, err := c.store.RealOrders()
+	orders, err := c.store.RealOrdersForUser(c.userID)
 	if err != nil {
 		return fmt.Errorf("read real orders: %w", err)
 	}
@@ -527,7 +527,7 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 		return fmt.Errorf("单日买入预算不足: 已报 %.0f + 本次 %.0f > 预算 %.0f", spent, amount, cfg.DailyBudgetAmount)
 	}
 	if cfg.InitialCapital > 0 {
-		pos, err := c.store.RealPositions()
+		pos, err := c.store.RealPositionsForUser(c.userID)
 		if err != nil {
 			return fmt.Errorf("read real positions: %w", err)
 		}
@@ -549,10 +549,31 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 	// own frozen amounts, so local `spent` is NOT subtracted again (no double-count); the legacy
 	// approximation still runs in parallel — both gates must pass.
 	if acc, err := c.store.GetRealAccount(c.userID); err == nil && acc.AvailableCash > 0 {
-		if at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc); perr == nil {
-			if time.Since(at) <= 10*time.Minute && amount > acc.AvailableCash {
-				return fmt.Errorf("可用资金不足(券商口径): 可用 %.2f < 本次 %.2f（上报于 %s）",
-					acc.AvailableCash, amount, acc.UpdatedAt)
+		at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc)
+		if perr == nil {
+			// §P1-16 保守口径：快照新鲜（≤10min）用全额可用；陈旧（断开/长时间未上报）则用 50%
+			// 作为上限，避免券商侧已冻结/已用资金未知时过量下单（缺失即拒绝而非放行）。
+			// English: P1-16 conservative gate — fresh snapshot uses full available cash; a stale one
+			// (disconnected / long-unreported) caps at 50% so we never over-commit when the broker's
+			// frozen/spent state is unknown. Absence of snapshot rejects rather than passes.
+			cap := acc.AvailableCash
+			fresh := time.Since(at) <= 10*time.Minute
+			if !fresh {
+				cap = acc.AvailableCash * 0.5
+			}
+			label := "实时"
+			if !fresh {
+				label = "陈旧保守折算50%"
+			}
+			if amount > cap {
+				return fmt.Errorf("可用资金不足(券商口径%s): 上限 %.2f < 本次 %.2f（上报于 %s）",
+					label, cap, amount, acc.UpdatedAt)
+			}
+		} else if acc.AvailableCash > 0 {
+			// UpdatedAt 无法解析：同样走保守 50%% 折算。
+			if amount > acc.AvailableCash*0.5 {
+				return fmt.Errorf("可用资金不足(券商口径, 时间戳异常保守折算50%%): 上限 %.2f < 本次 %.2f",
+					acc.AvailableCash*0.5, amount)
 			}
 		}
 	}
@@ -587,7 +608,7 @@ func (c *Controller) Reconcile() error {
 	}
 	// 委托流水对账（此前 State 拉回即丢）：仅记日志差异告警，自动纠偏仍留给回报线程。
 	if len(st.Orders) > 0 {
-		local, _ := c.store.RealOrders()
+		local, _ := c.store.RealOrdersForUser(c.userID)
 		if len(local) != len(st.Orders) {
 			log.Printf("[trading] 对账差异: 网关委托 %d 笔 vs 本地 %d 笔（以回报线程为准，仅告警）",
 				len(st.Orders), len(local))
@@ -641,35 +662,38 @@ func (c *Controller) CancelOrder(orderID string) error {
 		return err
 	}
 	if c.store != nil {
-		if err := c.store.UpdateRealOrderStatus(orderID, "已撤"); err != nil {
+		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, orderID, "已撤"); err != nil {
 			log.Printf("[trading] cancel mark local %s: %v", orderID, err)
+		} else if !ok {
+			log.Printf("[trading] cancel mark local %s skipped: already at same/higher rank", orderID)
 		}
 	}
 	return nil
 }
 
-// HaltAll §R4-1 kill-switch 配套：撤销本地账本中全部"已报"未成交委托（非占位行），
+// HaltAll §R4-1 kill-switch 配套：撤销本地账本中全部"已报"/"部成"未成交委托（非占位行），
 // 返回成功撤销数。占位行（pend:，从未到达网关）不撤——由 MarkRealOrderSendFailed 降级口径处理。
-// English: §R4-1 kill-switch companion — cancels every unfilled 已报 (non-placeholder) order;
+// English: §R4-1 kill-switch companion — cancels every unfilled 已报/部成 (non-placeholder) order;
 // returns the successfully cancelled count. Placeholders are left to the send-failed demotion path.
 func (c *Controller) HaltAll() int {
 	if c.store == nil {
 		return 0
 	}
-	orders, err := c.store.RealOrders()
+	orders, err := c.store.RealOrdersForUser(c.userID)
 	if err != nil {
 		return 0
 	}
 	n := 0
 	for _, o := range orders {
-		if o.Status != "已报" || strings.HasPrefix(o.OrderID, "pend:") {
+		// §P1-7 kill-switch 同样覆盖部成，撤销剩余未成交部分。
+		if (o.Status != "已报" && o.Status != "部成") || strings.HasPrefix(o.OrderID, "pend:") {
 			continue
 		}
 		if err := c.exec.Cancel(o.OrderID); err != nil {
 			log.Printf("[trading] HaltAll 撤单失败 %s: %v", o.OrderID, err)
 			continue
 		}
-		if err := c.store.UpdateRealOrderStatus(o.OrderID, "已撤"); err == nil {
+		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, o.OrderID, "已撤"); err == nil && ok {
 			n++
 		}
 	}
@@ -743,7 +767,7 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		return nil // 自动撤单已关闭且未到收盘清单时刻
 	}
 
-	orders, err := c.store.RealOrders()
+	orders, err := c.store.RealOrdersForUser(c.userID)
 	if err != nil {
 		log.Printf("[trading] 撤单闭环读取订单失败: %v", err)
 		return nil
@@ -751,7 +775,8 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	res := &SweepResult{CloseSweep: closeSweep}
 	staleAfter := time.Duration(staleSec) * time.Second
 	for _, o := range orders {
-		if o.Status != "已报" {
+		// §P1-7 超时撤单范围扩展到部成：已报/部成 均可能剩余未成交，需自动撤销。
+		if o.Status != "已报" && o.Status != "部成" {
 			continue
 		}
 		at, perr := time.Parse(time.RFC3339, o.CreatedAt)
@@ -763,7 +788,7 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		if strings.HasPrefix(o.OrderID, "pend:") {
 			// 占位行从未到达网关：超时降级为"发送失败"（同 signal_id 可重试）
 			if staleSec > 0 && age > staleAfter {
-				if err := c.store.MarkRealOrderSendFailed(o.SignalID); err == nil {
+				if err := c.store.MarkRealOrderSendFailed(c.userID, o.SignalID); err == nil {
 					res.Demoted++
 				} else {
 					res.Errors++
@@ -782,7 +807,7 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 				o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), err)
 			continue
 		}
-		if err := c.store.UpdateRealOrderStatus(o.OrderID, "已撤"); err != nil {
+		if ok, err := c.store.UpdateRealOrderStatusMonotonic(c.userID, o.OrderID, "已撤"); err != nil || !ok {
 			res.Errors++
 			continue
 		}

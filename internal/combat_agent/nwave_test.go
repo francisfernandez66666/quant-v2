@@ -34,7 +34,7 @@ func mkWaveMD(price float64, volShares int64) *strategy_engine.StockMarketData {
 // 回调（跌破峰价×0.997）→ 再重破峰价 → Eval 返回 right（二突）。
 func TestWaveTrackerOneThenTwoBreakout(t *testing.T) {
 	tr := NewWaveTracker()
-	// 量比=2000手 / max(prevLow=9,1)=9 ≈222 ≥1.8，恒满足一突量比条件
+	// 量比 = 当日累计成交量(股) / 近20日日均成交量(股) = 2_000_000 / 10_000 = 200 ≥ 1.8
 	const bigVol = int64(2_000_000) // 2000手
 
 	// ① 一突：现价 11.2 > 11×1.005=11.055
@@ -55,6 +55,41 @@ func TestWaveTrackerOneThenTwoBreakout(t *testing.T) {
 	left, right = tr.Eval("600899", mkWaveMD(11.5, bigVol))
 	if !right {
 		t.Fatalf("重破峰价应触发二突(right=true), got left=%v right=%v", left, right)
+	}
+}
+
+// TestWaveTrackerVolumeRatioUsesVolumeNotPrice 验证一突量比用成交量而非价格做分母。
+// 构造 prevLow 极低（1 元）的场景：旧公式 cumVol/prevLow 会虚高，新公式应以日均量为分母。
+func TestWaveTrackerVolumeRatioUsesVolumeNotPrice(t *testing.T) {
+	base := time.Now()
+	prev := data.KLine{
+		Date: base.AddDate(0, 0, -1), High: 11, Low: 1, Close: 10,
+		Open: 9.8, Volume: 10000,
+	}
+	today := data.KLine{Date: base, High: 11.3, Low: 11.1, Close: 11.2, Volume: 10000}
+	md := &strategy_engine.StockMarketData{
+		Code: "600899", Name: "突破", Price: 11.2,
+		Quote:  &data.StockInfo{Price: 11.2, Volume: 180000, Open: 10.3}, // 1800手，刚好量比=1.8
+		KLines: []data.KLine{prev, today},
+	}
+	tr := NewWaveTracker()
+	left, _ := tr.Eval("600899", md)
+	if !left {
+		t.Fatalf("量比=1.8 应触发一突，left=%v", left)
+	}
+
+	// 同场景下，若把 prevLow 压到 0.1 元，旧公式会滥触发；新公式不应因此改变结果
+	prev.Low = 0.1
+	today.Low = 0.1
+	md2 := &strategy_engine.StockMarketData{
+		Code: "600899", Name: "突破", Price: 11.2,
+		Quote:  &data.StockInfo{Price: 11.2, Volume: 180000, Open: 10.3},
+		KLines: []data.KLine{prev, today},
+	}
+	tr2 := NewWaveTracker()
+	left2, _ := tr2.Eval("600899", md2)
+	if left2 != left {
+		t.Fatalf("prevLow 不应影响量比判定，left=%v left2=%v", left, left2)
 	}
 }
 

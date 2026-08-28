@@ -53,26 +53,26 @@ func TestAdvanceRealOrderStatusMonotonic(t *testing.T) {
 		t.Fatalf("seed order: %v", err)
 	}
 	// 正向推进：已报 → 部成 → 已成
-	if ok, _ := db.AdvanceRealOrderStatus("SIG-M1", "部成"); !ok {
+	if ok, _ := db.AdvanceRealOrderStatus("u_m", "SIG-M1", "部成"); !ok {
 		t.Fatal("已报→部成 应推进成功")
 	}
-	if ok, _ := db.AdvanceRealOrderStatus("SIG-M1", "已成"); !ok {
+	if ok, _ := db.AdvanceRealOrderStatus("u_m", "SIG-M1", "已成"); !ok {
 		t.Fatal("部成→已成 应推进成功")
 	}
 	// 乱序/重放/回退：全部拒绝
 	for _, stale := range []string{"已报", "部成", "已报待撤"} {
-		if ok, _ := db.AdvanceRealOrderStatus("SIG-M1", stale); ok {
+		if ok, _ := db.AdvanceRealOrderStatus("u_m", "SIG-M1", stale); ok {
 			t.Fatalf("已成之后回放 %s 绝不允许覆盖", stale)
 		}
 	}
 	// 终态互斥：已成之后来 废单/已撤 也不回退
 	for _, stale := range []string{"废单", "已撤", "部撤"} {
-		if ok, _ := db.AdvanceRealOrderStatus("SIG-M1", stale); ok {
+		if ok, _ := db.AdvanceRealOrderStatus("u_m", "SIG-M1", stale); ok {
 			t.Fatalf("已成之后 %s 绝不允许覆盖", stale)
 		}
 	}
 	// 本地无此单：返回 false 且不报错（交由调用方决定补插）
-	if ok, err := db.AdvanceRealOrderStatus("SIG-NOPE", "已成"); ok || err != nil {
+	if ok, err := db.AdvanceRealOrderStatus("u_m", "SIG-NOPE", "已成"); ok || err != nil {
 		t.Fatalf("未知 signal_id 应 (false,nil), got (%v,%v)", ok, err)
 	}
 	// 最终状态必须是 已成
@@ -161,5 +161,58 @@ func TestRealCashGate(t *testing.T) {
 	}
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-CASH-STALE", 1000)); err != nil {
 		t.Fatalf("过期回报不应约束(且 AvailableCash=0 不触发), got %v", err)
+	}
+}
+
+// TestCancelPathMonotonic §P0-4 撤单路径单调状态机：本地订单已是 已成/已撤 等终态时，
+// 撤单成功后不得把状态回退/覆盖为 已撤（防止晚到的撤单响应覆盖真实成交回报）。
+func TestCancelPathMonotonic(t *testing.T) {
+	db := testDB(t)
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	ctrl := NewController(guardServer(), db, "u_cancel", cfg, nil)
+
+	seed := func(orderID, signalID, status string) {
+		if _, err := db.UpsertRealOrder(store.RealOrder{
+			OrderID: orderID, SignalID: signalID, Code: "600000.SH", Side: SideBuy,
+			Status: status, Price: 10, Qty: 100, CreatedAt: time.Now().Format(time.RFC3339),
+			UserID: "u_cancel",
+		}); err != nil {
+			t.Fatalf("seed %s: %v", status, err)
+		}
+	}
+
+	seed("GW-FILLED", "SIG-FILLED", "已成")
+	seed("GW-CANCELLED", "SIG-CANCELLED", "已撤")
+	seed("GW-REPORTED", "SIG-REPORTED", "已报")
+
+	// 直接调用 CancelOrder：对 guardServer() 来说任意 orderID 都能撤成功，
+	// 但本地状态必须受单调秩保护。
+	if err := ctrl.CancelOrder("GW-FILLED"); err != nil {
+		t.Fatalf("撤单调用应成功: %v", err)
+	}
+	if err := ctrl.CancelOrder("GW-CANCELLED"); err != nil {
+		t.Fatalf("撤单调用应成功: %v", err)
+	}
+	if err := ctrl.CancelOrder("GW-REPORTED"); err != nil {
+		t.Fatalf("撤单调用应成功: %v", err)
+	}
+
+	orders, _ := db.RealOrdersForUser("u_cancel")
+	for _, o := range orders {
+		switch o.SignalID {
+		case "SIG-FILLED":
+			if o.Status != "已成" {
+				t.Fatalf("已成单不得被撤单路径回退, got %s", o.Status)
+			}
+		case "SIG-CANCELLED":
+			if o.Status != "已撤" {
+				t.Fatalf("已撤单应保持已撤, got %s", o.Status)
+			}
+		case "SIG-REPORTED":
+			if o.Status != "已撤" {
+				t.Fatalf("已报单撤单后应变已撤, got %s", o.Status)
+			}
+		}
 	}
 }

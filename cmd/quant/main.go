@@ -82,6 +82,8 @@ func main() {
 
 	// 配置管理器：读取数据目录下的 config.json（策略/风控/情绪/LLM 等）
 	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
+	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
+	cfgMgr.Watch(context.Background(), 60*time.Second)
 
 	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN）：primary_source=hithink 时回测取数优先 ths_ 表。
 	store.PrimarySourceThsDaily = strings.EqualFold(cfgMgr.Rules.Data.PrimarySource, "hithink")
@@ -310,6 +312,8 @@ func main() {
 	// English: paper account policy — only admin accounts auto-fill/mark from strategies; normal users'
 	// paper is manual-only and static. Also injects the enabled-strategy pool template (allocation).
 	registry.SetAutoPaperCheck(authMgr.IsAdmin)
+	// §P1-4 透传管理员判定，使共享引擎的实盘账本/QMT 控制器默认归属管理员账号。
+	registry.SetAdminCheck(authMgr.IsAdmin)
 	registry.SetPaperPools(server.ActivePaperPoolTypes(dataDir))
 	// §C 规则细分池显示名解析器：fac_1/pat_2 → "因子战法#1" 等（分仓条可读）
 	registry.SetPaperLabelResolver(server.LibraryLabelResolver(dataDir))

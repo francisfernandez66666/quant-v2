@@ -1,3 +1,8 @@
+// Package main —— cmd/quant 子模块：实盘财务因子查询缓存（finaCache）。
+//
+// 从研究库 fina_indicator 读取各股最新报告期财务指标，带 TTL 缓存，避免 5s 打分循环反复查库。
+// 代码/后缀统一由 normalizeTSCode 归一化为研究库 ts_code（XXXXXX.SH/SZ/BJ）。
+// 详见下方 finaCache、cacheEntry、normalizeTSCode、isDigit6 等定义。
 package main
 
 import (

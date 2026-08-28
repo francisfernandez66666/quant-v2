@@ -182,11 +182,15 @@ class ReportHandler:
         if not ev.get("signal_id"):
             log.info("[handler] order without signal_id, skip: %s", ev)
             return
+        # §P1-9 落库携带归属账号 ID（多账号隔离）
+        ev["user_id"] = self.user_id
         self.store.upsert_order(ev)
         self._push({"type": "order", **ev})
 
     def on_trade(self, ev):
         # 成交先落库并去重；重复重放不推送，避免持仓翻倍
+        # §P1-9 落库携带归属账号 ID（多账号隔离）
+        ev["user_id"] = self.user_id
         pos, is_dup = self.store.apply_fill(ev)
         if is_dup:
             log.warning("[handler] duplicate trade replay ignored: %s %s %s@%s x%s",
@@ -209,6 +213,9 @@ class ReportHandler:
             log.warning("[handler] two consecutive empty snapshots — accepting full clear")
         else:
             self._empty_snaps = 0
+        # §P1-9 对账持仓逐条补归属账号 ID（多账号隔离）
+        for p in positions:
+            p["user_id"] = self.user_id
         n = self.store.reconcile_positions(positions)
         log.info("[handler] reconciled %d positions", n)
         self._push({"type": "positions", "positions": list(positions)})

@@ -63,6 +63,29 @@ class TestStore(unittest.TestCase):
                       "amount": 1950, "traded_at": "t4", "signal_id": "S4"})
         self.assertEqual(s.list_positions(), [])
 
+    def test_user_id_isolated_in_store(self):
+        # §P1-9 成交/委托落库携带归属账号 ID（多账号隔离）。
+        s = new_store()
+        s.apply_fill({"code": "600519.SH", "side": "买入", "price": 10, "qty": 100,
+                      "amount": 1000, "traded_at": "t1", "signal_id": "S1", "user_id": "uA"})
+        self.assertEqual(s.list_positions()[0]["user_id"], "uA")
+        # 成交去重表里也带 user_id
+        s.upsert_order({"signal_id": "S1", "code": "600519.SH", "side": "买入",
+                        "status": "已报", "price": 10, "qty": 100, "created_at": "t1",
+                        "user_id": "uA"})
+        o = s.order_by_signal("S1")
+        self.assertEqual(o["user_id"], "uA")
+        # 对账持仓带 user_id；对账会用传入集合覆盖，故把该持仓一起纳入对账集合
+        n = s.reconcile_positions([{"ts_code": "600519.SH", "qty": 100, "cost_price": 10,
+                                    "amount": 1000, "user_id": "uA"},
+                                   {"ts_code": "000001.SZ", "qty": 50, "cost_price": 5,
+                                    "amount": 250, "user_id": "uB"}])
+        self.assertEqual(n, 2)
+        by_uB = [p for p in s.list_positions() if p["user_id"] == "uB"]
+        self.assertEqual(len(by_uB), 1)
+        by_uA = [p for p in s.list_positions() if p["user_id"] == "uA"]
+        self.assertEqual(len(by_uA), 1)
+
     def test_reconcile_removes_absent(self):
         s = new_store()
         s.upsert_position({"ts_code": "000001.SZ", "qty": 100, "cost_price": 10})
@@ -230,6 +253,26 @@ class TestMockBroker(unittest.TestCase):
         self.assertEqual(p["qty"], 200)
         self.assertAlmostEqual(p["cost_price"], 1505)
         self.assertAlmostEqual(p["highest_price"], 1510)
+
+    def test_cash_model_decrements_and_replenishes(self):
+        # §P1-17 显式现金模型：买入扣减 price*qty，卖出回补；初始资金=200000。
+        b = MockBroker(account_init=200000.0, delay_sec=0.05)
+        b.connect()
+        ok, oid, err = b.place_order({"signal_id": "S1", "code": "600519.SH",
+                                      "name": "贵州茅台", "side": "买入", "price": 1000,
+                                      "qty": 100, "amount": 100000})
+        self.assertTrue(ok)
+        time.sleep(0.3)
+        # 买入 100@1000 = 100000，可用资金应降至 100000
+        self.assertAlmostEqual(b.query_asset()["cash"], 100000.0)
+        # 再卖出 100@1100 → 回补 110000，可用资金回到 210000
+        ok, oid2, err = b.place_order({"signal_id": "S2", "code": "600519.SH",
+                                       "name": "贵州茅台", "side": "卖出", "price": 1100,
+                                       "qty": 100, "amount": 110000})
+        self.assertTrue(ok)
+        time.sleep(0.3)
+        self.assertAlmostEqual(b.query_asset()["cash"], 210000.0)
+        self.assertEqual(b.query_asset()["market_value"], 0.0)
 
 
 class TestXtBrokerLazyImport(unittest.TestCase):

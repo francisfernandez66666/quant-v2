@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
 	"encoding/json"
 	"expvar"
 	"fmt"
@@ -100,6 +101,10 @@ type Server struct {
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
 	runtimeURL string     // 运行时实际使用的 API 地址
 	limiter    ipLimiter  // §A4 匿名端点 IP 频控（register/temp/login/setup）
+	// §P1-5 初始化令牌：若环境变量 SETUP_TOKEN 非空，POST /setup 必须携带匹配令牌
+	// （body.setup_token 或 X-Setup-Token 头），否则拒绝。防止未授权者抢跑初始化。
+	// English: P1-5 setup token — when SETUP_TOKEN env is set, POST /setup requires the matching token.
+	setupToken string
 
 	calMu         sync.Mutex        // 保护日历缓存的互斥锁
 	macroCache    []data.MacroEvent // 宏观日历事件缓存
@@ -270,16 +275,17 @@ func (s *Server) shortOnFor(userID string) bool {
 // New 创建 HTTP 服务端实例。
 func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rpt *report.Report, market *data.MarketAPI, wl *data.WatchlistManager, ths *data.THSClient) *Server {
 	s := &Server{
-		auth:      authMgr,
-		agg:       agg,
-		cfg:       cfg,
-		rpt:       rpt,
-		mux:       http.NewServeMux(),
-		market:    market,
-		ths:       ths,
-		watchlist: wl,
-		sse:       NewSSEBroker(),
-		startTime: time.Now(),
+		auth:       authMgr,
+		agg:        agg,
+		cfg:        cfg,
+		rpt:        rpt,
+		mux:        http.NewServeMux(),
+		market:     market,
+		ths:        ths,
+		watchlist:  wl,
+		sse:        NewSSEBroker(),
+		startTime:  time.Now(),
+		setupToken: os.Getenv("SETUP_TOKEN"),
 	}
 	// 多账号多配置：把 auth.Manager 作为 per-user 配置存储注入 config.Manager，
 	// 使策略/D1/LLM 配置可按账号隔离保存。
@@ -654,6 +660,7 @@ type setupReq struct {
 	LLMApiURL    string `json:"llm_api_url"`
 	LLMApiKey    string `json:"llm_api_key"`
 	TushareToken string `json:"tushare_token"`
+	SetupToken   string `json:"setup_token"` // §P1-5 初始化令牌（SETUP_TOKEN 开启时必填）
 }
 
 // handleSetupSubmit 处理 POST /setup：完成首次初始化。
@@ -670,6 +677,18 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
+	}
+
+	// §P1-5 SETUP_TOKEN 守卫：环境变量已配置时，POST /setup 必须携带匹配令牌，否则拒绝抢跑初始化。
+	if s.setupToken != "" {
+		provided := req.SetupToken
+		if provided == "" {
+			provided = r.Header.Get("X-Setup-Token")
+		}
+		if !hmac.Equal([]byte(provided), []byte(s.setupToken)) {
+			writeError(w, 401, "setup token required")
+			return
+		}
 	}
 
 	if req.Username == "" || req.Password == "" {

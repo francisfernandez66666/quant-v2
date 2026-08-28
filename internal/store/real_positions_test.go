@@ -3,7 +3,10 @@ package store
 
 import (
 	"database/sql"
+	"path/filepath"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 // TestUpsertRealPositions 验证全量对账：upsert 覆盖 + 移除已清仓行 + highest_price 单调不回退。
@@ -194,5 +197,76 @@ func TestApplyRealFillIdempotent(t *testing.T) {
 	}
 	if p, _ = db.RealPositionByCode("600519.SH"); p.Qty != 200 {
 		t.Fatalf("新成交应累加到 200, got %d", p.Qty)
+	}
+}
+
+// TestSchemaMigrationP01P02 §P0-1/P0-2 旧库主键/唯一约束迁移：
+// 模拟只含单 ts_code 主键的 real_positions 和单 signal_id 唯一的 orders，
+// Open 后应自动重建为 (ts_code, user_id) 与 (user_id, signal_id)。
+func TestSchemaMigrationP01P02(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "migrate.db")
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 创建旧 schema
+	if _, err := rawDB.Exec(`
+		CREATE TABLE real_positions (
+			ts_code TEXT PRIMARY KEY,
+			name TEXT DEFAULT '',
+			qty INTEGER NOT NULL DEFAULT 0,
+			cost_price REAL NOT NULL DEFAULT 0,
+			amount REAL NOT NULL DEFAULT 0,
+			highest_price REAL NOT NULL DEFAULT 0,
+			strategy TEXT DEFAULT '',
+			signal_id TEXT DEFAULT '',
+			updated_at TEXT NOT NULL,
+			user_id TEXT DEFAULT ''
+		);
+		CREATE TABLE orders (
+			order_id TEXT PRIMARY KEY,
+			signal_id TEXT UNIQUE,
+			code TEXT NOT NULL,
+			side TEXT NOT NULL,
+			status TEXT NOT NULL,
+			price REAL,
+			qty INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			user_id TEXT DEFAULT ''
+		);
+	`); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	rawDB.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open after migration: %v", err)
+	}
+	defer db.Close()
+
+	// 迁移后应支持多账号同股票
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Qty: 100, UserID: "u1"},
+		{TsCode: "600000.SH", Qty: 200, UserID: "u2"},
+	}); err != nil {
+		t.Fatalf("multi-tenant positions upsert: %v", err)
+	}
+	all, _ := db.RealPositions()
+	if len(all) != 2 {
+		t.Fatalf("应存在 2 条持仓, got %d", len(all))
+	}
+
+	// 迁移后应支持同 signal_id 不同账号
+	if _, err := db.UpsertRealOrder(RealOrder{OrderID: "O1", SignalID: "SIG-X", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-08-28T10:00:00+08:00", UserID: "u1"}); err != nil {
+		t.Fatalf("u1 order: %v", err)
+	}
+	if _, err := db.UpsertRealOrder(RealOrder{OrderID: "O2", SignalID: "SIG-X", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-08-28T10:00:00+08:00", UserID: "u2"}); err != nil {
+		t.Fatalf("u2 order: %v", err)
+	}
+	orders, _ := db.RealOrders()
+	if len(orders) != 2 {
+		t.Fatalf("应存在 2 条委托, got %d", len(orders))
 	}
 }

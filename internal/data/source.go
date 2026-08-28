@@ -64,6 +64,9 @@ type DataCoordinator struct {
 	ipoRefreshing atomic.Bool // IPO 日历刷新进行中标志（防 TTL 到期瞬间多调用方并发重复刷新）
 	// English: ipoRefreshing: an IPO-calendar refresh is in flight (prevents concurrent
 	// English: duplicate refreshes when multiple callers hit the expired-TTL path at once).
+
+	lastSource string // §P1-10 最近一次成功命中的行情源名称（hithink/sina/ths/eastmoney）
+	// English: name of the last successful quote source.
 }
 
 // cachedSectorStocks 板块成分股缓存条目。
@@ -182,6 +185,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	if hk := dc.hithink; hk != nil {
 		if hkQuotes, hkErr := hk.BatchQuotes([]string{code}); hkErr == nil {
 			if si := lookupHithinkQuote(hkQuotes, code); si != nil && si.Price > 0 {
+				dc.setLastSource("hithink")
 				log.Printf("hithink(新)返回 %s 最新价 %.2f", code, si.Price)
 				return si, nil
 			}
@@ -193,6 +197,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	// ② 新浪：hithink 缺失/失败时的主用源。
 	si, err := dc.eastMoney.GetSinaQuote(code)
 	if err == nil && si != nil && si.Price > 0 {
+		dc.setLastSource("sina")
 		return si, nil
 	}
 	if err != nil {
@@ -203,6 +208,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	if dc.thsAvailable() {
 		thsSi, thsErr := dc.ths.GetQuote(code)
 		if thsErr == nil && thsSi != nil && thsSi.Price > 0 {
+			dc.setLastSource("ths")
 			log.Printf("同花顺返回 %s 最新价 %.2f", code, thsSi.Price)
 			return thsSi, nil
 		} else if thsErr != nil {
@@ -214,6 +220,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	// ④ 东财：永远处于最末兜底位（绝不作为第一/主源）。
 	emSI, emErr := dc.eastMoney.GetRealtimeQuote(code)
 	if emErr == nil && emSI != nil && emSI.Price > 0 {
+		dc.setLastSource("eastmoney")
 		return emSI, nil
 	}
 	if emErr != nil {
@@ -534,11 +541,21 @@ func (dc *DataCoordinator) CrossCheckPrice(code string) (price float64, err erro
 	return si.Price, nil
 }
 
-// SourceName 返回当前首选数据源的名称。
-// English: SourceName returns the name of the current primary data source.
-// SourceName returns the name of the current primary data source.
+// SourceName 返回最近一次成功命中的行情源名称。
+// 在 GetQuote 任意降级链路命中后更新；从未命中过行情时返回空串。
+// English: returns the name of the last successful quote source; empty if no quote has ever hit.
 func (dc *DataCoordinator) SourceName() string {
-	return "Sina"
+	dc.mu.RLock()
+	defer dc.mu.RUnlock()
+	return dc.lastSource
+}
+
+// setLastSource 在锁内更新最近一次成功命中的行情源名称（线程安全）。
+// English: updates the last successful quote source under lock.
+func (dc *DataCoordinator) setLastSource(src string) {
+	dc.mu.Lock()
+	dc.lastSource = src
+	dc.mu.Unlock()
 }
 
 // GetAuctionData 获取集合竞价数据。

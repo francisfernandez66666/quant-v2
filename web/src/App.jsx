@@ -37,6 +37,31 @@ function PageFallback() {
   )
 }
 
+// 无权限兜底页：渲染 403 提示，并提供返回仪表盘的入口
+function Forbidden() {
+  const navigate = useNavigate()
+  return (
+    <div style={{ padding: 48, textAlign: 'center', color: '#888' }}>
+      <h2>403 · 无访问权限</h2>
+      <p>当前账号无权访问此页面。</p>
+      <Button theme="default" variant="outline" size="small" onClick={() => navigate('/dashboard')}>返回仪表盘</Button>
+    </div>
+  )
+}
+
+// 路由级权限守卫：根据后端已下发的角色/权限位决定是否渲染，无权限则重定向到 403。
+// 后端接口已做鉴权兜底，此处仅作体验层保护（避免直接渲染无权页面）。
+//   admin: 仅管理员可访问；perm: 指定权限位（管理员隐式全部）。
+function ProtectedRoute({ admin, perm, children }) {
+  // §P1-13 路由守卫：未登录先跳转登录页（/ 由顶层 loggedIn 切换为登录视图），
+  // 已登录但权限/角色不足才落到 /403，避免未登录直接暴露 401 空页面。
+  if (!api.isLoggedIn()) {
+    return <Navigate to="/" replace />
+  }
+  const allowed = admin ? api.isAdmin() : perm ? api.hasPerm(perm) : true
+  return allowed ? children : <Navigate to="/403" replace />
+}
+
 /**
  * 应用根组件
  * 负责登录态、全局状态轮询、SSE 推送、角色权限、侧边栏与路由渲染。
@@ -357,12 +382,13 @@ export default function App() {
                     <Route path="/quant" element={<Quant />} />
                     <Route path="/hotspot" element={<Hotspot />} />
                     <Route path="/msgcenter" element={<MsgCenter />} />
-                    <Route path="/settings" element={<Settings />} />
+                    <Route path="/settings" element={<ProtectedRoute admin><Settings /></ProtectedRoute>} />
                     <Route path="/llm-debug" element={<LLMDebug />} />
                     <Route path="/consult" element={<Consult />} />
-                    <Route path="/research" element={<Research />} />
-                    <Route path="/admin" element={<Admin />} />
+                    <Route path="/research" element={<ProtectedRoute perm="research_approve"><Research /></ProtectedRoute>} />
+                    <Route path="/admin" element={<ProtectedRoute admin><Admin /></ProtectedRoute>} />
                     <Route path="/paper" element={<Paper />} />
+                    <Route path="/403" element={<Forbidden />} />
                   </Routes>
                 </Suspense>
               </ErrorBoundary>

@@ -153,7 +153,7 @@ func dragonReturnDataFromMarketData(code string, md *strategy_engine.StockMarket
 	if sector != nil {
 		sd.IsSectorTop2 = sector.RPSRank > 0 && sector.RPSRank <= 2
 		sd.SectorRPS20 = sector.RPS20
-		sd.SectorRPS60 = sector.RPS20
+		sd.SectorRPS60 = sector.RPS60 // §P1-19 修正：取板块 60 日 RPS（此前误用 RPS20）
 	}
 	return sd
 }

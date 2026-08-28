@@ -350,8 +350,14 @@ func (s *LeftSideScorer) Evaluate(wa *WaveA, ib *IntradayB, ctx *Ctx) *ScoreResu
 	// English: left-breakout requires a valid D1 event score along with the price/volume shape, so a
 	// placeholder low/zero D1 never fires the left-buy reminder.
 	if res.D1Event > 0 && ib.CurPrice > ib.PrevHigh*1.005 && ib.CumVol > 0 && ib.PrevClose > 0 {
-		// 量比用当日累计量 / 前日最低价量级近似（Volume ratio approximated as cumulative volume scaled by prior low）
-		volRatio := ib.CumVol / math.Max(ib.PrevLow, 1)
+		// 量比 = 当日累计成交量(手) / 近20日日均成交量(手)。
+		// ib.CumVol 已为手，ib.AvgDailyVol 为股，需统一为手后比较。
+		// English: volume ratio = today's cumulative volume (lots) / 20-day average daily volume (lots).
+		// ib.CumVol is already in lots; ib.AvgDailyVol is in shares, so convert to lots before comparing.
+		volRatio := 0.0
+		if ib.AvgDailyVol > 0 {
+			volRatio = ib.CumVol / (ib.AvgDailyVol / 100)
+		}
 		if volRatio >= 1.8 {
 			res.LeftSignal = true
 		}

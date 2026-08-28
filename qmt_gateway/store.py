@@ -84,7 +84,8 @@ class Store:
                 highest_price REAL,
                 strategy      TEXT,
                 signal_id     TEXT,
-                updated_at    TEXT
+                updated_at    TEXT,
+                user_id       TEXT           -- P1-9：多账号隔离归属
             );
             CREATE TABLE IF NOT EXISTS orders (
                 order_id   TEXT PRIMARY KEY,
@@ -94,7 +95,8 @@ class Store:
                 status     TEXT,
                 price      REAL,
                 qty        INTEGER,
-                created_at TEXT
+                created_at TEXT,
+                user_id       TEXT           -- P1-9：多账号隔离归属
             );
             CREATE TABLE IF NOT EXISTS fills (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,15 +107,25 @@ class Store:
                 qty       INTEGER,
                 amount    REAL,
                 traded_at TEXT,
-                signal_id TEXT
+                signal_id TEXT,
+                user_id       TEXT           -- P1-9：多账号隔离归属
             );
             """
         )
         self._conn.commit()
 
     def _migrate_schema(self):
-        """老库兼容：无破坏性变更即跳过（当前 schema 与初版一致）。"""
-        return
+        """P1-9：老库兼容——三表补加 user_id 列（多账号隔离）。
+
+        SQLite ALTER TABLE 不支持 IF NOT EXISTS，故先查 PRAGMA 列信息再按需加列。
+        """
+        for t in ("real_positions", "orders", "fills"):
+            cols = [r[1] for r in self._conn.execute(
+                "PRAGMA table_info(%s)" % t).fetchall()]
+            if "user_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE %s ADD COLUMN user_id TEXT DEFAULT ''" % t)
+        self._conn.commit()
 
     # ── orders ──
     def claim_order(self, draft):
@@ -128,8 +140,8 @@ class Store:
         with self._lock:
             # 以 signal_id UNIQUE 做原子 INSERT；冲突则啥也不做（占位失败=已被抢占）
             cur = self._conn.execute(
-                """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at)
-                   VALUES(?,?,?,?,?,?,?,?)
+                """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
+                   VALUES(?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(signal_id) DO NOTHING""",
                 (
                     "pending:" + sid,
@@ -140,6 +152,7 @@ class Store:
                     float(draft.get("price", 0) or 0),
                     int(draft.get("qty", 0) or 0),
                     draft.get("created_at", "") or _now_cn(),
+                    draft.get("user_id", ""),
                 ),
             )
             if cur.rowcount == 0:
@@ -176,8 +189,8 @@ class Store:
             ).fetchone()
             if row is None:
                 self._conn.execute(
-                    """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
                         new_oid or ("pending:" + sid),
                         sid,
@@ -187,6 +200,7 @@ class Store:
                         float(order.get("price", 0) or 0),
                         int(order.get("qty", 0) or 0),
                         order.get("created_at", ""),
+                        order.get("user_id", ""),
                     ),
                 )
                 self._conn.commit()
@@ -196,7 +210,7 @@ class Store:
             if order_id_rank(new_oid) > order_id_rank(final_oid):
                 final_oid = new_oid
             self._conn.execute(
-                """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?
+                """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?, user_id=?
                    WHERE signal_id=?""",
                 (
                     final_oid,
@@ -204,6 +218,7 @@ class Store:
                     float(order.get("price", 0) or row["price"] or 0),
                     int(order.get("qty", 0) or 0) or row["qty"] or 0,
                     order.get("created_at", "") or row["created_at"],
+                    order.get("user_id", row["user_id"]),
                     sid,
                 ),
             )
@@ -244,16 +259,17 @@ class Store:
                 highest = row["highest_price"]
             self._conn.execute(
                 """INSERT INTO real_positions
-                     (ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(ts_code) DO UPDATE SET
-                     name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
-                     amount=excluded.amount, highest_price=excluded.highest_price,
-                     strategy=excluded.strategy, signal_id=excluded.signal_id, updated_at=excluded.updated_at""",
+                     (ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(ts_code) DO UPDATE SET
+                      name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
+                      amount=excluded.amount, highest_price=excluded.highest_price,
+                      strategy=excluded.strategy, signal_id=excluded.signal_id, updated_at=excluded.updated_at,
+                      user_id=excluded.user_id""",
                 (
                     p["ts_code"], p.get("name", ""), p.get("qty", 0), p.get("cost_price", 0.0),
                     p.get("amount", 0.0), highest, p.get("strategy", ""), p.get("signal_id", ""),
-                    p.get("updated_at", ""),
+                    p.get("updated_at", ""), p.get("user_id", ""),
                 ),
             )
             self._conn.commit()
@@ -291,13 +307,14 @@ class Store:
                 "SELECT * FROM real_positions WHERE ts_code = ?", (f["code"],)
             ).fetchone()
             if fill_side == "买入":
+                uid = f.get("user_id", "")
                 if row is None:
                     self._conn.execute(
                         """INSERT INTO real_positions
-                             (ts_code, name, qty, cost_price, amount, highest_price, updated_at)
-                           VALUES(?,?,?,?,?,?,?)""",
+                             (ts_code, name, qty, cost_price, amount, highest_price, updated_at, user_id)
+                            VALUES(?,?,?,?,?,?,?,?)""",
                         (f["code"], f.get("name", ""), f.get("qty", 0), f.get("price", 0.0),
-                         f.get("amount", 0.0), f.get("price", 0.0), f.get("traded_at", "")),
+                         f.get("amount", 0.0), f.get("price", 0.0), f.get("traded_at", ""), uid),
                     )
                 else:
                     old_qty, old_cost = row["qty"], row["cost_price"]
@@ -306,9 +323,9 @@ class Store:
                     highest = max(row["highest_price"], f["price"])
                     self._conn.execute(
                         """UPDATE real_positions
-                           SET qty=?, cost_price=?, amount=?, highest_price=?, updated_at=?
-                           WHERE ts_code=?""",
-                        (new_qty, new_cost, new_qty * f["price"], highest, f.get("traded_at", ""), f["code"]),
+                            SET qty=?, cost_price=?, amount=?, highest_price=?, updated_at=?, user_id=?
+                            WHERE ts_code=?""",
+                        (new_qty, new_cost, new_qty * f["price"], highest, f.get("traded_at", ""), uid, f["code"]),
                     )
             else:
                 if row is None:
@@ -320,15 +337,15 @@ class Store:
                     )
                 else:
                     self._conn.execute(
-                        """UPDATE real_positions SET qty=?, amount=?, updated_at=?
-                           WHERE ts_code=?""",
-                        (remain, remain * f["price"], f.get("traded_at", ""), f["code"]),
+                        """UPDATE real_positions SET qty=?, amount=?, updated_at=?, user_id=?
+                            WHERE ts_code=?""",
+                        (remain, remain * f["price"], f.get("traded_at", ""), f.get("user_id", ""), f["code"]),
                     )
             self._conn.execute(
-                """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
                 (f.get("order_id", ""), f["code"], fill_side, f["price"], f["qty"],
-                 f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", "")),
+                 f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", ""), f.get("user_id", "")),
             )
             self._conn.commit()
             cur = self._conn.execute(

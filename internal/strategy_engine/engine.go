@@ -15,14 +15,13 @@ import (
 	"quant-trading-v2/internal/newsagent"
 )
 
-// Engine 策略引擎，负责事件归因、行情数据拉取、评分池收拢、个股板块索引维护。
-// （Engine handles event attribution, quote fetching, scoring-pool collection and the stock→sector index.）
+// Engine 策略引擎，负责事件归因、行情数据拉取、评分池收拢。
+// （Engine handles event attribution, quote fetching and scoring-pool collection.）
 type Engine struct {
-	mu             sync.RWMutex        // 读写锁（Read-write lock）
-	marketAPI      *data.MarketAPI     // 行情 API（Market data API）
-	ths            *data.THSClient     // 同花顺客户端（行情降级链路：新浪→同花顺→东财）（THS client: quote fallback Sina→THS→Eastmoney）
-	scanner        *data.SectorScanner // 板块扫描器（Sector scanner）
-	stockSectorIdx map[string][]string // 个股→板块倒排索引（Stock→sector inverted index）
+	mu        sync.RWMutex        // 读写锁（Read-write lock）
+	marketAPI *data.MarketAPI     // 行情 API（Market data API）
+	ths       *data.THSClient     // 同花顺客户端（行情降级链路：新浪→同花顺→东财）（THS client: quote fallback Sina→THS→Eastmoney）
+	scanner   *data.SectorScanner // 板块扫描器（Sector scanner）
 
 	klineCacheMu sync.RWMutex                // 保护 klineCache 的读写锁（近实时打分并发访问）（Lock guarding klineCache for concurrent near-realtime scoring）
 	klineCache   map[string]*klineCacheEntry // 日K/资金流缓存（近实时打分用）（Daily-bar / capital-flow cache for near-realtime scoring）
@@ -80,10 +79,9 @@ type minuteKCacheEntry struct {
 // New 创建策略引擎实例。（New creates a strategy-engine instance.）
 func New(marketAPI *data.MarketAPI) *Engine {
 	return &Engine{
-		marketAPI:      marketAPI,
-		stockSectorIdx: make(map[string][]string),
-		klineCache:     make(map[string]*klineCacheEntry),
-		minuteKCache:   make(map[string]*minuteKCacheEntry),
+		marketAPI:    marketAPI,
+		klineCache:   make(map[string]*klineCacheEntry),
+		minuteKCache: make(map[string]*minuteKCacheEntry),
 	}
 }
 
@@ -117,11 +115,6 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 	// 1. attribution: 事件 → 板块/个股分流（Attribution: events → sector/stock split）
 	bullSectors, bearSectors := e.attribution(events)
 	log.Printf("[strategy_engine] attribution: %d利好板块 %d利空板块", len(bullSectors), len(bearSectors))
-
-	// rebuildIndex 个股解码失败会返回结构化错误：仅记告警，不阻断后续归因/打分流程（降级而非停摆）。
-	if err := e.rebuildIndex(events); err != nil {
-		log.Printf("[strategy_engine][降级告警] rebuildIndex 返回错误(已降级继续): %v", err)
-	}
 
 	// 2. 分流事件个股到 LongStocks / ShortStocks（按带符号 Score 判定方向）。
 	//    个股级事件取 LLM 识别的关联股；板块级事件经 propagateSectorToStocks 已注入成分股（CleanedStocks），

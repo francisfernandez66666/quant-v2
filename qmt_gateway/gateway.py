@@ -135,8 +135,9 @@ class Gateway:
         self.store = Store(cfg["db"])
         self.ids = Idempotency(self.store)
         self.broker = build_broker(cfg)
+        self.user_id = cfg.get("user_id", "")  # §P1-9 多账号归属：落库/上报统一带此 ID
         self.handler = ReportHandler(
-            self.store, cfg.get("report_url", ""), cfg.get("report_token", ""), cfg.get("user_id", ""),
+            self.store, cfg.get("report_url", ""), cfg.get("report_token", ""), self.user_id,
         )
         self.broker.handler = self.handler
         self._stop = threading.Event()
@@ -258,6 +259,7 @@ class Gateway:
             "signal_id": signal_id, "code": code, "side": side,
             "price": price, "qty": qty,
             "created_at": req.get("created_at") or "",
+            "user_id": self.user_id,  # §P1-9 多账号隔离归属
         }
         claimed, existing = self.ids.claim(draft)
         # 没抢到占位 = 已下过（幂等返回）或正在下单中（409 防并发穿透）
@@ -279,6 +281,7 @@ class Gateway:
             "order_id": order_ref, "signal_id": signal_id, "code": code, "side": side,
             "status": "已报", "price": price, "qty": qty,
             "created_at": req.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "user_id": self.user_id,  # §P1-9 多账号隔离归属
         })
         return 200, {"ok": True, "order_id": order_ref, "err": ""}
 

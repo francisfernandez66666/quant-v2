@@ -653,7 +653,10 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		return p
 	}()), "task_logs")
 	_ = os.MkdirAll(logDir, 0o755)
+	// §P1-12 任务日志轮转：每次建任务前清理 30 天前的日志，避免 task_logs 无限膨胀占满磁盘。
+	cleanupTaskLogs(logDir, 30*24*time.Hour)
 	logPath := filepath.Join(logDir, fmt.Sprintf("task_%d.log", tk.ID))
+	_ = os.Remove(logPath) // §P1-12 先清掉同名旧日志（若重跑同 ID），避免与轮转清理/续跑混淆
 	lf, lerr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if lerr != nil {
 		fail("创建任务日志失败: " + lerr.Error())

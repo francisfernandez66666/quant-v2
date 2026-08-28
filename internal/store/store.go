@@ -232,6 +232,7 @@ func (d *DB) migrate() error {
 			chain_day TEXT DEFAULT '',
 			chain_seq INTEGER DEFAULT 0,
 			control TEXT DEFAULT '',
+			retry_count INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			started_at TEXT DEFAULT '',
 			finished_at TEXT DEFAULT '',
@@ -320,7 +321,7 @@ func (d *DB) migrate() error {
 		// English: real book positions (AUTO_TRADING_PLAN live ledger source) — driven by the domestic QMT
 		// gateway's reconciliation/fill reports, fully independent of the paper report.Report (dual ledgers).
 		`CREATE TABLE IF NOT EXISTS real_positions (
-			ts_code TEXT PRIMARY KEY,
+			ts_code TEXT NOT NULL,
 			name TEXT DEFAULT '',
 			qty INTEGER NOT NULL DEFAULT 0,
 			cost_price REAL NOT NULL DEFAULT 0,
@@ -328,19 +329,23 @@ func (d *DB) migrate() error {
 			highest_price REAL NOT NULL DEFAULT 0,
 			strategy TEXT DEFAULT '',
 			signal_id TEXT DEFAULT '',
-			updated_at TEXT NOT NULL
+			updated_at TEXT NOT NULL,
+			user_id TEXT DEFAULT '',
+			PRIMARY KEY (ts_code, user_id)
 		)`,
 		// 实盘委托单：order_id 为网关返回的单号，signal_id 唯一（幂等，防重复下单）。
 		// English: real order tickets — order_id from the gateway, signal_id unique (idempotency key).
 		`CREATE TABLE IF NOT EXISTS orders (
 			order_id TEXT PRIMARY KEY,
-			signal_id TEXT UNIQUE,
+			signal_id TEXT NOT NULL,
 			code TEXT NOT NULL,
 			side TEXT NOT NULL,
 			status TEXT NOT NULL,
 			price REAL,
 			qty INTEGER NOT NULL,
-			created_at TEXT NOT NULL
+			created_at TEXT NOT NULL,
+			user_id TEXT DEFAULT '',
+			UNIQUE (user_id, signal_id)
 		)`,
 
 		// 实盘成交回报：网关成交事件逐条落库（对账/研究用）。
@@ -521,6 +526,23 @@ func (d *DB) migrate() error {
 			return fmt.Errorf("store migrate research_tasks.requeue_seq: %w", err)
 		}
 	}
+	// §P1-11 失败重试计数上限列（旧库增量迁移，幂等）。
+	// English: P1-11 failure retry counter column, added to pre-existing DBs idempotently.
+	if ok, err := d.hasColumn("research_tasks", "retry_count"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.retry_count: %w", err)
+		}
+	}
+	// §P0-1 real_positions 主键迁移为 (ts_code, user_id)：旧库单主键重建。
+	// English: P0-1 migrate real_positions primary key to (ts_code, user_id) for multi-tenant isolation.
+	if err := d.migrateRealPositionsPK(); err != nil {
+		return fmt.Errorf("store migrate real_positions pk: %w", err)
+	}
+	// §P0-2 orders.signal_id 唯一约束迁移为 (user_id, signal_id)：旧库单唯一索引重建。
+	// English: P0-2 migrate orders signal_id uniqueness to (user_id, signal_id).
+	if err := d.migrateOrdersSignalUnique(); err != nil {
+		return fmt.Errorf("store migrate orders signal unique: %w", err)
+	}
 	return nil
 }
 
@@ -545,6 +567,265 @@ func (d *DB) hasColumn(table, column string) (bool, error) {
 		}
 	}
 	return false, rows.Err()
+}
+
+// tableHasPKColumns 返回指定表当前主键包含的列名（按 PRAGMA table_info 的 pk 顺序）。
+// 表不存在或无法解析时返回空切片与 nil 错误。
+// English: returns the columns that make up the current primary key of the given table.
+func (d *DB) tableHasPKColumns(table string) ([]string, error) {
+	rows, err := d.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type colInfo struct {
+		name string
+		pk   int
+	}
+	var infos []colInfo
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		infos = append(infos, colInfo{name: name, pk: pk})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	maxPK := 0
+	for _, info := range infos {
+		if info.pk > maxPK {
+			maxPK = info.pk
+		}
+	}
+	if maxPK == 0 {
+		return nil, nil
+	}
+	cols := make([]string, 0, maxPK)
+	for i := 1; i <= maxPK; i++ {
+		for _, info := range infos {
+			if info.pk == i {
+				cols = append(cols, info.name)
+				break
+			}
+		}
+	}
+	return cols, nil
+}
+
+// indexKeyColumns 返回指定索引中 key=1 的列名（使用 PRAGMA index_xinfo，兼容 modernc.org/sqlite
+// 下 index_info 的 name/cid 为空的问题）。
+func (d *DB) indexKeyColumns(indexName string) ([]string, error) {
+	rows, err := d.db.Query("PRAGMA index_xinfo(" + indexName + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for rows.Next() {
+		dest := make([]any, len(cols))
+		for i := range dest {
+			dest[i] = new(any)
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, err
+		}
+		get := func(key string) any {
+			for i, c := range cols {
+				if c == key {
+					return *(dest[i].(*any))
+				}
+			}
+			return nil
+		}
+		key, _ := get("key").(int64)
+		if key != 1 {
+			continue
+		}
+		if v, ok := get("name").(string); ok && v != "" {
+			names = append(names, v)
+		}
+	}
+	return names, rows.Err()
+}
+
+// tableHasUniqueIndex 判断表是否存在仅由给定单列组成的唯一索引/约束。
+// English: reports whether the table has a unique index/constraint consisting solely of the given single column.
+func (d *DB) tableHasUniqueIndex(table, column string) (bool, error) {
+	idxRows, err := d.db.Query("PRAGMA index_list(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer idxRows.Close()
+	for idxRows.Next() {
+		cols, err := idxRows.Columns()
+		if err != nil {
+			return false, err
+		}
+		dest := make([]any, len(cols))
+		for i := range dest {
+			dest[i] = new(any)
+		}
+		if err := idxRows.Scan(dest...); err != nil {
+			return false, err
+		}
+		get := func(key string) string {
+			for i, c := range cols {
+				if c == key {
+					switch v := (*(dest[i].(*any))).(type) {
+					case string:
+						return v
+					case int64:
+						if v == 1 {
+							return "1"
+						}
+						return "0"
+					}
+				}
+			}
+			return ""
+		}
+		if get("unique") != "1" {
+			continue
+		}
+		name := get("name")
+		if name == "" {
+			continue
+		}
+		colNames, err := d.indexKeyColumns(name)
+		if err != nil {
+			return false, err
+		}
+		if len(colNames) == 1 && colNames[0] == column {
+			return true, nil
+		}
+	}
+	return false, idxRows.Err()
+}
+
+// migrateRealPositionsPK 把 real_positions 主键从单 ts_code 重建为 (ts_code, user_id)。
+// 幂等：已符合目标结构时不操作。
+// English: rebuilds real_positions primary key from single ts_code to (ts_code, user_id).
+func (d *DB) migrateRealPositionsPK() error {
+	cols, err := d.tableHasPKColumns("real_positions")
+	if err != nil {
+		return err
+	}
+	if len(cols) == 2 && cols[0] == "ts_code" && cols[1] == "user_id" {
+		return nil // 已迁移
+	}
+	if len(cols) == 1 && cols[0] == "ts_code" {
+		log.Printf("[store] migrate real_positions PK: (ts_code) -> (ts_code, user_id)")
+		_, err := d.db.Exec(`
+			CREATE TABLE real_positions_new (
+				ts_code TEXT NOT NULL,
+				name TEXT DEFAULT '',
+				qty INTEGER NOT NULL DEFAULT 0,
+				cost_price REAL NOT NULL DEFAULT 0,
+				amount REAL NOT NULL DEFAULT 0,
+				highest_price REAL NOT NULL DEFAULT 0,
+				strategy TEXT DEFAULT '',
+				signal_id TEXT DEFAULT '',
+				updated_at TEXT NOT NULL,
+				user_id TEXT DEFAULT '',
+				PRIMARY KEY (ts_code, user_id)
+			);
+			INSERT OR REPLACE INTO real_positions_new
+				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
+			SELECT ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, COALESCE(user_id, '')
+			FROM real_positions;
+			DROP TABLE real_positions;
+			ALTER TABLE real_positions_new RENAME TO real_positions;
+		`)
+		return err
+	}
+	return nil
+}
+
+// migrateOrdersSignalUnique 把 orders.signal_id 单唯一索引重建为 (user_id, signal_id)。
+// 幂等：已符合目标结构时不操作。
+// English: rebuilds orders uniqueness from single signal_id to (user_id, signal_id).
+func (d *DB) migrateOrdersSignalUnique() error {
+	has, err := d.tableHasUniqueIndex("orders", "signal_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		// 已无单 signal_id 唯一索引，再检查是否有 (user_id, signal_id) 即可
+		idxRows, err := d.db.Query("PRAGMA index_list(orders)")
+		if err != nil {
+			return err
+		}
+		defer idxRows.Close()
+		for idxRows.Next() {
+			idxCols, err := idxRows.Columns()
+			if err != nil {
+				return err
+			}
+			dest := make([]any, len(idxCols))
+			for i := range dest {
+				dest[i] = new(any)
+			}
+			if err := idxRows.Scan(dest...); err != nil {
+				return err
+			}
+			get := func(key string) string {
+				for i, c := range idxCols {
+					if c == key {
+						if v, ok := (*(dest[i].(*any))).(string); ok {
+							return v
+						}
+					}
+				}
+				return ""
+			}
+			if get("unique") != "1" {
+				continue
+			}
+			name := get("name")
+			if name == "" {
+				continue
+			}
+			cols, err := d.indexKeyColumns(name)
+			if err != nil {
+				return err
+			}
+			if len(cols) == 2 && cols[0] == "user_id" && cols[1] == "signal_id" {
+				return nil
+			}
+		}
+		return nil
+	}
+	log.Printf("[store] migrate orders unique: signal_id -> (user_id, signal_id)")
+	_, err = d.db.Exec(`
+		CREATE TABLE orders_new (
+			order_id TEXT PRIMARY KEY,
+			signal_id TEXT NOT NULL,
+			code TEXT NOT NULL,
+			side TEXT NOT NULL,
+			status TEXT NOT NULL,
+			price REAL,
+			qty INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			user_id TEXT DEFAULT '',
+			UNIQUE (user_id, signal_id)
+		);
+		INSERT OR REPLACE INTO orders_new
+			(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
+		SELECT order_id, signal_id, code, side, status, price, qty, created_at, COALESCE(user_id, '')
+		FROM orders;
+		DROP TABLE orders;
+		ALTER TABLE orders_new RENAME TO orders;
+	`)
+	return err
 }
 
 // QueryRows 执行只读查询，返回 列名→值 的行切片（TEXT 以 string 返回，其余按驱动原生类型）。

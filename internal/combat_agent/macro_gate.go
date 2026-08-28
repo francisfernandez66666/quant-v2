@@ -92,37 +92,34 @@ func macroGateMinConfidence(cfg config.MacroGateConfig) float64 {
 // English: whether N-shape ultra-short is blocked on gate days (default true; only an explicit
 // false disables the block).
 func macroGateBlockNShape(cfg config.MacroGateConfig) bool {
-	if cfg.BlockNShape {
-		return true
+	if cfg.BlockNShape == nil {
+		return true // 默认拦截
 	}
-	// 未显式配置时按缺省 true 处理（零值 = 开启拦截），显式 false 才放行
-	// English: unset (zero) defaults to true (block); only an explicit false disables it.
-	return true
+	return *cfg.BlockNShape
 }
 
 // macroGateBlockMomentum 交割日是否拦截动量 watch 观察信号（默认 true：整体利空下不新增观察）。
 // English: whether the momentum watch signal is blocked on gate days (default true — no new watch
 // under a whole-market bearish day).
 func macroGateBlockMomentum(cfg config.MacroGateConfig) bool {
-	if cfg.BlockMomentum {
-		return true
+	if cfg.BlockMomentum == nil {
+		return true // 默认拦截
 	}
-	// 未显式配置时按缺省 true 处理（零值 = 开启拦截），显式 false 才放行
-	// English: unset (zero) defaults to true (block); only an explicit false disables it.
-	return true
+	return *cfg.BlockMomentum
 }
 
 // applyMacroGate 对已生成信号应用宏观利空门控：
 //   - 非 N 形战法买入信号：置信度 < 最低门槛 → 降级为 watch（理由注明宏观利空）；
 //     置信度 ≥ 门槛 → 保留（"特别高质量信号"放行）。
 //   - N 形超短：门控日一律降级为 watch（超短对交割日波动最敏感）。
-//   - 动量 watch 观察信号：门控日一律降级拦截（整体利空下不新增观察）。
+//   - 动量 watch 观察信号：门控日一律拦截（整体利空下不新增观察），从输出中剔除。
 //
-// 返回处理后的信号切片（原地修改 reason/action，保持顺序与稳定性）。
+// 返回处理后的信号切片（原地修改 reason/action；动量 watch 被拦截时剔除，保持其余信号顺序与稳定性）。
 // English: applies the E1 macro bearish gate to generated signals — non-N buy signals below the
 // minimum confidence are downgraded to watch (reason notes the macro bearish context); those at/above
-// the threshold pass as "exceptionally high-quality"; N-shape ultra-short and momentum watch signals
-// are always downgraded on gate days. Mutates reason/action in place, preserving order.
+// the threshold pass as "exceptionally high-quality"; N-shape ultra-short is always downgraded to watch
+// on gate days; momentum watch signals are blocked entirely (no new observations on bearish macro days).
+// Mutates reason/action in place and filters out blocked momentum-watch signals while preserving order.
 func applyMacroGate(sigs []Signal, gateActive bool, cfg config.MacroGateConfig) []Signal {
 	if !gateActive || len(sigs) == 0 {
 		return sigs
@@ -130,16 +127,17 @@ func applyMacroGate(sigs []Signal, gateActive bool, cfg config.MacroGateConfig) 
 	minConf := macroGateMinConfidence(cfg)
 	blockN := macroGateBlockNShape(cfg)
 	blockMomentum := macroGateBlockMomentum(cfg)
+	out := make([]Signal, 0, len(sigs))
 	for i := range sigs {
 		s := &sigs[i]
 		isBuy := s.Action == "buy" || s.Action == "买入"
-		// 动量信号（watch 拦截；buy 落入下方通用置信度降级）：门控日整体收紧
-		// English: momentum watch is blocked on gate days; momentum buys fall through to the generic
-		// confidence downgrade below.
+		// 动量 watch 观察信号：门控日一律拦截（整体利空下不新增观察）。
+		// English: momentum watch signals are blocked entirely on gate days — no new observations.
 		if s.Strategy == "动量" && s.Action == "watch" {
 			if blockMomentum {
-				s.Reason = "宏观利空(交割日)整体降级: " + s.Reason
+				continue
 			}
+			out = append(out, *s)
 			continue
 		}
 		// N 形超短：门控日一律降级 watch。§名称规整：Signal.Strategy 已统一中文规范名，
@@ -151,6 +149,7 @@ func applyMacroGate(sigs []Signal, gateActive bool, cfg config.MacroGateConfig) 
 				s.Action = "watch"
 				s.Reason = "宏观利空(交割日)拦截N形超短: " + s.Reason
 			}
+			out = append(out, *s)
 			continue
 		}
 		// 非 N 形买入信号：置信度低于门槛 → 降级 watch；达到门槛 → 保留（特别高质量放行）
@@ -160,6 +159,7 @@ func applyMacroGate(sigs []Signal, gateActive bool, cfg config.MacroGateConfig) 
 			s.Action = "watch"
 			s.Reason = "宏观利空(交割日)降级(置信度不足): " + s.Reason
 		}
+		out = append(out, *s)
 	}
-	return sigs
+	return out
 }

@@ -119,6 +119,30 @@ func TestScoreStoreCorruptFile(t *testing.T) {
 	}
 }
 
+// TestScoreStoreSeparation §P0-8 主循环与 5s 循环打分持久化分池：
+// fastScoreStore 与主循环 scoreStore 使用不同文件，互不覆盖。
+// English: P0-8 main-loop and 5s-loop score persistence must use separate pools/files.
+func TestScoreStoreSeparation(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "scores.json")
+	fastPath := filepath.Join(dir, "scores_fast.json")
+	mainStore := newScoreStore(mainPath)
+	fastStore := newScoreStore(fastPath)
+
+	mainScores := map[string]combat_agent.StockScores{"600000.SH": {NScore: 88}}
+	fastScores := map[string]combat_agent.StockScores{"600000.SH": {NScore: 77}, "000001.SZ": {NScore: 66}}
+
+	mainStore.Save("2026-08-28", mainScores)
+	fastStore.Save("2026-08-28", fastScores)
+
+	if got := mainStore.Load(); len(got) != 1 || got["600000.SH"].NScore != 88 {
+		t.Fatalf("主循环分池被覆盖，got %+v", got)
+	}
+	if got := fastStore.Load(); len(got) != 2 || got["600000.SH"].NScore != 77 {
+		t.Fatalf("5s 循环分池被覆盖，got %+v", got)
+	}
+}
+
 // TestCountAction 验证 countAction 仅统计指定 Action 的信号（用于 SSE 通知只计 buy）。
 // 做多信号里 buy / watch / brief 混合时，只统计 buy。
 // English: TestCountAction verifies countAction only counts signals of the specified Action (used so SSE notifications only count buy). When buy / watch / brief are mixed among long signals, only buy is counted.

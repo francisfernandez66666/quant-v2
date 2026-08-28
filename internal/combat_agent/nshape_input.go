@@ -93,7 +93,9 @@ func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 	if q := md.Quote; q != nil && q.Open > 0 && ib.PrevClose > 0 {
 		ib.AuctionChgPct = (q.Open - ib.PrevClose) / ib.PrevClose * 100
 	}
-	ib.AvgDailyVol = avgVol(kl[:len(kl)], 20)
+	// 近20日日均成交量：剔除今日未收盘K线，避免盘中把未完成的今日量计入均值（压低/抬升量比）。
+	// English: 20-day average daily volume, excluding today's unfinished bar to avoid distorting the ratio.
+	ib.AvgDailyVol = avgVol(kl[:len(kl)-1], 20)
 	// 分钟级 MACD 三值直接透传，供 B 段多头/红柱判断
 	// The three minute-level MACD values are passed through for the Segment-B bullish/red-bar judgement.
 	ib.MinuteMACDDIF = md.MinuteMACD.DIF
@@ -120,8 +122,10 @@ func buildCtx(md *strategy_engine.StockMarketData, emotionPhase string, d1 *D1Sc
 		ctx.LLMD1Score = d1.Score
 		ctx.LLMBlocked = d1.Blocked
 	}
-	if md != nil {
-		ctx.AvgDailyVol = avgVol(md.KLines, 20)
+	if md != nil && len(md.KLines) >= 2 {
+		// 与 buildIntradayB 同口径：剔除今日未收盘K线。
+		// English: same口径 as buildIntradayB — exclude today's unfinished bar.
+		ctx.AvgDailyVol = avgVol(md.KLines[:len(md.KLines)-1], 20)
 	}
 	return ctx
 }

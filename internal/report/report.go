@@ -469,6 +469,23 @@ func (r *Report) HeldPositionCodes() []string {
 	return codes
 }
 
+// HeldPositionCodesFor §P1-2 按账号过滤：仅返回归属 userID 且状态为"持仓中"的去重代码。
+// 多账号共享同一份 report 实例时，避免 A 账号的持仓被计入 B 账号打分池。
+// English: P1-2 user-scoped held codes — only this account's held positions feed its scoring pool.
+func (r *Report) HeldPositionCodesFor(userID string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]bool)
+	var codes []string
+	for _, l := range r.logs {
+		if l.Status == "持仓中" && l.UserID == userID && !seen[l.Code] {
+			seen[l.Code] = true
+			codes = append(codes, l.Code)
+		}
+	}
+	return codes
+}
+
 // HasHolding 判断某代码当前是否有持仓中记录（含其他账号？不含，仅本报告实例）。
 // English: reports whether a code currently has a held position in this report.
 func (r *Report) HasHolding(code string) bool {
@@ -476,6 +493,20 @@ func (r *Report) HasHolding(code string) bool {
 	defer r.mu.RUnlock()
 	for _, l := range r.logs {
 		if l.Code == code && l.Status == "持仓中" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasHoldingFor §P1-3 按账号判断某代码是否持仓中：避免多账号共享 report 时 A 账号持仓被误判为 B 账号持仓，
+// 导致镜像建仓跨账号幂等跳过错误。
+// English: P1-3 idempotency check scoped by account so one account's holding never suppresses another's mirror open.
+func (r *Report) HasHoldingFor(userID, code string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, l := range r.logs {
+		if l.Code == code && l.UserID == userID && l.Status == "持仓中" {
 			return true
 		}
 	}

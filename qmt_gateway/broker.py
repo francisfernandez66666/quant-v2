@@ -329,8 +329,13 @@ class MockBroker(Broker):
         self._next_id = 1
         self._orders = {}   # order_id -> dict
         self._positions = {}  # ts_code -> dict
+        # §P1-17 显式现金模型：可用资金随成交实时扣减/回补，而非仅由市值反推
+        # （反推会因行情波动虚增/虚减现金，导致对账失真）。
+        self._cash = float(account_init)
         for seed_pos in seed or []:
             self._positions[seed_pos["ts_code"]] = dict(seed_pos)
+            # 种子持仓视为已占用现金（按成本），避免初始可用资金虚高
+            self._cash -= float(seed_pos.get("qty", 0)) * float(seed_pos.get("cost_price", 0) or 0)
 
     def connect(self):
         self._connected = True
@@ -403,8 +408,14 @@ class MockBroker(Broker):
             return False, "order in state %s" % o["status"]
 
     def _apply_fill_locked(self, order, price):
-        """调用方须持 _lock。"""
+        """调用方须持 _lock。§P1-17 同步更新显式现金：买入扣减 price*qty，卖出回补 price*qty。"""
         code = order.get("code", "")
+        qty = int(order.get("qty", 0))
+        # 下单方向决定现金流向：买入占用、卖出释放
+        if order.get("side") == "买入":
+            self._cash -= qty * float(price)
+        else:
+            self._cash += qty * float(price)
         p = self._positions.get(code)
         # 买入：加仓或新建，按加权成本更新持仓成本与最高价
         if order.get("side") == "买入":
@@ -412,7 +423,6 @@ class MockBroker(Broker):
                 p = {"ts_code": code, "name": order.get("name", ""), "qty": 0,
                      "cost_price": 0.0, "amount": 0.0, "highest_price": price}
                 self._positions[code] = p
-            qty = int(order.get("qty", 0))
             new_qty = p["qty"] + qty
             p["cost_price"] = (p["qty"] * p["cost_price"] + qty * price) / new_qty
             p["qty"] = new_qty
@@ -421,7 +431,7 @@ class MockBroker(Broker):
         else:
             if p is None:
                 return
-            remain = p["qty"] - int(order.get("qty", 0))
+            remain = p["qty"] - qty
             if remain <= 0:
                 del self._positions[code]
             else:
@@ -434,14 +444,15 @@ class MockBroker(Broker):
                 self._positions.values(), key=lambda x: x.get("amount", 0), reverse=True)]
 
     def query_asset(self):
-        """mock 账户资产：可用资金 = 初始资金 - 持仓市值（模拟），冻结 0、市值=持仓汇总。"""
+        """mock 账户资产：可用资金=显式现金账（成交实时扣减/回补），冻结 0、市值=持仓汇总。
+        §P1-17 不再用 初始资金-市值 反推现金（会随行情波动虚增/虚减）。"""
         with self._lock:
             mv = sum(p.get("amount", 0.0) for p in self._positions.values())
-            init = float(self.account_init) if hasattr(self, "account_init") else 100000.0
+            cash = self._cash
             return {
-                "cash": max(init - mv, 0.0),
+                "cash": max(cash, 0.0),
                 "frozen_cash": 0.0,
-                "total_asset": init,
+                "total_asset": max(cash, 0.0) + mv,
                 "market_value": mv,
             }
 
@@ -460,4 +471,5 @@ def build_broker(cfg):
         account=cfg.get("account", "MOCK0001"),
         delay_sec=cfg.get("mock_delay_sec", 1),
         seed=cfg.get("seed", []),
+        account_init=float(cfg.get("account_init", 100000.0)),  # §P1-17 多账号初始资金
     )
