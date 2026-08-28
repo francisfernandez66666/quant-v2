@@ -51,6 +51,55 @@ var progressCache struct {
 	body map[string]any
 }
 
+// handleSchedulerStatus 处理 GET /api/scheduler/status：读取 researchd 每 30s 写入的
+// scheduler_status.json 可见性快照，让前端直接回答"为何卡排队"（禁用/交易时段/内存闸门/槽位占用/队列空）。
+// 文件不存在时回退为"未知"，避免前端误判。English: returns researchd's visibility snapshot so the
+// UI can explain why tasks are queued without server logs.
+func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
+	path := filepath.Join(s.researchDir, "scheduler_status.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{
+			"ok":     false,
+			"reason": "尚未获取到调度状态：researchd 未运行或未到首次写入（请确认 quant-research 服务已启动，且与 quant 共用同一 QUANT_DATA_DIR）",
+		})
+		return
+	}
+	var st map[string]any
+	if err := json.Unmarshal(raw, &st); err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "reason": "调度状态解析失败"})
+		return
+	}
+	st["ok"] = true
+	writeJSON(w, 200, st)
+}
+
+// handleResearchTaskLog 处理 GET /api/research/task/{id}/log：读取 researchd 为每条研究任务
+// 落盘的 task_logs/task_<id>.log（子进程 stdout/stderr），让前端直接查看回测/研究日志，
+// 无需 SSH 翻服务器。文件不存在时返回 exists=false。English: serves the per-task log file so the
+// UI can show backtest/research output without server access.
+func (s *Server) handleResearchTaskLog(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, 400, "missing id")
+		return
+	}
+	logPath := filepath.Join(s.researchDir, "task_logs", "task_"+id+".log")
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"exists": false, "log": ""})
+		return
+	}
+	// 限制返回体积：超过 200KB 只取末尾，避免一次性拖垮前端/接口。
+	const maxBytes = 200 * 1024
+	if len(raw) > maxBytes {
+		raw = raw[len(raw)-maxBytes:]
+	}
+	writeJSON(w, 200, map[string]any{"exists": true, "log": string(raw)})
+}
+
+// handleResearchProgress 处理 GET /api/research/progress：返回自动研究流水尾部日志
+// （截断至 maxBytes 防止超大响应），配合前端轮询展示研究执行进度。
 func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) {
 	if s.researchDB == nil {
 		writeError(w, 503, "研究库未接入")

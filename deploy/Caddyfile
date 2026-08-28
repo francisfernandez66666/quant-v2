@@ -14,6 +14,20 @@
 #     `import /etc/caddy/translator.conf`（见 deploy/caddy/translator.conf）。
 #     本文件被 deploy_seoul.sh 用 mv 整体覆盖时只含本站点 + import 行，不内联 translator，
 #     保证另一项目配置独立不受影响；两端模板保持一致（均含 import 行）。
+#
+# ⚠️ Caddy 2.9 起 on_demand_tls 必须配置 permission/ask 模块，否则整体拒绝加载（两个项目一起挂）。
+#    下方全局块 + :20928 本机 always-200 端点即为此而设（translator 通配符子域名按需签发证书用）。
+
+{
+    on_demand_tls {
+        ask http://127.0.0.1:20928/
+    }
+}
+
+# on_demand_tls 的 ask 校验端点：恒返回 200，仅监听本机(plain HTTP，显式 http:// 关闭自动 HTTPS)
+http://127.0.0.1:20928 {
+    respond 200
+}
 
 quant-trading.top {
 	# 传输安全与压缩

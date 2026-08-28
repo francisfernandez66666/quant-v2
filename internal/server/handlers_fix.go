@@ -226,6 +226,20 @@ type fixMinutePoint struct {
 	BAR    float64 `json:"bar"`    // MACD 柱（2*(DIF-DEA)）
 }
 
+// ── 分时数据缓存：保留每支股票最近一次成功拉取的分时，非交易时段/数据源抖动时回退展示，
+//    避免“分时图空白”（用户预期能看到最近一次缓存的分时）。 ──
+var (
+	minuteCacheMu sync.RWMutex
+	minuteCache   = map[string]*minuteCacheEntry{}
+)
+
+type minuteCacheEntry struct {
+	Points    []fixMinutePoint // 分时点（含价格/量/MACD）
+	PrevClose float64          // 昨收
+	Name      string           // 名称
+	At        time.Time        // 缓存时间
+}
+
 // handleFixMinute 处理 GET /api/minute 请求，返回个股分钟级分时 + 成交量 + MACD。
 // 参数：code 必填；scale 分钟数（默认 1）；count 点数（默认 241，即一整交易日分钟数）。
 // 返回 { code, name, prev_close, points: [...] }。
@@ -268,6 +282,20 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 			reason = "非交易时段：无当日分时行情，开盘后自动恢复"
 		}
 		log.Printf("[server] /api/minute %s 获取失败: %v", code, err)
+		// 回退到最近一次成功缓存的分时（非交易时段/数据源抖动），标注 cached
+		minuteCacheMu.RLock()
+		cached, ok := minuteCache[code]
+		minuteCacheMu.RUnlock()
+		if ok && len(cached.Points) > 0 {
+			writeJSON(w, 200, map[string]interface{}{
+				"code":       code,
+				"name":       cached.Name,
+				"prev_close": r2(cached.PrevClose),
+				"points":     cached.Points,
+				"cached":     true,
+			})
+			return
+		}
 		writeJSON(w, 200, map[string]interface{}{"code": code, "name": "", "prev_close": 0, "points": []fixMinutePoint{}, "error": reason})
 		return
 	}
@@ -304,6 +332,11 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 			prevClose = daily[len(daily)-1].Close
 		}
 	}
+
+	// 缓存本次成功拉取的分时，供非交易时段/数据源抖动回退
+	minuteCacheMu.Lock()
+	minuteCache[code] = &minuteCacheEntry{Points: points, PrevClose: prevClose, Name: s.stockName(code), At: time.Now()}
+	minuteCacheMu.Unlock()
 
 	writeJSON(w, 200, map[string]interface{}{
 		"code":       code,
@@ -1033,6 +1066,8 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 			if newsTitles == nil {
 				newsTitles = []string{}
 			}
+			// 数据来源标识：本记录来自 LLM 归因（能从新闻中归因于该板块）
+			source := "llm"
 			out = append(out, map[string]interface{}{
 				"name":          sec.Name,
 				"code":          si.Code,
@@ -1045,6 +1080,8 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 				"limitup_cnt":   si.LimitupCnt,
 				"net_inflow":    r2(si.NetInflow),
 				"news_titles":   newsTitles,
+				// source 透传给前端弹窗，用于展示「信息来源/归因来源」标识
+				"source": source,
 			})
 		}
 	}
@@ -1069,6 +1106,8 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 				"limitup_cnt":   si.LimitupCnt,
 				"net_inflow":    r2(si.NetInflow),
 				"news_titles":   []string{},
+				// source 透传给前端弹窗，用于展示「信息来源/归因来源」标识
+				"source": "ths",
 			})
 		}
 	}
@@ -1089,7 +1128,12 @@ func (s *Server) quote(code string) (*data.StockInfo, error) {
 	if s.dc != nil {
 		return s.dc.GetQuote(code)
 	}
-	return s.market.GetRealtimeQuote(code)
+	// market 未注入（如最小化测试构造/依赖缺失）时返回错误而非 nil receiver panic——
+	// 此前 GetRealtimeQuote 内访问 m.quoteMu 直接 SIGSEGV，整个请求链崩溃。
+	if s.market != nil {
+		return s.market.GetRealtimeQuote(code)
+	}
+	return nil, fmt.Errorf("market quote unavailable")
 }
 
 // quoteSnapshot 只读行情入口：仅从 fetcher 5s 快照取价，缺失不回落真打上游。
@@ -1390,6 +1434,8 @@ func newsTimeFromEpoch(sec int64) string {
 // absorbs the bursts so the news sources are not hit on every request.）
 const newsTTL = 30 * time.Second
 
+// handleFixNews 处理 GET /api/news：聚合多来源资讯列表，30s TTL 缓存吸收前端 3s 轮询洪峰；
+// ?all=true 返回全量合并视图（缓存键含 userID，防止跨账号响应串号）。
 func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "true"
 	// §GAP2-W2 缓存键加入 userID（I-7 根修）：旧键只有 "all"/""，30s 内 B 会拿到

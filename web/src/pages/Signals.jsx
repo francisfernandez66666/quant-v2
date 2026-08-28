@@ -5,8 +5,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
-import KLineChart from '../components/KLineChart.jsx'
-import DepthPanel from '../components/DepthPanel.jsx'
+import MinuteView from '../components/MinuteView.jsx'
 import LogModal from '../components/LogModal.jsx'
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
@@ -322,10 +321,7 @@ export default function Signals() {
           columns={columns}
           size="small"
           expandedRow={(row) => (
-            <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', flexWrap: 'wrap' }}>
-              <div style={{ flex: '1 1 auto', minWidth: 0 }}><KLineChart code={row.code} name={row.name} /></div>
-              <div style={{ flex: '0 0 300px' }}><DepthPanel code={row.code} name={row.name} /></div>
-            </div>
+            <MinuteView code={row.code} name={row.name} />
           )}
           expandedRowKeys={[...klineOpen]}
           onExpandChange={(keys) => setKlineOpen(new Set(keys))}

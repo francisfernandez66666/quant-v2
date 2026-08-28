@@ -33,6 +33,7 @@ type reEntryTracker struct {
 	lastClose map[string]time.Time // code → 最近清仓时间
 }
 
+// newReEntryTracker 创建空的再入场冷却跟踪器（lastClose 就绪，无历史清仓记录）。
 func newReEntryTracker() *reEntryTracker {
 	return &reEntryTracker{lastClose: make(map[string]time.Time)}
 }
@@ -51,6 +52,12 @@ func (t *reEntryTracker) canReEnter(code string, cooldownMin int, now time.Time)
 		return now.Sub(last).Minutes() >= float64(cooldownMin)
 	}
 	return true
+}
+
+// lastCloseAt 返回某票最近一次清仓时间（未清仓过返回零值），供上层构造拒绝文案用。
+// English: returns the code's last close time (zero value if never closed), for building reject messages.
+func (t *reEntryTracker) lastCloseAt(code string) time.Time {
+	return t.lastClose[code]
 }
 
 // ── R2.2 绩效指标 ──

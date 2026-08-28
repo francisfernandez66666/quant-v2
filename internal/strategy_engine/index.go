@@ -2,6 +2,10 @@
 package strategy_engine
 
 import (
+	"fmt"
+	"log"
+	"strings"
+
 	"quant-trading-v2/internal/newsagent"
 
 	"quant-trading-v2/internal/llm"
@@ -10,13 +14,17 @@ import (
 // rebuildIndex 从事件板块重建个股→板块倒排索引。（rebuildIndex rebuilds the stock→sector inverted index from event sectors.）
 // 遍历每个事件的板块（含上游/下游），通过 LLM ResolveStocks 解析出关联个股，建立 code → 板块列表 的映射。
 // 仅在本次结果非空时替换旧索引（避免无事件轮次清空缓存索引）。
+// 解码失败（关联股解析不出代码 / 部分未解析）不再静默吞掉，而是返回结构化错误并记告警，便于运维发现 LLM/解析异常。
 // （For every event sector (incl. upstream/downstream), resolves related stocks via LLM ResolveStocks to build
-// code → sector-list mappings, and only replaces the old index when the new one is non-empty to avoid clearing it.)
-func (e *Engine) rebuildIndex(events []newsagent.NewsEvent) {
+// code → sector-list mappings, and only replaces the old index when the new one is non-empty to avoid clearing it.
+// Decode failures (no codes resolved / partially unresolved) are no longer silently swallowed; they return a
+// structured error and log an alert so operators can spot LLM/parse anomalies.)
+func (e *Engine) rebuildIndex(events []newsagent.NewsEvent) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	idx := make(map[string][]string)
+	var failures []string // 收集解码失败的结构化详情（板块 + 关联股 + 未解析项）
 	for _, ev := range events {
 		// 汇总事件涉及的全部板块：本级 + 上游 + 下游（Collect all involved sectors: own + upstream + downstream）
 		allSectors := append([]string{}, ev.Sectors...)
@@ -24,7 +32,15 @@ func (e *Engine) rebuildIndex(events []newsagent.NewsEvent) {
 		allSectors = append(allSectors, ev.DownstreamSectors...)
 		for _, s := range allSectors {
 			// 解析事件关联个股（LLM 从 RelatedStocks 中识别出代码）（Resolve event-related stocks; LLM extracts codes from RelatedStocks）
-			codes, _ := llm.ResolveStocks(ev.RelatedStocks)
+			codes, unresolved := llm.ResolveStocks(ev.RelatedStocks)
+			if len(codes) == 0 {
+				// 板块→个股解码完全失败：无任何可解析代码，记录结构化告警（含关联股原文）
+				failures = append(failures, fmt.Sprintf("板块=%q 关联股=%v 未解析出任何代码", s, ev.RelatedStocks))
+			} else if len(unresolved) > 0 {
+				// 部分解码失败：已解析出部分代码但存在未解析项，记降级告警但不阻断其余索引构建
+				log.Printf("[strategy_engine][降级告警] rebuildIndex 个股解码部分失败: 板块=%q 已解析=%d 未解析=%v",
+					s, len(codes), unresolved)
+			}
 			for _, code := range codes {
 				if !contains(idx[code], s) {
 					idx[code] = append(idx[code], s)
@@ -36,6 +52,14 @@ func (e *Engine) rebuildIndex(events []newsagent.NewsEvent) {
 	if len(idx) > 0 {
 		e.stockSectorIdx = idx
 	}
+
+	// 存在解码失败：向上返回结构化错误（不阻断流水线，调用方据此记告警/计数），不再静默吞掉
+	if len(failures) > 0 {
+		err := fmt.Errorf("rebuildIndex 个股解码失败 %d 处: %s", len(failures), strings.Join(failures, "; "))
+		log.Printf("[strategy_engine][降级告警] %v", err)
+		return err
+	}
+	return nil
 }
 
 // sectorStocks 根据板块名称查询成分股列表，从 scanner 获取板块代码后调用市场 API。

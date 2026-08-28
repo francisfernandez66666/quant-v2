@@ -18,6 +18,7 @@ import (
 
 	"quant-trading-v2/internal/factor"
 	"quant-trading-v2/internal/research"
+	"quant-trading-v2/internal/research/scoring"
 	"quant-trading-v2/internal/store"
 )
 
@@ -112,6 +113,10 @@ type Options struct {
 	Benchmark   string // 基准指数（默认 000300.SH）
 	Lookback    int    // 因子预热回看天数（默认 70）
 	Rule        SignalRule
+	// Cost 交易成本模型（B4 成本模型，修复零成本假设）：默认 DefaultCostModel（佣金万2.5+最低5元、
+	// 滑点 5bp 双边、卖出印花税 0.05%，与模拟盘/btreplay 同源）。零值时 Run 自动填充默认值。
+	// English: trading-cost model; Run fills the default when left zero-valued.
+	Cost CostModel
 	// OnProgress 可选进度回调（已处理事件数/总事件数）。供 CLI/HTTP 上报回测进度，
 	// 前端据此渲染"全链路回测进度条"。nil 时不回调。
 	// English: optional progress callback (events done / total). Lets the CLI/HTTP layer report
@@ -167,6 +172,10 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 	}
 	if opts.Rule.MinCover <= 0 {
 		opts.Rule.MinCover = 0.5
+	}
+	// B4 成本模型：未显式配置时使用与模拟盘/btreplay 同源的默认成本（佣金万2.5+最低5元、滑点5bp、印花税0.05%）。
+	if opts.Cost == (CostModel{}) {
+		opts.Cost = DefaultCostModel()
 	}
 	maxH := 0
 	for _, h := range opts.Horizons {
@@ -284,7 +293,7 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 				}
 			}
 			if !cached {
-				er = evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons)
+				er = evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons, opts.Cost)
 				if opts.CandidateID > 0 {
 					if js, err := json.Marshal(er); err == nil {
 						if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP, string(js)); err != nil {
@@ -332,53 +341,16 @@ func allEventsCached(db *store.DB, candID int64, ruleFP string, winEvents []Sect
 // evalEvent 对单个事件做"选股 → 前瞻收益 → 基准超额"。
 // （evalEvent picks stocks for one event and validates forward excess returns.）
 func evalEvent(panels map[string]*stockData, bench []store.Bar, benchIdx map[string]int,
-	e SectorEvent, rule SignalRule, horizons []int) EventResult {
+	e SectorEvent, rule SignalRule, horizons []int, cost CostModel) EventResult {
 	er := EventResult{
 		Date: e.Date, Industry: e.Industry,
 		LimitUpCount: e.LimitUpCount, Constituents: e.Constituents,
 		MeanExcess: map[int]float64{}, HitRate: map[int]float64{},
 	}
 
-	// 第一遍：收集事件日截面（每因子的当日值，过滤 ST/无价）
-	vals := make(map[string]map[string]float64, len(rule.Factors)) // factorID → code → value
-	for code, sd := range panels {
-		idx, ok := sd.DateIdx[e.Date]
-		if !ok || sd.Series.IsST[idx] == 1 || sd.Series.CloseHfq[idx] <= 0 {
-			continue
-		}
-		for _, fid := range rule.Factors {
-			fvals, ok := sd.FactorVals[fid]
-			if !ok || idx >= len(fvals) || math.IsNaN(fvals[idx]) {
-				continue
-			}
-			if vals[fid] == nil {
-				vals[fid] = make(map[string]float64)
-			}
-			vals[fid][code] = fvals[idx]
-		}
-	}
-	// 每因子截面均值/标准差
-	meanStd := make(map[string]struct{ mean, std float64 }, len(rule.Factors))
-	for fid, m := range vals {
-		var sum, sum2 float64
-		n := 0
-		for _, v := range m {
-			sum += v
-			sum2 += v * v
-			n++
-		}
-		if n < 2 {
-			continue
-		}
-		mean := sum / float64(n)
-		std := math.Sqrt(sum2/float64(n) - mean*mean)
-		meanStd[fid] = struct{ mean, std float64 }{mean, std}
-	}
-	if len(meanStd) == 0 {
-		return er
-	}
-
-	// 第二遍：z 分数复合 + 选股
+	// 选股打分：统一改用「单股时序分位」(scoring.ScoreValue)，与实盘 internal/strategies/factor 同口径，
+	// 修复旧实现「截面 z 标准化」导致的「研究↔实盘打分语义断层」。每只股票逐因子取其事件日值
+	// 在「自身因子历史（截至事件日，无未来泄漏）」中的分位（看多=分位，看空=1-分位），加权复合后排序选 TopK。
 	type cand struct {
 		code  string
 		score float64
@@ -399,14 +371,16 @@ func evalEvent(panels map[string]*stockData, bench []store.Bar, benchIdx map[str
 		}
 		total, used := 0.0, 0
 		for _, fid := range rule.Factors {
-			ms, has := meanStd[fid]
-			if !has || ms.std == 0 {
+			fvals, ok := sd.FactorVals[fid]
+			if !ok || idx >= len(fvals) || math.IsNaN(fvals[idx]) {
 				continue
 			}
-			v, ok := vals[fid][code]
-			if !ok {
+			// 时序分位：事件日值在该股自身因子历史（含当日）中的分位秩，与实盘同源。
+			pct := scoring.ScoreValue(fvals[:idx+1], fvals[idx])
+			if math.IsNaN(pct) {
 				continue
 			}
+			// 方向与实盘一致：看多因子取分位（越高越好），看空因子取 1-分位（越低越好）。
 			dir := 1
 			if fd, ok := factor.Get(fid); ok {
 				dir = dirOf(fd, rule.Directions)
@@ -417,13 +391,17 @@ func evalEvent(panels map[string]*stockData, bench []store.Bar, benchIdx map[str
 					w = wv
 				}
 			}
-			total += float64(dir) * w * (v - ms.mean) / ms.std
+			contrib := w * pct
+			if dir < 0 {
+				contrib = w * (1 - pct)
+			}
+			total += contrib
 			used++
 		}
 		cover := 1.0
-		// 覆盖度按"当日实际有截面变差的因子"计（无变差因子不算缺失）
-		if len(meanStd) > 0 {
-			cover = float64(used) / float64(len(meanStd))
+		// 覆盖度按"当日实际可用的因子"计（与规则配置因子数对比）。
+		if len(rule.Factors) > 0 {
+			cover = float64(used) / float64(len(rule.Factors))
 		}
 		if used == 0 || cover < rule.MinCover {
 			continue
@@ -460,10 +438,12 @@ func evalEvent(panels map[string]*stockData, bench []store.Bar, benchIdx map[str
 				continue
 			}
 			ret := sd.Series.CloseHfq[fi]/entryPrice - 1
-			pick.Returns[h] = ret
+			// B4 成本模型：从毛收益中扣除往返交易成本（滑点+佣金+印花税），得到可代表实盘机制的净收益。
+			netRet := cost.NetReturn(ret, cost.AssumeNotional)
+			pick.Returns[h] = netRet
 			if bj >= 0 && bj+h < len(bench) && bench[bj].Open > 0 {
 				bre := bench[bj+h].Close/bench[bj].Open - 1
-				pick.Excess[h] = ret - bre
+				pick.Excess[h] = netRet - bre
 			}
 		}
 		er.Picks = append(er.Picks, pick)

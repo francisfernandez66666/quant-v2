@@ -247,7 +247,17 @@ func main() {
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
 	baseStocks := append(wlMgr.All(), rpt.HeldPositionCodes()...)
-	dc := data.NewDataCoordinator(marketAPI, thsClient) // 统一行情源：新浪→同花顺→东财 三级降级链
+	dc := data.NewDataCoordinator(marketAPI, thsClient) // 统一行情源：hithink→新浪→同花顺→东财 四级降级链
+
+	// 注入同花顺（新）hithink 最高优先级源（可选）：Key 缺失时 NewHithinkClient 返回错误，
+	// 此处静默跳过——降级链自动退化为 新浪→同花顺→东财，不破坏既有功能、不报错。
+	// 注入成功后 hithink 成为 GetQuote 第一顺位，东财永远最末兜底。
+	if hk, hkErr := data.NewHithinkClient(); hkErr == nil {
+		dc.SetHithink(hk)
+		log.Printf("[main] 同花顺(新)hithink 数据源已注入为行情第一顺位")
+	} else {
+		log.Printf("[main] 同花顺(新)hithink 未启用(降级链不受影响): %v", hkErr)
+	}
 	fetcher := data.NewFetcher(baseStocks, marketAPI, dc)
 	// §GAP3.2/3.3 快照落盘（同日重启恢复）+ 盘中陈旧度告警
 	fetcher.SetDataDir(dataDir)

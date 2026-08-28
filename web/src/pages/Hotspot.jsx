@@ -316,21 +316,37 @@ export default function Hotspot() {
       <Dialog visible={!!reasonTarget} header={reasonTarget ? reasonTarget.name : ''} onClose={() => setReasonTarget(null)} confirmBtn="知道了" cancelBtn="">
         {reasonTarget && (
           <div>
+            {/* 信息来源 / 归因来源标识：根据后端透传的 source 字段渲染 */}
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>信息来源</div>
+              <div style={{ fontSize: 13 }}>
+                {reasonTarget.source === 'llm' ? (
+                  <span style={{ display: 'inline-block', background: 'rgba(0,168,112,0.15)', color: '#00a870', borderRadius: 4, padding: '2px 8px' }}>LLM 归因</span>
+                ) : reasonTarget.source === 'ths' ? (
+                  <span style={{ display: 'inline-block', background: 'rgba(250,173,20,0.15)', color: '#FAAD14', borderRadius: 4, padding: '2px 8px' }}>同花顺板块兜底</span>
+                ) : (
+                  <span style={{ display: 'inline-block', background: 'rgba(153,153,153,0.15)', color: '#999', borderRadius: 4, padding: '2px 8px' }}>未知来源</span>
+                )}
+              </div>
+            </div>
             <div style={{ marginBottom: 14 }}>
               <div style={{ fontWeight: 600, marginBottom: 6 }}>板块异动原因</div>
               <div style={{ fontSize: 13, color: '#ccc', whiteSpace: 'pre-wrap' }}>{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
             </div>
-            {reasonTarget.news_titles && reasonTarget.news_titles.length ? (
-              <div>
-                <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻（{reasonTarget.news_titles.length}条）</div>
-                {reasonTarget.news_titles.map((t, i) => (
+            {/* 触发新闻：有则渲染列表，无则给出友好空态提示，避免用户误以为功能损坏 */}
+            <div>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻{reasonTarget.news_titles && reasonTarget.news_titles.length ? `（${reasonTarget.news_titles.length}条）` : ''}</div>
+              {reasonTarget.news_titles && reasonTarget.news_titles.length ? (
+                reasonTarget.news_titles.map((t, i) => (
                   <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#666666', padding: '2px 0' }}>
                     <span style={{ color: '#888' }}>{i + 1}.</span>
                     <span>{t}</span>
                   </div>
-                ))}
-              </div>
-            ) : null}
+                ))
+              ) : (
+                <div style={{ fontSize: 13, color: '#888' }}>暂无关联新闻（来源未提供相关触发新闻）</div>
+              )}
+            </div>
           </div>
         )}
       </Dialog>

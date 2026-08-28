@@ -63,6 +63,7 @@ type Outbox struct {
 	stop        chan struct{} // 停止后台协程的信号通道
 	owner       *Notifier     // 重建持久化条目的投递函数用（New 时绑定）
 	persistPath string        // 非空时启用磁盘持久化（重启续发）
+	saveWG      sync.WaitGroup // 追踪在途持久化写，Stop 时等待其完成以免退出后仍在重写文件
 }
 
 // SetPersistPath 启用磁盘持久化并加载既有队列（须在首次 enqueue 前调用；文件不存在/损坏则从空队开始）。
@@ -155,6 +156,25 @@ func (o *Outbox) loop(stop chan struct{}) {
 	}
 }
 
+// Stop 停止后台重试协程并释放其持有的持久化写句柄，避免进程/测试退出后
+// 仍有 goroutine 持续重写 outbox.json 导致资源泄漏或临时目录无法清理。
+// 幂等：未启动时直接返回；已停止后重复调用安全。
+// English: stops the background retry goroutine and releases its file handle so it no
+// longer rewrites outbox.json after the owner is gone. Idempotent and safe to call once.
+func (o *Outbox) Stop() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	if o.started {
+		o.started = false
+		close(o.stop) // 触发 loop 退出（enqueue 中仅创建一次，不会重复 close）
+	}
+	o.mu.Unlock()
+	// 无论后台协程是否启动，都等待在途持久化写完成，确保退出后不再重写 outbox.json
+	o.saveWG.Wait()
+}
+
 // pump 扫描到期项逐条重试。§R3-8 P1-D：收集与状态回写持锁、HTTP 投递放锁外——
 // 此前全程持锁，单条 10s 超时会阻塞 Push()/enqueue() 主路径。
 // English: R3-8 P1-D — due items are collected under lock but delivered outside it, so a slow
@@ -218,7 +238,9 @@ func (o *Outbox) saveLocked() {
 			NextAt: it.nextAt, DeliverStr: it.kind,
 		}
 	}
+	o.saveWG.Add(1)
 	go func(path string, items []outboxPersistItem) {
+		defer o.saveWG.Done()
 		data, err := json.Marshal(items)
 		if err != nil {
 			return

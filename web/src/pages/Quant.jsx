@@ -17,12 +17,18 @@ const KIND_LABELS = {
 }
 const KIND_ORDER = ['form', 'factor', 'pattern']
 
-// 本地缓存键：切换 tab 时先显示上次成功加载的配置，避免开关/参数瞬间跳回默认值
-const STORAGE_QMT_FORM = 'liangzai_qmt_form'
+// 本地缓存键：切换 tab 时先显示上次成功加载的配置，避免开关/参数瞬间跳回默认值。
+// 键含当前账号名（多账号隔离），防止 A 账号的表单缓存串给 B 账号显示。
+const STORAGE_QMT_FORM_BASE = 'liangzai_qmt_form'
+
+function cachedFormKey() {
+  const acc = (typeof api.getAccount === 'function' && api.getAccount()) || ''
+  return acc ? STORAGE_QMT_FORM_BASE + ':' + acc : STORAGE_QMT_FORM_BASE
+}
 
 function readCachedForm() {
   try {
-    const raw = localStorage.getItem(STORAGE_QMT_FORM)
+    const raw = localStorage.getItem(cachedFormKey()) || localStorage.getItem(STORAGE_QMT_FORM_BASE)
     if (raw) return JSON.parse(raw)
   } catch (_) {}
   return null
@@ -30,7 +36,7 @@ function readCachedForm() {
 
 function writeCachedForm(form) {
   try {
-    localStorage.setItem(STORAGE_QMT_FORM, JSON.stringify(form))
+    localStorage.setItem(cachedFormKey(), JSON.stringify(form))
   } catch (_) {}
 }
 
@@ -81,6 +87,9 @@ export default function Quant() {
   const [saving, setSaving] = useState(false)
   const [trades, setTrades] = useState(null)
   const [amountsInput, setAmountsInput] = useState({})
+  // 配置加载失败提示：加载失败时表单停留在本地缓存值，若无提示用户会误把
+  // 缓存当成服务器真实状态，误以为"开关被自动关闭"。显式告警消除歧义。
+  const [loadErr, setLoadErr] = useState('')
 
   const stateTimer = useRef(null)
   const tradesTimer = useRef(null)
@@ -125,37 +134,44 @@ export default function Quant() {
     return Math.floor(sec / 3600) + '小时前'
   }
 
-  // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启
+  // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启。
+  // 失败时置 loadErr 告警（页面顶部显示），并向上抛出由调用方决定是否 toast。
   async function loadConfig() {
-    const c = await api.fetchQMTConfig()
-    const nextForm = {
-      enabled: !!c.enabled, mode: c.mode || 'manual', price_type: c.price_type || 'market',
-      auto_sell: !!c.auto_sell, gateway_url: c.gateway_url || '', token_masked: c.token_masked || '',
-      fixed_amount: c.fixed_amount ?? 10000, max_positions: c.max_positions ?? 10,
-      initial_capital: c.initial_capital ?? 100000,
-      daily_max_buys: c.daily_max_buys ?? 20, daily_budget_amount: c.daily_budget_amount ?? 100000,
-      miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
+    try {
+      const c = await api.fetchQMTConfig()
+      setLoadErr('')
+      const nextForm = {
+        enabled: !!c.enabled, mode: c.mode || 'manual', price_type: c.price_type || 'market',
+        auto_sell: !!c.auto_sell, gateway_url: c.gateway_url || '', token_masked: c.token_masked || '',
+        fixed_amount: c.fixed_amount ?? 10000, max_positions: c.max_positions ?? 10,
+        initial_capital: c.initial_capital ?? 100000,
+        daily_max_buys: c.daily_max_buys ?? 20, daily_budget_amount: c.daily_budget_amount ?? 100000,
+        miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
+      }
+      setForm(nextForm)
+      writeCachedForm(nextForm)
+      // 后端 known_strategies 可能为对象数组 [{id,name,kind}]（新）或纯 ID 数组（旧），统一归一
+      let list = []
+      if (Array.isArray(c.known_strategies)) {
+        list = c.known_strategies.map((x) => {
+          if (typeof x === 'string') return { id: x, name: x, kind: 'form' }
+          return { id: x.id, name: x.name || x.id, kind: x.kind || 'form' }
+        })
+      }
+      setStrategyList(list)
+      const wl = Array.isArray(c.strategies) ? c.strategies : []
+      const on = {}
+      list.forEach((v) => { on[v.id] = wl.length === 0 || wl.includes(v.id) })
+      setStrategyOn(on)
+      const sa = c.strategy_amounts || {}
+      const ai = {}
+      list.forEach((v) => { ai[v.id] = sa[v.id] ?? '' })
+      setAmountsInput(ai)
+      setStrategyDirty(false)
+    } catch (e) {
+      setLoadErr('实盘配置加载失败（' + (e && e.message ? e.message : '网络异常') + '）——下方开关显示的是本机缓存，不代表服务器真实状态')
+      throw e
     }
-    setForm(nextForm)
-    writeCachedForm(nextForm)
-    // 后端 known_strategies 可能为对象数组 [{id,name,kind}]（新）或纯 ID 数组（旧），统一归一
-    let list = []
-    if (Array.isArray(c.known_strategies)) {
-      list = c.known_strategies.map((x) => {
-        if (typeof x === 'string') return { id: x, name: x, kind: 'form' }
-        return { id: x.id, name: x.name || x.id, kind: x.kind || 'form' }
-      })
-    }
-    setStrategyList(list)
-    const wl = Array.isArray(c.strategies) ? c.strategies : []
-    const on = {}
-    list.forEach((v) => { on[v.id] = wl.length === 0 || wl.includes(v.id) })
-    setStrategyOn(on)
-    const sa = c.strategy_amounts || {}
-    const ai = {}
-    list.forEach((v) => { ai[v.id] = sa[v.id] ?? '' })
-    setAmountsInput(ai)
-    setStrategyDirty(false)
   }
 
   // 拉取交易流水（含汇总与分战法/成交流水），仅在返回合法时更新
@@ -174,7 +190,9 @@ export default function Quant() {
   // 标记战法开关被改动
   function markStrategyDirty() { setStrategyDirty(true) }
 
-  // 通用保存：回写指定字段到后端，成功提示并重新拉取配置，失败提示错误
+  // 通用保存：回写指定字段到后端，成功提示并重新拉取配置。
+  // 失败时除提示外，还回滚到后端真实配置——否则界面显示与实际不一致，
+  // 刷新/切tab重新挂载后配置"跳回"，造成开关丢了的现象。
   async function patch(fields, okTip) {
     setSaving(true)
     try {
@@ -183,33 +201,50 @@ export default function Quant() {
       await loadConfig()
     } catch (e) {
       MessagePlugin.error('保存失败：' + (e && e.message ? e.message : e))
+      try { await loadConfig() } catch (_) {}
     } finally {
       setSaving(false)
     }
   }
 
-  // 保存实盘总开关：启用前需二次确认（将向网关下发真实交易指令）
-  async function saveSwitches(v) {
-    const next = v === undefined ? form.enabled : v
-    if (next && !(await confirmDialog('确认启用实盘链路？启用后将按下方参数向广州网关传递真实交易指令。', '启用实盘链路'))) {
-      setForm({ ...form, enabled: false })
-      return
-    }
-    await patch({ enabled: next }, next ? '实盘链路已启用' : '实盘链路已停用')
+  // 切换执行模式：点击立即保存到后端（全自动需二次确认），不再依赖"保存"按钮
+  async function saveMode(mode) {
+    if (saving) return
+    if (mode === 'auto' && !(await confirmDialog('确认切换为「全自动」？信号将不经人工确认直接下单（受熔断/纪律约束）。', '切换全自动'))) return
+    setForm((f) => ({ ...f, mode }))
+    await patch({ mode }, mode === 'auto' ? '已切换为全自动' : '已切换为手动确认')
   }
 
-  // 保存执行参数（模式/价格/自动卖出/网关/心跳/Token），切换全自动前需确认
-  async function saveExec() {
-    if (form.mode === 'auto' && !(await confirmDialog('确认切换为「全自动」？信号将不经人工确认直接下单（受熔断/纪律约束）。', '切换全自动'))) {
-      setForm({ ...form, mode: 'manual' })
+  // 切换委托价格：点击立即保存到后端
+  async function savePriceType(priceType) {
+    if (saving) return
+    setForm((f) => ({ ...f, price_type: priceType }))
+    await patch({ price_type: priceType }, '委托价格已保存')
+  }
+
+  // 切换自动卖出：点击立即保存到后端
+  async function saveAutoSell(v) {
+    if (saving) return
+    setForm((f) => ({ ...f, auto_sell: v }))
+    await patch({ auto_sell: v }, v ? '已开启自动卖出' : '已关闭自动卖出')
+  }
+
+  // 保存实盘总开关：启用前需二次确认（将向网关下发真实交易指令）
+  async function saveSwitches(v) {
+    if (v && !(await confirmDialog('确认启用实盘链路？启用后将按下方参数向广州网关传递真实交易指令。', '启用实盘链路'))) {
+      setForm((f) => ({ ...f, enabled: false }))
       return
     }
+    await patch({ enabled: v }, v ? '实盘链路已启用' : '实盘链路已停用')
+  }
+
+  // 保存网关连接参数（网关地址/心跳超时/Token）；模式与价格已改为点击即存，不再随此保存
+  async function saveExec() {
     const fields = {
-      mode: form.mode, price_type: form.price_type, auto_sell: form.auto_sell,
       gateway_url: form.gateway_url, miss_heartbeat_sec: form.miss_heartbeat_sec,
     }
     if (tokenInput) fields.token = tokenInput
-    await patch(fields, '执行参数已保存')
+    await patch(fields, '网关连接参数已保存')
   }
 
   // 保存仓位纪律（最大持仓/单票金额/初始资金/日买笔数上限/日预算）
@@ -291,6 +326,12 @@ export default function Quant() {
       <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>📈 量化交易</div>
       <div style={{ fontSize: 12, color: '#888', marginBottom: 14 }}>实盘链路参数、仓位纪律与战法白名单（保存后约 5 秒热加载生效）</div>
 
+      {loadErr && (
+        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: '#fdecea', border: '1px solid #f5c6c2', color: '#b71c1c', fontSize: 12 }}>
+          ⚠️ {loadErr}
+        </div>
+      )}
+
       <Card style={{ marginBottom: 14 }}>
         {state && state.enabled ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
@@ -304,11 +345,16 @@ export default function Quant() {
             <span>{state.mode === 'auto' ? '自动' : '手动'}</span>
             {fmtAgo(state.last_report_at) && <span>回报{fmtAgo(state.last_report_at)}</span>}
           </div>
-        ) : (
+        ) : state ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
             <span style={{ color: '#666' }}>●</span>
             <span>实盘链路未启用</span>
             <span style={{ color: '#666', fontSize: 11 }}>打开下方「总开关」并配置网关地址后开始互通</span>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
+            <span style={{ color: '#999' }}>●</span>
+            <span style={{ color: '#666' }}>链路状态加载中（若长期停留请检查网络/重新登录）</span>
           </div>
         )}
       </Card>
@@ -320,16 +366,17 @@ export default function Quant() {
             <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>关闭后引擎不再向网关传递任何信号/建议（纸面盘不受影响）</span>
           </Form.FormItem>
           <Form.FormItem label="执行模式">
-            <span style={segBtn(form.mode === 'manual')} onClick={() => setForm({ ...form, mode: 'manual' })}>手动确认</span>
-            <span style={segBtn(form.mode === 'auto')} onClick={() => setForm({ ...form, mode: 'auto' })}>全自动</span>
-            <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>手动=每单前端确认；自动=信号直接下单</span>
+            <span style={segBtn(form.mode === 'manual')} onClick={() => saveMode('manual')}>手动确认</span>
+            <span style={segBtn(form.mode === 'auto')} onClick={() => saveMode('auto')}>全自动</span>
+            <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存；手动=每单前端确认；自动=信号直接下单</span>
           </Form.FormItem>
           <Form.FormItem label="委托价格">
-            <span style={segBtn(form.price_type === 'market')} onClick={() => setForm({ ...form, price_type: 'market' })}>对手价</span>
-            <span style={segBtn(form.price_type === 'limit')} onClick={() => setForm({ ...form, price_type: 'limit' })}>限价</span>
+            <span style={segBtn(form.price_type === 'market')} onClick={() => savePriceType('market')}>对手价</span>
+            <span style={segBtn(form.price_type === 'limit')} onClick={() => savePriceType('limit')}>限价</span>
+            <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存</span>
           </Form.FormItem>
           <Form.FormItem label="自动卖出">
-            <Switch value={form.auto_sell} onChange={(v) => setForm({ ...form, auto_sell: v })} />
+            <Switch value={form.auto_sell} onChange={saveAutoSell} />
             <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>自动模式下止损/清仓级建议自动全仓卖出；止盈/减仓保持提醒</span>
           </Form.FormItem>
           <Form.FormItem label="心跳超时(秒)">
@@ -347,7 +394,7 @@ export default function Quant() {
             <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>显示为脱敏形态；留空表示保持原值不变</span>
           </Form.FormItem>
           <Form.FormItem>
-            <Button theme="primary" onClick={saveExec} loading={saving}>保存执行参数</Button>
+            <Button theme="primary" onClick={saveExec} loading={saving}>保存网关参数</Button>
           </Form.FormItem>
         </Form>
       </Card>

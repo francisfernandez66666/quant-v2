@@ -39,6 +39,13 @@ type DataCoordinator struct {
 	eastMoney *MarketAPI
 	ths       *THSClient
 
+	// hithink 同花顺（新）官方数据源客户端，作为行情/板块的最高优先级源（东财永远兜底）。
+	// 该字段为可选：默认 nil，由 server 层在持有 hithink 客户端时通过 SetHithink 注入；
+	// 为 nil 时自动降级到后续链，不影响既有逻辑（不报错、不破坏调用方）。
+	// English: hithink (the new Tonghuashun official client) is the top-priority source;
+	// EastMoney is always the final fallback. It is optional and injected via SetHithink.
+	hithink *HithinkClient
+
 	mu sync.RWMutex
 
 	thsDeadline time.Time // 同花顺熔断截止时间（失败后 60s 内不再尝试）
@@ -77,6 +84,18 @@ func NewDataCoordinator(api *MarketAPI, ths *THSClient) *DataCoordinator {
 		ths:              ths,
 		sectorStockCache: make(map[string]cachedSectorStocks),
 	}
+}
+
+// SetHithink 注入同花顺（新）官方数据源客户端（可选）。
+// 调用方（server 层）若已构造 *HithinkClient 则调用本方法注入，使行情/板块链路
+// 以 hithink 为第一顺位、东财为最末兜底。未注入（h==nil）时功能自动降级，不报错。
+// 注意：本方法不改变 NewDataCoordinator(api, ths) 签名，避免牵连大量调用方。
+// English: SetHithink injects the optional Hithink (new THS) client as the top-priority
+// source. When not called (nil), the chain degrades gracefully; EastMoney stays last.
+func (dc *DataCoordinator) SetHithink(h *HithinkClient) {
+	dc.mu.Lock()
+	dc.hithink = h
+	dc.mu.Unlock()
 }
 
 // thsAvailable §R3-2 P0-D1 熔断状态锁内读取：thsDeadline 此前被 GetQuote/GetKLine/
@@ -143,16 +162,35 @@ func (dc *DataCoordinator) NewsSourceHealth() map[string]bool {
 	}
 }
 
-// GetQuote 获取个股实时行情：新浪 → 同花顺 → 东财 三级降级链，同花顺每失败一次熔断 60s。
-// 三级源全部失败时返回明确错误（不再返回零值脏快照，避免前端显示 0.00 元）。
-// English: GetQuote fetches a per-stock realtime quote down the chain Sina → THS → EastMoney,
-// tripping THS for 60s after each THS failure; returns an explicit error when all three fail.
+// GetQuote 获取个股实时行情：同花顺（新）hithink → 新浪 → 同花顺 → 东财 四级降级链，
+// 同花顺每失败一次熔断 60s。东财永远处于最末兜底位（绝不作为第一/主源）。
+// 同花顺（新）hithink 为第一顺位：优先用 BatchQuotes 批量快照取该 code 的实时价。
+// 四级源全部失败时返回明确错误（不再返回零值脏快照，避免前端显示 0.00 元）。
+// English: GetQuote fetches a per-stock realtime quote down the chain
+// hithink → Sina → THS → EastMoney; EastMoney is always the final fallback.
 func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	// 空代码防御（§门控配套）：上游对空代码必然失败并刷错误日志
 	// （周六实录：每秒数行"新浪/东财行情失败 ()"），直接本地拒绝。
 	if code == "" {
 		return nil, fmt.Errorf("空股票代码")
 	}
+
+	// ① 同花顺（新）hithink 第一顺位：批量快照命中则直接返回，失败/空则继续降级链。
+	// hithink 为可选源（可能 nil），nil 时跳过本步，自动降级到后续链，不报错。
+	// BatchQuotes 返回的 map 以裸码（去掉 sh/sz/bj 前缀）为键；入参 code 可能带前缀，
+	// 故同时尝试原始 code 与去前缀后的裸码两种键。
+	if hk := dc.hithink; hk != nil {
+		if hkQuotes, hkErr := hk.BatchQuotes([]string{code}); hkErr == nil {
+			if si := lookupHithinkQuote(hkQuotes, code); si != nil && si.Price > 0 {
+				log.Printf("hithink(新)返回 %s 最新价 %.2f", code, si.Price)
+				return si, nil
+			}
+		} else {
+			log.Printf("hithink(新)行情失败 (%s): %v, 降级新浪", code, hkErr)
+		}
+	}
+
+	// ② 新浪：hithink 缺失/失败时的主用源。
 	si, err := dc.eastMoney.GetSinaQuote(code)
 	if err == nil && si != nil && si.Price > 0 {
 		return si, nil
@@ -161,6 +199,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 		log.Printf("新浪行情失败 (%s): %v, 降级同花顺", code, err)
 	}
 
+	// ③ 同花顺（旧）ths：保留原链，失败按既有逻辑熔断 60s。
 	if dc.thsAvailable() {
 		thsSi, thsErr := dc.ths.GetQuote(code)
 		if thsErr == nil && thsSi != nil && thsSi.Price > 0 {
@@ -172,6 +211,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 		}
 	}
 
+	// ④ 东财：永远处于最末兜底位（绝不作为第一/主源）。
 	emSI, emErr := dc.eastMoney.GetRealtimeQuote(code)
 	if emErr == nil && emSI != nil && emSI.Price > 0 {
 		return emSI, nil
@@ -180,9 +220,9 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 		log.Printf("东财行情失败 (%s): %v", code, emErr)
 	}
 
-	// §D3 修复：三级源全部失败时不再返回 (nil/零值, nil) 脏快照——此前新浪返回空行时
+	// §D3 修复：四级源全部失败时不再返回 (nil/零值, nil) 脏快照——此前新浪返回空行时
 	// si=nil,err=nil 直通 fetcher 写入 5s 快照、前端显示 0.00 元。现统一返回明确错误。
-	// English: D3 fix — when all three sources fail, never return a zero-value snapshot with a
+	// English: D3 fix — when all four sources fail, never return a zero-value snapshot with a
 	// nil error (it flowed straight into the 5s snapshot and rendered 0.00 on the frontend).
 	if si != nil && si.Price > 0 {
 		return si, err
@@ -193,9 +233,33 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	return nil, err
 }
 
-// GetKLine 获取 K 线数据。新浪日线 → 东财
-// English: GetKLine fetches K-line data. Sina daily → EastMoney.
-// GetKLine fetches K-lines: Sina daily first, then EastMoney.
+// lookupHithinkQuote 从 hithink 批量快照结果中取指定 code 的行情。
+// BatchQuotes 以裸码（去掉 sh/sz/bj 交易所前缀）为键；入参 code 可能带前缀，
+// 故依次尝试原始 code 与去前缀裸码两种键，命中且价格有效则返回。
+// English: lookupHithinkQuote picks the quote for code from the hithink batch result,
+// trying both the raw code and the stripped bare code (BatchQuotes keys by bare code).
+func lookupHithinkQuote(quotes map[string]*StockInfo, code string) *StockInfo {
+	if si, ok := quotes[code]; ok {
+		return si
+	}
+	// 去除常见交易所前缀（sh/sz/bj），回退到裸码键。
+	bare := code
+	if len(code) > 2 {
+		switch code[:2] {
+		case "sh", "sz", "bj":
+			bare = code[2:]
+		}
+	}
+	if si, ok := quotes[bare]; ok {
+		return si
+	}
+	return nil
+}
+
+// GetKLine 获取 K 线数据。新浪日线 → 腾讯 → 同花顺 → 东财。
+// 说明：同花顺（新）hithink 当前未提供通用 K 线接口（不臆造），故本方法保持
+// 新浪/腾讯/同花顺/东财顺序，东财恒为最后兜底项。
+// English: GetKLine fetches K-lines: Sina → Tencent → THS → EastMoney (EastMoney always last).
 func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, error) {
 	if period == "101" {
 		// §GAP3.6 日线降级链补全（原仅 新浪→东财 两级）：新浪 → 腾讯 → 同花顺 → 东财，
@@ -225,9 +289,10 @@ func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, er
 
 // GetMinuteKLine 获取分钟级 K 线（分时）。新浪分钟 → 同花顺分钟 → 腾讯分钟 → 东财分钟。
 // scale 为分钟数（1/5/15/30/60），返回按时间升序排列的 KLine。
-// English: GetMinuteKLine fetches minute K-lines (intraday). Sina → THS → Tencent → EastMoney.
-// English: scale is the minute count (1/5/15/30/60); returns KLine sorted ascending by time.
-// GetMinuteKLine fetches minute K-lines (分时). Chain: Sina → THS → Tencent → EastMoney.
+// 说明：同花顺（新）hithink 当前未提供通用分时接口（不臆造），保持既有顺序，
+// 东财恒为最后兜底项（绝不成为第一/主源）。
+// English: GetMinuteKLine fetches minute K-lines (intraday). Sina → THS → Tencent → EastMoney
+// (EastMoney always last; hithink has no generic intraday method, so the chain is unchanged).
 func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLine, error) {
 	if klines, err := dc.eastMoney.GetSinaMinuteKLine(code, scale, count); err == nil && len(klines) > 0 {
 		return klines, nil
@@ -253,10 +318,11 @@ func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLin
 	return nil, fmt.Errorf("所有分钟K线源均失败 for %s", code)
 }
 
-// GetSectors 获取板块列表。同花顺 → 东财
-// English: GetSectors fetches the sector list. THS → EastMoney.
-// GetSectors returns the board list from THS → EastMoney with a 30s cache,
-// merging THS board inventory with EastMoney realtime data when both succeed.
+// GetSectors 获取板块列表。同花顺(ths) → 东财。
+// 说明：同花顺（新）hithink 当前未提供板块列表接口（不臆造），故保持 ths→东财，
+// 东财恒为最末兜底（绝不成为第一/主源）。
+// English: GetSectors fetches the sector list. THS → EastMoney (EastMoney always last;
+// hithink has no board-list method, so the chain is unchanged).
 func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 	dc.mu.RLock()
 	if len(dc.sectorCache) > 0 && time.Since(dc.sectorCacheAt) < 30*time.Second {
@@ -342,10 +408,11 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 	return nil, fmt.Errorf("所有板块源均失败")
 }
 
-// GetSectorStocks 获取板块成分股。东财 → 同花顺
-// English: GetSectorStocks fetches sector constituents. EastMoney → THS.
-// GetSectorStocks returns a sector's constituent stocks (EastMoney first, THS
-// fallback) with a 60s per-sector cache.
+// GetSectorStocks 获取板块成分股。同花顺(ths) → 东财。
+// 说明：同花顺（新）hithink 当前未提供板块成分股接口（不臆造），故保持 ths→东财，
+// 东财恒为最末兜底（绝不成为第一/主源）。
+// English: GetSectorStocks fetches sector constituents. THS → EastMoney (EastMoney always
+// last; hithink has no board-constituent method, so the chain is unchanged).
 func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]StockInfo, error) {
 	dc.mu.RLock()
 	if c, ok := dc.sectorStockCache[sectorCode]; ok && time.Since(c.at) < 60*time.Second {

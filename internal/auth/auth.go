@@ -35,10 +35,14 @@ type User struct {
 	Username     string   `json:"username"`
 	// bcrypt 密码哈希（临时账户为空）
 	PasswordHash string   `json:"password_hash"`
-	// 认证令牌
+	// 认证令牌（§多会话迁移：仅作旧数据兼容槽位，新签发一律写入 Sessions）
 	Token        string   `json:"token,omitempty"`
 	// 令牌过期 Unix 时间戳（0 表示永不过期）
 	TokenExp     int64    `json:"token_exp,omitempty"`
+	// 多会话列表：每个登录设备一个会话（手机 App 与 Web 可同时在线互不顶踢）。
+	// §历史缺陷：此前单 token 槽位"登录即轮换"，手机/电脑任一端重新登录即把
+	// 另一端顶成 401——前端拉配置失败回退本地缓存，表现为"实盘开关自动关闭"。
+	Sessions     []Session `json:"sessions,omitempty"`
 	// 角色：admin=管理员 / user=普通用户（空按 user 处理）
 	Role         string   `json:"role,omitempty"`
 	// 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
@@ -50,6 +54,20 @@ type User struct {
 	// 账号有效期截止 Unix 时间戳（0=永久）
 	ExpiresAt    int64    `json:"expires_at,omitempty"`
 }
+
+// Session 单个登录会话：一个设备/客户端对应一条，落盘仅存令牌哈希。
+// （Session is a single login session, one per device/client; only the token hash is persisted.）
+type Session struct {
+	// 令牌 SHA-256 哈希（不落明文）
+	Token string `json:"token"`
+	// 会话过期 Unix 时间戳
+	Exp int64 `json:"exp"`
+	// 会话创建时间 Unix 时间戳（审计用）
+	CreatedAt int64 `json:"created_at,omitempty"`
+}
+
+// maxSessions 每账号最大并发会话数：超出时淘汰最旧会话（FIFO），防止 auth.json 无限膨胀。
+const maxSessions = 8
 
 // 角色常量。
 // （Role constants.）
@@ -272,6 +290,36 @@ const tokenTTL = 30 * 24 * time.Hour
 // newTokenExpiry 返回新的令牌过期时间戳。
 func newTokenExpiry() int64 { return time.Now().Add(tokenTTL).Unix() }
 
+// issueSession 为用户签发一个新会话：生成原始令牌、追加会话（哈希落盘）、
+// 超出 maxSessions 时淘汰最旧会话，并把最新会话同步到旧 Token/TokenExp 兼容槽位。
+// 返回原始令牌（仅本次响应可见，落盘的是哈希）。
+// （issueSession issues a new login session: generates a raw token, appends a hashed session,
+// evicts the oldest one past maxSessions, and mirrors the newest session to the legacy slot.）
+func issueSession(u *User, ttl time.Duration) (string, error) {
+	raw, err := generateToken()
+	if err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	now := time.Now().Unix()
+	exp := now + int64(ttl.Seconds())
+	// 惰性清理：追加前先剔除已过期会话
+	live := u.Sessions[:0]
+	for _, s := range u.Sessions {
+		if s.Exp == 0 || s.Exp > now {
+			live = append(live, s)
+		}
+	}
+	u.Sessions = append(live, Session{Token: hashToken(raw), Exp: exp, CreatedAt: now})
+	// 超上限淘汰最旧（FIFO）
+	if len(u.Sessions) > maxSessions {
+		u.Sessions = u.Sessions[len(u.Sessions)-maxSessions:]
+	}
+	// 旧槽位同步最新会话（兼容读取路径与既有语义：最新签发即生效）
+	u.Token = u.Sessions[len(u.Sessions)-1].Token
+	u.TokenExp = exp
+	return raw, nil
+}
+
 // generateToken 生成 32 字节随机令牌的十六进制字符串（密码学安全随机源）。
 // （generateToken produces a hex string of a 32-byte random token from a cryptographic RNG.）
 func generateToken() (string, error) {
@@ -383,20 +431,17 @@ func (m *Manager) Register(username, password, inviteCode string) (*User, error)
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
-	token, err := generateToken()
-	if err != nil {
-		return nil, fmt.Errorf("generate token: %w", err)
-	}
-
 	user := User{
 		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
 		Username:     username,
 		PasswordHash: string(hash),
-		Token:        hashToken(token), // §GAP6.2 落盘哈希
-		TokenExp:     newTokenExpiry(), // §A3 默认 30 天（此前永不过期）
-		Role:         RoleUser,         // 注册用户默认为普通用户
+		Role:         RoleUser, // 注册用户默认为普通用户
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
+	}
+	token, err := issueSession(&user, tokenTTL) // 首个会话（§A3 默认 30 天）
+	if err != nil {
+		return nil, err
 	}
 	m.db.Users = append(m.db.Users, user)
 	m.rawTokens[user.ID] = token                // 原始令牌仅内存，供本次响应返回
@@ -422,20 +467,17 @@ func (m *Manager) CreateTemp(duration time.Duration, inviteCode string) (*User, 
 		return nil, err
 	}
 
-	token, err := generateToken()
-	if err != nil {
-		return nil, err
-	}
-
 	user := User{
 		ID:        fmt.Sprintf("tmp_%d", time.Now().UnixNano()),
-		Username:  fmt.Sprintf("temp_%s", token[:8]),
-		Token:     hashToken(token),                // §GAP6.2 落盘哈希
-		TokenExp:  time.Now().Add(duration).Unix(), // 令牌过期时间
 		Role:      RoleUser,
 		Enabled:   true,
 		CreatedAt: time.Now().Unix(),
 	}
+	token, err := issueSession(&user, duration) // 临时账户：会话有效期=账户有效期
+	if err != nil {
+		return nil, err
+	}
+	user.Username = fmt.Sprintf("temp_%s", token[:8]) // 用户名取自令牌前缀（保持既有命名规则）
 	m.db.Users = append(m.db.Users, user)
 	m.markInviteUsedLocked(inviteCode, user.ID) // §GAP2-W2
 	m.rawTokens[user.ID] = token
@@ -469,15 +511,13 @@ func (m *Manager) Login(username, password string) (*User, error) {
 			if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
 				return nil, fmt.Errorf("wrong password")
 			}
-			// §GAP6.2 登录即轮换令牌（旧令牌立即失效）+ 哈希落盘：响应副本携带原始令牌。
-			// English: §GAP6.2 rotate the token on every login (old one invalidated immediately);
-			// only the SHA-256 hash is persisted, and the returned copy carries the raw token.
-			raw, err := generateToken()
+			// §多会话：登录签发新会话而非轮换覆盖——手机/电脑可同时在线，
+			// 旧令牌继续有效至其自然过期（此前"登录即踢旧端"导致另一端 401，
+			// 前端拉配置失败回退缓存，表现为实盘开关"自动关闭"）。
+			raw, err := issueSession(u, tokenTTL)
 			if err != nil {
-				return nil, fmt.Errorf("generate token: %w", err)
+				return nil, err
 			}
-			u.Token = hashToken(raw)
-			u.TokenExp = newTokenExpiry()
 			m.rawTokens[u.ID] = raw
 			if err := m.save(); err != nil {
 				return nil, err
@@ -511,19 +551,17 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
-	token, err := generateToken()
-	if err != nil {
-		return nil, fmt.Errorf("generate token: %w", err)
-	}
 	user := User{
 		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
 		Username:     username,
 		PasswordHash: string(hash),
-		Token:        hashToken(token), // §GAP6.2 落盘哈希
-		TokenExp:     newTokenExpiry(),
 		Role:         RoleAdmin,
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
+	}
+	token, err := issueSession(&user, tokenTTL) // 首个会话
+	if err != nil {
+		return nil, err
 	}
 	m.db.Users = append(m.db.Users, user)
 	m.db.Configs = append(m.db.Configs, ConfigEntry{UserID: user.ID, Key: "initialized", Value: "1"})
@@ -536,9 +574,10 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 }
 
 // ValidateToken 校验令牌是否有效并返回对应未过期用户。
-// TokenExp>0 且已过期时视为无效，返回 nil。
+// 多会话：先在用户的 Sessions 列表匹配；未命中时回退旧 Token 单槽位（存量 auth.json 兼容，
+// 命中后原地迁入 Sessions）。任一匹配后仍需通过会话过期、账号过期、账号启用三重校验。
 // （ValidateToken checks whether a token is valid and returns the matching, still-valid user.
-// If TokenExp>0 and the expiry has passed, it returns nil.）
+// It matches the per-device session list first, then falls back to the legacy single slot.）
 func (m *Manager) ValidateToken(token string) *User {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -547,31 +586,65 @@ func (m *Manager) ValidateToken(token string) *User {
 		return nil
 	}
 	presented := hashToken(token)
+	now := time.Now().Unix()
 	for i := range m.db.Users {
 		u := &m.db.Users[i]
+
+		// ── 路径一：多会话列表匹配（每个设备一条，哈希常量时间比较）──
+		matched := -1
+		for j := range u.Sessions {
+			if subtle.ConstantTimeCompare([]byte(u.Sessions[j].Token), []byte(presented)) == 1 {
+				matched = j
+				break
+			}
+		}
+		if matched >= 0 {
+			s := u.Sessions[matched]
+			// 会话过期：剔除并落盘，返回无效
+			if s.Exp > 0 && now > s.Exp {
+				u.Sessions = append(u.Sessions[:matched], u.Sessions[matched+1:]...)
+				if err := m.save(); err != nil {
+					log.Printf("[auth] 过期会话清理落盘失败: %v", err)
+				}
+				return nil
+			}
+			if u.expired() || !u.Enabled {
+				return nil
+			}
+			// 内存补记原始令牌（仅空缺时，如进程重启恢复；不覆盖最近签发记录）
+			if _, ok := m.rawTokens[u.ID]; !ok {
+				m.rawTokens[u.ID] = token
+			}
+			cp := *u
+			cp.Token = ""
+			return &cp
+		}
+
+		// ── 路径二：旧单槽位兼容（存量明文令牌命中后原地升级哈希并迁入会话列表）──
 		if u.Token == "" {
 			continue
 		}
-		// §GAP6.2 常量时间比较；存量明文令牌（auth.json 旧数据）直接比对命中后原地升级哈希
 		matchHash := subtle.ConstantTimeCompare([]byte(u.Token), []byte(presented)) == 1
 		matchPlain := !matchHash && subtle.ConstantTimeCompare([]byte(u.Token), []byte(token)) == 1
 		if matchHash || matchPlain {
-			if u.TokenExp > 0 && time.Now().Unix() > u.TokenExp {
+			if u.TokenExp > 0 && now > u.TokenExp {
 				return nil
 			}
-			if u.expired() {
-				return nil
-			}
-			if !u.Enabled {
+			if u.expired() || !u.Enabled {
 				return nil
 			}
 			if matchPlain {
 				u.Token = presented
-				if err := m.save(); err != nil {
-					log.Printf("[auth] 令牌哈希迁移落盘失败: %v", err)
-				}
 			}
-			m.rawTokens[u.ID] = token // 内存补记原始令牌（UserToken 消费）
+			// 迁入多会话列表（继承原过期时间；0=永不过期原样保留）
+			u.Sessions = append(u.Sessions, Session{Token: u.Token, Exp: u.TokenExp, CreatedAt: now})
+			if err := m.save(); err != nil {
+				log.Printf("[auth] 令牌会话迁移落盘失败: %v", err)
+			}
+			// 内存补记原始令牌（仅空缺时，如进程重启恢复；不覆盖最近签发记录）
+			if _, ok := m.rawTokens[u.ID]; !ok {
+				m.rawTokens[u.ID] = token
+			}
 			cp := *u
 			cp.Token = ""
 			return &cp
@@ -715,7 +788,7 @@ func (m *Manager) IsAdmin(userID string) bool {
 	return false
 }
 
-// ChangePassword 修改用户密码（bcrypt 哈希）并重新签发令牌，使旧 token 失效。
+// ChangePassword 修改用户密码（bcrypt 哈希）并吊销全部会话：所有设备需重新登录。
 func (m *Manager) ChangePassword(userID, newPassword string) error {
 	if newPassword == "" {
 		return fmt.Errorf("password required")
@@ -724,25 +797,30 @@ func (m *Manager) ChangePassword(userID, newPassword string) error {
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
-	token, err := generateToken()
-	if err != nil {
-		return fmt.Errorf("generate token: %w", err)
-	}
 	return m.updateUser(userID, func(u *User) error {
 		u.PasswordHash = string(hash)
-		u.Token = hashToken(token) // §GAP6.2 重签令牌落盘哈希（旧 token 立即失效）
+		// 吊销全部会话与旧槽位令牌（密码变更后旧 token 一律失效，需重新登录）
+		u.Sessions = nil
+		u.Token = ""
+		u.TokenExp = 0
 		delete(m.rawTokens, userID)
 		return nil
 	})
 }
 
-// SetEnabled 启用/禁用账号；禁用后登录与令牌校验均被拒绝。
+// SetEnabled 启用/禁用账号；禁用即吊销全部会话（所有设备下线），重新启用后需重新登录。
 func (m *Manager) SetEnabled(userID string, enabled bool) error {
 	return m.updateUser(userID, func(u *User) error {
 		if u.Role == RoleAdmin && !enabled {
 			return fmt.Errorf("cannot disable admin")
 		}
 		u.Enabled = enabled
+		if !enabled {
+			u.Sessions = nil
+			u.Token = ""
+			u.TokenExp = 0
+			delete(m.rawTokens, userID)
+		}
 		return nil
 	})
 }
@@ -799,16 +877,10 @@ func (m *Manager) CreateUser(username, password, role string, perms []string, ex
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
-	token, err := generateToken()
-	if err != nil {
-		return nil, fmt.Errorf("generate token: %w", err)
-	}
 	user := User{
 		ID:           fmt.Sprintf("u_%d", time.Now().UnixNano()),
 		Username:     username,
 		PasswordHash: string(hash),
-		Token:        hashToken(token), // §GAP6.2 落盘哈希（§GAP2-W1 补齐：CreateUser 此前是唯一漏掉哈希的签发路径）
-		TokenExp:     newTokenExpiry(), // §A3 默认 30 天
 		Role:         role,
 		Perms:        perms,
 		Enabled:      true,
@@ -817,8 +889,12 @@ func (m *Manager) CreateUser(username, password, role string, perms []string, ex
 	if expiresDays > 0 {
 		user.ExpiresAt = time.Now().AddDate(0, 0, expiresDays).Unix()
 	}
+	token, err := issueSession(&user, tokenTTL) // 首个会话（§A3 默认 30 天）
+	if err != nil {
+		return nil, err
+	}
 	m.db.Users = append(m.db.Users, user)
-	m.rawTokens[user.ID] = token // §GAP2-W1 原始令牌仅内存（对齐 Register/Login 的哈希化口径）
+	m.rawTokens[user.ID] = token // 原始令牌仅内存（对齐 Register/Login 的哈希化口径）
 	if err := m.save(); err != nil {
 		return nil, err
 	}

@@ -258,6 +258,7 @@ func (s *Server) longOnFor(userID string) bool {
 	return true
 }
 
+// shortOnFor 返回指定账号的做空开关（账号级覆盖优先，默认仅做多：做空关）。
 func (s *Server) shortOnFor(userID string) bool {
 	if s.cfg != nil {
 		return s.cfg.GetLongShortConfigFor(userID).ShortEnabled
@@ -354,9 +355,13 @@ func (s *Server) registerRoutes() {
 	// 引擎与新闻管线的客户端（归因上下文外送/计费劫持），故写权限收敛到 admin；普通用户 GET 只读。
 	s.mux.HandleFunc("POST /api/config/llm", s.adminMiddleware(s.handleSetLLMConfig))
 
-	// QMT 实盘配置：读=登录账号只读自己的；写=admin（实盘资金参数属高危面，与 LLM 同口径收敛）
+	// QMT 实盘配置：读写均按登录账号隔离（per-user QMT 配置，Get/SetQMTConfigFor）。
+	// 历史缺陷：写路径曾挂 adminMiddleware——量化页面对所有登录用户开放，但非 admin
+	// 打开开关 POST 恒 403，配置从未落盘；刷新后 loadConfig 拉回默认值，表现为
+	// "实盘开关每次刷新都被关闭"。配置本身账号级隔离 + 前端二次确认 + 引擎纪律
+	// （日笔数/预算/熔断）多层防护，登录用户保存自己的实盘配置不再要求 admin。
 	s.mux.HandleFunc("GET /api/config/qmt", s.authMiddleware(s.handleGetQMTConfig))
-	s.mux.HandleFunc("POST /api/config/qmt", s.adminMiddleware(s.handleSetQMTConfig))
+	s.mux.HandleFunc("POST /api/config/qmt", s.authMiddleware(s.handleSetQMTConfig))
 
 	// 模拟盘（纸面交易）：独立于真实持仓，实时价撮合 + 净值曲线 + 信号质量统计
 	s.mux.HandleFunc("GET /api/paper/state", s.authMiddleware(s.handlePaperState))
@@ -430,6 +435,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/stage-records", s.authMiddleware(s.handleStageRecords))
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
+	s.mux.HandleFunc("GET /api/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
+	s.mux.HandleFunc("GET /api/research/task/{id}/log", s.authMiddleware(s.handleResearchTaskLog))
 	s.mux.HandleFunc("GET /api/research/progress", s.permMiddleware(auth.PermResearchApprove, s.handleResearchProgress))
 	s.mux.HandleFunc("GET /api/research/factors", s.authMiddleware(s.handleResearchFactors))
 	s.mux.HandleFunc("GET /api/research/candidates", s.permMiddleware(auth.PermResearchApprove, s.handleResearchCandidates))
@@ -823,6 +830,8 @@ func userFromContext(r *http.Request) *auth.User {
 	return u
 }
 
+// authMiddleware 认证中间件：校验 Authorization Bearer 令牌（兼容有无 "Bearer " 前缀），
+// 有效时将用户注入请求上下文（ctxUserKey）后放行，否则 401。
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("Authorization")
@@ -1390,6 +1399,26 @@ func maskSecret(k string) string {
 // English: reports whether the submitted value is a masked sentinel echoed from GET.
 func isMaskedSecret(k string) bool {
 	return k == "***" || strings.Contains(k, "…")
+}
+
+// validateGatewayURL 校验量化实盘网关地址（内部可信端点，与公网外呼不同）：
+// 仅要求 http/https 协议，允许环回/私网地址（网关就部署在首尔机本机 127.0.0.1 或
+// 广州执行机内网，属预期内网拓扑，不能按公网外呼的 fail-closed 标准拒绝）。
+// 用于 POST /api/config/qmt 的 gateway_url 字段。
+// English: validates the (internal, trusted) QMT gateway URL — http(s) only, and loopback/
+// private addresses are permitted because the gateway intentionally lives on localhost/LAN.
+func validateGatewayURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("URL 解析失败")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("仅允许 http/https")
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("缺少主机名")
+	}
+	return nil
 }
 
 // validatePublicURL §GAP2-W2 外呼 URL 校验（scrm P1-f 同源思路）：

@@ -25,6 +25,41 @@ import (
 	"golang.org/x/text/transform"
 )
 
+// cst 中国时区（Asia/Shanghai，UTC+8）。A 股所有时间戳（开盘/收盘/分钟 K 等）均以此为准，
+// 必须用 time.ParseInLocation 配合 cst 解析，禁止直接用 time.Parse（默认 UTC），
+// 否则分钟 K 的时间戳会错 8 小时。LoadLocation 在部分运行环境（如裁剪镜像）可能缺失，
+// 此时退回固定 UTC+8 偏移，保证分钟 K 不错位。
+// cst is the China time zone (Asia/Shanghai, UTC+8). Every A-share timestamp must be
+// parsed with time.ParseInLocation(..., cst); using time.Parse (UTC) drifts minute K by 8h.
+var cst = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		// 时区数据库缺失时退回固定 +8 偏移，保证分钟K不跑偏。
+		return time.FixedZone("CST", 8*3600)
+	}
+	return loc
+}()
+
+// klineFQT 东方财富 K 线复权参数：1 = 前复权(qfq)。
+// 全系统 K 线统一使用前复权，禁止与 Tushare 后复权(hfq)/不复权混算，
+// 否则均线、涨跌幅、PE 等口径错乱（如东财 qfq 与 Tushare hfq 直接相减毫无意义）。
+// klineFQT is the EastMoney K-line adjustment flag: 1 = forward-adjusted (qfq).
+// The whole system standardizes on qfq; mixing with hfq/unadjusted corrupts MA/pct math.
+const klineFQT = "1"
+
+// ── 东方财富单点熔断参数 ──
+// 东财是当前板块/资金流/指数/IPO 等多类数据的唯一主源且无降级保护，
+// 连续失败达到阈值即进入熔断窗口，窗口内所有东财调用快速失败并触发既有降级/缓存路径，
+// 避免长时间挂起拖垮全链路。
+// EastMoney single-point circuit-breaker: on N consecutive failures we open the breaker
+// for a cooldown window, during which EM calls fast-fail and fall back to secondary sources.
+
+// emBreakerThreshold 连续失败达到该次数即触发熔断。
+const emBreakerThreshold = 5
+
+// emBreakerCooldown 熔断窗口时长（窗口内快速失败）。
+const emBreakerCooldown = 30 * time.Second
+
 // htmlTagRe 匹配 HTML 标签（含属性），用于正文清洗。
 // htmlTagRe matches HTML tags (with attributes) for article body cleanup.
 var htmlTagRe = regexp.MustCompile(`(?s)<[^>]+>`)
@@ -71,6 +106,16 @@ type MarketAPI struct {
 	peMu  sync.Mutex              // 保护 PE 缓存的读写
 	peTTL time.Duration           // PE 缓存有效期（PE 变动低频）
 	peMap map[string]peCacheEntry // code → PE 缓存条目
+
+	emBreakerMu sync.Mutex            // 保护东财熔断计数器的读写
+	emBreakers  map[string]*emBreaker // 按接口路径(scope)隔离的熔断器，避免单接口故障拖垮其他接口
+}
+
+// emBreaker 单接口熔断器状态：记录该接口连续失败次数与熔断到期时间。
+// emBreaker is the per-endpoint breaker state: consecutive failure count and open-until time.
+type emBreaker struct {
+	failStreak int       // 该接口连续失败次数（成功则清零）
+	openUntil  time.Time // 熔断窗口到期时间，未到期直接快速失败
 }
 
 // peCacheEntry PE 缓存条目。
@@ -144,6 +189,7 @@ func NewMarketAPI() *MarketAPI {
 		quoteCache: make(map[string]cachedQuote),
 		peMap:      make(map[string]peCacheEntry),
 		peTTL:      10 * time.Minute,
+		emBreakers: make(map[string]*emBreaker),
 	}
 }
 
@@ -154,20 +200,79 @@ func (m *MarketAPI) SetTransport(rt http.RoundTripper) {
 	m.client.Transport = rt
 }
 
+// emAllow 判断是否放行某个东财接口(scope)的调用。各接口熔断器相互独立：
+// 某接口连续失败超阈值进入熔断窗口后，仅该接口快速失败，不影响其他接口。
+// 这样单一接口故障（如快照接口）不会拖垮板块成分股等依赖其他接口的功能。
+// emAllow reports whether a single EastMoney endpoint (scope) is permitted. Breakers are
+// independent per endpoint so one dead endpoint can't disable the others.
+func (m *MarketAPI) emAllow(scope string) bool {
+	m.emBreakerMu.Lock()
+	defer m.emBreakerMu.Unlock()
+	b := m.emBreakers[scope]
+	if b == nil {
+		return true
+	}
+	return time.Now().After(b.openUntil)
+}
+
+// emRecord 记录某个东财接口(scope)的调用结果，驱动该接口自身的熔断：
+// 失败累计连续次数，达阈值即进入熔断窗口；成功则清零计数。
+// 需配合 emAllow 在调用前判断是否快速失败。
+// emRecord drives the per-endpoint breaker: increments the streak on failure and trips it
+// at the threshold; resets on success. Pair with emAllow(scope) before each call.
+func (m *MarketAPI) emRecord(scope string, err error) {
+	m.emBreakerMu.Lock()
+	defer m.emBreakerMu.Unlock()
+	b := m.emBreakers[scope]
+	if b == nil {
+		b = &emBreaker{}
+		m.emBreakers[scope] = b
+	}
+	if err == nil {
+		b.failStreak = 0
+		return
+	}
+	b.failStreak++
+	if b.failStreak >= emBreakerThreshold {
+		b.openUntil = time.Now().Add(emBreakerCooldown)
+		log.Printf("[market] 东财熔断触发(%s)：连续 %d 次失败，接下来 %v 内快速失败并降级", scope, b.failStreak, emBreakerCooldown)
+	}
+}
+
 // getWithHeaders 发起带浏览器头部模拟的 GET 请求。
 // 解决东财 CDN 对无头请求的 geo-block / anti-crawler 封锁。
+// 内置单点熔断：处于熔断窗口内直接快速失败，避免挂起拖垮全链路。
 // getWithHeaders issues a GET with simulated browser headers to bypass
-// EastMoney CDN geo-blocking / anti-crawler filters.
+// EastMoney CDN geo-blocking / anti-crawler filters, wrapped with the
+// single-point circuit breaker so callers can fast-fail during outages.
 func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) {
+	// 以请求路径作为熔断 scope，使各东财接口独立熔断、互不拖累。
+	scope := url
+	if u, perr := urlpkg.Parse(url); perr == nil {
+		scope = u.Path
+	}
+	// 熔断窗口内直接快速失败，触发上层既有降级/缓存路径，不发起网络请求。
+	if !m.emAllow(scope) {
+		return nil, fmt.Errorf("eastmoney circuit-breaker open (%s): fast-fail (cooldown)", scope)
+	}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
+		m.emRecord(scope, err)
 		return nil, err
 	}
 	req.Header.Set("User-Agent", emUserAgent)
 	req.Header.Set("Referer", referer)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	return m.client.Do(req)
+	resp, err := m.client.Do(req)
+	if err != nil {
+		// HTTP 层失败：累计该接口熔断计数。
+		m.emRecord(scope, err)
+		return nil, err
+	}
+	// 到达 HTTP 层即视为东财连通，清零该接口熔断计数（业务层解析错误由调用方另判）。
+	m.emRecord(scope, nil)
+	return resp, nil
 }
 
 // stripSuffix 剥离股票代码的交易所后缀（.SH / .SZ / .BJ）。
@@ -835,7 +940,8 @@ func (m *MarketAPI) GetSinaMinuteKLine(code string, scale, count int) ([]KLine, 
 		if r.Day == "" {
 			continue
 		}
-		t, err := time.ParseInLocation("2006-01-02 15:04:05", r.Day, time.Local)
+		// 一律按中国时区 cst 解析（显式 Asia/Shanghai），避免依赖运行机 time.Local 漂移。
+		t, err := time.ParseInLocation("2006-01-02 15:04:05", r.Day, cst)
 		if err != nil {
 			continue
 		}
@@ -876,7 +982,8 @@ func parseSinaKLine(body []byte) ([]KLine, error) {
 		if r.Day == "" {
 			continue
 		}
-		t, err := time.Parse("2006-01-02", r.Day)
+		// 按中国时区 cst 解析日期（与分钟K保持一致口径，避免跨源时间比较错位）。
+		t, err := time.ParseInLocation("2006-01-02", r.Day, cst)
 		if err != nil {
 			continue
 		}
@@ -913,8 +1020,13 @@ func (m *MarketAPI) GetKLine(code, period string, count int) ([]KLine, error) {
 }
 
 // klineBySecID 按给定 secid 拉 K 线（个股/指数共用；§D1 指数 MA20 用指数 secid）。
+// 复权口径统一：强制前复权(qfq, klineFQT=1)。全系统 K 线只能走此入口，
+// 严禁在此混用后复权(hfq)或不复权，否则与下游均线/涨跌幅计算口径冲突。
+// klineBySecID pulls K-lines by secid (shared by stocks/index). Adjustment is pinned to
+// forward-adjusted (qfq); mixing hfq/unadjusted here corrupts downstream MA/pct math.
 func (m *MarketAPI) klineBySecID(sid, period string, count int) ([]KLine, error) {
-	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/kline/get?secid=%s&klt=%s&lmt=%d&fqt=1", sid, period, count)
+	// fqt 参数恒为前复权(qfq)，由 klineFQT 常量统一注入，杜绝跨源复权混算。
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/kline/get?secid=%s&klt=%s&lmt=%d&fqt=%s", sid, period, count, klineFQT)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
@@ -947,11 +1059,14 @@ func parseEastMoneyKLine(rawLines []string) ([]KLine, error) {
 		if len(parts) < 7 {
 			continue
 		}
-		t, err := time.Parse("2006-01-02", parts[0])
+		// 统一用中国时区 cst 解析（禁止 time.Parse 默认 UTC，否则分钟K错 8 小时）。
+		// 日线仅日期 "2006-01-02"；分钟线形如 "2006-01-02 15:04"。
+		// Parse in the China zone cst (never time.Parse's UTC, which drifts minute K by 8h).
+		// Daily rows are date-only "2006-01-02"; minute rows look like "2006-01-02 15:04".
+		t, err := time.ParseInLocation("2006-01-02", parts[0], cst)
 		if err != nil {
-			// 分钟级别行形如 "2006-01-02 15:04"，尝试日期时间格式
-			// minute-level rows look like "2006-01-02 15:04"; try the datetime format
-			t, err = time.Parse("2006-01-02 15:04", parts[0])
+			// 分钟级别行带时分，回退到日期时间格式（仍按 cst 解析，消灭 8 小时错位）。
+			t, err = time.ParseInLocation("2006-01-02 15:04", parts[0], cst)
 			if err != nil {
 				continue
 			}
@@ -1424,6 +1539,8 @@ func (m *MarketAPI) GetIndexData() (indexPrice float64, ma20 float64, upCount, d
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
+		// 指数行情为东财单点主源，失败需告警并快速返回，交由上层降级（无第二源，需补第二源）。
+		log.Printf("[market] 东财指数行情获取失败，快速返回错误（需补第二源）: %v", err)
 		return 0, 0, 0, 0, fmt.Errorf("eastmoney index http: %v", err)
 	}
 	defer resp.Body.Close()
@@ -1506,6 +1623,8 @@ func (m *MarketAPI) GetStockMoneyFlow(code string) (*CapitalFlow, error) {
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
+		// 资金流向为东财单点主源，失败需告警并快速返回，交由上层降级（无第二源，需补第二源）。
+		log.Printf("[market] 东财个股资金流向获取失败，快速返回错误（需补第二源）: %v", err)
 		return nil, fmt.Errorf("eastmoney moneyflow http: %v", err)
 	}
 	defer resp.Body.Close()

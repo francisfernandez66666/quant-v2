@@ -63,6 +63,12 @@ type Config struct {
 	CommissionRate float64 `json:"commission_rate"` // 佣金率（默认0.00025）
 	StampTaxRate   float64 `json:"stamp_tax_rate"`  // 印花税率（仅卖出，默认0.0005）
 	MinCommission  float64 `json:"min_commission"`  // 单笔最低佣金（默认5元）
+	// ReentryCooldownMin 同票清仓后再入场冷却（分钟；§R1.4，取 paper_r12 的 reEntryTracker）。
+	// 0 = 不限制（默认，兼容旧行为）；>0 时清仓后该时间段内禁止同票再次买入，
+	// 防止"刚止损又追高"式的回马枪。可由后台 rules.paper.reentry_cooldown_min 配置。
+	// English: re-entry cooldown (minutes, §R1.4) — 0 = unlimited (legacy default); >0 blocks re-buying
+	// the same code within the window after a full close. Configurable via rules.paper.reentry_cooldown_min.
+	ReentryCooldownMin int `json:"reentry_cooldown_min"`
 }
 
 // DefaultConfig 返回模拟盘出厂默认配置。
@@ -202,6 +208,7 @@ type Trade struct {
 // 佣金 = max(成交额 × CommissionRate, MinCommission)；印花税 = 卖出成交额 × StampTaxRate（仅卖出，
 // 无最低）；费率 ≤0 视为不收（兼容既有测试/用户配置）。须持锁调用（读 cfg 快照语义）。
 
+// buyFeeLocked 计算买入佣金：成交额 × 费率（含最低佣金封底），费率≤0 视为不收。须持锁调用。
 func (e *Engine) buyFeeLocked(cost float64) float64 {
 	if e.cfg.CommissionRate <= 0 {
 		return 0
@@ -213,6 +220,7 @@ func (e *Engine) buyFeeLocked(cost float64) float64 {
 	return fee
 }
 
+// sellFeeLocked 计算卖出费用：佣金（含最低佣金封底）+ 印花税（仅卖出收取）。须持锁调用。
 func (e *Engine) sellFeeLocked(proceeds float64) float64 {
 	fee := 0.0
 	if e.cfg.CommissionRate > 0 {
@@ -392,6 +400,11 @@ type Engine struct {
 	// trading day so repeated alerts can't keep halving the position. Full closes need no dedup (natural
 	// no-op once flat).
 	trimDone map[string]string // 当日减仓去重表（code → 交易日）
+	// reEntry 同票清仓后再入场冷却追踪器（§R1.4，来自 paper_r12）。清仓时记录时间，
+	// 新开仓前置检查处调用 canReEnter 拦住冷却期内回马枪。nil 安全（未启用冷却时为 nil）。
+	// English: re-entry cooldown tracker (§R1.4, paper_r12). Records close time; the fill pre-check calls
+	// canReEnter to block re-buys inside the cooldown window after a full close. nil-safe.
+	reEntry *reEntryTracker
 }
 
 // New 创建模拟盘引擎并加载历史持久化数据。
@@ -414,6 +427,7 @@ func New(cfg Config, path string) *Engine {
 		extraPoolKeys:  make(map[string]bool),
 		positions:      make(map[string]*Position),
 		trimDone:       make(map[string]string),
+		reEntry:        newReEntryTracker(), // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
 		path:           path,
 	}
 	if path != "" {
@@ -959,6 +973,17 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 		log.Printf("[paper] 分仓纪律拒绝 %s→%s: %s", strategy, code, reason)
 		return errPoolDiscipline
 	}
+	// §R1.4 再入场冷却（接线生效，此前 reEntryTracker 为死代码）：清仓后冷却期内禁止同票再买入。
+	// 逻辑来自 paper_r12.go；参数取配置 ReentryCooldownMin（0=不限制，兼容旧行为）。
+	// 手动买入与自动撮合均经 fillLocked，故两者均受此闸门约束。
+	if e.reEntry != nil && e.cfg.ReentryCooldownMin > 0 {
+		if !e.reEntry.canReEnter(code, e.cfg.ReentryCooldownMin, now) {
+			elapsed := now.Sub(e.reEntry.lastCloseAt(code)).Minutes()
+			log.Printf("[paper] 再入场冷却拒绝 %s(%s): 清仓后 %.0f/%.0f 分钟内禁止回买",
+				code, name, elapsed, float64(e.cfg.ReentryCooldownMin))
+			return fmt.Errorf("再入场冷却中(%.0f/%.0f分钟)", elapsed, float64(e.cfg.ReentryCooldownMin))
+		}
+	}
 	explicitQty := qty > 0
 	if !explicitQty {
 		qty = int(e.cfg.FixedAmount/price/100) * 100
@@ -1092,8 +1117,11 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 		return errNoQuote
 	}
 	if _, ok := e.pools[poolKey]; !ok {
+		// §健壮性：未知池 key 不再静默回退「其他池」——静默回退会让资金被悄悄计入错误池，
+		// 既污染该池累计表现，又可能挤占其他池预算。改为显式报错，让上层（前端/调用方）可知。
 		if poolKey != "" {
-			log.Printf("[paper] 目标池 %s 不存在，手动买入回退其他池 (%s)", poolKey, code)
+			log.Printf("[paper] 手动买入拒绝 %s(%s): 目标池 %s 不存在", code, name, poolKey)
+			return fmt.Errorf("目标战法池 %s 不存在，无法买入（请先确认分池配置）", poolKey)
 		}
 		poolKey = ""
 	}
@@ -1158,8 +1186,10 @@ func (e *Engine) BuyExInPool(code, name, strategy, poolKey string, signalPrice, 
 		}
 	}
 	if _, ok := e.pools[poolKey]; !ok {
+		// §健壮性：未知池 key 显式报错（同 BuyInPool），不静默回退其他池。
 		if poolKey != "" {
-			log.Printf("[paper] 目标池 %s 不存在，手动买入回退其他池 (%s)", poolKey, code)
+			log.Printf("[paper] 手动买入(手输价)拒绝 %s(%s): 目标池 %s 不存在", code, name, poolKey)
+			return fmt.Errorf("目标战法池 %s 不存在，无法买入（请先确认分池配置）", poolKey)
 		}
 		poolKey = ""
 	}
@@ -1492,6 +1522,10 @@ func (e *Engine) sellAllLocked(p *Position, price float64, reason string) error 
 	// 清仓镜像（阶段1.2）：report 账对应记录同步平仓（pap_<code> 稳定键）。
 	// English: close mirror (unified books) — the report-book record closes in sync (stable key pap_<code>).
 	e.mirrorCloseLocked(p.Code, price, float64(qty), reason)
+	// §R1.4 再入场冷却：记录本次清仓时间，供后续 fillLocked 前置检查拦住冷却期内回马枪。
+	if e.reEntry != nil {
+		e.reEntry.recordClose(p.Code, time.Now())
+	}
 	e.persist()
 	return nil
 }

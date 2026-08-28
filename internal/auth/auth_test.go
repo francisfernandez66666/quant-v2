@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+// newTestMgr 创建临时目录中的测试认证管理器（独立 auth.json，互不污染）。
 func newTestMgr(t *testing.T) *Manager {
 	t.Helper()
 	m := NewManager(t.TempDir())
@@ -43,12 +44,12 @@ func TestRegisterLoginValidate(t *testing.T) {
 		t.Error("Login(错误密码) 应失败")
 	}
 
-	// 令牌校验（§GAP6.2 登录轮换：以登录返回的原始令牌为准）
+	// 令牌校验（§多会话：登录签发新会话，不再轮换失效旧令牌——多设备同时在线）
 	if got := m.ValidateToken(lu.Token); got == nil || got.Username != "tester" {
-		t.Error("ValidateToken 应返回对应用户(登录轮换后的令牌)")
+		t.Error("ValidateToken 应返回对应用户(登录后的新令牌)")
 	}
-	if got := m.ValidateToken(u.Token); got != nil {
-		t.Error("注册令牌在登录轮换后应失效")
+	if got := m.ValidateToken(u.Token); got == nil {
+		t.Error("注册会话令牌应仍有效（多会话共存，不互踢）")
 	}
 	if got := m.ValidateToken("bogus"); got != nil {
 		t.Error("ValidateToken(bogus) 应返回 nil")
@@ -88,11 +89,14 @@ func TestCreateTemp(t *testing.T) {
 	if _, err := m.Login(u.Username, "x"); err == nil {
 		t.Error("临时账户不应允许密码登录")
 	}
-	// 过期后令牌失效：手动把 TokenExp 改到过去
+	// 过期后令牌失效：手动把会话（及旧兼容槽位）过期时间改到过去
 	m.mu.Lock()
 	for i := range m.db.Users {
 		if m.db.Users[i].Username == u.Username {
 			m.db.Users[i].TokenExp = time.Now().Add(-time.Second).Unix()
+			for j := range m.db.Users[i].Sessions {
+				m.db.Users[i].Sessions[j].Exp = time.Now().Add(-time.Second).Unix()
+			}
 		}
 	}
 	m.mu.Unlock()
@@ -442,5 +446,76 @@ func TestTokenExpiryAndSlidingRenewal(t *testing.T) {
 	got := fresh.TokenExp
 	if got < want-60 || got > want+60 {
 		t.Fatalf("登录后令牌应续满 30 天, got %d", got)
+	}
+}
+
+// TestMultiSession 多会话核心行为：多设备同时在线互不顶踢；
+// 超出上限淘汰最旧会话；改密/禁用吊销全部会话。
+func TestMultiSession(t *testing.T) {
+	m := newTestMgr(t)
+	code, _ := m.CreateInvite()
+	if _, err := m.Register("multi", "pw", code); err != nil {
+		t.Fatal(err)
+	}
+	uid := ""
+	// 模拟 3 个设备依次登录，全部令牌应同时有效（互不顶踢）
+	toks := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		lu, err := m.Login("multi", "pw")
+		if err != nil {
+			t.Fatal(err)
+		}
+		toks = append(toks, lu.Token)
+		if m.ValidateToken(lu.Token) == nil {
+			t.Fatalf("第 %d 个设备令牌应有效", i+1)
+		}
+	}
+	for i, tk := range toks {
+		if m.ValidateToken(tk) == nil {
+			t.Errorf("设备 %d 令牌在新设备登录后应仍有效（不互踢）", i+1)
+		}
+	}
+	// 连续登录至超出上限：最早的令牌被 FIFO 淘汰，最新的有效
+	for i := 0; i < maxSessions; i++ {
+		lu, err := m.Login("multi", "pw")
+		if err != nil {
+			t.Fatal(err)
+		}
+		toks = append(toks, lu.Token)
+	}
+	// 淘汰后令牌总数不超过上限
+	m.mu.Lock()
+	n := 0
+	for i := range m.db.Users {
+		if m.db.Users[i].Username == "multi" {
+			n = len(m.db.Users[i].Sessions)
+		}
+	}
+	m.mu.Unlock()
+	if n > maxSessions {
+		t.Errorf("会话数应不超过 %d, got %d", maxSessions, n)
+	}
+	if m.ValidateToken(toks[0]) != nil {
+		t.Error("最旧会话应被 FIFO 淘汰而失效")
+	}
+	if last := toks[len(toks)-1]; m.ValidateToken(last) == nil {
+		t.Error("最新会话应有效")
+	}
+	// 改密吊销全部会话：所有设备均需重新登录（从用户列表取 ID）
+	for _, uu := range m.ListUsers() {
+		if uu.Username == "multi" {
+			uid = uu.ID
+		}
+	}
+	if err := m.ChangePassword(uid, "newpw"); err != nil {
+		t.Fatal(err)
+	}
+	for i, tk := range toks {
+		if m.ValidateToken(tk) != nil {
+			t.Errorf("改密后设备 %d 令牌应失效", i+1)
+		}
+	}
+	if _, err := m.Login("multi", "newpw"); err != nil {
+		t.Errorf("新密码应可登录: %v", err)
 	}
 }

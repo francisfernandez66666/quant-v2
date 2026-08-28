@@ -44,6 +44,12 @@ import (
 	"quant-trading-v2/internal/trading"
 )
 
+// llmDegradeCount 包级 LLM 降级计数：累计因 LLM 不可用/限流/失败而退化为中性(或规则兜底)的次数，
+// 供运维观测 LLM 异常频率（结合日志与 /api/debug）。默认相关个股/板块降级为中性占位，但保证日志可见。
+// （llmDegradeCount is a package-level counter of LLM-degradation events (LLM down/throttled/failed) where
+// affected stocks/sectors fall back to a neutral placeholder; it lets ops monitor LLM anomaly frequency.）
+var llmDegradeCount int64
+
 // Engine 顶层编排引擎，持有全部子代理引用与利好/利空开关。
 // 它是唯一被允许跨模块调用的对象：把新闻流水线、板块验证、战法扫描与信号聚合串联成一条完整链路。
 type Engine struct {
@@ -127,6 +133,16 @@ func (e *Engine) LastRunTiming() *RunTiming {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.lastTiming
+}
+
+// recordLLMDegrade 累计一次 LLM 降级事件并打出结构化告警（原因 + 影响条数 + 累计次数）。
+// 用于 sector 解码/归因或 D1 评分因 LLM 故障而默认中性占位时，保证日志可见、便于运维发现 LLM 异常。
+// （recordLLMDegrade records one LLM-degradation event and logs a structured alert (reason + affected count
+// + cumulative count), used when sector decode/attribution or D1 scoring silently falls back to neutral due
+// to LLM failure, keeping it visible to operators.）
+func (e *Engine) recordLLMDegrade(reason string, affected int) {
+	n := atomic.AddInt64(&llmDegradeCount, 1)
+	log.Printf("[engine][LLM降级#%d] %s, 影响条数=%d", n, reason, affected)
 }
 
 // LastD1Scores 返回主循环最近一轮 D1 评分结果（副本），含 RetryPending 标记，
@@ -311,6 +327,8 @@ type signalRecordFile struct {
 }
 
 // New 创建顶层编排引擎。
+// New 组装量化引擎主实例：注入行情/新闻/战法/板块/对抗等各子系统与展示聚合器，
+// 并按 dataDir 初始化各持久化文件路径（dataDir 为空时不落盘，纯内存模式）。
 func New(
 	marketAPI *data.MarketAPI,
 	newsAgent *newsagent.Agent,
@@ -2470,9 +2488,17 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	var verifiedBull, verifiedBear []sector_agent.VerifiedSector
 	if e.LongEnabled() {
 		verifiedBull = e.sectorAgent.Verify(sr.HotSectors)
+		// 板块解码/归因失败降级检测：输入有热点板块却验证出 0 个，说明 LLM/板块解析异常，
+		// 板块默认退化为中性(无信号)。记告警 + 计入降级计数，保证日志可见而非静默吞掉。
+		if len(sr.HotSectors) > 0 && len(verifiedBull) == 0 {
+			e.recordLLMDegrade(fmt.Sprintf("板块验真失败: 输入%d个利好板块验证为0(解码/归因异常, 默认中性无信号)", len(sr.HotSectors)), len(sr.HotSectors))
+		}
 	}
 	if e.ShortEnabled() {
 		verifiedBear = e.sectorAgent.Verify(sr.BearSectors)
+		if len(sr.BearSectors) > 0 && len(verifiedBear) == 0 {
+			e.recordLLMDegrade(fmt.Sprintf("板块验真失败: 输入%d个利空板块验证为0(解码/归因异常, 默认中性无信号)", len(sr.BearSectors)), len(sr.BearSectors))
+		}
 	}
 	_verifyT := time.Since(_stepVerify)
 
@@ -2538,6 +2564,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		if d.RetryPending {
 			nextRetry[code] = true
 		}
+	}
+	// LLM 评分失败降级检测：失败个股本轮无 D1 分(等价于中性占位 0 分)，记告警 + 计入降级计数，
+	// 保证日志可见（而非静默置 0），失败股并入下轮重试队列继续尝试真实 LLM 评分。
+	if len(nextRetry) > 0 {
+		e.recordLLMDegrade(fmt.Sprintf("D1 LLM 评分失败 %d 只, 本轮降级为中性占位并进入重试队列", len(nextRetry)), len(nextRetry))
 	}
 	e.mu.Lock()
 	e.lastD1Scores = d1Scores

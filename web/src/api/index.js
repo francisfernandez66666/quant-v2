@@ -1136,6 +1136,23 @@ export async function fetchResearchProgress() {
   return request('/api/research/progress')
 }
 
+/** 获取研究调度可见性快照（GET /api/scheduler/status） */
+/** Fetch the scheduler visibility snapshot (GET /api/scheduler/status) */
+// 返回 researchd 每 30s 写入的调度状态：enabled / beijing_now / in_trading_window /
+// mem_avail_mb / mem_gate_open / busy / reason，用于前端直接解释"为何卡排队"。
+// Returns researchd's 30s visibility snapshot so the UI can explain why tasks are queued.
+export async function getSchedulerStatus() {
+  return request('/api/scheduler/status')
+}
+
+/** 获取某条研究/回测任务的运行日志（GET /api/research/task/{id}/log） */
+/** Fetch a research/backtest task's run log (GET /api/research/task/{id}/log) */
+// 返回 { exists: bool, log: string }——researchd 把子进程输出写到 QUANT_DATA_DIR/task_logs/task_<id>.log，
+// 前端弹窗直接展示，免去 SSH 翻服务器。Returns the per-task log so the UI can show it without server access.
+export async function getResearchTaskLog(id) {
+  return request('/api/research/task/' + id + '/log')
+}
+
 /** 获取全部因子元数据（GET /api/research/factors） */
 /** Fetch factor metadata (GET /api/research/factors) */
 // 返回 { factors: [{ id, name, cat, desc }, ...] }，供自动研究页把因子规则渲染成中文可读文案

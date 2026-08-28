@@ -407,18 +407,20 @@ func parseTHSLine(body []byte, isMinute bool) ([]KLine, error) {
 		var err error
 		if isMinute {
 			if len(parts[0]) >= 15 {
-				// "yyyyMMddHHmmss" 或 "yyyyMMdd HH:MM"
-				t, err = time.ParseInLocation("20060102150405", parts[0], time.Local)
+				// "yyyyMMddHHmmss" 或 "yyyyMMdd HH:MM"，统一按中国时区 cst 解析。
+				t, err = time.ParseInLocation("20060102150405", parts[0], cst)
 				if err != nil {
-					t, err = time.ParseInLocation("20060102 15:04", parts[0], time.Local)
+					t, err = time.ParseInLocation("20060102 15:04", parts[0], cst)
 				}
 			} else {
-				t, err = time.Parse("2006-01-02", parts[0])
+				// 分钟级别短格式仍按中国时区 cst 解析，消灭 8 小时错位。
+				t, err = time.ParseInLocation("2006-01-02", parts[0], cst)
 			}
 		} else {
-			t, err = time.Parse("2006-01-02", parts[0])
+			// 日线按中国时区 cst 解析，与东财/新浪K线口径一致。
+			t, err = time.ParseInLocation("2006-01-02", parts[0], cst)
 			if err != nil {
-				t, err = time.Parse("20060102", parts[0])
+				t, err = time.ParseInLocation("20060102", parts[0], cst)
 			}
 		}
 		if err != nil {

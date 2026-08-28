@@ -186,13 +186,15 @@ func parseTencentKLine(rows [][]string, isMinute bool) ([]KLine, error) {
 		var t time.Time
 		var err error
 		if isMinute {
+			// 分钟K按中国时区 cst 解析，消灭 8 小时错位（不再依赖运行机 time.Local）。
 			if len(r[0]) >= 12 {
-				t, err = time.ParseInLocation("200601021504", r[0][:12], time.Local)
+				t, err = time.ParseInLocation("200601021504", r[0][:12], cst)
 			} else {
-				t, err = time.ParseInLocation("20060102", r[0][:8], time.Local)
+				t, err = time.ParseInLocation("20060102", r[0][:8], cst)
 			}
 		} else {
-			t, err = time.Parse("2006-01-02", r[0])
+			// 日线按中国时区 cst 解析，与东财/新浪K线口径一致。
+			t, err = time.ParseInLocation("2006-01-02", r[0], cst)
 		}
 		if err != nil {
 			continue

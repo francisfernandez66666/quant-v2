@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -51,6 +52,7 @@ const researchStart = "20230801"
 // Scheduler 研究任务队列唯一执行器：30s tick 检查会话门控并驱动队列消费。
 type Scheduler struct {
 	cfgPath   string // config.json 路径
+	dataDir   string // 数据目录（scheduler_status.json 落盘用）
 	statePath string // research_state.json 路径（展示兼容状态）
 	// nowFn 可注入时钟：测试用 setNow 替换。§flaky 修复——字段自身以 nowMu 保护，
 	// 此前后台排水 goroutine（tryStartNext 自驱）与测试改写 s.now 存在数据竞争。
@@ -98,6 +100,7 @@ func New(dataDir, cfgPath, statePath string) *Scheduler {
 	}
 	return &Scheduler{
 		cfgPath:   cfgPath,
+		dataDir:   dataDir,
 		statePath: statePath,
 		nowFn:     time.Now,
 		failCool:  make(map[int64]time.Time),
@@ -149,6 +152,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // tick 单次调度检查：读配置 → 会话分派（盘后门控在 workerTick 内统一执行）。
+// 每次检查结束都写一份可见性快照（scheduler_status.json），让前端/API 能直接回答
+// "为何卡排队"，不再依赖翻 researchd 原始日志。English: every tick also writes a
+// visibility snapshot so the UI can explain why tasks are queued without server logs.
 func (s *Scheduler) tick() {
 	cfg := config.LoadSchedulerConfig(s.cfgPath)
 	// §数据源路由装配（热生效）：primary_source=hithink 时回测取数优先 ths_ 表；
@@ -158,6 +164,7 @@ func (s *Scheduler) tick() {
 	now := s.nowTime()
 	if !cfg.Enabled {
 		s.preemptCurrent("调度器已禁用")
+		s.writeStatus(cfg, now)
 		return
 	}
 	if data.IsTradingWindow(now) {
@@ -165,9 +172,81 @@ func (s *Scheduler) tick() {
 		s.preemptCurrent("交易时段开始")
 		s.trimInSession(cfg, now)
 		s.maybeTradingDataload(cfg, now)
+		s.writeStatus(cfg, now)
 		return
 	}
 	s.workerTick(cfg, now)
+	s.writeStatus(cfg, now)
+}
+
+// SchedulerStatus 调度可见性快照（落 scheduler_status.json）：前端/API 据此展示"为何卡排队"，
+// 不再依赖翻 researchd 原始日志。English: visibility snapshot — lets the UI explain why tasks
+// are queued (disabled / trading window / memory gate / busy / empty) without server logs.
+type SchedulerStatus struct {
+	Ts              int64  `json:"ts"`               // 快照时间戳（unix 秒）
+	Enabled         bool   `json:"enabled"`          // 调度器是否启用
+	BeijingNow      string `json:"beijing_now"`      // 北京时间（用于核对交易时段）
+	InTradingWindow bool   `json:"in_trading_window"`// 当前是否处于交易窗口（9:15-15:00）
+	NightlyEligible bool   `json:"nightly_eligible"` // 是否处于可研究时段（盘后/休市）
+	MemAvailMB      int    `json:"mem_avail_mb"`      // 系统可用内存（MB，-1=无法读取）
+	MemGateOpen     bool   `json:"mem_gate_open"`     // 内存闸门是否放行
+	Busy            bool   `json:"busy"`              // 是否有任务在跑（唯一槽位占用）
+	BusyTask        string `json:"busy_task,omitempty"` // 当前运行任务（#id(type)）
+	Reason          string `json:"reason"`           // 人类可读的"当前为何未出队"原因
+}
+
+// writeStatus 把调度可见性快照落盘（scheduler_status.json），供 quant API 读取后前端展示。
+// 综合 enabled / 交易窗口 / 内存闸门 / 槽位占用 / 队列是否为空，给出唯一的可执行结论。
+// English: writes the visibility snapshot so the UI can state exactly why nothing is dequeuing.
+func (s *Scheduler) writeStatus(cfg config.SchedulerConfig, now time.Time) {
+	mem := readMemAvailableMB()
+	s.mu.Lock()
+	busy := s.busy
+	busyTask := ""
+	if s.curTask != nil {
+		busyTask = fmt.Sprintf("#%d(%s)", s.curTask.ID, s.curTask.Type)
+	}
+	s.mu.Unlock()
+	st := SchedulerStatus{
+		Ts:              now.Unix(),
+		Enabled:         cfg.Enabled,
+		BeijingNow:      cntime.In(now).Format("2006-01-02 15:04:05"),
+		InTradingWindow: data.IsTradingWindow(now),
+		NightlyEligible: !data.IsTradingWindow(now),
+		MemAvailMB:      mem,
+		MemGateOpen:     memGateOpen(cfg),
+		Busy:            busy,
+		BusyTask:        busyTask,
+	}
+	switch {
+	case !cfg.Enabled:
+		st.Reason = "调度器已禁用(enabled=false)：请检查 config.json 的 rules.scheduler.enabled"
+	case data.IsTradingWindow(now):
+		st.Reason = "当前为交易时段(9:15-15:00)，按设计盘后/休市才执行"
+	case busy:
+		st.Reason = "正在执行任务 " + busyTask + "（唯一槽位占用中）"
+	case !st.MemGateOpen:
+		thresh := cfg.MinFreeMemMB
+		if thresh <= 0 {
+			thresh = memGateDefaultMB
+		}
+		st.Reason = fmt.Sprintf("内存闸门拦截：MemAvailable=%dMB < %dMB，任务留队等待", mem, thresh)
+	default:
+		// 其余情况：开库看队列是否有可出队任务（区分"队列为空"与"异常未认领"）。
+		if db := s.openStore(cfg); db != nil {
+			if t, err := db.DequeueHighestTask(); err == nil && t != nil {
+				st.Reason = "可出队（队列有任务待执行）"
+			} else {
+				st.Reason = "队列为空（无可执行任务）"
+			}
+		} else {
+			st.Reason = "队列状态未知（打开队列表失败）"
+		}
+	}
+	raw, _ := json.MarshalIndent(st, "", "  ")
+	if s.dataDir != "" {
+		_ = data.AtomicWrite(filepath.Join(s.dataDir, "scheduler_status.json"), raw, 0644)
+	}
 }
 
 // trimInSession 盘中内存治理：活跃时段对 researchd 自身 GC+FreeOSMemory 归还堆内存。

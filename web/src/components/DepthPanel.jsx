@@ -1,62 +1,43 @@
 // ── 盘口面板组件 DepthPanel.jsx ──
-// 展示个股买卖五档盘口、现价涨跌与委比/封单等派生因子，基于 Canvas 绘制。
+// Canvas 展示个股买卖盘口（最多十档）、现价涨跌与委比/封单等派生因子。
+// 自动按实际档位数撑高，避免行距过密；无数据的档位自动隐藏。
 import React, { useState, useEffect, useRef } from 'react'
 import * as api from '../api/index.js'
 import './DepthPanel.css'
 
-// 配色（与 Vue 源完全一致）
 const C = {
-  bg: '#f7f8fa',
-  lv: '#5b6b85',
-  vol: '#5b6b85',
-  nowBg: '#eef2f7',
-  now: '#e8f0fe',
-  ask: '#3ddc84',   // 卖盘绿
-  bid: '#ff6b5a',   // 买盘红
-  up: '#ff6b5a',
-  down: '#3ddc84',
-  src: '#5b8ff9',
+  bg: '#ffffff',
+  lv: '#606266',
+  vol: '#909399',
+  nowBg: '#f5f7fa',
+  ask: '#16a34a',
+  bid: '#f5222d',
+  up: '#f5222d',
+  down: '#16a34a',
+  src: '#1677ff',
 }
 
-/**
- * 格式化盘口价格为两位小数字符串，空/零值显示 "--"。
- * @param {number} v 价格
- * @returns {string}
- */
-// 格式化价格，空值显示 --
 function fmtPrice(v) {
   const n = Number(v) || 0
   return n ? n.toFixed(2) : '--'
 }
-/**
- * 格式化盘口量为中文单位（万），空/零值显示 "--"。
- * @param {number} v 委托量
- * @returns {string} 例如 "1.2万" / "--"
- */
-// 格式化盘口量为中文单位
 function fmtVol(v) {
   const n = Number(v) || 0
   if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'
   return n ? String(Math.round(n)) : '--'
 }
 
-/**
- * 盘口面板组件
- * @param {{code:string, name?:string, height?:number}} props
- * @returns {JSX.Element}
- */
 export default function DepthPanel({ code, name = '', height = 260 }) {
   const [ob, setOb] = useState({})
   const [factors, setFactors] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [dispName, setDispName] = useState(name)
-  const [viewW, setViewW] = useState(320)
+  const [viewW, setViewW] = useState(300)
 
   const wrapRef = useRef(null)
   const canvasRef = useRef(null)
 
-  // 拉取盘口（code 变化时重新加载）
   useEffect(() => {
     if (!code) return
     let cancelled = false
@@ -83,7 +64,6 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     return () => { cancelled = true }
   }, [code])
 
-  // 容器宽度自适应（ResizeObserver，退化轮询）
   useEffect(() => {
     if (!wrapRef.current) return
     setViewW(wrapRef.current.clientWidth)
@@ -104,7 +84,6 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     }
   }, [])
 
-  // 现价相对昨收涨跌幅文本 + 颜色
   const pctText = (() => {
     const p = ob.price || 0
     const pc = ob.prev_close || 0
@@ -114,17 +93,30 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
   })()
   const nowCls = pctText.startsWith('+') ? 'up' : 'down'
 
-  // 绘制盘口阶梯（canvas，devicePixelRatio 缩放）
   useEffect(() => {
     const cvs = canvasRef.current
     if (!cvs || !ob || !ob.bids || !ob.bids.length) return
 
     const dpr = window.devicePixelRatio || 1
-    const W = viewW
-    const H = height
+    cvs.style.width = '100%'
+    const W = Math.max(1, Math.round(cvs.clientWidth || viewW))
+
+    let levelCount = 0
+    const maxL = Math.min(ob.bids.length, 10)
+    for (let i = 0; i < maxL; i++) {
+      const b = ob.bids[i], a = ob.asks ? ob.asks[i] : null
+      if ((b && b.price > 0) || (a && a.price > 0)) levelCount = i + 1
+    }
+    if (levelCount === 0) levelCount = 5
+    const L = levelCount
+
+    const rowH = 22
+    const topPad = 4, botPad = 4
+    const factorH = factors ? 66 : 0
+    const H = topPad + (L * 2 + 1) * rowH + (factors ? factorH + 6 : 0) + botPad
+
     cvs.width = Math.round(W * dpr)
     cvs.height = Math.round(H * dpr)
-    cvs.style.width = W + 'px'
     cvs.style.height = H + 'px'
     const ctx = cvs.getContext('2d')
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -132,85 +124,70 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     ctx.fillStyle = C.bg
     ctx.fillRect(0, 0, W, H)
 
-    // 档位
-    const levels = Number(ob.levels) || Math.min(ob.bids.length || 0, 5) || 5 // 档位数：接口给定，缺省取买卖盘前 5 档
-    const showLevels = Math.min(levels, 10) // 最多展示 10 档
-
-    // 构建行：卖 high→low ... 现价 ... 买 low→high
     const rows = []
-    for (let i = 0; i < showLevels; i++) {
-      const label = showLevels - i
-      const idx = showLevels - 1 - i
+    for (let i = 0; i < L; i++) {
+      const label = L - i
+      const idx = L - 1 - i
       const a = ob.asks ? ob.asks[idx] : null
-      rows.push({ lv: '卖' + label, price: a ? a.price : 0, vol: a ? a.volume : 0, color: C.ask, best: i === showLevels - 1 })
+      rows.push({ side: 'ask', lv: '卖' + label, price: a ? a.price : 0, vol: a ? a.volume : 0 })
     }
-    rows.push({ now: true, lv: ob.name || code, price: ob.price || 0, volText: pctText, color: nowCls })
-    for (let i = 0; i < showLevels; i++) {
-      const label = i + 1
+    rows.push({ now: true, lv: ob.name || code, price: ob.price || 0, volText: pctText })
+    for (let i = 0; i < L; i++) {
       const b = ob.bids ? ob.bids[i] : null
-      rows.push({ lv: '买' + label, price: b ? b.price : 0, vol: b ? b.volume : 0, color: C.bid, best: i === 0 })
+      rows.push({ side: 'bid', lv: '买' + (i + 1), price: b ? b.price : 0, vol: b ? b.volume : 0 })
     }
 
-    const factorH = factors ? 78 : 0          // 底部派生因子区高度（无因子则为 0）
-    const rowH = (H - 8 - factorH) / rows.length // 每行高度（上下各留 4px）
-    const col1 = 6, col1W = 56                // 第一列（档位标签）起点与宽度
-    const priceX = col1 + col1W
-    const priceW = (W - priceX) / 2           // 价格列占剩余宽度一半
-    const volX = priceX + priceW              // 量/涨跌幅列起点
+    let maxVol = 0
+    for (const r of rows) if (r.vol > maxVol) maxVol = r.vol
+    if (maxVol <= 0) maxVol = 1
 
-    ctx.font = '14px monospace'
+    const col1 = 8
+    const labelW = 44
+    const priceX = col1 + labelW
+    const priceW = 70
+    const volRight = W - col1
+    const volAreaLeft = priceX + priceW + 6
+    const volAreaRight = volRight
+
+    ctx.font = '13px monospace'
     ctx.textBaseline = 'middle'
 
     rows.forEach((r, ri) => {
-      const y = 4 + ri * rowH
+      const y = topPad + ri * rowH
       const cy = y + rowH / 2
-      // 高亮最优档
-      if (r.best) {
-        ctx.fillStyle = 'rgba(0,0,0,0.03)'
-        ctx.fillRect(col1, y, W - col1 * 2, rowH)
-      }
       if (r.now) {
         ctx.fillStyle = C.nowBg
         ctx.fillRect(col1, y, W - col1 * 2, rowH)
-        ctx.fillStyle = C.now
-        ctx.textAlign = 'left'
-        ctx.fillText(r.lv, col1, cy)
-        const pcolor = r.color === 'up' ? C.up : C.down
-        ctx.fillStyle = pcolor
-        ctx.textAlign = 'right'
-        ctx.fillText(fmtPrice(r.price), volX - 6, cy)
-        ctx.fillStyle = C.vol
-        ctx.fillText(r.volText, W - col1, cy)
-      } else {
         ctx.fillStyle = C.lv
         ctx.textAlign = 'left'
         ctx.fillText(r.lv, col1, cy)
-        ctx.fillStyle = r.color
+        const pcolor = r.volText && r.volText.startsWith('+') ? C.up : C.down
+        ctx.fillStyle = pcolor
         ctx.textAlign = 'right'
-        ctx.fillText(fmtPrice(r.price), volX - 6, cy)
+        ctx.fillText(fmtPrice(r.price), volRight, cy)
+        ctx.fillStyle = pcolor
+        ctx.fillText(r.volText, col1 + 120, cy)
+      } else {
+        if (r.vol > 0) {
+          const bw = (r.vol / maxVol) * (volAreaRight - volAreaLeft)
+          ctx.fillStyle = r.side === 'ask' ? 'rgba(22,163,74,0.14)' : 'rgba(245,34,77,0.14)'
+          ctx.fillRect(volAreaLeft, y + 3, bw, rowH - 6)
+        }
+        ctx.fillStyle = C.lv
+        ctx.textAlign = 'left'
+        ctx.fillText(r.lv, col1, cy)
+        ctx.fillStyle = r.side === 'ask' ? C.ask : C.bid
+        ctx.textAlign = 'left'
+        ctx.fillText(fmtPrice(r.price), priceX, cy)
         ctx.fillStyle = C.vol
-        ctx.fillText(fmtVol(r.vol), W - col1, cy)
+        ctx.textAlign = 'right'
+        ctx.fillText(fmtVol(r.vol), volRight, cy)
       }
     })
 
-    // 因子区
     if (factors) {
-      let fy = H - factorH + 14
-      ctx.font = '13px monospace'
-      const labelColor = C.lv
-      const drawRow = (items) => {
-        let x = col1
-        ctx.textAlign = 'left'
-        items.forEach((it) => {
-          ctx.fillStyle = labelColor
-          ctx.fillText(it.label, x, fy)
-          x += 52
-          ctx.fillStyle = it.color || C.now
-          ctx.fillText(it.val, x, fy)
-          x += 70
-        })
-        fy += 22
-      }
+      let fy = topPad + (L * 2 + 1) * rowH + 18
+      ctx.font = '12px monospace'
       const F = {
         bid_ask_ratio: Number(factors.bid_ask_ratio) || 0,
         bid_vol: Number(factors.bid_vol) || 0,
@@ -220,18 +197,30 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         spread_pct: Number(factors.spread_pct) || 0,
         near_pct: Number(factors.near_pct) || 0,
       }
-      drawRow([
+      const drawPair = (a, b) => {
+        ctx.textAlign = 'left'
+        ctx.fillStyle = C.lv
+        ctx.fillText(a.label, col1, fy)
+        ctx.fillStyle = a.color || C.lv
+        ctx.fillText(a.val, col1 + 44, fy)
+        ctx.fillStyle = C.lv
+        ctx.fillText(b.label, col1 + 150, fy)
+        ctx.fillStyle = b.color || C.lv
+        ctx.fillText(b.val, col1 + 194, fy)
+        fy += 22
+      }
+      drawPair(
         { label: '委比', val: (F.bid_ask_ratio * 100).toFixed(1) + '%', color: F.bid_ask_ratio >= 0 ? C.up : C.down },
-        { label: '买/卖量', val: fmtVol(F.bid_vol) + ' / ' + fmtVol(F.ask_vol) },
-      ])
-      drawRow([
+        { label: '买/卖量', val: fmtVol(F.bid_vol) + '/' + fmtVol(F.ask_vol) }
+      )
+      drawPair(
         { label: '买一封单', val: fmtVol(F.seal_bid), color: C.up },
-        { label: '卖一封单', val: fmtVol(F.seal_ask), color: C.down },
-      ])
-      drawRow([
+        { label: '卖一封单', val: fmtVol(F.seal_ask), color: C.down }
+      )
+      drawPair(
         { label: '价差', val: F.spread_pct.toFixed(3) + '%' },
-        { label: '覆盖', val: F.near_pct.toFixed(2) + '%' },
-      ])
+        { label: '覆盖', val: F.near_pct.toFixed(2) + '%' }
+      )
     }
   }, [ob, factors, viewW, height, pctText])
 

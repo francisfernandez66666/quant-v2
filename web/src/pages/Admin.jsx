@@ -9,6 +9,10 @@ import {
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
+// 从 api 模块导入权限判断工具：isAdmin() 读取 localStorage 中缓存的 role（由 App 的 refreshMe 写入）
+// 守卫判断来源：web/src/api/index.js 的 isAdmin()（基于 STORAGE_ROLE），与 App.jsx 中侧边栏 canAdmin 一致
+import { isAdmin } from '../api/index.js'
+
 const PERM_LABELS = { research_approve: '研究审批' }
 
 // 战法参数分组定义（与 Vue 版 Settings/Admin 一致）；每个 group 的 fields 决定代配弹窗中展示的输入框与步长
@@ -140,8 +144,10 @@ export default function Admin() {
     return Array.isArray(u.perms) ? u.perms : []
   }
 
-  // 加载全部用户与权限列表
+  // 加载全部用户与权限列表（仅管理员调用；非管理员直接返回，避免越权请求）
   async function loadUsers() {
+    // 守卫二次校验：不是管理员则直接中止数据加载
+    if (!isAdmin()) return
     try {
       const res = await api.fetchAdminUsers()
       setUsers(res.users || [])
@@ -335,6 +341,19 @@ export default function Admin() {
   ]
 
   useEffect(() => { loadUsers() }, [])
+
+  // 权限守卫：非管理员（api.isAdmin() 返回 false）直接渲染"无权限访问"，
+  // 既禁止通过 URL 直接访问，也避免越权渲染管理界面（数据由 loadUsers 守卫拦截）
+  if (!isAdmin()) {
+    return (
+      <div className="page" style={{ textAlign: 'center', paddingTop: 80 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 600 }}>无权限访问</h2>
+        <p style={{ color: '#888', fontSize: 13, marginTop: 8 }}>
+          该页面仅限管理员访问，请联系管理员或使用管理员账号登录。
+        </p>
+      </div>
+    )
+  }
 
   return (
     <div className="page">

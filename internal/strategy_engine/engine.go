@@ -118,7 +118,10 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 	bullSectors, bearSectors := e.attribution(events)
 	log.Printf("[strategy_engine] attribution: %d利好板块 %d利空板块", len(bullSectors), len(bearSectors))
 
-	e.rebuildIndex(events)
+	// rebuildIndex 个股解码失败会返回结构化错误：仅记告警，不阻断后续归因/打分流程（降级而非停摆）。
+	if err := e.rebuildIndex(events); err != nil {
+		log.Printf("[strategy_engine][降级告警] rebuildIndex 返回错误(已降级继续): %v", err)
+	}
 
 	// 2. 分流事件个股到 LongStocks / ShortStocks（按带符号 Score 判定方向）。
 	//    个股级事件取 LLM 识别的关联股；板块级事件经 propagateSectorToStocks 已注入成分股（CleanedStocks），

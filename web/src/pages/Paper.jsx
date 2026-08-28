@@ -7,8 +7,7 @@ import {
 } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
-import KLineChart from '../components/KLineChart.jsx'
-import DepthPanel from '../components/DepthPanel.jsx'
+import MinuteView from '../components/MinuteView.jsx'
 
 const UP = '#e34d59'   // 涨（A股习惯红）
 const DOWN = '#00a870' // 跌（绿）
@@ -540,12 +539,7 @@ export default function Paper() {
 
   function renderKline(params) {
     const row = params && params.row ? params.row : params
-    return (
-      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-        <div style={{ flex: '1 1 360px', minWidth: 300 }}><KLineChart code={row.code} name={row.name} /></div>
-        <div style={{ flex: '1 1 240px', minWidth: 240 }}><DepthPanel code={row.code} name={row.name} /></div>
-      </div>
-    )
+    return <MinuteView code={row.code} name={row.name} />
   }
 
   return (

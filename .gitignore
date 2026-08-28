@@ -32,6 +32,12 @@ node_modules/
 monitor_logs/
 nohup.out
 
+# 运行时数据库（含真实持仓/成交，禁止入库）
+data.db
+*.db
+*.sqlite
+*.sqlite3
+
 # IDE
 .idea/
 .vscode/

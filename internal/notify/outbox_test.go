@@ -125,6 +125,8 @@ func TestOutboxPersistsAcrossRestart(t *testing.T) {
 	n1.outbox.enqueue("gateway", Message{Level: LevelHigh, Title: "止损提醒"}, func(string, Message) error {
 		return errFake{}
 	})
+	// 停止后台重试协程，释放持久化写句柄，避免退出后仍在重写 outbox.json 导致临时目录无法清理
+	defer n1.outbox.Stop()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
@@ -140,6 +142,7 @@ func TestOutboxPersistsAcrossRestart(t *testing.T) {
 	n2 := New()
 	n2.SetGateway(&fakeGatewayOK{})
 	n2.SetOutboxPersistPath(path)
+	defer n2.outbox.Stop()
 	if got := n2.outbox.pendingLen(); got != 1 {
 		t.Fatalf("重启后应恢复 1 条待补投, got %d", got)
 	}

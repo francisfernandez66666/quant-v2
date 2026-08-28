@@ -192,8 +192,10 @@ func (r *Registry) paperMirror(userID string) (func(paper.Position), func(string
 		if pos.StrategyType == "dragon" && pos.SignalPrice > 0 {
 			meta["limit_price"] = pos.SignalPrice // 炸板回落基准=买入触发价
 		}
-		rpt.LogSignalWithMetaQty("pap_"+pos.Code, pos.Code, pos.Name, "做多", pos.Strategy,
-			pos.CostPrice, tp, sl, float64(pos.Qty), meta)
+		// §多账号隔离：镜像建仓写入归属账号 userID，避免多账号下 report 持仓串号
+		// （此前漏打 user_id，导致不同账号的纸面持仓在 report 账里互相可见/被错误消费）。
+		rpt.LogSignalWithMetaQtyUser("pap_"+pos.Code, pos.Code, pos.Name, "做多", pos.Strategy,
+			pos.CostPrice, tp, sl, float64(pos.Qty), meta, userID)
 		log.Printf("[registry] 镜像开仓 %s(%s) 战法:%s 数量%d 止盈%.0f%% 止损%.0f%%",
 			pos.Name, pos.Code, pos.StrategyType, pos.Qty, tp, sl)
 	}

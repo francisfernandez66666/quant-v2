@@ -197,7 +197,21 @@ class XtBroker(Broker):
     def place_order(self, req):
         if not self._connected:
             return False, "", "not connected"
-        code = req.get("code", "")
+        code = str(req.get("code", "") or "")
+        # ── 交易所后缀前置校验 ──
+        # 柜台对代码/交易所不匹配的委托只返回 seq=-1（无原因），在下单前本地拦截并
+        # 给出明确错误（生产实际踩坑：601086 误传 .SZ → seq=-1 排障无门）。
+        head = code.split(".")[0]
+        suffix = code.split(".")[1].upper() if "." in code else ""
+        _expect = ("SH" if head.startswith("6") else
+                   "SZ" if head[:1] in ("0", "3") else
+                   "BJ" if head[:1] in ("4", "8") else "")
+        if not _expect:
+            return False, "", "unsupported stock code: %s" % code
+        if suffix and suffix != _expect:
+            return False, "", "exchange suffix mismatch: %s should be %s" % (code, _expect)
+        if suffix != _expect:
+            code = "%s.%s" % (head, _expect)
         price = float(req.get("price", 0) or 0)
         side = req.get("side", "")
         order_type = 1101 if side == "买入" else 1102  # xtquant: 1101=买, 1102=卖
@@ -215,7 +229,14 @@ class XtBroker(Broker):
                 signal_id,
             )
         if seq <= 0:
-            return False, "", "order_stock failed (seq=%s)" % seq
+            # seq=-1 = 柜台/客户端拒绝受理且无异步原因可查。上下文全量带出 +
+            # 常见原因提示，避免排障无门（查询通而下单拒 → 优先查 QMT 策略交易
+            # 权限是否开通、客户端是否已输入交易密码解锁）。
+            log.warning("[broker] order rejected seq=-1: %s %s qty=%s price_type=%s price=%s signal=%s",
+                        side, code, req.get("qty"), req.get("price_type"), price, signal_id)
+            return False, "", ("order_stock failed (seq=-1): %s %s qty=%s price_type=%s price=%s — "
+                               "柜台拒绝受理（常见原因：QMT 策略交易权限未开通/客户端交易未解锁/非交易时段）") % (
+                side, code, req.get("qty"), req.get("price_type"), price)
         seq_s = str(seq)
         with self._lock:
             # 维护 seq ↔ signal_id 双向映射，供撤单时反查

@@ -22,6 +22,7 @@ import Consult from './pages/Consult.jsx'
 import Research from './pages/Research.jsx'
 import Admin from './pages/Admin.jsx'
 import Paper from './pages/Paper.jsx'
+import ErrorBoundary from './components/ErrorBoundary.jsx'
 
 /**
  * 应用根组件
@@ -147,7 +148,7 @@ export default function App() {
         if (bear > 0) parts.push('做空 ' + bear + ' 条')
         const text = '新交易信号: ' + parts.join('、') + (msg.time ? ' (' + msg.time + ')' : '')
         showToast(text, 'warning')
-        notifyThrottled('scan', '量仔期货 交易信号', text)
+        notifyThrottled('scan', '量仔 交易信号', text)
       }
       refreshStatus()
       return
@@ -158,7 +159,7 @@ export default function App() {
       if (critical) {
         const code = msg.item.code || ''
         const name = msg.item.name || ''
-        const title = level ? ('量仔期货 ' + level) : '量仔期货 提醒'
+        const title = level ? ('量仔 ' + level) : '量仔 提醒'
         const body = (code ? code + ' ' : '') + (name || '') + (msg.item.title || msg.item.body || '')
         notifyThrottled(code + '@' + level, title, body)
       }
@@ -211,7 +212,7 @@ export default function App() {
       <ConfigProvider>
         <div className="login-page">
           <div className="login-box t-card">
-            <h1>量仔期货</h1>
+            <h1>量仔</h1>
             <p className="subtitle">量化交易辅助工具</p>
             <div className="form-group">
               <label>服务器地址</label>
@@ -259,7 +260,7 @@ export default function App() {
       {!loggedIn ? (
         <div className="login-page">
           <div className="login-box">
-            <h1>量仔期货</h1>
+            <h1>量仔</h1>
             <p className="subtitle">量化交易辅助工具</p>
             <div className="form-group">
               <label>服务器地址</label>
@@ -295,7 +296,7 @@ export default function App() {
               <span className="muted">{shortEnabled ? '做多+空' : '仅做多'}</span>
               {/* 通知测试按钮：验证系统/原生通知通道是否可用 */}
               <Button theme="default" variant="outline" size="small" onClick={() => {
-                const sent = sendNotify('量仔期货', '通知测试成功')
+                const sent = sendNotify('量仔', '通知测试成功')
                 MessagePlugin.info('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')))
               }}>🔔</Button>
               {/* 退出登录 */}
@@ -305,7 +306,7 @@ export default function App() {
           <div className="app-body">
             {/* 侧边栏：品牌 logo + 导航菜单 + 底部当前账号；menuOpen 控制移动端抽屉展开 */}
             <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
-              <div className="brand-logo">量仔期货</div>
+              <div className="brand-logo">量仔</div>
               <div style={{ flex: 1, overflowY: 'auto' }}>
                 {/* 根据 navItems 渲染导航项，当前路由高亮；点击后跳转并收起抽屉 */}
                 <Menu theme="light" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
@@ -330,22 +331,25 @@ export default function App() {
             {menuOpen && <div className="sidebar-overlay" onClick={() => setMenuOpen(false)} />}
             <main className="app-main">
               {/* 路由出口：根据 path 渲染对应页面组件；根路径重定向到仪表盘 */}
-              <Routes>
-                <Route path="/" element={<Navigate to="/dashboard" replace />} />
-                <Route path="/dashboard" element={<Dashboard />} />
-                <Route path="/signals" element={<Signals />} />
-                <Route path="/watchlist" element={<Watchlist />} />
-                <Route path="/positions" element={<Positions />} />
-                <Route path="/quant" element={<Quant />} />
-                <Route path="/hotspot" element={<Hotspot />} />
-                <Route path="/msgcenter" element={<MsgCenter />} />
-                <Route path="/settings" element={<Settings />} />
-                <Route path="/llm-debug" element={<LLMDebug />} />
-                <Route path="/consult" element={<Consult />} />
-                <Route path="/research" element={<Research />} />
-                <Route path="/admin" element={<Admin />} />
-                <Route path="/paper" element={<Paper />} />
-              </Routes>
+              {/* 用全局 ErrorBoundary 包裹路由出口：任意页面渲染抛错时显示中文兜底 UI，避免整页白屏 */}
+              <ErrorBoundary>
+                <Routes>
+                  <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                  <Route path="/dashboard" element={<Dashboard />} />
+                  <Route path="/signals" element={<Signals />} />
+                  <Route path="/watchlist" element={<Watchlist />} />
+                  <Route path="/positions" element={<Positions />} />
+                  <Route path="/quant" element={<Quant />} />
+                  <Route path="/hotspot" element={<Hotspot />} />
+                  <Route path="/msgcenter" element={<MsgCenter />} />
+                  <Route path="/settings" element={<Settings />} />
+                  <Route path="/llm-debug" element={<LLMDebug />} />
+                  <Route path="/consult" element={<Consult />} />
+                  <Route path="/research" element={<Research />} />
+                  <Route path="/admin" element={<Admin />} />
+                  <Route path="/paper" element={<Paper />} />
+                </Routes>
+              </ErrorBoundary>
             </main>
           </div>
         </div>

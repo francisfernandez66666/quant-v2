@@ -17,10 +17,17 @@ function Log($m) {
 Log "watchdog started (pid=$PID)"
 while ($true) {
     Log "launching gateway..."
-    # 前台运行网关：进程退出（崩溃/异常）即落到下一行进入重启流程
-    & $py (Join-Path $gw "gateway.py") "-c" (Join-Path $gw "config.xt.json") *>> $log
+    # QUANT_GATEWAY_BIND 显式放行公网绑定：广州执行机设计上必须接收首尔（43.108.86.140）
+    # 的下单/查询请求，新版网关会把 config 里的 0.0.0.0 安全收敛为 127.0.0.1，
+    # 不设该环境变量首尔将完全失联（生产踩坑：2026-08-28 部署后首尔下单通道中断）。
+    $env:QUANT_GATEWAY_BIND = "0.0.0.0:8789"
+    # 允许来源 IP 白名单（首尔服务器出口 IP；为空则仅依赖 token 防护）
+    $env:ALLOWED_IPS = "43.108.86.140,127.0.0.1"
+    # 网关自管文件日志（gateway-<pid>.log，UTF-8 轮转）；此处不再做外部重定向——
+    # 旧 *>> 方式在 Windows 产生 UTF-16 文件且句柄被假死实例长期持有，新实例日志全部丢失。
+    & $py (Join-Path $gw "gateway.py") "-c" (Join-Path $gw "config.xt.json")
     Log ("gateway exited code=" + $LASTEXITCODE + " - restarting in 3s")
-    # 日志轮转：仅保留一代 .old，活动日志上限约 20MB
+    # 旧式外部重定向日志只保留一代 .old 供历史排查，网关自身日志已轮转无需在此处理
     if ((Test-Path $log) -and ((Get-Item $log).Length -gt 20MB)) {
         Move-Item -Force $log ($log + ".old")
         Log "log rotated"

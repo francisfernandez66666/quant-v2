@@ -312,21 +312,29 @@ class _Handler(BaseHTTPRequestHandler):
     _LOCAL_ADDRS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
     def _real_ip(self):
-        """取对端真实 IP：优先取 X-Forwarded-For 首跳（经反向代理时还原真实客户端），否则取 socket 对端。"""
-        fwd = self.headers.get("X-Forwarded-For", "")
-        if fwd:
-            return fwd.split(",")[0].strip()
+        """取对端真实 IP。
+
+        安全注意：本网关是 Windows 执行机上的直连服务（首尔的下单/查询直连 :8789，
+        不经过任何反向代理），因此**只信任 socket 对端地址**。旧实现优先取
+        X-Forwarded-For 首跳——直连部署下攻击者伪造该头即可绕过 ALLOWED_IPS
+        白名单（第二道防线失效，仅剩 token）。如未来引入反向代理，需以配置显式
+        声明信任代理后才能启用 XFF 还原。
+        """
         return self.client_address[0]
 
     def _ip_allowed(self, path):
         """按端点类型做 IP 访问控制，返回 (allowed, status, err)。
 
-        - /health：仅本机回环地址（127.0.0.1 / ::1）可访问，否则 403；
+        - /health：本机回环（127.0.0.1 / ::1）或 ALLOWED_IPS 白名单（决策机首尔，
+          其引擎以 /health 驱动熔断状态机）可访问，其余 403——陌生人探测不到健康状态；
         - 其它敏感端点：若配置了 ALLOWED_IPS 白名单，来源 IP 必须命中，否则 403。
         """
-        # /health 用 socket 对端判断（经本机反向代理时连接来自 127.0.0.1，应放行）
+        # /health：回环或白名单（首尔引擎 probeHealth 驱动熔断，403 会被计为探测失败）
         if path == "/health":
             if self.client_address[0] in self._LOCAL_ADDRS:
+                return True, 200, ""
+            allowed = self.gateway.allowed_ips
+            if allowed and self._real_ip() in allowed:
                 return True, 200, ""
             return False, 403, "health endpoint is localhost-only"
         # 其它端点：若启用 IP 白名单则校验（空列表表示不限制，仅依赖 token）
@@ -403,11 +411,44 @@ def main(argv=None):
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
-    # 尽早初始化日志，使配置阶段的环境变量告警也能输出
+    # stderr 基线日志先配置（basicConfig 在 root 已有 handler 时是 no-op，
+    # 因此文件 handler 必须加在它之后，保证双通道都生效）
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # ── 文件日志（自管 + PID 隔离，根治两大生产缺陷）──
+    # 缺陷一：watchdog 以外部重定向写 gateway.log（Windows 下 UTF-16 且句柄被
+    # 假死旧实例持有），新实例启动后日志全部丢失——排障只见"最后一刻"残影。
+    # 缺陷二：单文件无限增长。
+    # 方案：进程内 RotatingFileHandler（UTF-8、5MB×3 轮转）写 gateway-<pid>.log，
+    # 文件名含 PID 使新旧实例互不锁文件；启动时仅保留最近 10 个旧 PID 日志；
+    # stderr 保留（watchdog/控制台仍可见）。可用 config 的 log_file 覆盖路径。
+    try:
+        _cfg_dir = os.path.dirname(os.path.abspath(args.config)) if args.config else os.path.dirname(os.path.abspath(__file__))
+        _cfg_probe = {}
+        try:
+            with open(args.config, "r", encoding="utf-8") as _f:
+                _cfg_probe = json.load(_f)
+        except Exception:  # noqa: BLE001 — 配置缺失/未加载时用默认路径即可
+            pass
+        _log_file = _cfg_probe.get("log_file") or os.path.join(_cfg_dir, "gateway-%d.log" % os.getpid())
+        from logging.handlers import RotatingFileHandler  # noqa: PLC0415
+        _fh = RotatingFileHandler(_log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(_fh)
+        # 清理旧 PID 日志：按修改时间只保留最近 10 个 gateway-*.log
+        import glob  # noqa: PLC0415
+        _olds = sorted(glob.glob(os.path.join(_cfg_dir, "gateway-*.log")), key=os.path.getmtime, reverse=True)
+        for _p in _olds[10:]:
+            try:
+                os.remove(_p)
+            except OSError:  # noqa: PERF203 — 被占用的旧文件跳过，不影响启动
+                pass
+        logging.getLogger("qmt_gateway").info("[main] log file: %s", _log_file)
+    except Exception as _e:  # noqa: BLE001 — 日志文件不可用时退回 stderr-only，网关必须能跑
+        print("[gateway] file logging disabled: %s" % _e, file=sys.stderr)
 
     cfg = load_config(args.config)
     if args.listen:

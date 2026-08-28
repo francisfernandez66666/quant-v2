@@ -164,7 +164,7 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)
             val channel = NotificationChannel(
-                "quant_signals", "量仔期货信号", NotificationManager.IMPORTANCE_HIGH
+                "quant_signals", "量仔信号", NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "策略信号与提醒推送"
             }

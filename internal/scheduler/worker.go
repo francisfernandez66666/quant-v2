@@ -30,8 +30,10 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
-// taskProgressRe 统一进度协议：兼容各子命令既有的"回测/发现/任务进度 xx%"输出行。
-var taskProgressRe = regexp.MustCompile(`(?:任务|回测|发现)进度 (\d+)%`)
+// taskProgressRe 统一进度协议：兼容各子命令既有的"回测/发现/任务/参数优化进度 xx%"输出行。
+// 扩充"参数优化进度"以覆盖 §P2 全库寻优（sweep）任务的进度回报，避免其进度长期为空被误判停滞。
+// English: progress protocol — matches backtest/discover/task/param-optimize progress lines.
+var taskProgressRe = regexp.MustCompile(`(?:任务|回测|发现|参数优化)进度 (\d+)%`)
 
 // avgExcessRe 匹配 B4 回测 CLI 的平均超额（done 后写 result_num）。
 var avgExcessRe = regexp.MustCompile(`平均超额=(-?\d+(?:\.\d+)?)`)
@@ -845,13 +847,34 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		}
 	}()
 
-	// 看门狗：仅高优先级手动任务启用；夜间链任务靠硬超时兜底。
-	// 30 分钟（原 15）：B4 单窗装配在整机满负荷期可合法超过 15 分钟无事件完成，
-	// 曾把健康的续跑回测当挂死误杀（#9 error@50% 实录）。
-	// English: stall watchdog raised to 30m — a single window assembly can legitimately exceed 15m
-	// under box saturation; 15m mis-killed a healthy resumed backtest (#9 error@50%).
-	if tk.Priority == "high" {
-		const stallSecs = 30 * 60
+	// 看门狗：所有「已对齐进度协议」的任务启用进度停滞保护，避免单个卡死任务长期霸占
+	// 唯一 busy 槽、饿死整条队列（"一直卡排队"根因之一：低优先级夜间/战法库回放任务挂死时，
+	// 旧逻辑仅高优先级有看门狗，低优先级只能等单步硬超时(90min~3h)才被回收，期间全队停滞）。
+	// 高优先级手动任务更敏感（30min）；低优先级夜间任务放宽至单步硬超时的 2/3
+	// （默认 90min 超时→60min；战法库回放 3h→120min）。
+	// 仅对已对齐进度协议（回测进度/发现进度/参数优化进度）的类型启用——其余类型
+	// （dataload/sector_rebuild/list 等）未输出匹配进度行，仍靠单步硬超时兜底，避免误杀健康长任务。
+	// English: stall watchdog now covers progress-emitting tasks of any priority, so a hung task
+	// cannot starve the single-slot queue; types without a matching progress protocol keep relying
+	// on the per-step hard timeout instead.
+	watchTypes := map[string]bool{
+		store.TaskBacktestCandidate: true, store.TaskBacktestNightly: true,
+		store.TaskBacktestStrategy: true, // library 回放 emit 回测进度；optimize 经 sweep 输出"参数优化进度"
+		store.TaskDiscoverFactors:  true, store.TaskDiscoverPatterns:  true,
+	}
+	stallSecs := 30 * 60
+	if tk.Priority != "high" {
+		// low 夜间任务：以单步硬超时的 2/3 为停滞阈值。
+		if timeout > 0 {
+			stallSecs = int(timeout.Seconds() * 2 / 3)
+		} else {
+			stallSecs = 60 * 60
+		}
+		if tk.Type == store.TaskBacktestStrategy {
+			stallSecs = 120 * 60
+		}
+	}
+	if watchTypes[tk.Type] {
 		watchStop := make(chan struct{})
 		go func() {
 			t := time.NewTicker(time.Minute)
@@ -865,10 +888,10 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 				case <-t.C:
 					s.mu.Lock()
 					stalled := !s.paused && !s.cancelReq && !s.preemptReq &&
-						time.Now().Unix()-s.lastProgress > stallSecs
+						time.Now().Unix()-s.lastProgress > int64(stallSecs)
 					s.mu.Unlock()
 					if stalled {
-						log.Printf("[scheduler] 任务 #%d 进度停滞>%dm，看门狗终止", tk.ID, stallSecs/60)
+						log.Printf("[scheduler] 任务 #%d 进度停滞>%dm，看门狗终止（腾出队列槽位）", tk.ID, stallSecs/60)
 						killProcessGroup(cmd)
 						return
 					}

@@ -132,7 +132,7 @@ export default function Settings() {
   function requestNotify() {
     requestPermission().then(perm => {
       if (perm === 'granted') {
-        sendNotify('量仔期货', '通知授权成功')
+        sendNotify('量仔', '通知授权成功')
         showToast('通知授权成功', 'success')
       } else {
         showToast('通知被拒绝，请在系统设置中开启通知', 'warning')
@@ -355,7 +355,7 @@ export default function Settings() {
       <Card title="系统" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>版本</span>
-          <span>量仔期货 v1.1.0 桌面版</span>
+          <span>量仔 v1.1.0 桌面版</span>
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>后端</span>

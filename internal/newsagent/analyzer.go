@@ -2,6 +2,7 @@
 package newsagent
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"strings"
@@ -37,8 +38,12 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedIt
 
 	results, failedIdx, err := a.llmClient.AnalyzeHotTopicBatch(titles)
 	if err != nil {
-		log.Printf("[newsagent] Stage2 LLM批量分析失败, 该批%d条丢弃: %v", len(titles), err)
-		return nil, items
+		// LLM 不可用/限流/耗尽：不再整批丢弃（丢信号），改为「规则兜底 + 低置信度中性」降级，
+		// 保证流水线继续运转；同时打出明确降级告警（含原因与影响条数），便于运维发现 LLM 异常。
+		// 降级事件照常返回给调用方参与后续流转，原批次仍作为 failedItems 留队，下轮用真实 LLM 重试。
+		log.Printf("[newsagent][降级告警] Stage2 LLM批量分析失败, 整批 %d 条降级为低置信度中性(规则兜底)而非丢弃: %v", len(titles), err)
+		degraded := a.ruleBasedDegrade(items, err)
+		return degraded, items
 	}
 
 	// LLM 重试耗尽失败的新闻（nil 占位）：视为未归因，交调用方留队下一轮重试
@@ -286,4 +291,59 @@ func directionFromScore(score float64) string {
 		return "利空"
 	}
 	return "中性"
+}
+
+// ruleBasedDegrade LLM 不可用时的规则兜底：基于标题/正文关键词做简易利好/利空判定，
+// 统一标记为「低置信度中性」事件（Direction=中性、Score=0），保证流水线不中断、事件不整批丢失。
+// 降级事件仅作为占位保留在 /api/news 可见（中性不触发信号），真实归因交由下轮 LLM 重试。
+// （ruleBasedDegrade is the rule-based fallback when the LLM is unavailable: a simple keyword check
+// yields a low-confidence NEUTRAL event (Direction=neutral, Score=0) so the pipeline keeps running
+// and no events are dropped wholesale; real attribution is retried next round via the LLM.）
+func (a *Agent) ruleBasedDegrade(items []data.NewsItem, cause error) []NewsEvent {
+	// 利好/利空关键词（命中其一即给出方向提示，但事件本身仍统一标记中性，避免 LLM 缺失时给出错误方向信号）
+	bullKW := []string{"利好", "增长", "中标", "签约", "增持", "回购", "扩产", "涨价", "突破", "获批", "订单", "业绩预增", "上调", "合作", "超预期"}
+	bearKW := []string{"利空", "减持", "下跌", "亏损", "处罚", "退市", "调查", "暴雷", "下滑", "业绩预减", "诉讼", "查封", "风险警示", "下修"}
+
+	events := make([]NewsEvent, 0, len(items))
+	for _, item := range items {
+		text := item.Title + " " + item.Content
+		keywordDir := "中性"
+		var hit []string
+		for _, k := range bullKW {
+			if strings.Contains(text, k) {
+				hit = append(hit, "利好:"+k)
+				keywordDir = "利好"
+				break
+			}
+		}
+		if keywordDir == "中性" {
+			for _, k := range bearKW {
+				if strings.Contains(text, k) {
+					hit = append(hit, "利空:"+k)
+					keywordDir = "利空"
+					break
+				}
+			}
+		}
+
+		dt := item.Datetime
+		if dt == "" {
+			dt = time.Now().Format("2006-01-02 15:04:05")
+		}
+		// 降级：统一低置信度中性，不触发信号，仅保留可见性；关键词命中情况写入 Reason 供排查。
+		ev := NewsEvent{
+			Title:      item.Title,
+			Content:    item.Content,
+			Datetime:   dt,
+			Source:     item.Source,
+			IsMaterial: true,
+			Level:      "一般", // 降级事件无可靠级别，标为一般，避免错误扩散到个股/板块候选
+			Direction:  "中性",       // 降级：低置信度中性，杜绝 LLM 缺失时给出错误方向
+			Score:      0,            // 中性占位，不触发任何信号，仅保留在 /api/news 可见
+			EventType:  "降级兜底",
+			Reason: fmt.Sprintf("[降级·规则兜底] LLM不可用(%v); 关键词命中=%v; 原判定方向=%s", cause, hit, keywordDir),
+		}
+		events = append(events, ev)
+	}
+	return events
 }
