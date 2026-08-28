@@ -30,29 +30,29 @@ import (
 // （User is a user account record.）
 type User struct {
 	// 用户唯一标识（u_ 前缀）
-	ID           string   `json:"id"`
+	ID string `json:"id"`
 	// 登录用户名
-	Username     string   `json:"username"`
+	Username string `json:"username"`
 	// bcrypt 密码哈希（临时账户为空）
-	PasswordHash string   `json:"password_hash"`
+	PasswordHash string `json:"password_hash"`
 	// 认证令牌（§多会话迁移：仅作旧数据兼容槽位，新签发一律写入 Sessions）
-	Token        string   `json:"token,omitempty"`
+	Token string `json:"token,omitempty"`
 	// 令牌过期 Unix 时间戳（0 表示永不过期）
-	TokenExp     int64    `json:"token_exp,omitempty"`
+	TokenExp int64 `json:"token_exp,omitempty"`
 	// 多会话列表：每个登录设备一个会话（手机 App 与 Web 可同时在线互不顶踢）。
 	// §历史缺陷：此前单 token 槽位"登录即轮换"，手机/电脑任一端重新登录即把
 	// 另一端顶成 401——前端拉配置失败回退本地缓存，表现为"实盘开关自动关闭"。
-	Sessions     []Session `json:"sessions,omitempty"`
+	Sessions []Session `json:"sessions,omitempty"`
 	// 角色：admin=管理员 / user=普通用户（空按 user 处理）
-	Role         string   `json:"role,omitempty"`
+	Role string `json:"role,omitempty"`
 	// 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
-	Perms        []string `json:"perms,omitempty"`
+	Perms []string `json:"perms,omitempty"`
 	// 账号是否启用（默认 true；禁用后登录/令牌失效）
-	Enabled      bool     `json:"enabled,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
 	// 创建时间 Unix 时间戳
-	CreatedAt    int64    `json:"created_at"`
+	CreatedAt int64 `json:"created_at"`
 	// 账号有效期截止 Unix 时间戳（0=永久）
-	ExpiresAt    int64    `json:"expires_at,omitempty"`
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 // Session 单个登录会话：一个设备/客户端对应一条，落盘仅存令牌哈希。
@@ -118,9 +118,9 @@ func (u *User) IsAdmin() bool {
 // （ConfigEntry is a user-config key-value entry.）
 type ConfigEntry struct {
 	// 配置键名
-	Key    string `json:"key"`
+	Key string `json:"key"`
 	// 配置值
-	Value  string `json:"value"`
+	Value string `json:"value"`
 	// 所属用户 ID（系统级配置用 "system"）
 	UserID string `json:"user_id"`
 }
@@ -129,7 +129,7 @@ type ConfigEntry struct {
 // （DB is the authentication database structure: user and config lists.）
 type DB struct {
 	// 全部用户列表
-	Users   []User        `json:"users"`
+	Users []User `json:"users"`
 	// 用户/系统级配置项列表
 	Configs []ConfigEntry `json:"configs"`
 	// §GAP2-W2 邀请码注册（owner 决策 D7）：公网开放注册/临时号是隔离违例的放大器，
@@ -343,13 +343,13 @@ var ErrInvalidInvite = errors.New("邀请码无效或已被使用")
 // English: an invite code issued by admin, single-use, with usage audit fields.
 type Invite struct {
 	// 邀请码（QT+16hex）
-	Code      string `json:"code"`
+	Code string `json:"code"`
 	// 签发时间
-	CreatedAt int64  `json:"created_at"`
+	CreatedAt int64 `json:"created_at"`
 	// 使用者账号 ID（空=未用）
-	UsedBy    string `json:"used_by,omitempty"`
+	UsedBy string `json:"used_by,omitempty"`
 	// 使用时间
-	UsedAt    int64  `json:"used_at,omitempty"`
+	UsedAt int64 `json:"used_at,omitempty"`
 }
 
 // CreateInvite 签发一个新邀请码（仅 admin 路径调用）。

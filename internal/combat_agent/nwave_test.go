@@ -205,9 +205,11 @@ func TestScorePoolN1NoD1Suppressed(t *testing.T) {
 type fakeFullChainStrategy struct{}
 
 // Name 返回测试桩战法名称 "fake_n"（伪 N 形）。
-func (fakeFullChainStrategy) Name() string              { return "fake_n" }
+func (fakeFullChainStrategy) Name() string { return "fake_n" }
+
 // Type 返回战法信号类型 SignalNShape。
 func (fakeFullChainStrategy) Type() strategy.SignalType { return strategy.SignalNShape }
+
 // Evaluate 固定返回 full_chain Pass（d1=0.8），用于隔离 N 形状态机判定。
 func (fakeFullChainStrategy) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{
@@ -216,6 +218,7 @@ func (fakeFullChainStrategy) Evaluate(string, interface{}) (*strategy.Evaluation
 		Confidence: 0.7,
 	}, nil
 }
+
 // GenerateSignal 返回 N 形买入信号（Price=11.0）。
 func (fakeFullChainStrategy) GenerateSignal(code string, _ *strategy.Evaluation) (*strategy.Signal, error) {
 	return &strategy.Signal{

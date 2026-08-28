@@ -860,7 +860,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	watchTypes := map[string]bool{
 		store.TaskBacktestCandidate: true, store.TaskBacktestNightly: true,
 		store.TaskBacktestStrategy: true, // library 回放 emit 回测进度；optimize 经 sweep 输出"参数优化进度"
-		store.TaskDiscoverFactors:  true, store.TaskDiscoverPatterns:  true,
+		store.TaskDiscoverFactors:  true, store.TaskDiscoverPatterns: true,
 	}
 	stallSecs := 30 * 60
 	if tk.Priority != "high" {

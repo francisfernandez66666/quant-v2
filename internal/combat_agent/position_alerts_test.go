@@ -58,7 +58,7 @@ func TestCheckPositionAlerts_NoScore(t *testing.T) {
 	// 开仓 40 元，止盈 8%（现价 43.79 → 盈亏 +9.47% ≥ 8% 触发）
 	// English: Opened at 40, take-profit 8% (current price 43.79 → P&L +9.47% ≥ 8% triggers).
 	rpt.LogSignal("pos-1", "600206", "有研新材", "做多", "dragon", 40.0, 8.0, 5.0)
-	alerts := a.CheckPositionAlerts(rpt, m, nil)
+	alerts := a.CheckPositionAlerts(rpt, m, nil, nil)
 	if len(alerts) != 1 {
 		t.Fatalf("应产出 1 条止盈提醒, got %d", len(alerts))
 	}
@@ -75,7 +75,7 @@ func TestCheckPositionAlerts_SignalActiveDowngradesToHint(t *testing.T) {
 	scores := map[string]StockScores{
 		"600206": {Code: "600206", NScore: 70, SignalActive: true},
 	}
-	alerts := a.CheckPositionAlerts(rpt, m, scores)
+	alerts := a.CheckPositionAlerts(rpt, m, nil, scores)
 	if len(alerts) != 1 {
 		t.Fatalf("应产出 1 条降级提示, got %d", len(alerts))
 	}
@@ -97,7 +97,7 @@ func TestCheckPositionAlerts_StopLossDowngrade(t *testing.T) {
 	scores := map[string]StockScores{
 		"600000": {Code: "600000", DragonReturnScore: 65, SignalActive: true},
 	}
-	alerts := a.CheckPositionAlerts(rpt, m, scores)
+	alerts := a.CheckPositionAlerts(rpt, m, nil, scores)
 	if len(alerts) != 1 {
 		t.Fatalf("应产出 1 条降级提示, got %d", len(alerts))
 	}
@@ -113,7 +113,7 @@ func TestCheckPositionAlerts_StopLossHardWhenBear(t *testing.T) {
 	// 开仓 10 元，止损 5%（现价 8.00 → 盈亏 -20% ≤ -5% 触发），且该股命中利空板块(做空信号)
 	// English: Opened at 10, stop-loss 5% (current price 8.00 → P&L -20% ≤ -5% triggers), and the stock matches a bearish sector (short signal).
 	rpt.LogSignal("pos-2", "600000", "浦发银行", "做多", "n_shape", 10.0, 8.0, 5.0)
-	alerts := a.CheckPositionAlerts(rpt, m, map[string]StockScores{}, map[string]bool{"600000": true})
+	alerts := a.CheckPositionAlerts(rpt, m, nil, map[string]StockScores{}, map[string]bool{"600000": true})
 	if len(alerts) != 1 {
 		t.Fatalf("应产出 1 条硬止损, got %d", len(alerts))
 	}
@@ -130,7 +130,7 @@ func TestCheckPositionAlerts_TakeProfitNeedsBull(t *testing.T) {
 	// English: Opened at 40, take-profit 8% (current price 43.79 → P&L +9.47% ≥ 8% triggers), with a long signal → hint to hold.
 	rpt.LogSignal("pos-1", "600206", "有研新材", "做多", "dragon", 40.0, 8.0, 5.0)
 	scores := map[string]StockScores{"600206": {Code: "600206", SignalActive: true}}
-	alerts := a.CheckPositionAlerts(rpt, m, scores)
+	alerts := a.CheckPositionAlerts(rpt, m, nil, scores)
 	if len(alerts) != 1 {
 		t.Fatalf("应产出 1 条提醒, got %d", len(alerts))
 	}
@@ -147,7 +147,7 @@ func TestCheckPositionAlerts_TakeProfitNeedsBull(t *testing.T) {
 func TestCheckPositionAlerts_NoThreshold(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
 	rpt.LogSignal("pos-3", "600206", "有研新材", "做多", "dragon", 40.0, 0, 0)
-	alerts := a.CheckPositionAlerts(rpt, m, nil)
+	alerts := a.CheckPositionAlerts(rpt, m, nil, nil)
 	if len(alerts) != 0 {
 		t.Errorf("无阈值不应产出提醒, got %d", len(alerts))
 	}
@@ -180,7 +180,7 @@ func TestCheckPositionAlerts_DailyDrop(t *testing.T) {
 	// English: Opened at 42 with stop-loss 5% (current price 40.00 → cost P&L -4.76%, stop line not hit), but the day's change of -7% ≤ -5% → should produce a "drop alert".
 	rpt.LogSignal("pos-4", "600206", "有研新材", "做多", "dragon", 42.0, 0, 5.0)
 	m.SetTransport(&dailyDropTransport{})
-	alerts := a.CheckPositionAlerts(rpt, m, nil)
+	alerts := a.CheckPositionAlerts(rpt, m, nil, nil)
 	if len(alerts) != 1 {
 		t.Fatalf("应产出 1 条跌幅提醒, got %d", len(alerts))
 	}
@@ -203,7 +203,7 @@ func TestCheckPositionAlerts_DailyDropOff(t *testing.T) {
 	// English: Current price 40.00, day -2% > -5%, stop line not hit (cost 42 → -4.76%) → no alerts.
 	rpt.LogSignal("pos-4", "600206", "有研新材", "做多", "dragon", 42.0, 0, 5.0)
 	m.SetTransport(&quoteMockTransport{}) // f170=+10%
-	alerts := a.CheckPositionAlerts(rpt, m, nil)
+	alerts := a.CheckPositionAlerts(rpt, m, nil, nil)
 	if len(alerts) != 0 {
 		t.Errorf("当日跌幅未超阈值不应产出提醒, got %d", len(alerts))
 	}

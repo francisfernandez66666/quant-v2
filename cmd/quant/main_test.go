@@ -385,7 +385,7 @@ func TestFullPipeline(t *testing.T) {
 
 	// Step 4: CheckPositionAlerts (无持仓，应为空)
 	marketAPI := data.NewMarketAPI()
-	alerts := cAgent.CheckPositionAlerts(rpt, marketAPI, map[string]combat_agent.StockScores{})
+	alerts := cAgent.CheckPositionAlerts(rpt, marketAPI, nil, map[string]combat_agent.StockScores{})
 	if len(alerts) != 0 {
 		t.Logf("[Pipeline] Alerts (empty): %d", len(alerts))
 	}

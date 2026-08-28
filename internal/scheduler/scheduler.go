@@ -40,8 +40,8 @@ import (
 	"sync"
 	"time"
 
-	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -183,16 +183,16 @@ func (s *Scheduler) tick() {
 // 不再依赖翻 researchd 原始日志。English: visibility snapshot — lets the UI explain why tasks
 // are queued (disabled / trading window / memory gate / busy / empty) without server logs.
 type SchedulerStatus struct {
-	Ts              int64  `json:"ts"`               // 快照时间戳（unix 秒）
-	Enabled         bool   `json:"enabled"`          // 调度器是否启用
-	BeijingNow      string `json:"beijing_now"`      // 北京时间（用于核对交易时段）
-	InTradingWindow bool   `json:"in_trading_window"`// 当前是否处于交易窗口（9:15-15:00）
-	NightlyEligible bool   `json:"nightly_eligible"` // 是否处于可研究时段（盘后/休市）
-	MemAvailMB      int    `json:"mem_avail_mb"`      // 系统可用内存（MB，-1=无法读取）
-	MemGateOpen     bool   `json:"mem_gate_open"`     // 内存闸门是否放行
-	Busy            bool   `json:"busy"`              // 是否有任务在跑（唯一槽位占用）
+	Ts              int64  `json:"ts"`                  // 快照时间戳（unix 秒）
+	Enabled         bool   `json:"enabled"`             // 调度器是否启用
+	BeijingNow      string `json:"beijing_now"`         // 北京时间（用于核对交易时段）
+	InTradingWindow bool   `json:"in_trading_window"`   // 当前是否处于交易窗口（9:15-15:00）
+	NightlyEligible bool   `json:"nightly_eligible"`    // 是否处于可研究时段（盘后/休市）
+	MemAvailMB      int    `json:"mem_avail_mb"`        // 系统可用内存（MB，-1=无法读取）
+	MemGateOpen     bool   `json:"mem_gate_open"`       // 内存闸门是否放行
+	Busy            bool   `json:"busy"`                // 是否有任务在跑（唯一槽位占用）
 	BusyTask        string `json:"busy_task,omitempty"` // 当前运行任务（#id(type)）
-	Reason          string `json:"reason"`           // 人类可读的"当前为何未出队"原因
+	Reason          string `json:"reason"`              // 人类可读的"当前为何未出队"原因
 }
 
 // writeStatus 把调度可见性快照落盘（scheduler_status.json），供 quant API 读取后前端展示。

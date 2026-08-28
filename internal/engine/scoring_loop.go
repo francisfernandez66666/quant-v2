@@ -6,14 +6,18 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
@@ -56,6 +60,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// 防御：单轮 panic 不拖垮整个循环，记录日志后继续下一轮
 	defer func() {
 		if r := recover(); r != nil {
+			metrics.PanicRecovered() // §R4-9 panic 恢复计数进指标面
 			log.Printf("[engine] 打分循环 panic: %v", r)
 		}
 	}()
@@ -155,9 +160,8 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	}
 	exitSigs := e.combatAgent.CheckPositionsExits(e.rpt, exitQuotes, exitDayK, time.Now())
 	// 通用止盈/止损/当日跌幅提醒并入近实时通道（止损提醒延迟 ≤5s；消息中心按稳定键去重不重复）
-	// English: the generic take-profit / stop-loss / daily-drop alerts also run near-realtime; the message
-	// store dedups by stable key so repeated ticks just refresh the same message.
-	alertSigs := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, scores, nil)
+	// §R4-6：行情传 5s 快照（quotes），缺失的持仓才逐票兜底单查。
+	alertSigs := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, quotes, scores, nil)
 	// 逐股卖点评估（利空D1/破MA5·MA20/放量派发/动量衰竭）：对打分池全量个股独立评估，仅提醒。
 	// 仅做多（shortEnabled=false）时非持仓个股不评估、不发减仓/清仓提醒（非持仓无从减仓，纯噪音）；
 	// 做多+做空（shortEnabled=true）时评估全打分池，级别徽标按卖出方向显示为"做空"。
@@ -444,6 +448,11 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	ctrl.HealthCheck()
 	// §W6-a 周期对账（默认 5min 节流）：首尔侧主动拉网关持仓落库，终结"双向对账均不存在"的盲区
 	ctrl.MaybeReconcile(5 * time.Minute)
+	// §R4-1 撤单闭环（30s 节流 + 每日收盘清单）：未成交超时自动撤 / 占位行降级 / 收盘清单，
+	// 根除"已报委托悬置整天虚耗买入纪律预算"的悬置态（内部自节流，5s 循环调用无额外开销）
+	if res := ctrl.SweepOrders(time.Now()); res != nil {
+		_ = res // 摘要日志已在 SweepOrders 内按需打印
+	}
 
 	// §GAP2-W2 实盘建议定向化（I-4）：只读主账号（=QMT 归属账号，实盘仅 admin 开启）的持仓，
 	// SSE 只推给该账号——admin 真实持仓代码/数量/买卖建议不再每 5s 广播给所有在线用户。
@@ -462,6 +471,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 			e.mu.Lock()
 			e.m8PeakTotal = 0
 			e.mu.Unlock()
+			e.saveM8Peak(0) // §R4-7 空仓归零同步落盘
 		}
 		return
 	}
@@ -606,14 +616,17 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 // 回撤超 rules.risk_ctrl.m8_portfolio_drawdown_pct 且 m8_enabled 时全部持仓自动卖出
 // （类别 m8，按日幂等）。§GAP2-W1：空仓入口真正把峰值归零重新累计（旧实现注释宣称
 // 归零实际提前 return 从不重置——清仓后再入场会被陈旧峰值立即判定回撤并连环强平）。
+// §R4-7：峰值持久化到 accounts/<uid>/qmt_m8.json——旧实现峰值仅进程内存，盘中重启后
+// 基线从当前市值重计，回撤保护存在窗口缺口（重启前的高点被遗忘）。
 func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.DB, positions []store.RealPosition, quotes map[string]*data.StockInfo) {
 	if realStore == nil || len(positions) == 0 {
-		// §GAP2-W1 双保险归零：本函数被独立调用（如未来其他链路）时空仓同样清零基线。
-		// English: §GAP2-W1 belt-and-braces: standalone callers also see the peak reset when flat.
+		// §GAP2-W1 双保险归零：本函数被独立调用（如未来其他链路）时空仓同样清零基线
+		// （§R4-7：连同持久化文件一并归零）。
 		if len(positions) == 0 {
 			e.mu.Lock()
 			e.m8PeakTotal = 0
 			e.mu.Unlock()
+			e.saveM8Peak(0)
 		}
 		return
 	}
@@ -624,6 +637,10 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 	e.mu.RUnlock()
 	if cfgMgr == nil {
 		return
+	}
+	// §R4-7 进程内无峰值（刚重启）时从持久化文件恢复，回撤保护跨重启连续
+	if peak <= 0 {
+		peak = e.loadM8Peak()
 	}
 	rc := cfgMgr.GetRulesFor(userID).RiskCtrl
 	if !rc.M8Enabled || rc.M8PortfolioDrawdownPct >= 0 {
@@ -648,6 +665,7 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		e.mu.Lock()
 		e.m8PeakTotal = newPeak
 		e.mu.Unlock()
+		e.saveM8Peak(newPeak)
 		peak = newPeak
 	}
 	// 组合回撤触发判定（与 risk.Engine.M8Check 同式：drawdown 为负值）
@@ -664,4 +682,58 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		}
 		_ = e.sellRealPosition(ctrl, p, price, "m8", fmt.Sprintf("M8组合回撤%.1f%%兜底清仓", drawdown))
 	}
+}
+
+// qmtM8State §R4-7 M8 峰值持久化结构（accounts/<uid>/qmt_m8.json）。
+type qmtM8State struct {
+	PeakTotal float64 `json:"peak_total"` // 组合市值峰值（M8 回撤基线）
+}
+
+// m8StatePath 返回 M8 峰值持久化路径（accountsRoot/<uid>/qmt_m8.json）；
+// accountsRoot/userID 缺失（旧装配/e2e）返回空串=不持久化，行为与旧版一致。
+func (e *Engine) m8StatePath() string {
+	e.mu.RLock()
+	root, uid := e.accountsRoot, e.userID
+	e.mu.RUnlock()
+	if root == "" || uid == "" {
+		return ""
+	}
+	return filepath.Join(root, uid, "qmt_m8.json")
+}
+
+// loadM8Peak 从持久化文件恢复峰值；文件缺失/损坏/路径不可用返回 0。
+func (e *Engine) loadM8Peak() float64 {
+	path := e.m8StatePath()
+	if path == "" {
+		return 0
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	var st qmtM8State
+	if json.Unmarshal(raw, &st) != nil || st.PeakTotal < 0 {
+		return 0
+	}
+	return st.PeakTotal
+}
+
+// saveM8Peak 原子落盘峰值（temp+rename；失败仅影响下次重启的基线连续性，不阻断交易主流程）。
+func (e *Engine) saveM8Peak(peak float64) {
+	path := e.m8StatePath()
+	if path == "" {
+		return
+	}
+	raw, err := json.MarshalIndent(qmtM8State{PeakTotal: peak}, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }

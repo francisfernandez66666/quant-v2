@@ -297,7 +297,7 @@ func (c *Client) UsageStats() map[string]int64 {
 // （Message is a chat message with a role and content.）
 type Message struct {
 	// 角色（system/user/assistant）
-	Role    string `json:"role"`
+	Role string `json:"role"`
 	// 消息内容
 	Content string `json:"content"`
 }
@@ -306,7 +306,7 @@ type Message struct {
 // （ChatRequest is the chat-completion request body.）
 type ChatRequest struct {
 	// 模型名
-	Model    string    `json:"model"`
+	Model string `json:"model"`
 	// 消息列表
 	Messages []Message `json:"messages"`
 }
@@ -326,11 +326,11 @@ type ChatResponse struct {
 // llmUsage 单次请求的 token 用量元数据（OpenAI 兼容口径）。
 type llmUsage struct {
 	// 提示 token 数
-	PromptTokens     int64 `json:"prompt_tokens"`
+	PromptTokens int64 `json:"prompt_tokens"`
 	// 补全 token 数
 	CompletionTokens int64 `json:"completion_tokens"`
 	// 总 token 数
-	TotalTokens      int64 `json:"total_tokens"`
+	TotalTokens int64 `json:"total_tokens"`
 }
 
 // Chat 向 SiliconFlow API 发送对话请求。先传入 system 提示词（设定角色和输出格式），再传入 user 问题。
@@ -426,9 +426,9 @@ func (c *Client) do(req ChatRequest) (string, error) {
 type chatCompletionRequest struct {
 	ChatRequest
 	// 是否流式
-	Stream    bool `json:"stream"`
+	Stream bool `json:"stream"`
 	// 最大生成 token
-	MaxTokens int  `json:"max_tokens,omitempty"`
+	MaxTokens int `json:"max_tokens,omitempty"`
 }
 
 // streamChat 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
@@ -662,45 +662,45 @@ func ConsultSystemPrompt() string { return consultSystemPrompt }
 // （HotTopic is the structured analysis result of a hot news item.）
 type HotTopic struct {
 	// 新闻标题
-	Title               string   `json:"title"`
+	Title string `json:"title"`
 	// 事件级别：板块 / 个股
-	Level               string   `json:"level"`
+	Level string `json:"level"`
 	// 情感：正面 / 负面 / 中性
-	Sentiment           string   `json:"sentiment"`
+	Sentiment string `json:"sentiment"`
 	// 带符号强度：正=利好 负=利空 0=中性
-	Score               float64  `json:"score"`
+	Score float64 `json:"score"`
 	// 影响级别：高 / 中 / 低
-	ImpactLevel         string   `json:"impact_level"`
+	ImpactLevel string `json:"impact_level"`
 	// 事件类型：政策/财报/行业/公司/宏观/事件驱动
-	EventType           string   `json:"event_type"`
+	EventType string `json:"event_type"`
 	// 紧急程度：立即 / 关注 / 观察
-	Urgency             string   `json:"urgency"`
+	Urgency string `json:"urgency"`
 	// 方向：利好 / 利空 / 中性
-	Direction           string   `json:"direction"`
+	Direction string `json:"direction"`
 	// 直接影响板块
-	Sectors             []string `json:"sectors"`
+	Sectors []string `json:"sectors"`
 	// 上游产业链受影响板块
-	UpstreamSectors     []string `json:"upstream_sectors"`
+	UpstreamSectors []string `json:"upstream_sectors"`
 	// 下游产业链受影响板块
-	DownstreamSectors   []string `json:"downstream_sectors"`
+	DownstreamSectors []string `json:"downstream_sectors"`
 	// 关联个股名称或代码
-	RelatedStocks       []string `json:"related_stocks"`
+	RelatedStocks []string `json:"related_stocks"`
 	// 上游产业链关联个股（具体核心供应商）
-	UpstreamStocks      []string `json:"upstream_stocks"`
+	UpstreamStocks []string `json:"upstream_stocks"`
 	// 下游产业链关联个股（具体核心应用/终端）
-	DownstreamStocks    []string `json:"downstream_stocks"`
+	DownstreamStocks []string `json:"downstream_stocks"`
 	// 匹配战法：N形/龙头/双凸/龙回头/无
-	Strategy            string   `json:"strategy"`
+	Strategy string `json:"strategy"`
 	// 简要分析理由
-	Reason              string   `json:"reason"`
+	Reason string `json:"reason"`
 	// 事件来源地域：国内 / 海外
-	Region              string   `json:"region"`
+	Region string `json:"region"`
 	// 海外事件与A股板块关系：对抗制裁/合作/不涉及
-	Relation            string   `json:"relation"`
+	Relation string `json:"relation"`
 	// 上游传导方向：利好/利空/中性
-	UpstreamDirection   string   `json:"upstream_direction"`
+	UpstreamDirection string `json:"upstream_direction"`
 	// 下游传导方向：利好/利空/中性
-	DownstreamDirection string   `json:"downstream_direction"`
+	DownstreamDirection string `json:"downstream_direction"`
 }
 
 // valueChainSection 产业链价值传导推理规则：决定事件归因到产业链上/下游的准确性。
@@ -1280,45 +1280,45 @@ var plusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
 // （stage2Row is one row of the Stage2 batch response (fault-tolerant: index also accepts strings).）
 type stage2Row struct {
 	// 序号
-	Index               flexInt       `json:"index"`
+	Index flexInt `json:"index"`
 	// 事件级别（个股/板块/行业/宏观）
-	Level               string        `json:"level"`
+	Level string `json:"level"`
 	// 情绪（正面/负面/中性）
-	Sentiment           string        `json:"sentiment"`
+	Sentiment string `json:"sentiment"`
 	// 置信/影响分
-	Score               flexibleFloat `json:"score"`
+	Score flexibleFloat `json:"score"`
 	// 影响级别（高/中/低）
-	ImpactLevel         string        `json:"impact_level"`
+	ImpactLevel string `json:"impact_level"`
 	// 事件类型
-	EventType           string        `json:"event_type"`
+	EventType string `json:"event_type"`
 	// 紧迫度
-	Urgency             string        `json:"urgency"`
+	Urgency string `json:"urgency"`
 	// 方向（利好/利空）
-	Direction           string        `json:"direction"`
+	Direction string `json:"direction"`
 	// 相关板块
-	Sectors             []string      `json:"sectors"`
+	Sectors []string `json:"sectors"`
 	// 上游板块
-	UpstreamSectors     []string      `json:"upstream_sectors"`
+	UpstreamSectors []string `json:"upstream_sectors"`
 	// 下游板块
-	DownstreamSectors   []string      `json:"downstream_sectors"`
+	DownstreamSectors []string `json:"downstream_sectors"`
 	// 相关个股
-	RelatedStocks       []string      `json:"related_stocks"`
+	RelatedStocks []string `json:"related_stocks"`
 	// 上游个股
-	UpstreamStocks      []string      `json:"upstream_stocks"`
+	UpstreamStocks []string `json:"upstream_stocks"`
 	// 下游个股
-	DownstreamStocks    []string      `json:"downstream_stocks"`
+	DownstreamStocks []string `json:"downstream_stocks"`
 	// 策略建议
-	Strategy            string        `json:"strategy"`
+	Strategy string `json:"strategy"`
 	// 归因理由
-	Reason              string        `json:"reason"`
+	Reason string `json:"reason"`
 	// 地域（国内/海外）
-	Region              string        `json:"region"`
+	Region string `json:"region"`
 	// 关联关系
-	Relation            string        `json:"relation"`
+	Relation string `json:"relation"`
 	// 上游方向
-	UpstreamDirection   string        `json:"upstream_direction"`
+	UpstreamDirection string `json:"upstream_direction"`
 	// 下游方向
-	DownstreamDirection string        `json:"downstream_direction"`
+	DownstreamDirection string `json:"downstream_direction"`
 }
 
 // flexInt 兼容 JSON 中整数为数字或字符串（1 / "1"）的解析。
@@ -1455,7 +1455,7 @@ func minInt(a, b int) int {
 // （SectorTag is a parsed sector tag with a confidence weight.）
 type SectorTag struct {
 	// 板块名
-	Name       string
+	Name string
 	// 置信度 0~1（无后缀时=1.0）
 	Confidence float64
 }

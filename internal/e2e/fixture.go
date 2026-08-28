@@ -20,7 +20,7 @@ type Fixture struct {
 	// 同花顺行业列表
 	THSIndustries string `json:"ths_industries_html"`
 	// 同花顺概念列表
-	THSConcepts   string `json:"ths_concepts_html"`
+	THSConcepts string `json:"ths_concepts_html"`
 
 	// 东财行业板块列表（clist fs=m:90+t:2）。
 	// 东财板块列表
@@ -34,9 +34,9 @@ type Fixture struct {
 	// 涨停池
 	LimitUpPool []data.LimitUpStock `json:"limit_up_pool"`
 	// 龙虎榜
-	LHB         []data.LHBItem      `json:"lhb"`
+	LHB []data.LHBItem `json:"lhb"`
 	// IPO 日历
-	IPO         []data.IPOEvent     `json:"ipo"`
+	IPO []data.IPOEvent `json:"ipo"`
 
 	// 板块成分股 sectorCode -> 成分股（fs=b:<code>）。
 	// 板块成分股
@@ -72,11 +72,11 @@ type Fixture struct {
 	// 指数点位
 	IndexPrice float64 `json:"index_price"`
 	// 指数 MA20
-	IndexMA20  float64 `json:"index_ma20"`
+	IndexMA20 float64 `json:"index_ma20"`
 	// 上涨家数
-	UpCount    int     `json:"up_count"`
+	UpCount int `json:"up_count"`
 	// 下跌家数
-	DownCount  int     `json:"down_count"`
+	DownCount int `json:"down_count"`
 
 	// 场景新闻：按数据源分桶，标题/正文/时间均为可复现的固定值。
 	// 新闻回传时延

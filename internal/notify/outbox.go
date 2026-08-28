@@ -44,25 +44,25 @@ type outboxItem struct {
 // outboxPersistItem 磁盘序列化形态（无函数字段）。deliverStr 可经 owner 重建投递函数。
 type outboxPersistItem struct {
 	// 消息类型
-	Kind       string    `json:"kind"`
+	Kind string `json:"kind"`
 	// 消息内容
-	Msg        Message   `json:"msg"`
+	Msg Message `json:"msg"`
 	// 已投递尝试次数
-	Attempts   int       `json:"attempts"`
+	Attempts int `json:"attempts"`
 	// 下次重试时间
-	NextAt     time.Time `json:"next_at"`
+	NextAt time.Time `json:"next_at"`
 	// 投递策略字符串
-	DeliverStr string    `json:"deliver_str"`
+	DeliverStr string `json:"deliver_str"`
 }
 
 // Outbox 补投队列：惰性启动后台重试协程（首条入队时拉起），进程生命周期内有效。
 type Outbox struct {
-	mu          sync.Mutex    // 保护队列状态的互斥锁
-	items       []outboxItem  // 待补投消息条目
-	started     bool          // 后台重试协程是否已启动
-	stop        chan struct{} // 停止后台协程的信号通道
-	owner       *Notifier     // 重建持久化条目的投递函数用（New 时绑定）
-	persistPath string        // 非空时启用磁盘持久化（重启续发）
+	mu          sync.Mutex     // 保护队列状态的互斥锁
+	items       []outboxItem   // 待补投消息条目
+	started     bool           // 后台重试协程是否已启动
+	stop        chan struct{}  // 停止后台协程的信号通道
+	owner       *Notifier      // 重建持久化条目的投递函数用（New 时绑定）
+	persistPath string         // 非空时启用磁盘持久化（重启续发）
 	saveWG      sync.WaitGroup // 追踪在途持久化写，Stop 时等待其完成以免退出后仍在重写文件
 }
 

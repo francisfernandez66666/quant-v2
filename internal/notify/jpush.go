@@ -19,13 +19,13 @@ import (
 // appKey/masterSecret come from config — server-side only, never bundled into the APK.）
 type JPushGateway struct {
 	// 极光 AppKey
-	AppKey  string
+	AppKey string
 	// 极光 Master Secret（REST 鉴权）
-	Secret  string
+	Secret string
 	// 推送目标别名（空则默认 quant_owner）
-	Alias   string
+	Alias string
 	// 极光推送地址（默认 https://api.jpush.cn/v3/push）
-	URL     string
+	URL string
 	// HTTP 超时（默认 5s）
 	Timeout time.Duration
 }
@@ -53,13 +53,13 @@ type jpushPayload struct {
 		Alert   string `json:"alert"`
 		Android struct {
 			// 通知正文
-			Alert     string `json:"alert"`
+			Alert string `json:"alert"`
 			// 通知标题
-			Title     string `json:"title"`
+			Title string `json:"title"`
 			// 安卓渠道 ID
 			ChannelID string `json:"channel_id"`
 			// 优先级（Android）
-			Priority  int    `json:"priority"`
+			Priority int `json:"priority"`
 		} `json:"android"`
 	} `json:"notification"`
 	// 安卓推送选项

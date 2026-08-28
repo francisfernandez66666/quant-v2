@@ -8,6 +8,21 @@ const backendPort = process.env.VITE_BACKEND_PORT || '8080'
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // §R4-10 手动分包：把第三方库（tdesign/react/react-router 等 vendor）与应用代码拆开——
+    // 业务代码改动后 vendor chunk 的内容哈希不变，用户浏览器可继续命中长缓存，
+    // 首屏只需拉取小体积的应用 chunk（此前 13 页 + 全部 vendor 挤在一个 737KB 包里）。
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined
+          if (id.includes('tdesign-react') || id.includes('tdesign-icons')) return 'vendor-tdesign'
+          if (id.includes('react') || id.includes('scheduler') || id.includes('axios')) return 'vendor-react'
+          return 'vendor-misc'
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     strictPort: false,

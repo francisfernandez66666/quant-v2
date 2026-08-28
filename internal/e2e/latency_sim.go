@@ -49,7 +49,7 @@ type LatencyProfile struct {
 	// Stage2 token 数
 	Stage2Tokens int
 	// D1 token 数
-	D1Tokens     int
+	D1Tokens int
 
 	// Jitter 抖动比例(0~1)：实际延迟 ∈ base×(1, 1+Jitter)，模拟网络抖动。
 	// 抖动系数

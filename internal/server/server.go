@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"log"
 	"net"
@@ -336,6 +337,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminSetLLMConfig))
 
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
+	// §R4-9 指标面（鉴权后导出 expvar：下单/熔断/撤单/LLM 降级等关键事件计数）
+	s.mux.HandleFunc("GET /api/metrics", s.authMiddleware(http.HandlerFunc(expvar.Handler().ServeHTTP)))
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
 	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
@@ -426,6 +429,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
 	s.mux.HandleFunc("GET /api/qmt/state", s.authMiddleware(s.handleQMTState))
 	s.mux.HandleFunc("GET /api/qmt/trades", s.authMiddleware(s.handleQMTTrades))
+	// §R4-1 kill-switch 与手动撤单（admin 权限：紧急停止/撤单属资损级操作）
+	s.mux.HandleFunc("POST /api/qmt/halt", s.adminMiddleware(s.handleQMTHalt))
+	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.adminMiddleware(s.handleQMTCancel))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
 	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
 	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))

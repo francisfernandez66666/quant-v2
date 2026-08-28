@@ -227,7 +227,8 @@ type fixMinutePoint struct {
 }
 
 // ── 分时数据缓存：保留每支股票最近一次成功拉取的分时，非交易时段/数据源抖动时回退展示，
-//    避免“分时图空白”（用户预期能看到最近一次缓存的分时）。 ──
+//
+//	避免“分时图空白”（用户预期能看到最近一次缓存的分时）。 ──
 var (
 	minuteCacheMu sync.RWMutex
 	minuteCache   = map[string]*minuteCacheEntry{}

@@ -66,7 +66,7 @@ type pos struct {
 // book 网关内存账本。
 // （book is the gateway in-memory book.）
 type book struct {
-	mu        sync.Mutex       // 保护账本并发读写的互斥锁
+	mu        sync.Mutex        // 保护账本并发读写的互斥锁
 	orders    map[string]*order // 全部委托记录（键为 order_id）
 	positions map[string]*pos   // 持仓（键为 ts_code，加权成本聚合）
 	signal    map[string]string // signal_id → order_id 幂等索引（防止同信号重复下单）

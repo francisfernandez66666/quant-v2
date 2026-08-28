@@ -306,7 +306,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	t.Log("\n=== STAGE 8 ===")
 	r8 := runStage("8_PositionAlerts", func() (bool, string) {
-		alerts := cAgent.CheckPositionAlerts(rpt, api, map[string]combat_agent.StockScores{})
+		alerts := cAgent.CheckPositionAlerts(rpt, api, nil, map[string]combat_agent.StockScores{})
 		var alertDesc []string
 		for _, a := range alerts {
 			alertDesc = append(alertDesc, fmt.Sprintf("%s:%s", a.Code, a.AlertType))
@@ -334,7 +334,7 @@ func TestMonitorPipelineStages(t *testing.T) {
 			Sectors: ve, L1Score: sr.L1Score, L1Blocked: sr.L1Blocked,
 			MarketData: sr.MarketData,
 		})
-		alerts := cAgent.CheckPositionAlerts(rpt, api, map[string]combat_agent.StockScores{})
+		alerts := cAgent.CheckPositionAlerts(rpt, api, nil, map[string]combat_agent.StockScores{})
 		agg.Update(sr, vb, ve, bs, be, alerts, nil, rpt)
 		dash := agg.Current()
 		if dash == nil {

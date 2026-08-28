@@ -13,12 +13,12 @@ import (
 // RealAccount 实盘账户资产行（账户级，非持仓级）。
 // （RealAccount is one row of live account assets — account-level, not position-level.）
 type RealAccount struct {
-	UserID       string  `json:"user_id"`                 // 归属用户（空=遗留全局行）
-	AvailableCash float64 `json:"available_cash"`         // 可用资金（可买新股的钱）
-	FrozenCash   float64 `json:"frozen_cash"`             // 冻结资金
-	TotalAsset   float64 `json:"total_asset"`             // 总资产
-	MarketValue  float64 `json:"market_value"`            // 持仓市值
-	UpdatedAt    string  `json:"updated_at"`              // 更新时间
+	UserID        string  `json:"user_id"`        // 归属用户（空=遗留全局行）
+	AvailableCash float64 `json:"available_cash"` // 可用资金（可买新股的钱）
+	FrozenCash    float64 `json:"frozen_cash"`    // 冻结资金
+	TotalAsset    float64 `json:"total_asset"`    // 总资产
+	MarketValue   float64 `json:"market_value"`   // 持仓市值
+	UpdatedAt     string  `json:"updated_at"`     // 更新时间
 }
 
 // ensureRealAccountTable 幂等建表（首次上报时创建）。

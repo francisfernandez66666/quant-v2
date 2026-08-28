@@ -8,6 +8,33 @@ import (
 	"quant-trading-v2/internal/llm"
 )
 
+// TestChainScoreNoWeakFloor §R4-2 回归锚定：chainScore 不得把弱分（|score|<0.25）抬到 0.5——
+// 抬零会越过引擎 filterThreshold(0.50) 有效事件线，击穿漏斗。弱分须保持原值（落漏斗外）。
+func TestChainScoreNoWeakFloor(t *testing.T) {
+	cases := []struct {
+		in   float64
+		dir  string
+		want float64
+	}{
+		{0.10, "利好", 0.10},   // 弱利好：保持 0.10，不抬 0.5
+		{-0.20, "利空", -0.20}, // 弱利空：保持 -0.20
+		{0.60, "利好", 0.60},   // 强利好：原样
+		{-0.80, "利空", -0.80}, // 强利空：原样
+		{0.60, "中性", 0},      // 未知方向：0
+	}
+	for _, c := range cases {
+		if got := chainScore(c.in, c.dir); got != c.want {
+			t.Fatalf("chainScore(%v,%s)=%v, want %v", c.in, c.dir, got, c.want)
+		}
+	}
+	// 关键断言：任何弱分经 chainScore 后都不得越过引擎 0.5 有效线
+	for _, s := range []float64{0.05, 0.1, 0.24, -0.1, -0.24} {
+		if got := chainScore(s, "利好"); got >= 0.5 || got <= -0.5 {
+			t.Fatalf("弱分 %v 被 chainScore 抬到 %v，仍会漏进引擎 0.5 阈值", s, got)
+		}
+	}
+}
+
 // TestPostProcessPreservesExplicitScore B：LLM 明确给出非中性方向的分数应保留量化档，
 // 不再被"中性归零"误清空。
 func TestPostProcessPreservesExplicitScore(t *testing.T) {

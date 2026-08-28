@@ -35,29 +35,22 @@ func ScoreLaodeng(cfg *config.LaodengConfig, marketCap, pe, turnover float64, se
 		return 0
 	}
 
-	score := 0.0
-
-	// 市值维度（满分 0.3）：达标给满，未达标按比例线性折算（Market cap (max 0.3): full when ≥ min, else linear scaling）
-	if marketCap >= cfg.MarketCapMin {
-		score += 0.3
+	// §R4-5 修复：市值数据源未接入时（marketCap<=0）不再"假装知道市值"——
+	// 跳过市值维度，把剩余两维（PE+换手，满分 0.5）放大回 0.8 满分口径，
+	// 与有市值路径输出区间一致；旧调用方曾硬编码 marketCap=600 亿喂分，属数据造假。
+	// English: §R4-5 — when market cap is unknown (<=0), skip that dimension and scale
+	// PE+turnover (max 0.5) up to the same 0.8 scale, instead of fabricating a cap value.
+	var score float64
+	if marketCap > 0 {
+		// 有市值：市值维度（满分 0.3，达标给满否则线性折算）+ PE + 换手，满分 0.8（旧口径不变）
+		capScore := 0.3
+		if marketCap < cfg.MarketCapMin {
+			capScore = 0.3 * (marketCap / cfg.MarketCapMin)
+		}
+		score = capScore + peScore(cfg, pe) + turnScore(cfg, turnover)
 	} else {
-		score += 0.3 * (marketCap / cfg.MarketCapMin)
-	}
-
-	// 市盈率维度（满分 0.3）：PE≤上限给满，超出后线性衰减；无 PE 数据给保底 0.1（PE (max 0.3): full up to the cap, linear decay above; missing PE gets a floor of 0.1）
-	if pe > 0 && pe <= cfg.PeMax {
-		score += 0.3
-	} else if pe > 0 {
-		score += 0.3 * math.Max(0, 1-(pe-cfg.PeMax)/cfg.PeMax)
-	} else {
-		score += 0.1
-	}
-
-	// 换手率维度（满分 0.2）：达标给满，未达标按比例线性折算（Turnover (max 0.2): full when ≥ min, else linear scaling）
-	if turnover >= cfg.TurnoverMin {
-		score += 0.2
-	} else {
-		score += 0.2 * (turnover / cfg.TurnoverMin)
+		// 无市值：PE+换手（满分 0.5）等比放大到 0.8 尺度，输出区间与有市值路径一致
+		score = (peScore(cfg, pe) + turnScore(cfg, turnover)) * (0.8 / 0.5)
 	}
 
 	// 科技板块加权（乘数）：命中任一科技关键词则整体分数乘 (1+TechPenalty)
@@ -73,6 +66,27 @@ func ScoreLaodeng(cfg *config.LaodengConfig, marketCap, pe, turnover float64, se
 
 	// 最终得分收敛到 [0,1] 区间后再乘权重系数（Clamp the final score to [0,1], then apply the weight factor）
 	return math.Max(0, math.Min(1, score)) * cfg.WeightScore
+}
+
+// peScore 市盈率维度（满分 0.3）：PE≤上限给满，超出后线性衰减；无 PE 数据给保底 0.1。
+// English: the PE dimension (max 0.3) — full up to the cap, linear decay above; missing PE gets a 0.1 floor.
+func peScore(cfg *config.LaodengConfig, pe float64) float64 {
+	if pe > 0 && pe <= cfg.PeMax {
+		return 0.3
+	}
+	if pe > 0 {
+		return 0.3 * math.Max(0, 1-(pe-cfg.PeMax)/cfg.PeMax)
+	}
+	return 0.1
+}
+
+// turnScore 换手率维度（满分 0.2）：达标给满，未达标按比例线性折算。
+// English: the turnover dimension (max 0.2) — full when ≥ min, else linear scaling.
+func turnScore(cfg *config.LaodengConfig, turnover float64) float64 {
+	if turnover >= cfg.TurnoverMin {
+		return 0.2
+	}
+	return 0.2 * (turnover / cfg.TurnoverMin)
 }
 
 // IsActionWatchOrAbove 判断操作级别是否达到 watch 或以上。（IsActionWatchOrAbove reports whether an action is watch or above.）

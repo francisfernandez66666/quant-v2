@@ -148,13 +148,16 @@ func TestD1BoostDragonEndToEnd(t *testing.T) {
 type fakeAlwaysPass struct{}
 
 // Name 返回测试桩战法名称 "恒通过"。
-func (f *fakeAlwaysPass) Name() string              { return "恒通过" }
+func (f *fakeAlwaysPass) Name() string { return "恒通过" }
+
 // Type 返回战法信号类型 SignalDragon。
 func (f *fakeAlwaysPass) Type() strategy.SignalType { return strategy.SignalDragon }
+
 // Evaluate 固定返回满分级 Pass（TotalScore=80），用于隔离 D1 负面硬 veto 的拦截行为。
 func (f *fakeAlwaysPass) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{TotalScore: 80, Pass: true, Level: "full_chain", Confidence: 0.8}, nil
 }
+
 // GenerateSignal 返回买入信号，用于隔离 D1 负面硬 veto 的拦截行为。
 func (f *fakeAlwaysPass) GenerateSignal(code string, _ *strategy.Evaluation) (*strategy.Signal, error) {
 	return &strategy.Signal{Action: "buy", Name: code, Confidence: 0.8}, nil

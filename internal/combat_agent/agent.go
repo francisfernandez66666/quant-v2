@@ -501,35 +501,40 @@ func seqID() string {
 	return fmt.Sprintf("SIG%d", time.Now().UnixNano())
 }
 
-// applyLaodeng 对信号应用 Laodeng 评分修正，按评分系数提高置信度（上限 1.0）。
-// 逐信号乘以 (1+Laodeng 分)，使高分股置信度放大、低分股基本不变。
-// 入参 signals 为待修正的原始信号列表，返回修正后的新列表（不可用时原样返回）。
-// English: applies Laodeng score correction to signals, scaling each confidence by (1+Laodeng score)
-// capped at 1.0 so high-score stocks are amplified while low-score ones stay flat; returns the new list
-// or passes through unchanged when disabled/empty.
-func (a *Agent) applyLaodeng(signals []Signal) []Signal {
+// applyLaodengToSignals §R4-5 修复：对单只股票的信号应用 Laodeng 置信度修正（上限 1.0）。
+// 旧实现（applyLaodeng）对全量信号喂硬编码模拟值（市值600亿/PE12/换手2.5/白酒），
+// 等于给所有信号乘同一个常数，不具备任何选股信息。现接真实数据逐股计算：
+//   - pe：引擎打分池预取的市盈率（evalAll 入参）；
+//   - turnover：实时快照换手率（md.Quote.Turnover，%）；
+//   - sector：真实板块名（板块路径）或 "个股"（个股直入，科技加权自然不命中，保守）；
+//   - 市值：数据源缺失传 0，ScoreLaodeng 跳过该维度并归一化剩余权重（见 strategy/laodeng.go）。
+//
+// 未配置/未启用/无信号时原地不动。English: §R4-5 — applies the Laodeng confidence correction
+// per stock with REAL inputs (pool PE, live turnover, real sector name; market cap unknown → 0
+// and ScoreLaodeng renormalizes the remaining dimensions). The old stub fed one hardcoded tuple
+// to every signal, i.e. a constant multiplier with zero stock-discriminating information.
+func (a *Agent) applyLaodengToSignals(sigs []Signal, md *strategy_engine.StockMarketData, pe float64, sectorName string) {
 	a.mu.RLock()
 	cfg := a.laodengCfg
 	a.mu.RUnlock()
-
-	// 未配置/未启用/无信号时直接透传，不做修正
-	if cfg == nil || !cfg.Enabled || len(signals) == 0 {
-		return signals
+	if cfg == nil || !cfg.Enabled || len(sigs) == 0 {
+		return
 	}
-
-	out := make([]Signal, len(signals))
-	for i, s := range signals {
-		// 模拟 laodeng 评分所需数据（实际可从 marketAPI 实时查）
-		// 简化：使用默认值，后续可增强
-		laodengScore := strategy.ScoreLaodeng(cfg, 600, 12, 2.5, "白酒")
-		s.Confidence *= (1 + laodengScore)
+	turnover := 0.0
+	if md != nil && md.Quote != nil {
+		turnover = md.Quote.Turnover
+	}
+	laodengScore := strategy.ScoreLaodeng(cfg, 0, pe, turnover, sectorName)
+	if laodengScore <= 0 {
+		return
+	}
+	for i := range sigs {
+		sigs[i].Confidence *= (1 + laodengScore)
 		// 置信度封顶 1.0，避免溢出
-		if s.Confidence > 1 {
-			s.Confidence = 1
+		if sigs[i].Confidence > 1 {
+			sigs[i].Confidence = 1
 		}
-		out[i] = s
 	}
-	return out
 }
 
 // ScanLong 执行做多扫描：7a 板块利好→验证后个股→8a；8a 个股利好→直入战法。
@@ -580,9 +585,8 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 		raw = append(raw, a.evalAll(&input, runners, code, input.MarketData[code], nil, "做多", "个股", now)...)
 	}
 
-	// 最后统一套 Laodeng 评分修正置信度
-	// English: apply the unified Laodeng confidence correction at the end.
-	signals := a.applyLaodeng(raw)
+	// Laodeng 置信度修正已下沉到 evalAll 内按真实数据逐股应用（§R4-5），此处不再统一套常数
+	signals := raw
 	// 对最终信号批量附加盘口因子（买卖压力/封单量，供战法与前端使用）
 	// English: attach order-book factors (bid/ask pressure & seal volume) to final signals.
 	a.attachDepthFactors(signals)
@@ -987,6 +991,9 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 			}
 		}
 	}
+	// §R4-5 Laodeng 置信度修正：按该股真实 PE/换手率/板块名逐股计算（未启用时 no-op）。
+	// English: §R4-5 — apply the Laodeng confidence correction per stock using real PE/turnover/sector.
+	a.applyLaodengToSignals(sigs, md, pe, sectorName)
 	return sigs
 }
 
@@ -1359,9 +1366,8 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 		raw = append(raw, a.evalAll(&input, runners, code, input.MarketData[code], nil, "做空", "个股", now)...)
 	}
 
-	// 同样套 Laodeng 评分修正
-	// English: apply the same Laodeng confidence correction.
-	signals := a.applyLaodeng(raw)
+	// Laodeng 置信度修正已下沉到 evalAll 内按真实数据逐股应用（§R4-5），此处不再统一套常数
+	signals := raw
 	// 对最终信号批量附加盘口因子（买卖压力/封单量，供战法与前端使用）
 	// English: attach order-book factors (bid/ask pressure & seal volume) to final signals.
 	a.attachDepthFactors(signals)
@@ -1384,7 +1390,7 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 // from the realtime quote P/L vs thresholds. The decision depends on the position direction and current
 // same-direction signals: for longs, a live bull signal downgrades take-profit to a keep/watch hint while
 // a bear signal forces stop-loss; shorts mirror the logic with inverted signal meanings.
-func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI, scores map[string]StockScores, bearHit ...map[string]bool) []Signal {
+func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI, quotes map[string]*data.StockInfo, scores map[string]StockScores, bearHit ...map[string]bool) []Signal {
 	positions := rpt.HeldPositions()
 	if len(positions) == 0 {
 		return nil
@@ -1408,13 +1414,21 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 	}
 
 	for _, pos := range positions {
-		// 拉取实时报价，失败/为空/现价为 0（停牌未成交）则跳过该持仓，
-		// 避免以无效价格误判止盈/止损（如 0 价会算成 -100%）。
-		// English: skip when the quote is missing/invalid or the price is 0 (suspended), avoiding false
-		// P/L judgments like a 0 price counting as -100%.
-		quote, err := marketAPI.GetRealtimeQuote(pos.Code)
-		if err != nil || quote == nil || quote.Price <= 0 {
-			continue
+		// §R4-6 行情取用快照化：优先取调用方注入的 5s 快照（主循环/近实时循环批量现成），
+		// 缺失时才逐票兜底单查。此前逐持仓串行同步调 GetRealtimeQuote——持仓多时 5s 循环
+		// 被上游限流拖长（N 次网络往返/轮）。
+		// 快照缺失/无效/现价为 0（停牌未成交）时跳过该持仓，避免以无效价格误判止盈/止损
+		// （如 0 价会算成 -100%）。English: §R4-6 — prefer the injected 5s snapshot (a batch the
+		// callers already hold) and only fall back to per-position single fetches when missing,
+		// instead of N serial network calls per 5s round. Missing/invalid/zero prices skip the
+		// position to avoid false P/L judgments (a 0 price would compute as -100%).
+		quote := quotes[pos.Code]
+		if quote == nil || quote.Price <= 0 {
+			var err error
+			quote, err = marketAPI.GetRealtimeQuote(pos.Code)
+			if err != nil || quote == nil || quote.Price <= 0 {
+				continue
+			}
 		}
 
 		// 按现价计算持仓盈亏比例（%）

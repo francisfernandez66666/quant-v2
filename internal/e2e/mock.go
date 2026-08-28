@@ -575,7 +575,7 @@ func (c *llmCalls) IsFailD1() bool {
 // roleContent 咨询请求中的一条消息（role + content）。
 type roleMsg struct {
 	// 角色（system/user/assistant）
-	Role    string `json:"role"`
+	Role string `json:"role"`
 	// 消息内容
 	Content string `json:"content"`
 }
@@ -673,11 +673,11 @@ func judgeCombined(title string) combinedJudge {
 func mockStage0JSON(user string) string {
 	type item struct {
 		// 序号
-		Index          int    `json:"index"`
+		Index int `json:"index"`
 		// 分类（题材/行业/个股/板块）
-		Category       string `json:"category"`
+		Category string `json:"category"`
 		// 是否实质利好材料（区别于噪音）
-		Material       bool   `json:"material"`
+		Material bool `json:"material"`
 		// 校正后标题
 		CorrectedTitle string `json:"corrected_title"`
 	}
@@ -713,33 +713,33 @@ func mockStage0JSON(user string) string {
 // htResult 与 llm.HotTopic 同构的 JSON 输出。
 type htResult struct {
 	// 序号
-	Index             int      `json:"index"`
+	Index int `json:"index"`
 	// 事件级别（个股/板块/行业/宏观）
-	Level             string   `json:"level"`
+	Level string `json:"level"`
 	// 情绪（正面/负面/中性）
-	Sentiment         string   `json:"sentiment"`
+	Sentiment string `json:"sentiment"`
 	// 置信/影响分
-	Score             float64  `json:"score"`
+	Score float64 `json:"score"`
 	// 影响级别（高/中/低）
-	ImpactLevel       string   `json:"impact_level"`
+	ImpactLevel string `json:"impact_level"`
 	// 事件类型
-	EventType         string   `json:"event_type"`
+	EventType string `json:"event_type"`
 	// 紧迫度
-	Urgency           string   `json:"urgency"`
+	Urgency string `json:"urgency"`
 	// 方向（利好/利空）
-	Direction         string   `json:"direction"`
+	Direction string `json:"direction"`
 	// 相关板块
-	Sectors           []string `json:"sectors"`
+	Sectors []string `json:"sectors"`
 	// 上游板块
-	UpstreamSectors   []string `json:"upstream_sectors"`
+	UpstreamSectors []string `json:"upstream_sectors"`
 	// 下游板块
 	DownstreamSectors []string `json:"downstream_sectors"`
 	// 相关个股
-	RelatedStocks     []string `json:"related_stocks"`
+	RelatedStocks []string `json:"related_stocks"`
 	// 策略建议
-	Strategy          string   `json:"strategy"`
+	Strategy string `json:"strategy"`
 	// 归因理由
-	Reason            string   `json:"reason"`
+	Reason string `json:"reason"`
 }
 
 // scenarioAnalyses 场景标题 → Stage2 深度分析（确定性返回）。
@@ -808,13 +808,13 @@ func mockD1JSON(user string) string {
 	}
 	type d1Res struct {
 		// 代码
-		Code    string  `json:"code"`
+		Code string `json:"code"`
 		// 置信/影响分
-		Score   float64 `json:"score"`
+		Score float64 `json:"score"`
 		// 是否拦截
-		Blocked bool    `json:"blocked"`
+		Blocked bool `json:"blocked"`
 		// 归因理由
-		Reason  string  `json:"reason"`
+		Reason string `json:"reason"`
 	}
 	var out []d1Res
 	for _, c := range codes {

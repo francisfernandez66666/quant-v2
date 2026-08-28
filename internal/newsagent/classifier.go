@@ -208,13 +208,13 @@ var trailingJunkRe = regexp.MustCompile(`"\s*[\)']+\s*([,}\]]|$)`)
 // English: stage0Judge is the shape of a single Stage0 judgement object.
 type stage0Judge struct {
 	// 序号
-	Index     flexInt  `json:"index"`
+	Index flexInt `json:"index"`
 	// 分类（题材/行业/个股/板块）
-	Category  string   `json:"category"`
+	Category string `json:"category"`
 	// 是否实质利好材料（区别于噪音）
-	Material  flexBool `json:"material"`
+	Material flexBool `json:"material"`
 	// 是否已做中性归零/校正
-	Corrected string   `json:"corrected_title"`
+	Corrected string `json:"corrected_title"`
 }
 
 // flexInt 兼容 JSON 中整数字段为数字或字符串（如 1 或 "1"）的解析。

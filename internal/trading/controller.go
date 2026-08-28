@@ -9,12 +9,15 @@ package trading
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/store"
 )
 
@@ -50,6 +53,10 @@ type Controller struct {
 
 	// §ROBUST 早期预警：健康→失败的首跳立即告警（区别于熔断的 high 级），恢复后复位。
 	warnedUnhealthy bool // 是否已发出过健康转失败早期预警
+
+	// §R4-1 撤单闭环节流状态（mu 保护）
+	lastSweepAt       time.Time // 最近一次 SweepOrders 执行时间（30s 节流）
+	lastCloseSweepDay string    // 最近一次执行收盘清单的交易日（每日一次）
 
 	// 通知回调（告警熔断/恢复）：由上层注入（SSE/notify）。
 	onAlert func(level, title, content string) // 告警回调（可空）
@@ -178,6 +185,7 @@ func (c *Controller) setTripped(tripped bool, reason string) {
 		return
 	}
 	if tripped {
+		metrics.BreakerTripped() // §R4-9 熔断计数
 		onAlert("high", "QMT 实盘熔断", reason)
 	} else {
 		onAlert("info", "QMT 实盘恢复", "网关连接恢复，自动解熔")
@@ -273,16 +281,31 @@ func (c *Controller) fireOnAlert(level, title, content string) {
 	}
 }
 
-// PlaceOrder 下单（幂等 + 熔断 + 前置守卫）。
+// PlaceOrder 下单入口（§R4-9 指标接线）：统计成功/被拒后委托 placeOrder 执行真实守卫链。
+// English: PlaceOrder wraps placeOrder, counting accepted vs rejected orders for metrics.
+func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
+	res, err := c.placeOrder(req)
+	if err != nil {
+		metrics.OrdersRejected()
+	} else if res == nil || !res.OK {
+		metrics.OrdersRejected()
+	} else {
+		metrics.OrdersPlaced()
+	}
+	return res, err
+}
+
+// placeOrder 下单（幂等 + 熔断 + 前置守卫）。
 //   - 熔断中：拒绝新下单并返回错误；
 //   - 前置守卫（ST/单日纪律/白名单/仓位上限）全部通过后才落库占位——不打算下的单绝不写 orders 表，
 //     避免被拒订单留下幽灵行污染当日统计；
 //   - signal_id 已在 orders 表：返回已存在（幂等，不重复下单）。
 //
-// English: PlaceOrder places an order with idempotency, breaker and pre-checks — rejects while tripped;
-// all guards (ST / daily discipline / whitelist / position cap) run BEFORE the pending ticket is
-// persisted so rejected orders never leave phantom rows; a signal_id already in the table short-circuits.
-func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
+// English: placeOrder runs the full guard chain with idempotency + breaker + pre-checks — rejects
+// while tripped; all guards (ST / daily discipline / whitelist / position cap) run BEFORE the pending
+// ticket is persisted so rejected orders never leave phantom rows; a signal_id already in the table
+// short-circuits.
+func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// §R3-1 P0-C 下单互斥：整段串行化（见结构体字段注释）。
 	c.orderMu.Lock()
 	defer c.orderMu.Unlock()
@@ -295,6 +318,14 @@ func (c *Controller) PlaceOrder(req OrderRequest) (*OrderResult, error) {
 	c.mu.RUnlock()
 	if !cfg.Enabled {
 		return nil, fmt.Errorf("qmt disabled")
+	}
+	// §R4-1 kill-switch（人工紧急停止）：置位时拒绝一切新下单（auto 与手动全路径）。
+	// 已报未成交委托由 SweepOrders 撤单闭环 / HaltAll 处理；卖出同样被拦——紧急停止语义下
+	// 一切柜台动作都停，宁可人工接手也不让系统在未知状态下继续动作。
+	// English: §R4-1 kill switch — when engaged, ALL new orders (auto & manual, both sides) are
+	// rejected; unfilled tickets are handled by SweepOrders/HaltAll. Deliberate fail-stop semantics.
+	if cfg.Halted {
+		return nil, fmt.Errorf("qmt kill-switch engaged (halted=true)：人工紧急停止中，拒绝一切新下单")
 	}
 	if c.store == nil {
 		return nil, fmt.Errorf("qmt store not set")
@@ -509,6 +540,22 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 				avail, cfg.InitialCapital, held, spent, amount)
 		}
 	}
+	// §R4-3 真实可用资金回灌：网关 account 事件（broker.query_asset）落库的券商口径可用资金，
+	// 在新鲜（10 分钟内）时作为额外硬约束。券商 cash 口径已扣除其侧冻结（含已报未成交单），
+	// 故此处不再扣减本地 spent，避免与券商冻结双重扣减；近似口径检查仍然并行生效——
+	// 两道闸都过才放行，任一拒绝即拒单。
+	// English: §R4-3 feeds the broker-side available cash (gateway account report) back into the
+	// buy discipline as an extra hard gate when fresh (≤10min). Broker cash already nets out its
+	// own frozen amounts, so local `spent` is NOT subtracted again (no double-count); the legacy
+	// approximation still runs in parallel — both gates must pass.
+	if acc, err := c.store.GetRealAccount(c.userID); err == nil && acc.AvailableCash > 0 {
+		if at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc); perr == nil {
+			if time.Since(at) <= 10*time.Minute && amount > acc.AvailableCash {
+				return fmt.Errorf("可用资金不足(券商口径): 可用 %.2f < 本次 %.2f（上报于 %s）",
+					acc.AvailableCash, amount, acc.UpdatedAt)
+			}
+		}
+	}
 	return nil
 }
 
@@ -577,6 +624,178 @@ func (c *Controller) MaybeReconcile(interval time.Duration) {
 			log.Printf("[trading] 周期对账完成: %d 持仓已与网关同步", len(poses))
 		}
 	}()
+}
+
+// CancelOrder §R4-1 手动撤单：撤网关委托并把本地行推进为"已撤"。撤单失败如实返回错误
+// （网关 409=已成交/已撤/无法撤，交由回报线程推进状态），绝不吞掉失败让首尔误判成功。
+// English: §R4-1 manual cancel — cancels at the gateway and marks the local row 已撤 on success;
+// failures surface as errors (gateway 409 = filled/cancelled/uncancellable → let report thread progress).
+func (c *Controller) CancelOrder(orderID string) error {
+	c.mu.RLock()
+	enabled := c.cfg.Enabled
+	c.mu.RUnlock()
+	if !enabled {
+		return fmt.Errorf("qmt disabled")
+	}
+	if err := c.exec.Cancel(orderID); err != nil {
+		return err
+	}
+	if c.store != nil {
+		if err := c.store.UpdateRealOrderStatus(orderID, "已撤"); err != nil {
+			log.Printf("[trading] cancel mark local %s: %v", orderID, err)
+		}
+	}
+	return nil
+}
+
+// HaltAll §R4-1 kill-switch 配套：撤销本地账本中全部"已报"未成交委托（非占位行），
+// 返回成功撤销数。占位行（pend:，从未到达网关）不撤——由 MarkRealOrderSendFailed 降级口径处理。
+// English: §R4-1 kill-switch companion — cancels every unfilled 已报 (non-placeholder) order;
+// returns the successfully cancelled count. Placeholders are left to the send-failed demotion path.
+func (c *Controller) HaltAll() int {
+	if c.store == nil {
+		return 0
+	}
+	orders, err := c.store.RealOrders()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, o := range orders {
+		if o.Status != "已报" || strings.HasPrefix(o.OrderID, "pend:") {
+			continue
+		}
+		if err := c.exec.Cancel(o.OrderID); err != nil {
+			log.Printf("[trading] HaltAll 撤单失败 %s: %v", o.OrderID, err)
+			continue
+		}
+		if err := c.store.UpdateRealOrderStatus(o.OrderID, "已撤"); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// SweepResult 撤单闭环单轮执行摘要。
+// （SweepResult is one cancel-sweep round's summary.）
+type SweepResult struct {
+	Cancelled  int  // 成功撤销的未成交单数
+	Demoted    int  // 占位行降级为发送失败的笔数
+	Skipped    int  // 时间不可解析等跳过数
+	Errors     int  // 撤单失败笔数（已成交被拒/网关暂不可撤等，留回报线程处理）
+	CloseSweep bool // 本轮是否执行了收盘清单
+}
+
+// SweepOrders §R4-1 撤单闭环主入口（30s 节流，由引擎 5s 循环调用）：
+//  1. 未成交超时自动撤：orders 表 状态=已报 且滞留超过 cancel_stale_sec（默认 120s）→
+//     调网关撤单，成功即把本地行推进为"已撤"。撤单被拒（已成交/交易所号未回报）不重试强撤，
+//     交由回报线程（§R4-4 单调状态机）推进真实状态；
+//  2. 占位行清理：pend: 占位（从未到达网关）滞留超时 → MarkRealOrderSendFailed 降级，
+//     释放同 signal_id 重试通道，不再整天虚耗买入纪律预算；
+//  3. 收盘清单：到达 close_sweep_at（北京时，默认 14:52）且当日未执行过 → 对当日全部
+//     "已报"未成交委托撤单（A 股收盘前清掉悬置单，资金/持仓状态归零进清算）。
+//
+// 熔断中跳过（网关不可达时撤单必然失败，避免错误风暴）。English: §R4-1 cancel-loop entry
+// (30s throttled, called from the engine's 5s cycle): stale unfilled auto-cancel, placeholder
+// demotion, and the once-a-day pre-close cancel list. Skipped while the breaker is open.
+func (c *Controller) SweepOrders(now time.Time) *SweepResult {
+	c.mu.RLock()
+	cfg := c.cfg
+	last := c.lastSweepAt
+	c.mu.RUnlock()
+	if !cfg.Enabled || c.store == nil || c.Tripped() {
+		return nil
+	}
+	if now.Sub(last) < 30*time.Second {
+		return nil
+	}
+	c.mu.Lock()
+	c.lastSweepAt = now
+	c.mu.Unlock()
+
+	// 阈值解析：-1=关闭自动撤单；0=默认 120s
+	staleSec := cfg.CancelStaleSec
+	if staleSec == 0 {
+		staleSec = 120
+	}
+
+	// 收盘清单判定：北京时到达 close_sweep_at（默认 1452）且本交易日未执行过
+	bj := cntime.In(now)
+	day := bj.Format("20060102")
+	hhmm := bj.Hour()*100 + bj.Minute()
+	closeAt := cfg.CloseSweepAt
+	if closeAt == 0 {
+		closeAt = 1452
+	}
+	closeSweep := false
+	if closeAt > 0 && hhmm >= closeAt && data.IsTradingDay(bj) {
+		c.mu.RLock()
+		lastDay := c.lastCloseSweepDay
+		c.mu.RUnlock()
+		if lastDay != day {
+			c.mu.Lock()
+			c.lastCloseSweepDay = day
+			c.mu.Unlock()
+			closeSweep = true
+		}
+	}
+	if staleSec < 0 && !closeSweep {
+		return nil // 自动撤单已关闭且未到收盘清单时刻
+	}
+
+	orders, err := c.store.RealOrders()
+	if err != nil {
+		log.Printf("[trading] 撤单闭环读取订单失败: %v", err)
+		return nil
+	}
+	res := &SweepResult{CloseSweep: closeSweep}
+	staleAfter := time.Duration(staleSec) * time.Second
+	for _, o := range orders {
+		if o.Status != "已报" {
+			continue
+		}
+		at, perr := time.Parse(time.RFC3339, o.CreatedAt)
+		if perr != nil {
+			res.Skipped++
+			continue
+		}
+		age := now.Sub(cntime.In(at))
+		if strings.HasPrefix(o.OrderID, "pend:") {
+			// 占位行从未到达网关：超时降级为"发送失败"（同 signal_id 可重试）
+			if staleSec > 0 && age > staleAfter {
+				if err := c.store.MarkRealOrderSendFailed(o.SignalID); err == nil {
+					res.Demoted++
+				} else {
+					res.Errors++
+				}
+			}
+			continue
+		}
+		if !((staleSec > 0 && age > staleAfter) || closeSweep) {
+			continue
+		}
+		if err := c.exec.Cancel(o.OrderID); err != nil {
+			res.Errors++
+			// 典型失败：交易所委托号尚未回报（网关暂不可撤）/ 已成交（撤单被拒）——
+			// 不强试，交由回报线程推进真实状态，下轮再评估
+			log.Printf("[trading] 自动撤单被拒 %s(%s %s qty=%d, 滞留%s): %v",
+				o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), err)
+			continue
+		}
+		if err := c.store.UpdateRealOrderStatus(o.OrderID, "已撤"); err != nil {
+			res.Errors++
+			continue
+		}
+		res.Cancelled++
+		metrics.OrdersCancelled() // §R4-9 撤单计数
+		log.Printf("[trading] 自动撤单成功 %s %s %s qty=%d (滞留%s, 收盘清单=%v)",
+			o.OrderID, o.Code, o.Side, o.Qty, age.Round(time.Second), closeSweep)
+	}
+	if res.Cancelled+res.Demoted > 0 || closeSweep {
+		log.Printf("[trading] 撤单闭环本轮: 撤销=%d 占位降级=%d 失败=%d 跳过=%d 收盘清单=%v",
+			res.Cancelled, res.Demoted, res.Errors, res.Skipped, closeSweep)
+	}
+	return res
 }
 
 // tripReasonLocked 返回熔断原因（不加锁，调用方需持锁/已检查）。

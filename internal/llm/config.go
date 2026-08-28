@@ -8,13 +8,13 @@ import "time"
 // （Config is the LLM client configuration: API key, request URL, model name and per-request timeout.）
 type Config struct {
 	// API 密钥，用于认证
-	APIKey  string
+	APIKey string
 	// 多 API 密钥（并发请求按 key 轮询分发，突破单 key 限流；为空时回退 APIKey）
 	APIKeys []string
 	// API 请求地址（如 https://api.openai.com/v1/chat/completions）
-	APIURL  string
+	APIURL string
 	// 模型名称（如 gpt-4、deepseek-chat 等）
-	Model   string
+	Model string
 	// 单次请求超时（<=0 时 New 兜底为 60s）
 	Timeout time.Duration
 
@@ -50,7 +50,7 @@ type Config struct {
 	// English: §GAP5.1 cost governance — daily call/token budgets (0 = unlimited); once exceeded,
 	// new requests are rejected until the next day.
 	// 日调用预算（0=不限）
-	DailyCallBudget  int64
+	DailyCallBudget int64
 	// 日 token 预算（0=不限）
 	DailyTokenBudget int64
 }

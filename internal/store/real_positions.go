@@ -262,8 +262,8 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	switch {
 	case err == sql.ErrNoRows:
 		// 首次成交：建仓（卖出空仓视为 no-op，仅记录 fills，不建行）。
-	// §实盘账户隔离：INSERT 必须写入 user_id，将该持仓归属到来源成交的账号，
-	// 否则该持仓会落入 user_id='' 的遗留全局行，对所有账号可见，造成跨账号持仓泄漏。
+		// §实盘账户隔离：INSERT 必须写入 user_id，将该持仓归属到来源成交的账号，
+		// 否则该持仓会落入 user_id='' 的遗留全局行，对所有账号可见，造成跨账号持仓泄漏。
 		err = nil
 		if f.Side == "买入" {
 			_, err = tx.Exec(`INSERT INTO real_positions
@@ -418,6 +418,57 @@ func (d *DB) RealOrders() ([]RealOrder, error) {
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// orderStatusRank §R4-4 委托状态单调推进秩：回报乱序/重放时绝不回退真实进度。
+// 终态（已成/已撤/部撤/废单）秩最高；未报/待报视同初始已报。
+// English: §R4-4 monotonic rank for order-report statuses so out-of-order/replayed reports
+// never roll real progress back; terminal states rank highest.
+func orderStatusRank(status string) int {
+	switch status {
+	case "已成", "已撤", "部撤", "废单":
+		return 6
+	case "部成待撤":
+		return 4
+	case "部成":
+		return 3
+	case "已报待撤":
+		return 2
+	case "已报":
+		return 1
+	default: // 未报/待报/未知 → 初始档
+		return 1
+	}
+}
+
+// AdvanceRealOrderStatus §R4-4 带单调守卫的委托状态推进（按 signal_id 定位）：
+// 仅当回报状态的秩高于本地当前秩时才更新——修掉"回报 部成/已成/已撤 被 INSERT OR IGNORE
+// 静默吞掉、本地永远停留已报"的状态机断链（该断链会让自动撤单误撤已成交单，资损级前置）。
+// 返回 (是否实际更新, 错误)。
+// English: §R4-4 guarded status advance keyed by signal_id — updates only when the reported
+// status outranks the local one, fixing the silent-swallow hole where 部成/已成/已撤 reports
+// never landed (a prerequisite before any auto-cancel can be trusted).
+func (d *DB) AdvanceRealOrderStatus(signalID, status string) (bool, error) {
+	var cur string
+	err := d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=?`, signalID).Scan(&cur)
+	if err == sql.ErrNoRows {
+		return false, nil // 本地无此单（如网侧重放的历史单）：交由调用方决定是否补插
+	}
+	if err != nil {
+		return false, err
+	}
+	if orderStatusRank(status) <= orderStatusRank(cur) {
+		return false, nil // 乱序/重放/回退：忽略
+	}
+	res, err := d.db.Exec(`UPDATE orders SET status=? WHERE signal_id=?`, status, signalID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // RealFills 返回全部实盘成交回报（倒序）。

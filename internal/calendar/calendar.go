@@ -13,11 +13,11 @@ import (
 // （Event is a macro event with date, title, impact level and days of advance notice.）
 type Event struct {
 	// 事件发生日期
-	Date        time.Time
+	Date time.Time
 	// 事件标题
-	Title       string
+	Title string
 	// 影响程度（high/medium/low）
-	Impact      string
+	Impact string
 	// 提前显示/提醒天数
 	DaysAdvance int
 }

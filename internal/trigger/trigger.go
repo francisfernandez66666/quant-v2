@@ -21,9 +21,9 @@ import (
 // （Config is the real-time trigger configuration, mirroring daban's TriggerConf.）
 type Config struct {
 	// 观测窗口（秒），默认 6
-	Sec      int
+	Sec int
 	// 秒均涨幅阈值（%/s），默认 0.125
-	RaRate   float64
+	RaRate float64
 	// 秒成交额阈值（元/s），默认 20万
 	StockAmt float64
 	// 同股触发冷却，默认 5 分钟
@@ -45,23 +45,23 @@ func DefaultConfig() Config {
 // （Signal is a real-time trigger signal.）
 type Signal struct {
 	// 股票代码
-	Code      string    `json:"code"`
+	Code string `json:"code"`
 	// 股票名称
-	Name      string    `json:"name"`
+	Name string `json:"name"`
 	// 当前价
-	Price     float64   `json:"price"`
+	Price float64 `json:"price"`
 	// 当日涨跌幅（%）
-	ChangePct float64   `json:"change_pct"`
+	ChangePct float64 `json:"change_pct"`
 	// 窗口秒均涨幅（%/s）
-	SecRise   float64   `json:"sec_rise"`
+	SecRise float64 `json:"sec_rise"`
 	// 窗口秒成交额（元/s）
-	SecAmt    float64   `json:"sec_amt"`
+	SecAmt float64 `json:"sec_amt"`
 	// 窗口秒均换手（%/s）
-	SecTurn   float64   `json:"sec_turn"`
+	SecTurn float64 `json:"sec_turn"`
 	// 触发描述
-	Msg       string    `json:"msg"`
+	Msg string `json:"msg"`
 	// 触发时间
-	At        time.Time `json:"at"`
+	At time.Time `json:"at"`
 }
 
 // tickState 单只股票的窗口滑动状态，记录上一 tick 的快照用于计算差分指标。

@@ -16,52 +16,52 @@ import (
 // （LaodengConfig is the configuration for the Laodeng scoring system.）
 type LaodengConfig struct {
 	// 是否启用 Laodeng 评分修正
-	Enabled      bool    `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// 最低流通市值（亿）
 	MarketCapMin float64 `json:"market_cap_min"`
 	// 最大市盈率阈值
-	PeMax        float64 `json:"pe_max"`
+	PeMax float64 `json:"pe_max"`
 	// 最低换手率
-	TurnoverMin  float64 `json:"turnover_min"`
+	TurnoverMin float64 `json:"turnover_min"`
 	// 技术面扣分系数
-	TechPenalty  float64 `json:"tech_penalty"`
+	TechPenalty float64 `json:"tech_penalty"`
 	// 评分权重
-	WeightScore  float64 `json:"weight_score"`
+	WeightScore float64 `json:"weight_score"`
 }
 
 // Rules 顶层规则配置，包含情绪周期、策略、板块、风控等完整配置。
 // （Rules is the top-level rules config aggregating emotion cycle, strategy, sector, risk control, etc.）
 type Rules struct {
 	// 情绪周期阶段阈值
-	Emotion    EmotionConfig    `json:"emotion_cycle"`
+	Emotion EmotionConfig `json:"emotion_cycle"`
 	// 各策略参数
-	Strategy   StrategyConfig   `json:"strategy"`
+	Strategy StrategyConfig `json:"strategy"`
 	// Laodeng 评分
-	Laodeng    LaodengConfig    `json:"laodeng"`
+	Laodeng LaodengConfig `json:"laodeng"`
 	// 主线板块配置
 	MainSector MainSectorConfig `json:"main_sector"`
 	// LLM 客户端配置
-	LLM        LLMConfig        `json:"llm"`
+	LLM LLMConfig `json:"llm"`
 	// 主题/黑名单配置
-	Theme      ThemeConfig      `json:"theme"`
+	Theme ThemeConfig `json:"theme"`
 	// 风控参数
-	RiskCtrl   RiskCtrlConfig   `json:"risk_ctrl"`
+	RiskCtrl RiskCtrlConfig `json:"risk_ctrl"`
 	// 仓位管理参数
-	Position   PositionConfig   `json:"position"`
+	Position PositionConfig `json:"position"`
 	// 通知推送参数
-	Notify     NotifyConfig     `json:"notify"`
+	Notify NotifyConfig `json:"notify"`
 	// 研究调度器配置（quant-research 服务读取）
-	Scheduler  SchedulerConfig  `json:"scheduler"`
+	Scheduler SchedulerConfig `json:"scheduler"`
 	// 模拟盘/纸面交易配置
-	Paper      PaperConfig      `json:"paper"`
+	Paper PaperConfig `json:"paper"`
 	// 东莞证券 MiniQMT 实盘交易配置
-	QMT        QMTConfig        `json:"qmt"`
+	QMT QMTConfig `json:"qmt"`
 	// 运行时内存治理配置
-	Runtime    RuntimeConfig    `json:"runtime"`
+	Runtime RuntimeConfig `json:"runtime"`
 	// 数据源配置（§HITHINK_DATA_SOURCE_PLAN）
-	Data       DataConfig       `json:"data"`
+	Data DataConfig `json:"data"`
 	// 宏观日历补充事件（§R3-8 P1-J 接线：此前类型定义存在但从未挂到 Rules）
-	Calendar   CalendarConfig   `json:"calendar"`
+	Calendar CalendarConfig `json:"calendar"`
 }
 
 // RuntimeConfig 运行时内存治理配置：盘后释放常驻服务内存，避免与夜间研究作业叠加触发 OOM。
@@ -90,11 +90,11 @@ type RuntimeConfig struct {
 // isolated from the real book. Off by default; when enabled the engine fills each signal round.
 type PaperConfig struct {
 	// 总开关（默认 false）
-	Enabled        bool    `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// 每票固定买入资金（元，默认 10000）
-	FixedAmount    float64 `json:"fixed_amount"`
+	FixedAmount float64 `json:"fixed_amount"`
 	// 最大并行持仓数（默认 10）
-	MaxPositions   int     `json:"max_positions"`
+	MaxPositions int `json:"max_positions"`
 	// 初始资金（元，默认 100000）
 	InitialCapital float64 `json:"initial_capital"`
 	// AutoSell 卖出信号自动成交开关（阶段1.1 全自动执行）：nil/未配置=开启。开启时 清仓/减仓/
@@ -189,6 +189,20 @@ type QMTConfig struct {
 	// Advice 持仓处理分析层（实盘持仓）规则参数。
 	// 持仓处理分析层规则参数
 	Advice QMTAdviceConfig `json:"advice"`
+	// Halted §R4-1 kill-switch（人工紧急停止）：true 时拒绝一切新下单（auto 与手动全路径），
+	// 已报未成交委托由撤单闭环/停机清单处理。经 POST /api/qmt/halt 切换并持久化。
+	// English: §R4-1 kill switch — when true every new order (auto & manual) is rejected;
+	// unfilled tickets are handled by the cancel sweep / close list. Toggled via POST /api/qmt/halt.
+	Halted bool `json:"halted"`
+	// CancelStaleSec §R4-1 未成交自动撤单阈值（秒）：已报超过该秒数仍未成交/未推进状态即自动撤单
+	//（0=默认 120；-1=关闭自动撤单，仅保留收盘清单）。
+	// English: §R4-1 stale-order auto-cancel threshold in seconds (0 = default 120; -1 disables).
+	CancelStaleSec int `json:"cancel_stale_sec"`
+	// CloseSweepAt §R4-1 收盘清单时刻（北京时 HHMM）：到达后对当日全部"已报"未成交委托撤单
+	//（0=默认 1452；-1=关闭收盘清单）。
+	// English: §R4-1 close-list time (Beijing HHMM) — cancels all unfilled 已报 orders of the day
+	// (0 = default 1452; -1 disables).
+	CloseSweepAt int `json:"close_sweep_at"`
 }
 
 // DefaultQMTConfig 返回 QMT 实盘配置出厂默认：enabled=false（默认关闭）、manual 半自动、对手价。
@@ -220,13 +234,13 @@ func DefaultQMTConfig() QMTConfig {
 // ThsFactorsReady：同花顺复权因子对账门禁——未通过(false)时 HfqBars 仍走旧表。
 type DataConfig struct {
 	// hithink(同花顺(新)优先) | baostock(旧表)
-	PrimarySource     string `json:"primary_source"`
+	PrimarySource string `json:"primary_source"`
 	// 复权因子对账门禁（默认 false）
-	ThsFactorsReady   bool   `json:"ths_factors_ready"`
+	ThsFactorsReady bool `json:"ths_factors_ready"`
 	// 夜间链自动追加全库寻优步骤（默认 false=推荐制手动触发）
-	OptimizeEnabled   bool   `json:"optimize_enabled"`
+	OptimizeEnabled bool `json:"optimize_enabled"`
 	// 择优结果自动应用（默认 false=推荐制需人工审批）
-	OptimizeAutoApply bool   `json:"optimize_auto_apply"`
+	OptimizeAutoApply bool `json:"optimize_auto_apply"`
 }
 
 // SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
@@ -236,17 +250,17 @@ type DataConfig struct {
 // weekends run the full nightly research job.
 type SchedulerConfig struct {
 	// 总开关（默认 true）
-	Enabled             bool                      `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// research 二进制路径
-	ResearchBin         string                    `json:"research_bin"`
+	ResearchBin string `json:"research_bin"`
 	// dataload 二进制路径
-	DataloadBin         string                    `json:"dataload_bin"`
+	DataloadBin string `json:"dataload_bin"`
 	// 研究库路径（trading.db）
-	DB                  string                    `json:"db"`
+	DB string `json:"db"`
 	// baostock sidecar 地址（默认 http://127.0.0.1:8787）
-	PyURL               string                    `json:"pyurl"`
+	PyURL string `json:"pyurl"`
 	// 盘后/周末夜间作业
-	Nightly             NightlyConfig             `json:"nightly"`
+	Nightly NightlyConfig `json:"nightly"`
 	// 交易时段增量下载
 	DataloadDuringTrade DataloadDuringTradeConfig `json:"dataload_during_trading"`
 	// StepTimeoutMin 夜间作业单步超时（分钟，默认 90，0=用默认）：超时 kill 子进程并记 error，
@@ -270,23 +284,23 @@ type SchedulerConfig struct {
 	MinFreeMemMB int `json:"min_free_mem_mb"`
 	// §数据源路由（§HITHINK_DATA_SOURCE_PLAN）：研究/回测取数主源与复权门禁。
 	// hithink | baostock（默认 baostock=旧表，安全）
-	PrimarySource   string `json:"primary_source"`
+	PrimarySource string `json:"primary_source"`
 	// 复权对账门禁：通过后置 true，HfqBars 才走 ths 因子
-	ThsFactorsReady bool   `json:"ths_factors_ready"`
+	ThsFactorsReady bool `json:"ths_factors_ready"`
 	// 夜间自动寻优开关（默认 true，推荐制）
-	OptimizeEnabled bool   `json:"optimize_enabled"`
+	OptimizeEnabled bool `json:"optimize_enabled"`
 }
 
 // NightlyConfig 夜间研究作业配置（盘后/周末触发）。
 type NightlyConfig struct {
 	// 交易日盘后启动时间 HHMM（默认 1530）
-	StartHHMM        int      `json:"start_hhmm"`
+	StartHHMM int `json:"start_hhmm"`
 	// 周末启动时间 HHMM（默认 1530，周六周日各跑一次）
-	WeekendStartHHMM int      `json:"weekend_start_hhmm"`
+	WeekendStartHHMM int `json:"weekend_start_hhmm"`
 	// 步骤序列（dataload/sector_rebuild/discover_factors/discover_patterns/list）
-	Steps            []string `json:"steps"`
+	Steps []string `json:"steps"`
 	// 单步失败是否终止整链（默认 false=记录后继续）
-	AbortOnError     bool     `json:"abort_on_error"`
+	AbortOnError bool `json:"abort_on_error"`
 	// BacktestEnabled 是否在发现因子候选后追加一次 B4 全链路回测，把候选的「回测超额」
 	// （avg_excess）填上（前端原本显示"未测"）。默认 false（省时省 CPU）。
 	// English: when true, after factor discovery the nightly job also runs a B4 full-chain backtest
@@ -302,9 +316,9 @@ type NightlyConfig struct {
 // DataloadDuringTradeConfig 交易时段增量下载配置（只下载，不含任何研究/回测）。
 type DataloadDuringTradeConfig struct {
 	// 开关（默认 true）
-	Enabled         bool `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// 间隔分钟（默认 30）
-	IntervalMinutes int  `json:"interval_minutes"`
+	IntervalMinutes int `json:"interval_minutes"`
 }
 
 // DefaultSchedulerConfig 返回研究调度器出厂默认配置。
@@ -345,15 +359,15 @@ func DefaultSchedulerConfig() SchedulerConfig {
 // close-out/stop-loss alerts fire.）
 type NotifyConfig struct {
 	// Webhook 地址列表（空则只走桌面/SSE）
-	WebhookURLs []string   `json:"webhook_urls,omitempty"`
+	WebhookURLs []string `json:"webhook_urls,omitempty"`
 	// 外部推送网关配置（APK 后台/离线触达）
-	Push        PushConfig `json:"push,omitempty"`
+	Push PushConfig `json:"push,omitempty"`
 	// §GAP5.2 静默时段："HH:MM"~"HH:MM"（可跨午夜，如 22:00~08:00）；任一为空=不启用。
 	// 窗口内仅高级别（LevelHigh：交易信号/清仓/止损）放行，低/中级别本地日志留痕不推送。
 	// 静默时段开始（HH:MM）
 	QuietStart string `json:"quiet_start,omitempty"`
 	// 静默时段结束（HH:MM）
-	QuietEnd   string `json:"quiet_end,omitempty"`
+	QuietEnd string `json:"quiet_end,omitempty"`
 }
 
 // PushConfig 外部推送网关配置。
@@ -365,17 +379,17 @@ type NotifyConfig struct {
 // POSTs JSON to URL. Enabled=false disables the gateway.）
 type PushConfig struct {
 	// 是否启用外部推送网关
-	Enabled  bool   `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// 网关类型：jpush | webhook（默认 webhook）
 	Provider string `json:"provider"`
 	// webhook 推送接收地址（JSON POST）
-	URL      string `json:"url,omitempty"`
+	URL string `json:"url,omitempty"`
 	// 极光 AppKey（服务端推送鉴权用）
-	AppKey   string `json:"app_key,omitempty"`
+	AppKey string `json:"app_key,omitempty"`
 	// 极光 Master Secret（服务端推送鉴权用，勿入库/勿进 APK）
-	Secret   string `json:"secret,omitempty"`
+	Secret string `json:"secret,omitempty"`
 	// 极光推送目标设备别名（默认 quant_owner）
-	Alias    string `json:"alias,omitempty"`
+	Alias string `json:"alias,omitempty"`
 }
 
 // EmotionConfig 情绪周期六个阶段（冰点/启动/发酵/高潮/背离/退潮）的判定阈值。
@@ -384,47 +398,47 @@ type PushConfig struct {
 // divergence/retreat), jointly determined by bounds on limit-up count, open-board rate, etc.）
 type EmotionConfig struct {
 	// 冰点期：涨停家数上限
-	EmoIceBoardMax        int     `json:"emo_ice_board_max"`
+	EmoIceBoardMax int `json:"emo_ice_board_max"`
 	// 冰点期：连板高度上限
-	EmoIceLimitupMax      int     `json:"emo_ice_limitup_max"`
+	EmoIceLimitupMax int `json:"emo_ice_limitup_max"`
 	// 冰点期：炸板率下限
-	EmoIceBlastMin        float64 `json:"emo_ice_blast_min"`
+	EmoIceBlastMin float64 `json:"emo_ice_blast_min"`
 	// 启动期：涨停家数上限
-	EmoStartBoardMax      int     `json:"emo_start_board_max"`
+	EmoStartBoardMax int `json:"emo_start_board_max"`
 	// 启动期：连板高度下限
-	EmoStartLimitupMin    int     `json:"emo_start_limitup_min"`
+	EmoStartLimitupMin int `json:"emo_start_limitup_min"`
 	// 启动期：连板高度上限
-	EmoStartLimitupMax    int     `json:"emo_start_limitup_max"`
+	EmoStartLimitupMax int `json:"emo_start_limitup_max"`
 	// 启动期：炸板率下限
-	EmoStartBlastMin      float64 `json:"emo_start_blast_min"`
+	EmoStartBlastMin float64 `json:"emo_start_blast_min"`
 	// 启动期：炸板率上限
-	EmoStartBlastMax      float64 `json:"emo_start_blast_max"`
+	EmoStartBlastMax float64 `json:"emo_start_blast_max"`
 	// 发酵期：涨停家数上限
-	EmoFermentBoardMax    int     `json:"emo_ferment_board_max"`
+	EmoFermentBoardMax int `json:"emo_ferment_board_max"`
 	// 发酵期：连板高度下限
-	EmoFermentLimitupMin  int     `json:"emo_ferment_limitup_min"`
+	EmoFermentLimitupMin int `json:"emo_ferment_limitup_min"`
 	// 发酵期：连板高度上限
-	EmoFermentLimitupMax  int     `json:"emo_ferment_limitup_max"`
+	EmoFermentLimitupMax int `json:"emo_ferment_limitup_max"`
 	// 发酵期：炸板率上限
-	EmoFermentBlastMax    float64 `json:"emo_ferment_blast_max"`
+	EmoFermentBlastMax float64 `json:"emo_ferment_blast_max"`
 	// 高潮期：涨停家数下限
-	EmoClimaxBoardMin     int     `json:"emo_climax_board_min"`
+	EmoClimaxBoardMin int `json:"emo_climax_board_min"`
 	// 高潮期：连板高度下限
-	EmoClimaxLimitupMin   int     `json:"emo_climax_limitup_min"`
+	EmoClimaxLimitupMin int `json:"emo_climax_limitup_min"`
 	// 高潮期：炸板率上限
-	EmoClimaxBlastMax     float64 `json:"emo_climax_blast_max"`
+	EmoClimaxBlastMax float64 `json:"emo_climax_blast_max"`
 	// 背离期：涨停家数相对峰值回落家数
-	EmoDivergeBoardDrop   int     `json:"emo_diverge_board_drop"`
+	EmoDivergeBoardDrop int `json:"emo_diverge_board_drop"`
 	// 背离期：连板高度相对峰值回落
-	EmoDivergeLimitupDrop int     `json:"emo_diverge_limitup_drop"`
+	EmoDivergeLimitupDrop int `json:"emo_diverge_limitup_drop"`
 	// 背离期：炸板率抬升幅度
-	EmoDivergeBlastRise   float64 `json:"emo_diverge_blast_rise"`
+	EmoDivergeBlastRise float64 `json:"emo_diverge_blast_rise"`
 	// 退潮期：涨停家数上限
-	EmoRetreatBoardMax    int     `json:"emo_retreat_board_max"`
+	EmoRetreatBoardMax int `json:"emo_retreat_board_max"`
 	// 退潮期：连板高度上限
-	EmoRetreatLimitupMax  int     `json:"emo_retreat_limitup_max"`
+	EmoRetreatLimitupMax int `json:"emo_retreat_limitup_max"`
 	// 退潮期：炸板率下限
-	EmoRetreatBlastMin    float64 `json:"emo_retreat_blast_min"`
+	EmoRetreatBlastMin float64 `json:"emo_retreat_blast_min"`
 	// BlockBuyPhases 禁止开仓的情绪周期阶段列表（C5）：这些阶段下四战法均不发买入信号
 	// （降级为 watch 观察）。空列表时默认仅 ["衰退"]（与 N 形既有情绪硬闸一致）。
 	// English: emotion phases in which buying is forbidden (C5) — all four strategies downgrade buy
@@ -451,11 +465,11 @@ type MainSectorConfig struct {
 // （LLMConfig is the LLM client connection configuration.）
 type LLMConfig struct {
 	// LLM API 地址
-	APIURL     string `json:"api_url"`
+	APIURL string `json:"api_url"`
 	// 模型名称
-	Model      string `json:"model"`
+	Model string `json:"model"`
 	// 单次请求超时（秒），缺省 60
-	TimeoutSec int    `json:"timeout_sec"`
+	TimeoutSec int `json:"timeout_sec"`
 	// Stream 流式（SSE）响应开关。nil（缺省/未配置）= 开启（推理模型非流式首字极慢，
 	// 恒开流式 + 内部回落为默认策略）；显式 false = 关闭，走一次性非流式。
 	// 是否启用流式响应
@@ -478,7 +492,7 @@ type LLMConfig struct {
 	// §GAP5.1 成本治理：当日调用次数 / token 总量预算（0=不设限）。超限后当日新请求熔断，
 	// 次日自动恢复。LLM 是系统最大可变成本，此前用量完全不可见、无任何上限。
 	// 当日 LLM 调用次数预算
-	DailyCallBudget  int64 `json:"daily_call_budget"`
+	DailyCallBudget int64 `json:"daily_call_budget"`
 	// Daily鉴权TokenBudget
 	DailyTokenBudget int64 `json:"daily_token_budget"`
 }
@@ -503,9 +517,9 @@ type ThemeConfig struct {
 // （DrawdownRule defines a drawdown rule: when the threshold is hit, the action fires.）
 type DrawdownRule struct {
 	// 回撤百分比阈值
-	Pct    float64 `json:"pct"`
+	Pct float64 `json:"pct"`
 	// 触发操作（如 "减仓"/"清仓"）
-	Action string  `json:"action"`
+	Action string `json:"action"`
 }
 
 // ComplianceConfig 合规配置。
@@ -519,13 +533,13 @@ type ComplianceConfig struct {
 // （RiskCtrlConfig is the risk-control config: stop-loss rules, compliance mode, portfolio drawdown cap, etc.）
 type RiskCtrlConfig struct {
 	// 合规模式
-	Compliance             ComplianceConfig `json:"compliance"`
+	Compliance ComplianceConfig `json:"compliance"`
 	// 是否启用 M8 风控
-	M8Enabled              bool             `json:"m8_enabled"`
+	M8Enabled bool `json:"m8_enabled"`
 	// 组合最大回撤百分比
-	M8PortfolioDrawdownPct float64          `json:"m8_portfolio_drawdown_pct"`
+	M8PortfolioDrawdownPct float64 `json:"m8_portfolio_drawdown_pct"`
 	// 单只股票最大仓位比例
-	PerStockMax            float64          `json:"per_stock_max"`
+	PerStockMax float64 `json:"per_stock_max"`
 }
 
 // StopLossConfig 止损配置：买入后回撤阶梯规则。
@@ -566,17 +580,17 @@ type PositionConfig struct {
 // （StrategyConfig holds the per-strategy parameter configuration.）
 type StrategyConfig struct {
 	// 龙头战法配置
-	Dragon       DragonConfig       `json:"dragon"`
+	Dragon DragonConfig `json:"dragon"`
 	// 双响炮战法配置
-	DoubleBump   DoubleBumpConfig   `json:"double_bump"`
+	DoubleBump DoubleBumpConfig `json:"double_bump"`
 	// N 形战法配置
-	NShape       NShapeConfig       `json:"n_shape"`
+	NShape NShapeConfig `json:"n_shape"`
 	// 龙回头战法配置
 	DragonReturn DragonReturnConfig `json:"dragon_return"`
 	// 动量分权重配置
-	Momentum     MomentumConfig     `json:"momentum"`
+	Momentum MomentumConfig `json:"momentum"`
 	// 宏观利空门控配置
-	MacroGate    MacroGateConfig    `json:"macro_gate"`
+	MacroGate MacroGateConfig `json:"macro_gate"`
 }
 
 // MacroGateConfig 宏观利空门控（E1）：股指期货交割日等高影响宏观事件作为整体利空，
@@ -615,11 +629,11 @@ type MomentumConfig struct {
 	// 量价分权重（0~100）
 	VolumePriceWeight float64 `json:"volume_price_weight"`
 	// MACD分权重（0~100）
-	MACDWeight        float64 `json:"macd_weight"`
+	MACDWeight float64 `json:"macd_weight"`
 	// 走势分权重（0~100）
-	TrendWeight       float64 `json:"trend_weight"`
+	TrendWeight float64 `json:"trend_weight"`
 	// 动量分触发信号阈值（默认 60）
-	SignalThreshold   float64 `json:"signal_threshold"`
+	SignalThreshold float64 `json:"signal_threshold"`
 	// BuySignalThreshold 动量买入阈值：动量分 ≥ 此值且数据有效时发 buy 级信号（进模拟盘自动撮合，
 	// 归动量池）。默认 75（高于 watch 阈值 60 一档，避免动量信号大量直接转买单）；≤0 时回退默认。
 	// English: momentum BUY threshold — score at/above this (with valid data) emits a buy signal that
@@ -643,29 +657,29 @@ type MomentumConfig struct {
 // （DragonConfig tunes the dragon-leader strategy: multi-factor weights, drawdown/take-profit/stop-loss thresholds, buy conditions.）
 type DragonConfig struct {
 	// F1 封单强度权重
-	F1SealWeight           float64 `json:"f1_seal_weight"`
+	F1SealWeight float64 `json:"f1_seal_weight"`
 	// F2 板块共振权重
-	F2ResonanceWeight      float64 `json:"f2_resonance_weight"`
+	F2ResonanceWeight float64 `json:"f2_resonance_weight"`
 	// F3 溢价权重
-	F3PremiumWeight        float64 `json:"f3_premium_weight"`
+	F3PremiumWeight float64 `json:"f3_premium_weight"`
 	// F4 相对强度(RS)权重
-	F4RsWeight             float64 `json:"f4_rs_weight"`
+	F4RsWeight float64 `json:"f4_rs_weight"`
 	// 买入后最大回撤容忍比例
-	PullbackMaxPct         float64 `json:"pullback_max_pct"`
+	PullbackMaxPct float64 `json:"pullback_max_pct"`
 	// 破板跌幅达此值减半仓
-	BreakerSellHalfPct     float64 `json:"breaker_sell_half_pct"`
+	BreakerSellHalfPct float64 `json:"breaker_sell_half_pct"`
 	// 破板跌幅达此值清仓
-	BreakerSellAllPct      float64 `json:"breaker_sell_all_pct"`
+	BreakerSellAllPct float64 `json:"breaker_sell_all_pct"`
 	// 买入后回撤减半仓阈值
 	BuyPullbackSellHalfPct float64 `json:"buy_pullback_sell_half_pct"`
 	// 买入后回撤清仓阈值
-	BuyPullbackSellAllPct  float64 `json:"buy_pullback_sell_all_pct"`
+	BuyPullbackSellAllPct float64 `json:"buy_pullback_sell_all_pct"`
 	// 买入日收盘低于买入价比例止损
-	BuyDayCloseBelow       float64 `json:"buy_day_close_below"`
+	BuyDayCloseBelow float64 `json:"buy_day_close_below"`
 	// 次日开盘低于此比例则卖出
-	NextOpenIfBelow        float64 `json:"next_open_if_below"`
+	NextOpenIfBelow float64 `json:"next_open_if_below"`
 	// 止盈比例(%)，浮盈达此值落袋（默认 10）
-	TakeProfitPct          float64 `json:"take_profit_pct"`
+	TakeProfitPct float64 `json:"take_profit_pct"`
 	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
 	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
 	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
@@ -673,30 +687,30 @@ type DragonConfig struct {
 	// 移动止盈回撤幅度(%)
 	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
 	// 最长持仓天数
-	MaxHoldDays         int     `json:"max_hold_days,omitempty"`
+	MaxHoldDays int `json:"max_hold_days,omitempty"`
 }
 
 // DoubleBumpConfig 双响炮战法参数：一突/二突放量倍数、调整周期、仓位比例等。
 // （DoubleBumpConfig tunes the double-bump strategy: first/second breakout volume multiples, adjustment window, position ratios.）
 type DoubleBumpConfig struct {
 	// 一突放量倍数阈值
-	FirstBreakVolumeMultiple  float64 `json:"first_break_volume_multiple"`
+	FirstBreakVolumeMultiple float64 `json:"first_break_volume_multiple"`
 	// 二突放量倍数阈值
 	SecondBreakVolumeMultiple float64 `json:"second_break_volume_multiple"`
 	// 调整期最大量比
-	AdjustVolRatioMax         float64 `json:"adjust_vol_ratio_max"`
+	AdjustVolRatioMax float64 `json:"adjust_vol_ratio_max"`
 	// 调整超期天数（超期判弱）
-	AdjustDaysOverflow        int     `json:"adjust_days_overflow"`
+	AdjustDaysOverflow int `json:"adjust_days_overflow"`
 	// 第二波当日最低涨跌幅(%)：<=该值判无效，水下不评买入
-	MinChangePct              float64 `json:"min_change_pct"`
+	MinChangePct float64 `json:"min_change_pct"`
 	// 仓位因子权重
-	PositionWeight            float64 `json:"position_weight"`
+	PositionWeight float64 `json:"position_weight"`
 	// 均线因子权重
-	MAWeight                  float64 `json:"ma_weight"`
+	MAWeight float64 `json:"ma_weight"`
 	// 量能因子权重
-	VolumeWeight              float64 `json:"volume_weight"`
+	VolumeWeight float64 `json:"volume_weight"`
 	// 双响炮止盈比例
-	DoubleBumpTakeProfitPct   float64 `json:"double_bump_take_profit_pct"`
+	DoubleBumpTakeProfitPct float64 `json:"double_bump_take_profit_pct"`
 	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
 	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
 	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
@@ -704,7 +718,7 @@ type DoubleBumpConfig struct {
 	// 移动止盈回撤幅度(%)
 	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
 	// 最长持仓天数
-	MaxHoldDays         int     `json:"max_hold_days,omitempty"`
+	MaxHoldDays int `json:"max_hold_days,omitempty"`
 }
 
 // NShapeConfig N 形战法参数：D1~D4 评分阈值、旗形整理区间、突破量比等。
@@ -713,7 +727,7 @@ type NShapeConfig struct {
 	// N 形形态总分阈值
 	NPatternScoreThreshold float64 `json:"n_pattern_score_threshold"`
 	// 硬止损比例
-	HardStopLoss           float64 `json:"hard_stop_loss"`
+	HardStopLoss float64 `json:"hard_stop_loss"`
 	// §扫参应用（STRATEGY_OPTIMIZE_PLAN）：移动止盈回撤%(从阶段高点)与最长持仓天数。
 	// 0=不启用（保持既有退出规则不变）；>0 时由 CheckExit 在既有规则之前执行——
 	// 与扫参的统一出场引擎同语义，寻优冠军参数可一键应用到实盘且口径一致。
@@ -721,35 +735,35 @@ type NShapeConfig struct {
 	// 移动止盈回撤幅度(%)
 	TrailingDrawbackPct float64 `json:"trailing_drawback_pct,omitempty"`
 	// 最长持仓天数
-	MaxHoldDays         int     `json:"max_hold_days,omitempty"`
+	MaxHoldDays int `json:"max_hold_days,omitempty"`
 }
 
 // DragonReturnConfig 龙回头战法参数：回调幅度、量缩比、止盈止损、持仓天数等。
 // （DragonReturnConfig tunes the dragon-return strategy: pullback depth, volume-shrink ratio, take-profit/stop-loss, hold days.）
 type DragonReturnConfig struct {
 	// 止损比例
-	StopLossPct       float64 `json:"stop_loss_pct"`
+	StopLossPct float64 `json:"stop_loss_pct"`
 	// 止盈比例
-	TakeProfitPct     float64 `json:"take_profit_pct"`
+	TakeProfitPct float64 `json:"take_profit_pct"`
 	// 最长持仓天数
-	MaxHoldDays       int     `json:"max_hold_days"`
+	MaxHoldDays int `json:"max_hold_days"`
 	// 目标价 1 倍数
 	Target1Multiplier float64 `json:"target1_multiplier"`
 	// 目标价 2 倍数
 	Target2Multiplier float64 `json:"target2_multiplier"`
 	// 移动止盈回撤幅度
-	TrailingDrawback  float64 `json:"trailing_drawback"`
+	TrailingDrawback float64 `json:"trailing_drawback"`
 }
 
 // D1Rule D1 事件匹配规则：模式匹配、方向、评分、是否阻断。
 // （D1Rule is an event-matching rule for D1 scoring: pattern, direction, score and block flag.）
 type D1Rule struct {
 	// 方向：利好/利空
-	Direction string  `json:"direction"`
+	Direction string `json:"direction"`
 	// 匹配得分
-	Score     float64 `json:"score"`
+	Score float64 `json:"score"`
 	// 是否阻断（负面事件）
-	Blocked   bool    `json:"blocked,omitempty"`
+	Blocked bool `json:"blocked,omitempty"`
 }
 
 // D1Config D1 事件匹配规则集 + 四战法软加成配置。
@@ -806,7 +820,7 @@ const perUserLongShortKey = "quant_config_longshort_v1"
 // （LongShortConfig holds the per-account long/short toggle state.）
 type LongShortConfig struct {
 	// 做多开关（默认开）
-	LongEnabled  bool `json:"long_enabled"`
+	LongEnabled bool `json:"long_enabled"`
 	// 做空开关（默认关）
 	ShortEnabled bool `json:"short_enabled"`
 }
@@ -1320,22 +1334,22 @@ func cfgObject(m map[string]json.RawMessage, key string) (map[string]json.RawMes
 // （CalendarEvent is an entry of a macro-calendar event.）
 type CalendarEvent struct {
 	// 事件日期（YYYY-MM-DD）
-	Date        string `json:"date"`
+	Date string `json:"date"`
 	// 事件标题
-	Title       string `json:"title"`
+	Title string `json:"title"`
 	// 影响程度（high/medium/low）
-	Impact      string `json:"impact"`
+	Impact string `json:"impact"`
 	// 提前提醒天数
-	DaysAdvance int    `json:"days_advance"`
+	DaysAdvance int `json:"days_advance"`
 }
 
 // CalendarConfig 宏观日历配置。
 // （CalendarConfig is the macro-calendar configuration.）
 type CalendarConfig struct {
 	// 是否启用日历告警
-	Enabled bool            `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// 事件列表
-	Events  []CalendarEvent `json:"events"`
+	Events []CalendarEvent `json:"events"`
 }
 
 // DefaultRules 默认交易规则实例（未初始化字段为零值）。

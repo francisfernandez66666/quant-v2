@@ -455,7 +455,7 @@ func TestFullPipelineMock(t *testing.T) {
 
 	// ─── Step 6: Display ───
 	t.Logf("\n=== [6/6] Display Aggregator ===")
-	alertSignals := cAgent.CheckPositionAlerts(rpt, api, map[string]combat_agent.StockScores{})
+	alertSignals := cAgent.CheckPositionAlerts(rpt, api, nil, map[string]combat_agent.StockScores{})
 	agg.Update(sr, verifiedBull, verifiedBear, bullSignals, bearSignals, alertSignals, nil, rpt)
 	dash := agg.Current()
 	if dash == nil {

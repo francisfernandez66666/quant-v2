@@ -197,3 +197,51 @@ func TestQMTReportAuthzGatewayTokenOnly(t *testing.T) {
 		t.Fatalf("网关 token 应通过鉴权, got %d", code)
 	}
 }
+
+// TestHandleQMTReportOrderAdvancesStatus §R4-4 接线回归：网关委托状态回报
+// （部成/已成）必须推进本地订单行——旧实现 UpsertRealOrder（INSERT OR IGNORE）
+// 把状态回报静默吞掉，本地永远停留"已报"。
+func TestHandleQMTReportOrderAdvancesStatus(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+
+	// 种一单本地"已报"
+	if _, err := db.UpsertRealOrder(store.RealOrder{OrderID: "pend:S-ADV", SignalID: "S-ADV",
+		Code: "600519.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100,
+		CreatedAt: "2026-08-20T09:31:00+08:00", UserID: ""}); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+
+	// 回报 部成 → 本地行应推进
+	reqBody := `{"type":"order","order_id":"O-ADV","signal_id":"S-ADV","code":"600519.SH","side":"买入","status":"部成","price":10,"qty":100,"at":"2026-08-20T09:32:00+08:00"}`
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	assertOrderStatus := func(want string) {
+		t.Helper()
+		orders, _ := db.RealOrders()
+		for _, o := range orders {
+			if o.SignalID == "S-ADV" {
+				if o.Status != want {
+					t.Fatalf("订单状态应=%s, got %s", want, o.Status)
+				}
+				return
+			}
+		}
+		t.Fatal("订单行丢失")
+	}
+	assertOrderStatus("部成")
+
+	// 回报 已成 → 推进
+	reqBody = `{"type":"order","order_id":"O-ADV","signal_id":"S-ADV","code":"600519.SH","side":"买入","status":"已成","price":10,"qty":100,"at":"2026-08-20T09:33:00+08:00"}`
+	rr = httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	assertOrderStatus("已成")
+
+	// 重放 已报 → 绝不回退
+	reqBody = `{"type":"order","order_id":"O-ADV","signal_id":"S-ADV","code":"600519.SH","side":"买入","status":"已报","price":10,"qty":100,"at":"2026-08-20T09:34:00+08:00"}`
+	rr = httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	assertOrderStatus("已成")
+}

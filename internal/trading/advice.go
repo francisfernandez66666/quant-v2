@@ -83,8 +83,8 @@ func Advise(in AdviceInput) []PositionAdvice {
 		for _, sig := range in.Agent.CheckPositionsExits(view, in.Quotes, in.DayKLines, now) {
 			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
 		}
-		// 2. 卖出侧：通用止盈/止损/跌幅提醒
-		for _, sig := range in.Agent.CheckPositionAlerts(view, in.MarketAPI, in.Scores) {
+		// 2. 卖出侧：通用止盈/止损/跌幅提醒（§R4-6：行情走调用方注入的快照，缺失兜底单查）
+		for _, sig := range in.Agent.CheckPositionAlerts(view, in.MarketAPI, in.Quotes, in.Scores) {
 			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
 		}
 		// 3. 卖出侧：卖点评估（利空D1/破MA/放量派发/动量衰竭）

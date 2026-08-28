@@ -31,9 +31,9 @@ type PushGateway interface {
 // self-hosted APK relay or a generic JSON push gateway; vendor channels can terminate at this URL.）
 type WebhookGateway struct {
 	// 推送接收地址
-	URL       string
+	URL string
 	// HTTP 请求超时（默认 5s）
-	Timeout   time.Duration
+	Timeout time.Duration
 	// 可选的 User-Agent 标识
 	UserAgent string
 }

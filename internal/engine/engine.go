@@ -31,6 +31,7 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/paper"
@@ -142,6 +143,7 @@ func (e *Engine) LastRunTiming() *RunTiming {
 // to LLM failure, keeping it visible to operators.）
 func (e *Engine) recordLLMDegrade(reason string, affected int) {
 	n := atomic.AddInt64(&llmDegradeCount, 1)
+	metrics.LLMDegraded() // §R4-9 LLM 降级计数进指标面
 	log.Printf("[engine][LLM降级#%d] %s, 影响条数=%d", n, reason, affected)
 }
 
@@ -2392,6 +2394,7 @@ func (e *Engine) TryAsyncRun(ctx context.Context, since time.Time) bool {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
+				metrics.PanicRecovered() // §R4-9 panic 恢复计数进指标面
 				log.Printf("[engine] 异步Run panic(本轮跳过): %v\n%s", r, debug.Stack())
 			}
 			atomic.StoreInt32(&e.asyncBusy, 0)
@@ -2790,8 +2793,9 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	_trackerT := time.Since(_stepTracker)
 
 	// 13. 持仓止盈/止损提醒（传入当轮打分表 + 利空板块信号：有反向信号才硬推止盈/止损）
+	// §R4-6：行情优先走 5s 快照（批量），缺失持仓才逐票兜底单查。
 	_stepAlerts := time.Now()
-	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, stockScores, bearHitCodes(sr))
+	alertSignals := e.combatAgent.CheckPositionAlerts(e.rpt, e.marketAPI, e.snapshotQuotes(), stockScores, bearHitCodes(sr))
 	_alertsT := time.Since(_stepAlerts)
 
 	// 13b. 战法退出引擎实时评估（移动止盈/分批止盈/尾盘强平/破位/超期 等卖点提醒，仅提醒不自动执行）。

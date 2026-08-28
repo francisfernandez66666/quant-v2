@@ -396,13 +396,26 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 	case "order":
 		if ev.OrderID != "" && ev.SignalID != "" {
-			if _, err := db.UpsertRealOrder(store.RealOrder{
-				OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
-				Side: ev.Side, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
-				CreatedAt: ev.At,
-				UserID:    uid, // §W2-10 委托行打归属账号
-			}); err != nil {
-				log.Printf("[trading] upsert order: %v", err)
+			// §R4-4 委托状态推进：回报的 部成/已成/已撤/部撤/废单 必须写入本地行——
+			// 旧实现 UpsertRealOrder 是 INSERT OR IGNORE（signal_id 冲突即忽略），状态回报被
+			// 静默吞掉、本地永远停留"已报"，撤单闭环/对账全部失真。现走单调守卫的
+			// AdvanceRealOrderStatus：秩高于本地才更新，乱序/重放/回退绝不覆盖真实进度。
+			// 本地无此单时（网侧重放等）回落原 INSERT OR IGNORE 行为补插。
+			advanced, err := db.AdvanceRealOrderStatus(ev.SignalID, ev.Status)
+			if err != nil {
+				log.Printf("[trading] advance order status: %v", err)
+			}
+			if !advanced {
+				if _, err := db.UpsertRealOrder(store.RealOrder{
+					OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
+					Side: ev.Side, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
+					CreatedAt: ev.At,
+					UserID:    uid, // §W2-10 委托行打归属账号
+				}); err != nil {
+					log.Printf("[trading] upsert order: %v", err)
+				}
+			} else if ev.Status != "已报" {
+				log.Printf("[trading] 委托状态推进 %s: %s (order=%s)", ev.SignalID, ev.Status, ev.OrderID)
 			}
 		}
 	case "trade":
@@ -493,7 +506,11 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		"daily_budget_amount": cfg.DailyBudgetAmount,
 		"auto_sell":           cfg.AutoSell,
 		"miss_heartbeat_sec":  cfg.MissHeartbeatSec,
-		"known_strategies":    s.knownStrategyList(),
+		// §R4-1 kill-switch 与撤单闭环参数
+		"halted":           cfg.Halted,
+		"cancel_stale_sec": cfg.CancelStaleSec,
+		"close_sweep_at":   cfg.CloseSweepAt,
+		"known_strategies": s.knownStrategyList(),
 	})
 }
 
@@ -513,6 +530,10 @@ type setQMTConfigReq struct {
 	DailyBudgetAmount *float64            `json:"daily_budget_amount"`
 	AutoSell          *bool               `json:"auto_sell"`
 	MissHeartbeatSec  *int                `json:"miss_heartbeat_sec"`
+	// §R4-1 kill-switch 与撤单闭环参数
+	Halted         *bool `json:"halted"`
+	CancelStaleSec *int  `json:"cancel_stale_sec"`
+	CloseSweepAt   *int  `json:"close_sweep_at"`
 }
 
 // handleSetQMTConfig 处理 POST /api/config/qmt：局部合并保存当前账号实盘配置并热加载生效。
@@ -542,18 +563,18 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.PriceType = p
 	}
-		if req.GatewayURL != nil {
-			u := strings.TrimSpace(*req.GatewayURL)
-			if u != "" && u != cfg.GatewayURL {
-				// 网关为内部可信端点（本机/局域网），用宽松校验（允许环回/私网），
-				// 不能用公网外呼的 validatePublicURL（会拒绝 127.0.0.1/内网地址）。
-				if err := validateGatewayURL(u); err != nil {
-					writeError(w, 400, "gateway_url "+err.Error())
-					return
-				}
+	if req.GatewayURL != nil {
+		u := strings.TrimSpace(*req.GatewayURL)
+		if u != "" && u != cfg.GatewayURL {
+			// 网关为内部可信端点（本机/局域网），用宽松校验（允许环回/私网），
+			// 不能用公网外呼的 validatePublicURL（会拒绝 127.0.0.1/内网地址）。
+			if err := validateGatewayURL(u); err != nil {
+				writeError(w, 400, "gateway_url "+err.Error())
+				return
 			}
-			cfg.GatewayURL = u
 		}
+		cfg.GatewayURL = u
+	}
 	if req.Token != nil && *req.Token != "" && !isMaskedSecret(*req.Token) {
 		cfg.Token = strings.TrimSpace(*req.Token)
 	}
@@ -604,6 +625,26 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg.MissHeartbeatSec = *req.MissHeartbeatSec
+	}
+	// §R4-1 kill-switch 与撤单闭环参数（范围校验：cancel_stale_sec -1/0/30-3600；close_sweep_at -1/0/1300-1500）
+	if req.Halted != nil {
+		cfg.Halted = *req.Halted
+	}
+	if req.CancelStaleSec != nil {
+		v := *req.CancelStaleSec
+		if v != -1 && v != 0 && (v < 30 || v > 3600) {
+			writeError(w, 400, "cancel_stale_sec 仅允许 -1(关闭)/0(默认120)/30-3600")
+			return
+		}
+		cfg.CancelStaleSec = v
+	}
+	if req.CloseSweepAt != nil {
+		v := *req.CloseSweepAt
+		if v != -1 && v != 0 && (v < 1300 || v > 1500) {
+			writeError(w, 400, "close_sweep_at 仅允许 -1(关闭)/0(默认1452)/1300-1500（北京时 HHMM）")
+			return
+		}
+		cfg.CloseSweepAt = v
 	}
 	if req.Strategies != nil {
 		seen := map[string]bool{}
@@ -666,6 +707,73 @@ func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, ctrl.Snapshot())
+}
+
+// handleQMTHalt §R4-1 kill-switch 端点（POST /api/qmt/halt，admin 权限）：
+//   - 请求体 {"halted": true}：置位人工紧急停止——立即拒绝一切新下单（auto/manual 双路径），
+//     并同步撤销本地账本全部"已报"未成交委托（HaltAll），SSE 告警广播；
+//   - {"halted": false}：解除停止，恢复正常下单（熔断仍按健康探测独立生效）。
+//
+// 持久化走 per-user QMT 配置（SetQMTConfigFor），跨重启保留。
+// English: §R4-1 kill-switch endpoint (admin) — halted=true rejects every new order and cancels
+// all unfilled tickets immediately (HaltAll) with an SSE alert; halted=false releases the stop.
+// Persisted per-user, survives restarts.
+func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Halted *bool `json:"halted"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Halted == nil {
+		writeError(w, 400, "invalid request body: 需要 {\"halted\": true|false}")
+		return
+	}
+	uid := userIDFor(r)
+	cfg := *(s.cfg.GetQMTConfigFor(uid))
+	cfg.Halted = *req.Halted
+	s.cfg.SetQMTConfigFor(uid, &cfg)
+	ctrl := s.qmtCtrlFor(uid)
+	cancelled := 0
+	if *req.Halted && ctrl != nil {
+		cancelled = ctrl.HaltAll()
+	}
+	log.Printf("[trading] ⚠️ kill-switch %s (用户=%s): 同步撤销未成交委托 %d 笔",
+		map[bool]string{true: "置位——紧急停止一切下单", false: "解除"}[*req.Halted], uid, cancelled)
+	if s.sse != nil {
+		s.sse.BroadcastTo(uid, map[string]interface{}{
+			"type":      "qmt_halt",
+			"halted":    *req.Halted,
+			"cancelled": cancelled,
+			"time":      time.Now().Format("15:04:05"),
+		})
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": "1", "halted": *req.Halted, "cancelled": cancelled})
+}
+
+// handleQMTCancel §R4-1 手动撤单端点（POST /api/qmt/cancel/{order_id}，admin 权限）：
+// 撤销指定网关委托并把本地行推进为"已撤"；失败（已成交/已撤/网关不可达）如实返回 409/502。
+// English: §R4-1 manual cancel endpoint (admin) — cancels one gateway order; failures surface
+// honestly (409 filled/cancelled, 502 gateway unreachable).
+func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
+	orderID := r.PathValue("order_id")
+	if strings.TrimSpace(orderID) == "" {
+		writeError(w, 400, "order_id required")
+		return
+	}
+	ctrl := s.qmtCtrlFor(userIDFor(r))
+	if ctrl == nil {
+		writeError(w, 503, "real book not available")
+		return
+	}
+	if err := ctrl.CancelOrder(orderID); err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "not connected") || strings.Contains(msg, "circuit") {
+			writeError(w, 502, "撤单失败: "+msg)
+			return
+		}
+		writeError(w, 409, "撤单失败(已成交/已撤/不可撤): "+msg)
+		return
+	}
+	log.Printf("[trading] 手动撤单成功 %s (用户=%s)", orderID, userIDFor(r))
+	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
 // qmtStrategyOf 从 signal_id 解析战法归属：buy:<码>:<战法>:<日> → 战法名；其余（sell:/manual@）→ manual。

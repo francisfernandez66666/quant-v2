@@ -2,7 +2,7 @@
 // 主布局：侧边栏导航（TDesign Menu）+ 顶部栏（TDesign Header）+ 内容区（Routes）；未登录显示登录页。
 // 全局逻辑：登录态恢复、15s 状态轮询、SSE 推送订阅、做空开关、通知测试、Toast 提示。
 // 全站使用 TDesign React 组件 + 浅色主题（默认，不设置 theme 即为浅色）。
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, Suspense, lazy } from 'react'
 import { NavLink, Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
 import { ConfigProvider, Menu, Switch, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
 import * as api from './api/index.js'
@@ -10,19 +10,32 @@ import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThr
 import { showToast, showNotify } from './ui.jsx'
 
 import Dashboard from './pages/Dashboard.jsx'
-import Signals from './pages/Signals.jsx'
-import Watchlist from './pages/Watchlist.jsx'
-import Positions from './pages/Positions.jsx'
-import Quant from './pages/Quant.jsx'
-import Hotspot from './pages/Hotspot.jsx'
-import MsgCenter from './pages/MsgCenter.jsx'
-import Settings from './pages/Settings.jsx'
-import LLMDebug from './pages/LLMDebug.jsx'
-import Consult from './pages/Consult.jsx'
-import Research from './pages/Research.jsx'
-import Admin from './pages/Admin.jsx'
-import Paper from './pages/Paper.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
+
+// §R4-10 路由级代码分割：除首屏落地页 Dashboard 外，其余页面全部 React.lazy 按需加载，
+// Vite 自动按页面拆 chunk——首屏 bundle 只含外壳+Dashboard，进入对应路由时才拉取该页代码
+//（旧实现 13 个页面全量打进单包，954KB 首屏一次拉完）。
+// English: §R4-10 route-level code splitting — every page except the landing Dashboard is lazy-loaded
+// so the first-screen bundle only carries the shell + Dashboard; each route chunk is fetched on demand.
+const Signals = lazy(() => import('./pages/Signals.jsx'))
+const Watchlist = lazy(() => import('./pages/Watchlist.jsx'))
+const Positions = lazy(() => import('./pages/Positions.jsx'))
+const Quant = lazy(() => import('./pages/Quant.jsx'))
+const Hotspot = lazy(() => import('./pages/Hotspot.jsx'))
+const MsgCenter = lazy(() => import('./pages/MsgCenter.jsx'))
+const Settings = lazy(() => import('./pages/Settings.jsx'))
+const LLMDebug = lazy(() => import('./pages/LLMDebug.jsx'))
+const Consult = lazy(() => import('./pages/Consult.jsx'))
+const Research = lazy(() => import('./pages/Research.jsx'))
+const Admin = lazy(() => import('./pages/Admin.jsx'))
+const Paper = lazy(() => import('./pages/Paper.jsx'))
+
+// 懒加载路由切换时的加载占位（页面 chunk 拉取间隙的兜底 UI）
+function PageFallback() {
+  return (
+    <div style={{ padding: 32, color: '#888', fontSize: 14 }}>页面加载中…</div>
+  )
+}
 
 /**
  * 应用根组件
@@ -333,22 +346,25 @@ export default function App() {
               {/* 路由出口：根据 path 渲染对应页面组件；根路径重定向到仪表盘 */}
               {/* 用全局 ErrorBoundary 包裹路由出口：任意页面渲染抛错时显示中文兜底 UI，避免整页白屏 */}
               <ErrorBoundary>
-                <Routes>
-                  <Route path="/" element={<Navigate to="/dashboard" replace />} />
-                  <Route path="/dashboard" element={<Dashboard />} />
-                  <Route path="/signals" element={<Signals />} />
-                  <Route path="/watchlist" element={<Watchlist />} />
-                  <Route path="/positions" element={<Positions />} />
-                  <Route path="/quant" element={<Quant />} />
-                  <Route path="/hotspot" element={<Hotspot />} />
-                  <Route path="/msgcenter" element={<MsgCenter />} />
-                  <Route path="/settings" element={<Settings />} />
-                  <Route path="/llm-debug" element={<LLMDebug />} />
-                  <Route path="/consult" element={<Consult />} />
-                  <Route path="/research" element={<Research />} />
-                  <Route path="/admin" element={<Admin />} />
-                  <Route path="/paper" element={<Paper />} />
-                </Routes>
+                {/* §R4-10 Suspense 兜底：lazy 页面 chunk 加载期间显示占位，避免白屏 */}
+                <Suspense fallback={<PageFallback />}>
+                  <Routes>
+                    <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                    <Route path="/dashboard" element={<Dashboard />} />
+                    <Route path="/signals" element={<Signals />} />
+                    <Route path="/watchlist" element={<Watchlist />} />
+                    <Route path="/positions" element={<Positions />} />
+                    <Route path="/quant" element={<Quant />} />
+                    <Route path="/hotspot" element={<Hotspot />} />
+                    <Route path="/msgcenter" element={<MsgCenter />} />
+                    <Route path="/settings" element={<Settings />} />
+                    <Route path="/llm-debug" element={<LLMDebug />} />
+                    <Route path="/consult" element={<Consult />} />
+                    <Route path="/research" element={<Research />} />
+                    <Route path="/admin" element={<Admin />} />
+                    <Route path="/paper" element={<Paper />} />
+                  </Routes>
+                </Suspense>
               </ErrorBoundary>
             </main>
           </div>

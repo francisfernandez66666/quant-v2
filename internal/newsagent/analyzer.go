@@ -196,9 +196,11 @@ func chainScore(score float64, dir string) float64 {
 	if abs < 0 {
 		abs = -abs
 	}
-	if abs < 0.25 {
-		abs = 0.5
-	}
+	// §R4-2 修复（前轮 P1-F）：删除"弱分<0.25 硬抬到 0.5"的保底分支——
+	// 该抬零恰好越过引擎 filterThreshold(0.50) 的有效事件线，使 LLM 判弱的新闻
+	// 照样进板块验真/打分池/占用 D1 配额，击穿自己的漏斗。弱分保持原值自然落漏斗外。
+	// English: §R4-2 fix (round-3 P1-F) — drop the floor that bumped weak scores (<0.25) up to 0.5,
+	// which breached the engine's 0.50 validity threshold; weak events now fall out of the funnel naturally.
 	switch dir {
 	case "利好":
 		return abs
@@ -338,10 +340,10 @@ func (a *Agent) ruleBasedDegrade(items []data.NewsItem, cause error) []NewsEvent
 			Source:     item.Source,
 			IsMaterial: true,
 			Level:      "一般", // 降级事件无可靠级别，标为一般，避免错误扩散到个股/板块候选
-			Direction:  "中性",       // 降级：低置信度中性，杜绝 LLM 缺失时给出错误方向
-			Score:      0,            // 中性占位，不触发任何信号，仅保留在 /api/news 可见
+			Direction:  "中性", // 降级：低置信度中性，杜绝 LLM 缺失时给出错误方向
+			Score:      0,    // 中性占位，不触发任何信号，仅保留在 /api/news 可见
 			EventType:  "降级兜底",
-			Reason: fmt.Sprintf("[降级·规则兜底] LLM不可用(%v); 关键词命中=%v; 原判定方向=%s", cause, hit, keywordDir),
+			Reason:     fmt.Sprintf("[降级·规则兜底] LLM不可用(%v); 关键词命中=%v; 原判定方向=%s", cause, hit, keywordDir),
 		}
 		events = append(events, ev)
 	}
