@@ -19,11 +19,41 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, time as dtime, timedelta
+
+# 北京时间解析（Python 3.9+ 内置 zoneinfo；降级到 UTC+8 估算）。
+try:
+    from zoneinfo import ZoneInfo
+    _BJ = ZoneInfo("Asia/Shanghai")
+except Exception:  # noqa: BLE001
+    _BJ = None
 
 log = logging.getLogger("qmt_gateway.handler")
 
 RETRY_DELAYS = [1, 2, 4]  # 秒，指数退避
 HEARTBEAT_SEC = 60        # §ROBUST 上行心跳间隔（尽力而为，不入持久化队列）
+
+
+def _now_beijing():
+    """返回当前北京时间（Asia/Shanghai）。zoneinfo 不可用时降级为 UTC+8 估算。"""
+    if _BJ is not None:
+        return datetime.now(_BJ)
+    return datetime.utcnow() + timedelta(hours=8)
+
+
+def is_active_trading_session():
+    """活跃交易窗口判定（与引擎 data.CurrentSession 对齐）：工作日 9:15~15:00。
+
+    非交易时段（盘前/盘后/周末/节假日）返回 False——此时 MiniQMT 被 qmtctl 关闭属预期，
+    断连不上报熔断，避免每天收盘刷 high 告警污染信号（见
+    docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。节假日简化为工作日即交易日，
+    因为非交易时段本就抑制上报，误判影响为零。
+    """
+    now = _now_beijing()
+    if now.weekday() >= 5:  # 周六/周日
+        return False
+    t = now.time()
+    return dtime(9, 15) <= t < dtime(15, 0)
 
 
 def post_report(base_url, token, payload, retries=3):
@@ -165,10 +195,17 @@ class ReportHandler:
         })
 
     def on_disconnected(self):
-        """断线：记录并推送首尔（首尔侧据此熔断暂停下单）。"""
+        """断线：记录并（交易时段）推送首尔（首尔侧据此熔断暂停下单）。
+
+        非交易时段（盘前/盘后/周末/节假日）不上报——此时 MiniQMT 被 qmtctl 关闭属预期，
+        上报会每天触发引擎熔断误报（见 docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。
+        """
         self.disconnected = True
-        log.warning("[handler] channel disconnected — reporting to Seoul")
-        self._push({"type": "disconnect", "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+        if is_active_trading_session():
+            log.warning("[handler] channel disconnected during trading session — reporting to Seoul (triggers fuse)")
+            self._push({"type": "disconnect", "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+        else:
+            log.info("[handler] channel disconnected off-hours (MiniQMT killed by qmtctl) — silent, no fuse")
 
     @staticmethod
     def _status(code):

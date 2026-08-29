@@ -1,6 +1,6 @@
-//go:build !linux
+//go:build !linux && !windows
 
-// 非 Linux（开发机 darwin）：仅设独立进程组；Pdeathsig 为 Linux 专有不可用。
+// 非 Linux/Windows（开发机 darwin 等）：仅设独立进程组；Pdeathsig 为 Linux 专有不可用。
 // 文件：procattr_other.go
 // 包名：scheduler
 // 所属模块：「任务调度与后台 worker 管理」

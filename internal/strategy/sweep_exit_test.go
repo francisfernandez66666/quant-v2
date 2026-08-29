@@ -1,3 +1,5 @@
+// sweep_exit_test.go — ApplyTrailingHoldExit（扫参统一出场旋钮）的单元测试。
+// 覆盖：双旋钮全缺省不干预、非法价放行、移动回撤止盈触发与未盈利不触发、超期离场触发与未到期不触发。
 package strategy
 
 import (
@@ -5,6 +7,8 @@ import (
 	"time"
 )
 
+// TestApplyTrailingHoldExitDisabled 验证两个旋钮都未配置(0)或价格非法时返回 nil，
+// 即默认零行为变更，绝不干预既有退出规则。
 func TestApplyTrailingHoldExitDisabled(t *testing.T) {
 	// 两个旋钮都未配置(0)→返回 nil，既有规则不受影响（默认零行为变更保证）
 	ctx := &ExitContext{CostPrice: 100, CurPrice: 80,
@@ -19,6 +23,8 @@ func TestApplyTrailingHoldExitDisabled(t *testing.T) {
 	}
 }
 
+// TestApplyTrailingHoldExitTrailing 验证阶段高点回撤止盈：曾盈利且回撤越界触发，
+// 未盈利（高点=成本）不触发。
 func TestApplyTrailingHoldExitTrailing(t *testing.T) {
 	now := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
 	// 成本100，阶段高110，现价104.4 → 回撤 -5.09% ≤ -5% 且曾盈利 → 移动止盈
@@ -35,6 +41,7 @@ func TestApplyTrailingHoldExitTrailing(t *testing.T) {
 	}
 }
 
+// TestApplyTrailingHoldExitTimeout 验证最长持仓天超期离场：恰好到期触发，未到期不触发。
 func TestApplyTrailingHoldExitTimeout(t *testing.T) {
 	now := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
 	// EntryAt=08-19 → 恰好3天；maxHold=3 → 超期离场

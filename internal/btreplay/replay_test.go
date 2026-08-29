@@ -1,3 +1,7 @@
+// replay_test.go — 回放引擎单测：summarize 统计口径、chgPct/avgVolK/toDataKLine 工具、
+// 以及库规则适配器缺省出场（§GAP2.2 负号语义）回归。
+// English: replay engine tests — summarize stats, helper functors, and the rule-adapter default-exit
+// regression (§GAP2.2 negative-sign semantics).
 package btreplay
 
 import (

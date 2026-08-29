@@ -124,9 +124,14 @@ func newTestAuthManager(t *testing.T) *auth.Manager {
 		t.Fatalf("auth init: %v", err)
 	}
 	invCode, _ := m.CreateInvite()
-	_, err := m.Register("testuser", "testpass", invCode)
+	u, err := m.Register("testuser", "testpass", invCode)
 	if err != nil {
 		t.Fatalf("register: %v", err)
+	}
+	// 测试用户提升为管理员：short/config/positions 等运营配置端点仅 admin 可写，
+	// 与首尔侧 server.go 的管理员门禁设计一致（前端以管理员 token 调用）。
+	if err := m.SetRole(u.ID, "admin"); err != nil {
+		t.Fatalf("promote admin: %v", err)
 	}
 	m.MarkInitialized()
 	return m

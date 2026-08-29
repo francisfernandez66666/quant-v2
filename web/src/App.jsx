@@ -293,10 +293,10 @@ export default function App() {
     canAdmin ? { to: '/admin', icon: '👥', label: '用户管理' } : null,
   ].filter(Boolean)
 
+  // §安全 F1（2026-08-29）：全局 ErrorBoundary 包裹整个应用（登录页/顶部栏/侧边栏/路由出口），
+  // 任意位置渲染抛错均显示中文兜底 UI，避免整页白屏。此前仅包裹主内容区路由出口，
+  // 顶栏/侧栏/登录页仍在边界外。
   return (
-    {/* §安全 F1（2026-08-29）：全局 ErrorBoundary 包裹整个应用（登录页/顶部栏/侧边栏/路由出口），
-        任意位置渲染抛错均显示中文兜底 UI，避免整页白屏。此前仅包裹 <main> 路由出口，
-        顶栏/侧栏/登录页仍在边界外。 */}
     <ErrorBoundary>
     <ConfigProvider>
       {/* 安全兜底：理论上进入主布局时 loggedIn 必为 true，此处保留登录页分支以防状态竞态 */}

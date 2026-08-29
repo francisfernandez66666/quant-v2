@@ -75,3 +75,10 @@ mobile/keystore.pass
 
 # §安全：QMT 网关本地配置（含 token/账户，禁止入库）
 qmt_gateway/config.xt.json
+
+# 构建产物 / 二进制（不入库，避免大体积与机密泄漏）
+*.exe
+*.zip
+/qmtctl
+mobile/app/src/debug/
+mobile/app/src/release/

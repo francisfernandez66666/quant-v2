@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"quant-trading-v2/internal/data"
 )
 
 // mkEvent 构造一个带方向与板块的测试事件。
@@ -140,24 +142,32 @@ func TestFrozenExpiry(t *testing.T) {
 // English: TestFrozenSaveCrossDay verifies SaveFrozen's cross-day expiry cleanup (Day uses TradingDay's 20060102 format).
 func TestFrozenSaveCrossDay(t *testing.T) {
 	a := newTestAgent(t)
-	yesterday := time.Now().AddDate(0, 0, -1).Format("20060102")
-	twoDaysAgo := time.Now().AddDate(0, 0, -2).Format("20060102")
+	// 与产物代码一致：以交易日（跳过周末/休市）为基准计算相对日，避免日历日与交易日错位导致周末跑测不稳定。
+	// English: align with production: derive relative days from the trading day (skips weekends/holidays)
+	// so the test is stable regardless of the weekday it runs on.
+	td := data.TradingDayDate(time.Now())
+	today := td
+	// 过期日取当前自然日前推 5 天：无论运行于星期几/休市日，交易日 td 都必然 > Day+1（自然日窗口），
+	// 从而稳定触发跨日到期清理（data.AddTradingDays 仅支持正向步进，此处用自然日偏移表达“足够旧”）。
+	// English: the stale day is 5 calendar days back; on any weekday/holiday the trading day td is
+	// always past Day+1, so cross-day cleanup is deterministically triggered.
+	stale := time.Now().AddDate(0, 0, -5).Format("20060102")
 
 	a.writeFrozenDB(&frozenDB{
-		TradingDay: yesterday,
+		TradingDay: today,
 		Events: []FrozenEvent{
-			{NewsEvent: mkEvent("昨日利好", "利好", 0.9, []string{"半导体"}), Day: yesterday, Key: "半导体|利好"},
-			{NewsEvent: mkEvent("前天利好", "利好", 0.9, []string{"白酒"}), Day: twoDaysAgo, Key: "白酒|利好"},
+			{NewsEvent: mkEvent("今日利好", "利好", 0.9, []string{"半导体"}), Day: today, Key: "半导体|利好"},
+			{NewsEvent: mkEvent("前天利好", "利好", 0.9, []string{"白酒"}), Day: stale, Key: "白酒|利好"},
 		},
 	})
 
 	a.SaveFrozen(nil)
 	db := a.loadFrozenDB()
 	if len(db.Events) != 1 {
-		t.Fatalf("跨日保留昨日(1条), 得 %d", len(db.Events))
+		t.Fatalf("跨日保留今日(1条), 得 %d", len(db.Events))
 	}
 	if db.Events[0].Key != "半导体|利好" {
-		t.Fatalf("应保留昨日半导体利好, 得 %s", db.Events[0].Key)
+		t.Fatalf("应保留今日半导体利好, 得 %s", db.Events[0].Key)
 	}
 }
 
@@ -202,7 +212,9 @@ func TestFrozenCorruptRecovery(t *testing.T) {
 // English: TestFrozenEventsOnlyUnExpired verifies FrozenEvents returns only unexpired events.
 func TestFrozenEventsOnlyUnExpired(t *testing.T) {
 	a := newTestAgent(t)
-	td := time.Now().AddDate(0, 0, -2).Format("20060102")
+	// 过期日取当前自然日前推 5 天：任意星期几/休市日下，交易日 td 都 > Day+1，稳定落入到期窗口。
+	// English: 5 calendar days back; the trading day td is always past Day+1 on any run day.
+	td := time.Now().AddDate(0, 0, -5).Format("20060102")
 	a.writeFrozenDB(&frozenDB{
 		Events: []FrozenEvent{
 			{NewsEvent: mkEvent("过期", "利好", 0.8, []string{"半导体"}), Day: td, Key: "半导体|利好"},

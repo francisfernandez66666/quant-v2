@@ -1,3 +1,7 @@
+// sweep_test.go — 参数扫参引擎单测：统一出场 uniformExitV2、组合参数应用/恢复互不污染、
+// 目标函数排序与自适应门槛、步进序列与分战法寻优池。
+// English: sweep optimizer tests — uniformExitV2, combo-param apply/restore isolation, objective
+// ranking, adaptive thresholds, step ranges and per-strategy pools.
 package btreplay
 
 import (

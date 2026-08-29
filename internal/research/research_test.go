@@ -10,6 +10,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// TestSpearmanIC 验证 Spearman 秩相关的同序/反序/NaN跳过/并列平均秩等语义。
 func TestSpearmanIC(t *testing.T) {
 	if ic := SpearmanIC([]float64{1, 2, 3, 4, 5}, []float64{10, 20, 30, 40, 50}); math.Abs(ic-1) > 1e-9 {
 		t.Fatalf("同序期望 1，得 %v", ic)
@@ -47,6 +48,7 @@ func mkPanel(dates []string, fvals, closes []float64) *Panel {
 	}
 }
 
+// TestICByDate 验证按日期横截面 IC 的计算：完全同序日 IC=1 且样本数正确。
 func TestICByDate(t *testing.T) {
 	// 3 只股票在 20230103 形成完全同序截面 → IC=1；其中一只后续日期越界不影响
 	// English: 3 stocks form a fully ordered cross-section on 20230103 → IC=1; one stock's later dates going out of range has no effect
@@ -71,6 +73,7 @@ func TestICByDate(t *testing.T) {
 	}
 }
 
+// TestSingleQuarterNetProfitYoy 验证单季净利同比（SUE 降级版）按财年累计差分与上年同期对比。
 func TestSingleQuarterNetProfitYoy(t *testing.T) {
 	income := []store.IncomeRow{
 		{EndDate: "20200331", NIncomeAttrP: 10},
@@ -96,6 +99,7 @@ func TestSingleQuarterNetProfitYoy(t *testing.T) {
 	}
 }
 
+// TestLayerReturns 验证分层收益：因子值单调分层且层间收益单调递增。
 func TestLayerReturns(t *testing.T) {
 	p1 := mkPanel([]string{"20230103"}, []float64{1}, []float64{100, 101})
 	p2 := mkPanel([]string{"20230103"}, []float64{2}, []float64{100, 102})
@@ -114,6 +118,7 @@ func TestLayerReturns(t *testing.T) {
 	}
 }
 
+// TestIR 验证信息比率 IR = mean(IC)/std(IC) 的计算与空输入返回 NaN。
 func TestIR(t *testing.T) {
 	rows := []ICRow{{Date: "a", IC: 0.1}, {Date: "b", IC: 0.2}, {Date: "c", IC: 0.3}}
 	ir := IR(rows)

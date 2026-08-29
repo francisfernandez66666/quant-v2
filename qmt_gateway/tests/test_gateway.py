@@ -173,7 +173,7 @@ class TestLotRule(unittest.TestCase):
         from gateway import lot_rule
         self.assertEqual(lot_rule("600519.SH", "买入"), (100, 100))
         self.assertEqual(lot_rule("000001.SZ", "买入"), (100, 100))
-        self.assertEqual(lot_rule("300750.SZ", "买入"), (200, 1))
+        self.assertEqual(lot_rule("300750.SZ", "买入"), (100, 1))
         self.assertEqual(lot_rule("688160.SH", "买入"), (200, 1))
 
     def test_zero_lot_sell_allowed_by_gateway(self):

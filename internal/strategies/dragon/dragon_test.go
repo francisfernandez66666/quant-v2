@@ -95,6 +95,7 @@ func TestBuyPoints(t *testing.T) {
 	}
 }
 
+// TestInvarsChecked 验证龙回头战法的信号类型常量等不变量保持预期值。
 func TestInvarsChecked(t *testing.T) {
 	if strategy.SignalDragon != "dragon" {
 		t.Error("SignalDragon 应=dragon")

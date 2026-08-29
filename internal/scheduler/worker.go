@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -232,7 +231,7 @@ func (s *Scheduler) preemptCurrent(reason string) {
 	}
 	s.preemptReq = true
 	cancel := s.taskCancel // 可能为 nil（子进程尚未 Start）
-	cur := s.curCmd       // 当前子进程（可能为 nil），用于整组击杀
+	cur := s.curCmd        // 当前子进程（可能为 nil），用于整组击杀
 	s.mu.Unlock()
 	log.Printf("[scheduler] 终止当前任务 #%d(%s): %s", id, typ, reason)
 	// §修复 S3（2026-08-29）：整组击杀而非仅 SIGKILL 直接子进程。子进程设了 Setpgid，
@@ -252,25 +251,10 @@ func (s *Scheduler) preemptCurrent(reason string) {
 // MemAvailable drops below the threshold, no task is dequeued (everything stays queued).
 const memGateDefaultMB = 400
 
-// readMemAvailableMB 读 /proc/meminfo 的 MemAvailable（KB→MB）；读取失败返回 -1（闸门放行，
-// 不因读数失败卡死队列）。Linux 专用路径；非 Linux（本地 darwin 开发）返回 -1 直接放行。
+// readMemAvailableMB 系统可用内存（MB）；读取失败返回 -1（闸门放行，不因读数失败卡死队列）。
+// 平台实现见 memgate_unix.go（/proc/meminfo）/ memgate_windows.go（GlobalMemoryStatusEx）。
 func readMemAvailableMB() int {
-	b, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return -1
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(line, "MemAvailable:") {
-			f := strings.Fields(strings.TrimPrefix(line, "MemAvailable:"))
-			if len(f) >= 1 {
-				if kb, e := strconv.ParseInt(f[0], 10, 64); e == nil {
-					return int(kb / 1024)
-				}
-			}
-			return -1
-		}
-	}
-	return -1
+	return platformMemAvailableMB()
 }
 
 // memGateOpen 内存总闸判定：MemAvailable ≥ 阈值（或无法读取）时放行。
@@ -824,7 +808,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 				paused := s.paused
 				s.mu.Unlock()
 				if !paused && cmd.Process != nil {
-					_ = cmd.Process.Signal(syscall.SIGSTOP)
+					pauseProcess(cmd)
 					s.mu.Lock()
 					s.paused = true
 					s.mu.Unlock()
@@ -844,7 +828,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 				s.lastProgress = time.Now().Unix()
 				s.mu.Unlock()
 				if cmd.Process != nil {
-					_ = cmd.Process.Signal(syscall.SIGCONT)
+					resumeProcess(cmd)
 				}
 				rs.mu.Lock()
 				pg := rs.progress

@@ -51,6 +51,7 @@ func rep(v float64, n int) []float64 {
 	return out
 }
 
+// TestCompositeIC 验证等权复合强信号（f1+f2）的截面平均 IC 明显为正。
 func TestCompositeIC(t *testing.T) {
 	dates := []string{"20230101", "20230102", "20230103", "20230104", "20230105", "20230106"}
 	var panels []*Panel
@@ -69,6 +70,7 @@ func TestCompositeIC(t *testing.T) {
 	}
 }
 
+// TestOptimizeWeights 验证坐标上升权重优化能提升复合 IR 并使权重 L1 归一化=1。
 func TestOptimizeWeights(t *testing.T) {
 	dates := []string{"20230101", "20230102", "20230103", "20230104", "20230105", "20230106"}
 	var panels []*Panel

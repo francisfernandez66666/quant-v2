@@ -1,0 +1,44 @@
+//go:build windows
+
+// Windows：调用 kernel32 GlobalMemoryStatusEx 读物理可用内存（AvailPhys，字节→MB）；
+// 读取失败返回 -1（闸门放行，不因读数失败卡死队列）。与 memgate_unix.go 语义对齐。
+// x/sys/windows v0.47.0 未导出 MEMORYSTATUSEX/GlobalMemoryStatusEx，故直接走 syscall。
+// 文件：memgate_windows.go
+// 包名：scheduler
+
+package scheduler
+
+import (
+	"syscall"
+	"unsafe"
+)
+
+// memoryStatusEx 对应 Win32 MEMORYSTATUSEX（含 ullAvailExtendedVirtual 共 64 字节）。
+type memoryStatusEx struct {
+	Length               uint32
+	MemoryLoad           uint32
+	TotalPhys            uint64
+	AvailPhys            uint64
+	TotalPageFile        uint64
+	AvailPageFile        uint64
+	TotalVirtual         uint64
+	AvailVirtual         uint64
+	AvailExtendedVirtual uint64
+}
+
+var (
+	kernel32                 = syscall.MustLoadDLL("kernel32.dll")
+	procGlobalMemoryStatusEx = kernel32.MustFindProc("GlobalMemoryStatusEx")
+)
+
+// platformMemAvailableMB 系统可用物理内存（MB）。
+func platformMemAvailableMB() int {
+	var m memoryStatusEx
+	m.Length = uint32(unsafe.Sizeof(m))
+	r, _, _ := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&m)))
+	if r == 0 {
+		return -1
+	}
+	// AvailPhys 单位字节 → MB
+	return int(m.AvailPhys / (1024 * 1024))
+}

@@ -37,7 +37,11 @@ func TestPoolKeyForStrategy(t *testing.T) {
 	}
 }
 
-// TestApplyPoolMinScoreMergeAndClear 应用池最小评分合并和Clear。
+// TestApplyPoolMinScoreMergeAndClear 验证 ApplyPoolMinScore 的合并与清除语义：
+// 池无规则时写入创建、已有规则只改 MinScore 其余保留、清零 MinScore 仅置零字段保留规则、
+// 空 key/未启用类型静默跳过。
+// English: verifies ApplyPoolMinScore — create-when-absent, field-merged update, zeroed-but-kept
+// clearing, and silent skip for empty/unenabled keys.
 func TestApplyPoolMinScoreMergeAndClear(t *testing.T) {
 	e := New(testCfg(), "")
 	e.SetStrategyPools([]string{"dragon"})
@@ -101,7 +105,10 @@ func TestSetPoolBuyRulePersistedAcrossReload(t *testing.T) {
 	}
 }
 
-// TestEnsurePoolConservation Ensure池Conservation。
+// TestEnsurePoolConservation 验证 EnsurePool 开立规则细分池时资金守恒：Σ池现金在开池前后不变，
+// 新池获得 max(总现金×5%, ¥1000 保底) 且不超 25% 上限，重复开池返回 false。
+// English: verifies EnsurePool conservation — Σpool cash is unchanged, the new pool gets
+// max(5% of total, ¥1000 floor) capped at 25%, and a duplicate open returns false.
 func TestEnsurePoolConservation(t *testing.T) {
 	e := New(testCfg(), "")
 	e.SetStrategyPools([]string{"dragon", "n_shape"})
@@ -137,7 +144,10 @@ func TestEnsurePoolConservation(t *testing.T) {
 	}
 }
 
-// TestRulePoolSignalRoutingAndLabel Rule池信号Routing和Label。
+// TestRulePoolSignalRoutingAndLabel 验证规则细分池（fac_1）信号正确归池、标签解析器生效
+// （fac_1 → 因子战法#1，未知回退 key 本身）。
+// English: verifies rule-split pool (fac_1) routing and the label resolver (fac_1 → 因子战法#1,
+// unknown falls back to the key itself).
 func TestRulePoolSignalRoutingAndLabel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "paper_state.json")
 	e := New(testCfg(), path)
@@ -171,6 +181,7 @@ func TestRulePoolSignalRoutingAndLabel(t *testing.T) {
 	}
 }
 
+// abs 返回浮点数的绝对值（测试断言容差比较辅助）。
 func abs(f float64) float64 {
 	if f < 0 {
 		return -f

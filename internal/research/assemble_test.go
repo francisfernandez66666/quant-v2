@@ -107,6 +107,7 @@ func seedDB(t *testing.T) *store.DB {
 	return db
 }
 
+// TestAssemblePointInTime 验证从研究库装配时点对齐：财务字段按 ann_date≤当日取最新报告，避免未来函数。
 func TestAssemblePointInTime(t *testing.T) {
 	db := seedDB(t)
 	s, err := Assemble(db, "000001.SZ", "20210104", "20210108")
@@ -151,6 +152,7 @@ func TestAssemblePointInTime(t *testing.T) {
 	}
 }
 
+// TestAssembleMissingSeries 验证区间无行情时返回错误，行情存在但数据缺失字段为 NaN。
 func TestAssembleMissingSeries(t *testing.T) {
 	db := seedDB(t)
 	if _, err := Assemble(db, "000001.SZ", "20230101", "20231231"); err == nil {

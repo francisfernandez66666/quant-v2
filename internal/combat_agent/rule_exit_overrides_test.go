@@ -15,6 +15,11 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// TestRuleExitOverridesLookupAndExit 校验规则级出场覆盖注册表的查询与退出逻辑：
+//   - 按规则 ID 或显示名（含大小写/空白归一）均可命中覆盖项；
+//   - 未注册/空串返回 nil；
+//   - 覆盖生效时 genericTrailingExitWith 按规则参数（回撤5%/持仓7天、形态3天）触发移动止盈与超期离场，
+//     而默认 8% 阈值下不触发。验证 §P2-d 规则级出场覆盖的真实接线效果。
 func TestRuleExitOverridesLookupAndExit(t *testing.T) {
 	// 注册表：因子 fac_1（显示名 因子战法#1）止盈5%/持仓7天；形态 pat_9 仅持仓 3 天
 	SetRuleExitOverrides(
@@ -68,6 +73,9 @@ func TestRuleExitOverridesLookupAndExit(t *testing.T) {
 	}
 }
 
+// TestSetRuleExitOverridesDisabledCleared 校验 SetRuleExitOverrides 的全量重建语义：
+//   - 未启用（Enabled=false）的条目不进入注册表；
+//   - 重新调用后旧键被清除（全量重建而非增量合并），仅新列表中的启用条目生效。
 func TestSetRuleExitOverridesDisabledCleared(t *testing.T) {
 	SetRuleExitOverrides([]research.AppliedFactorEntry{{ID: "fac_2", Name: "因子战法#2", Enabled: false,
 		ExitTrailPct: 10}}, nil)

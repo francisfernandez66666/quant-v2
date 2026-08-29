@@ -12,6 +12,7 @@ type memKV struct {
 	m map[string]map[string]string
 }
 
+// SetConfig 实现 KVStore 接口：按 (userID, key) 写入配置值（首次访问惰性初始化双层 map）。
 func (k *memKV) SetConfig(userID, key, value string) error {
 	if k.m == nil {
 		k.m = map[string]map[string]string{}

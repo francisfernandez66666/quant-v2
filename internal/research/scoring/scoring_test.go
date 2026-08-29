@@ -1,3 +1,5 @@
+// scoring_test.go — 统一打分（时序分位）模块的单元测试。
+// 验证 ScoreSeries / ScoreValue 的分位语义、MinLookback 边界与单值便捷封装一致性。
 package scoring
 
 import (

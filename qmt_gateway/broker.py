@@ -31,6 +31,7 @@ class Broker:
         raise NotImplementedError
 
     def is_connected(self):
+        """返回通道是否已连接。基类未实现，由子类提供真实/模拟状态。"""
         raise NotImplementedError
 
     def place_order(self, req):
@@ -201,6 +202,7 @@ class XtBroker(Broker):
                 self._seq_exchange[seq] = oid
 
     def is_connected(self):
+        """返回真实 MiniQMT 通道是否已连接（_connected 由适配器/重连循环维护）。"""
         return self._connected
 
     def place_order(self, req):
@@ -351,9 +353,11 @@ class MockBroker(Broker):
         return True
 
     def mark_disconnected(self):
+        """模拟通道断线：仅置位标记（测试/mock 场景使用）。"""
         self._connected = False
 
     def is_connected(self):
+        """返回模拟通道是否已连接。"""
         return self._connected
 
     def _next_order_id(self):
@@ -448,6 +452,7 @@ class MockBroker(Broker):
                 p["amount"] = remain * price
 
     def query_positions(self):
+        """返回 mock 持仓快照（按市值降序），调用方持锁读取内存账本。"""
         with self._lock:
             return [dict(p) for p in sorted(
                 self._positions.values(), key=lambda x: x.get("amount", 0), reverse=True)]

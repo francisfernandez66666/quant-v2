@@ -108,7 +108,8 @@ class Store:
                 amount    REAL,
                 traded_at TEXT,
                 signal_id TEXT,
-                user_id       TEXT           -- P1-9：多账号隔离归属
+                user_id       TEXT,          -- P1-9：多账号隔离归属
+                trade_id      TEXT DEFAULT '' -- §G1（2026-08-29）：唯一成交编号，部成去重
             );
             """
         )
@@ -236,11 +237,13 @@ class Store:
             return cur.fetchone()
 
     def order_by_id(self, order_id):
+        """按交易所/模拟委托号查委托（非幂等键，用于反向检索）。"""
         with self._lock:
             cur = self._conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
             return cur.fetchone()
 
     def list_orders(self):
+        """列出全部委托（按创建时间倒序），供 /state 端点返回。"""
         with self._lock:
             cur = self._conn.execute("SELECT * FROM orders ORDER BY created_at DESC")
             return [dict(r) for r in cur.fetchall()]
@@ -416,6 +419,7 @@ class Store:
         return len(codes)
 
     def close(self):
+        """关闭 SQLite 连接（进程退出时调用）。"""
         with self._lock:
             self._conn.close()
 
@@ -465,6 +469,7 @@ class Store:
             return n - cap
 
     def outbox_count(self):
+        """返回 outbox 当前待发条数（用于 sender 空队列等待判断）。"""
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) AS c FROM outbox").fetchone()["c"]
 
@@ -481,4 +486,5 @@ def json_default(o):
 
 
 def to_json(obj):
+    """将账本对象序列化为 JSON 字符串（ensure_ascii=False 保留中文，sqlite3.Row 走兜底）。"""
     return json.dumps(obj, ensure_ascii=False, default=json_default)

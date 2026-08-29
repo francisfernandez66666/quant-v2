@@ -184,7 +184,10 @@ func testCfg() Config {
 	return c
 }
 
-// TestOnSignalsFillAtLivePrice 于SignalsFill在Live价格。
+// TestOnSignalsFillAtLivePrice 验证 OnSignals 按实时快照价撮合：成交价=实时价而非信号价，
+// 并记录信号价参照与信号→成交延迟；watch 信号不成交；现金按实际支出扣减。
+// English: verifies OnSignals fills at the live snapshot price (not the signal price), records the
+// signal-price reference and the signal→fill latency, skips "watch" signals, and debits cash exactly.
 func TestOnSignalsFillAtLivePrice(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -234,7 +237,9 @@ func TestOnSignalsFillAtLivePrice(t *testing.T) {
 	}
 }
 
-// TestSkipHeldAndNoQuote SkipHeld和NoQuote。
+// TestSkipHeldAndNoQuote 验证同票重复信号去重（已持仓跳过）与无行情信号一律拒绝撮合（不伪造成交）。
+// English: verifies de-duplication of repeated signals for an already-held code, and that signals with
+// no live quote are rejected (no fabricated fills).
 func TestSkipHeldAndNoQuote(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -257,7 +262,10 @@ func TestSkipHeldAndNoQuote(t *testing.T) {
 	}
 }
 
-// TestMarkToMarketAndSnapshot Mark到Market和Snapshot。
+// TestMarkToMarketAndSnapshot 验证 MarkToMarket 刷新持仓市值与 Snapshot 记录当日净值点，
+// 且同日重复快照去重不新增（同一交易日只保留最新一个点）。
+// English: verifies MarkToMarket refreshes the mark price and Snapshot records one equity point per
+// trading day, with same-day repeats de-duplicated.
 func TestMarkToMarketAndSnapshot(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -296,7 +304,10 @@ func t1Ready(e *Engine) {
 	}
 }
 
-// TestSellAndReset Sell和重置。
+// TestSellAndReset 验证卖出结算已实现盈亏、清盘重置（不改资金，清空全部持仓/成交/净值），
+// 以及确认资金（重开并保留成交日志、净值从新资金重开、持仓上限生效）。
+// English: verifies sell settlement of realized P&L, Reset (clears everything, keeps capital), and
+// Reconfigure (reopens with new capital, keeps fill log, applies the new position cap).
 func TestSellAndReset(t *testing.T) {
 	e := New(testCfg(), "")
 	now := time.Now()
@@ -343,7 +354,8 @@ func TestSellAndReset(t *testing.T) {
 	}
 }
 
-// TestMaxPositions 最大Positions。
+// TestMaxPositions 验证自定义持仓上限生效：达上限后后续买入信号被拒（不再建仓）。
+// English: verifies the custom position cap — once hit, later buy signals are rejected (no new positions).
 func TestMaxPositions(t *testing.T) {
 	c := testCfg()
 	c.MaxPositions = 2
