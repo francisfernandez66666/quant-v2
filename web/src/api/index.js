@@ -239,37 +239,57 @@ const REQUEST_TIMEOUT = 10000
 async function request(path, opts = {}) {
   // 拼接完整请求地址：服务器基础地址 + 相对路径
   // Build the full request URL: server base URL + relative path
-  const url = baseUrl() + path
-  // 默认 JSON 头，允许调用方通过 opts.headers 覆盖 / 追加
-  // Default JSON header; callers may override / append via opts.headers
-  const headers = { 'Content-Type': 'application/json', ...opts.headers }
-  const token = getToken()
-  // 已登录时附加 Bearer 令牌，供后端鉴权
-  // Attach the Bearer token when logged in so the backend can authenticate
-  if (token) headers['Authorization'] = 'Bearer ' + token
-
+  const base = baseUrl()
   // 设置请求超时（默认 REQUEST_TIMEOUT，可通过 opts.timeout 覆盖，如 LLM 咨询需要更长等待），超时后中止请求
   // Set a request timeout (default REQUEST_TIMEOUT, overridable via opts.timeout, e.g. LLM consult needs to wait longer); abort on timeout
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), opts.timeout || REQUEST_TIMEOUT)
-  let res
-  try {
-    res = await fetch(url, {
+
+  // 单次请求执行：base 为基础地址（可为自定义服务器或同源空串）
+  // Single attempt: base is the server base (custom server URL or same-origin empty string)
+  const doFetch = async (tryBase) => {
+    const url = tryBase + path
+    const headers = { 'Content-Type': 'application/json', ...opts.headers }
+    const token = getToken()
+    if (token) headers['Authorization'] = 'Bearer ' + token
+    return fetch(url, {
       method: opts.method || 'GET',
       headers,
       body: opts.data ? JSON.stringify(opts.data) : undefined,
       signal: ctrl.signal,
     })
-  } catch (e) {
-    // 区分“超时中止”与真正的网络错误：超时抛出明确的中文提示
-    // Distinguish a "timeout abort" from a real network error: throw a clear message on timeout
-    if (e && e.name === 'AbortError') throw new Error('请求超时')
-    throw e
-  } finally {
-    // 无论成功与否都清理定时器，避免计时器泄漏
-    // Always clear the timer to avoid a leaked timer
-    clearTimeout(timer)
   }
+
+  let res
+  try {
+    res = await doFetch(base)
+  } catch (e) {
+    // 网络层失败（DNS 解析失败 / 连接被拒 / 跨域 / 超时）：若配置了自定义服务器且同源可用，
+    // 自动回退到「当前页面同源」再试一次——修复「设置了失效的自定义服务器地址后，
+    // 登录态靠缓存令牌保留、但所有页面都拿不到后端数据」的系统性断联问题。
+    // English: on a network-level failure (DNS/connection/CORS/timeout), if a custom server was
+    // configured but same-origin is reachable, retry against same-origin once. This heals the
+    // "stale custom server URL keeps you logged in (cached token) yet every page is empty" case.
+    if (e && e.name === 'AbortError') {
+      clearTimeout(timer)
+      throw new Error('请求超时')
+    }
+    if (base !== '') {
+      try {
+        if (typeof console !== 'undefined') {
+          console.warn('[api] 自定义服务器地址不可达，回退同源请求:', base + path)
+        }
+        res = await doFetch('')
+      } catch (e2) {
+        clearTimeout(timer)
+        throw e2 || e
+      }
+    } else {
+      clearTimeout(timer)
+      throw e
+    }
+  }
+  clearTimeout(timer)
 
   // 401 表示令牌过期，清除本地登录态
   // 401 means the token expired; clear local auth state
@@ -537,6 +557,12 @@ export async function fetchPaperOrders() {
 // 对应 GET /api/paper/equity
 export async function fetchPaperEquity() {
   return request('/api/paper/equity')
+}
+
+/** Paper trading: self-check diagnostics (positions/trades/orders/equity emptiness + paper.json file state).
+ * 对应 GET /api/paper/selfcheck */
+export async function fetchPaperSelfCheck() {
+  return request('/api/paper/selfcheck')
 }
 
 /** 模拟盘：手动买入（信号页"模拟买入"按钮触发）。qty>0 时按用户输入价格/手数成交（静态记账），
@@ -1034,6 +1060,22 @@ export async function fetchShortStatus() {
 // Maps to POST /api/short/toggle; the body { enabled } carries the target state, persisted by the backend
 export async function toggleShort(enabled) {
   return request('/api/short/toggle', { method: 'POST', data: { enabled } })
+}
+
+/** 查询当前做多状态 */
+/** Query the current long status */
+// 对应 GET /api/long/status，返回 { long_enabled } 布尔值
+// Maps to GET /api/long/status; returns the boolean { long_enabled }
+export async function fetchLongStatus() {
+  return request('/api/long/status')
+}
+
+/** 切换做多开关 */
+/** Toggle the long switch */
+// 对应 POST /api/long/toggle，请求体 { enabled } 传入目标开关状态，后端持久化
+// Maps to POST /api/long/toggle; the body { enabled } carries the target state, persisted by the backend
+export async function toggleLong(enabled) {
+  return request('/api/long/toggle', { method: 'POST', data: { enabled } })
 }
 
 // ── 资讯显示全部开关 ──

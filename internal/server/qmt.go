@@ -487,6 +487,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 // English: GET /api/config/qmt returns the account's live-trading config with the token masked.
 func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.GetQMTConfigFor(userIDFor(r))
+	// 诊断日志：排查「开关刷新后变回关闭」——记录每次读取的真实账号与 enabled 值。
+	log.Printf("[diag-qmt] GET /api/config/qmt user=%s operator=%s enabled=%v", userIDFor(r), s.operatorID(), cfg.Enabled)
 	tokenMasked := ""
 	if cfg.Token != "" {
 		tokenMasked = maskSecret(cfg.Token)
@@ -688,6 +690,9 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.cfg.SetQMTConfigFor(userIDFor(r), &cfg)
+	// 诊断日志：记录每次保存的真实账号、目标 enabled 与落盘后回读值，确认是否真正写盘。
+	saved := s.cfg.GetQMTConfigFor(userIDFor(r))
+	log.Printf("[diag-qmt] POST /api/config/qmt user=%s operator=%s reqEnabled=%v savedEnabled=%v", userIDFor(r), s.operatorID(), cfg.Enabled, saved.Enabled)
 	log.Printf("[trading] qmt 配置已更新: enabled=%v mode=%s price=%s max_pos=%d fixed=%.0f strategies=%v",
 		cfg.Enabled, cfg.Mode, cfg.PriceType, cfg.MaxPositions, cfg.FixedAmount, cfg.Strategies)
 	writeJSON(w, 200, map[string]string{"ok": "1"})

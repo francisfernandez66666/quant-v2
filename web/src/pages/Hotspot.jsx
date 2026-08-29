@@ -2,7 +2,7 @@
 // 展示热点板块（含异动原因弹窗）、全市场个股评分排名、宏观日历、IPO日历、热点资讯。
 // 全面使用 TDesign 组件：Card / Table / Dialog / Tag / Button，纯内联样式，无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
-import { Card, Table, Dialog, Tag, Button, MessagePlugin } from 'tdesign-react'
+import { Card, Table, Dialog, Tag, Button, Select, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
 
@@ -41,8 +41,10 @@ export default function Hotspot() {
   const [ipoCalendar, setIpoCalendar] = useState([])
   const [reasonTarget, setReasonTarget] = useState(null)
   const [showLog, setShowLog] = useState(false)
-  const [logSignal, setLogSignal] = useState('')
-  const [logStage, setLogStage] = useState('')
+  const [logSignals, setLogSignals] = useState([])
+  const [logStages, setLogStages] = useState([])
+  // 日志批次选择：'all'=平铺全部；数字=只看该轮批次（下拉框按批次区分）
+  const [logBatch, setLogBatch] = useState('all')
   const [reanalyzing, setReanalyzing] = useState(false)
 
   const [sortKey, setSortKey] = useState('')
@@ -68,6 +70,56 @@ export default function Hotspot() {
   // 过滤宏观日历与政策反制事件
   const calendarEvents = useMemo(() => news.filter((n) => n.source === '宏观日历' || n.source === '政策反制'), [news])
 
+  // 资讯按标题建索引，供板块弹窗匹配「原文」
+  // 按标题建索引：标题→新闻原文，供板块弹窗精确匹配关联新闻
+  const newsByTitle = useMemo(() => {
+    const m = {} // 标题→新闻原文的索引表
+    for (const n of news) if (n.title) m[n.title] = n
+    return m
+  }, [news])
+  // 按标题（精确→模糊包含）查找关联新闻原文
+  function findNews(title) {
+    if (!title) return null
+    if (newsByTitle[title]) return newsByTitle[title]
+    const t = title.replace(/\s/g, '')
+    for (const k of Object.keys(newsByTitle)) {
+      const kk = k.replace(/\s/g, '')
+      if (kk && (kk.includes(t) || t.includes(kk))) return newsByTitle[k]
+    }
+    return null
+  }
+
+  // 按板块名反查资讯库原文：板块归因的 news_titles 与资讯库标题常不一致（LLM 改写/截断），
+  // 标题匹配失败时退而展示「资讯库中 sectors 命中本板块」的原文，保证点开能溯源看到原文（修复：点开啥也没有）。
+  // English: when title matching fails, surface news whose `sectors` contains this sector name.
+  // 按板块名建索引：板块名→命中该板块的全部新闻原文，用于标题匹配失败时的兜底溯源
+  const newsBySector = useMemo(() => {
+    const m = {} // 板块名→新闻数组的索引表
+    for (const n of news) {
+      for (const sec of (n.sectors || [])) {
+        if (!sec) continue
+        if (!m[sec]) m[sec] = []
+        m[sec].push(n)
+      }
+    }
+    return m
+  }, [news])
+  // 按板块名反查资讯库原文：返回所有 sectors 命中该板块的新闻（去重），供异动原因弹窗溯源展示
+  function findNewsBySector(name) {
+    if (!name) return []
+    const out = []
+    const seen = new Set()
+    for (const k of Object.keys(newsBySector)) {
+      if (!k) continue
+      if (k === name || k.includes(name) || name.includes(k)) {
+        for (const n of newsBySector[k]) {
+          if (!seen.has(n.title)) { seen.add(n.title); out.push(n) }
+        }
+      }
+    }
+    return out
+  }
+
   // 根据上市日期计算 IPO 倒计时（相对今天的天数差，含「今天/已上市/即将上市」）
   function ipoCountdown(c) {
     const ds = c.listing_date || c.ipo_date
@@ -77,6 +129,16 @@ export default function Hotspot() {
     if (diff > 0) return `${diff}天后`
     if (diff === 0) return '📌今天'
     return `${-diff}天前`
+  }
+
+  // 将时间戳或字符串统一格式化为 YYYY-MM-DD HH:mm:ss（用于日志/弹窗时间）
+  function fmtLogTime(dt) {
+    if (dt === null || dt === undefined || dt === '') return ''
+    const s = String(dt)
+    const d = /^\d+$/.test(s) ? new Date(Number(s) * 1000) : new Date(s)
+    if (isNaN(d.getTime())) return s
+    const p = (n) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
   }
 
   // 将时间戳或字符串统一格式化为 MM-DD HH:mm
@@ -181,14 +243,15 @@ export default function Hotspot() {
   // 打开日志弹窗并加载信号与 Stage 日志
   async function openLog() {
     setShowLog(true)
+    setLogBatch('all')
     try {
       const sl = await fetchSignalLogs()
-      setLogSignal(typeof sl === 'string' ? sl : JSON.stringify(sl, null, 2))
-    } catch (_) { setLogSignal('') }
+      setLogSignals(Array.isArray(sl) ? sl : [])
+    } catch (_) { setLogSignals([]) }
     try {
       const st = await fetchStageRecords()
-      setLogStage(typeof st === 'string' ? st : JSON.stringify(st, null, 2))
-    } catch (_) { setLogStage('') }
+      setLogStages(Array.isArray(st) ? st : [])
+    } catch (_) { setLogStages([]) }
   }
 
   // 挂载时加载数据、启动轮询与 SSE；处理页面可见性变化；卸载时清理
@@ -261,11 +324,24 @@ export default function Hotspot() {
   const ipoData = ipoCalendar.map((c, i) => ({ id: 'ipo' + i, date: c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : ''), name: c.name, code: c.code, issue_price: c.issue_price, status: ipoCountdown(c), statusTheme: c.list_status === 'L' ? 'default' : 'warning' }))
 
   // 资讯标签解析：根据情绪/方向/影响等级生成 TDesign Tag 的 {text, theme} 列表
+  // 归一影响级别：后端部分来源可能下发英文 high/medium/low，统一成中文 高/中/低
+  function normImpact(v) {
+    if (!v) return ''
+    const m = { high: '高', medium: '中', low: '低' }
+    return m[String(v).toLowerCase()] || v
+  }
+  // 将单条资讯解析为标签列表（情绪/方向/影响级别），供热点资讯表格渲染彩色 Tag
   function newsTags(n) {
     const tags = []
-    if (n.sentiment) { const theme = n.sentiment === '正面' ? 'success' : n.sentiment === '负面' ? 'danger' : 'default'; tags.push({ text: n.sentiment, theme }) }
+    // sentiment 与 direction 常相等（后端 sentiment 复用了 direction 值），仅在不同时展示避免重复；
+    // 颜色映射同时兼容「正面/负面」与「利好/利空」两种取值
+    if (n.sentiment && n.sentiment !== n.direction) {
+      const theme = (n.sentiment === '正面' || n.sentiment === '利好') ? 'success' : (n.sentiment === '负面' || n.sentiment === '利空') ? 'danger' : 'default'
+      tags.push({ text: n.sentiment, theme })
+    }
     if (n.direction) { const theme = n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'; tags.push({ text: n.direction, theme }) }
-    if (n.impact_level) { const theme = n.impact_level === '高' ? 'warning' : n.impact_level === '中' ? 'primary' : 'default'; tags.push({ text: n.impact_level + '影响', theme }) }
+    const il = normImpact(n.impact_level)
+    if (il) { const theme = il === '高' ? 'warning' : il === '中' ? 'primary' : 'default'; tags.push({ text: il + '影响', theme }) }
     return tags
   }
   // 资讯列
@@ -292,7 +368,8 @@ export default function Hotspot() {
         {sectors.length ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12 }}>
             {sectors.map((s) => (
-              <Card key={s.code} bordered={false} style={{ cursor: 'pointer', background: '#eef4fc', border: '1px solid #eef0f3' }} onClick={() => setReasonTarget(s)}>
+              <Card key={s.code} bordered={false} style={{ background: '#eef4fc', border: '1px solid #eef0f3' }}>
+                <div onClick={() => setReasonTarget(s)} style={{ cursor: 'pointer' }}>
                 <div style={{ fontSize: 14, fontWeight: 600, color: '#1a1a1a' }}>{s.name}</div>
                 {s.reason && <div style={{ fontSize: 11, color: '#888', marginTop: 4, minHeight: 28, overflow: 'hidden' }}>{shortReason(s.reason)}</div>}
                 <div style={{ fontSize: 16, fontWeight: 700, color: '#FAAD14', marginTop: 4 }}>{Math.round((s.score || 0) * 100)}分</div>
@@ -303,6 +380,7 @@ export default function Hotspot() {
                   {(s.d1 || 0) > 0 && <span style={{ display: 'inline-block', background: 'rgba(79,195,247,0.15)', color: '#4fc3f7', borderRadius: 4, padding: '1px 5px', marginRight: 6 }}>D1 {s.d1.toFixed(0)}</span>}
                   <span>涨停 {s.limitup_cnt || 0}</span>
                   <span style={{ marginLeft: 8 }}>流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
+                </div>
                 </div>
               </Card>
             ))}
@@ -331,37 +409,193 @@ export default function Hotspot() {
             </div>
             <div style={{ marginBottom: 14 }}>
               <div style={{ fontWeight: 600, marginBottom: 6 }}>板块异动原因</div>
-              <div style={{ fontSize: 13, color: '#ccc', whiteSpace: 'pre-wrap' }}>{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
+              <div style={{ fontSize: 13, color: '#333', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
             </div>
-            {/* 触发新闻：有则渲染列表，无则给出友好空态提示，避免用户误以为功能损坏 */}
+            {/* 触发新闻：优先用后端直接溯源的 news_items（含正文），标题二次匹配失败时按板块名兜底 */}
             <div>
-              <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻{reasonTarget.news_titles && reasonTarget.news_titles.length ? `（${reasonTarget.news_titles.length}条）` : ''}</div>
-              {reasonTarget.news_titles && reasonTarget.news_titles.length ? (
-                reasonTarget.news_titles.map((t, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#666666', padding: '2px 0' }}>
-                    <span style={{ color: '#888' }}>{i + 1}.</span>
-                    <span>{t}</span>
+              {(() => {
+                const items = reasonTarget.news_items && reasonTarget.news_items.length ? reasonTarget.news_items : null
+                if (items) {
+                  return (
+                    <div>
+                      <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻（{items.length}条）</div>
+                      {items.map((art, i) => (
+                        <div key={i} style={{ marginBottom: 12, borderLeft: '3px solid #4fc3f7', paddingLeft: 10 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a' }}>{i + 1}. {art.title}</div>
+                          <div style={{ fontSize: 12, color: '#555', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（该资讯暂未收录正文）'}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )
+                }
+                // 兜底：旧逻辑（标题匹配 + 板块名反查）
+                const titles = reasonTarget.news_titles || []
+                return (
+                  <div>
+                    <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻{titles.length ? `（${titles.length}条）` : ''}</div>
+                    {titles.length ? (
+                      titles.map((t, i) => {
+                        const art = findNews(t)
+                        return (
+                          <div key={i} style={{ marginBottom: 12, borderLeft: '3px solid #4fc3f7', paddingLeft: 10 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a' }}>{i + 1}. {t}</div>
+                            {art ? (
+                              <div style={{ fontSize: 12, color: '#555', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（资讯库无正文）'}</div>
+                            ) : (
+                              <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>（未在资讯库匹配到原文）</div>
+                            )}
+                          </div>
+                        )
+                      })
+                    ) : (
+                      <div style={{ fontSize: 13, color: '#888' }}>暂无关联新闻（来源未提供相关触发新闻）</div>
+                    )}
+                    {titles.length > 0 && !titles.every((t) => findNews(t)) ? (
+                      (() => {
+                        const related = findNewsBySector(reasonTarget.name)
+                        if (!related.length) return null
+                        return (
+                          <div style={{ marginTop: 10 }}>
+                            <div style={{ fontWeight: 600, marginBottom: 6, color: '#1d4ed8' }}>板块相关原文（按板块名匹配，{related.length}条）</div>
+                            {related.map((art, i) => (
+                              <div key={'r' + i} style={{ marginBottom: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 10 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a' }}>{art.title}</div>
+                                <div style={{ fontSize: 12, color: '#555', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（资讯库无正文）'}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )
+                      })()
+                    ) : null}
                   </div>
-                ))
-              ) : (
-                <div style={{ fontSize: 13, color: '#888' }}>暂无关联新闻（来源未提供相关触发新闻）</div>
-              )}
+                )
+              })()}
             </div>
           </div>
         )}
       </Dialog>
 
-      {/* 运行日志弹窗 */}
+      {/* 运行日志弹窗：将结构化日志渲染为人人可读的摘要，避免原始 JSON 对非技术人员不可读。
+          批次下拉框：按轮次（批次）区分，默认平铺全部；选定某轮只展示该批次信号+分析。 */}
       <Dialog visible={showLog} header="运行日志" onClose={() => setShowLog(false)} confirmBtn="关闭" cancelBtn="">
         <div>
-          <div style={{ marginBottom: 14 }}>
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>信号批次 / 阶段记录</div>
-            <pre style={{ fontSize: 12, color: '#ccc', background: '#eef4fc', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logSignal || '暂无'}</pre>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+            <span style={{ fontSize: 13, color: '#888' }}>按批次查看</span>
+            <Select
+              value={logBatch}
+              onChange={(v) => setLogBatch(v)}
+              size="small"
+              style={{ width: 280 }}
+              options={[
+                { label: `全部批次（信号 ${logSignals.length} 轮 / 分析 ${logStages.length} 轮）`, value: 'all' },
+                ...Array.from({ length: Math.max(logSignals.length, logStages.length) }, (_, i) => {
+                  const t = (logSignals[i] && logSignals[i].process_time) || (logStages[i] && logStages[i].process_time) || ''
+                  return { label: `第 ${i + 1} 轮 · ${fmtLogTime(t)}`, value: String(i) }
+                }),
+              ]}
+            />
           </div>
-          <div>
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>Stage 轮次记录</div>
-            <pre style={{ fontSize: 12, color: '#ccc', background: '#eef4fc', borderRadius: 6, padding: 10, maxHeight: 180, overflow: 'auto', margin: 0 }}>{logStage || '暂无'}</pre>
-          </div>
+
+          {logBatch !== 'all' ? (() => {
+            const bi = Number(logBatch)
+            const log = logSignals[bi]
+            const d = logStages[bi]
+            return (
+              <div>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>第 {bi + 1} 轮 · 信号批次</div>
+                {!log ? (
+                  <div style={{ fontSize: 13, color: '#888', marginBottom: 12 }}>该批次暂无信号日志</div>
+                ) : (
+                  <div style={{ marginBottom: 16, border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                      {fmtLogTime(log.process_time)} · 扫描新闻 {log.raw_count || 0} 条 · 产出信号 {log.signals ? log.signals.length : 0} 个
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {(log.signals || []).map((sg, j) => (
+                        <div key={j} style={{ fontSize: 12, background: '#f7f9fc', borderRadius: 4, padding: '6px 8px' }}>
+                          <span style={{ fontFamily: 'monospace', color: '#1a1a1a', fontWeight: 600 }}>{sg.code} {sg.name}</span>
+                          <span style={{ marginLeft: 6, color: sg.direction === '做空' ? '#e34d59' : '#00a870' }}>{sg.direction}</span>
+                          <span style={{ marginLeft: 6, color: '#1d4ed8' }}>{sg.action}</span>
+                          <span style={{ marginLeft: 6, color: '#666' }}>{sg.strategy}</span>
+                          {sg.price > 0 && <span style={{ marginLeft: 6, color: '#666' }}>触发价 ¥{sg.price}</span>}
+                          {sg.reason && <div style={{ color: '#888', marginTop: 3 }}>原因：{sg.reason}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>第 {bi + 1} 轮 · 新闻分析</div>
+                {!d ? (
+                  <div style={{ fontSize: 13, color: '#888' }}>该批次暂无阶段记录</div>
+                ) : (
+                  <div style={{ border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                      {fmtLogTime(d.process_time)} · 初筛模式 {d.stage1_mode || '-'}：原始 {d.raw_count || 0} 条 → 命中 {d.selected_count || 0} 条
+                    </div>
+                    <div style={{ fontSize: 12, color: '#333', fontWeight: 600, marginBottom: 4 }}>命中事件：</div>
+                    {(d.stage2_events || []).map((ev, j) => (
+                      <div key={j} style={{ fontSize: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 8, margin: '4px 0', color: '#555' }}>
+                        <span style={{ fontWeight: 600, color: '#1a1a1a' }}>{ev.title}</span>
+                        <span style={{ marginLeft: 6, color: ev.direction === '利好' ? '#00a870' : ev.direction === '利空' ? '#e34d59' : '#888' }}>{ev.direction}</span>
+                        {(ev.sectors || []).length > 0 && <span style={{ marginLeft: 6, color: '#4fc3f7' }}>{ev.sectors.join(' / ')}</span>}
+                      </div>
+                    ))}
+                    {(!d.stage2_events || d.stage2_events.length === 0) && (
+                      <div style={{ fontSize: 12, color: '#999' }}>本轮无命中事件（原始标题 {d.raw_titles ? d.raw_titles.length : 0} 条未通过筛选）</div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })() : (
+            <div>
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>信号批次（共 {logSignals.length} 轮）</div>
+                {logSignals.length === 0 && <div style={{ fontSize: 13, color: '#888' }}>暂无信号日志</div>}
+                {logSignals.map((log, i) => (
+                  <div key={i} style={{ marginBottom: 12, border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                      第 {i + 1} 轮 · {fmtLogTime(log.process_time)} · 扫描新闻 {log.raw_count || 0} 条 · 产出信号 {log.signals ? log.signals.length : 0} 个
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {(log.signals || []).map((sg, j) => (
+                        <div key={j} style={{ fontSize: 12, background: '#f7f9fc', borderRadius: 4, padding: '6px 8px' }}>
+                          <span style={{ fontFamily: 'monospace', color: '#1a1a1a', fontWeight: 600 }}>{sg.code} {sg.name}</span>
+                          <span style={{ marginLeft: 6, color: sg.direction === '做空' ? '#e34d59' : '#00a870' }}>{sg.direction}</span>
+                          <span style={{ marginLeft: 6, color: '#1d4ed8' }}>{sg.action}</span>
+                          <span style={{ marginLeft: 6, color: '#666' }}>{sg.strategy}</span>
+                          {sg.price > 0 && <span style={{ marginLeft: 6, color: '#666' }}>触发价 ¥{sg.price}</span>}
+                          {sg.reason && <div style={{ color: '#888', marginTop: 3 }}>原因：{sg.reason}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>新闻分析轮次（共 {logStages.length} 轮）</div>
+                {logStages.length === 0 && <div style={{ fontSize: 13, color: '#888' }}>暂无阶段记录</div>}
+                {logStages.map((d, i) => (
+                  <div key={i} style={{ marginBottom: 12, border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
+                    <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                      第 {i + 1} 轮 · {fmtLogTime(d.process_time)} · 初筛模式 {d.stage1_mode || '-'}：原始 {d.raw_count || 0} 条 → 命中 {d.selected_count || 0} 条
+                    </div>
+                    <div style={{ fontSize: 12, color: '#333', fontWeight: 600, marginBottom: 4 }}>命中事件：</div>
+                    {(d.stage2_events || []).map((ev, j) => (
+                      <div key={j} style={{ fontSize: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 8, margin: '4px 0', color: '#555' }}>
+                        <span style={{ fontWeight: 600, color: '#1a1a1a' }}>{ev.title}</span>
+                        <span style={{ marginLeft: 6, color: ev.direction === '利好' ? '#00a870' : ev.direction === '利空' ? '#e34d59' : '#888' }}>{ev.direction}</span>
+                        {(ev.sectors || []).length > 0 && <span style={{ marginLeft: 6, color: '#4fc3f7' }}>{ev.sectors.join(' / ')}</span>}
+                      </div>
+                    ))}
+                    {(!d.stage2_events || d.stage2_events.length === 0) && (
+                      <div style={{ fontSize: 12, color: '#999' }}>本轮无命中事件（原始标题 {d.raw_titles ? d.raw_titles.length : 0} 条未通过筛选）</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </Dialog>
 

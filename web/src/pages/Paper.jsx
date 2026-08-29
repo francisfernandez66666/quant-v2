@@ -11,6 +11,7 @@ import MinuteView from '../components/MinuteView.jsx'
 
 const UP = '#e34d59'   // 涨（A股习惯红）
 const DOWN = '#00a870' // 跌（绿）
+// 将 up/down 涨跌标记映射为对应的红/绿颜色常量
 const clsColor = (c) => (c === 'up' ? UP : c === 'down' ? DOWN : undefined)
 
 /**
@@ -149,6 +150,8 @@ function StatCard({ label, children }) {
 export default function Paper() {
   const [enabled, setEnabled] = useState(false)
   const [isAdmin, setIsAdmin] = useState(false)
+  // 后端鉴权拒绝（403）：模拟盘仅管理员可访问，后端据此决定，前端只负责展示。
+  const [forbidden, setForbidden] = useState(false)
   const [initialCapital, setInitialCapital] = useState('')
   const [maxPos, setMaxPos] = useState('')
   const [appliedMax, setAppliedMax] = useState(0)
@@ -175,6 +178,10 @@ export default function Paper() {
   const [cfgRuleSel, setCfgRuleSel] = useState('')
   const [cfgWarn, setCfgWarn] = useState('')
 
+  const [selfCheck, setSelfCheck] = useState(null)
+  const [selfCheckOpen, setSelfCheckOpen] = useState(false)
+  const [selfCheckLoading, setSelfCheckLoading] = useState(false)
+
   const [klineOpen, setKlineOpen] = useState(new Set())
   const [sheetPos, setSheetPos] = useState(null)
   const [sheetTradeRow, setSheetTradeRow] = useState(null)
@@ -194,11 +201,13 @@ export default function Paper() {
   const tradeOverSell = useMemo(() =>
     tradeDir === 'trim' && tradeTarget && tradePreviewQty * 100 >= tradeTarget.qty, [tradeDir, tradePreviewQty, tradeTarget])
 
+  // 判断指定资金池是否已配置买入纪律（日限/冷却/最低分/日预算任一非空即视为已配）
   const poolCurrentRule = (key) => {
     const p = pools.find((x) => x.key === key)
     return !!(p && p.buy_rule && (p.buy_rule.max_daily_buys || p.buy_rule.cooldown_minutes ||
       p.buy_rule.min_score || p.buy_rule.budget_pct_per_day))
   }
+  // 将指定资金池的买入纪律序列化为可读文案（日限/冷却/最低分/日预算%）
   const poolCurrentRuleText = (key) => {
     const p = pools.find((x) => x.key === key)
     const r = p && p.buy_rule
@@ -247,6 +256,7 @@ export default function Paper() {
   const tradeData = useMemo(() => filteredTrades.map((t, i) => ({ ...t, __key: 'trade_' + i, __idx: i })), [filteredTrades])
   const orderData = useMemo(() => filteredOrders.map((o, i) => ({ ...o, __key: o.id || ('o_' + i) })), [filteredOrders])
 
+  // 展开/收起指定持仓代码的分时图（维护已展开 key 集合）
   function toggleKline(key) {
     setKlineOpen((prev) => {
       const next = new Set(prev)
@@ -254,16 +264,21 @@ export default function Paper() {
       return next
     })
   }
+  // 移动端点击持仓行时打开底部持仓操作面板（桌面端不响应）
   function onRowTap(p) { if (window.innerWidth <= 768) setSheetPos(p) }
+  // 移动端点击成交行时打开底部成交操作面板（带索引，便于展开对应分时）
   function onTradeTap(t, i) { if (window.innerWidth <= 768) setSheetTradeRow({ ...t, idx: i }) }
+  // 移动端面板：展开当前选中持仓的分时图并关闭面板
   function sheetKline() {
     if (!sheetPos) return
     toggleKline(sheetPos.code); setSheetPos(null)
   }
+  // 移动端面板：对当前选中持仓打开加仓/减仓/清仓交易弹窗
   function sheetTrade(dir) {
     if (!sheetPos) return
     const p = sheetPos; setSheetPos(null); openTrade(p, dir)
   }
+  // 移动端面板：展开当前选中成交所属标的的分时图并关闭面板
   function sheetTradeKline() {
     if (!sheetTradeRow) return
     toggleKline('trade_' + sheetTradeRow.idx); setSheetTradeRow(null)
@@ -316,19 +331,50 @@ export default function Paper() {
   async function load() {
     try {
       const st = await api.fetchPaperState()
-      setEnabled(!!st.enabled)
+      // 注意：开关状态必须用本次拉取到的 st.enabled 判断，不能用组件 state 的 enabled——
+      // 首屏 enabled 初始为 false，且 setInterval(load) 捕获的是首屏闭包，若用 state 判断会
+      // 永远走到「未启用」提前返回，导致持仓/成交/订单/净值曲线（在 return 之后才拉取）永远为空
+      // （实录：分仓池显示 20 仓但「全部」页为空）。
+      // English: decide the early-return from the freshly-fetched st.enabled, never from the
+      // stale `enabled` state — otherwise positions/trades/orders/equity are never fetched.
+      const en = !!st.enabled
+      setEnabled(en)
       setIsAdmin(!!st.is_admin)
       if (st.initial_capital > 0 && !initialCapital) setInitialCapital(String(st.initial_capital))
       if (st.max_positions !== undefined && !maxPos) setMaxPos(st.max_positions > 0 ? String(st.max_positions) : '0')
       setAppliedMax((st.max_positions !== undefined && st.max_positions > 0) ? st.max_positions : 0)
       setStats(st.stats || null)
       setPools(Array.isArray(st.strategy_pools) ? st.strategy_pools : [])
-    } catch (_) {}
-    if (!enabled) return
-    try { setPositions(await api.fetchPaperPositions()) } catch (_) {}
-    try { setTrades(await api.fetchPaperTrades()) } catch (_) {}
-    try { setOrders(await api.fetchPaperOrders()) } catch (_) {}
-    try { setEquity(await api.fetchPaperEquity()) } catch (_) {}
+      if (!en) {
+        // 关闭后清空持仓/成交/订单/净值，避免残留旧数据让用户误以为仍有持仓
+        setPositions([])
+        setTrades([])
+        setOrders([])
+        setEquity([])
+        return
+      }
+      try { setPositions(await api.fetchPaperPositions()) } catch (_) {}
+      try { setTrades(await api.fetchPaperTrades()) } catch (_) {}
+      try { setOrders(await api.fetchPaperOrders()) } catch (_) {}
+      try { setEquity(await api.fetchPaperEquity()) } catch (_) {}
+    } catch (e) {
+      // 后端返回 403（无权限）时，展示「无权限」面板，不再静默兜底。
+      if (e && e.message && e.message.indexOf('无权限') >= 0) { setForbidden(true); return }
+    }
+  }
+
+  // 触发模拟盘自检诊断（持仓/成交/订单/净值一致性），结果弹窗展示
+  async function runSelfCheck() {
+    setSelfCheckLoading(true)
+    try {
+      const res = await api.fetchPaperSelfCheck()
+      setSelfCheck(res)
+      setSelfCheckOpen(true)
+    } catch (e) {
+      showToast(e && e.message ? e.message : '自检失败')
+    } finally {
+      setSelfCheckLoading(false)
+    }
   }
 
   /**
@@ -503,6 +549,7 @@ export default function Paper() {
     ) },
   ]
 
+  // 成交记录表列定义：时间、方向、代码/名称、战法、数量、价格、金额、滑点、延迟与分时
   const tradeColumns = [
     { colKey: 'time', title: '时间', width: 160, cell: ({ row }) => fmtTime(row.time) },
     { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
@@ -524,6 +571,7 @@ export default function Paper() {
     ) },
   ]
 
+  // 委托生命周期表列定义：时间、方向、代码/名称、来源、状态、量价、信号价与说明
   const orderColumns = [
     { colKey: 'time', title: '时间', width: 160, cell: ({ row }) => fmtTime(row.created_at) },
     { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
@@ -537,6 +585,7 @@ export default function Paper() {
     { colKey: 'reason', title: '说明', width: 160, ellipsis: true, cell: ({ row }) => <span title={row.reason || ''}>{shortReason(row.reason)}</span> },
   ]
 
+  // 委托/持仓表格的展开行渲染器：返回该标的分时+盘口组合视图（MinuteView）
   function renderKline(params) {
     const row = params && params.row ? params.row : params
     return <MinuteView code={row.code} name={row.name} />
@@ -554,9 +603,16 @@ export default function Paper() {
           {enabled && <Tag>上限：{appliedMax > 0 ? appliedMax + ' 只' : '不设限'}</Tag>}
           <Button theme="primary" disabled={!enabled} onClick={() => setShowDepositModal(true)}>＋ 注入资金</Button>
           <Button disabled={!enabled} onClick={openSettingsModal}>⚙ 设置</Button>
+          <Button theme="default" loading={selfCheckLoading} onClick={runSelfCheck}>🔍 自检</Button>
           <Button theme="danger" disabled={!enabled} onClick={() => setShowResetModal(true)}>清盘</Button>
         </div>
       </div>
+
+      {forbidden && (
+        <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: '#ad6800', fontSize: 13 }}>
+          🔒 无权限访问模拟盘：当前登录「{api.getAccount() || '未知'}」为普通用户，该页面仅管理员账号可操作。请使用管理员账号（用户名 admin）登录后再进行管理。
+        </div>
+      )}
 
       {/* 注入资金弹窗 */}
       <Dialog
@@ -852,6 +908,65 @@ export default function Paper() {
             <div style={{ color: '#e6a23c' }}>减仓后：剩余 {tradeTarget.qty - tradePreviewQty * 100} 股</div>
           )}
         </Form>
+      </Dialog>
+
+      {/* 模拟盘自检弹窗 */}
+      <Dialog visible={selfCheckOpen} header="模拟盘自检" onClose={() => setSelfCheckOpen(false)} footer={null} width={640}>
+        {selfCheck && (
+          <div style={{ fontSize: 13, lineHeight: 1.9 }}>
+            {selfCheck.note && <div style={{ color: '#e6a23c', marginBottom: 8 }}>{selfCheck.note}</div>}
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <tbody>
+                {[
+                  ['开关(enabled)', selfCheck.enabled],
+                  ['是否管理员', selfCheck.is_admin],
+                  ['引擎快照路径', selfCheck.engine_path || '—'],
+                  ['是否发生过成交(has_filled)', selfCheck.has_filled],
+                  ['当前持仓数', selfCheck.positions],
+                  ['成交记录数', selfCheck.trades],
+                  ['订单记录数', selfCheck.orders],
+                  ['净值点数', selfCheck.equity_points],
+                  ['资金池数', selfCheck.pools],
+                  ['paper.json 存在', selfCheck.file_exists],
+                  ['文件大小(byte)', selfCheck.file_size ?? '—'],
+                  ['文件修改时间', selfCheck.file_mtime || '—'],
+                  ['文件错误', selfCheck.file_error || '—'],
+                ].map(([k, v]) => (
+                  <tr key={k} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ color: '#666', padding: '4px 8px', width: 200 }}>{k}</td>
+                    <td style={{ padding: '4px 8px', fontFamily: 'monospace', wordBreak: 'break-all' }}>{String(v)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {Array.isArray(selfCheck.pool_detail) && selfCheck.pool_detail.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>各资金池持仓分布</div>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ color: '#666', textAlign: 'left' }}>
+                      <th style={{ padding: '4px 8px' }}>池(key)</th>
+                      <th style={{ padding: '4px 8px' }}>名称</th>
+                      <th style={{ padding: '4px 8px' }}>持仓数</th>
+                      <th style={{ padding: '4px 8px' }}>可用现金</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selfCheck.pool_detail.map((p, i) => (
+                      <tr key={i} style={{ borderBottom: '1px solid #eee' }}>
+                        <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{p.strategy}</td>
+                        <td style={{ padding: '4px 8px' }}>{p.name}</td>
+                        <td style={{ padding: '4px 8px' }}>{p.positions}</td>
+                        <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{fmt(p.cash)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div style={{ marginTop: 10, color: '#999' }}>提示：若「当前持仓数」&gt;0 但前端「全部」页为空，多半是前端拉取逻辑问题（已修复）；若持仓与文件都为空，则确属无数据。</div>
+          </div>
+        )}
       </Dialog>
     </div>
   )

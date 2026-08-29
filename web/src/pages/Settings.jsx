@@ -2,7 +2,8 @@
 // 服务器连接、通知、账户信息、LLM 配置、五大战法参数、资讯显示开关、系统信息
 // 使用 TDesign React 组件（Card / Input / InputNumber / Switch / Button / Tag / Textarea）。
 import React, { useState, useEffect } from 'react'
-import { Card, Input, InputNumber, Switch, Button, Tag, Textarea } from 'tdesign-react'
+import { Card, Input, InputNumber, Button, Tag, Textarea } from 'tdesign-react'
+import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
 import { showToast } from '../ui.jsx'
@@ -112,9 +113,10 @@ export default function Settings() {
   }
 
   // 切换「显示全部资讯」开关
-  async function toggleNewsShowAll() {
+  async function toggleNewsShowAll(next) {
+    const val = typeof next === 'boolean' ? next : newsShowAll
     try {
-      const res = await api.toggleNewsShowAll(newsShowAll)
+      const res = await api.toggleNewsShowAll(val)
       if (res && typeof res.news_show_all === 'boolean') setNewsShowAll(res.news_show_all)
     } catch (e) {
       setNewsShowAll(v => !v)
@@ -226,8 +228,8 @@ export default function Settings() {
   const renderField = (group, f) => {
     if (f.type === 'switch') {
       return (
-        <Switch
-          value={!!strategyCfg[group.key][f.k]}
+        <ToggleSw
+          checked={!!strategyCfg[group.key][f.k]}
           onChange={(v) => setStrategyField(group.key, f.k, v)}
         />
       )
@@ -341,9 +343,9 @@ export default function Settings() {
       <Card title="资讯显示" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={{ ...labelStyle, width: 240 }} title="开启后弱档/中性资讯（|score|<0.25）也出现在资讯列表；关闭则仅显示有价值的强事件">显示全部资讯（含弱/中性）</span>
-          <Switch
-            value={newsShowAll}
-            onChange={(v) => { setNewsShowAll(v); toggleNewsShowAll() }}
+          <ToggleSw
+            checked={newsShowAll}
+            onChange={(v) => { setNewsShowAll(v); toggleNewsShowAll(v) }}
           />
         </div>
         <div style={rowStyle}>

@@ -842,6 +842,10 @@ type Manager struct {
 	path  string       // 配置文件路径（全局默认）
 	mu    sync.RWMutex // 保护 store/规则指针的读写锁
 	store KVStore      // per-user 配置存储（可为 nil，表示不支持账号级隔离）
+	// operatorID 运营数据归属账号（管理员）ID。所有运营数据（量化/模拟盘/看板/告警/LLM）
+	// 统一归属该账号，后端按角色做访问控制：管理员可读写，子账号仅可读公开部分。
+	// 由 main 在启动后注入 auth.AdminID()。为空时回退到调用方传入的 userID（兼容旧路径）。
+	operatorID string
 }
 
 // NewManager 创建配置管理器，加载指定路径的 JSON 配置文件。
@@ -866,10 +870,39 @@ func (m *Manager) SetStore(s KVStore) {
 	m.store = s
 }
 
+// SetOperatorID 设置运营数据归属账号（管理员）ID。注入后，量化/模拟盘等运营配置统一
+// 归属该账号，后端按角色鉴权：管理员可读写，子账号按权限仅可读公开部分。
+// （SetOperatorID sets the operator (admin) account that owns all operational data.）
+func (m *Manager) SetOperatorID(id string) {
+	m.mu.Lock()
+	m.operatorID = id
+	m.mu.Unlock()
+}
+
+// ownerOf 返回运营数据归属账号：已注入 operatorID 时优先，否则回退到调用方传入的 userID。
+// 这是“运营数据系统级共享、后端按角色鉴权”的核心：所有账号看到的量化/模拟盘/看板/告警/LLM
+// 都是同一份（归属管理员），前端只负责展示，权限由后端在接口层判定。
+// （ownerOf resolves the operational-data owner: injected operatorID first, else the caller's userID.）
+func (m *Manager) ownerOf(userID string) string {
+	if m.operatorID != "" {
+		return m.operatorID
+	}
+	return userID
+}
+
 // userRules 返回指定账号的规则快照；未配置账号级覆盖时回退全局 Rules。
 // 快照来自 KVStore 中的 JSON，反序列化为副本，避免污染全局。
 // （userRules returns the rules snapshot for a user, falling back to global Rules when
 // the account has no override; the snapshot is a deserialized copy.）
+// userRules 返回账号级规则快照（账号级覆盖优先，否则返回全局配置的堆副本）。
+// 关键不变量：
+//  1. 始终返回堆分配的 *Rules，避免调用方通过 &userRules(userID).X 取到悬垂指针（此前反序列化分支返回局部变量地址，属未定义行为）。
+//  2. 无账号级覆盖时返回全局 m.Rules 的副本而非其地址，避免 SetXxxConfigFor 改账号级配置时副作用改写全局（§全局指针副作用）。
+//
+// English: returns the account's rules snapshot (per-user override first, else a heap copy of global).
+// Invariants: (1) always heap-allocated so &userRules(userID).X is never dangling; (2) when there is no
+// per-user override we return a COPY of global (not its address) so account-scoped setters never mutate the
+// global rules as a side effect.
 func (m *Manager) userRules(userID string) *Rules {
 	if m.store == nil || userID == "" {
 		return m.Rules
@@ -878,14 +911,32 @@ func (m *Manager) userRules(userID string) *Rules {
 	raw, ok := m.store.GetConfig(userID, perUserKey)
 	m.mu.RUnlock()
 	if !ok || raw == "" {
-		return m.Rules
+		// §回退系统级覆盖：历史版本曾把账号级配置写到 userID="" 的键下。
+		// 若本账号无独立覆盖，则回退到系统级键，避免配置在重启/重载后“丢失”
+		// （表现为开关被自动关闭）。这属于兼容回退，不影响正常账号级覆盖优先级。
+		// English: fall back to the system-level (empty userID) override so legacy
+		// configs written under "" are still honored and survive restarts.
+		m.mu.RLock()
+		sysRaw, sysOk := m.store.GetConfig("", perUserKey)
+		m.mu.RUnlock()
+		if sysOk && sysRaw != "" {
+			raw = sysRaw
+			ok = true
+		}
 	}
-	var r Rules
-	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+	if !ok || raw == "" {
+		cp := new(Rules)
+		*cp = *m.Rules
+		return cp
+	}
+	r := new(Rules)
+	if err := json.Unmarshal([]byte(raw), r); err != nil {
 		log.Printf("[config] 账号 %s 配置反序列化失败, 回退全局: %v", userID, err)
-		return m.Rules
+		cp := new(Rules)
+		*cp = *m.Rules
+		return cp
 	}
-	return &r
+	return r
 }
 
 // saveUserRules 将账号规则快照持久化到 KVStore。
@@ -921,138 +972,144 @@ func (m *Manager) GetRulesFor(userID string) *Rules {
 
 // GetStrategyConfigFor 返回指定账号的策略参数配置（账号级覆盖优先，否则全局）。
 // （GetStrategyConfigFor returns the strategy config for a user (account override wins, else global).）
+// GetStrategyConfigFor 返回运营数据归属账号（管理员）的策略参数（运营配置系统级共享）。
 func (m *Manager) GetStrategyConfigFor(userID string) *StrategyConfig {
-	return &m.userRules(userID).Strategy
+	return &m.userRules(m.ownerOf(userID)).Strategy
 }
 
-// SetStrategyConfigFor 更新指定账号的策略参数并持久化（账号级覆盖）。
-// （SetStrategyConfigFor updates and persists a user's strategy params as an account override.）
+// SetStrategyConfigFor 更新运营数据归属账号（管理员）的策略参数并持久化（系统级共享）。
 func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
-	if m.store == nil || userID == "" {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
 		m.Rules.Strategy = *cfg
 		m.Save()
 		return
 	}
-	r := m.userRules(userID)
+	r := m.userRules(oid)
 	r.Strategy = *cfg
-	m.saveUserRules(userID, r)
+	m.saveUserRules(oid, r)
 }
 
-// GetLLMConfigFor 返回指定账号的 LLM 配置（账号级覆盖优先，否则全局）。
+// GetLLMConfigFor 返回运营数据归属账号（管理员）的 LLM 配置（运营配置系统级共享）。
 func (m *Manager) GetLLMConfigFor(userID string) *LLMConfig {
-	return &m.userRules(userID).LLM
+	return &m.userRules(m.ownerOf(userID)).LLM
 }
 
-// SetLLMConfigFor 更新指定账号的 LLM 配置并持久化（账号级覆盖）。
+// SetLLMConfigFor 更新运营数据归属账号（管理员）的 LLM 配置并持久化（系统级共享）。
 func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
-	if m.store == nil || userID == "" {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
 		m.Rules.LLM = *cfg
 		m.Save()
 		return
 	}
-	r := m.userRules(userID)
+	r := m.userRules(oid)
 	r.LLM = *cfg
-	m.saveUserRules(userID, r)
+	m.saveUserRules(oid, r)
 }
 
-// GetQMTConfigFor 返回指定账号的 QMT 实盘配置（账号级覆盖优先，否则全局）。
-// English: returns the account's QMT live-trading config (per-user override wins, else global).
+// GetQMTConfigFor 返回运营数据归属账号（管理员）的 QMT 实盘配置。
+// 运营数据系统级共享，后端按角色鉴权：所有账号读到的是同一份（归属管理员）配置。
+// English: returns the operator's (admin's) QMT live-trading config — operational data is
+// system-scoped; every account reads the same owner config, access gated by role at the API layer.
 func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
-	return &m.userRules(userID).QMT
+	return &m.userRules(m.ownerOf(userID)).QMT
 }
 
-// SetQMTConfigFor 更新指定账号的 QMT 实盘配置并持久化（账号级覆盖，5s 热加载生效）。
+// SetQMTConfigFor 更新运营数据归属账号（管理员）的 QMT 实盘配置并持久化（5s 热加载生效）。
 // 调用方负责校验取值合法性（mode/price_type 枚举、白名单过滤等），这里只做落库。
-// English: persists the account's QMT live-trading config override (hot-reloaded within 5s);
+// English: persists the operator's QMT live-trading config (hot-reloaded within 5s);
 // callers must validate enum/whitelist values — this method only stores.
 func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
-	if m.store == nil || userID == "" {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
 		m.Rules.QMT = *cfg
 		m.Save()
 		return
 	}
-	r := m.userRules(userID)
+	r := m.userRules(oid)
 	r.QMT = *cfg
-	m.saveUserRules(userID, r)
+	m.saveUserRules(oid, r)
 }
 
-// GetD1ConfigFor 返回指定账号的 D1 事件匹配规则（账号级覆盖优先，否则全局）。
+// GetD1ConfigFor 返回运营数据归属账号（管理员）的 D1 事件匹配规则（运营配置系统级共享）。
 func (m *Manager) GetD1ConfigFor(userID string) *D1Config {
-	if m.store == nil || userID == "" {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
 		return m.D1
 	}
 	m.mu.RLock()
-	raw, ok := m.store.GetConfig(userID, perUserD1Key)
+	raw, ok := m.store.GetConfig(oid, perUserD1Key)
 	m.mu.RUnlock()
 	if !ok || raw == "" {
 		return m.D1
 	}
 	var d D1Config
 	if err := json.Unmarshal([]byte(raw), &d); err != nil {
-		log.Printf("[config] 账号 %s D1 配置反序列化失败, 回退全局: %v", userID, err)
+		log.Printf("[config] 账号 %s D1 配置反序列化失败, 回退全局: %v", oid, err)
 		return m.D1
 	}
 	normalizeD1(&d)
 	return &d
 }
 
-// SetD1ConfigFor 更新指定账号的 D1 规则并持久化（账号级覆盖）。
+// SetD1ConfigFor 更新运营数据归属账号（管理员）的 D1 规则并持久化（系统级共享）。
 func (m *Manager) SetD1ConfigFor(userID string, cfg *D1Config) {
-	if m.store == nil || userID == "" {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
 		m.D1 = cfg
 		m.Save()
 		return
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
-		log.Printf("[config] 账号 %s D1 配置序列化失败: %v", userID, err)
+		log.Printf("[config] 账号 %s D1 配置序列化失败: %v", oid, err)
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.store.SetConfig(userID, perUserD1Key, string(data)); err != nil {
-		log.Printf("[config] 账号 %s D1 配置保存失败: %v", userID, err)
+	if err := m.store.SetConfig(oid, perUserD1Key, string(data)); err != nil {
+		log.Printf("[config] 账号 %s D1 配置保存失败: %v", oid, err)
 	}
 }
 
-// GetLongShortConfigFor 返回指定账号的做多/做空开关（账号级覆盖优先，否则全局默认：
-// 做多开/做空关）。
-// （GetLongShortConfigFor returns a user's long/short toggles (account override wins,
-// else the global default: long on / short off).）
+// GetLongShortConfigFor 返回运营数据归属账号（管理员）的做多/做空开关（运营配置系统级共享，
+// 默认做多开/做空关）。
 func (m *Manager) GetLongShortConfigFor(userID string) LongShortConfig {
 	def := LongShortConfig{LongEnabled: true, ShortEnabled: false}
-	if m.store == nil || userID == "" {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
 		return def
 	}
 	m.mu.RLock()
-	raw, ok := m.store.GetConfig(userID, perUserLongShortKey)
+	raw, ok := m.store.GetConfig(oid, perUserLongShortKey)
 	m.mu.RUnlock()
 	if !ok || raw == "" {
 		return def
 	}
 	var c LongShortConfig
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
-		log.Printf("[config] 账号 %s 做多/做空配置反序列化失败, 回退默认: %v", userID, err)
+		log.Printf("[config] 账号 %s 做多/做空配置反序列化失败, 回退默认: %v", oid, err)
 		return def
 	}
 	return c
 }
 
-// SetLongShortConfigFor 更新指定账号的做多/做空开关并持久化（账号级覆盖）。
-// （SetLongShortConfigFor updates and persists a user's long/short toggles as an account override.）
+// SetLongShortConfigFor 更新运营数据归属账号（管理员）的做多/做空开关并持久化（系统级共享）。
 func (m *Manager) SetLongShortConfigFor(userID string, c LongShortConfig) {
-	if m.store == nil || userID == "" {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
 		return
 	}
 	data, err := json.Marshal(c)
 	if err != nil {
-		log.Printf("[config] 账号 %s 做多/做空配置序列化失败: %v", userID, err)
+		log.Printf("[config] 账号 %s 做多/做空配置序列化失败: %v", oid, err)
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.store.SetConfig(userID, perUserLongShortKey, string(data)); err != nil {
-		log.Printf("[config] 账号 %s 做多/做空配置保存失败: %v", userID, err)
+	if err := m.store.SetConfig(oid, perUserLongShortKey, string(data)); err != nil {
+		log.Printf("[config] 账号 %s 做多/做空配置保存失败: %v", oid, err)
 	}
 }
 

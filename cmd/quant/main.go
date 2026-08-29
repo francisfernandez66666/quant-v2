@@ -82,6 +82,9 @@ func main() {
 
 	// 配置管理器：读取数据目录下的 config.json（策略/风控/情绪/LLM 等）
 	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
+	// 运营数据统一归属管理员：把管理员账号 ID 注入配置管理器，使量化/模拟盘/策略/D1/LLM/
+	// 做多空等配置与持仓/告警等数据系统级共享，后端按角色鉴权（子账号只读公开部分）。
+	cfgMgr.SetOperatorID(authMgr.AdminID())
 	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
 	cfgMgr.Watch(context.Background(), 60*time.Second)
 
@@ -174,6 +177,7 @@ func main() {
 
 	// HTTP 服务：认证/前端/报告/自选股 + SSE 实时推送
 	srv := server.New(authMgr, agg, cfgMgr, rpt, marketAPI, wlMgr, thsClient)
+	srv.SetCacheDir(dataDir) // 看板快照落盘，休市/重启后前端仍有最近一次有效数据
 	effModel := llmCfg.Model
 	if effModel == "" {
 		effModel = llm.DefaultModel

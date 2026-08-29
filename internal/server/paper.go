@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"quant-trading-v2/internal/data"
@@ -22,7 +23,7 @@ func (s *Server) paperEngine() *paper.Engine { return s.paper }
 // per-account lazy-load, falling back to the global engine without a registry.
 func (s *Server) paperEngineFor(userID string) *paper.Engine {
 	if s.registry != nil {
-		return s.registry.PaperForUser(userID)
+		return s.registry.PaperForUser(s.operatorID())
 	}
 	return s.paperEngine()
 }
@@ -91,6 +92,70 @@ func (s *Server) handlePaperEquity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, pe.Equity())
+}
+
+// handlePaperSelfCheck 模拟盘自检接口：汇总"为什么持仓/成交/订单/净值可能为空"的诊断信息，
+// 便于前端一键排查与后端日志对齐。GET /api/paper/selfcheck。
+// English: paper self-check — aggregates diagnostics for why positions/trades/orders/equity may be
+// empty, so the frontend can one-click troubleshoot and align with backend logs. GET /api/paper/selfcheck.
+func (s *Server) handlePaperSelfCheck(w http.ResponseWriter, r *http.Request) {
+	uid := requestUserID(r)
+	pe := s.paperEngineFor(uid)
+	if pe == nil {
+		writeJSON(w, 200, map[string]interface{}{
+			"enabled":       false,
+			"engine":        "nil",
+			"is_admin":      s.auth.IsAdmin(uid),
+			"has_filled":    false,
+			"positions":     0,
+			"trades":        0,
+			"orders":        0,
+			"equity_points": 0,
+			"pools":         0,
+			"engine_path":   "",
+			"file_exists":   false,
+			"pool_detail":   []map[string]interface{}{},
+			"note":          "模拟盘引擎未初始化（注册表/全局引擎均为空），所有持仓/成交/订单/净值均为空属正常",
+		})
+		return
+	}
+	path := pe.Path()
+	info := map[string]interface{}{
+		"enabled":      pe.Enabled(),
+		"is_admin":     s.auth.IsAdmin(uid),
+		"engine_path":  path,
+		"has_filled":   pe.HasFilled(),
+		"positions":    len(pe.Positions()),
+		"trades":       len(pe.Trades()),
+		"orders":       len(pe.Orders()),
+		"equity_points": len(pe.Equity()),
+		"pools":        len(pe.StrategyPools()),
+	}
+	// paper.json 物理文件状态
+	if path != "" {
+		if st, err := os.Stat(path); err == nil {
+			info["file_exists"] = true
+			info["file_size"] = st.Size()
+			info["file_mtime"] = st.ModTime().Format(time.RFC3339)
+		} else {
+			info["file_exists"] = false
+			info["file_error"] = err.Error()
+		}
+	}
+	// 汇总各资金池持仓数（用于核对"全部"tab 是否漏算）
+	poolSummary := make([]map[string]interface{}, 0)
+	for _, p := range pe.StrategyPools() {
+		poolSummary = append(poolSummary, map[string]interface{}{
+			"strategy": p.Key,
+			"name":     p.Label,
+			"positions": p.Positions,
+			"cash":     p.Cash,
+		})
+	}
+	info["pool_detail"] = poolSummary
+	log.Printf("[paper-selfcheck] uid=%s admin=%v enabled=%v has_filled=%v positions=%d trades=%d orders=%d equity=%d file=%s exists=%v",
+		uid, s.auth.IsAdmin(uid), pe.Enabled(), pe.HasFilled(), len(pe.Positions()), len(pe.Trades()), len(pe.Orders()), len(pe.Equity()), path, info["file_exists"])
+	writeJSON(w, 200, info)
 }
 
 // handlePaperBuy 手动买入一只股票（前端信号页/持仓页"模拟买入/加仓"）。请求体：

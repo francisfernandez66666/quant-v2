@@ -3,9 +3,10 @@
 // enable/disable, expiry, and per-account strategy param delegation.
 import React, { useState, useEffect } from 'react'
 import {
-  Button, Switch, Input, InputNumber, Select, Dialog, DialogPlugin,
+  Button, Input, InputNumber, Select, Dialog, DialogPlugin,
   Table, Tag, Card, Form, Checkbox,
 } from 'tdesign-react'
+import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
@@ -13,6 +14,7 @@ import { showToast } from '../ui.jsx'
 // 守卫判断来源：web/src/api/index.js 的 isAdmin()（基于 STORAGE_ROLE），与 App.jsx 中侧边栏 canAdmin 一致
 import { isAdmin } from '../api/index.js'
 
+// 权限位中文标签映射：把后端下发的英文权限标识翻译为界面可读文案（当前仅"研究审批"一项）
 const PERM_LABELS = { research_approve: '研究审批' }
 
 // 战法参数分组定义（与 Vue 版 Settings/Admin 一致）；每个 group 的 fields 决定代配弹窗中展示的输入框与步长
@@ -273,6 +275,7 @@ export default function Admin() {
     }
   }
 
+  // 关闭战法参数代配弹窗：清空当前选中用户
   function closeStrategy() { setActiveUser(null) }
 
   // 保存当前选中用户的战法参数下发配置
@@ -390,7 +393,7 @@ export default function Admin() {
                 placeholder="天数"
                 style={{ width: 140 }}
               />
-              <Switch value={newUser.permanent} onChange={(v) => setNewUser({ ...newUser, permanent: v })} />
+              <ToggleSw checked={newUser.permanent} onChange={(v) => setNewUser({ ...newUser, permanent: v })} />
               <span style={{ fontSize: 13, color: '#888' }}>永久</span>
             </div>
             <span style={{ fontSize: 12, color: '#888' }}>填天数表示到期后自动失效；开启"永久"则不过期</span>
@@ -455,8 +458,8 @@ export default function Admin() {
             {group.fields.map((f) => (
               <Form.FormItem key={f.k} label={f.label} style={{ marginBottom: 8 }}>
                 {f.type === 'switch' ? (
-                  <Switch
-                    value={!!(activeStrategy[group.key] && activeStrategy[group.key][f.k])}
+                  <ToggleSw
+                    checked={!!(activeStrategy[group.key] && activeStrategy[group.key][f.k])}
                     onChange={(v) => setActiveStrategy({
                       ...activeStrategy,
                       [group.key]: { ...activeStrategy[group.key], [f.k]: v },

@@ -4,8 +4,9 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Card, Table, Tag, Button, Dialog, DialogPlugin, Select, Input, InputNumber,
-  Tabs, Switch, MessagePlugin,
+  Tabs, MessagePlugin,
 } from 'tdesign-react'
+import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
@@ -13,6 +14,7 @@ import { showToast } from '../ui.jsx'
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
     const d = DialogPlugin.confirm({
+    // 常量 d：局部定义
       header,
       body,
       theme: 'warning',
@@ -73,22 +75,27 @@ export default function Research() {
   const [logExists, setLogExists] = useState(true)
   const [logLoading, setLogLoading] = useState(false)
   const logTimer = useRef(null)
+  // 常量 logTimer：局部定义
   const [cfgSweep, setCfgSweep] = useState({})
   const [cfgRule, setCfgRule] = useState({})
   const [expandedStrategy, setExpandedStrategy] = useState('')
   const strategyRefs = useRef({})
+  // 常量 strategyRefs：局部定义
   const [showMetricHelp, setShowMetricHelp] = useState(false)
   const [adviceOpen, setAdviceOpen] = useState(0)
 
   const canApprove = api.hasPerm('research_approve')
+  // 常量 canApprove：局部定义
 
   const tabs = [
+  // 顶部主导航标签定义（待审批候选 / 战法库 / 回测 / 设置）
     { value: 'candidates', label: '待审批候选' },
     { value: 'library', label: '战法库' },
     { value: 'backtests', label: '回测' },
     { value: 'settings', label: '设置' },
   ]
   const builtinPatterns = [
+  // 内置形态战法枚举（双响炮/龙头/龙回头/N形），用于回测与战法库归类
     { id: 'double_bump', name: '双响炮' },
     { id: 'dragon', name: '龙头' },
     { id: 'dragon_return', name: '龙回头' },
@@ -98,9 +105,12 @@ export default function Research() {
   // 轮询 / 计时器：backtestPollers 按候选 id 缓存单候选回测轮询；libPollTimer 为战法库回测轮询；pollTimer 为研究进度轮询
   const backtestPollers = useRef({})
   const libPollTimer = useRef(null)
+  // 常量 libPollTimer：局部定义
   const pollTimer = useRef(null)
+  // 常量 pollTimer：局部定义
 
   const setStrategyRef = (key) => (el) => { if (el) strategyRefs.current[key] = el }
+  // 生成设置各战法 ref 的回调，便于滚动定位到具体战法配置项
 
   // ===== 通用工具 =====
   function pct(v) {
@@ -108,32 +118,40 @@ export default function Research() {
     return Math.min(100, Math.round(v * 100))
   }
   function fmtRows(v) {
+  // 格式化计数：千分位展示样本/持仓等整数
     if (v === null || v === undefined || isNaN(v)) return '-'
     return Number(v).toLocaleString('zh-CN')
   }
   function fmt(v) {
+  // 格式化数值：保留 4 位小数（因子/权重精度用）
     if (v === null || v === undefined || isNaN(v)) return '-'
     return Number(v).toFixed(4)
   }
   function signClass(v) {
+  // 根据正负返回 pos/neg 样式类，用于盈亏着色
     if (v === null || v === undefined || isNaN(v)) return ''
     return Number(v) >= 0 ? 'pos' : 'neg'
   }
   function signColor(v) {
+  // 根据正负返回红/绿颜色（红涨绿跌）
     if (v === null || v === undefined || isNaN(v)) return '#aaa'
     return Number(v) >= 0 ? '#e34d59' : '#00a870'
   }
   function fmtNum(v, digits) {
+  // 格式化数值：指定小数位，空值返回占位符
     if (v === null || v === undefined || isNaN(v)) return '-'
     const d = digits === undefined ? 0 : digits
+    // 常量 d：局部定义
     return Number(v).toFixed(d)
   }
 
   // ===== 因子元数据 =====
   const factorMeta = useRef({})
   async function loadFactorMeta() {
+  // 加载全部因子元数据（id/名称/分类/说明）供战法规则渲染
     try {
       const res = await api.fetchResearchFactors()
+      // 常量 res：局部定义
       if (res && Array.isArray(res.factors)) {
         for (const f of res.factors) {
           if (f && f.id) factorMeta.current[f.id] = f
@@ -142,39 +160,55 @@ export default function Research() {
     } catch (_) {}
   }
   function factorName(id) {
+  // 将因子 id 转换为中文可读名称
     const m = factorMeta.current[id]
+    // 常量 m：局部定义
     return (m && m.name) ? m.name : id
   }
 
   function weightList(c) {
+  // 解析战法权重对象为可读的「因子名×权重」列表
     try {
       const w = JSON.parse(c.weights || '{}')
+      // 常量 w：局部定义
       const wm = (w && typeof w === 'object' && w.weights && typeof w.weights === 'object' && !Array.isArray(w.weights)) ? w.weights : w
+      // 常量 wm：局部定义
       if (!wm || typeof wm !== 'object') return []
       const entries = Object.entries(wm).filter(([, v]) => typeof v === 'number' && isFinite(v))
+      // 常量 entries：局部定义
       return entries.sort((a, b) => b[1] - a[1])
     } catch (_) { return [] }
   }
   function depthSummary(c) {
+  // 汇总盘口扫描深度指标为简要文案
     try { return JSON.parse(c.weights || '{}') } catch (_) { return {} }
   }
   function kindLabel(k) {
+  // 将研究类型（factor/pattern/weights/depth）翻译为中文标签
     const m = { factor: '因子战法', pattern: '形态战法', weights: '权重优化', depth: '盘口扫描' }
+    // 常量 m：局部定义
     return m[k] || k
   }
   function factorDirs(c) {
+  // 解析因子方向（多/空）为可读文案
     try {
       const w = JSON.parse(c.weights || '{}')
+      // 常量 w：局部定义
       if (w && typeof w === 'object' && w.directions && typeof w.directions === 'object') return w.directions
     } catch (_) {}
     return {}
   }
   function factorRule(c) {
+  // 将因子规则对象渲染为可读的中文规则描述
     const dirs = factorDirs(c)
+    // 常量 dirs：局部定义
     const wm = {}
+    // 常量 wm：局部定义
     try {
       const w = JSON.parse(c.weights || '{}')
+      // 常量 w：局部定义
       const weightsObj = (w && w.weights && typeof w.weights === 'object' && !Array.isArray(w.weights)) ? w.weights : w
+      // 常量 weightsObj：局部定义
       Object.assign(wm, weightsObj)
     } catch (_) {}
     return Object.entries(wm)
@@ -183,36 +217,53 @@ export default function Research() {
       .sort((a, b) => b.weight - a.weight)
   }
   function parseReason(c, key) {
+  // 解析命中原因字段，拆出模式/方向/阈值等子项
     const reason = c.reason || ''
+    // 常量 reason：局部定义
     const pats = {
+    // 常量 pats：局部定义
       '样本内IR': /样本内IR=(-?\d+\.?\d*)/,
       '样本外IR': /样本外IR=(-?\d+\.?\d*)/,
       反推超额: /反推超额=(-?\d+\.?\d*)/,
     }
     const m = reason.match(pats[key])
+    // 常量 m：局部定义
     return m ? parseFloat(m[1]) : null
   }
   function fmtPct(v) {
+  // 将 0~1 比率格式化为百分比字符串
     if (v === null || v === undefined || isNaN(v)) return '-'
     const s = (v * 100).toFixed(1)
+    // 常量 s：局部定义
     return (v >= 0 ? '+' : '') + s + '%'
   }
   function verdict(c) {
+  // 根据样本内/样本外阈值判定战法回测结论（通过/失败）
     const insample = parseReason(c, '样本内IR')
+    // 常量 insample：局部定义
     const outsample = parseReason(c, '样本外IR')
+    // 常量 outsample：局部定义
     const gen = parseReason(c, '反推超额')
+    // 常量 gen：局部定义
     const thr = 0.3
+    // 常量 thr：局部定义
     const passed = (insample !== null ? insample >= thr : true) &&
+    // 常量 passed：局部定义
                    (outsample !== null ? outsample >= thr : true) &&
                    (gen !== null ? gen > 0 : true)
     if (passed) return { ok: true, text: '电脑用两段互不相干的历史行情分别验证过，这条规律都能跑赢，不是碰运气。' }
     return { ok: false, text: '这条规律在验证中没站稳，不建议直接拿来实盘。' }
   }
   function plainLines(c) {
+  // 将候选理由多行文本拆分为纯文本行数组
     const insample = parseReason(c, '样本内IR')
+    // 常量 insample：局部定义
     const outsample = parseReason(c, '样本外IR')
+    // 常量 outsample：局部定义
     const gen = parseReason(c, '反推超额')
+    // 常量 gen：局部定义
     const lines = []
+    // 常量 lines：局部定义
     if (insample !== null) lines.push('先拿前半段历史行情回放：这套打分的选股效果明显（稳定度 ' + fmt(insample) + '，越高越靠谱）。')
     if (outsample !== null) lines.push('再拿一段完全没参与挑规律的行情回放：效果仍然明显（稳定度 ' + fmt(outsample) + '）。这一步是防止规律只对老数据灵、换市场就失灵。')
     if (gen !== null) lines.push('最后对比「按这套规律选出的股票」和「随便买」：选的比平均多赚 ' + fmtPct(gen) + '，说明规律确实挑得出好股票。')
@@ -220,13 +271,17 @@ export default function Research() {
     return lines
   }
   function btTested(c) {
+  // 判断该候选是否已跑过回测
     if (typeof c.backtest_done === 'boolean') return c.backtest_done
     return c.avg_excess !== 0
   }
   function btPct(id) {
+  // 根据回测结果计算并显示回测进度百分比
     const p = backtestProgress[id]
+    // 常量 p：局部定义
     if (!p) return '0%'
     const n = parseInt(p, 10)
+    // 常量 n：局部定义
     return (isNaN(n) ? 0 : Math.max(0, Math.min(100, n))) + '%'
   }
 
@@ -235,6 +290,7 @@ export default function Research() {
   async function loadProgress() {
     try {
       const p = await api.fetchResearchProgress()
+      // 常量 p：局部定义
       if (p) setProgress(p)
     } catch (e) { console.error('Research 进度加载失败', e) }
   }
@@ -243,6 +299,7 @@ export default function Research() {
     setLoading(true)
     try {
       const res = await api.fetchResearchCandidates(statusFilter || '')
+      // 常量 res：局部定义
       if (res && Array.isArray(res.candidates)) {
         setCandidates(res.candidates)
         setNoDB(false)
@@ -255,6 +312,7 @@ export default function Research() {
     } finally { setLoading(false) }
   }
   async function loadAll() {
+  // 并行加载候选/战法库/回测/进度等全部研究数据
     setLoading(true)
     await loadProgress()
     await loadData()
@@ -265,7 +323,8 @@ export default function Research() {
   async function loadSchedStatus() {
     try {
       const res = await api.getSchedulerStatus()
-      setSchedStatus(res && res.ok ? res : null)
+      // 常量 res：局部定义
+      setSchedStatus(res || null)
     } catch (e) { setSchedStatus(null) }
   }
   // 打开任务运行日志弹窗：拉取 task_<id>.log，运行中的任务每 4s 自动刷新。
@@ -273,6 +332,7 @@ export default function Research() {
     setLogId(id); setLogOpen(true); setLogLoading(true)
     try {
       const res = await api.getResearchTaskLog(id)
+      // 常量 res：局部定义
       setLogExists(res && res.exists !== false)
       setLogContent((res && res.log) || '')
     } catch (e) {
@@ -282,17 +342,21 @@ export default function Research() {
     logTimer.current = setInterval(async () => {
       try {
         const res = await api.getResearchTaskLog(id)
+        // 常量 res：局部定义
         setLogExists(res && res.exists !== false)
         setLogContent((res && res.log) || '')
       } catch (e) { /* 静默，关闭时清理 */ }
     }, 4000)
   }
   function closeLog() {
+  // 关闭任务运行日志弹窗并停止轮询
     if (logTimer.current) { clearInterval(logTimer.current); logTimer.current = null }
     setLogOpen(false)
   }
   function statusLabel(s) {
+  // 将候选审批状态翻译为中文标签
     const m = { proposed: '待审批', approved: '已审批', applied: '已应用', rejected: '已驳回' }
+    // 常量 m：局部定义
     return m[s] || s
   }
   // 审批并通过接口应用某条研究候选（写回后端并热更新状态），权限不足时回退
@@ -304,6 +368,7 @@ export default function Research() {
     } catch (e) { showToast('审批失败: ' + (e.message || e), 'error') }
   }
   async function doReject(c) {
+  // 驳回某研究候选（调用后端拒绝接口）
     try {
       await api.rejectResearchCandidate(c.id)
       c.status = 'rejected'
@@ -314,27 +379,36 @@ export default function Research() {
   // ===== 战法库 =====
   function ruleFactors(s) {
     const dirs = s.directions || {}
+    // 常量 dirs：局部定义
     const wm = s.weights || {}
+    // 常量 wm：局部定义
     return Object.entries(wm)
       .filter(([, v]) => typeof v === 'number' && isFinite(v))
       .map(([id, weight]) => ({ id, label: factorName(id), weight, dir: (typeof dirs[id] === 'number' && dirs[id] < 0) ? -1 : 1 }))
       .sort((a, b) => b.weight - a.weight)
   }
   function condLabel(c) {
+  // 将扫参条件（min/max/step）翻译为中文可读文案
     const name = factorName(c.factor || '')
+    // 常量 name：局部定义
     const min = (c.min !== undefined && c.min !== null) ? c.min : '-∞'
+    // 常量 min：局部定义
     const max = (c.max !== undefined && c.max !== null) ? c.max : '+∞'
+    // 常量 max：局部定义
     return name + ' ∈ [' + min + ', ' + max + ')'
   }
   async function loadLibrary() {
+  // 加载战法库列表与生效状态
     setLoadingLibrary(true)
     try {
       const res = await api.fetchResearchLibrary()
+      // 常量 res：局部定义
       if (res && Array.isArray(res.library)) setLibrary(res.library)
     } catch (e) { console.error('战法库加载失败', e) }
     finally { setLoadingLibrary(false) }
   }
   async function toggleLibrary(s) {
+  // 启用/禁用某条战法库记录
     try {
       await api.setResearchLibraryEnabled(s.id, !s.enabled)
       s.enabled = !s.enabled
@@ -342,6 +416,7 @@ export default function Research() {
     } catch (e) { showToast('操作失败: ' + (e.message || e), 'error') }
   }
   async function removeLibrary(s) {
+  // 删除某条战法库记录
     if (!(await confirmDialog('确定删除战法 ' + s.name + ' ？删除后不再注入 8a/8b 实盘。'))) return
     try {
       await api.deleteResearchLibrary(s.id)
@@ -350,11 +425,14 @@ export default function Research() {
     } catch (e) { showToast('删除失败: ' + (e.message || e), 'error') }
   }
   function startRename(s) {
+  // 进入某战法库的改名编辑态
     setEditingName((e) => ({ ...e, [s.id]: true }))
     setNameDraft((d) => ({ ...d, [s.id]: s.name }))
   }
   async function saveName(s) {
+  // 保存某战法库记录的新名称
     const name = (nameDraft[s.id] || '').trim()
+    // 常量 name：局部定义
     setEditingName((e) => ({ ...e, [s.id]: false }))
     if (!name || name === s.name) return
     try {
@@ -368,16 +446,18 @@ export default function Research() {
   async function loadBacktestToggle() {
     try {
       const res = await api.fetchBacktestToggle()
+      // 常量 res：局部定义
       if (res && typeof res.enabled === 'boolean') setBacktestEnabled(res.enabled)
     } catch (e) { console.error('加载回测开关失败', e) }
   }
-  async function saveBacktestToggle() {
+  async function saveBacktestToggle(val) {
+  // 保存全量回测全局开关状态
     try {
-      await api.setBacktestToggle(backtestEnabled)
-      showToast('全量回测全局开关已' + (backtestEnabled ? '开启' : '关闭'), 'success')
+      await api.setBacktestToggle(val)
+      showToast('全量回测全局开关已' + (val ? '开启' : '关闭'), 'success')
     } catch (e) {
       showToast('保存失败: ' + (e.message || e), 'error')
-      setBacktestEnabled(!backtestEnabled)
+      setBacktestEnabled(!val)
     }
   }
 
@@ -403,13 +483,16 @@ export default function Research() {
     pollBacktest(c)
   }
   async function doCancelBacktest(id) {
+  // 取消（中断/置失效）某回测任务
     if (!(await confirmDialog('取消候选 #' + id + ' 的回测？（已算完的事件保留缓存，续跑只算剩余）'))) return
     try { await api.cancelBacktest(id); loadBacktests() } catch (e) { showToast('取消失败: ' + (e.message || e), 'error') }
   }
   async function doPauseBacktest(id) {
+  // 暂停运行中的回测子进程（SIGSTOP）
     try { await api.pauseBacktest(id); loadBacktests() } catch (e) { showToast('暂停失败: ' + (e.message || e), 'error') }
   }
   async function doResumeBacktest(id) {
+  // 恢复已暂停的回测（SIGCONT）
     try { await api.resumeBacktest(id); loadBacktests() } catch (e) { showToast('恢复失败: ' + (e.message || e), 'error') }
   }
 
@@ -418,10 +501,12 @@ export default function Research() {
     return { profitfactor: '盈亏比', profitFactor: '盈亏比', winrate: '胜率', winRate: '胜率', avgwin: '平均盈利', avgWin: '平均盈利', expectancy: '期望收益' }[o] || (o || '-')
   }
   async function loadOptimizations() {
+  // 加载参数寻优任务列表
     if (loadingOpts) return
     setLoadingOpts(true)
     try {
       const res = await api.fetchOptimizations()
+      // 常量 res：局部定义
       setOptTasks(res.optimizations || [])
     } catch (e) { console.warn('寻优结果加载失败', e) }
     finally { setLoadingOpts(false) }
@@ -436,100 +521,138 @@ export default function Research() {
     } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
   }
   async function approveOpt(r) {
+  // 审批通过某条寻优排名（写入 applied 配置并热加载）
     const msg = '把参数应用到「' + r.strategy + '」？\n止盈线 ' + fmtNum(r.params.take_profit_pct) + '% · 止损线 ' +
+    // 常量 msg：局部定义
       fmtNum(r.params.stop_loss_pct) + '% · 兜底 ' + fmtNum(r.params.hold_days) + ' 天' +
       ((r.params || {}).min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') + '\n审批后立即热重载生效。'
     if (!(await confirmDialog(msg))) return
     try { await api.approveOptimization(r.id); r.status = 'approved'; showToast('已应用参数', 'success') } catch (e) { showToast('入库失败: ' + (e.message || e), 'error') }
   }
   async function rejectOpt(r) {
+  // 淘汰某条寻优排名
     try { await api.rejectOptimization(r.id); r.status = 'rejected'; showToast('已淘汰', 'success') } catch (e) { showToast('操作失败: ' + (e.message || e), 'error') }
   }
 
   const optStrategies = useMemo(() => {
+  // 常量 optStrategies：局部定义
     if (!optTasks.length) return []
     const rows = optTasks[0].results || []
+    // 常量 rows：局部定义
     return rows.map((r) => ({ key: r.strategy_kind || r.strategy, label: r.strategy, bestExp: (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null }))
   }, [optTasks])
   const optCur = useMemo(() => {
+  // 常量 optCur：局部定义
     for (const t of optTasks) {
       const hit = (t.results || []).find((r) => (r.strategy_kind || r.strategy) === optSelected)
+      // 常量 hit：局部定义
       if (hit) return { ...hit, task_id: t.task_id }
     }
     return null
   }, [optTasks, optSelected])
   const optCurHeat = useMemo(() => {
+  // 常量 optCurHeat：局部定义
     const empty = { tps: [], sls: [], map: {} }
+    // 常量 empty：局部定义
     if (!optCur || !optCur.grid_json) return empty
     try {
       const extra = JSON.parse(optCur.grid_json)
+      // 常量 extra：局部定义
       const cells = extra.grid || []
+      // 常量 cells：局部定义
       const tps = [...new Set(cells.map((c) => Number(c.tp)))].sort((a, b) => a - b)
+      // 常量 tps：局部定义
       const sls = [...new Set(cells.map((c) => Number(c.sl)))].sort((a, b) => a - b)
+      // 常量 sls：局部定义
       const map = {}
+      // 常量 map：局部定义
       cells.forEach((c) => { map[c.tp + '|' + c.sl] = c.expectancy })
       return { tps, sls, map }
     } catch { return empty }
   }, [optCur])
   function heatVal(tp, sl) {
+  // 计算止盈/止损组合在热力图中的热度期望值
     const v = optCurHeat.map[tp + '|' + sl]
+    // 常量 v：局部定义
     return (v === undefined || v === null) ? null : v
   }
   function heatColor(exp) {
+  // 根据热度期望值返回热力图配色
     if (exp === null || exp === undefined || isNaN(Number(exp))) return 'transparent'
     const clamped = Math.max(-5, Math.min(5, exp))
+    // 常量 clamped：局部定义
     const alpha = 0.12 + Math.abs(clamped) / 5 * 0.55
+    // 常量 alpha：局部定义
     return clamped >= 0 ? `rgba(34,197,94,${alpha.toFixed(2)})` : `rgba(239,68,68,${alpha.toFixed(2)})`
   }
   const optCurBatches = useMemo(() => {
+  // 常量 optCurBatches：局部定义
     if (!optCur || !optCur.grid_json) return []
     try { return JSON.parse(optCur.grid_json).batches || [] } catch { return [] }
   }, [optCur])
   const optCurPoolKey = useMemo(() => {
+  // 常量 optCurPoolKey：局部定义
     if (!optCur) return ''
     if ((optCur.strategy_kind || '').startsWith('fac_')) return 'factor'
     if ((optCur.strategy_kind || '').startsWith('pat_')) return 'pattern'
     return ({ '双响炮': 'double_bump', '龙头': 'dragon', 'N形': 'n_shape', '龙回头': 'dragon_return' })[optCur.strategy] || ''
   }, [optCur])
   const sweepComboEstimate = useMemo(() => {
+  // 常量 sweepComboEstimate：局部定义
     const c = cfgSweep
+    // 常量 c：局部定义
     const nF = (f, t, s) => (s > 0 && t >= f) ? Math.round((t - f) / s) + 1 : 1
+    // 常量 nF：局部定义
     const nI = (f, t, s) => (s > 0 && t >= f) ? Math.floor((t - f) / s) + 1 : 1
+    // 常量 nI：局部定义
     return nF(+c.tp_from || 0, +c.tp_to || 0, +c.tp_step || 0) *
            nF(+c.sl_from || 0, +c.sl_to || 0, +c.sl_step || 0) *
            nI(+c.hold_from || 0, +c.hold_to || 0, +c.hold_step || 0) *
            nF(+c.score_from || 0, +c.score_to || 0, +c.score_step || 0)
   }, [cfgSweep])
   async function toggleDrawer() {
+  // 打开/关闭参数寻优抽屉，初始化默认扫参范围
     if (optDrawerOpen) { setOptDrawerOpen(false); return }
     const def = { tp_from: 5, tp_to: 30, tp_step: 5, sl_from: 3, sl_to: 15, sl_step: 3, hold_from: 2, hold_to: 30, hold_step: 2, score_from: 40, score_to: 95, score_step: 5 }
+    // 常量 def：局部定义
     setCfgSweep(def)
     try {
       const res = await api.fetchSweepPools()
+      // 常量 res：局部定义
       const mine = (res.pools || []).find((p) => p.strategy === (optCur ? optCur.strategy : ''))
+      // 常量 mine：局部定义
       if (mine) setCfgSweep({ ...def, ...mine, tp_from: mine.tp_from, tp_to: mine.tp_to, tp_step: mine.tp_step, sl_from: mine.sl_from, sl_to: mine.sl_to, sl_step: mine.sl_step, hold_from: mine.hold_from, hold_to: mine.hold_to, hold_step: mine.hold_step, score_from: mine.score_from, score_to: mine.score_to, score_step: mine.score_step })
     } catch {}
     setCfgRule({ max_daily_buys: 0, cooldown_minutes: 0, min_score: 0, budget_pct_per_day: 0 })
     try {
       const ps = await api.fetchPaperState()
+      // 常量 ps：局部定义
       const pk = optCurPoolKey
+      // 常量 pk：局部定义
       const pool = ((ps.strategy_pools) || []).find((p) => p.key === pk)
+      // 常量 pool：局部定义
       if (pool && pool.buy_rule) setCfgRule({ max_daily_buys: pool.buy_rule.max_daily_buys || 0, cooldown_minutes: pool.buy_rule.cooldown_minutes || 0, min_score: pool.buy_rule.min_score || 0, budget_pct_per_day: pool.buy_rule.budget_pct_per_day || 0 })
     } catch {}
     setOptDrawerOpen(true)
   }
   async function saveSweepPool() {
+  // 保存单战法四维步进搜索空间（服务端校验组合数护栏）
     if (!optCur) return
     try {
       const res = await api.saveSweepPool({ strategy: optCur.strategy, ...cfgSweep })
+      // 常量 res：局部定义
       showToast(`参数池已保存——预估 ${Number(res.combos).toLocaleString()} 组合`, 'success')
     } catch (e) { showToast('保存失败: ' + (e.message || e), 'error') }
   }
   async function savePoolDiscipline() {
+  // 保存分仓池买入纪律（日限/冷却/最低分/日预算%）
     const pk = optCurPoolKey
+    // 常量 pk：局部定义
     if (!pk) { showToast('未知战法无法映射资金池', 'warning'); return }
     const r = cfgRule
+    // 常量 r：局部定义
     const rule = { max_daily_buys: parseInt(r.max_daily_buys, 10) || 0, cooldown_minutes: parseInt(r.cooldown_minutes, 10) || 0, min_score: parseFloat(r.min_score) || 0, budget_pct_per_day: parseFloat(r.budget_pct_per_day) || 0 }
+    // 常量 rule：局部定义
     try {
       await api.configPaperPools(null, null, null, { [pk]: rule })
       showToast('池纪律已保存并即时生效', 'success')
@@ -539,10 +662,13 @@ export default function Research() {
   // ===== 回测任务中心 =====
   function toggleAdvice(id) { setAdviceOpen((a) => (a === id ? 0 : id)) }
   function jobParams(j) {
+  // 拼接回测任务的展示参数（起止/止盈/止损/持仓天数等）
     if (!j.params_json) return ''
     try {
       const p = JSON.parse(j.params_json)
+      // 常量 p：局部定义
       const parts = []
+      // 常量 parts：局部定义
       if (p.start) parts.push(p.start + '~' + (p.end || '今'))
       if (p.top_k) parts.push('每次选 ' + p.top_k + ' 只')
       if (p.min_stocks) parts.push('最少样本 ' + p.min_stocks)
@@ -551,15 +677,22 @@ export default function Research() {
     } catch { return '' }
   }
   function metricAdvices(j) {
+  // 从回测结果文本解析出指标改进建议列表
     const out = []
+    // 常量 out：局部定义
     const lines = (j.result_text || '').split('\n')
+    // 常量 lines：局部定义
     for (const line of lines) {
       const m = line.match(/^【(.+?)】胜率 ([\d.]+)% 盈亏比 ([\d.]+) 触发 (\d+) 持仓 ([\d.]+)天/)
+      // 常量 m：局部定义
       if (!m) continue
       const [, name, wrS, pfS, nS, holdS] = m
       const wr = parseFloat(wrS), pf = parseFloat(pfS), n = parseInt(nS, 10), hold = parseFloat(holdS)
+      // 常量 wr：局部定义
       const ev = wr / 100 * pf - (1 - wr / 100)
+      // 常量 ev：局部定义
       const tips = []
+      // 常量 tips：局部定义
       if (n < 50) tips.push('触发仅 ' + n + ' 次，统计意义弱——扩大回测区间再下结论')
       if (wr < 40) tips.push('胜率 ' + wr.toFixed(1) + '% 偏低：提高入场门槛（寻优里选门槛80）或叠加情绪/D1 过滤，宁缺毋滥')
       if (pf < 1.0) tips.push('盈亏比 ' + pf.toFixed(2) + ' <1：平均亏损吃掉平均盈利——收紧止损（更早认错）或让利润奔跑（放宽止盈）')
@@ -571,10 +704,13 @@ export default function Research() {
     return out
   }
   function ruleNum(id) {
+  // 根据战法 id 反推内置规则编号
     const n = parseInt(String(id || '').replace(/^[a-z]+_/, ''), 10)
+    // 常量 n：局部定义
     return Number.isFinite(n) ? n : -1
   }
   function latestLibJob(sk, num) {
+  // 取某战法最近一次回测任务
     let best = null
     for (const j of backtestJobs) {
       if (j.kind !== 'library' || (j.strategy_kind || '') !== sk) continue
@@ -584,37 +720,50 @@ export default function Research() {
     return best
   }
   function summarizeJob(j) {
+  // 将回测任务结果摘要为单行可读文案
     if (!j) return '未回测'
     if (j.status === 'running') return '回测中 ' + jobPct(j)
     if (j.status === 'queued') return '排队中·盘后执行'
     if (j.status === 'interrupted') return '已中断·可续跑'
     if (j.status === 'error') return '回测失败'
     const line = (j.result_text || '').split('\n')[0] || ''
+    // 常量 line：局部定义
     return line.replace(/^【[^】]*】/, '').trim() || '已完成'
   }
   function queueHint(j) {
+  // 根据任务状态生成排队原因提示
     const ahead = backtestJobs.filter((x) => x.status === 'running' || (x.status === 'queued' && (x.id || 0) < (j.id || 0))).length
+    // 常量 ahead：局部定义
     return ahead > 0 ? `排队中：前方还有 ${ahead} 个任务，将按优先级依次执行` : '已加入队列，将在非交易时段自动执行（交易日盘后起 / 非交易日全天；绝不进入盘中）'
   }
   function libraryJobLabel(j) {
+  // 生成战法库回测任务的中文标签
     if (j.candidate_id === 0) return '夜间全量回放'
     return builtinLabel(j.candidate_id)
   }
   async function rerunLibrary(j) {
+  // 对战法库规则重新发起一次回测
     const sk = j.strategy_kind
+    // 常量 sk：局部定义
     const id = ['double_bump', 'dragon', 'dragon_return', 'n_shape'].includes(sk) ? sk : (sk === 'factor' ? 'fac_' : 'pat_') + j.candidate_id
+    // 常量 id：局部定义
     try { await api.backtestLibraryRule(id, {}); startLibPoll(); await loadBacktests() } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
   }
   function builtinLabel(num) {
+  // 将内置规则编号转换为战法中文名
     const m = { 901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形' }
+    // 常量 m：局部定义
     return m[num] || ('规则 ' + num)
   }
   function selectStrategy(key) {
+  // 选中某战法进入参数寻优配置
     setExpandedStrategy((e) => (e === key ? '' : key))
     const el = strategyRefs.current[key]
+    // 常量 el：局部定义
     if (expandedStrategy !== key && el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
   async function doLibraryBacktest(s) {
+  // 对指定战法库记录发起回测任务
     if (!(await confirmDialog(`回测战法「${s.name || s.id}」？（历史日K回放，结果进「回测」tab）`))) return
     try {
       await api.backtestLibraryRule(s.id, { start: btStart.trim(), end: btEnd.trim() })
@@ -624,21 +773,26 @@ export default function Research() {
     } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
   }
   function startLibPoll() {
+  // 启动战法库回测轮询（定时刷新任务状态）
     if (libPollTimer.current) return
     // 每 5000ms = 5 秒轮询一次战法库回测任务，直至无运行中任务时停止
     libPollTimer.current = setInterval(async () => {
       await loadBacktests()
       const busy = backtestJobs.some((j) => j.kind === 'library' && (j.status === 'running' || j.status === 'paused' || j.status === 'queued'))
+      // 常量 busy：局部定义
       if (!busy) { clearInterval(libPollTimer.current); libPollTimer.current = null }
     }, 5000)
   }
   function pollBacktest(c) {
+  // 轮询单候选回测任务进度并刷新结果
     const id = c.id
+    // 常量 id：局部定义
     if (backtestPollers.current[id]) return
     // 每 5000ms = 5 秒轮询一次单候选回测进度与结果，完成时回填超额收益并刷新战法库
     backtestPollers.current[id] = setInterval(async () => {
       try {
         const j = await api.fetchBacktestStatus(id)
+        // 常量 j：局部定义
         if (j.progress) {
           setBacktestProgress((p) => ({ ...p, [id]: j.progress }))
           syncJobIntoList(j)
@@ -665,17 +819,23 @@ export default function Research() {
     }, 5000)
   }
   function clearPoll(id) {
+  // 清除指定候选的回测轮询定时器
     if (backtestPollers.current[id]) { clearInterval(backtestPollers.current[id]); delete backtestPollers.current[id] }
   }
   async function restoreRunningBacktests() {
+  // 页面刷新后恢复仍在运行的回测轮询
     try {
       const res = await api.fetchRunningBacktests()
+      // 常量 res：局部定义
       const jobs = (res && res.jobs) || []
+      // 常量 jobs：局部定义
       for (const j of jobs) {
         if (j.kind !== 'candidate') continue
         if (j.status !== 'running' && j.status !== 'queued') continue
         const cand = candidates.find((x) => x.id === j.candidate_id)
+        // 常量 cand：局部定义
         const c = cand || { id: j.candidate_id, kind: 'factor' }
+        // 常量 c：局部定义
         setBacktestLoading((b) => ({ ...b, [c.id]: true }))
         setBacktestState((b) => ({ ...b, [c.id]: 'running' }))
         if (j.progress) setBacktestProgress((p) => ({ ...p, [c.id]: j.progress }))
@@ -688,10 +848,13 @@ export default function Research() {
     setBtLoading(true)
     try {
       const res = await api.fetchAllBacktests()
+      // 常量 res：局部定义
       if (res && Array.isArray(res.jobs)) {
         const seen = new Set()
+        // 常量 seen：局部定义
         setBacktestJobs(res.jobs.filter((j) => {
           const k = (j.kind || 'candidate') + ':' + j.candidate_id
+          // 常量 k：局部定义
           if (seen.has(k)) return false
           seen.add(k)
           return true
@@ -701,37 +864,52 @@ export default function Research() {
     finally { setBtLoading(false) }
   }
   function syncJobIntoList(j) {
+  // 将回测任务状态合并进任务列表（更新或追加）
     setBacktestJobs((jobs) => {
       const jk = j.kind || 'candidate'
+      // 常量 jk：局部定义
       const idx = jobs.findIndex((x) => (x.kind || 'candidate') === jk && x.candidate_id === j.candidate_id)
+      // 常量 idx：局部定义
       const merged = { ...(idx >= 0 ? jobs[idx] : { id: j.task_id }), ...j, kind: jk }
+      // 常量 merged：局部定义
       if (idx >= 0) { const copy = jobs.slice(); copy[idx] = merged; return copy }
       return [merged, ...jobs]
     })
   }
   function doBacktestById(id) {
+  // 根据任务 id 查询并展示回测详情
     const c = candidates.find((x) => x.id === id)
+    // 常量 c：局部定义
     if (c) doBacktest(c)
     else showToast('候选 #' + id + ' 不存在（请先刷新候选列表）', 'warning')
   }
   function btStatusLabel(s) {
+  // 将回测任务状态翻译为中文标签
     const m = { running: '运行中', paused: '已暂停', done: '已完成', error: '失败', interrupted: '已中断', queued: '排队中·盘后执行', preempted: '已中断' }
+    // 常量 m：局部定义
     return m[s] || s
   }
   function ctrlId(j) {
+  // 生成回测任务控制的唯一键
     return j.kind === 'library' ? 1000000000 + j.candidate_id : j.candidate_id
   }
   function jobPct(j) {
+  // 计算回测任务整体进度百分比
     const p = j.progress || '0%'
+    // 常量 p：局部定义
     const n = parseInt(p, 10)
+    // 常量 n：局部定义
     return (isNaN(n) ? 0 : Math.max(0, Math.min(100, n))) + '%'
   }
   const btCandidates = useMemo(() => candidates.filter((c) => (c.kind === 'factor' || c.kind === 'pattern') && c.status === 'proposed'), [candidates])
+  // 常量 btCandidates：局部定义
 
   // 分组
   const libGroupFactors = useMemo(() => library.filter((s) => s.kind !== 'pattern'), [library])
   const libGroupPatterns = useMemo(() => library.filter((s) => s.kind === 'pattern'), [library])
+  // 常量 libGroupPatterns：局部定义
   const ruleGroups = useMemo(() => [
+  // 常量 ruleGroups：局部定义
     { key: 'factor', title: '因子战法', items: libGroupFactors },
     { key: 'pattern', title: '形态战法', items: libGroupPatterns },
   ].filter((g) => g.items.length), [libGroupFactors, libGroupPatterns])
@@ -740,7 +918,9 @@ export default function Research() {
   const btColumns = useMemo(() => [
     { colKey: 'kind', title: '类型', width: 90, cell: ({ row }) => {
       const k = row.kind === 'nightly' ? '' : (row.kind === 'library' ? 'kind-pattern' : 'kind-factor')
+      // 常量 k：局部定义
       const label = row.kind === 'nightly' ? '夜间全量' : (row.kind === 'library' ? '战法库' : '单候选')
+      // 常量 label：局部定义
       return <Tag theme={row.kind === 'nightly' ? 'warning' : (row.kind === 'library' ? 'primary' : 'default')}>{label}</Tag>
     } },
     { colKey: 'candidate', title: '对象', width: 120, cell: ({ row }) => {
@@ -750,7 +930,9 @@ export default function Research() {
     } },
     { colKey: 'status', title: '状态', width: 110, cell: ({ row }) => {
       const st = row.status
+      // 常量 st：局部定义
       const theme = st === 'done' ? 'success' : st === 'error' ? 'danger' : st === 'queued' ? 'warning' : st === 'running' ? 'primary' : 'default'
+      // 常量 theme：局部定义
       return <Tag theme={theme}>{btStatusLabel(st)}</Tag>
     } },
     { colKey: 'params', title: '参数', minWidth: 160, cell: ({ row }) => <span style={{ fontSize: 12, color: '#aaa' }}>{jobParams(row) || '-'}</span> },
@@ -792,17 +974,21 @@ export default function Research() {
   // 寻优热力网格表列
   const heatColumns = useMemo(() => {
     const cols = [{ colKey: 'tp', title: '止盈\\止损', width: 100, fixed: 'left', cell: ({ row }) => <b>{fmtNum(row.tp)}%</b> }]
+    // 常量 cols：局部定义
     optCurHeat.sls.forEach((sl) => {
       cols.push({ colKey: 'sl_' + sl, title: fmtNum(sl) + '%', cell: ({ row }) => {
         const v = row['sl_' + sl]
+        // 常量 v：局部定义
         return <span style={{ background: heatColor(v), padding: '2px 6px', borderRadius: 3, display: 'inline-block' }}>{heatVal(row.tp, sl) !== null ? fmtNum(heatVal(row.tp, sl), 2) : '—'}</span>
       } })
     })
     return cols
   }, [optCurHeat])
   const heatData = useMemo(() => {
+  // 常量 heatData：局部定义
     return optCurHeat.tps.map((tp) => {
       const r = { tp }
+      // 常量 r：局部定义
       optCurHeat.sls.forEach((sl) => { r['sl_' + sl] = heatVal(tp, sl) })
       return r
     })
@@ -815,6 +1001,7 @@ export default function Research() {
     pollTimer.current = setInterval(loadProgress, 30000)
   }
   function stopPolling() {
+  // 停止全部研究轮询定时器（组件卸载时清理）
     if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null }
   }
 
@@ -939,6 +1126,7 @@ export default function Research() {
         <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>{g.title}（{g.items.length}）</div>
         {g.items.map((s) => {
           const expanded = expandedStrategy === 'rule:' + s.id
+          // 常量 expanded：局部定义
           return (
             <Card key={s.id} style={{ marginBottom: 10 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -1049,7 +1237,7 @@ export default function Research() {
             {candSubTab === 'patterns' && (
               <div>
                 {progress && (
-                  <Card style={{ marginBottom: 12 }} title={<span>研究处理进度 {progress.data_source && <Tag theme="success" size="small">数据源: {progress.data_source}</Tag>}</span>}>
+                  <Card style={{ marginBottom: 12 }} title={<span>研究处理进度 {progress.db_attached && <Tag theme="success" size="small">数据源: {progress.db_attached}</Tag>}</span>}>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(200px,1fr))', gap: 12 }}>
                       <div>
                         <div style={{ fontSize: 12, color: '#888' }}>数据准备度（近一年有行情 / 全市场）</div>
@@ -1179,9 +1367,11 @@ export default function Research() {
 
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '8px 0' }}>
               {builtinPatterns.map((b) => (
-                <Card key={'card-' + b.id} style={{ flex: '1 1 140px', cursor: 'pointer', borderColor: expandedStrategy === 'bt:' + b.id ? '#4c8dff' : undefined }} onClick={() => selectStrategy('bt:' + b.id)}>
+                <Card key={'card-' + b.id} style={{ flex: '1 1 140px', borderColor: expandedStrategy === 'bt:' + b.id ? '#4c8dff' : undefined }}>
+                  <div onClick={() => selectStrategy('bt:' + b.id)} style={{ cursor: 'pointer' }}>
                   <div style={{ fontWeight: 700, fontSize: 13 }}>{b.name}</div>
                   <div style={{ fontSize: 12, color: '#888' }}>{summarizeJob(latestLibJob(b.id, -1))}</div>
+                  </div>
                 </Card>
               ))}
             </div>
@@ -1189,7 +1379,9 @@ export default function Research() {
             <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>内置形态战法（{builtinPatterns.length}）</div>
             {builtinPatterns.map((b) => {
               const expanded = expandedStrategy === 'bt:' + b.id
+              // 常量 expanded：局部定义
               const job = latestLibJob(b.id, -1)
+              // 常量 job：局部定义
               return (
                 <Card key={'bt-' + b.id} ref={setStrategyRef('bt:' + b.id)} style={{ marginBottom: 10 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -1231,7 +1423,7 @@ export default function Research() {
               <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 <Select value={btPickId} onChange={(v) => setBtPickId(v)} disabled={btLoading} style={{ width: 260 }} options={[
                   { label: '选择待审批因子候选', value: 0, disabled: true },
-                  ...btCandidates.map((c) => ({ label: `#${c.id} ${c.kind === 'pattern' ? '形态战法' : '因子战法'}（${c.kind === 'pattern' ? ('触发 ' + (c.triggers ?? '-')) : ('IC ' + fmt(c.ic_mean) + '，IR ' + fmt(c.ir))}）`, value: c.id })),
+                  ...btCandidates.map((c) => ({ label: `#${c.id} ${c.kind === 'pattern' ? '形态战法' : '因子战法'}（${c.kind === 'pattern' ? ('触发 ' + (c.triggers ?? '规则')) : ('IC ' + fmt(c.ic_mean) + '，IR ' + fmt(c.ir))}）`, value: c.id })),
                 ]} />
                 <Button theme="warning" disabled={btPickId === 0} onClick={() => doBacktestById(btPickId)}>发起全量回测</Button>
                 <Button theme="default" variant="outline" loading={btLoading} onClick={loadBacktests}>刷新列表</Button>
@@ -1271,7 +1463,7 @@ export default function Research() {
                   <div style={{ fontSize: 13, fontWeight: 600 }}>全量回测全局开关</div>
                   <div style={{ fontSize: 12, color: '#888', marginTop: 4, lineHeight: 1.5 }}>开启后，夜间自动研究在发现因子候选后会追加一次 B4 全链路回测（回填回测超额）；关闭则只做发现、不做回测，省时省 CPU。</div>
                 </div>
-                <Switch value={backtestEnabled} onChange={(v) => { setBacktestEnabled(v); saveBacktestToggle() }} />
+                <ToggleSw checked={backtestEnabled} onChange={(v) => { setBacktestEnabled(v); saveBacktestToggle(v) }} />
                 <Tag theme={backtestEnabled ? 'success' : 'default'}>{backtestEnabled ? '已开启' : '已关闭'}</Tag>
               </div>
             </Card>

@@ -63,6 +63,7 @@ function LogModal({ visible, onClose }) {
   function fmtTime(t) {
     if (!t) return '-'
     const d = new Date(t)
+    // 将时间戳转为 Date 对象
     return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   }
 
@@ -72,6 +73,7 @@ function LogModal({ visible, onClose }) {
   // 将当前选中的 LLM 轮次数据应用到展示态
   function applyLLM() {
     const r = llmRecords[llmIdx]
+    // 取当前选中的记录（LLM 轮次 / 信号批次 / Stage 记录）
     setLlmData(r || null)
     setLlmNoData(!r)
     setSelectedSet(new Set(r ? r.selected_idx || [] : []))
@@ -79,6 +81,7 @@ function LogModal({ visible, onClose }) {
   // 将当前选中的信号批次数据应用到展示态
   function applySignal() {
     const r = sigRecords[sigIdx]
+    // 取当前选中的记录（LLM 轮次 / 信号批次 / Stage 记录）
     setSigData(r || null)
     setSigNoData(!r)
   }
@@ -110,7 +113,9 @@ function LogModal({ visible, onClose }) {
   }
 
   const sigStrategyOptions = useMemo(() => {
+  // 从信号批次日志中提取全部战法名，生成下拉筛选项
     const set = new Set()
+    // 用于去重收集战法名的集合
     for (const r of sigRecords) {
       for (const sg of (r.signals || [])) {
         if (sg.strategy) set.add(sg.strategy)
@@ -120,35 +125,49 @@ function LogModal({ visible, onClose }) {
   }, [sigRecords])
 
   const sigFiltered = useMemo(() => {
+  // 按当前选中的战法过滤出要展示的信号列表
     const sigs = sigData?.signals || []
+    // 当前信号数据中的信号数组（空值兜底）
     if (activeSigStrategy === 'all') return sigs
     return sigs.filter((sg) => sg.strategy === activeSigStrategy)
   }, [sigData, activeSigStrategy])
 
   const llmSearching = (llmQuery || '').trim() !== ''
+  // 是否存在 LLM 日志搜索关键词
   const sigSearching = (sigQuery || '').trim() !== ''
+  // 是否存在信号搜索关键词
   const llmSearchGroups = useMemo(() => {
+  // 按关键词对 LLM 各轮 stage2 事件分组聚合
     const q = (llmQuery || '').trim().toUpperCase()
+    // 归一化后的搜索关键词（去除首尾空格并转大写）
     if (!q) return []
     const groups = []
+    // 聚合命中结果的按轮次/批次分组容器
     for (const r of llmRecords) {
       const items = (r.stage2_events || []).filter((ev) => eventHit(ev, q))
+      // 当前轮次/批次中命中搜索条件的条目
       if (items.length) groups.push({ time: r.process_time, items })
     }
     return groups
   }, [llmRecords, llmQuery])
   const llmTotalHits = llmSearchGroups.reduce((n, g) => n + g.items.length, 0)
+  // LLM 搜索命中的事件总条数
   const sigSearchGroups = useMemo(() => {
+  // 按关键词与战法对信号批次分组聚合
     const q = (sigQuery || '').trim().toUpperCase()
+    // 归一化后的搜索关键词（去除首尾空格并转大写）
     if (!q) return []
     const groups = []
+    // 聚合命中结果的按轮次/批次分组容器
     for (const r of sigRecords) {
       const items = (r.signals || []).filter((sg) => sigHit(sg, q) && (activeSigStrategy === 'all' || sg.strategy === activeSigStrategy))
+      // 当前轮次/批次中命中搜索条件的条目
       if (items.length) groups.push({ time: r.process_time, items })
     }
     return groups
   }, [sigRecords, sigQuery, activeSigStrategy])
   const sigTotalHits = sigSearchGroups.reduce((n, g) => n + g.items.length, 0)
+  // 信号搜索命中的信号总条数
 
   // 加载 Stage 记录与信号批次日志，并更新默认选中项
   const load = useCallback(async () => {
@@ -190,10 +209,12 @@ function LogModal({ visible, onClose }) {
   }, [visible])
 
   const llmBatchOptions = llmRecords.map((r, i) => ({
+  // LLM 轮次下拉选项（含时间/原始条数/选中数）
     label: `轮次 ${llmRecords.length - i} · ${fmtTime(r.process_time)}（${r.raw_count} 条 / 选 ${r.selected_count}）`,
     value: i,
   }))
   const sigBatchOptions = sigRecords.map((r, i) => ({
+  // 信号批次下拉选项（含时间/信号数/原始条数）
     label: `批次 ${sigRecords.length - i} · ${fmtTime(r.process_time)}（${r.signals.length} 信号 / ${r.raw_count} 条）`,
     value: i,
   }))
@@ -441,10 +462,12 @@ export default function LLMDebug() {
   const [selectedSet, setSelectedSet] = useState(new Set())
 
   const isSelected = (i) => selectedSet.has(i)
+  // 判断 Stage1 初筛中第 i 条是否被 LLM 选中（复用 selectedSet）
 
   // 取最新一轮 Stage 记录更新页面展示态
   function applyLatest() {
     const r = records[0] || null
+    // 取当前选中的记录（LLM 轮次 / 信号批次 / Stage 记录）
     setData(r)
     setNoAgent(false)
     setNoData(!r)
@@ -455,6 +478,7 @@ export default function LLMDebug() {
   function formatTime(t) {
     if (!t) return '-'
     const d = new Date(t)
+    // 将时间戳转为 Date 对象
     return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   }
 
@@ -463,6 +487,7 @@ export default function LLMDebug() {
     setLoading(true)
     try {
       const res = await api.fetchStageRecords()
+      // 拉取到的 Stage 记录接口响应
       if (res && res.status === 'no_engine') {
         setNoAgent(true)
         setNoData(false)

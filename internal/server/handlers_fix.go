@@ -18,10 +18,26 @@ import (
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/trading"
 )
+
+// normImpactLevel 把影响级别归一为前端约定的中文（高/中/低），
+// 兼容英文 high/medium/low 与已中文两种来源（标签着色统一）。
+// English: normalize impact level to Chinese (高/中/低), accepting both English and Chinese inputs.
+func normImpactLevel(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "high", "高":
+		return "高"
+	case "medium", "mid", "中":
+		return "中"
+	case "low", "低":
+		return "低"
+	}
+	return v
+}
 
 // r2 四舍五入到 2 位小数（价格/百分比）。
 func r2(v float64) float64 { return math.Round(v*100) / 100 }
@@ -497,18 +513,23 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 					ctrl.RefreshMessageName(m.Code, name)
 				}
 			}
+			// 同时回传 generated_at（完整日期时间）与时间串：前端消息中心按 generated_at 展示
+			// 「YYYY-MM-DD HH:MM:SS」，避免只显示时分导致用户无法判断消息新旧（实录：消息中心无日期）。
+			// English: also return generated_at (full datetime) alongside the time string so the
+			// message center can render a date, not just HH:MM:SS.
 			out = append(out, map[string]interface{}{
-				"id":        m.ID,
-				"code":      m.Code,
-				"name":      name,
-				"type":      m.Level,
-				"level":     m.Level,
-				"action":    m.Action,
-				"strategy":  m.Strategy,
-				"time":      m.Time,
-				"title":     m.Title,
-				"body":      m.Body,
-				"direction": m.Direction,
+				"id":          m.ID,
+				"code":        m.Code,
+				"name":        name,
+				"type":        m.Level,
+				"level":       m.Level,
+				"action":      m.Action,
+				"strategy":    m.Strategy,
+				"time":        m.Time,
+				"generated_at": m.GeneratedAt,
+				"title":       m.Title,
+				"body":        m.Body,
+				"direction":   m.Direction,
 			})
 		}
 		writeJSON(w, 200, out)
@@ -528,21 +549,22 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 			lvl = "策略信号"
 		}
 		item := map[string]interface{}{
-			"id":        a.ID,
-			"code":      a.Code,
-			"name":      a.Name,
-			"type":      lvl,
-			"level":     lvl,
-			"action":    a.Action,
-			"strategy":  a.Strategy,
-			"time":      a.GeneratedAt.Format("15:04:05"),
-			"title":     fmt.Sprintf("%s %s", lvl, a.Code),
-			"body":      a.Reason,
-			"direction": a.Direction,
+			"id":          a.ID,
+			"code":        a.Code,
+			"name":        a.Name,
+			"type":        lvl,
+			"level":       lvl,
+			"action":      a.Action,
+			"strategy":    a.Strategy,
+			"time":        a.GeneratedAt.Format("15:04:05"),
+			"generated_at": a.GeneratedAt,
+			"title":       fmt.Sprintf("%s %s", lvl, a.Code),
+			"body":        a.Reason,
+			"direction":   a.Direction,
 		}
 		out = append(out, item)
 	}
-	for _, l := range s.rpt.ListFor(requestUserID(r)) {
+	for _, l := range s.rpt.ListFor("") {
 		// 仅展示持仓中或已平仓的记录，平仓记录用当前盈亏补全提示文本
 		if l.Status == "持仓中" || l.ExitAt != nil {
 			alertType := "持仓提示"
@@ -551,17 +573,18 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 				pct = fmt.Sprintf("%.1f%%", *l.ProfitPct)
 			}
 			item := map[string]interface{}{
-				"id":        l.SignalID,
-				"code":      l.Code,
-				"name":      l.Name,
-				"type":      alertType,
-				"level":     alertType,
-				"action":    l.Status,
-				"strategy":  l.Strategy,
-				"time":      l.EntryAt.Format("15:04:05"),
-				"title":     fmt.Sprintf("%s %s", l.Status, l.Code),
-				"body":      fmt.Sprintf("策略:%s 入场:%.2f %s", l.Strategy, l.EntryPrice, pct),
-				"direction": l.Direction,
+				"id":          l.SignalID,
+				"code":        l.Code,
+				"name":        l.Name,
+				"type":        alertType,
+				"level":       alertType,
+				"action":      l.Status,
+				"strategy":    l.Strategy,
+				"time":        l.EntryAt.Format("15:04:05"),
+				"generated_at": l.EntryAt,
+				"title":       fmt.Sprintf("%s %s", l.Status, l.Code),
+				"body":        fmt.Sprintf("策略:%s 入场:%.2f %s", l.Strategy, l.EntryPrice, pct),
+				"direction":   l.Direction,
 			}
 			out = append(out, item)
 		}
@@ -646,8 +669,9 @@ type fixHolding struct {
 // 从执行日志中筛选状态为"持仓中"的记录，实时拉取最新股价计算盈亏。
 // 同时关联信号数据，标注持仓是否有活跃信号。
 func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
-	userID := requestUserID(r)
-	logs := s.rpt.ListFor(userID)
+	// 自选股/持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 读取。
+	userID := s.operatorID()
+	logs := s.rpt.ListFor("")
 	holdings := make([]fixHolding, 0)
 	for _, l := range logs {
 		if l.Status != "持仓中" {
@@ -753,8 +777,9 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	uid := requestUserID(r)
-	// 手动持仓 ID 按账号隔离：code_userID_fix（空账号兼容旧格式 code_fix）
+	// 自选股/持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 写入与隔离。
+	uid := s.operatorID()
+	// 手动持仓 ID 按运营账号隔离：code_operatorID_fix（空账号兼容旧格式 code_fix）
 	fixSuffix := "_fix"
 	if uid != "" {
 		fixSuffix = "_" + uid + "_fix"
@@ -1048,6 +1073,97 @@ func (s *Server) thsTopFallbackBoards() []data.SectorInfo {
 // 优先展示 LLM 归因出的热点板块（仅保留能匹配到同花顺 top-20 的板块）；
 // 当 LLM 未筛选出任何板块时，用同花顺板块行情表（行业+概念）兜底，取涨幅前十，
 // 每分钟刷新一次实现板块轮动。
+// normalizeTitle 归一标题：去空白、去标点、转小写，用于模糊匹配溯源原文。
+// English: normalize a title (strip spaces/punctuation, lowercase) for fuzzy news matching.
+func normalizeTitle(s string) string {
+	repl := strings.NewReplacer(" ", "", "　", "", "，", "", "。", "", "、", "", "：", "",
+		"·", "", "-", "", "—", "", "（", "", "）", "", "(", "", ")", "", "\"", "", "'", "")
+	return strings.ToLower(repl.Replace(s))
+}
+
+// resolveSectorNewsItems 把板块的 LLM 改写新闻标题(news_titles) 反查回真实新闻事件，
+// 直接把带正文的 news_items 透传给前端溯源弹窗，避免前端二次按标题精确匹配失败而显示空白。
+// English: resolve a sector's LLM-rewritten news titles back to the real news events and embed
+// the articles (with content) so the trace-to-source dialog never shows blank due to title mismatch.
+func resolveSectorNewsItems(s *Server, userID string, dash *display.DashboardData, newsTitles []string) []map[string]interface{} {
+	if len(newsTitles) == 0 {
+		return []map[string]interface{}{}
+	}
+	events := make([]newsagent.NewsEvent, 0)
+	if dash != nil {
+		events = append(events, dash.NewsEvents...)
+	}
+	if c := s.ctrlFor(userID); c != nil {
+		events = append(events, c.GetAllNewsEvents()...)
+	}
+	// 建立归一标题索引（含子串匹配），用于把改写标题映射到真实事件
+	byNorm := make(map[string][]newsagent.NewsEvent, len(events))
+	for _, e := range events {
+		if e.Title == "" {
+			continue
+		}
+		n := normalizeTitle(e.Title)
+		byNorm[n] = append(byNorm[n], e)
+	}
+	seen := map[string]bool{}
+	items := make([]map[string]interface{}, 0, len(newsTitles))
+	for _, t := range newsTitles {
+		if t == "" {
+			continue
+		}
+		nt := normalizeTitle(t)
+		var best *newsagent.NewsEvent
+		// 1) 精确归一匹配；2) 子串包含匹配（改写标题与被改写标题互相包含）
+		if list, ok := byNorm[nt]; ok {
+			best = pickBestEvent(list)
+		}
+		if best == nil {
+			for n, list := range byNorm {
+				if strings.Contains(n, nt) || strings.Contains(nt, n) {
+					if b := pickBestEvent(list); b != nil {
+						best = b
+						break
+					}
+				}
+			}
+		}
+		if best == nil {
+			// 即便正文缺失也保留改写标题，保证溯源弹窗至少展示 LLM 引用的标题而非空白
+			items = append(items, map[string]interface{}{
+				"title": t, "content": "", "source": "llm", "sectors": []string{}, "direction": "",
+			})
+			continue
+		}
+		if seen[best.Title] {
+			continue
+		}
+		seen[best.Title] = true
+		items = append(items, map[string]interface{}{
+			"title":     best.Title,
+			"content":   best.Content,
+			"source":    best.Source,
+			"sectors":   best.Sectors,
+			"direction": best.Direction,
+		})
+	}
+	return items
+}
+
+// pickBestEvent 从同标题候选中选正文最长的一条（优先有正文的可读溯源）。
+// English: pick the candidate with the longest content (prefer readable articles).
+func pickBestEvent(list []newsagent.NewsEvent) *newsagent.NewsEvent {
+	if len(list) == 0 {
+		return nil
+	}
+	best := &list[0]
+	for i := 1; i < len(list); i++ {
+		if len(list[i].Content) > len(best.Content) {
+			best = &list[i]
+		}
+	}
+	return best
+}
+
 func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 	dash := s.dashFor(requestUserID(r))
 	// 同花顺板块行情表（首屏 top-20，按涨跌幅排序），按名称精确匹配
@@ -1081,6 +1197,8 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 				"limitup_cnt":   si.LimitupCnt,
 				"net_inflow":    r2(si.NetInflow),
 				"news_titles":   newsTitles,
+				// news_items：直接携带可溯源的正文（§热点板块溯源原文修复），前端优先展示
+				"news_items": resolveSectorNewsItems(s, requestUserID(r), dash, newsTitles),
 				// source 透传给前端弹窗，用于展示「信息来源/归因来源」标识
 				"source": source,
 			})
@@ -1107,6 +1225,7 @@ func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 				"limitup_cnt":   si.LimitupCnt,
 				"net_inflow":    r2(si.NetInflow),
 				"news_titles":   []string{},
+				"news_items":    []map[string]interface{}{},
 				// source 透传给前端弹窗，用于展示「信息来源/归因来源」标识
 				"source": "ths",
 			})
@@ -1513,7 +1632,7 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 			"source":       e.Source,
 			"direction":    e.Direction,
 			"sentiment":    e.Direction,
-			"impact_level": e.ImpactLevel,
+			"impact_level": normImpactLevel(e.ImpactLevel),
 			"sectors":      e.Sectors,
 			"stocks":       e.CleanedStocks,
 			"score":        e.Score,

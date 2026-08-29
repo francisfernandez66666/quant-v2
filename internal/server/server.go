@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -97,6 +98,8 @@ type Server struct {
 	researchDB  *store.DB // B5 研究候选库（optimize 产出入库；web 审批读写）
 	researchDir string    // B5 应用目录（applied_rules.json 落盘处）
 
+	cacheDir string // 看板快照落盘目录（休市/重启后前端仍可读取最近一次有效数据）
+
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
 	runtimeURL string     // 运行时实际使用的 API 地址
@@ -152,23 +155,90 @@ func (s *Server) SetEngineRegistry(r EngineRegistry) { s.registry = r }
 // (available right after login). Falls back to the global ctrl in the legacy single-engine mode.
 func (s *Server) ctrlFor(userID string) EngineController {
 	if s.registry != nil {
-		return s.registry.GetController(userID)
+		return s.registry.GetController(s.operatorID())
 	}
 	return s.ctrl
 }
 
-// dashFor 返回指定账号的看板快照（通过注册表懒加载引擎）。
+// dashFor 返回运营数据归属账号（管理员）的看板快照（运营数据系统级共享）。
 // 未接入注册表时回退全局 agg（旧单引擎模式）。
-// English: returns the dashboard snapshot for an account (via registry lazy load).
+// English: returns the operator's dashboard snapshot (operational data is system-scoped).
 // Falls back to the global agg in legacy single-engine mode.
 func (s *Server) dashFor(userID string) *display.DashboardData {
+	var d *display.DashboardData
 	if s.registry != nil {
-		if c := s.registry.GetController(userID); c != nil {
-			return c.DashboardData()
+		if c := s.registry.GetController(s.operatorID()); c != nil {
+			d = c.DashboardData()
 		}
-		return nil
+	} else {
+		d = s.agg.Current()
 	}
-	return s.agg.Current()
+	if d == nil {
+		// 实时聚合器空闲（休市/夜间/重启）时，回退到最近一次落盘快照
+		return s.loadCachedDash()
+	}
+	// 有实时数据时刷新落盘缓存，供空闲期回退
+	s.cacheDash(d)
+	return d
+}
+
+// SetCacheDir 设置看板快照落盘目录（缓存最近一次有效看板，解决派生数据不持久化导致休市期前端空白的问题）。
+func (s *Server) SetCacheDir(dir string) { s.cacheDir = dir }
+
+// cacheDashPath 返回看板快照落盘路径。
+func (s *Server) cacheDashPath() string {
+	if s.cacheDir == "" {
+		return ""
+	}
+	return filepath.Join(s.cacheDir, "dashboard_latest.json")
+}
+
+// cacheDash 将当前看板快照原子落盘；仅在有实质内容时写入，避免空闲期用空数据覆盖缓存。
+func (s *Server) cacheDash(d *display.DashboardData) {
+	if s.cacheDir == "" || d == nil {
+		return
+	}
+	if len(d.NewsEvents) == 0 && len(d.HotSectors) == 0 && len(d.BearSectors) == 0 &&
+		len(d.BullSignals) == 0 && len(d.FinalSignals) == 0 {
+		return
+	}
+	p := s.cacheDashPath()
+	b, err := json.Marshal(d)
+	if err != nil {
+		return
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, p)
+}
+
+// loadCachedDash 读取落盘的最近看板快照；若不存在则尝试用持久化新闻文件构造仅含新闻的最小快照，保证新闻组件始终有数据。
+func (s *Server) loadCachedDash() *display.DashboardData {
+	if p := s.cacheDashPath(); p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			var d display.DashboardData
+			if json.Unmarshal(b, &d) == nil &&
+				(len(d.NewsEvents) > 0 || len(d.HotSectors) > 0 || len(d.BearSectors) > 0 ||
+					len(d.BullSignals) > 0 || len(d.FinalSignals) > 0) {
+				return &d
+			}
+		}
+	}
+	if s.cacheDir != "" {
+		np := filepath.Join(s.cacheDir, "news_events.json")
+		if b, err := os.ReadFile(np); err == nil {
+			var wrap struct {
+				TradingDay string                `json:"trading_day"`
+				Events     []newsagent.NewsEvent `json:"events"`
+			}
+			if json.Unmarshal(b, &wrap) == nil && len(wrap.Events) > 0 {
+				return &display.DashboardData{NewsEvents: wrap.Events}
+			}
+		}
+	}
+	return nil
 }
 
 // SetLLMRecreate 设置 LLM 客户端热重建回调。
@@ -259,15 +329,15 @@ func (s *Server) ipoCalendar(now time.Time) ([]data.IPOEvent, error) {
 // same value on any device.
 func (s *Server) longOnFor(userID string) bool {
 	if s.cfg != nil {
-		return s.cfg.GetLongShortConfigFor(userID).LongEnabled
+		return s.cfg.GetLongShortConfigFor(s.operatorID()).LongEnabled
 	}
 	return true
 }
 
-// shortOnFor 返回指定账号的做空开关（账号级覆盖优先，默认仅做多：做空关）。
+// shortOnFor 返回运营数据归属账号（管理员）的做空开关（运营配置系统级共享）。
 func (s *Server) shortOnFor(userID string) bool {
 	if s.cfg != nil {
-		return s.cfg.GetLongShortConfigFor(userID).ShortEnabled
+		return s.cfg.GetLongShortConfigFor(s.operatorID()).ShortEnabled
 	}
 	return false
 }
@@ -348,45 +418,56 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
 	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
-	s.mux.HandleFunc("POST /api/long/toggle", s.authMiddleware(s.handleLongToggle))
+	// 做多/做空开关：属运营配置，仅管理员可切换；状态对所有登录用户可读（看板展示用）。
+	// （Long/short toggles are operator config: only admin may toggle; status is readable by all.）
+	s.mux.HandleFunc("POST /api/long/toggle", s.adminMiddleware(s.handleLongToggle))
 	s.mux.HandleFunc("GET /api/long/status", s.authMiddleware(s.handleLongStatus))
-	s.mux.HandleFunc("POST /api/short/toggle", s.authMiddleware(s.handleShortToggle))
+	s.mux.HandleFunc("POST /api/short/toggle", s.adminMiddleware(s.handleShortToggle))
 	s.mux.HandleFunc("GET /api/short/status", s.authMiddleware(s.handleShortStatus))
-	s.mux.HandleFunc("GET /api/config/strategy", s.authMiddleware(s.handleGetStrategyConfig))
+	// 策略/D1/LLM 配置：运营配置系统级共享、仅管理员可读写（写会热替换全部账号引擎/新闻管线客户端）。
+	// （Strategy/D1/LLM configs are operator-owned: admin-only read+write.）
+	s.mux.HandleFunc("GET /api/config/strategy", s.adminMiddleware(s.handleGetStrategyConfig))
 	// §GAP2-W2 权限收口：全局战法参数影响所有账号的实盘/模拟决策，写权限收敛到 admin
 	// （此前任意 14 天临时账号可改全局止盈止损）。English: §GAP2-W2 — global strategy writes are admin-only.
 	s.mux.HandleFunc("POST /api/config/strategy", s.adminMiddleware(s.handleSetStrategyConfig))
-	s.mux.HandleFunc("GET /api/config/d1", s.authMiddleware(s.handleGetD1Config))
+	s.mux.HandleFunc("GET /api/config/d1", s.adminMiddleware(s.handleGetD1Config))
 	// §GAP2-W2 权限收口：D1 规则同为全局决策面，写权限收敛到 admin。
 	s.mux.HandleFunc("POST /api/config/d1", s.adminMiddleware(s.handleSetD1Config))
-	s.mux.HandleFunc("GET /api/config/llm", s.authMiddleware(s.handleGetLLMConfig))
+	s.mux.HandleFunc("GET /api/config/llm", s.adminMiddleware(s.handleGetLLMConfig))
 	// §GAP2-W2 权限收口（P1-3）：普通用户保存自己的 LLM 配置会经 llmRecreate 热替换【全部账号】
 	// 引擎与新闻管线的客户端（归因上下文外送/计费劫持），故写权限收敛到 admin；普通用户 GET 只读。
 	s.mux.HandleFunc("POST /api/config/llm", s.adminMiddleware(s.handleSetLLMConfig))
 
-	// QMT 实盘配置：读写均按登录账号隔离（per-user QMT 配置，Get/SetQMTConfigFor）。
-	// 历史缺陷：写路径曾挂 adminMiddleware——量化页面对所有登录用户开放，但非 admin
-	// 打开开关 POST 恒 403，配置从未落盘；刷新后 loadConfig 拉回默认值，表现为
-	// "实盘开关每次刷新都被关闭"。配置本身账号级隔离 + 前端二次确认 + 引擎纪律
-	// （日笔数/预算/熔断）多层防护，登录用户保存自己的实盘配置不再要求 admin。
-	s.mux.HandleFunc("GET /api/config/qmt", s.authMiddleware(s.handleGetQMTConfig))
-	s.mux.HandleFunc("POST /api/config/qmt", s.authMiddleware(s.handleSetQMTConfig))
+	// QMT 实盘配置：运营数据统一归属管理员（系统级共享），仅管理员可读写。
+	// 子账号不拥有/不操作量化交易，后端据此鉴权，前端不自行判定权限。
+	// （QMT config is operator-owned: admin-only read+write; sub-accounts are denied at the API layer.）
+	s.mux.HandleFunc("GET /api/config/qmt", s.adminMiddleware(s.handleGetQMTConfig))
+	s.mux.HandleFunc("POST /api/config/qmt", s.adminMiddleware(s.handleSetQMTConfig))
 
-	// 模拟盘（纸面交易）：独立于真实持仓，实时价撮合 + 净值曲线 + 信号质量统计
+	// 模拟盘（纸面交易）：运营数据统一归属管理员（系统级共享），仅管理员可读写；
+	// 子账号不操作模拟盘，后端鉴权，前端只负责展示与交互。
+	// （Paper trading is operator-owned: admin-only read+write.）
+	// 模拟盘为系统级共享的模拟数据（非真实资金），读接口对任一已登录账号开放；
+	// 写接口（买入/卖出/清盘/分池配置）仍限管理员，避免越权改动。
+	// English: paper is system-scoped simulation data — read endpoints are open to any
+	// authenticated user; mutating endpoints stay admin-only.
 	s.mux.HandleFunc("GET /api/paper/state", s.authMiddleware(s.handlePaperState))
 	s.mux.HandleFunc("GET /api/paper/positions", s.authMiddleware(s.handlePaperPositions))
 	s.mux.HandleFunc("GET /api/paper/trades", s.authMiddleware(s.handlePaperTrades))
 	s.mux.HandleFunc("GET /api/paper/orders", s.authMiddleware(s.handlePaperOrders))
 	s.mux.HandleFunc("GET /api/paper/equity", s.authMiddleware(s.handlePaperEquity))
-	s.mux.HandleFunc("POST /api/paper/sell", s.authMiddleware(s.handlePaperSell))
-	s.mux.HandleFunc("POST /api/paper/buy", s.authMiddleware(s.handlePaperBuy))
-	s.mux.HandleFunc("POST /api/paper/reset", s.authMiddleware(s.handlePaperReset))
-	s.mux.HandleFunc("POST /api/paper/pool/reset", s.authMiddleware(s.handlePaperPoolReset))
-	s.mux.HandleFunc("POST /api/paper/pool/config", s.authMiddleware(s.handlePaperPoolConfig))
-	s.mux.HandleFunc("POST /api/positions", s.authMiddleware(s.handleCreatePosition))
-	s.mux.HandleFunc("PUT /api/positions/{id}", s.authMiddleware(s.handleUpdatePosition))
-	s.mux.HandleFunc("DELETE /api/positions/{id}", s.authMiddleware(s.handleDeletePosition))
-	s.mux.HandleFunc("POST /api/positions/{id}/exit", s.authMiddleware(s.handleExitPosition))
+	s.mux.HandleFunc("GET /api/paper/selfcheck", s.authMiddleware(s.handlePaperSelfCheck))
+	s.mux.HandleFunc("POST /api/paper/sell", s.adminMiddleware(s.handlePaperSell))
+	s.mux.HandleFunc("POST /api/paper/buy", s.adminMiddleware(s.handlePaperBuy))
+	s.mux.HandleFunc("POST /api/paper/reset", s.adminMiddleware(s.handlePaperReset))
+	s.mux.HandleFunc("POST /api/paper/pool/reset", s.adminMiddleware(s.handlePaperPoolReset))
+	s.mux.HandleFunc("POST /api/paper/pool/config", s.adminMiddleware(s.handlePaperPoolConfig))
+	// 持仓（运营账本）：读对所有登录用户开放（系统级共享的大盘持仓）；写仅管理员可操作。
+	// （Positions: readable by all; writes are admin-only.）
+	s.mux.HandleFunc("POST /api/positions", s.adminMiddleware(s.handleCreatePosition))
+	s.mux.HandleFunc("PUT /api/positions/{id}", s.adminMiddleware(s.handleUpdatePosition))
+	s.mux.HandleFunc("DELETE /api/positions/{id}", s.adminMiddleware(s.handleDeletePosition))
+	s.mux.HandleFunc("POST /api/positions/{id}/exit", s.adminMiddleware(s.handleExitPosition))
 	s.mux.HandleFunc("GET /api/positions", s.authMiddleware(s.handleListPositions))
 
 	// fix 兼容端点
@@ -395,15 +476,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/signals", s.authMiddleware(s.handleFixSignals))
 	s.mux.HandleFunc("GET /api/status", s.authMiddleware(s.handleFixStatus))
 	s.mux.HandleFunc("GET /api/engine_health", s.authMiddleware(s.handleFixEngineHealth))
+	// 消息中心：列表对所有登录用户可读（运营数据系统级共享）；清空/删除为写操作，仅管理员可操作。
 	s.mux.HandleFunc("GET /api/alerts", s.authMiddleware(s.handleFixAlerts))
-	s.mux.HandleFunc("DELETE /api/alerts", s.authMiddleware(s.handleClearAlerts))
-	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.authMiddleware(s.handleDeleteAlert))
+	s.mux.HandleFunc("DELETE /api/alerts", s.adminMiddleware(s.handleClearAlerts))
+	s.mux.HandleFunc("DELETE /api/alerts/{id}", s.adminMiddleware(s.handleDeleteAlert))
+	// 自选股/持仓：读对所有登录用户开放（系统级共享的大盘自选）；写仅管理员可操作。
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
-	s.mux.HandleFunc("POST /api/holdings", s.authMiddleware(s.handleFixSetHoldings))
-	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.authMiddleware(s.handleFixAddHoldingLot))
-	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.authMiddleware(s.handleFixSetCost))
-	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.authMiddleware(s.handleFixSellHolding))
-	s.mux.HandleFunc("POST /api/holdings/{code}/close", s.authMiddleware(s.handleFixCloseHolding))
+	s.mux.HandleFunc("POST /api/holdings", s.adminMiddleware(s.handleFixSetHoldings))
+	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.adminMiddleware(s.handleFixAddHoldingLot))
+	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.adminMiddleware(s.handleFixSetCost))
+	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.adminMiddleware(s.handleFixSellHolding))
+	s.mux.HandleFunc("POST /api/holdings/{code}/close", s.adminMiddleware(s.handleFixCloseHolding))
 	s.mux.HandleFunc("GET /api/sector/hot", s.authMiddleware(s.handleFixSectorHot))
 	s.mux.HandleFunc("GET /api/sector/hot/records", s.authMiddleware(s.handleSectorHotRecords))
 	s.mux.HandleFunc("GET /api/snapshot", s.authMiddleware(s.handleFixSnapshot))
@@ -433,8 +516,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/positions/advice", s.adminMiddleware(s.handleRealAdvice))
 	s.mux.HandleFunc("POST /api/positions/execute", s.adminMiddleware(s.handleExecuteAction))
 	s.mux.HandleFunc("POST /api/qmt/report", s.qmtReportMiddleware(s.handleQMTReport))
-	s.mux.HandleFunc("GET /api/qmt/state", s.authMiddleware(s.handleQMTState))
-	s.mux.HandleFunc("GET /api/qmt/trades", s.authMiddleware(s.handleQMTTrades))
+	// QMT 实盘状态/成交：运营数据系统级共享，仅管理员可读（子账号无量化交易权限）。
+	s.mux.HandleFunc("GET /api/qmt/state", s.adminMiddleware(s.handleQMTState))
+	s.mux.HandleFunc("GET /api/qmt/trades", s.adminMiddleware(s.handleQMTTrades))
 	// §R4-1 kill-switch 与手动撤单（admin 权限：紧急停止/撤单属资损级操作）
 	s.mux.HandleFunc("POST /api/qmt/halt", s.adminMiddleware(s.handleQMTHalt))
 	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.adminMiddleware(s.handleQMTCancel))
@@ -882,7 +966,7 @@ func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		user := userFromContext(r)
 		if user == nil || !user.IsAdmin() {
-			writeError(w, 403, "admin required")
+			writeError(w, 403, "无权限：该接口仅管理员账号可用")
 			return
 		}
 		next(w, r)
@@ -946,8 +1030,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"auction":       data.Auction, // §同花顺（新）竞价快照（9:15-9:26 窗口内非空）
 		"short_enabled": s.shortOnFor(userID),
 	}
-	if data.Report != nil {
-		total, holding, win, wr, avgW, avgL := data.Report.Stats()
+	if data.Report != nil || s.rpt != nil {
+		rpt := data.Report
+		if rpt == nil {
+			rpt = s.rpt // 落盘缓存不含 Report（json:"-"），回退到持久化报表库
+		}
+		total, holding, win, wr, avgW, avgL := rpt.Stats()
 		resp["report_stats"] = map[string]interface{}{
 			"total":        total,
 			"holding":      holding,
@@ -955,9 +1043,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			"win_rate":     wr,
 			"avg_win_pct":  avgW,
 			"avg_loss_pct": avgL,
-			"by_strategy":  data.Report.StatsByStrategy(""), // 按战法分组的胜率/盈亏比明细
+			"by_strategy":  rpt.StatsByStrategy(""), // 按战法分组的胜率/盈亏比明细
 		}
-		resp["report_logs"] = data.Report.List()
+		resp["report_logs"] = rpt.List()
 	}
 	writeJSON(w, 200, resp)
 }
@@ -974,7 +1062,7 @@ func (s *Server) handleLongToggle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	userID := requestUserID(r)
+	userID := s.operatorID()
 	if s.cfg != nil {
 		cur := s.cfg.GetLongShortConfigFor(userID)
 		cur.LongEnabled = req.Enabled
@@ -984,12 +1072,12 @@ func (s *Server) handleLongToggle(w http.ResponseWriter, r *http.Request) {
 		c.SetLongEnabled(req.Enabled)
 	}
 	log.Printf("[server] 账号 %s 做多开关: %v", userID, req.Enabled)
-	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOnFor(userID)})
+	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOnFor("")})
 }
 
-// handleLongStatus 处理 GET /api/long/status：返回指定账号当前做多开关状态。
+// handleLongStatus 处理 GET /api/long/status：返回运营数据归属账号当前做多开关状态。
 func (s *Server) handleLongStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOnFor(requestUserID(r))})
+	writeJSON(w, 200, map[string]bool{"long_enabled": s.longOnFor("")})
 }
 
 // shortToggleReq 做空开关请求体。
@@ -1004,7 +1092,7 @@ func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	userID := requestUserID(r)
+	userID := s.operatorID()
 	if s.cfg != nil {
 		cur := s.cfg.GetLongShortConfigFor(userID)
 		cur.ShortEnabled = req.Enabled
@@ -1014,12 +1102,12 @@ func (s *Server) handleShortToggle(w http.ResponseWriter, r *http.Request) {
 		c.SetShortEnabled(req.Enabled)
 	}
 	log.Printf("[server] 账号 %s 做空开关: %v", userID, req.Enabled)
-	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOnFor(userID)})
+	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOnFor("")})
 }
 
-// handleShortStatus 处理 GET /api/short/status：返回指定账号当前做空开关状态。
+// handleShortStatus 处理 GET /api/short/status：返回运营数据归属账号当前做空开关状态。
 func (s *Server) handleShortStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOnFor(requestUserID(r))})
+	writeJSON(w, 200, map[string]bool{"short_enabled": s.shortOnFor("")})
 }
 
 // newsShowAllReq 资讯"显示全部"开关请求体。
@@ -1271,8 +1359,9 @@ func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 
 // handleListPositions 处理 GET /api/positions：返回当前账号的持仓记录与交易统计指标。
 func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
-	uid := requestUserID(r)
-	logs := s.rpt.ListFor(uid)
+	// 持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 读取统计与列表。
+	uid := s.operatorID()
+	logs := s.rpt.ListFor("")
 	reportStats := map[string]interface{}{}
 	total, holding, win, wr, avgW, avgL := s.rpt.StatsFor(uid)
 	reportStats["total"] = total
@@ -1281,7 +1370,7 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 	reportStats["win_rate"] = wr
 	reportStats["avg_win_pct"] = avgW
 	reportStats["avg_loss_pct"] = avgL
-	reportStats["by_strategy"] = s.rpt.StatsByStrategy(uid) // 按账号、按战法分组的胜率明细
+	reportStats["by_strategy"] = s.rpt.StatsByStrategy(uid) // 按运营账号、按战法分组的胜率明细
 	writeJSON(w, 200, map[string]interface{}{
 		"positions": logs,
 		"stats":     reportStats,
@@ -1405,6 +1494,16 @@ func requestUserID(r *http.Request) string {
 		return ""
 	}
 	return u.ID
+}
+
+// operatorID 返回运营数据归属账号（管理员）ID。所有运营数据（量化/模拟盘/看板/告警/LLM）
+// 统一归属该账号，后端按角色做访问控制，前端只负责展示与交互。
+// （operatorID returns the operator (admin) account that owns all operational data.）
+func (s *Server) operatorID() string {
+	if s.auth == nil {
+		return ""
+	}
+	return s.auth.AdminID()
 }
 
 // maskSecret §GAP2-W2 密钥脱敏（P2-4）：保留前 4 后 4，中段以 … 掩盖；短密钥全掩。

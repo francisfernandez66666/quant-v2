@@ -2,7 +2,8 @@
 // 提供与 LLM 的多轮对话能力，支持专业模式切换、LLM 配置、历史记录加载与清空。
 // 使用 TDesign React 组件（Card / Switch / Input / Textarea / Button / Tag）。
 import React, { useState, useEffect, useRef, useCallback } from 'react'
-import { Card, Switch, Input, Textarea, Button, Tag } from 'tdesign-react'
+import { Card, Input, Textarea, Button, Tag } from 'tdesign-react'
+import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
@@ -13,7 +14,9 @@ function fmtTime(t) {
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+// 聊天框容器样式：占满剩余高度并允许纵向滚动，消息按时间纵列排列
 const chatBoxStyle = { flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }
+// 单条消息气泡样式：限制最大宽度、圆角、自动折行，避免长文本溢出
 const bubbleStyle = { maxWidth: '80%', padding: '10px 12px', borderRadius: 8, fontSize: 14, lineHeight: 1.5, wordBreak: 'break-word' }
 
 /**
@@ -107,7 +110,7 @@ export default function Consult() {
     setLlmMsg('')
     try {
       await api.setLLMConfig({
-        api_key: cfgApiKey || undefined,
+        api_keys: cfgApiKey ? [cfgApiKey] : undefined,
         api_url: cfgApiUrl || undefined,
         model: cfgModel || undefined,
       })
@@ -137,7 +140,7 @@ export default function Consult() {
         if (cfg) {
           setCfgApiUrl(cfg.api_url || '')
           setCfgModel(cfg.model || '')
-          setLlmConfigured(!!(cfg.api_key || cfg.api_url))
+          setLlmConfigured(!!(cfg.api_keys && cfg.api_keys.length) || !!cfg.api_url)
         } else {
           setLlmConfigured(false)
         }
@@ -154,7 +157,7 @@ export default function Consult() {
         <SectionLabel>股票咨询</SectionLabel>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <label className="muted" title="开启后咨询将注入该股全部实时行情（现价/净流入/大单明细/均线/MACD/策略信号）。盘中每 15 分钟限流一次，盘前盘后不限。" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
-            <Switch value={proMode} disabled={proModeSaving} onChange={onToggleProMode} />
+            <ToggleSw checked={proMode} disabled={proModeSaving} onChange={onToggleProMode} />
             专业模式
           </label>
           <Button theme="default" variant="outline" onClick={onClear} disabled={loading}>🗑 清空对话</Button>

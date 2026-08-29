@@ -4,7 +4,8 @@
 // 全站使用 TDesign React 组件 + 浅色主题（默认，不设置 theme 即为浅色）。
 import React, { useState, useEffect, useRef, Suspense, lazy } from 'react'
 import { NavLink, Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
-import { ConfigProvider, Menu, Switch, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
+import { ConfigProvider, Menu, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
+import ToggleSw from './components/ToggleSw'
 import * as api from './api/index.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
@@ -330,7 +331,7 @@ export default function App() {
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               {/* 做空开关：开启后允许"做多+做空"，关闭则"仅做多" */}
-              <Switch value={shortEnabled} onChange={onShortToggle} />
+              <ToggleSw checked={shortEnabled} onChange={onShortToggle} />
               <span className="muted">{shortEnabled ? '做多+空' : '仅做多'}</span>
               {/* 通知测试按钮：验证系统/原生通知通道是否可用 */}
               <Button theme="default" variant="outline" size="small" onClick={() => {
@@ -340,8 +341,16 @@ export default function App() {
               {/* 退出登录 */}
               <Button theme="default" variant="outline" size="small" onClick={logout}>退出</Button>
             </div>
-          </header>
-          <div className="app-body">
+           </header>
+           {/* 后端断联横幅：登录态可能因缓存令牌保留，但所有数据接口失败。
+               显式提示用户检查「设置→服务器地址」（留空=使用当前域名），避免误以为"后端没给数据"。 */}
+           {loggedIn && !serverOnline && (
+             <div style={{ margin: '8px 12px 0', padding: '8px 12px', borderRadius: 6, background: '#fdecea', border: '1px solid #f5c6c2', color: '#b71c1c', fontSize: 13 }}>
+               ⚠ 无法连接服务器：页面可打开但后端数据未加载。请到「设置 → 服务器连接」确认服务器地址——
+               若填了自定义地址请改为留空（使用当前域名 quant-trading.top），或确认该地址可达。
+             </div>
+           )}
+           <div className="app-body">
             {/* 侧边栏：品牌 logo + 导航菜单 + 底部当前账号；menuOpen 控制移动端抽屉展开 */}
             <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
               <div className="brand-logo">量仔</div>
@@ -360,9 +369,13 @@ export default function App() {
                   ))}
                 </Menu>
               </div>
-              {/* 侧边栏底部固定显示登录账号名 */}
+              {/* 侧边栏底部固定显示登录账号名与角色：后端下发的身份，前端只展示，
+                  便于一眼确认当前是管理员还是普通用户（量化/模拟盘仅管理员可操作）。 */}
               <div className="sidebar-footer">
-                <div className="account-name">{account}</div>
+                <div className="account-name">{account || '未登录'}</div>
+                <div className={canAdmin ? 'role-badge role-admin' : 'role-badge role-user'}>
+                  {canAdmin ? '管理员' : '普通用户'}
+                </div>
               </div>
             </aside>
             {/* 移动端抽屉展开时，点击遮罩收起侧边栏 */}

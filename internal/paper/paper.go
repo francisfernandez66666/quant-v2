@@ -440,6 +440,22 @@ func New(cfg Config, path string) *Engine {
 // English: reports whether paper trading is enabled.
 func (e *Engine) Enabled() bool { return e.cfg.Enabled }
 
+// HasFilled 返回引擎是否发生过任何成交（用于诊断净值曲线为何为空）。
+// English: returns whether any fill has happened (used to diagnose empty equity curve).
+func (e *Engine) HasFilled() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.hasFilled
+}
+
+// Path 返回持久化文件路径（用于诊断 paper.json 是否存在/大小/修改时间）。
+// English: returns the persistence file path (for diagnostics: exists/size/mtime).
+func (e *Engine) Path() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.path
+}
+
 // Cfg 返回当前生效的配置副本。
 // English: returns a copy of the effective config.
 func (e *Engine) Cfg() Config {

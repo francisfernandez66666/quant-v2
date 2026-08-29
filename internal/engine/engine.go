@@ -569,12 +569,14 @@ func (e *Engine) syncAccountConfig() {
 		}
 	}
 	// QMT 实盘配置热同步：每轮从配置管理器读取，控制器据此切换 enabled/mode/参数（5s 生效）。
+	// 必须用账号级 GetQMTConfigFor（而非全局 GetRulesFor().QMT）：账号级覆盖优先，且可避免
+	// Watch/Load 重置全局 m.Rules 后，把已开启的实盘链路短暂关掉（开关"秒关"的潜在根因）。
 	// §GAP1.7 黑名单接线：Theme.BlackList 一并同步进下单守卫（此前仅死代码 risk.go 消费）。
-	// English: hot-sync the QMT live config each cycle; Theme.BlackList rides along into the order guard.
+	// English: hot-sync the per-user QMT config each cycle (GetQMTConfigFor, not the global
+	// GetRulesFor().QMT) so a Load()-reset of the global rules can't transiently disable a live link.
 	if c := e.QMTController(); c != nil {
-		rules := cfgMgr.GetRulesFor(userID)
-		q := rules.QMT
-		q.Blacklist = append(q.Blacklist, rules.Theme.BlackList...)
+		q := *cfgMgr.GetQMTConfigFor(userID)
+		q.Blacklist = append(q.Blacklist, cfgMgr.GetRulesFor(userID).Theme.BlackList...)
 		c.UpdateConfig(q)
 	}
 	// §GAP5.1 LLM 成本治理：日预算热同步（0=不设限）。

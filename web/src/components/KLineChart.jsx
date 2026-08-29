@@ -26,15 +26,18 @@ const C = {
   dif: '#d48806',
   dea: '#1677ff',
 }
+// 分时价格线上涨/下跌颜色（红涨绿跌）
 const PRICE_UP = '#f5222d'
 const PRICE_DOWN = '#16a34a'
 
+// 格式化成交量：>=1亿 显「亿」、>=1万 显「万」，否则原值
 function fmtVol(v) {
   const n = Number(v) || 0
   if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿'
   if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'
   return String(n)
 }
+// 格式化成交额：>=1亿 显「亿」、>=1万 显「万」，否则原值
 function fmtAmt(v) {
   const n = Number(v) || 0
   if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿'
@@ -42,10 +45,12 @@ function fmtAmt(v) {
   return String(n)
 }
 
+// 根据容器宽高推导画布视图高度（限制在 0.5×宽 ~ 440px 之间）
 function computeViewH(w, h) {
   return Math.min(440, Math.max(h, Math.round(w * 0.5)))
 }
 
+// 在 canvas 上按坐标数组绘制连续折线（无点则直接返回）
 function drawPolyline(ctx, coords) {
   if (!coords.length) return
   ctx.beginPath()

@@ -209,6 +209,7 @@ export default function Positions() {
     } catch (_) { setLookupName('') }
   }
 
+  // 清空新增/编辑持仓表单（代码、成本、数量、查得名称/现价、止盈止损归零）
   function resetForm() {
     setFormCode(''); setFormCost(0); setFormQty(0); setLookupName(''); setLookupPrice(0)
   }
@@ -244,6 +245,7 @@ export default function Positions() {
     resetForm()
   }
 
+  // 用指定持仓填充编辑表单并打开编辑弹窗
   function editHolding(h) {
     setEditingIdx(holdings.indexOf(h))
     setFormCode(h.code)
@@ -256,6 +258,7 @@ export default function Positions() {
     setShowAdd(true)
   }
 
+  // 打开加/减仓弹窗：预填现价并刷新该持仓最新价
   function openAddLot(h) {
     setLotTarget(h)
     setLotDir('add')
@@ -265,6 +268,7 @@ export default function Positions() {
     setShowLot(true)
     refreshLotPrice(h.code)
   }
+  // 按代码查询最新价并刷新加减仓弹窗的现价/成交价
   async function refreshLotPrice(code) {
     if (!code) return
     try {
@@ -292,6 +296,7 @@ export default function Positions() {
       setShowLot(false)
     } catch (e) { MessagePlugin.error((lotDir === 'sell' ? '减仓失败: ' : '加仓失败: ') + (e.message || '')) }
   }
+  // 打开改成本弹窗并预填当前成本价
   function openSetCost(h) {
     setCostTarget(h); setCostFormPrice(Number(h.cost_price) || 0); setShowCost(true)
   }
@@ -306,6 +311,7 @@ export default function Positions() {
       setShowCost(false)
     } catch (e) { MessagePlugin.error('更新成本失败: ' + (e ? e.message : '')) }
   }
+  // 打开指定持仓的加仓批次明细弹窗
   function showLotsFor(h) { setLotsTarget(h); setShowLots(true) }
   // 新增或更新本地持仓数据
   function upsertHolding(h) {
@@ -315,9 +321,12 @@ export default function Positions() {
       return [...prev, h]
     })
   }
+  // 关闭新增/编辑持仓弹窗并清除编辑下标
   function closeAdd() { setShowAdd(false); setEditingIdx(-1) }
+  // 打开「新增持仓」弹窗：重置为新增态并设默认止盈+8%/止损-5%
   function openAddNew() { setEditingIdx(-1); resetForm(); setFormTp(8); setFormSl(5); setShowAdd(true) }
 
+  // 根据清仓价实时预览该持仓的盈亏金额与比例（校验价/量是否有效）
   function closePriceInput() {
     const t = closeTarget
     const price = Number(closeFormPrice)
@@ -328,6 +337,7 @@ export default function Positions() {
     setClosePnlPct(cost > 0 ? (price - cost) / cost * 100 : 0)
     setClosePreviewValid(true)
   }
+  // 打开清仓弹窗并预填现价，等待输入清仓价预览盈亏
   function openCloseHolding(h) {
     setCloseTarget(h); setCloseFormPrice(Number(h.cur_price) || 0); setClosePreviewValid(false); setShowClose(true)
   }
@@ -369,13 +379,18 @@ export default function Positions() {
       if (data && data.account) setRealAccount(data.account)
     } catch (_) {}
   }
+  // 取实盘持仓的有效现价（无效价返回 0，避免展示脏数据）
   function curPrice(p) { return (p.cur_price && p.cur_price > 0) ? p.cur_price : 0 }
+  // 计算实盘持仓盈亏百分比（成本或现价为空时返回 0）
   function realPnlPct(p) {
     if (!p.cost_price || p.cost_price <= 0 || !curPrice(p)) return 0
     return (curPrice(p) - p.cost_price) / p.cost_price * 100
   }
+  // 按 ts_code 取出该实盘持仓对应的操作建议（无则 null）
   function adviceFor(tsCode) { return realAdvices[tsCode] || null }
+  // 将实盘操作方向（add/reduce/tp/close）翻译为中文动作标签
   function realActionLabel(dir) { return ({ add: '加仓', reduce: '减仓', tp: '止盈', close: '清仓' })[dir] || dir }
+  // 打开实盘下单确认弹窗：预填参考价与默认数量，若网关已熔断则禁止下单
   function openRealAction(p, dir) {
     if (realTripped) { MessagePlugin.warning('网关已熔断，暂停实盘下单'); return }
     setRealAction({ pos: p, dir })
@@ -411,19 +426,24 @@ export default function Positions() {
     finally { setRealSubmitting(false) }
   }
 
+  // 展开/收起指定代码的分时图（维护已展开代码集合）
   function toggleKline(code) {
     setKlineOpen((prev) => { const next = new Set(prev); if (next.has(code)) next.delete(code); else next.add(code); return next })
   }
+  // 桌面端点击行不响应；移动端点击行时打开底部持仓操作面板
   function onRowTap(h) {
     if (window.innerWidth > 768) return
     setSheetHolding(h)
   }
 
   // 可用资金编辑
+  // 进入可用资金编辑态：用当前余额预填输入框
   function editBalanceStart() { setBalanceInputVal(availableBalance); setEditingBalance(true) }
+  // 保存可用资金编辑结果并同步后端持仓数据
   function editBalanceSave() {
     setAvailableBalance(balanceInputVal); setEditingBalance(false); saveHoldings()
   }
+  // 取消可用资金编辑，放弃本次修改
   function editBalanceCancel() { setEditingBalance(false) }
 
   // 挂载时加载持仓、启动轮询并订阅 SSE 实盘建议；卸载时清理

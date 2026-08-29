@@ -107,6 +107,16 @@ export default function MsgCenter() {
     return 'default'
   }
 
+  // 将消息时间格式化为「YYYY-MM-DD HH:MM:SS」；优先用生成时间 generated_at，回退触发时间 time
+  function fmtMsgTime(a) {
+    const raw = a.generated_at || a.time || ''
+    if (!raw) return ''
+    const d = new Date(raw)
+    if (isNaN(d.getTime())) return raw // 已是可读字符串则原样返回
+    const p = (n) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  }
+
   // 加载消息列表并过滤掉日历类消息
   async function load() {
     try {
@@ -197,7 +207,7 @@ export default function MsgCenter() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
             <Tag theme={levelTagTheme(a.level)} size="small">{a.level}</Tag>
             <span style={{ fontFamily: 'monospace', color: '#4fc3f7', fontWeight: 600 }}>{a.code} {a.name}</span>
-            <span style={{ color: '#555', flex: 1, fontSize: 13 }}>{a.time}</span>
+            <span style={{ color: '#555', flex: 1, fontSize: 13 }}>{fmtMsgTime(a)}</span>
             <Tag theme={actionTagTheme(a)} size="small" variant="light">{actionText(a)}</Tag>
             {isSellAlert(a) && (
               <Button size="small" variant="outline" theme="danger" onClick={() => onPaperSell(a)}>模拟卖出</Button>

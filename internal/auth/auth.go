@@ -114,6 +114,22 @@ func (u *User) IsAdmin() bool {
 	return u != nil && u.Role == RoleAdmin
 }
 
+// AdminID 返回第一个正式管理员账号的 ID（剔除临时账号 tmp_），作为运营数据归属账号。
+// 后端据此把量化/模拟盘/看板/告警/LLM 等运营数据统一归属管理员，并按角色鉴权。
+// English: returns the first real admin account's ID (excluding tmp_ accounts); used as the
+// operator that owns all operational data, with role-based access enforced at the API layer.
+func (m *Manager) AdminID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for i := range m.db.Users {
+		u := &m.db.Users[i]
+		if u.Role == RoleAdmin && !strings.HasPrefix(u.ID, "tmp_") {
+			return u.ID
+		}
+	}
+	return ""
+}
+
 // ConfigEntry 用户配置键值项。
 // （ConfigEntry is a user-config key-value entry.）
 type ConfigEntry struct {

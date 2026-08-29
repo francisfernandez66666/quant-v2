@@ -3,9 +3,10 @@
 // 主要功能：查看首尔↔广州链路状态/熔断；配置总开关、执行模式、委托价格、心跳超时、网关与 Token；
 //          设定最大持仓/单票金额/预算等仓位纪律；按战法开关实盘准入并展示交易流水与归因盈亏。
 //          定时轮询：链路状态 10s 一次、交易流水 30s 一次；保存后约 5s 热加载生效。
-// 使用 TDesign React 组件（Card / Form / Input / Switch / Button / Tag / Table）。
+// 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
-import { Card, Form, Input, Switch, Button, Tag, Table, MessagePlugin, DialogPlugin } from 'tdesign-react'
+import ToggleSw from '../components/ToggleSw'
+import { Card, Form, Input, Button, Tag, Table, MessagePlugin, DialogPlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
@@ -45,15 +46,27 @@ function pnlColor(v) {
   return (v || 0) >= 0 ? '#e34d59' : '#00a870'
 }
 
-// 通用确认弹窗：返回 Promise<boolean>，用户确认 resolve(true)、关闭 resolve(false)
+// 通用确认弹窗：返回 Promise<boolean>，用户确认 resolve(true)、关闭/取消 resolve(false)。
+// 必须只 resolve 一次：TDesign 的 d.hide() 会同步触发 onClose，若 onConfirm 先 d.hide() 再 resolve(true)，
+// onClose 的 resolve(false) 会先一步生效（Promise 首次 resolve 即定型），导致"确认"被当作"取消"——
+// 表现为实盘总开关点了启用却存不进、瞬间弹回关闭。这里用 done 守卫保证首次 resolve 的值生效。
+// English: resolve-once guard. d.hide() synchronously fires onClose; without the guard a confirm could
+// resolve false (treated as cancel), so enabling the master switch would never persist.
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
+    let done = false
+    const finish = (val) => {
+      if (done) return
+      done = true
+      d.hide()
+      resolve(val)
+    }
     const d = DialogPlugin.confirm({
       header,
       body,
       theme: 'warning',
-      onConfirm: () => { d.hide(); resolve(true) },
-      onClose: () => { d.hide(); resolve(false) },
+      onConfirm: () => finish(true),
+      onClose: () => finish(false),
     })
   })
 }
@@ -90,6 +103,14 @@ export default function Quant() {
   // 配置加载失败提示：加载失败时表单停留在本地缓存值，若无提示用户会误把
   // 缓存当成服务器真实状态，误以为"开关被自动关闭"。显式告警消除歧义。
   const [loadErr, setLoadErr] = useState('')
+  // 后端鉴权拒绝（403）：量化交易仅管理员可访问，后端据此决定，前端只负责展示。
+  // English: backend denied (403) — quant trading is admin-only; the frontend just renders the denial.
+  const [forbidden, setForbidden] = useState(false)
+  // 是否已从服务器同步完成：首屏先显示「同步中」占位，避免把本地缓存的旧值
+  // 误当成服务器真实状态（用户反馈「开关刷新后变回关闭」多源于此闪烁）。
+  // English: whether config has synced from server; show a placeholder first paint
+  // so a stale cached value can never be mistaken for the server's truth.
+  const [syncing, setSyncing] = useState(true)
 
   const stateTimer = useRef(null)
   const tradesTimer = useRef(null)
@@ -137,6 +158,7 @@ export default function Quant() {
   // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启。
   // 失败时置 loadErr 告警（页面顶部显示），并向上抛出由调用方决定是否 toast。
   async function loadConfig() {
+    setSyncing(true)
     try {
       const c = await api.fetchQMTConfig()
       setLoadErr('')
@@ -168,8 +190,16 @@ export default function Quant() {
       list.forEach((v) => { ai[v.id] = sa[v.id] ?? '' })
       setAmountsInput(ai)
       setStrategyDirty(false)
+      setSyncing(false)
     } catch (e) {
+      // 后端返回 403（无权限）时，直接展示「无权限」面板，不再走缓存兜底提示。
+      if (e && e.message && e.message.indexOf('无权限') >= 0) {
+        setForbidden(true)
+        setSyncing(false)
+        return
+      }
       setLoadErr('实盘配置加载失败（' + (e && e.message ? e.message : '网络异常') + '）——下方开关显示的是本机缓存，不代表服务器真实状态')
+      setSyncing(false)
       throw e
     }
   }
@@ -229,13 +259,18 @@ export default function Quant() {
     await patch({ auto_sell: v }, v ? '已开启自动卖出' : '已关闭自动卖出')
   }
 
-  // 保存实盘总开关：启用前需二次确认（将向网关下发真实交易指令）
+  // 保存实盘总开关：直接保存（不再用阻塞式二次确认，避免“开关一拨就弹回关闭”）。
+  // 启用后下发真实交易指令属高危操作，故用非阻塞告警提示用户确认网关地址正确。
+  // English: save immediately (no blocking confirm that could snap the switch back);
+  // a non-blocking warning reminds the admin that enabling routes real orders to the gateway.
   async function saveSwitches(v) {
-    if (v && !(await confirmDialog('确认启用实盘链路？启用后将按下方参数向广州网关传递真实交易指令。', '启用实盘链路'))) {
-      setForm((f) => ({ ...f, enabled: false }))
-      return
-    }
-    await patch({ enabled: v }, v ? '实盘链路已启用' : '实盘链路已停用')
+    if (saving) return
+    await patch(
+      { enabled: v },
+      v
+        ? '实盘链路已启用：将按下方参数向广州网关下发真实交易指令，请确认网关地址正确'
+        : '实盘链路已停用',
+    )
   }
 
   // 保存网关连接参数（网关地址/心跳超时/Token）；模式与价格已改为点击即存，不再随此保存
@@ -332,6 +367,12 @@ export default function Quant() {
         </div>
       )}
 
+      {forbidden && (
+        <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: '#ad6800', fontSize: 13 }}>
+          🔒 无权限访问量化交易：当前登录「{api.getAccount() || '未知'}」为普通用户，该页面仅管理员账号可操作。请使用管理员账号（用户名 admin）登录后再进行管理。
+        </div>
+      )}
+
       <Card style={{ marginBottom: 14 }}>
         {state && state.enabled ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
@@ -347,9 +388,18 @@ export default function Quant() {
           </div>
         ) : state ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
-            <span style={{ color: '#666' }}>●</span>
-            <span>实盘链路未启用</span>
-            <span style={{ color: '#666', fontSize: 11 }}>打开下方「总开关」并配置网关地址后开始互通</span>
+            <span style={{ color: form.enabled ? '#e6a23c' : '#666' }}>●</span>
+            {form.enabled ? (
+              <>
+                <span>实盘链路已配置启用，但当前未连通网关</span>
+                <span style={{ color: '#666', fontSize: 11 }}>请确认下方「网关地址」正确且广州网关在线，连通后此处转为实时状态</span>
+              </>
+            ) : (
+              <>
+                <span>实盘链路未启用</span>
+                <span style={{ color: '#666', fontSize: 11 }}>打开下方「总开关」并配置网关地址后开始互通</span>
+              </>
+            )}
           </div>
         ) : (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
@@ -362,8 +412,17 @@ export default function Quant() {
       <Card title="总开关与执行方式" style={{ marginBottom: 14 }}>
         <Form labelWidth={120} labelAlign="right">
           <Form.FormItem label="实盘总开关">
-            <Switch value={form.enabled} onChange={(v) => { setForm({ ...form, enabled: v }); saveSwitches(v) }} />
-            <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>关闭后引擎不再向网关传递任何信号/建议（纸面盘不受影响）</span>
+            {syncing ? (
+              <span style={{ fontSize: 13, color: '#999' }}>同步中…</span>
+            ) : (
+              <ToggleSw checked={form.enabled} onChange={(v) => { setForm({ ...form, enabled: v }); saveSwitches(v) }} />
+            )}
+            <span style={{ color: loadErr ? '#b71c1c' : '#00a870', fontSize: 11, marginLeft: 10 }}>
+              {loadErr ? '⚠ 未同步服务器（下方为本地缓存，非真实状态）' : '已同步服务器 ✓'}
+            </span>
+            <span style={{ color: '#666', fontSize: 11, marginLeft: 10, display: 'block', marginTop: 4 }}>
+              关闭后引擎不再向网关传递任何信号/建议（纸面盘不受影响）
+            </span>
           </Form.FormItem>
           <Form.FormItem label="执行模式">
             <span style={segBtn(form.mode === 'manual')} onClick={() => saveMode('manual')}>手动确认</span>
@@ -376,7 +435,7 @@ export default function Quant() {
             <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存</span>
           </Form.FormItem>
           <Form.FormItem label="自动卖出">
-            <Switch value={form.auto_sell} onChange={saveAutoSell} />
+            <ToggleSw checked={form.auto_sell} onChange={(v) => { setForm({ ...form, auto_sell: v }); saveAutoSell(v) }} />
             <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>自动模式下止损/清仓级建议自动全仓卖出；止盈/减仓保持提醒</span>
           </Form.FormItem>
           <Form.FormItem label="心跳超时(秒)">
@@ -451,7 +510,7 @@ export default function Quant() {
                   <Input style={{ width: 100 }} type="number" min={0} step={500} value={amountsInput[s.id] ?? ''} placeholder="全局"
                     onChange={(v) => setAmountsInput({ ...amountsInput, [s.id]: v })} />
                   <span style={{ fontSize: 11, color: '#666' }}>元/次</span>
-                  <Switch value={!!strategyOn[s.id]} onChange={(v) => { setStrategyOn({ ...strategyOn, [s.id]: v }); markStrategyDirty() }} />
+                  <ToggleSw checked={!!strategyOn[s.id]} onChange={(v) => { setStrategyOn({ ...strategyOn, [s.id]: v }); markStrategyDirty() }} />
                 </div>
               </div>
             ))}

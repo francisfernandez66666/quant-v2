@@ -5,6 +5,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import * as api from '../api/index.js'
 import './DepthPanel.css'
 
+// 盘口面板配色常量（文字/现价底/买卖盘/涨跌/数据源色）
 const C = {
   bg: '#ffffff',
   lv: '#606266',
@@ -17,10 +18,12 @@ const C = {
   src: '#1677ff',
 }
 
+// 格式化价格：保留两位小数，空值返回占位符 '--'
 function fmtPrice(v) {
   const n = Number(v) || 0
   return n ? n.toFixed(2) : '--'
 }
+// 格式化成交量：>=1万 时换算为「万」并保留 1 位小数，空值返回 '--'
 function fmtVol(v) {
   const n = Number(v) || 0
   if (n >= 1e4) return (n / 1e4).toFixed(1) + '万'
