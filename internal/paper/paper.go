@@ -464,6 +464,15 @@ func (e *Engine) Cfg() Config {
 	return e.cfg
 }
 
+// UpdateConfig §修复 S2（2026-08-29）：后台改账户级模拟盘配置（费率/滑点/开关等）后热同步到运行实例，
+// 无需重建引擎即可生效（此前配置在创建时一次性快照，改配置不反映到已运行账号）。
+// English: S2 hot-sync — push updated account-level paper config into a running engine without rebuild.
+func (e *Engine) UpdateConfig(cfg Config) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg = cfg
+}
+
 // SetMirror 注入账本镜像回调（阶段1.2 两本账合一，由 engine/registry 在创建账号模拟盘时调用）。
 // open 在新开仓后触发（手动买入含、加仓不含）；close 仅整笔清仓触发（部分减仓不含）。
 // 回调内部不得再调用本引擎方法（避免锁递归）；nil 安全。
@@ -1786,13 +1795,23 @@ func (e *Engine) ResetPool(key string) {
 	closed := 0
 	for code, p := range e.positions {
 		if p.StrategyType == key {
-			proceeds += p.MarketValue()
+			// §修复 S6（2026-08-29）：清盘回补现金优先用估值价(Mark)，未估值(Mark<=0，盘后/
+			// 未快照)按成本(Cost)回补，避免现金凭空消失、破坏分仓守恒。
+			mv := p.MarketValue()
+			markPrice := p.Mark
+			if p.Mark <= 0 && p.Cost > 0 {
+				mv = p.Cost
+				if p.CostPrice > 0 {
+					markPrice = p.CostPrice
+				}
+			}
+			proceeds += mv
 			delete(e.positions, code)
 			closed++
-			// 清盘镜像（阶段1.2）：report 账对应记录同步平仓（按估值价结算）。
+			// 清盘镜像（阶段1.2）：report 账对应记录同步平仓（按估值价/成本价结算）。
 			// English: liquidation mirror (unified books) — the report-book record closes in sync
-			// (settled at the mark price).
-			e.mirrorCloseLocked(code, p.Mark, float64(p.Qty), "分仓清盘")
+			// (settled at the mark/cost price).
+			e.mirrorCloseLocked(code, markPrice, float64(p.Qty), "分仓清盘")
 		}
 	}
 	if proceeds > 0 {
@@ -2195,10 +2214,11 @@ type PoolBuyRule struct {
 
 // poolDiscipline 每池买入纪律运行时状态（不持久化，重启重置——保守安全）。
 type poolDiscipline struct {
-	buysToday  int       // 今日已买次数
-	lastBuyAt  time.Time // 最近一次买入时间
-	spentToday float64   // 今日已花费金额（元）
-	day        string    // 当前日期（跨日自动重置）
+	buysToday     int       // 今日已买次数
+	lastBuyAt     time.Time // 最近一次买入时间
+	spentToday    float64   // 今日已花费金额（元）
+	dayStartCash  float64   // §修复 S7：本日开始时池现金（预算分母，避免越买分母越小越松）
+	day           string    // 当前日期（跨日自动重置）
 }
 
 // checkPoolDisciplinePre 分仓纪律预检查（不需要 cost）：日限次数+冷却+评分门槛。
@@ -2250,8 +2270,13 @@ func (e *Engine) checkPoolBudget(poolKey string, cost float64) string {
 		return ""
 	}
 	d := e.poolDiscipline[poolKey]
-	poolCash := e.pools[poolKey]
-	budget := poolCash * rule.BudgetPctPerDay / 100
+	// §修复 S7（2026-08-29）：预算分母用"本日开始时池现金"而非当前缩水池现金，
+	// 否则越买分母越小、限制越松，违背"全天动用≤池资金 X%"语义。
+	baseCash := d.dayStartCash
+	if baseCash <= 0 {
+		baseCash = e.pools[poolKey] // 尚未记录日初现金时退回当前池现金
+	}
+	budget := baseCash * rule.BudgetPctPerDay / 100
 	if d.spentToday+cost > budget {
 		return fmt.Sprintf("日内预算超限(%.0f+%.0f>%.0f)", d.spentToday, cost, budget)
 	}
@@ -2264,7 +2289,8 @@ func (e *Engine) recordPoolBuy(poolKey string, cost float64) {
 	today := cntime.DayOf(now) // §TZ1
 	d, ok := e.poolDiscipline[poolKey]
 	if !ok || d.day != today {
-		e.poolDiscipline[poolKey] = poolDiscipline{day: today}
+		// §修复 S7：跨日重置时记录本日开始时池现金作为预算分母基准。
+		e.poolDiscipline[poolKey] = poolDiscipline{day: today, dayStartCash: e.pools[poolKey]}
 		d = e.poolDiscipline[poolKey]
 	}
 	d.buysToday++

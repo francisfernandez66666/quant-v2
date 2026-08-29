@@ -550,14 +550,15 @@ func pureTsCode(tsCode string) string {
 }
 
 // sellRealPosition 通过控制器对单一实盘持仓下卖出单。行情缺失时跳过（宁可不卖不以错价报单）。
-func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, price float64, class, reason string) error {
+// §修复 R6（2026-08-29）：qty 显式传入（补卖时传剩余量），signalID 由调用方按"剩余量桶"生成，
+// 确保首笔仅部成时仍能对剩余仓位开新单，而非被日级幂等键永久拦截。
+func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string) error {
 	cfg := ctrl.Config()
-	qty := p.Qty
 	if qty <= 0 || price <= 0 {
 		return nil
 	}
 	res, err := ctrl.PlaceOrder(trading.OrderRequest{
-		SignalID:  realSellSignalID(p.TsCode, class),
+		SignalID:  signalID,
 		Code:      p.TsCode,
 		Name:      p.Name,
 		Strategy:  p.Strategy,
@@ -576,9 +577,6 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		// §GAP2-W1 语义更新：duplicate 现在只可能意味着"当日同类卖单已真实报出"
 		// （发送失败的单会经 MarkRealOrderSendFailed→ResetFailedRealOrder 放行重试，
 		// 不再以 duplicate 形态出现），因此幂等命中=目标已达成，静默返回是正确行为。
-		// English: §GAP2-W1 semantics: duplicate now strictly means "this day's same-class sell was
-		// genuinely sent" — failed sends are retried via the send-failed demotion path instead of
-		// surfacing as duplicates, so an idempotent hit equals mission accomplished.
 		return nil // 当日已下过同类卖单（幂等命中），静默
 	}
 	log.Printf("[qmt] 自动卖出 %s(%s) %d股 @%.2f 类别=%s 原因=%s → %+v",
@@ -613,7 +611,17 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 		if !ok || a.RefPrice <= 0 {
 			continue
 		}
-		_ = e.sellRealPosition(ctrl, p, a.RefPrice, "止损", a.Reason)
+		// §修复 R6：日级幂等键 sell:<code>:止损:<交易日> 统计已成交数量，仅对"剩余未成交"部分补卖；
+		// 信号键追加 :r<剩余量> 桶——剩余量变化才开新单，避免部成后死循环重复下单，
+		// 也保证同日同剩余量不重复刷单（broker 仍在处理该笔时）。
+		base := realSellSignalID(p.TsCode, "止损")
+		filled := realStore.SumFilledQty(userID, base)
+		remaining := p.Qty - filled
+		if remaining <= 0 {
+			continue
+		}
+		sid := fmt.Sprintf("%s:r%d", base, remaining)
+		_ = e.sellRealPosition(ctrl, p, remaining, sid, a.RefPrice, "止损", a.Reason)
 	}
 }
 
@@ -649,8 +657,15 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		peak = e.loadM8Peak()
 	}
 	rc := cfgMgr.GetRulesFor(userID).RiskCtrl
-	if !rc.M8Enabled || rc.M8PortfolioDrawdownPct >= 0 {
-		return // 未启用或阈值配置非法（应为负值）
+	// §修复 R7（2026-08-29）：阈值接受正数（更直观，"回撤 10% 触发"直接写 10）或负数（旧口径）；
+	// 一律归一为负值口径参与比较，避免误填 0/正值导致 M8 静默失效且无告警。
+	// 0 或未设置视为关闭。
+	thr := rc.M8PortfolioDrawdownPct
+	if thr > 0 {
+		thr = -thr
+	}
+	if !rc.M8Enabled || thr >= 0 {
+		return // 未启用或阈值未配置（0）
 	}
 	total := 0.0
 	for _, p := range positions {
@@ -674,19 +689,26 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		e.saveM8Peak(newPeak)
 		peak = newPeak
 	}
-	// 组合回撤触发判定（与 risk.Engine.M8Check 同式：drawdown 为负值）
+	// 组合回撤触发判定（drawdown 为负值，与归一后的 thr 同口径比较）
 	drawdown := (total - peak) / peak * 100
-	if drawdown > rc.M8PortfolioDrawdownPct {
+	if drawdown > thr {
 		return
 	}
 	log.Printf("[qmt] M8 兜底触发: 组合市值 %.0f 自峰值 %.0f 回撤 %.1f%% ≤ 阈值 %.1f%% —— 全部自动卖出",
-		total, peak, drawdown, rc.M8PortfolioDrawdownPct)
+		total, peak, drawdown, thr)
 	for _, p := range positions {
 		price := p.CostPrice
 		if q := quotes[pureTsCode(p.TsCode)]; q != nil && q.Price > 0 {
 			price = q.Price
 		}
-		_ = e.sellRealPosition(ctrl, p, price, "m8", fmt.Sprintf("M8组合回撤%.1f%%兜底清仓", drawdown))
+		// §修复 R6：M8 清仓同样走剩余量补卖逻辑（按 code:day 桶统计已成交，剩余量>0 才发单）。
+		base := realSellSignalID(p.TsCode, "m8")
+		filled := realStore.SumFilledQty(userID, base)
+		remaining := p.Qty - filled
+		if remaining > 0 {
+			sid := fmt.Sprintf("%s:r%d", base, remaining)
+			_ = e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", fmt.Sprintf("M8组合回撤%.1f%%兜底清仓", drawdown))
+		}
 	}
 }
 

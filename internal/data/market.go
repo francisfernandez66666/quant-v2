@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"bytes"
 	urlpkg "net/url"
 	"regexp"
 	"sort"
@@ -20,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
@@ -270,7 +274,30 @@ func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) 
 		m.emRecord(scope, err)
 		return nil, err
 	}
-	// 到达 HTTP 层即视为东财连通，清零该接口熔断计数（业务层解析错误由调用方另判）。
+	// §修复 D2（2026-08-29）：东财反爬常返回 200 但空体/非 JSON（geo-block 或风控），
+	// 旧逻辑仅 HTTP 失败才计熔断、到达 HTTP 层即清零 → 空体风暴下熔断永不触发，
+	// 每次都把空体丢给上层解析失败重试。现对非 200 与空体（ContentLength==0）直接
+	// 计为失败并快速失败，让熔断窗口正确开启、走既有降级/缓存路径。
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		m.emRecord(scope, fmt.Errorf("eastmoney http status %d", resp.StatusCode))
+		return nil, fmt.Errorf("eastmoney http status %d (%s)", resp.StatusCode, scope)
+	}
+	// §修复 D2（2026-08-29）：东财反爬常返回 200 + HTML（geo-block/风控）而非 JSON。
+	// 旧逻辑仅 HTTP 失败才计熔断、到达 HTTP 层即清零 → 反爬风暴下熔断永不触发，
+	// 每次都把 HTML 丢给上层解析失败重试。现读取 body 窥探：首字节为 '<'（HTML）即视为
+	// 失败并计熔断，让熔断窗口正确开启、走既有降级/缓存路径；否则原样回封装供下游解析。
+	raw, rerr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if rerr != nil {
+		return nil, fmt.Errorf("eastmoney read: %v", rerr)
+	}
+	if len(raw) > 0 && raw[0] == '<' {
+		m.emRecord(scope, fmt.Errorf("eastmoney anti-crawler html"))
+		return nil, fmt.Errorf("eastmoney returned html (anti-crawler) (%s)", scope)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(raw))
+	// 到达 HTTP 层且确为 JSON 即视为东财连通，清零该接口熔断计数（业务层解析错误由调用方另判）。
 	m.emRecord(scope, nil)
 	return resp, nil
 }
@@ -1077,7 +1104,9 @@ func parseEastMoneyKLine(rawLines []string) ([]KLine, error) {
 			High:   toFloat64(parts[2]),
 			Low:    toFloat64(parts[3]),
 			Close:  toFloat64(parts[4]),
-			Volume: toFloat64(parts[5]),
+			Volume: toFloat64(parts[5]) * 100, // §修复 D1（2026-08-29）：东财 push2 kline volume 单位为手，
+			// 实时行情 F47 已按 手→股(×100) 对齐（见 stockQuote 解析），此处漏乘导致 K 线量纲偏小、
+			// 量比/换手等指标与实时口径不一致。统一乘 100 归为股。
 			Amount: toFloat64(parts[6]),
 		})
 	}
@@ -1088,6 +1117,24 @@ func parseEastMoneyKLine(rawLines []string) ([]KLine, error) {
 
 // GetSinaNews 获取新浪财经新闻（快讯/滚动）。
 // pageSize 限制返回条数。
+// ValidateKLine §修复 D8（2026-08-29）：复权/解析异常的 K 线（复权口径错乱、脏数、零/负收盘价）
+// 会污染下游均线/涨跌幅/打分。此处做粗粒度断言：丢弃含零/负收盘价或 NaN 的序列，
+// 迫使上层降级链回落到第二源，而非把错误数据喂给指标计算。
+func ValidateKLine(klines []KLine) bool {
+	if len(klines) == 0 {
+		return false
+	}
+	for _, k := range klines {
+		if k.Close <= 0 || k.Open <= 0 || k.High <= 0 || k.Low <= 0 {
+			return false
+		}
+		if math.IsNaN(k.Close) || math.IsNaN(k.Volume) {
+			return false
+		}
+	}
+	return true
+}
+
 // GetSinaNews fetches Sina Finance flash/rolling news capped by pageSize.
 func (m *MarketAPI) GetSinaNews(pageSize int) ([]NewsItem, error) {
 	url := fmt.Sprintf("https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&knum=%d", pageSize)
@@ -1498,11 +1545,13 @@ func listingStatus(listingDate string) string {
 	if listingDate == "" {
 		return "U"
 	}
-	t, err := time.Parse("20060102", listingDate)
+	// §修复 D5（2026-08-29）：上市日期按中国时区解析并比对，避免服务器 UTC 时区下
+	// "当日上市"被误判为未上市(U)，导致新股当日被过滤出研究池。
+	t, err := time.ParseInLocation("20060102", listingDate, cntime.Loc)
 	if err != nil {
 		return "U"
 	}
-	if t.After(time.Now()) {
+	if t.After(cntime.Now()) {
 		return "U"
 	}
 	return "L"

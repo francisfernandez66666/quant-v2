@@ -146,6 +146,15 @@ class XtBroker(Broker):
         with self._lock:
             if self._connected:
                 return True
+            # §修复 G4（2026-08-29）：重连前先停掉旧 trader，避免旧实例仍持有订阅、
+            # 与新 trader 重复推送回报（双份成交回调）。首次连接 _trader 为 None 跳过。
+            if self._trader is not None:
+                try:
+                    self._trader.stop()
+                except Exception:  # noqa: BLE001
+                    log.warning("[broker] stop stale trader on reconnect failed")
+                self._trader = None
+                self._acc = None
             trader = XtQuantTrader(self.path, self.session_id)
             if trader.start() is not None:  # 0 表示启动成功
                 raise RuntimeError("XtQuantTrader.start() failed")

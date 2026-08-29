@@ -268,28 +268,29 @@ func lookupHithinkQuote(quotes map[string]*StockInfo, code string) *StockInfo {
 // 新浪/腾讯/同花顺/东财顺序，东财恒为最后兜底项。
 // English: GetKLine fetches K-lines: Sina → Tencent → THS → EastMoney (EastMoney always last).
 func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, error) {
+	// §修复 D6（2026-08-29）：东财 push2 是复权口径锁定(fqt=qfq)、量纲已对齐(×100)的最稳源，
+	// 此前被排到链尾仅在三源全崩时兜底，日常却优先撞新浪/腾讯易被 IP 封禁的源。
+	// 改为东财首选，新浪/腾讯/同花顺作降级（东财触发熔断时自动回落到免费源）。
+	if klines, err := dc.eastMoney.GetKLine(code, period, count); err == nil && ValidateKLine(klines) {
+		return klines, nil
+	}
 	if period == "101" {
-		// §GAP3.6 日线降级链补全（原仅 新浪→东财 两级）：新浪 → 腾讯 → 同花顺 → 东财，
-		// 腾讯日K客户端此前已实现但未接入，作为新浪被 IP 封禁时的主力兜底。
-		if klines, err := dc.eastMoney.GetSinaKLine(code, count); err == nil && len(klines) > 0 {
+		// 新浪/腾讯日K作为东财熔断或限流时的降级；腾讯日K此前已实现但未接入主链。
+		if klines, err := dc.eastMoney.GetSinaKLine(code, count); err == nil && ValidateKLine(klines) {
 			return klines, nil
 		}
-		if klines, err := dc.eastMoney.GetTencentKLine(code, count); err == nil && len(klines) > 0 {
+		if klines, err := dc.eastMoney.GetTencentKLine(code, count); err == nil && ValidateKLine(klines) {
 			return klines, nil
 		}
 		if dc.thsAvailable() {
 			thsKL, thsErr := dc.ths.GetTHSKLine(code)
-			if thsErr == nil && len(thsKL) > 0 {
+			if thsErr == nil && ValidateKLine(thsKL) {
 				return thsKL, nil
 			} else if thsErr != nil {
 				dc.tripThs()
 				log.Printf("同花顺日线失败 (%s): %v, 熔断60s", code, thsErr)
 			}
 		}
-	}
-
-	if klines, err := dc.eastMoney.GetKLine(code, period, count); err == nil && len(klines) > 0 {
-		return klines, nil
 	}
 	return nil, fmt.Errorf("所有K线源均失败 for %s", code)
 }

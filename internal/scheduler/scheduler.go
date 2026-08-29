@@ -65,6 +65,7 @@ type Scheduler struct {
 	storeReset    bool                // 启动恢复是否已执行（running→preempted）
 	busy          bool                // 是否有任务子进程在跑（原 jobRunning）
 	taskCancel    context.CancelFunc  // 当前任务取消函数（kill 用）
+	curCmd        *exec.Cmd           // §修复 S3：当前子进程（整组击杀用，含孙进程）
 	curTask       *store.ResearchTask // 当前运行任务
 	preemptReq    bool                // 抢占请求（会话开始/禁用/high 到来）
 	cancelReq     bool                // 用户取消请求（control=cancel 消费后置位）

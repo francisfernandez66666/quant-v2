@@ -360,8 +360,11 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		}
 	}
 
-	// 白名单过滤：strategies 非空且不含该策略时拒绝
-	if len(cfg.Strategies) > 0 && req.Strategy != "" {
+	// 白名单过滤：strategies 非空且不含该策略时拒绝。**仅作用于买入方向**——
+	// §安全 T2（2026-08-29）：此前无 SideBuy 限制，一旦配置了白名单且不含持仓战法，
+	// auto 止损卖单 / M8 清仓卖单会被拒 → 止损不执行，资损。卖出不受白名单约束（退出的持仓
+	// 其战法可能未在白名单，但退出是既有风险敞口的了结，不应被拦）。
+	if req.Side == SideBuy && len(cfg.Strategies) > 0 && req.Strategy != "" {
 		allowed := false
 		for _, s := range cfg.Strategies {
 			if s == req.Strategy {
@@ -548,14 +551,18 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 	// buy discipline as an extra hard gate when fresh (≤10min). Broker cash already nets out its
 	// own frozen amounts, so local `spent` is NOT subtracted again (no double-count); the legacy
 	// approximation still runs in parallel — both gates must pass.
+	// §R4-3 真实可用资金回灌：网关 account 事件（broker.query_asset）落库的券商口径可用资金，
+	// 在新鲜（10 分钟内）时作为额外硬约束。券商 cash 口径已扣除其侧冻结（含已报未成交单），
+	// 故此处不再扣减本地 spent，避免与券商冻结双重扣减；近似口径检查仍然并行生效——
+	// 两道闸都过才放行，任一拒绝即拒单。
+	// 说明（2026-08-29）：AvailableCash<=0 视为"券商尚未回报可用资金/未接通"→ 跳过本闸，
+	// 由上方 InitialCapital-held-spent 近似口径继续守卫（fail-open 但有近似闸兜底）。
+	// 若需"券商明确回报 0 即拒单"，需新增"已回报"标志位区分，避免阻断 mock/刚连场景的合法买入。
 	if acc, err := c.store.GetRealAccount(c.userID); err == nil && acc.AvailableCash > 0 {
 		at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc)
 		if perr == nil {
-			// §P1-16 保守口径：快照新鲜（≤10min）用全额可用；陈旧（断开/长时间未上报）则用 50%
-			// 作为上限，避免券商侧已冻结/已用资金未知时过量下单（缺失即拒绝而非放行）。
-			// English: P1-16 conservative gate — fresh snapshot uses full available cash; a stale one
-			// (disconnected / long-unreported) caps at 50% so we never over-commit when the broker's
-			// frozen/spent state is unknown. Absence of snapshot rejects rather than passes.
+			// 保守口径：快照新鲜（≤10min）用全额可用；陈旧（断开/长时间未上报）则用 50%
+			// 作为上限，避免券商侧已冻结/已用资金未知时过量下单。
 			cap := acc.AvailableCash
 			fresh := time.Since(at) <= 10*time.Minute
 			if !fresh {

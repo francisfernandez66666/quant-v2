@@ -16,6 +16,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // MacroEvent 宏观事件定义
@@ -137,7 +139,9 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 			log.Printf("[macro] 补充事件格式非法（应为 标题→日期|impact[|duration]），跳过: %q → %q", title, spec)
 			continue
 		}
-		d, err := time.Parse("2006-01-02", strings.TrimSpace(parts[0]))
+		// §修复 D4（2026-08-29）：事件日期按北京时区解析，避免 UTC 主机上日期边界错 8 小时
+		// （交割日/高影响门控可能早/晚一天触发）。
+		d, err := time.ParseInLocation("2006-01-02", strings.TrimSpace(parts[0]), cntime.Loc)
 		if err != nil {
 			log.Printf("[macro] 补充事件日期解析失败，跳过: %q → %q (%v)", title, spec, err)
 			continue
@@ -192,7 +196,7 @@ func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 		}
 	}
 	*events = append(*events, MacroEvent{
-		Date:     time.Now(),
+		Date:     cntime.Now(),
 		Title:    title,
 		Level:    "war",
 		Impact:   "high",
@@ -361,7 +365,7 @@ type ChatFunc func(system, user string) (string, error)
 // LLMCalendarPrompt 生成日历专属的 system+user prompt
 // English: LLMCalendarPrompt generates the calendar-specific system+user prompt.
 func LLMCalendarPrompt(months int) (string, string) {
-	now := time.Now()
+	now := cntime.Now()
 	end := now.AddDate(0, months, 0)
 	system := "你是一个A股宏观日历助手。返回纯JSON数组，不要任何其他文字。事件类型以下划线命名：cpi/nfp/pce/fomc/contract/geo/other"
 	user := "生成" + now.Format("2006-01") + "至" + end.Format("2006-01") + "间的宏观事件。具体要求：\n" +
@@ -459,7 +463,7 @@ type CalendarCacheFile struct {
 // English: SaveCalendarCache writes the calendar events to a cache file.
 func SaveCalendarCache(filePath string, events []MacroEvent) error {
 	cached := CalendarCacheFile{
-		Date:   time.Now().Format("2006-01-02"),
+		Date:   cntime.DayOf(time.Now()),
 		Events: events,
 	}
 	data, err := json.Marshal(cached)
@@ -482,7 +486,7 @@ func LoadCalendarCache(filePath string) (events []MacroEvent, ok bool) {
 	if err := json.Unmarshal(data, &cached); err != nil {
 		return nil, false
 	}
-	if cached.Date != time.Now().Format("2006-01-02") {
+	if cached.Date != cntime.DayOf(time.Now()) {
 		return nil, false // 缓存过期
 		// English: Cache expired.
 	}

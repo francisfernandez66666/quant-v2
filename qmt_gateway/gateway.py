@@ -118,14 +118,22 @@ def lot_rule(code, side):
     """§G7 分板块申报单位。
 
     返回 (min_qty:int, step:int)：
-      创业板(30)/科创板(68)：最低 200 股、之后 1 股递增；
-      主板/其他：100 股整手。
+       科创板(688)：最低 200 股、1 股递增；
+       创业板(300/301)：最低 100 股、1 股递增；
+       北交所(920/83/87/43 等 8/4 开头)：最低 100 股、1 股递增；
+       主板/其他：100 股整手。
+    §修复 T4（2026-08-29）：此前 创业板与科创板同判 200 股 → 所有合法创业板 100 股小单被拒、
+    整板无法成交。现拆分。
     卖方向允许任意 ≥1 股（送转零股、基金零股清仓是交易所允许的），由调用方放宽。
     """
     head = _code_head(code)
-    if head[:2] in ("30", "68"):
-        return 200, 1
-    return 100, 100
+    if head[:2] == "68":
+        return 200, 1   # 科创板 688：最低 200 股、1 股递增
+    if head[:2] == "30":
+        return 100, 1   # 创业板 300/301：最低 100 股、1 股递增
+    if head[:2] == "92" or head[:1] in ("8", "4"):
+        return 100, 1   # 北交所（920/83/87/43 等）：最低 100 股、1 股递增
+    return 100, 100     # 主板/其他：100 股整手
 
 
 class Gateway:
@@ -147,13 +155,21 @@ class Gateway:
         self.allowed_ips = []
 
     def start(self):
-        # §G1 启动检查：残留 pending 占位 = 上次进程在下单窗口内 crash，
-        # 这些 signal_id 永久阻塞（安全侧失效），需人工核对券商侧是否已有委托。
-        pendings = self.store.list_pending()
-        for p in pendings:
-            log.warning("[gateway] STALE pending order from previous crash: signal_id=%s "
-                        "code=%s side=%s qty=%s — blocked to prevent duplicate real order; "
-                        "verify against broker and resolve manually",
+        # §修复 T5（2026-08-29）：启动时先清理「超时残留 pending 占位」——上次进程在下单窗口内 crash
+        # 留下的 pending 行会永久阻塞 signal_id（首尔重试恒得 409 duplicate in-flight）。删除超过
+        # 10 分钟的残留占位行，安全解锁；仍在 10 分钟内的（极短窗口内刚崩溃）保留并告警，避免
+        # 与可能已真实发出的券商委托冲突。
+        released = 0
+        try:
+            released = self.store.release_stale_pending(max_age_sec=600)
+        except Exception as _e:  # noqa: BLE001 — 清理解放失败不应阻断启动
+            log.warning("[gateway] 清理残留 pending 失败: %s", _e)
+        if released:
+            log.warning("[gateway] 已释放 %d 个超时残留 pending 占位（崩溃恢复，避免 signal_id 永久死锁）", released)
+        # 仍存在的 pending（10 分钟内、可能对应真实在途委托）仅告警，不自动释放，需人工核对券商侧。
+        for p in self.store.list_pending():
+            log.warning("[gateway] STALE pending order (within 10min, verify against broker): signal_id=%s "
+                        "code=%s side=%s qty=%s",
                         p.get("signal_id"), p.get("code"), p.get("side"), p.get("qty"))
         # 回报 outbox 发送线程
         self.handler.start_sender()

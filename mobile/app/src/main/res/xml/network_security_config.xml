@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 网络安全配置：仅放行应用自己的云服务器域名（HTTPS 默认允许）。
-     usesCleartextTraffic=true 是为兼容"先用 http://IP 验证"的阶段；
-     生产走 https 域名时明文流量被系统拦截（Android 9+ 默认禁明文），此处无需额外白名单。 -->
+<!-- 网络安全配置（§安全 T6，2026-08-29）：
+     - 生产(release)：base-config 禁止一切明文(http)流量，仅 https 放行；
+       用户若在设置里填入 http 地址，系统在 release 下直接拦截，避免 token 明文传输/中间人注入。
+     - 仅 localhost / 模拟器回环(127.0.0.1 / 10.0.2.2 / localhost) 允许明文，供 debug 局域网联调。 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
 </network-security-config>

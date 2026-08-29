@@ -6,6 +6,7 @@ package calendar
 import (
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 )
 
@@ -39,11 +40,11 @@ func New(events []config.CalendarEvent) *Calendar {
 // （UpcomingEvents returns events scheduled within the next days days. DaysAdvance controls how early
 // an event shows up; in-progress (already started but not ended) events are also included.）
 func (c *Calendar) UpcomingEvents(days int) []Event {
-	now := time.Now()
+	now := cntime.Now()
 	var out []Event
 	for _, e := range c.events {
 		// 解析事件日期，格式非法的事件直接跳过
-		t, err := time.Parse("2006-01-02", e.Date)
+		t, err := time.ParseInLocation("2006-01-02", e.Date, cntime.Loc)
 		if err != nil {
 			continue
 		}

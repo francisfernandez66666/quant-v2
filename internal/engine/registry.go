@@ -434,6 +434,24 @@ func (r *Registry) SetPaperPools(types []string) {
 	}
 }
 
+// SetPaperConfig §修复 S2（2026-08-29）：后台更新账户级模拟盘配置后热同步到模板与所有运行中的账号实例。
+// 此前 paper.New 在创建时一次性快照 r.opts.Paper.Cfg()，之后改费率/滑点/开关对运行账号不生效。
+// English: S2 — update account-level paper config on the template and push it to every running engine.
+func (r *Registry) SetPaperConfig(cfg paper.Config) {
+	if r.opts.Paper != nil {
+		r.opts.Paper.UpdateConfig(cfg)
+	}
+	r.mu.Lock()
+	pes := make([]*paper.Engine, 0, len(r.papers))
+	for _, pe := range r.papers {
+		pes = append(pes, pe)
+	}
+	r.mu.Unlock()
+	for _, pe := range pes {
+		pe.UpdateConfig(cfg)
+	}
+}
+
 // SetPaperLabelResolver 注入规则池 ID → 显示名 解析器（§C 规则细分池：fac_1→"因子战法#1"）。
 // 同步到所有已建账号引擎并记住，供后续懒加载的新账号引擎继承。
 // English: injects the rule-pool id→label resolver into every existing paper engine and remembers it

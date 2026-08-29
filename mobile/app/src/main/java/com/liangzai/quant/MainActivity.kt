@@ -14,6 +14,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import com.liangzai.quant.BuildConfig
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -156,7 +157,10 @@ class MainActivity : AppCompatActivity() {
             @android.webkit.JavascriptInterface
             fun setServerUrl(url: String): Boolean {
                 val value = url.trim()
-                if (!java.util.regex.Pattern.matches("^https?://.+", value)) return false
+                // §安全 T6（2026-08-29）：release 构建强制 https（拒绝明文 http，防止 token 明文传输/
+                // 中间人注入）；debug 构建允许 http 便于局域网/模拟器联调。
+                val pattern = if (BuildConfig.DEBUG) "^https?://.+" else "^https://.+"
+                if (!java.util.regex.Pattern.matches(pattern, value)) return false
                 getSharedPreferences("quant_prefs", MODE_PRIVATE)
                     .edit().putString("server_url", value).apply()
                 webView.evaluateJavascript(

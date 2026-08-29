@@ -65,11 +65,25 @@ def bj_count():
 
 
 def discover_running():
-    """返回是否有 discover-factors 进程在跑（scheduler 子进程/手工跑批均可命中）。"""
-    r = subprocess.run(
-        ["pgrep", "-f", "discover-factors"], capture_output=True, text=True
-    )
-    return r.returncode == 0 and bool(r.stdout.strip())
+    """返回是否有夜间研究批（discover-factors / dataload / 调度器 research run-task）在跑。
+
+    §修复 S5（2026-08-29）：原 pgrep 仅匹配 'discover-factors'，但生产实际由 scheduler 以
+    'research run-task --task-id N' 子进程运行，导致等待永远判定"已结束"→ 北交所提前注入，
+    与老池 discover-factors 争用写入、污染研究池。现同时匹配调度器真实命令，且排除本脚本自身。
+    """
+    for pat in ("discover-factors", "research run-task", "research dataload"):
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", pat], capture_output=True, text=True
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if r.returncode == 0 and bool(r.stdout.strip()):
+            # 排除本脚本进程自身（其命令行可能含 'research' 字样时避免误判）
+            pids = [p for p in r.stdout.strip().splitlines() if p.strip().isdigit()]
+            if pids:
+                return True
+    return False
 
 
 def _to_ts(row):

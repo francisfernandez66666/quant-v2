@@ -232,10 +232,16 @@ func (s *Scheduler) preemptCurrent(reason string) {
 	}
 	s.preemptReq = true
 	cancel := s.taskCancel // 可能为 nil（子进程尚未 Start）
+	cur := s.curCmd       // 当前子进程（可能为 nil），用于整组击杀
 	s.mu.Unlock()
 	log.Printf("[scheduler] 终止当前任务 #%d(%s): %s", id, typ, reason)
+	// §修复 S3（2026-08-29）：整组击杀而非仅 SIGKILL 直接子进程。子进程设了 Setpgid，
+	// 孙进程（如 research run-task 派生的计算进程）若只杀直接子进程会成为孤儿继续写库。
+	if cur != nil {
+		killProcessGroup(cur)
+	}
 	if cancel != nil {
-		cancel() // CommandContext 取消 → SIGKILL 子进程
+		cancel() // CommandContext 取消兜底（单杀 + 取消 context）
 	}
 }
 
@@ -339,6 +345,7 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 		s.mu.Lock()
 		s.busy = false
 		s.curTask = nil
+		s.curCmd = nil // §修复 S3：任务结束后清空当前子进程引用
 		s.mu.Unlock()
 		if err != nil {
 			log.Printf("[scheduler] 认领任务 #%d 失败: %v", next.ID, err)
@@ -591,6 +598,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		s.busy = false
 		s.taskCancel = nil
 		s.curTask = nil
+		s.curCmd = nil // §修复 S3：清空当前子进程引用
 		s.paused = false
 		s.mu.Unlock()
 		// 自驱排水：本任务终态落库后立即尝试下一个（不依赖 30s tick）。
@@ -681,6 +689,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	}
 	s.mu.Lock()
 	s.taskCancel = cancel
+	s.curCmd = cmd // §修复 S3：记录当前子进程，抢占时整组击杀含孙进程
 	pendingPreempt := s.preemptReq
 	s.mu.Unlock()
 	if pendingPreempt {

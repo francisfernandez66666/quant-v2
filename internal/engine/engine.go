@@ -3146,8 +3146,10 @@ func (e *Engine) refreshSectors() {
 	log.Printf("[engine] 板块名单刷新: %d 个 (一级行业+概念)", len(boards))
 }
 
-// feedRPS 按当日涨跌幅百分位构造 RPS20/RPS60 近似值并喂给板块验证代理。
-// 真实多周期 RPS 需历史K线（后续 Phase F 可升级），当日涨幅近似足以支撑 RPSRank 排序。
+// feedRPS §修复 D3（2026-08-29）：按多个可得周期构造 RPS 近似值（此前 RPS20/RPS60 用同一
+// 单日涨幅，等价无效）。可用字段：当日涨跌幅 ChangePct（短周期≈RPS20）、两日涨幅 Gain2d
+// （中周期≈RPS60）。真实多周期（5/10/20/60/120/250）百分位仍需历史 K 线（Phase F 升级），
+// 但至少让两个维度反映不同时间窗口，支撑 RPSRank 排序去伪。
 func (e *Engine) feedRPS(boards []data.SectorInfo) {
 	e.mu.RLock()
 	sa := e.sectorAgent
@@ -3157,28 +3159,48 @@ func (e *Engine) feedRPS(boards []data.SectorInfo) {
 	}
 	type br struct {
 		code, name string
-		pct        float64
+		d1, d2     float64
 	}
 	rows := make([]br, 0, len(boards))
 	for _, b := range boards {
 		if b.Name == "" {
 			continue
 		}
-		rows = append(rows, br{code: b.Code, name: b.Name, pct: b.ChangePct})
+		rows = append(rows, br{code: b.Code, name: b.Name, d1: b.ChangePct, d2: b.Gain2d})
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].pct > rows[j].pct })
+	sort.Slice(rows, func(i, j int) bool { return rows[i].d1 > rows[j].d1 })
 	rps := make([]data.SectorRPS, 0, len(rows))
 	for i, r := range rows {
-		rank := 0.0
+		rank20 := 0.0
 		if len(rows) > 1 {
-			// 按当日涨幅排名线性映射 RPS 近似值（第一名≈100，最后一名≈0）
-			rank = 100 * (1 - float64(i)/float64(len(rows)-1))
+			// 按当日涨幅排名线性映射 RPS20 近似值（第一名≈100，最后一名≈0）
+			rank20 = 100 * (1 - float64(i)/float64(len(rows)-1))
+		}
+		// 中周期：用两日涨幅 Gain2d 重新排名（若全 0 退化为单日涨幅）
+		rank60 := rank20
+		if rows[0].d2 != 0 || rows[len(rows)-1].d2 != 0 {
+			// 显式按 Gain2d 排名（避免与上面 d1 排序混淆）
+			order := make([]int, len(rows))
+			for k := range order {
+				order[k] = k
+			}
+			sort.SliceStable(order, func(x, y int) bool { return rows[order[x]].d2 > rows[order[y]].d2 })
+			pos := 0
+			for k, idx := range order {
+				if rows[idx].code == r.code {
+					pos = k
+					break
+				}
+			}
+			if len(rows) > 1 {
+				rank60 = 100 * (1 - float64(pos)/float64(len(rows)-1))
+			}
 		}
 		rps = append(rps, data.SectorRPS{
 			Code:  r.code,
 			Name:  r.name,
-			RPS20: rank,
-			RPS60: rank,
+			RPS20: rank20,
+			RPS60: rank60,
 		})
 	}
 	sa.FeedRPS(rps)

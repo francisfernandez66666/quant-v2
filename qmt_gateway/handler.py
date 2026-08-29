@@ -153,6 +153,8 @@ class ReportHandler:
         """成交回报（xtquant trade 对象）。"""
         self.on_trade({
             "order_id": str(getattr(trade, "order_id", "")),
+            "trade_id": str(getattr(trade, "trade_id", "") or getattr(trade, "order_sysid", "") or ""),
+            "name": getattr(trade, "stock_name", "") or "",
             "code": getattr(trade, "stock_code", ""),
             "side": "买入" if getattr(trade, "order_type", 0) == 1101 else "卖出",
             "price": float(getattr(trade, "traded_price", 0) or 0),
@@ -178,47 +180,60 @@ class ReportHandler:
 
     # ── 事件落库 + 推送 ──
     def on_order(self, ev):
-        # 无 signal_id 的委托忽略（无法归因/幂等）；否则落库并推送首尔
-        if not ev.get("signal_id"):
-            log.info("[handler] order without signal_id, skip: %s", ev)
-            return
-        # §P1-9 落库携带归属账号 ID（多账号隔离）
-        ev["user_id"] = self.user_id
-        self.store.upsert_order(ev)
-        self._push({"type": "order", **ev})
+        # §修复 G3（2026-08-29）：回调体全程异常保护——落库/推送异常绝不应冒泡到 xtquant
+        # 回调线程（否则可能打断通道回调、丢失后续回报）。异常仅记录并降级跳过本事件。
+        try:
+            # 无 signal_id 的委托忽略（无法归因/幂等）；否则落库并推送首尔
+            if not ev.get("signal_id"):
+                log.info("[handler] order without signal_id, skip: %s", ev)
+                return
+            # §P1-9 落库携带归属账号 ID（多账号隔离）
+            ev["user_id"] = self.user_id
+            self.store.upsert_order(ev)
+            self._push({"type": "order", **ev})
+        except Exception:  # noqa: BLE001
+            log.exception("[handler] on_order failed, event skipped: %s", ev)
 
     def on_trade(self, ev):
-        # 成交先落库并去重；重复重放不推送，避免持仓翻倍
-        # §P1-9 落库携带归属账号 ID（多账号隔离）
-        ev["user_id"] = self.user_id
-        pos, is_dup = self.store.apply_fill(ev)
-        if is_dup:
-            log.warning("[handler] duplicate trade replay ignored: %s %s %s@%s x%s",
-                        ev.get("order_id"), ev.get("side"), ev.get("code"),
-                        ev.get("price"), ev.get("qty"))
-            return
-        self._push({"type": "trade", **ev})
+        # §修复 G3（2026-08-29）：回调异常保护（见 on_order 说明）。
+        try:
+            # 成交先落库并去重；重复重放不推送，避免持仓翻倍
+            # §P1-9 落库携带归属账号 ID（多账号隔离）
+            ev["user_id"] = self.user_id
+            pos, is_dup = self.store.apply_fill(ev)
+            if is_dup:
+                log.warning("[handler] duplicate trade replay ignored: %s %s %s@%s x%s",
+                            ev.get("order_id"), ev.get("side"), ev.get("code"),
+                            ev.get("price"), ev.get("qty"))
+                return
+            self._push({"type": "trade", **ev})
+        except Exception:  # noqa: BLE001
+            log.exception("[handler] on_trade failed, event skipped: %s", ev)
 
     def on_positions(self, positions):
         """全量对账 + 推送。§G5：空快照守卫——只有连续两次空快照且本地有持仓才接受清空。"""
-        if not positions:
-            held = len(self.store.list_positions())
-            self._empty_snaps += 1
-            if held == 0:
-                return  # 本来就无持仓，无事可做
-            if self._empty_snaps < 2:
-                log.warning("[handler] empty positions snapshot #%d — reconcile skipped "
-                            "(防通道异常清空账本)", self._empty_snaps)
-                return
-            log.warning("[handler] two consecutive empty snapshots — accepting full clear")
-        else:
-            self._empty_snaps = 0
-        # §P1-9 对账持仓逐条补归属账号 ID（多账号隔离）
-        for p in positions:
-            p["user_id"] = self.user_id
-        n = self.store.reconcile_positions(positions)
-        log.info("[handler] reconciled %d positions", n)
-        self._push({"type": "positions", "positions": list(positions)})
+        # §修复 G3（2026-08-29）：回调异常保护（见 on_order 说明）。
+        try:
+            if not positions:
+                held = len(self.store.list_positions())
+                self._empty_snaps += 1
+                if held == 0:
+                    return  # 本来就无持仓，无事可做
+                if self._empty_snaps < 2:
+                    log.warning("[handler] empty positions snapshot #%d — reconcile skipped "
+                                "(防通道异常清空账本)", self._empty_snaps)
+                    return
+                log.warning("[handler] two consecutive empty snapshots — accepting full clear")
+            else:
+                self._empty_snaps = 0
+            # §P1-9 对账持仓逐条补归属账号 ID（多账号隔离）
+            for p in positions:
+                p["user_id"] = self.user_id
+            n = self.store.reconcile_positions(positions)
+            log.info("[handler] reconciled %d positions", n)
+            self._push({"type": "positions", "positions": list(positions)})
+        except Exception:  # noqa: BLE001
+            log.exception("[handler] on_positions failed, reconcile skipped")
 
     def on_account(self, asset):
         """账户资产回报（可用资金/冻结/总值/市值）。asset 为 None 时跳过（查询失败）。"""

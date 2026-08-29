@@ -56,6 +56,7 @@ type RealFill struct {
 	ID       int64   `json:"id"`
 	OrderID  string  `json:"order_id"`          // 订单ID
 	Code     string  `json:"code"`              // 代码
+	Name     string  `json:"name"`              // 名称（成交回报携带，建仓回填）
 	Side     string  `json:"side"`              // 方向
 	Price    float64 `json:"price"`             // 价格
 	Qty      int     `json:"qty"`               // 数量
@@ -99,9 +100,35 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 		}
 	}
 	// 移除网关推送中已不存在的持仓（全量对账语义）。
+	// §修复 R9（2026-08-29）：原 len(pos)==0 分支是 `DELETE FROM real_positions` 全表删除，
+	// 多租户下任一账号推送空快照即清掉所有账号持仓（清库炸弹）。现按 user_id 作用域删除：
+	// 仅当 pos 含归属账号时才限定到这些账号行；无归属账号(旧单租户/测试)保留原行为。
+	userSet := make(map[string]bool)
+	for _, p := range pos {
+		if p.UserID != "" {
+			userSet[p.UserID] = true
+		}
+	}
 	if len(pos) == 0 {
-		if _, err := tx.Exec(`DELETE FROM real_positions`); err != nil {
-			return 0, err
+		if len(userSet) == 0 {
+			// 旧单租户 / 测试：保留原整表清空语义
+			if _, err := tx.Exec(`DELETE FROM real_positions`); err != nil {
+				return 0, err
+			}
+		} else {
+			// 多租户空快照：仅清这些账号行，绝不动他人持仓
+			args := make([]any, 0, len(userSet))
+			ph := ""
+			for u := range userSet {
+				if ph != "" {
+					ph += ","
+				}
+				ph += "?"
+				args = append(args, u)
+			}
+			if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id IN (`+ph+`)`, args...); err != nil {
+				return 0, err
+			}
 		}
 	} else {
 		codes := make([]any, 0, len(pos))
@@ -113,8 +140,26 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 			}
 			placeholders += "?"
 		}
-		if _, err := tx.Exec(`DELETE FROM real_positions WHERE ts_code NOT IN (`+placeholders+`)`, codes...); err != nil {
-			return 0, err
+		if len(userSet) == 0 {
+			// 旧单租户 / 测试：原整表 NOT IN 语义
+			if _, err := tx.Exec(`DELETE FROM real_positions WHERE ts_code NOT IN (`+placeholders+`)`, codes...); err != nil {
+				return 0, err
+			}
+		} else {
+			// 多租户：仅删这些账号、且不在推送集合内的行
+			args := make([]any, 0, len(codes)+len(userSet))
+			ph := ""
+			for u := range userSet {
+				if ph != "" {
+					ph += ","
+				}
+				ph += "?"
+				args = append(args, u)
+			}
+			args = append(args, codes...)
+			if _, err := tx.Exec(`DELETE FROM real_positions WHERE user_id IN (`+ph+`) AND ts_code NOT IN (`+placeholders+`)`, args...); err != nil {
+				return 0, err
+			}
 		}
 	}
 	var n int
@@ -300,10 +345,12 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		// 否则该持仓会落入 user_id='' 的遗留全局行，对所有账号可见，造成跨账号持仓泄漏。
 		err = nil
 		if f.Side == "买入" {
+			// §修复 R8（2026-08-29）：建仓时回填成交携带的 name（此前硬编码空串，
+			// 导致实盘持仓页个股名称为空）。
 			_, err = tx.Exec(`INSERT INTO real_positions
 				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				f.Code, "", f.Qty, f.Price, f.Price*float64(f.Qty), f.Price, "", f.SignalID,
+				f.Code, f.Name, f.Qty, f.Price, f.Price*float64(f.Qty), f.Price, "", f.SignalID,
 				time.Now().Format("2006-01-02 15:04:05"), f.UserID)
 		}
 	case err == nil:
@@ -324,9 +371,11 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 				hi = f.Price
 			}
 			// §实盘账户隔离：加仓时一并回写 user_id，确保归属字段不被旧行残值覆盖。
+			// §修复 R8：加仓时若原持仓 name 为空，用本次成交的 name 回填。
 			_, err = tx.Exec(`UPDATE real_positions SET qty=?, cost_price=?, amount=?,
-				highest_price=?, updated_at=?, user_id=? WHERE ts_code=? AND (user_id='' OR user_id=?)`,
-				newQty, newCost, newCost*float64(newQty), hi, now, ownerID, f.Code, f.UserID)
+				highest_price=?, updated_at=?, user_id=?, name=CASE WHEN name='' OR name IS NULL THEN ? ELSE name END
+				WHERE ts_code=? AND (user_id='' OR user_id=?)`,
+				newQty, newCost, newCost*float64(newQty), hi, now, ownerID, f.Name, f.Code, f.UserID)
 		} else {
 			newQty := p.Qty - f.Qty
 			if newQty < 0 {
@@ -386,6 +435,18 @@ func (d *DB) UpsertRealOrder(o RealOrder) (bool, error) {
 func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 	_, err := d.db.Exec(`UPDATE orders SET status=? WHERE order_id=?`, status, orderID)
 	return err
+}
+
+// SumFilledQty 汇总某账号某 signal_id 的累计成交数量（按 (user_id, signal_id) 过滤）。
+// §修复 R6（2026-08-29）：自动卖出为日级幂等键，若首笔卖单仅部成（部分成交），同日同键重试会被
+// 唯一键判 duplicate 而剩余仓位不再卖出。此处累计已成交数量，供补卖逻辑计算剩余可卖量。
+func (d *DB) SumFilledQty(userID, signalID string) int {
+	var total int
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills WHERE user_id=? AND signal_id=?`,
+		userID, signalID).Scan(&total); err != nil {
+		return 0
+	}
+	return total
 }
 
 // UpdateRealOrderBySignalID 下单回填：把 pend:<signal_id> 占位行的 order_id 替换为网关真实委托号并更新状态。

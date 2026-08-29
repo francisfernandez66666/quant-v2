@@ -758,8 +758,9 @@ export default function Paper() {
         <div style={{ marginBottom: 8 }}><Tag>统计范围：{activePoolLabel}</Tag></div>
       )}
 
-      {/* 绩效统计卡 */}
-      {activeStats && (
+      {/* 绩效统计卡（§安全 F2，2026-08-29）：含自动估值的总资产/市值/已实现盈亏，仅管理员可见；
+          普通用户纯手动记账视图隐藏，避免泄露自动估值口径。 */}
+      {activeStats && isAdmin && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
           <StatCard label="总资产">¥{fmt(activeStats.total_value)}</StatCard>
           <StatCard label="总收益">

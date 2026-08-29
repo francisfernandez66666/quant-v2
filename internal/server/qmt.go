@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -343,6 +344,21 @@ func normalizeTsCode(code string) string {
 // 落库 → SSE 推前端 → 断线触发熔断并告警。
 // English: receives gateway reports (POST /api/qmt/report, Bearer auth). Event types: trade/order/
 // positions/disconnect. Persists → SSE to frontend; disconnect trips the breaker and alerts.
+// normalizeReportSide 将网关回报的 side 字段归一为账本内部标准串（"买入"/"卖出"）。
+// §安全 T3（2026-08-29）：网关若回报 buy/BUY/买入（含首尾空格）等非精确串，ApplyRealFill 仅认
+// "买入"/"卖出"，非精确串会全部走 else（卖）分支 → 持仓被静默清零。此处先归一，非预期值直接报错，
+// 绝不默认走卖。
+func normalizeReportSide(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	switch strings.ToLower(s) {
+	case "buy", "b", "买入", "买":
+		return "买入", nil
+	case "sell", "s", "卖出", "卖":
+		return "卖出", nil
+	}
+	return "", fmt.Errorf("未知回报方向(side=%q)", raw)
+}
+
 func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
 	db := s.researchDB
@@ -383,11 +399,10 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 全表覆盖（空快照会 DELETE FROM real_positions 清全表），多账号下会误删他人持仓、造成
 		// 跨账号持仓泄漏甚至误卖。按用户 reconcile 后，空快照只清空本账号（含遗留全局行），
 		// 绝不波及任何其它账号的数据。
-		// 归属账号优先级：网关显式携带的 user_id > 路由经 token 解析出的账号 uid。
+		// §安全 T1（2026-08-29）：归属账号一律以网关 token 解析出的 uid 为准，
+		// 忽略 body 携带的 user_id——防止持有 A 账号网关 token 者借 ev.UserID 越权写入/清空任意账号持仓。
+		// 此前"网关 user_id > token uid"的优先级是越权写面。
 		owner := uid
-		if ev.UserID != "" {
-			owner = ev.UserID
-		}
 		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions); err != nil {
 			writeError(w, 500, "reconcile positions: "+err.Error())
 			return
@@ -395,6 +410,12 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[trading] 网关全量对账(用户=%s): %d 持仓", owner, n)
 		}
 	case "order":
+		// §安全 T3：委托方向同样归一（仅用于展示，但保持口径一致，避免"BUY"等串污染委托行）。
+		orderSide, oErr := normalizeReportSide(ev.Side)
+		if oErr != nil {
+			writeError(w, 400, oErr.Error())
+			return
+		}
 		if ev.OrderID != "" && ev.SignalID != "" {
 			// §R4-4 委托状态推进：回报的 部成/已成/已撤/部撤/废单 必须写入本地行——
 			// 旧实现 UpsertRealOrder 是 INSERT OR IGNORE（signal_id 冲突即忽略），状态回报被
@@ -408,7 +429,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			if !advanced {
 				if _, err := db.UpsertRealOrder(store.RealOrder{
 					OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
-					Side: ev.Side, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
+					Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
 					CreatedAt: ev.At,
 					UserID:    uid, // §W2-10 委托行打归属账号
 				}); err != nil {
@@ -420,8 +441,14 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 	case "trade":
 		// 成交回报应用到实盘账本（建仓/加仓加权/减仓/清仓）+ 写 fills
+		// §安全 T3：先归一方向，非预期值直接报错，避免误走卖分支清零持仓。
+		tradeSide, sErr := normalizeReportSide(ev.Side)
+		if sErr != nil {
+			writeError(w, 400, sErr.Error())
+			return
+		}
 		if err := db.ApplyRealFill(store.RealFill{
-			OrderID: ev.OrderID, Code: ev.Code, Side: ev.Side, Price: ev.Price,
+			OrderID: ev.OrderID, Code: ev.Code, Side: tradeSide, Price: ev.Price,
 			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: ev.SignalID,
 			UserID: uid, // §W2-10 成交流水打归属账号（幂等键冲突时整体回滚，持仓不重复累加）
 		}); err != nil {
@@ -437,11 +464,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[trading] 网关断线回报，实盘下单已熔断")
 	case "account":
-		// 账户资产回报（可用资金等）：归属优先级同 positions（网关 user_id > token 解析 uid）
+		// 账户资产回报（可用资金等）：归属账号同 positions，一律以网关 token 解析出的 uid 为准（§安全 T1）。
 		owner := uid
-		if ev.UserID != "" {
-			owner = ev.UserID
-		}
 		if len(ev.Asset) == 0 {
 			writeError(w, 400, "empty account asset")
 			return

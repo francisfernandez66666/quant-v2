@@ -125,6 +125,10 @@ class Store:
             if "user_id" not in cols:
                 self._conn.execute(
                     "ALTER TABLE %s ADD COLUMN user_id TEXT DEFAULT ''" % t)
+            if t == "fills" and "trade_id" not in cols:
+                # §修复 G1（2026-08-29）：唯一成交编号列，用于去重（避免部成重复丢单）
+                self._conn.execute(
+                    "ALTER TABLE fills ADD COLUMN trade_id TEXT DEFAULT ''")
         self._conn.commit()
 
     # ── orders ──
@@ -247,6 +251,24 @@ class Store:
             cur = self._conn.execute("SELECT * FROM orders WHERE status = 'pending'")
             return [dict(r) for r in cur.fetchall()]
 
+    def release_stale_pending(self, max_age_sec):
+        """§修复 T5（2026-08-29）：启动时清理崩溃残留的超时 pending 占位。
+
+        claim 成功→settle 前崩溃会在 orders 表留下 status='pending' 行，进程重启后若只 warning
+        不释放，该 signal_id 永久被 claim 占位阻塞（首尔重试恒得 409 'duplicate in-flight'），
+        对应信号永不能再下单。此处删除「创建超过 max_age_sec 秒」的 pending 行，安全解锁。
+        """
+        import time as _time  # noqa: PLC0415
+        threshold = (_time.time() - max_age_sec) if max_age_sec > 0 else 0
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM orders WHERE status = 'pending' AND created_at <> '' "
+                "AND CAST(strftime('%s', created_at) AS INTEGER) < ?",
+                (threshold,),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
     # ── positions ──
     def upsert_position(self, p):
         """upsert 单条持仓，保持 highest_price 单调。"""
@@ -275,7 +297,15 @@ class Store:
             self._conn.commit()
 
     def _fill_is_duplicate(self, f, cutoff):
-        """§G10 时间窗内相同 (order_id,side,price,qty) 视为通道重放。"""
+        """§修复 G1（2026-08-29）：优先用唯一成交编号 trade_id 去重——同一委托的多笔部成
+        (order_id/side/price/qty 完全相同) 不会再被误判为重放而丢单；无 trade_id 时退回
+        原 (order_id,side,price,qty,时间窗) 兼容逻辑。"""
+        tid = str(f.get("trade_id", "") or "")
+        if tid:
+            cur = self._conn.execute(
+                "SELECT 1 FROM fills WHERE trade_id = ? LIMIT 1", (tid,)
+            )
+            return cur.fetchone() is not None
         if not f.get("order_id"):
             return False
         cur = self._conn.execute(
@@ -342,10 +372,11 @@ class Store:
                         (remain, remain * f["price"], f.get("traded_at", ""), f.get("user_id", ""), f["code"]),
                     )
             self._conn.execute(
-                """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id)
-                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, trade_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (f.get("order_id", ""), f["code"], fill_side, f["price"], f["qty"],
-                 f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", ""), f.get("user_id", "")),
+                 f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", ""), f.get("user_id", ""),
+                 str(f.get("trade_id", "") or "")),
             )
             self._conn.commit()
             cur = self._conn.execute(

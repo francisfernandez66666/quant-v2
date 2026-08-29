@@ -30,8 +30,10 @@ class JPushMessageReceiver : JPushMessageReceiver() {
         val alias = jPushMessage.alias
         if (code == 0) {
             Log.d(TAG, "JPush alias 设置成功: $alias")
+            // §修复 F6（2026-08-29）：成功后清空重试计数，否则一次失败周期把计数顶到上限后，
+            // 后续真实失败将永远放弃重试（计数不再清零 → scheduleRetry 直接 return）。
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putBoolean(KEY_ALIAS_SET, true).apply()
+                .edit().putBoolean(KEY_ALIAS_SET, true).remove(KEY_RETRY_COUNT).apply()
         } else {
             Log.e(TAG, "JPush alias 设置失败 code=$code alias=$alias，将重试")
             scheduleRetry(context, alias)
