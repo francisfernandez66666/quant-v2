@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,6 +97,97 @@ func parseBtSummary(out string) string {
 		return "无触发信号"
 	}
 	return strings.Join(rows, "\n")
+}
+
+// numField 从结果 map 抽取数值字段：section 非空时从嵌套对象（如 params）取，否则取顶层。
+// English: extracts a numeric field; when section is set, reads from a nested object (e.g. params).
+func numField(r map[string]any, section, key string) float64 {
+	if section != "" {
+		if sec, ok := r[section].(map[string]any); ok {
+			if v, ok := sec[key].(float64); ok {
+				return v
+			}
+		}
+		return 0
+	}
+	if v, ok := r[key].(float64); ok {
+		return v
+	}
+	return 0
+}
+
+// buildOptimizeSummary 把 optimize 任务的 SWEEP_JSON 输出整理为可读的回测结果文本：
+// 战法说明（寻优目标/组合数）+ 各战法冠军参数与指标 + 核心结论。替代原先仅截取前 100 字符的占位日志。
+// English: turns the optimize task's SWEEP_JSON into a readable result: objective/combination count,
+// per-strategy champion params & metrics, and a core verdict.
+func buildOptimizeSummary(out string) string {
+	lines := strings.Split(out, "\n")
+	var rows []string
+	objectives := map[string]bool{}
+	total := 0
+	bestEv := math.Inf(-1)
+	bestLine := ""
+	for _, line := range lines {
+		m := sweepJSONRe.FindStringSubmatch(line)
+		if len(m) != 2 {
+			continue
+		}
+		var payload struct {
+			Strategy  string           `json:"strategy"`
+			Objective string           `json:"objective"`
+			Results   []map[string]any `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(m[1]), &payload); err != nil {
+			continue
+		}
+		if payload.Objective != "" {
+			objectives[payload.Objective] = true
+		}
+		for _, r := range payload.Results {
+			strat, _ := r["strategy"].(string)
+			if ns, _ := r["no_signal"].(bool); ns {
+				rows = append(rows, fmt.Sprintf("【%s】无触发信号", strat))
+				continue
+			}
+			total++
+			tp := numField(r, "params", "take_profit_pct")
+			sl := numField(r, "params", "stop_loss_pct")
+			hold := numField(r, "params", "hold_days")
+			thr := numField(r, "params", "min_score")
+			wr := numField(r, "", "win_rate")
+			pf := numField(r, "", "profit_factor")
+			ev := numField(r, "", "expectancy")
+			ln := fmt.Sprintf("【%s】止盈%.0f%% 止损%.0f%% 持仓%.0f天 门槛%.0f → 胜率%.1f%% 盈亏比%.2f 期望%.2f%%",
+				strat, tp, sl, hold, thr, wr, pf, ev)
+			if ev > bestEv {
+				bestEv = ev
+				bestLine = ln
+			}
+			rows = append(rows, ln)
+		}
+	}
+	if len(rows) == 0 {
+		return parseBtSummary(out)
+	}
+	header := fmt.Sprintf("全库参数寻优完成：共 %d 组参数组合", total)
+	if len(objectives) > 0 {
+		objs := make([]string, 0, len(objectives))
+		for o := range objectives {
+			objs = append(objs, o)
+		}
+		header += "（目标：" + strings.Join(objs, "/") + "）"
+	}
+	concl := "核心结论："
+	if bestEv > 0 {
+		concl += "存在正期望参数组合，建议取冠军参数小仓位实盘验证；"
+	} else {
+		concl += "未发现正期望组合，当前样本下该目标暂不宜实盘；"
+	}
+	concl += "完整排名见「优化结果 / 参数寻优中心」。"
+	if bestEv > math.Inf(-1) && bestLine != "" {
+		concl += "\n冠军：" + bestLine
+	}
+	return header + "\n" + strings.Join(rows, "\n") + "\n" + concl
 }
 
 // sweepJSONRe 匹配子进程输出的机器可读扫参结果行。
@@ -946,13 +1038,9 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			}
 		case store.TaskBacktestStrategy:
 			if strings.Contains(fullOut, "SWEEP_JSON:") {
-				// §P2 扫参任务：SWEEP_JSON 解析后 TOP-N 落 optimization_results。
-				// 先取前 100 字符作为 result_text 保底
-				if len(fullOut) > 100 {
-					resultText = fullOut[:100]
-				} else {
-					resultText = fullOut
-				}
+				// §P2 扫参任务：SWEEP_JSON 解析后 TOP-N 落 optimization_results，
+				// 并把冠军参数与核心结论整理进 result_text（替代原先仅截取前 100 字符的占位日志）。
+				resultText = buildOptimizeSummary(fullOut)
 				s.saveSweepResults(db, tk.ID, fullOut)
 			} else {
 				log.Printf("[scheduler] 任务 #%d 未检测到 SWEEP_JSON（fullOut len=%d, 前100=%q）",

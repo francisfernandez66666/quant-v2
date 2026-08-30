@@ -272,6 +272,24 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		}
 		if len(all) == 0 {
 			fmt.Println("无有效组合。")
+			// §完善：零触发战法也输出 SWEEP_JSON 标记，使「优化结果」完整呈现（而非静默消失）。
+			// English: even zero-trigger strategies emit a SWEEP_JSON marker so the result list is complete.
+			noSignal := struct {
+				Strategy  string           `json:"strategy"`
+				Objective string           `json:"objective"`
+				NoSignal  bool             `json:"no_signal"`
+				Results   []map[string]any `json:"results"`
+			}{
+				Strategy:  ad.Name(),
+				Objective: obj,
+				NoSignal:  true,
+				Results: []map[string]any{
+					{"strategy": ad.Name(), "strategy_kind": kind, "no_signal": true, "trigger_count": 0},
+				},
+			}
+			if bj, jerr := json.Marshal(noSignal); jerr == nil {
+				fmt.Printf("SWEEP_JSON:%s\n", bj)
+			}
 			continue
 		}
 		// 批冠军终选（平局以触发数多者胜——与 betterOf 同口径）

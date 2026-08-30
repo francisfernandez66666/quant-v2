@@ -381,6 +381,8 @@ export async function fetchKline(code, period, count) {
 // 返回 { code, name, prev_close, points: [{ time, open, high, low, close, volume, amount, dif, dea, bar }] }
 // returns { code, name, prev_close, points: [{ time, open, high, low, close, volume, amount, dif, dea, bar }] }
 export async function fetchMinute(code, scale, count) {
+  // 守卫：code 为空或字符串 "undefined" 时直接抛清晰错误，避免把 undefined 打到后端造成「for undefined」
+  if (!code || code === 'undefined') throw new Error('缺少股票代码，无法获取分时')
   const s = scale || 1
   const c = count || 241
   return request('/api/minute?code=' + encodeURIComponent(code) + '&scale=' + encodeURIComponent(s) + '&count=' + c)
@@ -393,6 +395,8 @@ export async function fetchMinute(code, scale, count) {
 // bids/asks 下标 0 为最优档（买一/卖一），长度 levels（免费源填充前五档，其余零值）
 // bids/asks index 0 is the best level (bid1/ask1), length is `levels` (free source fills five, rest zero)
 export async function fetchDepth(code) {
+  // 守卫：同 fetchMinute，防止把 undefined 代码传给盘口接口
+  if (!code || code === 'undefined') throw new Error('缺少股票代码，无法获取盘口')
   return request('/api/depth/' + encodeURIComponent(code), { timeout: 15000 })
 }
 

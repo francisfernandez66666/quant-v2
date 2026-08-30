@@ -662,19 +662,35 @@ export default function Research() {
   // ===== 回测任务中心 =====
   function toggleAdvice(id) { setAdviceOpen((a) => (a === id ? 0 : id)) }
   function jobParams(j) {
-  // 拼接回测任务的展示参数（起止/止盈/止损/持仓天数等）
+  // 拼接回测任务的展示参数（起止/止盈/止损/持仓天数等；优化类展示寻优目标）
     if (!j.params_json) return ''
     try {
       const p = JSON.parse(j.params_json)
       // 常量 p：局部定义
       const parts = []
       // 常量 parts：局部定义
+      if (j.strategy_kind === 'optimize' && p.objective) parts.push('寻优目标·' + p.objective)
       if (p.start) parts.push(p.start + '~' + (p.end || '今'))
       if (p.top_k) parts.push('每次选 ' + p.top_k + ' 只')
       if (p.min_stocks) parts.push('最少样本 ' + p.min_stocks)
       if (p.maxstocks) parts.push('池子 ' + p.maxstocks + ' 只')
       return parts.join(' · ')
     } catch { return '' }
+  }
+  function initiatingRule(j) {
+  // 回测任务的「发起规则」：标识是哪类规则/配置触发了本次回测（因子/形态/参数寻优/候选/夜间调度）
+    const sk = j.strategy_kind || ''
+    if (sk === 'optimize') {
+      let obj = ''
+      try { const p = JSON.parse(j.params_json || '{}'); if (p.objective) obj = '·' + p.objective } catch { /* 忽略解析失败 */ }
+      return '参数寻优' + obj
+    }
+    if (sk.startsWith('fac_')) return '因子战法·' + (libraryJobLabel(j) || sk)
+    if (sk.startsWith('pat_')) return '形态战法·' + (libraryJobLabel(j) || sk)
+    if (j.kind === 'library') return libraryJobLabel(j) || '战法库'
+    if (j.kind === 'candidate') return '候选 #' + j.candidate_id
+    if (j.kind === 'nightly') return '夜间全量调度'
+    return j.kind || '-'
   }
   function metricAdvices(j) {
   // 从回测结果文本解析出指标改进建议列表
@@ -751,7 +767,7 @@ export default function Research() {
   }
   function builtinLabel(num) {
   // 将内置规则编号转换为战法中文名
-    const m = { 901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形' }
+    const m = { 901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形', 990: '全库参数寻优' }
     // 常量 m：局部定义
     return m[num] || ('规则 ' + num)
   }
@@ -935,7 +951,9 @@ export default function Research() {
       // 常量 theme：局部定义
       return <Tag theme={theme}>{btStatusLabel(st)}</Tag>
     } },
+    { colKey: 'started_at', title: '发起时间', width: 150, cell: ({ row }) => <span style={{ fontSize: 12, color: '#bbb' }}>{row.started_at || (row.status === 'queued' ? '排队中' : (row.finished_at || '-'))}</span> },
     { colKey: 'params', title: '参数', minWidth: 160, cell: ({ row }) => <span style={{ fontSize: 12, color: '#aaa' }}>{jobParams(row) || '-'}</span> },
+    { colKey: 'rule', title: '发起规则', minWidth: 140, cell: ({ row }) => <span style={{ fontSize: 12, color: '#aaa' }}>{initiatingRule(row)}</span> },
     { colKey: 'progress', title: '进度', width: 140, cell: ({ row }) => {
       if (row.status === 'running' || row.status === 'paused' || row.status === 'queued') {
         return (
@@ -998,7 +1016,9 @@ export default function Research() {
   // 启动研究进度定时轮询（每 30000ms = 30 秒刷新一次处理进度）
   function startPolling() {
     if (pollTimer.current) return
-    pollTimer.current = setInterval(loadProgress, 30000)
+    // 每 30 秒同时刷新「研究进度」与「回测任务列表」：回测任务列表此前未纳入轮询，
+    // 导致任务排队 → 运行 → 完成的状态变化在前端不刷新（长时间停在「排队中」）。
+    pollTimer.current = setInterval(() => { loadProgress(); loadBacktests() }, 30000)
   }
   function stopPolling() {
   // 停止全部研究轮询定时器（组件卸载时清理）
@@ -1220,6 +1240,11 @@ export default function Research() {
           borderRadius: 6, padding: '8px 12px', marginBottom: 12, fontSize: 13
         }}>
           <b>研究调度状态</b>：{schedStatus.reason}
+          {(backtestJobs || []).filter((j) => j.status === 'queued' || j.status === 'running').length > 0 && (
+            <span style={{ color: '#1d4ed8', marginLeft: 8 }}>
+              （回测队列：{(backtestJobs || []).filter((j) => j.status === 'queued' || j.status === 'running').length} 个任务排队/执行中）
+            </span>
+          )}
           <span style={{ color: '#888', marginLeft: 8 }}>
             （北京时间 {schedStatus.beijing_now} · 交易时段={schedStatus.in_trading_window ? '是' : '否'} · 内存可用 {schedStatus.mem_avail_mb}MB · 闸门={schedStatus.mem_gate_open ? '开' : '关'} · 槽位={schedStatus.busy ? '占用' : '空闲'}）
           </span>
@@ -1312,6 +1337,7 @@ export default function Research() {
                         )}
                         <Button size="small" variant="outline" style={{ marginLeft: 'auto' }} onClick={toggleDrawer}>⚙ 参数池 / 池纪律</Button>
                       </div>
+                      {optCur.params ? (
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))', gap: 8 }}>
                         <div><label>止盈线</label><b>{fmtNum((optCur.params || {}).take_profit_pct)}%</b></div>
                         <div><label>止损线</label><b>{fmtNum((optCur.params || {}).stop_loss_pct)}%</b></div>
@@ -1323,6 +1349,9 @@ export default function Research() {
                         <div><label>实盘复核</label><b>{optCur.win_rate !== undefined ? fmtNum(optCur.win_rate, 1) + '% / ' + fmtNum(optCur.profit_factor, 2) + ' / ' + fmtNum(optCur.expectancy, 2) + '%' : '—'}</b></div>
                         {optCur.pool_stats && <div><label>模拟盘实测</label><b>{fmtNum(optCur.pool_stats.win_rate_pct, 1)}% / {optCur.pool_stats.expectancy >= 0 ? '+' : ''}{fmtNum(optCur.pool_stats.expectancy, 2)}% / {optCur.pool_stats.filled_buys}笔</b></div>}
                       </div>
+                      ) : (
+                        <div style={{ color: '#e34d59', padding: '4px 0' }}>窗口内未触发买入信号（无有效组合），该战法本轮无可优化参数。</div>
+                      )}
                     </Card>
 
                     <div style={{ marginTop: 10, fontWeight: 600, fontSize: 14 }}>止盈×止损 热力网格<span style={{ fontSize: 11, color: '#888' }}>（格值 %：该格跨持仓/门槛最优期望；点击格高亮）</span></div>
