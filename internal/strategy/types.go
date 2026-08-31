@@ -17,6 +17,7 @@ import "time"
 // SignalType 战法信号类型标识。（SignalType identifies a strategy signal type.）
 type SignalType string
 
+// 战法信号类型取值（与后端信号落库的 type 字段一致）。
 const (
 	SignalDragon        SignalType = "dragon"         // 龙回头（Dragon）
 	SignalDoubleBump    SignalType = "double_bump"    // 双响炮（Double Bump）
@@ -31,6 +32,7 @@ const (
 // TradeAction 交易动作类型。（TradeAction is a trade action type.）
 type TradeAction string
 
+// 交易动作类型取值。
 const (
 	ActionBuy   TradeAction = "buy"   // 买入（Buy）
 	ActionSell  TradeAction = "sell"  // 卖出（Sell）
@@ -41,6 +43,7 @@ const (
 // Priority 信号优先级（1 最高，5 最低）。（Priority is the signal priority, 1 highest to 5 lowest.）
 type Priority int
 
+// 信号优先级取值（1 最高，5 最低）。
 const (
 	P1   Priority = 1 // 立即执行（Execute immediately）
 	P2   Priority = 2 // 尽快执行（Execute soon）

@@ -101,6 +101,7 @@ func evalPattern(panels []*Panel, p Pattern, opts DiscoverOptsPattern, start, en
 			splitDate = dates[splitIdx]
 		}
 	}
+	// rec 单次触发记录：日期 + 前瞻 h 日收益（用于全样本/样本外汇总）。
 	type rec struct {
 		date string
 		ret  float64

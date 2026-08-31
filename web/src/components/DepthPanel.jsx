@@ -45,13 +45,14 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
   const [dispName, setDispName] = useState(name)
   const [viewW, setViewW] = useState(300)
 
-  const wrapRef = useRef(null)
-  const canvasRef = useRef(null)
+  const wrapRef = useRef(null)    // 容器 DOM 引用（取可用宽度）
+  const canvasRef = useRef(null)  // 画布 DOM 引用（绘制盘口图）
 
   useEffect(() => {
     if (!code) return
     let cancelled = false
     async function load() {
+      // 拉取指定股票的实时盘口（买卖五档/十档 + 盘口因子），更新状态
       setLoading(true)
       setError('')
       try {

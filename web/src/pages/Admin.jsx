@@ -351,6 +351,7 @@ export default function Admin() {
     },
   ]
 
+  // 挂载时加载用户与权限列表
   useEffect(() => { loadUsers() }, [])
 
   // ── §DAILY_OPSLOG 运行日志加载 ──

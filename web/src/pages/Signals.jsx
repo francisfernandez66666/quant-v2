@@ -70,8 +70,10 @@ export default function Signals() {
   // SSE 订阅取消函数
   const unsubSSE = useRef(null)
 
+  // 从信号列表中提取全部战法名称作为筛选下拉选项
   const strategyOptions = Array.from(new Set(signals.map((s) => s.strategy).filter(Boolean)))
 
+  // 按等级筛选、战法筛选，并过滤掉「预期差」非标准评级信号
   const filteredSignals = signals
     .filter((s) => (activeFilter !== 'all' ? s.remind_level === activeFilter : true))
     .filter((s) => (activeStrategy !== 'all' ? s.strategy === activeStrategy : true))

@@ -308,6 +308,7 @@ func loadFinancial(db *store.DB, token, start, end string) error {
 	}
 	log.Printf("[dataload] 财务类开始：%d 只股票（2次/秒限流，预计较久）", len(codes))
 
+	// tbl 财务表拉取任务：表名 + 对应的 Tushare 拉取函数。
 	type tbl struct {
 		table string
 		fetch func(string, string, string) ([]data.TushareRow, error)

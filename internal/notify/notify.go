@@ -17,6 +17,7 @@ import (
 // AlertLevel 告警级别枚举。（AlertLevel is the alert severity enumeration.）
 type AlertLevel int
 
+// 告警级别取值：低/中/高。
 const (
 	LevelLow    AlertLevel = iota // 低级别（如命中提醒、观察信号）
 	LevelMedium AlertLevel = 1    // 中级别（默认告警）

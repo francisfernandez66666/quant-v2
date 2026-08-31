@@ -50,6 +50,7 @@ func (s *Server) handleOpslogDates(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "read opslog dir: "+err.Error())
 		return
 	}
+	// dateItem 运行日志日期条目：日期 + 文件大小。
 	type dateItem struct {
 		Date string `json:"date"`
 		Size int64  `json:"size"`

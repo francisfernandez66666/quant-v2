@@ -310,6 +310,7 @@ func (a *Agent) attachDepthFactors(signals []Signal) {
 	if len(idx) == 0 {
 		return
 	}
+	// res 并发盘口拉取结果：下标 + 盘口因子。
 	type res struct {
 		i int
 		f *data.OrderBookFactors

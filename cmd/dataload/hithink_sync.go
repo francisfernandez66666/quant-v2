@@ -295,6 +295,7 @@ func cmdHithinkSyncAnomaly(client *data.HithinkClient, db *store.DB, since strin
 		log.Fatalf("异动列表拉取失败: %v", err)
 	}
 	tradeDate := time.Now().Format("20060102")
+	// row 异动公告行：代码/名称/标签/正文 + 关键词。
 	type row struct {
 		code, name, tag, content string
 		kw                       []string

@@ -709,9 +709,11 @@ func (a *Agent) BuildIPOBootEvents() []NewsEvent {
 		return nil
 	}
 
+	// bootDays 启动期事件探测的交易日前瞻天数。
 	const bootDays = 5
 	bootDeadline := data.AddTradingDays(td, bootDays)
 	var titles []string
+	// bootTarget 启动期事件目标：代码 + 名称 + 事件标题。
 	type bootTarget struct {
 		code, name, title string
 	}

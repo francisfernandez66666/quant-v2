@@ -117,6 +117,7 @@ func alignFina(fina []store.FinaRow, income []store.IncomeRow, dates []string) m
 		annByEnd[f.EndDate] = f.AnnDate
 	}
 
+	// rec 单条财务记录：公告日期 + 原始财务行（用于按公告日对齐）。
 	type rec struct {
 		ann string
 		f   store.FinaRow

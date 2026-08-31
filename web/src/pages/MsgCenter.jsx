@@ -47,8 +47,8 @@ export default function MsgCenter() {
   const [activeFilter, setActiveFilter] = useState('all')
   const [activeStrategy, setActiveStrategy] = useState('all')
 
-  const timerRef = useRef(null)
-  const unsubSSERef = useRef(null)
+  const timerRef = useRef(null)      // 轮询定时器句柄
+  const unsubSSERef = useRef(null)   // SSE 取消订阅函数引用
 
   // SSE 推送到达时刷新消息
   function handleSSE() { load() }

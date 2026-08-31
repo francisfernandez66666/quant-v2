@@ -458,8 +458,8 @@ export default function LLMDebug() {
   const [noAgent, setNoAgent] = useState(false)
   const [noData, setNoData] = useState(false)
   const [showLog, setShowLog] = useState(false)
-  const timerRef = useRef(null)
-  const sseUnsubRef = useRef(null)
+  const timerRef = useRef(null)      // 轮询定时器句柄
+  const sseUnsubRef = useRef(null)   // SSE 取消订阅函数引用
 
   const [selectedSet, setSelectedSet] = useState(new Set())
 

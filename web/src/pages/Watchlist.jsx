@@ -7,6 +7,7 @@ import * as api from '../api/index.js'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 
+// 自选股列表的 localStorage 缓存键
 const CACHE_KEY = 'wl_cache_v1'
 
 // 将自选股列表持久化到 localStorage
@@ -181,6 +182,7 @@ export default function Watchlist() {
     setExpandedKeys((prev) => prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code])
   }
 
+  // 移动端点击行时打开底部操作面板（桌面端不响应）
   function onRowTap(e) {
     if (window.innerWidth > 768) return
     setSheetStock(e)

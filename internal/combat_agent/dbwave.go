@@ -24,6 +24,7 @@ import (
 // 用于跟踪双响炮战法的日内确认状态，从第一波突破到第二波确认。
 type doubleBumpPhase int
 
+// 双响炮日内阶段取值。
 const (
 	dbPhaseFirst  doubleBumpPhase = 1  // 第一波突破（First breakout）
 	dbPhaseAdjust doubleBumpPhase = 2  // 缩量调整（Adjustment）

@@ -6,6 +6,7 @@ import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, Messa
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 
+// 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
 
 // 将持仓与资金缓存到 localStorage
@@ -30,6 +31,7 @@ function loadCache() {
  * @returns {JSX.Element}
  */
 export default function Positions() {
+  // 初始化时读取本地缓存的持仓与资金作为初始值（断线/刷新后仍可见）
   const cache = loadCache()
   // 纸面持仓列表
   const [holdings, setHoldings] = useState(cache.holdings)
@@ -114,6 +116,7 @@ export default function Positions() {
   // SSE 订阅取消函数
   const unsubSSE = useRef(null)
 
+  // 计算总盈亏 = 累计已实现盈亏 + 各持仓浮盈（现价-成本）×数量 - 显示偏移量
   const totalPnl = useMemo(() => {
     let sum = totalRealizedPnl
     for (const h of holdings) {
@@ -125,6 +128,7 @@ export default function Positions() {
     return sum - pnlOffset
   }, [holdings, totalRealizedPnl, pnlOffset])
 
+  // 预览加减仓后该持仓的数量（加仓=现量+加量；减仓=现量-减量，无效时归零）
   const lotPreviewQty = useMemo(() => {
     const cur = Number(lotTarget?.quantity) || 0
     const add = Number(lotFormQty) || 0
@@ -132,6 +136,7 @@ export default function Positions() {
     return add > 0 ? cur - add : 0
   }, [lotTarget, lotFormQty, lotDir])
 
+  // 判断减仓数量是否超过当前持仓量（超卖时禁用确认并提示）
   const lotOverSell = useMemo(() => {
     if (lotDir !== 'sell') return false
     const cur = Number(lotTarget?.quantity) || 0
@@ -139,6 +144,7 @@ export default function Positions() {
     return sell > cur
   }, [lotTarget, lotFormQty, lotDir])
 
+  // 加减仓确认按钮是否禁用：成交价或数量无效，或减仓超卖时禁用
   const fareCalcDisabled = useMemo(() => {
     const pr = Number(lotFormPrice) || 0
     const qt = Number(lotFormQty) || 0
@@ -146,6 +152,7 @@ export default function Positions() {
     return pr <= 0 || qt <= 0 || lotOverSell
   }, [lotFormPrice, lotFormQty, lotDir, lotOverSell])
 
+  // 预览加减仓后的加权平均成本（加仓按新量加权，减仓保持原成本）
   const lotPreviewCost = useMemo(() => {
     const cur = Number(lotTarget?.quantity) || 0
     const curCost = Number(lotTarget?.cost_price) || 0
@@ -161,6 +168,7 @@ export default function Positions() {
     return curCost
   }, [lotTarget, lotFormQty, lotFormPrice, lotDir])
 
+  // 持仓与资金变动时持久化到 localStorage，供下次进入恢复
   useEffect(() => { persistCache(holdings, availableBalance) }, [holdings, availableBalance])
 
   // 以当前总盈亏为基准设置偏移量，实现「清零」显示

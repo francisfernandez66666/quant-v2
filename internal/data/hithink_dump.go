@@ -19,6 +19,7 @@ import (
 // HithinkDumpKind dump 种类（对应官方 dump_id）。
 type HithinkDumpKind string
 
+// Hithink dump 种类取值。
 const (
 	HithinkDumpDailyK10y  HithinkDumpKind = "daily-k"            // 10 年全量日K（未复权）
 	HithinkDumpDailyK10d  HithinkDumpKind = "daily-k-10d"        // 最近 10 交易日增量

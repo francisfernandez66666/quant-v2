@@ -202,6 +202,7 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 // （NPhase is the intraday N-shape state machine.）
 type NPhase int
 
+// N 形日内阶段取值。
 const (
 	NPhaseIdle           NPhase = 0 // 空闲，未检测到首次突破（Idle: no first breakout yet）
 	NPhaseFirstBreakout  NPhase = 1 // 第一波突破：价格快速拉高，伴随放量（First breakout: fast rally on volume）

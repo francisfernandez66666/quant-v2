@@ -52,6 +52,7 @@ const DepthLevels = 10
 // BigOrderKind classifies a detected large order: support (bid) or resistance (ask).
 type BigOrderKind string
 
+// 大单托压类型取值。
 const (
 	BigOrderSupport    BigOrderKind = "support"    // 托单：买盘大额挂单，意图托住股价
 	BigOrderResistance BigOrderKind = "resistance" // 压单：卖盘大额挂单，意图压制股价
@@ -251,6 +252,7 @@ func extractTencentTime(fields []string) string {
 // getEastMoneyDepth parses the 5-level order book from EastMoney push2 stock/get.
 func (m *MarketAPI) getEastMoneyDepth(code string) (*OrderBook, error) {
 	sid := secID(code)
+	// fields 东方财富个股接口请求字段清单（分笔/盘口数据列）。
 	const fields = "f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,f43,f57,f58,f60,f86"
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fltt=2&invt=2&fields=%s", sid, fields)
 	EastMoneyLimiter.Wait()

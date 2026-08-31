@@ -19,6 +19,7 @@ import (
 	"time"
 )
 
+// CLS（财联社）API 端点与请求参数常量。
 const (
 	// CLS API 端点与请求参数常量。
 	// CLS API endpoint, referer and client constants.

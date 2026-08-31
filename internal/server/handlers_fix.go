@@ -275,6 +275,7 @@ var (
 	minuteCache   = map[string]*minuteCacheEntry{}
 )
 
+// minuteCacheEntry 分时缓存条目：分时点序列 + 昨收 + 名称 + 缓存时间。
 type minuteCacheEntry struct {
 	Points    []fixMinutePoint // 分时点（含价格/量/MACD）
 	PrevClose float64          // 昨收

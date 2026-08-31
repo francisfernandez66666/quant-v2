@@ -93,6 +93,7 @@ func pairsR(p []pair) []float64 {
 
 // rank 计算平均秩（并列取平均）。
 func rank(xs []float64) []float64 {
+	// idx 带原始位置的取值对（用于计算平均秩时保留序号）。
 	type idx struct {
 		v   float64
 		pos int

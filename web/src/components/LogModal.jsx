@@ -78,9 +78,10 @@ export default function LogModal({ visible, onClose }) {
   const [sigQuery, setSigQuery] = useState('')
   const [activeSigStrategy, setActiveSigStrategy] = useState('all')
 
-  const firstLoad = useRef(false)
+  const firstLoad = useRef(false) // 是否已完成首次加载（避免重复请求）
 
   function applyLLM() {
+    // 应用当前选中的 LLM 调试记录：写入数据并回填选中索引集合
     const r = llmRecords[llmIdx]
     setLlmData(r || null)
     setLlmNoData(!r)
@@ -88,25 +89,29 @@ export default function LogModal({ visible, onClose }) {
   }
 
   function applySignal() {
+    // 应用当前选中的信号调试记录
     const r = sigRecords[sigIdx]
     setSigData(r || null)
     setSigNoData(!r)
   }
 
   function isSelected(i) {
+    // 判断某条记录是否在选中集合中（用于高亮已选调试记录）
     return selectedSet.has(i)
   }
 
   function sigMatchStrategy(sg) {
+    // 信号是否匹配当前筛选的战法（all 表示全部匹配）
     if (!sg) return false
     if (activeSigStrategy === 'all') return true
     return sg.strategy === activeSigStrategy
   }
 
-  const llmSearching = useMemo(() => (llmQuery || '').trim() !== '', [llmQuery])
-  const sigSearching = useMemo(() => (sigQuery || '').trim() !== '', [sigQuery])
+  const llmSearching = useMemo(() => (llmQuery || '').trim() !== '', [llmQuery]) // LLM 搜索框是否有输入
+  const sigSearching = useMemo(() => (sigQuery || '').trim() !== '', [sigQuery]) // 信号搜索框是否有输入
 
   const sigStrategyOptions = useMemo(() => {
+    // 汇总全部信号记录中出现过的战法列表（用于筛选下拉）
     const set = new Set()
     for (const r of sigRecords) {
       for (const sg of (r.signals || [])) {
@@ -117,12 +122,14 @@ export default function LogModal({ visible, onClose }) {
   }, [sigRecords])
 
   const sigFiltered = useMemo(() => {
+    // 按当前战法筛选过滤信号数据
     const sigs = sigData?.signals || []
     if (activeSigStrategy === 'all') return sigs
     return sigs.filter((sg) => sg.strategy === activeSigStrategy)
   }, [sigData, activeSigStrategy])
 
   const llmSearchGroups = useMemo(() => {
+    // 按关键字检索 LLM 阶段事件，按处理批次分组返回
     const q = (llmQuery || '').trim().toUpperCase()
     if (!q) return []
     const groups = []
@@ -134,11 +141,13 @@ export default function LogModal({ visible, onClose }) {
   }, [llmRecords, llmQuery])
 
   const llmTotalHits = useMemo(
+    // LLM 检索命中总数（全部批次累加）
     () => llmSearchGroups.reduce((n, g) => n + g.items.length, 0),
     [llmSearchGroups]
   )
 
   const sigSearchGroups = useMemo(() => {
+    // 按关键字 + 战法筛选检索信号记录，按处理批次分组返回
     const q = (sigQuery || '').trim().toUpperCase()
     if (!q) return []
     const groups = []
@@ -150,6 +159,7 @@ export default function LogModal({ visible, onClose }) {
   }, [sigRecords, sigQuery, activeSigStrategy])
 
   const sigTotalHits = useMemo(
+    // 信号检索命中总数（全部批次累加）
     () => sigSearchGroups.reduce((n, g) => n + g.items.length, 0),
     [sigSearchGroups]
   )

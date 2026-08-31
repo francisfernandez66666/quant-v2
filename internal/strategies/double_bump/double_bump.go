@@ -354,6 +354,7 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 // （BumpPhase is the Double Bump formation state machine.）
 type BumpPhase int
 
+// 双凸形态阶段取值。
 const (
 	PhaseFirst  BumpPhase = 1  // 第一波突破（首次放量拉升）（First breakout: first scaling rally）
 	PhaseAdjust BumpPhase = 2  // 调整阶段（缩量回调，等待第二波）（Adjust: volume-shrunk pullback awaiting second wave）

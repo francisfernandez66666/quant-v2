@@ -42,6 +42,7 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
+// N 形评分各维度满分常量。
 const (
 	MaxD1      = 40.0 // D1 事件维度满分（D1 event dimension max）
 	MaxD2      = 30.0 // D2 相对强度维度满分（D2 relative-strength dimension max）

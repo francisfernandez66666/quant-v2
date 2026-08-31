@@ -21,6 +21,7 @@ type ThsDailyRow struct {
 	Amount    float64 // 成交额（元）
 }
 
+// thsDailyColumns ths_daily 表插入列清单（与 ThsDailyRow 字段顺序一致）。
 const thsDailyColumns = `ts_code, trade_date, open, high, low, close, vol, amount`
 
 // UpsertThsDailyRows 批量幂等写入（事务，INSERT OR REPLACE）。

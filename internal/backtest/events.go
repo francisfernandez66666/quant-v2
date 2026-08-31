@@ -29,6 +29,7 @@ func SynthesizeEvents(db *store.DB, start, end string, minLimitUps, maxPerDay in
 	i := 0
 	for i < len(rows) {
 		d := rows[i].Date
+		// pair 单日涨停行业命中：行业名 + 涨停家数。
 		type pair struct {
 			industry string
 			count    int

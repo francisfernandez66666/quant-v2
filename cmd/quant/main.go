@@ -454,6 +454,7 @@ func main() {
 		if sec := cfgMgr.Rules.Runtime.ScoringIntervalSec; sec > 0 {
 			scoringTick = time.Duration(sec) * time.Second
 		}
+		// sleepChunk 分块休眠窗口：将长等待切分为 ≤15 分钟的片段，便于响应信号/退出。
 		const sleepChunk = 15 * time.Minute
 		activeTick := scoringTick
 		timer := time.NewTimer(activeTick)
@@ -568,6 +569,7 @@ func main() {
 // heartbeat, news→scan latency drops to ~the probe period (default 30s); quiet periods are covered by the
 // maxIdleWait backstop so quote/watchlist-only refreshes still happen periodically.）
 func adaptiveIntradayWait(ctx context.Context, engines []*engine.Engine) {
+	// 自适应盘中等待参数：探测周期与兜底间隔。
 	const (
 		probeInterval = 30 * time.Second // 新新闻探测周期：决定"新闻到达→触发"的最大感知延迟
 		maxIdleWait   = 3 * time.Minute  // 无新新闻时的兜底触发间隔

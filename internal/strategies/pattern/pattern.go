@@ -280,6 +280,7 @@ func (s *PatternStrategy) GenerateSignal(code string, eval *strategy.Evaluation)
 // topConditionIDs 返回 Details 中值最大的前 n 个条件因子 ID（值降序，跳过零/空）。
 // English: returns the top-n condition factor IDs in Details by value (descending, skipping empty/zero).
 func topConditionIDs(details map[string]float64, n int) []string {
+	// kv 条件因子键值对（用于排序取 Top-N）。
 	type kv struct {
 		k string
 		v float64

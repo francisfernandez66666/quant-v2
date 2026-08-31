@@ -83,12 +83,13 @@ export default function KLineChart({
   const [viewW, setViewW] = useState(axisL + 320)
   const [hover, setHover] = useState(null)
 
-  const wrapRef = useRef(null)
-  const canvasRef = useRef(null)
+  const wrapRef = useRef(null)    // 容器 DOM 引用（取可用宽度）
+  const canvasRef = useRef(null)  // 画布 DOM 引用（绘制分时图）
 
   useEffect(() => {
     let cancelled = false
     async function load() {
+      // 拉取指定股票的分时/分钟数据并缓存到 raw，触发重绘
       if (!code) return
       setLoading(true)
       setError('')
@@ -364,6 +365,7 @@ export default function KLineChart({
   }, [raw, prevClose, viewW, height, hover])
 
   function onMove(ev) {
+    // 鼠标移动：按横向距离就近定位数据点，计算相对昨收的涨跌幅并显示十字光标信息
     if (raw.length === 0) return
     const rect = ev.currentTarget.getBoundingClientRect()
     const lx = ev.clientX - rect.left
@@ -403,7 +405,7 @@ export default function KLineChart({
     const pct = pc > 0 ? (delta / pc) * 100 : 0
     setHover({ x: best.cx, y: best.yClose, point: best.raw, delta, pct })
   }
-  function onLeave() { setHover(null) }
+  function onLeave() { setHover(null) } // 鼠标移出画布：清除十字光标信息
 
   const avgMemo = React.useMemo(() => {
     const arr = new Array(raw.length).fill(0)
@@ -416,7 +418,7 @@ export default function KLineChart({
     }
     return arr
   }, [raw])
-  function avgAt(idx) { return avgMemo[idx] || 0 }
+  function avgAt(idx) { return avgMemo[idx] || 0 } // 取某点的分时均价（无则 0）
 
   return (
     <div className="kline-chart">

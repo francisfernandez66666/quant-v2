@@ -184,6 +184,7 @@ func IsAfterMarket(now time.Time) bool {
 // MarketSession 当前市场时段枚举。
 type MarketSession int
 
+// 市场时段枚举取值。
 const (
 	SessionPreMarket      MarketSession = iota // 盘前 8:30-9:15
 	SessionMorningTrade                        // 上午交易 9:15-11:30

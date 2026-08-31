@@ -578,6 +578,7 @@ func (d *DB) tableHasPKColumns(table string) ([]string, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	// colInfo 表列信息：列名 + 是否主键。
 	type colInfo struct {
 		name string
 		pk   int

@@ -443,6 +443,7 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 	}
 	defer body.Close()
 
+	// streamOut 流式响应通道结果：拼接内容 + usage 统计 + 错误。
 	type streamOut struct {
 		content string
 		usage   *llmUsage

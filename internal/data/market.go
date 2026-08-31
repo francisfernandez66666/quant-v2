@@ -379,6 +379,7 @@ func (m *MarketAPI) GetSinaQuotes(codes []string) map[string]*StockInfo {
 	if len(codes) == 0 {
 		return out
 	}
+	// batch 批量查询分片大小（避免单次请求 URL 过长）。
 	const batch = 80
 	for i := 0; i < len(codes); i += batch {
 		end := i + batch

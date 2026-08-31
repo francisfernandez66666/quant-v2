@@ -91,22 +91,29 @@ export default function Dashboard() {
   // 页面可见性变化处理函数引用
   const visibilityHandler = useRef(null)
 
+  // 从引擎状态中提取扫描统计（监控个股数/板块数等），供指标卡与系统卡展示
   const scanStats = useMemo(() => status.scan_stats || {}, [status])
 
+  // 统计强信号（strong）信号数量
   const strongCount = useMemo(() => signals.filter((s) => s.remind_level === 'strong').length, [signals])
+  // 统计观察中（observe）信号数量
   const observeCount = useMemo(() => signals.filter((s) => s.remind_level === 'observe').length, [signals])
+  // 统计静默（mute）信号数量
   const muteCount = useMemo(() => signals.filter((s) => s.remind_level === 'mute').length, [signals])
 
+  // 过滤出宏观日历与政策反制类资讯事件
   const calendarEvents = useMemo(
     () => newsItems.filter((n) => n.source === '宏观日历' || n.source === '政策反制'),
     [newsItems]
   )
 
+  // 将按战法归因的统计对象扁平化为表格行数组
   const strategyRows = useMemo(
     () => Object.entries(strategyStats || {}).map(([name, s]) => ({ name, ...s })),
     [strategyStats]
   )
 
+  // 拼接实盘/QMT 链路状态摘要文本（探测正常/模式/是否熔断）
   const qmtLine = useMemo(() => {
     const s = qmtState
     if (!s || !s.enabled) return ''

@@ -128,6 +128,7 @@ func (p *Position) MarketValue() float64 { return p.Mark * float64(p.Qty) }
 // MarshalJSON 输出持仓字段外加浮动盈亏/滑点/延迟等计算值（前端直接展示）。
 // English: marshals the position with computed floating P/L, slippage and latency for the frontend.
 func (p Position) MarshalJSON() ([]byte, error) {
+	// alias 原始 Position 类型别名（避免自定义 MarshalJSON 造成无限递归）。
 	type alias Position
 	return json.Marshal(&struct {
 		alias

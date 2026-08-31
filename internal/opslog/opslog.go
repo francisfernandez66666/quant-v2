@@ -40,6 +40,7 @@ import (
 	"time"
 )
 
+// 日志文件名与行内时间戳的格式、保留策略常量。
 const (
 	// filePrefix 文件名前缀；dateLayout 文件名与行内时间戳共用的本地日期格式。
 	filePrefix = "opslog-"

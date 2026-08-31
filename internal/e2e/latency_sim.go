@@ -180,6 +180,7 @@ func (m *simMetrics) tabData(p *LatencyProfile) [][4]string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	one := oneXBase(p)
+	// row 单类接口耗时统计行。
 	type row struct {
 		name string
 		n    int
@@ -203,6 +204,7 @@ func (m *simMetrics) tabLLM(p *LatencyProfile) [][4]string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	one := oneXBase(p)
+	// row LLM 阶段耗时统计行。
 	type row struct {
 		name   string
 		n      int

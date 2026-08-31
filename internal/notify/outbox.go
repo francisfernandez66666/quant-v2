@@ -26,6 +26,7 @@ import (
 	"quant-trading-v2/internal/fileutil"
 )
 
+// 外发重试参数：单条最大尝试次数与退避时间上下限。
 const (
 	outboxMaxAttempts = 5 // 单条最大尝试次数（含首次失败后的全部重试）
 	outboxBaseDelay   = 30 * time.Second
@@ -180,6 +181,7 @@ func (o *Outbox) Stop() {
 // English: R3-8 P1-D — due items are collected under lock but delivered outside it, so a slow
 // webhook can no longer stall the main push path.
 func (o *Outbox) pump() {
+	// job 待投递任务：队列内下标 + 对应 outboxItem。
 	type job struct {
 		idx  int
 		item outboxItem

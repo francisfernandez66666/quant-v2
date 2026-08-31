@@ -671,6 +671,7 @@ func judgeCombined(title string) combinedJudge {
 
 // mockStage0JSON 解析 "N. 标题\n正文: ..." 格式，返回每条的 category/material。
 func mockStage0JSON(user string) string {
+	// item 阶段 0 解析结果：序号 + 分类 + 是否实质利好 + 校正标题。
 	type item struct {
 		// 序号
 		Index int `json:"index"`
@@ -806,6 +807,7 @@ func mockD1JSON(user string) string {
 			codes = append(codes, strings.TrimSpace(line[i+len("代码:"):]))
 		}
 	}
+	// d1Res D1 事件响应结果：代码 + 置信分 + 拦截标记 + 归因理由。
 	type d1Res struct {
 		// 代码
 		Code string `json:"code"`

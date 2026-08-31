@@ -50,10 +50,10 @@ export default function Hotspot() {
   const [sortKey, setSortKey] = useState('')
   const [sortDir, setSortDir] = useState(-1)
 
-  const loadingRef = useRef(false)
-  const timerRef = useRef(null)
-  const unsubSSERef = useRef(null)
-  const visHandlerRef = useRef(null)
+  const loadingRef = useRef(false)      // 加载互斥标记（防止重复请求）
+  const timerRef = useRef(null)         // 轮询定时器句柄
+  const unsubSSERef = useRef(null)      // SSE 取消订阅函数引用
+  const visHandlerRef = useRef(null)    // 页面可见性事件处理器引用
 
   // 用 ref 保存最新评分数据，避免轮询闭包引用旧值
   const evalsRef = useRef([])
@@ -321,6 +321,7 @@ export default function Hotspot() {
     { colKey: 'price', title: '发行价', width: 90, cell: ({ row }) => row.issue_price ? <span style={{ color: '#4fc3f7' }}>¥{row.issue_price.toFixed(2)}</span> : null },
     { colKey: 'status', title: '状态', width: 100, cell: ({ row }) => <Tag size="small" theme={row.statusTheme}>{row.status}</Tag> },
   ]
+  // 将 IPO 日历转为表格行数据并附加上市倒计时状态与标签主题
   const ipoData = ipoCalendar.map((c, i) => ({ id: 'ipo' + i, date: c.listing_date ? c.listing_date.slice(5, 10) : (c.ipo_date ? c.ipo_date.slice(5, 10) : ''), name: c.name, code: c.code, issue_price: c.issue_price, status: ipoCountdown(c), statusTheme: c.list_status === 'L' ? 'default' : 'warning' }))
 
   // 资讯标签解析：根据情绪/方向/影响等级生成 TDesign Tag 的 {text, theme} 列表
@@ -356,6 +357,7 @@ export default function Hotspot() {
       </span>
     ) },
   ]
+  // 将资讯列表转成表格行数据（格式化时间并解析情绪/方向/影响标签、板块、个股）
   const newsData = newsItems.map((n, i) => ({ id: 'n' + i, time: fmtNewsTime(n.datetime), title: n.title, tags: newsTags(n), sectors: n.sectors, stocks: n.stocks }))
 
   return (

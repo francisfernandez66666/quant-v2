@@ -25,6 +25,7 @@ type MarketSnapshot struct {
 	Source string                // 数据来源名称（如 "Tushare"/"EastMoney"）
 }
 
+// maxWatchStocks 热点监控股票上限。
 const maxWatchStocks = 60 // 热点监控股票上限
 
 // Fetcher 5 秒轮询行情采集器。

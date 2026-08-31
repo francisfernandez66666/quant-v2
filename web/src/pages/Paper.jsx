@@ -192,12 +192,14 @@ export default function Paper() {
   const [tradeFormQty, setTradeFormQty] = useState(1)
 
   const W = 900, H = 220 // 净值曲线 SVG 的逻辑尺寸（viewBox 坐标，非真实像素）
-  const timer = useRef(null)
+  const timer = useRef(null) // 轮询定时器句柄
 
+  // 解析交易弹窗中输入的手数（无效或非正整数则归零，用于预览/校验）
   const tradePreviewQty = useMemo(() => {
     const q = parseInt(tradeFormQty, 10)
     return isNaN(q) || q <= 0 ? 0 : q
   }, [tradeFormQty])
+  // 减仓手数×100 是否达到或超过当前持仓股数（超卖时禁用确认）
   const tradeOverSell = useMemo(() =>
     tradeDir === 'trim' && tradeTarget && tradePreviewQty * 100 >= tradeTarget.qty, [tradeDir, tradePreviewQty, tradeTarget])
 
@@ -215,6 +217,7 @@ export default function Paper() {
     return `限${r.max_daily_buys || '∞'}次/冷却${r.cooldown_minutes || 0}分/分≥${r.min_score || 0}/预算${r.budget_pct_per_day || 0}%`
   }
 
+  // 将净值序列归一化映射为 SVG 折线坐标点（viewBox 尺寸 W×H）
   const linePoints = useMemo(() => {
     if (equity.length < 2) return ''
     const pad = 10
@@ -230,30 +233,38 @@ export default function Paper() {
   // 净值曲线背景横向网格线：在画布 1/4、2/4、3/4 高度处（k=1,2,3）
   const gridLines = useMemo(() => [1, 2, 3].map((k) => ({ y: (H / 4) * k })), [])
 
+  // 按当前选中的资金池过滤持仓列表
   const filteredPositions = useMemo(() => {
     if (activePool === null) return positions
     return positions.filter((p) => normPoolKey(p.strategy_type) === activePool)
   }, [positions, activePool])
+  // 按当前选中的资金池过滤成交记录
   const filteredTrades = useMemo(() => {
     if (activePool === null) return trades
     return trades.filter((t) => normPoolKey(t.strategy_type) === activePool)
   }, [trades, activePool])
+  // 按当前选中的资金池过滤订单
   const filteredOrders = useMemo(() => {
     if (activePool === null) return orders
     return orders.filter((o) => normPoolKey(o.strategy_type) === activePool)
   }, [orders, activePool])
+  // 取当前选中资金池的统计（未选中时回退到全局统计）
   const activeStats = useMemo(() => {
     if (activePool === null) return stats
     const p = pools.find((p) => normPoolKey(p.key) === activePool)
     return (p && p.stats) || stats
   }, [activePool, pools, stats])
+  // 取当前选中资金池的中文标签
   const activePoolLabel = useMemo(() => {
     const p = pools.find((p) => normPoolKey(p.key) === activePool)
     return p ? p.label : ''
   }, [activePool, pools])
 
+  // 为持仓行补充稳定行 key（供表格展开/分时图追踪）
   const posData = useMemo(() => filteredPositions.map((p) => ({ ...p, __key: p.code })), [filteredPositions])
+  // 为成交行补充稳定行 key 与序号
   const tradeData = useMemo(() => filteredTrades.map((t, i) => ({ ...t, __key: 'trade_' + i, __idx: i })), [filteredTrades])
+  // 为订单行补充稳定行 key
   const orderData = useMemo(() => filteredOrders.map((o, i) => ({ ...o, __key: o.id || ('o_' + i) })), [filteredOrders])
 
   // 展开/收起指定持仓代码的分时图（维护已展开 key 集合）
@@ -521,6 +532,7 @@ export default function Paper() {
   }, [])
 
   // ── 列定义 ──
+  // 模拟盘持仓表格列定义：代码/名称/买卖时间/数量/成本/现价/浮盈/滑点/延迟/资金池/分时/操作
   const posColumns = [
     { colKey: 'code', title: '代码', width: 90 },
     { colKey: 'name', title: '名称', width: 100 },

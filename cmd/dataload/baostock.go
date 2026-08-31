@@ -125,6 +125,7 @@ func bsRunDaily(db *store.DB, c *data.BaostockClient, start, end string) error {
 	log.Printf("[dataload] 行情类开始：%d 只股票（baostock 逐票）", len(codes))
 	tStart := time.Now()
 	done, inserted, skipped := 0, 0, 0
+	// maxRetry 单票失败最大重试次数（网络错误 10002007 等，重试前短暂等待）。
 	const maxRetry = 3
 	for _, code := range codes {
 		n, err := bsLoadStockTables(db, c, code, start, end)
@@ -375,6 +376,7 @@ func bsLoadAdjFactor(db *store.DB, c *data.BaostockClient, codes []string, start
 	log.Printf("[dataload] adj_factor 补齐开始：%d 只股票（baostock 逐票单次全区间）", len(codes))
 	tStart := time.Now()
 	done, inserted, skipped := 0, 0, 0
+	// maxRetry 单票失败最大重试次数（复权因子拉取重试）。
 	const maxRetry = 3
 	for _, code := range codes {
 		maxD, err := db.MaxTradeDate("adj_factor", code)

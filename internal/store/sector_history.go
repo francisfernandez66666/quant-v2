@@ -73,6 +73,7 @@ func (d *DB) aggregateSectorDayFull(date string) ([]SectorDay, error) {
 	if err != nil {
 		return nil, err
 	}
+	// agg 板块聚合行：板块名 + 股票数 + 涨跌幅。
 	type agg struct {
 		ind   string
 		count int
@@ -145,6 +146,7 @@ func (d *DB) topStocksByIndustry(date string) (map[string][]string, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	// pick 板块内个股候选：代码 + 涨跌幅。
 	type pick struct {
 		code string
 		pct  float64

@@ -90,8 +90,8 @@ export default function App() {
   const [logging, setLogging] = useState(false)
   const [loginError, setLoginError] = useState('')
 
-  const statusTimer = useRef(null)
-  const unsubSSE = useRef(null)
+  const statusTimer = useRef(null) // 状态轮询定时器句柄
+  const unsubSSE = useRef(null)     // SSE 取消订阅函数引用
 
   // 根据当前用户权限刷新研究/管理入口可见性
   function applyRoleGates() {

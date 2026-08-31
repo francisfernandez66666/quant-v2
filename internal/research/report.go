@@ -110,6 +110,7 @@ type icRowJSON struct {
 	IC   *float64
 }
 
+// layerJSON 分层统计 JSON 输出结构：层号、样本量 N 与均值收益。
 type layerJSON struct {
 	Layer      int
 	N          int

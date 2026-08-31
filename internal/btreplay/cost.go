@@ -9,6 +9,7 @@ import (
 	"quant-trading-v2/internal/paper"
 )
 
+// 回测交易成本费率常量（与模拟盘同源）。
 const (
 	costSlippageBps    = 5.0     // 单边滑点（bp）
 	costCommissionRate = 0.00025 // 佣金万2.5（双边）

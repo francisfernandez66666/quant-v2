@@ -70,6 +70,7 @@ func (a *Agent) exitConfigs() (dragonCfg config.DragonConfig, dbCfg config.Doubl
 // English: the strategy exit engines a position may map onto.
 type exitStrategy int
 
+// 持仓可接入的战法退出引擎枚举。
 const (
 	exitStrategyGeneric      exitStrategy = iota // 手动/未知战法：走通用移动止盈+超期回退
 	exitStrategyDragon                           // 龙头

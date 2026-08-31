@@ -28,7 +28,7 @@ export default function Consult() {
   const [messages, setMessages] = useState([])
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
-  const chatBox = useRef(null)
+  const chatBox = useRef(null) // 聊天消息容器引用（自动滚动到底部）
 
   const [proMode, setProMode] = useState(false)
   const [proModeSaving, setProModeSaving] = useState(false)

@@ -91,6 +91,7 @@ func (r *ChainReport) JSONReport() ([]byte, error) {
 // HTMLReport 渲染自包含 HTML。
 // （HTMLReport renders the chain report as a self-contained HTML page.）
 func (r *ChainReport) HTMLReport() ([]byte, error) {
+	// evRow 事件报告行：日期、行业、涨停数、成分数、5 日超额均值。
 	type evRow struct {
 		Date, Industry string
 		LimitUp, Cons  int

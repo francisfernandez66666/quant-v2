@@ -6,6 +6,7 @@
 import React from 'react'
 
 export default function ToggleSw({ checked, onChange, disabled }) {
+  // 纯受控开关：渲染状态完全由 checked 决定，点击回传新值
   const on = !!checked
   return (
     <button
