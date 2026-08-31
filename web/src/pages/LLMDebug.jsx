@@ -2,7 +2,7 @@
 // 展示最新一轮 Stage 流水线结果（Stage1 初筛 / Stage2 事件分析），
 // 并内嵌 Dialog + Tabs 弹窗用于按批次查看 LLM 分析与信号批次日志。
 // 使用 TDesign React 组件（Card / Table / Tag / Button / Dialog / Tabs / Input / Select）。
-import React, { useState, useEffect, useMemo, useCallback } from 'react'
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { Card, Table, Tag, Button, Dialog, Tabs, Input, Select } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
@@ -458,6 +458,8 @@ export default function LLMDebug() {
   const [noAgent, setNoAgent] = useState(false)
   const [noData, setNoData] = useState(false)
   const [showLog, setShowLog] = useState(false)
+  const timerRef = useRef(null)
+  const sseUnsubRef = useRef(null)
 
   const [selectedSet, setSelectedSet] = useState(new Set())
 
@@ -509,8 +511,21 @@ export default function LLMDebug() {
     }
   }
 
-  // 页面挂载时加载最新 Stage 记录
-  useEffect(() => { loadData() }, [])
+  // 页面挂载：首次加载 + SSE 实时刷新 + 15s 轮询兜底
+  // 近实时翻转信号由 scoring_loop 固化进 signal_records，主循环轮次之外也能及时上屏。
+  // English: initial load + SSE-driven refresh + 15s poll fallback, so near-realtime signals
+  // (persisted by scoring_loop) show up even between main-loop rounds.
+  useEffect(() => {
+    loadData()
+    api.connectSSE()
+    sseUnsubRef.current = api.onSSE(loadData)
+    timerRef.current = setInterval(loadData, 15000)
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current)
+      if (sseUnsubRef.current) { sseUnsubRef.current(); sseUnsubRef.current = null }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Stage1 初筛表格列定义：序号 / 标题 / 是否通过筛选
   const stage1Columns = [

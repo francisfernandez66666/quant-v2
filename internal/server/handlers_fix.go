@@ -103,6 +103,7 @@ func scoreToRemindLevel(score float64) string {
 func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 	out := make([]fixSignal, 0, len(signals))
 	for _, s := range signals {
+		d1, d2, d3, d4 := dimScores(s)
 		fs := fixSignal{
 			Code:         s.Code,
 			Name:         s.Name,
@@ -115,10 +116,10 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			Action:       s.Action,
 			Price:        s.Price,
 			CanOpen:      s.Confidence >= 0.7 && s.Action == "buy",
-			D1:           metaD(s, "d1"),
-			D2:           metaD(s, "d2"),
-			D3:           metaD(s, "d3"),
-			D4:           metaD(s, "d4"),
+			D1:           d1,
+			D2:           d2,
+			D3:           d3,
+			D4:           d4,
 			D1Desc:       s.Reason,
 			D2Desc:       s.Sector,
 			SignalActive: true,
@@ -133,15 +134,31 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 	return out
 }
 
-// metaD 从信号 Meta 读取某维度的真实评分（d1/d2/d3/d4），缺失或非正数返回 0。
-// 修复历史问题：旧实现把 Confidence×100 复用到全部维度，导致前端 D2/D3/D4 虚高为总分。
-// English: reads a real dimension score (d1/d2/d3/d4) from signal Meta; 0 when absent. Fixes the
-// legacy bug of reusing Confidence×100 for every dimension, which inflated D2/D3/D4 to the total.
-func metaD(s combat_agent.Signal, key string) float64 {
-	if s.Meta == nil {
-		return 0
+// dimScores 按战法类型把 Meta 里的维度评分映射到统一的 d1/d2/d3/d4（前端 D1~D4 列）。
+// §寻优修复：各战法写入 Meta 的键不同——龙头 f1_seal/f2_resonance/f3_premium/f4_rs、
+// 双响炮 vol_score/adjust_score/ma_score/adjust_depth、龙回头 dragon_score/pullback_score/
+// duck_score/confirm_score、N形 d1/d2/d3/d4（唯一原生一致）。此前 toFixSignals 一律读
+// Meta["d1"]，除 N形外全部读到 0，前端 D1~D4 整列为 0。
+// English: maps per-strategy Meta dimension keys onto the unified d1/d2/d3/d4 used by the frontend's
+// D1~D4 columns. Strategies write different keys (dragon: f1_seal/…; double_bump: vol_score/…;
+// dragon_return: dragon_score/…; n_shape: d1..d4 natively); the old code read Meta["d1"] for every
+// strategy, so all but n_shape rendered 0.
+func dimScores(s combat_agent.Signal) (float64, float64, float64, float64) {
+	meta := s.Meta
+	if len(meta) == 0 {
+		return 0, 0, 0, 0
 	}
-	return s.Meta[key]
+	switch s.StrategyType {
+	case "dragon":
+		return meta["f1_seal"], meta["f2_resonance"], meta["f3_premium"], meta["f4_rs"]
+	case "double_bump":
+		return meta["vol_score"], meta["adjust_score"], meta["ma_score"], meta["adjust_depth"]
+	case "dragon_return":
+		return meta["dragon_score"], meta["pullback_score"], meta["duck_score"], meta["confirm_score"]
+	default:
+		// n_shape 原生用 d1/d2/d3/d4；因子/形态战法由策略侧把 Top-4 因子贡献写入 d1..d4。
+		return meta["d1"], meta["d2"], meta["d3"], meta["d4"]
+	}
 }
 
 // filterStaleSignals 信号展示的实时复核（仅影响"当前信号"展示，不改写任何存储/日志）：
@@ -249,8 +266,8 @@ type fixMinutePoint struct {
 // 实盘机内存约束（4G）：缓存带容量上限与单条目 TTL，超出淘汰最旧条目、过期僵尸条目（退市/
 // 长期无交易）自动丢弃，防止 map 随监控标的数量无限增长。
 const (
-	minuteCacheMax = 2000             // 分时缓存容量上限（股票数）
-	minuteCacheTTL = 24 * time.Hour   // 单条目存活上限
+	minuteCacheMax = 2000           // 分时缓存容量上限（股票数）
+	minuteCacheTTL = 24 * time.Hour // 单条目存活上限
 )
 
 var (
@@ -547,18 +564,18 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 			// English: also return generated_at (full datetime) alongside the time string so the
 			// message center can render a date, not just HH:MM:SS.
 			out = append(out, map[string]interface{}{
-				"id":          m.ID,
-				"code":        m.Code,
-				"name":        name,
-				"type":        m.Level,
-				"level":       m.Level,
-				"action":      m.Action,
-				"strategy":    m.Strategy,
-				"time":        m.Time,
+				"id":           m.ID,
+				"code":         m.Code,
+				"name":         name,
+				"type":         m.Level,
+				"level":        m.Level,
+				"action":       m.Action,
+				"strategy":     m.Strategy,
+				"time":         m.Time,
 				"generated_at": m.GeneratedAt,
-				"title":       m.Title,
-				"body":        m.Body,
-				"direction":   m.Direction,
+				"title":        m.Title,
+				"body":         m.Body,
+				"direction":    m.Direction,
 			})
 		}
 		writeJSON(w, 200, out)
@@ -578,18 +595,18 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 			lvl = "策略信号"
 		}
 		item := map[string]interface{}{
-			"id":          a.ID,
-			"code":        a.Code,
-			"name":        a.Name,
-			"type":        lvl,
-			"level":       lvl,
-			"action":      a.Action,
-			"strategy":    a.Strategy,
-			"time":        a.GeneratedAt.Format("15:04:05"),
+			"id":           a.ID,
+			"code":         a.Code,
+			"name":         a.Name,
+			"type":         lvl,
+			"level":        lvl,
+			"action":       a.Action,
+			"strategy":     a.Strategy,
+			"time":         a.GeneratedAt.Format("15:04:05"),
 			"generated_at": a.GeneratedAt,
-			"title":       fmt.Sprintf("%s %s", lvl, a.Code),
-			"body":        a.Reason,
-			"direction":   a.Direction,
+			"title":        fmt.Sprintf("%s %s", lvl, a.Code),
+			"body":         a.Reason,
+			"direction":    a.Direction,
 		}
 		out = append(out, item)
 	}
@@ -602,18 +619,18 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 				pct = fmt.Sprintf("%.1f%%", *l.ProfitPct)
 			}
 			item := map[string]interface{}{
-				"id":          l.SignalID,
-				"code":        l.Code,
-				"name":        l.Name,
-				"type":        alertType,
-				"level":       alertType,
-				"action":      l.Status,
-				"strategy":    l.Strategy,
-				"time":        l.EntryAt.Format("15:04:05"),
+				"id":           l.SignalID,
+				"code":         l.Code,
+				"name":         l.Name,
+				"type":         alertType,
+				"level":        alertType,
+				"action":       l.Status,
+				"strategy":     l.Strategy,
+				"time":         l.EntryAt.Format("15:04:05"),
 				"generated_at": l.EntryAt,
-				"title":       fmt.Sprintf("%s %s", l.Status, l.Code),
-				"body":        fmt.Sprintf("策略:%s 入场:%.2f %s", l.Strategy, l.EntryPrice, pct),
-				"direction":   l.Direction,
+				"title":        fmt.Sprintf("%s %s", l.Status, l.Code),
+				"body":         fmt.Sprintf("策略:%s 入场:%.2f %s", l.Strategy, l.EntryPrice, pct),
+				"direction":    l.Direction,
 			}
 			out = append(out, item)
 		}

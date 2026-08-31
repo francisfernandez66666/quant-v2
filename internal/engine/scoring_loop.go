@@ -239,6 +239,12 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 				bullE = append(bullE, sig)
 			}
 		}
+		// 近实时翻转信号同样固化进"信号日志"（signal_records），
+		// 让 LLM Debug 的信号批次弹窗/日志能展示近实时信号，而非只进消息中心。
+		// English: also persist near-realtime flipped signals into signal_records so the
+		// LLM Debug signal-batch panel can show them, instead of only the message center.
+		e.captureSignalRecords(len(scores), emit)
+
 		e.syncMessages(bullE, bearE, nil, nil, quotes)
 
 		// 模拟盘撮合：本轮翻转的做多 buy 信号按实时快照价自动成交（独立于真实持仓）。
@@ -252,6 +258,13 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// 模拟盘估值与日净值：每轮用实时快照价刷新持仓市值，并记录当日净值点。
 	// English: paper mark-to-market + daily equity point each round, using the live snapshot.
 	e.paperMark(quotes)
+
+	// §LLM 面板修复：近实时循环也捕获一次 Stage 快照（待归因原始新闻 + 已归因事件），
+	// 保证主循环空闲/无 L2 时 LLM 诊断页主面板仍有"原始新闻缓存"可看（内部 60s 节流）。
+	// English: the near-realtime loop also captures a Stage snapshot (pending raw news + attributed
+	// events) so the LLM debug main panel shows a raw-news cache even when the main loop is idle
+	// or no L2 news arrived (internally throttled to ≥60s).
+	e.captureNearRealtimeStage()
 
 	// 有分数才更新看板并落盘（保持与 8a/8b 主循环同口径）
 	if len(scores) > 0 {

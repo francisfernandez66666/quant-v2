@@ -537,9 +537,24 @@ export default function Research() {
   const optStrategies = useMemo(() => {
   // 常量 optStrategies：局部定义
     if (!optTasks.length) return []
-    const rows = optTasks[0].results || []
-    // 常量 rows：局部定义
-    return rows.map((r) => ({ key: r.strategy_kind || r.strategy, label: r.strategy, bestExp: (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null }))
+    // §寻优修复：此前只取 optTasks[0].results——只显示最新任务的排名。现跨全部任务按战法聚合，
+    // 同一战法保留最新任务中的冠军行（bestExp 最大），避免"只显示一个战法"或重复按钮。
+    // English: was optTasks[0].results only (latest task). Now aggregates across all tasks per strategy,
+    // keeping the best champion row (max expectancy) so every strategy shows up once.
+    const byKey = new Map()
+    for (const t of optTasks) {
+      const rows = t.results || []
+      // 常量 rows：局部定义
+      for (const r of rows) {
+        const key = r.strategy_kind || r.strategy
+        const exp = (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null
+        const prev = byKey.get(key)
+        if (!prev || (exp !== null && (prev.bestExp === null || exp > prev.bestExp))) {
+          byKey.set(key, { key, label: r.strategy, bestExp: exp })
+        }
+      }
+    }
+    return [...byKey.values()]
   }, [optTasks])
   const optCur = useMemo(() => {
   // 常量 optCur：局部定义

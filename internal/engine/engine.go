@@ -91,6 +91,7 @@ type Engine struct {
 	debugInfo    *newsagent.DebugInfo  // 最近一轮流水线的调试数据（/api/debug 展示）
 	stageRecords []newsagent.DebugInfo // 当日全量轮次记录（固化到磁盘）
 	stageRecPath string                // Stage 记录持久化文件路径
+	lastStageCap time.Time             // §LLM 面板：近实时循环最近一次 Stage 快照捕获时间（节流用）
 
 	signalRecords []combat_agent.SignalLog // 当日全量信号批次记录（固化到磁盘）
 	signalRecPath string                   // 信号批次记录持久化文件路径
@@ -932,9 +933,40 @@ func (e *Engine) paperMark(quotes map[string]*data.StockInfo) {
 		return
 	}
 	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
-		pe.MarkToMarket(quotes)
+		// §纸面估值修复：持仓不在 5s 快照池时用最近收盘价回填估值价，避免 Mark 恒 0 → 现价0/浮亏-100%。
+		// English: backfill marks from the last daily close for held codes missing from the live snapshot,
+		// so a held position never displays 0.00 / -100%.
+		pe.MarkToMarket(backfillPaperQuotes(e, pe, quotes))
 		pe.Snapshot(time.Now())
 	}
+}
+
+// backfillPaperQuotes 为模拟盘持仓中缺失实时价的代码用最近日K收盘价补齐估值行情。
+// 仅对 MarkToMarket 生效，不改动快照本身。无法取到收盘价时保持原样（该持仓沿用旧 Mark）。
+// English: fills in last-close prices for held paper codes missing a live quote, so MarkToMarket can
+// re-mark them. Only affects this valuation pass — the snapshot itself is untouched. Codes with no
+// close available are left as-is (their existing Mark is kept).
+func backfillPaperQuotes(e *Engine, pe *paper.Engine, quotes map[string]*data.StockInfo) map[string]*data.StockInfo {
+	backed := make(map[string]*data.StockInfo, len(quotes)+8)
+	for k, v := range quotes {
+		backed[k] = v
+	}
+	if pe == nil || e == nil || e.strategy == nil {
+		return backed
+	}
+	for _, p := range pe.Positions() {
+		if p.Code == "" {
+			continue
+		}
+		q, ok := backed[p.Code]
+		if ok && q != nil && q.Price > 0 {
+			continue
+		}
+		if c := e.strategy.LastClose(p.Code); c > 0 {
+			backed[p.Code] = &data.StockInfo{Code: p.Code, Name: p.Name, Price: c}
+		}
+	}
+	return backed
 }
 
 // SetFetcher 设置 5s 实时行情采集器（近实时打分循环的快照来源）。
@@ -2103,11 +2135,11 @@ func (e *Engine) pushSSEMessages(items []data.MessageItem) {
 		return
 	}
 	members := e.memberIDs()
+	// 所有级别的新消息首次出现时都经 SSE 推给前端——消息中心页据此实时刷新；
+	// 系统弹窗仍由前端按关键级别（止盈/止损/清仓/交易信号）自行过滤，互不冲突。
+	// English: push every newly-appearing message (any level) over SSE so the message
+	// center reloads immediately; the frontend still gatekeeps system notifications by level.
 	for _, it := range items {
-		critical := it.Level == "止盈" || it.Level == "止损" || it.Level == "清仓" || it.Level == "交易信号"
-		if !critical {
-			continue
-		}
 		key := it.ID
 		if key == "" {
 			key = it.Code + "@" + it.Level
@@ -3583,6 +3615,48 @@ func (e *Engine) captureDebug(rawNews []data.NewsItem, st0 newsagent.Stage0Resul
 	}
 	e.mu.Unlock()
 
+	e.persistStageRecords()
+}
+
+// captureNearRealtimeStage §LLM 面板修复：近实时打分循环每轮也会触发一次 Stage 快照，
+// 让 LLM 诊断页主面板在主循环空闲/无 L2 新闻时也能看到"原始新闻缓存"（待归因队列 + 已归因事件）。
+// 节流：距上次捕获 ≥ 60s 才落盘，避免每 5s 一次磁盘写入（低配服务器友好）。
+// English: near-realtime stage snapshot — the 5s scoring loop also emits a Stage record so the LLM
+// debug main panel always has a raw-news cache (pending queue + attributed events) even when the main
+// loop is idle or no L2 news arrived. Throttled to ≥ 60s between writes to avoid per-5s disk I/O.
+func (e *Engine) captureNearRealtimeStage() {
+	if e.newsAgent == nil {
+		return
+	}
+	e.mu.RLock()
+	last := e.lastStageCap
+	e.mu.RUnlock()
+	if !last.IsZero() && time.Since(last) < 60*time.Second {
+		return
+	}
+	pending := e.newsAgent.UnattributedItems()
+	events := e.newsAgent.AllEvents()
+	titles := make([]string, 0, len(pending))
+	for _, it := range pending {
+		if it.Title != "" {
+			titles = append(titles, it.Title)
+		}
+	}
+	e.mu.Lock()
+	e.lastStageCap = time.Now()
+	e.debugInfo = &newsagent.DebugInfo{
+		Stage1Mode:    "combined",
+		RawCount:      len(titles),
+		SelectedCount: 0,
+		RawTitles:     titles,
+		Stage2Events:  events,
+		ProcessTime:   time.Now(),
+	}
+	e.stageRecords = append(e.stageRecords, *e.debugInfo)
+	if len(e.stageRecords) > 20 {
+		e.stageRecords = e.stageRecords[len(e.stageRecords)-20:]
+	}
+	e.mu.Unlock()
 	e.persistStageRecords()
 }
 

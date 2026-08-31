@@ -186,6 +186,25 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.qmtCtrlFor(userIDFor(r))
 	// §可用资金：广州实盘账户资产（可用/冻结/总值/市值），随持仓接口一并返回供前端展示。
 	acc, _ := db.GetRealAccount(userIDFor(r))
+	// §实盘账户兜底：网关未上报 account 事件（或上报异常）时 GetRealAccount 返回零值行，
+	// 前端"可用资金 ¥0.00/总值 ¥0.00"失真。此时用持仓市值（实时价优先、缺则成本价）补总值/
+	// 市值，可用资金未知则保持 0（无法凭空造现金，前端按 updated_at 区分展示）。
+	// English: account fallback — when the gateway hasn't reported an account event, GetRealAccount
+	// returns a zero row and the frontend shows ¥0.00. We backfill total_asset/market_value from the
+	// positions (live price first, cost price as fallback); available cash stays 0 (unknowable here —
+	// the frontend distinguishes by updated_at).
+	if acc.UpdatedAt == "" && len(positions) > 0 {
+		var mv float64
+		for i := range positions {
+			price := positions[i].CurPrice
+			if price <= 0 {
+				price = positions[i].CostPrice
+			}
+			mv += price * float64(positions[i].Qty)
+		}
+		acc.MarketValue = mv
+		acc.TotalAsset = mv
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"positions": positions,
 		"account":   acc,

@@ -577,6 +577,7 @@ export default function Paper() {
     { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
     { colKey: 'code', title: '代码', width: 90 },
     { colKey: 'name', title: '名称', width: 100 },
+    { colKey: 'strategy', title: '战法', width: 110, cell: ({ row }) => <Tag>{row.strategy || '—'}</Tag> },
     { colKey: 'kind', title: '来源', width: 90, cell: ({ row }) => <Tag>{row.kind || '—'}</Tag> },
     { colKey: 'status', title: '状态', width: 90, cell: ({ row }) => <Tag theme={orderStatusTheme(row.status)}>{orderStatusText(row.status)}</Tag> },
     { colKey: 'qty', title: '数量', width: 70 },

@@ -589,7 +589,9 @@ export default function Positions() {
             {qmtState.gateway_url && <span className="muted">网关 {qmtState.gateway_url}</span>}
             {realAccount && (
               <span style={{ color: '#4fc3f7', fontWeight: 600 }}>
-                可用资金 ¥{(realAccount.available_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                可用资金 {realAccount.updated_at
+                  ? '¥' + (realAccount.available_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+                  : '—（网关未上报）'}
               </span>
             )}
             {realAccount && realAccount.total_asset > 0 && (

@@ -202,7 +202,15 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 	lines := strings.Split(out, "\n")
 	log.Printf("[scheduler] 任务 #%d saveSweepResults: 共 %d 行", taskID, len(lines))
 	matched := 0
-	// 遍历输出中所有 SWEEP_JSON 行（每战法一条，独立落库）
+	// §寻优修复 2026-08-31：此前逐战法独立调 SaveOptimizationResults——该函数"先清 task 旧行再插"，
+	// 每调一次就把上一战法的排名整批抹掉，多战法寻优只剩最后一条（N形）。现先把各战法 results 收拢
+	// 到一个切片，循环结束后一次性落库（单次 DELETE + 全量 INSERT），多战法排名全部保留。
+	// English: previously SaveOptimizationResults was called per strategy — but it DELETEs the task's old
+	// rows first, so each call wiped the previous strategy's rankings (only the last one survived).
+	// Now all strategies' results are collected into one slice and saved in a single call.
+	var allResults []map[string]any
+	objective := ""
+	// 遍历输出中所有 SWEEP_JSON 行（每战法一条，聚合后整批落库）
 	for _, line := range lines {
 		m := sweepJSONRe.FindStringSubmatch(line)
 		if len(m) != 2 {
@@ -223,10 +231,10 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 			log.Printf("[scheduler] 任务 #%d SWEEP_JSON 解析失败: %v", taskID, err)
 			continue
 		}
-		if err := db.SaveOptimizationResults(taskID, payload.Objective, payload.Results); err != nil {
-			log.Printf("[scheduler] 任务 #%d 扫参排名落库失败: %v", taskID, err)
-			continue
+		if objective == "" && payload.Objective != "" {
+			objective = payload.Objective
 		}
+		allResults = append(allResults, payload.Results...)
 		// §D2 冠军行附带信息（热力网格 + 批次冠军明细）回写 grid_json，前端详情渲染源
 		if len(payload.Grid) > 0 || len(payload.Batches) > 0 {
 			if extra, jerr := json.Marshal(map[string]any{
@@ -236,8 +244,15 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 				_ = db.UpdateOptimizationGrid(taskID, strategy, string(extra))
 			}
 		}
-		log.Printf("[scheduler] 任务 #%d 扫参排名已落库：%s %d 条（目标 %s）",
+		log.Printf("[scheduler] 任务 #%d 扫参排名收拢：%s %d 条（目标 %s）",
 			taskID, payload.Strategy, len(payload.Results), payload.Objective)
+	}
+	if len(allResults) > 0 {
+		if err := db.SaveOptimizationResults(taskID, objective, allResults); err != nil {
+			log.Printf("[scheduler] 任务 #%d 扫参排名聚合落库失败: %v", taskID, err)
+		} else {
+			log.Printf("[scheduler] 任务 #%d 扫参排名聚合落库成功: 全部 %d 条（目标 %s）", taskID, len(allResults), objective)
+		}
 	}
 	log.Printf("[scheduler] 任务 #%d saveSweepResults 完成: 匹配 %d 条 SWEEP_JSON", taskID, matched)
 }

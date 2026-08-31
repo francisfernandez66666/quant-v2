@@ -342,13 +342,45 @@ func (f *FactorStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	} else if eval.Confidence >= 0.6 {
 		prio = strategy.P2
 	}
+	meta := map[string]float64{"strategy_id": float64(candID)}
+	// §D1-D4 修复：因子战法此前 Meta 只带 strategy_id，前端 D1~D4 全 0。
+	// 现把贡献最大的 4 个因子分写入 d1..d4（前端维度列展示因子强度）。
+	// English: factor signals previously carried only strategy_id in Meta, so the frontend D1~D4 all
+	// rendered 0. Now the top-4 factor scores are written to d1..d4 for the dimension columns.
+	for i, fid := range topFactorIDs(eval.Details, 4) {
+		if i < 4 {
+			meta[[]string{"d1", "d2", "d3", "d4"}[i]] = eval.Details[fid]
+		}
+	}
 	return &strategy.Signal{
 		Code: code, Type: strategy.SignalFactor, Action: strategy.ActionBuy,
 		Priority: prio, Confidence: eval.Confidence,
 		StrategyName: ruleName,
-		Meta:         map[string]float64{"strategy_id": float64(candID)},
+		Meta:         meta,
 		Reason:       ruleName + "触发: " + strconv.FormatFloat(eval.TotalScore, 'f', 2, 64),
 	}, nil
+}
+
+// topFactorIDs 返回 Details 中值最大的前 n 个因子 ID（值降序，跳过零/空）。
+// English: returns the top-n factor IDs in Details by value (descending, skipping empty/zero).
+func topFactorIDs(details map[string]float64, n int) []string {
+	type kv struct {
+		k string
+		v float64
+	}
+	all := make([]kv, 0, len(details))
+	for k, v := range details {
+		all = append(all, kv{k, v})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].v > all[j].v })
+	if len(all) > n {
+		all = all[:n]
+	}
+	out := make([]string, 0, len(all))
+	for _, e := range all {
+		out = append(out, e.k)
+	}
+	return out
 }
 
 // RecordForwardReturn 记录某规则一条触发股的 5 日（Horizon）前向收益，用于效果监测。

@@ -667,9 +667,9 @@ func (a *Agent) applyLaodengToSignals(sigs []Signal, md *strategy_engine.StockMa
 // 返回做多信号列表，若输入的板块/个股为空或无可运行策略则返回 nil。
 //
 // 扫描流程：
-//   1. 遍历已验证的利好板块，对板块内每只个股执行评分
-//   2. 遍历个股直入列表，对每只个股执行评分
-//   3. 对最终信号批量附加盘口因子
+//  1. 遍历已验证的利好板块，对板块内每只个股执行评分
+//  2. 遍历个股直入列表，对每只个股执行评分
+//  3. 对最终信号批量附加盘口因子
 //
 // 参数：
 //   - input: 扫描输入，包含已验证板块、行情数据、D1评分等信息
@@ -732,17 +732,17 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 // （8a/8b 持续打分），只对通过的战法生成信号并返回。这是 8a/8b 打分与信号输出的统一入口。
 //
 // 核心流程：
-//   1. ST 个股屏蔽：名称以 ST/*ST/S*ST/退 开头的股票不产生任何信号
-//   2. 提取 D1 评分、事件描述、PE 等共享数据
-//   3. 并发调用各战法评分（龙头/双响炮/N形/龙回头）
-//   4. 对通过的战法生成信号，未通过的记录原因
-//   5. 处理 N 形一突/二突日内状态机
-//   6. 处理双响炮第二波日内确认
-//   7. 应用动量分提升门槛
-//   8. 应用情绪周期过滤
-//   9. 应用宏观利空门控
-//   10. 附加盘口因子
-//   11. 应用 Laodeng 置信度修正
+//  1. ST 个股屏蔽：名称以 ST/*ST/S*ST/退 开头的股票不产生任何信号
+//  2. 提取 D1 评分、事件描述、PE 等共享数据
+//  3. 并发调用各战法评分（龙头/双响炮/N形/龙回头）
+//  4. 对通过的战法生成信号，未通过的记录原因
+//  5. 处理 N 形一突/二突日内状态机
+//  6. 处理双响炮第二波日内确认
+//  7. 应用动量分提升门槛
+//  8. 应用情绪周期过滤
+//  9. 应用宏观利空门控
+//  10. 附加盘口因子
+//  11. 应用 Laodeng 置信度修正
 //
 // 参数：
 //   - input: 扫描输入（包含行情数据、D1评分等）
@@ -1172,21 +1172,44 @@ func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMa
 		return nil, nil
 	}
 	scores := make(map[string]StockScores, len(codes))
-	// 组装最小化 ScanInput：个股直入（无板块上下文）、打分池行情、D1 评分缓存、情绪阶段
-	// English: assemble a minimal ScanInput — direct stock inputs, pool market data, cached D1 scores,
-	// emotion phase.
+	// 组装最小化 ScanInput（共享只读字段）
+	// English: assemble a minimal ScanInput (shared read-only fields).
 	input := &ScanInput{MarketData: md, Scores: scores, D1Scores: d1Scores, EmotionPhase: emotionPhase}
 	now := time.Now()
-	var sigs []Signal
-	for _, code := range codes {
+	// 股票级并发：每只股票独立 goroutine 走 evalAll，各自持有本地 Scores map 避免并发写同一 map；
+	// 波态机/diag 均由内部互斥锁保护，结果按下标归位以保持确定性顺序。
+	// English: parallelize per stock — each goroutine runs evalAll with its own local Scores map
+	// (no concurrent writes to a shared map); wave machines / diagnostics are mutex-protected, and
+	// results are placed back by index so the final signal order stays deterministic.
+	type poolResult struct {
+		has bool
+		sc  StockScores
+		sig []Signal
+	}
+	results := make([]poolResult, len(codes))
+	var wg sync.WaitGroup
+	for i, code := range codes {
 		// L1 阻塞的股票跳过打分
 		// English: skip L1-blocked stocks.
 		if input.L1Blocked[code] {
 			continue
 		}
-		// 逐只走 evalAll，方向统一为做多、板块记为"个股"
-		// English: run evalAll per stock with a unified long direction and "个股" sector label.
-		sigs = append(sigs, a.evalAll(input, runners, code, md[code], nil, "做多", "个股", now)...)
+		wg.Add(1)
+		go func(i int, code string) {
+			defer wg.Done()
+			local := &ScanInput{MarketData: md, Scores: make(map[string]StockScores), D1Scores: d1Scores, EmotionPhase: emotionPhase}
+			sig := a.evalAll(local, runners, code, md[code], nil, "做多", "个股", now)
+			sc, ok := local.Scores[code]
+			results[i] = poolResult{has: ok, sc: sc, sig: sig}
+		}(i, code)
+	}
+	wg.Wait()
+	var sigs []Signal
+	for i, code := range codes {
+		if results[i].has {
+			scores[code] = results[i].sc
+		}
+		sigs = append(sigs, results[i].sig...)
 	}
 	return scores, sigs
 }
@@ -1526,10 +1549,10 @@ func markDataGap(sc *StockScores, t strategy.SignalType, md *strategy_engine.Sto
 // 流程与 ScanLong 对称：方向字段标记为"做空"，供上层做反向处理。
 //
 // 扫描流程：
-//   1. 检查做空开关，关闭则直接返回
-//   2. 遍历已验证的利空板块，对板块内每只个股执行评分
-//   3. 遍历个股直入列表，对每只个股执行评分
-//   4. 对最终信号批量附加盘口因子
+//  1. 检查做空开关，关闭则直接返回
+//  2. 遍历已验证的利空板块，对板块内每只个股执行评分
+//  3. 遍历个股直入列表，对每只个股执行评分
+//  4. 对最终信号批量附加盘口因子
 //
 // 参数：
 //   - input: 扫描输入，包含已验证板块、行情数据、D1评分等信息

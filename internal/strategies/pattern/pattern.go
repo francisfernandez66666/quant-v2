@@ -13,6 +13,7 @@ package pattern
 
 import (
 	"math"
+	"sort"
 	"sync"
 
 	"quant-trading-v2/internal/data"
@@ -257,13 +258,45 @@ func (s *PatternStrategy) GenerateSignal(code string, eval *strategy.Evaluation)
 	if ap != nil {
 		candID = ap.CandID
 	}
+	meta := map[string]float64{"strategy_id": float64(candID)}
+	// §D1-D4 修复：形态战法此前 Meta 只带 strategy_id，前端 D1~D4 全 0。
+	// 现把命中/得分最高的 4 个算子条件值写入 d1..d4（前端维度列展示形态条件强度）。
+	// English: pattern signals previously carried only strategy_id in Meta, so the frontend D1~D4 all
+	// rendered 0. Now the top-4 condition values are written to d1..d4 for the dimension columns.
+	for i, fid := range topConditionIDs(eval.Details, 4) {
+		if i < 4 {
+			meta[[]string{"d1", "d2", "d3", "d4"}[i]] = eval.Details[fid]
+		}
+	}
 	return &strategy.Signal{
 		Code: code, Type: strategy.SignalPattern, Action: strategy.ActionBuy,
 		Priority: prio, Confidence: eval.Confidence,
 		StrategyName: name,
-		Meta:         map[string]float64{"strategy_id": float64(candID)},
+		Meta:         meta,
 		Reason:       name + "触发: " + eval.Reasons["pattern"],
 	}, nil
+}
+
+// topConditionIDs 返回 Details 中值最大的前 n 个条件因子 ID（值降序，跳过零/空）。
+// English: returns the top-n condition factor IDs in Details by value (descending, skipping empty/zero).
+func topConditionIDs(details map[string]float64, n int) []string {
+	type kv struct {
+		k string
+		v float64
+	}
+	all := make([]kv, 0, len(details))
+	for k, v := range details {
+		all = append(all, kv{k, v})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].v > all[j].v })
+	if len(all) > n {
+		all = all[:n]
+	}
+	out := make([]string, 0, len(all))
+	for _, e := range all {
+		out = append(out, e.k)
+	}
+	return out
 }
 
 // seriesFromKLines 从日K构造 factorlib.StockSeries（仅价量字段）。

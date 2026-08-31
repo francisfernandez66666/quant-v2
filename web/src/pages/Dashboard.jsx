@@ -7,16 +7,6 @@ import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
 import LogModal from '../components/LogModal.jsx'
 
-// 将时间戳格式化为相对时间（如 5s前 / 3m前 / 2h前）
-function fmtAgo(ts) {
-  if (!ts || String(ts).startsWith('0001')) return ''
-  const sec = Math.floor((Date.now() - new Date(ts).getTime()) / 1000)
-  if (!Number.isFinite(sec) || sec < 0) return ''
-  if (sec < 60) return sec + 's前'
-  if (sec < 3600) return Math.floor(sec / 60) + 'm前'
-  return Math.floor(sec / 3600) + 'h前'
-}
-
 // 根据 IPO/上市日期计算倒计时或上市状态
 function ipoCountdown(c) {
   const ds = c.listing_date || c.ipo_date
@@ -122,11 +112,8 @@ export default function Dashboard() {
     if (!s || !s.enabled) return ''
     const parts = []
     parts.push(s.last_probe_ok ? '●' : '○')
-    if (s.last_latency_ms > 0) parts.push(s.last_latency_ms + 'ms')
     parts.push(s.mode === 'auto' ? '自动' : '手动')
     parts.push(s.tripped ? '⚠熔断' + (s.trip_reason ? ':' + s.trip_reason : '') : '正常')
-    const ra = fmtAgo(s.last_report_at)
-    if (ra) parts.push('回报' + ra)
     return parts.join(' ')
   }, [qmtState])
 

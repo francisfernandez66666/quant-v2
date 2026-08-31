@@ -141,25 +141,6 @@ export default function Quant() {
     const n = Number(v) || 0
     return (n > 0 ? '+' : '') + n.toFixed(2)
   }
-  // 将时间戳格式化为「x秒前 / x分前 / x小时前」。
-  // 兼容两种来源：后端 time.Time 默认序列化为 RFC3339 字符串（如 "2026-08-28T00:01:01Z"），
-  // 也可能是 Unix 秒级数字；统一归一后再计算，避免字符串做乘法得到 NaN。
-  function fmtAgo(ts) {
-    if (!ts) return ''
-    let sec
-    if (typeof ts === 'string') {
-      const d = new Date(ts)
-      if (isNaN(d.getTime())) return ''
-      sec = Math.floor((Date.now() - d.getTime()) / 1000)
-    } else {
-      sec = Math.floor((Date.now() - ts * 1000) / 1000)
-    }
-    if (isNaN(sec) || sec < 0) return ''
-    if (sec < 60) return sec + '秒前'
-    if (sec < 3600) return Math.floor(sec / 60) + '分前'
-    return Math.floor(sec / 3600) + '小时前'
-  }
-
   // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启。
   // 失败时置 loadErr 告警（页面顶部显示），并向上抛出由调用方决定是否 toast。
   async function loadConfig() {
@@ -382,14 +363,12 @@ export default function Quant() {
         {state && state.enabled ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
             <span style={{ color: state.last_probe_ok ? '#00a870' : '#666' }}>●</span>
-            <span>首尔 ↔ 广州</span>
+            <span>本机网关（实盘闭环，无两地互通）</span>
             <span style={{ fontFamily: 'monospace', color: '#4fc3f7' }}>{state.gateway_url}</span>
-            {state.last_latency_ms > 0 && <Tag size="small"> {state.last_latency_ms}ms</Tag>}
             <Tag size="small" theme={state.tripped ? 'danger' : 'success'}>
               {state.tripped ? '熔断:' + (state.trip_reason || '未知') : '正常'}
             </Tag>
             <span>{state.mode === 'auto' ? '自动' : '手动'}</span>
-            {fmtAgo(state.last_report_at) && <span>回报{fmtAgo(state.last_report_at)}</span>}
           </div>
         ) : state ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>

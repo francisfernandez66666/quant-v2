@@ -480,6 +480,23 @@ func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 	return klines, cf
 }
 
+// LastClose 返回个股最近一根日K的收盘价（走日K缓存，非交易时段/停牌也有昨收），无数据返回 0。
+// §纸面估值修复：模拟盘持仓若不在 5s 快照池（非跟踪股），MarkToMarket 收不到实时价导致
+// Mark 一直为 0 → 前端现价显示 0.00、浮亏 -100%。引擎侧用最近收盘价回填估值价。
+// English: returns the latest daily-bar close for a code (via the day-K cache — works after hours /
+// for suspended stocks; 0 when unavailable). Paper marks fall back to this when a held code is missing
+// from the live 5s snapshot, so it never displays 0.00 / -100%.
+func (e *Engine) LastClose(code string) float64 {
+	if e == nil {
+		return 0
+	}
+	klines, _ := e.cachedKLine(code)
+	if len(klines) == 0 {
+		return 0
+	}
+	return klines[len(klines)-1].Close
+}
+
 // fetchDayKLine 按 新浪→同花顺→腾讯→东财 降级链拉取日 K 线（120 根）。
 // 任一源返回有效数据即停；全失败时统计"失败"并返回 nil。
 // （fetchDayKLine fetches 120 daily bars via the Sina→THS→Tencent→Eastmoney chain. Stops at the first valid source;

@@ -58,7 +58,25 @@ func (s *Server) handlePaperPositions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, []paper.Position{})
 		return
 	}
-	writeJSON(w, 200, pe.Positions())
+	// §纸面估值修复：持仓不在 5s 快照池（非跟踪股/盘后/重启后）时 Mark 可能为 0，前端现价显示 0.00、
+	// 浮亏 -100% 失真。展示层兜底：Mark<=0 时先用实时行情（快照→单查），再无则回退成本价，
+	// 保证 PnL 不虚报 -100%。不改持久化，仅响应层装配。
+	// English: display-time mark fallback — a held code missing from the live snapshot (non-pool / after
+	// hours / after restart) may carry Mark=0, which the frontend renders as 0.00 and -100% (false). Here
+	// we backfill: try the live quote first (snapshot → single fetch), else fall back to the cost price
+	// so PnL is never misreported as -100%. Response-layer only; persistence untouched.
+	positions := pe.Positions()
+	for i := range positions {
+		if positions[i].Mark > 0 {
+			continue
+		}
+		if si := s.quoteDisplay(positions[i].Code); si != nil && si.Price > 0 {
+			positions[i].Mark = si.Price
+		} else if positions[i].CostPrice > 0 {
+			positions[i].Mark = positions[i].CostPrice
+		}
+	}
+	writeJSON(w, 200, positions)
 }
 
 // handlePaperTrades 返回模拟盘成交记录（最新在前）。
@@ -121,15 +139,15 @@ func (s *Server) handlePaperSelfCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	path := pe.Path()
 	info := map[string]interface{}{
-		"enabled":      pe.Enabled(),
-		"is_admin":     s.auth.IsAdmin(uid),
-		"engine_path":  path,
-		"has_filled":   pe.HasFilled(),
-		"positions":    len(pe.Positions()),
-		"trades":       len(pe.Trades()),
-		"orders":       len(pe.Orders()),
+		"enabled":       pe.Enabled(),
+		"is_admin":      s.auth.IsAdmin(uid),
+		"engine_path":   path,
+		"has_filled":    pe.HasFilled(),
+		"positions":     len(pe.Positions()),
+		"trades":        len(pe.Trades()),
+		"orders":        len(pe.Orders()),
 		"equity_points": len(pe.Equity()),
-		"pools":        len(pe.StrategyPools()),
+		"pools":         len(pe.StrategyPools()),
 	}
 	// paper.json 物理文件状态
 	if path != "" {
@@ -146,10 +164,10 @@ func (s *Server) handlePaperSelfCheck(w http.ResponseWriter, r *http.Request) {
 	poolSummary := make([]map[string]interface{}, 0)
 	for _, p := range pe.StrategyPools() {
 		poolSummary = append(poolSummary, map[string]interface{}{
-			"strategy": p.Key,
-			"name":     p.Label,
+			"strategy":  p.Key,
+			"name":      p.Label,
 			"positions": p.Positions,
-			"cash":     p.Cash,
+			"cash":      p.Cash,
 		})
 	}
 	info["pool_detail"] = poolSummary

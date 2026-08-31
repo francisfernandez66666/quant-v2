@@ -340,7 +340,10 @@ func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInf
 		}
 		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
 			if inSession {
-				pe.MarkToMarket(quotes)
+				// §纸面估值修复：与 engine.paperMark 同口径——快照缺价的持仓用最近收盘价回填估值。
+				// English: same backfill as engine.paperMark — held codes missing from the snapshot get
+				// marked with their last daily close.
+				pe.MarkToMarket(backfillPaperQuotes(e, pe, quotes))
 				pe.Snapshot(now)
 			}
 			r.checkDayClose(uid, pe, now)

@@ -194,7 +194,9 @@ export default function App() {
     }
     if (msg && msg.type === 'message' && msg.item) {
       const level = msg.item.level || ''
-      const critical = level.indexOf('止盈') >= 0 || level.indexOf('止损') >= 0 || level.indexOf('清仓') >= 0 || level.indexOf('交易信号') >= 0 || level.indexOf('买入') >= 0
+      // 系统弹窗仅限交易/风控关键级别；持仓提示、卖点评估等低级别只进消息中心，避免打扰
+      // English: only trading/risk-critical levels raise system notifications; low-level notices stay in the message center.
+      const critical = level.indexOf('止盈') >= 0 || level.indexOf('止损') >= 0 || level.indexOf('清仓') >= 0 || level.indexOf('交易信号') >= 0
       if (critical) {
         const code = msg.item.code || ''
         const name = msg.item.name || ''
