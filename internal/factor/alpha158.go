@@ -166,6 +166,8 @@ func turnoverStd20(s *StockSeries) []float64 {
 	return indicator.RollingStd(s.Turnover, 20)
 }
 
+// init 在包加载阶段注册本文件定义的因子（ID/名称/分类/计算函数）进全局注册表。
+// English: registers this file's factor definitions into the global registry at package init.
 func init() {
 	// 动量
 	Register(Def{ID: "RSI14", Name: "14日RSI", Cat: CatMomentum, Desc: "Wilder 平滑 RSI14", Compute: rsi14})

@@ -19,7 +19,10 @@ func momentum(n int) func(*StockSeries) []float64 {
 	}
 }
 
+// init 在包加载阶段注册本文件定义的因子（ID/名称/分类/计算函数）进全局注册表。
+// English: registers this file's factor definitions into the global registry at package init.
 func init() {
+	// 注册动量类因子定义（多窗口收益动量；init 阶段登记进全局注册表）。
 	Register(Def{ID: "Mom5", Name: "5日动量", Cat: CatMomentum, Desc: "过去5日收益", Compute: momentum(5)})
 	Register(Def{ID: "Mom10", Name: "10日动量", Cat: CatMomentum, Desc: "过去10日收益", Compute: momentum(10)})
 	Register(Def{ID: "Mom20", Name: "20日动量", Cat: CatMomentum, Desc: "过去20日收益", Compute: momentum(20)})

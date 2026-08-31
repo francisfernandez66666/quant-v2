@@ -129,6 +129,7 @@ type simMetrics struct {
 	otherN   int
 }
 
+// addQuote 记一笔行情数据注入时延（线程安全，锁内累加计数）。
 func (m *simMetrics) addQuote(d time.Duration) {
 	m.mu.Lock()
 	m.quoteMs += d

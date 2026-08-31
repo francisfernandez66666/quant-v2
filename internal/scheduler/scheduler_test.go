@@ -254,6 +254,7 @@ func shQuote(s string) string {
 	return "'" + s + "'"
 }
 
+// callCount 统计日志文件中 FAKE 前缀行数（验证作业执行次数）。
 func callCount(t *testing.T, logPath string) int {
 	t.Helper()
 	data, err := os.ReadFile(logPath)
@@ -270,6 +271,7 @@ func callCount(t *testing.T, logPath string) int {
 	return n
 }
 
+// waitFor 轮询等待条件满足，超时即测试失败。
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -453,6 +455,7 @@ func TestNightlyCrossDayReplacesJob(t *testing.T) {
 	waitIdleAndSettle(t, s)
 }
 
+// TestRunCancelsJob 验证 Run(ctx) 退出时取消正在运行的作业。
 func TestRunCancelsJob(t *testing.T) {
 	// Run(ctx) 退出时应 kill 正在运行的作业（CommandContext 取消）
 	t.Setenv("FAKE_SLEEP", "5")

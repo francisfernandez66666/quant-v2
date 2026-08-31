@@ -8,10 +8,12 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// newRisk 构造测试用风控引擎（默认配置）。
 func newRisk() *Engine {
 	return New(config.NewManager(""))
 }
 
+// signal 构造测试信号。
 func signal(code string, prio strategy.Priority, action strategy.TradeAction) *strategy.Signal {
 	return &strategy.Signal{Code: code, Priority: prio, Action: action}
 }

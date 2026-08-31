@@ -15,6 +15,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// testDB 打开临时目录下的测试库并注册清理。
 func testDB(t *testing.T) *store.DB {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -179,10 +180,12 @@ func TestControllerTripAndIdempotent(t *testing.T) {
 	}
 }
 
+// stringsContains 手写子串包含判断（测试断言辅助，避免依赖标准库 strings 之外行为）。
 func stringsContains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || indexOf(s, sub) >= 0)
 }
 
+// indexOf 手写子串首现下标（-1=未找到），供 stringsContains 使用。
 func indexOf(s, sub string) int {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
@@ -196,6 +199,7 @@ func indexOf(s, sub string) int {
 // （failingExecutor simulates an unreachable gateway.）
 type failingExecutor struct{}
 
+// PlaceBuy 模拟网关失联：返回 DeadlineExceeded。
 func (failingExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) {
 	return nil, context.DeadlineExceeded
 }
@@ -204,7 +208,11 @@ func (failingExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) {
 func (failingExecutor) PlaceSell(req OrderRequest) (*OrderResult, error) {
 	return nil, context.DeadlineExceeded
 }
-func (failingExecutor) Cancel(orderID string) error   { return context.DeadlineExceeded }
+
+// Cancel 模拟网关失联：返回 DeadlineExceeded。
+func (failingExecutor) Cancel(orderID string) error { return context.DeadlineExceeded }
+
+// State 模拟网关失联：返回 DeadlineExceeded。
 func (failingExecutor) State() (*GatewayState, error) { return nil, context.DeadlineExceeded }
 
 // Health Health。

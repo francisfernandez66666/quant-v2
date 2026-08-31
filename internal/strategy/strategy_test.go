@@ -33,6 +33,7 @@ func TestIsActionWatchOrAbove(t *testing.T) {
 	}
 }
 
+// lad 返回测试用 Laodeng 配置。
 func lad() *config.LaodengConfig {
 	return &config.LaodengConfig{
 		Enabled:      true,

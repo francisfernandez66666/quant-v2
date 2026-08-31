@@ -834,7 +834,14 @@ func (e *Engine) StartBuyDispatcher(n int) {
 		e.buyWg.Add(1)
 		go func() {
 			defer e.buyWg.Done()
-			stop := e.buyStop // 本地引用，StopBuyDispatcher 关闭后即可退出
+			// 加锁读取，避免与 StopBuyDispatcher 写 e.buyStop=nil 形成数据竞争
+			// English: read under lock to avoid a data race with StopBuyDispatcher.
+			e.mu.RLock()
+			stop := e.buyStop
+			e.mu.RUnlock()
+			if stop == nil {
+				return
+			}
 			for {
 				select {
 				case t := <-e.buyCh:

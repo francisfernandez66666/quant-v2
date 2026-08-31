@@ -11,6 +11,7 @@ import (
 	"quant-trading-v2/internal/notify"
 )
 
+// item 构造消息条目（测试辅助）。
 func item(id, code, level, body string) data.MessageItem {
 	return data.MessageItem{ID: id, Code: code, Name: code, Level: level, Body: body, GeneratedAt: time.Now()}
 }

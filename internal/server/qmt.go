@@ -340,11 +340,6 @@ func normalizeTsCode(code string) string {
 	}
 }
 
-// handleQMTReport 接收网关回报（POST /api/qmt/report，Bearer token 鉴权）。
-// 事件类型：trade（成交）/ order（委托）/ positions（全量对账）/ disconnect（断线）。
-// 落库 → SSE 推前端 → 断线触发熔断并告警。
-// English: receives gateway reports (POST /api/qmt/report, Bearer auth). Event types: trade/order/
-// positions/disconnect. Persists → SSE to frontend; disconnect trips the breaker and alerts.
 // normalizeReportSide 将网关回报的 side 字段归一为账本内部标准串（"买入"/"卖出"）。
 // §安全 T3（2026-08-29）：网关若回报 buy/BUY/买入（含首尾空格）等非精确串，ApplyRealFill 仅认
 // "买入"/"卖出"，非精确串会全部走 else（卖）分支 → 持仓被静默清零。此处先归一，非预期值直接报错，
@@ -360,6 +355,11 @@ func normalizeReportSide(raw string) (string, error) {
 	return "", fmt.Errorf("未知回报方向(side=%q)", raw)
 }
 
+// handleQMTReport 接收网关回报（POST /api/qmt/report，Bearer token 鉴权）。
+// 事件类型：trade（成交）/ order（委托）/ positions（全量对账）/ disconnect（断线）。
+// 落库 → SSE 推前端 → 断线触发熔断并告警。
+// English: receives gateway reports (POST /api/qmt/report, Bearer auth). Event types: trade/order/
+// positions/disconnect. Persists → SSE to frontend; disconnect trips the breaker and alerts.
 func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
 	db := s.realDB()

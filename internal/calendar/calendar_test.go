@@ -8,6 +8,7 @@ import (
 	"quant-trading-v2/internal/config"
 )
 
+// ev 构造日历事件（测试辅助）。
 func ev(date, title, impact string, adv int) config.CalendarEvent {
 	return config.CalendarEvent{Date: date, Title: title, Impact: impact, DaysAdvance: adv}
 }

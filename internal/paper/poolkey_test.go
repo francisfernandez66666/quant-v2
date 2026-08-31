@@ -83,6 +83,7 @@ func TestApplyPoolMinScoreMergeAndClear(t *testing.T) {
 	e.ApplyPoolMinScore("other", 50) // 未启用类型不报错即可
 }
 
+// TestSetPoolBuyRulePersistedAcrossReload 验证池买入纪律跨重载持久化。
 func TestSetPoolBuyRulePersistedAcrossReload(t *testing.T) {
 	// §A1 回归：此前 SetPoolBuyRule 缺 persist() 导致纪律重启即丢
 	path := filepath.Join(t.TempDir(), "paper_state.json")

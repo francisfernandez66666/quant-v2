@@ -59,6 +59,13 @@ function drawPolyline(ctx, coords) {
   ctx.stroke()
 }
 
+/**
+ * 分时图组件
+ * Canvas 绘制个股分时价格线、均价线、成交量柱、MACD（DIF/DEA/柱），
+ * 价格线按相对昨收动态红涨绿跌并填充区域，支持容器自适应与 hover 十字线。
+ * @param {{code:string, name?:string, height?:number, scale?:number, count?:number}} props
+ * @returns {JSX.Element}
+ */
 export default function KLineChart({
   code,
   name = '',

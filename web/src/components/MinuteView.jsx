@@ -4,6 +4,12 @@ import React from 'react'
 import KLineChart from './KLineChart.jsx'
 import DepthPanel from './DepthPanel.jsx'
 
+/**
+ * 分时视图容器组件
+ * 将分时图与买卖盘组合为一个自适应容器：分时图占满整行宽度，盘口在其下方。
+ * @param {{code:string, name?:string}} props
+ * @returns {JSX.Element}
+ */
 export default function MinuteView({ code, name }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '100%' }}>

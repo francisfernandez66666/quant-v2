@@ -14,6 +14,8 @@ func sue(s *StockSeries) []float64 {
 	return fieldOrNaN(s.SingleQuarterNIYoy, s.Len())
 }
 
+// init 在包加载阶段注册本文件定义的因子（ID/名称/分类/计算函数）进全局注册表。
+// English: registers this file's factor definitions into the global registry at package init.
 func init() {
 	Register(Def{ID: "YoyNetProfit", Name: "净利同比", Cat: CatGrowth, Desc: "归母净利同比（%），点对时", Compute: yoyNetProfit})
 	Register(Def{ID: "SUE", Name: "单季净利同比", Cat: CatGrowth, Desc: "SUE 降级版（单季净利同比 %），B3 层做截面 Z", Compute: sue})

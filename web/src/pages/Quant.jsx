@@ -11,22 +11,26 @@ import * as api from '../api/index.js'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
+// 战法类型展示名映射：形态（内置）/因子/形态自动发现，用于标签渲染
 const KIND_LABELS = {
   form: '形态战法（内置）',
   factor: '因子战法',
   pattern: '形态自动发现战法',
 }
+// 战法类型展示顺序：按 内置→因子→自动发现 排列 tab
 const KIND_ORDER = ['form', 'factor', 'pattern']
 
 // 本地缓存键：切换 tab 时先显示上次成功加载的配置，避免开关/参数瞬间跳回默认值。
 // 键含当前账号名（多账号隔离），防止 A 账号的表单缓存串给 B 账号显示。
 const STORAGE_QMT_FORM_BASE = 'liangzai_qmt_form'
 
+// cachedFormKey 返回当前账号专属的缓存键（多账号隔离：拼接账号名）。
 function cachedFormKey() {
   const acc = (typeof api.getAccount === 'function' && api.getAccount()) || ''
   return acc ? STORAGE_QMT_FORM_BASE + ':' + acc : STORAGE_QMT_FORM_BASE
 }
 
+// readCachedForm 读取本地缓存的实盘表单配置；无缓存时回退旧键并返回 null。
 function readCachedForm() {
   try {
     const raw = localStorage.getItem(cachedFormKey()) || localStorage.getItem(STORAGE_QMT_FORM_BASE)
@@ -35,6 +39,7 @@ function readCachedForm() {
   return null
 }
 
+// writeCachedForm 把实盘表单配置写入本地缓存（当前账号专属键）。
 function writeCachedForm(form) {
   try {
     localStorage.setItem(cachedFormKey(), JSON.stringify(form))

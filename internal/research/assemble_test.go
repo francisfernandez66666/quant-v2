@@ -248,10 +248,12 @@ func TestReportEndToEnd(t *testing.T) {
 	}
 }
 
+// bytesContains 手写字节子串包含判断（测试断言辅助）。
 func bytesContains(b, sub []byte) bool {
 	return len(sub) == 0 || (len(b) >= len(sub) && indexBytes(b, sub) >= 0)
 }
 
+// indexBytes 手写字节子串首现下标（测试断言辅助）。
 func indexBytes(b, sub []byte) int {
 	for i := 0; i+len(sub) <= len(b); i++ {
 		if string(b[i:i+len(sub)]) == string(sub) {

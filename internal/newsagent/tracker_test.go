@@ -167,6 +167,7 @@ func TestPrunePendingWindow(t *testing.T) {
 	_ = tr.save()
 }
 
+// itoa 手写整数转字符串（测试辅助）。
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

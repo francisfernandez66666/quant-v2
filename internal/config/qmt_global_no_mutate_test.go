@@ -1,3 +1,6 @@
+// qmt_global_no_mutate_test.go 账号级 QMT 配置保存的"全局不改写"回归测试。
+// 覆盖 §全局指针副作用 bug：无账号级覆盖时 userRules 曾返回全局地址，SetQMTConfigFor
+// 会误改全局配置。文件头即注册一个内存 KVStore，供测试构造 per-user 覆盖。
 package config
 
 import "testing"
@@ -5,6 +8,7 @@ import "testing"
 // memStore 极简 KVStore 实现，仅供单测构造 per-user 覆盖。
 type memStore struct{ m map[string]map[string]string }
 
+// SetConfig 按 用户ID+key 写一条配置到内存 map（懒初始化两级 map）。
 func (k *memStore) SetConfig(u, key, v string) error {
 	if k.m == nil {
 		k.m = map[string]map[string]string{}
@@ -15,6 +19,8 @@ func (k *memStore) SetConfig(u, key, v string) error {
 	k.m[u][key] = v
 	return nil
 }
+
+// GetConfig 按 用户ID+key 读一条配置；不存在返回 ("", false)。
 func (k *memStore) GetConfig(u, key string) (string, bool) {
 	if k.m == nil {
 		return "", false

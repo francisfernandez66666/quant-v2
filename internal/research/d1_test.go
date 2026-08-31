@@ -141,6 +141,7 @@ func d1SeedDB(t *testing.T) *store.DB {
 	return db
 }
 
+// mustFactor 按 ID 从注册表取因子定义，缺失即测试失败。
 func mustFactor(t *testing.T, id string) factor.Def {
 	t.Helper()
 	d, ok := factor.Get(id)
@@ -150,6 +151,7 @@ func mustFactor(t *testing.T, id string) factor.Def {
 	return d
 }
 
+// sin 测试用正弦别名。
 func sin(v float64) float64 { return math.Sin(v) }
 
 // addTradeDay 简单推进交易日历（跳过周末，忽略节假日——测试只需日期排序与预热窗口足够）。
@@ -171,6 +173,7 @@ func addTradeDay(start string, offset int) string {
 	}
 }
 
+// dayOfWeek 计算某日期为周几（Zeller 或直接查表，测试用）。
 func dayOfWeek(y, m, d int) int {
 	// Sakamoto 算法：0=周日
 	// English: Sakamoto's algorithm: 0=Sunday
@@ -181,6 +184,7 @@ func dayOfWeek(y, m, d int) int {
 	return (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7
 }
 
+// nextDay 返回下一天 (y,m,d)。
 func nextDay(y, m, d int) (int, int, int) {
 	d++
 	dim := []int{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
@@ -198,6 +202,7 @@ func nextDay(y, m, d int) (int, int, int) {
 	return y, m, d
 }
 
+// fmtDate 格式化为 YYYYMMDD 字符串。
 func fmtDate(y, m, d int) string {
 	return fmt.Sprintf("%04d%02d%02d", y, m, d)
 }

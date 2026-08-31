@@ -47,6 +47,7 @@ func TestUniformExitV2Trailing(t *testing.T) {
 	}
 }
 
+// TestUniformExitV2TakeProfit 验证统一离场 V2：涨破止盈线即卖（止盈优先，净额口径）。
 func TestUniformExitV2TakeProfit(t *testing.T) {
 	// 止盈线优先：涨破 8% 即卖，不等回撤也不等超期
 	closes := []float64{100, 104, 109, 112, 115}
@@ -61,6 +62,7 @@ func TestUniformExitV2TakeProfit(t *testing.T) {
 	}
 }
 
+// TestUniformExitV2StopLoss 验证统一离场 V2：跌破止损线立即卖出控制损失。
 func TestUniformExitV2StopLoss(t *testing.T) {
 	// 止损线优先于一切：跌破 -5% 立即卖出控制损失（不等盈利确认、不等超期）
 	closes := []float64{100, 98, 95, 94, 96}
@@ -75,6 +77,7 @@ func TestUniformExitV2StopLoss(t *testing.T) {
 	}
 }
 
+// TestUniformExitV2Timeout 验证统一离场 V2：温和上涨无触发条件时持仓满期超时兜底离场。
 func TestUniformExitV2Timeout(t *testing.T) {
 	// 温和上涨不触发任何止盈条件 → 持仓满 5 天超期兜底离场
 	closes := []float64{100, 101, 102, 103, 104, 105, 106, 107, 108}
@@ -86,6 +89,7 @@ func TestUniformExitV2Timeout(t *testing.T) {
 	}
 }
 
+// TestUniformExitV2NeverProfitable 验证统一离场 V2：单边下跌不触发移动止盈，止损关闭时靠超期结算亏损。
 func TestUniformExitV2NeverProfitable(t *testing.T) {
 	// 单边下跌：stageHigh 永不超过 entry → 移动止盈不触发；止损线关闭时靠超期结算亏损
 	closes := []float64{100, 95, 92, 90, 89, 88}
@@ -96,6 +100,7 @@ func TestUniformExitV2NeverProfitable(t *testing.T) {
 	}
 }
 
+// TestUniformExitV2ForcedClose 验证统一离场 V2：数据末尾仍未满足出场条件时末日收盘强制结算。
 func TestUniformExitV2ForcedClose(t *testing.T) {
 	// 数据末尾仍未满足任何出场条件 → 末日收盘强制结算
 	closes := []float64{100, 102, 103, 101}
@@ -124,6 +129,7 @@ func TestApplyComboParamsRestoreRuleAdapter(t *testing.T) {
 	}
 }
 
+// TestApplyComboParamsRestoreBuiltinConfig 验证组合参数应用后内置配置可完整恢复。
 func TestApplyComboParamsRestoreBuiltinConfig(t *testing.T) {
 	// 内置战法适配器：改写出厂配置的出场旋钮，restore 后逐字段还原
 	cfg := &config.DoubleBumpConfig{TrailingDrawbackPct: 8, DoubleBumpTakeProfitPct: 10, MaxHoldDays: 20}
@@ -138,6 +144,7 @@ func TestApplyComboParamsRestoreBuiltinConfig(t *testing.T) {
 	}
 }
 
+// TestApplyComboParamsUnknownAdapterSafe 验证未知适配器参数时安全忽略不 panic。
 func TestApplyComboParamsUnknownAdapterSafe(t *testing.T) {
 	// 未识别的适配器类型：返回空恢复函数，绝不 panic
 	restore := applyComboParams(fakeAdapter{}, 10, 5, 20, 0)
@@ -147,11 +154,18 @@ func TestApplyComboParamsUnknownAdapterSafe(t *testing.T) {
 // fakeAdapter 仅实现 adapter 接口的最小桩，用于未知类型的健壮性验证。
 type fakeAdapter struct{}
 
-func (fakeAdapter) Name() string        { return "fake" }
+// Name 返回测试桩适配器名称。
+func (fakeAdapter) Name() string { return "fake" }
+
+// Description 返回测试桩适配器描述。
 func (fakeAdapter) Description() string { return "" }
+
+// Trigger 测试桩触发函数：永不触发（返回空结果）。
 func (fakeAdapter) Trigger(_ []data.KLine, _, _ float64) (map[string]float64, bool) {
 	return nil, false
 }
+
+// Exit 测试桩离场函数：永不触发离场（返回空结果）。
 func (fakeAdapter) Exit(_ *strategy.ExitContext, _ []strategy.KLine) (*strategy.ExitResult, bool) {
 	return nil, false
 }
@@ -179,6 +193,7 @@ func TestObjectiveValueRanking(t *testing.T) {
 	}
 }
 
+// abs 返回浮点绝对值（测试断言辅助）。
 func abs(f float64) float64 {
 	if f < 0 {
 		return -f
@@ -186,6 +201,8 @@ func abs(f float64) float64 {
 	return f
 }
 
+// TestScoreQuantilesAdaptive 验证自适应门槛：分布 60~95 应切分递增阈值，
+// 样本不足与全同分（无区分度）应返回 nil（免疫机制）。
 func TestScoreQuantilesAdaptive(t *testing.T) {
 	// 分布 60~95：p40/p60/p80/p95 应真实切分且各不相同
 	scores := make([]float64, 100)
@@ -215,6 +232,7 @@ func TestScoreQuantilesAdaptive(t *testing.T) {
 	}
 }
 
+// TestStepRange 验证步进序列：含起终点、步长正确、两位小数无浮点尾差。
 func TestStepRange(t *testing.T) {
 	// 步进序列：含起终点、步长正确、两位小数无浮点尾差
 	got := stepRange(5, 15, 2.5)

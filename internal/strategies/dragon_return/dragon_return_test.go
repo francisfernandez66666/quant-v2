@@ -8,6 +8,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// newDR 构造测试用龙回头策略实例。
 func newDR() *DragonReturnStrategy {
 	return New(config.NewManager(""))
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 )
 
+// seedSweepResults 构造扫参结果测试数据。
 func seedSweepResults() []map[string]any {
 	return []map[string]any{
 		{"rank": 1.0, "strategy": "双响炮", "strategy_kind": "",

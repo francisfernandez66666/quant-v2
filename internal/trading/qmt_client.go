@@ -168,6 +168,8 @@ func (c *QMTClient) State() (*GatewayState, error) {
 	return st, nil
 }
 
+// stateOnce 单次查询网关状态与持仓（不重试），State 的重试语义在其调用方实现。
+// English: single-shot gateway state/positions query (no retry); retry semantics live in State().
 func (c *QMTClient) stateOnce() (*GatewayState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
@@ -211,6 +213,8 @@ func (c *QMTClient) Health() (bool, error) {
 	return ok, nil
 }
 
+// healthOnce 单次探测网关健康（不重试）；语义见 Health 注释，重试由 Health 负责。
+// English: single-shot gateway health probe (no retry); see Health for semantics and retry.
 func (c *QMTClient) healthOnce() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()

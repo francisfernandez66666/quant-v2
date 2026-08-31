@@ -10,6 +10,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// newCfg 构造测试用配置管理器。
 func newCfg() *config.Manager {
 	m := config.NewManager("")
 	cfg := m.Get()

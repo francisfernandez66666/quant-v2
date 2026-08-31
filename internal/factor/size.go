@@ -18,6 +18,9 @@ func lnMktCap(s *StockSeries) []float64 {
 	return out
 }
 
+// init 在包加载阶段注册本文件定义的因子（ID/名称/分类/计算函数）进全局注册表。
+// English: registers this file's factor definitions into the global registry at package init.
 func init() {
+	// 注册规模类因子定义（对数市值，init 阶段登记进全局注册表）。
 	Register(Def{ID: "LnMktCap", Name: "对数市值", Cat: CatSize, Desc: "ln(原始价×股本)，规模因子", Compute: lnMktCap})
 }

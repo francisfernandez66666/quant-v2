@@ -13,6 +13,7 @@ func mkSig(code, dir string) combat_agent.Signal {
 	return combat_agent.Signal{Code: code, Name: "测试", Direction: dir, Action: "buy", Confidence: 1.0}
 }
 
+// quote 构造测试行情快照。
 func quote(chg float64) *data.StockInfo { return &data.StockInfo{Price: 10, ChangePct: chg} }
 
 // TestFilterStaleSignals_LongRed 做多信号当日转绿 → 从当前信号展示中撤下。

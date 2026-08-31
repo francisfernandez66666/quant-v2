@@ -145,6 +145,9 @@ func better(a, b OptResult, metric string) bool {
 	return va > vb
 }
 
+// cloneWeights 深拷贝权重表并对副本做 L1 归一化（总和=1；全零时原样返回）。
+// 供扫参/审批时生成规范化权重，避免调用方持有的原表被间接改写。
+// English: deep-copies a weight map and L1-normalizes the copy (sum to 1; all-zero returns as-is).
 func cloneWeights(w map[string]float64) map[string]float64 {
 	out := make(map[string]float64, len(w))
 	for k, v := range w {

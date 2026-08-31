@@ -97,6 +97,7 @@ func TestStreamingEnabled(t *testing.T) {
 	}
 }
 
+// defaultLLM 返回默认 LLM 配置（测试辅助）。
 func defaultLLM() *LLMConfig { return &LLMConfig{} }
 
 // TestRuntimeConfigIntervalDefaults A+B 快速执行器配置：默认回退 5s，可配置更低值。

@@ -7,6 +7,7 @@ import (
 	"time"
 )
 
+// TestPerfMetricsKnownSeries 验证已知序列的绩效指标计算。
 func TestPerfMetricsKnownSeries(t *testing.T) {
 	// 稳定 +1%/笔 ×100 笔、首末相隔 99 个自然日：均值 1%、std=0 → Sharpe=0；
 	// 净值单调上升 → MDD≈0、Calmar≈0；年化按实际跨度复利折算。
@@ -25,6 +26,7 @@ func TestPerfMetricsKnownSeries(t *testing.T) {
 	}
 }
 
+// TestPerfMetricsDrawdownAndSharpe 验证回撤与夏普比率计算。
 func TestPerfMetricsDrawdownAndSharpe(t *testing.T) {
 	// 序列：+20% 后 -10%（净值 1.2→1.08，MDD=(1.2-1.08)/1.2=10%）
 	pnls := []float64{20, -10}
@@ -48,6 +50,7 @@ func TestPerfMetricsDrawdownAndSharpe(t *testing.T) {
 	}
 }
 
+// TestPerfMetricsEdge 验证绩效指标边界（空序列/单点等）。
 func TestPerfMetricsEdge(t *testing.T) {
 	if s, mdd, a, c := perfMetrics(nil, nil); s != 0 || mdd != 0 || a != 0 || c != 0 {
 		t.Fatal("空输入应全零")
@@ -57,6 +60,7 @@ func TestPerfMetricsEdge(t *testing.T) {
 	}
 }
 
+// repeat 生成长度 n 的重复值序列（测试数据辅助）。
 func repeat(v float64, n int) []float64 {
 	out := make([]float64, n)
 	for i := range out {

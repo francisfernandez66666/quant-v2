@@ -84,6 +84,8 @@ func alpha101(s *StockSeries) []float64 {
 	return out
 }
 
+// init 在包加载阶段注册本文件定义的因子（ID/名称/分类/计算函数）进全局注册表。
+// English: registers this file's factor definitions into the global registry at package init.
 func init() {
 	Register(Def{ID: "Alpha1", Name: "趋势强度", Cat: CatMomentum, Desc: "WQ-Alpha1 风格：复合动量5日极值偏移", Compute: alpha1})
 	Register(Def{ID: "Alpha4", Name: "超跌反转", Cat: CatMomentum, Desc: "WQ-Alpha4 风格：−ts_rank(低价,9)", Compute: alpha4})

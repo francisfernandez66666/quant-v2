@@ -9,6 +9,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// newNS 构造测试用 N 形策略实例。
 func newNS() *NShapeStrategy {
 	return New(config.NewManager(""), data.NewEventMatcher(&data.EventsConfig{}))
 }
@@ -25,6 +26,7 @@ func fullCtx() *Ctx {
 	}
 }
 
+// fullIB 构造完整分时盘数据（测试辅助）。
 func fullIB() *IntradayB {
 	return &IntradayB{
 		TTime:         935,
@@ -41,6 +43,7 @@ func fullIB() *IntradayB {
 	}
 }
 
+// fullWA 构造完整波形 A 数据（测试辅助）。
 func fullWA() *WaveA {
 	return &WaveA{AHigh: 13, ALow: 11, AChgPct: 0.06, AAboveMA60: true}
 }

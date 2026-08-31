@@ -12,12 +12,14 @@ import (
 	"quant-trading-v2/internal/report"
 )
 
+// newTestAgent 构造测试用战法 Agent。
 func newTestAgent(t *testing.T) *Agent {
 	t.Helper()
 	cfg := config.NewManager("").GetStrategyConfig()
 	return New(cfg)
 }
 
+// qs 把 map[code]price 转成行情快照 map（测试辅助）。
 func qs(m map[string]float64) map[string]*data.StockInfo {
 	out := make(map[string]*data.StockInfo, len(m))
 	for code, p := range m {

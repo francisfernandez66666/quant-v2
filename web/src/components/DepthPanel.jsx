@@ -30,6 +30,13 @@ function fmtVol(v) {
   return n ? String(Math.round(n)) : '--'
 }
 
+/**
+ * 盘口面板组件
+ * 展示个股买卖盘口（最多十档）、现价涨跌与委比/封单等派生因子。
+ * 自动按实际档位数撑高，无数据的档位自动隐藏。
+ * @param {{code:string, name?:string, height?:number}} props
+ * @returns {JSX.Element}
+ */
 export default function DepthPanel({ code, name = '', height = 260 }) {
   const [ob, setOb] = useState({})
   const [factors, setFactors] = useState(null)

@@ -43,7 +43,10 @@ func amihud20(s *StockSeries) []float64 {
 	return indicator.SMA(out, 20)
 }
 
+// init 在包加载阶段注册本文件定义的因子（ID/名称/分类/计算函数）进全局注册表。
+// English: registers this file's factor definitions into the global registry at package init.
 func init() {
+	// 注册流动性类因子定义（换手/成交额/Amihud；init 阶段登记进全局注册表）。
 	Register(Def{ID: "STO20", Name: "20日平均换手率", Cat: CatLiquidity, Desc: "换手率（%）20日均值", Compute: sto20})
 	Register(Def{ID: "STOA", Name: "对数20日均成交额", Cat: CatLiquidity, Desc: "ln(20日均成交额)", Compute: stoa})
 	Register(Def{ID: "Amihud20", Name: "20日Amihud非流动性", Cat: CatLiquidity, Desc: "20日均 |r|/成交额，越高越不流动", Compute: amihud20})

@@ -10,6 +10,7 @@ import (
 	"quant-trading-v2/internal/newsagent"
 )
 
+// mkEv 构造新闻事件（测试辅助）。
 func mkEv(title, level, direction string, score float64) newsagent.NewsEvent {
 	return newsagent.NewsEvent{Title: title, Level: level, Direction: direction, Score: score}
 }

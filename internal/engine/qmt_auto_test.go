@@ -351,6 +351,7 @@ func TestM8RealDrawdown(t *testing.T) {
 	}
 }
 
+// mustPositions 读取实盘持仓并断言非空。
 func mustPositions(t *testing.T, db *store.DB) []store.RealPosition {
 	t.Helper()
 	ps, err := db.RealPositions()

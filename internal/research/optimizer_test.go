@@ -43,6 +43,7 @@ func mkStockPanel(dates []string, k int) *Panel {
 	}
 }
 
+// rep 生成长度 n 的重复值序列（测试数据辅助）。
 func rep(v float64, n int) []float64 {
 	out := make([]float64, n)
 	for i := range out {

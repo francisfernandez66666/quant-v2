@@ -12,6 +12,7 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// dragonCfg 返回测试用龙头战法配置。
 func dragonCfg() *config.DragonConfig {
 	return &config.DragonConfig{
 		BuyPullbackSellAllPct:  0.08,

@@ -125,6 +125,8 @@ func (e *Engine) EnsurePool(key string) bool {
 	return true
 }
 
+// containsStr 判断字符串切片中是否包含指定字符串（池 key 查重用）。
+// English: reports whether a string slice contains the given string (pool-key dedup).
 func containsStr(list []string, s string) bool {
 	for _, x := range list {
 		if x == s {

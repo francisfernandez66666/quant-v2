@@ -84,6 +84,9 @@ func (d *DB) ListBacktestJobs() ([]BacktestJob, error) {
 	return d.listBacktestJobs("")
 }
 
+// listBacktestJobs 按可选 WHERE 条件查询回测任务（按更新时间倒序、再按 ID 倒序）。
+// 供 ListBacktestJobs 与按条件筛选的调用方复用。
+// English: queries backtest jobs with an optional WHERE clause, newest-first by updated_at then id.
 func (d *DB) listBacktestJobs(where string) ([]BacktestJob, error) {
 	rows, err := d.db.Query(`SELECT id, kind, candidate_id, status,
 		COALESCE(progress,''), COALESCE(avg_excess,0), COALESCE(error,''), COALESCE(result_text,''),

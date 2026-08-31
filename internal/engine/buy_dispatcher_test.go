@@ -21,6 +21,7 @@ import (
 	"quant-trading-v2/internal/trading"
 )
 
+// newAsyncEngine 构造异步下单引擎 + mock 网关测试夹具。
 func newAsyncEngine(t *testing.T) (*Engine, *store.DB, *httptest.Server, *[]map[string]interface{}, *sync.Mutex) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "qmt.db"))
@@ -171,6 +172,7 @@ func TestAsyncDispatcherIdempotentKey(t *testing.T) {
 	}
 }
 
+// startsWith 字符串前缀判断（测试断言辅助）。
 func startsWith(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }

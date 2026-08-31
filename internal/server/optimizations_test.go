@@ -16,6 +16,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// seedOptLib 构造战法库种子数据。
 func seedOptLib(t *testing.T, dir string) {
 	t.Helper()
 	entry := research.AppliedFactorEntry{

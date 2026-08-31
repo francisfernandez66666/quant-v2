@@ -71,10 +71,12 @@ func mkPatternPanels(t *testing.T) []*Panel {
 	return panels
 }
 
+// itoaTest 手写整数转字符串（测试辅助）。
 func itoaTest(v int) string {
 	return intToString2(v)
 }
 
+// intToString2 整数转字符串（测试辅助）。
 func intToString2(v int) string {
 	if v == 0 {
 		return "0"

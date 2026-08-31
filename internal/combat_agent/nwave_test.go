@@ -335,6 +335,7 @@ func TestFullChainVolumeGateLeftNotGated(t *testing.T) {
 	t.Fatalf("应产出 buy 信号, got %+v", sigs)
 }
 
+// containsSubstr 子串包含判断（测试断言辅助）。
 func containsSubstr(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

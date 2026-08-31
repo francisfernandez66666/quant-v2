@@ -171,6 +171,7 @@ func TestPoolPerfBackfillLegacy(t *testing.T) {
 	}
 }
 
+// testCfg 返回测试用模拟盘配置。
 func testCfg() Config {
 	c := DefaultConfig()
 	c.Enabled = true

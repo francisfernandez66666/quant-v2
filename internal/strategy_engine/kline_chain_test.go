@@ -16,6 +16,7 @@ import (
 // 新浪 → 拒绝访问(HTML)；同花顺 → 不可用；腾讯 → 正常；东财 → 失败。
 type klineChainTransport struct{}
 
+// RoundTrip 测试传输桩：按请求返回预设 K 线响应。
 func (klineChainTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Hostname()
 	switch {
@@ -35,6 +36,7 @@ func (klineChainTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return testRespEngine(404, ""), nil
 }
 
+// testRespEngine 构造指定状态码+body 的 HTTP 测试响应。
 func testRespEngine(code int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: code,
@@ -99,6 +101,7 @@ func TestFetchDayKLineAllFail(t *testing.T) {
 // allFailTransport 所有 host 均返回空响应。
 type allFailTransport struct{}
 
+// RoundTrip 全失败传输桩：总是返回网络错误。
 func (allFailTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return testRespEngine(200, ""), nil
 }

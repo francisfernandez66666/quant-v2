@@ -23,6 +23,7 @@ var (
 // countersVar expvar 发布用的可序列化快照。
 var countersVar = expvar.NewString("quant.metrics")
 
+// init 包加载时立即发布一次全零快照，保证 /api/metrics 未发生任何事件也可读到结构。
 func init() { publish() }
 
 // publish 把全部计数器序列化进 expvar（JSON 字符串，采集端直接解析）。
@@ -35,6 +36,7 @@ func publish() {
 		`,"panics_recovered":` + itoa(httpPanics.Load()) + `}`)
 }
 
+// itoa 手写 int64→十进制字符串（无符号分支处理），避免为 6 个计数器引入 strconv 别名噪音。
 func itoa(v int64) string {
 	// 小工具：避免为 6 个数字引入 strconv 别名噪音
 	b := [20]byte{}

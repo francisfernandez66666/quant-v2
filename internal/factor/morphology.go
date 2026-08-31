@@ -152,7 +152,10 @@ func rollingMean(s *StockSeries, i, n int) float64 {
 // isNaNf 判断浮点是否为 NaN。
 func isNaNf(v float64) bool { return math.IsNaN(v) }
 
+// init 在包加载阶段注册本文件定义的因子（ID/名称/分类/计算函数）进全局注册表。
+// English: registers this file's factor definitions into the global registry at package init.
 func init() {
+	// 注册形态/量价类因子定义（放量缩量、新高突破、回撤、均线排列；init 阶段登记）。
 	Register(Def{ID: "VolSurge5", Name: "放量倍数", Cat: CatLiquidity, Desc: "当日量/20日均量（放量突破）", Compute: volSurge})
 	Register(Def{ID: "VolShrink", Name: "缩量比", Cat: CatLiquidity, Desc: "5日均量/20日均量（回调缩量）", Compute: volShrink})
 	Register(Def{ID: "Brk20", Name: "20日新高突破", Cat: CatMomentum, Desc: "收盘创20日新高=1", Compute: priceBreakout(20)})

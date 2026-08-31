@@ -172,6 +172,7 @@ func TestOutboxPersistsAcrossRestart(t *testing.T) {
 // fakeGatewayOK 恒成功的推送网关桩。
 type fakeGatewayOK struct{}
 
+// Send 测试桩：总是成功。
 func (fakeGatewayOK) Send(Message) error { return nil }
 
 // TestParseHM 验证 "HH:MM" 解析：正常时间转分钟数、非法值解析失败。

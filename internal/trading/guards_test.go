@@ -40,8 +40,10 @@ func (g *guardStub) PlaceSell(req OrderRequest) (*OrderResult, error) {
 // Cancel Cancel（Stub方法）。
 func (g *guardStub) Cancel(orderID string) error { return nil }
 
+// State 测试桩：返回已连接网关状态。
 func (g *guardStub) State() (*GatewayState, error) { return &GatewayState{Connected: true}, nil }
 
+// Health 测试桩：返回健康。
 func (g *guardStub) Health() (bool, error) { return true, nil }
 
 // buyReq 构造一笔标准买单。

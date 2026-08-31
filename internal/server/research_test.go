@@ -168,6 +168,7 @@ func TestResearchProgress(t *testing.T) {
 	_ = db
 }
 
+// itoa 手写整数转字符串（测试辅助）。
 func itoa(v int64) string {
 	return strconv.FormatInt(v, 10)
 }

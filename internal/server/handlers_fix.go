@@ -1193,6 +1193,12 @@ func pickBestEvent(list []newsagent.NewsEvent) *newsagent.NewsEvent {
 	return best
 }
 
+// handleFixSectorHot 处理 GET /api/sector/hot：返回热门板块列表。
+// 以同花顺板块行情表（首屏 top-20，按涨跌幅排序）为主，按名称精确匹配东财板块，
+// 补涨停家数/成交额等字段；无实时数据时回退最近快照。
+// English: handles GET /api/sector/hot — returns the hot-sector list built from the THS board
+// quote table (top-20 by change%) matched to EastMoney boards for limit-up count/amount; falls
+// back to the last snapshot when no live data is available.
 func (s *Server) handleFixSectorHot(w http.ResponseWriter, r *http.Request) {
 	dash := s.dashFor(requestUserID(r))
 	// 同花顺板块行情表（首屏 top-20，按涨跌幅排序），按名称精确匹配

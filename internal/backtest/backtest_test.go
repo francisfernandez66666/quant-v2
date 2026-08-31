@@ -157,6 +157,7 @@ func seedBT(t *testing.T) *store.DB {
 	return db
 }
 
+// TestSynthesizeEvents 验证事件合成逻辑。
 func TestSynthesizeEvents(t *testing.T) {
 	db := seedBT(t)
 	evs, err := SynthesizeEvents(db, "20230103", "20230112", 3, 3)
@@ -176,6 +177,7 @@ func TestSynthesizeEvents(t *testing.T) {
 	}
 }
 
+// TestRunChain 验证回测链条完整跑通。
 func TestRunChain(t *testing.T) {
 	db := seedBT(t)
 	opts := DefaultOptions()
@@ -218,14 +220,17 @@ func TestRunChain(t *testing.T) {
 	}
 }
 
+// bytesContains 手写字节子串包含判断（测试断言辅助）。
 func bytesContains(b, sub []byte) bool {
 	return stringContains(string(b), string(sub))
 }
 
+// stringContains 手写字符串子串包含判断（测试断言辅助）。
 func stringContains(s, sub string) bool {
 	return len(sub) == 0 || (len(s) >= len(sub) && indexStr(s, sub) >= 0)
 }
 
+// indexStr 手写子串首现下标（测试断言辅助）。
 func indexStr(s, sub string) int {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
