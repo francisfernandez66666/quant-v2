@@ -2,7 +2,7 @@
 // 页面用途：实盘链路总开关、执行方式、仓位纪律与战法白名单的统一管理界面。
 // 主要功能：查看首尔↔广州链路状态/熔断；配置总开关、执行模式、委托价格、心跳超时、网关与 Token；
 //          设定最大持仓/单票金额/预算等仓位纪律；按战法开关实盘准入并展示交易流水与归因盈亏。
-//          定时轮询：链路状态 10s 一次、交易流水 30s 一次；保存后约 5s 热加载生效。
+//          定时轮询：链路状态 10s 一次、交易流水 30s 一次；配置修改提交后待交易时段生效。
 // 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import ToggleSw from '../components/ToggleSw'
@@ -117,8 +117,8 @@ export default function Quant() {
   // so a stale cached value can never be mistaken for the server's truth.
   const [syncing, setSyncing] = useState(true)
 
-  const stateTimer = useRef(null)
-  const tradesTimer = useRef(null)
+  const stateTimer = useRef(null)  // 链路状态轮询定时器
+  const tradesTimer = useRef(null) // 交易流水轮询定时器
 
   // 按 kind 分组（form → factor → pattern），便于分别展示"形态战法 / 因子战法"
   const strategyGroups = useMemo(() => {
@@ -129,7 +129,9 @@ export default function Quant() {
     })
     return KIND_ORDER.map((kind) => ({ kind, label: KIND_LABELS[kind] || kind, items: g[kind] })).filter((x) => x.items.length)
   }, [strategyList])
+  // 全部战法是否都处于开启状态（全部开启时白名单传空数组表示不设限）
   const allStrategyOn = useMemo(() => strategyList.length > 0 && strategyList.every((s) => strategyOn[s.id]), [strategyList, strategyOn])
+  // 生成当前战法开关状态的提示文案（全部允许 / 已开启数量）
   const strategyHint = useMemo(() => {
     const onCount = strategyList.filter((s) => strategyOn[s.id]).length
     if (allStrategyOn) return '当前：全部允许'
@@ -254,8 +256,8 @@ export default function Quant() {
     await patch(
       { enabled: v },
       v
-        ? '实盘链路已启用：将按下方参数向广州网关下发真实交易指令，请确认网关地址正确'
-        : '实盘链路已停用',
+        ? '实盘链路启用已提交：将按下方参数向广州网关下发真实交易指令，待交易时段生效'
+        : '实盘链路停用已提交，待交易时段生效',
     )
   }
 
@@ -345,7 +347,7 @@ export default function Quant() {
   return (
     <div className="page">
       <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>📈 量化交易</div>
-      <div style={{ fontSize: 12, color: '#888', marginBottom: 14 }}>实盘链路参数、仓位纪律与战法白名单（保存后约 5 秒热加载生效）</div>
+      <div style={{ fontSize: 12, color: '#888', marginBottom: 14 }}>实盘链路参数、仓位纪律与战法白名单（修改提交后，待下一交易时段自动生效）</div>
 
       {loadErr && (
         <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: '#fdecea', border: '1px solid #f5c6c2', color: '#b71c1c', fontSize: 12 }}>
@@ -375,8 +377,8 @@ export default function Quant() {
             <span style={{ color: form.enabled ? '#e6a23c' : '#666' }}>●</span>
             {form.enabled ? (
               <>
-                <span>实盘链路已配置启用，但当前未连通网关</span>
-                <span style={{ color: '#666', fontSize: 11 }}>请确认下方「网关地址」正确且广州网关在线，连通后此处转为实时状态</span>
+                <span>实盘链路已配置启用（修改已提交，待交易时段生效）</span>
+                <span style={{ color: '#666', fontSize: 11 }}>配置变更在下一交易时段自动生效；休市/非交易时段不下发，生效后此处转为实时状态</span>
               </>
             ) : (
               <>

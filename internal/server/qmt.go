@@ -797,8 +797,17 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 	s.cfg.SetQMTConfigFor(uid, &cfg)
 	ctrl := s.qmtCtrlFor(uid)
 	cancelled := 0
-	if *req.Halted && ctrl != nil {
-		cancelled = ctrl.HaltAll()
+	if ctrl != nil {
+		// §QMT-PENDING kill-switch 属紧急停止：必须立即生效（不入开关队列）——
+		// placeOrder 读 ctrl.cfg.Halted 拦截新单，若只靠引擎热同步（现为盘中队列消费）会推迟到
+		// 交易时段，置位瞬间仍有新单流入，违背 fail-stop 语义。此处直接 UpdateConfig 立即同步。
+		// English: kill-switch must take effect immediately (bypasses the switch queue) — placeOrder reads
+		// ctrl.cfg.Halted; delaying via the session-queued hot-sync would let new orders flow in the
+		// meantime, violating fail-stop semantics.
+		ctrl.UpdateConfig(cfg)
+		if *req.Halted {
+			cancelled = ctrl.HaltAll()
+		}
 	}
 	log.Printf("[trading] ⚠️ kill-switch %s (用户=%s): 同步撤销未成交委托 %d 笔",
 		map[bool]string{true: "置位——紧急停止一切下单", false: "解除"}[*req.Halted], uid, cancelled)
@@ -891,12 +900,14 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(fills, func(i, j int) bool { return fills[i].TradedAt < fills[j].TradedAt })
 
+	// posState 持仓累计状态：数量 + 成本 + 归属战法。
 	type posState struct {
 		qty      int
 		cost     float64
 		strategy string
 	}
 	stratState := map[string]*posState{}
+	// stratStat 按战法汇总的成交统计（JSON 输出给前端）。
 	type stratStat struct {
 		Buys     float64 `json:"buys"`
 		Sells    float64 `json:"sells"`

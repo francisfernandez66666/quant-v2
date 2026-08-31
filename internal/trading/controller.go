@@ -39,6 +39,16 @@ type Controller struct {
 	userID          string           // 归属账号（多账号模式下各引擎独立控制器）
 	lastReconcileAt time.Time        // §W6-a 上次主动对账时间（节流用）
 
+	// §QMT-PENDING 待生效配置（开关队列）：普通配置变更（enabled/mode/白名单/纪律）先入队，
+	// 由引擎在交易时段（scoreCycle 的 IsActiveSession 门控内）调用 ApplyPendingConfig 才真正
+	// 应用到 c.cfg 并重建 executor（Noop↔QMTClient）。避免休市时配置变更立即翻转实盘行为、
+	// 以及"构建时固化 Noop 后永远不下单"的 executor 固化 bug。halt（kill-switch）走 UpdateConfig
+	// 立即生效，不进队列——紧急停止语义必须即时。
+	// English: pending config (switch queue). Ordinary config changes are queued and only applied at
+	// trading session via ApplyPendingConfig, which also rebuilds the executor (Noop↔QMTClient) to avoid
+	// the build-time-Noop-stuck bug. halt (kill-switch) bypasses the queue via UpdateConfig — immediate.
+	pendingCfg *config.QMTConfig // 待生效配置（nil=无待应用变更）
+
 	// 熔断状态：tripped=true 表示网关失联/心跳超时，暂停一切新下单
 	tripped      bool      // 是否处于熔断状态
 	tripAt       time.Time // 熔断触发时间
@@ -78,12 +88,57 @@ func NewController(exec Executor, db *store.DB, userID string, cfg config.QMTCon
 	}
 }
 
-// UpdateConfig 热更新配置（引擎每轮从 config.Manager 读取后调用）。
-// English: UpdateConfig hot-updates the QMT config (called by the engine each cycle from the manager).
+// UpdateConfig 立即应用配置（紧急语义）：halt（kill-switch）/ 测试直接生效，不进队列。
+// 注意：只更新 c.cfg，不重建 executor——executor 类型由构建或 ApplyPendingConfig 决定。
+// English: UpdateConfig applies config immediately (emergency semantics) — halt/kill-switch and tests
+// take effect right away, bypassing the queue. Only updates c.cfg; the executor type is decided at
+// build or by ApplyPendingConfig.
 func (c *Controller) UpdateConfig(cfg config.QMTConfig) {
 	c.mu.Lock()
 	c.cfg = cfg
 	c.mu.Unlock()
+}
+
+// QueueConfigUpdate 将配置变更放入待生效队列（开关队列）：仅记录，不立即应用。
+// 由引擎每轮热同步调用（GetQMTConfigFor 最新值），交易时段由 ApplyPendingConfig 消费。
+// English: QueueConfigUpdate queues a config change (switch queue) without applying it. Called by the
+// engine's hot-sync each cycle with the latest GetQMTConfigFor; consumed by ApplyPendingConfig at the
+// trading session.
+func (c *Controller) QueueConfigUpdate(cfg config.QMTConfig) {
+	c.mu.Lock()
+	cp := cfg
+	c.pendingCfg = &cp
+	c.mu.Unlock()
+}
+
+// ApplyPendingConfig 在交易时段应用待生效配置并重建执行器（Noop↔QMTClient）。
+// 返回是否真的有配置被应用。enabled && gateway_url 非空 → 真实网关客户端；否则回退 Noop。
+// 这修复了"构建时 qmt.enabled=false 固化 NoopExecutor 后，即使配置开启也永不下单、
+// Health 恒失败"的 executor 固化 bug。
+// English: ApplyPendingConfig applies the queued config at the trading session and rebuilds the
+// executor (Noop↔QMTClient) accordingly. Returns whether a config was actually applied. It fixes the
+// build-time-Noop-stuck bug: once fixed to NoopExecutor, the chain could never place orders or pass
+// Health even after the config was enabled.
+func (c *Controller) ApplyPendingConfig() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingCfg == nil {
+		return false
+	}
+	cfg := *c.pendingCfg
+	c.pendingCfg = nil
+	c.cfg = cfg
+	needClient := cfg.Enabled && cfg.GatewayURL != ""
+	_, isClient := c.exec.(*QMTClient)
+	switch {
+	case needClient && !isClient:
+		c.exec = NewQMTClient(cfg.GatewayURL, cfg.Token, time.Duration(cfg.TimeoutSec)*time.Second, 1)
+		log.Printf("[trading] QMT 实盘已启用，executor 切换为真实网关 (%s)", cfg.GatewayURL)
+	case !needClient && isClient:
+		c.exec = NoopExecutor{}
+		log.Printf("[trading] QMT 实盘已停用，executor 回退 Noop")
+	}
+	return true
 }
 
 // Enabled 是否启用实盘链路。

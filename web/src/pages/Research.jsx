@@ -550,7 +550,7 @@ export default function Research() {
         const exp = (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null
         const prev = byKey.get(key)
         if (!prev || (exp !== null && (prev.bestExp === null || exp > prev.bestExp))) {
-          byKey.set(key, { key, label: r.strategy, bestExp: exp })
+          byKey.set(key, { key, label: r.strategy, bestExp: exp, samples: (r.trigger_count !== undefined && r.trigger_count !== null) ? Number(r.trigger_count) : null })
         }
       }
     }
@@ -1327,6 +1327,9 @@ export default function Research() {
                     {optStrategies.map((s) => (
                       <Button key={s.key} variant={optSelected === s.key ? 'base' : 'outline'} size="small" onClick={() => setOptSelected(s.key)}>
                         {s.label}
+                        {s.samples !== null && (
+                          <span style={{ color: '#aaa', marginLeft: 4, fontSize: 11 }}>样本{s.samples}</span>
+                        )}
                         <span style={(s.bestExp ?? 0) >= 0 ? { color: '#00a870' } : { color: '#e34d59' }}>
                           {s.bestExp !== null ? ((s.bestExp >= 0 ? '+' : '') + fmtNum(s.bestExp, 2) + '%') : ''}
                         </span>
@@ -1361,6 +1364,7 @@ export default function Research() {
                         <div><label>胜率</label><b>{fmtNum(optCur.win_rate, 1)}%</b></div>
                         <div><label>盈亏比</label><b>{fmtNum(optCur.profit_factor, 2)}</b></div>
                         <div><label>期望收益</label><b style={optCur.expectancy >= 0 ? { color: '#00a870' } : { color: '#e34d59' }}>{fmtNum(optCur.expectancy, 2)}%</b></div>
+                        <div><label>触发样本</label><b>{(optCur.trigger_count !== undefined && optCur.trigger_count !== null) ? optCur.trigger_count : '—'}</b></div>
                         <div><label>实盘复核</label><b>{optCur.win_rate !== undefined ? fmtNum(optCur.win_rate, 1) + '% / ' + fmtNum(optCur.profit_factor, 2) + ' / ' + fmtNum(optCur.expectancy, 2) + '%' : '—'}</b></div>
                         {optCur.pool_stats && <div><label>模拟盘实测</label><b>{fmtNum(optCur.pool_stats.win_rate_pct, 1)}% / {optCur.pool_stats.expectancy >= 0 ? '+' : ''}{fmtNum(optCur.pool_stats.expectancy, 2)}% / {optCur.pool_stats.filled_buys}笔</b></div>}
                       </div>

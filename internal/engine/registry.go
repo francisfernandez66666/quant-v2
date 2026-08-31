@@ -652,7 +652,10 @@ func (r *Registry) build(userID string) *Engine {
 	// paper book. The engine hot-syncs the qmt config each 5s cycle (syncAccountConfig); breaker/health
 	// probing runs throttled inside the advice loop.
 	if opts.RealStore != nil {
-		qmtCfg := opts.CfgMgr.GetRulesFor(userID).QMT
+		// §QMT-PENDING 构建期也走账号级配置（GetQMTConfigFor），与运行期热同步（syncAccountConfig）
+		// 同源——避免构建时用全局 GetRulesFor().QMT（磁盘 rules.qmt）读到与账号级覆盖不同的
+		// enabled 值，导致初始 executor 类型与前端展示不一致。
+		qmtCfg := *opts.CfgMgr.GetQMTConfigFor(userID)
 		// 熔断/恢复告警走推送器（与 P1 强提醒同通道）
 		onAlert := func(level, title, content string) {}
 		if opts.Notifier != nil {
@@ -848,6 +851,7 @@ func (r *Registry) fingerprint(userID string) string {
 	// 导致两账号 D1/ATR 不同却共享同一引擎 → 战法结果互相串味。此处纳入账号级 D1 与
 	// 持仓 ATR/跌幅阈值（均走 per-user getter），确保"配置不同则引擎不同"。
 	pos := opts.CfgMgr.GetRulesFor(userID).Position
+	// f 指纹参与字段（账号级可覆盖项，配置不同则引擎不同）。
 	type f struct {
 		Strategy  *config.StrategyConfig
 		Laodeng   *config.LaodengConfig

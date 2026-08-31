@@ -595,7 +595,9 @@ func (e *Engine) syncAccountConfig() {
 	if c := e.QMTController(); c != nil {
 		q := *cfgMgr.GetQMTConfigFor(userID)
 		q.Blacklist = append(q.Blacklist, cfgMgr.GetRulesFor(userID).Theme.BlackList...)
-		c.UpdateConfig(q)
+		// §QMT-PENDING 开关队列：普通配置变更只入队不立即生效，交易时段由 scoreCycle 的
+		// ApplyPendingConfig 消费（重建 executor）。防止休市时配置立即翻转实盘行为。
+		c.QueueConfigUpdate(q)
 	}
 	// §GAP5.1 LLM 成本治理：日预算热同步（0=不设限）。
 	if c := e.LLMClient(); c != nil {
@@ -3341,6 +3343,7 @@ func (e *Engine) feedRPS(boards []data.SectorInfo) {
 	if sa == nil || len(boards) == 0 {
 		return
 	}
+	// br 板块行情行：代码 + 名称 + 当日/次日涨跌幅。
 	type br struct {
 		code, name string
 		d1, d2     float64
@@ -3484,6 +3487,7 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 		stocks []data.StockInfo
 		err    error
 	}
+	// sectorFetchWorkers 板块行情并发拉取的工作协程数。
 	const sectorFetchWorkers = 6
 	jobs := make(chan needFetch)
 	results := make(chan result, len(needs))

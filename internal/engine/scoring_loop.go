@@ -76,6 +76,14 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
 	e.syncAccountConfig()
 
+	// §QMT-PENDING 开关队列：交易时段内应用待生效的 QMT 实盘配置（enabled/mode/白名单等），
+	// 并按最新配置重建 executor（Noop↔QMTClient）。休市时入队不消费，开盘首个 cycle 即生效。
+	// English: inside the trading session, apply the queued QMT live config and rebuild the executor
+	// (Noop↔QMTClient). Off-hours changes stay queued and take effect on the first session cycle.
+	if c := e.qmtCtrl; c != nil {
+		c.ApplyPendingConfig()
+	}
+
 	e.mu.RLock()
 	f := e.fetcher
 	emotionPhase := e.lastEmotionPhase // 复用主循环算出的情绪阶段，不重复调涨停池接口

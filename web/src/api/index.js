@@ -512,7 +512,7 @@ export async function fetchQMTConfig() {
   return request('/api/config/qmt')
 }
 
-/** 实盘配置保存：局部更新（仅传需要修改的字段，后端校验后热加载生效） */
+/** 实盘配置保存：局部更新（仅传需要修改的字段，后端校验后进入待生效队列，交易时段自动生效） */
 /** Save live config: partial update — only send changed fields; backend validates then hot-reloads */
 // 对应 POST /api/config/qmt；token 留空或传脱敏哨兵=保持原值
 export async function updateQMTConfig(data) {
