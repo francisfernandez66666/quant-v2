@@ -18,7 +18,9 @@
 #   LLM_MODEL        默认 THUDM/GLM-Z1-9B-0414
 #   DEPLOY_DIR       Windows 目录（默认 C:/opt/quant）
 #   DATA_DIR         数据目录（默认 C:/var/lib/quant-trading-v2）
-#   MINIQMT_PATH     MiniQMT 可执行路径（默认 C:/QMT/userdata_mini/bin/XtMiniQmt.exe）
+#   MINIQMT_PATH     QMT 完整交易端 XtItClient.exe 路径（默认 C:/Program Files (x86)/东莞证券QMT实盘交易端/bin.x64/XtItClient.exe；
+#                    注意：必须是 XtItClient.exe——可自动登录交易；不能是 XtMiniQmt.exe，后者无法自动登录，
+#                    会导致 broker 永远连不上）
 
 set -euo pipefail
 
@@ -32,7 +34,7 @@ LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn/v1/chat/completions}"
 LLM_MODEL="${LLM_MODEL:-THUDM/GLM-Z1-9B-0414}"
 DEPLOY_DIR="${DEPLOY_DIR:-C:/opt/quant}"
 DATA_DIR="${DATA_DIR:-C:/var/lib/quant-trading-v2}"
-MINIQMT_PATH="${MINIQMT_PATH:-C:/QMT/userdata_mini/bin/XtMiniQmt.exe}"
+MINIQMT_PATH="${MINIQMT_PATH:-C:/Program Files (x86)/东莞证券QMT实盘交易端/bin.x64/XtItClient.exe}"
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_DIR"

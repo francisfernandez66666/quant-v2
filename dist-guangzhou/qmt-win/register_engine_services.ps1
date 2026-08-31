@@ -5,20 +5,22 @@
 #       -ResearchExe C:\opt\quant\researchd.exe `
 #       -PydataVenv C:\opt\quant\venv `
 #       -DataDir C:\var\lib\quant-trading-v2 `
-#       -MiniQmtPath "C:\QMT\userdata_mini\bin\XtMiniQmt.exe" `
+#       -MiniQmtPath "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe" `
 #       -LLMApiKey "..." -LLMApiURL "..." -LLMModel "..."
+# 注意：MiniQmtPath 必须是完整交易端 XtItClient.exe（能自动登录并交易）；若传 XtMiniQmt.exe
+#       （极简 miniQMT，无法自动登录）会导致 broker 永远连不上、实盘全流程被打断。
 # 设计（见 docs/MIGRATION_GUANGZHOU_ALLINONE.md §4）：
 #   - quant          NSSM 服务, NORMAL 优先级
 #   - quant-research NSSM 服务, BELOW_NORMAL 优先级（交易时段被会话门控不跑重型任务）
 #   - pydata         NSSM 服务, BELOW_NORMAL 优先级（baostock 国内直连）
 #   - qmt-gateway    已由 register_service.ps1 注册（本脚本不改）
-#   - qmtctl         任务计划（交互会话，每 10 分钟）管控 MiniQMT 启停——勿用 NSSM（需 GUI 登录会话）
+#   - qmtctl         任务计划（交互会话，每 10 分钟）管控 QMT 完整交易端启停——勿用 NSSM（需 GUI 登录会话）
 param(
     [string]$QuantExe = "C:\opt\quant\quant.exe",
     [string]$ResearchExe = "C:\opt\quant\researchd.exe",
     [string]$PydataVenv = "C:\opt\quant\venv",
     [string]$QmtctlExe = "C:\opt\quant\qmtctl.exe",
-    [string]$MiniQmtPath = "C:\QMT\userdata_mini\bin\XtMiniQmt.exe",
+    [string]$MiniQmtPath = "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe",
     [string]$DataDir = "C:\var\lib\quant-trading-v2",
     [string]$LLMApiKey = "",
     [string]$LLMApiURL = "https://api.siliconflow.cn/v1/chat/completions",

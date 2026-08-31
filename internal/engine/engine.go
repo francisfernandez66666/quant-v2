@@ -688,10 +688,13 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		return
 	}
 	cfg := ctrl.Config()
+	// §UAT-FIX 2026-08-31：白名单条目是战法 ID（n_shape/fac_1…，量化交易页保存的就是 ID），
+	// 而 sig.Strategy 是中文显示名（如"波动突破战法"）——旧逻辑只比显示名，ID 永远不命中，
+	// auto 全程静默跳过（连日志都没有）。现同时匹配 StrategyID（库规则 ID）与显示名。
 	if len(cfg.Strategies) > 0 && sig.Strategy != "" {
 		allowed := false
 		for _, s := range cfg.Strategies {
-			if s == sig.Strategy {
+			if s == sig.Strategy || s == sig.StrategyID {
 				allowed = true
 				break
 			}
@@ -717,8 +720,11 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		return
 	}
 	amount := cfg.FixedAmount
-	// §QUANT-TAB 每战法仓位大小：该战法配置了正数金额则覆盖全局 fixed_amount（量化交易页可配）
-	if v := cfg.StrategyAmounts[sig.Strategy]; v > 0 {
+	// §QUANT-TAB 每战法仓位大小：该战法配置了正数金额则覆盖全局 fixed_amount（量化交易页可配）。
+	// §UAT-FIX 2026-08-31：面板按战法 ID（fac_1…）配置金额，同键优先，回退显示名，再回退全局。
+	if v := cfg.StrategyAmounts[sig.StrategyID]; v > 0 {
+		amount = v
+	} else if v := cfg.StrategyAmounts[sig.Strategy]; v > 0 {
 		amount = v
 	}
 	if amount <= 0 {
@@ -729,6 +735,26 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	if qty <= 0 {
 		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
 		return
+	}
+	// §UAT-CASH 2026-08-31：按可用资金自动降档——与模拟盘"现金不足时按剩余现金整手买入"
+	// （paper.go FixedAmount 注释）同语义。fixed_amount 是预算上限而非死数：最近上报的可用
+	// 资金（网关每分钟对账）不足以按预算整手买入时，降到现金可负担的最大整手数；连一手都
+	// 买不起才放弃。资金未知/过期时 AvailableCash 返回 0 → 不设限，维持原行为。
+	// English: §UAT-CASH — degrade the lot count to what the latest reported available cash
+	// affords (whole lots) instead of rejecting the order when cash < fixed_amount; skip only
+	// when even one lot is unaffordable. Unknown/stale cash (0) keeps the old behavior.
+	if cash := ctrl.AvailableCash(); cash > 0 && qty > 0 {
+		// 预留 0.6% 佣金/过户费余量，避免贴着可用资金下单被柜台以"资金不足"废单
+		affordable := int(cash*0.994/price/100) * 100
+		if affordable < qty {
+			if affordable <= 0 {
+				log.Printf("[qmt] %s 可用资金 %.0f 不足以买一手(现价 %.2f)，跳过下单", sig.Code, cash, price)
+				return
+			}
+			log.Printf("[qmt] %s 可用资金 %.0f 不足按预算 %d 股买入，自动降档为 %d 股(约 %.0f 元)",
+				sig.Code, cash, qty, affordable, float64(affordable)*price)
+			qty = affordable
+		}
 	}
 	// §GAP2-W1 确定性幂等键（资损级修复）：实盘买入 signal_id 改为 buy:<纯代码>:<战法>:<交易日>。
 	// 旧实现直接用 sig.ID（seqID="SIG"+UnixNano，每轮扫描重新生成）——主循环每 ~5 分钟重扫一次，
@@ -746,16 +772,17 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	// (stock, strategy, day), consistent with the daily-count/budget discipline.
 	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), sig.Strategy, data.TradingDayDate(time.Now()))
 	req := trading.OrderRequest{
-		SignalID:  id,
-		Code:      withSuffix(sig.Code),
-		Name:      sig.Name,
-		Strategy:  sig.Strategy,
-		Side:      trading.SideBuy,
-		PriceType: cfg.PriceType,
-		Price:     price,
-		Qty:       qty,
-		Amount:    float64(qty) * price,
-		CreatedAt: time.Now().Format(time.RFC3339),
+		SignalID:   id,
+		Code:       withSuffix(sig.Code),
+		Name:       sig.Name,
+		Strategy:   sig.Strategy,
+		StrategyID: sig.StrategyID,
+		Side:       trading.SideBuy,
+		PriceType:  cfg.PriceType,
+		Price:      price,
+		Qty:        qty,
+		Amount:     float64(qty) * price,
+		CreatedAt:  time.Now().Format(time.RFC3339),
 	}
 	// §A+B 事件驱动热路径：若已启动异步分发器（buyCh 非空）则入队，否则同步下单
 	// （兼容未启动分发器的调用方，如测试与直调；保持原有行为）。

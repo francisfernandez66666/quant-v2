@@ -3,20 +3,24 @@
 #   powershell -ExecutionPolicy Bypass -File register_engine_services.ps1 `
 #       -QuantExe C:\opt\quant\quant.exe -ResearchExe C:\opt\quant\researchd.exe `
 #       -PydataVenv C:\opt\quant\venv -QmtctlExe C:\opt\quant\qmtctl.exe `
-#       -MiniQmtPath "C:\Program Files (x86)\xxx\bin.x64\XtMiniQmt.exe" `
+#       -MiniQmtPath "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe" `
 #       -DataDir C:\var\lib\quant-trading-v2 -LLMApiKey "..." -LLMApiURL "..." -LLMModel "..."
+# NOTE: MiniQmtPath MUST be the full client XtItClient.exe (auto-login + trading). XtMiniQmt.exe
+#       cannot auto-login → broker never connects.
 # Design (docs/MIGRATION_GUANGZHOU_ALLINONE.md section 4):
 #   quant          NSSM service, NORMAL priority
 #   quant-research NSSM service, BELOW_NORMAL priority (session-gated off-hours)
 #   pydata         NSSM service, BELOW_NORMAL priority (baostock sidecar, port 8787)
-#   qmt-gateway    already managed by scheduled task qmt-gateway-wd (NOT re-registered here)
+#   qmt-gateway    MUST run in the interactive session (see register_service.ps1 header):
+#                  xtquant talks to the QMT client via per-session shared-memory queues,
+#                  a Session-0/NSSM instance can never complete the heartbeat handshake.
 #   qmtctl         scheduled task (interactive session, every 10 min) - must NOT use NSSM (needs GUI login)
 param(
     [string]$QuantExe = "C:\opt\quant\quant.exe",
     [string]$ResearchExe = "C:\opt\quant\researchd.exe",
     [string]$PydataVenv = "C:\opt\quant\venv",
     [string]$QmtctlExe = "C:\opt\quant\qmtctl.exe",
-    [string]$MiniQmtPath = "C:\QMT\userdata_mini\bin\XtMiniQmt.exe",
+    [string]$MiniQmtPath = "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe",
     [string]$DataDir = "C:\var\lib\quant-trading-v2",
     [string]$LLMApiKey = "",
     [string]$LLMApiURL = "https://api.siliconflow.cn/v1/chat/completions",
@@ -110,7 +114,8 @@ if (-not (Test-Path $QmtctlExe)) {
 } else {
     $wrapper = Join-Path $PSScriptRoot "ensure_miniqmt.ps1"
     $wrapContent = "& '$QmtctlExe' ensure-miniqmt -path '$MiniQmtPath' -gateway-url http://127.0.0.1:8789/health"
-    Set-Content -Path $wrapper -Value $wrapContent -Encoding ASCII
+    # UTF8（PS5.1 带 BOM）：MiniQmtPath 常含中文安装目录，ASCII 会写成 '?' 导致启动失败
+    Set-Content -Path $wrapper -Value $wrapContent -Encoding UTF8
     $taskName = "QMT-Ensure-Running"
     $action = "powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"
     # no /RU SYSTEM: runs in the logged-on interactive session (MiniQMT needs GUI session)

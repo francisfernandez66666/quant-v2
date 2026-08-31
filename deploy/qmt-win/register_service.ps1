@@ -1,19 +1,27 @@
-﻿# register_service.ps1 — 把 qmt_gateway 注册为 Windows 服务（nssm 守护），可选 QMT 日常守护任务
+﻿# register_service.ps1 — 把 qmt_gateway 注册为「交互会话计划任务」（勿用 NSSM！），可选 QMT 守护任务
 # 用法（必须管理员 PowerShell）：
 #   powershell -ExecutionPolicy Bypass -File register_service.ps1
-#   powershell -ExecutionPolicy Bypass -File register_service.ps1 -InstallQmtRestart -InstallQmtAutostart
+#   powershell -ExecutionPolicy Bypass -File register_service.ps1 -InstallQmtAutostart
 # 前置：先跑 setup_windows.ps1 生成 config.xt.json。
+#
+# ⚠️ 为什么不能用 NSSM/Windows 服务（2026-08-31 广州机实障结论）：
+#   xtquant 与 QMT 客户端之间经「按会话隔离的命名共享内存队列」通信（down_queue_win_N/
+#   up_queue_*/lock_*，位于 userdata_mini）。服务跑在 Session 0，客户端跑在交互桌面会话，
+#   双方各连各的共享内存 → 客户端日志每 8 秒循环 "quant session connected → heartbeat
+#   timeout → file lock not held, offline"，XtQuantTrader.connect() 恒返回 -1。
+#   因此网关 python 必须与 XtItClient/XtMiniQmt 同在登录用户的交互会话中运行——
+#   由"仅在用户登录时运行"的计划任务拉起（与 qmtctl 同模式）。
 # 说明：
-#   - nssm 提供开机自启 + 崩溃自动拉起 + 日志轮转；官网下载失败时手动放 nssm.exe 到 tools\ 再重跑。
-#   - -InstallQmtRestart：每天 07:40 强杀极简 QMT 进程（防长跑内存增长），
-#     仅当 QMT 已「记住账号密码」能自动重新登录时才启用，否则重启后停在登录页导致网关断连（首尔侧会自动熔断停单，安全但没得交易）。
-#   - -InstallQmtAutostart：把 XtMiniQmt.exe 快捷方式放进当前用户启动文件夹；需配合 Windows 自动登录（netplwiz）。
+#   - 计划任务提供登录自启 + 每 5 分钟幂等守护（端口活着就不动，死了才拉起）。
+#   - -InstallQmtAutostart：把 XtItClient.exe 快捷方式放进当前用户启动文件夹；
+#     需配合 Windows 自动登录（netplwiz），否则重启后无人登录、客户端与网关都起不来。
 param(
     [string]$PythonExe = "",
     [string]$GatewayDir = "",      # 留空取本仓库相对路径 qmt_gateway
     [string]$ConfigFile = "",      # 留空取 <GatewayDir>\config.xt.json
-    [string]$ServiceName = "qmt-gateway",
-    [string]$NSSMUrl = "https://nssm.cc/release/nssm-2.24.zip",
+    [string]$TaskEnsureName = "QMT-Gateway-Ensure",
+    [string]$TaskLogonName = "QMT-Gateway-Logon",
+    [int]$EnsureIntervalMin = 5,
     [switch]$InstallQmtRestart,
     [switch]$InstallQmtAutostart
 )
@@ -42,78 +50,90 @@ if (-not $PythonExe) {
     if (-not $pyCmd) { Die "python 不在 PATH —— 用 -PythonExe 指定 python.exe 绝对路径" }
     $PythonExe = $pyCmd.Source
 }
-Info "服务: $ServiceName"
 Info "python: $PythonExe"
 Info "config: $ConfigFile"
 
-# ---- 2. 准备 nssm ----
-$tools = Join-Path $PSScriptRoot "tools"
-$nssm = Join-Path $tools "nssm-2.24\win64\nssm.exe"
-if (-not (Test-Path $nssm)) {
-    Info "下载并解压 nssm ..."
-    New-Item $tools -ItemType Directory -Force | Out-Null
-    try {
-        Invoke-WebRequest -Uri $NSSMUrl -OutFile (Join-Path $tools "nssm.zip") -UseBasicParsing -TimeoutSec 60
-        Expand-Archive (Join-Path $tools "nssm.zip") $tools -Force
-    } catch {
-        Die "nssm 下载失败（$NSSMUrl）：$($_.Exception.Message)`n手动下载后解压到 $tools 再重跑本脚本"
+# ---- 2. 停用遗留 NSSM 网关服务（Session 0 实例永远连不上，且会抢占 8789 端口）----
+foreach ($legacy in "qmt-gateway", "quant-gateway") {
+    $svc = Get-Service -Name $legacy -ErrorAction SilentlyContinue
+    if ($svc) {
+        Warn "检测到遗留服务 $legacy（NSSM/Session 0）—— 停止并禁用"
+        Stop-Service $legacy -Force -ErrorAction SilentlyContinue
+        & (Join-Path $PSScriptRoot "tools\nssm-2.24\win64\nssm.exe") set $legacy Start SERVICE_DISABLED 2>$null
+        if ($LASTEXITCODE -ne 0) { Set-Service $legacy -StartupType Disabled -ErrorAction SilentlyContinue }
     }
 }
-if (-not (Test-Path $nssm)) { Die "未找到 $nssm —— 检查压缩包结构（需 win64\nssm.exe）" }
 
-# ---- 3. 注册服务 ----
-Info "注册服务 $ServiceName ..."
-& $nssm install $ServiceName $PythonExe "gateway.py -c `"$ConfigFile`"" | Out-Null
-& $nssm set $ServiceName AppDirectory $GatewayDir | Out-Null
-$logDir = Join-Path $GatewayDir "logs"
-New-Item $logDir -ItemType Directory -Force | Out-Null
-& $nssm set $ServiceName AppStdout (Join-Path $logDir "out.log") | Out-Null
-& $nssm set $ServiceName AppStderr (Join-Path $logDir "err.log") | Out-Null
-& $nssm set $ServiceName AppRotateFiles 1 | Out-Null
-& $nssm set $ServiceName AppRotateOnline 1 | Out-Null
-& $nssm set $ServiceName AppRotateBytes 10485760 | Out-Null     # 10MB 轮转
-& $nssm set $ServiceName Start SERVICE_AUTO_START | Out-Null
-& $nssm restart $ServiceName
-Start-Sleep -Seconds 2
-Get-Service $ServiceName | Format-List Name, Status, StartType
+# ---- 3. 生成守护 wrapper：8789 未监听才拉起（幂等），与客户端同交互会话 ----
+$wrapper = Join-Path $PSScriptRoot "ensure_gateway.ps1"
+$wrap = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+`$py = '$PythonExe'
+`$gw = '$GatewayDir\gateway.py'
+`$cfg = '$ConfigFile'
+`$dir = '$GatewayDir'
+# xtquant <-> QMT 客户端经按会话隔离的共享内存通信：网关必须与客户端同交互会话，
+# 绝不能以服务/SYSTEM 会话运行（详见 register_service.ps1 文件头说明）。
+`$listening = Get-NetTCPConnection -LocalPort 8789 -State Listen
+if (-not `$listening) {
+  Start-Process -FilePath `$py -ArgumentList "`"`$gw`" -c `"`$cfg`"" -WorkingDirectory `$dir -WindowStyle Hidden
+  exit 1
+}
+exit 0
+"@
+# UTF8（PS5.1 带 BOM）：防路径含中文时被按 GBK 误读成乱码
+Set-Content -Path $wrapper -Value $wrap -Encoding UTF8
+Ok "已生成守护 wrapper: $wrapper"
 
-# 本机健康检查
+# ---- 4. 注册计划任务（交互会话，勿加 /RU SYSTEM）----
+$taskAction = "powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"
+schtasks /Create /F /SC MINUTE /MO $EnsureIntervalMin /TN $TaskEnsureName /TR $taskAction
+if ($LASTEXITCODE -eq 0) { Ok "任务 $TaskEnsureName 已创建（每 $EnsureIntervalMin 分钟幂等守护，仅登录会话运行）" }
+else { Warn "schtasks 创建失败（exit=$LASTEXITCODE），请在任务计划程序手动创建（当前用户、交互令牌）" }
+schtasks /Create /F /SC ONLOGON /TN $TaskLogonName /TR $taskAction
+if ($LASTEXITCODE -eq 0) { Ok "任务 $TaskLogonName 已创建（用户登录即拉起）" }
+
+# ---- 5. 立即跑一次并做本机健康检查 ----
+schtasks /Run /TN $TaskEnsureName
+Start-Sleep -Seconds 8
 try {
     $h = Invoke-RestMethod "http://127.0.0.1:8789/health" -TimeoutSec 5
-    Ok "网关 /health: ok=$($h.ok) broker=$($h.broker) broker_connected=$($h.broker_connected)"
+    Ok "网关 /health: ok=$($h.ok) broker=$($h.broker) broker_connected=$($h.broker_connected)（xt 通道需客户端已登录才为 true）"
 } catch {
-    Warn "本机 8789 健康检查失败: $($_.Exception.Message)（看日志 $logDir\err.log；broker=mock 应秒起）"
+    Warn "本机 8789 健康检查失败: $($_.Exception.Message)（gateway-<pid>.log 可查；先确认 QMT 客户端在线）"
 }
 
-# ---- 4. 可选：每日 07:40 重启极简 QMT 进程（内存增长守卫）----
+# ---- 6. 可选：每日 07:40 重启 QMT 客户端（内存增长守卫）----
 if ($InstallQmtRestart) {
     $taskName = "QMT-Daily-Restart"
-    $ps1 = Join-Path $tools "restart_qmt.ps1"
-    Set-Content -Path $ps1 -Value "Get-Process XtMiniQmt -ErrorAction SilentlyContinue | Stop-Process -Force" -Encoding ASCII
-    schtasks /Create /F /SC DAILY /ST 07:40 /TN $taskName /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $ps1" /RU SYSTEM
-    if ($LASTEXITCODE -eq 0) { Ok "计划任务 $taskName 已创建（每天 07:40 重启 QMT 进程）" }
+    $ps1 = Join-Path $PSScriptRoot "tools\restart_qmt.ps1"
+    Set-Content -Path $ps1 -Value "Get-Process XtItClient,XtMiniQmt -ErrorAction SilentlyContinue | Stop-Process -Force" -Encoding ASCII
+    # 必须交互会话运行（/RU SYSTEM 会话里杀不到桌面进程的窗口句柄，且重登需 GUI）
+    schtasks /Create /F /SC DAILY /ST 07:40 /TN $taskName /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $ps1"
+    if ($LASTEXITCODE -eq 0) { Ok "计划任务 $taskName 已创建（每天 07:40 重启客户端；重启后由 QMT-Ensure-Running 拉起并自动登录）" }
     else { Warn "schtasks 创建失败（exit=$LASTEXITCODE），可手动在任务计划程序里建" }
 }
 
-# ---- 5. 可选：QMT 开机自启快捷方式 ----
+# ---- 7. 可选：QMT 完整交易端开机自启快捷方式 ----
 if ($InstallQmtAutostart) {
     $exe = $null
     foreach ($d in (@("C:", "D:", "E:") | Where-Object { Test-Path $_ })) {
-        $exe = Get-ChildItem "$d\" -Recurse -Filter "XtMiniQmt.exe" -ErrorAction SilentlyContinue |
+        # 拉起完整交易端 XtItClient.exe（自动登录），而非 XtMiniQmt.exe（无法自动登录）
+        $exe = Get-ChildItem "$d\Program Files*" -Recurse -Depth 4 -Filter "XtItClient.exe" -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName
         if ($exe) { break }
     }
     if (-not $exe) {
-        Warn "未找到 XtMiniQmt.exe —— 手动把它加入启动文件夹后跳过本步"
+        Warn "未找到 XtItClient.exe —— 手动把它加入启动文件夹后跳过本步"
     } else {
         $ws = New-Object -ComObject WScript.Shell
-        $lnkPath = Join-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "XtMiniQmt.lnk"
+        $lnkPath = Join-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "XtItClient.lnk"
         $lnk = $ws.CreateShortcut($lnkPath)
         $lnk.TargetPath = $exe
         $lnk.Save()
         Ok "已加入开机自启: $exe"
-        Warn "记得配置系统自动登录（netplwiz → 取消勾选'要求用户输入用户名和密码'），否则重启后停在登录页、QMT 无法自启"
+        Warn "记得配置系统自动登录（netplwiz → 取消勾选'要求用户输入用户名和密码'），否则重启后停在登录页、客户端与网关都无法自启"
     }
 }
 
-Ok "全部完成。验证命令：Get-Service $ServiceName ；curl http://127.0.0.1:8789/health"
+Ok "全部完成。验证命令：schtasks /Query /TN $TaskEnsureName ；curl http://127.0.0.1:8789/health"

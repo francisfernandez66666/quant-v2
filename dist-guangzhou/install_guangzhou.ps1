@@ -33,6 +33,17 @@ function Ok($m){Write-Host "[ ok ] $m" -ForegroundColor Green}
 function Warn($m){Write-Host "[warn] $m" -ForegroundColor Yellow}
 function Die($m){Write-Host "[fail] $m" -ForegroundColor Red; exit 1}
 
+# 网关重启（交互会话任务模式；勿用 Restart-Service——NSSM/Session 0 实例无法与
+# QMT 客户端建立 xtquant 共享内存会话，见 deploy/qmt-win/register_service.ps1 文件头）
+function Restart-GatewayTask{
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'gateway\.py' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep 2
+    schtasks /Run /TN QMT-Gateway-Ensure | Out-Null
+    Start-Sleep 8
+}
+
 # ---- 0. 管理员 ----
 $id=[Security.Principal.WindowsIdentity]::GetCurrent()
 if(-not (New-Object Security.Principal.WindowsPrincipal($id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))){Die "请管理员运行"}
@@ -88,7 +99,7 @@ if($Rollback){
         if($ec.qmt){$ec.qmt.enabled=$false}
         $ec | ConvertTo-Json -Depth 8 | Set-Content $engineCfgPath
     }
-    Restart-Service qmt-gateway -Force -ErrorAction SilentlyContinue
+    Restart-GatewayTask
     Ok "回滚完成（首尔侧需把该账号 qmt.enabled 重新置 true 恢复）"
     exit 0
 }
@@ -110,7 +121,7 @@ if(-not $ec.rules){$ec|Add-Member -NotePropertyName rules -NotePropertyValue ([o
 $ec | ConvertTo-Json -Depth 8 | Set-Content $engineCfgPath
 
 # 3c. 重启网关 + 引擎服务使配置生效
-Restart-Service qmt-gateway -Force -ErrorAction SilentlyContinue
+Restart-GatewayTask
 Restart-Service quant -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 3
 

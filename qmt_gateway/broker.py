@@ -87,6 +87,33 @@ class _CallbackAdapter:
             log.exception("[adapter] record exchange order_id failed")
         self._inner.on_stock_order(order)
 
+    def on_order_error(self, order_error):
+        """§UAT 2026-08-31：委托失败主推（XtOrderError）。同步 order_stock 返回 -1 时，
+        柜台/客户端的真实拒绝原因（error_id + error_msg）经此回调送达——此前未实现，
+        原因被静默丢弃，排障只剩裸 seq=-1。order_remark 即下单时的 signal_id。"""
+        try:
+            log.warning(
+                "[broker] order ERROR callback: signal(remark)=%s order_id=%s error_id=%s error_msg=%s",
+                getattr(order_error, "order_remark", "") or "",
+                getattr(order_error, "order_id", ""),
+                getattr(order_error, "error_id", ""),
+                getattr(order_error, "error_msg", ""),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("[adapter] on_order_error handling failed")
+
+    def on_cancel_error(self, cancel_error):
+        """§UAT 2026-08-31：撤单失败主推（XtCancelError）——与 on_order_error 同理补齐。"""
+        try:
+            log.warning(
+                "[broker] cancel ERROR callback: order_id=%s error_id=%s error_msg=%s",
+                getattr(cancel_error, "order_id", ""),
+                getattr(cancel_error, "error_id", ""),
+                getattr(cancel_error, "error_msg", ""),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("[adapter] on_cancel_error handling failed")
+
 
 class XtBroker(Broker):
     """真实东莞证券 MiniQMT 通道。xtquant 延迟 import；connect() 时初始化。"""
@@ -302,12 +329,13 @@ class XtBroker(Broker):
         pass  # 回调已在 connect() 注册
 
     def query_asset(self):
-        """查询账户资产（可用资金/冻结/总资产/市值）。xtquant query_asset 返回平铺 dict，
-        字段名取 cash/frozen_cash/total_asset/market_value；未连接或异常返回 None。"""
+        """查询账户资产（可用资金/冻结/总资产/市值）。xtquant query_stock_asset 返回
+        XtAsset 对象（cash/frozen_cash/market_value/total_asset 属性，或平铺 dict）；
+        未连接或异常返回 None。"""
         if not self._connected or self._trader is None:
             return None
         try:
-            raw = self._trader.query_asset(self._acc)
+            raw = self._trader.query_stock_asset(self._acc)
             if not raw:
                 return None
 

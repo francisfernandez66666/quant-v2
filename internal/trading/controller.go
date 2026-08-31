@@ -101,6 +101,27 @@ func (c *Controller) Mode() string {
 	return c.cfg.Mode
 }
 
+// AvailableCash 返回最近一次网关上报的可用资金；未知/过期/查询失败返回 0（调用方视为"不设限"）。
+// 资产由广州网关每分钟对账上报（real_account 表，§M1）；超过 30 分钟未刷新视为过期——
+// 此时宁可不降档（维持 fixed_amount 行为），让柜台做最终裁决，也不拿陈旧数字误拦订单。
+// English: returns the latest gateway-reported available cash; 0 when unknown/stale(>30min)/error —
+// callers treat 0 as "no cap", keeping the pre-existing fixed_amount behavior instead of gating
+// orders on stale numbers.
+func (c *Controller) AvailableCash() float64 {
+	if c.store == nil {
+		return 0
+	}
+	acc, err := c.store.GetRealAccount(c.userID)
+	if err != nil || acc.AvailableCash <= 0 {
+		return 0
+	}
+	updated, err := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, time.Local)
+	if err != nil || time.Since(updated) > 30*time.Minute {
+		return 0
+	}
+	return acc.AvailableCash
+}
+
 // Tripped 是否处于熔断状态（网关失联/心跳超时）。
 // English: Tripped reports whether the circuit breaker is open (gateway lost / heartbeat timeout).
 func (c *Controller) Tripped() bool {
@@ -364,10 +385,12 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// §安全 T2（2026-08-29）：此前无 SideBuy 限制，一旦配置了白名单且不含持仓战法，
 	// auto 止损卖单 / M8 清仓卖单会被拒 → 止损不执行，资损。卖出不受白名单约束（退出的持仓
 	// 其战法可能未在白名单，但退出是既有风险敞口的了结，不应被拦）。
+	// §UAT-FIX 2026-08-31：白名单条目是战法 ID（n_shape/fac_1…），req.Strategy 是中文显示名——
+	// 只比显示名会让 ID 白名单永远拒绝。现同时匹配 StrategyID 与显示名。
 	if req.Side == SideBuy && len(cfg.Strategies) > 0 && req.Strategy != "" {
 		allowed := false
 		for _, s := range cfg.Strategies {
-			if s == req.Strategy {
+			if s == req.Strategy || s == req.StrategyID {
 				allowed = true
 				break
 			}
