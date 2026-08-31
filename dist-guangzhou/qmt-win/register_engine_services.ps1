@@ -112,7 +112,15 @@ else {
 if (-not (Test-Path $QmtctlExe)) { Warn "未找到 $QmtctlExe —— 跳过 qmtctl 任务（可后续补全）" }
 else {
     $taskName = "QMT-Ensure-Running"
-    $action = "powershell -NoProfile -ExecutionPolicy Bypass -Command `"& '$QmtctlExe' ensure-miniqmt -path '$MiniQmtPath' -gateway-url http://127.0.0.1:8789/health`""
+    # §FIX 2026-08-31：无窗口包装——先落 wrapper ps1（UTF8-BOM：MiniQmtPath 常含中文目录，
+    # ASCII 会写成 '?' 导致启动失败），再由 wscript(GUI 子系统、无控制台)经 VBS 隐藏运行，
+    # 根除交互任务每 10 分钟的黑框闪烁（"监控闪退"观感）。VBS 内容保持 ASCII。
+    $wrapper = Join-Path $PSScriptRoot "ensure_miniqmt.ps1"
+    $wrapContent = "& '$QmtctlExe' ensure-miniqmt -path '$MiniQmtPath' -gateway-url http://127.0.0.1:8789/health"
+    Set-Content -Path $wrapper -Value $wrapContent -Encoding UTF8
+    $vbs = Join-Path $PSScriptRoot "run_qmt_ensure.vbs"
+    [IO.File]::WriteAllText($vbs, "CreateObject(""WScript.Shell"").Run ""powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"", 0, True", (New-Object Text.ASCIIEncoding))
+    $action = "wscript.exe //B $vbs"
     # 注意：不指定 /RU SYSTEM —— 默认在当前登录用户的交互会话运行（MiniQMT 需 GUI 登录会话）。
     # 配合 netplwiz 自动登录，开机后用户会话存在即周期执行。
     schtasks /Create /F /SC MINUTE /MO 10 /TN $taskName /TR $action

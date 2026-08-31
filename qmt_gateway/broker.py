@@ -252,7 +252,16 @@ class XtBroker(Broker):
             code = "%s.%s" % (head, _expect)
         price = float(req.get("price", 0) or 0)
         side = req.get("side", "")
-        order_type = 1101 if side == "买入" else 1102  # xtquant: 1101=买, 1102=卖
+        # §FIX 2026-08-31：order_type 必须取自本机 xtconstant——东莞证券构建 STOCK_BUY=23/STOCK_SELL=24，
+        # 此前硬编码主流文档口径 1101/1102（属另一枚举空间），客户端 orderservice 校验不过，
+        # 一律回 "invalid order type [-1]"（市价/限价、沪市/深市全中，查询不受影响）。
+        # English: derive order_type from the LOCAL xtconstant (DGZQ build: STOCK_BUY=23/STOCK_SELL=24);
+        # the previously hardcoded 1101/1102 belong to a different enum space and were rejected
+        # client-side with "invalid order type [-1]" for every market/price-type.
+        # （xtquant 为 Windows 专有库延迟导入，此处内联 import）
+        from xtquant import xtconstant as _xtc
+        ot = int(getattr(_xtc, "STOCK_BUY", 23)) if side == "买入" else int(getattr(_xtc, "STOCK_SELL", 24))
+        order_type = ot
         pt_const = self.price_type_const(req.get("price_type"), code)
         signal_id = req.get("signal_id", "")
         with self._lock:

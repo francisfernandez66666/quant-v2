@@ -117,7 +117,11 @@ if (-not (Test-Path $QmtctlExe)) {
     # UTF8（PS5.1 带 BOM）：MiniQmtPath 常含中文安装目录，ASCII 会写成 '?' 导致启动失败
     Set-Content -Path $wrapper -Value $wrapContent -Encoding UTF8
     $taskName = "QMT-Ensure-Running"
-    $action = "powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"
+    # §FIX 2026-08-31：无窗口包装——wscript(GUI 子系统)经 VBS 隐藏运行，根除交互任务
+    # 每 10 分钟的黑框闪烁（"监控闪退"观感）。VBS 内容 ASCII（wscript 不认 UTF-8 BOM）。
+    $vbs = Join-Path $PSScriptRoot "run_qmt_ensure.vbs"
+    [IO.File]::WriteAllText($vbs, "CreateObject(""WScript.Shell"").Run ""powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"", 0, True", (New-Object Text.ASCIIEncoding))
+    $action = "wscript.exe //B $vbs"
     # no /RU SYSTEM: runs in the logged-on interactive session (MiniQMT needs GUI session)
     schtasks /Create /F /SC MINUTE /MO 10 /TN $taskName /TR $action
     if ($LASTEXITCODE -eq 0) { Ok "task $taskName created (every 10 min, interactive)" }

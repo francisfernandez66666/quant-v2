@@ -169,9 +169,9 @@ class ReportHandler:
         ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
         self.on_order({
             "order_id": str(getattr(order, "order_id", "")),
-            "signal_id": getattr(order, "remark", "") or "",
+            "signal_id": self._signal_of(order),
             "code": getattr(order, "stock_code", ""),
-            "side": "买入" if getattr(order, "order_type", 0) == 1101 else "卖出",
+            "side": self._side_of(order),
             "status": self._status(getattr(order, "order_status", "")),
             "price": float(getattr(order, "price", 0) or 0),
             "qty": int(getattr(order, "order_volume", 0) or 0),
@@ -186,12 +186,12 @@ class ReportHandler:
             "trade_id": str(getattr(trade, "trade_id", "") or getattr(trade, "order_sysid", "") or ""),
             "name": getattr(trade, "stock_name", "") or "",
             "code": getattr(trade, "stock_code", ""),
-            "side": "买入" if getattr(trade, "order_type", 0) == 1101 else "卖出",
+            "side": self._side_of(trade),
             "price": float(getattr(trade, "traded_price", 0) or 0),
             "qty": int(getattr(trade, "traded_volume", 0) or 0),
             "amount": float(getattr(trade, "traded_amount", 0) or 0),
             "traded_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
-            "signal_id": getattr(trade, "remark", "") or "",
+            "signal_id": self._signal_of(trade),
         })
 
     def on_disconnected(self):
@@ -206,6 +206,46 @@ class ReportHandler:
             self._push({"type": "disconnect", "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00")})
         else:
             log.info("[handler] channel disconnected off-hours (MiniQMT killed by qmtctl) — silent, no fuse")
+
+    @staticmethod
+    def _side_of(obj):
+        """§FIX 2026-08-31：买卖方向识别——本机东莞证券 xtconstant 构建 STOCK_BUY=23/STOCK_SELL=24，
+        此前硬编码 `order_type == 1101`（主流文档枚举空间）恒不命中，导致一切回报被判"卖出"
+        （实盘首两笔买入成交全被记成卖出，账本方向失真）。
+        现按多字段多枚举空间探测：order_type(本构建 23/24，兼容主流 1101/1102)
+        → offset_type(柜台回推口径 48=买/50=卖，已由实盘成交实证)。
+        都不命中时记警告并返回空串。
+        English: detect buy/sell across enum spaces (local build 23/24, legacy 1101/1102,
+        counter offset 48/50); warn and return "" when nothing matches."""
+        for attr, buys, sells in (("order_type", (23, 1101), (24, 1102)),
+                                  ("offset_type", (48,), (50,))):
+            v = getattr(obj, attr, None)
+            if v is None:
+                continue
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            if v in buys:
+                return "买入"
+            if v in sells:
+                return "卖出"
+        log.warning("[handler] side detect failed: order_type=%r offset_type=%r",
+                    getattr(obj, "order_type", None), getattr(obj, "offset_type", None))
+        return ""
+
+    @staticmethod
+    def _signal_of(obj):
+        """§FIX 2026-08-31：signal_id 归因——xtquant 回调对象的备注字段名为
+        strategy_name/order_remark，此前读 `remark`（不存在）恒为空 → 委托/成交无法归因、
+        orders 行被 skip、按战法盈亏统计断链（柜台回推 remark 实际带完整 signal_id，见
+        XtMiniQmt 日志 `m_pRemark.m_strMsg`）。
+        English: attribute signal_id from strategy_name/order_remark/remark (first non-empty)."""
+        for attr in ("strategy_name", "order_remark", "remark"):
+            v = str(getattr(obj, attr, "") or "").strip()
+            if v:
+                return v
+        return ""
 
     @staticmethod
     def _status(code):

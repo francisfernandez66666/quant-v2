@@ -85,8 +85,16 @@ exit 0
 Set-Content -Path $wrapper -Value $wrap -Encoding UTF8
 Ok "已生成守护 wrapper: $wrapper"
 
+# ---- 3.5 无窗口包装器（§FIX 2026-08-31）：交互会话计划任务每次触发都会弹黑色控制台
+#      （用户观感="监控程序闪退"）。wscript.exe 是 GUI 子系统程序自身无控制台，
+#      经 VBS 以隐藏窗口+同步等待运行 wrapper，任务触发间隔/会话亲和/单实例策略不变。
+#      VBS 内容保持 ASCII（wscript 对 UTF-8 BOM 支持差）。
+$vbs = Join-Path $PSScriptRoot "run_gateway_ensure.vbs"
+[IO.File]::WriteAllText($vbs, "CreateObject(""WScript.Shell"").Run ""powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"", 0, True", (New-Object Text.ASCIIEncoding))
+Ok "已生成无窗口包装器: $vbs"
+
 # ---- 4. 注册计划任务（交互会话，勿加 /RU SYSTEM）----
-$taskAction = "powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper"
+$taskAction = "wscript.exe //B $vbs"
 schtasks /Create /F /SC MINUTE /MO $EnsureIntervalMin /TN $TaskEnsureName /TR $taskAction
 if ($LASTEXITCODE -eq 0) { Ok "任务 $TaskEnsureName 已创建（每 $EnsureIntervalMin 分钟幂等守护，仅登录会话运行）" }
 else { Warn "schtasks 创建失败（exit=$LASTEXITCODE），请在任务计划程序手动创建（当前用户、交互令牌）" }
@@ -108,8 +116,11 @@ if ($InstallQmtRestart) {
     $taskName = "QMT-Daily-Restart"
     $ps1 = Join-Path $PSScriptRoot "tools\restart_qmt.ps1"
     Set-Content -Path $ps1 -Value "Get-Process XtItClient,XtMiniQmt -ErrorAction SilentlyContinue | Stop-Process -Force" -Encoding ASCII
+    # 无窗口包装（同 §3.5）：每日一次的黑框闪烁同样消除
+    $vbsR = Join-Path $PSScriptRoot "run_daily_restart.vbs"
+    [IO.File]::WriteAllText($vbsR, "CreateObject(""WScript.Shell"").Run ""powershell -NoProfile -ExecutionPolicy Bypass -File $ps1"", 0, True", (New-Object Text.ASCIIEncoding))
     # 必须交互会话运行（/RU SYSTEM 会话里杀不到桌面进程的窗口句柄，且重登需 GUI）
-    schtasks /Create /F /SC DAILY /ST 07:40 /TN $taskName /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $ps1"
+    schtasks /Create /F /SC DAILY /ST 07:40 /TN $taskName /TR "wscript.exe //B $vbsR"
     if ($LASTEXITCODE -eq 0) { Ok "计划任务 $taskName 已创建（每天 07:40 重启客户端；重启后由 QMT-Ensure-Running 拉起并自动登录）" }
     else { Warn "schtasks 创建失败（exit=$LASTEXITCODE），可手动在任务计划程序里建" }
 }

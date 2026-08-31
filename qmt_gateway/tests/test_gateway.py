@@ -224,6 +224,10 @@ class TestHandler(unittest.TestCase):
         old = post_report
         import handler as handler_mod
         handler_mod.post_report = fake_post
+        # §FIX 2026-08-31：on_disconnected 仅交易时段推送（防非交易时段熔断误报）——
+        # 该测试此前在收盘后跑必挂（时间敏感）。冻结为交易时段，测试不再依赖挂钟。
+        old_session = handler_mod.is_active_trading_session
+        handler_mod.is_active_trading_session = lambda: True
         try:
             h = ReportHandler(s, "http://seoul:8080", "tok")
             h._push = lambda p: pushed.append(p)  # 直接捕获
@@ -232,6 +236,7 @@ class TestHandler(unittest.TestCase):
             h.on_disconnected()
         finally:
             handler_mod.post_report = old
+            handler_mod.is_active_trading_session = old_session
         types = [p["type"] for p in pushed]
         self.assertEqual(types, ["trade", "disconnect"])
         # 落库校验
