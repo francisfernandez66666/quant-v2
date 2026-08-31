@@ -20,6 +20,7 @@ import (
 	"time"
 	_ "time/tzdata" // §TZ1 内嵌 IANA 时区库：Windows/精简容器保证 Asia/Shanghai 可加载
 
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/scheduler"
 )
 
@@ -50,6 +51,10 @@ func main() {
 	}
 	log.Printf("[researchd] 数据目录: %s", dataDir)
 
+	// §DAILY_OPSLOG 每日系统运行日志：research 侧与 quant 共写同目录（按日核心记录）。
+	opslog.Init(dataDir, 0)
+	opslog.Logf("research", "研究调度服务启动 dataDir=%s tz=%s", dataDir, time.Local.String())
+
 	sch := scheduler.New(dataDir, "", "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -60,6 +65,7 @@ func main() {
 	go func() {
 		<-stop
 		log.Println("[researchd] 收到退出信号，正在停止研究调度…")
+		opslog.Logf("research", "收到退出信号，停止调度（运行任务标抢占续跑）")
 		sch.PreemptForShutdown() // §先标抢占再取消：运行任务落 preempted 断点续跑，不落 error
 		cancel()
 	}()

@@ -27,6 +27,7 @@ import (
 
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 )
 
@@ -264,6 +265,7 @@ func (s *Scheduler) openStore(cfg config.SchedulerConfig) *store.DB {
 			log.Printf("[scheduler] 启动恢复失败: %v", err)
 		} else if n > 0 {
 			log.Printf("[scheduler] 启动恢复：%d 个遗留运行任务标记为 preempted（盘后自动续跑）", n)
+			opslog.Logf("research", "启动恢复 %d 个遗留任务为 preempted（盘后续跑）", n)
 		}
 		s.mu.Lock()
 		s.storeReset = true
@@ -326,6 +328,7 @@ func (s *Scheduler) preemptCurrent(reason string) {
 	cur := s.curCmd        // 当前子进程（可能为 nil），用于整组击杀
 	s.mu.Unlock()
 	log.Printf("[scheduler] 终止当前任务 #%d(%s): %s", id, typ, reason)
+	opslog.Logf("research", "抢占任务 #%d(%s): %s", id, typ, reason)
 	// §修复 S3（2026-08-29）：整组击杀而非仅 SIGKILL 直接子进程。子进程设了 Setpgid，
 	// 孙进程（如 research run-task 派生的计算进程）若只杀直接子进程会成为孤儿继续写库。
 	if cur != nil {
@@ -376,6 +379,9 @@ func (s *Scheduler) tryStartNext(db *store.DB, cfg config.SchedulerConfig) {
 	}
 	if !memGateOpen(cfg) {
 		// 内存总闸：系统可用内存不足——一切任务留队等待，绝不与量化主程序/系统抢内存。
+		opslog.OncePer("memgate", time.Hour, func() {
+			opslog.Logf("research", "内存总闸拦截 MemAvailable=%dMB 阈值=%dMB 任务留队", readMemAvailableMB(), cfg.MinFreeMemMB)
+		})
 		log.Printf("[scheduler] 内存总闸拦截：MemAvailable=%dMB < %dMB，本轮不出队（任务留队）",
 			readMemAvailableMB(), func() int {
 				t := cfg.MinFreeMemMB
@@ -539,6 +545,7 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 	s.mu.Unlock()
 	s.saveState()
 	log.Printf("[scheduler] 夜间链 %s 已入队 %d 个 low 任务: %v", today, len(steps), steps)
+	opslog.Logf("research", "夜间链 %s 入队 %d 个任务: %v", today, len(steps), steps)
 }
 
 // containsStep 报告 steps 中是否包含指定步骤。
@@ -702,11 +709,13 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	}()
 	log.Printf("[scheduler] 任务 #%d(%s prio=%s ref=%d chain=%s/%d) 启动",
 		tk.ID, tk.Type, tk.Priority, tk.RefID, tk.ChainDay, tk.ChainSeq)
+	opslog.Logf("research", "任务 #%d(%s) 启动 prio=%s chain=%s/%d", tk.ID, tk.Type, tk.Priority, tk.ChainDay, tk.ChainSeq)
 
 	// §失败重排队：失败不再落 error 终态——回队尾（updated_at 尾键沉底），不设重试上限；
 	// error 列保留最后失败原因。冷却窗防快速失败自旋。
 	fail := func(errMsg string) {
 		log.Printf("[scheduler] 任务 #%d(%s) 失败→回队尾重试: %s", tk.ID, tk.Type, errMsg)
+		opslog.Logf("research", "任务 #%d(%s) 失败回队重试: %s", tk.ID, tk.Type, errMsg)
 		_ = db.RequeueFailedTask(tk.ID, errMsg)
 		s.noteFailure(tk.ID)
 		s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
@@ -771,6 +780,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		if base.Err() != nil || errors.Is(err, context.Canceled) {
 			errMsg := "调度器停止，断点续跑"
 			log.Printf("[scheduler] 任务 #%d 启动被停机打断 → preempted", tk.ID)
+			opslog.Logf("research", "任务 #%d 启动被停机打断 → preempted", tk.ID)
 			s.finishTask(db, cfg, &tk, store.TaskPreempted, errMsg)
 			return
 		}
@@ -902,6 +912,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			if av := readMemAvailableMB(); av >= 0 && av < runtimeFloor {
 				log.Printf("[scheduler] 运行时熔断：MemAvailable=%dMB < %dMB，抢占当前任务 #%d(%s) 留队续跑",
 					av, runtimeFloor, tk.ID, tk.Type)
+				opslog.Logf("research", "运行时熔断抢占 #%d(%s) MemAvailable=%dMB<%dMB", tk.ID, tk.Type, av, runtimeFloor)
 				s.preemptCurrent("系统内存危急(运行时熔断)")
 			}
 			c, err := db.ConsumeTaskControl(tk.ID)
@@ -1087,6 +1098,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		s.clearFailure(tk.ID) // 成功/取消清除冷却记录
 	}
 	log.Printf("[scheduler] 任务 #%d(%s) -> %s%s", tk.ID, tk.Type, status, tailOf(errMsg))
+	opslog.Logf("research", "任务 #%d(%s) 终态=%s%s", tk.ID, tk.Type, status, tailOf(errMsg))
 	s.finishTask(db, cfg, &tk, status, errMsg)
 }
 
@@ -1156,6 +1168,7 @@ func (s *Scheduler) finishTask(db *store.DB, cfg config.SchedulerConfig, tk *sto
 	s.mu.Unlock()
 	s.saveState()
 	log.Printf("[scheduler] 夜间链 %s 已全部完成", tk.ChainDay)
+	opslog.Logf("research", "夜间链 %s 全部完成", tk.ChainDay)
 }
 
 // recordStepState 把任务结果写入状态文件（前端 /api/research/progress 可见，排障用）。

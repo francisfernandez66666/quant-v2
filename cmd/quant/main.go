@@ -24,6 +24,7 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
@@ -56,6 +57,11 @@ func main() {
 	// 数据目录：存放认证、配置、报告、自选等持久化文件
 	dataDir := getDataDir()
 	os.MkdirAll(dataDir, 0755)
+
+	// §DAILY_OPSLOG 每日系统运行日志：quant/research 双进程共写的按日核心记录
+	// （订单/成交/对账/熔断/任务生命周期……策划性低频事件），详见 internal/opslog 包注释。
+	opslog.Init(dataDir, 0)
+	opslog.Logf("quant", "引擎进程启动 dataDir=%s tz=%s", dataDir, time.Local.String())
 
 	// 认证管理：初始化用户库。§GAP2-W1 移除"首次启动自动创建 admin/admin123"——
 	// 全世界都知道的弱口令在公网等于无门；现在全新部署必须走 POST /setup 原子初始化

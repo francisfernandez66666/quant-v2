@@ -34,6 +34,7 @@ import (
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
@@ -717,6 +718,10 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	if si := live[sig.Code]; si != nil && si.ChangePct >= paper.LimitUpPct(sig.Code, sig.Name) {
 		log.Printf("[qmt] %s(%s) 涨停封板 %.1f%%≥%.1f%% 拒买跳过", sig.Code, sig.Name,
 			si.ChangePct, paper.LimitUpPct(sig.Code, sig.Name))
+		// §DAILY_OPSLOG 按天/按股去重（同一封板股每 5s 循环都会触达，全记会刷屏）
+		opslog.DayOnce("limitup:"+sig.Code, func() {
+			opslog.Logf("quant", "涨停封板拒买 %s(%s) 涨幅=%.1f%% 策略=%s/%s", sig.Code, sig.Name, si.ChangePct, sig.StrategyID, sig.Strategy)
+		})
 		return
 	}
 	amount := cfg.FixedAmount
@@ -734,6 +739,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	// §R0.7 修复：高价股不足一手时不再强凑 1 手（旧逻辑 qty=100 导致订单金额超预算数倍）
 	if qty <= 0 {
 		log.Printf("[qmt] %s 金额不足以买一手，跳过下单", sig.Code)
+		opslog.DayOnce("one-lot:"+sig.Code, func() {
+			opslog.Logf("quant", "金额不足一手跳过 %s 现价=%.2f 预算=%.0f 策略=%s/%s", sig.Code, price, amount, sig.StrategyID, sig.Strategy)
+		})
 		return
 	}
 	// §UAT-CASH 2026-08-31：按可用资金自动降档——与模拟盘"现金不足时按剩余现金整手买入"
@@ -749,10 +757,14 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		if affordable < qty {
 			if affordable <= 0 {
 				log.Printf("[qmt] %s 可用资金 %.0f 不足以买一手(现价 %.2f)，跳过下单", sig.Code, cash, price)
+				opslog.DayOnce("nocash:"+sig.Code, func() {
+					opslog.Logf("quant", "资金不足跳过 %s 现价=%.2f 可用=%.0f 策略=%s/%s", sig.Code, price, cash, sig.StrategyID, sig.Strategy)
+				})
 				return
 			}
 			log.Printf("[qmt] %s 可用资金 %.0f 不足按预算 %d 股买入，自动降档为 %d 股(约 %.0f 元)",
 				sig.Code, cash, qty, affordable, float64(affordable)*price)
+			opslog.Logf("quant", "资金降档 %s 预算=%d股→%d股 可用=%.0f 现价=%.2f", sig.Code, qty, affordable, cash, price)
 			qty = affordable
 		}
 	}
@@ -792,6 +804,7 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 			log.Printf("[trading] auto order queued %s(%s) qty=%d price=%.2f (async)", sig.Code, sig.Name, qty, price)
 		default:
 			log.Printf("[trading] auto order DROPPED (buy queue full) %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
+			opslog.Logf("quant", "auto 买单丢失(队列满) %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
 		}
 	} else {
 		res, err := ctrl.PlaceOrder(req)
@@ -867,6 +880,9 @@ func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal
 		return
 	}
 	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, req.Qty, req.Price, res)
+	// §DAILY_OPSLOG auto 实际下单结果（受理/业务拒单由 controller 侧另记，此处补策略上下文）
+	opslog.Logf("quant", "auto 下单 %s(%s) 策略=%s/%s qty=%d price=%.2f → ok=%v order=%s err=%s",
+		sig.Code, sig.Name, req.StrategyID, req.Strategy, req.Qty, req.Price, res.OK, res.OrderID, res.Err)
 }
 
 // SetScoringInterval §A+B 设置近实时打分循环间隔（0 → 回退 5s）。

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
@@ -408,6 +409,10 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			return
 		} else {
 			log.Printf("[trading] 网关全量对账(用户=%s): %d 持仓", owner, n)
+			// §DAILY_OPSLOG 每日至首次对账记一行（对账每分钟跑，全记会淹没核心记录）
+			opslog.DayOnce("reconcile:"+owner, func() {
+				opslog.Logf("quant", "首次持仓对账 用户=%s 持仓=%d", owner, n)
+			})
 		}
 	case "order":
 		// §安全 T3：委托方向同样归一（仅用于展示，但保持口径一致，避免"BUY"等串污染委托行）。
@@ -437,6 +442,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 				}
 			} else if ev.Status != "已报" {
 				log.Printf("[trading] 委托状态推进 %s: %s (order=%s)", ev.SignalID, ev.Status, ev.OrderID)
+				// §DAILY_OPSLOG 状态推进是委托生命周期的核心节点（已成/已撤/废单…）
+				opslog.Logf("quant", "委托状态推进 %s %s %s qty=%d status=%s order=%s",
+					ev.SignalID, orderSide, ev.Code, ev.Qty, ev.Status, ev.OrderID)
 			}
 		}
 	case "trade":
@@ -456,6 +464,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[trading] 成交回报 %s %s qty=%d price=%.2f", ev.Side, ev.Code, ev.Qty, ev.Price)
+		// §DAILY_OPSLOG 成交是每日核心记录的第一等事件（信号归因一并落档）
+		opslog.Logf("quant", "成交 %s %s qty=%d price=%.2f 金额=%.2f signal=%s order=%s",
+			tradeSide, ev.Code, ev.Qty, ev.Price, ev.Amount, ev.SignalID, ev.OrderID)
 	case "disconnect":
 		// 断线回报 → 熔断暂停下单并告警
 		if ctrl != nil {
@@ -463,6 +474,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			ctrl.SetTripped("网关断线回报（disconnect）")
 		}
 		log.Printf("[trading] 网关断线回报，实盘下单已熔断")
+		opslog.Logf("quant", "网关断线回报，已熔断暂停全部下单")
 	case "account":
 		// 账户资产回报（可用资金等）：归属账号同 positions，一律以网关 token 解析出的 uid 为准（§安全 T1）。
 		owner := uid
@@ -483,6 +495,11 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[trading] 账户资产上报(用户=%s): 可用=%.2f 冻结=%.2f 总值=%.2f 市值=%.2f",
 			owner, ev.Asset["cash"], ev.Asset["frozen_cash"], ev.Asset["total_asset"], ev.Asset["market_value"])
+		// §DAILY_OPSLOG 每日至首次资产上报=开盘快照（每分钟全记会淹没核心记录）
+		opslog.DayOnce("asset:"+owner, func() {
+			opslog.Logf("quant", "开盘资产快照 用户=%s 可用=%.2f 冻结=%.2f 总值=%.2f 市值=%.2f",
+				owner, ev.Asset["cash"], ev.Asset["frozen_cash"], ev.Asset["total_asset"], ev.Asset["market_value"])
+		})
 	case "heartbeat":
 		// §ROBUST 上行心跳：last_report_at 已在 switch 前统一刷新——它就是心跳的全部意义
 		// （无交易时段证明 广州→首尔 回程连通），无任何账本副作用。
@@ -766,6 +783,9 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[trading] ⚠️ kill-switch %s (用户=%s): 同步撤销未成交委托 %d 笔",
 		map[bool]string{true: "置位——紧急停止一切下单", false: "解除"}[*req.Halted], uid, cancelled)
+	// §DAILY_OPSLOG kill-switch 属最高优先级留档事件
+	opslog.Logf("quant", "kill-switch %s 用户=%s 撤销未成交委托=%d",
+		map[bool]string{true: "置位(紧急停止)", false: "解除"}[*req.Halted], uid, cancelled)
 	if s.sse != nil {
 		s.sse.BroadcastTo(uid, map[string]interface{}{
 			"type":      "qmt_halt",

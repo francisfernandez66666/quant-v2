@@ -18,6 +18,7 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 )
 
@@ -212,6 +213,8 @@ func (c *Controller) setTripped(tripped bool, reason string) {
 		onAlert("info", "QMT 实盘恢复", "网关连接恢复，自动解熔")
 	}
 	log.Printf("[trading] circuit breaker %v: %s", tripped, reason)
+	// §DAILY_OPSLOG 熔断/恢复是资金安全的分水岭事件，必须留档
+	opslog.Logf("quant", "熔断器 %s: %s", map[bool]string{true: "触发", false: "恢复"}[tripped], reason)
 }
 
 // SetTripped 外部置熔断（网关断线回报等确定性事件立即熔断，不等心跳超时）。
@@ -467,6 +470,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		if merr := c.store.MarkRealOrderSendFailed(c.userID, req.SignalID); merr != nil {
 			log.Printf("[trading] mark send-failed %s: %v", req.SignalID, merr)
 		}
+		opslog.Logf("quant", "下单发送失败(降级可重试) %s %s %s qty=%d: %v", req.SignalID, req.Side, req.Code, req.Qty, err)
 		return nil, err
 	}
 	// §R3-1 P0-A 业务拒单兜底：网关返回 200+ok:false（券商侧拒绝：资金不足/废单等）时
@@ -482,6 +486,8 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 			log.Printf("[trading] mark send-failed (business reject) %s: %v", req.SignalID, merr)
 		}
 		log.Printf("[trading] %s 网关业务拒单: %s（占位行已降级发送失败，可重试）", req.SignalID, res.Err)
+		opslog.Logf("quant", "网关业务拒单 %s %s %s qty=%d price=%.2f: %s",
+			req.SignalID, req.Side, req.Code, req.Qty, req.Price, res.Err)
 		return res, nil
 	}
 	// 回填网关委托单号并更新状态（占位行按 signal_id 定位）
@@ -490,6 +496,9 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 			log.Printf("[trading] backfill order id: %v", err)
 		}
 	}
+	// §DAILY_OPSLOG 下单受理（网关已收单）——含策略归因与金额口径
+	opslog.Logf("quant", "下单受理 %s %s %s qty=%d price=%.2f amount=%.0f 策略=%s/%s order=%s",
+		req.SignalID, req.Side, req.Code, req.Qty, req.Price, req.Amount, req.StrategyID, req.Strategy, res.OrderID)
 	return res, nil
 }
 
@@ -849,6 +858,11 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	if res.Cancelled+res.Demoted > 0 || closeSweep {
 		log.Printf("[trading] 撤单闭环本轮: 撤销=%d 占位降级=%d 失败=%d 跳过=%d 收盘清单=%v",
 			res.Cancelled, res.Demoted, res.Errors, res.Skipped, closeSweep)
+		// §DAILY_OPSLOG 收盘清单属每日留档节点；常规轮次仅在确有动作时记
+		if closeSweep || res.Cancelled+res.Demoted > 0 {
+			opslog.Logf("quant", "撤单闭环 撤销=%d 占位降级=%d 失败=%d 收盘清单=%v",
+				res.Cancelled, res.Demoted, res.Errors, closeSweep)
+		}
 	}
 	return res
 }
