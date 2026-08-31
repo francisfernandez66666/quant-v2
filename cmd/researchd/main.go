@@ -52,7 +52,7 @@ func main() {
 	log.Printf("[researchd] 数据目录: %s", dataDir)
 
 	// §DAILY_OPSLOG 每日系统运行日志：research 侧与 quant 共写同目录（按日核心记录）。
-	opslog.Init(dataDir, 0)
+	opslog.Init(filepath.Join(dataDir, "opslog"), 0)
 	opslog.Logf("research", "研究调度服务启动 dataDir=%s tz=%s", dataDir, time.Local.String())
 
 	sch := scheduler.New(dataDir, "", "")

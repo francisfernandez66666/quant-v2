@@ -60,7 +60,8 @@ func main() {
 
 	// §DAILY_OPSLOG 每日系统运行日志：quant/research 双进程共写的按日核心记录
 	// （订单/成交/对账/熔断/任务生命周期……策划性低频事件），详见 internal/opslog 包注释。
-	opslog.Init(dataDir, 0)
+	// 独立 opslog 子目录：数据目录根已很拥挤，日志按天集中收纳便于巡检与整体备份。
+	opslog.Init(filepath.Join(dataDir, "opslog"), 0)
 	opslog.Logf("quant", "引擎进程启动 dataDir=%s tz=%s", dataDir, time.Local.String())
 
 	// 认证管理：初始化用户库。§GAP2-W1 移除"首次启动自动创建 admin/admin123"——
