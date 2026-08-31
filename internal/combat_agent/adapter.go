@@ -1,8 +1,16 @@
 // Package combat_agent 战法适配层：把引擎传入的 *strategy_engine.StockMarketData
 // 转换成各战法真实评分接口需要的结构化输入，让 8a/8b 战法在标准扫描路径上真正产出信号。
-// English: strategy adapter layer — converts the engine's *strategy_engine.StockMarketData into the
-// structured inputs each strategy's real scoring interface needs, so the 8a/8b strategies produce real
-// signals on the standard scan path.
+//
+// 本文件是 combat_agent 包的数据适配层，负责：
+//   - 将行情数据转换为战法需要的个股实时信息
+//   - 计算均线、平均成交量等技术指标
+//   - 从日K线派生龙回头战法的输入数据
+//   - 根据战法类型分发到对应的评分逻辑
+//
+// 适配层的设计目的：
+//   - 解耦引擎数据格式与战法输入格式
+//   - 统一技术指标计算
+//   - 按战法类型自动分发评分逻辑
 package combat_agent
 
 import (
@@ -20,8 +28,12 @@ import (
 // stockInfoFromMarketData 从 StockMarketData 构造战法需要的个股实时信息。
 // 成交量/成交额取自日K最后一根（近似当日量能）。
 // 基础字段（代码/名称/现价/涨跌幅）直接取自引擎行情；OHLC/量额回填最后一根日K。
-// English: builds the realtime StockInfo a strategy needs from StockMarketData. Base fields come from
-// engine quotes; OHLC and volume/amount are back-filled from the last daily K-line as an intraday proxy.
+//
+// 参数：
+//   - md: 引擎行情数据快照
+//
+// 返回值：
+//   - 战法需要的个股实时信息指针
 func stockInfoFromMarketData(md *strategy_engine.StockMarketData) *data.StockInfo {
 	si := &data.StockInfo{
 		Code:      md.Code,
@@ -44,9 +56,13 @@ func stockInfoFromMarketData(md *strategy_engine.StockMarketData) *data.StockInf
 
 // ma 计算最近 n 根K线的收盘均线（委托指标库 indicator.SMA，末尾值）。
 // K线数量不足 n 根时按实际数量回退计算（SMA 预热期为 NaN，此处回退简单平均）；n<=0 或空列表返回 0。
-// English: last simple moving average of the n K-line closes, delegating to indicator.SMA. Falls back to
-// the available-count average when K-lines are fewer than n (SMA warm-up is NaN), and returns 0 for
-// n<=0 or an empty list.
+//
+// 参数：
+//   - kl: K线数据列表
+//   - n: 均线周期
+//
+// 返回值：
+//   - 最近 n 根K线的收盘均线值
 func ma(kl []data.KLine, n int) float64 {
 	if len(kl) == 0 || n <= 0 {
 		return 0
@@ -69,8 +85,13 @@ func ma(kl []data.KLine, n int) float64 {
 
 // avgVol 计算最近 n 根K线的平均成交量。
 // 逻辑与 ma 一致，仅统计维度为成交量；K线不足或空列表时返回 0。
-// English: average volume of the last n K-lines, same semantics as ma but on Volume; returns 0 when
-// insufficient or empty.
+//
+// 参数：
+//   - kl: K线数据列表
+//   - n: 计算周期
+//
+// 返回值：
+//   - 最近 n 根K线的平均成交量
 func avgVol(kl []data.KLine, n int) float64 {
 	if len(kl) < n {
 		n = len(kl)
@@ -89,9 +110,23 @@ func avgVol(kl []data.KLine, n int) float64 {
 // dragonReturnDataFromMarketData 从日K线派生龙回头战法的输入：
 // 首轮涨幅(近40日主升高点)、回调幅度/天数、缩量比、均线；板块龙性由已验证板块填充。
 // K线不足30根时返回零值结构（龙性硬性条件不满足 → 0分，安全降级）。
-// English: derives the dragon-return strategy input from daily K-lines — first-leg rise (40-day peak),
-// pullback depth/days, volume-shrink ratio, MAs; sector leadership comes from the verified sector.
-// Returns the zero-valued struct (safe 0-score degrade) when fewer than 30 K-lines are available.
+//
+// 派生逻辑：
+//   1. 均线族：MA5/MA10/MA20
+//   2. 主升高点：近40根内最高收盘价
+//   3. 首轮涨幅：主升高点相对窗口起点收盘的涨幅
+//   4. 回调幅度：主升高点相对现价的回撤
+//   5. 回调天数：主升高点之后的K线根数
+//   6. 缩量比：近5日均量 / 20日均量
+//   7. 板块龙性：RPS 排名前2视为板块龙头
+//
+// 参数：
+//   - code: 股票代码
+//   - md: 行情数据快照
+//   - sector: 板块上下文（可为 nil）
+//
+// 返回值：
+//   - 龙回头战法输入数据指针
 func dragonReturnDataFromMarketData(code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector) *dragon_return.StockData {
 	sd := &dragon_return.StockData{
 		Code:         code,
@@ -163,13 +198,26 @@ func dragonReturnDataFromMarketData(code string, md *strategy_engine.StockMarket
 //   - DragonReturn 从K线派生 StockData 走 Evaluate
 //   - NShape 从日K+实时量价+分钟MACD构造 WaveA/IntradayB/Ctx 走 EvaluateWave
 //
-// sector 传 nil 表示无板块上下文（个股直入 8a/8b 场景）；emotionPhase 供 N 形情绪硬闸；
-// d1 为 D1Scorer 对该股的评分（含 LLM 打分与负面阻断），eventDesc 为个股关联新闻标题（供 D1 YAML 兜底），
-// pe 为个股PE（供 D3 超跌评分），两者仅 N 形战法消费，其他战法忽略。
-// English: dispatches to each strategy's real scoring by concrete type — Dragon/DoubleBump via
-// EvaluateReal, DragonReturn via a derived StockData Evaluate, NShape via constructed WaveA/IntradayB/Ctx
-// EvaluateWave. sector nil means no sector context (direct 8a/8b input); d1/eventDesc/pe are consumed by
-// the N-shape strategy only.
+// 分发策略：
+//   - 龙头战法：K线 + 板块共振（把已验证板块折叠成 SectorInfo 列表）
+//   - 双响炮：实时信息 + K线
+//   - 龙回头：从日K派生首轮涨幅/回调/缩量输入
+//   - N形：日K A波 + 日内快照 B段 + 上下文（含情绪硬闸 + D1 事件 + PE）
+//   - 未知策略：回退到策略默认评估接口
+//
+// 参数：
+//   - runner: 策略运行器，包含策略类型和实例
+//   - code: 股票代码
+//   - md: 行情数据快照
+//   - sector: 板块上下文（nil 表示无板块上下文）
+//   - emotionPhase: 情绪阶段，供 N 形情绪硬闸使用
+//   - d1: D1 评分结果（供 N 形战法消费）
+//   - eventDesc: 个股关联新闻标题（供 N 形战法消费）
+//   - pe: 个股市盈率（供 N 形 D3 超跌评分）
+//
+// 返回值：
+//   - eval: 策略评分结果
+//   - err: 错误信息
 func evalFor(runner StrategyRunner, code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, emotionPhase string, d1 *D1Score, eventDesc string, pe float64) (*strategy.Evaluation, error) {
 	// 行情数据缺失时回退到策略的默认评估接口（各战法自行处理 nil 行情）
 	// English: when market data is missing fall back to the strategy's default Evaluate (strategies

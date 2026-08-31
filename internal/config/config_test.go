@@ -98,3 +98,54 @@ func TestStreamingEnabled(t *testing.T) {
 }
 
 func defaultLLM() *LLMConfig { return &LLMConfig{} }
+
+// TestRuntimeConfigIntervalDefaults A+B 快速执行器配置：默认回退 5s，可配置更低值。
+// English: A+B fast-executor config: default falls back to 5s, lower values are configurable.
+func TestRuntimeConfigIntervalDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	m := NewManager(path)
+
+	// 显式设为 1s 并持久化（深拷贝避免污染共享 DefaultRules）
+	rules := *m.Rules
+	rules.Runtime = RuntimeConfig{FeedIntervalSec: 1, ScoringIntervalSec: 1}
+	m.Rules = &rules
+	m.Save()
+	m2 := NewManager(path)
+	if m2.Rules.Runtime.FeedIntervalSec != 1 {
+		t.Errorf("FeedIntervalSec=%d, want 1", m2.Rules.Runtime.FeedIntervalSec)
+	}
+	if m2.Rules.Runtime.ScoringIntervalSec != 1 {
+		t.Errorf("ScoringIntervalSec=%d, want 1", m2.Rules.Runtime.ScoringIntervalSec)
+	}
+	// 未设置时默认 0（调用方回退 5s）
+	m3 := NewManager(filepath.Join(t.TempDir(), "cfg2.json"))
+	if m3.Rules.Runtime.FeedIntervalSec != 0 || m3.Rules.Runtime.ScoringIntervalSec != 0 {
+		t.Errorf("默认应为 0（回退 5s）, got %d/%d", m3.Rules.Runtime.FeedIntervalSec, m3.Rules.Runtime.ScoringIntervalSec)
+	}
+}
+
+// TestLoadSchedulerConfigResourceThrottles 内存闸门/回放节流配置应被 LoadSchedulerConfig 解析：
+// 此前 min_free_mem_mb 漏解析恒走默认 400，无法按需为 quant 留内存余量（修复 #A）。
+// English: min_free_mem_mb / replay_throttle_ms must round-trip through LoadSchedulerConfig —
+// min_free_mem_mb was previously never parsed (always the 400 default) and is now honored.
+func TestLoadSchedulerConfigResourceThrottles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := `{"rules":{"scheduler":{
+		"min_free_mem_mb": 600,
+		"replay_throttle_ms": 80,
+		"step_timeout_min": 360
+	}}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := LoadSchedulerConfig(path)
+	if cfg.MinFreeMemMB != 600 {
+		t.Errorf("MinFreeMemMB=%d, want 600", cfg.MinFreeMemMB)
+	}
+	if cfg.ReplayThrottleMs != 80 {
+		t.Errorf("ReplayThrottleMs=%d, want 80", cfg.ReplayThrottleMs)
+	}
+	if cfg.StepTimeoutMin != 360 {
+		t.Errorf("StepTimeoutMin=%d, want 360", cfg.StepTimeoutMin)
+	}
+}

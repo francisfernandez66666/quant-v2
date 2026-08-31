@@ -88,8 +88,9 @@ type AppliedFactorEntry struct {
 	CumReturn   float64 `json:"cum_return"`   // 累计前向收益（% 或小数，由监控写入）
 
 	// §P2-d 规则级参数覆盖（扫参审批后写入；0=缺省用全局默认）。
-	// ExitTrailPct/ExitMaxHoldDays：回测 ruleEvalAdapter 立即生效；实盘出场接线见 v2 TODO。
+	// ExitTrailPct/ExitMaxHoldDays：回测 ruleEvalAdapter 立即生效；实盘由 rule_exit_overrides.go 注册表消费。
 	// English: rule-level parameter overrides from sweep approvals (0 = use global defaults).
+	// ExitTrailPct/ExitMaxHoldDays: consumed by rule_exit_overrides.go registry for live exit logic.
 	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`
 	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"`
 	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"`

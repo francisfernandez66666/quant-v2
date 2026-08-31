@@ -763,7 +763,7 @@ export default function Research() {
     // 常量 sk：局部定义
     const id = ['double_bump', 'dragon', 'dragon_return', 'n_shape'].includes(sk) ? sk : (sk === 'factor' ? 'fac_' : 'pat_') + j.candidate_id
     // 常量 id：局部定义
-    try { await api.backtestLibraryRule(id, {}); startLibPoll(); await loadBacktests() } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
+    try { await api.backtestLibraryRule(id, { quality: true }); startLibPoll(); await loadBacktests() } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
   }
   function builtinLabel(num) {
   // 将内置规则编号转换为战法中文名
@@ -782,7 +782,7 @@ export default function Research() {
   // 对指定战法库记录发起回测任务
     if (!(await confirmDialog(`回测战法「${s.name || s.id}」？（历史日K回放，结果进「回测」tab）`))) return
     try {
-      await api.backtestLibraryRule(s.id, { start: btStart.trim(), end: btEnd.trim() })
+      await api.backtestLibraryRule(s.id, { start: btStart.trim(), end: btEnd.trim(), quality: true })
       setActiveTab('backtests')
       await loadBacktests()
       startLibPoll()

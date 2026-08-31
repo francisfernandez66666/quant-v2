@@ -415,6 +415,16 @@ type Options struct {
 	// English: when set with Strategy=pattern, build one rule from the candidate row itself —
 	// proposed candidates get a replay path without requiring library approval.
 	CandidateID int64
+	// Screen 非空时以质控筛选股票池替代全部 StockCodes()（再叠加 MaxStocks 截断）：
+	// 全量回测默认剔除 ST/退市/多年亏损/地量股，而非 maxstocks=300 的字母序傻截。
+	// English: when set, run on the quality-screened universe instead of all StockCodes(),
+	// so full-market replays drop ST/delisted/multi-year-loss/illiquid names.
+	Screen *store.StockScreen
+	// ThrottleMs 逐股节流（毫秒/只）：>0 时每处理完一只股票 sleep 该时长，摊平全量回放
+	// 对服务器的瞬时 CPU/内存挤压（2 核 4G 机器全池回放会触发内存熔断抢占）。0=不节流。
+	// English: per-stock throttle in ms — sleeps between stocks to flatten instantaneous CPU/mem
+	// pressure during full-universe replay on small boxes. 0 = no throttling.
+	ThrottleMs int
 }
 
 // DefaultDB 研究库默认路径：QUANT_DATA_DIR 优先，否则 ~/.quant-trading-v2/trading.db
@@ -744,13 +754,27 @@ func (o *Options) Run() error {
 	}
 	defer db.Close()
 
-	codes, err := db.StockCodes()
+	// §质控筛选：Screen 非空时用质控池（剔 ST/退市/多年亏损/地量股）替代全量 StockCodes()，
+	// 再叠加 MaxStocks 截断——全量回测不再是 maxstocks=300 的字母序傻截。
+	// English: with a quality Screen set, build the universe from ScreenedCodes (drops ST/delisted/
+	// multi-year-loss/illiquid names), then apply the MaxStocks cap on top.
+	var codes []string
+	if o.Screen != nil {
+		sc := *o.Screen
+		if sc.End == "" && o.End != "" {
+			sc.End = o.End // 质控窗口结束日对齐回测区间，避免用"今天"跨出回测区间
+		}
+		codes, err = db.ScreenedCodes(sc)
+	} else {
+		codes, err = db.StockCodes()
+	}
 	if err != nil {
 		return err
 	}
 	if o.MaxStocks > 0 && len(codes) > o.MaxStocks {
 		codes = codes[:o.MaxStocks]
 	}
+	log.Printf("回放股票池 %d 只（质控筛选=%v）", len(codes), o.Screen != nil)
 
 	// 阶段3.4：factor/pattern → 从战法库加载全部启用规则（每条规则一个 adapter，分组统计）。
 	// "all"（子系统统一改造新增）：因子+形态启用规则一起回放——夜间 library_replay 步骤用，
@@ -819,6 +843,13 @@ func (o *Options) Run() error {
 			}
 			klines := toDataKLine(bars)
 			trades = append(trades, o.backtestStock(code, klines, ad, industryChg[code])...)
+			// §节流：每处理完一只股票 sleep 指定毫秒，把全量回放对服务器的瞬时 CPU/内存
+			// 挤压摊平到盘后十几个小时——2 核 4G 机器上全池回放曾把可用内存打到熔断线。
+			// English: throttle per stock to flatten instantaneous CPU/mem pressure of a
+			// full-universe replay over the long post-close window on small boxes.
+			if o.ThrottleMs > 0 {
+				time.Sleep(time.Duration(o.ThrottleMs) * time.Millisecond)
+			}
 		}
 		sm := summarize(trades)
 		if sm.Name == "" {

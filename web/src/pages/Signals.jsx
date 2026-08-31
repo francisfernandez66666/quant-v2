@@ -320,9 +320,6 @@ export default function Signals() {
           data={filteredSignals}
           columns={columns}
           size="small"
-          {/* tdesign-react 的 expandedRow 回调参数为 TableExpandedRowParams（形如 { row, index, columns, tableWidth, isWidthOverflow }），
-              而非记录本身；故必须用 { row } 解构。若改回 (row)=>，则 row 实为参数对象，row.code 取到的会是 undefined，
-              进而 MinuteView 收到 code=undefined，后端查询会变成「for undefined」。 */}
           expandedRow={({ row }) => (
             <MinuteView code={row.code} name={row.name} />
           )}

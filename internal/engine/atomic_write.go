@@ -1,4 +1,6 @@
 // Package engine 核心引擎：信号生产、打分池、板块传播、持仓退出、通知推送与 QMT 自动交易的 orchestration。
+// 本文件提供原子写盘工具函数，确保关键状态文件（信号/墓碑/打分等）在进程 crash/OOM 时不会被截断。
+// 采用"先写临时文件再 rename"的策略，利用文件系统 rename 的原子性保证数据完整性。
 package engine
 
 import (
@@ -35,6 +37,7 @@ func mustAtomicWrite(tag, path string, raw []byte) {
 }
 
 // ensureParentDir 确保目标文件的父目录存在（首次落盘前调用）。
+// 若目录已存在则 MkdirAll 静默返回 nil；路径为空或 "." 时跳过。
 func ensureParentDir(path string) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0755)

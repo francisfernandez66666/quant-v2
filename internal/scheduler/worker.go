@@ -599,10 +599,20 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 	case "library_replay":
 		// 战法库全量回放（因子+形态启用规则一起）：夜间对现行战法做实盘口径的
 		// 胜率/盈亏比回归验证，结果落 backtest_jobs（kind=library）供「回测」tab 查看。
-		// English: replays every enabled factor+pattern rule — nightly live-semantics regression test.
-		return store.TaskBacktestStrategy, mustJSON(map[string]any{
-			"kind": "all", "start": researchStart, "end": today, "maxstocks": 300,
-		}), true
+		// §质控：全池（maxstocks=0）+ quality=true——以质控池（剔 ST/退市/多年亏损/地量股）
+		// 替代字母序 300 截断，回归验证覆盖真实可用交易标的。
+		// §节流：replay_throttle_ms>0 时逐股 sleep 摊平全量回放对 2核4G 服务器的瞬时
+		// CPU/内存挤压（盘后十几个小时足够，拉长时长换稳定性）。
+		// English: replays every enabled factor+pattern rule on the quality-screened full universe —
+		// no more maxstocks=300 alphabetical truncation; optional per-stock throttle to flatten
+		// instantaneous load over the long post-close window.
+		p := map[string]any{
+			"kind": "all", "start": researchStart, "end": today, "maxstocks": 0, "quality": true,
+		}
+		if cfg.ReplayThrottleMs > 0 {
+			p["throttle_ms"] = cfg.ReplayThrottleMs
+		}
+		return store.TaskBacktestStrategy, mustJSON(p), true
 	case "optimize":
 		// §策略自优化引擎：全库寻优（贝叶斯搜索+细粒度网格），结果自动排名落库
 		p := map[string]any{"kind": "optimize", "start": researchStart, "end": today, "top_n": 20}
@@ -710,11 +720,15 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	timeout := time.Duration(cfg.StepTimeoutMin) * time.Minute
 	if timeout <= 0 {
 		timeout = 90 * time.Minute
-		// 战法库全量回放合法耗时较长且过程有进度输出——未显式配置时放宽至 3h，
-		// 显式配置 StepTimeoutMin 时以配置为准。English: replay tasks default to 3h unless configured.
-		if tk.Type == store.TaskBacktestStrategy {
-			timeout = 3 * time.Hour
-		}
+	}
+	// §质控全量回放超时加固：library_replay 已从 maxstocks=300 改为全池（maxstocks=0）质控池，
+	// 全市场数千标的 × 全库规则回放合法耗时可达数小时——无论 step_timeout_min 配置为何值，
+	// TaskBacktestStrategy 类任务一律至少放宽至 6h（过程持续有"回测进度 xx%"输出，不会误判停滞）。
+	// English: full-market quality-screened replays legitimately take hours — always give
+	// TaskBacktestStrategy at least a 6h budget regardless of the configured per-step timeout;
+	// steady "回测进度 xx%" output means this can't mask a stall.
+	if tk.Type == store.TaskBacktestStrategy && timeout < 6*time.Hour {
+		timeout = 6 * time.Hour
 	}
 	runCtx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
@@ -953,13 +967,15 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	stallSecs := 30 * 60
 	if tk.Priority != "high" {
 		// low 夜间任务：以单步硬超时的 2/3 为停滞阈值。
+		// §质控全量回放：TaskBacktestStrategy 单步已放宽至 6h，停滞阈值随其 2/3
+		// （4h）联动，不再硬编码 120min——全市场质控池回放合法耗时可达数小时，
+		// 硬编码会误杀仍在产出"回测进度 xx%"的健康长任务。
+		// English: low-priority stall threshold rides 2/3 of the (6h, for replays) step timeout,
+		// so legitimate multi-hour full-market replays aren't killed while emitting progress.
 		if timeout > 0 {
 			stallSecs = int(timeout.Seconds() * 2 / 3)
 		} else {
 			stallSecs = 60 * 60
-		}
-		if tk.Type == store.TaskBacktestStrategy {
-			stallSecs = 120 * 60
 		}
 	}
 	if watchTypes[tk.Type] {

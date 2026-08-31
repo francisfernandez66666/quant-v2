@@ -2,6 +2,12 @@
 // 模拟盘 fillLocked 成交后由 registry.paperMirror 经 SetMirror 回调写 report 持仓账，
 // 本文件仅保留战法→止盈/止损百分比的映射函数供镜像使用（paper 为唯一真实账本，
 // rpt 由镜像保持一致 → CheckPositionsExits 离场路径照常生效）。
+//
+// 各战法默认止盈止损：
+//   - dragon（龙头）：止盈 10%，止损 8%（买入后回撤清仓阈值）
+//   - double_bump（双响炮）：止盈 15%，止损 8%
+//   - n_shape（N形）：止盈 10%，止损 8%（硬止损比例）
+//   - dragon_return（龙回头）：止盈 25%，止损 5%
 // English: TP/SL mapping for paper opens (C3 legacy, kept after the unified-book refactor): after a
 // paper fillLocked, registry.paperMirror writes the report holding book via the SetMirror callback.
 // Only the strategy→TP/SL percent mapping remains here for the mirror (paper is the single source of

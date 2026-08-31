@@ -245,6 +245,14 @@ type fixMinutePoint struct {
 // ── 分时数据缓存：保留每支股票最近一次成功拉取的分时，非交易时段/数据源抖动时回退展示，
 //
 //	避免“分时图空白”（用户预期能看到最近一次缓存的分时）。 ──
+//
+// 实盘机内存约束（4G）：缓存带容量上限与单条目 TTL，超出淘汰最旧条目、过期僵尸条目（退市/
+// 长期无交易）自动丢弃，防止 map 随监控标的数量无限增长。
+const (
+	minuteCacheMax = 2000             // 分时缓存容量上限（股票数）
+	minuteCacheTTL = 24 * time.Hour   // 单条目存活上限
+)
+
 var (
 	minuteCacheMu sync.RWMutex
 	minuteCache   = map[string]*minuteCacheEntry{}
@@ -255,6 +263,26 @@ type minuteCacheEntry struct {
 	PrevClose float64          // 昨收
 	Name      string           // 名称
 	At        time.Time        // 缓存时间
+}
+
+// minuteCacheEvictLocked 在写锁内调用：超出容量上限时淘汰 At 最早的条目，将内存增长收敛在
+// minuteCacheMax 以内。English: drop the stalest entry when over capacity (caller holds the write lock).
+func minuteCacheEvictLocked() {
+	if len(minuteCache) <= minuteCacheMax {
+		return
+	}
+	var oldestKey string
+	var oldestAt time.Time
+	first := true
+	for k, v := range minuteCache {
+		if first || v.At.Before(oldestAt) {
+			oldestKey, oldestAt = k, v.At
+			first = false
+		}
+	}
+	if oldestKey != "" {
+		delete(minuteCache, oldestKey)
+	}
 }
 
 // handleFixMinute 处理 GET /api/minute 请求，返回个股分钟级分时 + 成交量 + MACD。
@@ -303,7 +331,7 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 		minuteCacheMu.RLock()
 		cached, ok := minuteCache[code]
 		minuteCacheMu.RUnlock()
-		if ok && len(cached.Points) > 0 {
+		if ok && len(cached.Points) > 0 && time.Since(cached.At) <= minuteCacheTTL {
 			writeJSON(w, 200, map[string]interface{}{
 				"code":       code,
 				"name":       cached.Name,
@@ -353,6 +381,7 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 	// 缓存本次成功拉取的分时，供非交易时段/数据源抖动回退
 	minuteCacheMu.Lock()
 	minuteCache[code] = &minuteCacheEntry{Points: points, PrevClose: prevClose, Name: s.stockName(code), At: time.Now()}
+	minuteCacheEvictLocked()
 	minuteCacheMu.Unlock()
 
 	writeJSON(w, 200, map[string]interface{}{

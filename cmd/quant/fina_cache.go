@@ -27,8 +27,6 @@ type finaCache struct {
 	mu sync.Mutex
 	// cache 各股最新财务指标缓存（键为 ts_code）
 	cache map[string]*cacheEntry
-	// at 缓存刷新时间，用于 TTL 过期判断
-	at time.Time
 }
 
 // cacheEntry 一条财务缓存。
@@ -36,6 +34,8 @@ type finaCache struct {
 type cacheEntry struct {
 	// fina 该股最新报告期财务指标（nil 表示缺失/查库失败）
 	fina *strategy_engine.FinancialData
+	// at 该条目写入时间，用于 per-entry TTL 过期判断（避免整表失效造成的查询尖峰）
+	at time.Time
 }
 
 // newFinaCache 创建财务查询缓存。
@@ -54,15 +54,11 @@ func (c *finaCache) Lookup(code string) *strategy_engine.FinancialData {
 		return nil
 	}
 	c.mu.Lock()
-	now := time.Now()
-	// 10 分钟 TTL：财务数据按报告期更新，无需更频繁刷新
-	if now.Sub(c.at) > 10*time.Minute {
-		c.cache = make(map[string]*cacheEntry)
-		c.at = now
-	}
-	if e, ok := c.cache[ts]; ok {
+	// per-entry 10 分钟 TTL：仅过期条目回源，避免整表失效造成的查询尖峰
+	if e, ok := c.cache[ts]; ok && time.Since(e.at) <= 10*time.Minute {
+		fina := e.fina
 		c.mu.Unlock()
-		return e.fina
+		return fina
 	}
 	c.mu.Unlock()
 
@@ -83,7 +79,7 @@ func (c *finaCache) Lookup(code string) *strategy_engine.FinancialData {
 		}
 	}
 	c.mu.Lock()
-	c.cache[ts] = &cacheEntry{fina: fina}
+	c.cache[ts] = &cacheEntry{fina: fina, at: time.Now()}
 	c.mu.Unlock()
 	return fina
 }

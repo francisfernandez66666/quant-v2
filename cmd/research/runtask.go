@@ -86,6 +86,19 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 			D1Score:     float64(payloadInt(p, "d1", 20)),
 			Industry:    payloadStr(p, "industry", "") == "true",
 			CandidateID: payloadInt(p, "candidate_id", 0), // 形态候选直读回放（§8.6-B）
+			// §节流：payload throttle_ms >0 时逐股 sleep 摊平全量回放瞬时 CPU/内存挤压
+			// （夜间 library_replay 由 scheduler 配置 rules.scheduler.replay_throttle_ms 下发）。
+			// English: per-stock throttle (ms) to flatten instantaneous load during full replays.
+			ThrottleMs: payloadIntDef(p, "throttle_ms", 0),
+		}
+		// §质控：payload quality=true（夜间 library_replay 全量回放默认开启）时以质控池
+		// （剔 ST/退市/多年亏损/地量股）替代全量 StockCodes()，再叠加 maxstocks 截断。
+		// English: payload quality=true builds the universe from the quality screen instead of all
+		// StockCodes() (used by the nightly full-market library replay).
+		if payloadBool(p, "quality") {
+			sc := store.DefaultQualityScreen()
+			sc.End = o.End
+			o.Screen = &sc
 		}
 		// §P2 参数优化任务：payload kind=optimize → 全库扫参模式（网格系统自动推导）。
 		// English: kind=optimize → cross-library parameter sweep (auto-derived grid).
@@ -138,6 +151,19 @@ func payloadStr(p map[string]any, key, def string) string {
 		return v
 	}
 	return def
+}
+
+// payloadBool 取布尔参数：payload 里可能是 bool 或 "true"/"1"/"false" 字符串。
+func payloadBool(p map[string]any, key string) bool {
+	switch v := p[key].(type) {
+	case bool:
+		return v
+	case string:
+		return v == "true" || v == "1"
+	case float64:
+		return v != 0
+	}
+	return false
 }
 
 // payloadInt 取整数参数：JSON 反序列化后数字统一为 float64，此处转 int64；缺失回退默认值。

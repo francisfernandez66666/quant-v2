@@ -1,4 +1,11 @@
 // 龙回头战法离场判定：止损/止盈T1T2/移动止损/破位/超期等出场逻辑（CheckExit）。
+// 本文件实现了龙回头战法的退出逻辑，包含多种退出条件：
+//   - 止损：浮亏达到止损百分比
+//   - 止盈T1：到达目标价1（成本价）
+//   - 止盈T2：到达目标价2（成本×1.25）
+//   - 移动止损：从阶段最高点回撤超过阈值
+//   - 破位：收盘跌破MA20×0.98
+//   - 超期退出：持仓时间超过限制
 package dragon_return
 
 import (
@@ -8,10 +15,22 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// CheckExit 判断龙回头策略是否触发退出信号。（CheckExit decides whether the Dragon Return strategy should exit.）
-// 检查顺序：止损（-StopLossPct）→ 止盈 T2（Target2）→ 移动止损（回撤 TrailingDrawback）→ 跌破 MA20×0.98 → 止盈 T1 → 超期。
-// 返回 nil 表示继续持有。（Checks in order: stop-loss → take-profit T2 → trailing stop → break below MA20×0.98 → T1 → timeout;
-// returns nil to keep holding.）
+// CheckExit 判断龙回头策略是否触发退出信号。
+// 按优先级依次检查多种退出条件，返回nil表示继续持有，返回ExitResult表示应该退出。
+//
+// 检查顺序（优先级从高到低）：
+//  1. 止损：浮亏达到StopLossPct（默认-5%），支持ATR动态止损
+//  2. 止盈T2：到达目标价2（默认成本×1.25）
+//  3. 移动止损：从阶段最高点回撤超过TrailingDrawback（默认8%）
+//  4. 破位：收盘跌破MA20×0.98，中期支撑失守
+//  5. 止盈T1：到达目标价1（默认成本×1.0），保本兑现
+//  6. 超期退出：持仓超过MaxHoldDays（默认8天）
+//
+// 返回值：
+//   - nil: 继续持有
+//   - *ExitResult: 触发退出，包含退出理由和优先级
+//
+// （CheckExit decides whether the Dragon Return strategy should exit.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strategy.ExitResult {
 	cost := ctx.CostPrice
 	price := ctx.CurPrice
@@ -93,5 +112,8 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonReturnConfig) *strat
 	return nil
 }
 
-// NeedUpdateHighest 龙回头策略需要更新最高价。（NeedUpdateHighest reports that Dragon Return tracks the stage high price.）
+// NeedUpdateHighest 龙回头策略需要更新最高价。
+// 龙回头是中线策略，需要追踪阶段最高价用于移动止损计算，因此返回true。
+//
+// （NeedUpdateHighest reports that Dragon Return tracks the stage high price.）
 func NeedUpdateHighest() bool { return true }

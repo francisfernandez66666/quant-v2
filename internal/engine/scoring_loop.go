@@ -52,6 +52,7 @@ func (e *Engine) RunScoringLoop(ctx context.Context) {
 // English: runs one near-realtime scoring cycle (called by the multi-account registry's shared
 // 5s scheduler).
 func (e *Engine) RunScoringLoopOnce(ctx context.Context) {
+	e.StartBuyDispatcher(4) // §A+B 异步下单分发器（幂等启动）
 	e.scoreCycle(ctx)
 }
 
@@ -396,6 +397,7 @@ func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMar
 }
 
 // countAction 统计信号列表中指定 Action 的条数（如只统计 "buy"，用于 SSE 通知计数）。
+// 仅计数可操作买入信号（Action=="buy"），观察类信号（watch/brief）不计入浏览器通知数量。
 // English: counts how many signals carry the given Action (e.g. only "buy"), used for SSE notification counts.
 func countAction(sigs []combat_agent.Signal, action string) int {
 	n := 0
@@ -409,6 +411,10 @@ func countAction(sigs []combat_agent.Signal, action string) int {
 
 // filterTransitionSignals 状态翻转去重（纯函数）：返回本轮应广播的信号 + 下一轮去重状态。
 // 仅当某股某战法从 非Pass → Pass 翻转时广播；持续 Pass 不重发；翻回后再翻上会再发。
+// 这是"信号翻转才发"机制的核心：避免同一信号每轮重复推送，只在状态变化时通知前端。
+// English: state-transition dedup (pure function): returns signals to broadcast this round + next-round state.
+// Only emits when a stock/strategy flips from non-Pass to Pass; sustained Pass is not re-sent; re-flip after
+// flip-back does re-emit.
 func filterTransitionSignals(sigs []combat_agent.Signal, prev map[string]map[string]bool) (emit []combat_agent.Signal, next map[string]map[string]bool) {
 	// 双缓冲区翻转检测：prev 记录上一轮 Pass 状态，next 为本轮新状态；
 	// 仅当某股某战法从 非Pass → Pass 翻越状态边界时放入 emit，持续 Pass 不重发。
@@ -535,11 +541,14 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 
 // realSellSignalID 实盘自动卖出的幂等键：sell:<纯代码>:<类别>:<交易日>。
 // orders 表 signal_id 唯一键天然防重：同码同类当日只下一单（跨重启/跨轮次安全）。
+// 例如：sell:600519:止损:2026-08-30 表示茅台在当天的止损卖出幂等键。
 func realSellSignalID(tsCode, class string) string {
 	return fmt.Sprintf("sell:%s:%s:%s", pureTsCode(tsCode), class, data.TradingDayDate(time.Now()))
 }
 
-// pureTsCode 剥离交易所后缀。
+// pureTsCode 剥离交易所后缀，返回纯数字代码。
+// 例如：600519.SH → 600519，000001.SZ → 000001，430047.BJ → 430047。
+// 用于构建幂等键（signal_id）和比对持仓代码。
 func pureTsCode(tsCode string) string {
 	for _, suf := range []string{".SH", ".SZ", ".BJ"} {
 		if i := strings.LastIndex(tsCode, suf); i > 0 {
@@ -713,8 +722,10 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 }
 
 // qmtM8State §R4-7 M8 峰值持久化结构（accounts/<uid>/qmt_m8.json）。
+// 保存实盘组合市值峰值，用于跨重启后继续计算组合回撤。
+// 峰值在每次组合市值创新高时更新，空仓时归零重新累计。
 type qmtM8State struct {
-	PeakTotal float64 `json:"peak_total"` // 组合市值峰值（M8 回撤基线）
+	PeakTotal float64 `json:"peak_total"` // 组合市值峰值（M8 回撤基线），单位：元
 }
 
 // m8StatePath 返回 M8 峰值持久化路径（accountsRoot/<uid>/qmt_m8.json）；

@@ -1,4 +1,11 @@
 // 破局龙战法离场判定：止盈/买入回撤/炸板回落/尾盘/次日不及预期/超期等出场逻辑（CheckExit）。
+// 本文件实现了破局龙战法的退出逻辑，包含多种退出条件：
+//   - 止盈：浮盈达到目标百分比
+//   - 买入回撤：买入后价格回撤超过阈值（支持ATR动态止损）
+//   - 炸板回落：跌破封板价超过阈值
+//   - 尾盘检查：买入日收盘浮亏超过阈值
+//   - 次日不及预期：开盘价低于预期
+//   - 超期退出：持仓时间超过限制
 package dragon
 
 import (
@@ -8,10 +15,22 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// CheckExit 判断破局龙策略是否触发退出信号。（CheckExit decides whether the Dragon strategy should exit.）
-// 检查顺序：止盈 → 买入回撤（全出/半仓）→ 炸板回落（跌破封板价）→ 买入日收盘不佳 → 次日开盘不及预期 → 超期退出。（Checks in order:
-// take-profit → post-buy pullback (all/half) → broken-seal retreat → bad close on entry day → weak next-day open → timeout.）
-// 返回 nil 表示继续持有。（Returns nil to keep holding.）
+// CheckExit 判断破局龙策略是否触发退出信号。
+// 按优先级依次检查多种退出条件，返回nil表示继续持有，返回ExitResult表示应该退出。
+//
+// 检查顺序（优先级从高到低）：
+//  1. 扫参统一出场（TrailingDrawback/MaxHoldDays）
+//  2. 止盈：浮盈达到TakeProfitPct（默认10%）
+//  3. 买入回撤：支持ATR动态止损，跌破阈值触发全出或半仓
+//  4. 炸板回落：以入场时封板价为基准，跌破阈值触发退出
+//  5. 尾盘检查：14:55~15:00期间，买入日收盘浮亏超过阈值
+//  6. 次日及以后：开盘价低于预期或持仓超期
+//
+// 返回值：
+//   - nil: 继续持有
+//   - *ExitResult: 触发退出，包含退出理由和优先级
+//
+// （CheckExit decides whether the Dragon strategy should exit.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.ExitResult {
 	// §扫参统一出场（STRATEGY_OPTIMIZE_PLAN）：配置了 trailing_drawback_pct/max_hold_days
 	// 时优先执行——与扫参排名同口径；未配置(0)时完全走既有规则，行为零变更。
@@ -104,5 +123,8 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DragonConfig) *strategy.Ex
 	return nil
 }
 
-// NeedUpdateHighest 破局龙策略无需更新最高价。（NeedUpdateHighest reports that Dragon does not track a stage high price.）
+// NeedUpdateHighest 破局龙策略无需更新最高价。
+// 破局龙是超短策略，不追踪阶段最高价，因此返回false。
+//
+// （NeedUpdateHighest reports that Dragon does not track a stage high price.）
 func NeedUpdateHighest() bool { return false }

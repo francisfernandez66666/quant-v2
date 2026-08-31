@@ -1,18 +1,13 @@
 // Package combat_agent 战法引擎：8a/8b 处理信号个股打分，以及持仓/自选的持续打分。
-// Package combat_agent: scoring for 8a/8b signal stocks, plus continuous scoring of holdings/watchlist.
 // dbwave.go 实现双响炮"跨 5s 打分周期"的第二波确认状态机。
-// dbwave.go implements the Double-Bump "second-wave" confirmation state machine across the 5s scoring cycles.
 // 背景：double_bump 战法本身已通过 volScore>0 硬闸（最后一根日K放量达第二波倍数）才出分，
 // 但该确认只基于日K最后一根（可能是昨日收盘），无法区分"竞价/盘前的存量假放量"。
-// 订单叠加一个按股票代码维护的日内阶段状态机：一突破位（PhaseFirst）→ 缩量回调（PhaseAdjust）
-// → 二次放量重破前高（PhaseSecond）才视为双凸真正确认，从而放行买入信号。
-// 背景/English: the double_bump scorer already hard-gates on volScore>0 (last daily bar expanding to the
-// second-wave multiple) before emitting, but that check is based on the last daily bar which may be
-// yesterday's close, so it can't distinguish auction/pre-open "stale fake volume". This watcher stacks a
-// per-code intraday phase machine on top: first-breakout (PhaseFirst) -> pullback (PhaseAdjust) -> a
-// renewed volume breakout (PhaseSecond) is what truly confirms the Double Bump and releases the buy signal.
-// 状态按交易日隔离，跨日自动重置；仅在双响炮候选被评分时推进。
-// State is isolated per trading day and reset across days; it only advances when a Double Bump candidate is scored.
+//
+// 状态机设计：
+//   - 阶段流转：一突破位（PhaseFirst）→ 缩量回调（PhaseAdjust）→ 二次放量重破前高（PhaseSecond）
+//   - 状态按交易日隔离，跨日自动重置
+//   - 仅在双响炮候选被评分时推进
+//   - 竞价/盘前（Volume=0）无真实成交，状态机不推进 → 不会误放行假双凸
 package combat_agent
 
 import (
@@ -26,7 +21,7 @@ import (
 )
 
 // doubleBumpPhase 双响炮日内阶段。
-// （doubleBumpPhase is the intraday Double-Bump phase.）
+// 用于跟踪双响炮战法的日内确认状态，从第一波突破到第二波确认。
 type doubleBumpPhase int
 
 const (
@@ -38,7 +33,9 @@ const (
 )
 
 // dbState 单只股票的双响炮日内阶段状态。
-// （dbState holds the per-code Double-Bump intraday phase state.）
+// 跟踪每只股票在当日的双响炮确认进度，用于判断是否真正确认第二波突破。
+//
+// 字段说明：
 //   - day: 交易日（跨日重置依据）
 //   - phase: 当前阶段
 //   - prevHigh: 前日最高价（一突破位参照）
@@ -55,26 +52,38 @@ type dbState struct {
 }
 
 // DoubleBumpWatcher 双响炮日内第二波确认状态机容器，按股票代码维护日内阶段。
-// （DoubleBumpWatcher is the Double-Bump second-wave confirmation state machine container, per-code.）
+// 每只股票维护独立的状态，跨交易日自动重置。
+//
+// 字段说明：
+//   - mu: 互斥锁，保护并发访问
+//   - states: 股票代码→日内状态映射
 type DoubleBumpWatcher struct {
 	mu     sync.Mutex
 	states map[string]*dbState
 }
 
 // NewDoubleBumpWatcher 创建状态机容器。
-// （NewDoubleBumpWatcher creates a new state-machine container.）
+// 返回值：
+//   - 初始化后的 DoubleBumpWatcher 指针
 func NewDoubleBumpWatcher() *DoubleBumpWatcher {
 	return &DoubleBumpWatcher{states: make(map[string]*dbState)}
 }
 
 // Confirm 推进并读取 code 的双响炮阶段，返回当前是否已到达第二波确认（PhaseSecond）。
-// 一突：现价 > 前高×1.005 且累计量 > 0；随后跌破峰价×0.997 记回调（Adjust）；
-// 二次放量重破峰价 → PhaseSecond（阶段升至 Third）。
-// 前日K线刷新（跨日首轮）重置全部阶段状态。
-// Confirm advances and reads code's Double-Bump phase, reporting whether it reached the second-wave
-// confirmation (PhaseSecond). First break: price > prior-high x 1.005 with cumulative volume > 0; a drop
-// below the peak x 0.997 marks the pullback (Adjust); a renewed breakout above the peak promotes the phase
-// to Second (advancing to Third afterwards). A refreshed prior-day bar (first round across days) resets it.
+// 状态机流转：
+//   1. 一突：现价 > 前高×1.005 且累计量 > 0
+//   2. 回调：跌破峰价×0.997 记回调（Adjust）
+//   3. 二突：二次放量重破峰价 → PhaseSecond（阶段升至 Third）
+//   4. 前日K线刷新（跨日首轮）重置全部阶段状态
+//
+// 参数：
+//   - code: 股票代码
+//   - md: 行情数据快照
+//   - cfg: 双响炮配置
+//
+// 返回值：
+//   - true: 已到达第二波确认（PhaseSecond）
+//   - false: 未到达第二波确认
 func (w *DoubleBumpWatcher) Confirm(code string, md *strategy_engine.StockMarketData, cfg config.DoubleBumpConfig) bool {
 	if code == "" || md == nil || md.Price <= 0 || len(md.KLines) < 2 {
 		return false

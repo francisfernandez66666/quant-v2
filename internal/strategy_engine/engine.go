@@ -1,4 +1,11 @@
 // Package strategy_engine 策略引擎：事件归因、行情数据获取、策略评分池收拢。
+// 本包实现了策略引擎的核心逻辑：
+//   - Engine: 策略引擎主结构，负责事件归因、行情数据拉取、评分池收拢
+//   - Evaluate: 策略评估入口，从新闻事件到交易信号的完整流程
+//   - BuildScoringData: 为近实时打分循环构建行情数据
+//   - 事件归因：将新闻事件按利好/利空方向分流到板块
+//   - 行情数据获取：支持新浪/同花顺/腾讯/东财多源降级
+//
 // （Package strategy_engine is the strategy engine: event attribution, market-data fetching and scoring-pool collection.）
 package strategy_engine
 
@@ -16,6 +23,15 @@ import (
 )
 
 // Engine 策略引擎，负责事件归因、行情数据拉取、评分池收拢。
+// 这是策略引擎的核心结构体，包含多个缓存和锁机制以支持并发安全的实时评分。
+// 主要职责：
+//   - 事件归因：将新闻事件分流到板块和个股
+//   - 行情数据获取：支持多数据源降级链路（新浪→同花顺→腾讯→东财）
+//   - 评分池收拢：合并Stage2个股、持仓和自选池
+//   - K线和资金流数据缓存（TTL 5分钟）
+//   - 分钟K线数据缓存（TTL 60秒）
+//   - 基准指数涨跌幅缓存（TTL 30秒）
+//
 // （Engine handles event attribution, quote fetching and scoring-pool collection.）
 type Engine struct {
 	mu        sync.RWMutex        // 读写锁（Read-write lock）
@@ -63,7 +79,9 @@ func (e *Engine) finaOf(code string) *FinancialData {
 	return fn(code)
 }
 
-// klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。（klineCacheEntry is a cached daily-bar + capital-flow entry refreshed by TTL.）
+// klineCacheEntry 日K + 资金流缓存条目（交易日内基本不变，TTL 刷新）。
+// 用于缓存日K线和资金流数据，避免频繁请求数据源。
+// （klineCacheEntry is a cached daily-bar + capital-flow entry refreshed by TTL.）
 type klineCacheEntry struct {
 	klines    []data.KLine      // 日K线数据（近120根，趋势/均线类战法使用）（Daily bars, ~120, for trend/MA strategies）
 	moneyFlow *data.CapitalFlow // 资金流向（主力净流入）（Capital flow, main-force net inflow）
@@ -71,12 +89,15 @@ type klineCacheEntry struct {
 }
 
 // minuteKCacheEntry 分钟K线缓存条目（5分钟48根≈当日；60s TTL）。
+// 用于缓存分钟K线数据，避免扩大打分池后每5秒重复拉取压垮数据源。
 type minuteKCacheEntry struct {
 	bars      []data.KLine
 	fetchedAt time.Time
 }
 
-// New 创建策略引擎实例。（New creates a strategy-engine instance.）
+// New 创建策略引擎实例。
+// 初始化引擎的所有缓存和数据源，返回可直接使用的引擎实例。
+// （New creates a strategy-engine instance.）
 func New(marketAPI *data.MarketAPI) *Engine {
 	return &Engine{
 		marketAPI:    marketAPI,
@@ -201,6 +222,7 @@ func (e *Engine) Evaluate(ctx context.Context, events []newsagent.NewsEvent, pos
 
 // benchChg 返回上证指数当前涨跌幅（%），供 N 形 D2 相对强度对比。
 // 指数行情 30s TTL 缓存（非交易时段也会取到当日值，可接受），失败返回 0。
+// 这个方法被多个评分函数调用，用于计算个股相对大盘的超额收益。
 // （benchChg returns the current SSE change % for N-shape D2 relative strength, cached with a 30s TTL; returns 0 on failure.）
 func (e *Engine) benchChg() float64 {
 	e.benchChgMu.RLock()
@@ -224,7 +246,7 @@ func (e *Engine) benchChg() float64 {
 
 // fetchMarketData 为打分池所有个股拉取行情数据（实时价 + KLine + 资金流向）。
 // 实时行情降级链路：新浪批量 CSV（一次网络请求拉全池）→ 同花顺单查 → 东财单查。
-// K线/资金流并发拉取（每只2次请求）。
+// K线/资金流并发拉取（每只2次请求），最大并发数为6。
 // （fetchMarketData fetches quotes for the whole pool — live price + bars + capital flow. Real-time fallback chain:
 // Sina batch CSV → THS single → Eastmoney single. Bars/flow are fetched concurrently, 2 requests per stock.）
 func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string]*StockMarketData {
@@ -322,6 +344,7 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 // - 实时量价优先取外部快照 quotes（data.Fetcher 5s 采集：新浪→同花顺→东财），缺失的走本引擎降级链补齐；
 // - 日K + 资金流走进程内缓存（TTL 5 分钟，交易日内基本不变）；
 // - 分钟K线（MACD）每轮现拉，保证动量/N 形评分的实时性。
+// 这个方法是近实时打分循环的核心，每5秒调用一次，为所有评分策略提供最新的行情数据。
 // （BuildScoringData builds market data for the near-realtime 8a/8b scoring loop at a 5s cadence. Live quotes prefer the
 // external 5s snapshot (Sina→THS→Eastmoney) and fall back to the engine chain; daily bars + capital flow use a 5-min TTL
 // cache; minute bars/MACD are fetched fresh each round for realtime momentum/N-shape scoring.）
@@ -653,6 +676,12 @@ func (e *Engine) attachLiveBar(md *StockMarketData) {
 // attribution 事件归因：将新闻事件按利好/利空方向分流到板块，合并相同板块的事件。
 // 仅取 ev.Sectors 一级板块（上游/下游不参与热点归因）；板块名须能匹配真实同花顺板块，否则丢弃。
 // 返回利好板块和利空板块列表。
+// 处理逻辑：
+// 1. 遍历所有事件，跳过个股级事件
+// 2. 根据事件Score符号决定归属板块池（负分进利空池，正分进利好池）
+// 3. 同一板块的多次事件合并：累计新闻标题，保留 |score| 最大的一次事件属性
+// 4. 从板块扫描器查询行情数据填充 SectorHot
+//
 // （attribution splits news events into bullish/bearish sector lists and merges events of the same sector. Only the
 // primary ev.Sectors take part (upstream/downstream excluded); sector names must match real THS sectors or be dropped.）
 func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorHot) {
@@ -708,13 +737,16 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 
 // BuildHotSectors 将事件归因出利好/利空板块候选列表（供引擎"新热点立马进池"复用）。
 // 与 Evaluate 内的 attribution 共用同一实现，幂等可重复调用。
+// 这个方法主要用于在评估过程中实时更新热点板块列表。
 // （BuildHotSectors attributes events into bullish/bearish sector candidates, reusing the same logic as
 // attribution inside Evaluate so the engine can push fresh hotspots into the watch pool immediately.）
 func (e *Engine) BuildHotSectors(events []newsagent.NewsEvent) (bull, bear []SectorHot) {
 	return e.attribution(events)
 }
 
-// absScore 取评分的绝对值。（absScore returns the absolute value of a score.）
+// absScore 取评分的绝对值。
+// 用于比较事件评分的大小，不考虑方向（正负）。
+// （absScore returns the absolute value of a score.）
 func absScore(s float64) float64 {
 	if s < 0 {
 		return -s
@@ -722,7 +754,9 @@ func absScore(s float64) float64 {
 	return s
 }
 
-// collectBearStocks 从利空板块中收集个股代码，去重后返回。（collectBearStocks collects deduplicated stock codes from bearish sectors.）
+// collectBearStocks 从利空板块中收集个股代码，去重后返回。
+// 用于识别利空板块中的领跌股，供后续风险评估使用。
+// （collectBearStocks collects deduplicated stock codes from bearish sectors.）
 func (e *Engine) collectBearStocks(bearSectors []SectorHot) []string {
 	seen := make(map[string]bool)
 	var stocks []string
@@ -739,6 +773,7 @@ func (e *Engine) collectBearStocks(bearSectors []SectorHot) []string {
 
 // enrichSectorData 从 Scanner 查询板块行情数据填充 SectorHot。
 // 板块名无法匹配真实同花顺板块（FindSectorsByNames 查不到）时直接丢弃（LLM 造名板块）。
+// 这个函数为板块信息补充实时行情数据（涨跌幅、涨停家数、净流入）。
 // （enrichSectorData fills SectorHot with sector quotes from the Scanner, dropping sectors that can't be matched to real
 // THS boards (LLM-invented names) via FindSectorsByNames.）
 func enrichSectorData(sectors map[string]*SectorHot, scanner *data.SectorScanner) {
@@ -757,7 +792,9 @@ func enrichSectorData(sectors map[string]*SectorHot, scanner *data.SectorScanner
 	}
 }
 
-// countSuccess 统计行情数据获取成功的股票数量（Price>0 且无错误）。（countSuccess counts stocks fetched successfully: Price>0 with no error.）
+// countSuccess 统计行情数据获取成功的股票数量（Price>0 且无错误）。
+// 用于日志输出，帮助排查数据源问题。
+// （countSuccess counts stocks fetched successfully: Price>0 with no error.）
 func countSuccess(m map[string]*StockMarketData) int {
 	n := 0
 	for _, v := range m {
@@ -769,6 +806,8 @@ func countSuccess(m map[string]*StockMarketData) int {
 }
 
 // normalizeCode 归一化股票代码：去除 SH/SZ/BJ 前缀和 .SH/.SZ/.BJ 后缀。
+// 用于统一股票代码格式，确保不同来源的代码能够正确匹配。
+// 例如：SH600000 → 600000，600000.SH → 600000
 // （normalizeCode normalizes a stock code by stripping SH/SZ/BJ prefixes and .SH/.SZ/.BJ suffixes.）
 func normalizeCode(code string) string {
 	c := strings.TrimSpace(code)

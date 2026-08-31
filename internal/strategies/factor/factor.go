@@ -1,13 +1,22 @@
 // Package factor 实现"因子战法"（E6）：把自动研究（discover-factors）发现的因子组合
 // 在实盘打分池消费，产出交易信号。与四大形态战法并列，同属 8a（利多）扫描链路。
 //
-// 数据口径：实盘数据（StockMarketData）只有日K（open/high/low/close/vol/amount），
-// 没有研究库的财务/估值字段。因此本战法只对"纯价量因子"（动量/波动率/流动性/技术指标）
-// 打分，估值/成长/质量/规模类因子因实盘缺数据记 0 分。发现候选若含财务因子，实盘侧自动跳过。
+// 本包实现了因子战法，这是一种基于量化因子的选股策略：
+//   - 从自动研究系统（discover-factors）获取因子组合
+//   - 在实盘打分池中对每只股票独立评分
+//   - 支持多规则同时实盘，各规则独立评分
+//   - 效果监测：记录信号数、命中/亏损计数与累计前向收益
 //
-// 打分：对每只股票，各价量因子取其自身历史序列的当前分位（0~1，时序相对强弱），
-// 复合分 = Σ w·dir·分位（w 权重、dir 方向 +1/-1），再归一化到 0~100。
-// 这是对横截面 IC 的单股时序近似，保证无需全池截面即可独立评分。
+// 数据口径：
+//   - 实盘数据（StockMarketData）只有日K（open/high/low/close/vol/amount）
+//   - 没有研究库的财务/估值字段
+//   - 因此本战法只对"纯价量因子"（动量/波动率/流动性/技术指标）打分
+//   - 估值/成长/质量/规模类因子因实盘缺数据记 0 分
+//
+// 打分逻辑：
+//   - 对每只股票，各价量因子取其自身历史序列的当前分位（0~1，时序相对强弱）
+//   - 复合分 = Σ w·dir·分位（w 权重、dir 方向 +1/-1），再归一化到 0~100
+//   - 这是对横截面 IC 的单股时序近似，保证无需全池截面即可独立评分
 //
 // （English: implements the "factor strategy" (E6) — consumes factor combos discovered by
 // discover-factors on the live scoring pool, producing trade signals alongside the four shape
@@ -31,6 +40,8 @@ import (
 )
 
 // Rule 因子战法的评分规则（由 applied 的 discover-factors 候选构造）。
+// 定义了一组因子的评分逻辑，包括因子列表、权重、方向和买入阈值。
+//
 // （Rule is the scoring rule for the factor strategy, built from an applied discover-factors candidate.）
 type Rule struct {
 	Factors    []string           // 因子 ID 列表
@@ -42,6 +53,12 @@ type Rule struct {
 }
 
 // ActiveRule 一条已应用的因子战法规则（战法库中的一条），带独立 ID/名称与运行统计（效果监测）。
+// 这是因子战法的核心数据结构，包含了规则的完整信息：
+//   - ID/Name: 规则标识
+//   - CandID: 来源候选ID
+//   - Rule: 评分规则（因子、权重、方向、阈值）
+//   - 运行统计：信号数、命中/亏损计数、累计前向收益
+//
 // English: one applied factor-strategy rule (an entry in the strategy library), with its own ID, name
 // and running stats for live effectiveness monitoring.
 type ActiveRule struct {
@@ -61,7 +78,9 @@ type ActiveRule struct {
 
 // FactorStrategy 因子战法策略：按一组 ActiveRule 对实盘个股打分并出信号。
 // 支持多个规则同时实盘：每只股票对各规则独立评分，得分最高且过阈值的规则产出一条信号，
-// 并以该规则的 Name 作为信号 strategy 名（去重键互不冲突）。各规则触发情况计入运行统计供效果监测。
+// 并以该规则的 Name 作为信号 strategy 名（去重键互不冲突）。
+// 各规则触发情况计入运行统计供效果监测。
+//
 // English: scores live stocks per a set of ActiveRules and emits signals. Multiple rules run
 // simultaneously: each rule scores a stock independently; the highest-scoring passing rule emits a
 // signal named by that rule (distinct dedup keys). Per-rule triggers are counted for effectiveness monitoring.
@@ -73,6 +92,8 @@ type FactorStrategy struct {
 }
 
 // pendingEval 一次 Evaluate 的最高分规则结果，供 GenerateSignal 使用。
+// 这是评分和信号生成之间的桥梁，保存了最高分规则的信息。
+//
 // English: the highest-scoring rule result of one Evaluate, consumed by GenerateSignal.
 type pendingEval struct {
 	rule *ActiveRule
@@ -80,12 +101,17 @@ type pendingEval struct {
 }
 
 // New 创建因子战法策略实例（默认未启用，需 SetRules 注入有效规则后生效）。
+// 初始化策略结构，返回可直接使用的策略实例。
+//
 // English: creates a FactorStrategy; disabled until SetRules injects valid rules.
 func New() *FactorStrategy {
 	return &FactorStrategy{rules: nil, pending: make(map[string]*pendingEval)}
 }
 
-// SetRule 注入单条评分规则（兼容旧版：清空后加一条）。空 Factors 视为禁用。
+// SetRule 注入单条评分规则（兼容旧版：清空后加一条）。
+// 空 Factors 视为禁用。
+// 这是为了兼容旧版本的单规则接口。
+//
 // English: injects a single scoring rule (back-compat: clears then adds one). Empty Factors disables.
 func (f *FactorStrategy) SetRule(r Rule) {
 	f.mu.Lock()
@@ -97,7 +123,10 @@ func (f *FactorStrategy) SetRule(r Rule) {
 	f.rules = []*ActiveRule{{ID: "fac_0", Name: "因子战法", CandID: 0, Rule: r}}
 }
 
-// SetRules 注入多规则（战法库）。仅保留 enabled 的规则；空列表禁用。
+// SetRules 注入多规则（战法库）。
+// 仅保留 enabled 的规则（Factors非空）；空列表禁用整个策略。
+// 这是因子战法的主要配置接口，支持同时运行多个规则。
+//
 // English: injects multiple rules (strategy library). Only enabled rules are kept; empty disables.
 func (f *FactorStrategy) SetRules(rules []*ActiveRule) {
 	f.mu.Lock()
@@ -121,6 +150,8 @@ func (f *FactorStrategy) SetRules(rules []*ActiveRule) {
 }
 
 // Enabled 返回是否启用（已注入至少一条有效规则）。
+// 用于判断因子战法是否可以执行评分。
+//
 // English: reports whether the strategy is enabled (at least one valid rule was injected).
 func (f *FactorStrategy) Enabled() bool {
 	f.mu.RLock()
@@ -129,6 +160,8 @@ func (f *FactorStrategy) Enabled() bool {
 }
 
 // RuleCount 返回已注入的规则数量。
+// 用于监控和调试。
+//
 // English: returns the number of injected rules.
 func (f *FactorStrategy) RuleCount() int {
 	f.mu.RLock()
@@ -137,12 +170,17 @@ func (f *FactorStrategy) RuleCount() int {
 }
 
 // Name 返回策略中文名。
+// 用于日志输出和前端展示。
 func (f *FactorStrategy) Name() string { return "因子战法" }
 
 // Type 返回信号类型 SignalFactor。
+// 用于信号分类和去重。
 func (f *FactorStrategy) Type() strategy.SignalType { return strategy.SignalFactor }
 
 // Stats 返回各规则的运行统计快照（效果监测用）。
+// 包含各规则的信号数、命中/亏损计数与累计前向收益。
+// 用于监控因子战法的实际效果。
+//
 // English: returns a snapshot of each rule's running stats (for effectiveness monitoring).
 func (f *FactorStrategy) Stats() []ActiveRule {
 	f.mu.RLock()
@@ -154,9 +192,18 @@ func (f *FactorStrategy) Stats() []ActiveRule {
 	return out
 }
 
-// Evaluate 对单只股票评分（实现 Strategy 接口）。data 为 *strategy_engine.StockMarketData。
+// Evaluate 对单只股票评分（实现 Strategy 接口）。
 // 对每条启用规则独立评分，取最高分（且过阈值的）规则作为本次结果；未过阈值取最高原始分。
+//
+// 参数：
+//   - code: 股票代码
+//   - data: 必须为 *strategy_engine.StockMarketData 类型
+//
+// 返回值：
+//   - *Evaluation: 评分结果，包含总分、是否通过、信号级别等
+//
 // 仅用日K价量因子，输出 Evaluation{TotalScore, Pass, Level, Confidence}。
+//
 // English: scores one stock (Strategy interface); data is *strategy_engine.StockMarketData.
 // Evaluates each enabled rule independently and returns the highest-scoring passing rule (or highest
 // raw score if none pass). Only price-volume factors are used from daily bars.
@@ -191,6 +238,8 @@ func (f *FactorStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 }
 
 // scoreRule 对单条规则打分。
+// 这是因子评分的核心函数，计算每个因子的分位数，然后加权合成复合分。
+//
 // English: scores a stock against a single rule.
 func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries) *strategy.Evaluation {
 	var total, used float64
@@ -267,6 +316,8 @@ func (f *FactorStrategy) scoreRule(r *ActiveRule, series *factorlib.StockSeries)
 
 // GenerateSignal 把最高分规则评分转为交易信号（实现 Strategy 接口）。
 // 信号以该规则的 Name 作为 StrategyName，使消息中心去重键按规则独立；Reason 附规则名。
+// 这种设计确保了多规则同时实盘时信号去重不会冲突。
+//
 // English: converts the highest-scoring rule's evaluation into a trade signal. The signal is named by
 // that rule (StrategyName) so message-center dedup keys stay distinct per rule; Reason includes the rule name.
 func (f *FactorStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
@@ -302,6 +353,8 @@ func (f *FactorStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 
 // RecordForwardReturn 记录某规则一条触发股的 5 日（Horizon）前向收益，用于效果监测。
 // 在监控层（引擎/战法库）调用；正收益计入 Win，负计入 Loss，并累加 CumReturn。
+// 这是因子战法效果监测的核心函数，用于评估规则的实际表现。
+//
 // English: records a rule's 5-day (Horizon) forward return for one triggered stock, for effect
 // monitoring; positive returns count toward Win, negative toward Loss, and accumulate into CumReturn.
 func (f *FactorStrategy) RecordForwardReturn(ruleID string, ret float64) {
@@ -321,6 +374,8 @@ func (f *FactorStrategy) RecordForwardReturn(ruleID string, ret float64) {
 }
 
 // ResetStats 重置全部规则的运行统计。
+// 用于定期清零统计，重新开始效果监测。
+//
 // English: resets all rules' running stats.
 func (f *FactorStrategy) ResetStats() {
 	f.mu.Lock()
@@ -333,6 +388,8 @@ func (f *FactorStrategy) ResetStats() {
 // seriesFromKLines 从日K + 财务指标构造 factorlib.StockSeries。
 // 价量字段来自日K；财务字段（ROE/净利同比/毛利/净利/负债率/EPS）来自 md.Fina（最新报告期，缺失 0）。
 // 使财务类因子（ROE 质量 / YoyNetProfit 成长 / SUE 等）在实盘打分时也有值。
+// 这个函数是因子评分的数据准备函数，将原始数据转换为因子库需要的格式。
+//
 // English: builds a factorlib.StockSeries from daily bars + financials. Price/volume fields come from
 // daily bars; financial fields (ROE/YoyNetProfit/margins/debt/EPS) come from md.Fina (latest report, 0
 // when missing), so financial factors (ROE quality / YoyNetProfit growth / SUE etc.) score live too.
@@ -369,6 +426,8 @@ func seriesFromKLines(kl []data.KLine, fina *strategy_engine.FinancialData) *fac
 }
 
 // constant 返回长度为 n、值均为 v 的切片（财务字段时间序列常量）。
+// 用于将财务指标扩展为与日K线等长的时间序列。
+//
 // English: returns a length-n slice filled with v (a constant financial series).
 func constant(n int, v float64) []float64 {
 	out := make([]float64, n)
@@ -380,6 +439,8 @@ func constant(n int, v float64) []float64 {
 
 // percentile 返回序列末值在整体序列中的分位（0~1）；序列过短/无有效值返回 NaN。
 // 用于把因子当前值映射为"相对自身历史"的相对强弱。
+// 这是因子评分的核心函数，实现了时序相对强弱的计算。
+//
 // English: returns the percentile rank (0~1) of the last value within the series; NaN when too short
 // or no valid values. Maps a factor's current value to its relative strength vs its own history.
 func percentile(vals []float64) float64 {
@@ -410,7 +471,9 @@ func percentile(vals []float64) float64 {
 	return float64(below) / float64(len(valid))
 }
 
-// isFinancialFactor 判断某因子是否为财务类（质量/成长/估值），这类因子在实盘用最新值直接打分。
+// isFinancialFactor 判断某因子是否为财务类（质量/成长/估值）。
+// 这类因子在实盘用最新值直接打分，因为没有横截面排名数据。
+//
 // English: reports whether a factor is financial (quality/growth/value), scored live by its latest value.
 func isFinancialFactor(df factorlib.Def) bool {
 	switch df.Cat {
@@ -421,7 +484,12 @@ func isFinancialFactor(df factorlib.Def) bool {
 }
 
 // finaScore 把财务类因子最新值归一化到 0~1（绝对区间近似，缺横截面排名）。
-// 越高分代表该指标越"强"（ROE/净利同比/毛利/净利越高越好；负债率越低越好）。
+// 越高分代表该指标越"强"：
+//   - ROE/净利同比/毛利/净利：越高越好
+//   - 负债率：越低越好
+//
+// 这是财务因子评分的辅助函数，将绝对值转换为相对强弱。
+//
 // English: normalizes a financial factor's latest value to 0~1 (absolute-range approximation, no live
 // cross-section). Higher = stronger (high ROE/YoyNetProfit/margins good; low debt good).
 func finaScore(fid string, v float64) float64 {
@@ -449,6 +517,8 @@ func finaScore(fid string, v float64) float64 {
 }
 
 // clamp01 把值截断到 [0,1]。
+// 辅助函数，确保评分在有效范围内。
+//
 // English: clamps a value into [0,1].
 func clamp01(v float64) float64 {
 	if v < 0 {

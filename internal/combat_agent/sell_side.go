@@ -3,11 +3,14 @@
 // 命中 利空D1 / 破MA5·MA20 / 放量派发 / 动量衰竭 任一因素即产生"卖点"提醒信号。
 // 仅提醒、不自动执行，与战法退出引擎（position_exits.go）互补：退出引擎按持仓成本/策略参数算，
 // 本模块按行情与事件面判断"该不该卖"，覆盖尚未持仓或无法用持仓成本度量的股票。
-// English: per-stock sell-point assessment — each stock in the scoring pool (holdings / watchlist /
-// tracked) is independently evaluated for sell risk; hitting any of bearish-D1 / breaking MA5·MA20 /
-// volume-distribution / momentum-exhaustion emits a sell-point reminder. Reminder-only, complementary
-// to the strategy exit engines (position_exits.go) which judge by holding cost/strategy params, while
-// this module judges by event/market face for stocks not yet held or not measurable by cost.
+//
+// 四项卖点因素（按严重度降序）：
+//   1. 利空D1：负面过滤拦截（立案/减持/质押/解禁等）→ 清仓级
+//   2. 破MA5·MA20：现价同时跌破5日与20日均线 → 减仓级
+//   3. 放量派发：当日实时量明显放大且价格下跌 → 减仓级
+//   4. 动量衰竭：动量分低于信号阈值一半且分钟MACD转空 → 提示级
+//
+// 单只个股只产出一条卖点信号，取最严重因素决定级别与动作
 package combat_agent
 
 import (

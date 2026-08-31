@@ -29,13 +29,19 @@ type signalStoreFile struct {
 
 // signalStore 当日战法信号固化存储，键为 code@strategy。
 // 加载时校验交易日，跨天自动重置为当日空桶。
+// 核心功能：
+//   - Upsert: 合并本轮 Pass 信号，仅交易型（做多/做空）入库存
+//   - Invalidate: 标记信号失效（失效墓碑），当日该 key 不再允许固化
+//   - IsInvalidated: 判断 code@strategy 今日是否已被失效墓碑标记
+//   - List: 返回当日固化信号列表供聚合器展示
 // English: pinned-signal store keyed by code@strategy; validates the trading day on load and
 // automatically resets to an empty day-bucket when the day rolls over.
 type signalStore struct {
-	mu    sync.Mutex
-	path  string
-	byKey map[string]combat_agent.Signal
+	mu    sync.Mutex                                // 保护 byKey/invalidated 的互斥锁
+	path  string                                    // 磁盘持久化路径（空=不落盘）
+	byKey map[string]combat_agent.Signal            // code@strategy → 最近一次 Pass 信号
 	// invalidated 失效墓碑集合：已被标记失效的 key 当日不允许重新固化（防"假信号复活"）。
+	// 一旦标记，即使后续轮次重新产生同 key 信号也会被跳过。
 	// English: tombstone set — invalidated keys can't be re-pinned for the rest of the day.
 	invalidated map[string]bool
 }

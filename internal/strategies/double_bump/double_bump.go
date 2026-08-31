@@ -1,7 +1,12 @@
 // Package double_bump 实现双凸战法（Double Bump Strategy）。
 //
-// 市场模式：识别股价在日线级别走出"首次放量突破 → 缩量调整 → 二次放量突破"的双凸形态。
-// 这是典型的中线趋势延续形态，常见于主力资金两阶段建仓后的加速拉升。
+// 本包实现了双凸战法，这是一种中线趋势延续策略，核心思想是：
+// 识别股价在日线级别走出"首次放量突破 → 缩量调整 → 二次放量突破"的双凸形态。
+//
+// 市场模式：
+//   - 首次放量突破：主力资金第一阶段建仓
+//   - 缩量调整：洗盘和筹码沉淀
+//   - 二次放量突破：主力资金第二阶段建仓后的加速拉升
 //
 // 三维评分体系：
 //
@@ -27,8 +32,9 @@
 //   - total ≥ 50 → brief（半确认），P3_5 观察
 //   - total < 50 → watch，不操作
 //
-// 不适用 30%/80% 仓位限制（按 N 形仓位特殊规则，仅 90% 截断）。（English: implements the Double Bump continuation
-// strategy scoring volume / pullback depth / MA, gated by intraday up-session direction, with 70/50 thresholds→
+// 不适用 30%/80% 仓位限制（按 N 形仓位特殊规则，仅 90% 截断）。
+//
+// （English: implements the Double Bump continuation strategy scoring volume / pullback depth / MA, gated by intraday up-session direction, with 70/50 thresholds→
 // full_chain/brief/watch, and only a 90% position ceiling instead of 30%/80% caps.）
 package double_bump
 
@@ -41,25 +47,37 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// DoubleBumpStrategy 双凸战法策略结构。（Double Bump strategy struct.）
-// 通过量能/调整深度/均线三维度评分识别双凸突破机会。（Scores double-bump breakouts across volume / depth / MA.）
+// DoubleBumpStrategy 双凸战法策略结构。
+// 通过量能/调整深度/均线三维度评分识别双凸突破机会。
+// 这是一个中线趋势延续策略，专注于捕捉主力资金两阶段建仓后的加速拉升。
+//
+// （Double Bump strategy struct.）
 type DoubleBumpStrategy struct {
 	cfg    *config.Manager // 配置管理器（热加载 DoubleBumpConfig）（Config manager, hot-reloads DoubleBumpConfig）
 	userID string          // 账号 ID：非空时按该账号的策略配置读取，否则回退全局（Account ID: per-account strategy config when set, else global）
 }
 
-// New 创建双凸战法策略实例。（New creates a Double Bump strategy instance.）
+// New 创建双凸战法策略实例。
+// 初始化策略配置，返回可直接使用的策略实例。
+//
+// （New creates a Double Bump strategy instance.）
 func New(cfg *config.Manager) *DoubleBumpStrategy {
 	return &DoubleBumpStrategy{cfg: cfg}
 }
 
-// SetUserID 设置账号 ID（多账号独立引擎时，各账号 runner 按本账号配置读取）。
+// SetUserID 设置账号 ID。
+// 在多账号独立引擎场景下，各账号 runner 按本账号配置读取策略参数。
+// 这允许不同账号使用不同的策略配置。
+//
 // English: sets the account ID so a per-account engine's runner reads that account's config.
 func (d *DoubleBumpStrategy) SetUserID(userID string) {
 	d.userID = userID
 }
 
-// strategyCfg 返回当前账号的双凸配置（账号级覆盖优先，否则全局）。
+// strategyCfg 返回当前账号的双凸配置。
+// 优先使用账号级配置，若未设置则回退到全局配置。
+// 这种设计支持多账号独立配置策略参数。
+//
 // English: returns the Double Bump config for the current account (account override wins, else global).
 func (d *DoubleBumpStrategy) strategyCfg() config.DoubleBumpConfig {
 	if d.userID != "" && d.cfg != nil {
@@ -71,22 +89,33 @@ func (d *DoubleBumpStrategy) strategyCfg() config.DoubleBumpConfig {
 	return config.DoubleBumpConfig{}
 }
 
-// Name 返回策略中文名称"双凸战法"。（Name returns the strategy display name "双凸战法".）
+// Name 返回策略中文名称"双凸战法"。
+// 用于日志输出和前端展示。
+//
+// （Name returns the strategy display name "双凸战法".）
 func (d *DoubleBumpStrategy) Name() string {
 	return "双凸战法"
 }
 
-// Type 返回信号类型标识 SignalDoubleBump。（Type returns the signal type SignalDoubleBump.）
+// Type 返回信号类型标识 SignalDoubleBump。
+// 用于信号分类和去重。
+//
+// （Type returns the signal type SignalDoubleBump.）
 func (d *DoubleBumpStrategy) Type() strategy.SignalType {
 	return strategy.SignalDoubleBump
 }
 
-// Evaluate 标准接口（占位）。实际使用 EvaluateReal 传入结构化数据。（Standard interface stub; real scoring uses EvaluateReal.）
+// Evaluate 标准接口（占位）。
+// 实际使用 EvaluateReal 传入结构化数据，这个方法仅作为 Strategy 接口的占位实现。
+// 返回空结果，表示无数据可评分。
+//
+// （Standard interface stub; real scoring uses EvaluateReal.）
 func (d *DoubleBumpStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Pass: false, Level: "nodata", Confidence: 0}, nil
 }
 
-// EvaluateReal 执行双凸战法核心评分。（EvaluateReal runs the core Double Bump scoring.）
+// EvaluateReal 执行双凸战法核心评分。
+// 这是双凸战法的核心评分函数，实现三维评分体系。
 //
 // 评分步骤：
 //  1. 计算 20 日均量和均价（lookback ≤ 可用K线数）
@@ -97,7 +126,16 @@ func (d *DoubleBumpStrategy) Evaluate(code string, data interface{}) (*strategy.
 //  6. MA 评分：MA5 > MA10 多头排列 + 收盘 > MA5 确认强势
 //  7. 总分 = volScore + adjustScore + maScore，上限 100
 //
-// 输入: si（个股信息）、kLines（日K线列表，需 ≥10 根）（Inputs: si stock info; kLines daily bars requiring ≥10.）
+// 输入参数：
+//   - code: 股票代码
+//   - si: 个股信息（含价格/涨跌幅）
+//   - kLines: 日K线列表（需 ≥10 根）
+//
+// 返回值：
+//   - nil: 不构成双凸形态
+//   - *Evaluation: 评分结果
+//
+// （EvaluateReal runs the core Double Bump scoring.）
 func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []data.KLine) *strategy.Evaluation {
 	// 基础校验：无实时价或 K 线不足 10 根无法评分（Guard: require a live price and ≥10 bars to score）
 	if si == nil || si.Price <= 0 || len(kLines) < 10 {
@@ -239,8 +277,11 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 	}
 }
 
-// movingAvg 计算移动平均线。（movingAvg computes a moving average of closes.）
-// 从 K 线列表末尾向前取 period 根收盘价计算均值。（Averages the last `period` closes of the bar slice.）
+// movingAvg 计算移动平均线。
+// 从 K 线列表末尾向前取 period 根收盘价计算均值。
+// 用于计算MA5、MA10等均线指标。
+//
+// （movingAvg computes a moving average of closes.）
 func movingAvg(kLines []data.KLine, n, period int) float64 {
 	if n < period {
 		return kLines[n-1].Close
@@ -252,7 +293,10 @@ func movingAvg(kLines []data.KLine, n, period int) float64 {
 	return sum / float64(period)
 }
 
-// min 返回两个整数中的较小值。（min returns the smaller of two ints.）
+// min 返回两个整数中的较小值。
+// 辅助函数，用于计算回看窗口大小。
+//
+// （min returns the smaller of two ints.）
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -260,9 +304,15 @@ func min(a, b int) int {
 	return b
 }
 
-// GenerateSignal 将评分结果转化为交易信号。（GenerateSignal converts an evaluation into a trade signal.）
-// full_chain → buy，置信度>0.8 → P1，否则 P2。（full_chain→buy; confidence>0.8→P1 otherwise P2.）
-// brief → watch，P3_5。（brief→watch with priority P3_5.）
+// GenerateSignal 将评分结果转化为交易信号。
+// 根据评估结果的Level字段决定交易动作和优先级：
+//   - full_chain: 买入信号，按置信度分P1/P2
+//   - brief: 观察信号，P3_5优先级
+//   - 其他: 默认观察
+//
+// 信号生成后，会将评分明细复制到Meta字段，供前端展示各维度分数。
+//
+// （GenerateSignal converts an evaluation into a trade signal.）
 func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
 	// 默认：仅观察（watch / P3）（Default: watch only with P3）
 	prio := strategy.P3
@@ -297,9 +347,11 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 	}, nil
 }
 
-// BumpPhase 双凸形态状态机阶段。（BumpPhase is the Double Bump formation state machine.）
-// 跟踪从 first → adjust → second → third 的完整周期。（Tracks the cycle first → adjust → second → third.）
-// PhaseIDF 表示形态失效（形态破坏）。（PhaseIDF marks an invalidated/broken formation.）
+// BumpPhase 双凸形态状态机阶段。
+// 跟踪从 first → adjust → second → third 的完整周期。
+// 用于识别个股当前所处的双凸形态阶段。
+//
+// （BumpPhase is the Double Bump formation state machine.）
 type BumpPhase int
 
 const (
@@ -310,9 +362,16 @@ const (
 	PhaseIDF    BumpPhase = -1 // 形态失效（放量滞涨或破位）（Formation invalid: high volume stalling or breakdown）
 )
 
-// DetectPhase 检测个股当前所处的双凸形态阶段。（DetectPhase identifies the current Double Bump phase.）
-// 使用最新K线判断：第一波突破 → 第二波突破 → 失效反转。（Uses the latest bar: first→second breakout, else invalidation.）
-// 需要至少 20 根 K 线来计算均线和量能。（Requires ≥20 bars to compute averages.）
+// DetectPhase 检测个股当前所处的双凸形态阶段。
+// 使用最新K线判断当前处于哪个阶段：
+//   - PhaseFirst: 第一波突破（刚启动）
+//   - PhaseAdjust: 缩量调整（蓄势待发）
+//   - PhaseSecond: 第二波突破（确认双凸）
+//   - PhaseIDF: 形态失效（放量滞涨或破位）
+//
+// 需要至少 20 根 K 线来计算均线和量能。
+//
+// （DetectPhase identifies the current Double Bump phase.）
 func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpPhase {
 	// K 线不足 20 根时无法计算均量/均线，保守判定为第一波阶段（With <20 bars, conservatively assume first wave）
 	if len(kLines) < 20 {
@@ -365,9 +424,17 @@ func (d *DoubleBumpStrategy) DetectPhase(code string, kLines []data.KLine) BumpP
 	return PhaseFirst
 }
 
-// CheckIDFReturn 检查是否出现形态失效后的反转信号。（CheckIDFReturn detects a reversal signal after invalidation.）
-// 判断逻辑：最近两根K线收涨且成交量放大，之前有超过 3% 的下跌。
-// 用于在 PhaseIDF 失效后捕捉可能的修复反弹买点。（Two up/expanding-volume bars after a >3% drop → rebound entry after PhaseIDF.）
+// CheckIDFReturn 检查是否出现形态失效后的反转信号。
+// 在双凸形态失效后，捕捉可能的修复反弹买点。
+//
+// 判断逻辑：
+//  1. 最近两根K线收涨（连续两日阳线确认反转力度）
+//  2. 最近两根K线成交量均放大（大于20日均量×1.2，资金回流）
+//  3. 近期（近5日）曾出现单日跌幅>3%的深跌（存在超跌修复空间）
+//
+// 三个条件同时满足时返回true，表示可能出现反转。
+//
+// （CheckIDFReturn detects a reversal signal after invalidation.）
 func (d *DoubleBumpStrategy) CheckIDFReturn(code string, kLines []data.KLine) bool {
 	if len(kLines) < 5 {
 		return false

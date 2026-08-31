@@ -97,6 +97,10 @@ type Server struct {
 
 	researchDB  *store.DB // B5 研究候选库（optimize 产出入库；web 审批读写）
 	researchDir string    // B5 应用目录（applied_rules.json 落盘处）
+	// liveDB 实盘账本隔离库（real_positions/orders/fills/real_account）。§OPT-3：与 researchDB（trading.db）
+	// 拆分，避免夜间研究大批量写入与实时实盘对账/心跳同文件争锁，并便于独立备份。
+	// 为空时 realDB() 回退 researchDB，保证旧部署（实盘账本仍在 trading.db）向后兼容。
+	liveDB *store.DB
 
 	cacheDir string // 看板快照落盘目录（休市/重启后前端仍可读取最近一次有效数据）
 
@@ -374,6 +378,21 @@ func New(authMgr *auth.Manager, agg *display.Aggregator, cfg *config.Manager, rp
 func (s *Server) SetResearch(db *store.DB, dataDir string) {
 	s.researchDB = db
 	s.researchDir = dataDir
+}
+
+// SetLiveDB 接入隔离的实盘账本库（live.db）。§OPT-3：实盘持仓/委托/成交与夜间研究库拆分，
+// 降低同文件写竞争并便于独立备份。English: wires the isolated live-book DB (live.db).
+func (s *Server) SetLiveDB(db *store.DB) {
+	s.liveDB = db
+}
+
+// realDB 返回实盘账本库：优先 liveDB，未配置时回退 researchDB（旧部署兼容）。
+// English: returns the live-book DB, falling back to researchDB when liveDB isn't wired.
+func (s *Server) realDB() *store.DB {
+	if s.liveDB != nil {
+		return s.liveDB
+	}
+	return s.researchDB
 }
 
 // GetSSE 返回 SSE 事件推送器。

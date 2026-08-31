@@ -132,6 +132,22 @@ type Engine struct {
 	// breaking and auto-orders each 5s cycle.
 	qmtCtrl   *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
 	realStore *store.DB           // 研究库（real_positions/orders/fills 实盘账本存取）
+
+	// §A+B 信号→交易低延迟：异步下单分发器（事件驱动热路径）。
+	// autoPlace 完成同步守卫（模式/白名单/涨停封板/金额）后把 OrderRequest 投入 buyCh，
+	// 由独立 worker 调用 ctrl.PlaceOrder，避免网关 RTT 阻塞 5s 打分/检测循环。
+	buyCh   chan buyTask
+	buyStop chan struct{}
+	buyWg   sync.WaitGroup
+	// §A+B 近实时打分循环间隔（默认 0 → 回退 5s），可配置为 1-2s 以加快信号翻转检出。
+	scoringInterval time.Duration
+}
+
+// buyTask §A+B 异步下单任务：守卫已过的 buy 信号 + 已折算的 OrderRequest。
+// English: A+B async order task — a buy signal that passed all synchronous guards, with its computed OrderRequest.
+type buyTask struct {
+	req trading.OrderRequest
+	sig combat_agent.Signal
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -729,7 +745,7 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	// unique constraint now blocks all repeats across rounds/channels/restarts — at most one buy per
 	// (stock, strategy, day), consistent with the daily-count/budget discipline.
 	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), sig.Strategy, data.TradingDayDate(time.Now()))
-	res, err := ctrl.PlaceOrder(trading.OrderRequest{
+	req := trading.OrderRequest{
 		SignalID:  id,
 		Code:      withSuffix(sig.Code),
 		Name:      sig.Name,
@@ -740,12 +756,98 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		Qty:       qty,
 		Amount:    float64(qty) * price,
 		CreatedAt: time.Now().Format(time.RFC3339),
-	})
+	}
+	// §A+B 事件驱动热路径：若已启动异步分发器（buyCh 非空）则入队，否则同步下单
+	// （兼容未启动分发器的调用方，如测试与直调；保持原有行为）。
+	if e.buyCh != nil {
+		select {
+		case e.buyCh <- buyTask{req: req, sig: sig}:
+			log.Printf("[trading] auto order queued %s(%s) qty=%d price=%.2f (async)", sig.Code, sig.Name, qty, price)
+		default:
+			log.Printf("[trading] auto order DROPPED (buy queue full) %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
+		}
+	} else {
+		res, err := ctrl.PlaceOrder(req)
+		if err != nil {
+			log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
+			return
+		}
+		log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+	}
+}
+
+// StartBuyDispatcher §A+B 启动异步下单 worker 池（事件驱动热路径）。在 RunScoringLoop 启动时调用一次。
+// English: A+B — starts the async order worker pool (event-driven hot path). Called once when the scoring loop starts.
+func (e *Engine) StartBuyDispatcher(n int) {
+	if n <= 0 {
+		n = 4
+	}
+	e.mu.Lock()
+	if e.buyCh != nil {
+		e.mu.Unlock()
+		return // 已启动，避免重复
+	}
+	e.buyCh = make(chan buyTask, 64)
+	e.buyStop = make(chan struct{})
+	e.mu.Unlock()
+	for i := 0; i < n; i++ {
+		e.buyWg.Add(1)
+		go func() {
+			defer e.buyWg.Done()
+			stop := e.buyStop // 本地引用，StopBuyDispatcher 关闭后即可退出
+			for {
+				select {
+				case t := <-e.buyCh:
+					e.placeOrderNow(t.req, t.sig)
+				case <-stop:
+					return
+				}
+			}
+		}()
+	}
+}
+
+// StopBuyDispatcher 停止 worker 池（进程退出时）。
+// English: stops the worker pool (on process shutdown).
+func (e *Engine) StopBuyDispatcher() {
+	e.mu.Lock()
+	stop := e.buyStop
+	e.buyStop = nil
+	e.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	select {
+	case <-stop:
+	default:
+		close(stop)
+	}
+	e.buyWg.Wait()
+}
+
+// placeOrderNow §A+B worker 实际下单：每次读取最新 qmtCtrl（配置热重载安全），调用网关。
+// English: A+B worker — performs the actual order via the latest qmtCtrl (config hot-reload safe).
+func (e *Engine) placeOrderNow(req trading.OrderRequest, sig combat_agent.Signal) {
+	e.mu.RLock()
+	ctrl := e.qmtCtrl
+	e.mu.RUnlock()
+	if ctrl == nil {
+		return
+	}
+	res, err := ctrl.PlaceOrder(req)
 	if err != nil {
 		log.Printf("[trading] auto order %s(%s): %v", sig.Code, sig.Name, err)
 		return
 	}
-	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, qty, price, res)
+	log.Printf("[trading] auto order %s(%s) qty=%d price=%.2f → %+v", sig.Code, sig.Name, req.Qty, req.Price, res)
+}
+
+// SetScoringInterval §A+B 设置近实时打分循环间隔（0 → 回退 5s）。
+// English: A+B — sets the near-realtime scoring-loop interval (0 → fallback 5s).
+func (e *Engine) SetScoringInterval(d time.Duration) {
+	e.mu.Lock()
+	e.scoringInterval = d
+	e.mu.Unlock()
 }
 
 // withSuffix 为纯数字股票代码补交易所后缀（600000 → 600000.SH；000001 → 000001.SZ；4/8 开头 → .BJ）。

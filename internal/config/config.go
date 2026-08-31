@@ -1,6 +1,12 @@
 // Package config 提供配置管理：加载/保存 JSON 配置文件，支持策略、风控、板块、LLM 等配置。
-// （Package config provides configuration management: loading/saving a JSON config file,
-// covering strategy, risk control, sector, LLM and other settings.）
+// 本文件定义了量化交易系统所需的全部配置结构体，包括：
+//   - 情绪周期阶段阈值（冰点/启动/发酵/高潮/背离/退潮）
+//   - 四大战法（龙头/双响炮/N形/龙回头）的独立参数
+//   - D1 事件评分规则集
+//   - 风控/止损/仓位管理参数
+//   - 模拟盘/实盘 QMT 交易配置
+//   - 运行时内存治理/数据源/调度器/通知推送等
+// 顶层 Rules 结构体聚合所有配置，Manager 负责加载/保存/按账号隔离。
 package config
 
 import (
@@ -85,6 +91,18 @@ type RuntimeConfig struct {
 	// English: after-hours trim throttle interval in minutes (default 15).
 	// 盘后释放节流间隔（分钟）
 	TrimIntervalMin int `json:"trim_interval_min"`
+	// FeedIntervalSec 行情快照刷新间隔（秒，默认 0 → 回退 5s）。
+	// 降低可缩短"行情变化→信号检测"的感知延迟（信号→交易链路优化 A+B 之 B 快速执行器）。
+	// 注意：过低会加大上游行情源请求频率与 CPU 占用，生产需结合服务器资源验证后再启用。
+	// English: quote-snapshot refresh interval in seconds (0 → fallback 5s). Lowering it shortens the
+	// market-change → signal-detection latency (signal→trade optimization A+B / B: fast executor).
+	// Too-low values raise upstream request rate & CPU; validate against server resources in prod.
+	FeedIntervalSec int `json:"feed_interval_sec"`
+	// ScoringIntervalSec 近实时 8a/8b 打分循环间隔（秒，默认 0 → 回退 5s）。
+	// 降低可让战法信号翻转更快被检出并触发下单（信号→交易链路优化 A+B 之 B）。
+	// English: near-realtime 8a/8b scoring-loop interval in seconds (0 → fallback 5s). Lowering it
+	// detects strategy signal flips (and fires orders) sooner (signal→trade optimization A+B / B).
+	ScoringIntervalSec int `json:"scoring_interval_sec"`
 }
 
 // PaperConfig 模拟盘（纸面交易）配置：把 buy 信号按实时价自动撮合成虚拟持仓，独立于真实持仓。
@@ -285,6 +303,13 @@ type SchedulerConfig struct {
 	// English: memory gate — tasks stay queued when system MemAvailable drops below this.
 	// 内存总闸阈值（MB）
 	MinFreeMemMB int `json:"min_free_mem_mb"`
+	// ReplayThrottleMs 战法库全量回放逐股节流（毫秒/只）：>0 时回放循环每处理完一只股票
+	// sleep 该时长——盘后十几个小时足够，用拉长总时长换取对 quant/系统的瞬时 CPU 挤压最小化
+	// （2 核 4G 服务器上全池回放瞬时会把可用内存打到熔断线以下）。0=不节流。
+	// English: per-stock throttle (ms) for full-library replay — sleeping between stocks stretches
+	// the runtime over the long post-close window in exchange for much smaller instantaneous CPU/mem
+	// pressure on the box (a 2-core/4G server). 0 = no throttling.
+	ReplayThrottleMs int `json:"replay_throttle_ms"`
 	// §数据源路由（§HITHINK_DATA_SOURCE_PLAN）：研究/回测取数主源与复权门禁。
 	// hithink | baostock（默认 baostock=旧表，安全）
 	PrimarySource string `json:"primary_source"`
@@ -957,8 +982,8 @@ func (m *Manager) saveUserRules(userID string, r *Rules) {
 	}
 }
 
-// Get 返回当前规则配置指针。
-// （Get returns a pointer to the current rules config.）
+// Get 返回当前全局规则配置指针。
+// （Get returns a pointer to the current global rules config.）
 func (m *Manager) Get() *Rules { return m.Rules }
 
 // GetRulesFor 返回指定账号的交易规则快照（账号级覆盖优先，否则全局）。
@@ -1271,6 +1296,7 @@ func (m *Manager) checksum() string {
 
 // LoadSchedulerConfig 从配置文件读取 rules.scheduler（供独立研究服务 quant-research 使用）。
 // 只覆盖 JSON 中显式出现的字段，其余回退 DefaultSchedulerConfig；文件缺失/解析失败整体回退默认。
+// 解析策略：先读 rules.data（数据源路由），再按 key 逐个解析 scheduler 段内的子对象。
 // English: reads rules.scheduler from the config file (for the standalone quant-research service).
 // Only fields explicitly present in JSON are applied; the rest fall back to DefaultSchedulerConfig;
 // a missing/unparseable file returns defaults wholesale.
@@ -1366,6 +1392,14 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 	}
 	if v, ok := cfgInt(m, "trim_interval_min"); ok {
 		out.TrimIntervalMin = v
+	}
+	// 内存总闸阈值（MB）：此前遗漏解析导致配置值永远不生效、恒走默认 400——
+	// 服务器实际空闲可用内存仅几百 MB，400 兜底无法按需留足 quant 余量。
+	if v, ok := cfgInt(m, "min_free_mem_mb"); ok {
+		out.MinFreeMemMB = v
+	}
+	if v, ok := cfgInt(m, "replay_throttle_ms"); ok {
+		out.ReplayThrottleMs = v
 	}
 	return out
 }

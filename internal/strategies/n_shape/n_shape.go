@@ -1,7 +1,12 @@
 // Package n_shape 实现 N 形超短策略。
 //
-// 市场模式：识别股价在日内走出"第一波拉升→小幅回调(旗形整理)→第二波拉升"的 N 形结构。
-// 这是典型的超短线动量突破形态，常见于强势股开盘后的延续行情。
+// 本包实现了N形超短策略，这是一种日内动量突破策略，核心思想是：
+// 识别股价在日内走出"第一波拉升→小幅回调(旗形整理)→第二波拉升"的 N 形结构。
+//
+// 市场模式：
+//   - 第一波拉升：快速上涨，伴随放量
+//   - 旗形整理：小幅回调，成交量萎缩
+//   - 第二波拉升：再次放量突破前高
 //
 // 四维评分体系（D1~D4）：
 //   - D1 事件硬闸（满分 40）：事件驱动匹配，事件正向且强度达标才可入场
@@ -15,6 +20,7 @@
 //   - 左侧一突信号（价格突破前高×1.005 且量比≥1.8）提升优先级至至少 P2
 //
 // 前置依赖：需提供 WaveA（昨日波形）、IntradayB（日内快照）、Ctx（板块&情绪上下文）。
+//
 // （English: Implements the intraday "N-shape" ultra-short-term momentum breakout strategy. Scores four dimensions
 // D1 event-gate (40) / D2 relative strength (30) / D3 oversold-pullback (20) / D4 fund confirmation (10); a signal is
 // valid when D1>0 and total ≥60, with priority boosted by time and by a left-side breakout.）
@@ -26,14 +32,21 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// NShapeStrategy N 形超短策略主结构。（NShapeStrategy is the N-shape strategy main struct.）
-// 持有配置管理器和左侧评分器，通过 EvaluateWave 执行实时评分。（Holds the config manager and left-side scorer; scores live via EvaluateWave.）
+// NShapeStrategy N 形超短策略主结构。
+// 持有配置管理器和左侧评分器，通过 EvaluateWave 执行实时评分。
+// 这是一个日内超短线策略，专注于捕捉动量突破机会。
+//
+// （NShapeStrategy is the N-shape strategy main struct.）
 type NShapeStrategy struct {
 	cfg    *config.Manager // 策略配置热加载（Strategy config hot reload）
 	scorer *LeftSideScorer // D1~D4 评分器（D1~D4 scorer）
 }
 
-// New 创建 N 形策略实例。matcher 用于事件匹配（D1 评分依赖）。（New creates an N-shape instance; matcher feeds D1 event matching.）
+// New 创建 N 形策略实例。
+// 初始化策略配置和事件匹配器，返回可直接使用的策略实例。
+// matcher 用于事件匹配（D1 评分依赖）。
+//
+// （New creates an N-shape instance; matcher feeds D1 event matching.）
 func New(cfg *config.Manager, matcher *data.EventMatcher) *NShapeStrategy {
 	return &NShapeStrategy{
 		cfg:    cfg,
@@ -42,25 +55,44 @@ func New(cfg *config.Manager, matcher *data.EventMatcher) *NShapeStrategy {
 }
 
 // Name 返回策略中文名称"N形"（§名称规整：与配置白名单/模拟盘池名统一，旧名"N形超短"作别名兼容）。
+// 用于日志输出和前端展示。
+//
 // （Name returns the strategy display name "N形"; the legacy "N形超短" is accepted as an alias.）
 func (s *NShapeStrategy) Name() string {
 	return "N形"
 }
 
-// Type 返回信号类型标识 SignalNShape。（Type returns the signal type SignalNShape.）
+// Type 返回信号类型标识 SignalNShape。
+// 用于信号分类和去重。
+//
+// （Type returns the signal type SignalNShape.）
 func (n *NShapeStrategy) Type() strategy.SignalType {
 	return strategy.SignalNShape
 }
 
-// Evaluate 标准接口（占位）。实际使用 EvaluateWave 传入结构化数据。（Standard interface stub; real scoring uses EvaluateWave.）
+// Evaluate 标准接口（占位）。
+// 实际使用 EvaluateWave 传入结构化数据，这个方法仅作为 Strategy 接口的占位实现。
+// 返回空结果，表示无数据可评分。
+//
+// （Standard interface stub; real scoring uses EvaluateWave.）
 func (n *NShapeStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Pass: false, Level: "nodata", Confidence: 0}, nil
 }
 
-// EvaluateWave 执行 N 形策略核心评分。（EvaluateWave runs the core N-shape scoring.）
-// 输入: wa（昨日波形）、ib（日内快照，含竞价/量能/MACD）、ctx（板块情绪&事件）
-// 输出: Evaluation，包含 D1~D4 各维度分数、总分、是否 full_chain。
+// EvaluateWave 执行 N 形策略核心评分。
+// 这是N形策略的核心评分函数，调用左侧评分器执行D1~D4四维评分。
+//
+// 输入参数：
+//   - wa: 昨日波形（A波）数据
+//   - ib: 日内快照（B段）数据，含竞价/量能/MACD
+//   - ctx: 板块情绪&事件上下文
+//
+// 返回值：
+//   - *Evaluation: 评分结果，包含 D1~D4 各维度分数、总分、是否 full_chain
+//   - error: 错误信息（当前实现不会返回错误）
+//
 // 评分链路: scorer.Evaluate → D1/D2/D3/D4 → Total → Valid 判断。
+//
 // （Inputs: wa yesterday's wave, ib intraday snapshot, ctx sector/emotion/event context. Pipeline: scorer.Evaluate→D1..D4→Total→Valid.）
 func (n *NShapeStrategy) EvaluateWave(wa *WaveA, ib *IntradayB, ctx *Ctx) (*strategy.Evaluation, error) {
 	sr := n.scorer.Evaluate(wa, ib, ctx)
@@ -100,9 +132,15 @@ func (n *NShapeStrategy) EvaluateWave(wa *WaveA, ib *IntradayB, ctx *Ctx) (*stra
 	}, nil
 }
 
-// GenerateSignal 将评分结果转化为交易信号。（GenerateSignal converts an evaluation into a trade signal.）
-// full_chain 级别生成 buy 信号，按置信度分 P1/P2/P3；
-// 若左侧一突信号触发则最低 P2。（full_chain→buy tiered by confidence; left-signal floors priority at P2.）
+// GenerateSignal 将评分结果转化为交易信号。
+// 根据评估结果的Level字段决定交易动作和优先级：
+//   - full_chain: 买入信号，按置信度分P1/P2/P3
+//   - left_signal: 左侧一突信号，至少P2
+//   - right_signal: 右侧二突信号，P1
+//
+// 若左侧一突信号触发则最低 P2。
+//
+// （GenerateSignal converts an evaluation into a trade signal.）
 func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
 	// 默认动作：watch / P3；仅 full_chain 才升级为买入（Default: watch / P3; only full_chain escalates to buy）
 	action := strategy.ActionWatch
@@ -157,9 +195,11 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	}, nil
 }
 
-// NPhase N 形日内状态机阶段。（NPhase is the intraday N-shape state machine.）
+// NPhase N 形日内状态机阶段。
 // 跟踪从 idle 到 first_breakout → flag → second_breakout → completed/failed 的完整生命周期。
-// （Tracks the lifecycle idle → first_breakout → flag → second_breakout → completed/failed.）
+// 用于识别个股当前所处的N形形态阶段。
+//
+// （NPhase is the intraday N-shape state machine.）
 type NPhase int
 
 const (
@@ -171,8 +211,11 @@ const (
 	NPhaseFailed         NPhase = 5 // 形态失败：回调过深或二突破未出现（Failed: pullback too deep or no second breakout）
 )
 
-// remindToInt 将提醒级别文本转为数值（用于前端展示）。（remindToInt maps a remind label to a numeric for frontend display.）
+// remindToInt 将提醒级别文本转为数值（用于前端展示）。
 // strong=3, observe=2, mute=1, 其他=0。
+// 用于将文本标签转换为前端可展示的数值。
+//
+// （remindToInt maps a remind label to a numeric for frontend display.）
 func remindToInt(l string) float64 {
 	switch l {
 	case "strong":
@@ -185,7 +228,10 @@ func remindToInt(l string) float64 {
 	return 0
 }
 
-// boolToFloat 布尔转 float64（true→1, false→0），用于 Details map。（boolToFloat converts a bool to 1/0 for Details maps.）
+// boolToFloat 布尔转 float64（true→1, false→0），用于 Details map。
+// 便于在评分明细中记录布尔类型的状态标志。
+//
+// （boolToFloat converts a bool to 1/0 for Details maps.）
 func boolToFloat(b bool) float64 {
 	if b {
 		return 1
@@ -193,7 +239,10 @@ func boolToFloat(b bool) float64 {
 	return 0
 }
 
-// NPhaseString 将 NPhase 枚举转为可读字符串。（NPhaseString converts an NPhase to a human-readable string.）
+// NPhaseString 将 NPhase 枚举转为可读字符串。
+// 用于日志输出和前端展示，将数字枚举转换为可读的阶段名称。
+//
+// （NPhaseString converts an NPhase to a human-readable string.）
 func NPhaseString(p NPhase) string {
 	switch p {
 	case NPhaseIdle:

@@ -54,6 +54,8 @@ type Fetcher struct {
 	lastStaleWarn atomic.Int64
 	// 落盘节拍计数
 	persistTick int
+	// §A+B 行情刷新间隔（秒）：默认 0 → 回退 5s。降低可缩短"行情变化→信号检测"感知延迟。
+	refreshInterval time.Duration
 }
 
 // allStocks 返回去重合并后的完整监控列表（base + hot）。
@@ -200,6 +202,12 @@ func (f *Fetcher) Running() bool {
 	}
 }
 
+// SetRefreshInterval §A+B 设置行情快照刷新间隔（0 → 回退默认 5s）。须在 Start() 前调用。
+// English: A+B — sets the quote-snapshot refresh interval (0 → default 5s). Call before Start().
+func (f *Fetcher) SetRefreshInterval(d time.Duration) {
+	f.refreshInterval = d
+}
+
 // FetchOnce 执行一次数据获取（非交易时段用）。
 // FetchOnce triggers a single fetch (for non-trading sessions).
 func (f *Fetcher) FetchOnce() {
@@ -265,7 +273,11 @@ func (f *Fetcher) loop() {
 	// §R3-2 P0-D3 锁内取数：启动日志不再锁外直读两个字段
 	baseN, hotN := f.watchCounts()
 	log.Printf("数据采集开始, 监控 %d 只股票(自选+持仓%d 热点%d), 来源 %s", len(all), baseN, hotN, f.dc.SourceName())
-	ticker := time.NewTicker(5 * time.Second)
+	interval := f.refreshInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// 非活跃时段门控：盘后/休市停止抓行情（保留上一份快照供 HTTP/SSE 读旧值），

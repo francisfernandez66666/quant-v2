@@ -523,6 +523,13 @@ func (s *Server) handleLibraryBacktest(w http.ResponseWriter, r *http.Request) {
 	if v, err := strconv.Atoi(q.Get("maxstocks")); err == nil && v > 0 {
 		payload["maxstocks"] = v
 	}
+	// §质控：quality=true 时以质控池（剔 ST/退市/多年亏损/地量股）替代全量 StockCodes()，
+	// 供前端"重新回测"手动全量回放时复用夜间 library_replay 的口径。
+	// English: quality=true builds the universe from the quality screen (drops ST/delisted/
+	// multi-year-loss/illiquid names) — same caliber as the nightly full-market library replay.
+	if q.Get("quality") == "true" || q.Get("quality") == "1" {
+		payload["quality"] = true
+	}
 	if _, _, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, num, payload); err != nil {
 		writeError(w, 500, err.Error())
 		return

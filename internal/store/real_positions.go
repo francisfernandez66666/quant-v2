@@ -695,3 +695,110 @@ func (d *DB) ClearRealBook() error {
 	}
 	return tx.Commit()
 }
+
+// MigrateRealTablesIfEmpty 仅在 dst 实盘账本为空时，从 src（通常是旧 trading.db）整表拷贝
+// real_positions / orders / fills / real_account，避免拆分 live.db 后存量实盘数据丢失。
+// 幂等：dst 已有数据则直接跳过，返回 (false, nil)。English: one-time copy of the live book
+// from src into dst when dst is empty (idempotent; skips when dst already holds rows).
+func MigrateRealTablesIfEmpty(dst, src *DB) (bool, error) {
+	if dst == nil || src == nil {
+		return false, nil
+	}
+	var n int
+	if err := dst.db.QueryRow(`SELECT COUNT(*) FROM real_positions`).Scan(&n); err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return false, nil
+	}
+
+	tx, err := dst.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// real_positions
+	if rows, rerr := src.db.Query(`SELECT ts_code,name,qty,cost_price,amount,highest_price,strategy,signal_id,updated_at,user_id FROM real_positions`); rerr == nil {
+		for rows.Next() {
+			var p RealPosition
+			if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount, &p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID); err != nil {
+				rows.Close()
+				return false, err
+			}
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO real_positions(ts_code,name,qty,cost_price,amount,highest_price,strategy,signal_id,updated_at,user_id) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+				p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID); err != nil {
+				rows.Close()
+				return false, err
+			}
+		}
+		rows.Close()
+	}
+
+	// orders
+	if oRows, oerr := src.db.Query(`SELECT order_id,signal_id,code,side,status,price,qty,created_at,user_id FROM orders`); oerr == nil {
+		for oRows.Next() {
+			var o RealOrder
+			if err := oRows.Scan(&o.OrderID, &o.SignalID, &o.Code, &o.Side, &o.Status, &o.Price, &o.Qty, &o.CreatedAt, &o.UserID); err != nil {
+				oRows.Close()
+				return false, err
+			}
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO orders(order_id,signal_id,code,side,status,price,qty,created_at,user_id) VALUES(?,?,?,?,?,?,?,?,?)`,
+				o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID); err != nil {
+				oRows.Close()
+				return false, err
+			}
+		}
+		oRows.Close()
+	}
+
+	// fills
+	if fRows, ferr := src.db.Query(`SELECT order_id,code,side,price,qty,amount,traded_at,signal_id,user_id FROM fills`); ferr == nil {
+		for fRows.Next() {
+			var f RealFill
+			if err := fRows.Scan(&f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount, &f.TradedAt, &f.SignalID, &f.UserID); err != nil {
+				fRows.Close()
+				return false, err
+			}
+			if _, err := tx.Exec(`INSERT INTO fills(order_id,code,side,price,qty,amount,traded_at,signal_id,user_id) VALUES(?,?,?,?,?,?,?,?,?)`,
+				f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID); err != nil {
+				fRows.Close()
+				return false, err
+			}
+		}
+		fRows.Close()
+	}
+
+	// real_account（惰性建表，一并迁移）
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS real_account (
+		user_id TEXT PRIMARY KEY, available_cash REAL NOT NULL DEFAULT 0,
+		frozen_cash REAL NOT NULL DEFAULT 0, total_asset REAL NOT NULL DEFAULT 0,
+		market_value REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)`); err != nil {
+		return false, err
+	}
+	if aRows, aerr := src.db.Query(`SELECT user_id,available_cash,frozen_cash,total_asset,market_value,updated_at FROM real_account`); aerr == nil {
+		for aRows.Next() {
+			var a RealAccount
+			if err := aRows.Scan(&a.UserID, &a.AvailableCash, &a.FrozenCash, &a.TotalAsset, &a.MarketValue, &a.UpdatedAt); err != nil {
+				aRows.Close()
+				return false, err
+			}
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO real_account(user_id,available_cash,frozen_cash,total_asset,market_value,updated_at) VALUES(?,?,?,?,?,?)`,
+				a.UserID, a.AvailableCash, a.FrozenCash, a.TotalAsset, a.MarketValue, a.UpdatedAt); err != nil {
+				aRows.Close()
+				return false, err
+			}
+		}
+		aRows.Close()
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	tx = nil
+	return true, nil
+}

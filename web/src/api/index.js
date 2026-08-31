@@ -1269,7 +1269,7 @@ export async function resumeBacktest(id) {
 }
 
 /** 战法库回测：对一条已应用规则（fac_<n>/pat_<n>）跑历史回放回测（阶段3.4，异步，结果进回测 tab）。
- *  params 可选 {start,end,maxstocks} */
+ *  params 可选 {start,end,maxstocks,quality}；quality=true 用质控池（剔 ST/退市/连亏/地量股） */
 /** Library-rule backtest: replay one applied rule over history (async; result lands in the backtest tab) */
 export async function backtestLibraryRule(id, params) {
   const qs = new URLSearchParams()
@@ -1277,6 +1277,7 @@ export async function backtestLibraryRule(id, params) {
     if (params.start) qs.set('start', params.start)
     if (params.end) qs.set('end', params.end)
     if (params.maxstocks) qs.set('maxstocks', params.maxstocks)
+    if (params.quality) qs.set('quality', params.quality ? 'true' : 'false')
   }
   const q = qs.toString()
   return request('/api/research/library/' + encodeURIComponent(id) + '/backtest' + (q ? '?' + q : ''), { method: 'POST' })

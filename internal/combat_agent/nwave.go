@@ -1,16 +1,14 @@
 // Package combat_agent 战法引擎：8a/8b 处理信号个股打分，以及持仓/自选的持续打分。
-// Package combat_agent: scoring for 8a/8b signal stocks, plus continuous scoring of holdings/watchlist.
 // nwave.go 实现 N 形"一突/二突"日内状态机：跨 5s 打分周期跟踪每只股票的突破节奏。
-// nwave.go implements the N-shape "first breakout / second breakout" intraday state machine, tracking
-// each stock's breakout rhythm across the 5s scoring cycles.
+//
 // 一突（左侧）：价格突破前日高点×1.005 且量比≥1.8 → 立即打标买入（≥P2）。
-// First breakout (left): price breaks above yesterday's high x 1.005 with a volume ratio >= 1.8 -> an
-// immediate buy candidate (>= P2).
 // 二突（右侧）：一突破位后经历回调（跌破峰价×0.997），再次放量重破前高 → 最强确认（P1）。
-// Second breakout (right): after the first breakout, a pullback (below the peak x 0.997) and then a
-// renewed breakout above the prior high -> the strongest confirmation (P1).
-// 状态按交易日隔离，跨日自动重置；状态仅在 N 形候选被评分时推进。
-// State is isolated per trading day and reset across days; it only advances when an N-shape candidate is scored.
+//
+// 状态机设计：
+//   - 状态按交易日隔离，跨日自动重置
+//   - 状态仅在 N 形候选被评分时推进
+//   - 一突每次满足条件都返回 true
+//   - 二突仅在一突后回调再重破峰价时返回一次
 package combat_agent
 
 import (
@@ -23,12 +21,14 @@ import (
 )
 
 // waveState 单只股票的日内突破状态。
-// waveState holds the intraday breakout state of a single stock.
-//   - day: trading day (basis for cross-day reset)
-//   - prevHigh: yesterday's high
-//   - armed: whether the first breakout has already occurred
-//   - highAfterArm: intraday high since the first breakout (the peak)
-//   - dipped: whether a pullback happened (below 0.997x the peak)
+// 跟踪每只股票在当日的 N 形突破进度，用于判断一突/二突信号。
+//
+// 字段说明：
+//   - day: 交易日（跨日重置依据）
+//   - prevHigh: 前日最高价
+//   - armed: 是否已发生一突破位
+//   - highAfterArm: 一突以来的盘中最高价（峰价）
+//   - dipped: 是否已从峰价回调（跌破 0.997 倍峰价）
 type waveState struct {
 	day          string  // 交易日（跨日重置依据）
 	prevHigh     float64 // 前日最高价
@@ -38,37 +38,52 @@ type waveState struct {
 }
 
 // WaveTracker N 形一突/二突状态机容器，按股票代码维护日内状态。
-// WaveTracker is the N-shape first/second-breakout state machine container, keeping per-code intraday state.
+// 每只股票维护独立的状态，跨交易日自动重置。
+//
+// 字段说明：
+//   - mu: 互斥锁，保护并发访问
+//   - states: 股票代码→日内状态映射
 type WaveTracker struct {
 	mu     sync.Mutex
 	states map[string]*waveState
 }
 
 // NewWaveTracker 创建状态机容器。
-// NewWaveTracker creates a new state-machine container.
+// 返回值：
+//   - 初始化后的 WaveTracker 指针
 func NewWaveTracker() *WaveTracker {
 	return &WaveTracker{states: make(map[string]*waveState)}
 }
 
 // firstBreakRatio 一突量比阈值（与 n_shape 左侧信号口径一致）。
-// firstBreakRatio is the first-breakout volume-ratio threshold (aligned with the n_shape left-side signal).
 const firstBreakRatio = 1.8
 
 // firstBreakPct 一突突破幅度（价格须超过前高×1.005）。
-// firstBreakPct is the first-breakout threshold (price must exceed yesterday's high x 1.005).
 const firstBreakPct = 1.005
 
 // dipFactor 二突判定中的回调阈值：跌破峰价×0.997 视为已回调。
-// dipFactor is the pullback threshold for the second-breakout check: below the peak x 0.997 counts as a dip.
 const dipFactor = 0.997
 
 // Eval 推进并读取 code 的日内突破状态，返回（一突触发, 二突触发）。
-// Eval advances and reads the intraday breakout state for code, returning (first-break trigger, second-break trigger).
 // 一突每次满足价格+量比条件都返回 true；二突仅在一突后回调再重破峰价时返回一次
 // （触发后峰价上移至现价、清除回调标记，供下一波再次判定）。
-// The first break returns true whenever the price+volume condition holds; the second break returns once,
-// after a pullback following the first break and a renewed break above the peak (the peak moves up to the
-// current price and the dip flag clears afterwards, allowing the next wave to be detected again).
+//
+// 一突条件：
+//   - 现价 > 前高×1.005
+//   - 量比≥1.8（当日累计成交量 / 近20日日均成交量）
+//
+// 二突条件：
+//   - 已一突（armed）
+//   - 已回调（dipped）
+//   - 现价重破峰价
+//
+// 参数：
+//   - code: 股票代码
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - left: 一突触发
+//   - right: 二突触发
 func (t *WaveTracker) Eval(code string, md *strategy_engine.StockMarketData) (left, right bool) {
 	left, right = false, false
 	if code == "" || md == nil || md.Price <= 0 || len(md.KLines) < 2 {

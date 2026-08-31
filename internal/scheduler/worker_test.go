@@ -158,6 +158,18 @@ func TestLibraryReplayStepMappedAndInserted(t *testing.T) {
 	if !strings.Contains(payload, `"kind":"all"`) {
 		t.Fatalf("payload 应为 kind=all, 得 %s", payload)
 	}
+	// §节流：ReplayThrottleMs>0 时 library_replay 应透传 throttle_ms（摊平全量回放瞬时负载）；
+	// 默认 0 不应出现该键（保持出厂行为不变）。
+	cfg := config.DefaultSchedulerConfig()
+	cfg.ReplayThrottleMs = 80
+	_, tp, _ := stepTask("library_replay", cfg, "20260822")
+	if !strings.Contains(tp, `"throttle_ms":80`) {
+		t.Fatalf("ReplayThrottleMs=80 时应带 throttle_ms, 得 %s", tp)
+	}
+	_, tp0, _ := stepTask("library_replay", config.DefaultSchedulerConfig(), "20260822")
+	if strings.Contains(tp0, "throttle_ms") {
+		t.Fatalf("默认 ReplayThrottleMs=0 不应带 throttle_ms, 得 %s", tp0)
+	}
 	steps := []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "list"}
 	if containsStep(steps, "backtest") {
 		t.Fatal("前置条件：默认步骤不含 backtest")

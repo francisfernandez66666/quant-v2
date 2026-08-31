@@ -1,4 +1,9 @@
 // N 形超短战法离场判定：硬止损/形态失败/尾盘强平/量能衰竭等出场逻辑（CheckExit）。
+// 本文件实现了N形超短战法的退出逻辑，包含多种退出条件：
+//   - 硬止损：跌破成本价超过阈值
+//   - 形态失败：入场时已处于失败阶段
+//   - 尾盘强平：超短策略日内了结
+//   - 量能衰竭：入场时量比不足
 package n_shape
 
 import (
@@ -8,11 +13,21 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// CheckExit 判断 N 形策略是否触发退出信号。（CheckExit decides whether the N-shape strategy should exit.）
-// 按优先级依次检查：硬止损 → N 形形态失败（入场时 phase=5）→ 尾盘 14:57 后按入场阶段强平/止盈 → 量能衰竭。
-// 返回 nil 表示继续持有；否则返回带理由和优先级的退出建议。
-// （Checks in order: hard stop-loss → formation failed at entry (phase=5) → post-14:57 close-out/take-profit by entry phase →
-// volume drain. Returns nil to hold, else an exit suggestion with reason and priority.）
+// CheckExit 判断 N 形策略是否触发退出信号。
+// 按优先级依次检查多种退出条件，返回nil表示继续持有，返回ExitResult表示应该退出。
+//
+// 检查顺序（优先级从高到低）：
+//  1. 扫参统一出场（TrailingDrawbackPct/MaxHoldDays）
+//  2. 硬止损：跌破成本价超过阈值（支持ATR动态止损）
+//  3. 形态失败：入场时已处于失败阶段（NPhaseFailed=5）
+//  4. 尾盘强平：14:57后超短策略必须日内了结
+//  5. 量能衰竭：入场时量比不足（vol_ratio<0.5）
+//
+// 返回值：
+//   - nil: 继续持有
+//   - *ExitResult: 触发退出，包含退出理由和优先级
+//
+// （CheckExit decides whether the N-shape strategy should exit.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.ExitResult {
 	// §扫参统一出场（STRATEGY_OPTIMIZE_PLAN）：配置了 trailing_drawback_pct/max_hold_days
 	// 时优先执行——与扫参排名同口径；未配置(0)时完全走既有规则，行为零变更。
@@ -81,5 +96,8 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.NShapeConfig) *strategy.Ex
 	return nil
 }
 
-// NeedUpdateHighest N 形策略无需更新最高价。（NeedUpdateHighest reports that N-shape does not track a stage high price.）
+// NeedUpdateHighest N 形策略无需更新最高价。
+// N形是超短策略，不追踪阶段最高价，因此返回false。
+//
+// （NeedUpdateHighest reports that N-shape does not track a stage high price.）
 func NeedUpdateHighest() bool { return false }

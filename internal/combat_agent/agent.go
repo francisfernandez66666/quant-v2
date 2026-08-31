@@ -1,13 +1,28 @@
-// Package combat_agent 战法引擎：多策略信号执行与持仓监控。
-// 支持多方向（做多/做空）扫描、Laodeng 评分修正、止盈止损提醒。
-// 核心入口包括 ScanLong/ScanShort/Scan 三大扫描路径、ScorePool 持续打分、
-// CheckPositionAlerts 持仓止盈止损提醒，以及 HotReload 配置热更新。
-// 配套文件：types.go(数据结构)、adapter.go(数据适配)、momentum.go/nshape_input.go(打分输入)、
-// d1_scorer.go(D1 事件评分)、expectation_gap.go(预期差)、limit_up.go(涨停龙头) 、loader.go(配置热加载)。
-// English: the combat engine — multi-strategy signal execution and position monitoring. It supports
-// multi-direction (long/short) scanning, Laodeng score correction, take-profit/stop-loss alerts.
-// Core entry points: ScanLong/ScanShort/Scan, ScorePool persistent scoring, CheckPositionAlerts and
-// HotReload config hot-reload. Companion files list the data structures, adapters, scoring inputs, etc.
+// Package combat_agent 战法引擎核心包：多策略信号执行与持仓监控。
+// 本文件是 combat_agent 包的主入口文件，包含 Agent 核心结构体和主要业务逻辑。
+//
+// 核心功能：
+//   - 多方向扫描：支持做多（ScanLong）、做空（ScanShort）、通用（Scan）三种扫描路径
+//   - 持续打分：ScorePool 对打分池（持仓+自选）逐只执行四战法评分 + 动量分
+//   - 持仓监控：CheckPositionAlerts 检查止盈止损条件，CheckPositionsExits 运行战法退出引擎
+//   - 配置热更新：HotReload 支持策略参数热更新，无需重启进程
+//
+// 配套文件说明：
+//   - types.go: 数据结构定义
+//   - adapter.go: 数据适配层，将行情数据转换为战法输入
+//   - momentum.go: 动量分计算
+//   - nshape_input.go: N 形战法评分输入构造
+//   - d1_scorer.go: D1 事件评分（LLM）
+//   - expectation_gap.go: 预期差检测
+//   - limit_up.go: 涨停龙头识别
+//   - loader.go: 配置热加载
+//   - runners.go: 战法运行器工厂
+//   - dbwave.go: 双响炮日内状态机
+//   - nwave.go: N 形日内状态机
+//   - sell_side.go: 卖点评估
+//   - position_exits.go: 战法退出引擎
+//   - rule_exit_overrides.go: 规则级出场覆盖
+//   - macro_gate.go: 宏观利空门控
 package combat_agent
 
 import (
@@ -30,17 +45,25 @@ import (
 )
 
 // StrategyRunner 策略运行器，封装策略类型与策略实例。
-// Type 标识该运行器对应的战法（如 SignalDragon 龙头战法），
-// Strategy 是具体的策略实现，Scan 阶段按 Type 分发到真实评分逻辑。
-// English: strategy runner wrapping a signal type and its strategy instance; Type identifies the
-// matching strategy (e.g. SignalDragon), Strategy is the concrete implementation dispatched at scan time.
+// 每个运行器对应一种战法（如龙头战法、双响炮战法等），在扫描阶段按 Type 分发到真实评分逻辑。
+// 运行器列表由 NewRunners 工厂函数创建，通过 SetRunners 注入 Agent。
+//
+// 字段说明：
+//   - Type: 策略信号类型（如 SignalDragon 龙头战法），用于分发和日志标识
+//   - Strategy: 策略接口实现，包含 Evaluate/GenerateSignal 等方法
 type StrategyRunner struct {
 	Type     strategy.SignalType // 策略信号类型（龙/双响炮/N形/龙回头）
 	Strategy strategy.Strategy   // 策略接口实现
 }
 
 // orDefault 返回 a 非空时的值，否则回退到 b。
-// English: returns a when non-empty, otherwise falls back to b.
+// 这是一个通用的字符串默认值辅助函数，用于处理可能为空的字符串字段。
+// 参数：
+//   - a: 主值，优先返回
+//   - b: 默认值，当 a 为空时返回
+//
+// 返回值：
+//   - 如果 a 非空则返回 a，否则返回 b
 func orDefault(a, b string) string {
 	if a != "" {
 		return a
@@ -48,11 +71,19 @@ func orDefault(a, b string) string {
 	return b
 }
 
-// libraryIDFromMeta 从策略信号的 Meta["strategy_id"]（候选 ID）转成战法库规则 ID。
-// 前缀按 runner 类型区分：factor→"fac_<id>"、pattern→"pat_<id>"（§C 修复：旧版形态信号
-// 也被硬编码 fac_ 前缀，效果监测/细分池归属全错）。无 strategy_id 或 ≤0 返回空串。
-// English: converts Meta["strategy_id"] (candidate ID) into the library rule ID, prefixed by
-// runner type (fac_/pat_). Empty when absent/≤0.
+// libraryIDFromMeta 从策略信号的 Meta["strategy_id"]（候选 ID）转换成战法库规则 ID。
+// 前缀按 runner 类型区分：
+//   - factor 类型 → "fac_<id>"
+//   - pattern 类型 → "pat_<id>"
+//
+// 这个转换确保效果监测能正确归属信号到具体规则。
+// 参数：
+//   - sig: 策略信号，包含 Meta 信息
+//   - t: 策略类型，用于确定前缀
+//
+// 返回值：
+//   - 规则 ID 字符串（如 "fac_1"、"pat_2"）
+//   - 无 strategy_id 或 ≤0 时返回空串
 func libraryIDFromMeta(sig *strategy.Signal, t strategy.SignalType) string {
 	if sig == nil {
 		return ""
@@ -68,8 +99,14 @@ func libraryIDFromMeta(sig *strategy.Signal, t strategy.SignalType) string {
 	return prefix + strconv.FormatInt(int64(v), 10)
 }
 
-// strategyLabel 战法类型 → 日志用简称。
-// English: maps a signal type to a short label used in logs.
+// strategyLabel 将战法类型转换为日志用的简称。
+// 用于日志输出，简化战法类型的显示。
+// 参数：
+//   - t: 策略信号类型
+//
+// 返回值：
+//   - 对应的单字符简称（龙/双/N/回/因/形）
+//   - 未知类型返回原始类型字符串
 func strategyLabel(t strategy.SignalType) string {
 	switch t {
 	case strategy.SignalDragon:
@@ -88,12 +125,19 @@ func strategyLabel(t strategy.SignalType) string {
 	return string(t)
 }
 
-// nShapeReason 为 N 形信号附加 D1 事件信息，使信号可读性更强：
-// - d1.Reason 为 LLM 的 D1 分析理由（故事）；
-// - eventDesc 为个股关联事件的名称（新闻标题），对应"D1 事件名称"。
-// base 为战法自身原因（如 left_signal/full_chain），三段按序拼接。
-// English: appends D1 event info to an N-shape signal for readability — d1.Reason is the LLM narrative
-// and eventDesc is the related news event name(s); base is the strategy's own reason (left_signal etc.).
+// nShapeReason 为 N 形信号附加 D1 事件信息，使信号可读性更强。
+// 将战法自身原因、LLM 的 D1 分析理由、个股关联事件名称三段按序拼接。
+//
+// 拼接格式：base | D1: <reason> | 事件: <eventDesc>
+// 空字段会被跳过，不参与拼接。
+//
+// 参数：
+//   - base: 战法自身原因（如 left_signal/full_chain）
+//   - d1: D1 评分结果，包含 LLM 分析理由
+//   - eventDesc: 个股关联事件的名称（新闻标题）
+//
+// 返回值：
+//   - 拼接后的完整原因字符串
 func nShapeReason(base string, d1 *D1Score, eventDesc string) string {
 	var parts []string
 	if base != "" {
@@ -108,8 +152,14 @@ func nShapeReason(base string, d1 *D1Score, eventDesc string) string {
 	return strings.Join(parts, " | ")
 }
 
-// nShapeTag 映射 N 形评分级别到信号标记（一突/二突），其余级别返回 ""。
-// English: maps an N-shape evaluation level to a signal tag (left/right breakout), "" for other levels.
+// nShapeTag 将 N 形评分级别映射到信号标记（一突/二突）。
+// 参数：
+//   - eval: N 形评分结果，包含 Level 字段
+//
+// 返回值：
+//   - "一突"：当 Level 为 "left_signal" 时
+//   - "二突"：当 Level 为 "right_signal" 时
+//   - 空字符串：其他级别
 func nShapeTag(eval *strategy.Evaluation) string {
 	if eval == nil {
 		return ""
@@ -125,8 +175,33 @@ func nShapeTag(eval *strategy.Evaluation) string {
 
 // Agent 战法引擎核心，管理多策略运行器与配置热更新。
 // 所有字段通过 mu 读写锁保护，保证并发扫描/热更新安全。
-// English: core of the combat engine, managing multi-strategy runners and config hot-reload; all fields
-// are guarded by the mu RWMutex for safe concurrent scanning and hot-reload.
+// Agent 是整个战法引擎的中枢，负责：
+//   - 管理多个策略运行器（龙头/双响炮/N形/龙回头等）
+//   - 处理配置热更新（策略参数、做空开关、D1 配置等）
+//   - 维护日内状态机（N 形一突/二突、双响炮第二波确认）
+//   - 管理动量分提升门槛（跨交易日隔离重置）
+//   - 提供扫描入口（ScanLong/ScanShort/Scan/ScorePool）
+//   - 检查持仓止盈止损（CheckPositionAlerts/CheckPositionsExits）
+//
+// 字段说明：
+//   - mu: 读写锁，保护并发访问
+//   - strategyCfg: 策略参数配置（含动量分权重等，可热更新）
+//   - laodengCfg: Laodeng 评分配置（nil 表示未启用）
+//   - runners: 多策略运行器列表（做多/通用扫描共用）
+//   - shortRunner: 做空策略运行器（预留）
+//   - shortEnabled: 做空功能开关（关闭时 ScanShort 直接返回 nil）
+//   - positionDailyDropPct: 持仓当日跌幅提醒阈值(%)，<=0 时用默认 5
+//   - waves: N 形一突/二突日内状态机（跨 5s 周期）
+//   - dbwaves: 双响炮第二波日内确认状态机（跨 5s 周期）
+//   - diagMu: 保护 nDiag 的并发读写
+//   - nDiag: 本轮 N 形候选诊断条目
+//   - momentumPrev: 动量分提升门槛，记录上一轮动量分
+//   - momentumPrevDay: 动量分记录的交易日
+//   - momentumPrevMu: 动量分记录的互斥锁
+//   - d1Boost: D1 软加成配置（C1）
+//   - atrEnabled/atrMult: C4 ATR 动态止损参数
+//   - emotionBlock: C5 情绪周期禁止开仓的阶段列表
+//   - depthFn: 盘口因子获取回调
 type Agent struct {
 	mu           sync.RWMutex           // 读写锁，保护并发访问
 	strategyCfg  *config.StrategyConfig // 策略参数配置（含动量分权重等，可热更新）
@@ -177,7 +252,12 @@ type Agent struct {
 }
 
 // New 创建战法引擎实例。
-// English: creates a new combat engine instance.
+// 初始化 Agent 结构体，创建空的运行器列表和状态机容器。
+// 参数：
+//   - cfg: 策略参数配置，包含动量分权重、止盈止损参数等
+//
+// 返回值：
+//   - 初始化后的 Agent 指针
 func New(cfg *config.StrategyConfig) *Agent {
 	return &Agent{
 		strategyCfg:  cfg,
@@ -189,7 +269,9 @@ func New(cfg *config.StrategyConfig) *Agent {
 }
 
 // SetDepthFactorFn 注入盘口因子获取回调（nil 禁用）。
-// English: injects the order-book factor fetcher (nil disables it).
+// 信号生成后对通过战法的个股拉取一次盘口因子（买卖压力/封单量），供战法与前端共同使用。
+// 参数：
+//   - fn: 盘口因子获取函数，接收股票代码，返回盘口因子
 func (a *Agent) SetDepthFactorFn(fn func(code string) *data.OrderBookFactors) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -198,9 +280,10 @@ func (a *Agent) SetDepthFactorFn(fn func(code string) *data.OrderBookFactors) {
 
 // attachDepthFactors 对信号列表批量附加盘口因子（并发拉取）。
 // 回调未注入或拉取失败时信号保留零值因子，战法/前端均须容忍缺失。
-// English: attaches order-book factors to a batch of signals (fetched concurrently).
-// Signals keep zero-valued factors when the fetcher is unset or fails; strategies and
-// the frontend must tolerate missing factors.
+// 优化：同一代码只拉一次（同一轮多战法命中同股共用因子），避免重复请求。
+//
+// 参数：
+//   - signals: 信号列表，将被原地修改以附加盘口因子
 func (a *Agent) attachDepthFactors(signals []Signal) {
 	if len(signals) == 0 {
 		return
@@ -251,7 +334,8 @@ func (a *Agent) attachDepthFactors(signals []Signal) {
 }
 
 // DrainNDiag 收口并清空本轮 N 形诊断条目（engine 每轮打分后调用并打印）。
-// English: drains and clears this round's N-shape diagnostics (called by engine each scoring round).
+// 返回值：
+//   - 本轮所有 N 形候选诊断条目列表
 func (a *Agent) DrainNDiag() []NDiag {
 	a.diagMu.Lock()
 	defer a.diagMu.Unlock()
@@ -261,7 +345,8 @@ func (a *Agent) DrainNDiag() []NDiag {
 }
 
 // recordNDiag 追加一条 N 形候选诊断（仅 N 形战法路径调用）。
-// English: appends an N-shape candidate diagnostic entry (called only by the N-shape path).
+// 参数：
+//   - d: N 形诊断条目，包含代码、评分、拦截原因等信息
 func (a *Agent) recordNDiag(d NDiag) {
 	a.diagMu.Lock()
 	defer a.diagMu.Unlock()
@@ -269,7 +354,9 @@ func (a *Agent) recordNDiag(d NDiag) {
 }
 
 // SetLaodengConfig 设置 Laodeng 评分配置（线程安全）。
-// English: sets the Laodeng scoring config (thread-safe).
+// Laodeng 评分用于对信号置信度进行修正，基于市盈率、换手率、板块等因素。
+// 参数：
+//   - cfg: Laodeng 评分配置，nil 表示禁用
 func (a *Agent) SetLaodengConfig(cfg *config.LaodengConfig) {
 	a.mu.Lock()
 	a.laodengCfg = cfg
@@ -277,7 +364,10 @@ func (a *Agent) SetLaodengConfig(cfg *config.LaodengConfig) {
 }
 
 // SetD1Config 注入 D1 软加成配置（C1）：负面硬 veto + 高分软加成（线程安全）。
-// English: injects the C1 D1 soft-boost config — negative hard veto + high-score soft boost (thread-safe).
+// 当 D1 分达到加成门槛时，对非 N 战法总分进行软加成，让强事件股越过买入门槛。
+// 负面 D1（Blocked）会硬 veto 该股票。
+// 参数：
+//   - cfg: D1 配置，包含 BoostWeight、BoostThreshold 等参数
 func (a *Agent) SetD1Config(cfg *config.D1Config) {
 	if cfg == nil {
 		return
@@ -287,8 +377,11 @@ func (a *Agent) SetD1Config(cfg *config.D1Config) {
 	a.mu.Unlock()
 }
 
-// SetATRStop 注入 C4 ATR 动态止损参数（线程安全）。enabled=false 时回退固定百分比止损。
-// English: injects the C4 ATR dynamic-stop params (thread-safe); false falls back to fixed percent.
+// SetATRStop 注入 C4 ATR 动态止损参数（线程安全）。
+// enabled=false 时回退固定百分比止损，enabled=true 时使用 ATR 动态止损。
+// 参数：
+//   - enabled: 是否启用 ATR 动态止损
+//   - mult: ATR 倍数（止损距离 = atrMult × ATR）
 func (a *Agent) SetATRStop(enabled bool, mult float64) {
 	a.mu.Lock()
 	a.atrEnabled = enabled
@@ -296,8 +389,10 @@ func (a *Agent) SetATRStop(enabled bool, mult float64) {
 	a.mu.Unlock()
 }
 
-// atrStopParams 读取 ATR 动态止损参数（线程安全）。未启用时 mult=0（回退固定百分比）。
-// English: reads the ATR dynamic-stop params (thread-safe); mult=0 when disabled.
+// atrStopParams 读取 ATR 动态止损参数（线程安全）。
+// 返回值：
+//   - enabled: 是否启用 ATR 动态止损
+//   - mult: ATR 倍数，未启用时为 0（回退固定百分比）
 func (a *Agent) atrStopParams() (enabled bool, mult float64) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -305,15 +400,23 @@ func (a *Agent) atrStopParams() (enabled bool, mult float64) {
 }
 
 // SetEmotionBlockPhases 注入 C5 情绪周期禁止开仓阶段列表（线程安全；nil 回退默认 ["衰退"]）。
-// English: injects the C5 emotion block-buy phase list (thread-safe; nil falls back to ["衰退"]).
+// 当情绪阶段处于禁止列表时，买入信号会降级为 watch（仅观察不交易）。
+// 参数：
+//   - phases: 禁止开仓的情绪阶段列表，nil 或空时回退默认 ["衰退"]
 func (a *Agent) SetEmotionBlockPhases(phases []string) {
 	a.mu.Lock()
 	a.emotionBlock = phases
 	a.mu.Unlock()
 }
 
-// emotionBlocksBuy 判断某情绪阶段是否禁止开仓（C5）。空配置回退默认仅"衰退"。
-// English: reports whether an emotion phase forbids buying (C5); empty config defaults to 衰退 only.
+// emotionBlocksBuy 判断某情绪阶段是否禁止开仓（C5）。
+// 空配置回退默认仅"衰退"阶段禁止开仓。
+// 参数：
+//   - phase: 当前情绪阶段
+//
+// 返回值：
+//   - true: 该阶段禁止开仓
+//   - false: 该阶段允许开仓
 func (a *Agent) emotionBlocksBuy(phase string) bool {
 	if phase == "" {
 		return false
@@ -333,7 +436,9 @@ func (a *Agent) emotionBlocksBuy(phase string) bool {
 }
 
 // SetRunners 设置策略运行器列表（线程安全）。
-// English: sets the strategy runner list (thread-safe).
+// 运行器列表由 NewRunners 工厂函数创建，通过此方法注入 Agent。
+// 参数：
+//   - runners: 策略运行器列表，包含龙头/双响炮/N形/龙回头等战法
 func (a *Agent) SetRunners(runners []StrategyRunner) {
 	a.mu.Lock()
 	a.runners = runners
@@ -341,10 +446,11 @@ func (a *Agent) SetRunners(runners []StrategyRunner) {
 }
 
 // ReloadFactorRules 从战法库 applied_factors.json 重载全部启用规则并注入因子 runner（热生效）。
-// 供战法库的启用/禁用/删除/新增审批后调用，无需重启。若因子 runner 不存在则忽略。
-// English: reloads all enabled rules from the strategy library applied_factors.json and injects them
-// into the factor runner (hot-applied). Call after library mutations (enable/disable/delete/approve);
-// no restart needed. No-op if the factor runner is absent.
+// 供战法库的启用/禁用/删除/新增审批后调用，无需重启。
+// 参数：
+//   - dataDir: 数据目录路径，包含 applied_factors.json 文件
+//
+// 注意：若因子 runner 不存在则忽略，不会影响其他战法。
 func (a *Agent) ReloadFactorRules(dataDir string) {
 	rules, err := research.LoadEnabledFactorRules(dataDir)
 	if err != nil {
@@ -363,7 +469,8 @@ func (a *Agent) ReloadFactorRules(dataDir string) {
 }
 
 // FactorStats 返回因子 runner 的各规则运行统计（效果监测）。
-// English: returns per-rule run stats of the factor runner (effectiveness monitoring).
+// 返回值：
+//   - 因子规则运行统计列表，包含规则 ID、触发次数、胜率等信息
 func (a *Agent) FactorStats() []factorstrat.ActiveRule {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -376,7 +483,10 @@ func (a *Agent) FactorStats() []factorstrat.ActiveRule {
 }
 
 // RecordFactorForwardReturn 记录某条因子规则一条触发股的 Horizon 日前向收益（效果监测）。
-// English: records a rule's Horizon-day forward return for one triggered stock (effectiveness monitoring).
+// 用于评估因子规则的实际收益表现。
+// 参数：
+//   - ruleID: 因子规则 ID
+//   - ret: Horizon 日前向收益率
 func (a *Agent) RecordFactorForwardReturn(ruleID string, ret float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -388,7 +498,8 @@ func (a *Agent) RecordFactorForwardReturn(ruleID string, ret float64) {
 }
 
 // ReloadPatternRules 从形态战法库 applied_patterns.json 重载全部启用规则并注入形态 runner（热生效）。
-// English: reloads all enabled rules from the pattern library and injects them (hot-applied).
+// 参数：
+//   - dataDir: 数据目录路径，包含 applied_patterns.json 文件
 func (a *Agent) ReloadPatternRules(dataDir string) {
 	rules, err := research.LoadEnabledPatternRules(dataDir)
 	if err != nil {
@@ -408,8 +519,8 @@ func (a *Agent) ReloadPatternRules(dataDir string) {
 
 // refreshExitOverrides 重建规则级出场覆盖注册表（§P2-d 实盘接线）。
 // 因子+形态两库合并刷新——注册表是全局单份，单库刷新必须双读，否则会清掉另一侧的覆盖。
-// English: rebuilds the exit-override registry from BOTH libraries (the registry is global;
-// single-side reloads must read both so the other side's overrides survive).
+// 参数：
+//   - dataDir: 数据目录路径
 func (a *Agent) refreshExitOverrides(dataDir string) {
 	fe, e1 := research.ListAppliedFactorRules(dataDir)
 	pe, e2 := research.ListAppliedPatternRules(dataDir)
@@ -430,7 +541,8 @@ func (a *Agent) refreshExitOverrides(dataDir string) {
 }
 
 // PatternStats 返回形态 runner 的各规则运行统计（效果监测）。
-// English: returns per-rule run stats of the pattern runner (effectiveness monitoring).
+// 返回值：
+//   - 形态规则运行统计列表，包含规则 ID、触发次数、胜率等信息
 func (a *Agent) PatternStats() []patternstrat.ActivePattern {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -443,7 +555,9 @@ func (a *Agent) PatternStats() []patternstrat.ActivePattern {
 }
 
 // RecordPatternForwardReturn 记录某条形态规则一条触发股的 Horizon 日前向收益（效果监测）。
-// English: records a pattern rule's Horizon-day forward return for one triggered stock (monitoring).
+// 参数：
+//   - ruleID: 形态规则 ID
+//   - ret: Horizon 日前向收益率
 func (a *Agent) RecordPatternForwardReturn(ruleID string, ret float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -455,7 +569,9 @@ func (a *Agent) RecordPatternForwardReturn(ruleID string, ret float64) {
 }
 
 // SetShortEnabled 设置做空开关（线程安全）。
-// English: sets the short-selling switch (thread-safe).
+// 关闭时 ScanShort 直接返回 nil，开启时执行做空扫描。
+// 参数：
+//   - enabled: 是否启用做空功能
 func (a *Agent) SetShortEnabled(enabled bool) {
 	a.mu.Lock()
 	a.shortEnabled = enabled
@@ -463,7 +579,9 @@ func (a *Agent) SetShortEnabled(enabled bool) {
 }
 
 // SetPositionDailyDropPct 设置持仓当日跌幅提醒阈值(%)（线程安全，<=0 用默认 5）。
-// English: sets the holding daily-drop alert threshold in percent (thread-safe; <=0 falls back to 5).
+// 当持仓当日跌幅超过该阈值时，会产生跌幅提醒信号。
+// 参数：
+//   - pct: 跌幅阈值百分比，<=0 时使用默认值 5
 func (a *Agent) SetPositionDailyDropPct(pct float64) {
 	a.mu.Lock()
 	a.positionDailyDropPct = pct
@@ -471,7 +589,8 @@ func (a *Agent) SetPositionDailyDropPct(pct float64) {
 }
 
 // PositionDailyDropPct 返回持仓当日跌幅提醒阈值(%)（线程安全；<=0 表示使用默认 5）。
-// English: returns the holding daily-drop alert threshold in percent (thread-safe; <=0 means the default 5 applies).
+// 返回值：
+//   - 当前的跌幅提醒阈值百分比
 func (a *Agent) PositionDailyDropPct() float64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -479,7 +598,9 @@ func (a *Agent) PositionDailyDropPct() float64 {
 }
 
 // ShortEnabled 返回当前做空是否启用（线程安全）。
-// English: reports whether short-selling is currently enabled (thread-safe).
+// 返回值：
+//   - true: 做空功能已启用
+//   - false: 做空功能已禁用
 func (a *Agent) ShortEnabled() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -487,7 +608,9 @@ func (a *Agent) ShortEnabled() bool {
 }
 
 // HotReload 热更新策略参数（线程安全）。
-// English: hot-reloads strategy parameters (thread-safe).
+// 当配置文件变更时，由 loader.go 调用此方法更新策略参数，无需重启进程。
+// 参数：
+//   - newCfg: 新的策略参数配置
 func (a *Agent) HotReload(newCfg *config.StrategyConfig) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -496,23 +619,26 @@ func (a *Agent) HotReload(newCfg *config.StrategyConfig) {
 }
 
 // seqID 生成全局唯一信号 ID，格式：SIG + 纳秒时间戳。
-// English: generates a globally unique signal ID, formatted as SIG + nanosecond timestamp.
+// 返回值：
+//   - 全局唯一信号 ID 字符串
 func seqID() string {
 	return fmt.Sprintf("SIG%d", time.Now().UnixNano())
 }
 
 // applyLaodengToSignals §R4-5 修复：对单只股票的信号应用 Laodeng 置信度修正（上限 1.0）。
-// 旧实现（applyLaodeng）对全量信号喂硬编码模拟值（市值600亿/PE12/换手2.5/白酒），
-// 等于给所有信号乘同一个常数，不具备任何选股信息。现接真实数据逐股计算：
-//   - pe：引擎打分池预取的市盈率（evalAll 入参）；
-//   - turnover：实时快照换手率（md.Quote.Turnover，%）；
-//   - sector：真实板块名（板块路径）或 "个股"（个股直入，科技加权自然不命中，保守）；
-//   - 市值：数据源缺失传 0，ScoreLaodeng 跳过该维度并归一化剩余权重（见 strategy/laodeng.go）。
+// 旧实现对全量信号喂硬编码模拟值，不具备任何选股信息。现接真实数据逐股计算：
+//   - pe: 引擎打分池预取的市盈率
+//   - turnover: 实时快照换手率
+//   - sector: 真实板块名或 "个股"
+//   - 市值: 数据源缺失传 0，ScoreLaodeng 跳过该维度并归一化剩余权重
 //
-// 未配置/未启用/无信号时原地不动。English: §R4-5 — applies the Laodeng confidence correction
-// per stock with REAL inputs (pool PE, live turnover, real sector name; market cap unknown → 0
-// and ScoreLaodeng renormalizes the remaining dimensions). The old stub fed one hardcoded tuple
-// to every signal, i.e. a constant multiplier with zero stock-discriminating information.
+// 未配置/未启用/无信号时原地不动。
+//
+// 参数：
+//   - sigs: 信号列表，将被原地修改置信度
+//   - md: 行情数据快照
+//   - pe: 个股动态市盈率
+//   - sectorName: 板块名称
 func (a *Agent) applyLaodengToSignals(sigs []Signal, md *strategy_engine.StockMarketData, pe float64, sectorName string) {
 	a.mu.RLock()
 	cfg := a.laodengCfg
@@ -539,9 +665,17 @@ func (a *Agent) applyLaodengToSignals(sigs []Signal, md *strategy_engine.StockMa
 
 // ScanLong 执行做多扫描：7a 板块利好→验证后个股→8a；8a 个股利好→直入战法。
 // 返回做多信号列表，若输入的板块/个股为空或无可运行策略则返回 nil。
-// 入参 input 含已验证板块（Sectors）、个股直入列表（IndividualStocks）、行情与 D1/L1 过滤结果。
-// English: runs the long scan — 7a verified bull sectors -> 8a stocks, and 8a stocks directly into the
-// strategies. Returns the long signal list, or nil when inputs are empty or no runner exists.
+//
+// 扫描流程：
+//   1. 遍历已验证的利好板块，对板块内每只个股执行评分
+//   2. 遍历个股直入列表，对每只个股执行评分
+//   3. 对最终信号批量附加盘口因子
+//
+// 参数：
+//   - input: 扫描输入，包含已验证板块、行情数据、D1评分等信息
+//
+// 返回值：
+//   - 做多信号列表，为空时表示无信号
 func (a *Agent) ScanLong(input ScanInput) []Signal {
 	a.mu.RLock()
 	runners := a.runners
@@ -596,12 +730,32 @@ func (a *Agent) ScanLong(input ScanInput) []Signal {
 
 // evalAll 对单只股票跑全部战法评分：无论 Pass 与否都记录原始分到 input.Scores
 // （8a/8b 持续打分），只对通过的战法生成信号并返回。这是 8a/8b 打分与信号输出的统一入口。
-// 入参 sector 为板块上下文（nil 表示个股直入），direction 为做多/做空，
-// now 用于统一信号的生成时间。返回本次评分为该股生成的信号列表。
-// English: runs all strategies on one stock, recording raw scores into input.Scores regardless of
-// pass/fail (8a/8b persistent scoring) and returning signals only for passed strategies. It is the
-// unified 8a/8b scoring and signal-output entry; sector is the sector context (nil for direct input),
-// direction is long/short, and now timestamps all produced signals.
+//
+// 核心流程：
+//   1. ST 个股屏蔽：名称以 ST/*ST/S*ST/退 开头的股票不产生任何信号
+//   2. 提取 D1 评分、事件描述、PE 等共享数据
+//   3. 并发调用各战法评分（龙头/双响炮/N形/龙回头）
+//   4. 对通过的战法生成信号，未通过的记录原因
+//   5. 处理 N 形一突/二突日内状态机
+//   6. 处理双响炮第二波日内确认
+//   7. 应用动量分提升门槛
+//   8. 应用情绪周期过滤
+//   9. 应用宏观利空门控
+//   10. 附加盘口因子
+//   11. 应用 Laodeng 置信度修正
+//
+// 参数：
+//   - input: 扫描输入（包含行情数据、D1评分等）
+//   - runners: 策略运行器列表
+//   - code: 股票代码
+//   - md: 行情数据快照
+//   - sector: 板块上下文（nil 表示个股直入）
+//   - direction: 方向（做多/做空）
+//   - sectorName: 板块名称
+//   - now: 当前时间（统一信号生成时间）
+//
+// 返回值：
+//   - 该股票本轮生成的信号列表
 func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, direction, sectorName string, now time.Time) []Signal {
 	// 无可运行策略或行情数据缺失 → 无法评分
 	// English: no runner or missing market data → cannot score.
@@ -1000,13 +1154,16 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 // ScorePool 近实时 8a/8b 持续打分入口：对打分池（持仓+自选）逐只执行四战法评分 + 动量分，
 // 无论是否通过都记录原始分；Pass 的战法生成信号返回（由调用方决定是否广播）。
 // 与 ScanLong/ScanShort 共用 evalAll，保证打分口径一致。
-// 入参 codes 为打分池代码列表，md 为行情映射，d1Scores 为最近一轮 D1 评分缓存
-// （主循环产出，近实时循环复用，不每 5s 调 LLM），emotionPhase 供 N 形情绪硬闸使用。
-// 返回 scores（code → 各战法原始分）与 sigs（本轮通过战法产生的信号）。
-// English: near-realtime 8a/8b persistent scoring entry — scores every code in the pool (positions +
-// watchlist) with the four strategies plus momentum, recording raw scores regardless of pass/fail and
-// returning signals for passed ones (broadcast decision is left to the caller). Reuses evalAll for a
-// consistent scoring basis; d1Scores is a cached round from the main loop (reused, no per-5s LLM call).
+//
+// 参数：
+//   - codes: 打分池代码列表（持仓+自选）
+//   - md: 行情数据映射（code → 行情快照）
+//   - d1Scores: 最近一轮 D1 评分缓存（主循环产出，近实时循环复用）
+//   - emotionPhase: 情绪阶段，供 N 形情绪硬闸使用
+//
+// 返回值：
+//   - scores: 打分结果映射（code → 各战法原始分）
+//   - sigs: 本轮通过战法产生的信号列表
 func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMarketData, d1Scores map[string]D1Score, emotionPhase string) (map[string]StockScores, []Signal) {
 	a.mu.RLock()
 	runners := a.runners
@@ -1035,8 +1192,9 @@ func (a *Agent) ScorePool(codes []string, md map[string]*strategy_engine.StockMa
 }
 
 // momentumWeights 读取动量分权重配置（nil 防护，缺省回退 40/30/30）。
-// 返回量价/ MACD /走势三者的权重配置，供 MomentumScore 使用。
-// English: reads the momentum weight config (nil-safe, defaults to 40/30/30) for MomentumScore.
+// 返回量价/MACD/走势三者的权重配置，供 MomentumScore 使用。
+// 返回值：
+//   - 动量分权重配置，包含量价权重、MACD权重、走势权重等
 func (a *Agent) momentumWeights() config.MomentumConfig {
 	a.mu.RLock()
 	cfg := a.strategyCfg
@@ -1049,7 +1207,9 @@ func (a *Agent) momentumWeights() config.MomentumConfig {
 }
 
 // momentumSignalThreshold 读取动量分触发信号的阈值（默认 60）。
-// English: reads the momentum signal threshold (defaults to 60).
+// 当动量分达到该阈值时，会产生动量信号（watch 或 buy）。
+// 返回值：
+//   - 动量分触发阈值
 func (a *Agent) momentumSignalThreshold() float64 {
 	w := a.momentumWeights()
 	if w.SignalThreshold <= 0 {
@@ -1059,9 +1219,9 @@ func (a *Agent) momentumSignalThreshold() float64 {
 }
 
 // momentumBuySignalThreshold 读取动量买入阈值（默认 75，且不低于 watch 阈值）。
-// §动量入模拟盘：≥此值发 buy 级信号进模拟盘动量池自动撮合；≤0 回退默认。
-// English: reads the momentum BUY threshold (default 75, never below the watch threshold; <=0 falls
-// back). At/above it a buy signal is emitted and auto-filled into the paper momentum pool.
+// 当动量分达到该阈值时，会产生 buy 级信号进入模拟盘动量池自动撮合。
+// 返回值：
+//   - 动量买入阈值
 func (a *Agent) momentumBuySignalThreshold() float64 {
 	w := a.momentumWeights()
 	if w.BuySignalThreshold <= 0 {
@@ -1075,15 +1235,18 @@ func (a *Agent) momentumBuySignalThreshold() float64 {
 
 // momentumGateEnabled 读取动量分"提升才提醒"门槛开关（默认开）。
 // 开关经前端 Settings 动量分组切换，随策略配置热更新即时生效。
-// English: reads the momentum "improvement-only" gate switch (default on). Toggled from the frontend
-// Settings momentum group and hot-reloaded live.
+// 返回值：
+//   - true: 启用动量提升门槛
+//   - false: 禁用动量提升门槛
 func (a *Agent) momentumGateEnabled() bool {
 	w := a.momentumWeights()
 	return w.MomentumGateEnabled
 }
 
 // momentumDeltaTol 读取动量分回落容忍差（默认 5）。
-// English: reads the momentum delta tolerance (default 5).
+// 当动量分回落幅度小于该值时，仍视为"未明显回落"，允许信号产生。
+// 返回值：
+//   - 动量分回落容忍差
 func (a *Agent) momentumDeltaTol() float64 {
 	w := a.momentumWeights()
 	if w.MomentumDeltaTol <= 0 {
@@ -1093,7 +1256,8 @@ func (a *Agent) momentumDeltaTol() float64 {
 }
 
 // doubleBumpConfig 读取双响炮配置（nil 防护，回退零值结构）。
-// English: reads the Double-Bump config (nil-safe, falls back to a zero struct).
+// 返回值：
+//   - 双响炮战法配置
 func (a *Agent) doubleBumpConfig() config.DoubleBumpConfig {
 	a.mu.RLock()
 	cfg := a.strategyCfg
@@ -1108,16 +1272,15 @@ func (a *Agent) doubleBumpConfig() config.DoubleBumpConfig {
 // 总分 ×(1+BoostWeight×D1/40)（封顶 100），并按各战法自身门槛重判 pass/level，
 // 让强事件股（如高确定性研报）跨越买入阈值。原始总分写入 Details["d1_raw"]，
 // 加成量写入 Details["d1_boost"]（前端可见，透明可追溯）。N 形战法有独立 D1 硬闸，不叠加。
-// English: applies the C1 D1 soft boost to a non-N strategy evaluation — when the D1 score is at or
-// above BoostThreshold the total is scaled by (1+BoostWeight×D1/40), capped at 100, then pass/level are
-// re-derived from each strategy's own thresholds so strong-event stocks clear their buy gate. The raw
-// total and boost delta are recorded in Details["d1_raw"]/["d1_boost"] for transparency. N-shape keeps
-// its own independent D1 hard gate and is skipped.
-// applyD1Boost §W5-v3 标注化改造（owner 口径：LLM 不参与非 N 战法信号产生）：
+//
+// §W5-v3 标注化改造（owner 口径：LLM 不参与非 N 战法信号产生）：
 // 只把"D1 参考分/旧公式理论加成值"写入 Details 供前端展示，绝不修改 TotalScore/Pass/Level——
 // 信号的观察与买入级别完全由原始量价分数决定。函数名保留以减少调用方改动。
-// English: §W5-v3 annotation-only — records the reference D1 score / theoretical boost into Details
-// for display; never mutates TotalScore/Pass/Level, so raw price-volume scores alone decide levels.
+//
+// 参数：
+//   - t: 策略类型
+//   - eval: 策略评分结果，将被原地修改
+//   - d1: D1 评分结果
 func (a *Agent) applyD1Boost(t strategy.SignalType, eval *strategy.Evaluation, d1 *D1Score) {
 	a.mu.RLock()
 	cfg := a.d1Boost
@@ -1139,12 +1302,15 @@ func (a *Agent) applyD1Boost(t strategy.SignalType, eval *strategy.Evaluation, d
 }
 
 // d1BoostTiers 返回非 N 战法的级别重判函数，门槛与 strategies/* 评分实现保持一致：
-//   - dragon / double_bump：≥60 full_chain(买入，放宽层级统一到60)，≥50 brief(观察)
-//   - dragon_return：≥85 accelerate，≥75 main，≥60 first（P1/P2/P3_5）
+//   - dragon / double_bump：≥60 full_chain(买入)，≥50 brief(观察)
+//   - dragon_return：≥85 accelerate，≥75 main，≥60 first
 //
-// English: returns the level re-derivation for non-N strategies, matching the thresholds in
-// strategies/*: dragon/double-bump ≥60 full_chain (buy, relaxed to 60) / ≥50 brief (watch);
-// dragon-return ≥85 accelerate / ≥75 main / ≥60 first (P1/P2/P3_5).
+// 参数：
+//   - t: 策略类型
+//
+// 返回值：
+//   - levelFn: 级别重判函数，接收评分返回（级别，是否通过）
+//   - ok: 是否支持该策略类型的级别重判
 func d1BoostTiers(t strategy.SignalType) (func(score float64) (string, bool), bool) {
 	switch t {
 	case strategy.SignalDragon, strategy.SignalDoubleBump:
@@ -1175,15 +1341,24 @@ func d1BoostTiers(t strategy.SignalType) (func(score float64) (string, bool), bo
 }
 
 // mdEmpty 判断行情快照是否为空（nil 或缺现价）。
-// English: reports whether the market snapshot is empty (nil or missing live price).
+// 参数：
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - true: 行情数据无效
+//   - false: 行情数据有效
 func mdEmpty(md *strategy_engine.StockMarketData) bool {
 	return md == nil || md.Price <= 0
 }
 
 // momentumPrevious 读取该股上一轮动量分（跨交易日隔离出重置）。
 // 返回（上一轮动量分, 是否已有记录）。
-// English: returns the prior round's momentum score for the code (isolated per trading day).
-// Returns (prior score, whether a record exists).
+// 参数：
+//   - code: 股票代码
+//
+// 返回值：
+//   - 上一轮动量分
+//   - 是否已有记录
 func (a *Agent) momentumPrevious(code string) (float64, bool) {
 	a.momentumPrevMu.Lock()
 	defer a.momentumPrevMu.Unlock()
@@ -1200,7 +1375,9 @@ func (a *Agent) momentumPrevious(code string) (float64, bool) {
 }
 
 // momentumRecord 记录该股本轮动量分（供下一轮提升门槛比较）。
-// English: records this round's momentum score for the code (for the next round's improvement gate).
+// 参数：
+//   - code: 股票代码
+//   - score: 本轮动量分
 func (a *Agent) momentumRecord(code string, score float64) {
 	a.momentumPrevMu.Lock()
 	defer a.momentumPrevMu.Unlock()
@@ -1212,11 +1389,17 @@ func (a *Agent) momentumRecord(code string, score float64) {
 	a.momentumPrev[code] = score
 }
 
-// momentumImproved 判断动量分相对上一轮是否"提升/未明显回落"（当前 ≥ 上一轮 − 容忍差）。
-// hasPrev 为 true 且未达到该条件时返回 false（应被门槛拦截）；无上一轮记录或数据无效时放行。
-// English: reports whether the current momentum score improved (or fell within tolerance) vs the prior
-// round (current >= prior - tolerance). Returns false only when a prior record exists and the condition
-// fails; missing prior history or invalid data always passes.
+// momentumImproved 判断动量分相对上一轮是否"提升/未明显回落"。
+// 当前 ≥ 上一轮 − 容忍差 时视为未明显回落。
+//
+// 参数：
+//   - code: 股票代码
+//   - cur: 当前动量分
+//   - valid: 动量数据是否有效
+//
+// 返回值：
+//   - true: 动量分提升或未明显回落（或无上一轮记录）
+//   - false: 动量分明显回落
 func (a *Agent) momentumImproved(code string, cur float64, valid bool) bool {
 	// 动量数据无效（竞价/盘前 Volume=0 等）→ 跳过门槛放行
 	// English: invalid momentum data (auction/pre-open Volume=0) -> skip the gate and let it through.
@@ -1232,8 +1415,16 @@ func (a *Agent) momentumImproved(code string, cur float64, valid bool) bool {
 	return cur >= prev-a.momentumDeltaTol()
 }
 
-// strategyDataInsufficient 判断某战法类型的输入数据是否不足（不足时得分 0 不代表真实 0 分）。
-// English: reports whether a strategy's input data is insufficient (a 0 score then does not mean a real 0).
+// strategyDataInsufficient 判断某战法类型的输入数据是否不足。
+// 不足时得分 0 不代表真实 0 分，而是数据缺失导致的降级。
+//
+// 参数：
+//   - t: 策略类型
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - true: 数据不足，评分降级为 0
+//   - false: 数据充足，评分真实
 func strategyDataInsufficient(t strategy.SignalType, md *strategy_engine.StockMarketData) bool {
 	if md == nil {
 		return true
@@ -1258,8 +1449,13 @@ func strategyDataInsufficient(t strategy.SignalType, md *strategy_engine.StockMa
 
 // IsSTStock 判断个股是否为风险警示/退市整理股票（ST / *ST / S*ST / SST / 退 开头）。
 // 用于战法信号层屏蔽：此类股票不产生交易/提醒信号。
-// English: reports whether a stock is risk-warning or delisting (prefixed ST / *ST / S*ST / SST / 退);
-// used to suppress trade/alert signals for such stocks.
+//
+// 参数：
+//   - name: 股票名称
+//
+// 返回值：
+//   - true: 是 ST/退市股票
+//   - false: 不是 ST/退市股票
 func IsSTStock(name string) bool {
 	n := strings.TrimSpace(name)
 	if n == "" {
@@ -1281,13 +1477,25 @@ func IsSTStock(name string) bool {
 }
 
 // isCJK 判断 rune 是否中文字符（基本区 \u4e00-\u9fff 起始范围，含扩展容纳常用名）。
-// English: reports whether a rune is a CJK ideograph (main block \u4e00-\u9fff onwards).
+// 参数：
+//   - r: 待判断的 rune
+//
+// 返回值：
+//   - true: 是中文字符
+//   - false: 不是中文字符
 func isCJK(r rune) bool {
 	return r >= 0x4e00 && r <= 0x9fff
 }
 
-// momentumDataValid 判断动量分所需数据是否完整（量价 + 走势 + MACD 任一缺失即视为不完整）。
-// English: reports whether momentum data is complete (missing any of volume-price, trend, or MACD).
+// momentumDataValid 判断动量分所需数据是否完整。
+// 量价 + 走势 + MACD 任一缺失即视为不完整。
+//
+// 参数：
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - true: 动量数据完整
+//   - false: 动量数据不完整
 func momentumDataValid(md *strategy_engine.StockMarketData) bool {
 	if md == nil || md.Quote == nil {
 		return false
@@ -1302,8 +1510,10 @@ func momentumDataValid(md *strategy_engine.StockMarketData) bool {
 }
 
 // markDataGap 记录某战法因数据不足而降级的数据缺口，供前端区分真实 0 分与无数据。
-// English: records a data-gap marker when a strategy is degraded due to insufficient data, letting the
-// frontend distinguish a real 0 from missing data.
+// 参数：
+//   - sc: 股票评分结果，将被原地修改
+//   - t: 策略类型
+//   - md: 行情数据快照
 func markDataGap(sc *StockScores, t strategy.SignalType, md *strategy_engine.StockMarketData) {
 	if sc.DataGaps == nil {
 		sc.DataGaps = make(map[string]bool)
@@ -1314,9 +1524,18 @@ func markDataGap(sc *StockScores, t strategy.SignalType, md *strategy_engine.Sto
 // ScanShort 执行做空扫描：7b 板块利空→验证后个股→8b；8b 个股利空→直入战法（反向信号）。
 // 仅当做空开关启用时执行，否则返回 nil。
 // 流程与 ScanLong 对称：方向字段标记为"做空"，供上层做反向处理。
-// English: runs the short scan — 7b bear sectors -> 8b stocks, and 8b stocks directly into the strategies
-// (inverted signals). Only runs when short-selling is enabled, otherwise nil; mirrors ScanLong with the
-// direction marked "做空" for upstream inversion.
+//
+// 扫描流程：
+//   1. 检查做空开关，关闭则直接返回
+//   2. 遍历已验证的利空板块，对板块内每只个股执行评分
+//   3. 遍历个股直入列表，对每只个股执行评分
+//   4. 对最终信号批量附加盘口因子
+//
+// 参数：
+//   - input: 扫描输入，包含已验证板块、行情数据、D1评分等信息
+//
+// 返回值：
+//   - 做空信号列表，为空时表示无信号
 func (a *Agent) ScanShort(input ScanInput) []Signal {
 	// 做空开关关闭 → 直接返回，不做任何做空扫描
 	// English: short-selling disabled → return immediately without scanning.
@@ -1377,19 +1596,22 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 
 // CheckPositionAlerts 检查所有持仓的止盈止损条件，返回需要提醒的信号列表。
 // 根据实时行情价格计算盈亏比例，触发止盈/止损阈值时生成提醒信号。
-// 入参 rpt 提供持仓明细，marketAPI 提供实时报价，scores 为当轮做多打分表（SignalActive=该股做多信号），
-// bearHit 为客置参数：该股本轮命中利空板块/利空个股的 code→true 映射（即"做空/利空信号"）。
 //
-// 止盈/止损按持仓方向看对应信号（跟 N 形/动量一致，做空则镜像反）：
-//   - 做多止盈：仍有做多信号 → 继续持有(降级提示)；无 → 硬止盈。
-//   - 做多止损：出现做空/利空信号 → 硬止损；未出现 → 可能洗盘，降级提示观察。
-//   - 做空止盈：仍有做空/利空信号 → 继续持有(降级提示)；无 → 硬止盈。
-//   - 做空止损：出现做多/利好信号 → 硬止损；未出现 → 降级提示观察。
+// 决策逻辑（按持仓方向）：
+//   - 做多止盈：仍有做多信号 → 继续持有(降级提示)；无 → 硬止盈
+//   - 做多止损：出现做空/利空信号 → 硬止损；未出现 → 可能洗盘，降级提示观察
+//   - 做空止盈：仍有做空/利空信号 → 继续持有(降级提示)；无 → 硬止盈
+//   - 做空止损：出现做多/利好信号 → 硬止损；未出现 → 降级提示观察
 //
-// English: checks take-profit/stop-loss conditions on all positions and returns alert signals, computed
-// from the realtime quote P/L vs thresholds. The decision depends on the position direction and current
-// same-direction signals: for longs, a live bull signal downgrades take-profit to a keep/watch hint while
-// a bear signal forces stop-loss; shorts mirror the logic with inverted signal meanings.
+// 参数：
+//   - rpt: 持仓报告，提供持仓明细
+//   - marketAPI: 市场数据 API，提供实时报价
+//   - quotes: 实时报价快照（code → 报价）
+//   - scores: 当轮做多打分表（SignalActive=该股做多信号）
+//   - bearHit: 客置参数：该股本轮命中利空板块/利空个股的 code→true 映射
+//
+// 返回值：
+//   - 提醒信号列表（止盈/止损/跌幅提醒）
 func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAPI, quotes map[string]*data.StockInfo, scores map[string]StockScores, bearHit ...map[string]bool) []Signal {
 	positions := rpt.HeldPositions()
 	if len(positions) == 0 {
@@ -1556,9 +1778,12 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 // Scan 通用扫描入口（不区分方向），对输入板块的每只股票逐策略评估打分。
 // 方向直接沿用板块本身的 Direction（利好/利空），不做做多/做空分流。
 // 返回所有通过策略评估的信号。
-// English: generic scan entry (direction-agnostic) scoring every stock in the input sectors; the signal
-// direction simply follows each sector's own Direction without long/short routing. Returns all signals
-// that passed strategy evaluation.
+//
+// 参数：
+//   - input: 扫描输入，包含已验证板块、行情数据、D1评分等信息
+//
+// 返回值：
+//   - 信号列表，为空时表示无信号
 func (a *Agent) Scan(input ScanInput) []Signal {
 	a.mu.RLock()
 	runners := a.runners

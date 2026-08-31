@@ -160,7 +160,7 @@ func (s *Server) qmtCtrlFor(userID string) *trading.Controller {
 // handleRealPositions 返回实盘持仓（real_positions，含建议徽标由前端按 advice 叠加）。
 // GET /api/positions/real
 func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
-	db := s.researchDB
+	db := s.realDB()
 	if db == nil {
 		// §白板修复：此前 writeError(w, 200, …) 返回 HTTP 200 + {"error":…}——前端 request()
 		// 只把非 2xx 当失败，成功路径把 {error} 塞给模板渲染 undefined 属性直接白屏。
@@ -211,7 +211,7 @@ func (s *Server) handleRealAdvice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "engine not available")
 		return
 	}
-	db := s.researchDB
+	db := s.realDB()
 	if db == nil {
 		writeError(w, http.StatusServiceUnavailable, "real book not available")
 		return
@@ -279,7 +279,7 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	}
 	// 卖出侧校验：减仓数量不得超过当前持仓
 	if side == trading.SideSell {
-		if db := s.researchDB; db != nil {
+		if db := s.realDB(); db != nil {
 			if p, err := db.RealPositionByCodeForUser(uid, normalizeTsCode(req.Code)); err == nil && p.Qty > 0 && qty > p.Qty {
 				writeError(w, 400, "sell qty exceeds holding")
 				return
@@ -361,7 +361,7 @@ func normalizeReportSide(raw string) (string, error) {
 
 func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
-	db := s.researchDB
+	db := s.realDB()
 	if db == nil {
 		writeError(w, 500, "real book not available")
 		return
@@ -831,7 +831,7 @@ func qmtStrategyOf(signalID string) string {
 // unrealized from the live book) and per-strategy attribution feeding the research flywheel.
 func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
-	db := s.researchDB
+	db := s.realDB()
 	if db == nil {
 		// §白板修复：同 handleRealPositions——200+{"error"} 会让前端把错误体当成功数据
 		// 渲染（trades.summary 为 undefined → TypeError → 整页白屏）。改 503 走前端失败分支。

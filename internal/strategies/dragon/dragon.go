@@ -1,7 +1,12 @@
 // Package dragon 实现破局龙战法（Dragon Strategy）。
 //
-// 市场模式：寻找板块内最先涨停的龙头股，在首次分歧/炸板后的回封或弱转强时介入。
-// 核心逻辑：龙头股在首次封板后可能出现开板分歧，若回封成功则二次介入机会。
+// 本包实现了破局龙战法，这是一种超短线策略，核心思想是：
+// 寻找板块内最先涨停的龙头股，在首次分歧/炸板后的回封或弱转强时介入。
+//
+// 市场模式：
+//   - 龙头股在首次封板后可能出现开板分歧
+//   - 若回封成功则构成二次介入机会
+//   - 板块效应是龙头溢价的基础
 //
 // 四维评分体系（F1~F4）：
 //
@@ -42,25 +47,37 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// DragonStrategy 破局龙战法策略结构。（DragonStrategy is the Dragon strategy struct.）
-// 使用 F1~F4 四维评分判断龙头股封板质量和参与机会。（Scores sector-leader seal quality via F1~F4.）
+// DragonStrategy 破局龙战法策略结构。
+// 使用 F1~F4 四维评分判断龙头股封板质量和参与机会。
+// 这是一个超短线策略，专注于捕捉龙头股的二次介入机会。
+//
+// （DragonStrategy is the Dragon strategy struct.）
 type DragonStrategy struct {
 	cfg    *config.Manager // 配置管理器（热加载 DragonConfig）（Config manager, hot-reloads DragonConfig）
 	userID string          // 账号 ID：非空时按该账号的策略配置读取，否则回退全局（Account ID: per-account strategy config when set, else global）
 }
 
-// New 创建破局龙战法策略实例。（New creates a Dragon strategy instance.）
+// New 创建破局龙战法策略实例。
+// 初始化策略配置，返回可直接使用的策略实例。
+//
+// （New creates a Dragon strategy instance.）
 func New(cfg *config.Manager) *DragonStrategy {
 	return &DragonStrategy{cfg: cfg}
 }
 
-// SetUserID 设置账号 ID（多账号独立引擎时，各账号 runner 按本账号配置读取）。
+// SetUserID 设置账号 ID。
+// 在多账号独立引擎场景下，各账号 runner 按本账号配置读取策略参数。
+// 这允许不同账号使用不同的策略配置。
+//
 // English: sets the account ID so a per-account engine's runner reads that account's config.
 func (d *DragonStrategy) SetUserID(userID string) {
 	d.userID = userID
 }
 
-// strategyCfg 返回当前账号的破局龙配置（账号级覆盖优先，否则全局）。
+// strategyCfg 返回当前账号的破局龙配置。
+// 优先使用账号级配置，若未设置则回退到全局配置。
+// 这种设计支持多账号独立配置策略参数。
+//
 // English: returns the Dragon config for the current account (account override wins, else global).
 func (d *DragonStrategy) strategyCfg() config.DragonConfig {
 	if d.userID != "" && d.cfg != nil {
@@ -72,29 +89,49 @@ func (d *DragonStrategy) strategyCfg() config.DragonConfig {
 	return config.DragonConfig{}
 }
 
-// Name 返回策略中文名称"破局龙战法"。（Name returns the strategy display name "破局龙战法".）
+// Name 返回策略中文名称"破局龙战法"。
+// 用于日志输出和前端展示。
+//
+// （Name returns the strategy display name "破局龙战法".）
 func (d *DragonStrategy) Name() string {
 	return "破局龙战法"
 }
 
-// Type 返回信号类型标识 SignalDragon。（Type returns the signal type SignalDragon.）
+// Type 返回信号类型标识 SignalDragon。
+// 用于信号分类和去重。
+//
+// （Type returns the signal type SignalDragon.）
 func (d *DragonStrategy) Type() strategy.SignalType {
 	return strategy.SignalDragon
 }
 
-// Evaluate 标准接口（占位）。实际使用 EvaluateReal 传入结构化数据。（Standard interface stub; real scoring uses EvaluateReal.）
+// Evaluate 标准接口（占位）。
+// 实际使用 EvaluateReal 传入结构化数据，这个方法仅作为 Strategy 接口的占位实现。
+// 返回空结果，表示无数据可评分。
+//
+// （Standard interface stub; real scoring uses EvaluateReal.）
 func (d *DragonStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{Pass: false, Level: "nodata", Confidence: 0}, nil
 }
 
-// EvaluateReal 执行破局龙战法核心评分。（EvaluateReal runs the core Dragon scoring.）
-// 输入：si（个股实时信息，含价格/涨幅/成交量）、kLines（日K线，用于RS趋势）、
-// sectors（板块信息列表，用于板块共振判断）。
+// EvaluateReal 执行破局龙战法核心评分。
+// 这是破局龙战法的核心评分函数，实现F1~F4四维评分体系。
 //
-// F1 封板质量：涨幅 >9.5% 即视为触及涨停，用成交量/成交额比例衡量封板力度。
-// F2 板块共振：取所有板块最大涨幅。
-// F3 溢价率：个股涨幅超出板块最强涨幅 2%+ 说明辨识度突出。
-// F4 RS 强度：近 5 日趋势涨幅。
+// 输入参数：
+//   - code: 股票代码
+//   - si: 个股实时信息（含价格/涨幅/成交量）
+//   - kLines: 日K线数据（用于RS趋势计算）
+//   - sectors: 板块信息列表（用于板块共振判断）
+//
+// 评分维度：
+//   - F1 封板质量：涨幅 >9.5% 即视为触及涨停，用成交量/成交额比例衡量封板力度
+//   - F2 板块共振：取所有板块最大涨幅
+//   - F3 溢价率：个股涨幅超出板块最强涨幅 2%+ 说明辨识度突出
+//   - F4 RS 强度：近 5 日趋势涨幅
+//
+// 返回值：
+//   - nil: 数据不足无法评分
+//   - *Evaluation: 评分结果，包含总分、各维度分数、是否通过等
 //
 // （English: Inputs are si (realtime info), kLines (daily bars for RS trend) and sectors (for resonance). Scores the
 // seal quality F1, sector resonance F2, premium F3 and 5-day RS strength F4.）
@@ -179,9 +216,15 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	}
 }
 
-// GenerateSignal 将评分结果转化为交易信号。（GenerateSignal converts an evaluation into a trade signal.）
-// full_chain → buy，置信度>0.8 → P1，否则 P2。（full_chain→buy; confidence>0.8→P1 otherwise P2.）
-// brief → watch，P3_5。（brief→watch with priority P3_5.）
+// GenerateSignal 将评分结果转化为交易信号。
+// 根据评估结果的Level字段决定交易动作和优先级：
+//   - full_chain: 买入信号，按置信度分P1/P2
+//   - brief: 观察信号，P3_5优先级
+//   - 其他: 默认观察
+//
+// 信号生成后，会将评分明细复制到Meta字段，供前端展示F1~F4分数。
+//
+// （GenerateSignal converts an evaluation into a trade signal.）
 func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) (*strategy.Signal, error) {
 	// 默认：仅观察（watch / P3）（Default: watch only with P3）
 	prio := strategy.P3
@@ -218,8 +261,14 @@ func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 	}, nil
 }
 
-// BuyPoints 返回四类买点对应的权重映射。（BuyPoints returns weight mappings for the four buy-point categories.）
-// 用于仓位管理和分段建仓决策。（Used for position sizing and staged entry decisions.）
+// BuyPoints 返回四类买点对应的权重映射。
+// 用于仓位管理和分段建仓决策，不同买点对应不同的建仓策略：
+//   - P1_first_to_second: 首封→二封（F1+F2高分时）
+//   - P2_divergence: 分歧转一致（F3高分时）
+//   - P3_weak_to_strong: 弱转强（F4高分时）
+//   - P4_pullback: 回调低吸（PullbackMaxPct配置）
+//
+// （BuyPoints returns weight mappings for the four buy-point categories.）
 func (d *DragonStrategy) BuyPoints(cfg config.DragonConfig) map[string]float64 {
 	return map[string]float64{
 		"P1_first_to_second": cfg.F1SealWeight + cfg.F2ResonanceWeight, // 首封→二封（First seal → second seal）

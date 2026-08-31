@@ -1,5 +1,7 @@
 // Package n_shape scorer — N 形超短策略 D1~D4 评分核心。
 //
+// 本文件实现了N形超短策略的核心评分逻辑，包含D1~D4四维评分体系：
+//
 // 评分体系总分 100，由四个维度加权组成：
 //
 //   - D1 事件驱动（40分）：事件驱动匹配。
@@ -70,16 +72,19 @@ const (
 // "衰退"阶段禁止任何开仓操作。（Emotion hard-block: "衰退" (recession) forbids any position opening.）
 var emotionHardBlock = map[string]bool{"衰退": true}
 
-// PriorityResult 时间优先级计算结果。（PriorityResult is the time-priority computation result.）
+// PriorityResult 时间优先级计算结果。
+// 根据当前时间、D1分数、是否龙头、情绪周期计算优先级。
 // Level 为基础分（0~100），Label 为等级（strong/observe/mute），CanOpen 表示是否允许开仓。
-// （Level is the base score 0~100, Label is strong/observe/mute, CanOpen flags whether to allow opening.）
+//
+// （PriorityResult is the time-priority computation result.）
 type PriorityResult struct {
 	Level   int    `json:"level"`    // 优先级基础分（Priority base score）
 	Label   string `json:"label"`    // 提醒级别（strong/observe/mute）（Remind level: strong/observe/mute）
 	CanOpen bool   `json:"can_open"` // 是否允许开仓（Whether opening is allowed）
 }
 
-// priorityOf 根据时间、D1分数、是否龙头、情绪周期计算当前时刻的优先级。（priorityOf computes the time priority from clock time, D1, leader flag and emotion phase.）
+// priorityOf 根据时间、D1分数、是否龙头、情绪周期计算当前时刻的优先级。
+// 这是N形策略时间优先级计算的核心函数，决定是否允许开仓以及开仓的优先级。
 //
 // 时间窗口权重：
 //
@@ -91,8 +96,7 @@ type PriorityResult struct {
 // 情绪因子修正：退潮-30（最低10）、高潮-20（最低20）。
 // "衰退"直接否决（返回 -1/mute/false）。
 //
-// （English: auction 9:15–9:20=70 (no open), golden window 9:20–10:00=100, then decays −5 per 30min to 11:30 and −7.5 per
-// 30min in the afternoon. Emotion: 退潮 −30 (floor 10), 高潮 −20 (floor 20); 衰退 hard-vetoes with −1/mute/false.）
+// （priorityOf computes the time priority from clock time, D1, leader flag and emotion phase.）
 func priorityOf(t int, d1 float64, isLeader bool, emotion string) PriorityResult {
 	if t < t915 || t > t1500 {
 		return PriorityResult{-1, "mute", false}

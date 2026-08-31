@@ -24,6 +24,8 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 	d1 := fs.Float64("d1", 20, "n_shape 的规则 D1 分（0=不触发 n_shape）")
 	industry := fs.Bool("industry", false, "dragon 是否用行业板块涨幅近似板块共振")
 	dataDir := fs.String("datadir", "", "战法库目录 applied_*.json（空=默认数据目录）")
+	quality := fs.Bool("quality", false, "全量回放用质控池替代 StockCodes()（剔 ST/退市/多年亏损/地量股）")
+	throttleMs := fs.Int("throttle-ms", 0, "逐股节流毫秒（>0 时每处理一只股票 sleep，摊平全量回放瞬时负载）")
 	fs.Parse(args)
 
 	if *dataDir == "" {
@@ -33,14 +35,20 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 		*end = today()
 	}
 	o := &btreplay.Options{
-		DBPath:    dbPath,
-		Start:     *start,
-		End:       *end,
-		Strategy:  *strategy,
-		MaxStocks: *maxStocks,
-		D1Score:   *d1,
-		Industry:  *industry,
-		DataDir:   *dataDir,
+		DBPath:     dbPath,
+		Start:      *start,
+		End:        *end,
+		Strategy:   *strategy,
+		MaxStocks:  *maxStocks,
+		D1Score:    *d1,
+		Industry:   *industry,
+		DataDir:    *dataDir,
+		ThrottleMs: *throttleMs,
+	}
+	if *quality {
+		sc := store.DefaultQualityScreen()
+		sc.End = *end
+		o.Screen = &sc
 	}
 	if err := o.Run(); err != nil {
 		log.Fatalf("战法回放失败: %v", err)

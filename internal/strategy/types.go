@@ -1,8 +1,15 @@
-// Package strategy 定义战法策略的核心类型和接口。（Package strategy defines core types and interfaces for strategies.）
+// Package strategy 定义战法策略的核心类型和接口。
+// 本包是所有战法策略的基础包，定义了：
+//   - Strategy 接口：所有具体战法必须实现的接口
+//   - Signal: 交易信号结构体
+//   - Evaluation: 战法评分结果
+//   - ExitContext: 止盈止损评估的上下文参数
+//   - ExitResult: 止盈止损评估结果
+//   - 各种常量定义：信号类型、交易动作、优先级等
+//
 // 所有具体战法（Dragon/DoubleBump/NShape/DragonReturn）均实现 Strategy 接口,
 // 通过 Evaluate → GenerateSignal 两阶段生成交易信号。
-// （All concrete strategies (Dragon/DoubleBump/NShape/DragonReturn) implement the Strategy interface, producing trade
-// signals in two stages: Evaluate then GenerateSignal.）
+// （Package strategy defines core types and interfaces for strategies.）
 package strategy
 
 import "time"
@@ -42,7 +49,16 @@ const (
 	P4   Priority = 5 // 仅记录（Log only）
 )
 
-// Signal 交易信号，由 GenerateSignal 生成，供 CombatAgent 消费。（Signal is a trade signal produced by GenerateSignal for the CombatAgent.）
+// Signal 交易信号，由 GenerateSignal 生成，供 CombatAgent 消费。
+// 这是战法策略的核心输出，包含了交易决策的所有关键信息：
+//   - Code/Name: 股票标识
+//   - Type: 战法类型（dragon/double_bump/n_shape等）
+//   - Action: 交易动作（buy/sell/hold/watch）
+//   - Priority: 优先级（1-5，1最高）
+//   - Confidence: 置信度（0.0-1.0）
+//   - Meta: 评分明细（供前端展示）
+//
+// （Signal is a trade signal produced by GenerateSignal for the CombatAgent.）
 type Signal struct {
 	Code       string             `json:"code"`           // 股票代码（Stock code）
 	Name       string             `json:"name"`           // 股票名称（Stock name）
@@ -71,7 +87,16 @@ type SignalResult struct {
 	Analyzed bool     `json:"analyzed"` // 是否完成了实际分析（false 表示数据不足/未评分）（Whether scoring actually ran; false = insufficient data / unscored）
 }
 
-// Evaluation 战法评分结果，由 Evaluate 返回。（Evaluation is the scoring result returned by Evaluate.）
+// Evaluation 战法评分结果，由 Evaluate 返回。
+// 这是战法评分的核心输出，包含了：
+//   - TotalScore: 综合总分（0-100）
+//   - Details: 各维度分数明细
+//   - Pass: 是否通过硬闸
+//   - Level: 信号级别（full_chain/brief/watch/nodata）
+//   - Confidence: 置信度（0.0-1.0）
+//   - Reasons: 各维度理由（供前端展示）
+//
+// （Evaluation is the scoring result returned by Evaluate.）
 type Evaluation struct {
 	TotalScore float64            `json:"total_score"` // 综合总分（Composite total score）
 	Details    map[string]float64 `json:"details"`     // 各维度分数（Per-dimension scores）
@@ -81,7 +106,18 @@ type Evaluation struct {
 	Reasons    map[string]string  `json:"reasons"`     // 各维度理由（Per-dimension reasons）
 }
 
-// ExitContext 止盈止损评估的上下文参数。（ExitContext carries parameters for take-profit / stop-loss evaluation.）
+// ExitContext 止盈止损评估的上下文参数。
+// 包含了持仓的所有关键信息，用于评估是否应该止盈或止损：
+//   - Code/Name: 股票标识
+//   - CostPrice: 持仓成本
+//   - CurPrice: 当前价格
+//   - EntryAt: 入场时间
+//   - EntryMeta: 入场时评分明细（包含highest_price等）
+//   - DailyK: 日K线历史
+//   - Now: 当前时间
+//   - ATR/ATRStopMult: ATR动态止损参数
+//
+// （ExitContext carries parameters for take-profit / stop-loss evaluation.）
 type ExitContext struct {
 	Code      string             // 股票代码（Stock code）
 	Name      string             // 股票名称（Stock name）
@@ -122,14 +158,25 @@ type KLine struct {
 	Volume float64 // 成交量（Volume）
 }
 
-// ExitResult 止盈止损评估结果。（ExitResult is the take-profit / stop-loss evaluation result.）
+// ExitResult 止盈止损评估结果。
+// 包含退出理由和建议优先级，供交易执行层决策。
+// 返回nil表示继续持有，返回ExitResult表示应该退出。
+//
+// （ExitResult is the take-profit / stop-loss evaluation result.）
 type ExitResult struct {
 	Reason   string   // 退出理由（如 "N形硬止损" / "双凸派发信号"）（Exit reason, e.g. N-shape hard stop / Double Bump distribution）
 	Priority Priority // 建议优先级（P1 立即执行 ~ P3 普通关注）（Suggested priority, P1 immediate to P3 normal）
 }
 
-// Strategy 战法策略接口。所有具体战法必须实现此接口。（Strategy is the interface all concrete strategies must implement.）
-// Evaluate 接收行情数据做评分，GenerateSignal 将评分转为交易信号。（Evaluate scores market data; GenerateSignal turns the score into a signal.）
+// Strategy 战法策略接口。所有具体战法必须实现此接口。
+// 这是所有战法的统一接口，确保不同战法可以被相同的方式调用和管理。
+// 主要方法：
+//   - Name: 返回策略中文名称
+//   - Type: 返回信号类型标识
+//   - Evaluate: 接收行情数据做评分
+//   - GenerateSignal: 将评分转为交易信号
+//
+// （Strategy is the interface all concrete strategies must implement.）
 type Strategy interface {
 	Name() string                                                  // 策略中文名称（Strategy display name）
 	Type() SignalType                                              // 信号类型（Signal type）

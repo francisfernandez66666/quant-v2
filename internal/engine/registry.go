@@ -62,11 +62,14 @@ type EngineOptions struct {
 	SectorTopN   int                     // 主线板块纳入成分股数量
 	D1MaxRetries int                     // D1 评分 LLM 调用最大重试次数
 	Paper        *paper.Engine           // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
-	// 实盘账本（AUTO_TRADING_PLAN M1）：研究库句柄，供 QMT 控制器存取 real_positions/orders/fills。
-	// 与纸面账本完全独立。nil = 未接入实盘（QMT 链路整体禁用）。
-	// English: real book (AUTO_TRADING_PLAN M1) — research-DB handle for the QMT controller's
-	// real_positions/orders/fills access. Fully independent of the paper book. nil = no live chain.
-	RealStore *store.DB // 实盘数据库存储
+	// 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions/orders/fills 的库句柄。
+	// §OPT-3 已隔离至独立 live.db。与纸面账本完全独立。nil = 未接入实盘（QMT 链路整体禁用）。
+	// English: real book (AUTO_TRADING_PLAN M1) — handle for the QMT controller's
+	// real_positions/orders/fills access (isolated to live.db). Fully independent of the paper book.
+	RealStore *store.DB // 实盘账本库（live.db）
+	// D1Store D1 评分历史库（d1_scores 表，研究侧数据）：必须留在研究库 trading.db，不可与实盘账本混库。
+	// English: D1 score history store (d1_scores, research-side) — must stay in the research DB (trading.db).
+	D1Store *store.DB // D1 评分库（trading.db）
 }
 
 // InitStage 引擎初始化进度阶段。
@@ -672,7 +675,8 @@ func (r *Registry) build(userID string) *Engine {
 				time.Duration(qmtCfg.TimeoutSec)*time.Second, 1)
 		}
 		ctrl := trading.NewController(exec, opts.RealStore, userID, qmtCfg, onAlert)
-		e.SetQMT(ctrl, opts.RealStore)
+		// 引擎侧 realStore 仅用于 D1 评分落库（d1_scores，研究侧数据），必须留在研究库而非 live.db。
+		e.SetQMT(ctrl, opts.D1Store)
 	}
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)

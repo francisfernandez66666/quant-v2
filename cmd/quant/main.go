@@ -221,9 +221,26 @@ func main() {
 		// 带进程内 TTL 缓存，避免 5s 打分循环反复查库；缓存缺失/过期时读库。
 		finaCache := newFinaCache(researchDB)
 		strategyEngine.SetFinaLookup(finaCache.Lookup)
-		log.Printf("[research] 研究库已接入（含实盘财务因子 + 实盘账本）: %s", filepath.Join(dataDir, "trading.db"))
+		log.Printf("[research] 研究库已接入（含实盘财务因子）: %s", filepath.Join(dataDir, "trading.db"))
 	} else if dbErr != nil {
 		log.Printf("[research] 研究库接入失败: %v", dbErr)
+	}
+
+	// §OPT-3 实盘账本隔离：独立 live.db，与夜间研究库（trading.db）拆分，降低同文件写竞争并便于独立备份。
+	// 首次启动从 trading.db 一次性迁移存量实盘数据（real_positions/orders/fills/real_account），幂等。
+	realStore := researchDB
+	liveDB, liveErr := store.Open(filepath.Join(dataDir, "live.db"))
+	if liveDB != nil && liveErr == nil {
+		if migrated, merr := store.MigrateRealTablesIfEmpty(liveDB, researchDB); merr != nil {
+			log.Printf("[research] live.db 存量迁移失败(忽略, 继续): %v", merr)
+		} else if migrated {
+			log.Printf("[research] 已从 trading.db 迁移实盘账本到 live.db（存量数据已保留）")
+		}
+		srv.SetLiveDB(liveDB)
+		realStore = liveDB
+		log.Printf("[research] 实盘账本已隔离至: %s", filepath.Join(dataDir, "live.db"))
+	} else if liveErr != nil {
+		log.Printf("[research] live.db 打开失败, 实盘账本回退 trading.db: %v", liveErr)
 	}
 
 	// 推送器：P1 清仓/止损强提醒走桌面 + Webhook（地址从 config.json notify.webhook_urls 读取，可热改）
@@ -268,6 +285,10 @@ func main() {
 	// §GAP3.2/3.3 快照落盘（同日重启恢复）+ 盘中陈旧度告警
 	fetcher.SetDataDir(dataDir)
 	fetcher.LoadPersistedSnapshot(dataDir)
+	// §A+B 行情刷新间隔可配置（默认 5s）：降低以缩短"行情变化→信号检测"感知延迟。
+	if sec := cfgMgr.Rules.Runtime.FeedIntervalSec; sec > 0 {
+		fetcher.SetRefreshInterval(time.Duration(sec) * time.Second)
+	}
 	go fetcher.Start()
 	defer fetcher.Stop()
 	srv.SetFetcher(fetcher) // 报价接口优先读 5s 快照，缺失再降级拉取
@@ -307,7 +328,8 @@ func main() {
 		SectorTopN:   sectorTopN,
 		Paper:        paperEngine,
 		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
-		RealStore:    researchDB, // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions
+		RealStore:    realStore,  // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
+		D1Store:      researchDB, // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
 	})
 	srv.SetEngineRegistry(registry)
 
@@ -419,20 +441,22 @@ func main() {
 		<-scoreLoopCtx.Done()
 	}()
 	go func() {
-		// §性能 彻底休眠（用户要求）：非交易时段连节拍器都不转——一次性睡到下一个交易窗口，
-		// 醒来只归还内存（TrimAfterHoursIfDue 自带 15m 节流），再重新判定会话。
-		// 睡眠分段封顶 15 分钟：防时钟跳变/节假日边界导致永久沉睡；交易时段恢复 5s 近实时节拍。
-		// English: true hibernation off-hours — sleep straight through to the next active session
-		// (chunks capped at 15m for clock-safety), only trimming memory on wake; 5s cadence intraday.
-		const (
-			activeTick = 5 * time.Second
-			sleepChunk = 15 * time.Minute
-		)
+		// §A+B 近实时节拍可配置（默认 5s）：降低以加快信号翻转检出与下单；非交易时段仍休眠。
+		// English: A+B — configurable near-realtime cadence (default 5s); off-hours still hibernated.
+		scoringTick := 5 * time.Second
+		if sec := cfgMgr.Rules.Runtime.ScoringIntervalSec; sec > 0 {
+			scoringTick = time.Duration(sec) * time.Second
+		}
+		const sleepChunk = 15 * time.Minute
+		activeTick := scoringTick
 		timer := time.NewTimer(activeTick)
 		defer timer.Stop()
 		for {
 			select {
 			case <-scoreLoopCtx.Done():
+				for _, e := range registry.All() {
+					e.StopBuyDispatcher()
+				}
 				return
 			case <-timer.C:
 			}

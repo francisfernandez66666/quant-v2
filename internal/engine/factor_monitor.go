@@ -19,6 +19,8 @@ import (
 )
 
 // factorMonitorEntry 一条待结算的因子信号跟踪。
+// 记录信号触发时的关键信息（规则ID、股票代码、触发价、触发时间），
+// 用于在前瞻窗口到期后计算前向收益，评估该因子规则的实际效果。
 // English: one pending factor-signal tracking entry awaiting settlement.
 type factorMonitorEntry struct {
 	RuleID     string    // 战法库规则 ID（fac_<candID>）
@@ -28,12 +30,14 @@ type factorMonitorEntry struct {
 }
 
 // factorMonitor 因子战法效果监测器。
+// 维护一个待结算的信号跟踪队列，定期结算到期条目并更新规则统计。
+// 支持因子战法（fac_ 前缀）和形态战法（pat_ 前缀）两类规则的效果监测。
 // English: factor-strategy effectiveness monitor.
 type factorMonitor struct {
-	mu      sync.Mutex
-	dataDir string
-	entries map[string]*factorMonitorEntry // key = ruleID|code（去重，同一规则同一股票只记一次）
-	horizon int
+	mu      sync.Mutex                       // 保护 entries 并发访问的互斥锁
+	dataDir string                           // 战法库文件所在目录
+	entries map[string]*factorMonitorEntry   // 待结算跟踪条目（key = ruleID|code，去重）
+	horizon int                              // 前瞻天数（默认 5 日）
 }
 
 // newFactorMonitor 创建监测器。horizon 为前瞻天数（默认 5）。
@@ -147,12 +151,13 @@ func (m *factorMonitor) forwardReturn(market *data.MarketAPI, e *factorMonitorEn
 }
 
 // factorRuleStat 一条规则的运行统计聚合（供 PersistStats）。
+// 包含信号触发次数、胜率、累计收益等核心指标，用于前端"效果"栏展示。
 // English: aggregated run stats of one rule (for PersistStats).
 type factorRuleStat struct {
-	SignalCount int
-	Win         int
-	Loss        int
-	CumReturn   float64
+	SignalCount int     // 信号触发总次数
+	Win         int     // 盈利次数（前向收益>0）
+	Loss        int     // 亏损次数（前向收益≤0）
+	CumReturn   float64 // 累计前向收益（所有已结算信号的收益之和）
 }
 
 // observeSettleFactor 引擎层：登记本轮战法库信号（因子/形态）跟踪 + 结算到期跟踪，并把统计回写战法库。

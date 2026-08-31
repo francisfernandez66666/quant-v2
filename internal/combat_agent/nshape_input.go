@@ -1,9 +1,11 @@
 // Package combat_agent 战法引擎：8a/8b 处理信号个股打分，以及持仓/自选的持续打分。
-// Package combat_agent: scoring for 8a/8b signal stocks, plus continuous scoring of holdings/watchlist.
 // nshape_input.go 从 8a/8b 打分池行情数据构造 N 形战法评分输入（WaveA/IntradayB/Ctx）。
-// nshape_input.go builds the N-shape scoring inputs (WaveA/IntradayB/Ctx) from the 8a/8b pool quotes.
 // 三个构造函数在 adapter.go 的 evalFor 中被 N 形策略分支调用。
-// The three constructors are called by the N-shape branch in evalFor (adapter.go).
+//
+// 构造逻辑：
+//   - buildWaveA: 从日K线构造 N 形昨日波形（A波）
+//   - buildIntradayB: 从实时量价快照 + 分钟MACD 构造日内快照（B段）
+//   - buildCtx: 构造 N 形评分上下文（情绪阶段 + 均量 + D1事件）
 package combat_agent
 
 import (
@@ -15,12 +17,22 @@ import (
 )
 
 // buildWaveA 从日K线构造 N 形昨日波形（A波）。
-// buildWaveA builds the N-shape yesterday waveform (Wave A) from daily K-lines.
 // 昨开/高/低/收/量取自日K倒数第二根，涨幅对前日收盘计算，MA60 判断用不含今日的K线。
-// Yesterday's open/high/low/close/volume come from the second-to-last daily bar; the gain is computed
-// against the prior close; MA60 uses the K-lines excluding today.
 // sector 用于注入板块龙头属性；K线不足 2 根时返回零值 WaveA（评分降级为 0）。
-// sector provides the industry-leader attributes; with fewer than 2 K-lines it returns a zero WaveA (score degraded to 0).
+//
+// 构造逻辑：
+//   1. 昨日波形 = 倒数第二根日K
+//   2. 昨日涨幅相对前日收盘计算
+//   3. 前日收阴线 → 标记弱势
+//   4. A波是否站上 MA60（剔除今日K线，避免未来函数）
+//   5. 板块 RPS 前 2 → 视为板块龙头
+//
+// 参数：
+//   - md: 行情数据快照
+//   - sector: 板块上下文（可为 nil）
+//
+// 返回值：
+//   - N 形昨日波形数据指针
 func buildWaveA(md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector) *n_shape.WaveA {
 	wa := &n_shape.WaveA{}
 	kl := md.KLines
@@ -58,12 +70,23 @@ func buildWaveA(md *strategy_engine.StockMarketData, sector *sector_agent.Verifi
 }
 
 // buildIntradayB 从实时量价快照 + 分钟MACD 构造日内快照（B段）。
-// buildIntradayB builds the intraday snapshot (Segment B) from real-time price-volume + minute MACD.
 // 竞价数据仅盘前可得：开盘竞价涨跌幅用 Quote.Open 对前日收盘计算（非零时填充），
 // 竞价量/趋势在非竞价时段无法回溯，置零降级（D2 相对强度偏低但 N 形仍出总分）。
-// Auction data is only available pre-market: the auction change % is computed from Quote.Open against the
-// prior close (filled only when non-zero); auction volume/trend cannot be reconstructed after hours and are
-// zeroed (D2 relative strength is slightly low, but the N-shape total still scores).
+//
+// 构造逻辑：
+//   1. 当前时间转为 HHMM 整数格式
+//   2. 实时成交量：股 → 手 换算
+//   3. 昨日收盘/最高/最低用于日内相对强度与位置计算
+//   4. 基准指数当前涨跌幅
+//   5. 开盘竞价涨跌幅
+//   6. 近20日日均成交量
+//   7. 分钟级 MACD 三值
+//
+// 参数：
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - N 形日内快照数据指针
 func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 	ib := &n_shape.IntradayB{}
 	kl := md.KLines
@@ -105,15 +128,20 @@ func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 }
 
 // buildCtx 构造 N 形评分上下文：情绪阶段 + 20日均量 + D1 事件评分。
-// buildCtx builds the N-shape scoring context: emotion phase + 20-day avg volume + D1 event score.
 // emotionPhase 供情绪硬闸（如冰点禁开仓）使用；均量为波动率/强度参考。
-// emotionPhase drives the emotion hard-gate (e.g. freeze-open at fear); the avg volume is a volatility/strength reference.
 // d1 为 D1Scorer 批量评分结果（LLM 0~40 分 + 负面阻断标记），nil 表示本轮无 D1 数据；
-// d1 is the D1Scorer batch result (LLM 0~40 score + negative-block flag); nil means no D1 data this round;
 // eventDesc 为个股关联新闻标题（供 calcD1 的 YAML 负面阻断 + LLM 评分）；
-// eventDesc is the stock's related news titles (for calcD1's YAML negative-block + LLM three-stage scoring);
 // pe 为个股市盈率（供 D3 超跌评分，<=0 时走斐波那契兜底）。
-// pe is the stock's P/E ratio (for the D3 oversold scoring; when <= 0, a Fibonacci fallback is used).
+//
+// 参数：
+//   - md: 行情数据快照
+//   - emotionPhase: 情绪阶段
+//   - d1: D1 评分结果（可为 nil）
+//   - eventDesc: 个股关联新闻标题
+//   - pe: 个股市盈率
+//
+// 返回值：
+//   - N 形评分上下文指针
 func buildCtx(md *strategy_engine.StockMarketData, emotionPhase string, d1 *D1Score, eventDesc string, pe float64) *n_shape.Ctx {
 	ctx := &n_shape.Ctx{EmotionPhase: emotionPhase, EventDesc: eventDesc, StockPE: pe}
 	if d1 != nil {

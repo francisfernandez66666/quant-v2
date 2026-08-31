@@ -1,4 +1,10 @@
 // 双凸战法离场判定：止盈/派发/破位/移动止损/超期等出场逻辑（CheckExit）。
+// 本文件实现了双凸战法的退出逻辑，包含多种退出条件：
+//   - 放量派发：主力出货信号
+//   - 跌破MA5：短期趋势转弱
+//   - 达到止盈线：浮盈达到目标百分比
+//   - 最高价回撤：从阶段最高点回撤超过阈值
+//   - 调整超期：持仓时间超过限制
 package double_bump
 
 import (
@@ -8,10 +14,23 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
-// CheckExit 判断双凸策略是否触发退出信号。（CheckExit decides whether the Double Bump strategy should exit.）
-// 检查顺序：放量派发（P1）→ 跌破 MA5（P2）→ 达到止盈线（P2）→ 最高价回撤 8%（P2）→ 调整超期（P3）。（Checks in order:
-// volume distribution (P1) → break below MA5 (P2) → take-profit (P2) → 8% trail stop (P2) → timeout (P3).）
-// 返回 nil 表示继续持有。（Returns nil to keep holding.）
+// CheckExit 判断双凸策略是否触发退出信号。
+// 按优先级依次检查多种退出条件，返回nil表示继续持有，返回ExitResult表示应该退出。
+//
+// 检查顺序（优先级从高到低）：
+//  1. 扫参统一出场（TrailingDrawbackPct/MaxHoldDays）
+//  2. C4 ATR硬止损：启用且日K充足时，跌破ATR×mult立即离场
+//  3. 放量派发：成交量>近4日均量×1.5且收阴，主力出货信号
+//  4. 跌破MA5：短期趋势转弱
+//  5. 达到止盈线：浮盈达到DoubleBumpTakeProfitPct（默认15%）
+//  6. 最高价回撤：从阶段最高点回撤8%且已盈利过
+//  7. 调整超期：持仓超过AdjustDaysOverflow（默认10天）
+//
+// 返回值：
+//   - nil: 继续持有
+//   - *ExitResult: 触发退出，包含退出理由和优先级
+//
+// （CheckExit decides whether the Double Bump strategy should exit.）
 func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strategy.ExitResult {
 	// §扫参统一出场（STRATEGY_OPTIMIZE_PLAN）：配置了 trailing_drawback_pct/max_hold_days
 	// 时优先执行——与扫参排名同口径；未配置(0)时完全走既有规则，行为零变更。
@@ -111,5 +130,8 @@ func CheckExit(ctx *strategy.ExitContext, cfg *config.DoubleBumpConfig) *strateg
 	return nil
 }
 
-// NeedUpdateHighest 双凸策略需要更新最高价。（NeedUpdateHighest reports that Double Bump tracks the stage high price.）
+// NeedUpdateHighest 双凸策略需要更新最高价。
+// 双凸是中线策略，需要追踪阶段最高价用于移动止损计算，因此返回true。
+//
+// （NeedUpdateHighest reports that Double Bump tracks the stage high price.）
 func NeedUpdateHighest() bool { return true }

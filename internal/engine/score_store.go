@@ -1,5 +1,7 @@
 // Package engine 8a/8b 打分持久化：scores.json 存当日最新分（无信号也持续写盘）。
 // 启动时 Load 回填聚合器，重启后前端立即可见上次打分结果。
+// 打分数据结构为 map[股票代码]打分明细，包含四战法得分、动量分、D1评分等。
+// 按交易日分桶存储，跨交易日自动重置。
 // English: Package engine 8a/8b score persistence: scores.json stores the latest score of the day
 // (written continuously even without signals). On startup Load backfills the aggregator, so the
 // frontend immediately sees the last scoring result after a restart.

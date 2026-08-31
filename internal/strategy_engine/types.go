@@ -1,4 +1,11 @@
 // Package strategy_engine 定义策略引擎相关数据结构：板块热度、个股行情、策略结果等。
+// 本包是策略引擎的核心类型定义，包含：
+//   - SectorHot: 热点板块信息，包含事件驱动的涨跌幅、涨停家数、资金流向等
+//   - IndividualStock: 个股事件信息，包含方向（利好/利空）
+//   - StockMarketData: 个股行情数据，包含实时价、K线、资金流向、分钟级量价/MACD等
+//   - FinancialData: 个股最新财务指标（实盘因子战法/财务因子评分用）
+//   - StrategyResult: 策略引擎评估结果，包含板块、个股、行情数据和 L1 过滤信息
+//
 // （Package strategy_engine defines strategy-engine data structures: sector heat, stock quotes, strategy results.）
 package strategy_engine
 
@@ -8,6 +15,7 @@ import (
 )
 
 // SectorHot 热点板块信息，包含事件驱动的涨跌幅、涨停家数、资金流向等。
+// 由 Evaluate 方法中的 attribution 函数从新闻事件归因得到，供板块验证和信号聚合使用。
 // （SectorHot is hot-sector info: event-driven change, limit-up count, capital flow, etc.）
 type SectorHot struct {
 	Name       string   `json:"name"`                  // 板块名称（Sector name）
@@ -21,7 +29,9 @@ type SectorHot struct {
 	NewsTitles []string `json:"news_titles,omitempty"` // 关联新闻标题（Related news titles）
 }
 
-// IndividualStock 个股事件信息，包含方向（利好/利空）。（IndividualStock is per-stock event info with direction.）
+// IndividualStock 个股事件信息，包含方向（利好/利空）。
+// 由 Evaluate 方法中的事件分流产生，用于标记事件驱动的个股交易方向。
+// （IndividualStock is per-stock event info with direction.）
 type IndividualStock struct {
 	Code      string // 股票代码（Stock code）
 	Name      string // 股票名称（Stock name）
@@ -35,8 +45,9 @@ type IndividualStock struct {
 
 // FinancialData 个股最新财务指标（实盘因子战法/财务因子评分用）。
 // 由研究库 fina_indicator 最新报告期填充（点对时：ann_date ≤ 当日 的最新值），缺失为 0。
-// English: a stock's latest financial indicators (for live factor-strategy financial scoring), filled
-// from the research DB's latest fina_indicator report (point-in-time: latest ann_date ≤ today); 0 when missing.
+// 这些字段用于因子战法中的财务类因子评分（ROE质量、净利同比成长、估值等）。
+// （English: a stock's latest financial indicators (for live factor-strategy financial scoring), filled
+// from the research DB's latest fina_indicator report (point-in-time: latest ann_date ≤ today); 0 when missing.）
 type FinancialData struct {
 	Roe          float64 `json:"roe,omitempty"`            // 净资产收益率（%）
 	YoyNetProfit float64 `json:"yoy_net_profit,omitempty"` // 净利同比（%）
@@ -68,6 +79,7 @@ type StockMarketData struct {
 
 // StrategyResult 策略引擎评估结果，包含板块、个股、行情数据和 L1 过滤信息。
 // 由 Evaluate 返回，供顶层引擎做板块验证、战法扫描与信号聚合。
+// 这是策略引擎的核心输出结构，包含了整个评估流程的所有关键数据。
 // （StrategyResult is the strategy-engine evaluation output — sectors, stocks, market data and L1 filtering — returned
 // by Evaluate for the top-level engine's sector verification, strategy scanning and signal aggregation.）
 type StrategyResult struct {

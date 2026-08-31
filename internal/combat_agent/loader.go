@@ -1,9 +1,13 @@
 // Package combat_agent 战法引擎的配置热加载。
-// Package combat_agent: configuration hot-reload for the combat engine.
 // loader.go 通过 fsnotify 监听策略配置文件变更，自动解析并热更新策略参数，
 // 使策略权重/阈值调整无需重启进程即可生效。
-// loader.go watches the strategy config file via fsnotify, parses it and hot-updates the strategy
-// parameters so weight/threshold changes take effect without restarting the process.
+//
+// 热加载机制：
+//   - 使用 fsnotify 监控文件写入/创建事件
+//   - 500ms 防抖：连续保存只触发最后一次重载
+//   - 读取 JSON 配置文件，提取 Strategy 配置段
+//   - 线程安全地更新 Agent 的策略参数
+//   - 同步更新持仓当日跌幅提醒阈值与 ATR 动态止损参数
 package combat_agent
 
 import (
@@ -18,11 +22,13 @@ import (
 )
 
 // StartHotReload 启动配置文件热加载，监听文件变化自动重载策略参数。
-// StartHotReload starts the config hot-reload, watching the file for changes and reloading strategy params.
 // 使用 fsnotify 监控文件写入/创建事件，500ms 防抖后执行重载。
-// Uses fsnotify to watch write/create events and reloads with a 500ms debounce.
-// 入参 path 为 JSON 配置文件路径；路径为空或初始化失败时仅记日志并返回。
-// path is the JSON config file path; an empty path or an init failure just logs and returns.
+// 启动一个后台 goroutine 常驻监听，自动处理文件变更事件。
+//
+// 参数：
+//   - path: JSON 配置文件路径
+//
+// 注意：路径为空或初始化失败时仅记日志并返回
 func (a *Agent) StartHotReload(path string) {
 	if path == "" {
 		return
@@ -81,9 +87,14 @@ func (a *Agent) StartHotReload(path string) {
 }
 
 // reloadConfig 读取并解析 JSON 配置文件，提取策略规则后热更新。
-// reloadConfig reads and parses the JSON config file, extracts the strategy rules, and hot-updates them.
 // 读取或解析失败仅记日志，不影响当前运行中的策略参数（安全降级）。
-// Read/parse failures only log and do not affect the currently running strategy params (safe degradation).
+// 更新内容：
+//   - 策略参数配置
+//   - 持仓当日跌幅提醒阈值
+//   - ATR 动态止损参数
+//
+// 参数：
+//   - path: JSON 配置文件路径
 func (a *Agent) reloadConfig(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {

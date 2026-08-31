@@ -4,11 +4,12 @@
 // 输出 0~40 满分制分数（对应 N 形 D1 事件维度）并附 LLM 分析理由。
 // D1 分独立于"板块利好/利空事件分"（HotTopic.Score / SectorHot.Score，0~1，仅作评分上下文），
 // 由 LLM 按 40 分制独立核定，避免两者混用。
-// English: provides D1 event-driven scoring per stock, using the LLM to analyze news events and market
-// data. Scoring dimensions by priority: negative filter (blocked) > top impact > indirect > medium >
-// low; outputs a 0~40 grade (the N-shape D1 event dimension) with an LLM reason. D1 is decoupled from
-// the sector bull/bear event score (HotTopic.Score / SectorHot.Score, 0~1, used only as scoring context)
-// and graded independently on the 40-point scale to avoid conflating the two.
+//
+// 评分机制：
+//   - 批量评分：按 llmBatchSize 分批并发调用 LLM
+//   - 失败重试：支持轮询重试（默认 5 次），指数抖动并封顶
+//   - 无事件归零：无实质事件的个股 D1 强制归 0
+//   - 负面过滤：命中负面事件的个股标记 Blocked，D1=0
 package combat_agent
 
 import (
@@ -28,9 +29,13 @@ import (
 // D1Score 表示单只个股的 D1 事件评分结果。
 // Score 范围 0~40（对应 N 形 D1 维度满分 40），Blocked 表示被负面过滤拦截，Reason 为 LLM 分析理由。
 // RetryPending 表示本轮 LLM 失败（未拿到有效评分），分数 0 且待重试队列下轮重新调 LLM。
-// English: D1 event-scoring result for a single stock — Score in 0~40 (the N-shape D1 dimension max),
-// Blocked means the negative filter tripped, Reason is the LLM analysis. RetryPending marks a stock whose
-// LLM scoring failed this round (score 0); it joins the retry queue and is re-scored via LLM next round.
+//
+// 字段说明：
+//   - Code: 股票代码
+//   - Score: 评分值，0~40，越高越值得关注
+//   - Blocked: 是否被负面过滤拦截（利空事件命中）
+//   - Reason: LLM 给出的评分分析理由
+//   - RetryPending: LLM 失败待重试（分数 0，入重试队列，下轮重新调 LLM）
 type D1Score struct {
 	Code         string  `json:"code"`          // 股票代码
 	Score        float64 `json:"score"`         // 评分值，0~40，越高越值得关注
@@ -42,8 +47,13 @@ type D1Score struct {
 // D1Scorer 批量个股 D1 评分器。
 // 收拢到 combat_agent，LLM 参考 events_leftside.yaml 规则评分。
 // 非并发安全，建议由 Engine 在独立 goroutine 中单实例调用。
-// English: batch D1 scorer for stocks, scoring with the LLM referencing events_leftside.yaml rules.
-// Not concurrency-safe; the Engine should call it from a single goroutine.
+//
+// 字段说明：
+//   - llmClient: LLM 客户端，用于调用大模型进行 D1 评分
+//   - yamlContent: events_leftside.yaml 原始内容，作为 LLM prompt 参考
+//   - maxAttempts: D1 LLM 调用轮询重试次数（含首次），默认 5
+//   - retryBackoff: 相邻两次重试的基础间隔
+//   - sectorEvents: 代码→所属板块事件标题映射
 type D1Scorer struct {
 	llmClient    *llm.Client       // LLM 客户端，用于调用大模型进行 D1 评分
 	yamlContent  string            // events_leftside.yaml 原始内容，作为 LLM prompt 参考
@@ -54,14 +64,15 @@ type D1Scorer struct {
 
 // defaultMaxAttempts 默认 D1 LLM 轮询重试次数（含首次）。
 // 加重次数以抗 LLM 偶发超时/限流，避免重要 D1 评分随调用失败而丢失。
-// English: default number of D1 LLM retries (including the first attempt), raised to survive occasional
-// LLM timeouts/rate-limits so important D1 scores are not lost to failures.
 const defaultMaxAttempts = 5
 
 // NewD1Scorer 创建 D1Scorer 实例。
-// llmClient: LLM 客户端，用于调用大模型进行评分。
-// yamlContent: events_leftside.yaml 的原始内容，作为评分规则的参考上下文。
-// English: creates a D1Scorer with the LLM client and the raw events_leftside.yaml as scoring-context.
+// 参数：
+//   - llmClient: LLM 客户端，用于调用大模型进行评分
+//   - yamlContent: events_leftside.yaml 的原始内容，作为评分规则的参考上下文
+//
+// 返回值：
+//   - 初始化后的 D1Scorer 指针
 func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 	return &D1Scorer{
 		llmClient:    llmClient,
@@ -74,17 +85,21 @@ func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 
 // SetSectorEvents 设置"代码→所属板块事件标题"映射，用于把板块级别事件传导到个股的 D1 评分上下文。
 // 个股即使不在新闻点名的 RelatedStocks 里，只要所属热点板块有正向事件，也能获得该事件标题供 LLM 合理打分。
-// English: sets the code→sector-event-title map used to relay sector-level events into per-stock D1
-// scoring context, so a constituent of a hot sector with a bullish event gets a fair score even when
-// the news didn't name it individually.
+//
+// 参数：
+//   - m: 代码→板块事件标题映射
 func (ds *D1Scorer) SetSectorEvents(m map[string]string) {
 	ds.sectorEvents = m
 }
 
 // SetMaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。
-// n<=0 时回退默认 defaultMaxAttempts。返回设置的生效值。
-// English: sets the D1 LLM retry count (including the first attempt); n<=0 reverts to the default and
-// the effective value is returned.
+// n<=0 时回退默认 defaultMaxAttempts。
+//
+// 参数：
+//   - n: 重试次数
+//
+// 返回值：
+//   - 设置的生效值
 func (ds *D1Scorer) SetMaxRetries(n int) int {
 	if n <= 0 {
 		ds.maxAttempts = defaultMaxAttempts
@@ -97,8 +112,13 @@ func (ds *D1Scorer) SetMaxRetries(n int) int {
 // d1SystemPrompt 是 D1 评分的系统级提示词，定义评分优先级规则和输出格式。
 // LLM 根据该提示词对个股关联事件进行分级打分（负面过滤/顶级影响/间接影响/中等影响/低影响）。
 // 打分采用 0~40 满分制（对应 N 形 D1 维度：事件驱动硬闸，满分 40，信号需 D1>0）。
-// English: the system prompt for D1 scoring. The LLM grades each stock's linked events on a 0~40 scale
-// (the N-shape D1 event-gate dimension, max 40; a signal needs D1>0).
+//
+// 评分优先级：
+//   1. 负面过滤(negative_filter): score=0, blocked=true
+//   2. 顶级影响(top_impact): score=16~40
+//   3. 间接影响(indirect): score=12~24
+//   4. 中等影响(medium_impact): score=8~20
+//   5. 低影响(low_impact): score=0~8
 var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个股基于关联事件进行D1评分。
 
 评分采用 0~40 满分制，对应 N 形策略的 D1 事件驱动维度（满分 40，信号需 D1>0 且 总分≥60）。
@@ -128,12 +148,15 @@ var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个�
 // llmBatchSize D1 单次 LLM 调用承载的最大个股条数。
 // 与 classifier.go 的 llmBatchSize 保持一致：超大批次会让推理模型 prompt 过长、
 // 输出被截断漏项（观察：55只漏38%、49只漏16%、17只不漏），故按此大小分批调用。
-// English: max stocks per D1 LLM call, kept in sync with classifier.go's llmBatchSize. Oversized batches
-// produce prompts so long the reasoning model truncates its output and drops tail stocks.
 const llmBatchSize = 10
 
 // batchBounds 将 n 个元素按 size 分块，返回 [start,end) 区间列表。
-// English: splits n items into size-sized chunks and returns the [start,end) ranges.
+// 参数：
+//   - n: 元素总数
+//   - size: 每块大小
+//
+// 返回值：
+//   - [start,end) 区间列表
 func batchBounds(n, size int) [][2]int {
 	if size <= 0 {
 		size = 1
@@ -150,23 +173,22 @@ func batchBounds(n, size int) [][2]int {
 }
 
 // BatchScore 对一组个股进行批量 D1 评分。
-// codes: 待评分的个股代码列表。
-// events: 当前周期的新闻事件列表，用于查找个股关联事件。
-// marketData: 个股行情数据映射，key 为股票代码。
-// 返回 map[string]D1Score，key 为股票代码，value 为 D1Score 评分结果。
+// 按 llmBatchSize 分批 → 每批独立"构建 prompt → 调用 LLM（轮询重试）→ 解析 JSON →
+// 标记失败个股" → 合并结果返回。
+//
 // 失败策略（全局原则：LLM 失败不靠兜底，全部走 LLM 重试队列）：
-//   - 本轮 LLM 明确给出的分数一律保留；
+//   - 本轮 LLM 明确给出的分数一律保留
 //   - 某批失败（重试全败/解析失败）或漏掉某只个股时，该批/该股不伪造分数、
 //     不回退上一轮，标记 RetryPending=true 且 Score=0（Reason 注明"待重试"），
-//     由调用方把这类个股并入重试队列，下一轮重新调 LLM。
+//     由调用方把这类个股并入重试队列，下一轮重新调 LLM
 //
-// 逻辑：按 llmBatchSize 分批 → 每批独立"构建 prompt → 调用 LLM（轮询重试）→ 解析 JSON →
-// 标记失败个股" → 合并结果返回。
-// English: batch-scores a list of stocks. Scores explicitly returned by the LLM this round are always
-// kept; a failing chunk (all retries / parse error) or a missed stock is NEVER padded with prior-round
-// scores — it is marked RetryPending=true with Score=0 so the caller queues it for a fresh LLM call next
-// round. Pipeline: split into llmBatchSize chunks → per chunk (build prompt → call LLM with increasing
-// retries → parse JSON → mark failed stocks) → merge and return the score map.
+// 参数：
+//   - codes: 待评分的个股代码列表
+//   - events: 当前周期的新闻事件列表，用于查找个股关联事件
+//   - marketData: 个股行情数据映射，key 为股票代码
+//
+// 返回值：
+//   - map[string]D1Score: key 为股票代码，value 为 D1Score 评分结果
 func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData) map[string]D1Score {
 	t0 := time.Now()
 	result := make(map[string]D1Score, len(codes))
@@ -229,15 +251,19 @@ func (ds *D1Scorer) BatchScore(codes []string, events []newsagent.NewsEvent, mar
 // scoreChunk 对单批个股（≤ llmBatchSize 只）构建 prompt 并调用 LLM 评分，返回本批独立结果 map
 // （不写共享 map，天然并发安全）。轮询重试（最多 maxAttempts 次、间隔按指数抖动并封顶，
 // 防重要 D1 评分随调用失败丢失）。
+//
 // 失败策略（全局原则：LLM 失败不靠兜底，全部走 LLM 重试队列）：
 // 整批失败/解析失败/漏项时不再回退上一轮评分或按理由兜底 0 分，而是把该批/该股标记为
 // RetryPending=true（Score=0, Reason 注明"待重试"），由调用方并入重试队列下轮重新调 LLM。
-// English: builds a prompt for one chunk (≤ llmBatchSize stocks) and calls the LLM, returning this
-// chunk's own result map (no shared map, so it is naturally concurrency-safe). Retries with capped
-// exponential backoff so important D1 scores are not lost to a single call failure. Per the global
-// "no fallback, all via LLM retry queue" principle, a whole-chunk failure / parse error / missed stock
-// is marked RetryPending=true (Score=0, Reason "待重试") for the caller to re-score via LLM next round —
-// never padded with prior-round scores or a reason-based 0.
+//
+// 参数：
+//   - codes: 单批个股代码列表
+//   - events: 新闻事件列表
+//   - marketData: 行情数据映射
+//   - maxAttempts: 最大重试次数
+//
+// 返回值：
+//   - 本批独立结果 map
 func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, marketData map[string]*strategy_engine.StockMarketData, maxAttempts int) map[string]D1Score {
 	result := make(map[string]D1Score, len(codes))
 	// 构建用户prompt：列出每只个股及其关联事件、行情数据
@@ -376,8 +402,11 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 
 // markRetryPending 对 LLM 评分失败的个股标记 RetryPending（Score=0, Reason 注明"待重试"），
 // 由调用方把该股并入 LLM 重试队列，下一轮重新调 LLM；不伪造分数、不回退上一轮。
-// English: marks stocks whose LLM scoring failed as RetryPending (Score=0, Reason "待重试") so the
-// caller queues them for a fresh LLM call next round — no fabricated score, no prior-round fallback.
+//
+// 参数：
+//   - result: 结果 map，将被原地修改
+//   - codes: 需要标记的股票代码列表
+//   - reason: 失败原因说明
 func (ds *D1Scorer) markRetryPending(result map[string]D1Score, codes []string, reason string) {
 	for _, code := range codes {
 		result[code] = D1Score{Code: code, Score: 0, Blocked: false, Reason: reason + "待重试", RetryPending: true}
@@ -387,10 +416,14 @@ func (ds *D1Scorer) markRetryPending(result map[string]D1Score, codes []string, 
 
 // findEventForCode 从 events 中查找个股关联事件描述。
 // 遍历所有事件的 RelatedStocks 与 CleanedStocks 字段，通过子串匹配找到对应事件标题。
-// code: 股票代码。
-// md: 个股行情数据（提供股票名称，板块级新闻常只带"名称"不带代码，须用名称兜底匹配）。
-// events: 新闻事件列表。
-// 返回匹配到的事件标题，未匹配则返回空字符串。
+//
+// 参数：
+//   - code: 股票代码
+//   - md: 个股行情数据（提供股票名称，板块级新闻常只带"名称"不带代码，须用名称兜底匹配）
+//   - events: 新闻事件列表
+//
+// 返回值：
+//   - 匹配到的事件标题，未匹配则返回空字符串
 func findEventForCode(code string, md *strategy_engine.StockMarketData, events []newsagent.NewsEvent) string {
 	for _, ev := range events {
 		for _, s := range ev.RelatedStocks {
@@ -407,16 +440,18 @@ func findEventForCode(code string, md *strategy_engine.StockMarketData, events [
 	return ""
 }
 
-// stockMatch 判断事件关联股票串 s 是否与 目标股票 命中。
+// stockMatch 判断事件关联股票串 s 是否与目标股票命中。
 // §D5 修复：精确匹配，兼容三种形态——CleanedStocks 的 "名称|代码"、RelatedStocks 的
 // "名称(代码)" 与纯名称/纯代码。有代码段时代码精确比对（去交易所后缀）；否则名称全等。
-// 旧实现双向 strings.Contains 让名称碎片（如事件关联"国电"）同时命中
-// "国电电力/国电南瑞"，findEventForCode 取首个命中即返回，事件张冠李戴
-// 直接污染 D1 分数并传导到买入信号。
-// English: D5 fix — exact matching across three shapes ("name|code" from the cleaner,
-// "name(code)" injected by sector propagation, and bare name/code). Code segments compare
-// exactly (suffix-insensitive), names verbatim. The old bidirectional Contains let fragments
-// like "国电" mis-hit 国电电力 vs 国电南瑞, corrupting D1 scores and downstream buy signals.
+//
+// 参数：
+//   - s: 事件关联股票字符串
+//   - code: 目标股票代码
+//   - md: 目标股票行情数据（提供名称）
+//
+// 返回值：
+//   - true: 命中
+//   - false: 未命中
 func stockMatch(s, code string, md *strategy_engine.StockMarketData) bool {
 	if s == "" {
 		return false
@@ -443,6 +478,11 @@ func stockMatch(s, code string, md *strategy_engine.StockMarketData) bool {
 }
 
 // bareCode 去掉交易所后缀（600540.SH → 600540）。
+// 参数：
+//   - c: 股票代码（可能带交易所后缀）
+//
+// 返回值：
+//   - 去掉后缀的纯代码
 func bareCode(c string) string {
 	if i := strings.IndexByte(c, '.'); i >= 0 {
 		return c[:i]
@@ -451,6 +491,12 @@ func bareCode(c string) string {
 }
 
 // minInt 返回两个整数中的较小值。
+// 参数：
+//   - a: 第一个整数
+//   - b: 第二个整数
+//
+// 返回值：
+//   - 两个整数中的较小值
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -459,9 +505,20 @@ func minInt(a, b int) int {
 }
 
 // cleanJSON 清洗 LLM 返回的原始字符串，提取出纯 JSON 数组部分。
-// 处理步骤：去除首尾空格 → 全局剔除 UTF-8 BOM(U+FEFF)（LLM 输出可能在数组内部夹 BOM，
-// 仅剥首尾会漏掉中间字符导致 json.Unmarshal 整批失败）→ 去除 markdown 代码块标记
-// （ ```json / ``` ）→ 提取第一个 '[' 到最后一个 ']' 之间的内容 → 去除末尾多余标点。
+// 处理步骤：
+//   1. 去除首尾空格
+//   2. 全局剔除 UTF-8 BOM(U+FEFF)
+//   3. 去除 markdown 代码块标记（```json / ```）
+//   4. 提取第一个 '[' 到最后一个 ']' 之间的内容
+//   5. 去除末尾多余标点
+//   6. 清理非法 '+' 前缀数值
+//   7. 转义字符串值中的换行符
+//
+// 参数：
+//   - s: LLM 返回的原始字符串
+//
+// 返回值：
+//   - 清洗后的纯 JSON 字符串
 func cleanJSON(s string) string {
 	s = strings.ReplaceAll(s, "\ufeff", "")
 	s = strings.TrimSpace(s)
@@ -523,6 +580,12 @@ func cleanJSON(s string) string {
 var d1PlusNumberRe = regexp.MustCompile(`([:,\[])\s*\+`)
 
 // isValidJSONEscape 判断字节是否为合法 JSON 转义字符。
+// 参数：
+//   - b: 待判断的字节
+//
+// 返回值：
+//   - true: 是合法 JSON 转义字符
+//   - false: 不是合法 JSON 转义字符
 func isValidJSONEscape(b byte) bool {
 	switch b {
 	case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':

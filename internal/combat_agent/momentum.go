@@ -1,9 +1,14 @@
 // Package combat_agent 战法引擎：8a/8b 处理信号个股打分，以及持仓/自选的持续打分。
-// Package combat_agent: scoring for 8a/8b signal stocks, plus continuous scoring of holdings/watchlist.
 // momentum.go 实现动量分（量价 + MACD + 走势），作为 8a/8b 打分量的一部分。
-// momentum.go implements the momentum score (volume-price + MACD + trend) as part of the 8a/8b score.
 // 三个子指标均输出 0~1 的比率，按配置权重加权后映射到 0~100 分。
-// The three sub-indicators each output a 0~1 ratio, weighted by config weights and mapped to 0~100.
+//
+// 动量分计算逻辑：
+//   - 量价比：量比 + 涨幅，量价齐升得分最高；放量下跌时量能分折半
+//   - MACD比：金叉 + 水上 + 红柱，来自分钟级 MACD，三项各占 1/3
+//   - 走势比：站上均线 + 多头排列 + 5日上行，来自日K，四项各占 1/4
+//
+// 数据来源：8a/8b 打分池行情（同花顺/新浪实时量价 + 日K + 分钟MACD）
+// 数据缺失时对应子项按 0 降级，不影响整体出分
 package combat_agent
 
 import (
@@ -14,15 +19,15 @@ import (
 )
 
 // MomentumScore 计算动量分（0~100）：量价权重 + MACD权重 + 走势权重（默认 40/30/30，前端可配）。
-// MomentumScore computes the momentum score (0~100): volume-price weight + MACD weight + trend weight
-// (default 40/30/30, configurable by the front end).
 // 数据来源为 8a/8b 打分池行情（同花顺/新浪实时量价 + 日K + 分钟MACD）。
-// Data comes from the 8a/8b scoring pool quotes (THS/Sina real-time price-volume + daily K + minute MACD).
 // 数据缺失时对应子项按 0 降级，不影响整体出分；权重全 0 时回退默认 40/30/30。
-// Missing data degrades the corresponding sub-item to 0 without blocking the total; all-zero weights
-// fall back to the default 40/30/30.
-// 入参 md 为行情快照，w 为三子项权重；返回四舍五入后的整数动量分。
-// md is the market snapshot and w is the three sub-item weights; returns the rounded momentum score.
+//
+// 参数：
+//   - md: 行情数据快照
+//   - w: 三子项权重配置
+//
+// 返回值：
+//   - 四舍五入后的整数动量分（0~100）
 func MomentumScore(md *strategy_engine.StockMarketData, w config.MomentumConfig) float64 {
 	// 权重全 0（未配置）→ 回退默认 40/30/30
 	// All-zero weights (unconfigured) -> fall back to the default 40/30/30.
@@ -42,12 +47,24 @@ func MomentumScore(md *strategy_engine.StockMarketData, w config.MomentumConfig)
 }
 
 // volumePriceRatio 量价比（0~1）：量比 + 涨幅，量价齐升得分最高；放量下跌时量能分折半。
-// volumePriceRatio is the volume-price ratio (0~1): volume ratio + change %, highest when both rise
-// together; the volume score is halved when price falls on expanding volume.
 // 量能维度：当日实时成交量 / 前20日均量（排除今日）分档打分；
 // 价格维度：按涨跌幅分档打分。二者均值作为结果。
-// Volume dimension: today's real-time volume over the prior 20-day average (excluding today), bucketed;
-// price dimension: bucketed by change %. The result is the mean of the two.
+//
+// 分档规则：
+//   - 量比 >= 2: 1.0
+//   - 量比 >= 1.5: 0.75
+//   - 量比 >= 1.2: 0.5
+//   - 量比 >= 1: 0.25
+//   - 涨幅 >= 5%: 1.0
+//   - 涨幅 >= 3%: 0.75
+//   - 涨幅 >= 1%: 0.5
+//   - 涨幅 >= 0%: 0.25
+//
+// 参数：
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - 量价比（0~1）
 func volumePriceRatio(md *strategy_engine.StockMarketData) float64 {
 	q := md.Quote
 	// 无量价数据 → 0 降级
@@ -104,10 +121,18 @@ func volumePriceRatio(md *strategy_engine.StockMarketData) float64 {
 }
 
 // macdRatio MACD 比（0~1）：金叉 + 水上 + 红柱，来自分钟级 MACD，三项各占 1/3。
-// macdRatio is the MACD ratio (0~1): golden cross + above zero axis + red bar, from minute-level MACD,
-// each contributing 1/3.
 // DIF/DEA 均为 0（无 MACD 数据）时返回 0 降级。
-// Returns 0 (degraded) when both DIF and DEA are 0 (no MACD data).
+//
+// 三项指标：
+//   - 金叉：DIF > DEA（多头）
+//   - 水上：DIF > 0（在零轴上方）
+//   - 红柱：Bar > 0（多头动能）
+//
+// 参数：
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - MACD比（0~1）
 func macdRatio(md *strategy_engine.StockMarketData) float64 {
 	m := md.MinuteMACD
 	if m.DIF == 0 && m.DEA == 0 {
@@ -127,10 +152,19 @@ func macdRatio(md *strategy_engine.StockMarketData) float64 {
 }
 
 // trendRatio 走势比（0~1）：站上均线 + 多头排列 + 5日上行，来自日K，四项各占 1/4。
-// trendRatio is the trend ratio (0~1): above the MAs + bullish alignment + 5-day uptrend, from daily K,
-// each of the four contributing 1/4.
 // K线不足 5 根时返回 0 降级。
-// Returns 0 (degraded) when there are fewer than 5 K-lines.
+//
+// 四项指标：
+//   - 收盘站上 MA5
+//   - 收盘站上 MA10
+//   - 均线多头排列（MA5 > MA10）
+//   - 5日上行（现价相对5日前收盘上涨）
+//
+// 参数：
+//   - md: 行情数据快照
+//
+// 返回值：
+//   - 走势比（0~1）
 func trendRatio(md *strategy_engine.StockMarketData) float64 {
 	kl := md.KLines
 	if len(kl) < 5 {
