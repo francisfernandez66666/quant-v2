@@ -432,6 +432,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminSetLLMConfig))
 
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
+	// §DAILY_OPSLOG 每日系统运行日志（管理员只读）：日期列表 + 按日内容（tail 截尾）
+	s.mux.HandleFunc("GET /api/opslog/dates", s.adminMiddleware(s.handleOpslogDates))
+	s.mux.HandleFunc("GET /api/opslog", s.adminMiddleware(s.handleOpslog))
 	// §R4-9 指标面（鉴权后导出 expvar：下单/熔断/撤单/LLM 降级等关键事件计数）
 	s.mux.HandleFunc("GET /api/metrics", s.authMiddleware(http.HandlerFunc(expvar.Handler().ServeHTTP)))
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))

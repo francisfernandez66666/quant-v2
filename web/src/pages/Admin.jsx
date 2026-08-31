@@ -141,6 +141,14 @@ export default function Admin() {
   const [expUser, setExpUser] = useState(null)
   const [expDays, setExpDays] = useState(0)
 
+  // ── §DAILY_OPSLOG 系统运行日志（管理员）──
+  const [opsDates, setOpsDates] = useState([])      // 可选日期（倒序，"20260831"）
+  const [opsDate, setOpsDate] = useState('')        // 当前选中日期
+  const [opsLines, setOpsLines] = useState([])      // 当日日志行
+  const [opsMeta, setOpsMeta] = useState({ total: 0, truncated: false })
+  const [opsLoading, setOpsLoading] = useState(false)
+  const opsBodyRef = React.useRef(null)             // 内容区（自动滚到底部=最新事件）
+
   // 安全读取用户权限数组
   function uPerms(u) {
     return Array.isArray(u.perms) ? u.perms : []
@@ -345,6 +353,77 @@ export default function Admin() {
 
   useEffect(() => { loadUsers() }, [])
 
+  // ── §DAILY_OPSLOG 运行日志加载 ──
+  // 拉日期列表；为空（尚无日志）保持静默。默认选中最新一天。
+  const loadOpsDates = async () => {
+    try {
+      const res = await api.fetchOpslogDates()
+      const ds = (res && res.dates) || []
+      setOpsDates(ds)
+      return ds
+    } catch (e) {
+      showToast('日志日期列表加载失败: ' + (e.message || e), 'error')
+      return []
+    }
+  }
+  // 拉某日内容；date 空串 = 服务端今天
+  const loadOpslog = async (date) => {
+    setOpsLoading(true)
+    try {
+      const res = await api.fetchOpslog(date || '', 2000)
+      setOpsLines((res && res.lines) || [])
+      setOpsMeta({ total: (res && res.total) || 0, truncated: !!(res && res.truncated) })
+    } catch (e) {
+      showToast('日志加载失败: ' + (e.message || e), 'error')
+    } finally {
+      setOpsLoading(false)
+    }
+  }
+  // 首次进入：日期列表 → 默认选最新一天并加载
+  useEffect(() => {
+    ;(async () => {
+      const ds = await loadOpsDates()
+      if (ds && ds.length) setOpsDate(ds[0].date)
+    })()
+  }, [])
+  // 选中日期变化 → 加载内容 + 滚到底部
+  useEffect(() => {
+    if (!opsDate) return
+    loadOpslog(opsDate)
+  }, [opsDate])
+  // 内容变化 → 滚到底部（最新事件在文件尾部）
+  useEffect(() => {
+    if (opsBodyRef.current) opsBodyRef.current.scrollTop = opsBodyRef.current.scrollHeight
+  }, [opsLines])
+  // 30s 轮询当前日期（盘中排查实时性；日期列表不轮询）
+  useEffect(() => {
+    const t = setInterval(() => { if (opsDate) loadOpslog(opsDate) }, 30000)
+    return () => clearInterval(t)
+  }, [opsDate])
+  // 手动刷新：日期列表 + 当前内容
+  const refreshOps = async () => {
+    const ds = await loadOpsDates()
+    if (ds && ds.length && !ds.some((d) => d.date === opsDate)) {
+      setOpsDate(ds[0].date) // 出现了新的一天 → 切过去（触发 loadOpslog）
+    } else {
+      loadOpslog(opsDate)
+    }
+  }
+
+  // 日志行渲染：把 `[quant]`/`[research]` 标签染成不同颜色，其余保持原样
+  function renderOpsLine(line, i) {
+    const m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(quant|research)\] (.*)$/)
+    if (!m) return <div key={i} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{line}</div>
+    const color = m[2] === 'quant' ? '#3b82f6' : '#10b981'
+    return (
+      <div key={i} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+        <span style={{ color: '#94a3b8' }}>{m[1]} </span>
+        <span style={{ color, fontWeight: 600 }}>[{m[2]}] </span>
+        <span>{m[3]}</span>
+      </div>
+    )
+  }
+
   // 权限守卫：非管理员（api.isAdmin() 返回 false）直接渲染"无权限访问"，
   // 既禁止通过 URL 直接访问，也避免越权渲染管理界面（数据由 loadUsers 守卫拦截）
   if (!isAdmin()) {
@@ -416,6 +495,53 @@ export default function Admin() {
           size="medium"
           pagination={{ defaultPageSize: 10, showJumper: true }}
         />
+      </Card>
+
+      {/* ── §DAILY_OPSLOG 系统运行日志（每日核心记录，管理员可查）── */}
+      <Card
+        title="系统运行日志（每日核心记录）"
+        style={{ marginBottom: 12 }}
+        headerRightContent={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Select value={opsDate} onChange={(v) => setOpsDate(v)} style={{ width: 150 }} size="small" clearable={false}>
+              {opsDates.map((d) => (
+                <Select.Option key={d.date} value={d.date} label={d.date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')} />
+              ))}
+            </Select>
+            <Button size="small" variant="outline" loading={opsLoading} onClick={refreshOps}>刷新</Button>
+          </div>
+        }
+      >
+        {opsDates.length === 0 && !opsLoading ? (
+          <div style={{ fontSize: 13, color: '#888' }}>
+            暂无运行日志（引擎/研究服务启动后自动产出，每天一份，保留 90 天）
+          </div>
+        ) : (
+          <>
+            <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+              共 {opsMeta.total} 行
+              {opsMeta.truncated ? '（仅显示最后 2000 行）' : ''}
+              {' · '}<span style={{ color: '#3b82f6', fontWeight: 600 }}>quant</span> = 量化引擎
+              {' · '}<span style={{ color: '#10b981', fontWeight: 600 }}>research</span> = 研究调度
+              {' · '}自动滚动到最新事件，30s 自动刷新
+            </div>
+            <div
+              ref={opsBodyRef}
+              style={{
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace",
+                fontSize: 12, lineHeight: 1.55,
+                background: 'rgba(128,128,128,0.08)',
+                border: '1px solid rgba(128,128,128,0.2)',
+                borderRadius: 6, padding: '8px 10px',
+                maxHeight: 480, overflowY: 'auto',
+              }}
+            >
+              {opsLines.length === 0 && !opsLoading
+                ? <div style={{ color: '#888' }}>该日暂无记录</div>
+                : opsLines.map(renderOpsLine)}
+            </div>
+          </>
+        )}
       </Card>
 
       {/* 重置密码弹窗 */}

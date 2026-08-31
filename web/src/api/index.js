@@ -1440,6 +1440,21 @@ export async function enqueueOptimize(params) {
   return request('/api/backtest/optimize', { method: 'POST', data: params || {} })
 }
 
+/** §DAILY_OPSLOG 每日系统运行日志（管理员）：列出已有日志的日期与大小（倒序）。
+ *  对应后端 GET /api/opslog/dates。 */
+export async function fetchOpslogDates() {
+  return request('/api/opslog/dates')
+}
+
+/** §DAILY_OPSLOG 每日系统运行日志（管理员）：读取某日内容（date=YYYYMMDD，缺省今天；
+ *  tail 可选，服务端取最后 N 行，默认 2000）。对应后端 GET /api/opslog。 */
+export async function fetchOpslog(date, tail) {
+  const q = []
+  if (date) q.push('date=' + encodeURIComponent(date))
+  if (tail) q.push('tail=' + encodeURIComponent(tail))
+  return request('/api/opslog' + (q.length ? '?' + q.join('&') : ''))
+}
+
 /** §P2-f 查询寻优结果列表（按任务倒序分组，含每行排名/参数/指标/审批状态）
  *  对应后端 GET /api/research/optimizations */
 export async function fetchOptimizations() {
