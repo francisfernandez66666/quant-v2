@@ -470,8 +470,13 @@ export default function LLMDebug() {
   // 判断 Stage1 初筛中第 i 条是否被 LLM 选中（复用 selectedSet）
 
   // 取最新一轮 Stage 记录更新页面展示态
-  function applyLatest() {
-    const r = records[0] || null
+  // §FIX-0921e 根修（2026-09-01 白板实录）：改为接收本次取到的记录作为参数——此前读闭包里的
+  // `records` state，`setRecords` 之后立即调用读到的是**上一次渲染的旧值**（首次加载为 []），
+  // 导致 r=null → noData=true → 「暂无数据」白板，而自检行照常显示 20 轮 ✅（setState 异步
+  // 提交的经典陷阱；旧版靠 15s 轮询的下一次调用自愈，但闭包仍滞后一轮）。
+  function applyLatest(recs) {
+    const list = recs || records
+    const r = (list && list[0]) || null
     // 取当前选中的记录（LLM 轮次 / 信号批次 / Stage 记录）
     setData(r)
     setNoAgent(false)
@@ -530,7 +535,7 @@ export default function LLMDebug() {
     }
     if (Array.isArray(recs) && recs.length) {
       setRecords(recs)
-      applyLatest()
+      applyLatest(recs) // §FIX-0921e 传入本次取到的记录，避免读到 setState 前的旧闭包
       setDiag({ n: recs.length, mainOk, fbOk, ms: Date.now() - t0, err: '' })
     } else {
       setNoData(true)
