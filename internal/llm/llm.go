@@ -408,9 +408,11 @@ func (c *Client) do(req ChatRequest) (string, error) {
 		if streamErr == nil {
 			return content, nil
 		}
-		// 仅当流式因"未收到任何有效内容"失败（典型：上游不支持 SSE，对 stream=true 返回普通 JSON）
-		// 时回落到非流式重试一次；超时/空闲/网络等错误直接返回，交由上层重试队列处理，避免重复放大延迟。
-		if strings.Contains(streamErr.Error(), "no response") {
+		// §FIX-0921 流式卡死回落（2026-09-01 实录）：GLM-Z1 流式下上游长时间不吐增量分片
+		// （思维链被上游缓冲、无心跳）→ 空闲超时误杀"模型疑似卡死"；同一请求非流式可正常
+		// 完成（实测 200）。空闲超时与"无有效内容"两类失败回落非流式重试一次；其余（网络/
+		// 5xx/已收到分片后中途死亡）仍直接返回交由上层重试，避免重复放大延迟。
+		if strings.Contains(streamErr.Error(), "no response") || strings.Contains(streamErr.Error(), "空闲超时") {
 			if content, err := c.nonStreamChat(req); err == nil {
 				log.Printf("LLM 流式无有效内容(%v), 已回落到非流式成功", streamErr)
 				return content, nil

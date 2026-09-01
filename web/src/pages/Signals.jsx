@@ -221,6 +221,12 @@ export default function Signals() {
     },
     { colKey: 'strategy', title: '策略', width: 90, cell: ({ row }) => row.strategy },
     {
+      // §FIX-0921 信号产生时间列（2026-09-01 用户需求）：展示信号生成时间戳，
+      // 用户可判断信号新旧（此前只有现价/策略，无法区分是早盘还是午后产生的信号）
+      colKey: 'generated_at', title: '产生时间', width: 155,
+      cell: ({ row }) => <span style={{ fontSize: 12, color: '#888' }}>{row.generated_at || '-'}</span>,
+    },
+    {
       colKey: 'total_score', title: '总分', width: 70,
       cell: ({ row }) => (row.total_score != null ? row.total_score.toFixed(0) : '—'),
     },

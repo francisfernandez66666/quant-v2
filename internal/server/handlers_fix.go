@@ -72,6 +72,10 @@ type fixSignal struct {
 	D4Desc       string  `json:"d4_desc"`       // 维度4 说明
 	SignalActive bool    `json:"signal_active"` // 信号是否活跃
 
+	// §FIX-0921 信号产生时间（2026-09-01 用户需求）：信号页新增「产生时间」列。
+	// 内部 Signal.GeneratedAt 已有完整时间戳，此前未透出前端——用户无法判断信号新旧。
+	GeneratedAt string `json:"generated_at,omitempty"` // 信号产生时间（"2006-01-02 15:04:05"；零值省略，前端显示 '-'）
+
 	// 真实 D1 事件信息：区别于上面的 D1Desc（策略理由），单独展示新闻事件的 D1 分析
 	// English: real D1 event info — distinct from D1Desc (strategy reason), shown separately as the
 	// news-event D1 analysis (score 0~40, negative-filter flag, LLM reason, linked event title).
@@ -95,6 +99,15 @@ func scoreToRemindLevel(score float64) string {
 		return "observe"
 	}
 	return "mute"
+}
+
+// signalGeneratedAtText 信号产生时间的展示文本（"2006-01-02 15:04:05"）；零值返回空串（前端显示 '-'）。
+// English: renders the signal's generation timestamp for the Signals page; empty for zero time.
+func signalGeneratedAtText(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04:05")
 }
 
 // toFixSignals 将内部 Signal 列表转换为前端 fixSignal 格式。
@@ -128,6 +141,7 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			D1Reason:     s.D1Reason,
 			D1Event:      s.D1Event,
 			DepthFactors: s.DepthFactors,
+			GeneratedAt:  signalGeneratedAtText(s.GeneratedAt),
 		}
 		out = append(out, fs)
 	}
@@ -579,6 +593,11 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 				"direction":    m.Direction,
 			})
 		}
+		// §FIX-0921 ctrl 路径同样按 generated_at 倒序（此前 ctrl 路径完全无排序，
+		// 按存储文件顺序（最旧在前）返回——消息中心「不更新」的另一半根因。
+		sort.Slice(out, func(i, j int) bool {
+			return alertGeneratedAtKey(out[i]["generated_at"]) > alertGeneratedAtKey(out[j]["generated_at"])
+		})
 		writeJSON(w, 200, out)
 		return
 	}
@@ -636,10 +655,29 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 			out = append(out, item)
 		}
 	}
+	// §FIX-0921 消息中心排序修复（2026-09-01 实录）：此前按 "time"（仅 HH:MM:SS）字符串倒序，
+	// 跨日期完全错乱——8/25 的 14:56 会排在今天 13:23 之前，用户看到旧消息置顶即误判
+	// 「消息中心不更新」。现按 generated_at（完整时间戳）倒序：ctrl 路径为字符串（RFC3339，
+	// 同一 +08:00 时区下可直接字典序比较），看板兜底路径为 time.Time，统一归一化后比较。
 	sort.Slice(out, func(i, j int) bool {
-		return out[i]["time"].(string) > out[j]["time"].(string)
+		return alertGeneratedAtKey(out[i]["generated_at"]) > alertGeneratedAtKey(out[j]["generated_at"])
 	})
 	writeJSON(w, 200, out)
+}
+
+// alertGeneratedAtKey 把消息条目的 generated_at 归一化为可比较的时间键。
+// ctrl 路径存字符串（RFC3339Nano），看板兜底路径存 time.Time；缺失/未知类型返回空串（排最后）。
+// English: normalizes a message entry's generated_at (string in ctrl path, time.Time in dashboard
+// fallback) into a lexicographically comparable key; unknown/missing values sort last.
+func alertGeneratedAtKey(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case time.Time:
+		return t.Format("2006-01-02T15:04:05.000000000Z07:00")
+	default:
+		return ""
+	}
 }
 
 // handleClearAlerts 处理 DELETE /api/alerts 请求：清空消息中心全部消息（按账号）。
