@@ -28,6 +28,7 @@ CN_TZ = timezone(timedelta(hours=8))
 
 
 def new_store():
+    """创建临时 SQLite 文件并立即删除，得到“存在路径但空库”的 Store（测试隔离用）"""
     # 创建临时 SQLite 文件并立即删除，得到“存在路径但空库”的 Store（测试隔离用）
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
@@ -37,6 +38,7 @@ def new_store():
 
 class TestStore(unittest.TestCase):
     def test_apply_fill_weighted_cost_and_highest(self):
+        """网关/账本单测：test_apply_fill_weighted_cost_and_highest"""
         s = new_store()
         # 建仓 100@10
         s.apply_fill({"code": "600519.SH", "side": "买入", "price": 10, "qty": 100,
@@ -64,6 +66,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(s.list_positions(), [])
 
     def test_user_id_isolated_in_store(self):
+        """§P1-9 成交/委托落库携带归属账号 ID（多账号隔离）。"""
         # §P1-9 成交/委托落库携带归属账号 ID（多账号隔离）。
         s = new_store()
         s.apply_fill({"code": "600519.SH", "side": "买入", "price": 10, "qty": 100,
@@ -87,6 +90,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(len(by_uA), 1)
 
     def test_reconcile_removes_absent(self):
+        """网关/账本单测：test_reconcile_removes_absent"""
         s = new_store()
         s.upsert_position({"ts_code": "000001.SZ", "qty": 100, "cost_price": 10})
         s.upsert_position({"ts_code": "600519.SH", "qty": 200, "cost_price": 1500})
@@ -98,6 +102,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(codes, ["600519.SH"])
 
     def test_orders_unique_signal(self):
+        """网关/账本单测：test_orders_unique_signal"""
         s = new_store()
         s.upsert_order({"order_id": "A", "signal_id": "S1", "code": "600519.SH", "side": "买入",
                         "status": "已报", "price": 10, "qty": 100, "created_at": "t"})
@@ -170,6 +175,7 @@ class TestStore(unittest.TestCase):
 
 class TestLotRule(unittest.TestCase):
     def test_lot_rule_by_board(self):
+        """网关/账本单测：test_lot_rule_by_board"""
         from gateway import lot_rule
         self.assertEqual(lot_rule("600519.SH", "买入"), (100, 100))
         self.assertEqual(lot_rule("000001.SZ", "买入"), (100, 100))
@@ -202,6 +208,7 @@ class TestLotRule(unittest.TestCase):
 
 class TestIdempotency(unittest.TestCase):
     def test_check_and_record(self):
+        """网关/账本单测：test_check_and_record"""
         s = new_store()
         ids = Idempotency(s)
         self.assertTrue(ids.check("S1")[0])
@@ -213,11 +220,13 @@ class TestIdempotency(unittest.TestCase):
 
 class TestHandler(unittest.TestCase):
     def test_trade_push_and_disconnect(self):
+        """网关/账本单测：test_trade_push_and_disconnect"""
         s = new_store()
         pushed = []
         captured = {}
 
         def fake_post(url, token, payload):
+            """网关/账本单测：fake_post"""
             pushed.append(payload)
             return True
 
@@ -246,6 +255,7 @@ class TestHandler(unittest.TestCase):
 
 class TestMockBroker(unittest.TestCase):
     def test_place_order_fill_updates_position(self):
+        """网关/账本单测：test_place_order_fill_updates_position"""
         b = MockBroker(seed=[{"ts_code": "600519.SH", "name": "贵州茅台", "qty": 100,
                               "cost_price": 1500, "highest_price": 1500}])
         b.connect()
@@ -260,6 +270,7 @@ class TestMockBroker(unittest.TestCase):
         self.assertAlmostEqual(p["highest_price"], 1510)
 
     def test_cash_model_decrements_and_replenishes(self):
+        """§P1-17 显式现金模型：买入扣减 price*qty，卖出回补；初始资金=200000。"""
         # §P1-17 显式现金模型：买入扣减 price*qty，卖出回补；初始资金=200000。
         b = MockBroker(account_init=200000.0, delay_sec=0.05)
         b.connect()
@@ -282,6 +293,7 @@ class TestMockBroker(unittest.TestCase):
 
 class TestXtBrokerLazyImport(unittest.TestCase):
     def test_importable_without_xtquant(self):
+        """无 xtquant 的环境应能实例化；connect 时才报错（延迟 import）"""
         # 无 xtquant 的环境应能实例化；connect 时才报错（延迟 import）
         b = XtBroker("A1")
         self.assertFalse(b.is_connected())
@@ -292,6 +304,7 @@ class TestXtBrokerLazyImport(unittest.TestCase):
             self.assertIn("xtquant", str(e))
 
     def test_build_broker(self):
+        """网关/账本单测：test_build_broker"""
         self.assertIsInstance(build_broker({"broker": "mock"}), MockBroker)
         self.assertIsInstance(build_broker({}), MockBroker)
         self.assertIsInstance(build_broker({"broker": "xt"}), XtBroker)
@@ -299,6 +312,7 @@ class TestXtBrokerLazyImport(unittest.TestCase):
 
 class TestGatewayHTTP(unittest.TestCase):
     def setUp(self):
+        """网关/账本单测：setUp"""
         fd, dbpath = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         os.unlink(dbpath)
@@ -321,11 +335,13 @@ class TestGatewayHTTP(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self):
+        """网关/账本单测：tearDown"""
         self.gw._stop.set()
         self.server.shutdown()
         self.server.server_close()
 
     def _req(self, method, path, body=None, token="tk"):
+        """构造一次本地 HTTP 请求，带 JSON 体与 Bearer 鉴权，返回 (status, json)"""
         # 构造一次本地 HTTP 请求，带 JSON 体与 Bearer 鉴权，返回 (status, json)
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -339,15 +355,18 @@ class TestGatewayHTTP(unittest.TestCase):
             return e.code, json.loads(e.read().decode("utf-8"))
 
     def test_health_no_auth(self):
+        """网关/账本单测：test_health_no_auth"""
         status, body = self._req("GET", "/health", token="")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
     def test_unauthorized(self):
+        """网关/账本单测：test_unauthorized"""
         status, body = self._req("GET", "/state", token="wrong")
         self.assertEqual(status, 401)
 
     def test_order_state_and_idempotent(self):
+        """网关/账本单测：test_order_state_and_idempotent"""
         status, body = self._req("POST", "/order", {
             "signal_id": "S1", "code": "600519.SH", "name": "贵州茅台", "side": "买入",
             "price_type": "market", "price": 1510, "qty": 100, "amount": 151000,
@@ -416,6 +435,7 @@ class TestGatewayHTTP(unittest.TestCase):
         self.assertFalse(body["ok"])
 
     def test_health_reports_broker_state(self):
+        """网关/账本单测：test_health_reports_broker_state"""
         status, body = self._req("GET", "/health", token="")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])

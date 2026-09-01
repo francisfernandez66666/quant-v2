@@ -18,6 +18,7 @@ class Idempotency:
     """基于 store.orders 的幂等守卫（占位式）。"""
 
     def __init__(self, store):
+        """构造幂等守卫。:param store: 本地 SQLite 账本（Store 实例），占位/查询均委托其原子操作。"""
         self.store = store
 
     def check(self, signal_id):

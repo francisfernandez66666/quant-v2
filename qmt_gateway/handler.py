@@ -82,6 +82,7 @@ def post_report(base_url, token, payload, retries=3):
 
 
 def json_dumps(o):
+    """将对象序列化为 JSON 字符串：ensure_ascii=False 保留中文，非标准类型走 str 兜底。"""
     import json
     return json.dumps(o, ensure_ascii=False, default=str)
 
@@ -90,6 +91,16 @@ class ReportHandler:
     """回报处理器：写库 + outbox 异步推送首尔。"""
 
     def __init__(self, store, report_url, report_token, user_id="", max_outbox=5000):
+        """构造回报处理器。
+
+        :param store: 本地 SQLite 账本（Store 实例）。
+        :param report_url: 首尔回报接收地址（引擎 /api/qmt/report）。
+        :param report_token: 回报鉴权 token（与首尔侧配置一致）。
+        :param user_id: 多账号归属标识（§P1-9），回报/落库统一携带。
+        :param max_outbox: outbox 落库行数上限，超限裁剪最旧。
+        English: builds the report handler — persists events to the local store and
+        pushes them to the decision-side /api/qmt/report via a durable outbox.
+        """
         self.store = store
         self.report_url = report_url
         self.report_token = report_token
@@ -108,6 +119,12 @@ class ReportHandler:
         self._max_outbox = max_outbox
 
     def start_sender(self):
+        """启动后台回报发送线程 + 上行心跳线程（幂等，重复调用直接返回）。
+
+        发送线程消费持久化 outbox；心跳线程在无交易时段也周期上报，
+        用于刷新首尔侧 last_report_at 证明回程连通。
+        English: starts the report-sender thread and the heartbeat thread (idempotent).
+        """
         if self._sender_thread is not None:
             return
         self._sender_thread = threading.Thread(
@@ -119,6 +136,7 @@ class ReportHandler:
         self._heartbeat_thread.start()
 
     def stop_sender(self):
+        """停止回报发送线程：置停止信号并唤醒发送协程使其退出。"""
         self._stop.set()
         with self._outbox_cv:
             self._outbox_cv.notify_all()
@@ -257,6 +275,13 @@ class ReportHandler:
 
     # ── 事件落库 + 推送 ──
     def on_order(self, ev):
+        """委托回报回调：落库并推送首尔。无 signal_id 的委托忽略（无法归因/幂等）。
+
+        §修复 G3：回调体全程异常保护——落库/推送异常绝不应冒泡到 xtquant 回调线程，
+        否则可能打断通道回调、丢失后续回报；异常仅记录并降级跳过本事件。
+        English: order-report callback — persists the order and pushes it to the decision
+        side; orders without a signal_id are ignored (no attribution/idempotency).
+        """
         # §修复 G3（2026-08-29）：回调体全程异常保护——落库/推送异常绝不应冒泡到 xtquant
         # 回调线程（否则可能打断通道回调、丢失后续回报）。异常仅记录并降级跳过本事件。
         try:
@@ -272,6 +297,12 @@ class ReportHandler:
             log.exception("[handler] on_order failed, event skipped: %s", ev)
 
     def on_trade(self, ev):
+        """成交回报回调：落库 + 去重 + 推送首尔。重复重放不推送（避免持仓翻倍）。
+
+        §修复 G3：回调异常保护（见 on_order 说明）。§P1-9 落库携带归属账号 ID。
+        English: trade/fill callback — persists, de-duplicates and pushes to the decision
+        side; replayed duplicates are dropped to avoid doubling positions.
+        """
         # §修复 G3（2026-08-29）：回调异常保护（见 on_order 说明）。
         try:
             # 成交先落库并去重；重复重放不推送，避免持仓翻倍
@@ -319,9 +350,16 @@ class ReportHandler:
         self._push({"type": "account", "asset": dict(asset)})
 
     def push_disconnect(self):
+        """对外封装断线回调（供外部调用方触发），等价于 on_disconnected。"""
         self.on_disconnected()
 
     def _push(self, payload):
+        """把回报入 outbox 持久化队列并唤醒发送线程（先落库后发送，崩溃/重启不丢回报）。
+
+        未配置 report_url 时直接丢弃（本地联调场景）；超 max_outbox 上限裁剪最旧
+        （极端保护）。English: enqueues a report into the durable outbox and wakes the
+        sender; dropped locally when no report_url is configured, trimmed when overflowing.
+        """
         # 未配置上报地址则直接丢弃（本地联调场景）
         if not self.report_url:
             return

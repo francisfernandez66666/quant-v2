@@ -96,6 +96,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
   }, [])
 
   const pctText = (() => {
+    // 现价相对昨收的涨跌幅文本（带 +/ 符号），数据缺失返回 '--'
     const p = ob.price || 0
     const pc = ob.prev_close || 0
     if (!p || !pc) return '--'
@@ -209,6 +210,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         near_pct: Number(factors.near_pct) || 0,
       }
       const drawPair = (a, b) => {
+        // 在盘口因子区绘制一行「标签-数值 × 2」：a/b 各含 label/val/color，行高自动下移
         ctx.textAlign = 'left'
         ctx.fillStyle = C.lv
         ctx.fillText(a.label, col1, fy)

@@ -118,7 +118,11 @@ func buildIntradayB(md *strategy_engine.StockMarketData) *n_shape.IntradayB {
 	}
 	// 近20日日均成交量：剔除今日未收盘K线，避免盘中把未完成的今日量计入均值（压低/抬升量比）。
 	// English: 20-day average daily volume, excluding today's unfinished bar to avoid distorting the ratio.
-	ib.AvgDailyVol = avgVol(kl[:len(kl)-1], 20)
+	// 空K线（len=0）时禁止切片 kl[:-1]（panic: slice bounds out of range），留零值由 avgVol 兜底返回 0。
+	// English: with an empty K-line list, slicing kl[:-1] would panic; leave the zero value (avgVol returns 0).
+	if len(kl) > 1 {
+		ib.AvgDailyVol = avgVol(kl[:len(kl)-1], 20)
+	}
 	// 分钟级 MACD 三值直接透传，供 B 段多头/红柱判断
 	// The three minute-level MACD values are passed through for the Segment-B bullish/red-bar judgement.
 	ib.MinuteMACDDIF = md.MinuteMACD.DIF

@@ -55,6 +55,7 @@ def _bs_call(fn, *args, **kwargs):
     fut = concurrent.futures.Future()
 
     def _run():
+        """在线程里执行目标查询函数：成功把结果写入 future，异常写入异常对象。"""
         try:
             fut.set_result(fn(*args, **kwargs))
         except BaseException as e:  # noqa: BLE001
@@ -269,6 +270,11 @@ def r_health(params):
 
 
 def r_trade_days(params):
+    """交易日历查询：baostock query_trade_dates → CSV（calendar_date,is_open）。
+
+    失败降级到新浪交易日历（ak.tool_trade_date_hist_sina，is_open 恒 1）。
+    English: trade-calendar query via baostock with a Sina fallback on failure.
+    """
     start, end = params.get("start", "2020-01-01"), params.get("end", "2026-12-31")
     try:
         rows, fields = _bs_query(bs.query_trade_dates, start_date=start, end_date=end)
@@ -281,6 +287,11 @@ def r_trade_days(params):
 
 
 def r_all_stock(params):
+    """全市场股票列表查询：baostock query_all_stock → CSV（code/name/tradeStatus）。
+
+    失败降级到 akshare stock_info_a_code_name。English: full stock-list query with
+    akshare fallback; returns code/name/tradeStatus rows.
+    """
     try:
         day = params.get("day") or _recent_weekday()
         rows, fields = _bs_query(bs.query_all_stock, day=day)
@@ -325,6 +336,12 @@ def r_stock_basic(params):
 
 
 def _kline_impl(params, index=False):
+    """日K线核心查询（baostock query_history_k_data_plus）。
+
+    :param params: 请求参数（code/start/end/adjust）。
+    :param index: 是否指数（指数走 _INDEX_FIELDS 无估值/ST 字段）。
+    English: core daily-K-line query via baostock; index=True uses the index field set.
+    """
     code = params.get("code", "")
     start, end = params.get("start", ""), params.get("end", "")
     adj = params.get("adjust", "3")  # 1后复权 2前复权 3不复权
@@ -335,6 +352,11 @@ def _kline_impl(params, index=False):
 
 
 def r_kline(params):
+    """股票日K线查询（baostock 主链路 + 新浪→东财降级链）。
+
+    akshare 降级需交易所前缀（sh/sz/bj），由 _sina_sym 转换。
+    English: stock daily-K query — baostock first, Sina then Eastmoney as fallbacks.
+    """
     code, start, end = params.get("code", ""), params.get("start", ""), params.get("end", "")
     try:
         return _kline_impl(params, index=False)
@@ -374,6 +396,15 @@ def r_adjust_factor(params):
 
 
 def _fina(params, fn, name):
+    """财务数据统一查询（baostock），参数校验 + 异常兜底说明。
+
+    财务类接口不做 akshare 降级（其为爬虫、易变），查询失败直接抛错，由上层处理。
+    :param params: 请求参数（code/year/quarter）。
+    :param fn: baostock 财务查询函数（profit/growth/balance/cashflow）。
+    :param name: 接口中文名（用于报错提示）。
+    English: unified financial-statement query via baostock with param validation; no
+    akshare fallback (unstable), failures raise with a descriptive error.
+    """
     code, year, quarter = params.get("code", ""), params.get("year", ""), params.get("quarter", "")
     if not (code and year and quarter):
         raise ValueError("finance 接口需要 code/year/quarter")
@@ -386,18 +417,22 @@ def _fina(params, fn, name):
 
 
 def r_profit(params):
+    """盈利能力财务数据（baostock query_profit_data）。"""
     return _fina(params, bs.query_profit_data, "profit")
 
 
 def r_growth(params):
+    """成长能力财务数据（baostock query_growth_data）。"""
     return _fina(params, bs.query_growth_data, "growth")
 
 
 def r_balance(params):
+    """偿债能力/资产负债表数据（baostock query_balance_data）。"""
     return _fina(params, bs.query_balance_data, "balance")
 
 
 def r_cashflow(params):
+    """现金流量数据（baostock query_cash_flow_data）。"""
     return _fina(params, bs.query_cash_flow_data, "cashflow")
 
 
@@ -427,6 +462,7 @@ _ROUTES = {
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # 精简 access log
+        """精简访问日志：把基类默认 stderr 输出改为 info 级别记录。"""
         log.info("req " + fmt % args)
 
     def do_GET(self):
@@ -457,6 +493,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    """pydata sidecar 命令行入口：解析参数 → 登录 baostock → 启动 ThreadingHTTPServer。
+
+    启动即登录（可用 BAOSTOCK_USER/BAOSTOCK_PASS 换账号），失败仅告警（请求时再报错）；
+    Ctrl+C 优雅退出并 logout。English: CLI entry — parse args, log in to baostock, and
+    start the threaded HTTP sidecar; graceful exit on interrupt.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)

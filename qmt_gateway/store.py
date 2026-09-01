@@ -50,6 +50,15 @@ class Store:
     """SQLite 账本。"""
 
     def __init__(self, path):
+        """初始化 SQLite 账本：打开数据库连接并建立线程安全锁。
+
+        :param path: 数据库文件路径。库文件尚不存在时新建并建表，否则走迁移逻辑
+                     （老库只补新列，保留既有数据）。启动后统一建 outbox 表
+                     （§ROBUST 持久化回报队列，旧库也补建）。English: opens the SQLite
+                     DB, creates schema on first run or migrates old DBs, guards all
+                     access with an RLock for multi-thread safety, and ensures the
+                     persistent outbox table exists.
+        """
         self.path = path
         # 全部读写统一持 RLock，保证多线程并发安全
         self._lock = threading.RLock()
@@ -72,6 +81,12 @@ class Store:
             self._conn.commit()
 
     def _init_schema(self):
+        """新建数据库时初始化全量表结构：持仓/委托/成交/幂等/outbox 等核心表。
+
+        首次运行（库文件不存在）时调用，executescript 批量建表；含 real_positions、
+        orders、fills、outbox、pending 等，索引一并建立。English: creates the full
+        schema (positions/orders/fills/outbox/pending) on first run via executescript.
+        """
         cur = self._conn.cursor()
         cur.executescript(
             """
@@ -389,6 +404,12 @@ class Store:
             return (dict(row) if row else None), False
 
     def list_positions(self):
+        """返回全部持仓（按市值降序）。返回 [{ts_code,name,qty,cost_price,amount,...}] 字典列表。
+
+        供 /state 查询与对账使用；纯读操作，持 RLock 保证并发安全。可能返回空列表
+        （未连接/无持仓——调用方必须按不可信快照处理）。English: returns all positions
+        ordered by amount descending, for /state queries and reconciliation.
+        """
         with self._lock:
             cur = self._conn.execute(
                 "SELECT * FROM real_positions ORDER BY amount DESC"
@@ -475,6 +496,11 @@ class Store:
 
 
 def _now_cn():
+    """返回当前北京时间 ISO 时间戳（东八区），如 "2026-09-01T09:30:00+08:00"。
+
+    用于订单/成交时间落库的统一口径，保证本机（广州）时区语义一致。
+    English: returns the current Beijing-time ISO timestamp for consistent order/fill timestamps.
+    """
     return time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 

@@ -65,15 +65,24 @@ class _CallbackAdapter:
     """
 
     def __init__(self, broker, inner):
+        """构造回调适配器。
+
+        :param broker: 被包装的通道实例（断线时调用其 mark_disconnected 复位连接态）。
+        :param inner: 真实回报处理器（handler.ReportHandler），事件经转发送达。
+        English: builds the callback adapter wrapping a broker (for disconnect reset) and
+        the inner report handler (for event forwarding).
+        """
         # 记录被包装的 broker（用于断线复位）与真实 handler（用于事件转发）
         self._broker = broker
         self._inner = inner
 
     def __getattr__(self, name):
+        """未显式定义的回调方法（如 on_stock_trade）统一转发给内部真实 handler。"""
         # 未显式定义的方法（如 on_stock_trade）统一转发给内部真实 handler
         return getattr(self._inner, name)
 
     def on_disconnected(self):
+        """断线回调：复位通道连接态并把断线事件转达 handler（异常仅记录不阻断）。"""
         self._broker.mark_disconnected()
         try:
             self._inner.on_disconnected()
@@ -81,6 +90,7 @@ class _CallbackAdapter:
             log.exception("[adapter] inner on_disconnected failed")
 
     def on_stock_order(self, order):
+        """委托回报回调：先回填 seq→交易所委托号映射，再转达 handler。"""
         try:
             self._broker.record_exchange_order_id(order)
         except Exception:  # noqa: BLE001
@@ -119,6 +129,14 @@ class XtBroker(Broker):
     """真实东莞证券 MiniQMT 通道。xtquant 延迟 import；connect() 时初始化。"""
 
     def __init__(self, account, session_id=1, path="", reconnect_sec=5):
+        """构造真实 MiniQMT 通道。
+
+        :param account: 券商资金账号。
+        :param session_id: xtquant 会话号（默认 1，按会话隔离的 IPC 队列名含此号）。
+        :param path: xtquant 连接路径（Windows 上通常为 'extended' 或本地端口目录）。
+        :param reconnect_sec: 重连循环失败重试间隔（秒）。
+        English: builds the real MiniQMT broker with account/session/path and reconnect interval.
+        """
         self.account = account
         self.session_id = session_id
         self.path = path  # xtquant 连接路径（Windows 上通常为 'extended' 或本地端口目录）
@@ -233,6 +251,14 @@ class XtBroker(Broker):
         return self._connected
 
     def place_order(self, req):
+        """真实下单（xtquant order_stock）。
+
+        前置校验：交易所后缀匹配（6→SH / 0,3→SZ / 4,8→BJ，防止 601086.SZ 类误传致 seq=-1）；
+        order_type 取本机 xtconstant（STOCK_BUY/SELL=23/24，§FIX 2026-08-31 跨构建枚举错位根因）；
+        返回 (ok, order_ref, err)，order_ref 为 "seq:<n>" 不透明串，真实委托号由回报回填。
+        English: real order placement with exchange-suffix pre-check and local xtconstant
+        order_type; returns an opaque "seq:<n>" ref resolved to the exchange id by callbacks.
+        """
         if not self._connected:
             return False, "", "not connected"
         code = str(req.get("code", "") or "")
@@ -294,6 +320,11 @@ class XtBroker(Broker):
         return True, "seq:%s" % seq_s, ""
 
     def cancel(self, order_id):
+        """真实撤单（cancel_order_stock）。支持 "seq:<n>" 占位引用 → 解析为真实交易所委托号后撤单。
+
+        未回报委托号时不可撤（返回失败原因）；非法串返回失败。
+        English: real cancel; resolves an opaque "seq:" ref to the exchange order id first.
+        """
         if not self._connected:
             return False, "not connected"
         oid = str(order_id or "")
@@ -317,6 +348,11 @@ class XtBroker(Broker):
         return True, ""
 
     def query_positions(self):
+        """查询真实持仓：映射 xtquant 持仓对象为网关统一字典（ts_code/name/qty/cost/amount...）。
+
+        未连接返回空列表（调用方按不可信快照处理）；英文: queries real positions from
+        xtquant and maps them into the gateway's unified position dicts.
+        """
         if not self._connected:
             return []
         poss = self._trader.query_stock_positions(self._acc)
@@ -335,6 +371,7 @@ class XtBroker(Broker):
         return out
 
     def subscribe(self):
+        """订阅回调（真实通道在 connect() 时已注册，此方法保持空实现以符合基类契约）。"""
         pass  # 回调已在 connect() 注册
 
     def query_asset(self):
@@ -349,6 +386,7 @@ class XtBroker(Broker):
                 return None
 
             def g(k, d=0.0):
+                # 统一取值辅助：兼容 dict 与对象属性两种返回形态
                 if isinstance(raw, dict):
                     return raw.get(k, d)
                 return getattr(raw, k, d)
@@ -368,6 +406,15 @@ class MockBroker(Broker):
     """内存模拟通道：等价 Go cmd/qmt-mock（下单→延时模拟成交→回调 handler）。"""
 
     def __init__(self, account="MOCK0001", delay_sec=1, seed=None, account_init=100000.0):
+        """构造内存模拟通道。
+
+        :param account: mock 资金账号（默认 MOCK0001）。
+        :param delay_sec: 模拟成交延时（秒），0 表示立即成交。
+        :param seed: 种子持仓列表 [{ts_code,name,qty,cost_price,...}]，用于对账测试。
+        :param account_init: 初始可用资金（默认 100000），种子持仓按成本占用现金。
+        English: builds the in-memory mock broker with optional seed positions and a
+        explicit cash account initialized to account_init minus seed-position cost.
+        """
         self.account = account
         self.account_init = account_init
         self.delay_sec = delay_sec
@@ -386,6 +433,7 @@ class MockBroker(Broker):
             self._cash -= float(seed_pos.get("qty", 0)) * float(seed_pos.get("cost_price", 0) or 0)
 
     def connect(self):
+        """模拟通道连接：直接置为已连接（无真实握手）。"""
         self._connected = True
         return True
 
@@ -398,11 +446,18 @@ class MockBroker(Broker):
         return self._connected
 
     def _next_order_id(self):
+        """自增生成 mock 委托号（MOCK + 6 位序号），保证唯一。"""
         # 自增生成 mock 委托号（MOCK 前缀 + 6 位序号），保证唯一
         self._next_id += 1
         return "MOCK%06d" % self._next_id
 
     def place_order(self, req):
+        """mock 下单：登记内存账本 → 后台延时模拟成交 → 回调 handler（订单+成交回报）。
+
+        §修复撤单竞态：订单已撤/已删时不再延迟成交、不改持仓、不回调。
+        English: mock order placement — records the order, then a delayed thread simulates
+        the fill and fires order/trade callbacks; cancelled/deleted orders never fill.
+        """
         with self._lock:
             # 生成 mock 委托号并落内存账本，状态先置“已报”
             order_id = self._next_order_id()
@@ -414,6 +469,7 @@ class MockBroker(Broker):
                  req.get("qty"), req.get("price"))
 
         def _fill():
+            """后台模拟成交线程：延时后把订单置为已成并回调订单+成交回报。"""
             time.sleep(self.delay_sec)
             filled_snapshot = None
             with self._lock:
@@ -446,6 +502,7 @@ class MockBroker(Broker):
         return True, order_id, ""
 
     def cancel(self, order_id):
+        """mock 撤单：仅「已报」态可撤（置为已撤），已成/不存在返回失败。"""
         with self._lock:
             o = self._orders.get(str(order_id))
             if o is None:

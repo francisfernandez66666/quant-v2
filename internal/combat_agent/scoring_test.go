@@ -115,6 +115,23 @@ func TestNShapeScoreAlwaysReturns(t *testing.T) {
 	}
 }
 
+// TestBuildIntradayBEmptyKLines 回归验证（UAT 2026-09-01 抓到）：
+// 空 KLines 时 buildIntradayB 不得 panic（曾因 `kl[:len(kl)-1]` 在 len=0 时越界崩溃整进程，
+// 症状 panic: slice bounds out of range [:-1]）。
+// English: TestBuildIntradayBEmptyKLines is a UAT regression test (2026-09-01): buildIntradayB must not
+// panic on an empty KLines list — the unguarded `kl[:len(kl)-1]` slice previously crashed the process
+// with "panic: slice bounds out of range [:-1]".
+func TestBuildIntradayBEmptyKLines(t *testing.T) {
+	md := &strategy_engine.StockMarketData{Code: "600000", Price: 10, KLines: nil}
+	ib := buildIntradayB(md)
+	if ib == nil {
+		t.Fatal("buildIntradayB 应返回非 nil 结构")
+	}
+	if ib.AvgDailyVol != 0 {
+		t.Fatalf("空K线时日均量应为 0, got %v", ib.AvgDailyVol)
+	}
+}
+
 // TestEvalForNShape 验证 8a/8b 的 N 形打分路径：nil matcher 不 panic，且恒返回总分。
 // 覆盖 adapter.go evalFor 中 N 形策略分支的完整数据适配链路。
 // English: TestEvalForNShape verifies the 8a/8b N-shape scoring path: a nil matcher does not panic and a total score is always returned; covers the full data-adaptation chain of the N-shape branch in adapter.go evalFor.

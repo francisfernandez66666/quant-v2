@@ -80,6 +80,13 @@ DEFAULT_CONFIG = {
 
 
 def load_config(path):
+    """加载网关配置：默认配置 + 用户 JSON 文件覆盖 + 环境变量 token 注入。
+
+    优先级：环境变量 QUANT_GATEWAY_TOKEN > 配置文件 token；report_token 同理
+    （QUANT_GATEWAY_REPORT_TOKEN，缺省回退 token）。返回合并后的配置字典。
+    English: loads gateway config — defaults merged with the user JSON file, then
+    environment-variable tokens (QUANT_GATEWAY_TOKEN / QUANT_GATEWAY_REPORT_TOKEN) override file values.
+    """
     cfg = dict(DEFAULT_CONFIG)
     if path and os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -138,6 +145,11 @@ def lot_rule(code, side):
 
 class Gateway:
     def __init__(self, cfg):
+        """构造网关实例：组装本地账本 / 幂等守卫 / 交易通道 / 回报处理器四大组件。
+
+        :param cfg: 已合并的配置字典（含 db/broker/report_url/report_token/user_id 等）。
+        :ivar _stop: 停止信号 Event，供各后台线程（重连/对账/回报发送）优雅退出。
+        """
         self.cfg = cfg
         # 组装四大核心组件：本地账本 / 幂等守卫 / 交易通道 / 回报处理器
         self.store = Store(cfg["db"])
@@ -155,6 +167,13 @@ class Gateway:
         self.allowed_ips = []
 
     def start(self):
+        """启动网关：清理崩溃残留 pending → 启动回报发送线程 → 后台连接 broker → 可选对账线程。
+
+        启动即先释放超过 10 分钟的超时 pending 占位（避免崩溃后 signal_id 永久死锁），
+        对仍在 10 分钟内的在途委托仅告警、不自动释放，交由人工核对券商侧。
+        English: boots the gateway — cleans stale pending placeholders, starts the report
+        sender, connects the broker in the background, and optionally starts reconciliation.
+        """
         # §修复 T5（2026-08-29）：启动时先清理「超时残留 pending 占位」——上次进程在下单窗口内 crash
         # 留下的 pending 行会永久阻塞 signal_id（首尔重试恒得 409 duplicate in-flight）。删除超过
         # 10 分钟的残留占位行，安全解锁；仍在 10 分钟内的（极短窗口内刚崩溃）保留并告警，避免
@@ -185,10 +204,18 @@ class Gateway:
             self._reconcile_thread.start()
 
     def stop(self):
+        """优雅停止：置停止信号并停掉回报发送线程（重连/对账线程随之退出）。"""
         self._stop.set()
         self.handler.stop_sender()
 
     def _connect_loop(self):
+        """后台重连线程：通道未连接时循环重试 connect()，连上即推全量对账与账户资产。
+
+        失败按 reconnect_sec 间隔重试直至进程停止；连上后立即上报持仓快照与可用资金，
+        使首尔侧快速对齐（空持仓快照由 handler.on_positions 守卫，不误清账本）。
+        English: background reconnect loop — retries connect() until the broker is up, then
+        pushes a full position reconciliation and account asset snapshot.
+        """
         # 后台重连线程：通道断开时持续重试 connect()，直到进程停止
         while not self._stop.is_set():
             if not self.broker.is_connected():
@@ -232,6 +259,13 @@ class Gateway:
         return 404, {"ok": False, "err": "not found"}
 
     def _do_order(self, body):
+        """处理 POST /order 下单：参数校验 → 幂等占位 → 真实下单 → 回填委托号。
+
+        校验 code/qty/signal_id（非空）、限价单必须有价格；按板块整手规则校验买入数量；
+        signal_id 为空一律拒绝（幂等与审计唯一锚点，§G2）；同 signal_id 幂等去重。
+        English: handles POST /order — validates params, takes the idempotent placeholder,
+        places the order via the broker, and fills back the exchange order id.
+        """
         # 下单主流程：参数校验 → 幂等占位 → 真实下单 → 回填
         req = body or {}
         code = str(req.get("code", "") or "")
@@ -302,6 +336,12 @@ class Gateway:
         return 200, {"ok": True, "order_id": order_ref, "err": ""}
 
     def _do_cancel(self, body):
+        """处理 POST /cancel 撤单：校验委托引用后委托 broker，结果如实返回。
+
+        失败返回 409 且不吞掉错误——让首尔侧继续跟踪该委托并告警，避免误判成功。
+        English: handles POST /cancel — validates the order ref and delegates to the broker,
+        returning failures honestly so the decision side keeps tracking the order.
+        """
         # 撤单：校验引用后委托给 broker，结果如实返回（失败不让首尔误判成功）
         order_ref = str((body or {}).get("order_id", "") or "")
         if not order_ref:
@@ -313,6 +353,12 @@ class Gateway:
         return 409, {"ok": False, "err": err or "cancel failed"}
 
     def _do_state(self):
+        """处理 GET /state 状态查询：返回通道连接态、账户与全部委托（含历史）。
+
+        通道未连接时持仓返回空列表（调用方按不可信快照处理，不据此清账）。
+        English: handles GET /state — returns connection state, account and all orders;
+        positions are empty when the broker is disconnected (treated as untrusted snapshot).
+        """
         positions = self.broker.query_positions() if self.broker.is_connected() else []
         orders = self.store.list_orders()
         return 200, {
@@ -377,6 +423,7 @@ class _Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(auth, expected)
 
     def _respond(self, status, payload):
+        """写 HTTP JSON 响应：UTF-8 编码、ensure_ascii=False 保留中文，串化兜底。"""
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -385,6 +432,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _dispatch(self):
+        """统一 HTTP 分发入口：解析路径/读 JSON 体 → IP 访问控制 → Bearer 鉴权 → 转交 Gateway.handle。
+
+        顶层 try/except（§G8）：handler 内任何异常返回结构化 500 而非裸断连，
+        避免首尔侧把无响应当 transport error 无限重试打爆网关。/health 免鉴权但受 IP 限制。
+        English: unified dispatch — parse/read body, enforce IP allow-list and Bearer auth,
+        then delegate to Gateway.handle with a top-level exception guard returning a structured 500.
+        """
         # 统一分发入口：解析路径/读取 JSON 体 → IP 访问控制 → 鉴权 → 交由 Gateway.handle 处理
         parsed = urlparse(self.path)
         # 先做 IP 访问控制（健康检查与敏感端点分别处理）
@@ -413,16 +467,25 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond(status, payload)
 
     def do_GET(self):  # noqa: N802
+        """处理 GET 请求（/health、/state 等只读端点），统一走 _dispatch。"""
         self._dispatch()
 
     def do_POST(self):  # noqa: N802
+        """处理 POST 请求（/order、/cancel 等写端点），统一走 _dispatch。"""
         self._dispatch()
 
     def log_message(self, *args):  # noqa: A003
+        # 静默基类默认访问日志（避免每请求打一行噪声，错误已由网关自身结构化日志覆盖）
         pass
 
 
 def main(argv=None):
+    """命令行入口：解析参数 → 装载配置 → 启动 HTTP/HTTPS 服务与网关后台线程。
+
+    支持 --config / --listen / --verbose；日志双通道（stderr + PID 隔离文件）。
+    English: CLI entry — parse args, load config, and start the HTTP/HTTPS server
+    with the gateway's background threads (reconnect/reconcile/report sender).
+    """
     # 命令行入口：解析参数 → 装载配置 → 启动 HTTP/HTTPS 服务与网关后台线程
     ap = argparse.ArgumentParser(description="MiniQMT gateway (M2)")
     ap.add_argument("-c", "--config", default="", help="config JSON path")
