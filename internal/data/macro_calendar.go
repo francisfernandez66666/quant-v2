@@ -309,9 +309,9 @@ func itoa(i int) string {
 // ExternalEvent 外部日历API返回的单条事件（标准JSON格式）
 // English: ExternalEvent is a single event returned by an external calendar API (standard JSON format).
 type ExternalEvent struct {
-	Date   string `json:"date"`   // YYYY-MM-DD
+	Date   string `json:"date"`   // 事件日期 YYYY-MM-DD
 	Title  string `json:"title"`  // 事件标题
-	Impact string `json:"impact"` // high/medium/low
+	Impact string `json:"impact"` // 影响程度：high/medium/low（高/中/低）
 	Level  string `json:"level"`  // 事件类型(可选): fomc/cpi/nfp/pce/contract
 	// English: Date: YYYY-MM-DD; Title: event title; Impact: high/medium/low; Level: event type (optional): fomc/cpi/nfp/pce/contract.
 }

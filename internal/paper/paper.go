@@ -190,7 +190,7 @@ type Trade struct {
 	// English: the strategy-pool type of this fill (for pooling and post-close research export; empty =
 	// the other pool / manual).
 	StrategyType string    `json:"strategy_type,omitempty"` // 战法类型
-	Side         string    `json:"side"`                    // buy / sell
+	Side         string    `json:"side"`                    // buy / sell（买入/卖出）
 	Price        float64   `json:"price"`                   // 价格
 	SignalPrice  float64   `json:"signal_price,omitempty"`  // 信号价
 	Qty          int       `json:"qty"`                     // 数量
@@ -246,7 +246,7 @@ type Order struct {
 	Name         string    `json:"name"`                    // 股票名称
 	Strategy     string    `json:"strategy"`                // 战法名
 	StrategyType string    `json:"strategy_type,omitempty"` // 战法池类型
-	Side         string    `json:"side"`                    // buy / sell
+	Side         string    `json:"side"`                    // buy / sell（买入/卖出）
 	Kind         string    `json:"kind"`                    // 来源：自动撮合/手动买入/自动清仓/自动减仓/手动卖出/手动减仓
 	SignalPrice  float64   `json:"signal_price,omitempty"`  // 信号价（参照）
 	Price        float64   `json:"price"`                   // 成交价（rejected 时为 0）
@@ -268,7 +268,7 @@ func newOrderID() string {
 // EquityPoint 净值序列（按交易日一个点）。
 // English: an equity-curve point, one per trading day.
 type EquityPoint struct {
-	Date  string  `json:"date"`  // YYYY-MM-DD
+	Date  string  `json:"date"`  // YYYY-MM-DD（交易日）
 	Value float64 `json:"value"` // 总资产 = 现金 + 持仓市值
 	Cash  float64 `json:"cash"`  // 现金
 }
@@ -512,25 +512,25 @@ func (e *Engine) mirrorCloseLocked(code string, price, qty float64, reason strin
 // drop the private fields (cash/positions/…), writing an empty object and loading cash=0 so the paper
 // book could never fill. State fields are therefore persisted explicitly.
 type persistedState struct {
-	Cash           float64 `json:"cash"`
+	Cash           float64 `json:"cash"`                      // 可用现金
 	InitialCapital float64 `json:"initial_capital,omitempty"` // 自定义初始资金（reset 设置；空历史时保留，重启后恢复）
 	// 自定义持仓上限：>0 生效，0=不设限（由资金自然决定）。不用 omitempty，
 	// 保证 0（不设限）也明确落盘可见，避免"上限设置没固化"的排查困惑。
 	// English: custom position cap — applies when > 0, 0 = unlimited (driven by the balance).
 	// No omitempty so that 0 (unlimited) is explicitly written to disk, avoiding "cap not persisted" confusion.
 	MaxPositions int                  `json:"max_positions"`
-	Positions    map[string]*Position `json:"positions"`
-	Trades       []Trade              `json:"trades"`
+	Positions    map[string]*Position `json:"positions"`        // 持仓（key=代码）
+	Trades       []Trade              `json:"trades"`           // 成交记录
 	Orders       []Order              `json:"orders,omitempty"` // 订单生命周期（旧数据无此字段，load 兼容为空）
-	Equity       []EquityPoint        `json:"equity"`
-	Realized     float64              `json:"realized"`
+	Equity       []EquityPoint        `json:"equity"`           // 净值序列
+	Realized     float64              `json:"realized"`         // 已实现盈亏
 	// Pools 战法资金池（key=策略类型，""=其他池；Pools 与 PoolTypes 同时落盘，跨重启保留各池现金）。
 	// 旧数据（无 Pools）兼容：load 时按现金建单池 {"": cash}，行为与分仓前完全一致。
 	// English: strategy cash pools (key = strategy type, "" = the other pool; both Pools and PoolTypes are
 	// persisted so per-pool cash survives restarts). Legacy data without Pools is compatible: load falls
 	// back to the single pool {"": cash}, identical to pre-allocation behavior.
 	Pools     map[string]float64 `json:"pools,omitempty"`
-	PoolTypes []string           `json:"pool_types,omitempty"`
+	PoolTypes []string           `json:"pool_types,omitempty"` // 池类型列表
 	// PoolMaxPos 每池持仓上限（key=策略类型，0=该池不单独设限；跨重启保留）。
 	// English: per-pool position caps (key = strategy type, 0 = no per-pool limit; survives restarts).
 	PoolMaxPos map[string]int `json:"pool_max_pos,omitempty"`
@@ -539,8 +539,8 @@ type persistedState struct {
 	// English: persisted per-pool performance (cumulative buy cost / realized P&L; counted after buy,
 	// sells still attribute to the pool). Legacy data without PoolPerf initializes empty records on load.
 	PoolPerf     map[string]*PoolPerf    `json:"pool_perf,omitempty"`
-	HasFilled    bool                    `json:"has_filled"`
-	PoolBuyRules map[string]*PoolBuyRule `json:"pool_buy_rules,omitempty"`
+	HasFilled    bool                    `json:"has_filled"`               // 是否已发生成交
+	PoolBuyRules map[string]*PoolBuyRule `json:"pool_buy_rules,omitempty"` // 每池买入规则
 }
 
 // tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
@@ -2215,11 +2215,11 @@ type PoolBuyRule struct {
 
 // poolDiscipline 每池买入纪律运行时状态（不持久化，重启重置——保守安全）。
 type poolDiscipline struct {
-	buysToday     int       // 今日已买次数
-	lastBuyAt     time.Time // 最近一次买入时间
-	spentToday    float64   // 今日已花费金额（元）
-	dayStartCash  float64   // §修复 S7：本日开始时池现金（预算分母，避免越买分母越小越松）
-	day           string    // 当前日期（跨日自动重置）
+	buysToday    int       // 今日已买次数
+	lastBuyAt    time.Time // 最近一次买入时间
+	spentToday   float64   // 今日已花费金额（元）
+	dayStartCash float64   // §修复 S7：本日开始时池现金（预算分母，避免越买分母越小越松）
+	day          string    // 当前日期（跨日自动重置）
 }
 
 // checkPoolDisciplinePre 分仓纪律预检查（不需要 cost）：日限次数+冷却+评分门槛。

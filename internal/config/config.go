@@ -502,7 +502,8 @@ type LLMConfig struct {
 	// 恒开流式 + 内部回落为默认策略）；显式 false = 关闭，走一次性非流式。
 	// 是否启用流式响应
 	Stream *bool `json:"stream,omitempty"`
-	// MaxRetryTimes D1 评分 LLM 调用轮询重试次数（含首次）。<=0 时回退默认 5。
+	// MaxRetryTimes D1 评分 LLM 调用轮询重试次数（含首次）。<=0 时回退默认 2（§信号速度 S5）。
+	// 当轮不反复死磕：失败股置 RetryPending 并入下轮重试队列，不丢分；配合增量 D1 提速。
 	// 重试防丢信号：LLM 偶发超时/限流时不再轻易丢弃重要 D1 评分。
 	// LLM 调用最大重试次数
 	MaxRetryTimes int `json:"max_retry_times"`
@@ -510,6 +511,13 @@ type LLMConfig struct {
 	// <=0 时回退默认 8；API 配额充足时调高可加快盘前新闻归因吞吐，前端可热改。
 	// LLM 批量分析最大并发批次
 	BatchConcurrency int `json:"batch_concurrency"`
+	// D1MaxTokens D1 评分 LLM 单次调用的 max_tokens（推理长度上限，§信号速度 S3）。
+	// <=0 时回退默认 2048。D1 评分输出为结构化 JSON，无需过长思维链，
+	// 限制长度可显著降低单股评分耗时（原非流式硬编码 4096）。前端可热改。
+	// English: max_tokens for D1 scoring LLM calls (reasoning-length cap, §speed S3). <=0 falls back to the
+	// default 2048. D1 outputs structured JSON needing no long chain-of-thought, so capping length cuts
+	// per-stock latency (previously hardcoded 4096 on the non-streaming path). Hot-adjustable in the UI.
+	D1MaxTokens int `json:"d1_max_tokens"`
 	// ClassifierModel 可选：新闻归因分类（Stage0/1 合并调用等"快速分类/初筛"）专用模型。
 	// 配置轻量/快速模型可显著加快分类吞吐，把主模型留给 D1/Stage2 等深度分析；留空与主模型一致。
 	// English: optional dedicated model for news-attribution classification (Stage0/1 combined calls and

@@ -26,8 +26,8 @@ type ConfrontationEvent struct {
 // confrontationFile 政策反制持久化文件结构。
 // TradingDay 记录当前交易日；Events 为当日政策反制事件（跨日自动清空）。
 type confrontationFile struct {
-	TradingDay string               `json:"trading_day"`
-	Events     []ConfrontationEvent `json:"events"`
+	TradingDay string               `json:"trading_day"` // 当前交易日
+	Events     []ConfrontationEvent `json:"events"`      // 当日政策反制事件
 }
 
 // ConfrontationStore 政策反制事件持久化存储。

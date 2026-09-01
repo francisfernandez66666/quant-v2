@@ -380,6 +380,34 @@ func (c *Client) ChatClassifier(system, user string) (string, error) {
 	return c.do(req)
 }
 
+// ChatD1 用主模型执行 D1 评分的非流式调用，显式指定 max_tokens 限制推理长度（§信号速度 S3）。
+// 配置项 rules.llm.d1_max_tokens 由引擎注入；maxTokens<=0 时回退默认 2048。
+// D1 输出为结构化 JSON（个股+分数+理由），限制 max_tokens 可在不损失评分质量的前提下显著
+// 降低单股耗时（原走 nonStreamChat 硬编码 4096）。
+// English: ChatD1 runs the D1-scoring chat non-streamingly with an explicit max_tokens cap (§speed S3),
+// fed by the rules.llm.d1_max_tokens config. maxTokens<=0 falls back to the default 2048. Since D1 emits
+// structured JSON, capping max_tokens cuts per-stock latency without hurting score quality (previously the
+// non-streaming path hardcoded 4096).
+func (c *Client) ChatD1(system, user string, maxTokens int) (string, error) {
+	if len(c.apiKeys) == 0 {
+		return "", fmt.Errorf("LLM_API_KEY not set")
+	}
+	if maxTokens <= 0 {
+		maxTokens = defaultD1MaxTokens
+	}
+	req := ChatRequest{
+		Model: c.model,
+		Messages: []Message{
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
+		},
+	}
+	return c.nonStreamChatMax(req, maxTokens)
+}
+
+// defaultD1MaxTokens D1 评分默认推理长度上限（§信号速度 S3，未配置 rules.llm.d1_max_tokens 时）。
+const defaultD1MaxTokens = 2048
+
 // messages 为完整消息序列，首条必须是 system（角色+注入数据），后接历史与当前提问。
 // 只透传调用方组装好的消息，不再自动追加 system，避免出现多条/中途 system 导致模型上下文错乱。
 // 与 Chat 一致默认走流式响应，解析失败自动回落到非流式。
@@ -562,7 +590,19 @@ type chatCompletionChunk struct {
 // nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用）。
 // （nonStreamChat fetches the full response in one non-streaming call (used on fallback/streaming off).）
 func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
-	body, err := c.post(req, false, 4096)
+	return c.nonStreamChatMax(req, defaultNonStreamMaxTokens)
+}
+
+// defaultNonStreamMaxTokens 非流式调用的默认 max_tokens（防超长输出触发上游 504/截断）。
+const defaultNonStreamMaxTokens = 4096
+
+// nonStreamChatMax 非流式一次性取回完整响应，显式指定 max_tokens（§信号速度 S3：
+// D1 评分输出为结构化 JSON，无需超长思维链，限制推理长度可显著降低单股评分耗时）。
+// nonStreamChatMax fetches the full response in one non-streaming call with an explicit max_tokens cap
+// (§speed S3: D1 scoring emits structured JSON needing no long chain-of-thought, so capping length cuts
+// per-stock latency).
+func (c *Client) nonStreamChatMax(req ChatRequest, maxTokens int) (string, error) {
+	body, err := c.post(req, false, maxTokens)
 	if err != nil {
 		return "", err
 	}

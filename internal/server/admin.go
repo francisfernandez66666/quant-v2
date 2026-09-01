@@ -46,9 +46,9 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 // createUserReq 管理员开户请求体。
 // English: createUserReq is the admin account-creation request body.
 type createUserReq struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Role     string `json:"role"` // 可选，缺省 user
+	Username string `json:"username"` // 用户名
+	Password string `json:"password"` // 密码
+	Role     string `json:"role"`     // 可选，缺省 user
 	// English: optional, defaults to user.
 	Perms []string `json:"perms"` // 可选，权限位列表
 	// English: optional, list of permission bits.
@@ -84,7 +84,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 // setUserRoleReq 设置角色请求体。
 // English: setUserRoleReq is the set-role request body.
 type setUserRoleReq struct {
-	Role string `json:"role"`
+	Role string `json:"role"` // 目标角色
 }
 
 // handleSetUserRole 处理 POST /api/admin/users/{id}/role：设置用户角色。
@@ -107,7 +107,7 @@ func (s *Server) handleSetUserRole(w http.ResponseWriter, r *http.Request) {
 // setUserPermsReq 设置权限位请求体。
 // English: setUserPermsReq is the set-perms request body.
 type setUserPermsReq struct {
-	Perms []string `json:"perms"`
+	Perms []string `json:"perms"` // 权限位列表（整体覆盖）
 }
 
 // handleSetUserPerms 处理 POST /api/admin/users/{id}/perms：整体覆盖用户权限位列表。
@@ -130,7 +130,7 @@ func (s *Server) handleSetUserPerms(w http.ResponseWriter, r *http.Request) {
 // setUserPasswordReq 重置密码请求体。
 // English: setUserPasswordReq is the password-reset request body.
 type setUserPasswordReq struct {
-	Password string `json:"password"`
+	Password string `json:"password"` // 新密码
 }
 
 // handleSetUserPassword 处理 POST /api/admin/users/{id}/password：重置用户密码并重签令牌。
@@ -153,7 +153,7 @@ func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request) {
 // setUserEnabledReq 启/禁用请求体。
 // English: setUserEnabledReq is the enable/disable request body.
 type setUserEnabledReq struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `json:"enabled"` // 是否启用
 }
 
 // setUserExpiryReq 设置有效期请求体。

@@ -70,29 +70,29 @@ func (c *HithinkClient) DownloadDumpFile(kind HithinkDumpKind, destPath string) 
 
 // HithinkDailyKRow 日 K dump 行（date_ms 由调用方换算 yyyyMMdd）。
 type HithinkDailyKRow struct {
-	ThsCode  string
-	Date     string // yyyyMMdd
-	Open     float64
-	High     float64
-	Low      float64
-	Close    float64
-	Volume   float64
-	Turnover float64
+	ThsCode  string  // 同花顺代码（如 "600519.SH"）
+	Date     string  // yyyyMMdd（交易日）
+	Open     float64 // 开盘价（元）
+	High     float64 // 最高价（元）
+	Low      float64 // 最低价（元）
+	Close    float64 // 收盘价（元）
+	Volume   float64 // 成交量
+	Turnover float64 // 换手率（%）
 }
 
 // thsDumpDailyKRow parquet 物理行结构（列名与官方 schema 一致）。
 type thsDumpDailyKRow struct {
-	ThsCode    string  `parquet:"thscode"`
-	Currency   string  `parquet:"currency"`
-	Interval   string  `parquet:"interval"`
-	Adjusted   string  `parquet:"adjusted"`
-	DateMs     int64   `parquet:"date_ms"`
-	OpenPrice  float64 `parquet:"open_price"`
-	HighPrice  float64 `parquet:"high_price"`
-	LowPrice   float64 `parquet:"low_price"`
-	ClosePrice float64 `parquet:"close_price"`
-	Volume     float64 `parquet:"volume"`
-	Turnover   float64 `parquet:"turnover"`
+	ThsCode    string  `parquet:"thscode"`     // 同花顺代码
+	Currency   string  `parquet:"currency"`    // 币种（如 CNY）
+	Interval   string  `parquet:"interval"`    // 周期（如 DAY）
+	Adjusted   string  `parquet:"adjusted"`    // 复权方式（如 QFQ/NONE）
+	DateMs     int64   `parquet:"date_ms"`     // 日期时间戳（毫秒）
+	OpenPrice  float64 `parquet:"open_price"`  // 开盘价
+	HighPrice  float64 `parquet:"high_price"`  // 最高价
+	LowPrice   float64 `parquet:"low_price"`   // 最低价
+	ClosePrice float64 `parquet:"close_price"` // 收盘价
+	Volume     float64 `parquet:"volume"`      // 成交量
+	Turnover   float64 `parquet:"turnover"`    // 成交额/换手率
 }
 
 // StreamDailyKParquet 流式解析日 K parquet，逐行回调（内存占用恒定）。
@@ -134,8 +134,8 @@ var _ = time.Second // 占位保留（限速器在客户端内）
 
 // HithinkAdjEvent 复权因子事件行（全量 dump 解析输出）。
 type HithinkAdjEvent struct {
-	ThsCode    string
-	ExDate     string  // yyyyMMdd
+	ThsCode    string  // 同花顺代码（如 "600519.SH"）
+	ExDate     string  // yyyyMMdd（除权除息日）
 	Dividend   float64 // 每股现金分红（税前）
 	BonusRatio float64 // 送股比例（10送N → N/10）
 	AllotRatio float64 // 配股比例
@@ -144,14 +144,14 @@ type HithinkAdjEvent struct {
 
 // thsDumpAdjRow 复权因子 dump 的 parquet 物理行结构（列名与官方 schema 一致）。
 type thsDumpAdjRow struct {
-	ThsCode          string  `parquet:"thscode"`
-	Ticker           string  `parquet:"ticker"`
-	ExDateMs         int64   `parquet:"ex_date_ms"`
-	DividendPerShare float64 `parquet:"dividend_per_share"`
-	PerShareBonus    float64 `parquet:"per_share_bonus"`
-	AllotmentRatio   float64 `parquet:"allotment_ratio"`
-	AllotmentPrice   float64 `parquet:"allotment_price"`
-	Currency         string  `parquet:"currency"`
+	ThsCode          string  `parquet:"thscode"`            // 同花顺代码
+	Ticker           string  `parquet:"ticker"`             // 市场代码
+	ExDateMs         int64   `parquet:"ex_date_ms"`         // 除权除息日（毫秒时间戳）
+	DividendPerShare float64 `parquet:"dividend_per_share"` // 每股现金分红
+	PerShareBonus    float64 `parquet:"per_share_bonus"`    // 每股送转
+	AllotmentRatio   float64 `parquet:"allotment_ratio"`    // 配股比例
+	AllotmentPrice   float64 `parquet:"allotment_price"`    // 配股价
+	Currency         string  `parquet:"currency"`           // 币种（如 CNY）
 }
 
 // StreamAdjFactorsParquet 流式解析复权因子事件 parquet，逐事件回调。

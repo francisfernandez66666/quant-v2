@@ -31,8 +31,8 @@ func tencentPrefix(code string) string {
 // gbKLine 请求体解构用的内部结构。
 // tencentKResp is the internal struct for decoding the Tencent K-line response.
 type tencentKResp struct {
-	Code int                     `json:"code"`
-	Data map[string]tencentKData `json:"data"`
+	Code int                     `json:"code"` // 返回码（0=成功）
+	Data map[string]tencentKData `json:"data"` // 代码 → K 线数据
 }
 
 // tencentKData 不同周期 K 线数组容器（前复权日线/日线/分钟线）。
@@ -42,13 +42,13 @@ type tencentKResp struct {
 // Minute rows may carry a bare `{}` placeholder (e.g. the volume column), which cannot
 // unmarshal into [][]string; the minute fields therefore use tencentRow (tolerant).
 type tencentKData struct {
-	QfqDay [][]string   `json:"qfqday"`
-	Day    [][]string   `json:"day"`
-	M1     []tencentRow `json:"m1"`
-	M5     []tencentRow `json:"m5"`
-	M15    []tencentRow `json:"m15"`
-	M30    []tencentRow `json:"m30"`
-	M60    []tencentRow `json:"m60"`
+	QfqDay [][]string   `json:"qfqday"` // 前复权日线
+	Day    [][]string   `json:"day"`    // 不复权日线
+	M1     []tencentRow `json:"m1"`     // 1 分钟线
+	M5     []tencentRow `json:"m5"`     // 5 分钟线
+	M15    []tencentRow `json:"m15"`    // 15 分钟线
+	M30    []tencentRow `json:"m30"`    // 30 分钟线
+	M60    []tencentRow `json:"m60"`    // 60 分钟线
 }
 
 // tencentRow 是腾讯分钟 K 线的一行；非字符串元素（如 `{}` 占位）容错为空串。

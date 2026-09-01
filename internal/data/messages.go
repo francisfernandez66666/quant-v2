@@ -37,9 +37,9 @@ type MessageItem struct {
 // messageFile 消息中心持久化文件结构。
 // TradingDay 记录当前交易日；Messages 为消息列表；DeletedKeys 为当日删除墓碑。
 type messageFile struct {
-	TradingDay  string        `json:"trading_day"`
-	Messages    []MessageItem `json:"messages"`
-	DeletedKeys []string      `json:"deleted_keys"`
+	TradingDay  string        `json:"trading_day"`  // 当前交易日
+	Messages    []MessageItem `json:"messages"`     // 消息列表
+	DeletedKeys []string      `json:"deleted_keys"` // 当日删除墓碑
 }
 
 // MessageStore 消息中心持久化存储。

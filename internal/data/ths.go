@@ -505,7 +505,7 @@ type thsQuoteRaw struct {
 		Volume    float64 `json:"volume"`     // 成交量
 		Amount    float64 `json:"amount"`     // 成交额
 		ChangePct float64 `json:"change_pct"` // 涨跌幅（%）
-	} `json:"items"`
+	} `json:"items"` // 代码 → 行情
 }
 
 // parseTHSQuote 解析同花顺实时行情响应体。

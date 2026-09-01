@@ -17,8 +17,8 @@ type BacktestJob struct {
 	ID          int64   `json:"id"`           // 任务自增 ID
 	Kind        string  `json:"kind"`         // candidate=单候选 / nightly=夜间全量 / library=战法库规则
 	CandidateID int64   `json:"candidate_id"` // kind=candidate/library 时对应候选或规则 ID（nightly=0）
-	Status      string  `json:"status"`       // running / paused / done / error / interrupted
-	Progress    string  `json:"progress"`     // "45%"
+	Status      string  `json:"status"`       // running / paused / done / error / interrupted（运行中/暂停/完成/错误/中断）
+	Progress    string  `json:"progress"`     // "45%"（进度百分比）
 	AvgExcess   float64 `json:"avg_excess"`   // 回测超额（h 日前瞻，done 后回填）
 	Error       string  `json:"error"`        // 失败原因（error 时）
 	// ResultText 战法库回测的汇总报告文本（阶段3.4：胜率/盈亏比等，done 后回填，前端直接展示）。

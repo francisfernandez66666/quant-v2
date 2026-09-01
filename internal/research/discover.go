@@ -44,13 +44,13 @@ type DiscoverResult struct {
 	Factors     []string           // 选中的因子集合（按加入顺序）
 	Directions  map[string]int     // factorID → 方向（+1 看多 / -1 看空）
 	Weights     map[string]float64 // 归一化权重（L1 和 = 1）
-	ICMean      float64
-	IR          float64
-	NDays       int
-	PassGuard   bool
-	Reason      string
-	InsampleIR  float64 // E3 样本内 IR（前半段）
-	OutsampleIR float64 // E3 样本外 IR（后半段）
+	ICMean      float64            // 样本内平均 IC（信息系数）
+	IR          float64            // 信息比率 = ICMean / ICStdev
+	NDays       int                // 有效评估天数
+	PassGuard   bool               // 是否通过护栏（样本量/信号强度校验）
+	Reason      string             // 未通过护栏时的原因说明
+	InsampleIR  float64            // E3 样本内 IR（前半段）
+	OutsampleIR float64            // E3 样本外 IR（后半段）
 	// 反推泛化（E3）：在样本外区间，把每日按复合分排序，高分组（top 20%）平均前瞻收益
 	// vs 非高分组平均 —— 衡量"相同因子环境在同类股票上是否普适上涨"。
 	GenTopMean float64 // 高分组平均前瞻收益

@@ -29,9 +29,9 @@ import (
 // knownStrategyInfo 实盘战法白名单中的单条战法元信息（供前端分组展示与切换）。
 // kind 取值：form=内置形态战法，factor=因子战法（fac_*），pattern=形态自动发现战法（pat_*）。
 type knownStrategyInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Kind string `json:"kind"`
+	ID   string `json:"id"`   // 战法 ID（如 dragon/fac_1/pat_2）
+	Name string `json:"name"` // 显示名
+	Kind string `json:"kind"` // form/factor/pattern（内置形态/因子/形态自动发现）
 }
 
 // knownStrategyList 返回实盘战法白名单全集：内置四形态战法 + 已应用的因子/形态战法（fac_*/pat_*）。
@@ -591,24 +591,24 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 
 // setQMTConfigReq 局部更新请求：指针字段=「本次要改的」，nil=保持不变。
 type setQMTConfigReq struct {
-	Enabled           *bool               `json:"enabled"`
-	Mode              *string             `json:"mode"`
-	GatewayURL        *string             `json:"gateway_url"`
-	Token             *string             `json:"token"`
-	PriceType         *string             `json:"price_type"`
-	FixedAmount       *float64            `json:"fixed_amount"`
-	MaxPositions      *int                `json:"max_positions"`
-	InitialCapital    *float64            `json:"initial_capital"`
-	Strategies        *[]string           `json:"strategies"`
-	StrategyAmounts   *map[string]float64 `json:"strategy_amounts"`
-	DailyMaxBuys      *int                `json:"daily_max_buys"`
-	DailyBudgetAmount *float64            `json:"daily_budget_amount"`
-	AutoSell          *bool               `json:"auto_sell"`
-	MissHeartbeatSec  *int                `json:"miss_heartbeat_sec"`
+	Enabled           *bool               `json:"enabled"`             // 是否启用量化实盘
+	Mode              *string             `json:"mode"`                // 运行模式（实盘/模拟等）
+	GatewayURL        *string             `json:"gateway_url"`         // 券商网关地址
+	Token             *string             `json:"token"`               // 网关鉴权令牌
+	PriceType         *string             `json:"price_type"`          // 委托价格类型（市价/限价）
+	FixedAmount       *float64            `json:"fixed_amount"`        // 单笔固定买入金额
+	MaxPositions      *int                `json:"max_positions"`       // 最大持仓数
+	InitialCapital    *float64            `json:"initial_capital"`     // 初始资金
+	Strategies        *[]string           `json:"strategies"`          // 启用战法列表
+	StrategyAmounts   *map[string]float64 `json:"strategy_amounts"`    // 各战法分配资金
+	DailyMaxBuys      *int                `json:"daily_max_buys"`      // 每日最大买入笔数
+	DailyBudgetAmount *float64            `json:"daily_budget_amount"` // 每日买入预算
+	AutoSell          *bool               `json:"auto_sell"`           // 是否自动卖出
+	MissHeartbeatSec  *int                `json:"miss_heartbeat_sec"`  // 心跳超时秒数
 	// §R4-1 kill-switch 与撤单闭环参数
-	Halted         *bool `json:"halted"`
-	CancelStaleSec *int  `json:"cancel_stale_sec"`
-	CloseSweepAt   *int  `json:"close_sweep_at"`
+	Halted         *bool `json:"halted"`           // 全局熔断暂停
+	CancelStaleSec *int  `json:"cancel_stale_sec"` // 未成交撤单超时秒数
+	CloseSweepAt   *int  `json:"close_sweep_at"`   // 尾盘清仓时间（分钟）
 }
 
 // handleSetQMTConfig 处理 POST /api/config/qmt：局部合并保存当前账号实盘配置并热加载生效。

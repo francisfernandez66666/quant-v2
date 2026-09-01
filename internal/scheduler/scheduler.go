@@ -86,9 +86,9 @@ type stateFile struct {
 	Done         bool   `json:"done"`                  // 该日链是否已全部完成
 	LastDataload int64  `json:"last_dataload_ts"`      // 交易时段最近一次 dataload UnixNano（节流）
 	LastStep     string `json:"last_step,omitempty"`   // 最近完成任务类型
-	LastStatus   string `json:"last_status,omitempty"` // done/error/interrupted/paused
-	LastError    string `json:"last_error,omitempty"`
-	LastAt       string `json:"last_at,omitempty"`
+	LastStatus   string `json:"last_status,omitempty"` // 最近状态：done/error/interrupted/paused
+	LastError    string `json:"last_error,omitempty"`  // 最近一次错误信息
+	LastAt       string `json:"last_at,omitempty"`     // 最近任务时间
 }
 
 // New 创建调度器。cfgPath/statePath 为空时由 dataDir 推导。

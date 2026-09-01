@@ -320,11 +320,12 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 			md.KLines = e.fetchDayKLine(code)
 			e.attachLiveBar(md)
 
-			// 资金流向（主力净流入，供资金维度评分）（Capital flow, main-force net inflow, for fund-dimension scoring）
-			cf, err := e.marketAPI.GetStockMoneyFlow(code)
-			if err == nil && cf != nil {
-				md.MoneyFlow = cf
-			}
+			// §信号速度 S0：资金流（fflow）批量调用已停用——全库无评分代码消费 md.MoneyFlow，
+			// 仅手动咨询路径 buildStockBlock 直连 GetStockMoneyFlow。停用可消灭每轮 56 次东财请求（熔断主源）。
+			// English: §speed S0 — per-stock capital-flow (fflow) batch fetch is disabled; no scorer reads
+			// md.MoneyFlow, only the manual consult path (buildStockBlock) fetches it directly. This cuts
+			// 56 EastMoney calls per round (the breaker storm source). Field/method retained for manual path.
+			md.MoneyFlow = nil
 
 			// 分钟K线（5分钟，48根≈当日）→ 计算 MACD，供 8a/8b 动量分与 N 形评分使用（Minute bars (5-min, 48 ≈ a day) → MACD for 8a/8b momentum and N-shape scoring）
 			minKL := e.cachedMinuteKLine(code)
@@ -469,10 +470,11 @@ func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 
 	klines := e.fetchDayKLine(code)
 
-	cf, err := e.marketAPI.GetStockMoneyFlow(code)
-	if err != nil {
-		cf = nil
-	}
+	// §信号速度 S0：资金流批量抓取已停用（无评分消费，见 BuildScoringData 同款注释），
+	// 返回 nil 资金流；手动咨询路径 internal/engine buildStockBlock 直连 GetStockMoneyFlow 不受影响。
+	// English: §speed S0 — capital-flow batch fetch disabled (no scorer consumes it); returns nil flow.
+	// The manual consult path (internal/engine buildStockBlock) still calls GetStockMoneyFlow directly.
+	var cf *data.CapitalFlow
 
 	e.klineCacheMu.Lock()
 	e.klineCache[code] = &klineCacheEntry{klines: klines, moneyFlow: cf, fetchedAt: now}

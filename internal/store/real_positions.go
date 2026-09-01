@@ -53,7 +53,7 @@ type RealOrder struct {
 // RealFill 实盘成交回报行。
 // （RealFill is one live fill report.）
 type RealFill struct {
-	ID       int64   `json:"id"`
+	ID       int64   `json:"id"`                // 自增 ID
 	OrderID  string  `json:"order_id"`          // 订单ID
 	Code     string  `json:"code"`              // 代码
 	Name     string  `json:"name"`              // 名称（成交回报携带，建仓回填）

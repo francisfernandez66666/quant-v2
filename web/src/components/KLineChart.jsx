@@ -6,11 +6,11 @@ import * as api from '../api/index.js'
 import './KLineChart.css'
 
 // ── 布局常量（逻辑像素）──
-const axisL = 48
-const plotL = axisL
-const plotR = 10
-const axisB = 16
-const plotT = 8
+const axisL = 48 // 左侧坐标轴宽
+const plotL = axisL // 绘图区左边距（=坐标轴宽）
+const plotR = 10 // 绘图区右边距
+const axisB = 16 // 底部坐标轴高
+const plotT = 8 // 绘图区上边距
 
 // 配色（浅色底、强对比，避免浅色线刺眼）
 const C = {
@@ -28,7 +28,7 @@ const C = {
 }
 // 分时价格线上涨/下跌颜色（红涨绿跌）
 const PRICE_UP = '#f5222d'
-const PRICE_DOWN = '#16a34a'
+const PRICE_DOWN = '#16a34a' // 下跌绿
 
 // 格式化成交量：>=1亿 显「亿」、>=1万 显「万」，否则原值
 function fmtVol(v) {

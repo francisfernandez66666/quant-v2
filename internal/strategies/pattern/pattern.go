@@ -25,9 +25,9 @@ import (
 // Cond 形态模板中的单个算子条件：某因子值落在 [Min, Max) 才视为满足。
 // （Cond is one operator condition: the factor value must lie in [Min, Max).）
 type Cond struct {
-	Factor string  `json:"factor"`
-	Min    float64 `json:"min"`
-	Max    float64 `json:"max"`
+	Factor string  `json:"factor"` // 因子名
+	Min    float64 `json:"min"`    // 下界（含），值需 >= Min
+	Max    float64 `json:"max"`    // 上界（不含），值需 < Max
 }
 
 // PatternRule 实盘形态模板规则（由 applied 的 pattern 候选构造）。
@@ -46,10 +46,10 @@ type ActivePattern struct {
 	CandID int64  // 来源候选 ID
 	Conds  []Cond // 条件集
 	// 效果监测
-	SignalCount int
-	Win         int
-	Loss        int
-	CumReturn   float64
+	SignalCount int     // 触发信号数
+	Win         int     // 触发后 5 日收益率为正的次数
+	Loss        int     // 触发后 5 日收益率为负的次数
+	CumReturn   float64 // 累计前向收益（监测实战效果用）
 }
 
 // PatternStrategy 形态战法策略：按一组 ActivePattern 对实盘个股解释执行。

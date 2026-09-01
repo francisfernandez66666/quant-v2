@@ -32,11 +32,11 @@ const patternWarmupDays = 40
 // English: per-window aggregate (checkpoint payload): benchmark sums/counts plus per-combo trigger
 // returns and out-of-sample split — all linearly mergeable across windows.
 type patWinAgg struct {
-	BaseSum float64     `json:"bs"`
-	BaseN   int         `json:"bn"`
-	Rets    [][]float64 `json:"rets"`
-	OutSums []float64   `json:"os"`
-	OutNs   []int       `json:"on"`
+	BaseSum float64     `json:"bs"`   // 基准窗口收益和（得分为 0 的空窗口基准）
+	BaseN   int         `json:"bn"`   // 基准窗口计数
+	Rets    [][]float64 `json:"rets"` // 各参数组合触发收益
+	OutSums []float64   `json:"os"`   // 组合外（样本外）累计收益
+	OutNs   []int       `json:"on"`   // 组合外样本数
 }
 
 // PatternCond 模板中的一个算子条件：某因子值落在 [Min, Max) 区间才视为满足。
@@ -76,16 +76,16 @@ type DiscoverOptsPattern struct {
 // （PatternTemplate is a searchable template skeleton with per-operator parameter grids; the search
 // takes the Cartesian product of Min/Max candidates.）
 type PatternTemplate struct {
-	Name  string
-	Conds []CondGrid
+	Name  string     // 模板名称
+	Conds []CondGrid // 各算子的参数网格（搜索时做笛卡尔积）
 }
 
 // CondGrid 单个算子的参数搜索网格。
 // （CondGrid is one operator's parameter search grid.）
 type CondGrid struct {
-	Factor  string
-	MinVals []float64
-	MaxVals []float64
+	Factor  string    // 算子名称（如因子ID）
+	MinVals []float64 // 下界候选值列表
+	MaxVals []float64 // 上界候选值列表
 }
 
 // evalPattern 对某模板在 [start,end] 区间逐日评估触发与前瞻超额。

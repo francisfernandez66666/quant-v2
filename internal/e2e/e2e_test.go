@@ -390,8 +390,10 @@ func TestEndToEndFullPipeline(t *testing.T) {
 		if md.KLines == nil || len(md.KLines) < 60 {
 			t.Errorf("300750 K线不足60根, got %d", len(md.KLines))
 		}
-		if md.MoneyFlow == nil {
-			t.Error("300750 资金流缺失")
+		// §信号速度 S0：资金流（fflow）批量调用已停用（全库无评分消费），md.MoneyFlow 应为 nil；
+		// 手动咨询路径 buildStockBlock 直连 GetStockMoneyFlow 不受影响。
+		if md.MoneyFlow != nil {
+			t.Error("S0 停用批量资金流后 md.MoneyFlow 应为 nil（仅手动咨询路径直连 fflow）")
 		}
 
 		mt := sr.MarketData["600519"]

@@ -117,9 +117,11 @@ type Engine struct {
 	prevPass         map[string]map[string]bool                                          // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
 	prevBullBuy      map[string]map[string]bool                                          // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
 	lastD1Scores     map[string]combat_agent.D1Score                                     // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
+	d1ScoredSig      map[string]string                                                   // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
 	d1RetryQueue     map[string]bool                                                     // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
 	lastEmotionPhase string                                                              // 主循环最近一轮情绪阶段（近实时循环复用）
-	d1MaxRetries     int                                                                 // D1 评分 LLM 轮询重试次数（<=0 用默认5）
+	d1MaxRetries     int                                                                 // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
+	d1MaxTokens      int                                                                 // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
 	lastTiming       *RunTiming                                                          // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
 	factorMon        *factorMonitor                                                      // 因子战法效果监测（战法库触发信号前向收益结算）
 	paper            *paper.Engine                                                       // 模拟盘引擎（独立纸面交易，可空=未启用）
@@ -220,10 +222,18 @@ func (e *Engine) SetSectorConstituentTopN(n int) {
 	e.mu.Unlock()
 }
 
-// SetD1MaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。n<=0 使用默认5。
+// SetD1MaxRetries 设置 D1 评分 LLM 调用的轮询重试次数（含首次）。n<=0 使用默认2（§S5）。
 func (e *Engine) SetD1MaxRetries(n int) {
 	e.mu.Lock()
 	e.d1MaxRetries = n
+	e.mu.Unlock()
+}
+
+// SetD1MaxTokens 设置 D1 评分 LLM 单次调用的推理长度上限（§信号速度 S3）。n<=0 使用默认2048。
+// English: SetD1MaxTokens sets the per-call reasoning-length cap for D1 scoring (§speed S3); n<=0 uses 2048.
+func (e *Engine) SetD1MaxTokens(n int) {
+	e.mu.Lock()
+	e.d1MaxTokens = n
 	e.mu.Unlock()
 }
 
@@ -335,20 +345,20 @@ func (e *Engine) RecordPatternForwardReturn(ruleID string, ret float64) {
 
 // stageRecordFile Stage 记录磁盘持久化结构（按交易日分桶）。
 type stageRecordFile struct {
-	TradingDay string                `json:"trading_day"`
-	Records    []newsagent.DebugInfo `json:"records"`
+	TradingDay string                `json:"trading_day"` // 交易日
+	Records    []newsagent.DebugInfo `json:"records"`     // Stage 调试记录
 }
 
 // hotRecordFile 热点板块记录磁盘持久化结构（按交易日分桶）。
 type hotRecordFile struct {
-	TradingDay string           `json:"trading_day"`
-	Records    []data.HotRecord `json:"records"`
+	TradingDay string           `json:"trading_day"` // 交易日
+	Records    []data.HotRecord `json:"records"`     // 热点板块记录
 }
 
 // signalRecordFile 信号批次记录磁盘持久化结构（按交易日分桶）。
 type signalRecordFile struct {
-	TradingDay string                   `json:"trading_day"`
-	Records    []combat_agent.SignalLog `json:"records"`
+	TradingDay string                   `json:"trading_day"` // 交易日
+	Records    []combat_agent.SignalLog `json:"records"`     // 信号批次记录
 }
 
 // New 创建顶层编排引擎。
@@ -429,6 +439,7 @@ func New(
 		prevPass:         make(map[string]map[string]bool),
 		prevBullBuy:      make(map[string]map[string]bool),
 		lastD1Scores:     make(map[string]combat_agent.D1Score),
+		d1ScoredSig:      make(map[string]string),
 		d1RetryQueue:     make(map[string]bool),
 		factorMon:        newFactorMonitor(dataDir, 5),
 	}
@@ -1196,8 +1207,8 @@ func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_e
 			sr.ScoringPool = append(sr.ScoringPool, c)
 			poolSet[c] = true
 		}
-		// 3. 补 PE（N 形 D3 超跌评分）
-		peScores[c] = e.marketAPI.GetStockPE(c)
+		// 3. 补 PE（N 形 D3 超跌评分；§S2 传现价，当日首取后盘中按现价推算）
+		peScores[c] = e.marketAPI.GetStockPEAt(c, md.Price)
 	}
 
 	log.Printf("[engine] 板块→个股归因: 补 %d 只成分股行情并入打分池, 板块=%d", len(extras), len(secOf))
@@ -1713,12 +1724,14 @@ func (e *Engine) buildStockBlock(code, name string) string {
 	}
 	b.WriteString(" ——\n")
 
-	// 实时报价（东财 push2，含主力净流入）
+	// 实时报价（东财优先，含主力净流入 f62；主循环高频路径仍走 GetRealtimeQuote 的 S4 新浪→腾讯→东财链）
+	// English: consult prefers EastMoney so the main-force net-inflow (f62) is injected; the hot main loop
+	// keeps the §S4 Sina→Tencent→EastMoney chain via GetRealtimeQuote.
 	if e.marketAPI == nil {
 		b.WriteString("实时行情数据源未初始化。\n")
 		return b.String()
 	}
-	si, err := e.marketAPI.GetRealtimeQuote(code)
+	si, err := e.marketAPI.GetRealtimeQuoteWithFlow(code)
 	if err == nil && si != nil && si.Price > 0 {
 		if si.Name != "" {
 			name = si.Name
@@ -2780,8 +2793,10 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	d1Scorer := combat_agent.NewD1Scorer(llmClient, "")
 	e.mu.RLock()
 	retries := e.d1MaxRetries
+	maxTokens := e.d1MaxTokens
 	e.mu.RUnlock()
 	d1Scorer.SetMaxRetries(retries)
+	d1Scorer.SetMaxTokens(maxTokens)
 	e.mu.RLock()
 	retryQueue := make([]string, 0, len(e.d1RetryQueue))
 	for code := range e.d1RetryQueue {
@@ -2803,7 +2818,37 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		log.Printf("[engine] D1重试队列%d只并入本轮打分池", len(retryQueue))
 	}
 	d1Scorer.SetSectorEvents(eventMap)
-	d1Scores := d1Scorer.BatchScore(sr.ScoringPool, valid, sr.MarketData)
+	// §信号速度 S1：增量 D1 —— 只对"有新事件/缺分/待重试"的个股调 LLM，其余复用上一轮评分。
+	// 事件签名（EventSignature）= 命中该股新闻事件 Datetime+Title 排序拼接 + 板块事件标题；
+	// 签名未变 → 直接复用 lastD1Scores，避免每轮全池 56 只重复调 LLM（主循环耗时主因）。
+	// English: §speed S1 — incremental D1: only re-score codes with new events / missing scores / pending
+	// retries; the rest reuse the previous round's score. Signature = matched news "Datetime|Title" (sorted)
+	// plus sector event title; unchanged signature → reuse, cutting per-round LLM calls from full-pool to new-only.
+	e.mu.RLock()
+	prevScores := e.lastD1Scores
+	prevSig := e.d1ScoredSig
+	e.mu.RUnlock()
+	toScore := make([]string, 0, len(sr.ScoringPool))
+	reuse := make(map[string]combat_agent.D1Score, len(sr.ScoringPool))
+	sigNow := make(map[string]string, len(sr.ScoringPool))
+	for _, code := range sr.ScoringPool {
+		sig := combat_agent.EventSignature(code, sr.MarketData[code], valid, eventMap[code])
+		sigNow[code] = sig
+		if prev, ok := prevScores[code]; ok && !prev.RetryPending && prevSig[code] == sig {
+			reuse[code] = prev
+			continue
+		}
+		toScore = append(toScore, code)
+	}
+	d1Scores := d1Scorer.BatchScore(toScore, valid, sr.MarketData)
+	for code, sc := range reuse {
+		d1Scores[code] = sc
+	}
+	log.Printf("[engine] D1增量: 全池%d只 → 复用%d只(无新事件) 重评%d只", len(sr.ScoringPool), len(reuse), len(toScore))
+	// 记录本轮评分时的事件签名（供下轮增量复用判定；离池个股签名一并清理防无限增长）
+	e.mu.Lock()
+	e.d1ScoredSig = sigNow
+	e.mu.Unlock()
 	// 收集 LLM 失败待重试个股：并入重试队列（下轮重调 LLM），并清理已成功个股。
 	// English: collect RetryPending stocks into the retry queue (re-scored next round); drop the resolved ones.
 	nextRetry := make(map[string]bool)
@@ -2846,11 +2891,19 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// English: prefetch PE for the scoring pool (N-shape D3 oversold). Constituent PE was filled in 9c;
 	// only remaining pool codes are fetched here.
 	_stepPE := time.Now()
+	// §S2：现价取 5s 新浪快照（一次性快照，不新增请求），PE 当日首取后盘中按现价推算。
+	// English: §S2 — take one 5s Sina snapshot for live prices (no extra requests); after the daily first
+	// fetch, PE is derived intraday from the live price.
+	snap := e.snapshotQuotes()
 	for _, code := range sr.ScoringPool {
 		if _, ok := peScores[code]; ok {
 			continue
 		}
-		peScores[code] = e.marketAPI.GetStockPE(code)
+		price := 0.0
+		if si := snap[code]; si != nil && si.Price > 0 {
+			price = si.Price
+		}
+		peScores[code] = e.marketAPI.GetStockPEAt(code, price)
 	}
 	_peT := time.Since(_stepPE)
 

@@ -41,7 +41,7 @@ type clsNewsRaw struct {
 	StockList []struct {
 		Name    string `json:"name"`    // 关联股票名称
 		StockID string `json:"StockID"` // 关联股票内部 ID
-	} `json:"stock_list"`
+	} `json:"stock_list"` // 关联股票列表
 }
 
 // clsSign 计算财联社接口签名：

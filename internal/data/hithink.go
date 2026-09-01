@@ -40,10 +40,10 @@ var (
 
 // HithinkEnvelope 统一响应信封。
 type HithinkEnvelope struct {
-	Code      int             `json:"code"`
-	Message   string          `json:"message"`
-	RequestID string          `json:"request_id"`
-	Data      json.RawMessage `json:"data"`
+	Code      int             `json:"code"`       // 业务码（0=成功，非 0 见分类错误表）
+	Message   string          `json:"message"`    // 错误/提示消息
+	RequestID string          `json:"request_id"` // 请求追踪 ID
+	Data      json.RawMessage `json:"data"`       // 业务数据（JSON 原始字节，按接口解析）
 }
 
 // hithinkLimiter 令牌桶限速器（QPS 可运行时下调以自适应 4001）。
@@ -171,24 +171,24 @@ func (c *HithinkClient) get(path string, params url.Values, out any) error {
 
 // HithinkSnapshotItem 行情快照条目。
 type HithinkSnapshotItem struct {
-	ThsCode             string  `json:"thscode"`
-	Ticker              string  `json:"ticker"`
-	LastPrice           float64 `json:"last_price"`
-	PriceChange         float64 `json:"price_change"`
-	PriceChangeRatioPct float64 `json:"price_change_ratio_pct"`
-	OpenPrice           float64 `json:"open_price"`
-	HighPrice           float64 `json:"high_price"`
-	LowPrice            float64 `json:"low_price"`
-	PrevPrice           float64 `json:"prev_price"`
-	Volume              float64 `json:"volume"`
-	Turnover            float64 `json:"turnover"`
+	ThsCode             string  `json:"thscode"`                // 同花顺代码（如 "600519.SH"）
+	Ticker              string  `json:"ticker"`                 // 股票代码（6 位）
+	LastPrice           float64 `json:"last_price"`             // 最新价（元）
+	PriceChange         float64 `json:"price_change"`           // 涨跌额（元）
+	PriceChangeRatioPct float64 `json:"price_change_ratio_pct"` // 涨跌幅（%）
+	OpenPrice           float64 `json:"open_price"`             // 开盘价（元）
+	HighPrice           float64 `json:"high_price"`             // 最高价（元）
+	LowPrice            float64 `json:"low_price"`              // 最低价（元）
+	PrevPrice           float64 `json:"prev_price"`             // 昨收价（元）
+	Volume              float64 `json:"volume"`                 // 成交量（股）
+	Turnover            float64 `json:"turnover"`               // 成交额（元）
 }
 
 // HithinkSnapshot 行情快照数据容器。
 type HithinkSnapshot struct {
-	Timestamp int64                 `json:"timestamp"`
-	Total     int                   `json:"total"`
-	Item      []HithinkSnapshotItem `json:"item"`
+	Timestamp int64                 `json:"timestamp"` // 行情时间戳（毫秒）
+	Total     int                   `json:"total"`     // 条目总数
+	Item      []HithinkSnapshotItem `json:"item"`      // 快照条目列表
 }
 
 // Snapshot 行情快照：thscodes 逗号分隔批量取（显式传入不分页）。
@@ -205,8 +205,8 @@ func (c *HithinkClient) Snapshot(thscodes []string) (*HithinkSnapshot, error) {
 
 // HithinkCalendarDay 交易日历条目。
 type HithinkCalendarDay struct {
-	DateMs int64  `json:"date_ms"`
-	Date   string `json:"date"` // yyyyMMdd
+	DateMs int64  `json:"date_ms"` // 交易日毫秒时间戳
+	Date   string `json:"date"`    // 交易日（yyyyMMdd）
 }
 
 // TradingDays 近一年交易日序列（无入参）。文档：GET /api/a-share/calendar/trading-days
@@ -330,28 +330,28 @@ func (c *HithinkClient) BatchQuotes(codes []string) (map[string]*StockInfo, erro
 
 // HithinkAuctionItem 竞价快照条目。
 type HithinkAuctionItem struct {
-	ThsCode            string  `json:"thscode"`
-	Ticker             string  `json:"ticker"`
-	Name               string  `json:"name"`
-	AuctionPrice       float64 `json:"auction_price"`
-	AuctionPct         float64 `json:"auction_pct"` // 竞价涨跌幅%
-	AuctionVolume      float64 `json:"auction_volume"`
-	AuctionAmount      float64 `json:"auction_amount"`
-	AuctionUnmatched   float64 `json:"auction_unmatched"`
-	AuctionTurnoverPct float64 `json:"auction_turnover_pct"`
+	ThsCode            string  `json:"thscode"`              // 同花顺代码（如 "600519.SH"）
+	Ticker             string  `json:"ticker"`               // 股票代码（6 位）
+	Name               string  `json:"name"`                 // 股票名称
+	AuctionPrice       float64 `json:"auction_price"`        // 竞价参考价（元）
+	AuctionPct         float64 `json:"auction_pct"`          // 竞价涨跌幅（%）
+	AuctionVolume      float64 `json:"auction_volume"`       // 竞价成交量（股）
+	AuctionAmount      float64 `json:"auction_amount"`       // 竞价成交额（元）
+	AuctionUnmatched   float64 `json:"auction_unmatched"`    // 竞价未匹配量（股）
+	AuctionTurnoverPct float64 `json:"auction_turnover_pct"` // 竞价换手率（%）
 	AuctionVolumeRatio float64 `json:"auction_volume_ratio"` // 竞价量比
-	PreClosePrice      float64 `json:"pre_close_price"`
-	OpenPrice          float64 `json:"open_price"`
-	LastPrice          float64 `json:"last_price"`
-	FloatMarketCap     float64 `json:"float_market_cap"`
+	PreClosePrice      float64 `json:"pre_close_price"`      // 昨收价（元）
+	OpenPrice          float64 `json:"open_price"`           // 开盘价（元）
+	LastPrice          float64 `json:"last_price"`           // 最新价（元）
+	FloatMarketCap     float64 `json:"float_market_cap"`     // 流通市值（元）
 }
 
 // HithinkAuctionSnapshot 竞价快照容器（含阶段与状态）。
 type HithinkAuctionSnapshot struct {
-	Timestamp    int64                `json:"timestamp"`
-	AuctionPhase string               `json:"auction_phase"`
-	DataStatus   string               `json:"data_status"`
-	Item         []HithinkAuctionItem `json:"item"`
+	Timestamp    int64                `json:"timestamp"`     // 数据时间戳（毫秒）
+	AuctionPhase string               `json:"auction_phase"` // 竞价阶段（live 实时 / final 终态）
+	DataStatus   string               `json:"data_status"`   // 数据状态标记
+	Item         []HithinkAuctionItem `json:"item"`          // 竞价条目列表
 }
 
 // Auction 竞价快照：thscodes 批量；stage=live(实时)/final(终态)。
@@ -373,19 +373,19 @@ func (c *HithinkClient) Auction(thscodes []string, stage string) (*HithinkAuctio
 
 // HithinkLimitUpItem 涨停池条目（含盘口级关键字段）。
 type HithinkLimitUpItem struct {
-	ThsCode             string  `json:"thscode"`
-	Ticker              string  `json:"ticker"`
-	Name                string  `json:"name"`
-	IsST                bool    `json:"is_st"`
-	IsNew               bool    `json:"is_new"`
-	LastPrice           float64 `json:"last_price"`
-	PriceChangeRatioPct float64 `json:"price_change_ratio_pct"`
-	LimitUpTime         string  `json:"limit_up_time"`     // 首次封板 HH:MM
-	LimitUpReason       *string `json:"limit_up_reason"`   // 涨停原因（可能 null）
-	ContinueDayText     string  `json:"continue_day_text"` // 如 "5天4板"
-	ContinueDayCnt      int     `json:"continue_day_cnt"`  // 连板数
-	SealMoney           float64 `json:"seal_money"`        // 当前封单额（元）
-	MaxSealMoney        float64 `json:"max_seal_money"`    // 峰值封单额（元）
+	ThsCode             string  `json:"thscode"`                // 同花顺代码（如 "600519.SH"）
+	Ticker              string  `json:"ticker"`                 // 股票代码（6 位）
+	Name                string  `json:"name"`                   // 股票名称
+	IsST                bool    `json:"is_st"`                  // 是否 ST 股票
+	IsNew               bool    `json:"is_new"`                 // 是否新股
+	LastPrice           float64 `json:"last_price"`             // 最新价（元）
+	PriceChangeRatioPct float64 `json:"price_change_ratio_pct"` // 涨跌幅（%）
+	LimitUpTime         string  `json:"limit_up_time"`          // 首次封板 HH:MM
+	LimitUpReason       *string `json:"limit_up_reason"`        // 涨停原因（可能 null）
+	ContinueDayText     string  `json:"continue_day_text"`      // 如 "5天4板"
+	ContinueDayCnt      int     `json:"continue_day_cnt"`       // 连板数
+	SealMoney           float64 `json:"seal_money"`             // 当前封单额（元）
+	MaxSealMoney        float64 `json:"max_seal_money"`         // 峰值封单额（元）
 	// 炸板池专用字段（涨停/跌停池响应中缺省为零值，无碍）：
 	OpenTimes        int     `json:"open_times"`         // 开板次数
 	TurnoverRatioPct float64 `json:"turnover_ratio_pct"` // 换手率%
@@ -394,14 +394,14 @@ type HithinkLimitUpItem struct {
 
 // HithinkPoolPage 分页容器（三池共用形状）。
 type HithinkPoolPage struct {
-	Timestamp  int64 `json:"timestamp"`
+	Timestamp  int64 `json:"timestamp"` // 数据时间戳（毫秒）
 	Pagination struct {
-		Total int `json:"total"`
-		Pages int `json:"pages"`
-		Size  int `json:"size"`
-		Page  int `json:"page"`
-	} `json:"pagination"`
-	Item []HithinkLimitUpItem `json:"item"`
+		Total int `json:"total"` // 总条目数
+		Pages int `json:"pages"` // 总页数
+		Size  int `json:"size"`  // 每页条数
+		Page  int `json:"page"`  // 当前页码（从 1 起）
+	} `json:"pagination"` // 分页信息
+	Item []HithinkLimitUpItem `json:"item"` // 池内股票条目
 }
 
 // LimitUpPool 涨停股票池（dateMs=0 取当日；自动翻页取尽）。
@@ -443,12 +443,12 @@ func (c *HithinkClient) fetchPool(name string, dateMs int64) ([]HithinkLimitUpIt
 
 // HithinkLadderBoard 连板天梯单板位条目。
 type HithinkLadderBoard struct {
-	ThsCode     string `json:"thscode"`
-	Ticker      string `json:"ticker"`
-	Name        string `json:"name"`
-	BoardNum    int    `json:"board_num"`
-	SealNextDay *bool  `json:"seal_nextday"`
-	SignLevel   int    `json:"sign_level"`
+	ThsCode     string `json:"thscode"`      // 同花顺代码（如 "600519.SH"）
+	Ticker      string `json:"ticker"`       // 股票代码（6 位）
+	Name        string `json:"name"`         // 股票名称
+	BoardNum    int    `json:"board_num"`    // 连板数
+	SealNextDay *bool  `json:"seal_nextday"` // 次日是否续封（可能 null）
+	SignLevel   int    `json:"sign_level"`   // 信号强度等级
 }
 
 // LimitUpLadder 近 30 交易日连板天梯矩阵（无参数）。
@@ -463,11 +463,11 @@ func (c *HithinkClient) LimitUpLadder() (json.RawMessage, error) {
 
 // HithinkAnomalyItem 个股异动原因条目。
 type HithinkAnomalyItem struct {
-	ThsCode         string   `json:"thscode"`
-	StockName       string   `json:"stock_name"`
-	TagName         string   `json:"tag_name"`
-	AnalysisContent string   `json:"analysis_content"`
-	KeywordList     []string `json:"keyword_list"`
+	ThsCode         string   `json:"thscode"`          // 同花顺代码（如 "600519.SH"）
+	StockName       string   `json:"stock_name"`       // 股票名称
+	TagName         string   `json:"tag_name"`         // 异动标签名（如 涨停/急拉）
+	AnalysisContent string   `json:"analysis_content"` // 异动原因分析文本
+	KeywordList     []string `json:"keyword_list"`     // 关键词列表
 }
 
 // AnomalyForStocks 批量查询个股当日异动原因（≤50 只）。
@@ -507,30 +507,30 @@ func (c *HithinkClient) AnomalyList(tagCodes []string) ([]HithinkAnomalyItem, er
 
 // HithinkLadderEntry 天梯矩阵展开后的单条（日期×板位×标的）。
 type HithinkLadderEntry struct {
-	TradeDate   string // yyyyMMdd
-	BoardNum    int
-	ThsCode     string
-	Name        string
-	SealNextDay *bool // 次日是否续封（最近交易日恒 null）
-	SignLevel   int
+	TradeDate   string // 交易日（yyyyMMdd）
+	BoardNum    int    // 连板数
+	ThsCode     string // 同花顺代码（如 "600519.SH"）
+	Name        string // 股票名称
+	SealNextDay *bool  // 次日是否续封（最近交易日恒 null）
+	SignLevel   int    // 信号强度等级
 }
 
 // hithinkLadderResp 连板天梯 API 原始响应结构（矩阵形式，需展开为逐条记录）。
 type hithinkLadderResp struct {
 	Window struct {
-		Length   int      `json:"length"`
+		Length   int      `json:"length"`    // 日期窗口长度
 		DateList []string `json:"date_list"` // yyyy-MM-dd
-	} `json:"window"`
+	} `json:"window"` // 时间窗口
 	Item []struct {
 		Boards map[string][]struct {
-			ThsCode     string `json:"thscode"`
-			Ticker      string `json:"ticker"`
-			Name        string `json:"name"`
-			BoardNum    int    `json:"board_num"`
-			SealNextDay *bool  `json:"seal_nextday"`
-			SignLevel   int    `json:"sign_level"`
+			ThsCode     string `json:"thscode"`      // 同花顺代码
+			Ticker      string `json:"ticker"`       // 市场代码
+			Name        string `json:"name"`         // 股票名称
+			BoardNum    int    `json:"board_num"`    // 连板数
+			SealNextDay *bool  `json:"seal_nextday"` // 次日是否续封（最近交易日恒 null）
+			SignLevel   int    `json:"sign_level"`   // 信号强度等级
 		} `json:"boards"`
-	} `json:"item"`
+	} `json:"item"` // 每日条目
 }
 
 // LimitUpLadderEntries 天梯矩阵 → 展开条目（日期取 window.date_list 对应位）。
@@ -592,15 +592,15 @@ func boardNumFromKey(k string) int {
 
 // HithinkFinIndicators 财务指标（五类，value 为 string|null 保上游原始精度）。
 type HithinkFinIndicators struct {
-	ThsCode   string `json:"thscode"`
-	Report    string `json:"report"` // "2024-4" 格式
+	ThsCode   string `json:"thscode"` // 同花顺代码
+	Report    string `json:"report"`  // "2024-4" 格式（报告期）
 	Abilities []struct {
 		Ability    string `json:"ability"` // growth/profitability/solvency/operation/cash-flow
 		Indicators []struct {
-			IndexID string  `json:"index_id"`
-			Value   *string `json:"value"`
+			IndexID string  `json:"index_id"` // 指标 ID
+			Value   *string `json:"value"`    // 指标值（string 保留原始精度，可为 null）
 		} `json:"indicators"`
-	} `json:"abilities"`
+	} `json:"abilities"` // 能力维度列表
 }
 
 // FinancialIndicators 单只标的双报告期财务指标。
@@ -619,14 +619,14 @@ func (c *HithinkClient) FinancialIndicators(thsCode, report string) (*HithinkFin
 
 // HithinkValuationItem 估值快照条目（五个估值指标）。
 type HithinkValuationItem struct {
-	ThsCode string   `json:"thscode"`
-	Ticker  string   `json:"ticker"`
-	Name    *string  `json:"name"`
-	PeTtm   *float64 `json:"pe_ttm"`
-	PeMrq   *float64 `json:"pe_mrq"`
-	PbMrq   *float64 `json:"pb_mrq"`
-	PsTtm   *float64 `json:"ps_ttm"`
-	PcfTtm  *float64 `json:"pcf_ttm"`
+	ThsCode string   `json:"thscode"` // 同花顺代码
+	Ticker  string   `json:"ticker"`  // 市场代码（如 600519）
+	Name    *string  `json:"name"`    // 股票名称（可为 null）
+	PeTtm   *float64 `json:"pe_ttm"`  // 滚动市盈率 TTM
+	PeMrq   *float64 `json:"pe_mrq"`  // 静态市盈率（最新报告期）
+	PbMrq   *float64 `json:"pb_mrq"`  // 市净率
+	PsTtm   *float64 `json:"ps_ttm"`  // 市销率 TTM
+	PcfTtm  *float64 `json:"pcf_ttm"` // 市现率 TTM
 }
 
 // ValuationsSnapshot 估值快照：thscodes 批量（单请求≤100 只）。

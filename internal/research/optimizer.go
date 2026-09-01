@@ -33,8 +33,8 @@ type OptimizeOpts struct {
 	// hold-out 只是描述性分段、形同虚设。
 	// English: true hold-out — coordinate ascent only sees the in-sample window; the out-of-sample
 	// segment is reserved for validation reporting only.
-	Start string
-	End   string
+	Start string // 寻优区间开始日期（YYYY-MM-DD，空=全区间）
+	End   string // 寻优区间结束日期（YYYY-MM-DD，空=全区间）
 }
 
 // OptResult 优化结果。
@@ -43,12 +43,12 @@ type OptimizeOpts struct {
 type OptResult struct {
 	Weights map[string]float64 // 归一化权重（L1 和 = 1）
 	// English: normalized weights (L1 sum = 1).
-	ICMean    float64
-	ICStd     float64
-	IR        float64
-	NDays     int
-	PassGuard bool
-	Reason    string
+	ICMean    float64 // 复合分平均 IC
+	ICStd     float64 // 复合分 IC 标准差
+	IR        float64 // 信息比率 = ICMean / ICStd
+	NDays     int     // 有效评估天数
+	PassGuard bool    // 是否通过护栏校验
+	Reason    string  // 护栏判定理由（未通过时说明原因）
 }
 
 // OptimizeWeights 用坐标上升搜索因子权重，最大化复合 |IR|（或 |IC|）。

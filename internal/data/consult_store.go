@@ -12,7 +12,7 @@ import (
 
 // ConsultMessage 一条咨询对话消息。
 type ConsultMessage struct {
-	Role    string    `json:"role"`    // user / assistant
+	Role    string    `json:"role"`    // user / assistant（用户 / 助手）
 	Content string    `json:"content"` // 消息内容
 	Time    time.Time `json:"time"`    // 发送时间
 }
@@ -20,8 +20,8 @@ type ConsultMessage struct {
 // consultFile 咨询对话持久化文件结构。
 // TradingDay 记录当前交易日；Messages 为当日对话历史（跨日自动清空）。
 type consultFile struct {
-	TradingDay string           `json:"trading_day"`
-	Messages   []ConsultMessage `json:"messages"`
+	TradingDay string           `json:"trading_day"` // 当前交易日
+	Messages   []ConsultMessage `json:"messages"`    // 当日对话历史
 }
 
 // ConsultStore 咨询对话持久化存储。

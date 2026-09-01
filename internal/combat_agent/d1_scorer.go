@@ -7,7 +7,7 @@
 //
 // 评分机制：
 //   - 批量评分：按 llmBatchSize 分批并发调用 LLM
-//   - 失败重试：支持轮询重试（默认 5 次），指数抖动并封顶
+//   - 失败重试：支持轮询重试（§S5 默认 2 次含首次=1 次重试），指数抖动并封顶
 //   - 无事件归零：无实质事件的个股 D1 强制归 0
 //   - 负面过滤：命中负面事件的个股标记 Blocked，D1=0
 package combat_agent
@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -51,20 +52,30 @@ type D1Score struct {
 // 字段说明：
 //   - llmClient: LLM 客户端，用于调用大模型进行 D1 评分
 //   - yamlContent: events_leftside.yaml 原始内容，作为 LLM prompt 参考
-//   - maxAttempts: D1 LLM 调用轮询重试次数（含首次），默认 5
+//   - maxAttempts: D1 LLM 调用轮询重试次数（含首次），默认 2（§S5）
 //   - retryBackoff: 相邻两次重试的基础间隔
 //   - sectorEvents: 代码→所属板块事件标题映射
+//   - maxTokens: D1 评分 LLM 单次调用的推理长度上限（§信号速度 S3），默认 2048
 type D1Scorer struct {
 	llmClient    *llm.Client       // LLM 客户端，用于调用大模型进行 D1 评分
 	yamlContent  string            // events_leftside.yaml 原始内容，作为 LLM prompt 参考
-	maxAttempts  int               // D1 LLM 调用轮询重试次数（含首次），默认 5；0/负回退默认
+	maxAttempts  int               // D1 LLM 调用轮询重试次数（含首次），默认 2（§S5）；0/负回退默认
 	retryBackoff time.Duration     // 相邻两次重试的基础间隔
 	sectorEvents map[string]string // 代码→所属板块事件标题（板块事件传导 D1：个股不在新闻点名里也能拿到板块利好作为评分上下文）
+	maxTokens    int               // D1 评分 LLM 单次调用推理长度上限（§S3），默认 2048；0/负回退默认
 }
 
+// defaultD1MaxTokens D1 评分默认推理长度上限（§信号速度 S3）。
+// 与 llm.defaultD1MaxTokens 保持一致；D1 输出结构化 JSON，无需超长思维链。
+const defaultD1MaxTokens = 2048
+
 // defaultMaxAttempts 默认 D1 LLM 轮询重试次数（含首次）。
-// 加重次数以抗 LLM 偶发超时/限流，避免重要 D1 评分随调用失败而丢失。
-const defaultMaxAttempts = 5
+// §信号速度 S5：5 → 2（含首次=1 次重试）。当轮不反复死磕，失败置 RetryPending 进下轮重试队列，
+// 配合增量 D1（只评新事件/缺分股）整体轮次显著提速；max_retry_times 仍可前端热改调高。
+// English: default D1 LLM total attempts including the first (§speed S5: 5 → 2, i.e. one retry). The round
+// gives up fast, marking failures RetryPending into the next round's queue; combined with incremental D1
+// (only new-event/missing codes re-scored) rounds are much faster. max_retry_times remains UI-adjustable.
+const defaultMaxAttempts = 2
 
 // NewD1Scorer 创建 D1Scorer 实例。
 // 参数：
@@ -80,6 +91,7 @@ func NewD1Scorer(llmClient *llm.Client, yamlContent string) *D1Scorer {
 		maxAttempts:  defaultMaxAttempts,
 		retryBackoff: 2 * time.Second,
 		sectorEvents: make(map[string]string),
+		maxTokens:    defaultD1MaxTokens,
 	}
 }
 
@@ -107,6 +119,23 @@ func (ds *D1Scorer) SetMaxRetries(n int) int {
 		ds.maxAttempts = n
 	}
 	return ds.maxAttempts
+}
+
+// SetMaxTokens 设置 D1 评分 LLM 单次调用的推理长度上限（§信号速度 S3）。
+// n<=0 时回退默认 defaultD1MaxTokens（2048）。
+//
+// 参数：
+//   - n: max_tokens 上限
+//
+// 返回值：
+//   - 设置的生效值
+func (ds *D1Scorer) SetMaxTokens(n int) int {
+	if n <= 0 {
+		ds.maxTokens = defaultD1MaxTokens
+	} else {
+		ds.maxTokens = n
+	}
+	return ds.maxTokens
 }
 
 // d1SystemPrompt 是 D1 评分的系统级提示词，定义评分优先级规则和输出格式。
@@ -320,10 +349,14 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 	log.Printf("[D1Scorer] 单批评分 %d只个股, prompt=%d字符", len(codes), len(prompt))
 
 	// 调用LLM（系统提示词 d1SystemPrompt 固定，用户提示词携带个股与规则）。
+	// §信号速度 S3：走 ChatD1 显式 max_tokens（默认 2048，配置 rules.llm.d1_max_tokens 可调），
+	// 限制推理长度降低单股评分耗时（原走 Chat → nonStreamChat 硬编码 4096）。
+	// English: §speed S3 — use ChatD1 with an explicit max_tokens cap (default 2048, adjustable via
+	// rules.llm.d1_max_tokens) to cut per-stock scoring latency (previously Chat → nonStreamChat @4096).
 	var resp string
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, err = ds.llmClient.Chat(d1SystemPrompt, prompt)
+		resp, err = ds.llmClient.ChatD1(d1SystemPrompt, prompt, ds.maxTokens)
 		if err == nil {
 			break
 		}
@@ -438,6 +471,54 @@ func findEventForCode(code string, md *strategy_engine.StockMarketData, events [
 		}
 	}
 	return ""
+}
+
+// EventSignature 计算个股 D1 评分上下文的稳定签名：命中该股的新闻事件（Datetime+Title 排序拼接）
+// + 板块事件标题。签名未变 → 引擎复用当日已有评分，避免每轮全池重调 LLM（§信号速度 S1）。
+// 与 findEventForCode 同源匹配逻辑（RelatedStocks/CleanedStocks → stockMatch），保证"事件变化"判定
+// 与评分视角一致；重复事件（同时间+标题）去重，板块事件变化同样触发重评。
+// English: EventSignature computes a stable signature of a stock's D1 context — the sorted
+// "Datetime|Title" of news events matching the stock, plus its sector event title. When the signature
+// is unchanged the engine reuses the same-day score instead of re-calling the LLM each round (§speed S1).
+// Matching is the same source as findEventForCode (RelatedStocks/CleanedStocks → stockMatch), and a
+// changed sector event also triggers re-scoring.
+func EventSignature(code string, md *strategy_engine.StockMarketData, events []newsagent.NewsEvent, sectorEvent string) string {
+	var parts []string
+	seen := make(map[string]bool)
+	for _, ev := range events {
+		if ev.Datetime == "" {
+			continue
+		}
+		hit := false
+		for _, s := range ev.RelatedStocks {
+			if stockMatch(s, code, md) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			for _, s := range ev.CleanedStocks {
+				if stockMatch(s, code, md) {
+					hit = true
+					break
+				}
+			}
+		}
+		if !hit {
+			continue
+		}
+		key := ev.Datetime + "|" + ev.Title
+		if !seen[key] {
+			seen[key] = true
+			parts = append(parts, key)
+		}
+	}
+	sort.Strings(parts)
+	sig := strings.Join(parts, ";")
+	if sectorEvent != "" {
+		sig += "|SEC|" + sectorEvent
+	}
+	return sig
 }
 
 // stockMatch 判断事件关联股票串 s 是否与目标股票命中。

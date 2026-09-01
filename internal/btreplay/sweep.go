@@ -124,28 +124,28 @@ type sweepTrigger struct {
 
 // sweepResult 单个组合的单战法汇总。
 type sweepResult struct {
-	Name           string
+	Name           string  // 战法名称
 	Kind           string  // 规则 ID（fac_N/pat_N）；内置战法为空
-	Trail          float64 `json:"trail_pct"`
-	Hold           int     `json:"hold_days"`
-	MinScore       float64 `json:"min_score"`
-	Count          int     `json:"trigger_count"`
-	Win            int     `json:"win"`
-	Loss           int     `json:"loss"`
-	WinRate        float64 `json:"win_rate"`
-	AvgWinPct      float64 `json:"avg_win_pct"`
-	AvgLossPct     float64 `json:"avg_loss_pct"`
-	ProfitFactor   float64 `json:"profit_factor"`
-	Expectancy     float64 `json:"expectancy"`
-	StopLossPct    float64 `json:"stop_loss_pct"`
-	AvgHold        float64 `json:"avg_hold_days"`
-	ObjectiveScore float64 `json:"-"`
+	Trail          float64 `json:"trail_pct"`     // 移动止盈比例
+	Hold           int     `json:"hold_days"`     // 最大持仓天数
+	MinScore       float64 `json:"min_score"`     // 最低得分门槛
+	Count          int     `json:"trigger_count"` // 触发次数
+	Win            int     `json:"win"`           // 盈利次数
+	Loss           int     `json:"loss"`          // 亏损次数
+	WinRate        float64 `json:"win_rate"`      // 胜率（%）
+	AvgWinPct      float64 `json:"avg_win_pct"`   // 平均盈利百分比
+	AvgLossPct     float64 `json:"avg_loss_pct"`  // 平均亏损百分比
+	ProfitFactor   float64 `json:"profit_factor"` // 盈亏比
+	Expectancy     float64 `json:"expectancy"`    // 期望收益率
+	StopLossPct    float64 `json:"stop_loss_pct"` // 止损比例
+	AvgHold        float64 `json:"avg_hold_days"` // 平均持仓天数
+	ObjectiveScore float64 `json:"-"`             // 目标函数得分（不入库）
 
 	// §GAP4.5 风险调整指标（随 SWEEP_JSON 落库展示）
-	Sharpe          float64 `json:"sharpe"`
-	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`
-	AnnualReturnPct float64 `json:"annual_return_pct"`
-	Calmar          float64 `json:"calmar"`
+	Sharpe          float64 `json:"sharpe"`            // 年化夏普比率
+	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`  // 复利净值最大回撤%（正数）
+	AnnualReturnPct float64 `json:"annual_return_pct"` // 年化收益率（%）
+	Calmar          float64 `json:"calmar"`            // 卡玛比率（年化收益/最大回撤）
 }
 
 // runSweep 扫参主流程。codes 为裸码列表；industryChg 与普通回放同构。

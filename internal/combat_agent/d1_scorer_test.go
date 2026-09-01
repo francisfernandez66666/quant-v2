@@ -130,15 +130,15 @@ func TestBatchScoreNilLLM(t *testing.T) {
 }
 
 // TestSetMaxRetries 验证轮询重试次数（含首次）默认值与配置语义：
-// 默认加大到 defaultMaxAttempts（防重要 D1 信号随 LLM 偶发失败丢失），
+// §信号速度 S5 默认=2（含首次=1 次重试，当轮不反复死磕，失败进下轮重试队列），
 // 0/负值回退默认，显式正值生效。
 func TestSetMaxRetries(t *testing.T) {
 	ds := NewD1Scorer(nil, "")
 	if ds.maxAttempts != defaultMaxAttempts {
 		t.Fatalf("默认重试次数=%d, want %d", ds.maxAttempts, defaultMaxAttempts)
 	}
-	if ds.maxAttempts < 3 {
-		t.Fatalf("重试次数应比旧值(3)更大, got %d", ds.maxAttempts)
+	if defaultMaxAttempts != 2 {
+		t.Fatalf("§S5 默认应为2(含首次=1次重试), got %d", defaultMaxAttempts)
 	}
 	// 显式配置生效
 	if got := ds.SetMaxRetries(8); got != 8 || ds.maxAttempts != 8 {

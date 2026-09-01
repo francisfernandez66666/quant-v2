@@ -16,7 +16,7 @@ import (
 
 // OptimizationResult 一次扫参任务的单条排名行。
 type OptimizationResult struct {
-	ID           int64       `json:"id"`
+	ID           int64       `json:"id"`                      // 自增主键
 	TaskID       int64       `json:"task_id"`                 // 所属扫参任务 ID
 	Rank         int         `json:"rank"`                    // 排名
 	Strategy     string      `json:"strategy"`                // 显示名：双响炮/因子战法#1/波动突破战法…
@@ -33,7 +33,7 @@ type OptimizationResult struct {
 	AvgLossPct   float64     `json:"avg_loss_pct"`            // 平均亏损百分比
 	AvgHoldDays  float64     `json:"avg_hold_days"`           // 平均持仓天数
 	TriggerCount int         `json:"trigger_count"`           // 触发次数
-	Status       string      `json:"status"`                  // pending | approved | rejected
+	Status       string      `json:"status"`                  // pending | approved | rejected（待审/通过/拒绝）
 	CreatedAt    string      `json:"created_at"`              // 创建时间
 	GridJSON     string      `json:"grid_json,omitempty"`     // §D3 止盈×止损热力网格（冠军行携带）
 

@@ -53,24 +53,24 @@ type fixSignal struct {
 	Strategy string `json:"strategy"` // 触发策略
 	// §C 归属字段：信号所属战法资金池（dragon/double_bump/…/fac_1/pat_2）与库规则 ID。
 	// 前端据此决定是否显示「模拟买入」（非战法信号不可买）并把买入归入对应池。
-	StrategyType string  `json:"strategy_type,omitempty"`
-	StrategyID   string  `json:"strategy_id,omitempty"`
-	TotalScore   float64 `json:"total_score"`   // 总分（0~100）
-	RemindLevel  string  `json:"remind_level"`  // 提醒级别：strong/observe/mute
-	Level        string  `json:"level"`         // 固定"交易"
-	Action       string  `json:"action"`        // 交易动作（buy 等）
-	Price        float64 `json:"price"`         // 信号触发价格
-	ChangePct    float64 `json:"change_pct"`    // 实时涨跌幅（%）
-	CanOpen      bool    `json:"can_open"`      // 是否可开仓（置信度≥0.7 且为买入）
-	D1           float64 `json:"d1"`            // 维度1 评分
-	D2           float64 `json:"d2"`            // 维度2 评分
-	D3           float64 `json:"d3"`            // 维度3 评分
-	D4           float64 `json:"d4"`            // 维度4 评分
-	D1Desc       string  `json:"d1_desc"`       // 维度1 说明（触发理由）
-	D2Desc       string  `json:"d2_desc"`       // 维度2 说明（所属板块）
-	D3Desc       string  `json:"d3_desc"`       // 维度3 说明
-	D4Desc       string  `json:"d4_desc"`       // 维度4 说明
-	SignalActive bool    `json:"signal_active"` // 信号是否活跃
+	StrategyType string  `json:"strategy_type,omitempty"` // 战法池类型
+	StrategyID   string  `json:"strategy_id,omitempty"`   // 库规则 ID
+	TotalScore   float64 `json:"total_score"`             // 总分（0~100）
+	RemindLevel  string  `json:"remind_level"`            // 提醒级别：strong/observe/mute
+	Level        string  `json:"level"`                   // 固定"交易"
+	Action       string  `json:"action"`                  // 交易动作（buy 等）
+	Price        float64 `json:"price"`                   // 信号触发价格
+	ChangePct    float64 `json:"change_pct"`              // 实时涨跌幅（%）
+	CanOpen      bool    `json:"can_open"`                // 是否可开仓（置信度≥0.7 且为买入）
+	D1           float64 `json:"d1"`                      // 维度1 评分
+	D2           float64 `json:"d2"`                      // 维度2 评分
+	D3           float64 `json:"d3"`                      // 维度3 评分
+	D4           float64 `json:"d4"`                      // 维度4 评分
+	D1Desc       string  `json:"d1_desc"`                 // 维度1 说明（触发理由）
+	D2Desc       string  `json:"d2_desc"`                 // 维度2 说明（所属板块）
+	D3Desc       string  `json:"d3_desc"`                 // 维度3 说明
+	D4Desc       string  `json:"d4_desc"`                 // 维度4 说明
+	SignalActive bool    `json:"signal_active"`           // 信号是否活跃
 
 	// §FIX-0921 信号产生时间（2026-09-01 用户需求）：信号页新增「产生时间」列。
 	// 内部 Signal.GeneratedAt 已有完整时间戳，此前未透出前端——用户无法判断信号新旧。
@@ -268,8 +268,8 @@ type fixMinutePoint struct {
 	Close  float64 `json:"close"`  // 收盘价
 	Volume float64 `json:"volume"` // 成交量（股）
 	Amount float64 `json:"amount"` // 成交额（元）
-	DIF    float64 `json:"dif"`    // MACD DIF
-	DEA    float64 `json:"dea"`    // MACD DEA
+	DIF    float64 `json:"dif"`    // MACD DIF（差离值）
+	DEA    float64 `json:"dea"`    // MACD DEA（异同平均线）
 	BAR    float64 `json:"bar"`    // MACD 柱（2*(DIF-DEA)）
 }
 
@@ -850,8 +850,8 @@ func holdingLots(l report.ExecLog) []report.Lot {
 
 // fixSetHoldingsReq 手动设置持仓的请求结构体：待同步的持仓列表 + 可用资金。
 type fixSetHoldingsReq struct {
-	Holdings         []fixHolding `json:"holdings"`
-	AvailableBalance float64      `json:"available_balance"`
+	Holdings         []fixHolding `json:"holdings"`          // 待同步的持仓列表
+	AvailableBalance float64      `json:"available_balance"` // 可用资金
 }
 
 // handleFixSetHoldings 处理 POST /api/holdings 请求，手动设置/同步持仓信息。
@@ -932,8 +932,8 @@ func (s *Server) handleFixSetHoldings(w http.ResponseWriter, r *http.Request) {
 
 // addHoldingLotReq 加仓请求体：加仓价格与数量。
 type addHoldingLotReq struct {
-	Price    float64 `json:"price"`
-	Quantity float64 `json:"quantity"`
+	Price    float64 `json:"price"`    // 加仓价格
+	Quantity float64 `json:"quantity"` // 加仓数量
 }
 
 // heldSignalIDByCode 返回指定账号某代码当前最末一笔"持仓中"记录的信号 ID；无持仓返回空串。
@@ -1015,13 +1015,13 @@ func (s *Server) handleFixSetCost(w http.ResponseWriter, r *http.Request) {
 
 // closeHoldingReq 清仓请求体：清仓价。
 type closeHoldingReq struct {
-	Price float64 `json:"price"`
+	Price float64 `json:"price"` // 清仓价
 }
 
 // sellHoldingReq 减仓请求体：卖出价与卖出数量。
 type sellHoldingReq struct {
-	Price    float64 `json:"price"`
-	Quantity float64 `json:"quantity"`
+	Price    float64 `json:"price"`    // 卖出价
+	Quantity float64 `json:"quantity"` // 卖出数量
 }
 
 // handleFixSellHolding 处理 POST /api/holdings/{code}/sell 请求：对该持仓减仓卖出部分数量。
@@ -1854,7 +1854,7 @@ func (s *Server) handleFixGetWatchlist(w http.ResponseWriter, r *http.Request) {
 
 // watchlistReq 自选股操作的请求结构体。
 type watchlistReq struct {
-	Code string `json:"code"`
+	Code string `json:"code"` // 股票代码
 }
 
 // handleFixAddWatchlist 处理 POST /api/watchlist 请求，添加个股到自选股。

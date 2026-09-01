@@ -10,6 +10,7 @@ package e2e
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,10 +35,13 @@ func TestLLMTimeoutConfig(t *testing.T) {
 
 // TestD1RetryQueueAcrossRuns 实盘快照下验证 D1 失败不靠兜底、全部走重试队列：
 //
-//	第一轮 mock LLM 正常 → 300308 D1=0.3 且非 RetryPending；
-//	第二轮 mock LLM 对 D1 返回 500 → BatchScore 重试全败 → 300308 标记 RetryPending（Score=0，
-//	不回退上一轮），且该股并入重试队列；
-//	第三轮 mock 恢复 → 300308 经重试队列重新调 LLM → D1 恢复为 0.3 且退出重试队列。
+//	§S1 增量 D1 语义：签名未变 + 已有非待重试分 → 复用不调 LLM（主循环提速主因）；
+//	只有"新事件/缺分/待重试"的个股才会真正调 LLM。因此本测试用"第二轮新增无旧分自选股"
+//	强制触发重评 → mock LLM 返回 500 → BatchScore 重试全败 → 该股标记 RetryPending（Score=0，
+//	不回退上一轮），并入重试队列；第三轮 mock 恢复 → 经重试队列重新调 LLM → D1 恢复且退出队列。
+//	同时断言第一轮 300308 正常得分、第二轮仍被复用（增量路径未受影响）。
+//	注意：重试标的须选"新闻池外 + 有行情数据"的代码（002594 比亚迪），否则若本就在新闻池内，
+//	首轮已有分 → 第二轮被复用而不会真正调 LLM（复用了错误的标的）。
 func TestD1RetryQueueAcrossRuns(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
@@ -61,7 +65,7 @@ func TestD1RetryQueueAcrossRuns(t *testing.T) {
 	}
 	since := time.Date(capT.Year(), capT.Month(), capT.Day(), 8, 30, 0, 0, time.Local)
 
-	// ── 第一轮：LLM 正常 → D1 正常入池 ──
+	// ── 第一轮：LLM 正常 → 300308 正常入池 ──
 	rig.eng.Run(context.Background(), since)
 	d1s1 := rig.eng.LastD1Scores()
 	sc1, ok := d1s1["300308"]
@@ -72,41 +76,50 @@ func TestD1RetryQueueAcrossRuns(t *testing.T) {
 	if sc1.Score <= 0 || sc1.RetryPending {
 		t.Fatalf("第一轮 300308 D1 应>0 且非 RetryPending, got %+v", sc1)
 	}
-	firstD1Calls := rig.calls.lenOf("d1")
 
-	// ── 第二轮：mock D1 返回 500 → 标记 RetryPending，并入重试队列（不回退上一轮）──
+	// ── 第二轮：新增无旧分自选股 002594（比亚迪，mock 返回 0.3）触发增量重评；
+	//    mock D1 返回 500 → 该股标记 RetryPending（Score=0，不回退上一轮）并入重试队列；
+	//    300308 签名未变 + 有非待重试分 → 被复用（增量路径，不重复调 LLM）──
 	rig.calls.SetFailD1(true)
+	if !rig.wl.Add("", "002594") {
+		t.Fatal("自选添加 002594 失败")
+	}
 	rig.eng.Run(context.Background(), since)
-	if rig.calls.lenOf("d1") <= firstD1Calls {
-		t.Fatal("第二轮 D1 LLM 未被调用（失败重试路径未触发）")
-	}
 	d1s2 := rig.eng.LastD1Scores()
-	sc2, ok := d1s2["300308"]
+	scNew, ok := d1s2["002594"]
 	if !ok {
-		t.Fatalf("第二轮 300308 无 D1 记录")
+		t.Fatalf("第二轮 002594 无 D1 记录")
 	}
-	t.Logf("第二轮(Fail) 300308 D1=%.2f RetryPending=%v D1调用=%d (新增%d次失败)", sc2.Score, sc2.RetryPending, rig.calls.lenOf("d1"), rig.calls.lenOf("d1")-firstD1Calls)
-	if sc2.Score != 0 || !sc2.RetryPending {
-		t.Fatalf("第二轮 D1 失败应标记 RetryPending 且 Score=0（不回退上一轮）, got %+v", sc2)
+	t.Logf("第二轮(Fail) 002594 D1=%.2f RetryPending=%v D1调用=%d", scNew.Score, scNew.RetryPending, rig.calls.lenOf("d1"))
+	if scNew.Score != 0 || !scNew.RetryPending {
+		t.Fatalf("第二轮 002594 D1 失败应标记 RetryPending 且 Score=0（不回退上一轮）, got %+v", scNew)
 	}
-	if !contains(rig.eng.D1RetryQueueCodes(), "300308") {
-		t.Fatalf("第二轮 300308 应并入重试队列, got %v", rig.eng.D1RetryQueueCodes())
+	if !contains(rig.eng.D1RetryQueueCodes(), "002594") {
+		t.Fatalf("第二轮 002594 应并入重试队列, got %v", rig.eng.D1RetryQueueCodes())
+	}
+	if sc300, ok := d1s2["300308"]; !ok || sc300.Score != sc1.Score || sc300.RetryPending {
+		t.Fatalf("第二轮 300308 应复用第一轮分(%.2f,非待重试), got %+v", sc1.Score, sc300)
 	}
 
-	// ── 第三轮：mock 恢复 → 300308 经重试队列重新调 LLM → D1 恢复、退出重试队列 ──
+	// ── 第三轮：mock 恢复 → 002594 经重试队列重新调 LLM → D1 恢复、退出重试队列 ──
 	rig.calls.SetFailD1(false)
 	rig.eng.Run(context.Background(), since)
 	d1s3 := rig.eng.LastD1Scores()
-	sc3, ok := d1s3["300308"]
+	sc3, ok := d1s3["002594"]
 	if !ok {
-		t.Fatalf("第三轮 300308 无 D1 记录")
+		t.Fatalf("第三轮 002594 无 D1 记录")
 	}
-	t.Logf("第三轮(Recover) 300308 D1=%.2f RetryPending=%v D1调用=%d", sc3.Score, sc3.RetryPending, rig.calls.lenOf("d1"))
-	if sc3.Score <= 0 || sc3.RetryPending {
-		t.Fatalf("第三轮 300308 D1 应恢复>0 且退出重试状态, got %+v", sc3)
+	t.Logf("第三轮(Recover) 002594 D1=%.2f RetryPending=%v D1调用=%d", sc3.Score, sc3.RetryPending, rig.calls.lenOf("d1"))
+	// 恢复语义 = 退出重试状态（不再 RetryPending、不再在重试队列），LLM 已重新调用拿到真实分；
+	// 002594 无实质事件 → 按规则 D1 归 0，故不断言分数>0（只要非"待重试"占位即恢复成功）。
+	if sc3.RetryPending {
+		t.Fatalf("第三轮 002594 D1 应退出重试状态（LLM 已恢复重打分）, got %+v", sc3)
 	}
-	if contains(rig.eng.D1RetryQueueCodes(), "300308") {
-		t.Fatalf("第三轮 300308 应退出重试队列, got %v", rig.eng.D1RetryQueueCodes())
+	if strings.Contains(sc3.Reason, "待重试") {
+		t.Fatalf("第三轮 002594 不应再是重试占位（Reason=%q）, got %+v", sc3.Reason, sc3)
+	}
+	if contains(rig.eng.D1RetryQueueCodes(), "002594") {
+		t.Fatalf("第三轮 002594 应退出重试队列, got %v", rig.eng.D1RetryQueueCodes())
 	}
 }
 

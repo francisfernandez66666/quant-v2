@@ -17,12 +17,12 @@ import (
 // English: FactorReport aggregates one factor's validation for the B3 tool output.
 // （FactorReport aggregates one factor's validation for the B3 tool output.）
 type FactorReport struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Category string `json:"category"`
-	Start    string `json:"start"`
-	End      string `json:"end"`
-	Horizon  int    `json:"horizon"` // 前瞻天数
+	ID       string `json:"id"`       // 因子 ID
+	Name     string `json:"name"`     // 因子名称
+	Category string `json:"category"` // 因子分类
+	Start    string `json:"start"`    // 统计区间开始日期
+	End      string `json:"end"`      // 统计区间结束日期
+	Horizon  int    `json:"horizon"`  // 前瞻天数
 	// English: forward horizon in days.
 	Quantiles int `json:"quantiles"` // 分层数
 	// English: number of quantiles.
@@ -105,16 +105,16 @@ func fptr(v float64) *float64 {
 // MarshalJSON NaN→null 适配（Go 原生 JSON 无法编码 NaN）。
 // English: MarshalJSON adapts NaN to null (Go's native JSON cannot encode NaN).
 type icRowJSON struct {
-	Date string
-	N    int
-	IC   *float64
+	Date string   // 统计日期 YYYY-MM-DD
+	N    int      // 样本股票数
+	IC   *float64 // 当日 IC（null=当日样本不足）
 }
 
 // layerJSON 分层统计 JSON 输出结构：层号、样本量 N 与均值收益。
 type layerJSON struct {
-	Layer      int
-	N          int
-	MeanReturn *float64
+	Layer      int      // 分层编号（0 最低 … Quantiles-1 最高）
+	N          int      // 该层样本数
+	MeanReturn *float64 // 该层平均收益（null=样本不足）
 }
 
 // MarshalJSON 自定义 JSON 输出：把内部均值等字段按前端约定格式序列化

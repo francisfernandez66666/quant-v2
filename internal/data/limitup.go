@@ -95,7 +95,7 @@ type limitUpRaw struct {
 				Days int `json:"days"` // 近期涨停天数
 			} `json:"zttj"`
 		} `json:"pool"`
-	} `json:"data"`
+	} `json:"data"` // 数据主体
 }
 
 // parseLimitUpPool 解析东财涨停池 JSON。

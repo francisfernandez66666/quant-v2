@@ -714,8 +714,8 @@ func (s *Server) handleTemp(w http.ResponseWriter, r *http.Request) {
 
 // loginReq 登录请求体：用户名 + 密码。
 type loginReq struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username string `json:"username"` // 用户名
+	Password string `json:"password"` // 密码
 }
 
 // handleLogin 处理 POST /auth/login（/api/auth/login 同路由）：校验凭据并返回 token/ID/账号名。
@@ -761,12 +761,12 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 
 // setupReq 首次初始化配置请求体：管理员账号 + LLM 参数 + Tushare token。
 type setupReq struct {
-	Username     string `json:"username"`
-	Password     string `json:"password"`
-	LLMApiURL    string `json:"llm_api_url"`
-	LLMApiKey    string `json:"llm_api_key"`
-	TushareToken string `json:"tushare_token"`
-	SetupToken   string `json:"setup_token"` // §P1-5 初始化令牌（SETUP_TOKEN 开启时必填）
+	Username     string `json:"username"`      // 管理员用户名
+	Password     string `json:"password"`      // 管理员密码
+	LLMApiURL    string `json:"llm_api_url"`   // LLM 接口地址
+	LLMApiKey    string `json:"llm_api_key"`   // LLM 接口密钥
+	TushareToken string `json:"tushare_token"` // Tushare 数据平台 token
+	SetupToken   string `json:"setup_token"`   // §P1-5 初始化令牌（SETUP_TOKEN 开启时必填）
 }
 
 // handleSetupSubmit 处理 POST /setup：完成首次初始化。
@@ -1074,7 +1074,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 // longToggleReq 做多开关请求体。
 type longToggleReq struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `json:"enabled"` // 是否启用做多
 }
 
 // handleLongToggle 处理 POST /api/long/toggle：切换做多开关（按账号持久化）并返回最新状态。
@@ -1104,7 +1104,7 @@ func (s *Server) handleLongStatus(w http.ResponseWriter, r *http.Request) {
 
 // shortToggleReq 做空开关请求体。
 type shortToggleReq struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `json:"enabled"` // 是否启用做空
 }
 
 // handleShortToggle 处理 POST /api/short/toggle：切换做空开关（按账号持久化）并返回最新状态。
@@ -1134,7 +1134,7 @@ func (s *Server) handleShortStatus(w http.ResponseWriter, r *http.Request) {
 
 // newsShowAllReq 资讯"显示全部"开关请求体。
 type newsShowAllReq struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `json:"enabled"` // 是否显示全部资讯
 }
 
 // newsShowAllOn 读取引擎"资讯显示全部"开关；未接入引擎时回退默认（关闭）。
@@ -1214,8 +1214,8 @@ func (s *Server) handleNewsReanalyze(w http.ResponseWriter, r *http.Request) {
 
 // testAttributionReq 单条归因测试请求体：标题 + 可选正文摘要（供 LLM 价值链背景）。
 type testAttributionReq struct {
-	Title  string `json:"title"`
-	Digest string `json:"digest,omitempty"`
+	Title  string `json:"title"`            // 资讯标题
+	Digest string `json:"digest,omitempty"` // 正文摘要（可选）
 }
 
 // handleNewsTestAttribution 处理 POST /api/news/test-attribution：单条新闻走 Stage2
@@ -1263,13 +1263,13 @@ func streamingEnabled(s *bool) bool {
 
 // createPositionReq 新建持仓请求体：股票代码/名称、方向、策略、开仓价及止盈止损百分比。
 type createPositionReq struct {
-	Code          string  `json:"code"`
-	Name          string  `json:"name"`
-	Direction     string  `json:"direction"`
-	Strategy      string  `json:"strategy"`
-	EntryPrice    float64 `json:"entry_price"`
-	TakeProfitPct float64 `json:"take_profit_pct,omitempty"`
-	StopLossPct   float64 `json:"stop_loss_pct,omitempty"`
+	Code          string  `json:"code"`                      // 股票代码
+	Name          string  `json:"name"`                      // 股票名称
+	Direction     string  `json:"direction"`                 // 方向（long/short）
+	Strategy      string  `json:"strategy"`                  // 触发策略
+	EntryPrice    float64 `json:"entry_price"`               // 开仓价
+	TakeProfitPct float64 `json:"take_profit_pct,omitempty"` // 止盈百分比
+	StopLossPct   float64 `json:"stop_loss_pct,omitempty"`   // 止损百分比
 }
 
 // handleCreatePosition 处理 POST /api/positions：记录一条开仓信号到报表，返回生成的信号 ID。
@@ -1292,9 +1292,9 @@ func (s *Server) handleCreatePosition(w http.ResponseWriter, r *http.Request) {
 
 // updatePositionReq 更新持仓请求体：止盈/止损百分比与名称均可选，指针为 nil 表示不修改。
 type updatePositionReq struct {
-	TakeProfitPct *float64 `json:"take_profit_pct,omitempty"`
-	StopLossPct   *float64 `json:"stop_loss_pct,omitempty"`
-	Name          *string  `json:"name,omitempty"`
+	TakeProfitPct *float64 `json:"take_profit_pct,omitempty"` // 新止盈百分比（nil=不修改）
+	StopLossPct   *float64 `json:"stop_loss_pct,omitempty"`   // 新止损百分比（nil=不修改）
+	Name          *string  `json:"name,omitempty"`            // 新名称（nil=不修改）
 }
 
 // ownsPosition §A2 归属校验：持仓记录属于当前登录用户（或 admin 全权）才可写。
@@ -1345,7 +1345,7 @@ func (s *Server) handleUpdatePosition(w http.ResponseWriter, r *http.Request) {
 
 // exitPositionReq 平仓请求体：平仓价格。
 type exitPositionReq struct {
-	ExitPrice float64 `json:"exit_price"`
+	ExitPrice float64 `json:"exit_price"` // 平仓价格
 }
 
 // handleDeletePosition 处理 DELETE /api/positions/{id}：软删除指定持仓记录。
@@ -1440,15 +1440,18 @@ func (s *Server) handleSetD1Config(w http.ResponseWriter, r *http.Request) {
 
 // setLLMConfigReq LLM 配置请求体：APIKey 可选（不修改时留空），APIURL 与 Model 必填。
 type setLLMConfigReq struct {
-	APIKey     string   `json:"api_key,omitempty"`
+	APIKey     string   `json:"api_key,omitempty"`  // 单个 API 密钥（可空）
 	APIKeys    []string `json:"api_keys,omitempty"` // 多 API 密钥（逗号分隔或数组，轮询分发；为空时回退 APIKey）
-	APIURL     string   `json:"api_url"`
-	Model      string   `json:"model"`
-	TimeoutSec int      `json:"timeout_sec"`      // 单次请求超时（秒），缺省 0
-	Stream     *bool    `json:"stream,omitempty"` // 流式开关，缺省维持现状/默认开启
+	APIURL     string   `json:"api_url"`            // LLM 接口地址
+	Model      string   `json:"model"`              // 模型名
+	TimeoutSec int      `json:"timeout_sec"`        // 单次请求超时（秒），缺省 0
+	Stream     *bool    `json:"stream,omitempty"`   // 流式开关，缺省维持现状/默认开启
 	// BatchConcurrency 新闻归因 LLM 批量并发批次，<=0 时维持现状/默认 4。
 	// （BatchConcurrency is the news-attribution LLM batch concurrency; <=0 keeps current/default 4.）
 	BatchConcurrency int `json:"batch_concurrency,omitempty"`
+	// D1MaxTokens D1 评分 LLM 单次调用推理长度上限（§信号速度 S3），<=0 维持现状/默认 2048。
+	// （D1MaxTokens is the D1-scoring max_tokens cap (§speed S3); <=0 keeps current/default 2048.）
+	D1MaxTokens int `json:"d1_max_tokens,omitempty"`
 	// ClassifierModel 可选分类专用模型（Stage0/1 等快速分类/初筛），留空用主模型。
 	// （ClassifierModel is an optional dedicated model for cheap classification/screening; empty = main model.）
 	ClassifierModel string `json:"classifier_model,omitempty"`
@@ -1480,6 +1483,7 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		"batch_concurrency": cfg.BatchConcurrency,
 		"max_retry_times":   cfg.MaxRetryTimes,
 		"classifier_model":  cfg.ClassifierModel,
+		"d1_max_tokens":     cfg.D1MaxTokens,
 	})
 }
 
@@ -1616,6 +1620,7 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		Stream:           req.Stream,
 		BatchConcurrency: req.BatchConcurrency,
 		ClassifierModel:  req.ClassifierModel,
+		D1MaxTokens:      req.D1MaxTokens,
 	})
 
 	// §GAP2-W2 出呼地址校验（SSRF 面收口）：非法直接拒绝，不落任何配置
@@ -1713,7 +1718,7 @@ func (s *Server) handleLLMDebug(w http.ResponseWriter, r *http.Request) {
 
 // consultReq 股票咨询请求体：用户消息。
 type consultReq struct {
-	Message string `json:"message"`
+	Message string `json:"message"` // 用户咨询消息
 }
 
 // 专业模式相关配置键（per-user，落盘 auth.json，跨重启保留）。
@@ -1808,7 +1813,7 @@ func (s *Server) handleGetConsultProMode(w http.ResponseWriter, r *http.Request)
 
 // proModeReq 专业模式开关请求体。
 type proModeReq struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `json:"enabled"` // 是否启用专业模式
 }
 
 // handleSetConsultProMode 处理 PUT /api/consult/pro-mode：切换当前用户专业模式开关。

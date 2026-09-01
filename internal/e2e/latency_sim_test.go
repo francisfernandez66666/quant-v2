@@ -200,8 +200,10 @@ func TestRealSpeedRehearsal(t *testing.T) {
 		t.Errorf("近实时打分轮不应重复调 Stage0/Stage2 新闻分析 LLM(实测 %d/%d), 打分轮应无新闻分析",
 			metricsScore.stage0N, metricsScore.stage2N)
 	}
-	if metricsScore.d1N < 3 {
-		t.Errorf("近实时打分轮应对打分池执行 D1 评分(≥3次, 实测%d), 否则打分池断链", metricsScore.d1N)
+	// §S1 增量 D1：消费轮新评分池全量调一次 D1；其后 3 个打分轮签名未变 + 已有分 → 全量复用不重复调 LLM。
+	// 断言 d1N==1：既证明打分池没断链（首轮真调了 LLM），又证明增量复用生效（不每轮重打）。
+	if metricsScore.d1N != 1 {
+		t.Errorf("近实时打分轮应仅消费轮调 1 次 D1(增量复用, 实测%d), 否则打分池断链或复用未生效", metricsScore.d1N)
 	}
 	// 打分轮稳态应显著快于新闻触发轮（无 LLM 等待）
 	avgMain := avgDur(mainTimings, func(tm *engine.RunTiming) time.Duration { return tm.Total })

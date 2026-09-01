@@ -91,9 +91,9 @@ type AppliedFactorEntry struct {
 	// ExitTrailPct/ExitMaxHoldDays：回测 ruleEvalAdapter 立即生效；实盘由 rule_exit_overrides.go 注册表消费。
 	// English: rule-level parameter overrides from sweep approvals (0 = use global defaults).
 	// ExitTrailPct/ExitMaxHoldDays: consumed by rule_exit_overrides.go registry for live exit logic.
-	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`
-	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"`
-	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"`
+	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`     // 移动止盈比例
+	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"` // 止损比例
+	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"` // 最大持仓天数
 }
 
 // ApplyFactorRule 把审批通过的 factor 候选**追加**写入战法库 applied_factors.json（多战法共存），
@@ -350,28 +350,28 @@ func saveAppliedFactors(dataDir string, entries []AppliedFactorEntry) error {
 // AppliedPatternRule 实盘形态模板规则（F3）。复用本包 pattern.go 的 PatternCond。
 // English: live pattern-template rule (F3). Reuses PatternCond from pattern.go.
 type AppliedPatternRule struct {
-	Name  string        `json:"name"`
-	Conds []PatternCond `json:"conds"`
+	Name  string        `json:"name"`  // 模板名称
+	Conds []PatternCond `json:"conds"` // 触发条件集
 }
 
 // AppliedPatternEntry 战法库中的一条已应用形态战法（F3 + 战法库），带独立 ID/名称/启用/来源候选/运行统计。
 // English: one applied pattern strategy in the library (F3 + library), with ID/name/enabled/source/run-stats.
 type AppliedPatternEntry struct {
-	ID          string        `json:"id"`           // "pat_<candidate_id>"
+	ID          string        `json:"id"`           // 唯一标识（"pat_<candidate_id>"/"fac_<candidate_id>"）
 	Name        string        `json:"name"`         // 显示名
 	Enabled     bool          `json:"enabled"`      // 是否注入 8a/8b
 	CandID      int64         `json:"candidate_id"` // 来源候选 ID
 	AppliedAt   string        `json:"applied_at"`   // 应用时间
 	Conds       []PatternCond `json:"conds"`        // 条件集
 	SignalCount int           `json:"signal_count"` // 触发信号数
-	Win         int           `json:"win"`
-	Loss        int           `json:"loss"`
-	CumReturn   float64       `json:"cum_return"`
+	Win         int           `json:"win"`          // 盈利信号数
+	Loss        int           `json:"loss"`         // 亏损信号数
+	CumReturn   float64       `json:"cum_return"`   // 累计收益
 
 	// §P2-d 规则级出场参数覆盖（扫参审批后写入；0=缺省全局默认）。形态无连续分，无门槛覆盖。
-	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`
-	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"`
-	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"`
+	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`     // 移动止盈比例
+	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"` // 止损比例
+	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"` // 最大持仓天数
 }
 
 // ApplyPatternRule 把审批通过的 pattern 候选**追加**写入战法库 applied_patterns.json（多形态共存，按候选 ID 幂等）。

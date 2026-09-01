@@ -92,6 +92,7 @@ export default function Settings() {
   const [llmModel, setLlmModel] = useState('')
   const [llmClassifierModel, setLlmClassifierModel] = useState('')
   const [llmBatchConcurrency, setLlmBatchConcurrency] = useState(4)
+  const [llmD1MaxTokens, setLlmD1MaxTokens] = useState(2048)
   const [llmConfigured, setLlmConfigured] = useState(false)
   const [llmSaving, setLlmSaving] = useState(false)
 
@@ -165,6 +166,7 @@ export default function Settings() {
         model: llmModel,
         classifier_model: llmClassifierModel,
         batch_concurrency: llmBatchConcurrency,
+        d1_max_tokens: llmD1MaxTokens,
       })
       setLlmConfigured(!!llmApiKeys)
       showToast('LLM 配置已保存并热生效', 'success')
@@ -196,6 +198,7 @@ export default function Settings() {
           setLlmModel(cfg.model || '')
           setLlmClassifierModel(cfg.classifier_model || '')
           if (cfg.batch_concurrency > 0) setLlmBatchConcurrency(cfg.batch_concurrency)
+          if (cfg.d1_max_tokens > 0) setLlmD1MaxTokens(cfg.d1_max_tokens)
           let keys = ''
           if (Array.isArray(cfg.api_keys) && cfg.api_keys.length) {
             keys = cfg.api_keys.join('\n')
@@ -311,6 +314,11 @@ export default function Settings() {
         <div style={rowStyle}>
           <span style={labelStyle}>归因批并发度</span>
           <InputNumber value={llmBatchConcurrency} onChange={(v) => setLlmBatchConcurrency(v)} min={1} max={16} style={{ width: 200 }} />
+        </div>
+        <div style={rowStyle}>
+          <span style={labelStyle}>D1推理上限</span>
+          <InputNumber value={llmD1MaxTokens} onChange={(v) => setLlmD1MaxTokens(v)} min={512} max={4096} step={256} style={{ width: 200 }} />
+          <span style={{ ...labelStyle, color: '#999', marginLeft: 8, fontSize: 12 }}>tokens（默认 2048，D1 评分推理长度）</span>
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>状态</span>

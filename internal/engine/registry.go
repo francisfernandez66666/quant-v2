@@ -61,6 +61,7 @@ type EngineOptions struct {
 	Notifier     *notify.Notifier        // 通知推送器（全局共享）
 	SectorTopN   int                     // 主线板块纳入成分股数量
 	D1MaxRetries int                     // D1 评分 LLM 调用最大重试次数
+	D1MaxTokens  int                     // D1 评分 LLM 单次调用推理长度上限（§S3）
 	Paper        *paper.Engine           // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
 	// 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions/orders/fills 的库句柄。
 	// §OPT-3 已隔离至独立 live.db。与纸面账本完全独立。nil = 未接入实盘（QMT 链路整体禁用）。
@@ -634,6 +635,9 @@ func (r *Registry) build(userID string) *Engine {
 	}
 	if opts.D1MaxRetries > 0 {
 		e.SetD1MaxRetries(opts.D1MaxRetries)
+	}
+	if opts.D1MaxTokens > 0 {
+		e.SetD1MaxTokens(opts.D1MaxTokens)
 	}
 	// 模拟盘引擎：账户级独立实例（每账号独立 paper.json），信号/估值按账号分发。
 	// 全局模板仅提供配置（opts.Paper）；e.paper 保留为旧单引擎回退。

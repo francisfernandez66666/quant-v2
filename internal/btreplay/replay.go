@@ -398,14 +398,14 @@ func toStrategyKLine(klines []data.KLine) []strategy.KLine {
 // Options 回放回测参数（数据库、日期区间、战法选择与近似开关）。
 // English: Options configures a replay backtest.
 type Options struct {
-	DBPath    string
-	Start     string
-	End       string
-	Strategy  string // double_bump|dragon|dragon_return|n_shape|factor|pattern|all
-	MaxStocks int    // 最多回测股票数（0=全部）
-	D1Score   float64
-	Industry  bool
-	DataDir   string // 战法库目录（applied_factors.json / applied_patterns.json 所在）
+	DBPath    string  // 回放用数据库路径（daily K 等原始数据）
+	Start     string  // 回测开始日期（YYYY-MM-DD）
+	End       string  // 回测结束日期（YYYY-MM-DD）
+	Strategy  string  // double_bump|dragon|dragon_return|n_shape|factor|pattern|all（战法选择）
+	MaxStocks int     // 最多回测股票数（0=全部）
+	D1Score   float64 // 外部注入的固定 D1 分（≥0 时使用）
+	Industry  bool    // 是否启用行业过滤/分组
+	DataDir   string  // 战法库目录（applied_factors.json / applied_patterns.json 所在）
 	// Sweep 非 nil 时进入参数扫参模式（§P2）：全库战法 × 出场/门槛参数网格自动寻优，
 	// 触发一次性预计算 + 逐组合廉价统一出场模拟，产出排名表与 SWEEP_JSON。
 	// English: when set, run the parameter sweep optimizer (see sweep.go).
@@ -967,16 +967,16 @@ func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, e
 
 // summary 按战法分组的回测统计结果。
 type summary struct {
-	Name         string
-	Count        int
-	Win          int
-	Loss         int
-	WinRate      float64
-	AvgWinPct    float64
-	AvgLossPct   float64
-	ProfitFactor float64
+	Name         string  // 战法名称
+	Count        int     // 触发/交易次数
+	Win          int     // 盈利次数
+	Loss         int     // 亏损次数
+	WinRate      float64 // 胜率（%）
+	AvgWinPct    float64 // 平均盈利百分比
+	AvgLossPct   float64 // 平均亏损百分比
+	ProfitFactor float64 // 盈亏比
 	Expectancy   float64 // 每笔交易期望收益率%（正=正期望策略）
-	AvgHold      float64
+	AvgHold      float64 // 平均持仓天数
 
 	// §GAP4.5 风险调整指标（此前全系统零实现）
 	Sharpe          float64 `json:"sharpe"`            // 年化夏普（逐笔净额收益）

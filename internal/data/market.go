@@ -108,7 +108,7 @@ type MarketAPI struct {
 	quoteCache map[string]cachedQuote // 实时行情 TTL 缓存
 
 	peMu  sync.Mutex              // 保护 PE 缓存的读写
-	peTTL time.Duration           // PE 缓存有效期（PE 变动低频）
+	peTTL time.Duration           // PE 缓存有效期（已弃用：§S2 起 getPECache 改按"当日"判定，字段保留兼容）
 	peMap map[string]peCacheEntry // code → PE 缓存条目
 
 	emBreakerMu sync.Mutex            // 保护东财熔断计数器的读写
@@ -122,34 +122,37 @@ type emBreaker struct {
 	openUntil  time.Time // 熔断窗口到期时间，未到期直接快速失败
 }
 
-// peCacheEntry PE 缓存条目。
-// peCacheEntry is a PE (price-to-earnings) cache entry.
+// peCacheEntry PE 缓存条目（§信号速度 S2：存抓取时的现价基准与日期，支持盘中按现价推算）。
+// peCacheEntry is a PE (price-to-earnings) cache entry holding the fetched PE, the base price at fetch
+// time and the trade date — enabling intraday derivation via PE = PE₀ × (现价/Price₀).
 type peCacheEntry struct {
-	pe float64   // 动态市盈率
-	at time.Time // 缓存写入时间
+	pe    float64   // 动态市盈率（抓取值 PE₀）
+	price float64   // 抓取时的现价基准 Price₀（f2），0 表示源未返回
+	day   string    // 缓存日期 YYYY-MM-DD（当日有效，跨日强制重抓）
+	at    time.Time // 缓存写入时间
 }
 
-// getPECache 读取 PE 缓存，命中且在有效期内返回 true。
-// getPECache reads the PE cache; returns the value if it is fresh within the TTL.
-func (m *MarketAPI) getPECache(code string) (float64, bool) {
+// getPECache 读取 PE 缓存，命中且当日有效返回 (pe, price, true)；否则返回 (0,0,false)。
+// getPECache reads the PE cache; returns (pe, basePrice, true) when fresh for the current trade date.
+func (m *MarketAPI) getPECache(code string) (float64, float64, bool) {
 	m.peMu.Lock()
 	defer m.peMu.Unlock()
 	e, ok := m.peMap[code]
-	if !ok || time.Since(e.at) > m.peTTL {
-		return 0, false
+	if !ok || e.day != time.Now().Format("2006-01-02") {
+		return 0, 0, false
 	}
-	return e.pe, true
+	return e.pe, e.price, true
 }
 
-// setPECache 写入 PE 缓存。
-// setPECache writes a PE value into the cache with the current timestamp.
-func (m *MarketAPI) setPECache(code string, pe float64) {
+// setPECache 写入 PE 缓存（记录现价基准与当日日期）。
+// setPECache writes a PE value into the cache with the base price and today's date.
+func (m *MarketAPI) setPECache(code string, pe, price float64) {
 	m.peMu.Lock()
 	defer m.peMu.Unlock()
 	if m.peMap == nil {
 		m.peMap = make(map[string]peCacheEntry)
 	}
-	m.peMap[code] = peCacheEntry{pe: pe, at: time.Now()}
+	m.peMap[code] = peCacheEntry{pe: pe, price: price, day: time.Now().Format("2006-01-02"), at: time.Now()}
 }
 
 // quoteTTL 实时行情缓存有效期：同一股票在窗口内只打一次网络，
@@ -462,36 +465,67 @@ func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
 // inflow is f62 (f162 is the dynamic PE on the stock/get endpoint).
 const stockQuoteFields = "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f60,f62,f116,f117,f167,f168,f169,f170,f171,f292"
 
-// GetRealtimeQuote 获取实时行情。先尝试东方财富 push2，失败时回退到新浪。
+// GetRealtimeQuote 获取实时行情。§信号速度 S4：三级链 新浪→腾讯→东财（东财仅作末位兜底）。
 // 结果按 quoteTTL 短期缓存，同一股票在窗口内的重复请求直接命中缓存。
 // 东财 push2 接口返回的价格字段（F43/F44/F45/F46/F60）单位为分，需 ÷100 转换为元。
 // 返回 StockInfo，包含名称、价格、涨跌幅、成交量、换手率、主力净流入等。
-// GetRealtimeQuote returns a realtime quote: EastMoney push2 first, falling back to
-// Sina on failure. Results are cached for quoteTTL; prices come back in cents (/100).
+// 注：主力净流入（NetInflow）仅东财提供，新浪/腾讯命中时该字段为 0（buildStockBlock 已按 0 判空处理）。
+// GetRealtimeQuote returns a realtime quote via the §S4 chain Sina→Tencent→EastMoney (EastMoney last as
+// the final fallback). Results are cached for quoteTTL; prices from EastMoney come back in cents (/100).
+// NetInflow (main-force flow) is only provided by EastMoney — Sina/Tencent hits leave it 0 (buildStockBlock
+// already treats 0 as "source did not return the field").
 func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 	code = stripSuffix(code)
 	if c, ok := m.quoteHit(code); ok {
 		return c, nil
 	}
-	info, emErr := m.getEastMoneyQuote(code)
-	if emErr == nil {
-		m.quoteStore(code, info)
-		return info, nil
-	}
-	// 东财失败 → 回落到新浪。注意把两个来源的错误都透传，避免上层把新浪错误误标成东财失败。
+	// 主源：新浪单票实时行情（与 5s 快照同源，最稳）。
+	// Primary: Sina single-stock quote (same source family as the 5s snapshot fetcher, most stable).
 	sina, serr := m.GetSinaQuote(code)
 	if serr == nil {
 		m.quoteStore(code, sina)
 		return sina, nil
 	}
-	// 东财/新浪都失败 → 回落到腾讯实时行情（ifzq/qt.gtimg.cn，通常更稳定）。
-	// Fall back to Tencent realtime quotes (ifzq/qt.gtimg.cn) when both EastMoney and Sina fail.
+	// 新浪失败 → 腾讯实时行情（ifzq/qt.gtimg.cn，通常更稳定）。
+	// Fall back to Tencent realtime quotes when Sina fails.
 	ten, terr := m.getTencentQuote(code)
-	if terr != nil {
-		return nil, fmt.Errorf("eastmoney: %v; sina: %v; tencent: %v", emErr, serr, terr)
+	if terr == nil {
+		m.quoteStore(code, ten)
+		return ten, nil
 	}
-	m.quoteStore(code, ten)
-	return ten, nil
+	// 新浪/腾讯都失败 → 东财 push2 末位兜底。错误全部透传，避免上层误标失败源。
+	// Final fallback: EastMoney push2 when both Sina and Tencent fail. All errors are passed through so
+	// callers don't mislabel which source failed.
+	info, emErr := m.getEastMoneyQuote(code)
+	if emErr != nil {
+		return nil, fmt.Errorf("sina: %v; tencent: %v; eastmoney: %v", serr, terr, emErr)
+	}
+	m.quoteStore(code, info)
+	return info, nil
+}
+
+// GetRealtimeQuoteWithFlow 获取含主力净流入的实时行情（consult 手动路径专用）。
+// 与 GetRealtimeQuote 不同：主循环高频路径 §S4 走 新浪→腾讯→东财（东财末位兜底，降熔断冲击）；
+// 但主力净流入（NetInflow/f62）只有东财提供，consult 手动咨询路径（buildStockBlock）需要它，
+// 故这里改为 东财→新浪→腾讯（东财优先），保证净流入可注入。consult 为低频用户操作，不构成东财压力。
+// 不走 quoteTTL 共享缓存（避免主循环缓存的新浪无净流入快照被复用），每次直连。
+// GetRealtimeQuoteWithFlow returns a quote with main-force net inflow, used by the consult manual path.
+// Unlike GetRealtimeQuote (S4: Sina→Tencent→EastMoney for the hot loop), NetInflow (f62) only exists on
+// EastMoney, so this consults EastMoney first (EastMoney→Sina→Tencent). Consult is low-frequency, so this
+// does not pressure EastMoney; it also bypasses the shared quoteTTL cache (a cached Sina snapshot lacks flow).
+func (m *MarketAPI) GetRealtimeQuoteWithFlow(code string) (*StockInfo, error) {
+	code = stripSuffix(code)
+	info, emErr := m.getEastMoneyQuote(code)
+	if emErr == nil {
+		return info, nil
+	}
+	if sina, serr := m.GetSinaQuote(code); serr == nil {
+		return sina, nil
+	}
+	if ten, terr := m.getTencentQuote(code); terr == nil {
+		return ten, nil
+	}
+	return nil, fmt.Errorf("eastmoney: %v; sina/tencent unavailable", emErr)
 }
 
 // checkEastMoneyHealth 探测东财行情源是否可用。
@@ -1809,27 +1843,48 @@ const stockListFields = "f12,f14,f9,f20"
 // stockRawItem 东方财富全量股票列表的原始 JSON 行。
 // stockRawItem is a raw row of the EastMoney full-stock-list JSON.
 type stockRawItem struct {
-	Code string  `json:"f12"` // 股票代码
-	Name string  `json:"f14"` // 股票名称
-	PE   float64 `json:"f9"`  // 市盈率
-	MCap float64 `json:"f20"` // 总市值
+	Code  string  `json:"f12"` // 股票代码
+	Name  string  `json:"f14"` // 股票名称
+	PE    float64 `json:"f9"`  // 市盈率
+	MCap  float64 `json:"f20"` // 总市值
+	Price float64 `json:"f2"`  // 现价（§S2：PE 盘内按现价推算的基准价）
 }
 
 // GetStockPE 获取单只个股的动态市盈率（PE-TTM）。
-// 通过东财 clist 接口按证券ID单查（fields=f9 市盈率），失败返回 0（调用方按无PE处理）。
-// 带独立 TTL 缓存（PE 变动低频），避免高频调用撞东财限流。
+// 通过东财 clist 接口按证券ID单查（fields=f9 市盈率 + f2 现价基准），失败返回 0（调用方按无PE处理）。
+// 带独立缓存（当日有效，PE 变动低频），避免高频调用撞东财限流。
 // GetStockPE returns a stock's PE-TTM via the EastMoney clist endpoint,
-// with an independent TTL cache since PE changes infrequently. Returns 0 on failure.
+// with an independent same-day cache since PE changes infrequently. Returns 0 on failure.
 func (m *MarketAPI) GetStockPE(code string) float64 {
+	// 兼容入口：不带现价 → 命中缓存直接返回缓存 PE（无推算）；由引擎优先走 GetStockPEAt。
+	// English: compatibility entry without a live price — returns the cached PE as-is; the engine
+	// prefers GetStockPEAt for intraday price-based derivation.
+	return m.GetStockPEAt(code, 0)
+}
+
+// GetStockPEAt 获取单只个股的动态市盈率（PE-TTM），支持盘内按现价推算（§信号速度 S2）。
+// 每日首取打东财 clist（fields=f9 市盈率 + f2 现价基准 Price₀），当日命中缓存后：
+//   - price>0 且缓存有基准价 → PE = PE₀ × (price / Price₀) 推算（PE 公式恒定：PE=价/EPS，EPS 盘中不变）
+//   - 否则 → 直接返回缓存 PE₀（无现价或基准缺失时不再推算）
+//
+// 现价由调用方（引擎）从 5s 新浪快照传入，不新增请求；失败返回 0（N 形 D3 走斐波那契兜底）。
+// English: GetStockPEAt fetches PE-TTM once per day (clist f9 + f2 base price). On a same-day cache hit it
+// derives PE = PE₀ × (livePrice/Price₀) when a live price is supplied and a base price was stored — the PE
+// formula (price/EPS) is constant intraday — otherwise it returns the cached PE₀ as-is. The live price comes
+// from the engine's 5s Sina snapshot (no extra request). Returns 0 on failure (N-shape D3 uses Fibonacci).
+func (m *MarketAPI) GetStockPEAt(code string, price float64) float64 {
 	code = stripSuffix(code)
 	if code == "" {
 		return 0
 	}
-	if v, ok := m.getPECache(code); ok {
-		return v
+	if pe, basePrice, ok := m.getPECache(code); ok {
+		if price > 0 && basePrice > 0 {
+			return pe * price / basePrice
+		}
+		return pe
 	}
 
-	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:%s&fields=f12,f14,f9", secID(code))
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:%s&fields=f12,f14,f9,f2", secID(code))
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
@@ -1853,7 +1908,10 @@ func (m *MarketAPI) GetStockPE(code string) float64 {
 	if item.PE <= 0 {
 		return 0
 	}
-	m.setPECache(code, item.PE)
+	m.setPECache(code, item.PE, item.Price)
+	if price > 0 && item.Price > 0 {
+		return item.PE * price / item.Price
+	}
 	return item.PE
 }
 

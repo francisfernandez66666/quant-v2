@@ -20,8 +20,8 @@ import (
 // signalStoreFile 当日固化信号磁盘结构（按交易日分桶）。
 // English: on-disk layout of the pinned signals for the day (bucketed by trading day).
 type signalStoreFile struct {
-	TradingDay string                `json:"trading_day"`
-	Signals    []combat_agent.Signal `json:"signals"`
+	TradingDay string                `json:"trading_day"` // 交易日
+	Signals    []combat_agent.Signal `json:"signals"`     // 当日固化信号
 	// 失效墓碑 key 集合（code@strategy）：买入前提已破坏的固化信号当日不再复活。
 	// English: tombstoned keys (code@strategy) whose buy premise broke; never re-pinned that day.
 	Invalidated []string `json:"invalidated,omitempty"`

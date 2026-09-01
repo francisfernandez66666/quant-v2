@@ -9,7 +9,7 @@ import (
 
 // ThsLimitUpRow 涨停池行。
 type ThsLimitUpRow struct {
-	TradeDate     string  // yyyyMMdd
+	TradeDate     string  // yyyyMMdd（交易日）
 	TsCode        string  // TS代码
 	Name          string  // 名称
 	IsST          bool    // 是否ST
@@ -284,8 +284,8 @@ func (d *DB) UpsertThsValuations(rows []ThsValuationRow) (int64, error) {
 // ThsFinIndicatorRow 财务指标单行。
 type ThsFinIndicatorRow struct {
 	TsCode  string  // TS代码
-	Report  string  // "2024-4"
-	Ability string  // growth/profitability/solvency/operation/cash-flow
+	Report  string  // "2024-4"（报告期）
+	Ability string  // 能力维度：growth/profitability/solvency/operation/cash-flow
 	IndexID string  // 同花顺指标 ID
 	Value   *string // 上游原始精度字符串；null=未披露
 }

@@ -9,7 +9,7 @@ type KDJPoint struct {
 	// English: RSV is the immature stochastic value.
 	K float64 // K 值（慢速随机，由 RSV 平滑递推）
 	D float64 // D 值（慢速随机，由 K 平滑递推）
-	J float64 // J = 3K − 2D
+	J float64 // J 值 = 3K − 2D（超买超卖领先指标）
 }
 
 // KDJ 计算 KDJ 序列（默认 9,3,3）。

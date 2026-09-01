@@ -8,15 +8,15 @@ import (
 // Candidate 一条研究候选（待审批的战法/因子参数改动）。
 // （Candidate is one research candidate awaiting approval.）
 type Candidate struct {
-	ID        int64   `json:"id"`
+	ID        int64   `json:"id"`         // 自增 ID
 	CreatedAt string  `json:"created_at"` // 创建时间
-	Kind      string  `json:"kind"`       // weights | d1rule | factor | depth
-	Status    string  `json:"status"`     // proposed | approved | rejected | applied
+	Kind      string  `json:"kind"`       // weights | d1rule | factor | depth（候选类型）
+	Status    string  `json:"status"`     // proposed | approved | rejected | applied（待审/通过/拒绝/已应用）
 	Factors   string  `json:"factors"`    // 因子 JSON 数组
 	Weights   string  `json:"weights"`    // 权重 JSON 对象
 	Metric    float64 `json:"metric"`     // 指标
 	ICMean    float64 `json:"ic_mean"`    // IC均值
-	IR        float64 `json:"ir"`
+	IR        float64 `json:"ir"`         // ICIR（信息比率）
 	AvgExcess float64 `json:"avg_excess"` // 平均超额收益
 	Horizon   int     `json:"horizon"`    // 周期
 	Reason    string  `json:"reason"`     // 原因

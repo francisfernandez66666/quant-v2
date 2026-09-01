@@ -71,7 +71,7 @@ type ActiveRule struct {
 	SignalCount int
 	// Win 表示"触发后 5 日（Horizon）收益为正"的次数；Loss 为负。
 	Win  int
-	Loss int
+	Loss int // 触发后 5 日（Horizon）收益为负的次数
 	// CumReturn 累计前向收益（触发股 5 日收益累加，监测战法实际效果用）。
 	CumReturn float64
 }

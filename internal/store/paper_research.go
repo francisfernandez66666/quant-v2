@@ -19,7 +19,7 @@ type PaperTradeRecord struct {
 	Name         string  `json:"name"`                    // 名称
 	Strategy     string  `json:"strategy"`                // 战法
 	StrategyType string  `json:"strategy_type,omitempty"` // 战法类型
-	Side         string  `json:"side"`                    // buy / sell
+	Side         string  `json:"side"`                    // buy / sell（买入/卖出）
 	Price        float64 `json:"price"`                   // 价格
 	SignalPrice  float64 `json:"signal_price,omitempty"`  // 信号价
 	LatencySec   float64 `json:"latency_sec,omitempty"`   // 信号→成交延迟（秒）
@@ -33,7 +33,7 @@ type PaperTradeRecord struct {
 // English: one paper daily snapshot (research-DB flavor).
 type PaperDailyRecord struct {
 	UserID      string  `json:"user_id"`      // 归属用户
-	Date        string  `json:"date"`         // YYYY-MM-DD
+	Date        string  `json:"date"`         // YYYY-MM-DD（基准日）
 	Cash        float64 `json:"cash"`         // 现金
 	MarketValue float64 `json:"market_value"` // 市值
 	TotalValue  float64 `json:"total_value"`  // 总资产

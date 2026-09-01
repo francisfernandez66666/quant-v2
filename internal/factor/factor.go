@@ -65,7 +65,7 @@ func (c Category) CategoryName() string {
 // StockSeries 单只股票按日期对齐的研究输入（hfq 主序列 + 估值/换手 + 点对时财务）。
 // （StockSeries is one stock's date-aligned research input.）
 type StockSeries struct {
-	Dates      []string
+	Dates      []string  // 交易日序列
 	CloseHfq   []float64 // hfq 收盘（价格比率因子）
 	CloseRaw   []float64 // 原始收盘（规模等需真实价）
 	Open       []float64 // hfq 开盘

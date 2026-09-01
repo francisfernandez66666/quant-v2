@@ -11,9 +11,9 @@ import (
 // English: Panel holds one stock's factor values aligned to its trade dates.
 // （Panel holds one stock's factor values aligned to its trade dates.）
 type Panel struct {
-	Code    string
-	Series  *factor.StockSeries
-	DateIdx map[string]int // 日期 → 序列下标
+	Code    string              // 股票代码
+	Series  *factor.StockSeries // 该股的价格/成交量序列
+	DateIdx map[string]int      // 日期 → 序列下标
 	// English: date -> series index.
 	Factors map[string][]float64 // factorID → 与 Dates 对齐的因子值
 	// English: factorID -> factor values aligned with Dates.

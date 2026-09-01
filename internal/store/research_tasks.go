@@ -55,10 +55,10 @@ const (
 // ResearchTask 队列中的一条研究任务。
 // English: one research task in the queue.
 type ResearchTask struct {
-	ID         int64   `json:"id"`
+	ID         int64   `json:"id"`                    // 任务自增 ID
 	Type       string  `json:"type"`                  // 类型
-	RefID      int64   `json:"ref_id"`                // 关联ID
-	Priority   string  `json:"priority"`              // high | low
+	RefID      int64   `json:"ref_id"`                // 关联 ID
+	Priority   string  `json:"priority"`              // high | low（高/低优先级）
 	Status     string  `json:"status"`                // 状态
 	Progress   string  `json:"progress"`              // 进度
 	ResultNum  float64 `json:"result_num"`            // 结果数值

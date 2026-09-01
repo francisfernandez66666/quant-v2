@@ -15,15 +15,15 @@ import (
 
 // memoryStatusEx 对应 Win32 MEMORYSTATUSEX（含 ullAvailExtendedVirtual 共 64 字节）。
 type memoryStatusEx struct {
-	Length               uint32
-	MemoryLoad           uint32
-	TotalPhys            uint64
-	AvailPhys            uint64
-	TotalPageFile        uint64
-	AvailPageFile        uint64
-	TotalVirtual         uint64
-	AvailVirtual         uint64
-	AvailExtendedVirtual uint64
+	Length               uint32 // 结构体大小（调用前需填入）
+	MemoryLoad           uint32 // 当前内存使用率（0-100）
+	TotalPhys            uint64 // 物理内存总量（字节）
+	AvailPhys            uint64 // 可用物理内存（字节）
+	TotalPageFile        uint64 // 页面文件总大小（字节）
+	AvailPageFile        uint64 // 可用页面文件（字节）
+	TotalVirtual         uint64 // 总虚拟地址空间（字节）
+	AvailVirtual         uint64 // 可用虚拟地址空间（字节）
+	AvailExtendedVirtual uint64 // 可用扩展虚拟地址空间（字节）
 }
 
 var (

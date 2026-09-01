@@ -12,7 +12,7 @@ import (
 // ThsDailyRow ths_daily 单行。
 type ThsDailyRow struct {
 	TsCode    string  // 完整代码 600519.SH
-	TradeDate string  // yyyyMMdd
+	TradeDate string  // yyyyMMdd（交易日）
 	Open      float64 // 开盘价
 	High      float64 // 最高价
 	Low       float64 // 最低价

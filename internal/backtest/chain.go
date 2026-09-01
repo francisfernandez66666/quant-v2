@@ -105,14 +105,14 @@ func dirOf(fdef factor.Def, dirs map[string]int) int {
 // Options 回测选项。
 // （Options configures a backtest run.）
 type Options struct {
-	Start       string // 事件区间起点 YYYYMMDD
-	End         string // 事件区间终点 YYYYMMDD
-	Horizons    []int  // 前瞻天数（默认 [1,5,10]）
-	MinLimitUps int    // 触发事件的行业涨停家数下限（默认 3）
-	MaxPerDay   int    // 每日最多事件数（默认 3，取涨停家数最多）
-	Benchmark   string // 基准指数（默认 000300.SH）
-	Lookback    int    // 因子预热回看天数（默认 70）
-	Rule        SignalRule
+	Start       string     // 事件区间起点 YYYYMMDD
+	End         string     // 事件区间终点 YYYYMMDD
+	Horizons    []int      // 前瞻天数（默认 [1,5,10]）
+	MinLimitUps int        // 触发事件的行业涨停家数下限（默认 3）
+	MaxPerDay   int        // 每日最多事件数（默认 3，取涨停家数最多）
+	Benchmark   string     // 基准指数（默认 000300.SH）
+	Lookback    int        // 因子预热回看天数（默认 70）
+	Rule        SignalRule // 触发信号规则（决定事件归类与成本计算）
 	// Cost 交易成本模型（B4 成本模型，修复零成本假设）：默认 DefaultCostModel（佣金万2.5+最低5元、
 	// 滑点 5bp 双边、卖出印花税 0.05%，与模拟盘/btreplay 同源）。零值时 Run 自动填充默认值。
 	// English: trading-cost model; Run fills the default when left zero-valued.
@@ -485,9 +485,9 @@ func firstStrictlyAfter(idx map[string]int, d string) int {
 
 // stockData 装配后的单股数据：序列 + 因子值缓存。
 type stockData struct {
-	Series     *factor.StockSeries
-	DateIdx    map[string]int
-	FactorVals map[string][]float64
+	Series     *factor.StockSeries  // 装配后的单股序列
+	DateIdx    map[string]int       // 日期 → 序列下标
+	FactorVals map[string][]float64 // 因子名 → 逐日因子值缓存
 }
 
 // shiftDate 把 YYYYMMDD 平移 d 天（日历日，够用）。

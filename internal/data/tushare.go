@@ -73,13 +73,13 @@ var tushareAPI = "https://api.tushare.pro"
 type tushareResponse struct {
 	Code int `json:"code"` // 0=成功，非 0=失败（含积分不足/参数错误）
 	// English: 0=success, non-zero=failure (including insufficient points/bad params).
-	Msg  string `json:"msg"`
+	Msg  string `json:"msg"` // 提示信息/错误说明
 	Data struct {
 		Fields []string `json:"fields"` // 列名
 		// English: column names.
 		Items [][]any `json:"items"` // 行数据（与 fields 对齐）
 		// English: row data (aligned with fields).
-	} `json:"data"`
+	} `json:"data"` // 数据主体
 }
 
 // Call 调用任意 Tushare API：apiName 接口名、params 参数、fields 逗号分隔的列。

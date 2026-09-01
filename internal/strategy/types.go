@@ -135,8 +135,8 @@ type ExitContext struct {
 	// ATRStopMult 为止损倍数（≤0 表示未启用、回退固定百分比）。
 	// English: C4 ATR dynamic stop — ATR is the instrument's current ATR (usually ATR14, 0 when daily
 	// bars are missing); ATRStopMult is the stop multiplier (≤0 = disabled, fall back to fixed percent).
-	ATR         float64
-	ATRStopMult float64
+	ATR         float64 // 标的当前 ATR（通常 ATR14，缺日K时为 0）
+	ATRStopMult float64 // ATR 止损倍数（≤0 表示未启用、回退固定百分比）
 }
 
 // ATRStopPct 返回本持仓的有效止损亏损百分比（相对成本）：

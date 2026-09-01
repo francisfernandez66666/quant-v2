@@ -351,6 +351,7 @@ func main() {
 		SectorTopN:   sectorTopN,
 		Paper:        paperEngine,
 		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
+		D1MaxTokens:  cfgMgr.Rules.LLM.D1MaxTokens,
 		RealStore:    realStore,  // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
 		D1Store:      researchDB, // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
 	})

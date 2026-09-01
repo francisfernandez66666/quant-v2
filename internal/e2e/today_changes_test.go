@@ -185,14 +185,15 @@ func TestConsultMultipleStocks(t *testing.T) {
 	}
 }
 
-// TestConsultRealtimeQuoteNetInflow 通过东财 emStockGet f62 验证净流入 -2.22亿 可被 GetRealtimeQuote 读取。
-// 东财单股接口主力净流入字段为 f62（f162 是动态市盈率）。
+// TestConsultRealtimeQuoteNetInflow 通过东财 emStockGet f62 验证净流入 -2.22亿 可被 GetRealtimeQuoteWithFlow 读取。
+// 东财单股接口主力净流入字段为 f62（f162 是动态市盈率）。consult 手动路径用东财优先的 WithFlow；
+// 主循环高频路径的 GetRealtimeQuote 已按 §S4 走 新浪→腾讯→东财（东财末位），净流入仅东财提供。
 func TestConsultRealtimeQuoteNetInflow(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
 	api := rigMarket(t, loadTodayFixture(t))
-	si, err := api.GetRealtimeQuote("600580")
+	si, err := api.GetRealtimeQuoteWithFlow("600580")
 	if err != nil {
 		t.Fatalf("GetRealtimeQuote: %v", err)
 	}
