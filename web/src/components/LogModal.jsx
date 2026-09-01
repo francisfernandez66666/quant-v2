@@ -189,9 +189,26 @@ export default function LogModal({ visible, onClose }) {
       setLlmNoData(!r)
       setSelectedSet(new Set(r ? r.selected_idx || [] : []))
     } else {
-      setLlmRecords([])
-      setLlmData(null)
-      setLlmNoData(true)
+      // §FIX-0921b 主源失败/为空时回落 /api/llm-debug（最新单轮快照）——
+      // 即使本轮没有分析出有价值结果也如实展示 L1/L2，避免「暂无 LLM 分析记录」白板
+      let fb = null
+      try {
+        const d = await api.fetchLLMDebug()
+        if (d && !d.status && (d.raw_titles || d.stage2_events)) {
+          fb = d
+        }
+      } catch (_) {}
+      if (fb) {
+        setLlmRecords([fb])
+        setLlmIdx(0)
+        setLlmData(fb)
+        setLlmNoData(false)
+        setSelectedSet(new Set(fb.selected_idx || []))
+      } else {
+        setLlmRecords([])
+        setLlmData(null)
+        setLlmNoData(true)
+      }
     }
     if (slRes.status === 'fulfilled' && Array.isArray(slRes.value) && slRes.value.length) {
       setSigRecords(slRes.value)

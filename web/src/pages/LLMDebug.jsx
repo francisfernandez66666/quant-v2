@@ -485,24 +485,43 @@ export default function LLMDebug() {
   }
 
   // 拉取 Stage 记录并处理 Agent 未就绪、无数据、正常数据三种状态
+  // §FIX-0921b 双源兜底（2026-09-01 用户反馈实录）：主源 /api/stage-records（当日全量轮次，
+  // LLM 修好后单轮含百余条原始标题 + 数十条事件，弱网下可能超时或被判空）拉不到时，
+  // 回落 /api/llm-debug（最新单轮快照，含待归因原始新闻 + 已归因事件）——保证「即使新闻
+  // 没有分析出有价值结果，也如实显示 L1/L2 内容」，不再出现「暂无数据」白板。
   async function loadData() {
     setLoading(true)
     try {
-      const res = await api.fetchStageRecords()
-      // 拉取到的 Stage 记录接口响应
-      if (res && res.status === 'no_engine') {
+      let recs = null
+      try {
+        recs = await api.fetchStageRecords()
+      } catch (_) {
+        recs = null // 主源失败（超时/网络抖动）不直接白板，走回落
+      }
+      if (recs && recs.status === 'no_engine') {
         setNoAgent(true)
         setNoData(false)
         setRecords([])
         setData(null)
-      } else if (!Array.isArray(res) || res.length === 0) {
+        return
+      }
+      if (!Array.isArray(recs) || recs.length === 0) {
+        // 回落源：最新单轮快照（字段与轮次记录同构，直接包一层数组复用渲染）
+        try {
+          const d = await api.fetchLLMDebug()
+          if (d && !d.status && (d.raw_titles || d.stage2_events)) {
+            recs = [d]
+          }
+        } catch (_) {}
+      }
+      if (Array.isArray(recs) && recs.length) {
+        setRecords(recs)
+        applyLatest()
+      } else {
         setNoData(true)
         setNoAgent(false)
         setRecords([])
         setData(null)
-      } else {
-        setRecords(res)
-        applyLatest()
       }
     } catch (e) {
       console.error('LLMDebug 加载失败', e)

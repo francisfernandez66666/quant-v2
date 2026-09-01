@@ -1035,8 +1035,11 @@ export async function fetchLLMDebug() {
 /** Fetch today's full LLM/Stage round records (persisted to disk, for review) */
 // 对应 GET /api/stage-records，返回当日全部轮次快照，用于事后复盘
 // Maps to GET /api/stage-records; returns all of today's round snapshots for later review
+// §FIX-0921b 超时放宽到 30s（2026-09-01 实录）：LLM 修好后单轮含 110 条原始标题 + 数十条
+// Stage2 事件（含完整理由），20 轮响应可达 ~700KB——弱网下 10s 默认超时会杀掉正常响应，
+// 页面表现为「暂无数据」白板。复盘类接口放宽超时，宁可多等也不误判为空。
 export async function fetchStageRecords() {
-  return request('/api/stage-records')
+  return request('/api/stage-records', { timeout: 30000 })
 }
 
 /** 获取当日全量信号批次记录（固化到磁盘，供复盘） */
@@ -1044,7 +1047,8 @@ export async function fetchStageRecords() {
 // 对应 GET /api/signal-logs，返回当日各轮信号批次快照（做多/做空/提醒），用于信号日志弹窗
 // Maps to GET /api/signal-logs; returns today's per-round signal batch snapshots (long/short/alerts) for the log modal
 export async function fetchSignalLogs() {
-  return request('/api/signal-logs')
+  // §FIX-0921b 复盘类接口同样放宽 30s（信号批次含全量信号明细，弱网同理）
+  return request('/api/signal-logs', { timeout: 30000 })
 }
 
 // ── 做空开关 ──
