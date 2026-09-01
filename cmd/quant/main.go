@@ -107,6 +107,22 @@ func main() {
 	llmCfg.APIKey = os.Getenv("LLM_API_KEY")
 	llmCfg.APIURL = os.Getenv("LLM_API_URL")
 	llmCfg.Model = os.Getenv("LLM_MODEL")
+	// §LLM-ROTATE 多 key 池（2026-09-01）：LLM_API_KEYS 逗号分隔，首 key 为主用、其余备用，
+	// 供 §S6 健康轮换消费——某把 key 401/403 鉴权失效时自动冷却 30min 并切到下一把（429 按
+	// Retry-After、5xx 短冷却），主 key 恢复后冷却到期自动回归轮询池。避免单 key 误植/吊销
+	// （2026-08-31 13:23 实录：NSSM 环境变量 key 误植一字 → LLM 全线 401 降级 22h）导致整条
+	// 新闻分类/D1 评分链路瘫痪。
+	if rawKeys := os.Getenv("LLM_API_KEYS"); rawKeys != "" {
+		for _, k := range strings.Split(rawKeys, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				llmCfg.APIKeys = append(llmCfg.APIKeys, k)
+			}
+		}
+		// 主 key 兼容字段：未显式设置 LLM_API_KEY 时取列表首把，保持单 key 语义（日志脱敏等）一致
+		if llmCfg.APIKey == "" && len(llmCfg.APIKeys) > 0 {
+			llmCfg.APIKey = llmCfg.APIKeys[0]
+		}
+	}
 	if llmCfg.APIKey == "" {
 		if v, ok := authMgr.GetConfig("", "llm_api_key"); ok {
 			llmCfg.APIKey = v
