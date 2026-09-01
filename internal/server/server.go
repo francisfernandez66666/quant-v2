@@ -1690,6 +1690,8 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 
 // handleLLMDebug 处理 GET /api/llm-debug：返回引擎的 LLM 流水线调试信息。
 // 未接入引擎或无数据时分别返回 no_engine / no_data 状态。
+// §FIX-0921c：内存 debugInfo 为空（重启窗口/懒建）时回落操作员账号当日落盘的最新一轮，
+// 保证前端单轮兜底源（LLMDebug/LogModal 的回落链路）始终有 L1/L2 数据可取。
 func (s *Server) handleLLMDebug(w http.ResponseWriter, r *http.Request) {
 	c := s.ctrlFor(requestUserID(r))
 	if c == nil {
@@ -1697,6 +1699,11 @@ func (s *Server) handleLLMDebug(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	di := c.GetDebugInfo()
+	if di == nil {
+		if disk := s.operatorStageRecordsFromDisk(); len(disk) > 0 {
+			di = &disk[len(disk)-1] // 落盘顺序即时间正序，取最后一轮（最新）
+		}
+	}
 	if di == nil {
 		writeJSON(w, 200, map[string]string{"status": "no_data"})
 		return
@@ -1853,15 +1860,39 @@ func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Reques
 }
 
 // handleStageRecords 返回当日全量 Stage 流水线轮次记录（用于复盘/策略引擎实时调取）。
+// §FIX-0921c（2026-09-01 用户反馈实录「LLM 页白板」）：内存为空（引擎重启后当日轮次尚未
+// 产出/懒建窗口/跨实例差异）时回落读**操作员账号目录的当日落盘文件**（引擎每次捕获都会
+// persistStageRecords，磁盘上始终有当日最新 20 轮），保证前端即使无价值轮次也能如实展示
+// L1/L2；同时打诊断日志（uid/来源/条数）便于远程定位用户侧真实返回。
 func (s *Server) handleStageRecords(w http.ResponseWriter, r *http.Request) {
-	c := s.ctrlFor(requestUserID(r))
+	uid := requestUserID(r)
+	c := s.ctrlFor(uid)
 	if c == nil {
+		log.Printf("[llm-diag] uid=%s stage-records: ctrl=nil → no_engine", uid)
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
 	recs := c.GetStageRecords()
+	src := "mem"
+	if len(recs) == 0 {
+		if disk := s.operatorStageRecordsFromDisk(); len(disk) > 0 {
+			recs = disk
+			src = "disk"
+		}
+	}
+	log.Printf("[llm-diag] uid=%s stage-records: src=%s recs=%d", uid, src, len(recs))
 	if recs == nil {
 		recs = []newsagent.DebugInfo{}
+	}
+	// §FIX-0921d 响应瘦身（2026-09-01 实录）：单轮全量 Stage2 事件含长文本理由，20 轮合计
+	// ~700KB——弱网下前端取数超时 → 「LLM 页白板」。仅最近 5 轮保留完整 L2 事件明细（页面
+	// 默认展示最新轮），更早轮次保留 L1（原始标题/计数，raw_count/selected_count 真实值不动），
+	// 体积降至 ~1/3。recs 为时间正序（引擎原始序），最旧的在头部。
+	const fullDetailKeep = 5
+	if len(recs) > fullDetailKeep {
+		for i := 0; i < len(recs)-fullDetailKeep; i++ {
+			recs[i].Stage2Events = nil
+		}
 	}
 	// 就地倒序，最新轮次的记录排在最前
 	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
@@ -1870,16 +1901,98 @@ func (s *Server) handleStageRecords(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, recs)
 }
 
+// operatorStageRecordsFromDisk 读操作员账号目录的当日 stage_records.json（内存为空时的兜底源）。
+// 仅当日交易日的记录有效（与引擎 loadStageRecords 同口径，跨日自动视为空）。
+// English: reads the operator account's on-disk stage_records.json as a fallback when the in-memory
+// records are empty; only same-trading-day records are served (same rule as the engine loader).
+func (s *Server) operatorStageRecordsFromDisk() []newsagent.DebugInfo {
+	dir := s.cacheDir
+	if dir == "" {
+		return nil
+	}
+	op := s.operatorID()
+	if op == "" {
+		return nil
+	}
+	p := filepath.Join(dir, "accounts", op, "stage_records.json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var f struct {
+		TradingDay string                `json:"trading_day"`
+		Records    []newsagent.DebugInfo `json:"records"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil
+	}
+	if f.TradingDay != data.TradingDayDate(time.Now()) {
+		return nil
+	}
+	return f.Records
+}
+
+// operatorSignalLogsFromDisk 读操作员账号目录的当日 signal_records.json（内存为空时的兜底源）。
+// English: reads the operator account's on-disk signal_records.json as a fallback when the in-memory
+// signal logs are empty; same-trading-day records only.
+func (s *Server) operatorSignalLogsFromDisk() []combat_agent.SignalLog {
+	dir := s.cacheDir
+	if dir == "" {
+		return nil
+	}
+	op := s.operatorID()
+	if op == "" {
+		return nil
+	}
+	p := filepath.Join(dir, "accounts", op, "signal_records.json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var f struct {
+		TradingDay string                   `json:"trading_day"`
+		Records    []combat_agent.SignalLog `json:"records"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil
+	}
+	if f.TradingDay != data.TradingDayDate(time.Now()) {
+		return nil
+	}
+	return f.Records
+}
+
 // handleSignalLogs 返回当日全量信号批次记录（用于"信号日志"弹窗按批次复盘）。
+// §FIX-0921c：内存为空时回落操作员账号当日落盘（同 stage-records 口径），并打诊断日志。
 func (s *Server) handleSignalLogs(w http.ResponseWriter, r *http.Request) {
-	c := s.ctrlFor(requestUserID(r))
+	uid := requestUserID(r)
+	c := s.ctrlFor(uid)
 	if c == nil {
+		log.Printf("[llm-diag] uid=%s signal-logs: ctrl=nil → no_engine", uid)
 		writeJSON(w, 200, map[string]string{"status": "no_engine"})
 		return
 	}
 	recs := c.GetSignalLogs()
+	src := "mem"
+	if len(recs) == 0 {
+		if disk := s.operatorSignalLogsFromDisk(); len(disk) > 0 {
+			recs = disk
+			src = "disk"
+		}
+	}
+	log.Printf("[llm-diag] uid=%s signal-logs: src=%s recs=%d", uid, src, len(recs))
 	if recs == nil {
 		recs = []combat_agent.SignalLog{}
+	}
+	// §FIX-0921d 响应瘦身：仅最近 5 批保留完整信号明细，更早批次截断到前 20 条（批次时间/
+	// 原始条数保留，复盘仍可辨认）。
+	const fullDetailKeep = 5
+	if len(recs) > fullDetailKeep {
+		for i := 0; i < len(recs)-fullDetailKeep; i++ {
+			if len(recs[i].Signals) > 20 {
+				recs[i].Signals = recs[i].Signals[:20]
+			}
+		}
 	}
 	// 就地倒序，最新批次的记录排在最前
 	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {

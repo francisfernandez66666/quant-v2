@@ -458,6 +458,9 @@ export default function LLMDebug() {
   const [noAgent, setNoAgent] = useState(false)
   const [noData, setNoData] = useState(false)
   const [showLog, setShowLog] = useState(false)
+  // §FIX-0921d 取数自诊断（页顶小字）：记录主源/回落成败、轮数与耗时——远程定位「白板」根因用，
+  // 用户刷新后一眼可见取数链路真实状态（2026-09-01 实录：服务端 20 条正常但用户端白板，无法定位）。
+  const [diag, setDiag] = useState(null)
   const timerRef = useRef(null)      // 轮询定时器句柄
   const sseUnsubRef = useRef(null)   // SSE 取消订阅函数引用
 
@@ -490,44 +493,53 @@ export default function LLMDebug() {
   // 回落 /api/llm-debug（最新单轮快照，含待归因原始新闻 + 已归因事件）——保证「即使新闻
   // 没有分析出有价值结果，也如实显示 L1/L2 内容」，不再出现「暂无数据」白板。
   async function loadData() {
+    if (loading) return // §FIX-0921d 防并发风暴：SSE/15s 轮询/手动刷新互斥，避免同时多个 700KB 请求挤占连接
     setLoading(true)
+    const t0 = Date.now()
+    let recs = null
+    let mainOk = false
+    let fbOk = false
+    let errMsg = ''
     try {
-      let recs = null
-      try {
-        recs = await api.fetchStageRecords()
-      } catch (_) {
-        recs = null // 主源失败（超时/网络抖动）不直接白板，走回落
-      }
-      if (recs && recs.status === 'no_engine') {
-        setNoAgent(true)
-        setNoData(false)
-        setRecords([])
-        setData(null)
-        return
-      }
-      if (!Array.isArray(recs) || recs.length === 0) {
-        // 回落源：最新单轮快照（字段与轮次记录同构，直接包一层数组复用渲染）
-        try {
-          const d = await api.fetchLLMDebug()
-          if (d && !d.status && (d.raw_titles || d.stage2_events)) {
-            recs = [d]
-          }
-        } catch (_) {}
-      }
-      if (Array.isArray(recs) && recs.length) {
-        setRecords(recs)
-        applyLatest()
-      } else {
-        setNoData(true)
-        setNoAgent(false)
-        setRecords([])
-        setData(null)
-      }
+      recs = await api.fetchStageRecords()
+      mainOk = Array.isArray(recs) && recs.length > 0
     } catch (e) {
-      console.error('LLMDebug 加载失败', e)
-    } finally {
-      setLoading(false)
+      recs = null
+      errMsg = (e && e.message) || String(e)
     }
+    if (recs && recs.status === 'no_engine') {
+      setNoAgent(true)
+      setNoData(false)
+      setRecords([])
+      setData(null)
+      setDiag({ n: 0, mainOk: false, fbOk: false, ms: Date.now() - t0, err: 'no_engine' })
+      setLoading(false)
+      return
+    }
+    if (!mainOk) {
+      // 回落源：最新单轮快照（字段与轮次记录同构，直接包一层数组复用渲染）
+      try {
+        const d = await api.fetchLLMDebug()
+        if (d && !d.status && (d.raw_titles || d.stage2_events)) {
+          recs = [d]
+          fbOk = true
+        }
+      } catch (e2) {
+        if (!errMsg) errMsg = (e2 && e2.message) || String(e2)
+      }
+    }
+    if (Array.isArray(recs) && recs.length) {
+      setRecords(recs)
+      applyLatest()
+      setDiag({ n: recs.length, mainOk, fbOk, ms: Date.now() - t0, err: '' })
+    } else {
+      setNoData(true)
+      setNoAgent(false)
+      setRecords([])
+      setData(null)
+      setDiag({ n: 0, mainOk, fbOk, ms: Date.now() - t0, err: errMsg })
+    }
+    setLoading(false)
   }
 
   // 页面挂载：首次加载 + SSE 实时刷新 + 15s 轮询兜底
@@ -595,6 +607,13 @@ export default function LLMDebug() {
       </div>
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
 
+      {/* §FIX-0921d 取数自诊断行：主源/回落/轮数/耗时/错误，一眼定位白板根因 */}
+      {diag && (
+        <div style={{ fontSize: 12, color: '#999', marginBottom: 8 }}>
+          数据自检: {diag.n} 轮 · 主源{diag.mainOk ? '✅' : '❌'} · 回落{diag.fbOk ? '✅' : '❌'} · {diag.ms}ms
+          {diag.err ? ' · ' + diag.err : ''}
+        </div>
+      )}
       {noAgent && <div style={emptyStyle}>Agent 未就绪</div>}
       {!noAgent && noData && <div style={emptyStyle}>暂无数据，等待下一轮扫描</div>}
       {data && (
