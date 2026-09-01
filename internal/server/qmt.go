@@ -397,6 +397,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		Amount    float64              `json:"amount"`
 		TradedAt  string               `json:"traded_at"`
 		SignalID  string               `json:"signal_id"`
+		Reason    string               `json:"reason"` // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
 		Positions []store.RealPosition `json:"positions"`
 		Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
 		At        string               `json:"at"`
@@ -460,10 +461,22 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 					log.Printf("[trading] upsert order: %v", err)
 				}
 			} else if ev.Status != "已报" {
-				log.Printf("[trading] 委托状态推进 %s: %s (order=%s)", ev.SignalID, ev.Status, ev.OrderID)
+				log.Printf("[trading] 委托状态推进 %s: %s (order=%s%s)", ev.SignalID, ev.Status, ev.OrderID,
+					func() string {
+						if ev.Reason != "" {
+							return " 拒因=" + ev.Reason
+						}
+						return ""
+					}())
 				// §DAILY_OPSLOG 状态推进是委托生命周期的核心节点（已成/已撤/废单…）
-				opslog.Logf("quant", "委托状态推进 %s %s %s qty=%d status=%s order=%s",
-					ev.SignalID, orderSide, ev.Code, ev.Qty, ev.Status, ev.OrderID)
+				opslog.Logf("quant", "委托状态推进 %s %s %s qty=%d status=%s order=%s%s",
+					ev.SignalID, orderSide, ev.Code, ev.Qty, ev.Status, ev.OrderID,
+					func() string {
+						if ev.Reason != "" {
+							return " 拒因=" + ev.Reason
+						}
+						return ""
+					}())
 			}
 		}
 	case "trade":

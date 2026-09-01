@@ -168,22 +168,26 @@ class XtBroker(Broker):
     def price_type_const(price_type, code):
         """§G6 price_type → xtconstant 数值常量。
 
-        limit → FIX_PRICE(11)；market → 对手方最优价格委托（契约语义=对手价），
-        沪市取 MARKET_PEER_PRICE_FIRST_SH(44)、深市取 MARKET_PEER_PRICE_FIRST(14)。
+        limit → FIX_PRICE(11)；market → 分市场映射：
+          沪市 → MARKET_SH_CONVERT_5_LIMIT(43)「最优五档即时成交剩余转限价」（§FIX-0921：
+          2026-09-01 14:43 实录：本东莞构建 xtconstant 无 MARKET_PEER_PRICE_FIRST_SH 常量，
+          回退值 44(对手方最优价) 发沪市被柜台 200ms 内废单（XtMiniQmt 日志 prctype=84,
+          stat 50→57）；沪市合规市价等价物是 42/43，取 43（剩余转限价，按我方价格兜底成交）；
+          深市 → MARKET_PEER_PRICE_FIRST（对手方最优价，本构建=44；昨日 000600.SZ 实证可成交）。
         常量名缺失时用文档数值兜底；有 xtconstant 时以库值为准。
         """
-        fix, peer_sh, peer_sz = 11, 44, 14
+        fix, sh_conv_limit, peer_sz = 11, 43, 14
         try:
             from xtquant import xtconstant  # noqa: PLC0415
             fix = getattr(xtconstant, "FIX_PRICE", fix)
-            peer_sh = getattr(xtconstant, "MARKET_PEER_PRICE_FIRST_SH", peer_sh)
+            sh_conv_limit = getattr(xtconstant, "MARKET_SH_CONVERT_5_LIMIT", sh_conv_limit)
             peer_sz = getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", peer_sz)
         except Exception:  # noqa: BLE001 — 无 xtquant 环境（mock/测试）
             pass
         if str(price_type or "").lower() == "limit":
             return int(fix)
         head = str(code or "").split(".")[0]
-        return int(peer_sh) if head.startswith("6") else int(peer_sz)
+        return int(sh_conv_limit) if head.startswith("6") else int(peer_sz)
 
     def connect(self):
         """connect() 一次性建立 + 自实现自动重连循环。"""

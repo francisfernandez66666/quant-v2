@@ -261,6 +261,23 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		// price (isolated from the real book). The signal price is recorded as a reference to quantify
 		// the signal-to-fill latency and slippage impact on returns.
 		e.paperSignals(emit, quotes)
+
+		// §FIX-0921f 实盘 auto 下单接入近实时翻转信号（2026-09-01 用户实录「开关开着零实盘交易」）：
+		// 此前实盘 auto 下单只挂在主循环 syncMessages 上，而主循环单轮可被 LLM 慢链拖到
+		// 33min+ 甚至停摆（13:44:58 后全天零轮完成），今日全部 buy 信号产自本近实时翻转循环
+		// 却从未走到下单。现与模拟盘撮合同点接线：autoPlace 内含模式/白名单/涨停封板/整手
+		// 缩量/可用资金降档/幂等（signal_id=buy:code:strategy:交易日）全套守卫，与主循环共享
+		// 幂等键——双通道叠加也被 orders 表唯一约束拦重，不会重复下单。
+		// English: wire live auto-buy into the near-realtime flip emission (same point as the paper fill).
+		// Previously auto-buy was only on the main loop's syncMessages, which can stall 33min+ per round
+		// under slow LLM chains — today ALL buy signals originated here yet never reached ordering.
+		// autoPlace carries the full guard chain (mode/whitelist/sealed-board/lot-sizing/cash-downshift/
+		// idempotent key) shared with the main loop; the DB unique key blocks cross-channel repeats.
+		for _, sig := range emit {
+			if sig.Action == "buy" && sig.Direction == "做多" {
+				e.autoPlace(sig, quotes)
+			}
+		}
 	}
 
 	// 模拟盘估值与日净值：每轮用实时快照价刷新持仓市值，并记录当日净值点。

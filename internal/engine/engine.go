@@ -689,6 +689,21 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	ctrl := e.qmtCtrl
 	e.mu.RUnlock()
 	if ctrl == nil || !ctrl.Enabled() || ctrl.Mode() != "auto" {
+		// §DIAG-0921 静默门插桩（2026-09-01 实录：fac_1 buy 信号进主循环却全程零下单/零日志，
+		// 无法定位是哪个静默门吞掉的）：每个静默跳过点打一条 DayOnce 节流日志（每码每天一次），
+		// 不刷屏但让"信号为何没下单"一眼可见。
+		reason := "ctrl-nil"
+		if ctrl != nil {
+			if !ctrl.Enabled() {
+				reason = "qmt-disabled"
+			} else if ctrl.Mode() != "auto" {
+				reason = "mode-" + ctrl.Mode()
+			}
+		}
+		log.Printf("[qmt-gate] %s(%s) %s/%s 自动下单跳过: %s", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, reason)
+		opslog.DayOnce("auto-gate:"+reason+":"+sig.Code, func() {
+			opslog.Logf("quant", "auto下单跳过 %s(%s) 策略=%s/%s 原因=%s", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, reason)
+		})
 		return
 	}
 	cfg := ctrl.Config()
@@ -704,6 +719,11 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 			}
 		}
 		if !allowed {
+			// §DIAG-0921 白名单外静默跳过同样打节流日志（此前完全无声，无法区分"没信号"与"被白名单拦"）
+			log.Printf("[qmt-gate] %s(%s) %s/%s 白名单外跳过: 允许=%v", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, cfg.Strategies)
+			opslog.DayOnce("auto-wl:"+sig.Code, func() {
+				opslog.Logf("quant", "auto白名单外跳过 %s(%s) 策略=%s/%s 允许=%v", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, cfg.Strategies)
+			})
 			return
 		}
 	}
@@ -712,6 +732,11 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		price = si.Price
 	}
 	if price <= 0 {
+		// §DIAG-0921 价格无效静默跳过节流日志（触发价缺失且无实时行情时的无声丢弃点）
+		log.Printf("[qmt-gate] %s(%s) %s/%s 价格无效跳过: price=%.2f", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, price)
+		opslog.DayOnce("auto-price:"+sig.Code, func() {
+			opslog.Logf("quant", "auto价格无效跳过 %s(%s) 策略=%s/%s price=%.2f", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, price)
+		})
 		return
 	}
 	// §GAP1.5 涨停封板拒买（与模拟盘 paper.LimitUpPct 同款分板块守卫）：

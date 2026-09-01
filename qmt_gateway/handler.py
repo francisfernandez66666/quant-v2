@@ -183,7 +183,19 @@ class ReportHandler:
 
     # ── xtquant 回调 / mock 直调 ──
     def on_stock_order(self, order):
-        """委托回报（xtquant order 对象）。at/created_at 双字段兼容首尔契约。"""
+        """委托回报（xtquant order 对象）。at/created_at 双字段兼容首尔契约。
+
+        §FIX-0921 拒因透传（2026-09-01 实录：沪市对手方最优价被柜台废单，XtMiniQmt 日志才见
+        prctype=84/stat 57——xtquant 回调对象携带 status_msg/order_status_msg 被此处丢弃，
+        引擎侧永远看不到柜台废单原因）。尽力提取原因字段透传给引擎（字段名跨构建不定，
+        逐一探测，缺失为空串）。
+        """
+        reason = ""
+        for attr in ("order_status_msg", "status_msg", "strategy_name", "error_info", "msg"):
+            v = getattr(order, attr, None)
+            if v:
+                reason = str(v)
+                break
         ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
         self.on_order({
             "order_id": str(getattr(order, "order_id", "")),
@@ -193,6 +205,7 @@ class ReportHandler:
             "status": self._status(getattr(order, "order_status", "")),
             "price": float(getattr(order, "price", 0) or 0),
             "qty": int(getattr(order, "order_volume", 0) or 0),
+            "reason": reason,
             "created_at": ts,
             "at": ts,
         })

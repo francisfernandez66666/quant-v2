@@ -617,17 +617,37 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 		return fmt.Errorf("单日买入预算不足: 已报 %.0f + 本次 %.0f > 预算 %.0f", spent, amount, cfg.DailyBudgetAmount)
 	}
 	if cfg.InitialCapital > 0 {
-		pos, err := c.store.RealPositionsForUser(c.userID)
-		if err != nil {
-			return fmt.Errorf("read real positions: %w", err)
+		// §FIX-0921g 近似口径让位于券商实口径（2026-09-01 用户实录「开关开着零实盘交易」终极根因）：
+		// InitialCapital 是静态配置值，不随实际入金增长——用户实际已追加资金（持仓成本 113,012
+		// > 初始配置 100,000 → 近似可用恒为负数 −13,012），无论券商真实可用 1,500.45 充足与否
+		// 都被这道硬闸先拒。券商口径可用资金（网关 account 事件回灌）是账本事实、已含全部入金：
+		// **快照可用且新鲜（≤10min）时本近似硬闸让位（跳过），由下方券商闸独立把关**；
+		// 券商数据缺失/过期时才回落到本近似口径维持旧防线（保守折算 50% 的券商闸仍在）。
+		// English: supersede the static-capital approximation when the broker-reported available cash
+		// is present and fresh (≤10min) — the broker number is the ledger fact (includes all deposits);
+		// the legacy InitialCapital−held−spent estimate is stale-by-design (static config never grows
+		// with deposits, here it went negative −13,012 and hard-rejected every buy despite ample real
+		// cash). The approximation only guards when broker data is missing/stale.
+		brokerFresh := false
+		if acc, aerr := c.store.GetRealAccount(c.userID); aerr == nil && acc.AvailableCash > 0 {
+			if at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc); perr == nil &&
+				time.Since(at) <= 10*time.Minute {
+				brokerFresh = true
+			}
 		}
-		held := 0.0
-		for _, p := range pos {
-			held += p.CostPrice * float64(p.Qty)
-		}
-		if avail := cfg.InitialCapital - held - spent; amount > avail {
-			return fmt.Errorf("可用资金不足: 预估可用 %.0f（本金%.0f−持仓成本%.0f−今日已报%.0f）< 本次 %.0f",
-				avail, cfg.InitialCapital, held, spent, amount)
+		if !brokerFresh {
+			pos, err := c.store.RealPositionsForUser(c.userID)
+			if err != nil {
+				return fmt.Errorf("read real positions: %w", err)
+			}
+			held := 0.0
+			for _, p := range pos {
+				held += p.CostPrice * float64(p.Qty)
+			}
+			if avail := cfg.InitialCapital - held - spent; amount > avail {
+				return fmt.Errorf("可用资金不足: 预估可用 %.0f（本金%.0f−持仓成本%.0f−今日已报%.0f）< 本次 %.0f",
+					avail, cfg.InitialCapital, held, spent, amount)
+			}
 		}
 	}
 	// §R4-3 真实可用资金回灌：网关 account 事件（broker.query_asset）落库的券商口径可用资金，
