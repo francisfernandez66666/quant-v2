@@ -153,6 +153,7 @@ export default function KLineChart({
     const cvs = canvasRef.current
     if (!cvs || raw.length === 0) return
 
+    // 画布初始化：按 devicePixelRatio 高清适配、清屏并填充底色
     const dpr = window.devicePixelRatio || 1
     cvs.style.width = '100%'
     const contW = Math.max(1, Math.round(cvs.clientWidth || viewW))
@@ -166,6 +167,7 @@ export default function KLineChart({
     ctx.fillStyle = C.bg
     ctx.fillRect(0, 0, contW, viewH)
 
+    // 纵向分区：上中下分别为 价格区(62%) / 成交量区(20%) / MACD 区
     const innerH = viewH - plotT - axisB
     const priceH = Math.round(innerH * 0.62)
     const volH = Math.round(innerH * 0.20)
@@ -182,6 +184,7 @@ export default function KLineChart({
       if (p.high > max) max = p.high
       if (p.low < min) min = p.low
     }
+    // 价格轴范围：以昨收为中心取对称区间（带 15% 余量），保证红涨绿跌基准一致；无昨收则按高低点加边距
     let lo, hi
     if (prevClose > 0 && max >= 0 && min >= 0) {
       const span = Math.max(0.015, (max - min) / (2 * prevClose))
@@ -203,6 +206,7 @@ export default function KLineChart({
     const points = raw.map((p, i) => ({ i, raw: p, cx: cxOf(i), yClose: priceY(p.close) }))
     const priceCoords = points.map((p) => [p.cx, p.yClose])
 
+    // 分时均价线：累计成交额 / 累计成交量（前复权价口径）
     let cumAmt = 0, cumVol = 0
     const avgArr = new Array(n).fill(0)
     const avgCoords = []
@@ -219,6 +223,7 @@ export default function KLineChart({
     for (const p of raw) if (p.volume > maxV) maxV = p.volume
     if (maxV <= 0) maxV = 1
     const vW = Math.max(1, step * 0.6)
+    // 成交量柱：按最大量归一化高度，红涨绿跌着色（相对昨收或相对开盘）
     const volBars = raw.map((p, i) => {
       const cx = cxOf(i)
       const h = (p.volume / maxV) * volH
@@ -230,6 +235,7 @@ export default function KLineChart({
     for (const p of raw) maxAbs = Math.max(maxAbs, Math.abs(p.bar), Math.abs(p.dif), Math.abs(p.dea))
     const half = macdH / 2
     const mW = Math.max(1, step * 0.55)
+    // MACD 柱（红正绿负）+ DIF/DEA 折线数据点，按最大绝对值归一化到 MACD 区
     const difCoords = [], deaCoords = []
     const macdBars = raw.map((p, i) => {
       const cx = cxOf(i)
@@ -245,6 +251,7 @@ export default function KLineChart({
     ctx.font = '12px monospace'
     ctx.textBaseline = 'middle'
 
+    // 价格区横向 5 等分网格线 + 左侧坐标刻度
     for (let i = 0; i <= 4; i++) {
       const v = lo + (hi - lo) * i / 4
       const y = plotT + priceH - (v - lo) / (hi - lo) * priceH
@@ -257,6 +264,7 @@ export default function KLineChart({
       ctx.fillText(v.toFixed(2), plotL - 4, y)
     }
 
+    // 昨收基准虚线（红涨绿跌的分界线）
     const prevY = priceY(prevClose)
     ctx.strokeStyle = C.prev
     ctx.setLineDash([4, 3])
@@ -266,6 +274,7 @@ export default function KLineChart({
     ctx.textAlign = 'end'
     ctx.fillText(prevClose ? prevClose.toFixed(2) : '', contW - plotR, prevY - 8)
 
+    // 分时价格线：整体渐变填充到价格区底 + 逐段按红涨绿跌着色 + 末点高亮
     if (priceCoords.length > 1) {
       const up = raw[n - 1].close >= prevClose
       const cc = up ? PRICE_UP : PRICE_DOWN
@@ -298,6 +307,7 @@ export default function KLineChart({
     ctx.lineWidth = 1
     drawPolyline(ctx, avgCoords)
 
+    // 成交量区/MACD 区分隔线 + MACD 零轴虚线
     ctx.strokeStyle = C.grid
     ctx.lineWidth = 1
     ctx.beginPath(); ctx.moveTo(plotL, volTop); ctx.lineTo(contW - plotR, volTop); ctx.stroke()
@@ -307,6 +317,7 @@ export default function KLineChart({
     ctx.beginPath(); ctx.moveTo(plotL, macdZero); ctx.lineTo(contW - plotR, macdZero); ctx.stroke()
     ctx.setLineDash([])
 
+    // 成交量柱批量绘制（半透明红涨绿跌）
     for (const b of volBars) {
       ctx.fillStyle = b.color
       ctx.globalAlpha = 0.45
@@ -314,6 +325,7 @@ export default function KLineChart({
     }
     ctx.globalAlpha = 1
 
+    // MACD 柱批量绘制（红正绿负）
     for (const b of macdBars) {
       ctx.fillStyle = b.color
       ctx.globalAlpha = 0.8
@@ -327,6 +339,7 @@ export default function KLineChart({
     ctx.strokeStyle = C.dea
     drawPolyline(ctx, deaCoords)
 
+    // 底部时间轴刻度（最多 6 个，取分时时间 HH:mm）
     ctx.fillStyle = C.axisTxt
     ctx.textAlign = 'center'
     const tcount = Math.min(6, n)
@@ -336,6 +349,7 @@ export default function KLineChart({
       ctx.fillText((p.raw.time || '').slice(11, 16), p.cx, viewH - 5)
     }
 
+    // hover 十字光标：竖/横参考线 + 定位点 + 信息气泡（时间/价/涨跌幅/开高低/量额/MACD）
     if (hover) {
       ctx.strokeStyle = C.cross
       ctx.lineWidth = 1

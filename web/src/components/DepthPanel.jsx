@@ -109,11 +109,13 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     const cvs = canvasRef.current
     if (!cvs || !ob || !ob.bids || !ob.bids.length) return
 
+    // 画布初始化：按 devicePixelRatio 高清适配
     const dpr = window.devicePixelRatio || 1
     cvs.style.width = '100%'
     const W = Math.max(1, Math.round(cvs.clientWidth || viewW))
 
     let levelCount = 0
+    // 有效档位数：最大支持 10 档，按买卖两侧价格>0 的档位统计，无数据则按 5 档兜底
     const maxL = Math.min(ob.bids.length, 10)
     for (let i = 0; i < maxL; i++) {
       const b = ob.bids[i], a = ob.asks ? ob.asks[i] : null
@@ -126,6 +128,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     const topPad = 4, botPad = 4
     const factorH = factors ? 66 : 0
     const H = topPad + (L * 2 + 1) * rowH + (factors ? factorH + 6 : 0) + botPad
+    // 行布局：上为卖盘（倒序）、中间现价行、下为买盘；画布高度随档位数自适应
 
     cvs.width = Math.round(W * dpr)
     cvs.height = Math.round(H * dpr)
@@ -137,6 +140,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     ctx.fillRect(0, 0, W, H)
 
     const rows = []
+    // 卖盘行：档位标签倒序（卖五…卖一），价格/量取自 asks 数组
     for (let i = 0; i < L; i++) {
       const label = L - i
       const idx = L - 1 - i
@@ -144,15 +148,18 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
       rows.push({ side: 'ask', lv: '卖' + label, price: a ? a.price : 0, vol: a ? a.volume : 0 })
     }
     rows.push({ now: true, lv: ob.name || code, price: ob.price || 0, volText: pctText })
+    // 买盘行：档位标签正序（买一…买五/%d），价格/量取自 bids 数组
     for (let i = 0; i < L; i++) {
       const b = ob.bids ? ob.bids[i] : null
       rows.push({ side: 'bid', lv: '买' + (i + 1), price: b ? b.price : 0, vol: b ? b.volume : 0 })
     }
 
+    // 量能最大值（用于量柱宽度归一化），避免除零
     let maxVol = 0
     for (const r of rows) if (r.vol > maxVol) maxVol = r.vol
     if (maxVol <= 0) maxVol = 1
 
+    // 列布局：档位标签 | 价格 | 量柱，量柱区按最大量归一化
     const col1 = 8
     const labelW = 44
     const priceX = col1 + labelW
@@ -168,6 +175,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
       const y = topPad + ri * rowH
       const cy = y + rowH / 2
       if (r.now) {
+        // 现价行：浅灰底 + 名称 + 右侧现价与涨跌幅（红涨绿跌）
         ctx.fillStyle = C.nowBg
         ctx.fillRect(col1, y, W - col1 * 2, rowH)
         ctx.fillStyle = C.lv
@@ -180,6 +188,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         ctx.fillStyle = pcolor
         ctx.fillText(r.volText, col1 + 120, cy)
       } else {
+        // 买卖档行：量柱（买红/卖绿）+ 档位标签 + 价格 + 手数；价格色区分买卖侧
         if (r.vol > 0) {
           const bw = (r.vol / maxVol) * (volAreaRight - volAreaLeft)
           ctx.fillStyle = r.side === 'ask' ? 'rgba(22,163,74,0.14)' : 'rgba(245,34,77,0.14)'
@@ -198,6 +207,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     })
 
     if (factors) {
+      // 盘口因子区：委比/买卖量/封单/价差/覆盖度，每行一对「标签-数值」
       let fy = topPad + (L * 2 + 1) * rowH + 18
       ctx.font = '12px monospace'
       const F = {

@@ -1,25 +1,31 @@
 /* ── 日志弹窗组件样式 LogModal.css ──
  * 定义弹窗遮罩、头部筛选、批次卡片、内容区域、加载与空态样式。
  */
+
+/* 全屏遮罩：半透明黑底、居中弹出 */
 .log-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,0.65);
   display: flex; align-items: center; justify-content: center; z-index: 200;
 }
+/* 弹窗主体：自适应宽度、纵向 flex 布局、内容区可滚动 */
 .log-modal {
   width: 92%; max-width: 860px; max-height: 86vh;
   background: #ffffff; border-radius: 12px;
   display: flex; flex-direction: column; overflow: hidden;
 }
+/* 头部：标题左置、关闭按钮右置，下边框分隔 */
 .log-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 16px; border-bottom: 1px solid #1a1a1a;
 }
 .log-title { font-size: 15px; font-weight: 600; color: #1a1a1a; }
+/* 关闭按钮：灰字，悬停变红 */
 .log-close {
   border: none; background: transparent; color: #888; font-size: 16px; cursor: pointer;
 }
 .log-close:hover { color: #FF4D4F; }
 
+/* 弹窗内 tab 切换条：标签胶囊式排布，激活态红字强调 */
 .log-tabs {
   display: flex; gap: 6px; padding: 10px 16px 0;
 }
@@ -29,12 +35,15 @@
 }
 .log-tab.active { color: #1a1a1a; background: #f0f0f0; border-color: #FF4D4F; }
 
+/* 内容区：内边距 + 纵向滚动 */
 .log-body {
   padding: 12px 16px 16px; overflow-y: auto;
 }
+/* 顶部工具条：搜索框、下拉筛选与刷新按钮横排 */
 .log-toolbar {
   display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
 }
+/* 搜索输入框：浅灰底圆角，聚焦红边 */
 .log-search {
   flex: 1; min-width: 0;
   padding: 6px 10px; border-radius: 6px; border: 1px solid #dcdcdc;
@@ -58,11 +67,14 @@
 .btn-refresh:disabled { opacity: 0.5; }
 .btn-refresh:hover { background: rgba(255,77,79,0.1); }
 
+/* 空态提示：居中灰字 */
 .log-empty { text-align: center; padding: 40px; color: #888888; font-size: 14px; }
 
+/* 检索视图（Stage0/1）：摘要、分组标题与批次列表 */
 .search-view { display: flex; flex-direction: column; gap: 12px; }
 .search-summary { font-size: 14px; color: #888; }
 .search-group { display: flex; flex-direction: column; gap: 8px; }
+/* 分组标题：批次数 + 命中条数，下虚线分隔 */
 .search-group-head {
   display: flex; align-items: center; gap: 10px;
   padding: 4px 2px; border-bottom: 1px dashed #1a1a1a;
@@ -70,6 +82,7 @@
 .search-batch { font-size: 14px; font-weight: 600; color: #4fc3f7; }
 .search-count { font-size: 14px; color: #888; }
 
+/* 概览条：灰度底的横向汇总指标（条数/命中/LLM/关键词等） */
 .summary-bar {
   display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px;
   background: #f5f5f5; border-radius: 8px; padding: 10px 14px;
@@ -80,17 +93,21 @@
 .tag-llm { color: #4caf50; }
 .tag-keyword { color: #ff9800; }
 
+/* 区块标题：下边框分隔的段落小标题 */
 .section-title { font-size: 14px; margin: 14px 0 8px; color: #555555; border-bottom: 1px solid #1a1a1a; padding-bottom: 5px; }
+/* Stage1 标题候选列表：逐行可选，选中淡绿底、被丢弃半透明 */
 .stage1-list { margin-bottom: 8px; }
 .title-item { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 4px; margin-bottom: 2px; font-size: 14px; }
 .title-item.selected { background: rgba(76,175,80,0.08); }
 .title-item.discarded { opacity: 0.45; }
+/* 标题徽标（通过/跳过）与索引/正文/省略号样式 */
 .title-idx { color: #888888; min-width: 22px; font-size: 14px; text-align: right; }
 .title-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .title-badge { font-size: 14px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
 .badge-pass { background: rgba(76,175,80,0.2); color: #4caf50; }
 .badge-skip { background: rgba(255,152,0,0.15); color: #ff9800; }
 
+/* Stage2 事件卡：灰色卡片内含标题/评分/标签/原因明细 */
 .stage2-events { display: flex; flex-direction: column; gap: 8px; }
 .event-card { background: #f5f5f5; border-radius: 8px; padding: 10px 12px; border: 1px solid #1a1a1a; }
 .event-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
@@ -105,6 +122,7 @@
 .mini-tag.stock { color: #ff9800; background: rgba(255,152,0,0.1); }
 .event-reason { color: #555555; line-height: 1.4; }
 
+/* 信号卡（Stage2 输出）：代码/名称/战法/置信/价格/板块/原因 */
 .signal-list { display: flex; flex-direction: column; gap: 8px; }
 .signal-item { background: #f5f5f5; border-radius: 8px; padding: 10px 12px; border: 1px solid #1a1a1a; }
 .sig-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -117,6 +135,7 @@
 .sig-sector { font-size: 14px; color: #64b5f6; background: rgba(100,181,246,0.1); padding: 1px 6px; border-radius: 3px; }
 .sig-reason { color: #555555; line-height: 1.4; }
 
+/* 通用小标签：按 利好/利空/中性/做多/做空/提醒 着色 */
 .tag { font-size: 14px; padding: 2px 7px; border-radius: 4px; white-space: nowrap; }
 .tag-利好 { background: rgba(76,175,80,0.2); color: #4caf50; }
 .tag-利空 { background: rgba(255,77,79,0.2); color: #FF4D4F; }
@@ -124,6 +143,7 @@
 .tag-做多 { background: rgba(76,175,80,0.2); color: #4caf50; }
 .tag-做空 { background: rgba(255,77,79,0.2); color: #FF4D4F; }
 .tag-提醒 { background: rgba(255,152,0,0.15); color: #ff9800; }
+/* 方向徽标（做多/做空/提醒）与动作徽标（买入/观察/卖出） */
 .dir-做多 { background: rgba(76,175,80,0.2); color: #4caf50; }
 .dir-做空 { background: rgba(255,77,79,0.2); color: #FF4D4F; }
 .dir-提醒 { background: rgba(255,152,0,0.15); color: #ff9800; }
@@ -131,6 +151,7 @@
 .act-watch { background: rgba(100,181,246,0.15); color: #64b5f6; }
 .act-卖出 { background: rgba(255,77,79,0.25); color: #FF4D4F; }
 
+/* 窄屏适配：弹窗加宽、工具条折行换列避免挤压 */
 @media (max-width: 768px) {
   .log-modal { width: 96%; max-height: 92vh; }
   .log-toolbar { flex-wrap: wrap; gap: 6px; }
