@@ -18,6 +18,10 @@ import (
 
 // handleSweepPoolList 处理 GET /api/research/sweep-pools。
 func (s *Server) handleSweepPoolList(w http.ResponseWriter, r *http.Request) {
+	if s.researchDB == nil {
+		writeError(w, http.StatusServiceUnavailable, "研究库未接入")
+		return
+	}
 	list, err := s.researchDB.ListSweepPoolConfigs()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -44,6 +48,10 @@ func (s *Server) handleSweepPoolUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := c.Validate(); err != nil {
 		writeError(w, 400, err.Error())
+		return
+	}
+	if s.researchDB == nil {
+		writeError(w, http.StatusServiceUnavailable, "研究库未接入")
 		return
 	}
 	if err := s.researchDB.UpsertSweepPoolConfig(&c); err != nil {

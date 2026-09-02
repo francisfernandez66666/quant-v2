@@ -49,6 +49,7 @@ type clsNewsRaw struct {
 // clsSign computes the CLS API signature as
 // md5( sha1( urlencode(sorted(params)) ).hexdigest() ).hexdigest().
 func clsSign(params map[string]string) string {
+	// 参数按 key 字典序拼接（urlencode），先 SHA1 再 MD5 双哈希
 	keys := make([]string, 0, len(params))
 	for k := range params {
 		keys = append(keys, k)

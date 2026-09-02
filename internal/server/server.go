@@ -1018,12 +1018,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleDataSourceHealth 处理 GET /api/data_source_health：返回各数据源健康探测结果。
 // （handleDataSourceHealth returns the probing results of each data source.）
 func (s *Server) handleDataSourceHealth(w http.ResponseWriter, r *http.Request) {
+	if s.dc == nil {
+		writeError(w, http.StatusServiceUnavailable, "data coordinator not wired")
+		return
+	}
 	writeJSON(w, 200, s.dc.HealthCheck())
 }
 
 // handleNewsSourceHealth 处理 GET /api/news_source_health：返回新闻资讯源健康探测结果。
 // （handleNewsSourceHealth returns the probing results of each news source.）
 func (s *Server) handleNewsSourceHealth(w http.ResponseWriter, r *http.Request) {
+	if s.dc == nil {
+		writeError(w, http.StatusServiceUnavailable, "data coordinator not wired")
+		return
+	}
 	writeJSON(w, 200, s.dc.NewsSourceHealth())
 }
 

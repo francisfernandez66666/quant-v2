@@ -990,16 +990,18 @@ func backfillPaperQuotes(e *Engine, pe *paper.Engine, quotes map[string]*data.St
 		backed[k] = v
 	}
 	if pe == nil || e == nil || e.strategy == nil {
-		return backed
+		return backed // 缺依赖时原样返回
 	}
 	for _, p := range pe.Positions() {
 		if p.Code == "" {
 			continue
 		}
+		// 快照已有有效价则跳过，避免覆盖实时行情
 		q, ok := backed[p.Code]
 		if ok && q != nil && q.Price > 0 {
 			continue
 		}
+		// 缺失时用最近收盘价补估值（仅本估值轮次生效，不改快照本身）
 		if c := e.strategy.LastClose(p.Code); c > 0 {
 			backed[p.Code] = &data.StockInfo{Code: p.Code, Name: p.Name, Price: c}
 		}
@@ -1319,7 +1321,7 @@ func (e *Engine) GetSignalLogs() []combat_agent.SignalLog {
 // so the log UI never shows empty rounds.
 func (e *Engine) captureSignalRecords(rawCount int, signals []combat_agent.Signal) {
 	if len(signals) == 0 {
-		return
+		return // 无信号批次不入日志，避免空轮次刷屏
 	}
 	e.mu.Lock()
 	rec := combat_agent.SignalLog{
@@ -1327,7 +1329,7 @@ func (e *Engine) captureSignalRecords(rawCount int, signals []combat_agent.Signa
 		RawCount:    rawCount,
 		Signals:     make([]combat_agent.Signal, len(signals)),
 	}
-	copy(rec.Signals, signals)
+	copy(rec.Signals, signals) // 深拷贝，避免外部修改影响历史快照
 	e.signalRecords = append(e.signalRecords, rec)
 	e.mu.Unlock()
 	e.persistSignalRecords()

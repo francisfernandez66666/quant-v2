@@ -515,6 +515,7 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 // does not pressure EastMoney; it also bypasses the shared quoteTTL cache (a cached Sina snapshot lacks flow).
 func (m *MarketAPI) GetRealtimeQuoteWithFlow(code string) (*StockInfo, error) {
 	code = stripSuffix(code)
+	// 东财行情自带资金流，故优先东财，失败再依次降级新浪/腾讯
 	info, emErr := m.getEastMoneyQuote(code)
 	if emErr == nil {
 		return info, nil

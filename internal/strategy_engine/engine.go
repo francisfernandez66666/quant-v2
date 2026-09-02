@@ -494,7 +494,7 @@ func (e *Engine) LastClose(code string) float64 {
 	}
 	klines, _ := e.cachedKLine(code)
 	if len(klines) == 0 {
-		return 0
+		return 0 // 无缓存 K 线（停牌等）返回 0
 	}
 	return klines[len(klines)-1].Close
 }

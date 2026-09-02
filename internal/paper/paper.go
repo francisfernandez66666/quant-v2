@@ -1928,11 +1928,11 @@ func (e *Engine) SetPoolCaps(caps map[string]int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.poolMaxPos == nil {
-		e.poolMaxPos = make(map[string]int)
+		e.poolMaxPos = make(map[string]int) // 首建时初始化每池持仓上限表
 	}
 	for k, n := range caps {
 		if n < 0 {
-			n = 0
+			n = 0 // 负数视为不设限（0）
 		}
 		e.poolMaxPos[k] = n
 	}

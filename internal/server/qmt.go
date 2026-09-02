@@ -107,6 +107,7 @@ func (s *Server) qmtReportMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, 401, "missing authorization token")
 			return
 		}
+		// 仅允许携带「网关 token」的请求（回报/对账），普通用户 token 一律拒绝
 		if uid := s.userForQMTToken(token); uid != "" {
 			u := &auth.User{ID: uid}
 			next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, u)))

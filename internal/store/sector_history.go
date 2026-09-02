@@ -34,12 +34,14 @@ func (d *DB) RebuildSectorHistory(start, end string) (int, error) {
 	}
 	total := 0
 	for _, date := range dates {
+		// 逐日聚合板块（涨停家数/平均涨幅/成员数/领涨股）
 		days, err := d.aggregateSectorDay(date)
 		if err != nil {
 			return total, err
 		}
 		for _, sd := range days {
 			top, _ := json.Marshal(sd.TopStocks)
+			// INSERT OR REPLACE 幂等重建
 			n, err := d.InsertRows("sector_history", TableColumns("sector_history"), []map[string]any{{
 				"trade_date": sd.TradeDate, "industry": sd.Industry,
 				"limitup_cnt": sd.LimitupCnt, "change_pct": sd.ChangePct,

@@ -21,15 +21,16 @@ type KDJPoint struct {
 func KDJ(closes, highs, lows []float64, n, m1, m2 int) []KDJPoint {
 	out := make([]KDJPoint, len(closes))
 	if n <= 0 || m1 <= 0 || m2 <= 0 || len(closes) == 0 {
-		return out
+		return out // 非法参数直接返回空结果
 	}
-	k, d := 50.0, 50.0
+	k, d := 50.0, 50.0 // K/D 初值取 50（中位起点）
 	for i := range closes {
 		lo, hi := lows[i], highs[i]
 		from := 0
 		if i-n+1 > from {
-			from = i - n + 1
+			from = i - n + 1 // 滑动窗口起点（不足 n 根时从 0 开始）
 		}
+		// 求窗口内最低/最高价
 		for j := from; j <= i; j++ {
 			if lows[j] < lo {
 				lo = lows[j]
@@ -40,10 +41,10 @@ func KDJ(closes, highs, lows []float64, n, m1, m2 int) []KDJPoint {
 		}
 		rsv := 50.0
 		if hi != lo {
-			rsv = (closes[i] - lo) / (hi - lo) * 100
+			rsv = (closes[i] - lo) / (hi - lo) * 100 // 未成熟随机值 RSV
 		}
-		k = k*(1-1/float64(m1)) + rsv/float64(m1)
-		d = d*(1-1/float64(m2)) + k/float64(m2)
+		k = k*(1-1/float64(m1)) + rsv/float64(m1) // K 平滑（1/m1 权重）
+		d = d*(1-1/float64(m2)) + k/float64(m2)   // D 平滑（1/m2 权重）
 		out[i] = KDJPoint{RSV: rsv, K: k, D: d, J: 3*k - 2*d}
 	}
 	return out

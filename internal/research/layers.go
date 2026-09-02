@@ -95,11 +95,12 @@ func Monotonic(layers []LayerSummary) (bool, int) {
 	prev := math.NaN()
 	for _, l := range layers {
 		if isNaN(l.MeanReturn) {
-			continue
+			continue // 空层跳过，不参与单调性判断
 		}
 		if !isNaN(prev) {
 			d := l.MeanReturn - prev
 			if math.Abs(d) > 1e-12 {
+				// 相邻两层收益存在差异（容差内视为相等），记录方向
 				if d > 0 {
 					signs = append(signs, 1)
 				} else {
@@ -112,6 +113,7 @@ func Monotonic(layers []LayerSummary) (bool, int) {
 	if len(signs) == 0 {
 		return false, 0
 	}
+	// 全部方向一致才是单调：首方向即基准，后续方向不同则判非单调
 	first := signs[0]
 	for _, s := range signs[1:] {
 		if s != first {

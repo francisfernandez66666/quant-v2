@@ -459,6 +459,7 @@ func (d *DB) SumFilledQty(userID, signalID string) int {
 // never matched.
 func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string) error {
 	if userID == "" {
+		// 遗留全局行（user_id=''）兼容路径
 		_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=''`, orderID, status, signalID)
 		return err
 	}

@@ -1267,10 +1267,10 @@ func (m *Manager) Save() {
 // inotify is unreliable. Stop on ctx cancellation.
 func (m *Manager) Watch(ctx context.Context, interval time.Duration) {
 	if m.path == "" {
-		return
+		return // 无配置文件路径则无需监听
 	}
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = 30 * time.Second // 默认轮询周期 30s
 	}
 	last := m.checksum()
 	go func() {
@@ -1279,14 +1279,14 @@ func (m *Manager) Watch(ctx context.Context, interval time.Duration) {
 		for {
 			select {
 			case <-ctx.Done():
-				return
+				return // 上下文取消即停止监听
 			case <-ticker.C:
 				cur := m.checksum()
 				if cur == "" || cur == last {
-					continue
+					continue // 未变化或读取失败则跳过
 				}
 				last = cur
-				m.Load()
+				m.Load() // 内容变更 → 热重载
 			}
 		}
 	}()

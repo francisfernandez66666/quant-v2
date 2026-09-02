@@ -614,7 +614,7 @@ func (dc *DataCoordinator) GetHotNews(pageSize int) []NewsItem {
 func truncateStr(s string, maxLen int) string {
 	runes := []rune(s)
 	if len(runes) > maxLen {
-		return string(runes[:maxLen])
+		return string(runes[:maxLen]) // 按 rune 截断，保留多字节中文字符完整
 	}
 	return s
 }

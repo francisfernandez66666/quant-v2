@@ -210,12 +210,12 @@ func (e *Engine) PoolABGroups() map[string]string {
 // distinct from clearing. Persisted.
 func (e *Engine) SetPoolIR(poolKey string, ir float64) {
 	if poolKey == "" {
-		return
+		return // 空池键不参与 IR 设定
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if ir == 0 {
-		delete(e.poolIR, poolKey)
+		delete(e.poolIR, poolKey) // IR=0 表示清除（回退默认预算）
 	} else {
 		if e.poolIR == nil {
 			e.poolIR = map[string]float64{}

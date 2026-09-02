@@ -37,9 +37,9 @@ func ATR(highs, lows, closes []float64, n int) []float64 {
 	if n <= 0 || len(tr) < n {
 		return out
 	}
-	out[n-1] = mean(tr[:n])
+	out[n-1] = mean(tr[:n]) // 首值：前 n 根真实波幅的简单均值
 	for i := n; i < len(tr); i++ {
-		out[i] = (out[i-1]*float64(n-1) + tr[i]) / float64(n)
+		out[i] = (out[i-1]*float64(n-1) + tr[i]) / float64(n) // 后续 Wilder 平滑
 	}
 	return out
 }

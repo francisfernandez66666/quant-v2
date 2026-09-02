@@ -24,6 +24,7 @@ func alpha1(s *StockSeries) []float64 {
 	std20 := indicator.RollingStd(ret, 20)
 	for i := range composite {
 		composite[i] = math.NaN()
+		// 收益为负时用 20 日波动率代替收盘价，再取平方：小值表示强度峰值更近
 		if !math.IsNaN(ret[i]) && !math.IsNaN(std20[i]) {
 			base := s.CloseHfq[i]
 			if ret[i] < 0 {
@@ -77,6 +78,7 @@ func alpha101(s *StockSeries) []float64 {
 	for i := range out {
 		out[i] = math.NaN()
 		if s.High[i] > s.Low[i] && s.Vol[i] > 0 && !math.IsNaN(s.High[i]) && !math.IsNaN(s.Low[i]) && !math.IsNaN(s.CloseHfq[i]) {
+			// 收盘价在当日区间内的相对位置（-1~1），以成交量加权
 			pos := (2*s.CloseHfq[i] - s.Low[i] - s.High[i]) / (s.High[i] - s.Low[i])
 			out[i] = pos * s.Vol[i]
 		}

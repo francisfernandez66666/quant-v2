@@ -249,14 +249,14 @@ func (t *tracker) RemovePending(items []data.NewsItem) {
 	for _, it := range items {
 		idx := t.pendingIndexLocked(it.Title)
 		if idx < 0 {
-			continue
+			continue // 队列中不存在（可能已被处理），跳过
 		}
 		dt := it.Datetime
 		if dt == "" {
-			dt = time.Now().Format("2006-01-02 15:04:05")
+			dt = time.Now().Format("2006-01-02 15:04:05") // 缺时间戳用当前时间兜底
 		}
 		t.data.PendingItems = append(t.data.PendingItems[:idx], t.data.PendingItems[idx+1:]...)
-		t.data.SeenTitles[titleHash(it.Title)] = dt
+		t.data.SeenTitles[titleHash(it.Title)] = dt // 标记已处理，避免重启后重试
 	}
 	t.mu.Unlock()
 	_ = t.save()
@@ -289,6 +289,6 @@ func (t *tracker) SortPendingNewestFirst() {
 	sort.SliceStable(t.data.PendingItems, func(i, j int) bool {
 		ti := parsePendingTime(t.data.PendingItems[i].Datetime)
 		tj := parsePendingTime(t.data.PendingItems[j].Datetime)
-		return ti.After(tj)
+		return ti.After(tj) // 发布时间倒序：越新的越靠前处理
 	})
 }

@@ -21,6 +21,7 @@ func atomicWrite(path string, raw []byte, perm os.FileMode) error {
 	if err := os.WriteFile(tmp, raw, perm); err != nil {
 		return err
 	}
+	// 先写临时文件再原子重命名：崩溃/断电不产生半截文件
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err

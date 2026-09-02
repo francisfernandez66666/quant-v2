@@ -487,8 +487,9 @@ func EventSignature(code string, md *strategy_engine.StockMarketData, events []n
 	seen := make(map[string]bool)
 	for _, ev := range events {
 		if ev.Datetime == "" {
-			continue
+			continue // 无时间戳的事件不参与签名（无法定位新旧）
 		}
+		// 事件与该股关联（RelatedStocks / CleanedStocks 任一命中）
 		hit := false
 		for _, s := range ev.RelatedStocks {
 			if stockMatch(s, code, md) {
@@ -507,16 +508,17 @@ func EventSignature(code string, md *strategy_engine.StockMarketData, events []n
 		if !hit {
 			continue
 		}
+		// 去重后把「时间|标题」并入签名，事件集变化即可驱动重评
 		key := ev.Datetime + "|" + ev.Title
 		if !seen[key] {
 			seen[key] = true
 			parts = append(parts, key)
 		}
 	}
-	sort.Strings(parts)
+	sort.Strings(parts) // 排序保证同事件集产生相同签名
 	sig := strings.Join(parts, ";")
 	if sectorEvent != "" {
-		sig += "|SEC|" + sectorEvent
+		sig += "|SEC|" + sectorEvent // 板块事件变化也计入签名
 	}
 	return sig
 }

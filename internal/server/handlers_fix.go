@@ -1363,7 +1363,7 @@ func (s *Server) quote(code string) (*data.StockInfo, error) {
 // sources, keeping results consistent across devices.）
 func (s *Server) quoteSnapshot(code string) *data.StockInfo {
 	if s.fetcher == nil {
-		return nil
+		return nil // 未接入采集器
 	}
 	snap := s.fetcher.Snapshot()
 	if snap == nil {
@@ -1371,7 +1371,7 @@ func (s *Server) quoteSnapshot(code string) *data.StockInfo {
 	}
 	si, ok := snap.Stocks[code]
 	if !ok || si == nil || si.Price <= 0 {
-		return nil
+		return nil // 快照中缺失或价格无效
 	}
 	return si
 }
@@ -1385,8 +1385,9 @@ func (s *Server) quoteSnapshot(code string) *data.StockInfo {
 // appeared and hasn't joined the pool yet), so price/change are always real instead of 0.00%.）
 func (s *Server) quoteDisplay(code string) *data.StockInfo {
 	if si := s.quoteSnapshot(code); si != nil {
-		return si
+		return si // 优先 5s 快照（高频端点防抖）
 	}
+	// 快照缺失（信号/热门股刚出现）时降级为 TTL 缓存实时价，保证涨跌幅非 0
 	si, err := s.quote(code)
 	if err != nil {
 		return nil

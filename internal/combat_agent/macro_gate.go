@@ -59,10 +59,10 @@ func hasGateTriggerLevel(events []data.MacroEvent, levels []string) bool {
 func (a *Agent) macroGateActive() (bool, config.MacroGateConfig) {
 	cfg := a.macroGateConfig()
 	if !cfg.Enabled {
-		return false, cfg
+		return false, cfg // 宏观闸门关闭：不启用
 	}
 	if !hasGateTriggerLevel(macroEventsNow(), cfg.Levels) {
-		return false, cfg
+		return false, cfg // 当前无触发级别的事件：闸门不生效
 	}
 	return true, cfg
 }

@@ -37,7 +37,7 @@ func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
 	pe := s.paperEngineFor(uid)
 	if pe == nil {
-		writeJSON(w, 200, map[string]interface{}{"enabled": false})
+		writeJSON(w, 200, map[string]interface{}{"enabled": false}) // 未接入模拟盘引擎
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{

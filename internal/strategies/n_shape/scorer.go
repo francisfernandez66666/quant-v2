@@ -486,6 +486,7 @@ func (s *LeftSideScorer) calcD2(wa *WaveA, ib *IntradayB) float64 {
 // 0.618~1.0→8, else 0.）
 func (s *LeftSideScorer) calcD3(wa *WaveA, ib *IntradayB, ctx *Ctx) float64 {
 	if ctx.StockPE > 0 {
+		// 有 PE 数据：估值越低回撤容忍度越高（<15 满配，≥50 归零）
 		if ctx.StockPE < 15 {
 			return MaxD3
 		}
@@ -497,6 +498,7 @@ func (s *LeftSideScorer) calcD3(wa *WaveA, ib *IntradayB, ctx *Ctx) float64 {
 		}
 		return 0
 	}
+	// 无 PE（兜底）：按回调深度占 A 浪波幅的斐波那契比例打分
 	span := wa.AHigh - wa.ALow
 	if span <= 0 {
 		return 0
@@ -504,11 +506,11 @@ func (s *LeftSideScorer) calcD3(wa *WaveA, ib *IntradayB, ctx *Ctx) float64 {
 	depth := safeDiv(wa.AHigh-ib.CurPrice, span)
 	switch {
 	case depth >= 0.382 && depth <= 0.618:
-		return MaxD3 * 0.6
+		return MaxD3 * 0.6 // 回调到 0.382~0.618 黄金分割区
 	case depth >= 0.2 && depth < 0.382:
-		return MaxD3 * 0.8
+		return MaxD3 * 0.8 // 浅回调 0.2~0.382：蓄势充分
 	case depth > 0.618 && depth <= 1.0:
-		return MaxD3 * 0.4
+		return MaxD3 * 0.4 // 深回调 0.618~1.0：分歧加大
 	default:
 		return 0
 	}

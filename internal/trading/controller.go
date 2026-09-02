@@ -165,12 +165,13 @@ func (c *Controller) Mode() string {
 // orders on stale numbers.
 func (c *Controller) AvailableCash() float64 {
 	if c.store == nil {
-		return 0
+		return 0 // 未接账本库时视为无可用资金（不上限门控，避免卡死下单）
 	}
 	acc, err := c.store.GetRealAccount(c.userID)
 	if err != nil || acc.AvailableCash <= 0 {
 		return 0
 	}
+	// 对账数据超过 30 分钟视为过期：返回 0，不拿陈旧数字当门控依据
 	updated, err := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, time.Local)
 	if err != nil || time.Since(updated) > 30*time.Minute {
 		return 0

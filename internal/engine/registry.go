@@ -463,7 +463,7 @@ func (r *Registry) SetPaperPools(types []string) {
 	r.paperPoolTypes = append([]string(nil), types...)
 	pes := make([]*paper.Engine, 0, len(r.papers))
 	for _, pe := range r.papers {
-		pes = append(pes, pe)
+		pes = append(pes, pe) // 锁内快照引擎列表，锁外逐个下发避免长时间持锁
 	}
 	r.mu.Unlock()
 	for _, pe := range pes {

@@ -201,7 +201,7 @@ func (a *Agent) MarkAttributedTitles(titles map[string]bool) {
 	var matched []data.NewsItem
 	for _, it := range pending {
 		if titles[it.Title] {
-			matched = append(matched, it)
+			matched = append(matched, it) // 命中已归因标题 → 待处理队列中移除
 		}
 	}
 	if len(matched) > 0 {

@@ -126,11 +126,12 @@ func (s *signalStore) Invalidate(code, strategy string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := code + "@" + strategy
+	// 已删除且已打墓碑则直接返回（幂等，避免重复触发）
 	if _, ok := s.byKey[key]; !ok && s.invalidated[key] {
 		return
 	}
 	delete(s.byKey, key)
-	s.invalidated[key] = true
+	s.invalidated[key] = true // 打墓碑：当日禁止该 key 复活
 	s.save()
 }
 

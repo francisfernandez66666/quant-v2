@@ -36,17 +36,18 @@ func SMA(closes []float64, n int) []float64 {
 func EMA(closes []float64, n int) []float64 {
 	out := make([]float64, len(closes))
 	for i := range out {
-		out[i] = nan()
+		out[i] = nan() // 预热期内置 NaN
 	}
 	if n <= 0 || len(closes) < n {
 		return out
 	}
+	// 用前 n 根均值作为 EMA 种子，避免冷启动偏差
 	seed := 0.0
 	for i := 0; i < n; i++ {
 		seed += closes[i]
 	}
 	out[n-1] = seed / float64(n)
-	k := 2.0 / float64(n+1)
+	k := 2.0 / float64(n+1) // 平滑系数：越大的 n 越迟钝
 	for i := n; i < len(closes); i++ {
 		out[i] = closes[i]*k + out[i-1]*(1-k)
 	}

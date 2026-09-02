@@ -207,15 +207,15 @@ func (s *Server) computeResearchProgress(w http.ResponseWriter) map[string]any {
 // stalls (a dataload once hung 21h with step_index stuck at 0) become visible.
 func (s *Server) schedulerState() map[string]any {
 	if s.researchDir == "" {
-		return nil
+		return nil // 未配置研究目录
 	}
 	b, err := os.ReadFile(filepath.Join(s.researchDir, "research_state.json"))
 	if err != nil {
-		return nil
+		return nil // 无状态文件
 	}
 	var st map[string]any
 	if json.Unmarshal(b, &st) != nil {
-		return nil
+		return nil // 状态文件损坏按缺失处理
 	}
 	return st
 }

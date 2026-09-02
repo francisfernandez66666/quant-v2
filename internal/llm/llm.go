@@ -345,7 +345,7 @@ type llmUsage struct {
 // upstream API failure/timeout let callers retry or fall back.）
 func (c *Client) Chat(system, user string) (string, error) {
 	if len(c.apiKeys) == 0 {
-		return "", fmt.Errorf("LLM_API_KEY not set")
+		return "", fmt.Errorf("LLM_API_KEY not set") // 未配置任何 key，直接报错
 	}
 
 	req := ChatRequest{
@@ -355,7 +355,7 @@ func (c *Client) Chat(system, user string) (string, error) {
 			{Role: "user", Content: user},
 		},
 	}
-	return c.do(req)
+	return c.do(req) // 走统一请求路径（含流式/非流式/多 key 轮换）
 }
 
 // ChatClassifier 用分类专用模型执行对话（未配置分类模型时回落到主模型，与 Chat 一致）。
@@ -368,7 +368,7 @@ func (c *Client) Chat(system, user string) (string, error) {
 func (c *Client) ChatClassifier(system, user string) (string, error) {
 	model := c.model
 	if c.classifierModel != "" {
-		model = c.classifierModel
+		model = c.classifierModel // 配置了独立分类模型时优先使用（更快/更便宜）
 	}
 	req := ChatRequest{
 		Model: model,
@@ -393,7 +393,7 @@ func (c *Client) ChatD1(system, user string, maxTokens int) (string, error) {
 		return "", fmt.Errorf("LLM_API_KEY not set")
 	}
 	if maxTokens <= 0 {
-		maxTokens = defaultD1MaxTokens
+		maxTokens = defaultD1MaxTokens // 未显式指定时用默认 D1 输出上限
 	}
 	req := ChatRequest{
 		Model: c.model,
@@ -402,7 +402,7 @@ func (c *Client) ChatD1(system, user string, maxTokens int) (string, error) {
 			{Role: "user", Content: user},
 		},
 	}
-	return c.nonStreamChatMax(req, maxTokens)
+	return c.nonStreamChatMax(req, maxTokens) // 非流式 + 限 token，控延迟
 }
 
 // defaultD1MaxTokens D1 评分默认推理长度上限（§信号速度 S3，未配置 rules.llm.d1_max_tokens 时）。

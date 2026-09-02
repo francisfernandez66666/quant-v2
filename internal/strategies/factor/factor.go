@@ -395,6 +395,7 @@ func (f *FactorStrategy) RecordForwardReturn(ruleID string, ret float64) {
 	defer f.mu.Unlock()
 	for _, r := range f.rules {
 		if r.ID == ruleID {
+			// 正收益计 Win、负收益计 Loss，并累加累计收益供效果监控
 			if ret > 0 {
 				r.Win++
 			} else if ret < 0 {

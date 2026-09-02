@@ -45,8 +45,9 @@ func (a *Agent) exitConfigs() (dragonCfg config.DragonConfig, dbCfg config.Doubl
 	defer a.mu.RUnlock()
 	cfg := a.strategyCfg
 	if cfg == nil {
-		return
+		return // 无配置时返回零值，调用方按不触发处理
 	}
+	// 拷贝后把各战法「百分比语义」阈值统一规范化为小数（除 n_shape 保持比例原值）
 	dragonCfg = cfg.Dragon
 	dragonCfg.BuyPullbackSellAllPct = normalizePctForExit(dragonCfg.BuyPullbackSellAllPct)
 	dragonCfg.BuyPullbackSellHalfPct = normalizePctForExit(dragonCfg.BuyPullbackSellHalfPct)
@@ -138,11 +139,12 @@ func atr14Last(klines []data.KLine) float64 {
 func buildExitContext(pos report.ExecLog, price float64, dayK []data.KLine, now time.Time) *strategy.ExitContext {
 	stageHigh := pos.HighestPrice
 	if stageHigh <= 0 {
-		stageHigh = pos.EntryPrice
+		stageHigh = pos.EntryPrice // 无阶段高点时回退开仓价
 	}
 	if price > stageHigh {
-		stageHigh = price
+		stageHigh = price // 现价创新高则同步抬升
 	}
+	// 拷贝持仓 EntryMeta，并把阶段高点注入供止损/移动止盈计算
 	meta := make(map[string]float64, len(pos.EntryMeta)+1)
 	for k, v := range pos.EntryMeta {
 		meta[k] = v

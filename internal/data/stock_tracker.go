@@ -129,21 +129,22 @@ func (t *StockTracker) GetActiveByDirection(td, direction string) []*TrackedStoc
 func (t *StockTracker) OnCycleDone(td string, signaledCodes []string) {
 	sigSet := make(map[string]bool)
 	for _, c := range signaledCodes {
-		sigSet[c] = true
+		sigSet[c] = true // 本轮出信号的代码集合，用于到期清理判定
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// 更新本轮最后可见交易日与是否出信号
 	for _, s := range t.stocks {
 		s.LastSeenTD = td
 		s.LastHadSignal = sigSet[s.Code]
 	}
 	for code, s := range t.stocks {
 		if td > s.ExpiryTD {
-			delete(t.stocks, code)
+			delete(t.stocks, code) // 已过跟踪期：移除
 			continue
 		}
 		if td == s.ExpiryTD && !s.LastHadSignal {
-			delete(t.stocks, code)
+			delete(t.stocks, code) // 到期日仍未出信号：移除
 		}
 	}
 	t.save()

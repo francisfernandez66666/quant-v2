@@ -61,6 +61,10 @@ const optTaskRefID int64 = 990
 // §B 每行附加「模拟盘实测」：按 战法→池 映射取池级真实绩效（胜率/期望/成交笔数），
 // 前端与回测最优并排对比——回测冠军是否在模拟盘复现一眼可见。
 func (s *Server) handleOptimizationList(w http.ResponseWriter, r *http.Request) {
+	if s.researchDB == nil {
+		writeError(w, http.StatusServiceUnavailable, "研究库未接入")
+		return
+	}
 	list, err := s.researchDB.ListOptimizations(20)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
