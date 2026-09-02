@@ -373,6 +373,8 @@ type Engine struct {
 	poolPerf       map[string]*PoolPerf      // 战法资金池持久化表现：key=策略类型（买入累计成本/已实现盈亏）
 	poolMaxPos     map[string]int            // 每池持仓上限：key=策略类型（0=该池不单独设限，仅受全局上限约束；可自定义）
 	poolBuyRules   map[string]*PoolBuyRule   // 每池买入纪律规则（冷却/日限/门槛/预算配比）
+	poolGrp        map[string]string         // §Phase3 A/B 对照组：poolKey → 组标签（A=回测最优/B=灰度观察）
+	poolIR         map[string]float64        // §Phase4 IR 动态仓位：poolKey → 参考 IR（自动买入金额缩放）
 	poolDiscipline map[string]poolDiscipline // 运行时状态：每池今日买入计数/花费/最近时间
 	// §C 规则细分池：fac_1/pat_2 等 EnsurePool 开立的动态池 key 集合（SetStrategyPools
 	// 重建时必须合并保留，否则配置同步会把规则池冲掉）；labelFn 解析规则 ID → 显示名。
@@ -424,6 +426,8 @@ func New(cfg Config, path string) *Engine {
 		poolPerf:       make(map[string]*PoolPerf),
 		poolMaxPos:     make(map[string]int),
 		poolBuyRules:   make(map[string]*PoolBuyRule),
+		poolGrp:        make(map[string]string),
+		poolIR:         make(map[string]float64),
 		poolDiscipline: make(map[string]poolDiscipline),
 		extraPoolKeys:  make(map[string]bool),
 		positions:      make(map[string]*Position),
@@ -538,7 +542,17 @@ type persistedState struct {
 	// 旧数据（无 PoolPerf）兼容：load 时按池类型初始化空记录。
 	// English: persisted per-pool performance (cumulative buy cost / realized P&L; counted after buy,
 	// sells still attribute to the pool). Legacy data without PoolPerf initializes empty records on load.
-	PoolPerf     map[string]*PoolPerf    `json:"pool_perf,omitempty"`
+	PoolPerf map[string]*PoolPerf `json:"pool_perf,omitempty"`
+	// §Phase3 paper A/B 对照组：池级实验组标记（key=池 key，值=A/B/任意标签）。
+	// 回测最优（A 组，实盘参数验证）与灰度候选（B 组，新战法观察）同关键盘对照。
+	// English: Phase-3 paper A/B control — per-pool experiment group tag (key=pool key). The backtest
+	// champion (group A, live-params validation) runs head-to-head with grayscale candidates (group B).
+	PoolGrp map[string]string `json:"pool_grp,omitempty"`
+	// §Phase4 IR 动态仓位：per-pool 参考 IR（信息比率，扫参排名行 IR 下发）。买入自动金额按
+	// IR 缩放（高 IR 战法加大单笔预算、低 IR 缩仓），持久化跨重启保留。
+	// English: Phase-4 IR-scaled position sizing — per-pool reference IR (issued from sweep rows); the
+	// auto buy amount scales by IR (higher IR → larger per-trade budget, lower IR → smaller), persisted.
+	PoolIR       map[string]float64      `json:"pool_ir,omitempty"`
 	HasFilled    bool                    `json:"has_filled"`               // 是否已发生成交
 	PoolBuyRules map[string]*PoolBuyRule `json:"pool_buy_rules,omitempty"` // 每池买入规则
 }
@@ -571,6 +585,8 @@ func (e *Engine) persist() {
 		PoolPerf:       e.poolPerf,
 		HasFilled:      e.hasFilled,
 		PoolBuyRules:   e.poolBuyRules,
+		PoolGrp:        e.poolGrp,
+		PoolIR:         e.poolIR,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -654,6 +670,16 @@ func (e *Engine) load() {
 	e.hasFilled = st.HasFilled
 	if st.PoolBuyRules != nil {
 		e.poolBuyRules = st.PoolBuyRules
+	}
+	// §Phase3 恢复 A/B 对照组标记（旧数据无则初始化空表）
+	// English: Phase-3 restore A/B group tags (legacy data initializes an empty table).
+	if st.PoolGrp != nil {
+		e.poolGrp = st.PoolGrp
+	}
+	// §Phase4 恢复每池参考 IR（旧数据无则初始化为空表）
+	// English: Phase-4 restore per-pool reference IR (legacy data initializes an empty table).
+	if st.PoolIR != nil {
+		e.poolIR = st.PoolIR
 	}
 	// §C 从持久化的 poolTypes 还原规则细分池标记（fac_/pat_ 前缀）
 	for _, k := range e.poolTypes {
@@ -1012,7 +1038,11 @@ func (e *Engine) fillLocked(poolKey, code, name, strategy string, signalPrice fl
 	}
 	explicitQty := qty > 0
 	if !explicitQty {
-		qty = int(e.cfg.FixedAmount/price/100) * 100
+		// §Phase4 IR 动态仓位：自动买入金额按该池参考 IR 缩放（高 IR 加大单笔预算、低 IR 缩仓）。
+		// English: Phase-4 IR-scaled sizing — the auto amount scales by the pool's reference IR
+		// (higher IR → larger per-trade budget, lower IR → smaller).
+		amount := e.cfg.FixedAmount * e.applyPoolIRLocked(poolKey)
+		qty = int(amount/price/100) * 100
 	}
 	if qty <= 0 {
 		return errLotTooSmall // 一手都买不起（不足 A 股一手）

@@ -284,6 +284,12 @@ func (s *Server) handleResearchReject(w http.ResponseWriter, r *http.Request) {
 	s.approveCandidate(w, r, "reject")
 }
 
+// handleResearchGrayscale 处理 POST /api/research/candidates/{id}/grayscale：
+// §Phase2 自动灰度分级——候选进入灰度观察（写 grayscale_rules.json，仅 paper 盘消费，不上实盘）。
+func (s *Server) handleResearchGrayscale(w http.ResponseWriter, r *http.Request) {
+	s.approveCandidate(w, r, "grayscale")
+}
+
 // approveCandidate 审批/驳回候选的公共实现：更新候选状态；审批时按候选类型
 // （weights/factor/pattern）写应用配置并热重载引擎，驳回仅改状态。
 func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action string) {
@@ -353,6 +359,36 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 			return
 		}
 		log.Printf("[research] 候选 #%d 已驳回", id)
+	case "grayscale":
+		// §Phase2 自动灰度分级：仅 factor/pattern 支持；写入灰度库（paper 观察），不改实盘。
+		// English: Phase-2 grayscale — factor/pattern only; enters the grayscale library (paper observation),
+		// the live 8a/8b injection is untouched.
+		if c.Kind != "factor" && c.Kind != "pattern" {
+			writeError(w, 400, "灰度仅支持 factor/pattern 候选（kind="+c.Kind+"）")
+			return
+		}
+		if err := research.ApplyGrayscale(s.researchDir, c); err != nil {
+			writeError(w, 500, "写入灰度库失败: "+err.Error())
+			return
+		}
+		if err := s.researchDB.UpdateCandidateStatus(id, research.StatusGrayscale); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		// §Phase3 paper A/B 对照组：为灰度候选开立独立规则池并标记 B 组，
+		// 与回测最优（A 组）并行实测。池 key 与库规则同规则（fac_<id>/pat_<id>）。
+		// English: Phase-3 paper A/B — carve a dedicated rule pool for the grayscale candidate and tag
+		// it group B, running head-to-head against the backtest champion (group A). Pool key follows
+		// the library-rule convention (fac_<id>/pat_<id>).
+		if pe := s.paperEngineFor(requestUserID(r)); pe != nil {
+			poolKey := "fac_" + strconv.FormatInt(id, 10)
+			if c.Kind == "pattern" {
+				poolKey = "pat_" + strconv.FormatInt(id, 10)
+			}
+			pe.EnsurePool(poolKey)
+			pe.SetPoolABGroup(poolKey, "B")
+		}
+		log.Printf("[research] 候选 #%d 进入灰度观察（paper 盘，B 组对照）", id)
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }

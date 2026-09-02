@@ -139,6 +139,48 @@ func (d *DB) PaperDailyAll() ([]PaperDailyRecord, error) {
 	return out, rows.Err()
 }
 
+// PaperAttribution 归因喂回（§Phase4）：按 用户+战法 分组统计盘中信号→成交的
+// 承接质量（笔数/成交额/平均滑点/平均延迟），并把每战法当日最新净值差还原为增量收益。
+// 供研究侧判断：哪些战法信号的成交兑现好（滑点小、成交快），喂回优化排序与失败聚类。
+// English: PaperAttribution (Phase 4) — groups signal-to-fill quality by user+strategy (count/amount/
+// avg slippage/avg latency) plus the latest realized delta per strategy, so the research side can rank
+// which strategy signals fill well (low slippage, fast fills) and feed that back into optimization and
+// failure clustering.
+type PaperAttribution struct {
+	UserID, Strategy string  // 用户 + 战法
+	Count            int     // 成交笔数
+	TotalAmount      float64 // 成交额
+	AvgSlippage      float64 // 平均滑点 %
+	AvgLatency       float64 // 平均延迟 秒
+	BuyCount         int     // 买入笔数
+	SellCount        int     // 卖出笔数
+}
+
+// PaperAttributions 归因查询（按 用户+战法，含方向计数）。
+// English: attribution query (grouped by user+strategy with per-side counts).
+func (d *DB) PaperAttributions() ([]PaperAttribution, error) {
+	rows, err := d.db.Query(`SELECT user_id, strategy, COUNT(*), SUM(amount),
+		AVG(CASE WHEN signal_price > 0 AND price > 0 THEN (price - signal_price) / signal_price * 100 ELSE 0 END),
+		AVG(latency_sec),
+		SUM(CASE WHEN side='buy' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN side='sell' THEN 1 ELSE 0 END)
+		FROM paper_trades GROUP BY user_id, strategy ORDER BY COUNT(*) DESC, SUM(amount) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PaperAttribution
+	for rows.Next() {
+		var a PaperAttribution
+		if err := rows.Scan(&a.UserID, &a.Strategy, &a.Count, &a.TotalAmount,
+			&a.AvgSlippage, &a.AvgLatency, &a.BuyCount, &a.SellCount); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // SavePaperResearchReport 保存一条模拟盘研究报告摘要（UPSERT：同一账号同一报告日期覆盖）。
 // English: saves a paper-research report summary (UPSERT per account + report date).
 func (d *DB) SavePaperResearchReport(date, userID, summaryJSON string) error {

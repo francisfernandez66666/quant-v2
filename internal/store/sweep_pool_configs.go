@@ -31,10 +31,18 @@ type SweepPoolConfig struct {
 	ScoreTo   float64 `json:"score_to"`   // 评分结束
 	ScoreStep float64 `json:"score_step"` // 评分步长
 
+	// §Phase3 ATR 动态止损维：ATR×mult 距离作为动态止损（0 档=禁用 ATR 止损、回退固定百分比 sl）。
+	// 默认池 atr 单档 0 → 既有行为不变；配置多档时搜索空间 ×档数。
+	// English: Phase-3 ATR dynamic stop dimension — stop distance = ATR×mult (0 = disabled, fall back
+	// to fixed-pct stop loss). Default pool keeps a single 0 level so existing behavior is unchanged.
+	AtrFrom float64 `json:"atr_from"` // ATR 倍数起始
+	AtrTo   float64 `json:"atr_to"`   // ATR 倍数结束（含）
+	AtrStep float64 `json:"atr_step"` // ATR 倍数步长
+
 	UpdatedAt string `json:"updated_at"` // 更新时间
 }
 
-// ComboCount 计算该配置的组合总数（四维档数乘积；任一维非法按 1 档计）。
+// ComboCount 计算该配置的组合总数（五维档数乘积；任一维非法按 1 档计）。
 func (c *SweepPoolConfig) ComboCount() int {
 	steps := func(from, to, step float64) int {
 		if step <= 0 || to < from {
@@ -51,7 +59,8 @@ func (c *SweepPoolConfig) ComboCount() int {
 	return steps(c.TpFrom, c.TpTo, c.TpStep) *
 		steps(c.SlFrom, c.SlTo, c.SlStep) *
 		hSteps(c.HoldFrom, c.HoldTo, c.HoldStep) *
-		steps(c.ScoreFrom, c.ScoreTo, c.ScoreStep)
+		steps(c.ScoreFrom, c.ScoreTo, c.ScoreStep) *
+		steps(c.AtrFrom, c.AtrTo, c.AtrStep)
 }
 
 // sweepPoolMaxCombos 单战法组合总数硬护栏（超出拒绝保存，提示放宽步长）。
@@ -79,6 +88,15 @@ func (c *SweepPoolConfig) Validate() error {
 	if err := pos(c.ScoreFrom, c.ScoreTo, c.ScoreStep, "门槛分数"); err != nil {
 		return err
 	}
+	// §Phase3 ATR 动态止损维：默认单档 0（禁用）；多档需步长正、范围有序
+	// English: Phase-3 ATR stop dimension — single level 0 is the disabled default; multi-level ranges
+	// must have a positive step and ordered range.
+	if c.AtrStep < 0 || (c.AtrTo != c.AtrFrom && c.AtrStep <= 0) {
+		return errSprintf("ATR 止损倍数 步长必须大于 0")
+	}
+	if c.AtrTo < c.AtrFrom {
+		return errSprintf("ATR 止损倍数 终点不能小于起点")
+	}
 	if c.HoldStep <= 0 || c.HoldTo < c.HoldFrom {
 		return errSprintf("持仓天数 步长/范围非法")
 	}
@@ -95,12 +113,12 @@ func errSprintf(s string, args ...any) error { return fmt.Errorf(s, args...) }
 func (d *DB) GetSweepPoolConfig(strategy string) (*SweepPoolConfig, error) {
 	row := d.db.QueryRow(`SELECT strategy, tp_from, tp_to, tp_step,
 		sl_from, sl_to, sl_step, hold_from, hold_to, hold_step,
-		score_from, score_to, score_step, updated_at
+		score_from, score_to, score_step, atr_from, atr_to, atr_step, updated_at
 		FROM sweep_pool_configs WHERE strategy = ?`, strategy)
 	var c SweepPoolConfig
 	err := row.Scan(&c.Strategy, &c.TpFrom, &c.TpTo, &c.TpStep,
 		&c.SlFrom, &c.SlTo, &c.SlStep, &c.HoldFrom, &c.HoldTo, &c.HoldStep,
-		&c.ScoreFrom, &c.ScoreTo, &c.ScoreStep, &c.UpdatedAt)
+		&c.ScoreFrom, &c.ScoreTo, &c.ScoreStep, &c.AtrFrom, &c.AtrTo, &c.AtrStep, &c.UpdatedAt)
 	if err != nil {
 		return nil, nil // not found → nil,nil（调用方回退默认池）
 	}
@@ -111,7 +129,7 @@ func (d *DB) GetSweepPoolConfig(strategy string) (*SweepPoolConfig, error) {
 func (d *DB) ListSweepPoolConfigs() ([]*SweepPoolConfig, error) {
 	rows, err := d.db.Query(`SELECT strategy, tp_from, tp_to, tp_step,
 		sl_from, sl_to, sl_step, hold_from, hold_to, hold_step,
-		score_from, score_to, score_step, updated_at
+		score_from, score_to, score_step, atr_from, atr_to, atr_step, updated_at
 		FROM sweep_pool_configs ORDER BY strategy`)
 	if err != nil {
 		return nil, err
@@ -122,7 +140,7 @@ func (d *DB) ListSweepPoolConfigs() ([]*SweepPoolConfig, error) {
 		var c SweepPoolConfig
 		if err := rows.Scan(&c.Strategy, &c.TpFrom, &c.TpTo, &c.TpStep,
 			&c.SlFrom, &c.SlTo, &c.SlStep, &c.HoldFrom, &c.HoldTo, &c.HoldStep,
-			&c.ScoreFrom, &c.ScoreTo, &c.ScoreStep, &c.UpdatedAt); err == nil {
+			&c.ScoreFrom, &c.ScoreTo, &c.ScoreStep, &c.AtrFrom, &c.AtrTo, &c.AtrStep, &c.UpdatedAt); err == nil {
 			out = append(out, &c)
 		}
 	}
@@ -134,16 +152,19 @@ func (d *DB) UpsertSweepPoolConfig(c *SweepPoolConfig) error {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	_, err := d.db.Exec(`INSERT INTO sweep_pool_configs
 		(strategy, tp_from, tp_to, tp_step, sl_from, sl_to, sl_step,
-		 hold_from, hold_to, hold_step, score_from, score_to, score_step, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 hold_from, hold_to, hold_step, score_from, score_to, score_step,
+		 atr_from, atr_to, atr_step, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(strategy) DO UPDATE SET
 			tp_from=excluded.tp_from, tp_to=excluded.tp_to, tp_step=excluded.tp_step,
 			sl_from=excluded.sl_from, sl_to=excluded.sl_to, sl_step=excluded.sl_step,
 			hold_from=excluded.hold_from, hold_to=excluded.hold_to, hold_step=excluded.hold_step,
 			score_from=excluded.score_from, score_to=excluded.score_to, score_step=excluded.score_step,
+			atr_from=excluded.atr_from, atr_to=excluded.atr_to, atr_step=excluded.atr_step,
 			updated_at=excluded.updated_at`,
 		c.Strategy, c.TpFrom, c.TpTo, c.TpStep, c.SlFrom, c.SlTo, c.SlStep,
-		c.HoldFrom, c.HoldTo, c.HoldStep, c.ScoreFrom, c.ScoreTo, c.ScoreStep, now)
+		c.HoldFrom, c.HoldTo, c.HoldStep, c.ScoreFrom, c.ScoreTo, c.ScoreStep,
+		c.AtrFrom, c.AtrTo, c.AtrStep, now)
 	return err
 }
 

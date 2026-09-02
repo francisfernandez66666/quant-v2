@@ -355,7 +355,7 @@ export default function Research() {
   }
   function statusLabel(s) {
   // 将候选审批状态翻译为中文标签
-    const m = { proposed: '待审批', approved: '已审批', applied: '已应用', rejected: '已驳回' }
+    const m = { proposed: '待审批', approved: '已审批', applied: '已应用', rejected: '已驳回', grayscale: '灰度观察' }
     // 常量 m：局部定义
     return m[s] || s
   }
@@ -374,6 +374,14 @@ export default function Research() {
       c.status = 'rejected'
       showToast('候选 #' + c.id + ' 已驳回', 'success')
     } catch (e) { showToast('驳回失败: ' + (e.message || e), 'error') }
+  }
+  async function doGrayscale(c) {
+  // 候选进入灰度观察（§Phase2）：写入灰度库、仅 paper 盘消费，不上实盘 8a/8b
+    try {
+      await api.grayscaleResearchCandidate(c.id)
+      c.status = 'grayscale'
+      showToast('候选 #' + c.id + ' 已进入灰度观察（模拟盘实测）', 'success')
+    } catch (e) { showToast('灰度失败: ' + (e.message || e), 'error') }
   }
 
   // ===== 战法库 =====
@@ -1132,6 +1140,7 @@ export default function Research() {
         {canApprove && c.status === 'proposed' && (
           <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <Button theme="primary" size="small" onClick={() => doApprove(c)}>审批并应用</Button>
+            <Button theme="warning" size="small" onClick={() => doGrayscale(c)}>灰度观察</Button>
             <Button theme="danger" size="small" onClick={() => doReject(c)}>驳回</Button>
             {c.kind === 'factor' && (
               <Button theme="warning" size="small" loading={!!backtestLoading[c.id]} onClick={() => doBacktest(c)}>

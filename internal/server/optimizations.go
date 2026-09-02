@@ -79,6 +79,9 @@ func (s *Server) handleOptimizationList(w http.ResponseWriter, r *http.Request) 
 				WinRatePct: st.WinRatePct,
 				Expectancy: st.Expectancy,
 				FilledBuys: st.FilledBuys,
+				// §Phase3 A/B 对照组：回显池组标签（A=回测最优/B=灰度观察）
+				// English: Phase-3 A/B group tag echoed for the pool.
+				ABGroup: pe.PoolABGroup(poolKey),
 			}
 		}
 	}
@@ -127,8 +130,10 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 
 // applyPoolMinScore 把寻优排名行的门槛分数写入对应模拟盘战法池的买入纪律（§A2）。
 // 映射失败（未知战法→"" 其他池）静默跳过——其他池是手动/兜底池，不自动改纪律。
-// English: pushes an optimization row's min_score into the matching paper pool's buy discipline;
-// silently skips unmappable strategies — the "other" pool is manual/fallback and never auto-tuned.
+// §Phase4 同时下发参考 IR（信息比率）供动态仓位缩放。
+// English: pushes an optimization row's min_score into the matching paper pool's buy discipline,
+// and (Phase 4) also pushes its reference IR for dynamic position sizing. Silently skips
+// unmappable strategies — the "other" pool is manual/fallback and never auto-tuned.
 func (s *Server) applyPoolMinScore(userID string, row *store.OptimizationResult) {
 	poolKey := paper.PoolKeyForStrategy(row.Strategy, row.StrategyKind)
 	if poolKey == "" {
@@ -136,6 +141,11 @@ func (s *Server) applyPoolMinScore(userID string, row *store.OptimizationResult)
 	}
 	if pe := s.paperEngineFor(userID); pe != nil {
 		pe.ApplyPoolMinScore(poolKey, row.Params.MinScore)
+		// §Phase4 IR 动态仓位基准：排名行无独立 IR 字段，用 Sharpe 作为风险调整收益代理
+		// （年均化夏普与 IR 同为风险调整口径，动态仓位语义一致）。
+		// English: Phase-4 IR-scale basis — the sweep row has no IR column, so Sharpe stands in as the
+		// risk-adjusted-return proxy (same spirit as IR for dynamic sizing).
+		pe.SetPoolIR(poolKey, row.Sharpe)
 	}
 }
 

@@ -191,6 +191,49 @@ func TestObjectiveValueRanking(t *testing.T) {
 	if objectiveValue("expectancy", &e1) <= objectiveValue("expectancy", &e2) {
 		t.Fatal("期望收益目标排序错误")
 	}
+	// 卡玛目标：Calmar 直接取值比较
+	// English: Calmar objective ranks by raw Calmar value.
+	c1 := sweepResult{Calmar: 3.2}
+	c2 := sweepResult{Calmar: 0.8}
+	if objectiveValue("calmar", &c1) <= objectiveValue("calmar", &c2) {
+		t.Fatal("卡玛目标排序错误")
+	}
+}
+
+// TestUniformExitV2ATRStop 验证 ATR 动态止损变体（§Phase3）：
+// 启动 ATR 止损时止损线 = 当日ATR×mult（可较固定止损更宽/更窄）；不启动时回退固定百分比。
+// 净额口径：costRoundTripPnl(100, 96)≈-4.2%，(100, 95)≈-5.2%。
+// English: validates the ATR dynamic-stop variant — the stop follows ATR×mult (possibly wider/narrower
+// than the fixed pct) when enabled, and falls back to the fixed pct when disabled.
+func TestUniformExitV2ATRStop(t *testing.T) {
+	closes := []float64{100, 100, 100, 100, 96, 95, 100}
+	kls := mkKLine(closes)
+	entryDay := 0 + 1
+	// 固定止损 5%：j=5 cur=95 净额≈-5.2% ≤ -5% 触发
+	exitJ, _ := uniformExitV2(kls, 0, 100, 100, 0, 5, 0, 30)
+	if exitJ != 5 {
+		t.Fatalf("固定止损应在 j=5 触发, got exitJ=%d", exitJ)
+	}
+	// ATR 止损 3×2=6%：50% 于 -5.2% 不触发（放款），末日 j=6 结算
+	exitJ, _ = uniformExitV2ATR(kls, 0, 100, 100, 0, 5, 0, 30, []float64{3, 3, 3, 3, 3, 3, 3}, 2)
+	if exitJ != len(kls)-1 {
+		t.Fatalf("ATR=3×2 放款至 6%% 后 j=5 不应触发, got exitJ=%d want %d", exitJ, len(kls)-1)
+	}
+	// ATR 止损 2.5×2=5%（等价固定）：j=5 触发
+	exitJ, _ = uniformExitV2ATR(kls, 0, 100, 100, 0, 5, 0, 30, []float64{2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5}, 2)
+	if exitJ != 5 {
+		t.Fatalf("ATR=2.5×2 等价固定 5%% 应在 j=5 触发, got exitJ=%d", exitJ)
+	}
+	// ATR 收窄（1×2=2%）：j=4 cur=96 净额≈-4.2% ≤ -2% 提前触发
+	exitJ, _ = uniformExitV2ATR(kls, 0, 100, 100, 0, 5, 0, 30, []float64{1, 1, 1, 1, 1, 1, 1}, 2)
+	if exitJ != 4 {
+		t.Fatalf("ATR=1×2 收窄至 2%% 应于 j=4 提前触发, got exitJ=%d", exitJ)
+	}
+	// 不启动 ATR（mult=0）→ 回退固定止损，行为与 uniformExitV2 一致
+	_ = entryDay
+	if exitJ, pnl := uniformExitV2ATR(kls, 0, 100, 100, 0, 5, 0, 30, []float64{1, 1, 1, 1, 1, 1, 1}, 0); exitJ != 5 {
+		t.Fatalf("mult=0 应回退固定止损在 j=5 触发, got exitJ=%d pnl=%.2f", exitJ, pnl)
+	}
 }
 
 // abs 返回浮点绝对值（测试断言辅助）。

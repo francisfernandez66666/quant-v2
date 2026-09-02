@@ -30,7 +30,7 @@ import (
 // Category 因子大类。
 type Category int
 
-// 7 大类因子类别。
+// 8 大类因子类别（§Phase2 新增情绪类）。
 const (
 	CatValue      Category = iota // 估值
 	CatGrowth                     // 成长
@@ -39,6 +39,7 @@ const (
 	CatVolatility                 // 波动率
 	CatMomentum                   // 动量/反转
 	CatLiquidity                  // 流动性
+	CatSentiment                  // 情绪（涨停/炸板/连板高度市场状态）
 )
 
 // CategoryName 返回类别中文名。
@@ -58,6 +59,8 @@ func (c Category) CategoryName() string {
 		return "动量"
 	case CatLiquidity:
 		return "流动性"
+	case CatSentiment:
+		return "情绪"
 	}
 	return "未知"
 }
@@ -89,6 +92,14 @@ type StockSeries struct {
 	YoyNetProfit       []float64 // 净利同比
 	SingleQuarterNIYoy []float64 // 单季净利同比（SUE 降级版）
 	Eps                []float64 // 每股收益
+
+	// 市场情绪（单日全体一致，由 Store.EmotionStatsRange 预装载；缺失为 NaN）。
+	// §Phase2 情绪因子入池：同截面所有股票当日情绪值相同，属于"市场状态因子"，
+	// 用于 B3 分层/IC 时须与其他风格因子配合，或作情绪相位分组回测输入。
+	EmoLimitUp   []float64 // 当日涨停家数
+	EmoBreakCnt  []float64 // 当日炸板家数
+	EmoMaxBoard  []float64 // 当日最高连板
+	EmoBlastRate []float64 // 当日炸板率（%）
 }
 
 // Len 返回序列长度。

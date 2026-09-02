@@ -148,7 +148,7 @@ func cmdList(db *store.DB, args []string) {
 // approve 同时把权重写入应用文件（B5 一键应用：随 config 热加载被引擎读取）。
 func cmdApprove(db *store.DB, args []string, dataDir string) {
 	fs := flag.NewFlagSet("approve", flag.ExitOnError)
-	action := fs.String("action", "approve", "approve|reject")
+	action := fs.String("action", "approve", "approve|reject|grayscale")
 	fs.Parse(args)
 	if fs.NArg() < 1 {
 		log.Fatalf("用法: research approve --action approve|reject <id>")
@@ -181,6 +181,19 @@ func cmdApprove(db *store.DB, args []string, dataDir string) {
 			log.Fatalf("更新状态失败: %v", err)
 		}
 		log.Printf("候选 #%d 已驳回", id)
+	case "grayscale":
+		// §Phase2 自动灰度分级：factor/pattern 候选写入灰度库（paper 观察），不上实盘。
+		// English: Phase-2 grayscale — factor/pattern candidates enter the grayscale library for paper observation.
+		if c.Kind != "factor" && c.Kind != "pattern" {
+			log.Fatalf("灰度仅支持 factor/pattern 候选（kind=%s）", c.Kind)
+		}
+		if err := research.ApplyGrayscale(dataDir, c); err != nil {
+			log.Fatalf("写入灰度库失败: %v", err)
+		}
+		if err := db.UpdateCandidateStatus(id, research.StatusGrayscale); err != nil {
+			log.Fatalf("更新状态失败: %v", err)
+		}
+		log.Printf("候选 #%d 已进入灰度观察（paper 盘）", id)
 	default:
 		log.Fatalf("未知 action: %s", *action)
 	}

@@ -1226,6 +1226,12 @@ export async function approveResearchCandidate(id) {
   return request('/api/research/candidates/' + encodeURIComponent(id) + '/approve', { method: 'POST' })
 }
 
+/** 候选进入灰度观察（POST /api/research/candidates/{id}/grayscale，仅 factor/pattern） */
+/** Grayscale a candidate for paper observation (POST /api/research/candidates/{id}/grayscale) */
+export async function grayscaleResearchCandidate(id) {
+  return request('/api/research/candidates/' + encodeURIComponent(id) + '/grayscale', { method: 'POST' })
+}
+
 /** 驳回候选（POST /api/research/candidates/{id}/reject） */
 /** Reject a candidate (POST /api/research/candidates/{id}/reject) */
 export async function rejectResearchCandidate(id) {

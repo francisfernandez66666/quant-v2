@@ -11,6 +11,7 @@ import (
 	"log"
 	"time"
 
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
 
@@ -30,10 +31,27 @@ func cmdPaperResearch(db *store.DB, args []string) {
 		return
 	}
 
+	// §Phase4 归因喂回：按 用户+战法 的信号→成交质量（滑点/延迟/笔数），
+	// 输给研究侧判断"哪个战法的信号兑现好"，可喂回失败聚类与寻优排序。
+	// English: Phase-4 attribution — signal-to-fill quality by user+strategy (slippage/latency/count),
+	// feeding "which strategy's signals fill well" back to clustering and optimization ranking.
+	attrib, _ := db.PaperAttributions()
+
+	// §Phase4 情绪相位上下文：最近一个月的历史情绪分布（配合每日复盘，判断当日情绪环境）
+	// English: Phase-4 sentiment context — the emotion-phase histogram over the last ~30 trading days.
+	phaseHist := research.EmotionPhaseHist(nil, nil)
+	if rangeFrom := time.Now().AddDate(0, 0, -45).Format("20060102"); true {
+		if emo, eerr := db.EmotionStatsRange(rangeFrom, time.Now().Format("20060102")); eerr == nil && len(emo) > 0 {
+			phaseHist = research.EmotionPhaseHist(emo, nil)
+		}
+	}
+
 	report := map[string]interface{}{
 		"generated_at": time.Now().Format("2006-01-02 15:04:05"),
 		"trades":       summaries,
 		"daily":        daily,
+		"attribution":  attrib,
+		"emotion":      phaseHist,
 	}
 	// 战法池标签映射（与 paper.StrategyPools 展示一致）
 	labels := map[string]string{"dragon": "龙头", "double_bump": "双板", "n_shape": "N形", "dragon_return": "龙回头", "factor": "波动突破", "pattern": "形态"}
@@ -47,6 +65,24 @@ func cmdPaperResearch(db *store.DB, args []string) {
 		}
 		log.Printf("  %-8s %s 笔数=%-4d 金额=%.0f 均价=%.2f 平均滑点=%+.3f%% 平均延迟=%.1fs",
 			label, sideZh(s.Side), s.Count, s.TotalAmount, s.AvgPrice, s.AvgSlippage, s.AvgLatency)
+	}
+	// 归因喂回：打印前 5 个 用户+战法 的承接质量
+	// English: attribution — print the top 5 user+strategy fill-quality rows.
+	for i, a := range attrib {
+		if i >= 5 {
+			break
+		}
+		log.Printf("  归因 [%s/%s] 笔数=%-4d 成交额=%.0f 滑点=%+.3f%% 延迟=%.1fs (买%d/卖%d)",
+			a.UserID, a.Strategy, a.Count, a.TotalAmount, a.AvgSlippage, a.AvgLatency, a.BuyCount, a.SellCount)
+	}
+	// 情绪相位：打印分布与最近阶段（每日复盘的环境锚点）
+	// English: sentiment-phase histogram and latest phase (the environment anchor for the daily review).
+	if phaseHist.Days > 0 {
+		log.Printf("  情绪相位（近 %d 交易日）：最近=%s",
+			phaseHist.Days, phaseHist.Last)
+		for p, n := range phaseHist.PhaseDays {
+			log.Printf("    %-6s %d 天", p, n)
+		}
 	}
 	// 每个用户最新的净值/收益
 	lastByUser := map[string]store.PaperDailyRecord{}

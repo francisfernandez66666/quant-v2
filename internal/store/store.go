@@ -500,6 +500,12 @@ func (d *DB) migrate() error {
 		{"optimization_results", "max_drawdown_pct", "ALTER TABLE optimization_results ADD COLUMN max_drawdown_pct REAL DEFAULT 0"},
 		{"optimization_results", "annual_return_pct", "ALTER TABLE optimization_results ADD COLUMN annual_return_pct REAL DEFAULT 0"},
 		{"optimization_results", "calmar", "ALTER TABLE optimization_results ADD COLUMN calmar REAL DEFAULT 0"},
+		// §Phase3 ATR 动态止损维：ATR×mult 作为动态止损距离（0 档=禁用、回退固定百分比止损）
+		{"sweep_pool_configs", "atr_from", "ALTER TABLE sweep_pool_configs ADD COLUMN atr_from REAL DEFAULT 0"},
+		{"sweep_pool_configs", "atr_to", "ALTER TABLE sweep_pool_configs ADD COLUMN atr_to REAL DEFAULT 0"},
+		{"sweep_pool_configs", "atr_step", "ALTER TABLE sweep_pool_configs ADD COLUMN atr_step REAL DEFAULT 1"},
+		// §Phase3 情绪相位分参回测：扫参排名行记录当日情绪阶段（无情绪数据为空串）
+		{"optimization_results", "emotion_phase", "ALTER TABLE optimization_results ADD COLUMN emotion_phase TEXT DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

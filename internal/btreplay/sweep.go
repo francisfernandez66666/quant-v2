@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	data "quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/indicator"
 	"quant-trading-v2/internal/store"
 )
 
@@ -141,6 +142,10 @@ type sweepResult struct {
 	AvgHold        float64 `json:"avg_hold_days"` // 平均持仓天数
 	ObjectiveScore float64 `json:"-"`             // 目标函数得分（不入库）
 
+	// §Phase3 ATR 动态止损维：ATR×mult 距离（0=禁用，回退固定百分比止损）
+	// English: Phase-3 ATR dynamic stop — distance as ATR×mult (0 = disabled, fixed-pct fallback).
+	AtrStopMult float64 `json:"atr_stop_mult"` // ATR 止损倍数
+
 	// §GAP4.5 风险调整指标（随 SWEEP_JSON 落库展示）
 	Sharpe          float64 `json:"sharpe"`            // 年化夏普比率
 	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`  // 复利净值最大回撤%（正数）
@@ -156,9 +161,9 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	if obj == "" {
 		obj = "profitfactor"
 	}
-	objName := map[string]string{"profitfactor": "盈亏比", "winrate": "胜率", "avgwin": "平均盈利", "expectancy": "期望收益"}[obj]
+	objName := map[string]string{"profitfactor": "盈亏比", "winrate": "胜率", "avgwin": "平均盈利", "expectancy": "期望收益", "calmar": "卡玛比率"}[obj]
 	if objName == "" {
-		return fmt.Errorf("未知优化目标: %s（可选 profitFactor/winRate/avgWin/expectancy）", o.Sweep.Objective)
+		return fmt.Errorf("未知优化目标: %s（可选 profitFactor/winRate/avgWin/expectancy/calmar）", o.Sweep.Objective)
 	}
 
 	// ── 1) K 线一次性载入内存 ──
@@ -166,6 +171,9 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		codes = codes[:sweepMaxStocksLimit(o.MaxStocks)]
 	}
 	klines := make(map[string][]data.KLine, len(codes))
+	// §Phase3 ATR 动态止损维：与 K 线同序预计算每只股票 ATR14 序列（网格模拟动态止损复用）
+	// English: Phase-3 ATR dynamic stop — precompute each stock's ATR14 series alongside the bars.
+	atrs := make(map[string][]float64, len(codes))
 	for _, tsCode := range codes {
 		// §GAP4 复权价：扫参与回放同用 HfqBars（除权缺口不再污染形态/止损判定）
 		bars, err := db.HfqBars(tsCode, o.Start, o.End)
@@ -173,7 +181,13 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			continue
 		}
 		code := strings.Split(tsCode, ".")[0]
-		klines[code] = toDataKLine(bars)
+		k := toDataKLine(bars)
+		klines[code] = k
+		hs, ls, cs := make([]float64, len(k)), make([]float64, len(k)), make([]float64, len(k))
+		for i, b := range k {
+			hs[i], ls[i], cs[i] = b.High, b.Low, b.Close
+		}
+		atrs[code] = indicator.ATR14(hs, ls, cs)
 	}
 
 	// ── 2) 逐战法独立优化：四维步进网格 → 分批护栏 → 批冠军淘汰赛 → 冠军实盘口径复核 ──
@@ -222,23 +236,30 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			scores = stepRangeF(poolCfg.ScoreFrom, poolCfg.ScoreTo, poolCfg.ScoreStep)
 		}
 
-		// 2c) 全组合枚举（指数级：|tp|×|sl|×|hold|×|score|，护栏由保存端校验 ≤10万）
-		type combo4 struct {
-			tp, sl, score float64
-			hold          int
+		// §Phase3 ATR 动态止损维：默认单档 0=禁用（回退固定百分比止损）；多档启用动态止损搜索
+		// English: Phase-3 ATR dynamic-stop dimension — single 0 level = disabled (fixed-pct fallback);
+		// multi-level ranges enable dynamic ATR-stop search.
+		atrMults := stepRangeF(poolCfg.AtrFrom, poolCfg.AtrTo, poolCfg.AtrStep)
+
+		// 2c) 全组合枚举（指数级：|tp|×|sl|×|hold|×|score|×|atr|，护栏由保存端校验 ≤10万）
+		type combo5 struct {
+			tp, sl, score, atr float64
+			hold               int
 		}
-		var combos []combo4
+		var combos []combo5
 		for _, tp := range tps {
 			for _, sl := range sls {
 				for _, h := range holds {
 					for _, s := range scores {
-						combos = append(combos, combo4{tp, sl, s, h})
+						for _, a := range atrMults {
+							combos = append(combos, combo5{tp, sl, s, a, h})
+						}
 					}
 				}
 			}
 		}
-		fmt.Printf("搜索空间：%d 组合（止盈%d档×止损%d档×持仓%d档×门槛%d档）\n",
-			len(combos), len(tps), len(sls), len(holds), len(scores))
+		fmt.Printf("搜索空间：%d 组合（止盈%d档×止损%d档×持仓%d档×门槛%d档×ATR%d档）\n",
+			len(combos), len(tps), len(sls), len(holds), len(scores), len(atrMults))
 
 		// 2d) 分批锦标赛：每批 ≤5000 全量模拟出批冠军，批冠军间 PK 出全局冠军
 		const batchSize = 5000                     // §护栏：单批组合上限（分批全量模拟，非抽样）
@@ -252,7 +273,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			hasChamp := false
 			for ci := lo; ci < hi; ci++ {
 				cb := combos[ci]
-				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score)
+				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs)
 				r.ObjectiveScore = objectiveValue(obj, &r)
 				all = append(all, r)
 				cur := &all[len(all)-1]
@@ -302,11 +323,17 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		best := &global
 
 		// 2e) 冠军实盘口径复核：真实 adapter.Exit 注入冠军参数后整库回放一遍。
-		// 网格用统一出场引擎保证四维梯度有效；复核让落地数字与实盘同口径、两种口径都留档。
+		// 网格用统一出场引擎保证梯度有效；复核让落地数字与实盘同口径、两种口径都留档。
+		// §Phase3 ATR 冠军的实盘口径复核仍走固定止损（真实 adapter 的动态 ATR 止损
+		// 位于运行期 ExitContext，网格层以固定比例复现其等价距离，标注在 params.atr_stop_mult）。
 		verify := verifyChampion(ad, kind, o, klines, industryChg,
 			best.Trail, best.StopLossPct, best.Hold)
-		fmt.Printf("★ 冠军：止盈%.0f%% 止损%.0f%% 持仓%d天 门槛%.0f → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
-			best.Trail, best.StopLossPct, best.Hold, best.MinScore, best.WinRate, best.ProfitFactor, best.Expectancy, best.Count)
+		atrNote := ""
+		if best.AtrStopMult > 0 {
+			atrNote = fmt.Sprintf(" ATR=%.1f×", best.AtrStopMult)
+		}
+		fmt.Printf("★ 冠军：止盈%.0f%% 止损%.0f%% 持仓%d天 门槛%.0f%s → 胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
+			best.Trail, best.StopLossPct, best.Hold, best.MinScore, atrNote, best.WinRate, best.ProfitFactor, best.Expectancy, best.Count)
 		fmt.Printf("✓ 实盘口径复核：胜率%.2f%% 盈亏比%.2f 期望%+.2f%% 触发%d\n",
 			verify.WinRate, verify.ProfitFactor, verify.Expectancy, verify.Count)
 
@@ -366,7 +393,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		// 2g) 输出该战法 SWEEP_JSON（worker 解析落库：冠军行 + grid/batches 附带信息）
 		jsonResult := map[string]any{
 			"rank": 1, "strategy": ad.Name(), "strategy_kind": kind,
-			"params":        map[string]any{"take_profit_pct": best.Trail, "stop_loss_pct": best.StopLossPct, "hold_days": best.Hold, "min_score": best.MinScore},
+			"params":        map[string]any{"take_profit_pct": best.Trail, "stop_loss_pct": best.StopLossPct, "hold_days": best.Hold, "min_score": best.MinScore, "atr_stop_mult": best.AtrStopMult},
 			"win_rate":      best.WinRate,
 			"profit_factor": best.ProfitFactor,
 			"expectancy":    best.Expectancy,
@@ -386,7 +413,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			batchList = append(batchList, map[string]any{
 				"batch": i + 1,
 				"tp":    ch.Trail, "sl": ch.StopLossPct,
-				"hold_days": ch.Hold, "min_score": ch.MinScore,
+				"hold_days": ch.Hold, "min_score": ch.MinScore, "atr_stop_mult": ch.AtrStopMult,
 				"objective": ch.ObjectiveScore,
 			})
 		}
@@ -556,6 +583,23 @@ func applyComboParams(ad adapter, takeProfitPct, stopLossPct float64, maxHold in
 // maxHoldDays 是安全兜底而非主要出场方式。
 func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int) (int, float64) {
+	// §Phase3 ATR 动态止损：旧签名委托新变体（不传 ATR → 固定百分比止损，行为不变）
+	// English: ATR dynamic stop — the legacy signature delegates to the new variant (no ATR series →
+	// fixed-percentage stop, unchanged behavior).
+	return uniformExitV2ATR(kls, sigIdx, entry, sigHigh, takeProfitPct, stopLossPct, trailPct, maxHoldDays, nil, 0)
+}
+
+// uniformExitV2ATR 统一出场引擎 v2 的 ATR 动态止损变体（§Phase3）：
+// 当 atrStopMult>0 且 ATR 序列在 j 日有效时，止损线用 当日ATR×mult/入场价 换算的动态百分比
+// （跟随波动率自适应，高波动放宽止损、低波动收紧）；否则回退固定 stopLossPct。
+// 其余止盈/移动止盈/超期条件与 uniformExitV2 完全一致。
+// English: uniformExitV2ATR is the ATR dynamic-stop variant of the v2 uniform exit engine (Phase 3).
+// When atrStopMult>0 and the ATR series is valid on day j, the stop line becomes the dynamic percent
+// computed as ATR[j]×mult/entry (volatility-adaptive: wider stops in high volatility, tighter in low);
+// otherwise it falls back to the fixed stopLossPct. Take-profit/trailing/timeout logic is unchanged.
+func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
+	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int,
+	atr []float64, atrStopMult float64) (int, float64) {
 	entryDay := sigIdx + 1
 	stageHigh := math.Max(entry, sigHigh)
 	lastJ := len(kls) - 1
@@ -566,6 +610,17 @@ func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 		}
 		// §GAP4.1 净额口径（滑点+佣金+印花税），与 replay 回放同模型
 		return costRoundTripPnl(entry, kls[j].Close)
+	}
+
+	// 当日有效止损百分比：ATR 止损启用时随当日 ATR 自适应，否则固定
+	// English: effective stop percent for day j — volatility-adaptive when ATR stop is on, else fixed.
+	effStop := func(j int) float64 {
+		if atrStopMult > 0 && atr != nil && j < len(atr) && atr[j] > 0 && entry > 0 {
+			if pct := atr[j] * atrStopMult / entry * 100; pct > 0 {
+				return pct
+			}
+		}
+		return stopLossPct
 	}
 
 	for j := entryDay + 1; j <= lastJ; j++ {
@@ -579,7 +634,7 @@ func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 		pnlPct := costRoundTripPnl(entry, cur)
 		days := j - entryDay
 
-		if stopLossPct > 0 && pnlPct <= -stopLossPct {
+		if s := effStop(j); s > 0 && pnlPct <= -s {
 			return j, pnlPct // 止损线：立即卖出控制损失
 		}
 		if takeProfitPct > 0 && pnlPct >= takeProfitPct {
@@ -611,6 +666,8 @@ func objectiveValue(obj string, r *sweepResult) float64 {
 		return r.WinRate
 	case "avgwin":
 		return r.AvgWinPct
+	case "calmar":
+		return r.Calmar
 	default: // profitfactor
 		if r.Loss == 0 && r.Win > 0 {
 			return 99
@@ -629,7 +686,9 @@ func rankedJSON(all *[]sweepResult, order []int) []map[string]any {
 		r := (*all)[idx]
 		out = append(out, map[string]any{
 			"rank": pos + 1, "strategy": r.Name, "strategy_kind": r.Kind,
-			"params":   map[string]any{"trail_pct": r.Trail, "hold_days": r.Hold, "min_score": r.MinScore},
+			// §§Phase3：trail_pct 向后兼容旧前端；take_profit_pct/atr_stop_mult 为新解析键
+			// English: trail_pct kept for legacy frontends; take_profit_pct/atr_stop_mult are the new keys.
+			"params":   map[string]any{"trail_pct": r.Trail, "take_profit_pct": r.Trail, "hold_days": r.Hold, "min_score": r.MinScore, "atr_stop_mult": r.AtrStopMult},
 			"win_rate": r.WinRate, "profit_factor": r.ProfitFactor,
 			"win": r.Win, "loss": r.Loss,
 			"avg_win_pct": r.AvgWinPct, "avg_loss_pct": r.AvgLossPct,
@@ -671,12 +730,15 @@ func betterOf(obj string, a, b *sweepResult) *sweepResult {
 // simulateUniform 网格扫参专用轻量模拟：预计算触发 + uniformExitV2 统一出场。
 // 触发与出场参数无关 → 只在此处按门槛过滤/贪心不重叠/逐日出场扫描，
 // 单组合成本 O(触发数×平均持仓天数)，万级组合秒~分钟级完成。
+// atrStopMult>0 时启用 ATR 动态止损（§Phase3，需传入与 klines 同序的 ATR14 序列）。
 // English: grid-mode lightweight simulation — precomputed triggers filtered by threshold,
 // greedy non-overlapping entries, daily uniform exit walk; thousands of combos in seconds.
+// atrStopMult>0 enables the ATR dynamic stop (Phase 3, requires the parallel ATR14 series).
 func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string][]data.KLine,
-	takeProfitPct, stopLossPct float64, maxHold int, minScore float64) sweepResult {
+	takeProfitPct, stopLossPct float64, maxHold int, minScore float64,
+	atrStopMult float64, atrs map[string][]float64) sweepResult {
 	res := sweepResult{Name: name, Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct,
-		Hold: maxHold, MinScore: minScore}
+		Hold: maxHold, MinScore: minScore, AtrStopMult: atrStopMult}
 	nextFree := map[string]int{} // code -> 可再入场最早下标（同股持仓期内不重复入场）
 	var winSum, lossSum float64
 	var pnls []float64
@@ -688,8 +750,8 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 		if t.sigIdx < nextFree[t.code] {
 			continue
 		}
-		exitJ, pnl := uniformExitV2(klines[t.code], t.sigIdx, t.entry, t.highest,
-			takeProfitPct, stopLossPct, 0, maxHold)
+		exitJ, pnl := uniformExitV2ATR(klines[t.code], t.sigIdx, t.entry, t.highest,
+			takeProfitPct, stopLossPct, 0, maxHold, atrs[t.code], atrStopMult)
 		nextFree[t.code] = exitJ + 1
 		res.Count++
 		res.AvgHold += float64(exitJ - (t.sigIdx + 1))
@@ -783,5 +845,10 @@ func defaultPoolConfig(name string) *store.SweepPoolConfig {
 		SlFrom: slFrom, SlTo: slTo, SlStep: slStep,
 		HoldFrom: 2, HoldTo: p.maxHold, HoldStep: 2,
 		ScoreFrom: 40, ScoreTo: 95, ScoreStep: 5,
+		// §Phase3 ATR 动态止损维：默认单档 0=禁用（回退固定百分比止损），
+		// 用户可在 API 配置多档（如 1.5~3.0 步进 0.5）启用动态止损搜索。
+		// English: Phase-3 ATR stop dimension — default single level 0 (disabled, fixed-pct fallback);
+		// multi-level ranges (e.g. 1.5~3.0 step 0.5) enable dynamic ATR-stop search via the API.
+		AtrFrom: 0, AtrTo: 0, AtrStep: 1,
 	}
 }

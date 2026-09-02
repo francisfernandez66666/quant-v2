@@ -45,7 +45,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases")
 	}
 	cmd := args[0]
 
@@ -82,6 +82,14 @@ func main() {
 		// 队列任务分发器（子系统统一改造一期）：worker 以 run-task --task-id N 拉起。
 		// English: queue-task dispatcher (phase 1) — the worker spawns `run-task --task-id N`.
 		cmdRunTask(db, *dbPath, args[1:])
+	case "cluster-failures":
+		// §Phase2 失败战法聚类：按失败原因聚类扫参结果并输出统计与明细。
+		// English: Phase-2 failed-strategy clustering over sweep optimization results.
+		cmdClusterFailures(db, args[1:])
+	case "emotion-phases":
+		// §Phase3 情绪相位标定：输出区间内每日情绪阶段与相位分布（分参回测依据）。
+		// English: Phase-3 sentiment-phase labeling — prints the per-day phase and phase distribution.
+		cmdEmotionPhases(db, *start, *end, args[1:])
 	case "list":
 		cmdList(db, args[1:])
 	case "approve":

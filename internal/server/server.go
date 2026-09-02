@@ -560,6 +560,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/research/candidates", s.permMiddleware(auth.PermResearchApprove, s.handleResearchCandidates))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleResearchApprove))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleResearchReject))
+	s.mux.HandleFunc("POST /api/research/candidates/{id}/grayscale", s.permMiddleware(auth.PermResearchApprove, s.handleResearchGrayscale))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest))
 	s.mux.HandleFunc("GET /api/research/backtest/{id}", s.authMiddleware(s.handleBacktestStatus))
 	// 阶段3.2 回测运行控制：取消（kill+interrupted，断点缓存可续跑）/ 暂停（SIGSTOP）/ 继续（SIGCONT）

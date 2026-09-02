@@ -51,8 +51,8 @@ func TestRegistry(t *testing.T) {
 		}
 		lastID = d.ID
 	}
-	if len(cats) != 7 {
-		t.Fatalf("应覆盖 7 大类，实际 %d: %v", len(cats), cats)
+	if len(cats) != 8 {
+		t.Fatalf("应覆盖 8 大类，实际 %d: %v", len(cats), cats)
 	}
 	// 每类中文名有效
 	// English: Chinese name valid for every category.

@@ -90,6 +90,124 @@ func (d *DB) LimitUpCountOnDate(date string) (int, error) {
 
 // ── 跌停池 / 炸板池（结构对称，字段较少）──
 
+// ThsBreakRow 炸板池单行（开板次数 = 炸板证据）。
+type ThsBreakRow struct {
+	TradeDate string  // yyyyMMdd
+	TsCode    string  // TS代码
+	Name      string  // 名称
+	Price     float64 // 价格
+	PctChg    float64 // 涨跌幅（%）
+	OpenTimes int     // 开板次数
+	Turnover  float64 // 成交额（元）
+}
+
+// BreakPoolOnDate 某交易日炸板池（情绪因子/炸板率消费）。
+func (d *DB) BreakPoolOnDate(date string) ([]ThsBreakRow, error) {
+	rows, err := d.db.Query(`SELECT trade_date, ts_code, name, price, pct_chg, open_times, turnover
+		FROM ths_break_pool_daily WHERE trade_date=?`, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ThsBreakRow
+	for rows.Next() {
+		var r ThsBreakRow
+		if err := rows.Scan(&r.TradeDate, &r.TsCode, &r.Name, &r.Price, &r.PctChg,
+			&r.OpenTimes, &r.Turnover); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// EmotionStat 单日市场情绪统计（涨停池 + 炸板池合成）。
+type EmotionStat struct {
+	Date      string  // yyyyMMdd
+	LimitUp   int     // 涨停家数
+	BreakCnt  int     // 炸板家数
+	MaxBoard  int     // 最高连板高度
+	BlastRate float64 // 炸板率（%）：炸板/(涨停+炸板)*100；分母为 0 时 = 0
+}
+
+// EmotionStatsRange 区间内逐日市场情绪统计（按日期升序）。
+// English: per-day market-sentiment stats over [from,to], ascending by date.
+func (d *DB) EmotionStatsRange(from, to string) ([]EmotionStat, error) {
+	var out []EmotionStat
+	dates, err := d.ThsDatesBetween(from, to)
+	if err != nil {
+		return nil, err
+	}
+	// 涨停池按日计数 + 最高连板
+	q1 := `SELECT trade_date, COUNT(*), MAX(continue_cnt) FROM ths_limit_up_daily
+		WHERE trade_date BETWEEN ? AND ? GROUP BY trade_date`
+	rows, err := d.db.Query(q1, from, to)
+	if err != nil {
+		return nil, err
+	}
+	limitByDate := make(map[string][2]int, 64)
+	for rows.Next() {
+		var dt string
+		var cnt, maxBoard int
+		if err := rows.Scan(&dt, &cnt, &maxBoard); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		limitByDate[dt] = [2]int{cnt, maxBoard}
+	}
+	rows.Close()
+	// 炸板池按日计数
+	q2 := `SELECT trade_date, COUNT(*) FROM ths_break_pool_daily
+		WHERE trade_date BETWEEN ? AND ? GROUP BY trade_date`
+	rows, err = d.db.Query(q2, from, to)
+	if err != nil {
+		return nil, err
+	}
+	breakByDate := make(map[string]int, 64)
+	for rows.Next() {
+		var dt string
+		var cnt int
+		if err := rows.Scan(&dt, &cnt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		breakByDate[dt] = cnt
+	}
+	rows.Close()
+	for _, dt := range dates {
+		lu := limitByDate[dt]
+		bc := breakByDate[dt]
+		total := lu[0] + bc
+		rate := 0.0
+		if total > 0 {
+			rate = float64(bc) / float64(total) * 100
+		}
+		out = append(out, EmotionStat{
+			Date: dt, LimitUp: lu[0], MaxBoard: lu[1], BreakCnt: bc, BlastRate: rate,
+		})
+	}
+	return out, nil
+}
+
+// ThsDatesBetween 区间内已收录行情/涨停数据的交易日（升序去重）。
+// English: trading dates in [from,to] from the THS tables (ascending, deduped).
+func (d *DB) ThsDatesBetween(from, to string) ([]string, error) {
+	rows, err := d.db.Query(`SELECT DISTINCT trade_date FROM ths_limit_up_daily
+		WHERE trade_date BETWEEN ? AND ? ORDER BY trade_date`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var dt string
+		if err := rows.Scan(&dt); err == nil {
+			out = append(out, dt)
+		}
+	}
+	return out, rows.Err()
+}
+
 // UpsertThsSimplePool 通用三池写入（跌停/炸板共用简化列集）。
 // table 仅允许白名单值，防拼接注入。
 func (d *DB) UpsertThsSimplePool(table, tradeDate string, rows map[string]ThsPoolSimple) (int64, error) {

@@ -53,6 +53,25 @@ func Assemble(db *store.DB, code, start, end string) (*factor.StockSeries, error
 		s.Vol[i], s.Amount[i] = b.Vol, b.Amount
 	}
 
+	// §Phase2 情绪因子入池：预取区间内逐日市场情绪统计，按日期回填（全体标的一致）。
+	// 缺失日（涨停池未收录）保留 NaN，由因子层过滤。
+	// English: Phase-2 sentiment factors — preload per-day market sentiment stats over [start,end]
+	// and backfill by date (uniform across the universe); days without pool data stay NaN.
+	if emos, err := db.EmotionStatsRange(start, end); err == nil {
+		emoByDate := make(map[string]store.EmotionStat, len(emos))
+		for _, e := range emos {
+			emoByDate[e.Date] = e
+		}
+		for i, d := range s.Dates {
+			if e, ok := emoByDate[d]; ok {
+				s.EmoLimitUp[i] = float64(e.LimitUp)
+				s.EmoBreakCnt[i] = float64(e.BreakCnt)
+				s.EmoMaxBoard[i] = float64(e.MaxBoard)
+				s.EmoBlastRate[i] = e.BlastRate
+			}
+		}
+	}
+
 	// 原始价（规模因子用）
 	// English: raw price (used by the size factor).
 	rawByDate := make(map[string]float64, len(raw))
@@ -167,6 +186,10 @@ func fillSlices(s *factor.StockSeries, n int) {
 	s.CloseRaw = make([]float64, n)
 	s.Vol = make([]float64, n)
 	s.Amount = make([]float64, n)
+	s.EmoLimitUp = make([]float64, n)
+	s.EmoBreakCnt = make([]float64, n)
+	s.EmoMaxBoard = make([]float64, n)
+	s.EmoBlastRate = make([]float64, n)
 	s.Turnover = make([]float64, n)
 	s.PeTTM = make([]float64, n)
 	s.Pb = make([]float64, n)
@@ -191,5 +214,7 @@ func fillSlices(s *factor.StockSeries, n int) {
 		s.IsST[i] = math.NaN()
 		s.Roe[i], s.GrossMargin[i], s.NetMargin[i], s.DebtToAssets[i] = math.NaN(), math.NaN(), math.NaN(), math.NaN()
 		s.YoyNetProfit[i], s.SingleQuarterNIYoy[i] = math.NaN(), math.NaN()
+		s.EmoLimitUp[i], s.EmoBreakCnt[i] = math.NaN(), math.NaN()
+		s.EmoMaxBoard[i], s.EmoBlastRate[i] = math.NaN(), math.NaN()
 	}
 }

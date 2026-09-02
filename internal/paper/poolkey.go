@@ -157,3 +157,110 @@ func (e *Engine) poolLabelOf(key string) string {
 	}
 	return key
 }
+
+// ── §Phase3 paper A/B 对照组 ──
+
+// SetPoolABGroup 给资金池打 A/B 组标签（如 A=回测最优实盘验证、B=灰度新战法观察），
+// 持久化；空 label 清除该池标记。
+// English: tags a cash pool with an A/B group label (e.g. A=live validation of the backtest champion,
+// B=grayscale candidate under observation); an empty label clears the tag. Persisted.
+func (e *Engine) SetPoolABGroup(poolKey, label string) {
+	if poolKey == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if label == "" {
+		delete(e.poolGrp, poolKey)
+	} else {
+		if e.poolGrp == nil {
+			e.poolGrp = map[string]string{}
+		}
+		e.poolGrp[poolKey] = label
+	}
+	e.persist()
+}
+
+// PoolABGroup 返回指定池的 A/B 组标签（无标记返回空串）。
+// English: returns a pool's A/B group label (empty when unset).
+func (e *Engine) PoolABGroup(poolKey string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.poolGrp[poolKey]
+}
+
+// PoolABGroups 返回全部 A/B 组标记（poolKey → label）。
+// English: returns all A/B group tags (poolKey → label).
+func (e *Engine) PoolABGroups() map[string]string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]string, len(e.poolGrp))
+	for k, v := range e.poolGrp {
+		out[k] = v
+	}
+	return out
+}
+
+// ── §Phase4 IR 动态仓位 ──
+
+// SetPoolIR 设置某池参考 IR（信息比率），自动买入金额按其缩放；IR==0 清除（恢复默认单笔预算）。
+// 负 IR 允许保留（缩到 0.6 下限），与"清零（恢复默认）"语义区分。
+// English: sets a pool's reference IR — the auto-buy amount scales by it; IR==0 clears the override
+// (back to the default per-trade budget). Negative IR is allowed (shrinks to the 0.6 floor),
+// distinct from clearing. Persisted.
+func (e *Engine) SetPoolIR(poolKey string, ir float64) {
+	if poolKey == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ir == 0 {
+		delete(e.poolIR, poolKey)
+	} else {
+		if e.poolIR == nil {
+			e.poolIR = map[string]float64{}
+		}
+		e.poolIR[poolKey] = ir
+	}
+	e.persist()
+}
+
+// PoolIR 返回某池参考 IR（无配置返回 0）。
+// English: returns a pool's reference IR (0 when unset).
+func (e *Engine) PoolIR(poolKey string) float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.poolIR[poolKey]
+}
+
+// applyPoolIRLocked 计算某池自动买入金额的 IR 缩放系数（须持锁）。无 IR（key 缺失）→ 1.0；
+// 负 IR → 缩到 0.6 下限（低质量信号少配）。
+// 映射：预算倍数 = clamp(0.6 + IR, 0.6, 2.0) —— 高 IR 战法加大单笔预算，低 IR/负 IR 缩仓
+// 至少保留 60% 基线（不超配低质信号，也不过度剥夺新战法试错资金）。
+// English: returns this pool's auto-buy amount IR scale (caller holds the lock). Missing key → 1.0;
+// negative IR → the 0.6 floor. Mapping: budget multiplier = clamp(0.6 + IR, 0.6, 2.0).
+func (e *Engine) applyPoolIRLocked(poolKey string) float64 {
+	ir, ok := e.poolIR[poolKey]
+	if !ok || ir == 0 {
+		return 1.0
+	}
+	if v := 0.6 + ir; v < 0.6 {
+		return 0.6
+	} else if v > 2.0 {
+		return 2.0
+	} else {
+		return v
+	}
+}
+
+// PoolIRScales 返回各池当前生效的 IR 缩放系数（poolKey → scale，1.0=未配置）。
+// English: returns the currently effective IR scale per pool (poolKey → scale; 1.0 = unset).
+func (e *Engine) PoolIRScales() map[string]float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]float64, len(e.poolIR))
+	for k := range e.poolIR {
+		out[k] = e.applyPoolIRLocked(k)
+	}
+	return out
+}

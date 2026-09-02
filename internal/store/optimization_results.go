@@ -52,6 +52,9 @@ type PoolLiveStats struct {
 	WinRatePct float64 `json:"win_rate_pct"` // 已平仓胜率%
 	Expectancy float64 `json:"expectancy"`   // 每笔期望收益%
 	FilledBuys int     `json:"filled_buys"`  // 已撮合买入笔数（样本量参考）
+	// §Phase3 A/B 对照组：该池组标签（A=回测最优/B=灰度观察，空=未标记）
+	// English: Phase-3 A/B group tag for the pool (A=champion / B=grayscale, empty=unset).
+	ABGroup string `json:"ab_group,omitempty"`
 }
 
 // SweepParams 扫参组合参数（与 SWEEP_JSON 的 params 对象对应）。
@@ -60,6 +63,7 @@ type SweepParams struct {
 	StopLossPct   float64 `json:"stop_loss_pct"`   // Stop亏损次数Pct
 	HoldDays      int     `json:"hold_days"`       // 持仓天数
 	MinScore      float64 `json:"min_score"`       // Min评分
+	AtrStopMult   float64 `json:"atr_stop_mult"`   // §Phase3 ATR 动态止损倍数（0=禁用）
 }
 
 // ParseSweepParams 从 params JSON 解析（容错：空/坏 JSON 返回零值）。
