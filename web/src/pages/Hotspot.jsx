@@ -613,7 +613,8 @@ export default function Hotspot() {
             columns={evalColumns}
             rowKey="code"
             size="small"
-            pagination={{ pageSize: 20, showJumper: true }}
+            // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页显示「共 0 条」且下一页不可用
+            pagination={{ pageSize: 20, showJumper: true, total: sortedEvals.length }}
           />
         ) : (
           <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待评估结果...</div>

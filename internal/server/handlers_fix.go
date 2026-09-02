@@ -497,12 +497,20 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	matCount := 0
 	hotCount := 0
 	finalCount := 0
+	monitored := 0
 	session := 99
 	if dash != nil {
 		rawCount = len(dash.NewsEvents)
 		matCount = rawCount
 		hotCount = len(dash.HotSectors)
 		finalCount = len(dash.FinalSignals)
+	}
+	// §扫描统计语义修正：total_stocks 应为监控个股数（fetch 快照股票数），
+	// 此前误用 NewsEvents 条数（新闻事件数），前端「监控个股」卡与「快照 N 股」展示错标。
+	if s.fetcher != nil {
+		if snap := s.fetcher.Snapshot(); snap != nil {
+			monitored = len(snap.Stocks)
+		}
 	}
 	now := time.Now()
 	// 交易时段判定统一走 data 包（含周末/休市）：9:15 集合竞价开盘，15:30 收盘后进入静默释放期。
@@ -520,7 +528,7 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		"active":        active,
 		"signal_count":  finalCount,
 		"scan_stats": map[string]interface{}{
-			"total_stocks":     rawCount,
+			"total_stocks":     monitored,
 			"hot_sector_count": hotCount,
 			"raw_signals":      rawCount,
 			"material_events":  matCount,

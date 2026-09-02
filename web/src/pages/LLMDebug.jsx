@@ -352,7 +352,8 @@ function LogModal({ visible, onClose }) {
                         columns={stage2Columns}
                         rowKey="_k"
                         size="small"
-                        pagination={{ pageSize: 10, showJumper: true }}
+                        // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页错显「共 0 条」且无法翻页
+                        pagination={{ pageSize: 10, showJumper: true, total: llmData.stage2_events.length }}
                       />
                     ) : (
                       <div style={emptyStyle}>Stage2 无分析结果</div>
@@ -430,7 +431,8 @@ function LogModal({ visible, onClose }) {
                         columns={signalColumns}
                         rowKey="_k"
                         size="small"
-                        pagination={{ pageSize: 10, showJumper: true }}
+                        // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页错显「共 0 条」且无法翻页
+                        pagination={{ pageSize: 10, showJumper: true, total: sigFiltered.length }}
                       />
                     ) : (
                       <div style={emptyStyle}>{sigData.signals.length ? '当前战法无匹配信号' : '本轮无信号产出'}</div>
@@ -654,7 +656,8 @@ export default function LLMDebug() {
                 columns={stage2Columns}
                 rowKey="_k"
                 size="small"
-                pagination={{ pageSize: 10, showJumper: true }}
+                // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页错显「共 0 条」且无法翻页
+                pagination={{ pageSize: 10, showJumper: true, total: data.stage2_events.length }}
               />
             ) : (
               <div style={emptyStyle}>Stage2 无分析结果</div>

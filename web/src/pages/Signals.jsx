@@ -334,7 +334,10 @@ export default function Signals() {
           expandedRowKeys={[...klineOpen]}
           onExpandChange={(keys) => setKlineOpen(new Set(keys))}
           onRowClick={(ctx) => onRowTap(ctx.row)}
-          pagination={{ pageSize: 10, showJumper: true, totalContent: true }}
+          // §FIX-20260902 信号一页全显：此前 pagination={{ pageSize:10, totalContent:true }}
+          // 把第 11+ 条信号藏到第 2 页，且 tdesign 未传 total 时页脚错显「共 0 条数据」、
+          // 下一页按钮不可用——「全部 vs 分战法」数量对不上的根因。改为关闭分页直接展示全部。
+          pagination={false}
           empty="暂无信号"
         />
       </Card>

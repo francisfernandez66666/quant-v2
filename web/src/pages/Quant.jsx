@@ -547,7 +547,8 @@ export default function Quant() {
 
             {(trades.fills || []).length ? (
               <Table data={trades.fills} columns={fillsColumns} rowKey="order_id" size="small"
-                pagination={{ pageSize: 10, showJumper: true }} />
+                // §FIX-20260902 补 total=长度：tdesign 未传 total 时分页默认 0 → 页脚「共 0 条」且无法翻页
+                pagination={{ pageSize: 10, showJumper: true, total: trades.fills.length }} />
             ) : null}
           </>
         ) : (

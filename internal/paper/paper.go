@@ -2019,6 +2019,19 @@ func (e *Engine) Positions() []Position {
 	return out
 }
 
+// Holds 判断该模拟盘账本当前是否持有某代码（供按账号逐仓路由卖出信号使用）。
+// English: reports whether this paper book currently holds the given code (used by per-account
+// sell-signal routing so a sell only reaches the account that actually holds the position).
+func (e *Engine) Holds(code string) bool {
+	if code == "" {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p, ok := e.positions[code]
+	return ok && p != nil && p.Qty > 0
+}
+
 // Trades 返回成交记录（最新在前）。
 // English: returns the fill records (newest first).
 func (e *Engine) Trades() []Trade {

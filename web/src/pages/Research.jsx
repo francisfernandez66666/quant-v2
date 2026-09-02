@@ -1506,7 +1506,8 @@ export default function Research() {
             {backtestJobs.length === 0 && <Card style={{ marginTop: 12 }}>暂无回测任务。选择上方候选发起全量回测，或等待夜间调度器产出。</Card>}
             {backtestJobs.length > 0 && (
               <Card style={{ marginTop: 12 }} title="回测任务">
-                <Table data={backtestJobs} columns={btColumns} rowKey={(r) => (r.kind || 'candidate') + ':' + r.candidate_id} size="small" pagination={{ pageSize: 10, showJumper: true }} />
+                {/* §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页错显「共 0 条」且无法翻页 */}
+                <Table data={backtestJobs} columns={btColumns} rowKey={(r) => (r.kind || 'candidate') + ':' + r.candidate_id} size="small" pagination={{ pageSize: 10, showJumper: true, total: backtestJobs.length }} />
               </Card>
             )}
           </div>

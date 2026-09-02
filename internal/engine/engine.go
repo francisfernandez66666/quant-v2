@@ -1312,7 +1312,15 @@ func (e *Engine) GetSignalLogs() []combat_agent.SignalLog {
 }
 
 // captureSignalRecords 收集本轮全部信号为一条批次快照，固化到当日信号记录。
+// §REQ-20260902：LLM/战法近实时后轮次大幅增加，改为保留全天、不再截断 20 条；
+// 空批次（无任何信号，无实际内容）直接不落库，前端也不再出现「0 信号」的空轮次。
+// English: keeps the whole trading day of signal batches instead of the old 20-round cap
+// (near-realtime rounds multiply the volume); batches with no signals are dropped entirely
+// so the log UI never shows empty rounds.
 func (e *Engine) captureSignalRecords(rawCount int, signals []combat_agent.Signal) {
+	if len(signals) == 0 {
+		return
+	}
 	e.mu.Lock()
 	rec := combat_agent.SignalLog{
 		ProcessTime: time.Now(),
@@ -1321,9 +1329,6 @@ func (e *Engine) captureSignalRecords(rawCount int, signals []combat_agent.Signa
 	}
 	copy(rec.Signals, signals)
 	e.signalRecords = append(e.signalRecords, rec)
-	if len(e.signalRecords) > 20 {
-		e.signalRecords = e.signalRecords[len(e.signalRecords)-20:]
-	}
 	e.mu.Unlock()
 	e.persistSignalRecords()
 }
@@ -3672,6 +3677,10 @@ func strContains(slice []string, s string) bool {
 }
 
 // captureDebug 收集本轮流水线调试数据，并固化到当日 Stage 记录。
+// §REQ-20260902：保留全天轮次（去掉 20 条截断）；无实际内容（既无原始新闻、无选中，
+// 也无阶段事件）的轮次直接跳过，避免前端出现「0 条 / 选 0」的空轮次。
+// English: keeps the whole day of stage rounds (no 20-round cap); rounds with no raw news,
+// no selections and no stage-2 events are skipped so the UI never lists empty rounds.
 func (e *Engine) captureDebug(rawNews []data.NewsItem, st0 newsagent.Stage0Result, events []newsagent.NewsEvent) {
 	titles := make([]string, len(rawNews))
 	for i, n := range rawNews {
@@ -3682,7 +3691,7 @@ func (e *Engine) captureDebug(rawNews []data.NewsItem, st0 newsagent.Stage0Resul
 	idx = append(idx, st0.IpoIdx...)
 
 	e.mu.Lock()
-	e.debugInfo = &newsagent.DebugInfo{
+	debugInfo := &newsagent.DebugInfo{
 		Stage1Mode:    "combined",
 		RawCount:      len(rawNews),
 		SelectedCount: len(idx),
@@ -3691,10 +3700,12 @@ func (e *Engine) captureDebug(rawNews []data.NewsItem, st0 newsagent.Stage0Resul
 		Stage2Events:  events,
 		ProcessTime:   time.Now(),
 	}
-	e.stageRecords = append(e.stageRecords, *e.debugInfo)
-	if len(e.stageRecords) > 20 {
-		e.stageRecords = e.stageRecords[len(e.stageRecords)-20:]
+	e.debugInfo = debugInfo
+	if len(rawNews) == 0 && len(idx) == 0 && len(events) == 0 {
+		e.mu.Unlock()
+		return
 	}
+	e.stageRecords = append(e.stageRecords, *debugInfo)
 	e.mu.Unlock()
 
 	e.persistStageRecords()
@@ -3726,7 +3737,7 @@ func (e *Engine) captureNearRealtimeStage() {
 	}
 	e.mu.Lock()
 	e.lastStageCap = time.Now()
-	e.debugInfo = &newsagent.DebugInfo{
+	debugInfo := &newsagent.DebugInfo{
 		Stage1Mode:    "combined",
 		RawCount:      len(titles),
 		SelectedCount: 0,
@@ -3734,10 +3745,13 @@ func (e *Engine) captureNearRealtimeStage() {
 		Stage2Events:  events,
 		ProcessTime:   time.Now(),
 	}
-	e.stageRecords = append(e.stageRecords, *e.debugInfo)
-	if len(e.stageRecords) > 20 {
-		e.stageRecords = e.stageRecords[len(e.stageRecords)-20:]
+	e.debugInfo = debugInfo
+	// §REQ-20260902：无实际内容（无待归因标题且无已归因事件）不落库，前端不出现空轮次。
+	if len(titles) == 0 && len(events) == 0 {
+		e.mu.Unlock()
+		return
 	}
+	e.stageRecords = append(e.stageRecords, *debugInfo)
 	e.mu.Unlock()
 	e.persistStageRecords()
 }

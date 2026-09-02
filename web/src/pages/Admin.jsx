@@ -494,7 +494,8 @@ export default function Admin() {
           columns={userColumns}
           bordered={false}
           size="medium"
-          pagination={{ defaultPageSize: 10, showJumper: true }}
+          // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页错显「共 0 条」且无法翻页
+          pagination={{ defaultPageSize: 10, showJumper: true, total: users.length }}
         />
       </Card>
 

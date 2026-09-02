@@ -244,6 +244,18 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	// holding book so the rpt consumed by exit engines / positions page / scoring pool stays consistent.
 	if open, closeFn := r.paperMirror(userID); open != nil {
 		pe.SetMirror(open, closeFn)
+		// §P-AS1 存量持仓回灌（2026-09-02 用户实录「模拟盘不自动卖出」根修一层）：
+		// GetPaper 从磁盘恢复的既有持仓此前只活在账号 paper.json，从未写回共享 rpt（镜像只在
+		// 新成交时触发），导致 CheckPositionsExits/CheckPositionAlerts 只评估 rpt 那一两条镜像持仓，
+		// 账号真实持仓（如 20 仓满仓）对退出引擎完全隐形而不产生卖出信号。现按现有持仓逐笔
+		// 幂等回灌（open 回调内 HasHoldingFor 去重），重启后退出引擎能看到全部账号持仓。
+		// English: backfill restored holdings into the shared report book (root-fix layer 1). Certificates
+		// from disk only lived in the account paper.json, never in rpt (mirror only fires on new fills), so
+		// the exit engines only ever saw 1-2 mirrored positions and real holdings stayed invisible — no
+		// sell signals. Re-firing the open mirror per existing holding is idempotent via HasHoldingFor.
+		for _, p := range pe.Positions() {
+			open(p)
+		}
 	}
 	// 新账号继承全局战法资金池模板（分仓，防单战法垄断）。
 	// English: a new account inherits the global strategy pool template (allocation against monopolies).
@@ -308,9 +320,15 @@ func (r *Registry) registerUser(e *Engine, userID string) {
 
 // dispatchPaperSignals 把本轮翻转信号分发给共享引擎服务的账号中"参与自动撮合"的模拟盘
 // （各自独立撮合；普通用户账号不自动建仓，模拟盘纯手动）。仅交易时段运行（盘后省内存）。
-// English: dispatches this round's flipped signals to the paper engines of the accounts served by the
-// shared engine that participate in auto-fill (each fills independently; normal users' books are manual).
-// Runs only during trading hours (after-hours skips to save memory).
+// §P-AS2 逐仓路由（2026-09-02 用户实录「模拟盘不自动卖出」根修二层）：
+// 卖出信号按账号逐仓投递——只发给【当前持有该 code】的账号引擎（pe.Holds 匹配），
+// 无持仓账号不再收到无关卖点（此前整批下发+autoSellLocked 内部 no-op，信号归属错位）。
+// 买入信号仍全量下发（各账号独立决定现金/上限/池）。卖出+买入合并后一次性 OnSignals。
+// English: dispatches signals to the auto-fill accounts of a shared engine, each filling
+// independently (normal users' books are manual). Trading hours only. Per-account routing for sells —
+// a sell signal only reaches accounts whose book currently holds that code (pe.Holds), instead of
+// broadcasting the whole batch to every account where autoSellLocked silently no-ops. Buys still go
+// to all accounts (each independently gates on cash/cap/pool). Sells+buys are merged before OnSignals.
 func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
 	if !data.IsFullTradingHours(time.Now()) {
 		return
@@ -319,8 +337,20 @@ func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, q
 		if !r.isAutoPaper(uid) {
 			continue
 		}
-		if pe := r.GetPaper(uid); pe != nil && pe.Enabled() {
-			pe.OnSignals(emit, quotes)
+		pe := r.GetPaper(uid)
+		if pe == nil || !pe.Enabled() {
+			continue
+		}
+		// 按 code 拆分卖出信号：仅投递给本账号持有的（逐仓路由）；买入信号保留全量。
+		// English: keep sell signals whose code this account holds; keep all buys.
+		acct := make([]combat_agent.Signal, 0, len(emit))
+		for _, s := range emit {
+			if combat_agent.SellAction(s) == "" || pe.Holds(s.Code) {
+				acct = append(acct, s)
+			}
+		}
+		if len(acct) > 0 {
+			pe.OnSignals(acct, quotes)
 		}
 	}
 }
