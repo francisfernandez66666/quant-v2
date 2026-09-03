@@ -375,6 +375,21 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 		Factors: pool, Horizon: *h, MinStocks: *minStocks, Metric: *metric,
 		MaxFactors: *maxFactors, SplitPct: *split, MinIR: *minIR, MinDays: *minDays, MinGenT: *minGenT,
 	}
+	// §F4 已驳回去重：取历史全部 rejected 的 factor 候选，解析其因子组合注入 ExcludeCombos，
+	// 贪心选择时命中即跳过，避免每晚重复生成同一已驳回战法（如 #108~#111 的 Brk60）。
+	// English: §F4 — load all rejected factor candidates, parse their factor sets into ExcludeCombos so
+	// greedy selection skips already-rejected combos instead of regenerating them every night.
+	if rej, err := db.RejectedFactorCombos(); err != nil {
+		log.Printf("读取已驳回候选失败（忽略）: %v", err)
+	} else if len(rej) > 0 {
+		for _, raw := range rej {
+			var combo []string
+			if json.Unmarshal([]byte(raw), &combo) == nil && len(combo) > 0 {
+				opts.ExcludeCombos = append(opts.ExcludeCombos, combo)
+			}
+		}
+		log.Printf("§F4 已驳回组合 %d 组将跳过", len(opts.ExcludeCombos))
+	}
 	// 内存可控的窗口分块发现：不再一次性 BuildPanels 全量加载（全市场近3年约 2.8GB），
 	// 而是按交易日窗口逐窗装配、算完即释放，峰值内存压到单窗口（900M 内），代价是更慢。
 	// English: memory-bounded windowed discovery — no longer loads the full panel set at once
@@ -397,6 +412,13 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	_ = wj
 	reason := fmt.Sprintf("%s | 样本内IR=%.3f 样本外IR=%.3f 反推超额=%.4f 反推t=%.2f",
 		res.Reason, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT)
+	// §F4 落库前兜底：即使贪心阶段因断点复用跳过了去重，最终组合若仍命中已驳回集合则直接丢弃。
+	// English: §F4 final guard — even if checkpoints bypassed the greedy-stage de-dup, drop a final
+	// combination that still equals a previously rejected factor set.
+	if research.IsComboRejected(res.Factors, opts.ExcludeCombos) {
+		log.Printf("§F4 组合已驳回，跳过生成候选：因子=%v", res.Factors)
+		return
+	}
 	status := "proposed"
 	if !res.PassGuard {
 		status = "proposed" // 护栏不过仍入库，标记 reason

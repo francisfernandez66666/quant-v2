@@ -94,13 +94,23 @@ func (p *stageProgress) tick() {
 
 // discoveryResumeKey 断点键：任何影响结果的参数（区间/前瞻/最小样本/窗口宽/因子池/股票池）
 // 变更都会生成新 key，旧缓存自动失效。English: checkpoint key — any result-affecting change rolls a fresh key.
-func discoveryResumeKey(start, end string, horizon, minStocks, winDays int, fids []string, codes []string) string {
+func discoveryResumeKey(start, end string, horizon, minStocks, winDays int, fids []string, codes []string, excl [][]string) string {
 	sorted := append([]string{}, fids...)
 	sort.Strings(sorted)
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", codes)))
-	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s",
+	// §F4 排除组合纳入 key：已驳回组合变化必须使断点缓存失效，否则复用的贪心结果绕过去重。
+	// English: §F4 — fold excluded combos into the key so a change in rejected combos invalidates the
+	// cached greedy windows (otherwise the resume path would bypass de-duplication).
+	ex := make([]string, 0, len(excl))
+	for _, c := range excl {
+		s := append([]string{}, c...)
+		sort.Strings(s)
+		ex = append(ex, strings.Join(s, "+"))
+	}
+	sort.Strings(ex)
+	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s|x%s",
 		start, end, horizon, minStocks, winDays,
-		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10])
+		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10], strings.Join(ex, ","))
 }
 
 // windowDays 每个窗口包含的交易日数。越小峰值内存越低、但装配次数越多（越慢）。
@@ -529,7 +539,7 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 	// 预筛/贪心/分段IR/反推各阶段命中窗口直接复用，不再重装配。
 	// English: window-level checkpoints — resume key binds range+params+pool; a preempted rerun
 	// reuses finished windows across the pre-screen / greedy / split-IR / gen stages.
-	rk := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes)
+	rk := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes, opts.ExcludeCombos)
 	log.Printf("[discover] 断点key=%s 窗口数=%d（中断续跑跳过已完成窗口）", rk, len(chunks))
 
 	// 1) 单因子预筛：每窗口装配一次（含全部候选因子），§GAP 二.3#4 只算样本内（≤split）|IR|
@@ -577,6 +587,12 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 		subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1],
 			&winCkpt{db: db, resumeKey: rk, stage: "greedy|" + strings.Join(selected, "+")})
 		for _, fid := range cands {
+			// §F4 已驳回组合跳过：selected+fid 的排序后集合若命中任一 ExcludeCombo 则不再评估，
+			// 避免每晚重复产出同一已驳回战法（如 Brk60 #111）。English: skip candidates whose
+			// sorted set (selected+this factor) equals a previously rejected combo.
+			if comboExcluded(selected, fid, opts.ExcludeCombos) {
+				continue
+			}
 			ir := absf(IR(subsetIC[fid]))
 			if isNaN(ir) {
 				continue

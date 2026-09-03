@@ -22,6 +22,28 @@ type Candidate struct {
 	Reason    string  `json:"reason"`     // 原因
 }
 
+// RejectedFactorCombos §F4 取全部已驳回（status='rejected'）的因子战法候选的因子集合。
+// 返回每个候选的 Factors JSON 原文，供调用方解析为因子 ID 组合做发现去重。
+// English: §F4 returns every rejected kind="factor" candidate's raw Factors JSON, so discovery can
+// de-duplicate against combinations that were already rejected.
+func (d *DB) RejectedFactorCombos() ([]string, error) {
+	rows, err := d.db.Query(
+		`SELECT factors FROM research_candidates WHERE kind='factor' AND status='rejected' AND factors<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 // SaveCandidate 写入一条候选。
 // （SaveCandidate inserts a candidate.）
 func (d *DB) SaveCandidate(c *Candidate) (int64, error) {

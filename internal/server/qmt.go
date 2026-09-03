@@ -179,7 +179,18 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// §联调修复：装配实时现价（CurPrice）供前端实盘持仓"现价/浮动盈亏"列展示。
 	// 网关回报仅含 cost_price，实时价取自 fetcher 5s 快照（缺则按 TS 代码变换重试一次）。
 	// 不影响持久化（real_positions 仍按网关为准 upsert），仅响应层补充展示字段。
+	// §F2 名称兜底：网关对账回报常不带 name（real_positions.name 为空）——用行情快照的
+	// Name 补全展示名，避免前端实盘持仓只显示代码不显示名称。
+	// English: §F2 name backfill — gateway reconciliation omits name; fill it from the quote
+	// snapshot so the real-positions table shows stock names, response-layer only (no persist).
 	for i := range positions {
+		if positions[i].Name == "" {
+			if n := s.stockName(positions[i].TsCode); n != "" {
+				positions[i].Name = n
+			} else if si := s.quoteDisplay(positions[i].TsCode); si != nil && si.Name != "" {
+				positions[i].Name = si.Name
+			}
+		}
 		if si := s.quoteDisplay(positions[i].TsCode); si != nil && si.Price > 0 {
 			positions[i].CurPrice = si.Price
 		}

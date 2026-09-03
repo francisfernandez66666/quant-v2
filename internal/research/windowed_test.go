@@ -139,14 +139,24 @@ func datesEnd(db *store.DB) string {
 
 // TestDiscoveryResumeKeyAndCkpt 断点键稳定性/参数敏感性与窗口缓存往返。
 func TestDiscoveryResumeKeyAndCkpt(t *testing.T) {
-	base := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"B", "A"}, []string{"600000.SH"})
-	same := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"})
+	base := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"B", "A"}, []string{"600000.SH"}, nil)
+	same := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"}, nil)
 	if base != same {
 		t.Fatal("因子池顺序不应影响 resume_key")
 	}
-	diff := discoveryResumeKey("20230101", "20260822", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"})
+	diff := discoveryResumeKey("20230101", "20260822", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"}, nil)
 	if diff == base {
 		t.Fatal("区间变更必须换 key（旧缓存自动失效）")
+	}
+	// §F4 已驳回组合参与 key：新增排除必须失效旧断点缓存（否则复用的贪心结果绕过排除）。
+	// English: §F4 excluded combos participate in the key — adding exclusions must invalidate the cache.
+	d2 := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"}, [][]string{{"Brk60"}})
+	if d2 == base {
+		t.Fatal("已驳回组合加入必须换 key")
+	}
+	d3 := discoveryResumeKey("20230101", "20260821", 5, 20, 60, []string{"A", "B"}, []string{"600000.SH"}, [][]string{{"A"}, {"B"}})
+	if d3 == d2 {
+		t.Fatal("已驳回组合集合不同必须换 key")
 	}
 
 	dbPath := filepath.Join(t.TempDir(), "t.db")

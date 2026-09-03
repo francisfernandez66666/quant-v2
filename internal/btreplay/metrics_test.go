@@ -2,6 +2,7 @@
 package btreplay
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
@@ -57,6 +58,41 @@ func TestPerfMetricsEdge(t *testing.T) {
 	}
 	if s, _, _, _ := perfMetrics([]float64{5}, []string{"20250101"}); s != 0 {
 		t.Fatal("单样本 Sharpe 应为 0")
+	}
+}
+
+// TestSweepChampionRiskMetrics §F5 回归：冠军 sweepResult 的风险调整指标必须被计算并由
+// JSON 序列化携带（此前漏带出 SWEEP_JSON → optimization_results 落库恒 0）。
+// English: §F5 regression — the champion sweepResult's risk-adjusted metrics must be computed and
+// survive JSON serialization (they were previously dropped before SWEEP_JSON, zeroing the DB rows).
+func TestSweepChampionRiskMetrics(t *testing.T) {
+	var res sweepResult
+	res.Count = 2
+	res.Win, res.Loss = 1, 1
+	res.AvgHold = 10
+	finalizeResult(&res, 8.0, -4.0, []float64{8, -4}, []string{"20250101", "20250301"})
+	if res.WinRate != 50 || res.ProfitFactor != 2 {
+		t.Fatalf("基础指标异常: wr=%.1f pf=%.2f", res.WinRate, res.ProfitFactor)
+	}
+	if res.Sharpe == 0 || res.Calmar == 0 {
+		t.Fatalf("风险指标未计算: sharpe=%.4f calmar=%.4f", res.Sharpe, res.Calmar)
+	}
+	bj, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back struct {
+		Sharpe          float64 `json:"sharpe"`
+		MaxDrawdownPct  float64 `json:"max_drawdown_pct"`
+		AnnualReturnPct float64 `json:"annual_return_pct"`
+		Calmar          float64 `json:"calmar"`
+	}
+	if err := json.Unmarshal(bj, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Sharpe != res.Sharpe || back.Calmar != res.Calmar ||
+		back.MaxDrawdownPct != res.MaxDrawdownPct || back.AnnualReturnPct != res.AnnualReturnPct {
+		t.Fatalf("风险指标序列化丢失: got %+v want %+v", back, res)
 	}
 }
 

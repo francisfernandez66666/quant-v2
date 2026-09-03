@@ -36,6 +36,13 @@ type DiscoverOpts struct {
 	// which a fixed-percent threshold would wrongly pass; with small samples a mildly negative excess
 	// passes because its t is not significant.
 	MinGenT float64 // 默认 -2
+	// ExcludeCombos §F4 已驳回候选去重：禁止再次生成的因子组合集合（每个元素=一组因子 ID）。
+	// 贪心前向选择每步评估候选集时，若 selected+当前因子 与任一已驳回组合同集合（排序后逐元素相等）
+	// 则跳过该因子，强制探索其它组合；horizon/方向为每轮参数与类别默认方向，天然一致。
+	// English: §F4 rejected-combo de-duplication — factor sets that must not be regenerated. During
+	// greedy selection a candidate (selected + candidate factor) whose sorted set matches any excluded
+	// combo is skipped, forcing discovery to explore different combinations.
+	ExcludeCombos [][]string
 }
 
 // DiscoverResult 因子发现结果。
@@ -155,6 +162,10 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 			if selectedSet[fid] {
 				continue
 			}
+			// §F4 已驳回组合跳过（与非 windowed 版本一致）。English: skip already-rejected combos.
+			if comboExcluded(selected, fid, opts.ExcludeCombos) {
+				continue
+			}
 			// 候选集 = selected + fid，等权评估样本内 IR（§GAP 二.3#4 真 hold-out）
 			candFactors := append(append([]string{}, selected...), fid)
 			w := map[string]float64{}
@@ -233,6 +244,70 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 		res.PassGuard = false
 	}
 	return res
+}
+
+// comboExcluded §F4 判断 已选中因子集 selected + 候选因子 fid 的组合 是否命中已驳回组合。
+// 组合按排序后的集合比较（顺序无关）；单元素命中即视为该组合已驳回。
+// English: reports whether the factor set (selected ∪ {fid}) equals any rejected combo,
+// compared set-wise after sorting.
+func comboExcluded(selected []string, fid string, excludes [][]string) bool {
+	if len(excludes) == 0 {
+		return false
+	}
+	cur := make([]string, 0, len(selected)+1)
+	cur = append(cur, selected...)
+	cur = append(cur, fid)
+	sort.Strings(cur)
+	for _, ex := range excludes {
+		if len(ex) != len(cur) {
+			continue
+		}
+		sorted := make([]string, len(ex))
+		copy(sorted, ex)
+		sort.Strings(sorted)
+		same := true
+		for i := range cur {
+			if cur[i] != sorted[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return true
+		}
+	}
+	return false
+}
+
+// IsComboRejected §F4 判断一个最终因子组合是否命中已驳回组合集合（集合比较，顺序无关）。
+// 供调用方在落库前兜底过滤。English: reports whether a final factor set matches any rejected combo
+// (set-wise, order-independent); used as a final guard before persisting a candidate.
+func IsComboRejected(factors []string, excludes [][]string) bool {
+	if len(excludes) == 0 || len(factors) == 0 {
+		return false
+	}
+	cur := make([]string, len(factors))
+	copy(cur, factors)
+	sort.Strings(cur)
+	for _, ex := range excludes {
+		if len(ex) != len(cur) {
+			continue
+		}
+		sorted := make([]string, len(ex))
+		copy(sorted, ex)
+		sort.Strings(sorted)
+		same := true
+		for i := range cur {
+			if cur[i] != sorted[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return true
+		}
+	}
+	return false
 }
 
 // rowsUntil 返回 date ≤ end 的 IC 行子集（§GAP 二.3#4 样本内切分辅助；end 为空=原样返回）。

@@ -402,6 +402,14 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			"avg_loss_pct":  best.AvgLossPct,
 			"trigger_count": best.Count,
 			"avg_hold_days": best.AvgHold,
+			// §F5 风险调整指标：finalizeResult 已算好 Sharpe/MDD/年化/Calmar，此前漏带出 SWEEP_JSON
+			// → worker 落库读到缺失字段恒为 0（optimization_results 531..527 全 0.0 的根因）。
+			// English: §F5 risk-adjusted metrics were computed by finalizeResult but never included in
+			// the SWEEP_JSON payload, so the worker persisted zeros (root cause of the all-zero rows).
+			"sharpe":            best.Sharpe,
+			"max_drawdown_pct":  best.MaxDrawdownPct,
+			"annual_return_pct": best.AnnualReturnPct,
+			"calmar":            best.Calmar,
 			// 实盘口径复核数字（前端冠军卡展示，与网格口径并列）
 			"verify_win_rate":      verify.WinRate,
 			"verify_profit_factor": verify.ProfitFactor,

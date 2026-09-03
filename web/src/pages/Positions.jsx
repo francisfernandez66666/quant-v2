@@ -54,6 +54,8 @@ export default function Positions() {
   const [realPositions, setRealPositions] = useState([])
   // 实盘账户资产（广州 QMT 上报的可用资金/冻结/总值/市值）
   const [realAccount, setRealAccount] = useState(null)
+  // 实盘整体盈亏（/api/qmt/trades summary：realized/unrealized/total_pnl）——页头优先展示
+  const [realTrades, setRealTrades] = useState(null)
   // 实盘持仓建议映射（ts_code -> 建议）
   const [realAdvices, setRealAdvices] = useState({})
   // 实盘是否启用
@@ -127,6 +129,28 @@ export default function Positions() {
     }
     return sum - pnlOffset
   }, [holdings, totalRealizedPnl, pnlOffset])
+
+  // §F1 是否有实盘数据（持仓或账户上报存在）：有则页头展示实盘盈亏/可用资金，无才回落纸面
+  const hasReal = useMemo(
+    () => realPositions.length > 0 || (realAccount && (realAccount.updated_at || realAccount.total_asset > 0)),
+    [realPositions, realAccount]
+  )
+  // 实盘可用资金：网关上报的 available_cash（无上报时保持 0，与实盘 tab 口径一致）
+  const displayAvailable = hasReal
+    ? (realAccount && realAccount.available_cash != null ? realAccount.available_cash : 0)
+    : availableBalance
+  // 实盘总盈亏：优先用 /api/qmt/trades 的 total_pnl（已实现+浮动）；未取到时按实盘持仓现价-成本×数量兜底
+  const displayPnl = useMemo(() => {
+    if (!hasReal) return totalPnl
+    if (realTrades && realTrades.total_pnl != null) return realTrades.total_pnl
+    let sum = 0
+    for (const p of realPositions) {
+      const price = curPrice(p) || 0
+      sum += (price - (p.cost_price || 0)) * (p.qty || 0)
+    }
+    return sum
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasReal, realTrades, realPositions, totalPnl])
 
   // 预览加减仓后该持仓的数量（加仓=现量+加量；减仓=现量-减量，无效时归零）
   const lotPreviewQty = useMemo(() => {
@@ -386,6 +410,11 @@ export default function Positions() {
       if (data && Array.isArray(data.positions)) setRealPositions(data.positions)
       if (data && data.account) setRealAccount(data.account)
     } catch (_) {}
+    // §F1 实盘整体盈亏（已实现+浮动）：页头优先展示，无实盘才回落纸面
+    try {
+      const t = await api.fetchQMTTrades()
+      if (t && t.summary) setRealTrades(t.summary)
+    } catch (_) {}
   }
   // 取实盘持仓的有效现价（无效价返回 0，避免展示脏数据）
   function curPrice(p) { return (p.cur_price && p.cur_price > 0) ? p.cur_price : 0 }
@@ -537,13 +566,25 @@ export default function Positions() {
         <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>持仓管理</h2>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-            <div className={totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
-              总盈亏: {totalPnl >= 0 ? '+' : ''}¥{totalPnl.toFixed(2)}
-              <Button size="small" variant="outline" theme="default" onClick={resetPnl} style={{ marginLeft: 8 }}>清零</Button>
-            </div>
-            {!editingBalance
-              ? <div onClick={editBalanceStart} style={{ cursor: 'pointer' }}>可用资金: ¥{availableBalance.toFixed(2)} ✏️</div>
-              : <InputNumber value={balanceInputVal} min={0} step={0.01} onBlur={editBalanceSave} onEnter={editBalanceSave} onChange={(v) => setBalanceInputVal(Number(v) || 0)} style={{ width: 160 }} autoFocus />}
+            {hasReal ? (
+              <>
+                <div className={displayPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
+                  <span className="muted" style={{ fontSize: 12, marginRight: 4 }}>实盘</span>
+                  总盈亏: {displayPnl >= 0 ? '+' : ''}¥{displayPnl.toFixed(2)}
+                </div>
+                <div style={{ fontWeight: 600 }}>可用资金: ¥{displayAvailable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+              </>
+            ) : (
+              <>
+                <div className={totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
+                  总盈亏: {totalPnl >= 0 ? '+' : ''}¥{totalPnl.toFixed(2)}
+                  <Button size="small" variant="outline" theme="default" onClick={resetPnl} style={{ marginLeft: 8 }}>清零</Button>
+                </div>
+                {!editingBalance
+                  ? <div onClick={editBalanceStart} style={{ cursor: 'pointer' }}>可用资金: ¥{availableBalance.toFixed(2)} ✏️</div>
+                  : <InputNumber value={balanceInputVal} min={0} step={0.01} onBlur={editBalanceSave} onEnter={editBalanceSave} onChange={(v) => setBalanceInputVal(Number(v) || 0)} style={{ width: 160 }} autoFocus />}
+              </>
+            )}
             <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>
           </div>
         </div>
