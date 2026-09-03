@@ -51,12 +51,14 @@ echo "=============================================="
 
 # ── 1. 交叉编译 windows/amd64 ──
 echo "[1/5] 交叉编译 windows/amd64..."
-GOOS=windows GOARCH=amd64 go build -o /tmp/quant.exe      ./cmd/quant
+# §R6 P1-1 二进制指纹：把 git 短 SHA 注入 quant buildCommit，启动自检可比对线上版本是否漂移
+LDFLAGS="-X main.buildCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GOOS=windows GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/quant.exe      ./cmd/quant
 GOOS=windows GOARCH=amd64 go build -o /tmp/researchd.exe  ./cmd/researchd
 GOOS=windows GOARCH=amd64 go build -o /tmp/dataload.exe   ./cmd/dataload
 GOOS=windows GOARCH=amd64 go build -o /tmp/research.exe   ./cmd/research
 GOOS=windows GOARCH=amd64 go build -o /tmp/qmtctl.exe     ./cmd/qmtctl
-echo "      产物: $(ls -lh /tmp/*.exe | awk '{print $5, $9}')"
+echo "      产物: $(ls -lh /tmp/*.exe | awk '{print $5, $9}') (quant buildCommit=$LDFLAGS)"
 
 # ── 2. 上传二进制 + 部署脚本 + qmtctl ──
 echo "[2/5] 上传二进制/脚本到 $DEPLOY_DIR ..."

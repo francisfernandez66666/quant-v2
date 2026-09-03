@@ -43,8 +43,10 @@ echo "=============================================="
 
 # ── 1. 本地交叉编译（linux/amd64，静态链接纯 Go）──
 echo "[1/8] 交叉编译 linux/amd64..."
-GOOS=linux GOARCH=amd64 go build -o /tmp/quant_linux ./cmd/quant
-echo "      产物: /tmp/quant_linux ($(du -h /tmp/quant_linux | cut -f1))"
+# §R6 P1-1 二进制指纹：把 git 短 SHA 注入 quant buildCommit，启动自检可比对线上版本是否漂移
+LDFLAGS="-X main.buildCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/quant_linux ./cmd/quant
+echo "      产物: /tmp/quant_linux ($(du -h /tmp/quant_linux | cut -f1)) buildCommit=${LDFLAGS}"
 
 # ── 2. 上传二进制 + 配置文件到服务器 ──
 echo "[2/8] 上传二进制与配置..."

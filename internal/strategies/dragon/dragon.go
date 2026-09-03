@@ -124,7 +124,7 @@ func (d *DragonStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 //   - sectors: 板块信息列表（用于板块共振判断）
 //
 // 评分维度：
-//   - F1 封板质量：涨幅 >9.5% 即视为触及涨停，用成交量/成交额比例衡量封板力度
+//   - F1 封板质量：涨幅贴近板块涨停（主板≈9.9、双创≈19.9、北交所≈29.9）即视为封板，用成交量/成交额比例衡量封板力度
 //   - F2 板块共振：取所有板块最大涨幅
 //   - F3 溢价率：个股涨幅超出板块最强涨幅 2%+ 说明辨识度突出
 //   - F4 RS 强度：近 5 日趋势涨幅
@@ -143,9 +143,13 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 	dc := d.strategyCfg()
 
 	// F1: 封板质量 — 基于涨幅和成交量（F1: seal quality — based on gain and volume）
-	// 涨幅>9.5%视为封板，量额比高说明封板坚决。（Gain >9.5% counts as sealed; a high volume/turnover ratio implies a firm seal.）
+	// §R6 P1-4 北交所显式适配：旧硬编码 `>9.5` 是主板假设，对 30% 板的 BJ 股 10% 远未封板却误判触及。
+	// 现按板块涨停阈值（data.LimitUpPct）判"贴近封板"（-0.5% 容差），ST/双创/BJ/主板同口径。
+	// English: F1 seal detection is now board-aware via data.LimitUpPct (ST/ChiNext/STAR/BJ/main) instead
+	// of the old main-board-only >9.5 — fixes BJ (30% board) where a 10% gain was falsely scored as sealed.
+	limitPct := data.LimitUpPct(code, si.Name)
 	f1 := 0.0
-	if si.ChangePct > 9.5 {
+	if si.ChangePct > limitPct-0.5 {
 		// 基础分 = 权重×90%；量额比（成交量/成交额）越高封板越坚决，最高补充 10%（Base=weight×90%; volume/turnover ratio adds up to 10%）
 		f1 = dc.F1SealWeight * 100 * 0.9
 		if si.Amount > 0 {

@@ -34,10 +34,19 @@ import (
 	"quant-trading-v2/internal/trigger"
 )
 
+// buildCommit 构建期注入的 git 提交指纹（-ldflags "-X main.buildCommit=$(git rev-parse --short HEAD)"）。
+// 未注入时显示 "unknown"——用于 §R6 P1-1 部署漂移自检：日志/告警可据此判断线上二进制与代码头是否一致
+// （2026-09-01 实录：广州旧二进制缺 d09c07a 执行器重建修复，开关打开引擎仍用 Noop executor）。
+// 相较仅靠文件时间戳/大小，短 SHA 可与本地 git 直接比对，瞬间定位漂移。
+// English: git short-SHA stamped at build time via -ldflags; "unknown" when not injected. Used by the
+// §R6 P1-1 deployment-drift self-check to detect a binary running behind its source commit.
+var buildCommit = "unknown"
+
 // main 系统入口：初始化数据目录、认证、行情 API、LLM、新闻代理、策略引擎等所有组件，
 // 然后进入主循环，每 5 分钟驱动一次顶层编排引擎（engine.Engine）。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Printf("[deploy] 二进制构建指纹: buildCommit=%s（未注入显示 unknown，用于比对代码头是否一致）", buildCommit)
 
 	// 时区加固：全部交易时段判断基于 time.Local（如 CurrentSession / 主循环 sinceForSession），
 	// 服务器若在海外（如首尔 KST=UTC+9）或系统默认 UTC，会导致开盘/收盘/盘前窗口整体偏移。
@@ -357,6 +366,15 @@ func main() {
 	})
 	srv.SetEngineRegistry(registry)
 
+	// §R6 P1-1 部署漂移自检：启动阶段汇总高影响配置的"声明态 vs 实际生效态"，与二进制指纹一并
+	// 落到 opslog + 启动日志，早期暴露 2026-09-01 三类线上事故（旧二进制缺修复 / LLM key 拼写/
+	// 为空 / QMT enabled 但 gateway_url/token 缺失致 executor 固化 Noop）。
+	// 仅告警不阻断——配置缺失时既有降级逻辑继续兜底，但运维可从日志一眼看出"开关白开"。
+	// English: §R6 P1-1 startup self-check — dumps binary fingerprint + high-impact config summaries
+	// (LLM key sanity, QMT effective executor) to opslog once at boot so the three real incidents from
+	// 2026-09-01 surface immediately. Warning-only: existing fallbacks still apply.
+	verifyDeployment(cfgMgr)
+
 	// 模拟盘账号策略：仅 admin 账号自动按战法建仓/估值；普通用户模拟盘纯手动 + 静态存储。
 	// 同时注入当前启用战法资金池模板（分仓，防单战法垄断）。
 	// English: paper account policy — only admin accounts auto-fill/mark from strategies; normal users'
@@ -669,6 +687,109 @@ func getDataDir() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".quant-trading-v2")
+}
+
+// verifyDeployment §R6 P1-1 部署漂移自检（启动时调用一次，仅告警不阻断）。
+// 目标：把 2026-09-01 三类线上事故（①旧二进制缺执行器重建修复、②LLM key 拼写漂移致全链 401、
+// ③qmt.enabled=true 但 gateway_url/token 缺失 executor 固化 Noop）在启动阶段一眼暴露，而非盘中才发现。
+//
+// 检查项：
+//  1. 二进制 git 指纹（buildCommit，构建期 -ldflags 注入；unknown=未注入需在部署侧排查）。
+//  2. LLM 密钥池健全性：唯一 key 数、可疑长度（<8 截断/拼写漂移常见特征）、含空白字符。
+//  3. QMT 实盘配置一致性：enabled=true 时 gateway_url/token 是否齐备（缺任一 → executor 必为 Noop，
+//     即"开关白开"的根因信号）；mode/price_type 枚举合理性。
+//
+// English: §R6 P1-1 deployment-drift self-check at boot (warning-only). Surfaces three real 2026-09-01
+// incidents at startup: stale binary missing the executor-rebuild fix; LLM key typo → full-chain 401;
+// qmt.enabled=true with missing gateway_url/token pinning the executor to Noop.
+func verifyDeployment(cfgMgr *config.Manager) {
+	// —— 1. 二进制指纹 ——
+	if buildCommit == "" || buildCommit == "unknown" {
+		log.Printf("[deploy] ⚠ 二进制未注入 git 指纹（buildCommit=unknown）：部署脚本已带 -ldflags -X main.buildCommit，请勿手动裸 go build 覆盖线上产物")
+		opslog.Logf("quant", "部署自检: 二进制未注入 git 指纹(建议构建期 -ldflags 注入 buildCommit)")
+	} else {
+		log.Printf("[deploy] 二进制 git 指纹正常: %s", buildCommit)
+	}
+
+	// —— 2. LLM 密钥池 ——
+	var keys []string
+	if raw := os.Getenv("LLM_API_KEYS"); raw != "" {
+		for _, k := range strings.Split(raw, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				keys = append(keys, k)
+			}
+		}
+	}
+	if len(keys) == 0 {
+		if k := os.Getenv("LLM_API_KEY"); k != "" {
+			keys = []string{k}
+		}
+	}
+	seen := map[string]bool{}
+	var uniq []string
+	for _, k := range keys {
+		if !seen[k] {
+			seen[k] = true
+			uniq = append(uniq, k)
+		}
+	}
+	log.Printf("[deploy] LLM 密钥池: 配置 %d 把, 去重后 %d 把", len(keys), len(uniq))
+	for i, k := range uniq {
+		suspicious := len(k) < 8 || strings.ContainsAny(k, " \t\n")
+		if suspicious {
+			log.Printf("[deploy] ⚠ LLM 密钥[%d] 长度=%d 或含空白（疑似截断/拼写漂移, 请核对环境变量）: %s",
+				i+1, len(k), redact(k))
+			opslog.Logf("quant", "部署自检⚠ LLM 密钥[%d]可疑(长度%d), 请核对 LLM_API_KEYS", i+1, len(k))
+		}
+	}
+	if len(keys) != len(uniq) {
+		log.Printf("[deploy] ⚠ LLM 密钥存在重复（配置 %d → 去重 %d），不影响运行但不建议", len(keys), len(uniq))
+	}
+
+	// —— 3. QMT 实盘配置一致性 ——
+	if q := cfgMgr.GetQMTConfigFor(""); q != nil {
+		log.Printf("[deploy] QMT 实盘配置: enabled=%t mode=%s price_type=%s gateway_url=%q token=%q",
+			q.Enabled, q.Mode, q.PriceType, q.GatewayURL, redact(q.Token))
+		if !q.Enabled {
+			log.Printf("[deploy] QMT 实盘当前关闭（enabled=false），实盘链路停用，模拟盘不受影响")
+		} else {
+			missing := []string{}
+			if q.GatewayURL == "" {
+				missing = append(missing, "gateway_url")
+			}
+			if q.Token == "" {
+				missing = append(missing, "token")
+			}
+			if len(missing) > 0 {
+				log.Printf("[deploy] ⚠ QMT enabled=true 但缺少 %v → executor 将固化为 Noop（不真下）, 这是"+
+					"“开关白开”的根因信号，请到量化交易页补全后重启或热更（5s 生效）", missing)
+				opslog.Logf("quant", "部署自检⚠ QMT enabled=true 但缺少 %s, executor=Noop 不真下", strings.Join(missing, ","))
+			} else {
+				log.Printf("[deploy] QMT enabled=true 且 gateway_url/token 齐备 → executor=QMTClient 真实通道（假定已前端热更生效）")
+			}
+			switch q.Mode {
+			case "auto", "manual":
+			default:
+				log.Printf("[deploy] ⚠ QMT mode=%q 非 auto/manual 枚举（可致开关判定异常）", q.Mode)
+			}
+			switch q.PriceType {
+			case "market", "limit":
+			default:
+				log.Printf("[deploy] ⚠ QMT price_type=%q 非 market/limit 枚举（可致废单，参考沪市 price_type 实录）", q.PriceType)
+			}
+		}
+	} else {
+		log.Printf("[deploy] QMT 配置段缺失（GetQMTConfigFor 返回 nil），实盘链路按关闭处理")
+	}
+}
+
+// redact 密钥等敏感串脱敏显示：仅留前 3 位与后 2 位，中间掩码。空串原样返回。
+// English: redacts a secret for logging — keeps first 3 + last 2 chars, masks the rest.
+func redact(s string) string {
+	if len(s) <= 6 {
+		return "****"
+	}
+	return s[:3] + "…" + s[len(s)-2:]
 }
 
 // pickListener §W4-b fail-fast 化：仅尝试绑定 baseAddr 本身；端口被占用即返回 nil 由调用方

@@ -17,7 +17,6 @@ import (
 	"math"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,17 +32,9 @@ import (
 // English: board-aware limit-up threshold for the sealed-board buy guard — main board ~10%,
 // ChiNext/STAR 20%, BSE 30%, ST (name contains "ST") 5%.
 func LimitUpPct(code, name string) float64 {
-	if strings.Contains(strings.ToUpper(name), "ST") {
-		return 4.9
-	}
-	head := strings.Split(code, ".")[0]
-	switch {
-	case strings.HasPrefix(head, "30"), strings.HasPrefix(head, "68"):
-		return 19.9
-	case strings.HasPrefix(head, "4"), strings.HasPrefix(head, "8"), strings.HasPrefix(head, "92"):
-		return 29.9
-	}
-	return 9.9
+	// §R6 P1-4 收敛到 data.LimitUpPct（全系统唯一口径，含北交所 30% 板）。
+	// English: delegated to data.LimitUpPct — single authoritative board-aware threshold.
+	return data.LimitUpPct(code, name)
 }
 
 // Config 模拟盘配置（rules.paper）。

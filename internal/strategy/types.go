@@ -19,7 +19,7 @@ type SignalType string
 
 // 战法信号类型取值（与后端信号落库的 type 字段一致）。
 const (
-	SignalDragon        SignalType = "dragon"         // 龙回头（Dragon）
+	SignalDragon        SignalType = "dragon"         // 龙头（Dragon）
 	SignalDoubleBump    SignalType = "double_bump"    // 双响炮（Double Bump）
 	SignalNShape        SignalType = "n_shape"        // N 形超短（N-shape ultra-short）
 	SignalDragonReturn  SignalType = "dragon_return"  // 龙回头(中线)（Dragon Return, mid-line）

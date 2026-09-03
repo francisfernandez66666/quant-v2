@@ -43,7 +43,7 @@ func TestEvaluateFullSeal(t *testing.T) {
 	d := New(newCfg())
 	si := strongSI()
 	sectors := []data.SectorInfo{{ChangePct: 10}} // 板块共振强
-	ev := d.EvaluateReal("300000", si, klines(10, 12), sectors)
+	ev := d.EvaluateReal("600000", si, klines(10, 12), sectors) // 主板代码：9.9% 贴主板涨停(9.9)→F1 封板
 	if ev == nil {
 		t.Fatal("EvaluateReal 不应返回 nil")
 	}
@@ -54,6 +54,20 @@ func TestEvaluateFullSeal(t *testing.T) {
 		if _, ok := ev.Details[k]; !ok {
 			t.Errorf("明细缺少 %s", k)
 		}
+	}
+}
+
+// TestEvaluateBJNotSealedAtMainLevel §R6 P1-4 北交所显式适配：30% 板下 9.9% 涨幅不判封板（旧硬编码 9.5 误判）。
+func TestEvaluateBJNotSealedAtMainLevel(t *testing.T) {
+	d := New(newCfg())
+	si := strongSI() // ChangePct 9.9
+	ev := d.EvaluateReal("920001", si, klines(10, 12), []data.SectorInfo{{ChangePct: 10}})
+	if ev == nil {
+		t.Fatal("EvaluateReal 不应返回 nil")
+	}
+	// BJ 涨停阈值 29.9，9.9% 未贴近封板 → F1 封板质量必须为 0（不得误判"触及涨停"）
+	if ev.Details["f1_seal"] != 0 {
+		t.Errorf("北交所 9.9%% 涨幅 F1 应=0(未封板), got %.2f", ev.Details["f1_seal"])
 	}
 }
 
