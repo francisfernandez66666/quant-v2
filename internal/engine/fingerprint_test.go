@@ -67,3 +67,35 @@ func TestEngineFingerprintPerUserD1ATR(t *testing.T) {
 		t.Fatal("有覆盖账号不应与默认账号共享指纹")
 	}
 }
+
+// TestEngineFingerprintQMTDifferentiates §修复 FIX#11：QMT 实盘配置差异必须反映到指纹——
+// 否则同战法配置的不同账号共享引擎与同一 QMT 控制器，配置互相覆盖/熔断互相影响（资损链）。
+// English: §FIX#11 regression — Live-trading (QMT) config differences must split the fingerprint,
+// so accounts with different live settings never share one engine (and thus one QMT controller).
+func TestEngineFingerprintQMTDifferentiates(t *testing.T) {
+	mgr := config.NewManager("")
+	mgr.SetStore(&memKV{})
+
+	// A 账号开启实盘（网关 A），B 账号开启实盘（网关 B）——实盘目标不同不得共享引擎
+	mgr.SetQMTConfigFor("userA", &config.QMTConfig{Enabled: true, GatewayURL: "https://gw-a", FixedAmount: 10000})
+	mgr.SetQMTConfigFor("userB", &config.QMTConfig{Enabled: true, GatewayURL: "https://gw-b", FixedAmount: 10000})
+	r := NewRegistry(EngineOptions{CfgMgr: mgr})
+	fpA := r.fingerprint("userA")
+	fpB := r.fingerprint("userB")
+	if fpA == fpB {
+		t.Fatalf("网关不同的账号不应共享引擎: A=%s B=%s", fpA, fpB)
+	}
+	// 无实盘覆盖的账号共享指纹（与默认账号组一致）
+	fpN := r.fingerprint("userN")
+	fpM := r.fingerprint("userM")
+	if fpN != fpM {
+		t.Fatalf("无 QMT 覆盖账号应共享: N=%s M=%s", fpN, fpM)
+	}
+	// 同账号 QMT 数值差异（金额）也改变指纹
+	mgr.SetQMTConfigFor("userC", &config.QMTConfig{Enabled: true, GatewayURL: "https://gw-a", FixedAmount: 10000})
+	fpC := r.fingerprint("userC")
+	mgr.SetQMTConfigFor("userC", &config.QMTConfig{Enabled: true, GatewayURL: "https://gw-a", FixedAmount: 20000})
+	if fpC == r.fingerprint("userC") {
+		t.Fatal("QMT FixedAmount 变化应改变指纹")
+	}
+}

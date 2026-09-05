@@ -28,6 +28,7 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/research"
@@ -303,6 +304,19 @@ func (r *Registry) registerUser(e *Engine, userID string) {
 	}
 	if !seen {
 		r.coreUsers[e] = append(r.coreUsers[e], userID)
+	}
+	// §修复 FIX#11：多账号共享同一计算引擎且实盘（QMT）开启时显式告警——
+	// 共享引擎只有一套 QMT 控制器（首建账号），多账号下任何成员改动配置/熔断将互相影响，
+	// 且实盘账本归属 primaryMember。历史上指纹不含 QMT 段导致同战法配置账号共享实盘控制器。
+	// 告警不阻断（单账号部署/collab 共享无实盘场景无影响）；若确认多账号需要实盘，应按账号拆分引擎。
+	// English: §FIX#11 — when a compute engine is shared by more than one account AND live trading is
+	// on, log an explicit warning (non-blocking): a shared engine carries but one QMT controller,
+	// so members would share breaker/config/books and could cross-affect each other's real trades.
+	if len(r.coreUsers[e]) > 1 && e.QMTEnabled() {
+		log.Printf("[engine] 多账号共享引擎(%d个账号)且实盘开启——共享同一 QMT 控制器,任一成员改 QMT 配置/触发熔断将互相影响;如需多账号实盘请按账号拆分引擎",
+			len(r.coreUsers[e]))
+		opslog.Logf("quant", "多账号共享引擎且实盘开启(%d个账号)：共享 QMT 控制器存在互相覆盖/熔断风险",
+			len(r.coreUsers[e]))
 	}
 	// §GAP2-W2 成员接线（I-2 根修）：把服务账号全集注入引擎——
 	// ①私有消息/SSE 扇出按成员路由；②单成员引擎同步固化 userID，恢复账号级配置热同步
@@ -694,6 +708,7 @@ func (r *Registry) build(userID string) *Engine {
 		onAlert := func(level, title, content string) {}
 		if opts.Notifier != nil {
 			onAlert = func(level, title, content string) {
+				// 通用级别映射：仅支持 high/low 两档，其余归中档。
 				notifyLevel := notify.LevelMedium
 				switch level {
 				case "high":
@@ -874,17 +889,25 @@ func (r *Registry) refreshAll() {
 }
 
 // fingerprint 计算账号的战法配置指纹：序列化影响战法结果的全部配置
-// （策略参数 + Laodeng + 做多/做空开关 + 持仓提醒阈值 + D1 重试），
+// （策略参数 + Laodeng + 做多/做空开关 + 持仓提醒阈值 + D1 重试 + §修复 FIX#11 QMT 实盘段），
 // 指纹一致的账号共享同一计算引擎（战法只算一遍）。
+// §修复 FIX#11（2026-09-04）：指纹追加 QMT 关键字段——不同实盘配置（enabled/gateway/金额/黑名单/
+// 白名单等）的账号若因 QMT 段不同而被区分开，将各自构建独立引擎，绝不共享同一实盘控制器，
+// 根除"同指纹账号共享引擎时 QMT 配置互相覆盖、账目错位、熔断互相影响"的资损链。
 // English: computes an account's strategy-config fingerprint from every setting that affects
 // strategy results (strategy params + Laodeng + long/short toggles + position-alert threshold +
-// D1 retries). Accounts with equal fingerprints share one compute engine (the strategy runs once).
+// D1 retries + §FIX#11 the live-trading/QMT segment). Accounts with equal fingerprints share one
+// compute engine (the strategy runs once). §FIX#11 — the fingerprint now also includes the QMT
+// live-trading keys, so accounts with materially different live configs never share one controller
+// (QMT overlap / book mismatch / shared circuit-breaker are capital-loss-grade).
 func (r *Registry) fingerprint(userID string) string {
 	opts := r.opts
 	// §P1-C 指纹补全：原指纹漏掉 D1 事件规则与 ATR 止损（均为账号级可覆盖项），
 	// 导致两账号 D1/ATR 不同却共享同一引擎 → 战法结果互相串味。此处纳入账号级 D1 与
 	// 持仓 ATR/跌幅阈值（均走 per-user getter），确保"配置不同则引擎不同"。
 	pos := opts.CfgMgr.GetRulesFor(userID).Position
+	// §FIX#11 QMT 实盘配置（账号级 getter；排除 Token 等敏感字段，仅取行为关键项）
+	q := opts.CfgMgr.GetQMTConfigFor(userID)
 	// f 指纹参与字段（账号级可覆盖项，配置不同则引擎不同）。
 	type f struct {
 		Strategy  *config.StrategyConfig
@@ -897,7 +920,19 @@ func (r *Registry) fingerprint(userID string) string {
 			Enabled bool
 			Mult    float64
 		}
+		QMT struct {
+			Enabled      bool     // 实盘开关
+			Mode         string   // auto/manual
+			GatewayURL   string   // 网关地址（不同网关绝不可同控制器）
+			PriceType    string   // 报价类型
+			FixedAmount  float64  // 单票金额
+			MaxPositions int      // 持仓上限
+			AutoSell     bool     // 自动卖出
+			Strategies   []string // 策略白名单
+			Blacklist    []string // 黑名单
+		}
 	}
+	// 组装控制器指纹字段并序列化：策略/长空/盘前跌停/ATR 等配置逐项透传。
 	fp := f{
 		Strategy:  opts.CfgMgr.GetStrategyConfigFor(userID),
 		Laodeng:   &opts.CfgMgr.Rules.Laodeng,
@@ -909,6 +944,20 @@ func (r *Registry) fingerprint(userID string) string {
 			Enabled bool
 			Mult    float64
 		}{pos.ATREnabled, pos.ATRStopMult},
+	}
+	// 实盘启用时附带 QMT 网关参数（开关/模式/价格类型/白名单等）。
+	if q != nil {
+		fp.QMT = struct {
+			Enabled      bool
+			Mode         string
+			GatewayURL   string
+			PriceType    string
+			FixedAmount  float64
+			MaxPositions int
+			AutoSell     bool
+			Strategies   []string
+			Blacklist    []string
+		}{q.Enabled, q.Mode, q.GatewayURL, q.PriceType, q.FixedAmount, q.MaxPositions, q.AutoSell, q.Strategies, q.Blacklist}
 	}
 	b, err := json.Marshal(fp)
 	if err != nil {

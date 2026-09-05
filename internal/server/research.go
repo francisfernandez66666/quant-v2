@@ -105,6 +105,7 @@ func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 503, "研究库未接入")
 		return
 	}
+	// 60s 缓存：命中则直接返回上次结果，避免高频轮询重复统计。
 	progressCache.mu.Lock()
 	if progressCache.body != nil && time.Since(progressCache.at) < 60*time.Second {
 		body := progressCache.body
@@ -117,6 +118,7 @@ func (s *Server) handleResearchProgress(w http.ResponseWriter, r *http.Request) 
 	if body == nil {
 		return
 	}
+	// 未命中缓存时重新统计并刷新缓存。
 	progressCache.mu.Lock()
 	progressCache.at, progressCache.body = time.Now(), body
 	progressCache.mu.Unlock()
@@ -183,6 +185,7 @@ func (s *Server) computeResearchProgress(w http.ResponseWriter) map[string]any {
 			ds = "同花顺（新）"
 		}
 	}
+	// 汇总研究进度统计并返回：各数据源覆盖量、就绪比、候选/已应用数。
 	return map[string]any{
 		"stocks":       nStocks,
 		"ready_stocks": ready,

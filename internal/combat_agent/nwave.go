@@ -126,8 +126,15 @@ func (t *WaveTracker) Eval(code string, md *strategy_engine.StockMarketData) (le
 	// today's unfinished bar to avoid look-ahead bias.
 	avgDailyVol := avgVol(md.KLines[:len(md.KLines)-1], 20)
 	volRatio := 0.0
-	if avgDailyVol > 0 {
-		volRatio = (cumVol * 100) / avgDailyVol
+	if avgDailyVol > 0 && md.Quote != nil {
+		// §修复 P2#26：盘中时间窗归一——旧公式 cumVol*100/avgDailyVol 把「实时累计量」直接
+		// 对「全日均量」，上午累计量天然偏小→量比被稀释，同一放量在开盘半小时只显示 1/5
+		// 强度，早盘一突经常因"量比达标前量不足"被误杀。现在按已流逝交易分钟折算全天等值
+		// 量再与均量比较，量比口径任意时刻与收盘一致。
+		// English: P2#26 — time-normalize the intraday cumulative volume to a full-day equivalent before
+		// comparing with the daily average; otherwise a morning breakout's volume ratio is diluted ~5x
+		// and the 一突 signal is wrongly killed early in the session.
+		volRatio = intradayVolumeRatio(time.Now(), md.Quote.Volume, avgDailyVol)
 	}
 	isFirst := cur > prevHigh*firstBreakPct && cumVol > 0 && volRatio >= firstBreakRatio
 	if isFirst {

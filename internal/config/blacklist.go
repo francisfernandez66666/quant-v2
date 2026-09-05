@@ -6,6 +6,7 @@
 //   - 条目与请求代码均剥离交易所后缀（.SH/.SZ/.BJ 及首个 . 之后的部分）
 //   - 按纯数字前缀比对（600519 匹配 600519.SH）
 //   - 空列表/空代码恒为 false
+//
 // English: R3-8 P1-H — the single canonical blacklist matcher. The risk layer used exact string
 // equality while the execution layer normalized exchange suffixes; the same configured entry could
 // pass one layer and be blocked by the other. Both now call this.

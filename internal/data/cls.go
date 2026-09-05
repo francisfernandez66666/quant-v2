@@ -139,6 +139,7 @@ func parseCLSNews(body []byte) ([]NewsItem, error) {
 	}
 
 	items := make([]NewsItem, 0, len(raw.Data.RollData))
+	// 逐条滚屏新闻：空标题跳过，时间戳转北京时间格式，关联股票取名称列表。
 	for _, r := range raw.Data.RollData {
 		if r.Title == "" {
 			continue

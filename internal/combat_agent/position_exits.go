@@ -198,9 +198,13 @@ func SellAction(s Signal) string {
 		return "" // 做空方向词是开仓方向语义，不是卖出提醒
 	}
 	switch s.AlertType {
-	case "清仓":
+	case "清仓", "利空抛售":
+		// FIX#13：利空归因命中持仓 → 直接清仓（用户决策：收到关联持仓的利空消息自动清仓，
+		// 而非此前的半仓 trim——利空事件风险不对称，先避险优先）。
+		// English: FIX#13 — bearish-attribution hits now close fully (user decision), not half-trim;
+		// bearish events carry one-sided downside risk, so exiting first is the priority.
 		return "close"
-	case "减仓", "利空抛售":
+	case "减仓":
 		return "trim"
 	}
 	switch s.Action {
@@ -267,11 +271,19 @@ func genericTrailingExitWith(ctx *strategy.ExitContext, now time.Time, trailPct 
 		return &strategy.ExitResult{Reason: "回撤止损(移动止盈)", Priority: strategy.P2}
 	}
 	// 超期：持仓超过上限未完成形态，强制离场提醒
+	// §修复 FIX#10（2026-09-04）：持有天数改按交易日计——旧实现用自然日（now.Sub(entry).Hours()/24），
+	// 周末/节假日全被算作持仓日：周五买入下周一即 3 天、跨长假隔周即判 8 天超期提前离场提醒。
+	// 现以 data.AddTradingDays 从入场日推 maxHoldDays 个交易日作为截止日，仅当今天≥截止日才触发。
+	// English: §FIX#10 — the hold-timeout now counts trading days, not calendar days. The old natural-day
+	// math made weekends/holidays count as holding days (buy Friday → "3 days" by Monday, or a week-long
+	// break → premature 8-day timeout alerts). The deadline is now entry + maxHoldDays trading days
+	// (data.AddTradingDays), and the exit fires only once today ≥ that deadline.
 	if ctx.EntryAt != "" {
 		entryDate, err := time.Parse("2006-01-02", ctx.EntryAt)
 		if err == nil {
-			days := int(now.Sub(entryDate).Hours() / 24)
-			if days >= maxHoldDays {
+			deadline := data.AddTradingDays(entryDate.Format("20060102"), maxHoldDays)
+			today := data.TradingDayDate(now)
+			if today >= deadline {
 				return &strategy.ExitResult{Reason: "持仓超期离场", Priority: strategy.P3}
 			}
 		}
@@ -414,6 +426,7 @@ func (a *Agent) BearishAttributionAlerts(rpt *report.Report, quotes map[string]*
 		return nil
 	}
 	var alerts []Signal
+	// 逐持仓检查利空归因命中：仅多头（跳过做空），用实时价覆盖入场价生成卖出提醒。
 	for _, pos := range positions {
 		if pos.Direction == "做空" {
 			continue

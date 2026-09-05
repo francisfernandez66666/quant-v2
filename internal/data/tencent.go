@@ -112,6 +112,7 @@ func (m *MarketAPI) GetTencentKLine(code string, count int) ([]KLine, error) {
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return nil, fmt.Errorf("tencent kline json: %v", err)
 		}
+		// 以代码为键取该股票 K 线，优先前复权，缺失时回退未复权。
 		stk, ok := raw.Data[tencentPrefix(code)+code]
 		if !ok {
 			return nil, fmt.Errorf("tencent kline missing symbol")
@@ -139,6 +140,7 @@ func (m *MarketAPI) GetTencentMinuteKLine(code string, scale, count int) ([]KLin
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return nil, fmt.Errorf("tencent minute kline json: %v", err)
 		}
+		// 以代码为键取分钟线数据，取分钟数组（minute）解析为 KLine。
 		stk, ok := raw.Data[tencentPrefix(code)+code]
 		if !ok {
 			return nil, fmt.Errorf("tencent minute kline missing symbol")

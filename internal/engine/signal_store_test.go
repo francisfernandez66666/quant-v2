@@ -8,6 +8,7 @@ import (
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -150,6 +151,42 @@ func TestInvalidateBrokenSignalsKeepsAboveTrigger(t *testing.T) {
 	if e.signalStore.IsInvalidated("600001", "n_shape") {
 		t.Fatal("现价未跌破触发价不应打墓碑")
 	}
+}
+
+// TestInvalidateBrokenSignalsSkipsHeld P2#24 回归：已持有持仓的信号不打失效墓碑——
+// 买入成交后现价跌破触发价只是浮亏，不是"买入依据破坏"，固化信号/消息中心条目必须保留。
+// English: P2#24 regression — signals of currently-held codes are exempt from invalidation tombstones:
+// a filled position breaking below its trigger is a floating loss, not a "broken buy premise"; the pinned
+// signal and its message-center entry must survive.
+func TestInvalidateBrokenSignalsSkipsHeld(t *testing.T) {
+	e := invalidateTestEngine()
+	at := time.Now()
+	e.signalStore.Upsert([]combat_agent.Signal{mkBuySig("600001", "n_shape", at)})
+	e.msgStore.Sync([]data.MessageItem{{ID: "600001@交易信号@n_shape", Code: "600001"}})
+
+	// 装配 report 账本：600001 处于持仓中（已买入成交）——userID 需与 HeldPositionCodesFor 过滤口径一致
+	rpt := report.New(filepath.Join(t.TempDir(), "rpt.json"))
+	rpt.LogSignalWithMetaQty("S1", "600001", "测试", "做多", "n_shape", 10, 0, 0, 100, nil)
+	e.rpt = rpt
+	e.userID = ""
+
+	md := map[string]*strategy_engine.StockMarketData{
+		"600001": {Code: "600001", Price: 9.5, Quote: &data.StockInfo{Price: 9.5}},
+	}
+	e.invalidateBrokenSignals(md, nil)
+
+	if len(e.signalStore.List()) != 1 {
+		t.Fatalf("已持有持仓的信号不应被墓碑移除, got %+v", e.signalStore.List())
+	}
+	if e.signalStore.IsInvalidated("600001", "n_shape") {
+		t.Fatal("已持有持仓的信号不应打失效墓碑")
+	}
+	for _, m := range e.msgStore.List() {
+		if m.ID == "600001@交易信号@n_shape" {
+			return // 消息中心条目保留 ✓
+		}
+	}
+	t.Fatal("已持有持仓的信号消息中心条目应保留")
 }
 
 // TestInvalidateBrokenSignalsSkipsShortAndMissing 验证：做空信号不受墓碑影响；

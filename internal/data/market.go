@@ -8,13 +8,13 @@
 package data
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
-	"bytes"
 	urlpkg "net/url"
 	"regexp"
 	"sort"
@@ -413,6 +413,7 @@ func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
 	if err != nil {
 		return out
 	}
+	// 携带浏览器 UA/Referer，规避新浪对脚本请求的限流或拒绝。
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://finance.sina.com.cn")
 	resp, err := m.client.Do(req)
@@ -424,6 +425,7 @@ func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
 	if err != nil {
 		return out
 	}
+	// 新浪返回 GBK 编码，转 UTF-8 后按 CSV 文本解析。
 	utfBody, _, _ := transform.String(simplifiedchinese.GBK.NewDecoder(), string(body))
 	for _, mch := range sinaQuoteRe.FindAllStringSubmatch(utfBody, -1) {
 		if len(mch) < 3 {
@@ -648,6 +650,7 @@ func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
 	if err != nil {
 		return out
 	}
+	// 携带浏览器 UA/Referer，规避腾讯对脚本请求的限流或拒绝。
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://gu.qq.com/")
 	resp, err := m.client.Do(req)
@@ -659,6 +662,7 @@ func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
 	if err != nil {
 		return out
 	}
+	// 腾讯返回 GBK 编码，转 UTF-8 后按 ~ 分隔 CSV 解析。
 	utfBody, _, _ := transform.String(simplifiedchinese.GBK.NewDecoder(), string(body))
 	for _, mch := range tencentQuoteRe.FindAllStringSubmatch(utfBody, -1) {
 		if len(mch) < 3 {
@@ -669,6 +673,7 @@ func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
 		if len(fields) < 35 {
 			continue
 		}
+		// 腾讯行情字段索引：1名称 3现价 4昨收 5今开 6成交量 32涨跌幅 33最高 34最低。
 		price, _ := strconv.ParseFloat(fields[3], 64)
 		prevClose, _ := strconv.ParseFloat(fields[4], 64)
 		chg, _ := strconv.ParseFloat(fields[32], 64)
@@ -731,6 +736,7 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	if raw.Data.F43 == 0 {
 		return nil, fmt.Errorf("eastmoney: no data for %s", code)
 	}
+	// 组装 StockInfo：价格类字段以「分」为单位需 ÷100，成交量以「手」计需 ×100 换算为股。
 	volHands := raw.Data.F47
 	amount := raw.Data.F48
 	if amount == 0 {
@@ -901,6 +907,7 @@ func parseSectorStocks(body []byte) ([]StockInfo, error) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("eastmoney sector stocks json: %v", err)
 	}
+	// 逐行组装板块成分股列表（价格字段以「分」为单位需 ÷100，涨跌幅为 ×100 的千分数）。
 	stocks := make([]StockInfo, 0, len(raw.Data.Items))
 	for _, item := range raw.Data.Items {
 		if item.F12 == "" {
@@ -985,6 +992,7 @@ func (m *MarketAPI) GetSinaMinuteKLine(code string, scale, count int) ([]KLine, 
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://finance.sina.com.cn")
+	// 发送请求并读取响应体，随后解析 JSON K 线数组。
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sina minute kline http: %v", err)
@@ -1216,6 +1224,7 @@ func parseSinaNews(body []byte) ([]NewsItem, error) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("sina news json: %v", err)
 	}
+	// 逐条组装新浪财经新闻（空标题跳过）。
 	items := make([]NewsItem, 0, len(raw.Result.Data))
 	for _, r := range raw.Result.Data {
 		if r.Title == "" {
@@ -1373,6 +1382,7 @@ func parseTonghuashunNews(body []byte) ([]NewsItem, error) {
 	if raw.Code != "200" {
 		return nil, fmt.Errorf("ths news code=%s", raw.Code)
 	}
+	// 逐条组装同花顺快讯：发布时间为 Unix 秒戳，解析失败则留空时间。
 	items := make([]NewsItem, 0, len(raw.Data.List))
 	for _, r := range raw.Data.List {
 		if r.Title == "" {
@@ -1470,6 +1480,7 @@ func extractArticleDiv(html, marker string) string {
 	}
 	start := i + gt + 1
 
+	// 用 <div> 标签配对深度找到起始 <div> 的闭合位置（提取目标 div 内部 HTML）。
 	depth := 1
 	pos := start
 	for depth > 0 && pos < len(html) {
@@ -1496,6 +1507,7 @@ func extractArticleDiv(html, marker string) string {
 	}
 	raw := html[start:pos]
 
+	// 清洗 HTML：剥标签、还原常见实体、压缩空白为单空格。
 	raw = htmlTagRe.ReplaceAllString(raw, " ")
 	raw = strings.ReplaceAll(raw, "&nbsp;", " ")
 	raw = strings.ReplaceAll(raw, "&quot;", "\"")
@@ -1549,6 +1561,7 @@ func parseEastMoneyIPO(body []byte) ([]IPOEvent, error) {
 		return nil, fmt.Errorf("eastmoney ipo: API returned success=false")
 	}
 	today := time.Now().Format("20060102")
+	// 逐条组装 IPO 日历事件：代码去除市场后缀，仅保留 T 日及之后的上市计划。
 	items := make([]IPOEvent, 0, len(raw.Result.Data))
 	for _, r := range raw.Result.Data {
 		code := r.SecurityCode
@@ -1905,6 +1918,7 @@ func (m *MarketAPI) GetStockPEAt(code string, price float64) float64 {
 	if err := json.Unmarshal(body, &raw); err != nil || raw.Data == nil || len(raw.Data.Diff) == 0 {
 		return 0
 	}
+	// 取查询命中的首行，PE 非正视为无效；命中后写缓存，并用缓存价与实时价按比例修正。
 	item := raw.Data.Diff[0]
 	if item.PE <= 0 {
 		return 0
@@ -1956,6 +1970,7 @@ func (m *MarketAPI) GetStockList() (map[string]string, error) {
 	if raw.Data == nil || len(raw.Data.Diff) == 0 {
 		return nil, nil
 	}
+	// 组装 名称→代码 映射（空代码或空名称跳过）。
 	result := make(map[string]string, len(raw.Data.Diff))
 	for _, item := range raw.Data.Diff {
 		if item.Code == "" || item.Name == "" {
@@ -2027,6 +2042,7 @@ func (m *MarketAPI) fetchSinaStockPage(page int) ([]sinaStockItemRaw, error) {
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://finance.sina.com.cn")
+	// 发送请求并读取响应体，随后解析 JSON 股票列表。
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sina stock list http: %v", err)

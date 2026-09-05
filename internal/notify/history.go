@@ -61,6 +61,7 @@ func (h *History) Record(sig *SignalRecord) {
 
 	h.records = append(h.records, *sig)
 
+	// 配置了 CSV writer 时同步追加一行信号记录并落盘。
 	if h.writer != nil {
 		record := []string{
 			sig.Time.Format("2006-01-02 15:04:05"),

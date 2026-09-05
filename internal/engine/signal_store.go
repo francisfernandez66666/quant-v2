@@ -34,12 +34,13 @@ type signalStoreFile struct {
 //   - Invalidate: 标记信号失效（失效墓碑），当日该 key 不再允许固化
 //   - IsInvalidated: 判断 code@strategy 今日是否已被失效墓碑标记
 //   - List: 返回当日固化信号列表供聚合器展示
+//
 // English: pinned-signal store keyed by code@strategy; validates the trading day on load and
 // automatically resets to an empty day-bucket when the day rolls over.
 type signalStore struct {
-	mu    sync.Mutex                                // 保护 byKey/invalidated 的互斥锁
-	path  string                                    // 磁盘持久化路径（空=不落盘）
-	byKey map[string]combat_agent.Signal            // code@strategy → 最近一次 Pass 信号
+	mu    sync.Mutex                     // 保护 byKey/invalidated 的互斥锁
+	path  string                         // 磁盘持久化路径（空=不落盘）
+	byKey map[string]combat_agent.Signal // code@strategy → 最近一次 Pass 信号
 	// invalidated 失效墓碑集合：已被标记失效的 key 当日不允许重新固化（防"假信号复活"）。
 	// 一旦标记，即使后续轮次重新产生同 key 信号也会被跳过。
 	// English: tombstone set — invalidated keys can't be re-pinned for the rest of the day.
@@ -62,6 +63,7 @@ func newSignalStore(path string) *signalStore {
 		log.Printf("[engine] signal_store 解析失败: %v", err)
 		return s
 	}
+	// 仅载入当前交易日的固化信号（昨日数据一律忽略），按 code@strategy 建索引。
 	if f.TradingDay != data.TradingDayDate(time.Now()) {
 		return s
 	}
@@ -99,6 +101,7 @@ func (s *signalStore) Upsert(sigs []combat_agent.Signal) {
 		if sig.Direction != "做多" && sig.Direction != "做空" {
 			continue
 		}
+		// 仅交易型信号入固化库：已失效墓碑或更新时间不回退则跳过。
 		key := sig.Code + "@" + sig.Strategy
 		if s.invalidated[key] {
 			continue

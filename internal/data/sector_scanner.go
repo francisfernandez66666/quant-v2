@@ -142,20 +142,24 @@ func fSeriesScore(s SectorInfo, maxLimitup int, maxAmt, maxInflow float64) float
 	score := 0.0
 	parts := 0
 
+	// 涨停家数相对最大值的 40 分权重（最高 40 分）。
 	if maxLimitup > 0 {
 		score += float64(s.LimitupCnt) / float64(maxLimitup) * 40
 		parts++
 	}
+	// 板块涨跌幅：上涨时 2 倍加权，下跌按原值计入。
 	if s.ChangePct > 0 {
 		score += s.ChangePct * 2
 		parts++
 	} else {
 		score += s.ChangePct
 	}
+	// 成交额相对最大值的 20 分权重。
 	if maxAmt > 0 {
 		score += s.Amount / maxAmt * 20
 		parts++
 	}
+	// 主力净流入相对最大值的 15 分权重。
 	if maxInflow > 0 {
 		inflowScore := s.NetInflow / maxInflow * 15
 		score += inflowScore

@@ -30,7 +30,7 @@ func d1BoostDragonMD() *strategy_engine.StockMarketData {
 		}
 	}
 	return &strategy_engine.StockMarketData{
-		Code: "300000", Name: "强势股",
+		Code: "000001", Name: "强势股",
 		Price: 11, ChangePct: 9.9,
 		Quote:  &data.StockInfo{Price: 11, ChangePct: 9.9, Volume: 1e7, Amount: 1e8},
 		KLines: ks,
@@ -123,12 +123,12 @@ func TestD1BoostDragonEndToEnd(t *testing.T) {
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: dragon.New(cfg)}})
 
-	pool := map[string]*strategy_engine.StockMarketData{"300000": d1BoostDragonMD()}
+	pool := map[string]*strategy_engine.StockMarketData{"000001": d1BoostDragonMD()}
 
 	// 对照组：无 D1（Score=0）→ dragon 62 ≥60（放宽后买入层级）→ 直接 buy
 	// English: Control group: no D1 (Score=0) → dragon 62 ≥60 (relaxed buy gate) → buy directly.
-	_, sigsNo := a.ScorePool([]string{"300000"}, pool, map[string]D1Score{}, "")
-	if !hasDragonAction(sigsNo, "300000", "buy") {
+	_, sigsNo := a.ScorePool([]string{"000001"}, pool, map[string]D1Score{}, "")
+	if !hasDragonAction(sigsNo, "000001", "buy") {
 		t.Fatalf("放宽到60后 dragon 62 无加成也应发 buy, got %+v", sigsNo)
 	}
 
@@ -137,8 +137,8 @@ func TestD1BoostDragonEndToEnd(t *testing.T) {
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: dragon.New(cfg)}})
-	_, sigsBoost := a2.ScorePool([]string{"300000"}, pool, map[string]D1Score{"300000": {Code: "300000", Score: 40, Blocked: false}}, "")
-	if !hasDragonAction(sigsBoost, "300000", "buy") {
+	_, sigsBoost := a2.ScorePool([]string{"000001"}, pool, map[string]D1Score{"000001": {Code: "000001", Score: 40, Blocked: false}}, "")
+	if !hasDragonAction(sigsBoost, "000001", "buy") {
 		t.Fatalf("D1=40 软加成后应升级为 dragon buy, got %+v", sigsBoost)
 	}
 }
@@ -173,13 +173,13 @@ func TestD1BlockedAnnotatesButNotVetoes(t *testing.T) {
 	a.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: &fakeAlwaysPass{}}})
 
-	pool := map[string]*strategy_engine.StockMarketData{"300000": d1BoostDragonMD()}
+	pool := map[string]*strategy_engine.StockMarketData{"000001": d1BoostDragonMD()}
 
-	_, sigs := a.ScorePool([]string{"300000"}, pool,
-		map[string]D1Score{"300000": {Code: "300000", Score: 30, Blocked: true, Reason: "立案调查"}}, "")
+	_, sigs := a.ScorePool([]string{"000001"}, pool,
+		map[string]D1Score{"000001": {Code: "000001", Score: 30, Blocked: true, Reason: "立案调查"}}, "")
 	found := 0
 	for _, sg := range sigs {
-		if sg.Code == "300000" && strings.Contains(sg.Reason, "LLM利空提示") {
+		if sg.Code == "000001" && strings.Contains(sg.Reason, "LLM利空提示") {
 			found++
 		}
 	}
@@ -191,9 +191,9 @@ func TestD1BlockedAnnotatesButNotVetoes(t *testing.T) {
 	a2 := New(cfg.GetStrategyConfig())
 	a2.SetD1Config(&config.D1Config{BoostWeight: 0.15, BoostThreshold: 8})
 	a2.SetRunners([]StrategyRunner{{Type: strategy.SignalDragon, Strategy: &fakeAlwaysPass{}}})
-	_, sigs2 := a2.ScorePool([]string{"300000"}, pool,
-		map[string]D1Score{"300000": {Code: "300000", Score: 30, Blocked: false}}, "")
-	if !hasDragonAction(sigs2, "300000", "buy") {
+	_, sigs2 := a2.ScorePool([]string{"000001"}, pool,
+		map[string]D1Score{"000001": {Code: "000001", Score: 30, Blocked: false}}, "")
+	if !hasDragonAction(sigs2, "000001", "buy") {
 		t.Fatalf("对照组应正常产出 dragon buy, got %+v", sigs2)
 	}
 	for _, sg := range sigs2 {

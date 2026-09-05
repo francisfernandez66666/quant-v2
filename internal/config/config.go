@@ -6,6 +6,7 @@
 //   - 风控/止损/仓位管理参数
 //   - 模拟盘/实盘 QMT 交易配置
 //   - 运行时内存治理/数据源/调度器/通知推送等
+//
 // 顶层 Rules 结构体聚合所有配置，Manager 负责加载/保存/按账号隔离。
 package config
 
@@ -1330,6 +1331,7 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 		log.Printf("[scheduler] 解析配置 %s 失败(用默认): %v", path, err)
 		return def
 	}
+	// 覆盖 data 段字段（仅显式出现的项生效）。
 	if wrapper.Rules.Data.OptimizeEnabled != nil {
 		def.OptimizeEnabled = *wrapper.Rules.Data.OptimizeEnabled
 	}
@@ -1337,6 +1339,7 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 		def.PrimarySource = wrapper.Rules.Data.PrimarySource
 	}
 	def.ThsFactorsReady = wrapper.Rules.Data.ThsFactorsReady
+	// scheduler 段缺失/为 null 时直接返回默认值。
 	raw := wrapper.Rules.Scheduler
 	if len(raw) == 0 || string(raw) == "null" {
 		return def
@@ -1346,6 +1349,7 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 		log.Printf("[scheduler] 解析 scheduler 段失败(用默认): %v", err)
 		return def
 	}
+	// 逐项覆盖顶层 scheduler 字段与嵌套 nightly / dataload_during_trading 子段。
 	out := def
 	if v, ok := cfgBool(m, "enabled"); ok {
 		out.Enabled = v

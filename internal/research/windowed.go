@@ -420,6 +420,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 	if len(opts.Factors) == 0 {
 		return OptResult{Reason: "因子池为空"}
 	}
+	// 参数缺省填充（Horizon/MinStocks/MaxIter/Step）。
 	if opts.Horizon <= 0 {
 		opts.Horizon = 5
 	}
@@ -432,6 +433,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 	if opts.Step <= 0 {
 		opts.Step = 0.1
 	}
+	// 坐标上升贪心搜索：逐因子逐方向试探权重微调，采纳更优者直至一轮无改进。
 	w := make(map[string]float64, len(opts.Factors))
 	for _, f := range opts.Factors {
 		w[f] = 1.0

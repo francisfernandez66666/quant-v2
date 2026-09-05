@@ -7,6 +7,8 @@
 package combat_agent
 
 import (
+	"log"
+	"sync"
 	"time"
 
 	"quant-trading-v2/internal/config"
@@ -18,13 +20,37 @@ import (
 // English: default macro-event levels that trigger the gate (index-futures delivery day).
 var macroGateLevels = []string{"contract"}
 
-// macroEventsAt 返回指定时刻处于影响期/临近的宏观事件（生成当年全部事件后筛选）。
-// 供宏观利空门控判断使用；按天生成成本低，直接每次调用即可。
-// English: returns the macro events within their impact window at the given instant (generates the
-// year's full calendar then filters). Cheap enough to call per eval; used by the E1 macro gate.
+// macroEventsAt 返回指定时刻处于影响期/临近的宏观事件。
+// §修复 P2#27：全年生成结果按年份缓存——旧实现每次调用都重建当年全部日历
+// （GenMacroEvents 参数补丁设定为空，循环生成 40+ 事件），主循环/近实时每 ~5s 评估一次，
+// 纯计算浪费且随 call 频率线性放大。缓存后同一自然年内仅生成一次。
+// English: P2#27 — cache the generated year calendar: the old call rebuilt the entire year's event
+// list per eval (GenMacroEvents with a nil patch builds 40+ events per loop), recomputed every ~5s
+// in the main/near-realtime cycles for pure CPU waste. Now generated once per calendar year.
 func macroEventsAt(now time.Time) []data.MacroEvent {
-	return data.GetActiveMacroEvents(data.GenMacroEvents(now.Year(), nil), now)
+	return data.GetActiveMacroEvents(macroEventsCache(now.Year()), now)
 }
+
+// macroEventsCache 按年缓存宏观事件日历（跨年自动重建；并发安全）。
+// English: macroEventsCache caches the macro-event calendar per year (rebuilt on year rollover; concurrency-safe).
+func macroEventsCache(year int) []data.MacroEvent {
+	macroCalMu.Lock()
+	defer macroCalMu.Unlock()
+	if macroCalYear == year {
+		return macroCalEvents
+	}
+	log.Printf("[macro] 生成 %d 年宏观日历缓存", year)
+	macroCalYear = year
+	macroCalEvents = data.GenMacroEvents(year, nil)
+	return macroCalEvents
+}
+
+// macroCalMu/macroCalYear/macroCalEvents 全年日历缓存（P2#27）。
+var (
+	macroCalMu     sync.Mutex
+	macroCalYear   int
+	macroCalEvents []data.MacroEvent
+)
 
 // macroEventsNow 返回当前时刻处于影响期/临近的宏观事件（宏门控运行入口）。
 // English: macro events within their impact window at the current instant (E1 gate entry point).

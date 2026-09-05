@@ -62,6 +62,7 @@ func (r *RPSManager) Update(sectors []SectorRPS) {
 
 	r.sectors = sectors
 
+	// 取主板块或 RPS20≥85 的强势板块，按 RPS20 降序截取前 5 作为强势板块榜。
 	var top []SectorRPS
 	for _, s := range sectors {
 		if s.IsMain || s.RPS20 >= 85 {

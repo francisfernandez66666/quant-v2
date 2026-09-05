@@ -112,6 +112,7 @@ func ApplyFactorRule(dataDir string, c *store.Candidate) error {
 	}
 	var factors []string
 	json.Unmarshal([]byte(c.Factors), &factors)
+	// 组装战法条目：BuyThreshold 缺省 70，其余字段直接透传候选。
 	entry := AppliedFactorEntry{
 		ID:           "fac_" + strconv.FormatInt(c.ID, 10),
 		Name:         "因子战法#" + strconv.FormatInt(c.ID, 10),
@@ -633,6 +634,7 @@ func ApplyOptimizationParams(dataDir, kind string, takeProfitPct, stopLossPct fl
 		return saveAppliedFactors(dataDir, entries)
 	}
 	if strings.HasPrefix(kind, "pat_") {
+		// pattern 规则：按 ID 定位后仅覆盖传入的非零退出参数（止盈/止损/持有天数/最低分）。
 		entries, err := ListAppliedPatternRules(dataDir)
 		if err != nil {
 			return err

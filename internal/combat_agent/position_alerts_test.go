@@ -94,22 +94,47 @@ func TestCheckPositionAlerts_SignalActiveDowngradesToHint(t *testing.T) {
 	}
 }
 
-// TestCheckPositionAlerts_StopLossDowngrade 做多止损未出现利空确认 → 降级为"提示"观察（可能洗盘）。
-// English: TestCheckPositionAlerts_StopLossDowngrade a long stop-loss without a bearish confirmation → downgraded to a "hint" for observation (possibly a shakeout).
-func TestCheckPositionAlerts_StopLossDowngrade(t *testing.T) {
+// TestCheckPositionAlerts_StopLossTrimFirst FIX#12 做多止损未出现利空确认且未深度破位 → 减仓（半仓自动退出）。
+// English: TestCheckPositionAlerts_StopLossTrimFirst (FIX#12) a long stop-loss without a bearish
+// confirmation and without a deep breach → trim alert (auto half-exit).
+func TestCheckPositionAlerts_StopLossTrimFirst(t *testing.T) {
 	a, rpt, m := newAlertTestRig(t)
-	// 开仓 10 元，止损 5%（现价 8.00 → 盈亏 -20% ≤ -5% 触发）
-	// English: Opened at 10, stop-loss 5% (current price 8.00 → P&L -20% ≤ -5% triggers).
+	// 开仓 10 元，止损 5%（现价 9.20 → 盈亏 -8% ≤ -5% 触发，且 -8% > -10% 未深度破位）
+	// English: Opened at 10, stop-loss 5% (current price 9.20 → P&L -8% ≤ -5%, and -8% > -10% not a deep breach).
 	rpt.LogSignal("pos-2", "600000", "浦发银行", "做多", "n_shape", 10.0, 8.0, 5.0)
 	scores := map[string]StockScores{
 		"600000": {Code: "600000", DragonReturnScore: 65, SignalActive: true},
 	}
-	alerts := a.CheckPositionAlerts(rpt, m, nil, scores)
+	alerts := a.CheckPositionAlerts(rpt, m, map[string]*data.StockInfo{
+		"600000": {Code: "600000", Name: "浦发银行", Price: 9.20, ChangePct: 0},
+	}, scores)
 	if len(alerts) != 1 {
-		t.Fatalf("应产出 1 条降级提示, got %d", len(alerts))
+		t.Fatalf("应产出 1 条减仓提醒, got %d", len(alerts))
 	}
-	if alerts[0].AlertType != "提示" {
-		t.Errorf("做止损未出现做空信号应降级为提示, got %s", alerts[0].AlertType)
+	if alerts[0].AlertType != "减仓" {
+		t.Errorf("首触止损线且无利空确认应产出减仓, got %s", alerts[0].AlertType)
+	}
+	if alerts[0].Action != "卖出" {
+		t.Errorf("减仓 Action 应为卖出, got %s", alerts[0].Action)
+	}
+}
+
+// TestCheckPositionAlerts_StopLossDeepBreachHard FIX#12 深度破位（-2×止损线）兜底 → 无条件硬止损。
+// English: TestCheckPositionAlerts_StopLossDeepBreachHard (FIX#12) a deep breach (2× the stop line)
+// backstops to an unconditional hard stop-loss.
+func TestCheckPositionAlerts_StopLossDeepBreachHard(t *testing.T) {
+	a, rpt, m := newAlertTestRig(t)
+	// 开仓 10 元，止损 5%（现价 8.00 → 盈亏 -20% ≤ -10% 深破，无利空确认也硬止损）
+	// English: Opened at 10, stop-loss 5% (current price 8.00 → P&L -20% ≤ -10% deep breach; hard stop even without a bearish confirmation).
+	rpt.LogSignal("pos-2", "600000", "浦发银行", "做多", "n_shape", 10.0, 8.0, 5.0)
+	alerts := a.CheckPositionAlerts(rpt, m, map[string]*data.StockInfo{
+		"600000": {Code: "600000", Name: "浦发银行", Price: 8.00, ChangePct: 0},
+	}, nil)
+	if len(alerts) != 1 {
+		t.Fatalf("应产出 1 条硬止损, got %d", len(alerts))
+	}
+	if alerts[0].AlertType != "止损" {
+		t.Errorf("深度破位应无条件硬止损, got %s", alerts[0].AlertType)
 	}
 }
 

@@ -104,12 +104,14 @@ func (s *Server) handleOpslog(w http.ResponseWriter, r *http.Request) {
 	data, err := os.ReadFile(filepath.Join(dir, "opslog-"+date+".log"))
 	if err != nil {
 		if os.IsNotExist(err) {
+			// 该日无日志：返回空行集合（前端可正常渲染）。
 			writeJSON(w, 200, map[string]interface{}{"date": date, "lines": []string{}, "total": 0, "truncated": false})
 			return
 		}
 		writeError(w, 500, "read opslog: "+err.Error())
 		return
 	}
+	// 按行切分并去掉尾部空行；超长时只取最近 tail 行。
 	all := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 	if len(all) == 1 && all[0] == "" {
 		all = nil

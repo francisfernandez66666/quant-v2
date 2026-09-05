@@ -33,11 +33,11 @@ func LayerReturns(panels []*Panel, factorID string, h, quantiles, minStocks int)
 	counts := make([]int, quantiles)
 
 	for _, d := range unionDates(panels) {
-	// fr 因子值 + 前瞻收益对（用于当日按因子分层）。
-	type fr struct {
-		f, r float64
-	}
-	var list []fr
+		// fr 因子值 + 前瞻收益对（用于当日按因子分层）。
+		type fr struct {
+			f, r float64
+		}
+		var list []fr
 		for _, p := range panels {
 			i, ok := p.DateIdx[d]
 			if !ok {

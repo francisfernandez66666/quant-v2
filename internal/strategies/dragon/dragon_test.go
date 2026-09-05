@@ -42,7 +42,7 @@ func strongSI() *data.StockInfo {
 func TestEvaluateFullSeal(t *testing.T) {
 	d := New(newCfg())
 	si := strongSI()
-	sectors := []data.SectorInfo{{ChangePct: 10}} // 板块共振强
+	sectors := []data.SectorInfo{{ChangePct: 10}}               // 板块共振强
 	ev := d.EvaluateReal("600000", si, klines(10, 12), sectors) // 主板代码：9.9% 贴主板涨停(9.9)→F1 封板
 	if ev == nil {
 		t.Fatal("EvaluateReal 不应返回 nil")

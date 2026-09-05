@@ -104,6 +104,7 @@ func (e *Engine) EnsurePool(key string) bool {
 	if total <= 0 {
 		return false
 	}
+	// 从全部存量池等比划拨新池资金：额度取下限与总池固定比例的最大值，上限为总池 25%。
 	give := math.Max(ensurePoolFloor, total*ensurePoolMinFrac)
 	if cap := total * 0.25; give > cap {
 		give = cap

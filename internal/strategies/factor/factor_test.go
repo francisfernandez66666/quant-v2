@@ -141,6 +141,7 @@ func TestFactorFinancial(t *testing.T) {
 	}
 	_ = eval2
 }
+
 // TestFactorMultiRule 验证因子战法支持多条规则共存并各自独立评估生成信号。
 func TestFactorMultiRule(t *testing.T) {
 	fs := New()

@@ -87,12 +87,14 @@ func nowStr() string { return time.Now().Format("2006-01-02 15:04:05") }
 // EnqueueResearchTask 入队一条任务并返回自增 ID。
 // English: enqueues a task and returns its auto-increment ID.
 func (d *DB) EnqueueResearchTask(t *ResearchTask) (int64, error) {
+	// 入队默认参数：优先级/状态未显式指定时落 low + queued
 	if t.Priority == "" {
 		t.Priority = "low"
 	}
 	if t.Status == "" {
 		t.Status = TaskQueued
 	}
+	// created_at/updated_at 统一取当前时间，保证排序字段可用
 	now := nowStr()
 	res, err := d.db.Exec(`INSERT INTO research_tasks
 		(type, ref_id, priority, status, progress, result_num, result_text, error,
@@ -114,6 +116,8 @@ func (d *DB) EnqueueResearchTask(t *ResearchTask) (int64, error) {
 // English: peeks the next runnable task — high before low; preempted first; then FIFO with the
 // monotonic requeue_seq as the tail key so failed-and-requeued tasks sink to the back (no retry cap).
 func (d *DB) DequeueHighestTask() (*ResearchTask, error) {
+	// 只读预览队首（不出队）：high 先于 low，同级 preempted 续跑优先，
+	// 再按 chain_day → chain_seq → requeue_seq → id FIFO
 	row := d.db.QueryRow(`SELECT ` + researchTaskCols + ` FROM research_tasks
 		WHERE status IN ('` + TaskQueued + `','` + TaskPreempted + `')
 		ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END,
@@ -266,6 +270,7 @@ func (d *DB) RequeueFailedTask(id int64, errMsg string) error {
 
 // itoa 小工具：避免为单一常量引入 strconv（重试上限文案用）。
 func itoa(n int) string {
+	// 手写整数转字符串：逐位取余逆序填入字节数组（避免为单点文案引 strconv）
 	if n == 0 {
 		return "0"
 	}
@@ -320,6 +325,8 @@ func (d *DB) ActiveResearchTasks() ([]ResearchTask, error) {
 // listResearchTasks 列表查询共用体：ListResearchTasks（全部）与 ActiveResearchTasks（未终结）
 // 仅 where 子句不同，扫描逻辑共享。
 func (d *DB) listResearchTasks(where string) ([]ResearchTask, error) {
+	// 共享列表查询：ListResearchTasks 与 ActiveResearchTasks 仅 where 子句不同，
+	// 统一追加 WHERE 后按 ID 倒序（最新在前）
 	rows, err := d.db.Query(`SELECT ` + researchTaskCols + ` FROM research_tasks ` + where +
 		` ORDER BY id DESC`)
 	if err != nil {

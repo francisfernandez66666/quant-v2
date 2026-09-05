@@ -129,6 +129,8 @@ func evalPattern(panels []*Panel, p Pattern, opts DiscoverOptsPattern, start, en
 		baseMean /= float64(len(baseRet))
 	}
 
+	// 遍历面板逐日判定形态触发：过滤日期区间后累计前视收益记录，
+	// 并按样本切分日 splitDate 区分训练/样本外，用于 HitRate/Excess/SampleOut 统计。
 	for _, pnl := range panels {
 		for i := 0; i < pnl.Series.Len()-opts.Horizon; i++ {
 			d := pnl.Series.Dates[i]
@@ -157,6 +159,7 @@ func evalPattern(panels []*Panel, p Pattern, opts DiscoverOptsPattern, start, en
 	if allN < opts.MinTrigger {
 		return p
 	}
+	// 聚合统计：触发次数、均值收益、超额、胜率（相对基准），样本外需足够样本才输出。
 	p.Triggers = allN
 	p.MeanRet = allRetSum / float64(allN)
 	p.Excess = p.MeanRet - baseMean
@@ -275,6 +278,7 @@ func DiscoverPatternsWindowed(db *store.DB, codes []string, start, end string,
 
 	combos, accs, baseMean := discoverPatternsWindowedRaw(db, codes, start, end, templates, opts)
 
+	// 按组合聚合各窗口统计：触发数不足跳过，均值/超额/胜率/样本外按线性可合并公式汇总。
 	baseMeanV := baseMean
 	out := make([]Pattern, 0, len(combos))
 	for ci := range combos {

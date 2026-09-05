@@ -543,6 +543,8 @@ func (c *HithinkClient) LimitUpLadderEntries() ([]HithinkLadderEntry, error) {
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, fmt.Errorf("hithink: 天梯解析失败: %w", err)
 	}
+	// 解析天梯数据：各 item 的板块映射 key 解析为梯队序号，
+	// 每个标的的日期由 BoardNum 倒序映射到 DateList 中的交易日（去 '-' 为 YYYYMMDD）。
 	var out []HithinkLadderEntry
 	for _, it := range resp.Item {
 		for key, lst := range it.Boards {
@@ -555,6 +557,7 @@ func (c *HithinkClient) LimitUpLadderEntries() ([]HithinkLadderEntry, error) {
 						date = strings.ReplaceAll(resp.Window.DateList[idx], "-", "")
 					}
 				}
+				// 兜底：映射失败时取最新交易日。
 				if date == "" && len(resp.Window.DateList) > 0 {
 					date = strings.ReplaceAll(resp.Window.DateList[len(resp.Window.DateList)-1], "-", "")
 				}

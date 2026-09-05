@@ -5,10 +5,10 @@
 // 本模块按行情与事件面判断"该不该卖"，覆盖尚未持仓或无法用持仓成本度量的股票。
 //
 // 四项卖点因素（按严重度降序）：
-//   1. 利空D1：负面过滤拦截（立案/减持/质押/解禁等）→ 清仓级
-//   2. 破MA5·MA20：现价同时跌破5日与20日均线 → 减仓级
-//   3. 放量派发：当日实时量明显放大且价格下跌 → 减仓级
-//   4. 动量衰竭：动量分低于信号阈值一半且分钟MACD转空 → 提示级
+//  1. 利空D1：负面过滤拦截（立案/减持/质押/解禁等）→ 清仓级
+//  2. 破MA5·MA20：现价同时跌破5日与20日均线 → 减仓级
+//  3. 放量派发：当日实时量明显放大且价格下跌 → 减仓级
+//  4. 动量衰竭：动量分低于信号阈值一半且分钟MACD转空 → 提示级
 //
 // 单只个股只产出一条卖点信号，取最严重因素决定级别与动作
 package combat_agent
@@ -76,18 +76,21 @@ func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Sco
 		}
 	}
 
-	// 3. 放量派发：当日实时量明显放大（>1.5倍前20日均量）且价格下跌 → 资金派发特征
+	// 3. 放量派发：当日实时量明显放大（>1.5倍前20日均量）且价格下跌 → 资金派发特征。
+	// §修复 P2#26：今日累计量按已流逝交易时间折算全天等值后与均量比较（旧实现直接比，
+	// 上午的放量下跌常因累计量不足被漏判成不放量）。English: P2#26 — prorate today's cumulative
+	// volume to a full-day equivalent before comparing (the raw comparison missed morning distribution).
 	// English: volume distribution — today's live volume expands (>1.5× prior 20-day average) while the
 	// price falls, a capital-distribution signature.
 	if q := md.Quote; q != nil && q.Price > 0 && q.Volume > 0 {
 		kl := md.KLines
 		if len(kl) >= 21 {
 			avgV := avgVol(kl[:len(kl)-1], 20)
-			if avgV > 0 && q.Volume > avgV*1.5 && md.ChangePct < 0 {
+			if avgV > 0 && intradayVolumeRatio(time.Now(), q.Volume, avgV) > 1.5 && md.ChangePct < 0 {
 				factors = append(factors, sellSideFactor{
 					level:  "减仓",
 					action: "卖出",
-					reason: fmt.Sprintf("放量下跌: 量%.0f=%.1f倍均量, 跌幅%.2f%%, 有资金派发迹象", q.Volume, q.Volume/avgV, md.ChangePct),
+					reason: fmt.Sprintf("放量下跌: 折算日量=%.1f倍均量, 跌幅%.2f%%, 有资金派发迹象", intradayVolumeRatio(time.Now(), q.Volume, avgV), md.ChangePct),
 					score:  2,
 				})
 			}

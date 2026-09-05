@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -231,9 +232,20 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 			}
 			placeholders += "?"
 		}
-		q := `DELETE FROM real_positions WHERE ts_code NOT IN (` + placeholders + `) AND user_id = ?`
-		codes = append(codes, userID)
-		if _, err := tx.Exec(q, codes...); err != nil {
+		// §修复 P2#17：非空快照分支必须连同清理不在快照中的遗留全局行（user_id=''）。
+		// 旧实现只删 `user_id=?` 的作用域行，遗留全局行既未被本账号声明（claim 只对快照内的
+		// ts_code 执行），又不在快照中 → 成为永驻残留：对全账号可见、Reconcile 计数虚高、
+		// 前向对账后还会把这些无主行误当成真实持仓展示。真正的多租户 scoped 行不会被误删；
+		// 可靠的遗留行走 claim 路径已在本事务前转成 scoped，这里删掉的只能是"无任何账号认领"
+		// 的过期行。English: P2#17 — the non-empty branch must also purge legacy global rows (user_id='')
+		// absent from the snapshot. The old code deleted only this account's scoped rows, so a legacy row
+		// that was neither claimed by this snapshot (claim runs only for codes present in pos) nor present
+		// in it lingered forever: visible to every account, inflating the reconciliation count, and
+		// re-surfacing as phantom positions after a full reconcile. Real multi-tenant scoped rows are
+		// untouched; a genuine legacy row gets converted to scoped earlier in this transaction via the
+		// claim UPDATE, so what this deletes is only ownerless stale rows.
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE (user_id = ? OR user_id = '') AND ts_code NOT IN (`+placeholders+`)`,
+			append([]any{userID}, codes...)...); err != nil {
 			return 0, err
 		}
 	}
@@ -437,12 +449,18 @@ func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 	return err
 }
 
-// SumFilledQty 汇总某账号某 signal_id 的累计成交数量（按 (user_id, signal_id) 过滤）。
+// SumFilledQty 汇总某账号某 signal_id 前缀的累计成交数量（按 (user_id, signal_id) 过滤）。
 // §修复 R6（2026-08-29）：自动卖出为日级幂等键，若首笔卖单仅部成（部分成交），同日同键重试会被
 // 唯一键判 duplicate 而剩余仓位不再卖出。此处累计已成交数量，供补卖逻辑计算剩余可卖量。
+// §修复 FIX#1（2026-09-04）：卖出单 signal_id 是 base（sell:<码>:<类>:<日>）追加 :r<剩余量> 后缀
+// 的完整键——网关回报的 fills 恒带该后缀，按 base 精确匹配恒为 0，导致补卖逻辑把"已成交量"看成 0、
+// 对尚未成交的旧挂单叠加发单（卖出敞口超额）。改为按 base 前缀聚合，base 与所有 :rN 桶的成交都计入。
+// English: §FIX#1 — sell fills carry the full signal id (base + ":r<remaining>" suffix), so an exact
+// match on base always returned 0 and re-sells overlapped pending old orders (oversold exposure).
+// Aggregate by signal_id prefix to count fills across the base and every :rN bucket.
 func (d *DB) SumFilledQty(userID, signalID string) int {
 	var total int
-	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills WHERE user_id=? AND signal_id=?`,
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills WHERE user_id=? AND signal_id LIKE ?||'%'`,
 		userID, signalID).Scan(&total); err != nil {
 		return 0
 	}
@@ -453,17 +471,36 @@ func (d *DB) SumFilledQty(userID, signalID string) int {
 // §GAP 修复：此前占位行 order_id 恒为空串，与 order_id 主键冲突导致第二笔起的新单被
 // INSERT OR IGNORE 误判为重复（静默不下单），且按网关单号 UPDATE 也永不命中。
 // §P0-2/P0-3 userID 为空时仅操作遗留全局行；非空时严格限定本账号，防止跨账号误更新。
+// §修复 FIX#2（2026-09-04）：加单调状态守卫——重试成功后该行可能已被回报线程推进到
+// 已成/部分成交（超时但券商实际受理），旧实现直接覆盖为"已报"会回退真实进度；现仅当
+// 新状态秩更高时才回填（对齐 §R4-4 单调状态机口径）。
 // English: backfills the pending ticket (keyed by signal_id) with the gateway-assigned order id.
 // English: §GAP fix — placeholder rows previously stored an empty order_id, colliding on the primary
 // key so every later new order was swallowed as a "duplicate", and the status update by gateway id
-// never matched.
+// never matched. §FIX#2 — a monotonic guard now skips the backfill when the row already advanced
+// past 已报 (e.g. a late fill landed), so real progress is never rolled back.
 func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string) error {
+	var cur string
+	var err error
 	if userID == "" {
-		// 遗留全局行（user_id=''）兼容路径
-		_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=''`, orderID, status, signalID)
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=''`, signalID).Scan(&cur)
+	} else {
+		err = d.db.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=?`, signalID, userID).Scan(&cur)
+	}
+	if err == sql.ErrNoRows {
+		return nil // 无占位行（例如回填前已被清仓清理）：回填无可定位目标，静默跳过
+	}
+	if err != nil {
 		return err
 	}
-	_, err := d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=?`, orderID, status, signalID, userID)
+	if orderStatusRank(status) <= orderStatusRank(cur) {
+		return nil // 乱序/回退：不回填（真实进度不被覆盖）
+	}
+	if userID == "" {
+		_, err = d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=''`, orderID, status, signalID)
+	} else {
+		_, err = d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=?`, orderID, status, signalID, userID)
+	}
 	return err
 }
 
@@ -499,16 +536,50 @@ func (d *DB) MarkRealOrderSendFailed(userID, signalID string) error {
 // 仅当行存在且状态恰为"发送失败"时生效并返回 true；其余状态（已报/部分成交/已成/已撤）原样保留
 // 并返回 false——即真正的重复下单仍然被唯一键拦截，只有确认失败过的单才允许再发一次。
 // §P0-3 userID 限定本账号作用域。
-// English: §GAP2-W1 retry gate — resets a 发送失败 ticket back to 已报 so the same signal_id may be
-// re-sent. Returns true only when a failed row was actually reset; genuine duplicates (already
-// reported/filled/cancelled) stay untouched and return false.
+// §修复 FIX#2（2026-09-04）：重试同时换新占位单号 `pend:<signal_id>:<attempt>`（attempt 自增）。
+// 旧实现只改状态、占位单号保持首次 `pend:<sid>`——一旦重试实际到券商（响应丢失）而网关单号
+// 回填前崩溃，SweepOrders 见 pend: 前缀行即按"从未到达网关"再降级，同 signal_id 反复真报单。
+// 每次重试换唯一占位单号后，真实委托的回填（UpdateRealOrderBySignalID）只会命中本轮单号，
+// 历史 pend 行不再被误判为幽灵单。
+// English: §FIX#2 — a retry now also rotates to a fresh placeholder order_id
+// `pend:<signal_id>:<attempt>` (attempt auto-increments). The old code kept the first attempt's
+// `pend:` order_id, so if a retry actually reached the broker (lost response) and crashed before the
+// gateway id was backfilled, SweepOrders saw the pend: prefix and demoted it again — re-sending the
+// same signal_id for real, repeatedly. With a unique placeholder per attempt, the backfill only ever
+// targets this round's order and stale pend rows are no longer misjudged as ghosts.
 func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
-	var res sql.Result
-	var err error
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var cur string
 	if userID == "" {
-		res, err = d.db.Exec(`UPDATE orders SET status='已报' WHERE signal_id=? AND status='发送失败' AND user_id=''`, signalID)
+		err = tx.QueryRow(`SELECT order_id FROM orders WHERE signal_id=? AND status='发送失败' AND user_id=''`, signalID).Scan(&cur)
 	} else {
-		res, err = d.db.Exec(`UPDATE orders SET status='已报' WHERE signal_id=? AND status='发送失败' AND user_id=?`, signalID, userID)
+		err = tx.QueryRow(`SELECT order_id FROM orders WHERE signal_id=? AND status='发送失败' AND user_id=?`, signalID, userID).Scan(&cur)
+	}
+	if err == sql.ErrNoRows {
+		return false, nil // 行不存在或状态非"发送失败"：不可重试
+	}
+	if err != nil {
+		return false, err
+	}
+	// 自增 attempt：旧式 pend:<sid> 视为第 1 次；解析失败/非 pend 前缀时从 1 重新计
+	attempt := 1
+	prefix := "pend:" + signalID + ":"
+	if strings.HasPrefix(cur, prefix) {
+		if n, perr := strconv.Atoi(strings.TrimPrefix(cur, prefix)); perr == nil && n > 0 {
+			attempt = n + 1
+		}
+	}
+	newID := fmt.Sprintf("pend:%s:%d", signalID, attempt)
+	// 发送失败行重置为"已报"并换新占位单号（供重试队列再次投递）。
+	var res sql.Result
+	if userID == "" {
+		res, err = tx.Exec(`UPDATE orders SET status='已报', order_id=? WHERE signal_id=? AND status='发送失败' AND user_id=''`, newID, signalID)
+	} else {
+		res, err = tx.Exec(`UPDATE orders SET status='已报', order_id=? WHERE signal_id=? AND status='发送失败' AND user_id=?`, newID, signalID, userID)
 	}
 	if err != nil {
 		return false, err
@@ -517,7 +588,14 @@ func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return n > 0, nil
+	// 无行受影响（已被其他重试处理）→ 视为不可重试。
+	if n == 0 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // RealOrders 返回全部实盘委托单（倒序）。

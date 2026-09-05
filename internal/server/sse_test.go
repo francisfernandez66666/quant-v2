@@ -3,6 +3,7 @@ package server
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -98,4 +99,36 @@ func TestSSEBrokerNoReplayForStaleID(t *testing.T) {
 	default:
 		// 正确：无补发
 	}
+}
+
+// TestSSEBrokerUnsubscribeNoSendOnClosed §修复 FIX#5：广播与注销并发时不得
+// `send on closed channel` panic——close(ch) 须在锁内与广播互斥。
+// English: §FIX#5 regression — concurrent Broadcast and Unsubscribe must never panic with
+// "send on closed channel" (close moved inside the lock, serialized with broadcasts).
+func TestSSEBrokerUnsubscribeNoSendOnClosed(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("广播与注销并发不得 panic: %v", r)
+		}
+	}()
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		b := NewSSEBroker()
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 2000; j++ {
+				b.Broadcast(map[string]string{"type": "tick", "seq": "1"})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			ch := b.SubscribeFor("u1", 0)
+			<-done
+			b.UnsubscribeFor("u1", ch)
+		}()
+	}
+	close(done)
+	wg.Wait()
 }

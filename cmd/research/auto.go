@@ -236,6 +236,7 @@ func cmdScanDepth(db *store.DB, args []string) {
 	cfg := data.BigOrderConfig{MinSharePct: *minShare}
 	summary := make(map[string]depthPerStock)
 	nSupport, nResist, nScanned := 0, 0, 0
+	// 逐票拉取盘口并识别大单：托单/压单分别计数，记录买1卖1快照。
 	for _, code := range codes {
 		ob, err := api.GetOrderBook(code)
 		if err != nil {

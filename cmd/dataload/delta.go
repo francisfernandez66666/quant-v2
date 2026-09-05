@@ -190,6 +190,7 @@ func cmdImportDelta(db *store.DB, args []string) {
 		if err := json.Unmarshal(line, &dl); err != nil {
 			log.Fatalf("解析 delta 行失败: %v", err)
 		}
+		// 将 delta 行按列名组装为 map，缺失单元格置 NULL 后整表入库。
 		rows := make([]map[string]any, 0, len(dl.Rows))
 		for _, arr := range dl.Rows {
 			m := make(map[string]any, len(dl.Cols))

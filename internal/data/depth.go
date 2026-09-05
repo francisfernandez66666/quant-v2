@@ -198,6 +198,7 @@ func (m *MarketAPI) getTencentDepth(code string) (*OrderBook, error) {
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://gu.qq.com/")
+	// 发送请求并读取响应体，腾讯返回 GBK 编码需转 UTF-8 后再正则提取盘口。
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tencent depth http: %v", err)

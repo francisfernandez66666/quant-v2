@@ -78,12 +78,14 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 	// 连续亏损股票集（仅统计有年度利润表数据的标的）。
 	lose := map[string]bool{}
 	if s.MaxLossYears > 0 {
+		// 统计每只股票年报（end_date 以 1231 结尾）净利润为负的年数。
 		rows, err := d.db.Query(`SELECT ts_code, COUNT(*) FROM income
 			WHERE end_date LIKE '%1231' AND n_income_attr_p < 0
 			GROUP BY ts_code HAVING COUNT(*) >= ?`, s.MaxLossYears)
 		if err != nil {
 			return nil, fmt.Errorf("亏损筛选: %w", err)
 		}
+		// 逐行标记连亏年数超限的股票到 lose 集合。
 		for rows.Next() {
 			var code string
 			var n int
@@ -101,13 +103,18 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 	}
 
 	// 流动性/近期行情：近 cutoff 起各票根数与日均额。
-	liq := map[string]struct{ Bars int; Amt float64 }{}
+	liq := map[string]struct {
+		Bars int
+		Amt  float64
+	}{}
 	if s.MinRecentBars > 0 || s.MinAvgAmount > 0 {
+		// 近 cutoff 后每只股票的根数与平均成交额。
 		rows, err := d.db.Query(`SELECT ts_code, COUNT(*), AVG(amount) FROM daily
 			WHERE trade_date >= ? GROUP BY ts_code`, cutoff)
 		if err != nil {
 			return nil, fmt.Errorf("流动性筛选: %w", err)
 		}
+		// 逐行记录根数与日均成交额到 liq 集合。
 		for rows.Next() {
 			var code string
 			var bars int
@@ -116,8 +123,12 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 				rows.Close()
 				return nil, err
 			}
-			liq[code] = struct{ Bars int; Amt float64 }{bars, amt}
+			liq[code] = struct {
+				Bars int
+				Amt  float64
+			}{bars, amt}
 		}
+		// 遍历完检查游标错误。
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			return nil, err
@@ -140,15 +151,18 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 	}
 	defer rows.Close()
 
+	// 最终过滤并输出：全量股票逐只核对亏损/流动性条件。
 	var out []string
 	for rows.Next() {
 		var code string
 		if err := rows.Scan(&code); err != nil {
 			return nil, err
 		}
+		// 连续亏损年数超标 → 剔除。
 		if lose[code] {
 			continue
 		}
+		// 根数/日均额不达标 → 剔除（未在 liq 中视为 0 数据）。
 		if s.MinRecentBars > 0 || s.MinAvgAmount > 0 {
 			l, ok := liq[code]
 			if !ok {

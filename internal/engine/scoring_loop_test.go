@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/data"
 )
 
 // mkSig 构造一个仅含 code 与 strategy 的最小信号对象（其余字段留零值即可）。
@@ -71,7 +72,7 @@ func TestScoreStoreRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "scores.json")
 
 	s := newScoreStore(path)
-	day := "2026-07-31"
+	day := data.TradingDayDate(time.Now()) // §P2#19：仅当日的桶会被加载（跨日重置）
 	in := map[string]combat_agent.StockScores{
 		"600000": {Code: "600000", NScore: 66, DragonScore: 80, MomentumScore: 75, SignalActive: true, UpdatedAt: time.Now()},
 		"000001": {Code: "000001", DragonScore: 0, MomentumScore: 0},

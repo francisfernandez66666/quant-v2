@@ -590,6 +590,7 @@ func insertAfter(steps []string, anchor, step string) []string {
 // stepTask 夜间步骤 → (任务类型, payload JSON)。payload 与旧 buildCommand 参数一一对应，
 // 由 run-task 分发器展平为子命令 CLI 参数。
 func stepTask(step string, cfg config.SchedulerConfig, today string) (string, string, bool) {
+	// 将调度步骤映射为 research 任务类型+参数载荷；未知步骤返回 ok=false。
 	switch step {
 	case "dataload":
 		pyurl := cfg.PyURL
@@ -877,6 +878,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		for {
 			select {
 			case <-tailStop:
+				// 收尾模式：持续读文件至 EOF 稳定（无新增长且偏移不变）才退出。
 				tailFile() // 收尾冲刷最后一段（含无换行的尾部）
 				for {      // 持续读到 EOF 稳定，确保汇总数据完整
 					rs.mu.Lock()
@@ -930,6 +932,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 				opslog.Logf("research", "运行时熔断抢占 #%d(%s) MemAvailable=%dMB<%dMB", tk.ID, tk.Type, av, runtimeFloor)
 				s.preemptCurrent("系统内存危急(运行时熔断)")
 			}
+			// 消费任务控制指令：暂停/恢复/取消三种状态机切换。
 			c, err := db.ConsumeTaskControl(tk.ID)
 			if err != nil || c == "" {
 				continue

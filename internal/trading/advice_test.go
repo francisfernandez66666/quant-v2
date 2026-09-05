@@ -156,7 +156,7 @@ func TestControllerTripAndIdempotent(t *testing.T) {
 		t.Fatalf("expected duplicate rejection, got %+v", res)
 	}
 	// 熔断：HealthCheck 失败超时后拒绝下单
-	ctrl.exec = failingExecutor{}
+	ctrl.exec.Store(execHolder{failingExecutor{}})
 	ctrl.mu.Lock()
 	ctrl.lastHealthAt = time.Time{}
 	ctrl.lastFailAt = time.Now().Add(-3 * time.Second)
@@ -169,7 +169,7 @@ func TestControllerTripAndIdempotent(t *testing.T) {
 		t.Fatal("expected order rejected while tripped")
 	}
 	// 恢复：健康恢复解熔
-	ctrl.exec = exec
+	ctrl.exec.Store(execHolder{exec})
 	ctrl.mu.Lock()
 	ctrl.lastFailAt = time.Time{}
 	ctrl.lastHealthAt = time.Time{}
@@ -177,6 +177,34 @@ func TestControllerTripAndIdempotent(t *testing.T) {
 	ctrl.HealthCheck()
 	if ctrl.Tripped() {
 		t.Fatal("expected circuit breaker un-tripped after recovery")
+	}
+}
+
+// TestFromSignalNoLivePriceNoFakeRef P2#25 回归：行情缺失时 fromSignal 不得用成本价顶替现价——
+// RefPrice 保持 0（自动卖出守卫据此拦截，避免按成本价挂错单），显示估值仍按成本价（ProfitPct=0）。
+// English: P2#25 regression — a missing live quote must not be faked with cost price in fromSignal:
+// RefPrice stays 0 (the auto-sell guard skips it, so no order at the wrong cost price) while the display
+// estimate still uses cost (ProfitPct=0).
+func TestFromSignalNoLivePriceNoFakeRef(t *testing.T) {
+	pos := store.RealPosition{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10, Amount: 1000}
+	in := AdviceInput{Positions: []store.RealPosition{pos}}
+	sig := combat_agent.Signal{
+		Code: "600000", AlertType: "止损", Direction: "提醒", Action: "止损",
+		Price:  0, // 行情缺失（触发价无效）
+		Reason: "行情缺失止损",
+	}
+	pa := fromSignal(sig, in, time.Now(), "")
+	if pa == nil {
+		t.Fatal("fromSignal 不应返回 nil")
+	}
+	if pa.RefPrice != 0 {
+		t.Fatalf("行情缺失时 RefPrice 应为 0（不可用做挂单价）, got %.2f", pa.RefPrice)
+	}
+	if pa.Action != "止损" || pa.Level != "高" {
+		t.Fatalf("止损信号应映射为 止损/高, got %s/%s", pa.Action, pa.Level)
+	}
+	if pa.Amount != 1000 || pa.ProfitPct != 0 {
+		t.Fatalf("展示估值应按成本价兜底 (Amount=1000, ProfitPct=0), got Amount=%.0f ProfitPct=%.2f", pa.Amount, pa.ProfitPct)
 	}
 }
 

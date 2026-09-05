@@ -100,6 +100,7 @@ func ApplyGrayscale(dataDir string, c *store.Candidate) error {
 		_ = json.Unmarshal([]byte(c.Weights), &payload)
 		var factors []string
 		_ = json.Unmarshal([]byte(c.Factors), &factors)
+		// 追加灰度因子规则（已存在同候选 ID 则提前返回，幂等）。
 		gs.Factors = append(gs.Factors, GrayscaleFactorRule{
 			ID:              "gfac_" + strconv.FormatInt(c.ID, 10),
 			Name:            "灰度因子#" + strconv.FormatInt(c.ID, 10),
@@ -115,6 +116,7 @@ func ApplyGrayscale(dataDir string, c *store.Candidate) error {
 			Excess:          c.AvgExcess,
 			Enabled:         true,
 		})
+	// pattern 分支：已存在同候选则跳过，追加形态灰度规则。
 	case "pattern":
 		for _, r := range gs.Patterns {
 			if r.CandID == c.ID {
@@ -150,6 +152,7 @@ func DemoteGrayscale(dataDir string, candID int64) error {
 	} else if err := json.Unmarshal(b, &gs); err != nil {
 		return err
 	}
+	// 分别从因子与形态两类规则中剔除目标候选，标记 changed 以便落盘。
 	changed := false
 	facts := gs.Factors[:0]
 	for _, r := range gs.Factors {

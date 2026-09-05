@@ -61,6 +61,7 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 	for _, e := range entries {
 		stats[e.ID] = e
 	}
+	// 用各实盘控制器上报的因子绩效覆盖统计：信号数/胜平负/累计收益。
 	if s.registry != nil {
 		for _, c := range s.registry.AllControllers() {
 			for _, rl := range c.FactorStats() {
@@ -71,6 +72,7 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 组装因子卡片：合并绩效统计与候选表验证信息。
 	for _, e := range stats {
 		item := libItem{
 			Kind: "factor", ID: e.ID, Name: e.Name, Enabled: e.Enabled, CandID: e.CandID,
@@ -130,10 +132,12 @@ func (s *Server) handleResearchLibraryToggle(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		enabled := action == "enable"
+		// 研究库未接入时拒绝操作。
 		if s.researchDir == "" {
 			writeError(w, 503, "研究库未接入")
 			return
 		}
+		// 按 ID 前缀区分形态/因子战法，分别走对应开关持久化。
 		var err error
 		if isPatternID(id) {
 			err = research.SetAppliedPatternEnabled(s.researchDir, id, enabled)
@@ -153,10 +157,12 @@ func (s *Server) handleResearchLibraryToggle(action string) http.HandlerFunc {
 // English: POST /api/research/library/{id}/delete — remove an applied strategy.
 func (s *Server) handleResearchLibraryDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// 研究库未接入时拒绝操作。
 	if s.researchDir == "" {
 		writeError(w, 503, "研究库未接入")
 		return
 	}
+	// 按 ID 前缀分发：形态/因子分别走对应删除持久化。
 	var err error
 	if isPatternID(id) {
 		err = research.RemoveAppliedPatternRule(s.researchDir, id)

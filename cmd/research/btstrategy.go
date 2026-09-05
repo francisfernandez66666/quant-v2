@@ -34,6 +34,7 @@ func cmdBacktestStrategy(db *store.DB, dbPath string, args []string) {
 	if *end == "" {
 		*end = today()
 	}
+	// 组装回放选项：DB 路径/区间/战法/标的数/D1/行业/节流等，可选叠加质量筛查。
 	o := &btreplay.Options{
 		DBPath:     dbPath,
 		Start:      *start,

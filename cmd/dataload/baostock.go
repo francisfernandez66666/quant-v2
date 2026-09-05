@@ -243,6 +243,7 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 		})
 	}
 
+	// 分表批量入库：daily / daily_basic / stk_limit / adj_factor，空表跳过。
 	total := 0
 	for _, t := range []struct {
 		table string
@@ -312,6 +313,7 @@ func bsLoadFinancial(db *store.DB, c *data.BaostockClient, startYear, endYear in
 				if len(profit) == 0 {
 					continue // 无该期数据
 				}
+				// 逐期拉取利润表/成长/资产负债后组装入库。
 				growth, err := c.FinaGrowth(bsCode, year, q)
 				if err != nil {
 					return fmt.Errorf("%s growth %dq%d: %v", code, year, q, err)
@@ -342,6 +344,7 @@ func bsInsertFinancial(db *store.DB, code string, profit, growth, balance []data
 	p := profit[0]
 	ann, stat := normDate(p.S("pubdate")), normDate(p.S("statdate"))
 
+	// 组装财务主表与利润表行：中间期缺字段由 optF 回退 NULL。
 	fina := map[string]any{
 		"ts_code": code, "end_date": stat, "ann_date": ann,
 		"eps":                optF(p, "epsttm"),
@@ -403,6 +406,7 @@ func bsLoadAdjFactor(db *store.DB, c *data.BaostockClient, codes []string, start
 			skipped++
 			continue
 		}
+		// 组装复权因子行并批量入库，计数插入与完成数。
 		rows := make([]map[string]any, 0, len(adj))
 		for _, r := range adj {
 			rows = append(rows, map[string]any{

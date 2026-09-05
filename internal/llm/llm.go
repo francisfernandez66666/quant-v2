@@ -191,6 +191,7 @@ func (c *Client) markKeyStatus(key string, status int, retryAfter time.Duration)
 	if len(c.apiKeys) <= 1 {
 		return // 单 key 无可回避，标记无意义
 	}
+	// 按状态码映射冷却时长并写入对应 key 槽位，直至其过期前不再被轮询使用。
 	var cool time.Duration
 	switch {
 	case status == 401 || status == 403:
@@ -488,6 +489,7 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 
 		var sb strings.Builder
 		var lastUsage *llmUsage
+		// 逐行解析 SSE 分片：非 data: 前缀跳过，[DONE] 结束，chunk 携带 usage 则记录。
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
 			if !strings.HasPrefix(line, "data:") {
@@ -1155,6 +1157,7 @@ func (c *Client) Ping() error {
 	if len(c.apiKeys) == 0 {
 		return fmt.Errorf("LLM_API_KEY not set")
 	}
+	// 发起一次最小成本请求（单 token 非流式）探测 API 连通性。
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	payload := chatCompletionRequest{

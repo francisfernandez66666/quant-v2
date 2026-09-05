@@ -77,6 +77,7 @@ func (a *Aggregator) Update(
 ) *DashboardData {
 	finalSignals := resolveConflict(bullSignals, bearSignals, alertSignals, result.L1Blocked)
 
+	// 锁内写入最新看板快照并返回（快照对外不可变，读取走 Current）。
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.current = &DashboardData{
@@ -119,6 +120,7 @@ func (a *Aggregator) UpdateFast(scores map[string]combat_agent.StockScores, fast
 	bull := fastSignals // 全量替换（调用方已合并 固化+本轮）
 	final := resolveConflict(bull, cur.BearSignals, cur.AlertSignals, cur.L1Blocked)
 
+	// 组装新快照原子替换：未变部分沿用旧值，做多信号用全量替换后的 bull。
 	a.current = &DashboardData{
 		NewsEvents:   cur.NewsEvents,
 		HotSectors:   cur.HotSectors,

@@ -70,7 +70,7 @@ func TestAsyncDispatcherPlacesOrder(t *testing.T) {
 	defer e.StopBuyDispatcher()
 
 	sig := combat_agent.Signal{
-		ID:         "sig-1", Code: "600000", Name: "浦发银行", Strategy: "龙头",
+		ID: "sig-1", Code: "600000", Name: "浦发银行", Strategy: "龙头",
 		Direction: "做多", Action: "买入", Price: 10, Confidence: 0.9,
 	}
 	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}

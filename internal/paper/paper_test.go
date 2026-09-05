@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 )
@@ -22,6 +23,56 @@ func poolSnapshotCost(e *Engine, key string) float64 {
 		}
 	}
 	return 0
+}
+
+// TestPoolBudgetDayStartCashFixed §修复 FIX#4：预算分母=日初池现金（跨日重捕获、日内不缩水）。
+// 旧实现 dayStartCash 恒 0 → 分母回退当前缩水池现金，越买分母越小越松。
+// English: §FIX#4 regression — the daily budget denominator stays fixed at the day-start pool cash
+// (recaptured on the first buy of a new day); intraday debits never shrink it.
+func TestPoolBudgetDayStartCashFixed(t *testing.T) {
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"n_shape"}) // 100000 / 2 池 → n_shape 日初 50000
+	e.SetPoolBuyRule("n_shape", &PoolBuyRule{BudgetPctPerDay: 30, MaxDailyBuys: 100})
+	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10}}
+	// 首日首笔：预算 50000×30%=15000；先买 5000（500股@10）
+	if err := e.BuyExInPool("600000.SH", "浦发", "N形", "n_shape", 10, 10, 500, quotes); err != nil {
+		t.Fatalf("首笔买入失败: %v", err)
+	}
+	d := e.poolDiscipline["n_shape"]
+	if math.Abs(d.dayStartCash-50000) > 1e-9 {
+		t.Fatalf("日初现金应锁定 50000（日初快照，非扣款后 45000）, got %.2f", d.dayStartCash)
+	}
+	if math.Abs(d.spentToday-5000) > 1e-9 {
+		t.Fatalf("当日已花费应 5000, got %.2f", d.spentToday)
+	}
+	// 当日第二笔 12000（1200股@10）：5000+12000=17000>15000 超限 → 拒绝
+	if err := e.BuyExInPool("000001.SZ", "平安", "N形", "n_shape", 10, 10, 1200, quotes); err == nil {
+		t.Fatal("同日内累计 17000 超预算 15000 应被拒绝")
+	}
+	// 当日第三笔 9000：5000+9000=14000≤15000 放行（若分母按扣款后缩水现金将 <14000 误拒）
+	if err := e.BuyExInPool("000002.SZ", "万科", "N形", "n_shape", 10, 10, 900, quotes); err != nil {
+		t.Fatalf("同日内 5000+9000=14000≤15000 应放行（分母不得缩水）, got %v", err)
+	}
+	// 模拟跨日（强制 day 落回昨天）：下次首笔重新捕获"本日开始时池现金"（此时池现金 36000）
+	prevDay := cntime.DayOf(time.Now().Add(-48 * time.Hour))
+	e.poolDiscipline["n_shape"] = poolDiscipline{day: prevDay}
+	if err := e.BuyExInPool("600000.SH", "浦发", "N形", "n_shape", 10, 10, 200, quotes); err != nil {
+		t.Fatalf("跨日首笔应放行: %v", err)
+	}
+	d = e.poolDiscipline["n_shape"]
+	if math.Abs(d.dayStartCash-36000) > 1e-9 {
+		t.Fatalf("跨日首笔应重新锁定日初池现金 36000, got %.2f", d.dayStartCash)
+	}
+	if math.Abs(d.spentToday-2000) > 1e-9 {
+		t.Fatalf("跨日计数应重置为本次 2000, got %.2f", d.spentToday)
+	}
+	// 新日预算 = 36000×30% = 10800；再买 8000（累计 10000）放行、当日累计 11000 拒绝
+	if err := e.BuyExInPool("000001.SZ", "平安", "N形", "n_shape", 10, 10, 800, quotes); err != nil {
+		t.Fatalf("新日 2000+8000=10000 未超 10800 应放行, got %v", err)
+	}
+	if err := e.BuyExInPool("000002.SZ", "万科", "N形", "n_shape", 10, 10, 100, quotes); err == nil {
+		t.Fatal("新日累计 2000+8000+1000=11000>10800 应被拒绝")
+	}
 }
 
 // TestPoolCapsDecoupled 验证每池持仓上限与全局解耦：设置池上限后该池持仓数被约束，
@@ -683,6 +734,56 @@ func TestMomentumPoolRouting(t *testing.T) {
 	}
 }
 
+// TestTrimThenCloseCostNoDoubleCount §修复 FIX#3：减仓摊销持仓成本——
+// 减仓后清仓的已实现盈亏不得把已卖股份成本重复扣除。
+// English: §FIX#3 regression — trimming a position amortizes its cost, so a later full close settles
+// against the remaining cost instead of the original total (realized P&L would otherwise be understated).
+func TestTrimThenCloseCostNoDoubleCount(t *testing.T) {
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"n_shape"})
+	quotes := map[string]*data.StockInfo{"600000.SH": {Price: 10}}
+	if err := e.BuyExInPool("600000.SH", "浦发", "N形", "n_shape", 10, 10, 100, quotes); err != nil {
+		t.Fatalf("买入失败: %v", err)
+	}
+	p := e.positions["600000.SH"]
+	if p == nil || p.Cost != 1000 || p.Qty != 100 {
+		t.Fatalf("买入应 100股@10 成本1000, got %+v", p)
+	}
+	// 次日：减仓 50 股 @12 → 减仓已实现 +100（600-500），剩余成本摊销为 500
+	t1Ready(e)
+	if err := e.SellEx("600000.SH", 12, 50, map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("减仓失败: %v", err)
+	}
+	p = e.positions["600000.SH"]
+	if p.Qty != 50 {
+		t.Fatalf("减仓后应余 50 股, got %d", p.Qty)
+	}
+	if math.Abs(p.Cost-500) > 1e-9 {
+		t.Fatalf("减仓后成本应摊销为 500, got %.2f", p.Cost)
+	}
+	if math.Abs(e.realized-100) > 1e-9 {
+		t.Fatalf("减仓已实现盈亏应 +100, got %.2f", e.realized)
+	}
+	// 清仓剩余 50 股 @12 → 再 +100；总已实现 200（若成本未摊销，清仓会按 1000 再扣一次 → 0）
+	if err := e.SellEx("600000.SH", 12, 100, map[string]*data.StockInfo{"600000.SH": {Price: 12}}); err != nil {
+		t.Fatalf("清仓失败: %v", err)
+	}
+	if len(e.positions) != 0 {
+		t.Fatalf("清仓后应无持仓, got %d", len(e.positions))
+	}
+	if math.Abs(e.realized-200) > 1e-9 {
+		t.Fatalf("减仓+清仓总已实现盈亏应 200, got %.2f", e.realized)
+	}
+	perf := e.poolPerf["n_shape"]
+	if perf == nil || math.Abs(perf.Realized-200) > 1e-9 {
+		t.Fatalf("池已实现盈亏应 200, got %+v", perf)
+	}
+	// 全局统计口径一致
+	if st := e.Stats(); math.Abs(st.RealizedPnl-200) > 1e-9 {
+		t.Fatalf("全局已实现盈亏应 200, got %.2f", st.RealizedPnl)
+	}
+}
+
 // TestFeesCharged §R1/R2 费用入账：买入扣佣金(含最低5元)、持仓成本含费、
 // 卖出扣佣金+印花税且滑点下浮、Trade.Fee 留痕。
 // English: fee accounting end-to-end — commission debited on buys (min ¥5), cost is fee-inclusive,
@@ -857,5 +958,75 @@ func TestPoolMinScoreEnforced(t *testing.T) {
 	e3.SetPoolBuyRule("dragon", &PoolBuyRule{MinScore: 99})
 	if err := e3.BuyInPool("600000.SH", "手动", "龙头", "dragon", 10, map[string]*data.StockInfo{"600000.SH": {Price: 10}}); err != nil {
 		t.Fatalf("手动买入不受 MinScore 约束, got %v", err)
+	}
+}
+
+// TestAutoShrinkMinFeeNoNegativePool P2#20 回归：自动缩量须为最低佣金预留头寸，
+// 无论缩量后买不买得起都不得让池现金变为负数（旧实现只按费率预留 pool/(1+rate)，
+// MinCommission=5 让 cost+fee 超出 pool，池现金被穿成负）。
+// English: P2#20 regression — the auto-shrink must reserve MinCommission headroom so the pool cash never
+// goes negative (the old shrink reserved only rate-fee via pool/(1+rate); the 5元 minimum-commission
+// floor pushed cost+fee past the pool balance).
+func TestAutoShrinkMinFeeNoNegativePool(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.SlippageBps = 0
+	cfg.CommissionRate = 0.00025
+	cfg.MinCommission = 5
+	cfg.StampTaxRate = 0
+	cfg.InitialCapital = 2008 // dragon+"" 两池 均分 → dragon 池 1004（旧实现缩量后 1000+5=1005>1004 → -1）
+	cfg.FixedAmount = 10000
+	cfg.MaxPositions = 10
+
+	e := New(cfg, "")
+	e.SetStrategyPools([]string{"dragon"})
+	dragonCash0 := e.PoolStats("dragon").Cash
+	if dragonCash0 != 1004 {
+		t.Fatalf("dragon 池应 1004, got %.2f", dragonCash0)
+	}
+	sig := combat_agent.Signal{
+		Code: "600000.SH", Name: "小池票", Strategy: "龙头", StrategyType: "dragon",
+		Direction: "做多", Action: "buy", Price: 10, Confidence: 0.6, GeneratedAt: time.Now(),
+	}
+	e.OnSignals([]combat_agent.Signal{sig}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	// 修复后收尾守卫拒绝（买不起一手含费），池现金分文未动、不穿负
+	after := e.PoolStats("dragon").Cash
+	if after < 0 {
+		t.Fatalf("池现金穿负: %.2f", after)
+	}
+	if after != dragonCash0 {
+		t.Fatalf("买不起一手含费应保持池现金 %.2f, got %.2f", dragonCash0, after)
+	}
+	// 对照组：池现金充足（可覆盖一手+最低佣金）时正常买入且池现金不为负
+	cfgOK := cfg
+	cfgOK.InitialCapital = 3000 // dragon 池 1500 ≥ 1000本金+5佣金
+	e2 := New(cfgOK, "")
+	e2.SetStrategyPools([]string{"dragon"})
+	sig2 := sig
+	sig2.Code = "600001.SH"
+	e2.OnSignals([]combat_agent.Signal{sig2}, map[string]*data.StockInfo{"600001.SH": {Price: 10}})
+	st2 := e2.PoolStats("dragon")
+	if st2.Cash < 0 || st2.OpenPositions != 1 {
+		t.Fatalf("可负担时应买入 1 笔且池现金非负: cash=%.2f open=%d", st2.Cash, st2.OpenPositions)
+	}
+}
+
+// TestPoolMinScoreNotBypassedByFullConfidence P2#22 回归：真实信号置信度恰为 1.0 时
+// 不得被当成"手动买入"绕过评分门槛（旧实现用 confidence<1 判别手动，1.0 的真信号被误放行）。
+// English: P2#22 regression — a genuine signal whose confidence is exactly 1.0 must NOT be treated as a
+// manual buy and skip the score gate (the old "confidence<1 ⇒ manual" proxy let a full-confidence
+// signal slip past MinScore).
+func TestPoolMinScoreNotBypassedByFullConfidence(t *testing.T) {
+	e := New(testCfg(), "")
+	e.SetStrategyPools([]string{"dragon"})
+	// MinScore=110（百分制刻度，message语文案 `%.0f`）：1.0 信号×100=100 < 110 → 必须拒绝
+	e.SetPoolBuyRule("dragon", &PoolBuyRule{MinScore: 110})
+	sig := combat_agent.Signal{
+		Code: "600000.SH", Name: "满分信号", Strategy: "龙头", StrategyType: "dragon",
+		Direction: "做多", Action: "buy", Price: 10, Confidence: 1.0, GeneratedAt: time.Now(),
+	}
+	e.OnSignals([]combat_agent.Signal{sig}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
+	if len(e.positions) != 0 {
+		t.Fatalf("confidence=1.0 的真实信号仍应受 MinScore=110 拦截, got %d positions", len(e.positions))
 	}
 }

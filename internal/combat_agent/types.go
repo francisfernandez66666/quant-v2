@@ -203,11 +203,11 @@ type SignalLog struct {
 //   - D1: D1 事件分（0~40），由 LLM 评分
 //   - Total: 四维总分（0~100），综合 d1/d2/d3/d4 四个维度
 //   - Level: 判定级别，可能的值：
-//     - full_chain: 完整形态确认
-//     - left_signal: 一突信号
-//     - right_signal: 二突信号
-//     - fail: 未通过
-//     - noscore: 无评分
+//   - full_chain: 完整形态确认
+//   - left_signal: 一突信号
+//   - right_signal: 二突信号
+//   - fail: 未通过
+//   - noscore: 无评分
 //   - Tag: 信号标记（一突/二突）
 //   - Pass: 本轮是否通过
 //   - Reason: 拦截原因（d1=0/total_below/emotion 等）

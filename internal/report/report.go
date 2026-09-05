@@ -325,6 +325,14 @@ func (r *Report) SellLot(id string, price, qty float64) {
 			break
 		}
 		// 部分卖出：FIFO 扣减批次数量
+		// §FIX#15 兼容无批次持仓（LogSignalWithMetaQty 手动录入仅设 Quantity，Lots 为空）：
+		// 合成单批次按持仓均价扣减，否则 partial 卖出在空循环下无效（余量不变）。
+		// English: FIX#15 — partial sells on batch-less holdings (manual entries via LogSignalWithMetaQty
+		// set only Quantity, leaving Lots empty) synthesize a single lot at the average cost, otherwise
+		// the FIFO loop no-ops and the remaining quantity never decreases.
+		if len(l.Lots) == 0 {
+			l.Lots = []Lot{{Price: l.EntryPrice, Quantity: l.Quantity, At: l.EntryAt}}
+		}
 		remain := qty
 		newLots := make([]Lot, 0, len(l.Lots))
 		for _, lot := range l.Lots {
@@ -644,6 +652,7 @@ func (r *Report) StatsByStrategy(userID string) map[string]StrategyStats {
 			a = &agg{}
 			aggs[strategy] = a
 		}
+		// 按已平仓盈亏归入赢/平/亏三档累计。
 		if l.ExitAt != nil && l.ProfitPct != nil {
 			switch {
 			case *l.ProfitPct > 0:
@@ -717,6 +726,7 @@ func (r *Report) statsFor(userID string) (total, holding, win int, winRate, avgW
 			holding++
 		}
 	}
+	// 汇总胜率/平均盈亏（无样本时保持 0）。
 	if winCount+lossCount > 0 {
 		winRate = float64(winCount) / float64(winCount+lossCount) * 100
 	}

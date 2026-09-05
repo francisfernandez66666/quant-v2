@@ -28,6 +28,7 @@ func Assemble(db *store.DB, code, start, end string) (*factor.StockSeries, error
 	if len(hfq) == 0 {
 		return nil, fmt.Errorf("%s 区间 %s-%s 无行情", code, start, end)
 	}
+	// 加载该股区间全部数据：前复权日K、原始K、每日基本面、历史财务与利润表。
 	raw, err := db.RawBars(code, start, end)
 	if err != nil {
 		return nil, err

@@ -197,6 +197,7 @@ func parseLHB(body []byte) ([]LHBItem, error) {
 	if !raw.Success || raw.Result == nil {
 		return nil, fmt.Errorf("eastmoney lhb: API returned success=false")
 	}
+	// 逐条龙虎榜记录组装 LHBItem（跳过空代码行）。
 	items := make([]LHBItem, 0, len(raw.Result.Data))
 	for _, r := range raw.Result.Data {
 		if r.Code == "" {

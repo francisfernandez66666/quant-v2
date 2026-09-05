@@ -12,8 +12,10 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/data"
 )
 
 // scoreStoreFile scores.json 磁盘结构（按交易日分桶）。
@@ -90,7 +92,13 @@ func (s *scoreStore) Load() map[string]combat_agent.StockScores {
 }
 
 // load 从磁盘加载 scores.json。文件不存在或损坏时静默保留空 map（不 panic）。
-// English: load reads scores.json from disk. When the file is missing or corrupt, it silently keeps an empty map (no panic).
+// §修复 P2#19：跨交易日桶校验——旧实现无条件装载 f.TradingDay 的分数，收盘后跨日重启
+// 会把昨日打分当"当日"展示给前端（端口口气源，昨日强分误导今日决策），直到下轮打分覆盖。
+// 现与 signal_store 同口径：仅装载当前交易日的桶，跨日自动重置为空分。
+// English: P2#19 — cross-trading-day bucket check. The old load accepted whatever TradingDay the file
+// carried, so a restart after close would show yesterday's scores as "today's" (a stale-signal source)
+// until the next scoring round overwrote them. Now only the current trading day's bucket is loaded;
+// a rollover resets to an empty map, matching signal_store's day-bucket semantics.
 func (s *scoreStore) load() {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
@@ -101,7 +109,14 @@ func (s *scoreStore) load() {
 		return
 	}
 	s.mu.Lock()
-	s.day = f.TradingDay
-	s.scores = f.Scores
+	// §修复 P2#19：交易日桶不匹配 → 视为空桶（当日从零开始），不展示旧日强分。
+	// English: P2#19 — a mismatched trading-day bucket counts as empty (start fresh today).
+	if f.TradingDay != data.TradingDayDate(time.Now()) {
+		s.day = f.TradingDay
+		s.scores = map[string]combat_agent.StockScores{}
+	} else {
+		s.day = f.TradingDay
+		s.scores = f.Scores
+	}
 	s.mu.Unlock()
 }

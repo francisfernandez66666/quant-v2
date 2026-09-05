@@ -18,6 +18,7 @@ import (
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
@@ -88,6 +89,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	f := e.fetcher
 	emotionPhase := e.lastEmotionPhase // 复用主循环算出的情绪阶段，不重复调涨停池接口
 	d1Scores := e.lastD1Scores         // 复用主循环最近一轮 D1 评分，不每 5s 调 LLM
+	bearReasons := e.lastBearReasons   // FIX#13 复用主循环利空归因（实盘建议利空→自动清仓）
 	e.mu.RUnlock()
 	if f == nil {
 		return
@@ -202,7 +204,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// English: live position advice (AUTO_TRADING_PLAN M1) — when qmt.enabled, generates 加仓/减仓/止盈/
 	// 止损/格局 advice for the real book (real_positions) and pushes it to the frontend live tab via SSE.
 	// Trading-hours only; no cost when disabled or no holdings. Never touches the paper book.
-	e.pushRealAdvice(md, scores, d1Scores, emotionPhase, quotes)
+	e.pushRealAdvice(md, scores, d1Scores, emotionPhase, quotes, bearReasons)
 
 	// 开市(9:30)前及午休(11:30-13:00)只更新评分数字，不发布任何战法信号：
 	// 盘前无实盘成交量，双响炮/龙头等易基于存量历史数据误报（如整池双响炮全 70、9:11 龙头）；
@@ -401,12 +403,29 @@ func (e *Engine) invalidateBrokenSignals(md map[string]*strategy_engine.StockMar
 	if e.signalStore == nil || e.msgStore == nil {
 		return
 	}
+	// §P2#24 已持有持仓不参与墓碑判定：买入后已成交持仓的信号是"持有中"的呈现，
+	// 现价跌破触发价只是浮亏，不是"买入依据破坏"——若照常打墓碑会把已买信号从
+	// 当日固化/消息中心抹掉，用户看不到自己买的票。仅对未持有的 code 判失效。
+	// rpt 为 nil（测试/未装配账本）时跳过豁免逻辑，保持原有墓碑行为。
+	// English: P2#24 — signals whose code is currently held are NOT tombstoned: a filled position is a
+	// hold, not a "broken buy premise"; tombstoning it would wipe the bought signal from today's pinned
+	// store and message center. Only non-held codes are candidates for invalidation. When rpt is nil
+	// (tests / no book attached) the exemption is skipped and the original tombstone behavior is kept.
+	held := make(map[string]bool, 8)
+	if e.rpt != nil {
+		for _, c := range e.rpt.HeldPositionCodesFor(e.userID) {
+			held[c] = true
+		}
+	}
 	pinned := e.signalStore.List()
 	if len(pinned) == 0 {
 		return
 	}
 	for _, sig := range pinned {
 		if sig.Direction != "做多" {
+			continue
+		}
+		if held[pureTsCode(sig.Code)] {
 			continue
 		}
 		smd := md[sig.Code]
@@ -479,7 +498,7 @@ func filterTransitionSignals(sigs []combat_agent.Signal, prev map[string]map[str
 // runs trading.Advise (sell-side reuse + add/hold rules), and pushes the advice to the frontend live tab
 // via SSE. Circuit-breaker health probing is also throttled here (gateway loss pauses orders and alerts).
 // Trading-hours only (after-hours skips to save memory).
-func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, scores map[string]combat_agent.StockScores, d1Scores map[string]combat_agent.D1Score, emotionPhase string, quotes map[string]*data.StockInfo) {
+func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, scores map[string]combat_agent.StockScores, d1Scores map[string]combat_agent.D1Score, emotionPhase string, quotes map[string]*data.StockInfo, bearReasons map[string]string) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
 	realStore := e.realStore
@@ -552,6 +571,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		D1Scores:     d1Scores,
 		ShortEnabled: e.ShortEnabled(),
 		EmotionPhase: emotionPhase,
+		BearReasons:  bearReasons, // FIX#13 利空归因接线：实盘持仓命中利空 → 止损级建议 → 自动清仓
 		Cfg:          ctrl.Config(),
 	})
 
@@ -582,6 +602,28 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 // 例如：sell:600519:止损:2026-08-30 表示茅台在当天的止损卖出幂等键。
 func realSellSignalID(tsCode, class string) string {
 	return fmt.Sprintf("sell:%s:%s:%s", pureTsCode(tsCode), class, data.TradingDayDate(time.Now()))
+}
+
+// realSoldQtyToday P2#13 汇总某账号某持仓「今日各全平类」的累计已成交数量——与单类 SumFilledQty
+// 的区别：止损/清仓与 m8 是两个独立幂等键（sell:<码>:止损:<日> vs sell:<码>:m8:<日>），
+// 旧实现各自只计本类的成交，若同日 止损 先全平、m8 随后再触发，m8 侧剩余量仍按全量算 →
+// 对已无仓的持仓下第二单（超额卖出）。按全部全平类累加后，剩余 = 持仓量 - Σ已卖，任一类先
+// 卖多少另一类就看到剩余多少，从根源杜绝跨类重卖。
+// English: P2#13 — sums today's TOTAL filled qty across all full-close classes for a code. The
+// stop-loss and m8 paths use independent idempotency keys (sell:<code>:止损:<day> vs sell:<code>:m8:<day>),
+// and each used to subtract only its own class's fills — so after 止损 already fully sold a position, a
+// later same-day m8 recomputed remaining from the full quantity and placed a second sell on an empty
+// position (overselling). Aggregating every full-close class makes remaining = heldQty - Σsold, so
+// whichever class fires first, the others see what's left. No cross-class double-sell.
+func (e *Engine) realSoldQtyToday(realStore *store.DB, userID, tsCode string) int {
+	if realStore == nil {
+		return 0
+	}
+	total := 0
+	for _, c := range []string{"止损", "m8"} {
+		total += realStore.SumFilledQty(userID, realSellSignalID(tsCode, c))
+	}
+	return total
 }
 
 // pureTsCode 剥离交易所后缀，返回纯数字代码。
@@ -639,7 +681,34 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 // English: R3-1 P0-B — filter positions by account: the old full-table RealPositions() could pair
 // account A's stop-loss advice with account B's same-code position and really sell it.
 func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, realStore *store.DB, advices []trading.PositionAdvice) {
-	if realStore == nil || !ctrl.Enabled() || ctrl.Mode() != "auto" || !ctrl.Config().AutoSell {
+	if realStore == nil || ctrl == nil {
+		return
+	}
+	// FIX#14 显式化卖出静默门槛：mode≠auto 或 auto_sell=false 时，若有止损级建议却跳单——
+	// 打一条节流告警让"为什么没自动卖"一眼可见（旧实现直接 return，用户以为自动卖出已开）。
+	// English: FIX#14 surface the silent sell gate — when stop-loss class advice exists but auto mode
+	// is off, log a throttled warning so "why didn't it auto-sell" is visible (the old early-return
+	// made users believe auto-sell was on while nothing ever fired).
+	gated := !ctrl.Enabled() || ctrl.Mode() != "auto" || !ctrl.Config().AutoSell
+	if gated {
+		for _, a := range advices {
+			if a.Action == "止损" {
+				reason := "qmt-disabled"
+				if ctrl.Enabled() {
+					if ctrl.Mode() != "auto" {
+						reason = "mode-" + ctrl.Mode()
+					} else if !ctrl.Config().AutoSell {
+						reason = "auto_sell=false"
+					}
+				}
+				log.Printf("[qmt-gate] %s(%s) 止损级建议未自动卖出: %s (mode=%s auto_sell=%v enabled=%v)",
+					a.Code, a.Name, reason, ctrl.Mode(), ctrl.Config().AutoSell, ctrl.Enabled())
+				opslog.DayOnce("auto-sell-gate:"+a.Code, func() {
+					opslog.Logf("quant", "止损级建议未自动卖出 %s(%s) 原因=%s", a.Code, a.Name, reason)
+				})
+				break
+			}
+		}
 		return
 	}
 	positions, err := realStore.RealPositionsForUser(userID)
@@ -661,8 +730,10 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 		// §修复 R6：日级幂等键 sell:<code>:止损:<交易日> 统计已成交数量，仅对"剩余未成交"部分补卖；
 		// 信号键追加 :r<剩余量> 桶——剩余量变化才开新单，避免部成后死循环重复下单，
 		// 也保证同日同剩余量不重复刷单（broker 仍在处理该笔时）。
+		// §修复 P2#13：剩余量按「今日全部全平类已成交」扣减（止损+m8），不再只看本类——
+		// 否则同日 止损 全平后 m8 再触发会对已空仓的持仓下第二单（超额卖出）。
 		base := realSellSignalID(p.TsCode, "止损")
-		filled := realStore.SumFilledQty(userID, base)
+		filled := e.realSoldQtyToday(realStore, userID, p.TsCode)
 		remaining := p.Qty - filled
 		if remaining <= 0 {
 			continue
@@ -749,8 +820,10 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 			price = q.Price
 		}
 		// §修复 R6：M8 清仓同样走剩余量补卖逻辑（按 code:day 桶统计已成交，剩余量>0 才发单）。
+		// §修复 P2#13：剩余量按「今日全部全平类已成交」扣减（止损+m8），与止损路径同口径——
+		// 防止 M8 在止损已全平后对空仓再下一单。
 		base := realSellSignalID(p.TsCode, "m8")
-		filled := realStore.SumFilledQty(userID, base)
+		filled := e.realSoldQtyToday(realStore, userID, p.TsCode)
 		remaining := p.Qty - filled
 		if remaining > 0 {
 			sid := fmt.Sprintf("%s:r%d", base, remaining)
@@ -784,6 +857,7 @@ func (e *Engine) loadM8Peak() float64 {
 	if path == "" {
 		return 0
 	}
+	// 读取失败/损坏按 0 处理（进程内峰值兜底，不影响主流程）。
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return 0
@@ -805,6 +879,7 @@ func (e *Engine) saveM8Peak(peak float64) {
 	if err != nil {
 		return
 	}
+	// 原子写：先建目录、写临时文件再 rename（损坏/失败仅影响重启基线连续性）。
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return
 	}

@@ -23,12 +23,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -254,6 +254,7 @@ func queryBrokerConnected(url, token string) bool {
 // 注意：目标是完整交易端 XtItClient.exe（在 QMT 安装目录 bin.x64 下），不是
 // userdata_mini 下的 XtMiniQmt.exe（该程序无法自动登录交易，见文件头）。
 func defaultMiniPath() string {
+	// 依次探测常见 QMT 安装路径，找不到再递归搜索 qmtImage 镜像。
 	cands := []string{
 		`C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe`,
 		`C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe`,
@@ -266,6 +267,7 @@ func defaultMiniPath() string {
 			return c
 		}
 	}
+	// 兜底：在常见盘符下递归搜索可执行镜像，命中即返回。
 	roots := []string{
 		`C:\Program Files (x86)`,
 		`C:\Program Files`,

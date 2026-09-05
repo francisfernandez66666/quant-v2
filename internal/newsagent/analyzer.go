@@ -91,6 +91,7 @@ func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 	// English: the source's own stock tags (e.g. Cailian Press stock_list) are merged into the attribution and cleaned by the cleaner
 	sourceStocks := mergeStr(ht.RelatedStocks, item.Stocks)
 
+	// 组装基础新闻事件：字段缺省补默认（Region=国内、Relation=不涉及）。
 	base := NewsEvent{
 		Title:       item.Title,
 		Content:     item.Content,

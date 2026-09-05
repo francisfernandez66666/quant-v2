@@ -37,6 +37,7 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	if err != nil {
 		log.Fatalf("同花顺（新）客户端初始化失败: %v（检查 /etc/quant.env 的 HITHINK_FINANCE_API_KEY）", err)
 	}
+	// 按 --kind 分发到对应同步子命令（adj_factor / pools / anomaly / valuations / fin-indicators）。
 	if *kind == string(data.HithinkDumpAdjFactors) {
 		cmdHithinkSyncAdjFactors(client, db, *tmpPath, *since, *batchSize)
 		return
@@ -407,6 +408,7 @@ func cmdHithinkSyncFinIndicators(client *data.HithinkClient, db *store.DB, args 
 	for _, r := range strings.Split(*reports, ",") {
 		repNums = append(repNums, strings.TrimSpace(r))
 	}
+	// 逐标的逐报告期拉取财务指标并组装入库，单次失败静默跳过。
 	total := 0
 	for _, code := range codes {
 		for _, rn := range repNums {

@@ -116,6 +116,7 @@ func signalGeneratedAtText(t time.Time) string {
 func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 	out := make([]fixSignal, 0, len(signals))
 	for _, s := range signals {
+		// 信号→前端 fixSignal 组装：含 D1~D4 维度分、可开仓判定（置信度≥0.7 且 buy）。
 		d1, d2, d3, d4 := dimScores(s)
 		fs := fixSignal{
 			Code:         s.Code,
@@ -129,6 +130,7 @@ func toFixSignals(signals []combat_agent.Signal) []fixSignal {
 			Action:       s.Action,
 			Price:        s.Price,
 			CanOpen:      s.Confidence >= 0.7 && s.Action == "buy",
+			// D1~D4 维度评分、D1 阻断信息与事件标题、盘口因素。
 			D1:           d1,
 			D2:           d2,
 			D3:           d3,
@@ -326,12 +328,14 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]interface{}{"error": "缺少 code 参数"})
 		return
 	}
+	// scale：分钟粒度（默认 1）；非法值回退默认。
 	scale := 1
 	if raw := r.URL.Query().Get("scale"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
 			scale = n
 		}
 	}
+	// count：请求点数（默认 241=一交易日分钟数）；上限 3000。
 	count := 241
 	if raw := r.URL.Query().Get("count"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
@@ -378,6 +382,7 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	macd := data.CalcMACDSeries(klines)
+	// 组装分时点：价格/成交量与 MACD 三线逐根对齐（DIF/DEA/BAR 保留两位小数）。
 	points := make([]fixMinutePoint, 0, len(klines))
 	for i, k := range klines {
 		m := macd[i]
@@ -445,10 +450,12 @@ func (s *Server) handleFixKLine(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]interface{}{"error": "缺少 code 参数"})
 		return
 	}
+	// period：K线周期编码（默认 "101" 日线）。
 	period := r.URL.Query().Get("period")
 	if period == "" {
 		period = "101"
 	}
+	// count：请求K线根数（默认 90）；上限 500。
 	count := 90
 	if raw := r.URL.Query().Get("count"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
@@ -622,6 +629,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		if lvl == "" {
 			lvl = "策略信号"
 		}
+		// 告警信号转消息条目（标题用级别+代码）。
 		item := map[string]interface{}{
 			"id":           a.ID,
 			"code":         a.Code,
@@ -642,6 +650,7 @@ func (s *Server) handleFixAlerts(w http.ResponseWriter, r *http.Request) {
 		// 仅展示持仓中或已平仓的记录，平仓记录用当前盈亏补全提示文本
 		if l.Status == "持仓中" || l.ExitAt != nil {
 			alertType := "持仓提示"
+			// 盈亏百分比文本（无数据时留空）。
 			pct := ""
 			if l.ProfitPct != nil {
 				pct = fmt.Sprintf("%.1f%%", *l.ProfitPct)
@@ -1532,10 +1541,12 @@ func (s *Server) handleFixEvaluations(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleFixIPOCalendar(w http.ResponseWriter, r *http.Request) {
 	list, err := s.ipoCalendar(time.Now())
 	if err != nil {
+		// 拉取失败返回空列表（前端显示空日历而非报错）。
 		log.Printf("[ipo] 获取失败: %v", err)
 		writeJSON(w, 200, []map[string]interface{}{})
 		return
 	}
+	// 组装 IPO 日历条目（代码/名称/上市日/发行价/状态）。
 	out := make([]map[string]interface{}, 0, len(list))
 	for _, item := range list {
 		out = append(out, map[string]interface{}{
@@ -1739,6 +1750,7 @@ func (s *Server) handleFixNews(w http.ResponseWriter, r *http.Request) {
 			"tagged":       true,
 		}
 		out = append(out, item)
+		// 记录已打标新闻标题（截断至 60 字），后续原始新闻展示时跳过重复项。
 		tagged[truncateTitle(e.Title, 60)] = true
 	}
 	for _, n := range rawNews {
@@ -1942,12 +1954,20 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := userFromContext(r)
+	// §P2#29 防御：nil 检查前置——旧实现先取 user.ID（1945）再判空（1950），
+	// user 为 nil 时解引用直接 panic。现先判空再取 ID。
+	// English: P2#29 defensive — the nil check now runs before dereferencing user.ID; the old order
+	// panicked on a nil user.
+	if user == nil {
+		writeError(w, 401, "unauthorized")
+		return
+	}
 	ctrl := s.qmtCtrlFor(user.ID)
 	if ctrl != nil && ctrl.Enabled() && ctrl.Mode() == "manual" {
 		// §GAP1.8（A5）：实盘下单分支独立权限位——仅 admin 可触发真实下单；
 		// 模拟买入等其余分支不受影响（普通用户仍可用）。
 		// English: §GAP1.8 (A5) — the live-order branch requires admin; other branches unaffected.
-		if user == nil || !user.IsAdmin() {
+		if !user.IsAdmin() {
 			writeError(w, 403, "admin required for live orders")
 			return
 		}
@@ -1955,10 +1975,12 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "code required")
 			return
 		}
+		// 买卖方向：卖出/卖映射到卖出侧，其余默认买入。
 		side := trading.SideBuy
 		if req.Action == "卖出" || req.Action == "sell" {
 			side = trading.SideSell
 		}
+		// 未传价格时取实时行情价；仍未取得则拒绝。
 		price := req.Price
 		if price <= 0 {
 			if q, err := s.quote(req.Code); err == nil && q != nil && q.Price > 0 {
@@ -1969,10 +1991,12 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "price unavailable")
 			return
 		}
+		// 未传数量默认一手（100 股）。
 		qty := req.Qty
 		if qty <= 0 {
 			qty = 100
 		}
+		// 未传幂等键时生成 manual@code@时间戳 唯一键。
 		signalID := req.SignalID
 		if signalID == "" {
 			signalID = "manual@" + req.Code + "@" + time.Now().Format("20060102150405")

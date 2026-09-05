@@ -138,6 +138,7 @@ func (s *Server) handlePaperSelfCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := pe.Path()
+	// 引擎健康信息：开关/权限/持仓数/资金池数等概览。
 	info := map[string]interface{}{
 		"enabled":       pe.Enabled(),
 		"is_admin":      s.auth.IsAdmin(uid),
@@ -333,6 +334,7 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
+	// qty>0 按手数减仓，否则整仓卖出（价格按用户输入，缺省走实时价）。
 	if req.Qty > 0 {
 		if err := pe.SellEx(req.Code, req.Price, req.Qty, s.liveQuotes(req.Code)); err != nil {
 			writeError(w, 400, err.Error())

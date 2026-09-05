@@ -25,7 +25,7 @@ func initConfig(t *testing.T) *config.Manager {
 func TestVerifyDeploymentQMTDisabled(t *testing.T) {
 	m := initConfig(t)
 	m.Rules.QMT = config.DefaultQMTConfig() // enabled=false
-	verifyDeployment(m)                      // 不应 panic
+	verifyDeployment(m)                     // 不应 panic
 }
 
 // TestVerifyDeploymentQMTEnabledNoToken QMT enabled=true 但缺 token → 必须输出 Noop 告警（开关白开根因）。

@@ -143,11 +143,11 @@ func (ds *D1Scorer) SetMaxTokens(n int) int {
 // 打分采用 0~40 满分制（对应 N 形 D1 维度：事件驱动硬闸，满分 40，信号需 D1>0）。
 //
 // 评分优先级：
-//   1. 负面过滤(negative_filter): score=0, blocked=true
-//   2. 顶级影响(top_impact): score=16~40
-//   3. 间接影响(indirect): score=12~24
-//   4. 中等影响(medium_impact): score=8~20
-//   5. 低影响(low_impact): score=0~8
+//  1. 负面过滤(negative_filter): score=0, blocked=true
+//  2. 顶级影响(top_impact): score=16~40
+//  3. 间接影响(indirect): score=12~24
+//  4. 中等影响(medium_impact): score=8~20
+//  5. 低影响(low_impact): score=0~8
 var d1SystemPrompt = `你是一个A股个股D1事件评分专家。对每只个股基于关联事件进行D1评分。
 
 评分采用 0~40 满分制，对应 N 形策略的 D1 事件驱动维度（满分 40，信号需 D1>0 且 总分≥60）。
@@ -589,13 +589,13 @@ func minInt(a, b int) int {
 
 // cleanJSON 清洗 LLM 返回的原始字符串，提取出纯 JSON 数组部分。
 // 处理步骤：
-//   1. 去除首尾空格
-//   2. 全局剔除 UTF-8 BOM(U+FEFF)
-//   3. 去除 markdown 代码块标记（```json / ```）
-//   4. 提取第一个 '[' 到最后一个 ']' 之间的内容
-//   5. 去除末尾多余标点
-//   6. 清理非法 '+' 前缀数值
-//   7. 转义字符串值中的换行符
+//  1. 去除首尾空格
+//  2. 全局剔除 UTF-8 BOM(U+FEFF)
+//  3. 去除 markdown 代码块标记（```json / ```）
+//  4. 提取第一个 '[' 到最后一个 ']' 之间的内容
+//  5. 去除末尾多余标点
+//  6. 清理非法 '+' 前缀数值
+//  7. 转义字符串值中的换行符
 //
 // 参数：
 //   - s: LLM 返回的原始字符串

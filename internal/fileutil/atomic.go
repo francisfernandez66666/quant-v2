@@ -26,6 +26,7 @@ func AtomicWrite(path string, raw []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName) // rename 成功后是 no-op；失败路径清理半截文件
 	}()
+	// 写临时文件→fsync→改权限→rename 原子替换，目录 fsync 尽力而为。
 	if _, err := tmp.Write(raw); err != nil {
 		return err
 	}

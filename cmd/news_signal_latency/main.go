@@ -130,6 +130,7 @@ func main() {
 
 	// —— 阶段2：新闻→D1 ——
 	fmt.Println("=== 阶段2 新闻→D1 ===")
+	// 配置真实 LLM D1 评分器：API 参数缺省回退配置文件，随后批量评分。
 	d1s := map[string]combat_agent.D1Score{}
 	var d1Ms time.Duration
 	if apiKey := os.Getenv("LLM_API_KEY"); apiKey != "" {
@@ -166,6 +167,7 @@ func main() {
 	cAgent.SetRunners(combat_agent.NewRunners(cfgMgr, matcher))
 
 	fmt.Printf("=== 阶段3 逐战法评分+信号(生产5s节奏, %d轮) ===\n", *cycles)
+	// 按生产 5s 节奏循环评分：记录各战法首次信号时间与信号计数。
 	tAnchor := time.Now()
 	firstSig := map[string]time.Time{}
 	sigCount := map[string]int{}

@@ -1774,6 +1774,7 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "引擎未启动")
 		return
 	}
+	// 解析咨询请求体：空消息直接拒绝。
 	var req consultReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -1783,6 +1784,7 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "message required")
 		return
 	}
+	// 提取用户 ID（未登录时为空串），用于专业模式与私有历史寻址。
 	user := userFromContext(r)
 	userID := ""
 	if user != nil {

@@ -65,11 +65,24 @@ func TestRuleExitOverridesLookupAndExit(t *testing.T) {
 	if res2 := genericTrailingExit(ctx, now); res2 != nil {
 		t.Fatalf("默认阈值不应触发: %+v", res2)
 	}
-	// 超期覆盖：pat_9 持仓 3 天即离场（EntryAt=19 日 → 22 日恰 3 天）
+	// 超期覆盖：pat_9 持仓 3 个交易日即离场（EntryAt=19 日(周三) → 24 日(周一) 恰满 3 个交易日）
+	// §修复 FIX#10：超期按交易日计，周末/节假日不计持仓日——旧自然日语义在 22 日(周六)即误判超期。
 	ctx2 := &strategy.ExitContext{CostPrice: 100, CurPrice: 101, EntryAt: "2026-08-19",
-		EntryMeta: map[string]float64{}, Now: now}
-	if r := genericTrailingExitWith(ctx2, now, 8, 3); r == nil || r.Reason != "持仓超期离场" {
+		EntryMeta: map[string]float64{}, Now: time.Date(2026, 8, 24, 15, 0, 0, 0, time.UTC)}
+	if r := genericTrailingExitWith(ctx2, time.Date(2026, 8, 24, 15, 0, 0, 0, time.UTC), 8, 3); r == nil || r.Reason != "持仓超期离场" {
 		t.Fatalf("超期覆盖失效: %+v", r)
+	}
+	// 周五买入 + 周末：2 个自然日(0 交易日)不得判超期——旧自然日逻辑 2≥2 会误判离场
+	ctx3 := &strategy.ExitContext{CostPrice: 100, CurPrice: 101, EntryAt: "2026-08-21",
+		EntryMeta: map[string]float64{}, Now: time.Date(2026, 8, 23, 15, 0, 0, 0, time.UTC)}
+	if r := genericTrailingExitWith(ctx3, time.Date(2026, 8, 23, 15, 0, 0, 0, time.UTC), 8, 2); r != nil {
+		t.Fatalf("周末不得计入持仓交易日: %+v", r)
+	}
+	// 周五买入 → 满 2 个交易日后（下周二）应判超期
+	ctx4 := &strategy.ExitContext{CostPrice: 100, CurPrice: 101, EntryAt: "2026-08-21",
+		EntryMeta: map[string]float64{}, Now: time.Date(2026, 8, 25, 15, 0, 0, 0, time.UTC)}
+	if r := genericTrailingExitWith(ctx4, time.Date(2026, 8, 25, 15, 0, 0, 0, time.UTC), 8, 2); r == nil || r.Reason != "持仓超期离场" {
+		t.Fatalf("满 2 个交易日应判超期: %+v", r)
 	}
 }
 

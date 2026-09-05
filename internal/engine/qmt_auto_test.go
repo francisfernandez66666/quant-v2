@@ -5,11 +5,14 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +72,33 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 	return e, db, srv, &orders
 }
 
+// TestAutoPlaceQueueFullFallsBackSync §修复 FIX#8：buyCh 满队时不得静默丢弃——
+// 回落同步 PlaceOrder 兜底（旧实现 select default 直接 drop，当日信号永久丢失）。
+// English: §FIX#8 regression — when the async buy queue is full, autoPlace falls back to a
+// synchronous order instead of silently dropping the signal.
+func TestAutoPlaceQueueFullFallsBackSync(t *testing.T) {
+	e, _, _, orders := newQMTEngine(t, nil)
+	// 直接注入一个无消费者的满缓冲队列（不走 worker，避免 worker 并发消费干扰断言）
+	e.mu.Lock()
+	if e.buyCh == nil {
+		e.buyCh = make(chan buyTask, 64)
+	}
+	ch := e.buyCh
+	e.mu.Unlock()
+	for i := 0; i < cap(ch); i++ {
+		ch <- buyTask{}
+	}
+	// 队列已满：autoPlace 应同步兜底下单，而非丢弃
+	sig := combat_agent.Signal{ID: "SIG-FULL", Code: "600000", Name: "浦发", Strategy: "龙头", Direction: "做多", Price: 10}
+	e.autoPlace(sig, map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}})
+	if len(*orders) != 1 {
+		t.Fatalf("满队回落同步应下 1 单, got %d", len(*orders))
+	}
+	if o := (*orders)[0]; o["code"] != "600000.SH" || o["side"] != "买入" {
+		t.Fatalf("同步兜底单内容异常: %+v", o)
+	}
+}
+
 // TestAutoPlacePlacesOrder 验证 auto 模式做多信号直下网关：金额折算整手、code 补后缀、信号 ID 幂等键。
 func TestAutoPlacePlacesOrder(t *testing.T) {
 	e, _, _, orders := newQMTEngine(t, nil)
@@ -105,6 +135,28 @@ func TestAutoPlaceSkipsWhenManual(t *testing.T) {
 	e.autoPlace(combat_agent.Signal{ID: "S1", Code: "000001", Strategy: "龙头", Direction: "做多", Price: 10}, nil)
 	if len(*orders) != 0 {
 		t.Fatalf("manual mode should not place, got %d", len(*orders))
+	}
+}
+
+// TestAutoPlaceIdempotencyKeyStable P2#14 回归：幂等键用稳定 ID（fac_1）而非可变显示名——
+// 库规则改名后旧键与新键仍是同一个（防同日重复下单）；两条同名规则不会键碰撞合并。
+// English: P2#14 regression — the buy idempotency key uses the stable rule ID (fac_1) instead of the
+// mutable display name: renaming a library rule keeps the same key (no intraday duplicate order), and
+// two same-named rules never collapse into one key.
+func TestAutoPlaceIdempotencyKeyStable(t *testing.T) {
+	e, _, _, orders := newQMTEngine(t, nil)
+	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
+	// fac_1 改名前后显示名不同，但 StrategyID 稳定 → 幂等键应不变
+	e.autoPlace(combat_agent.Signal{ID: "S1", Code: "600000", Name: "浦发",
+		Strategy: "强势龙头V2", StrategyID: "fac_1", Direction: "做多", Price: 10}, live)
+	e.autoPlace(combat_agent.Signal{ID: "S2", Code: "600000", Name: "浦发",
+		Strategy: "老名字", StrategyID: "fac_1", Direction: "做多", Price: 10}, live)
+	if len(*orders) != 1 {
+		t.Fatalf("改名后同 StrategyID 应幂等去重为 1 单, got %d: %+v", len(*orders), *orders)
+	}
+	want := fmt.Sprintf("buy:600000:fac_1:%s", data.TradingDayDate(time.Now()))
+	if o := (*orders)[0]; o["signal_id"] != want {
+		t.Fatalf("signal_id: got %v want %v", o["signal_id"], want)
 	}
 }
 
@@ -284,6 +336,100 @@ func TestAutoSellDisabledSkips(t *testing.T) {
 	e.autoExecuteRealSells(e.UserID(), e.QMTController(), db, advices)
 	if len(*orders) != 0 {
 		t.Fatalf("auto_sell=false 不应下单, got %d", len(*orders))
+	}
+}
+
+// TestAutoSellNoLiveQuoteSkips P2#25 回归：行情缺失时 fromSignal 保持 RefPrice=0，
+// autoExecuteRealSells 的守卫（a.RefPrice<=0 continue）必须拦下，不按成本价挂错单。
+// English: P2#25 regression — when no live quote exists the advice carries RefPrice=0 and the auto-sell
+// guard must skip it (no order at the wrong cost price).
+func TestAutoSellNoLiveQuoteSkips(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.AutoSell = true })
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 止损级建议但 RefPrice=0（行情缺失，fromSignal 不再回退成本价）
+	advices := []trading.PositionAdvice{
+		{Code: "600000", TsCode: "600000.SH", Action: "止损", Level: "高", RefPrice: 0, Reason: "破位"},
+	}
+	e.autoExecuteRealSells(e.UserID(), e.QMTController(), db, advices)
+	if len(*orders) != 0 {
+		t.Fatalf("行情缺失(RefPrice=0)不应挂单, got %d", len(*orders))
+	}
+}
+
+// TestAutoSellCrossClassMutualExclusion P2#13 回归：止损与 m8 是全平类但幂等键相互独立——
+// 旧实现各自只扣本类成交，m8 已全平（当日成交 500）后止损仍按 full qty 复发（对已空仓重复卖出）。
+// 修复后剩余量按「今日全部全平类已成交」（止损+m8）扣减，且按码作用域隔离。
+func TestAutoSellCrossClassMutualExclusion(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.AutoSell = true })
+	ctrl := e.QMTController()
+	// 场景一：m8 当日已全平 500（fills 落账），券商对账延迟仍报 500 → 止损剩余=0，不得再挂单
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10, Amount: 5000, Strategy: "龙头"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyRealFill(store.RealFill{
+		OrderID: "M8FILL1", Code: "600000.SH", Name: "浦发", Side: "卖出", Price: 9,
+		Qty: 500, Amount: 4500, TradedAt: "2026-09-04 10:00:00",
+		SignalID: realSellSignalID("600000.SH", "m8"), UserID: e.UserID(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// m8 清仓后券商全量对账重推仍报 500（回报延迟窗口，持仓行被重建）——此时止损建议不得再卖
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10, Amount: 5000, Strategy: "龙头"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.autoExecuteRealSells(e.UserID(), ctrl, db, []trading.PositionAdvice{
+		{Code: "600000", TsCode: "600000.SH", Action: "止损", Level: "高", RefPrice: 9.0, Reason: "破位止损"},
+	})
+	if len(*orders) != 0 {
+		t.Fatalf("m8 已全平后止损不应重复卖出, got %d orders: %+v", len(*orders), *orders)
+	}
+
+	// 场景二：互斥必须按码作用域——m8 只清了 600000，另一码 600519 的止损仍应正常卖出
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600519.SH", Name: "茅台", Qty: 200, CostPrice: 1500, Amount: 300000, Strategy: "龙头"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.autoExecuteRealSells(e.UserID(), ctrl, db, []trading.PositionAdvice{
+		{Code: "600519", TsCode: "600519.SH", Action: "止损", Level: "高", RefPrice: 1400, Reason: "破位"},
+	})
+	if len(*orders) != 1 || (*orders)[0]["qty"].(float64) != 200 {
+		t.Fatalf("跨类互斥应按码隔离, 600519 止损应正常卖 200: %+v", *orders)
+	}
+}
+
+// TestAutoSellGateModeManualLogs FIX#14：mode=manual 时止损级建议不自动下单，
+// 但必须打出 [qmt-gate] 门槛日志（旧实现静默 return，用户以为自动卖出已开）。
+// English: FIX#14 regression — with mode=manual, stop-loss advice is not auto-ordered, but a
+// [qmt-gate] gate log is emitted (the old silent return made users think auto-sell was on).
+func TestAutoSellGateModeManualLogs(t *testing.T) {
+	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.Mode = "manual" })
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 捕获标准日志输出断言门槛告警
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	advices := []trading.PositionAdvice{{Code: "600000", TsCode: "600000.SH", Action: "止损", RefPrice: 9, Reason: "破位"}}
+	e.autoExecuteRealSells(e.UserID(), e.QMTController(), db, advices)
+	if len(*orders) != 0 {
+		t.Fatalf("mode=manual 不应自动下单, got %d", len(*orders))
+	}
+	if !strings.Contains(buf.String(), "[qmt-gate]") || !strings.Contains(buf.String(), "止损级建议未自动卖出") {
+		t.Fatalf("mode=manual 门槛应打 [qmt-gate] 日志, got: %s", buf.String())
 	}
 }
 

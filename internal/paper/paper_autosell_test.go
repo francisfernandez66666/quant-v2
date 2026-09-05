@@ -41,9 +41,9 @@ func buyFill(t *testing.T, e *Engine) {
 	}
 }
 
-// TestSellActionVocabulary SellAction 词汇归一：清仓→close；减仓/利空抛售→trim；
+// TestSellActionVocabulary SellAction 词汇归一：清仓/利空抛售→close；减仓→trim；
 // 硬止盈/止损（Action）→close；软提示/关注/跌幅提醒→""；做空方向词→""。
-// English: SellAction vocabulary — 清仓→close; 减仓/利空抛售→trim; hard TP/SL by Action→close;
+// English: SellAction vocabulary — 清仓/利空抛售→close; 减仓→trim; hard TP/SL by Action→close;
 // soft 提示/关注/跌幅提醒→""; short-direction badge→"".
 func TestSellActionVocabulary(t *testing.T) {
 	cases := []struct {
@@ -52,7 +52,7 @@ func TestSellActionVocabulary(t *testing.T) {
 	}{
 		{combat_agent.Signal{Direction: "提醒", Action: "卖出", AlertType: "清仓"}, "close"},
 		{combat_agent.Signal{Direction: "提醒", Action: "卖出", AlertType: "减仓"}, "trim"},
-		{combat_agent.Signal{Direction: "提醒", Action: "卖出", AlertType: "利空抛售"}, "trim"},
+		{combat_agent.Signal{Direction: "提醒", Action: "卖出", AlertType: "利空抛售"}, "close"},
 		{combat_agent.Signal{Direction: "提醒", Action: "止盈", AlertType: "止盈"}, "close"},
 		{combat_agent.Signal{Direction: "提醒", Action: "止损", AlertType: "止损"}, "close"},
 		{combat_agent.Signal{Direction: "提醒", Action: "关注", AlertType: "提示"}, ""},

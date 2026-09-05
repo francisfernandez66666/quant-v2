@@ -99,6 +99,11 @@ func (b *SSEBroker) Unsubscribe(ch chan SSEEvent) {
 }
 
 // UnsubscribeFor 注销指定账号下的一个 SSE 客户端，关闭并移除其 channel。
+// §修复 FIX#5（2026-09-04）：close(ch) 移入锁内——旧实现先解锁再关闭，与 Broadcast/BroadcastTo
+// 持锁对每个已注册 channel 非阻塞 send 并发 → `send on closed channel` panic。
+// 现在先删注册再关 channel，注销与广播在锁内互斥，杜绝向已关闭 channel 发送。
+// English: §FIX#5 — close the channel while holding the lock (remove from the registry first), so a
+// concurrent Broadcast holding the same lock can never send on a closed channel (no send-on-closed panic).
 func (b *SSEBroker) UnsubscribeFor(userID string, ch chan SSEEvent) {
 	b.mu.Lock()
 	if set := b.clients[userID]; set != nil {
@@ -107,8 +112,8 @@ func (b *SSEBroker) UnsubscribeFor(userID string, ch chan SSEEvent) {
 			delete(b.clients, userID)
 		}
 	}
-	b.mu.Unlock()
 	close(ch)
+	b.mu.Unlock()
 }
 
 // Broadcast 向所有账号的所有 SSE 客户端广播消息（全局事件，如 scan/score/trigger 状态事件）。

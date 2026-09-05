@@ -104,12 +104,13 @@ func Advise(in AdviceInput) []PositionAdvice {
 		}
 	}
 
-	// 6. 加仓/格局：对无卖出建议的持仓逐只判定
+	// 6. 加仓/格局：对无卖出建议的持仓逐只判定（已有卖出级建议的不再叠加）。
 	for _, p := range in.Positions {
 		code := pureCode(p.TsCode)
 		if advByCode[code] != nil {
 			continue // 已有卖出级建议，不再叠加加仓/格局
 		}
+		// 无行情则跳过；有行情时先试加仓建议，再加仓不成立再试格局持有建议。
 		quote := in.Quotes[code]
 		if quote == nil || quote.Price <= 0 {
 			continue
@@ -241,6 +242,15 @@ func fromSignal(sig combat_agent.Signal, in AdviceInput, now time.Time, _ string
 		price = p.CostPrice
 	}
 	pa := baseAdvice(*p, price, now)
+	// §P2#25 行情缺失不伪造现价：RefPrice 是自动卖出的挂单价来源（autoExecuteRealSells 用它下单）。
+	// 旧实现把成本价顶替成"参考价"，行情缺失时止损级建议会按成本价真实挂单（挂错价）。
+	// 改为缺失时 RefPrice=0 —— 自动卖出守卫（a.RefPrice<=0 跳过）拦截，宁可不成交也不挂错价；
+	// 展示侧仍用成本价兜底估值（ProfitPct=0，语义为"现价未知"）。
+	// English: P2#25 — a missing live quote no longer fakes a reference price. RefPrice feeds the auto-sell
+	// order price (autoExecuteRealSells), and the old cost-price fallback would place a real order at cost
+	// when no quote existed. Now RefPrice stays 0 so the auto-sell guard skips it — better no order than a
+	// wrong-priced one. Display still estimates value at cost (ProfitPct=0, meaning "live price unknown").
+	pa.RefPrice = sig.Price
 	pa.Reason = sig.Reason
 	switch sig.AlertType {
 	case "清仓":

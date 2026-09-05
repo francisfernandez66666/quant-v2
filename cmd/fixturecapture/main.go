@@ -285,6 +285,7 @@ func applyFallbacks(fix *e2e.Fixture, api *data.MarketAPI, sinaQuotes map[string
 				log.Printf("fallback: 板块 %q 未在同花顺名单", sec.board)
 				continue
 			}
+			// 从新浪实时行情拼板块成分股快照，全部缺失则跳过该板块。
 			var stocks []data.StockInfo
 			for _, code := range sec.codes {
 				si := sinaQuotes[code]

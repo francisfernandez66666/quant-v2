@@ -13,6 +13,7 @@ package combat_agent
 
 import (
 	"math"
+	"time"
 
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/strategy_engine"
@@ -80,11 +81,16 @@ func volumePriceRatio(md *strategy_engine.StockMarketData) float64 {
 	// Prior 20-day average volume (excluding today's bar, approximating the volume baseline).
 	avgV := avgVol(kl[:len(kl)-1], 20)
 
-	// 量比分档：放量程度越高得分越高
-	// Volume-ratio buckets: the more volume expands, the higher the score.
+	// 量比分档：放量程度越高得分越高。
+	// §修复 P2#26：今日实时累计量按已流逝交易分钟折算全天等值后与日均量比较——
+	// 否则上午累计量天然偏小、量比被稀释（同一放量 09:40 只显示 1/4 强度），早盘动量
+	// 信号常被"量能不足"误压；归一后任意时刻与收盘口径一致。
+	// English: P2#26 — normalize today's cumulative volume to a full-day equivalent by elapsed trading
+	// minutes before bucketing; otherwise a morning burst reads ~1/4 strength and momentum signals are
+	// wrongly throttled early in the session.
 	volScore := 0.0
 	if avgV > 0 {
-		ratio := q.Volume / avgV
+		ratio := intradayVolumeRatio(time.Now(), q.Volume, avgV)
 		switch {
 		case ratio >= 2:
 			volScore = 1.0

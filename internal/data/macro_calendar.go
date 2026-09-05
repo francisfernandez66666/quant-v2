@@ -152,6 +152,7 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 		default:
 			impact = "medium"
 		}
+		// 影响持续天数：缺省 2 天，仅接受 1~30 天。
 		duration := 2
 		if len(parts) >= 3 {
 			if n := atoiDefault(parts[2], 2); n > 0 && n <= 30 {

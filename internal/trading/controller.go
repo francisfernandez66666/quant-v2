@@ -11,6 +11,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quant-trading-v2/internal/cntime"
@@ -21,6 +22,10 @@ import (
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 )
+
+// execHolder 统一 atomic.Value 存储载荷：同一具体类型避免 Store 不同类型触发 panic。
+// English: uniform payload for atomic.Value so the stored concrete type never changes.
+type execHolder struct{ e Executor }
 
 // Controller 交易执行控制器。
 // English: Controller is the trade execution controller.
@@ -33,7 +38,7 @@ type Controller struct {
 	// 只串行化下单路径（HealthCheck/StateSnapshot 等读路径不取该锁），单实盘账户场景无吞吐损失。
 	orderMu sync.Mutex // 下单路径互斥锁
 
-	exec            Executor         // 下单执行器（真实网关 / noop）
+	exec            atomic.Value     // 下单执行器（真实网关 / noop）——§修复 FIX#7 原子引用，持 Executor 接口
 	store           *store.DB        // 研究库（real_positions/orders/fills 落库）
 	cfg             config.QMTConfig // 当前生效的 QMT 配置（热加载替换）
 	userID          string           // 归属账号（多账号模式下各引擎独立控制器）
@@ -79,13 +84,29 @@ func NewController(exec Executor, db *store.DB, userID string, cfg config.QMTCon
 	if exec == nil {
 		exec = NoopExecutor{}
 	}
-	return &Controller{
-		exec:    exec,
+	c := &Controller{
 		store:   db,
 		userID:  userID,
 		cfg:     cfg,
 		onAlert: onAlert,
 	}
+	c.exec.Store(execHolder{exec}) // §FIX#7 executor 走原子引用
+	return c
+}
+
+// execRef 返回当前生效的下单执行器（原子读；nil 兜底 Noop）。
+// §修复 FIX#7（2026-09-04）：executor 由 ApplyPendingConfig 在交易时段被替换，其余路径并发读取。
+// 旧实现裸字段读写构成 data race（go test -race 可复现），且替换窗口内入队任务可能命中错误执行器
+// （如真单任务在切换成 Noop 后被当作业务拒单静默丢弃）。统一走原子引用后替换与读取天然互斥。
+// English: §FIX#7 — the executor is swapped at trading session by ApplyPendingConfig while other
+// goroutines (worker / sweep / health) read it concurrently; the old plain field raced and could hand a
+// real order to the wrong executor mid-swap. Reads now go through this atomic getter.
+func (c *Controller) execRef() Executor {
+	v := c.exec.Load()
+	if v == nil {
+		return NoopExecutor{}
+	}
+	return v.(execHolder).e
 }
 
 // UpdateConfig 立即应用配置（紧急语义）：halt（kill-switch）/ 测试直接生效，不进队列。
@@ -129,13 +150,13 @@ func (c *Controller) ApplyPendingConfig() bool {
 	c.pendingCfg = nil
 	c.cfg = cfg
 	needClient := cfg.Enabled && cfg.GatewayURL != ""
-	_, isClient := c.exec.(*QMTClient)
+	_, isClient := c.exec.Load().(execHolder).e.(*QMTClient)
 	switch {
 	case needClient && !isClient:
-		c.exec = NewQMTClient(cfg.GatewayURL, cfg.Token, time.Duration(cfg.TimeoutSec)*time.Second, 1)
+		c.exec.Store(execHolder{NewQMTClient(cfg.GatewayURL, cfg.Token, time.Duration(cfg.TimeoutSec)*time.Second, 1)})
 		log.Printf("[trading] QMT 实盘已启用，executor 切换为真实网关 (%s)", cfg.GatewayURL)
 	case !needClient && isClient:
-		c.exec = NoopExecutor{}
+		c.exec.Store(execHolder{NoopExecutor{}})
 		log.Printf("[trading] QMT 实盘已停用，executor 回退 Noop")
 	}
 	return true
@@ -303,7 +324,7 @@ func (c *Controller) HealthCheck() {
 	c.mu.Unlock()
 
 	started := time.Now()
-	ok, err := c.exec.Health()
+	ok, err := c.execRef().Health()
 	c.mu.Lock()
 	c.lastLatencyMs = time.Since(started).Milliseconds()
 	c.mu.Unlock()
@@ -511,9 +532,9 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 
 	var res *OrderResult
 	if req.Side == SideSell {
-		res, err = c.exec.PlaceSell(req)
+		res, err = c.execRef().PlaceSell(req)
 	} else {
-		res, err = c.exec.PlaceBuy(req)
+		res, err = c.execRef().PlaceBuy(req)
 	}
 	if err != nil {
 		// §GAP2-W1 发送失败降级：占位行从"已报"改为"发送失败"——
@@ -707,7 +728,7 @@ func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID strin
 // a fully-flat book now clears local rows via user-scoped reconciliation (legacy rows included,
 // other accounts' rows never touched).
 func (c *Controller) Reconcile() error {
-	st, err := c.exec.State()
+	st, err := c.execRef().State()
 	if err != nil {
 		return err
 	}
@@ -773,7 +794,7 @@ func (c *Controller) CancelOrder(orderID string) error {
 	if !enabled {
 		return fmt.Errorf("qmt disabled")
 	}
-	if err := c.exec.Cancel(orderID); err != nil {
+	if err := c.execRef().Cancel(orderID); err != nil {
 		return err
 	}
 	if c.store != nil {
@@ -804,7 +825,7 @@ func (c *Controller) HaltAll() int {
 		if (o.Status != "已报" && o.Status != "部成") || strings.HasPrefix(o.OrderID, "pend:") {
 			continue
 		}
-		if err := c.exec.Cancel(o.OrderID); err != nil {
+		if err := c.execRef().Cancel(o.OrderID); err != nil {
 			log.Printf("[trading] HaltAll 撤单失败 %s: %v", o.OrderID, err)
 			continue
 		}
@@ -914,7 +935,7 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 		if !((staleSec > 0 && age > staleAfter) || closeSweep) {
 			continue
 		}
-		if err := c.exec.Cancel(o.OrderID); err != nil {
+		if err := c.execRef().Cancel(o.OrderID); err != nil {
 			res.Errors++
 			// 典型失败：交易所委托号尚未回报（网关暂不可撤）/ 已成交（撤单被拒）——
 			// 不强试，交由回报线程推进真实状态，下轮再评估

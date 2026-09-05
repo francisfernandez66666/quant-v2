@@ -190,6 +190,7 @@ func (tc *THSClient) getBoardPage(url string) ([]SectorInfo, error) {
 		return nil, fmt.Errorf("no board links found in %s", url)
 	}
 
+	// 去重收集板块链接：空代码/空名称/重复代码一律跳过。
 	seen := make(map[string]bool)
 	result := make([]SectorInfo, 0, len(matches))
 	for _, m := range matches {
@@ -248,6 +249,7 @@ func (tc *THSClient) GetBoardStocks(boardCode string, topN int) ([]StockInfo, er
 		if len(matches) == 0 {
 			break // 无新链接 → 到底了
 		}
+		// 去重收集成分股代码，到达 topN 上限即停止分页。
 		for _, m := range matches {
 			code := m[1]
 			if code == "" || seen[code] {
@@ -308,6 +310,7 @@ func (tc *THSClient) getTopBoardPage(url string) ([]SectorInfo, error) {
 		return nil, err
 	}
 
+	// 解析榜单页：逐 tbody/tr/td 提取单元格，少于 6 列或取不到代码则跳过该行。
 	var out []SectorInfo
 	for _, tbody := range topBoardTbodyRe.FindAllStringSubmatch(text, -1) {
 		for _, tr := range topBoardTrRe.FindAllStringSubmatch(tbody[1], -1) {
@@ -323,6 +326,7 @@ func (tc *THSClient) getTopBoardPage(url string) ([]SectorInfo, error) {
 			if len(cm) != 2 {
 				continue
 			}
+			// 单元格约定：0序号 1名称 2涨跌幅 ... 5主力净流入。
 			chg, _ := strconv.ParseFloat(cells[2], 64)
 			inflow, _ := strconv.ParseFloat(cells[5], 64)
 			out = append(out, SectorInfo{

@@ -141,6 +141,7 @@ func TriangularChipDistribution(klines []KLine, params ChipParams) *ChipAnalysis
 		cumSum += b.mass
 		fraction := cumSum / totalMass
 
+		// 越过 5%/15%/85%/95% 累积筹码分位的档位价即记录为分位点价格（p5/p15/p85/p95）。
 		if prev/totalMass < 0.05 && fraction >= 0.05 {
 			p5 = b.price
 		}
@@ -153,6 +154,7 @@ func TriangularChipDistribution(klines []KLine, params ChipParams) *ChipAnalysis
 		if prev/totalMass < 0.95 && fraction >= 0.95 {
 			p95 = b.price
 		}
+		// 低于现价的筹码计为获利盘，用于计算获利比例。
 		if b.price < currentPrice {
 			profitRatio += b.mass
 		}

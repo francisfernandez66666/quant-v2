@@ -87,6 +87,7 @@ func (o *Outbox) SetPersistPath(path string) {
 		log.Printf("[notify][outbox] 持久化文件损坏，丢弃重建: %v", err)
 		return
 	}
+	// 恢复上次未投递完的消息：解析持久化项并按投递器重建队列。
 	n := 0
 	for _, p := range persisted {
 		dl, ok := outboxDelivererFor(o.owner, p.DeliverStr)

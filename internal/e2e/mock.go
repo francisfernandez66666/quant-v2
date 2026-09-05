@@ -27,6 +27,7 @@ func (t *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	host := req.URL.Hostname()
 	path := req.URL.Path
 
+	// 按 主机+路径 路由到各 mock handler；无匹配时返回空 JSON。
 	switch {
 	case host == "hq.sinajs.cn":
 		return t.sinaQuotes(req)
@@ -158,6 +159,7 @@ func (t *fixtureTransport) sinaKLine(req *http.Request) (*http.Response, error) 
 func (t *fixtureTransport) emClist(req *http.Request) (*http.Response, error) {
 	fs := req.URL.Query().Get("fs")
 
+	// b: 前缀 → 板块成分股列表（f 字段以分/基点换算）。
 	if strings.HasPrefix(fs, "b:") {
 		code := strings.TrimPrefix(fs, "b:")
 		stocks := t.fix.SectorStocks[code]
@@ -223,6 +225,7 @@ func (t *fixtureTransport) emStockGet(req *http.Request) (*http.Response, error)
 		})
 	}
 
+	// 按 fixture 行情 CSV 组装单股响应：解析各字段并按分/基点换算。
 	csv, ok := t.fix.Quotes[code]
 	if !ok {
 		return t.json(map[string]interface{}{"data": map[string]interface{}{"f43": 0}})

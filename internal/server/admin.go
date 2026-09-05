@@ -311,6 +311,7 @@ func (s *Server) handleAdminGetLLMConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, 503, "配置未接入")
 		return
 	}
+	// 读取账号级 LLM 配置，多 key 优先（兼容旧单 key 配置）。
 	cfg := s.cfg.GetLLMConfigFor(id)
 	var apiKeys []string
 	if v, ok := s.auth.GetConfig(id, "llm_api_keys"); ok && v != "" {
@@ -342,6 +343,7 @@ func (s *Server) handleAdminSetLLMConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, 503, "配置未接入")
 		return
 	}
+	// 解析请求体为 LLM 配置结构（非法 JSON 直接拒绝）。
 	var req setLLMConfigReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")

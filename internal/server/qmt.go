@@ -46,6 +46,7 @@ func (s *Server) knownStrategyList() []knownStrategyInfo {
 		{ID: "n_shape", Name: "N形超短 NShape", Kind: "form"},
 		{ID: "dragon_return", Name: "龙回头(中线) DragonReturn", Kind: "form"},
 	}
+	// 追加战法库已启用的规则进白名单（因子 fac_ 与形态 pat_）。
 	if s.researchDir != "" {
 		if es, err := research.ListAppliedFactorRules(s.researchDir); err == nil {
 			for _, e := range es {
@@ -54,6 +55,7 @@ func (s *Server) knownStrategyList() []knownStrategyInfo {
 				}
 			}
 		}
+		// 形态规则同样按启用状态透出。
 		if ps, err := research.ListAppliedPatternRules(s.researchDir); err == nil {
 			for _, p := range ps {
 				if p.Enabled {
@@ -970,6 +972,7 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			buyStat.Buys += amt
 			buyStat.Count++
 		case "卖出":
+			// 卖出：按持仓剩余量钳制成交，计已实现盈亏与胜负次数。
 			sellQty := f.Qty
 			if sellQty > ps.qty {
 				sellQty = ps.qty // 超卖钳制（与 ApplyRealFill 同口径）
@@ -981,6 +984,7 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			} else {
 				losses++
 			}
+			// 战法标签：卖出单无内嵌战法时沿用买入时状态，空回退 manual。
 			k := ps.strategy
 			if k == "" {
 				k = "manual"
@@ -1025,6 +1029,7 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// 按战法名排序输出统计列表（含胜率与已实现盈亏）。
 	stratList := make([]map[string]interface{}, 0, len(byStrat))
 	names := make([]string, 0, len(byStrat))
 	for k := range byStrat {

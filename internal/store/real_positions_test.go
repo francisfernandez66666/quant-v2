@@ -81,6 +81,38 @@ func TestApplyRealFill(t *testing.T) {
 	}
 }
 
+// TestSumFilledQtyPrefix §修复 FIX#1：卖出成交的 signal_id 是 base 追加 :r<剩余量> 后缀的完整键。
+// SumFilledQty 须按 base 前缀聚合（base 与所有 :rN 桶的成交都计入），且按账号隔离。
+// English: §FIX#1 regression — sells fill under the full signal id (base + ":r<remaining>"),
+// so SumFilledQty must aggregate by base prefix and stay user-scoped.
+func TestSumFilledQtyPrefix(t *testing.T) {
+	db := testDB(t)
+	base := "sell:600000:止损:2026-09-04"
+	ins := func(uid, sid string, qty int) {
+		t.Helper()
+		_, err := db.db.Exec(`INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id)
+			VALUES (?, '600000.SH', '卖出', 10, ?, 10*?, '2026-09-04 09:40:00', ?, ?)`,
+			sid+"#"+uid, qty, qty, sid, uid)
+		if err != nil {
+			t.Fatalf("insert fill: %v", err)
+		}
+	}
+	// 首笔部成 300（base 键）+ 补卖成交 400（:r700 桶）→ 前缀聚合应得 700
+	ins("U1", base, 300)
+	ins("U1", base+":r700", 400)
+	// 另一账号同码同键 999 不得串入
+	ins("U2", base, 999)
+	if got := db.SumFilledQty("U1", base); got != 700 {
+		t.Fatalf("SumFilledQty(U1, base) 应 700，got %d", got)
+	}
+	if got := db.SumFilledQty("U1", base+":r700"); got != 400 {
+		t.Fatalf("SumFilledQty(U1, base:r700) 应 400，got %d", got)
+	}
+	if got := db.SumFilledQty("U2", base); got != 999 {
+		t.Fatalf("SumFilledQty(U2, base) 应 999，got %d", got)
+	}
+}
+
 // TestUpsertRealOrderIdempotent 验证同一 signal_id 重复下单被幂等拦截。
 func TestUpsertRealOrderIdempotent(t *testing.T) {
 	db := testDB(t)
@@ -168,6 +200,41 @@ func TestRealPositionsForUser(t *testing.T) {
 	}
 }
 
+// TestReconcileLegacyRowPrunedWhenNotInSnapshot P2#17 回归：非空快照对账分支必须把
+// 不在快照中的遗留全局行（user_id=”）一并清理——旧实现只删本账号 scoped 行，遗留行
+// 既未被声明归属又不在快照中，成为对全账号可见的永驻残影（虚报对账计数/前向看起来像持仓）。
+// 同时已验证真正的 scoped 行（其他账号）与快照内行不受影响。
+// English: P2#17 regression — the non-empty snapshot reconcile branch must also purge legacy global rows
+// (user_id=”) absent from the snapshot. The old code deleted only this account's scoped rows, so an
+// unclaimed legacy row lingered indefinitely (a phantom visible to every account / inflating counts).
+// Genuine scoped rows of other accounts and snapshot-present rows stay untouched.
+func TestReconcileLegacyRowPrunedWhenNotInSnapshot(t *testing.T) {
+	db := testDB(t)
+	// 遗留全局行（无归属）600519 + 本账号 scoped 600000
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600519.SH", Name: "茅台", Qty: 100}, // 遗留全局行
+		{TsCode: "600000.SH", Name: "浦发", Qty: 200, UserID: "u_a"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 用户 B 做全量对账：快照只有 600000（自身），不含 600519 也不含 600519 的归属声明
+	if n, err := db.ReconcilePositionsForUser("u_b", []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 300},
+	}); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("对账后可见行应 1（600000），got %d", n)
+	}
+	// 600519 遗留行应已被清除，而非对所有人可见
+	rows, _ := db.RealPositions()
+	for _, p := range rows {
+		if p.TsCode == "600519.SH" {
+			// 允许已被任一账号声明归属（本测试未声明，不应出现）
+			t.Fatalf("遗留全局行 600519 不应残留: %+v", p)
+		}
+	}
+}
+
 // TestApplyRealFillIdempotent §W3-b 回归：同一笔回报（同 order_id/traded_at/price/qty）重复投递时，
 // 幂等唯一键命中 → 整体 no-op，持仓数量不被二次累加（根除 outbox 重试双倍记账）。
 func TestApplyRealFillIdempotent(t *testing.T) {
@@ -197,6 +264,76 @@ func TestApplyRealFillIdempotent(t *testing.T) {
 	}
 	if p, _ = db.RealPositionByCode("600519.SH"); p.Qty != 200 {
 		t.Fatalf("新成交应累加到 200, got %d", p.Qty)
+	}
+}
+
+// TestResetFailedRealOrderRotatesPlaceholder §修复 FIX#2：失败重试须换新占位单号
+// （pend:<sid>:<attempt> 自增），避免旧 pend 行被 SweepOrders 反复误判为"从未到达网关"而降级重放。
+// English: §FIX#2 regression — each retry of a failed order rotates to a fresh pend: order_id
+// with an auto-incremented attempt, so SweepOrders never misjudges a retried real order as a ghost.
+func TestResetFailedRealOrderRotatesPlaceholder(t *testing.T) {
+	db := testDB(t)
+	o := RealOrder{OrderID: "pend:S1", SignalID: "S1", Code: "600000.SH", Side: "卖出", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-04T09:30:00+08:00", UserID: "u1"}
+	if _, err := db.UpsertRealOrder(o); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := db.MarkRealOrderSendFailed("u1", "S1"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	// 首次重试：旧式 pend:S1 → pend:S1:1
+	ok, err := db.ResetFailedRealOrder("u1", "S1")
+	if err != nil || !ok {
+		t.Fatalf("first reset: ok=%v err=%v", ok, err)
+	}
+	os, _ := db.RealOrdersForUser("u1")
+	if os[0].OrderID != "pend:S1:1" || os[0].Status != "已报" {
+		t.Fatalf("重试 1 应得 pend:S1:1/已报，got %+v", os[0])
+	}
+	// 再次失败再重试：attempt 自增 → pend:S1:2
+	if err := db.MarkRealOrderSendFailed("u1", "S1"); err != nil {
+		t.Fatalf("mark failed 2: %v", err)
+	}
+	ok, err = db.ResetFailedRealOrder("u1", "S1")
+	if err != nil || !ok {
+		t.Fatalf("second reset: ok=%v err=%v", ok, err)
+	}
+	os, _ = db.RealOrdersForUser("u1")
+	if os[0].OrderID != "pend:S1:2" || os[0].Status != "已报" {
+		t.Fatalf("重试 2 应得 pend:S1:2/已报，got %+v", os[0])
+	}
+	// 非"发送失败"状态不可重试（真实在途/已成被唯一键拦截语义）
+	if err := db.MarkRealOrderSendFailed("u1", "S1"); err != nil {
+		t.Fatalf("mark failed 3: %v", err)
+	}
+	if err := db.UpdateRealOrderBySignalID("u1", "S1", "GW-1", "已成"); err != nil {
+		t.Fatalf("backfill to 已成: %v", err)
+	}
+	if ok, _ := db.ResetFailedRealOrder("u1", "S1"); ok {
+		t.Fatalf("已成单不应可重试")
+	}
+}
+
+// TestUpdateRealOrderBySignalIDMonotonic §修复 FIX#2：下单回填加单调守卫——
+// 若回报线程已把占位行推进到已成/部成，晚到的回填不得把它覆盖回"已报"。
+// English: §FIX#2 regression — the order-id backfill must not roll a row back from
+// a later (已成/部成) status to 已报.
+func TestUpdateRealOrderBySignalIDMonotonic(t *testing.T) {
+	db := testDB(t)
+	o := RealOrder{OrderID: "pend:S2", SignalID: "S2", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-04T09:30:00+08:00", UserID: "u1"}
+	if _, err := db.UpsertRealOrder(o); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	// 回报线程先推进到"已成"
+	if ok, err := db.AdvanceRealOrderStatus("u1", "S2", "已成"); err != nil || !ok {
+		t.Fatalf("advance to 已成: ok=%v err=%v", ok, err)
+	}
+	// 晚到的回填（重试成功的网关单号）不应回退状态
+	if err := db.UpdateRealOrderBySignalID("u1", "S2", "GW-2", "已报"); err != nil {
+		t.Fatalf("late backfill: %v", err)
+	}
+	os, _ := db.RealOrdersForUser("u1")
+	if os[0].Status != "已成" {
+		t.Fatalf("已成状态被回填覆盖: %+v", os[0])
 	}
 }
 

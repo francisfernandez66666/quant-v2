@@ -512,6 +512,7 @@ func (m *Manager) Login(username, password string) (*User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// 按用户名定位用户：临时账号/禁用/过期直接拒绝，命中后校验密码哈希。
 	for i := range m.db.Users {
 		u := &m.db.Users[i]
 		if u.Username == username {

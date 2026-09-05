@@ -225,6 +225,7 @@ func (a *nShapeAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[
 		MinuteMACDDEA: macd.DEA,
 		MinuteMACDBar: macd.Bar,
 	}
+	// 走完整 n_shape 波评估链，仅 full_chain 通过才视为有效触发。
 	ctx := &n_shape.Ctx{LLMD1Score: a.d1Score}
 	eval, err := a.st.EvaluateWave(wa, ib, ctx)
 	if err != nil || eval == nil || !eval.Pass || eval.Level != "full_chain" {
@@ -794,6 +795,7 @@ func (o *Options) Run() error {
 		if m, err := db.Industries(); err == nil {
 			indMap = m
 		}
+		// 逐票按其行业取区间板块涨幅，转 代码→日期→涨幅 结构供 dragon 使用。
 		for _, tsCode := range codes {
 			ind, ok := indMap[tsCode]
 			if !ok {

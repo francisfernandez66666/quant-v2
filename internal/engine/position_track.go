@@ -8,6 +8,7 @@
 //   - double_bump（双响炮）：止盈 15%，止损 8%
 //   - n_shape（N形）：止盈 10%，止损 8%（硬止损比例）
 //   - dragon_return（龙回头）：止盈 25%，止损 5%
+//
 // English: TP/SL mapping for paper opens (C3 legacy, kept after the unified-book refactor): after a
 // paper fillLocked, registry.paperMirror writes the report holding book via the SetMirror callback.
 // Only the strategy→TP/SL percent mapping remains here for the mirror (paper is the single source of
@@ -28,12 +29,14 @@ func paperOpenTpSl(strategyName string, sc *config.StrategyConfig) (tp, sl float
 	if sc == nil {
 		sc = &config.StrategyConfig{}
 	}
+	// 比例(<1)自动放大为百分数（0.08 → 8）；已为百分数(≥1)则原样返回。
 	toPct := func(v float64) float64 {
 		if v > 0 && v < 1 {
 			return v * 100
 		}
 		return v
 	}
+	// 各战法默认止盈/止损（未配置时使用缺省值）。
 	switch strategyName {
 	case "dragon":
 		tp = toPct(sc.Dragon.TakeProfitPct)

@@ -44,6 +44,7 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 		p = map[string]any{}
 	}
 
+	// 按任务类型分发到对应子命令，payload 中的参数统一转换为 CLI 参数串。
 	switch tk.Type {
 	case store.TaskDiscoverFactors:
 		cmdDiscoverFactors(db, payloadArgs(p,

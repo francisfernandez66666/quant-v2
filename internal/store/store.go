@@ -555,6 +555,7 @@ func (d *DB) migrate() error {
 // hasColumn 判断表是否已含某列（用于旧库增量迁移幂等）。
 // （hasColumn reports whether a table already has a column, for idempotent migration.）
 func (d *DB) hasColumn(table, column string) (bool, error) {
+	// 通过 PRAGMA table_info 查询列定义，逐列比对列名。
 	rows, err := d.db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
 		return false, err
@@ -589,6 +590,7 @@ func (d *DB) tableHasPKColumns(table string) ([]string, error) {
 		name string
 		pk   int
 	}
+	// 遍历 PRAGMA table_info 行：记录每列的列名与主键序号（pk>0 表示复合主键成员）。
 	var infos []colInfo
 	for rows.Next() {
 		var cid int
@@ -603,6 +605,7 @@ func (d *DB) tableHasPKColumns(table string) ([]string, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// 取主键序号最大值；无主键时返回 nil。
 	maxPK := 0
 	for _, info := range infos {
 		if info.pk > maxPK {
@@ -612,6 +615,7 @@ func (d *DB) tableHasPKColumns(table string) ([]string, error) {
 	if maxPK == 0 {
 		return nil, nil
 	}
+	// 按主键序号 1..maxPK 依次找列名，得到复合主键列的有序列表。
 	cols := make([]string, 0, maxPK)
 	for i := 1; i <= maxPK; i++ {
 		for _, info := range infos {
@@ -637,6 +641,7 @@ func (d *DB) indexKeyColumns(indexName string) ([]string, error) {
 		return nil, err
 	}
 	var names []string
+	// 逐行读取索引键信息；key=1 的列即索引键成员，取其 name（name 为空时跳过）。
 	for rows.Next() {
 		dest := make([]any, len(cols))
 		for i := range dest {
@@ -645,6 +650,7 @@ func (d *DB) indexKeyColumns(indexName string) ([]string, error) {
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
+		// 按列名取值的辅助闭包（兼容 index_xinfo 顺序与缺失列）。
 		get := func(key string) any {
 			for i, c := range cols {
 				if c == key {
@@ -672,6 +678,7 @@ func (d *DB) tableHasUniqueIndex(table, column string) (bool, error) {
 		return false, err
 	}
 	defer idxRows.Close()
+	// 遍历所有索引：unique=1 且键恰好等于指定单列 → 判定命中。
 	for idxRows.Next() {
 		cols, err := idxRows.Columns()
 		if err != nil {
@@ -684,6 +691,7 @@ func (d *DB) tableHasUniqueIndex(table, column string) (bool, error) {
 		if err := idxRows.Scan(dest...); err != nil {
 			return false, err
 		}
+		// 兼容性取值：string 原样，int64 的 1 归一为 "1"。
 		get := func(key string) string {
 			for i, c := range cols {
 				if c == key {
@@ -707,6 +715,7 @@ func (d *DB) tableHasUniqueIndex(table, column string) (bool, error) {
 		if name == "" {
 			continue
 		}
+		// 取该唯一索引的键列，验证是否单列且为目标列。
 		colNames, err := d.indexKeyColumns(name)
 		if err != nil {
 			return false, err
@@ -731,6 +740,7 @@ func (d *DB) migrateRealPositionsPK() error {
 	}
 	if len(cols) == 1 && cols[0] == "ts_code" {
 		log.Printf("[store] migrate real_positions PK: (ts_code) -> (ts_code, user_id)")
+		// 重建表：旧数据整体搬运（user_id 缺省补空串），主键升级为 (ts_code, user_id)。
 		_, err := d.db.Exec(`
 			CREATE TABLE real_positions_new (
 				ts_code TEXT NOT NULL,
@@ -772,6 +782,7 @@ func (d *DB) migrateOrdersSignalUnique() error {
 			return err
 		}
 		defer idxRows.Close()
+		// 遍历 orders 全部索引：确认 (user_id, signal_id) 唯一键已存在则迁移完成。
 		for idxRows.Next() {
 			idxCols, err := idxRows.Columns()
 			if err != nil {
@@ -784,6 +795,7 @@ func (d *DB) migrateOrdersSignalUnique() error {
 			if err := idxRows.Scan(dest...); err != nil {
 				return err
 			}
+			// 按列名取值（仅处理 string 类型字段）。
 			get := func(key string) string {
 				for i, c := range idxCols {
 					if c == key {
@@ -812,6 +824,7 @@ func (d *DB) migrateOrdersSignalUnique() error {
 		return nil
 	}
 	log.Printf("[store] migrate orders unique: signal_id -> (user_id, signal_id)")
+	// 重建 orders 表：旧数据整体搬运，唯一键升级为 (user_id, signal_id)。
 	_, err = d.db.Exec(`
 		CREATE TABLE orders_new (
 			order_id TEXT PRIMARY KEY,
@@ -850,6 +863,7 @@ func (d *DB) QueryRows(query string, args ...any) ([]map[string]any, error) {
 		return nil, err
 	}
 	var out []map[string]any
+	// 逐行读取：每列用指针接收原生值，组装为列名→值 的 map。
 	for rows.Next() {
 		vals := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -876,9 +890,11 @@ func (d *DB) InsertRows(table string, cols []string, rows []map[string]any) (int
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	// 生成占位符与 INSERT OR REPLACE 语句（列名来自调用方，与表结构对齐）。
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",")
 	query := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
 		table, strings.Join(cols, ","), placeholders)
+	// 单事务批量写入：失败整体回滚，保证断点续传一致性。
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
@@ -889,6 +905,7 @@ func (d *DB) InsertRows(table string, cols []string, rows []map[string]any) (int
 		return 0, err
 	}
 	defer stmt.Close()
+	// 逐行按列取值：值为 nil 的单元格写 NULL。
 	for _, r := range rows {
 		args := make([]any, 0, len(cols))
 		for _, c := range cols {
@@ -996,6 +1013,7 @@ func (d *DB) Count(table string, fromDate string) (int, error) {
 // TradeDates 返回 [from,to]（含）内全部交易日（升序）。
 // （TradeDates returns the ascending trade dates within [from,to] inclusive.）
 func (d *DB) TradeDates(from, to string) ([]string, error) {
+	// 查询开市日历（is_open=1）并升序返回。
 	rows, err := d.db.Query("SELECT cal_date FROM trade_cal WHERE is_open=1 AND cal_date>=? AND cal_date<=? ORDER BY cal_date", from, to)
 	if err != nil {
 		return nil, err
@@ -1015,6 +1033,7 @@ func (d *DB) TradeDates(from, to string) ([]string, error) {
 // StockCodes 返回全部股票代码（含已退市）。
 // （StockCodes returns all stock codes, delisted included.）
 func (d *DB) StockCodes() ([]string, error) {
+	// 全量代码清单，按代码升序。
 	rows, err := d.db.Query("SELECT ts_code FROM stocks ORDER BY ts_code")
 	if err != nil {
 		return nil, err
@@ -1068,6 +1087,7 @@ func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
 			return d.thsHfqBars(tsCode, start, end)
 		}
 	}
+	// 主源路径：日线 JOIN 复权因子（缺因子按 1 兜底），后复权口径计算。
 	query := `SELECT d.trade_date,
 		COALESCE(d.open,0), COALESCE(d.high,0), COALESCE(d.low,0), COALESCE(d.close,0),
 		COALESCE(d.vol,0), COALESCE(d.amount,0), COALESCE(a.adj_factor,1) AS adj
@@ -1080,6 +1100,7 @@ func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
 	}
 	defer rows.Close()
 	var out []Bar
+	// 逐行按复权因子换算：hfc_close = close × adj_factor（量能不换算）。
 	for rows.Next() {
 		var b Bar
 		var adj float64
@@ -1108,6 +1129,7 @@ func (d *DB) RawBars(tsCode, start, end string) ([]Bar, error) {
 			return d.thsRawBars(tsCode, start, end)
 		}
 	}
+	// 旧表路径：直读 daily 未复权行情（供回测真实成交价撮合）。
 	query := `SELECT trade_date,
 		COALESCE(open,0), COALESCE(high,0), COALESCE(low,0), COALESCE(close,0),
 		COALESCE(vol,0), COALESCE(amount,0)
@@ -1130,6 +1152,7 @@ func (d *DB) RawBars(tsCode, start, end string) ([]Bar, error) {
 
 // thsRawBars 读同花顺（新）日K（升序），形状与 RawBars 一致。
 func (d *DB) thsRawBars(tsCode, start, end string) ([]Bar, error) {
+	// 直读 ths_daily 未复权行情（升序）。
 	query := `SELECT trade_date,
 		COALESCE(open,0), COALESCE(high,0), COALESCE(low,0), COALESCE(close,0),
 		COALESCE(vol,0), COALESCE(amount,0)
@@ -1152,6 +1175,7 @@ func (d *DB) thsRawBars(tsCode, start, end string) ([]Bar, error) {
 
 // thsHfqBars 读同花顺（新）日K×因子的后复权序列（hfq_close = close × factor）。
 func (d *DB) thsHfqBars(tsCode, start, end string) ([]Bar, error) {
+	// ths_daily JOIN ths_adj_factor：价格类在 SQL 层直接乘因子做后复权（量能不换算）。
 	query := `SELECT b.trade_date,
 		COALESCE(b.open,0)*f.factor, COALESCE(b.high,0)*f.factor,
 		COALESCE(b.low,0)*f.factor, COALESCE(b.close,0)*f.factor,
@@ -1177,6 +1201,7 @@ func (d *DB) thsHfqBars(tsCode, start, end string) ([]Bar, error) {
 // DailyBasicRange 读取某股票一段区间的每日指标（升序），供估值/流动性类因子。
 // （DailyBasicRange reads a stock's per-day indicators over a range for valuation/liquidity factors.）
 func (d *DB) DailyBasicRange(tsCode, start, end string) ([]DailyBasic, error) {
+	// 查询区间内每日估值/流动性指标（缺失字段按 0 兜底）。
 	query := `SELECT trade_date,
 		COALESCE(turnover_rate,0), COALESCE(volume_ratio,0), COALESCE(pe_ttm,0),
 		COALESCE(pb,0), COALESCE(ps_ttm,0), COALESCE(pcf_ttm,0), COALESCE(dv_ttm,0),

@@ -267,6 +267,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		all := make([]sweepResult, 0, len(combos)) // 全量留存供热力网格聚合（10万条 ≈ 12MB）
 		done := 0
 		lastPct := -10
+		// 分批全量模拟：每批选批冠军，进度按完成百分比每 10% 打印一次。
 		for bi := 0; bi*batchSize < len(combos); bi++ {
 			lo, hi := bi*batchSize, min((bi+1)*batchSize, len(combos))
 			bestInBatch := sweepResult{}
@@ -648,6 +649,7 @@ func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 		if takeProfitPct > 0 && pnlPct >= takeProfitPct {
 			return j, pnlPct // 止盈线：锁定利润
 		}
+		// 移动止盈：较持仓期最高价回撤超过阈值即出场。
 		if trailPct > 0 && stageHigh > entry {
 			dd := (cur - stageHigh) / stageHigh * 100
 			if dd <= -trailPct {
@@ -658,6 +660,7 @@ func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 			return j, pnlPct
 		}
 	}
+	// 未触发任何退出：持有到区间末，记录末日盈亏。
 	if lastJ > entryDay {
 		return lastJ, pnlAt(lastJ)
 	}
@@ -751,6 +754,7 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 	var winSum, lossSum float64
 	var pnls []float64
 	var dates []string
+	// 逐触发模拟：门槛过滤后按 ATR 止损统一出场，记录胜败、持有天数与日期。
 	for _, t := range trigs {
 		if minScore > 0 && t.score >= 0 && t.score < minScore {
 			continue // 门槛过滤（score=-1 标记=无分维度，不过滤）

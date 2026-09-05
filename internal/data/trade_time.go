@@ -247,10 +247,12 @@ func IsTradingWindow(now time.Time) bool {
 // CurrentSession 返回当前市场时段。
 func CurrentSession(now time.Time) MarketSession {
 	now = cntime.In(now) // §TZ1 北京时区统一
+	// 周末无交易时段。
 	wd := now.Weekday()
 	if wd == time.Saturday || wd == time.Sunday {
 		return SessionClosed
 	}
+	// 按 HHMM 分钟数判断所在时段：盘前/早盘/午休/午盘/盘后。
 	m := now.Hour()*100 + now.Minute()
 	switch {
 	case m >= 830 && m < defaultTradeTime.FullOpen:
@@ -282,6 +284,7 @@ func BeforeOpenTrade(now time.Time) bool {
 // NextTradeOpen 返回距离下一个交易时段开盘的等待时长。
 func NextTradeOpen(now time.Time) time.Duration {
 	now = cntime.In(now) // §TZ1 北京时区统一
+	// 向后最多 7 天找到下一交易日的开盘时刻；当日未收盘且已开盘则等待 0（立即进入交易时段）。
 	for i := 0; i < 7; i++ {
 		t := now.AddDate(0, 0, i)
 		if t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {

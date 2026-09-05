@@ -34,10 +34,10 @@ type factorMonitorEntry struct {
 // 支持因子战法（fac_ 前缀）和形态战法（pat_ 前缀）两类规则的效果监测。
 // English: factor-strategy effectiveness monitor.
 type factorMonitor struct {
-	mu      sync.Mutex                       // 保护 entries 并发访问的互斥锁
-	dataDir string                           // 战法库文件所在目录
-	entries map[string]*factorMonitorEntry   // 待结算跟踪条目（key = ruleID|code，去重）
-	horizon int                              // 前瞻天数（默认 5 日）
+	mu      sync.Mutex                     // 保护 entries 并发访问的互斥锁
+	dataDir string                         // 战法库文件所在目录
+	entries map[string]*factorMonitorEntry // 待结算跟踪条目（key = ruleID|code，去重）
+	horizon int                            // 前瞻天数（默认 5 日）
 }
 
 // newFactorMonitor 创建监测器。horizon 为前瞻天数（默认 5）。

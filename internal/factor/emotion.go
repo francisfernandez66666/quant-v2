@@ -72,6 +72,7 @@ func init() {
 		Cat:  CatSentiment,
 		Desc: "涨停家数 5 日变化（当日 − 5 日前；正=情绪升温，负=退潮）",
 		Compute: func(s *StockSeries) []float64 {
+			// 样本不足或任一端为 NaN 时该日置 NaN。
 			v := emoArray(s, func(x *StockSeries) []float64 { return x.EmoLimitUp })
 			if len(v) < 5 {
 				return v

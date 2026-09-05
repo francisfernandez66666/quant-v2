@@ -63,9 +63,11 @@ func (c *BaostockClient) call(method string, params map[string]string, strCols m
 		return nil, fmt.Errorf("baostock %s read: %v", method, err)
 	}
 	text := string(body)
+	// baostock 以文本行返回结果：error: 前缀表示调用失败。
 	if strings.HasPrefix(text, "error:") {
 		return nil, fmt.Errorf("baostock %s: %s", method, strings.TrimSpace(text))
 	}
+	// 其余为 CSV 文本（首行表头）。
 	r := csv.NewReader(strings.NewReader(text))
 	records, err := r.ReadAll()
 	if err != nil {

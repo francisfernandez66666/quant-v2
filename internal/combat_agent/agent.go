@@ -1756,27 +1756,36 @@ func (a *Agent) CheckPositionAlerts(rpt *report.Report, marketAPI *data.MarketAP
 			})
 		}
 
-		// 触及止损线 → 生成止损提醒。
-		// 做多：出现做空/利空信号→硬止损；未出现→可能是洗盘，降级提示观察。做空：出现做多信号→硬止损；否则提示。
-		// English: stop-loss line hit — a same-direction adverse signal forces a hard stop-loss,
-		// otherwise it may be a shakeout, so downgrade to a watch hint.
+		// 触及止损线 → 分级止损提醒（FIX#12）：首触线且无反向确认 → 减仓（半仓自动退出）；
+		// 出现反向确认信号或深度破位（-2×止损线）→ 硬止损（全清）。
+		// 模拟盘/实盘卖出侧按 Signal 级别自动执行：减仓级自动半仓、止损级自动全平——
+		// 彻底取代旧"降级关注洗盘"（只提醒不动作，造成"亏十几个点拿好几天不止损"）。
+		// English: tiered stop-loss (FIX#12) — first line breach with no adverse confirmation trims
+		// (half-position auto-exit); an adverse signal OR a deep breach (-2× the line) forces a hard
+		// full close. The sell side auto-executes these levels (trim/close), replacing the old
+		// "downgrade to watch" that only reminded without acting (the "held days at -13% never sold" bug).
 		if pos.StopLossPct > 0 && pnl <= -pos.StopLossPct {
 			alertType, action := "止损", "止损"
 			reason := fmt.Sprintf("盈亏%.2f%% 触及止损%.0f%%", pnl, pos.StopLossPct)
-			// 是否出现对已方向不利的信号决定是否硬止损
-			// English: an adverse signal in the opposite direction decides a hard stop-loss.
+			// 是否出现对持仓不利的确认信号（决定直接全清）
+			// English: whether an adverse confirmation is present (decides a hard full close).
 			hard := false
 			if isShort {
 				hard = hasBull // 做空止损：出现做多(利好)信号→硬止损
 			} else {
 				hard = hasBear // 做多止损：出现做空(利空)信号→硬止损
 			}
+			// 深度破位兜底：浮亏达到 2×止损线时无论有无确认一律全清（防止阴跌钝刀割肉）。
+			// English: deep-breach backstop — at 2× the stop line, close regardless of confirmation.
+			if !hard && pnl <= -2*pos.StopLossPct {
+				hard = true
+			}
 			if !hard {
-				alertType, action = "提示", "关注"
+				alertType, action = "减仓", "卖出"
 				if isShort {
-					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未出现利好确认,关注是否回稳", pnl, pos.StopLossPct)
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未现利好确认,先减半仓控制风险", pnl, pos.StopLossPct)
 				} else {
-					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未出现利空/做空信号,关注是否洗盘", pnl, pos.StopLossPct)
+					reason = fmt.Sprintf("盈亏%.2f%% 已触止损%.0f%% 未现利空/做空信号,先减半仓控制风险", pnl, pos.StopLossPct)
 				}
 			}
 			alerts = append(alerts, Signal{
