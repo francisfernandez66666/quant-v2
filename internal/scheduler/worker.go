@@ -510,8 +510,13 @@ func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
 // ensureNightlyEnqueue 幂等入队当日夜间步骤链（low、chain_day=今天、chain_seq 递增）。
 // 队列即断点：researchd 重启后已入队未完成的任务天然续跑，不再依赖 research_state.json 步骤下标。
 // 跨日残留的旧链任务按 chain_day 升序先于今日执行（保留已完成工作量，优于旧的直接杀掉重来）。
+// §2026-09-05 多轮发现：原单个 discover_factors 展开为 variants 个变体任务（各自产出 top_n
+// 个排他最优组合），回测开关开启时在其后追加一次 --since 的配对 backtest（回填全部当日候选）。
 // English: idempotently enqueues today's nightly step chain (low priority). The queue itself is the
 // checkpoint — restarts resume naturally; leftover chains from prior days drain first by chain_day.
+// §2026-09-05 multi-round: discover_factors expands into `variants` variant tasks (each emitting
+// top_n exclusion-distinct combos); the backtest toggle appends one --since paired backtest that
+// backfills every today-created candidate.
 func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfig, now time.Time) {
 	today := cntime.DayCompactOf(now) // §TZ1 北京日历定链日
 	has, err := db.ChainHasTasks(today)
@@ -540,18 +545,65 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 		steps = insertAfter(steps, "library_replay", "optimize")
 		log.Printf("[scheduler] 策略自优化引擎开启：夜间链追加 optimize 任务（全库参数寻优）")
 	}
-	for i, step := range steps {
-		typ, payload, ok := stepTask(step, cfg, today)
-		if !ok {
-			log.Printf("[scheduler] 未知夜间步骤 %q 跳过", step)
-			continue
-		}
+	seq := 0
+	enqueue := func(typ, step, payload string) bool {
 		if _, err := db.EnqueueResearchTask(&store.ResearchTask{
 			Type: typ, Priority: "low", Status: store.TaskQueued,
-			Payload: payload, ChainDay: today, ChainSeq: i,
+			Payload: payload, ChainDay: today, ChainSeq: seq,
 		}); err != nil {
 			log.Printf("[scheduler] 入队夜间任务 %s 失败: %v", step, err)
-			return
+			return false
+		}
+		seq++
+		return true
+	}
+	// §多轮发现：expand discover_factors → variants 个变体任务；配对 backtest 仅放置一次，
+	// 之后的显式/auto-inserted "backtest" 步骤跳过，避免重复回测。
+	variants := discoverVariants(cfg)
+	backtestPlaced := false
+	for _, step := range steps {
+		switch step {
+		case "discover_factors":
+			for v := 0; v < variants; v++ {
+				typ, payload, ok := discoverVariantPayload(cfg, today, v)
+				if !ok {
+					continue
+				}
+				if !enqueue(typ, fmt.Sprintf("discover_factors 变体#%d", v), payload) {
+					return
+				}
+			}
+			log.Printf("[scheduler] 多轮发现：discover_factors 展开为 %d 个变体任务（每变体 top_n 排他最优组合）", variants)
+			if cfg.Nightly.BacktestEnabled {
+				if !enqueue(store.TaskBacktestNightly, "backtest(配对)",
+					nightlyBacktestPayload(cfg, today)) {
+					return
+				}
+				backtestPlaced = true
+				log.Printf("[scheduler] 夜间链追加配对 backtest（--since %s 回填多候选）", today)
+			}
+		case "backtest":
+			if backtestPlaced {
+				backtestPlaced = false
+				continue // 已由 discover_factors 展开配对，跳过重复 backtest
+			}
+			typ, payload, ok := stepTask(step, cfg, today)
+			if !ok {
+				log.Printf("[scheduler] 未知夜间步骤 %q 跳过", step)
+				continue
+			}
+			if !enqueue(typ, step, payload) {
+				return
+			}
+		default:
+			typ, payload, ok := stepTask(step, cfg, today)
+			if !ok {
+				log.Printf("[scheduler] 未知夜间步骤 %q 跳过", step)
+				continue
+			}
+			if !enqueue(typ, step, payload) {
+				return
+			}
 		}
 	}
 	s.mu.Lock()
@@ -559,8 +611,8 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 	s.state.Done = false
 	s.mu.Unlock()
 	s.saveState()
-	log.Printf("[scheduler] 夜间链 %s 已入队 %d 个 low 任务: %v", today, len(steps), steps)
-	opslog.Logf("research", "夜间链 %s 入队 %d 个任务: %v", today, len(steps), steps)
+	log.Printf("[scheduler] 夜间链 %s 已入队 %d 个 low 任务: %v", today, seq, steps)
+	opslog.Logf("research", "夜间链 %s 入队 %d 个任务: %v", today, seq, steps)
 }
 
 // containsStep 报告 steps 中是否包含指定步骤。
@@ -607,9 +659,22 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 			"split": 0.7, "min-ir": 0.3, "min-days": 30,
 		}), true
 	case "discover_patterns":
+		d := cfg.Nightly.Discover
+		mt := d.MinTrigger
+		if mt <= 0 {
+			mt = 20
+		}
+		me := d.MinExcess
+		if me <= 0 {
+			me = 0.01
+		}
+		split := d.Split
+		if split <= 0 || split >= 1 {
+			split = 0.7
+		}
 		return store.TaskDiscoverPatterns, mustJSON(map[string]any{
 			"start": researchStart, "end": today,
-			"h": 5, "min-trigger": 20, "min-excess": 0.01, "split": 0.7,
+			"h": 5, "min-trigger": mt, "min-excess": me, "split": split,
 		}), true
 	case "backtest":
 		p := map[string]any{"start": researchStart, "end": today, "h": 5}
@@ -644,6 +709,154 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 		return store.TaskList, "{}", true
 	}
 	return "", "", false
+}
+
+// discoverVariants §2026-09-05 每晚因子发现变体任务数 = ceil(research_rounds / top_n)。
+// 每个变体各产出 top_n 个排他最优组合 → 每晚候选数 = rounds（默认 4 = 2 变体 × 2 排他）。
+// English: nightly factor-discovery variant-task count = ceil(rounds/top_n); candidates/night =
+// rounds (default 4 = 2 variants × top_n=2 exclusive).
+func discoverVariants(cfg config.SchedulerConfig) int {
+	rounds := cfg.Nightly.ResearchRounds
+	if rounds <= 0 {
+		rounds = 4
+	}
+	topN := cfg.Nightly.Discover.TopN
+	if topN <= 0 {
+		topN = 1
+	}
+	v := (rounds + topN - 1) / topN
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
+// discoverVariantPayload §2026-09-05 多轮变体第 v 个 payload：参数差异 = 前瞻 h / 窗口年数 /
+// 优化目标 / 风格子池，均从 rules.nightly.discover 读（越界取默认）。start 窗轮换使样本内
+// 每夜真前进，从源头避免滑窗贪心每晚选同一组合；变体天然的 discoveryResumeKey 差异保证
+// 窗口断点缓存互不串扰。English: produces the v-th variant payload — horizon/start-window/metric/
+// style-pool rotation from config; window-rotation genuinely advances the in-sample set each night.
+func discoverVariantPayload(cfg config.SchedulerConfig, today string, v int) (string, string, bool) {
+	d := cfg.Nightly.Discover
+	h := elemInt(d.Horizons, v, 5)
+	years := elemInt(d.StartWindows, v, 3)
+	metric := elemStr(d.Metrics, v, "ir")
+	pool := elemStr(d.FactorPools, v, "")
+	topN := d.TopN
+	if topN <= 0 {
+		topN = 1
+	}
+	minStocks := d.MinStocks
+	if minStocks <= 0 {
+		minStocks = 20
+	}
+	maxFactors := d.MaxFactors
+	if maxFactors <= 0 {
+		maxFactors = 8
+	}
+	split := d.Split
+	if split <= 0 || split >= 1 {
+		split = 0.7
+	}
+	minIR := d.MinIR
+	if minIR <= 0 {
+		minIR = 0.3
+	}
+	minDays := d.MinDays
+	if minDays <= 0 {
+		minDays = 30
+	}
+	minGenT := d.MinGenT
+	if minGenT >= 0 {
+		minGenT = -2
+	}
+	dedupJaccard := d.DedupJaccard
+	if dedupJaccard <= 0 {
+		dedupJaccard = 0.8
+	}
+	guardStrong := d.GuardStrong
+	if guardStrong <= 0 {
+		guardStrong = 0.45
+	}
+	guardWeak := d.GuardWeak
+	if guardWeak <= 0 {
+		guardWeak = 0.2
+	}
+	stalenessDays := d.StalenessDays
+	if stalenessDays <= 0 {
+		stalenessDays = 30
+	}
+	hysteresis := d.Hysteresis
+	if hysteresis <= 0 {
+		hysteresis = 0.05
+	}
+	start := startWindowYear(today, years)
+	return store.TaskDiscoverFactors, mustJSON(map[string]any{
+		"start": start, "end": today,
+		"h": h, "metric": metric, "pool": pool, "top-n": topN,
+		"min-stocks": minStocks, "max-factors": maxFactors,
+		"split": split, "min-ir": minIR, "min-days": minDays, "min-gen-t": minGenT,
+		"dedup-jaccard": dedupJaccard,
+		"guard-strong":  guardStrong, "guard-weak": guardWeak,
+		"min-yr-sign": d.MinYrSign,
+		"change-gate": d.ChangeGate, "staleness-days": stalenessDays,
+		"hysteresis": hysteresis,
+	}), true
+}
+
+// nightlyBacktestPayload §2026-09-05 配对 B4 回测 payload：--since 今日 → 回填当日全部候选
+// （多轮多候选逐一回测），max_per_day/min_limit_ups/top_k/min_stocks 从 discover 配置注入。
+// English: paired B4 backtest payload — --since today backfills every today-created candidate,
+// event/selection params come from the discover config block.
+func nightlyBacktestPayload(cfg config.SchedulerConfig, today string) string {
+	d := cfg.Nightly.Discover
+	p := map[string]any{"start": researchStart, "end": today, "h": 5, "since": today}
+	if ev := cfg.Nightly.BacktestEvents; ev > 0 {
+		p["max-per-day"] = ev
+	} else if d.MaxPerDay > 0 {
+		p["max-per-day"] = d.MaxPerDay
+	}
+	if d.MinLimitUps > 0 {
+		p["min-limit-ups"] = d.MinLimitUps
+	}
+	if d.TopK > 0 {
+		p["top-k"] = d.TopK
+	}
+	if d.MinStocks > 0 {
+		p["min-stocks"] = d.MinStocks
+	}
+	if d.MinBtEvents > 0 {
+		p["min-bt-events"] = d.MinBtEvents
+	}
+	return mustJSON(p)
+}
+
+// elemInt 取数组第 idx 个元素，越界回退默认值。English: index-safe int element lookup.
+func elemInt(v []int, idx, def int) int {
+	if idx >= 0 && idx < len(v) {
+		return v[idx]
+	}
+	return def
+}
+
+// elemStr 取数组第 idx 个元素，越界回退默认值。English: index-safe string element lookup.
+func elemStr(v []string, idx int, def string) string {
+	if idx >= 0 && idx < len(v) {
+		return v[idx]
+	}
+	return def
+}
+
+// startWindowYear 把 YYYYMMDD 前移 years 个自然年（同月同日）。English: shifts a YYYYMMDD back years.
+func startWindowYear(today string, years int) string {
+	if len(today) != 8 || years <= 0 {
+		return today
+	}
+	y, err := strconv.Atoi(today[:4])
+	if err != nil {
+		return today
+	}
+	return fmt.Sprintf("%04d%s", y-years, today[4:])
 }
 
 // mustJSON 序列化为 JSON；失败兜底返回 "{}"（保证 payload 列永远是合法 JSON）。

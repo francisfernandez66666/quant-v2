@@ -124,7 +124,9 @@ func (d *DB) migrate() error {
 			ir REAL,
 			avg_excess REAL,
 			horizon INTEGER,
-			reason TEXT
+			reason TEXT,
+			guard TEXT DEFAULT 'standard',
+			params TEXT DEFAULT ''
 		)`,
 		// 参数扫参结果（§P2-c）：optimize 任务 TOP-N 排名，审批后转规则级参数覆盖。
 		// English: parameter-sweep rankings per task; approvals become rule-level overrides.
@@ -506,6 +508,9 @@ func (d *DB) migrate() error {
 		{"sweep_pool_configs", "atr_step", "ALTER TABLE sweep_pool_configs ADD COLUMN atr_step REAL DEFAULT 1"},
 		// §Phase3 情绪相位分参回测：扫参排名行记录当日情绪阶段（无情绪数据为空串）
 		{"optimization_results", "emotion_phase", "ALTER TABLE optimization_results ADD COLUMN emotion_phase TEXT DEFAULT ''"},
+		// §2026-09-05 多轮发现/护栏分级：候选护栏档位 + 参数快照（精确复现审批时的战法）
+		{"research_candidates", "guard", "ALTER TABLE research_candidates ADD COLUMN guard TEXT DEFAULT 'standard'"},
+		{"research_candidates", "params", "ALTER TABLE research_candidates ADD COLUMN params TEXT DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {

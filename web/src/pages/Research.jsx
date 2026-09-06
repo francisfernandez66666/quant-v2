@@ -359,6 +359,28 @@ export default function Research() {
     // 常量 m：局部定义
     return m[s] || s
   }
+  function guardMeta(g) {
+  // §C2 护栏档位展示元数据：分级色标（strong=绿/standard=蓝/weak=黄/reject=红/旧数据无档=灰）
+    const m = {
+      strong: { label: '强护栏', theme: 'success' },
+      standard: { label: '标准', theme: 'primary' },
+      weak: { label: '弱护栏·观察', theme: 'warning' },
+      reject: { label: '未过护栏', theme: 'danger' },
+    }
+    // 常量 m：局部定义
+    return m[g] || { label: '标准', theme: 'default' }
+  }
+  function paramsLines(c) {
+  // §C4 参数快照渲染：把 params JSON 展开为可读的键值行（精确复现审批战法）
+    if (!c.params) return []
+    // 常量 c：局部定义
+    try {
+      const p = JSON.parse(c.params)
+      // 常量 p：局部定义
+      return Object.entries(p).map(([k, v]) => ({ k, v: Array.isArray(v) ? v.join(',') : String(v) }))
+    } catch (_) { return [] }
+  }
+
   // 审批并通过接口应用某条研究候选（写回后端并热更新状态），权限不足时回退
   async function doApprove(c) {
     try {
@@ -1068,7 +1090,7 @@ export default function Research() {
   // 渲染单条研究候选卡片：展示战法构成、电脑验证结论、关键指标与审批/回测操作按钮
   function renderCandidate(c) {
     return (
-      <Card key={c.id} style={{ marginBottom: 12 }} title={<span>#{c.id} <Tag theme="primary">{kindLabel(c.kind)}</Tag> <Tag theme={c.status === 'proposed' ? 'warning' : 'success'}>{statusLabel(c.status)}</Tag> <span style={{ fontSize: 12, color: '#888' }}>{c.created_at}</span></span>}>
+      <Card key={c.id} style={{ marginBottom: 12 }} title={<span>#{c.id} <Tag theme="primary">{kindLabel(c.kind)}</Tag> <Tag theme={c.status === 'proposed' ? 'warning' : 'success'}>{statusLabel(c.status)}</Tag> {c.guard && c.guard !== 'standard' && <Tag theme={guardMeta(c.guard).theme}>{guardMeta(c.guard).label}</Tag>} <span style={{ fontSize: 12, color: '#888' }}>{c.created_at}</span></span>}>
         {c.kind === 'factor' ? (
            <div>
             <div style={{ fontWeight: 600, margin: '6px 0', fontSize: 13 }}>这条战法在做什么</div>
@@ -1101,6 +1123,16 @@ export default function Research() {
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>全样本 IR</span><span>{fmt(c.ir)}（参考）</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>全样本 IC</span><span>{fmt(c.ic_mean)}（参考）</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>全链路回测</span><span>{btTested(c) ? (c.backtest_result_text || fmt(c.avg_excess)) : '未测'}</span></div>
+              {paramsLines(c).length > 0 && (
+                <div style={{ borderTop: '1px dashed #e7e7e7', marginTop: 6, paddingTop: 6 }}>
+                  <div style={{ color: '#888', fontSize: 12 }}>参数快照（复现用）：</div>
+                  {paramsLines(c).map((p, i) => (
+                    <div key={i} style={{ display: 'flex', gap: 8, fontSize: 12, margin: '2px 0' }}>
+                      <span style={{ color: '#888', minWidth: 90 }}>{p.k}</span><span>{p.v}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </details>
           </div>
         ) : (

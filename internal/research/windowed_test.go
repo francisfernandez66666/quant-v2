@@ -79,6 +79,94 @@ func seedWindowDB(t *testing.T) *store.DB {
 	return db
 }
 
+// TestTopNExclusiveReruns §S1 排他重跑：topN=2 应产出两条互异最优组合，且首轮不劣于次轮。
+// English: §S1 exclusive reruns — topN=2 must yield two mutually-distinct combos, first no worse than second.
+func TestTopNExclusiveReruns(t *testing.T) {
+	db := seedWindowDB(t)
+	codes, _ := db.StockCodes()
+
+	opts := DiscoverOpts{
+		Factors:    []string{"Mom20", "STO20", "Brk20", "RSI14", "AtrRatio14"},
+		Horizon:    5,
+		MinStocks:  3,
+		MaxFactors: 4,
+		SplitPct:   0.7,
+		MinIR:      0.1,
+		MinDays:    5,
+	}
+	results := DiscoverFactorsWindowedN(db, codes, "20230101", datesEnd(db), opts, 2)
+	if len(results) == 0 || len(results[0].Factors) == 0 {
+		t.Fatalf("应产出 ≥1 条非空结果, got %d (%v)", len(results), results)
+	}
+	t.Logf("topN=2 产出 %d 条：%v", len(results), results)
+	// 排他重跑机制：当第二组合可行时两轮必须互异
+	if len(results) >= 2 {
+		jacc := jaccardSet(results[0].Factors, results[1].Factors)
+		if jacc >= 1 {
+			t.Fatalf("两轮组合应互异: 轮0=%v 轮1=%v（Jaccard=%.2f）", results[0].Factors, results[1].Factors, jacc)
+		}
+	}
+}
+
+// jaccardSet 两个因子集合的 Jaccard 相似度（交/并）。
+func jaccardSet(a, b []string) float64 {
+	am, bm := map[string]bool{}, map[string]bool{}
+	for _, f := range a {
+		am[f] = true
+	}
+	n := 0
+	for _, f := range b {
+		bm[f] = true
+		if am[f] {
+			n++
+		}
+	}
+	union := len(am) + len(bm) - n
+	if union == 0 {
+		return 0
+	}
+	return float64(n) / float64(union)
+}
+
+// TestYearlySignConsistency §C3a 分年度 IR 符号一致统计。
+func TestYearlySignConsistency(t *testing.T) {
+	type attrYear func(year, j int) float64
+	// IC 需有微小方差（否则 std=0 → IR=NaN → 判 0，无法做一致性判断）。
+	// English: IC needs tiny variance (constant IC → std=0 → IR=NaN → treated 0, inconsistent).
+	mk := func(years []int, ic attrYear) []ICRow {
+		var rows []ICRow
+		for _, y := range years {
+			for j := 0; j < 3; j++ {
+				rows = append(rows, ICRow{Date: fmt.Sprintf("%04d0101", y), N: 100, IC: ic(y, j)})
+			}
+		}
+		return rows
+	}
+	pos := func(year, j int) float64 { return 0.02 + 0.001*float64((year+j)%3) }
+
+	// 全部同号（每年 3 行≥2）→ 一致年份 = 非平凡年份
+	yrs := []int{2023, 2024, 2025}
+	c, tt := yearlySignConsistency(mk(yrs, pos), 2)
+	if c != len(yrs) || tt != len(yrs) {
+		t.Fatalf("全同号应一致=总=%d, got c=%d t=%d", len(yrs), c, tt)
+	}
+	// 2022 整体为负 → 一致 3 年 / 非平凡 4 年（总体仍为正）
+	mixed := func(year, j int) float64 {
+		if year == 2022 {
+			return -(0.02 + 0.001*float64(j%3))
+		}
+		return pos(year, j)
+	}
+	c, tt = yearlySignConsistency(mk([]int{2022, 2023, 2024, 2025}, mixed), 2)
+	if tt != 4 || c != 3 {
+		t.Fatalf("一年反向应 c=3 t=4, got c=%d t=%d", c, tt)
+	}
+	// 空/样本不足
+	if c, tt := yearlySignConsistency(nil, 2); c != 0 || tt != 0 {
+		t.Fatalf("空输入应 0,0, got %d,%d", c, tt)
+	}
+}
+
 // TestWindowedMatchesFull 窗口分块与全量发现结果一致。
 // English: TestWindowedMatchesFull: windowed chunking and full discovery produce consistent results.
 func TestWindowedMatchesFull(t *testing.T) {

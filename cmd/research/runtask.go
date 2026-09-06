@@ -49,7 +49,9 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 	case store.TaskDiscoverFactors:
 		cmdDiscoverFactors(db, payloadArgs(p,
 			"start", "end", "h", "min-stocks", "max-factors", "split",
-			"min-ir", "min-days", "min-gen-t", "metric", "factors", "codes"))
+			"min-ir", "min-days", "min-gen-t", "metric", "factors", "codes",
+			"pool", "top-n", "dedup-jaccard", "guard-strong", "guard-weak",
+			"min-yr-sign", "change-gate", "staleness-days", "hysteresis"))
 	case store.TaskDiscoverPatterns:
 		cmdDiscoverPatterns(db, payloadArgs(p,
 			"start", "end", "h", "min-trigger", "min-excess", "split", "codes"))
@@ -70,7 +72,10 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 		}
 		cmdBacktestCandidate(db, btArgs)
 	case store.TaskBacktestNightly:
-		cmdBacktestCandidate(db, payloadArgs(p, "start", "end", "h", "max-per-day"))
+		// A2 配对回测：since（回填当日多候选）+ C3b min-bt-events + A3 max-per-day 等事件/选股参数。
+		cmdBacktestCandidate(db, payloadArgs(p,
+			"start", "end", "h", "max-per-day", "since", "min-bt-events",
+			"min-limit-ups", "top-k", "min-stocks"))
 	case store.TaskBacktestStrategy:
 		// 二期：进程内调用 btreplay（bt_strategy 已并入 research 二进制）。
 		// English: phase-2 — in-process replay via internal/btreplay.

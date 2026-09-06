@@ -491,6 +491,31 @@ func windowEval(db *store.DB, codes []string, opts OptimizeOpts, w map[string]fl
 // db+codes+range and assembles per window internally, avoiding the ~2.8GB full-panel residency so
 // peak memory stays within a single window (inside 900M). Same semantics as the full version.
 func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, opts DiscoverOpts) DiscoverResult {
+	results := DiscoverFactorsWindowedN(db, codes, start, end, opts, 1)
+	if len(results) == 0 {
+		return DiscoverResult{Directions: map[string]int{}, Weights: map[string]float64{}, Reason: "无结果"}
+	}
+	return results[0]
+}
+
+// DiscoverFactorsWindowedN §S1 多解排他版因子发现：在 DiscoverFactorsWindowed 基础上支持
+// topN>1 时连续求解前 N 个互异最优组合——每轮贪心求出最优组合 W 后把 W 加入排他集
+// （沿用 ExcludeCombos 机制）清空重跑下一轮，产出按优劣排序的互异候选列表。
+// 预筛（单因子 IR）与贪心子集 IC 的行值与排除集无关，统一用 rkBase 缓存跨排他轮复用；
+// 分段/反推(gen)缓存依赖最终组合，用含排除集的 per-rerun key 保证正确性。
+// English: §S1 top-N exclusive rerun discovery — with topN>1 it solves the first N mutually-distinct
+// best combos by excluding each winner and re-running greedy. Pre-screen and greedy-subset IC rows are
+// exclusion-independent and shared under rkBase; segment/gen caches depend on the final combo and use a
+// per-rerun exclusion-sensitive key for correctness.
+func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, opts DiscoverOpts, topN int) []DiscoverResult {
+	res := DiscoverResult{Directions: map[string]int{}, Weights: map[string]float64{}}
+	empty := func(reason string) []DiscoverResult {
+		res.Reason = reason
+		return []DiscoverResult{res}
+	}
+	if topN <= 0 {
+		topN = 1
+	}
 	if opts.Horizon <= 0 {
 		opts.Horizon = 5
 	}
@@ -520,35 +545,33 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 			opts.Factors = append(opts.Factors, d.ID)
 		}
 	}
-	res := DiscoverResult{Directions: map[string]int{}, Weights: map[string]float64{}}
 	if len(codes) == 0 {
-		res.Reason = "无有效面板"
-		return res
+		return empty("无有效面板")
 	}
 	// 全局交易日列表 + 分段边界
 	dates, err := db.TradeDates(start, end)
 	if err != nil || len(dates) < 10 {
-		res.Reason = "日期过少"
-		return res
+		return empty("日期过少")
 	}
 	splitIdx := int(float64(len(dates)) * opts.SplitPct)
 	winDays := windowDays
 	chunks := windowChunks(dates, winDays)
 	// §GAP 二.3#4 真 hold-out：寻优只用样本内窗口（≤splitIdx），样本外留作第 4 步验证
 	inChunks := windowChunks(dates[:splitIdx+1], winDays)
+	splitChunks := windowChunks(dates[splitIdx:], winDays)
+	headChunks := windowChunks(dates[:splitIdx+1], winDays)
 
-	// 窗口级断点（二期）：resume_key 绑定区间+参数+股票池；被抢占后重入，
-	// 预筛/贪心/分段IR/反推各阶段命中窗口直接复用，不再重装配。
-	// English: window-level checkpoints — resume key binds range+params+pool; a preempted rerun
-	// reuses finished windows across the pre-screen / greedy / split-IR / gen stages.
-	rk := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes, opts.ExcludeCombos)
-	log.Printf("[discover] 断点key=%s 窗口数=%d（中断续跑跳过已完成窗口）", rk, len(chunks))
+	// 窗口级断点（二期）：预筛/贪心子集 IC 与排除集无关，统一用 rkBase 跨排他轮复用；
+	// 分段/反推(gen)依赖最终组合，per-rerun 用含排除集的 rk 保证缓存正确。
+	// English: pre-screen and greedy-subset IC rows are exclusion-independent → shared rkBase;
+	// segment/gen rows depend on the final combo → per-rerun rk carrying the exclusion set.
+	rkBase := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes, nil)
+	log.Printf("[discover] 断点key=%s 窗口数=%d 排他重跑 topN=%d（中断续跑跳过已完成窗口）", rkBase, len(chunks), topN)
 
 	// 1) 单因子预筛：每窗口装配一次（含全部候选因子），§GAP 二.3#4 只算样本内（≤split）|IR|
-	// （比逐因子重新装配窗口快约「因子数」倍）。进度带 5%–35%。
-	// English: single-factor pre-screen (progress band 5–35%), in-sample only.
+	// 进度带 5%–35%。English: single-factor pre-screen (progress band 5–35%), in-sample only.
 	var pre []string
-	preCk := &winCkpt{db: db, resumeKey: rk, stage: "pre"}
+	preCk := &winCkpt{db: db, resumeKey: rkBase, stage: "pre"}
 	allIC := windowICByAllFactors(db, codes, opts.Factors, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1], preCk, newStageProgress(5, 35, len(inChunks)))
 	for _, fid := range opts.Factors {
 		rows := allIC[fid]
@@ -562,103 +585,165 @@ func DiscoverFactorsWindowed(db *store.DB, codes []string, start, end string, op
 		pre = append(pre, fid)
 	}
 	if len(pre) == 0 {
-		res.Reason = "预筛后无有效因子"
-		return res
+		return empty("预筛后无有效因子")
 	}
 
-	// 2) 贪心前向选择（等权）
-	selected := make([]string, 0, opts.MaxFactors)
-	selectedSet := map[string]bool{}
-	bestIR := -1e9
-	dirs := map[string]int{}
-	for len(selected) < opts.MaxFactors {
-		// 候选因子（未选中的）
-		var cands []string
-		for _, fid := range pre {
-			if !selectedSet[fid] {
-				cands = append(cands, fid)
+	var results []DiscoverResult
+	exclude := append([][]string{}, opts.ExcludeCombos...)
+	for r := 0; r < topN; r++ {
+		// 2) 贪心前向选择（等权），命中排除集（F4 已驳回 + 前几轮冠军）的组合跳过
+		selected := make([]string, 0, opts.MaxFactors)
+		selectedSet := map[string]bool{}
+		bestIR := -1e9
+		for len(selected) < opts.MaxFactors {
+			var cands []string
+			for _, fid := range pre {
+				if !selectedSet[fid] {
+					cands = append(cands, fid)
+				}
 			}
+			if len(cands) == 0 {
+				break
+			}
+			bestFid := ""
+			bestCandIR := bestIR
+			subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1],
+				&winCkpt{db: db, resumeKey: rkBase, stage: "greedy|" + strings.Join(selected, "+")})
+			for _, fid := range cands {
+				if comboExcluded(selected, fid, exclude) {
+					continue
+				}
+				ir := absf(IR(subsetIC[fid]))
+				if isNaN(ir) {
+					continue
+				}
+				if ir > bestCandIR {
+					bestCandIR = ir
+					bestFid = fid
+				}
+			}
+			if bestFid == "" || bestCandIR <= bestIR {
+				break
+			}
+			selected = append(selected, bestFid)
+			selectedSet[bestFid] = true
+			bestIR = bestCandIR
 		}
-		if len(cands) == 0 {
+		if len(selected) == 0 {
 			break
 		}
-		// 每窗口装配一次，算所有候选子集（base+各 cand）的复合 IC（提速；§GAP 二.3#4 样本内）
-		bestFid := ""
-		bestCandIR := bestIR
-		// 断点 stage 含 base 标识：贪心每步 base 集不同，各自成槽（stage embeds the base set）。
-		subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1],
-			&winCkpt{db: db, resumeKey: rk, stage: "greedy|" + strings.Join(selected, "+")})
-		for _, fid := range cands {
-			// §F4 已驳回组合跳过：selected+fid 的排序后集合若命中任一 ExcludeCombo 则不再评估，
-			// 避免每晚重复产出同一已驳回战法（如 Brk60 #111）。English: skip candidates whose
-			// sorted set (selected+this factor) equals a previously rejected combo.
-			if comboExcluded(selected, fid, opts.ExcludeCombos) {
-				continue
-			}
-			ir := absf(IR(subsetIC[fid]))
-			if isNaN(ir) {
-				continue
-			}
-			if ir > bestCandIR {
-				bestCandIR = ir
-				bestFid = fid
+		// per-rerun 断点 key（含排除集 → gen 缓存与最终组合绑定）
+		rk := discoveryResumeKey(start, end, opts.Horizon, opts.MinStocks, winDays, opts.Factors, codes, exclude)
+
+		// 3) 方向 + 权重优化
+		dirs := map[string]int{}
+		for _, fid := range selected {
+			if d, ok := factor.Get(fid); ok {
+				dirs[fid] = dirOfCat(d.Cat)
+			} else {
+				dirs[fid] = 1
 			}
 		}
-		if bestFid == "" || bestCandIR <= bestIR {
-			break
+		opt := windowOptimizeWeights(db, codes, OptimizeOpts{
+			Factors: selected, Horizon: opts.Horizon, MinStocks: opts.MinStocks,
+			Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
+			GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
+			End: dates[splitIdx],
+		}, inChunks, dates[:splitIdx+1])
+
+		// 4) E3 分段 + 反推验证（窗口分块，IR 行与 gen 都走 per-rerun rk，跨排他轮隔离）
+		irCk := func() *winCkpt { return &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(opt.Weights)} }
+		inRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, headChunks, dates, irCk())
+		outRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, splitChunks, dates, irCk())
+		res.InsampleIR = irOrZero(inRows)
+		res.OutsampleIR = irOrZero(outRows)
+		if opts.MinYrSign > 0 {
+			res.YearlyConsistentYears, res.YearlyTotalYears = yearlySignConsistency(outRows, 5)
 		}
-		selected = append(selected, bestFid)
-		selectedSet[bestFid] = true
-		bestIR = bestCandIR
-	}
-	if len(selected) == 0 {
-		res.Reason = "前向选择未选出因子"
-		return res
-	}
+		res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT =
+			windowReverseExtension(db, codes, selected, dirs, opt.Weights, opts, splitChunks, dates, rk)
 
-	// 3) 方向 + 权重优化
-	for _, fid := range selected {
-		if d, ok := factor.Get(fid); ok {
-			dirs[fid] = dirOfCat(d.Cat)
-		} else {
-			dirs[fid] = 1
+		res.Factors = selected
+		res.Directions = dirs
+		res.Weights = opt.Weights
+		res.ICMean = opt.ICMean
+		res.IR = opt.IR
+		res.NDays = opt.NDays
+		res.PassGuard = opt.PassGuard
+		res.Reason = opt.Reason
+
+		if res.OutsampleIR < opts.MinIR {
+			if res.PassGuard {
+				res.Reason = "样本内过护栏但样本外IR不足(" + trimFloat(res.OutsampleIR) + ")"
+				res.PassGuard = false
+			}
 		}
-	}
-	opt := windowOptimizeWeights(db, codes, OptimizeOpts{
-		Factors: selected, Horizon: opts.Horizon, MinStocks: opts.MinStocks,
-		Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
-		GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
-		End: dates[splitIdx],
-	}, inChunks, dates[:splitIdx+1])
-	res.Factors = selected
-	res.Directions = dirs
-	res.Weights = opt.Weights
-	res.ICMean = opt.ICMean
-	res.IR = opt.IR
-	res.NDays = opt.NDays
-	res.PassGuard = opt.PassGuard
-	res.Reason = opt.Reason
-
-	// 4) E3 分段 + 反推验证（窗口分块）
-	// 分段 IR 与反推验证：输入确定（selected+权重固定），窗口断点全量生效。
-	splitChunks := windowChunks(dates[splitIdx:], winDays)
-	headChunks := windowChunks(dates[:splitIdx+1], winDays)
-	res.InsampleIR = windowCompositeIR(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, headChunks, dates, rk)
-	res.OutsampleIR = windowCompositeIR(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, splitChunks, dates, rk)
-	res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT =
-		windowReverseExtension(db, codes, selected, dirs, opt.Weights, opts, splitChunks, dates, rk)
-
-	if res.OutsampleIR < opts.MinIR {
-		if res.PassGuard {
-			res.Reason = "样本内过护栏但样本外IR不足(" + trimFloat(res.OutsampleIR) + ")"
+		if res.PassGuard && !isNaN(res.GenT) && res.GenT < opts.MinGenT {
+			res.Reason = "反推泛化不足（高分组超额" + trimFloat(res.GenExcess) + "，t=" + trimFloat(res.GenT) + "显著为负）"
 			res.PassGuard = false
 		}
+		// §C3a 分年度 IR 符号一致性：样本外非平凡年份中与总体同号的年份不足 → 护栏不过
+		if res.PassGuard && opts.MinYrSign > 0 && res.YearlyTotalYears > opts.MinYrSign &&
+			res.YearlyConsistentYears < opts.MinYrSign {
+			res.Reason = fmt.Sprintf("样本外分年度IR符号一致性不足(%d/%d年与总体同号)", res.YearlyConsistentYears, res.YearlyTotalYears)
+			res.PassGuard = false
+		}
+		results = append(results, res)
+		// 排他：把本轮最优组合加入排除集，保证下一轮产出互异组合
+		exclude = append(exclude, append([]string{}, selected...))
 	}
-	if res.PassGuard && !isNaN(res.GenT) && res.GenT < opts.MinGenT {
-		res.Reason = "反推泛化不足（高分组超额" + trimFloat(res.GenExcess) + "，t=" + trimFloat(res.GenT) + "显著为负）"
-		res.PassGuard = false
+	if len(results) == 0 {
+		return empty("前向选择未选出因子")
 	}
-	return res
+	return results
+}
+
+// irOrZero 返回 IR（NaN 归 0）。English: IR with NaN → 0.
+func irOrZero(rows []ICRow) float64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	ir := IR(rows)
+	if isNaN(ir) {
+		return 0
+	}
+	return ir
+}
+
+// yearlySignConsistency §C3a 分年度 IR 符号一致性：按自然年分组，统计"非平凡"年份
+// （样本≥minRows）中 IR 符号与总体 IR 符号一致的年份数。返回 (一致年份数, 非平凡年份总数)。
+// English: §C3a yearly IR sign consistency — groups rows by calendar year and counts non-trivial
+// years (≥ minRows) whose IR sign matches the overall IR sign. Returns (consistent, total).
+func yearlySignConsistency(rows []ICRow, minRows int) (int, int) {
+	if minRows <= 0 {
+		minRows = 5
+	}
+	overall := irOrZero(rows)
+	if overall == 0 || len(rows) < minRows {
+		return 0, 0
+	}
+	byYear := map[string][]ICRow{}
+	for _, r := range rows {
+		if len(r.Date) >= 4 {
+			y := r.Date[:4]
+			byYear[y] = append(byYear[y], r)
+		}
+	}
+	consistent, total := 0, 0
+	for _, yrows := range byYear {
+		if len(yrows) < minRows {
+			continue
+		}
+		yir := irOrZero(yrows)
+		if yir == 0 {
+			continue
+		}
+		total++
+		if (yir > 0) == (overall > 0) {
+			consistent++
+		}
+	}
+	return consistent, total
 }
 
 // storeNextDay 返回 YYYYMMDD 的次日（跨月跨年）。

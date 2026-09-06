@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/store"
 )
 
 // mustConfig 写一个临时 config.json（含 rules.scheduler）并返回路径。
@@ -221,6 +223,108 @@ func TestInsertAfter(t *testing.T) {
 	// 已含 backtest 不重复
 	if containsStep(got, "backtest") != true {
 		t.Error("containsStep 应识别 backtest")
+	}
+}
+
+// TestEnsureNightlyEnqueueMultiRound §2026-09-05 多轮发现链路：discover_factors 展开为
+// variants 个变体任务（4 轮 = 2 变体 × top_n=2 排他）+ 一次配对 backtest（--since 今日回填多候选），
+// 并对每个变体做参数差异断言（h/start 窗口轮换、top-n、since、max-per-day）。
+// English: multi-round expansion — discover_factors → 2 variant tasks (4 rounds = 2×topN2), a paired
+// --since backtest, param rotation asserted per variant.
+func TestEnsureNightlyEnqueueMultiRound(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "trading.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	cfg := cfgSamples("fake", dbPath)
+	cfg.Nightly.Steps = []string{"discover_factors", "discover_patterns", "list"}
+	cfg.Nightly.BacktestEnabled = true
+	cfg.Nightly.ResearchRounds = 4
+	cfg.Nightly.Discover = config.DiscoverConfig{
+		Horizons:     []int{5, 10},
+		StartWindows: []int{3, 1},
+		Metrics:      []string{"ir", "ir"},
+		FactorPools:  []string{"", "mom_liq"},
+		TopN:         2,
+		MaxPerDay:    3,
+	}
+
+	loc := time.FixedZone("CST", 8*3600)
+	s := &Scheduler{statePath: filepath.Join(t.TempDir(), "state.json")}
+	s.setNow(func() time.Time { return time.Date(2026, 9, 5, 16, 0, 0, 0, loc) })
+	s.ensureNightlyEnqueue(db, cfg, s.nowTime())
+
+	tasks, err := db.ListResearchTasks()
+	if err != nil {
+		t.Fatalf("ListResearchTasks: %v", err)
+	}
+	// ListResearchTasks 按 id 倒序返回，测试内按 chain_seq 升序重排后再断言
+	sort.SliceStable(tasks, func(i, j int) bool { return tasks[i].ChainSeq < tasks[j].ChainSeq })
+	// 期望顺序：disc#0 → disc#1 → backtest(配对) → discover_patterns → library_replay → list（共 6 任务）
+	wantTypes := []string{
+		store.TaskDiscoverFactors, store.TaskDiscoverFactors,
+		store.TaskBacktestNightly, store.TaskDiscoverPatterns,
+		store.TaskBacktestStrategy, store.TaskList,
+	}
+	if len(tasks) != len(wantTypes) {
+		t.Fatalf("任务数=%d, want %d: %+v", len(tasks), len(wantTypes), tasks)
+	}
+	num := func(m map[string]any, k string) float64 {
+		if v, ok := m[k].(float64); ok {
+			return v
+		}
+		return 0
+	}
+	strv := func(m map[string]any, k string) string {
+		if v, ok := m[k].(string); ok {
+			return v
+		}
+		return ""
+	}
+	for i, tk := range tasks {
+		if tk.Type != wantTypes[i] {
+			t.Fatalf("任务#%d 类型=%s, want %s (chain_seq=%d)", i, tk.Type, wantTypes[i], tk.ChainSeq)
+		}
+		if tk.ChainSeq != i {
+			t.Fatalf("任务#%d chain_seq=%d, want %d", i, tk.ChainSeq, i)
+		}
+	}
+	// 变体 0（近3年窗 + h=5）与变体 1（近1年窗 + h=10）参数差异
+	var p0, p1 map[string]any
+	if err := json.Unmarshal([]byte(tasks[0].Payload), &p0); err != nil {
+		t.Fatalf("变体0 payload 解析: %v", err)
+	}
+	if err := json.Unmarshal([]byte(tasks[1].Payload), &p1); err != nil {
+		t.Fatalf("变体1 payload 解析: %v", err)
+	}
+	if num(p0, "h") != 5 || strv(p0, "start") != "20230905" {
+		t.Errorf("变体0 payload=%+v (期望 h=5 start=20230905)", p0)
+	}
+	if num(p1, "h") != 10 || strv(p1, "start") != "20250905" {
+		t.Errorf("变体1 payload=%+v (期望 h=10 start=20250905)", p1)
+	}
+	if num(p0, "top-n") != 2 {
+		t.Errorf("变体0 top-n=2, got %v", num(p0, "top-n"))
+	}
+	// 配对 backtest：since=今日 + max-per-day=3
+	var pb map[string]any
+	if err := json.Unmarshal([]byte(tasks[2].Payload), &pb); err != nil {
+		t.Fatalf("backtest payload 解析: %v", err)
+	}
+	if strv(pb, "since") != "20260905" {
+		t.Errorf("backtest since=20260905, got %q (%+v)", strv(pb, "since"), pb)
+	}
+	if num(pb, "max-per-day") != 3 {
+		t.Errorf("backtest max-per-day=3, got %v (%+v)", num(pb, "max-per-day"), pb)
+	}
+	// 幂等：二次入队不再产生任务
+	s.ensureNightlyEnqueue(db, cfg, s.nowTime())
+	tasks2, _ := db.ListResearchTasks()
+	if len(tasks2) != len(tasks) {
+		t.Errorf("ChainHasTasks 幂等应不重复入队: before=%d after=%d", len(tasks), len(tasks2))
 	}
 }
 

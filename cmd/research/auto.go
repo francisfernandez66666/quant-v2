@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -350,7 +351,17 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	minGenT := fs.Float64("min-gen-t", -2, "反推泛化护栏 Welch t 阈值（t 低于此负值拦截，默认 -2）")
 	metric := fs.String("metric", "ir", "优化目标: ir|ic")
 	factors := fs.String("factors", "", "候选因子池（逗号分隔，缺省全部注册因子）")
+	pool := fs.String("pool", "", "风格子池（''=全池 all|value|growth|quality|size|volatility|momentum|liquidity|mom_liq|value_quality|vol_size 等预设）")
 	codesFile := fs.String("codes", "", "研究池文件（每行一个 ts_code）")
+	// §S1/C2/C3/C4 多轮发现护栏与去重参数（调度器从 rules.nightly.discover 注入，缺省即旧行为）
+	topN := fs.Int("top-n", 1, "S1 排他重跑最优组合数（每变体连续产出前 N 个互异组合）")
+	dedupJaccard := fs.Float64("dedup-jaccard", 0.8, "S2 近似去重 Jaccard 阈值（0~1，0 关闭）")
+	guardStrong := fs.Float64("guard-strong", 0.45, "C2 强护栏：样本外 IR ≥ 此值 标记 strong")
+	guardWeak := fs.Float64("guard-weak", 0.2, "C2 弱护栏：样本外 IR ≥ 此值 标记 weak（否则 reject 不落库）")
+	minYrSign := fs.Int("min-yr-sign", 0, "C3a 样本外分年度 IR 符号一致最少年数（0=关闭）")
+	changeGate := fs.Bool("change-gate", false, "S3 变化门：与最新 proposed 组合相同且在冷却期内则跳过")
+	stalenessDays := fs.Int("staleness-days", 30, "S3 冷却天数")
+	hysteresis := fs.Float64("hysteresis", 0.05, "C4 滞回：与最新 applied 组合相同且 |ΔIR|<此值 则跳过")
 	fs.Parse(args)
 
 	codes, err := db.StockCodes()
@@ -363,18 +374,11 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	if len(codes) == 0 {
 		log.Fatalf("研究池为空")
 	}
-	var pool []string
-	if *factors != "" {
-		for _, f := range strings.Split(*factors, ",") {
-			f = strings.TrimSpace(f)
-			if f != "" {
-				pool = append(pool, f)
-			}
-		}
-	}
+	poolFactors := resolveFactorPool(*factors, *pool)
 	opts := research.DiscoverOpts{
-		Factors: pool, Horizon: *h, MinStocks: *minStocks, Metric: *metric,
+		Factors: poolFactors, Horizon: *h, MinStocks: *minStocks, Metric: *metric,
 		MaxFactors: *maxFactors, SplitPct: *split, MinIR: *minIR, MinDays: *minDays, MinGenT: *minGenT,
+		MinYrSign: *minYrSign,
 	}
 	// §F4 已驳回去重：取历史全部 rejected 的 factor 候选，解析其因子组合注入 ExcludeCombos，
 	// 贪心选择时命中即跳过，避免每晚重复生成同一已驳回战法（如 #108~#111 的 Brk60）。
@@ -396,51 +400,225 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	// English: memory-bounded windowed discovery — no longer loads the full panel set at once
 	// (~2.8GB for the whole universe × 3y), but assembles per trading-day window and releases it,
 	// keeping peak memory within a single window (under 900M) at the cost of speed.
-	log.Printf("因子发现（窗口分块）：%d 只股票 目标=%s 组合上限=%d 样本内=%.0f%%…",
-		len(codes), *metric, *maxFactors, *split*100)
-	res := research.DiscoverFactorsWindowed(db, codes, *start, *end, opts)
-
-	wj, _ := json.Marshal(res.Weights)
-	fj, _ := json.Marshal(res.Factors)
-	// E6：方向与权重一并存盘，供实盘因子 runner 恢复完整规则。
-	// Weights 字段存 {weights, directions, buy_threshold} 复合结构。
-	// English: store directions alongside weights so the live factor runner can rebuild the full rule.
-	ruleJSON, _ := json.Marshal(map[string]any{
-		"weights":       res.Weights,
-		"directions":    res.Directions,
-		"buy_threshold": 70,
-	})
-	_ = wj
-	reason := fmt.Sprintf("%s | 样本内IR=%.3f 样本外IR=%.3f 反推超额=%.4f 反推t=%.2f",
-		res.Reason, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT)
-	// §F4 落库前兜底：即使贪心阶段因断点复用跳过了去重，最终组合若仍命中已驳回集合则直接丢弃。
-	// English: §F4 final guard — even if checkpoints bypassed the greedy-stage de-dup, drop a final
-	// combination that still equals a previously rejected factor set.
-	if research.IsComboRejected(res.Factors, opts.ExcludeCombos) {
-		log.Printf("§F4 组合已驳回，跳过生成候选：因子=%v", res.Factors)
+	log.Printf("因子发现（窗口分块）：%d 只股票 目标=%s 组合上限=%d 样本内=%.0f%% 排他topN=%d 子池=%q…",
+		len(codes), *metric, *maxFactors, *split*100, *topN, *pool)
+	results := research.DiscoverFactorsWindowedN(db, codes, *start, *end, opts, *topN)
+	if len(results) == 0 {
+		log.Printf("未发现任何候选")
 		return
 	}
-	status := "proposed"
-	if !res.PassGuard {
-		status = "proposed" // 护栏不过仍入库，标记 reason
-	}
-	id, err := db.SaveCandidate(&store.Candidate{
-		Kind: "factor", Status: status, Factors: string(fj), Weights: string(ruleJSON),
-		Metric: res.IR, ICMean: res.ICMean, IR: res.IR,
-		Horizon: *h, Reason: reason,
-	})
-	if err != nil {
-		log.Fatalf("保存候选失败: %v", err)
-	}
-	log.Printf("因子候选 #%d：因子=%v IR=%.3f 样本内=%.3f 样本外=%.3f 反推=%.4f 反推t=%.2f 护栏=%v",
-		id, res.Factors, res.IR, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT, res.PassGuard)
-	for _, f := range sortedIDs(res.Weights) {
-		dir := "+"
-		if res.Directions[f] < 0 {
-			dir = "-"
+	// S2 去重的状态集合：已提出/已审批/已应用/灰度中 都算占用，杜绝重复副本堆进审批面。
+	live := []string{store.CandProposed, store.CandApproved, store.CandApplied, store.CandGrayscale}
+	for i := range results {
+		res := &results[i]
+		if len(res.Factors) == 0 {
+			continue
 		}
-		log.Printf("  %s%s %.3f", dir, f, res.Weights[f])
+		// S2 落库前全状态去重：精确重复或 Jaccard 近似重复 → 跳过（任务仍 Done，不落 error）。
+		if fd, _ := db.ComboExistsLike(res.Factors, live...); fd {
+			log.Printf("§S2 组合已存在（proposed/approved/applied/grayscale），跳过：因子=%v", res.Factors)
+			continue
+		}
+		if *dedupJaccard > 0 {
+			if nd, _ := db.ComboNearDup(res.Factors, *dedupJaccard, live...); nd {
+				log.Printf("§S2 组合近似重复（Jaccard≥%.2f），跳过：因子=%v", *dedupJaccard, res.Factors)
+				continue
+			}
+		}
+		// S3 变化门（默认关）：与最新 proposed 组合精确相同且在冷却期内 → 当晚跳过。
+		if *changeGate {
+			if last, err := db.LatestCandidate("factor", store.CandProposed); err == nil && last != nil && comboEqual(res.Factors, last.Factors) {
+				ageDays := int(candidateAgeDays(last.CreatedAt))
+				if ageDays < *stalenessDays {
+					log.Printf("§S3 变化门：组合与最新 proposed 相同且仍在冷却期(%d天<%d天)，跳过", ageDays, *stalenessDays)
+					continue
+				}
+			}
+		}
+		// C4 滞回：与最新 applied 组合相同且 |ΔIR|<hysteresis → 跳过（防边际改进噪音顶掉实盘战法）。
+		if *hysteresis > 0 {
+			if app, err := db.LatestCandidate("factor", store.CandApplied); err == nil && app != nil && comboEqual(res.Factors, app.Factors) {
+				if math.Abs(res.IR-app.IR) < *hysteresis {
+					log.Printf("§C4 滞回：组合与最新 applied 相同且 |ΔIR|=%.3f<%.3f，跳过", math.Abs(res.IR-app.IR), *hysteresis)
+					continue
+				}
+			}
+		}
+		// C2 护栏分级（基于样本外 IR）：strong/standard/weak → 落库；reject → 不落库。
+		tier := factorGuardTier(res.OutsampleIR, *guardStrong, *minIR, *guardWeak)
+		if tier == "reject" {
+			log.Printf("§C2 护栏不够（样本外IR=%.3f<%.3f），不落库：因子=%v", res.OutsampleIR, *guardWeak, res.Factors)
+			continue
+		}
+		// C4 参数快照：精确复现审批战法的全量参数 JSON。
+		params, _ := json.Marshal(map[string]any{
+			"start": *start, "end": *end, "h": *h, "variant": i + 1, "top_n": *topN,
+			"pool": *pool, "min_stocks": *minStocks, "max_factors": *maxFactors,
+			"split": *split, "min_ir": *minIR, "min_days": *minDays, "min_gen_t": *minGenT,
+			"metric": *metric, "guard_strong": *guardStrong, "guard_weak": *guardWeak,
+			"min_yr_sign": *minYrSign,
+		})
+		fj, _ := json.Marshal(res.Factors)
+		// E6：方向与权重一并存盘，供实盘因子 runner 恢复完整规则。
+		// English: store directions alongside weights so the live factor runner can rebuild the full rule.
+		ruleJSON, _ := json.Marshal(map[string]any{
+			"weights":       res.Weights,
+			"directions":    res.Directions,
+			"buy_threshold": 70,
+		})
+		rank := "冠军"
+		if i > 0 {
+			rank = fmt.Sprintf("亚军+%d", i)
+		}
+		reason := fmt.Sprintf("%s | 样本内IR=%.3f 样本外IR=%.3f 反推超额=%.4f 反推t=%.2f 排他第%d",
+			res.Reason, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT, i+1)
+		if res.YearlyTotalYears > 0 {
+			reason += fmt.Sprintf(" 年度符号一致(%d/%d)", res.YearlyConsistentYears, res.YearlyTotalYears)
+		}
+		if tier == "weak" {
+			reason = "[弱护栏-观察] " + reason
+		}
+		id, err := db.SaveCandidate(&store.Candidate{
+			Kind: "factor", Status: store.CandProposed, Guard: tier, Params: string(params),
+			Factors: string(fj), Weights: string(ruleJSON),
+			Metric: res.IR, ICMean: res.ICMean, IR: res.IR,
+			Horizon: *h, Reason: reason,
+		})
+		if err != nil {
+			log.Fatalf("保存候选失败: %v", err)
+		}
+		log.Printf("因子候选[%s] #%d（%s）：因子=%v IR=%.3f 样本内=%.3f 样本外=%.3f 反推=%.4f 反推t=%.2f",
+			rank, id, tier, res.Factors, res.IR, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT)
+		_ = rank
+		for _, f := range sortedIDs(res.Weights) {
+			dir := "+"
+			if res.Directions[f] < 0 {
+				dir = "-"
+			}
+			log.Printf("  %s%s %.3f", dir, f, res.Weights[f])
+		}
 	}
+}
+
+// factorGuardTier §C2 护栏分级：基于样本外 IR 判定 strong/standard/weak/reject。
+// strong ≥ guardStrong；standard ≥ minIR；weak ≥ guardWeak；其余 reject（不落库）。
+// English: C2 guard tiering from out-of-sample IR.
+func factorGuardTier(outIR, guardStrong, minIR, guardWeak float64) string {
+	switch {
+	case outIR >= guardStrong:
+		return "strong"
+	case outIR >= minIR:
+		return "standard"
+	case outIR >= guardWeak:
+		return "weak"
+	}
+	return "reject"
+}
+
+// resolveFactorPool 结算 --factors/--pool 指定的候选因子池。
+// --factors 显式逗号列表优先；否则按 --pool 风格子池（"" 或 "all" 即全池）解析为
+// 对应大类因子 ID 列表（支持 "mom_liq" 等多类组合名）。
+// English: resolves the candidate factor pool from --factors/--pool — explicit list wins; style pools
+// map to category factor IDs (supports multi-category combos like "mom_liq").
+func resolveFactorPool(explicit, pool string) []string {
+	if explicit != "" {
+		var out []string
+		for _, f := range strings.Split(explicit, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+	if pool == "" || pool == "all" {
+		return nil // 全池：由 DiscoverFactorsWindowedN 缺省兜底
+	}
+	catByName := map[string]factor.Category{
+		"value":       factor.CatValue,
+		"growth":      factor.CatGrowth,
+		"quality":     factor.CatQuality,
+		"size":        factor.CatSize,
+		"volatility":  factor.CatVolatility,
+		"momentum":    factor.CatMomentum,
+		"liquidity":   factor.CatLiquidity,
+		"mom_liq":     factor.CatMomentum,
+		"value_quality": factor.CatValue,
+		"vol_size":    factor.CatVolatility,
+	}
+	// 多类组合名依次展开后按大类过滤去重
+	type pair struct{ name string; cat factor.Category }
+	groups := []pair{
+		{"mom_liq", factor.CatMomentum}, {"mom_liq", factor.CatLiquidity},
+		{"value_quality", factor.CatValue}, {"value_quality", factor.CatQuality},
+		{"vol_size", factor.CatVolatility}, {"vol_size", factor.CatSize},
+	}
+	var cats []factor.Category
+	if c, ok := catByName[pool]; ok && isSingle(pool) {
+		cats = append(cats, c)
+	} else {
+		for _, g := range groups {
+			if g.name == pool {
+				cats = append(cats, g.cat)
+			}
+		}
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range cats {
+		for _, d := range factor.ByCategory(c) {
+			if !seen[d.ID] {
+				seen[d.ID] = true
+				out = append(out, d.ID)
+			}
+		}
+	}
+	return out
+}
+
+// isSingle 池名是否为单一大类（非组合名）。English: whether pool is a single category name.
+func isSingle(pool string) bool {
+	switch pool {
+	case "mom_liq", "value_quality", "vol_size":
+		return false
+	}
+	return true
+}
+
+// comboEqual 规范化排序后比较两个因子组合（JSON 字符串 vs []string）。
+// English: normalized (sorted) equality of a factor set against its persisted JSON form.
+func comboEqual(a []string, bJSON string) bool {
+	var b []string
+	if json.Unmarshal([]byte(bJSON), &b) != nil {
+		return false
+	}
+	return comboKey(a) == comboKey(b)
+}
+
+// comboKey 排序拼接为判等/去重 key。English: sorted-join key for equality/dedup.
+func comboKey(a []string) string {
+	s := append([]string{}, a...)
+	sort.Strings(s)
+	return strings.Join(s, "\x00")
+}
+
+// candidateAgeDays 解析候选创建时间（"2006-01-02 15:04:05"，解析失败按 0 天）。
+// 注意 created_at 由 time.Now().Format 写入（本地时区），解析必须用 time.Local 对齐，
+// 否则 UTC 解析会把 +8 时区的当日候选错算成负龄期。English: age in days of a
+// candidate's created_at string (local-time aware; 0 on parse failure).
+func candidateAgeDays(createdAt string) float64 {
+	now := time.Now()
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, createdAt, time.Local); err == nil {
+			return now.Sub(t).Hours() / 24
+		}
+	}
+	if len(createdAt) == 8 {
+		if t, err := time.ParseInLocation("20060102", createdAt, time.Local); err == nil {
+			return now.Sub(t).Hours() / 24
+		}
+	}
+	return 0
 }
 
 // cmdDiscoverPatterns 形态模板搜索（F2）子命令：用已注册形态算子定义模板，
@@ -506,14 +684,30 @@ func cmdDiscoverPatterns(db *store.DB, args []string) {
 		return
 	}
 	log.Printf("发现 %d 个通过护栏的形态：", len(results))
+	live := []string{store.CandProposed, store.CandApproved, store.CandApplied, store.CandGrayscale}
 	for i := range results {
 		p := &results[i]
 		condsJSON, _ := json.Marshal(p.Conds)
+		// §S2 形态候选去重：以「模板名 + 条件签名」为组合，全状态占用即跳过。
+		sig := make([]string, 0, len(p.Conds)+1)
+		sig = append(sig, p.Name)
+		for _, c := range p.Conds {
+			sig = append(sig, fmt.Sprintf("%s[%.3f,%.3f)", c.Factor, c.Min, c.Max))
+		}
+		if fd, _ := db.ComboExistsLike(sig, live...); fd {
+			log.Printf("§S2 形态候选已存在，跳过：[%s]", p.Name)
+			continue
+		}
 		reason := fmt.Sprintf("触发=%d 超额=%.4f 命中率=%.2f 样本外超额=%.4f",
 			p.Triggers, p.Excess, p.HitRate, p.SampleOut)
-		// 存候选：Factors=模板名+条件JSON，Weights=空，Reason=证据
+		params, _ := json.Marshal(map[string]any{
+			"start": *start, "end": *end, "h": *h,
+			"min_trigger": *minTrigger, "min_excess": *minExcess, "split": *split,
+		})
+		// 存候选：Factors=模板名+条件JSON，Weights=空，Reason=证据；guard 统一 standard
+		// （形态搜索已过 MinTrigger/MinExcess 护栏），params 落参数快照（C4）。
 		id, err := db.SaveCandidate(&store.Candidate{
-			Kind: "pattern", Status: "proposed",
+			Kind: "pattern", Status: "proposed", Guard: "standard", Params: string(params),
 			Factors: string(condsJSON), Weights: "{}",
 			Metric: p.Excess, AvgExcess: p.Excess, IR: 0,
 			Horizon: *h, Reason: reason,
@@ -543,87 +737,122 @@ func cmdBacktestCandidate(db *store.DB, args []string) {
 	start := fs.String("start", "20200101", "起始日期 YYYYMMDD")
 	end := fs.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
 	h := fs.Int("h", 5, "前瞻天数")
-	id := fs.Int64("id", 0, "候选 ID（0=最近一条 proposed factor 候选）")
+	id := fs.Int64("id", 0, "候选 ID（0=按 since/最新一条 proposed factor 候选）")
+	since := fs.String("since", "", "只回填此日(YYYYMMDD)以来创建的 proposed factor 候选（A2 配对回测）")
 	minStocks := fs.Int("min-stocks", 10, "B4 回测每日最小样本")
 	minLimitUps := fs.Int("min-limit-ups", 3, "B4 回测事件触发涨停下限")
 	topK := fs.Int("top-k", 5, "B4 回测每事件选股数")
 	maxPerDay := fs.Int("max-per-day", 1, "B4 回测每日最多事件数")
+	minBtEvents := fs.Int("min-bt-events", 0, "C3b 事件数护栏：回测事件 < 此值时 Reason 追加统计意义弱标注")
 	fs.Parse(args)
 
-	var c *store.Candidate
-	var err error
-	if *id > 0 {
-		c, err = db.CandidateByID(*id)
-		if err != nil {
-			log.Fatalf("候选 %d 不存在: %v", *id, err)
-		}
-	} else {
-		c, err = latestFactorCandidate(db)
-		if err != nil {
-			log.Fatalf("读取候选失败: %v", err)
-		}
+	// A2 夜间配对回测：--since 指定后回填该日以来全部 proposed factor 候选（逐一回测），
+	// 不再只认最近一条——多轮 top-N 产出的冠军/亚军都会被回填 avg_excess。
+	cands, err := factorCandidatesForBackfill(db, *id, *since)
+	if err != nil {
+		log.Fatalf("读取候选失败: %v", err)
 	}
-	if c == nil {
-		log.Printf("无可回测的因子候选（尚无 proposed factor 候选）")
+	if len(cands) == 0 {
+		log.Printf("无可回测的因子候选")
 		return
 	}
-
-	// 解析候选：factors 为 JSON 数组，weights 为复合结构 {"weights":{...},"directions":{...}}
-	factors, err := parseFactorsJSON(c.Factors)
-	if err != nil {
-		log.Fatalf("解析候选因子失败: %v", err)
-	}
-	weights, directions, err := parseFactorWeightsJSON(c.Weights)
-	if err != nil {
-		log.Fatalf("解析候选权重失败: %v", err)
-	}
-
-	log.Printf("回测候选 #%d 因子=%v…", c.ID, factors)
-	bopts := backtest.DefaultOptions()
-	bopts.Start, bopts.End = *start, *end
-	bopts.Horizons = []int{*h}
-	bopts.MinLimitUps = *minLimitUps
-	bopts.MaxPerDay = *maxPerDay
-	bopts.Rule = backtest.DefaultRule()
-	bopts.Rule.Factors = factors
-	bopts.Rule.Directions = directions
-	bopts.Rule.Weights = weights
-	bopts.Rule.TopK = *topK
-	bopts.Rule.MinStocks = *minStocks
-	// 断点续跑：候选 ID 传给 backtest.Run——每事件先读 backtest_event_results 缓存，
-	// 命中即复用（同一候选重跑/中断后续跑只重算未缓存事件）；单候选（--id）与夜间
-	// （缺省最近候选）都受益。
-	// English: checkpoint-resume — the candidate ID is passed to backtest.Run so each event first
-	// reads the backtest_event_results cache and reuses hits (reruns / resumes after interruption only
-	// recompute uncached events). Both --id (per-candidate) and nightly (default latest) runs benefit.
-	bopts.CandidateID = c.ID
-	// 进度上报：每推进 10% 打印一次"回测进度 xx%"（供 HTTP 层逐行解析 → 前端进度条）。
-	// English: report progress — print "回测进度 xx%" every 10% so the HTTP layer can parse it
-	// line-by-line and drive the frontend progress bar.
-	lastPct := 0
-	bopts.OnProgress = func(done, total int) {
-		if total <= 0 {
-			return
+	for _, c := range cands {
+		// 解析候选：factors 为 JSON 数组，weights 为复合结构 {"weights":{...},"directions":{...}}
+		factors, err := parseFactorsJSON(c.Factors)
+		if err != nil {
+			log.Fatalf("解析候选因子失败: %v", err)
 		}
-		pct := done * 100 / total
-		if pct >= lastPct+10 {
-			lastPct = pct
-			log.Printf("回测进度 %d%% (%d/%d)", pct, done, total)
+		weights, directions, err := parseFactorWeightsJSON(c.Weights)
+		if err != nil {
+			log.Fatalf("解析候选权重失败: %v", err)
 		}
+
+		log.Printf("回测候选 #%d 因子=%v…", c.ID, factors)
+		bopts := backtest.DefaultOptions()
+		bopts.Start, bopts.End = *start, *end
+		bopts.Horizons = []int{*h}
+		bopts.MinLimitUps = *minLimitUps
+		bopts.MaxPerDay = *maxPerDay
+		bopts.Rule = backtest.DefaultRule()
+		bopts.Rule.Factors = factors
+		bopts.Rule.Directions = directions
+		bopts.Rule.Weights = weights
+		bopts.Rule.TopK = *topK
+		bopts.Rule.MinStocks = *minStocks
+		// 断点续跑：候选 ID 传给 backtest.Run——每事件先读 backtest_event_results 缓存，
+		// 命中即复用（同一候选重跑/中断后续跑只重算未缓存事件）；多候选逐一回测也受益。
+		// English: checkpoint-resume — the candidate ID is passed to backtest.Run so each event first
+		// reads the backtest_event_results cache and reuses hits (reruns / resumes after interruption only
+		// recompute uncached events).
+		bopts.CandidateID = c.ID
+		// 进度上报：每推进 10% 打印一次"回测进度 xx%"（供 HTTP 层逐行解析 → 前端进度条）。
+		// English: report progress — print "回测进度 xx%" every 10% so the HTTP layer can parse it
+		// line-by-line and drive the frontend progress bar.
+		lastPct := 0
+		bopts.OnProgress = func(done, total int) {
+			if total <= 0 {
+				return
+			}
+			pct := done * 100 / total
+			if pct >= lastPct+10 {
+				lastPct = pct
+				log.Printf("回测进度 %d%% (%d/%d)", pct, done, total)
+			}
+		}
+		rep, err := backtest.Run(db, bopts)
+		if err != nil {
+			log.Fatalf("B4 回测失败: %v", err)
+		}
+		avgExcess := 0.0
+		if v, ok := rep.AvgExcess[*h]; ok {
+			avgExcess = v
+		}
+		if err := db.UpdateCandidateAvgExcess(c.ID, avgExcess); err != nil {
+			log.Fatalf("回填 avg_excess 失败: %v", err)
+		}
+		reason := fmt.Sprintf(" B4事件=%d 入选=%d 平均超额=%.4f（已回填）", rep.TotalEvents, rep.TotalPicks, avgExcess)
+		// C3b 事件数护栏：事件不足 → Reason 标注统计意义弱，前端提示。
+		if *minBtEvents > 0 && rep.TotalEvents < *minBtEvents {
+			reason += fmt.Sprintf(" 事件不足(%d<%d) 统计意义弱", rep.TotalEvents, *minBtEvents)
+		}
+		if err := db.AppendCandidateReason(c.ID, reason); err != nil {
+			log.Fatalf("追加候选 Reason 失败: %v", err)
+		}
+		log.Printf("B4 回测完成: 候选 #%d 事件=%d 入选=%d 平均超额=%.4f（已回填）",
+			c.ID, rep.TotalEvents, rep.TotalPicks, avgExcess)
 	}
-	rep, err := backtest.Run(db, bopts)
+}
+
+// factorCandidatesForBackfill 选择本次回测要回填的 proposed factor 候选：
+// --id 指定 → 单条；--since YYYYMMDD → 该日以来全部 created（A2 配对）；缺省 → 最近一条。
+// English: picks proposed factor candidates for excess backfill — fixed id, all created since a date
+// (nightly paired mode), or newest.
+func factorCandidatesForBackfill(db *store.DB, id int64, since string) ([]store.Candidate, error) {
+	if id > 0 {
+		c, err := db.CandidateByID(id)
+		if err != nil {
+			return nil, err
+		}
+		if c != nil {
+			return []store.Candidate{*c}, nil
+		}
+		return nil, nil
+	}
+	if since != "" {
+		preds, err := db.ProposedFactorCandidatesSince(since)
+		if err != nil {
+			return nil, err
+		}
+		return preds, nil
+	}
+	c, err := latestFactorCandidate(db)
 	if err != nil {
-		log.Fatalf("B4 回测失败: %v", err)
+		return nil, err
 	}
-	avgExcess := 0.0
-	if v, ok := rep.AvgExcess[*h]; ok {
-		avgExcess = v
+	if c == nil {
+		return nil, nil
 	}
-	if err := db.UpdateCandidateAvgExcess(c.ID, avgExcess); err != nil {
-		log.Fatalf("回填 avg_excess 失败: %v", err)
-	}
-	log.Printf("B4 回测完成: 候选 #%d 事件=%d 入选=%d 平均超额=%.4f（已回填）",
-		c.ID, rep.TotalEvents, rep.TotalPicks, avgExcess)
+	return []store.Candidate{*c}, nil
 }
 
 // latestFactorCandidate 取最近一条 kind="factor" 且 status="proposed" 的候选。

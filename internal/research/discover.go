@@ -43,6 +43,15 @@ type DiscoverOpts struct {
 	// greedy selection a candidate (selected + candidate factor) whose sorted set matches any excluded
 	// combo is skipped, forcing discovery to explore different combinations.
 	ExcludeCombos [][]string
+	// TopN §S1 每变体排他重跑产出的互异最优组合数（默认 1=现行为）。>1 时连续求出
+	// 前 N 个互异组合（每个先选最优，再把该组合加入排他集重跑），供夜间多轮发现
+	// 一次产出多条候选。English: number of mutually-distinct top combos (default 1 = legacy
+	// behavior); >1 excludes each winner and re-runs greedy to emit the top-N distinct candidates.
+	TopN int
+	// MinYrSign §C3a 分年度 IR 符号一致最少年数（0=不启用）。样本外逐自然年算 IR，
+	// 一致的年份少于该值则判为护栏不过并标注 Reason。English: minimum count of non-trivial
+	// years whose IR sign matches the overall sign (0=disabled). Below it the guard fails.
+	MinYrSign int
 }
 
 // DiscoverResult 因子发现结果。
@@ -65,6 +74,9 @@ type DiscoverResult struct {
 	GenExcess  float64 // 高分组超额 = GenTopMean - GenAllMean（>0 表示因子环境普适）
 	GenStdErr  float64 // 超额的标准误（Welch）
 	GenT       float64 // 超额 t 统计量 = GenExcess / GenStdErr（< -2 显著为负 → 反推失败）
+	// YearlyConsistentYears/TotalYears §C3a 样本外分年度 IR 符号一致性（MinYrSign 启用时有效）。
+	YearlyConsistentYears int
+	YearlyTotalYears      int
 }
 
 // DiscoverFactors 执行因子子集选择 + 分段/反推验证。

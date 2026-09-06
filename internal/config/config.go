@@ -320,6 +320,62 @@ type SchedulerConfig struct {
 	OptimizeEnabled bool `json:"optimize_enabled"`
 }
 
+// DiscoverConfig 因子/形态发现 + B4 回测 + 护栏参数（rules.nightly.discover）。
+// 2026-09-05 多轮自动发现：每夜按 variants 个变体任务 × 每变体 top_n 个排他最优组合产出互异候选。
+// English: factor/pattern discovery, B4 backtest and guardrail parameters (rules.nightly.discover).
+// Since 2026-09-05 multi-round discovery: `variants` variant tasks per night × `top_n` exclusive
+// top combos per variant produce mutually-distinct candidates.
+type DiscoverConfig struct {
+	// Horizons 多轮变体参数：前瞻天数列表（轮次 i 用 Horizons[i]，越界用默认 5）。
+	Horizons []int `json:"horizons"`
+	// StartWindows 多轮变体参数：窗口年数列表（1/2/3=近 N 年）。窗轮换使样本内每夜真前进，从源头避免滑窗贪心每晚选同一组合。
+	StartWindows []int `json:"start_windows"`
+	// Metrics 多轮变体参数：优化目标列表（ir|ic），轮次 i 用 Metrics[i]。
+	Metrics []string `json:"metrics"`
+	// FactorPools 多轮变体参数：风格子池名列表（""=全池；预设见 cmd/research 的 resolveFactorPool）。
+	FactorPools []string `json:"factor_pools"`
+	// TopN §S1 每变体排他重跑产出的互异最优组合数（默认 2）。与 variants 相乘 = 每晚候选数。
+	TopN int `json:"top_n"`
+	// MinStocks 每日最小样本（默认 20）
+	MinStocks int `json:"min_stocks"`
+	// MaxFactors 组合最大因子数（默认 8）
+	MaxFactors int `json:"max_factors"`
+	// Split 样本内占比（默认 0.7）
+	Split float64 `json:"split"`
+	// MinIR 护栏 |IR| 下限（默认 0.3）
+	MinIR float64 `json:"min_ir"`
+	// MinDays 护栏有效日下限（默认 30）
+	MinDays int `json:"min_days"`
+	// MinGenT 反推泛化 Welch t 护栏（默认 -2）
+	MinGenT float64 `json:"min_gen_t"`
+	// MinTrigger 形态战法最小触发次数（默认 20）
+	MinTrigger int `json:"min_trigger"`
+	// MinExcess 形态战法护栏最小平均超额（默认 0.01）
+	MinExcess float64 `json:"min_excess"`
+	// MinLimitUps B4 合成事件行业涨停家数下限（默认 3）
+	MinLimitUps int `json:"min_limit_ups"`
+	// TopK B4 每事件选股数（默认 5）
+	TopK int `json:"top_k"`
+	// MaxPerDay B4 每交易日最多事件数（默认 3，对齐 backtest.DefaultOptions。>1 才有多事件）。
+	MaxPerDay int `json:"max_per_day"`
+	// GuardStrong §C2 护栏分级：|IR| ≥ 记 strong（可审批）
+	GuardStrong float64 `json:"guard_strong"`
+	// GuardWeak §C2 护栏分级：|IR| ≥ 记 weak（进灰度观察区）
+	GuardWeak float64 `json:"guard_weak"`
+	// MinYrSign §C3a 分年度 IR 符号一致最少年数（0=不启用）
+	MinYrSign int `json:"min_yr_sign"`
+	// MinBtEvents §C3b B4 回测事件数护栏（< 则 reason 标注统计意义弱；0=不启用）
+	MinBtEvents int `json:"min_bt_events"`
+	// DedupJaccard §S2 近似重复 Jaccard 阈值（集合交/并 ≥ 则判定重复候选，默认 0.8）
+	DedupJaccard float64 `json:"dedup_jaccard"`
+	// ChangeGate §S3 变化门：最优组合与最近 pending 候选相同且新鲜时跳过（默认关→经观察后开）
+	ChangeGate bool `json:"change_gate"`
+	// StalenessDays §S3 变化门冷却（组合相同但候选超过该天数可重发，默认 30）
+	StalenessDays int `json:"staleness_days"`
+	// Hysteresis §C4 滞回：与已应用候选组合相同且 |ΔIR| < 时跳过（防边际改进顶掉已应用战法，默认 0.05）
+	Hysteresis float64 `json:"hysteresis"`
+}
+
 // NightlyConfig 夜间研究作业配置（盘后/周末触发）。
 type NightlyConfig struct {
 	// 交易日盘后启动时间 HHMM（默认 1530）
@@ -340,6 +396,11 @@ type NightlyConfig struct {
 	// BacktestEvents B4 回测事件数上限（backtest_enabled 时生效；0=用默认合理值）。
 	// B4 回测事件数上限
 	BacktestEvents int `json:"backtest_events"`
+	// ResearchRounds 每晚因子发现候选轮数（默认 4 = 2 变体 × top_n=2 排他）。
+	// English: nightly factor-discovery candidate rounds (default 4 = 2 variants × top_n=2 exclusive).
+	ResearchRounds int `json:"research_rounds"`
+	// Discover 发现/护栏参数（多轮变体 + 护栏分级 + 去重阈值）。
+	Discover DiscoverConfig `json:"discover"`
 }
 
 // DataloadDuringTradeConfig 交易时段增量下载配置（只下载，不含任何研究/回测）。
@@ -374,6 +435,35 @@ func DefaultSchedulerConfig() SchedulerConfig {
 			AbortOnError:    false,
 			BacktestEnabled: false,
 			BacktestEvents:  0,
+			// 多轮自动发现：默认 4 轮 = 2 变体 × top_n=2 排他。
+			// English: multi-round default 4 = 2 variants × top_n=2 exclusive reruns.
+			ResearchRounds: 4,
+			Discover: DiscoverConfig{
+				Horizons:      []int{5, 10},
+				StartWindows:  []int{3, 1},
+				Metrics:       []string{"ir", "ir"},
+				FactorPools:   []string{"", "mom_liq"},
+				TopN:          2,
+				MinStocks:     20,
+				MaxFactors:    8,
+				Split:         0.7,
+				MinIR:         0.3,
+				MinDays:       30,
+				MinGenT:       -2,
+				MinTrigger:    20,
+				MinExcess:     0.01,
+				MinLimitUps:   3,
+				TopK:          5,
+				MaxPerDay:     3,
+				GuardStrong:   0.45,
+				GuardWeak:     0.20,
+				MinYrSign:     0,
+				MinBtEvents:   0,
+				DedupJaccard:  0.8,
+				ChangeGate:    false,
+				StalenessDays: 30,
+				Hysteresis:    0.05,
+			},
 		},
 		DataloadDuringTrade: DataloadDuringTradeConfig{
 			Enabled:         true,
@@ -1385,8 +1475,16 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 		if v, ok := cfgInt(sub, "backtest_events"); ok {
 			out.Nightly.BacktestEvents = v
 		}
+		if v, ok := cfgInt(sub, "research_rounds"); ok && v > 0 {
+			out.Nightly.ResearchRounds = v
+		}
 		if v, ok := cfgStrs(sub, "steps"); ok && len(v) > 0 {
 			out.Nightly.Steps = v
+		}
+		// §2026-09-05 多轮发现/护栏参数子块 rules.nightly.discover。
+		// English: multi-round discovery + guardrail parameter block rules.nightly.discover.
+		if dsub, ok := cfgObject(sub, "discover"); ok {
+			applyDiscoverConfig(&out.Nightly.Discover, dsub)
 		}
 	}
 	if sub, ok := cfgObject(m, "dataload_during_trading"); ok {
@@ -1466,6 +1564,126 @@ func cfgStrs(m map[string]json.RawMessage, key string) ([]string, bool) {
 		return nil, false
 	}
 	return v, true
+}
+
+// cfgInts 返回整数数组字段（非数组或不存在时 ok=false）。
+// English: reads an int-array field; ok=false when missing or not an int array.
+func cfgInts(m map[string]json.RawMessage, key string) ([]int, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var v []int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+// cfgFloats 返回浮点数组字段（非数组或不存在时 ok=false）。
+// English: reads a float-array field; ok=false when missing or not a float array.
+func cfgFloats(m map[string]json.RawMessage, key string) ([]float64, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	var v []float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, false
+	}
+	return v, true
+}
+
+// cfgFloat 返回浮点字段（非数值或不存在时 ok=false）。
+func cfgFloat(m map[string]json.RawMessage, key string) (float64, bool) {
+	raw, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	var v float64
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// applyDiscoverConfig 把 rules.nightly.discover 子块各字段覆盖到默认 DiscoverConfig。
+// 仅显式出现的 JSON 键生效；负数/空数组跳过（保留默认）。
+// English: overlays rules.nightly.discover onto the default DiscoverConfig; only explicitly
+// present keys apply, empty/negative values keep factory defaults.
+func applyDiscoverConfig(d *DiscoverConfig, m map[string]json.RawMessage) {
+	if v, ok := cfgInts(m, "horizons"); ok && len(v) > 0 {
+		d.Horizons = v
+	}
+	if v, ok := cfgInts(m, "start_windows"); ok && len(v) > 0 {
+		d.StartWindows = v
+	}
+	if v, ok := cfgStrs(m, "metrics"); ok && len(v) > 0 {
+		d.Metrics = v
+	}
+	if v, ok := cfgStrs(m, "factor_pools"); ok && len(v) > 0 {
+		d.FactorPools = v
+	}
+	if v, ok := cfgInt(m, "top_n"); ok && v > 0 {
+		d.TopN = v
+	}
+	if v, ok := cfgInt(m, "min_stocks"); ok && v > 0 {
+		d.MinStocks = v
+	}
+	if v, ok := cfgInt(m, "max_factors"); ok && v > 0 {
+		d.MaxFactors = v
+	}
+	if v, ok := cfgFloat(m, "split"); ok && v > 0 && v < 1 {
+		d.Split = v
+	}
+	if v, ok := cfgFloat(m, "min_ir"); ok && v > 0 {
+		d.MinIR = v
+	}
+	if v, ok := cfgInt(m, "min_days"); ok && v > 0 {
+		d.MinDays = v
+	}
+	if v, ok := cfgFloat(m, "min_gen_t"); ok && v < 0 {
+		d.MinGenT = v
+	}
+	if v, ok := cfgInt(m, "min_trigger"); ok && v > 0 {
+		d.MinTrigger = v
+	}
+	if v, ok := cfgFloat(m, "min_excess"); ok {
+		d.MinExcess = v
+	}
+	if v, ok := cfgInt(m, "min_limit_ups"); ok && v > 0 {
+		d.MinLimitUps = v
+	}
+	if v, ok := cfgInt(m, "top_k"); ok && v > 0 {
+		d.TopK = v
+	}
+	if v, ok := cfgInt(m, "max_per_day"); ok && v > 0 {
+		d.MaxPerDay = v
+	}
+	if v, ok := cfgFloat(m, "guard_strong"); ok && v >= 0 {
+		d.GuardStrong = v
+	}
+	if v, ok := cfgFloat(m, "guard_weak"); ok && v >= 0 {
+		d.GuardWeak = v
+	}
+	if v, ok := cfgInt(m, "min_yr_sign"); ok {
+		d.MinYrSign = v
+	}
+	if v, ok := cfgInt(m, "min_bt_events"); ok {
+		d.MinBtEvents = v
+	}
+	if v, ok := cfgFloat(m, "dedup_jaccard"); ok && v > 0 && v <= 1 {
+		d.DedupJaccard = v
+	}
+	if v, ok := cfgBool(m, "change_gate"); ok {
+		d.ChangeGate = v
+	}
+	if v, ok := cfgInt(m, "staleness_days"); ok && v > 0 {
+		d.StalenessDays = v
+	}
+	if v, ok := cfgFloat(m, "hysteresis"); ok && v >= 0 {
+		d.Hysteresis = v
+	}
 }
 
 // cfgObject 返回子对象字段的 map（不存在或非对象时 ok=false）。
