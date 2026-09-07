@@ -243,8 +243,10 @@ func ctrlMode(c *trading.Controller) string {
 
 // handleRealAdvice 返回实盘持仓处理建议（实时计算，供持仓页实盘 tab 展示）。
 // GET /api/positions/advice
+// §2026-09-07 多账号实盘：引擎可用性按调用方账号自身路由（liveCtrlFor），子账号只读自己的实盘建议。
+// English: handles GET /api/positions/advice — engine availability is routed to the CALLER's own account.
 func (s *Server) handleRealAdvice(w http.ResponseWriter, r *http.Request) {
-	c := s.ctrlFor(userIDFor(r))
+	c := s.liveCtrlFor(userIDFor(r))
 	if c == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine not available")
 		return
