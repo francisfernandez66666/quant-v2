@@ -1027,40 +1027,47 @@ func (m *Manager) ownerOf(userID string) string {
 // Invariants: (1) always heap-allocated so &userRules(userID).X is never dangling; (2) when there is no
 // per-user override we return a COPY of global (not its address) so account-scoped setters never mutate the
 // global rules as a side effect.
-func (m *Manager) userRules(userID string) *Rules {
+// storedUserRules 读取账号自身已持久化的规则快照（不含回退）；无覆盖或解析失败返回 (nil,false)。
+// §2026-09-07 多账号实盘：供 GetQMTConfigFor 等区分「账号自身覆盖」与「回退」，实现逐账号实盘配置。
+// English: reads an account's own persisted rules snapshot without fallbacks — lets per-account
+// readers (e.g. QMT config) tell "account override exists" apart from "fall back".
+func (m *Manager) storedUserRules(userID string) (*Rules, bool) {
 	if m.store == nil || userID == "" {
-		return m.Rules
+		return nil, false
 	}
 	m.mu.RLock()
 	raw, ok := m.store.GetConfig(userID, perUserKey)
 	m.mu.RUnlock()
 	if !ok || raw == "" {
-		// §回退系统级覆盖：历史版本曾把账号级配置写到 userID="" 的键下。
-		// 若本账号无独立覆盖，则回退到系统级键，避免配置在重启/重载后“丢失”
-		// （表现为开关被自动关闭）。这属于兼容回退，不影响正常账号级覆盖优先级。
-		// English: fall back to the system-level (empty userID) override so legacy
-		// configs written under "" are still honored and survive restarts.
-		m.mu.RLock()
-		sysRaw, sysOk := m.store.GetConfig("", perUserKey)
-		m.mu.RUnlock()
-		if sysOk && sysRaw != "" {
-			raw = sysRaw
-			ok = true
-		}
-	}
-	if !ok || raw == "" {
-		cp := new(Rules)
-		*cp = *m.Rules
-		return cp
+		return nil, false
 	}
 	r := new(Rules)
 	if err := json.Unmarshal([]byte(raw), r); err != nil {
 		log.Printf("[config] 账号 %s 配置反序列化失败, 回退全局: %v", userID, err)
-		cp := new(Rules)
-		*cp = *m.Rules
-		return cp
+		return nil, false
 	}
-	return r
+	return r, true
+}
+
+// userRules 返回指定账号的规则快照（账号级覆盖优先，否则回退系统级键/全局副本）。
+func (m *Manager) userRules(userID string) *Rules {
+	if m.store == nil || userID == "" {
+		return m.Rules
+	}
+	if r, ok := m.storedUserRules(userID); ok {
+		return r
+	}
+	// §回退系统级覆盖：历史版本曾把账号级配置写到 userID="" 的键下。
+	// 若本账号无独立覆盖，则回退到系统级键，避免配置在重启/重载后“丢失”
+	// （表现为开关被自动关闭）。这属于兼容回退，不影响正常账号级覆盖优先级。
+	// English: fall back to the system-level (empty userID) override so legacy
+	// configs written under "" are still honored and survive restarts.
+	if r, ok := m.storedUserRules(""); ok {
+		return r
+	}
+	cp := new(Rules)
+	*cp = *m.Rules
+	return cp
 }
 
 // saveUserRules 将账号规则快照持久化到 KVStore。
@@ -1132,28 +1139,43 @@ func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
 	m.saveUserRules(oid, r)
 }
 
-// GetQMTConfigFor 返回运营数据归属账号（管理员）的 QMT 实盘配置。
-// 运营数据系统级共享，后端按角色鉴权：所有账号读到的是同一份（归属管理员）配置。
-// English: returns the operator's (admin's) QMT live-trading config — operational data is
-// system-scoped; every account reads the same owner config, access gated by role at the API layer.
+// GetQMTConfigFor 返回指定账号的 QMT 实盘配置（§2026-09-07 多账号实盘）。
+// 解析优先级：① 账号自身覆盖 → ② 运营账号覆盖（存量单账号行为：所有账号共享运营账号配置）
+// → ③ 全局 rules.qmt。引擎构建/热同步（registry.go:706、engine.go syncAccountConfig）按此
+// 取每账号独立 gateway/token/资金，逐账号独立下单。
+// English: returns an account's QMT live-trading config — account override first, then the operator's
+// (legacy single-account behavior), then global. Every engine's controller is wired from this so each
+// account can trade against its own gateway/capital.
 func (m *Manager) GetQMTConfigFor(userID string) *QMTConfig {
-	return &m.userRules(m.ownerOf(userID)).QMT
+	if m.store == nil || userID == "" {
+		return &m.Rules.QMT
+	}
+	if r, ok := m.storedUserRules(userID); ok {
+		return &r.QMT
+	}
+	if oid := m.ownerOf(userID); oid != "" && oid != userID {
+		if r, ok := m.storedUserRules(oid); ok {
+			return &r.QMT
+		}
+	}
+	return &m.Rules.QMT
 }
 
-// SetQMTConfigFor 更新运营数据归属账号（管理员）的 QMT 实盘配置并持久化（5s 热加载生效）。
+// SetQMTConfigFor 更新指定账号的 QMT 实盘配置并持久化到该账号的规则快照（5s 热加载生效）。
+// §2026-09-07 从「运营账号系统级共享」改为「按账号落库」：管理员经
+// /api/admin/users/{id}/config/qmt 逐账号配置；账号所有者经 /api/config/qmt 配自己的。
 // 调用方负责校验取值合法性（mode/price_type 枚举、白名单过滤等），这里只做落库。
-// English: persists the operator's QMT live-trading config (hot-reloaded within 5s);
-// callers must validate enum/whitelist values — this method only stores.
+// English: persists an account's QMT live-trading config to that account's rules snapshot
+// (hot-reloaded within 5s). Callers must validate enum/whitelist values — this method only stores.
 func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
-	oid := m.ownerOf(userID)
-	if m.store == nil || oid == "" {
+	if m.store == nil || userID == "" {
 		m.Rules.QMT = *cfg
 		m.Save()
 		return
 	}
-	r := m.userRules(oid)
+	r := m.userRules(userID)
 	r.QMT = *cfg
-	m.saveUserRules(oid, r)
+	m.saveUserRules(userID, r)
 }
 
 // GetD1ConfigFor 返回运营数据归属账号（管理员）的 D1 事件匹配规则（运营配置系统级共享）。

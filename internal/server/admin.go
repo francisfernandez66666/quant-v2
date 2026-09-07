@@ -366,3 +366,37 @@ func (s *Server) handleAdminSetLLMConfig(w http.ResponseWriter, r *http.Request)
 	log.Printf("[admin] 用户 %s LLM 配置已保存", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
+
+// handleAdminGetQMTConfig 处理 GET /api/admin/users/{id}/config/qmt（§2026-09-07 多账号实盘）：
+// 管理员读取指定账号的 QMT 实盘配置（token 脱敏）。
+// English: handles GET /api/admin/users/{id}/config/qmt — admin reads an account's QMT live config.
+func (s *Server) handleAdminGetQMTConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	log.Printf("[diag-qmt] admin GET /api/admin/users/%s/config/qmt operator=%s", id, s.operatorID())
+	writeJSON(w, 200, qmtConfigView(s.cfg.GetQMTConfigFor(id), s.knownStrategyList()))
+}
+
+// handleAdminSetQMTConfig 处理 POST /api/admin/users/{id}/config/qmt（§2026-09-07 多账号实盘）：
+// 管理员为指定账号局部合并保存 QMT 实盘配置（逐账号独立 gateway/token/资金，落该账号规则快照，
+// 引擎 syncAccountConfig 5s 热同步生效）。复用 applySetQMTConfig 与 /api/config/qmt 完全同口径
+// （指针字段=本次要改的，nil=保持原值；token 脱敏哨兵/空串保持原值）。
+// English: handles POST /api/admin/users/{id}/config/qmt — admin merges an account's QMT live config
+// (per-account gateway/token/capital; hot-synced within 5s). Reuses applySetQMTConfig, identical
+// validation/semantics to the operator endpoint.
+func (s *Server) handleAdminSetQMTConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.cfg == nil {
+		writeError(w, 503, "配置未接入")
+		return
+	}
+	var req setQMTConfigReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	s.applySetQMTConfig(w, id, req)
+}

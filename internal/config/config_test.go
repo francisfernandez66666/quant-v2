@@ -150,3 +150,70 @@ func TestLoadSchedulerConfigResourceThrottles(t *testing.T) {
 		t.Errorf("StepTimeoutMin=%d, want 360", cfg.StepTimeoutMin)
 	}
 }
+
+// memKVStore 内存版 KVStore（测试用）：按 (userID,key) 存取 JSON 快照。
+// English: in-memory KVStore for tests — stores snapshots by (userID, key).
+type memKVStore struct {
+	m map[string]string
+}
+
+func (m *memKVStore) SetConfig(userID, key, value string) error {
+	if m.m == nil {
+		m.m = map[string]string{}
+	}
+	m.m[userID+"\x00"+key] = value
+	return nil
+}
+
+func (m *memKVStore) GetConfig(userID, key string) (string, bool) {
+	if m.m == nil {
+		return "", false
+	}
+	v, ok := m.m[userID+"\x00"+key]
+	return v, ok
+}
+
+// TestQMTConfigPerAccount §2026-09-07 多账号实盘：QMT 实盘配置按账号隔离——
+// 账号自身覆盖优先；无覆盖回退运营账号（存量单账号行为）；两者皆无回退全局 rules.qmt。
+// English: per-account QMT live-trading config — account override first, then operator, then global.
+func TestQMTConfigPerAccount(t *testing.T) {
+	m := NewManager(filepath.Join(t.TempDir(), "config.json"))
+	kv := &memKVStore{}
+	m.SetStore(kv)
+	m.SetOperatorID("u_op")
+
+	opCfg := DefaultQMTConfig()
+	opCfg.Enabled = true
+	opCfg.GatewayURL = "http://127.0.0.1:8789"
+	opCfg.Token = "op-token"
+	opCfg.FixedAmount = 20000
+	m.SetQMTConfigFor("u_op", &opCfg)
+
+	// 子账号无覆盖 → 回退运营账号配置（存量行为不变）
+	if got := m.GetQMTConfigFor("u_sub"); got == nil || got.FixedAmount != 20000 || got.Token != "op-token" {
+		t.Errorf("子账号应回退运营账号配置, got %+v", got)
+	}
+
+	// 子账号配置自己的实盘 → 覆盖运营账号，且不影响运营账号
+	subCfg := DefaultQMTConfig()
+	subCfg.Enabled = true
+	subCfg.GatewayURL = "http://127.0.0.1:8790"
+	subCfg.Token = "sub-token"
+	subCfg.FixedAmount = 50000
+	m.SetQMTConfigFor("u_sub", &subCfg)
+
+	if got := m.GetQMTConfigFor("u_sub"); got == nil || got.GatewayURL != "http://127.0.0.1:8790" || got.FixedAmount != 50000 {
+		t.Errorf("子账号应返回自身配置, got %+v", got)
+	}
+	if got := m.GetQMTConfigFor("u_op"); got == nil || got.GatewayURL != "http://127.0.0.1:8789" {
+		t.Errorf("运营账号配置不应被子账号覆盖, got %+v", got)
+	}
+
+	// 无 store（未接入账号隔离）→ 回退全局 rules.qmt
+	m2 := NewManager(filepath.Join(t.TempDir(), "config2.json"))
+	m2.Rules.QMT = DefaultQMTConfig()
+	m2.Rules.QMT.GatewayURL = "http://127.0.0.1:8888"
+	if got := m2.GetQMTConfigFor("any"); got == nil || got.GatewayURL != "http://127.0.0.1:8888" {
+		t.Errorf("无 store 应回退全局 rules.qmt, got %+v", got)
+	}
+}

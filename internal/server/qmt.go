@@ -23,6 +23,7 @@ import (
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/trading"
 )
 
@@ -152,9 +153,12 @@ func userIDFor(r *http.Request) string {
 }
 
 // qmtCtrlFor 返回指定账号的 QMT 执行控制器（可空=未接入实盘）。
-// English: returns an account's QMT controller (nil when the live chain isn't wired).
+// §2026-09-07 多账号实盘：走 liveCtrlFor 按调用方账号自身路由——每个账号读到自己引擎
+// 的控制器（其 gateway/token 由该账号 QMT 配置决定），运营账号行为与旧路径一致。
+// English: returns an account's QMT controller (nil when the live chain isn't wired) — routed to the
+// caller's own engine so each account sees its own gateway/capital.
 func (s *Server) qmtCtrlFor(userID string) *trading.Controller {
-	c := s.ctrlFor(userID)
+	c := s.liveCtrlFor(userID)
 	if c == nil {
 		return nil
 	}
@@ -576,11 +580,17 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.GetQMTConfigFor(userIDFor(r))
 	// 诊断日志：排查「开关刷新后变回关闭」——记录每次读取的真实账号与 enabled 值。
 	log.Printf("[diag-qmt] GET /api/config/qmt user=%s operator=%s enabled=%v", userIDFor(r), s.operatorID(), cfg.Enabled)
+	writeJSON(w, 200, qmtConfigView(cfg, s.knownStrategyList()))
+}
+
+// qmtConfigView 把 QMT 实盘配置渲染为对外响应形状（token 脱敏、附已知战法列表）。
+// English: renders a QMT live-trading config as the API response shape (token masked).
+func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]interface{} {
 	tokenMasked := ""
 	if cfg.Token != "" {
 		tokenMasked = maskSecret(cfg.Token)
 	}
-	writeJSON(w, 200, map[string]interface{}{
+	return map[string]interface{}{
 		"enabled":             cfg.Enabled,
 		"mode":                cfg.Mode,
 		"gateway_url":         cfg.GatewayURL,
@@ -599,8 +609,8 @@ func (s *Server) handleGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		"halted":           cfg.Halted,
 		"cancel_stale_sec": cfg.CancelStaleSec,
 		"close_sweep_at":   cfg.CloseSweepAt,
-		"known_strategies": s.knownStrategyList(),
-	})
+		"known_strategies": known,
+	}
 }
 
 // setQMTConfigReq 局部更新请求：指针字段=「本次要改的」，nil=保持不变。
@@ -634,7 +644,16 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	cfg := *(s.cfg.GetQMTConfigFor(userIDFor(r)))
+	s.applySetQMTConfig(w, userIDFor(r), req)
+}
+
+// applySetQMTConfig 局部合并 QMT 实盘配置并保存到目标账号（§2026-09-07 多账号实盘）：
+// 运营账号经 /api/config/qmt、管理员代配经 /api/admin/users/{id}/config/qmt 都走这里，
+// 校验与落库语义一致（指针字段=本次要改的，nil=保持原值）。
+// English: merges and persists a QMT config patch for the target account — shared by the operator
+// endpoint and the admin per-account endpoint so validation/save semantics stay identical.
+func (s *Server) applySetQMTConfig(w http.ResponseWriter, target string, req setQMTConfigReq) {
+	cfg := *(s.cfg.GetQMTConfigFor(target))
 
 	if req.Mode != nil {
 		m := strings.TrimSpace(*req.Mode)
@@ -776,10 +795,10 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		cfg.StrategyAmounts = out
 	}
 
-	s.cfg.SetQMTConfigFor(userIDFor(r), &cfg)
+	s.cfg.SetQMTConfigFor(target, &cfg)
 	// 诊断日志：记录每次保存的真实账号、目标 enabled 与落盘后回读值，确认是否真正写盘。
-	saved := s.cfg.GetQMTConfigFor(userIDFor(r))
-	log.Printf("[diag-qmt] POST /api/config/qmt user=%s operator=%s reqEnabled=%v savedEnabled=%v", userIDFor(r), s.operatorID(), cfg.Enabled, saved.Enabled)
+	saved := s.cfg.GetQMTConfigFor(target)
+	log.Printf("[diag-qmt] POST qmt config target=%s operator=%s reqEnabled=%v savedEnabled=%v", target, s.operatorID(), cfg.Enabled, saved.Enabled)
 	log.Printf("[trading] qmt 配置已更新: enabled=%v mode=%s price=%s max_pos=%d fixed=%.0f strategies=%v",
 		cfg.Enabled, cfg.Mode, cfg.PriceType, cfg.MaxPositions, cfg.FixedAmount, cfg.Strategies)
 	writeJSON(w, 200, map[string]string{"ok": "1"})

@@ -164,6 +164,18 @@ func (s *Server) ctrlFor(userID string) EngineController {
 	return s.ctrl
 }
 
+// liveCtrlFor §2026-09-07 多账号实盘：返回实盘读取路径归属的引擎控制面——
+// 按调用方账号自身路由（其引擎带独立 QMT 控制器/gateway），运营账号行为与 ctrlFor 一致。
+// 仅用于实盘链路（持仓/资金/网关状态/熔断），看板等运营数据仍走 ctrlFor（系统级共享）。
+// English: engine controller for live-trading read paths — routed to the CALLER's own account so each
+// account sees its own QMT controller/gateway; identical to ctrlFor for the operator account.
+func (s *Server) liveCtrlFor(userID string) EngineController {
+	if s.registry != nil {
+		return s.registry.GetController(userID)
+	}
+	return s.ctrl
+}
+
 // dashFor 返回运营数据归属账号（管理员）的看板快照（运营数据系统级共享）。
 // 未接入注册表时回退全局 agg（旧单引擎模式）。
 // English: returns the operator's dashboard snapshot (operational data is system-scoped).
@@ -430,6 +442,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/longshort", s.adminMiddleware(s.handleAdminSetLongShortConfig))
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminGetLLMConfig))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/llm", s.adminMiddleware(s.handleAdminSetLLMConfig))
+	// §2026-09-07 多账号实盘：管理员逐账号配置 QMT 实盘（每账号独立 gateway/token/资金）。
+	s.mux.HandleFunc("GET /api/admin/users/{id}/config/qmt", s.adminMiddleware(s.handleAdminGetQMTConfig))
+	s.mux.HandleFunc("POST /api/admin/users/{id}/config/qmt", s.adminMiddleware(s.handleAdminSetQMTConfig))
 
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
 	// §DAILY_OPSLOG 每日系统运行日志（管理员只读）：日期列表 + 按日内容（tail 截尾）

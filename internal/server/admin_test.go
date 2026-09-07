@@ -224,6 +224,66 @@ func TestAuthMe(t *testing.T) {
 	}
 }
 
+// TestAdminPerUserQMTConfig §2026-09-07 多账号实盘：管理员可逐账号配置 QMT 实盘——
+// 为子账号写入独立 gateway/token/资金，读回一致；脱敏哨兵 token 保持原值；mode 枚举校验。
+// English: admin per-account QMT live config — write/read per-account gateway/token/capital; masked
+// token sentinel keeps the stored value; invalid mode rejected.
+func TestAdminPerUserQMTConfig(t *testing.T) {
+	s, admin := newAdminTestServer(t)
+	normal, _ := s.auth.CreateUser("u_qmt", "pw", "", nil, 0)
+
+	// 管理员为子账号配置实盘（独立 gateway/token/资金）
+	body := `{"enabled":true,"mode":"auto","gateway_url":"http://127.0.0.1:8790","token":"sub-secret",
+		"price_type":"market","fixed_amount":50000,"max_positions":8,"initial_capital":200000}`
+	rr := adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/"+normal.ID+"/config/qmt", body))
+	if rr.Code != 200 {
+		t.Fatalf("代配 QMT 应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// 读回：独立 gateway/资金生效，token 脱敏
+	rr = adminDo(s, adminReq(s, admin, http.MethodGet, "/api/admin/users/"+normal.ID+"/config/qmt", ""))
+	if rr.Code != 200 {
+		t.Fatalf("读取 QMT 应 200, got %d", rr.Code)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &got)
+	if got["gateway_url"] != "http://127.0.0.1:8790" || got["fixed_amount"] != 50000.0 || got["enabled"] != true {
+		t.Fatalf("子账号 QMT 配置读回不一致: %v", got)
+	}
+	tm, _ := got["token_masked"].(string)
+	if tm == "" || tm == "sub-secret" {
+		t.Fatalf("token 应脱敏, got %q", tm)
+	}
+
+	// 脱敏哨兵 token 应保持原值（不覆盖）
+	body2 := `{"enabled":true,"mode":"auto","gateway_url":"http://127.0.0.1:8790","token":"` + tm + `","fixed_amount":60000,"max_positions":8}`
+	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/"+normal.ID+"/config/qmt", body2))
+	if rr.Code != 200 {
+		t.Fatalf("带哨兵保存应 200, got %d", rr.Code)
+	}
+	rr = adminDo(s, adminReq(s, admin, http.MethodGet, "/api/admin/users/"+normal.ID+"/config/qmt", ""))
+	var got2 map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &got2)
+	if got2["token_masked"] != tm {
+		t.Fatalf("哨兵 token 应保持原值, got %q want %q", got2["token_masked"], tm)
+	}
+
+	// 非法 mode 拒绝
+	rr = adminDo(s, adminReq(s, admin, http.MethodPost, "/api/admin/users/"+normal.ID+"/config/qmt",
+		`{"enabled":true,"mode":"bad","fixed_amount":10000,"max_positions":8}`))
+	if rr.Code != 400 {
+		t.Fatalf("非法 mode 应 400, got %d", rr.Code)
+	}
+
+	// 子账号配置不影响运营账号（独立隔离）
+	rr = adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/qmt", ""))
+	var op map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &op)
+	if op["gateway_url"] == "http://127.0.0.1:8790" {
+		t.Fatalf("运营账号配置不应被子账号覆盖: %v", op)
+	}
+}
+
 // TestAdminDeleteUser admin 删除普通用户成功、删除 admin 被拒。
 func TestAdminDeleteUser(t *testing.T) {
 	s, admin := newAdminTestServer(t)
