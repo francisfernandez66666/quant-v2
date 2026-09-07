@@ -19,58 +19,22 @@ import (
 	"quant-trading-v2/internal/config"
 )
 
-// paperOpenTpSl 返回某战法纸面开仓时的止盈/止损百分比（供持仓记录与百分比止盈止损提醒使用）。
-// 单位统一为"百分数"（10=10%）；源配置为比例语义（<1，如 0.08=8%）时自动 ×100。
-// 各战法缺省值与 internal/combat_agent/position_exits.go 的退出引擎默认保持一致。
-// English: returns the take-profit / stop-loss percent for a strategy's paper open, in percent units
-// (10 = 10%); ratio-style source values (<1, e.g. 0.08 = 8%) are scaled by 100. Defaults mirror the
-// exit engines in internal/combat_agent/position_exits.go.
-func paperOpenTpSl(strategyName string, sc *config.StrategyConfig) (tp, sl float64) {
-	if sc == nil {
-		sc = &config.StrategyConfig{}
+// paperOpenTpSl 返回模拟盘镜像开仓的统一止盈/止损百分比（单位：百分数）。
+// §统一纪律 E：不再按战法各自默认（龙头10/8、龙回头25/5、动量10/8…），统一走
+// rules.paper.discipline 总纪律（默认止盈+15/止损−6）；战法自带止盈止损降级为触发通知。
+// ATR 动态止损仍由调用方（registry.paperMirror）覆盖，此函数只提供统一固定百分比。
+// English: returns the unified take-profit/stop-loss percent for a paper open (percent units). Per-strategy
+// defaults (dragon 10/8, dragon_return 25/5, momentum 10/8…) are replaced by the unified discipline from
+// rules.paper.discipline (default +15/−6); strategy-native TP/SL degrade to notification-only. The ATR
+// dynamic stop still overrides at the caller (registry.paperMirror).
+func paperOpenTpSl(disc config.DisciplineConfig) (tp, sl float64) {
+	tp = disc.TakeProfitPct
+	if tp <= 0 {
+		tp = 15
 	}
-	// 比例(<1)自动放大为百分数（0.08 → 8）；已为百分数(≥1)则原样返回。
-	toPct := func(v float64) float64 {
-		if v > 0 && v < 1 {
-			return v * 100
-		}
-		return v
-	}
-	// 各战法默认止盈/止损（未配置时使用缺省值）。
-	switch strategyName {
-	case "dragon":
-		tp = toPct(sc.Dragon.TakeProfitPct)
-		if tp <= 0 {
-			tp = 10
-		}
-		sl = toPct(sc.Dragon.BuyPullbackSellAllPct)
-		if sl <= 0 {
-			sl = 8
-		}
-	case "double_bump":
-		tp = toPct(sc.DoubleBump.DoubleBumpTakeProfitPct)
-		if tp <= 0 {
-			tp = 15
-		}
-		sl = 8
-	case "n_shape":
-		tp = 10
-		sl = toPct(sc.NShape.HardStopLoss)
-		if sl <= 0 {
-			sl = 8
-		}
-	case "dragon_return":
-		tp = toPct(sc.DragonReturn.TakeProfitPct)
-		if tp <= 0 {
-			tp = 25
-		}
-		sl = toPct(sc.DragonReturn.StopLossPct)
-		if sl <= 0 {
-			sl = 5
-		}
-	default:
-		// 手动/未知战法：通用止盈止损
-		tp, sl = 10, 8
+	sl = disc.StopLossPct
+	if sl <= 0 {
+		sl = 6
 	}
 	return
 }

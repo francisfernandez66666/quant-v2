@@ -182,17 +182,16 @@ func (r *Registry) paperMirror(userID string) (func(paper.Position), func(string
 		if rpt.HasHoldingFor(userID, pos.Code) {
 			return // 已有同码同账号记录，幂等跳过（按账号隔离，避免跨账号误判）
 		}
-		var sc *config.StrategyConfig
+		disc := config.DefaultDisciplineConfig()
 		atrOn, atrMult := false, 0.0
 		if cm != nil {
 			if rules := cm.GetRulesFor(userID); rules != nil {
-				scfg := rules.Strategy
-				sc = &scfg
+				disc = rules.Paper.Discipline // §统一纪律 E：镜像止盈止损统一走总纪律（默认+15/−6）
 				atrOn = rules.Position.ATREnabled
 				atrMult = rules.Position.ATRStopMult
 			}
 		}
-		tp, sl := paperOpenTpSl(pos.StrategyType, sc)
+		tp, sl := paperOpenTpSl(disc)
 		if atrOn && atrMult > 0 && pos.ATR > 0 && pos.CostPrice > 0 {
 			if s := pos.ATR * atrMult / pos.CostPrice * 100; s > 0 {
 				sl = s // ATR 动态止损优先（C4），无效回退固定百分比
@@ -239,6 +238,18 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	// 的 5s 调度路径；改为锁外构建、重取锁二次检查后再注册。
 	cfg := r.opts.Paper.Cfg()
 	pe := paper.New(cfg, r.paperPath(userID))
+	// 统一纪律注入（探针+扳机；rules.paper.discipline 默认已挂进 DefaultRules.Paper.Discipline）：
+	// 买入确认状态机据此决定撮合确认窗（低置信5min/高置信30s），实盘与模拟盘同口径。
+	// English: inject the unified discipline (probe+trigger; rules.paper.discipline defaulted into
+	// DefaultRules.Paper.Discipline) — the buy-confirmation state machine derives its fill windows from
+	// it, unified with live. Falls back to factory defaults when the config manager is absent.
+	disc := config.DefaultDisciplineConfig()
+	if r.opts.CfgMgr != nil {
+		if rules := r.opts.CfgMgr.GetRulesFor(userID); rules != nil {
+			disc = rules.Paper.Discipline
+		}
+	}
+	pe.SetDiscipline(&disc)
 	// 两本账合一（阶段1.2）：paper 为唯一真实账本，开仓/清仓镜像写 report 持仓账，
 	// 使 CheckPositionsExits 离场路径、持仓页、打分池消费的 rpt 与模拟盘保持一致。
 	// English: unified books — paper is the single source of truth; opens/closes mirror into the report
@@ -338,12 +349,16 @@ func (r *Registry) registerUser(e *Engine, userID string) {
 // 卖出信号按账号逐仓投递——只发给【当前持有该 code】的账号引擎（pe.Holds 匹配），
 // 无持仓账号不再收到无关卖点（此前整批下发+autoSellLocked 内部 no-op，信号归属错位）。
 // 买入信号仍全量下发（各账号独立决定现金/上限/池）。卖出+买入合并后一次性 OnSignals。
+// exit 为卖出侧纪律信号（CheckPositionsExits/CheckPositionAlerts 产出：止损/止盈/移动止盈/当日跌幅），
+// 同样按持仓路由并入，让模拟盘能因止损/止盈/移动止盈线自动离场（此前只发消息不执行——605177 -11.55% 未止损根因）。
 // English: dispatches signals to the auto-fill accounts of a shared engine, each filling
 // independently (normal users' books are manual). Trading hours only. Per-account routing for sells —
 // a sell signal only reaches accounts whose book currently holds that code (pe.Holds), instead of
 // broadcasting the whole batch to every account where autoSellLocked silently no-ops. Buys still go
-// to all accounts (each independently gates on cash/cap/pool). Sells+buys are merged before OnSignals.
-func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+// to all accounts (each independently gates on cash/cap/pool). exit = sell-side discipline signals
+// (CheckPositionsExits/CheckPositionAlerts: stop-loss/TP/trailing/daily-drop) merged by routing so the
+// paper book auto-exits on the discipline lines (previously message-only — the 605177 -11.55% no-stop root cause).
+func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
 	if !data.IsFullTradingHours(time.Now()) {
 		return
 	}
@@ -357,8 +372,13 @@ func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, q
 		}
 		// 按 code 拆分卖出信号：仅投递给本账号持有的（逐仓路由）；买入信号保留全量。
 		// English: keep sell signals whose code this account holds; keep all buys.
-		acct := make([]combat_agent.Signal, 0, len(emit))
+		acct := make([]combat_agent.Signal, 0, len(emit)+len(exit))
 		for _, s := range emit {
+			if combat_agent.SellAction(s) == "" || pe.Holds(s.Code) {
+				acct = append(acct, s)
+			}
+		}
+		for _, s := range exit {
 			if combat_agent.SellAction(s) == "" || pe.Holds(s.Code) {
 				acct = append(acct, s)
 			}
@@ -689,8 +709,8 @@ func (r *Registry) build(userID string) *Engine {
 	// template only supplies config; e.paper stays as the legacy single-engine fallback.
 	e.SetPaper(opts.Paper)
 	e.SetPaperDispatch(
-		func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
-			r.dispatchPaperSignals(e, emit, quotes)
+		func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+			r.dispatchPaperSignals(e, emit, exit, quotes)
 		},
 		func(quotes map[string]*data.StockInfo) { r.dispatchPaperMark(e, quotes) },
 	)

@@ -23,6 +23,7 @@ import (
 
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 )
 
@@ -399,6 +400,23 @@ type Engine struct {
 	// English: re-entry cooldown tracker (§R1.4, paper_r12). Records close time; the fill pre-check calls
 	// canReEnter to block re-buys inside the cooldown window after a full close. nil-safe.
 	reEntry *reEntryTracker
+	// discipline 统一止盈止损纪律参数（探针5s + 扳机确认窗；rules.paper.discipline 注入，可空=走默认）。
+	// English: unified stop-loss/take-profit discipline params (probe 5s + trigger windows; injected from
+	// rules.paper.discipline, nil = defaults).
+	discipline *config.DisciplineConfig
+	// buyConfirm 买入确认状态机：code → 该股买入信号首次出现的探针时刻。信号需持续存在
+	// 达到确认窗（低置信5min / 高置信30s）才真正撮合，过滤插针假信号。nil = 未启用买入确认。
+	// English: buy-confirmation state machine — code → first probe time a buy signal appeared. The signal
+	// must persist for the confirmation window (low-conf 5min / high-conf 30s) before filling, filtering
+	// spurious pin-bar signals. nil = buy confirmation disabled.
+	buyConfirm map[string]time.Time
+	// lastBuyReject 买入拒绝订单去重：code → 最近一次拒绝原因。探针改为每轮重放全量活跃
+	// 买入信号后，不可撮合信号（持仓上限/涨停/无行情等）会每 5s 触达一次——同一原因只留痕
+	// 一次，防止 orders 表与磁盘写被刷爆；成功成交时清除该码记录。
+	// English: rejected-buy order dedup — code → last reject reason. With the probe now re-feeding the
+	// full active buy set each round, an unfillable code would log a rejected order every 5s; the same
+	// reason is audited once. Cleared on a successful fill.
+	lastBuyReject map[string]string
 }
 
 // New 创建模拟盘引擎并加载历史持久化数据。
@@ -424,6 +442,8 @@ func New(cfg Config, path string) *Engine {
 		positions:      make(map[string]*Position),
 		trimDone:       make(map[string]string),
 		reEntry:        newReEntryTracker(), // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
+		buyConfirm:     make(map[string]time.Time),
+		lastBuyReject:  make(map[string]string),
 		path:           path,
 	}
 	if path != "" {
@@ -482,6 +502,19 @@ func (e *Engine) SetMirror(open func(p Position), close func(code string, price,
 	e.mu.Lock()
 	e.onOpen, e.onClose = open, close
 	e.mu.Unlock()
+}
+
+// SetDiscipline 注入统一止盈止损纪律参数（探针+扳机；rules.paper.discipline 热更新到运行账号）。
+// 传入的副本仅用于买入确认状态机（buyConfirm）的确认窗；nil 安全 = 禁用买入确认。
+// English: injects the unified discipline params (probe+trigger; hot-syncs rules.paper.discipline into a
+// running account). Only the buy-confirmation windows are read here; nil = buy confirmation disabled.
+func (e *Engine) SetDiscipline(d *config.DisciplineConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.discipline = d
+	if e.buyConfirm == nil {
+		e.buyConfirm = make(map[string]time.Time)
+	}
 }
 
 // mirrorOpenLocked 触发开仓镜像（须持锁调用；副本传值防回调侧读到后续变更）。
@@ -788,6 +821,25 @@ func (e *Engine) recordOrderLocked(o Order) {
 	e.orders = append(e.orders, o)
 }
 
+// recordBuyRejectLocked 记录一笔「自动撮合买入被拒」订单留痕，同一原因按码去重。
+// §统一纪律·探针改为每轮重放全量活跃买入信号后，不可撮合信号（持仓上限/涨停/无行情/
+// 池未启用/资金不足等）会每 5s 触达一次——同一原因只留痕一次，防止 orders 表与磁盘写被刷爆；
+// 成功成交路径会清除该码记录（见 OnSignals fillLocked 成功后 delete）。
+// English: records a rejected auto-buy order, deduplicated by (code, reason). With the probe re-feeding
+// the full active buy set every round, an unfillable code would otherwise log a rejected order every 5s;
+// the same reason is audited once. Cleared on a successful fill (see OnSignals).
+func (e *Engine) recordBuyRejectLocked(o Order, reason string) {
+	if e.lastBuyReject == nil {
+		e.lastBuyReject = map[string]string{}
+	}
+	if e.lastBuyReject[o.Code] == reason {
+		return
+	}
+	e.lastBuyReject[o.Code] = reason
+	o.Reason = reason
+	e.recordOrderLocked(o)
+}
+
 // OnSignals 消费一轮策略信号做自动撮合：仅做多 buy 信号，用实时快照价成交固定资金。
 // 同一股票已持仓则跳过；达持仓上限跳过。行情缺失时跳过该信号（不伪造成交）。
 // 记录信号价作辅助参照 + 信号→成交延迟。
@@ -806,6 +858,7 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		return
 	}
 	now := time.Now()
+	buySeen := make(map[string]struct{})
 	for i := range sigs {
 		s := sigs[i]
 		// 卖出信号自动成交（阶段1.1 全自动执行）：清仓/硬止盈/硬止损 → 全平；减仓类 → 半仓
@@ -819,6 +872,9 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if s.Direction == "做空" || s.Action != "buy" {
 			continue
 		}
+		if e.buyConfirm != nil {
+			buySeen[s.Code] = struct{}{}
+		}
 		if _, held := e.positions[s.Code]; held {
 			continue
 		}
@@ -828,10 +884,10 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// English: R4 fix — the cap used to `return`, aborting the whole loop and silently dropping
 		// every later buy AND stop-loss sell; now it skips this buy with an audit record and continues.
 		if e.cfg.MaxPositions > 0 && len(e.positions) >= e.cfg.MaxPositions {
-			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+			e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 				StrategyType: s.StrategyType, Side: "buy", Kind: "自动撮合",
-				SignalPrice: s.Price, Status: "rejected",
-				Reason: fmt.Sprintf("持仓数达上限(%d)", e.cfg.MaxPositions), CreatedAt: now})
+				SignalPrice: s.Price, Status: "rejected", CreatedAt: now},
+				fmt.Sprintf("持仓数达上限(%d)", e.cfg.MaxPositions))
 			continue
 		}
 		// 战法分池：按信号 StrategyType 归池；类型未启用（无对应池）时显式拒绝留痕。
@@ -842,10 +898,10 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		poolKey := s.StrategyType
 		if poolKey != "" {
 			if _, ok := e.pools[poolKey]; !ok {
-				e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+				e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 					StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
-					SignalPrice: s.Price, Status: "rejected",
-					Reason: fmt.Sprintf("战法池未启用(%s)", poolKey), CreatedAt: now})
+					SignalPrice: s.Price, Status: "rejected", CreatedAt: now},
+					fmt.Sprintf("战法池未启用(%s)", poolKey))
 				log.Printf("[paper] 池键失配拒绝 %s(%s): 类型 %s 无对应启用池", s.Code, s.Name, poolKey)
 				continue
 			}
@@ -859,10 +915,10 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// header contract "never fabricate fills"); also un-short-circuits the limit-up guard.
 		q, hasQuote := quotes[s.Code]
 		if !hasQuote || q == nil || q.Price <= 0 {
-			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+			e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 				StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
-				SignalPrice: s.Price, Status: "rejected",
-				Reason: "行情缺失跳过(不伪造成交)", CreatedAt: now})
+				SignalPrice: s.Price, Status: "rejected", CreatedAt: now},
+				"行情缺失跳过(不伪造成交)")
 			continue
 		}
 		price := q.Price
@@ -871,10 +927,10 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// 龙头识别 10:15 发信号被瞬间以涨停价撮合，制造"买后必涨"的虚假胜率。
 		// 以实时涨幅近似封板判定；§R6 分板块幅度：主板/ST≈10%/5%、创业科创 20cm、北交 30%。
 		if q := quotes[s.Code]; q != nil && q.ChangePct >= LimitUpPct(s.Code, s.Name) {
-			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+			e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
 				StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
-				SignalPrice: s.Price, Status: "rejected",
-				Reason: fmt.Sprintf("涨停封板无法买入(%.1f%%)", q.ChangePct), CreatedAt: now})
+				SignalPrice: s.Price, Status: "rejected", CreatedAt: now},
+				fmt.Sprintf("涨停封板无法买入(%.1f%%)", q.ChangePct))
 			log.Printf("[paper] 涨停拒买(自动) %s(%s) %.1f%%——封板股买单不撮合", s.Code, s.Name, q.ChangePct)
 			continue
 		}
@@ -886,14 +942,58 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
 			continue
 		}
+		// §统一纪律·买入确认扳机（探针+扳机）：5s 探针太灵敏，盘中瞬间插针会产生假买入信号。
+		// 买入信号必须持续存在到确认窗才真正撮合——置信度 < 高置信阈值走 BuyConfirmMin（默认5分钟）
+		// 持续确认，≥ 高置信阈值也至少观察 BuyConfirmHighSec（默认30秒），过滤插针假信号。
+		// buyConfirm[code] 记录该股买入信号首次出现的探针时刻；连续出现累计，消失即重置。
+		// discipline 为 nil（未注入/未启用）时整闸门跳过，行为与旧版完全一致。
+		// English: unified buy-confirmation gate — a 5s probe is too twitchy, intraday pin-bars fabricate
+		// fake buy signals. A buy signal must persist for its confirmation window before filling: confidence
+		// below the high-conf threshold needs BuyConfirmMin (default 5min) of continuous presence, ≥ high-conf
+		// still observes at least BuyConfirmHighSec (default 30s). buyConfirm[code] records the first probe
+		// time; presence accumulates, absence resets. Skipped entirely when discipline is nil (unchanged legacy).
+		if e.discipline != nil {
+			d := *e.discipline
+			lowWin := time.Duration(d.BuyConfirmMin) * time.Minute
+			highWin := time.Duration(d.BuyConfirmHighSec) * time.Second
+			if lowWin > 0 || highWin > 0 {
+				first, tracked := e.buyConfirm[s.Code]
+				if !tracked {
+					e.buyConfirm[s.Code] = now
+					e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
+						StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
+						SignalPrice: s.Price, Status: "rejected",
+						Reason: "买入信号待确认(探针观测中)", CreatedAt: now})
+					continue
+				}
+				win := lowWin
+				// 置信度阈值归一：combat_agent.Confidence 为 0~1（显示时 ×100），后台阈值存百分数（默认 85），
+				// 统一先放大到百分数再比，避免 0.9 ≥ 85 恒假导致高置信快车道永远不触发。
+				// English: normalize the scale — Confidence is 0~1 (shown as ×100) while the config stores a
+				// percent threshold (default 85); compare in percent space so 0.9 ≥ 85 never false-passes the
+				// high-confidence fast lane to dead.
+				if s.Confidence*100 >= d.HighConfThreshold {
+					win = highWin
+				}
+				if now.Sub(first) < win {
+					continue // 信号需连续存在到确认窗；每轮只累计，不重复刷订单留痕
+				}
+				delete(e.buyConfirm, s.Code) // 确认通过，撮合后清除
+			}
+		}
 		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, false); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 			// 订单留痕：买入被拒（现金不足/超上限/池上限/买不起一手）。
 			// English: order audit — the buy was rejected (cash short / cap / pool cap / can't afford a lot).
-			e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy, StrategyType: poolKey,
-				Side: "buy", Kind: "自动撮合", SignalPrice: s.Price, Status: "rejected",
-				Reason: fmt.Sprintf("%v", err), CreatedAt: now})
+			e.recordBuyRejectLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy, StrategyType: poolKey,
+				Side: "buy", Kind: "自动撮合", SignalPrice: s.Price, Status: "rejected", CreatedAt: now},
+				fmt.Sprintf("%v", err))
 			continue
+		}
+		// 买入拒绝去重表同步清除：该码已成交，后续同码不再按旧原因去重。
+		// English: clear the reject-dedup entry — this code filled, later rejects must re-audit.
+		if e.lastBuyReject != nil {
+			delete(e.lastBuyReject, s.Code)
 		}
 		// 订单留痕：自动撮合全部成交。
 		// English: order audit — the auto fill completed.
@@ -906,6 +1006,23 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if p, ok := e.positions[s.Code]; ok {
 			p.ATR = s.ATR
 			e.mirrorOpenLocked(p)
+		}
+	}
+	// 清理买入确认表：本轮未出现买入信号的记录清除——信号需连续存在，一旦中断即重置
+	// （防跨轮累计触发）。同时清除已达最大观察期的僵尸记录防表无限膨胀。
+	// English: purge stale buy-confirm entries — codes with no buy signal this round are dropped so
+	// presence must be continuous (no cross-round accumulation); capped entries are also cleaned so the
+	// table can't grow unbounded.
+	if e.discipline != nil && len(e.buyConfirm) > 0 {
+		d := *e.discipline
+		maxAge := time.Duration(d.BuyConfirmMin) * time.Minute
+		if h := time.Duration(d.BuyConfirmHighSec) * time.Second; h > maxAge {
+			maxAge = h
+		}
+		for code, first := range e.buyConfirm {
+			if _, ok := buySeen[code]; !ok || now.Sub(first) > maxAge {
+				delete(e.buyConfirm, code)
+			}
 		}
 	}
 	e.persist()
@@ -1465,8 +1582,8 @@ func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*
 		if err == nil {
 			e.recordOrderLocked(Order{Code: code, Name: p.Name, Strategy: p.Strategy, StrategyType: p.StrategyType,
 				Side: "sell", Kind: "手动卖出", Price: price, Qty: full, Status: "filled", Reason: "手动模拟卖出"})
-			e.persist()
 		}
+		e.persist()
 		return err
 	}
 	err := e.sellQtyLocked(p, price, qty, "手动模拟减仓")

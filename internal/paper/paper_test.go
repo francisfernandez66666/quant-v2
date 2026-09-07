@@ -326,7 +326,8 @@ func TestMarkToMarketAndSnapshot(t *testing.T) {
 	}, map[string]*data.StockInfo{"600000.SH": {Price: 10}})
 	// 价格升到 11，估值刷新
 	e.MarkToMarket(map[string]*data.StockInfo{"600000.SH": {Price: 11}})
-	e.Snapshot(now)
+	anchor := time.Date(2026, 9, 8, 10, 0, 0, 0, time.Local) // 固定锚点（避午夜跨日抖动）
+	e.Snapshot(anchor)
 	st := e.Stats()
 	if got := st.MarketValue; got != 11000 {
 		t.Errorf("市值应为 11000, 实际 %.2f", got)
@@ -337,8 +338,8 @@ func TestMarkToMarketAndSnapshot(t *testing.T) {
 	if eq := e.Equity(); len(eq) != 1 {
 		t.Fatalf("净值点应为 1, 实际 %d", len(eq))
 	}
-	// 同日再次快照：覆盖不新增
-	e.Snapshot(now.Add(5 * time.Minute))
+	// 同一锚日再次快照：覆盖不新增
+	e.Snapshot(anchor.Add(5 * time.Minute))
 	if eq := e.Equity(); len(eq) != 1 {
 		t.Fatalf("同日净值点应去重为 1, 实际 %d", len(eq))
 	}

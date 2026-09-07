@@ -111,26 +111,26 @@ type Engine struct {
 	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
 	sectorConstTopN  int                   // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
 
-	fetcher          *data.Fetcher                                                       // 5s 实时行情采集器（近实时打分快照来源）
-	scoreStore       *scoreStore                                                         // 8a/8b 主循环打分持久化（scores.json）
-	fastScoreStore   *scoreStore                                                         // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
-	prevPass         map[string]map[string]bool                                          // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
-	prevBullBuy      map[string]map[string]bool                                          // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
-	lastD1Scores     map[string]combat_agent.D1Score                                     // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
-	d1ScoredSig      map[string]string                                                   // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
-	d1RetryQueue     map[string]bool                                                     // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
-	lastEmotionPhase string                                                              // 主循环最近一轮情绪阶段（近实时循环复用）
-	lastBearReasons  map[string]string                                                   // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
-	d1MaxRetries     int                                                                 // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
-	d1MaxTokens      int                                                                 // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
-	lastTiming       *RunTiming                                                          // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
-	factorMon        *factorMonitor                                                      // 因子战法效果监测（战法库触发信号前向收益结算）
-	paper            *paper.Engine                                                       // 模拟盘引擎（独立纸面交易，可空=未启用）
-	paperOnSignals   func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy 信号撮合（registry 注入）
-	paperMarkFn      func(quotes map[string]*data.StockInfo)                             // 按账号分发估值/净值（registry 注入）
-	lastTrim         time.Time                                                           // 盘后内存释放最近一次执行时间（节流用）
-	reportTrimDone   map[string]string                                                   // FIX#15 report 账本减仓去重：code → 交易日（autoExitReportSells 半仓每日一次）
-	reportTrimDoneMu sync.Mutex                                                          // reportTrimDone 互斥（主循环独占写，SSE/HTTP 可能读，防御性）
+	fetcher          *data.Fetcher                                                                                   // 5s 实时行情采集器（近实时打分快照来源）
+	scoreStore       *scoreStore                                                                                     // 8a/8b 主循环打分持久化（scores.json）
+	fastScoreStore   *scoreStore                                                                                     // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
+	prevPass         map[string]map[string]bool                                                                      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
+	prevBullBuy      map[string]map[string]bool                                                                      // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
+	lastD1Scores     map[string]combat_agent.D1Score                                                                 // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
+	d1ScoredSig      map[string]string                                                                               // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
+	d1RetryQueue     map[string]bool                                                                                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
+	lastEmotionPhase string                                                                                          // 主循环最近一轮情绪阶段（近实时循环复用）
+	lastBearReasons  map[string]string                                                                               // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
+	d1MaxRetries     int                                                                                             // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
+	d1MaxTokens      int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
+	lastTiming       *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
+	factorMon        *factorMonitor                                                                                  // 因子战法效果监测（战法库触发信号前向收益结算）
+	paper            *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
+	paperOnSignals   func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
+	paperMarkFn      func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
+	lastTrim         time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
+	reportTrimDone   map[string]string                                                                               // FIX#15 report 账本减仓去重：code → 交易日（autoExitReportSells 半仓每日一次）
+	reportTrimDoneMu sync.Mutex                                                                                      // reportTrimDone 互斥（主循环独占写，SSE/HTTP 可能读，防御性）
 
 	// 实盘交易（AUTO_TRADING_PLAN M1）：QMT 控制器 + 实盘账本 store。独立于纸面账本。
 	// 仅 qmt.enabled=true 时参与 5s 分析循环（读 real_positions 生成持仓建议 / 熔断 / 自动下单）。
@@ -139,6 +139,24 @@ type Engine struct {
 	// breaking and auto-orders each 5s cycle.
 	qmtCtrl   *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
 	realStore *store.DB           // 研究库（real_positions/orders/fills 实盘账本存取）
+
+	// buyConfirmReal 实盘买入确认状态机（§统一纪律·探针+扳机）：code → 买入信号首次出现的探针时刻。
+	// 信号需连续存在到确认窗（低置信 BuyConfirmMin / 高置信 BuyConfirmHighSec）才允许 autoPlace，
+	// 过滤盘中插针假买入信号。e.mu 保护；信号中断（本轮不再活跃）由 pruneRealBuyConfirm 清理。
+	// English: real-book buy-confirmation state machine — code → first probe time a buy signal appeared;
+	// the signal must persist for its window (low-conf BuyConfirmMin / high-conf BuyConfirmHighSec) before
+	// autoPlace, filtering intraday pin-bar fake buys. Guarded by e.mu; non-active codes are pruned each round.
+	buyConfirmReal map[string]time.Time
+	// disciplineTracker 实盘统一止盈止损纪律状态机（§统一纪律 B：pushRealAdvice 经 trading.Advise
+	// 注入）。pushRealAdvice 惰性初始化（避免 build 顺序耦合）；nil = 未接入纪律裁决。
+	// English: the live unified-discipline tracker (wired into trading.Advise by pushRealAdvice).
+	// Lazy-initialized in pushRealAdvice to avoid build-order coupling; nil = no discipline adjudication.
+	disciplineTracker *trading.DisciplineTracker
+	// realTrimDone 实盘纪律减仓去重：code → 交易日（同一交易日只响应一次"减仓"裁决，
+	// 防纪律状态机每轮重放 ActionTrim 把仓位反复减半）。e.mu 保护。
+	// English: live discipline-trim dedup — code → trading day (at most one 减仓 per code per day, so the
+	// discipline state machine's per-round ActionTrim can't keep halving the position). Guarded by e.mu.
+	realTrimDone map[string]string
 
 	// §A+B 信号→交易低延迟：异步下单分发器（事件驱动热路径）。
 	// autoPlace 完成同步守卫（模式/白名单/涨停封板/金额）后把 OrderRequest 投入 buyCh，
@@ -645,7 +663,7 @@ func (e *Engine) SetPaper(p *paper.Engine) {
 // SetPaperDispatch 注入按账号的模拟盘分发回调（多账号模式；注入后优先于全局 e.paper）。
 // English: injects the per-account paper dispatch callbacks (multi-account mode; take precedence over
 // the global e.paper when set).
-func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, quotes map[string]*data.StockInfo), mark func(quotes map[string]*data.StockInfo)) {
+func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo), mark func(quotes map[string]*data.StockInfo)) {
 	e.mu.Lock()
 	e.paperOnSignals = onSignals
 	e.paperMarkFn = mark
@@ -680,21 +698,87 @@ func (e *Engine) QMTController() *trading.Controller {
 	return e.qmtCtrl
 }
 
-// paperSignals 把本轮翻转信号送入模拟盘撮合：优先按账号分发，回退全局引擎。
-// 仅交易时段执行（盘后停自动撮合，省内存）。
-// English: feeds this round's flipped signals into paper filling — per-account dispatch first, global
-// engine as the fallback. Runs only during trading hours (no after-hours auto-fill to save memory).
-func (e *Engine) paperSignals(emit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+// paperSignals 把本轮翻转信号 + 卖出侧纪律信号（止损/止盈/移动止盈）送入模拟盘撮合。
+// 优先按账号分发，回退全局引擎。仅交易时段执行（盘后停自动撮合，省内存）。
+// exit 为卖出侧纪律信号（CheckPositionsExits/CheckPositionAlerts 产出），并入撮合，
+// 让模拟盘能因止损/止盈/移动止盈线自动离场（此前只发消息不执行——-11.55% 未止损根因）。
+// English: feeds this round's flipped signals PLUS sell-side discipline signals (stop-loss/take-profit/
+// trailing) into paper filling — per-account dispatch first, global engine fallback. Trading hours only.
+// exit merges CheckPositionsExits/CheckPositionAlerts outputs so the paper book auto-exits on stop-loss/
+// take-profit/trailing lines (previously message-only — the -11.55% never-stopped root cause).
+func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
 	e.mu.RLock()
 	dispatch := e.paperOnSignals
 	pe := e.paper
 	e.mu.RUnlock()
+	combined := make([]combat_agent.Signal, 0, len(emit)+len(exit))
+	combined = append(combined, emit...)
+	combined = append(combined, exit...)
 	if dispatch != nil {
-		dispatch(emit, quotes)
+		dispatch(combined, nil, quotes)
 		return
 	}
 	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
-		pe.OnSignals(emit, quotes)
+		pe.OnSignals(combined, quotes)
+	}
+}
+
+// realBuyConfirmPass 实盘买入确认扳机（§统一纪律·探针+扳机）：返回 true 才允许实盘下单。
+// buyConfirmReal[code] 记录该股买入信号首现的探针时刻；连续出现累计，窗满放行；
+// 两窗（BuyConfirmMin/BuyConfirmHighSec）均 ≤0 = 未启用买入确认 → 直接放行（兼容旧行为）。
+// 信号中断（不再活跃）由调用方用本轮活跃集调 pruneRealBuyConfirm 清理重置。
+// English: real buy-confirmation gate — returns true only when the buy signal has persisted for its
+// window (low-conf BuyConfirmMin / high-conf BuyConfirmHighSec; both ≤0 = disabled, legacy instant pass).
+// buyConfirmReal[code] records the first probe time; callers prune non-active codes via pruneRealBuyConfirm.
+func (e *Engine) realBuyConfirmPass(code string, confidence float64, disc config.DisciplineConfig) bool {
+	if disc.BuyConfirmMin <= 0 && disc.BuyConfirmHighSec <= 0 {
+		return true
+	}
+	now := time.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.buyConfirmReal == nil {
+		e.buyConfirmReal = map[string]time.Time{}
+	}
+	first, tracked := e.buyConfirmReal[code]
+	if !tracked {
+		e.buyConfirmReal[code] = now
+		return false
+	}
+	win := time.Duration(disc.BuyConfirmMin) * time.Minute
+	// 置信度阈值归一：combat_agent.Confidence 为 0~1（显示时 ×100），后台阈值存百分数（默认 85），
+	// 统一先放大到百分数再比，避免 0.9 ≥ 85 恒假导致高置信快车道永远不触发。
+	// English: normalize the scale — Confidence is 0~1 (shown as ×100) while the config stores a percent
+	// threshold (default 85); compare in percent space so high-confidence signals take the fast lane.
+	if confidence*100 >= disc.HighConfThreshold {
+		win = time.Duration(disc.BuyConfirmHighSec) * time.Second
+	}
+	if now.Sub(first) < win {
+		return false
+	}
+	delete(e.buyConfirmReal, code) // 确认通过，下单后清除
+	return true
+}
+
+// pruneRealBuyConfirm 清理实盘买入确认表：本轮未出现买入信号的记录清除（信号需连续存在），
+// 同时清除超过最大观察窗的僵尸记录，防表无限膨胀。seen = 本轮活跃买入信号代码集。
+// English: prunes the real buy-confirm table — codes without a buy signal this round are dropped (presence
+// must be continuous) and over-max-window zombies are cleaned so the table can't grow unbounded.
+func (e *Engine) pruneRealBuyConfirm(seen map[string]struct{}, disc config.DisciplineConfig) {
+	if len(e.buyConfirmReal) == 0 {
+		return
+	}
+	maxAge := time.Duration(disc.BuyConfirmMin) * time.Minute
+	if h := time.Duration(disc.BuyConfirmHighSec) * time.Second; h > maxAge {
+		maxAge = h
+	}
+	now := time.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for code, first := range e.buyConfirmReal {
+		if _, ok := seen[code]; !ok || now.Sub(first) > maxAge {
+			delete(e.buyConfirmReal, code)
+		}
 	}
 }
 
@@ -2097,7 +2181,16 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 		// while the breaker is open). manual mode sends nothing — the frontend live tab confirms first via
 		// POST /api/positions/execute.
 		if direction == "做多" && action == "买入" {
-			e.autoPlace(sig, live)
+			// §统一纪律·实盘买入确认扳机：信号需持续存在到确认窗才真正下单（过滤插针假信号）。
+			// 近实时全量活跃集（scoring_loop）经同一闸门，双通道都不会绕过确认。
+			// English: unified buy-confirm gate — persist for the window before ordering (pin-bar filter);
+			// the near-realtime full-active loop applies the same gate, so neither channel bypasses it.
+			e.mu.RLock()
+			rc := e.qmtCtrl
+			e.mu.RUnlock()
+			if rc == nil || e.realBuyConfirmPass(sig.Code, sig.Confidence, rc.Config().Discipline) {
+				e.autoPlace(sig, live)
+			}
 		}
 		// 现价与涨跌幅：优先实时行情（比信号触发价更新），行情失败则回退信号触发价，避免消息里"现价:0.00"
 		// English: prefer the live quote for the price and change% (fresher than the trigger price); fall
@@ -3154,16 +3247,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			}
 		}
 		if len(buys) > 0 {
-			e.mu.RLock()
-			prev := e.prevBullBuy
-			e.mu.RUnlock()
-			emit, next := filterTransitionSignals(buys, prev)
-			e.mu.Lock()
-			e.prevBullBuy = next
-			e.mu.Unlock()
-			if len(emit) > 0 {
-				e.paperSignals(emit, e.snapshotQuotes())
-			}
+			// §统一纪律·买入确认：主循环也喂全量活跃买入信号（非仅翻转），让模拟盘买入
+			// 确认状态机能观察"信号是否持续存在"（翻转一次即不再出现无法判连续性）。
+			// English: feed the FULL active buy set (not just flips) so the paper buy-confirm gate can
+			// observe signal persistence (a flip emits once and never re-appears).
+			e.paperSignals(buys, nil, e.snapshotQuotes())
 		}
 	}
 
@@ -3245,7 +3333,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			}
 		}
 		if len(sells) > 0 {
-			e.paperSignals(sells, exitQuotes)
+			e.paperSignals(sells, nil, exitQuotes)
 			// FIX#15 report 账本（用户手动录入持仓）也自动执行卖出：close→LogExit 全平、
 			// trim→SellLot 半仓（每码每日一次）。只处理 paper 引擎未持有的（避免双账簿重复卖）。
 			// English: FIX#15 auto-execute sells on the report book (manually entered holdings) as well —

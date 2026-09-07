@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/opslog"
@@ -256,30 +257,49 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		e.captureSignalRecords(len(scores), emit)
 
 		e.syncMessages(bullE, bearE, nil, nil, quotes)
+	}
 
-		// 模拟盘撮合：本轮翻转的做多 buy 信号按实时快照价自动成交（独立于真实持仓）。
-		// 信号价作为辅助参照记录，量化「信号发出→成交」的延迟与滑点对收益的影响。
-		// English: paper fill — this round's flipped long buy signals auto-fill at the live snapshot
-		// price (isolated from the real book). The signal price is recorded as a reference to quantify
-		// the signal-to-fill latency and slippage impact on returns.
-		e.paperSignals(emit, quotes)
+	// 模拟盘撮合 + 实盘下单（§统一纪律·探针+扳机）：
+	// 探针每轮喂入【全量活跃买入信号】（非仅翻转 emit）——翻转信号只出现一次，
+	// 买入确认状态机无法据此判定"信号是否持续存在"；全量活跃集才能观察连续性，
+	// 让插针假信号（一次翻转后即消失）在确认窗内被过滤，同时修复此前卖出侧纪律信号
+	// 只在"本轮有翻转"时才被并入模拟盘的遗漏（exit 独立于 buy 翻转，应每轮送达）。
+	// English: paper fill + live buy under the unified discipline — feed the FULL active buy set each
+	// probe round (not just flips): a flip emits once, so persistence (the buy-confirm gate's input)
+	// can only be observed from the full active set, filtering pin-bar one-shot signals. This also
+	// fixes exit/discipline signals only reaching paper when a buy flip happened that round.
+	if len(sigs) > 0 {
+		var buys []combat_agent.Signal
+		for _, sig := range sigs {
+			if sig.Direction == "做多" && sig.Action == "buy" {
+				buys = append(buys, sig)
+			}
+		}
+		// 模拟盘撮合：全量活跃 buy 信号 + 卖出侧纪律信号（止损/止盈/移动止盈/当日跌幅）。
+		// English: paper fill — full active buys + sell-side discipline signals (stop-loss/TP/trailing/daily-drop).
+		exitSell := append(append([]combat_agent.Signal{}, exitSigs...), alertSigs...)
+		e.paperSignals(buys, exitSell, quotes)
 
-		// §FIX-0921f 实盘 auto 下单接入近实时翻转信号（2026-09-01 用户实录「开关开着零实盘交易」）：
-		// 此前实盘 auto 下单只挂在主循环 syncMessages 上，而主循环单轮可被 LLM 慢链拖到
-		// 33min+ 甚至停摆（13:44:58 后全天零轮完成），今日全部 buy 信号产自本近实时翻转循环
-		// 却从未走到下单。现与模拟盘撮合同点接线：autoPlace 内含模式/白名单/涨停封板/整手
-		// 缩量/可用资金降档/幂等（signal_id=buy:code:strategy:交易日）全套守卫，与主循环共享
-		// 幂等键——双通道叠加也被 orders 表唯一约束拦重，不会重复下单。
-		// English: wire live auto-buy into the near-realtime flip emission (same point as the paper fill).
-		// Previously auto-buy was only on the main loop's syncMessages, which can stall 33min+ per round
-		// under slow LLM chains — today ALL buy signals originated here yet never reached ordering.
-		// autoPlace carries the full guard chain (mode/whitelist/sealed-board/lot-sizing/cash-downshift/
-		// idempotent key) shared with the main loop; the DB unique key blocks cross-channel repeats.
-		for _, sig := range emit {
-			if sig.Action == "buy" && sig.Direction == "做多" {
+		// 实盘 auto 下单（§FIX-0921f 接线点）接入买入确认扳机：
+		// autoPlace 内含模式/白名单/涨停封板/整手缩量/可用资金降档/幂等（signal_id=buy:code:strategy:交易日）
+		// 全套守卫，与主循环共享幂等键——双通道叠加也被 orders 表唯一约束拦重，不会重复下单。
+		// English: live auto-buy wired through the buy-confirm gate — autoPlace carries the full guard chain
+		// (mode/whitelist/sealed-board/lot-sizing/cash-downshift/idempotent key) shared with the main loop.
+		e.mu.RLock()
+		rc := e.qmtCtrl
+		e.mu.RUnlock()
+		disc := config.DefaultDisciplineConfig()
+		if rc != nil {
+			disc = rc.Config().Discipline
+		}
+		seen := make(map[string]struct{}, len(buys))
+		for _, sig := range buys {
+			seen[sig.Code] = struct{}{}
+			if e.realBuyConfirmPass(sig.Code, sig.Confidence, disc) {
 				e.autoPlace(sig, quotes)
 			}
 		}
+		e.pruneRealBuyConfirm(seen, disc)
 	}
 
 	// 模拟盘估值与日净值：每轮用实时快照价刷新持仓市值，并记录当日净值点。
@@ -560,6 +580,17 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		}
 	}
 
+	// 统一纪律裁决引擎惰性初始化（§统一纪律 B）：实盘止盈/止损/移动止盈/深破走探针+扳机状态机，
+	// 与模拟盘同口径。nil 安全：qmtCtrl 未启用时 pushRealAdvice 不会到这里。
+	// English: lazy-init the unified-discipline tracker — live TP/SL/trail/deep go through the probe+
+	// trigger state machine, unified with paper. Nil-safe: pushRealAdvice exits before this when QMT is off.
+	e.mu.Lock()
+	if e.disciplineTracker == nil {
+		e.disciplineTracker = trading.NewDisciplineTracker()
+	}
+	dt := e.disciplineTracker
+	e.mu.Unlock()
+
 	advices := trading.Advise(trading.AdviceInput{
 		Agent:        agent,
 		MarketAPI:    marketAPI,
@@ -573,6 +604,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		EmotionPhase: emotionPhase,
 		BearReasons:  bearReasons, // FIX#13 利空归因接线：实盘持仓命中利空 → 止损级建议 → 自动清仓
 		Cfg:          ctrl.Config(),
+		DiscTracker:  dt, // 统一纪律裁决（探针+扳机）
 	})
 
 	// §GAP1.2 M8 组合回撤熔断（risk.M8Check 口径接线）：实盘组合市值自峰值回撤超阈值 → 全部自动卖出。
@@ -720,26 +752,68 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 		byCode[pureTsCode(p.TsCode)] = p
 	}
 	for _, a := range advices {
-		if a.Action != "止损" {
-			continue
-		}
 		p, ok := byCode[a.Code]
 		if !ok || a.RefPrice <= 0 {
 			continue
 		}
-		// §修复 R6：日级幂等键 sell:<code>:止损:<交易日> 统计已成交数量，仅对"剩余未成交"部分补卖；
+		// §统一纪律：止损级建议任何来源都自动执行（保护性不变）；止盈/减仓仅在来源为统一纪律
+		// 裁决引擎（Source=discipline）时自动执行——战法自带止盈止损降级为触发通知，不动作。
+		// English: stop-loss advice auto-executes from any source (unchanged protection); TP/trim only
+		// auto-execute when they come from the unified discipline engine — strategy-native TP/SL are
+		// notification-only.
+		var class string
+		var qty int
+		switch a.Action {
+		case "止损":
+			class = "止损"
+		case "止盈":
+			if a.Source != "discipline" {
+				continue
+			}
+			class = "止盈"
+		case "减仓":
+			if a.Source != "discipline" {
+				continue
+			}
+			class = "减仓"
+		default:
+			continue
+		}
+		// §修复 R6：日级幂等键 sell:<code>:<类别>:<交易日> 统计已成交数量，仅对"剩余未成交"部分补卖；
 		// 信号键追加 :r<剩余量> 桶——剩余量变化才开新单，避免部成后死循环重复下单，
 		// 也保证同日同剩余量不重复刷单（broker 仍在处理该笔时）。
 		// §修复 P2#13：剩余量按「今日全部全平类已成交」扣减（止损+m8），不再只看本类——
 		// 否则同日 止损 全平后 m8 再触发会对已空仓的持仓下第二单（超额卖出）。
-		base := realSellSignalID(p.TsCode, "止损")
+		base := realSellSignalID(p.TsCode, class)
 		filled := e.realSoldQtyToday(realStore, userID, p.TsCode)
 		remaining := p.Qty - filled
 		if remaining <= 0 {
 			continue
 		}
-		sid := fmt.Sprintf("%s:r%d", base, remaining)
-		_ = e.sellRealPosition(ctrl, p, remaining, sid, a.RefPrice, "止损", a.Reason)
+		// §统一纪律：减仓半平每码每日一次（纪律状态机每轮重放 ActionTrim，须去重防反复减半）。
+		// English: trim halves at most once per code per day (the discipline state machine re-fires
+		// ActionTrim every round — dedup prevents repeated halving).
+		if class == "减仓" {
+			e.mu.Lock()
+			if e.realTrimDone == nil {
+				e.realTrimDone = map[string]string{}
+			}
+			day := time.Now().Format("20060102")
+			if e.realTrimDone[p.TsCode] == day {
+				e.mu.Unlock()
+				continue
+			}
+			e.realTrimDone[p.TsCode] = day
+			e.mu.Unlock()
+			qty = remaining / 2
+			if qty <= 0 {
+				continue
+			}
+		} else {
+			qty = remaining
+		}
+		sid := fmt.Sprintf("%s:r%d", base, qty)
+		_ = e.sellRealPosition(ctrl, p, qty, sid, a.RefPrice, class, a.Reason)
 	}
 }
 

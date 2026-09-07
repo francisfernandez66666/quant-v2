@@ -41,6 +41,12 @@ type PositionAdvice struct {
 	Strategy     string    `json:"strategy"`      // 触发战法
 	SignalActive bool      `json:"signal_active"` // 该股当前是否有信号（加仓前置条件）
 	GeneratedAt  time.Time `json:"generated_at"`  // 生成时间
+	// Source 建议来源：""=常规卖出侧/加仓/格局；"discipline"=统一纪律裁决引擎（probeDiscipline）。
+	// 实盘自动卖出据此区分——纪律的止盈/减仓才自动执行，战法自带止盈止损（降级为通知）不执行。
+	// English: advice source — "" = regular sell-side / add / hold; "discipline" = the unified discipline
+	// engine (probeDiscipline). The live auto-sell uses it to execute only discipline TP/trims, while
+	// strategy-native TP/SL (downgraded to notifications) never auto-executes.
+	Source string `json:"source,omitempty"`
 }
 
 // AdviceInput 持仓分析入参（由引擎每轮组装传入）。
@@ -58,6 +64,11 @@ type AdviceInput struct {
 	EmotionPhase string                                      // 情绪阶段（退潮/背离 → 减仓）
 	BearReasons  map[string]string                           // 利空归因（code → 原因）
 	Cfg          config.QMTConfig                            // QMT 配置（加仓/格局阈值）
+	// DiscTracker 统一纪律裁决引擎（探针+扳机）状态机（§统一纪律 B）。nil = 未启用纪律裁决
+	//（旧行为：走 CheckPositionAlerts 即时止盈止损）。由 engine 按账号注入。
+	// English: the unified-discipline tracker (probe+trigger; §unified-discipline B). nil = discipline
+	// adjudication off (legacy instant TP/SL via CheckPositionAlerts). Injected by the engine per account.
+	DiscTracker *DisciplineTracker
 }
 
 // Advise 生成实盘持仓处理建议：卖出侧（复用）→ 加仓 → 格局，按 action 排序输出。
@@ -72,7 +83,7 @@ func Advise(in AdviceInput) []PositionAdvice {
 	now := time.Now()
 
 	// 构造只读 Report 视图复用卖出侧函数（NewFromLogs 不持久化）
-	view := report.NewFromLogs(execLogsFromReal(in.Positions))
+	view := report.NewFromLogs(execLogsFromReal(in.Positions, in.Cfg.Discipline))
 
 	var advices []PositionAdvice
 	advByCode := make(map[string]*PositionAdvice)
@@ -83,9 +94,18 @@ func Advise(in AdviceInput) []PositionAdvice {
 		for _, sig := range in.Agent.CheckPositionsExits(view, in.Quotes, in.DayKLines, now) {
 			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
 		}
-		// 2. 卖出侧：通用止盈/止损/跌幅提醒（§R4-6：行情走调用方注入的快照，缺失兜底单查）
-		for _, sig := range in.Agent.CheckPositionAlerts(view, in.MarketAPI, in.Quotes, in.Scores) {
-			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
+		// 2. 卖出侧：统一止盈/止损/移动止盈/深破裁决（§统一纪律·探针+扳机）。
+		// 替换旧的 CheckPositionAlerts 即时止盈止损：判定线 −6/+15/最高价−6/−12 全部来自
+		// DisciplineConfig（实盘与模拟盘同口径），命中后固定观察窗，窗内无同向信号才离场，
+		// 过滤盘中插针；战法自带止盈止损降级为触发通知。DiscTracker 为 nil（未注入）时跳过。
+		// English: unified TP/SL/trail/deep adjudication (probe+trigger) replaces the legacy instant
+		// CheckPositionAlerts: all lines (−6/+15/high−6/−12) come from DisciplineConfig (same as paper),
+		// with a fixed confirm window — no same-direction signal by settlement → exit, filtering pin-bars;
+		// strategy-native TP/SL degrade to notifications. Skipped when DiscTracker is nil.
+		if in.DiscTracker != nil {
+			for _, a := range in.DiscTracker.ProbeAll(in, in.Cfg.Discipline) {
+				mergeAdvice(advByCode, &a)
+			}
 		}
 		// 3. 卖出侧：卖点评估（利空D1/破MA/放量派发/动量衰竭）
 		held := heldCodes(in.Positions)
@@ -136,26 +156,37 @@ func Advise(in AdviceInput) []PositionAdvice {
 }
 
 // execLogsFromReal 把实盘持仓映射为 ExecLog 视图（SignalID 用 ts_code 保持稳定，供 RaiseHighest）。
-// 方向固定做多；止盈/止损阈值留 0（CheckPositionAlerts 对 0 阈值跳过止盈/止损，仅跌幅提醒仍生效）。
+// 方向固定做多；止盈/止损阈值取统一纪律 DisciplineConfig（默认止盈+15/止损-6），使实盘走
+// CheckPositionAlerts 与模拟盘同口径严格执行（此前留 0 → 0 阈值跳过止盈止损，仅跌幅提醒生效）。
 // English: maps real positions onto an ExecLog view (SignalID stable via ts_code for RaiseHighest).
-// Direction is fixed to 做多; TP/SL thresholds stay 0 (CheckPositionAlerts skips TP/SL for 0 but still
-// fires daily-drop alerts).
-func execLogsFromReal(positions []store.RealPosition) []report.ExecLog {
+// Direction is fixed to 做多; TP/SL thresholds come from the unified DisciplineConfig (default +15 / −6)
+// so the live CheckPositionAlerts enforces the same lines as paper (previously left 0 → TP/SL skipped).
+func execLogsFromReal(positions []store.RealPosition, disc config.DisciplineConfig) []report.ExecLog {
+	sl := disc.StopLossPct
+	if sl <= 0 {
+		sl = 6 // 与 DefaultDisciplineConfig 同口径兜底（旧配置未设）
+	}
+	tp := disc.TakeProfitPct
+	if tp <= 0 {
+		tp = 15
+	}
 	logs := make([]report.ExecLog, 0, len(positions))
 	for _, p := range positions {
 		if p.Qty <= 0 {
 			continue
 		}
 		logs = append(logs, report.ExecLog{
-			SignalID:     "real@" + p.TsCode,
-			Code:         pureCode(p.TsCode),
-			Name:         p.Name,
-			Direction:    "做多",
-			Strategy:     p.Strategy,
-			EntryPrice:   p.CostPrice,
-			Quantity:     float64(p.Qty),
-			HighestPrice: p.HighestPrice,
-			Status:       "持仓中",
+			SignalID:      "real@" + p.TsCode,
+			Code:          pureCode(p.TsCode),
+			Name:          p.Name,
+			Direction:     "做多",
+			Strategy:      p.Strategy,
+			EntryPrice:    p.CostPrice,
+			Quantity:      float64(p.Qty),
+			HighestPrice:  p.HighestPrice,
+			TakeProfitPct: tp,
+			StopLossPct:   sl,
+			Status:        "持仓中",
 		})
 	}
 	return logs

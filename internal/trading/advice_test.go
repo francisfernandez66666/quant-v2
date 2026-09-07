@@ -208,6 +208,39 @@ func TestFromSignalNoLivePriceNoFakeRef(t *testing.T) {
 	}
 }
 
+// TestExecLogsFromRealDiscipline §统一纪律：execLogsFromReal 把实盘持仓映射为 ExecLog 视图时，
+// 止盈/止损阈值取自统一纪律 DisciplineConfig（默认 +15/−6），使实盘 CheckPositionAlerts 与
+// 模拟盘同口径严格执行；空配置（旧配置未设）兜底出厂默认。
+// English: §unified-discipline — execLogsFromReal must stamp the TP/SL thresholds from the unified
+// DisciplineConfig (default +15/−6) onto the ExecLog view so the live CheckPositionAlerts enforces the
+// same lines as paper; zero config falls back to the factory defaults.
+func TestExecLogsFromRealDiscipline(t *testing.T) {
+	positions := []store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 11, Strategy: "龙头"},
+		{TsCode: "000001.SZ", Name: "平安", Qty: 0, CostPrice: 50}, // Qty≤0 → 跳过
+	}
+	disc := config.DefaultDisciplineConfig()
+	logs := execLogsFromReal(positions, disc)
+	if len(logs) != 1 {
+		t.Fatalf("应映射 1 条 ExecLog（Qty≤0 跳过）, got %d", len(logs))
+	}
+	if logs[0].TakeProfitPct != 15 || logs[0].StopLossPct != 6 {
+		t.Fatalf("统一纪律应写 止盈15/止损6, got %.0f/%.0f", logs[0].TakeProfitPct, logs[0].StopLossPct)
+	}
+	// 空配置兜底出厂默认
+	zero := execLogsFromReal(positions, config.DisciplineConfig{})
+	if zero[0].TakeProfitPct != 15 || zero[0].StopLossPct != 6 {
+		t.Fatalf("空纪律应兜底 止盈15/止损6, got %.0f/%.0f", zero[0].TakeProfitPct, zero[0].StopLossPct)
+	}
+	// 自定义纪律（后台可配）取值生效
+	custom := config.DefaultDisciplineConfig()
+	custom.TakeProfitPct, custom.StopLossPct = 20, 8
+	cc := execLogsFromReal(positions, custom)
+	if cc[0].TakeProfitPct != 20 || cc[0].StopLossPct != 8 {
+		t.Fatalf("自定义纪律应写 止盈20/止损8, got %.0f/%.0f", cc[0].TakeProfitPct, cc[0].StopLossPct)
+	}
+}
+
 // stringsContains 手写子串包含判断（测试断言辅助，避免依赖标准库 strings 之外行为）。
 func stringsContains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || indexOf(s, sub) >= 0)

@@ -125,6 +125,9 @@ type PaperConfig struct {
 	// alerts close paper positions automatically; when off, sells stay reminder-only (manual).
 	// 自动卖出
 	AutoSell *bool `json:"auto_sell,omitempty"`
+	// Discipline 统一止盈止损纪律（探针+扳机）参数。实盘与模拟盘共用同一套口径。
+	// English: unified stop-loss/take-profit discipline (probe+trigger) parameters; shared by real and paper.
+	Discipline DisciplineConfig `json:"discipline,omitempty"`
 }
 
 // QMTAdviceConfig 持仓处理分析层（实盘持仓）规则参数：加仓/格局判定阈值。
@@ -211,6 +214,9 @@ type QMTConfig struct {
 	// Advice 持仓处理分析层（实盘持仓）规则参数。
 	// 持仓处理分析层规则参数
 	Advice QMTAdviceConfig `json:"advice"`
+	// Discipline 统一止盈止损纪律（探针+扳机）参数，实盘与模拟盘共用同一套口径。
+	// English: unified stop-loss/take-profit discipline (probe+trigger) params, shared with the paper book.
+	Discipline DisciplineConfig `json:"discipline,omitempty"`
 	// Halted §R4-1 kill-switch（人工紧急停止）：true 时拒绝一切新下单（auto 与手动全路径），
 	// 已报未成交委托由撤单闭环/停机清单处理。经 POST /api/qmt/halt 切换并持久化。
 	// English: §R4-1 kill switch — when true every new order (auto & manual) is rejected;
@@ -225,6 +231,33 @@ type QMTConfig struct {
 	// English: §R4-1 close-list time (Beijing HHMM) — cancels all unfilled 已报 orders of the day
 	// (0 = default 1452; -1 disables).
 	CloseSweepAt int `json:"close_sweep_at"`
+}
+
+// DisciplineConfig 统一止盈止损纪律参数（探针5s扫描 + 扳机确认窗）。
+// 判定线全部相对买入价：止损-6 / 止盈+15 / 移动止盈=最高价-6（突破+15后动态上移）/ 深破=-12(2×止损线)。
+// 触发后进入固定观察窗（不滚动）：窗内持续有同向信号→跟随；窗结算仍无信号→离场。
+// 实盘与模拟盘统一严格执行；战法自带止盈止损降级为触发通知。
+type DisciplineConfig struct {
+	// 止损线（%）：浮亏达此值触发止损判定（默认 6）
+	StopLossPct float64 `json:"stop_loss_pct"`
+	// 止盈线（%）：盈利达此值触发止盈判定（默认 15）
+	TakeProfitPct float64 `json:"take_profit_pct"`
+	// 移动止盈最大回撤（%）：突破止盈线后，按最高价-此值动态上移止盈点（默认 6）
+	MaxPullbackPct float64 `json:"max_pullback_pct"`
+	// 深破倍数：浮亏达 止损线×此倍数 触发深破判定（默认 2 → -12%），同样走观察窗确认
+	DeepStopMult float64 `json:"deep_stop_mult"`
+	// 低置信买入确认（分钟）：置信度<高置信阈值的买入信号需持续存在该时长才下单（默认 5）
+	BuyConfirmMin int `json:"buy_confirm_min"`
+	// 高置信买入观察（秒）：置信度≥高置信阈值的买入信号至少观察该秒数才下单（默认 30）
+	BuyConfirmHighSec int `json:"buy_confirm_high_sec"`
+	// 止损/止盈结算窗（分钟）：首触判定线锁死一个固定窗口，结算仍无信号即离场（默认 15）
+	ExitConfirmMin int `json:"exit_confirm_min"`
+	// 移动止盈洗盘过滤窗（分钟）：移动止盈用更长窗过滤主升浪中的回撤洗盘（默认 45，30-60 可选）
+	TrailConfirmMin int `json:"trail_confirm_min"`
+	// 探针频率（秒）：实时快照扫描间隔（默认 5）
+	ProbeSec int `json:"probe_sec"`
+	// 高置信度阈值（百分数）：≥此值视为高置信买入（默认 85）
+	HighConfThreshold float64 `json:"high_conf_threshold"`
 }
 
 // DefaultQMTConfig 返回 QMT 实盘配置出厂默认：enabled=false（默认关闭）、manual 半自动、对手价。
@@ -247,6 +280,7 @@ func DefaultQMTConfig() QMTConfig {
 			AddSignalActive:      true,
 			HoldMinProfitPct:     0,
 		},
+		Discipline: DefaultDisciplineConfig(),
 	}
 }
 
@@ -1754,9 +1788,27 @@ var DefaultRules = &Rules{
 		DailyDropAlertPct: 5,
 	},
 	Scheduler: DefaultSchedulerConfig(),
-	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000},
+	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000, Discipline: DefaultDisciplineConfig()},
 	QMT:       DefaultQMTConfig(),
 	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15},
+}
+
+// DefaultDisciplineConfig 统一止盈止损纪律的出厂默认（可后台配置覆盖）：
+// 止损-6 / 止盈+15 / 移动回撤-6 / 深破2×(-12) / 低置信买入确认5min / 高置信观察30s /
+// 止损止盈结算窗15min / 移动止盈洗盘过滤45min / 探针5s / 高置信阈值85。
+func DefaultDisciplineConfig() DisciplineConfig {
+	return DisciplineConfig{
+		StopLossPct:       6,
+		TakeProfitPct:     15,
+		MaxPullbackPct:    6,
+		DeepStopMult:      2,
+		BuyConfirmMin:     5,
+		BuyConfirmHighSec: 30,
+		ExitConfirmMin:    15,
+		TrailConfirmMin:   45,
+		ProbeSec:          5,
+		HighConfThreshold: 85,
+	}
 }
 
 // defaultStrategyConfig 四战法出厂默认参数（可在前端 Settings 调整并持久化）。
