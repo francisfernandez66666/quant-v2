@@ -2517,7 +2517,9 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 	}
 	for _, it := range items {
 		switch it.Level {
-		case "清仓", "止损", "止盈", "交易信号":
+		// 减仓=统一纪律"首触止损未深破→半平"，属保护性动作，同样需要强提醒
+		// English: 减仓/trim (first SL touch without deep breach → half out) is protective, alert too.
+		case "清仓", "止损", "止盈", "减仓", "交易信号":
 		default:
 			continue
 		}
@@ -2543,6 +2545,98 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 		// 同步转发到外部推送网关（若已配置），让关键提醒触达 APK 后台/离线场景
 		nt.PushGateway(msg)
 	}
+}
+
+// syncLiveAdviceAlerts 把实盘持仓分析建议（统一纪律裁决 Source=discipline + 常规卖出侧）中的
+// 止损/止盈/减仓 转入消息中心，并触发 P1 桌面/Webhook/外部推送网关强提醒——**与 auto_sell 开关无关**：
+// 用户关闭自动交易（mode≠auto 或 auto_sell=false）时，实时持仓触发止盈/止损/减仓判定仍能收到强提醒，
+// 及时手动处理；自动模式开启时也同步下发"已触发自动卖出"便于核对成交。
+// 去重：私有作用域（Scope=主账号）+ 交易日键（u<uid>|discipline@码@类@日）——纪律在观察窗结算后
+// 每轮重复输出断言（auto 关闭、持仓未动）,靠交易日键阻止 5s 循环重复轰炸；跨交易日仍未处理的持仓
+// 会在新交易日再次提醒（与退出动作同 home 消息，同键刷新正文）。与主循环纸面告警键（code@级别）
+// 不冲突。正文携带 现价/盈亏/回撤 + 自动卖出开关状态，行情缺失（RefPrice=0）时按 §P2#25 不伪造现价。
+// English: routes live-position advices whose action is 止损/止盈/减仓 — from the unified-discipline
+// engine (Source=discipline) and the regular sell-side — into the message center and fires P1 desktop /
+// Webhook / push-gateway alerts regardless of the auto_sell switch: with auto trading off, a live holding
+// tripping TP/SL/trim still gets a strong reminder to act manually; when auto is on it also announces
+// "已触发自动卖出" so fills can be double-checked. Dedup: private scope (Scope=primary account) plus a
+// trading-day key — the discipline re-asserts its decision every round once settled (holding untouched
+// with auto off), so the day key blocks 5s-loop spam while re-alerting on a fresh trading day when the
+// position is still unhandled. No key clash with main-loop paper alerts (code@level). The body carries
+// price / P&L / drawdown and the auto-sell state; missing quotes (RefPrice=0) never fake a price (§P2#25).
+func (e *Engine) syncLiveAdviceAlerts(sendTo string, advices []trading.PositionAdvice, autoActive bool) {
+	if e.msgStore == nil || len(advices) == 0 {
+		return
+	}
+	now := time.Now()
+	day := data.TradingDayDate(now)
+	idPrefix := "discipline@"
+	if sendTo != "" {
+		idPrefix = "u" + sendTo + "|discipline@"
+	}
+	items := make([]data.MessageItem, 0, len(advices))
+	for _, a := range advices {
+		switch a.Action {
+		case "止损", "止盈", "减仓":
+		default:
+			continue // 加仓/格局/持有 不提醒
+		}
+		name := a.Name
+		if name == "" {
+			name = a.Code
+		}
+		var b strings.Builder
+		b.WriteString("[")
+		if a.RefPrice > 0 {
+			fmt.Fprintf(&b, "现价:%.2f", a.RefPrice)
+			if math.Abs(a.ProfitPct) > 0.001 {
+				fmt.Fprintf(&b, " 盈亏:%+.2f%%", a.ProfitPct)
+			}
+			if math.Abs(a.DrawdownPct) > 0.001 {
+				fmt.Fprintf(&b, " 回撤:%+.2f%%", a.DrawdownPct)
+			}
+		} else {
+			b.WriteString("现价未知")
+		}
+		b.WriteString("]")
+		if a.Reason != "" {
+			b.WriteString(" ")
+			b.WriteString(a.Reason)
+		}
+		// 自动卖出开关状态提示：让用户立即知道系统是否已代执行/需手动处理
+		// English: surface auto-sell state so the user knows whether the system already acted.
+		if autoActive {
+			b.WriteString(" 【已触发自动卖出】")
+		} else {
+			b.WriteString(" 【自动卖出未开启，请手动处理】")
+		}
+		direction := "利空"
+		if a.Action == "止盈" {
+			direction = "利好"
+		}
+		items = append(items, data.MessageItem{
+			ID:          fmt.Sprintf("%s%s@%s@%s", idPrefix, a.Code, a.Action, day),
+			Scope:       sendTo,
+			Code:        a.Code,
+			Name:        name,
+			Level:       a.Action,
+			Action:      "卖出",
+			Strategy:    a.Strategy,
+			Time:        a.GeneratedAt.Format("15:04:05"),
+			Title:       fmt.Sprintf("%s %s", a.Action, a.Name),
+			Body:        b.String(),
+			Direction:   direction,
+			GeneratedAt: a.GeneratedAt,
+		})
+	}
+	if len(items) == 0 {
+		return
+	}
+	// 与 syncMessages 同序：先判新推送（P1 桌面/Webhook + SSE），后合并入库（下一轮同键即"已存在"静默）
+	// English: same order as syncMessages — push first (P1 + SSE), then persist; next round the key exists so it stays quiet.
+	e.pushCriticalAlerts(items)
+	e.pushSSEMessages(items)
+	e.msgStore.Sync(items)
 }
 
 // SetScanner 设置板块扫描器（线程安全，透传给策略引擎）。

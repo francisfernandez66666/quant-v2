@@ -43,6 +43,8 @@ const STORAGE_KEY = 'liangzai_token'
 const STORAGE_SERVER = 'liangzai_server_url'
 const STORAGE_ACCOUNT = 'liangzai_account'
 const STORAGE_ROLE = 'liangzai_role'
+// STORAGE_ROLE 存储当前登录账号角色（admin/member），角色位图随登录响应写入
+// STORAGE_ROLE holds the logged-in account role (admin/member); the role bitmap is written from the login response
 const STORAGE_PERMS = 'liangzai_perms'
 
 // 从 localStorage 读取服务器基础地址

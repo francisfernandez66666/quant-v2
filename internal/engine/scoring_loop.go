@@ -633,6 +633,14 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		e.autoExecuteRealSells(sendTo, ctrl, realStore, advices)
 	}
 
+	// §统一纪律补充（2026-09-08）：无论自动卖出开关，止损/止盈/减仓建议都进消息中心 + P1 强提醒。
+	// 用户关闭自动交易（mode≠auto / auto_sell=false）时，实时持仓触发止盈止损仍需强提醒手动处理；
+	// auto 开启时也提示"已触发自动卖出"，动作全程可核对。按 码@类@交易日 去重，5s 循环不重复轰炸。
+	// English: regardless of the auto-sell switch, 止损/止盈/减仓 advices also land in the message
+	// center with a P1 strong push — with auto trading off a live TP/SL/trim trip still demands manual
+	// handling; with auto on it confirms the sell fired. Deduped per code/class/trading-day.
+	e.syncLiveAdviceAlerts(sendTo, advices, ctrl.Enabled() && ctrl.Mode() == "auto" && ctrl.Config().AutoSell)
+
 	if len(advices) == 0 || sse == nil || sendTo == "" {
 		return
 	}
