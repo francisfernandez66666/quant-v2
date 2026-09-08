@@ -192,15 +192,18 @@ export default function KLineChart({
       lo = Math.min(prevClose * (1 - half), min - (max - min) * 0.05)
       hi = Math.max(prevClose * (1 + half), max + (max - min) * 0.05)
     } else {
+      // 无昨收基准：按高低点 ±6% 加安全边距，留出坐标刻度空间
       const pad = (max - min) * 0.06 || 0.01
       lo = min - pad
       hi = max + pad
     }
+    // 价格/MACD 纵坐标线性映射（像素↔数值）：值在上界映射顶、下界映射底
     const priceY = (v) => plotT + (hi - v) / (hi - lo) * priceH
     const macdLineY = (v, maxAbs, half) => macdZero - (v / maxAbs) * half
 
     const n = raw.length
     const step = plotW / n
+    // 横坐标：第 i 根 K 线柱中点（左边界 + 步长×i + 半柱宽）
     const cxOf = (i) => plotL + step * i + step / 2
 
     const points = raw.map((p, i) => ({ i, raw: p, cx: cxOf(i), yClose: priceY(p.close) }))
@@ -226,6 +229,7 @@ export default function KLineChart({
     // 成交量柱：按最大量归一化高度，红涨绿跌着色（相对昨收或相对开盘）
     const volBars = raw.map((p, i) => {
       const cx = cxOf(i)
+      // 柱高 = 成交量/池内最大量 × 区域高度
       const h = (p.volume / maxV) * volH
       const up = prevClose > 0 ? p.close >= prevClose : p.close >= p.open
       return { x: cx - vW / 2, w: vW, y: volBottom - h, h: Math.max(0.5, h), color: up ? C.volUp : C.volDown }
@@ -240,6 +244,7 @@ export default function KLineChart({
     const macdBars = raw.map((p, i) => {
       const cx = cxOf(i)
       const b = p.bar
+      // 柱高按最大绝对值归一化至半区高度，正负分绘上下半区
       const hgt = (Math.abs(b) / maxAbs) * half
       const y = b >= 0 ? macdZero - hgt : macdZero
       difCoords.push([cx, macdLineY(p.dif, maxAbs, half)])
@@ -399,11 +404,13 @@ export default function KLineChart({
       lo = Math.min(prevClose * (1 - half), mn - (mx - mn) * 0.05)
       hi = Math.max(prevClose * (1 + half), mx + (mx - mn) * 0.05)
     } else {
+      // 无昨收基准：按极值 ±6% 加安全边距（十字光标坐标范围）
       const pad = (mx - mn) * 0.06 || 0.01
       lo = mn - pad; hi = mx + pad
     }
     const plotW = contW - plotL - plotR
     const step = plotW / raw.length
+    // 十字光标探测用横/纵线性坐标映射（与绘制共用同一套像素基准）
     const cxOf = (i) => plotL + step * i + step / 2
     const priceY = (v) => plotT + (hi - v) / (hi - lo) * priceH
 

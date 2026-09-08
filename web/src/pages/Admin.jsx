@@ -87,6 +87,7 @@ function permLabel(p) {
 function fmtTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts * 1000)
+  // 两位补零（月/日展示）
   const p = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
@@ -359,6 +360,7 @@ export default function Admin() {
   const loadOpsDates = async () => {
     try {
       const res = await api.fetchOpslogDates()
+      // 仅取 dates 字段，缺失时按空数组处理
       const ds = (res && res.dates) || []
       setOpsDates(ds)
       return ds

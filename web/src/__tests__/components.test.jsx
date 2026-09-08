@@ -24,6 +24,7 @@ describe('ErrorBoundary', () => {
   })
 
   it('捕获错误后渲染兜底 UI', () => {
+    // 抛错子组件：验证 ErrorBoundary 捕获并展示兜底
     const Throw = () => {
       throw new Error('测试错误')
     }
@@ -37,6 +38,7 @@ describe('ErrorBoundary', () => {
   })
 
   it('自定义 fallback 为 React 节点', () => {
+    // 抛错子组件：验证 fallback 节点形态
     const Throw = () => {
       throw new Error('测试错误')
     }
@@ -49,6 +51,7 @@ describe('ErrorBoundary', () => {
   })
 
   it('自定义 fallback 为函数', () => {
+    // 抛错子组件：验证 fallback 函数接收 err 渲染
     const Throw = () => {
       throw new Error('函数错误')
     }

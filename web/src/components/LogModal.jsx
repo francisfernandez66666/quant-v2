@@ -134,6 +134,7 @@ export default function LogModal({ visible, onClose }) {
     if (!q) return []
     const groups = []
     for (const r of llmRecords) {
+      // 过滤命中关键字的本批次 LLM 阶段事件行
       const items = (r.stage2_events || []).filter((ev) => eventHit(ev, q))
       if (items.length) groups.push({ time: r.process_time, items })
     }
@@ -152,6 +153,7 @@ export default function LogModal({ visible, onClose }) {
     if (!q) return []
     const groups = []
     for (const r of sigRecords) {
+      // 过滤命中关键字且战法筛选通过的本批次信号行
       const items = (r.signals || []).filter((sg) => sigHit(sg, q) && sigMatchStrategy(sg))
       if (items.length) groups.push({ time: r.process_time, items })
     }

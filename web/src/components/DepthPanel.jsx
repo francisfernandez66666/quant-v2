@@ -100,6 +100,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
     const p = ob.price || 0
     const pc = ob.prev_close || 0
     if (!p || !pc) return '--'
+    // 涨跌幅百分比：(现价-昨收)/昨收×100
     const d = (p - pc) / pc * 100
     return (d >= 0 ? '+' : '') + d.toFixed(2) + '%'
   })()

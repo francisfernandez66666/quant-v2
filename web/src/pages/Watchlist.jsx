@@ -92,12 +92,14 @@ export default function Watchlist() {
         api.fetchSnapshot(), api.fetchWatchlist(), api.fetchEvaluations(),
       ])
       const wlStocks = (wl.stocks || []).map((c) => (typeof c === 'object' ? c : { code: c }))
+      // 归一为 {code} 形式的股票列表再取代码集合
       const codes = wlStocks.map((c) => c.code)
       if (!codes.length) { setStocks([]); return }
       const wlMap = {}
       wlStocks.forEach((c) => { wlMap[c.code] = c })
       const evMap = {}
       if (ev) ev.forEach((e) => { evMap[e.code] = e })
+      // 组装单行展示数据：名称/现价/涨跌幅，缺失字段回退兜底值
       const wlRow = (c) => {
         const code = typeof c === 'string' ? c : (c && c.code)
         return {

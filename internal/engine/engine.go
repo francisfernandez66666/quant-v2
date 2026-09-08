@@ -138,7 +138,8 @@ type Engine struct {
 	// paper book. Only active when qmt.enabled=true: reads real_positions for position advice, circuit
 	// breaking and auto-orders each 5s cycle.
 	qmtCtrl   *trading.Controller // QMT 执行控制器（下单/熔断/健康探测，可空=未启用）
-	realStore *store.DB           // 研究库（real_positions/orders/fills 实盘账本存取）
+	realStore *store.DB           // 实盘账本库（live.db：real_positions/orders/fills 存取）
+	d1Store   *store.DB           // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
 
 	// buyConfirmReal 实盘买入确认状态机（§统一纪律·探针+扳机）：code → 买入信号首次出现的探针时刻。
 	// 信号需连续存在到确认窗（低置信 BuyConfirmMin / 高置信 BuyConfirmHighSec）才允许 autoPlace，
@@ -671,13 +672,23 @@ func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, exi
 }
 
 // SetQMT 注入 QMT 实盘执行控制器与实盘账本 store（AUTO_TRADING_PLAN M1）。
-// qmtCtrl 可空（未启用）；realStore 为研究库句柄（real_positions 存取）。
+// qmtCtrl 可空（未启用）；realStore 为实盘账本库（live.db：real_positions/orders/fills 存取）。
 // English: injects the QMT live-trading controller and the real-book store (AUTO_TRADING_PLAN M1).
-// qmtCtrl may be nil (disabled); realStore is the research-DB handle (real_positions access).
+// qmtCtrl may be nil (disabled); realStore is the live-book DB handle (real_positions/orders/fills access).
 func (e *Engine) SetQMT(qmtCtrl *trading.Controller, realStore *store.DB) {
 	e.mu.Lock()
 	e.qmtCtrl = qmtCtrl
 	e.realStore = realStore
+	e.mu.Unlock()
+}
+
+// SetD1Store 注入 D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库；可空）。
+// 与实盘账本库（realStore）分离——live.db 隔离后 d1_scores 仍留研究库，避免跨库双写。
+// English: injects the D1-score history store (trading.db; may be nil). Kept separate from the live
+// book store — after the live.db split, d1_scores stay in the research DB to avoid cross-DB dual writes.
+func (e *Engine) SetD1Store(d1Store *store.DB) {
+	e.mu.Lock()
+	e.d1Store = d1Store
 	e.mu.Unlock()
 }
 
@@ -3032,9 +3043,11 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 历史 D1 方案B·攒数据：本轮真实 LLM 评分按日落库 d1_scores（幂等覆盖），
 	// 攒够数据后 N 形回放按触发日 JOIN 当日真实分。重试占位（RetryPending，分数 0）
 	// 不入库；落库失败仅记日志，绝不影响打分主流程。
+	// 存放库与实盘账本分离（e.d1Store）——d1_scores 属研究侧数据，落 trading.db 而非 live.db。
 	// English: persist this round's real LLM D1 scores per day (idempotent) so N-shape replay can
 	// later join the real trigger-day score. Retry placeholders are skipped; failures only log.
-	if e.realStore != nil && len(d1Scores) > 0 {
+	// Routes to the dedicated D1 store (trading.db), separate from the live book store.
+	if e.d1Store != nil && len(d1Scores) > 0 {
 		rows := make([]store.D1ScoreRow, 0, len(d1Scores))
 		for code, d := range d1Scores {
 			if d.RetryPending {
@@ -3042,7 +3055,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			}
 			rows = append(rows, store.D1ScoreRow{Code: code, Score: d.Score, Blocked: d.Blocked, Reason: d.Reason})
 		}
-		if err := e.realStore.UpsertD1Scores(time.Now().Format("2006-01-02"), rows); err != nil {
+		if err := e.d1Store.UpsertD1Scores(time.Now().Format("2006-01-02"), rows); err != nil {
 			log.Printf("[engine] D1 评分落库失败(不影响主流程): %v", err)
 		}
 	}
@@ -3216,7 +3229,10 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// near-realtime loop — keep take-profit/stop-loss/sell-point/emotion-retreat reminders, but emit no new
 	// buy/watch strategy signals. prevPass is maintained by filterTransitionSignals, so the first Pass
 	// after 13:00 re-flips normally.
-	if data.IsPreAfternoon(time.Now()) {
+	// 与下方的 BeforeOpenTrade 及近实时循环一致，统一走注入时钟 e.nowTime() 而非
+	// time.Now()：生产两者无异，但测试在线程注入确定时钟后不受真实钟点影响
+	//（否则 11:30-13:00 跑 e2e 会把全量信号稳定清空，制造时钟 flaky）。
+	if data.IsPreAfternoon(e.nowTime()) {
 		bullSignals = nil
 		bearSignals = nil
 	}

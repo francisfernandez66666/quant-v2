@@ -113,6 +113,7 @@ export default function MsgCenter() {
     if (!raw) return ''
     const d = new Date(raw)
     if (isNaN(d.getTime())) return raw // 已是可读字符串则原样返回
+    // 两位补零：月/日/时/分/秒统一两位展示
     const p = (n) => String(n).padStart(2, '0')
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
   }

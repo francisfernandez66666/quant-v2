@@ -750,8 +750,16 @@ func (r *Registry) build(userID string) *Engine {
 				time.Duration(qmtCfg.TimeoutSec)*time.Second, 1)
 		}
 		ctrl := trading.NewController(exec, opts.RealStore, userID, qmtCfg, onAlert)
-		// 引擎侧 realStore 仅用于 D1 评分落库（d1_scores，研究侧数据），必须留在研究库而非 live.db。
-		e.SetQMT(ctrl, opts.D1Store)
+		// 引擎侧两个库职责分离（§UAT-2026-09-08 修复）：
+		//  - realStore = 实盘账本库（live.db）：pushRealAdvice 读 real_positions 生成建议/自动卖出；
+		//  - d1Store   = 研究库（trading.db）：d1_scores 历史落库（研究侧数据）。
+		// 旧实现把 D1Store 传入 SetQMT（第二参=realStore），导致 pushRealAdvice 从研究库读持仓
+		// 恒为 0——实盘止损/止盈/自动卖出/M8 链路静默失效。
+		// English: two stores with separate duties — realStore=live.db for real_positions (advice/auto-sell
+		// reads), d1Store=trading.db for d1_scores history. The old wiring passed D1Store as realStore,
+		// so pushRealAdvice read 0 positions and the live SL/TP/auto-sell/M8 chain silently stopped.
+		e.SetQMT(ctrl, opts.RealStore)
+		e.SetD1Store(opts.D1Store)
 	}
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)

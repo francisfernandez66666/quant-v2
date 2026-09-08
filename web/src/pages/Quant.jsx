@@ -60,6 +60,7 @@ function pnlColor(v) {
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
     let done = false
+    // resolve 一次性守卫：无论确认/取消/点遮罩先触发，首次结果生效
     const finish = (val) => {
       if (done) return
       done = true

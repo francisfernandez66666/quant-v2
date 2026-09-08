@@ -201,6 +201,7 @@ export default function App() {
         const code = msg.item.code || ''
         const name = msg.item.name || ''
         const title = level ? ('量仔 ' + level) : '量仔 提醒'
+        // 组装通知正文：代码+名称+标题/内容，按 (code@level) 做去重节流
         const body = (code ? code + ' ' : '') + (name || '') + (msg.item.title || msg.item.body || '')
         notifyThrottled(code + '@' + level, title, body)
       }

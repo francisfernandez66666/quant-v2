@@ -245,3 +245,98 @@ func TestHandleQMTReportOrderAdvancesStatus(t *testing.T) {
 	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
 	assertOrderStatus("已成")
 }
+
+// TestQMTTradesUnknownBasisSellNotCountedAsWin §2026-09-08 验证②：对账来源持仓（成交簿无买入
+// 记录）卖出时，成本基准不可得——旧实现 sellQty 被钳到 0 → pnl=0 → 一律 wins++，把亏损退出
+// 伪造成"胜"并吞掉已实现盈亏。视为缺陷：无基准退出不得计入胜/负，也不得伪造 realized。
+// English: sells of reconcile-seeded positions (no buy fill in the ledger) must not be reported
+// as a 0-PnL win — the exit has no cost basis in the fill replay and must be excluded from
+// win/loss and realized PnL rather than fabricated as a win.
+func TestQMTTradesUnknownBasisSellNotCountedAsWin(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+
+	// 对账来源持仓：成本 1500（UpsertRealPositions 仅对账写入，成交簿无买入）
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1500, Amount: 150000},
+	}); err != nil {
+		t.Fatalf("seed position: %v", err)
+	}
+	// 全仓卖出 @1318（真实亏损 -(1500-1318)*100=-18200），成交簿无对应买入
+	if err := db.ApplyRealFill(store.RealFill{
+		OrderID: "F-SELL-RECON", Code: "600519.SH", Side: "卖出",
+		Price: 1318, Qty: 100, Amount: 131800, TradedAt: "2026-09-07 14:00:00",
+	}); err != nil {
+		t.Fatalf("seed fill: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handleQMTTrades(rr, httptest.NewRequest(http.MethodGet, "/api/qmt/trades", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("trades HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Summary struct {
+			RealizedPnl float64 `json:"realized_pnl"`
+			Wins        int     `json:"wins"`
+			Losses      int     `json:"losses"`
+			TradeCount  int     `json:"trade_count"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if out.Summary.Wins != 0 || out.Summary.Losses != 0 {
+		t.Fatalf("无成本基准退出应不计胜/负, got wins=%d losses=%d", out.Summary.Wins, out.Summary.Losses)
+	}
+	if out.Summary.RealizedPnl != 0 {
+		t.Fatalf("无成本基准退出无法定价, realized 应为 0, got %v", out.Summary.RealizedPnl)
+	}
+	if out.Summary.TradeCount != 1 {
+		t.Fatalf("流水应计入该笔卖出, trade_count=%d", out.Summary.TradeCount)
+	}
+}
+
+// TestQMTTradesPartialSellUsesPositionCost §2026-09-08 验证②：对账来源持仓**部分卖出**且持仓仍
+// 存在时，超出成交簿买量的部分应借用当前账本成本定价（旧实现 sellQty 钳 0 → pnl=0 白记"胜"）。
+// 例：持仓 100@1500（对账来源），卖 40 @1400 → 应计已实现盈亏 (1400-1500)*40 = -4000 且计 1 亏。
+// English: partial sells of reconcile-seeded positions (position still on book) must price the share
+// portion beyond the ledger via the live-book cost basis instead of clamping PnL to a fabricated 0.
+func TestQMTTradesPartialSellUsesPositionCost(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+
+	// 对账来源持仓：成本 1500、数量 100（成交簿无买入记录）
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1500, Amount: 150000},
+	}); err != nil {
+		t.Fatalf("seed position: %v", err)
+	}
+	// 部分卖出 40 股 @1400（亏损 (1400-1500)*40=-4000），持仓剩 60@1500
+	if err := db.ApplyRealFill(store.RealFill{
+		OrderID: "F-SELL-PART", Code: "600519.SH", Side: "卖出",
+		Price: 1400, Qty: 40, Amount: 56000, TradedAt: "2026-09-07 14:10:00",
+	}); err != nil {
+		t.Fatalf("seed fill: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	s.handleQMTTrades(rr, httptest.NewRequest(http.MethodGet, "/api/qmt/trades", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("trades HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Summary struct {
+			RealizedPnl float64 `json:"realized_pnl"`
+			Wins        int     `json:"wins"`
+			Losses      int     `json:"losses"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if out.Summary.Losses != 1 || out.Summary.Wins != 0 {
+		t.Fatalf("亏损部分卖出应计 1 亏 0 胜, got wins=%d losses=%d", out.Summary.Wins, out.Summary.Losses)
+	}
+	if out.Summary.RealizedPnl != -4000 {
+		t.Fatalf("部分卖出已实现盈亏应=-4000(借用账本成本), got %v", out.Summary.RealizedPnl)
+	}
+}

@@ -51,6 +51,7 @@ function fmtTime(t) {
   if (!t) return '—'
   const d = new Date(t)
   if (isNaN(d)) return String(t).slice(5, 16)
+  // 两位补零：月/日/时/分/秒统一两位展示
   const p2 = (n) => String(n).padStart(2, '0')
   return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
 }
@@ -69,6 +70,7 @@ function pnlCls(v) { return v >= 0 ? 'up' : 'down' }
 // 计算买入成交价相对信号价的滑点
 function tradeSlippage(t) {
   if (t.side !== 'buy' || !(t.signal_price > 0)) return '—'
+  // 滑点百分比：(成交价-信号价)/信号价×100
   const pct = (t.price - t.signal_price) / t.signal_price * 100
   return (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%'
 }

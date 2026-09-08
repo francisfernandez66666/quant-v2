@@ -137,6 +137,7 @@ export default function Hotspot() {
     const s = String(dt)
     const d = /^\d+$/.test(s) ? new Date(Number(s) * 1000) : new Date(s)
     if (isNaN(d.getTime())) return s
+    // 两位补零：月/日/时/分/秒统一两位展示
     const p = (n) => String(n).padStart(2, '0')
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
   }
@@ -491,6 +492,7 @@ export default function Hotspot() {
               options={[
                 { label: `全部批次（信号 ${logSignals.length} 轮 / 分析 ${logStages.length} 轮）`, value: 'all' },
                 ...Array.from({ length: Math.max(logSignals.length, logStages.length) }, (_, i) => {
+                  // 每轮批次标签：优先信号流水时间，其次分析流水时间
                   const t = (logSignals[i] && logSignals[i].process_time) || (logStages[i] && logStages[i].process_time) || ''
                   return { label: `第 ${i + 1} 轮 · ${fmtLogTime(t)}`, value: String(i) }
                 }),

@@ -948,6 +948,18 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(fills, func(i, j int) bool { return fills[i].TradedAt < fills[j].TradedAt })
 
+	// 当前实盘账本持仓：①计算浮动盈亏（unrealized）；②为"对账来源持仓"（成交簿无买入记录）的
+	// 卖出提供成本基准（§2026-09-08 验证②）。
+	positions, err := db.RealPositionsForUser(uid)
+	if err != nil {
+		writeError(w, 500, "read positions: "+err.Error())
+		return
+	}
+	posCost := make(map[string]float64, len(positions))
+	for _, p := range positions {
+		posCost[p.TsCode] = p.CostPrice
+	}
+
 	// posState 持仓累计状态：数量 + 成本 + 归属战法。
 	type posState struct {
 		qty      int
@@ -998,12 +1010,26 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			if sellQty > ps.qty {
 				sellQty = ps.qty // 超卖钳制（与 ApplyRealFill 同口径）
 			}
-			pnl := (f.Price - ps.cost) * float64(sellQty)
-			realized += pnl
-			if pnl >= 0 {
-				wins++
-			} else {
-				losses++
+			sellPnl := (f.Price - ps.cost) * float64(sellQty)
+			// §2026-09-08 验证②修复：超出成交簿买量的部分（对账来源持仓）无重放成本基准——
+			// 旧实现 sellQty=0 → pnl=0 → 一律 wins++，把亏损退出伪造成"胜"并吞掉已实现盈亏。
+			// 改用当前实盘账本成本 pricing；账本亦无该持仓（已全仓卖光）则放弃定价，不计胜/负
+			// 与已实现盈亏——无基准的退出不应被当成结果计数。
+			extra := f.Qty - sellQty
+			pricable := sellQty > 0
+			if extra > 0 {
+				if pc, ok := posCost[f.Code]; ok {
+					sellPnl += (f.Price - pc) * float64(extra)
+					pricable = true
+				}
+			}
+			if pricable {
+				realized += sellPnl
+				if sellPnl >= 0 {
+					wins++
+				} else {
+					losses++
+				}
 			}
 			// 战法标签：卖出单无内嵌战法时沿用买入时状态，空回退 manual。
 			k := ps.strategy
@@ -1012,17 +1038,14 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			}
 			sellStat := statFor(k)
 			sellStat.Sells += amt
-			sellStat.Realized += pnl
+			if pricable {
+				sellStat.Realized += sellPnl
+			}
 			sellStat.Count++
 			ps.qty -= sellQty
 		}
 	}
 
-	positions, err := db.RealPositionsForUser(uid)
-	if err != nil {
-		writeError(w, 500, "read positions: "+err.Error())
-		return
-	}
 	unrealized := 0.0
 	for _, p := range positions {
 		unrealized += p.Amount - float64(p.Qty)*p.CostPrice

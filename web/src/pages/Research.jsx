@@ -577,6 +577,7 @@ export default function Research() {
       // 常量 rows：局部定义
       for (const r of rows) {
         const key = r.strategy_kind || r.strategy
+        // 期望值归一：undefined/null 视为未知，仅在更高时替换该战法最优记录
         const exp = (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null
         const prev = byKey.get(key)
         if (!prev || (exp !== null && (prev.bestExp === null || exp > prev.bestExp))) {

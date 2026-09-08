@@ -53,6 +53,7 @@ export function fmtTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts)
   if (isNaN(d.getTime())) return String(ts)
+  // 两位补零：月/日/时/分/秒统一两位数展示（如 09、05）
   const p = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
