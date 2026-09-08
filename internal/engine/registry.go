@@ -416,6 +416,56 @@ func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInf
 	}
 }
 
+// allPaperHeldCodes 聚合共享引擎服务的全部账号模拟盘持仓代码（含全局模板 opts.Paper 旧回退账本）。
+// 供 5s 监控池 base 重建（engine.syncMonitorBase）把每个账号的纸面持仓永久钉入行情监控。
+// §QUOTE_POOL_SPLIT 预创建：纸面引擎是懒加载的——若只读 r.papers，重启后未触发过 HTTP 的账号
+// 持仓会全部缺失，纸面持仓钉入监控将依赖前端轮询（脆弱）。故先对 auto-paper 账号锁外幂等
+// GetPaper（首轮即从磁盘恢复持仓），再聚合。所有 Positions() 读取在锁外（磁盘恢复 IO 不占全局锁）。
+// English: aggregates the paper-held codes of every account served by the shared engine, including the
+// global template opts.Paper (legacy fallback book), for the base-pool rebuild to pin all paper holdings
+// into perpetual quote monitoring. Eagerly creates (idempotent, outside the lock) the lazy paper engine
+// for each auto-paper account so restart-then-nothing-pinned cannot happen; all Positions() reads stay
+// outside the registry lock (disk-restore IO must not hold it).
+func (r *Registry) allPaperHeldCodes() []string {
+	r.mu.Lock()
+	var users []string
+	for _, us := range r.coreUsers {
+		users = append(users, us...)
+	}
+	tmpl := r.opts.Paper
+	r.mu.Unlock()
+	// 锁外预创建：让 auto-paper 账号的纸面引擎先落位（幂等，首轮即恢复磁盘持仓），
+	// 否则纸面持仓要等前端首次访问 /api/paper/* 才进监控池。
+	if tmpl != nil {
+		for _, uid := range users {
+			if r.isAutoPaper(uid) {
+				r.GetPaper(uid)
+			}
+		}
+	}
+	r.mu.Lock()
+	pes := make([]*paper.Engine, 0, len(r.papers)+1)
+	for _, pe := range r.papers {
+		pes = append(pes, pe)
+	}
+	r.mu.Unlock()
+	if tmpl != nil {
+		pes = append(pes, tmpl)
+	}
+	var out []string
+	for _, pe := range pes {
+		if pe == nil {
+			continue
+		}
+		for _, p := range pe.Positions() {
+			if p.Code != "" {
+				out = append(out, p.Code)
+			}
+		}
+	}
+	return out
+}
+
 // checkDayClose 每日盘后（交易日 15:00 后）首次调用时触发一次盘后导出 hook（当日成交 + 每日快照
 // 落研究库）。按账号记录导出日期，一天只导一次；幂等写入由 store 的唯一键保证。
 // English: fires the post-close export hook once per account per day — on the first call after 15:00 on a
@@ -714,6 +764,11 @@ func (r *Registry) build(userID string) *Engine {
 		},
 		func(quotes map[string]*data.StockInfo) { r.dispatchPaperMark(e, quotes) },
 	)
+	// §QUOTE_POOL_SPLIT: 注入全账号模拟盘持仓聚合——5s 监控池 base 重建（syncMonitorBase）把
+	// 每个账号的纸面持仓永久钉入行情监控，持仓估值/自动卖出不再因掉出 hot 池而缺行情。
+	// English: inject the all-accounts paper-held aggregator so the base-pool rebuild pins every
+	// account's paper holdings into perpetual quote monitoring.
+	e.SetPaperHeldCodesFn(r.allPaperHeldCodes)
 	// 实盘交易（AUTO_TRADING_PLAN M1）：QMT 执行控制器 + 实盘账本 store（独立于纸面账本）。
 	// 引擎每 5s 把 qmt 配置热同步给控制器（syncAccountConfig），熔断/健康探测随分析循环节流执行。
 	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the

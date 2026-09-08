@@ -68,6 +68,17 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		}
 	}()
 
+	// §QUOTE_POOL_SPLIT: 持仓池 base 重建放在会话门禁之前——盘后/休市也保持持仓池最新
+	// （自选∪实盘持仓∪全账号纸面持仓），次日开盘首个 cycle 即用最新 base 拉行情，无需等到盘中。
+	// English: rebuild the base "held pool" before the session gate so holdings stay pinned even
+	// after hours; the next open's first cycle fetches against the freshest base.
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f != nil {
+		e.syncMonitorBase()
+	}
+
 	// 交易时段门控（盘后/休市跳过，避免无效拉取）
 	// English: session gate — skip after-market/holiday to avoid pointless fetching.
 	if !data.IsActiveSession(time.Now()) {
@@ -87,7 +98,6 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	}
 
 	e.mu.RLock()
-	f := e.fetcher
 	emotionPhase := e.lastEmotionPhase // 复用主循环算出的情绪阶段，不重复调涨停池接口
 	d1Scores := e.lastD1Scores         // 复用主循环最近一轮 D1 评分，不每 5s 调 LLM
 	bearReasons := e.lastBearReasons   // FIX#13 复用主循环利空归因（实盘建议利空→自动清仓）
@@ -277,6 +287,12 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		}
 		// 模拟盘撮合：全量活跃 buy 信号 + 卖出侧纪律信号（止损/止盈/移动止盈/当日跌幅）。
 		// English: paper fill — full active buys + sell-side discipline signals (stop-loss/TP/trailing/daily-drop).
+		// §QUOTE_POOL_SPLIT: 撮合前先给缺行情的买入信号入池并供价——信号进确认窗即开始被监控，
+		// 确认窗满后用快照实时价撮合（实盘/模拟盘同段 buys 一并受益），消除"信号稳定却行情缺失"整轮拒绝。
+		// English: before filling, ensure buy-signal codes lacking a live quote are monitored & priced this
+		// round — a signal is observed from the start of its confirm window and filled at the fresh snapshot
+		// price once confirmed (paper and live both benefit), removing whole-round "signal present, no quote" rejects.
+		e.ensureBuyQuotes(buys, quotes)
 		exitSell := append(append([]combat_agent.Signal{}, exitSigs...), alertSigs...)
 		e.paperSignals(buys, exitSell, quotes)
 

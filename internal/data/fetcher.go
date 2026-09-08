@@ -245,6 +245,45 @@ func (f *Fetcher) HotStocks() []string {
 	return out
 }
 
+// Monitoring 报告某代码当前是否已在 5s 监控池（base ∪ hot 任一）。
+// 供引擎在"信号入池/持仓钉仓"时幂等判定：已监控则跳过冗余单查与重复加池。
+// English: reports whether a code is already in the live monitor pool (base ∪ hot),
+// letting the engine skip redundant single-fetches when ensuring a code into the pool.
+func (f *Fetcher) Monitoring(code string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, s := range f.baseStocks {
+		if s == code {
+			return true
+		}
+	}
+	for _, s := range f.hotStocks {
+		if s == code {
+			return true
+		}
+	}
+	return false
+}
+
+// SnapshotQuote 返回快照中某只股票的最新行情（锁内返回指针引用，按"存入后不可变"约定只读）。
+// 用于引擎把刚 EnsureStock 入池的信号股价格合并进本轮打分/撮合。
+// English: returns the snapshot quote for one code (pointer under lock, read-only per the
+// immutable-after-store convention) — used to merge a just-ensured signal's price into this round.
+func (f *Fetcher) SnapshotQuote(code string) *StockInfo {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.snapshot == nil {
+		return nil
+	}
+	return f.snapshot.Stocks[code]
+}
+
+// Quote 单查一只股票实时行情（走数据协调器统一降级链：同花顺→新浪→东财）。
+// English: fetches a fresh single-code quote via the unified source chain (THS→Sina→EastMoney).
+func (f *Fetcher) Quote(code string) (*StockInfo, error) {
+	return f.dc.GetQuote(code)
+}
+
 // StockCount 返回当前监控的股票总数（base + hot 去重后）。
 // StockCount returns the deduplicated count of monitored stocks (base + hot).
 func (f *Fetcher) StockCount() int {

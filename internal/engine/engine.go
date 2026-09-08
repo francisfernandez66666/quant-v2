@@ -128,6 +128,8 @@ type Engine struct {
 	paper            *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
 	paperOnSignals   func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
 	paperMarkFn      func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
+	paperHeldCodes   func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
+	lastBaseLog      time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
 	lastTrim         time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
 	reportTrimDone   map[string]string                                                                               // FIX#15 report 账本减仓去重：code → 交易日（autoExitReportSells 半仓每日一次）
 	reportTrimDoneMu sync.Mutex                                                                                      // reportTrimDone 互斥（主循环独占写，SSE/HTTP 可能读，防御性）
@@ -671,6 +673,16 @@ func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, exi
 	e.mu.Unlock()
 }
 
+// SetPaperHeldCodesFn 注入"全账号模拟盘持仓代码"聚合函数（多账号模式由注册表注入，
+// 用于 5s 监控池 base 重建时把纸面持仓永久钉入行情监控；nil=回退全局 e.paper 账本）。
+// English: injects the all-accounts paper-held-codes aggregator (wired by the registry in
+// multi-account mode; nil falls back to the global e.paper book).
+func (e *Engine) SetPaperHeldCodesFn(fn func() []string) {
+	e.mu.Lock()
+	e.paperHeldCodes = fn
+	e.mu.Unlock()
+}
+
 // SetQMT 注入 QMT 实盘执行控制器与实盘账本 store（AUTO_TRADING_PLAN M1）。
 // qmtCtrl 可空（未启用）；realStore 为实盘账本库（live.db：real_positions/orders/fills 存取）。
 // English: injects the QMT live-trading controller and the real-book store (AUTO_TRADING_PLAN M1).
@@ -1141,6 +1153,123 @@ func backfillPaperQuotes(e *Engine, pe *paper.Engine, quotes map[string]*data.St
 		}
 	}
 	return backed
+}
+
+// syncMonitorBase 重建 5s 监控池的 base（持仓池）：自选 ∪ 实盘持仓 ∪ 全部账号模拟盘持仓。
+// base 无上限、永不轮换——持仓/自选从此永远有 5s 实时行情（纸面估值、实盘建议 RefPrice、
+// 自动卖出行情依赖全部恒可用）；与"监控池 hot（≤60）只管潜在机会、可任意淘汰"彻底分离。
+// 每一轮近实时循环调用一次，覆盖盘中新买入/手动加仓（含手动录入模拟持仓）。
+// English: rebuilds the monitor-pool base ("held pool"): watchlist ∪ real held ∪ every account's
+// paper held. Base is uncapped and never rotated — held/watchlist codes always carry a live 5s quote
+// (paper valuation, live-advice RefPrice, auto-sell guards all stay warm), decoupled from the ≤60 hot
+// pool that only serves speculative candidates and may evict freely. Runs once per near-realtime cycle,
+// so intraday buys and manual entries are pinned the next tick.
+func (e *Engine) syncMonitorBase() {
+	e.mu.RLock()
+	f := e.fetcher
+	rpt := e.rpt
+	wl := e.wlMgr
+	paper := e.paper
+	heldFn := e.paperHeldCodes
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	set := make(map[string]bool)
+	wlN, rptN, paperN := 0, 0, 0
+	if wl != nil {
+		for _, c := range wl.All() {
+			if c != "" {
+				set[c] = true
+				wlN++
+			}
+		}
+	}
+	if rpt != nil {
+		for _, c := range rpt.HeldPositionCodes() {
+			if c != "" {
+				set[c] = true
+				rptN++
+			}
+		}
+	}
+	if heldFn != nil {
+		for _, c := range heldFn() {
+			if c != "" {
+				set[c] = true
+				paperN++
+			}
+		}
+	}
+	if paper != nil {
+		for _, p := range paper.Positions() {
+			if p.Code != "" {
+				set[p.Code] = true
+				paperN++
+			}
+		}
+	}
+	if len(set) == 0 {
+		return
+	}
+	codes := make([]string, 0, len(set))
+	for c := range set {
+		codes = append(codes, c)
+	}
+	sort.Strings(codes)
+	f.SetBaseStocks(codes)
+	// §QUOTE_POOL_SPLIT 观测：节流打印 base 构成（自选/实盘/纸面），线上确认持仓钉仓生效。
+	// English: throttled observation log — base composition (watchlist/real/paper) so ops can confirm pinning.
+	if time.Since(e.lastBaseLog) >= 60*time.Second {
+		e.lastBaseLog = time.Now()
+		log.Printf("[pool] 持仓池 base=%d (自选%d 实盘%d 纸面%d)", len(codes), wlN, rptN, paperN)
+	}
+}
+
+// SyncMonitorBase 导出持仓池 base 重建（供 main 盘后/休眠分支调用，保证盘后持仓变化亦即时入池；
+// 近实时打分循环被会话门禁拦截时，由主循环休眠分支每轮驱动）。
+// English: exported held-pool base rebuild — driven from main's after-hours sleep branch so holding
+// changes stay pinned even while the session-gated near-realtime loop is idle.
+func (e *Engine) SyncMonitorBase() { e.syncMonitorBase() }
+
+// ensureBuyQuotes 在本轮撮合前把"缺实时行情"的买入信号代码纳入监控并给本轮供价。
+// 时序修正（§QUOTE_POOL_SPLIT）：信号第一次进入买入确认窗那一刻即被 EnsureStock 永久钉入
+// base + 单查 + 合并快照，确认窗（高置信30s/低置信5min）内该股持续有真实行情，窗满后按快照
+// 实时价撮合。此前信号可以在打分池（fallback 单查行情）产生、撮合要求的快照池却无此股，
+// 导致"信号稳定却行情缺失"整轮拒绝（实盘/模拟盘同病）。已监控但本轮快照无有效价的再单查一次，
+// 仍取不到则保持缺失——由撮合侧"行情缺失跳过(不伪造成交)"守卫正常拒绝，不伪造价格。
+// English: before this round's fills, bring buy-signal codes lacking a live quote into the monitor
+// and price them this round: the moment a signal enters its confirm window it is permanently ensured
+// into base (single fetch + snapshot merge), so the confirm window (30s high / 5min low) observes real
+// quotes and the fill prices from the fresh snapshot — inverting the old timing where a signal could
+// originate in the scoring pool (fallback quote) yet be rejected at fill for the snapshot pool not
+// carrying it. If still unpriccable (upstream outage), the existing "missing-quote skip (never
+// fabricate)" guard rejects normally; no price is invented.
+func (e *Engine) ensureBuyQuotes(buys []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+	if len(buys) == 0 {
+		return
+	}
+	e.mu.RLock()
+	f := e.fetcher
+	e.mu.RUnlock()
+	if f == nil {
+		return
+	}
+	for _, sig := range buys {
+		if q := quotes[sig.Code]; q != nil && q.Price > 0 {
+			continue
+		}
+		if !f.Monitoring(sig.Code) {
+			f.EnsureStock(sig.Code)
+		}
+		if si := f.SnapshotQuote(sig.Code); si != nil && si.Price > 0 {
+			quotes[sig.Code] = si
+			continue
+		}
+		if si, err := f.Quote(sig.Code); err == nil && si != nil && si.Price > 0 {
+			quotes[sig.Code] = si
+		}
+	}
 }
 
 // SetFetcher 设置 5s 实时行情采集器（近实时打分循环的快照来源）。

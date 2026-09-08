@@ -506,6 +506,11 @@ func main() {
 			if !data.IsActiveSession(time.Now()) {
 				for _, e := range registry.All() {
 					e.TrimAfterHoursIfDue(time.Now())
+					// §QUOTE_POOL_SPLIT: 盘后也保持持仓池 base 最新（自选∪实盘∪纸面持仓钉仓），
+					// 次日开盘首个 cycle 直接用最新 base 拉行情，无需等到盘中才钉入。
+					// English: keep the held-pool base fresh after hours too, so the next open fetches
+					// against the latest base right away.
+					e.SyncMonitorBase()
 				}
 				d := data.DurationToNextActiveSession(time.Now())
 				if d > sleepChunk {
