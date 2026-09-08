@@ -54,8 +54,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import Store, is_placeholder_order_id  # noqa: E402
 from ids import Idempotency  # noqa: E402
-from broker import build_broker  # noqa: E402
-from handler import ReportHandler, periodic_reconcile  # noqa: E402
+from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
+from handler import ReportHandler, periodic_reconcile, is_active_trading_session  # noqa: E402
 
 # 模块级日志器
 log = logging.getLogger("qmt_gateway")
@@ -76,6 +76,10 @@ DEFAULT_CONFIG = {
     "xt_path": "",
     "session_id": 1,
     "reconnect_sec": 5,
+    # §QMT-DUAL 双路径参数
+    "failover_enable": False,           # 自动翻转开关（xt 断连 N 秒→queued，交易时段）
+    "failover_sec": 60,                 # xt 断连超过该秒数触发自动翻转
+    "bridge_heartbeat_timeout_sec": 15,  # 桥心跳新鲜窗口（超时视为离线）
 }
 
 
@@ -147,6 +151,9 @@ class Gateway:
     def __init__(self, cfg):
         """构造网关实例：组装本地账本 / 幂等守卫 / 交易通道 / 回报处理器四大组件。
 
+        §QMT-DUAL 双路径：broker 非 mock 时同时装配 XtBroker（xt 主）与 QueuedBroker
+        （queued 兜底），任一时刻仅 active 一个接单；active 由 config.broker 决定、
+        可经 /admin/broker 切换、交易时段 xt 断连可自动翻转。
         :param cfg: 已合并的配置字典（含 db/broker/report_url/report_token/user_id 等）。
         :ivar _stop: 停止信号 Event，供各后台线程（重连/对账/回报发送）优雅退出。
         """
@@ -154,17 +161,40 @@ class Gateway:
         # 组装四大核心组件：本地账本 / 幂等守卫 / 交易通道 / 回报处理器
         self.store = Store(cfg["db"])
         self.ids = Idempotency(self.store)
-        self.broker = build_broker(cfg)
         self.user_id = cfg.get("user_id", "")  # §P1-9 多账号归属：落库/上报统一带此 ID
         self.handler = ReportHandler(
             self.store, cfg.get("report_url", ""), cfg.get("report_token", ""), self.user_id,
         )
-        self.broker.handler = self.handler
+        # §QMT-DUAL 双通道装配：mock 单通道；xt/queued 双通道且 active 原子切换
+        self.active_broker, self.brokers, self.active_key = build_brokers(cfg, self.store)
+        for _b in self.brokers.values():
+            _b.handler = self.handler
         self._stop = threading.Event()
         self._reconcile_thread = None
         self._broker_thread = None
+        self._failover_thread = None
+        # xt 最近一次确认连接时间（自动翻转判定用；初始视为刚断开，避免一启动就误翻）
+        self._xt_last_connected = 0.0
         # 来源 IP 白名单（由 main 从环境变量 ALLOWED_IPS 注入；空列表表示不做 IP 限制，仅依赖 token）
         self.allowed_ips = []
+
+    def switch_broker(self, key, reason=""):
+        """原子切换 active 通道（xt/queued/mock）。返回 (ok:bool, err:str)。"""
+        if key not in self.brokers:
+            return False, "unknown broker: %s" % key
+        if key == self.active_key:
+            return True, ""
+        old = self.active_key
+        self.active_key = key
+        self.active_broker = self.brokers[key]
+        log.warning("[gateway] broker switched %s -> %s (%s)", old, key, reason or "manual")
+        # 推送 broker 变更事件到量仔（/api/qmt/report 未知 type 会被忽略，仅观察用）
+        try:
+            self.handler._push({"type": "broker", "broker": key, "from": old,
+                                "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+        except Exception:  # noqa: BLE001
+            log.exception("[gateway] push broker-change event failed")
+        return True, ""
 
     def start(self):
         """启动网关：清理崩溃残留 pending → 启动回报发送线程 → 后台连接 broker → 可选对账线程。
@@ -195,13 +225,21 @@ class Gateway:
         # 连接 broker（失败则后台重试，不阻塞 HTTP 起服）
         self._broker_thread = threading.Thread(target=self._connect_loop, daemon=True)
         self._broker_thread.start()
+        # §QMT-DUAL 自动翻转线程（xt 断连 N 秒且交易时段 → queued；切回仅手动）
+        self._failover_thread = threading.Thread(target=self._failover_loop, daemon=True)
+        self._failover_thread.start()
         if self.cfg.get("reconcile_sec", 0) > 0:
+            # active 通道运行时可变（自动翻转），对账源用 callable 取当前 active
             self._reconcile_thread = threading.Thread(
-                target=periodic_reconcile, args=(self.handler, self.broker),
+                target=periodic_reconcile, args=(self.handler, self._active_broker_fn),
                 kwargs={"interval_sec": self.cfg.get("reconcile_sec", 60), "stop": self._stop},
                 daemon=True,
             )
             self._reconcile_thread.start()
+
+    def _active_broker_fn(self):
+        """对账/重连循环取当前 active 通道（运行时切换后立即生效）。"""
+        return self.active_broker
 
     def stop(self):
         """优雅停止：置停止信号并停掉回报发送线程（重连/对账线程随之退出）。"""
@@ -209,46 +247,96 @@ class Gateway:
         self.handler.stop_sender()
 
     def _connect_loop(self):
-        """后台重连线程：通道未连接时循环重试 connect()，连上即推全量对账与账户资产。
+        """后台线程：主动重连 XtBroker；任一 active 通道从断开转连接时推一次对账与资产。
 
-        失败按 reconnect_sec 间隔重试直至进程停止；连上后立即上报持仓快照与可用资金，
-        使首尔侧快速对齐（空持仓快照由 handler.on_positions 守卫，不误清账本）。
-        English: background reconnect loop — retries connect() until the broker is up, then
-        pushes a full position reconciliation and account asset snapshot.
+        QueuedBroker 无需主动连接（在线由桥心跳驱动），其持仓/资产快照由桥经
+        /dispatch/result 周期上报。English: reconnect thread — retries XtBroker, and on a
+        disconnected→connected transition of the ACTIVE channel pushes a full position
+        reconciliation plus account asset so the decision side aligns fast.
         """
-        # 后台重连线程：通道断开时持续重试 connect()，直到进程停止
+        prev = {k: b.is_connected() for k, b in self.brokers.items()}
         while not self._stop.is_set():
-            if not self.broker.is_connected():
-                try:
-                    self.broker.connect()
+            # 主动重连：外部 xtquant 与 mock 需要主动 connect；queued 由桥心跳驱动
+            # （连接动作放在 sleep 之前，保证进程启动后立即触发，缩短首单等待）
+            for key, b in self.brokers.items():
+                if isinstance(b, QueuedBroker):
+                    continue
+                if not b.is_connected():
+                    try:
+                        b.connect()
+                        log.info("[gateway] broker %s connected", key)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("[gateway] %s connect failed: %s (retry %ss)",
+                                    key, e, self.cfg.get("reconnect_sec", 5))
+            for key, b in self.brokers.items():
+                conn = b.is_connected()
+                # 仅当 active 通道发生「断开→连接」转换时推一次全量对账 + 资产
+                if conn and not prev[key] and key == self.active_key:
                     self.handler.disconnected = False
-                    # 连上即推一次全量对账，首尔侧快速对齐（空快照由 on_positions 守卫）
-                    poss = self.broker.query_positions()
+                    poss = b.query_positions()
                     if poss:
                         self.handler.on_positions(poss)
                     else:
                         log.warning("[gateway] post-connect empty positions snapshot — "
                                     "reconcile skipped (account data may not be synced yet)")
-                    # 连上即推一次账户资产（可用资金等），首尔侧即时展示
-                    self.handler.on_account(self.broker.query_asset())
-                except Exception as e:  # noqa: BLE001
-                    log.warning("[gateway] broker connect failed: %s (retry %ss)", e,
-                                self.cfg.get("reconnect_sec", 5))
-                    time.sleep(self.cfg.get("reconnect_sec", 5))
-                    continue
+                    self.handler.on_account(b.query_asset())
+                prev[key] = conn
             time.sleep(1)
 
+    def _failover_loop(self):
+        """§QMT-DUAL 自动翻转循环：交易时段 + active=xt + 断连 ≥ failover_sec + 桥心跳新鲜
+        → 自动切 queued；切回仅手动（/admin/broker）。每 5s 轮询，异常不阻断。"""
+        while not self._stop.is_set():
+            time.sleep(5)
+            try:
+                self._maybe_failover()
+            except Exception:  # noqa: BLE001
+                log.exception("[gateway] failover loop error")
+
+    def _maybe_failover(self):
+        """自动翻转判定（见 _failover_loop 说明）。"""
+        if not self.cfg.get("failover_enable", False):
+            return
+        if self.active_key != "xt":
+            return  # 已在 queued，切回仅手动
+        if not is_active_trading_session():
+            return  # 非交易时段断连属预期（qmtctl 杀客户端），不翻转
+        xt = self.brokers.get("xt")
+        queued = self.brokers.get("queued")
+        if xt is None or queued is None:
+            return
+        now = time.time()
+        if xt.is_connected():
+            self._xt_last_connected = now
+            return
+        if self._xt_last_connected == 0.0:
+            self._xt_last_connected = now  # 启动后首次探测，先给观察窗口
+            return
+        if now - self._xt_last_connected < int(self.cfg.get("failover_sec", 60)):
+            return
+        if queued.is_connected():
+            self.switch_broker("queued", reason="auto-failover: xt disconnected %.0fs" %
+                               (now - self._xt_last_connected))
+
     def handle(self, method, path, body, request_handler):
-        """路由分发。返回 (status, payload_dict)。"""
+        """路由分发。返回 (status, payload_dict)。
+
+        §QMT-DUAL 新增 /dispatch/*（桥取单/回报，Bearer 鉴权）与 /admin/broker
+        （手动切换 active 通道）。下单/撤单/状态均路由到当前 active 通道。
+        """
         if path == "/health":
-            # ok=进程活着；broker_connected=通道真实状态（§修复 /health 说谎在线）
-            return 200, {
-                "ok": True,
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
-                "broker": self.cfg.get("broker", ""),
-                "broker_connected": bool(self.broker.is_connected()),
-            }
-        if not self.broker.is_connected():
+            # ok=进程活着；broker=active 通道名；broker_connected=active 通道真实状态；
+            # xt_connected/queued_connected 双状态供兜底可观测（§QMT-DUAL）
+            return 200, self._health_payload()
+        if path == "/dispatch/pending" and method == "GET":
+            return self._do_dispatch_pending()
+        if path == "/dispatch/result" and method == "POST":
+            return self._do_dispatch_result(body)
+        if path == "/admin/broker" and method == "POST":
+            return self._do_admin_broker(body)
+        if path == "/admin/status" and method == "GET":
+            return self._do_admin_status()
+        if not self.active_broker.is_connected():
             return 503, {"ok": False, "err": "broker not connected"}
         if path == "/order" and method == "POST":
             return self._do_order(body)
@@ -257,6 +345,173 @@ class Gateway:
         if path == "/state" and method == "GET":
             return self._do_state()
         return 404, {"ok": False, "err": "not found"}
+
+    def _health_payload(self):
+        """组装 /health 响应：active 通道状态 + 双通道（xt/queued）状态。"""
+        broker_connected = self.active_broker.is_connected()
+        payload = {
+            "ok": True,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "broker": self.active_key,
+            "broker_connected": bool(broker_connected),
+            "broker_mode": self.active_key,  # 与 Go 侧解析字段兼容的别名
+        }
+        if "xt" in self.brokers:
+            payload["xt_connected"] = bool(self.brokers["xt"].is_connected())
+        if "queued" in self.brokers:
+            payload["queued_connected"] = bool(self.brokers["queued"].is_connected())
+        return payload
+
+    def _do_dispatch_pending(self):
+        """桥取单（GET /dispatch/pending）：原子取 pending 项并标记 inflight。"""
+        items = self.store.dispatch_pending(limit=50)
+        return 200, {"ok": True, "items": items}
+
+    def _do_dispatch_result(self, body):
+        """桥回报（POST /dispatch/result）：结算派发项 + 按现有协议推量仔。
+
+        事件类型：order_result（下单结果）/ cancel_result / trade（成交）/
+        positions（持仓快照）/ account（资产快照）/ heartbeat（心跳）。
+        English: applies a bridge report — settles the dispatch row and routes the event
+        through the existing handler protocol to the decision side.
+        """
+        req = body or {}
+        etype = req.get("type", "")
+        try:
+            if etype == "heartbeat":
+                self.store.bridge_heartbeat()
+                return 200, {"ok": True, "err": ""}
+            if etype == "positions":
+                poss = req.get("positions") or []
+                self.store.bridge_snapshot_set("positions", poss)
+                self.handler.on_positions(poss)
+                return 200, {"ok": True, "err": ""}
+            if etype == "account":
+                asset = req.get("asset")
+                if asset:
+                    self.store.bridge_snapshot_set("asset", asset)
+                    self.handler.on_account(asset)
+                return 200, {"ok": True, "err": ""}
+            if etype == "order_result":
+                return self._apply_order_result(req)
+            if etype == "cancel_result":
+                return self._apply_cancel_result(req)
+            if etype == "trade":
+                return self._apply_trade(req)
+            return 400, {"ok": False, "err": "unknown dispatch result type: %s" % etype}
+        except Exception as e:  # noqa: BLE001
+            log.exception("[gateway] dispatch result failed: %s", etype)
+            return 500, {"ok": False, "err": "dispatch result error: %s" % e}
+
+    def _apply_order_result(self, req):
+        """下单结果回报：结算派发项；ok→已报（回填交易所委托号），失败→已废（带拒因）。"""
+        seq = str(req.get("seq", "") or "")
+        ok = bool(req.get("ok"))
+        order_id = str(req.get("order_id", "") or "")
+        err = str(req.get("err", "") or "")
+        row = self.store.dispatch_set_result(seq, {"ok": ok, "order_id": order_id, "err": err})
+        if row is None:
+            return 404, {"ok": False, "err": "unknown seq: %s" % seq}
+        signal_id = row.get("signal_id", "")
+        if not signal_id:
+            log.warning("[gateway] order_result without signal_id: seq=%s", seq)
+            return 200, {"ok": True, "err": ""}
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        if ok:
+            self.handler.on_order({
+                "order_id": order_id or seq, "signal_id": signal_id, "code": row.get("code"),
+                "side": row.get("side"), "status": "已报",
+                "price": float(row.get("price", 0) or 0), "qty": int(row.get("qty", 0) or 0),
+                "created_at": row.get("created_at") or ts, "at": ts,
+            })
+        else:
+            self.handler.on_order({
+                "order_id": seq, "signal_id": signal_id, "code": row.get("code"),
+                "side": row.get("side"), "status": "已废", "reason": err,
+                "price": float(row.get("price", 0) or 0), "qty": int(row.get("qty", 0) or 0),
+                "created_at": row.get("created_at") or ts, "at": ts,
+            })
+        return 200, {"ok": True, "err": ""}
+
+    def _apply_cancel_result(self, req):
+        """撤单结果回报：ok→已撤；失败→保持已报并透出原因。"""
+        seq = str(req.get("seq", "") or "")
+        ok = bool(req.get("ok"))
+        err = str(req.get("err", "") or "")
+        row = self.store.dispatch_set_result(seq, {"ok": ok, "err": err})
+        if row is None:
+            return 404, {"ok": False, "err": "unknown seq: %s" % seq}
+        signal_id = row.get("signal_id", "")
+        if not signal_id:
+            return 200, {"ok": True, "err": ""}
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        self.handler.on_order({
+            "order_id": row.get("order_id") or seq, "signal_id": signal_id, "code": row.get("code"),
+            "side": row.get("side"), "status": "已撤" if ok else "已报",
+            "price": 0.0, "qty": 0, "reason": err,
+            "created_at": row.get("created_at") or ts, "at": ts,
+        })
+        return 200, {"ok": True, "err": ""}
+
+    def _apply_trade(self, req):
+        """成交回报：走 handler.on_trade（落库去重 + 推送量仔），归因缺失用派发项回填。
+
+        成交隐含委托状态推进（部成/已成），与 mock/xt 回调口径一致——桥回报不含委托
+        状态事件，量仔侧需据此感知订单终结态。
+        """
+        if not req.get("signal_id"):
+            seq = str(req.get("seq", "") or "")
+            row = self.store.dispatch_get(seq) if seq else None
+            if row:
+                req["signal_id"] = row.get("signal_id", "")
+                req.setdefault("code", row.get("code", ""))
+                req.setdefault("side", row.get("side", ""))
+        self.handler.on_trade({
+            "order_id": req.get("order_id", ""), "trade_id": req.get("trade_id", ""),
+            "name": req.get("name", ""), "code": req.get("code", ""), "side": req.get("side", ""),
+            "price": float(req.get("price", 0) or 0), "qty": int(req.get("qty", 0) or 0),
+            "amount": float(req.get("amount", 0) or 0),
+            "traded_at": req.get("traded_at") or time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "signal_id": req.get("signal_id", ""),
+        })
+        # §QMT-DUAL 委托状态推进：按累计成交量对比申报量判已成/部成（对同一交易所委托号）
+        oid = str(req.get("order_id", "") or "")
+        prow = self.store.dispatch_by_order_id(oid) if oid else None
+        if prow and prow.get("signal_id"):
+            filled = self.store.order_filled_qty(oid)
+            order_qty = int(prow.get("qty", 0) or 0)
+            status = "已成" if filled >= order_qty else "部成"
+            self.handler.on_order({
+                "order_id": oid, "signal_id": prow.get("signal_id", ""),
+                "code": prow.get("code", ""), "side": prow.get("side", ""), "status": status,
+                "price": float(prow.get("price", 0) or 0), "qty": int(prow.get("qty", 0) or 0),
+                "created_at": prow.get("created_at", ""),
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            })
+        return 200, {"ok": True, "err": ""}
+
+    def _do_admin_broker(self, body):
+        """手动切换 active 通道（POST /admin/broker {"broker":"xt|queued"}）。"""
+        key = str((body or {}).get("broker", "") or "")
+        if key not in self.brokers:
+            return 400, {"ok": False, "err": "broker must be one of: %s" % ", ".join(self.brokers)}
+        ok, err = self.switch_broker(key, reason="admin")
+        if not ok:
+            return 409, {"ok": False, "err": err}
+        return 200, {"ok": True, "broker": key, "err": ""}
+
+    def _do_admin_status(self):
+        """观察端点（GET /admin/status）：active 通道、双通道在线态、派发队列统计。"""
+        payload = {
+            "ok": True,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "active": self.active_key,
+            "failover_enable": bool(self.cfg.get("failover_enable", False)),
+        }
+        payload["brokers"] = {k: bool(b.is_connected()) for k, b in self.brokers.items()}
+        if "queued" in self.brokers:
+            payload["dispatch"] = self.store.dispatch_stats()
+        return 200, payload
 
     def _do_order(self, body):
         """处理 POST /order 下单：参数校验 → 幂等占位 → 真实下单 → 回填委托号。
@@ -311,6 +566,7 @@ class Gateway:
             "created_at": req.get("created_at") or "",
             "user_id": self.user_id,  # §P1-9 多账号隔离归属
         }
+        _t0 = time.time()  # §PERF 下单 accept 延迟埋点（性能门禁 G3 数据源）
         claimed, existing = self.ids.claim(draft)
         # 没抢到占位 = 已下过（幂等返回）或正在下单中（409 防并发穿透）
         if not claimed:
@@ -321,7 +577,7 @@ class Gateway:
             # 幂等：已下过 → 返回原委托引用（不重复下单）
             return 200, {"ok": True, "order_id": oid, "err": ""}
 
-        ok, order_ref, err = self.broker.place_order(req)
+        ok, order_ref, err = self.active_broker.place_order(req)
         if not ok:
             # 失败释放占位，允许后续重试真正重新下单
             self.ids.release(signal_id)
@@ -333,6 +589,9 @@ class Gateway:
             "created_at": req.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
             "user_id": self.user_id,  # §P1-9 多账号隔离归属
         })
+        log.info("[gateway] order accept: signal=%s code=%s side=%s qty=%s ref=%s "
+                 "accept_ms=%.1f broker=%s", signal_id, code, side, qty, order_ref,
+                 (time.time() - _t0) * 1000, self.active_key)
         return 200, {"ok": True, "order_id": order_ref, "err": ""}
 
     def _do_cancel(self, body):
@@ -347,7 +606,7 @@ class Gateway:
         if not order_ref:
             return 400, {"ok": False, "err": "order_id required"}
         # §修复：撤单结果不再被吞——失败让首尔侧继续跟踪该委托并告警
-        ok, err = self.broker.cancel(order_ref)
+        ok, err = self.active_broker.cancel(order_ref)
         if ok:
             return 200, {"ok": True, "err": ""}
         return 409, {"ok": False, "err": err or "cancel failed"}
@@ -359,14 +618,17 @@ class Gateway:
         English: handles GET /state — returns connection state, account and all orders;
         positions are empty when the broker is disconnected (treated as untrusted snapshot).
         """
-        positions = self.broker.query_positions() if self.broker.is_connected() else []
+        positions = self.active_broker.query_positions() if self.active_broker.is_connected() else []
         orders = self.store.list_orders()
-        return 200, {
-            "connected": self.broker.is_connected(),
+        payload = {
+            "connected": self.active_broker.is_connected(),
             "account": self.cfg.get("account", ""),
             "positions": positions,
             "orders": orders,
         }
+        # §QMT-DUAL 透出 active 通道名，便于量仔/前端展示当前执行路径
+        payload["broker_mode"] = self.active_key
+        return 200, payload
 
 
 class _Handler(BaseHTTPRequestHandler):

@@ -228,3 +228,42 @@ func (c *QMTClient) healthOnce() (bool, error) {
 	}
 	return out.OK && out.BrokerConnected, nil
 }
+
+// GatewayBrokerStatus 网关双路径状态（§QMT-DUAL）：active 通道 + xt/queued 各自在线态。
+// English: dual-path gateway status — the active broker and per-channel liveness.
+type GatewayBrokerStatus struct {
+	OK              bool   `json:"ok"`
+	Broker          string `json:"broker"`
+	BrokerMode      string `json:"broker_mode"`
+	BrokerConnected bool   `json:"broker_connected"`
+	XTConnected     bool   `json:"xt_connected"`
+	QueuedConnected bool   `json:"queued_connected"`
+	FailoverEnable  bool   `json:"failover_enable,omitempty"`
+	Dispatch        any    `json:"dispatch,omitempty"`
+}
+
+// BrokerStatus 查询网关 active 通道与双路径状态（GET /health 字段解析）。
+// §QMT-DUAL：供 admin 切换按钮读取当前执行路径（miniqmt=xt / qmt=queued）。
+// English: reads the gateway's active broker and dual-path liveness from /health.
+func (c *QMTClient) BrokerStatus() (*GatewayBrokerStatus, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+	var out GatewayBrokerStatus
+	if err := c.do(ctx, http.MethodGet, "/health", nil, &out); err != nil {
+		return nil, err
+	}
+	// 兼容新老网关：broker_mode 是 broker 的别名，缺省回退 broker
+	if out.Broker == "" {
+		out.Broker = out.BrokerMode
+	}
+	return &out, nil
+}
+
+// SwitchBroker 切换网关 active 通道（POST /admin/broker，broker ∈ xt|queued）。
+// §QMT-DUAL：admin 兜底切换入口；仅切换网关侧，量仔契约不变。
+// English: switches the gateway's active broker (xt|queued) via /admin/broker.
+func (c *QMTClient) SwitchBroker(broker string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+	return c.do(ctx, http.MethodPost, "/admin/broker", map[string]string{"broker": broker}, nil)
+}

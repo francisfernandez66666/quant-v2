@@ -126,6 +126,34 @@ class Store:
                 user_id       TEXT,          -- P1-9：多账号隔离归属
                 trade_id      TEXT DEFAULT '' -- §G1（2026-08-29）：唯一成交编号，部成去重
             );
+            -- §QMT-DUAL 派发队列（QueuedBroker + qmt_bridge.py 兜底路径）：
+            -- 量仔下单先入此表，由 QMT 客户端内置策略桥消费执行；结果回填后按现有
+            -- orders/fills 账本 + outbox 回报量仔，HTTP 契约不变。
+            CREATE TABLE IF NOT EXISTS dispatch (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                seq         TEXT UNIQUE,          -- "seq:<id>" 不透明引用（量仔撤单锚点）
+                signal_id   TEXT DEFAULT '',
+                kind        TEXT DEFAULT 'order', -- order | cancel
+                code        TEXT DEFAULT '',
+                side        TEXT DEFAULT '',
+                price_type  TEXT DEFAULT '',
+                price       REAL DEFAULT 0,
+                qty         INTEGER DEFAULT 0,
+                strategy    TEXT DEFAULT '',
+                order_id    TEXT DEFAULT '',      -- 交易所委托号（order 结果回填，供撤单）
+                status      TEXT DEFAULT 'pending', -- pending|inflight|done
+                result      TEXT DEFAULT '',      -- JSON 结果（ok/err/order_id 等）
+                created_at  TEXT DEFAULT '',
+                user_id     TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_dispatch_status ON dispatch(status);
+            CREATE INDEX IF NOT EXISTS idx_dispatch_signal ON dispatch(signal_id);
+            -- §QMT-DUAL 桥状态：心跳 + 持仓/资产快照（QueuedBroker 只读，桥只写）
+            CREATE TABLE IF NOT EXISTS bridge_state (
+                key         TEXT PRIMARY KEY,
+                value       TEXT,
+                updated_at  TEXT
+            );
             """
         )
         self._conn.commit()
@@ -145,6 +173,35 @@ class Store:
                 # §修复 G1（2026-08-29）：唯一成交编号列，用于去重（避免部成重复丢单）
                 self._conn.execute(
                     "ALTER TABLE fills ADD COLUMN trade_id TEXT DEFAULT ''")
+        # §QMT-DUAL：老库补建派发队列与桥状态表（dispatch/bridge_state）
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS dispatch (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                seq         TEXT UNIQUE,
+                signal_id   TEXT DEFAULT '',
+                kind        TEXT DEFAULT 'order',
+                code        TEXT DEFAULT '',
+                side        TEXT DEFAULT '',
+                price_type  TEXT DEFAULT '',
+                price       REAL DEFAULT 0,
+                qty         INTEGER DEFAULT 0,
+                strategy    TEXT DEFAULT '',
+                order_id    TEXT DEFAULT '',
+                status      TEXT DEFAULT 'pending',
+                result      TEXT DEFAULT '',
+                created_at  TEXT DEFAULT '',
+                user_id     TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_dispatch_status ON dispatch(status);
+            CREATE INDEX IF NOT EXISTS idx_dispatch_signal ON dispatch(signal_id);
+            CREATE TABLE IF NOT EXISTS bridge_state (
+                key         TEXT PRIMARY KEY,
+                value       TEXT,
+                updated_at  TEXT
+            );
+            """
+        )
         self._conn.commit()
 
     # ── orders ──
@@ -256,6 +313,14 @@ class Store:
         with self._lock:
             cur = self._conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
             return cur.fetchone()
+
+    def order_filled_qty(self, order_id):
+        """该委托累计成交量（fills 求和，部成累计）。无成交返回 0。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT COALESCE(SUM(qty),0) AS q FROM fills WHERE order_id = ?",
+                (str(order_id),))
+            return int(cur.fetchone()["q"])
 
     def list_orders(self):
         """列出全部委托（按创建时间倒序），供 /state 端点返回。"""
@@ -493,6 +558,148 @@ class Store:
         """返回 outbox 当前待发条数（用于 sender 空队列等待判断）。"""
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) AS c FROM outbox").fetchone()["c"]
+
+    # ── §QMT-DUAL 派发队列（QueuedBroker 兜底路径）──
+    # 量仔 /order 在此入队，QMT 客户端内置策略桥（qmt_bridge.py）经 /dispatch/pending
+    # 取单执行、/dispatch/result 回报；网关把结果按现有 handler 协议推量仔，契约不变。
+
+    def dispatch_enqueue_order(self, req, user_id=""):
+        """把一笔待执行单写入派发队列，返回 "seq:<id>" 不透明引用。
+
+        幂等由上层 ids.claim（orders.signal_id UNIQUE）保证——同一 signal_id 重复
+        入队只会有一方进入（网关 /order 的 claim 段已在入队前完成互斥）。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO dispatch(seq, signal_id, kind, code, side, price_type,
+                                        price, qty, strategy, status, created_at, user_id)
+                   VALUES(?,?,?,?,?,?,?,?,?, 'pending', ?, ?)""",
+                ("", req.get("signal_id", ""), "order", req.get("code", ""),
+                 req.get("side", ""), req.get("price_type", ""),
+                 float(req.get("price", 0) or 0), int(req.get("qty", 0) or 0),
+                 req.get("strategy", ""), req.get("created_at", "") or _now_cn(), user_id))
+            rowid = cur.lastrowid
+            seq = "seq:%d" % rowid
+            self._conn.execute("UPDATE dispatch SET seq=? WHERE id=?", (seq, rowid))
+            self._conn.commit()
+            return seq
+
+    def dispatch_enqueue_cancel(self, order_ref, exchange_order_id, signal_id="",
+                                code="", side="", user_id=""):
+        """写入撤单请求，返回 "seq:<id>" 引用。
+
+        :param exchange_order_id: 要撤的交易所委托号（QueuedBroker 已解析，缺省则不可撤）。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO dispatch(seq, signal_id, kind, code, side, order_id,
+                                        status, created_at, user_id)
+                   VALUES(?,?,?,?,?,?, 'pending', ?, ?)""",
+                ("", signal_id, "cancel", code, side, exchange_order_id, _now_cn(), user_id))
+            rowid = cur.lastrowid
+            seq = "seq:%d" % rowid
+            self._conn.execute("UPDATE dispatch SET seq=? WHERE id=?", (seq, rowid))
+            self._conn.commit()
+            return seq
+
+    def dispatch_get(self, seq):
+        """按 seq 查派发项（含结果）。不存在返回 None。"""
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM dispatch WHERE seq = ?", (seq,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def dispatch_by_order_id(self, exchange_order_id):
+        """按交易所委托号反查派发项（桥回报成交归因用）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM dispatch WHERE order_id = ? ORDER BY id DESC LIMIT 1",
+                (str(exchange_order_id),))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def dispatch_pending(self, limit=50):
+        """原子取出 pending 派发项并标记 inflight（桥取单，防并发双执行）。返回 dict 列表。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dispatch WHERE status = 'pending' ORDER BY id LIMIT ?",
+                (limit,)).fetchall()
+            for r in rows:
+                self._conn.execute("UPDATE dispatch SET status = 'inflight' WHERE id = ?", (r["id"],))
+            self._conn.commit()
+            return [dict(r) for r in rows]
+
+    def dispatch_set_result(self, seq, result):
+        """结算派发项：status=done，result 合并写回，交易所委托号回填 order_id 列。"""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM dispatch WHERE seq = ?", (seq,)).fetchone()
+            if row is None:
+                return None
+            merged = {}
+            if row["result"]:
+                try:
+                    merged.update(json.loads(row["result"]))
+                except ValueError:  # noqa: BLE001 — 脏 result 行直接覆盖
+                    pass
+            merged.update(result)
+            oid = str(merged.get("order_id", "") or row["order_id"] or "")
+            self._conn.execute(
+                "UPDATE dispatch SET status='done', result=?, order_id=? WHERE id=?",
+                (json.dumps(merged, ensure_ascii=False, default=json_default), oid, row["id"]))
+            self._conn.commit()
+            return dict(row)
+
+    def dispatch_stats(self):
+        """派发队列统计（/admin/status 观察用）：pending/inflight/done 计数。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS c FROM dispatch GROUP BY status").fetchall()
+            return {r["status"]: r["c"] for r in rows}
+
+    # ── §QMT-DUAL 桥状态（心跳 + 快照）──
+
+    def bridge_heartbeat(self):
+        """桥心跳落库（epoch 秒，驱动 QueuedBroker.is_connected 新鲜度判定）。"""
+        with self._lock:
+            self._bridge_set("last_heartbeat", str(time.time()))
+
+    def bridge_connected(self, timeout_sec):
+        """桥是否在线：last_heartbeat 距今 ≤ timeout_sec。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM bridge_state WHERE key='last_heartbeat'").fetchone()
+            if row is None:
+                return False
+            try:
+                ts = float(row["value"])
+            except (TypeError, ValueError):  # noqa: BLE001
+                return False
+            return (time.time() - ts) <= float(timeout_sec or 0)
+
+    def bridge_snapshot_set(self, key, value):
+        """写桥快照（如 positions/asset 最新一次）。value 为可 JSON 序列化对象。"""
+        with self._lock:
+            self._bridge_set(key, json.dumps(value, ensure_ascii=False, default=json_default))
+
+    def bridge_snapshot_get(self, key, default=None):
+        """读桥快照；不存在/解析失败返回 default。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM bridge_state WHERE key=?", (key,)).fetchone()
+            if row is None:
+                return default
+            try:
+                return json.loads(row["value"])
+            except ValueError:  # noqa: BLE001
+                return default
+
+    def _bridge_set(self, key, value):
+        """桥状态 upsert（调用方须持 _lock）。"""
+        self._conn.execute(
+            "INSERT INTO bridge_state(key, value, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, _now_cn()))
+        self._conn.commit()
 
 
 def _now_cn():

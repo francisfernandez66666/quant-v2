@@ -389,12 +389,17 @@ class ReportHandler:
 
 def periodic_reconcile(handler, broker, interval_sec=60, stop=None):
     """周期全量对账：broker.query_positions() → handler.on_positions()；同时上报账户资产
-    （可用资金/冻结/总值/市值）→ handler.on_account()。stop 事件可退出。"""
+    （可用资金/冻结/总值/市值）→ handler.on_account()。stop 事件可退出。
+
+    broker 参数支持「通道实例」或「零参 callable 返回当前 active 通道」两种形态——
+    §QMT-DUAL 双路径下 active 通道可运行时切换，网关传入 callable 保证对账源实时正确。
+    """
     while not stop or not stop.is_set():
         time.sleep(interval_sec)
         try:
-            if broker.is_connected():
-                handler.on_positions(broker.query_positions())
-                handler.on_account(broker.query_asset())
+            b = broker() if callable(broker) else broker
+            if b.is_connected():
+                handler.on_positions(b.query_positions())
+                handler.on_account(b.query_asset())
         except Exception as e:  # noqa: BLE001
             log.warning("[handler] periodic reconcile failed: %s", e)

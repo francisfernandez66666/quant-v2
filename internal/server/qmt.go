@@ -901,6 +901,48 @@ func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
+// handleQMTBroker 返回网关 active 通道与双路径状态（GET /api/qmt/broker，登录可见）。
+// §QMT-DUAL：供 admin 面板读取当前执行路径（miniqmt=xt / qmt=queued）与兜底在线态。
+// 未接入实盘或网关不可达时返回 200 + {ok:false, err:...}（前端展示"未接入/不可达"）。
+// English: returns the gateway's active broker and dual-path liveness (GET /api/qmt/broker).
+func (s *Server) handleQMTBroker(w http.ResponseWriter, r *http.Request) {
+	ctrl := s.qmtCtrlFor(userIDFor(r))
+	if ctrl == nil {
+		writeJSON(w, 200, map[string]interface{}{"ok": false, "broker": "", "err": "not enabled"})
+		return
+	}
+	st, err := ctrl.GatewayBrokerStatus()
+	if err != nil {
+		writeJSON(w, 200, map[string]interface{}{"ok": false, "broker": "", "err": err.Error()})
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+// handleQMTBrokerSwitch 切换网关 active 通道（POST /api/qmt/broker，仅 admin）。
+// 请求体 {"broker":"xt"|"queued"}；xt=miniqmt 兼容主路径，queued=QMT 内置桥兜底。
+// English: admin-only gateway broker switch (POST /api/qmt/broker).
+func (s *Server) handleQMTBrokerSwitch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Broker string `json:"broker"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Broker) == "" {
+		writeError(w, 400, "invalid request body: 需要 {\"broker\":\"xt\"|\"queued\"}")
+		return
+	}
+	ctrl := s.qmtCtrlFor(userIDFor(r))
+	if ctrl == nil {
+		writeError(w, 503, "real book not available")
+		return
+	}
+	if err := ctrl.SwitchGatewayBroker(req.Broker); err != nil {
+		writeError(w, 502, "切换失败: "+err.Error())
+		return
+	}
+	opslog.Logf("quant", "admin 切换网关通道 -> %s 用户=%s", req.Broker, userIDFor(r))
+	writeJSON(w, 200, map[string]interface{}{"ok": "1", "broker": req.Broker})
+}
+
 // qmtStrategyOf 从 signal_id 解析战法归属：buy:<码>:<战法>:<日> → 战法名；其余（sell:/manual@）→ manual。
 // 卖出盈亏按持仓当前的入场战法归因（重放状态维护），卖出自身 signal_id 里的类目是退出原因而非来源战法。
 // English: derives the strategy tag from a buy signal_id; sells are attributed to the position's

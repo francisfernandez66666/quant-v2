@@ -92,6 +92,9 @@ function confirmDialog(body, header = '确认') {
  */
 export default function Quant() {
   const [state, setState] = useState(null)
+  // §QMT-DUAL 网关 active 通道与双路径状态（broker: xt=miniQMT兼容 / queued=QMT桥兜底）
+  const [broker, setBroker] = useState(null)
+  const [switchingBroker, setSwitchingBroker] = useState(false)
   const cachedForm = readCachedForm()
   const [form, setForm] = useState(cachedForm || {
     enabled: false, mode: 'manual', price_type: 'market', auto_sell: false,
@@ -206,6 +209,33 @@ export default function Quant() {
     try { setState(await api.fetchQMTState()) } catch (_) {}
   }
 
+  // §QMT-DUAL 拉取网关 active 通道与双路径在线态（broker/xt_connected/queued_connected）
+  async function loadBroker() {
+    try { setBroker(await api.fetchQMTBroker()) } catch (_) {}
+  }
+
+  // §QMT-DUAL 切换网关 active 通道（xt=miniQMT兼容主路径 / queued=QMT内置桥兜底）。
+  // 切换执行路径属高危操作：二次确认后调用后端（仅 admin），成功后刷新状态。
+  async function switchBrokerTo(target) {
+    if (switchingBroker) return
+    if (broker && broker.broker === target) return  // 已在该通道，无需切换
+    const targetName = target === 'queued' ? 'QMT桥(兜底)' : 'miniQMT(兼容)'
+    if (!(await confirmDialog(
+      `确认将实盘执行路径切换为「${targetName}」？\n切换后新订单将走该通道；切回需再次手动操作。`,
+      '切换执行通道',
+    ))) return
+    setSwitchingBroker(true)
+    try {
+      await api.switchQMTBroker(target)
+      MessagePlugin.success(`已切换为${targetName}`)
+      await loadBroker()
+    } catch (e) {
+      MessagePlugin.error('切换失败：' + (e && e.message ? e.message : e))
+    } finally {
+      setSwitchingBroker(false)
+    }
+  }
+
   // 标记战法开关被改动
   function markStrategyDirty() { setStrategyDirty(true) }
 
@@ -298,6 +328,7 @@ export default function Quant() {
     loadState()
     // 链路状态每 10s 轮询一次（心跳/延迟/熔断实时性要求高）
     stateTimer.current = setInterval(loadState, 10000)
+    loadBroker()
     loadTrades()
     // 交易流水每 30s 轮询一次（成交频率低，降低刷新压力）
     tradesTimer.current = setInterval(loadTrades, 30000)
@@ -394,6 +425,23 @@ export default function Quant() {
             <span style={{ color: '#666' }}>链路状态加载中（若长期停留请检查网络/重新登录）</span>
           </div>
         )}
+        {/* §QMT-DUAL 执行路径切换：miniQMT(兼容主路径) ↔ QMT内置桥(兜底)。仅 admin 可操作（本页即管理员页）。 */}
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #eee', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 13 }}>
+          <span style={{ fontWeight: 600 }}>执行路径</span>
+          <span style={segBtn(broker && broker.broker === 'xt')} onClick={() => switchBrokerTo('xt')}>
+            miniQMT(兼容主路径)
+            {broker && <span style={{ fontSize: 11, opacity: 0.8, marginLeft: 4 }}>{broker.xt_connected ? '●在线' : '○离线'}</span>}
+          </span>
+          <span style={segBtn(broker && broker.broker === 'queued')} onClick={() => switchBrokerTo('queued')}>
+            QMT桥(兜底)
+            {broker && <span style={{ fontSize: 11, opacity: 0.8, marginLeft: 4 }}>{broker.queued_connected ? '●在线' : '○离线'}</span>}
+          </span>
+          {broker && broker.ok === false && (
+            <span style={{ color: '#e6a23c', fontSize: 12 }}>网关不可达：{broker.err || '未接入实盘'}</span>
+          )}
+          {switchingBroker && <span style={{ color: '#999', fontSize: 12 }}>切换中…</span>}
+          <span style={{ color: '#aaa', fontSize: 11 }}>切换仅影响执行通道，量仔信号决策不变；自动翻转在交易时段生效</span>
+        </div>
       </Card>
 
       <Card title="总开关与执行方式" style={{ marginBottom: 14 }}>

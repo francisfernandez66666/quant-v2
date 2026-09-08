@@ -12,5 +12,8 @@
   "seed": [
     { "ts_code": "600519.SH", "name": "贵州茅台", "qty": 100, "cost_price": 1500.0, "highest_price": 1500.0 },
     { "ts_code": "300750.SZ", "name": "宁德时代", "qty": 200, "cost_price": 180.0, "highest_price": 180.0 }
-  ]
+  ],
+  "failover_enable": true,
+  "failover_sec": 60,
+  "bridge_heartbeat_timeout_sec": 15
 }

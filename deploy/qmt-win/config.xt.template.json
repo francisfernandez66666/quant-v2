@@ -1,7 +1,7 @@
 {
   "listen": "0.0.0.0:8789",
   "token": "__TOKEN__",
-  "broker": "mock",
+  "broker": "xt",
   "account": "__ACCOUNT__",
   "user_id": "",
   "db": "data.db",
@@ -12,5 +12,8 @@
   "seed": [],
   "xt_path": "__XT_PATH__",
   "session_id": 1,
-  "reconnect_sec": 5
+  "reconnect_sec": 5,
+  "failover_enable": true,
+  "failover_sec": 60,
+  "bridge_heartbeat_timeout_sec": 15
 }

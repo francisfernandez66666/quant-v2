@@ -7,6 +7,7 @@
 package trading
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -978,4 +979,45 @@ func (c *Controller) Config() config.QMTConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.cfg
+}
+
+// gatewayClient 构建一个直连网关的临时客户端（读当前 cfg 的 gateway_url/token）。
+// §QMT-DUAL：broker 切换/状态读取不经过下单执行器抽象，独立建客户端避免耦合 Executor 接口。
+// English: builds a throwaway gateway client from the current config for broker status/switch,
+// bypassing the order executor abstraction.
+func (c *Controller) gatewayClient() *QMTClient {
+	c.mu.RLock()
+	cfg := c.cfg
+	c.mu.RUnlock()
+	if !cfg.Enabled || cfg.GatewayURL == "" {
+		return nil
+	}
+	return NewQMTClient(cfg.GatewayURL, cfg.Token, 8*time.Second, 0)
+}
+
+// GatewayBrokerStatus 查询网关 active 通道与双路径状态（§QMT-DUAL，admin 观察用）。
+// English: queries the gateway's active broker and dual-path liveness for admin observability.
+func (c *Controller) GatewayBrokerStatus() (*GatewayBrokerStatus, error) {
+	gc := c.gatewayClient()
+	if gc == nil {
+		return nil, errors.New("qmt not enabled or gateway_url not set")
+	}
+	return gc.BrokerStatus()
+}
+
+// SwitchGatewayBroker 切换网关 active 通道（xt=miniqmt / queued=qmt 桥），§QMT-DUAL admin 入口。
+// English: switches the gateway's active broker between xt (miniQMT) and queued (QMT bridge).
+func (c *Controller) SwitchGatewayBroker(broker string) error {
+	if broker != "xt" && broker != "queued" {
+		return fmt.Errorf("broker must be xt|queued, got %q", broker)
+	}
+	gc := c.gatewayClient()
+	if gc == nil {
+		return errors.New("qmt not enabled or gateway_url not set")
+	}
+	if err := gc.SwitchBroker(broker); err != nil {
+		return err
+	}
+	log.Printf("[trading] admin 切换网关 active 通道 -> %s (用户=%s)", broker, c.userID)
+	return nil
 }

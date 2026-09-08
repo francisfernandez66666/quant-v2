@@ -18,6 +18,8 @@
 #   LLM_MODEL        默认 THUDM/GLM-Z1-9B-0414
 #   DEPLOY_DIR       Windows 目录（默认 C:/opt/quant）
 #   DATA_DIR         数据目录（默认 C:/var/lib/quant-trading-v2）
+#   QMT_GATEWAY_DIR  qmt_gateway Python 网关目录（默认 C:/qmt/quant-trading-v2/qmt_gateway；
+#                    §QMT-DUAL 需同步含 qmt_bridge.py 的网关文件到此目录）
 #   MINIQMT_PATH     QMT 完整交易端 XtItClient.exe 路径（默认 C:/Program Files (x86)/东莞证券QMT实盘交易端/bin.x64/XtItClient.exe；
 #                    注意：必须是 XtItClient.exe——可自动登录交易；不能是 XtMiniQmt.exe，后者无法自动登录，
 #                    会导致 broker 永远连不上）
@@ -34,6 +36,7 @@ LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn/v1/chat/completions}"
 LLM_MODEL="${LLM_MODEL:-THUDM/GLM-Z1-9B-0414}"
 DEPLOY_DIR="${DEPLOY_DIR:-C:/opt/quant}"
 DATA_DIR="${DATA_DIR:-C:/var/lib/quant-trading-v2}"
+QMT_GATEWAY_DIR="${QMT_GATEWAY_DIR:-C:/qmt/quant-trading-v2/qmt_gateway}"
 MINIQMT_PATH="${MINIQMT_PATH:-C:/Program Files (x86)/东莞证券QMT实盘交易端/bin.x64/XtItClient.exe}"
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -67,6 +70,14 @@ $SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/
 $SCP deploy/qmt-win/register_engine_services.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # baostock sidecar
 $SCP cmd/pydata/server.py cmd/pydata/requirements.txt "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/pydata/"
+
+# ── 2b. 同步 qmt_gateway Python 网关（§QMT-DUAL：含 qmt_bridge.py 策略桥）──
+echo "[2b/5] 同步 qmt_gateway 到 $QMT_GATEWAY_DIR ..."
+$SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $QMT_GATEWAY_DIR | Out-Null\""
+$SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
+     qmt_gateway/store.py qmt_gateway/ids.py qmt_gateway/qmt_bridge.py \
+     qmt_gateway/config.bridge.example.json \
+     "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
 
 # ── 3. 数据目录 + 默认 config.json（影子模式：qmt.enabled=false）──
 echo "[3/5] 初始化数据目录 + 默认 config.json（影子模式）..."

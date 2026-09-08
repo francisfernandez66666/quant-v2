@@ -505,6 +505,20 @@ export async function fetchQMTState() {
   return request('/api/qmt/state')
 }
 
+/** 实盘：网关 active 通道与双路径状态（§QMT-DUAL） */
+/** Live: gateway active broker and dual-path liveness (miniQMT / QMT bridge) */
+// 对应 GET /api/qmt/broker，返回 { ok, broker, broker_connected, xt_connected, queued_connected }
+export async function fetchQMTBroker() {
+  return request('/api/qmt/broker')
+}
+
+/** 实盘：切换网关 active 通道（仅 admin；xt=miniQMT 兼容 / queued=QMT 内置桥兜底） */
+/** Live: switch gateway active broker (admin only) */
+// 对应 POST /api/qmt/broker，body { broker: 'xt' | 'queued' }
+export async function switchQMTBroker(broker) {
+  return request('/api/qmt/broker', { method: 'POST', data: { broker } })
+}
+
 /** 实盘配置：当前账号的实盘参数与战法白名单（token 脱敏回显） */
 /** Live config: account's trading params and strategy whitelist (token masked) */
 // 对应 GET /api/config/qmt，返回 { enabled, mode, gateway_url, token_masked, price_type,

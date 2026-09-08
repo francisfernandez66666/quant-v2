@@ -123,3 +123,56 @@ describe('api - 会话追踪', () => {
     expect(api.getLastSession()).toBe(5)
   })
 })
+
+describe('api - 网关执行通道（§QMT-DUAL）', () => {
+  // 统一 fetch mock：替换全局 fetch，返回可解析的两段式 Response（status/ok/json）
+  function mockFetchOk(payload, status = 200) {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => payload,
+    })
+  }
+
+  beforeEach(() => {
+    localStorage.clear()
+    vi.restoreAllMocks()
+  })
+
+  it('fetchQMTBroker 请求 GET /api/qmt/broker 并回传双路径状态', async () => {
+    const payload = { ok: true, broker: 'xt', xt_connected: true, queued_connected: false }
+    mockFetchOk(payload)
+    // 注入 token：request() 会附加 Authorization 头
+    localStorage.setItem('liangzai_token', 'test-token')
+
+    const st = await api.fetchQMTBroker()
+    expect(st).toEqual(payload)
+
+    const [url, opts] = global.fetch.mock.calls[0]
+    expect(url.endsWith('/api/qmt/broker')).toBe(true)
+    expect((opts && opts.method) || 'GET').toBe('GET')
+    expect(opts.headers.Authorization).toBe('Bearer test-token')
+  })
+
+  it('switchQMTBroker 提交 POST /api/qmt/broker 并携带目标通道', async () => {
+    const payload = { ok: '1', broker: 'queued' }
+    mockFetchOk(payload)
+
+    const res = await api.switchQMTBroker('queued')
+    expect(res).toEqual(payload)
+
+    const [url, opts] = global.fetch.mock.calls[0]
+    expect(url.endsWith('/api/qmt/broker')).toBe(true)
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({ broker: 'queued' })
+  })
+
+  it('fetchQMTBroker 网关不可达（ok=false）时原样回传，交由调用方展示', async () => {
+    const payload = { ok: false, broker: '', err: 'not enabled' }
+    mockFetchOk(payload)
+
+    const st = await api.fetchQMTBroker()
+    expect(st.ok).toBe(false)
+    expect(st.err).toBe('not enabled')
+  })
+})

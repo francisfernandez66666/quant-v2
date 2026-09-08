@@ -569,8 +569,131 @@ class MockBroker(Broker):
             }
 
 
+class QueuedBroker(Broker):
+    """§QMT-DUAL 本地派发队列通道（QMT 完整版内置策略桥兜底）。
+
+    量仔 /order 入本地 dispatch 表（返回 "seq:<n>" 占位引用），由跑在 QMT 客户端内置
+    "模型交易"环境里的 qmt_bridge.py 轮询消费并真实下单；结果经 /dispatch/result 回填，
+    网关按现有 handler 协议（order/trade/positions/account）推量仔，HTTP 契约不变。
+
+    在线判定 = 桥心跳新鲜度（bridge_state.last_heartbeat ≤ heartbeat_timeout_sec）；
+    持仓/资产 = 桥最近一次快照。撤单先解析 seq→交易所委托号（未回报前不可撤，与
+    XtBroker 语义一致）。English: the local dispatch-queue channel backing the QMT
+    in-client bridge; connectivity is heartbeat freshness, positions/asset come from the
+    bridge snapshot, and cancels resolve seq refs to exchange order ids first.
+    """
+
+    def __init__(self, store, account="", heartbeat_timeout_sec=15, user_id=""):
+        """构造本地派发队列通道。
+
+        :param store: 本地 SQLite 账本（Store 实例，dispatch/bridge_state 表）。
+        :param account: 券商资金账号（仅透出，实际执行在桥侧）。
+        :param heartbeat_timeout_sec: 桥心跳新鲜窗口（秒），超时视为离线。
+        :param user_id: 多账号归属标识（派发/落库统一携带）。
+        """
+        self.store = store
+        self.account = account
+        self.heartbeat_timeout_sec = heartbeat_timeout_sec
+        self.user_id = user_id
+        self.handler = None
+
+    def connect(self):
+        """桥在线由心跳驱动，connect 无需动作（幂等返回 True）。"""
+        return True
+
+    def is_connected(self):
+        """桥是否在线：心跳新鲜度。"""
+        try:
+            return bool(self.store.bridge_connected(self.heartbeat_timeout_sec))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def place_order(self, req):
+        """把订单写入派发队列，返回 (True, "seq:<n>", "")。"""
+        seq = self.store.dispatch_enqueue_order(req, user_id=self.user_id)
+        log.info("[queued] order enqueued %s seq=%s signal=%s", req.get("side"), seq,
+                 req.get("signal_id"))
+        return True, seq, ""
+
+    def cancel(self, order_id):
+        """把撤单请求写入派发队列。仅当交易所委托号已回报（或直接传入真实号）才可撤。"""
+        oid = str(order_id or "")
+        exchange_id, signal_id, code, side = self._resolve_cancel_target(oid)
+        if not exchange_id:
+            return False, "交易所委托号尚未回报，暂不可撤（%s）" % oid
+        seq = self.store.dispatch_enqueue_cancel(
+            oid, exchange_id, signal_id=signal_id, code=code, side=side, user_id=self.user_id)
+        log.info("[queued] cancel enqueued seq=%s target=%s", seq, exchange_id)
+        return True, ""
+
+    def _resolve_cancel_target(self, order_id):
+        """解析撤单目标：seq 占位 → 查派发项取交易所委托号；纯数字视为真实委托号。"""
+        if order_id.startswith(("seq:", "SEQ:", "pending:")):
+            row = self.store.dispatch_get(order_id)  # dispatch 表 seq 列存完整 "seq:<id>"
+            if row is None:
+                return "", "", "", ""
+            return (str(row.get("order_id", "") or ""), row.get("signal_id", ""),
+                    row.get("code", ""), row.get("side", ""))
+        try:
+            int(order_id)
+        except ValueError:
+            return "", "", "", ""
+        row = self.store.dispatch_by_order_id(order_id)
+        return (order_id, (row or {}).get("signal_id", ""),
+                (row or {}).get("code", ""), (row or {}).get("side", ""))
+
+    def query_positions(self):
+        """返回桥最近一次持仓快照（未同步返回空列表，调用方按不可信快照处理）。"""
+        return self.store.bridge_snapshot_get("positions") or []
+
+    def query_asset(self):
+        """返回桥最近一次账户资产快照（未同步返回 None）。"""
+        return self.store.bridge_snapshot_get("asset")
+
+    def subscribe(self):
+        """无回调订阅（结果经 /dispatch/result 回填）。"""
+        pass
+
+
+def build_brokers(cfg, store):
+    """§QMT-DUAL 按配置构建通道集合。
+
+    双通道模式（broker=xt|queued）：同时持有 XtBroker（外部 xtquant→客户端）与
+    QueuedBroker（派发队列→内置桥），任一时刻仅 active 一个接单；
+    broker=mock 时仅单 MockBroker（联调）。返回 (active_broker, brokers_dict, active_key)。
+    English: builds the broker set — dual-channel (xt + queued) for the compat+QMT
+    dual-path deployment, single MockBroker for local wiring; returns the active broker,
+    the full dict, and the active key.
+    """
+    kind = cfg.get("broker", "mock")
+    if kind == "mock":
+        mb = MockBroker(
+            account=cfg.get("account", "MOCK0001"),
+            delay_sec=cfg.get("mock_delay_sec", 1),
+            seed=cfg.get("seed", []),
+            account_init=float(cfg.get("account_init", 100000.0)),
+        )
+        return mb, {"mock": mb}, "mock"
+    xt = XtBroker(
+        account=cfg.get("account", ""),
+        session_id=cfg.get("session_id", 1),
+        path=cfg.get("xt_path", ""),
+        reconnect_sec=cfg.get("reconnect_sec", 5),
+    )
+    queued = QueuedBroker(
+        store,
+        account=cfg.get("account", ""),
+        heartbeat_timeout_sec=cfg.get("bridge_heartbeat_timeout_sec", 15),
+        user_id=cfg.get("user_id", ""),
+    )
+    brokers = {"xt": xt, "queued": queued}
+    active = kind if kind in brokers else "xt"
+    return brokers[active], brokers, active
+
+
 def build_broker(cfg):
-    """按配置构建通道：broker=xt → XtBroker；broker=mock → MockBroker（默认）。"""
+    """按配置构建单通道（mock 联调用）。broker=xt → XtBroker；broker=queued → 需 store，
+    此处仅构建 xt/mock（QueuedBroker 由 build_brokers 在网关装配时传入 store）。"""
     kind = cfg.get("broker", "mock")
     if kind == "xt":
         return XtBroker(

@@ -559,6 +559,9 @@ func (s *Server) registerRoutes() {
 	// §R4-1 kill-switch 与手动撤单（admin 权限：紧急停止/撤单属资损级操作）
 	s.mux.HandleFunc("POST /api/qmt/halt", s.adminMiddleware(s.handleQMTHalt))
 	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.adminMiddleware(s.handleQMTCancel))
+	// §QMT-DUAL：网关 active 通道（miniqmt=xt / qmt=queued）读取与切换（仅 admin）
+	s.mux.HandleFunc("GET /api/qmt/broker", s.adminMiddleware(s.handleQMTBroker))
+	s.mux.HandleFunc("POST /api/qmt/broker", s.adminMiddleware(s.handleQMTBrokerSwitch))
 	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
 	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
 	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))

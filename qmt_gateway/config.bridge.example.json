@@ -1,0 +1,9 @@
+{
+  "gateway_url": "http://127.0.0.1:8789",
+  "token": "change-me",
+  "account": "2069008957",
+  "poll_sec": 1.0,
+  "heartbeat_sec": 5.0,
+  "positions_sec": 30.0,
+  "dry_run": true
+}

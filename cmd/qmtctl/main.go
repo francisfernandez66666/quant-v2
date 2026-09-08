@@ -47,6 +47,11 @@ const qmtImage = "XtItClient.exe"
 // 会交由 XtMiniQmt.exe（极简交易端）常驻并自行退出——进程检测必须把两者都算上，
 // 否则 qmtctl 每 10 分钟都会误判"未运行"而重复拉起，把已登录的客户端顶掉线
 // （2026-08-31 广州机实障：XtMiniQmt 每 10 分钟被顶掉一次，broker 永远连不上）。
+// §QMT-DUAL 双路径：完整版客户端既承载外部 xtquant（miniqmt 兼容主路径）又跑
+// qmt_bridge 内置策略桥（QMT 兜底），任一模态下二者任一进程在即视为客户端在线——list
+// 保持两枚可执行名，兼容"mini 交棒"与"full 常驻"两种形态（券商 9/23 停 mini 后
+// XtMiniQmt.exe 不再存在，但保留条目无害）。readiness 的 broker 就绪检测走网关
+// /health broker_connected（= active 通道连通），自动翻转后即反映 QMT 桥通道。
 var qmtImages = []string{"XtItClient.exe", "XtMiniQmt.exe"}
 
 // 运行窗口：交易日 08:45（给 30 分钟登录+行情就绪到 9:15）~ 15:05（收盘后留 5 分钟缓冲再关）。
