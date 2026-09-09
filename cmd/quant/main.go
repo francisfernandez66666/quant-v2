@@ -520,6 +520,12 @@ func main() {
 			}
 			if !data.IsActiveSession(time.Now()) {
 				for _, e := range registry.All() {
+					// §修复 P2#23：休市/跨日也做交易日滚动清空，00:00 后即移除昨日固化信号，
+					// 无需等到次日第一个盘中 cycle（近实时循环在盘前休眠，主循环由这里补位）。
+					// English: P2#23 — run the trading-day rollover during off-hours too, so yesterday's
+					// pinned signals are cleared right after midnight (the scoring loop sleeps pre-open;
+					// this loop covers that window).
+					e.RolloverDayStores()
 					e.TrimAfterHoursIfDue(time.Now())
 					// §QUOTE_POOL_SPLIT: 盘后也保持持仓池 base 最新（自选∪实盘∪纸面持仓钉仓），
 					// 次日开盘首个 cycle 直接用最新 base 拉行情，无需等到盘中才钉入。

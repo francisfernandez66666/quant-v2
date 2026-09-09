@@ -100,6 +100,7 @@ type Engine struct {
 	signalRecPath string                   // 信号批次记录持久化文件路径
 	signalStore   *signalStore             // 当日战法信号固化存储（code@strategy 最近一次 Pass，跨重启恢复）
 	// English: pinned per-day signal store (latest Pass per code@strategy, restored across restarts)
+	storeDay string // §修复 P2#23：signalStore/signalRecords 已加载的交易日（YYYMMDD），跨日即清空避免昨日信号残留
 
 	msgStore      *data.MessageStore            // 消息中心持久化存储
 	consultStore  *data.ConsultStore            // 股票咨询对话持久化存储（跨交易日清空；accountsRoot 未注入时的共享回退）
@@ -458,6 +459,7 @@ func New(
 		signalRecords:    loadSignalRecords(signalRecPath),
 		signalRecPath:    signalRecPath,
 		signalStore:      newSignalStore(signalStorePath),
+		storeDay:         data.TradingDayDate(time.Now()), // 启动日即视为已加载日（新库只装当日），跨日才触发滚动清空
 		msgStore:         data.NewMessageStore(msgPath),
 		consultStore:     data.NewConsultStore(consultPath),
 		consultByUser:    make(map[string]*data.ConsultStore),
@@ -1624,6 +1626,30 @@ func (e *Engine) captureSignalRecords(rawCount int, signals []combat_agent.Signa
 	e.signalRecords = append(e.signalRecords, rec)
 	e.mu.Unlock()
 	e.persistSignalRecords()
+}
+
+// RolloverDayStores 交易日切巡查：跨 00:00 清空当日固化信号库与信号批次记录，
+// 防止昨日未再触发的 code@strategy 信号残留到新交易日（带旧时间戳继续展示，乃至被
+// 误当当日信号参与去重/下单幂等）。进程 24h 常驻，仅启动时按日加载不够，需每轮巡检。
+// English: trading-day rollover check — on midnight crossover, clears the pinned-signal store and the
+// batch log so yesterday's no-longer-refreshed code@strategy signals can't leak into the new day with
+// stale timestamps (or feed idempotency/dedup). The 24/7 process only loads per-day at startup, so the
+// day boundary needs per-round vigilance, not just init.
+func (e *Engine) RolloverDayStores() {
+	td := data.TradingDayDate(time.Now())
+	e.mu.Lock()
+	if e.storeDay == td {
+		e.mu.Unlock()
+		return
+	}
+	e.storeDay = td
+	e.mu.Unlock()
+	if e.signalStore != nil {
+		e.signalStore.ClearDay()
+	}
+	e.mu.Lock()
+	e.signalRecords = nil
+	e.mu.Unlock()
 }
 
 // GetAllNewsEvents 返回持久化到本地的全部已打标新闻事件，供 /api/news?all=true 展示。
@@ -3091,6 +3117,10 @@ func (e *Engine) HasNewNews() bool {
 // since 为本次追回起始时间，由调用方（主循环）根据市场时段计算。
 func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.StrategyResult {
 	t0 := time.Now()
+	// §修复 P2#23：主循环同样先做交易日滚动清空（双通道互补，防止仅近实时循环在休市期未跑时漏清）。
+	// English: P2#23 — also roll over the day stores at the top of the main loop (belt-and-braces with the
+	// scoring loop, in case the near-realtime channel idled over a holiday/weekend).
+	e.RolloverDayStores()
 	// 同步本账号配置（做多/做空开关 + 战法参数），保证账号内各设备一致
 	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
 	e.syncAccountConfig()
@@ -3661,16 +3691,19 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 16. SSE 广播通知前端（附信号摘要）
 	// bull/bear 只统计可操作买入（Action=="buy"）信号：watch/brief 观察信号仍进消息中心与信号列表，
 	// 但不计入浏览器通知数量，避免观察类信号频繁弹系统通知。
+	// §修复 P2#23：按 code 去重后计数（同票多战法只算一只），与 /api/signals 列表去重口径一致，
+	// 消除"toast 报 40+ 条但列表只有 21 条"的观感差异。
 	// English: bull/bear count only actionable buy (Action=="buy") signals — watch/brief observations still
 	// land in the message center and signal list, but aren't counted for browser notifications, so
-	// watch-only signals don't spam the system notification.
+	// watch-only signals don't spam the system notification. P2#23: dedup by code (a stock hit by several
+	// strategies counts once), matching the /api/signals list so the toast number lines up with the list.
 	_stepSSE := time.Now()
 	if e.sse != nil && e.sse.Len() > 0 {
 		payload := map[string]string{
 			"type":   "scan",
 			"status": "done",
-			"bull":   fmt.Sprintf("%d", countAction(bullSignals, "buy")),
-			"bear":   fmt.Sprintf("%d", countAction(bearSignals, "buy")),
+			"bull":   fmt.Sprintf("%d", countUniqueBuyCodes(bullSignals, "buy")),
+			"bear":   fmt.Sprintf("%d", countUniqueBuyCodes(bearSignals, "buy")),
 			"alert":  fmt.Sprintf("%d", len(alertSignals)),
 			"time":   time.Now().Format("15:04:05"),
 		}

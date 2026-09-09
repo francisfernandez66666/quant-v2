@@ -164,6 +164,26 @@ func (s *signalStore) List() []combat_agent.Signal {
 	return out
 }
 
+// ClearDay 交易日滚动清空：进程 24h 常驻跨 00:00 时调用，移除昨日固化信号与失效墓碑，
+// 并以当前交易日标记落盘，防止昨日未再触发的新 key 信号残留（带旧时间戳继续展示）。
+// （ClearDay wipes the pinned signals and tombstones on a trading-day rollover, then persists with
+// today's stamp, so yesterday's unre-freshed code@strategy signals can't linger with old timestamps.）
+func (s *signalStore) ClearDay() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.byKey) == 0 && len(s.invalidated) == 0 {
+		return
+	}
+	oldKeys := len(s.byKey)
+	s.byKey = make(map[string]combat_agent.Signal)
+	s.invalidated = make(map[string]bool)
+	log.Printf("[engine] 交易日滚动: 清空昨日固化信号 %d 组", oldKeys)
+	s.save()
+}
+
 // save 将当日固化信号写盘（覆盖写，交易日标记）。
 // English: writes the day's pinned signals to disk (overwrite, marked with the trading day).
 func (s *signalStore) save() {

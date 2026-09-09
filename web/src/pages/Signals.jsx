@@ -37,6 +37,22 @@ function chgColor(v) {
   return (v || 0) >= 0 ? '#e34d59' : '#00a870'
 }
 
+// 通用表头排序器工厂（§修复 P2#23 提取为纯函数，供排序单测覆盖）：
+// sorterStr 按字符串字段字典序比较（代码/名称/策略/产生时间，时间串 YYYY-MM-DD HH:MM:SS 字典序即时间序）；
+// sorterNum 按数值字段比较（现价/总分）。返回的排序器直接用于 TDesign 列配置 sorter 字段。
+// English: generic header-sorter factories (P2#23 extracted as pure functions for the sorting unit tests):
+// sorterStr compares a string field lexicographically (code/name/strategy/generated_at — the
+// "YYYY-MM-DD HH:MM:SS" timestamp string sorts correctly in lexicographic order); sorterNum compares a
+// numeric field (price/total score). Both plug straight into the TDesign column sorter config.
+export function sorterStr(key) {
+  return (a, b) => (a[key] || '').localeCompare(b[key] || '')
+}
+
+// English: numeric-field sorter factory (ascending; missing values treated as 0).
+export function sorterNum(key) {
+  return (a, b) => (a[key] || 0) - (b[key] || 0)
+}
+
 /**
  * 策略信号页面组件
  * 展示策略评级信号，支持等级/战法筛选、D1-D4 维度展示、买入/忽略、模拟买入与日志。
@@ -69,6 +85,11 @@ export default function Signals() {
   const visHandler = useRef(null)
   // SSE 订阅取消函数
   const unsubSSE = useRef(null)
+  // §修复 P2#23：受控排序——所有列可点击表头排序（此前表格完全没有 sorter，点表头无反应），
+  // 受控状态保证 5s 轮询整体替换信号列表时用户选择的排序不被重置。
+  // English: P2#23 — controlled sort so every column is header-sortable (previously the table had no
+  // sorters at all) and the user's chosen sort survives the 5s signal-list poll.
+  const [sort, setSort] = useState(null)
 
   // 从信号列表中提取全部战法名称作为筛选下拉选项
   const strategyOptions = Array.from(new Set(signals.map((s) => s.strategy).filter(Boolean)))
@@ -205,11 +226,12 @@ export default function Signals() {
 
   // 信号表格列定义：代码、名称、现价/涨跌、策略、总分、等级、
   // D1-D4 维度评分、分时展开按钮、买入/忽略/模拟买入/收藏操作
+  // 排序：代码/名称/策略/generated_at 字符串比较，现价/涨跌/总分数值比较（§修复 P2#23 补齐）
   const columns = [
-    { colKey: 'code', title: '代码', width: 90 },
-    { colKey: 'name', title: '名称', width: 100, cell: ({ row }) => row.name || '-' },
+    { colKey: 'code', title: '代码', width: 90, sorter: sorterStr('code') },
+    { colKey: 'name', title: '名称', width: 100, sorter: sorterStr('name'), cell: ({ row }) => row.name || '-' },
     {
-      colKey: 'price', title: '现价/涨跌', width: 130,
+      colKey: 'price', title: '现价/涨跌', width: 130, sorter: sorterNum('price'),
       cell: ({ row }) => (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
           <span>¥{(row.price || 0).toFixed(2)}</span>
@@ -219,15 +241,16 @@ export default function Signals() {
         </div>
       ),
     },
-    { colKey: 'strategy', title: '策略', width: 90, cell: ({ row }) => row.strategy },
+    { colKey: 'strategy', title: '策略', width: 90, sorter: sorterStr('strategy'), cell: ({ row }) => row.strategy },
     {
       // §FIX-0921 信号产生时间列（2026-09-01 用户需求）：展示信号生成时间戳，
       // 用户可判断信号新旧（此前只有现价/策略，无法区分是早盘还是午后产生的信号）
       colKey: 'generated_at', title: '产生时间', width: 155,
+      sorter: sorterStr('generated_at'),
       cell: ({ row }) => <span style={{ fontSize: 12, color: '#888' }}>{row.generated_at || '-'}</span>,
     },
     {
-      colKey: 'total_score', title: '总分', width: 70,
+      colKey: 'total_score', title: '总分', width: 70, sorter: sorterNum('total_score'),
       cell: ({ row }) => (row.total_score != null ? row.total_score.toFixed(0) : '—'),
     },
     {
@@ -327,6 +350,8 @@ export default function Signals() {
           rowKey="code"
           data={filteredSignals}
           columns={columns}
+          sort={sort}
+          onSortChange={(val) => setSort(val)}
           size="small"
           expandedRow={({ row }) => (
             <MinuteView code={row.code} name={row.name} />

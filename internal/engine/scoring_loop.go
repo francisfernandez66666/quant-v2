@@ -68,6 +68,12 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		}
 	}()
 
+	// §修复 P2#23：循环最前做交易日滚动清空（跨 00:00 后首个 5s 轮即清理昨日固化信号），
+	// 放在会话门禁之前——休市/跨日也执行，保证次日开盘看板即干净。
+	// English: P2#23 — run the trading-day rollover first each cycle (clears yesterday's pinned
+	// signals right after midnight), before the session gate so the next open's dashboard is clean.
+	e.RolloverDayStores()
+
 	// §QUOTE_POOL_SPLIT: 持仓池 base 重建放在会话门禁之前——盘后/休市也保持持仓池最新
 	// （自选∪实盘持仓∪全账号纸面持仓），次日开盘首个 cycle 即用最新 base 拉行情，无需等到盘中。
 	// English: rebuild the base "held pool" before the session gate so holdings stay pinned even
@@ -509,6 +515,24 @@ func countAction(sigs []combat_agent.Signal, action string) int {
 		}
 	}
 	return n
+}
+
+// countUniqueBuyCodes 统计做多/做空可操作买入信号各自覆盖的【去重股票数】。
+// §修复 P2#23：SSE toast 数字此前数的是原始信号条数——同一只股票会被多战法同时扫中，
+// 294 条原始信号去重后只有 76 只，与"信号列表（按 code 去重展示）"数量对不上
+// （用户反馈 toast 40+ 而列表仅 21 条）。改为按 code 去重后计数，口径与列表一致。
+// English: counts the DEDUPLICATED stock codes behind long/short actionable buy signals. The toast
+// previously counted raw signal rows — the same stock can be caught by several strategies at once
+// (294 raw rows → 76 unique codes), mismatching the code-deduped signal list. Dedup by code here so
+// the toast matches what the list shows.
+func countUniqueBuyCodes(sigs []combat_agent.Signal, action string) int {
+	seen := make(map[string]struct{})
+	for _, s := range sigs {
+		if s.Action == action && s.Code != "" {
+			seen[s.Code] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 // filterTransitionSignals 状态翻转去重（纯函数）：返回本轮应广播的信号 + 下一轮去重状态。

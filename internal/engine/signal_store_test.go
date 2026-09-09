@@ -189,6 +189,92 @@ func TestInvalidateBrokenSignalsSkipsHeld(t *testing.T) {
 	t.Fatal("已持有持仓的信号消息中心条目应保留")
 }
 
+// TestSignalStoreClearDay 验证交易日滚动清空：ClearDay 移除全部固化信号与墓碑，
+// 并落盘为当前交易日空桶（重载后不再带旧信号）。
+// English: TestSignalStoreClearDay verifies the trading-day rollover: ClearDay removes every pinned
+// signal and tombstone and persists an empty current-day bucket (a reload no longer sees stale signals).
+func TestSignalStoreClearDay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "signals.json")
+	s := newSignalStore(path)
+	at := time.Now()
+	s.Upsert([]combat_agent.Signal{
+		mkBuySig("600001", "n_shape", at),
+		mkBuySig("600002", "dragon", at),
+	})
+	s.Invalidate("600002", "dragon")
+	if len(s.List()) != 1 {
+		t.Fatalf("清空前应有 1 条信号, got %d", len(s.List()))
+	}
+
+	s.ClearDay()
+	if len(s.List()) != 0 {
+		t.Fatalf("ClearDay 后固化列表应为空, got %+v", s.List())
+	}
+	if s.IsInvalidated("600002", "dragon") {
+		t.Fatal("ClearDay 后墓碑应一并清空")
+	}
+
+	// 重载验证：文件已带当前交易日空桶，旧信号不再复活
+	s2 := newSignalStore(path)
+	if len(s2.List()) != 0 {
+		t.Fatalf("重载后不应有旧信号, got %+v", s2.List())
+	}
+}
+
+// TestEngineRolloverDayStores 验证跨日清理：昨日固化信号与信号批次记录在新交易日首轮即被清空，
+// 同日重复巡检是幂等空操作。
+// English: TestEngineRolloverDayStores verifies the cross-day cleanup: yesterday's pinned signals and
+// the batch log are cleared on the first cycle of the new trading day, and a same-day re-check is a no-op.
+func TestEngineRolloverDayStores(t *testing.T) {
+	e := invalidateTestEngine()
+	e.storeDay = "20260907" // 模拟上一个交易日（与真实当前日不同 → 应触发清空）
+	at := time.Now()
+	e.signalStore.Upsert([]combat_agent.Signal{mkBuySig("600001", "n_shape", at)})
+	e.signalRecords = append(e.signalRecords, combat_agent.SignalLog{ProcessTime: at})
+
+	e.RolloverDayStores()
+	if len(e.signalStore.List()) != 0 {
+		t.Fatalf("跨日首轮应清空昨日固化信号, got %+v", e.signalStore.List())
+	}
+	if len(e.signalRecords) != 0 {
+		t.Fatalf("跨日首轮应清空信号批次记录, got %d", len(e.signalRecords))
+	}
+	if e.storeDay == "20260907" {
+		t.Fatal("storeDay 应已推进到当前交易日")
+	}
+
+	// 同日再次调用 → 幂等，不影响已固化内容
+	day := e.storeDay
+	e.signalStore.Upsert([]combat_agent.Signal{mkBuySig("600002", "dragon", time.Now())})
+	e.RolloverDayStores()
+	if e.storeDay != day {
+		t.Fatalf("同日巡检不应改 storeDay: got %s want %s", e.storeDay, day)
+	}
+	if len(e.signalStore.List()) != 1 {
+		t.Fatalf("同日巡检不应清空今日信号, got %+v", e.signalStore.List())
+	}
+}
+
+// TestCountUniqueBuyCodes 验证 toast 计数口径：同票多战法去重只算一只，watch/brief 观察信号不计。
+// English: TestCountUniqueBuyCodes verifies the toast-count semantics: a stock caught by several
+// strategies counts once, and watch/brief observation signals are excluded.
+func TestCountUniqueBuyCodes(t *testing.T) {
+	at := time.Now()
+	sigs := []combat_agent.Signal{
+		mkBuySig("600001", "n_shape", at),
+		mkBuySig("600001", "dragon", at), // 同一只票第二个战法 → 去重
+		mkBuySig("600002", "dragon", at),
+		{Code: "600003", Strategy: "momentum", Action: "watch", GeneratedAt: at},             // 观察信号不计
+		{Code: "600004", Strategy: "n_shape", Action: "buy", Direction: "", GeneratedAt: at}, // 无方向但 buy → 计
+	}
+	if n := countUniqueBuyCodes(sigs, "buy"); n != 3 {
+		t.Fatalf("去重后应按 code 计 3 只, got %d", n)
+	}
+	if n := countAction(sigs, "buy"); n != 4 {
+		t.Fatalf("原始计数应 4 条（含重复票）, got %d", n)
+	}
+}
+
 // TestInvalidateBrokenSignalsSkipsShortAndMissing 验证：做空信号不受墓碑影响；
 // 行情缺失/价格无效时跳过（不误删），留待下一轮有数据再判。
 // English: TestInvalidateBrokenSignalsSkipsShortAndMissing verifies: short signals are not affected by the tombstone;

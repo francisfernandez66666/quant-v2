@@ -56,6 +56,9 @@ export default function Watchlist() {
   const [sheetStock, setSheetStock] = useState(null)
   // 轮询定时器（30s）
   const timer = useRef(null)
+  // §修复 P2#23：受控排序状态——点击表头排序后持久保留，避免 30s 数据轮询整体替换把排序重置
+  // English: P2#23 — controlled sort state keeps the user's column sort across the 30s data poll.
+  const [sort, setSort] = useState(null)
 
   // 初始化：读取缓存、加载数据、启动 30s 轮询
   useEffect(() => {
@@ -223,6 +226,8 @@ export default function Watchlist() {
           <Table
             data={sortedEvals}
             columns={columns}
+            sort={sort}
+            onSortChange={(val) => setSort(val)}
             rowKey="code"
             size="small"
             pagination={false}
