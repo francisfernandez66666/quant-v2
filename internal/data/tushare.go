@@ -196,12 +196,19 @@ func (r TushareRow) I(key string) int {
 	return int(r.F(key))
 }
 
-// StockBasic 获取 A 股上市公司基础信息（全量，2020 前上市含已退市）。
-// English: StockBasic fetches A-share listed-company basics (full universe, including names delisted before 2020).
-// （StockBasic returns the full A-share listing universe, including delisted names.）
+// StockBasic 获取 A 股上市公司基础信息（全量在市，list_status=L）。
+// English: StockBasic fetches A-share listed-company basics for the currently-listed universe.
 func (c *TushareClient) StockBasic() ([]TushareRow, error) {
+	return c.StockBasicWithStatus("L")
+}
+
+// StockBasicWithStatus §WS-D D-2 按上市状态获取股票基础信息。
+// listStatus 取值：L=在市（默认）、D=已退市、P=暂停上市；"L,D,P" 拉全量（含退市，消除幸存者偏差）。
+// English: §WS-D D-2 fetches stock basics by listing status; "L,D,P" pulls the full universe including
+// delisted names so backtests drop survivorship bias.
+func (c *TushareClient) StockBasicWithStatus(listStatus string) ([]TushareRow, error) {
 	return c.Call("stock_basic", map[string]string{
-		"exchange": "", "list_status": "L", "fields": "",
+		"exchange": "", "list_status": listStatus, "fields": "",
 	}, "ts_code,symbol,name,area,industry,market,list_date,delist_date")
 }
 

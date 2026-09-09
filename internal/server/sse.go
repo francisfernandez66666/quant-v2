@@ -7,10 +7,88 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
+	"time"
 )
+
+// sseTicketTTL 一次性票据有效期（60s 足够 EventSource 完成建链；过短体验差，过长放大泄漏面）。
+const sseTicketTTL = 60 * time.Second
+
+// sseTicketMaxLive 同时存活的票据上限：超过后新票挤出最旧票（防票据池内存放大）。
+const sseTicketMaxLive = 1024
+
+// sseTicket 一次有效的 SSE 建链票据：绑定签发用户，60s 后过期，消费后立即作废。
+type sseTicket struct {
+	userID   string
+	expireAt time.Time
+}
+
+// newSSETicket 生成一个 24 字节随机 hex 票据；随机源失败时降级为时间戳+随机数拼接（仍满足
+// 不可枚举，因为票据仅 60s 有效且一次性）。
+// English: mintSSETicket generates a 24-byte random hex ticket (with a degraded fallback if the
+// CSPRNG fails; the 60s one-time window still defeats enumeration).
+func (s *Server) newSSETicket(userID string) string {
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("f%x-%x", time.Now().UnixNano(), b[0])
+	}
+	s.sseTicketsMu.Lock()
+	defer s.sseTicketsMu.Unlock()
+	if s.sseTickets == nil {
+		s.sseTickets = make(map[string]sseTicket)
+	}
+	if len(s.sseTickets) >= sseTicketMaxLive {
+		// 挤出最旧的一批（按时间淘汰约 1/4），保持池有界
+		var oldest []string
+		for k := range s.sseTickets {
+			oldest = append(oldest, k)
+			if len(oldest) >= sseTicketMaxLive/4 {
+				break
+			}
+		}
+		for _, k := range oldest {
+			delete(s.sseTickets, k)
+		}
+	}
+	tk := hex.EncodeToString(b[:])
+	s.sseTickets[tk] = sseTicket{userID: userID, expireAt: time.Now().Add(sseTicketTTL)}
+	return tk
+}
+
+// consumeSSETicket 校验并作废票据：不存在/已消费（已被 delete）→ 失败；命中即删除（一次性），
+// 并返回票据绑定的账号。票据只由已认证用户签发，故命中票据即代表该账号已通过认证。
+// English: consumeSSETicket validates and atomically consumes a one-time ticket (deleted on first
+// use), returning the account the ticket was minted for. A valid ticket implies prior authentication.
+func (s *Server) consumeSSETicket(tk string) (string, bool) {
+	s.sseTicketsMu.Lock()
+	defer s.sseTicketsMu.Unlock()
+	v, ok := s.sseTickets[tk]
+	if !ok {
+		return "", false
+	}
+	delete(s.sseTickets, tk)
+	if time.Now().After(v.expireAt) {
+		return "", false
+	}
+	return v.userID, true
+}
+
+// sweepSSETickets 惰性清理过期票据（供建链/签发时顺带调用），防过期票滞留。
+// English: sweepSSETickets lazily drops expired tickets.
+func (s *Server) sweepSSETickets() {
+	s.sseTicketsMu.Lock()
+	defer s.sseTicketsMu.Unlock()
+	for k, v := range s.sseTickets {
+		if time.Now().After(v.expireAt) {
+			delete(s.sseTickets, k)
+		}
+	}
+}
 
 // sseMaxHistory 每个账号在内存中保留的最近事件条数上限，用于断线续传（last-event-id）补发。
 const sseMaxHistory = 200

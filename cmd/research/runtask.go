@@ -113,6 +113,8 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 			o.Sweep = &btreplay.SweepConfig{
 				Objective: payloadStr(p, "objective", ""),
 				TopN:      int(payloadInt(p, "top_n", 0)),
+				// §WS-H C2 多重检验校正开关（payload mcc=true 时输出 Bonferroni 校正后 p 简报）
+				MCC: payloadBool(p, "mcc"),
 			}
 		}
 		if err := o.Run(); err != nil {

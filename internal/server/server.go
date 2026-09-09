@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/store"
@@ -112,6 +114,15 @@ type Server struct {
 	// （body.setup_token 或 X-Setup-Token 头），否则拒绝。防止未授权者抢跑初始化。
 	// English: P1-5 setup token — when SETUP_TOKEN env is set, POST /setup requires the matching token.
 	setupToken string
+
+	// §WS-F C4a SSE 一次性票据：SSE 用 Authorization 头（浏览器 EventSource 不支持），
+	// 改为「短时 one-time ticket」——POST /api/events/ticket 取 60s 有效随机票，
+	// SSE URL /api/events?ticket=xxx 校验并立即作废。access log 里的 ticket 不可复用。
+	// English: WS-F C4a — EventSource cannot set Authorization headers, so SSE uses a short-lived
+	// one-time ticket minted at POST /api/events/ticket (60s TTL, bound to the issuing user,
+	// consumed on first use).
+	sseTicketsMu sync.Mutex
+	sseTickets   map[string]sseTicket
 
 	calMu         sync.Mutex        // 保护日历缓存的互斥锁
 	macroCache    []data.MacroEvent // 宏观日历事件缓存
@@ -452,6 +463,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/opslog", s.adminMiddleware(s.handleOpslog))
 	// §R4-9 指标面（鉴权后导出 expvar：下单/熔断/撤单/LLM 降级等关键事件计数）
 	s.mux.HandleFunc("GET /api/metrics", s.authMiddleware(http.HandlerFunc(expvar.Handler().ServeHTTP)))
+	// §WS-L 维5 Prometheus text 导出（admin 鉴权，promtool 可校验）+ 阈值告警状态
+	s.mux.HandleFunc("GET /api/metrics/prometheus", s.adminMiddleware(s.handlePrometheusMetrics))
+	s.mux.HandleFunc("GET /api/metrics/alerts", s.adminMiddleware(s.handleAlertState))
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
 	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
@@ -562,13 +576,22 @@ func (s *Server) registerRoutes() {
 	// §QMT-DUAL：网关 active 通道（miniqmt=xt / qmt=queued）读取与切换（仅 admin）
 	s.mux.HandleFunc("GET /api/qmt/broker", s.adminMiddleware(s.handleQMTBroker))
 	s.mux.HandleFunc("POST /api/qmt/broker", s.adminMiddleware(s.handleQMTBrokerSwitch))
-	s.mux.HandleFunc("GET /api/llm-debug", s.authMiddleware(s.handleLLMDebug))
+	// §WS-B：券商交割单三方对账（触发 + 历史查询，仅 admin）
+	s.mux.HandleFunc("POST /api/qmt/settle", s.adminMiddleware(s.handleQMTSettle))
+	s.mux.HandleFunc("GET /api/qmt/settle/history", s.adminMiddleware(s.handleQMTSettleHistory))
+	// §WS-C：风控闸口状态（命中明细 + 开关状态，仅 admin）
+	s.mux.HandleFunc("GET /api/risk/gates", s.adminMiddleware(s.handleRiskGates))
+	// §WS-E 敏感管线隔离：llm-debug / stage-records 含运营账号 LLM 密钥池与全链路日志，
+	// 仅管理员可见（子账号 403）。English: §WS-E sensitive-pipeline isolation — these endpoints expose
+	// the operator's LLM key pool and full pipeline logs, so they are admin-only.
+	s.mux.HandleFunc("GET /api/llm-debug", s.adminMiddleware(s.handleLLMDebug))
 	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
 	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))
 	s.mux.HandleFunc("DELETE /api/consult/history", s.authMiddleware(s.handleClearConsultHistory))
 	s.mux.HandleFunc("GET /api/consult/pro-mode", s.authMiddleware(s.handleGetConsultProMode))
 	s.mux.HandleFunc("PUT /api/consult/pro-mode", s.authMiddleware(s.handleSetConsultProMode))
-	s.mux.HandleFunc("GET /api/stage-records", s.authMiddleware(s.handleStageRecords))
+	// §WS-E 敏感管线隔离：stage-records 暴露运营账号全链路 stage 记录，仅管理员可见（子账号 403）。
+	s.mux.HandleFunc("GET /api/stage-records", s.adminMiddleware(s.handleStageRecords))
 	s.mux.HandleFunc("GET /api/signal-logs", s.authMiddleware(s.handleSignalLogs))
 	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
 	s.mux.HandleFunc("GET /api/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
@@ -608,6 +631,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/research/library/{id}/rename", s.permMiddleware(auth.PermResearchApprove, s.handleResearchLibraryRename))
 	s.mux.HandleFunc("GET /api/research/backtest-toggle", s.authMiddleware(s.handleResearchBacktestToggle))
 	s.mux.HandleFunc("POST /api/research/backtest-toggle", s.permMiddleware(auth.PermResearchApprove, s.handleResearchBacktestToggle))
+	// §WS-H C2 参数版本化：历史快照列表（auth 可见）+ 回滚（admin 专属，原子恢复+审计）
+	s.mux.HandleFunc("GET /api/research/strategies/snapshots", s.authMiddleware(s.handleStrategySnapshots))
+	s.mux.HandleFunc("POST /api/research/strategies/rollback", s.adminMiddleware(s.handleStrategyRollback))
+	// §WS-K 维4 配置历史/回滚：快照+diff 列表（admin）、回滚恢复（admin）
+	s.mux.HandleFunc("GET /api/config/history", s.adminMiddleware(s.handleConfigHistory))
+	s.mux.HandleFunc("POST /api/config/rollback", s.adminMiddleware(s.handleConfigRollback))
+	// §WS-F C4a SSE 一次性票据签发端点（需认证）；SSE 建链用 /api/events?ticket=xxx（60s 一次性）。
+	s.mux.HandleFunc("POST /api/events/ticket", s.authMiddleware(s.handleSSETicket))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
 
@@ -616,7 +647,17 @@ func (s *Server) registerRoutes() {
 const maxBodyBytes = 64 << 10
 
 // Serve 启动 HTTP 服务监听指定地址。
+// Serve 启动 HTTP 服务。§WS-F B4：若设置 QUANT_TLS_CERT 与 QUANT_TLS_KEY 则启用 HTTPS
+// （可选本地直连加密；生产公网仍以 Caddy TLS 终结为准，见 deploy/caddy/guangzhou.conf）。
+// 文档强制约定：公网部署必须经 TLS（Caddy）暴露，禁止明文 8080 直连公网。
+// English: Serve starts the HTTP server. If QUANT_TLS_CERT/QUANT_TLS_KEY are set, it serves HTTPS.
+// Production TLS termination stays with Caddy; plaintext 8080 must never be exposed to the public net.
 func (s *Server) Serve(addr string) error {
+	cert, key := os.Getenv("QUANT_TLS_CERT"), os.Getenv("QUANT_TLS_KEY")
+	if cert != "" && key != "" {
+		log.Printf("HTTPS server starting on %s (TLS: %s)", addr, cert)
+		return http.ListenAndServeTLS(addr, cert, key, s.chain(s.mux))
+	}
 	log.Printf("HTTP server starting on %s", addr)
 	return http.ListenAndServe(addr, s.chain(s.mux))
 }
@@ -668,9 +709,33 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 }
 
 // corsMiddleware 跨域中间件：为所有响应添加 CORS 头，并直接终结 OPTIONS 预检请求。
+// §WS-F B4 收紧：不再恒发 `Allow-Origin:*`——仅放行「同源」（Origin 与 Host 匹配）或
+// `ALLOWED_ORIGINS` 白名单（逗号分隔 host，可带 scheme，如
+// https://trade.example.com,http://127.0.0.1:8080）中的源；无 Origin 头的非浏览器请求回退 `*`。
+// 跨域源不写 Allow-Origin 头 → 浏览器直接拦截（fetch 被拒）。用 token header 鉴权，无 cookie，
+// 故不开 Allow-Credentials。
+// English: §WS-F B4 CORS hardening — echo the origin only when it is same-origin (Origin host matches
+// request Host) or on the ALLOWED_ORIGINS whitelist; non-browser requests without an Origin header
+// fall back to "*". Cross-origin requests get no Allow-Origin header, so browsers block them.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, o := range strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allowed[o] = true
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		allow := ""
+		switch {
+		case origin == "":
+			allow = "*" // 非浏览器（curl/探针）无 Origin 头，回退全放行
+		case allowed[origin], allowed[originHost(origin)], originMatchesHost(r, origin):
+			allow = origin
+		}
+		if allow != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allow)
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == "OPTIONS" {
@@ -679,6 +744,30 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// originHost 提取 Origin 的 host 段（https://a.com:8443 → a.com）。
+// English: originHost extracts the hostname from an origin URL.
+func originHost(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+// originMatchesHost Origin 与请求 Host 是否同源（忽略端口，适配反代场景）。
+// English: reports whether the Origin and the request Host share a hostname (port-insensitive, reverse-proxy friendly).
+func originMatchesHost(r *http.Request, origin string) bool {
+	oh := originHost(origin)
+	if oh == "" {
+		return false
+	}
+	rh := r.Host
+	if h, _, e := net.SplitHostPort(r.Host); e == nil {
+		rh = h
+	}
+	return oh == rh
 }
 
 // chain 将多个中间件按顺序包装 next（外层 → 内层）。
@@ -758,9 +847,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	user, err := s.auth.Login(req.Username, req.Password)
 	if err != nil {
 		// §A4 统一文案：不区分"用户不存在/密码错"，阻断用户名枚举
+		// §WS-F C1 审计：登录失败留痕（actor 用 clientIP 而非用户名，防枚举用户名单）
+		opslog.Audit("login", clientIP(r), req.Username, "fail")
 		writeError(w, 401, "invalid credentials")
 		return
 	}
+	opslog.Audit("login", user.ID, req.Username, "ok")
 	writeJSON(w, 200, map[string]interface{}{
 		"token":   user.Token,
 		"id":      user.ID,
@@ -853,9 +945,15 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 
 // ipLimiter 进程内滑动窗口频控器（单实例部署足够；多实例需外置网关）。
 // 用于 register/temp/login/setup 等匿名端点的防刷与防撞库。
+// §WS-F P3 加固：map 增 TTL 清理（超过 maxIPs 时淘汰过期条目，防 IP 放大内存）。
+// English: in-process sliding-window rate limiter for anonymous endpoints; hardened with a TTL sweep so
+// a rotating-IP flood cannot grow the map unboundedly.
 type ipLimiter struct {
-	mu   sync.Mutex
-	hits map[string][]time.Time // key=IP，value=该 IP 近期的请求时间戳序列
+	mu       sync.Mutex
+	hits     map[string][]time.Time // key=IP，value=该 IP 近期的请求时间戳序列
+	maxIPs   int                    // map 上限（0=默认 10000）
+	sweepMod int                    // 每 N 次 allow 清扫一次（0=默认 256）
+	ops      int                    // allow 调用计数（清扫节拍）
 }
 
 // allow 滑动窗口判定：window 内该 IP 已达 max 次则拒绝。
@@ -865,6 +963,14 @@ func (l *ipLimiter) allow(ip string, max int, window time.Duration) bool {
 	defer l.mu.Unlock()
 	if l.hits == nil {
 		l.hits = make(map[string][]time.Time)
+	}
+	l.ops++
+	if l.sweepMod <= 0 {
+		l.sweepMod = 256
+	}
+	// §WS-F TTL 清理：每 sweepMod 次调用清扫一次（淘汰超过 MaxWindow 的整段旧数据 + 超上限截断）。
+	if l.ops%l.sweepMod == 0 {
+		l.sweep(now, 24*time.Hour)
 	}
 	recent := l.hits[ip][:0]
 	for _, t := range l.hits[ip] {
@@ -878,6 +984,50 @@ func (l *ipLimiter) allow(ip string, max int, window time.Duration) bool {
 	}
 	l.hits[ip] = append(recent, now)
 	return true
+}
+
+// sweep 淘汰超过 maxAge 的全部条目；仍超 maxIPs 则保留最活跃的 maxIPs 个 IP。
+// English: sweep drops entries older than maxAge, then keeps only the most-recent maxIPs IPs.
+func (l *ipLimiter) sweep(now time.Time, maxAge time.Duration) {
+	for ip, ts := range l.hits {
+		cut := 0
+		for _, t := range ts {
+			if now.Sub(t) < maxAge {
+				ts[cut] = t
+				cut++
+			}
+		}
+		if cut == 0 {
+			delete(l.hits, ip)
+		} else {
+			l.hits[ip] = ts[:cut]
+		}
+	}
+	if l.maxIPs <= 0 {
+		l.maxIPs = 10000
+	}
+	if len(l.hits) <= l.maxIPs {
+		return
+	}
+	// 按最近时间戳排序，保留最新的 maxIPs 个 IP
+	type kv struct {
+		ip string
+		at time.Time
+	}
+	var all []kv
+	for ip, ts := range l.hits {
+		var last time.Time
+		for _, t := range ts {
+			if t.After(last) {
+				last = t
+			}
+		}
+		all = append(all, kv{ip, last})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.After(all[j].at) })
+	for _, e := range all[l.maxIPs:] {
+		delete(l.hits, e.ip)
+	}
 }
 
 // ── §GAP2-W1 客户端 IP 提取（可信代理收口）─────────────────────────────────────
@@ -1003,10 +1153,14 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 // adminMiddleware 管理员中间件：在认证基础上要求当前用户为管理员角色，否则返回 403。
 // 仅包裹用户/账号管理与全局配置等管理类接口。
+// §WS-E 审计：越权访问（子账号请求 admin 端点）记 opslog，配合 WS-F 审计日志。
+// English: admin middleware — requires the admin role after auth, else 403; §WS-E audits unauthorized
+// (non-admin) attempts to opslog for the WS-F audit trail.
 func (s *Server) adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		user := userFromContext(r)
 		if user == nil || !user.IsAdmin() {
+			opslog.Logf("quant", "越权访问拒绝 uid=%s %s %s（仅管理员可用）", userIDFor(r), r.Method, r.URL.Path)
 			writeError(w, 403, "无权限：该接口仅管理员账号可用")
 			return
 		}

@@ -77,6 +77,7 @@ const defaultObservationDays = 20
 // English: writes a candidate into the grayscale library (idempotent per candidate_id).
 // Supports factor/pattern candidates only.
 func ApplyGrayscale(dataDir string, c *store.Candidate) error {
+	snapshotBeforeWrite(dataDir)
 	if c.Kind != "factor" && c.Kind != "pattern" {
 		return fmt.Errorf("灰度仅支持 factor/pattern 候选，实际 kind=%s", c.Kind)
 	}
@@ -145,6 +146,7 @@ func ApplyGrayscale(dataDir string, c *store.Candidate) error {
 // DemoteGrayscale 把候选从灰度库移除（晋升 approved 或回退 rejected 时调用）。
 // English: removes a candidate from the grayscale library (on promotion or demotion).
 func DemoteGrayscale(dataDir string, candID int64) error {
+	snapshotBeforeWrite(dataDir)
 	p := GrayscalePath(dataDir)
 	gs := grayscaleFile{}
 	if b, err := os.ReadFile(p); err != nil {

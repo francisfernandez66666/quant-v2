@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -312,6 +314,107 @@ func localCode(code string) string {
 	return code
 }
 
+// cmdLifecycleEval §WS-H 维7：灰度晋升评估 CLI——读灰度库 + 分池 paper 逐笔净收益
+// （--pools 指定 poolKey→收益数组 JSON，缺省自动从 paper.json 聚合）→ 打印 verdicts →
+// promote 判定生成晋升候选（复用现有审批流）。衰退降级由调度器按日指标调用 EvaluateDemote。
+// English: WS-H 维7 grayscale promotion eval CLI — reads the grayscale library plus per-pool paper
+// net returns (--pools JSON map; auto-aggregated from paper.json when omitted), prints verdicts and
+// writes promote decisions as promotion candidates via the existing approval flow.
+func cmdLifecycleEval(db *store.DB, dataDir string, args []string) {
+	fs := flag.NewFlagSet("lifecycle-eval", flag.ExitOnError)
+	pools := fs.String("pools", "", "分池收益 JSON：{\"fac_<id>\": [逐笔净收益%...], ...}（缺省读 paper.json 聚合）")
+	paperPath := fs.String("paper", "", "paper.json 路径（缺省 dataDir/paper.json）")
+	fs.Parse(args)
+
+	gs, err := research.LoadGrayscaleRules(dataDir)
+	if err != nil {
+		log.Fatalf("读取灰度库失败（无灰度规则则无需评估）: %v", err)
+	}
+	poolTrades := map[string][]float64{}
+	if *pools != "" {
+		b, err := os.ReadFile(*pools)
+		if err != nil {
+			log.Fatalf("读取 pools JSON 失败: %v", err)
+		}
+		if err := json.Unmarshal(b, &poolTrades); err != nil {
+			log.Fatalf("pools JSON 解析失败: %v", err)
+		}
+	} else {
+		poolTrades = paperPoolReturns(*paperPath, dataDir)
+	}
+	verds := research.EvaluateGrayscale(&gs, poolTrades, research.PromotionOpts{})
+	if len(verds) == 0 {
+		log.Printf("灰度库为空，无需评估")
+		return
+	}
+	for _, v := range verds {
+		log.Printf("[lifecycle] %s cand=%d verdict=%s trades=%d IR=%.3f 胜率=%.1f%% 盈亏比=%.2f 回撤=%.1f%% 理由=%s",
+			v.RuleID, v.CandID, v.Verdict, v.Trades, v.IR, v.WinRate, v.ProfitFactor, v.MaxDrawdownPct, v.Reason)
+	}
+	ids, err := research.PromotionCandidates(db, &gs, verds)
+	if err != nil {
+		log.Fatalf("生成晋升候选失败: %v", err)
+	}
+	for _, id := range ids {
+		log.Printf("✅ 晋升候选 #%d 已入库（待人工确认上实盘）", id)
+	}
+}
+
+// paperPoolReturns 从 paper.json 聚合各策略池的逐笔净收益：
+// 卖出成交价/买入成本 → 单笔盈亏%，按池归类（fac_<id>/pat_<id>）。
+// 简化实现：卖出记录按 (code) 匹配该池最近一笔买入价计算收益率。
+// English: aggregates per-pool per-trade net returns from paper.json. Simplified: for each sell,
+// match the pool's most recent buy of the same code and compute the return.
+func paperPoolReturns(paperPath, dataDir string) map[string][]float64 {
+	path := paperPath
+	if path == "" {
+		path = filepath.Join(dataDir, "paper.json")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return map[string][]float64{}
+	}
+	var state struct {
+		Trades []struct {
+			Code     string  `json:"code"`
+			PoolKey  string  `json:"pool_key,omitempty"`
+			Strategy string  `json:"strategy"`
+			Side     string  `json:"side"`
+			Price    float64 `json:"price"`
+			Signal   float64 `json:"signal_price,omitempty"`
+			Qty      int     `json:"qty"`
+			Time     string  `json:"time"`
+		} `json:"trades"`
+	}
+	if err := json.Unmarshal(b, &state); err != nil {
+		return map[string][]float64{}
+	}
+	// poolKey → code → (qty cost basis via most recent buy price)
+	lastBuy := map[string]map[string]float64{}
+	out := map[string][]float64{}
+	for _, t := range state.Trades {
+		pool := t.PoolKey
+		if pool == "" {
+			pool = "other"
+		}
+		if t.Side == "buy" && t.Qty > 0 {
+			if lastBuy[pool] == nil {
+				lastBuy[pool] = map[string]float64{}
+			}
+			lastBuy[pool][t.Code] = t.Price
+			continue
+		}
+		if t.Side == "sell" {
+			cost := lastBuy[pool][t.Code]
+			if cost > 0 && t.Price > 0 {
+				pnl := (t.Price - cost) / cost * 100
+				out[pool] = append(out[pool], pnl)
+			}
+		}
+	}
+	return out
+}
+
 // sortedIDs 返回因子权重 map 的 key 升序切片（保证日志输出顺序确定性）。
 func sortedIDs(m map[string]float64) []string {
 	ids := make([]string, 0, len(m))
@@ -535,19 +638,22 @@ func resolveFactorPool(explicit, pool string) []string {
 		return nil // 全池：由 DiscoverFactorsWindowedN 缺省兜底
 	}
 	catByName := map[string]factor.Category{
-		"value":       factor.CatValue,
-		"growth":      factor.CatGrowth,
-		"quality":     factor.CatQuality,
-		"size":        factor.CatSize,
-		"volatility":  factor.CatVolatility,
-		"momentum":    factor.CatMomentum,
-		"liquidity":   factor.CatLiquidity,
-		"mom_liq":     factor.CatMomentum,
+		"value":         factor.CatValue,
+		"growth":        factor.CatGrowth,
+		"quality":       factor.CatQuality,
+		"size":          factor.CatSize,
+		"volatility":    factor.CatVolatility,
+		"momentum":      factor.CatMomentum,
+		"liquidity":     factor.CatLiquidity,
+		"mom_liq":       factor.CatMomentum,
 		"value_quality": factor.CatValue,
-		"vol_size":    factor.CatVolatility,
+		"vol_size":      factor.CatVolatility,
 	}
 	// 多类组合名依次展开后按大类过滤去重
-	type pair struct{ name string; cat factor.Category }
+	type pair struct {
+		name string
+		cat  factor.Category
+	}
 	groups := []pair{
 		{"mom_liq", factor.CatMomentum}, {"mom_liq", factor.CatLiquidity},
 		{"value_quality", factor.CatValue}, {"value_quality", factor.CatQuality},

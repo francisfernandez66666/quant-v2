@@ -2025,22 +2025,51 @@ func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
+// handleSSETicket 处理 POST /api/events/ticket（需认证）：签发一个 60s 有效、绑定当前账号、
+// 一次性（消费即废）的 SSE 建链票据。理由：浏览器 EventSource 无法自定义 Authorization 头，
+// 直接走 URL query token 会进 access log 且长期有效；票据把暴露面收敛到 60s 且不可复用。
+// English: §WS-F C4a — mint a 60s one-time SSE ticket bound to the authenticated user; consumed on
+// first use so a leaked URL can never be reused to open a second stream.
+func (s *Server) handleSSETicket(w http.ResponseWriter, r *http.Request) {
+	uid := userIDFor(r)
+	s.sweepSSETickets()
+	tk := s.newSSETicket(uid)
+	writeJSON(w, 200, map[string]interface{}{
+		"ticket":     tk,
+		"expires_in": int(sseTicketTTL / time.Second),
+	})
+}
+
 // handleFixSSE 处理 GET /api/events 请求，建立 Server-Sent Events (SSE) 连接。
 // 用于向前端推送实时事件更新。需要 token 认证。
 // 连接建立后：15 秒发送一次心跳保活，有数据时立即推送。
 // 账号隔离：按 token 解析 userID，仅订阅该账号定向事件；断线续传：读取 Last-Event-ID 补发漏掉的事件。
 func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
-	tokenStr := r.URL.Query().Get("token")
-	if tokenStr == "" {
-		writeError(w, 401, "missing token")
+	// §WS-F C4a 鉴权：优先一次性票据（推荐，URL 不留长期 token，票据消费即废）；兼容旧客户端
+	// token query 回退。无票据亦无 token → 401；票据已用/过期 → 401。
+	// English: SSE auth prefers a one-time ticket (consumed on use; the URL never carries a long-lived
+	// token); legacy token query still works as a fallback.
+	userID := ""
+	if tk := r.URL.Query().Get("ticket"); tk != "" {
+		s.sweepSSETickets()
+		if uid, ok := s.consumeSSETicket(tk); ok {
+			userID = uid
+		}
+		if userID == "" {
+			writeError(w, 401, "invalid or expired ticket")
+			return
+		}
+	} else if tokenStr := r.URL.Query().Get("token"); tokenStr != "" {
+		if u := s.auth.ValidateToken(tokenStr); u != nil {
+			userID = u.ID
+		} else {
+			writeError(w, 401, "invalid token")
+			return
+		}
+	} else {
+		writeError(w, 401, "missing ticket or token")
 		return
 	}
-	user := s.auth.ValidateToken(tokenStr)
-	if user == nil {
-		writeError(w, 401, "invalid token")
-		return
-	}
-	userID := user.ID
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

@@ -362,7 +362,10 @@ func (d *DB) migrate() error {
 			amount REAL NOT NULL,
 			traded_at TEXT NOT NULL,
 			signal_id TEXT DEFAULT '',
-			user_id TEXT DEFAULT ''
+			user_id TEXT DEFAULT '',
+			fee REAL DEFAULT 0,
+			stamp_tax REAL DEFAULT 0,
+			serial TEXT DEFAULT ''
 		)`,
 		// §W3-b 成交回报幂等唯一键：同一委托+同一回报时间戳+同价同量只入账一次，
 		// 根除 outbox 重试遇响应丢失时的双倍记账（首尔侧此前零幂等）。
@@ -371,6 +374,50 @@ func (d *DB) migrate() error {
 		`DELETE FROM fills WHERE rowid NOT IN (
 			SELECT MIN(rowid) FROM fills GROUP BY order_id, traded_at, price, qty)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_idem ON fills(order_id, traded_at, price, qty)`,
+		// §WS-A T+1/交割单对账查询加速：按交易日聚合成交/费用
+		`CREATE INDEX IF NOT EXISTS idx_fills_traded_at ON fills(traded_at)`,
+		// §WS-B 券商交割单三方对账结果：每日一条对账差异快照（report_only 落账 / sync_fills 纠偏留痕）。
+		`CREATE TABLE IF NOT EXISTS settlement_diff (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT DEFAULT '',
+			day TEXT NOT NULL,
+			diff_json TEXT NOT NULL,
+			fee_diff REAL DEFAULT 0,
+			cash_diff REAL DEFAULT 0,
+			mode TEXT DEFAULT 'report_only',
+			created_at TEXT DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_settle_day ON settlement_diff(day)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_settle_user_day ON settlement_diff(user_id, day)`,
+		// §WS-C 风控闸口命中计数与每日汇总：供 SLO/审计/UI 卡片（每 user+日+闸 一行，命中自增）。
+		`CREATE TABLE IF NOT EXISTS risk_gates (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT DEFAULT '',
+			trade_date TEXT NOT NULL,
+			gate TEXT NOT NULL,
+			hits INTEGER NOT NULL DEFAULT 0,
+			last_reason TEXT DEFAULT '',
+			updated_at TEXT DEFAULT '',
+			UNIQUE(user_id, trade_date, gate)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_risk_gates_day ON risk_gates(trade_date)`,
+		// §WS-G Shadow 执行器落账：staging 影子引擎只记录决策不真下（signal_id 幂等，同键去重）。
+		`CREATE TABLE IF NOT EXISTS shadow_orders (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id TEXT DEFAULT '',
+			signal_id TEXT NOT NULL,
+			code TEXT DEFAULT '',
+			name TEXT DEFAULT '',
+			strategy TEXT DEFAULT '',
+			strategy_id TEXT DEFAULT '',
+			side TEXT DEFAULT '',
+			price REAL DEFAULT 0,
+			qty INTEGER DEFAULT 0,
+			amount REAL DEFAULT 0,
+			created_at TEXT DEFAULT '',
+			UNIQUE(signal_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_shadow_day ON shadow_orders(created_at)`,
 		// 常用查询索引（主键外的补充加速）
 		`CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_db_date ON daily_basic(trade_date)`,
@@ -511,6 +558,13 @@ func (d *DB) migrate() error {
 		// §2026-09-05 多轮发现/护栏分级：候选护栏档位 + 参数快照（精确复现审批时的战法）
 		{"research_candidates", "guard", "ALTER TABLE research_candidates ADD COLUMN guard TEXT DEFAULT 'standard'"},
 		{"research_candidates", "params", "ALTER TABLE research_candidates ADD COLUMN params TEXT DEFAULT ''"},
+		// §WS-A/WS-B 实盘账本扩充：
+		//  fills 手续费/印花税/交割流水号（券商交割单三方对账 + 盈亏含成本口径）
+		{"fills", "fee", "ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0"},
+		{"fills", "stamp_tax", "ALTER TABLE fills ADD COLUMN stamp_tax REAL DEFAULT 0"},
+		{"fills", "serial", "ALTER TABLE fills ADD COLUMN serial TEXT DEFAULT ''"},
+		//  real_positions.buy_date：买入交易日（T+1 可卖量判定 + 日终对账关联）
+		{"real_positions", "buy_date", "ALTER TABLE real_positions ADD COLUMN buy_date TEXT DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {
@@ -1040,6 +1094,31 @@ func (d *DB) TradeDates(from, to string) ([]string, error) {
 func (d *DB) StockCodes() ([]string, error) {
 	// 全量代码清单，按代码升序。
 	rows, err := d.db.Query("SELECT ts_code FROM stocks ORDER BY ts_code")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// UniverseAt §WS-D D-2 时点股票池（消除幸存者偏差）：返回截至 date 已上市且未退市的股票
+// （list_date ≤ date < delist_date；delist_date 空 = 仍未退市）。date 格式 YYYYMMDD。
+// English: §WS-D D-2 point-in-time universe (survivorship-bias-free): stocks listed on or before date
+// and not yet delisted (list_date ≤ date < delist_date; empty delist_date = still listed). Date format
+// is YYYYMMDD.
+func (d *DB) UniverseAt(date string) ([]string, error) {
+	rows, err := d.db.Query(`SELECT ts_code FROM stocks
+		WHERE list_date != '' AND list_date <= ?
+		  AND (delist_date = '' OR delist_date > ?)
+		ORDER BY ts_code`, date, date)
 	if err != nil {
 		return nil, err
 	}

@@ -57,6 +57,9 @@ var llmDegradeCount int64
 type Engine struct {
 	mu sync.RWMutex // 保护全部可变字段的读写锁（多 goroutine：主循环 + 近实时打分循环 + SSE/HTTP 调用）
 
+	// lastAlertEval §WS-L 阈值告警评估节流时间戳（scoreCycle 每 30s 跑一轮）。
+	lastAlertEval time.Time
+
 	marketAPI    *data.MarketAPI         // 行情 API（实时价/K线/资金流/涨停池）
 	newsAgent    *newsagent.Agent        // 新闻代理（拉取 + Stage0/1/2 归因分析）
 	strategy     *strategy_engine.Engine // 策略引擎（事件归因 → 评分池 → 行情数据）
@@ -856,8 +859,10 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		}
 	}
 	price := sig.Price
-	if si := live[sig.Code]; si != nil && si.Price > 0 {
-		price = si.Price
+	var si *data.StockInfo
+	if q := live[sig.Code]; q != nil && q.Price > 0 {
+		si = q
+		price = q.Price
 	}
 	if price <= 0 {
 		// §DIAG-0921 价格无效静默跳过节流日志（触发价缺失且无实时行情时的无声丢弃点）
@@ -947,18 +952,27 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	}
 	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), stratKey, data.TradingDayDate(time.Now()))
 	// 组装买入订单请求：金额按数量×价格计算，幂等键随信号 ID 传递。
+	// §WS-C 行情上下文装配：StalenessMs（fetcher 快照陈旧度）/ CurrentPrice / PrevClose 供
+	// risk.Gate 的行情新鲜度、集中度与涨跌停不可追单闸消费（缺失时对应闸 fail-open）。
+	// English: §WS-C quote context for the risk gate (staleness / live price / prev close); gates
+	// fail open when the fields are missing.
 	req := trading.OrderRequest{
-		SignalID:   id,
-		Code:       withSuffix(sig.Code),
-		Name:       sig.Name,
-		Strategy:   sig.Strategy,
-		StrategyID: sig.StrategyID,
-		Side:       trading.SideBuy,
-		PriceType:  cfg.PriceType,
-		Price:      price,
-		Qty:        qty,
-		Amount:     float64(qty) * price,
-		CreatedAt:  time.Now().Format(time.RFC3339),
+		SignalID:    id,
+		Code:        withSuffix(sig.Code),
+		Name:        sig.Name,
+		Strategy:    sig.Strategy,
+		StrategyID:  sig.StrategyID,
+		Side:        trading.SideBuy,
+		PriceType:   cfg.PriceType,
+		Price:       price,
+		Qty:         qty,
+		Amount:      float64(qty) * price,
+		CreatedAt:   time.Now().Format(time.RFC3339),
+		StalenessMs: e.quoteStalenessMs(sig.Code),
+	}
+	if si != nil {
+		req.CurrentPrice = si.Price
+		req.PrevClose = si.Close
 	}
 	// （兼容未启动分发器的调用方，如测试与直调；保持原有行为）。
 	// §修复 FIX#8（2026-09-04）：满队不再静默丢弃——旧实现 select default 直接 drop，
@@ -1277,6 +1291,15 @@ func (e *Engine) SetFetcher(f *data.Fetcher) {
 	e.mu.Lock()
 	e.fetcher = f
 	e.mu.Unlock()
+}
+
+// quoteStalenessMs §WS-C 行情新鲜度（毫秒）：fetcher 未配置时返回 -1（对应风险闸 fail-open）。
+// English: §WS-C quote staleness in ms; -1 when no fetcher is configured (the risk gate fails open).
+func (e *Engine) quoteStalenessMs(code string) int64 {
+	if e.fetcher == nil {
+		return -1
+	}
+	return e.fetcher.StalenessMs(code)
 }
 
 // snapshotQuotes 返回 fetcher 最近一轮 5s 实时行情快照（map: code → quote），

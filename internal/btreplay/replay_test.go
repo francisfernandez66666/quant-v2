@@ -21,7 +21,7 @@ func TestSummarize(t *testing.T) {
 		{Strategy: "DoubleBump", PnlPct: 20, HoldDays: 3},
 		{Strategy: "DoubleBump", PnlPct: -5, HoldDays: 1},
 	}
-	s := summarize(trades)
+	s := summarize(trades, 0)
 	if s.Count != 4 {
 		t.Fatalf("Count=%d, want 4", s.Count)
 	}
@@ -47,7 +47,7 @@ func TestSummarize(t *testing.T) {
 
 // TestSummarizeEmpty 无交易时统计应为零值且不除零。
 func TestSummarizeEmpty(t *testing.T) {
-	s := summarize(nil)
+	s := summarize(nil, 0)
 	if s.Count != 0 || s.WinRate != 0 || s.ProfitFactor != 0 || s.AvgHold != 0 {
 		t.Fatalf("empty summary = %+v, want zero", s)
 	}

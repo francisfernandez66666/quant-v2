@@ -231,6 +231,131 @@ type QMTConfig struct {
 	// English: §R4-1 close-list time (Beijing HHMM) — cancels all unfilled 已报 orders of the day
 	// (0 = default 1452; -1 disables).
 	CloseSweepAt int `json:"close_sweep_at"`
+	// EnforceT1 §WS-A T+1 可卖量守卫开关：nil=默认开启（A 股 T+1 制度恒真）；显式 false 关闭，
+	// 退回券商柜台终裁（当日买入误卖会收到废单回报，不作为本地硬闸）。
+	// English: §WS-A T+1 sell-guard switch — nil means enabled by default (A-share T+1 is universal);
+	// explicit false disables the local hard gate and falls back to the broker's rejection.
+	EnforceT1 *bool `json:"enforce_t1,omitempty"`
+	// Money §WS-M 资金管理：现金缓冲 + 本地在途冻结动态占用。
+	// Money = capital buffer + dynamic local frozen-in-transit accounting (§WS-M).
+	Money MoneyMgmtConfig `json:"money,omitempty"`
+	// Settle §WS-B 券商交割单三方对账（默认关闭：启用后才拉交割单+告警+可选补记）。
+	// English: §WS-B daily three-way settlement reconciliation (off by default; enabling pulls the
+	// broker settlement, persists diffs, alerts, and optionally backfills missing fills).
+	Settle SettleConfig `json:"settle,omitempty"`
+	// RiskGate §WS-C 风控闸口参数（零值=全部关闭，保持现状行为；开启的闸命中即拒单+记录+告警）。
+	// English: §WS-C risk-gate params (zero-value = all off, legacy behavior; an enabled gate that
+	// trips rejects the order, records a hit and alerts).
+	RiskGate RiskGateConfig `json:"risk_gate,omitempty"`
+}
+
+// RiskGateConfig §WS-C 机构级风控闸口参数。零值 = 闸全部关闭（现状行为不变，可随时开启、可回滚）。
+// 目标补齐：日内已实现亏损熔断、单票市值集中度、涨停/跌停不可追单、行情新鲜度硬闸——
+// 全部经 RiskGate.CheckLiveOrder 单一权威入口消费，命中即拒单并记录 risk_gates 命中计数。
+// English: §WS-C institutional risk-gate params. Zero-value = all gates off (legacy behavior; each
+// gate can be enabled independently and reverted). Covers: intraday realized-loss circuit breaker,
+// single-stock value concentration, limit-up/down chase blocking, and quote-staleness hard gate —
+// all consumed by the single authoritative RiskGate.CheckLiveOrder entry point, recording hits.
+type RiskGateConfig struct {
+	// DayLossLimitPct 日内已实现亏损熔断阈值（%）：0=关（默认）。
+	// 已实现亏损 = Σ今日卖出成交(fill价−成本)×数量；达到阈值 → 熔断当日新买入（卖出/清仓放行）+ P1 告警。
+	// English: intraday realized-loss circuit breaker threshold (%). 0 = off (default). Realized loss =
+	// Σ today's sell fills (fillPrice − cost)×qty; at threshold the day's new buys are circuit-broken
+	// (sells/liquidation stay open) with a P1 alert.
+	DayLossLimitPct float64 `json:"day_loss_limit_pct"`
+	// SingleStockValuePct 单票市值/总资产 集中度上限（%）：0=关（默认）。
+	// 买入后该股预计市值（持仓+本单）/ 总资产（可用现金+持仓市值）超过阈值 → 拒新买。
+	// English: single-stock market value / total assets concentration cap (%). 0 = off (default).
+	// If the projected value of the stock after this buy (held + this order) over total assets
+	// (available cash + held value) exceeds the cap, the buy is rejected.
+	SingleStockValuePct float64 `json:"single_stock_value_pct"`
+	// StaleQuoteMs 行情新鲜度硬闸（毫秒）：0=关（默认）。下单时快照陈旧度超过该值 → 拒单 + 告警
+	// （原 fetcher 只打日志不拦单）。
+	// English: quote-staleness hard gate (ms). 0 = off (default). If the snapshot staleness at order
+	// time exceeds this, the order is rejected + alerted (the fetcher used to only log).
+	StaleQuoteMs int64 `json:"stale_quote_ms"`
+	// LimitUpBlockBuy 涨停不可追买（默认关）：买入参考价 ≥ 昨收×(1+板感知涨停%) → 拒单。
+	// English: block chasing a limit-up buy (default off): buy reference price ≥ prevClose×(1+board
+	// limit-up%) → reject.
+	LimitUpBlockBuy bool `json:"limit_up_block_buy"`
+	// LimitDownBlockSell 跌停不可追卖（默认关）：卖出参考价 ≤ 昨收×(1−板感知涨停%) → 拒单。
+	// English: block chasing a limit-down sell (default off): sell reference price ≤ prevClose×(1−board
+	// limit-up%) → reject.
+	LimitDownBlockSell bool `json:"limit_down_block_sell"`
+}
+
+// AnyEnabled 是否开启了至少一道 RiskGate（供 UI/健康展示与短路）。
+// English: AnyEnabled reports whether at least one risk gate is enabled.
+func (r RiskGateConfig) AnyEnabled() bool {
+	return r.DayLossLimitPct > 0 || r.SingleStockValuePct > 0 || r.StaleQuoteMs > 0 ||
+		r.LimitUpBlockBuy || r.LimitDownBlockSell
+}
+
+// SettleConfig §WS-B 交割单三方对账参数。
+// English: §WS-B settlement params.
+type SettleConfig struct {
+	// Enabled 启用每日盘后交割单对账（默认 false）。
+	Enabled bool `json:"enabled"`
+	// Mode report_only=只出差异+告警（默认）；sync_fills=同时补记券商有本地无的成交。
+	Mode string `json:"mode"`
+	// At 每日对账时刻（北京时 HHMM，默认 1530）。
+	At int `json:"at"`
+}
+
+// MoneyMgmtConfig §WS-M 资金管理参数（默认零值=现状行为：无缓冲、无本地冻结叠加）。
+// 目标：①可配置"最低保留现金"（防把可用打到 0 满仓）；②在券商口径不可信时，
+// 用本地账本（已报未成交买单）显式计冻结，防止并发多信号超买；③明确不双扣——
+// 券商口径新鲜时信任其侧冻结，本地冻结仅在券商口径过期/缺失分支生效。
+// English: §WS-M money-management params (zero-value = legacy behavior). Adds an optional cash
+// reserve and, when broker cash is stale/missing, an explicit local frozen-in-transit deduction
+// (never double-counts — the broker's own freeze is trusted while its report is fresh).
+type MoneyMgmtConfig struct {
+	// CashReserveRatio 保留现金比例（0~1）：可下单资金 = 可用 × (1−ratio)。0=无缓冲（现状）。
+	// English: fraction of available cash held as a reserve (0~1). 0 = no buffer (legacy).
+	CashReserveRatio float64 `json:"cash_reserve_ratio"`
+	// MinReserveAmount 最低保留现金绝对值（元）：生效值取 max(ratio×可用, MinReserveAmount)。
+	// English: absolute floor for the cash reserve (yuan); effective reserve = max(ratio, min).
+	MinReserveAmount float64 `json:"min_reserve_amount"`
+	// TrustBrokerFreeze 券商口径新鲜（≤10min）时信任其侧已含冻结，不再叠加本地在途冻结。
+	// 默认 true（避免双扣）；false 时始终叠加本地冻结（更保守）。
+	// English: when the broker cash snapshot is fresh, trust that it already nets its own freeze and
+	// skip the local frozen-in-transit deduction. Default true (no double count); false always deducts.
+	TrustBrokerFreeze *bool `json:"trust_broker_freeze,omitempty"`
+}
+
+// TrustBrokerFreezeEnabled §WS-M：是否信任券商侧冻结（nil 默认 true）。
+// English: reports whether the broker-side freeze is trusted; unset defaults to true.
+func (m MoneyMgmtConfig) TrustBrokerFreezeEnabled() bool {
+	if m.TrustBrokerFreeze == nil {
+		return true
+	}
+	return *m.TrustBrokerFreeze
+}
+
+// EffectiveReserve 计算生效保留额：max(可用×ratio, MinReserveAmount)。
+// English: effective reserve = max(available×ratio, MinReserveAmount).
+func (m MoneyMgmtConfig) EffectiveReserve(available float64) float64 {
+	r := m.CashReserveRatio
+	if r > 1 {
+		r = 1
+	}
+	if r < 0 {
+		r = 0
+	}
+	byRatio := available * r
+	if m.MinReserveAmount > byRatio {
+		return m.MinReserveAmount
+	}
+	return byRatio
+}
+
+// EnforceT1Enabled §WS-A 返回 T+1 守卫是否生效：nil（未配置）→ true（默认开）；显式布尔按值。
+// English: §WS-A reports whether the T+1 sell guard is active; unset defaults to true.
+func (c QMTConfig) EnforceT1Enabled() bool {
+	if c.EnforceT1 == nil {
+		return true
+	}
+	return *c.EnforceT1
 }
 
 // DisciplineConfig 统一止盈止损纪律参数（探针5s扫描 + 扳机确认窗）。

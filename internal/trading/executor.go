@@ -34,6 +34,16 @@ type OrderRequest struct {
 	Qty        int     `json:"qty"`                   // 股数（整手）
 	Amount     float64 `json:"amount"`                // 金额（元）
 	CreatedAt  string  `json:"created_at"`            // 创建时间（RFC3339）
+	// StalenessMs §WS-C 行情快照陈旧度（毫秒；-1=未提供，StaleQuoteGuard 跳过）。由调用方（引擎）
+	// 从 fetcher.StalenessMs 装配；手动下单/未提供时闸 fail-open。
+	// English: §WS-C quote-staleness (ms; -1 = unavailable → StaleQuoteGuard skipped). Filled by the
+	// engine from fetcher.StalenessMs; manual orders leave it unset and the gate fails open.
+	StalenessMs int64 `json:"staleness_ms,omitempty"`
+	// PrevClose 昨收（§WS-C 涨跌停不可追单闸用；0=未提供 → fail-open）。CurrentPrice 现价（集中度闸用）。
+	// English: §WS-C prev close (limit up/down gate; 0 = unavailable → fail open) and live price
+	// (concentration gate).
+	PrevClose    float64 `json:"prev_close,omitempty"`
+	CurrentPrice float64 `json:"current_price,omitempty"`
 }
 
 // OrderResult 下单返回（网关 → 首尔）。

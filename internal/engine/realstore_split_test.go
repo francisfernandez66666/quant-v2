@@ -2,9 +2,11 @@
 // 修复前 registry.go 把 opts.D1Store 传入 SetQMT（第二参=realStore），引擎近实时建议循环
 // pushRealAdvice 从研究库读 real_positions 恒为 0——实盘止损/止盈/自动卖出/M8 链路静默失效，
 // e2e 因双库同源（RealStore=D1Store=同一 DB）未能暴露。本测试钉死分库不变量：
-//   ① e.realStore 与 e.d1Store 必须分离；
-//   ② 实盘账本(realStore)持仓必须能被引擎的实时建议读取入口(RealPositionsForUser)看到；
-//   ③ D1 评分落库走 d1Store（研究库），绝不混入实盘账本库。
+//
+//	① e.realStore 与 e.d1Store 必须分离；
+//	② 实盘账本(realStore)持仓必须能被引擎的实时建议读取入口(RealPositionsForUser)看到；
+//	③ D1 评分落库走 d1Store（研究库），绝不混入实盘账本库。
+//
 // English: §UAT-2026-09-08 P0 regression — the live book (live.db) and the D1 score store (trading.db)
 // must be wired to separate engine stores. Before the fix, registry.go passed opts.D1Store as the
 // realStore (2nd arg of SetQMT), so pushRealAdvice read real_positions from the research DB and always

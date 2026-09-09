@@ -426,6 +426,16 @@ type Options struct {
 	// English: per-stock throttle in ms — sleeps between stocks to flatten instantaneous CPU/mem
 	// pressure during full-universe replay on small boxes. 0 = no throttling.
 	ThrottleMs int
+	// RiskFreeRate §WS-D D3 无风险利率（年化，小数）：Sharpe 日频口径 (mean(R_daily)−rf/252)/std×√252。
+	// 默认 0（A 股保守口径）；参考可配国债利率如 0.02。English: §WS-D D3 annual risk-free rate used in
+	// the daily-frequency Sharpe formula; default 0, a reasonable A-share reference is ~0.02.
+	RiskFreeRate float64
+	// PointInTime §WS-D D-2 时点股票池：置真时以回测起始日"当时点已上市且未退市"的股票池
+	//（store.UniverseAt(o.Start)，含退市样本消除幸存者偏差）替代全量 StockCodes()——
+	// 需 dataload 已用 --with-delisted 装载含退市元数据。English: §WS-D D-2 point-in-time universe —
+	// when set, run on the universe listed-and-not-yet-delisted at the backtest start (drops survivorship
+	// bias); requires dataload loaded with --with-delisted.
+	PointInTime bool
 }
 
 // DefaultDB 研究库默认路径：QUANT_DATA_DIR 优先，否则 ~/.quant-trading-v2/trading.db
@@ -757,16 +767,25 @@ func (o *Options) Run() error {
 
 	// §质控筛选：Screen 非空时用质控池（剔 ST/退市/多年亏损/地量股）替代全量 StockCodes()，
 	// 再叠加 MaxStocks 截断——全量回测不再是 maxstocks=300 的字母序傻截。
+	// §WS-D D-2：PointInTime=true 时改用"回测起始日时点股票池"（含退市样本），消除幸存者偏差。
 	// English: with a quality Screen set, build the universe from ScreenedCodes (drops ST/delisted/
-	// multi-year-loss/illiquid names), then apply the MaxStocks cap on top.
+	// multi-year-loss/illiquid names), then apply the MaxStocks cap on top. §WS-D D-2 — PointInTime
+	// switches to the listed-at-start universe (delisted included) to kill survivorship bias.
 	var codes []string
-	if o.Screen != nil {
+	switch {
+	case o.Screen != nil:
 		sc := *o.Screen
 		if sc.End == "" && o.End != "" {
 			sc.End = o.End // 质控窗口结束日对齐回测区间，避免用"今天"跨出回测区间
 		}
 		codes, err = db.ScreenedCodes(sc)
-	} else {
+	case o.PointInTime:
+		codes, err = db.UniverseAt(o.Start)
+		if err != nil {
+			return fmt.Errorf("时点股票池(%s): %w", o.Start, err)
+		}
+		log.Printf("回放股票池：时点口径 %d 只（截至 %s，含退市消除幸存者偏差）", len(codes), o.Start)
+	default:
 		codes, err = db.StockCodes()
 	}
 	if err != nil {
@@ -853,7 +872,7 @@ func (o *Options) Run() error {
 				time.Sleep(time.Duration(o.ThrottleMs) * time.Millisecond)
 			}
 		}
-		sm := summarize(trades)
+		sm := summarize(trades, o.RiskFreeRate)
 		if sm.Name == "" {
 			// 零触发时 summarize 拿不到交易行，名字会空——报告头变成"战法历史回测: （N 只股票）"。
 			// English: zero-trigger adapters have no trade row to carry the name; backfill it.
@@ -988,7 +1007,7 @@ type summary struct {
 }
 
 // summarize 汇总所有交易的胜率/盈亏指标。
-func summarize(trades []trade) *summary {
+func summarize(trades []trade, rf float64) *summary {
 	s := &summary{}
 	if len(trades) == 0 {
 		return s
@@ -1036,7 +1055,7 @@ func summarize(trades []trade) *summary {
 		pnls[k] = trades[idx].PnlPct
 		dates[k] = trades[idx].Date
 	}
-	s.Sharpe, s.MaxDrawdownPct, s.AnnualReturnPct, s.Calmar = perfMetrics(pnls, dates)
+	s.Sharpe, s.MaxDrawdownPct, s.AnnualReturnPct, s.Calmar = perfMetricsRF(pnls, dates, rf)
 	return s
 }
 

@@ -16,11 +16,11 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/cntime"
-	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/opslog"
+	"quant-trading-v2/internal/risk"
 	"quant-trading-v2/internal/store"
 )
 
@@ -75,6 +75,14 @@ type Controller struct {
 	lastSweepAt       time.Time // 最近一次 SweepOrders 执行时间（30s 节流）
 	lastCloseSweepDay string    // 最近一次执行收盘清单的交易日（每日一次）
 
+	// §WS-B 交割单对账节流：lastSettleDay 记录最近对账交易日（每日一次，mu 保护）
+	lastSettleDay string // 最近一次 SettleDay 的交易日
+
+	// §WS-C 风控闸口统一入口：placeOrder 的全部前置守卫收敛到 risk.Gate.CheckLiveOrder
+	//（controller 只保留 orderMu 串行、幂等与 executor 分发）。新闸命中即记录+告警。
+	// English: §WS-C unified risk gate — all pre-order guards live in risk.Gate.CheckLiveOrder.
+	gate *risk.Gate
+
 	// 通知回调（告警熔断/恢复）：由上层注入（SSE/notify）。
 	onAlert func(level, title, content string) // 告警回调（可空）
 }
@@ -92,6 +100,8 @@ func NewController(exec Executor, db *store.DB, userID string, cfg config.QMTCon
 		onAlert: onAlert,
 	}
 	c.exec.Store(execHolder{exec}) // §FIX#7 executor 走原子引用
+	// §WS-C 风控闸：告警回调复用 onAlert（新闸高优告警；存量守卫静默）。
+	c.gate = risk.NewGate(db, userID, onAlert)
 	return c
 }
 
@@ -285,9 +295,11 @@ func (c *Controller) setTripped(tripped bool, reason string) {
 		return
 	}
 	if tripped {
-		metrics.BreakerTripped() // §R4-9 熔断计数
+		metrics.BreakerTripped()              // §R4-9 熔断计数
+		metrics.SetGauge("breaker_active", 1) // §WS-L 熔断状态量规（告警规则 breaker_open）
 		onAlert("high", "QMT 实盘熔断", reason)
 	} else {
+		metrics.SetGauge("breaker_active", 0)
 		onAlert("info", "QMT 实盘恢复", "网关连接恢复，自动解熔")
 	}
 	log.Printf("[trading] circuit breaker %v: %s", tripped, reason)
@@ -433,65 +445,29 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		return nil, fmt.Errorf("qmt store not set")
 	}
 
-	// §GAP1.6 ST/退市风险警示股一律拒绝买入（auto/manual 全路径统一收口；
-	// 与信号层 combat_agent.IsSTStock 同一判定，堵住 ScanLimitUp 直出信号与手动单绕过）。
-	// §GAP2-W1 修复：守卫仅作用于买入方向——持仓股盘中被戴帽 ST/进黑名单属于"风险暴露已存在"，
-	// 拦截卖出等于强迫扛单，与止损/风控目标背道而驰；此前双向拦截会让这类仓位永远无法退出。
-	// English: §GAP1.6 ST/delisting-risk stocks are rejected on BUY only (both auto & manual paths),
-	// using the same combat_agent.IsSTStock check as the signal layer. §GAP2-W1 fix: sells are exempt —
-	// a held stock getting ST-flagged/blacklisted mid-day is existing exposure; blocking its exit would
-	// force holding, the opposite of risk control.
-	if req.Side == SideBuy && combat_agent.IsSTStock(req.Name) {
-		return nil, fmt.Errorf("ST/退市风险股禁止买入: %s", req.Name)
+	// §WS-C 风控闸口统一入口：ST/黑名单/T+1/涨跌停不可追单/行情新鲜度硬闸/日内已实现亏损熔断/
+	// 单票集中度/买入纪律/白名单/仓位上限 全部收敛到 risk.Gate.CheckLiveOrder 单一权威入口——
+	// controller 不再散装守卫（新增闸口只改 gate，不可能漏装）。命中即拒单并记录 risk_gates 命中；
+	// 新闸（涨跌停/新鲜度/熔断/集中度）额外高优告警。无数据字段（PrevClose/StalenessMs 等）对应闸
+	// fail-open 跳过。English: §WS-C unified risk gate — every pre-order guard lives in one authoritative
+	// entry (adding a gate means editing only the gate, it can't be forgotten); hits are recorded in
+	// risk_gates; new gates also alert; missing quote fields fail their gates open.
+	lo := risk.LiveOrder{
+		SignalID:     req.SignalID,
+		Code:         req.Code,
+		Name:         req.Name,
+		Strategy:     req.Strategy,
+		StrategyID:   req.StrategyID,
+		Side:         req.Side,
+		Price:        req.Price,
+		Qty:          req.Qty,
+		Amount:       req.Amount,
+		StalenessMs:  req.StalenessMs,
+		CurrentPrice: req.CurrentPrice,
+		PrevClose:    req.PrevClose,
 	}
-
-	// §GAP1.7 黑名单接线（仅买方向，理由同上）：命中 qmt.blacklist（含引擎同步的 Theme.BlackList）即拒。
-	// 纯数字与带后缀代码双向归一比对。English: §GAP1.7 blacklist wiring (buy-only) — normalized both ways.
-	if req.Side == SideBuy && blacklisted(cfg.Blacklist, req.Code) {
-		return nil, fmt.Errorf("黑名单股票禁止买入: %s", req.Code)
-	}
-
-	// §GAP1.3/1.4 买入纪律预检（卖出不受限）：单日买入笔数上限、单日买入预算、近似可用资金。
-	amount := req.Amount
-	if amount <= 0 {
-		amount = req.Price * float64(req.Qty)
-	}
-	if req.Side == SideBuy {
-		if err := c.checkBuyDiscipline(cfg, req.SignalID, amount); err != nil {
-			return nil, err
-		}
-	}
-
-	// 白名单过滤：strategies 非空且不含该策略时拒绝。**仅作用于买入方向**——
-	// §安全 T2（2026-08-29）：此前无 SideBuy 限制，一旦配置了白名单且不含持仓战法，
-	// auto 止损卖单 / M8 清仓卖单会被拒 → 止损不执行，资损。卖出不受白名单约束（退出的持仓
-	// 其战法可能未在白名单，但退出是既有风险敞口的了结，不应被拦）。
-	// §UAT-FIX 2026-08-31：白名单条目是战法 ID（n_shape/fac_1…），req.Strategy 是中文显示名——
-	// 只比显示名会让 ID 白名单永远拒绝。现同时匹配 StrategyID 与显示名。
-	if req.Side == SideBuy && len(cfg.Strategies) > 0 && req.Strategy != "" {
-		allowed := false
-		for _, s := range cfg.Strategies {
-			if s == req.Strategy || s == req.StrategyID {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return nil, fmt.Errorf("strategy %q not in qmt whitelist", req.Strategy)
-		}
-	}
-
-	// 仓位上限校验：max_positions>0 且当前持仓数已达上限时，仅允许卖出。
-	// §R3-1 P0-B 按账号过滤：此前读全表 RealPositions()，多账号部署下 A 的持仓上限被 B 的
-	// 持仓占满（误拒）。与插入侧 §W2-10 的 UserID 盖章对齐，读取侧统一走 ForUser。
-	if cfg.MaxPositions > 0 && req.Side == SideBuy {
-		poses, err := c.store.RealPositionsForUser(c.userID)
-		if err != nil {
-			return nil, err
-		}
-		if len(poses) >= cfg.MaxPositions {
-			return nil, fmt.Errorf("real positions %d >= max_positions %d", len(poses), cfg.MaxPositions)
-		}
+	if v := c.gate.CheckLiveOrder(cfg, lo); !v.Pass {
+		return nil, fmt.Errorf("%s", v.Reason)
 	}
 
 	// 幂等：同一 signal_id 不重复下单。
@@ -578,143 +554,6 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	opslog.Logf("quant", "下单受理 %s %s %s qty=%d price=%.2f amount=%.0f 策略=%s/%s order=%s",
 		req.SignalID, req.Side, req.Code, req.Qty, req.Price, req.Amount, req.StrategyID, req.Strategy, res.OrderID)
 	return res, nil
-}
-
-// blacklisted §GAP1.7 黑名单比对：统一委托给 config.CodeInBlacklist（§R3-8 P1-H 唯一权威实现，
-// 后缀剥离双向归一）。保留包内别名以兼容既有调用与测试。
-// English: §GAP1.7 blacklist check — delegates to the canonical config.CodeInBlacklist
-// (R3-8 P1-H) so the risk layer and the execution layer share one matching semantic.
-func blacklisted(list []string, code string) bool {
-	return config.CodeInBlacklist(list, code)
-}
-
-// checkBuyDiscipline §GAP1.3/1.4 买入纪律预检：单日买入笔数上限、单日买入预算、近似可用资金。
-// 数据源为本地 real_orders/real_positions 账本（崩溃安全，重启不丢当日累计）；
-// selfSignalID 排除自身（幂等重试场景下占位行可能已存在）；守卫先于 UpsertRealOrder 执行，
-// 被拒订单不落库、不污染当日统计。
-// §GAP2-W1 状态过滤：只统计 已报/部成/已成 三类真实占用资金的状态——"发送失败"占位降级行与
-// 已撤/废单不再虚耗当日预算与笔数（幽灵单根因之一）。
-// §TZ1 日期口径：委托时间统一换算北京时区再取日（此前用服务器本地时区，首尔 KST 主机在
-// 北京时间 08:00 翻转日期，恰好落在盘前窗口）。
-// 可用资金 ≈ InitialCapital − Σ持仓成本市值 − 当日已报买单金额（近似口径，
-// 精确券商可用余额待 M2 网关协议扩展 query_cash 后接入）。
-// English: buy-discipline precheck — daily buy-count cap, daily budget and an estimated available-cash
-// check, derived from the local real book (crash-safe). selfSignalID excludes the ticket itself
-// (idempotent retries); guards run BEFORE UpsertRealOrder so rejected orders never pollute the sums.
-// §GAP2-W1 status filter: only 已报/部成/已成 count as real capital usage — send-failed placeholders,
-// cancelled and rejected orders no longer eat the daily budget. §TZ1: order timestamps are converted to
-// Beijing time before extracting the date. Exact broker cash lands with the M2 extension (query_cash).
-func (c *Controller) checkBuyDiscipline(cfg config.QMTConfig, selfSignalID string, amount float64) error {
-	if c.store == nil {
-		return nil
-	}
-	orders, err := c.store.RealOrdersForUser(c.userID)
-	if err != nil {
-		return fmt.Errorf("read real orders: %w", err)
-	}
-	today := cntime.In(time.Now()).Format("2006-01-02")
-	buys := 0
-	spent := 0.0
-	for _, o := range orders {
-		if o.Side != SideBuy || o.SignalID == selfSignalID {
-			continue
-		}
-		// §GAP2-W1 状态白名单：仅真实占款状态计入；发送失败/已撤等跳过。
-		// English: §GAP2-W1 only capital-consuming statuses count.
-		switch o.Status {
-		case "已报", "部成", "已成":
-		default:
-			continue
-		}
-		at, perr := time.Parse(time.RFC3339, o.CreatedAt)
-		if perr != nil || cntime.In(at).Format("2006-01-02") != today {
-			continue
-		}
-		buys++
-		spent += o.Price * float64(o.Qty)
-	}
-	if cfg.DailyMaxBuys > 0 && buys >= cfg.DailyMaxBuys {
-		return fmt.Errorf("单日买入笔数达上限 %d（今日已报 %d 笔）", cfg.DailyMaxBuys, buys)
-	}
-	if cfg.DailyBudgetAmount > 0 && spent+amount > cfg.DailyBudgetAmount {
-		return fmt.Errorf("单日买入预算不足: 已报 %.0f + 本次 %.0f > 预算 %.0f", spent, amount, cfg.DailyBudgetAmount)
-	}
-	if cfg.InitialCapital > 0 {
-		// §FIX-0921g 近似口径让位于券商实口径（2026-09-01 用户实录「开关开着零实盘交易」终极根因）：
-		// InitialCapital 是静态配置值，不随实际入金增长——用户实际已追加资金（持仓成本 113,012
-		// > 初始配置 100,000 → 近似可用恒为负数 −13,012），无论券商真实可用 1,500.45 充足与否
-		// 都被这道硬闸先拒。券商口径可用资金（网关 account 事件回灌）是账本事实、已含全部入金：
-		// **快照可用且新鲜（≤10min）时本近似硬闸让位（跳过），由下方券商闸独立把关**；
-		// 券商数据缺失/过期时才回落到本近似口径维持旧防线（保守折算 50% 的券商闸仍在）。
-		// English: supersede the static-capital approximation when the broker-reported available cash
-		// is present and fresh (≤10min) — the broker number is the ledger fact (includes all deposits);
-		// the legacy InitialCapital−held−spent estimate is stale-by-design (static config never grows
-		// with deposits, here it went negative −13,012 and hard-rejected every buy despite ample real
-		// cash). The approximation only guards when broker data is missing/stale.
-		brokerFresh := false
-		if acc, aerr := c.store.GetRealAccount(c.userID); aerr == nil && acc.AvailableCash > 0 {
-			if at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc); perr == nil &&
-				time.Since(at) <= 10*time.Minute {
-				brokerFresh = true
-			}
-		}
-		if !brokerFresh {
-			pos, err := c.store.RealPositionsForUser(c.userID)
-			if err != nil {
-				return fmt.Errorf("read real positions: %w", err)
-			}
-			held := 0.0
-			for _, p := range pos {
-				held += p.CostPrice * float64(p.Qty)
-			}
-			if avail := cfg.InitialCapital - held - spent; amount > avail {
-				return fmt.Errorf("可用资金不足: 预估可用 %.0f（本金%.0f−持仓成本%.0f−今日已报%.0f）< 本次 %.0f",
-					avail, cfg.InitialCapital, held, spent, amount)
-			}
-		}
-	}
-	// §R4-3 真实可用资金回灌：网关 account 事件（broker.query_asset）落库的券商口径可用资金，
-	// 在新鲜（10 分钟内）时作为额外硬约束。券商 cash 口径已扣除其侧冻结（含已报未成交单），
-	// 故此处不再扣减本地 spent，避免与券商冻结双重扣减；近似口径检查仍然并行生效——
-	// 两道闸都过才放行，任一拒绝即拒单。
-	// English: §R4-3 feeds the broker-side available cash (gateway account report) back into the
-	// buy discipline as an extra hard gate when fresh (≤10min). Broker cash already nets out its
-	// own frozen amounts, so local `spent` is NOT subtracted again (no double-count); the legacy
-	// approximation still runs in parallel — both gates must pass.
-	// §R4-3 真实可用资金回灌：网关 account 事件（broker.query_asset）落库的券商口径可用资金，
-	// 在新鲜（10 分钟内）时作为额外硬约束。券商 cash 口径已扣除其侧冻结（含已报未成交单），
-	// 故此处不再扣减本地 spent，避免与券商冻结双重扣减；近似口径检查仍然并行生效——
-	// 两道闸都过才放行，任一拒绝即拒单。
-	// 说明（2026-08-29）：AvailableCash<=0 视为"券商尚未回报可用资金/未接通"→ 跳过本闸，
-	// 由上方 InitialCapital-held-spent 近似口径继续守卫（fail-open 但有近似闸兜底）。
-	// 若需"券商明确回报 0 即拒单"，需新增"已回报"标志位区分，避免阻断 mock/刚连场景的合法买入。
-	if acc, err := c.store.GetRealAccount(c.userID); err == nil && acc.AvailableCash > 0 {
-		at, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, cntime.Loc)
-		if perr == nil {
-			// 保守口径：快照新鲜（≤10min）用全额可用；陈旧（断开/长时间未上报）则用 50%
-			// 作为上限，避免券商侧已冻结/已用资金未知时过量下单。
-			cap := acc.AvailableCash
-			fresh := time.Since(at) <= 10*time.Minute
-			if !fresh {
-				cap = acc.AvailableCash * 0.5
-			}
-			label := "实时"
-			if !fresh {
-				label = "陈旧保守折算50%"
-			}
-			if amount > cap {
-				return fmt.Errorf("可用资金不足(券商口径%s): 上限 %.2f < 本次 %.2f（上报于 %s）",
-					label, cap, amount, acc.UpdatedAt)
-			}
-		} else if acc.AvailableCash > 0 {
-			// UpdatedAt 无法解析：同样走保守 50%% 折算。
-			if amount > acc.AvailableCash*0.5 {
-				return fmt.Errorf("可用资金不足(券商口径, 时间戳异常保守折算50%%): 上限 %.2f < 本次 %.2f",
-					acc.AvailableCash*0.5, amount)
-			}
-		}
-	}
-	return nil
 }
 
 // Reconcile 从网关拉取全量持仓并落库（对账）。网关不可达时返回错误（不落库）。

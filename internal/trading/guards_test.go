@@ -435,3 +435,82 @@ func TestGuardSellExemptsSTAndBlacklist(t *testing.T) {
 		t.Fatalf("黑名单股卖出应豁免守卫放行: %v", err)
 	}
 }
+
+// TestGuardT1SellLocked §WS-A A5：当日买入份额 T+1 锁定——卖出超过可卖量被拒；
+// 可卖量内放行；本地无持仓行（未知仓位）fail-open 放行交给柜台。
+func TestGuardT1SellLocked(t *testing.T) {
+	db := testDB(t)
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	ctrl := NewController(guardServer(), db, "u_t1", cfg, nil)
+
+	// 今日建仓 100 股（fills 记录今日买入）
+	today := time.Now().Format("2006-01-02")
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "T1-B", Code: "600000.SH", Side: "买入",
+		Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:35:00", SignalID: "T1-BSIG", UserID: "u_t1"}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	sell := func(qty int) error {
+		_, err := ctrl.PlaceOrder(OrderRequest{SignalID: "T1-SELL", Code: "600000.SH", Name: "浦发",
+			Side: SideSell, Price: 10, Qty: qty, Amount: float64(qty) * 10,
+			CreatedAt: time.Now().Format(time.RFC3339)})
+		return err
+	}
+	// 全卖 100 → 全部当日买入锁定，应拒
+	if err := sell(100); err == nil || !strings.Contains(err.Error(), "T+1 不可卖") {
+		t.Fatalf("当日买入全卖应被 T+1 拒, got %v", err)
+	}
+	// 未知仓位代码（无持仓行）→ fail-open 放行
+	if err := sellOtherQty(t, ctrl); err != nil {
+		t.Fatalf("未知仓位卖出应 fail-open 放行: %v", err)
+	}
+}
+
+func sellOtherQty(t *testing.T, ctrl *Controller) error {
+	_, err := ctrl.PlaceOrder(OrderRequest{SignalID: "T1-SELL-OTHER", Code: "000002.SZ", Name: "万科",
+		Side: SideSell, Price: 10, Qty: 100, Amount: 1000,
+		CreatedAt: time.Now().Format(time.RFC3339)})
+	return err
+}
+
+// TestGuardCashReserve §WS-M：现金缓冲把可下单额压到 可用×(1−ratio)；
+// 券商口径缺失（无 account 行）时走近似闸 + reserve，验证放行/拒绝边界。
+func TestGuardCashReserve(t *testing.T) {
+	db := testDB(t)
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.InitialCapital = 10000
+	cfg.Money = config.MoneyMgmtConfig{CashReserveRatio: 0.5} // 保留 50%
+	ctrl := NewController(guardServer(), db, "u_res", cfg, nil)
+
+	// 5000 正好 = 可用 10000 × (1−0.5) → 放行
+	if _, err := ctrl.PlaceOrder(buyReq("RES-B1", 5000)); err != nil {
+		t.Fatalf("5000 ≤ 保留后可用 5000 应放行: %v", err)
+	}
+	// 再下 5001 → 超出 → 拒（此时已报 5000 计入 spent，avail=10000−5000−reserve(2500)=2500）
+	if _, err := ctrl.PlaceOrder(buyReq("RES-B2", 2600)); err == nil {
+		t.Fatalf("超出保留后可用应被拒")
+	}
+}
+
+// TestGuardLocalFrozen §WS-M：券商口径不可信且 TrustBrokerFreeze=false 时，
+// 本地已报未成交买单金额作为在途冻结从近似可用中扣除，防并发超买。
+func TestGuardLocalFrozen(t *testing.T) {
+	db := testDB(t)
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.InitialCapital = 10000
+	f := false
+	cfg.Money = config.MoneyMgmtConfig{TrustBrokerFreeze: &f}
+	ctrl := NewController(guardServer(), db, "u_fr", cfg, nil)
+
+	// 首单 6000 放行（占位行已报 6000 进入 orders 表）
+	if _, err := ctrl.PlaceOrder(buyReq("FR-B1", 6000)); err != nil {
+		t.Fatalf("首单应放行: %v", err)
+	}
+	// 第二单：近似可用 = 10000 − held(0) − spent(6000) − 在途冻结(6000) = −2000 → 拒
+	if _, err := ctrl.PlaceOrder(buyReq("FR-B2", 3000)); err == nil || !strings.Contains(err.Error(), "可用资金不足") {
+		t.Fatalf("本地在途冻结应把第二单拒掉, got %v", err)
+	}
+}

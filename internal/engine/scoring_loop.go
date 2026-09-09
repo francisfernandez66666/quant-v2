@@ -79,6 +79,15 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		e.syncMonitorBase()
 	}
 
+	// §WS-L 维5 阈值告警评估：每 30s 节流跑一轮（量规值越界持续满 For 才 fire，去重+恢复）。
+	// English: WS-L 维5 — throttled alert evaluation every 30s (sustained-for state machine, dedup,
+	// recovery).
+	now := time.Now()
+	if e.lastAlertEval.IsZero() || now.Sub(e.lastAlertEval) >= 30*time.Second {
+		metrics.RunAlertEvaluation()
+		e.lastAlertEval = now
+	}
+
 	// 交易时段门控（盘后/休市跳过，避免无效拉取）
 	// English: session gate — skip after-market/holiday to avoid pointless fetching.
 	if !data.IsActiveSession(time.Now()) {
@@ -558,6 +567,10 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	if res := ctrl.SweepOrders(time.Now()); res != nil {
 		_ = res // 摘要日志已在 SweepOrders 内按需打印
 	}
+	// §WS-B 券商交割单三方对账（默认关闭；启用后每日 settle_at 后对账一次，差异告警+可选补记）
+	if sc := ctrl.Config().Settle; sc.Enabled {
+		ctrl.MaybeSettleDay(data.TradingDayDate(time.Now()), sc.Mode, sc.At, true)
+	}
 
 	// §GAP2-W2 实盘建议定向化（I-4）：只读主账号（=QMT 归属账号，实盘仅 admin 开启）的持仓，
 	// SSE 只推给该账号——admin 真实持仓代码/数量/买卖建议不再每 5s 广播给所有在线用户。
@@ -703,16 +716,17 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		return nil
 	}
 	res, err := ctrl.PlaceOrder(trading.OrderRequest{
-		SignalID:  signalID,
-		Code:      p.TsCode,
-		Name:      p.Name,
-		Strategy:  p.Strategy,
-		Side:      trading.SideSell,
-		PriceType: cfg.PriceType,
-		Price:     price,
-		Qty:       qty,
-		Amount:    price * float64(qty),
-		CreatedAt: time.Now().Format(time.RFC3339),
+		SignalID:    signalID,
+		Code:        p.TsCode,
+		Name:        p.Name,
+		Strategy:    p.Strategy,
+		Side:        trading.SideSell,
+		PriceType:   cfg.PriceType,
+		Price:       price,
+		Qty:         qty,
+		Amount:      price * float64(qty),
+		CreatedAt:   time.Now().Format(time.RFC3339),
+		StalenessMs: e.quoteStalenessMs(p.TsCode),
 	})
 	if err != nil {
 		log.Printf("[qmt] 自动卖出 %s(%s) 失败: %v", p.TsCode, p.Name, err)

@@ -321,6 +321,20 @@ func main() {
 	if sec := cfgMgr.Rules.Runtime.FeedIntervalSec; sec > 0 {
 		fetcher.SetRefreshInterval(time.Duration(sec) * time.Second)
 	}
+	// §WS-G 快照流录制：QUANT_RECORD_STREAM=1 时把每轮 5s 快照追加为 quote_stream.jsonl
+	//（staging 录制，供回放 harness 以"与线上同输入"驱动打分循环；失败仅记日志不阻断采集）。
+	// English: §WS-G quote-stream recording — QUANT_RECORD_STREAM=1 appends each 5s snapshot as JSONL
+	// for the replay harness; failures only log, never block collection.
+	if os.Getenv("QUANT_RECORD_STREAM") == "1" {
+		sl, err := data.NewStreamLog(filepath.Join(dataDir, "quote_stream.jsonl"))
+		if err != nil {
+			log.Printf("[main] 快照流录制开启失败（继续采集）: %v", err)
+		} else {
+			fetcher.SetSnapshotSink(func(snap *data.MarketSnapshot) { _ = sl.Write(snap) })
+			defer sl.Close()
+			log.Printf("[main] 行情快照流录制已开启: %s", filepath.Join(dataDir, "quote_stream.jsonl"))
+		}
+	}
 	go fetcher.Start()
 	defer fetcher.Stop()
 	srv.SetFetcher(fetcher) // 报价接口优先读 5s 快照，缺失再降级拉取
@@ -361,8 +375,9 @@ func main() {
 		Paper:        paperEngine,
 		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
 		D1MaxTokens:  cfgMgr.Rules.LLM.D1MaxTokens,
-		RealStore:    realStore,  // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
-		D1Store:      researchDB, // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
+		RealStore:    realStore,   // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
+		D1Store:      researchDB,  // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
+		ShadowExec:   isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
 	})
 	srv.SetEngineRegistry(registry)
 
@@ -685,13 +700,29 @@ func sinceForSession(session data.MarketSession, now time.Time) (time.Time, bool
 	}
 }
 
-// getDataDir 返回数据存储目录，优先使用环境变量 QUANT_DATA_DIR，默认 ~/.quant-trading-v2。
+// getDataDir 返回数据存储目录：
+//   - QUANT_ENV=staging（staging 影子环境）→ 强制 ~/.quant-staging（忽略 QUANT_DATA_DIR，
+//     与生产数据/账本/配置完全隔离，防 staging 误读实盘数据或误连实盘网关）。
+//   - 否则优先 QUANT_DATA_DIR，默认 ~/.quant-trading-v2。
+//
+// English: data-dir resolution — the staging env forces ~/.quant-staging (fully isolated from
+// production data/books/config); otherwise QUANT_DATA_DIR wins with ~/.quant-trading-v2 as default.
 func getDataDir() string {
+	if os.Getenv("QUANT_ENV") == "staging" {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".quant-staging")
+	}
 	if v := os.Getenv("QUANT_DATA_DIR"); v != "" {
 		return v
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".quant-trading-v2")
+}
+
+// isStaging 是否处于 staging 影子环境（QUANT_ENV=staging）。
+// English: reports whether the process runs in the staging shadow environment.
+func isStaging() bool {
+	return os.Getenv("QUANT_ENV") == "staging"
 }
 
 // verifyDeployment §R6 P1-1 部署漂移自检（启动时调用一次，仅告警不阻断）。
@@ -708,6 +739,24 @@ func getDataDir() string {
 // incidents at startup: stale binary missing the executor-rebuild fix; LLM key typo → full-chain 401;
 // qmt.enabled=true with missing gateway_url/token pinning the executor to Noop.
 func verifyDeployment(cfgMgr *config.Manager) {
+	// —— 0. staging 影子环境 fail-fast ——
+	// §WS-G：QUANT_ENV=staging 下 qmt.enabled=true 一律拒绝启动（staging 严禁连接实盘网关；
+	// enabled=true 说明部署侧残留生产配置，一旦放行即资损级误连）。staging 的决策流由
+	// ShadowExecutor 接管（registry ShadowExec=isStaging()），qmt.enabled 在影子环境无意义。
+	// English: §WS-G staging fail-fast — QUANT_ENV=staging with qmt.enabled=true refuses to start:
+	// staging must never touch the real gateway (an enabled flag means a production config leaked in).
+	if isStaging() {
+		if cfgMgr.Get().QMT.Enabled {
+			log.Fatalf("[deploy] staging 环境检测到 qmt.enabled=true：staging 严禁连接实盘网关，拒绝启动。" +
+				"请将 qmt.enabled 置 false（staging 决策流由 ShadowExecutor 接管，不真下）")
+		}
+		log.Printf("[deploy] staging 影子环境启动: 数据目录=%s（QMT 一律走 ShadowExecutor，不真下）", getDataDir())
+	}
+	// —— 0.5 配置 schema 校验（§WS-K 维4：非法段启动即告警，不阻断，符合 only-warning 语义）——
+	if verr := config.Validate(cfgMgr.Get()); verr != nil {
+		log.Printf("[deploy] ⚠ 配置 schema 校验告警（不阻断启动）: %v", verr)
+		opslog.Logf("quant", "部署自检: 配置 schema 校验告警: %v", verr)
+	}
 	// —— 1. 二进制指纹 ——
 	if buildCommit == "" || buildCommit == "unknown" {
 		log.Printf("[deploy] ⚠ 二进制未注入 git 指纹（buildCommit=unknown）：部署脚本已带 -ldflags -X main.buildCommit，请勿手动裸 go build 覆盖线上产物")

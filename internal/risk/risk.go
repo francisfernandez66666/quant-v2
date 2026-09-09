@@ -133,7 +133,21 @@ func (e *Engine) checkCompliance(cc config.ComplianceConfig) *CheckResult {
 // （M8Check checks whether the portfolio drawdown from its peak hits the M8 fallback threshold,
 // triggering a sell-all when exceeded; Blocked=true means liquidation is required.）
 func (e *Engine) M8Check(currentTotal, peakTotal float64) *CheckResult {
-	cfg := e.cfg.Get()
+	var rules *config.Rules
+	if e != nil && e.cfg != nil {
+		rules = e.cfg.Get()
+	}
+	return M8CheckWith(rules, currentTotal, peakTotal)
+}
+
+// M8CheckWith M8 兜底判定共享实现（不依赖 Engine 实例，Gate.CheckPortfolio 与测试直接调用）。
+// §WS-C：原 M8Check 逻辑原样保留在此，Engine 委托同一口径。
+// English: M8CheckWith is the Engine-free shared M8 fallback used by Gate.CheckPortfolio and tests;
+// the original semantics are preserved verbatim.
+func M8CheckWith(cfg *config.Rules, currentTotal, peakTotal float64) *CheckResult {
+	if cfg == nil {
+		return &CheckResult{Pass: true}
+	}
 	rc := cfg.RiskCtrl
 	// M8 兜底未启用或无有效峰值时不检查
 	if !rc.M8Enabled || peakTotal <= 0 {

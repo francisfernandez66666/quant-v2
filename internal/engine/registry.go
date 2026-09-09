@@ -72,6 +72,11 @@ type EngineOptions struct {
 	// D1Store D1 评分历史库（d1_scores 表，研究侧数据）：必须留在研究库 trading.db，不可与实盘账本混库。
 	// English: D1 score history store (d1_scores, research-side) — must stay in the research DB (trading.db).
 	D1Store *store.DB // D1 评分库（trading.db）
+	// ShadowExec §WS-G 影子执行器开关：置真时控制器用 ShadowExecutor（决策落 shadow_orders、
+	// 回执受理、永不真下），staging 环境全链路验证而不碰钱。
+	// English: §WS-G shadow-executor switch — when true the controller uses ShadowExecutor (decisions
+	// persisted to shadow_orders, echoed as accepted, never really placed) for full staging runs.
+	ShadowExec bool // 影子执行器（staging）
 }
 
 // InitStage 引擎初始化进度阶段。
@@ -799,8 +804,13 @@ func (r *Registry) build(userID string) *Engine {
 			}
 		}
 		// 网关客户端：真实网关或 noop（enabled=false / URL 为空时 noop 降级，仅记账不真下）。
+		// §WS-G staging：ShadowExec 置真时无论 qmt.enabled 一律用影子执行器（决策留痕、永不真下）。
+		// English: §WS-G staging — ShadowExec=true forces the shadow executor regardless of qmt.enabled
+		// so staging exercises the full decision tree without real orders.
 		var exec trading.Executor = trading.NoopExecutor{}
-		if qmtCfg.Enabled && qmtCfg.GatewayURL != "" {
+		if opts.ShadowExec {
+			exec = trading.NewShadowExecutor(opts.RealStore, userID)
+		} else if qmtCfg.Enabled && qmtCfg.GatewayURL != "" {
 			exec = trading.NewQMTClient(qmtCfg.GatewayURL, qmtCfg.Token,
 				time.Duration(qmtCfg.TimeoutSec)*time.Second, 1)
 		}

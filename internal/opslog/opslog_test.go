@@ -43,6 +43,41 @@ func TestLogfWriteAndAppend(t *testing.T) {
 	}
 }
 
+// TestAuditWriteAndRetention §WS-F C1：Audit 写独立 audit-YYYYMMDD.log，结构与保留期与 opslog 一致。
+func TestAuditWriteAndRetention(t *testing.T) {
+	dir := t.TempDir()
+	at := time.Date(2026, 8, 31, 15, 0, 0, 0, time.Local)
+	fixedClock(t, at)
+	Init(dir, 0)
+
+	Audit("login", "u_1", "admin", "ok")
+	Audit("kill_switch", "u_2", "qmt", "set")
+	Audit("settle", "u_1", "2026-08-31", "fail: 券商无交割单")
+
+	data, err := os.ReadFile(filepath.Join(dir, "audit-20260831.log"))
+	if err != nil {
+		t.Fatalf("读取 audit 失败: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("应有三行, got %d: %q", len(lines), data)
+	}
+	for i, want := range []string{
+		"event=login actor=u_1 target=admin result=ok",
+		"event=kill_switch actor=u_2 target=qmt result=set",
+		"event=settle actor=u_1 target=2026-08-31 result=fail: 券商无交割单",
+	} {
+		if !strings.HasPrefix(lines[i], "2026-08-31 15:00:00 | ") || !strings.Contains(lines[i], want) {
+			t.Fatalf("第 %d 行不符: %q (want contains %q)", i, lines[i], want)
+		}
+	}
+	// 未 Init 时静默
+	savedDir, savedWarn := dir, warned
+	t.Cleanup(func() { dir, warned = savedDir, savedWarn })
+	dir = ""
+	Audit("login", "u_9", "x", "ok") // 不应 panic
+}
+
 // TestNotInitializedSilent 未 Init 时静默无 panic、无文件。
 func TestNotInitializedSilent(t *testing.T) {
 	savedDir, savedWarn := dir, warned

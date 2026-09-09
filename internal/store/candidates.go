@@ -138,6 +138,40 @@ func (d *DB) CandidateByID(id int64) (*Candidate, error) {
 	return c, nil
 }
 
+// CandidateExistsPromotion §WS-H 维7：判断某灰度候选是否已有 [晋升候选] 记录且仍在生命周期内
+// （proposed/approved/applied/grayscale）——按 Params.from_candidate 匹配，避免重复生成晋升候选。
+// English: WS-H 维7 — reports whether a grayscale candidate already has an in-lifecycle promotion
+// record (matched via Params.from_candidate), preventing duplicate promotion candidates.
+func (d *DB) CandidateExistsPromotion(fromCandidate int64) (bool, error) {
+	rows, err := d.db.Query(`SELECT `+candidateCols+` FROM research_candidates
+		WHERE status IN (?,?,?,?)`, CandProposed, CandApproved, CandApplied, CandGrayscale)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		c, err := scanCandidate(rows)
+		if err != nil {
+			return false, err
+		}
+		if promotionFromCandidate(c.Params) == fromCandidate {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// promotionFromCandidate 解析 Params JSON 中的 from_candidate（0=无）。
+func promotionFromCandidate(params string) int64 {
+	var p struct {
+		FromCandidate int64 `json:"from_candidate"`
+	}
+	if json.Unmarshal([]byte(params), &p) != nil {
+		return 0
+	}
+	return p.FromCandidate
+}
+
 // UpdateCandidateStatus 更新候选状态。
 // （UpdateCandidateStatus sets a candidate's status.）
 func (d *DB) UpdateCandidateStatus(id int64, status string) error {

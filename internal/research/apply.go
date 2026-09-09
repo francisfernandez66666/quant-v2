@@ -22,6 +22,7 @@ import (
 // 引擎侧按需读取（B5 一键应用；config 热加载链路同时生效）。
 // （ApplyWeights writes an approved weight candidate to applied_rules.json.）
 func ApplyWeights(dataDir string, c *store.Candidate) error {
+	snapshotBeforeWrite(dataDir)
 	var weights map[string]float64
 	if err := json.Unmarshal([]byte(c.Weights), &weights); err != nil {
 		return err
@@ -338,9 +339,10 @@ func UpdateAppliedFactorStats(dataDir, id string, sc, win, loss int, cum float64
 	return saveAppliedFactors(dataDir, entries)
 }
 
-// saveAppliedFactors 落盘战法库。
-// English: persists the strategy library.
+// saveAppliedFactors 落盘战法库（§WS-H C2 写前自动快照，支持参数回滚）。
+// English: persists the strategy library (WS-H C2: pre-write snapshot for rollback).
 func saveAppliedFactors(dataDir string, entries []AppliedFactorEntry) error {
+	snapshotBeforeWrite(dataDir)
 	b, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return err
@@ -591,6 +593,7 @@ func UpdateAppliedPatternStats(dataDir, id string, sc, win, loss int, cum float6
 // saveAppliedPatterns 落盘形态战法库（JSON 缩进格式，0644）。
 // （saveAppliedPatterns persists the pattern strategy library.）
 func saveAppliedPatterns(dataDir string, entries []AppliedPatternEntry) error {
+	snapshotBeforeWrite(dataDir)
 	b, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return err

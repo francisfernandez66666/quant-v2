@@ -50,6 +50,7 @@ func main() {
 	codesFile := flag.String("codes", "", "finance 研究池文件（每行一个 ts_code）")
 	finStart := flag.Int("fin-start", 2020, "财务起始年份")
 	finEnd := flag.Int("fin-end", time.Now().Year(), "财务结束年份")
+	withDelisted := flag.Bool("with-delisted", false, "§WS-D D-2 拉取已退市/暂停上市股票（list_status=L,D,P），消除回测幸存者偏差")
 	flag.Parse()
 
 	args := flag.Args()
@@ -74,7 +75,7 @@ func main() {
 	case "full":
 		var err error
 		if *provider == "tushare" {
-			err = runFull(db, *token, *start, *end)
+			err = runFull(db, *token, *start, *end, *withDelisted)
 		} else {
 			err = bsFull(db, bsClient, *start, *end)
 		}
@@ -150,8 +151,8 @@ func main() {
 
 // runFull 全量装载：元数据 → 行情类 → 财务类。
 // （runFull loads metadata, then bar-like tables by date, then financials per stock.）
-func runFull(db *store.DB, token, start, end string) error {
-	if err := loadMeta(db, token); err != nil {
+func runFull(db *store.DB, token, start, end string, withDelisted bool) error {
+	if err := loadMeta(db, token, withDelisted); err != nil {
 		return fmt.Errorf("元数据: %v", err)
 	}
 	if err := loadIndex(db, token, start, end); err != nil {
@@ -172,17 +173,24 @@ func runFull(db *store.DB, token, start, end string) error {
 
 // loadMeta 装载股票基础信息与交易日历（全量幂等）。
 // （loadMeta loads stock basics and the trading calendar, idempotent.）
-func loadMeta(db *store.DB, token string) error {
+func loadMeta(db *store.DB, token string, withDelisted bool) error {
 	c := data.NewTushareClient(token)
 
-	rows, err := c.StockBasic()
+	// §WS-D D-2：默认仅在市（list_status=L，现状）；--with-delisted 时拉 L,D,P 全量
+	//（含退市，供回测时点股票池消除幸存者偏差）。English: §WS-D D-2 — default only listed; with the
+	// flag, pull L,D,P so delisted names enter the point-in-time backtest universe.
+	listStatus := "L"
+	if withDelisted {
+		listStatus = "L,D,P"
+	}
+	rows, err := c.StockBasicWithStatus(listStatus)
 	if err != nil {
 		return err
 	}
 	if n, err := db.InsertRows("stocks", store.TableColumns("stocks"), toMaps(rows)); err != nil {
 		return err
 	} else {
-		log.Printf("[dataload] stocks 写入 %d 行", n)
+		log.Printf("[dataload] stocks 写入 %d 行（list_status=%s）", n, listStatus)
 	}
 
 	// 交易日历拉 2015-至今（含 2020 前的校准区间，供热手/校准回测使用）

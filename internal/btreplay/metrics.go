@@ -2,10 +2,12 @@
 // 此前全系统零风险调整指标，胜率/盈亏比之外无任何波动与回撤刻画；
 // 现对逐笔净额收益率序列统一计算，供回放汇总（summary）与扫参排名（sweepResult）消费。
 //
-// 口径说明：
+// 口径说明（§WS-D D3 修正）：
 //   - 输入为按时间排序的逐笔收益率（%，净额口径含成本）与对应入场日（YYYYMMDD）；
-//   - Sharpe = 逐笔收益均值/总体标准差 × sqrt(年化笔数)；年化笔数 = N / 跨度年数，
-//     样本 <2 笔或标准差为 0 返回 0；
+//   - Sharpe 改**日频净值口径**：把逐笔收益按入场日聚合（同日多笔复利合成当日收益）得到日收益序列，
+//     Sharpe = (mean(R_daily) − rf/252) / std(R_daily) × sqrt(252)，rf 为年化无风险利率（默认 0，
+//     A 股参考口径可配国债利率如 0.02）；旧口径为"逐笔收益均值/标准差 × sqrt(年化笔数)"——
+//     非标准（笔数频率≠日历频率），已废弃。日样本 <2 笔或标准差为 0 返回 0；
 //   - MaxDrawdown：逐笔复利净值曲线的最大峰谷回撤（输出正数 %）；
 //   - AnnualReturn：期末复利总收益年化（%；净值非正时返回 -100）；
 //   - Calmar = |年化收益 / 最大回撤|（MDD=0 时返回 0）。
@@ -13,36 +15,64 @@ package btreplay
 
 import (
 	"math"
+	"sort"
 	"time"
 )
 
-// perfMetrics 计算一组交易的夏普/最大回撤/年化/卡玛。
+// perfMetrics 计算一组交易的夏普/最大回撤/年化/卡玛（rf=0 的便捷封装，语义同 perfMetricsRF）。
+// English: perfMetrics wraps perfMetricsRF with a zero risk-free rate.
 func perfMetrics(pnls []float64, dates []string) (sharpe, maxDD, annual, calmar float64) {
+	return perfMetricsRF(pnls, dates, 0)
+}
+
+// perfMetricsRF 计算一组交易的夏普/最大回撤/年化/卡玛（§WS-D D3 日频口径）。
+//  1. 按入场日聚合逐笔收益（同日多笔复利合成当日收益）→ 日收益序列 R_daily；
+//  2. Sharpe = (mean(R_daily) − rf/252) / std(R_daily) × sqrt(252)；rf 为年化无风险利率；
+//  3. MaxDD/AnnualReturn/Calmar 沿用逐笔复利净值曲线口径（不受 Sharpe 口径变更影响）。
+//
+// English: §WS-D D3 — daily-frequency Sharpe: per-trade returns are compounded into a daily series by
+// entry date, then Sharpe = (mean(R_daily) − rf/252) / std(R_daily) × sqrt(252) with rf as the annual
+// risk-free rate. MaxDD/annual/Calmar keep the compounded per-trade equity-curve semantics.
+func perfMetricsRF(pnls []float64, dates []string, rf float64) (sharpe, maxDD, annual, calmar float64) {
 	n := len(pnls)
-	if n == 0 {
+	if n == 0 || len(dates) != n {
 		return 0, 0, 0, 0
 	}
 
-	// 均值 / 总体标准差
-	mean := 0.0
-	for _, p := range pnls {
-		mean += p
-	}
-	mean /= float64(n)
-	if n >= 2 {
-		var ss float64
-		for _, p := range pnls {
-			ss += (p - mean) * (p - mean)
+	// 按日聚合：同日多笔复利合成当日收益；dayOf 存小数（0.2=20%），逐笔复利 (1+dayOf)*(1+p/100)−1。
+	dayOf := map[string]float64{}
+	var dayIdx []string
+	for i, p := range pnls {
+		d := dates[i]
+		if _, ok := dayOf[d]; !ok {
+			dayIdx = append(dayIdx, d)
 		}
-		std := math.Sqrt(ss / float64(n))
-		if std > 1e-12 && len(dates) == n {
-			if years := spanYears(dates[0], dates[n-1]); years > 0 {
-				sharpe = mean / std * math.Sqrt(float64(n)/years)
-			}
+		dayOf[d] = (1+dayOf[d])*(1+p/100) - 1
+	}
+	sort.Strings(dayIdx)
+	daily := make([]float64, len(dayIdx))
+	for i, d := range dayIdx {
+		daily[i] = dayOf[d]
+	}
+
+	// 日频 Sharpe：(mean(R_daily) − rf/252) / std(R_daily) × sqrt(252)
+	if len(daily) >= 2 {
+		mean := 0.0
+		for _, r := range daily {
+			mean += r
+		}
+		mean /= float64(len(daily))
+		var ss float64
+		for _, r := range daily {
+			ss += (r - mean) * (r - mean)
+		}
+		std := math.Sqrt(ss / float64(len(daily)))
+		if std > 1e-12 {
+			sharpe = (mean - rf/252) / std * math.Sqrt(252)
 		}
 	}
 
-	// 复利净值曲线 → 最大回撤 + 期末净值
+	// 复利净值曲线 → 最大回撤 + 期末净值（沿用逐笔口径）
 	eq, peak := 1.0, 1.0
 	for _, p := range pnls {
 		eq *= 1 + p/100
@@ -57,7 +87,7 @@ func perfMetrics(pnls []float64, dates []string) (sharpe, maxDD, annual, calmar 
 	}
 
 	// 年化收益 + 卡玛
-	if n >= 2 && len(dates) == n {
+	if n >= 2 {
 		if years := spanYears(dates[0], dates[n-1]); years > 0 {
 			if eq <= 0 {
 				annual = -100

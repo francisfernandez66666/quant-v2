@@ -43,8 +43,9 @@ import (
 // 日志文件名与行内时间戳的格式、保留策略常量。
 const (
 	// filePrefix 文件名前缀；dateLayout 文件名与行内时间戳共用的本地日期格式。
-	filePrefix = "opslog-"
-	dateLayout = "20060102"
+	filePrefix  = "opslog-"
+	auditPrefix = "audit-"
+	dateLayout  = "20060102"
 	// lineLayout 行首时间戳格式（本地时区，量化主程序/researchd 均固定 Asia/Shanghai）。
 	lineLayout = "2006-01-02 15:04:05"
 	// defaultKeepDays 默认保留天数（保留期内的每日文件全量留存）。
@@ -139,6 +140,39 @@ func DayOnce(key string, fn func()) {
 	OncePer(now().Format(dateLayout)+"|"+key, 48*time.Hour, fn)
 }
 
+// Audit 追加一条安全审计记录到 `audit-YYYYMMDD.log`（与 opslog 同目录、同保留期）。
+// 事件是结构化的低噪声安全敏感事件：登录成败/注册/改密/禁启用/角色变更/QMT 开关与熔断/
+// 撤单/kill-switch/配置热更/settle 纠偏/越权访问拒绝。未 Init 或 IO 失败静默降级。
+// 语义约定：event=事件名，actor=操作者(uid或IP)，target=对象(账号/路径/单号)，result=ok|deny|fail|...
+// English: append one structured security-audit line to audit-YYYYMMDD.log (same dir/retention as
+// opslog). Silent no-op when uninitialized or on IO errors — never disturb the trading path.
+func Audit(event, actor, target, result string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if dir == "" {
+		return
+	}
+	t := now()
+	line := fmt.Sprintf("%s | event=%s actor=%s target=%s result=%s\n",
+		t.Format(lineLayout), event, actor, target, result)
+	path := filepath.Join(dir, auditPrefix+t.Format(dateLayout)+".log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		warnLocked(err)
+		return
+	}
+	_, werr := io.WriteString(f, line)
+	f.Close()
+	if werr != nil {
+		warnLocked(werr)
+		return
+	}
+	if d := t.Format(dateLayout); d != lastDay {
+		lastDay = d
+		sweepLocked(t) // 跨日首写：顺手清理过期文件（覆盖 opslog- 与 audit- 双前缀）
+	}
+}
+
 // pruneLocked 清理 once 表中已远超窗口的键（阈值：超过 256 条时才值得扫一遍）。
 func pruneLocked(t time.Time) {
 	if len(once) <= 256 {
@@ -162,8 +196,10 @@ func sweepLocked(t time.Time) {
 	cutoff := t.AddDate(0, 0, -keepDays).Format(dateLayout)
 	var names []string
 	for _, e := range entries {
-		if n := e.Name(); strings.HasPrefix(n, filePrefix) && strings.HasSuffix(n, ".log") {
-			names = append(names, strings.TrimSuffix(strings.TrimPrefix(n, filePrefix), ".log"))
+		for _, pre := range []string{filePrefix, auditPrefix} {
+			if n := e.Name(); strings.HasPrefix(n, pre) && strings.HasSuffix(n, ".log") {
+				names = append(names, strings.TrimSuffix(strings.TrimPrefix(n, pre), ".log"))
+			}
 		}
 	}
 	sort.Strings(names) // 旧日期在前，可提前退出
@@ -174,8 +210,10 @@ func sweepLocked(t time.Time) {
 		if n >= cutoff {
 			break // 已按名排序，后续必然更新
 		}
-		if err := os.Remove(filepath.Join(dir, filePrefix+n+".log")); err != nil && !os.IsNotExist(err) {
-			warnLocked(err)
+		for _, pre := range []string{filePrefix, auditPrefix} {
+			if err := os.Remove(filepath.Join(dir, pre+n+".log")); err != nil && !os.IsNotExist(err) {
+				warnLocked(err)
+			}
 		}
 	}
 }

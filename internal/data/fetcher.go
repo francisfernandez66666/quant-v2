@@ -51,6 +51,9 @@ type Fetcher struct {
 	dataDir string
 	// §GAP3.3 盘中延迟监控：最近一次成功采集 unix 秒；Staleness() 供健康检查/告警消费。
 	lastOK atomic.Int64
+	// §WS-G 快照流接收器：每次成功采集后回调（staging 录制 quote_stream.jsonl 供回放）。
+	// English: §WS-G snapshot-stream sink invoked after each successful fetch (staging records JSONL).
+	sink func(*MarketSnapshot)
 	// 陈旧告警节流（unix 秒）
 	lastStaleWarn atomic.Int64
 	// 落盘节拍计数
@@ -449,7 +452,41 @@ func (f *Fetcher) fetch() {
 	f.snapshot = snapshot
 	f.mu.Unlock()
 	f.lastOK.Store(time.Now().Unix())
+	f.emitSink(snapshot)
 	f.persistSnapshotMaybe(snapshot)
+}
+
+// SetSnapshotSink §WS-G 注册快照流接收器（staging 录制 / 回放对比用；可空）。
+// English: §WS-G registers a snapshot-stream sink (staging recording / replay parity; may be nil).
+func (f *Fetcher) SetSnapshotSink(fn func(*MarketSnapshot)) {
+	f.mu.Lock()
+	f.sink = fn
+	f.mu.Unlock()
+}
+
+// emitSink 在锁外回调快照接收器（不阻塞采集主流程）。
+// English: emits the snapshot to the sink outside the lock (non-blocking for the fetch loop).
+func (f *Fetcher) emitSink(snap *MarketSnapshot) {
+	f.mu.RLock()
+	fn := f.sink
+	f.mu.RUnlock()
+	if fn != nil {
+		fn(snap)
+	}
+}
+
+// IngestSnapshot §WS-G 回放：把录制/外部快照注入 fetcher（替代一轮采集），
+// 驱动打分循环与线上同输入。English: §WS-G replay — injects a recorded/external snapshot into the
+// fetcher (replacing a fetch round) so the scoring loop runs on identical inputs to production.
+func (f *Fetcher) IngestSnapshot(snap *MarketSnapshot) {
+	if snap == nil {
+		return
+	}
+	f.mu.Lock()
+	f.snapshot = snap
+	f.mu.Unlock()
+	f.lastOK.Store(time.Now().Unix())
+	f.emitSink(snap)
 }
 
 // SetDataDir §GAP3.2 启用快照落盘（启动时调用一次）。
@@ -520,6 +557,19 @@ func (f *Fetcher) Staleness() time.Duration {
 		return 0
 	}
 	return time.Since(time.Unix(ts, 0))
+}
+
+// StalenessMs §WS-C 行情新鲜度硬闸用：返回当前快照陈旧度（毫秒；-1=从未采集）。
+// 快照采集是全局的（全池一轮一起刷），故单 code 与全局陈旧度一致，code 参数保留
+// 供未来按源/分片精细化的接口形态。English: quote staleness in ms for the §WS-C hard gate
+// (-1 when never fetched). The snapshot refresh is global, so per-code staleness equals the global
+// value; the code param reserves the shape for future per-source staleness.
+func (f *Fetcher) StalenessMs(code string) int64 {
+	ts := f.lastOK.Load()
+	if ts == 0 {
+		return -1
+	}
+	return time.Since(time.Unix(ts, 0)).Milliseconds()
 }
 
 // inAuctionWindow 当前是否处于集合竞价注入窗口（9:15-9:26，Asia/Shanghai）。

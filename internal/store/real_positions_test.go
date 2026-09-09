@@ -407,3 +407,89 @@ func TestSchemaMigrationP01P02(t *testing.T) {
 		t.Fatalf("应存在 2 条委托, got %d", len(orders))
 	}
 }
+
+// TestApplyRealFillIdempotentDuplicate §WS-A A2：同笔成交（order_id+traded_at+price+qty 复合键）
+// 二次投递必须判为重复且不二次累加持仓（原实现依赖 SQLite 错误文案匹配，本用例验证结构化判重）。
+func TestApplyRealFillIdempotentDuplicate(t *testing.T) {
+	db := testDB(t)
+	base := RealFill{OrderID: "O1", Code: "600000.SH", Side: "买入", Price: 10, Qty: 100,
+		Amount: 1000, TradedAt: "2026-08-20 09:35:00", SignalID: "SIG1"}
+	if err := db.ApplyRealFill(base); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	// 同笔再投递
+	if err := db.ApplyRealFill(base); err != nil {
+		t.Fatalf("duplicate should be idempotent-success, got err=%v", err)
+	}
+	p, _ := db.RealPositionByCode("600000.SH")
+	if p.Qty != 100 {
+		t.Fatalf("重复投递后持仓应仍为 100, got %d", p.Qty)
+	}
+	fills, _ := db.RealFills()
+	if len(fills) != 1 {
+		t.Fatalf("fills 应只有 1 条, got %d", len(fills))
+	}
+	// 同 order_id 但不同 traded_at（部分成交第二笔）应正常累加
+	if err := db.ApplyRealFill(RealFill{OrderID: "O1", Code: "600000.SH", Side: "买入", Price: 10, Qty: 100,
+		Amount: 1000, TradedAt: "2026-08-20 09:36:00", SignalID: "SIG1"}); err != nil {
+		t.Fatalf("partial second: %v", err)
+	}
+	p, _ = db.RealPositionByCode("600000.SH")
+	if p.Qty != 200 {
+		t.Fatalf("部分成交第二笔应累加至 200, got %d", p.Qty)
+	}
+}
+
+// TestBuyDateAndT1Sellable §WS-A A5：建仓写 buy_date；T+1 可卖量=持仓−当日买入（按账号隔离）。
+func TestBuyDateAndT1Sellable(t *testing.T) {
+	db := testDB(t)
+	// u1 当日买入 100（T+1 锁定）
+	if err := db.ApplyRealFill(RealFill{OrderID: "O1", Code: "600000.SH", Side: "买入", Price: 10, Qty: 100,
+		Amount: 1000, TradedAt: "2026-09-08 09:35:00", SignalID: "SIG1", UserID: "u1"}); err != nil {
+		t.Fatalf("open u1: %v", err)
+	}
+	// 隔夜加仓 50（前一日买入，可卖）
+	if err := db.ApplyRealFill(RealFill{OrderID: "O2", Code: "600000.SH", Side: "买入", Price: 12, Qty: 50,
+		Amount: 600, TradedAt: "2026-09-07 14:00:00", SignalID: "SIG2", UserID: "u1"}); err != nil {
+		t.Fatalf("open overnight: %v", err)
+	}
+	if got := db.TodayBoughtQty("u1", "600000.SH", "2026-09-08"); got != 100 {
+		t.Fatalf("今日买入应 100, got %d", got)
+	}
+	// 可卖 = 150 − 100 = 50（当日买入的 100 股 T+1 锁定）
+	if got := db.BuyableQtyForUserSell("u1", "600000.SH", "2026-09-08"); got != 50 {
+		t.Fatalf("可卖应 50, got %d", got)
+	}
+	// 账号隔离：u2 看不到 u1 的买入
+	if got := db.TodayBoughtQty("u2", "600000.SH", "2026-09-08"); got != 0 {
+		t.Fatalf("u2 今日买入应 0, got %d", got)
+	}
+}
+
+// TestScopedDeleteAfterClose §WS-A A3：跨账号清仓互不影响——u1 清仓只删 u1（含遗留全局）行，
+// 绝不删除 u2 的同码持仓。
+func TestScopedDeleteAfterClose(t *testing.T) {
+	db := testDB(t)
+	mk := func(uid string) {
+		if err := db.ApplyRealFill(RealFill{OrderID: uid + "-B", Code: "600000.SH", Side: "买入", Price: 10, Qty: 100,
+			Amount: 1000, TradedAt: "2026-09-07 09:35:00", SignalID: uid + "-S", UserID: uid}); err != nil {
+			t.Fatalf("open %s: %v", uid, err)
+		}
+	}
+	mk("u1")
+	mk("u2")
+	// u1 全卖清仓
+	if err := db.ApplyRealFill(RealFill{OrderID: "u1-S1", Code: "600000.SH", Side: "卖出", Price: 11, Qty: 100,
+		Amount: 1100, TradedAt: "2026-09-08 10:00:00", SignalID: "u1-SELL", UserID: "u1"}); err != nil {
+		t.Fatalf("close u1: %v", err)
+	}
+	// u2 的持仓必须还在
+	p2, err := db.RealPositionByCodeForUser("u2", "600000.SH")
+	if err != nil || p2.Qty != 100 {
+		t.Fatalf("u2 持仓应保留 100, got %+v err=%v", p2, err)
+	}
+	_, err = db.RealPositionByCodeForUser("u1", "600000.SH")
+	if err != sql.ErrNoRows {
+		t.Fatalf("u1 清仓后应无持仓, err=%v", err)
+	}
+}

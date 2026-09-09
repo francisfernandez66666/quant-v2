@@ -947,23 +947,40 @@ export function onSSE(fn) {
 // Notes:
 //  - 已有连接或未登录时直接返回（幂等操作，避免重复建连）；
 //  - returns immediately if already connected or not logged in (idempotent, avoids duplicate connections);
-//  - 连接 URL = baseUrl() + '/api/events?token=' + encodeURIComponent(token)；
-//  - connection URL = baseUrl() + '/api/events?token=' + encodeURIComponent(token);
+//  - §WS-F C4a：先 POST /api/events/ticket 取 60s 一次性票据，再以
+//    connection URL = baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket) 建链；
+//    票据一次性（用后即废）、过期即废，即使泄漏进 access log 也无法复用/冒充他人建链。
+//  - §WS-F C4a: mint a one-time 60s ticket at POST /api/events/ticket, then connect to
+//    baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket). The ticket is consumed on
+//    first use and expires, so a leaked URL cannot open a second stream.
 //  - 收到消息时解析 JSON 并依次调用 sseCallbacks 中的回调；
 //  - received messages are parsed as JSON and dispatched to each callback in sseCallbacks;
 //  - onerror 触发时关闭旧连接，3 秒后重新建立，实现手动重连。
 //  - onerror closes the old connection and reconnects after 3 seconds (manual reconnect).
-export function connectSSE() {
+export async function connectSSE() {
   if (sse) return
   const token = getToken()
   // 未登录时不建立连接
   // Do not connect when not logged in
   if (!token) return
+  // 先取一次性票据：每次（重）建链都要重新签发（旧票已消费/过期）
+  // Mint a fresh one-time ticket per (re)connect; the previous one is spent or expired
+  let ticket = ''
+  try {
+    const resp = await request('/api/events/ticket', { method: 'POST' })
+    ticket = resp && resp.ticket ? resp.ticket : ''
+  } catch (_) {}
+  if (!ticket) {
+    // 票据签发失败（如 token 失效）：走一次探测，交给上层统一回到登录态
+    // Ticket mint failed (e.g. dead token): probe once and let the app return to login
+    request('/api/status').catch(() => {})
+    return
+  }
   // 说明：浏览器 EventSource 会自动携带 Last-Event-ID 头（来自服务端 `id:` 行），
   //       服务端据此实现断线续传（见 handleFixSSE 读取 Last-Event-ID）。
   // Note: the browser EventSource automatically sends the Last-Event-ID header
   //       (from the server's `id:` line), enabling reconnect resume server-side.
-  sse = new EventSource(baseUrl() + '/api/events?token=' + encodeURIComponent(token))
+  sse = new EventSource(baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket))
   sse.onmessage = (e) => {
     // 成功收到一条消息即重置重连计数（连接已恢复）
     sseRetry = 0

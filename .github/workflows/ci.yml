@@ -90,6 +90,10 @@ jobs:
         working-directory: web
         run: npm ci
 
+      - name: Test（§WS-I vitest 门禁：SSE 票据/认证/UI 组件回归）
+        working-directory: web
+        run: npm test
+
       - name: Build（§R4-10 前端构建门禁：JSX 语法/路由懒加载分包/vendor 拆分回归）
         working-directory: web
         run: npm run build

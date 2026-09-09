@@ -29,6 +29,11 @@ import (
 type SweepConfig struct {
 	Objective string // "profitFactor"(默认) | "winRate" | "avgWin"；空串取默认
 	TopN      int    // 输出前 N 名，默认 10
+	// §WS-H C2 多重检验校正开关：开启时 SWEEP_JSON 输出 Bonferroni 校正后 p 值简报
+	// （校正因子=该战法本次测试组合数）。默认关=现状不改变输出形状。
+	// English: WS-H C2 multiple-comparison correction switch — when enabled, the SWEEP_JSON payload
+	// includes a Bonferroni-corrected p-value (factor = combos tested for that strategy).
+	MCC bool
 }
 
 // 策略自有寻优池：每个战法独立设定止盈线/止损线/兜底天数的搜索范围（§用户反馈）。
@@ -151,6 +156,12 @@ type sweepResult struct {
 	MaxDrawdownPct  float64 `json:"max_drawdown_pct"`  // 复利净值最大回撤%（正数）
 	AnnualReturnPct float64 `json:"annual_return_pct"` // 年化收益率（%）
 	Calmar          float64 `json:"calmar"`            // 卡玛比率（年化收益/最大回撤）
+
+	// §WS-H C2 多重检验：单组合 t 检验 p 值（均值>0 双尾）；Bonferroni 校正值在
+	// SWEEP_JSON 输出时按该战法组合数计算（见 runSweep 2g）。
+	// English: WS-H C2 multiple-comparison — per-combo one-sample t-test p (two-sided mean>0);
+	// the Bonferroni-adjusted value is applied at JSON output using the strategy's tested-combo count.
+	PValue float64 `json:"p_value"` // 逐笔净收益均值>0 的双尾 t 检验 p 值
 }
 
 // runSweep 扫参主流程。codes 为裸码列表；industryChg 与普通回放同构。
@@ -274,7 +285,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			hasChamp := false
 			for ci := lo; ci < hi; ci++ {
 				cb := combos[ci]
-				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs)
+				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate)
 				r.ObjectiveScore = objectiveValue(obj, &r)
 				all = append(all, r)
 				cur := &all[len(all)-1]
@@ -392,6 +403,22 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		}
 
 		// 2g) 输出该战法 SWEEP_JSON（worker 解析落库：冠军行 + grid/batches 附带信息）
+		// §WS-H C2 多重检验简报：p_value=单组合 t 检验 p；mcc=true 时附 Bonferroni 校正
+		// （×该战法组合数，封顶 1），未过校正（p_bonf≥0.05）标注 not_significant。
+		// English: WS-H C2 MCC brief — p_value from the per-combo t-test; with MCC on, add the
+		// Bonferroni-corrected p (× tested-combo count, capped at 1) plus a not_significant flag.
+		mccInfo := map[string]any{
+			"tested_combos": len(combos),
+			"p_value":       best.PValue,
+		}
+		if o.Sweep.MCC {
+			pBonf := bonferroniP(best.PValue, len(combos))
+			mccInfo["p_value_bonf"] = pBonf
+			mccInfo["corrected"] = true
+			if pBonf >= 0.05 {
+				mccInfo["not_significant"] = true
+			}
+		}
 		jsonResult := map[string]any{
 			"rank": 1, "strategy": ad.Name(), "strategy_kind": kind,
 			"params":        map[string]any{"take_profit_pct": best.Trail, "stop_loss_pct": best.StopLossPct, "hold_days": best.Hold, "min_score": best.MinScore, "atr_stop_mult": best.AtrStopMult},
@@ -403,6 +430,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			"avg_loss_pct":  best.AvgLossPct,
 			"trigger_count": best.Count,
 			"avg_hold_days": best.AvgHold,
+			"mcc":           mccInfo,
 			// §F5 风险调整指标：finalizeResult 已算好 Sharpe/MDD/年化/Calmar，此前漏带出 SWEEP_JSON
 			// → worker 落库读到缺失字段恒为 0（optimization_results 531..527 全 0.0 的根因）。
 			// English: §F5 risk-adjusted metrics were computed by finalizeResult but never included in
@@ -509,7 +537,7 @@ func simulateCombo(ad adapter, kind string, o *Options, klines map[string][]data
 		}
 	}
 	restore() // 恢复原始参数
-	finalizeResult(&res, winSum, lossSum, pnls, dates)
+	finalizeResult(&res, winSum, lossSum, pnls, dates, o.RiskFreeRate)
 	return res
 }
 
@@ -747,7 +775,7 @@ func betterOf(obj string, a, b *sweepResult) *sweepResult {
 // atrStopMult>0 enables the ATR dynamic stop (Phase 3, requires the parallel ATR14 series).
 func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string][]data.KLine,
 	takeProfitPct, stopLossPct float64, maxHold int, minScore float64,
-	atrStopMult float64, atrs map[string][]float64) sweepResult {
+	atrStopMult float64, atrs map[string][]float64, rf float64) sweepResult {
 	res := sweepResult{Name: name, Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct,
 		Hold: maxHold, MinScore: minScore, AtrStopMult: atrStopMult}
 	nextFree := map[string]int{} // code -> 可再入场最早下标（同股持仓期内不重复入场）
@@ -777,13 +805,13 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 			lossSum += pnl
 		}
 	}
-	finalizeResult(&res, winSum, lossSum, pnls, dates)
+	finalizeResult(&res, winSum, lossSum, pnls, dates, rf)
 	return res
 }
 
 // finalizeResult 由胜负计数与盈亏和聚合出 胜率/均盈/均亏/盈亏比/期望/风险调整指标
 // （两种模拟共用口径；pnls/dates 为按发生序的逐笔净额收益与入场日）。
-func finalizeResult(res *sweepResult, winSum, lossSum float64, pnls []float64, dates []string) {
+func finalizeResult(res *sweepResult, winSum, lossSum float64, pnls []float64, dates []string, rf float64) {
 	if res.Count == 0 {
 		return
 	}
@@ -802,7 +830,9 @@ func finalizeResult(res *sweepResult, winSum, lossSum float64, pnls []float64, d
 	}
 	wr := res.WinRate / 100
 	res.Expectancy = wr*res.AvgWinPct + (1-wr)*res.AvgLossPct
-	res.Sharpe, res.MaxDrawdownPct, res.AnnualReturnPct, res.Calmar = perfMetrics(pnls, dates)
+	res.Sharpe, res.MaxDrawdownPct, res.AnnualReturnPct, res.Calmar = perfMetricsRF(pnls, dates, rf)
+	// §WS-H C2 单组合统计显著性：逐笔净收益均值>0 的双尾 t 检验 p 值。
+	res.PValue = oneSampleTP(pnls)
 }
 
 // stepRangeF 浮点步进序列（止盈/止损/门槛维），含起终点；非法输入回退单档。

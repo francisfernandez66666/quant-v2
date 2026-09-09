@@ -45,7 +45,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|lifecycle-eval")
 	}
 	cmd := args[0]
 
@@ -95,6 +95,10 @@ func main() {
 	case "approve":
 		dataDir := filepath.Dir(*dbPath)
 		cmdApprove(db, args[1:], dataDir)
+	case "lifecycle-eval":
+		// §WS-H 维7 灰度晋升评估（CLI 触发，夜间调度器可配置周期执行）
+		dataDir := filepath.Dir(*dbPath)
+		cmdLifecycleEval(db, dataDir, args[1:])
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}

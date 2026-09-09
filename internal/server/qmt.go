@@ -20,10 +20,11 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
-	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/trading"
 )
 
@@ -646,7 +647,7 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.applySetQMTConfig(w, userIDFor(r), req)
+	s.applySetQMTConfig(w, userIDFor(r), userIDFor(r), req)
 }
 
 // applySetQMTConfig 局部合并 QMT 实盘配置并保存到目标账号（§2026-09-07 多账号实盘）：
@@ -654,7 +655,11 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 // 校验与落库语义一致（指针字段=本次要改的，nil=保持原值）。
 // English: merges and persists a QMT config patch for the target account — shared by the operator
 // endpoint and the admin per-account endpoint so validation/save semantics stay identical.
-func (s *Server) applySetQMTConfig(w http.ResponseWriter, target string, req setQMTConfigReq) {
+func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, req setQMTConfigReq) {
+	// §WS-K 维4 保存前快照上一版 config.json（全局无 store 路径；best-effort，失败仅告警不阻断）。
+	// English: WS-K 维4 — snapshot the previous config.json before saving (best-effort).
+	beforeBytes, _ := config.RestoreRulesContentCurrent(s.cfg)
+	_, _ = config.SnapshotRules(s.cfg)
 	cfg := *(s.cfg.GetQMTConfigFor(target))
 
 	if req.Mode != nil {
@@ -797,7 +802,27 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, target string, req set
 		cfg.StrategyAmounts = out
 	}
 
+	// §WS-K 维4 保存前 schema 校验：非法配置返回 400，不再静默排队/落库。
+	// English: WS-K 维4 — schema-validate before persisting; invalid configs get an explicit 400.
+	if verr := config.Validate(&config.Rules{QMT: cfg}); verr != nil {
+		writeError(w, 400, "非法配置: "+verr.Error())
+		return
+	}
 	s.cfg.SetQMTConfigFor(target, &cfg)
+	// §WS-K 维4 变更 diff → opslog 审计（可下载/前端历史可见）
+	if beforeBytes != nil {
+		if afterBytes, err := config.RestoreRulesContentCurrent(s.cfg); err == nil {
+			if d, derr := config.DiffRules(beforeBytes, afterBytes); derr == nil && d != "(无变更)" {
+				opslog.Audit("config_change", actor, "qmt", d)
+			}
+		}
+	}
+	// §WS-F C1 审计：QMT 配置变更留痕（enabled 翻转为"上线/下线"，其余为"hot_reload"）
+	event := "qmt_config_hot_reload"
+	if req.Enabled != nil {
+		event = map[bool]string{true: "qmt_go_live", false: "qmt_shutdown"}[cfg.Enabled]
+	}
+	opslog.Audit(event, actor, target, "ok")
 	// 诊断日志：记录每次保存的真实账号、目标 enabled 与落盘后回读值，确认是否真正写盘。
 	saved := s.cfg.GetQMTConfigFor(target)
 	log.Printf("[diag-qmt] POST qmt config target=%s operator=%s reqEnabled=%v savedEnabled=%v", target, s.operatorID(), cfg.Enabled, saved.Enabled)
@@ -862,6 +887,12 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 	// §DAILY_OPSLOG kill-switch 属最高优先级留档事件
 	opslog.Logf("quant", "kill-switch %s 用户=%s 撤销未成交委托=%d",
 		map[bool]string{true: "置位(紧急停止)", false: "解除"}[*req.Halted], uid, cancelled)
+	// §WS-F C1 审计：kill-switch 翻转留痕
+	result := "clear"
+	if *req.Halted {
+		result = "set"
+	}
+	opslog.Audit("kill_switch", uid, "qmt", result)
 	if s.sse != nil {
 		s.sse.BroadcastTo(uid, map[string]interface{}{
 			"type":      "qmt_halt",
@@ -871,6 +902,74 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": "1", "halted": *req.Halted, "cancelled": cancelled})
+}
+
+// handleQMTSettle §WS-B 交割单三方对账端点（POST /api/qmt/settle，admin 权限）：
+// 请求体 {"day":"2026-09-08","mode":"report_only|sync_fills"}（day 缺省今天）。
+// 调用 Controller.SettleDay 拉券商交割单 ↔ 本地账本三方比对，差异落 settlement_diff + 告警。
+// English: §WS-B settlement endpoint (admin) — triggers a three-way reconciliation for a day,
+// persisting diffs to settlement_diff and alerting on discrepancies.
+func (s *Server) handleQMTSettle(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Day  string `json:"day"`
+		Mode string `json:"mode"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Day == "" {
+		req.Day = cntime.In(time.Now()).Format("2006-01-02")
+	}
+	if req.Mode == "" {
+		req.Mode = trading.SettleModeReportOnly
+	}
+	ctrl := s.qmtCtrlFor(userIDFor(r))
+	if ctrl == nil {
+		writeError(w, 503, "real book not available")
+		return
+	}
+	diff, err := ctrl.SettleDay(req.Day, req.Mode)
+	if err != nil {
+		opslog.Audit("settle", userIDFor(r), req.Day, "fail: "+err.Error())
+		writeError(w, 502, "settle failed: "+err.Error())
+		return
+	}
+	// 差异告警（与调度路径一致）
+	if diff != nil && (len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch) > 0) {
+		s.notifySettleDiff(userIDFor(r), diff)
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": "1", "day": req.Day, "mode": req.Mode,
+		"diff": diff,
+	})
+}
+
+// notifySettleDiff §WS-B 对账差异告警（P1 强提醒 + opslog）。
+// English: alerts a settlement diff via the notify/opslog channels.
+func (s *Server) notifySettleDiff(uid string, diff *store.SettlementDiff) {
+	opslog.Logf("quant", "交割单对账差异 用户=%s 日=%s 缺失=%d 多余=%d 不符=%d 费用差=%.2f 现金差=%.2f",
+		uid, diff.Day, len(diff.MissingInLocal), len(diff.ExtraInLocal), len(diff.Mismatch), diff.FeeDiff, diff.CashDiff)
+	if s.sse != nil {
+		s.sse.BroadcastTo(uid, map[string]interface{}{
+			"type": "settlement_diff",
+			"diff": diff,
+			"time": time.Now().Format("15:04:05"),
+		})
+	}
+}
+
+// handleQMTSettleHistory §WS-B 对账历史（GET /api/qmt/settle/history，admin）。
+// English: settlement history (admin).
+func (s *Server) handleQMTSettleHistory(w http.ResponseWriter, r *http.Request) {
+	db := s.realDB()
+	if db == nil {
+		writeError(w, 503, "real book not available")
+		return
+	}
+	diffs, err := db.ListSettlementDiffs(20)
+	if err != nil {
+		writeError(w, 500, "list settlement diffs: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": "1", "diffs": diffs})
 }
 
 // handleQMTCancel §R4-1 手动撤单端点（POST /api/qmt/cancel/{order_id}，admin 权限）：

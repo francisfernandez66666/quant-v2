@@ -267,3 +267,40 @@ func (c *QMTClient) SwitchBroker(broker string) error {
 	defer cancel()
 	return c.do(ctx, http.MethodPost, "/admin/broker", map[string]string{"broker": broker}, nil)
 }
+
+// SettlementTrade 券商交割单单笔成交（§WS-B 三方对账的券商权威源）。
+// English: one broker settlement trade (the broker-authoritative leg of three-way reconciliation).
+type SettlementTrade struct {
+	OrderID  string  `json:"order_id"`  // 委托号
+	TsCode   string  `json:"ts_code"`   // 代码
+	Side     string  `json:"side"`      // 买入/卖出
+	Price    float64 `json:"price"`     // 价格
+	Qty      int     `json:"qty"`       // 数量
+	Amount   float64 `json:"amount"`    // 金额
+	Fee      float64 `json:"fee"`       // 手续费
+	StampTax float64 `json:"stamp_tax"` // 印花税
+	Serial   string  `json:"serial"`    // 交割流水号
+	TradedAt string  `json:"traded_at"` // 成交时间
+}
+
+// SettlementResponse 网关 /settlement 响应（§WS-B）。
+// English: gateway /settlement response.
+type SettlementResponse struct {
+	Date      string             `json:"date"`
+	Account   string             `json:"account"`
+	Trades    []SettlementTrade  `json:"trades"`
+	Cash      map[string]float64 `json:"cash"`
+	Connected bool               `json:"connected"`
+}
+
+// FetchSettlement 拉取券商交割单（GET /settlement?date=YYYYMMDD，§WS-B 三方对账权威源）。
+// English: fetches the broker settlement for a day (three-way reconciliation authoritative leg).
+func (c *QMTClient) FetchSettlement(date string) (*SettlementResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+	var out SettlementResponse
+	if err := c.do(ctx, http.MethodGet, "/settlement?date="+date, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

@@ -72,6 +72,41 @@ func apiReq(t *testing.T, hr *httpRig, token, method, path string, body []byte) 
 	return rec.Code, rec.Body.String()
 }
 
+// apiReqWithOrigin 携带指定 Origin/Host 头请求（CORS 测试用）；origin 为空则不带 Origin 头。
+// 固定请求 Host 为 quant.local（与同源断言一致）。
+func apiReqWithOrigin(t *testing.T, hr *httpRig, method, path, origin string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	req.Host = "quant.local"
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	rec := httptest.NewRecorder()
+	hr.srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// sseConnectStatus 建立 SSE 连接，用带超时的上下文驱动 ServeHTTP 返回后取状态码。
+// qs 直接作为 query string（如 ticket=xxx 或 token=xxx）。
+func sseConnectStatus(t *testing.T, hr *httpRig, qs string) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/events?"+qs, nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		hr.srv.ServeHTTP(rec, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("SSE 建链超时")
+	}
+	return rec.Code
+}
+
 // TestHTTPAuthRequired 未带 token 访问业务端点应返回 401。
 func TestHTTPAuthRequired(t *testing.T) {
 	data.DisableAll = true
@@ -84,6 +119,123 @@ func TestHTTPAuthRequired(t *testing.T) {
 		if code != 401 {
 			t.Errorf("%s 无token应401, got %d body=%s", path, code, body)
 		}
+	}
+}
+
+// TestHTTPAdminIsolation §WS-E 多账号敏感隔离：子账号请求 admin 专属端点（llm-debug /
+// stage-records，含运营账号 LLM 密钥池与全链路日志）→ 403；admin 正常 200。
+// English: §WS-E account isolation — sub-account tokens get 403 on admin-only sensitive endpoints
+// (operator LLM key pool / full pipeline logs); the admin keeps full access.
+func TestHTTPAdminIsolation(t *testing.T) {
+	data.DisableAll = true
+	defer func() { data.DisableAll = false }()
+
+	fix := loadFixtureMain(t)
+	hr := newHTTPServerRig(t, fix)
+	// 确保 tester 为管理员
+	if u, err := hr.rig.auth.Login("tester", "tester123"); err != nil {
+		t.Fatalf("login tester: %v", err)
+	} else if err := hr.rig.auth.SetRole(u.ID, "admin"); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	// 子账号
+	sub, err := hr.rig.auth.CreateUser("subuser", "subpass123", "user", nil, 30)
+	if err != nil {
+		t.Fatalf("create sub: %v", err)
+	}
+	subToken := hr.rig.auth.UserToken("subuser")
+	if subToken == "" {
+		t.Fatalf("sub token empty, user=%+v", sub)
+	}
+	for _, path := range []string{"/api/llm-debug", "/api/stage-records"} {
+		code, _ := apiGet(t, hr, subToken, path)
+		if code != 403 {
+			t.Errorf("子账号 %s 应 403, got %d", path, code)
+		}
+		code, _ = apiGet(t, hr, hr.token, path)
+		if code == 403 || code == 401 {
+			t.Errorf("管理员 %s 不应 403/401, got %d", path, code)
+		}
+	}
+	// 公共看板数据子账号仍可见（共享运营数据叙事）
+	if code, _ := apiGet(t, hr, subToken, "/api/signals"); code != 200 {
+		t.Errorf("子账号 /api/signals 应 200（运营数据共享）, got %d", code)
+	}
+}
+
+// TestHTTPCORSHardening §WS-F B4：跨域源（Origin 与 Host 不同且不在白名单）不写
+// Allow-Origin 头（浏览器拦截）；同源与无 Origin 的非浏览器请求正常放行。
+// English: §WS-F B4 CORS hardening — cross-origin requests get no Allow-Origin header (blocked by
+// browsers); same-origin and non-browser (no Origin) requests keep working.
+func TestHTTPCORSHardening(t *testing.T) {
+	data.DisableAll = true
+	defer func() { data.DisableAll = false }()
+
+	fix := loadFixtureMain(t)
+	hr := newHTTPServerRig(t, fix)
+
+	cross := apiReqWithOrigin(t, hr, http.MethodGet, "/api/status", "https://evil.example")
+	code, hdr := cross.Code, cross.Header().Get("Access-Control-Allow-Origin")
+	if hdr != "" {
+		t.Errorf("跨域源不应有 Allow-Origin 头, got %q (code=%d)", hdr, code)
+	}
+	same := apiReqWithOrigin(t, hr, http.MethodGet, "/api/status", "http://quant.local")
+	if got := same.Header().Get("Access-Control-Allow-Origin"); got != "http://quant.local" {
+		t.Errorf("同源应回显 Origin, got %q", got)
+	}
+	// 无 Origin 头（curl/探针）回退 *
+	noorig := apiReqWithOrigin(t, hr, http.MethodGet, "/api/status", "")
+	if got := noorig.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("无 Origin 头应回退 *, got %q", got)
+	}
+}
+
+// TestHTTPSSeTicket §WS-F C4a：POST /api/events/ticket 取一次性票据；
+// /api/events?ticket= 建链 200；同票二次使用 401；伪造/过期票 401；无票无 token 401；
+// 旧版 token query 兼容仍可用。
+// English: §WS-F C4a — mint a one-time SSE ticket, connect with it (200), reuse → 401, bogus → 401,
+// no credential → 401, and the legacy token query still works.
+func TestHTTPSSeTicket(t *testing.T) {
+	data.DisableAll = true
+	defer func() { data.DisableAll = false }()
+
+	fix := loadFixtureMain(t)
+	hr := newHTTPServerRig(t, fix)
+
+	// 无票无 token → 401
+	if code, _ := apiGet(t, hr, "", "/api/events"); code != 401 {
+		t.Errorf("/api/events 无凭证应 401, got %d", code)
+	}
+	// 伪造票据 → 401
+	if code, _ := apiGet(t, hr, hr.token, "/api/events?ticket=bogus"); code != 401 {
+		t.Errorf("/api/events 伪造票据应 401, got %d", code)
+	}
+	// 取票（需认证）
+	var resp struct {
+		Ticket string `json:"ticket"`
+	}
+	code, body := apiReq(t, hr, hr.token, http.MethodPost, "/api/events/ticket", nil)
+	if code != 200 {
+		t.Fatalf("POST /api/events/ticket → %d body=%s", code, body)
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil || resp.Ticket == "" {
+		t.Fatalf("ticket 响应异常: %v body=%s", err, body)
+	}
+	// 有效票据建链 → 200（SSE 握手后阻塞，用超时上下文驱动返回）
+	if code := sseConnectStatus(t, hr, "ticket="+resp.Ticket); code != 200 {
+		t.Errorf("有效票据建链应 200, got %d", code)
+	}
+	// 同一票据复用 → 401（一次性）
+	if code, _ := apiGet(t, hr, hr.token, "/api/events?ticket="+resp.Ticket); code != 401 {
+		t.Errorf("已用票据应 401, got %d", code)
+	}
+	// 未认证取票 → 401
+	if code, _ := apiReq(t, hr, "", http.MethodPost, "/api/events/ticket", nil); code != 401 {
+		t.Errorf("未认证取票应 401, got %d", code)
+	}
+	// 旧版 token query 兼容
+	if code := sseConnectStatus(t, hr, "token="+hr.token); code != 200 {
+		t.Errorf("token query 兼容应 200, got %d", code)
 	}
 }
 

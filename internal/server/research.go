@@ -395,3 +395,43 @@ func (s *Server) approveCandidate(w http.ResponseWriter, r *http.Request, action
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
+
+// handleStrategySnapshots §WS-H C2：GET /api/research/strategies/snapshots —— 列出历史参数快照
+// （applied_*.json / grayscale_rules.json 的写前自动快照，最新在前），前端回滚选择用。
+// English: WS-H C2 — lists historical strategy-parameter snapshots (newest first) for rollback selection.
+func (s *Server) handleStrategySnapshots(w http.ResponseWriter, r *http.Request) {
+	if s.researchDir == "" {
+		writeError(w, 503, "研究目录未接入")
+		return
+	}
+	list, err := research.ListSnapshots(s.researchDir)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"snapshots": list})
+}
+
+// handleStrategyRollback §WS-H C2：POST /api/research/strategies/rollback {snapshot_ts}
+// —— 从历史快照原子恢复四类策略规则文件，记 opslog 审计。
+// 仅管理员可操作。English: WS-H C2 — restores the four strategy-rule files from a historical
+// snapshot (atomic), records an opslog audit. Admin only.
+func (s *Server) handleStrategyRollback(w http.ResponseWriter, r *http.Request) {
+	if s.researchDir == "" {
+		writeError(w, 503, "研究目录未接入")
+		return
+	}
+	var req struct {
+		SnapshotTS string `json:"snapshot_ts"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SnapshotTS == "" {
+		writeError(w, 400, "需要 snapshot_ts")
+		return
+	}
+	if err := research.RestoreSnapshot(s.researchDir, req.SnapshotTS); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	log.Printf("[research] 参数回滚到快照 %s（操作者=%s）", req.SnapshotTS, userIDFor(r))
+	writeJSON(w, 200, map[string]string{"status": "ok", "snapshot_ts": req.SnapshotTS})
+}

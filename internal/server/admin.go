@@ -11,6 +11,7 @@ import (
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/opslog"
 )
 
 // handleAuthMe 处理 GET /api/auth/me：返回当前登录用户的公开信息（角色/权限位），
@@ -146,6 +147,7 @@ func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	opslog.Audit("password_reset", userIDFor(r), id, "ok")
 	log.Printf("[admin] 用户 %s 已重置密码", id)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
@@ -398,5 +400,5 @@ func (s *Server) handleAdminSetQMTConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.applySetQMTConfig(w, id, req)
+	s.applySetQMTConfig(w, userIDFor(r), id, req)
 }

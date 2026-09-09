@@ -30,7 +30,7 @@ func TestQMTBrokerNotWired(t *testing.T) {
 		t.Fatalf("GET broker 未接入应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
 	var body struct {
-		OK bool   `json:"ok"`
+		OK  bool   `json:"ok"`
 		Err string `json:"err"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
@@ -53,7 +53,7 @@ func TestQMTBrokerSwitchInvalidBody(t *testing.T) {
 	s, admin := newAdminTestServer(t)
 
 	for name, body := range map[string]string{
-		"非JSON":    `not-json`,
+		"非JSON":   `not-json`,
 		"缺broker": `{}`,
 		"空串":      ``,
 	} {

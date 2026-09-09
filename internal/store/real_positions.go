@@ -54,17 +54,20 @@ type RealOrder struct {
 // RealFill 实盘成交回报行。
 // （RealFill is one live fill report.）
 type RealFill struct {
-	ID       int64   `json:"id"`                // 自增 ID
-	OrderID  string  `json:"order_id"`          // 订单ID
-	Code     string  `json:"code"`              // 代码
-	Name     string  `json:"name"`              // 名称（成交回报携带，建仓回填）
-	Side     string  `json:"side"`              // 方向
-	Price    float64 `json:"price"`             // 价格
-	Qty      int     `json:"qty"`               // 数量
-	Amount   float64 `json:"amount"`            // 成交额
-	TradedAt string  `json:"traded_at"`         // 成交时间
-	SignalID string  `json:"signal_id"`         // 信号ID
-	UserID   string  `json:"user_id,omitempty"` // §W2-10 归属账号
+	ID       int64   `json:"id"`                  // 自增 ID
+	OrderID  string  `json:"order_id"`            // 订单ID
+	Code     string  `json:"code"`                // 代码
+	Name     string  `json:"name"`                // 名称（成交回报携带，建仓回填）
+	Side     string  `json:"side"`                // 方向
+	Price    float64 `json:"price"`               // 价格
+	Qty      int     `json:"qty"`                 // 数量
+	Amount   float64 `json:"amount"`              // 成交额
+	TradedAt string  `json:"traded_at"`           // 成交时间
+	SignalID string  `json:"signal_id"`           // 信号ID
+	UserID   string  `json:"user_id,omitempty"`   // §W2-10 归属账号
+	Fee      float64 `json:"fee,omitempty"`       // §WS-B 手续费（交割单回灌）
+	StampTax float64 `json:"stamp_tax,omitempty"` // §WS-B 印花税（交割单回灌）
+	Serial   string  `json:"serial,omitempty"`    // §WS-B 券商交割流水号（三方对账关联键）
 }
 
 // UpsertRealPositions 全量对账写入：以网关推送的持仓集合为准，逐条 upsert 并移除已不在集合内的旧持仓。
@@ -359,11 +362,13 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 		if f.Side == "买入" {
 			// §修复 R8（2026-08-29）：建仓时回填成交携带的 name（此前硬编码空串，
 			// 导致实盘持仓页个股名称为空）。
+			// §WS-A T+1：建仓记录买入交易日 buy_date（北京时，T+1 可卖量判定用）。
+			buyDate := buyDateOf(f.TradedAt)
 			_, err = tx.Exec(`INSERT INTO real_positions
-				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				f.Code, f.Name, f.Qty, f.Price, f.Price*float64(f.Qty), f.Price, "", f.SignalID,
-				time.Now().Format("2006-01-02 15:04:05"), f.UserID)
+				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate)
 		}
 	case err == nil:
 		now := time.Now().Format("2006-01-02 15:04:05")
@@ -402,22 +407,112 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	if err != nil {
 		return fmt.Errorf("apply fill %s %s: %w", f.Code, f.Side, err)
 	}
-	if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0`); err != nil {
+	// §WS-A A3 作用域化清仓：只删"本次成交归属账号（∪遗留全局行）"下的 qty<=0 行，
+	// 绝不 `DELETE FROM real_positions WHERE qty<=0` 扫全表（多账号下会误删他人刚清仓的零仓行）。
+	if f.UserID == "" {
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0 AND user_id=''`); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.Exec(`DELETE FROM real_positions WHERE qty <= 0 AND (user_id='' OR user_id=?)`, f.UserID); err != nil {
+			return err
+		}
+	}
+	// §WS-A A2 结构化幂等：先按复合唯一键 (order_id,traded_at,price,qty) 显式判重——
+	// 网关 outbox 对同笔回报重试时，命中即视为已入账，整体事务回滚并返回幂等成功，
+	// 持仓数量不再被二次累加（此前依赖 SQLite 错误文案匹配，驱动措辞变化即静默失效）。
+	var dup int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM fills WHERE order_id=? AND traded_at=? AND price=? AND qty=?`,
+		f.OrderID, f.TradedAt, f.Price, f.Qty).Scan(&dup); err != nil {
 		return err
 	}
-	// §W2-10 流水行打归属账号；§W3-b 幂等唯一键 (order_id,traded_at,price,qty)：
-	// 网关 outbox 对同笔回报重试时，唯一索引冲突 → 视为已入账的重复投递，整体事务回滚并返回幂等成功，
-	// 持仓数量不再被二次累加（此前首尔侧零幂等，响应丢失即双倍记账）。
-	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed: fills.order_id") {
-			log.Printf("[store] fills 幂等命中(重复回报): order=%s traded_at=%s qty=%d", f.OrderID, f.TradedAt, f.Qty)
-			return tx.Rollback()
-		}
+	if dup > 0 {
+		log.Printf("[store] fills 幂等命中(重复回报): order=%s traded_at=%s qty=%d", f.OrderID, f.TradedAt, f.Qty)
+		return tx.Rollback()
+	}
+	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// buyDateOf 从成交时间串提取买入交易日（北京时 yyyy-MM-dd）；解析失败回退到 TradedAt 前 10 字符
+// （TradedAt 通常为 RFC3339 或 "yyyy-MM-dd HH:mm:ss"，前缀即日期）。空串返回 ""。
+// English: extracts the buy trading-day from a fill's traded-at string (Beijing date); falls back to
+// the first 10 chars (RFC3339 / SQL datetime prefix). Empty when the input is empty.
+func buyDateOf(tradedAt string) string {
+	if tradedAt == "" {
+		return ""
+	}
+	if len(tradedAt) >= 10 {
+		return tradedAt[:10]
+	}
+	return tradedAt
+}
+
+// TodayBoughtQty §WS-A T+1 可卖量辅助：统计某账号某代码在指定北京交易日的累计买入量
+// （含部成，不含撤单——fills 只记真实成交）。供卖出侧做 T+1 前置校验：
+// 可卖量 = 持仓量 − 当日买入量（当日买入的份额 T+1 才能卖）。
+// English: WS-A T+1 sell-availability helper — sums a code's today-bought qty per user/day,
+// so sellable = held − todayBought (same-day buys are T+1 locked).
+func (d *DB) TodayBoughtQty(userID, tsCode, day string) int {
+	var n int
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills
+		WHERE user_id=? AND code=? AND side='买入' AND substr(traded_at,1,10)=?`,
+		userID, tsCode, day).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// BuyableQtyForUserSell §WS-A T+1：返回某账号某代码"可立即卖出"的数量（持仓 − 当日买入）。
+// 遗留全局行（user_id=”）对该账号可见。English: WS-A T+1 sellable qty = held − todayBought.
+func (d *DB) BuyableQtyForUserSell(userID, tsCode, day string) int {
+	p, err := d.RealPositionByCodeForUser(userID, tsCode)
+	if err != nil {
+		return 0
+	}
+	bought := d.TodayBoughtQty(userID, tsCode, day)
+	q := p.Qty - bought
+	if q < 0 {
+		q = 0
+	}
+	return q
+}
+
+// LocalBuyFrozen §WS-M 本地在途冻结金额：某账号当日"已报/部成"买单中仍未成交部分的金额。
+//   - 已报：全额计入（amount = price×qty）；
+//   - 部成：按 amount − 已成交额（SumFilledQty 按 signal_id 前缀聚合）计入；
+//   - 发送失败/已撤/已成/废单：不计。
+//
+// 用途：券商口径不可信（过期/缺失）时，用本地账本显式计冻结，防并发信号超买。
+// English: §WS-M local frozen-in-transit — today's 已报/部成 buy orders' unfilled amount, used as a
+// local-freeze proxy when the broker cash snapshot is stale/missing (never double-counts vs broker).
+func (d *DB) LocalBuyFrozen(userID, day string) float64 {
+	rows, err := d.db.Query(`SELECT signal_id, status, price, qty FROM orders
+		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')`, userID)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	frozen := 0.0
+	for rows.Next() {
+		var sid, status string
+		var price float64
+		var qty int
+		if err := rows.Scan(&sid, &status, &price, &qty); err != nil {
+			continue
+		}
+		filled := d.SumFilledQty(userID, sid)
+		remain := qty - filled
+		if remain < 0 {
+			remain = 0
+		}
+		frozen += price * float64(remain)
+	}
+	return frozen
 }
 
 // UpsertRealOrder 写入/更新委托单；signal_id 冲突时返回已存在（幂等，不重复下单）。
@@ -442,10 +537,13 @@ func (d *DB) UpsertRealOrder(o RealOrder) (bool, error) {
 	return false, nil
 }
 
-// UpdateRealOrderStatus 更新委托单状态（已报/已撤/已成）。
-// （UpdateRealOrderStatus updates an order's status.）
+// UpdateRealOrderStatus §WS-A A4 收权：无用户作用域版本。历史裸 UPDATE 可回退委托真实进度，
+// 现已统一委托给带单调秩守卫的实现（UpdateRealOrderStatusMonotonic），杜绝状态倒卷。
+// 保留签名兼容遗留调用；全仓只有定义无调用（grep 证实），可安全保持为薄包装。
+// English: §WS-A A4 — legacy no-scope status update now routes through the monotonic rank-guarded
+// implementation so order progress can never regress. Kept as a thin wrapper for legacy callers.
 func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
-	_, err := d.db.Exec(`UPDATE orders SET status=? WHERE order_id=?`, status, orderID)
+	_, err := d.UpdateRealOrderStatusMonotonic("", orderID, status)
 	return err
 }
 
