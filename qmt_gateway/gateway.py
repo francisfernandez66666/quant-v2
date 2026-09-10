@@ -52,7 +52,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import Store, is_placeholder_order_id  # noqa: E402
+from store import Store, is_placeholder_order_id, json_default  # noqa: E402
 from ids import Idempotency  # noqa: E402
 from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
 from handler import ReportHandler, periodic_reconcile, is_active_trading_session  # noqa: E402
@@ -173,6 +173,10 @@ class Gateway:
         self._reconcile_thread = None
         self._broker_thread = None
         self._failover_thread = None
+        # §QMT-F16 文件桥 sidecar：QMT 模型沙箱无法联网（缺 C 扩展 socket）→
+        # 桥以 JSONL 文件上报事件（bridge_report.jsonl 追加行），由本线程读文件
+        # 并复用 _do_dispatch_result 语义（心跳/快照/派发回报/推量仔零改动）。
+        self._file_bridge_thread = None
         # xt 最近一次确认连接时间（自动翻转判定用；初始视为刚断开，避免一启动就误翻）
         self._xt_last_connected = 0.0
         # 来源 IP 白名单（由 main 从环境变量 ALLOWED_IPS 注入；空列表表示不做 IP 限制，仅依赖 token）
@@ -228,6 +232,10 @@ class Gateway:
         # §QMT-DUAL 自动翻转线程（xt 断连 N 秒且交易时段 → queued；切回仅手动）
         self._failover_thread = threading.Thread(target=self._failover_loop, daemon=True)
         self._failover_thread.start()
+        # §QMT-F16 文件桥 sidecar（哑文件读事件行 → 复用 dispatch/result 语义）
+        self._file_bridge_thread = threading.Thread(
+            target=self._file_bridge_loop, daemon=True, name="file-bridge")
+        self._file_bridge_thread.start()
         if self.cfg.get("reconcile_sec", 0) > 0:
             # active 通道运行时可变（自动翻转），对账源用 callable 取当前 active
             self._reconcile_thread = threading.Thread(
@@ -240,6 +248,94 @@ class Gateway:
     def _active_broker_fn(self):
         """对账/重连循环取当前 active 通道（运行时切换后立即生效）。"""
         return self.active_broker
+
+    def _file_bridge_path(self):
+        """§QMT-F16 桥上报文件路径：与网关同目录 bridge_report.jsonl（沙箱可写）。"""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(self.cfg.get("bridge_report_dir") or base_dir, "bridge_report.jsonl")
+
+    def _file_bridge_cmd_path(self):
+        """§QMT-F17 命令下发文件：网关侧每轮把 pending 派发行推送成该文件（桥执行）。"""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(self.cfg.get("bridge_report_dir") or base_dir, "bridge_cmd.json")
+
+    def _file_bridge_push_pending(self):
+        """§QMT-F16 file 桥命令下发：有 pending 派发项 → 原子写 bridge_cmd.json。
+        所有 pending 行由桥逐条执行并回报，gateway _apply_* 根据 seq 结算→done。
+        实现只对「有 pending」的轮次写文件（无 pending 不打扰桥）。"""
+        try:
+            pending = self.store.dispatch_pending(limit=50)
+        except Exception:  # noqa: BLE001
+            log.exception("[file-bridge] dispatch_pending failed")
+            return
+        if not pending:
+            return
+        cmd_path = self._file_bridge_cmd_path()
+        payload = {
+            "ts": time.time(),
+            "cmds": [
+                {
+                    "seq": p.get("seq"), "kind": p.get("kind"),
+                    "signal_id": p.get("signal_id"), "code": p.get("code"),
+                    "side": p.get("side"), "price_type": p.get("price_type"),
+                    "price": p.get("price"), "qty": p.get("qty"),
+                    "order_id": p.get("order_id"),
+                }
+                for p in pending
+            ],
+        }
+        tmp = cmd_path + ".tmp"
+        try:
+            body = json.dumps(payload, ensure_ascii=False, default=json_default)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.replace(tmp, cmd_path)
+        except Exception:  # noqa: BLE001
+            log.exception("[file-bridge] push pending to cmd file failed")
+        else:
+            log.info("[file-bridge] pushed %d pending cmd(s) to %s", len(pending), cmd_path)
+
+    def _file_bridge_loop(self):
+        """§QMT-F16 文件桥 sidecar：读桥的 JSONL 上报 + 推 pending 命令文件，
+        回报语义与 HTTP PATH 一字不差。上报文件被轮转缩小则回到 0 偏移。"""
+        report_path = self._file_bridge_path()
+        pos = 0
+        log.info("[file-bridge] watching %s", report_path)
+        while not self._stop.is_set():
+            time.sleep(2)
+            # ① 扫上报
+            try:
+                size = os.path.getsize(report_path)
+            except OSError:
+                pos = 0
+                size = 0
+            if size < pos:  # 文件被重写（轮转），从头再读
+                pos = 0
+            if size != pos:
+                try:
+                    with open(report_path, "rb") as f:
+                        f.seek(pos)
+                        block = f.read().decode("utf-8", errors="replace")
+                        pos = f.tell()
+                except OSError as e:  # noqa: BLE001 — 文件被占用等瞬态，跳过本轮
+                    log.warning("[file-bridge] read failed: %s", e)
+                    block = ""
+                for line in block.splitlines():
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        body = json.loads(text)
+                    except Exception as e:  # noqa: BLE001 — 残行不中断流
+                        log.warning("[file-bridge] bad line skipped: %s (%s)", text[:80], e)
+                        continue
+                    try:
+                        code, resp = self._do_dispatch_result(body)
+                        log.debug("[file-bridge] %s -> %s", body.get("type"), code)
+                    except Exception:  # noqa: BLE001 — 单事件失败不阻断后续行
+                        log.exception("[file-bridge] apply %s failed", body.get("type"))
+            # ② 推命令（无 pending 不打扰桥）
+            self._file_bridge_push_pending()
 
     def stop(self):
         """优雅停止：置停止信号并停掉回报发送线程（重连/对账线程随之退出）。"""

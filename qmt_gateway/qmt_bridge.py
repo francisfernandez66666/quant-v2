@@ -454,6 +454,46 @@ class Bridge:
             time.sleep(self.poll_sec)
 
 
+def start_from_config(cfg_path, log_path=None):
+    """QMT 内置环境入口：读 config.bridge.json → 建桥 → 常驻（阻塞调用线程）。
+
+    QMT 模型交易沙箱 __file__/argv 不可靠，故由策略包装器显式传 cfg_path，
+    并在这里把日志落到文件（沙箱 print 不一定可见）。
+    """
+    import os  # noqa: PLC0415
+    cfg = {}
+    if cfg_path and os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+        except Exception as e:  # noqa: BLE001
+            log.warning("[bridge] config 读取失败，使用默认值: %s", e)
+    if log_path:
+        try:
+            import logging.handlers  # noqa: PLC0415
+            # 沙箱可能没有 handlers，先清掉已有 handler 再挂 RotatingFileHandler
+            for _h in list(log.handlers):
+                log.removeHandler(_h)
+            _rot = logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+            _rot.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            log.addHandler(_rot)
+            log.setLevel(logging.INFO)
+        except Exception:  # noqa: BLE001 — 落日志失败不阻断桥
+            log.exception("[bridge] file logging setup failed")
+    base = str(cfg.get("gateway_url", "") or "http://127.0.0.1:8789")
+    token = str(cfg.get("token", "") or "")
+    account = str(cfg.get("account", "") or "")
+    poll = float(cfg.get("poll_sec", 1.0) or 1.0)
+    hb = float(cfg.get("heartbeat_sec", 5.0) or 5.0)
+    pos = float(cfg.get("positions_sec", 30.0) or 30.0)
+    dry = bool(cfg.get("dry_run", False))
+    log.info("[bridge] start_from_config cfg=%s", cfg_path)
+    Bridge(base, token=token, account=account, poll_sec=poll,
+           heartbeat_sec=hb, positions_sec=pos, dry_run=dry).run_forever()
+
+
 def main(argv=None):
     """命令行入口（真机以策略形式在 QMT 内运行；此处供本机/容器联调与排障）。
 

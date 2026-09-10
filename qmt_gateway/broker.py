@@ -248,7 +248,9 @@ class XtBroker(Broker):
 
     def record_exchange_order_id(self, order):
         """§G4 由回调适配器调用：remark(signal_id) 关联出 seq→交易所委托号映射。"""
-        remark = getattr(order, "remark", "") or ""
+        # §FIX 2026-09-10 实录：xtquant 委托回调对象备注字段名是 order_remark
+        # （handler.py 同款修复的遗漏点）——读 remark 恒为空导致映射永不回填、撤单必失败。
+        remark = getattr(order, "order_remark", "") or getattr(order, "remark", "") or ""
         oid = str(getattr(order, "order_id", "") or "")
         if not remark or not oid:
             return
