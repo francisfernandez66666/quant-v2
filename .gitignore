@@ -82,3 +82,6 @@ qmt_gateway/config.xt.json
 /qmtctl
 mobile/app/src/debug/
 mobile/app/src/release/
+
+# 一次性调试脚本归档（本地工具，不入库）
+scripts/qmt-debug/
