@@ -123,17 +123,47 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 
 	// §同花顺（新）竞价窗口注入：9:15-9:26 把官方集合竞价快照写进看板——
 	// 抢筹幅度/量比/未匹配量是当日开盘强弱最早的信号；同时记录显著异动（|涨幅|≥3% 或量比≥5）。
+	// §P1.2 竞价信号：开关 Enable.AuctionSignal 开启时另算竞价强度分（[0,10]），存入引擎供
+	// 开盘窗口（9:30-10:00）确认/观察，并把看板预排名改为按强度分排序。
 	if data.InAuctionWindow(time.Now()) {
 		if auction := f.AuctionSnapshot(); len(auction) > 0 {
 			items := make([]data.HithinkAuctionItem, 0, len(auction))
+			auctionOn := e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.AuctionSignal })
+			strengths := make(map[string]float64, len(auction))
 			for _, it := range auction {
 				items = append(items, it)
 				if it.AuctionPct >= 3 || it.AuctionVolumeRatio >= 5 {
 					log.Printf("[engine] 竞价异动 %s(%s): 涨幅 %.2f%% 量比 %.1f 未匹配 %.0f",
 						it.ThsCode, it.Name, it.AuctionPct, it.AuctionVolumeRatio, it.AuctionUnmatched)
 				}
+				// §P1.2 竞价强度分：开关开启时按四维合成计算并缓存（大单抢筹日志）。
+				// English: auction strength score when the auction-signal toggle is enabled.
+				if auctionOn {
+					s := data.AuctionStrengthBreakdown(it)
+					strengths[normalizeCode(it.Ticker)] = s.Strength
+					if s.Strength >= 7 {
+						log.Printf("[engine] 竞价抢筹 %s(%s): 强度 %.1f 量比 %.1f 高开 %.1f%% 换手 %.2f%%",
+							it.ThsCode, it.Name, s.Strength, s.VolumeRatio, s.OpenPct, s.TurnoverPct)
+					}
+				}
 			}
-			sort.Slice(items, func(i, j int) bool { return items[i].AuctionPct > items[j].AuctionPct })
+			if auctionOn && len(strengths) > 0 {
+				e.mu.Lock()
+				e.auctionStrengths = strengths
+				e.mu.Unlock()
+			}
+			// 看板预排名：开启竞价信号时按强度分降序（同强度再按高开幅度），否则保持原有高开排序。
+			// English: board pre-ranking — by strength when the toggle is on, else by open pct.
+			sort.Slice(items, func(i, j int) bool {
+				if auctionOn {
+					a := data.AuctionStrengthScore(items[i])
+					b := data.AuctionStrengthScore(items[j])
+					if a != b {
+						return a > b
+					}
+				}
+				return items[i].AuctionPct > items[j].AuctionPct
+			})
 			e.agg.SetAuction(items)
 		}
 	}

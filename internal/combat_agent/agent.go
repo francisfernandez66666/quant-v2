@@ -249,6 +249,13 @@ type Agent struct {
 	// generation, per-signal depth factors (bid/ask pressure, seal volume) are fetched once for
 	// strategies and the frontend alike.
 	depthFn func(code string) *data.OrderBookFactors
+
+	// auctionStrengthFn 竞价强度分回调（§P1.2；由 Engine 仅在 Enhance.AuctionSignal 开启时注入，
+	// nil 表示不消费）。开盘窗口（9:30-10:00）内对买入信号追加强度观察字段（不改变分数）。
+	// English: auction strength-score callback (P1.2; injected by the Engine only when
+	// Enhance.AuctionSignal is on, nil consumes nothing). Appends an observation field to buy
+	// signals within the open window (9:30-10:00) without changing scores.
+	auctionStrengthFn func(code string) float64
 }
 
 // New 创建战法引擎实例。
@@ -276,6 +283,19 @@ func (a *Agent) SetDepthFactorFn(fn func(code string) *data.OrderBookFactors) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.depthFn = fn
+}
+
+// SetAuctionStrengthFn 注入竞价强度分回调（§P1.2；nil 禁用）。
+// 仅由 Engine 在 Enhance.AuctionSignal 开启时调用；开盘窗口内对买入信号追加
+// "竞价强度X.X"观察字段（不改变分数，默认仅此观察，供后续纸面 A/B 度量是否加分）。
+// English: injects the auction strength callback (P1.2; nil disables). Called by the Engine only
+// when Enhance.AuctionSignal is on; within the open window the hook appends an
+// "auction-strength X.X" observation field to buy signals (no score change by default — this
+// observation feeds a later paper A/B to decide whether to boost scores).
+func (a *Agent) SetAuctionStrengthFn(fn func(code string) float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.auctionStrengthFn = fn
 }
 
 // attachDepthFactors 对信号列表批量附加盘口因子（并发拉取）。
@@ -624,6 +644,51 @@ func (a *Agent) HotReload(newCfg *config.StrategyConfig) {
 //   - 全局唯一信号 ID 字符串
 func seqID() string {
 	return fmt.Sprintf("SIG%d", time.Now().UnixNano())
+}
+
+// applyAuctionConfirmToSignals 开盘窗口竞价确认观察（§P1.2）：
+// 仅当竞价强度回调已注入（Engine 在 Enhance.AuctionSignal 开启时调用 SetAuctionStrengthFn）
+// 且处于开盘窗口（9:30-10:00）时，对买入信号追加"竞价强度X.X"观察字段，不改动分数。
+// 目的是为纸面 A/B 度量"竞价强度是否值得加分"提供可观察样本，默认零加分零行为变化。
+// English: open-window auction confirmation observation (P1.2). Only when the strength callback
+// is injected (engine registers it with Enhance.AuctionSignal on) and we are inside the open
+// window (9:30-10:00), appends an "auction-strength X.X" observation to buy signals without
+// altering scores — a sample for a later paper A/B deciding whether to boost scores.
+func (a *Agent) applyAuctionConfirmToSignals(sigs []Signal, now time.Time) {
+	a.mu.RLock()
+	fn := a.auctionStrengthFn
+	a.mu.RUnlock()
+	if fn == nil || len(sigs) == 0 {
+		return
+	}
+	if !a.inOpenWindow(now) {
+		return
+	}
+	for i := range sigs {
+		if sigs[i].Action != "买入" && sigs[i].Action != "buy" {
+			continue
+		}
+		s := fn(sigs[i].Code)
+		if s <= 0 {
+			continue
+		}
+		note := fmt.Sprintf("竞价强度%.1f", s)
+		if sigs[i].Reason == "" {
+			sigs[i].Reason = note
+		} else {
+			sigs[i].Reason = sigs[i].Reason + " | " + note
+		}
+	}
+}
+
+// inOpenWindow 开盘确认窗口：9:30-10:00（Asia/Shanghai）。
+// English: open confirmation window 9:30-10:00 (Asia/Shanghai).
+func (a *Agent) inOpenWindow(now time.Time) bool {
+	h, m := now.Hour(), now.Minute()
+	if h == 9 && m >= 30 {
+		return true
+	}
+	return h == 10 && m == 0
 }
 
 // applyLaodengToSignals §R4-5 修复：对单只股票的信号应用 Laodeng 置信度修正（上限 1.0）。
@@ -1149,6 +1214,8 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	// §R4-5 Laodeng 置信度修正：按该股真实 PE/换手率/板块名逐股计算（未启用时 no-op）。
 	// English: §R4-5 — apply the Laodeng confidence correction per stock using real PE/turnover/sector.
 	a.applyLaodengToSignals(sigs, md, pe, sectorName)
+	// §P1.2 开盘窗口竞价强度观察（仅注入回调且处于 9:30-10:00 时追加观察字段，不加分）。
+	a.applyAuctionConfirmToSignals(sigs, now)
 	return sigs
 }
 

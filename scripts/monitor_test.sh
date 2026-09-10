@@ -137,10 +137,12 @@ do_curl() {
 	elif [ "$method" = "DELETE" ]; then
 		if [ -n "$TOKEN" ]; then
 			http_code_raw=$(curl -s -o "$TMP_RES" -w "%{http_code}" --max-time 10 \
-				-X DELETE -H "Authorization: $TOKEN" -H "Content-Type: application/json" "$url" 2>/dev/null)
+				-X DELETE -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+				-d "$body" "$url" 2>/dev/null)
 		else
 			http_code_raw=$(curl -s -o "$TMP_RES" -w "%{http_code}" --max-time 10 \
-				-X DELETE -H "Content-Type: application/json" "$url" 2>/dev/null)
+				-X DELETE -H "Content-Type: application/json" \
+				-d "$body" "$url" 2>/dev/null)
 		fi
 	fi
 	end_time=$(python3 -c "import time; print(int(time.time()*1000))" 2>/dev/null || echo 0)

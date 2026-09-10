@@ -33,6 +33,7 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
@@ -114,6 +115,11 @@ type Engine struct {
 	sectorEventTimes map[string]time.Time  // 板块事件时间戳（重复事件衰减状态）
 	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
 	sectorConstTopN  int                   // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
+	auctionStrengths map[string]float64    // 竞价强度分（§P1.2，code→[0,10]，开盘窗口确认/观察用）
+	impactTbl        *research.ImpactTable // 新闻影响率表（§P2.1；Enhance.NewsImpact 开启时懒建，nil=关闭）
+	sectorLeaders    []sector_agent.LinkageLeader // §P2.2 龙头观察列表（Enhance.SectorLinkage 开启时刷新）
+	marketTracker    *research.StateTracker // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
+	signalQuality    *research.SignalQualityTable // §P2.5 信号质量分桶表（Enhance.DynWeight 开启时懒建，nil=关闭）
 
 	fetcher          *data.Fetcher                                                                                   // 5s 实时行情采集器（近实时打分快照来源）
 	scoreStore       *scoreStore                                                                                     // 8a/8b 主循环打分持久化（scores.json）
@@ -468,6 +474,7 @@ func New(
 		hotRecPath:       hotRecPath,
 		sectorEventTimes: make(map[string]time.Time),
 		sectorConstTopN:  20,
+		auctionStrengths: make(map[string]float64),
 		scoreStore:       newScoreStore(scoreRecPath),
 		fastScoreStore:   newScoreStore(fastScoreRecPath),
 		prevPass:         make(map[string]map[string]bool),
@@ -2952,6 +2959,16 @@ func (e *Engine) produceNews(ctx context.Context, since time.Time) produceOut {
 		// 6c. 事件衰减：同板块同方向事件在窗口内重复出现时按 0.5^(h/4) 降权
 		e.applyEventDecay(out.valid)
 
+		// 6c2. 新闻时效衰减（§P1.1）：事件年龄按类型半衰期降权，过期事件 Score→0
+		// 由下方 6d 阈值过滤清除（开关 Enhance.NewsDecay 关闭时零操作）。
+		// English: news time-decay (P1.1). Applied at the single choke point so all downstream
+		// consumers (hotspot pool / sector attribution / D1 / tactics) see consistent decaying
+		// scores; expired events drop out via the 6d re-filter.
+		e.applyAgeDecay(out.valid)
+
+		// 6c3. 新闻影响率加权（§P2.1）：按历史影响中位修正置信度（开关关闭时零操作）。
+		e.applyNewsImpact(out.valid)
+
 		// 6d. 衰减后再次阈值过滤（重复事件降权后可掉出 0.5 线）
 		out.valid = filterThreshold(out.valid, 0.50)
 		log.Printf("[engine][news漏斗] 聚簇+衰减后再滤 -> 有效=%d", len(out.valid))
@@ -3164,6 +3181,13 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	if poolErr != nil {
 		log.Printf("[engine] 涨停池拉取失败: %v", poolErr)
 	}
+	// §P2.2 板块联动观察：识别当日龙头（Enhance.SectorLinkage 开启时；关闭零操作）。
+	e.sectorLinkageObserve(pool)
+	// §P2.3 市场状态机观察：由涨停池装配快照（连板高度=max LianBan；炸板率/上涨占比/指数斜率
+	// 调用方暂缺时以 NaN 弃权，不影响判定——保留接口由后续接入真实值）。开关关闭零操作。
+	// English: §P2.3 market-state observation fed from the limit-up pool (ladder = max LianBan;
+	// NaN abstains for break-rate / up-ratio / index slope until real inputs are wired). No-op when off.
+	e.MarketStateObserve(len(pool), maxLadder(pool), math.NaN(), math.NaN(), math.NaN(), math.NaN())
 	// 事件简报取当日全量已打标事件（比本轮 valid 更全：个股级事件即使本轮未过阈值也可关联信号标题）
 	// English: build news briefs from today's full attributed-event store (richer than this round's `valid`,
 	// so individual-stock events below this round's threshold can still title D1 events on their signals).
@@ -4506,6 +4530,258 @@ func (e *Engine) applyEventDecay(events []newsagent.NewsEvent) {
 		e.sectorEventTimes[key] = now
 		e.mu.Unlock()
 	}
+}
+
+// enhanceFlag 读取信号/战法增强开关（§EnhanceConfig）。
+// cfgMgr 为 nil（测试/最小装配）或未挂 Rules 时返回 false → 全部增强默认关闭、零行为变化。
+// English: reads a signal/tactic enhancement toggle (§EnhanceConfig). Returns false when cfgMgr
+// is nil or Rules is absent → all enhancements off by default.
+func (e *Engine) enhanceFlag(get func(config.EnhanceConfig) bool) bool {
+	e.mu.RLock()
+	mgr := e.cfgMgr
+	e.mu.RUnlock()
+	if mgr == nil {
+		return false
+	}
+	return get(mgr.Rules.Enhance)
+}
+
+// applyAgeDecay 新闻时效衰减（§P1.1）：事件年龄按类型半衰期降权。
+// 在汇聚点（out.valid 值副本）上次于重复事件衰减执行；过期事件 Score→0 由下游 6d
+// 阈值过滤自然清除。开关 Enhance.NewsDecay 关闭时零操作。
+// 注：固化回填（6a）事件也参与衰减——跨日旧事件会被正常淘汰，符合"过期事件不冒充新事件"。
+// English: news time-decay (P1.1). Rewrites the score of each event copy by age/per-type
+// half-life. Runs at the pipeline choke point after repeat-event decay; expired events (Score→0)
+// are dropped by the downstream 6d threshold filter. No-op unless Enhance.NewsDecay is enabled.
+// Note: freeze-backfilled (6a) events also decay, so stale cross-day events drop out naturally.
+func (e *Engine) applyAgeDecay(events []newsagent.NewsEvent) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.NewsDecay }) {
+		return
+	}
+	now := time.Now()
+	for i := range events {
+		ev := &events[i]
+		orig := ev.Score
+		ev.Score = ev.EffectiveScore(now)
+		if ev.Score != orig {
+			log.Printf("[engine][news漏斗] 时效衰减 %s(%s) age=%v: score %.2f→%.2f",
+				ev.EventType, ev.Title, time.Since(parseEventTime(ev.Datetime)).Round(time.Second), orig, ev.Score)
+		}
+	}
+}
+
+// ensureImpactTable 懒建新闻影响率表（线程安全；Enhance.NewsImpact 关闭时无需创建）。
+func (e *Engine) ensureImpactTable() *research.ImpactTable {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.impactTbl == nil {
+		e.impactTbl = research.NewImpactTable(0)
+	}
+	return e.impactTbl
+}
+
+// applyNewsImpact 新闻影响率加权（§P2.1）：按"事件类型×当前情绪相位×方向"的历史影响中位
+// 对事件分数乘 [0.7,1.3] 置信度乘子（样本不足回退 1.0，零行为变化）。开关 Enhance.NewsImpact
+// 关闭时 no-op。English: news impact-rate weighting (P2.1) multiplies each event's score by the
+// [0.7,1.3] confidence multiplier from historical median impact by type×phase×direction (1.0 when
+// under-sampled). No-op unless Enhance.NewsImpact is on.
+func (e *Engine) applyNewsImpact(events []newsagent.NewsEvent) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.NewsImpact }) {
+		return
+	}
+	tb := e.ensureImpactTable()
+	e.mu.RLock()
+	phase := e.lastEmotionPhase
+	e.mu.RUnlock()
+	for i := range events {
+		ev := &events[i]
+		mul := tb.Confidence(ev.EventType, phase, ev.Direction)
+		if mul == 1.0 {
+			continue
+		}
+		orig := ev.Score
+		ev.Score *= mul
+		log.Printf("[engine][news漏斗] 影响率加权 %s(%s) 相位=%s 方向=%s 乘子=%.2f score %.2f→%.2f",
+			ev.EventType, ev.Title, phase, ev.Direction, mul, orig, ev.Score)
+	}
+}
+
+// RecordNewsImpact 摄入一条"新闻类型×相位×方向"的 5/30/60 分钟超额收益样本（§P2.1）。
+// 由调度器/盘后回填调用；开关关闭时仍摄入（表一直累积，供后续开关启用即用），
+// 但不影响当前打分。English: ingests one type×phase×direction excess-return sample for §P2.1.
+// Called by the scheduler/EOD backfill; samples always accumulate (usable once the toggle is on)
+// but do not affect scoring while disabled.
+func (e *Engine) RecordNewsImpact(evType, phase, direction string, excess5, excess30, excess60 []float64, halfLifeObs float64) {
+	tb := e.ensureImpactTable()
+	tb.Update(evType, phase, direction, excess5, excess30, excess60, halfLifeObs)
+}
+
+// ImpactTableRef 返回影响率表用于持久化合并（Merge）——外部加载磁盘表后调用 Merge。
+// 开关关闭或未初始化时返回 nil。English: returns the impact table for persistence/merge.
+func (e *Engine) ImpactTableRef() *research.ImpactTable {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.impactTbl
+}
+
+// SectorLinkageLeaders 把当日涨停池折算为联动龙头列表（§P2.2）。
+// 龙头定义复用 sector_agent.IsLeader（封单强度 × 连板高度）。
+// English: converts today's limit-up pool into linkage leaders (P2.2), reusing IsLeader.
+func (e *Engine) SectorLinkageLeaders(pool []data.LimitUpStock) []sector_agent.LinkageLeader {
+	if len(pool) == 0 {
+		return nil
+	}
+	out := make([]sector_agent.LinkageLeader, 0, len(pool))
+	for _, s := range pool {
+		out = append(out, sector_agent.LinkageLeader{
+			Code:        s.Code,
+			Name:        s.Name,
+			Sector:      s.Industry,
+			SealRatio:   s.SealRatio,
+			BoardHeight: s.LianBan,
+			ChangePct:   s.ChangePct,
+		})
+	}
+	return out
+}
+
+// sectorLinkageObserve 板块联动观察钩子（§P2.2）：Enhance.SectorLinkage 开启时识别当日龙头并
+// 记录为观察字段/e.sectorLeaders，供前端与后续"板块成分股 × 板块资金流 → 联动候选"接入使用。
+// 完整候选生成依赖成分股与资金流源（接口 FindLinkageCandidates 已就绪并有单测）；此处先观察、
+// 零行为变化。关闭时零操作。English: sector-linkage observation hook (P2.2). When enabled, records
+// today's leaders into e.sectorLeaders for the frontend and the future "constituents × flow →
+// candidates" wiring. Candidate generation needs the constituents/flow sources (FindLinkageCandidates
+// is ready and unit-tested); this step only observes. No-op when disabled.
+func (e *Engine) sectorLinkageObserve(pool []data.LimitUpStock) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.SectorLinkage }) || len(pool) == 0 {
+		return
+	}
+	leaders := e.SectorLinkageLeaders(pool)
+	var strong []sector_agent.LinkageLeader
+	for _, ld := range leaders {
+		if sector_agent.IsLeader(ld) {
+			strong = append(strong, ld)
+		}
+	}
+	if len(strong) == 0 {
+		return
+	}
+	e.mu.Lock()
+	e.sectorLeaders = strong
+	e.mu.Unlock()
+	log.Printf("[engine] §P2.2 板块联动观察：龙头 %d 只", len(strong))
+	for i := 0; i < len(strong) && i < 5; i++ {
+		log.Printf("[engine] §P2.2 龙头[%d] %s(%s) %s 封单比%.1f%% 连板%d",
+			i, strong[i].Name, strong[i].Code, strong[i].Sector, strong[i].SealRatio, strong[i].BoardHeight)
+	}
+}
+
+// MarketStateObserve 市场状态机观察（§P2.3）：Enhance.MarketState 开启时按快照更新状态机的
+// 牛/震荡/熊判定与仓位档位。喂入数据由调用方（主循环已有涨停池/连板/炸板等）装配。
+// 关闭或快照空时零操作。返回当前状态与仓位档位上限。
+// English: market-state observation (P2.3). When enabled, feeds a snapshot into the bull/range/
+// bear tracker and updates the max position cap. No-op when disabled or the snapshot is empty.
+// Returns the current state and the max position fraction.
+func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, upRatio, ma20Slope, ma60Slope float64) (research.MarketState, float64) {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState }) {
+		return research.StateRange, 0
+	}
+	e.mu.Lock()
+	if e.marketTracker == nil {
+		e.marketTracker = research.NewStateTracker(research.StateConfig{})
+	}
+	tracker := e.marketTracker
+	e.mu.Unlock()
+	st := tracker.Observe(research.StateSnapshot{
+		LimitUpCount:   limitUpCount,
+		LadderHeight:   ladderHeight,
+		BreakRate:      breakRate,
+		UpRatio:        upRatio,
+		IndexMA20Slope: ma20Slope,
+		IndexMA60Slope: ma60Slope,
+	}, time.Now())
+	cap := tracker.MaxPosPct()
+	if st != research.StateRange {
+		log.Printf("[engine] §P2.3 市场状态=%s 仓位档=%.0f%%（涨停%d 连板%d 炸板率%.0f%% 上涨占比%.0f%%）",
+			st, cap*100, limitUpCount, ladderHeight, breakRate, upRatio)
+	}
+	return st, cap
+}
+
+// maxLadder 涨停池最高连板数（§P2.3 市场状态机输入）。English: max board height in the pool.
+func maxLadder(pool []data.LimitUpStock) int {
+	m := 0
+	for _, s := range pool {
+		if s.LianBan > m {
+			m = s.LianBan
+		}
+	}
+	return m
+}
+
+// SignalQualityRecord 记录一个信号结果样本（§P2.5）：按 战法×板块×新闻类型×情绪相位 分桶。
+// 归因方（引  擎对信号做胜负判定后）调用；开关关闭时仍累积（启用即用），不影响打分。
+// English: records one signal-outcome sample (P2.5) bucketed by tactic×sector×news-type×phase.
+// Called by the attribution side after win/loss judgment; samples always accumulate.
+func (e *Engine) SignalQualityRecord(tactic, sector, newsType, phase string, hit bool) {
+	tb := e.signalQualityTable()
+	if tb == nil {
+		return
+	}
+	tb.Update(research.MakeQualityKey(tactic, sector, newsType, phase), hit)
+}
+
+// SignalQualityWeight 返回分桶权重乘子（§P2.5）；未达最小样本或未开启时恒 1.0。
+// English: returns the bucket weight multiplier (P2.5); 1.0 below MinSample or when disabled.
+func (e *Engine) SignalQualityWeight(tactic, sector, newsType, phase string) float64 {
+	tb := e.signalQualityTable()
+	if tb == nil {
+		return 1.0
+	}
+	return tb.Weight(research.MakeQualityKey(tactic, sector, newsType, phase))
+}
+
+func (e *Engine) signalQualityTable() *research.SignalQualityTable {
+	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.DynWeight }) {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.signalQuality == nil {
+		e.signalQuality = research.NewSignalQualityTable(0)
+	}
+	return e.signalQuality
+}
+
+// parseEventTime 解析新闻 Datetime；失败时返回零时间（仅日志展示用）。
+func parseEventTime(dt string) time.Time {
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", dt, time.Local)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// normalizeCode 规整股票代码：去除交易所后缀（.SH/.SZ 等），保留 6 位纯数字。
+// English: normalizes a stock code by stripping any exchange suffix, keeping the 6-digit form.
+func normalizeCode(code string) string {
+	if i := strings.IndexByte(code, '.'); i > 0 {
+		return code[:i]
+	}
+	return code
+}
+
+// AuctionStrength 返回某代码最近一轮竞价强度分（§P1.2；非竞价窗口或未开启时返回 0）。
+// 供战法代理开盘窗口（9:30-10:00）确认/观察与外部展示消费。
+// English: returns the latest auction strength score for a code (P1.2; 0 outside the auction
+// window or when disabled). Consumed by the combat agent's open-window confirmation/observation.
+func (e *Engine) AuctionStrength(code string) float64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.auctionStrengths) == 0 {
+		return 0
+	}
+	return e.auctionStrengths[normalizeCode(code)]
 }
 
 // containsStr 判断字符串切片是否包含目标。

@@ -206,15 +206,26 @@ class XtBroker(Broker):
                 self._trader = None
                 self._acc = None
             trader = XtQuantTrader(self.path, self.session_id)
-            if trader.start() is not None:  # 0 表示启动成功
-                raise RuntimeError("XtQuantTrader.start() failed")
-            if trader.connect() != 0:
-                raise RuntimeError("XtQuantTrader.connect() failed")
-            acc = StockAccount(self.account)
-            time.sleep(1.0)
-            asset = trader.query_stock_asset(acc)
-            if asset is None:
-                raise RuntimeError("query_stock_asset() returned None — 确认东莞 miniQMT 客户端已登录并连接交易")
+            # §FIX 2026-09-10 实录：start/connect/query 任一失败必须 stop() 本次 trader，
+            # 否则每个重连周期（5s）泄漏一组共享内存 writer，累积后 xtquant 抛
+            # "WaitingFreeWriter instances exceed maximum limit"，此后永远无法重连。
+            try:
+                if trader.start() is not None:  # 0 表示启动成功
+                    raise RuntimeError("XtQuantTrader.start() failed")
+                if trader.connect() != 0:
+                    raise RuntimeError("XtQuantTrader.connect() failed")
+                acc = StockAccount(self.account)
+                time.sleep(1.0)
+                asset = trader.query_stock_asset(acc)
+                if asset is None:
+                    raise RuntimeError(
+                        "query_stock_asset() returned None — 确认东莞 miniQMT 客户端已登录并连接交易")
+            except Exception:
+                try:
+                    trader.stop()
+                except Exception:  # noqa: BLE001 — 清理失败不掩盖原始异常
+                    log.warning("[broker] stop leaked trader after failed connect error")
+                raise
             # 资产查询成功即认为登录有效，固化账户对象/交易对象并置为已连接
             self._acc = acc
             self._trader = trader

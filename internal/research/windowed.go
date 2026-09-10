@@ -254,6 +254,32 @@ func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min in
 	return out
 }
 
+// WindowFactorIC 有界导出：窗口分块计算多因子的逐日 IC 序列（键=factorID），内存~单窗口。
+// §P1.3 结果集相关度去重专用——对结果内/结果间因子一次性装配算 IC，不驻留全量面板。
+// 断点 key 用独立前缀，避免与发现管线缓存互相覆盖。
+// English: exported, memory-bounded per-factor per-date IC series (key=factorID), ~one window in
+// RAM. Used by §P1.3 results-level correlation dedup, assembling factors once without retaining
+// the full panel set. Uses a dedicated prefix so checkpoints don't collide with the discovery pipe.
+func WindowFactorIC(db *store.DB, codes []string, start, end string, fids []string, h, min int) map[string][]ICRow {
+	out := make(map[string][]ICRow, len(fids))
+	if len(fids) == 0 {
+		return out
+	}
+	if h <= 0 {
+		h = 5
+	}
+	if min <= 0 {
+		min = 10
+	}
+	dates, err := db.TradeDates(start, end)
+	if err != nil || len(dates) < 2 {
+		return out
+	}
+	chunks := windowChunks(dates, windowDays)
+	ck := &winCkpt{db: db, resumeKey: "pfac-dedup:" + start + ":" + end, stage: "dedup"}
+	return windowICByAllFactors(db, codes, fids, h, min, chunks, dates, ck, newStageProgress(0, 1, len(chunks)))
+}
+
 // windowCompositeIR 返回全区间复合 |IR|（窗口分块，断点 stage 含权重标识）。
 func windowCompositeIR(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, chunks [][2]string, dates []string, rk string) float64 {
 	ck := &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(weights)}

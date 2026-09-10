@@ -72,6 +72,11 @@ type Rules struct {
 	Data DataConfig `json:"data"`
 	// 宏观日历补充事件（§R3-8 P1-J 接线：此前类型定义存在但从未挂到 Rules）
 	Calendar CalendarConfig `json:"calendar"`
+	// 信号与战法增强开关组（§SIGNAL_EDGE_ENHANCEMENT_PLAN）：全部默认关闭，
+	// 关闭时对应逻辑零行为变化（零值 = 全禁用，向后兼容存量配置）。
+	// English: signal & tactic enhancement toggles (see SIGNAL_EDGE_ENHANCEMENT_PLAN).
+	// All default off; zero value = all disabled, backward compatible with existing configs.
+	Enhance EnhanceConfig `json:"enhance"`
 }
 
 // RuntimeConfig 运行时内存治理配置：盘后释放常驻服务内存，避免与夜间研究作业叠加触发 OOM。
@@ -104,6 +109,33 @@ type RuntimeConfig struct {
 	// English: near-realtime 8a/8b scoring-loop interval in seconds (0 → fallback 5s). Lowering it
 	// detects strategy signal flips (and fires orders) sooner (signal→trade optimization A+B / B).
 	ScoringIntervalSec int `json:"scoring_interval_sec"`
+}
+
+// EnhanceConfig 信号与战法增强开关组（§SIGNAL_EDGE_ENHANCEMENT_PLAN_20260909 §7）。
+// 全部默认关闭；开启后才注入对应信号/战术逻辑，关闭路径零行为变化。
+// English: signal & tactic enhancement toggles. All default off; enabled toggles inject the
+// corresponding signal/tactic logic, disabled paths keep zero behavior change.
+type EnhanceConfig struct {
+	// NewsDecay 新闻时效衰减（P1.1）：事件按类型半衰期随年龄降权。
+	NewsDecay bool `json:"news_decay_enabled"`
+	// NewsDecayHalfLifeMin 半衰期覆盖（分钟，0=用类型默认表）。
+	NewsDecayHalfLifeMin int `json:"news_decay_half_life_min"`
+	// AuctionSignal 竞价信号（P1.2）：竞价强度分进打分池预排名/开盘确认。
+	AuctionSignal bool `json:"auction_signal_enabled"`
+	// FactorDedup 因子相关度去重（P1.3）。
+	FactorDedup bool `json:"factor_dedup_enabled"`
+	// NewsImpact 新闻影响率模型（P2.1）。
+	NewsImpact bool `json:"news_impact_enabled"`
+	// SectorLinkage 板块联动交易（P2.2）。
+	SectorLinkage bool `json:"sector_linkage_enabled"`
+	// MarketState 市场状态机（P2.3）。
+	MarketState bool `json:"market_state_enabled"`
+	// OrderFlow 盘口微观结构（P2.4）。
+	OrderFlow bool `json:"orderflow_enabled"`
+	// DynWeight 信号质量动态权重（P2.5）。
+	DynWeight bool `json:"dynweight_enabled"`
+	// T0 底仓 T+0（P3）。
+	T0 bool `json:"t0_enabled"`
 }
 
 // PaperConfig 模拟盘（纸面交易）配置：把 buy 信号按实时价自动撮合成虚拟持仓，独立于真实持仓。

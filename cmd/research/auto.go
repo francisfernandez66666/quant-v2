@@ -465,6 +465,8 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	changeGate := fs.Bool("change-gate", false, "S3 变化门：与最新 proposed 组合相同且在冷却期内则跳过")
 	stalenessDays := fs.Int("staleness-days", 30, "S3 冷却天数")
 	hysteresis := fs.Float64("hysteresis", 0.05, "C4 滞回：与最新 applied 组合相同且 |ΔIR|<此值 则跳过")
+	// §P1.3 因子相关度去重开关（0=关闭，0~1 阈值）。调度器经 rules.enhance.factor_dedup 注入。
+	dedupCorr := fs.Float64("dedup-corr", 0, "P1.3 因子相关度去重阈值（0=关闭，建议 0.7）")
 	fs.Parse(args)
 
 	codes, err := db.StockCodes()
@@ -509,6 +511,48 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 	if len(results) == 0 {
 		log.Printf("未发现任何候选")
 		return
+	}
+	// §P1.3 因子相关度去重（结果集层面：结果内 + 结果间）。
+	// 结果内：逐因子 IC 序列相关聚类，簇内仅保留均值 |IC| 最高者，权重按去相关 IC 重归一
+	//（避免一次结果里塞进一堆高度相关的重复 alpha）；结果间：去重后因子组合（排序 key）相同的
+	// 结果只保留最早出现的。阈值 0 关闭 → 零行为变化。全部走 WindowFactorIC 有界二分装配，不驻留全量面板。
+	// English: §P1.3 factor-correlation dedup at the results level (within + across). Within: cluster
+	// each result's factors by IC-series correlation, keep the highest mean |IC| per cluster and
+	// re-normalize weights on the de-correlated set (avoid packing one result full of highly related
+	// duplicate alphas). Across: keep only the first result whose post-dedup sorted factor set matches.
+	// Threshold 0 disables; all IC series computed via the bounded windowed helper.
+	if *dedupCorr > 0 && len(results) > 1 {
+		union := make(map[string]bool)
+		for _, r := range results {
+			for _, f := range r.Factors {
+				union[f] = true
+			}
+		}
+		fids := make([]string, 0, len(union))
+		for f := range union {
+			fids = append(fids, f)
+		}
+		icByFactor := research.WindowFactorIC(db, codes, *start, *end, fids, *h, *minStocks)
+		seen := make(map[string]bool, len(results))
+		deduped := make([]research.DiscoverResult, 0, len(results))
+		for _, r := range results {
+			kept, ndirs, nw := research.ApplyDedup(r.Factors, r.Directions, icByFactor, *dedupCorr)
+			if nw != nil && len(kept) != len(r.Factors) {
+				log.Printf("§P1.3 结果内去重：%v→%v（相关阈值 %.2f），权重重归一", r.Factors, kept, *dedupCorr)
+				r.Factors, r.Directions, r.Weights = kept, ndirs, nw
+			}
+			key := comboKey(r.Factors)
+			if seen[key] {
+				log.Printf("§P1.3 结果间去重：组合重复跳过 %v", r.Factors)
+				continue
+			}
+			seen[key] = true
+			deduped = append(deduped, r)
+		}
+		if len(deduped) != len(results) {
+			log.Printf("§P1.3 结果集去重：%d→%d 条候选", len(results), len(deduped))
+			results = deduped
+		}
 	}
 	// S2 去重的状态集合：已提出/已审批/已应用/灰度中 都算占用，杜绝重复副本堆进审批面。
 	live := []string{store.CandProposed, store.CandApproved, store.CandApplied, store.CandGrayscale}
