@@ -21,6 +21,8 @@ SEQUENCE*
 # 构建产物
 # 仅忽略仓库根的编译产物 ./quant，避免误伤源码目录 cmd/quant/（其 *_test.go 需纳入版本控制）
 /quant
+# 构建/冒烟产物目录（如 bin/quant-staging 本地二进制），不入库
+bin/
 dist/
 
 # 前端依赖

@@ -198,13 +198,18 @@ func SellAction(s Signal) string {
 		return "" // 做空方向词是开仓方向语义，不是卖出提醒
 	}
 	switch s.AlertType {
-	case "清仓", "利空抛售":
+	case "清仓", "利空抛售", "利空清仓":
 		// FIX#13：利空归因命中持仓 → 直接清仓（用户决策：收到关联持仓的利空消息自动清仓，
-		// 而非此前的半仓 trim——利空事件风险不对称，先避险优先）。
-		// English: FIX#13 — bearish-attribution hits now close fully (user decision), not half-trim;
-		// bearish events carry one-sided downside risk, so exiting first is the priority.
+		// 而非此前的半仓 trim——利空事件风险不对称，先避险优先）。§NEWS_BEAR 后新增
+		// "利空清仓"分级档（清仓决策由 DecideBearSell 产出），与旧 "利空抛售" 兼容归一。
+		// English: FIX#13 — bearish-attribution hits close fully (user decision), not half-trim;
+		// bearish events carry one-sided downside risk, so exiting first is the priority. §NEWS_BEAR
+		// adds the "利空清仓" graded level (decided by DecideBearSell), normalized with the legacy
+		// "利空抛售".
 		return "close"
-	case "减仓":
+	case "减仓", "利空减仓":
+		// §NEWS_BEAR：利空减仓由 DecideBearSell 产出（新闻命中且量价初步转弱 → 半平留观察仓）。
+		// English: §NEWS_BEAR trim decision from DecideBearSell — half the book while keeping a watch lot.
 		return "trim"
 	}
 	switch s.Action {
@@ -407,37 +412,72 @@ func (a *Agent) EmotionRetreatAlerts(rpt *report.Report, quotes map[string]*data
 	return alerts
 }
 
-// BearishAttributionAlerts 利空归因持仓抛售提醒（E4）：对做多持仓逐只检查是否命中
-// 本轮利空板块/利空个股（bearReasons: code → 归因说明），命中即独立于价格止损产出一条
-// "利空归因 → 尽快抛掉"卖出提醒。与 CheckPositionAlerts 的价格止损解耦：只要该持仓被 8b
-// 利空识别归因（如板块利空/利空事件/D1 负面传导），即便尚未跌破止损线也提醒避险。
-// 已做空持仓忽略（利空对做空是顺向）。
-// English: E4 bearish-attribution sell alerts — for each long holding, if it is hit by this round's
-// bearish sector/stock signals (bearReasons: code → attribution), emit an independent "利空归因 →
-// 尽快抛掉" sell reminder, decoupled from the price-based stop-loss in CheckPositionAlerts: a holding
-// hit by 8b bearish attribution (sector bearishness / bearish event / D1-negative propagation) triggers
-// even before its stop-loss line is breached. Short positions are ignored (bearish is their direction).
-func (a *Agent) BearishAttributionAlerts(rpt *report.Report, quotes map[string]*data.StockInfo, bearReasons map[string]string, now time.Time) []Signal {
-	if len(bearReasons) == 0 {
+// BearishAttributionAlerts 利空归因持仓分级处理（§NEWS_BEAR，原 E4 升级）：
+// 对做多持仓逐只检查是否命中本轮利空板块/利空个股（bearHits: code → 命中情报），
+// 命中即独立于价格止损、经 DecideBearSell 按「信号强度 × 真实量价趋势」分级产出
+//
+//	利空清仓（close）/ 利空减仓（trim）/ 利空观望（watch）
+//
+// 三个等级经 SellAction 归一：清仓/减仓会失效纸面自动与实盘自动卖出执行，观望仅提醒。
+// 与 CheckPositionAlerts 的价格止损解耦：只要被 8b 利空识别归因（板块利空/利空事件/
+// D1 负面传导）即触发风险评估，而不是等到跌破止损线。已做空持仓忽略（利空是顺向）。
+// English: §NEWS_BEAR graded bearish-attribution handling (a full upgrade of E4) — for each long
+// holding hit by this round's bearish sector/stock signals (bearHits: code → hit intelligence),
+// graded independently of the price stop-loss via DecideBearSell (signal strength × real price/volume
+// trend) into 利空清仓(close) / 利空减仓(trim) / 利空观望(watch). SellAction normalizes them so
+// close/trim execute in the paper book and the live auto-trader while watch stays reminder-only.
+// Shorts are ignored (bearish is their direction).
+func (a *Agent) BearishAttributionAlerts(rpt *report.Report, quotes map[string]*data.StockInfo, bearHits map[string]BearHitInfo, cfg config.BearNewsConfig, now time.Time) []Signal {
+	if len(bearHits) == 0 {
 		return nil
 	}
+	cfg = cfg.EnsureDefaults() // 配置段缺失/零值 → 出厂默认（保留用户显式开关）
 	positions := rpt.HeldPositions()
 	if len(positions) == 0 {
 		return nil
 	}
 	var alerts []Signal
-	// 逐持仓检查利空归因命中：仅多头（跳过做空），用实时价覆盖入场价生成卖出提醒。
+	// 逐持仓检查利空归因命中：仅多头（跳过做空），用实时价覆盖入场价做分级决策。
 	for _, pos := range positions {
 		if pos.Direction == "做空" {
 			continue
 		}
-		reason, hit := bearReasons[pos.Code]
-		if !hit {
+		hit, ok := bearHits[pos.Code]
+		if !ok {
 			continue
 		}
 		price := pos.EntryPrice
 		if q := quotes[pos.Code]; q != nil && q.Price > 0 {
 			price = q.Price
+		}
+		// bear_news.enabled=false → 回退 FIX#13 旧行为：命中即"利空抛售"清仓（无分级）。
+		// English: bear_news.enabled=false reverts to the legacy FIX#13 behavior — any hit closes fully
+		// (利空抛售, no grading).
+		if !cfg.EnabledOn() {
+			alerts = append(alerts, Signal{
+				ID:          seqID(),
+				Code:        pos.Code,
+				Name:        pos.Name,
+				Strategy:    pos.Strategy,
+				Direction:   "提醒",
+				Action:      "卖出",
+				AlertType:   "利空抛售",
+				Price:       price,
+				Confidence:  0.9,
+				Reason:      "利空归因: " + hit.Reason + " → 建议尽快抛售该持仓以规避风险",
+				GeneratedAt: now,
+			})
+			continue
+		}
+		plan := DecideBearSell(&hit, quotes[pos.Code], pos.Code, pos.Name, &cfg)
+		// 分级映射：清仓/减仓 → 卖出语义词（SellAction 归一到 close/trim 自动执行），
+		// 观望 → 关注提醒（SellAction 为空，仅消息提醒不动作）。
+		alertType, action := "利空清仓", "卖出"
+		switch plan.Action {
+		case BearActionTrim:
+			alertType = "利空减仓"
+		case BearActionWatch:
+			alertType, action = "利空观望", "关注"
 		}
 		alerts = append(alerts, Signal{
 			ID:          seqID(),
@@ -445,16 +485,16 @@ func (a *Agent) BearishAttributionAlerts(rpt *report.Report, quotes map[string]*
 			Name:        pos.Name,
 			Strategy:    pos.Strategy,
 			Direction:   "提醒",
-			Action:      "卖出",
-			AlertType:   "利空抛售",
+			Action:      action,
+			AlertType:   alertType,
 			Price:       price,
-			Confidence:  1.0,
-			Reason:      "利空归因: " + reason + " → 建议尽快抛售该持仓以规避风险",
+			Confidence:  0.9,
+			Reason:      plan.Reason,
 			GeneratedAt: now,
 		})
 	}
 	if len(alerts) > 0 {
-		log.Printf("[combat_agent] BearishAttributionAlerts: %d 持仓命中利空归因 → %d 抛售提醒", len(positions), len(alerts))
+		log.Printf("[combat_agent] BearishAttributionAlerts: %d 持仓命中利空归因 → %d 条分级信号（清仓/减仓/观望）", len(positions), len(alerts))
 	}
 	return alerts
 }

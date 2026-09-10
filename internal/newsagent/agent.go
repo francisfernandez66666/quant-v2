@@ -364,9 +364,34 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 		}
 	}
 
-	// 控制单日事件规模，只保留最新的 200 条
+	// 控制单日事件规模，只保留最新的 200 条。§NEWS_BEAR 保底：利空事件（Direction=利空）
+	// 是持仓风险提示的关键依据，裁剪时恒定保留、绝不因容量被丢弃；其余事件仍按时间序
+	// 优先保留最新。
+	// English: cap daily events at 200, but bearish events are pinned — they are the key evidence
+	// behind holding-risk alerts, so trimming never drops one; the rest keeps the newest by order.
 	if len(existing.Events) > 200 {
-		existing.Events = existing.Events[len(existing.Events)-200:]
+		// 溢出裁剪：先把利空与其余事件分离（利空全保留，不因容量被裁剪）；
+		// 再用 200 条容量先装利空、剩余配额装最新非利空，仍超出时利空内部截最旧的。
+		var bearish, other []NewsEvent
+		for _, e := range existing.Events {
+			if e.Direction == "利空" {
+				// 利空事件全量保留（持仓风险提示的关键证据），非利空的归入另一组待裁剪
+				bearish = append(bearish, e)
+			} else {
+				other = append(other, e)
+			}
+		}
+		capN := 200
+		if len(bearish) > capN {
+			bearish = bearish[len(bearish)-capN:]
+			capN = 0
+		} else {
+			capN -= len(bearish)
+		}
+		if len(other) > capN {
+			other = other[len(other)-capN:]
+		}
+		existing.Events = append(bearish, other...)
 	}
 
 	data, err := json.MarshalIndent(existing, "", "  ")

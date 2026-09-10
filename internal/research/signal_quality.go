@@ -52,8 +52,8 @@ func (c *signalQualityConfig) fill() {
 
 // SignalQualityTable 分桶质量表（线程安全）。
 type SignalQualityTable struct {
-	mu     sync.RWMutex
-	cfg    signalQualityConfig
+	mu      sync.RWMutex
+	cfg     signalQualityConfig
 	Buckets map[QualityBucketKey]*QualityBucket
 }
 

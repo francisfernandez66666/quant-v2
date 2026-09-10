@@ -5,6 +5,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
+import { prioritizeBearishNews } from '../utils.js'
 import LogModal from '../components/LogModal.jsx'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
@@ -106,6 +107,13 @@ export default function Dashboard() {
     () => newsItems.filter((n) => n.source === '宏观日历' || n.source === '政策反制'),
     [newsItems]
   )
+
+  // §NEWS_BEAR 展示保底：利空资讯置顶（稳定排序，其余保持相对顺序），避免在
+  // slice(0,15) 截断时利空被排挤到列表后部而不可见——利空承载持仓风险提示的关键证据。
+  // 排序逻辑抽到 src/utils.js#prioritizeBearishNews 供 Dashboard/Hotspot 复用并单测。
+  // English: §NEWS_BEAR display guarantee — bearish news is sorted to the top (stable, others keep
+  // relative order) so the slice(0,15) never hides it; the sorter lives in src/utils.js#prioritizeBearishNews.
+  const prioritizedNews = useMemo(() => prioritizeBearishNews(newsItems), [newsItems])
 
   // 将按战法归因的统计对象扁平化为表格行数组
   const strategyRows = useMemo(
@@ -284,7 +292,7 @@ export default function Dashboard() {
           <Divider />
 
           {newsItems.length > 0 && <SectionLabel>📰 资讯</SectionLabel>}
-          {newsItems.slice(0, 15).map((n, i) => (
+          {prioritizedNews.slice(0, 15).map((n, i) => (
             <div key={'n' + i} style={{ padding: '6px 0', borderBottom: '1px solid #e7e7e7' }}>
               <div style={{ display: 'flex', gap: 8, fontSize: 13 }}>
                 <span className="muted">{fmtNewsTime(n.datetime)}</span>

@@ -24,22 +24,22 @@ const (
 
 // StateSnapshot 状态判定的输入快照（由引擎从行情/情绪数据装配）。
 type StateSnapshot struct {
-	LimitUpCount  int     // 当日涨停家数
-	LadderHeight  int     // 最高连板高度
-	BreakRate     float64 // 炸板率（%）
-	UpRatio       float64 // 上涨家数占比（0~1）
+	LimitUpCount   int     // 当日涨停家数
+	LadderHeight   int     // 最高连板高度
+	BreakRate      float64 // 炸板率（%）
+	UpRatio        float64 // 上涨家数占比（0~1）
 	IndexMA20Slope float64 // 指数 MA20 斜率（>0 上行，<0 下行）
 	IndexMA60Slope float64 // 指数 MA60 斜率
 }
 
 // StateConfig 状态机阈值（可配）；零值字段回退默认。
 type StateConfig struct {
-	BullLimit  int     // 涨停家数 ≥ 此值 → 牛信号
-	BearLimit  int     // 涨停家数 ≤ 此值 → 熊信号
-	BullLadder int     // 连板高度 ≥ 此值 → 牛信号
-	BearLadder int     // 连板高度 ≤ 此值 → 熊信号
-	BullBreak  float64 // 炸板率 ≤ 此值 → 牛信号
-	BearBreak  float64 // 炸板率 ≥ 此值 → 熊信号
+	BullLimit   int     // 涨停家数 ≥ 此值 → 牛信号
+	BearLimit   int     // 涨停家数 ≤ 此值 → 熊信号
+	BullLadder  int     // 连板高度 ≥ 此值 → 牛信号
+	BearLadder  int     // 连板高度 ≤ 此值 → 熊信号
+	BullBreak   float64 // 炸板率 ≤ 此值 → 牛信号
+	BearBreak   float64 // 炸板率 ≥ 此值 → 熊信号
 	BullUpRatio float64 // 上涨占比 ≥ 此值 → 牛信号
 	BearUpRatio float64 // 上涨占比 ≤ 此值 → 熊信号
 	// MaxPosPct 各态仓位档位上限。默认 bull 0.60 / range 0.35 / bear 0.15。

@@ -64,6 +64,13 @@ type Rules struct {
 	Scheduler SchedulerConfig `json:"scheduler"`
 	// 模拟盘/纸面交易配置
 	Paper PaperConfig `json:"paper"`
+	// 利空新闻持仓处理配置（§NEWS_BEAR）：A 股只能做多，但利空新闻必须对持仓
+	// 产生"信号强度 × 真实量价趋势"分级决策（清仓/减仓/观望），并在模拟盘与
+	// 实盘自动交易中按决策执行卖出，而非一次性无脑清仓。
+	// English: bearish-news position handling (NEWS_BEAR). A shares are long-only, but bearish news must
+	// drive a graded sell decision (close/trim/watch) from signal strength × real price/volume trend and
+	// execute on line in the paper book and the live auto-trader, instead of an unconditional dump.
+	BearNews BearNewsConfig `json:"bear_news"`
 	// 东莞证券 MiniQMT 实盘交易配置
 	QMT QMTConfig `json:"qmt"`
 	// 运行时内存治理配置
@@ -1948,7 +1955,111 @@ var DefaultRules = &Rules{
 	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000, Discipline: DefaultDisciplineConfig()},
 	QMT:       DefaultQMTConfig(),
 	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15},
+	BearNews:  DefaultBearNewsConfig(),
 }
+
+// BearNewsConfig 利空新闻持仓处理决策参数（§NEWS_BEAR）：决定利空命中持仓时
+// 按"信号强度 × 真实量价趋势"输出清仓/减仓/观望之一，并据此在模拟盘与实盘
+// 自动交易中执行卖出。默认值保守：优先减仓、封板强势不卖、破位放量才清仓。
+// （每档阈值均为"综合分"：newsStrength = 命中级别(个股1.0/板块0.55) × 事件强度
+// |score|归一 × 影响加成；trend ∈ [-1,1] 来自实时量价。总分 = wN×news + wT×trend。）
+// English: bearish-news decision params (NEWS_BEAR): graded close/trim/watch from signal strength ×
+// real price-volume trend, then executes sells in the paper book and live auto-trader. Conservative
+// defaults: trim first, never sell into limit-up strength, close only on breakdown with volume.
+type BearNewsConfig struct {
+	// Enabled 利空新闻持仓决策总开关（*bool：nil/缺省=启用分级决策；false=回到旧的无条件抛售提醒）。
+	// 用指针以区分「配置段缺失（nil→默认启用）」与「显式关闭（false）」——config.json 直接编辑
+	// + 热重载是唯一写入口，结构体相等判断无法区分二者。
+	// English: master switch (*bool so an absent segment (nil→enabled by default) is distinguishable from
+	// an explicit off (false) — config.json edits + hot reload are the only write path).
+	Enabled *bool `json:"enabled,omitempty"`
+	// DirectHit 直接命中权重：事件 CleanedStocks/RelatedStocks 直接命中持仓个股。
+	DirectHit float64 `json:"direct_hit"`
+	// SectorHit 板块命中权重：事件板块命中持仓所属板块（间接）。
+	SectorHit float64 `json:"sector_hit"`
+	// NewsWeight 新闻信号强度在综合分中的权重。
+	NewsWeight float64 `json:"news_weight"`
+	// TrendWeight 真实量价趋势在综合分中的权重。
+	TrendWeight float64 `json:"trend_weight"`
+	// SellScore 清仓阈值：综合分高于此值 → 全部卖出（利空清仓）。
+	SellScore float64 `json:"sell_score"`
+	// TrimScore 减仓阈值：综合分高于此值（低于 SellScore）→ 半仓卖出（利空减仓）。
+	TrimScore float64 `json:"trim_score"`
+	// BreakPct 量价破位阈值(%)：涨跌幅 ≤ -BreakPct 且放量 → 量价转弱，趋势因子为负。
+	BreakPct float64 `json:"break_pct"`
+	// StrongPct 强势阈值(%)：涨跌幅 ≥ StrongPct（或封涨停）→ 趋势因子为正，抑制卖出。
+	StrongPct float64 `json:"strong_pct"`
+	// LimitUpHold 封涨停不卖（*bool，nil/缺省=true）：强势封板时利空仅观望，避免高开砸盘接刀。
+	LimitUpHold *bool `json:"limit_up_hold,omitempty"`
+}
+
+// DefaultBearNewsConfig 利空新闻决策出厂默认（保守，资金安全优先）：
+// 直接命中 1.0 / 板块命中 0.55；新闻权重 1.0 / 量价权重 0.7；
+// 清仓阈值 1.15（需新闻强命中 + 量价配合破位）、减仓阈值 0.55；破位 -3% 放量、强势 +5% 或封板；
+// 总开关与封板保护均默认开启。
+// English: default bearish-news decision params. Conservative and capital-safe: direct hit 1.0 / sector
+// 0.55; news 1.0 / trend 0.7; sell at 1.15 (strong hit + trend confirmation), trim at 0.55; breakdown
+// −3% with volume, strength +5% or limit-up; master switch and limit-up hold default on.
+func DefaultBearNewsConfig() BearNewsConfig {
+	on := true
+	return BearNewsConfig{
+		Enabled:     &on,
+		DirectHit:   1.0,
+		SectorHit:   0.55,
+		NewsWeight:  1.0,
+		TrendWeight: 0.7,
+		SellScore:   1.15,
+		TrimScore:   0.55,
+		BreakPct:    3,
+		StrongPct:   5,
+		LimitUpHold: &on,
+	}
+}
+
+// EnsureDefaults 把零值/缺省字段回填为出厂默认（段缺失时整体激活默认行为），
+// 但保留用户的显式开关（Enabled/LimitUpHold 为 nil 才取默认，false 保持 false）。
+// English: fills zero/missing fields with factory defaults (an absent segment activates default behavior)
+// while preserving explicit switches — Enabled/LimitUpHold fall back only when nil, an explicit false stays.
+func (c BearNewsConfig) EnsureDefaults() BearNewsConfig {
+	d := DefaultBearNewsConfig()
+	if c.Enabled == nil {
+		c.Enabled = d.Enabled
+	}
+	if c.DirectHit <= 0 {
+		c.DirectHit = d.DirectHit
+	}
+	if c.SectorHit <= 0 {
+		c.SectorHit = d.SectorHit
+	}
+	if c.NewsWeight <= 0 {
+		c.NewsWeight = d.NewsWeight
+	}
+	if c.TrendWeight <= 0 {
+		c.TrendWeight = d.TrendWeight
+	}
+	if c.SellScore <= 0 {
+		c.SellScore = d.SellScore
+	}
+	if c.TrimScore <= 0 {
+		c.TrimScore = d.TrimScore
+	}
+	if c.BreakPct <= 0 {
+		c.BreakPct = d.BreakPct
+	}
+	if c.StrongPct <= 0 {
+		c.StrongPct = d.StrongPct
+	}
+	if c.LimitUpHold == nil {
+		c.LimitUpHold = d.LimitUpHold
+	}
+	return c
+}
+
+// EnabledOn 语义读法：nil/true=启用分级决策；显式 false=停用（回退旧行为）。
+func (c BearNewsConfig) EnabledOn() bool { return c.Enabled == nil || *c.Enabled }
+
+// LimitUpHoldOn 语义读法：nil/true=封涨停不卖；显式 false=封板也按强度决策。
+func (c BearNewsConfig) LimitUpHoldOn() bool { return c.LimitUpHold == nil || *c.LimitUpHold }
 
 // DefaultDisciplineConfig 统一止盈止损纪律的出厂默认（可后台配置覆盖）：
 // 止损-6 / 止盈+15 / 移动回撤-6 / 深破2×(-12) / 低置信买入确认5min / 高置信观察30s /

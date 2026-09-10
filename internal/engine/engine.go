@@ -33,11 +33,11 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
-	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
 	"quant-trading-v2/internal/store"
@@ -112,13 +112,13 @@ type Engine struct {
 	hotRecords    []data.HotRecord              // 当日热点板块轮次记录（固化到磁盘）
 	hotRecPath    string                        // 热点板块记录持久化文件路径
 
-	sectorEventTimes map[string]time.Time  // 板块事件时间戳（重复事件衰减状态）
-	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
-	sectorConstTopN  int                   // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
-	auctionStrengths map[string]float64    // 竞价强度分（§P1.2，code→[0,10]，开盘窗口确认/观察用）
-	impactTbl        *research.ImpactTable // 新闻影响率表（§P2.1；Enhance.NewsImpact 开启时懒建，nil=关闭）
+	sectorEventTimes map[string]time.Time         // 板块事件时间戳（重复事件衰减状态）
+	emotionCfg       *config.EmotionConfig        // 情绪周期阈值（SSE 广播情绪阶段）
+	sectorConstTopN  int                          // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
+	auctionStrengths map[string]float64           // 竞价强度分（§P1.2，code→[0,10]，开盘窗口确认/观察用）
+	impactTbl        *research.ImpactTable        // 新闻影响率表（§P2.1；Enhance.NewsImpact 开启时懒建，nil=关闭）
 	sectorLeaders    []sector_agent.LinkageLeader // §P2.2 龙头观察列表（Enhance.SectorLinkage 开启时刷新）
-	marketTracker    *research.StateTracker // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
+	marketTracker    *research.StateTracker       // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
 	signalQuality    *research.SignalQualityTable // §P2.5 信号质量分桶表（Enhance.DynWeight 开启时懒建，nil=关闭）
 
 	fetcher          *data.Fetcher                                                                                   // 5s 实时行情采集器（近实时打分快照来源）
@@ -130,7 +130,7 @@ type Engine struct {
 	d1ScoredSig      map[string]string                                                                               // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
 	d1RetryQueue     map[string]bool                                                                                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
 	lastEmotionPhase string                                                                                          // 主循环最近一轮情绪阶段（近实时循环复用）
-	lastBearReasons  map[string]string                                                                               // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
+	lastBearHits     map[string]combat_agent.BearHitInfo                                                             // §NEWS_BEAR 主循环最近一轮利空命中情报（code→命中级别/新闻强度/归因，近实时实盘建议 BearishAttributionAlerts 分级复用；旧 lastBearReasons 升级为带强度的 BearHitInfo）
 	d1MaxRetries     int                                                                                             // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
 	d1MaxTokens      int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
 	lastTiming       *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
@@ -3209,9 +3209,13 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.lastEmotionPhase = emotionPhase
 	// FIX#13 缓存本轮利空归因，供近实时实盘建议（pushRealAdvice→BearishAttributionAlerts）复用：
 	// 实盘持仓命中利空板块/利空个股 → advice Action=止损 → autoExecuteRealSells 自动全平。
-	// English: FIX#13 cache this round's bearish attributions for the near-realtime real-book advice,
-	// so a live holding hit by a bear sector/stock yields a stop-loss advice that auto-closes.
-	e.lastBearReasons = bearHitReasons(sr)
+	// §NEWS_BEAR 升级：缓存的 BearHitInfo 携带命中级别与新闻信号强度，供分级决策
+	// （清仓/减仓/观望，见 combat_agent.DecideBearSell），不再一刀切全平。
+	// English: FIX#13 cache this round's bearish attribution for the near-realtime real-book advice,
+	// so a live holding hit by a bear sector/stock gets a stop-loss advice that auto-closes. §NEWS_BEAR
+	// upgrade: the cached BearHitInfo carries hit level + news strength for graded close/trim/watch
+	// decisions (see combat_agent.DecideBearSell) instead of an unconditional dump.
+	e.lastBearHits = e.bearHitsFromResult(sr, e.rpt.HeldPositions())
 	e.mu.Unlock()
 	stockScores := make(map[string]combat_agent.StockScores)
 
@@ -3605,12 +3609,17 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// English: when the emotion cycle turns to retreat/divergence, advise trimming all long positions.
 	alertSignals = append(alertSignals, e.combatAgent.EmotionRetreatAlerts(e.rpt, exitQuotes, emotionPhase, time.Now())...)
 
-	// 13c'. 利空归因持仓抛售提醒（E4）：做多持仓命中利空板块/利空个股 → 独立于价格止损提醒尽快抛售。
-	// 使用 bearHitReasons 提供归因说明（板块名/上榜原因/关联新闻），让用户理解为何抛售。
-	// English: E4 bearish-attribution sell alerts — long holdings hit by bearish sectors/stocks get an
-	// independent "sell soon" reminder decoupled from price stops, with an attribution reason (sector
-	// name / listing reason / linked news) explaining why.
-	alertSignals = append(alertSignals, e.combatAgent.BearishAttributionAlerts(e.rpt, exitQuotes, bearHitReasons(sr), time.Now())...)
+	// 13c'. 利空归因持仓分级处理（§NEWS_BEAR 升级 E4）：做多持仓命中利空板块/利空个股 →
+	// 按「信号强度 × 真实量价趋势」产出 利空清仓/利空减仓/利空观望 分级信号（见
+	// BearishAttributionAlerts，单级决策由 combat_agent.DecideBearSell 与当前实时行情完成）。
+	// 使用 bearHitsFromResult 提供命中情报（板块名/上榜原因/关联新闻 + 新闻强度），
+	// 让用户理解为何触发以及为何清/减/观望。配置 bear_news.enabled=false 时回到旧行为。
+	// English: §NEWS_BEAR upgrade of E4 — long holdings hit by bearish sectors/stocks get graded
+	// 利空清仓/利空减仓/利空观望 signals from signal strength × real price/volume trend (per-stock
+	// decision in combat_agent.DecideBearSell against the live quote). bearHitsFromResult supplies the
+	// hit intelligence (sector name / reason / linked news + news strength). bear_news.enabled=false
+	// reverts to legacy behavior.
+	alertSignals = append(alertSignals, e.combatAgent.BearishAttributionAlerts(e.rpt, exitQuotes, e.lastBearHits, e.bearNewsCfg(), time.Now())...)
 
 	// 13d. 逐股卖点评估：对打分池全量个股（含未持仓的自选/跟踪股）评估利空D1/破位/派发/动量衰竭，
 	// 命中即产出"卖点"提醒（仅提醒不自动执行）；消息中心按 code@卖点评估 稳定键去重，5s 循环同键刷新。
@@ -4850,6 +4859,141 @@ func bearHitReasons(sr *strategy_engine.StrategyResult) map[string]string {
 		}
 	}
 	return out
+}
+
+// bearHitsFromResult 组装"持仓 → 利空命中情报"（§NEWS_BEAR）：综合本轮利空事件
+// （直接命中个股 / 命中持仓所属板块）与利空板块上榜/利空个股兜底，为每只命中持仓产出
+// combat_agent.BearHitInfo（命中级别 + 新闻信号强度 + 影响程度 + 归因说明），
+// 供 BearishAttributionAlerts 做清仓/减仓/观望分级，替换旧的纯文本 bearHitReasons。
+//
+//	个股直命中（stock 级）：持仓纯代码在 sr.BearStocks 内，或被某条利空事件的
+//	  CleanedStocks("名称|代码")/RelatedStocks 命中；
+//	板块命中（sector 级）：持仓所属板块（sr.MarketData code→Quote.Sector）与某条
+//	  利空事件 Sectors 相同，或板块上榜 BearSectors 的 LeadStocks 含该股；
+//	新闻强度取命中事件 |score| 最大值，个股直命中的强度肯定越过板块命中。
+//
+// English: builds code → bearish-hit intelligence (§NEWS_BEAR) from this round's bearish events
+// (direct stock hits / holdings' sector hits) plus bear-sector/stock fallbacks, so
+// BearishAttributionAlerts can grade close/trim/watch — replacing the plain-text bearHitReasons.
+func (e *Engine) bearHitsFromResult(sr *strategy_engine.StrategyResult, positions []report.ExecLog) map[string]combat_agent.BearHitInfo {
+	if sr == nil || len(positions) == 0 {
+		return nil
+	}
+	// 持仓 code → 所属板块（当前行情快照），用于事件板块命中判定。
+	sectorOf := func(code string) string {
+		if md, ok := sr.MarketData[code]; ok && md.Quote != nil {
+			return md.Quote.Sector
+		}
+		return ""
+	}
+	out := make(map[string]combat_agent.BearHitInfo)
+	// upsert 合并：命中级别 stock>sector，同级取更大新闻强度；个股直命中覆盖归因文本。
+	upsert := func(code, reason, level string, score float64, impact string) {
+		score = math.Abs(score)
+		cur, ok := out[code]
+		if !ok {
+			out[code] = combat_agent.BearHitInfo{Code: code, HitLevel: level, NewsScore: score, Impact: impact, Reason: reason}
+			return
+		}
+		upgrade := cur.HitLevel != combat_agent.BearHitStock && level == combat_agent.BearHitStock
+		if !upgrade && (cur.HitLevel == level && score > cur.NewsScore) {
+			upgrade = true
+		}
+		if upgrade {
+			cur.HitLevel, cur.NewsScore, cur.Impact = level, score, impact
+			if cur.Reason == "" || level == combat_agent.BearHitStock {
+				cur.Reason = reason
+			}
+			out[code] = cur
+		}
+	}
+	// ① 逐条利空事件匹配持仓（个股直命中优先于板块命中）。
+	for _, ev := range sr.Events {
+		if ev.Direction != "利空" {
+			continue
+		}
+		evSectors := make(map[string]bool, len(ev.Sectors))
+		for _, s := range ev.Sectors {
+			evSectors[s] = true
+		}
+		for _, pos := range positions {
+			if pos.Direction == "做空" {
+				continue
+			}
+			direct := false
+			for _, cs := range ev.CleanedStocks {
+				if strings.HasSuffix(cs, "|"+pos.Code) {
+					direct = true
+					break
+				}
+			}
+			for _, rs := range ev.RelatedStocks {
+				if rs == pos.Code || (len(rs) > len(pos.Code) && strings.HasSuffix(rs, pos.Code)) {
+					direct = true
+					break
+				}
+			}
+			if direct {
+				upsert(pos.Code, "个股利空事件: "+ev.Title, combat_agent.BearHitStock, ev.Score, ev.ImpactLevel)
+				continue
+			}
+			if sec := sectorOf(pos.Code); sec != "" && evSectors[sec] {
+				upsert(pos.Code, "板块利空事件: "+ev.Title, combat_agent.BearHitSector, ev.Score, ev.ImpactLevel)
+			}
+		}
+	}
+	// ② 利空板块上榜/利空个股兜底：事件未匹配到的幸存仓位也能被覆盖。
+	for _, bs := range sr.BearSectors {
+		for _, code := range bs.LeadStocks {
+			if _, ok := out[code]; !ok {
+				upsert(code, "利空板块上榜: "+bs.Name, combat_agent.BearHitSector, bs.Score, sectorImpact(bs.Score))
+			}
+		}
+	}
+	for _, code := range sr.BearStocks {
+		if _, ok := out[code]; !ok {
+			ubs := combat_agent.BearHitStock
+			if reasonMap := bearHitReasons(sr); reasonMap[code] != "" && !strings.Contains(reasonMap[code], "板块") {
+				upsert(code, "利空个股事件", ubs, 0.5, "")
+			} else {
+				upsert(code, "利空个股/板块事件", combat_agent.BearHitSector, 0.5, "")
+			}
+		}
+	}
+	// ③ 归因文本兜底：bearHitReasons 更完备（含上榜原因与新闻标题），无事件理由时覆盖。
+	reasonMap := bearHitReasons(sr)
+	for code, cur := range out {
+		if r, ok := reasonMap[code]; ok && (cur.Reason == "" || cur.NewsScore <= 0) {
+			cur.Reason = r
+			out[code] = cur
+		}
+	}
+	return out
+}
+
+// sectorImpact 把板块事件评分映射为影响档位（高/中/低），用于利空板块上榜兜底的强度标注。
+func sectorImpact(score float64) string {
+	s := math.Abs(score)
+	switch {
+	case s >= 0.6:
+		return "高"
+	case s >= 0.35:
+		return "中"
+	default:
+		return "低"
+	}
+}
+
+// bearNewsCfg 返回本账号的利空新闻分级决策配置（bear_news 段；cfgMgr 缺失时用出厂默认）。
+// English: returns this account's bearish-news graded-decision config (bear_news; factory default when
+// the config manager is absent).
+func (e *Engine) bearNewsCfg() config.BearNewsConfig {
+	if e.cfgMgr == nil {
+		return config.DefaultBearNewsConfig()
+	}
+	// EnsureDefaults：config.json 缺 bear_news 段（旧配置热重载整段替换 → 零值）时回退出厂默认，
+	// 同时保留用户显式开关（Enabled=false 仍是 false）。
+	return e.cfgMgr.GetRulesFor(e.userID).BearNews.EnsureDefaults()
 }
 
 // autoExitReportSells FIX#15 report 账本自动执行卖出（对用户手动录入报表持仓/未进纸面引擎的持仓生效）：

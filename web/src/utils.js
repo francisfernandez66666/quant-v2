@@ -66,3 +66,15 @@ export function fmtTime(ts) {
 export function toStr(v) {
   return v === null || v === undefined ? '' : String(v)
 }
+
+/**
+ * 利空资讯置顶排序（§NEWS_BEAR 展示保底）
+ * 把 direction==='利空' 的资讯稳定排到列表顶部，其余保持原有相对顺序。
+ * 用途：资讯列表在截断展示（slice(0,15)）时，利空——持仓风险提示的关键证据——
+ * 不会被排挤到列表后部而不可见。
+ * @param {Array<{direction?: string}>} items - 资讯列表
+ * @returns {Array} 利空置顶后的新数组（不修改入参）
+ */
+export function prioritizeBearishNews(items) {
+  return (items || []).slice().sort((a, b) => ((b.direction === '利空') ? 1 : 0) - ((a.direction === '利空') ? 1 : 0))
+}
