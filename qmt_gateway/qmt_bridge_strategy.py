@@ -115,16 +115,183 @@ class _XtOps:
     On start/connect failure the trader MUST be stop()ed to avoid leaking one set of
     shared-memory writers per reconnect cycle (WaitingFreeWriter limit), same as broker.py."""
 
-    def __init__(self, account, dry_run, xt_path, session_id):
+    def __init__(self, account, dry_run, xt_path, session_id, embed_account_id="stock"):
         self.account = account
         self.dry_run = dry_run
         self.xt_path = xt_path
         self.session_id = int(session_id or 2)
+        self.embed_account_id = embed_account_id or "stock"
         self._import_tried = False
         self._trader = None
         self._acc = None
         self._xtc = _xtc_safe()
+        self._embed_ok = None  # None=not probed (2026-09-11: sandbox builtin API first)
+        self._ctx = None       # QMT ContextInfo injected by init()
 
+    # ---- QMT model-sandbox BUILTIN API (primary since 2026-09-11) ------------------
+    # XtQuantTrader is the miniQMT/standalone-trading EXTERNAL interface. The strategy
+    # itself runs INSIDE the QMT client process, so connecting back to itself via
+    # XtQuantTrader fails (connect() != 0) -- and miniQMT is being retired by the
+    # broker anyway. The embedded model-trading API operates the account directly:
+    #   get_trade_detail_data(acct_id, "stock", "account"/"position"/"order"/"trade")
+    #   passorder(opType, priceType, acct, code, 5, price, volume, strategy, 0, "", userOrderId)
+    #   cancel(order_id, acct)
+    # XtQuantTrader stays as the legacy miniQMT fallback only.
+
+    def _builtin(self, name):
+        # QMT injects these into the strategy module globals (some builds into builtins)
+        g = globals().get(name)
+        if callable(g):
+            return g
+        import builtins
+        b = getattr(builtins, name, None)
+        return b if callable(b) else None
+
+    def probe_embed(self):
+        """One-shot capability probe; result logged so the environment is diagnosable."""
+        gtdd = self._builtin("get_trade_detail_data")
+        po = self._builtin("passorder")
+        _trace("embed probe: get_trade_detail_data=%s passorder=%s cancel=%s" % (
+            bool(gtdd), bool(po), bool(self._builtin("cancel"))))
+        if not (gtdd and po):
+            self._embed_ok = False
+            return False
+        try:
+            rows = gtdd(self.embed_account_id, "stock", "account") or []
+            _trace("embed probe account rows=%d" % len(rows))
+            self._embed_ok = bool(rows)
+        except Exception as e:
+            _trace("embed probe account error: " + repr(e))
+            self._embed_ok = False
+        return self._embed_ok
+
+    def embed_usable(self):
+        if self._embed_ok is None:
+            self.probe_embed()
+        return bool(self._embed_ok)
+
+    def _code_ex(self, code):
+        head = str(code or "").split(".")[0]
+        return "%s.%s" % (head, _expect_suffix(head))
+
+    def embed_asset(self):
+        rows = self._builtin("get_trade_detail_data")(self.embed_account_id, "stock", "account") or []
+        out = None
+        for r in rows:
+            mv = float(getattr(r, "market_value", 0) or getattr(r, "instrument_value", 0) or 0)
+            cash = float(getattr(r, "available", 0) or getattr(r, "available_cash", 0) or getattr(r, "cash", 0) or 0)
+            frz = float(getattr(r, "frozen", 0) or getattr(r, "frozen_cash", 0) or 0)
+            tot = float(getattr(r, "equity", 0) or getattr(r, "total_asset", 0) or (cash + frz + mv))
+            out = {"cash": cash, "frozen_cash": frz, "total_asset": tot, "market_value": mv}
+        return out
+
+    def embed_positions(self):
+        rows = self._builtin("get_trade_detail_data")(self.embed_account_id, "stock", "position") or []
+        out = []
+        for p in rows:
+            code = str(getattr(p, "code", "") or getattr(p, "stock_code", "") or "")
+            qty = int(getattr(p, "volume", 0) or 0)
+            if qty <= 0 or not code:
+                continue
+            open_p = float(getattr(p, "open_price", 0) or getattr(p, "cost", 0) or 0)
+            mv = float(getattr(p, "market_value", 0) or getattr(p, "value", 0) or 0)
+            out.append({
+                "ts_code": self._code_ex(code),
+                "name": str(getattr(p, "name", getattr(p, "stock_name", "")) or ""),
+                "qty": qty,
+                "can_use_qty": int(getattr(p, "can_use_volume", getattr(p, "available_volume", 0)) or 0),
+                "open_price": open_p,
+                "cost_price": open_p,
+                "amount": mv,
+                "highest_price": open_p,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            })
+        return out
+
+    def embed_orders(self):
+        return self._builtin("get_trade_detail_data")(self.embed_account_id, "stock", "order") or []
+
+    def embed_trades_rows(self):
+        rows = self._builtin("get_trade_detail_data")(self.embed_account_id, "stock", "deal") or []
+        out = []
+        for t in rows:
+            code = str(getattr(t, "code", "") or getattr(t, "stock_code", "") or "")
+            remark = str(getattr(t, "order_remark", "") or getattr(t, "user_order_id", "") or "")
+            price = float(getattr(t, "price", 0) or getattr(t, "traded_price", 0) or 0)
+            qty = int(getattr(t, "traded_volume", 0) or getattr(t, "volume", 0) or 0)
+            side_raw = str(getattr(t, "direction", "") or getattr(t, "bs_type", "") or
+                           getattr(t, "offset_flag", "") or "")
+            up = side_raw.upper()
+            side = BUY if ("BUY" in up or side_raw in ("\u4e70", "\u4e70\u5165")) else SELL
+            amount = float(getattr(t, "amount", 0) or getattr(t, "traded_amount", 0) or price * qty)
+            out.append({
+                "order_id": remark or str(getattr(t, "order_id", "") or ""),
+                "code": self._code_ex(code) if code else "",
+                "side": side, "price": price, "qty": qty, "amount": amount,
+                "trade_id": str(getattr(t, "traded_id", getattr(t, "trade_no", getattr(t, "id", ""))) or ""),
+                "traded_at": str(getattr(t, "traded_time", getattr(t, "time", "")) or ""),
+                "signal_id": remark,
+            })
+        return out
+
+    def embed_place(self, req):
+        po = self._builtin("passorder")
+        code = str(req.get("code", "") or "")
+        expect = _expect_suffix(code)
+        if not expect:
+            return False, "", "unsupported stock code: %s" % code
+        suffix = code.split(".")[1].upper() if "." in code else ""
+        if suffix and suffix != expect:
+            return False, "", "exchange suffix mismatch: %s should be .%s" % (code, expect)
+        c6 = self._code_ex(code)
+        side = str(req.get("side", "") or "")
+        op_type = 23 if side == BUY else 24
+        ptype = 11 if str(req.get("price_type", "")).lower() == "limit" else 5
+        price = float(req.get("price", 0) or 0)
+        qty = int(req.get("qty", 0) or 0)
+        signal_id = str(req.get("signal_id", "") or "")
+        args = (op_type, ptype, self.embed_account_id, c6, 5, price, qty, "qmt_bridge", 0, "", signal_id)
+        try:
+            if self._ctx is not None:
+                try:
+                    po(*(args + (self._ctx,)))
+                except TypeError:
+                    po(*args)
+            else:
+                po(*args)
+            return True, "", ""
+        except Exception as e:
+            _trace("embed passorder error: " + repr(e))
+            return False, "", "passorder error: %s" % e
+
+    def embed_cancel(self, exchange_order_id, code=""):
+        ca = self._builtin("cancel")
+        if not ca:
+            return False, "builtin cancel unavailable"
+        try:
+            ca(int(str(exchange_order_id)), self.embed_account_id)
+            return True, ""
+        except Exception as e:
+            _trace("embed cancel error: " + repr(e))
+            return False, "cancel error: %s" % e
+
+    def embed_resolve(self, signal_id, timeout_sec=6.0):
+        """poll order list: userOrderId(order_remark)==signal_id -> exchange order id."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                for o in self.embed_orders():
+                    remark = str(getattr(o, "order_remark", "") or getattr(o, "user_order_id", "") or "")
+                    if remark == signal_id:
+                        oid = getattr(o, "order_id", getattr(o, "id", "")) or ""
+                        if oid:
+                            return str(oid)
+            except Exception:
+                return ""
+            time.sleep(0.5)
+        return ""
+
+    # ---- legacy miniQMT XtQuantTrader fallback (kept; broker may retire miniQMT) ----
     def ensure(self):
         if self._import_tried:
             if self._trader is None:
@@ -168,6 +335,8 @@ class _XtOps:
                 req.get("side"), req.get("code"), req.get("price_type"),
                 req.get("qty"), signal_id))
             return True, "DRYRUN-%d" % int(time.time() * 1000), ""
+        if self.embed_usable():
+            return self.embed_place(req)
         self.ensure()
         code = str(req.get("code", "") or "")
         expect = _expect_suffix(code)
@@ -202,6 +371,9 @@ class _XtOps:
         seq->exchange mapping and later cancels). dry_run keeps the dry ref."""
         if self.dry_run or not signal_id:
             return pending_ref
+        if self.embed_usable():
+            oid = self.embed_resolve(signal_id)
+            return oid or pending_ref
         for _ in range(3):
             try:
                 orders = self._trader.query_stock_orders(self._acc) or []
@@ -220,6 +392,8 @@ class _XtOps:
         if self.dry_run:
             _trace("dry cancel order_id=%s" % exchange_order_id)
             return True, ""
+        if self.embed_usable():
+            return self.embed_cancel(exchange_order_id, code)
         self.ensure()
         try:
             n = int(str(exchange_order_id or ""))
@@ -236,6 +410,11 @@ class _XtOps:
         """positions snapshot -> gateway dict list (schema == handler.on_positions)."""
         if self.dry_run:
             return []
+        if self.embed_usable():
+            try:
+                return self.embed_positions()
+            except Exception as e:
+                _trace("embed positions error: " + repr(e))
         self.ensure()
         try:
             raw = self._trader.query_stock_positions(self._acc) or []
@@ -263,6 +442,11 @@ class _XtOps:
         """account asset snapshot (cash/frozen/total/market_value). dry_run -> None."""
         if self.dry_run:
             return None
+        if self.embed_usable():
+            try:
+                return self.embed_asset()
+            except Exception as e:
+                _trace("embed asset error: " + repr(e))
         self.ensure()
         try:
             raw = self._trader.query_stock_asset(self._acc)
@@ -288,6 +472,11 @@ class _XtOps:
         """trades list (order_remark attribution + side) -> type=trade rows."""
         if self.dry_run:
             return []
+        if self.embed_usable():
+            try:
+                return self.embed_trades_rows()
+            except Exception as e:
+                _trace("embed trades error: " + repr(e))
         self.ensure()
         try:
             raw = self._trader.query_stock_trades(self._acc) or []
@@ -341,7 +530,8 @@ def _xt():
         _XtAdapter_holder = _XtOps(account=str(cfg.get("account", "")),
                                    dry_run=bool(cfg.get("dry_run", False)),
                                    xt_path=str(cfg.get("xt_path", "") or ""),
-                                   session_id=int(cfg.get("session_id", 2) or 2))
+                                   session_id=int(cfg.get("session_id", 2) or 2),
+                                   embed_account_id=str(cfg.get("embed_account_id", "stock") or "stock"))
     return _XtAdapter_holder
 
 
@@ -420,6 +610,10 @@ def run_forever():
     import json
     cfg = _read_cfg()
     _trace("cfg loaded: dry=" + str(cfg.get("dry_run")))
+    try:
+        _xt().probe_embed()
+    except Exception as e:
+        _trace("probe error: " + repr(e))
     seen = _load_seen()
     _trace("seen seqs loaded: %d" % len(seen))
     last_cmd_ts = 0.0
@@ -500,6 +694,10 @@ def init(ContextInfo):
     right after init returned; blocking guarantees the loop's lifetime)."""
     _trace("init called (blocking cmdline loop)")
     try:
+        try:
+            _xt()._ctx = ContextInfo
+        except Exception as e:
+            _trace("ctx inject fail: " + repr(e))
         run_forever()
     except Exception as e:
         _trace("EXCEPTION in init loop: " + repr(e))

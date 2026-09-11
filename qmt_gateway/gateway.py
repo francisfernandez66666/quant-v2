@@ -179,6 +179,8 @@ class Gateway:
         self._file_bridge_thread = None
         # xt 最近一次确认连接时间（自动翻转判定用；初始视为刚断开，避免一启动就误翻）
         self._xt_last_connected = 0.0
+        # §主备反转：queued（桥）最近一次心跳确认时间（failover 判定用）
+        self._queued_last_connected = 0.0
         # 来源 IP 白名单（由 main 从环境变量 ALLOWED_IPS 注入；空列表表示不做 IP 限制，仅依赖 token）
         self.allowed_ips = []
 
@@ -301,8 +303,10 @@ class Gateway:
         report_path = self._file_bridge_path()
         pos = 0
         log.info("[file-bridge] watching %s", report_path)
+        # §2026-09-11 主接线时延：0.5s 轮询（信号→下单→回传闭环秒级；本地文件读开销可忽略）
         while not self._stop.is_set():
-            time.sleep(2)
+            if self._stop.wait(0.5):
+                break
             # ① 扫上报
             try:
                 size = os.path.getsize(report_path)
@@ -380,8 +384,9 @@ class Gateway:
             time.sleep(1)
 
     def _failover_loop(self):
-        """§QMT-DUAL 自动翻转循环：交易时段 + active=xt + 断连 ≥ failover_sec + 桥心跳新鲜
-        → 自动切 queued；切回仅手动（/admin/broker）。每 5s 轮询，异常不阻断。"""
+        """§QMT-DUAL 主备自动翻转循环（2026-09-11 语义反转：queued 主 / xt 备）：
+        交易时段 active=queued 且桥心跳断 ≥ failover_sec 且 xt 在线 → 翻 xt 顶班；
+        active=xt 且桥恢复新鲜 → 自动回切 queued。每 5s 轮询，异常不阻断。"""
         while not self._stop.is_set():
             time.sleep(5)
             try:
@@ -390,29 +395,39 @@ class Gateway:
                 log.exception("[gateway] failover loop error")
 
     def _maybe_failover(self):
-        """自动翻转判定（见 _failover_loop 说明）。"""
+        """自动翻转判定（§QMT-DUAL 主备语义 2026-09-11 反转）。
+
+        主接线 = queued（QMT 模型沙箱文件桥——券商 2026-09 下旬关 miniQMT 后唯一存活通道）；
+        备 = xt（miniQMT 独立交易，可跑但随时可能被停）。规则：
+          - active=queued 且心跳断 ≥ failover_sec、xt 可用 → 翻 xt 顶班（保下单回路不中断）；
+          - active=xt 且桥心跳恢复新鲜 → 自动回切 queued（主接线优先归位）。
+        非交易时段断连属预期（客户端被 qmtctl 杀），不翻转。
+        """
         if not self.cfg.get("failover_enable", False):
             return
-        if self.active_key != "xt":
-            return  # 已在 queued，切回仅手动
         if not is_active_trading_session():
-            return  # 非交易时段断连属预期（qmtctl 杀客户端），不翻转
+            return  # 非交易时段断连属预期，不翻转
         xt = self.brokers.get("xt")
         queued = self.brokers.get("queued")
         if xt is None or queued is None:
             return
         now = time.time()
-        if xt.is_connected():
-            self._xt_last_connected = now
+        if self.active_key == "queued":
+            if queued.is_connected():
+                self._queued_last_connected = now
+                return
+            if self._queued_last_connected == 0.0:
+                self._queued_last_connected = now  # 启动后首次探测，先给观察窗口
+                return
+            if now - self._queued_last_connected < int(self.cfg.get("failover_sec", 60)):
+                return
+            if xt.is_connected():
+                self.switch_broker("xt", reason="auto-failover: bridge heartbeat stale %.0fs" %
+                                   (now - self._queued_last_connected))
             return
-        if self._xt_last_connected == 0.0:
-            self._xt_last_connected = now  # 启动后首次探测，先给观察窗口
-            return
-        if now - self._xt_last_connected < int(self.cfg.get("failover_sec", 60)):
-            return
+        # active == xt：桥恢复即回切主接线
         if queued.is_connected():
-            self.switch_broker("queued", reason="auto-failover: xt disconnected %.0fs" %
-                               (now - self._xt_last_connected))
+            self.switch_broker("queued", reason="auto-failback: bridge online")
 
     def handle(self, method, path, body, request_handler):
         """路由分发。返回 (status, payload_dict)。
