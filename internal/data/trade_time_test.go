@@ -4,11 +4,13 @@ package data
 import (
 	"testing"
 	"time"
+
+	"quant-trading-v2/internal/cntime"
 )
 
 // TestBeforeOpenTrade 开市(9:30)前视为盘前，9:30 起不再压制；周末视为盘前。
 func TestBeforeOpenTrade(t *testing.T) {
-	tue := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local) // 2026-08-04 是周二
+	tue := time.Date(2026, 8, 4, 0, 0, 0, 0, cntime.Loc) // 2026-08-04 是周二（按北京墙钟，CI UTC 不漂移）
 	cases := []struct {
 		name string
 		time time.Time
@@ -20,7 +22,7 @@ func TestBeforeOpenTrade(t *testing.T) {
 		{"09:30:00 开盘", tue.Add(9*time.Hour + 30*time.Minute), false},
 		{"10:00 盘中", tue.Add(10 * time.Hour), false},
 		{"14:30 午后", tue.Add(14*time.Hour + 30*time.Minute), false},
-		{"周末任意时刻", time.Date(2026, 8, 8, 10, 0, 0, 0, time.Local), true},
+		{"周末任意时刻", time.Date(2026, 8, 8, 10, 0, 0, 0, cntime.Loc), true},
 	}
 	for _, c := range cases {
 		if got := BeforeOpenTrade(c.time); got != c.want {
@@ -31,7 +33,7 @@ func TestBeforeOpenTrade(t *testing.T) {
 
 // TestIsPreAfternoon 午休(11:30-13:00)判定：午休返回 true，盘中/盘前/非交易日返回 false。
 func TestIsPreAfternoon(t *testing.T) {
-	tue := time.Date(2026, 8, 4, 0, 0, 0, 0, time.Local) // 2026-08-04 是周二
+	tue := time.Date(2026, 8, 4, 0, 0, 0, 0, cntime.Loc) // 2026-08-04 是周二（按北京墙钟）
 	cases := []struct {
 		name string
 		time time.Time
@@ -43,7 +45,7 @@ func TestIsPreAfternoon(t *testing.T) {
 		{"12:59:59 午休末", tue.Add(12*time.Hour + 59*time.Minute + 59*time.Second), true},
 		{"13:00 午后开盘", tue.Add(13 * time.Hour), false},
 		{"10:00 盘中", tue.Add(10 * time.Hour), false},
-		{"周末 12:00", time.Date(2026, 8, 8, 12, 0, 0, 0, time.Local), false},
+		{"周末 12:00", time.Date(2026, 8, 8, 12, 0, 0, 0, cntime.Loc), false},
 	}
 	for _, c := range cases {
 		if got := IsPreAfternoon(c.time); got != c.want {

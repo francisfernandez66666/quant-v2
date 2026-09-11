@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/llm"
 )
@@ -25,8 +26,8 @@ type mockIPOTransport struct{}
 func (m *mockIPOTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 仅拦截东财 IPO 日历，其余返回空
 	if strings.Contains(req.URL.Host, "eastmoney.com") && strings.Contains(req.URL.RawQuery, "IPOAPPLY") {
-		tomorrow := time.Now().AddDate(0, 0, 1).Format("20060102")
-		apply := time.Now().Format("20060102")
+		tomorrow := time.Now().In(cntime.Loc).AddDate(0, 0, 1).Format("20060102")
+		apply := time.Now().In(cntime.Loc).Format("20060102")
 		body := fmt.Sprintf(`{"success":true,"result":{"data":[
 			{"SECURITY_CODE":"688836","SECURITY_NAME":"宇树科技","APPLY_DATE":%q,"ISSUE_PRICE":150.80,"LISTING_DATE":%q,"SECURITY_MARKET_ABBR":"科创板"}
 		]}}`, apply, tomorrow)

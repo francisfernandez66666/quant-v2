@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
 )
@@ -142,9 +143,10 @@ func TestRealCashGate(t *testing.T) {
 	cfg.Enabled = true
 	ctrl := NewController(guardServer(), db, "u_g", cfg, nil)
 
-	// 新鲜回报：可用 500 元
+	// 新鲜回报：可用 500 元。§CI 2026-09-11：账户新鲜度按 cntime.Loc（北京）判定，
+	// 播种须与之一致，否则 CI（UTC）上 8h 偏移被误判"陈旧"→保守折算50% 误拒（曾偶发 FAIL）。
 	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_g", AvailableCash: 500,
-		UpdatedAt: time.Now().Format("2006-01-02 15:04:05")}); err != nil {
+		UpdatedAt: time.Now().In(cntime.Loc).Format("2006-01-02 15:04:05")}); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-CASH-BIG", 1000)); err == nil || !strings.Contains(err.Error(), "券商口径") {
@@ -156,7 +158,7 @@ func TestRealCashGate(t *testing.T) {
 	}
 	// 过期回报（20 分钟前）：不再约束
 	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_g", AvailableCash: 0,
-		UpdatedAt: time.Now().Add(-20 * time.Minute).Format("2006-01-02 15:04:05")}); err != nil {
+		UpdatedAt: time.Now().In(cntime.Loc).Add(-20 * time.Minute).Format("2006-01-02 15:04:05")}); err != nil {
 		t.Fatalf("seed stale account: %v", err)
 	}
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-CASH-STALE", 1000)); err != nil {

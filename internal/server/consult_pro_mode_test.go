@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/auth"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 )
 
@@ -58,8 +59,9 @@ func TestConsultProModeSetAndGet(t *testing.T) {
 // TestConsultProModeRateLimitInTradeTime 交易时段 15 分钟限流生效。
 func TestConsultProModeRateLimitInTradeTime(t *testing.T) {
 	s := newTestServerAuth(t)
-	// 模拟交易日 10:00（周一）
-	now := time.Date(2026, 8, 3, 10, 0, 0, 0, time.Local)
+	// 模拟交易日 10:00（周一）。§CI 2026-09-11：写作时刻固定用北京时区——
+	// IsTradeTime 内部按北京墙钟判定，CI(UTC) 上若用 time.Local，10:00 UTC=北京 18:00 非交易时段误 FAIL。
+	now := time.Date(2026, 8, 3, 10, 0, 0, 0, cntime.Loc)
 	if !data.IsTradeTime(now) {
 		t.Fatalf("测试时间应处于交易时段")
 	}

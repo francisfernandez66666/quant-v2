@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
 )
@@ -444,8 +445,10 @@ func TestGuardT1SellLocked(t *testing.T) {
 	cfg.Enabled = true
 	ctrl := NewController(guardServer(), db, "u_t1", cfg, nil)
 
-	// 今日建仓 100 股（fills 记录今日买入）
-	today := time.Now().Format("2006-01-02")
+	// 今日建仓 100 股（fills 记录今日买入）。§CI 2026-09-11：必须按北京时间播种——
+	// 风控闸 g.today() 用 cntime.Loc 判定"当日"，CI 跑在 UTC 上若用 time.Now()
+	// 会与北京日跨天，T+1 锁定查不到当日买入（之前 CI 偶发 FAIL 根因）。
+	today := time.Now().In(cntime.Loc).Format("2006-01-02")
 	if err := db.ApplyRealFill(store.RealFill{OrderID: "T1-B", Code: "600000.SH", Side: "买入",
 		Price: 10, Qty: 100, Amount: 1000, TradedAt: today + " 09:35:00", SignalID: "T1-BSIG", UserID: "u_t1"}); err != nil {
 		t.Fatalf("open: %v", err)
