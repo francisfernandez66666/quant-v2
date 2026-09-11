@@ -355,19 +355,32 @@ class Gateway:
         reconciliation plus account asset so the decision side aligns fast.
         """
         prev = {k: b.is_connected() for k, b in self.brokers.items()}
+        xt_fail_streak = 0
         while not self._stop.is_set():
             # 主动重连：外部 xtquant 与 mock 需要主动 connect；queued 由桥心跳驱动
             # （连接动作放在 sleep 之前，保证进程启动后立即触发，缩短首单等待）
+            # §2026-09-11 主备反转止血：queued（桥）在线时 xt 只是备胎，不再空转
+            # 重连——每次 XtQuantTrader 连接尝试都会在客户端共享内存占一个 writer 槽，
+            # 桥正常时的无意义重试会耗尽 writer（WaitingFreeWriter exceeded）并拖崩
+            # QMT 客户端（生产实录：网关每秒重连 → 客户端闪退）。
             for key, b in self.brokers.items():
                 if isinstance(b, QueuedBroker):
+                    continue
+                if (self.active_key == "queued"
+                        and self.brokers.get("queued") is not None
+                        and self.brokers["queued"].is_connected()):
                     continue
                 if not b.is_connected():
                     try:
                         b.connect()
                         log.info("[gateway] broker %s connected", key)
                     except Exception as e:  # noqa: BLE001
-                        log.warning("[gateway] %s connect failed: %s (retry %ss)",
-                                    key, e, self.cfg.get("reconnect_sec", 5))
+                        xt_fail_streak += 1
+                        backoff = min(60, int(self.cfg.get("reconnect_sec", 5)) * (2 ** min(xt_fail_streak, 4)))
+                        log.warning("[gateway] %s connect failed: %s (backoff %ss, streak=%d)",
+                                    key, e, backoff, xt_fail_streak)
+                        self._stop.wait(backoff)
+                        continue
             for key, b in self.brokers.items():
                 conn = b.is_connected()
                 # 仅当 active 通道发生「断开→连接」转换时推一次全量对账 + 资产
