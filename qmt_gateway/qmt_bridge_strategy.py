@@ -146,9 +146,18 @@ class _XtOps:
     #   passorder(opType, priceType, acct, code, 5, price, volume, strategy, 0, "", userOrderId)
     #   cancel(order_id, acct)
     # XtQuantTrader stays as the legacy miniQMT fallback only.
+    #
+    # ---- QMT model-trading SANDBOX builtin API (primary since 2026-09-11) ----------
+    # Verified against the live client's own mpython/pythonbalance.py and the official
+    # demos (get_trade_detail_data(accountid, datatype, "POSITION")):
+    #   get_trade_detail_data(accountid, accounttype, DATATYPE[, strategyname])
+    #       DATATYPE UPPERCASE: ACCOUNT / POSITION / ORDER / DEAL
+    #       objects expose m_str*/m_n*/m_d* fields (m_strInstrumentID, m_nVolume, ...)
+    #   passorder(opType, orderType, accountid, orderCode, prType, modelprice, volume[, ContextInfo])
+    #       opType 23=buy / 24=sell (DG build); NO userOrderId slot -> fingerprint resolve
+    #   ContextInfo-driven cancel is build-specific; probe logs the real surface.
 
     def _builtin(self, name):
-        # QMT injects these into the strategy module globals (some builds into builtins)
         g = globals().get(name)
         if callable(g):
             return g
@@ -157,11 +166,7 @@ class _XtOps:
         return b if callable(b) else None
 
     def _embed_acct(self):
-        """Resolve the funding account id for sandbox trade queries.
-
-        get_trade_detail_data/passorder want the accountID (e.g. 2069008957), NOT the
-        literal "stock"; get_account("stock") is the documented way to obtain it.
-        """
+        """Resolve the funding accountID for sandbox trade queries (NOT literal 'stock')."""
         if getattr(self, "_acct_resolved", None):
             return self._acct_resolved
         self._acct_resolved = None
@@ -173,147 +178,140 @@ class _XtOps:
                 except Exception:
                     continue
                 if isinstance(a, (list, tuple)) and a:
-                    self._acct_resolved = str(a[0])
-                    break
+                    self._acct_resolved = str(a[0]); break
                 if isinstance(a, str) and a:
-                    self._acct_resolved = a
-                    break
+                    self._acct_resolved = a; break
         if not self._acct_resolved:
             self._acct_resolved = self.account or self.embed_account_id
         _trace("embed acct resolved: %r" % self._acct_resolved)
         return self._acct_resolved
 
-    def _gtdd(self, *tables):
-        """query a trade-detail table trying case variants until a non-empty result."""
-        gtdd = self._builtin("get_trade_detail_data")
-        acct = self._embed_acct()
-        last_err = None
-        for tbl in tables:
-            for dtype in ("stock", "STOCK", "Stock"):
-                for tname in (tbl, tbl.upper(), tbl.capitalize()):
-                    try:
-                        rows = gtdd(acct, dtype, tname)
-                    except Exception as e:
-                        last_err = e
-                        continue
-                    if rows:
-                        return rows
-        if last_err is not None:
-            _trace("gtdd(%s) all variants empty/failed: %r" % (tables[0], last_err))
-        return []
-
     def probe_embed(self):
-        """One-shot capability probe; result logged so the environment is diagnosable."""
+        """Capability probe; dumps the sandbox trade-function surface to boot.log so
+        per-build signature differences are diagnosable at a glance."""
+        names = []
+        try:
+            import builtins as _b
+            for n in dir(_b):
+                if any(k in n.lower() for k in ("order", "trade", "cancel", "account")):
+                    names.append(n)
+            for n in globals():
+                if any(k in n.lower() for k in ("order", "trade", "cancel", "account")) and n not in names:
+                    names.append(n)
+        except Exception:
+            pass
+        _trace("embed trade fns: %s" % ",".join(sorted(names)))
         gtdd = self._builtin("get_trade_detail_data")
         po = self._builtin("passorder")
-        _trace("embed probe: get_trade_detail_data=%s passorder=%s cancel=%s get_account=%s" % (
-            bool(gtdd), bool(po), bool(self._builtin("cancel")), bool(self._builtin("get_account"))))
         if not (gtdd and po):
             self._embed_ok = False
             return False
-        try:
-            rows = self._gtdd("account", "fund")
+        acct = self._embed_acct()
+        for atype in ("STOCK", "stock", "8", "10"):
+            try:
+                rows = gtdd(acct, atype, "ACCOUNT")
+            except Exception:
+                rows = None
             if rows:
-                r0 = rows[0]
-                attrs = [a for a in dir(r0) if not a.startswith("_")][:14]
-                _trace("embed probe account rows=%d attrs=%r" % (len(rows), attrs))
-            else:
-                _trace("embed probe account rows=0")
-            # API reachable counts as usable even if the account table is momentarily
-            # empty (funding session may still be syncing at login).
-            self._embed_ok = True
-        except Exception as e:
-            _trace("embed probe account error: " + repr(e))
-            self._embed_ok = False
-        return self._embed_ok
+                attrs = [a for a in dir(rows[0]) if a.startswith("m_")][:18]
+                _trace("embed ACCOUNT acct=%s atype=%s rows=%d attrs=%r" % (acct, atype, len(rows), attrs))
+                self._acct_type_ok = atype
+                self._embed_ok = True
+                return True
+        # API present but ACCOUNT momentarily empty (session still syncing) -> stay builtin
+        self._embed_ok = True
+        _trace("embed probe: API present, ACCOUNT empty -- keep builtin, retry each cycle")
+        return True
 
     def embed_usable(self):
         if self._embed_ok is None:
             self.probe_embed()
         return bool(self._embed_ok)
 
-    def _code_ex(self, code):
-        head = str(code or "").split(".")[0]
-        return "%s.%s" % (head, _expect_suffix(head))
+    def _gtdd(self, table):
+        """get_trade_detail_data(acct, accounttype, "TABLE"); [] is a valid empty snapshot."""
+        gtdd = self._builtin("get_trade_detail_data")
+        acct = self._embed_acct()
+        for at in (self._acct_type_ok or "STOCK", "STOCK", "stock", "8"):
+            try:
+                return gtdd(acct, at, table.upper()) or []
+            except Exception:
+                continue
+        return []
 
     @staticmethod
     def _obj_code(o):
-        """stock code across builds: code / stock_code / m_strInstrumentID(+m_strExchangeID)."""
-        c = str(getattr(o, "code", "") or getattr(o, "stock_code", "") or
-                getattr(o, "m_strInstrumentID", "") or "")
-        ex = str(getattr(o, "sector_name", "") or getattr(o, "m_strExchangeID", "") or "")
+        c = str(getattr(o, "m_strInstrumentID", "") or getattr(o, "code", "") or
+                getattr(o, "stock_code", "") or "")
+        ex = str(getattr(o, "m_strExchangeID", "") or getattr(o, "sector_name", "") or "")
         if c and "." not in c:
             up = ex.upper()
-            sec = "SH" if ("SH" in up or "\u4e0a\u6d77" in ex or up == "S") else \
-                  ("SZ" if ("SZ" in up or "\u6df1\u5733" in ex or up == "Z") else
-                   (_expect_suffix(c) or "SH"))
+            sec = "SH" if ("SH" in up or up in ("S",)) else \
+                  ("SZ" if ("SZ" in up or up in ("Z",)) else (_expect_suffix(c) or "SH"))
             c = "%s.%s" % (c, sec)
         return c
 
     def embed_asset(self):
-        rows = self._gtdd("account", "fund")
+        rows = self._gtdd("ACCOUNT")
         out = None
         for r in rows:
-            mv = float(getattr(r, "market_value", 0) or getattr(r, "instrument_value", 0) or
-                       getattr(r, "m_dInstrumentValue", 0) or 0)
-            cash = float(getattr(r, "available", 0) or getattr(r, "available_cash", 0) or
-                         getattr(r, "cash", 0) or getattr(r, "m_dAvailable", 0) or 0)
-            frz = float(getattr(r, "frozen", 0) or getattr(r, "frozen_cash", 0) or
-                        getattr(r, "m_dFrozenCash", 0) or 0)
-            tot = float(getattr(r, "equity", 0) or getattr(r, "total_asset", 0) or
-                        getattr(r, "m_dBalance", 0) or (cash + frz + mv))
+            mv = float(getattr(r, "m_dInstrumentValue", 0) or getattr(r, "market_value", 0) or 0)
+            cash = float(getattr(r, "m_dAvailable", 0) or getattr(r, "available", 0) or
+                         getattr(r, "cash", 0) or 0)
+            frz = float(getattr(r, "m_dFrozenCash", 0) or getattr(r, "frozen_cash", 0) or 0)
+            tot = float(getattr(r, "m_dBalance", 0) or getattr(r, "total_asset", 0) or (cash + frz + mv))
             out = {"cash": cash, "frozen_cash": frz, "total_asset": tot, "market_value": mv}
         return out
 
     def embed_positions(self):
-        rows = self._gtdd("position")
+        rows = self._gtdd("POSITION")
         out = []
         for p in rows:
             code = self._obj_code(p)
-            qty = int(getattr(p, "volume", 0) or getattr(p, "m_nVolume", 0) or 0)
+            qty = int(getattr(p, "m_nVolume", 0) or getattr(p, "volume", 0) or 0)
             if qty <= 0 or not code:
                 continue
-            open_p = float(getattr(p, "open_price", 0) or getattr(p, "cost", 0) or
-                           getattr(p, "m_dOpenPrice", 0) or 0)
-            mv = float(getattr(p, "market_value", 0) or getattr(p, "value", 0) or
-                       getattr(p, "m_dBalance", 0) or 0)
+            open_p = float(getattr(p, "m_dOpenPrice", 0) or getattr(p, "open_price", 0) or 0)
+            mv = float(getattr(p, "m_dBalance", 0) or getattr(p, "market_value", 0) or 0)
             out.append({
-                "ts_code": self._code_ex(code),
-                "name": str(getattr(p, "name", getattr(p, "stock_name", "")) or
-                            getattr(p, "m_strInstrumentName", "") or ""),
+                "ts_code": code,
+                "name": str(getattr(p, "m_strInstrumentName", "") or getattr(p, "name", "") or ""),
                 "qty": qty,
-                "can_use_qty": int(getattr(p, "can_use_volume", getattr(p, "available_volume",
-                               getattr(p, "m_nCanUseVolume", 0))) or 0),
-                "open_price": open_p,
-                "cost_price": open_p,
-                "amount": mv,
+                "can_use_qty": int(getattr(p, "m_nCanUseVolume", 0) or getattr(p, "can_use_volume", 0) or 0),
+                "open_price": open_p, "cost_price": open_p, "amount": mv,
                 "highest_price": open_p,
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
             })
         return out
 
     def embed_orders(self):
-        return self._gtdd("order")
+        return self._gtdd("ORDER")
 
     def embed_trades_rows(self):
-        rows = self._gtdd("trade", "deal")
+        rows = self._gtdd("DEAL")
         out = []
         for t in rows:
-            code = str(getattr(t, "code", "") or getattr(t, "stock_code", "") or "")
-            remark = str(getattr(t, "order_remark", "") or getattr(t, "user_order_id", "") or "")
-            price = float(getattr(t, "price", 0) or getattr(t, "traded_price", 0) or 0)
-            qty = int(getattr(t, "traded_volume", 0) or getattr(t, "volume", 0) or 0)
-            side_raw = str(getattr(t, "direction", "") or getattr(t, "bs_type", "") or
-                           getattr(t, "offset_flag", "") or "")
-            up = side_raw.upper()
-            side = BUY if ("BUY" in up or side_raw in ("\u4e70", "\u4e70\u5165")) else SELL
-            amount = float(getattr(t, "amount", 0) or getattr(t, "traded_amount", 0) or price * qty)
+            code = self._obj_code(t)
+            remark = str(getattr(t, "m_strRemark", "") or getattr(t, "order_remark", "") or "")
+            price = float(getattr(t, "m_dPrice", 0) or getattr(t, "traded_price", 0) or 0)
+            qty = int(getattr(t, "m_nVolume", 0) or getattr(t, "traded_volume", 0) or 0)
+            ot = int(getattr(t, "m_nOrderType", 0) or getattr(t, "order_type", 0) or 0)
+            if ot == self.op_buy:
+                side = BUY
+            elif ot == self.op_sell:
+                side = SELL
+            else:
+                side_raw = str(getattr(t, "direction", "") or getattr(t, "bs_type", "") or "")
+                up = side_raw.upper()
+                side = BUY if ("BUY" in up or "\u4e70" in side_raw) else SELL
+            amount = float(getattr(t, "m_dTradeAmount", 0) or getattr(t, "amount", 0) or price * qty)
             out.append({
-                "order_id": remark or str(getattr(t, "order_id", "") or ""),
-                "code": self._code_ex(code) if code else "",
-                "side": side, "price": price, "qty": qty, "amount": amount,
-                "trade_id": str(getattr(t, "traded_id", getattr(t, "trade_no", getattr(t, "id", ""))) or ""),
-                "traded_at": str(getattr(t, "traded_time", getattr(t, "time", "")) or ""),
+                "order_id": remark or str(getattr(t, "m_strOrderSysID", "") or getattr(t, "order_id", "") or ""),
+                "code": code, "side": side, "price": price, "qty": qty, "amount": amount,
+                "trade_id": str(getattr(t, "m_strTradeID", "") or getattr(t, "traded_id", "") or
+                                getattr(t, "trade_no", "") or getattr(t, "id", "") or ""),
+                "traded_at": str(getattr(t, "m_strTradeTime", "") or getattr(t, "traded_time", "") or
+                                 getattr(t, "time", "") or ""),
                 "signal_id": remark,
             })
         return out
@@ -327,25 +325,25 @@ class _XtOps:
         suffix = code.split(".")[1].upper() if "." in code else ""
         if suffix and suffix != expect:
             return False, "", "exchange suffix mismatch: %s should be .%s" % (code, expect)
-        c6 = self._code_ex(code)
+        head = code.split(".")[0]
+        c6 = "%s.%s" % (head, expect)
         side = str(req.get("side", "") or "")
         op_type = self.op_buy if side == BUY else self.op_sell
         ptype = self.pr_limit if str(req.get("price_type", "")).lower() == "limit" else self.pr_market
         price = float(req.get("price", 0) or 0)
         qty = int(req.get("qty", 0) or 0)
-        signal_id = str(req.get("signal_id", "") or "")
-        # classic slots: (opType, orderType, accountID, orderCode, prType, price,
-        #                 volume, strategyName, quickTrade, userOrderId[, ContextInfo])
-        args = (op_type, self.order_type, self._embed_acct(), c6, ptype, price, qty,
-                "qmt_bridge", 1, signal_id)
+        # official sandbox signature: passorder(opType, orderType, accountid, orderCode,
+        # prType, modelprice, volume[, ContextInfo]) -- 7 or 8 args by build
+        args7 = (op_type, self.order_type, self._embed_acct(), c6, ptype, price, qty)
         try:
             if self._ctx is not None:
                 try:
-                    po(*(args + (self._ctx,)))
+                    po(*(args7 + (self._ctx,)))
                 except TypeError:
-                    po(*args)
+                    po(*args7)
             else:
-                po(*args)
+                po(*args7)
+            self._last_place = (head, op_type, price, qty, time.time())
             return True, "", ""
         except Exception as e:
             _trace("embed passorder error: " + repr(e))
@@ -353,28 +351,44 @@ class _XtOps:
 
     def embed_cancel(self, exchange_order_id, code=""):
         ca = self._builtin("cancel")
-        if not ca:
-            return False, "builtin cancel unavailable"
-        try:
-            ca(int(str(exchange_order_id)), self._embed_acct())
-            return True, ""
-        except Exception as e:
-            _trace("embed cancel error: " + repr(e))
-            return False, "cancel error: %s" % e
+        if ca:
+            try:
+                ca(int(str(exchange_order_id)), self._embed_acct())
+                return True, ""
+            except TypeError:
+                try:
+                    ca(self._embed_acct(), int(str(exchange_order_id)))
+                    return True, ""
+                except Exception as e:
+                    _trace("embed cancel(2) error: " + repr(e))
+            except Exception as e:
+                _trace("embed cancel error: " + repr(e))
+                return False, "cancel error: %s" % e
+        return False, "builtin cancel unavailable"
 
-    def embed_resolve(self, signal_id, timeout_sec=6.0):
-        """poll order list: userOrderId(order_remark)==signal_id -> exchange order id."""
+    def embed_resolve(self, req, timeout_sec=8.0):
+        """poll ORDER for the just-placed order -> m_strOrderSysID. No userOrderId in
+        this build -> match by fingerprint (code/op/price/qty), first unclaimed row."""
+        code6 = str((req.get("code") or "").split(".")[0])
+        _head, _op, _price, _qty, t0 = self._last_place or (code6, 0, 0.0, 0, time.time() - 5)
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
-            try:
-                for o in self.embed_orders():
-                    remark = str(getattr(o, "order_remark", "") or getattr(o, "user_order_id", "") or "")
-                    if remark == signal_id:
-                        oid = getattr(o, "order_id", getattr(o, "id", "")) or ""
-                        if oid:
-                            return str(oid)
-            except Exception:
-                return ""
+            for o in self.embed_orders():
+                c = str(getattr(o, "m_strInstrumentID", "") or getattr(o, "code", "") or "")
+                if c and c != code6:
+                    continue
+                ot = int(getattr(o, "m_nOrderType", 0) or 0)
+                if _op and ot and ot != _op:
+                    continue
+                pq = float(getattr(o, "m_dOrderPrice", 0) or getattr(o, "m_dPrice", 0) or 0)
+                qv = int(getattr(o, "m_nOrderVolume", 0) or getattr(o, "volume", 0) or 0)
+                if _price and pq and abs(pq - _price) > 0.001:
+                    continue
+                if _qty and qv and qv != _qty:
+                    continue
+                oid = str(getattr(o, "m_strOrderSysID", "") or getattr(o, "order_id", "") or "")
+                if oid:
+                    return oid
             time.sleep(0.5)
         return ""
 
@@ -453,7 +467,7 @@ class _XtOps:
                                " (check trade permission / unlock / session)" % (seq, code, qty))
         return True, "seq:%s" % seq, ""
 
-    def resolve_order_id(self, signal_id, pending_ref):
+    def resolve_order_id(self, signal_id, pending_ref, req=None):
         """poll orders by order_remark(signal_id) -> exchange order id (for gateway
         seq->exchange mapping and later cancels). dry_run keeps the dry ref."""
         if self.dry_run or not signal_id:
