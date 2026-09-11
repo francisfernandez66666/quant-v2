@@ -90,6 +90,9 @@ def json_dumps(o):
 class ReportHandler:
     """回报处理器：写库 + outbox 异步推送首尔。"""
 
+    # §清算 Guard 阈值：账户持仓市值低于该值视为"事实上无持仓"允许清账本（元）。
+    CLEAR_GUARD_MIN_MV = 1.0
+
     def __init__(self, store, report_url, report_token, user_id="", max_outbox=5000):
         """构造回报处理器。
 
@@ -109,6 +112,11 @@ class ReportHandler:
         self.disconnected = False
         # §G5 连续空快照计数（对账清空守卫）
         self._empty_snaps = 0
+        # §清算 Guard（2026-09-11 生产实录）：最近一次账户资产回报快照（asset dict，
+        # 关键字段 market_value）。空持仓快照时若资产回报显示仍有持仓市值，
+        # 绝不清空账本——防止 broker 会话未同步时把满仓账户对账清零（实录：
+        # 账户总值 106k、可用资金 84.8，positions 快照空 → 09:17 全账本被清空）。
+        self._last_asset = None
         # §ROBUST outbox 改为 store 持久化队列（崩溃/重启续发，不丢回报）；
         # _pending 仅作 sender 唤醒信号。max_outbox 转义为落库行数上限。
         self._outbox_cv = threading.Condition()
@@ -332,7 +340,20 @@ class ReportHandler:
             log.exception("[handler] on_trade failed, event skipped: %s", ev)
 
     def on_positions(self, positions):
-        """全量对账 + 推送。§G5：空快照守卫——只有连续两次空快照且本地有持仓才接受清空。"""
+        """全量对账 + 推送。§G5：空快照守卫——只有连续两次空快照且本地有持仓才接受清空。
+
+        §清算 Guard（2026-09-11）：接受清空前再校验最近账户资产回报——
+        market_value（持仓市值）> 阈值说明账户事实上仍满仓，空 positions 快照只是
+        broker 会话未同步（实录：总值 106k 账户被 full clear 清零账本）。
+        资产回报存在且市值显著为正 → 不清账本；无资产回报（未同步）同样不清，
+        保持保守（宁可保留本地持仓也不误清）。
+        English: positions full reconcile + push. §clr-guard (2026-09-11 prod incident):
+        before accepting an empty-snapshot full clear, cross-check the latest account
+        asset snapshot — when market_value stays materially positive the account is in
+        fact still holding, and an empty positions list only means the broker session
+        has not synced yet; keep the ledger (conservative: never clear on unknown asset
+        either) instead of wiping a fully-invested account.
+        """
         # §修复 G3（2026-08-29）：回调异常保护（见 on_order 说明）。
         try:
             if not positions:
@@ -343,6 +364,17 @@ class ReportHandler:
                 if self._empty_snaps < 2:
                     log.warning("[handler] empty positions snapshot #%d — reconcile skipped "
                                 "(防通道异常清空账本)", self._empty_snaps)
+                    return
+                asset = self._last_asset or {}
+                mv = float(asset.get("market_value") or 0.0)
+                if mv > self.CLEAR_GUARD_MIN_MV:
+                    log.warning(
+                        "[handler] empty snapshot but account still holds ¥%.2f market value — "
+                        "reconcile skipped (broker session likely not synced yet)", mv)
+                    return
+                if "market_value" not in asset:
+                    log.warning("[handler] empty snapshot and no asset snapshot yet — "
+                                "reconcile skipped (conservative: keep ledger)")
                     return
                 log.warning("[handler] two consecutive empty snapshots — accepting full clear")
             else:
@@ -357,9 +389,15 @@ class ReportHandler:
             log.exception("[handler] on_positions failed, reconcile skipped")
 
     def on_account(self, asset):
-        """账户资产回报（可用资金/冻结/总值/市值）。asset 为 None 时跳过（查询失败）。"""
+        """账户资产回报（可用资金/冻结/总值/市值）。asset 为 None 时跳过（查询失败）。
+
+        §清算 Guard：回报里的 market_value 是空持仓快照是否可信的最后仲裁依据，
+        缓存最近一次非空资产快照供 on_positions 清空判定使用。
+        English: account asset report; the market_value field arbitrates whether an
+        empty positions snapshot may clear the ledger (§clr-guard)."""
         if not asset:
             return
+        self._last_asset = dict(asset)
         self._push({"type": "account", "asset": dict(asset)})
 
     def push_disconnect(self):

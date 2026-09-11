@@ -163,13 +163,20 @@ class TestStore(unittest.TestCase):
         self.assertEqual(p["qty"], 100)  # 未翻倍
 
     def test_empty_positions_snapshot_guard(self):
-        """§G5：单次空快照不清账本；连续两次才接受清空。"""
+        """§G5：单次空快照不清账本；连续两次才接受清空。
+
+        §清算 Guard（2026-09-11）：资产回报显示无持仓市值（真清仓）时连续
+        空快照才接受清空；有市值/未回报时保守保留（详见 test_clear_guard.py）。
+        """
         s = new_store()
         h = ReportHandler(s, "", "")
+        # 资产回报明确 market_value=0（真清仓）→ 维持 §G5 旧语义：连续两次空快照接受清空
+        h.on_account({"cash": 90000.0, "frozen_cash": 0.0,
+                      "total_asset": 90000.0, "market_value": 0.0})
         s.upsert_position({"ts_code": "600519.SH", "qty": 100, "cost_price": 1500})
         h.on_positions([])  # 第 1 次：跳过
         self.assertEqual(len(s.list_positions()), 1)
-        h.on_positions([])  # 第 2 次：接受清空
+        h.on_positions([])  # 第 2 次：接受清空（资产回报证实已无持仓市值）
         self.assertEqual(s.list_positions(), [])
 
 
