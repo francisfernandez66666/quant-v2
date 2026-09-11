@@ -246,6 +246,42 @@ func TestHandleQMTReportOrderAdvancesStatus(t *testing.T) {
 	assertOrderStatus("已成")
 }
 
+// TestHandleQMTReportOrderUnknownSideNotRejected §2026-09-11 生产实录：
+// 桥侧干跑探测单（TEST-DRY…）side="???" 会被旧实现 400 拒收并在网关 outbox
+// 反复重推刷屏。order 事件仅展示/推进状态不动账本，未知方向应原样落库 200；
+// trade 事件保持强校验（§安全 T3）。
+func TestHandleQMTReportOrderUnknownSideNotRejected(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+
+	reqBody := `{"type":"order","order_id":"O-DRY","signal_id":"TEST-DRY-20260911-1","code":"600000.SH","side":"???","status":"已报","price":9.3,"qty":100,"at":"2026-09-11T11:19:00+08:00"}`
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(reqBody)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("未知方向 order 回报不应拒收: HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	orders, _ := db.RealOrders()
+	found := false
+	for _, o := range orders {
+		if o.SignalID == "TEST-DRY-20260911-1" {
+			if o.Side != "???" {
+				t.Fatalf("未知方向应原样保留, got %q", o.Side)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("干跑委托行应落库（仅展示）")
+	}
+
+	// trade 事件：未知方向仍必须 400 拒收（§安全 T3 防误走卖分支清仓）
+	tradeBody := `{"type":"trade","order_id":"O-DRY-T","code":"600000.SH","side":"???","price":9.3,"qty":100,"amount":930,"traded_at":"2026-09-11T11:19:05+08:00","signal_id":"TEST-DRY-20260911-2"}`
+	rr2 := httptest.NewRecorder()
+	s.handleQMTReport(rr2, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(tradeBody)))
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("未知方向 trade 必须拒收, got HTTP %d", rr2.Code)
+	}
+}
+
 // TestQMTTradesUnknownBasisSellNotCountedAsWin §2026-09-08 验证②：对账来源持仓（成交簿无买入
 // 记录）卖出时，成本基准不可得——旧实现 sellQty 被钳到 0 → pnl=0 → 一律 wins++，把亏损退出
 // 伪造成"胜"并吞掉已实现盈亏。视为缺陷：无基准退出不得计入胜/负，也不得伪造 realized。

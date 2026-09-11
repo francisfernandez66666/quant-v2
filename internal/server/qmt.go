@@ -457,10 +457,13 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		}
 	case "order":
 		// §安全 T3：委托方向同样归一（仅用于展示，但保持口径一致，避免"BUY"等串污染委托行）。
+		// §2026-09-11 生产实录放宽：委托状态回报里 side 属"仅展示"语义，桥侧干跑探测
+		// 单（TEST-DRY…）side="???" 会被拒 400 并在 outbox 反复重推刷屏——order 事件
+		// 不动账本，未知方向改为原样保留 + 告警日志，不再拒收（trade 仍保持强校验）。
 		orderSide, oErr := normalizeReportSide(ev.Side)
 		if oErr != nil {
-			writeError(w, 400, oErr.Error())
-			return
+			log.Printf("[trading] 委托回报方向异常(signal=%s status=%s): %v，按原样落库仅展示", ev.SignalID, ev.Status, ev.Side)
+			orderSide = ev.Side
 		}
 		if ev.OrderID != "" && ev.SignalID != "" {
 			// §R4-4 委托状态推进：回报的 部成/已成/已撤/部撤/废单 必须写入本地行——
