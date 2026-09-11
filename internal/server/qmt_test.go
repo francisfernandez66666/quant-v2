@@ -257,7 +257,7 @@ func TestHandleQMTReportBrokerEventAccepted(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("broker 切换事件应 200 接受, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if pos, _ := db.RealPositionByCode("600000.SH"); pos != nil {
+	if pos, _ := db.RealPositionByCode("600000.SH"); pos.TsCode != "" {
 		t.Fatal("broker 事件不应动账本")
 	}
 }
