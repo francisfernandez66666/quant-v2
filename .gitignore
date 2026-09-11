@@ -85,3 +85,6 @@ mobile/app/src/release/
 
 # 一次性调试脚本归档（本地工具，不入库）
 scripts/qmt-debug/
+
+# 构建/冒烟产物目录（如 bin/quant-staging 本地二进制），不入库
+bin/

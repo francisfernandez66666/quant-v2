@@ -62,8 +62,10 @@ export default class ErrorBoundary extends React.Component {
 
       // 内置中文兜底界面：提示页面出错并提供刷新入口
       return (
+        /* 内置中文兜底界面：居中卡片式布局，垂直排列标题/错误详情/重试按钮 */
         <div
           style={{
+            // 容器样式：近全高（60vh）居中的纵向卡片布局，元素间距 16
             padding: 32,
             textAlign: 'center',
             fontFamily: 'system-ui, -apple-system, sans-serif',
@@ -76,13 +78,23 @@ export default class ErrorBoundary extends React.Component {
             gap: 16,
           }}
         >
+          {
+            // 标题：告知用户页面出错而非静默白屏
+          }
           <h2 style={{ margin: 0, fontSize: 20 }}>页面出错了，请刷新</h2>
+          {
+            // 错误详情：展示捕获到的 error.message，最长 480px 自动换行，未知错误给兜底文案
+          }
           <p style={{ margin: 0, color: '#888', fontSize: 13, maxWidth: 480, wordBreak: 'break-all' }}>
             {(this.state.error && this.state.error.message) || '发生未知错误'}
           </p>
+          {
+            // 刷新重试按钮：点击后重置错误状态并尝试重新渲染子树
+          }
           <button
             onClick={this.handleReload}
             style={{
+              // 主按钮样式：TDesign 品牌蓝底白字圆角，悬停指针
               padding: '8px 20px',
               border: 'none',
               borderRadius: 6,
@@ -99,6 +111,7 @@ export default class ErrorBoundary extends React.Component {
     }
 
     // 正常状态：直接渲染受保护的子树
+    // 兜底 UI 的样式细节：32px 内边距、垂直居中、至少 60vh 高，错误详情限宽换行
     return this.props.children
   }
 }

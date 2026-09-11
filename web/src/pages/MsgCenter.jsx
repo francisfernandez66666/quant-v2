@@ -66,14 +66,17 @@ export default function MsgCenter() {
   // 根据等级与战法筛选消息列表
   const filteredAlerts = useMemo(() => {
     let list = alerts
+    // 按等级过滤
     if (activeFilter === 'hit') list = list.filter(a => a.level === '命中提醒')
     if (activeFilter === 'trade') list = list.filter(a => a.level === '交易信号')
     if (activeFilter === 'strategy') list = list.filter(a => a.level === '策略信号')
     if (activeFilter === 'stop') list = list.filter(a => a.level === '止盈' || a.level === '止损')
     if (activeFilter === 'hold') list = list.filter(a => a.level === '持仓提示')
+    // 交易信号二级筛选：按战法名称
     if (activeFilter === 'trade' && activeStrategy !== 'all') {
       list = list.filter(a => a.strategy === activeStrategy)
     }
+    // 非策略信号且非预期差战法时，过滤掉预期差
     if (activeFilter !== 'strategy' && activeStrategy !== '预期差') {
       list = list.filter(a => a.strategy !== '预期差')
     }
@@ -177,8 +180,42 @@ export default function MsgCenter() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 渲染单条消息卡片：等级标签、股票信息、时间、操作按钮、标题与正文
+  function renderAlertCard(a, i) {
+    // 卡片左边框颜色根据消息等级与方向动态设置
+    const borderStyle = { marginBottom: 8, borderLeft: `4px solid ${alertBorder(a)}` }
+    // 头部行包含：等级标签、股票代码名称、时间、操作按钮
+    const headerRow = (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+        <Tag theme={levelTagTheme(a.level)} size="small">{a.level}</Tag>
+        <span style={{ fontFamily: 'monospace', color: '#4fc3f7', fontWeight: 600 }}>{a.code} {a.name}</span>
+        <span style={{ color: '#555', flex: 1, fontSize: 13 }}>{fmtMsgTime(a)}</span>
+        <Tag theme={actionTagTheme(a)} size="small" variant="light">{actionText(a)}</Tag>
+        {isSellAlert(a) && (
+          <Button size="small" variant="outline" theme="danger" onClick={() => onPaperSell(a)}>模拟卖出</Button>
+        )}
+        <Button size="small" variant="text" theme="default" onClick={() => onDeleteOne(a)}>✕</Button>
+      </div>
+    )
+    // 卡片主体：标题 + 正文
+    const cardBody = (
+      <>
+        <div style={{ fontSize: 14, color: '#1a1a1a', fontWeight: 600 }}>{a.title}</div>
+        <div style={{ fontSize: 13, color: '#999', marginTop: 4 }}>{a.body}</div>
+      </>
+    )
+    return (
+      <Card key={a.id || i} style={borderStyle}>
+        {headerRow}
+        {cardBody}
+      </Card>
+    )
+  }
+
+  /* 消息中心页面主渲染：标题栏 → 等级筛选 → 战法筛选 → 消息卡片列表 */
   return (
     <div className="page">
+      {/* 页面标题 + 清空全部按钮 */}
       <Card style={{ marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>消息中心</h2>
@@ -186,6 +223,7 @@ export default function MsgCenter() {
         </div>
       </Card>
 
+      {/* 消息等级筛选按钮组：全部/命中提醒/交易信号/策略信号/止盈止损/持仓提示 */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 14, flexWrap: 'wrap' }}>
         {filters.map((f) => (
           <Button key={f.key} size="small" variant={activeFilter === f.key ? 'base' : 'outline'}
@@ -195,6 +233,7 @@ export default function MsgCenter() {
         ))}
       </div>
 
+      {/* 交易信号二级筛选：按战法名称过滤（仅选中"交易信号"时显示） */}
       {activeFilter === 'trade' && strategyOptions.length > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
           <span style={{ fontSize: 14, color: '#888' }}>战法</span>
@@ -203,23 +242,10 @@ export default function MsgCenter() {
         </div>
       )}
 
-      {filteredAlerts.map((a, i) => (
-        <Card key={a.id || i} style={{ marginBottom: 8, borderLeft: `4px solid ${alertBorder(a)}` }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
-            <Tag theme={levelTagTheme(a.level)} size="small">{a.level}</Tag>
-            <span style={{ fontFamily: 'monospace', color: '#4fc3f7', fontWeight: 600 }}>{a.code} {a.name}</span>
-            <span style={{ color: '#555', flex: 1, fontSize: 13 }}>{fmtMsgTime(a)}</span>
-            <Tag theme={actionTagTheme(a)} size="small" variant="light">{actionText(a)}</Tag>
-            {isSellAlert(a) && (
-              <Button size="small" variant="outline" theme="danger" onClick={() => onPaperSell(a)}>模拟卖出</Button>
-            )}
-            <Button size="small" variant="text" theme="default" onClick={() => onDeleteOne(a)}>✕</Button>
-          </div>
-          <div style={{ fontSize: 14, color: '#1a1a1a', fontWeight: 600 }}>{a.title}</div>
-          <div style={{ fontSize: 13, color: '#999', marginTop: 4 }}>{a.body}</div>
-        </Card>
-      ))}
+      {/* 消息卡片列表：按等级着色左边框，显示标题/时间/操作按钮 */}
+      {filteredAlerts.map(renderAlertCard)}
 
+      {/* 空状态提示：无匹配消息时展示 */}
       {filteredAlerts.length === 0 && (
         <div style={{ textAlign: 'center', padding: 60, color: '#555' }}>暂无消息</div>
       )}

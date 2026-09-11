@@ -83,22 +83,28 @@ export default function Consult() {
   async function onSend() {
     const text = draft.trim()
     if (!text || loading) return
+    // 清空输入框、设置加载状态、追加用户消息到聊天列表
     setDraft('')
     setLoading(true)
     setMessages((m) => [...m, { role: 'user', content: text, time: new Date().toISOString() }])
     scrollToBottom()
     try {
+      // 调用后端咨询接口，获取 LLM 回复
       const res = await api.consultChat(text)
       setMessages((m) => [...m, { role: 'assistant', content: res.reply, time: new Date().toISOString() }])
+      // 回复包含"未配置"时标记 LLM 未配置，触发配置卡片显示
       if (res.reply && res.reply.includes('未配置')) {
         setLlmConfigured(false)
       }
     } catch (e) {
+      // 请求失败：追加错误消息到聊天列表
       setMessages((m) => [...m, { role: 'assistant', content: '⚠️ ' + (e.message || '咨询失败'), time: new Date().toISOString() }])
+      // 错误信息包含 LLM_API_KEY 或配置关键字时，标记需要配置
       if ((e.message || '').includes('LLM_API_KEY') || (e.message || '').includes('配置')) {
         setLlmConfigured(false)
       }
     } finally {
+      // 无论成功失败，结束加载状态并滚动到底部
       setLoading(false)
       scrollToBottom()
     }
@@ -109,15 +115,18 @@ export default function Consult() {
     setLlmSaving(true)
     setLlmMsg('')
     try {
+      // 调用后端保存 LLM 配置接口
       await api.setLLMConfig({
         api_keys: cfgApiKey ? [cfgApiKey] : undefined,
         api_url: cfgApiUrl || undefined,
         model: cfgModel || undefined,
       })
+      // 保存成功：标记已配置、显示成功提示
       setLlmConfigured(true)
       setLlmMsg('LLM 配置已保存')
       setLlmMsgType('ok')
     } catch (e) {
+      // 保存失败：显示错误提示
       setLlmMsg('保存失败: ' + (e.message || '未知错误'))
       setLlmMsgType('err')
     }
@@ -133,8 +142,10 @@ export default function Consult() {
   }
 
   // 初始化：加载 LLM 配置、专业模式与历史记录
+  // 页面初始化：加载 LLM 配置、专业模式状态、历史聊天记录
   useEffect(() => {
-    (async () => {
+    ;(async () => {
+      // 探测 LLM 配置状态：有 API Key 或自定义 API 地址即视为已配置
       try {
         const cfg = await api.fetchLLMConfig()
         if (cfg) {
@@ -151,8 +162,62 @@ export default function Consult() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 渲染单条聊天消息气泡：用户右对齐蓝色，AI左对齐灰色，含时间戳
+  function renderMessage(m, i) {
+    return (
+      <div key={i} style={{ alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start' }}>
+        <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>{m.role === 'user' ? '我' : 'AI 顾问'}</div>
+        <div style={{
+          ...bubbleStyle,
+          background: m.role === 'user' ? '#0052d9' : '#f4f4f5',
+          color: m.role === 'user' ? '#fff' : '#1a1a1a',
+        }}>{m.content}</div>
+        {m.time && <div className="muted" style={{ fontSize: 12, marginTop: 2, textAlign: m.role === 'user' ? 'right' : 'left' }}>{fmtTime(m.time)}</div>}
+      </div>
+    )
+  }
+
+  // 输入框按键事件处理：Enter 发送、Shift+Enter 换行
+  function handleInputKeydown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      onSend()
+    }
+  }
+
+  // 渲染底部输入区域：多行文本框 + 发送按钮，支持 Enter 发送、Shift+Enter 换行
+  function renderInputArea() {
+    // 发送按钮：加载中或无输入时禁用
+    const sendBtn = (
+      <Button theme="primary" onClick={onSend} disabled={loading || !draft.trim()}>
+        {loading ? '...' : '发送'}
+      </Button>
+    )
+    // 文本输入框：支持多行、自动伸缩、Enter 发送
+    const textInput = (
+      <Textarea
+        value={draft}
+        onChange={(v) => setDraft(v)}
+        placeholder="输入你想咨询的问题，Enter 发送，Shift+Enter 换行"
+        autosize={{ minRows: 2, maxRows: 6 }}
+        style={{ flex: 1 }}
+        onKeydown={handleInputKeydown}
+      />
+    )
+
+    // 输入区域：多行文本框 + 发送按钮，支持 Enter 发送
+    return (
+      <div style={{ display: 'flex', gap: 8, marginTop: 12, alignItems: 'flex-end' }}>
+        {textInput}
+        {sendBtn}
+      </div>
+    )
+  }
+
+  /* 股票咨询页面主渲染：工具栏 → LLM配置（未配置时） → 聊天消息区 → 输入框 */
   return (
     <div className="page" style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 32px)' }}>
+      {/* 顶部工具栏：标题 + 专业模式开关 + 清空对话按钮 */}
       <div className="toolbar" style={{ justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
         <SectionLabel>股票咨询</SectionLabel>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -164,6 +229,7 @@ export default function Consult() {
         </div>
       </div>
 
+      {/* LLM 配置卡片：首次使用或未配置 API Key 时显示，可填写地址/Key/模型 */}
       {!llmConfigured && (
         <Card title="🔑 LLM 配置（首次使用请填写 API Key）" style={{ marginBottom: 12 }}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -176,19 +242,11 @@ export default function Consult() {
         </Card>
       )}
 
+      {/* 聊天消息区域：用户消息右对齐蓝色气泡，AI消息左对齐灰色气泡 */}
       <div ref={chatBox} style={chatBoxStyle}>
         {messages.length === 0 && <div className="muted" style={{ textAlign: 'center', padding: 24 }}>开始咨询，向 AI 提问任意 A 股相关问题</div>}
-        {messages.map((m, i) => (
-          <div key={i} style={{ alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start' }}>
-            <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>{m.role === 'user' ? '我' : 'AI 顾问'}</div>
-            <div style={{
-              ...bubbleStyle,
-              background: m.role === 'user' ? '#0052d9' : '#f4f4f5',
-              color: m.role === 'user' ? '#fff' : '#1a1a1a',
-            }}>{m.content}</div>
-            {m.time && <div className="muted" style={{ fontSize: 12, marginTop: 2, textAlign: m.role === 'user' ? 'right' : 'left' }}>{fmtTime(m.time)}</div>}
-          </div>
-        ))}
+        {messages.map(renderMessage)}
+        {/* AI思考中状态指示器 */}
         {loading && (
           <div style={{ alignSelf: 'flex-start' }}>
             <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>AI 顾问</div>
@@ -197,24 +255,8 @@ export default function Consult() {
         )}
       </div>
 
-      <div style={{ display: 'flex', gap: 8, marginTop: 12, alignItems: 'flex-end' }}>
-        <Textarea
-          value={draft}
-          onChange={(v) => setDraft(v)}
-          placeholder="输入你想咨询的问题，Enter 发送，Shift+Enter 换行"
-          autosize={{ minRows: 2, maxRows: 6 }}
-          style={{ flex: 1 }}
-          onKeydown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              onSend()
-            }
-          }}
-        />
-        <Button theme="primary" onClick={onSend} disabled={loading || !draft.trim()}>
-          {loading ? '...' : '发送'}
-        </Button>
-      </div>
+      {/* 底部输入区域：多行文本框 + 发送按钮，支持 Enter 发送、Shift+Enter 换行 */}
+      {renderInputArea()}
     </div>
   )
 }

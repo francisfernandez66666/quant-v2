@@ -11,12 +11,15 @@ import { showToast } from '../ui.jsx'
 // 五大战法参数分组定义：每个 group 含标题与字段列表（k=后端字段名, label=展示名, step=步进, type=控件类型, hint=悬浮说明）
 const strategyGroups = [
   {
+    // ── 龙头战法：打分因子权重 + 卖出风控/止盈参数 ──
     key: 'dragon', title: '龙头战法（权重合计≤1）',
     fields: [
+      // 打分四因子权重（合计≤1，决定信号排序）
       { k: 'f1_seal_weight', label: 'F1 首封权重', step: 0.05 },
       { k: 'f2_resonance_weight', label: 'F2 共振权重', step: 0.05 },
       { k: 'f3_premium_weight', label: 'F3 溢价权重', step: 0.05 },
       { k: 'f4_rs_weight', label: 'F4 强度权重', step: 0.05 },
+      // 卖出风控与止盈参数（回撤/炸板分级减仓、走弱判定、止盈）
       { k: 'pullback_max_pct', label: '最大回撤%', step: 0.01 },
       { k: 'breaker_sell_half_pct', label: '炸板减半%', step: 0.01 },
       { k: 'breaker_sell_all_pct', label: '炸板清仓%', step: 0.01 },
@@ -28,6 +31,7 @@ const strategyGroups = [
     ],
   },
   {
+    // ── 双响炮战法：两段放量突破的量比门槛与评分权重 ──
     key: 'double_bump', title: '双响炮战法',
     fields: [
       { k: 'first_break_volume_multiple', label: '一突量比', step: 0.1 },
@@ -40,6 +44,7 @@ const strategyGroups = [
     ],
   },
   {
+    // ── N 形战法：形态门槛与固定止损 ──
     key: 'n_shape', title: 'N 形战法',
     fields: [
       { k: 'n_pattern_score_threshold', label: 'N 形态分阈值', step: 1 },
@@ -47,6 +52,7 @@ const strategyGroups = [
     ],
   },
   {
+    // ── 龙头回头战法：回调低吸的止盈止损与分批目标 ──
     key: 'dragon_return', title: '龙回头战法',
     fields: [
       { k: 'stop_loss_pct', label: '止损%', step: 0.01 },
@@ -58,6 +64,7 @@ const strategyGroups = [
     ],
   },
   {
+    // ── 动量分模型：三因子权重 + 动量闸门（信号过滤开关）──
     key: 'momentum', title: '动量分权重（合计建议=100）',
     fields: [
       { k: 'volume_price_weight', label: '量价权重', step: 5 },
@@ -187,10 +194,12 @@ export default function Settings() {
   // 初始化：检测服务器在线状态并加载 LLM/战法/资讯开关配置
   useEffect(() => {
     ;(async () => {
+      // 1) 服务器连通性探测：仅设置在线状态标记
       try {
         await api.fetchStatus()
         setServerOnline(true)
       } catch (_) { setServerOnline(false) }
+      // 2) 读取 LLM 配置回填到表单
       try {
         const cfg = await api.fetchLLMConfig()
         if (cfg) {
@@ -199,6 +208,7 @@ export default function Settings() {
           setLlmClassifierModel(cfg.classifier_model || '')
           if (cfg.batch_concurrency > 0) setLlmBatchConcurrency(cfg.batch_concurrency)
           if (cfg.d1_max_tokens > 0) setLlmD1MaxTokens(cfg.d1_max_tokens)
+          // 多 Key 场景：数组按换行合并为一段文本；兼容旧版单 api_key 字段
           let keys = ''
           if (Array.isArray(cfg.api_keys) && cfg.api_keys.length) {
             keys = cfg.api_keys.join('\n')
@@ -206,9 +216,11 @@ export default function Settings() {
             keys = cfg.api_key
           }
           setLlmApiKeys(keys)
+          // 已配置判定：有 Key 或有地址即视为已配置
           setLlmConfigured(!!(keys || cfg.api_url))
         }
       } catch (_) {}
+      // 3) 读取战法参数：先建五组空占位，再按分组归并后端返回
       try {
         const sc = await api.fetchStrategyConfig()
         if (sc) {
@@ -220,6 +232,7 @@ export default function Settings() {
           setStrategyCfg(next)
         }
       } catch (_) {}
+      // 4) 读取"显示全部资讯"开关状态
       try {
         const ns = await api.fetchNewsShowAllStatus()
         if (ns && typeof ns.news_show_all === 'boolean') setNewsShowAll(ns.news_show_all)
@@ -229,6 +242,7 @@ export default function Settings() {
 
   // 按字段类型渲染控件：switch 类型用 Switch，其余用 InputNumber（默认步进 1）
   const renderField = (group, f) => {
+    // 开关型字段：渲染 ToggleSw 布尔控件
     if (f.type === 'switch') {
       return (
         <ToggleSw
@@ -237,6 +251,7 @@ export default function Settings() {
         />
       )
     }
+    // 数字型字段：渲染 InputNumber（默认步进 1，列式布局）
     return (
       <InputNumber
         value={strategyCfg[group.key][f.k] ?? 0}
@@ -299,6 +314,9 @@ export default function Settings() {
           <span style={labelStyle}>API URL</span>
           <Input value={llmApiUrl} onChange={(v) => setLlmApiUrl(v)} placeholder="https://api.openai.com/v1" style={{ width: 280 }} />
         </div>
+        {
+          /* API Key 文本域：每行一个 Key，多 Key 后端轮询分发 */
+        }
         <div style={rowStyle}>
           <span style={labelStyle}>API Key(s)</span>
           <Textarea value={llmApiKeys} onChange={(v) => setLlmApiKeys(v)} placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" autosize={{ minRows: 4, maxRows: 8 }} style={{ width: 280 }} />
@@ -307,19 +325,31 @@ export default function Settings() {
           <span style={labelStyle}>模型</span>
           <Input value={llmModel} onChange={(v) => setLlmModel(v)} placeholder="gpt-4o-mini" style={{ width: 280 }} />
         </div>
+        {
+          /* 分类专用模型：留空则回退主模型 */
+        }
         <div style={rowStyle}>
           <span style={labelStyle}>分类专用模型</span>
           <Input value={llmClassifierModel} onChange={(v) => setLlmClassifierModel(v)} placeholder="留空则用主模型" style={{ width: 280 }} />
         </div>
+        {
+          /* 归因批并发度：批量归因请求的并发上限（1-16） */
+        }
         <div style={rowStyle}>
           <span style={labelStyle}>归因批并发度</span>
           <InputNumber value={llmBatchConcurrency} onChange={(v) => setLlmBatchConcurrency(v)} min={1} max={16} style={{ width: 200 }} />
         </div>
+        {
+          /* D1 推理上限：单条 D1 评分推理的最大 tokens */
+        }
         <div style={rowStyle}>
           <span style={labelStyle}>D1推理上限</span>
           <InputNumber value={llmD1MaxTokens} onChange={(v) => setLlmD1MaxTokens(v)} min={512} max={4096} step={256} style={{ width: 200 }} />
           <span style={{ ...labelStyle, color: '#999', marginLeft: 8, fontSize: 12 }}>tokens（默认 2048，D1 评分推理长度）</span>
         </div>
+        {
+          /* 配置状态展示与保存按钮 */
+        }
         <div style={rowStyle}>
           <span style={labelStyle}>状态</span>
           <Tag theme={llmConfigured ? 'success' : 'default'} variant="light">

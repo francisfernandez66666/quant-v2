@@ -160,22 +160,28 @@ export default function Signals() {
     }
   }
 
-  // 在模拟盘按指定价格/数量买入该信号个股
+  // 在模拟盘按指定价格/数量买入该信号个股（弹出 prompt 确认价格与手数）
   async function paperBuy(s) {
     const priceStr = window.prompt('输入买入价（元，留空用实时价）：', s.price || s.close || '')
     const qtyStr = window.prompt('输入买入手数（1 手 = 100 股）：', '1')
     if (qtyStr === null || priceStr === null) return
+
+    // 校验手数与价格合法性
     const qty = parseInt(qtyStr, 10)
     const price = parseFloat(priceStr)
     if (isNaN(qty) || qty <= 0) {
       window.alert('买入手数无效，请填写正整数')
       return
     }
+
+    // 价格为空按实时价成交，有价格则用指定价格；二次确认后提交
     if (isNaN(price) || price <= 0) {
       if (!window.confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手？将按实时价成交。`)) return
     } else {
       if (!window.confirm(`确认模拟买入 ${s.code} ${s.name || ''} ${qty} 手 @${price.toFixed(2)}？`)) return
     }
+
+    // 调用后端模拟买入接口：code/name/strategy/price/qty/type/id
     try {
       await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty, s.strategy_type || '', s.strategy_id || '')
       window.alert(`已模拟买入 ${s.code} ${qty} 手`)
@@ -216,6 +222,8 @@ export default function Signals() {
     document.addEventListener('visibilitychange', visHandler.current)
     api.connectSSE()
     unsubSSE.current = api.onSSE(handleSSE)
+
+    // 清理：清除轮询定时器、移除可见性监听、取消SSE订阅
     return () => {
       if (timer.current) clearInterval(timer.current)
       if (visHandler.current) document.removeEventListener('visibilitychange', visHandler.current)
@@ -228,8 +236,12 @@ export default function Signals() {
   // D1-D4 维度评分、分时展开按钮、买入/忽略/模拟买入/收藏操作
   // 排序：代码/名称/策略/generated_at 字符串比较，现价/涨跌/总分数值比较（§修复 P2#23 补齐）
   const columns = [
+    // 代码列：支持按代码字符串排序
     { colKey: 'code', title: '代码', width: 90, sorter: sorterStr('code') },
+
+    // 名称列：个股简称，无名称时显示 '-'
     { colKey: 'name', title: '名称', width: 100, sorter: sorterStr('name'), cell: ({ row }) => row.name || '-' },
+
     {
       colKey: 'price', title: '现价/涨跌', width: 130, sorter: sorterNum('price'),
       cell: ({ row }) => (
@@ -253,6 +265,8 @@ export default function Signals() {
       colKey: 'total_score', title: '总分', width: 70, sorter: sorterNum('total_score'),
       cell: ({ row }) => (row.total_score != null ? row.total_score.toFixed(0) : '—'),
     },
+
+    // 信号等级列：按 level/remind_level 映射为 交易/观望/可开仓/观察/静默 标签
     {
       colKey: 'level', title: '等级', width: 90,
       cell: ({ row }) => {
@@ -264,28 +278,36 @@ export default function Signals() {
         return <Tag theme={theme} size="small">{lv}</Tag>
       },
     },
+
+    // D1-D4 维度评分列：四色标签（红/黄/蓝/绿）展示各维度分数与描述
     {
       colKey: 'detail', title: 'D1/D2/D3/D4', minWidth: 220,
       cell: ({ row }) => (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          {/* D1 事件维度（红） */}
           <span title={'D1事件: ' + (row.d1_reason || row.d1_event || '无事件') + (row.d1_blocked ? '（负面拦截）' : '')}
             style={{ color: '#e34d59', background: 'rgba(227,77,89,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d1_score && (row.d1_reason || row.d1_event)
               ? <em style={{ fontStyle: 'normal' }}>{d1Tag(row)}</em>
               : (row.d1 != null ? row.d1.toFixed(0) : '—')}
           </span>
+          {/* D2 龙头/动量维度（黄） */}
           <span title={'D2: ' + (row.d2_desc || '')} style={{ color: '#FAAD14', background: 'rgba(250,173,20,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d2 != null ? row.d2.toFixed(0) : '—'}{row.d2_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d2_desc)}</em>}
           </span>
+          {/* D3 N形/结构维度（蓝） */}
           <span title={'D3: ' + (row.d3_desc || '')} style={{ color: '#4fc3f7', background: 'rgba(79,195,247,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d3 != null ? row.d3.toFixed(0) : '—'}{row.d3_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d3_desc)}</em>}
           </span>
+          {/* D4 基本面/回踩维度（绿） */}
           <span title={'D4: ' + (row.d4_desc || '')} style={{ color: '#00a870', background: 'rgba(0,168,112,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d4 != null ? row.d4.toFixed(0) : '—'}{row.d4_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d4_desc)}</em>}
           </span>
         </div>
       ),
     },
+
+    // 分时展开按钮列：点击展开/收起该信号个股的分时图
     {
       colKey: 'kline', title: '分时', width: 80,
       cell: ({ row }) => (
@@ -295,10 +317,13 @@ export default function Signals() {
         </Button>
       ),
     },
+
+    // 操作列：买入/忽略/模拟买入/收藏按钮，按信号状态与模拟盘开关动态显示
     {
       colKey: 'action', title: '操作', width: 180,
       cell: ({ row }) => (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {/* 主操作：买入（可开仓）/忽略（已标记）/无操作 */}
           {row.can_open ? (
             <Button size="small" theme="danger" onClick={(e) => { e.stopPropagation(); confirmTrade(row, 'buy') }}>买入</Button>
           ) : row.action === 'buy' ? (
@@ -306,10 +331,12 @@ export default function Signals() {
           ) : (
             <span className="muted">—</span>
           )}
+          {/* 模拟买入：仅已准入+有策略池的信号 */}
           {paperOn && row.can_open && hasStrategyPool(row) && (
             <Button size="small" variant="outline" theme="success" onClick={(e) => { e.stopPropagation(); paperBuy(row) }}
               title="模拟买入归入该信号所属战法资金池（非战法信号不可买）">模拟买入</Button>
           )}
+          {/* 收藏按钮：已忽略信号可收藏到自选股 */}
           {!row.can_open && row.action !== 'buy' && (
             <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); collectToWatchlist(row) }}>收藏</Button>
           )}
@@ -326,25 +353,31 @@ export default function Signals() {
     }
   }
 
+  {/* 页面整体布局：顶部筛选工具栏 + 信号表格 + 移动端底部操作面板 + 确认弹窗 + 日志弹窗 */}
   return (
     <div className="page">
+      {/* 工具栏卡片：页面标题 + 等级筛选按钮组 + 战法下拉筛选 + 日志入口 */}
       <Card style={{ marginBottom: 16 }}>
         <div className="toolbar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>策略信号</h2>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {/* 等级筛选按钮组：全部/强/达标/观察 */}
             {FILTERS.map((f) => (
               <Button key={f.key} size="small" variant={activeFilter === f.key ? 'base' : 'outline'}
                 theme={activeFilter === f.key ? 'primary' : 'default'} onClick={() => setActiveFilter(f.key)}>
                 {f.label}
               </Button>
             ))}
+            {/* 战法下拉筛选 */}
             <Select value={activeStrategy} onChange={(v) => setActiveStrategy(v)} size="small" style={{ width: 160 }}
               options={[{ label: '全部策略', value: 'all' }, ...strategyOptions.map((st) => ({ label: st, value: st }))]} />
+            {/* 日志入口按钮 */}
             <Button size="small" variant="outline" theme="primary" onClick={() => setShowLog(true)}>📋 日志</Button>
           </div>
         </div>
       </Card>
 
+      {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板 */}
       <Card>
         <Table
           rowKey="code"
@@ -367,6 +400,7 @@ export default function Signals() {
         />
       </Card>
 
+      {/* 移动端底部操作面板：点击行时弹出，提供买入/模拟买入/忽略/收藏/分时等快捷操作 */}
       {sheetSignal && (
         <div style={{
           position: 'fixed', inset: 0, zIndex: 300, background: 'rgba(0,0,0,0.6)',
@@ -382,6 +416,7 @@ export default function Signals() {
             {sheetSignal.can_open && (
               <button style={sheetBtnStyle('#FF4D4F')} onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'buy') }}>买入</button>
             )}
+            {/* 模拟买入按钮：仅当信号可开仓且模拟盘已开启且信号属于某战法资金池时显示 */}
             {sheetSignal.can_open && paperOn && hasStrategyPool(sheetSignal) && (
               <button style={sheetBtnStyle('#52c41a')} onClick={() => { const s = sheetSignal; setSheetSignal(null); paperBuy(s) }}>模拟买入</button>
             )}
@@ -399,6 +434,7 @@ export default function Signals() {
         </div>
       )}
 
+      {/* 交易确认弹窗：展示信号代码/名称/策略/总分/价格，确认后执行买入或忽略 */}
       <Dialog visible={showConfirm} onClose={() => setShowConfirm(false)} header="确认交易"
         onConfirm={() => doAction(tradeAction)} confirmBtn="确认" cancelBtn="取消">
         <p><strong>{tradeTarget.code}</strong> {tradeTarget.name}</p>

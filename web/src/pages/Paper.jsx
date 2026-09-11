@@ -470,6 +470,8 @@ export default function Paper() {
   // 保存资金分配、仓位上限或买入纪律配置
   async function saveSettings() {
     const totalCash = pools.reduce((s, p) => s + p.cash, 0)
+
+    // 资金分配保存：校验各池分配总额不超过总现金
     if (settingsTab === 'alloc') {
       const allocs = {}; let assigned = 0
       pools.forEach((p) => {
@@ -481,6 +483,8 @@ export default function Paper() {
       catch (e) { showToast(e.message || '保存失败','error') }
       return
     }
+
+    // 买入纪律保存：解析每池日买笔数/冷却/最低分/预算占比
     if (settingsTab === 'rules') {
       const rules = {}
       pools.forEach((p) => {
@@ -673,7 +677,9 @@ export default function Paper() {
         confirmBtn="保存"
         width={640}
       >
+        {/* 设置弹窗标签页：资金分配 / 仓位上限 / 买入纪律三个子面板 */}
         <Tabs value={settingsTab} onChange={(v) => setSettingsTab(v)}>
+          {/* 资金分配标签页：逐池调整资金额度，确保各池资金之和不超过总现金 */}
           <Tabs.TabPanel value="alloc" label="资金分配">
             <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>每池资金额（Σ ≈ 总现金守恒）。不影响仓位上限。</div>
             {pools.map((p) => (
@@ -688,6 +694,7 @@ export default function Paper() {
               </Form.FormItem>
             ))}
           </Tabs.TabPanel>
+          {/* 仓位上限标签页：设置全局持仓上限与各池独立上限，Σ 不得超全局 */}
           <Tabs.TabPanel value="caps" label="仓位上限">
             <Form.FormItem label="全局持仓上限（0=不设限）">
               <InputNumber value={cfgMaxPos} min={0} step={1} placeholder="0=不设限" onChange={(v) => setCfgMaxPos(v || 0)} style={{ width: 240 }} />
@@ -705,6 +712,7 @@ export default function Paper() {
               </Form.FormItem>
             ))}
           </Tabs.TabPanel>
+          {/* 买入纪律标签页：逐池配置日限次数/冷却/最低评分/日预算%，控制买入频率 */}
           <Tabs.TabPanel value="rules" label="买入纪律">
             <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>
               每池买入纪律：日限次数 / 冷却分钟 / 最低评分 / 日预算%。全 0 = 不设限；寻优审批会自动把门槛写入对应池的「最低评分」。
@@ -718,6 +726,7 @@ export default function Paper() {
                   {poolLabel(cfgRuleSel)}
                   {poolCurrentRule(cfgRuleSel) && <span style={{ color: '#888' }}>（当前生效：{poolCurrentRuleText(cfgRuleSel)}）</span>}
                 </div>
+                {/* 买入纪律四字段网格：日限买 / 冷却分钟 / 最低评分 / 日预算百分比 */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                   <Form.FormItem label="日限买">
                     <InputNumber value={cfgRules[cfgRuleSel].max_daily_buys} min={0} step={1} placeholder="0=不限" onChange={(v) => setCfgRules({ ...cfgRules, [cfgRuleSel]: { ...cfgRules[cfgRuleSel], max_daily_buys: v || 0 } })} />
@@ -833,13 +842,16 @@ export default function Paper() {
 
       {/* 持仓 / 成交 / 订单 */}
       <Tabs value={tab} onChange={(v) => setTab(v)} style={{ marginBottom: 8 }}>
+        {/* 当前持仓面板：模拟盘持仓列表，含分时图展开行 */}
         <Tabs.TabPanel value="positions" label={`当前持仓 (${filteredPositions.length})`}>
           <Card>
+            {/* 持仓表格：代码/名称/数量/成本/现价/盈亏/战法评分/止盈止损/移动止盈 */}
             {posData.length ? (
               <Table
                 rowKey="__key"
                 data={posData}
                 columns={posColumns}
+                {/* 行展开渲染分时图 */}
                 expandedRow={renderKline}
                 expandedRowKeys={[...klineOpen]}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
@@ -854,8 +866,10 @@ export default function Paper() {
             )}
           </Card>
         </Tabs.TabPanel>
+        {/* 成交日志面板：模拟盘成交记录 */}
         <Tabs.TabPanel value="trades" label={`成交日志 (${filteredTrades.length})`}>
           <Card>
+            {/* 成交表格：代码/方向/价格/数量/时间/状态 */}
             {tradeData.length ? (
               <Table
                 rowKey="__key"
@@ -871,8 +885,10 @@ export default function Paper() {
             ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无成交记录</div>}
           </Card>
         </Tabs.TabPanel>
+        {/* 订单记录面板：展示所有模拟交易订单 */}
         <Tabs.TabPanel value="orders" label={`订单 (${filteredOrders.length})`}>
           <Card>
+            {/* 订单表格：代码/方向/价格/数量/时间/状态 */}
             {orderData.length ? (
               <Table rowKey="__key" data={orderData} columns={orderColumns} bordered size="small" />
             ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无订单记录</div>}
@@ -927,10 +943,12 @@ export default function Paper() {
       </Dialog>
 
       {/* 模拟盘自检弹窗 */}
+      {/* 模拟盘自检弹窗：展示开关/管理员/引擎路径/持仓/成交/文件状态等诊断信息 */}
       <Dialog visible={selfCheckOpen} header="模拟盘自检" onClose={() => setSelfCheckOpen(false)} footer={null} width={640}>
         {selfCheck && (
           <div style={{ fontSize: 13, lineHeight: 1.9 }}>
             {selfCheck.note && <div style={{ color: '#e6a23c', marginBottom: 8 }}>{selfCheck.note}</div>}
+            {/* 诊断信息表格：开关/管理员/引擎路径/成交/持仓/文件状态等关键指标 */}
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <tbody>
                 {[
@@ -955,6 +973,7 @@ export default function Paper() {
                 ))}
               </tbody>
             </table>
+            {/* 各资金池持仓分布表：展示每个战法资金池的持仓数与可用现金 */}
             {Array.isArray(selfCheck.pool_detail) && selfCheck.pool_detail.length > 0 && (
               <div style={{ marginTop: 12 }}>
                 <div style={{ fontWeight: 600, marginBottom: 4 }}>各资金池持仓分布</div>

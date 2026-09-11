@@ -276,6 +276,7 @@ async function request(path, opts = {}) {
       clearTimeout(timer)
       throw new Error('请求超时')
     }
+    // 非超时类网络错误：若配置了自定义服务器，则回退当前页面同源地址重试一次
     if (base !== '') {
       try {
         if (typeof console !== 'undefined') {
@@ -286,6 +287,7 @@ async function request(path, opts = {}) {
         clearTimeout(timer)
         throw e2 || e
       }
+      // 未配置自定义服务器（base 为空同源请求）：无回退余地，直接抛出原始网络错误
     } else {
       clearTimeout(timer)
       throw e

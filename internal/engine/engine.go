@@ -33,11 +33,11 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
-	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
 	"quant-trading-v2/internal/store"
@@ -112,13 +112,13 @@ type Engine struct {
 	hotRecords    []data.HotRecord              // 当日热点板块轮次记录（固化到磁盘）
 	hotRecPath    string                        // 热点板块记录持久化文件路径
 
-	sectorEventTimes map[string]time.Time  // 板块事件时间戳（重复事件衰减状态）
-	emotionCfg       *config.EmotionConfig // 情绪周期阈值（SSE 广播情绪阶段）
-	sectorConstTopN  int                   // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
-	auctionStrengths map[string]float64    // 竞价强度分（§P1.2，code→[0,10]，开盘窗口确认/观察用）
-	impactTbl        *research.ImpactTable // 新闻影响率表（§P2.1；Enhance.NewsImpact 开启时懒建，nil=关闭）
+	sectorEventTimes map[string]time.Time         // 板块事件时间戳（重复事件衰减状态）
+	emotionCfg       *config.EmotionConfig        // 情绪周期阈值（SSE 广播情绪阶段）
+	sectorConstTopN  int                          // 板块→个股传播每板块成分股数量（默认 20，扩大同板块强势股覆盖）
+	auctionStrengths map[string]float64           // 竞价强度分（§P1.2，code→[0,10]，开盘窗口确认/观察用）
+	impactTbl        *research.ImpactTable        // 新闻影响率表（§P2.1；Enhance.NewsImpact 开启时懒建，nil=关闭）
 	sectorLeaders    []sector_agent.LinkageLeader // §P2.2 龙头观察列表（Enhance.SectorLinkage 开启时刷新）
-	marketTracker    *research.StateTracker // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
+	marketTracker    *research.StateTracker       // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
 	signalQuality    *research.SignalQualityTable // §P2.5 信号质量分桶表（Enhance.DynWeight 开启时懒建，nil=关闭）
 
 	fetcher          *data.Fetcher                                                                                   // 5s 实时行情采集器（近实时打分快照来源）

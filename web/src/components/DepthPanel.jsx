@@ -56,6 +56,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
       setLoading(true)
       setError('')
       try {
+        // 请求后端盘口接口；响应含 bids 视为合法数据，同时回填盘口因子与股票名
         const data = await api.fetchDepth(code)
         if (data && data.bids) {
           if (cancelled) return
@@ -66,18 +67,22 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
           if (!cancelled) setError('盘口数据格式异常')
         }
       } catch (e) {
+        // 请求失败：展示后端错误信息或通用提示，避免面板空白无反馈
         if (!cancelled) setError(e && e.message ? e.message : '盘口加载失败')
       } finally {
         if (!cancelled) setLoading(false)
       }
     }
+    // 触发首次加载；组件卸载或 code 变更时置 cancelled，丢弃未完成的过期响应
     load()
     return () => { cancelled = true }
   }, [code])
 
   useEffect(() => {
+    // 容器宽度监听：画布按容器实际宽度重绘（无 ResizeObserver 时退化为 500ms 轮询）
     if (!wrapRef.current) return
     setViewW(wrapRef.current.clientWidth)
+    // 优先使用 ResizeObserver 监听容器尺寸变化
     if (typeof ResizeObserver !== 'undefined') {
       const ro = new ResizeObserver(() => {
         if (wrapRef.current) setViewW(wrapRef.current.clientWidth)
@@ -85,6 +90,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
       ro.observe(wrapRef.current)
       return () => ro.disconnect()
     } else {
+      // 兜底：不支持 ResizeObserver 的环境改用 500ms 轮询容器宽度
       const t = setInterval(() => {
         if (wrapRef.current) {
           const w = wrapRef.current.clientWidth
@@ -191,6 +197,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
       } else {
         // 买卖档行：量柱（买红/卖绿）+ 档位标签 + 价格 + 手数；价格色区分买卖侧
         if (r.vol > 0) {
+          // 量柱宽度：按该档量 / 最大量归一化到量柱区宽度
           const bw = (r.vol / maxVol) * (volAreaRight - volAreaLeft)
           ctx.fillStyle = r.side === 'ask' ? 'rgba(22,163,74,0.14)' : 'rgba(245,34,77,0.14)'
           ctx.fillRect(volAreaLeft, y + 3, bw, rowH - 6)
@@ -198,6 +205,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         ctx.fillStyle = C.lv
         ctx.textAlign = 'left'
         ctx.fillText(r.lv, col1, cy)
+        // 价格文字：卖侧绿色、买侧红色（A 股红涨绿跌配色习惯）
         ctx.fillStyle = r.side === 'ask' ? C.ask : C.bid
         ctx.textAlign = 'left'
         ctx.fillText(fmtPrice(r.price), priceX, cy)
@@ -209,8 +217,10 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
 
     if (factors) {
       // 盘口因子区：委比/买卖量/封单/价差/覆盖度，每行一对「标签-数值」
+      // 因子区起始 y：位于档位行之下留出 18px 间距
       let fy = topPad + (L * 2 + 1) * rowH + 18
       ctx.font = '12px monospace'
+      // 数值统一转 Number：后端可能返回字符串，避免拼接与运算出错
       const F = {
         bid_ask_ratio: Number(factors.bid_ask_ratio) || 0,
         bid_vol: Number(factors.bid_vol) || 0,
@@ -233,14 +243,19 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         ctx.fillText(b.val, col1 + 194, fy)
         fy += 22
       }
+      // 逐对绘制因子：委比按正负红绿着色；封单红/绿区分买卖方向
       drawPair(
+        // 委比 = (买盘总量-卖盘总量)/(买盘总量+卖盘总量)，衡量买卖盘力量对比
         { label: '委比', val: (F.bid_ask_ratio * 100).toFixed(1) + '%', color: F.bid_ask_ratio >= 0 ? C.up : C.down },
+        // 买/卖量：买卖两侧挂单总量对比
         { label: '买/卖量', val: fmtVol(F.bid_vol) + '/' + fmtVol(F.ask_vol) }
       )
+      // 封单量：买一/卖一位置的封单（涨停/跌停时意义最大）
       drawPair(
         { label: '买一封单', val: fmtVol(F.seal_bid), color: C.up },
         { label: '卖一封单', val: fmtVol(F.seal_ask), color: C.down }
       )
+      // 价差：买卖一价差占现价比例（流动性）；覆盖：档位数据完整度
       drawPair(
         { label: '价差', val: F.spread_pct.toFixed(3) + '%' },
         { label: '覆盖', val: F.near_pct.toFixed(2) + '%' }
@@ -250,6 +265,9 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
 
   return (
     <div className="depth-panel">
+      {
+        // 工具栏：股票名+「盘口」标题、行情时间与数据源标识、手动刷新按钮
+      }
       <div className="depth-toolbar">
         <span className="depth-title">{ob.name || dispName || code} · 盘口</span>
         {ob.time ? (
@@ -257,6 +275,9 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
             {ob.time} {ob.source ? <i className="src">{ob.source}</i> : null}
           </span>
         ) : null}
+        {
+          // 刷新按钮：重新拉取盘口数据（复用加载态与错误态逻辑）
+        }
         <button className="btn-refresh" disabled={loading} onClick={() => {
           setLoading(true); setError('')
           api.fetchDepth(code).then((data) => {
@@ -266,9 +287,15 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         }}>刷新</button>
       </div>
 
+      {
+        // 加载中 / 错误提示区
+      }
       {loading ? <div className="depth-state">加载中…</div> : null}
       {error ? <div className="depth-state">{error}</div> : null}
 
+      {
+        // 盘口画布：仅在数据就绪且无错误时渲染
+      }
       {!loading && !error && ob.bids && ob.bids.length ? (
         <div ref={wrapRef}>
           <canvas ref={canvasRef} />

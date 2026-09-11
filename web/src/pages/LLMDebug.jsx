@@ -173,7 +173,9 @@ function LogModal({ visible, onClose }) {
   const load = useCallback(async () => {
     if (loading) return
     setLoading(true)
+    // 并行拉取两侧数据：Stage 记录（LLM 分析）与信号批次日志
     const [srRes, slRes] = await Promise.allSettled([api.fetchStageRecords(), api.fetchSignalLogs()])
+    // LLM 分析记录：有数据则默认选中最新一轮并应用，否则置空态
     if (srRes.status === 'fulfilled' && Array.isArray(srRes.value) && srRes.value.length) {
       setLlmRecords(srRes.value)
       setLlmIdx(0)
@@ -183,6 +185,7 @@ function LogModal({ visible, onClose }) {
       setLlmData(null)
       setLlmNoData(true)
     }
+    // 信号批次日志：同上，默认选中最新一批
     if (slRes.status === 'fulfilled' && Array.isArray(slRes.value) && slRes.value.length) {
       setSigRecords(slRes.value)
       setSigIdx(0)
@@ -234,16 +237,19 @@ function LogModal({ visible, onClose }) {
   ]
   // Stage2 事件分析表格列定义：标题 / 方向 / 评分 / 板块 / 个股 / 上下游 / 影响 / 类型 / 理由
   const stage2Columns = [
+    // 基础列：标题 / 方向 / 评分
     { colKey: 'title', title: '标题', ellipsis: true, minWidth: 160 },
     {
       colKey: 'direction', title: '方向', width: 80,
       cell: ({ row }) => <Tag theme={dirTheme(row.direction)} size="small">{row.direction || '中性'}</Tag>,
     },
     { colKey: 'score', title: '评分', width: 90, cell: ({ row }) => Number(row.score || 0).toFixed(2) },
+    // 关联对象列：板块 / 个股 / 上游板块 / 下游板块（打标展示）
     { colKey: 'sectors', title: '板块', minWidth: 120, cell: ({ row }) => <TagList items={row.sectors} /> },
     { colKey: 'stocks', title: '个股', minWidth: 120, cell: ({ row }) => <TagList items={row.related_stocks} kind="stock" /> },
     { colKey: 'upstream', title: '上游', minWidth: 100, cell: ({ row }) => <TagList items={row.upstream_sectors} /> },
     { colKey: 'downstream', title: '下游', minWidth: 100, cell: ({ row }) => <TagList items={row.downstream_sectors} /> },
+    // 定性列：影响等级 / 事件类型 / LLM 给出的分析理由
     {
       colKey: 'impact', title: '影响', width: 80,
       cell: ({ row }) => row.impact_level
@@ -259,12 +265,15 @@ function LogModal({ visible, onClose }) {
 
   // 信号批次表格列定义：代码 / 名称 / 战法 / 方向 / 动作 / 置信 / 现价 / 板块 / 理由
   const signalColumns = [
+    // 标的与战法归属列：代码 / 名称 / 所属战法
     { colKey: 'code', title: '代码', width: 90 },
     { colKey: 'name', title: '名称', width: 100 },
     { colKey: 'strategy', title: '战法', width: 130 },
+    // 信号结论列：方向 / 动作 / 置信度
     { colKey: 'direction', title: '方向', width: 80, cell: ({ row }) => <Tag theme={dirTheme(row.direction)} size="small">{row.direction || '中性'}</Tag> },
     { colKey: 'action', title: '动作', width: 80, cell: ({ row }) => <Tag size="small" variant="light">{row.action || '-'}</Tag> },
     { colKey: 'confidence', title: '置信', width: 90, cell: ({ row }) => Number(row.confidence || 0).toFixed(2) },
+    // 行情与归因列：现价 / 板块 / 生成理由
     { colKey: 'price', title: '现价', width: 90, cell: ({ row }) => row.price ? '¥' + Number(row.price).toFixed(2) : '-' },
     { colKey: 'sector', title: '板块', width: 120, ellipsis: true },
     { colKey: 'reason', title: '理由', ellipsis: true, minWidth: 160 },
@@ -276,6 +285,9 @@ function LogModal({ visible, onClose }) {
         <Tabs value={activeTab} onChange={(v) => switchTab(v)}>
           <Tabs.TabPanel value="llm" label="LLM 分析">
             <div className="toolbar" style={toolbarStyle}>
+              {
+                /* 工具栏：跨轮次搜索框 + 轮次下拉 + 刷新按钮 */
+              }
               <Input
                 value={llmQuery}
                 onChange={(v) => setLlmQuery(v)}
@@ -283,6 +295,7 @@ function LogModal({ visible, onClose }) {
                 style={{ flex: 1 }}
               />
               {!llmSearching && (
+                // 搜索时隐藏轮次下拉，切换后立即应用该轮数据
                 <Select
                   value={llmIdx}
                   options={llmBatchOptions}
@@ -295,18 +308,28 @@ function LogModal({ visible, onClose }) {
             </div>
 
             {llmSearching ? (
+              // 搜索态：按轮次分组展示跨批次命中结果
               <div>
                 {!llmSearchGroups.length ? (
+                  // 无命中空态提示
                   <div style={emptyStyle}>未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
                 ) : (
+                  // 命中分组列表：每个轮次一张命中事件小表
                   <>
                     <div className="muted" style={{ marginBottom: 8 }}>共 {llmTotalHits} 条事件命中，跨 {llmSearchGroups.length} 个轮次</div>
                     {llmSearchGroups.map((g, gi) => (
+                      // 单个轮次的命中：批次时间 + 命中数 + 事件表
                       <div key={gi} style={{ marginBottom: 12 }}>
+                        {
+                          /* 轮次时间与命中条数头 */
+                        }
                         <div style={{ display: 'flex', gap: 12, marginBottom: 4, fontSize: 13 }}>
                           <span className="muted">轮次 {fmtTime(g.time)}</span>
                           <span className="muted">命中 {g.items.length} 条</span>
                         </div>
+                        {
+                          /* 该轮命中事件用 Stage2 列渲染 */
+                        }
                         <Table
                           data={g.items.map((ev, i) => ({ ...ev, _k: gi + '_' + i }))}
                           columns={stage2Columns}
@@ -320,10 +343,14 @@ function LogModal({ visible, onClose }) {
                 )}
               </div>
             ) : (
+              // 常规态：无数据空态 + 选中轮次的概要条与两级表格
               <>
                 {llmNoData && <div style={emptyStyle}>暂无 LLM 分析记录，等待下一轮扫描</div>}
                 {llmData && (
                   <>
+                    {
+                      /* 概要条：Stage1 模式 / 原始条数 / 筛选后 / 分析时间 */
+                    }
                     <div style={summaryBarStyle}>
                       <div style={summaryItemStyle}>
                         <span className="muted">Stage1 模式</span>
@@ -336,6 +363,9 @@ function LogModal({ visible, onClose }) {
                       <div style={summaryItemStyle}><span className="muted">分析时间</span><span style={{ color: '#1a1a1a' }}>{fmtTime(llmData.process_time)}</span></div>
                     </div>
 
+                    {
+                      /* Stage1 表：本轮全部原始标题及是否通过关键词筛选 */
+                    }
                     <SectionLabel>Stage1 · 新闻初筛</SectionLabel>
                     <Table
                       data={(llmData.raw_titles || []).map((t, i) => ({ idx: i + 1, title: t, sel: isSelected(i) }))}
@@ -347,6 +377,7 @@ function LogModal({ visible, onClose }) {
 
                     <SectionLabel>Stage2 · LLM 分析结果</SectionLabel>
                     {llmData.stage2_events && llmData.stage2_events.length > 0 ? (
+                      // 有事件结果：分页展示 Stage2 分析明细
                       <Table
                         data={llmData.stage2_events.map((ev, i) => ({ ...ev, _k: i }))}
                         columns={stage2Columns}
@@ -356,6 +387,7 @@ function LogModal({ visible, onClose }) {
                         pagination={{ pageSize: 10, showJumper: true, total: llmData.stage2_events.length }}
                       />
                     ) : (
+                      // 本轮无事件结果的空态
                       <div style={emptyStyle}>Stage2 无分析结果</div>
                     )}
                   </>
@@ -366,12 +398,18 @@ function LogModal({ visible, onClose }) {
 
           <Tabs.TabPanel value="signal" label="信号批次">
             <div className="toolbar" style={toolbarStyle}>
+              {
+                /* 工具栏：跨批次搜索框 + 战法筛选 + 批次下拉 + 刷新按钮 */
+              }
               <Input
                 value={sigQuery}
                 onChange={(v) => setSigQuery(v)}
                 placeholder="搜索：个股名称 / 代码 / 板块（跨批次）"
                 style={{ flex: 1 }}
               />
+              {
+                /* 战法筛选下拉：全部战法或指定战法 */
+              }
               <Select
                 value={activeSigStrategy}
                 options={[{ label: '全部战法', value: 'all' }, ...sigStrategyOptions]}
@@ -379,6 +417,7 @@ function LogModal({ visible, onClose }) {
                 style={{ width: 160 }}
               />
               {!sigSearching && (
+                // 搜索时隐藏批次下拉
                 <Select
                   value={sigIdx}
                   options={sigBatchOptions}
@@ -391,18 +430,28 @@ function LogModal({ visible, onClose }) {
             </div>
 
             {sigSearching ? (
+              // 搜索态：按批次分组展示跨批次命中结果
               <div>
                 {!sigSearchGroups.length ? (
+                  // 无命中空态提示
                   <div style={emptyStyle}>未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
                 ) : (
+                  // 命中分组列表：每个批次一张命中信号小表
                   <>
                     <div className="muted" style={{ marginBottom: 8 }}>共 {sigTotalHits} 条信号命中，跨 {sigSearchGroups.length} 个批次</div>
                     {sigSearchGroups.map((g, gi) => (
+                      // 单个批次的命中：批次时间 + 命中数 + 信号表
                       <div key={gi} style={{ marginBottom: 12 }}>
+                        {
+                          /* 批次时间与命中条数头 */
+                        }
                         <div style={{ display: 'flex', gap: 12, marginBottom: 4, fontSize: 13 }}>
                           <span className="muted">批次 {fmtTime(g.time)}</span>
                           <span className="muted">命中 {g.items.length} 条</span>
                         </div>
+                        {
+                          /* 该批命中信号用信号列渲染 */
+                        }
                         <Table
                           data={g.items.map((sg, i) => ({ ...sg, _k: gi + '_' + i }))}
                           columns={signalColumns}
@@ -416,16 +465,21 @@ function LogModal({ visible, onClose }) {
                 )}
               </div>
             ) : (
+              // 常规态：无数据空态 + 选中批次的概要条与信号表
               <>
                 {sigNoData && <div style={emptyStyle}>暂无信号批次记录，等待下一轮扫描</div>}
                 {sigData && (
                   <>
+                    {
+                      /* 概要条：批次时间 / 原始条数 / 信号数 */
+                    }
                     <div style={summaryBarStyle}>
                       <div style={summaryItemStyle}><span className="muted">批次时间</span><span style={{ color: '#1a1a1a' }}>{fmtTime(sigData.process_time)}</span></div>
                       <div style={summaryItemStyle}><span className="muted">原始条数</span><span style={{ color: '#1a1a1a' }}>{sigData.raw_count}</span></div>
                       <div style={summaryItemStyle}><span className="muted">信号数</span><span style={{ color: '#1a1a1a' }}>{sigData.signals.length}</span></div>
                     </div>
                     {sigFiltered.length > 0 ? (
+                      // 有信号：按战法过滤后分页展示
                       <Table
                         data={sigFiltered.map((sg, i) => ({ ...sg, _k: i }))}
                         columns={signalColumns}
@@ -435,6 +489,7 @@ function LogModal({ visible, onClose }) {
                         pagination={{ pageSize: 10, showJumper: true, total: sigFiltered.length }}
                       />
                     ) : (
+                      // 无信号空态：区分"战法过滤后无命中"与"本轮无产出"
                       <div style={emptyStyle}>{sigData.signals.length ? '当前战法无匹配信号' : '本轮无信号产出'}</div>
                     )}
                   </>
@@ -502,11 +557,13 @@ export default function LLMDebug() {
   async function loadData() {
     if (loading) return // §FIX-0921d 防并发风暴：SSE/15s 轮询/手动刷新互斥，避免同时多个 700KB 请求挤占连接
     setLoading(true)
+    // 计时与诊断标记：主源/回落是否成功、错误信息
     const t0 = Date.now()
     let recs = null
     let mainOk = false
     let fbOk = false
     let errMsg = ''
+    // 主源：当日全量轮次记录
     try {
       recs = await api.fetchStageRecords()
       mainOk = Array.isArray(recs) && recs.length > 0
@@ -514,6 +571,7 @@ export default function LLMDebug() {
       recs = null
       errMsg = (e && e.message) || String(e)
     }
+    // 引擎未启动：直接置"Agent 未就绪"空态并返回
     if (recs && recs.status === 'no_engine') {
       setNoAgent(true)
       setNoData(false)
@@ -523,6 +581,7 @@ export default function LLMDebug() {
       setLoading(false)
       return
     }
+    // 主源失败 → 尝试回落源
     if (!mainOk) {
       // 回落源：最新单轮快照（字段与轮次记录同构，直接包一层数组复用渲染）
       try {
@@ -535,11 +594,13 @@ export default function LLMDebug() {
         if (!errMsg) errMsg = (e2 && e2.message) || String(e2)
       }
     }
+    // 双源任一生效：展示记录并应用最新一轮
     if (Array.isArray(recs) && recs.length) {
       setRecords(recs)
       applyLatest(recs) // §FIX-0921e 传入本次取到的记录，避免读到 setState 前的旧闭包
       setDiag({ n: recs.length, mainOk, fbOk, ms: Date.now() - t0, err: '' })
     } else {
+      // 双源皆失败：置无数据空态并记录诊断错误
       setNoData(true)
       setNoAgent(false)
       setRecords([])
@@ -580,16 +641,19 @@ export default function LLMDebug() {
   ]
   // Stage2 事件分析表格列定义：标题 / 方向 / 评分 / 板块 / 个股 / 上下游 / 影响 / 类型 / 理由
   const stage2Columns = [
+    // 基础列：标题 / 方向 / 评分
     { colKey: 'title', title: '标题', ellipsis: true, minWidth: 160 },
     {
       colKey: 'direction', title: '方向', width: 80,
       cell: ({ row }) => <Tag theme={dirTheme(row.direction)} size="small">{row.direction || '中性'}</Tag>,
     },
     { colKey: 'score', title: '评分', width: 90, cell: ({ row }) => Number(row.score || 0).toFixed(2) },
+    // 关联对象列：板块 / 个股 / 上游板块 / 下游板块（打标展示）
     { colKey: 'sectors', title: '板块', minWidth: 120, cell: ({ row }) => <TagList items={row.sectors} /> },
     { colKey: 'stocks', title: '个股', minWidth: 120, cell: ({ row }) => <TagList items={row.related_stocks} kind="stock" /> },
     { colKey: 'upstream', title: '上游', minWidth: 100, cell: ({ row }) => <TagList items={row.upstream_sectors} /> },
     { colKey: 'downstream', title: '下游', minWidth: 100, cell: ({ row }) => <TagList items={row.downstream_sectors} /> },
+    // 定性列：影响等级 / 事件类型 / LLM 给出的分析理由
     {
       colKey: 'impact', title: '影响', width: 80,
       cell: ({ row }) => row.impact_level
@@ -616,6 +680,7 @@ export default function LLMDebug() {
 
       {/* §FIX-0921d 取数自诊断行：主源/回落/轮数/耗时/错误，一眼定位白板根因 */}
       {diag && (
+        // 诊断行：轮数 · 主源/回落成败 · 耗时 · 错误信息
         <div style={{ fontSize: 12, color: '#999', marginBottom: 8 }}>
           数据自检: {diag.n} 轮 · 主源{diag.mainOk ? '✅' : '❌'} · 回落{diag.fbOk ? '✅' : '❌'} · {diag.ms}ms
           {diag.err ? ' · ' + diag.err : ''}
@@ -624,6 +689,7 @@ export default function LLMDebug() {
       {noAgent && <div style={emptyStyle}>Agent 未就绪</div>}
       {!noAgent && noData && <div style={emptyStyle}>暂无数据，等待下一轮扫描</div>}
       {data && (
+        // 有数据：概要卡片 + Stage1 初筛卡片 + Stage2 分析结果卡片
         <>
           <Card style={{ marginBottom: 16 }}>
             <div style={summaryBarStyle}>

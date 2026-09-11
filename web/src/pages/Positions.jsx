@@ -261,6 +261,7 @@ export default function Positions() {
       take_profit_pct: formTp || 8,
       stop_loss_pct: formSl || 5,
     }
+    // 编辑模式：替换原持仓的数量/成本/止盈止损；新增模式：追加到列表末尾
     if (editingIdx >= 0) {
       setHoldings((prev) => {
         const next = [...prev]
@@ -271,6 +272,7 @@ export default function Positions() {
     } else {
       setHoldings((prev) => [...prev, item])
     }
+    // 同步后端、关闭弹窗、重置表单
     await saveHoldings()
     setShowAdd(false)
     setEditingIdx(-1)
@@ -315,7 +317,8 @@ export default function Positions() {
     const qty = Number(lotFormQty)
     if (!t || price <= 0 || qty <= 0) { MessagePlugin.warning('请填写成交价与成交数量'); return }
     try {
-      if (lotDir === 'sell') {
+      // 根据方向调用加仓/减仓接口，减仓全部时移除持仓
+    if (lotDir === 'sell') {
         const res = await api.sellHoldingLot(t.code, price, qty)
         if (res && res.closed) {
           setHoldings((prev) => prev.filter((x) => x.code !== t.code))
@@ -379,6 +382,7 @@ export default function Positions() {
     const price = Number(closeFormPrice)
     if (!t || price <= 0) { MessagePlugin.warning('请输入有效的清仓价'); return }
     try {
+      // 调用后端清仓接口，返回盈亏金额与百分比
       const res = await api.closeHolding(t.code, price)
       if (res && res.status === 'ok') {
         setHoldings((prev) => prev.filter((x) => x.code !== t.code))
@@ -445,6 +449,7 @@ export default function Positions() {
     if (qty <= 0 || price <= 0) { MessagePlugin.warning('请输入有效的价格与数量'); return }
     const sell = a.dir === 'reduce' || a.dir === 'tp' || a.dir === 'close'
     setRealSubmitting(true)
+    // 构造实盘下单请求参数并提交
     try {
       const res = await api.executeRealAction({
         code: a.pos.ts_code,
@@ -504,6 +509,7 @@ export default function Positions() {
         loadReal()
       }
     })
+    // 卸载时清理：纸面轮询/实盘轮询/SSE订阅
     return () => {
       if (timer.current) clearInterval(timer.current)
       if (realTimer.current) clearInterval(realTimer.current)
@@ -521,14 +527,27 @@ export default function Positions() {
     { colKey: 'cost_price', title: '成本价', width: 80, cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(2) : '-') },
     { colKey: 'cur_price', title: '现价', width: 80, cell: ({ row }) => (row.cur_price != null ? '¥' + Number(row.cur_price).toFixed(2) : '-') },
     { colKey: 'change_pct', title: '当日涨跌', width: 90, cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    // 持仓盈亏百分比列：红涨绿跌
     { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, cell: ({ row }) => <span style={{ color: (row.pnl_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.pnl_pct || 0) > 0 ? '+' : ''}{(row.pnl_pct || 0).toFixed(2)}%</span> },
+
+    // 信号状态列：有策略信号时显示⚡
     { colKey: 'signal', title: '信号', width: 50, cell: ({ row }) => row.signal_active ? <span title="有策略信号">⚡</span> : <span style={{ color: '#e7e7e7' }}>—</span> },
+
+    // 战法评分列（N形/龙头/量能）：≥60 红色达标，≥50 黄色观察
     { colKey: 'n_score', title: 'N', width: 55, cell: ({ row }) => { const v = row.n_score || 0; const c = v >= 60 ? '#e34d59' : v > 0 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
     { colKey: 'dragon_score', title: '龙', width: 55, cell: ({ row }) => { const v = row.dragon_score || 0; const c = v >= 60 ? '#e34d59' : v >= 50 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
     { colKey: 'm_score', title: '量', width: 55, cell: ({ row }) => { const v = row.m_score || 0; const c = v >= 50 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
+
+    // 止盈/止损百分比列
     { colKey: 'sl', title: '止盈/止损', width: 110, cell: ({ row }) => <span><span style={{ color: '#e34d59' }}>+{(row.take_profit_pct || 8).toFixed(1)}%</span><span style={{ color: '#e7e7e7' }}> / </span><span style={{ color: '#00a870' }}>-{(row.stop_loss_pct || 5).toFixed(1)}%</span></span> },
+
+    // 移动止盈最高价列
     { colKey: 'highest', title: '移动止盈', width: 90, cell: ({ row }) => row.highest_price > 0 ? <span style={{ color: row.highest_price > (row.cost_price || 0) ? '#e34d59' : '#b388ff' }}>¥{row.highest_price.toFixed(2)}</span> : '—' },
+
+    // 分时图展开按钮列
     { colKey: 'kline', title: '分时', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{klineOpen.has(row.code) ? '收起' : '分时'}</Button> },
+
+    {/* 操作列：加减仓/改成本/明细/编辑/清仓 */}
     { colKey: 'actions', title: '操作', width: 230, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center', flexWrap: 'wrap' }}>
         <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openAddLot(row) }}>加减仓</Button>
@@ -550,6 +569,7 @@ export default function Positions() {
     { colKey: 'pnl', title: '持仓盈亏', width: 90, cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
     { colKey: 'highest_price', title: '最高价', width: 90, cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
     { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: '#e7e7e7' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
+    {/* 实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用） */}
     { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
         <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'add') }}>加仓</Button>
@@ -568,6 +588,7 @@ export default function Positions() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             {hasReal ? (
               <>
+                {/* 实盘盈亏与可用资金展示 */}
                 <div className={displayPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
                   <span className="muted" style={{ fontSize: 12, marginRight: 4 }}>实盘</span>
                   总盈亏: {displayPnl >= 0 ? '+' : ''}¥{displayPnl.toFixed(2)}
@@ -576,6 +597,7 @@ export default function Positions() {
               </>
             ) : (
               <>
+                {/* 纸面持仓页头：总盈亏（含清零按钮）+ 可用资金（可编辑） */}
                 <div className={totalPnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>
                   总盈亏: {totalPnl >= 0 ? '+' : ''}¥{totalPnl.toFixed(2)}
                   <Button size="small" variant="outline" theme="default" onClick={resetPnl} style={{ marginLeft: 8 }}>清零</Button>
@@ -592,8 +614,11 @@ export default function Positions() {
 
       <Tabs value={bookTab} onChange={(v) => switchBook(v)}>
         <Tabs.TabPanel value="paper" label="纸面持仓">
+          {/* 有持仓时渲染表格，无持仓时显示空态引导 */}
           {holdings.length > 0 ? (
+            {/* 持仓表格：支持展开分时图、行点击打开操作面板 */}
             <Card>
+              {/* 持仓表格：数据绑定/列定义/行展开分时图 */}
               <Table
                 data={holdings}
                 columns={paperColumns}
@@ -603,12 +628,14 @@ export default function Positions() {
                 expandOnRowClick={false}
                 expandedRowKeys={Array.from(klineOpen)}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
+                {/* 行展开渲染分时图 */}
                 expandedRow={({ row }) => (
                   <MinuteView code={row.code} name={row.name} />
                 )}
               />
             </Card>
           ) : (
+            {/* 无持仓空态：引导用户新增持仓 */}
             <Card>
               <div style={{ padding: 24, textAlign: 'center' }}>
                 <p className="muted">暂无持仓</p>
@@ -617,6 +644,7 @@ export default function Positions() {
             </Card>
           )}
 
+          {/* 图例说明：涨跌颜色/信号标记/止盈止损/评分阈值 */}
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: '#888', marginTop: 12 }}>
             <span>当日涨跌红涨绿跌</span>
             <span style={{ color: '#555' }}>|</span>
@@ -643,12 +671,14 @@ export default function Positions() {
                   : '—（网关未上报）'}
               </span>
             )}
+            {/* 实盘资产总值（网关上报时显示） */}
             {realAccount && realAccount.total_asset > 0 && (
               <span className="muted">总值 ¥{(realAccount.total_asset || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
             )}
             <Button size="small" variant="outline" theme="primary" onClick={loadReal} style={{ marginLeft: 'auto' }}>刷新</Button>
           </div>
 
+          {/* 实盘持仓表格或空态：有持仓渲染表格，无持仓显示启用状态 */}
           {!realPositions.length ? (
             <Card>
               <div style={{ padding: 24, textAlign: 'center' }}>
@@ -677,7 +707,7 @@ export default function Positions() {
         </div>
       </Dialog>
 
-      {/* 新增/编辑弹窗 */}
+      {/* 新增/编辑弹窗：代码查询/成本/数量/止盈止损 */}
       <Dialog visible={showAdd} header={editingIdx >= 0 ? '编辑持仓' : '新增持仓'} onClose={closeAdd} onConfirm={confirmAdd} confirmBtn="确定" cancelBtn="取消">
         <Form onSubmit={confirmAdd}>
           <Form.FormItem label="代码">
@@ -692,6 +722,7 @@ export default function Positions() {
           <Form.FormItem label="持股数">
             <InputNumber value={formQty} min={0} step={1} placeholder="持股数量" onChange={(v) => setFormQty(parseInt(v) || 0)} />
           </Form.FormItem>
+          {/* 止盈止损参数：默认 +8%/-5%，用户可自定义 */}
           <Form.FormItem label="止盈%">
             <InputNumber value={formTp} step={0.1} placeholder="默认+8%" onChange={(v) => setFormTp(Number(v) || 0)} />
           </Form.FormItem>
@@ -701,7 +732,7 @@ export default function Positions() {
         </Form>
       </Dialog>
 
-      {/* 加减仓弹窗 */}
+      {/* 加减仓弹窗：方向切换/当前持仓/现价/成交价/数量/预览加权成本 */}
       <Dialog visible={showLot} onClose={() => setShowLot(false)} confirmBtn={{ content: lotDir === 'add' ? '确定加仓' : '确定减仓', disabled: lotOverSell || fareCalcDisabled }} cancelBtn="取消" onConfirm={confirmLot}
         header={<span>加减仓 {lotTarget?.code} {lotTarget?.name}
           <span style={{ marginLeft: 12 }}>
@@ -711,6 +742,7 @@ export default function Positions() {
         </span>}
       >
         <Form>
+          {/* 当前持仓信息：数量/成本价 */}
           <Form.FormItem label="当前数量">
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               <span>{lotTarget?.quantity}</span>
@@ -718,18 +750,21 @@ export default function Positions() {
               <span>¥{lotTarget?.cost_price?.toFixed(2)}</span>
             </div>
           </Form.FormItem>
+          {/* 现价展示与快捷填入按钮 */}
           <Form.FormItem label="现价">
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span>{lotCurrentPrice > 0 ? '¥' + lotCurrentPrice.toFixed(2) : '—'}</span>
               {lotCurrentPrice > 0 && <Button size="small" variant="outline" theme="primary" onClick={() => setLotFormPrice(lotCurrentPrice)}>按现价</Button>}
             </div>
           </Form.FormItem>
+          {/* 成交价与成交数量输入 */}
           <Form.FormItem label={lotDir === 'add' ? '加仓价' : '减仓价'}>
             <InputNumber value={lotFormPrice} min={0} step={0.001} placeholder="成交价格（默认现价）" onChange={(v) => setLotFormPrice(Number(v) || 0)} />
           </Form.FormItem>
           <Form.FormItem label={lotDir === 'add' ? '加仓数量' : '减仓数量'}>
             <InputNumber value={lotFormQty} min={0} step={1} placeholder="成交数量" onChange={(v) => setLotFormQty(parseInt(v) || 0)} />
           </Form.FormItem>
+          {/* 加减仓后预览：总股数/加权平均成本/超卖警告 */}
           {lotPreviewQty > 0 && (
             <div className="muted">
               {lotDir === 'add'
@@ -742,7 +777,7 @@ export default function Positions() {
         </Form>
       </Dialog>
 
-      {/* 改成本弹窗 */}
+      {/* 改成本弹窗：输入新的成本价并确认 */}
       <Dialog visible={showCost} header={`更新成本 ${costTarget?.code} ${costTarget?.name}`} onClose={() => setShowCost(false)} onConfirm={confirmSetCost} confirmBtn="确定" cancelBtn="取消">
         <Form onSubmit={confirmSetCost}>
           <Form.FormItem label="目标成本">
@@ -751,7 +786,7 @@ export default function Positions() {
         </Form>
       </Dialog>
 
-      {/* 清仓弹窗 */}
+      {/* 清仓弹窗：输入清仓价并实时预览盈亏金额/比例 */}
       <Dialog visible={showClose} header={`清仓 ${closeTarget?.code} ${closeTarget?.name}`} onClose={() => setShowClose(false)} onConfirm={confirmCloseHolding} confirmBtn="确认清仓" cancelBtn="取消">
         <Form onSubmit={confirmCloseHolding}>
           <Form.FormItem label="当前持仓">
@@ -760,6 +795,7 @@ export default function Positions() {
           <Form.FormItem label="清仓价">
             <InputNumber value={closeFormPrice} min={0} step={0.001} placeholder="清仓价格" onChange={(v) => { setCloseFormPrice(Number(v) || 0); closePriceInput() }} />
           </Form.FormItem>
+          {/* 清仓盈亏预览：金额与百分比 */}
           {closePreviewValid && (
             <div className="muted">
               清仓盈亏：<span style={{ color: closePnlAmount >= 0 ? '#e34d59' : '#00a870' }}>{closePnlAmount >= 0 ? '+' : ''}¥{closePnlAmount.toFixed(2)}</span>
@@ -769,12 +805,15 @@ export default function Positions() {
         </Form>
       </Dialog>
 
-      {/* 批次明细弹窗 */}
+      {/* 批次明细弹窗：展示该持仓历次加仓的时间/价格/数量/金额明细 */}
       <Dialog visible={showLots && !!lotsTarget} header={`加仓明细 ${lotsTarget?.code} ${lotsTarget?.name}`} onClose={() => setShowLots(false)} onConfirm={() => setShowLots(false)} confirmBtn="关闭" cancelBtn="">
         <div>
+          {/* 表头：时间/价格/数量/金额 四列 */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, fontWeight: 600, fontSize: 13 }}>
             <span>时间</span><span>价格</span><span>数量</span><span>金额</span>
           </div>
+
+          {/* 各批次加仓明细行 */}
           {(lotsTarget?.lots || []).map((lot, i) => (
             <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, fontSize: 13, borderBottom: '1px solid #e7e7e7', padding: '4px 0' }}>
               <span className="muted">{(lot.at || '').replace('T', ' ').slice(0, 19)}</span>
@@ -787,12 +826,14 @@ export default function Positions() {
         </div>
       </Dialog>
 
-      {/* 实盘下单确认弹窗 */}
+      {/* 实盘下单确认弹窗：参考价/数量/战法/预估金额，网关熔断时禁用 */}
       <Dialog visible={!!realAction} header={`实盘${realAction ? realActionLabel(realAction.dir) : ''} ${realAction?.pos.ts_code} ${realAction?.pos.name}`} onClose={() => setRealAction(null)} onConfirm={confirmRealAction} confirmBtn={realSubmitting ? '下单中…' : '确认下单'} cancelBtn="取消">
         <Form onSubmit={confirmRealAction}>
+          {/* 实盘持仓信息：数量/成本价 */}
           <Form.FormItem label="当前持仓">
             <span>{realAction?.pos.qty} 股 / 成本 ¥{realAction?.pos.cost_price?.toFixed(3)}</span>
           </Form.FormItem>
+          {/* 参考价/数量/战法输入 */}
           <Form.FormItem label="参考价">
             <InputNumber value={realFormPrice} min={0} step={0.001} placeholder="成交参考价" onChange={(v) => setRealFormPrice(Number(v) || 0)} />
           </Form.FormItem>
@@ -802,6 +843,7 @@ export default function Positions() {
           <Form.FormItem label="战法">
             <Input value={realFormStrategy} placeholder="策略名（可选）" onChange={(v) => setRealFormStrategy(v)} />
           </Form.FormItem>
+          {/* 预估金额：数量×参考价 */}
           {realFormQty > 0 && realFormPrice > 0 && (
             <div className="muted">预估金额：¥{(realFormQty * realFormPrice).toFixed(2)}</div>
           )}

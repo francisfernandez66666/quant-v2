@@ -20,15 +20,15 @@ import (
 // English: default half-life (minutes) per event type. Fast-decaying for stock-level / chain
 // diffusion, slow for policy that keeps fermenting.
 var DefaultNewsHalfLife = map[string]time.Duration{
-	"政策":   120 * time.Minute,
-	"宏观":   120 * time.Minute,
-	"行业":   90 * time.Minute,
-	"公司":   60 * time.Minute,
+	"政策":    120 * time.Minute,
+	"宏观":    120 * time.Minute,
+	"行业":    90 * time.Minute,
+	"公司":    60 * time.Minute,
 	"产业链扩散": 45 * time.Minute,
 	"降级兜底":  120 * time.Minute,
-	"IPO":  120 * time.Minute,
-	"政策反制": 120 * time.Minute,
-	"对抗":   90 * time.Minute,
+	"IPO":   120 * time.Minute,
+	"政策反制":  120 * time.Minute,
+	"对抗":    90 * time.Minute,
 }
 
 const (

@@ -20,57 +20,94 @@ const PERM_LABELS = { research_approve: '研究审批' }
 // 战法参数分组定义（与 Vue 版 Settings/Admin 一致）；每个 group 的 fields 决定代配弹窗中展示的输入框与步长
 const strategyGroups = [
   {
+    // ── 龙头战法：涨停打板核心因子权重与卖出/止盈参数，管理员可代任意账号下发 ──
     key: 'dragon', title: '龙头战法（权重合计≤1）',
     fields: [
+      // 打分四因子权重（合计≤1，决定候选股排序优先级）
+      // F1 首封质量因子权重
       { k: 'f1_seal_weight', label: 'F1 首封权重', step: 0.05 },
+      // F2 板块共振因子权重
       { k: 'f2_resonance_weight', label: 'F2 共振权重', step: 0.05 },
+      // F3 次日溢价预期因子权重
       { k: 'f3_premium_weight', label: 'F3 溢价权重', step: 0.05 },
+      // F4 相对强度(RS)因子权重
       { k: 'f4_rs_weight', label: 'F4 强度权重', step: 0.05 },
+      // 卖出风控与止盈参数（回撤/炸板分级减仓、收盘与次日开盘走弱判定、止盈）
+      // 持仓期允许的最大回撤
       { k: 'pullback_max_pct', label: '最大回撤%', step: 0.01 },
+      // 炸板回撤达该值减半仓
       { k: 'breaker_sell_half_pct', label: '炸板减半%', step: 0.01 },
+      // 炸板回撤达该值清仓
       { k: 'breaker_sell_all_pct', label: '炸板清仓%', step: 0.01 },
+      // 买入后回撤减半阈值
       { k: 'buy_pullback_sell_half_pct', label: '买入回撤减半%', step: 0.01 },
+      // 买入后回撤清仓阈值
       { k: 'buy_pullback_sell_all_pct', label: '买入回撤清仓%', step: 0.01 },
+      // 买入日收盘走弱判定
       { k: 'buy_day_close_below', label: '买入日收盘低于%', step: 0.01 },
+      // 次日开盘走弱判定
       { k: 'next_open_if_below', label: '次日开盘低于%', step: 0.01 },
+      // 止盈幅度
       { k: 'take_profit_pct', label: '止盈%', step: 1 },
     ],
   },
   {
+    // ── 双响炮战法：两段放量突破形态的量比与评分权重参数 ──
     key: 'double_bump', title: '双响炮战法',
     fields: [
+      // 第一次突破要求的量比
       { k: 'first_break_volume_multiple', label: '一突量比', step: 0.1 },
+      // 第二次突破要求的量比
       { k: 'second_break_volume_multiple', label: '二突量比', step: 0.1 },
+      // 突破间调整期量比上限
       { k: 'adjust_vol_ratio_max', label: '调整量比上限', step: 0.5 },
+      // 调整深度评分权重
       { k: 'position_weight', label: '调整深度权重', step: 0.05 },
+      // 均线形态评分权重
       { k: 'ma_weight', label: '均线权重', step: 0.05 },
+      // 量能评分权重
       { k: 'volume_weight', label: '量能权重', step: 0.05 },
+      // 止盈幅度
       { k: 'double_bump_take_profit_pct', label: '止盈%', step: 0.01 },
     ],
   },
   {
+    // ── N 形战法：形态分门槛与硬止损 ──
     key: 'n_shape', title: 'N 形战法',
     fields: [
+      // N 形态分达该阈值才出信号
       { k: 'n_pattern_score_threshold', label: 'N 形态分阈值', step: 1 },
+      // 固定硬止损幅度
       { k: 'hard_stop_loss', label: '硬止损%', step: 0.01 },
     ],
   },
   {
+    // ── 龙回头战法：强势股回调低吸的止损止盈与分批目标参数 ──
     key: 'dragon_return', title: '龙回头战法',
     fields: [
+      // 止损幅度
       { k: 'stop_loss_pct', label: '止损%', step: 0.01 },
+      // 止盈幅度
       { k: 'take_profit_pct', label: '止盈%', step: 0.01 },
+      // 超期强制离场
       { k: 'max_hold_days', label: '最长持仓天数', step: 1 },
+      // 第一目标位（ATR 倍数）
       { k: 'target1_multiplier', label: '目标1倍数', step: 0.05 },
+      // 第二目标位（ATR 倍数）
       { k: 'target2_multiplier', label: '目标2倍数', step: 0.05 },
+      // 浮盈回撤比例触发移动止损
       { k: 'trailing_drawback', label: '移动止损回撤%', step: 0.01 },
     ],
   },
   {
+    // ── 动量分模型：量价/MACD/走势三因子权重与动量闸门（信号过滤开关） ──
     key: 'momentum', title: '动量分权重（合计建议=100）',
     fields: [
+      // 量价配合因子权重
       { k: 'volume_price_weight', label: '量价权重', step: 5 },
+      // MACD 动量因子权重
       { k: 'macd_weight', label: 'MACD权重', step: 5 },
+      // 走势趋势因子权重
       { k: 'trend_weight', label: '走势权重', step: 5 },
       { k: 'momentum_gate_enabled', label: '动量提升才提醒', type: 'switch', hint: '开启后仅当动量分提升(或回落≤容忍差)才放行 双响炮/龙头/龙回头 战法信号；N形不受影响' },
       { k: 'momentum_delta_tol', label: '回落容忍差(分)', step: 1, hint: '动量分相对上一轮回落 ≤ 该值仍视为提升；设为0表示需严格不回落' },
@@ -170,6 +207,7 @@ export default function Admin() {
 
   // 创建新账号并清空表单
   function createUser() {
+    // 表单基础校验：用户名与密码必填
     if (!newUser.username || !newUser.password) {
       setCreateMsg('用户名和密码必填'); setCreateMsgType('err'); return
     }
@@ -179,6 +217,7 @@ export default function Admin() {
       password: newUser.password,
       role: newUser.role,
       perms: newUser.perms,
+      // 有效期天数：勾选"永久"时传 0 表示永不过期
       expires_days: newUser.permanent ? 0 : (newUser.expiresDays || 0),
     }).then(() => {
       setCreateMsg('账号已创建'); setCreateMsgType('ok')
@@ -270,9 +309,11 @@ export default function Admin() {
     setActiveStrategy({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} })
     setStrategyMsg('')
     try {
+      // 请求该用户在后端的战法参数专属配置
       const sc = await api.fetchAdminStrategyConfig(u.id)
       if (sc) {
         const next = { dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} }
+        // 按分组把后端返回归并到五大战法占位对象中
         for (const group of strategyGroups) {
           const src = sc[group.key]
           if (src) Object.assign(next[group.key], src)
@@ -303,8 +344,10 @@ export default function Admin() {
   // 用户列表表格列定义：用户信息 / 权限勾选 / 操作按钮组
   const userColumns = [
     {
+      // 用户列：展示用户名 + 角色/禁用标签 + ID/创建时间/有效期摘要
       colKey: 'user', title: '用户', width: 220,
       cell: ({ row }) => (
+        // 用户列单元格：用户名/角色标签/禁用标记 + ID、创建时间、有效期摘要
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ fontSize: 15, fontWeight: 600 }}>{row.username}</span>
@@ -318,8 +361,10 @@ export default function Admin() {
           </div>
         </div>
       ),
+      // 用户列配置结束
     },
     {
+      // 权限列：勾选框组实时更新用户权限位（admin 账号禁用勾选，防止误改）
       colKey: 'perms', title: '权限', width: 220,
       cell: ({ row }) => (
         <Checkbox.Group
@@ -334,8 +379,10 @@ export default function Admin() {
       ),
     },
     {
+      // 操作列：角色切换 / 重置密码 / 启禁用 / 有效期 / 战法代配 / 删除（管理员账号受保护不可操作）
       colKey: 'ops', title: '操作', width: 360,
       cell: ({ row }) => (
+        // 操作按钮组：角色升降 / 重置密码 / 启禁用 / 有效期 / 战法代配 / 删除
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           <Button size="small" theme="default" onClick={() => toggleRole(row)}>
             {row.role === 'admin' ? '降为普通用户' : '设为管理员'}
@@ -349,6 +396,7 @@ export default function Admin() {
           <Button size="small" theme="danger" disabled={row.role === 'admin'} onClick={() => askDeleteUser(row)}>删除</Button>
         </div>
       ),
+      // 操作列配置结束
     },
   ]
 
@@ -445,6 +493,9 @@ export default function Admin() {
       <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>用户管理</h2>
 
       <Card title="开通新账号" style={{ marginBottom: 12 }}>
+        {
+          /* 开通新账号表单：录入用户名/初始密码/角色/权限/有效期 */
+        }
         <Form layout="vertical">
           <Form.FormItem label="用户名">
             <Input value={newUser.username} onChange={(v) => setNewUser({ ...newUser, username: v })} placeholder="登录名" />
@@ -452,12 +503,18 @@ export default function Admin() {
           <Form.FormItem label="初始密码">
             <Input type="password" value={newUser.password} onChange={(v) => setNewUser({ ...newUser, password: v })} placeholder="首次登录用" />
           </Form.FormItem>
+          {
+            /* 角色选择：普通用户 / 管理员 */
+          }
           <Form.FormItem label="角色">
             <Select value={newUser.role} onChange={(v) => setNewUser({ ...newUser, role: v })} style={{ width: 200 }}>
               <Select.Option value="user">普通用户</Select.Option>
               <Select.Option value="admin">管理员</Select.Option>
             </Select>
           </Form.FormItem>
+          {
+            /* 权限勾选：把可用的权限位分配给新账号 */
+          }
           <Form.FormItem label="权限">
             <Checkbox.Group value={newUser.perms} onChange={(val) => setNewUser({ ...newUser, perms: val })}>
               {allPerms.map((p) => (
@@ -465,6 +522,9 @@ export default function Admin() {
               ))}
             </Checkbox.Group>
           </Form.FormItem>
+          {
+            /* 有效期设置：天数 + "永久"开关互斥 */
+          }
           <Form.FormItem label="有效期">
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               <InputNumber
@@ -475,12 +535,18 @@ export default function Admin() {
                 placeholder="天数"
                 style={{ width: 140 }}
               />
+              {
+                /* 永久开关开启后天数输入禁用 */
+              }
               <ToggleSw checked={newUser.permanent} onChange={(v) => setNewUser({ ...newUser, permanent: v })} />
               <span style={{ fontSize: 13, color: '#888' }}>永久</span>
             </div>
             <span style={{ fontSize: 12, color: '#888' }}>填天数表示到期后自动失效；开启"永久"则不过期</span>
           </Form.FormItem>
         </Form>
+        {
+          /* 提交创建按钮与结果提示 */
+        }
         <Button theme="primary" loading={creating} onClick={createUser}>
           {creating ? '创建中...' : '创建账号'}
         </Button>
@@ -506,7 +572,9 @@ export default function Admin() {
         title="系统运行日志（每日核心记录）"
         style={{ marginBottom: 12 }}
         headerRightContent={
+          // 卡片右上角操作区：日志日期下拉 + 手动刷新按钮
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {/* 日期下拉：选择要查看的日志日（YYYYMMDD → YYYY-MM-DD 展示）+ 手动刷新按钮 */}
             <Select value={opsDate} onChange={(v) => setOpsDate(v)} style={{ width: 150 }} size="small" clearable={false}>
               {opsDates.map((d) => (
                 <Select.Option key={d.date} value={d.date} label={d.date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')} />
@@ -517,11 +585,14 @@ export default function Admin() {
         }
       >
         {opsDates.length === 0 && !opsLoading ? (
+          // 空态：尚无任何日志日期
           <div style={{ fontSize: 13, color: '#888' }}>
             暂无运行日志（引擎/研究服务启动后自动产出，每天一份，保留 90 天）
           </div>
         ) : (
+          // 有日志：概要条 + 终端风格日志正文
           <>
+            {/* 概要条：总行数 / 截断提示 / 双引擎（quant=量化、research=研究）图例 */}
             <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
               共 {opsMeta.total} 行
               {opsMeta.truncated ? '（仅显示最后 2000 行）' : ''}
@@ -529,9 +600,11 @@ export default function Admin() {
               {' · '}<span style={{ color: '#10b981', fontWeight: 600 }}>research</span> = 研究调度
               {' · '}自动滚动到最新事件，30s 自动刷新
             </div>
+            {/* 日志正文：等宽字体终端样式，ref 用于自动滚动到最新事件 */}
             <div
               ref={opsBodyRef}
               style={{
+                // 日志正文终端样式：等宽字体、浅底细边框、限高内部滚动
                 fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace",
                 fontSize: 12, lineHeight: 1.55,
                 background: 'rgba(128,128,128,0.08)',
@@ -541,6 +614,7 @@ export default function Admin() {
               }}
             >
               {opsLines.length === 0 && !opsLoading
+                // 空记录与日志行列表切换
                 ? <div style={{ color: '#888' }}>该日暂无记录</div>
                 : opsLines.map(renderOpsLine)}
             </div>
@@ -584,10 +658,13 @@ export default function Admin() {
         footer={strategySaving ? null : undefined}
       >
         {strategyGroups.map((group) => (
+          // 遍历五大战法分组，每组渲染一张参数卡片
           <Card key={group.key} title={group.title} style={{ marginBottom: 10 }}>
             {group.fields.map((f) => (
+              // 逐字段渲染：按字段类型生成控件
               <Form.FormItem key={f.k} label={f.label} style={{ marginBottom: 8 }}>
                 {f.type === 'switch' ? (
+                  // 开关型字段：ToggleSw 布尔控件
                   <ToggleSw
                     checked={!!(activeStrategy[group.key] && activeStrategy[group.key][f.k])}
                     onChange={(v) => setActiveStrategy({
@@ -596,6 +673,7 @@ export default function Admin() {
                     })}
                   />
                 ) : (
+                  // 数字输入型字段：InputNumber，步进取字段配置
                   <InputNumber
                     step={f.step || 'any'}
                     value={(activeStrategy[group.key] && activeStrategy[group.key][f.k]) ?? ''}
@@ -609,6 +687,7 @@ export default function Admin() {
                 )}
               </Form.FormItem>
             ))}
+            // 单个分组卡片渲染结束
           </Card>
         ))}
         {strategyMsg && (

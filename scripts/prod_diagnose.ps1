@@ -1,4 +1,4 @@
-# prod_diagnose.ps1 — 生产只读诊断脚本（PowerShell 原生版）
+﻿# prod_diagnose.ps1 — 生产只读诊断脚本（PowerShell 原生版）
 # 背景：广州单机 Windows Server 2022（deploy_guangzhou.sh + docs/MIGRATION_GUANGZHOU_ALLINONE.md），
 #       bash 版 scripts/prod_diagnose.sh 无法在 Windows 运行，本脚本等价实现。
 # 目的：诊断「利空归因卖出」发版后三类症状——信号 tab 空 / 实盘持仓空 / 首页推荐空。

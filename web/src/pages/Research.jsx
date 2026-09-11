@@ -36,30 +36,36 @@ function fmtPctGlobal(v) {
  * @returns {JSX.Element}
  */
 export default function Research() {
+  // ── 基础状态：加载/loading、候选列表、无库标记、状态筛选、整体进度 ──
   const [loading, setLoading] = useState(false)
   const [candidates, setCandidates] = useState([])
   const [noDB, setNoDB] = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
   const [progress, setProgress] = useState(null)
+  // ── 战法库状态：库列表、加载标记、展开指定战法 ──
   const [library, setLibrary] = useState([])
   const [loadingLibrary, setLoadingLibrary] = useState(false)
+  // ── 回测状态：各候选的加载/运行/结果/进度与任务列表 ──
   const [backtestLoading, setBacktestLoading] = useState({})
   const [backtestState, setBacktestState] = useState({})
   const [backtestResult, setBacktestResult] = useState({})
   const [backtestProgress, setBacktestProgress] = useState({})
   const [backtestJobs, setBacktestJobs] = useState([])
+  // ── 手动发起全量回测的表单状态：候选选择/开始结束日期/选股数/最小样本 ──
   const [btLoading, setBtLoading] = useState(false)
   const [btPickId, setBtPickId] = useState(0)
   const [btStart, setBtStart] = useState('')
   const [btEnd, setBtEnd] = useState('')
   const [btTopK, setBtTopK] = useState('')
   const [btMinStocks, setBtMinStocks] = useState('')
+  // ── 页面状态：当前标签 / 渲染兜底错误 / 战法改名 ──
   const [activeTab, setActiveTab] = useState('candidates')
   const [renderError, setRenderError] = useState('')
   const [editingName, setEditingName] = useState({})
   const [nameDraft, setNameDraft] = useState({})
   const [backtestEnabled, setBacktestEnabled] = useState(false)
 
+  // ── 参数寻优中心状态：子标签 / 优化目标 / 任务列表 / 当前选中战法 / 抽屉 ──
   const [candSubTab, setCandSubTab] = useState('patterns')
   const [optObjective, setOptObjective] = useState('profitFactor')
   const [optTasks, setOptTasks] = useState([])
@@ -498,6 +504,7 @@ export default function Research() {
     setBacktestLoading((b) => ({ ...b, [c.id]: true }))
     setBacktestState((b) => ({ ...b, [c.id]: 'running' }))
     try {
+      // 携带断点续跑/区间参数发起后端回测任务
       await api.backtestResearchCandidate(c.id, {
         start: btStart.trim(),
         end: btEnd.trim(),
@@ -505,11 +512,13 @@ export default function Research() {
         min_stocks: parseInt(btMinStocks, 10) || 0,
       })
     } catch (e) {
+      // 启动失败：复位状态并提示
       setBacktestLoading((b) => ({ ...b, [c.id]: false }))
       setBacktestState((b) => ({ ...b, [c.id]: 'error' }))
       showToast('回测启动失败: ' + (e.message || e), 'error')
       return
     }
+    // 成功发起后启动进度轮询
     pollBacktest(c)
   }
   async function doCancelBacktest(id) {
@@ -856,9 +865,11 @@ export default function Research() {
         const j = await api.fetchBacktestStatus(id)
         // 常量 j：局部定义
         if (j.progress) {
+          // 有进度：同步进度条与任务列表
           setBacktestProgress((p) => ({ ...p, [id]: j.progress }))
           syncJobIntoList(j)
         }
+        // 完成：停止轮询、回填超额、本地任务同步完成态并刷新战法库
         if (j.status === 'done') {
           clearPoll(id)
           setBacktestLoading((b) => ({ ...b, [id]: false }))
@@ -870,6 +881,7 @@ export default function Research() {
           showToast('候选 #' + id + ' 回测完成，回测超额 ' + (j.avg_excess !== undefined ? (j.avg_excess * 100).toFixed(2) + '%' : '0%'), 'success')
           loadLibrary()
         } else if (j.status === 'error') {
+          // 失败：停止轮询并提示错误
           clearPoll(id)
           setBacktestLoading((b) => ({ ...b, [id]: false }))
           setBacktestState((b) => ({ ...b, [id]: 'error' }))
@@ -1000,6 +1012,7 @@ export default function Research() {
     { colKey: 'started_at', title: '发起时间', width: 150, cell: ({ row }) => <span style={{ fontSize: 12, color: '#bbb' }}>{row.started_at || (row.status === 'queued' ? '排队中' : (row.finished_at || '-'))}</span> },
     { colKey: 'params', title: '参数', minWidth: 160, cell: ({ row }) => <span style={{ fontSize: 12, color: '#aaa' }}>{jobParams(row) || '-'}</span> },
     { colKey: 'rule', title: '发起规则', minWidth: 140, cell: ({ row }) => <span style={{ fontSize: 12, color: '#aaa' }}>{initiatingRule(row)}</span> },
+    // 进度列：运行中渲染进度条，完成展示超额收益，失败/其他展示占位
     { colKey: 'progress', title: '进度', width: 140, cell: ({ row }) => {
       if (row.status === 'running' || row.status === 'paused' || row.status === 'queued') {
         return (
@@ -1011,13 +1024,18 @@ export default function Research() {
           </div>
         )
       }
+      // 已完成且非战法库任务：展示回测超额（红正绿负）
       if (row.status === 'done' && row.kind !== 'library') {
         return <span style={{ color: signClass(row.avg_excess) === 'pos' ? '#00a870' : '#e34d59' }}>{fmt(row.avg_excess)}</span>
       }
+      // 其余：失败标记或占位
       return <span style={{ color: '#aaa' }}>{row.error ? '失败' : '-'}</span>
     } },
+    // 操作列：无权限或非候选/战法库任务不渲染；按状态给出 暂停/继续/取消/续跑/日志
     { colKey: 'actions', title: '操作', width: 180, cell: ({ row }) => {
+      // 无审批权限不放操作入口
       if (!canApprove) return null
+      // 仅候选回测与战法库回测可操作
       if (row.kind !== 'candidate' && row.kind !== 'library') return null
       return (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
@@ -1033,7 +1051,9 @@ export default function Research() {
         </div>
       )
     } },
-  ], [backtestJobs, canApprove])
+
+    // 回测任务操作列：取消/续跑/重跑/日志按钮，按任务状态与权限动态显示
+  ]
 
   // 寻优热力网格表列
   const heatColumns = useMemo(() => {
@@ -1091,9 +1111,12 @@ export default function Research() {
   // 渲染单条研究候选卡片：展示战法构成、电脑验证结论、关键指标与审批/回测操作按钮
   function renderCandidate(c) {
     return (
+      // 卡片标题行：候选编号 + 类型/状态/风控标签 + 创建时间
       <Card key={c.id} style={{ marginBottom: 12 }} title={<span>#{c.id} <Tag theme="primary">{kindLabel(c.kind)}</Tag> <Tag theme={c.status === 'proposed' ? 'warning' : 'success'}>{statusLabel(c.status)}</Tag> {c.guard && c.guard !== 'standard' && <Tag theme={guardMeta(c.guard).theme}>{guardMeta(c.guard).label}</Tag>} <span style={{ fontSize: 12, color: '#888' }}>{c.created_at}</span></span>}>
         {c.kind === 'factor' ? (
+           // 因子战法分支：解释玩法与电脑验证结论
            <div>
+            {/* 战法玩法说明：因子打分规则（红看多绿看空） */}
             <div style={{ fontWeight: 600, margin: '6px 0', fontSize: 13 }}>这条战法在做什么</div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, margin: '4px 0' }}>
               {factorRule(c).map((f) => (
@@ -1102,10 +1125,14 @@ export default function Research() {
                 </Tag>
               ))}
             </div>
+            {
+              /* 通俗解释玩法与使用注意事项 */
+            }
             <div style={{ fontSize: 13, color: '#666666', lineHeight: 1.7, margin: '4px 0' }}>
               玩法：每天给所有股票按上面 {factorRule(c).length} 个指标打分，分数最高的前一批会被标记为「值得买」，赌它们接下来 {c.horizon} 个交易日能涨。
               {factorRule(c).some((f) => f.dir < 0) && <span> 注意：带「看空」的指标是反着用的——这项数值越高，反而越说明不该买。</span>}
             </div>
+            {/* 电脑验证结论：是否推荐与逐条可读解释 */}
             <div style={{ fontWeight: 600, margin: '6px 0', fontSize: 13 }}>这条规律靠谱吗？（电脑验证过）</div>
             <div style={{ margin: '6px 0' }}>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1116,8 +1143,12 @@ export default function Research() {
                 <div key={i} style={{ display: 'flex', gap: 6, fontSize: 13, color: '#666666', margin: '4px 0' }}><span style={{ color: '#888' }}>{i + 1}.</span><span>{l}</span></div>
               ))}
             </div>
+            {/* 关键指标折叠区（默认收起） */}
             <details style={{ border: '1px solid #e7e7e7', borderRadius: 6, padding: 8, marginTop: 6 }}>
               <summary style={{ cursor: 'pointer' }}>想看具体数字？展开</summary>
+              {
+                /* 六项关键指标 + 参数快照 */
+              }
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>样本内测试</span><span>前一段历史回放：IR {fmt(parseReason(c, '样本内IR'))}</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>样本外测试</span><span>另一段没用过的历史回放：IR {fmt(parseReason(c, '样本外IR'))}</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>反推超额</span><span>高分股比全市场平均多赚 {fmtPct(parseReason(c, '反推超额'))}</span></div>
@@ -1126,8 +1157,10 @@ export default function Research() {
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: '#888', minWidth: 90 }}>全链路回测</span><span>{btTested(c) ? (c.backtest_result_text || fmt(c.avg_excess)) : '未测'}</span></div>
               {paramsLines(c).length > 0 && (
                 <div style={{ borderTop: '1px dashed #e7e7e7', marginTop: 6, paddingTop: 6 }}>
+                  {/* 参数快照：复现该战法所需参数 */}
                   <div style={{ color: '#888', fontSize: 12 }}>参数快照（复现用）：</div>
                   {paramsLines(c).map((p, i) => (
+                    // 逐一列出参数键值
                     <div key={i} style={{ display: 'flex', gap: 8, fontSize: 12, margin: '2px 0' }}>
                       <span style={{ color: '#888', minWidth: 90 }}>{p.k}</span><span>{p.v}</span>
                     </div>
@@ -1137,13 +1170,18 @@ export default function Research() {
             </details>
           </div>
         ) : (
+          // 非因子战法分支：仅展示核心指标与权重标签
           <div>
+            {/* 核心指标：IR / IC / 回测超额 / 前瞻天数 */}
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>IR</span><span style={{ color: signColor(c.ir), fontWeight: 600 }}>{fmt(c.ir)}</span></div>
               <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>IC</span><span style={{ color: signColor(c.ic_mean), fontWeight: 600 }}>{fmt(c.ic_mean)}</span></div>
               <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>回测超额</span><span style={{ color: signColor(c.avg_excess), fontWeight: 600 }}>{fmt(c.avg_excess)}</span></div>
               <div style={{ display: 'flex', gap: 6 }}><span style={{ color: '#888', fontSize: 13 }}>前瞻天数</span><span style={{ fontWeight: 600 }}>{c.horizon}</span></div>
             </div>
+            {
+              /* 组合权重标签（如有静态因子权重） */
+            }
             {weightList(c).length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, margin: '6px 0' }}>
                 {weightList(c).map((w) => (
@@ -1155,11 +1193,13 @@ export default function Research() {
         )}
 
         {c.kind === 'depth' && (
+          // 盘口深度战法分支：按个股展示买1/卖1与托压单标签
           <div style={{ marginTop: 8 }}>
             {Object.entries(depthSummary(c)).map(([code, s]) => (
               <div key={code} style={{ margin: '4px 0' }}>
                 <span style={{ fontWeight: 600 }}>{code}</span>
                 <span className="muted" style={{ marginLeft: 8 }}>买1 {s.bid1} / 卖1 {s.ask1}</span>
+                {/* 托单为绿色支撑、压单为红色压力 */}
                 {(s.orders || []).map((o) => (
                   <Tag key={o.level + o.kind} theme={o.kind === 'support' ? 'success' : 'danger'} style={{ margin: '2px' }}>
                     {o.kind === 'support' ? '托' : '压'}单 档{o.level} {o.price} / {o.volume}手 ({(o.share_pct * 100).toFixed(0)}%)
@@ -1171,16 +1211,20 @@ export default function Research() {
         )}
 
         {canApprove && c.status === 'proposed' && (
+          // 审批操作区：仅在待审批状态且有权限时渲染
           <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {/* 三个核心决策按钮：应用 / 灰度观察 / 驳回 */}
             <Button theme="primary" size="small" onClick={() => doApprove(c)}>审批并应用</Button>
             <Button theme="warning" size="small" onClick={() => doGrayscale(c)}>灰度观察</Button>
             <Button theme="danger" size="small" onClick={() => doReject(c)}>驳回</Button>
             {c.kind === 'factor' && (
+              // 因子候选：发起/重跑全链路回测，按钮带 loading
               <Button theme="warning" size="small" loading={!!backtestLoading[c.id]} onClick={() => doBacktest(c)}>
                 {backtestLoading[c.id] ? '回测中...' : (c.avg_excess ? '重新回测' : '全量回测')}
               </Button>
             )}
             {backtestLoading[c.id] && (
+              // 回测进行中：细进度条 + 百分比文案
               <div style={{ flex: 1, minWidth: 160 }}>
                 <div style={{ height: 6, background: '#e7e7e7', borderRadius: 3, overflow: 'hidden' }}>
                   <div style={{ width: btPct(c.id), height: '100%', background: '#4caf50' }} />
@@ -1188,6 +1232,7 @@ export default function Research() {
                 <span style={{ fontSize: 11, color: '#aaa' }}>全链路回测 {backtestProgress[c.id] || '0%'}</span>
               </div>
             )}
+            {/* 已出结果：回填的回测超额局部展示 */}
             {backtestResult[c.id] && <span style={{ color: signClass(backtestResult[c.id]) === 'pos' ? '#00a870' : '#e34d59' }}>回测超额 {fmt(backtestResult[c.id])}</span>}
           </div>
         )}
@@ -1200,12 +1245,14 @@ export default function Research() {
   function renderLibraryGroup(g) {
     return (
       <div key={g.key} style={{ marginBottom: 16 }}>
+        {/* 分组标题：因子战法/形态战法 + 条目数 */}
         <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>{g.title}（{g.items.length}）</div>
         {g.items.map((s) => {
           const expanded = expandedStrategy === 'rule:' + s.id
           // 常量 expanded：局部定义
           return (
             <Card key={s.id} style={{ marginBottom: 10 }}>
+              {/* 战法卡片头部：名称（可改名）+ 类型/启停标签 + ID/应用时间 */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 {editingName[s.id]
                   ? <Input value={nameDraft[s.id]} onChange={(v) => setNameDraft((d) => ({ ...d, [s.id]: v }))} onEnter={saveName(s)} onBlur={saveName(s)} style={{ width: 160 }} />
@@ -1215,6 +1262,7 @@ export default function Research() {
                 <Tag theme={s.enabled ? 'success' : 'default'}>{s.enabled ? '已启用' : '已停用'}</Tag>
                 <span style={{ fontSize: 11, color: '#777', marginLeft: 'auto' }}>{s.id}｜{s.applied_at}</span>
               </div>
+              {/* 战法条件/因子标签：形态战法展示扫参条件，因子战法展示多空因子列表 */}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
                 {s.kind === 'pattern'
                   ? (s.conds || []).map((c, i) => <Tag key={i} style={{ margin: '2px' }}>{condLabel(c)}</Tag>)
@@ -1224,12 +1272,14 @@ export default function Research() {
                     </Tag>
                   ))}
               </div>
+              {/* 收益统计条：信号总数/胜/负/累计前向收益 */}
               <div style={{ fontSize: 12, color: '#aaa', marginTop: 6 }}>
                 <span>信号 <b>{s.signal_count}</b></span>
                 <span style={{ marginLeft: 8 }}>胜 <b style={{ color: '#00a870' }}>{s.win}</b></span>
                 <span style={{ marginLeft: 8 }}>负 <b style={{ color: '#e34d59' }}>{s.loss}</b></span>
                 <span style={{ marginLeft: 8 }}>累计前向收益 <b style={{ color: s.cum_return >= 0 ? '#00a870' : '#e34d59' }}>{fmtPct(s.cum_return)}</b></span>
               </div>
+              {/* 操作按钮组：启停/回测/详情/删除（仅审批权限可见） */}
               {canApprove && (
                 <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <Button size="small" theme="primary" variant="outline" onClick={() => toggleLibrary(s)}>{s.enabled ? '停用' : '启用'}</Button>
@@ -1238,6 +1288,7 @@ export default function Research() {
                   <Button size="small" theme="danger" onClick={() => removeLibrary(s)}>删除</Button>
                 </div>
               )}
+              {/* 展开态：显示该战法最近一次回测报告文本 */}
               {expanded && (
                 <pre style={{ marginTop: 8, fontSize: 12, color: '#ccc', whiteSpace: 'pre-wrap' }}>
                   {latestLibJob(s.kind, ruleNum(s.id)) && latestLibJob(s.kind, ruleNum(s.id)).result_text
@@ -1266,6 +1317,7 @@ export default function Research() {
 
   return (
     <div className="page">
+      {/* 页面头部：标题 + 状态筛选下拉 + 刷新按钮 */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
         <h2>自动研究</h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -1273,6 +1325,7 @@ export default function Research() {
             value={statusFilter}
             onChange={(v) => { setStatusFilter(v); loadData() }}
             style={{ width: 140 }}
+            {/* 状态筛选选项：全部/待审批/已应用/已审批/已驳回 */}
             options={[
               { label: '全部', value: '' },
               { label: '待审批', value: 'proposed' },
@@ -1285,6 +1338,7 @@ export default function Research() {
         </div>
       </div>
 
+      {/* 研究调度状态横幅：展示排队原因/回测队列深度/系统资源（红=拦截、蓝=排队、绿=空闲） */}
       {schedStatus && (
         <div style={{
           background: (schedStatus.reason || '').includes('拦截') || (schedStatus.reason || '').includes('禁用') ? '#fef2f2'
@@ -1297,20 +1351,24 @@ export default function Research() {
           borderRadius: 6, padding: '8px 12px', marginBottom: 12, fontSize: 13
         }}>
           <b>研究调度状态</b>：{schedStatus.reason}
+          {/* 回测队列深度提示 */}
           {(backtestJobs || []).filter((j) => j.status === 'queued' || j.status === 'running').length > 0 && (
             <span style={{ color: '#1d4ed8', marginLeft: 8 }}>
               （回测队列：{(backtestJobs || []).filter((j) => j.status === 'queued' || j.status === 'running').length} 个任务排队/执行中）
             </span>
           )}
+          {/* 系统资源详情：交易时段/内存/闸门/槽位 */}
           <span style={{ color: '#888', marginLeft: 8 }}>
             （北京时间 {schedStatus.beijing_now} · 交易时段={schedStatus.in_trading_window ? '是' : '否'} · 内存可用 {schedStatus.mem_avail_mb}MB · 闸门={schedStatus.mem_gate_open ? '开' : '关'} · 槽位={schedStatus.busy ? '占用' : '空闲'}）
           </span>
         </div>
       )}
 
+      {/* 主标签页导航：待审批候选/战法库/回测/设置 */}
       <Tabs value={activeTab} onChange={(v) => setActiveTab(v)}>
         <Tabs.TabPanel value="candidates" label="待审批候选">
           <div style={{ marginTop: 12 }}>
+              {/* 候选子标签切换：形态候选/参数寻优结果 */}
               <div style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
               <Button variant={candSubTab === 'patterns' ? 'base' : 'outline'} size="small" onClick={() => setCandSubTab('patterns')}>形态候选</Button>
               <Button variant={candSubTab === 'optimize' ? 'base' : 'outline'} size="small" onClick={() => { setCandSubTab('optimize'); loadOptimizations() }}>优化结果</Button>
@@ -1318,8 +1376,10 @@ export default function Research() {
 
             {candSubTab === 'patterns' && (
               <div>
+                {/* 研究处理进度卡片：数据准备度/日线行数/财务行数/候选统计 */}
                 {progress && (
                   <Card style={{ marginBottom: 12 }} title={<span>研究处理进度 {progress.db_attached && <Tag theme="success" size="small">数据源: {progress.db_attached}</Tag>}</span>}>
+                    {/* 进度指标网格：数据准备度/日线行数/财务行数/候选统计 */}
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(200px,1fr))', gap: 12 }}>
                       <div>
                         <div style={{ fontSize: 12, color: '#888' }}>数据准备度（近一年有行情 / 全市场）</div>
@@ -1330,8 +1390,9 @@ export default function Research() {
                       </div>
                       <div><div style={{ fontSize: 12, color: '#888' }}>日线数据</div><div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>{fmtRows(progress.daily_rows)} 行</div></div>
                       <div><div style={{ fontSize: 12, color: '#888' }}>财务指标</div><div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>{fmtRows(progress.fin_rows)} 行</div></div>
-                      <div>
-                        <div style={{ fontSize: 12, color: '#888' }}>研究候选</div>
+                        {/* 候选统计：总数/已应用/待审批 */}
+                        <div>
+                          <div style={{ fontSize: 12, color: '#888' }}>研究候选</div>
                         <div style={{ fontSize: 12, color: '#aaa', marginTop: 4 }}>
                           <Tag style={{ margin: '0 2px' }}>{progress.candidates} 条</Tag>
                           {progress.applied && <Tag theme="success" size="small" style={{ margin: '0 2px' }}>已应用 {progress.applied}</Tag>}
@@ -1385,6 +1446,7 @@ export default function Research() {
 
                 {!loadingOpts && optCur && (
                   <div style={{ marginTop: 8 }}>
+                    {/* 当前选中战法的寻优结果卡片：参数/指标/操作按钮 */}
                     <Card title={<span style={{ fontWeight: 600 }}>{optCur.strategy} {!optCur.strategy_kind && <Tag theme="default">内置</Tag>} {optCur.status === 'approved' && <Tag theme="success">已应用</Tag>} {optCur.status === 'rejected' && <Tag theme="default">已淘汰</Tag>}</span>}>
                       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
                         {optCur.status === 'pending' && (
@@ -1398,6 +1460,7 @@ export default function Research() {
                         <Button size="small" variant="outline" style={{ marginLeft: 'auto' }} onClick={toggleDrawer}>⚙ 参数池 / 池纪律</Button>
                       </div>
                       {optCur.params ? (
+                      {/* 寻优结果指标网格：止盈/止损/持仓/门槛/胜率/盈亏比/期望/样本/实盘复核 */}
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))', gap: 8 }}>
                         <div><label>止盈线</label><b>{fmtNum((optCur.params || {}).take_profit_pct)}%</b></div>
                         <div><label>止损线</label><b>{fmtNum((optCur.params || {}).stop_loss_pct)}%</b></div>
@@ -1408,13 +1471,15 @@ export default function Research() {
                         <div><label>期望收益</label><b style={optCur.expectancy >= 0 ? { color: '#00a870' } : { color: '#e34d59' }}>{fmtNum(optCur.expectancy, 2)}%</b></div>
                         <div><label>触发样本</label><b>{(optCur.trigger_count !== undefined && optCur.trigger_count !== null) ? optCur.trigger_count : '—'}</b></div>
                         <div><label>实盘复核</label><b>{optCur.win_rate !== undefined ? fmtNum(optCur.win_rate, 1) + '% / ' + fmtNum(optCur.profit_factor, 2) + ' / ' + fmtNum(optCur.expectancy, 2) + '%' : '—'}</b></div>
+                        {/* 模拟盘实测结果（若已启用自动撮合则显示） */}
                         {optCur.pool_stats && <div><label>模拟盘实测</label><b>{fmtNum(optCur.pool_stats.win_rate_pct, 1)}% / {optCur.pool_stats.expectancy >= 0 ? '+' : ''}{fmtNum(optCur.pool_stats.expectancy, 2)}% / {optCur.pool_stats.filled_buys}笔</b></div>}
                       </div>
                       ) : (
                         <div style={{ color: '#e34d59', padding: '4px 0' }}>窗口内未触发买入信号（无有效组合），该战法本轮无可优化参数。</div>
-                      )}
+                                             )}
                     </Card>
 
+                    {/* 寻优结果摘要：最优参数/胜率/盈亏比/期望收益/触发样本/实盘复核/模拟盘实测 */}
                     <div style={{ marginTop: 10, fontWeight: 600, fontSize: 14 }}>止盈×止损 热力网格<span style={{ fontSize: 11, color: '#888' }}>（格值 %：该格跨持仓/门槛最优期望；点击格高亮）</span></div>
                     {optCurHeat.tps.length ? (
                       <Table data={heatData} columns={heatColumns} rowKey="tp" size="small" pagination={false} />
@@ -1423,17 +1488,24 @@ export default function Research() {
                     {optCurBatches.length > 0 && (
                       <details style={{ marginTop: 8 }}>
                         <summary style={{ cursor: 'pointer', fontSize: 12, color: '#888' }}>批次冠军明细（{optCurBatches.length} 批淘汰赛过程）</summary>
+                        {/* 批次冠军表：每批的止盈/止损/持仓/门槛/目标值 */}
                         <Table
                           size="small"
                           pagination={false}
                           rowKey="batch"
                           data={optCurBatches.map((b) => ({ ...b }))}
+                          {/* 批次冠军表列：批号/止盈/止损/持仓天/门槛/目标值 */}
                           columns={[
                             { colKey: 'batch', title: '批', cell: ({ row }) => '#' + row.batch },
+
                             { colKey: 'tp', title: '止盈%', cell: ({ row }) => fmtNum(row.tp) },
+
                             { colKey: 'sl', title: '止损%', cell: ({ row }) => fmtNum(row.sl) },
+
                             { colKey: 'hold_days', title: '持仓天', cell: ({ row }) => fmtNum(row.hold_days) },
+
                             { colKey: 'min_score', title: '门槛', cell: ({ row }) => fmtNum(row.min_score) },
+
                             { colKey: 'objective', title: '目标值', cell: ({ row }) => fmtNum(row.objective, 3) },
                           ]}
                         />
@@ -1446,8 +1518,10 @@ export default function Research() {
           </div>
         </Tabs.TabPanel>
 
+        {/* 战法库标签页：已应用因子/形态战法列表与操作 */}
         <Tabs.TabPanel value="library" label="战法库">
           <div style={{ marginTop: 12 }}>
+            {/* 战法库顶部操作栏：参数寻优入口 + 刷新按钮 */}
             <Card title="战法库（已应用因子战法）" style={{ marginBottom: 12 }}>
               <div style={{ display: 'flex', gap: 8 }}>
                 <Button theme="warning" size="small" onClick={() => { setActiveTab('candidates'); setCandSubTab('optimize'); loadOptimizations() }}>⚙ 参数寻优</Button>
@@ -1455,6 +1529,7 @@ export default function Research() {
               </div>
             </Card>
 
+            {/* 内置形态战法快捷卡片：双响炮/龙头/龙回头/N形，点击可展开详情 */}
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '8px 0' }}>
               {builtinPatterns.map((b) => (
                 <Card key={'card-' + b.id} style={{ flex: '1 1 140px', borderColor: expandedStrategy === 'bt:' + b.id ? '#4c8dff' : undefined }}>
@@ -1466,6 +1541,7 @@ export default function Research() {
               ))}
             </div>
 
+            {/* 内置形态战法详情列表：每个战法一张卡片，展示最新回测状态与操作 */}
             <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>内置形态战法（{builtinPatterns.length}）</div>
             {builtinPatterns.map((b) => {
               const expanded = expandedStrategy === 'bt:' + b.id
@@ -1486,6 +1562,7 @@ export default function Research() {
                   </div>
                   {expanded && (
                     <div style={{ marginTop: 8 }}>
+                      {/* 内置战法回测状态：未回测/运行中/结果/失败 */}
                       {!job && <div style={{ fontSize: 12, color: '#888' }}>尚未回测——点「回测此战法」发起历史日K回放（结果进「回测」tab）</div>}
                       {job && job.status === 'running' && <div>回测中 {jobPct(job)}</div>}
                       {job && job.result_text && <pre style={{ fontSize: 12, color: '#ccc', whiteSpace: 'pre-wrap' }}>{job.result_text}</pre>}
@@ -1503,6 +1580,7 @@ export default function Research() {
 
         <Tabs.TabPanel value="backtests" label="回测">
           <div style={{ marginTop: 12 }}>
+            {/* 发起全量回测表单：起止日期/选股数/最小样本/候选选择 */}
             <Card title="发起 / 重跑全量回测" style={{ marginBottom: 12 }}>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                 <Input value={btStart} onChange={(v) => setBtStart(v)} placeholder="开始 20230801" style={{ width: 130 }} />
@@ -1510,6 +1588,7 @@ export default function Research() {
                 <Input value={btTopK} onChange={(v) => setBtTopK(v)} placeholder="选股数" style={{ width: 90 }} />
                 <Input value={btMinStocks} onChange={(v) => setBtMinStocks(v)} placeholder="最小样本" style={{ width: 100 }} />
               </div>
+              {/* 候选选择与发起回测按钮 */}
               <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 <Select value={btPickId} onChange={(v) => setBtPickId(v)} disabled={btLoading} style={{ width: 260 }} options={[
                   { label: '选择待审批因子候选', value: 0, disabled: true },
@@ -1548,6 +1627,7 @@ export default function Research() {
 
         <Tabs.TabPanel value="settings" label="设置">
           <div style={{ marginTop: 12 }}>
+            {/* 研究调度设置：全量回测全局开关 */}
             <Card title="研究调度设置">
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <div style={{ flex: 1 }}>
@@ -1564,6 +1644,7 @@ export default function Research() {
 
       {/* 寻优参数池 / 池纪律 设置弹窗 */}
       <Dialog visible={optDrawerOpen} onClose={() => setOptDrawerOpen(false)} header="参数池 / 池纪律" onConfirm={undefined}>
+        {/* 参数池四维步进搜索空间配置：止盈/止损/持仓天数/门槛的起止与步长 */}
         <div style={{ fontWeight: 600, margin: '8px 0', fontSize: 14 }}>该战法寻优参数池（步进搜索空间，保存后下次寻优生效）</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
           <label>止盈起<input type="number" step="1" value={cfgSweep.tp_from ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, tp_from: +e.target.value }))} /></label>
@@ -1572,6 +1653,7 @@ export default function Research() {
           <label>止损起<input type="number" step="1" value={cfgSweep.sl_from ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, sl_from: +e.target.value }))} /></label>
           <label>止损终<input type="number" step="1" value={cfgSweep.sl_to ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, sl_to: +e.target.value }))} /></label>
           <label>步长<input type="number" step="1" min="0.5" value={cfgSweep.sl_step ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, sl_step: +e.target.value }))} /></label>
+          {/* 持仓天数步进配置 */}
           <label>持仓起(天)<input type="number" step="1" value={cfgSweep.hold_from ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, hold_from: +e.target.value }))} /></label>
           <label>持仓终(天)<input type="number" step="1" value={cfgSweep.hold_to ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, hold_to: +e.target.value }))} /></label>
           <label>步长(天)<input type="number" step="1" min="1" value={cfgSweep.hold_step ?? 0} onChange={(e) => setCfgSweep((c) => ({ ...c, hold_step: +e.target.value }))} /></label>
@@ -1607,6 +1689,7 @@ export default function Research() {
         {!logLoading && !logExists && (
           <div style={{ fontSize: 13, color: '#888' }}>暂无日志（任务尚未执行，或 researchd 未写入 task_logs）。</div>
         )}
+        {/* 日志正文：等宽字体终端样式，运行中任务每 4 秒自动刷新 */}
         {!logLoading && logExists && (
           <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 420, overflow: 'auto', background: '#0d1117', color: '#c9d1d9', padding: 12, borderRadius: 6, fontSize: 12, lineHeight: 1.6 }}>
             {logContent || '（日志为空）'}

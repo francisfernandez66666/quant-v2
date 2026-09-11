@@ -20,8 +20,10 @@ function ipoCountdown(c) {
 
 // 将时间戳或 ISO 字符串统一格式化为 MM-DD HH:mm
 function fmtNewsTime(dt) {
+  // 空值直接返回空字符串
   if (dt === null || dt === undefined || dt === '') return ''
   const s = String(dt)
+  // 纯数字视为 Unix 时间戳（秒），转换为 Date 对象
   if (/^\d+$/.test(s)) {
     const t = new Date(Number(s) * 1000)
     if (!isNaN(t.getTime())) {
@@ -33,6 +35,7 @@ function fmtNewsTime(dt) {
     }
     return ''
   }
+  // ISO 字符串截取 MM-DD HH:mm 部分
   return s.length >= 16 ? s.slice(5, 16) : s
 }
 
@@ -135,15 +138,18 @@ export default function Dashboard() {
       api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(),
       api.fetchHotSnapshot(), api.fetchIPOCalendar(), api.fetchDashboard(),
     ])
+    // 逐项处理各接口返回结果，任一失败不阻断其他数据展示
     if (sigRes.status === 'fulfilled' && Array.isArray(sigRes.value)) setSignals(sigRes.value)
     if (stRes.status === 'fulfilled' && stRes.value) setStatus(stRes.value)
     if (newsRes.status === 'fulfilled' && Array.isArray(newsRes.value)) setNewsItems(newsRes.value)
     if (secRes.status === 'fulfilled' && Array.isArray(secRes.value)) setHotSectors(secRes.value)
+    // 快照数据需同时更新股票列表与快照时间
     if (snapRes.status === 'fulfilled' && Array.isArray(snapRes.value) && snapRes.value.length) {
       setSnapshotStocks(snapRes.value)
       setSnapshotTime(new Date().toLocaleTimeString())
     }
     if (ipoRes.status === 'fulfilled' && Array.isArray(ipoRes.value)) setIpoCalendar(ipoRes.value)
+    // 战法归因统计从仪表盘接口的 report_stats 中提取
     if (dashRes.status === 'fulfilled' && dashRes.value && dashRes.value.report_stats) {
       setStrategyStats(dashRes.value.report_stats.by_strategy || {})
     }
@@ -219,12 +225,51 @@ export default function Dashboard() {
     { colKey: 'holding', title: '持仓中', width: 70 },
   ]
 
+  // 渲染单条资讯卡片：时间、标题、利好/利空标签、影响等级、关联板块与个股
+  function renderNewsItem(n, i) {
+    // 资讯标题行：时间 + 标题
+    const titleRow = (
+      <div style={{ display: 'flex', gap: 8, fontSize: 13 }}>
+        <span className="muted">{fmtNewsTime(n.datetime)}</span>
+        <span>{n.title}</span>
+      </div>
+    )
+    // 利好/利空标签
+    const directionTag = n.direction && <Tag theme={n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'} size="small">{n.direction}</Tag>
+    // 影响等级标签
+    const impactTag = n.impact_level && <Tag size="small" variant="light">{n.impact_level}影响</Tag>
+    // 关联板块标签列表
+    const sectorTags = n.sectors?.length && n.sectors.map((sec) => <Tag key={sec} size="small" theme="primary" variant="light">{sec}</Tag>)
+    // 关联个股标签列表
+    const stockTags = n.stocks?.length && n.stocks.map((stk) => <Tag key={stk} size="small" theme="warning" variant="light">{stk}</Tag>)
+    // 资讯标签行：利好/利空、影响等级、关联板块、关联个股
+    const tagRow = (
+      <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+        {directionTag}
+        {impactTag}
+        {sectorTags}
+        {stockTags}
+      </div>
+    )
+    // 卡片主体：标题行 + 标签行
+    const cardBody = (
+      <div key={'n' + i} style={{ padding: '6px 0', borderBottom: '1px solid #e7e7e7' }}>
+        {titleRow}
+        {tagRow}
+      </div>
+    )
+    return cardBody
+  }
+
+  /* 仪表盘页面主渲染：指标卡 → 热门个股与资讯双栏 → 战法胜率表 → 系统状态 */
   return (
     <div className="page">
+      {/* 右上角日志按钮：点击弹出 LogModal 查看后端运行日志 */}
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
         <Button theme="default" variant="outline" onClick={() => setShowLog(true)}>📋 日志</Button>
       </div>
 
+      {/* 核心指标卡：强信号/观察中/静默/监控个股数量一目了然 */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         {[
           { n: strongCount, l: '强信号', c: '#e34d59' },
@@ -239,7 +284,9 @@ export default function Dashboard() {
         ))}
       </div>
 
+      {/* 左栏热门个股 + 右栏资讯动态，双栏并列展示 */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        {/* 热门个股实时快照表格（带 LIVE 标签），无数据时显示等待提示 */}
         <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>}>
           {snapshotStocks.length ? (
             <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} />
@@ -249,6 +296,7 @@ export default function Dashboard() {
           <div className="muted" style={{ marginTop: 8 }}>{snapshotTime}</div>
         </Card>
 
+        {/* 最新动态面板：宏观日历、IPO日历、热门板块、资讯四块分区展示 */}
         <Card title="最新动态">
           <SectionLabel>📅 宏观日历</SectionLabel>
           {calendarEvents.length ? calendarEvents.map((c, i) => (
@@ -283,33 +331,24 @@ export default function Dashboard() {
 
           <Divider />
 
+          {/* 资讯列表：按时间倒序展示最新 15 条，含利好/利空/影响等级/关联板块标签 */}
           {newsItems.length > 0 && <SectionLabel>📰 资讯</SectionLabel>}
-          {newsItems.slice(0, 15).map((n, i) => (
-            <div key={'n' + i} style={{ padding: '6px 0', borderBottom: '1px solid #e7e7e7' }}>
-              <div style={{ display: 'flex', gap: 8, fontSize: 13 }}>
-                <span className="muted">{fmtNewsTime(n.datetime)}</span>
-                <span>{n.title}</span>
-              </div>
-              <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
-                {n.direction && <Tag theme={n.direction === '利好' ? 'success' : n.direction === '利空' ? 'danger' : 'default'} size="small">{n.direction}</Tag>}
-                {n.impact_level && <Tag size="small" variant="light">{n.impact_level}影响</Tag>}
-                {n.sectors?.length && n.sectors.map((sec) => <Tag key={sec} size="small" theme="primary" variant="light">{sec}</Tag>)}
-                {n.stocks?.length && n.stocks.map((stk) => <Tag key={stk} size="small" theme="warning" variant="light">{stk}</Tag>)}
-              </div>
-            </div>
-          ))}
+          {newsItems.slice(0, 15).map(renderNewsItem)}
+          {/* 无数据时的空状态占位 */}
           {!newsItems.length && !hotSectors.length && !calendarEvents.length && (
             <div className="muted" style={{ padding: 16, textAlign: 'center' }}>等待数据...</div>
           )}
         </Card>
       </div>
 
+      {/* 按战法胜率归因表格：展示各战法样本数、胜率、盈亏比等指标 */}
       {strategyRows.length > 0 && (
         <Card title="按战法胜率" style={{ marginBottom: 16 }}>
           <Table data={strategyRows} columns={strategyColumns} rowKey="name" size="small" pagination={false} />
         </Card>
       )}
 
+      {/* 系统状态面板：运行时间、数据源健康、新闻源、快照统计、流程引擎、实盘链路 */}
       <Card title="系统">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
           <span>运行 {status.uptime || '-'}</span>

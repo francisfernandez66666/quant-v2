@@ -195,11 +195,13 @@ export default function LogModal({ visible, onClose }) {
       // 即使本轮没有分析出有价值结果也如实展示 L1/L2，避免「暂无 LLM 分析记录」白板
       let fb = null
       try {
+        // §FIX-0921b 回退数据校验：仅接受无 status 错误标记且含有效内容的快照
         const d = await api.fetchLLMDebug()
         if (d && !d.status && (d.raw_titles || d.stage2_events)) {
           fb = d
         }
       } catch (_) {}
+      // 回落命中：包装为单条记录展示，并同步回填选中索引集合
       if (fb) {
         setLlmRecords([fb])
         setLlmIdx(0)
@@ -207,11 +209,13 @@ export default function LogModal({ visible, onClose }) {
         setLlmNoData(false)
         setSelectedSet(new Set(fb.selected_idx || []))
       } else {
+        // 主源与回落均无可用数据：清空并标记 NoData，界面显示等待下一轮扫描
         setLlmRecords([])
         setLlmData(null)
         setLlmNoData(true)
       }
     }
+    // 信号批次主源结果回填；为空时清空数据并标记 NoData
     if (slRes.status === 'fulfilled' && Array.isArray(slRes.value) && slRes.value.length) {
       setSigRecords(slRes.value)
       setSigIdx(0)
@@ -263,8 +267,15 @@ export default function LogModal({ visible, onClose }) {
         </div>
 
         {activeTab === 'llm' && (
+          // LLM 分析标签页：工具栏 + 搜索视图（跨批次）/ 单轮详情（概要栏 + Stage1/Stage2）
           <div className="log-body">
+            {
+              // 工具栏：搜索框 + 轮次下拉（搜索时隐藏）+ 刷新按钮
+            }
             <div className="log-toolbar">
+              {
+                // 搜索框：输入即切换为跨批次搜索视图（大小写不敏感）
+              }
               <input
                 value={llmQuery}
                 onChange={(e) => setLlmQuery(e.target.value)}
@@ -272,10 +283,14 @@ export default function LogModal({ visible, onClose }) {
                 className="log-search"
                 placeholder="搜索：个股名称 / 代码 / 板块（跨批次）"
               />
+              {
+                // 轮次下拉：按处理时间倒序展示各轮 LLM 分析（搜索态隐藏）
+              }
               {!llmSearching && (
                 <select
                   value={llmIdx}
                   disabled={llmRecords.length < 2}
+                  // 切换轮次：更新选中索引并回填该轮数据与选中集合
                   onChange={(e) => {
                     const i = Number(e.target.value)
                     setLlmIdx(i)
@@ -286,6 +301,9 @@ export default function LogModal({ visible, onClose }) {
                   }}
                   className="log-select"
                 >
+                  {
+                    // 下拉选项：轮次序号（最新在前）+ 分析时间 + 原始/选中条数
+                  }
                   {llmRecords.map((r, i) => (
                     <option key={r.process_time} value={i}>
                       轮次 {llmRecords.length - i} · {fmtTime(r.process_time)}（{r.raw_count} 条 / 选 {r.selected_count}）
@@ -293,11 +311,20 @@ export default function LogModal({ visible, onClose }) {
                   ))}
                 </select>
               )}
+              {
+                // 手动刷新：重新拉取 LLM 分析与信号批次全部日志
+              }
               <button className="btn-refresh" onClick={load} disabled={loading}>刷新</button>
             </div>
 
+            {
+              // 跨批次搜索视图：命中概要 + 按轮次分组的事件卡片
+            }
             {llmSearching ? (
               <div className="search-view">
+                {
+                  // 无命中提示 / 命中概要（总条数与轮次数）
+                }
                 {!llmSearchGroups.length ? (
                   <div className="log-empty">未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
                 ) : (
@@ -305,19 +332,34 @@ export default function LogModal({ visible, onClose }) {
                     共 {llmTotalHits} 条事件命中，跨 {llmSearchGroups.length} 个轮次
                   </div>
                 )}
+                {
+                  // 按轮次分组渲染命中的 Stage2 事件卡片
+                }
                 {llmSearchGroups.map((g, gi) => (
                   <div key={gi} className="search-group">
+                    {
+                      // 分组头：轮次时间 + 该轮命中条数
+                    }
                     <div className="search-group-head">
                       <span className="search-batch">轮次 {fmtTime(g.time)}</span>
                       <span className="search-count">命中 {g.items.length} 条</span>
                     </div>
+                    {
+                      // 事件卡片：标题 + 多空方向标签 + 评分；正文按板块/个股/理由分行
+                    }
                     {g.items.map((ev, i) => (
                       <div key={i} className="event-card">
+                        {
+                          // 卡片头：事件标题 + 方向标签 + 评分
+                        }
                         <div className="event-header">
                           <span className="event-title">{ev.title}</span>
                           <span className={'tag tag-' + ev.direction}>{ev.direction || '中性'}</span>
                           <span className="event-score">评分 {(ev.score || 0).toFixed(2)}</span>
                         </div>
+                        {
+                          // 详情行：命中板块标签（有值才渲染）
+                        }
                         <div className="event-body">
                           {ev.sectors && ev.sectors.length && (
                             <div className="event-row">
@@ -329,6 +371,9 @@ export default function LogModal({ visible, onClose }) {
                               </span>
                             </div>
                           )}
+                          {
+                            // 关联个股标签（命中事件的相关个股）
+                          }
                           {ev.related_stocks && ev.related_stocks.length && (
                             <div className="event-row">
                               <span className="event-label">个股</span>
@@ -339,6 +384,9 @@ export default function LogModal({ visible, onClose }) {
                               </span>
                             </div>
                           )}
+                          {
+                            // LLM 分析理由文本
+                          }
                           {ev.reason && (
                             <div className="event-row">
                               <span className="event-label">理由</span>
@@ -351,12 +399,17 @@ export default function LogModal({ visible, onClose }) {
                   </div>
                 ))}
               </div>
+            /* 单轮详情视图：无数据提示 / 概要栏 + Stage1 初筛 + Stage2 分析结果 */
             ) : (
               <>
+                {/* 无数据：本轮尚无 LLM 分析记录 */}
                 {llmNoData ? (
                   <div className="log-empty">暂无 LLM 分析记录，等待下一轮扫描</div>
                 ) : llmData ? (
                   <>
+                    {
+                      // 概要栏：Stage1 模式 / 原始条数 / 筛选后条数 / 分析时间
+                    }
                     <div className="summary-bar">
                       <div className="summary-item">
                         <span className="summary-label">Stage1 模式</span>
@@ -368,16 +421,25 @@ export default function LogModal({ visible, onClose }) {
                         <span className="summary-label">原始条数</span>
                         <span className="summary-value">{llmData.raw_count}</span>
                       </div>
+                      {
+                        // 概要项：筛选后保留的标题条数
+                      }
                       <div className="summary-item">
                         <span className="summary-label">筛选后</span>
                         <span className="summary-value">{llmData.selected_count}</span>
                       </div>
+                      {
+                        // 概要项：本轮分析完成时间
+                      }
                       <div className="summary-item">
                         <span className="summary-label">分析时间</span>
                         <span className="summary-value">{fmtTime(llmData.process_time)}</span>
                       </div>
                     </div>
 
+                    {
+                      // Stage1 新闻初筛列表：原始标题逐条展示，选中=通过、未选=过滤
+                    }
                     <h3 className="section-title">Stage1 · 新闻初筛</h3>
                     <div className="stage1-list">
                       {(llmData.raw_titles || []).map((title, i) => (
@@ -388,12 +450,18 @@ export default function LogModal({ visible, onClose }) {
                           <span className="title-idx">{i + 1}</span>
                           <span className="title-text">{title}</span>
                           <span className={'title-badge ' + (isSelected(i) ? 'badge-pass' : 'badge-skip')}>
+                            {
+                              // 徽标文案：命中选中集=通过，否则=被初筛过滤
+                            }
                             {isSelected(i) ? '通过' : '过滤'}
                           </span>
                         </div>
                       ))}
                     </div>
 
+                    {
+                      // Stage2 LLM 分析结果：事件卡片列表（结构与搜索视图一致），无结果给空态
+                    }
                     <h3 className="section-title">Stage2 · LLM 分析结果</h3>
                     {llmData.stage2_events && llmData.stage2_events.length ? (
                       <div className="stage2-events">
@@ -404,6 +472,9 @@ export default function LogModal({ visible, onClose }) {
                               <span className={'tag tag-' + ev.direction}>{ev.direction || '中性'}</span>
                               <span className="event-score">评分 {(ev.score || 0).toFixed(2)}</span>
                             </div>
+                            {
+                              // 卡片正文：板块 / 个股 / 理由（有值才渲染对应行）
+                            }
                             <div className="event-body">
                               {ev.sectors && ev.sectors.length && (
                                 <div className="event-row">
@@ -415,6 +486,9 @@ export default function LogModal({ visible, onClose }) {
                                   </span>
                                 </div>
                               )}
+                              {
+                                // 关联个股标签
+                              }
                               {ev.related_stocks && ev.related_stocks.length && (
                                 <div className="event-row">
                                   <span className="event-label">个股</span>
@@ -425,6 +499,9 @@ export default function LogModal({ visible, onClose }) {
                                   </span>
                                 </div>
                               )}
+                              {
+                                // 入选理由文本
+                              }
                               {ev.reason && (
                                 <div className="event-row">
                                   <span className="event-label">理由</span>
@@ -436,6 +513,7 @@ export default function LogModal({ visible, onClose }) {
                         ))}
                       </div>
                     ) : (
+                      /* 空态：本轮 Stage2 尚无分析结果 */
                       <div className="log-empty">Stage2 无分析结果</div>
                     )}
                   </>
@@ -445,9 +523,18 @@ export default function LogModal({ visible, onClose }) {
           </div>
         )}
 
+        {
+          // 信号批次标签页：工具栏 + 搜索视图（跨批次）/ 单批次详情（概要栏 + 信号列表）
+        }
         {activeTab === 'signal' && (
           <div className="log-body">
+            {
+              // 工具栏：搜索框 + 战法筛选下拉 + 批次下拉（搜索时隐藏）+ 刷新按钮
+            }
             <div className="log-toolbar">
+              {
+                // 搜索框：输入即切换为跨批次信号搜索视图
+              }
               <input
                 value={sigQuery}
                 onChange={(e) => setSigQuery(e.target.value)}
@@ -455,6 +542,9 @@ export default function LogModal({ visible, onClose }) {
                 className="log-search"
                 placeholder="搜索：个股名称 / 代码 / 板块（跨批次）"
               />
+              {
+                // 战法筛选下拉：全部战法 / 各战法（选项来自全部批次信号去重汇总）
+              }
               <select
                 value={activeSigStrategy}
                 onChange={(e) => setActiveSigStrategy(e.target.value)}
@@ -466,10 +556,14 @@ export default function LogModal({ visible, onClose }) {
                   <option key={st} value={st}>{st}</option>
                 ))}
               </select>
+              {
+                // 批次下拉：按处理时间倒序展示各信号批次（搜索态隐藏）
+              }
               {!sigSearching && (
                 <select
                   value={sigIdx}
                   disabled={sigRecords.length < 2}
+                  // 切换批次：更新选中索引并回填该批次的信号数据
                   onChange={(e) => {
                     const i = Number(e.target.value)
                     setSigIdx(i)
@@ -479,6 +573,9 @@ export default function LogModal({ visible, onClose }) {
                   }}
                   className="log-select"
                 >
+                  {
+                    // 下拉选项：批次序号（最新在前）+ 处理时间 + 信号/原始条数
+                  }
                   {sigRecords.map((r, i) => (
                     <option key={r.process_time} value={i}>
                       批次 {sigRecords.length - i} · {fmtTime(r.process_time)}（{r.signals.length} 信号 / {r.raw_count} 条）
@@ -489,8 +586,14 @@ export default function LogModal({ visible, onClose }) {
               <button className="btn-refresh" onClick={load} disabled={loading}>刷新</button>
             </div>
 
+            {
+              // 跨批次搜索视图：命中概要 + 按批次分组的信号卡片
+            }
             {sigSearching ? (
               <div className="search-view">
+                {
+                  // 无命中提示 / 命中概要（总条数与批次数）
+                }
                 {!sigSearchGroups.length ? (
                   <div className="log-empty">未找到匹配项（可试：代码 / 名称 / 板块关键词）</div>
                 ) : (
@@ -498,14 +601,26 @@ export default function LogModal({ visible, onClose }) {
                     共 {sigTotalHits} 条信号命中，跨 {sigSearchGroups.length} 个批次
                   </div>
                 )}
+                {
+                  // 按批次分组渲染命中的信号条目
+                }
                 {sigSearchGroups.map((g, gi) => (
                   <div key={gi} className="search-group">
+                    {
+                      // 分组头：批次时间 + 该批命中条数
+                    }
                     <div className="search-group-head">
                       <span className="search-batch">批次 {fmtTime(g.time)}</span>
                       <span className="search-count">命中 {g.items.length} 条</span>
                     </div>
+                    {
+                      // 信号条目：头部（代码/名称/战法/方向/动作/置信/价格）+ 正文（板块/理由）
+                    }
                     {g.items.map((sg, i) => (
                       <div key={i} className="signal-item">
+                        {
+                          // 信号头部：代码、名称、战法、多空方向、买卖动作、置信度、信号价
+                        }
                         <div className="sig-head">
                           <span className="sig-code">{sg.code}</span>
                           <span className="sig-name">{sg.name || '-'}</span>
@@ -515,6 +630,9 @@ export default function LogModal({ visible, onClose }) {
                           <span className="sig-conf">置信 {(sg.confidence || 0).toFixed(2)}</span>
                           {sg.price && <span className="sig-price">¥{sg.price.toFixed(2)}</span>}
                         </div>
+                        {
+                          // 详情行：所属板块与入选理由（有值才渲染）
+                        }
                         <div className="sig-body">
                           {sg.sector && <span className="sig-sector">{sg.sector}</span>}
                           {sg.reason && <span className="sig-reason">{sg.reason}</span>}
@@ -524,31 +642,48 @@ export default function LogModal({ visible, onClose }) {
                   </div>
                 ))}
               </div>
+            /* 单批次详情视图：无数据提示 / 概要栏 + 信号列表 */
             ) : (
               <>
+                {/* 无数据：当日尚无信号批次记录 */}
                 {sigNoData ? (
                   <div className="log-empty">暂无信号批次记录，等待下一轮扫描</div>
                 ) : sigData ? (
                   <>
+                    {
+                      // 概要栏：批次时间 / 原始条数 / 信号数
+                    }
                     <div className="summary-bar">
                       <div className="summary-item">
                         <span className="summary-label">批次时间</span>
                         <span className="summary-value">{fmtTime(sigData.process_time)}</span>
                       </div>
+                      {
+                        // 概要项：原始新闻条数（信号批次）
+                      }
                       <div className="summary-item">
                         <span className="summary-label">原始条数</span>
                         <span className="summary-value">{sigData.raw_count}</span>
                       </div>
+                      {
+                        // 概要项：本轮产出的信号总数
+                      }
                       <div className="summary-item">
                         <span className="summary-label">信号数</span>
                         <span className="summary-value">{sigData.signals.length}</span>
                       </div>
                     </div>
 
+                    {
+                      // 信号列表：按战法筛选后的信号逐条展示；筛选后为空给区分性空态文案
+                    }
                     {sigFiltered.length ? (
                       <div className="signal-list">
                         {sigFiltered.map((sg, i) => (
                           <div key={sg.id || i} className="signal-item">
+                            {
+                              // 信号头部：代码/名称/战法/方向/动作/置信/信号价
+                            }
                             <div className="sig-head">
                               <span className="sig-code">{sg.code}</span>
                               <span className="sig-name">{sg.name || '-'}</span>
@@ -558,6 +693,9 @@ export default function LogModal({ visible, onClose }) {
                               <span className="sig-conf">置信 {(sg.confidence || 0).toFixed(2)}</span>
                               {sg.price && <span className="sig-price">¥{sg.price.toFixed(2)}</span>}
                             </div>
+                            {
+                              // 信号正文：所属板块与入选理由（有值才渲染）
+                            }
                             <div className="sig-body">
                               {sg.sector && <span className="sig-sector">{sg.sector}</span>}
                               {sg.reason && <span className="sig-reason">{sg.reason}</span>}
@@ -566,6 +704,7 @@ export default function LogModal({ visible, onClose }) {
                         ))}
                       </div>
                     ) : (
+                      /* 空态：区分「当前战法无匹配」与「本轮无信号产出」 */
                       <div className="log-empty">{sigData.signals.length ? '当前战法无匹配信号' : '本轮无信号产出'}</div>
                     )}
                   </>

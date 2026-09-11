@@ -82,6 +82,7 @@ export default function App() {
   const [shortEnabled, setShortEnabled] = useState(false)
   const [canResearch, setCanResearch] = useState(false)
   const [canAdmin, setCanAdmin] = useState(false)
+  // 权限入口状态位：研究审批/管理员/模拟盘三个入口由后端角色与开关决定
   const [paperEnabled, setPaperEnabled] = useState(false)
 
   const [serverUrl, setServerUrl] = useState(api.getStoredServer() || '')
@@ -120,6 +121,7 @@ export default function App() {
     setLoginError('')
     api.setStoredServer(serverUrl)
     try {
+      // 调用后端登录：成功后恢复账号与角色，并启动轮询 + 请求通知权限
       await api.login(username, password)
       setAccount(api.getAccount())
       setLoggedIn(true)
@@ -154,10 +156,12 @@ export default function App() {
       setInTradeTime(st.in_trade_time)
       setActiveWindow(st.active)
     } catch (_) { setServerOnline(false) }
+    // 独立轮询未读消息数：失败不影响主状态展示
     try {
       const alerts = await api.fetchAlerts()
       setAlertCount(alerts?.length || 0)
     } catch (_) {}
+    // 独立轮询做空开关状态：与服务端保持一致
     try {
       const ss = await api.fetchShortStatus()
       setShortEnabled(ss.short_enabled || false)
@@ -181,6 +185,7 @@ export default function App() {
     if (msg && msg.type === 'scan') {
       const bull = parseInt(msg.bull || '0', 10)
       const bear = parseInt(msg.bear || '0', 10)
+      // 扫描批次有新信号时组装中文提示并节流推送（做多/做空分别计数）
       if (bull > 0 || bear > 0) {
         const parts = []
         if (bull > 0) parts.push('做多 ' + bull + ' 条')
@@ -254,8 +259,12 @@ export default function App() {
       <ConfigProvider>
         <div className="login-page">
           <div className="login-box t-card">
+            {/*
+             * 登录卡片：品牌标题 + 三项表单 + 登录按钮 */}
             <h1>量仔</h1>
             <p className="subtitle">量化交易辅助工具</p>
+            {/*
+             * 表单域一：服务器地址，留空即用当前域名 */}
             <div className="form-group">
               <label>服务器地址</label>
               <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
@@ -269,6 +278,8 @@ export default function App() {
               <Input type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码"
                 onEnter={handleLogin} />
             </div>
+            {/*
+             * 登录按钮：loading 期间防止重复提交；错误内容即时展示 */}
             <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
             {loginError && <p className="login-error">{loginError}</p>}
           </div>
@@ -293,6 +304,7 @@ export default function App() {
     { to: '/llm-debug', icon: '🧠', label: 'LLM诊断' },
     { to: '/consult', icon: '🎯', label: '股票咨询' },
     canResearch ? { to: '/research', icon: '🔬', label: '自动研究' } : null,
+    // 条件项为 null 时由下方 filter(Boolean) 剔除，实现入口按权限显隐
     canAdmin ? { to: '/admin', icon: '👥', label: '用户管理' } : null,
   ].filter(Boolean)
 
@@ -303,31 +315,46 @@ export default function App() {
     <ErrorBoundary>
     <ConfigProvider>
       {/* 安全兜底：理论上进入主布局时 loggedIn 必为 true，此处保留登录页分支以防状态竞态 */}
+      {/* 登录兜底分支：表单结构（服务器地址/账号/密码/登录按钮）与上方未登录视图一致，
+          防止主布局阶段登录态被意外置空导致白屏 */}
       {!loggedIn ? (
         <div className="login-page">
           <div className="login-box">
+            {/*
+             * 登录卡片标题与副标题 */}
             <h1>量仔</h1>
             <p className="subtitle">量化交易辅助工具</p>
+            {/*
+             * 表单域一：服务器地址（留空使用当前域名） */}
             <div className="form-group">
               <label>服务器地址</label>
               <Input value={serverUrl} onChange={(v) => setServerUrl(v)} placeholder="留空表示使用当前域名" />
             </div>
+            {/*
+             * 表单域二：登录账号 */}
             <div className="form-group">
               <label>账号</label>
               <Input value={username} onChange={(v) => setUsername(v)} placeholder="输入账号" />
             </div>
+            {/*
+             * 表单域三：登录密码（支持回车直接登录） */}
             <div className="form-group">
               <label>密码</label>
               <Input type="password" value={password} onChange={(v) => setPassword(v)} placeholder="输入密码" onEnter={handleLogin} />
             </div>
+            {/*
+             * 登录按钮与错误提示 */}
             <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
             {loginError && <p className="login-error">{loginError}</p>}
           </div>
         </div>
       ) : (
+        /* 主布局外壳：顶部栏 + 断联横幅 + 侧边栏 + 内容路由区三段式结构 */
         <div className="app-shell">
           {/* 顶部栏：左侧为汉堡菜单按钮 + 交易时段指示 + 服务在线状态，右侧为做空开关 + 通知测试 + 退出 */}
           <header className="app-header">
+            {/*
+             * 左侧状态区：汉堡按钮、量化活跃窗口指示、后端连通状态 */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
               {/* 汉堡按钮：点击切换侧边栏显隐（移动端抽屉式） */}
               <div className="hamburger" onClick={() => setMenuOpen((o) => !o)}><span></span><span></span><span></span></div>
@@ -337,6 +364,8 @@ export default function App() {
               <span className="muted">{serverOnline ? '服务在线' : '离线'}</span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              {/*
+               * 右侧操作区：做空开关、通知测试、退出登录 */}
               {/* 做空开关：开启后允许"做多+做空"，关闭则"仅做多" */}
               <ToggleSw checked={shortEnabled} onChange={onShortToggle} />
               <span className="muted">{shortEnabled ? '做多+空' : '仅做多'}</span>
@@ -348,22 +377,35 @@ export default function App() {
               {/* 退出登录 */}
               <Button theme="default" variant="outline" size="small" onClick={logout}>退出</Button>
             </div>
+            {/*
+             * 顶部栏右侧操作项至此排布完毕，header 标签收口 */}
            </header>
            {/* 后端断联横幅：登录态可能因缓存令牌保留，但所有数据接口失败。
                显式提示用户检查「设置→服务器地址」（留空=使用当前域名），避免误以为"后端没给数据"。 */}
            {loggedIn && !serverOnline && (
+             // 通栏提示框：仅在登录态且最近一次状态轮询失败时渲染
              <div style={{ margin: '8px 12px 0', padding: '8px 12px', borderRadius: 6, background: '#fdecea', border: '1px solid #f5c6c2', color: '#b71c1c', fontSize: 13 }}>
                ⚠ 无法连接服务器：页面可打开但后端数据未加载。请到「设置 → 服务器连接」确认服务器地址——
                若填了自定义地址请改为留空（使用当前域名 quant-trading.top），或确认该地址可达。
              </div>
            )}
            <div className="app-body">
+            {/* 中部主体注释起点：以下为 app-body（左栏 aside + 右栏 main） */}
+            {/*
+             * 中部主体：左侧侧边栏 + 右侧内容区（移动端侧栏折叠为抽屉） */}
             {/* 侧边栏：品牌 logo + 导航菜单 + 底部当前账号；menuOpen 控制移动端抽屉展开 */}
             <aside className={'app-aside' + (menuOpen ? ' open' : '')}>
+              {/*
+               * 品牌标识区：logo 文字 */}
               <div className="brand-logo">量仔</div>
+              {/*
+               * 可滚动导航区：TDesign Menu 渲染 navItems，当前路由高亮 */}
               <div style={{ flex: 1, overflowY: 'auto' }}>
                 {/* 根据 navItems 渲染导航项，当前路由高亮；点击后跳转并收起抽屉 */}
+                {/*
+                 * Menu 配置：value 取当前路由路径，选中项即导航并收起抽屉 */}
                 <Menu theme="light" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
+                  {/* 导航项循环渲染：icon + 文案 + 可选未读角标 */}
                   {navItems.map((it) => (
                     <Menu.MenuItem key={it.to} value={it.to}>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
@@ -374,10 +416,13 @@ export default function App() {
                       </span>
                     </Menu.MenuItem>
                   ))}
+                  {/*
+                   * 上述循环渲染完毕：Menu 至此闭合，转入底部账号区 */}
                 </Menu>
               </div>
               {/* 侧边栏底部固定显示登录账号名与角色：后端下发的身份，前端只展示，
                   便于一眼确认当前是管理员还是普通用户（量化/模拟盘仅管理员可操作）。 */}
+              {/* 底部账号区渲染：当前登录账号 + 管理员/普通用户徽标 */}
               <div className="sidebar-footer">
                 <div className="account-name">{account || '未登录'}</div>
                 <div className={canAdmin ? 'role-badge role-admin' : 'role-badge role-user'}>
@@ -385,38 +430,88 @@ export default function App() {
                 </div>
               </div>
             </aside>
+            {/*
+             * 移动端抽屉遮罩：menuOpen 为真时渲染全屏遮罩，点击即收起侧栏 */}
             {/* 移动端抽屉展开时，点击遮罩收起侧边栏 */}
             {menuOpen && <div className="sidebar-overlay" onClick={() => setMenuOpen(false)} />}
             <main className="app-main">
+              {/*
+               * 右侧内容区：全局 ErrorBoundary > Suspense > Routes 三层包裹 */}
+              {/* 路由出口注释：path 相配即渲染对应页面组件；根路径重定向仪表盘 */}
               {/* 路由出口：根据 path 渲染对应页面组件；根路径重定向到仪表盘 */}
+              {/* 惰性加载兜底：lazy 页面拉取期间显示 PageFallback 占位 */}
               {/* 用全局 ErrorBoundary 包裹路由出口：任意页面渲染抛错时显示中文兜底 UI，避免整页白屏 */}
               <ErrorBoundary>
                 {/* §R4-10 Suspense 兜底：lazy 页面 chunk 加载期间显示占位，避免白屏 */}
                 <Suspense fallback={<PageFallback />}>
+                  {/*
+                   * 路由表注释起点：下方 <Routes> 逐条登记 13 个业务页面 + 403 兜底 */}
+                  {/* 路由表：/settings /research /admin 均套 ProtectedRoute 权限守卫，
+                      其余页面默认全员可见（后端接口仍有鉴权兜底） */}
                   <Routes>
+                    {/*
+                     * 根路径重定向到仪表盘 */}
                     <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                    {/*
+                     * 首屏直接引入的落地页 Dashboard（不参与懒加载） */}
                     <Route path="/dashboard" element={<Dashboard />} />
+                    {/*
+                     * 信号页：策略评级信号列表，徽标角标展示未读数 */}
                     <Route path="/signals" element={<Signals />} />
+                    {/*
+                     * 自选股页 */}
                     <Route path="/watchlist" element={<Watchlist />} />
+                    {/*
+                     * 持仓页：实盘持仓管理 */}
                     <Route path="/positions" element={<Positions />} />
+                    {/*
+                     * 量化交易页：策略运行与调仓入口 */}
                     <Route path="/quant" element={<Quant />} />
+                    {/*
+                     * 热点页：热点板块/评分排名/宏观日历/IPO/资讯 */}
                     <Route path="/hotspot" element={<Hotspot />} />
+                    {/*
+                     * 消息中心：系统提醒与低级别通知（角标展示 alertCount 未读数） */}
                     <Route path="/msgcenter" element={<MsgCenter />} />
+                    {/*
+                     * 设置页：仅管理员（ProtectedRoute admin 守卫） */}
                     <Route path="/settings" element={<ProtectedRoute admin><Settings /></ProtectedRoute>} />
+                    {/*
+                     * LLM 诊断页：查看大模型调用与结构化输出 */}
                     <Route path="/llm-debug" element={<LLMDebug />} />
+                    {/*
+                     * 股票咨询页：自然语言问询个股/板块 */}
                     <Route path="/consult" element={<Consult />} />
+                    {/*
+                     * 自动研究页：需 research_approve 权限（研究闭环审批入口） */}
                     <Route path="/research" element={<ProtectedRoute perm="research_approve"><Research /></ProtectedRoute>} />
+                    {/*
+                     * 用户管理页：仅管理员 */}
                     <Route path="/admin" element={<ProtectedRoute admin><Admin /></ProtectedRoute>} />
+                    {/*
+                     * 模拟盘页：纸面交易记账/自动撮合（入口受 paperEnabled 开关控制） */}
                     <Route path="/paper" element={<Paper />} />
+                    {/*
+                     * 403 无权限兜底页 */}
                     <Route path="/403" element={<Forbidden />} />
                   </Routes>
+                  {/*
+                   * Routes 结束：以上覆盖全部 13 个业务页面 + 403 兜底（含懒加载兜底说明） */}
                 </Suspense>
               </ErrorBoundary>
             </main>
+            {/* app-main 内容区注释锚点：右栏至此整体闭合 */}
           </div>
+          {/* app-body 结语：左侧导航 + 右栏已有路由，外层 div 自此闭合 */}
         </div>
       )}
+      {/*
+       * ConfigProvider 提供全局主题与组件上下文；ErrorBoundary 兜底任意渲染错误，避免白屏，下方标签逐一闭合 */}
     </ConfigProvider>
+    {/*
+     * ErrorBoundary 收尾：主布局包裹层闭合 */}
     </ErrorBoundary>
   )
+  // 根组件 App 渲染结束：登录页或主布局（顶部栏/侧边栏/路由出口）
+  // JSX 树整体闭合，App 组件定义到此结束 ── App.jsx 全文完 ──
 }

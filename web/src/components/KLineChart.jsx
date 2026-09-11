@@ -73,13 +73,18 @@ export default function KLineChart({
   scale = 1,
   count = 241,
 }) {
+  // 分时原始数据点数组（后端返回的 points）
   const [raw, setRaw] = useState([])
+  // 昨收盘价：红涨绿跌着色与涨跌幅计算的基准
   const [prevClose, setPrevClose] = useState(0)
+  // 展示名：优先用后端返回的名称，否则用外部传入或代码
   const [dispName, setDispName] = useState(name)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  // 最新收盘价与相对昨收的涨跌幅（工具栏汇总展示）
   const [lastClose, setLastClose] = useState(0)
   const [last, setLast] = useState(0)
+  // 容器宽度（画布自适应重绘）与 hover 十字光标状态
   const [viewW, setViewW] = useState(axisL + 320)
   const [hover, setHover] = useState(null)
 
@@ -94,12 +99,14 @@ export default function KLineChart({
       setLoading(true)
       setError('')
       try {
+        // 请求分时接口；响应 points 非数组视为格式异常
         const data = await api.fetchMinute(code, scale, count)
         const pts = data && Array.isArray(data.points) ? data.points : null
         if (!pts) {
           if (!cancelled) setError('分时数据格式异常')
           return
         }
+        // 空数据：清空画布数据源；后端附带 error 文案时一并展示
         if (pts.length === 0) {
           if (!cancelled) {
             setRaw([])
@@ -108,6 +115,7 @@ export default function KLineChart({
           return
         }
         if (cancelled) return
+        // 回填点位、昨收与展示名，触发画布重绘
         setRaw(pts)
         setPrevClose(Number(data.prev_close) || 0)
         if (data.name) setDispName(data.name)
@@ -117,13 +125,16 @@ export default function KLineChart({
         if (!cancelled) setLoading(false)
       }
     }
+    // 触发首次加载；卸载或 code/scale/count 变更时置 cancelled，丢弃过期响应
     load()
     return () => { cancelled = true }
   }, [code, scale, count])
 
   useEffect(() => {
+    // 容器宽度监听：画布按容器实际宽度重绘（无 ResizeObserver 时退化为 500ms 轮询）
     if (!wrapRef.current) return
     setViewW(wrapRef.current.clientWidth)
+    // 优先使用 ResizeObserver 监听容器尺寸变化
     if (typeof ResizeObserver !== 'undefined') {
       const ro = new ResizeObserver(() => {
         if (wrapRef.current) setViewW(wrapRef.current.clientWidth)
@@ -131,6 +142,7 @@ export default function KLineChart({
       ro.observe(wrapRef.current)
       return () => ro.disconnect()
     } else {
+      // 兜底：不支持 ResizeObserver 的环境改用 500ms 轮询容器宽度
       const t = setInterval(() => {
         if (wrapRef.current) {
           const w = wrapRef.current.clientWidth
@@ -364,6 +376,7 @@ export default function KLineChart({
       ctx.beginPath(); ctx.arc(hover.x, hover.y, 3, 0, Math.PI * 2); ctx.fill()
 
       const tipX = Math.min(Math.max(hover.x - 92, axisL), contW - 184)
+      // 信息气泡：184×92 固定尺寸白底描边卡片，紧贴顶部
       const tipW = 184, tipH = 92, tipY = 4
       ctx.fillStyle = '#ffffff'
       ctx.strokeStyle = '#d0d0d0'
@@ -372,10 +385,12 @@ export default function KLineChart({
       ctx.textAlign = 'left'
       ctx.fillStyle = '#303133'
       ctx.fillText(hover.point.time || '', tipX + 8, tipY + 12)
+      // 行2：现价与涨跌幅（按相对昨收正负着色）
       const upc = hover.delta >= 0 ? PRICE_UP : PRICE_DOWN
       ctx.fillStyle = upc
       ctx.fillText('价 ' + hover.point.close.toFixed(2), tipX + 8, tipY + 30)
       ctx.fillText('涨 ' + (hover.delta >= 0 ? '+' : '') + hover.pct.toFixed(2) + '%', tipX + 96, tipY + 30)
+      // 行3：开/高/低；行4：量/额；行5：MACD 三值（DIF/DEA/BAR）
       ctx.fillStyle = '#606266'
       ctx.fillText('开 ' + hover.point.open.toFixed(2) + ' 高 ' + hover.point.high.toFixed(2) + ' 低 ' + hover.point.low.toFixed(2), tipX + 8, tipY + 48)
       ctx.fillText('量 ' + fmtVol(hover.point.volume) + ' · 额 ' + fmtAmt(hover.point.amount), tipX + 8, tipY + 66)
@@ -443,14 +458,23 @@ export default function KLineChart({
 
   return (
     <div className="kline-chart">
+      {
+        // 顶部工具栏：股票名+「分时」标题、现价/涨跌摘要、手动刷新按钮
+      }
       <div className="kline-toolbar">
         <span className="kline-title">{dispName || code} · 分时</span>
+        {
+          // 现价与涨跌幅：红涨绿跌着色（仅拿到最新价后展示）
+        }
         {lastClose ? (
           <span className="kline-summary">
             现价 <b className={last >= 0 ? 'up' : 'down'}>{lastClose.toFixed(2)}</b>
             涨跌 <b className={last >= 0 ? 'up' : 'down'}>{last >= 0 ? '+' : ''}{last.toFixed(2)}%</b>
           </span>
         ) : null}
+        {
+          // 刷新按钮：重新拉取分时数据并回填状态
+        }
         <button className="btn-refresh" disabled={loading} onClick={() => {
           setLoading(true)
           api.fetchMinute(code, scale, count).then((data) => {
@@ -463,10 +487,16 @@ export default function KLineChart({
         }}>刷新</button>
       </div>
 
+      {
+        // 加载中 / 错误 / 空数据提示区
+      }
       {loading ? <div className="kline-state">加载中…</div> : null}
       {error ? <div className="kline-state">{error}</div> : null}
       {!loading && !error && raw.length === 0 ? <div className="kline-state">暂无分时数据</div> : null}
 
+      {
+        // 分时画布：数据就绪时渲染，支持 hover 十字光标
+      }
       {!loading && !error && raw.length > 0 ? (
         <div ref={wrapRef} className="kline-wrap">
           <canvas
@@ -477,6 +507,9 @@ export default function KLineChart({
         </div>
       ) : null}
 
+      {
+        // 图例：价格线 / 均价线 / 昨收 / DIF / DEA 的颜色说明
+      }
       {raw.length > 0 ? (
         <div className="kline-legend">
           <span><i style={{ background: PRICE_UP }} />价格</span>
