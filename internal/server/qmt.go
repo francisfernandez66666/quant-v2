@@ -423,6 +423,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
 		At        string               `json:"at"`
 		UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
+		Broker    string               `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
+		From      string               `json:"from"`    // §QMT-DUAL 通道切换事件：来源通道
 	}
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 		writeError(w, 400, "invalid report body")
@@ -559,6 +561,10 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	case "heartbeat":
 		// §ROBUST 上行心跳：last_report_at 已在 switch 前统一刷新——它就是心跳的全部意义
 		// （无交易时段证明 广州→首尔 回程连通），无任何账本副作用。
+	case "broker":
+		// §QMT-DUAL 通道切换事件（xt↔queued）：仅观察用，不动账本。旧实现没有本 case
+		// 导致 outbox 里的切换回报反复 400 重推刷屏（2026-09-11 生产实录）。
+		log.Printf("[trading] 网关节点通道切换事件: %s -> %s at=%s", ev.From, ev.Broker, ev.At)
 	default:
 		writeError(w, 400, "unknown report type")
 		return

@@ -246,6 +246,22 @@ func TestHandleQMTReportOrderAdvancesStatus(t *testing.T) {
 	assertOrderStatus("已成")
 }
 
+// TestHandleQMTReportBrokerEventAccepted §2026-09-11 生产实录：网关通道切换事件
+// {"type":"broker"} 旧实现无对应 case → 400 拒收 → outbox 反复重推刷屏。
+// broker 事件仅观察用，应 200 接受且不动账本。
+func TestHandleQMTReportBrokerEventAccepted(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	body := `{"type":"broker","broker":"queued","from":"xt","at":"2026-09-11T14:48:00+08:00"}`
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("broker 切换事件应 200 接受, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pos, _ := db.RealPositionByCode("600000.SH"); pos != nil {
+		t.Fatal("broker 事件不应动账本")
+	}
+}
+
 // TestHandleQMTReportOrderUnknownSideNotRejected §2026-09-11 生产实录：
 // 桥侧干跑探测单（TEST-DRY…）side="???" 会被旧实现 400 拒收并在网关 outbox
 // 反复重推刷屏。order 事件仅展示/推进状态不动账本，未知方向应原样落库 200；
