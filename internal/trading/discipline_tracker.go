@@ -64,7 +64,7 @@ func (t *DisciplineTracker) ProbeAll(in AdviceInput, disc config.DisciplineConfi
 		if sc, ok := in.Scores[code]; ok {
 			hasBull = sc.SignalActive
 		}
-		hasBear := in.BearHits[code].Reason != ""
+		hasBear := in.BearReasons[code] != ""
 		// 持仓纪律状态：首次探针以持仓最高价（缺省成本价）为移动止盈基准。
 		st := t.states[code]
 		if st == nil {

@@ -105,20 +105,18 @@ func firstOrZero(xs []float64) float64 {
 
 // TriggerRule 订单流触发规则。返回买/卖信号与原因说明（观察用）。
 // 规则：
-//
-//	buy  ：委比 ≥ 0.4 且 主动买占比 ≥ 0.6 且 大单净流入 ≥ 0.3（持续买压）；
-//	sell ：委比 ≤ -0.4 且（封单快速撤减 → 大单净流入 ≤ -0.3 或 主动买占比 ≤ 0.4）。
-//
+//   buy  ：委比 ≥ 0.4 且 主动买占比 ≥ 0.6 且 大单净流入 ≥ 0.3（持续买压）；
+//   sell ：委比 ≤ -0.4 且（封单快速撤减 → 大单净流入 ≤ -0.3 或 主动买占比 ≤ 0.4）。
 // 阈值可调（TriggerDefaults）。English: order-flow trigger rules (observational): buy when the
 // imbalance is strongly positive with elevated active-buy and big-order inflow; sell-warning when
 // the book is heavily imbalanced to the ask with a fast seal-drain.
 type TriggerRule struct {
-	BuyImb  float64 // 买入触发委比
-	BuyAct  float64 // 买入触发主动买占比
-	BuyBig  float64 // 买入触发大单净流入
-	SellImb float64 // 卖出触发委比
-	SellAct float64 // 卖出触发主动买占比
-	SellBig float64 // 卖出触发大单净流入
+	BuyImb   float64 // 买入触发委比
+	BuyAct   float64 // 买入触发主动买占比
+	BuyBig   float64 // 买入触发大单净流入
+	SellImb  float64 // 卖出触发委比
+	SellAct  float64 // 卖出触发主动买占比
+	SellBig  float64 // 卖出触发大单净流入
 }
 
 // TriggerDefaults 默认阈值（按 A 股经验校准确认，可按配置覆盖）。

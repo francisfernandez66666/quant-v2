@@ -224,14 +224,16 @@ init_server() {
 	local setup_resp
 	setup_resp=$(curl -s --max-time 5 "${BASE_URL}/setup" 2>/dev/null)
 	local init_status
-	init_status=$(echo "$setup_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('initialized',''))" 2>/dev/null | tr 'A-Z' 'a-z')
+	init_status=$(echo "$setup_resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('initialized',''))" 2>/dev/null)
 
 	if [ "$init_status" = "false" ] || [ -z "$init_status" ]; then
 		log_summary "  系统未初始化，执行首次设置..."
-		if do_curl "POST" "/setup" 200 \
+		do_curl "POST" "/setup" 200 \
 			"{\"username\":\"${USERNAME}\",\"password\":\"${PASSWORD}\",\"llm_api_url\":\"\",\"llm_api_key\":\"\"}" \
-			"首次设置管理员账户"; then
-			TOKEN=$(cat "$TMP_RES" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+			"首次设置管理员账户"
+
+		if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
+			TOKEN=$(echo "$resp_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
 			log_summary "  首次设置完成，Token 已获取"
 		else
 			log_blocker "首次设置失败，无法继续"
@@ -610,9 +612,7 @@ while true; do
 	# 检查是否到交易结束 (15:30 后不再频繁请求)
 	current_hour=$(date '+%H' 2>/dev/null)
 	current_hour=${current_hour:-12}
-	if [ -n "${QUANT_UAT_NOSLEEP:-}" ]; then
-		sleep "$POLL_INTERVAL"
-	elif [ "$current_hour" -ge 15 ] 2>/dev/null && [ "$current_hour" -lt 18 ] 2>/dev/null; then
+	if [ "$current_hour" -ge 15 ] 2>/dev/null && [ "$current_hour" -lt 18 ] 2>/dev/null; then
 		log_summary "盘后时段，延长间隔至 120 秒"
 		sleep 120
 	elif [ "$current_hour" -ge 18 ] 2>/dev/null || [ "$current_hour" -lt 9 ] 2>/dev/null; then

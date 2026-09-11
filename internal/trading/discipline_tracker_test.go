@@ -13,13 +13,12 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
-func trackerInput(positions []store.RealPosition, quotes map[string]*data.StockInfo, scores map[string]combat_agent.StockScores, bears map[string]combat_agent.BearHitInfo) AdviceInput {
+func trackerInput(positions []store.RealPosition, quotes map[string]*data.StockInfo, scores map[string]combat_agent.StockScores, bears map[string]string) AdviceInput {
 	return AdviceInput{
-		Positions: positions,
-		Quotes:    quotes,
-		Scores:    scores,
-		BearHits:  bears,
-		BearNews:  config.DefaultBearNewsConfig(),
+		Positions:   positions,
+		Quotes:      quotes,
+		Scores:      scores,
+		BearReasons: bears,
 	}
 }
 

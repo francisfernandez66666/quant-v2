@@ -5,7 +5,6 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Table, Dialog, Tag, Button, Select, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
-import { prioritizeBearishNews } from '../utils.js'
 
 // ── 工具函数 ──
 // 截断异动原因为简短描述
@@ -359,13 +358,8 @@ export default function Hotspot() {
       </span>
     ) },
   ]
-  // 将资讯列表转成表格行数据（§NEWS_BEAR 展示保底：利空置顶，其余保持相对顺序——
-  // 利空承载持仓风险提示的关键证据，置于列表顶部便于优先看到与点击；排序逻辑见
-  // src/utils.js#prioritizeBearishNews）。
-  // English: §NEWS_BEAR display guarantee — bearish news sorts to the top of the news table (others
-  // keep relative order), since bearish items are the key evidence behind holding-risk alerts.
-  const newsData = prioritizeBearishNews(newsItems)
-    .map((n, i) => ({ id: 'n' + i, time: fmtNewsTime(n.datetime), title: n.title, tags: newsTags(n), sectors: n.sectors, stocks: n.stocks }))
+  // 将资讯列表转成表格行数据（格式化时间并解析情绪/方向/影响标签、板块、个股）
+  const newsData = newsItems.map((n, i) => ({ id: 'n' + i, time: fmtNewsTime(n.datetime), title: n.title, tags: newsTags(n), sectors: n.sectors, stocks: n.stocks }))
 
   return (
     <div className="page">

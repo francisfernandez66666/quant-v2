@@ -62,8 +62,7 @@ type AdviceInput struct {
 	D1Scores     map[string]combat_agent.D1Score             // D1 评分（卖点评估）
 	ShortEnabled bool                                        // 是否做空模式（卖点评估范围）
 	EmotionPhase string                                      // 情绪阶段（退潮/背离 → 减仓）
-	BearHits     map[string]combat_agent.BearHitInfo         // §NEWS_BEAR 利空命中情报（code → 命中级别/新闻强度/归因）
-	BearNews     config.BearNewsConfig                       // §NEWS_BEAR 利空分级决策配置（清仓/减仓/观望）
+	BearReasons  map[string]string                           // 利空归因（code → 原因）
 	Cfg          config.QMTConfig                            // QMT 配置（加仓/格局阈值）
 	// DiscTracker 统一纪律裁决引擎（探针+扳机）状态机（§统一纪律 B）。nil = 未启用纪律裁决
 	//（旧行为：走 CheckPositionAlerts 即时止盈止损）。由 engine 按账号注入。
@@ -119,8 +118,8 @@ func Advise(in AdviceInput) []PositionAdvice {
 		for _, sig := range in.Agent.EmotionRetreatAlerts(view, in.Quotes, in.EmotionPhase, now) {
 			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
 		}
-		// 5. 卖出侧：利空归因 → 分级清仓/减仓/观望（§NEWS_BEAR，DecideBearSell 产出）
-		for _, sig := range in.Agent.BearishAttributionAlerts(view, in.Quotes, in.BearHits, in.BearNews, now) {
+		// 5. 卖出侧：利空归因 → 尽快抛掉
+		for _, sig := range in.Agent.BearishAttributionAlerts(view, in.Quotes, in.BearReasons, now) {
 			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
 		}
 	}
@@ -299,26 +298,12 @@ func fromSignal(sig combat_agent.Signal, in AdviceInput, now time.Time, _ string
 		if pa.ProfitPct < 0 {
 			pa.Action, pa.Level = "止损", "中"
 		}
-	case "利空清仓":
-		// §NEWS_BEAR 利空分级·清仓档：止损级（自动卖出保护性无条件执行），来源标 news_bear。
-		pa.Action, pa.Level = "止损", "高"
-		pa.Source = "news_bear"
-	case "利空减仓":
-		// §NEWS_BEAR 利空分级·减仓档：减仓级（autoExecuteRealSells 对 news_bear 来源放行半平）。
-		pa.Action, pa.Level = "减仓", "高"
-		pa.Source = "news_bear"
-	case "利空观望":
-		// §NEWS_BEAR 利空分级·观望档：持有/低，仅提醒不动作（SellAction 空，自动卖出不命中）。
-		pa.Action, pa.Level = "持有", "低"
 	default:
 		pa.Action, pa.Level = "止盈", "中"
-		// 旧 reason 兜底：默认档（非显式分级）里的利空/抛售类理由 → 止损高（FIX#13 兼容）。
-		// 仅在 default 分支生效，避免把已归入"减仓/观望"分级档的建议再抬成止损。
-		// English: legacy fallback, default branch only — bearish/purge reasons map to stop-loss so the
-		// graded 减仓/观望 levels are never re-escalated to stop-loss.
-		if strings.Contains(sig.Reason, "利空") || strings.Contains(sig.Reason, "抛售") {
-			pa.Action, pa.Level = "止损", "高"
-		}
+	}
+	// 利空归因/抛售类理由 → 直接止损（强度最高）
+	if strings.Contains(sig.Reason, "利空") || strings.Contains(sig.Reason, "抛售") {
+		pa.Action, pa.Level = "止损", "高"
 	}
 	return pa
 }

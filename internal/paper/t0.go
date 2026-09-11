@@ -21,10 +21,10 @@ import (
 
 // PositionLayers 单一持仓的层拆分。
 type PositionLayers struct {
-	BaseQty      int     // 底仓数量（昨日及以前买入，可卖）
-	IntradayQty  int     // 机动仓数量（当日低吸，当日不可卖）
-	Sellable     int     // 可卖量（= BaseQty，T+1 语义下当日买入不可卖）
-	TotalQty     int     // 总持仓
+	BaseQty     int     // 底仓数量（昨日及以前买入，可卖）
+	IntradayQty int     // 机动仓数量（当日低吸，当日不可卖）
+	Sellable    int     // 可卖量（= BaseQty，T+1 语义下当日买入不可卖）
+	TotalQty    int     // 总持仓
 	WeightedCost float64 // 摊薄后成本价
 }
 
@@ -111,7 +111,7 @@ func T0Settle(layers PositionLayers, buyQty int, buyPrice, sellPrice float64) (s
 	}
 	perShare := sellPrice - buyPrice
 	spread = perShare * float64(sellQty)
-	improvePerShare := (layers.WeightedCost - buyPrice) / 2        // 摊薄近似（买卖等价量）
+	improvePerShare := (layers.WeightedCost - buyPrice) / 2 // 摊薄近似（买卖等价量）
 	costImprove = improvePerShare * float64(sellQty) * (1 - 0.005) // 印花税/佣金粗扣
 	remain := layers.TotalQty
 	if remain <= 0 {

@@ -180,12 +180,9 @@ func TestEmotionRetreatAlerts(t *testing.T) {
 	}
 }
 
-// TestBearishAttributionAlerts 利空归因持仓分级处理（§NEWS_BEAR，原 E4 升级）：命中利空板块/个股的
-// 做多持仓产分级信号（利空清仓/利空减仓/利空观望）。利空事件强度足以清仓时 default 配置应产出清仓档；
-// 未命中或做空持仓不产。
-// English: TestBearishAttributionAlerts — §NEWS_BEAR graded bearish-attribution handling (E4 upgrade).
-// Long positions hit by bearish sectors/stocks produce graded signals (利空清仓/利空减仓/利空观望).
-// A strong news hit under default config should yield the close level; mismatches and shorts produce none.
+// TestBearishAttributionAlerts 利空归因持仓抛售提醒（E4）：命中利空板块的做多持仓产抛售提醒，
+// 未命中或做空持仓不产；归因说明应带板块名/原因。
+// English: TestBearishAttributionAlerts bearish-attribution position sell alerts (E4): long positions hitting a bearish sector produce sell alerts, non-matching or short positions do not; the attribution text should include the sector name/reason.
 func TestBearishAttributionAlerts(t *testing.T) {
 	a := newTestAgent(t)
 	r := report.New("")
@@ -193,43 +190,28 @@ func TestBearishAttributionAlerts(t *testing.T) {
 	r.LogSignal("long2", "600519", "茅台", "做多", "手动", 100, 20, 5)
 	r.LogSignal("short1", "000001", "平安", "做空", "手动", 8, 20, 5)
 
-	// 仅 600276 命中利空个股（医药集采）+ 实时价格破位放量 → 默认配置下应产出利空清仓档。
-	// English: Only 600276 is hit (pharma Cailian bearish) with the live quote confirming a breakdown —
-	// under factory defaults this should grade to 利空清仓(close).
-	bearHits := map[string]BearHitInfo{
-		"600276": {Code: "600276", HitLevel: BearHitStock, NewsScore: 0.9, Impact: "高", Reason: "医药(集采利空) 事件:医药集采落地"},
+	// 仅 600276 命中利空板块（医药板块利空）
+	// English: Only 600276 matches a bearish sector (pharmaceutical sector bearish).
+	bearReasons := map[string]string{
+		"600276": "医药(集采利空) 事件:医药集采落地",
 	}
-	cfg := config.DefaultBearNewsConfig()
 	alerts := a.BearishAttributionAlerts(r, qs(map[string]float64{
 		"600276": 9, "600519": 100, "000001": 8,
-	}), bearHits, cfg, time.Now())
+	}), bearReasons, time.Now())
 	if len(alerts) != 1 {
-		t.Fatalf("应只对命中利空的做多持仓发 1 条分级信号, got %d", len(alerts))
+		t.Fatalf("应只对命中利空的做多持仓发 1 条抛售提醒, got %d", len(alerts))
 	}
 	sig := alerts[0]
-	if sig.Code != "600276" || sig.AlertType != "利空清仓" || sig.Action != "卖出" {
-		t.Errorf("高分利空+破位应产利空清仓, got %+v", sig)
+	if sig.Code != "600276" || sig.AlertType != "利空抛售" || sig.Action != "卖出" {
+		t.Errorf("抛售提醒字段异常: %+v", sig)
 	}
-	if sig.Reason == "" {
-		t.Errorf("分级信号应含归因说明, reason=%s", sig.Reason)
-	}
-	// SellAction 归一：利空清仓 → close（模拟盘/实盘自动卖出依据）
-	if SellAction(Signal{AlertType: sig.AlertType}) != "close" {
-		t.Errorf("利空清仓 SellAction 应归一为 close")
+	if sig.Reason == "" || !containsStr(sig.Reason, "集采") || !containsStr(sig.Reason, "尽快抛售") {
+		t.Errorf("抛售提醒应含归因说明, reason=%s", sig.Reason)
 	}
 
-	// 空 bearHits → 无信号
-	// English: Empty bearHits → no alerts.
-	if a := a.BearishAttributionAlerts(r, qs(map[string]float64{"600276": 9}), nil, cfg, time.Now()); len(a) != 0 {
-		t.Errorf("空归因不应发信号, got %d", len(a))
-	}
-
-	// 有多档信号时确认 trim/watch 的 SellAction 归一（不动用真实信号构造，覆盖词汇表）。
-	// English: covers the SellAction vocabulary for the graded levels.
-	if SellAction(Signal{AlertType: "利空减仓"}) != "trim" {
-		t.Errorf("利空减仓 SellAction 应归一为 trim")
-	}
-	if SellAction(Signal{AlertType: "利空观望"}) != "" {
-		t.Errorf("利空观望 SellAction 应归一为空(只提醒)")
+	// 空 bearReasons → 无提醒
+	// English: Empty bearReasons → no alerts.
+	if a := a.BearishAttributionAlerts(r, qs(map[string]float64{"600276": 9}), nil, time.Now()); len(a) != 0 {
+		t.Errorf("空归因不应发提醒, got %d", len(a))
 	}
 }

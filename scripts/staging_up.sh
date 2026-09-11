@@ -58,7 +58,7 @@ if [ "$RECORD" = "1" ]; then
   EXTRA="QUANT_RECORD_STREAM=1"
 fi
 
-echo "[staging] 启动影子引擎 (端口 $PORT, dataDir=$STAGING_DIR)"
+echo "[staging] 启动影子引擎（端口 $PORT, dataDir=$STAGING_DIR）"
 # 后台运行，日志落 staging 数据目录
 env QUANT_ENV=staging QUANT_DATA_DIR="$STAGING_DIR" $EXTRA \
   "$BIN" -listen ":$PORT" >> "$STAGING_DIR/staging.log" 2>&1 &

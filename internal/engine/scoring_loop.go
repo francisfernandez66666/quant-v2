@@ -115,7 +115,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	e.mu.RLock()
 	emotionPhase := e.lastEmotionPhase // 复用主循环算出的情绪阶段，不重复调涨停池接口
 	d1Scores := e.lastD1Scores         // 复用主循环最近一轮 D1 评分，不每 5s 调 LLM
-	bearHits := e.lastBearHits         // §NEWS_BEAR 复用主循环利空命中情报（实盘建议分级清仓/减仓/观望）
+	bearReasons := e.lastBearReasons   // FIX#13 复用主循环利空归因（实盘建议利空→自动清仓）
 	e.mu.RUnlock()
 	if f == nil {
 		return
@@ -260,7 +260,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// English: live position advice (AUTO_TRADING_PLAN M1) — when qmt.enabled, generates 加仓/减仓/止盈/
 	// 止损/格局 advice for the real book (real_positions) and pushes it to the frontend live tab via SSE.
 	// Trading-hours only; no cost when disabled or no holdings. Never touches the paper book.
-	e.pushRealAdvice(md, scores, d1Scores, emotionPhase, quotes, bearHits)
+	e.pushRealAdvice(md, scores, d1Scores, emotionPhase, quotes, bearReasons)
 
 	// 开市(9:30)前及午休(11:30-13:00)只更新评分数字，不发布任何战法信号：
 	// 盘前无实盘成交量，双响炮/龙头等易基于存量历史数据误报（如整池双响炮全 70、9:11 龙头）；
@@ -597,7 +597,7 @@ func filterTransitionSignals(sigs []combat_agent.Signal, prev map[string]map[str
 // runs trading.Advise (sell-side reuse + add/hold rules), and pushes the advice to the frontend live tab
 // via SSE. Circuit-breaker health probing is also throttled here (gateway loss pauses orders and alerts).
 // Trading-hours only (after-hours skips to save memory).
-func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, scores map[string]combat_agent.StockScores, d1Scores map[string]combat_agent.D1Score, emotionPhase string, quotes map[string]*data.StockInfo, bearHits map[string]combat_agent.BearHitInfo) {
+func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, scores map[string]combat_agent.StockScores, d1Scores map[string]combat_agent.D1Score, emotionPhase string, quotes map[string]*data.StockInfo, bearReasons map[string]string) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
 	realStore := e.realStore
@@ -685,8 +685,7 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		D1Scores:     d1Scores,
 		ShortEnabled: e.ShortEnabled(),
 		EmotionPhase: emotionPhase,
-		BearHits:     bearHits,        // §NEWS_BEAR 实盘持仓命中利空 → 分级止损/减仓建议（清仓/减仓自动执行，观望仅提醒）
-		BearNews:     e.bearNewsCfg(), // §NEWS_BEAR 利空分级决策配置
+		BearReasons:  bearReasons, // FIX#13 利空归因接线：实盘持仓命中利空 → 止损级建议 → 自动清仓
 		Cfg:          ctrl.Config(),
 		DiscTracker:  dt, // 统一纪律裁决（探针+扳机）
 	})
@@ -865,11 +864,7 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 			}
 			class = "止盈"
 		case "减仓":
-			// §NEWS_BEAR：利空减仓（Source=news_bear）与统一纪律减仓（discipline）都自动半平；
-			// 战法自带减仓仍仅通知。
-			// English: §NEWS_BEAR — bearish-news trims (news_bear) and discipline trims both auto-execute
-			// at half size; strategy-native trims stay notification-only.
-			if a.Source != "discipline" && a.Source != "news_bear" {
+			if a.Source != "discipline" {
 				continue
 			}
 			class = "减仓"

@@ -15,12 +15,12 @@ import "math"
 // AuctionStrength 竞价强度分四维分解，供看板/日志展示合成过程。
 // English: four-dimensional breakdown of the auction strength score (for board/log display).
 type AuctionStrength struct {
-	VolumeRatio    float64 `json:"volume_ratio"`    // 竞价量比（抢筹意愿）
-	OpenPct        float64 `json:"open_pct"`        // 高开幅度 %
-	UnmatchedRatio float64 `json:"unmatched_ratio"` // 未匹配量/竞价成交量 占比
-	TurnoverPct    float64 `json:"turnover_pct"`    // 竞价换手 %
-	Strength       float64 `json:"strength"`        // 合成强度分 [0,10]
-	Phase          string  `json:"phase,omitempty"` // live / final
+	VolumeRatio     float64 `json:"volume_ratio"`     // 竞价量比（抢筹意愿）
+	OpenPct         float64 `json:"open_pct"`         // 高开幅度 %
+	UnmatchedRatio  float64 `json:"unmatched_ratio"`  // 未匹配量/竞价成交量 占比
+	TurnoverPct     float64 `json:"turnover_pct"`     // 竞价换手 %
+	Strength        float64 `json:"strength"`         // 合成强度分 [0,10]
+	Phase           string  `json:"phase,omitempty"`  // live / final
 }
 
 // cap 限幅辅助。
@@ -36,12 +36,10 @@ func capn(v, lo, hi float64) float64 {
 
 // AuctionStrengthScore 竞价强度分合成：四维归一加权输出 [0,10]。
 // 各项物理含义与归一区间（按 A 股竞价经验值校准）：
-//
-//	量比           已按倍率给出（0~20），加权 0.35；
-//	高开幅度       -10%~+10% 线性映射到 [0,1]（高开=正项，低开=负项），加权 0.30；
-//	未匹配占比     未匹配/成交量，0~3 归一（未匹配大=抛压大或抢筹未完，双向项），加权 0.20；
-//	竞价换手率     0~2% 归一，加权 0.15。
-//
+//   量比           已按倍率给出（0~20），加权 0.35；
+//   高开幅度       -10%~+10% 线性映射到 [0,1]（高开=正项，低开=负项），加权 0.30；
+//   未匹配占比     未匹配/成交量，0~3 归一（未匹配大=抛压大或抢筹未完，双向项），加权 0.20；
+//   竞价换手率     0~2% 归一，加权 0.15。
 // 输出用 10 分制，便于与既有打分体系对齐。
 // English: synthesizes an auction strength score [0,10] from four normalized dimensions:
 // volume ratio (width 0.35), open gap percent mapped -10%~+10% -> [0,1] (0.30), unmatched
