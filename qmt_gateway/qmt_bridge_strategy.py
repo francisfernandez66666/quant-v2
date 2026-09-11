@@ -319,6 +319,9 @@ class _XtOps:
 import time  # noqa: E402  (canonical adapter needs time for connect sleep / order polling)
 
 
+XT = _XtAdapter_holder = None
+
+
 def _read_cfg():
     """cfg multi-encoding fallback: utf-8-sig / utf-8 / gbk (ops tooling rewrites vary)."""
     import json
