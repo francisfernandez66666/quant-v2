@@ -160,6 +160,14 @@ func (d *DB) migrate() error {
 			score_from REAL, score_to REAL, score_step REAL,
 			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 		)`,
+		// §回测自动增强 A0：回测引擎增强配置单行 JSON 载体（无记录=不启用=旧行为；
+		// 类型与校验归 config 包，store 只存原文，见 backtest_settings.go）。
+		// English: single-row JSON settings for the backtest enhancement (absent = disabled).
+		`CREATE TABLE IF NOT EXISTS backtest_settings (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			config_json TEXT NOT NULL,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+		)`,
 		// 同花顺（新）日K（§HITHINK_DATA_SOURCE_PLAN）：主源回测行情，与旧 daily 物理分离。
 		`CREATE TABLE IF NOT EXISTS ths_daily (
 			ts_code TEXT NOT NULL,

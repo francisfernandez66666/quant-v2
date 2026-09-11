@@ -1519,9 +1519,23 @@ export async function saveSweepPool(cfg) {
 }
 
 /** §P2-f 审批一条寻优排名：规则级参数覆盖写 applied_*.json + 热重载实盘生效
- *  对应后端 POST /api/research/optimizations/{id}/approve */
-export async function approveOptimization(id) {
-  return request('/api/research/optimizations/' + id + '/approve', { method: 'POST' })
+ *  对应后端 POST /api/research/optimizations/{id}/approve
+ *  §回测自动增强 D：可选 params（Pareto 推荐解四维参数）覆盖冠军行参数 */
+export async function approveOptimization(id, params) {
+  const data = params ? { params } : undefined
+  return request('/api/research/optimizations/' + id + '/approve', { method: 'POST', data })
+}
+
+/** §回测自动增强 D 读取回测增强配置（GET /api/research/backtest-config）
+ *  返回 { config: BacktestConfig, enabled: bool } */
+export async function fetchBacktestConfig() {
+  return request('/api/research/backtest-config')
+}
+
+/** §回测自动增强 D 保存回测增强配置（PUT /api/research/backtest-config，服务端校验越界 400）
+ *  body 为完整 BacktestConfig 对象 */
+export async function saveBacktestConfig(cfg) {
+  return request('/api/research/backtest-config', { method: 'PUT', data: cfg })
 }
 
 /** §P2-f 淘汰一条寻优排名

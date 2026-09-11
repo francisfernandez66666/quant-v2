@@ -384,6 +384,11 @@ func (s *Server) enqueueBacktestTask(taskType string, refID int64, payload map[s
 	if s.researchDB == nil {
 		return 0, nil, fmt.Errorf("研究库未接入")
 	}
+	// §回测自动增强 A0：战法回放/寻优任务统一在此注入 backtest 配置（enabled 才注入），
+	// 让回放与寻优口径同步升级；无记录/停用 = 不注入 = 旧行为。
+	if taskType == store.TaskBacktestStrategy {
+		s.injectBacktestPayload(payload)
+	}
 	// 同 ref 幂等：已有排队/运行中任务则直接返回现态，不重复入队。
 	has, err := s.researchDB.HasActiveTaskByRef(taskType, refID)
 	if err != nil {

@@ -436,6 +436,15 @@ type Options struct {
 	// when set, run on the universe listed-and-not-yet-delisted at the backtest start (drops survivorship
 	// bias); requires dataload loaded with --with-delisted.
 	PointInTime bool
+	// Backtest §回测自动增强 A0：动态滑点/流动性约束/Pareto 寻优配置（payload.backtest 注入）。
+	// nil 或 Enabled=false = 行为与增强前完全一致（固定 5bp、无流动性门控、无 Pareto 段）。
+	// English: backtest enhancement config injected via task payload; nil/disabled keeps the
+	// legacy fixed-5bp behavior byte-for-byte.
+	Backtest *config.BacktestConfig
+
+	// slip 运行期滑点上下文（Run/runSweep 每战法装配一次，非配置项；nil=旧行为）。
+	// English: runtime slippage context assembled per strategy during a run (not a config field).
+	slip *slipCtx
 }
 
 // DefaultDB 研究库默认路径：QUANT_DATA_DIR 优先，否则 ~/.quant-trading-v2/trading.db
@@ -844,7 +853,15 @@ func (o *Options) Run() error {
 	// 否则整轮回放只有结尾汇总、进度条全程空窗。
 	// English: emit "回测进度 x%" every 10% of the stock loop so the queue worker can feed the bar.
 	summaries := make([]*summary, 0, len(ads))
+	amountFixed := 0 // Risk-1 千元口径归一的股票计数（收尾日志）
 	for _, ad := range ads {
+		// §回测自动增强：每战法装配一次动态滑点上下文（含 paper_trades 校准合并；
+		// 增强关闭 = nil = 全部旧行为）。
+		kind := ""
+		if kp, ok := ad.(kindProvider); ok {
+			kind = kp.Kind()
+		}
+		o.slip, _ = o.buildSlipCtx(db, ad.Name(), kind)
 		var trades []trade
 		lastPct := -10
 		for ci2, tsCode := range codes {
@@ -863,6 +880,10 @@ func (o *Options) Run() error {
 				continue
 			}
 			klines := toDataKLine(bars)
+			// §Risk-1 单位自校：tushare 口径库 amount=千元，均价带判定后归一（仅增强模式）
+			if o.slip != nil && fixAmountScale(klines) {
+				amountFixed++
+			}
 			trades = append(trades, o.backtestStock(code, klines, ad, industryChg[code])...)
 			// §节流：每处理完一只股票 sleep 指定毫秒，把全量回放对服务器的瞬时 CPU/内存
 			// 挤压摊平到盘后十几个小时——2 核 4G 机器上全池回放曾把可用内存打到熔断线。
@@ -879,6 +900,9 @@ func (o *Options) Run() error {
 			sm.Name = ad.Name()
 		}
 		summaries = append(summaries, sm)
+	}
+	if amountFixed > 0 {
+		log.Printf("Risk-1 单位自校：%d 只股票 amount 按千元口径归一（×1000）", amountFixed)
 	}
 	printReports(summaries, len(codes))
 	return nil
@@ -898,6 +922,10 @@ func toDataKLine(bars []store.Bar) []data.KLine {
 }
 
 // backtestStock 对单只股票回放指定战法：逐日判定触发，触发后次日开盘入场并逐日模拟平仓。
+// o.slip 非空 = 回测增强模式：入场一字板判定升级为 封死跳过/打开加滑点，
+// 滑点按流动性/名义额逐笔定档，出场 walk 集成跌停封死不可卖与部分成交（模块 A/B）。
+// English: per-stock replay. When slip context is set, entry gating upgrades to sealed/openable
+// distinction, slippage is resolved per trade, and the exit walk honors limit-down sealing + partial fills.
 func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, industryChgByDate map[string]float64) []trade {
 	var trades []trade
 	// n_shape：预计算整条日线 MACD 序列（一次性，避免逐日重复 O(n²)）
@@ -928,13 +956,22 @@ func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, in
 		if entry <= 0 {
 			continue
 		}
-		// §GAP4.2 开盘即封板不可成交：一字板/秒板买单现实中排队无望，跳过该笔
-		// （打板类战法此前默认必成交，产生系统性乐观偏差）。
-		if costOpenAtLimitUp(code, klines[i].Close, entry) {
+		// 入场滑点/成交比例定档：旧路径 = 固定 5bp + 开盘一字板不可成交（§GAP4.2）；
+		// 增强路径 = 动态滑点 + 涨停打开可成交加罚分（一字封死仍不可成交）+ 部分成交比例。
+		buySlip, sellSlip, fill := costSlippageBps, costSlippageBps, 1.0
+		if o.slip != nil {
+			var can bool
+			buySlip, sellSlip, fill, can = o.slip.entrySlip(code, klines, i)
+			if !can {
+				continue
+			}
+		} else if costOpenAtLimitUp(code, klines[i].Close, entry) {
+			// §GAP4.2 开盘即封板不可成交：一字板/秒板买单现实中排队无望，跳过该笔
+			// （打板类战法此前默认必成交，产生系统性乐观偏差）。
 			continue
 		}
 		// 逐日平仓模拟：从入场次日（i+2）起跑 CheckExit
-		t := o.simulateExit(code, klines, i+1, entry, meta, ad)
+		t := o.simulateExit(code, klines, i+1, entry, meta, ad, buySlip, sellSlip, fill)
 		if t != nil {
 			trades = append(trades, *t)
 			// 入场后跳到该笔交易结束（平仓日）之后，避免同一标的在同一时段重复入场
@@ -945,11 +982,30 @@ func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, in
 }
 
 // simulateExit 从入场日 index 起逐日跑 CheckExit，返回平仓结果；到序列末尾仍未平仓则按末日收盘强制结算。
-func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, entry float64, meta map[string]float64, ad adapter) *trade {
+// buySlip/sellSlip/fill 为该笔入场日定档的动态滑点（bp）与成交比例（旧路径恒 5/5/1）。
+// 跌停封死门控（模块 B，o.slip 开启时）：封死日不可卖出、跳过出场判定；打开日以当日
+// 收盘卖出并追加 LimitDownSealedExtraBps 滑点。部分成交口径：pnl × fillRate
+// （未成交部分留现金属零收益，B.5-5 近似）。
+// English: daily exit walk with per-trade dynamic slippage; honors limit-down sealing
+// (no sell while sealed, extra slippage on the opening day) and partial fills.
+func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, entry float64, meta map[string]float64,
+	ad adapter, buySlip, sellSlip, fill float64) *trade {
+	sealedExtra := o.slip.sellSealedExtra() // 0 = 跌停封死门控未启用
+	wasSealed := false                      // 上一日是否封死（打开日加罚卖出滑点）
 	for j := entryIdx + 1; j < len(klines); j++ {
 		cur := klines[j].Close
 		if cur <= 0 {
 			continue
+		}
+		// 跌停封死判定：封死日不可卖出（强制持有），记录状态待打开日加罚
+		if sealedExtra > 0 && costLimitDownSealedDay(code, klines[j-1].Close, klines[j].Low, cur) {
+			wasSealed = true
+			continue
+		}
+		slipSell := sellSlip
+		if wasSealed {
+			slipSell += sealedExtra
+			wasSealed = false
 		}
 		// 用回测当天日期作为 Now（避免 time.Since 用真实时间导致历史入场立即判"调整超期"）
 		now := klines[j].Date
@@ -967,12 +1023,13 @@ func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, e
 			return &trade{
 				Strategy: ad.Name(), Code: code, Date: klines[entryIdx].Date.Format("20060102"),
 				HoldDays: j - entryIdx, Entry: entry, Exit: cur,
-				// §GAP4.1 净额口径：双边滑点+双边佣金+卖出印花税一次性计入收益率
-				PnlPct: costRoundTripPnl(entry, cur), Reason: res.Reason,
+				// §GAP4.1 净额口径：双边滑点+双边佣金+卖出印花税一次性计入收益率；
+				// 增强路径下滑点逐笔定档、盈亏按成交比例折算（近似，B.5-5）。
+				PnlPct: costRoundTripPnlEx(entry, cur, buySlip, slipSell) * fill, Reason: res.Reason,
 			}
 		}
 	}
-	// 未平仓：按末日收盘强制结算
+	// 未平仓：按末日收盘强制结算（即使末日仍封死——文档口径：持有到末日按末日收盘结算）
 	last := klines[len(klines)-1].Close
 	if last <= 0 {
 		return nil
@@ -980,8 +1037,17 @@ func (o *Options) simulateExit(code string, klines []data.KLine, entryIdx int, e
 	return &trade{
 		Strategy: ad.Name(), Code: code, Date: klines[entryIdx].Date.Format("20060102"),
 		HoldDays: len(klines) - 1 - entryIdx, Entry: entry, Exit: last,
-		PnlPct: costRoundTripPnl(entry, last), Reason: "区间结束强制结算",
+		PnlPct: costRoundTripPnlEx(entry, last, buySlip, sellSlip+sealedExtra*boolF(wasSealed)) * fill,
+		Reason: "区间结束强制结算",
 	}
+}
+
+// boolF 布尔转 0/1 系数（封死状态参与加罚计算的可读写法）。
+func boolF(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ── 汇总与输出 ──

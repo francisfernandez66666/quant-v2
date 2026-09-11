@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/btreplay"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/store"
 )
 
@@ -97,6 +98,9 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 			// English: per-stock throttle (ms) to flatten instantaneous load during full replays.
 			ThrottleMs: payloadIntDef(p, "throttle_ms", 0),
 		}
+		// §回测自动增强 A0：payload.backtest → Options.Backtest（入队端只在 enabled 时注入；
+		// 缺字段/解析失败 = nil = 增强前旧行为，向后兼容）。
+		o.Backtest = payloadBacktest(p)
 		// §质控：payload quality=true（夜间 library_replay 全量回放默认开启）时以质控池
 		// （剔 ST/退市/多年亏损/地量股）替代全量 StockCodes()，再叠加 maxstocks 截断。
 		// English: payload quality=true builds the universe from the quality screen instead of all
@@ -151,6 +155,26 @@ func payloadArgs(p map[string]any, keys ...string) []string {
 		}
 	}
 	return out
+}
+
+// payloadBacktest §回测自动增强 A0：反序列化 payload.backtest → *config.BacktestConfig。
+// 缺失/类型错/解析失败/enabled=false 一律返回 nil（=引擎旧行为，前向兼容）；
+// 旧 research 二进制遇到 payload 中的未知字段会自动忽略（发布时序无要求）。
+// English: decodes payload.backtest into the engine option; any failure or disabled = nil = legacy.
+func payloadBacktest(p map[string]any) *config.BacktestConfig {
+	v, ok := p["backtest"]
+	if !ok || v == nil {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var cfg config.BacktestConfig
+	if json.Unmarshal(b, &cfg) != nil || !cfg.Enabled {
+		return nil
+	}
+	return &cfg
 }
 
 // payloadStr 取字符串参数：缺失或空串回退默认值。

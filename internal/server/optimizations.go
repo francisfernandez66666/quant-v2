@@ -107,6 +107,18 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	p := row.Params
+	// §回测自动增强 D：可选 body {params:{...}} 用 Pareto 推荐解参数覆盖冠军行参数——
+	// 前端「应用推荐解」直接提交 grid_json.pareto.recommended.params，落库行与审计仍走本 id。
+	if r.Body != nil {
+		var body struct {
+			Params *store.SweepParams `json:"params"`
+		}
+		if derr := json.NewDecoder(r.Body).Decode(&body); derr == nil && body.Params != nil {
+			if body.Params.TakeProfitPct > 0 || body.Params.HoldDays > 0 {
+				p = *body.Params
+			}
+		}
+	}
 	if row.StrategyKind == "" {
 		// §内置战法一键应用：四内置均写统一出场旋钮（trailing_drawback_pct/max_hold_days）
 		if err := s.applyBuiltinOptParams(row); err != nil {

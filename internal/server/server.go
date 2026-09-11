@@ -622,6 +622,10 @@ func (s *Server) registerRoutes() {
 	// §D1 各战法独立寻优参数池：列表 + 保存（审批权限，服务端组合数护栏校验）
 	s.mux.HandleFunc("GET /api/research/sweep-pools", s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolList))
 	s.mux.HandleFunc("PUT /api/research/sweep-pools", s.permMiddleware(auth.PermResearchApprove, s.handleSweepPoolUpsert))
+	// §回测自动增强 A0：回测引擎增强配置（研究库 backtest_settings 单行 JSON，入队注入 payload）
+	// English: backtest enhancement settings endpoints (single-row JSON store, payload injection on enqueue).
+	s.mux.HandleFunc("GET /api/research/backtest-config", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestConfigGet))
+	s.mux.HandleFunc("PUT /api/research/backtest-config", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestConfigPut))
 	s.mux.HandleFunc("GET /api/research/optimizations", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationList))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/approve", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationApprove))
 	s.mux.HandleFunc("POST /api/research/optimizations/{id}/reject", s.permMiddleware(auth.PermResearchApprove, s.handleOptimizationReject))

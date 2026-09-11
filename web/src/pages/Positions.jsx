@@ -547,7 +547,7 @@ export default function Positions() {
     // 分时图展开按钮列
     { colKey: 'kline', title: '分时', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{klineOpen.has(row.code) ? '收起' : '分时'}</Button> },
 
-    {/* 操作列：加减仓/改成本/明细/编辑/清仓 */}
+    // 操作列：加减仓/改成本/明细/编辑/清仓
     { colKey: 'actions', title: '操作', width: 230, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center', flexWrap: 'wrap' }}>
         <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openAddLot(row) }}>加减仓</Button>
@@ -569,7 +569,7 @@ export default function Positions() {
     { colKey: 'pnl', title: '持仓盈亏', width: 90, cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
     { colKey: 'highest_price', title: '最高价', width: 90, cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
     { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: '#e7e7e7' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
-    {/* 实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用） */}
+    //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用） 
     { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
         <Button size="small" variant="outline" theme="primary" disabled={realTripped} onClick={(e) => { e.stopPropagation(); openRealAction(row, 'add') }}>加仓</Button>
@@ -616,7 +616,7 @@ export default function Positions() {
         <Tabs.TabPanel value="paper" label="纸面持仓">
           {/* 有持仓时渲染表格，无持仓时显示空态引导 */}
           {holdings.length > 0 ? (
-            {/* 持仓表格：支持展开分时图、行点击打开操作面板 */}
+            // 持仓表格：支持展开分时图、行点击打开操作面板
             <Card>
               {/* 持仓表格：数据绑定/列定义/行展开分时图 */}
               <Table
@@ -628,14 +628,14 @@ export default function Positions() {
                 expandOnRowClick={false}
                 expandedRowKeys={Array.from(klineOpen)}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
-                {/* 行展开渲染分时图 */}
+                //  行展开渲染分时图 
                 expandedRow={({ row }) => (
                   <MinuteView code={row.code} name={row.name} />
                 )}
               />
             </Card>
           ) : (
-            {/* 无持仓空态：引导用户新增持仓 */}
+            // 无持仓空态：引导用户新增持仓
             <Card>
               <div style={{ padding: 24, textAlign: 'center' }}>
                 <p className="muted">暂无持仓</p>

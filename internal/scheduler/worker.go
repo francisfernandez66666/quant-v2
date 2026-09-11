@@ -210,6 +210,12 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 	// Now all strategies' results are collected into one slice and saved in a single call.
 	var allResults []map[string]any
 	objective := ""
+	// §回测增强实施发现：grid_json 回写必须在 SaveOptimizationResults（DELETE+INSERT 重建）
+	// 之后执行——此前在解析循环内即写，行被重建后 grid_json 归零（多战法版本引入的时序回归）。
+	// 现把各战法 extra 收拢到 map，循环结束、排名落库成功后统一回写。
+	// English: grid_json updates must run AFTER the delete+insert rebuild; collected per strategy
+	// and applied once the rankings are saved.
+	gridExtras := map[string]string{} // strategy → grid_json 载荷
 	// 遍历输出中所有 SWEEP_JSON 行（每战法一条，聚合后整批落库）
 	for _, line := range lines {
 		m := sweepJSONRe.FindStringSubmatch(line)
@@ -226,6 +232,9 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 			Batches   []map[string]any `json:"batches"`
 			Grid      []map[string]any `json:"grid"`
 			Results   []map[string]any `json:"results"`
+			// §回测自动增强 C：顶层新键必须在此声明，否则 json 解析静默丢弃（D 轮前端消费源）
+			Pareto        json.RawMessage `json:"pareto"`
+			SlippageCalib json.RawMessage `json:"slippage_calib"`
 		}
 		if err := json.Unmarshal([]byte(m[1]), &payload); err != nil {
 			log.Printf("[scheduler] 任务 #%d SWEEP_JSON 解析失败: %v", taskID, err)
@@ -236,12 +245,19 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 		}
 		allResults = append(allResults, payload.Results...)
 		// §D2 冠军行附带信息（热力网格 + 批次冠军明细）回写 grid_json，前端详情渲染源
-		if len(payload.Grid) > 0 || len(payload.Batches) > 0 {
-			if extra, jerr := json.Marshal(map[string]any{
-				"grid": payload.Grid, "batches": payload.Batches,
-			}); jerr == nil && len(payload.Results) > 0 {
+		// §回测自动增强 C：pareto / slippage_calib 段捎带进同一 grid_json 容器（零 schema 迁移）；
+		// 旧任务无这些键 → omitempty 不落 null，前端按缺键降级为 champion 展示。
+		if len(payload.Grid) > 0 || len(payload.Batches) > 0 || len(payload.Pareto) > 0 || len(payload.SlippageCalib) > 0 {
+			extraMap := map[string]any{"grid": payload.Grid, "batches": payload.Batches}
+			if len(payload.Pareto) > 0 {
+				extraMap["pareto"] = payload.Pareto
+			}
+			if len(payload.SlippageCalib) > 0 {
+				extraMap["slippage_calib"] = payload.SlippageCalib
+			}
+			if extra, jerr := json.Marshal(extraMap); jerr == nil && len(payload.Results) > 0 {
 				strategy, _ := payload.Results[0]["strategy"].(string)
-				_ = db.UpdateOptimizationGrid(taskID, strategy, string(extra))
+				gridExtras[strategy] = string(extra)
 			}
 		}
 		log.Printf("[scheduler] 任务 #%d 扫参排名收拢：%s %d 条（目标 %s）",
@@ -252,9 +268,46 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 			log.Printf("[scheduler] 任务 #%d 扫参排名聚合落库失败: %v", taskID, err)
 		} else {
 			log.Printf("[scheduler] 任务 #%d 扫参排名聚合落库成功: 全部 %d 条（目标 %s）", taskID, len(allResults), objective)
+			// 排名行已就位，回写各战法冠军行的 grid_json（热力网格 + pareto + 校准简报）
+			for strategy, extra := range gridExtras {
+				if err := db.UpdateOptimizationGrid(taskID, strategy, extra); err != nil {
+					log.Printf("[scheduler] 任务 #%d grid_json 回写失败 %s: %v", taskID, strategy, err)
+				}
+			}
 		}
 	}
 	log.Printf("[scheduler] 任务 #%d saveSweepResults 完成: 匹配 %d 条 SWEEP_JSON", taskID, matched)
+}
+
+// injectBacktestPayload §回测自动增强 A0：夜间链 payload 注入回测增强配置（单行 JSON 表，
+// enabled 才注入；无记录/解析失败/停用 = 原样返回 = 引擎旧行为）。
+// 名义额在此解析为显式数值——btreplay 子进程固定出厂默认配置、读不到用户
+// rules.paper.fixed_amount（管线断链结论），只能在持有真实 config.json 的调度端解析。
+// English: injects the backtest enhancement config into a nightly-chain payload (only when
+// enabled), resolving order_value_yuan from the live config the engine subprocess cannot read.
+func (s *Scheduler) injectBacktestPayload(db *store.DB, payload string) string {
+	raw, ok, err := db.GetBacktestSettings()
+	if !ok || err != nil {
+		return payload
+	}
+	var cfg config.BacktestConfig
+	if json.Unmarshal([]byte(raw), &cfg) != nil || !cfg.Enabled {
+		return payload
+	}
+	// 名义额与模拟盘同源：从调度器持有的真实 config.json 解析 paper.fixed_amount
+	if cfg.OrderValueYuan <= 0 {
+		cfg.OrderValueYuan = config.NewManager(s.cfgPath).Get().Paper.FixedAmount
+	}
+	var p map[string]any
+	if json.Unmarshal([]byte(payload), &p) != nil || p == nil {
+		p = map[string]any{}
+	}
+	p["backtest"] = cfg
+	out, jerr := json.Marshal(p)
+	if jerr != nil {
+		return payload
+	}
+	return string(out)
 }
 
 // openStore 懒加载队列库句柄；首次打开执行启动恢复（崩溃遗留 running→preempted 自动续跑）。
@@ -547,6 +600,11 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 	}
 	seq := 0
 	enqueue := func(typ, step, payload string) bool {
+		// §回测自动增强 A0：夜间链战法回放/寻优任务注入 backtest 配置（enabled 才注入，
+		// 无记录=旧行为）——与 server 端 enqueueBacktestTask 同一管线。
+		if typ == store.TaskBacktestStrategy {
+			payload = s.injectBacktestPayload(db, payload)
+		}
 		if _, err := db.EnqueueResearchTask(&store.ResearchTask{
 			Type: typ, Priority: "low", Status: store.TaskQueued,
 			Payload: payload, ChainDay: today, ChainSeq: seq,

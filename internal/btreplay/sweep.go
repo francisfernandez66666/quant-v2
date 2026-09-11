@@ -119,13 +119,18 @@ func scoreQuantiles(scores []float64) []float64 {
 const sweepMaxCacheStocks = 500
 
 // sweepTrigger 预计算的入场事件（与出场参数无关，只算一次）。
+// §回测自动增强 A：滑点/成交比例在触发预算时一次定档（只依赖成交额与名义额、
+// 不依赖出场参数），逐组合模拟零额外开销；旧路径恒为 5/5/1。
 type sweepTrigger struct {
-	ad      int     // adapter 序号
-	code    string  // 股票代码（裸码）
-	sigIdx  int     // 触发信号日下标（次日开盘入场）
-	entry   float64 // 入场价 = 次日开盘
-	score   float64 // 入场评分（-1=该战法无连续分，如形态区间命中）
-	highest float64 // 信号日高点基准（移动止盈起点）
+	ad       int     // adapter 序号
+	code     string  // 股票代码（裸码）
+	sigIdx   int     // 触发信号日下标（次日开盘入场）
+	entry    float64 // 入场价 = 次日开盘
+	score    float64 // 入场评分（-1=该战法无连续分，如形态区间命中）
+	highest  float64 // 信号日高点基准（移动止盈起点）
+	buySlip  float64 // 买入滑点（bp，动态定档；旧路径=5）
+	sellSlip float64 // 卖出滑点（bp，动态定档；旧路径=5）
+	fillR    float64 // 部分成交比例（0~1；旧路径/关闭=1）
 }
 
 // sweepResult 单个组合的单战法汇总。
@@ -181,6 +186,9 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	if len(codes) > sweepMaxStocksLimit(o.MaxStocks) {
 		codes = codes[:sweepMaxStocksLimit(o.MaxStocks)]
 	}
+	// §回测自动增强 A0：生效配置（nil=全部旧行为，输出与基线逐字节一致的回归保证）
+	bt := o.activeBacktest()
+	amountFixed := 0 // Risk-1 千元口径归一的股票计数
 	klines := make(map[string][]data.KLine, len(codes))
 	// §Phase3 ATR 动态止损维：与 K 线同序预计算每只股票 ATR14 序列（网格模拟动态止损复用）
 	// English: Phase-3 ATR dynamic stop — precompute each stock's ATR14 series alongside the bars.
@@ -193,12 +201,21 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		}
 		code := strings.Split(tsCode, ".")[0]
 		k := toDataKLine(bars)
+		// §Risk-1 单位自校：tushare 口径库 amount=千元，均价带判定后归一（仅增强模式）
+		if bt != nil && fixAmountScale(k) {
+			amountFixed++
+		}
 		klines[code] = k
 		hs, ls, cs := make([]float64, len(k)), make([]float64, len(k)), make([]float64, len(k))
 		for i, b := range k {
 			hs[i], ls[i], cs[i] = b.High, b.Low, b.Close
 		}
 		atrs[code] = indicator.ATR14(hs, ls, cs)
+	}
+	if amountFixed > 0 {
+		// §Risk-1：daily 表若由 tushare 装载则 amount=千元（与契约"元"差 1000 倍），
+		// 不归一会让日均成交额被低估、滑点罚档跳最差、回测过保守。
+		log.Printf("Risk-1 单位自校：%d 只股票 amount 按千元口径归一（×1000）", amountFixed)
 	}
 
 	// ── 2) 逐战法独立优化：四维步进网格 → 分批护栏 → 批冠军淘汰赛 → 冠军实盘口径复核 ──
@@ -218,9 +235,13 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		}
 
 		// 2a) 触发预计算（入场与出场参数无关，一次算完全程复用）
+		// §回测自动增强：滑点上下文按战法构建（paper_trades 校准合并基准），
+		// 一字板预筛/逐笔定档在 sweepTriggersOf 内完成。
+		sc, calibBrief := o.buildSlipCtx(db, ad.Name(), kind)
+		o.slip = sc // 冠军复核（simulateCombo→backtestStock）同口径
 		var trigs []sweepTrigger
 		for code, kls := range klines {
-			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code])...)
+			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code], sc)...)
 		}
 		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })
 		log.Printf("触发预算 %s：%d 个入场事件", ad.Name(), len(trigs))
@@ -285,7 +306,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			hasChamp := false
 			for ci := lo; ci < hi; ci++ {
 				cb := combos[ci]
-				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate)
+				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate, sc)
 				r.ObjectiveScore = objectiveValue(obj, &r)
 				all = append(all, r)
 				cur := &all[len(all)-1]
@@ -454,13 +475,36 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 				"objective": ch.ObjectiveScore,
 			})
 		}
+		// §回测自动增强 C：Pareto 多目标前沿 + 推荐解（bt.Pareto.Enabled 才输出该段；
+		// worker 端 payload struct 必须同步加顶层字段，否则 json 解析静默丢弃）。
+		var paretoBrief any
+		if bt != nil && bt.Pareto.Enabled {
+			front := paretoFront(all, bt.Pareto.MaxFrontPoints)
+			rec := recommendedSolution(front, bt.Pareto)
+			paretoBrief = map[string]any{
+				"total": len(all), // 候选总点数（前端展示 N/M）
+				"gates": map[string]any{"min_win_rate": bt.Pareto.MinWinRate,
+					"min_profit_factor": bt.Pareto.MinProfitFactor,
+					"min_sharpe":        bt.Pareto.MinSharpe,
+					"min_calmar":        bt.Pareto.MinCalmar},
+				"front":       paretoPointsJSON(front),
+				"recommended": paretoPointJSON(rec), // nil → JSON null（前端降级为纯前沿展示）
+			}
+			log.Printf("Pareto 前沿 %s：%d 点，推荐解=%v", ad.Name(), len(front), rec != nil)
+		}
 		payload := struct {
 			Strategy  string           `json:"strategy"`
 			Objective string           `json:"objective"`
 			Batches   []map[string]any `json:"batches,omitempty"`
 			Grid      []gridCell       `json:"grid,omitempty"`
 			Results   []any            `json:"results"`
-		}{ad.Name(), obj, batchList, grid, []any{jsonResult}}
+			// §回测自动增强：顶层新增键（pareto 含 gates/front/recommended；
+			// slippage_calib=滑点校准审计；walk_forward A1 轮填充同容器捎带）。
+			// 三键全部 omitempty——增强关闭时载荷形状与基线逐字节一致（回归保证）。
+			Pareto        any `json:"pareto,omitempty"`
+			SlippageCalib any `json:"slippage_calib,omitempty"`
+			WalkForward   any `json:"walk_forward,omitempty"`
+		}{ad.Name(), obj, batchList, grid, []any{jsonResult}, paretoBrief, calibBrief, nil}
 		if bj, jerr := json.Marshal(payload); jerr == nil {
 			fmt.Printf("SWEEP_JSON:%s\n", bj)
 		}
@@ -471,8 +515,13 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 }
 
 // sweepTriggersOf 单股单 adapter 的触发扫描（backtestStock 的无出场版）。
+// §回测自动增强 A：滑点/成交比例在触发预算时一次定档（与出场参数无关，热路径零额外开销）；
+// sc 非空时顺带执行入场流动性预筛——一字封死直接不生成 trigger（修复网格模式此前
+// 没有一字板过滤、比回放口径乐观的既有偏差），涨停打开可成交但买滑点加罚。
+// English: pre-compute entry events; with a slippage context, resolve per-trade slippage and
+// fill ratio up-front and drop unfillable one-word limit-up entries (fixing a grid-only optimism gap).
 func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KLine,
-	indByDate map[string]float64) []sweepTrigger {
+	indByDate map[string]float64, sc *slipCtx) []sweepTrigger {
 	var out []sweepTrigger
 	if na, ok := ad.(*nShapeAdapter); ok {
 		na.macdSeries = data.CalcMACDSeries(kls)
@@ -497,12 +546,22 @@ func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KL
 		if entry <= 0 {
 			continue
 		}
+		// 滑点定档（旧路径=固定 5/5、成交比例 1）
+		buySlip, sellSlip, fill := costSlippageBps, costSlippageBps, 1.0
+		if sc != nil {
+			var can bool
+			buySlip, sellSlip, fill, can = sc.entrySlip(code, kls, i)
+			if !can {
+				continue // 一字封死：现实中买单排队无望
+			}
+		}
 		high := meta["highest_price"]
 		if high <= 0 {
 			high = entry
 		}
 		out = append(out, sweepTrigger{ad: ai, code: code, sigIdx: i,
-			entry: entry, score: meta["score"], highest: high})
+			entry: entry, score: meta["score"], highest: high,
+			buySlip: buySlip, sellSlip: sellSlip, fillR: fill})
 	}
 	return out
 }
@@ -637,16 +696,33 @@ func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int,
 	atr []float64, atrStopMult float64) (int, float64) {
+	// 旧签名委托全参数版：固定 5/5 滑点、全额成交、无跌停封死门控（行为不变）
+	return uniformExitV2Full(kls, "", sigIdx, entry, sigHigh, takeProfitPct, stopLossPct, trailPct,
+		maxHoldDays, atr, atrStopMult, costSlippageBps, costSlippageBps, 1, 0)
+}
+
+// uniformExitV2Full 统一出场引擎 v2 的完整参数版（§回测自动增强 A/B）：
+// 在 ATR 动态止损之上叠加——逐笔定档的买卖滑点（非对称）、跌停封死不可卖门控
+// （sealedExtra>0 时启用：封死日跳过出场判定、打开日卖出加罚该滑点）、
+// 部分成交（盈亏 × fillRate，未成交部分留现金属零收益的近似口径 B.5-5）。
+// buySlip=sellSlip=5、fill=1、sealedExtra=0 时与旧 uniformExitV2ATR 数值完全一致。
+// English: full-parameter v2 — per-trade asymmetric slippage, limit-down sealed gate (no sell
+// while sealed, extra slippage on the opening day) and partial fills; identical to the legacy
+// variant when slippage is fixed 5/5, fill=1 and the sealed gate is off.
+func uniformExitV2Full(kls []data.KLine, code string, sigIdx int, entry, sigHigh float64,
+	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int,
+	atr []float64, atrStopMult, buySlip, sellSlip, fill, sealedExtra float64) (int, float64) {
 	entryDay := sigIdx + 1
 	stageHigh := math.Max(entry, sigHigh)
 	lastJ := len(kls) - 1
 
-	pnlAt := func(j int) float64 {
+	// pnlAt 按当日有效卖出滑点结算净额收益率（含部分成交折算）
+	pnlAt := func(j int, slipSell float64) float64 {
 		if entry <= 0 {
 			return 0
 		}
-		// §GAP4.1 净额口径（滑点+佣金+印花税），与 replay 回放同模型
-		return costRoundTripPnl(entry, kls[j].Close)
+		// §GAP4.1 净额口径（滑点+佣金+印花税），与 replay 回放同模型；增强路径逐笔定档
+		return costRoundTripPnlEx(entry, kls[j].Close, buySlip, slipSell) * fill
 	}
 
 	// 当日有效止损百分比：ATR 止损启用时随当日 ATR 自适应，否则固定
@@ -660,15 +736,26 @@ func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 		return stopLossPct
 	}
 
+	wasSealed := false // 上一日是否跌停封死（打开日卖出加罚滑点）
 	for j := entryDay + 1; j <= lastJ; j++ {
 		cur := kls[j].Close
 		if cur <= 0 {
 			continue
 		}
+		// 跌停封死判定（模块 B）：封死日不可卖出、出场判定整体顺延
+		if sealedExtra > 0 && j > 0 && costLimitDownSealedDay(code, kls[j-1].Close, kls[j].Low, cur) {
+			wasSealed = true
+			continue
+		}
+		slipSell := sellSlip
+		if wasSealed {
+			slipSell += sealedExtra // 打开日以收盘价卖出，追加封死期流动性罚分
+			wasSealed = false
+		}
 		if cur > stageHigh {
 			stageHigh = cur
 		}
-		pnlPct := costRoundTripPnl(entry, cur)
+		pnlPct := pnlAt(j, slipSell)
 		days := j - entryDay
 
 		if s := effStop(j); s > 0 && pnlPct <= -s {
@@ -681,16 +768,17 @@ func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 		if trailPct > 0 && stageHigh > entry {
 			dd := (cur - stageHigh) / stageHigh * 100
 			if dd <= -trailPct {
-				return j, pnlAt(j)
+				return j, pnlAt(j, slipSell)
 			}
 		}
 		if days >= maxHoldDays {
 			return j, pnlPct
 		}
 	}
-	// 未触发任何退出：持有到区间末，记录末日盈亏。
+	// 未触发任何退出：持有到区间末，记录末日盈亏（末日仍封死也按末日收盘结算）。
 	if lastJ > entryDay {
-		return lastJ, pnlAt(lastJ)
+		extra := sealedExtra * boolF(wasSealed)
+		return lastJ, pnlAt(lastJ, sellSlip+extra)
 	}
 	return entryDay, 0
 }
@@ -770,15 +858,19 @@ func betterOf(obj string, a, b *sweepResult) *sweepResult {
 // 触发与出场参数无关 → 只在此处按门槛过滤/贪心不重叠/逐日出场扫描，
 // 单组合成本 O(触发数×平均持仓天数)，万级组合秒~分钟级完成。
 // atrStopMult>0 时启用 ATR 动态止损（§Phase3，需传入与 klines 同序的 ATR14 序列）。
+// §回测自动增强 A/B：滑点与成交比例取触发预计算时的逐笔定档值（旧路径恒 5/5/1）；
+// sc 非空且启用跌停封死时，出场 walk 内封死顺延、打开日加罚卖出滑点。
 // English: grid-mode lightweight simulation — precomputed triggers filtered by threshold,
 // greedy non-overlapping entries, daily uniform exit walk; thousands of combos in seconds.
-// atrStopMult>0 enables the ATR dynamic stop (Phase 3, requires the parallel ATR14 series).
+// Per-trade slippage/fill comes from the pre-computed trigger; the sealed limit-down gate
+// defers the exit to the opening day when enabled.
 func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string][]data.KLine,
 	takeProfitPct, stopLossPct float64, maxHold int, minScore float64,
-	atrStopMult float64, atrs map[string][]float64, rf float64) sweepResult {
+	atrStopMult float64, atrs map[string][]float64, rf float64, sc *slipCtx) sweepResult {
 	res := sweepResult{Name: name, Kind: kind, Trail: takeProfitPct, StopLossPct: stopLossPct,
 		Hold: maxHold, MinScore: minScore, AtrStopMult: atrStopMult}
 	nextFree := map[string]int{} // code -> 可再入场最早下标（同股持仓期内不重复入场）
+	sealedExtra := sc.sellSealedExtra()
 	var winSum, lossSum float64
 	var pnls []float64
 	var dates []string
@@ -790,8 +882,9 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 		if t.sigIdx < nextFree[t.code] {
 			continue
 		}
-		exitJ, pnl := uniformExitV2ATR(klines[t.code], t.sigIdx, t.entry, t.highest,
-			takeProfitPct, stopLossPct, 0, maxHold, atrs[t.code], atrStopMult)
+		exitJ, pnl := uniformExitV2Full(klines[t.code], t.code, t.sigIdx, t.entry, t.highest,
+			takeProfitPct, stopLossPct, 0, maxHold, atrs[t.code], atrStopMult,
+			t.buySlip, t.sellSlip, t.fillR, sealedExtra)
 		nextFree[t.code] = exitJ + 1
 		res.Count++
 		res.AvgHold += float64(exitJ - (t.sigIdx + 1))

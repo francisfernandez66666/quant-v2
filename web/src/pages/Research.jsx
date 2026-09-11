@@ -7,6 +7,8 @@ import {
   Tabs, MessagePlugin,
 } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
+import ParetoChart from '../components/ParetoChart'
+import BacktestConfigPanel from '../components/BacktestConfigPanel'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
@@ -72,6 +74,7 @@ export default function Research() {
   const [loadingOpts, setLoadingOpts] = useState(false)
   const [optLaunching, setOptLaunching] = useState(false)
   const [optSelected, setOptSelected] = useState('')
+  const [paretoPick, setParetoPick] = useState(null) // §回测自动增强 D：Pareto 图点选中的解明细
   const [optDrawerOpen, setOptDrawerOpen] = useState(false)
   const [schedStatus, setSchedStatus] = useState(null) // 研究调度可见性快照（为何卡排队）
   // 任务运行日志弹窗（前端直接看 researchd 落盘的 task_<id>.log，免去 SSH）
@@ -559,14 +562,16 @@ export default function Research() {
       showToast('已加入研究队列——进度可在「回测」tab 查看，完成后回到「优化结果」刷新。', 'success')
     } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
   }
-  async function approveOpt(r) {
-  // 审批通过某条寻优排名（写入 applied 配置并热加载）
-    const msg = '把参数应用到「' + r.strategy + '」？\n止盈线 ' + fmtNum(r.params.take_profit_pct) + '% · 止损线 ' +
+  async function approveOpt(r, overrideParams) {
+  // 审批通过某条寻优排名（写入 applied 配置并热加载）；
+  // §回测自动增强 D：overrideParams=Pareto 推荐解参数时以推荐解覆盖冠军行（body 透传后端）
+    const p = overrideParams || r.params || {}
+    const msg = '把参数应用到「' + r.strategy + '」？\n止盈线 ' + fmtNum(p.take_profit_pct) + '% · 止损线 ' +
     // 常量 msg：局部定义
-      fmtNum(r.params.stop_loss_pct) + '% · 兜底 ' + fmtNum(r.params.hold_days) + ' 天' +
-      ((r.params || {}).min_score ? ' · 门槛 ' + fmtNum(r.params.min_score) : '') + '\n审批后立即热重载生效。'
+      fmtNum(p.stop_loss_pct) + '% · 兜底 ' + fmtNum(p.hold_days) + ' 天' +
+      ((p || {}).min_score ? ' · 门槛 ' + fmtNum(p.min_score) : '') + '\n审批后立即热重载生效。'
     if (!(await confirmDialog(msg))) return
-    try { await api.approveOptimization(r.id); r.status = 'approved'; showToast('已应用参数', 'success') } catch (e) { showToast('入库失败: ' + (e.message || e), 'error') }
+    try { await api.approveOptimization(r.id, overrideParams); r.status = 'approved'; showToast('已应用参数', 'success') } catch (e) { showToast('入库失败: ' + (e.message || e), 'error') }
   }
   async function rejectOpt(r) {
   // 淘汰某条寻优排名
@@ -645,6 +650,19 @@ export default function Research() {
     if (!optCur || !optCur.grid_json) return []
     try { return JSON.parse(optCur.grid_json).batches || [] } catch { return [] }
   }, [optCur])
+  // §回测自动增强 D：解析冠军行 grid_json 的 pareto / slippage_calib 容器（旧任务产物无此键→null）
+  const optCurPareto = useMemo(() => {
+  // 常量 optCurPareto：局部定义（{gates, front, recommended, champion_key}；缺键=null）
+    if (!optCur || !optCur.grid_json) return null
+    try { return JSON.parse(optCur.grid_json).pareto || null } catch { return null }
+  }, [optCur])
+  const optCurCalib = useMemo(() => {
+  // 常量 optCurCalib：局部定义（滑点校准审计 {source, base_bps, buy_extra_bps, sample_*}）
+    if (!optCur || !optCur.grid_json) return null
+    try { return JSON.parse(optCur.grid_json).slippage_calib || null } catch { return null }
+  }, [optCur])
+  // 切换战法/刷新排名时清掉 Pareto 点选明细（避免跨战法残留）
+  useEffect(() => { setParetoPick(null) }, [optSelected])
   const optCurPoolKey = useMemo(() => {
   // 常量 optCurPoolKey：局部定义
     if (!optCur) return ''
@@ -1051,9 +1069,7 @@ export default function Research() {
         </div>
       )
     } },
-
-    // 回测任务操作列：取消/续跑/重跑/日志按钮，按任务状态与权限动态显示
-  ]
+  ], [backtestJobs, canApprove])
 
   // 寻优热力网格表列
   const heatColumns = useMemo(() => {
@@ -1325,7 +1341,7 @@ export default function Research() {
             value={statusFilter}
             onChange={(v) => { setStatusFilter(v); loadData() }}
             style={{ width: 140 }}
-            {/* 状态筛选选项：全部/待审批/已应用/已审批/已驳回 */}
+//
             options={[
               { label: '全部', value: '' },
               { label: '待审批', value: 'proposed' },
@@ -1460,7 +1476,7 @@ export default function Research() {
                         <Button size="small" variant="outline" style={{ marginLeft: 'auto' }} onClick={toggleDrawer}>⚙ 参数池 / 池纪律</Button>
                       </div>
                       {optCur.params ? (
-                      {/* 寻优结果指标网格：止盈/止损/持仓/门槛/胜率/盈亏比/期望/样本/实盘复核 */}
+                      // 寻优结果指标网格：止盈/止损/持仓/门槛/胜率/盈亏比/期望/样本/实盘复核
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))', gap: 8 }}>
                         <div><label>止盈线</label><b>{fmtNum((optCur.params || {}).take_profit_pct)}%</b></div>
                         <div><label>止损线</label><b>{fmtNum((optCur.params || {}).stop_loss_pct)}%</b></div>
@@ -1479,11 +1495,55 @@ export default function Research() {
                                              )}
                     </Card>
 
+                    {/* §回测自动增强 A.4：成本口径审计（滑点来源可追溯，不依赖 Pareto 开关） */}
+                    {optCurCalib && (
+                      <div style={{ marginTop: 6, fontSize: 11, color: '#888' }}>
+                        成本口径：滑点基准 <b>{fmtNum(optCurCalib.base_bps, 1)}bp</b>
+                        {optCurCalib.buy_extra_bps ? <>（买 +{fmtNum(optCurCalib.buy_extra_bps, 1)}bp）</> : null}
+                        {' '}来源 {optCurCalib.source === 'paper_median' ? '模拟盘实测中位数' : '配置默认'}
+                        {optCurCalib.n_buy !== undefined ? `（实测买${fmtNum(optCurCalib.buy_bps, 1)}bp / 卖${fmtNum(optCurCalib.sell_bps, 1)}bp，样本 ${optCurCalib.n_buy}/${optCurCalib.n_sell}）` : ''}
+                      </div>
+                    )}
+
                     {/* 寻优结果摘要：最优参数/胜率/盈亏比/期望收益/触发样本/实盘复核/模拟盘实测 */}
                     <div style={{ marginTop: 10, fontWeight: 600, fontSize: 14 }}>止盈×止损 热力网格<span style={{ fontSize: 11, color: '#888' }}>（格值 %：该格跨持仓/门槛最优期望；点击格高亮）</span></div>
                     {optCurHeat.tps.length ? (
                       <Table data={heatData} columns={heatColumns} rowKey="tp" size="small" pagination={false} />
                     ) : <Card style={{ padding: 8 }}>本行无网格数据（旧任务产物，重新寻优后生成）。</Card>}
+
+                    {/* §回测自动增强 D：Pareto 前沿（旧任务产物无 pareto 键→不渲染，champion 降级为现有展示） */}
+                    {optCurPareto && (
+                      <div style={{ marginTop: 10 }}>
+                        <div style={{ fontWeight: 600, fontSize: 14 }}>
+                          Pareto 前沿
+                          <span style={{ fontSize: 11, color: '#888' }}>（胜率×盈亏比×夏普×卡玛四维非支配解集 · {optCurPareto.front?.length || 0}/{optCurPareto.total ?? '—'} 候选）</span>
+                        </div>
+                        <ParetoChart
+                          front={optCurPareto.front || []}
+                          champion={optCur}
+                          recommended={optCurPareto.recommended}
+                          gates={optCurPareto.gates}
+                          onPick={(p) => setParetoPick(p)}
+                        />
+                        {/* 推荐解操作条：与冠军不一致时提供「应用推荐解」（approve 携带参数覆盖） */}
+                        {optCurPareto.recommended && optCur.status === 'pending' && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 6, fontSize: 12 }}>
+                            <Tag theme="danger" variant="light">推荐解</Tag>
+                            <span>止盈 {fmtNum(optCurPareto.recommended.params?.take_profit_pct)}% · 止损 {fmtNum(optCurPareto.recommended.params?.stop_loss_pct)}% · 持仓 {fmtNum(optCurPareto.recommended.params?.hold_days)}天 · 门槛 {fmtNum(optCurPareto.recommended.params?.min_score)} → 胜率 {fmtNum(optCurPareto.recommended.win_rate, 1)}% / 盈亏比 {fmtNum(optCurPareto.recommended.profit_factor)} / 夏普 {fmtNum(optCurPareto.recommended.sharpe)}</span>
+                            <Button size="small" theme="danger" variant="outline"
+                              onClick={() => approveOpt(optCur, optCurPareto.recommended.params)}>应用推荐解</Button>
+                          </div>
+                        )}
+                        {paretoPick && (
+                          <div style={{ marginTop: 6, fontSize: 12, background: '#fafafa', border: '1px solid #eee', borderRadius: 4, padding: '4px 8px' }}>
+                            <b>选中解</b>：止盈 {fmtNum(paretoPick.params?.take_profit_pct)}% · 止损 {fmtNum(paretoPick.params?.stop_loss_pct)}% ·
+                            持仓 {fmtNum(paretoPick.params?.hold_days)}天 · 门槛 {fmtNum(paretoPick.params?.min_score)} · 期望 {fmtNum(paretoPick.expectancy, 2)}% ·
+                            样本 {paretoPick.trigger_count ?? '—'} · 夏普 {fmtNum(paretoPick.sharpe)} · 卡玛 {fmtNum(paretoPick.calmar)}
+                            <Button size="small" variant="text" style={{ marginLeft: 8 }} onClick={() => setParetoPick(null)}>收起</Button>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {optCurBatches.length > 0 && (
                       <details style={{ marginTop: 8 }}>
@@ -1494,7 +1554,6 @@ export default function Research() {
                           pagination={false}
                           rowKey="batch"
                           data={optCurBatches.map((b) => ({ ...b }))}
-                          {/* 批次冠军表列：批号/止盈/止损/持仓天/门槛/目标值 */}
                           columns={[
                             { colKey: 'batch', title: '批', cell: ({ row }) => '#' + row.batch },
 
@@ -1638,6 +1697,9 @@ export default function Research() {
                 <Tag theme={backtestEnabled ? 'success' : 'default'}>{backtestEnabled ? '已开启' : '已关闭'}</Tag>
               </div>
             </Card>
+
+            {/* §回测自动增强 D：回测可信度增强配置（滑点校准/流动性门控/Pareto 前沿） */}
+            <BacktestConfigPanel />
           </div>
         </Tabs.TabPanel>
       </Tabs>

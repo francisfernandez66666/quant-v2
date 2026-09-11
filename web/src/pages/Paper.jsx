@@ -851,7 +851,7 @@ export default function Paper() {
                 rowKey="__key"
                 data={posData}
                 columns={posColumns}
-                {/* 行展开渲染分时图 */}
+                //  行展开渲染分时图 
                 expandedRow={renderKline}
                 expandedRowKeys={[...klineOpen]}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
