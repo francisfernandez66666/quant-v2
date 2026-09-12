@@ -303,7 +303,7 @@ export default function Dashboard() {
         {/* 热门个股实时快照表格（带 LIVE 标签），无数据时显示等待提示 */}
         <Card title={<span>🔥 热门个股 <Tag theme="warning" size="small">LIVE</Tag></span>}>
           {snapshotStocks.length ? (
-            <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} />
+            <Table data={snapshotStocks} columns={stockColumns} rowKey="code" size="small" pagination={false} fixedHeader maxHeight={320} />
           ) : (
             <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待行情数据...</div>
           )}

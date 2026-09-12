@@ -24,6 +24,16 @@ function mkPoint(tp, wr, pf, sharpe) {
 }
 
 describe('BacktestConfigPanel', () => {
+  // §UAT3.1 修复 vitest "Errors 1"：为两个 mock 设置兜底 mockResolvedValue——
+  // 各用例的 mockResolvedValueOnce 队列耗尽后再触发重挂载时，fetch/save 仍返回 Promise
+  // 而非 undefined，杜绝组件 useEffect 里 `.then` 命中 undefined 的同步 TypeError。
+  // English: baseline mockResolvedValue so that once the per-test Once queue drains, a remount
+  // still gets a Promise back, eliminating the unhandled TypeError from `.then` on undefined.
+  beforeEach(() => {
+    api.fetchBacktestConfig.mockResolvedValue({ config: null, enabled: false })
+    api.saveBacktestConfig.mockResolvedValue({ status: 'saved', enabled: false })
+  })
+
   it('读取配置：enabled=true 时展开滑点/流动性/Pareto 分区', async () => {
     api.fetchBacktestConfig.mockResolvedValueOnce({ config: { enabled: true, slippage: { base_bps: 3 } }, enabled: true })
     render(<BacktestConfigPanel />)

@@ -259,6 +259,9 @@ export default function Watchlist() {
         rowKey="code"
         size="small"
         pagination={false}
+        // §F1 自选列表固定表头（自选多时表头随滚消失）
+        fixedHeader
+        maxHeight="calc(100vh - 300px)"
 
         expandOnRowClick={false}
         expandedRowKeys={expandedKeys}

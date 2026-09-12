@@ -3,10 +3,11 @@
 // 确认买入/忽略操作、模拟买入归池、一键收藏自选、展开分时+盘口。
 // 纯 TDesign React（Card / Table / Tag / Button / Select / Dialog），无自定义 CSS。
 import React, { useState, useEffect, useRef } from 'react'
-import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin } from 'tdesign-react'
+import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin, Input } from 'tdesign-react'
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import LogModal from '../components/LogModal.jsx'
+import { Loading } from '../ui.jsx'
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
 const FILTERS = [
@@ -67,6 +68,10 @@ export default function Signals() {
   const [activeFilter, setActiveFilter] = useState('all')
   // 当前战法筛选
   const [activeStrategy, setActiveStrategy] = useState('all')
+  // §F1 代码/名称搜索关键字（此前 Signals 页没有搜索框，信号多时只能肉眼扫表）
+  const [q, setQ] = useState('')
+  // §F1 首屏加载态：区分"还没取到数据"与"取到了但没有信号"
+  const [loading, setLoading] = useState(true)
   // 买入/忽略确认弹窗显隐
   const [showConfirm, setShowConfirm] = useState(false)
   // 日志弹窗显隐
@@ -103,11 +108,17 @@ export default function Signals() {
     ? signals.filter((s) => activeDir === 'all' || (s.direction || '做多') === activeDir)
     : signals.filter((s) => s.direction !== '做空')
   // 按等级筛选、战法筛选，并过滤掉「预期差」非标准评级信号
-  const filteredSignals = dirScoped
+  let filteredSignals = dirScoped
     .filter((s) => (activeFilter !== 'all' ? s.remind_level === activeFilter : true))
     .filter((s) => (activeStrategy !== 'all' ? s.strategy === activeStrategy : true))
     // 过滤掉「预期差」战法（非标准评级信号，不在列表展示）
     .filter((s) => s.strategy !== '预期差')
+  // §F1 搜索框生效：代码或名称模糊匹配（空串时不过滤）
+  if (q.trim()) {
+    const kw = q.trim().toLowerCase()
+    filteredSignals = filteredSignals.filter((s) =>
+      (s.code || '').toLowerCase().includes(kw) || (s.name || '').toLowerCase().includes(kw))
+  }
 
   // 根据操作结果弹出成功/失败提示
   function showFeedback(msg, type) {
@@ -201,6 +212,8 @@ export default function Signals() {
   // 加载当前策略信号列表
   async function load() {
     try { setSignals(await api.fetchSignals()) } catch (_) {}
+    // §F1 首屏 loading 结束（后续 5s 轮询不重复转 loading，仅首帧需要）
+    setLoading(false)
   }
 
   // 探测模拟盘开关状态
@@ -392,6 +405,8 @@ export default function Signals() {
                 {f.label}
               </Button>
             ))}
+            {/* §F1 代码/名称搜索框（与收藏筛选同口径：命中代码或名称任一） */}
+            <Input size="small" value={q} onChange={(v) => setQ(v)} placeholder="搜索代码/名称" clearable style={{ width: 150 }} />
             {/* §SHORT-4 方向筛选（仅做空开启时出现） */}
             {shortEnabled && (
               <Select value={activeDir} onChange={(v) => setActiveDir(v)} size="small" style={{ width: 110 }}
@@ -425,6 +440,9 @@ export default function Signals() {
           // 把第 11+ 条信号藏到第 2 页，且 tdesign 未传 total 时页脚错显「共 0 条数据」、
           // 下一页按钮不可用——「全部 vs 分战法」数量对不上的根因。改为关闭分页直接展示全部。
           pagination={false}
+          // §F1 长列表固定表头：滚动时列名不再消失（信号一页全显后尤其需要）
+          fixedHeader
+          maxHeight="calc(100vh - 268px)"
           empty="暂无信号"
         />
       </Card>

@@ -5,6 +5,10 @@
 import React, { useState, useEffect, useRef, Suspense, lazy } from 'react'
 import { NavLink, Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
 import { ConfigProvider, Menu, Button, Badge, MessagePlugin, Input } from 'tdesign-react'
+// §F1 导航图标：emoji（📊⚡💬…）在 Windows Server / APK WebView 渲染不一致且显廉价，
+// 统一换 tdesign-icons-react（package.json 已装但此前全站零使用）。
+import { DashboardIcon, ThunderIcon, StarIcon, TrendingUpIcon, NotificationIcon, WalletIcon,
+  ChartLineIcon, RocketIcon, SettingIcon, TerminalIcon, ChatBubble1Icon, SearchIcon, UsergroupIcon } from 'tdesign-icons-react'
 import ToggleSw from './components/ToggleSw'
 import * as api from './api/index.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
@@ -292,20 +296,20 @@ export default function App() {
   // 根据权限（canResearch/canAdmin）与模拟盘开关（paperEnabled）动态生成侧边栏导航项，
   // 过滤掉当前角色无权访问或功能未开启的入口，再交给下方 Menu 渲染
   const navItems = [
-    { to: '/dashboard', icon: '📊', label: '仪表盘' },
-    { to: '/signals', icon: '⚡', label: '信号', badge: signalCount },
-    { to: '/watchlist', icon: '👁', label: '自选' },
-    { to: '/hotspot', icon: '🔥', label: '热点' },
-    { to: '/msgcenter', icon: '💬', label: '消息', badge: alertCount },
-    { to: '/positions', icon: '💼', label: '持仓' },
-    { to: '/quant', icon: '📈', label: '量化交易' },
-    paperEnabled ? { to: '/paper', icon: '🧪', label: '模拟盘' } : null,
-    canAdmin ? { to: '/settings', icon: '⚙', label: '设置' } : null,
-    { to: '/llm-debug', icon: '🧠', label: 'LLM诊断' },
-    { to: '/consult', icon: '🎯', label: '股票咨询' },
-    canResearch ? { to: '/research', icon: '🔬', label: '自动研究' } : null,
+    { to: '/dashboard', icon: <DashboardIcon size="18px" />, label: '仪表盘' },
+    { to: '/signals', icon: <ThunderIcon size="18px" />, label: '信号', badge: signalCount },
+    { to: '/watchlist', icon: <StarIcon size="18px" />, label: '自选' },
+    { to: '/hotspot', icon: <TrendingUpIcon size="18px" />, label: '热点' },
+    { to: '/msgcenter', icon: <NotificationIcon size="18px" />, label: '消息', badge: alertCount },
+    { to: '/positions', icon: <WalletIcon size="18px" />, label: '持仓' },
+    { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' },
+    paperEnabled ? { to: '/paper', icon: <RocketIcon size="18px" />, label: '模拟盘' } : null,
+    canAdmin ? { to: '/settings', icon: <SettingIcon size="18px" />, label: '设置' } : null,
+    { to: '/llm-debug', icon: <TerminalIcon size="18px" />, label: 'LLM诊断' },
+    { to: '/consult', icon: <ChatBubble1Icon size="18px" />, label: '股票咨询' },
+    canResearch ? { to: '/research', icon: <SearchIcon size="18px" />, label: '自动研究' } : null,
     // 条件项为 null 时由下方 filter(Boolean) 剔除，实现入口按权限显隐
-    canAdmin ? { to: '/admin', icon: '👥', label: '用户管理' } : null,
+    canAdmin ? { to: '/admin', icon: <UsergroupIcon size="18px" />, label: '用户管理' } : null,
   ].filter(Boolean)
 
   // §安全 F1（2026-08-29）：全局 ErrorBoundary 包裹整个应用（登录页/顶部栏/侧边栏/路由出口），
@@ -358,7 +362,7 @@ export default function App() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13 }}>
               {/* 汉堡按钮：点击切换侧边栏显隐（移动端抽屉式） */}
               <div className="hamburger" onClick={() => setMenuOpen((o) => !o)}><span></span><span></span><span></span></div>
-              {/* 量化活跃窗口指示：active=true 表示交易日 9:15-15:30 首尔服务器活跃；否则静默释放性能 */}
+              {/* 量化活跃窗口指示：active=true 表示交易日 9:15-15:30（广州生产节点）引擎活跃；否则静默释放性能 */}
               <span>{activeWindow !== null && (activeWindow ? '🟢 量化活跃 9:15-15:30' : '🌙 静默释放')}</span>
               {/* 后端服务连通状态文字提示 */}
               <span className="muted">{serverOnline ? '服务在线' : '离线'}</span>
@@ -408,8 +412,8 @@ export default function App() {
                   {/* 导航项循环渲染：icon + 文案 + 可选未读角标 */}
                   {navItems.map((it) => (
                     <Menu.MenuItem key={it.to} value={it.to}>
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                        <span>{it.icon}</span>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                        {it.icon}
                         <span>{it.label}</span>
                         {/* 存在未读数量时展示角标（信号/消息数） */}
                         {it.badge > 0 && <Badge count={it.badge} />}

@@ -523,12 +523,12 @@ export default function Positions() {
   const paperColumns = [
     { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name}</span> },
-    { colKey: 'quantity', title: '数量', width: 70, cell: ({ row }) => row.quantity },
-    { colKey: 'cost_price', title: '成本价', width: 80, cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(2) : '-') },
-    { colKey: 'cur_price', title: '现价', width: 80, cell: ({ row }) => (row.cur_price != null ? '¥' + Number(row.cur_price).toFixed(2) : '-') },
-    { colKey: 'change_pct', title: '当日涨跌', width: 90, cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
-    // 持仓盈亏百分比列：红涨绿跌
-    { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, cell: ({ row }) => <span style={{ color: (row.pnl_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.pnl_pct || 0) > 0 ? '+' : ''}{(row.pnl_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'quantity', title: '数量', width: 70, sorter: (a, b) => (a.quantity || 0) - (b.quantity || 0), cell: ({ row }) => row.quantity },
+    { colKey: 'cost_price', title: '成本价', width: 80, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(2) : '-') },
+    { colKey: 'cur_price', title: '现价', width: 80, sorter: (a, b) => (a.cur_price || 0) - (b.cur_price || 0), cell: ({ row }) => (row.cur_price != null ? '¥' + Number(row.cur_price).toFixed(2) : '-') },
+    { colKey: 'change_pct', title: '当日涨跌', width: 90, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    // 持仓盈亏百分比列：红涨绿跌（§F1 可排序——盯盘最常用「按盈亏排序找雷/找赢家」）
+    { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, sorter: (a, b) => (a.pnl_pct || 0) - (b.pnl_pct || 0), cell: ({ row }) => <span style={{ color: (row.pnl_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.pnl_pct || 0) > 0 ? '+' : ''}{(row.pnl_pct || 0).toFixed(2)}%</span> },
 
     // 信号状态列：有策略信号时显示⚡
     { colKey: 'signal', title: '信号', width: 50, cell: ({ row }) => row.signal_active ? <span title="有策略信号">⚡</span> : <span style={{ color: '#e7e7e7' }}>—</span> },
@@ -563,11 +563,12 @@ export default function Positions() {
   const realColumns = [
     { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.ts_code}</span> },
     { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name}</span> },
-    { colKey: 'qty', title: '数量', width: 70, cell: ({ row }) => row.qty },
-    { colKey: 'cost_price', title: '成本价', width: 90, cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(3) : '-') },
-    { colKey: 'cur_price', title: '现价', width: 90, cell: ({ row }) => curPrice(row) ? '¥' + curPrice(row).toFixed(2) : '—' },
-    { colKey: 'pnl', title: '持仓盈亏', width: 90, cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
-    { colKey: 'highest_price', title: '最高价', width: 90, cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
+    { colKey: 'qty', title: '数量', width: 70, sorter: (a, b) => (a.qty || 0) - (b.qty || 0), cell: ({ row }) => row.qty },
+    { colKey: 'cost_price', title: '成本价', width: 90, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(3) : '-') },
+    { colKey: 'cur_price', title: '现价', width: 90, sorter: (a, b) => curPrice(a) - curPrice(b), cell: ({ row }) => curPrice(row) ? '¥' + curPrice(row).toFixed(2) : '—' },
+    // §F1 实盘持仓盈亏按 realPnlPct 派生值排序（成本价×数量的浮盈率），与展示口径一致
+    { colKey: 'pnl', title: '持仓盈亏', width: 90, sorter: (a, b) => realPnlPct(a) - realPnlPct(b), cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
+    { colKey: 'highest_price', title: '最高价', width: 90, sorter: (a, b) => (a.highest_price || 0) - (b.highest_price || 0), cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
     { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: '#e7e7e7' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
     //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用） 
     { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (
@@ -625,6 +626,9 @@ export default function Positions() {
                 rowKey="code"
                 size="small"
                 pagination={false}
+                // §F1 长持仓列表固定表头
+                fixedHeader
+                maxHeight="calc(100vh - 320px)"
                 expandOnRowClick={false}
                 expandedRowKeys={Array.from(klineOpen)}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}

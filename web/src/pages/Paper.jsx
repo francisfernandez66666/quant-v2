@@ -911,6 +911,9 @@ export default function Paper() {
                 onRowClick={({ row }) => onRowTap(row)}
                 bordered
                 size="small"
+                // §F1 长列表固定表头
+                fixedHeader
+                maxHeight="calc(100vh - 360px)"
               />
             ) : (
               <div className="muted" style={{ padding: 24, textAlign: 'center' }}>
@@ -934,6 +937,10 @@ export default function Paper() {
                 onRowClick={({ row }) => onTradeTap(row, row.__idx)}
                 bordered
                 size="small"
+                // §F1 成交日志随时间无限增长：固定表头 + 分页，避免整页超长滚动
+                fixedHeader
+                maxHeight="calc(100vh - 360px)"
+                pagination={{ defaultPageSize: 20, showJumper: true, pageSizeOptions: [20, 50, 100] }}
               />
             ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无成交记录</div>}
           </Card>
@@ -943,7 +950,10 @@ export default function Paper() {
           <Card>
             {/* 订单表格：代码/方向/价格/数量/时间/状态 */}
             {orderData.length ? (
-              <Table rowKey="__key" data={orderData} columns={orderColumns} bordered size="small" />
+              <Table rowKey="__key" data={orderData} columns={orderColumns} bordered size="small"
+                // §F1 订单记录固定表头 + 分页
+                fixedHeader maxHeight="calc(100vh - 360px)"
+                pagination={{ defaultPageSize: 20, showJumper: true, pageSizeOptions: [20, 50, 100] }} />
             ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>暂无订单记录</div>}
           </Card>
         </Tabs.TabPanel>
