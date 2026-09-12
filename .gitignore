@@ -93,3 +93,4 @@ bin/
 web/test-results/
 web/playwright-report/
 web/playwright/.cache/
+web/.auth/

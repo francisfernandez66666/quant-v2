@@ -21,5 +21,13 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     headless: !process.env.PW_HEADED,
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  projects: [
+    // setup：仅登录一次并落 storageState，规避后端 5/min 匿名登录频控（避免多用例各自登录触发 429 假失败）
+    { name: 'setup', testMatch: /auth\.setup\.mjs/ },
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'], storageState: '.auth/state.json' },
+      dependencies: ['setup'],
+    },
+  ],
 })

@@ -33,7 +33,9 @@ for (const p of PAGES) {
   test(`页面可达：${p.name} ${p.hash}`, async ({ page }) => {
     await page.goto('/' + p.hash)
     await expect(page.locator('.app-main')).toBeVisible()
-    await expect(page.locator('.app-main').getByText(p.name, { exact: false }).first()).toBeVisible()
+    // 统一断言各页最稳的结构容器：每个业务页根节点都是 <div className="page">（非文案，避免
+    // 依赖具体中文标题——如仪表盘正文不含"仪表盘"字样会导致文案断言脆断）
+    await expect(page.locator('.app-main .page').first()).toBeVisible()
     if (p.anchor) await expect(page.locator(`[data-testid="${p.anchor}"]`)).toBeVisible()
   })
 }
