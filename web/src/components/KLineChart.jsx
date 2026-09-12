@@ -12,7 +12,11 @@ const plotR = 10 // 绘图区右边距
 const axisB = 16 // 底部坐标轴高
 const plotT = 8 // 绘图区上边距
 
-// 配色（浅色底、强对比，避免浅色线刺眼）
+// 配色令牌：canvas 不能用 CSS var()，故运行时从 :root 的 --app-chart-* 读取（refreshPalette）。
+// 初值为浅色基线；组件挂载/主题切换时刷新为当前主题值，保证深浅色下图表配色与全站一致。
+// English: canvas can't use CSS var(), so colors are read at runtime from --app-chart-* tokens
+// via refreshPalette(); defaults are the light baseline, refreshed on mount and theme change.
+import { subscribeTheme } from '../theme.js'
 const C = {
   bg: '#ffffff',
   grid: '#ececec',
@@ -25,10 +29,40 @@ const C = {
   avg: '#fa8c16',
   dif: '#d48806',
   dea: '#1677ff',
+  tipBg: '#ffffff',
+  tipBorder: '#d0d0d0',
+  tipText: '#303133',
+  tipSub: '#606266',
 }
 // 分时价格线上涨/下跌颜色（红涨绿跌）
-const PRICE_UP = '#f5222d'
-const PRICE_DOWN = '#16a34a' // 下跌绿
+let PRICE_UP = '#f5222d'
+let PRICE_DOWN = '#16a34a' // 下跌绿
+
+// refreshPalette 从当前主题的 CSS 自定义属性刷新配色（无 document 时保持默认）。
+// English: refreshPalette reads the live theme's custom properties into the canvas palette.
+function refreshPalette() {
+  if (typeof document === 'undefined' || typeof getComputedStyle !== 'function') return
+  const s = getComputedStyle(document.documentElement)
+  const g = (name, fb) => { const v = (s.getPropertyValue(name) || '').trim(); return v || fb }
+  C.bg = g('--app-chart-bg', C.bg)
+  C.grid = g('--app-chart-grid', C.grid)
+  C.axisTxt = g('--app-chart-axis', C.axisTxt)
+  C.prev = g('--app-chart-line', C.prev)
+  C.cross = g('--app-chart-line', C.cross)
+  C.dot = g('--app-chart-line', C.dot)
+  C.avg = g('--app-chart-avg', C.avg)
+  C.dif = g('--app-chart-dif', C.dif)
+  C.dea = g('--app-chart-dea', C.dea)
+  C.volUp = g('--app-chart-vol-up', C.volUp)
+  C.volDown = g('--app-chart-vol-down', C.volDown)
+  C.tipBg = g('--app-chart-tip-bg', C.tipBg)
+  C.tipBorder = g('--app-chart-tip-border', C.tipBorder)
+  C.tipText = g('--app-chart-tip-text', C.tipText)
+  C.tipSub = g('--app-chart-tip-sub', C.tipSub)
+  PRICE_UP = g('--app-chart-vol-up', PRICE_UP)
+  PRICE_DOWN = g('--app-chart-vol-down', PRICE_DOWN)
+}
+
 
 // 格式化成交量：>=1亿 显「亿」、>=1万 显「万」，否则原值
 function fmtVol(v) {
@@ -87,6 +121,9 @@ export default function KLineChart({
   // 容器宽度（画布自适应重绘）与 hover 十字光标状态
   const [viewW, setViewW] = useState(axisL + 320)
   const [hover, setHover] = useState(null)
+  // §F4 主题版本计数：订阅主题变化并自增，作为重绘依赖让 canvas 用新令牌配色刷新。
+  const [themeTick, setThemeTick] = useState(0)
+  useEffect(() => subscribeTheme(() => setThemeTick((n) => n + 1)), [])
 
   const wrapRef = useRef(null)    // 容器 DOM 引用（取可用宽度）
   const canvasRef = useRef(null)  // 画布 DOM 引用（绘制分时图）
@@ -164,6 +201,7 @@ export default function KLineChart({
   useEffect(() => {
     const cvs = canvasRef.current
     if (!cvs || raw.length === 0) return
+    refreshPalette() // §F4 每帧同步当前主题配色令牌（含首帧与主题切换后重绘）
 
     // 画布初始化：按 devicePixelRatio 高清适配、清屏并填充底色
     const dpr = window.devicePixelRatio || 1
@@ -378,12 +416,12 @@ export default function KLineChart({
       const tipX = Math.min(Math.max(hover.x - 92, axisL), contW - 184)
       // 信息气泡：184×92 固定尺寸白底描边卡片，紧贴顶部
       const tipW = 184, tipH = 92, tipY = 4
-      ctx.fillStyle = '#ffffff'
-      ctx.strokeStyle = '#d0d0d0'
+      ctx.fillStyle = C.tipBg
+      ctx.strokeStyle = C.tipBorder
       ctx.fillRect(tipX, tipY, tipW, tipH)
       ctx.strokeRect(tipX, tipY, tipW, tipH)
       ctx.textAlign = 'left'
-      ctx.fillStyle = '#303133'
+      ctx.fillStyle = C.tipText
       ctx.fillText(hover.point.time || '', tipX + 8, tipY + 12)
       // 行2：现价与涨跌幅（按相对昨收正负着色）
       const upc = hover.delta >= 0 ? PRICE_UP : PRICE_DOWN
@@ -391,12 +429,12 @@ export default function KLineChart({
       ctx.fillText('价 ' + hover.point.close.toFixed(2), tipX + 8, tipY + 30)
       ctx.fillText('涨 ' + (hover.delta >= 0 ? '+' : '') + hover.pct.toFixed(2) + '%', tipX + 96, tipY + 30)
       // 行3：开/高/低；行4：量/额；行5：MACD 三值（DIF/DEA/BAR）
-      ctx.fillStyle = '#606266'
+      ctx.fillStyle = C.tipSub
       ctx.fillText('开 ' + hover.point.open.toFixed(2) + ' 高 ' + hover.point.high.toFixed(2) + ' 低 ' + hover.point.low.toFixed(2), tipX + 8, tipY + 48)
       ctx.fillText('量 ' + fmtVol(hover.point.volume) + ' · 额 ' + fmtAmt(hover.point.amount), tipX + 8, tipY + 66)
       ctx.fillText('DIF ' + hover.point.dif.toFixed(3) + ' DEA ' + hover.point.dea.toFixed(3) + ' BAR ' + hover.point.bar.toFixed(3), tipX + 8, tipY + 84)
     }
-  }, [raw, prevClose, viewW, height, hover])
+  }, [raw, prevClose, viewW, height, hover, themeTick])
 
   function onMove(ev) {
     // 鼠标移动：按横向距离就近定位数据点，计算相对昨收的涨跌幅并显示十字光标信息

@@ -1,9 +1,11 @@
 // ── 消息中心页面 MsgCenter.jsx ──
 // 展示所有提醒/告警消息，支持按等级过滤、交易信号二级战法分类、删除/清空、一键模拟卖出
 // 使用 TDesign React 组件（Card / Tag / Button / Select / Dialog）。
-import React, { useState, useEffect, useRef, useMemo } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { Card, Tag, Button, Select, DialogPlugin, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
+import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+import useSseRefresh from '../useSseRefresh.js'
 
 // 通用确认弹窗：返回 Promise<boolean>，确认 resolve(true)、关闭 resolve(false)
 function confirmDialog(body, header = '确认') {
@@ -48,12 +50,11 @@ export default function MsgCenter() {
   const [activeStrategy, setActiveStrategy] = useState('all')
   // §SHORT-4 做空显隐（决策⑤）：开关关闭时隐藏做空方向/做空战法消息
   const [shortEnabled, setShortEnabled] = useState(false)
-
-  const timerRef = useRef(null)      // 轮询定时器句柄
-  const unsubSSERef = useRef(null)   // SSE 取消订阅函数引用
-
-  // SSE 推送到达时刷新消息
-  function handleSSE() { load() }
+  // §F3 全局个股详情抽屉的目标（{code,name}），null=关闭
+  const [detail, setDetail] = useState(null)
+  // §F5 分页：消息卡片列表按页展示（默认 50/页），筛选/类型变化时回到首页。
+  const [page, setPage] = useState(1)
+  const PAGE_SIZE = 50
 
   // 按交易信号中的战法名称统计可选战法
   const strategyOptions = useMemo(() => {
@@ -90,15 +91,21 @@ export default function MsgCenter() {
     return list
   }, [alerts, activeFilter, activeStrategy, shortEnabled])
 
+  // §F5 分页：筛选条件变化回到首页；page 越界时钳制（删除/筛选后总数变小）。
+  useEffect(() => { setPage(1) }, [activeFilter, activeStrategy, shortEnabled])
+  const totalPages = Math.max(1, Math.ceil(filteredAlerts.length / PAGE_SIZE))
+  const curPage = Math.min(page, totalPages)
+  const pagedAlerts = filteredAlerts.slice((curPage - 1) * PAGE_SIZE, curPage * PAGE_SIZE)
+
   // 根据消息等级与方向返回卡片左边框颜色
   function alertBorder(a) {
-    if (a.level === '止损' || a.level === '策略信号') return '#e34d59'
+    if (a.level === '止损' || a.level === '策略信号') return 'var(--app-up)'
     if (a.level === '交易信号') {
-      return a.direction === '做空' || a.action === '卖出' ? '#e34d59' : '#00a870'
+      return a.direction === '做空' || a.action === '卖出' ? 'var(--app-up)' : 'var(--app-down)'
     }
-    if (a.level === '止盈' || a.level === '加仓') return '#00a870'
-    if (a.level === '减仓') return '#FAAD14'
-    return '#4fc3f7'
+    if (a.level === '止盈' || a.level === '加仓') return 'var(--app-down)'
+    if (a.level === '减仓') return 'var(--td-warning-color)'
+    return 'var(--app-accent)'
   }
 
   // 提取消息对应的建议动作（买入/卖出/持有）
@@ -174,20 +181,16 @@ export default function MsgCenter() {
     } catch (_) { MessagePlugin.error('清空失败') }
   }
 
-  // 挂载时加载消息、启动轮询并订阅 SSE；卸载时清理
+  // 挂载时加载消息 + 探测做空开关；SSE 刷新/60s 兜底见下方 useSseRefresh（§F5）。
   useEffect(() => {
     load()
     // §SHORT-4 探测做空开关（关闭时消息列表隐藏做空内容）
     api.fetchShortStatus().then((r) => setShortEnabled(!!r.short_enabled)).catch(() => {})
-    timerRef.current = setInterval(load, 15000) // 每 15s 轮询刷新消息列表
-    api.connectSSE()
-    unsubSSERef.current = api.onSSE(handleSSE)
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current)
-      if (unsubSSERef.current) { unsubSSERef.current(); unsubSSERef.current = null }
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // §F5 SSE 驱动：message/scan/score 到达即刷新，60s 轮询仅兜底。
+  useSseRefresh(['message', 'scan', 'score'], load)
 
   // 渲染单条消息卡片：等级标签、股票信息、时间、操作按钮、标题与正文
   function renderAlertCard(a, i) {
@@ -197,8 +200,14 @@ export default function MsgCenter() {
     const headerRow = (
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
         <Tag theme={levelTagTheme(a.level)} size="small">{a.level}</Tag>
-        <span style={{ fontFamily: 'monospace', color: '#4fc3f7', fontWeight: 600 }}>{a.code} {a.name}</span>
-        <span style={{ color: '#555', flex: 1, fontSize: 13 }}>{fmtMsgTime(a)}</span>
+        {/* §F3 代码可点开全局个股详情抽屉（复用共享组件，携带同码相关消息） */}
+        <span
+          role="button"
+          title="查看个股详情"
+          onClick={() => setDetail({ code: a.code, name: a.name })}
+          style={{ fontFamily: 'monospace', color: 'var(--app-accent)', fontWeight: 600, cursor: 'pointer' }}
+        >{a.code} {a.name}</span>
+        <span style={{ color: 'var(--app-text-2)', flex: 1, fontSize: 13 }}>{fmtMsgTime(a)}</span>
         <Tag theme={actionTagTheme(a)} size="small" variant="light">{actionText(a)}</Tag>
         {isSellAlert(a) && (
           <Button size="small" variant="outline" theme="danger" onClick={() => onPaperSell(a)}>模拟卖出</Button>
@@ -209,8 +218,8 @@ export default function MsgCenter() {
     // 卡片主体：标题 + 正文
     const cardBody = (
       <>
-        <div style={{ fontSize: 14, color: '#1a1a1a', fontWeight: 600 }}>{a.title}</div>
-        <div style={{ fontSize: 13, color: '#999', marginTop: 4 }}>{a.body}</div>
+        <div style={{ fontSize: 14, color: 'var(--app-text)', fontWeight: 600 }}>{a.title}</div>
+        <div style={{ fontSize: 13, color: 'var(--app-muted-2)', marginTop: 4 }}>{a.body}</div>
       </>
     )
     return (
@@ -245,19 +254,32 @@ export default function MsgCenter() {
       {/* 交易信号二级筛选：按战法名称过滤（仅选中"交易信号"时显示） */}
       {activeFilter === 'trade' && strategyOptions.length > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-          <span style={{ fontSize: 14, color: '#888' }}>战法</span>
+          <span style={{ fontSize: 14, color: 'var(--app-muted)' }}>战法</span>
           <Select value={activeStrategy} onChange={(v) => setActiveStrategy(v)} size="small" style={{ width: 200 }}
             options={[{ label: '全部战法', value: 'all' }, ...strategyOptions.map((s) => ({ label: s, value: s }))]} />
         </div>
       )}
 
-      {/* 消息卡片列表：按等级着色左边框，显示标题/时间/操作按钮 */}
-      {filteredAlerts.map(renderAlertCard)}
+      {/* 消息卡片列表：按等级着色左边框，显示标题/时间/操作按钮（§F5 分页，每页 50 条） */}
+      {pagedAlerts.map(renderAlertCard)}
+
+      {/* §F5 分页控件：仅当超过一页时显示 */}
+      {filteredAlerts.length > PAGE_SIZE && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, padding: '12px 0' }}>
+          <Button size="small" variant="outline" disabled={curPage <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>上一页</Button>
+          <span style={{ color: 'var(--app-muted-2)', fontSize: 13 }}>第 {curPage} / {totalPages} 页 · 共 {filteredAlerts.length} 条</span>
+          <Button size="small" variant="outline" disabled={curPage >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>下一页</Button>
+        </div>
+      )}
 
       {/* 空状态提示：无匹配消息时展示 */}
       {filteredAlerts.length === 0 && (
-        <div style={{ textAlign: 'center', padding: 60, color: '#555' }}>暂无消息</div>
+        <div style={{ textAlign: 'center', padding: 60, color: 'var(--app-text-2)' }}>暂无消息</div>
       )}
+
+      {/* §F3 全局个股详情抽屉：实时价 + 分时/盘口 + 同码相关消息 */}
+      <StockDetailDrawer open={!!detail} code={detail?.code} name={detail?.name}
+        related={{ messages: alerts }} onClose={() => setDetail(null)} />
     </div>
   )
 }

@@ -7,6 +7,8 @@ import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin, Input } from '
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import LogModal from '../components/LogModal.jsx'
+import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+import { on } from '../sseBus.js'
 import { Loading } from '../ui.jsx'
 
 // 顶部快捷筛选：按 remind_level 划分（all/strong/observe/mute）
@@ -35,7 +37,7 @@ function d1Tag(s) {
 
 // 涨跌配色（红涨绿跌）
 function chgColor(v) {
-  return (v || 0) >= 0 ? '#e34d59' : '#00a870'
+  return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
 }
 
 // 通用表头排序器工厂（§修复 P2#23 提取为纯函数，供排序单测覆盖）：
@@ -78,6 +80,8 @@ export default function Signals() {
   const [showLog, setShowLog] = useState(false)
   // 移动端底部操作面板对应的信号
   const [sheetSignal, setSheetSignal] = useState(null)
+  // §F3 全局个股详情抽屉目标（{code,name,price,changePct}），null=关闭
+  const [detail, setDetail] = useState(null)
   // 模拟盘是否启用（决定是否显示「模拟买入」）
   const [paperOn, setPaperOn] = useState(false)
   // §SHORT-4 做空开关（决策⑤）：关闭时列表整体隐藏做空信号；开启后追加方向筛选与红徽标
@@ -87,12 +91,10 @@ export default function Signals() {
   const [tradeTarget, setTradeTarget] = useState({})
   // 待确认交易动作（buy/ignore）
   const [tradeAction, setTradeAction] = useState('')
-  // 主数据轮询定时器（5s）
+  // §F5 兜底轮询定时器（20s，此前 5s；新信号主要靠 SSE scan 即时刷新）
   const timer = useRef(null)
   // 页面可见性变化处理函数
   const visHandler = useRef(null)
-  // SSE 订阅取消函数
-  const unsubSSE = useRef(null)
   // §修复 P2#23：受控排序——所有列可点击表头排序（此前表格完全没有 sorter，点表头无反应），
   // 受控状态保证 5s 轮询整体替换信号列表时用户选择的排序不被重置。
   // English: P2#23 — controlled sort so every column is header-sortable (previously the table had no
@@ -226,7 +228,8 @@ export default function Signals() {
     try { setShortEnabled(!!(await api.fetchShortStatus()).short_enabled) } catch (_) {}
   }
 
-  // SSE 新信号或扫描到达时刷新列表
+  // §F5 SSE 新信号/扫描到达时刷新列表（改走 App 单连接扇出的事件总线，不再各页自建 SSE 连接）
+  const unsubBus = useRef(null)
   function handleSSE(msg) {
     if (msg.signal || msg.type === 'scan') load()
   }
@@ -236,25 +239,25 @@ export default function Signals() {
     load()
     probePaper()
     probeShort()
-    // 每 5s 轮询刷新信号列表
-    timer.current = setInterval(load, 5000)
+    // §F5 兜底轮询由 5s 降为 20s（信号看板需较实时）；新信号主要靠 SSE `scan` 即时刷新
+    timer.current = setInterval(load, 20000)
     visHandler.current = () => {
       if (document.hidden) {
         if (timer.current) { clearInterval(timer.current); timer.current = null }
       } else if (!timer.current) {
         load()
-        timer.current = setInterval(load, 5000)
+        timer.current = setInterval(load, 20000)
       }
     }
     document.addEventListener('visibilitychange', visHandler.current)
-    api.connectSSE()
-    unsubSSE.current = api.onSSE(handleSSE)
+    // §F5 订阅事件总线（App 拥有唯一 SSE 连接并分发）
+    unsubBus.current = on(['scan', 'message'], handleSSE)
 
-    // 清理：清除轮询定时器、移除可见性监听、取消SSE订阅
+    // 清理：清除轮询定时器、移除可见性监听、取消事件总线订阅
     return () => {
       if (timer.current) clearInterval(timer.current)
       if (visHandler.current) document.removeEventListener('visibilitychange', visHandler.current)
-      if (unsubSSE.current) unsubSSE.current()
+      if (unsubBus.current) unsubBus.current()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -296,7 +299,7 @@ export default function Signals() {
       // 用户可判断信号新旧（此前只有现价/策略，无法区分是早盘还是午后产生的信号）
       colKey: 'generated_at', title: '产生时间', width: 155,
       sorter: sorterStr('generated_at'),
-      cell: ({ row }) => <span style={{ fontSize: 12, color: '#888' }}>{row.generated_at || '-'}</span>,
+      cell: ({ row }) => <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>{row.generated_at || '-'}</span>,
     },
     {
       colKey: 'total_score', title: '总分', width: 70, sorter: sorterNum('total_score'),
@@ -323,21 +326,21 @@ export default function Signals() {
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
           {/* D1 事件维度（红） */}
           <span title={'D1事件: ' + (row.d1_reason || row.d1_event || '无事件') + (row.d1_blocked ? '（负面拦截）' : '')}
-            style={{ color: '#e34d59', background: 'rgba(227,77,89,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+            style={{ color: 'var(--app-up)', background: 'rgba(227,77,89,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d1_score && (row.d1_reason || row.d1_event)
               ? <em style={{ fontStyle: 'normal' }}>{d1Tag(row)}</em>
               : (row.d1 != null ? row.d1.toFixed(0) : '—')}
           </span>
           {/* D2 龙头/动量维度（黄） */}
-          <span title={'D2: ' + (row.d2_desc || '')} style={{ color: '#FAAD14', background: 'rgba(250,173,20,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+          <span title={'D2: ' + (row.d2_desc || '')} style={{ color: 'var(--td-warning-color)', background: 'rgba(250,173,20,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d2 != null ? row.d2.toFixed(0) : '—'}{row.d2_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d2_desc)}</em>}
           </span>
           {/* D3 N形/结构维度（蓝） */}
-          <span title={'D3: ' + (row.d3_desc || '')} style={{ color: '#4fc3f7', background: 'rgba(79,195,247,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+          <span title={'D3: ' + (row.d3_desc || '')} style={{ color: 'var(--app-accent)', background: 'rgba(79,195,247,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d3 != null ? row.d3.toFixed(0) : '—'}{row.d3_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d3_desc)}</em>}
           </span>
           {/* D4 基本面/回踩维度（绿） */}
-          <span title={'D4: ' + (row.d4_desc || '')} style={{ color: '#00a870', background: 'rgba(0,168,112,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
+          <span title={'D4: ' + (row.d4_desc || '')} style={{ color: 'var(--app-down)', background: 'rgba(0,168,112,0.10)', padding: '0 5px', borderRadius: 3, whiteSpace: 'nowrap' }}>
             {row.d4 != null ? row.d4.toFixed(0) : '—'}{row.d4_desc && <em style={{ fontStyle: 'normal' }}>{shortDesc(row.d4_desc)}</em>}
           </span>
         </div>
@@ -386,7 +389,7 @@ export default function Signals() {
   function sheetBtnStyle(color) {
     return {
       width: '100%', padding: 14, borderRadius: 8, border: 'none',
-      background: '#f4f4f5', color, fontSize: 16, cursor: 'pointer', marginBottom: 8, textAlign: 'center',
+      background: 'var(--app-surface-2)', color, fontSize: 16, cursor: 'pointer', marginBottom: 8, textAlign: 'center',
     }
   }
 
@@ -454,10 +457,10 @@ export default function Signals() {
           display: 'flex', alignItems: 'flex-end',
         }} onClick={() => setSheetSignal(null)}>
           <div style={{
-            width: '100%', background: '#1a1a2e', borderRadius: '14px 14px 0 0',
+            width: '100%', background: 'var(--app-surface)', borderRadius: '14px 14px 0 0',
             padding: '10px 12px calc(10px + env(safe-area-inset-bottom, 0px))',
           }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ fontSize: 14, color: '#999', textAlign: 'center', padding: '8px 0 12px', borderBottom: '1px solid #eef0f3', marginBottom: 8 }}>
+            <div style={{ fontSize: 14, color: 'var(--app-muted-2)', textAlign: 'center', padding: '8px 0 12px', borderBottom: '1px solid #eef0f3', marginBottom: 8 }}>
               {sheetSignal.code} {sheetSignal.name || ''} · {sheetSignal.strategy}
             </div>
             {sheetSignal.can_open && (
@@ -468,15 +471,17 @@ export default function Signals() {
               <button style={sheetBtnStyle('#52c41a')} onClick={() => { const s = sheetSignal; setSheetSignal(null); paperBuy(s) }}>模拟买入</button>
             )}
             {sheetSignal.action === 'buy' && (
-              <button style={sheetBtnStyle('#4fc3f7')} onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'ignore') }}>忽略</button>
+              <button style={sheetBtnStyle('var(--app-accent)')} onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'ignore') }}>忽略</button>
             )}
             {!sheetSignal.can_open && sheetSignal.action !== 'buy' && (
-              <button style={sheetBtnStyle('#4fc3f7')} onClick={() => { const s = sheetSignal; setSheetSignal(null); collectToWatchlist(s) }}>收藏</button>
+              <button style={sheetBtnStyle('var(--app-accent)')} onClick={() => { const s = sheetSignal; setSheetSignal(null); collectToWatchlist(s) }}>收藏</button>
             )}
-            <button style={sheetBtnStyle('#4fc3f7')} onClick={() => { toggleKline(sheetSignal.code); setSheetSignal(null) }}>
+            <button style={sheetBtnStyle('var(--app-accent)')} onClick={() => { toggleKline(sheetSignal.code); setSheetSignal(null) }}>
               {klineOpen.has(sheetSignal.code) ? '收起分时' : '展开分时'}
             </button>
-            <button style={{ ...sheetBtnStyle('#888'), background: '#eef0f3' }} onClick={() => setSheetSignal(null)}>取消</button>
+            {/* §F3 详情：打开全局个股详情抽屉（实时价+分时/盘口+同码相关信号） */}
+            <button style={sheetBtnStyle('#722ed1')} onClick={() => { const s = sheetSignal; setSheetSignal(null); if (s) setDetail({ code: s.code, name: s.name, price: s.price, changePct: s.change_pct }) }}>详情</button>
+            <button style={{ ...sheetBtnStyle('var(--app-muted)'), background: 'var(--app-divider)' }} onClick={() => setSheetSignal(null)}>取消</button>
           </div>
         </div>
       )}
@@ -491,6 +496,11 @@ export default function Signals() {
       </Dialog>
 
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
+
+      {/* §F3 全局个股详情抽屉：行点开，实时价 + 分时/盘口 + 同码相关信号 */}
+      <StockDetailDrawer open={!!detail} code={detail?.code} name={detail?.name}
+        price={detail?.price} changePct={detail?.changePct}
+        related={{ signals }} onClose={() => setDetail(null)} />
     </div>
   )
 }

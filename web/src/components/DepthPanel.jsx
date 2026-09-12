@@ -6,6 +6,7 @@ import * as api from '../api/index.js'
 import './DepthPanel.css'
 
 // 盘口面板配色常量（文字/现价底/买卖盘/涨跌/数据源色）
+import { subscribeTheme } from '../theme.js'
 const C = {
   bg: '#ffffff',
   lv: '#606266',
@@ -16,6 +17,19 @@ const C = {
   up: '#f5222d',
   down: '#16a34a',
   src: '#1677ff',
+}
+
+// refreshPalette 从当前主题的 --app-* 令牌刷新盘口 canvas 底色/文字色（语义涨跌色保持不变）。
+// English: refreshPalette pulls the live theme's surface/text tokens into the depth canvas
+// (semantic ask/bid/up/down colors stay fixed).
+function refreshPalette() {
+  if (typeof document === 'undefined' || typeof getComputedStyle !== 'function') return
+  const s = getComputedStyle(document.documentElement)
+  const g = (name, fb) => { const v = (s.getPropertyValue(name) || '').trim(); return v || fb }
+  C.bg = g('--app-surface', C.bg)
+  C.lv = g('--app-text-2', C.lv)
+  C.vol = g('--app-muted', C.vol)
+  C.nowBg = g('--app-surface-2', C.nowBg)
 }
 
 // 格式化价格：保留两位小数，空值返回占位符 '--'
@@ -44,6 +58,9 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
   const [error, setError] = useState('')
   const [dispName, setDispName] = useState(name)
   const [viewW, setViewW] = useState(300)
+  // §F4 主题版本计数：主题切换时自增触发重绘。English: theme version counter; bumped on theme change to repaint.
+  const [themeTick, setThemeTick] = useState(0)
+  useEffect(() => subscribeTheme(() => setThemeTick((n) => n + 1)), [])
 
   const wrapRef = useRef(null)    // 容器 DOM 引用（取可用宽度）
   const canvasRef = useRef(null)  // 画布 DOM 引用（绘制盘口图）
@@ -115,6 +132,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
   useEffect(() => {
     const cvs = canvasRef.current
     if (!cvs || !ob || !ob.bids || !ob.bids.length) return
+    refreshPalette() // §F4 每帧同步当前主题令牌配色
 
     // 画布初始化：按 devicePixelRatio 高清适配
     const dpr = window.devicePixelRatio || 1
@@ -261,7 +279,7 @@ export default function DepthPanel({ code, name = '', height = 260 }) {
         { label: '覆盖', val: F.near_pct.toFixed(2) + '%' }
       )
     }
-  }, [ob, factors, viewW, height, pctText])
+  }, [ob, factors, viewW, height, pctText, themeTick])
 
   return (
     <div className="depth-panel">

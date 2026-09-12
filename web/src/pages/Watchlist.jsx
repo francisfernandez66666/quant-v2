@@ -6,6 +6,7 @@ import { Card, Table, Button, Input, Dialog, MessagePlugin } from 'tdesign-react
 import * as api from '../api/index.js'
 import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
+import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 
 // 自选股列表的 localStorage 缓存键
 const CACHE_KEY = 'wl_cache_v1'
@@ -25,10 +26,10 @@ function loadCache() {
 
 // 根据分数与阈值返回评分单元格的颜色样式
 function scoreStyle(score, pass, strongMin) {
-  if (!score || score <= 0) return { color: '#555', fontWeight: 600 }
-  if (score >= strongMin) return { color: '#e34d59', fontWeight: 600 }
-  if (pass) return { color: '#FAAD14', fontWeight: 600 }
-  return { color: '#555', fontWeight: 600 }
+  if (!score || score <= 0) return { color: 'var(--app-text-2)', fontWeight: 600 }
+  if (score >= strongMin) return { color: 'var(--app-up)', fontWeight: 600 }
+  if (pass) return { color: 'var(--td-warning-color)', fontWeight: 600 }
+  return { color: 'var(--app-text-2)', fontWeight: 600 }
 }
 
 // 安全读取字段值
@@ -54,6 +55,8 @@ export default function Watchlist() {
   const [expandedKeys, setExpandedKeys] = useState([])
   // 移动端操作面板对应的自选股
   const [sheetStock, setSheetStock] = useState(null)
+  // §F3 全局个股详情抽屉目标（{code,name,price,changePct}），null=关闭
+  const [detail, setDetail] = useState(null)
   // 轮询定时器（30s）
   const timer = useRef(null)
   // §修复 P2#23：受控排序状态——点击表头排序后持久保留，避免 30s 数据轮询整体替换把排序重置
@@ -65,7 +68,7 @@ export default function Watchlist() {
     setStocks(loadCache())
     load()
     // 每 30s 轮询刷新自选股行情与评分
-    timer.current = setInterval(load, 30000)
+    timer.current = setInterval(load, 60000) // §F5 兜底降为 60s
     return () => { if (timer.current) clearInterval(timer.current) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -211,13 +214,13 @@ export default function Watchlist() {
   // 五个维度评分（可排序），K线展开与删除操作
   const columns = [
     // 代码列：蓝色等宽字体展示，支持按代码排序
-    { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
+    { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name, price: row.price, changePct: row.change_pct }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     // 名称列：灰色字体，支持按名称排序
-    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name || '-'}</span> },
+    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name || '-'}</span> },
     // 现价列：带人民币符号，支持按价格排序
     { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
     // 涨跌幅列：红涨绿跌配色，支持按涨跌排序
-    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
     // N形评分列：≥80红色强势，≥60黄色达标，<60灰色偏低
     { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => { const c = scoreStyle(row.n_score, row.n_pass, 80); return <span style={c}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> } },
     // 龙头评分列：≥70买入，50-70观察
@@ -292,13 +295,13 @@ export default function Watchlist() {
       )}
 
       {/* 评分图例：颜色含义 + 各维度操作阈值说明 */}
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: '#888', marginTop: 12 }}>
-        <span style={{ color: '#e34d59' }}>≥80 强势</span>
-        <span style={{ color: '#FAAD14' }}>≥门槛 达标</span>
-        <span style={{ color: '#555' }}>&lt;门槛 偏低</span>
-        <span style={{ color: '#555' }}>|</span>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: 'var(--app-muted)', marginTop: 12 }}>
+        <span style={{ color: 'var(--app-up)' }}>≥80 强势</span>
+        <span style={{ color: 'var(--td-warning-color)' }}>≥门槛 达标</span>
+        <span style={{ color: 'var(--app-text-2)' }}>&lt;门槛 偏低</span>
+        <span style={{ color: 'var(--app-text-2)' }}>|</span>
         <span>N形≥60操作, 龙头≥70买入/≥50观察, 双凸≥70买入/50-70观察, 回头≥60入场, 动量≥50关注</span>
-        <span style={{ color: '#555' }}>|</span>
+        <span style={{ color: 'var(--app-text-2)' }}>|</span>
         <span>点击表头排序</span>
       </div>
 
@@ -318,6 +321,10 @@ export default function Watchlist() {
           <Button theme="default" onClick={() => setSheetStock(null)}>取消</Button>
         </div>
       </Dialog>
+
+      {/* §F3 全局个股详情抽屉：代码点开，实时价 + 分时/盘口 */}
+      <StockDetailDrawer open={!!detail} code={detail?.code} name={detail?.name}
+        price={detail?.price} changePct={detail?.changePct} onClose={() => setDetail(null)} />
     </div>
   )
 }

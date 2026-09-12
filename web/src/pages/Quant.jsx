@@ -48,7 +48,7 @@ function writeCachedForm(form) {
 
 // 涨跌配色（红涨绿跌）：盈亏 >=0 用红色，<0 用绿色
 function pnlColor(v) {
-  return (v || 0) >= 0 ? '#e34d59' : '#00a870'
+  return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
 }
 
 // 通用确认弹窗：返回 Promise<boolean>，用户确认 resolve(true)、关闭/取消 resolve(false)。
@@ -360,8 +360,8 @@ export default function Quant() {
     marginRight: 8,
     padding: '5px 14px', borderRadius: 6, fontSize: 13, cursor: 'pointer',
     border: active ? '1px solid #1d4ed8' : '1px solid #cfd9ec',
-    color: active ? '#ffffff' : '#5a6b86',
-    background: active ? '#1d4ed8' : 'transparent',
+    color: active ? '#ffffff' : 'var(--app-text-2)',
+    background: active ? 'var(--td-brand-color)' : 'transparent',
     fontWeight: active ? 600 : 400,
   })
 
@@ -383,12 +383,12 @@ export default function Quant() {
     { colKey: 'code', title: '代码', width: 90 },
     {
       colKey: 'side', title: '方向', width: 80,
-      cell: ({ row }) => <span style={{ color: row.side === '买入' ? '#e34d59' : '#00a870' }}>{row.side}</span>,
+      cell: ({ row }) => <span style={{ color: row.side === '买入' ? 'var(--app-up)' : 'var(--app-down)' }}>{row.side}</span>,
     },
     { colKey: 'price', title: '价格', width: 90 },
     { colKey: 'qty', title: '数量', width: 80 },
     { colKey: 'amount', title: '金额', width: 100 },
-    { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => <span style={{ color: '#666' }}>{row.strategy}</span> },
+    { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => <span style={{ color: 'var(--app-text-2)' }}>{row.strategy}</span> },
   ]
 
   // 渲染"总开关与执行方式"表单内容：总开关、执行模式、委托价格、自动卖出、心跳超时、网关地址、Token
@@ -397,14 +397,14 @@ export default function Quant() {
     const masterSwitch = (
       <Form.FormItem label="实盘总开关">
         {syncing ? (
-          <span style={{ fontSize: 13, color: '#999' }}>同步中…</span>
+          <span style={{ fontSize: 13, color: 'var(--app-muted-2)' }}>同步中…</span>
         ) : (
           <ToggleSw checked={form.enabled} onChange={(v) => { setForm({ ...form, enabled: v }); saveSwitches(v) }} />
         )}
-        <span style={{ color: loadErr ? '#b71c1c' : '#00a870', fontSize: 11, marginLeft: 10 }}>
+        <span style={{ color: loadErr ? 'var(--app-up)' : 'var(--app-down)', fontSize: 11, marginLeft: 10 }}>
           {loadErr ? '⚠ 未同步服务器（下方为本地缓存，非真实状态）' : '已同步服务器 ✓'}
         </span>
-        <span style={{ color: '#666', fontSize: 11, marginLeft: 10, display: 'block', marginTop: 4 }}>
+        <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10, display: 'block', marginTop: 4 }}>
           关闭后引擎不再向网关传递任何信号/建议（纸面盘不受影响）
         </span>
       </Form.FormItem>
@@ -414,7 +414,7 @@ export default function Quant() {
       <Form.FormItem label="执行模式">
         <span style={segBtn(form.mode === 'manual')} onClick={() => saveMode('manual')}>手动确认</span>
         <span style={segBtn(form.mode === 'auto')} onClick={() => saveMode('auto')}>全自动</span>
-        <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存；手动=每单前端确认；自动=信号直接下单</span>
+        <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存；手动=每单前端确认；自动=信号直接下单</span>
       </Form.FormItem>
     )
     // 委托价格：对手价（市价）或限价
@@ -422,14 +422,14 @@ export default function Quant() {
       <Form.FormItem label="委托价格">
         <span style={segBtn(form.price_type === 'market')} onClick={() => savePriceType('market')}>对手价</span>
         <span style={segBtn(form.price_type === 'limit')} onClick={() => savePriceType('limit')}>限价</span>
-        <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存</span>
+        <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>点击立即生效并保存</span>
       </Form.FormItem>
     )
     // 自动卖出：自动模式下止损/清仓级建议自动全仓卖出
     const autoSell = (
       <Form.FormItem label="自动卖出">
         <ToggleSw checked={form.auto_sell} onChange={(v) => { setForm({ ...form, auto_sell: v }); saveAutoSell(v) }} />
-        <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>自动模式下止损/清仓级建议自动全仓卖出；止盈/减仓保持提醒</span>
+        <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>自动模式下止损/清仓级建议自动全仓卖出；止盈/减仓保持提醒</span>
       </Form.FormItem>
     )
     // §SHORT-4 做空战法自动卖出状态（决策②⑤）：开关与顶部全局做空开关同源；
@@ -445,7 +445,7 @@ export default function Quant() {
             MessagePlugin.success(r.short_enabled ? '做空已开启' : '做空已关闭')
           } catch (_) { MessagePlugin.error('做空开关切换失败') }
         }} />
-        <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>
+        <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>
           持有个股命中做空战法（高位滞涨/放量破位/龙头断板/利好兑现砸盘）自动卖出
           {form.mode === 'auto' && form.auto_sell ? '（当前满足：全自动+自动卖出）' : '（需「全自动 + 自动卖出」才代执行，否则 P1 强提醒手动处理）'}
           {shortPoolOn ? '；模拟盘融券池已开设' : ''}
@@ -457,7 +457,7 @@ export default function Quant() {
       <Form.FormItem label="心跳超时(秒)">
         <Input style={{ width: 140 }} type="number" value={form.miss_heartbeat_sec} min={30} max={3600}
           onChange={(v) => setForm({ ...form, miss_heartbeat_sec: parseInt(v, 10) })} />
-        <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>连续失联超过该值触发熔断暂停下单（30-3600）</span>
+        <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>连续失联超过该值触发熔断暂停下单（30-3600）</span>
       </Form.FormItem>
     )
     // 网关地址配置
@@ -472,7 +472,7 @@ export default function Quant() {
       <Form.FormItem label="鉴权Token">
         <Input style={{ flex: 1, minWidth: 240 }} type="password" value={tokenInput} placeholder={form.token_masked || '未设置'}
           onChange={(v) => setTokenInput(v)} />
-        <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>显示为脱敏形态；留空表示保持原值不变</span>
+        <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>显示为脱敏形态；留空表示保持原值不变</span>
       </Form.FormItem>
     )
     // 保存按钮
@@ -502,41 +502,41 @@ export default function Quant() {
     // 最大持仓数：1-50，双端校验
     const maxPos = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <label style={{ fontSize: 12, color: '#aaa' }}>最大持仓数</label>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>最大持仓数</label>
         <Input type="number" value={form.max_positions} min={1} max={50} onChange={(v) => setForm({ ...form, max_positions: parseInt(v, 10) })} />
-        <span style={{ fontSize: 10, color: '#666' }}>1-50，双端校验</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>1-50，双端校验</span>
       </div>
     )
     // 单票金额：每次买入投入金额
     const fixedAmt = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <label style={{ fontSize: 12, color: '#aaa' }}>单票金额(元)</label>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单票金额(元)</label>
         <Input type="number" value={form.fixed_amount} min={0} step={500} onChange={(v) => setForm({ ...form, fixed_amount: parseFloat(v) })} />
-        <span style={{ fontSize: 10, color: '#666' }}>每次买入投入金额</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>每次买入投入金额</span>
       </div>
     )
     // 初始资金：用于仓位约束预检
     const initCap = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <label style={{ fontSize: 12, color: '#aaa' }}>初始资金(元)</label>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>初始资金(元)</label>
         <Input type="number" value={form.initial_capital} min={0} step={10000} onChange={(v) => setForm({ ...form, initial_capital: parseFloat(v) })} />
-        <span style={{ fontSize: 10, color: '#666' }}>用于仓位约束预检</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>用于仓位约束预检</span>
       </div>
     )
     // 单日买入笔数上限：0=不设限，防信号风暴
     const dailyBuys = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <label style={{ fontSize: 12, color: '#aaa' }}>单日买入笔数上限</label>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单日买入笔数上限</label>
         <Input type="number" value={form.daily_max_buys} min={0} onChange={(v) => setForm({ ...form, daily_max_buys: parseInt(v, 10) })} />
-        <span style={{ fontSize: 10, color: '#666' }}>0=不设限，防信号风暴</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，防信号风暴</span>
       </div>
     )
     // 单日买入预算：0=不设限，超出拒绝新买入
     const dailyBudget = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <label style={{ fontSize: 12, color: '#aaa' }}>单日买入预算(元)</label>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单日买入预算(元)</label>
         <Input type="number" value={form.daily_budget_amount} min={0} step={10000} onChange={(v) => setForm({ ...form, daily_budget_amount: parseFloat(v) })} />
-        <span style={{ fontSize: 10, color: '#666' }}>0=不设限，超出拒绝新买入</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，超出拒绝新买入</span>
       </div>
     )
     return (
@@ -554,13 +554,13 @@ export default function Quant() {
   // 渲染战法开关列表：按类型分组，每项含名称、ID、自定义金额、准入开关
   function renderStrategyGroups() {
     if (strategyGroups.length === 0) {
-      return <div style={{ color: '#666', fontSize: 13, padding: '8px 2px' }}>暂无可用战法</div>
+      return <div style={{ color: 'var(--app-text-2)', fontSize: 13, padding: '8px 2px' }}>暂无可用战法</div>
     }
     // 渲染单个战法组：标题 + 战法项列表
     function renderGroup(grp) {
       // 战法组标题：蓝色左边框 + 类型名称
       const groupTitle = (
-        <div style={{ fontSize: 13, fontWeight: 700, color: '#1d4ed8', margin: '4px 0 6px', paddingLeft: 4, borderLeft: '3px solid #1d4ed8' }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--td-brand-color)', margin: '4px 0 6px', paddingLeft: 4, borderLeft: '3px solid #1d4ed8' }}>
           {grp.label}
         </div>
       )
@@ -570,14 +570,14 @@ export default function Quant() {
           <div key={s.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '9px 4px', borderBottom: '1px solid #ededed' }}>
             {/* 战法名称+ID */}
             <div>
-              <div style={{ fontSize: 13, color: '#333' }}>{s.name}</div>
-              <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#555', marginTop: 2 }}>{s.id}</div>
+              <div style={{ fontSize: 13, color: 'var(--app-text)' }}>{s.name}</div>
+              <div style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--app-text-2)', marginTop: 2 }}>{s.id}</div>
             </div>
             {/* 金额输入+开关：自定义单次金额，开关控制准入状态 */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, justifyContent: 'flex-end' }}>
               <Input style={{ width: 100 }} type="number" min={0} step={500} value={amountsInput[s.id] ?? ''} placeholder="全局"
                 onChange={(v) => setAmountsInput({ ...amountsInput, [s.id]: v })} />
-              <span style={{ fontSize: 11, color: '#666' }}>元/次</span>
+              <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>元/次</span>
               <ToggleSw checked={!!strategyOn[s.id]} onChange={(v) => { setStrategyOn({ ...strategyOn, [s.id]: v }); markStrategyDirty() }} />
             </div>
           </div>
@@ -598,37 +598,37 @@ export default function Quant() {
   function renderSummaryCards() {
     // 总盈亏指标卡
     const totalPnl = (
-      <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+      <div style={{ background: 'var(--app-surface-2)', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
         <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: pnlColor(trades.summary.total_pnl) }}>{fmtMoney(trades.summary.total_pnl)}</div>
-        <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>总盈亏</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginTop: 3 }}>总盈亏</div>
       </div>
     )
     // 已实现盈亏指标卡
     const realizedPnl = (
-      <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+      <div style={{ background: 'var(--app-surface-2)', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
         <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: pnlColor(trades.summary.realized_pnl) }}>{fmtMoney(trades.summary.realized_pnl)}</div>
-        <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>已实现</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginTop: 3 }}>已实现</div>
       </div>
     )
     // 浮动盈亏指标卡
     const unrealizedPnl = (
-      <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+      <div style={{ background: 'var(--app-surface-2)', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
         <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: pnlColor(trades.summary.unrealized_pnl) }}>{fmtMoney(trades.summary.unrealized_pnl)}</div>
-        <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>浮动盈亏</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginTop: 3 }}>浮动盈亏</div>
       </div>
     )
     // 成交笔数指标卡
     const tradeCount = (
-      <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
-        <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: '#1a1a1a' }}>{trades.summary.trade_count}</div>
-        <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>成交笔数</div>
+      <div style={{ background: 'var(--app-surface-2)', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+        <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: 'var(--app-text)' }}>{trades.summary.trade_count}</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginTop: 3 }}>成交笔数</div>
       </div>
     )
     // 卖出胜负统计卡
     const winLoss = (
-      <div style={{ background: '#eef4fc', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
-        <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: '#1a1a1a' }}>{trades.summary.wins}胜 / {trades.summary.losses}负</div>
-        <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>卖出胜负</div>
+      <div style={{ background: 'var(--app-surface-2)', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #eef0f3' }}>
+        <div style={{ fontSize: 18, fontWeight: 700, fontFamily: 'monospace', color: 'var(--app-text)' }}>{trades.summary.wins}胜 / {trades.summary.losses}负</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginTop: 3 }}>卖出胜负</div>
       </div>
     )
     return (
@@ -647,18 +647,18 @@ export default function Quant() {
     <div className="page">
       {/* 页面标题与说明 */}
       <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>📈 量化交易</div>
-      <div style={{ fontSize: 12, color: '#888', marginBottom: 14 }}>实盘链路参数、仓位纪律与战法白名单（修改提交后，待下一交易时段自动生效）</div>
+      <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 14 }}>实盘链路参数、仓位纪律与战法白名单（修改提交后，待下一交易时段自动生效）</div>
 
       {/* 配置加载失败警告：提示用户当前显示的是本地缓存值 */}
       {loadErr && (
-        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: '#fdecea', border: '1px solid #f5c6c2', color: '#b71c1c', fontSize: 12 }}>
+        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: 'var(--app-warn-bg)', border: '1px solid var(--app-warn-border)', color: 'var(--app-warn-text)', fontSize: 12 }}>
           ⚠️ {loadErr}
         </div>
       )}
 
       {/* 无权限访问提示：普通用户无法操作量化交易页面 */}
       {forbidden && (
-        <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: '#ad6800', fontSize: 13 }}>
+        <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
           🔒 无权限访问量化交易：当前登录「{api.getAccount() || '未知'}」为普通用户，该页面仅管理员账号可操作。请使用管理员账号（用户名 admin）登录后再进行管理。
         </div>
       )}
@@ -681,10 +681,10 @@ export default function Quant() {
 
       {/* 战法开关卡片：按类型分组展示各战法的准入开关与自定义金额 */}
       <Card title="战法开关" style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, color: '#666', marginBottom: 12 }}>关闭的战法信号不会进入实盘链路（模拟盘不受影响）；全部开启 = 不设白名单。因子/形态战法需先在「自动研究」页审批应用后才会出现在此处。</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 12 }}>关闭的战法信号不会进入实盘链路（模拟盘不受影响）；全部开启 = 不设白名单。因子/形态战法需先在「自动研究」页审批应用后才会出现在此处。</div>
         {renderStrategyGroups()}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'flex-end', marginTop: 10 }}>
-          <span style={{ fontSize: 11, color: '#666' }}>{strategyHint} · 仓位留空/0 = 使用全局单票金额</span>
+          <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>{strategyHint} · 仓位留空/0 = 使用全局单票金额</span>
           <Button theme="primary" disabled={!strategyDirty || saving} onClick={saveStrategies}>
             {saving ? '保存中…' : (strategyDirty ? '保存战法开关 *' : '已同步')}
           </Button>
@@ -693,7 +693,7 @@ export default function Quant() {
 
       {/* 交易流水与整体盈亏卡片：汇总指标 + 分战法盈亏表 + 成交流水表 */}
       <Card title="交易流水与整体盈亏" style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, color: '#666', marginBottom: 12 }}>已实现=加权成本重放；浮动=市值-成本×数量；30s 刷新</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 12 }}>已实现=加权成本重放；浮动=市值-成本×数量；30s 刷新</div>
         {trades && trades.summary ? (
           <>
             {renderSummaryCards()}
@@ -703,7 +703,7 @@ export default function Quant() {
                 <Table data={trades.by_strategy} columns={byStrategyColumns} rowKey="strategy" size="small" pagination={false} />
               </div>
             ) : (
-              <div style={{ padding: '8px 2px', color: '#666', fontSize: 13 }}>暂无成交——实盘成交后此处出现按战法归因的盈亏统计（飞轮回流数据源）</div>
+              <div style={{ padding: '8px 2px', color: 'var(--app-text-2)', fontSize: 13 }}>暂无成交——实盘成交后此处出现按战法归因的盈亏统计（飞轮回流数据源）</div>
             )}
             {/* 成交流水明细表：时间、代码、方向、价格、数量、金额、战法 */}
             {(trades.fills || []).length ? (
@@ -713,7 +713,7 @@ export default function Quant() {
             ) : null}
           </>
         ) : (
-          <div style={{ color: '#666', fontSize: 13 }}>加载交易流水…</div>
+          <div style={{ color: 'var(--app-text-2)', fontSize: 13 }}>加载交易流水…</div>
         )}
       </Card>
     </div>

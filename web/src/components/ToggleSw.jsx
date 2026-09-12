@@ -33,7 +33,7 @@ export default function ToggleSw({ checked, onChange, disabled }) {
         border: 'none',
         padding: 0,
         // 背景色即开关状态色：开=绿色、关=灰色；悬停指针/禁用指针区分交互态
-        background: on ? '#00a870' : '#c0c4cc',
+        background: on ? 'var(--app-down)' : 'var(--app-faint)',
         cursor: disabled ? 'not-allowed' : 'pointer',
         transition: 'background 0.2s',
         // flex:none：不被父级 flex 布局拉伸；inline-block 对齐基线

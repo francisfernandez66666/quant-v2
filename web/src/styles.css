@@ -4,8 +4,8 @@
 html, body, #app { height: 100%; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  background: #eaf1fb;
-  color: #1a1a1a;
+  background: var(--app-bg);
+  color: var(--app-text);
   -webkit-tap-highlight-color: transparent;
   font-size: 14px;
 }
@@ -14,54 +14,54 @@ body {
 .app-shell { display: flex; flex-direction: column; height: 100vh; width: 100vw; overflow: hidden; }
 .app-header {
   flex-shrink: 0; height: 56px; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 16px; background: #fff; border-bottom: 1px solid #e7e7e7; gap: 12px;
+  padding: 0 16px; background: var(--app-surface); border-bottom: 1px solid var(--app-border); gap: 12px;
 }
 .app-body { flex: 1; display: flex; min-height: 0; width: 100%; }
 .app-aside {
-  width: 210px; flex-shrink: 0; background: #f5f9ff; border-right: 1px solid #dbe6f5;
+  width: 210px; flex-shrink: 0; background: var(--app-aside-bg); border-right: 1px solid var(--app-border);
   display: flex; flex-direction: column; overflow: hidden;
 }
 .app-main { flex: 1; min-width: 0; overflow: auto; }
 
-/* 卡片统一柔和浅蓝描边 + 轻投影，从浅蓝画布上浮起，减少纯白刺眼感 */
-.t-card { box-shadow: 0 1px 6px rgba(31, 80, 160, 0.08); border-color: #dbe6f5; }
+/* 卡片统一柔和描边 + 轻投影（令牌化，随主题切换） */
+.t-card { box-shadow: 0 1px 6px var(--app-shadow); border-color: var(--app-border); }
 
 /* 侧边栏品牌与底部信息 */
-.brand-logo { padding: 18px 16px; font-size: 18px; font-weight: 700; color: #e34d59; border-bottom: 1px solid #eee; }
-.sidebar-footer { padding: 12px 16px; border-top: 1px solid #eee; }
-.account-name { font-size: 13px; color: #1a1a1a; }
+.brand-logo { padding: 18px 16px; font-size: 18px; font-weight: 700; color: var(--app-brand); border-bottom: 1px solid var(--app-border-2); }
+.sidebar-footer { padding: 12px 16px; border-top: 1px solid var(--app-border-2); }
+.account-name { font-size: 13px; color: var(--app-text); }
 .role-badge { display: inline-block; margin-top: 6px; padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 600; }
 .role-admin { background: #e8f3ff; color: #0052d9; border: 1px solid #bcdcff; }
-.role-user { background: #f2f3f5; color: #5a6b86; border: 1px solid #e0e3e8; }
+.role-user { background: var(--app-surface-2); color: var(--app-text-2); border: 1px solid var(--app-border); }
 
 /* 移动端汉堡按钮 + 遮罩（默认隐藏，窄屏显示） */
 .hamburger { display: none; width: 28px; height: 28px; cursor: pointer; flex-direction: column; justify-content: center; gap: 5px; }
-.hamburger span { display: block; height: 2px; width: 22px; background: #666; border-radius: 1px; }
+.hamburger span { display: block; height: 2px; width: 22px; background: var(--app-text-2); border-radius: 1px; }
 .sidebar-overlay { display: none; }
 
 /* 页面内容统一内边距容器（各页根节点使用 className="page"） */
 .page { padding: 16px; box-sizing: border-box; }
 
 /* 涨跌配色（A股惯例：红涨绿跌） */
-.up { color: #e34d59; }
-.down { color: #00a870; }
-.muted { color: #888; font-size: 12px; }
+.up { color: var(--app-up); }
+.down { color: var(--app-down); }
+.muted { color: var(--app-muted); font-size: 12px; }
 
 /* 按钮行间距 */
 .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
 .toolbar .spacer { flex: 1; }
 
 /* ====== 登录页（唯一保留的少量自定义样式） ====== */
-.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #eaf1fb; }
+.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--app-bg); }
 .login-box {
-  background: #fff; padding: 40px 28px; border-radius: 12px; width: 90%; max-width: 380px;
-  box-shadow: 0 8px 40px rgba(0,0,0,0.08); border: 1px solid #eee;
+  background: var(--app-surface); padding: 40px 28px; border-radius: 12px; width: 90%; max-width: 380px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.08); border: 1px solid var(--app-border-2);
 }
-.login-box h1 { font-size: 26px; margin-bottom: 4px; color: #e34d59; text-align: center; }
-.login-box .subtitle { color: #999; margin-bottom: 24px; font-size: 13px; text-align: center; }
+.login-box h1 { font-size: 26px; margin-bottom: 4px; color: var(--app-brand); text-align: center; }
+.login-box .subtitle { color: var(--app-muted-2); margin-bottom: 24px; font-size: 13px; text-align: center; }
 .form-group { margin-bottom: 14px; }
-.form-group label { display: block; font-size: 12px; color: #666; margin-bottom: 5px; }
-.login-error { color: #e34d59; font-size: 13px; margin-top: 12px; text-align: center; }
+.form-group label { display: block; font-size: 12px; color: var(--app-text-2); margin-bottom: 5px; }
+.login-error { color: var(--app-brand); font-size: 13px; margin-top: 12px; text-align: center; }
 
 /* ====== 响应式：窄屏（手机/小平板）====== */
 @media (max-width: 768px) {
@@ -80,6 +80,96 @@ body {
 /* 超宽屏：限制内容最大宽度，避免表格无限拉伸 */
 @media (min-width: 1600px) {
   .app-main .page > * { max-width: 1500px; }
+}
+
+/* ============================================================
+   §F4 全局主题令牌（浅色=现状基线，深色为增量覆盖）。
+   约定：所有页面/组件的自定义色一律引用 --app-* 令牌，杜绝裸 hex，切换
+   documentElement 的 theme-mode 属性即整站换肤。浅色令牌刻意等于既有字面量，
+   保证未开启深色时渲染与旧版一致（零回归）。TDesign 组件由 tdesign.css 内置的
+   :root[theme-mode='dark'] 令牌自动翻转，无需逐组件处理。
+   English: §F4 global theme tokens. Light values intentionally equal the pre-existing
+   literals so the default (light) render is unchanged; dark is purely additive. Every
+   custom color must reference an --app-* token (no raw hex); toggling the documentElement
+   `theme-mode` attribute reskins the whole app. TDesign components flip automatically via
+   the `:root[theme-mode='dark']` token block already compiled into tdesign.css.
+   ============================================================ */
+:root {
+  color-scheme: light;
+  --app-bg: #e8eefb;                 /* 页面画布底 */
+  --app-surface: #fff;               /* 卡片/头部/弹层表面 */
+  --app-surface-2: #f7f8fa;          /* 次级表面（列表行、内嵌块） */
+  --app-surface-3: #eef0f3;          /* 三级表面/分隔条 */
+  --app-aside-bg: #eef3fd;           /* 侧栏底 */
+  --app-border: #d4e0f4;             /* 通用描边 */
+  --app-border-2: #eee;              /* 弱描边 */
+  --app-divider: #eef0f3;            /* 分隔线 */
+  --app-text: #1a1a1a;               /* 主文字 */
+  --app-text-2: #555;                /* 次文字 */
+  --app-muted: #888;                 /* 弱文字/占位 */
+  --app-muted-2: #999;               /* 更弱文字 */
+  --app-faint: #ccc;                 /* 极淡文字/禁用 */
+  --app-accent: #4fc3f7;             /* 代码/链接强调（青） */
+  --app-brand: #e34d59;              /* 品牌红 */
+  --app-up: #e34d59;                 /* 涨（A股红涨） */
+  --app-down: #00a870;               /* 跌（A股绿跌） */
+  --app-warn-bg: #fdecea;            /* 警示横幅底 */
+  --app-warn-border: #f5c6c2;
+  --app-warn-text: #b71c1c;
+  --app-shadow: rgba(29, 78, 216, 0.10);
+  /* Canvas 图表令牌（KLineChart/DepthPanel 运行时读取） */
+  --app-chart-bg: #ffffff;
+  --app-chart-grid: #ececec;
+  --app-chart-axis: #909399;
+  --app-chart-line: #c0c4cc;
+  --app-chart-avg: #fa8c16;
+  --app-chart-dif: #d48806;
+  --app-chart-dea: #1677ff;
+  --app-chart-vol-up: #f5222d;
+  --app-chart-vol-down: #16a34a;
+  --app-chart-tip-bg: #ffffff;
+  --app-chart-tip-border: #d0d0d0;
+  --app-chart-tip-text: #303133;
+  --app-chart-tip-sub: #606266;
+}
+/* 深色：覆盖令牌 + 交给 TDesign 内置 dark 令牌（同 theme-mode 选择器）翻转组件 */
+:root[theme-mode='dark'],
+:root.dark {
+  color-scheme: dark;
+  --app-bg: #0f1420;
+  --app-surface: #1a2130;
+  --app-surface-2: #212a3b;
+  --app-surface-3: #2a3346;
+  --app-aside-bg: #141a28;
+  --app-border: #2b3650;
+  --app-border-2: #26304333;
+  --app-divider: #2a3346;
+  --app-text: #e6ebf5;
+  --app-text-2: #b7c1d4;
+  --app-muted: #8a94a8;
+  --app-muted-2: #76819a;
+  --app-faint: #5a6580;
+  --app-accent: #6fb9e8;
+  --app-brand: #ff6b76;
+  --app-up: #ff5b63;
+  --app-down: #2fbf87;
+  --app-warn-bg: #3a1e20;
+  --app-warn-border: #5e2a2d;
+  --app-warn-text: #ffb3ba;
+  --app-shadow: rgba(0, 0, 0, 0.45);
+  --app-chart-bg: #1a2130;
+  --app-chart-grid: #2a3346;
+  --app-chart-axis: #8a94a8;
+  --app-chart-line: #4a5670;
+  --app-chart-avg: #ffa940;
+  --app-chart-dif: #e8b339;
+  --app-chart-dea: #4c9aff;
+  --app-chart-vol-up: #ff5b63;
+  --app-chart-vol-down: #2fbf87;
+  --app-chart-tip-bg: #212a3b;
+  --app-chart-tip-border: #2b3650;
+  --app-chart-tip-text: #e6ebf5;
+  --app-chart-tip-sub: #b7c1d4;
 }
 
 /* ============================================================
@@ -133,8 +223,29 @@ body {
 .t-tabs__bar.t-is-top::after,
 .t-tabs__nav-item.t-is-active::after { background-color: var(--td-brand-color) !important; }
 
-/* 全局画布与侧栏底色略提饱和，避免大面空白发灰 */
-body { background: #e8eefb; }
-.app-aside { background: #eef3fd; border-right: 1px solid #c9d8f5; }
-.app-header { border-bottom: 1px solid #d4e0f4; }
-.t-card { border-color: #cdddf6 !important; box-shadow: 0 1px 6px rgba(29, 78, 216, 0.10) !important; }
+/* 全局画布与侧栏底色（令牌化，随主题切换） */
+body { background: var(--app-bg); }
+.app-aside { background: var(--app-aside-bg); border-right: 1px solid var(--app-border); }
+.app-header { border-bottom: 1px solid var(--app-border); }
+.t-card { border-color: var(--app-border) !important; box-shadow: 0 1px 6px var(--app-shadow) !important; }
+
+/* ============================================================
+   §F5 移动端布局微调（≤768px）：触控友好 + 表格横向滑动 + 顶栏紧凑。
+   仅追加约束，不重构为卡片流（无浏览器目视验证，保持低风险、可回退）。
+   English: §F5 mobile tweaks (≤768px): touch targets + horizontal table scroll + compact
+   header. Additive only — deliberately NOT restructuring tables into card flow (no browser
+   to visually verify), keeping it low-risk and reversible.
+   ============================================================ */
+@media (max-width: 768px) {
+  body { font-size: 13px; }
+  .app-header { height: 48px; }
+  /* 表格内容横向可滑，避免列在窄屏被压缩换行错位 */
+  .t-table__content { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .t-table { font-size: 12px; }
+  /* 操作列按钮组换行成触控友好的多行 */
+  .toolbar { gap: 6px; }
+  /* 个股详情抽屉在窄屏转底部抽屉（StockDetailDrawer 内联样式已处理，此处兜底全表面板） */
+  .page { padding: 10px 8px; }
+  /* 触控目标最小高度，手指点按更稳 */
+  .t-button--size-small, .t-table__expanded-icon { min-height: 28px; }
+}

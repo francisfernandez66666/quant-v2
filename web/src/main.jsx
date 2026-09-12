@@ -4,6 +4,11 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { HashRouter } from 'react-router-dom'
 import App from './App.jsx'
+import { initTheme } from './theme.js'
+
+// §F4 首屏前应用持久化主题，避免浅/深色闪烁（FOUC）。
+// English: apply the persisted theme before first paint to avoid a light/dark flash.
+initTheme()
 
 // TDesign React 全量样式；浅色为默认主题，无需额外激活
 import 'tdesign-react/dist/tdesign.css'

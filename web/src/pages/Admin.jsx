@@ -356,7 +356,7 @@ export default function Admin() {
             </Tag>
             {!row.enabled && <Tag theme="danger" variant="light">已禁用</Tag>}
           </div>
-          <div style={{ fontSize: 12, color: '#888', marginTop: 4 }}>
+          <div style={{ fontSize: 12, color: 'var(--app-muted)', marginTop: 4 }}>
             ID: {row.id} · 创建于 {fmtTime(row.created_at)} · {expiryText(row)}
           </div>
         </div>
@@ -481,7 +481,7 @@ export default function Admin() {
     return (
       <div className="page" style={{ textAlign: 'center', paddingTop: 80 }}>
         <h2 style={{ fontSize: 18, fontWeight: 600 }}>无权限访问</h2>
-        <p style={{ color: '#888', fontSize: 13, marginTop: 8 }}>
+        <p style={{ color: 'var(--app-muted)', fontSize: 13, marginTop: 8 }}>
           该页面仅限管理员访问，请联系管理员或使用管理员账号登录。
         </p>
       </div>
@@ -539,9 +539,9 @@ export default function Admin() {
                 /* 永久开关开启后天数输入禁用 */
               }
               <ToggleSw checked={newUser.permanent} onChange={(v) => setNewUser({ ...newUser, permanent: v })} />
-              <span style={{ fontSize: 13, color: '#888' }}>永久</span>
+              <span style={{ fontSize: 13, color: 'var(--app-muted)' }}>永久</span>
             </div>
-            <span style={{ fontSize: 12, color: '#888' }}>填天数表示到期后自动失效；开启"永久"则不过期</span>
+            <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>填天数表示到期后自动失效；开启"永久"则不过期</span>
           </Form.FormItem>
         </Form>
         {
@@ -551,7 +551,7 @@ export default function Admin() {
           {creating ? '创建中...' : '创建账号'}
         </Button>
         {createMsg && (
-          <span style={{ marginLeft: 10, fontSize: 13, color: createMsgType === 'ok' ? '#00a870' : '#e34d59' }}>{createMsg}</span>
+          <span style={{ marginLeft: 10, fontSize: 13, color: createMsgType === 'ok' ? 'var(--app-down)' : 'var(--app-up)' }}>{createMsg}</span>
         )}
       </Card>
 
@@ -586,14 +586,14 @@ export default function Admin() {
       >
         {opsDates.length === 0 && !opsLoading ? (
           // 空态：尚无任何日志日期
-          <div style={{ fontSize: 13, color: '#888' }}>
+          <div style={{ fontSize: 13, color: 'var(--app-muted)' }}>
             暂无运行日志（引擎/研究服务启动后自动产出，每天一份，保留 90 天）
           </div>
         ) : (
           // 有日志：概要条 + 终端风格日志正文
           <>
             {/* 概要条：总行数 / 截断提示 / 双引擎（quant=量化、research=研究）图例 */}
-            <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 6 }}>
               共 {opsMeta.total} 行
               {opsMeta.truncated ? '（仅显示最后 2000 行）' : ''}
               {' · '}<span style={{ color: '#3b82f6', fontWeight: 600 }}>quant</span> = 量化引擎
@@ -615,7 +615,7 @@ export default function Admin() {
             >
               {opsLines.length === 0 && !opsLoading
                 // 空记录与日志行列表切换
-                ? <div style={{ color: '#888' }}>该日暂无记录</div>
+                ? <div style={{ color: 'var(--app-muted)' }}>该日暂无记录</div>
                 : opsLines.map(renderOpsLine)}
             </div>
           </>
@@ -641,7 +641,7 @@ export default function Admin() {
         onConfirm={doSetExpiry}
         confirmBtn="确定"
       >
-        <div style={{ marginBottom: 8, fontSize: 13, color: '#888' }}>
+        <div style={{ marginBottom: 8, fontSize: 13, color: 'var(--app-muted)' }}>
           输入天数（0 表示永久）{expUser && expUser.expires_at ? '；当前剩余约 ' + (expUser.expires_at ? Math.ceil((expUser.expires_at * 1000 - Date.now()) / 86400000) : 0) + ' 天' : '；当前永久'}
         </div>
         <InputNumber value={expDays} min={0} onChange={(v) => setExpDays(v || 0)} style={{ width: 200 }} />
@@ -691,7 +691,7 @@ export default function Admin() {
           </Card>
         ))}
         {strategyMsg && (
-          <span style={{ fontSize: 13, color: strategyMsgType === 'ok' ? '#00a870' : '#e34d59' }}>{strategyMsg}</span>
+          <span style={{ fontSize: 13, color: strategyMsgType === 'ok' ? 'var(--app-down)' : 'var(--app-up)' }}>{strategyMsg}</span>
         )}
       </Dialog>
     </div>

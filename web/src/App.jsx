@@ -10,7 +10,15 @@ import { ConfigProvider, Menu, Button, Badge, MessagePlugin, Input } from 'tdesi
 import { DashboardIcon, ThunderIcon, StarIcon, TrendingUpIcon, NotificationIcon, WalletIcon,
   ChartLineIcon, RocketIcon, SettingIcon, TerminalIcon, ChatBubble1Icon, SearchIcon, UsergroupIcon } from 'tdesign-icons-react'
 import ToggleSw from './components/ToggleSw'
+import MarketStatusBar from './components/MarketStatusBar'
+import RoleBar from './components/RoleBar'
+import CommandPalette from './components/CommandPalette'
+import StockDetailDrawer from './components/StockDetailDrawer'
+import Disclaimer from './components/Disclaimer'
+import ThemeToggle from './components/ThemeToggle'
+import { useTheme } from './theme.js'
 import * as api from './api/index.js'
+import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
 
@@ -38,7 +46,7 @@ const Paper = lazy(() => import('./pages/Paper.jsx'))
 // 懒加载路由切换时的加载占位（页面 chunk 拉取间隙的兜底 UI）
 function PageFallback() {
   return (
-    <div style={{ padding: 32, color: '#888', fontSize: 14 }}>页面加载中…</div>
+    <div style={{ padding: 32, color: 'var(--app-muted)', fontSize: 14 }}>页面加载中…</div>
   )
 }
 
@@ -46,7 +54,7 @@ function PageFallback() {
 function Forbidden() {
   const navigate = useNavigate()
   return (
-    <div style={{ padding: 48, textAlign: 'center', color: '#888' }}>
+    <div style={{ padding: 48, textAlign: 'center', color: 'var(--app-muted)' }}>
       <h2>403 · 无访问权限</h2>
       <p>当前账号无权访问此页面。</p>
       <Button theme="default" variant="outline" size="small" onClick={() => navigate('/dashboard')}>返回仪表盘</Button>
@@ -88,6 +96,14 @@ export default function App() {
   const [canAdmin, setCanAdmin] = useState(false)
   // 权限入口状态位：研究审批/管理员/模拟盘三个入口由后端角色与开关决定
   const [paperEnabled, setPaperEnabled] = useState(false)
+  // §MARKET_RISK_GATE F2：市场环境条状态（情绪相位/市场状态/仓位档/风险档），由 SSE `score` 广播驱动
+  // English: F2 market-environment bar state, driven by the SSE `score` broadcast.
+  const [marketEnv, setMarketEnv] = useState({ emotion: '', marketState: '', maxPosPct: 0, riskTier: '', riskReasons: [] })
+  // §F4 全局主题（浅/深），驱动 TDesign Menu 的 theme 属性与顶栏切换按钮状态。
+  const [theme] = useTheme()
+  // §F6 命令面板（Ctrl/Cmd+K）开关 + 全局个股详情抽屉目标（复用 F3 组件，任意页可呼出）。
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [globalDetail, setGlobalDetail] = useState(null)
 
   const [serverUrl, setServerUrl] = useState(api.getStoredServer() || '')
   const [username, setUsername] = useState('')
@@ -186,6 +202,22 @@ export default function App() {
 
   // 处理 SSE 推送：scan 信号、重要消息提醒、单条新信号
   function handleSSE(msg) {
+    // §F5 单连接扇出：先转投事件总线，供各页按类型订阅即时刷新（页面不再各自起高频轮询）。
+    // English: fan out on the single connection so pages subscribing by type refresh on event.
+    sseDispatch(msg)
+    // §MARKET_RISK_GATE F2：每轮评分完成广播的 `score` 消息携带市场环境（情绪/状态/仓位档/风险档），
+    // 驱动顶部市场环境条；score 不含信号字段，更新后立即返回，不影响下方 scan/message 分支。
+    // English: each scoring round's `score` message carries the environment snapshot to drive the F2 bar.
+    if (msg && msg.type === 'score') {
+      setMarketEnv({
+        emotion: msg.emotion || '',
+        marketState: msg.market_state || '',
+        maxPosPct: msg.max_pos_pct || 0,
+        riskTier: msg.risk_tier || '',
+        riskReasons: Array.isArray(msg.risk_reasons) ? msg.risk_reasons : [],
+      })
+      return
+    }
     if (msg && msg.type === 'scan') {
       const bull = parseInt(msg.bull || '0', 10)
       const bear = parseInt(msg.bear || '0', 10)
@@ -233,7 +265,7 @@ export default function App() {
   // 启动状态轮询并订阅 SSE 推送
   function startPolling() {
     refreshStatus()
-    statusTimer.current = setInterval(refreshStatus, 15000)
+    statusTimer.current = setInterval(refreshStatus, 60000)
     api.connectSSE()
     unsubSSE.current = api.onSSE(handleSSE)
   }
@@ -256,6 +288,20 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // §F6 Ctrl/Cmd+K 呼出命令面板（仅登录后全局监听；输入框内也可用，避免吞正常输入需判断焦点？
+  // 组合键本身罕见误触，直接 preventDefault 打开面板）。
+  useEffect(() => {
+    if (!loggedIn) return
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault()
+        setPaletteOpen((o) => !o)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [loggedIn])
 
   // ── 登录页 ──
   if (!loggedIn) {
@@ -286,6 +332,7 @@ export default function App() {
              * 登录按钮：loading 期间防止重复提交；错误内容即时展示 */}
             <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
             {loginError && <p className="login-error">{loginError}</p>}
+            <Disclaimer variant="login" />
           </div>
         </div>
       </ConfigProvider>
@@ -350,10 +397,12 @@ export default function App() {
              * 登录按钮与错误提示 */}
             <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
             {loginError && <p className="login-error">{loginError}</p>}
+            <Disclaimer variant="login" />
           </div>
         </div>
       ) : (
-        /* 主布局外壳：顶部栏 + 断联横幅 + 侧边栏 + 内容路由区三段式结构 */
+        <>
+        {/* 主布局外壳：顶部栏 + 断联横幅 + 侧边栏 + 内容路由区三段式结构 */}
         <div className="app-shell">
           {/* 顶部栏：左侧为汉堡菜单按钮 + 交易时段指示 + 服务在线状态，右侧为做空开关 + 通知测试 + 退出 */}
           <header className="app-header">
@@ -378,17 +427,23 @@ export default function App() {
                 const sent = sendNotify('量仔', '通知测试成功')
                 MessagePlugin.info('通知测试' + (sent ? '已发送' : (isNative() ? '（请检查系统通知权限）' : '（通知未授权）')))
               }}>🔔</Button>
+              {/* §F4 主题切换按钮：浅/深色（持久化到 localStorage，切换即时全站换肤） */}
+              <ThemeToggle />
               {/* 退出登录 */}
               <Button theme="default" variant="outline" size="small" onClick={logout}>退出</Button>
             </div>
             {/*
              * 顶部栏右侧操作项至此排布完毕，header 标签收口 */}
            </header>
+            {/* §MARKET_RISK_GATE F2 市场环境条：全站唯一市场环境展示位，紧贴顶部栏下方（情绪相位/市场状态/风险档） */}
+            <MarketStatusBar env={marketEnv} />
+            {/* §F6 角色提示条：常驻一行说明当前账号/角色/可见入口（UAT 2.1 防误操作困惑） */}
+            <RoleBar account={account} isAdmin={canAdmin} canResearch={canResearch} paperEnabled={paperEnabled} />
            {/* 后端断联横幅：登录态可能因缓存令牌保留，但所有数据接口失败。
                显式提示用户检查「设置→服务器地址」（留空=使用当前域名），避免误以为"后端没给数据"。 */}
            {loggedIn && !serverOnline && (
              // 通栏提示框：仅在登录态且最近一次状态轮询失败时渲染
-             <div style={{ margin: '8px 12px 0', padding: '8px 12px', borderRadius: 6, background: '#fdecea', border: '1px solid #f5c6c2', color: '#b71c1c', fontSize: 13 }}>
+              <div style={{ margin: '8px 12px 0', padding: '8px 12px', borderRadius: 6, background: 'var(--app-warn-bg)', border: '1px solid var(--app-warn-border)', color: 'var(--app-warn-text)', fontSize: 13 }}>
                ⚠ 无法连接服务器：页面可打开但后端数据未加载。请到「设置 → 服务器连接」确认服务器地址——
                若填了自定义地址请改为留空（使用当前域名 quant-trading.top），或确认该地址可达。
              </div>
@@ -408,7 +463,7 @@ export default function App() {
                 {/* 根据 navItems 渲染导航项，当前路由高亮；点击后跳转并收起抽屉 */}
                 {/*
                  * Menu 配置：value 取当前路由路径，选中项即导航并收起抽屉 */}
-                <Menu theme="light" value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
+                <Menu theme={theme === 'dark' ? 'dark' : 'light'} value={location.pathname} onChange={(v) => { navigate(v); setMenuOpen(false) }} style={{ width: '100%', background: 'transparent', borderRight: 'none' }}>
                   {/* 导航项循环渲染：icon + 文案 + 可选未读角标 */}
                   {navItems.map((it) => (
                     <Menu.MenuItem key={it.to} value={it.to}>
@@ -508,6 +563,18 @@ export default function App() {
           </div>
           {/* app-body 结语：左侧导航 + 右栏已有路由，外层 div 自此闭合 */}
         </div>
+        {/* §F6 命令面板（Ctrl/Cmd+K）：页面跳转 + 六位代码查看个股详情（复用 F3 全局抽屉） */}
+        {paletteOpen && (
+          <CommandPalette
+            pages={navItems.map((n) => ({ to: n.to, label: n.label }))}
+            onOpenStock={(code) => setGlobalDetail({ code })}
+            onClose={() => setPaletteOpen(false)}
+          />
+        )}
+        {/* §F6 全局个股详情抽屉（命令面板/未来任意入口共用），仅此处一份实例避免多页重复 */}
+        <StockDetailDrawer open={!!globalDetail} code={globalDetail?.code}
+          onClose={() => setGlobalDetail(null)} />
+        </>
       )}
       {/*
        * ConfigProvider 提供全局主题与组件上下文；ErrorBoundary 兜底任意渲染错误，避免白屏，下方标签逐一闭合 */}

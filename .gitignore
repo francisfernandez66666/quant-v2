@@ -88,3 +88,8 @@ scripts/qmt-debug/
 
 # 构建/冒烟产物目录（如 bin/quant-staging 本地二进制），不入库
 bin/
+
+# §F6 Playwright 冒烟产物（报告/trace/截图，不入库）
+web/test-results/
+web/playwright-report/
+web/playwright/.cache/

@@ -5,7 +5,9 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
+import { on } from '../sseBus.js'
 import LogModal from '../components/LogModal.jsx'
+import Disclaimer from '../components/Disclaimer.jsx'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
 function ipoCountdown(c) {
@@ -49,7 +51,7 @@ function fmtProfitFactor(pf) {
 
 // 涨跌百分比配色（红涨绿跌）
 function chgColor(v) {
-  return (v || 0) >= 0 ? '#e34d59' : '#00a870'
+  return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
 }
 
 /**
@@ -87,7 +89,7 @@ export default function Dashboard() {
   // 实盘/QMT 链路状态
   const [qmtState, setQmtState] = useState(null)
 
-  // 主数据刷新定时器（每 5s 轮询）
+  // 主数据刷新定时器（§F5 每 10s 兜底轮询，实时性靠 SSE）
   const timer = useRef(null)
   // QMT 状态刷新定时器（每 15s 轮询）
   const qmtTimer = useRef(null)
@@ -172,13 +174,13 @@ export default function Dashboard() {
   // 页面挂载：加载数据、启动定时刷新、订阅 SSE、监听可见性变化；卸载时清理
   useEffect(() => {
     load()
-    // 主数据每 5s 轮询刷新
-    timer.current = setInterval(load, 5000)
+    // 主数据每 10s 兜底轮询（实时靠 SSE 事件）
+    timer.current = setInterval(load, 10000)
     loadQMT()
     // QMT 链路状态每 15s 轮询刷新
     qmtTimer.current = setInterval(loadQMT, 15000)
     api.connectSSE()
-    sseUnsub.current = api.onSSE(handleSSE)
+    sseUnsub.current = on(['scan', 'message', 'score', 'tick'], handleSSE)
     visibilityHandler.current = () => {
       if (document.hidden) {
         if (timer.current) { clearInterval(timer.current); timer.current = null }
@@ -186,8 +188,8 @@ export default function Dashboard() {
       } else {
         if (!timer.current) {
           load()
-          // 恢复页面后重启主数据 5s 轮询
-          timer.current = setInterval(load, 5000)
+          // 恢复页面后重启主数据 10s 兜底轮询
+          timer.current = setInterval(load, 10000)
         }
         if (!qmtTimer.current) {
           loadQMT()
@@ -226,10 +228,10 @@ export default function Dashboard() {
     { colKey: 'total', title: '样本', width: 70 },
     { colKey: 'closed', title: '已平仓', width: 80 },
     { colKey: 'win_rate', title: '胜率', width: 80, cell: ({ row }) => (
-      <span style={{ color: (row.win_rate || 0) >= 50 ? '#e34d59' : '#00a870' }}>{(row.win_rate || 0).toFixed(1)}%</span>
+      <span style={{ color: (row.win_rate || 0) >= 50 ? 'var(--app-up)' : 'var(--app-down)' }}>{(row.win_rate || 0).toFixed(1)}%</span>
     ) },
-    { colKey: 'avg_win_pct', title: '平均盈', width: 80, cell: ({ row }) => <span style={{ color: '#e34d59' }}>{(row.avg_win_pct || 0).toFixed(1)}%</span> },
-    { colKey: 'avg_loss_pct', title: '平均亏', width: 80, cell: ({ row }) => <span style={{ color: '#00a870' }}>{(row.avg_loss_pct || 0).toFixed(1)}%</span> },
+    { colKey: 'avg_win_pct', title: '平均盈', width: 80, cell: ({ row }) => <span style={{ color: 'var(--app-up)' }}>{(row.avg_win_pct || 0).toFixed(1)}%</span> },
+    { colKey: 'avg_loss_pct', title: '平均亏', width: 80, cell: ({ row }) => <span style={{ color: 'var(--app-down)' }}>{(row.avg_loss_pct || 0).toFixed(1)}%</span> },
     { colKey: 'profit_factor', title: '盈亏比', width: 80, cell: ({ row }) => fmtProfitFactor(row.profit_factor) },
     { colKey: 'holding', title: '持仓中', width: 70 },
   ]
@@ -281,15 +283,15 @@ export default function Dashboard() {
       {/* 核心指标卡：强信号/观察中/静默/监控个股数量一目了然 */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         {[
-          { n: strongCount, l: '强信号', c: '#e34d59' },
-          { n: observeCount, l: '观察中', c: '#faad14' },
-          { n: muteCount, l: '静默', c: '#888' },
+          { n: strongCount, l: '强信号', c: 'var(--app-up)' },
+          { n: observeCount, l: '观察中', c: 'var(--td-warning-color)' },
+          { n: muteCount, l: '静默', c: 'var(--app-muted)' },
           // §SHORT-4 做空统计卡（仅做空开关开启时出现）
           ...(shortEnabled ? [
-            { n: bearCount, l: '做空信号', c: '#e34d59' },
+            { n: bearCount, l: '做空信号', c: 'var(--app-up)' },
             { n: bearSellCount, l: '做空自动卖出', c: '#c9353f' },
           ] : []),
-          { n: (scanStats.total_stocks || snapshotStocks.length || 0), l: '监控个股', c: '#0052d9' },
+          { n: (scanStats.total_stocks || snapshotStocks.length || 0), l: '监控个股', c: 'var(--td-brand-color)' },
         ].map((s) => (
           <Card key={s.l} style={{ flex: '1 1 150px' }}>
             <div style={{ fontSize: 28, fontWeight: 700, color: s.c }}>{s.n}</div>
@@ -375,6 +377,8 @@ export default function Dashboard() {
         </div>
       </Card>
 
+      {/* §F6 免责声明页脚（UAT 4.1） */}
+      <Disclaimer variant="footer" />
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
     </div>
   )
@@ -386,5 +390,5 @@ function SectionLabel({ children }) {
 }
 // 分隔线
 function Divider() {
-  return <div style={{ height: 1, background: '#e7e7e7', margin: '10px 0' }} />
+  return <div style={{ height: 1, background: 'var(--app-border)', margin: '10px 0' }} />
 }

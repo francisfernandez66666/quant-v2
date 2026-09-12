@@ -10,18 +10,18 @@
 /* 弹窗主体：自适应宽度、纵向 flex 布局、内容区可滚动 */
 .log-modal {
   width: 92%; max-width: 860px; max-height: 86vh;
-  background: #ffffff; border-radius: 12px;
+  background: var(--app-surface); border-radius: 12px;
   display: flex; flex-direction: column; overflow: hidden;
 }
 /* 头部：标题左置、关闭按钮右置，下边框分隔 */
 .log-header {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 16px; border-bottom: 1px solid #1a1a1a;
+  padding: 12px 16px; border-bottom: 1px solid var(--app-text);
 }
-.log-title { font-size: 15px; font-weight: 600; color: #1a1a1a; }
+.log-title { font-size: 15px; font-weight: 600; color: var(--app-text); }
 /* 关闭按钮：灰字，悬停变红 */
 .log-close {
-  border: none; background: transparent; color: #888; font-size: 16px; cursor: pointer;
+  border: none; background: transparent; color: var(--app-muted); font-size: 16px; cursor: pointer;
 }
 .log-close:hover { color: #FF4D4F; }
 
@@ -30,10 +30,10 @@
   display: flex; gap: 6px; padding: 10px 16px 0;
 }
 .log-tab {
-  padding: 6px 16px; border-radius: 6px 6px 0 0; font-size: 14px; color: #888;
-  cursor: pointer; background: #f5f5f5; border: 1px solid #1a1a1a; border-bottom: none;
+  padding: 6px 16px; border-radius: 6px 6px 0 0; font-size: 14px; color: var(--app-muted);
+  cursor: pointer; background: var(--app-surface-2); border: 1px solid var(--app-text); border-bottom: none;
 }
-.log-tab.active { color: #1a1a1a; background: #f0f0f0; border-color: #FF4D4F; }
+.log-tab.active { color: var(--app-text); background: var(--app-surface-2); border-color: #FF4D4F; }
 
 /* 内容区：内边距 + 纵向滚动 */
 .log-body {
@@ -46,18 +46,18 @@
 /* 搜索输入框：浅灰底圆角，聚焦红边 */
 .log-search {
   flex: 1; min-width: 0;
-  padding: 6px 10px; border-radius: 6px; border: 1px solid #dcdcdc;
-  background: #f5f5f5; color: #1a1a1a; font-size: 14px; outline: none;
+  padding: 6px 10px; border-radius: 6px; border: 1px solid var(--app-border);
+  background: var(--app-surface-2); color: var(--app-text); font-size: 14px; outline: none;
 }
-.log-search::placeholder { color: #888888; }
+.log-search::placeholder { color: var(--app-muted); }
 .log-search:focus { border-color: #FF4D4F; }
 .log-select {
-  padding: 6px 10px; border-radius: 6px; border: 1px solid #dcdcdc;
-  background: #f5f5f5; color: #555555; font-size: 14px; cursor: pointer; max-width: 340px; flex: 1;
+  padding: 6px 10px; border-radius: 6px; border: 1px solid var(--app-border);
+  background: var(--app-surface-2); color: var(--app-text-2); font-size: 14px; cursor: pointer; max-width: 340px; flex: 1;
 }
 .log-strategy-select {
-  padding: 6px 10px; border-radius: 6px; border: 1px solid #dcdcdc;
-  background: #f5f5f5; color: #555555; font-size: 14px; cursor: pointer; outline: none;
+  padding: 6px 10px; border-radius: 6px; border: 1px solid var(--app-border);
+  background: var(--app-surface-2); color: var(--app-text-2); font-size: 14px; cursor: pointer; outline: none;
 }
 .log-strategy-select:focus { border-color: #b388ff; }
 .btn-refresh {
@@ -68,40 +68,40 @@
 .btn-refresh:hover { background: rgba(255,77,79,0.1); }
 
 /* 空态提示：居中灰字 */
-.log-empty { text-align: center; padding: 40px; color: #888888; font-size: 14px; }
+.log-empty { text-align: center; padding: 40px; color: var(--app-muted); font-size: 14px; }
 
 /* 检索视图（Stage0/1）：摘要、分组标题与批次列表 */
 .search-view { display: flex; flex-direction: column; gap: 12px; }
-.search-summary { font-size: 14px; color: #888; }
+.search-summary { font-size: 14px; color: var(--app-muted); }
 .search-group { display: flex; flex-direction: column; gap: 8px; }
 /* 分组标题：批次数 + 命中条数，下虚线分隔 */
 .search-group-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 4px 2px; border-bottom: 1px dashed #1a1a1a;
+  padding: 4px 2px; border-bottom: 1px dashed var(--app-text);
 }
-.search-batch { font-size: 14px; font-weight: 600; color: #4fc3f7; }
-.search-count { font-size: 14px; color: #888; }
+.search-batch { font-size: 14px; font-weight: 600; color: var(--app-accent); }
+.search-count { font-size: 14px; color: var(--app-muted); }
 
 /* 概览条：灰度底的横向汇总指标（条数/命中/LLM/关键词等） */
 .summary-bar {
   display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px;
-  background: #f5f5f5; border-radius: 8px; padding: 10px 14px;
+  background: var(--app-surface-2); border-radius: 8px; padding: 10px 14px;
 }
 .summary-item { display: flex; flex-direction: column; gap: 2px; min-width: 70px; }
-.summary-label { font-size: 14px; color: #888; }
-.summary-value { font-size: 15px; font-weight: 600; color: #1a1a1a; }
+.summary-label { font-size: 14px; color: var(--app-muted); }
+.summary-value { font-size: 15px; font-weight: 600; color: var(--app-text); }
 .tag-llm { color: #4caf50; }
 .tag-keyword { color: #ff9800; }
 
 /* 区块标题：下边框分隔的段落小标题 */
-.section-title { font-size: 14px; margin: 14px 0 8px; color: #555555; border-bottom: 1px solid #1a1a1a; padding-bottom: 5px; }
+.section-title { font-size: 14px; margin: 14px 0 8px; color: var(--app-text-2); border-bottom: 1px solid var(--app-text); padding-bottom: 5px; }
 /* Stage1 标题候选列表：逐行可选，选中淡绿底、被丢弃半透明 */
 .stage1-list { margin-bottom: 8px; }
 .title-item { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 4px; margin-bottom: 2px; font-size: 14px; }
 .title-item.selected { background: rgba(76,175,80,0.08); }
 .title-item.discarded { opacity: 0.45; }
 /* 标题徽标（通过/跳过）与索引/正文/省略号样式 */
-.title-idx { color: #888888; min-width: 22px; font-size: 14px; text-align: right; }
+.title-idx { color: var(--app-muted); min-width: 22px; font-size: 14px; text-align: right; }
 .title-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .title-badge { font-size: 14px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
 .badge-pass { background: rgba(76,175,80,0.2); color: #4caf50; }
@@ -109,31 +109,31 @@
 
 /* Stage2 事件卡：灰色卡片内含标题/评分/标签/原因明细 */
 .stage2-events { display: flex; flex-direction: column; gap: 8px; }
-.event-card { background: #f5f5f5; border-radius: 8px; padding: 10px 12px; border: 1px solid #1a1a1a; }
+.event-card { background: var(--app-surface-2); border-radius: 8px; padding: 10px 12px; border: 1px solid var(--app-text); }
 .event-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
-.event-title { flex: 1; font-size: 14px; font-weight: 600; color: #1a1a1a; min-width: 0; }
-.event-score { font-size: 14px; color: #888; white-space: nowrap; }
+.event-title { flex: 1; font-size: 14px; font-weight: 600; color: var(--app-text); min-width: 0; }
+.event-score { font-size: 14px; color: var(--app-muted); white-space: nowrap; }
 .event-body { display: flex; flex-direction: column; gap: 4px; }
 .event-row { display: flex; align-items: flex-start; gap: 8px; font-size: 14px; }
-.event-label { color: #888; min-width: 32px; flex-shrink: 0; }
+.event-label { color: var(--app-muted); min-width: 32px; flex-shrink: 0; }
 .event-tags { display: flex; flex-wrap: wrap; gap: 4px; }
-.mini-tag { font-size: 14px; padding: 1px 6px; border-radius: 3px; background: #1a1a1a; color: #555555; }
+.mini-tag { font-size: 14px; padding: 1px 6px; border-radius: 3px; background: var(--app-text); color: var(--app-text-2); }
 .mini-tag.sector { color: #64b5f6; background: rgba(100,181,246,0.1); }
 .mini-tag.stock { color: #ff9800; background: rgba(255,152,0,0.1); }
-.event-reason { color: #555555; line-height: 1.4; }
+.event-reason { color: var(--app-text-2); line-height: 1.4; }
 
 /* 信号卡（Stage2 输出）：代码/名称/战法/置信/价格/板块/原因 */
 .signal-list { display: flex; flex-direction: column; gap: 8px; }
-.signal-item { background: #f5f5f5; border-radius: 8px; padding: 10px 12px; border: 1px solid #1a1a1a; }
+.signal-item { background: var(--app-surface-2); border-radius: 8px; padding: 10px 12px; border: 1px solid var(--app-text); }
 .sig-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.sig-code { font-family: monospace; color: #4fc3f7; font-size: 14px; font-weight: 600; }
-.sig-name { color: #1a1a1a; font-size: 14px; }
+.sig-code { font-family: monospace; color: var(--app-accent); font-size: 14px; font-weight: 600; }
+.sig-name { color: var(--app-text); font-size: 14px; }
 .sig-strategy { font-size: 14px; color: #b388ff; background: rgba(179,136,255,0.12); padding: 1px 6px; border-radius: 3px; }
-.sig-conf { font-size: 14px; color: #888; }
+.sig-conf { font-size: 14px; color: var(--app-muted); }
 .sig-price { font-size: 14px; color: #FAAD14; }
 .sig-body { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-size: 14px; flex-wrap: wrap; }
 .sig-sector { font-size: 14px; color: #64b5f6; background: rgba(100,181,246,0.1); padding: 1px 6px; border-radius: 3px; }
-.sig-reason { color: #555555; line-height: 1.4; }
+.sig-reason { color: var(--app-text-2); line-height: 1.4; }
 
 /* 通用小标签：按 利好/利空/中性/做多/做空/提醒 着色 */
 .tag { font-size: 14px; padding: 2px 7px; border-radius: 4px; white-space: nowrap; }

@@ -5,6 +5,8 @@ import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
+import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+import { on } from '../sseBus.js'
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -37,6 +39,8 @@ export default function Positions() {
   const [holdings, setHoldings] = useState(cache.holdings)
   // 已展开分时图的持仓代码集合
   const [klineOpen, setKlineOpen] = useState(new Set())
+  // §F3 全局个股详情抽屉目标（{code,name}），null=关闭
+  const [detail, setDetail] = useState(null)
   // 可用资金余额
   const [availableBalance, setAvailableBalance] = useState(cache.balance)
   // 新增/编辑持仓弹窗显隐
@@ -401,7 +405,7 @@ export default function Positions() {
     if (tab === 'real') {
       loadReal()
       // 进入实盘标签时启动 30s 轮询对账
-      if (!realTimer.current) realTimer.current = setInterval(loadReal, 30000)
+      if (!realTimer.current) realTimer.current = setInterval(loadReal, 60000) // §F5 实盘持仓兜底 60s（回报走 SSE）
     } else if (realTimer.current) {
       clearInterval(realTimer.current); realTimer.current = null
     }
@@ -490,10 +494,9 @@ export default function Positions() {
 
   // 挂载时加载持仓、启动轮询并订阅 SSE 实盘建议；卸载时清理
   useEffect(() => {
-    load(); timer.current = setInterval(load, 30000) // 每 30s 轮询纸面持仓
-    // 订阅 SSE：处理实盘建议推送与 QMT 回报/订单回报，触发对应刷新
-    unsubSSE.current = api.onSSE((msg) => {
-      if (!msg || !msg.type) return
+    load(); timer.current = setInterval(load, 60000) // §F5 纸面持仓兜底轮询降为 60s
+    // 订阅 SSE 事件总线（App 单连接扇出）：处理实盘建议推送与 QMT/订单回报，触发对应刷新
+    unsubSSE.current = on(['real_advice', 'qmt_report', 'real_order'], (msg) => {
       // 实盘操作建议：按 ts_code 汇总成建议映射
       if (msg.type === 'real_advice' && Array.isArray(msg.advices)) {
         const m = {}
@@ -521,28 +524,28 @@ export default function Positions() {
   // 纸面持仓表格列定义：代码、名称、数量、成本/现价、当日涨跌、持仓盈亏、
   // 信号标记、N形/龙头/动量评分、止盈止损、移动止盈、分时与操作按钮
   const paperColumns = [
-    { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
-    { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name}</span> },
+    { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
+    { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name}</span> },
     { colKey: 'quantity', title: '数量', width: 70, sorter: (a, b) => (a.quantity || 0) - (b.quantity || 0), cell: ({ row }) => row.quantity },
     { colKey: 'cost_price', title: '成本价', width: 80, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(2) : '-') },
     { colKey: 'cur_price', title: '现价', width: 80, sorter: (a, b) => (a.cur_price || 0) - (b.cur_price || 0), cell: ({ row }) => (row.cur_price != null ? '¥' + Number(row.cur_price).toFixed(2) : '-') },
-    { colKey: 'change_pct', title: '当日涨跌', width: 90, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'change_pct', title: '当日涨跌', width: 90, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
     // 持仓盈亏百分比列：红涨绿跌（§F1 可排序——盯盘最常用「按盈亏排序找雷/找赢家」）
-    { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, sorter: (a, b) => (a.pnl_pct || 0) - (b.pnl_pct || 0), cell: ({ row }) => <span style={{ color: (row.pnl_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.pnl_pct || 0) > 0 ? '+' : ''}{(row.pnl_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'pnl_pct', title: '持仓盈亏', width: 90, sorter: (a, b) => (a.pnl_pct || 0) - (b.pnl_pct || 0), cell: ({ row }) => <span style={{ color: (row.pnl_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.pnl_pct || 0) > 0 ? '+' : ''}{(row.pnl_pct || 0).toFixed(2)}%</span> },
 
     // 信号状态列：有策略信号时显示⚡
-    { colKey: 'signal', title: '信号', width: 50, cell: ({ row }) => row.signal_active ? <span title="有策略信号">⚡</span> : <span style={{ color: '#e7e7e7' }}>—</span> },
+    { colKey: 'signal', title: '信号', width: 50, cell: ({ row }) => row.signal_active ? <span title="有策略信号">⚡</span> : <span style={{ color: 'var(--app-border)' }}>—</span> },
 
     // 战法评分列（N形/龙头/量能）：≥60 红色达标，≥50 黄色观察
-    { colKey: 'n_score', title: 'N', width: 55, cell: ({ row }) => { const v = row.n_score || 0; const c = v >= 60 ? '#e34d59' : v > 0 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
-    { colKey: 'dragon_score', title: '龙', width: 55, cell: ({ row }) => { const v = row.dragon_score || 0; const c = v >= 60 ? '#e34d59' : v >= 50 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
-    { colKey: 'm_score', title: '量', width: 55, cell: ({ row }) => { const v = row.m_score || 0; const c = v >= 50 ? '#FAAD14' : '#555'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
+    { colKey: 'n_score', title: 'N', width: 55, cell: ({ row }) => { const v = row.n_score || 0; const c = v >= 60 ? 'var(--app-up)' : v > 0 ? 'var(--td-warning-color)' : 'var(--app-text-2)'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
+    { colKey: 'dragon_score', title: '龙', width: 55, cell: ({ row }) => { const v = row.dragon_score || 0; const c = v >= 60 ? 'var(--app-up)' : v >= 50 ? 'var(--td-warning-color)' : 'var(--app-text-2)'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
+    { colKey: 'm_score', title: '量', width: 55, cell: ({ row }) => { const v = row.m_score || 0; const c = v >= 50 ? 'var(--td-warning-color)' : 'var(--app-text-2)'; return <span style={{ color: c, fontWeight: 600 }}>{v > 0 ? v.toFixed(0) : '—'}</span> } },
 
     // 止盈/止损百分比列
-    { colKey: 'sl', title: '止盈/止损', width: 110, cell: ({ row }) => <span><span style={{ color: '#e34d59' }}>+{(row.take_profit_pct || 8).toFixed(1)}%</span><span style={{ color: '#e7e7e7' }}> / </span><span style={{ color: '#00a870' }}>-{(row.stop_loss_pct || 5).toFixed(1)}%</span></span> },
+    { colKey: 'sl', title: '止盈/止损', width: 110, cell: ({ row }) => <span><span style={{ color: 'var(--app-up)' }}>+{(row.take_profit_pct || 8).toFixed(1)}%</span><span style={{ color: 'var(--app-border)' }}> / </span><span style={{ color: 'var(--app-down)' }}>-{(row.stop_loss_pct || 5).toFixed(1)}%</span></span> },
 
     // 移动止盈最高价列
-    { colKey: 'highest', title: '移动止盈', width: 90, cell: ({ row }) => row.highest_price > 0 ? <span style={{ color: row.highest_price > (row.cost_price || 0) ? '#e34d59' : '#b388ff' }}>¥{row.highest_price.toFixed(2)}</span> : '—' },
+    { colKey: 'highest', title: '移动止盈', width: 90, cell: ({ row }) => row.highest_price > 0 ? <span style={{ color: row.highest_price > (row.cost_price || 0) ? 'var(--app-up)' : '#b388ff' }}>¥{row.highest_price.toFixed(2)}</span> : '—' },
 
     // 分时图展开按钮列
     { colKey: 'kline', title: '分时', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{klineOpen.has(row.code) ? '收起' : '分时'}</Button> },
@@ -561,15 +564,15 @@ export default function Positions() {
 
   // 实盘持仓表格列定义：代码、名称、数量、成本/现价、持仓盈亏、最高价、建议标签与操作按钮
   const realColumns = [
-    { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.ts_code}</span> },
-    { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name}</span> },
+    { colKey: 'ts_code', title: '代码', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.ts_code}</span> },
+    { colKey: 'name', title: '名称', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name}</span> },
     { colKey: 'qty', title: '数量', width: 70, sorter: (a, b) => (a.qty || 0) - (b.qty || 0), cell: ({ row }) => row.qty },
     { colKey: 'cost_price', title: '成本价', width: 90, sorter: (a, b) => (a.cost_price || 0) - (b.cost_price || 0), cell: ({ row }) => (row.cost_price != null ? '¥' + Number(row.cost_price).toFixed(3) : '-') },
     { colKey: 'cur_price', title: '现价', width: 90, sorter: (a, b) => curPrice(a) - curPrice(b), cell: ({ row }) => curPrice(row) ? '¥' + curPrice(row).toFixed(2) : '—' },
     // §F1 实盘持仓盈亏按 realPnlPct 派生值排序（成本价×数量的浮盈率），与展示口径一致
-    { colKey: 'pnl', title: '持仓盈亏', width: 90, sorter: (a, b) => realPnlPct(a) - realPnlPct(b), cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
+    { colKey: 'pnl', title: '持仓盈亏', width: 90, sorter: (a, b) => realPnlPct(a) - realPnlPct(b), cell: ({ row }) => <span style={{ color: realPnlPct(row) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{row.cost_price > 0 && curPrice(row) ? (realPnlPct(row) > 0 ? '+' : '') + realPnlPct(row).toFixed(2) + '%' : '—'}</span> },
     { colKey: 'highest_price', title: '最高价', width: 90, sorter: (a, b) => (a.highest_price || 0) - (b.highest_price || 0), cell: ({ row }) => <span>¥{row.highest_price != null ? Number(row.highest_price).toFixed(2) : '—'}</span> },
-    { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: '#e7e7e7' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
+    { colKey: 'advice', title: '建议', width: 80, cell: ({ row }) => { const a = adviceFor(row.ts_code); if (!a) return <span style={{ color: 'var(--app-border)' }}>—</span>; const theme = { add: 'danger', reduce: 'warning', tp: 'success', close: 'success', hold: 'default' }[a.action] || 'default'; return <Tag theme={theme} size="small">{a.label}</Tag> } },
     //  实盘操作列：加仓/减仓/止盈/清仓（熔断时禁用） 
     { colKey: 'actions', title: '操作', width: 200, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
@@ -625,7 +628,8 @@ export default function Positions() {
                 columns={paperColumns}
                 rowKey="code"
                 size="small"
-                pagination={false}
+                // §F5 长持仓分页（默认 20/页，可选 20/50/100）
+                pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100], showJumper: true }}
                 // §F1 长持仓列表固定表头
                 fixedHeader
                 maxHeight="calc(100vh - 320px)"
@@ -649,27 +653,27 @@ export default function Positions() {
           )}
 
           {/* 图例说明：涨跌颜色/信号标记/止盈止损/评分阈值 */}
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: '#888', marginTop: 12 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12, color: 'var(--app-muted)', marginTop: 12 }}>
             <span>当日涨跌红涨绿跌</span>
-            <span style={{ color: '#555' }}>|</span>
+            <span style={{ color: 'var(--app-text-2)' }}>|</span>
             <span>持仓盈亏红赚绿亏</span>
-            <span style={{ color: '#555' }}>|</span>
+            <span style={{ color: 'var(--app-text-2)' }}>|</span>
             <span>⚡ 有策略信号</span>
-            <span style={{ color: '#555' }}>|</span>
+            <span style={{ color: 'var(--app-text-2)' }}>|</span>
             <span>止盈+8% / 止损-5%</span>
-            <span style={{ color: '#555' }}>|</span>
+            <span style={{ color: 'var(--app-text-2)' }}>|</span>
             <span>N≥60可买 龙≥60买 量≥50关注</span>
           </div>
         </Tabs.TabPanel>
 
         <Tabs.TabPanel value="real" label={realTripped ? '实盘持仓 !' : '实盘持仓'}>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
-            <span style={{ color: qmtState.enabled ? '#00a870' : '#888' }}>{qmtState.enabled ? '已启用' : '未启用'}</span>
+            <span style={{ color: qmtState.enabled ? 'var(--app-down)' : 'var(--app-muted)' }}>{qmtState.enabled ? '已启用' : '未启用'}</span>
             <span className="muted">模式: {qmtState.mode || 'manual'}</span>
-            <span style={{ color: qmtState.tripped ? '#e34d59' : '#00a870' }}>熔断: {qmtState.tripped ? '已熔断' : '正常'}</span>
+            <span style={{ color: qmtState.tripped ? 'var(--app-up)' : 'var(--app-down)' }}>熔断: {qmtState.tripped ? '已熔断' : '正常'}</span>
             {qmtState.gateway_url && <span className="muted">网关 {qmtState.gateway_url}</span>}
             {realAccount && (
-              <span style={{ color: '#4fc3f7', fontWeight: 600 }}>
+              <span style={{ color: 'var(--app-accent)', fontWeight: 600 }}>
                 可用资金 {realAccount.updated_at
                   ? '¥' + (realAccount.available_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
                   : '—（网关未上报）'}
@@ -692,7 +696,7 @@ export default function Positions() {
             </Card>
           ) : (
             <Card>
-              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={false} />
+              <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} />
             </Card>
           )}
         </Tabs.TabPanel>
@@ -773,7 +777,7 @@ export default function Positions() {
             <div className="muted">
               {lotDir === 'add'
                 ? <>加仓后：共 {lotPreviewQty} 股 / 平均成本 ¥{lotPreviewCost.toFixed(3)}</>
-                : <span style={{ color: lotOverSell ? '#e34d59' : '#888' }}>
+                : <span style={{ color: lotOverSell ? 'var(--app-up)' : 'var(--app-muted)' }}>
                     {lotOverSell ? '减仓数量超过持仓！' : `减仓后：剩余 ${lotPreviewQty} 股 / 平均成本 ¥${lotPreviewCost.toFixed(3)}`}
                   </span>}
             </div>
@@ -802,7 +806,7 @@ export default function Positions() {
           {/* 清仓盈亏预览：金额与百分比 */}
           {closePreviewValid && (
             <div className="muted">
-              清仓盈亏：<span style={{ color: closePnlAmount >= 0 ? '#e34d59' : '#00a870' }}>{closePnlAmount >= 0 ? '+' : ''}¥{closePnlAmount.toFixed(2)}</span>
+              清仓盈亏：<span style={{ color: closePnlAmount >= 0 ? 'var(--app-up)' : 'var(--app-down)' }}>{closePnlAmount >= 0 ? '+' : ''}¥{closePnlAmount.toFixed(2)}</span>
               （{closePnlPct >= 0 ? '+' : ''}{closePnlPct.toFixed(2)}%）
             </div>
           )}
@@ -853,6 +857,10 @@ export default function Positions() {
           )}
         </Form>
       </Dialog>
+
+      {/* §F3 全局个股详情抽屉：代码点开，实时价 + 分时/盘口 + 该标的持仓 */}
+      <StockDetailDrawer open={!!detail} code={detail?.code} name={detail?.name}
+        related={{ positions: holdings }} onClose={() => setDetail(null)} />
     </div>
   )
 }

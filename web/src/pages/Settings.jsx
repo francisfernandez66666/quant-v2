@@ -80,7 +80,7 @@ const strategyGroups = [
 const emptyStrategy = () => ({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} })
 
 const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' } // 设置项行布局
-const labelStyle = { width: 160, flexShrink: 0, color: '#999', fontSize: 13 } // 设置项标签样式
+const labelStyle = { width: 160, flexShrink: 0, color: 'var(--app-muted-2)', fontSize: 13 } // 设置项标签样式
 
 /**
  * 设置页面组件
@@ -299,7 +299,7 @@ export default function Settings() {
       <Card title="账户信息" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>账号</span>
-          <span style={{ color: '#1a1a1a' }}>{account}</span>
+          <span style={{ color: 'var(--app-text)' }}>{account}</span>
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>令牌</span>
@@ -345,7 +345,7 @@ export default function Settings() {
         <div style={rowStyle}>
           <span style={labelStyle}>D1推理上限</span>
           <InputNumber value={llmD1MaxTokens} onChange={(v) => setLlmD1MaxTokens(v)} min={512} max={4096} step={256} style={{ width: 200 }} />
-          <span style={{ ...labelStyle, color: '#999', marginLeft: 8, fontSize: 12 }}>tokens（默认 2048，D1 评分推理长度）</span>
+          <span style={{ ...labelStyle, color: 'var(--app-muted-2)', marginLeft: 8, fontSize: 12 }}>tokens（默认 2048，D1 评分推理长度）</span>
         </div>
         {
           /* 配置状态展示与保存按钮 */

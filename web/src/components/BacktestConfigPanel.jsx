@@ -83,7 +83,7 @@ function fromConfig(cfg) {
 function Num({ label, value, onChange, min, max, step = 1, tip }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '4px 0' }}>
-      <span style={{ fontSize: 12, width: 150, color: '#606266' }} title={tip || ''}>{label}</span>
+      <span style={{ fontSize: 12, width: 150, color: 'var(--app-text-2)' }} title={tip || ''}>{label}</span>
       <InputNumber value={value} onChange={onChange} min={min} max={max} step={step} size="small" style={{ width: 120 }} />
     </div>
   )
@@ -93,7 +93,7 @@ function Num({ label, value, onChange, min, max, step = 1, tip }) {
 function Sw({ label, checked, onChange, tip }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '4px 0' }}>
-      <span style={{ fontSize: 12, width: 150, color: '#606266' }} title={tip || ''}>{label}</span>
+      <span style={{ fontSize: 12, width: 150, color: 'var(--app-text-2)' }} title={tip || ''}>{label}</span>
       <ToggleSw checked={checked} onChange={onChange} />
     </div>
   )
@@ -140,11 +140,11 @@ export default function BacktestConfigPanel() {
     } catch (e) { MessagePlugin.error('保存失败: ' + (e.message || e)) } finally { setSaving(false) }
   }
 
-  if (loading || !f) return <Card title="回测增强设置" style={{ marginBottom: 12 }}><span style={{ color: '#888', fontSize: 12 }}>加载中...</span></Card>
+  if (loading || !f) return <Card title="回测增强设置" style={{ marginBottom: 12 }}><span style={{ color: 'var(--app-muted)', fontSize: 12 }}>加载中...</span></Card>
 
   return (
     <Card title="回测增强设置" style={{ marginBottom: 12 }}>
-      <div style={{ fontSize: 12, color: '#888', marginBottom: 8, lineHeight: 1.5 }}>
+      <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 8, lineHeight: 1.5 }}>
         回测可信度增强（动态滑点 / 流动性约束 / 多目标前沿）。全部关闭时行为与历史口径完全一致；
         配置在任务入队时注入，保存后<b>下一次</b>寻优/回放生效。
       </div>
@@ -164,10 +164,10 @@ export default function BacktestConfigPanel() {
           <Num label="模型内置滑点 bp" value={f.paperModelBps} onChange={(v) => set({ paperModelBps: v })} min={0} max={20} step={0.5}
             tip="模拟盘撮合已扣的固定滑点，校准求实测时同口径扣除" />
           <details style={{ margin: '4px 0' }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12, color: '#888' }}>高级：流动性分档表（JSON，留空=内置默认）</summary>
-            <div style={{ fontSize: 11, color: '#888', margin: '4px 0' }}>volume_tiers：按日均成交额(万元)分档加 bp，max_volume_wan 升序、extra_bps 降序</div>
+            <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--app-muted)' }}>高级：流动性分档表（JSON，留空=内置默认）</summary>
+            <div style={{ fontSize: 11, color: 'var(--app-muted)', margin: '4px 0' }}>volume_tiers：按日均成交额(万元)分档加 bp，max_volume_wan 升序、extra_bps 降序</div>
             <Input value={f.volTiersJson} onChange={(v) => set({ volTiersJson: v })} placeholder='[{"max_volume_wan":500,"extra_bps":20}]' style={{ fontSize: 11 }} />
-            <div style={{ fontSize: 11, color: '#888', margin: '4px 0' }}>size_tiers：按名义额/日成交额占比分档加 bp，min_ratio 降序、extra_bps 降序</div>
+            <div style={{ fontSize: 11, color: 'var(--app-muted)', margin: '4px 0' }}>size_tiers：按名义额/日成交额占比分档加 bp，min_ratio 降序、extra_bps 降序</div>
             <Input value={f.sizeTiersJson} onChange={(v) => set({ sizeTiersJson: v })} placeholder='[{"min_ratio":0.05,"extra_bps":10}]' style={{ fontSize: 11 }} />
           </details>
 

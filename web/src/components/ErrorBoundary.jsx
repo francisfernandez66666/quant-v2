@@ -69,7 +69,7 @@ export default class ErrorBoundary extends React.Component {
             padding: 32,
             textAlign: 'center',
             fontFamily: 'system-ui, -apple-system, sans-serif',
-            color: '#333',
+            color: 'var(--app-text)',
             minHeight: '60vh',
             display: 'flex',
             flexDirection: 'column',
@@ -85,7 +85,7 @@ export default class ErrorBoundary extends React.Component {
           {
             // 错误详情：展示捕获到的 error.message，最长 480px 自动换行，未知错误给兜底文案
           }
-          <p style={{ margin: 0, color: '#888', fontSize: 13, maxWidth: 480, wordBreak: 'break-all' }}>
+          <p style={{ margin: 0, color: 'var(--app-muted)', fontSize: 13, maxWidth: 480, wordBreak: 'break-all' }}>
             {(this.state.error && this.state.error.message) || '发生未知错误'}
           </p>
           {
@@ -98,7 +98,7 @@ export default class ErrorBoundary extends React.Component {
               padding: '8px 20px',
               border: 'none',
               borderRadius: 6,
-              background: '#0052d9',
+              background: 'var(--td-brand-color)',
               color: '#fff',
               fontSize: 14,
               cursor: 'pointer',

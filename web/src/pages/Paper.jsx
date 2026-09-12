@@ -8,9 +8,11 @@ import {
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 import MinuteView from '../components/MinuteView.jsx'
+import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
+import useSseRefresh from '../useSseRefresh.js'
 
-const UP = '#e34d59'   // 涨（A股习惯红）
-const DOWN = '#00a870' // 跌（绿）
+const UP = 'var(--app-up)'   // 涨（A股习惯红）
+const DOWN = 'var(--app-down)' // 跌（绿）
 // 将 up/down 涨跌标记映射为对应的红/绿颜色常量
 const clsColor = (c) => (c === 'up' ? UP : c === 'down' ? DOWN : undefined)
 
@@ -138,7 +140,7 @@ function shortReason(r) { if (!r) return '—'; return r.length > 18 ? r.slice(0
 function StatCard({ label, children }) {
   return (
     <Card bordered style={{ flex: '1 1 180px', minWidth: 160 }}>
-      <div style={{ fontSize: 12, color: '#888' }}>{label}</div>
+      <div style={{ fontSize: 12, color: 'var(--app-muted)' }}>{label}</div>
       <div style={{ fontSize: 18, fontWeight: 600, marginTop: 4 }}>{children}</div>
     </Card>
   )
@@ -187,6 +189,8 @@ export default function Paper() {
   const [selfCheckLoading, setSelfCheckLoading] = useState(false)
 
   const [klineOpen, setKlineOpen] = useState(new Set())
+  // §F3 全局个股详情抽屉目标（{code,name}），null=关闭
+  const [detail, setDetail] = useState(null)
   const [sheetPos, setSheetPos] = useState(null)
   const [sheetTradeRow, setSheetTradeRow] = useState(null)
   const [tradeModal, setTradeModal] = useState(false)
@@ -196,7 +200,8 @@ export default function Paper() {
   const [tradeFormQty, setTradeFormQty] = useState(1)
 
   const W = 900, H = 220 // 净值曲线 SVG 的逻辑尺寸（viewBox 坐标，非真实像素）
-  const timer = useRef(null) // 轮询定时器句柄
+  const timer = useRef(null) // §F5 预留（轮询已由 SSE + useSseRefresh 兜底接管）
+
 
   // 解析交易弹窗中输入的手数（无效或非正整数则归零，用于预览/校验）
   const tradePreviewQty = useMemo(() => {
@@ -533,17 +538,14 @@ export default function Paper() {
     } catch (e) { showToast(e.message || '清盘失败','error') }
   }
 
-  // 挂载时加载模拟盘数据并启动 15s 轮询
-  useEffect(() => {
-    load()
-    timer.current = setInterval(load, 15000) // 每 15 秒轮询刷新模拟盘数据
-    return () => { if (timer.current) clearInterval(timer.current) }
-  }, [])
+  // 挂载时加载模拟盘数据；§F5 刷新由 SSE 事件驱动 + 60s 兜底（原 15s 高频轮询）
+  useEffect(() => { load() }, [])
+  useSseRefresh(['message', 'scan', 'tick'], load)
 
   // ── 列定义 ──
   // 模拟盘持仓表格列定义：代码/名称/买卖时间/数量/成本/现价/浮盈/滑点/延迟/资金池/分时/操作
   const posColumns = [
-    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 100 },
     { colKey: 'time', title: '买入时间', width: 160, cell: ({ row }) => (
       <span title={'信号发出 ' + fmtTime(row.signal_at) + ' · 撮合成交 ' + fmtTime(row.filled_at)}>{fmtTime(row.filled_at || row.signal_at)}</span>
@@ -574,7 +576,7 @@ export default function Paper() {
   const tradeColumns = [
     { colKey: 'time', title: '时间', width: 160, cell: ({ row }) => fmtTime(row.time) },
     { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
-    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 100 },
     { colKey: 'strategy', title: '战法', width: 100, cell: ({ row }) => <Tag>{row.strategy}</Tag> },
     { colKey: 'qty', title: '数量', width: 70 },
@@ -596,7 +598,7 @@ export default function Paper() {
   const orderColumns = [
     { colKey: 'time', title: '时间', width: 160, cell: ({ row }) => fmtTime(row.created_at) },
     { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
-    { colKey: 'code', title: '代码', width: 90 },
+    { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 100 },
     { colKey: 'strategy', title: '战法', width: 110, cell: ({ row }) => <Tag>{row.strategy || '—'}</Tag> },
     { colKey: 'kind', title: '来源', width: 90, cell: ({ row }) => <Tag>{row.kind || '—'}</Tag> },
@@ -631,7 +633,7 @@ export default function Paper() {
       </div>
 
       {forbidden && (
-        <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: '#ad6800', fontSize: 13 }}>
+        <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
           🔒 无权限访问模拟盘：当前登录「{api.getAccount() || '未知'}」为普通用户，该页面仅管理员账号可操作。请使用管理员账号（用户名 admin）登录后再进行管理。
         </div>
       )}
@@ -659,11 +661,11 @@ export default function Paper() {
         onConfirm={doResetV2}
         confirmBtn="确认清盘"
       >
-        <div style={{ color: '#e6a23c', marginBottom: 8 }}>将平仓全部持仓、清除成交日志与净值曲线。</div>
+        <div style={{ color: 'var(--td-warning-color)', marginBottom: 8 }}>将平仓全部持仓、清除成交日志与净值曲线。</div>
         <Form layout="vertical">
           <Form.FormItem label="重置后初始资金">
             <InputNumber value={resetToCapital} min={0} step={10000} placeholder="默认 100000" onChange={(v) => setResetToCapital(v || 0)} style={{ width: 240 }} />
-            <span style={{ fontSize: 12, color: '#888' }}>元（不填则按当前累计投入总额重置）</span>
+            <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>元（不填则按当前累计投入总额重置）</span>
           </Form.FormItem>
           <Form.FormItem label="持仓上限">
             <InputNumber value={resetMaxPos} min={0} step={1} placeholder="0=不设限" onChange={(v) => setResetMaxPos(v || 0)} style={{ width: 240 }} />
@@ -684,7 +686,7 @@ export default function Paper() {
         <Tabs value={settingsTab} onChange={(v) => setSettingsTab(v)}>
           {/* 资金分配标签页：逐池调整资金额度，确保各池资金之和不超过总现金 */}
           <Tabs.TabPanel value="alloc" label="资金分配">
-            <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>每池资金额（Σ ≈ 总现金守恒）。不影响仓位上限。</div>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 8 }}>每池资金额（Σ ≈ 总现金守恒）。不影响仓位上限。</div>
             {pools.map((p) => (
               <Form.FormItem key={'sa-' + p.key} label={p.label}>
                 <InputNumber
@@ -702,7 +704,7 @@ export default function Paper() {
             <Form.FormItem label="全局持仓上限（0=不设限）">
               <InputNumber value={cfgMaxPos} min={0} step={1} placeholder="0=不设限" onChange={(v) => setCfgMaxPos(v || 0)} style={{ width: 240 }} />
             </Form.FormItem>
-            <div style={{ fontSize: 12, color: '#888', margin: '8px 0' }}>每池持仓上限（0=不单独设限）。Σ ≤ 全局。不影响资金分配。</div>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', margin: '8px 0' }}>每池持仓上限（0=不单独设限）。Σ ≤ 全局。不影响资金分配。</div>
             {pools.map((p) => (
               <Form.FormItem key={'sc-' + p.key} label={p.label}>
                 <InputNumber
@@ -717,7 +719,7 @@ export default function Paper() {
           </Tabs.TabPanel>
           {/* 买入纪律标签页：逐池配置日限次数/冷却/最低评分/日预算%，控制买入频率 */}
           <Tabs.TabPanel value="rules" label="买入纪律">
-            <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 8 }}>
               每池买入纪律：日限次数 / 冷却分钟 / 最低评分 / 日预算%。全 0 = 不设限；寻优审批会自动把门槛写入对应池的「最低评分」。
             </div>
             <Select value={cfgRuleSel} onChange={(v) => setCfgRuleSel(v)} style={{ width: 240, marginBottom: 8 }}>
@@ -727,7 +729,7 @@ export default function Paper() {
               <div>
                 <div style={{ marginBottom: 8 }}>
                   {poolLabel(cfgRuleSel)}
-                  {poolCurrentRule(cfgRuleSel) && <span style={{ color: '#888' }}>（当前生效：{poolCurrentRuleText(cfgRuleSel)}）</span>}
+                  {poolCurrentRule(cfgRuleSel) && <span style={{ color: 'var(--app-muted)' }}>（当前生效：{poolCurrentRuleText(cfgRuleSel)}）</span>}
                 </div>
                 {/* 买入纪律四字段网格：日限买 / 冷却分钟 / 最低评分 / 日预算百分比 */}
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -748,15 +750,15 @@ export default function Paper() {
             )}
           </Tabs.TabPanel>
         </Tabs>
-        {cfgWarn && <div style={{ color: '#e6a23c', marginTop: 8 }}>{cfgWarn}</div>}
+        {cfgWarn && <div style={{ color: 'var(--td-warning-color)', marginTop: 8 }}>{cfgWarn}</div>}
       </Dialog>
 
       {/* 分仓资金池条 */}
       {enabled && pools.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-          <span style={{ color: '#888', fontSize: 13 }}>分仓资金池</span>
+          <span style={{ color: 'var(--app-muted)', fontSize: 13 }}>分仓资金池</span>
           <Tag
-            style={{ cursor: 'pointer', background: activePool === null ? '#1d4ed8' : undefined, color: activePool === null ? '#ffffff' : undefined, borderColor: activePool === null ? '#1d4ed8' : undefined }}
+            style={{ cursor: 'pointer', background: activePool === null ? 'var(--td-brand-color)' : undefined, color: activePool === null ? '#ffffff' : undefined, borderColor: activePool === null ? 'var(--td-brand-color)' : undefined }}
             onClick={() => setActivePool(null)}
           >
             全部（{positions.length} 仓）
@@ -767,7 +769,7 @@ export default function Paper() {
             return (
               <Tag
                 key={p.key}
-                style={{ cursor: 'pointer', background: active ? '#1d4ed8' : undefined, color: active ? '#ffffff' : undefined, borderColor: active ? '#1d4ed8' : undefined }}
+                style={{ cursor: 'pointer', background: active ? 'var(--td-brand-color)' : undefined, color: active ? '#ffffff' : undefined, borderColor: active ? 'var(--td-brand-color)' : undefined }}
                 onClick={() => setActivePool(active ? null : key)}
               >
                 {p.label} <span style={{ color: p.return_pct >= 0 ? UP : DOWN }}>{(p.return_pct >= 0 ? '+' : '') + p.return_pct.toFixed(2)}%</span> · ¥{fmt(p.cash)} · {p.ratio_pct.toFixed(1)}%·{p.positions}仓
@@ -794,7 +796,7 @@ export default function Paper() {
             <span style={{ color: activeStats.total_return_pct >= 0 ? UP : DOWN }}>
               {(activeStats.total_return_pct >= 0 ? '+' : '') + activeStats.total_return_pct.toFixed(2)}%
             </span>
-            <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}> 基于累计投入 ¥{fmt(activeStats.initial_capital)}</em>
+            <em style={{ fontSize: 12, color: 'var(--app-muted)', fontStyle: 'normal' }}> 基于累计投入 ¥{fmt(activeStats.initial_capital)}</em>
           </StatCard>
           <StatCard label="当日收益">
             <span style={{ color: activeStats.today_return_pct >= 0 ? UP : DOWN }}>
@@ -808,7 +810,7 @@ export default function Paper() {
               {' '}{(activeStats.realized_pnl >= 0 ? '+' : '')}¥{fmt(activeStats.realized_pnl)}
             </em>
           </StatCard>
-          <StatCard label="已平仓胜率">{activeStats.win_rate_pct.toFixed(0)}% <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}>/ {activeStats.open_positions}仓</em></StatCard>
+          <StatCard label="已平仓胜率">{activeStats.win_rate_pct.toFixed(0)}% <em style={{ fontSize: 12, color: 'var(--app-muted)', fontStyle: 'normal' }}>/ {activeStats.open_positions}仓</em></StatCard>
         </div>
       )}
 
@@ -816,7 +818,7 @@ export default function Paper() {
       {activeStats && isAdmin && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
           <StatCard label="已撮合买入信号">{activeStats.filled_buys}</StatCard>
-          <StatCard label="平均成交延迟">{activeStats.avg_latency_sec}s <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}>最大 {activeStats.max_latency_sec}s</em></StatCard>
+          <StatCard label="平均成交延迟">{activeStats.avg_latency_sec}s <em style={{ fontSize: 12, color: 'var(--app-muted)', fontStyle: 'normal' }}>最大 {activeStats.max_latency_sec}s</em></StatCard>
           <StatCard label="平均滑点（成交 vs 信号价）">
             <span style={{ color: activeStats.avg_slippage_pct >= 0 ? UP : DOWN }}>
               {(activeStats.avg_slippage_pct >= 0 ? '+' : '') + activeStats.avg_slippage_pct.toFixed(2)}%
@@ -826,18 +828,18 @@ export default function Paper() {
             <span style={{ color: activeStats.slippage_cost >= 0 ? UP : DOWN }}>
               {(activeStats.slippage_cost >= 0 ? '+' : '')}¥{fmt(activeStats.slippage_cost)}
             </span>
-            <em style={{ fontSize: 12, color: '#888', fontStyle: 'normal' }}> 占初始 {activeStats.signal_amount_pct.toFixed(2)}%</em>
+            <em style={{ fontSize: 12, color: 'var(--app-muted)', fontStyle: 'normal' }}> 占初始 {activeStats.signal_amount_pct.toFixed(2)}%</em>
           </StatCard>
         </div>
       )}
 
       {/* 净值曲线 */}
       {isAdmin && (
-        <Card title={<span>净值曲线 <em style={{ color: '#888', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em></span>} style={{ marginBottom: 12 }}>
+        <Card title={<span>净值曲线 <em style={{ color: 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em></span>} style={{ marginBottom: 12 }}>
           {equity.length > 1 ? (
             <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: H }}>
               <polyline points={linePoints} fill="none" stroke="#FF4D4F" strokeWidth="2" />
-              {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} style={{ stroke: '#eef0f3' }} />)}
+              {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} style={{ stroke: 'var(--app-divider)' }} />)}
             </svg>
           ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>净值数据不足（自动撮合开启并产生成交后显示）</div>}
         </Card>
@@ -845,7 +847,7 @@ export default function Paper() {
 
       {/* §SHORT-4 融券做空卡：做空池启用时显示（负持仓/担保/利息/权益 + 手动买回） */}
       {shortBook?.enabled && (
-        <Card title={<span>融券做空 <em style={{ color: '#888', fontSize: 12, fontStyle: 'normal' }}>（独立做空池 · 做空战法信号自动开仓 · T+1 可平）</em></span>} style={{ marginBottom: 12 }}>
+        <Card title={<span>融券做空 <em style={{ color: 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>（独立做空池 · 做空战法信号自动开仓 · T+1 可平）</em></span>} style={{ marginBottom: 12 }}>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 8 }}>
             <StatCard label="做空权益">¥{fmt(shortBook.equity)}</StatCard>
             <StatCard label="池内可用现金">¥{fmt(shortBook.cash)}</StatCard>
@@ -865,7 +867,7 @@ export default function Paper() {
           {(shortBook.positions || []).length ? (
             <Table rowKey="code" size="small" data={shortBook.positions}
               columns={[
-                { colKey: 'code', title: '代码', width: 90 },
+                { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
                 { colKey: 'name', title: '名称', width: 100 },
                 { colKey: 'strategy', title: '触发战法', width: 120, cell: ({ row }) => <Tag theme="danger" size="small">{row.strategy}</Tag> },
                 { colKey: 'qty', title: '欠券数', width: 80 },
@@ -962,6 +964,7 @@ export default function Paper() {
       {/* 移动端：持仓行操作菜单 */}
       <Dialog visible={!!sheetPos} header={sheetPos ? sheetPos.code + ' ' + sheetPos.name : ''} onClose={() => setSheetPos(null)} footer={null}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <Button block theme="primary" onClick={() => { const p = sheetPos; setSheetPos(null); if (p) setDetail({ code: p.code, name: p.name }) }}>详情</Button>
           <Button block onClick={sheetKline}>{sheetPos && klineOpen.has(sheetPos.code) ? '收起分时' : '展开分时'}</Button>
           <Button block onClick={() => sheetTrade('add')}>加仓</Button>
           <Button block onClick={() => sheetTrade('trim')}>减仓</Button>
@@ -1000,7 +1003,7 @@ export default function Paper() {
               : <span>{tradeTarget?.qty} 股（全部）</span>}
           </Form.FormItem>
           {tradeDir === 'trim' && tradePreviewQty > 0 && (
-            <div style={{ color: '#e6a23c' }}>减仓后：剩余 {tradeTarget.qty - tradePreviewQty * 100} 股</div>
+            <div style={{ color: 'var(--td-warning-color)' }}>减仓后：剩余 {tradeTarget.qty - tradePreviewQty * 100} 股</div>
           )}
         </Form>
       </Dialog>
@@ -1010,7 +1013,7 @@ export default function Paper() {
       <Dialog visible={selfCheckOpen} header="模拟盘自检" onClose={() => setSelfCheckOpen(false)} footer={null} width={640}>
         {selfCheck && (
           <div style={{ fontSize: 13, lineHeight: 1.9 }}>
-            {selfCheck.note && <div style={{ color: '#e6a23c', marginBottom: 8 }}>{selfCheck.note}</div>}
+            {selfCheck.note && <div style={{ color: 'var(--td-warning-color)', marginBottom: 8 }}>{selfCheck.note}</div>}
             {/* 诊断信息表格：开关/管理员/引擎路径/成交/持仓/文件状态等关键指标 */}
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <tbody>
@@ -1030,7 +1033,7 @@ export default function Paper() {
                   ['文件错误', selfCheck.file_error || '—'],
                 ].map(([k, v]) => (
                   <tr key={k} style={{ borderBottom: '1px solid #eee' }}>
-                    <td style={{ color: '#666', padding: '4px 8px', width: 200 }}>{k}</td>
+                    <td style={{ color: 'var(--app-text-2)', padding: '4px 8px', width: 200 }}>{k}</td>
                     <td style={{ padding: '4px 8px', fontFamily: 'monospace', wordBreak: 'break-all' }}>{String(v)}</td>
                   </tr>
                 ))}
@@ -1042,7 +1045,7 @@ export default function Paper() {
                 <div style={{ fontWeight: 600, marginBottom: 4 }}>各资金池持仓分布</div>
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
-                    <tr style={{ color: '#666', textAlign: 'left' }}>
+                    <tr style={{ color: 'var(--app-text-2)', textAlign: 'left' }}>
                       <th style={{ padding: '4px 8px' }}>池(key)</th>
                       <th style={{ padding: '4px 8px' }}>名称</th>
                       <th style={{ padding: '4px 8px' }}>持仓数</th>
@@ -1062,10 +1065,14 @@ export default function Paper() {
                 </table>
               </div>
             )}
-            <div style={{ marginTop: 10, color: '#999' }}>提示：若「当前持仓数」&gt;0 但前端「全部」页为空，多半是前端拉取逻辑问题（已修复）；若持仓与文件都为空，则确属无数据。</div>
+            <div style={{ marginTop: 10, color: 'var(--app-muted-2)' }}>提示：若「当前持仓数」&gt;0 但前端「全部」页为空，多半是前端拉取逻辑问题（已修复）；若持仓与文件都为空，则确属无数据。</div>
           </div>
         )}
       </Dialog>
+
+      {/* §F3 全局个股详情抽屉：代码点开，实时价 + 分时/盘口 + 该标的持仓 */}
+      <StockDetailDrawer open={!!detail} code={detail?.code} name={detail?.name}
+        related={{ positions }} onClose={() => setDetail(null)} />
     </div>
   )
 }

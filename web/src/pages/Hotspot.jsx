@@ -4,6 +4,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Card, Table, Dialog, Tag, Button, Select, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
+import { on } from '../sseBus.js'
 import { fetchSignalLogs, fetchStageRecords } from '../api/index.js'
 
 // ── 工具函数 ──
@@ -16,10 +17,10 @@ function shortReason(r) {
 
 // 根据分数与阈值返回评分单元格颜色（红强 / 橙达标 / 灰偏低）
 function scoreColorF(score, pass, strongMin) {
-  if (!score || score <= 0) return '#555'
-  if (score >= strongMin) return '#e34d59'
-  if (pass) return '#FAAD14'
-  return '#555'
+  if (!score || score <= 0) return 'var(--app-text-2)'
+  if (score >= strongMin) return 'var(--app-up)'
+  if (pass) return 'var(--td-warning-color)'
+  return 'var(--app-text-2)'
 }
 
 // 安全读取字段值
@@ -264,11 +265,11 @@ export default function Hotspot() {
     } catch (_) { setLogStages([]) }
   }
 
-  // 挂载时加载数据、启动轮询与 SSE；处理页面可见性变化；卸载时清理
-  // 挂载即加载数据并开启 5s 轮询；页面隐藏时暂停轮询省电，恢复可见立即刷新
+  // 挂载时加载数据、启动兜底轮询与事件总线订阅；处理页面可见性变化；卸载时清理
+  // §F5 兜底轮询由 5s 降为 30s（实时性靠 SSE 事件）；页面隐藏时暂停轮询省电，恢复可见立即刷新
   useEffect(() => {
     load()
-    timerRef.current = setInterval(load, 5000)
+    timerRef.current = setInterval(load, 30000)
 
     visHandlerRef.current = () => {
       if (document.hidden) {
@@ -277,14 +278,13 @@ export default function Hotspot() {
         if (!timerRef.current) {
           load()
 
-    timerRef.current = setInterval(load, 5000) // 每 5s 轮询刷新热点/评分/新闻/IPO
+    timerRef.current = setInterval(load, 30000) // §F5 每 30s 兜底轮询刷新热点/评分/新闻/IPO
         }
       }
     }
 
     document.addEventListener('visibilitychange', visHandlerRef.current)
-    api.connectSSE()
-    unsubSSERef.current = api.onSSE(handleSSE)
+    unsubSSERef.current = on(['message', 'scan', 'score'], handleSSE)
 
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
@@ -297,11 +297,11 @@ export default function Hotspot() {
   // 板块卡片网格列
   const sectorColumns = [
     { colKey: 'name', title: '板块', width: 120 },
-    { colKey: 'reason', title: '异动原因', width: 200, ellipsis: true, cell: ({ row }) => row.reason ? <span style={{ color: '#4fc3f7' }}>{shortReason(row.reason)}</span> : null },
-    { colKey: 'score', title: '评分', width: 80, cell: ({ row }) => <span style={{ color: '#FAAD14' }}>{Math.round((row.score || 0) * 100)}分</span> },
-    { colKey: 'change_pct', title: '涨幅', width: 90, cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 700 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'reason', title: '异动原因', width: 200, ellipsis: true, cell: ({ row }) => row.reason ? <span style={{ color: 'var(--app-accent)' }}>{shortReason(row.reason)}</span> : null },
+    { colKey: 'score', title: '评分', width: 80, cell: ({ row }) => <span style={{ color: 'var(--td-warning-color)' }}>{Math.round((row.score || 0) * 100)}分</span> },
+    { colKey: 'change_pct', title: '涨幅', width: 90, cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 700 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
     { colKey: 'meta', title: '涨停/流入', width: 180, cell: ({ row }) => (
-      <span style={{ color: '#666', fontSize: 13 }}>
+      <span style={{ color: 'var(--app-text-2)', fontSize: 13 }}>
         {row.d1 > 0 && <Tag size="small" style={{ marginRight: 6 }}>D1 {row.d1.toFixed(0)}</Tag>}
         <span>涨停 {row.limitup_cnt || 0}</span>
         <span style={{ marginLeft: 8 }}>流入 {row.net_inflow ? (row.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
@@ -311,10 +311,10 @@ export default function Hotspot() {
 
   // 个股评分排名列
   const evalColumns = [
-    { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span style={{ color: '#4fc3f7', fontFamily: 'monospace' }}>{row.code}</span> },
-    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.name || '-'}</span> },
+    { colKey: 'code', title: '代码', width: 90, sorter: (a, b) => (a.code || '').localeCompare(b.code || ''), cell: ({ row }) => <span style={{ color: 'var(--app-accent)', fontFamily: 'monospace' }}>{row.code}</span> },
+    { colKey: 'name', title: '名称', width: 90, sorter: (a, b) => (a.name || '').localeCompare(b.name || ''), cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.name || '-'}</span> },
     { colKey: 'price', title: '现价', width: 90, sorter: (a, b) => (a.price || 0) - (b.price || 0), cell: ({ row }) => '¥' + (row.price || 0).toFixed(2) },
-    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? '#e34d59' : '#00a870', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
+    { colKey: 'change_pct', title: '涨跌', width: 100, sorter: (a, b) => (a.change_pct || 0) - (b.change_pct || 0), cell: ({ row }) => <span style={{ color: (row.change_pct || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)', fontWeight: 600 }}>{(row.change_pct || 0) > 0 ? '+' : ''}{(row.change_pct || 0).toFixed(2)}%</span> },
     { colKey: 'n_score', title: 'N≥60', width: 70, sorter: (a, b) => (a.n_score || 0) - (b.n_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.n_score, row.n_score >= 60, 80), fontWeight: 600 }}>{row.n_score > 0 ? row.n_score.toFixed(0) : '—'}</span> },
     { colKey: 'dragon_score', title: '龙≥60', width: 70, sorter: (a, b) => (a.dragon_score || 0) - (b.dragon_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.dragon_score, row.dragon_score >= 60, 80), fontWeight: 600 }}>{row.dragon_score > 0 ? row.dragon_score.toFixed(0) : '—'}</span> },
     { colKey: 'db_score', title: '凸≥60', width: 70, sorter: (a, b) => (a.db_score || 0) - (b.db_score || 0), cell: ({ row }) => <span style={{ color: scoreColorF(row.db_score, row.db_score >= 60, 80), fontWeight: 600 }}>{row.db_score > 0 ? row.db_score.toFixed(0) : '—'}</span> },
@@ -324,16 +324,16 @@ export default function Hotspot() {
 
   // 宏观日历列
   const calendarColumns = [
-    { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: '#888' }}>{row.date}</span> },
-    { colKey: 'title', title: '事件', cell: ({ row }) => <span style={{ color: '#1a1a1a' }}>{row.title}</span> },
+    { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-muted)' }}>{row.date}</span> },
+    { colKey: 'title', title: '事件', cell: ({ row }) => <span style={{ color: 'var(--app-text)' }}>{row.title}</span> },
   ]
   const calendarData = calendarEvents.map((c, i) => ({ id: 'c' + i, date: c.datetime ? c.datetime.slice(5, 10) : '', title: c.title })) // 取 MM-DD 作为日期列
 
   // IPO 日历列
   const ipoColumns = [
-    { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: '#888' }}>{row.date}</span> },
-    { colKey: 'name', title: '名称', width: 160, cell: ({ row }) => <span style={{ color: '#1a1a1a' }}>{row.name}（{row.code}）</span> },
-    { colKey: 'price', title: '发行价', width: 90, cell: ({ row }) => row.issue_price ? <span style={{ color: '#4fc3f7' }}>¥{row.issue_price.toFixed(2)}</span> : null },
+    { colKey: 'date', title: '日期', width: 90, cell: ({ row }) => <span style={{ color: 'var(--app-muted)' }}>{row.date}</span> },
+    { colKey: 'name', title: '名称', width: 160, cell: ({ row }) => <span style={{ color: 'var(--app-text)' }}>{row.name}（{row.code}）</span> },
+    { colKey: 'price', title: '发行价', width: 90, cell: ({ row }) => row.issue_price ? <span style={{ color: 'var(--app-accent)' }}>¥{row.issue_price.toFixed(2)}</span> : null },
     { colKey: 'status', title: '状态', width: 100, cell: ({ row }) => <Tag size="small" theme={row.statusTheme}>{row.status}</Tag> },
   ]
   // 将 IPO 日历转为表格行数据并附加上市倒计时状态与标签主题
@@ -362,8 +362,8 @@ export default function Hotspot() {
   }
   // 资讯列
   const newsColumns = [
-    { colKey: 'time', title: '时间', width: 100, cell: ({ row }) => <span style={{ color: '#888' }}>{row.time}</span> },
-    { colKey: 'title', title: '标题', cell: ({ row }) => <span style={{ color: '#ccc' }}>{row.title}</span> },
+    { colKey: 'time', title: '时间', width: 100, cell: ({ row }) => <span style={{ color: 'var(--app-muted)' }}>{row.time}</span> },
+    { colKey: 'title', title: '标题', cell: ({ row }) => <span style={{ color: 'var(--app-faint)' }}>{row.title}</span> },
     { colKey: 'tags', title: '标签', width: 280, cell: ({ row }) => (
       <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
         {row.tags.map((t, i) => <Tag key={i} size="small" theme={t.theme}>{t.text}</Tag>)}
@@ -388,20 +388,20 @@ export default function Hotspot() {
             {/*
              * 板块卡片网格：名称 + 异动原因摘要 + 评分 + 涨跌幅 + D1/涨停/流入 */}
             {sectors.map((s) => (
-              <Card key={s.code} bordered={false} style={{ background: '#eef4fc', border: '1px solid #eef0f3' }}>
+              <Card key={s.code} bordered={false} style={{ background: 'var(--app-surface-2)', border: '1px solid #eef0f3' }}>
                 {/* 卡片主体：整卡可点，打开该板块的异动原因弹窗 */}
                 <div onClick={() => setReasonTarget(s)} style={{ cursor: 'pointer' }}>
 
-                <div style={{ fontSize: 14, fontWeight: 600, color: '#1a1a1a' }}>{s.name}</div>
-                {s.reason && <div style={{ fontSize: 11, color: '#888', marginTop: 4, minHeight: 28, overflow: 'hidden' }}>{shortReason(s.reason)}</div>}
-                <div style={{ fontSize: 16, fontWeight: 700, color: '#FAAD14', marginTop: 4 }}>{Math.round((s.score || 0) * 100)}分</div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--app-text)' }}>{s.name}</div>
+                {s.reason && <div style={{ fontSize: 11, color: 'var(--app-muted)', marginTop: 4, minHeight: 28, overflow: 'hidden' }}>{shortReason(s.reason)}</div>}
+                <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--td-warning-color)', marginTop: 4 }}>{Math.round((s.score || 0) * 100)}分</div>
                 <div className={(s.change_pct || 0) >= 0 ? 'up' : 'down'} style={{ fontWeight: 700, marginTop: 2 }}>
                   {(s.change_pct || 0) > 0 ? '+' : ''}{(s.change_pct || 0).toFixed(2)}%
                 </div>
 
                 {/* 底行指标：D1 归因标签（>0 才显示）+ 涨停家数 + 主力净流入（亿元） */}
-                <div style={{ fontSize: 11, color: '#777', marginTop: 6 }}>
-                  {(s.d1 || 0) > 0 && <span style={{ display: 'inline-block', background: 'rgba(79,195,247,0.15)', color: '#4fc3f7', borderRadius: 4, padding: '1px 5px', marginRight: 6 }}>D1 {s.d1.toFixed(0)}</span>}
+                <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginTop: 6 }}>
+                  {(s.d1 || 0) > 0 && <span style={{ display: 'inline-block', background: 'rgba(79,195,247,0.15)', color: 'var(--app-accent)', borderRadius: 4, padding: '1px 5px', marginRight: 6 }}>D1 {s.d1.toFixed(0)}</span>}
                   <span>涨停 {s.limitup_cnt || 0}</span>
                   <span style={{ marginLeft: 8 }}>流入 {s.net_inflow ? (s.net_inflow / 1e8).toFixed(1) + '亿' : '—'}</span>
                 </div>
@@ -423,19 +423,19 @@ export default function Hotspot() {
               <div style={{ fontWeight: 600, marginBottom: 6 }}>信息来源</div>
               <div style={{ fontSize: 13 }}>
                 {reasonTarget.source === 'llm' ? (
-                  <span style={{ display: 'inline-block', background: 'rgba(0,168,112,0.15)', color: '#00a870', borderRadius: 4, padding: '2px 8px' }}>LLM 归因</span>
+                  <span style={{ display: 'inline-block', background: 'rgba(0,168,112,0.15)', color: 'var(--app-down)', borderRadius: 4, padding: '2px 8px' }}>LLM 归因</span>
                 ) : reasonTarget.source === 'ths' ? (
 
-                  <span style={{ display: 'inline-block', background: 'rgba(250,173,20,0.15)', color: '#FAAD14', borderRadius: 4, padding: '2px 8px' }}>同花顺板块兜底</span>
+                  <span style={{ display: 'inline-block', background: 'rgba(250,173,20,0.15)', color: 'var(--td-warning-color)', borderRadius: 4, padding: '2px 8px' }}>同花顺板块兜底</span>
                 ) : (
-                  <span style={{ display: 'inline-block', background: 'rgba(153,153,153,0.15)', color: '#999', borderRadius: 4, padding: '2px 8px' }}>未知来源</span>
+                  <span style={{ display: 'inline-block', background: 'rgba(153,153,153,0.15)', color: 'var(--app-muted-2)', borderRadius: 4, padding: '2px 8px' }}>未知来源</span>
                 )}
               </div>
             </div>
 
             <div style={{ marginBottom: 14 }}>
               <div style={{ fontWeight: 600, marginBottom: 6 }}>板块异动原因</div>
-              <div style={{ fontSize: 13, color: '#333', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
+              <div style={{ fontSize: 13, color: 'var(--app-text)', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{reasonTarget.reason_detail || reasonTarget.reason || '暂无'}</div>
             </div>
 
             {/* 触发新闻：优先用后端直接溯源的 news_items（含正文），标题二次匹配失败时按板块名兜底 */}
@@ -448,9 +448,9 @@ export default function Hotspot() {
                       <div style={{ fontWeight: 600, marginBottom: 6 }}>触发新闻（{items.length}条）</div>
                       {items.map((art, i) => (
                         <div key={i} style={{ marginBottom: 12, borderLeft: '3px solid #4fc3f7', paddingLeft: 10 }}>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a' }}>{i + 1}. {art.title}</div>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--app-text)' }}>{i + 1}. {art.title}</div>
 
-                          <div style={{ fontSize: 12, color: '#555', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（该资讯暂未收录正文）'}</div>
+                          <div style={{ fontSize: 12, color: 'var(--app-text-2)', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（该资讯暂未收录正文）'}</div>
                         </div>
                       ))}
                     </div>
@@ -468,11 +468,11 @@ export default function Hotspot() {
                         const art = findNews(t)
                         return (
                           <div key={i} style={{ marginBottom: 12, borderLeft: '3px solid #4fc3f7', paddingLeft: 10 }}>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a' }}>{i + 1}. {t}</div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--app-text)' }}>{i + 1}. {t}</div>
                             {art ? (
-                              <div style={{ fontSize: 12, color: '#555', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（资讯库无正文）'}</div>
+                              <div style={{ fontSize: 12, color: 'var(--app-text-2)', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（资讯库无正文）'}</div>
                             ) : (
-                              <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>（未在资讯库匹配到原文）</div>
+                              <div style={{ fontSize: 12, color: 'var(--app-muted-2)', marginTop: 4 }}>（未在资讯库匹配到原文）</div>
                             )}
 
                           </div>
@@ -480,7 +480,7 @@ export default function Hotspot() {
                       })
                     ) : (
 
-                      <div style={{ fontSize: 13, color: '#888' }}>暂无关联新闻（来源未提供相关触发新闻）</div>
+                      <div style={{ fontSize: 13, color: 'var(--app-muted)' }}>暂无关联新闻（来源未提供相关触发新闻）</div>
                     )}
 
                     {titles.length > 0 && !titles.every((t) => findNews(t)) ? (
@@ -489,11 +489,11 @@ export default function Hotspot() {
                         if (!related.length) return null
                         return (
                           <div style={{ marginTop: 10 }}>
-                            <div style={{ fontWeight: 600, marginBottom: 6, color: '#1d4ed8' }}>板块相关原文（按板块名匹配，{related.length}条）</div>
+                            <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--td-brand-color)' }}>板块相关原文（按板块名匹配，{related.length}条）</div>
                             {related.map((art, i) => (
                               <div key={'r' + i} style={{ marginBottom: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 10 }}>
-                                <div style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a' }}>{art.title}</div>
-                                <div style={{ fontSize: 12, color: '#555', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（资讯库无正文）'}</div>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--app-text)' }}>{art.title}</div>
+                                <div style={{ fontSize: 12, color: 'var(--app-text-2)', marginTop: 4, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{art.content || '（资讯库无正文）'}</div>
                               </div>
                             ))}
 
@@ -517,7 +517,7 @@ export default function Hotspot() {
       <Dialog visible={showLog} header="运行日志" onClose={() => setShowLog(false)} confirmBtn="关闭" cancelBtn="">
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-            <span style={{ fontSize: 13, color: '#888' }}>按批次查看</span>
+            <span style={{ fontSize: 13, color: 'var(--app-muted)' }}>按批次查看</span>
             <Select
               value={logBatch}
               onChange={(v) => setLogBatch(v)}
@@ -544,22 +544,22 @@ export default function Hotspot() {
                  <div style={{ fontWeight: 600, marginBottom: 6 }}>第 {bi + 1} 轮 · 信号批次</div>
 
                  {!log ? (
-                   <div style={{ fontSize: 13, color: '#888', marginBottom: 12 }}>该批次暂无信号日志</div>
+                   <div style={{ fontSize: 13, color: 'var(--app-muted)', marginBottom: 12 }}>该批次暂无信号日志</div>
                  ) : (
                    <div style={{ marginBottom: 16, border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
-                     <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                     <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 6 }}>
                        {fmtLogTime(log.process_time)} · 扫描新闻 {log.raw_count || 0} 条 · 产出信号 {log.signals ? log.signals.length : 0} 个
                      </div>
 
                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                        {(log.signals || []).map((sg, j) => (
-                         <div key={j} style={{ fontSize: 12, background: '#f7f9fc', borderRadius: 4, padding: '6px 8px' }}>
-                           <span style={{ fontFamily: 'monospace', color: '#1a1a1a', fontWeight: 600 }}>{sg.code} {sg.name}</span>
-                           <span style={{ marginLeft: 6, color: sg.direction === '做空' ? '#e34d59' : '#00a870' }}>{sg.direction}</span>
-                           <span style={{ marginLeft: 6, color: '#1d4ed8' }}>{sg.action}</span>
-                           <span style={{ marginLeft: 6, color: '#666' }}>{sg.strategy}</span>
-                           {sg.price > 0 && <span style={{ marginLeft: 6, color: '#666' }}>触发价 ¥{sg.price}</span>}
-                           {sg.reason && <div style={{ color: '#888', marginTop: 3 }}>原因：{sg.reason}</div>}
+                         <div key={j} style={{ fontSize: 12, background: 'var(--app-surface-2)', borderRadius: 4, padding: '6px 8px' }}>
+                           <span style={{ fontFamily: 'monospace', color: 'var(--app-text)', fontWeight: 600 }}>{sg.code} {sg.name}</span>
+                           <span style={{ marginLeft: 6, color: sg.direction === '做空' ? 'var(--app-up)' : 'var(--app-down)' }}>{sg.direction}</span>
+                           <span style={{ marginLeft: 6, color: 'var(--td-brand-color)' }}>{sg.action}</span>
+                           <span style={{ marginLeft: 6, color: 'var(--app-text-2)' }}>{sg.strategy}</span>
+                           {sg.price > 0 && <span style={{ marginLeft: 6, color: 'var(--app-text-2)' }}>触发价 ¥{sg.price}</span>}
+                           {sg.reason && <div style={{ color: 'var(--app-muted)', marginTop: 3 }}>原因：{sg.reason}</div>}
                          </div>
                        ))}
                      </div>
@@ -570,23 +570,23 @@ export default function Hotspot() {
                  <div style={{ fontWeight: 600, marginBottom: 6 }}>第 {bi + 1} 轮 · 新闻分析</div>
 
                  {!d ? (
-                   <div style={{ fontSize: 13, color: '#888' }}>该批次暂无阶段记录</div>
+                   <div style={{ fontSize: 13, color: 'var(--app-muted)' }}>该批次暂无阶段记录</div>
                  ) : (
                    <div style={{ border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
-                     <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                     <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 6 }}>
                        {fmtLogTime(d.process_time)} · 初筛模式 {d.stage1_mode || '-'}：原始 {d.raw_count || 0} 条 → 命中 {d.selected_count || 0} 条
                      </div>
 
-                     <div style={{ fontSize: 12, color: '#333', fontWeight: 600, marginBottom: 4 }}>命中事件：</div>
+                     <div style={{ fontSize: 12, color: 'var(--app-text)', fontWeight: 600, marginBottom: 4 }}>命中事件：</div>
                      {(d.stage2_events || []).map((ev, j) => (
-                       <div key={j} style={{ fontSize: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 8, margin: '4px 0', color: '#555' }}>
-                         <span style={{ fontWeight: 600, color: '#1a1a1a' }}>{ev.title}</span>
-                         <span style={{ marginLeft: 6, color: ev.direction === '利好' ? '#00a870' : ev.direction === '利空' ? '#e34d59' : '#888' }}>{ev.direction}</span>
-                         {(ev.sectors || []).length > 0 && <span style={{ marginLeft: 6, color: '#4fc3f7' }}>{ev.sectors.join(' / ')}</span>}
+                       <div key={j} style={{ fontSize: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 8, margin: '4px 0', color: 'var(--app-text-2)' }}>
+                         <span style={{ fontWeight: 600, color: 'var(--app-text)' }}>{ev.title}</span>
+                         <span style={{ marginLeft: 6, color: ev.direction === '利好' ? 'var(--app-down)' : ev.direction === '利空' ? 'var(--app-up)' : 'var(--app-muted)' }}>{ev.direction}</span>
+                         {(ev.sectors || []).length > 0 && <span style={{ marginLeft: 6, color: 'var(--app-accent)' }}>{ev.sectors.join(' / ')}</span>}
                        </div>
                      ))}
                      {(!d.stage2_events || d.stage2_events.length === 0) && (
-                       <div style={{ fontSize: 12, color: '#999' }}>本轮无命中事件（原始标题 {d.raw_titles ? d.raw_titles.length : 0} 条未通过筛选）</div>
+                       <div style={{ fontSize: 12, color: 'var(--app-muted-2)' }}>本轮无命中事件（原始标题 {d.raw_titles ? d.raw_titles.length : 0} 条未通过筛选）</div>
                      )}
                    </div>
                  )}
@@ -601,25 +601,25 @@ export default function Hotspot() {
                 {/* 信号批次轮次列表：每轮含初筛模式/原始数/命中数 */}
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ fontWeight: 600, marginBottom: 6 }}>信号批次（共 {logSignals.length} 轮）</div>
-                 {logSignals.length === 0 && <div style={{ fontSize: 13, color: '#888' }}>暂无信号日志</div>}
+                 {logSignals.length === 0 && <div style={{ fontSize: 13, color: 'var(--app-muted)' }}>暂无信号日志</div>}
 
                   {logSignals.map((log, i) => (
                     <div key={i} style={{ marginBottom: 12, border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
                       {/* 轮次摘要：第几轮/时间/扫描新闻数/产出信号数 */}
-                      <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                      <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 6 }}>
                         第 {i + 1} 轮 · {fmtLogTime(log.process_time)} · 扫描新闻 {log.raw_count || 0} 条 · 产出信号 {log.signals ? log.signals.length : 0} 个
                       </div>
 
                       {/* 信号条目列表：代码/名称/方向/策略/触发价/原因 */}
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                        {(log.signals || []).map((sg, j) => (
-                         <div key={j} style={{ fontSize: 12, background: '#f7f9fc', borderRadius: 4, padding: '6px 8px' }}>
-                           <span style={{ fontFamily: 'monospace', color: '#1a1a1a', fontWeight: 600 }}>{sg.code} {sg.name}</span>
-                           <span style={{ marginLeft: 6, color: sg.direction === '做空' ? '#e34d59' : '#00a870' }}>{sg.direction}</span>
-                           <span style={{ marginLeft: 6, color: '#1d4ed8' }}>{sg.action}</span>
-                           <span style={{ marginLeft: 6, color: '#666' }}>{sg.strategy}</span>
-                           {sg.price > 0 && <span style={{ marginLeft: 6, color: '#666' }}>触发价 ¥{sg.price}</span>}
-                           {sg.reason && <div style={{ color: '#888', marginTop: 3 }}>原因：{sg.reason}</div>}
+                         <div key={j} style={{ fontSize: 12, background: 'var(--app-surface-2)', borderRadius: 4, padding: '6px 8px' }}>
+                           <span style={{ fontFamily: 'monospace', color: 'var(--app-text)', fontWeight: 600 }}>{sg.code} {sg.name}</span>
+                           <span style={{ marginLeft: 6, color: sg.direction === '做空' ? 'var(--app-up)' : 'var(--app-down)' }}>{sg.direction}</span>
+                           <span style={{ marginLeft: 6, color: 'var(--td-brand-color)' }}>{sg.action}</span>
+                           <span style={{ marginLeft: 6, color: 'var(--app-text-2)' }}>{sg.strategy}</span>
+                           {sg.price > 0 && <span style={{ marginLeft: 6, color: 'var(--app-text-2)' }}>触发价 ¥{sg.price}</span>}
+                           {sg.reason && <div style={{ color: 'var(--app-muted)', marginTop: 3 }}>原因：{sg.reason}</div>}
                          </div>
                        ))}
                      </div>
@@ -630,27 +630,27 @@ export default function Hotspot() {
                {/* 全部批次：新闻分析轮次列表 */}
                <div>
                  <div style={{ fontWeight: 600, marginBottom: 6 }}>新闻分析轮次（共 {logStages.length} 轮）</div>
-                 {logStages.length === 0 && <div style={{ fontSize: 13, color: '#888' }}>暂无阶段记录</div>}
+                 {logStages.length === 0 && <div style={{ fontSize: 13, color: 'var(--app-muted)' }}>暂无阶段记录</div>}
 
                  {logStages.map((d, i) => (
                    <div key={i} style={{ marginBottom: 12, border: '1px solid #eef0f3', borderRadius: 6, padding: 10 }}>
-                     <div style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
+                     <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 6 }}>
                         第 {i + 1} 轮 · {fmtLogTime(d.process_time)} · 初筛模式 {d.stage1_mode || '-'}：原始 {d.raw_count || 0} 条 → 命中 {d.selected_count || 0} 条
                       </div>
 
                        {/* 命中事件列表：每轮筛选结果的事件标题/方向/关联板块 */}
-                       <div style={{ fontSize: 12, color: '#333', fontWeight: 600, marginBottom: 4 }}>命中事件：</div>
+                       <div style={{ fontSize: 12, color: 'var(--app-text)', fontWeight: 600, marginBottom: 4 }}>命中事件：</div>
                       {(d.stage2_events || []).map((ev, j) => (
-                        <div key={j} style={{ fontSize: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 8, margin: '4px 0', color: '#555' }}>
+                        <div key={j} style={{ fontSize: 12, borderLeft: '3px solid #FAAD14', paddingLeft: 8, margin: '4px 0', color: 'var(--app-text-2)' }}>
                           {/* 事件卡片：标题/方向/关联板块 */}
-                          <span style={{ fontWeight: 600, color: '#1a1a1a' }}>{ev.title}</span>
-                          <span style={{ marginLeft: 6, color: ev.direction === '利好' ? '#00a870' : ev.direction === '利空' ? '#e34d59' : '#888' }}>{ev.direction}</span>
-                          {(ev.sectors || []).length > 0 && <span style={{ marginLeft: 6, color: '#4fc3f7' }}>{ev.sectors.join(' / ')}</span>}
+                          <span style={{ fontWeight: 600, color: 'var(--app-text)' }}>{ev.title}</span>
+                          <span style={{ marginLeft: 6, color: ev.direction === '利好' ? 'var(--app-down)' : ev.direction === '利空' ? 'var(--app-up)' : 'var(--app-muted)' }}>{ev.direction}</span>
+                          {(ev.sectors || []).length > 0 && <span style={{ marginLeft: 6, color: 'var(--app-accent)' }}>{ev.sectors.join(' / ')}</span>}
                         </div>
                       ))}
                       {/* 无命中事件提示 */}
                       {(!d.stage2_events || d.stage2_events.length === 0) && (
-                       <div style={{ fontSize: 12, color: '#999' }}>本轮无命中事件（原始标题 {d.raw_titles ? d.raw_titles.length : 0} 条未通过筛选）</div>
+                       <div style={{ fontSize: 12, color: 'var(--app-muted-2)' }}>本轮无命中事件（原始标题 {d.raw_titles ? d.raw_titles.length : 0} 条未通过筛选）</div>
                      )}
                    </div>
                  ))}
@@ -678,10 +678,10 @@ export default function Hotspot() {
         ) : (
           <div className="muted" style={{ padding: 24, textAlign: 'center' }}>等待评估结果...</div>
         )}
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 11, color: '#888', marginTop: 10 }}>
-          <span style={{ color: '#e34d59' }}>≥80 强势</span>
-          <span style={{ color: '#FAAD14' }}>≥门槛 达标</span>
-          <span style={{ color: '#555' }}>&lt;门槛 偏低</span>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 11, color: 'var(--app-muted)', marginTop: 10 }}>
+          <span style={{ color: 'var(--app-up)' }}>≥80 强势</span>
+          <span style={{ color: 'var(--td-warning-color)' }}>≥门槛 达标</span>
+          <span style={{ color: 'var(--app-text-2)' }}>&lt;门槛 偏低</span>
 
           <span>|</span>
           <span>N形≥60操作, 龙头≥60买入/≥50观察, 双凸≥60买入/50-60观察, 回头≥60入场, 动量≥50关注</span>

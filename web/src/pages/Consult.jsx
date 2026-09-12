@@ -4,6 +4,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { Card, Input, Textarea, Button, Tag } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
+import Disclaimer from '../components/Disclaimer.jsx'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
 
@@ -169,8 +170,8 @@ export default function Consult() {
         <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>{m.role === 'user' ? '我' : 'AI 顾问'}</div>
         <div style={{
           ...bubbleStyle,
-          background: m.role === 'user' ? '#0052d9' : '#f4f4f5',
-          color: m.role === 'user' ? '#fff' : '#1a1a1a',
+          background: m.role === 'user' ? 'var(--td-brand-color)' : 'var(--app-surface-2)',
+          color: m.role === 'user' ? '#fff' : 'var(--app-text)',
         }}>{m.content}</div>
         {m.time && <div className="muted" style={{ fontSize: 12, marginTop: 2, textAlign: m.role === 'user' ? 'right' : 'left' }}>{fmtTime(m.time)}</div>}
       </div>
@@ -250,11 +251,13 @@ export default function Consult() {
         {loading && (
           <div style={{ alignSelf: 'flex-start' }}>
             <div className="muted" style={{ fontSize: 12, marginBottom: 2 }}>AI 顾问</div>
-            <div style={{ ...bubbleStyle, background: '#f4f4f5', color: '#1a1a1a' }}>思考中...</div>
+            <div style={{ ...bubbleStyle, background: 'var(--app-surface-2)', color: 'var(--app-text)' }}>思考中...</div>
           </div>
         )}
       </div>
 
+      {/* §F6 咨询合规尾注（UAT 4.1）：AI 回答为模型生成，参考性质 */}
+      {messages.length > 0 && <Disclaimer variant="inline" />}
       {/* 底部输入区域：多行文本框 + 发送按钮，支持 Enter 发送、Shift+Enter 换行 */}
       {renderInputArea()}
     </div>
