@@ -27,32 +27,54 @@
 #   融券做空簿     ：保证金/隔离/T+1/利息/止损/路由/e2e 权益连续（TestShort* paper 8 组）
 #   全链路 e2e     ：真 runners→ScanShort→SellAction→paper 开空→关门静默（TestShortPipelineTactics）
 #
+# §市场风险因子（2026-09-12 §MARKET_RISK_GATE B1+B2+B3）专项（见 5/5）：
+#   P0 数据源切换   ：涨停/跌停/炸板池 hithink 主源+东财永远兜底、涨跌家数真实弃权（GetBreadth 不编造
+#                    1500/1500 假中性）、hithinkItemsToLimitUp 映射、双跑背离 opslog（TestRiskPool*、TestPool*）
+#   P1 情绪广度纠偏 ：涨跌家数对涨停池口径单向纠偏（阈值未配/家数缺失=弃权；只降不升；反配兜底）
+#                    （TestEmotionBreadthCorrection、TestEmotionBreadthReversedConfig）
+#   P2 状态机接线   ：真实炸板率/上涨占比/指数 MA20·MA60 斜率灌入 MarketStateObserve + DetectEmotionPhaseV2
+#                    （masLowSlope 口径 + 斜率日级缓存 NaN 弃权）
+#   P3 风险档合成   ：情绪+市场状态+宏观三源→Red/Yellow/None + applyRiskTier 信号收紧（门槛/拦N形·动量/
+#                    板块映射上浮）+ 总开关/情绪开关热回退（TestSynthesize*、TestApplyRiskTier*、TestComputeAndSet*）
+#   P4/P5/P7        ：auto-buy 谨慎层(默认关)拒Red/缩Yellow、系统性风险持仓提醒(SellAction 不命中→绝不自动卖)、
+#                    做空风险日置信加成（TestAutoCaution*、TestMarketRiskAlertsNotAuto、TestRiskTierShortBoost）
+#
 # 用法:
-#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路专项
+#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路 + 风险因子专项
 #   ./scripts/verify_changes.sh -full          # 再连相关全量单测 + 前端 vitest 一起跑
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "==> 1/4 编译检查..."
+echo "==> 1/5 编译检查..."
 go build ./...
 go vet ./internal/llm ./internal/combat_agent ./internal/engine ./internal/e2e ./internal/server ./internal/data ./internal/display ./cmd/quant \
 	./internal/config ./internal/btreplay ./internal/store ./internal/scheduler ./cmd/research
 
-echo "==> 2/4 实时链路改动专项 e2e（实盘快照 mock）..."
+echo "==> 2/5 实时链路改动专项 e2e（实盘快照 mock）..."
 go test -count=1 -v ./internal/e2e/ \
 	-run 'TestLLMTimeoutConfig|TestD1RetryQueueAcrossRuns|TestNShapeGateD1AndTotal|TestEndToEndFullPipeline|TestConsult|TestHTTP|TestAttachLiveBar' 2>&1 \
 	| grep -E '^(=== RUN|--- (PASS|FAIL)|PASS|FAIL|ok)'
 
-echo "==> 3/4 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
+echo "==> 3/5 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
 go test -count=1 -v ./internal/config ./internal/btreplay ./internal/store ./internal/server ./internal/scheduler ./cmd/research \
 	-run 'TestValidateBacktest|TestFillDefaults|TestFillBacktestDefaults|TestBacktestSettingsRoundTrip|TestPaperSlippageCalib|TestBacktestConfigEndpoints|TestInjectBacktestPayload|TestPayloadBacktest|TestCostRoundTripPnlExCompat|TestSlippageTiers|TestSlippageBpsAsymmetric|TestFillRate|TestLimitBoardGating|TestCalibAudit|TestEntrySlipGating|TestUniformExit|TestFixAmountScale|TestAvgAmountWan|TestBuildSlipCtx|TestPareto|TestCapFront|TestRecommended|TestPointJSON|TestSaveSweepResultsParetoCarry' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 4/4 做空策略链路专项（§SHORT 2026-09-12：四战法/接线/自动卖出/融券/e2e）..."
+echo "==> 4/5 做空策略链路专项（§SHORT 2026-09-12：四战法/接线/自动卖出/融券/e2e）..."
 go test -count=1 ./internal/strategies/high_churn/... ./internal/strategies/break_down/... ./internal/strategies/leader_decay/... ./internal/strategies/good_news_fade/... ./internal/strategies/shortbase/... 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/combat_agent/... ./internal/paper/... ./internal/engine/... ./internal/e2e/ \
 	-run 'Short|BuildShort|StrategyDisplay|AutoExecuteRealSells|AutoExitReportSells|PaperSellSignals' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+
+echo "==> 5/5 市场风险因子专项（§MARKET_RISK_GATE 2026-09-12：P0 数据源 + P1 广度 + P2 状态机 + P3~P7 风险档）..."
+go test -count=1 ./internal/data/ -run 'RiskPool|PoolLimit|PoolHelpers|Breadth|MasLowSlope|EmotionPhase|EmotionBreadth' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/config/ -run 'Data|Risk|Emotion|Macro|Scheduler|AutoCaution' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/research/ -run 'MarketState|StateTracker|Classify' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/combat_agent/ -run 'RiskTier|ApplyRiskTier|ComputeAndSet|Synthesize|MarketRisk|AutoCaution|MacroGate' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
 if [ "${1:-}" = "-full" ]; then

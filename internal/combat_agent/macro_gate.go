@@ -31,24 +31,30 @@ func macroEventsAt(now time.Time) []data.MacroEvent {
 	return data.GetActiveMacroEvents(macroEventsCache(now.Year()), now)
 }
 
-// macroEventsCache 按年缓存宏观事件日历（跨年自动重建；并发安全）。
-// English: macroEventsCache caches the macro-event calendar per year (rebuilt on year rollover; concurrency-safe).
+// macroEventsCache 按年缓存宏观事件日历（跨年自动重建；并发安全）。§MARKET_RISK_GATE P6：并入进程级校准
+// 覆盖（真实 CPI/FOMC/交割日日期），并按校准代际号失效重建——每日重校准后版本号变化，缓存自动刷新。
+// English: per-year calendar cache (rebuilt on rollover; thread-safe). P6: merges the process-wide
+// calibrated override (real CPI/FOMC/delivery dates) and invalidates on the calibration version, so a daily
+// recalibration refreshes it automatically.
 func macroEventsCache(year int) []data.MacroEvent {
+	ver := data.CalibratedVersion()
 	macroCalMu.Lock()
 	defer macroCalMu.Unlock()
-	if macroCalYear == year {
+	if macroCalYear == year && macroCalVer == ver {
 		return macroCalEvents
 	}
-	log.Printf("[macro] 生成 %d 年宏观日历缓存", year)
-	macroCalYear = year
-	macroCalEvents = data.GenMacroEvents(year, nil)
+	formula := data.GenMacroEvents(year, nil)
+	merged := data.MergeCalibrated(formula, data.CalibratedEvents())
+	log.Printf("[macro] 生成 %d 年宏观日历缓存（公式%d 校准并入后%d, calver=%d）", year, len(formula), len(merged), ver)
+	macroCalYear, macroCalVer, macroCalEvents = year, ver, merged
 	return macroCalEvents
 }
 
-// macroCalMu/macroCalYear/macroCalEvents 全年日历缓存（P2#27）。
+// macroCalMu/macroCalYear/macroCalVer/macroCalEvents 全年日历缓存（P2#27 + P6 校准代际）。
 var (
 	macroCalMu     sync.Mutex
 	macroCalYear   int
+	macroCalVer    int64
 	macroCalEvents []data.MacroEvent
 )
 

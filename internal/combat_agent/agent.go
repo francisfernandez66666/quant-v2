@@ -246,6 +246,14 @@ type Agent struct {
 	// English: C5 emotion phases that forbid buying (SetEmotionBlockPhases); empty falls back to ["衰退"].
 	emotionBlock []string
 
+	// §MARKET_RISK_GATE P3：引擎每轮合成并下发的市场风险档（空/Yellow/Red）+ 触发原因。
+	// 信号路径 applyRiskTier 与做空增强/自动买谨慎层/持仓预警/F2 徽标共用同一档位（单一真相源）。
+	// English: the risk tier (empty/Yellow/Red) + trigger reasons computed by the Engine each cycle and
+	// pushed down here — shared as the single source of truth by the signal path, short boost, auto-buy
+	// caution layer, held-position alerts, and the F2 badge.
+	riskTier        string
+	riskTierReasons []string
+
 	// depthFn 盘口因子获取回调（由 Server/Engine 注入，nil 表示不拉取）。
 	// 信号生成后对通过战法的个股拉取一次盘口因子（买卖压力/封单量），供战法与前端共同使用。
 	// English: order-book factor fetcher injected by Server/Engine (nil disables). After signal
@@ -1187,15 +1195,20 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	// momentum score as the baseline for next round's improvement check.
 	a.momentumRecord(code, momentumScore)
 
-	// E1 宏观利空门控：股指期货交割日等高影响宏观事件当日，买入信号统一降级，
-	// 仅超高置信度（"特别高质量信号"）放行；N 形超短与动量 watch 一律拦截。
-	// English: E1 macro bearish gate — on high-impact macro days (e.g. 交割日), buy signals are
-	// downgraded unless exceptionally high-confidence; N-shape and momentum watch are blocked.
-	if active, mcfg := a.macroGateActive(); active {
-		sigs = applyMacroGate(sigs, true, mcfg)
-		if len(sigs) > 0 {
-			log.Printf("[combat_agent] 宏观利空门控生效: %d 条信号已降级/拦截", len(sigs))
+	// §MARKET_RISK_GATE P3 风险档门控（applyMacroGate 泛化）：引擎每轮合成的市场风险档（情绪+市场状态+宏观
+	// 三源合一）在此收紧做多买入信号——Yellow 门槛上浮、Red 硬拦 N 形/动量。总开关显式关闭时回退旧 E1 纯交割日语义。
+	// English: P3 risk-tier gate (generalized applyMacroGate) — the tier computed by the Engine each cycle
+	// tightens long buys (Yellow raises the bar, Red hard-blocks N-shape/momentum); when the master switch
+	// is explicitly off it falls back to the legacy E1 delivery-day behavior.
+	if cfg := a.macroGateConfig(); cfg.RiskGateOn() {
+		a.mu.RLock()
+		tier, tReasons := a.riskTier, a.riskTierReasons
+		a.mu.RUnlock()
+		if tier != RiskTierNone {
+			sigs = applyRiskTier(sigs, tier, cfg, tReasons)
 		}
+	} else if active, mcfg := a.macroGateActive(); active {
+		sigs = applyMacroGate(sigs, true, mcfg)
 	}
 	// 战法评分日志：code + 各维度分 + 是否命中（FLOW 全流程日志要求）
 	// 附加"未出"原因（diagnostic）：各战法未出信号的具体原因，便于排查非龙头为何不出分/不发声。
@@ -1732,6 +1745,10 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 	// 对最终信号批量附加盘口因子（买卖压力/封单量，供战法与前端使用）
 	// English: attach order-book factors (bid/ask pressure & seal volume) to final signals.
 	a.attachDepthFactors(signals)
+	// §MARKET_RISK_GATE P7 做空增强：风险日（Yellow/Red）恐慌对做空是顺势，做空 sell/watch 置信度小幅加成。
+	// 仅做空门已开（本函数已被两层门把守）时生效。English: P7 short boost — risk days raise short confidence slightly.
+	tier, _ := a.RiskTier()
+	signals = applyRiskTierShortBoost(signals, tier)
 	log.Printf("[combat_agent] ScanShort: %d 板块 %d 个股 → %d 做空信号", len(input.Sectors), len(input.IndividualStocks), len(signals))
 	return signals
 }

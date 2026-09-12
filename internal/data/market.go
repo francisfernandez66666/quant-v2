@@ -1702,6 +1702,82 @@ func (m *MarketAPI) GetIndexData() (indexPrice float64, ma20 float64, upCount, d
 	return indexPrice, ma20, upCount, downCount, nil
 }
 
+// GetBreadth 仅取全市场涨/跌家数（东财市场概况 f62/f63），带**真实弃权**语义：
+// 与 GetIndexData 不同——后者在接口失败时伪造 1500/1500 中性值，而风险因子判定绝不能把
+// "取数失败"当成"涨跌各半"，故本方法在 HTTP/解析失败或返回非正时一律 err!=nil（valid=false），
+// 由上层降级到同花顺全市场统计或弃权不参与判定。
+// English: GetBreadth fetches only market-wide up/down counts with TRUE abstention — unlike
+// GetIndexData, which fakes a neutral 1500/1500 on failure, the risk-factor path must never treat
+// "fetch failed" as "half up / half down". So any HTTP/parse failure or non-positive value returns
+// err != nil, letting callers fall back to THS full-market stats or abstain entirely.
+func (m *MarketAPI) GetBreadth() (up, down int, err error) {
+	marketURL := "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=1.000001&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63"
+	EastMoneyLimiter.Wait()
+	resp, e := m.getWithHeaders(marketURL, emReferer)
+	if e != nil {
+		return 0, 0, fmt.Errorf("eastmoney breadth http: %v", e)
+	}
+	defer resp.Body.Close()
+	body, e := io.ReadAll(resp.Body)
+	if e != nil {
+		return 0, 0, fmt.Errorf("eastmoney breadth read: %v", e)
+	}
+	var raw struct {
+		Data struct {
+			F62 float64 `json:"f62"` // 上涨家数
+			F63 float64 `json:"f63"` // 下跌家数
+		} `json:"data"`
+	}
+	if e := json.Unmarshal(body, &raw); e != nil {
+		return 0, 0, fmt.Errorf("eastmoney breadth json: %v", e)
+	}
+	if raw.Data.F62 <= 0 || raw.Data.F63 <= 0 {
+		return 0, 0, fmt.Errorf("eastmoney breadth: no data (f62=%.0f f63=%.0f)", raw.Data.F62, raw.Data.F63)
+	}
+	return int(raw.Data.F62), int(raw.Data.F63), nil
+}
+
+// GetIndexMASlopes 计算上证指数 MA20/MA60 的归一化斜率（供 §MARKET_RISK_GATE P2 状态机判趋势）。
+// 斜率口径：取最近 lookback=5 个交易日的均线变化率 (MA_now-MA_prev)/MA_prev，>0 上行 <0 下行；
+// 数据不足（< maLen+lookback 根日线）或接口失败时返回 NaN（弃权），调用方按中性处理，绝不编造。
+// English: computes normalized MA20/MA60 slopes of the SH index for the P2 state machine —
+// (MA_now - MA_5d_ago)/MA_5d_ago, >0 up / <0 down; NaN (abstain) on insufficient bars or fetch failure,
+// never fabricated.
+func (m *MarketAPI) GetIndexMASlopes() (ma20Slope, ma60Slope float64) {
+	ma20Slope, ma60Slope = math.NaN(), math.NaN()
+	klines, err := m.klineBySecID(indexSecID("000001"), "101", 90)
+	if err != nil || len(klines) < 65 {
+		return
+	}
+	closes := make([]float64, len(klines))
+	for i := range klines {
+		closes[i] = klines[i].Close
+	}
+	ma20Slope = masLowSlope(closes, 20, 5)
+	ma60Slope = masLowSlope(closes, 60, 5)
+	return
+}
+
+// masLowSlope 对收盘价序列计算 maLen 均线在 lookback 日前的归一化变化率；数据不足返回 NaN。
+// English: normalized change-rate of the maLen moving average over `lookback` bars; NaN if insufficient.
+func masLowSlope(closes []float64, maLen, lookback int) float64 {
+	if len(closes) < maLen+lookback {
+		return math.NaN()
+	}
+	maAt := func(end int) float64 { // end 为闭区间右端（含），向前取 maLen 根
+		sum := 0.0
+		for i := end - maLen + 1; i <= end; i++ {
+			sum += closes[i]
+		}
+		return sum / float64(maLen)
+	}
+	now, prev := maAt(len(closes)-1), maAt(len(closes)-1-lookback)
+	if prev == 0 {
+		return math.NaN()
+	}
+	return (now - prev) / prev
+}
+
 // GetIndexQuote 获取指数实时报价（含涨跌幅）。
 // 用于策略评估中的基准对比。
 // GetIndexQuote returns a live index quote for baseline comparison in strategies.

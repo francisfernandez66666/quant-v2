@@ -112,3 +112,31 @@ func TestGetStockListFallbackEastMoney(t *testing.T) {
 		t.Errorf("东财兜底应返回2只, got %v", list)
 	}
 }
+
+// TestMasLowSlope §MARKET_RISK_GATE P2：均线斜率口径（上行正/下行负/数据不足 NaN 弃权）。
+func TestMasLowSlope(t *testing.T) {
+	up := make([]float64, 120)
+	for i := range up {
+		up[i] = float64(i + 1)
+	}
+	if s := masLowSlope(up, 20, 5); !(s > 0) {
+		t.Fatalf("上升序列斜率应>0, got %v", s)
+	}
+	down := make([]float64, 120)
+	for i := range down {
+		down[i] = float64(120 - i)
+	}
+	if s := masLowSlope(down, 60, 5); !(s < 0) {
+		t.Fatalf("下降序列 MA60 斜率应<0, got %v", s)
+	}
+	flat := make([]float64, 120)
+	for i := range flat {
+		flat[i] = 100
+	}
+	if s := masLowSlope(flat, 20, 5); s != 0 {
+		t.Fatalf("恒定序列斜率应为0, got %v", s)
+	}
+	if s := masLowSlope([]float64{1, 2, 3}, 60, 5); s == s {
+		t.Fatalf("数据不足应返回 NaN, got %v", s)
+	}
+}

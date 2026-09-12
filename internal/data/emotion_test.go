@@ -113,3 +113,45 @@ func TestDetectEmotionPhaseBlastByHighGain(t *testing.T) {
 		}
 	})
 }
+
+// TestEmotionBreadthCorrection §MARKET_RISK_GATE P1：真实涨跌家数对涨停池口径的单向纠偏。
+// 覆盖：阈值未配→不纠偏；家数缺失→弃权；极端普跌→高潮强制冰点；中度普跌→启动降退潮；只降不升（冰点不被修暖）。
+func TestEmotionBreadthCorrection(t *testing.T) {
+	base := func(ice, retreat float64) *config.EmotionConfig {
+		c := emotionCfgStub()
+		c.EmoBreadthIceDownRatio, c.EmoBreadthRetreatDownRatio = ice, retreat
+		return c
+	}
+	cases := []struct {
+		name     string
+		pool     []LimitUpStock
+		up, down int
+		ice      float64
+		retreat  float64
+		want     string
+	}{
+		{"阈值未配_高潮不受影响", poolOf(90, 8), 100, 4000, 0, 0, "高潮"},
+		{"家数缺失_弃权", poolOf(90, 8), 0, 0, 0.85, 0.75, "高潮"},
+		{"极端普跌_高潮强制冰点", poolOf(90, 8), 200, 4800, 0.85, 0.75, "冰点"},
+		{"中度普跌_启动降退潮", poolOf(20, 2), 900, 3600, 0.85, 0.75, "退潮"}, // downRatio=0.80 ≥0.75 且 <0.85
+		{"已更冷_不被修暖", poolOf(10, 1), 200, 4800, 0.70, 0.60, "冰点"},   // 池判冰点，广度也只应维持冰点侧
+		{"广度温和_不改启动", poolOf(20, 2), 3000, 1000, 0.85, 0.75, "启动"},
+	}
+	for _, c := range cases {
+		got := DetectEmotionPhaseV2(c.pool, c.up, c.down, base(c.ice, c.retreat))
+		if got != c.want {
+			t.Errorf("%s: got %q want %q (up=%d down=%d ice=%.2f ret=%.2f)", c.name, got, c.want, c.up, c.down, c.ice, c.retreat)
+		}
+	}
+}
+
+// TestEmotionBreadthReversedConfig 阈值配反（ice<retreat）时取较大值兜底，避免弱广度误判冰点。
+func TestEmotionBreadthReversedConfig(t *testing.T) {
+	c := emotionCfgStub()
+	c.EmoBreadthIceDownRatio, c.EmoBreadthRetreatDownRatio = 0.5, 0.8 // 反配
+	// 下跌占比 0.6（介于二者间）：兜底后 ice=0.8 retreat=0.5 → 0.6≥0.5 降退潮，不到 0.8 不冰点
+	got := DetectEmotionPhaseV2(poolOf(20, 2), 2000, 3000, c)
+	if got != "退潮" {
+		t.Fatalf("反配应兜底为退潮, got %q", got)
+	}
+}

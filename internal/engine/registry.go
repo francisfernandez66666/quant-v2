@@ -58,12 +58,18 @@ type EngineOptions struct {
 	THS          *data.THSClient         // 同花顺数据客户端（全局共享）
 	Fetcher      *data.Fetcher           // 数据获取器（全局共享）
 	CfgMgr       *config.Manager         // 配置管理器（全局共享）
-	DataDir      string                  // 数据目录根路径
-	Notifier     *notify.Notifier        // 通知推送器（全局共享）
-	SectorTopN   int                     // 主线板块纳入成分股数量
-	D1MaxRetries int                     // D1 评分 LLM 调用最大重试次数
-	D1MaxTokens  int                     // D1 评分 LLM 单次调用推理长度上限（§S3）
-	Paper        *paper.Engine           // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
+	// Coordinator §MARKET_RISK_GATE P0：统一行情源协调器（hithink 主源+东财兜底），全局共享一份。
+	// 非空且 RiskHithinkPrimary 时，引擎风险盘口（涨停池等）走该协调器；否则回落旧的东财直连。
+	// English: the shared multi-source coordinator (hithink primary + EastMoney fallback) used by the
+	// engine's risk boards when present and RiskHithinkPrimary; otherwise the old EastMoney-direct path.
+	Coordinator        *data.DataCoordinator
+	RiskHithinkPrimary bool             // 风险盘口是否以 hithink 为主源（默认 true，false=应急回退东财直连）
+	DataDir            string           // 数据目录根路径
+	Notifier           *notify.Notifier // 通知推送器（全局共享）
+	SectorTopN         int              // 主线板块纳入成分股数量
+	D1MaxRetries       int              // D1 评分 LLM 调用最大重试次数
+	D1MaxTokens        int              // D1 评分 LLM 单次调用推理长度上限（§S3）
+	Paper              *paper.Engine    // 模拟盘引擎模板（配置来源；每账号独立实例+独立 paper.json）
 	// 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions/orders/fills 的库句柄。
 	// §OPT-3 已隔离至独立 live.db。与纸面账本完全独立。nil = 未接入实盘（QMT 链路整体禁用）。
 	// English: real book (AUTO_TRADING_PLAN M1) — handle for the QMT controller's
@@ -765,6 +771,10 @@ func (r *Registry) build(userID string) *Engine {
 	}
 	if opts.D1MaxTokens > 0 {
 		e.SetD1MaxTokens(opts.D1MaxTokens)
+	}
+	// §MARKET_RISK_GATE P0：注入统一协调器（风险盘口主源）。协调器为空时引擎自动回落东财直连。
+	if opts.Coordinator != nil {
+		e.SetCoordinator(opts.Coordinator, opts.RiskHithinkPrimary)
 	}
 	// 模拟盘引擎：账户级独立实例（每账号独立 paper.json），信号/估值按账号分发。
 	// 全局模板仅提供配置（opts.Paper）；e.paper 保留为旧单引擎回退。

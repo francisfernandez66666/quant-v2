@@ -29,6 +29,12 @@ type MacroEvent struct {
 	Impact   string    `json:"impact"`    // 影响程度（high/medium/low）
 	Duration int       `json:"duration"`  // 影响期天数（事件日前/后各 Duration 天为影响期）
 	DaysLeft int       `json:"days_left"` // 距离事件结束的剩余天数（由筛选逻辑计算）
+	// Source 事件日期来源（§MARKET_RISK_GATE P6）：formula=公式估算 / external=外部API / llm=LLM 校准 /
+	// cached=当日缓存复用。校准值覆盖同类型公式值，便于排查 CPI/FOMC 用的是真实日期还是估算。
+	// English: date provenance (P6): formula/external/llm/cached — a calibrated date overrides the formula
+	// estimate for the same event type, for easy triage of whether CPI/FOMC used a real or estimated date.
+	// 事件日期来源
+	Source string `json:"source,omitempty"`
 	// English: Date: event date; Title: event title; Level: event type (fomc/cpi/nfp/pce/contract/war);
 	// English: Impact: impact level (high/medium/low); Duration: impact-period days (Duration days before/after the event date);
 	// English: DaysLeft: remaining days until the event ends (computed by the filter logic).
@@ -164,6 +170,11 @@ func GenMacroEvents(year int, supplement map[string]string) []MacroEvent {
 		})
 	}
 
+	for i := range events { // §P6：公式生成的事件统一标记 Source=formula（校准覆盖时改 external/llm）
+		if events[i].Source == "" {
+			events[i].Source = "formula"
+		}
+	}
 	return events
 }
 

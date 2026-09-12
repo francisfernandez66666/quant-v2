@@ -289,6 +289,32 @@ type QMTConfig struct {
 	// English: §WS-C risk-gate params (zero-value = all off, legacy behavior; an enabled gate that
 	// trips rejects the order, records a hit and alerts).
 	RiskGate RiskGateConfig `json:"risk_gate,omitempty"`
+	// AutoRiskCaution §MARKET_RISK_GATE P4 auto-buy 谨慎层第二道闸（裁决④：默认关闭，需影子验证后开启）。
+	// 开启后 auto 模式对做多买入叠加风险档处置：Red 当日拒开新仓、Yellow 按仓位档缩放买入金额。
+	// 与信号侧风险档（P3，默认开）独立——这里是"真金白银下单层"，保守默认关。
+	// English: P4 auto-buy caution layer (ruling ④: default OFF until shadow-validated). When on, auto mode
+	// adds tier handling to real buy orders — reject new opens on Red, scale buy amount on Yellow. Independent
+	// of the signal-side tier (P3, default on): this is the money path, so it stays conservative by default.
+	// 自动买谨慎层开关
+	AutoRiskCaution *bool `json:"auto_risk_caution,omitempty"`
+	// YellowPosScale Yellow 档买入金额缩放系数（默认 0.35，对齐状态机 range 档；0=用默认）。
+	// 实际系数优先取状态机 MaxPosPct（>0 时），否则回退本值。
+	// YellowPosScale buy-amount scale on Yellow (default 0.35, aligned with the range tier; the live
+	// state-machine MaxPosPct takes precedence when >0).
+	// Yellow 档降额系数
+	YellowPosScale float64 `json:"yellow_pos_scale,omitempty"`
+}
+
+// AutoCautionOn P4 自动买谨慎层是否启用（nil 默认 false=保守关闭，需显式开启）。
+// English: whether the P4 auto-buy caution layer is on (nil = false, conservative; must be enabled explicitly).
+func (q QMTConfig) AutoCautionOn() bool { return q.AutoRiskCaution != nil && *q.AutoRiskCaution }
+
+// YellowScale Yellow 档降额系数（默认 0.35）。
+func (q QMTConfig) YellowScale() float64 {
+	if q.YellowPosScale <= 0 || q.YellowPosScale > 1 {
+		return 0.35
+	}
+	return q.YellowPosScale
 }
 
 // RiskGateConfig §WS-C 机构级风控闸口参数。零值 = 闸全部关闭（现状行为不变，可随时开启、可回滚）。
@@ -464,6 +490,18 @@ type DataConfig struct {
 	OptimizeEnabled bool `json:"optimize_enabled"`
 	// 择优结果自动应用（默认 false=推荐制需人工审批）
 	OptimizeAutoApply bool `json:"optimize_auto_apply"`
+	// RiskSourceHithink 风险因子盘口主源开关（§MARKET_RISK_GATE P0）：
+	// nil 或 true = 涨停/跌停/炸板池与涨跌家数以同花顺（新）hithink 为主源、东财兜底；
+	// 显式 false = 应急回退阀，全部改走旧的东财直连（行为与本方案前一致）。
+	// English: risk-factor board primary-source switch — nil/true = hithink primary + EastMoney
+	// fallback; explicit false = emergency rollback to the old EastMoney-direct path.
+	RiskSourceHithink *bool `json:"risk_source_hithink,omitempty"`
+}
+
+// RiskHithinkPrimary 返回风险盘口是否以同花顺为主源（nil 视为默认 true）。
+// English: whether the risk boards use hithink as primary (nil defaults to true).
+func (d DataConfig) RiskHithinkPrimary() bool {
+	return d.RiskSourceHithink == nil || *d.RiskSourceHithink
 }
 
 // SchedulerConfig 按时段切换的研究调度器配置（由独立的 quant-research 服务读取）。
@@ -759,6 +797,15 @@ type EmotionConfig struct {
 	EmoRetreatLimitupMax int `json:"emo_retreat_limitup_max"`
 	// 退潮期：炸板率下限
 	EmoRetreatBlastMin float64 `json:"emo_retreat_blast_min"`
+	// §MARKET_RISK_GATE P1 情绪广度纠偏（涨停池口径只看涨停家数/连板，看不到全市场普跌）：
+	// 以下跌幅占比阈值 >0 时才生效（0/未配置=不纠偏，保持既有行为）；涨跌家数缺失时同样弃权。
+	//   下跌家数/(涨+跌) ≥ IceDownRatio → 强制"冰点"；≥ RetreatDownRatio → 至少降为"退潮"。
+	// English: P1 breadth correction — the limit-up-pool phase ignores market-wide declines. These
+	// thresholds only apply when >0 (0/unset = no correction, preserving existing behavior), and the
+	// correction abstains when up/down counts are missing. down/(up+down) ≥ Ice → force "ice";
+	// ≥ Retreat → demote to at least "retreat".
+	EmoBreadthIceDownRatio     float64 `json:"emo_breadth_ice_down_ratio"`
+	EmoBreadthRetreatDownRatio float64 `json:"emo_breadth_retreat_down_ratio"`
 	// BlockBuyPhases 禁止开仓的情绪周期阶段列表（C5）：这些阶段下四战法均不发买入信号
 	// （降级为 watch 观察）。空列表时默认仅 ["衰退"]（与 N 形既有情绪硬闸一致）。
 	// English: emotion phases in which buying is forbidden (C5) — all four strategies downgrade buy
@@ -981,6 +1028,159 @@ type MacroGateConfig struct {
 	// English: whether the momentum watch signal is also blocked on delivery days (default true). nil means default true; only an explicit false disables it.
 	// 交割日是否拦截动量观察信号
 	BlockMomentum *bool `json:"block_momentum,omitempty"`
+
+	// ── §MARKET_RISK_GATE P3 风险档扩展（全部向后兼容：未配置即取下方默认）──
+
+	// RiskGateEnabled 分层风险档总开关（裁决④/§九：默认 true=上线即保护）。
+	// nil 或 true=启用 Red/Yellow 风险档收紧；显式 false=应急一键回退（风险档不参与信号降级，退回旧 E1 纯宏观门控语义）。
+	// English: master switch for the tiered risk gate. nil/true = Red/Yellow tightening active (protection on by default); an explicit false = emergency rollback to the old E1 pure-macro-gate behavior.
+	// 风险档总开关
+	RiskGateEnabled *bool `json:"risk_gate_enabled,omitempty"`
+	// EmotionEnabled 情绪相位是否参与风险档合成（裁决④：默认 true）。false 时仅宏观事件+市场状态定档，
+	// 冰点/退潮/背离不再触发降级——这是"情绪维度误伤"的独立热回退阀。
+	// English: whether the emotion phase feeds the tier. false = only macro events + market state decide, i.e. an independent hot-rollback for over-eager emotion downgrades.
+	// 情绪相位参与风险档开关
+	EmotionEnabled *bool `json:"emotion_enabled,omitempty"`
+	// EmotionLevels 参与风险档合成的情绪相位集合（默认 ["冰点","退潮","背离"]）。
+	// EmotionLevels emotion phases that feed tier synthesis (default ice/retreat/divergence).
+	// 参与合成的情绪相位列表
+	EmotionLevels []string `json:"emotion_levels,omitempty"`
+	// YellowConfidence Yellow 档放行买入的最低置信度（默认 0.90；低于此降级 watch）。
+	// YellowConfidence minimum buy confidence to pass a Yellow day (default 0.90).
+	// Yellow 档放行置信度门槛
+	YellowConfidence float64 `json:"yellow_confidence,omitempty"`
+	// RedConfidence Red 档放行买入的最低置信度（默认 0.92；系统性风险日门槛更高）。
+	// RedConfidence minimum buy confidence to pass a Red day (default 0.92 — stricter on systemic-risk days).
+	// Red 档放行置信度门槛
+	RedConfidence float64 `json:"red_confidence,omitempty"`
+	// BreadthWeakUpRatio "震荡且上涨占比偏弱"判定的上涨占比阈值（默认 0.40；range 且 up/(up+down) < 此值 → Yellow）。
+	// 家数缺失（upRatio=NaN）时该条件弃权，不触发。
+	// BreadthWeakUpRatio up-share threshold for the "range + weak breadth" Yellow trigger (default 0.40); abstains when the ratio is NaN (counts missing).
+	// range 弱势广度阈值
+	BreadthWeakUpRatio float64 `json:"breadth_weak_up_ratio,omitempty"`
+	// MacroSectorMap 板块级映射（中观层，差距5）：宏观事件级别/情绪 → 受影响板块名列表；
+	// 风险日命中这些板块的买入信号门槛再上浮一档（Yellow→按 Red 对待）。默认空=板块层不生效（显式配置才启用，避免上线即误伤）。
+	// MacroSectorMap maps a macro level / emotion to affected sector names; on risk days buys in those
+	// sectors take one tier stricter (Yellow→treated as Red). Default empty = sector layer off until configured.
+	// 板块级风险映射
+	MacroSectorMap map[string][]string `json:"macro_sector_map,omitempty"`
+	// HighImpactLevels 视为"高影响"的宏观事件级别（默认 ["cpi","fomc","nfp"]；用于 Red 的"高影响事件×退潮/背离"组合与 Yellow）。
+	// HighImpactLevels event levels treated as high-impact (default cpi/fomc/nfp) for the Red combo and Yellow.
+	// 高影响宏观事件级别列表
+	HighImpactLevels []string `json:"high_impact_levels,omitempty"`
+	// ContractLevel 股指期货交割日的事件级别名（默认 "contract"）——Red 的"交割日当日"与 Yellow 的"交割影响期"据此识别。
+	// ContractLevel is the event-level name for index-futures delivery day (default "contract").
+	// 交割日事件级别名
+	ContractLevel string `json:"contract_level,omitempty"`
+	// CalibrateEnabled §MARKET_RISK_GATE P6 日历校准开关（默认 true）：true=每日一次用外部API/LLM 校准
+	// CPI/FOMC/NFP/交割日真实发布日（失败静默降级公式，不阻断）；false=纯公式估算（行为=校准前）。
+	// nil 视为默认 true。
+	// English: P6 calendar-calibration switch (nil/true = calibrate real CPI/FOMC/delivery dates once per
+	// day via external API/LLM with silent formula fallback; false = formula-only, the pre-calibration behavior).
+	// 日历校准开关
+	CalibrateEnabled *bool `json:"calibrate_enabled,omitempty"`
+	// CalibrateMonths 校准前瞻月数（默认 3，仅取未来 N 个月事件节省 LLM token）。
+	// CalibrateMonths is the forward horizon in months for calibration (default 3).
+	// 校准前瞻月数
+	CalibrateMonths int `json:"calibrate_months,omitempty"`
+	// CalibrateAPIURL 外部宏观日历 API（返回 JSON 事件数组；空=不用 API，仅走 LLM）。
+	// CalibrateAPIURL is an optional external macro-calendar API (JSON array); empty = LLM only.
+	// 外部日历API地址
+	CalibrateAPIURL string `json:"calibrate_api_url,omitempty"`
+	// WarnDays §三 作用层6（差距4）前瞻预警窗口：距高影响事件（交割日/CPI/FOMC/NFP）≤ 该天数时，
+	// 每日出一条"临近高影响事件"提醒（默认 3；<=0 回退 3，上限 7）。
+	// English: the P5 forward-warning window — when a high-impact event (delivery/CPI/FOMC/NFP) is at most
+	// this many days away (default 3, clamped 1~7), a daily "upcoming event" reminder is emitted.
+	// 前瞻预警窗口天数
+	WarnDays int `json:"warn_days,omitempty"`
+}
+
+// WarnWindow 前瞻预警窗口（默认 3，夹在 1~7）。
+func (m MacroGateConfig) WarnWindow() int {
+	if m.WarnDays <= 0 {
+		return 3
+	}
+	if m.WarnDays > 7 {
+		return 7
+	}
+	return m.WarnDays
+}
+
+// CalibrateOn 日历校准是否启用（nil 默认 true）。
+func (m MacroGateConfig) CalibrateOn() bool { return m.CalibrateEnabled == nil || *m.CalibrateEnabled }
+
+// CalibrateHorizonMonths 校准前瞻月数（默认 3）。
+func (m MacroGateConfig) CalibrateHorizonMonths() int {
+	if m.CalibrateMonths <= 0 || m.CalibrateMonths > 12 {
+		return 3
+	}
+	return m.CalibrateMonths
+}
+
+// ── §MARKET_RISK_GATE P3 默认值访问器（nil/零值 → 出厂默认，保证向后兼容且默认 ON）──
+
+// RiskGateOn 风险档总开关（nil 默认 true）。
+func (m MacroGateConfig) RiskGateOn() bool { return m.RiskGateEnabled == nil || *m.RiskGateEnabled }
+
+// EmotionOn 情绪维度是否参与合成（nil 默认 true）。
+func (m MacroGateConfig) EmotionOn() bool { return m.EmotionEnabled == nil || *m.EmotionEnabled }
+
+// EmotionLevelSet 参与合成的情绪相位集合（默认 冰点/退潮/背离）。
+func (m MacroGateConfig) EmotionLevelSet() map[string]bool {
+	levels := m.EmotionLevels
+	if len(levels) == 0 {
+		levels = []string{"冰点", "退潮", "背离"}
+	}
+	set := make(map[string]bool, len(levels))
+	for _, l := range levels {
+		set[l] = true
+	}
+	return set
+}
+
+// YellowMinConf Yellow 档放行置信度（默认 0.90）。
+func (m MacroGateConfig) YellowMinConf() float64 {
+	if m.YellowConfidence <= 0 {
+		return 0.90
+	}
+	return m.YellowConfidence
+}
+
+// RedMinConf Red 档放行置信度（默认 0.92）。
+func (m MacroGateConfig) RedMinConf() float64 {
+	if m.RedConfidence <= 0 {
+		return 0.92
+	}
+	return m.RedConfidence
+}
+
+// WeakBreadthUpRatio range 弱势广度阈值（默认 0.40）。
+func (m MacroGateConfig) WeakBreadthUpRatio() float64 {
+	if m.BreadthWeakUpRatio <= 0 {
+		return 0.40
+	}
+	return m.BreadthWeakUpRatio
+}
+
+// HighImpactSet 高影响事件级别集合（默认 cpi/fomc/nfp）。
+func (m MacroGateConfig) HighImpactSet() map[string]bool {
+	levels := m.HighImpactLevels
+	if len(levels) == 0 {
+		levels = []string{"cpi", "fomc", "nfp"}
+	}
+	set := make(map[string]bool, len(levels))
+	for _, l := range levels {
+		set[l] = true
+	}
+	return set
+}
+
+// ContractLevelName 交割日级别名（默认 contract）。
+func (m MacroGateConfig) ContractLevelName() string {
+	if m.ContractLevel == "" {
+		return "contract"
+	}
+	return m.ContractLevel
 }
 
 // MomentumConfig 动量分权重配置（默认 量价40 + MACD30 + 走势30，合计≤100）。

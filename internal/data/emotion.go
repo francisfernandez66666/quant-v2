@@ -109,24 +109,80 @@ func DetectEmotionPhaseV2(pool []LimitUpStock, upCount, downCount int, cfg *conf
 		}
 	}
 
+	rawPhase := "启动"
 	switch {
 	case limitUpCnt >= cfg.EmoClimaxLimitupMin && maxBoard >= cfg.EmoClimaxBoardMin:
-		return "高潮"
+		rawPhase = "高潮"
 	case limitUpCnt >= cfg.EmoFermentLimitupMin &&
 		limitUpCnt <= cfg.EmoFermentLimitupMax &&
 		maxBoard <= cfg.EmoFermentBoardMax:
-		return "发酵"
+		rawPhase = "发酵"
 	case limitUpCnt >= cfg.EmoStartLimitupMin &&
 		limitUpCnt <= cfg.EmoStartLimitupMax &&
 		maxBoard <= cfg.EmoStartBoardMax:
-		return "启动"
+		rawPhase = "启动"
 	case limitUpCnt <= cfg.EmoIceLimitupMax && maxBoard <= cfg.EmoIceBoardMax:
-		return "冰点"
+		rawPhase = "冰点"
 	case limitUpCnt <= cfg.EmoRetreatLimitupMax && maxBoard <= cfg.EmoRetreatBoardMax:
-		return "退潮"
+		rawPhase = "退潮"
 	case limitUpCnt < cfg.EmoDivergeLimitupDrop && maxBoard < cfg.EmoDivergeBoardDrop:
-		return "背离"
-	default:
-		return "启动"
+		rawPhase = "背离"
 	}
+	// §MARKET_RISK_GATE P1：涨停池口径看不到全市场普跌，用真实涨跌家数纠偏（阈值未配或家数缺失=原样返回）。
+	return applyBreadthCorrection(rawPhase, upCount, downCount, cfg)
+}
+
+// emotionSeverity 情绪阶段按"强弱"排序（越大越冷/越危险），供纠偏时只降不升。
+// 冰点(5) < 退潮(4) < 背离(3) 为冷侧；高潮(1)/发酵(2)/启动(0) 为暖侧。
+// English: orders phases by "coldness" (higher = riskier) so breadth correction can only escalate.
+func emotionSeverity(phase string) int {
+	switch phase {
+	case "高潮":
+		return 1
+	case "发酵":
+		return 2
+	case "启动":
+		return 0
+	case "背离":
+		return 3
+	case "退潮":
+		return 4
+	case "冰点":
+		return 5
+	default:
+		return 0
+	}
+}
+
+// applyBreadthCorrection 用真实涨跌家数对涨停池口径的情绪阶段做**单向纠偏**（只往更冷方向修正，
+// 永不把危险阶段修成安全）。下跌占比 down/(up+down) 达 IceDownRatio 强制冰点、达 RetreatDownRatio
+// 至少降为退潮。以下任一条件成立则弃权原样返回：家数缺失(total<=0，接口失败≠涨跌各半)、阈值未配(<=0)、
+// 阈值配置非法(ice<retreat)。ice 阈值应 ≥ retreat 才有分层意义，若配反则取二者较大值兜底防误伤。
+// English: applies a ONE-WAY breadth correction to the limit-up-pool phase using real up/down counts
+// (never warms a dangerous phase). down-ratio ≥ Ice → force ice; ≥ Retreat → demote to at least retreat.
+// It abstains when counts are missing (total≤0: a failed fetch is NOT treated as 50/50), thresholds are
+// unset (≤0), or misconfigured; a reversed config falls back to the larger value to avoid over-triggering.
+func applyBreadthCorrection(phase string, upCount, downCount int, cfg *config.EmotionConfig) string {
+	total := upCount + downCount
+	if total <= 0 || cfg == nil {
+		return phase
+	}
+	ice, retreat := cfg.EmoBreadthIceDownRatio, cfg.EmoBreadthRetreatDownRatio
+	if ice <= 0 && retreat <= 0 {
+		return phase // 未配置阈值 → 不纠偏
+	}
+	if ice > 0 && retreat > 0 && ice < retreat {
+		// 配置反了（冰点阈值本应更极端）：取较大者作冰点、较小者作退潮，避免弱广度误判冰点。
+		ice, retreat = retreat, ice
+	}
+	downRatio := float64(downCount) / float64(total)
+	if ice > 0 && downRatio >= ice {
+		return "冰点"
+	}
+	if retreat > 0 && downRatio >= retreat {
+		if emotionSeverity(phase) < emotionSeverity("退潮") {
+			return "退潮"
+		}
+	}
+	return phase
 }

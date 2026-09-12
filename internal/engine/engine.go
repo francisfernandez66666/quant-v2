@@ -61,7 +61,20 @@ type Engine struct {
 	// lastAlertEval §WS-L 阈值告警评估节流时间戳（scoreCycle 每 30s 跑一轮）。
 	lastAlertEval time.Time
 
-	marketAPI    *data.MarketAPI         // 行情 API（实时价/K线/资金流/涨停池）
+	marketAPI *data.MarketAPI // 行情 API（实时价/K线/资金流/涨停池）
+	// §MARKET_RISK_GATE P0 风险盘口主源：注入多源协调器后，涨停池等盘口统计走 hithink 主源、
+	// 东财兜底；未注入（nil）或 riskHithink=false 时全部回落旧的 e.marketAPI 东财直连。
+	// English: multi-source coordinator for the risk boards — once injected, board stats route
+	// through hithink primary + EastMoney fallback; nil or riskHithink=false reverts to EM-direct.
+	coordinator *data.DataCoordinator
+	riskHithink bool
+	// §MARKET_RISK_GATE P2 指数均线斜率日级缓存（趋势斜率日内不变，避免每轮重复拉指数日K）：
+	// maSlopeDay 记录已算交易日，跨日才重算；未注入源/取数失败时保持 NaN 弃权。
+	// English: daily cache of index MA slopes (trend slope is intraday-invariant; recompute only on a
+	// new trading day; NaN abstain when no source or on failure).
+	maSlopeDay   string
+	maSlope20    float64
+	maSlope60    float64
 	newsAgent    *newsagent.Agent        // 新闻代理（拉取 + Stage0/1/2 归因分析）
 	strategy     *strategy_engine.Engine // 策略引擎（事件归因 → 评分池 → 行情数据）
 	sectorAgent  *sector_agent.Agent     // 板块验证代理（战法扫描前做板块真伪验证）
@@ -121,15 +134,29 @@ type Engine struct {
 	marketTracker    *research.StateTracker       // §P2.3 市场状态机跟踪器（Enhance.MarketState 开启时懒建，nil=关闭）
 	signalQuality    *research.SignalQualityTable // §P2.5 信号质量分桶表（Enhance.DynWeight 开启时懒建，nil=关闭）
 
-	fetcher          *data.Fetcher                                                                                   // 5s 实时行情采集器（近实时打分快照来源）
-	scoreStore       *scoreStore                                                                                     // 8a/8b 主循环打分持久化（scores.json）
-	fastScoreStore   *scoreStore                                                                                     // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
-	prevPass         map[string]map[string]bool                                                                      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
-	prevBullBuy      map[string]map[string]bool                                                                      // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
-	lastD1Scores     map[string]combat_agent.D1Score                                                                 // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
-	d1ScoredSig      map[string]string                                                                               // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
-	d1RetryQueue     map[string]bool                                                                                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
-	lastEmotionPhase string                                                                                          // 主循环最近一轮情绪阶段（近实时循环复用）
+	fetcher          *data.Fetcher                   // 5s 实时行情采集器（近实时打分快照来源）
+	scoreStore       *scoreStore                     // 8a/8b 主循环打分持久化（scores.json）
+	fastScoreStore   *scoreStore                     // §P0-8 近实时 5s 循环打分持久化（scores_fast.json），与主循环分池避免互相覆盖
+	prevPass         map[string]map[string]bool      // 近实时信号状态翻转去重（code → strategy → 上次是否Pass）
+	prevBullBuy      map[string]map[string]bool      // 主循环 buy 信号状态翻转去重（龙头识别等仅在主循环产生的信号，防重复买入）
+	lastD1Scores     map[string]combat_agent.D1Score // 主循环最近一轮 D1 评分（近实时循环复用，不每 5s 调 LLM）
+	d1ScoredSig      map[string]string               // §信号速度 S1：主循环最近一轮评分时的事件签名（code → 签名），供增量 D1 复用判定
+	d1RetryQueue     map[string]bool                 // D1 LLM 失败待重试队列（失败股并入下轮打分池重新调 LLM，不兜底）
+	lastEmotionPhase string                          // 主循环最近一轮情绪阶段（近实时循环复用）
+	// §MARKET_RISK_GATE P2/F2：最近一轮市场状态机结果 + 仓位档，供 SSE 市场环境条展示与风险档合成消费。
+	// English: last market-state-machine result + position cap, surfaced via the SSE status bar (F2) and
+	// consumed by the risk-tier synthesizer (B3).
+	lastMarketState string  // bull/range/bear（状态机关闭时为空串=不展示）
+	lastMaxPosPct   float64 // 状态机建议最大仓位比例（0=未启用）
+	// §MARKET_RISK_GATE P3：最近一轮合成的市场风险档（空/Yellow/Red）+ 触发原因，供 SSE 徽标/自动买谨慎层/持仓预警。
+	// English: the latest synthesized risk tier (empty/Yellow/Red) + reasons, used by the SSE badge, the
+	// auto-buy caution layer, and held-position alerts.
+	lastRiskTier    string
+	lastRiskReasons []string
+	// §MARKET_RISK_GATE P6 日历校准：落盘缓存路径（dataDir 空则禁用校准）+ 当日已校准标记（每日一次）。
+	// English: P6 calendar calibration — cache-file path (empty dataDir disables it) + a daily-calibrated marker.
+	macroCalCachePath string
+	calibrateDay      string
 	lastBearReasons  map[string]string                                                                               // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
 	d1MaxRetries     int                                                                                             // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
 	d1MaxTokens      int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
@@ -448,10 +475,12 @@ func New(
 	hotRecPath := ""
 	signalRecPath := ""
 	signalStorePath := ""
+	macroCalCachePath := "" // §MARKET_RISK_GATE P6 日历校准落盘缓存（dataDir 空则禁用）
 	if dataDir != "" {
 		hotRecPath = filepath.Join(dataDir, "hot_records.json")
 		signalRecPath = filepath.Join(dataDir, "signal_records.json")
 		signalStorePath = filepath.Join(dataDir, "signals_today.json")
+		macroCalCachePath = filepath.Join(dataDir, "macro_calendar_cache.json")
 	}
 	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
 	e := &Engine{
@@ -481,6 +510,7 @@ func New(
 		confrontStore:    data.NewConfrontationStore(confrontPath),
 		hotRecords:       loadHotRecords(hotRecPath),
 		hotRecPath:       hotRecPath,
+		macroCalCachePath: macroCalCachePath,
 		sectorEventTimes: make(map[string]time.Time),
 		sectorConstTopN:  20,
 		auctionStrengths: make(map[string]float64),
@@ -600,6 +630,147 @@ func (e *Engine) SetCfgMgr(m *config.Manager) {
 	e.mu.Lock()
 	e.cfgMgr = m
 	e.mu.Unlock()
+}
+
+// SetCoordinator 注入多源协调器并设置风险盘口主源开关（§MARKET_RISK_GATE P0）。
+// hithinkPrimary=true 时涨停池等盘口走 hithink 主源+东财兜底；false（应急回退阀）走旧的东财直连。
+// 幂等，可在启动时安全调用；nil dc 时仅落开关、fetch 自动回落东财。
+// English: injects the multi-source coordinator and the risk-board primary switch (P0). When
+// hithinkPrimary, board stats route via hithink+EastMoney fallback; otherwise the old EastMoney-direct
+// path is kept. Idempotent at startup; a nil dc only stores the flag and fetches fall back to EastMoney.
+func (e *Engine) SetCoordinator(dc *data.DataCoordinator, hithinkPrimary bool) {
+	e.mu.Lock()
+	e.coordinator = dc
+	e.riskHithink = hithinkPrimary
+	e.mu.Unlock()
+}
+
+// fetchRiskPool 取当日涨停池（P0 路由）：命中开关且注入了协调器→hithink 主源+东财兜底；
+// 否则走旧的东财直连。附带每日一次双跑一致性观测（两源数量背离 >5% 记 opslog）。
+// 返回池子、命中源名、错误。任何路径都不 panic，错误由调用方按空池降级处理。
+// English: fetches today's limit-up pool with P0 routing — when the switch is on and a coordinator is
+// injected, hithink primary + EastMoney fallback; otherwise the old EastMoney-direct call. Includes a
+// once-per-day dual-run consistency probe (>5% divergence → opslog). Returns (pool, source, err);
+// never panics — callers degrade to an empty pool on error.
+func (e *Engine) fetchRiskPool() ([]data.LimitUpStock, string, error) {
+	e.mu.RLock()
+	dc, useHithink := e.coordinator, e.riskHithink
+	e.mu.RUnlock()
+	if !useHithink || dc == nil {
+		pool, err := e.marketAPI.GetLimitUpPool("")
+		return pool, "eastmoney", err
+	}
+	res, err := dc.PoolLimitUp("")
+	if err != nil {
+		return nil, res.Source, err
+	}
+	// 每日一次双跑背离观测：hithink 命中时对照东财计数，>5% 差异落 opslog（不改行为，仅告警）。
+	// English: once-per-day dual-run probe — when hithink serves, compare with the EastMoney count and
+	// log a >5% divergence to opslog (warn-only, no behavior change).
+	if res.Source == "hithink" {
+		opslog.DayOnce("risk-pool-dual-run", func() {
+			if em, emErr := e.marketAPI.GetLimitUpPool(""); emErr == nil {
+				e.reportPoolDivergence(len(res.Stocks), len(em))
+			}
+		})
+	}
+	return res.Stocks, res.Source, nil
+}
+
+// reportPoolDivergence 双跑背离记录（hithink vs 东财涨停数差异 >5% 时告警，供切换期观测）。
+// English: records a >5% divergence between the hithink and EastMoney limit-up counts during the switch-over.
+func (e *Engine) reportPoolDivergence(thsCount, emCount int) {
+	base := emCount
+	if thsCount > base {
+		base = thsCount
+	}
+	if base == 0 {
+		return
+	}
+	diff := thsCount - emCount
+	if diff < 0 {
+		diff = -diff
+	}
+	if float64(diff)/float64(base) > 0.05 {
+		opslog.Logf("risk_pool", "涨停池双跑背离超5%% hithink=%d eastmoney=%d", thsCount, emCount)
+	}
+}
+
+// emotionConfigured 报告情绪相位是否已配置（emotionCfg 非空即可能产出纠偏/硬闸，需拉涨跌家数）。
+// English: whether the emotion phase is configured (a non-nil cfg means breadth may feed correction/gates).
+func (e *Engine) emotionConfigured() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.emotionCfg != nil
+}
+
+// riskBreadth 取全市场涨/跌家数（§P1）：注入协调器且主源开时走降级链（东财主源→hithink 兜底→弃权），
+// 否则直接东财 GetBreadth。valid=false 表示两源皆不可用，调用方必须弃权（不把失败当涨跌各半）。
+// English: fetches market-wide up/down counts (P1) — via the coordinator fallback chain when hithink
+// primary is on, else EastMoney GetBreadth directly. valid=false means both sources failed, so callers
+// must abstain rather than treat a failure as a neutral 50/50.
+func (e *Engine) riskBreadth() (up, down int, valid bool) {
+	e.mu.RLock()
+	dc, useHithink := e.coordinator, e.riskHithink
+	e.mu.RUnlock()
+	if useHithink && dc != nil {
+		u, d, _, ok := dc.MarketBreadth(nil) // universe=nil：EM 失败且无全市场清单时直接弃权（THS 全量统计由上层按需传）
+		return u, d, ok
+	}
+	if e.marketAPI == nil {
+		return 0, 0, false
+	}
+	u, d, err := e.marketAPI.GetBreadth()
+	if err != nil {
+		return 0, 0, false
+	}
+	return u, d, true
+}
+
+// riskBreakRate 真实炸板率（§P2）：炸板池数/(涨停池+炸板池)*100。炸板池仅 hithink 提供，
+// 无协调器或取数失败时返回 NaN 弃权（绝不用 V1 的近似口径冒充实测）。
+// English: true break rate = break/(limitUp+break)*100. The break pool is hithink-only; NaN abstain when
+// no coordinator or on failure (never passing off the V1 approximation as measured).
+func (e *Engine) riskBreakRate(limitUpCount int) float64 {
+	e.mu.RLock()
+	dc, useHithink := e.coordinator, e.riskHithink
+	e.mu.RUnlock()
+	if !useHithink || dc == nil {
+		return math.NaN()
+	}
+	brk, err := dc.PoolLimitBreak("")
+	if err != nil {
+		return math.NaN()
+	}
+	denom := limitUpCount + len(brk.Stocks)
+	if denom <= 0 {
+		return math.NaN()
+	}
+	return float64(len(brk.Stocks)) / float64(denom) * 100
+}
+
+// indexMASlopes 指数 MA20/MA60 斜率（§P2，日级缓存：跨交易日才重算，避免每轮拉指数日K）。
+// 取数失败/无源时缓存保持 NaN（弃权），不影响状态机其余维度投票。
+// English: index MA20/MA60 slopes (P2) with a daily cache (recompute only on a new trading day). On
+// failure/no-source the cached NaN persists (abstain), leaving the other state votes unaffected.
+func (e *Engine) indexMASlopes() (float64, float64) {
+	today := data.TradingDayDate(time.Now())
+	e.mu.RLock()
+	cached := e.maSlopeDay == today && e.maSlope20 == e.maSlope20 // 非 NaN 才算已缓存
+	m20, m60 := e.maSlope20, e.maSlope60
+	market := e.marketAPI
+	e.mu.RUnlock()
+	if cached {
+		return m20, m60
+	}
+	if market == nil {
+		return math.NaN(), math.NaN()
+	}
+	s20, s60 := market.GetIndexMASlopes()
+	e.mu.Lock()
+	e.maSlopeDay, e.maSlope20, e.maSlope60 = today, s20, s60
+	e.mu.Unlock()
+	return s20, s60
 }
 
 // SetLongShortConfig 固化本引擎的做多/做空开关（共享引擎在构建时由注册表按共享组配置设置）。
@@ -913,6 +1084,36 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	}
 	if amount <= 0 {
 		amount = 10000
+	}
+	// §MARKET_RISK_GATE P4 auto-buy 谨慎层（默认关闭，裁决④）：真金白银下单层的第二道风险闸——
+	// Red 当日拒开新仓（DayOnce+opslog 留痕）；Yellow 按仓位档缩放买入金额（优先状态机 MaxPosPct，回退
+	// YellowPosScale；缩后仍走下方整手/现金降档）。与信号侧 P3 降级独立叠加。
+	// English: the P4 auto-buy caution layer (default off, ruling ④) — a second risk gate on the money path:
+	// reject new opens on Red (DayOnce+opslog), scale the buy amount on Yellow (state-machine MaxPosPct first,
+	// YellowPosScale fallback; still passes the lot/cash degradation below). Stacks independently with P3.
+	if cfg.AutoCautionOn() {
+		e.mu.RLock()
+		tier, maxPos := e.lastRiskTier, e.lastMaxPosPct
+		e.mu.RUnlock()
+		switch tier {
+		case combat_agent.RiskTierRed:
+			log.Printf("[qmt] %s(%s) 风险档Red 拒开新仓（auto 谨慎层）", sig.Code, sig.Name)
+			opslog.DayOnce("auto-risk-red:"+sig.Code, func() {
+				opslog.Logf("quant", "风险档Red拒开新仓 %s(%s) 策略=%s/%s", sig.Code, sig.Name, sig.StrategyID, sig.Strategy)
+			})
+			return
+		case combat_agent.RiskTierYellow:
+			scale := cfg.YellowScale()
+			if maxPos > 0 && maxPos < scale {
+				scale = maxPos // 状态机给出更严的仓位档时以其为准
+			}
+			if scale > 0 && scale < 1 {
+				orig := amount
+				amount = amount * scale
+				log.Printf("[qmt] %s(%s) 风险档Yellow 降额买入 %.0f→%.0f（系数%.2f）", sig.Code, sig.Name, orig, amount, scale)
+				opslog.Logf("quant", "风险档Yellow降额 %s 预算=%.0f→%.0f 系数=%.2f 策略=%s/%s", sig.Code, orig, amount, scale, sig.StrategyID, sig.Strategy)
+			}
+		}
 	}
 	qty := int(amount/price/100) * 100
 	// §R0.7 修复：高价股不足一手时不再强凑 1 手（旧逻辑 qty=100 导致订单金额超预算数倍）
@@ -2504,6 +2705,22 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 			}
 		}
 	}
+	// §MARKET_RISK_GATE P5 前瞻预警：未来 N 天内有高影响事件（交割日/CPI/FOMC/NFP）时出一条"临近事件"提醒，
+	// 消息中心按 macro-warning@日期@类型 稳定键每日去重（Sync 每轮 upsert，同键覆盖不累积）。
+	// English: P5 forward warning — when a high-impact event (delivery/CPI/FOMC/NFP) is within N days, emit a
+	// "upcoming event" reminder; the message center dedups daily by a stable macro-warning@date@level key.
+	if e.combatAgent != nil {
+		if wmsg, wkey, wHit := e.combatAgent.ForwardMacroWarning(time.Now()); wHit {
+			items = append(items, data.MessageItem{
+				ID:          wkey,
+				Level:       "风险提示",
+				Title:       "宏观事件前瞻",
+				Body:        wmsg,
+				Time:        time.Now().Format("15:04:05"),
+				GeneratedAt: time.Now(),
+			})
+		}
+	}
 	// P1 强提醒：本轮新产生的 清仓/止损 告警，首次出现时走桌面通知 + Webhook 推送。
 	// 依据消息去重键（code@level）判新：已在消息中心存在则说明前几轮已提醒过，不再重复推送。
 	// English: strong P1 push — brand-new close-out / stop-loss alerts get a desktop + Webhook
@@ -3150,6 +3367,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// 同步本账号配置（做多/做空开关 + 战法参数），保证账号内各设备一致
 	// English: sync this account's config (long/short toggles + strategy params) for cross-device consistency.
 	e.syncAccountConfig()
+	// §MARKET_RISK_GATE P6：每日一次校准宏观日历真实发布日（进程级去重、失败静默降级、非阻塞主流程）。
+	e.calibrateMacroCalendarOnceToday()
 
 	// 0-6. 新闻流水线：拉取→Stage0/1/2→固化→阈值→聚簇→衰减→归因验真传播
 	pOut := e.produceNews(ctx, since)
@@ -3196,18 +3415,36 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	td := data.TradingDayDate(time.Now())
 
 	// 8b. 当日涨停池 + 事件新闻简报（龙头识别 / 涨停分类 / 预期差检测）
+	// §MARKET_RISK_GATE P0：主源经协调器路由为 hithink（新同花顺）优先、东财永远兜底。
 	_stepPool := time.Now()
-	pool, poolErr := e.marketAPI.GetLimitUpPool("")
+	pool, poolSrc, poolErr := e.fetchRiskPool()
 	if poolErr != nil {
-		log.Printf("[engine] 涨停池拉取失败: %v", poolErr)
+		log.Printf("[engine] 涨停池拉取失败(源=%s): %v", poolSrc, poolErr)
 	}
 	// §P2.2 板块联动观察：识别当日龙头（Enhance.SectorLinkage 开启时；关闭零操作）。
 	e.sectorLinkageObserve(pool)
-	// §P2.3 市场状态机观察：由涨停池装配快照（连板高度=max LianBan；炸板率/上涨占比/指数斜率
-	// 调用方暂缺时以 NaN 弃权，不影响判定——保留接口由后续接入真实值）。开关关闭零操作。
-	// English: §P2.3 market-state observation fed from the limit-up pool (ladder = max LianBan;
-	// NaN abstains for break-rate / up-ratio / index slope until real inputs are wired). No-op when off.
-	e.MarketStateObserve(len(pool), maxLadder(pool), math.NaN(), math.NaN(), math.NaN(), math.NaN())
+	// §MARKET_RISK_GATE P1/P2：为情绪纠偏与状态机装配真实市场广度/炸板率/指数趋势。
+	// 涨跌家数取不到时 up/down=0 → 情绪纠偏弃权、上涨占比=NaN；炸板池仅 hithink（无源=NaN 弃权）。
+	// English: P1/P2 wiring — assemble real breadth / break-rate / index trend for emotion correction
+	// and the state machine. A failed breadth fetch yields up/down=0 (correction abstains, upRatio=NaN);
+	// the break pool is hithink-only (no source → NaN abstain), never a fabricated neutral.
+	stateOn := e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState })
+	riskBrUp, riskBrDown, riskBrValid := 0, 0, false
+	if e.emotionConfigured() || stateOn {
+		riskBrUp, riskBrDown, riskBrValid = e.riskBreadth()
+	}
+	riskUpRatio := math.NaN()
+	if riskBrValid && riskBrUp+riskBrDown > 0 {
+		riskUpRatio = float64(riskBrUp) / float64(riskBrUp+riskBrDown)
+	}
+	riskBreakRate, riskMA20, riskMA60 := math.NaN(), math.NaN(), math.NaN()
+	if stateOn {
+		riskBreakRate = e.riskBreakRate(len(pool))
+		riskMA20, riskMA60 = e.indexMASlopes()
+	}
+	// §P2.3 市场状态机观察：由涨停池 + 真实广度/炸板/指数斜率装配快照（缺失项 NaN 弃权）。开关关闭零操作。
+	// English: §P2.3 market-state observation fed from the pool plus real breadth/break/index slope (NaN abstains).
+	e.MarketStateObserve(len(pool), maxLadder(pool), riskBreakRate, riskUpRatio, riskMA20, riskMA60)
 	// 事件简报取当日全量已打标事件（比本轮 valid 更全：个股级事件即使本轮未过阈值也可关联信号标题）
 	// English: build news briefs from today's full attributed-event store (richer than this round's `valid`,
 	// so individual-stock events below this round's threshold can still title D1 events on their signals).
@@ -3223,7 +3460,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	e.mu.RUnlock()
 	emotionPhase := ""
 	if emotionCfg != nil {
-		emotionPhase = data.DetectEmotionPhaseV2(pool, 0, 0, emotionCfg)
+		emotionPhase = data.DetectEmotionPhaseV2(pool, riskBrUp, riskBrDown, emotionCfg)
 	}
 	e.mu.Lock()
 	e.lastEmotionPhase = emotionPhase
@@ -3233,6 +3470,38 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// so a live holding hit by a bear sector/stock yields a stop-loss advice that auto-closes.
 	e.lastBearReasons = bearHitReasons(sr)
 	e.mu.Unlock()
+
+	// §MARKET_RISK_GATE P3 风险档合成：情绪相位 + 市场状态（关=空弃权）+ 真实上涨占比 + 宏观事件三源合一，
+	// 下发 combat_agent 统一收紧做多，并缓存到引擎供 SSE 徽标/自动买谨慎层/持仓预警读取（单一真相源）。
+	// English: P3 risk-tier synthesis — emotion phase + market state (empty=abstain) + real up-ratio + macro
+	// events, pushed to the combat agent to tighten longs and cached on the engine for the SSE badge /
+	// auto-buy caution / held alerts (single source of truth).
+	e.mu.RLock()
+	mState := e.lastMarketState
+	e.mu.RUnlock()
+	if e.combatAgent != nil {
+		riskTier, riskReasons := e.combatAgent.ComputeAndSetRiskTier(emotionPhase, mState, riskUpRatio)
+		e.mu.Lock()
+		e.lastRiskTier, e.lastRiskReasons = riskTier, riskReasons
+		e.mu.Unlock()
+		if riskTier != combat_agent.RiskTierNone {
+			log.Printf("[engine] §风险档=%s 原因=%v（情绪=%s 状态=%s 上涨占比=%.0f%%）",
+				riskTier, riskReasons, emotionPhase, mState, riskUpRatio*100)
+		}
+		// §P8 日级留痕：每交易日一条最新风险档快照，落研究库供分组回测/复盘（进程级每日去重）。
+		e.persistRiskDailyToday(store.MarketRiskDailyRow{
+			TradeDate:    td,
+			Emotion:      emotionPhase,
+			MarketState:  mState,
+			RiskTier:     riskTier,
+			Reasons:      strings.Join(riskReasons, "+"),
+			UpRatio:      nanPtr(riskUpRatio),
+			BreakRate:    nanPtr(riskBreakRate),
+			LimitUpCount: len(pool),
+			LadderHeight: maxLadder(pool),
+		})
+	}
+
 	stockScores := make(map[string]combat_agent.StockScores)
 
 	// 9. 板块验证（开关控制），结果同时用于战法扫描与看板展示
@@ -3634,6 +3903,14 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// independent "sell soon" reminder decoupled from price stops, with an attribution reason (sector
 	// name / listing reason / linked news) explaining why.
 	alertSignals = append(alertSignals, e.combatAgent.BearishAttributionAlerts(e.rpt, exitQuotes, bearHitReasons(sr), time.Now())...)
+
+	// 13c''. §MARKET_RISK_GATE P5 系统性风险持仓提醒：由合成风险档（情绪+市场状态+宏观三源）驱动，对做多持仓
+	// 产出「建议减仓」提醒（AlertType=系统性风险，SellAction 不命中 → 绝不自动卖出，仅进消息中心/展示）。
+	// 与只看情绪的 13c EmotionRetreatAlerts 互补：交割日/CPI/熊市等情绪未转弱但风险已抬头的日子也会避险提醒。
+	// English: P5 composite-tier held-position trim reminder — reminder only (never auto-sold), complementing
+	// the emotion-only 13c by firing on delivery-day/CPI/bear-market risk even before the phase turns cold.
+	_, _, _, riskTier, riskReasons := e.MarketEnvSnapshot()
+	alertSignals = append(alertSignals, e.combatAgent.MarketRiskAlerts(e.rpt, exitQuotes, riskTier, riskReasons, time.Now())...)
 
 	// 13d. 逐股卖点评估：对打分池全量个股（含未持仓的自选/跟踪股）评估利空D1/破位/派发/动量衰竭，
 	// 命中即产出"卖点"提醒（仅提醒不自动执行）；消息中心按 code@卖点评估 稳定键去重，5s 循环同键刷新。
@@ -4720,6 +4997,9 @@ func (e *Engine) sectorLinkageObserve(pool []data.LimitUpStock) {
 // Returns the current state and the max position fraction.
 func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, upRatio, ma20Slope, ma60Slope float64) (research.MarketState, float64) {
 	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.MarketState }) {
+		e.mu.Lock()
+		e.lastMarketState, e.lastMaxPosPct = "", 0 // 状态机关闭：清缓存，F2 不展示状态徽标
+		e.mu.Unlock()
 		return research.StateRange, 0
 	}
 	e.mu.Lock()
@@ -4737,11 +5017,106 @@ func (e *Engine) MarketStateObserve(limitUpCount, ladderHeight int, breakRate, u
 		IndexMA60Slope: ma60Slope,
 	}, time.Now())
 	cap := tracker.MaxPosPct()
+	e.mu.Lock()
+	e.lastMarketState, e.lastMaxPosPct = string(st), cap
+	e.mu.Unlock()
 	if st != research.StateRange {
 		log.Printf("[engine] §P2.3 市场状态=%s 仓位档=%.0f%%（涨停%d 连板%d 炸板率%.0f%% 上涨占比%.0f%%）",
 			st, cap*100, limitUpCount, ladderHeight, breakRate, upRatio)
 	}
 	return st, cap
+}
+
+// MarketEnvSnapshot 返回市场环境条（F2）所需的最近一轮快照：情绪相位 + 市场状态（关=空串）+ 仓位档
+// + 风险档（空/Yellow/Red）+ 触发原因。纯读缓存加锁快照，不触发取数。
+// English: returns the latest environment snapshot for the F2 status bar — emotion phase, market state
+// (empty when the machine is off), position cap, risk tier (empty/Yellow/Red), and trigger reasons —
+// read from cache under lock (no fetch).
+func (e *Engine) MarketEnvSnapshot() (emotion, marketState string, maxPosPct float64, riskTier string, riskReasons []string) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastEmotionPhase, e.lastMarketState, e.lastMaxPosPct, e.lastRiskTier, e.lastRiskReasons
+}
+
+// macroCalGuardMu/macroCalGuardDay 进程级"每日一次校准"闸门（校准缓存是进程全局的，
+// 多账号引擎共用，故只需一个引擎每天跑一次，避免重复 LLM 调用/token 浪费）。
+var (
+	macroCalGuardMu   sync.Mutex
+	macroCalGuardDay  string
+)
+
+// calibrateMacroCalendarOnceToday §MARKET_RISK_GATE P6：每日一次用外部 API/LLM 校准宏观日历真实发布日。
+// 仅当风险档总开 + 校准开关开时执行；进程级每日一次去重；任何失败静默降级公式（不阻断主循环）。
+// English: P6 — calibrate the macro calendar (real CPI/FOMC/delivery dates) once per day via external API/LLM.
+// Runs only when the risk gate + calibration switch are both on; process-level once-per-day; every failure
+// silently degrades to formula without blocking the main loop.
+func (e *Engine) calibrateMacroCalendarOnceToday() {
+	if e.macroCalCachePath == "" {
+		return // 无落盘目录（纯内存引擎）→ 跳过校准
+	}
+	e.mu.RLock()
+	cm := e.cfgMgr
+	llm := e.llmClient
+	e.mu.RUnlock()
+	if cm == nil {
+		return
+	}
+	mg := cm.Rules.Strategy.MacroGate
+	if !mg.RiskGateOn() || !mg.CalibrateOn() {
+		return
+	}
+	today := data.TradingDayDate(time.Now())
+	macroCalGuardMu.Lock()
+	if macroCalGuardDay == today {
+		macroCalGuardMu.Unlock()
+		return
+	}
+	macroCalGuardDay = today
+	macroCalGuardMu.Unlock()
+
+	var chat data.ChatFunc
+	if llm != nil {
+		chat = llm.Chat
+	}
+	src, n := data.CalibrateMacroCalendar(chat, mg.CalibrateAPIURL, e.macroCalCachePath, time.Now().Year(), mg.CalibrateHorizonMonths())
+	log.Printf("[engine] §P6 宏观日历校准完成: 来源=%s 校准事件=%d", src, n)
+}
+
+// macroDailyGuardMu/macroDailyGuardDay 进程级"每日一次风险档留痕"闸门（多账号引擎共用研究库，只写一次）。
+var (
+	macroDailyGuardMu  sync.Mutex
+	macroDailyGuardDay string
+)
+
+// persistRiskDailyToday §MARKET_RISK_GATE P8：把当日风险档快照落研究库 market_risk_daily（每日一次，进程级去重）。
+// 研究库未注入（d1Store=nil，纯内存/无研究库）时静默跳过。写入取最新一轮快照（同日重复运行覆盖）。
+// English: P8 — persist today's risk-tier snapshot into the research DB's market_risk_daily (once per day,
+// process-level dedup); silently skipped when the research DB isn't wired (nil d1Store); a same-day rerun
+// overwrites with the latest round.
+func (e *Engine) persistRiskDailyToday(row store.MarketRiskDailyRow) {
+	if e.d1Store == nil || row.TradeDate == "" {
+		return
+	}
+	macroDailyGuardMu.Lock()
+	if macroDailyGuardDay == row.TradeDate {
+		macroDailyGuardMu.Unlock()
+		return
+	}
+	macroDailyGuardDay = row.TradeDate
+	macroDailyGuardMu.Unlock()
+	if err := e.d1Store.UpsertMarketRiskDaily(row); err != nil {
+		log.Printf("[engine] §P8 风险档日级留痕失败: %v", err)
+	}
+}
+
+// nanPtr 把 NaN 转为 nil（供落库 NULL 语义：缺失=弃权，不当 0）。
+// English: maps NaN to nil for NULL persistence (missing = abstain, never a fake 0).
+func nanPtr(x float64) *float64 {
+	if x != x { // NaN
+		return nil
+	}
+	v := x
+	return &v
 }
 
 // maxLadder 涨停池最高连板数（§P2.3 市场状态机输入）。English: max board height in the pool.

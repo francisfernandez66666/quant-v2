@@ -375,29 +375,31 @@ func main() {
 	// own engine on login. The same account reads the same backend-computed results on any device
 	// (signals/scores/long-short toggles/strategy params are all isolated per account).
 	registry := engine.NewRegistry(engine.EngineOptions{
-		MarketAPI:    marketAPI,
-		NewsAgent:    nAgent,
-		StrategyEng:  strategyEngine,
-		SectorAgent:  sAgent,
-		Scanner:      scanner,
-		Matcher:      matcher,
-		Rpt:          rpt,
-		StockTracker: stockTracker,
-		WlMgr:        wlMgr,
-		SSE:          srv.GetSSE(),
-		LLMClient:    llmClient,
-		THS:          thsClient,
-		Fetcher:      fetcher,
-		CfgMgr:       cfgMgr,
-		DataDir:      dataDir,
-		Notifier:     notifier,
-		SectorTopN:   sectorTopN,
-		Paper:        paperEngine,
-		D1MaxRetries: cfgMgr.Rules.LLM.MaxRetryTimes,
-		D1MaxTokens:  cfgMgr.Rules.LLM.D1MaxTokens,
-		RealStore:    realStore,   // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
-		D1Store:      researchDB,  // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
-		ShadowExec:   isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
+		MarketAPI:          marketAPI,
+		NewsAgent:          nAgent,
+		StrategyEng:        strategyEngine,
+		SectorAgent:        sAgent,
+		Scanner:            scanner,
+		Matcher:            matcher,
+		Rpt:                rpt,
+		StockTracker:       stockTracker,
+		WlMgr:              wlMgr,
+		SSE:                srv.GetSSE(),
+		LLMClient:          llmClient,
+		THS:                thsClient,
+		Fetcher:            fetcher,
+		CfgMgr:             cfgMgr,
+		Coordinator:        dc,                                     // §MARKET_RISK_GATE P0：风险盘口主源协调器（hithink 优先+东财兜底）
+		RiskHithinkPrimary: cfgMgr.Rules.Data.RiskHithinkPrimary(), // 应急回退阀：false 时引擎回落东财直连
+		DataDir:            dataDir,
+		Notifier:           notifier,
+		SectorTopN:         sectorTopN,
+		Paper:              paperEngine,
+		D1MaxRetries:       cfgMgr.Rules.LLM.MaxRetryTimes,
+		D1MaxTokens:        cfgMgr.Rules.LLM.D1MaxTokens,
+		RealStore:          realStore,   // 实盘账本（AUTO_TRADING_PLAN M1）：QMT 控制器存取 real_positions（已隔离至 live.db）
+		D1Store:            researchDB,  // D1 评分历史（d1_scores）：研究侧数据，留 trading.db
+		ShadowExec:         isStaging(), // §WS-G staging 影子执行器：决策落 shadow_orders、永不真下
 	})
 	srv.SetEngineRegistry(registry)
 

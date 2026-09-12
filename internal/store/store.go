@@ -262,6 +262,25 @@ func (d *DB) migrate() error {
 			PRIMARY KEY (date, code)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_d1_date ON d1_scores(date)`,
+		// §MARKET_RISK_GATE P8 市场风险档日级留痕：每日一条，记录当日情绪相位/市场状态/合成风险档 + 关键
+		// 输入（上涨占比/炸板率/涨停数/连板高度），供分组回测（按风险档切样本看信号胜率/收益差）与复盘。
+		// up_ratio/break_rate 等缺失时存 NULL（NaN 弃权），聚合查询按 NULL 跳过，绝不当 0 参与。
+		// English: P8 daily risk-tier record — one row/day capturing emotion/market-state/synthesized tier
+		// plus key inputs (up-ratio/break-rate/limit-up count/ladder) for tier-grouped backtests and review;
+		// missing inputs stored as NULL (NaN abstain), never a fake 0.
+		`CREATE TABLE IF NOT EXISTS market_risk_daily (
+			trade_date TEXT PRIMARY KEY,
+			emotion TEXT DEFAULT '',
+			market_state TEXT DEFAULT '',
+			risk_tier TEXT DEFAULT '',
+			reasons TEXT DEFAULT '',
+			up_ratio REAL,
+			break_rate REAL,
+			max_pos_pct REAL,
+			limit_up_count INTEGER DEFAULT 0,
+			ladder_height INTEGER DEFAULT 0,
+			updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_state ON research_tasks(status, priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_rtask_chain ON research_tasks(chain_day)`,
 		// 研究窗口级断点（二期）：discover-factors 各阶段按窗口缓存装配产物（IC 行等），

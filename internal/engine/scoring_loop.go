@@ -417,14 +417,19 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		}
 	}
 
-	// SSE 通知前端分数已刷新
+	// SSE 通知前端分数已刷新（§MARKET_RISK_GATE F2/B3：附市场环境条所需的市场状态/仓位档/风险档）
 	if e.sse != nil {
+		_, mktState, maxPos, riskTier, riskReasons := e.MarketEnvSnapshot()
 		e.sse.Broadcast(map[string]interface{}{
-			"type":    "score",
-			"count":   len(scores),
-			"signals": len(emit),
-			"emotion": emotionPhase,
-			"time":    time.Now().Format("15:04:05"),
+			"type":         "score",
+			"count":        len(scores),
+			"signals":      len(emit),
+			"emotion":      emotionPhase,
+			"market_state": mktState,  // bull/range/bear（状态机关闭=空串，前端隐藏状态徽标）
+			"max_pos_pct":  maxPos,    // 状态机建议仓位档（0=未启用）
+			"risk_tier":    riskTier,  // 风险档 Red/Yellow（B3，空=无风险档）
+			"risk_reasons": riskReasons, // 风险档触发原因（供 F2 徽标 tooltip）
+			"time":         time.Now().Format("15:04:05"),
 		})
 	}
 }
