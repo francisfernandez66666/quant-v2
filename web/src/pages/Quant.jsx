@@ -642,6 +642,77 @@ export default function Quant() {
     )
   }
 
+  /* 渲染链路状态卡：实盘启用态/运行模式、网关地址、熔断、下行探测心跳、上行回报新鲜度、
+     §QMT-DUAL 执行路径（xt=miniQMT兼容 / queued=QMT桥兜底）与二次确认切换。数据来自 10s 轮询的 state 与 broker。
+     English: render the link-status card — enabled/mode, gateway, circuit-breaker, downlink probe,
+     uplink report freshness, and the §QMT-DUAL active path with a guarded (confirm-in-switchBrokerTo) switch. */
+  function renderChainStatusCard() {
+    // 首轮轮询未到达：state 为 null，显示占位避免读取未定义字段
+    if (!state) {
+      return (
+        <Card title="链路状态" style={{ marginBottom: 14 }}>
+          <span style={{ fontSize: 13, color: 'var(--app-muted-2)' }}>链路状态加载中…（每 10s 轮询）</span>
+        </Card>
+      )
+    }
+    // 单行信息条目：固定宽标签 + 值（用函数返回 JSX，避免在渲染函数内定义组件导致子树反复重挂载）
+    const row = (k, node) => (
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '7px 0', borderBottom: '1px solid var(--app-border)', fontSize: 13 }}>
+        <span style={{ width: 92, flexShrink: 0, color: 'var(--app-text-2)' }}>{k}</span>
+        <span style={{ flex: 1, minWidth: 0, wordBreak: 'break-all' }}>{node}</span>
+      </div>
+    )
+    const modeLabel = state.mode === 'auto' ? '全自动' : (state.mode === 'manual' ? '手动确认' : (state.mode || '—'))
+    // 熔断：已熔断展示红 Tag + 原因/时间，正常展示绿 Tag
+    const breaker = state.tripped ? (
+      <>
+        <Tag theme="danger">已熔断</Tag>
+        <span style={{ fontSize: 12, color: 'var(--app-up)', marginLeft: 8 }}>
+          {state.trip_reason || '原因未知'}{state.trip_at ? `（${state.trip_at}）` : ''}
+        </span>
+      </>
+    ) : <Tag theme="success">正常</Tag>
+    // 下行探测（quant→gateway 连通性）：在线态 + 延迟 + 最近探测时间
+    const probe = (
+      <span style={{ fontSize: 12 }}>
+        {state.last_probe_ok ? <Tag theme="success">连通</Tag> : <Tag theme="danger">失联</Tag>}
+        {typeof state.last_latency_ms === 'number' ? <span style={{ marginLeft: 8 }}>延迟 {state.last_latency_ms}ms</span> : null}
+        {state.last_probe_at ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>· {state.last_probe_at}</span> : null}
+      </span>
+    )
+    // 上行回报（gateway→quant 心跳/成交回执）新鲜度
+    const report = state.last_report_at ? (
+      <span style={{ fontSize: 12 }}>
+        最近 {state.last_report_at}
+        {state.last_report_kind ? <span style={{ color: 'var(--app-text-2)' }}>（{state.last_report_kind}）</span> : null}
+      </span>
+    ) : <span style={{ fontSize: 12, color: 'var(--app-text-2)' }}>暂无回报（非交易时段属正常）</span>
+    // §QMT-DUAL 执行路径：双通道在线态 + active 高亮 + 切换按钮（switchBrokerTo 内含二次确认，防误切）
+    const active = broker && broker.broker === 'queued' ? 'queued' : 'xt'
+    const path = (
+      <span style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <Tag theme={active === 'xt' ? 'primary' : 'default'}>miniQMT兼容{broker && broker.xt_connected ? ' ●' : ' ○'}</Tag>
+        <Tag theme={active === 'queued' ? 'primary' : 'default'}>QMT桥兜底{broker && broker.queued_connected ? ' ●' : ' ○'}</Tag>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'xt'} onClick={() => switchBrokerTo('xt')}>切到 miniQMT</Button>
+        <Button size="xs" variant="outline" theme="warning" loading={switchingBroker} disabled={active === 'queued'} onClick={() => switchBrokerTo('queued')}>切到 QMT桥</Button>
+        <span style={{ color: 'var(--app-text-2)' }}>当前：{active === 'queued' ? 'QMT桥兜底' : 'miniQMT兼容'}</span>
+      </span>
+    )
+    return (
+      <Card title="链路状态" style={{ marginBottom: 14 }}>
+        {row('实盘链路', <>
+          {state.enabled ? <Tag theme="success">已启用</Tag> : <Tag theme="default">未启用</Tag>}
+          <span style={{ fontSize: 12, color: 'var(--app-text-2)', marginLeft: 8 }}>模式：{modeLabel}</span>
+        </>)}
+        {row('网关地址', state.gateway_url || '—')}
+        {row('熔断', breaker)}
+        {row('下行探测', probe)}
+        {row('上行回报', report)}
+        {row('执行路径', path)}
+      </Card>
+    )
+  }
+
   /* 量化交易页面主渲染：链路状态卡 → 总开关与执行方式 → 仓位纪律 → 战法开关 → 交易流水 */
   return (
     <div className="page">
