@@ -47,6 +47,9 @@ func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 		"initial_capital": pe.Cfg().InitialCapital,
 		"max_positions":   pe.Cfg().MaxPositions,
 		"strategy_pools":  pe.StrategyPools(),
+		// §SHORT-3/决策⑤ 融券做空卡（负持仓/担保/利息/做空权益），enabled=false 时前端整卡隐藏。
+		// English: §SHORT-3 margin-short card payload; the frontend hides it entirely when disabled.
+		"short_book": pe.ShortBook(),
 	})
 }
 
@@ -347,6 +350,62 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// handlePaperShortOpen §SHORT-4 手动融券开仓：{"code","name","strategy","price"}；price>0 用指定价，
+// 0=实时价。做空池未开设/已持空/同日重复均返回中文错误。
+// English: manual short-open (margin sell). Body code/name/strategy/price (0 = live quote).
+func (s *Server) handlePaperShortOpen(w http.ResponseWriter, r *http.Request) {
+	pe := s.paperEngineFor(requestUserID(r))
+	if pe == nil || !pe.Enabled() {
+		writeError(w, 400, "模拟盘未启用")
+		return
+	}
+	var req struct {
+		Code     string  `json:"code"`
+		Name     string  `json:"name"`
+		Strategy string  `json:"strategy"`
+		Price    float64 `json:"price"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+		writeError(w, 400, "缺少股票代码")
+		return
+	}
+	q := s.liveQuotes(req.Code)
+	if req.Price > 0 && q[req.Code] != nil {
+		q[req.Code].Price = req.Price // 用户指定开仓价（缺实时价时引擎侧自行拒绝）
+	}
+	qty, err := pe.ShortOpenManual(req.Code, req.Name, req.Strategy, "", req.Price, q)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "qty": qty})
+}
+
+// handlePaperShortCover §SHORT-4 融券买回平仓：{"code","price"}；price>0 用指定价（缺实时价也可），
+// 0=按实时价。T+1 未解禁/无空头均返回中文错误。
+// English: manual buy-to-cover. Body code/price (0 = live quote); T+1 and no-short return errors.
+func (s *Server) handlePaperShortCover(w http.ResponseWriter, r *http.Request) {
+	pe := s.paperEngineFor(requestUserID(r))
+	if pe == nil || !pe.Enabled() {
+		writeError(w, 400, "模拟盘未启用")
+		return
+	}
+	var req struct {
+		Code  string  `json:"code"`
+		Price float64 `json:"price"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+		writeError(w, 400, "缺少股票代码")
+		return
+	}
+	pnl, err := pe.ShortCover(req.Code, req.Price, s.liveQuotes(req.Code))
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "realized": pnl})
 }
 
 // handlePaperPoolReset 单池清盘：只清指定战法资金池的持仓与持久化表现（平仓回池现金），

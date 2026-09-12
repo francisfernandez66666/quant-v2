@@ -76,6 +76,8 @@ export default function Dashboard() {
   const [showLog, setShowLog] = useState(false)
   // 各行情数据源健康状态（东财/新浪/腾讯/同花顺）
   const [dataSourceHealth, setDataSourceHealth] = useState({})
+  // §SHORT-4 做空统计卡（决策⑤）：short_enabled 关闭时不渲染任何做空内容
+  const [shortEnabled, setShortEnabled] = useState(false)
   // 各新闻数据源健康状态（财联社/同花顺/新浪）
   const [newsSourceHealth, setNewsSourceHealth] = useState({})
   // 流程引擎各模块健康状态
@@ -103,6 +105,9 @@ export default function Dashboard() {
   const observeCount = useMemo(() => signals.filter((s) => s.remind_level === 'observe').length, [signals])
   // 统计静默（mute）信号数量
   const muteCount = useMemo(() => signals.filter((s) => s.remind_level === 'mute').length, [signals])
+  // §SHORT-4 做空信号统计：sell=持仓走弱自动卖出 / watch(规避)=非持仓提示
+  const bearCount = useMemo(() => (shortEnabled ? signals.filter((s) => s.direction === '做空').length : 0), [signals, shortEnabled])
+  const bearSellCount = useMemo(() => (shortEnabled ? signals.filter((s) => s.direction === '做空' && s.action === 'sell').length : 0), [signals, shortEnabled])
 
   // 过滤出宏观日历与政策反制类资讯事件
   const calendarEvents = useMemo(
@@ -152,6 +157,10 @@ export default function Dashboard() {
     // 战法归因统计从仪表盘接口的 report_stats 中提取
     if (dashRes.status === 'fulfilled' && dashRes.value && dashRes.value.report_stats) {
       setStrategyStats(dashRes.value.report_stats.by_strategy || {})
+    }
+    // §SHORT-4 仪表盘接口自带 short_enabled，直接取用（失败保持 false=隐藏做空内容）
+    if (dashRes.status === 'fulfilled' && dashRes.value) {
+      setShortEnabled(!!dashRes.value.short_enabled)
     }
   }
 
@@ -275,6 +284,11 @@ export default function Dashboard() {
           { n: strongCount, l: '强信号', c: '#e34d59' },
           { n: observeCount, l: '观察中', c: '#faad14' },
           { n: muteCount, l: '静默', c: '#888' },
+          // §SHORT-4 做空统计卡（仅做空开关开启时出现）
+          ...(shortEnabled ? [
+            { n: bearCount, l: '做空信号', c: '#e34d59' },
+            { n: bearSellCount, l: '做空自动卖出', c: '#c9353f' },
+          ] : []),
           { n: (scanStats.total_stocks || snapshotStocks.length || 0), l: '监控个股', c: '#0052d9' },
         ].map((s) => (
           <Card key={s.l} style={{ flex: '1 1 150px' }}>

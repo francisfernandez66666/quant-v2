@@ -690,6 +690,9 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		DiscTracker:  dt, // 统一纪律裁决（探针+扳机）
 	})
 
+	// §SHORT-2 做空战法卖出标记 → 实盘清仓级建议（Source=short_tactic，见 shortTacticCloseAdvices）。
+	advices = append(advices, e.shortTacticCloseAdvices(positions, advices, exitQuotes)...)
+
 	// §GAP1.2 M8 组合回撤熔断（risk.M8Check 口径接线）：实盘组合市值自峰值回撤超阈值 → 全部自动卖出。
 	// 此前 M8Check 是死代码；现接入实盘链路（峰值随进程内存续，平仓后基线归零）。
 	e.checkM8RealDrawdown(ctrl, realStore, positions, exitQuotes)

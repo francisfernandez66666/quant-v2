@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 改动全量验证脚本（含 2026-08-05 实时链路改动专项 + 2026-09-11 回测自动增强专项）
+# 改动全量验证脚本（含 2026-08-05 实时链路改动专项 + 2026-09-11 回测自动增强专项 + 2026-09-12 做空策略链路专项）
 #
 # 用实盘数据快照（internal/e2e/testdata/fixtures.json / fixtures_600580.json）离线 mock 全部外部数据源，
 # 专项验证改动：
@@ -19,31 +19,46 @@
 #   D 前端        ：ParetoChart 渲染/交互 + BacktestConfigPanel 读写 + approveOptimization 推荐解请求体
 #   回归保证      ：增强关闭（nil/Enabled=false）时旧行为逐字节一致（各包 _test 已含短路用例）
 #
+# §做空策略链路（2026-09-12 §SHORT 1-5）专项（见 4/4）：
+#   四战法包       ：high_churn/break_down/leader_decay/good_news_fade + shortbase 共享输入（全用例跑）
+#   接线           ：ScanShort 两层门控/ST 拦截/评分日志（TestScanShort*、TestBuildShortDataDerives）
+#   自动卖出       ：SellAction→close、shortSellMarks 日幂等、止损级 advice（TestShortTacticCloseAdvices、
+#                   TestAutoExecuteRealSellsShortTactic、TestPaperSellSignalsIncludeShortTactic）
+#   融券做空簿     ：保证金/隔离/T+1/利息/止损/路由/e2e 权益连续（TestShort* paper 8 组）
+#   全链路 e2e     ：真 runners→ScanShort→SellAction→paper 开空→关门静默（TestShortPipelineTactics）
+#
 # 用法:
-#   ./scripts/verify_changes.sh                # 编译 + 专项 e2e + 回测增强单测
+#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路专项
 #   ./scripts/verify_changes.sh -full          # 再连相关全量单测 + 前端 vitest 一起跑
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "==> 1/3 编译检查..."
+echo "==> 1/4 编译检查..."
 go build ./...
 go vet ./internal/llm ./internal/combat_agent ./internal/engine ./internal/e2e ./internal/server ./internal/data ./internal/display ./cmd/quant \
 	./internal/config ./internal/btreplay ./internal/store ./internal/scheduler ./cmd/research
 
-echo "==> 2/3 实时链路改动专项 e2e（实盘快照 mock）..."
+echo "==> 2/4 实时链路改动专项 e2e（实盘快照 mock）..."
 go test -count=1 -v ./internal/e2e/ \
-	-run 'TestLLMTimeoutConfig|TestD1FallbackAcrossRuns|TestNShapeGateD1AndTotal|TestEndToEndFullPipeline|TestConsult|TestHTTP|TestAttachLiveBar' 2>&1 \
+	-run 'TestLLMTimeoutConfig|TestD1RetryQueueAcrossRuns|TestNShapeGateD1AndTotal|TestEndToEndFullPipeline|TestConsult|TestHTTP|TestAttachLiveBar' 2>&1 \
 	| grep -E '^(=== RUN|--- (PASS|FAIL)|PASS|FAIL|ok)'
 
-echo "==> 3/3 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
+echo "==> 3/4 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
 go test -count=1 -v ./internal/config ./internal/btreplay ./internal/store ./internal/server ./internal/scheduler ./cmd/research \
 	-run 'TestValidateBacktest|TestFillDefaults|TestFillBacktestDefaults|TestBacktestSettingsRoundTrip|TestPaperSlippageCalib|TestBacktestConfigEndpoints|TestInjectBacktestPayload|TestPayloadBacktest|TestCostRoundTripPnlExCompat|TestSlippageTiers|TestSlippageBpsAsymmetric|TestFillRate|TestLimitBoardGating|TestCalibAudit|TestEntrySlipGating|TestUniformExit|TestFixAmountScale|TestAvgAmountWan|TestBuildSlipCtx|TestPareto|TestCapFront|TestRecommended|TestPointJSON|TestSaveSweepResultsParetoCarry' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+
+echo "==> 4/4 做空策略链路专项（§SHORT 2026-09-12：四战法/接线/自动卖出/融券/e2e）..."
+go test -count=1 ./internal/strategies/high_churn/... ./internal/strategies/break_down/... ./internal/strategies/leader_decay/... ./internal/strategies/good_news_fade/... ./internal/strategies/shortbase/... 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/combat_agent/... ./internal/paper/... ./internal/engine/... ./internal/e2e/ \
+	-run 'Short|BuildShort|StrategyDisplay|AutoExecuteRealSells|AutoExitReportSells|PaperSellSignals' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
 if [ "${1:-}" = "-full" ]; then
 	echo ""
 	echo "==> 附加：实时链路相关全量单测..."
-	go test -count=1 ./internal/combat_agent/... ./internal/engine/... ./internal/llm/... ./internal/strategies/n_shape/... \
+	go test -count=1 ./internal/combat_agent/... ./internal/engine/... ./internal/llm/... ./internal/strategies/... ./internal/paper/... \
 		./internal/data/... ./internal/display/... ./internal/newsagent/... ./internal/e2e/ ./internal/server/ ./cmd/quant/...
 	echo ""
 	echo "==> 附加：回测增强全量单测（含回归短路）..."

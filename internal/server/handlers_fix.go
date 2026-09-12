@@ -53,24 +53,28 @@ type fixSignal struct {
 	Strategy string `json:"strategy"` // 触发策略
 	// §C 归属字段：信号所属战法资金池（dragon/double_bump/…/fac_1/pat_2）与库规则 ID。
 	// 前端据此决定是否显示「模拟买入」（非战法信号不可买）并把买入归入对应池。
-	StrategyType string  `json:"strategy_type,omitempty"` // 战法池类型
-	StrategyID   string  `json:"strategy_id,omitempty"`   // 库规则 ID
-	TotalScore   float64 `json:"total_score"`             // 总分（0~100）
-	RemindLevel  string  `json:"remind_level"`            // 提醒级别：strong/observe/mute
-	Level        string  `json:"level"`                   // 固定"交易"
-	Action       string  `json:"action"`                  // 交易动作（buy 等）
-	Price        float64 `json:"price"`                   // 信号触发价格
-	ChangePct    float64 `json:"change_pct"`              // 实时涨跌幅（%）
-	CanOpen      bool    `json:"can_open"`                // 是否可开仓（置信度≥0.7 且为买入）
-	D1           float64 `json:"d1"`                      // 维度1 评分
-	D2           float64 `json:"d2"`                      // 维度2 评分
-	D3           float64 `json:"d3"`                      // 维度3 评分
-	D4           float64 `json:"d4"`                      // 维度4 评分
-	D1Desc       string  `json:"d1_desc"`                 // 维度1 说明（触发理由）
-	D2Desc       string  `json:"d2_desc"`                 // 维度2 说明（所属板块）
-	D3Desc       string  `json:"d3_desc"`                 // 维度3 说明
-	D4Desc       string  `json:"d4_desc"`                 // 维度4 说明
-	SignalActive bool    `json:"signal_active"`           // 信号是否活跃
+	StrategyType string `json:"strategy_type,omitempty"` // 战法池类型
+	StrategyID   string `json:"strategy_id,omitempty"`   // 库规则 ID
+	// §SHORT-4 信号方向（做多/做空）：做空战法信号带方向下发，前端按做空开关显隐与打标。
+	// English: §SHORT-4 signal direction — bear-tactic signals carry it so the frontend can badge and
+	// gate short content by the short-enabled switch.
+	Direction    string  `json:"direction,omitempty"` // 方向：做多/做空（空=做多历史兼容）
+	TotalScore   float64 `json:"total_score"`         // 总分（0~100）
+	RemindLevel  string  `json:"remind_level"`        // 提醒级别：strong/observe/mute
+	Level        string  `json:"level"`               // 固定"交易"
+	Action       string  `json:"action"`              // 交易动作（buy 等）
+	Price        float64 `json:"price"`               // 信号触发价格
+	ChangePct    float64 `json:"change_pct"`          // 实时涨跌幅（%）
+	CanOpen      bool    `json:"can_open"`            // 是否可开仓（置信度≥0.7 且为买入）
+	D1           float64 `json:"d1"`                  // 维度1 评分
+	D2           float64 `json:"d2"`                  // 维度2 评分
+	D3           float64 `json:"d3"`                  // 维度3 评分
+	D4           float64 `json:"d4"`                  // 维度4 评分
+	D1Desc       string  `json:"d1_desc"`             // 维度1 说明（触发理由）
+	D2Desc       string  `json:"d2_desc"`             // 维度2 说明（所属板块）
+	D3Desc       string  `json:"d3_desc"`             // 维度3 说明
+	D4Desc       string  `json:"d4_desc"`             // 维度4 说明
+	SignalActive bool    `json:"signal_active"`       // 信号是否活跃
 
 	// §FIX-0921 信号产生时间（2026-09-01 用户需求）：信号页新增「产生时间」列。
 	// 内部 Signal.GeneratedAt 已有完整时间戳，此前未透出前端——用户无法判断信号新旧。

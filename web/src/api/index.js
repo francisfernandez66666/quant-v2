@@ -614,6 +614,18 @@ export async function sellPaperPosition(code, price, qty) {
   return request('/api/paper/sell', { method: 'POST', data: { code, price: price || 0, qty: qty || 0 } })
 }
 
+/** §SHORT-4 模拟盘：手动融券开仓（price=0 走实时价；做空池未开设/已持空/同日重复返回中文错误） */
+// 对应 POST /api/paper/short_open，data: { code, name, strategy, price }
+export async function shortOpenPaper(code, name, strategy, price) {
+  return request('/api/paper/short_open', { method: 'POST', data: { code, name, strategy, price: price || 0 } })
+}
+
+/** §SHORT-4 模拟盘：融券买回平仓（price=0 走实时价）。返回 { ok, realized } */
+// 对应 POST /api/paper/short_cover，data: { code, price }
+export async function shortCoverPaper(code, price) {
+  return request('/api/paper/short_cover', { method: 'POST', data: { code, price: price || 0 } })
+}
+
 /** 模拟盘：单池清盘（只清指定战法资金池的持仓与持久化表现，不影响其余池与全局净值/成交） */
 /** Paper trading: reset a single strategy pool (clears only that pool's positions & persisted perf;
  *  other pools and the global equity/fill log are untouched) */

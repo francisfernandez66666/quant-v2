@@ -108,6 +108,9 @@ export default function Quant() {
   const [strategyList, setStrategyList] = useState([])
   const [strategyOn, setStrategyOn] = useState({})
   const [strategyDirty, setStrategyDirty] = useState(false)
+  // §SHORT-4 做空战法状态：全局做空开关 + 模拟盘融券池开设标记
+  const [shortEnabled, setShortEnabled] = useState(false)
+  const [shortPoolOn, setShortPoolOn] = useState(false)
   const [saving, setSaving] = useState(false)
   const [trades, setTrades] = useState(null)
 
@@ -335,6 +338,9 @@ export default function Quant() {
 
   useEffect(() => {
     loadState()
+    // §SHORT-4 做空开关与融券池状态探测（开关与模拟盘 short_book.enabled）
+    api.fetchShortStatus().then((r) => setShortEnabled(!!r.short_enabled)).catch(() => {})
+    api.fetchPaperState().then((r) => setShortPoolOn(!!(r.short_book && r.short_book.enabled))).catch(() => {})
     // 链路状态每 10s 轮询一次（心跳/延迟/熔断实时性要求高）
     stateTimer.current = setInterval(loadState, 10000)
     loadBroker()
@@ -426,6 +432,26 @@ export default function Quant() {
         <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>自动模式下止损/清仓级建议自动全仓卖出；止盈/减仓保持提醒</span>
       </Form.FormItem>
     )
+    // §SHORT-4 做空战法自动卖出状态（决策②⑤）：开关与顶部全局做空开关同源；
+    // 状态行提示触发条件（全自动+自动卖出）与模拟盘融券池开设情况。
+    // English: §SHORT-4 bear-tactic auto-sell status — same source as the global short toggle;
+    // shows the live execution gate (auto mode + auto_sell) and the paper margin-short pool state.
+    const shortTactics = (
+      <Form.FormItem label="做空战法">
+        <ToggleSw checked={shortEnabled} onChange={async (v) => {
+          try {
+            const r = await api.toggleShort(v)
+            setShortEnabled(!!r.short_enabled)
+            MessagePlugin.success(r.short_enabled ? '做空已开启' : '做空已关闭')
+          } catch (_) { MessagePlugin.error('做空开关切换失败') }
+        }} />
+        <span style={{ color: '#666', fontSize: 11, marginLeft: 10 }}>
+          持有个股命中做空战法（高位滞涨/放量破位/龙头断板/利好兑现砸盘）自动卖出
+          {form.mode === 'auto' && form.auto_sell ? '（当前满足：全自动+自动卖出）' : '（需「全自动 + 自动卖出」才代执行，否则 P1 强提醒手动处理）'}
+          {shortPoolOn ? '；模拟盘融券池已开设' : ''}
+        </span>
+      </Form.FormItem>
+    )
     // 心跳超时：连续失联超过该值触发熔断暂停下单（30-3600秒）
     const heartbeat = (
       <Form.FormItem label="心跳超时(秒)">
@@ -462,6 +488,7 @@ export default function Quant() {
         {execMode}
         {priceType}
         {autoSell}
+        {shortTactics}
         {heartbeat}
         {gatewayUrl}
         {tokenConfig}

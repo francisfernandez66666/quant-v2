@@ -144,6 +144,15 @@ type Engine struct {
 	reportTrimDone   map[string]string                                                                               // FIX#15 report 账本减仓去重：code → 交易日（autoExitReportSells 半仓每日一次）
 	reportTrimDoneMu sync.Mutex                                                                                      // reportTrimDone 互斥（主循环独占写，SSE/HTTP 可能读，防御性）
 
+	// §SHORT-2 做空战法卖出标记：主循环命中持仓走弱的 sell 信号时记录（纯code → 标记），
+	// 近实时 pushRealAdvice 消费同交易日的标记生成实盘清仓级建议（Source=short_tactic），
+	// 复用 autoExecuteRealSells 的 mode=auto+auto_sell 门槛、幂等键与 syncLiveAdviceAlerts 强提醒。
+	// English: bear-tactic sell marks — the main loop records weak-holding sells; the near-realtime
+	// advice pass converts same-trading-day marks into 止损-class advices (Source=short_tactic) so the
+	// existing live auto-sell gates/idempotency/strong-reminders are reused wholesale.
+	shortSellMarks   map[string]shortSellMark
+	shortSellMarksMu sync.Mutex
+
 	// 实盘交易（AUTO_TRADING_PLAN M1）：QMT 控制器 + 实盘账本 store。独立于纸面账本。
 	// 仅 qmt.enabled=true 时参与 5s 分析循环（读 real_positions 生成持仓建议 / 熔断 / 自动下单）。
 	// English: live trading (AUTO_TRADING_PLAN M1) — QMT controller + real-book store, independent of the
@@ -3160,6 +3169,17 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	if e.userID == "" {
 		positions = e.rpt.HeldPositionCodes()
 	}
+	// §SHORT-1 持仓集合：做空战法 sell 信号仅对持仓股发出（非持仓降级 watch 规避提示）。
+	// §SHORT-2 并入全账号纸面持仓：纸面账本持有的也要出 sell 才能走自动卖出（决策②）。
+	heldSet := make(map[string]bool, len(positions))
+	for _, c := range positions {
+		heldSet[c] = true
+	}
+	if e.paperHeldCodes != nil {
+		for _, c := range e.paperHeldCodes() {
+			heldSet[c] = true
+		}
+	}
 	watchlist := e.wlMgr.List(e.userID)
 	if e.userID == "" {
 		watchlist = e.wlMgr.All()
@@ -3441,6 +3461,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			News:         newsBriefs,
 			Scores:       stockScores,
 			EmotionPhase: emotionPhase,
+			HeldCodes:    heldSet, // §SHORT-1 持仓股才发 sell，非持仓降级 watch
 		}
 		bearSignals = e.combatAgent.ScanShort(bearInput)
 	}
@@ -3494,6 +3515,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			PE:               peScores,
 			Scores:           stockScores,
 			EmotionPhase:     emotionPhase,
+			News:             newsBriefs, // §SHORT-1 利好兑现砸盘需个股关联利好简报（事件窗判定）
+			HeldCodes:        heldSet,    // §SHORT-1 持仓股才发 sell，非持仓降级 watch
 		}
 		individualSignals = append(individualSignals, e.combatAgent.ScanShort(in)...)
 	}
@@ -3646,6 +3669,17 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		for _, s := range alertSignals {
 			if combat_agent.SellAction(s) != "" {
 				sells = append(sells, s)
+			}
+		}
+		// §SHORT-2 做空战法 sell 信号（持仓走弱）并入自动卖出：SellAction 已把做空战法 sell 归一为
+		// close，这里一并送入 13e（纸面+report 账本自动平）；同时打实盘标记供 pushRealAdvice 消费。
+		// English: §SHORT-2 — bear-tactic "sell" signals (weak holdings) join the auto-sell round:
+		// SellAction normalizes them to "close", so they flow into paper/report exits; also stamp a
+		// live mark that pushRealAdvice turns into a 止损-class advice for real holdings.
+		for _, s := range bearSignals {
+			if combat_agent.IsShortTactic(s.StrategyType) && s.Action == "sell" {
+				sells = append(sells, s)
+				e.markShortSell(s.Code, s.Strategy)
 			}
 		}
 		if len(sells) > 0 {
@@ -4378,6 +4412,8 @@ func newsBriefsByCode(events []newsagent.NewsEvent) map[string][]combat_agent.Ne
 				Title:    ev.Title,
 				Positive: positive,
 				Time:     ev.Datetime,
+				Score:    ev.Score,
+				Level:    ev.Level,
 			})
 		}
 	}
@@ -4848,6 +4884,97 @@ func bearHitReasons(sr *strategy_engine.StrategyResult) map[string]string {
 		if _, ok := out[code]; !ok {
 			out[code] = "利空个股事件"
 		}
+	}
+	return out
+}
+
+// shortSellMark §SHORT-2 做空战法卖出标记（交易日 + 触发战法名）。
+// English: §SHORT-2 bear-tactic sell mark — trading day plus the triggering tactic name.
+type shortSellMark struct {
+	Day    string // 标记当日交易日（YYYY-MM-DD）（the trading day the mark was stamped）
+	Tactic string // 触发战法中文名（如「放量破位」）（display name of the tactic that fired）
+}
+
+// markShortSell §SHORT-2 记录做空战法对某股的 sell 标记（纯code → 战法名/交易日）。
+// 主循环每轮命中即刷新（保留当日最新战法名）；跨交易日自然失效（消费方比对交易日）。
+// English: §SHORT-2 — stamp a bear-tactic sell mark for a code (pure code → tactic/trading-day);
+// refreshed each round it fires, and the consumer drops stale marks from another trading day.
+func (e *Engine) markShortSell(code, tactic string) {
+	pure := pureTsCode(code)
+	if pure == "" {
+		return
+	}
+	e.shortSellMarksMu.Lock()
+	defer e.shortSellMarksMu.Unlock()
+	if e.shortSellMarks == nil {
+		e.shortSellMarks = make(map[string]shortSellMark)
+	}
+	e.shortSellMarks[pure] = shortSellMark{Day: data.TradingDayDate(e.nowTime()), Tactic: tactic}
+}
+
+// shortSellMarkOf §SHORT-2 查询某股当日有效做空 sell 标记（跨日自动视为无效）。
+// English: §SHORT-2 — the valid same-trading-day bear sell mark for a code, empty otherwise.
+func (e *Engine) shortSellMarkOf(code string) (shortSellMark, bool) {
+	e.shortSellMarksMu.Lock()
+	defer e.shortSellMarksMu.Unlock()
+	m, ok := e.shortSellMarks[pureTsCode(code)]
+	if !ok || m.Day != data.TradingDayDate(e.nowTime()) {
+		return shortSellMark{}, false
+	}
+	return m, true
+}
+
+// shortTacticCloseAdvices §SHORT-2 把当日做空战法 sell 标记转换为实盘清仓级建议（止损类，
+// Source=short_tactic），供 autoExecuteRealSells 复用门槛（mode=auto+auto_sell）/幂等键/
+// 剩余量扣减，syncLiveAdviceAlerts 复用 P1 强提醒。跳过已有止损级建议的码（避免双触发）
+// 与行情缺失的持仓（宁可不卖）。
+// English: §SHORT-2 — convert same-trading-day bear-tactic sell marks into 止损-class live advices
+// (Source=short_tactic) so the existing auto-sell gates/idempotency/remaining-qty logic and the P1
+// strong-reminder channel apply unchanged; codes already carrying a stop-loss advice are skipped
+// (no double trigger), and holdings without a live quote are never sold.
+func (e *Engine) shortTacticCloseAdvices(positions []store.RealPosition, advices []trading.PositionAdvice, quotes map[string]*data.StockInfo) []trading.PositionAdvice {
+	var out []trading.PositionAdvice
+	for i := range positions {
+		p := &positions[i]
+		if p.Qty <= 0 {
+			continue
+		}
+		mark, ok := e.shortSellMarkOf(p.TsCode)
+		if !ok {
+			continue
+		}
+		dup := false
+		for _, a := range advices {
+			if a.Code == pureTsCode(p.TsCode) && a.Action == "止损" {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		q := quotes[pureTsCode(p.TsCode)]
+		if q == nil || q.Price <= 0 {
+			continue // 无实时价不下单（宁可不卖）（no live quote → never sell）
+		}
+		profitPct := 0.0
+		if p.CostPrice > 0 {
+			profitPct = (q.Price - p.CostPrice) / p.CostPrice * 100
+		}
+		out = append(out, trading.PositionAdvice{
+			Code:        pureTsCode(p.TsCode),
+			TsCode:      p.TsCode,
+			Name:        p.Name,
+			Qty:         p.Qty,
+			Action:      "止损",
+			Level:       "高",
+			Reason:      fmt.Sprintf("做空战法「%s」判定走弱，自动清仓持仓", mark.Tactic),
+			RefPrice:    q.Price,
+			ProfitPct:   profitPct,
+			Strategy:    mark.Tactic,
+			GeneratedAt: e.nowTime(),
+			Source:      "short_tactic",
+		})
 	}
 	return out
 }

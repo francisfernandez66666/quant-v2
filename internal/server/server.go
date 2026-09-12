@@ -510,6 +510,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/paper/selfcheck", s.authMiddleware(s.handlePaperSelfCheck))
 	s.mux.HandleFunc("POST /api/paper/sell", s.adminMiddleware(s.handlePaperSell))
 	s.mux.HandleFunc("POST /api/paper/buy", s.adminMiddleware(s.handlePaperBuy))
+	// §SHORT-4 融券做空手动端点（开仓/买回）
+	s.mux.HandleFunc("POST /api/paper/short_open", s.adminMiddleware(s.handlePaperShortOpen))
+	s.mux.HandleFunc("POST /api/paper/short_cover", s.adminMiddleware(s.handlePaperShortCover))
 	s.mux.HandleFunc("POST /api/paper/reset", s.adminMiddleware(s.handlePaperReset))
 	s.mux.HandleFunc("POST /api/paper/pool/reset", s.adminMiddleware(s.handlePaperPoolReset))
 	s.mux.HandleFunc("POST /api/paper/pool/config", s.adminMiddleware(s.handlePaperPoolConfig))

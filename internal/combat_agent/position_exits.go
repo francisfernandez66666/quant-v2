@@ -195,6 +195,13 @@ func buildExitContextWithATR(pos report.ExecLog, price float64, dayK []data.KLin
 // downgrades (提示/关注) never match.
 func SellAction(s Signal) string {
 	if s.Direction == "做空" {
+		// §SHORT-2 做空战法 sell 信号语义 = 持仓走弱「卖出多头」（与旧做空词的「开仓」语义不同）：
+		// 仅当策略类型是四个做空战法且 Action=sell 时归一为 close，其余做空方向信号维持开仓语义返回 ""。
+		// English: a bear-tactic "sell" means closing the held LONG (not opening a short) — mapped to
+		// "close" only for the four short strategy types; other 做空 signals keep opening semantics ("").
+		if IsShortTactic(s.StrategyType) && (s.Action == "sell" || s.Action == "卖出") {
+			return "close"
+		}
 		return "" // 做空方向词是开仓方向语义，不是卖出提醒
 	}
 	switch s.AlertType {

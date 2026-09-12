@@ -24,9 +24,14 @@ const (
 	SignalNShape        SignalType = "n_shape"        // N 形超短（N-shape ultra-short）
 	SignalDragonReturn  SignalType = "dragon_return"  // 龙回头(中线)（Dragon Return, mid-line）
 	SignalShortSkeleton SignalType = "short_skeleton" // 做空骨架（Short-sell skeleton）
-	SignalFactor        SignalType = "factor"         // 因子战法（E6：自动发现的因子组合，实盘信号）（Factor strategy, E6）
-	SignalPattern       SignalType = "pattern"        // 形态战法（F3：自动发现的形态模板，实盘信号）（Pattern strategy, F3）
-	SignalMomentum      SignalType = "momentum"       // 动量（量价齐升观察/买入，§动量入模拟盘）
+	// §SHORT-1 做空四战法（docs/SHORT_STRATEGIES_PLAN_20260912.md）：卖出侧决策信号（持仓 sell/非持仓 watch）
+	SignalHighChurn    SignalType = "high_churn"     // 高位滞涨（放量不涨派发）（High-level churn/distribution）
+	SignalBreakDown    SignalType = "break_down"     // 放量破位（趋势终结）（Volume breakdown）
+	SignalLeaderDecay  SignalType = "leader_decay"   // 龙头断板（情绪退潮）（Leader board-break decay）
+	SignalGoodNewsFade SignalType = "good_news_fade" // 利好兑现砸盘（买预期卖现实）（Good-news fully-priced fade）
+	SignalFactor       SignalType = "factor"         // 因子战法（E6：自动发现的因子组合，实盘信号）（Factor strategy, E6）
+	SignalPattern      SignalType = "pattern"        // 形态战法（F3：自动发现的形态模板，实盘信号）（Pattern strategy, F3）
+	SignalMomentum     SignalType = "momentum"       // 动量（量价齐升观察/买入，§动量入模拟盘）
 )
 
 // TradeAction 交易动作类型。（TradeAction is a trade action type.）

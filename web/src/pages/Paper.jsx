@@ -158,6 +158,8 @@ export default function Paper() {
   const [maxPos, setMaxPos] = useState('')
   const [appliedMax, setAppliedMax] = useState(0)
   const [tab, setTab] = useState('positions')
+  // §SHORT-4 融券做空卡数据（short_book.enabled=false 时整卡隐藏，决策⑤）
+  const [shortBook, setShortBook] = useState(null)
   const [stats, setStats] = useState(null)
   const [positions, setPositions] = useState([])
   const [trades, setTrades] = useState([])
@@ -358,6 +360,7 @@ export default function Paper() {
       setAppliedMax((st.max_positions !== undefined && st.max_positions > 0) ? st.max_positions : 0)
       setStats(st.stats || null)
       setPools(Array.isArray(st.strategy_pools) ? st.strategy_pools : [])
+      setShortBook(st.short_book || null)
       if (!en) {
         // 关闭后清空持仓/成交/订单/净值，避免残留旧数据让用户误以为仍有持仓
         setPositions([])
@@ -837,6 +840,56 @@ export default function Paper() {
               {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} style={{ stroke: '#eef0f3' }} />)}
             </svg>
           ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>净值数据不足（自动撮合开启并产生成交后显示）</div>}
+        </Card>
+      )}
+
+      {/* §SHORT-4 融券做空卡：做空池启用时显示（负持仓/担保/利息/权益 + 手动买回） */}
+      {shortBook?.enabled && (
+        <Card title={<span>融券做空 <em style={{ color: '#888', fontSize: 12, fontStyle: 'normal' }}>（独立做空池 · 做空战法信号自动开仓 · T+1 可平）</em></span>} style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 8 }}>
+            <StatCard label="做空权益">¥{fmt(shortBook.equity)}</StatCard>
+            <StatCard label="池内可用现金">¥{fmt(shortBook.cash)}</StatCard>
+            <StatCard label="冻结保证金">¥{fmt(shortBook.margin_used)}</StatCard>
+            <StatCard label="浮动盈亏">
+              <span style={{ color: shortBook.floating_pnl >= 0 ? UP : DOWN }}>
+                {(shortBook.floating_pnl >= 0 ? '+' : '')}¥{fmt(shortBook.floating_pnl)}
+              </span>
+            </StatCard>
+            <StatCard label="已实现盈亏">
+              <span style={{ color: shortBook.realized >= 0 ? UP : DOWN }}>
+                {(shortBook.realized >= 0 ? '+' : '')}¥{fmt(shortBook.realized)}
+              </span>
+            </StatCard>
+            <StatCard label="已计融券利息">¥{fmt(shortBook.fee_accrued)}</StatCard>
+          </div>
+          {(shortBook.positions || []).length ? (
+            <Table rowKey="code" size="small" data={shortBook.positions}
+              columns={[
+                { colKey: 'code', title: '代码', width: 90 },
+                { colKey: 'name', title: '名称', width: 100 },
+                { colKey: 'strategy', title: '触发战法', width: 120, cell: ({ row }) => <Tag theme="danger" size="small">{row.strategy}</Tag> },
+                { colKey: 'qty', title: '欠券数', width: 80 },
+                { colKey: 'open_price', title: '开仓价', width: 90, cell: ({ row }) => row.open_price?.toFixed(2) },
+                { colKey: 'mark', title: '现价', width: 90, cell: ({ row }) => row.mark?.toFixed(2) },
+                { colKey: 'float', title: '浮动盈亏', width: 130, cell: ({ row }) => {
+                  const pnl = (row.open_price - row.mark) * row.qty - (row.fee_accrued || 0)
+                  const base = row.margin_used > 0 ? row.margin_used : row.open_price * row.qty
+                  return (
+                    <span style={{ color: pnl >= 0 ? UP : DOWN }}>
+                      {(pnl >= 0 ? '+' : '')}¥{fmt(pnl)} <em style={{ fontStyle: 'normal', fontSize: 12 }}>({(pnl / base * 100).toFixed(1)}%)</em>
+                    </span>
+                  )
+                } },
+                { colKey: 'fee', title: '已计息', width: 80, cell: ({ row }) => fmt(row.fee_accrued || 0) },
+                { colKey: 'op', title: '操作', width: 90, cell: ({ row }) => (
+                  <Button size="small" variant="outline" theme="primary" disabled={!isAdmin}
+                    onClick={async () => {
+                      try { const r = await api.shortCoverPaper(row.code, 0); showToast(`买回成交，实现盈亏 ${r.realized >= 0 ? '+' : ''}\u00a5${fmt(r.realized)}`, 'success'); load() }
+                      catch (e) { showToast(e.message || '买回失败', 'error') }
+                    }}>买回平仓</Button>
+                ) },
+              ]} />
+          ) : <div className="muted" style={{ padding: 8 }}>暂无融券空头（做空战法信号触发后自动开仓）</div>}
         </Card>
       )}
 

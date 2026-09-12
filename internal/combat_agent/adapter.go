@@ -14,13 +14,21 @@
 package combat_agent
 
 import (
+	"strings"
+	"time"
+
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/indicator"
 	"quant-trading-v2/internal/sector_agent"
+	"quant-trading-v2/internal/strategies/break_down"
 	"quant-trading-v2/internal/strategies/double_bump"
 	"quant-trading-v2/internal/strategies/dragon"
 	"quant-trading-v2/internal/strategies/dragon_return"
+	"quant-trading-v2/internal/strategies/good_news_fade"
+	"quant-trading-v2/internal/strategies/high_churn"
+	"quant-trading-v2/internal/strategies/leader_decay"
 	"quant-trading-v2/internal/strategies/n_shape"
+	"quant-trading-v2/internal/strategies/shortbase"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -248,9 +256,213 @@ func evalFor(runner StrategyRunner, code string, md *strategy_engine.StockMarket
 		// N形：日K A波 + 日内快照 B段 + 上下文（含情绪硬闸 + D1 事件 + PE）
 		// English: N-shape — daily A-wave + intraday B-snapshot + context (emotion gate, D1 event, PE).
 		return st.EvaluateWave(buildWaveA(md, sector), buildIntradayB(md), buildCtx(md, emotionPhase, d1, eventDesc, pe))
+	case *high_churn.Strategy, *break_down.Strategy, *leader_decay.Strategy, *good_news_fade.Strategy:
+		// §SHORT-1 做空四战法：统一消费适配层派生的 shortbase.Data（一次派生四战法共享）。
+		// 常规路径由 ScanShort→evalShort 直接注入预派生 sd；此分支兜底任何走 evalFor 的调用方。
+		// English: bear tactics consume the adapter-derived shared shortbase.Data.
+		return runner.Strategy.Evaluate(code, buildShortData(code, md, sector, nil, "", false, 0))
 	default:
 		// 未知/未特化策略 → 回退到策略默认评估接口
 		// English: unknown/non-specialized strategy → fall back to the default Evaluate.
 		return runner.Strategy.Evaluate(code, md)
 	}
+}
+
+// buildShortData §SHORT-1 从行情快照派生做空战法共享输入（一次计算，四战法只读评分）。
+//
+// 派生内容：均线族 / 60日高与20日低 / 近20日涨幅 / 量能族（5日/20日均量、当日量比）/
+// 滞涨与K线走弱（近3日区间涨幅、上影占比、破5日、连续阴线）/ 破位（20日线、20日低、深度）/
+// 连板序列（板感知 LimitUpPct 由日K推断，不依赖外部涨停池）/ 今日触板与封板 / 分钟K 14:30 后回封 /
+// 利好事件窗（近5交易日该股利好简报：年龄/强度/传导标记/事件日收盘）/ 情绪相位与板块退潮。
+//
+// 参数：
+//   - code: 股票代码
+//   - md: 引擎行情数据快照（日K尾部已 attachLiveBar 合成当日实时 bar）
+//   - input: 本轮扫描输入（News/HeldCodes/SectorLimitUpDrop/EmotionPhase 来源，可为 nil）
+//   - sector: 板块上下文（可为 nil；板块名用于查涨停家数降幅）
+//
+// 返回值：
+//   - 做空战法共享输入指针（KLines 为引用，战法只读）
+//
+// （buildShortData derives the shared bear-tactic input from market data in one pass.）
+func buildShortData(code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, input *ScanInput, sectorName string, held bool, sectorDrop float64) *shortbase.Data {
+	sd := &shortbase.Data{
+		Code:         code,
+		Name:         md.Name,
+		Price:        md.Price,
+		ChangePct:    md.ChangePct,
+		EmotionPhase: input.emotionPhase(),
+		Held:         held,
+	}
+	if input != nil && input.SectorLimitUpDrop != nil && sectorName != "" {
+		sectorDrop = input.SectorLimitUpDrop[sectorName]
+	}
+	sd.SectorLimitUpDropPct = sectorDrop
+	kl := md.KLines
+	n := len(kl)
+	if n == 0 {
+		return sd
+	}
+	sd.KLines = kl
+	last := kl[n-1]
+	if n >= 2 {
+		sd.PrevClose = kl[n-2].Close
+	}
+	sd.MA5 = ma(kl, 5)
+	sd.MA10 = ma(kl, 10)
+	sd.MA20 = ma(kl, 20)
+
+	// 位置族：60日最高收盘 / 20日最低收盘（不含今日）/ 近20日涨幅 / 现价相对60日高
+	hiStart := n - 60
+	if hiStart < 0 {
+		hiStart = 0
+	}
+	for i := hiStart; i < n; i++ {
+		if kl[i].Close > sd.High60 {
+			sd.High60 = kl[i].Close
+		}
+	}
+	lowStart := n - 21
+	if lowStart < 0 {
+		lowStart = 0
+	}
+	lowEnd := n - 1 // 20日最低不含今日（今日收盘破之才算破位）
+	if lowEnd <= lowStart {
+		lowEnd = lowStart + 1
+	}
+	for i := lowStart; i < lowEnd && i < n; i++ {
+		if sd.Low20 == 0 || kl[i].Close < sd.Low20 {
+			sd.Low20 = kl[i].Close
+		}
+	}
+	if gStart := n - 21; gStart >= 0 && kl[gStart].Close > 0 {
+		sd.Gain20 = (last.Close - kl[gStart].Close) / kl[gStart].Close
+	}
+	if sd.High60 > 0 {
+		sd.PosHigh = md.Price / sd.High60
+	}
+
+	// 量能族
+	sd.Vol5 = avgVol(kl, 5)
+	sd.Vol20 = avgVol(kl, 20)
+	if sd.Vol20 > 0 {
+		sd.VolRatio5_20 = sd.Vol5 / sd.Vol20
+	}
+	if sd.Vol5 > 0 {
+		sd.TodayVolVs5d = last.Volume / sd.Vol5
+	}
+
+	// 滞涨与走弱族
+	if n >= 4 && kl[n-4].Close > 0 {
+		sd.Last3RangePct = (last.Close - kl[n-4].Close) / kl[n-4].Close * 100
+	}
+	if rng := last.High - last.Low; rng > 0 {
+		sd.UpperShadowPct = (last.High - last.Close) / rng
+	}
+	sd.BelowMA5 = sd.MA5 > 0 && last.Close < sd.MA5
+	for i := n - 1; i >= 1; i-- {
+		if kl[i].Close < kl[i-1].Close {
+			sd.ConsecDownDays++
+		} else {
+			break
+		}
+	}
+
+	// 破位族：收盘破20日线 / 破20日最低，深度取相对被破位的百分比
+	if sd.MA20 > 0 && last.Close < sd.MA20 {
+		sd.BreakMA20 = true
+		sd.BreakDepthPct = (sd.MA20 - last.Close) / sd.MA20 * 100
+	}
+	if sd.Low20 > 0 && last.Close < sd.Low20 {
+		sd.BreakLow20 = true
+		if d := (sd.Low20 - last.Close) / sd.Low20 * 100; d > sd.BreakDepthPct {
+			sd.BreakDepthPct = d
+		}
+	}
+
+	// 连板族（板感知，由日K涨幅推断）：今日之前连板数 / 今日触板 / 今日封板 / 分钟回封
+	sd.LimitUpPct = data.LimitUpPct(code, md.Name)
+	if sd.LimitUpPct > 0 && n >= 2 {
+		boardPx := sd.PrevClose * (1 + sd.LimitUpPct/100)
+		sd.TouchedBoardToday = last.High >= boardPx*0.998
+		sd.SealedToday = last.Close >= boardPx*0.995
+		// 今日之前：从倒数第二根往前数涨幅≥板幅（容忍0.2个百分点的四舍五入误差）
+		for i := n - 2; i >= 1; i-- {
+			prev := kl[i-1].Close
+			if prev <= 0 {
+				break
+			}
+			if kl[i].Close/prev-1 >= (sd.LimitUpPct-0.2)/100 {
+				sd.ConsecBoards++
+			} else {
+				break
+			}
+		}
+		// 分钟K 14:30 后回封（断板反包保护）：任一 14:30 之后的 5 分钟 bar 收盘≥板价
+		for _, mb := range md.MinuteKLine {
+			t := mb.Date
+			if (t.Hour() > 14 || (t.Hour() == 14 && t.Minute() >= 30)) && mb.Close >= boardPx*0.995 {
+				sd.AfternoonReseal = true
+				break
+			}
+		}
+	}
+
+	// 事件窗族（利好兑现砸盘）：近5交易日该股最新利好简报
+	if input != nil && len(input.News) > 0 {
+		var best *NewsBrief
+		var bestT time.Time
+		for i := range input.News[code] {
+			b := &input.News[code][i]
+			if !b.Positive {
+				continue
+			}
+			t, err := time.ParseInLocation("2006-01-02 15:04:05", b.Time, time.Local)
+			if err != nil {
+				continue
+			}
+			if best == nil || t.After(bestT) {
+				best, bestT = b, t
+			}
+		}
+		if best != nil {
+			// 事件日=日K中首个 Date≥事件日 的 bar；年龄=该 bar 距末根的交易日数；超5交易日不在窗
+			idx := -1
+			for i := 0; i < n; i++ {
+				if !kl[i].Date.Before(bestT.Truncate(24 * time.Hour)) {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 {
+				age := n - 1 - idx
+				if age <= 5 {
+					sd.EventInWindow = true
+					sd.EventAgeDays = age
+					sd.EventScore = absF(best.Score)
+					sd.EventPropagation = best.Level != "" && !strings.Contains(best.Level, "个股")
+					sd.EventDayClose = kl[idx].Close
+				}
+			}
+		}
+	}
+	return sd
+}
+
+// absF 浮点绝对值小工具（避免为单点引入 math 包依赖扩散）。
+// （absF returns the absolute value of f.）
+func absF(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// emotionPhase 安全读取扫描输入的情绪相位（input 为 nil 时返回空）。
+// （emotionPhase nil-safely reads the emotion phase from a ScanInput.）
+func (in *ScanInput) emotionPhase() string {
+	if in == nil {
+		return ""
+	}
+	return in.EmotionPhase
 }

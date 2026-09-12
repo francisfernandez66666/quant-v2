@@ -46,6 +46,8 @@ export default function MsgCenter() {
   const [alerts, setAlerts] = useState([])
   const [activeFilter, setActiveFilter] = useState('all')
   const [activeStrategy, setActiveStrategy] = useState('all')
+  // §SHORT-4 做空显隐（决策⑤）：开关关闭时隐藏做空方向/做空战法消息
+  const [shortEnabled, setShortEnabled] = useState(false)
 
   const timerRef = useRef(null)      // 轮询定时器句柄
   const unsubSSERef = useRef(null)   // SSE 取消订阅函数引用
@@ -66,6 +68,11 @@ export default function MsgCenter() {
   // 根据等级与战法筛选消息列表
   const filteredAlerts = useMemo(() => {
     let list = alerts
+    // §SHORT-4 做空消息显隐：关闭时过滤掉做空方向与四做空战法消息
+    if (!shortEnabled) {
+      const bearTactics = ['高位滞涨', '放量破位', '龙头断板', '利好兑现砸盘']
+      list = list.filter(a => a.direction !== '做空' && !bearTactics.includes(a.strategy))
+    }
     // 按等级过滤
     if (activeFilter === 'hit') list = list.filter(a => a.level === '命中提醒')
     if (activeFilter === 'trade') list = list.filter(a => a.level === '交易信号')
@@ -81,7 +88,7 @@ export default function MsgCenter() {
       list = list.filter(a => a.strategy !== '预期差')
     }
     return list
-  }, [alerts, activeFilter, activeStrategy])
+  }, [alerts, activeFilter, activeStrategy, shortEnabled])
 
   // 根据消息等级与方向返回卡片左边框颜色
   function alertBorder(a) {
@@ -170,6 +177,8 @@ export default function MsgCenter() {
   // 挂载时加载消息、启动轮询并订阅 SSE；卸载时清理
   useEffect(() => {
     load()
+    // §SHORT-4 探测做空开关（关闭时消息列表隐藏做空内容）
+    api.fetchShortStatus().then((r) => setShortEnabled(!!r.short_enabled)).catch(() => {})
     timerRef.current = setInterval(load, 15000) // 每 15s 轮询刷新消息列表
     api.connectSSE()
     unsubSSERef.current = api.onSSE(handleSSE)

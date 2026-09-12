@@ -223,12 +223,32 @@ func main() {
 	// When enabled, the engine auto-fills buy signals at the live snapshot price; rules.paper in
 	// config.json controls the switch and parameters.
 	paperCfg := cfgMgr.Rules.Paper
+	// §SHORT-3 零值归一：保证金率/年化费率/止损涨幅未配置时取 paper.DefaultConfig 真实口径
+	// （0 会退化为「无保证金约束/免费/无止损」，均不可接受）。
+	pd := paper.DefaultConfig()
+	shortMarginRate, shortFeeAnnual, shortStopPct := paperCfg.ShortMarginRate, paperCfg.ShortFeeAnnual, paperCfg.ShortStopLossPct
+	if shortMarginRate <= 0 {
+		shortMarginRate = pd.ShortMarginRate
+	}
+	if shortFeeAnnual <= 0 {
+		shortFeeAnnual = pd.ShortFeeAnnual
+	}
+	if shortStopPct <= 0 {
+		shortStopPct = pd.ShortStopLossPct
+	}
 	paperEngine := paper.New(paper.Config{
 		Enabled:        paperCfg.Enabled,
 		FixedAmount:    paperCfg.FixedAmount,
 		MaxPositions:   paperCfg.MaxPositions,
 		InitialCapital: paperCfg.InitialCapital,
 		AutoSell:       paperCfg.AutoSell == nil || *paperCfg.AutoSell, // 未配置默认全自动卖出
+		// §SHORT-3 融券做空侧：预算未配=池不开设（整侧关闭）；费率/保证金/止损零值回退默认。
+		ShortEnabled:     paperCfg.ShortEnabled == nil || *paperCfg.ShortEnabled,
+		ShortCapital:     paperCfg.ShortCapital,
+		ShortMarginRate:  shortMarginRate,
+		ShortFeeAnnual:   shortFeeAnnual,
+		ShortFixedAmount: paperCfg.ShortFixedAmount,
+		ShortStopLossPct: shortStopPct,
 	}, filepath.Join(dataDir, "paper.json"))
 	srv.SetPaper(paperEngine)
 	if paperEngine.Enabled() {

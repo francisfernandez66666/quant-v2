@@ -61,6 +61,20 @@ type Config struct {
 	// English: re-entry cooldown (minutes, §R1.4) — 0 = unlimited (legacy default); >0 blocks re-buying
 	// the same code within the window after a full close. Configurable via rules.paper.reentry_cooldown_min.
 	ReentryCooldownMin int `json:"reentry_cooldown_min"`
+
+	// §SHORT-3 纸面融券做空（模拟盘做空侧，决策④）：做空战法信号 → 融券卖出开仓（负持仓），
+	// 下跌买回平仓获利、上涨触发做空止损；独立做空资金池 shortCash，与做多池完全隔离，
+	// 净值并入总账户。ShortCapital=0 即整条做空侧关闭（默认，影子期安全）。
+	// English: §SHORT-3 paper short-selling book — bear-tactic signals open short positions in a
+	// dedicated margin pool (shortCash, isolated from the long pools); drops profit on buy-back,
+	// stop-loss on rallies; equity merges into the total curve. ShortCapital=0 disables the side
+	// entirely (the safe shadow-run default).
+	ShortEnabled     bool    `json:"short_enabled"`       // 融券做空开关（缺省配合 ShortCapital>0 生效）
+	ShortCapital     float64 `json:"short_capital"`       // 做空池初始预算（元；0=不开设做空池）
+	ShortMarginRate  float64 `json:"short_margin_rate"`   // 融券开仓保证金率（默认 0.5）
+	ShortFeeAnnual   float64 `json:"short_fee_annual"`    // 融券年化费率（默认 0.083，按日对开仓名义额计提）
+	ShortFixedAmount float64 `json:"short_fixed_amount"`  // 单笔融券开仓名义预算（元；0=回退 FixedAmount）
+	ShortStopLossPct float64 `json:"short_stop_loss_pct"` // 做空止损：价格上涨超开仓价该百分比强制买回（默认 8；≤0=关闭，仅靠信号/手动平仓）
 }
 
 // DefaultConfig 返回模拟盘出厂默认配置。
@@ -80,6 +94,13 @@ func DefaultConfig() Config {
 		CommissionRate: 0.00025,
 		StampTaxRate:   0.0005,
 		MinCommission:  5,
+		// §SHORT-3 融券做空默认：开关开但预算 0 = 做空池未开设（影子期安全默认），
+		// 后台配 ShortCapital>0 才真正开仓；保证金/费率/止损用真实券商口径默认值。
+		ShortEnabled:     true,
+		ShortCapital:     0,
+		ShortMarginRate:  0.5,
+		ShortFeeAnnual:   0.083,
+		ShortStopLossPct: 8,
 	}
 }
 
@@ -290,6 +311,15 @@ type Stats struct {
 	MaxDrawdown float64 `json:"max_drawdown_pct,omitempty"` // 最大回撤%
 	Calmar      float64 `json:"calmar,omitempty"`           // Calmar 比率
 	Expectancy  float64 `json:"expectancy_pct,omitempty"`   // 每笔期望收益率%
+	// §SHORT-3 融券做空侧统计（做空池未开设时全为 0，前端按 enabled 显隐）。
+	// English: §SHORT-3 short-book stats (all zero when the pool isn't funded; the frontend gates on enabled).
+	ShortEnabled    bool    `json:"short_enabled,omitempty"`     // 做空侧是否启用
+	ShortCash       float64 `json:"short_cash,omitempty"`        // 做空池可用现金
+	ShortMarginUsed float64 `json:"short_margin_used,omitempty"` // 冻结保证金合计
+	ShortFloatPnl   float64 `json:"short_float_pnl,omitempty"`   // 空头浮动盈亏合计
+	ShortRealized   float64 `json:"short_realized,omitempty"`    // 空头已实现盈亏累计
+	ShortPositions  int     `json:"short_positions,omitempty"`   // 空头持仓数
+	ShortEquity     float64 `json:"short_equity,omitempty"`      // 做空侧权益（现金+保证金+浮动）
 }
 
 // StrategyPoolState 一个战法资金池的展示快照（前端分仓条）。
@@ -417,6 +447,18 @@ type Engine struct {
 	// full active buy set each round, an unfillable code would log a rejected order every 5s; the same
 	// reason is audited once. Cleared on a successful fill.
 	lastBuyReject map[string]string
+
+	// §SHORT-3 融券做空侧（详见 short.go）：独立做空池 shortCash（预算，与做多 cash/pools
+	// 完全隔离）+ 负持仓表 shorts + 已实现盈亏 shortRealized + 利息按日计提去重表 shortFeeDone。
+	// 净值口径：总资产 = 做多(cash+mv) + 做空(shortCash + Σ担保占用 + 浮动盈亏)。
+	// English: §SHORT-3 paper short book — a dedicated margin budget (shortCash, fully isolated from
+	// the long cash/pools), negative positions (shorts), realized P&L and per-day fee accrual dedup.
+	// Equity = long (cash+mv) + short (shortCash + Σ frozen margin + floating P&L).
+	shorts        map[string]*ShortPosition // 融券负持仓：code → 空头
+	shortCash     float64                   // 做空池可用现金（扣除保证金占用与费用后）
+	shortRealized float64                   // 做空已实现盈亏（买回平仓结算，含费用）
+	shortFeeDone  map[string]string         // 融券利息计提去重：code → 已计提交易日
+	shortOpenSeen map[string]string         // 开仓信号去重：code → 触发交易日（同日同码只下一笔融券单）
 }
 
 // New 创建模拟盘引擎并加载历史持久化数据。
@@ -444,7 +486,15 @@ func New(cfg Config, path string) *Engine {
 		reEntry:        newReEntryTracker(), // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
 		buyConfirm:     make(map[string]time.Time),
 		lastBuyReject:  make(map[string]string),
-		path:           path,
+		// §SHORT-3 做空侧初始化：shortCash 预算仅在 ShortCapital>0 时开设（默认 0=关闭）。
+		// load() 若磁盘已有做空持仓则保留恢复值不覆盖（见 paper.go load）。
+		// English: §SHORT-3 — seed the short budget only when ShortCapital>0; load() overrides with
+		// persisted state when a short book already exists.
+		shorts:        make(map[string]*ShortPosition),
+		shortCash:     cfg.ShortCapital,
+		shortFeeDone:  make(map[string]string),
+		shortOpenSeen: make(map[string]string),
+		path:          path,
 	}
 	if path != "" {
 		e.load()
@@ -490,6 +540,13 @@ func (e *Engine) UpdateConfig(cfg Config) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cfg = cfg
+	// §SHORT-3 预算后配：做空池尚未开设（现金 0 且无负债）且新配置给了预算 → 即时开设。
+	// 已有空头持仓时不重播预算（磁盘恢复的 shortCash 为准，防资金凭空放大）。
+	// English: §SHORT-3 — a later-funded short budget opens the pool lazily when it is still empty;
+	// never replayed while shorts are open (persisted cash rules, no phantom capital).
+	if e.shortCash == 0 && cfg.ShortCapital > 0 && len(e.shorts) == 0 {
+		e.shortCash = cfg.ShortCapital
+	}
 }
 
 // SetMirror 注入账本镜像回调（阶段1.2 两本账合一，由 engine/registry 在创建账号模拟盘时调用）。
@@ -582,6 +639,15 @@ type persistedState struct {
 	PoolIR       map[string]float64      `json:"pool_ir,omitempty"`
 	HasFilled    bool                    `json:"has_filled"`               // 是否已发生成交
 	PoolBuyRules map[string]*PoolBuyRule `json:"pool_buy_rules,omitempty"` // 每池买入规则
+	// §SHORT-3 融券做空侧持久化：负持仓表 / 做空池现金 / 做空已实现 / 利息计提与开仓去重表。
+	// 旧文件无这些字段 → load 零值兼容（做空池未开设，行为与纯做多账本完全一致）。
+	// English: §SHORT-3 — persisted short book (positions / margin pool cash / realized / fee & open
+	// dedup). Legacy files without them load as "short book never opened", identical to long-only.
+	Shorts        map[string]*ShortPosition `json:"shorts,omitempty"`
+	ShortCash     float64                   `json:"short_cash,omitempty"`
+	ShortRealized float64                   `json:"short_realized,omitempty"`
+	ShortFeeDone  map[string]string         `json:"short_fee_done,omitempty"`
+	ShortOpenSeen map[string]string         `json:"short_open_seen,omitempty"`
 }
 
 // tradeRetention 成交日志保留时长：3 个月，供战法效果/滑点/延迟分析。
@@ -614,6 +680,12 @@ func (e *Engine) persist() {
 		PoolBuyRules:   e.poolBuyRules,
 		PoolGrp:        e.poolGrp,
 		PoolIR:         e.poolIR,
+		// §SHORT-3 做空侧落盘（负持仓/池现金/已实现/计提与去重表）
+		Shorts:        e.shorts,
+		ShortCash:     e.shortCash,
+		ShortRealized: e.shortRealized,
+		ShortFeeDone:  e.shortFeeDone,
+		ShortOpenSeen: e.shortOpenSeen,
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -718,6 +790,23 @@ func (e *Engine) load() {
 	// English: restore order lifecycle (legacy data without the field → empty list).
 	if st.Orders != nil {
 		e.orders = st.Orders
+	}
+	// §SHORT-3 恢复做空侧：存在持久化空头/池现金时以磁盘为准覆盖 New 的预算初值
+	// （shortCash 在 New 用 cfg.ShortCapital 播种，重启后必须以实际余额恢复，防预算重置资金凭空放大）。
+	// English: §SHORT-3 — restore the short book; persisted cash overrides the New-time budget seed
+	// so restarts never inflate the margin pool back to its configured capital.
+	if st.Shorts != nil {
+		e.shorts = st.Shorts
+	}
+	if st.ShortCash > 0 || len(st.Shorts) > 0 || st.ShortRealized != 0 {
+		e.shortCash = st.ShortCash
+	}
+	e.shortRealized = st.ShortRealized
+	if st.ShortFeeDone != nil {
+		e.shortFeeDone = st.ShortFeeDone
+	}
+	if st.ShortOpenSeen != nil {
+		e.shortOpenSeen = st.ShortOpenSeen
 	}
 	e.backfillPoolPerfLocked()
 	e.trimTradesLocked()
@@ -861,6 +950,18 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 	buySeen := make(map[string]struct{})
 	for i := range sigs {
 		s := sigs[i]
+		// §SHORT-3 融券做空侧：做空战法通过信号（sell=持仓走弱卖出 / watch=纯做空机会）先落独立
+		// 做空账本（幂等：已空/同日同码去重/池未开则整步 no-op）；持多仓的 sell 信号随后仍走
+		// SellAction=close 平多（决策②），两本账互不挪用资金。
+		// English: §SHORT-3 — bear-tactic pass signals first feed the isolated short book (idempotent:
+		// already short / same-day dedup / pool not funded → no-op); held longs still close via the
+		// SellAction branch below, the two books never share cash.
+		if s.Direction == "做空" && combat_agent.IsShortTactic(s.StrategyType) {
+			e.shortOpenFromSignalLocked(&s, quotes)
+			if s.Action != "sell" {
+				continue // watch 信号只做空开仓，不再进入做多/平多分支
+			}
+		}
 		// 卖出信号自动成交（阶段1.1 全自动执行）：清仓/硬止盈/硬止损 → 全平；减仓类 → 半仓
 		// （每码每日一次）。非本账持仓（如手动记录账）自然跳过。
 		// English: auto-execute sell signals (full-auto) — 清仓/hard-TP/hard-SL close fully; trim-type
@@ -871,6 +972,13 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		}
 		if s.Direction == "做空" || s.Action != "buy" {
 			continue
+		}
+		// §SHORT-3 做多信号回补：该股存在融券空头时按现价买回平仓（T+1 未解禁则本轮跳过，
+		// 下轮探针重试）；不影响本笔多头买入撮合。
+		// English: §SHORT-3 — a bull buy signal covers any open short on the same code at the live
+		// price (T+1-locked covers retry next round); the long fill proceeds independently.
+		if _, isShort := e.shorts[s.Code]; isShort {
+			e.shortCoverLocked(s.Code, 0, "做多信号回补平仓", quotes, now)
 		}
 		if e.buyConfirm != nil {
 			buySeen[s.Code] = struct{}{}
@@ -1479,6 +1587,9 @@ func (e *Engine) MarkToMarket(quotes map[string]*data.StockInfo) {
 	if changed {
 		e.persist()
 	}
+	// §SHORT-3 做空侧估值：刷新空头现价 + 按日计提融券利息 + 涨幅止损强制买回。
+	// English: §SHORT-3 — mark the short book, accrue daily lending interest, force-cover rallies.
+	e.shortMarkToMarketLocked(quotes)
 }
 
 // Snapshot 记录当日净值（同一交易日只保留最新一个点）。
@@ -1500,7 +1611,9 @@ func (e *Engine) Snapshot(now time.Time) {
 	defer e.mu.Unlock()
 	date := cntime.DayOf(now) // §TZ1
 	mv := e.marketValueLocked()
-	val := e.cash + mv
+	// §SHORT-3 净值并入做空侧（shortCash + 担保占用 + 浮动盈亏，见 shortEquityLocked）。
+	// English: §SHORT-3 — total equity includes the short book (cash + frozen margin + floating P&L).
+	val := e.cash + mv + e.shortEquityLocked()
 	if len(e.equity) > 0 && e.equity[len(e.equity)-1].Date == date {
 		last := &e.equity[len(e.equity)-1]
 		if last.Value == val && last.Cash == e.cash {
@@ -1954,6 +2067,15 @@ func (e *Engine) Reset() {
 	// "liquidate and restart clean" contract.
 	e.poolDiscipline = make(map[string]poolDiscipline)
 	e.reEntry = newReEntryTracker()
+	// §SHORT-3 做空侧同步清盘：空头清零、池现金按预算重新开设（融券负债随持仓一并注销，
+	// 纸面无真实对手方）。
+	// English: §SHORT-3 — the global reset also liquidates the short book and re-funds the margin
+	// pool from configured capital (paper-only, no real counterparty).
+	e.shorts = make(map[string]*ShortPosition)
+	e.shortCash = e.cfg.ShortCapital
+	e.shortRealized = 0
+	e.shortFeeDone = make(map[string]string)
+	e.shortOpenSeen = make(map[string]string)
 	e.rebuildPoolsLocked() // 现金恢复后按当前池集合重新均分
 	e.persist()
 }
@@ -2256,11 +2378,37 @@ func (e *Engine) statsFor(poolKey *string) Stats {
 		TotalValue:    total,
 		OpenPositions: openPos,
 	}
+	// §SHORT-3 做空侧统计并入全局总账（分池统计不动，融券是账户级而非战法池级）。
+	// 启用时把做空权益计入 TotalValue/收益基准，并把做空池预算并入初始资金分母。
+	// English: §SHORT-3 — fold short-book stats into the account-level summary (pools are per-strategy
+	// and stay untouched). When funded, short equity is added to TotalValue and the short budget to
+	// the initial-capital denominator, so returns stay honest about the extra deployed capital.
+	if e.shortBookEnabledLocked() {
+		shortEq := e.shortEquityLocked()
+		margins, floatPnl := 0.0, 0.0
+		for _, s := range e.shorts {
+			margins += s.MarginUsed
+			floatPnl += s.FloatPnl()
+		}
+		total += shortEq
+		st.TotalValue = round2(total)
+		st.ShortEnabled = true
+		st.ShortCash = round2(e.shortCash)
+		st.ShortMarginUsed = round2(margins)
+		st.ShortFloatPnl = round2(floatPnl)
+		st.ShortRealized = round2(e.shortRealized)
+		st.ShortPositions = len(e.shorts)
+		st.ShortEquity = round2(shortEq)
+	}
 	if global {
 		st.InitialCapital = e.cfg.InitialCapital
 		st.RealizedPnl = e.realized
-		if e.cfg.InitialCapital > 0 {
-			st.TotalReturnPct = (total - e.cfg.InitialCapital) / e.cfg.InitialCapital * 100
+		if e.shortBookEnabledLocked() {
+			st.InitialCapital += e.cfg.ShortCapital // 融券预算计入总本金（收益分母与实际部署资金一致）
+			st.RealizedPnl += e.shortRealized       // 已实现盈亏含融券侧结算
+		}
+		if st.InitialCapital > 0 {
+			st.TotalReturnPct = (total - st.InitialCapital) / st.InitialCapital * 100
 		}
 		// 当日收益：最新净值 vs 前一交易日净值
 		if len(e.equity) >= 2 {

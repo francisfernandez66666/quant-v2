@@ -160,6 +160,16 @@ type PaperConfig struct {
 	// Discipline 统一止盈止损纪律（探针+扳机）参数。实盘与模拟盘共用同一套口径。
 	// English: unified stop-loss/take-profit discipline (probe+trigger) parameters; shared by real and paper.
 	Discipline DisciplineConfig `json:"discipline,omitempty"`
+	// §SHORT-3 融券做空侧（决策④）：ShortCapital>0 才开设做空池（默认 0=整侧关闭，影子期安全）。
+	// 保证金率/年化费率/单笔名义预算/止损涨幅可配，零值走 paper.DefaultConfig 真实券商口径。
+	// English: §SHORT-3 margin-short side — the pool is funded only when ShortCapital>0 (0 = side off,
+	// the safe shadow default); rate/budget/stop normalize to broker-real defaults when zero.
+	ShortEnabled     *bool   `json:"short_enabled,omitempty"` // 融券开关（nil=启用，配合 ShortCapital>0）
+	ShortCapital     float64 `json:"short_capital"`           // 做空池预算（元；0=不开设）
+	ShortMarginRate  float64 `json:"short_margin_rate"`       // 保证金率（默认 0.5）
+	ShortFeeAnnual   float64 `json:"short_fee_annual"`        // 融券年化费率（默认 0.083）
+	ShortFixedAmount float64 `json:"short_fixed_amount"`      // 单笔融券名义预算（元；0=回退 FixedAmount）
+	ShortStopLossPct float64 `json:"short_stop_loss_pct"`     // 做空止损涨幅%（默认 8）
 }
 
 // QMTAdviceConfig 持仓处理分析层（实盘持仓）规则参数：加仓/格局判定阈值。
@@ -909,6 +919,36 @@ type StrategyConfig struct {
 	Momentum MomentumConfig `json:"momentum"`
 	// 宏观利空门控配置
 	MacroGate MacroGateConfig `json:"macro_gate"`
+	// §SHORT-1 做空四战法配置（高位滞涨/放量破位/龙头断板/利好兑现砸盘）
+	Short ShortStrategiesConfig `json:"short"`
+}
+
+// ShortStrategiesConfig §SHORT-1 做空战法配置（docs/SHORT_STRATEGIES_PLAN_20260912.md）。
+// 做空信号定位=卖出侧决策：受全局 short_enabled 门控，本配置为战法层参数。
+// 阈值字段 ≤0 时走代码默认（60/60/65/60），保证旧配置零迁移兼容。
+// （ShortStrategiesConfig configures the four bear-side tactics; zero thresholds fall back to code
+// defaults so existing configs need no migration.）
+type ShortStrategiesConfig struct {
+	// Enabled 做空战法层开关（缺省 nil=启用；实际还受全局 short_enabled 总闸门控）
+	Enabled *bool `json:"enabled"`
+	// HighChurnMin 高位滞涨通过门槛（默认 60）
+	HighChurnMin float64 `json:"high_churn_min"`
+	// BreakDownMin 放量破位通过门槛（默认 60）
+	BreakDownMin float64 `json:"break_down_min"`
+	// LeaderDecayMin 龙头断板通过门槛（默认 65，四战法最严——断板有反包风险）
+	LeaderDecayMin float64 `json:"leader_decay_min"`
+	// GoodNewsFadeMin 利好兑现砸盘通过门槛（默认 60）
+	GoodNewsFadeMin float64 `json:"good_news_fade_min"`
+	// MarginRate 模拟盘融券开仓保证金率（默认 0.5=50%，占用=数量×开仓价×保证金率）
+	MarginRate float64 `json:"margin_rate"`
+	// AnnualFeeRate 融券年化费率（默认 0.083=8.3%，按自然日对开仓名义额计提）
+	AnnualFeeRate float64 `json:"annual_fee_rate"`
+}
+
+// ShortTacticsEnabled 返回做空战法层开关（nil=默认启用）。
+// （ShortTacticsEnabled reports the tactic-layer switch; nil defaults to enabled.）
+func (s *ShortStrategiesConfig) ShortTacticsEnabled() bool {
+	return s.Enabled == nil || *s.Enabled
 }
 
 // MacroGateConfig 宏观利空门控（E1）：股指期货交割日等高影响宏观事件作为整体利空，

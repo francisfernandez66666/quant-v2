@@ -30,9 +30,11 @@ import (
 //   - Positive: 事件方向，true=利好事件，false=利空事件
 //   - Time: 新闻发布时间，格式为 YYYY-MM-DD HH:MM:SS
 type NewsBrief struct {
-	Title    string // 新闻标题
-	Positive bool   // 事件方向：true=利好 false=利空
-	Time     string // 新闻时间（YYYY-MM-DD HH:MM:SS）
+	Title    string  // 新闻标题
+	Positive bool    // 事件方向：true=利好 false=利空
+	Time     string  // 新闻时间（YYYY-MM-DD HH:MM:SS）
+	Score    float64 // 带符号事件强度分（|Score| 0~1，§SHORT-1 利好兑现战法消费）
+	Level    string  // 影响级别：个股/板块/宏观（板块级=传导注入，兑现战法打折）
 }
 
 // ScanInput 战法扫描输入，包含已验证板块、行情数据、D1评分等信息。
@@ -63,6 +65,11 @@ type ScanInput struct {
 	News             map[string][]NewsBrief                      // code → 关联新闻简报（预期差）
 	Scores           map[string]StockScores                      // 8a/8b 打分输出（engine 初始化，扫描写入）
 	EmotionPhase     string                                      // 情绪阶段（供 N 形评分）
+	// HeldCodes §SHORT-1 当前账号实盘/纸面持仓 code 集合：做空战法 sell 信号仅对持仓股发出，
+	// 非持仓降级 watch（规避提示）。nil 视为空集（全部按 watch 处理，安全侧）。
+	HeldCodes map[string]bool
+	// SectorLimitUpDrop §SHORT-1 板块名 → 当日涨停家数较昨日下降比例（0~1），供龙头断板情绪退潮因子。
+	SectorLimitUpDrop map[string]float64
 }
 
 // StockScores 单只股票的四战法原始分 + 动量分（8a/8b 持续打分输出）。
@@ -81,16 +88,18 @@ type ScanInput struct {
 //   - DataGaps: 数据缺口标记，key 为战法类型，true 表示该战法输入数据不足
 //   - UpdatedAt: 打分时间戳
 type StockScores struct {
-	Code              string          `json:"code"`          // 股票代码
-	NScore            float64         `json:"n_score"`       // N 形战法分（0~100）
-	DragonScore       float64         `json:"dragon_score"`  // 龙头战法分（0~100）
-	DoubleBumpScore   float64         `json:"db_score"`      // 双响炮战法分（0~100）
-	DragonReturnScore float64         `json:"dr_score"`      // 龙回头战法分（0~100）
-	MomentumScore     float64         `json:"m_score"`       // 动量分（量价+MACD+走势，0~100）
-	MomentumValid     bool            `json:"m_valid"`       // 动量分数据是否完整（量价/走势/MACD 任一缺失为 false）
-	SignalActive      bool            `json:"signal_active"` // 本轮是否有该股信号
-	DataGaps          map[string]bool `json:"data_gaps"`     // 数据缺口标记：key=战法类型，true=该战法输入数据不足（0 分不代表真实 0）
-	UpdatedAt         time.Time       `json:"updated_at"`    // 打分时间
+	Code              string  `json:"code"`         // 股票代码
+	NScore            float64 `json:"n_score"`      // N 形战法分（0~100）
+	DragonScore       float64 `json:"dragon_score"` // 龙头战法分（0~100）
+	DoubleBumpScore   float64 `json:"db_score"`     // 双响炮战法分（0~100）
+	DragonReturnScore float64 `json:"dr_score"`     // 龙回头战法分（0~100）
+	MomentumScore     float64 `json:"m_score"`      // 动量分（量价+MACD+走势，0~100）
+	MomentumValid     bool    `json:"m_valid"`      // 动量分数据是否完整（量价/走势/MACD 任一缺失为 false）
+	// ShortScore §SHORT-1 做空战法最高分（四做空战法取 max，0~100；仅做空扫描写入）
+	ShortScore   float64         `json:"short_score,omitempty"`
+	SignalActive bool            `json:"signal_active"` // 本轮是否有该股信号
+	DataGaps     map[string]bool `json:"data_gaps"`     // 数据缺口标记：key=战法类型，true=该战法输入数据不足（0 分不代表真实 0）
+	UpdatedAt    time.Time       `json:"updated_at"`    // 打分时间
 }
 
 // Signal 战法引擎输出的信号，包含方向、操作、置信度等信息。
@@ -251,8 +260,30 @@ func StrategyDisplayName(t string) string {
 		return "龙回头"
 	case strategy.SignalMomentum:
 		return "动量"
+	// §SHORT-1 做空四战法规范中文名（前端标签/消息中心去重键共用口径）
+	case strategy.SignalHighChurn:
+		return "高位滞涨"
+	case strategy.SignalBreakDown:
+		return "放量破位"
+	case strategy.SignalLeaderDecay:
+		return "龙头断板"
+	case strategy.SignalGoodNewsFade:
+		return "利好兑现砸盘"
 	}
 	return t
+}
+
+// IsShortTactic 判断策略类型是否四个做空战法之一（高位滞涨/放量破位/龙头断板/利好兑现砸盘）。
+// 做空战法的 sell 信号语义 = 卖出持仓多头（区别于旧做空词的开仓语义），SellAction 据此归一。
+// English: true if the strategy type is one of the four bear tactics; their "sell" action means
+// closing a held long (SellAction maps it to "close"), unlike legacy 做空 signals ("open short").
+func IsShortTactic(strategyType string) bool {
+	switch strategy.SignalType(strategyType) {
+	case strategy.SignalHighChurn, strategy.SignalBreakDown,
+		strategy.SignalLeaderDecay, strategy.SignalGoodNewsFade:
+		return true
+	}
+	return false
 }
 
 // NormalizeStrategyName 将任意别名（英文名/旧中文变体）转换为规范展示名。
@@ -281,6 +312,15 @@ func NormalizeStrategyName(name string) string {
 		return "龙回头"
 	case "momentum", "Momentum", "动量":
 		return "动量"
+	// §SHORT-1 做空四战法别名归一
+	case "high_churn", "HighChurn", "高位滞涨":
+		return "高位滞涨"
+	case "break_down", "BreakDown", "放量破位", "破位":
+		return "放量破位"
+	case "leader_decay", "LeaderDecay", "龙头断板", "断板":
+		return "龙头断板"
+	case "good_news_fade", "GoodNewsFade", "利好兑现砸盘", "利好兑现":
+		return "利好兑现砸盘"
 	}
 	return name
 }

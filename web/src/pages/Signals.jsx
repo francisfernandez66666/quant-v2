@@ -75,6 +75,9 @@ export default function Signals() {
   const [sheetSignal, setSheetSignal] = useState(null)
   // 模拟盘是否启用（决定是否显示「模拟买入」）
   const [paperOn, setPaperOn] = useState(false)
+  // §SHORT-4 做空开关（决策⑤）：关闭时列表整体隐藏做空信号；开启后追加方向筛选与红徽标
+  const [shortEnabled, setShortEnabled] = useState(false)
+  const [activeDir, setActiveDir] = useState('all')
   // 待确认交易的信号对象
   const [tradeTarget, setTradeTarget] = useState({})
   // 待确认交易动作（buy/ignore）
@@ -94,8 +97,13 @@ export default function Signals() {
   // 从信号列表中提取全部战法名称作为筛选下拉选项
   const strategyOptions = Array.from(new Set(signals.map((s) => s.strategy).filter(Boolean)))
 
+  // §SHORT-4 做空显隐（决策⑤）：开关关闭时做空战法信号不进列表；开启后按方向筛选
+  // English: short signals are hidden entirely while the switch is off; direction filter when on.
+  const dirScoped = shortEnabled
+    ? signals.filter((s) => activeDir === 'all' || (s.direction || '做多') === activeDir)
+    : signals.filter((s) => s.direction !== '做空')
   // 按等级筛选、战法筛选，并过滤掉「预期差」非标准评级信号
-  const filteredSignals = signals
+  const filteredSignals = dirScoped
     .filter((s) => (activeFilter !== 'all' ? s.remind_level === activeFilter : true))
     .filter((s) => (activeStrategy !== 'all' ? s.strategy === activeStrategy : true))
     // 过滤掉「预期差」战法（非标准评级信号，不在列表展示）
@@ -200,6 +208,11 @@ export default function Signals() {
     try { setPaperOn(!!(await api.fetchPaperState()).enabled) } catch (_) {}
   }
 
+  // §SHORT-4 探测做空开关（关闭时隐藏全部做空内容）
+  async function probeShort() {
+    try { setShortEnabled(!!(await api.fetchShortStatus()).short_enabled) } catch (_) {}
+  }
+
   // SSE 新信号或扫描到达时刷新列表
   function handleSSE(msg) {
     if (msg.signal || msg.type === 'scan') load()
@@ -209,6 +222,7 @@ export default function Signals() {
   useEffect(() => {
     load()
     probePaper()
+    probeShort()
     // 每 5s 轮询刷新信号列表
     timer.current = setInterval(load, 5000)
     visHandler.current = () => {
@@ -253,7 +267,17 @@ export default function Signals() {
         </div>
       ),
     },
-    { colKey: 'strategy', title: '策略', width: 90, sorter: sorterStr('strategy'), cell: ({ row }) => row.strategy },
+    {
+      colKey: 'strategy', title: '策略', width: 130, sorter: sorterStr('strategy'),
+      // §SHORT-4 做空战法信号：红「空」徽标 + 动作中文（卖出=持有个股走弱平仓 / 规避=非持仓）
+      cell: ({ row }) => (row.direction === '做空' ? (
+        <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+          <Tag theme="danger" size="small">空</Tag>
+          <span>{row.strategy}</span>
+          <Tag theme={row.action === 'sell' ? 'danger' : 'warning'} size="small" variant="light">{row.action === 'sell' ? '卖出' : '规避'}</Tag>
+        </span>
+      ) : row.strategy),
+    },
     {
       // §FIX-0921 信号产生时间列（2026-09-01 用户需求）：展示信号生成时间戳，
       // 用户可判断信号新旧（此前只有现价/策略，无法区分是早盘还是午后产生的信号）
@@ -368,6 +392,11 @@ export default function Signals() {
                 {f.label}
               </Button>
             ))}
+            {/* §SHORT-4 方向筛选（仅做空开启时出现） */}
+            {shortEnabled && (
+              <Select value={activeDir} onChange={(v) => setActiveDir(v)} size="small" style={{ width: 110 }}
+                options={[{ label: '全部方向', value: 'all' }, { label: '做多', value: '做多' }, { label: '做空', value: '做空' }]} />
+            )}
             {/* 战法下拉筛选 */}
             <Select value={activeStrategy} onChange={(v) => setActiveStrategy(v)} size="small" style={{ width: 160 }}
               options={[{ label: '全部策略', value: 'all' }, ...strategyOptions.map((st) => ({ label: st, value: st }))]} />

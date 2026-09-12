@@ -467,6 +467,12 @@ func (r *Registry) allPaperHeldCodes() []string {
 				out = append(out, p.Code)
 			}
 		}
+		// §SHORT-3 融券空头同样永久钉入监控：买回/止损估值不因掉出 hot 池而缺行情。
+		for _, s := range pe.ShortPositions() {
+			if s.Code != "" {
+				out = append(out, s.Code)
+			}
+		}
 	}
 	return out
 }
@@ -707,6 +713,8 @@ func (r *Registry) build(userID string) *Engine {
 	cAgent.SetD1Config(opts.CfgMgr.GetD1ConfigFor(userID))
 	cAgent.SetATRStop(posCfg.ATREnabled, posCfg.ATRStopMult)
 	cAgent.SetRunners(newAccountRunners(opts.CfgMgr, opts.Matcher, userID, opts.DataDir))
+	// §SHORT-1 注入做空四战法 runner（高位滞涨/放量破位/龙头断板/利好兑现砸盘）。
+	cAgent.SetShortRunners(combat_agent.NewShortRunners(opts.CfgMgr))
 	cAgent.SetShortEnabled(opts.CfgMgr.GetLongShortConfigFor(userID).ShortEnabled)
 	// 注入盘口因子回调：信号生成后对命中个股拉取买卖压力/封单量（免费五档，Level-2 可扩十档）。
 	// English: inject the order-book factor fetcher — after signal generation, pull bid/ask pressure and

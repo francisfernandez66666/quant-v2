@@ -203,12 +203,15 @@ func nShapeTag(eval *strategy.Evaluation) string {
 //   - emotionBlock: C5 情绪周期禁止开仓的阶段列表
 //   - depthFn: 盘口因子获取回调
 type Agent struct {
-	mu           sync.RWMutex           // 读写锁，保护并发访问
-	strategyCfg  *config.StrategyConfig // 策略参数配置（含动量分权重等，可热更新）
-	laodengCfg   *config.LaodengConfig  // Laodeng 评分配置（nil 表示未启用）
-	runners      []StrategyRunner       // 多策略运行器列表（做多/通用扫描共用）
-	shortRunner  StrategyRunner         // 做空策略运行器（预留）
-	shortEnabled bool                   // 做空功能开关（关闭时 ScanShort 直接返回 nil）
+	mu          sync.RWMutex           // 读写锁，保护并发访问
+	strategyCfg *config.StrategyConfig // 策略参数配置（含动量分权重等，可热更新）
+	laodengCfg  *config.LaodengConfig  // Laodeng 评分配置（nil 表示未启用）
+	runners     []StrategyRunner       // 多策略运行器列表（做多/通用扫描共用）
+	shortRunner StrategyRunner         // 做空策略运行器（预留，历史字段保留兼容）
+	// shortRunners §SHORT-1 做空四战法运行器列表（ScanShort 专用；空时回退复用做多 runners 旧骨架行为）。
+	// （shortRunners are the bear-side tactic runners used by ScanShort; empty falls back to legacy skeleton.）
+	shortRunners []StrategyRunner
+	shortEnabled bool // 做空功能开关（关闭时 ScanShort 直接返回 nil）
 	// positionDailyDropPct 持仓当日跌幅提醒阈值(%)；<=0 时用默认 5。
 	// （positionDailyDropPct is the holding daily-drop alert threshold in percent; <=0 falls back to 5.）
 	positionDailyDropPct float64
@@ -463,6 +466,19 @@ func (a *Agent) emotionBlocksBuy(phase string) bool {
 func (a *Agent) SetRunners(runners []StrategyRunner) {
 	a.mu.Lock()
 	a.runners = runners
+	a.mu.Unlock()
+}
+
+// SetShortRunners §SHORT-1 设置做空战法运行器列表（线程安全）。
+// 由 NewShortRunners 工厂创建注入（高位滞涨/放量破位/龙头断板/利好兑现砸盘）；
+// 未注入时 ScanShort 回退旧骨架行为（复用做多 runners），保证行为兼容。
+// 参数：
+//   - runners: 做空战法运行器列表
+//
+// （SetShortRunners injects the bear-side tactic runners used by ScanShort.）
+func (a *Agent) SetShortRunners(runners []StrategyRunner) {
+	a.mu.Lock()
+	a.shortRunners = runners
 	a.mu.Unlock()
 }
 
@@ -1614,16 +1630,22 @@ func markDataGap(sc *StockScores, t strategy.SignalType, md *strategy_engine.Sto
 
 // ScanShort 执行做空扫描：7b 板块利空→验证后个股→8b；8b 个股利空→直入战法（反向信号）。
 // 仅当做空开关启用时执行，否则返回 nil。
-// 流程与 ScanLong 对称：方向字段标记为"做空"，供上层做反向处理。
+//
+// §SHORT-1 改造：不再复用做多看涨形态 runners（语义错位修复——看涨形态评分套利空个股
+// 不产生"卖出时机"），改为消费专用做空四战法（高位滞涨/放量破位/龙头断板/利好兑现砸盘，
+// 见 docs/SHORT_STRATEGIES_PLAN_20260912.md）；shortRunners 未注入时回退旧骨架路径保持兼容。
+// 信号口径：通过门槛且当前账号持仓 → Action=sell（决策②：开关打开时走自动卖出通道）；
+// 非持仓 → Action=watch（仅规避提示）。战法层开关 rules.strategy.short.enabled（默认开）
+// 与全局 short_enabled 两层门任一关则管道静默。
 //
 // 扫描流程：
-//  1. 检查做空开关，关闭则直接返回
-//  2. 遍历已验证的利空板块，对板块内每只个股执行评分
-//  3. 遍历个股直入列表，对每只个股执行评分
+//  1. 检查做空开关 + 战法层开关，关闭则直接返回
+//  2. 遍历已验证的利空板块，对板块内每只个股执行做空评分
+//  3. 遍历个股直入列表，对每只个股执行做空评分
 //  4. 对最终信号批量附加盘口因子
 //
 // 参数：
-//   - input: 扫描输入，包含已验证板块、行情数据、D1评分等信息
+//   - input: 扫描输入，包含已验证板块、行情数据、D1评分、持仓集合等信息
 //
 // 返回值：
 //   - 做空信号列表，为空时表示无信号
@@ -1633,17 +1655,47 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 	if !a.ShortEnabled() {
 		return nil
 	}
+	// 战法层开关（缺省启用；显式 rules.strategy.short.enabled=false 时整条管道静默）
+	if !a.shortTacticsEnabled() {
+		return nil
+	}
 	if len(input.Sectors) == 0 && len(input.IndividualStocks) == 0 {
 		return nil
 	}
 
 	a.mu.RLock()
-	runners := a.runners
+	shortRunners := a.shortRunners
+	longRunners := a.runners
 	a.mu.RUnlock()
 
-	if len(runners) == 0 {
-		log.Printf("[combat_agent] ScanShort: 无策略策略")
-		return nil
+	// 做空战法未注入 → 回退旧骨架（复用做多 runners 的 evalAll 反向路径），保证行为兼容
+	// English: no bear tactics injected → legacy skeleton fallback (reuse long runners via evalAll).
+	if len(shortRunners) == 0 {
+		if len(longRunners) == 0 {
+			log.Printf("[combat_agent] ScanShort: 无策略策略")
+			return nil
+		}
+		var legacy []Signal
+		now := time.Now()
+		for _, sector := range input.Sectors {
+			if sector.Direction != "利空" {
+				continue
+			}
+			for _, code := range sector.Stocks {
+				if input.L1Blocked[code] {
+					continue
+				}
+				legacy = append(legacy, a.evalAll(&input, longRunners, code, input.MarketData[code], &sector, "做空", sector.Name, now)...)
+			}
+		}
+		for _, code := range input.IndividualStocks {
+			if input.L1Blocked[code] {
+				continue
+			}
+			legacy = append(legacy, a.evalAll(&input, longRunners, code, input.MarketData[code], nil, "做空", "个股", now)...)
+		}
+		a.attachDepthFactors(legacy)
+		return legacy
 	}
 
 	var raw []Signal
@@ -1663,26 +1715,140 @@ func (a *Agent) ScanShort(input ScanInput) []Signal {
 			if input.L1Blocked[code] {
 				continue
 			}
-			raw = append(raw, a.evalAll(&input, runners, code, input.MarketData[code], &sector, "做空", sector.Name, now)...)
+			raw = append(raw, a.evalShort(&input, shortRunners, code, input.MarketData[code], &sector, sector.Name, now)...)
 		}
 	}
 
-	// 8b 个股利空 → 直入战法（反向信号）
-	// English: 8b direct stock inputs go straight into the strategies (inverted signals).
+	// 8b 个股利空 → 直入做空战法
+	// English: 8b direct bear-stock inputs go straight into the bear tactics.
 	for _, code := range input.IndividualStocks {
 		if input.L1Blocked[code] {
 			continue
 		}
-		raw = append(raw, a.evalAll(&input, runners, code, input.MarketData[code], nil, "做空", "个股", now)...)
+		raw = append(raw, a.evalShort(&input, shortRunners, code, input.MarketData[code], nil, "个股", now)...)
 	}
 
-	// Laodeng 置信度修正已下沉到 evalAll 内按真实数据逐股应用（§R4-5），此处不再统一套常数
 	signals := raw
 	// 对最终信号批量附加盘口因子（买卖压力/封单量，供战法与前端使用）
 	// English: attach order-book factors (bid/ask pressure & seal volume) to final signals.
 	a.attachDepthFactors(signals)
 	log.Printf("[combat_agent] ScanShort: %d 板块 %d 个股 → %d 做空信号", len(input.Sectors), len(input.IndividualStocks), len(signals))
 	return signals
+}
+
+// shortTacticsEnabled 战法层开关：strategyCfg.rules.strategy.short.enabled（nil=默认启用）。
+// （shortTacticsEnabled reports the tactic-layer switch, default enabled.）
+func (a *Agent) shortTacticsEnabled() bool {
+	a.mu.RLock()
+	cfg := a.strategyCfg
+	a.mu.RUnlock()
+	if cfg == nil {
+		return true
+	}
+	return cfg.Short.ShortTacticsEnabled()
+}
+
+// evalShort §SHORT-1 做空战法单股评分循环（与 evalAll 分离的卖出侧路径）。
+//
+// 与 evalAll 的差异（做多专属逻辑全部不适用）：
+//   - 无动量提升门/D1 软加成/N形波形机/双响炮二波确认/动量兜底信号；
+//   - 一次 buildShortData 派生共享输入，四个做空战法只读评分；
+//   - sell/watch 由持仓事实决定：持仓 → sell（自动卖出候选），非持仓 → watch（规避提示）；
+//   - ST 屏蔽与数据缺口留痕口径与 evalAll 一致。
+//
+// 参数：
+//   - input: 扫描输入（News/HeldCodes/SectorLimitUpDrop/EmotionPhase/Scores 来源）
+//   - runners: 做空战法运行器列表
+//   - code: 股票代码
+//   - md: 该股行情数据快照
+//   - sector: 板块上下文（个股直入时为 nil）
+//   - sectorName: 板块名（展示用）
+//   - now: 本轮时间戳
+//
+// 返回值：
+//   - 该股本轮做空信号列表（Direction=做空；持仓 sell / 非持仓 watch）
+//
+// （evalShort scores one stock through the bear tactics, emitting sell/watch signals.）
+func (a *Agent) evalShort(input *ScanInput, runners []StrategyRunner, code string, md *strategy_engine.StockMarketData, sector *sector_agent.VerifiedSector, sectorName string, now time.Time) []Signal {
+	if len(runners) == 0 || md == nil {
+		return nil
+	}
+	// ST 个股屏蔽：不产生做空信号（与 evalAll 同口径）
+	if IsSTStock(md.Name) {
+		return nil
+	}
+	if input.Scores == nil {
+		input.Scores = make(map[string]StockScores)
+	}
+	sc := input.Scores[code]
+	sc.Code = code
+	if sc.DataGaps == nil {
+		sc.DataGaps = make(map[string]bool)
+	}
+	held := input.HeldCodes[code]
+	sd := buildShortData(code, md, sector, input, sectorName, held, 0)
+
+	var sigs []Signal
+	var unSig []string
+	for _, runner := range runners {
+		if runner.Strategy == nil {
+			continue
+		}
+		eval, err := runner.Strategy.Evaluate(code, sd)
+		if err != nil || eval == nil {
+			markDataGap(&sc, runner.Type, md)
+			unSig = append(unSig, StrategyDisplayName(string(runner.Type))+":错误")
+			continue
+		}
+		if eval.TotalScore > sc.ShortScore {
+			sc.ShortScore = eval.TotalScore
+		}
+		if !eval.Pass {
+			if eval.TotalScore > 0 || eval.Level == "nodata" {
+				unSig = append(unSig, fmt.Sprintf("%s:%s(%.0f)", StrategyDisplayName(string(runner.Type)), eval.Level, eval.TotalScore))
+			}
+			continue
+		}
+		sig, err := runner.Strategy.GenerateSignal(code, eval)
+		if err != nil || sig == nil {
+			continue
+		}
+		// sell/watch 决策（决策②+非持仓安全侧）：仅对持仓股发卖出信号，非持仓降级观察
+		action := string(sig.Action)
+		if action != string(strategy.ActionSell) {
+			action = "watch"
+		} else if !held {
+			action = "watch"
+		}
+		sigPrice := sig.Price
+		if sigPrice <= 0 {
+			sigPrice = md.Price
+		}
+		sigs = append(sigs, Signal{
+			ID:           seqID(),
+			Code:         code,
+			Name:         orDefault(sig.Name, md.Name),
+			Strategy:     StrategyDisplayName(string(runner.Type)),
+			StrategyType: string(runner.Type),
+			Direction:    "做空",
+			Action:       action,
+			Price:        sigPrice,
+			Confidence:   sig.Confidence,
+			ATR:          atr14Last(md.KLines),
+			Reason:       sig.Reason,
+			Sector:       sectorName,
+			GeneratedAt:  now,
+			Meta:         sig.Meta,
+		})
+	}
+	if len(sigs) > 0 {
+		sc.SignalActive = true
+	}
+	if len(unSig) > 0 {
+		log.Printf("[combat_agent] 做空评分 %s(%s) 总分%.0f | 未出: %s", code, md.Name, sc.ShortScore, strings.Join(unSig, ", "))
+	}
+	input.Scores[code] = sc
+	return sigs
 }
 
 // CheckPositionAlerts 检查所有持仓的止盈止损条件，返回需要提醒的信号列表。

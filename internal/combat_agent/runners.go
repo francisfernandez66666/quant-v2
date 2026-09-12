@@ -15,10 +15,14 @@ package combat_agent
 import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/strategies/break_down"
 	"quant-trading-v2/internal/strategies/double_bump"
 	"quant-trading-v2/internal/strategies/dragon"
 	"quant-trading-v2/internal/strategies/dragon_return"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
+	"quant-trading-v2/internal/strategies/good_news_fade"
+	"quant-trading-v2/internal/strategies/high_churn"
+	"quant-trading-v2/internal/strategies/leader_decay"
 	"quant-trading-v2/internal/strategies/n_shape"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
 	"quant-trading-v2/internal/strategy"
@@ -42,5 +46,26 @@ func NewRunners(cfgMgr *config.Manager, matcher *data.EventMatcher) []StrategyRu
 		{Type: strategy.SignalDragonReturn, Strategy: dragon_return.New(cfgMgr)},
 		{Type: strategy.SignalFactor, Strategy: factorstrat.New()},
 		{Type: strategy.SignalPattern, Strategy: patternstrat.New()},
+	}
+}
+
+// NewShortRunners §SHORT-1 构建做空四战法 runner 的统一工厂（8b 反向信号专用）。
+// 与做多 runners 分离：ScanShort 不再复用看涨形态（语义错位修复），做空战法消费
+// shortbase.Data（适配层派生的量价+事件共享输入），产出 sell/watch 卖出侧信号。
+// 战法清单：高位滞涨 / 放量破位 / 龙头断板 / 利好兑现砸盘。
+//
+// 参数：
+//   - cfgMgr: 配置管理器（账号级阈值 rules.strategy.short.* 来源，可为 nil）
+//
+// 返回值：
+//   - 做空战法运行器列表
+//
+// （NewShortRunners builds the four bear-side tactic runners for ScanShort.）
+func NewShortRunners(cfgMgr *config.Manager) []StrategyRunner {
+	return []StrategyRunner{
+		{Type: strategy.SignalHighChurn, Strategy: high_churn.New(cfgMgr)},
+		{Type: strategy.SignalBreakDown, Strategy: break_down.New(cfgMgr)},
+		{Type: strategy.SignalLeaderDecay, Strategy: leader_decay.New(cfgMgr)},
+		{Type: strategy.SignalGoodNewsFade, Strategy: good_news_fade.New(cfgMgr)},
 	}
 }
