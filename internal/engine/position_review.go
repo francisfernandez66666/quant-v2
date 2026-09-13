@@ -42,11 +42,11 @@ const (
 // reviewTarget 一只待复盘股票（含来源标记集合与成本基准）。
 // reviewTarget is one stock to review, with its source tags (may hit multiple pools) and cost basis.
 type reviewTarget struct {
-	Code    string
-	Name    string
-	Cost    float64 // 持仓成本价（实盘/模拟盘），无持仓为 0
-	Sources []string
-	prio    int
+	Code    string   // 6 位数字股票代码（已归一化，去 .SH/.SZ 后缀）
+	Name    string   // 股票名称（可能为空：自选股/报表码无名称）
+	Cost    float64  // 持仓成本价（实盘/模拟盘），无持仓为 0
+	Sources []string // 来源标签集合（实盘/模拟盘/信号/自选，可多源命中）
+	prio    int      // 多来源时的最小优先级（截断排序用，见 reviewPriority）
 }
 
 // addSource 记录来源并维持最小优先级。
@@ -141,6 +141,8 @@ func (e *Engine) reviewUniverse() []reviewTarget {
 		}
 	}
 
+	// 汇总为切片并按"来源优先级↑、代码↑"排序：实盘股永远优先于自选股进入复盘名单。
+	// Aggregate into a slice sorted by source priority then code, so holdings are kept first on truncation.
 	out := make([]reviewTarget, 0, len(byCode))
 	for _, t := range byCode {
 		out = append(out, *t)
@@ -335,6 +337,7 @@ func reviewTokenBudget(stocks int) int {
 func buildReviewPrompt(facts []string, dateStr string) string {
 	var b strings.Builder
 	b.WriteString("交易日收盘后复盘。复盘日期：" + dateStr + "。请逐只输出，每行一只（CODE|倾向|正文）：\n\n")
+	// 事实行逐条换行拼接（每股一行，与系统提示的输出协议一一对应）。
 	for _, f := range facts {
 		b.WriteString(f + "\n")
 	}
@@ -361,6 +364,7 @@ func parseReviewResponse(resp string) map[string][2]string {
 			continue // 代码列非 6 位数字 → 非有效行（防 LLM 输出格式漂移时误吞标题行）
 		}
 		bias := strings.TrimSpace(parts[1])
+		// 倾向列归一化：非三选一的输出（如"谨慎偏多"）一律落到 中性，保守处理不放大情绪。
 		switch bias {
 		case reviewBiasBull, reviewBiasMid, reviewBiasBear:
 		default:
@@ -383,6 +387,9 @@ func parseReviewResponse(resp string) map[string][2]string {
 // English: runs one review pass (force=manual bypasses the daily/session gates). Returns the number of
 // review messages produced and an error (no universe / no LLM / LLM failure).
 func (e *Engine) runPositionReview(now time.Time, force bool) (int, error) {
+	// 双重闸门：reviewRunning 防自动/手动并发重入（同一引擎同时只跑一次复盘）；
+	// reviewGuardDay 防自动路径当日重复（盘后分支每 ~15min 唤醒一次，靠此日戳去重）。
+	// 手动 force 绕过日戳闸门但仍受并发锁约束；自动路径先占日戳，失败时再回退（见 LLM 失败分支）。
 	e.mu.Lock()
 	if e.reviewRunning {
 		e.mu.Unlock()
@@ -398,6 +405,7 @@ func (e *Engine) runPositionReview(now time.Time, force bool) (int, error) {
 	}
 	e.reviewRunning = true
 	e.mu.Unlock()
+	// 无论成功失败都释放并发锁（defer 兜底 panic 场景）。
 	defer func() {
 		e.mu.Lock()
 		e.reviewRunning = false
@@ -421,6 +429,7 @@ func (e *Engine) runPositionReview(now time.Time, force bool) (int, error) {
 		return 0, fmt.Errorf("复盘依赖未就绪（需 msgStore/日K源）")
 	}
 
+	// 复盘数量上限：默认 24、配置可改（ReviewMax 已夹到 1..50），超限按优先级截断（实盘优先）。
 	limit := 24
 	if e.cfgMgr != nil {
 		limit = e.cfgMgr.Rules.Runtime.ReviewMax()
@@ -481,6 +490,9 @@ func (e *Engine) runPositionReview(now time.Time, force bool) (int, error) {
 		if title == "" {
 			title = t.Code
 		}
+		// 消息字段约定：Level=复盘（筛选/配色依据）、Action/Direction=后市倾向（前端 Tag）、
+		// Strategy=盘后复盘（区别于战法信号分类）、Body=LLM 正文 + 分隔线后的量化事实（可追溯）、
+		// Scope=本人账号（仅本账号可见）、ID 含日期 → 同日重跑覆盖、跨日累积由 Sync 前清理兜底。
 		items = append(items, data.MessageItem{
 			ID:          fmt.Sprintf("pos-review@%s@%s@%s", userID, t.Code, day),
 			Code:        t.Code,
@@ -514,6 +526,7 @@ func (e *Engine) runPositionReview(now time.Time, force bool) (int, error) {
 		}
 	}
 	msgStore.Sync(items)
+	// SSE 实时推送：消息中心页监听 message 事件即刷新（§F5 前端免轮询链路）。
 	e.pushSSEMessages(items)
 	log.Printf("[review] %s 盘后复盘完成：%d 只", scopeLabel(userID), len(items))
 	return len(items), nil

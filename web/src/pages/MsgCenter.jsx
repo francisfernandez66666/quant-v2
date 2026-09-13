@@ -21,7 +21,7 @@ function confirmDialog(body, header = '确认') {
 }
 
 // 消息等级过滤选项：key 对应过滤逻辑，label 为按钮文案
-const filters = [
+export const filters = [
   { key: 'all', label: '全部' },
   { key: 'hit', label: '命中提醒' },
   { key: 'trade', label: '交易信号' },
@@ -32,7 +32,7 @@ const filters = [
 ]
 
 // 涨跌配色（红涨绿跌）— 此处仅用于"收益/亏损"语义外的边框，按 Vue 原色映射
-function levelTagTheme(level) {
+export function levelTagTheme(level) {
   if (level === '止损' || level === '策略信号') return 'danger'
   if (level === '交易信号') return 'success'
   if (level === '止盈' || level === '加仓') return 'success'
