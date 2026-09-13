@@ -32,6 +32,7 @@ const RISK_STYLE = {
   Yellow: { color: 'var(--td-warning-color)', bg: '#fff3e0', label: '警惕日·买入从严' },
 }
 
+// 全站顶部市场状态条：当前情绪相位 + 风险档 + 涨跌广度一行速览（SSE 驱动）。
 export default function MarketStatusBar({ env }) {
   if (!env) return null
   const emotion = (env.emotion || '').trim()

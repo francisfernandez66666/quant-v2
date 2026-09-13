@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 改动全量验证脚本（含 2026-08-05 实时链路改动专项 + 2026-09-11 回测自动增强专项 + 2026-09-12 做空策略链路专项）
+# 改动全量验证脚本（含 2026-08-05 实时链路改动专项 + 2026-09-11 回测自动增强专项 + 2026-09-12 做空策略链路专项
+#   + 2026-09-13 UAT 修复批/研究升级批/情绪面板 A/B/C 专项）
 #
 # 用实盘数据快照（internal/e2e/testdata/fixtures.json / fixtures_600580.json）离线 mock 全部外部数据源，
 # 专项验证改动：
@@ -39,35 +40,42 @@
 #   P4/P5/P7        ：auto-buy 谨慎层(默认关)拒Red/缩Yellow、系统性风险持仓提醒(SellAction 不命中→绝不自动卖)、
 #                    做空风险日置信加成（TestAutoCaution*、TestMarketRiskAlertsNotAuto、TestRiskTierShortBoost）
 #
+# §UAT 修复/研究升级/情绪面板（2026-09-13）专项（见 6/6）：
+#   会话安全链 D1/D3/D7：PublicUser 剥凭据、Enabled 恒序列化、RevokeSession 自助吊销
+#   部署自检 D5：verifyDeployment 四分支（禁用/缺 token/密钥池/nil auth）
+#   情绪面板 A/B：历史端点日期归一化（YYYYMMDD→ISO）+ days 钳制 250 + 矩阵六相位/thin 纪律
+#   研究升级 W6/W7：objective→ref_id 固定槽位（990~994/哈希 1000+）、min_triggers 按目标门槛
+#   前端（见 vitest sentiment.test.jsx）：F45 Card actions 插槽、矩阵懒加载、hit_rate×100
+#
 # 用法:
-#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路 + 风险因子专项
+#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路 + 风险因子 + 今日修复专项
 #   ./scripts/verify_changes.sh -full          # 再连相关全量单测 + 前端 vitest 一起跑
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "==> 1/5 编译检查..."
+echo "==> 1/6 编译检查..."
 go build ./...
 go vet ./internal/llm ./internal/combat_agent ./internal/engine ./internal/e2e ./internal/server ./internal/data ./internal/display ./cmd/quant \
 	./internal/config ./internal/btreplay ./internal/store ./internal/scheduler ./cmd/research
 
-echo "==> 2/5 实时链路改动专项 e2e（实盘快照 mock）..."
+echo "==> 2/6 实时链路改动专项 e2e（实盘快照 mock）..."
 go test -count=1 -v ./internal/e2e/ \
 	-run 'TestLLMTimeoutConfig|TestD1RetryQueueAcrossRuns|TestNShapeGateD1AndTotal|TestEndToEndFullPipeline|TestConsult|TestHTTP|TestAttachLiveBar' 2>&1 \
 	| grep -E '^(=== RUN|--- (PASS|FAIL)|PASS|FAIL|ok)'
 
-echo "==> 3/5 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
+echo "==> 3/6 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
 go test -count=1 -v ./internal/config ./internal/btreplay ./internal/store ./internal/server ./internal/scheduler ./cmd/research \
 	-run 'TestValidateBacktest|TestFillDefaults|TestFillBacktestDefaults|TestBacktestSettingsRoundTrip|TestPaperSlippageCalib|TestBacktestConfigEndpoints|TestInjectBacktestPayload|TestPayloadBacktest|TestCostRoundTripPnlExCompat|TestSlippageTiers|TestSlippageBpsAsymmetric|TestFillRate|TestLimitBoardGating|TestCalibAudit|TestEntrySlipGating|TestUniformExit|TestFixAmountScale|TestAvgAmountWan|TestBuildSlipCtx|TestPareto|TestCapFront|TestRecommended|TestPointJSON|TestSaveSweepResultsParetoCarry' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 4/5 做空策略链路专项（§SHORT 2026-09-12：四战法/接线/自动卖出/融券/e2e）..."
+echo "==> 4/6 做空策略链路专项（§SHORT 2026-09-12：四战法/接线/自动卖出/融券/e2e）..."
 go test -count=1 ./internal/strategies/high_churn/... ./internal/strategies/break_down/... ./internal/strategies/leader_decay/... ./internal/strategies/good_news_fade/... ./internal/strategies/shortbase/... 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/combat_agent/... ./internal/paper/... ./internal/engine/... ./internal/e2e/ \
 	-run 'Short|BuildShort|StrategyDisplay|AutoExecuteRealSells|AutoExitReportSells|PaperSellSignals' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 5/5 市场风险因子专项（§MARKET_RISK_GATE 2026-09-12：P0 数据源 + P1 广度 + P2 状态机 + P3~P7 风险档）..."
+echo "==> 5/6 市场风险因子专项（§MARKET_RISK_GATE 2026-09-12：P0 数据源 + P1 广度 + P2 状态机 + P3~P7 风险档）..."
 go test -count=1 ./internal/data/ -run 'RiskPool|PoolLimit|PoolHelpers|Breadth|MasLowSlope|EmotionPhase|EmotionBreadth' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/config/ -run 'Data|Risk|Emotion|Macro|Scheduler|AutoCaution' 2>&1 \
@@ -75,6 +83,16 @@ go test -count=1 ./internal/config/ -run 'Data|Risk|Emotion|Macro|Scheduler|Auto
 go test -count=1 ./internal/research/ -run 'MarketState|StateTracker|Classify' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/combat_agent/ -run 'RiskTier|ApplyRiskTier|ComputeAndSet|Synthesize|MarketRisk|AutoCaution|MacroGate' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+
+echo "==> 6/6 今日修复专项（2026-09-13：UAT D1/D3/D5/D7 + 情绪面板 A/B + 研究升级 W6/W7）..."
+go test -count=1 ./internal/auth/ ./cmd/quant/ -run 'TestPublicUserStripsSessionCredentials|TestEnabledSerializesWhenFalse|TestRevokeSessionSelfLogout|TestVerifyDeployment' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/store/ -run 'TestEmotionStrategyMatrixBuckets|TestEmotionMatrixFallbackPhase|TestEmotionMatrixBadJSONSkipped' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/server/ -run 'TestEmotionHistoryDateNormalize|TestEmotionStrategyMatrixShape|TestOptRefIDForSlots' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/btreplay/ -run 'TestMinTriggersForObjDefaults' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
 if [ "${1:-}" = "-full" ]; then

@@ -42,6 +42,8 @@ const Consult = lazy(() => import('./pages/Consult.jsx'))
 const Research = lazy(() => import('./pages/Research.jsx'))
 const Admin = lazy(() => import('./pages/Admin.jsx'))
 const Paper = lazy(() => import('./pages/Paper.jsx'))
+// §情绪面板 C：市场情绪回看页（涨停柱+净值折线+相位色带），懒加载不进首屏包
+const EmotionReview = lazy(() => import('./pages/EmotionReview.jsx'))
 
 // 懒加载路由切换时的加载占位（页面 chunk 拉取间隙的兜底 UI）
 function PageFallback() {
@@ -158,8 +160,11 @@ export default function App() {
   }
 
   // 清除认证、停止轮询并返回登录页
+  // §D7 修复：调用 api.logout() 触发服务端 POST /api/auth/logout 吊销当前会话——
+  // 旧行为只 clearAuth 清 localStorage，Sessions 里那条哈希仍在，被截获可在 TTL 内复用。
+  // 前端立刻本地清并跳登录，网络请求异步进行（失败兜底靠 TTL 过期，不阻塞 UX）。
   function logout() {
-    api.clearAuth()
+    api.logout()  // 内部会 clearAuth；不 await 以免网络抖动拖住退出体验
     stopPolling()
     setLoggedIn(false)
     setMenuOpen(false)
@@ -192,8 +197,14 @@ export default function App() {
   async function onShortToggle(val) {
     try {
       const res = await api.toggleShort(val)
-      setShortEnabled(res.short_enabled || false)
-      MessagePlugin.info(res.short_enabled ? '做空已开启' : '做空已关闭')
+      const next = res.short_enabled || false
+      setShortEnabled(next)
+      // §F26 修复：广播做空状态变更，让 MsgCenter 等订阅页与顶栏保持同一份真相；
+      // 旧行为各页 mount 独立 fetch，顶栏切"仅做多"进 MsgCenter 又显示"做多+空"。
+      // English: F26 — broadcast short_enabled so consumers (MsgCenter etc.) stay in sync with
+      // the header toggle instead of refetching stale state on mount.
+      window.dispatchEvent(new CustomEvent('short:toggled', { detail: { enabled: next } }))
+      MessagePlugin.info(next ? '做空已开启' : '做空已关闭')
     } catch (_) {
       setShortEnabled(!val)
       MessagePlugin.error('做空开关切换失败')
@@ -347,6 +358,8 @@ export default function App() {
     { to: '/signals', icon: <ThunderIcon size="18px" />, label: '信号', badge: signalCount },
     { to: '/watchlist', icon: <StarIcon size="18px" />, label: '自选' },
     { to: '/hotspot', icon: <TrendingUpIcon size="18px" />, label: '热点' },
+    // §情绪面板 C：情绪回看入口（涨停柱+净值+相位色带）
+    { to: '/emotion', icon: <ChartLineIcon size="18px" />, label: '情绪回看' },
     { to: '/msgcenter', icon: <NotificationIcon size="18px" />, label: '消息', badge: alertCount },
     { to: '/positions', icon: <WalletIcon size="18px" />, label: '持仓' },
     { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' },
@@ -550,6 +563,9 @@ export default function App() {
                     {/*
                      * 模拟盘页：纸面交易记账/自动撮合（入口受 paperEnabled 开关控制） */}
                     <Route path="/paper" element={<Paper />} />
+                    {/*
+                     * 情绪回看页：涨停柱+账户净值+相位色带三合一（§情绪面板 C） */}
+                    <Route path="/emotion" element={<EmotionReview />} />
                     {/*
                      * 403 无权限兜底页 */}
                     <Route path="/403" element={<Forbidden />} />

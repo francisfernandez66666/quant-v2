@@ -1995,10 +1995,18 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "price unavailable")
 			return
 		}
-		// 未传数量默认一手（100 股）。
+		// 未传数量默认一手（100 股）。§D4 修复：卖出侧显式 qty<100 拒单，避免静默放大；
+		// qty=0（未填）仍回落到一手，保持既有默认行为兼容。
+		// English: sub-lot explicit sells are rejected 400; unspecified qty still defaults to one lot.
 		qty := req.Qty
-		if qty <= 0 {
+		if qty < 0 {
+			qty = 0
+		}
+		if qty == 0 {
 			qty = 100
+		} else if qty < 100 && side == trading.SideSell {
+			writeError(w, 400, "卖出不支持零股（qty<100）；如需清仓请用清仓动作")
+			return
 		}
 		// 未传幂等键时生成 manual@code@时间戳 唯一键。
 		signalID := req.SignalID
@@ -2092,6 +2100,16 @@ func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	ch := s.sse.SubscribeFor(userID, lastID)
 	defer s.sse.UnsubscribeFor(userID, ch)
+
+	// §D2 修复：priming flush——Go ResponseWriter 有默认 2KB 缓冲，SubscribeFor 后若无事件
+	// 抵达，浏览器 EventSource 的 onopen 要等到 15s 心跳或第一条真实事件才触发；期间 UI
+	// 显示"连接中"、后端 SSE tickets 已消耗但未真正确认，用户以为服务卡住。
+	// 立即写一行 SSE 注释帧 + retry 提示 + flush，客户端 Event 通道进入 OPEN 状态；
+	// 注释帧浏览器不派发事件（只作 keepalive 语义）。
+	// English: D2 — priming flush immediately after subscribe so EventSource.onopen fires now
+	// instead of up to 15s later; retry hint tells the browser how fast to reconnect.
+	fmt.Fprintf(w, "retry: 5000\n: quant-sse ready\n\n")
+	flusher.Flush()
 
 	ctx := r.Context()
 	// 发送心跳保活

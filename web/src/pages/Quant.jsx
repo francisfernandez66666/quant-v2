@@ -30,10 +30,17 @@ function cachedFormKey() {
   return acc ? STORAGE_QMT_FORM_BASE + ':' + acc : STORAGE_QMT_FORM_BASE
 }
 
-// readCachedForm 读取本地缓存的实盘表单配置；无缓存时回退旧键并返回 null。
+// readCachedForm 读取当前账号本地缓存的实盘表单配置。
+// §F22 修复：不再回退到无账号后缀的旧全局键 —— 那会让切换账号时 B 账号看到 A 账号缓存的
+// gateway_url/token（D5 漂移场景下的隐私/安全事故）。旧键仅一次性清理，读时不采纳。
+// English: F22 — never fall back to the un-scoped legacy key; account B must not see A's cached
+// gateway/token. The legacy global key is purged on read.
 function readCachedForm() {
   try {
-    const raw = localStorage.getItem(cachedFormKey()) || localStorage.getItem(STORAGE_QMT_FORM_BASE)
+    // 一次性清理旧全局键（迁移遗留），避免下一个账号读到
+    const legacy = localStorage.getItem(STORAGE_QMT_FORM_BASE)
+    if (legacy) localStorage.removeItem(STORAGE_QMT_FORM_BASE)
+    const raw = localStorage.getItem(cachedFormKey())
     if (raw) return JSON.parse(raw)
   } catch (_) {}
   return null

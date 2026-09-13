@@ -102,6 +102,39 @@ export function clearAuth() {
   localStorage.removeItem(STORAGE_PERMS)
 }
 
+/** §D7 自助退出：先向服务端吊销当前 Bearer 对应的会话（POST /api/auth/logout）。
+ *  本地 clearAuth 立即执行（不 await 网络），避免用户快速重登时旧请求把新令牌误清；
+ *  网络请求带 captured token 走 fetch 直连，不走 request() 的 getToken() 路径。
+ *  English: clears local state synchronously then revokes server-side using the captured token. */
+export async function logout() {
+  const base = baseUrl()
+  const token = localStorage.getItem(STORAGE_KEY)
+  clearAuth() // 立即清，网络请求带快照 token 继续跑
+  if (!token) return
+  try {
+    await fetch(base + '/api/auth/logout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+    })
+  } catch (e) {
+    if (typeof console !== 'undefined') console.warn('[api] 服务端 logout 网络失败:', e && e.message)
+  }
+}
+
+/** §Dashboard 情绪面板 A：最近 N 交易日市场情绪/风险档快照（默认 30）。
+ *  数据源 market_risk_daily，引擎每交易日落一行；前端消费点：情绪色带 + 涨停/连板指标。
+ *  English: sentiment history for the Dashboard sentiment card (defaults to last 30 sessions). */
+export async function fetchEmotionHistory(days) {
+  return request('/api/market/emotion/history?days=' + (days || 30))
+}
+
+/** §Dashboard 情绪面板 B：情绪×战法回测矩阵（backtest_event_results 分相聚合）。
+ *  返回 { phases, min_events, rows:[{candidate_id, kind, name, horizons, cells:[{phase,events,thin,avg_excess,hit_rate,avg_limit_up}], total_events}] }
+ *  English: emotion × strategy backtest matrix, bucketed per-candidate by daily sentiment phase. */
+export async function fetchEmotionStrategyMatrix() {
+  return request('/api/research/emotion-strategy-matrix')
+}
+
 /**
  * 检查当前是否存在有效的登录令牌
  * Checks whether a login token currently exists

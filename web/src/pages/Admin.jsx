@@ -184,6 +184,10 @@ export default function Admin() {
   const [opsDate, setOpsDate] = useState('')        // 当前选中日期
   const [opsLines, setOpsLines] = useState([])      // 当日日志行
   const [opsMeta, setOpsMeta] = useState({ total: 0, truncated: false })
+  // §D6 修复：账号列表分页受控——旧写法用 `defaultPageSize:10` 非受控，
+  // 用户切到 50/100 后 refresh / 增删 / 角色变更触发重渲染就掉回 10。
+  // English: D6 — controlled pagination so pageSize survives re-renders.
+  const [userPage, setUserPage] = useState({ current: 1, pageSize: 10 })
   const [opsLoading, setOpsLoading] = useState(false)
   const opsBodyRef = React.useRef(null)             // 内容区（自动滚到底部=最新事件）
 
@@ -207,9 +211,20 @@ export default function Admin() {
 
   // 创建新账号并清空表单
   function createUser() {
-    // 表单基础校验：用户名与密码必填
+    // §F31 修复：提交前预校验，与后端 auth.CreateUser 的入参约束对齐——
+    // 用户名 3-20 位（首字符字母，允许字母/数字/下划线）；密码 ≥8 位。
+    // 后端目前只在 auth.go 层校验（撞车用户名/密码过短），错误信息经 catch 冒泡到 createMsg；
+    // 这里前端先拦，错误直白，避免用户按下"创建"才被拒。
     if (!newUser.username || !newUser.password) {
       setCreateMsg('用户名和密码必填'); setCreateMsgType('err'); return
+    }
+    if (!/^[A-Za-z][A-Za-z0-9_]{2,19}$/.test(newUser.username)) {
+      setCreateMsg('用户名需 3-20 位，首字符为字母，仅允许字母/数字/下划线')
+      setCreateMsgType('err'); return
+    }
+    if (newUser.password.length < 8) {
+      setCreateMsg('初始密码至少 8 位')
+      setCreateMsgType('err'); return
     }
     setCreating(true); setCreateMsg('')
     api.createAdminUser({
@@ -498,10 +513,15 @@ export default function Admin() {
         }
         <Form layout="vertical">
           <Form.FormItem label="用户名">
-            <Input value={newUser.username} onChange={(v) => setNewUser({ ...newUser, username: v })} placeholder="登录名" />
+            {/* §F31 修复：placeholder 从"登录名"这种含糊提示改为具体格式约束——
+                旧版没有 min-length / 字符集提示，用户输"1"或"admin"（与已存在的 admin 撞车）
+                提交才被后端拒；现前端预校验。 */}
+            <Input value={newUser.username} onChange={(v) => setNewUser({ ...newUser, username: v })}
+              placeholder="3-20 位，字母/数字/下划线，首字符为字母" />
           </Form.FormItem>
           <Form.FormItem label="初始密码">
-            <Input type="password" value={newUser.password} onChange={(v) => setNewUser({ ...newUser, password: v })} placeholder="首次登录用" />
+            <Input type="password" value={newUser.password} onChange={(v) => setNewUser({ ...newUser, password: v })}
+              placeholder="至少 8 位，首次登录后可自行修改" />
           </Form.FormItem>
           {
             /* 角色选择：普通用户 / 管理员 */
@@ -563,7 +583,9 @@ export default function Admin() {
           bordered={false}
           size="medium"
           // §FIX-20260902 补 total=长度：不传 total 时 tdesign 分页错显「共 0 条」且无法翻页
-          pagination={{ defaultPageSize: 10, showJumper: true, total: users.length }}
+          // §D6 修复：受控分页（pageSize 不再因增删/角色变更重渲染被重置）
+          pagination={{ ...userPage, total: users.length, showJumper: true,
+            onChange: (pi) => setUserPage((p) => ({ ...p, current: pi.current ?? p.current, pageSize: pi.pageSize ?? p.pageSize })) }}
         />
       </Card>
 
@@ -571,7 +593,9 @@ export default function Admin() {
       <Card
         title="系统运行日志（每日核心记录）"
         style={{ marginBottom: 12 }}
-        headerRightContent={
+        // §修复：TDesign Card 无 headerRightContent 属性，头部右侧插槽是 actions——
+        // 此前误用属性名导致日志日期下拉+刷新按钮从未渲染（静默丢 UI）。
+        actions={
           // 卡片右上角操作区：日志日期下拉 + 手动刷新按钮
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             {/* 日期下拉：选择要查看的日志日（YYYYMMDD → YYYY-MM-DD 展示）+ 手动刷新按钮 */}

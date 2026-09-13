@@ -48,7 +48,10 @@ type User struct {
 	// 细粒度权限位列表（如 research_approve），管理员隐式拥有全部
 	Perms []string `json:"perms,omitempty"`
 	// 账号是否启用（默认 true；禁用后登录/令牌失效）
-	Enabled bool `json:"enabled,omitempty"`
+	// §D3 修复：去掉 omitempty——Enabled=false 是敏感状态，序列化时必须显式出现，
+	// 否则 /api/admin/users 返回缺字段 → 前端 `enabled ?? true` 兜底把禁用账号渲染成启用。
+	// English: Enabled must always serialize; omitempty was hiding disabled state.
+	Enabled bool `json:"enabled"`
 	// 创建时间 Unix 时间戳
 	CreatedAt int64 `json:"created_at"`
 	// 账号有效期截止 Unix 时间戳（0=永久）
@@ -685,12 +688,20 @@ func (m *Manager) UserToken(username string) string {
 	return ""
 }
 
-// PublicUser 返回不包含敏感字段（密码哈希/令牌）的用户公开视图。
-// （PublicUser returns a user view stripped of sensitive fields (password hash/token).）
+// PublicUser 返回不包含敏感字段（密码哈希/令牌/会话哈希/过期时间）的用户公开视图。
+// §D1 修复：此前只清 PasswordHash+Token，Sessions 列表（含每设备令牌 SHA-256 哈希与过期时间）
+// 原样序列化到 /api/admin/users → 管理员视图泄露会话凭据；配合 ValidateToken 路径二 matchPlain
+// 分支存在，虽然 Sessions 里存的是哈希而非明文，但**哈希即凭据**（Presented 也是哈希比对，
+// 详见 auth.go:613），拿到哈希即可回放冒用，故必须清空。
+// English: PublicUser strips PasswordHash, Token, Sessions (device-token hashes) and TokenExp;
+// previously Sessions leaked and could be replayed because ValidateToken hashes the presented token
+// before comparing.
 func (u *User) PublicUser() User {
 	out := *u
 	out.PasswordHash = ""
 	out.Token = ""
+	out.Sessions = nil
+	out.TokenExp = 0
 	return out
 }
 
@@ -717,6 +728,52 @@ func (m *Manager) UserByID(userID string) *User {
 		}
 	}
 	return nil
+}
+
+// RevokeSession 吊销当前令牌对应的会话（自助退出）：从 Sessions 剔除哈希命中项并同步
+// 旧 Token/TokenExp 兼容槽（若命中的正是槽位会话）。找不到匹配返回 false（幂等）。
+// §D7 修复：此前无自助退出——清了 localStorage 令牌仍在 Sessions 中有效，
+// 手机/浏览器换设备登录后旧令牌可长期复用；退出必须回收服务端会话。
+// English: RevokeSession removes the presented token's session server-side; previously logout
+// was client-only and stale bearer tokens remained valid until expiry.
+func (m *Manager) RevokeSession(token string) bool {
+	if token == "" {
+		return false
+	}
+	presented := hashToken(token)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.db.Users {
+		u := &m.db.Users[i]
+		for j := range u.Sessions {
+			if subtle.ConstantTimeCompare([]byte(u.Sessions[j].Token), []byte(presented)) == 1 {
+				u.Sessions = append(u.Sessions[:j], u.Sessions[j+1:]...)
+				// 兼容槽位若指向同一条哈希则一并清空（避免 ValidateToken 路径二复活）
+				if u.Token == presented {
+					u.Token = ""
+					u.TokenExp = 0
+				}
+				if err := m.save(); err != nil {
+					log.Printf("[auth] 会话吊销落盘失败: %v", err)
+					return false
+				}
+				delete(m.rawTokens, u.ID)
+				return true
+			}
+		}
+		// 旧兼容槽（尚未迁入 Sessions 的存量数据）命中：直接清
+		if u.Token != "" && subtle.ConstantTimeCompare([]byte(u.Token), []byte(presented)) == 1 {
+			u.Token = ""
+			u.TokenExp = 0
+			if err := m.save(); err != nil {
+				log.Printf("[auth] 兼容槽吊销落盘失败: %v", err)
+				return false
+			}
+			delete(m.rawTokens, u.ID)
+			return true
+		}
+	}
+	return false
 }
 
 // updateUser 按 ID 定位用户并应用变更，写入磁盘。

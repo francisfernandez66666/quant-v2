@@ -410,7 +410,7 @@ func main() {
 	// English: §R6 P1-1 startup self-check — dumps binary fingerprint + high-impact config summaries
 	// (LLM key sanity, QMT effective executor) to opslog once at boot so the three real incidents from
 	// 2026-09-01 surface immediately. Warning-only: existing fallbacks still apply.
-	verifyDeployment(cfgMgr)
+	verifyDeployment(cfgMgr, authMgr)
 
 	// 模拟盘账号策略：仅 admin 账号自动按战法建仓/估值；普通用户模拟盘纯手动 + 静态存储。
 	// 同时注入当前启用战法资金池模板（分仓，防单战法垄断）。
@@ -768,7 +768,7 @@ func isStaging() bool {
 // English: §R6 P1-1 deployment-drift self-check at boot (warning-only). Surfaces three real 2026-09-01
 // incidents at startup: stale binary missing the executor-rebuild fix; LLM key typo → full-chain 401;
 // qmt.enabled=true with missing gateway_url/token pinning the executor to Noop.
-func verifyDeployment(cfgMgr *config.Manager) {
+func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
 	// —— 0. staging 影子环境 fail-fast ——
 	// §WS-G：QUANT_ENV=staging 下 qmt.enabled=true 一律拒绝启动（staging 严禁连接实盘网关；
 	// enabled=true 说明部署侧残留生产配置，一旦放行即资损级误连）。staging 的决策流由
@@ -864,6 +864,33 @@ func verifyDeployment(cfgMgr *config.Manager) {
 		}
 	} else {
 		log.Printf("[deploy] QMT 配置段缺失（GetQMTConfigFor 返回 nil），实盘链路按关闭处理")
+	}
+
+	// §D5 修复：per-user QMT 覆盖清单——多账号实盘下每个用户可独立配 gateway/token，
+	// 但启动日志此前只打 `GetQMTConfigFor("")`（读全局 config.json rules.qmt），
+	// 用户按启动日志判断连的是哪个 gateway，实际按 per-user 路由到别的地方（UAT 2026-09-13 现场踩过：
+	// 启动日志显示 mock:18789，生产 gateway 是别的地址；反之亦然）。
+	// 这里遍历所有账号打一行摘要，让"当前谁连哪儿"启动即显式，与 auth.json 内 per-user 快照同源。
+	// English: D5 — enumerate per-user QMT overrides at boot; previously the log only showed the
+	// global config.json fallback which can drift from the actual per-user gateway in use.
+	if authMgr != nil {
+		if global := cfgMgr.GetQMTConfigFor(""); global != nil {
+			for _, u := range authMgr.ListUsers() {
+				perUser := cfgMgr.GetQMTConfigFor(u.ID)
+				if perUser == nil {
+					continue
+				}
+				// 只在与全局回退不一致时打（一致时不刷屏）；enabled/token 都参与比对
+				if perUser.GatewayURL != global.GatewayURL || perUser.Enabled != global.Enabled || perUser.Token != global.Token || perUser.Mode != global.Mode {
+					state := "覆盖"
+					if !perUser.Enabled {
+						state = "覆盖·关闭"
+					}
+					log.Printf("[deploy] QMT %s %s(%s): enabled=%t gateway=%q token=%q mode=%s",
+						state, u.Username, u.ID, perUser.Enabled, perUser.GatewayURL, redact(perUser.Token), perUser.Mode)
+				}
+			}
+		}
 	}
 }
 

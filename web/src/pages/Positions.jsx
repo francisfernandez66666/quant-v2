@@ -438,6 +438,13 @@ export default function Positions() {
   // 打开实盘下单确认弹窗：预填参考价与默认数量，若网关已熔断则禁止下单
   function openRealAction(p, dir) {
     if (realTripped) { MessagePlugin.warning('网关已熔断，暂停实盘下单'); return }
+    // §F16 持仓不足一手禁减仓：A 股卖出必须整手（100 股）或清仓全卖，
+    // qty<100 减仓会被后端 400 拒（"卖出不支持零股"）；提前把用户引到清仓。
+    const p0 = p || {}
+    if (dir === 'reduce' && (p0.qty || 0) < 100) {
+      MessagePlugin.warning('持仓 ' + (p0.qty || 0) + ' 股不足一手，请用「清仓」全卖')
+      return
+    }
     setRealAction({ pos: p, dir })
     setRealFormPrice(curPrice(p) || p.cost_price || 0)
     // 默认数量：加仓 100 股（一手），减仓则为持仓量（不超过一手）
@@ -451,7 +458,12 @@ export default function Positions() {
     const qty = a.dir === 'close' ? (a.pos.qty || 0) : Math.round(Number(realFormQty) || 0)
     const price = Number(realFormPrice) || 0
     if (qty <= 0 || price <= 0) { MessagePlugin.warning('请输入有效的价格与数量'); return }
+    // §F16 前端兜底：减仓/止盈方向必须 ≥100 且为整手，与后端 400 拒单同口径
     const sell = a.dir === 'reduce' || a.dir === 'tp' || a.dir === 'close'
+    if (sell && a.dir !== 'close' && (qty < 100 || qty % 100 !== 0)) {
+      MessagePlugin.warning('卖出必须整手（100 的倍数）；如需清仓请用清仓动作')
+      return
+    }
     setRealSubmitting(true)
     // 构造实盘下单请求参数并提交
     try {
@@ -845,9 +857,18 @@ export default function Positions() {
           <Form.FormItem label="参考价">
             <InputNumber value={realFormPrice} min={0} step={0.001} placeholder="成交参考价" onChange={(v) => setRealFormPrice(Number(v) || 0)} />
           </Form.FormItem>
-          <Form.FormItem label={realAction?.dir === 'add' ? '加仓数量' : '数量'}>
-            <InputNumber value={realFormQty} min={0} step={100} placeholder={realAction?.dir === 'add' ? '股数（一手=100）' : '股数'} onChange={(v) => setRealFormQty(parseInt(v) || 0)} />
-          </Form.FormItem>
+           {/* §F16 卖出不支持零股：非清仓方向的卖出/减仓数量 min=100 强制一手起，
+               与后端 qmt.go:317-327 校验同口径；清仓走 pos.qty 全量，输入框隐藏数量语义。 */}
+           <Form.FormItem label={realAction?.dir === 'add' ? '加仓数量' : realAction?.dir === 'close' ? '清仓数量' : '减仓数量'}>
+             <InputNumber
+               value={realFormQty}
+               min={realAction?.dir === 'close' ? 0 : 100}
+               step={100}
+               disabled={realAction?.dir === 'close'}
+               placeholder={realAction?.dir === 'add' ? '股数（一手=100）' : realAction?.dir === 'close' ? '全部持仓 ' + (realAction?.pos?.qty || 0) + ' 股' : '股数（最少一手=100）'}
+               onChange={(v) => setRealFormQty(parseInt(v) || 0)}
+             />
+           </Form.FormItem>
           <Form.FormItem label="战法">
             <Input value={realFormStrategy} placeholder="策略名（可选）" onChange={(v) => setRealFormStrategy(v)} />
           </Form.FormItem>

@@ -52,6 +52,7 @@ export function sorterStr(key) {
 }
 
 // English: numeric-field sorter factory (ascending; missing values treated as 0).
+// sorterNum 数值列排序比较器（antd 风格 sorter 工厂，缺值沉底）。
 export function sorterNum(key) {
   return (a, b) => (a[key] || 0) - (b[key] || 0)
 }

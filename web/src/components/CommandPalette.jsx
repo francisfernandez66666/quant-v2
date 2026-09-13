@@ -30,6 +30,7 @@ export function filterCommands(items, query) {
 /**
  * @param {{pages:Array<{to:string,label:string,hint?:string}>, onOpenStock?:(code:string,name?:string)=>void, onClose:()=>void}} props
  */
+// Ctrl+K 全局命令面板：跳转页面/直达个股（输入过滤 + 键盘上下选）。
 export default function CommandPalette({ pages = [], onOpenStock, onClose }) {
   const navigate = useNavigate()
   const [query, setQuery] = useState('')

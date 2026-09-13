@@ -12,9 +12,12 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"log"
 	"net/http"
 	"reflect"
 	"strconv"
+	"strings"
 
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/research"
@@ -46,16 +49,47 @@ func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
 	if body.TopN > 0 {
 		payload["top_n"] = body.TopN
 	}
-	id, _, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, optTaskRefID, payload)
+	// §W6 修复：objective 分槽——不同优化目标使用不同 ref_id 槽位，
+	// 避免旧行为"任意时刻只允许 1 个扫参任务、后续 objective 请求被 HasActiveTaskByRef 静默吞掉"
+	// （前端 4 次切目标提交 → 实际只跑首次那条 → 结果永远一致）。
+	// 相同 objective 内部仍幂等（同一目标不会同时排队两条相同扫参）。
+	// English: W6 — slot ref_id by objective; prevents HasActiveTaskByRef from silently dropping
+	// follow-up optimize requests with a different objective while a prior one is still queued.
+	id, _, err := s.enqueueBacktestTask(store.TaskBacktestStrategy, optRefIDFor(body.Objective), payload)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"task_id": id, "status": "queued"})
+	writeJSON(w, http.StatusAccepted, map[string]any{"task_id": id, "status": "queued", "objective": body.Objective, "ref_id": optRefIDFor(body.Objective)})
 }
 
-// optTaskRefID 扫参任务的 ref_id（同 ref 幂等：已有排队/运行中扫参则不重复入队）。
+// optTaskRefID 扫参任务默认槽位（盈亏比 objective 或未指定时的历史值，兼容旧数据）。
+// English: default (profitFactor / unknown) slot for optimize tasks.
 const optTaskRefID int64 = 990
+
+// optRefIDFor 按优化目标返回稳定的槽位 id。
+// 已知 5 目标占 990-994（盈亏比沿用历史 990，其他 4 目标顺序排布），未知目标兜底
+// 走 FNV32 散列到 1000-1099 段（不与已知槽冲突）。同 objective 幂等，跨 objective 互不遮挡。
+// English: stable slot per objective; known objectives use 990-994, unknown fall back to a
+// hashed 1000-1099 range. Same-objective requests dedup, different-objective don't collide.
+func optRefIDFor(objective string) int64 {
+	switch strings.ToLower(strings.TrimSpace(objective)) {
+	case "", "profitfactor":
+		return 990
+	case "winrate":
+		return 991
+	case "avgwin":
+		return 992
+	case "expectancy":
+		return 993
+	case "calmar":
+		return 994
+	default:
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(strings.ToLower(strings.TrimSpace(objective))))
+		return 1000 + int64(h.Sum32()%100)
+	}
+}
 
 // handleOptimizationList 处理 GET /api/research/optimizations。
 // §B 每行附加「模拟盘实测」：按 战法→池 映射取池级真实绩效（胜率/期望/成交笔数），
@@ -109,6 +143,7 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 	p := row.Params
 	// §回测自动增强 D：可选 body {params:{...}} 用 Pareto 推荐解参数覆盖冠军行参数——
 	// 前端「应用推荐解」直接提交 grid_json.pareto.recommended.params，落库行与审计仍走本 id。
+	overridden := false
 	if r.Body != nil {
 		var body struct {
 			Params *store.SweepParams `json:"params"`
@@ -116,7 +151,17 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 		if derr := json.NewDecoder(r.Body).Decode(&body); derr == nil && body.Params != nil {
 			if body.Params.TakeProfitPct > 0 || body.Params.HoldDays > 0 {
 				p = *body.Params
+				overridden = true
 			}
+		}
+	}
+	// §F4 修复：override 生效时把实际写入的规则参数同步回排名行 params 列，
+	// 否则重开页面卡片显示旧冠军、applied_*.json 却是推荐解，两处数字对不上。
+	if overridden {
+		if uerr := s.researchDB.UpdateOptimizationParams(id, p); uerr != nil {
+			log.Printf("[optimize] 排名行 #%d 参数回写失败（已应用配置不受影响）: %v", id, uerr)
+		} else {
+			row.Params = p
 		}
 	}
 	if row.StrategyKind == "" {

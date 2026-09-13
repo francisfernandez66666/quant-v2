@@ -8,6 +8,7 @@ import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
+import SentimentCard from '../components/SentimentCard.jsx'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
 function ipoCountdown(c) {
@@ -279,6 +280,9 @@ export default function Dashboard() {
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
         <Button theme="default" variant="outline" onClick={() => setShowLog(true)}>📋 日志</Button>
       </div>
+
+      {/* §Dashboard 情绪面板 A：当前相位徽章 + 30 日色带 + 涨停/连板/建议仓位三指标 */}
+      <SentimentCard />
 
       {/* 核心指标卡：强信号/观察中/静默/监控个股数量一目了然 */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>

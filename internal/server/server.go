@@ -431,6 +431,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /auth/temp", s.handleTemp)
 	s.mux.HandleFunc("POST /auth/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	// §D7 自助退出：吊销当前 Bearer 对应的服务端会话（旧行为只清浏览器 localStorage，
+	// 令牌在服务端 Sessions 里长期有效，换设备/清缓存后仍可被截获回放）。
+	// English: self-service logout revokes the presenting token's server-side session.
+	s.mux.HandleFunc("POST /api/auth/logout", s.authMiddleware(s.handleLogout))
 	s.mux.HandleFunc("GET /setup", s.handleSetupStatus)
 	s.mux.HandleFunc("POST /setup", s.handleSetupSubmit)
 
@@ -472,6 +476,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/data_source_health", s.authMiddleware(s.handleDataSourceHealth))
 	s.mux.HandleFunc("GET /api/news_source_health", s.authMiddleware(s.handleNewsSourceHealth))
 	s.mux.HandleFunc("GET /api/dashboard", s.authMiddleware(s.handleDashboard))
+	// §Dashboard 情绪面板 A：日级情绪/风险档历史（近 30 交易日色带 + 关键指标）
+	// English: sentiment card backend — daily emotion/market-state series for the Dashboard.
+	s.mux.HandleFunc("GET /api/market/emotion/history", s.authMiddleware(s.handleMarketEmotionHistory))
+	// §Dashboard 情绪面板 B：情绪×战法回测矩阵（候选逐事件断点缓存分相聚合）
+	// English: emotion × strategy matrix (B4 event cache bucketed by daily sentiment phase).
+	s.mux.HandleFunc("GET /api/research/emotion-strategy-matrix", s.authMiddleware(s.handleEmotionStrategyMatrix))
 	// 做多/做空开关：属运营配置，仅管理员可切换；状态对所有登录用户可读（看板展示用）。
 	// （Long/short toggles are operator config: only admin may toggle; status is readable by all.）
 	s.mux.HandleFunc("POST /api/long/toggle", s.adminMiddleware(s.handleLongToggle))
@@ -874,6 +884,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLogout 处理 POST /api/auth/logout：吊销当前 Bearer 对应的服务端会话。
+// §D7 修复：退出必须回收 Sessions 中的哈希条目——只清客户端 localStorage 会让令牌
+// 在服务端一直有效到 TTL，任何拿到旧请求头的路径（浏览器历史/代理日志）都能续命。
+// 幂等：已吊销也返回 200（前端 logout 常因网络重试重复调用）。
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	tok := bearerToken(r)
+	uid := requestUserID(r)
+	ok := s.auth.RevokeSession(tok)
+	opslog.Audit("logout", uid, uid, map[bool]string{true: "ok", false: "noop"}[ok])
+	writeJSON(w, 200, map[string]bool{"revoked": ok})
+}
+
 // ── Setup handlers ──
 
 // handleSetupStatus 处理 GET /setup：返回系统是否已完成初始化（用于前端引导首次配置）。
@@ -1161,6 +1183,17 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, user)))
 	}
+}
+
+// bearerToken 从 Authorization 头取原始令牌（去 "Bearer " 前缀，与 authMiddleware 同口径）。
+// English: bearerToken extracts the raw bearer credential from the Authorization header, same
+// normalization as authMiddleware.
+func bearerToken(r *http.Request) string {
+	t := r.Header.Get("Authorization")
+	if t == "" {
+		return ""
+	}
+	return strings.TrimPrefix(t, "Bearer ")
 }
 
 // adminMiddleware 管理员中间件：在认证基础上要求当前用户为管理员角色，否则返回 403。

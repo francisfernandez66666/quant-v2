@@ -25,7 +25,7 @@ func initConfig(t *testing.T) *config.Manager {
 func TestVerifyDeploymentQMTDisabled(t *testing.T) {
 	m := initConfig(t)
 	m.Rules.QMT = config.DefaultQMTConfig() // enabled=false
-	verifyDeployment(m)                     // 不应 panic
+	verifyDeployment(m, nil)  // 不应 panic
 }
 
 // TestVerifyDeploymentQMTEnabledNoToken QMT enabled=true 但缺 token → 必须输出 Noop 告警（开关白开根因）。
@@ -37,19 +37,19 @@ func TestVerifyDeploymentQMTEnabledNoToken(t *testing.T) {
 	q.GatewayURL = "http://127.0.0.1:8789"
 	q.Token = ""
 	m.Rules.QMT = q
-	verifyDeployment(m) // 仅验证不 panic；告警内容经由日志人工核对
+	verifyDeployment(m, nil)  // 仅验证不 panic；告警内容经由日志人工核对
 }
 
 // TestVerifyDeploymentLLMKeys 短 key / 含空白 / 重复都只告警不阻断。
 func TestVerifyDeploymentLLMKeys(t *testing.T) {
 	t.Setenv("LLM_API_KEYS", "abc, abc, abc") // 短 + 空格 + 重复
 	m := initConfig(t)
-	verifyDeployment(m)
+	verifyDeployment(m, nil)
 }
 
 // TestVerifyDeploymentQMTNil 配置段缺失（GetQMTConfigFor 返回 nil 的等价场景）不 panic。
 func TestVerifyDeploymentQMTNil(t *testing.T) {
 	m := initConfig(t)
 	m.Rules.QMT = config.QMTConfig{} // 零值，缺 gateway_url/token 但 enabled=false
-	verifyDeployment(m)
+	verifyDeployment(m, nil)
 }

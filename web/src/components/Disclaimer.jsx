@@ -12,6 +12,7 @@ export const DISCLAIMER_TEXT =
 /**
  * @param {{variant?: 'login'|'footer'|'inline'}} [props]
  */
+// 合规免责声明条（登录页/仪表盘/咨询三处复用，固定文案不可配置）。
 export default function Disclaimer({ variant = 'inline' }) {
   if (variant === 'login') {
     return (

@@ -194,7 +194,9 @@ export default function MsgCenter() {
     const ok = await confirmDialog(`模拟卖出 ${a.code} ${a.name || ''}？（按实时价全仓卖出）`, '模拟卖出')
     if (!ok) return
     try {
-      await api.sellPaperPosition(a.code, 0)
+      // §F25 修复：签名 3 参 (code,price,qty)，此前只传 (code,0) → qty=undefined
+      // 落到 `qty||0` 依赖兜底语义（0=全平）；显式写出避免签名漂移时静默变化。
+      await api.sellPaperPosition(a.code, 0, 0)
       MessagePlugin.success(`${a.code} 模拟卖出成功`)
       load()
     } catch (e) {
@@ -217,6 +219,11 @@ export default function MsgCenter() {
     load()
     // §SHORT-4 探测做空开关（关闭时消息列表隐藏做空内容）
     api.fetchShortStatus().then((r) => setShortEnabled(!!r.short_enabled)).catch(() => {})
+    // §F26 修复：订阅顶栏广播的 short:toggled，保持与 App.jsx 同一份状态；
+    // 旧版本 mount 各自拉一次，切页/顶栏切换后本页可能显示旧值。
+    const onToggle = (e) => setShortEnabled(!!(e && e.detail && e.detail.enabled))
+    window.addEventListener('short:toggled', onToggle)
+    return () => window.removeEventListener('short:toggled', onToggle)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

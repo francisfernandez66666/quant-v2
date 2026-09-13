@@ -9,11 +9,13 @@
 // English: handlers keyed by type; '*' is a wildcard receiving every message.
 const handlers = new Map()
 
+// add 注册某类 SSE 事件的监听器，返回反订阅函数。
 function add(type, fn) {
   let set = handlers.get(type)
   if (!set) { set = new Set(); handlers.set(type, set) }
   set.add(fn)
 }
+// remove 按引用摘除监听器（重复订阅同回调时只摘一份）。
 function remove(type, fn) {
   const set = handlers.get(type)
   if (!set) return

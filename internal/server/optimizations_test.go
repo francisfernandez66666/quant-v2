@@ -117,3 +117,23 @@ func TestOptimizationEndpoints(t *testing.T) {
 		t.Fatalf("状态应为 rejected")
 	}
 }
+
+// TestOptRefIDForSlots §W6：objective→ref_id 固定槽位（990~994），未知目标哈希进
+// 1000~1099 且确定性稳定——锁死"同 objective 幂等、不同 objective 不互覆盖"的契约。
+// English: objective-slot mapping contract for parallel optimize tasks.
+func TestOptRefIDForSlots(t *testing.T) {
+	want := map[string]int64{"": 990, "profitfactor": 990, "winRate": 991, "AVGWIN": 992, " expectancy ": 993, "calmar": 994}
+	for obj, id := range want {
+		if got := optRefIDFor(obj); got != id {
+			t.Fatalf("optRefIDFor(%q)=%d want %d", obj, got, id)
+		}
+	}
+	// 未知目标：确定性哈希且落在 1000~1099 区间，不与固定槽位冲突
+	a, b := optRefIDFor("sharpe"), optRefIDFor("sharpe")
+	if a != b || a < 1000 || a > 1099 {
+		t.Fatalf("未知目标哈希漂移: %d vs %d", a, b)
+	}
+	if optRefIDFor("sharpe") == optRefIDFor("mdd") {
+		t.Fatalf("不同未知目标不应同槽")
+	}
+}

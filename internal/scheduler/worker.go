@@ -235,6 +235,11 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 			// §回测自动增强 C：顶层新键必须在此声明，否则 json 解析静默丢弃（D 轮前端消费源）
 			Pareto        json.RawMessage `json:"pareto"`
 			SlippageCalib json.RawMessage `json:"slippage_calib"`
+			// §W7 样本门槛审计（btreplay.SweepConfig.MinTriggers 侧输出）
+			Sample json.RawMessage `json:"sample"`
+			// §W7 兜底分支：全部低样本剔除时，results[0] 带 insufficient_sample=true；
+			// 单独透传一个标记供前端展示"样本不足以推荐"横幅。
+			Insufficient bool `json:"insufficient_sample"`
 		}
 		if err := json.Unmarshal([]byte(m[1]), &payload); err != nil {
 			log.Printf("[scheduler] 任务 #%d SWEEP_JSON 解析失败: %v", taskID, err)
@@ -247,13 +252,20 @@ func (s *Scheduler) saveSweepResults(db *store.DB, taskID int64, out string) {
 		// §D2 冠军行附带信息（热力网格 + 批次冠军明细）回写 grid_json，前端详情渲染源
 		// §回测自动增强 C：pareto / slippage_calib 段捎带进同一 grid_json 容器（零 schema 迁移）；
 		// 旧任务无这些键 → omitempty 不落 null，前端按缺键降级为 champion 展示。
-		if len(payload.Grid) > 0 || len(payload.Batches) > 0 || len(payload.Pareto) > 0 || len(payload.SlippageCalib) > 0 {
+		if len(payload.Grid) > 0 || len(payload.Batches) > 0 || len(payload.Pareto) > 0 || len(payload.SlippageCalib) > 0 || len(payload.Sample) > 0 {
 			extraMap := map[string]any{"grid": payload.Grid, "batches": payload.Batches}
 			if len(payload.Pareto) > 0 {
 				extraMap["pareto"] = payload.Pareto
 			}
 			if len(payload.SlippageCalib) > 0 {
 				extraMap["slippage_calib"] = payload.SlippageCalib
+			}
+			// §W7 样本门槛审计随附；insufficient_sample 兜底标记同容器
+			if len(payload.Sample) > 0 {
+				extraMap["sample"] = payload.Sample
+			}
+			if payload.Insufficient {
+				extraMap["insufficient_sample"] = true
 			}
 			if extra, jerr := json.Marshal(extraMap); jerr == nil && len(payload.Results) > 0 {
 				strategy, _ := payload.Results[0]["strategy"].(string)

@@ -297,3 +297,15 @@ func TestStepRange(t *testing.T) {
 		t.Fatalf("N形应命中独立寻优池 maxHold=15, got %d", p.maxHold)
 	}
 }
+
+// TestMinTriggersForObjDefaults §W7：按目标默认最小样本门槛（尾部依赖越重门槛越高）。
+// 锁死数字防止"改着玩"把胜率 20 改成 5 之类的静默放水。
+// English: pin the per-objective default min-trigger thresholds.
+func TestMinTriggersForObjDefaults(t *testing.T) {
+	cases := map[string]int{"winrate": 20, "avgwin": 20, "calmar": 30, "expectancy": 15, "profitfactor": 15, "": 15}
+	for obj, want := range cases {
+		if got := minTriggersForObj(obj); got != want {
+			t.Fatalf("minTriggersForObj(%q)=%d, want %d", obj, got, want)
+		}
+	}
+}

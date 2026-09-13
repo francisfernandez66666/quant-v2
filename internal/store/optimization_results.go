@@ -230,3 +230,18 @@ func (d *DB) UpdateOptimizationStatus(id int64, status string) error {
 	_, err := d.db.Exec(`UPDATE optimization_results SET status = ? WHERE id = ?`, status, id)
 	return err
 }
+
+// UpdateOptimizationParams 覆写排名行的 params_json 列（§F4 修复：Pareto 推荐解覆盖冠军行时，
+// 应用后 DB 里 params 仍是旧冠军 → 重开页面卡片与 applied 配置不一致；审批带 override 时
+// 应把实际写入的 params 同步回排名行）。
+// English: F4 — persist the actually-applied (possibly Pareto-override) params on the ranking
+// row; previously the row kept the champion params, so the UI showed one set while the rule
+// config had another.
+func (d *DB) UpdateOptimizationParams(id int64, params any) error {
+	b, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	_, err = d.db.Exec(`UPDATE optimization_results SET params = ? WHERE id = ?`, string(b), id)
+	return err
+}

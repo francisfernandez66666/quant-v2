@@ -17,6 +17,7 @@ const VALID = new Set(['light', 'dark'])
 // English: subscriber set for consumers outside React (canvas charts).
 const listeners = new Set()
 
+// readStored 读取 localStorage 中的主题偏好（异常/无痕环境静默回落 null）。
 function readStored() {
   try {
     const t = localStorage.getItem(THEME_KEY)

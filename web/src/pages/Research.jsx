@@ -554,14 +554,30 @@ export default function Research() {
     finally { setLoadingOpts(false) }
   }
   // 发起全库战法参数寻优，提交目标函数后进入研究队列（盘后窗口执行）
+  // §W6 修复：响应带 objective/ref_id，若与当前 optObjective 不同说明命中同 objective 幂等
+  //   → 提示"当前目标已有任务在跑"而不是假装新入队；配合 W8 前端过滤让列表卡片与详情同 objective。
+  // §F2 修复：try/finally 保证 optLaunching 复位；此前只有成功路径复位，网络异常/后端 500
+  //   会让按钮永远转圈。
+  // English: F2/W6 — always reset optLaunching; surface the "duplicate objective already queued"
+  // case instead of a fake "queued" toast.
   async function startOptimize() {
-    if (!(await confirmDialog('发起全库战法参数寻优？\n目标：' + optObjectiveLabel(optObjective) + '，盘后窗口执行，完成后排名出现在本页。'))) return
+    if (!(await confirmDialog('发起全库战法参数寻优？\n目标：' + optObjectiveLabel(optObjective) + '，盘后窗口执行，完成后回到「优化结果」tab 刷新。'))) return
+    setOptLaunching(true)
     try {
-      await api.enqueueOptimize({ objective: optObjective })
-      setOptLaunching(true)
-      showToast('已加入研究队列——进度可在「回测」tab 查看，完成后回到「优化结果」刷新。', 'success')
-    } catch (e) { showToast('发起失败: ' + (e.message || e), 'error') }
+      const res = await api.enqueueOptimize({ objective: optObjective })
+      const objEcho = (res && res.objective) || optObjective
+      showToast('已加入研究队列（task #' + (res && res.task_id) + '，目标 ' + objEcho + '）——盘后窗口执行，进度见「回测」tab。', 'success')
+      // §W6：入队成功后主动刷新任务列表（此前只 setOptLaunching 不刷新，用户看不到队列位次）
+      loadOptimizations()
+    } catch (e) {
+      showToast('发起失败: ' + (e.message || e), 'error')
+    } finally {
+      setOptLaunching(false)
+    }
   }
+  // §F5 修复：本地 mutation `r.status='approved'` 只改内存对象，列表 useMemo 依赖
+  // [optTasks]，不重取数据 → 用户刷新前按钮状态与实际后端不一致（reject 同）。
+  // 加 loadOptimizations() 强制重取，与 approve/reject 后端落库同步。
   async function approveOpt(r, overrideParams) {
   // 审批通过某条寻优排名（写入 applied 配置并热加载）；
   // §回测自动增强 D：overrideParams=Pareto 推荐解参数时以推荐解覆盖冠军行（body 透传后端）
@@ -571,45 +587,64 @@ export default function Research() {
       fmtNum(p.stop_loss_pct) + '% · 兜底 ' + fmtNum(p.hold_days) + ' 天' +
       ((p || {}).min_score ? ' · 门槛 ' + fmtNum(p.min_score) : '') + '\n审批后立即热重载生效。'
     if (!(await confirmDialog(msg))) return
-    try { await api.approveOptimization(r.id, overrideParams); r.status = 'approved'; showToast('已应用参数', 'success') } catch (e) { showToast('入库失败: ' + (e.message || e), 'error') }
+    try {
+      await api.approveOptimization(r.id, overrideParams)
+      r.status = 'approved'
+      showToast(overrideParams ? '已应用推荐解参数' : '已应用参数', 'success')
+      loadOptimizations() // §F5：后端 params 列 override 已回写，重取才能同步前端
+    } catch (e) { showToast('入库失败: ' + (e.message || e), 'error') }
   }
   async function rejectOpt(r) {
   // 淘汰某条寻优排名
-    try { await api.rejectOptimization(r.id); r.status = 'rejected'; showToast('已淘汰', 'success') } catch (e) { showToast('操作失败: ' + (e.message || e), 'error') }
+    try {
+      await api.rejectOptimization(r.id)
+      r.status = 'rejected'
+      showToast('已淘汰', 'success')
+      loadOptimizations() // §F5：同上，重取以刷新列表卡片状态
+    } catch (e) { showToast('操作失败: ' + (e.message || e), 'error') }
   }
 
   const optStrategies = useMemo(() => {
   // 常量 optStrategies：局部定义
     if (!optTasks.length) return []
-    // §寻优修复：此前只取 optTasks[0].results——只显示最新任务的排名。现跨全部任务按战法聚合，
-    // 同一战法保留最新任务中的冠军行（bestExp 最大），避免"只显示一个战法"或重复按钮。
-    // English: was optTasks[0].results only (latest task). Now aggregates across all tasks per strategy,
-    // keeping the best champion row (max expectancy) so every strategy shows up once.
+    // §W8 修复：仅展示「当前 objective 的最新任务」的冠军，不再跨任务按 bestExp 合并
+    // ——旧逻辑把「胜率冠军（exp=0.3%, n=800）」和「盈亏比冠军（exp=1.5%, n=3）」
+    // 折叠成一条（后者胜出），用户看不到自己刚提交的 objective 的实际结果。
+    // English: W8 — restrict to the currently-selected objective; the previous cross-task
+    // bestExp merge hid the user's just-submitted objective's champion.
+    const objWant = (optObjective || 'profitFactor').toLowerCase()
     const byKey = new Map()
+    // optTasks 由后端按 task_id DESC 排序，第一次命中的即该 objective 的最新任务
     for (const t of optTasks) {
+      const tObj = (t.objective || '').toLowerCase()
+      if (tObj && tObj !== objWant) continue
       const rows = t.results || []
-      // 常量 rows：局部定义
       for (const r of rows) {
         const key = r.strategy_kind || r.strategy
-        // 期望值归一：undefined/null 视为未知，仅在更高时替换该战法最优记录
-        const exp = (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null
-        const prev = byKey.get(key)
-        if (!prev || (exp !== null && (prev.bestExp === null || exp > prev.bestExp))) {
-          byKey.set(key, { key, label: r.strategy, bestExp: exp, samples: (r.trigger_count !== undefined && r.trigger_count !== null) ? Number(r.trigger_count) : null })
-        }
+        if (byKey.has(key)) continue // 同 objective 最新任务已收，旧任务不覆盖
+        byKey.set(key, {
+          key,
+          label: r.strategy,
+          bestExp: (r.expectancy !== undefined && r.expectancy !== null) ? Number(r.expectancy) : null,
+          samples: (r.trigger_count !== undefined && r.trigger_count !== null) ? Number(r.trigger_count) : null,
+        })
       }
     }
     return [...byKey.values()]
-  }, [optTasks])
+  }, [optTasks, optObjective])
   const optCur = useMemo(() => {
   // 常量 optCur：局部定义
+  // §W8 修复：同 objective 过滤（前端 optStrategies 与 optCur 用同一 objective，
+  // 避免卡片与详情抽屉数字不一致）
+    const objWant = (optObjective || 'profitFactor').toLowerCase()
     for (const t of optTasks) {
+      const tObj = (t.objective || '').toLowerCase()
+      if (tObj && tObj !== objWant) continue
       const hit = (t.results || []).find((r) => (r.strategy_kind || r.strategy) === optSelected)
-      // 常量 hit：局部定义
       if (hit) return { ...hit, task_id: t.task_id }
     }
     return null
-  }, [optTasks, optSelected])
+  }, [optTasks, optSelected, optObjective])
   const optCurHeat = useMemo(() => {
   // 常量 optCurHeat：局部定义
     const empty = { tps: [], sls: [], map: {} }
@@ -840,9 +875,17 @@ export default function Research() {
   }
   function builtinLabel(num) {
   // 将内置规则编号转换为战法中文名
-    const m = { 901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形', 990: '全库参数寻优' }
+  // §W6 objective 分槽：990-994 分别对应 盈亏比/胜率/平均盈利/期望收益/卡玛比率 扫参任务
+    const m = {
+      901: '双响炮', 902: '龙头', 903: '龙回头', 904: 'N形',
+      990: '全库寻优·盈亏比', 991: '全库寻优·胜率', 992: '全库寻优·平均盈利',
+      993: '全库寻优·期望收益', 994: '全库寻优·卡玛比率',
+    }
     // 常量 m：局部定义
-    return m[num] || ('规则 ' + num)
+    if (m[num]) return m[num]
+    // 1000-1099 段：W6 未知 objective 的 FNV 散列兜底
+    if (num >= 1000 && num < 1100) return '全库寻优·其他'
+    return ('规则 ' + num)
   }
   function selectStrategy(key) {
   // 选中某战法进入参数寻优配置

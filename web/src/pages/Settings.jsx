@@ -105,6 +105,12 @@ export default function Settings() {
 
   const [strategyCfg, setStrategyCfg] = useState(emptyStrategy())
   const [strategySaving, setStrategySaving] = useState(false)
+  // §F33 修复：保存前 dirty tracking 基线（LLM/战法配置分别），load 完成时同步，
+  // 保存成功后重置。dirty=true 时按钮右上角亮小圆点 + 页面关闭前 beforeunload 拦截。
+  // English: F33 — baseline snapshots for LLM/strategy configs; dirty indicator + unload guard
+  // replace the previous silent "unsaved edits lost on route change" behavior.
+  const [llmBaseline, setLlmBaseline] = useState(null)
+  const [strategyBaseline, setStrategyBaseline] = useState(null)
 
   const [newsShowAll, setNewsShowAll] = useState(false)
 
@@ -113,6 +119,7 @@ export default function Settings() {
     setStrategySaving(true)
     try {
       await api.setStrategyConfig(strategyCfg)
+      setStrategyBaseline(JSON.parse(JSON.stringify(strategyCfg))) // §F33 基线跟随
       showToast('战法参数已保存，热更新即时生效', 'success')
     } catch (e) {
       showToast('保存失败: ' + (e.message || '未知错误'), 'error')
@@ -176,6 +183,11 @@ export default function Settings() {
         d1_max_tokens: llmD1MaxTokens,
       })
       setLlmConfigured(!!llmApiKeys)
+      // §F33 保存成功后基线跟随当前值，dirty 归零
+      setLlmBaseline({
+        api_url: llmApiUrl, model: llmModel, classifier_model: llmClassifierModel,
+        batch_concurrency: llmBatchConcurrency, d1_max_tokens: llmD1MaxTokens, api_keys: llmApiKeys,
+      })
       showToast('LLM 配置已保存并热生效', 'success')
     } catch (e) {
       showToast('保存失败: ' + (e.message || '未知错误'), 'error')
@@ -218,6 +230,14 @@ export default function Settings() {
           setLlmApiKeys(keys)
           // 已配置判定：有 Key 或有地址即视为已配置
           setLlmConfigured(!!(keys || cfg.api_url))
+          // §F33 基线同步：与上面 set* 一一对应，用于计算 dirty
+          setLlmBaseline({
+            api_url: cfg.api_url || '', model: cfg.model || '',
+            classifier_model: cfg.classifier_model || '',
+            batch_concurrency: cfg.batch_concurrency > 0 ? cfg.batch_concurrency : 4,
+            d1_max_tokens: cfg.d1_max_tokens > 0 ? cfg.d1_max_tokens : 2048,
+            api_keys: keys,
+          })
         }
       } catch (_) {}
       // 3) 读取战法参数：先建五组空占位，再按分组归并后端返回
@@ -230,6 +250,7 @@ export default function Settings() {
             if (src) Object.assign(next[group.key], src)
           }
           setStrategyCfg(next)
+          setStrategyBaseline(JSON.parse(JSON.stringify(next))) // §F33 深拷贝基线
         }
       } catch (_) {}
       // 4) 读取"显示全部资讯"开关状态
@@ -239,6 +260,25 @@ export default function Settings() {
       } catch (_) {}
     })()
   }, [])
+
+  // §F33 修复：dirty 计算 + beforeunload 拦截 + 保存按钮未保存标记
+  // 基线未加载完成时视为不 dirty（避免首帧误闪）
+  const llmDirty = llmBaseline != null && (
+    llmApiUrl !== llmBaseline.api_url ||
+    llmModel !== llmBaseline.model ||
+    llmClassifierModel !== llmBaseline.classifier_model ||
+    llmBatchConcurrency !== llmBaseline.batch_concurrency ||
+    llmD1MaxTokens !== llmBaseline.d1_max_tokens ||
+    llmApiKeys !== llmBaseline.api_keys
+  )
+  const strategyDirty = strategyBaseline != null && JSON.stringify(strategyCfg) !== JSON.stringify(strategyBaseline)
+  const anyDirty = llmDirty || strategyDirty
+  useEffect(() => {
+    if (!anyDirty) return
+    const h = (e) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', h)
+    return () => window.removeEventListener('beforeunload', h)
+  }, [anyDirty])
 
   // 按字段类型渲染控件：switch 类型用 Switch，其余用 InputNumber（默认步进 1）
   const renderField = (group, f) => {
@@ -356,7 +396,9 @@ export default function Settings() {
             {llmConfigured ? '已配置' : '未配置（降级为关键词过滤）'}
           </Tag>
         </div>
+        {/* §F33 dirty=true 时右侧圆点+文字提示，避免"改了忘保存切页丢" */}
         <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
+        {llmDirty && <span style={{ marginLeft: 8, color: 'var(--app-warn-text)', fontSize: 12 }}>● 有未保存修改</span>}
       </Card>
 
       {strategyGroups.map((group) => (
@@ -376,6 +418,7 @@ export default function Settings() {
           <span className="muted" style={{ fontSize: 12 }}>参数保存后重启后端生效；权重请保持各策略合计 ≤ 1</span>
         </div>
         <Button theme="primary" onClick={saveStrategy} loading={strategySaving}>保存战法参数</Button>
+        {strategyDirty && <span style={{ marginLeft: 8, color: 'var(--app-warn-text)', fontSize: 12 }}>● 有未保存修改</span>}
       </Card>
 
       <Card title="资讯显示" style={{ marginBottom: 16 }}>

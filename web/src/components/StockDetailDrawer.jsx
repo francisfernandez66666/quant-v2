@@ -28,6 +28,7 @@ function fmtPct(v) {
   return (n >= 0 ? '+' : '') + n.toFixed(2) + '%'
 }
 
+// RelList 抽屉内关联列表（板块/概念/同行业个股）通用渲染子件。
 function RelList({ items, render }) {
   return (
     <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>

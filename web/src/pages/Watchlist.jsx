@@ -8,17 +8,28 @@ import KLineChart from '../components/KLineChart.jsx'
 import DepthPanel from '../components/DepthPanel.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 
-// 自选股列表的 localStorage 缓存键
+// 自选股列表的 localStorage 缓存键（账号后缀由 cacheKeyForAccount() 拼接）
 const CACHE_KEY = 'wl_cache_v1'
+
+// §F29 修复：自选股缓存按账号隔离——旧版共用 CACHE_KEY，同一浏览器切账号后
+// 首帧渲染会先闪出前一账号的自选列表（后端返回后被覆盖，但那一瞬已泄露）。
+// 迁移：读时若发现无账号后缀的旧键，一次性清除。
+// English: F29 — account-scoped watchlist cache; the legacy un-scoped key is purged on read.
+function cacheKeyForAccount() {
+  const acc = (typeof api.getAccount === 'function' && api.getAccount()) || ''
+  return acc ? CACHE_KEY + ':' + acc : CACHE_KEY
+}
 
 // 将自选股列表持久化到 localStorage
 function persistCache(stocks) {
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify(stocks)) } catch (_) {}
+  try { localStorage.setItem(cacheKeyForAccount(), JSON.stringify(stocks)) } catch (_) {}
 }
 // 从 localStorage 读取自选股缓存
 function loadCache() {
   try {
-    const raw = localStorage.getItem(CACHE_KEY)
+    const legacy = localStorage.getItem(CACHE_KEY)
+    if (legacy) localStorage.removeItem(CACHE_KEY)
+    const raw = localStorage.getItem(cacheKeyForAccount())
     const arr = raw ? JSON.parse(raw) : []
     return Array.isArray(arr) ? arr : []
   } catch (_) { return [] }

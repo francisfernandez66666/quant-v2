@@ -7,6 +7,7 @@ import React from 'react'
 import { useTheme } from '../theme.js'
 import { Tag } from 'tdesign-react'
 
+// 角色常驻条：显示当前账号角色与可见入口范围（admin/user 权限可视化）。
 export default function RoleBar({ account, isAdmin, canResearch, paperEnabled }) {
   const [theme] = useTheme()
   // 依据角色与开关拼入口可见性文案（与 App.jsx 侧 navItems 过滤规则一致）。

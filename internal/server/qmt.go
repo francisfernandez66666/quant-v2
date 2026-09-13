@@ -315,7 +315,16 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	qty := req.Qty
+	// §D4 修复：卖出侧 qty<100 静默放大到 100 会把「用户手滑输 50」变成「按 100 股下单」，
+	// 持仓 80 股时卖 100 会失败（sell exceeds holding）；持仓 500 股时想清 50 结果清 100——
+	// 语义与用户输入不一致。卖出直接 400 拒单，清残股请走「清仓」动作；买入侧凑整保留。
+	// English: silent round-up on sell is removed; sub-lot sells are rejected 400. Buys keep the
+	// <100→100 clamp because A-share 最小申购单位为一手.
 	if qty < 100 {
+		if side == trading.SideSell {
+			writeError(w, 400, "卖出不支持零股（qty<100）；如需清仓请用清仓动作")
+			return
+		}
 		qty = 100 // 不足一手按一手（100 股）
 	}
 	// 卖出侧校验：减仓数量不得超过当前持仓

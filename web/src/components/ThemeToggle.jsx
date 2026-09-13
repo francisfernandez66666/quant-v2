@@ -5,6 +5,7 @@ import React from 'react'
 import { Button } from 'tdesign-react'
 import { useTheme } from '../theme.js'
 
+// 深浅主题切换按钮：写 localStorage 并派发 theme:change 事件。
 export default function ThemeToggle() {
   const [theme, , toggle] = useTheme()
   return (

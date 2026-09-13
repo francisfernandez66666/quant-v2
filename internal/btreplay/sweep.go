@@ -34,6 +34,30 @@ type SweepConfig struct {
 	// English: WS-H C2 multiple-comparison correction switch — when enabled, the SWEEP_JSON payload
 	// includes a Bonferroni-corrected p-value (factor = combos tested for that strategy).
 	MCC bool
+	// §W7 最小触发样本：触发次数低于该阈值的组合直接排除出冠军竞争，
+	// 防"5× 盈利 / 3 次触发"这类统计噪声压过"3× 盈利 / 1000+ 次触发"的稳健解。
+	// 0 = 走 minTriggersForObj(obj) 的按目标默认（winrate/avgwin/calmar 更严）。
+	// English: W7 minimum trigger count — combos below this are excluded from champion contention;
+	// 0 uses per-objective defaults.
+	MinTriggers int
+}
+
+// minTriggersForObj 按目标函数取默认最小样本量：
+// 目标越依赖分布尾部（胜率、平均盈利、卡玛比率需要回撤样本长），门槛越高。
+// English: per-objective default minimum trigger count.
+func minTriggersForObj(obj string) int {
+	switch obj {
+	case "winrate":
+		return 20
+	case "avgwin":
+		return 20
+	case "calmar":
+		return 30
+	case "expectancy":
+		return 15
+	default: // profitfactor
+		return 15
+	}
 }
 
 // 策略自有寻优池：每个战法独立设定止盈线/止损线/兜底天数的搜索范围（§用户反馈）。
@@ -181,6 +205,17 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	if objName == "" {
 		return fmt.Errorf("未知优化目标: %s（可选 profitFactor/winRate/avgWin/expectancy/calmar）", o.Sweep.Objective)
 	}
+	// §W7 生效最小触发样本：显式配置优先，否则按目标默认。低于阈值的组合不参与冠军竞争，
+	// 也不进 Pareto/all 池（避免小样本解占据前沿、把稳健解挤下去）。
+	// English: W7 — effective min-triggers gate: explicit override or per-objective default;
+	// sub-threshold combos are excluded from champion contention AND from the Pareto pool.
+	minTriggers := o.Sweep.MinTriggers
+	if minTriggers <= 0 {
+		minTriggers = minTriggersForObj(obj)
+	}
+	if objName != "" {
+		fmt.Printf("最小触发样本：%d（目标 %s；低于此样本量的组合视为统计噪声，不入冠军候选）\n", minTriggers, objName)
+	}
 
 	// ── 1) K 线一次性载入内存 ──
 	if len(codes) > sweepMaxStocksLimit(o.MaxStocks) {
@@ -298,22 +333,39 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		var champions []sweepResult                // champions[bi] = 第 bi 批冠军（值语义，避免切片扩容指针失效）
 		all := make([]sweepResult, 0, len(combos)) // 全量留存供热力网格聚合（10万条 ≈ 12MB）
 		done := 0
+		lowSample := 0                // §W7 被样本门槛剔除的组合数（供兜底/审计）
+		var fallbackChampion sweepResult // §W7 门槛杀光全部时的兜底冠军（未过门槛的原始最优）
+		var hasFallback bool
 		lastPct := -10
 		// 分批全量模拟：每批选批冠军，进度按完成百分比每 10% 打印一次。
 		for bi := 0; bi*batchSize < len(combos); bi++ {
 			lo, hi := bi*batchSize, min((bi+1)*batchSize, len(combos))
 			bestInBatch := sweepResult{}
 			hasChamp := false
-			for ci := lo; ci < hi; ci++ {
-				cb := combos[ci]
-				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate, sc)
-				r.ObjectiveScore = objectiveValue(obj, &r)
-				all = append(all, r)
-				cur := &all[len(all)-1]
-				if !hasChamp || betterOf(obj, cur, &bestInBatch) == cur {
-					bestInBatch = *cur
-					hasChamp = true
+		for ci := lo; ci < hi; ci++ {
+			cb := combos[ci]
+			r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate, sc)
+			// §W7 小样本剔除：低于门槛的组合不入 all 池（也不参与 Pareto 前沿），
+			// 只在**全部**组合都低于门槛时兜底保留原始冠军，防止前端看到零结果。
+			// English: W7 sub-threshold combos skipped; if everything is below the gate we fall
+			// back to the raw champion so the UI doesn't see zero rows.
+			if r.Count < minTriggers {
+				lowSample++
+				rv := objectiveValue(obj, &r)
+				if !hasFallback || rv > objectiveValue(obj, &fallbackChampion) {
+					fallbackChampion = r
+					hasFallback = true
 				}
+				done++
+				continue
+			}
+			r.ObjectiveScore = objectiveValue(obj, &r)
+			all = append(all, r)
+			cur := &all[len(all)-1]
+			if !hasChamp || betterOf(obj, cur, &bestInBatch) == cur {
+				bestInBatch = *cur
+				hasChamp = true
+			}
 				done++
 				if pct := done * 100 / len(combos); pct >= lastPct+10 {
 					lastPct = pct
@@ -325,23 +377,57 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			}
 		}
 		if len(all) == 0 {
-			fmt.Println("无有效组合。")
-			// §完善：零触发战法也输出 SWEEP_JSON 标记，使「优化结果」完整呈现（而非静默消失）。
-			// English: even zero-trigger strategies emit a SWEEP_JSON marker so the result list is complete.
-			noSignal := struct {
-				Strategy  string           `json:"strategy"`
-				Objective string           `json:"objective"`
-				NoSignal  bool             `json:"no_signal"`
-				Results   []map[string]any `json:"results"`
-			}{
-				Strategy:  ad.Name(),
-				Objective: obj,
-				NoSignal:  true,
-				Results: []map[string]any{
-					{"strategy": ad.Name(), "strategy_kind": kind, "no_signal": true, "trigger_count": 0},
-				},
+			// §W7 兜底分支：
+			//   - 完全零触发（lowSample=0）：无信号；
+			//   - 全部低样本被门槛剔除（lowSample>0）：把未过门槛的原始最优作为 fallback 输出，
+			//     带 insufficient_sample=true 标记，前端展示"样本不足以推荐"但保留数字可查。
+			// English: W7 fall-back path — when the gate prunes everything, emit the raw best
+			// combo with an insufficient_sample flag so the UI can distinguish "no triggers"
+			// from "only noise-level samples".
+			noSignal := lowSample == 0
+			msg := "无有效组合"
+			if !noSignal {
+				msg = fmt.Sprintf("全部 %d 组合触发数 < 最小样本 %d，无可用冠军", lowSample, minTriggers)
 			}
-			if bj, jerr := json.Marshal(noSignal); jerr == nil {
+			fmt.Printf("%s。\n", msg)
+			var resRows []map[string]any
+			if hasFallback {
+				resRows = []map[string]any{{
+					"strategy":            ad.Name(),
+					"strategy_kind":       kind,
+					"insufficient_sample": true,
+					"min_triggers":        minTriggers,
+					"trigger_count":       fallbackChampion.Count,
+					"win_rate":            fallbackChampion.WinRate,
+					"profit_factor":       fallbackChampion.ProfitFactor,
+					"expectancy":          fallbackChampion.Expectancy,
+					"params": map[string]any{
+						"take_profit_pct": fallbackChampion.Trail,
+						"stop_loss_pct":   fallbackChampion.StopLossPct,
+						"hold_days":       fallbackChampion.Hold,
+						"min_score":       fallbackChampion.MinScore,
+						"atr_stop_mult":   fallbackChampion.AtrStopMult,
+					},
+				}}
+			} else {
+				resRows = []map[string]any{
+					{"strategy": ad.Name(), "strategy_kind": kind, "no_signal": true, "trigger_count": 0},
+				}
+			}
+			lowOut := struct {
+				Strategy      string           `json:"strategy"`
+				Objective     string           `json:"objective"`
+				NoSignal      bool             `json:"no_signal,omitempty"`
+				Insufficient  bool             `json:"insufficient_sample,omitempty"`
+				MinTriggers   int              `json:"min_triggers,omitempty"`
+				LowSampleSeen int              `json:"low_sample_combos,omitempty"`
+				Results       []map[string]any `json:"results"`
+			}{
+				Strategy: ad.Name(), Objective: obj, NoSignal: noSignal,
+				Insufficient: !noSignal, MinTriggers: minTriggers, LowSampleSeen: lowSample,
+				Results: resRows,
+			}
+			if bj, jerr := json.Marshal(lowOut); jerr == nil {
 				fmt.Printf("SWEEP_JSON:%s\n", bj)
 			}
 			continue
@@ -466,6 +552,15 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			"verify_expectancy":    verify.Expectancy,
 			"verify_trigger_count": verify.Count,
 		}
+		// §W7 门槛审计：本轮扫参被样本门槛剔除的组合数与生效门槛值，走 payload.sample 顶层
+		// 键（前端从 grid_json.sample 读取展示"剔除 N 个低样本组合"），不落 result 列避免 schema 迁移。
+		// English: W7 audit — combos pruned by the sample gate travel through payload.sample
+		// (persisted inside grid_json) rather than as new columns.
+		sampleBrief := map[string]any{
+			"min_triggers": minTriggers,
+			"low_sample":   lowSample,
+			"tested":       len(combos),
+		}
 		batchList := make([]map[string]any, 0, len(champions))
 		for i, ch := range champions {
 			batchList = append(batchList, map[string]any{
@@ -504,7 +599,9 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			Pareto        any `json:"pareto,omitempty"`
 			SlippageCalib any `json:"slippage_calib,omitempty"`
 			WalkForward   any `json:"walk_forward,omitempty"`
-		}{ad.Name(), obj, batchList, grid, []any{jsonResult}, paretoBrief, calibBrief, nil}
+			// §W7 样本门槛审计（min_triggers/low_sample/tested），worker 端透传进 grid_json.sample。
+			Sample any `json:"sample,omitempty"`
+		}{ad.Name(), obj, batchList, grid, []any{jsonResult}, paretoBrief, calibBrief, nil, sampleBrief}
 		if bj, jerr := json.Marshal(payload); jerr == nil {
 			fmt.Printf("SWEEP_JSON:%s\n", bj)
 		}
