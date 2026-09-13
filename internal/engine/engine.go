@@ -157,19 +157,30 @@ type Engine struct {
 	// English: P6 calendar calibration — cache-file path (empty dataDir disables it) + a daily-calibrated marker.
 	macroCalCachePath string
 	calibrateDay      string
-	lastBearReasons  map[string]string                                                                               // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
-	d1MaxRetries     int                                                                                             // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
-	d1MaxTokens      int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
-	lastTiming       *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
-	factorMon        *factorMonitor                                                                                  // 因子战法效果监测（战法库触发信号前向收益结算）
-	paper            *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
-	paperOnSignals   func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
-	paperMarkFn      func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
-	paperHeldCodes   func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
-	lastBaseLog      time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
-	lastTrim         time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
-	reportTrimDone   map[string]string                                                                               // FIX#15 report 账本减仓去重：code → 交易日（autoExitReportSells 半仓每日一次）
-	reportTrimDoneMu sync.Mutex                                                                                      // reportTrimDone 互斥（主循环独占写，SSE/HTTP 可能读，防御性）
+	lastBearReasons   map[string]string                                                                               // FIX#13 主循环最近一轮利空归因（code→原因，近实时实盘建议 BearishAttributionAlerts 复用）
+	d1MaxRetries      int                                                                                             // D1 评分 LLM 轮询重试次数（<=0 用默认2，§S5）
+	d1MaxTokens       int                                                                                             // D1 评分 LLM 单次调用推理长度上限（§S3，<=0 用默认2048）
+	lastTiming        *RunTiming                                                                                      // 最近一轮 Run 分段耗时（e2e 实速模拟观测）
+	factorMon         *factorMonitor                                                                                  // 因子战法效果监测（战法库触发信号前向收益结算）
+	paper             *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
+	paperOnSignals    func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
+	paperMarkFn       func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
+	paperHeldCodes    func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
+	lastBaseLog       time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
+	lastTrim          time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
+	// §DAILY_REVIEW 盘后持仓综合复盘：reviewGuardDay 记录本引擎最近一次复盘的交易日（YYYY-MM-DD），
+	// 保证每日只自动跑一次（盘后休眠分支每 ~15min 唤醒亦触发，靠此去重）；reviewRunning 防自动/手动并发重入；
+	// reviewDailyK / reviewAsk 为可注入依赖（默认取 e.marketAPI.GetSinaKLine 与 e.llmClient.Chat），
+	// 单测注入桩数据即可离线跑通"事实→合并提示词→解析→写消息"全链路。
+	// English: §DAILY_REVIEW after-hours per-account LLM position review state. reviewGuardDay de-dupes
+	// one auto run per trading day; reviewRunning prevents auto/manual overlap; reviewDailyK/reviewAsk are
+	// injectable deps (default → marketAPI.GetSinaKLine / llmClient.Chat) so tests run fully offline.
+	reviewGuardDay   string                                    // 最近一次复盘交易日（YYYY-MM-DD，每日去重）
+	reviewRunning    bool                                      // 复盘执行中标志（防自动/手动并发）
+	reviewDailyK     func(code string) ([]data.KLine, error)   // 可注入日K源（nil→marketAPI.GetSinaKLine）
+	reviewAsk        func(system, user string) (string, error) // 可注入 LLM 调用（nil→llmClient.Chat）
+	reportTrimDone   map[string]string                         // FIX#15 report 账本减仓去重：code → 交易日（autoExitReportSells 半仓每日一次）
+	reportTrimDoneMu sync.Mutex                                // reportTrimDone 互斥（主循环独占写，SSE/HTTP 可能读，防御性）
 
 	// §SHORT-2 做空战法卖出标记：主循环命中持仓走弱的 sell 信号时记录（纯code → 标记），
 	// 近实时 pushRealAdvice 消费同交易日的标记生成实盘清仓级建议（Source=short_tactic），
@@ -484,44 +495,44 @@ func New(
 	}
 	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
 	e := &Engine{
-		marketAPI:        marketAPI,
-		newsAgent:        newsAgent,
-		strategy:         strategy,
-		sectorAgent:      sectorAgent,
-		combatAgent:      combatAgent,
-		agg:              agg,
-		rpt:              rpt,
-		stockTracker:     stockTracker,
-		wlMgr:            wlMgr,
-		sse:              sse,
-		llmClient:        llmClient,
-		ths:              ths,
-		longEnabled:      true,
-		shortEnabled:     false,
-		stageRecords:     loadStageRecords(stageRecPath),
-		stageRecPath:     stageRecPath,
-		signalRecords:    loadSignalRecords(signalRecPath),
-		signalRecPath:    signalRecPath,
-		signalStore:      newSignalStore(signalStorePath),
-		storeDay:         data.TradingDayDate(time.Now()), // 启动日即视为已加载日（新库只装当日），跨日才触发滚动清空
-		msgStore:         data.NewMessageStore(msgPath),
-		consultStore:     data.NewConsultStore(consultPath),
-		consultByUser:    make(map[string]*data.ConsultStore),
-		confrontStore:    data.NewConfrontationStore(confrontPath),
-		hotRecords:       loadHotRecords(hotRecPath),
-		hotRecPath:       hotRecPath,
+		marketAPI:         marketAPI,
+		newsAgent:         newsAgent,
+		strategy:          strategy,
+		sectorAgent:       sectorAgent,
+		combatAgent:       combatAgent,
+		agg:               agg,
+		rpt:               rpt,
+		stockTracker:      stockTracker,
+		wlMgr:             wlMgr,
+		sse:               sse,
+		llmClient:         llmClient,
+		ths:               ths,
+		longEnabled:       true,
+		shortEnabled:      false,
+		stageRecords:      loadStageRecords(stageRecPath),
+		stageRecPath:      stageRecPath,
+		signalRecords:     loadSignalRecords(signalRecPath),
+		signalRecPath:     signalRecPath,
+		signalStore:       newSignalStore(signalStorePath),
+		storeDay:          data.TradingDayDate(time.Now()), // 启动日即视为已加载日（新库只装当日），跨日才触发滚动清空
+		msgStore:          data.NewMessageStore(msgPath),
+		consultStore:      data.NewConsultStore(consultPath),
+		consultByUser:     make(map[string]*data.ConsultStore),
+		confrontStore:     data.NewConfrontationStore(confrontPath),
+		hotRecords:        loadHotRecords(hotRecPath),
+		hotRecPath:        hotRecPath,
 		macroCalCachePath: macroCalCachePath,
-		sectorEventTimes: make(map[string]time.Time),
-		sectorConstTopN:  20,
-		auctionStrengths: make(map[string]float64),
-		scoreStore:       newScoreStore(scoreRecPath),
-		fastScoreStore:   newScoreStore(fastScoreRecPath),
-		prevPass:         make(map[string]map[string]bool),
-		prevBullBuy:      make(map[string]map[string]bool),
-		lastD1Scores:     make(map[string]combat_agent.D1Score),
-		d1ScoredSig:      make(map[string]string),
-		d1RetryQueue:     make(map[string]bool),
-		factorMon:        newFactorMonitor(dataDir, 5),
+		sectorEventTimes:  make(map[string]time.Time),
+		sectorConstTopN:   20,
+		auctionStrengths:  make(map[string]float64),
+		scoreStore:        newScoreStore(scoreRecPath),
+		fastScoreStore:    newScoreStore(fastScoreRecPath),
+		prevPass:          make(map[string]map[string]bool),
+		prevBullBuy:       make(map[string]map[string]bool),
+		lastD1Scores:      make(map[string]combat_agent.D1Score),
+		d1ScoredSig:       make(map[string]string),
+		d1RetryQueue:      make(map[string]bool),
+		factorMon:         newFactorMonitor(dataDir, 5),
 	}
 	e.syncMessages(nil, nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
@@ -5041,8 +5052,8 @@ func (e *Engine) MarketEnvSnapshot() (emotion, marketState string, maxPosPct flo
 // macroCalGuardMu/macroCalGuardDay 进程级"每日一次校准"闸门（校准缓存是进程全局的，
 // 多账号引擎共用，故只需一个引擎每天跑一次，避免重复 LLM 调用/token 浪费）。
 var (
-	macroCalGuardMu   sync.Mutex
-	macroCalGuardDay  string
+	macroCalGuardMu  sync.Mutex
+	macroCalGuardDay string
 )
 
 // calibrateMacroCalendarOnceToday §MARKET_RISK_GATE P6：每日一次用外部 API/LLM 校准宏观日历真实发布日。

@@ -51,3 +51,9 @@ test('§F6 角色提示条常驻', async ({ page }) => {
   await page.goto('/#/dashboard')
   await expect(page.getByTestId('role-bar')).toBeVisible()
 })
+
+test('§DAILY_REVIEW 消息中心含复盘筛选与手动按钮', async ({ page }) => {
+  await page.goto('/#/msgcenter')
+  await expect(page.getByText('盘后复盘')).toBeVisible()
+  await expect(page.getByRole('button', { name: '立即复盘' })).toBeVisible()
+})

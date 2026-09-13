@@ -929,6 +929,18 @@ func (r *Registry) GetController(userID string) server.EngineController {
 	return r.GetOrCreate(userID)
 }
 
+// TriggerPositionReview §DAILY_REVIEW 手动触发指定账号引擎的盘后持仓 LLM 复盘（懒加载该账号引擎后执行），
+// 返回成功复盘的股票数；引擎不可用时返回错误。
+// English: force-runs the §DAILY_REVIEW position review on an account's engine (lazily created),
+// returning the number of stocks reviewed.
+func (r *Registry) TriggerPositionReview(userID string) (int, error) {
+	e := r.GetOrCreate(userID)
+	if e == nil {
+		return 0, fmt.Errorf("账号引擎不可用")
+	}
+	return e.RunPositionReviewNow()
+}
+
 // InitStatusJSON 返回某账号引擎的初始化进度（map 形式，前端轮询登录进度条用）。
 // English: returns an account engine's init progress as a map for the frontend login progress bar.
 func (r *Registry) InitStatusJSON(userID string) map[string]interface{} {

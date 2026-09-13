@@ -28,6 +28,7 @@ const filters = [
   { key: 'strategy', label: '策略信号' },
   { key: 'stop', label: '止盈止损' },
   { key: 'hold', label: '持仓提示' },
+  { key: 'review', label: '盘后复盘' },
 ]
 
 // 涨跌配色（红涨绿跌）— 此处仅用于"收益/亏损"语义外的边框，按 Vue 原色映射
@@ -36,6 +37,7 @@ function levelTagTheme(level) {
   if (level === '交易信号') return 'success'
   if (level === '止盈' || level === '加仓') return 'success'
   if (level === '减仓') return 'warning'
+  if (level === '复盘') return 'primary'
   return 'primary'
 }
 
@@ -54,6 +56,8 @@ export default function MsgCenter() {
   const [detail, setDetail] = useState(null)
   // §F5 分页：消息卡片列表按页展示（默认 50/页），筛选/类型变化时回到首页。
   const [page, setPage] = useState(1)
+  // §DAILY_REVIEW 手动触发复盘标志（按钮 loading）
+  const [reviewing, setReviewing] = useState(false)
   const PAGE_SIZE = 50
 
   // 按交易信号中的战法名称统计可选战法
@@ -80,6 +84,8 @@ export default function MsgCenter() {
     if (activeFilter === 'strategy') list = list.filter(a => a.level === '策略信号')
     if (activeFilter === 'stop') list = list.filter(a => a.level === '止盈' || a.level === '止损')
     if (activeFilter === 'hold') list = list.filter(a => a.level === '持仓提示')
+    // §DAILY_REVIEW 盘后复盘（level=复盘，按日更新覆盖）
+    if (activeFilter === 'review') list = list.filter(a => a.level === '复盘')
     // 交易信号二级筛选：按战法名称
     if (activeFilter === 'trade' && activeStrategy !== 'all') {
       list = list.filter(a => a.strategy === activeStrategy)
@@ -105,11 +111,18 @@ export default function MsgCenter() {
     }
     if (a.level === '止盈' || a.level === '加仓') return 'var(--app-down)'
     if (a.level === '减仓') return 'var(--td-warning-color)'
+    // §DAILY_REVIEW 复盘卡：后市倾向 偏多→红 / 偏空→绿（涨跌语义）/ 其余→强调色
+    if (a.level === '复盘') {
+      if (a.direction === '偏多') return 'var(--app-up)'
+      if (a.direction === '偏空') return 'var(--app-down)'
+      return 'var(--app-accent)'
+    }
     return 'var(--app-accent)'
   }
 
   // 提取消息对应的建议动作（买入/卖出/持有）
   function actionText(a) {
+    if (a.level === '复盘') return a.action || a.direction || '中性' // §DAILY_REVIEW 复盘展示后市倾向
     if (a.level === '交易信号' || a.level === '策略信号') {
       return (a.action === '卖出') ? '卖出' : '买入'
     }
@@ -119,6 +132,7 @@ export default function MsgCenter() {
   // 根据建议动作（买入/卖出/持有）返回操作标签的主题色
   function actionTagTheme(a) {
     const t = actionText(a)
+    if (a.level === '复盘') return t === '偏多' ? 'primary' : (t === '偏空' ? 'warning' : 'default')
     if (t === '买入') return 'success'
     if (t === '卖出') return 'danger'
     return 'default'
@@ -141,6 +155,23 @@ export default function MsgCenter() {
       const all = await api.fetchAlerts()
       setAlerts((all || []).filter(a => a.code !== 'CAL' && !(a.level && a.level.startsWith('日历'))))
     } catch (_) {}
+  }
+
+  // §DAILY_REVIEW 手动触发盘后持仓复盘：同步等待 LLM 返回，成功后切到"盘后复盘"筛选并刷新。
+  async function onReviewNow() {
+    if (reviewing) return
+    setReviewing(true)
+    try {
+      const r = await api.reviewPositions()
+      const n = (r && typeof r.reviewed === 'number') ? r.reviewed : 0
+      if (n > 0) { MessagePlugin.success(`复盘完成：${n} 只`); setActiveFilter('review') }
+      else MessagePlugin.info('本次未生成复盘（无可复盘标的或数据不足）')
+      load()
+    } catch (e) {
+      MessagePlugin.error('复盘失败：' + (e && e.message ? e.message : e))
+    } finally {
+      setReviewing(false)
+    }
   }
 
   // 删除单条消息并刷新
@@ -219,7 +250,8 @@ export default function MsgCenter() {
     const cardBody = (
       <>
         <div style={{ fontSize: 14, color: 'var(--app-text)', fontWeight: 600 }}>{a.title}</div>
-        <div style={{ fontSize: 13, color: 'var(--app-muted-2)', marginTop: 4 }}>{a.body}</div>
+        {/* §DAILY_REVIEW 复盘正文含换行（正文+量化事实分隔）→ pre-line 保留排版 */}
+        <div style={{ fontSize: 13, color: 'var(--app-muted-2)', marginTop: 4, whiteSpace: 'pre-line' }}>{a.body}</div>
       </>
     )
     return (
@@ -237,7 +269,11 @@ export default function MsgCenter() {
       <Card style={{ marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>消息中心</h2>
-          <Button theme="danger" variant="outline" size="small" onClick={onClearAll}>清空全部</Button>
+          {/* §DAILY_REVIEW 手动复盘 + 清空 */}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Button theme="primary" variant="outline" size="small" loading={reviewing} onClick={onReviewNow}>立即复盘</Button>
+            <Button theme="danger" variant="outline" size="small" onClick={onClearAll}>清空全部</Button>
+          </div>
         </div>
       </Card>
 

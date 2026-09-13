@@ -467,6 +467,13 @@ export async function deleteAlert(id) {
   return request('/api/alerts/' + encodeURIComponent(id), { method: 'DELETE' })
 }
 
+/** §DAILY_REVIEW 手动触发当前账号盘后持仓 LLM 复盘，返回 {reviewed:N} */
+/** §DAILY_REVIEW force-run the after-hours LLM position review for this account; returns {reviewed}. */
+// 对应 POST /api/review/positions（同步执行，耗时数秒~数十秒；失败 502 抛错）。
+export async function reviewPositions() {
+  return request('/api/review/positions', { method: 'POST' })
+}
+
 // ── 持仓管理 ──
 // ── Holdings ──
 

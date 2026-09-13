@@ -549,6 +549,8 @@ func main() {
 					// this loop covers that window).
 					e.RolloverDayStores()
 					e.TrimAfterHoursIfDue(time.Now())
+					// §DAILY_REVIEW 盘后持仓 LLM 综合复盘：收盘后每日一次写入消息中心（引擎内 reviewGuardDay 去重）。
+					e.ReviewPositionsIfDue(time.Now())
 					// §QUOTE_POOL_SPLIT: 盘后也保持持仓池 base 最新（自选∪实盘∪纸面持仓钉仓），
 					// 次日开盘首个 cycle 直接用最新 base 拉行情，无需等到盘中才钉入。
 					// English: keep the held-pool base fresh after hours too, so the next open fetches

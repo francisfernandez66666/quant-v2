@@ -109,6 +109,36 @@ type RuntimeConfig struct {
 	// English: near-realtime 8a/8b scoring-loop interval in seconds (0 → fallback 5s). Lowering it
 	// detects strategy signal flips (and fires orders) sooner (signal→trade optimization A+B / B).
 	ScoringIntervalSec int `json:"scoring_interval_sec"`
+	// ReviewEnabled §DAILY_REVIEW 盘后持仓综合复盘总开关（默认开）：交易日收盘后对
+	// "自选 ∪ 实盘持仓 ∪ 模拟盘持仓 ∪ 当日信号股"逐票算量化事实（量能/MACD/量价/均线/位置）
+	// 交 LLM 生成综合复盘正文 + 后市倾向，写入消息中心（每日一份、按日去重覆盖）。
+	// 需配置 LLM Key 才实际调用；无 Key 时静默跳过。显式 false 关闭盘后复盘。
+	// English: §DAILY_REVIEW per-account after-hours LLM position review. Once per trading day after
+	// close it reviews watchlist ∪ real held ∪ paper held ∪ today's signals with a merged LLM call
+	// (facts computed in Go: volume/MACD/price-volume/MA/position) into a review card per stock in the
+	// message center. No-ops when no LLM key is configured.
+	ReviewEnabled *bool `json:"review_enabled,omitempty"`
+	// ReviewMaxStocks §DAILY_REVIEW 单次复盘最多覆盖的股票数（默认 24，上限 50，<=0 用默认）：
+	// 持仓/信号/自选去重后按优先级（实盘>模拟>信号>自选）截断，约束单次合并 LLM 调用的上下文规模。
+	// English: max distinct stocks per review run (default 24, capped 50); truncates the deduped universe
+	// by priority real>paper>signal>watchlist to bound the merged LLM prompt size.
+	ReviewMaxStocks int `json:"review_max_stocks"`
+}
+
+// ReviewOn §DAILY_REVIEW 盘后复盘是否启用（*bool 语义：未配置=默认开启，显式 false 关闭）。
+// English: §DAILY_REVIEW switch — nil (absent in config) means ON; explicit false disables.
+func (r RuntimeConfig) ReviewOn() bool { return r.ReviewEnabled == nil || *r.ReviewEnabled }
+
+// ReviewMax §DAILY_REVIEW 单次复盘股票数上限（<=0 回退默认 24，硬上限 50 护栏）。
+// English: review universe cap per run; <=0 → default 24, hard-capped at 50.
+func (r RuntimeConfig) ReviewMax() int {
+	if r.ReviewMaxStocks <= 0 {
+		return 24
+	}
+	if r.ReviewMaxStocks > 50 {
+		return 50
+	}
+	return r.ReviewMaxStocks
 }
 
 // EnhanceConfig 信号与战法增强开关组（§SIGNAL_EDGE_ENHANCEMENT_PLAN_20260909 §7）。
@@ -2187,7 +2217,7 @@ var DefaultRules = &Rules{
 	Scheduler: DefaultSchedulerConfig(),
 	Paper:     PaperConfig{Enabled: false, FixedAmount: 10000, MaxPositions: 10, InitialCapital: 100000, Discipline: DefaultDisciplineConfig()},
 	QMT:       DefaultQMTConfig(),
-	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15},
+	Runtime:   RuntimeConfig{TrimAfterHours: true, TrimIntervalMin: 15, ReviewMaxStocks: 24},
 }
 
 // DefaultDisciplineConfig 统一止盈止损纪律的出厂默认（可后台配置覆盖）：

@@ -159,6 +159,9 @@ type EngineRegistry interface {
 	// SetPaperLabelResolver §C 注入规则池 ID→显示名 解析器（fac_1→"因子战法#1"），
 	// 同步到全部已建账号并供懒加载引擎继承。English: injects the rule-pool label resolver.
 	SetPaperLabelResolver(fn func(string) string)
+	// TriggerPositionReview §DAILY_REVIEW 手动触发指定账号的盘后持仓 LLM 复盘，返回成功复盘的股票数。
+	// English: force-runs the §DAILY_REVIEW after-hours LLM position review for one account; returns count.
+	TriggerPositionReview(userID string) (int, error)
 }
 
 // SetEngineRegistry 设置多账号引擎注册表（懒加载/按配置指纹共享）。
@@ -591,6 +594,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/consult", s.authMiddleware(s.handleConsult))
 	s.mux.HandleFunc("GET /api/consult/history", s.authMiddleware(s.handleConsultHistory))
 	s.mux.HandleFunc("DELETE /api/consult/history", s.authMiddleware(s.handleClearConsultHistory))
+	// §DAILY_REVIEW 手动触发当前账号的盘后持仓 LLM 复盘（同步执行，返回复盘股票数；正常每日自动跑亦存在）。
+	s.mux.HandleFunc("POST /api/review/positions", s.authMiddleware(s.handleTriggerPositionReview))
 	s.mux.HandleFunc("GET /api/consult/pro-mode", s.authMiddleware(s.handleGetConsultProMode))
 	s.mux.HandleFunc("PUT /api/consult/pro-mode", s.authMiddleware(s.handleSetConsultProMode))
 	// §WS-E 敏感管线隔离：stage-records 暴露运营账号全链路 stage 记录，仅管理员可见（子账号 403）。
@@ -2052,6 +2057,25 @@ func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Reques
 		c.ClearConsultHistoryFor(uid) // §GAP2-W2 只清本人账号的历史
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleTriggerPositionReview 处理 POST /api/review/positions：§DAILY_REVIEW 手动触发当前账号的盘后
+// 持仓 LLM 综合复盘（同步执行）。复盘依赖 LLM 调用，耗时数秒~数十秒；成功返回 {reviewed:N}；
+// 依赖未就绪/LLM 失败返回 502。与每日自动复盘同源（消息按 pos-review@uid@code@日 键每日覆盖更新）。
+// English: force-runs the §DAILY_REVIEW position review for the calling account (synchronous LLM pass).
+// Returns {reviewed:N}; 502 when deps/LLM fail. Same message keys as the daily auto run (per-day upsert).
+func (s *Server) handleTriggerPositionReview(w http.ResponseWriter, r *http.Request) {
+	uid := requestUserID(r)
+	if s.registry == nil {
+		writeError(w, 503, "引擎注册表未就绪")
+		return
+	}
+	n, err := s.registry.TriggerPositionReview(uid)
+	if err != nil {
+		writeError(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"reviewed": n})
 }
 
 // handleStageRecords 返回当日全量 Stage 流水线轮次记录（用于复盘/策略引擎实时调取）。
