@@ -1,7 +1,7 @@
 // 多因子研究工具（B3/B5）：对一批股票计算 7 大类因子并输出 IC/IR/分层验证报告；
 // B5 提供 optimize（权重优化产出候选）/ list（候选列表）/ approve（审批应用）；
 // scan-depth 实时扫描研究池盘口，识别托单/压单并产出候选。
-// 用法：research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|list|approve
+// 用法：research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|risk-daily-backfill|list|approve
 //
 //	flags：--db（默认 ~/.quant-trading-v2/trading.db）、--start（YYYYMMDD，默认 20200101）、
 //	--end（YYYYMMDD，默认今天）、--h（前瞻天数，默认 5）、--quantiles（默认 5）、
@@ -45,7 +45,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|lifecycle-eval")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|risk-daily-backfill|lifecycle-eval")
 	}
 	cmd := args[0]
 
@@ -90,6 +90,10 @@ func main() {
 		// §Phase3 情绪相位标定：输出区间内每日情绪阶段与相位分布（分参回测依据）。
 		// English: Phase-3 sentiment-phase labeling — prints the per-day phase and phase distribution.
 		cmdEmotionPhases(db, *start, *end, args[1:])
+	case "risk-daily-backfill":
+		// §停摆期历史回放：从 ths 池+日线广度重建 market_risk_daily（引擎权威行默认跳过）。
+		// English: rebuild market_risk_daily for an outage window from ths pools + daily breadth.
+		cmdRiskDailyBackfill(db, *start, *end, args[1:])
 	case "list":
 		cmdList(db, args[1:])
 	case "approve":
