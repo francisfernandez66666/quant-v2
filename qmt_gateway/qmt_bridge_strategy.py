@@ -358,13 +358,26 @@ class _XtOps:
                 up = side_raw.upper()
                 side = BUY if ("BUY" in up or "\u4e70" in side_raw) else SELL
             amount = float(getattr(t, "m_dTradeAmount", 0) or getattr(t, "amount", 0) or price * qty)
+            td = str(getattr(t, "m_strTradeDate", "") or getattr(t, "trade_date", "") or "")
+            tt = str(getattr(t, "m_strTradeTime", "") or getattr(t, "traded_time", "") or
+                     getattr(t, "time", "") or "")
+            # FIX 2026-09-14: counter DEAL carries date/time split ("20260914"+"131351");
+            # reporting the bare HHMMSS broke the engine trade blotter (no time column).
+            if td and tt:
+                traded = "%s-%s-%sT%s:%s:%s+08:00" % (td[0:4], td[4:6], td[6:8],
+                                                      tt[0:2].zfill(2), tt[2:4].zfill(2),
+                                                      tt[4:6].zfill(2))
+            elif tt:
+                traded = time.strftime("%Y-%m-%dT", time.localtime()) + \
+                    tt[0:2].zfill(2) + ":" + tt[2:4].zfill(2) + ":" + tt[4:6].zfill(2) + "+08:00"
+            else:
+                traded = td or ""
             out.append({
                 "order_id": remark or str(getattr(t, "m_strOrderSysID", "") or getattr(t, "order_id", "") or ""),
                 "code": code, "side": side, "price": price, "qty": qty, "amount": amount,
                 "trade_id": str(getattr(t, "m_strTradeID", "") or getattr(t, "traded_id", "") or
                                 getattr(t, "trade_no", "") or getattr(t, "id", "") or ""),
-                "traded_at": str(getattr(t, "m_strTradeTime", "") or getattr(t, "traded_time", "") or
-                                 getattr(t, "time", "") or ""),
+                "traded_at": traded,
                 "signal_id": remark,
             })
         return out
@@ -427,21 +440,42 @@ class _XtOps:
         return False, "", "passorder arity fail: %s" % last_err
 
     def embed_cancel(self, exchange_order_id, code=""):
+        # FIX 2026-09-14: (int,str)/(str,int) two-arg ladders all died with
+        # C++ signature errors (seq:11 watchdog cancel lost). Official model
+        # form is cancel(order_id:str, account_id, account_type, ContextInfo)
+        # -- try the documented 4-arg forms first, then legacy 2-arg fallbacks.
         ca = self._builtin("cancel")
-        if ca:
-            try:
-                ca(int(str(exchange_order_id)), self._embed_acct())
-                return True, ""
-            except TypeError:
+        if not ca:
+            return False, "builtin cancel unavailable"
+        oid = str(exchange_order_id or "").strip()
+        if not oid:
+            return False, "cancel needs exchange order_id"
+        acct = self._embed_acct()
+        ctx = getattr(self, "_ctx", None)
+        attempts = [
+            ("4s", (oid, acct, "STOCK", ctx)),
+            ("4l", (oid, acct, "stock", ctx)),
+            ("3", (oid, acct, "STOCK")),
+            ("2i", (int(oid), acct)),
+            ("2s", (oid, acct)),
+        ]
+        errs = []
+        for tag, args in attempts:
+            if tag.startswith("4") and ctx is None:
+                continue
+            if tag == "2i":
                 try:
-                    ca(self._embed_acct(), int(str(exchange_order_id)))
-                    return True, ""
-                except Exception as e:
-                    _trace("embed cancel(2) error: " + repr(e))
+                    args = (int(oid), acct)
+                except ValueError:
+                    continue
+            try:
+                ca(*args)
+                _trace("embed cancel ok via %s" % tag)
+                return True, ""
             except Exception as e:
-                _trace("embed cancel error: " + repr(e))
-                return False, "cancel error: %s" % e
-        return False, "builtin cancel unavailable"
+                errs.append("%s:%s" % (tag, repr(e)[:80]))
+        _trace("embed cancel all failed: " + " | ".join(errs))
+        return False, "cancel error: %s" % errs[-1] if errs else "no attempt"
 
     def embed_resolve(self, req, signal_id="", timeout_sec=8.0):
         """poll ORDER for the just-placed order -> m_strOrderSysID. Prefer the remark
