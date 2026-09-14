@@ -23,16 +23,47 @@ func cmdRiskDailyBackfill(db *store.DB, start, end string, args []string) {
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("参数解析失败: %v", err)
 	}
-	stats, err := db.EmotionStatsRange(start, end)
+	rows, skipped, err := riskBackfillPlan(db, start, end, *force)
 	if err != nil {
 		log.Fatalf("读取情绪统计失败: %v", err)
 	}
-	written, skipped := 0, 0
+	written := 0
+	for _, row := range rows {
+		if *dry {
+			line := fmt.Sprintf("%s [%s] 涨停=%d 连板=%d 炸板率=%.1f%%", row.TradeDate, row.Emotion, row.LimitUpCount, row.LadderHeight, *row.BreakRate*100)
+			if row.UpRatio != nil {
+				line += fmt.Sprintf(" 上涨占比=%.1f%%", *row.UpRatio*100)
+			}
+			fmt.Println(line)
+			written++
+			continue
+		}
+		if err := db.UpsertMarketRiskDaily(row); err != nil {
+			log.Printf("写入 %s 失败: %v", row.TradeDate, err)
+			continue
+		}
+		written++
+	}
+	fmt.Printf("risk-daily-backfill %s~%s: 回补 %d 行，跳过权威行 %d（dry=%v force=%v）\n", start, end, written, skipped, *dry, *force)
+}
+
+// riskBackfillPlan 计算停摆区间的回补行：逐日从 ths 池统计 + daily 广度装配
+// MarketRiskDailyRow（emotion 用 PhaseFromEmotionStat 同口径，tier/state 弃权留空）。
+// 返回待回补行与跳过的引擎权威行数。
+// （Builds backfill rows for an outage window from ths pool stats + daily breadth;
+// returns planned rows and the count of engine-authoritative days skipped.）
+func riskBackfillPlan(db *store.DB, start, end string, force bool) ([]store.MarketRiskDailyRow, int, error) {
+	stats, err := db.EmotionStatsRange(start, end)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := make([]store.MarketRiskDailyRow, 0, len(stats))
+	skipped := 0
 	for _, st := range stats {
 		if st.LimitUp <= 0 {
 			continue
 		}
-		if !*force {
+		if !force {
 			// 引擎权威行（risk_tier 非空）跳过，回放值不覆盖实时判定。
 			rows, err := db.QueryRows(`SELECT risk_tier FROM market_risk_daily WHERE trade_date = ?`, st.Date)
 			if err == nil && len(rows) > 0 {
@@ -44,7 +75,7 @@ func cmdRiskDailyBackfill(db *store.DB, start, end string, args []string) {
 		}
 		upRatio := dailyUpRatio(db, st.Date)
 		brk := st.BlastRate / 100.0
-		row := store.MarketRiskDailyRow{
+		out = append(out, store.MarketRiskDailyRow{
 			TradeDate:    st.Date,
 			Emotion:      research.PhaseFromEmotionStat(st, nil),
 			Reasons:      "backfill:历史回放(ths池+日线广度,无实时tier)",
@@ -52,23 +83,9 @@ func cmdRiskDailyBackfill(db *store.DB, start, end string, args []string) {
 			BreakRate:    &brk,
 			LimitUpCount: st.LimitUp,
 			LadderHeight: st.MaxBoard,
-		}
-		if *dry {
-			line := fmt.Sprintf("%s [%s] 涨停=%d 连板=%d 炸板率=%.1f%%", st.Date, row.Emotion, st.LimitUp, st.MaxBoard, brk*100)
-			if upRatio != nil {
-				line += fmt.Sprintf(" 上涨占比=%.1f%%", *upRatio*100)
-			}
-			fmt.Println(line)
-			written++
-			continue
-		}
-		if err := db.UpsertMarketRiskDaily(row); err != nil {
-			log.Printf("写入 %s 失败: %v", st.Date, err)
-			continue
-		}
-		written++
+		})
 	}
-	fmt.Printf("risk-daily-backfill %s~%s: 回补 %d 行，跳过权威行 %d（dry=%v force=%v）\n", start, end, written, skipped, *dry, *force)
+	return out, skipped, nil
 }
 
 // dailyUpRatio 当日全市场上涨家数占比（daily 表口径，0..1；无行返回 nil 弃权）。

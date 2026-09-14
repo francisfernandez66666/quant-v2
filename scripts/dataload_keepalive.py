@@ -93,25 +93,33 @@ def fetch_index(start_iso, end_iso):
 
 def one_round(target):
     # 单轮补数：返回 True 表示目标表全部达到 target（yyyyMMdd）。
+    # 三张判定表全新鲜时零外部调用直接返回（不触发任何拉取）。
+    core = ("daily", "index_daily", "ths_limit_up_daily")
+    if all(latest(t) >= target for t in core):
+        return True
     ok = True
     d0 = datetime.datetime.strptime(target, "%Y%m%d").date() - datetime.timedelta(days=15)
     if latest("daily") < target:
         rc, msg = run([DATALOAD, "-db", DB, "-start", d0.strftime("%Y%m%d"),
                        "-end", time.strftime("%Y%m%d"), "daily"])
         log("daily rc=%d %s" % (rc, msg))
-        if rc != 0: ok = False
+    if latest("daily") < target:
+        ok = False
     start_iso, end_iso = d0.strftime("%Y-%m-%d"), datetime.date.today().strftime("%Y-%m-%d")
     if latest("index_daily") < target:
         n = fetch_index(start_iso, end_iso)
         log("index_daily wrote %d rows (max=%s)" % (n, latest("index_daily")))
-        if latest("index_daily") < target: ok = False
+        if latest("index_daily") < target:
+            ok = False
     if latest("ths_limit_up_daily") < target:
         rc, msg = run([DATALOAD, "-db", DB, "hithink-sync", "--kind", "pools", "--date", target])
         log("pools %s rc=%d %s" % (target, rc, msg))
-        if rc != 0: ok = False
-    rc, msg = run([DATALOAD, "-db", DB, "hithink-sync", "--kind", "daily-k-10d"])
-    log("ths daily-k-10d rc=%d %s" % (rc, msg))
-    # ths_daily 落后不阻塞完成判定（dump 有时效），只做一次尝试。
+        if latest("ths_limit_up_daily") < target:
+            ok = False
+    # ths_daily（主源近10日 dump）：仅当自身落后才尝试，且不阻塞完成判定（dump 有时效）。
+    if latest("ths_daily") < target:
+        rc, msg = run([DATALOAD, "-db", DB, "hithink-sync", "--kind", "daily-k-10d"])
+        log("ths daily-k-10d rc=%d %s" % (rc, msg))
     return ok
 
 
