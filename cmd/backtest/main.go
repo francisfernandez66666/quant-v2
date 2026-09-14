@@ -31,12 +31,14 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/llmcfg"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
@@ -54,6 +56,9 @@ type backtestOptions struct {
 	longOff   bool            // 关闭做多通道
 	shortOn   bool            // 开启做空通道
 	cfgMgr    *config.Manager // 全参数配置（rules + d1）
+	// operatorDir 运营数据目录（-data 优先，空则引擎同口径默认）：LLM 权威配置解析用，
+	// 与临时 outDir/data 工作目录区分——§UI-AUTHORITATIVE 统一接入运营配置源。
+	operatorDir string
 }
 
 // cycleMetrics 单个 cycle 的流水线阶段指标.
@@ -162,6 +167,12 @@ func parseFlags() (*backtestOptions, error) {
 		since = autoSince(time.Now())
 	}
 
+	// 运营数据目录：-data 显式指定优先，否则引擎同口径默认目录——LLM 权威配置从这里解析。
+	operatorDir := *dataDir
+	if operatorDir == "" {
+		operatorDir = llmcfg.DefaultDataDir()
+	}
+
 	return &backtestOptions{
 		cycles:    *cyclesRaw,
 		since:     since,
@@ -194,17 +205,17 @@ func autoSince(now time.Time) time.Time {
 	}
 }
 
-// buildLLM 从环境变量 + 配置管理器构造 LLM 客户端；未配置 APIKey 时返回 nil（LLM 降级）.
-func buildLLM(cfgMgr *config.Manager) *llm.Client {
-	c := llm.Config{}
-	c.APIKey = os.Getenv("LLM_API_KEY")
-	c.APIURL = os.Getenv("LLM_API_URL")
-	c.Model = os.Getenv("LLM_MODEL")
-	if c.APIKey == "" {
-		c.APIKey = cfgMgr.Rules.LLM.APIURL // 兼容旧配置：URL 兜底为 key
+// buildLLM 经 §UI-AUTHORITATIVE 权威链构造 LLM 客户端（设置页保存 > env > 全局配置，
+// 与 cmd/quant 共用 internal/llmcfg）；无密钥时返回 nil（LLM 降级）。
+// 旧版此处裸读 LLM_* 环境变量，运营换供应商后夜间回测仍走旧通道，口径分叉。
+func buildLLM(cfgMgr *config.Manager, operatorDir string) *llm.Client {
+	am := auth.NewManager(operatorDir) // 须 Init 建库后 AdminID/GetConfig 才可用（未初始化 nil db 会 panic）
+	if err := am.Init(); err != nil {
+		log.Printf("[backtest] 运营认证库初始化失败(LLM 回落 env/全局链): %v", err)
 	}
-	if c.APIKey == "" {
-		log.Println("[backtest] 未配置 LLM_API_KEY，LLM 功能不可用（新闻分析/D1 评分降级）")
+	c := llmcfg.Resolve(cfgMgr, am)
+	if len(c.APIKeys) == 0 {
+		log.Println("[backtest] 未配置 LLM API Key（设置页/环境变量均无），LLM 功能不可用（新闻分析/D1 评分降级）")
 		return nil
 	}
 	return llm.New(c)
@@ -222,7 +233,7 @@ func (o *backtestOptions) run() error {
 		return fmt.Errorf("创建数据目录: %v", err)
 	}
 
-	llmClient := buildLLM(o.cfgMgr)
+	llmClient := buildLLM(o.cfgMgr, o.operatorDir)
 
 	// ── 装配引擎（与 cmd/quant/main.go 相同链路：实时网络 + LLM）──
 	marketAPI := data.NewMarketAPI()

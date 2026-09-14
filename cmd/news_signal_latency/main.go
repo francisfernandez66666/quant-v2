@@ -16,10 +16,12 @@ import (
 	"path/filepath"
 	"time"
 
+	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/llmcfg"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
@@ -133,20 +135,12 @@ func main() {
 	// 配置真实 LLM D1 评分器：API 参数缺省回退配置文件，随后批量评分。
 	d1s := map[string]combat_agent.D1Score{}
 	var d1Ms time.Duration
-	if apiKey := os.Getenv("LLM_API_KEY"); apiKey != "" {
-		llmCfg := llm.Config{
-			APIKey:    apiKey,
-			APIURL:    os.Getenv("LLM_API_URL"),
-			Model:     os.Getenv("LLM_MODEL"),
-			Streaming: cfgMgr.Rules.LLM.StreamingEnabled(),
-		}
-		if llmCfg.APIURL == "" {
-			llmCfg.APIURL = cfgMgr.Rules.LLM.APIURL
-		}
-		if llmCfg.Model == "" {
-			llmCfg.Model = cfgMgr.Rules.LLM.Model
-		}
-		llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
+	am := auth.NewManager(*dataDir) // 须 Init：未建库时 AdminID/GetConfig 会 panic
+	_ = am.Init()                  // 运营库缺失不致命（回落 env/全局链）
+	if llmCfg := llmcfg.Resolve(cfgMgr, am); len(llmCfg.APIKeys) > 0 {
+		// §UI-AUTHORITATIVE：与引擎同源解析（设置页保存优先于环境变量），延迟工具测出的
+		// 新闻→D1 耗时才代表生产真实链路。
+		llmCfg.Streaming = cfgMgr.Rules.LLM.StreamingEnabled()
 		scorer := combat_agent.NewD1Scorer(llm.New(llmCfg), loadRawEvents())
 		fmt.Printf("  真实LLM D1批量评分(模型=%s): ", llmCfg.Model)
 		tD1 := time.Now()

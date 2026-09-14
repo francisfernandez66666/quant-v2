@@ -22,6 +22,7 @@ import (
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/llm"
+	"quant-trading-v2/internal/llmcfg"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
@@ -115,90 +116,9 @@ func main() {
 	// §GAP3.1 运行时交易日历：后台拉取法定节假日/临时休市日（失败按周末口径兜底，不阻断启动）。
 	data.LoadTradingCalendarAsync()
 
-	// LLM 配置优先级（§UI-AUTHORITATIVE 修复 2026-09-14）：
-	// ① 运营账号在设置页保存的配置（userRules + 按账号 auth 密钥，UI 写入的唯一权威面）；
-	// ② 环境变量 LLM_API_KEY(S)/LLM_API_URL/LLM_MODEL（部署 bootstrap，UI 从未保存过时生效）；
-	// ③ 全局 auth 配置项（历史 "" 键）→ ④ 全局 config.json rules.llm → ⑤ 代码默认。
-	// 修复前问题：生产 NSSM 服务把 siliconflow 旧地址/旧 key 硬编码进环境变量，而 UI 保存
-	// 落在①，启动只读②③④——每次重启/发布后设置页保存的 LLM 配置被环境变量悄悄顶掉，
-	// 表现为"前端改了没起作用"。（English: UI-saved config now wins over process env at startup;
-	// previously env pinned the old provider and silently reverted every settings-page save.）
-	llmCfg := llm.Config{}
-	adminID := authMgr.AdminID()
-	// ① 设置页保存的运营配置（URL/模型/超时/流式/并发/分类模型 + 按账号密钥）
-	if saved, ok := cfgMgr.StoredLLMConfig(adminID); ok && saved != nil {
-		llmCfg.APIURL = saved.APIURL
-		llmCfg.Model = saved.Model
-		llmCfg.Timeout = time.Duration(saved.TimeoutSec) * time.Second
-		llmCfg.Streaming = saved.StreamingEnabled()
-		llmCfg.BatchConcurrency = saved.BatchConcurrency
-		llmCfg.ClassifierModel = saved.ClassifierModel
-		// 运营账号的多 key（设置页保存形态：逗号分隔存 auth 配置）
-		if v, ok := authMgr.GetConfig(adminID, "llm_api_keys"); ok && v != "" {
-			for _, k := range strings.Split(v, ",") {
-				if k = strings.TrimSpace(k); k != "" {
-					llmCfg.APIKeys = append(llmCfg.APIKeys, k)
-				}
-			}
-		} else if v, ok := authMgr.GetConfig(adminID, "llm_api_key"); ok && v != "" {
-			llmCfg.APIKeys = append(llmCfg.APIKeys, v)
-		}
-	}
-	// ② 环境变量兜底（仅补①留空的字段，不覆盖已保存值）
-	if len(llmCfg.APIKeys) == 0 {
-		if rawKeys := os.Getenv("LLM_API_KEYS"); rawKeys != "" {
-			for _, k := range strings.Split(rawKeys, ",") {
-				if k = strings.TrimSpace(k); k != "" {
-					llmCfg.APIKeys = append(llmCfg.APIKeys, k)
-				}
-			}
-		} else if k := os.Getenv("LLM_API_KEY"); k != "" {
-			llmCfg.APIKeys = append(llmCfg.APIKeys, k)
-		}
-	}
-	if llmCfg.APIURL == "" {
-		llmCfg.APIURL = os.Getenv("LLM_API_URL")
-	}
-	if llmCfg.Model == "" {
-		llmCfg.Model = os.Getenv("LLM_MODEL")
-	}
-	// ③ 全局 auth 配置项（历史单账号形态）
-	if len(llmCfg.APIKeys) == 0 {
-		if v, ok := authMgr.GetConfig("", "llm_api_keys"); ok && v != "" {
-			for _, k := range strings.Split(v, ",") {
-				if k = strings.TrimSpace(k); k != "" {
-					llmCfg.APIKeys = append(llmCfg.APIKeys, k)
-				}
-			}
-		} else if v, ok := authMgr.GetConfig("", "llm_api_key"); ok && v != "" {
-			llmCfg.APIKeys = append(llmCfg.APIKeys, v)
-		}
-	}
-	if llmCfg.APIURL == "" {
-		if v, ok := authMgr.GetConfig("", "llm_api_url"); ok {
-			llmCfg.APIURL = v
-		}
-	}
-	// ④ 全局 config.json（无运营保存时的旧默认链）
-	if llmCfg.APIURL == "" {
-		llmCfg.APIURL = cfgMgr.Rules.LLM.APIURL
-	}
-	if llmCfg.Model == "" {
-		llmCfg.Model = cfgMgr.Rules.LLM.Model
-	}
-	if llmCfg.Timeout == 0 {
-		llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
-	}
-	if llmCfg.BatchConcurrency == 0 {
-		llmCfg.BatchConcurrency = cfgMgr.Rules.LLM.BatchConcurrency
-	}
-	if llmCfg.ClassifierModel == "" {
-		llmCfg.ClassifierModel = cfgMgr.Rules.LLM.ClassifierModel
-	}
-	// 主 key 兼容字段：日志脱敏等单 key 语义仍指向首把
-	if len(llmCfg.APIKeys) > 0 {
-		llmCfg.APIKey = llmCfg.APIKeys[0]
-	}
+	// LLM 配置解析统一走 §UI-AUTHORITATIVE 权威链（UI 保存 > env > 全局auth > config.json），
+	// 与 cmd/backtest、cmd/news_signal_latency 共用 internal/llmcfg，杜绝各入口口径分叉。
+	llmCfg := llmcfg.Resolve(cfgMgr, authMgr)
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
 	var llmClient *llm.Client
