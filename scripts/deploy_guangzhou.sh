@@ -32,8 +32,11 @@ while getopts ":s" opt; do case $opt in s) SYNC_ONLY=1 ;; *) ;; esac; done
 : "${GZ_IP:?请设置 GZ_IP（广州服务器公网 IP）}"
 GZ_USER="${GZ_USER:-Administrator}"
 LLM_API_KEY="${LLM_API_KEY:-}"
-LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn/v1/chat/completions}"
-LLM_MODEL="${LLM_MODEL:-THUDM/GLM-Z1-9B-0414}"
+# 默认仅注册服务时写入 bootstrap 环境变量；§UI-AUTHORITATIVE（2026-09-14）起
+# 运行期以「设置页保存」的配置为最高优先级，这里改默认值不会再顶掉 UI 配置。
+# 旧默认 siliconflow/GLM 已弃用（kiraai 免费档为现网生效通道）。
+LLM_API_URL="${LLM_API_URL:-https://kiraai.vn/v1/chat/completions}"
+LLM_MODEL="${LLM_MODEL:-qwen3.8-flash-free}"
 DEPLOY_DIR="${DEPLOY_DIR:-C:/opt/quant}"
 DATA_DIR="${DATA_DIR:-C:/var/lib/quant-trading-v2}"
 QMT_GATEWAY_DIR="${QMT_GATEWAY_DIR:-C:/qmt/quant-trading-v2/qmt_gateway}"
