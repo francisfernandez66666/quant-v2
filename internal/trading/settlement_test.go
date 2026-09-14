@@ -5,6 +5,7 @@
 package trading
 
 import (
+	"fmt"
 	"testing"
 
 	"quant-trading-v2/internal/config"
@@ -151,5 +152,70 @@ func TestSettleNormalizeSide(t *testing.T) {
 	}
 	if normalizeSide("unknown") != "" {
 		t.Fatalf("未知方向应忽略")
+	}
+}
+
+// TestSettleFactKeyNoCollapse §P0-1b 回归（2026-09-15）：同代码同方向同量价的多笔成交
+// 不得因关联键塌缩而互相覆盖——旧实现 CorrKey 塌缩为 "f:@@买入"，broker map 只剩最后一笔，
+// 对账必出假差异。现在按物理事实键多重集合逐笔配对。
+func TestSettleFactKeyNoCollapse(t *testing.T) {
+	db := testDB(t)
+	cfg := configDefault()
+	cfg.Enabled = true
+	// 本地两笔同码同向同量价成交（不同委托单）
+	for i, oid := range []string{"GW-A1", "GW-A2"} {
+		if err := db.ApplyRealFill(store.RealFill{OrderID: oid, Code: "600000.SH", Side: "买入",
+			Price: 10, Qty: 100, Amount: 1000, TradedAt: fmt.Sprintf("2026-09-08 09:3%d:00", i+1),
+			SignalID: "SIG" + oid, UserID: "u_st"}); err != nil {
+			t.Fatalf("local fill %d: %v", i, err)
+		}
+	}
+	src := &settleExecutor{src: &mockSettle{resp: &SettlementResponse{
+		Date: "2026-09-08", Connected: true,
+		Trades: []SettlementTrade{
+			{TsCode: "600000.SH", Side: "买入", Price: 10, Qty: 100}, // 两笔同键，均无 serial/order_id（最恶劣形态）
+			{TsCode: "600000.SH", Side: "买入", Price: 10, Qty: 100},
+			{TsCode: "000001.SZ", Side: "卖出", Price: 12, Qty: 200}, // 本地没有 → missing 1
+		},
+	}}}
+	ctrl := NewController(src, db, "u_st", cfg, nil)
+	diff, err := ctrl.SettleDay("2026-09-08", SettleModeReportOnly)
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if len(diff.MissingInLocal) != 1 {
+		t.Fatalf("两笔同键配对后应只剩 1 条缺失(000001), got %d: %v", len(diff.MissingInLocal), diff.MissingInLocal)
+	}
+	if len(diff.ExtraInLocal) != 0 || len(diff.Mismatch) != 0 {
+		t.Fatalf("本地两笔都应配对成功: extra=%v mismatch=%v", diff.ExtraInLocal, diff.Mismatch)
+	}
+}
+
+// TestSettleSyncFillsNoDoubleCount §P0-1c 回归（2026-09-15）：补记必须携带券商真实
+// 委托号+成交时间，使 (order_id,traded_at,price,qty) 判重键与真实回报路径重叠——
+// 补记后同一笔成交再从回报通道到达（网关 outbox 重放）时不得二次累加持仓。
+func TestSettleSyncFillsNoDoubleCount(t *testing.T) {
+	db := testDB(t)
+	cfg := configDefault()
+	cfg.Enabled = true
+	src := &settleExecutor{src: &mockSettle{resp: &SettlementResponse{
+		Date: "2026-09-08", Connected: true,
+		Trades: []SettlementTrade{
+			{OrderID: "GW-9", TsCode: "600519.SH", Side: "买入", Price: 100, Qty: 100, Fee: 5, Serial: "S-9", TradedAt: "09:31:00"},
+		},
+	}}}
+	ctrl := NewController(src, db, "u_st", cfg, nil)
+	if _, err := ctrl.SettleDay("2026-09-08", SettleModeSyncFills); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	// 模拟网关 outbox 对同一笔成交的重放（同 order_id + 同时间到达回报通道）
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-9", Code: "600519.SH", Side: "买入",
+		Price: 100, Qty: 100, Amount: 10000, TradedAt: "2026-09-08 09:31:00",
+		SignalID: "buy:test", UserID: "u_st"}); err != nil {
+		t.Fatalf("replayed report fill should be deduped by (order_id,traded_at,price,qty), got err: %v", err)
+	}
+	p, err := db.RealPositionByCodeForUser("u_st", "600519.SH")
+	if err != nil || p.Qty != 100 {
+		t.Fatalf("重放回报后持仓必须仍为 100（不双倍累加）, got %+v err=%v", p, err)
 	}
 }

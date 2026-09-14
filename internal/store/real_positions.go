@@ -565,6 +565,28 @@ func (d *DB) SumFilledQty(userID, signalID string) int {
 	return total
 }
 
+// SumOpenSellQty §P0-2（2026-09-15）汇总某账号某代码「当日仍在途的卖单」股数——
+// 状态 ∈ {已报,部成,已报待撤,部成待撤}（可能继续成交），不含已成/已撤/部撤/废单终态，
+// 也不含「发送失败」占位行（从未到达券商，重试前不该占额度）。
+// 用途：卖出剩余量 = 持仓量 − Σ已成交 − Σ在途。P2#13 只并了已成交口径，M8 清仓与止损
+// 建议同轮触发时（M8 卖单 fills 尚未回报），两类各按全量各下一笔全额卖单，第二笔只能靠
+// 柜台「证券不足」废单兜底；把在途卖量并入后，先到者占额度，后到者看到剩余=0 自然跳过。
+// 只统计「卖出」方向且当日（created_at 北京时前缀）的委托，买入在途不受影响。
+// English: §P0-2 — sums today's still-open sell qty for a code (statuses 已报/部成/已报待撤/部成待撤;
+// terminal and send-failed rows excluded). Sell remaining = held − Σfilled − Σopen, so a same-round
+// M8 liquidation + stop-loss advice can no longer both fire a full-qty sell before fills are reported.
+func (d *DB) SumOpenSellQty(userID, tsCode, day string) int {
+	var total int
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM orders
+		WHERE (user_id = '' OR user_id = ?) AND code = ? AND side = '卖出'
+		  AND created_at LIKE ?||'%'
+		  AND status IN ('已报','部成','已报待撤','部成待撤')`,
+		userID, tsCode, day).Scan(&total); err != nil {
+		return 0
+	}
+	return total
+}
+
 // UpdateRealOrderBySignalID 下单回填：把 pend:<signal_id> 占位行的 order_id 替换为网关真实委托号并更新状态。
 // §GAP 修复：此前占位行 order_id 恒为空串，与 order_id 主键冲突导致第二笔起的新单被
 // INSERT OR IGNORE 误判为重复（静默不下单），且按网关单号 UPDATE 也永不命中。

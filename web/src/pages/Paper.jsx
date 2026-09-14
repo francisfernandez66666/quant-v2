@@ -3,10 +3,10 @@
 // manual buy/trim/close, deposit, pool/cap config, pool reset, full liquidation.
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
-  Button, Dialog, DialogPlugin, Table, Tag, Card, Form, InputNumber, Input, Select, Tabs,
+  Button, Dialog, Table, Tag, Card, Form, InputNumber, Input, Select, Tabs,
 } from 'tdesign-react'
 import * as api from '../api/index.js'
-import { showToast } from '../ui.jsx'
+import { showToast, confirmDialog } from '../ui.jsx'
 import MinuteView from '../components/MinuteView.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
@@ -15,26 +15,6 @@ const UP = 'var(--app-up)'   // 涨（A股习惯红）
 const DOWN = 'var(--app-down)' // 跌（绿）
 // 将 up/down 涨跌标记映射为对应的红/绿颜色常量
 const clsColor = (c) => (c === 'up' ? UP : c === 'down' ? DOWN : undefined)
-
-/**
- * 封装 TDesign 确认对话框为 Promise。
- * 弹出「警告」主题确认框，用户点击确认返回 true，关闭或取消返回 false。
- * @param {string} body 弹窗正文内容
- * @param {string} [header='确认'] 弹窗标题
- * @returns {Promise<boolean>} 用户确认结果
- */
-// Promise 化确认对话框
-function confirmDialog(body, header = '确认') {
-  return new Promise((resolve) => {
-    const d = DialogPlugin.confirm({
-      header,
-      body,
-      theme: 'warning',
-      onConfirm: () => { d.hide(); resolve(true) },
-      onClose: () => { d.hide(); resolve(false) },
-    })
-  })
-}
 
 /**
  * 将数值格式化为带千分位、固定两位小数的中文本地化字符串。
@@ -210,9 +190,11 @@ export default function Paper() {
     const q = parseInt(tradeFormQty, 10)
     return isNaN(q) || q <= 0 ? 0 : q
   }, [tradeFormQty])
-  // 减仓手数×100 是否达到或超过当前持仓股数（超卖时禁用确认）
+  // 减仓手数×100 是否超过当前持仓股数（超卖时禁用确认）
+  // §P2-15（2026-09-15）：原 `>=` 把"全部清仓"也当成超卖禁用——与 Positions.jsx:171 的
+  // `sell > cur` 口径不一致，用户在模拟盘无法一键清掉整只持仓。改为严格大于。
   const tradeOverSell = useMemo(() =>
-    tradeDir === 'trim' && tradeTarget && tradePreviewQty * 100 >= tradeTarget.qty, [tradeDir, tradePreviewQty, tradeTarget])
+    tradeDir === 'trim' && tradeTarget && tradePreviewQty * 100 > tradeTarget.qty, [tradeDir, tradePreviewQty, tradeTarget])
 
   // 判断指定资金池是否已配置买入纪律（日限/冷却/最低分/日预算任一非空即视为已配）
   const poolCurrentRule = (key) => {

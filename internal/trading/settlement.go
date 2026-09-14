@@ -34,13 +34,14 @@ const (
 // brokerTrade 归一后的券商成交（用于三方比对）。
 // English: normalized broker trade for three-way comparison.
 type brokerTrade struct {
-	Key    string // FillKey（serial 优先，缺则 order_id+traded_at+side）
-	Code   string
-	Side   string
-	Price  float64
-	Qty    int
-	Fee    float64
-	Serial string
+	Code     string
+	Side     string
+	Price    float64
+	Qty      int
+	Fee      float64
+	OrderID  string // 券商委托号（sync_fills 补记时回填真实委托号，不再置空）
+	TradedAt string // 券商成交时间（补记时回填真实时间，不再用 day+" 00:00:00"）
+	Serial   string // 交割流水号（网关 trade_id）；缺失时不参与匹配（见 factKey）
 }
 
 // SettleDay 执行某交易日三方对账：券商交割单 ↔ 本地 fills ↔ real_account。
@@ -68,8 +69,11 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 		return nil, nil
 	}
 
-	// 归一券商成交（side 统一为 买入/卖出）
-	broker := map[string]brokerTrade{}
+	// 归一券商成交（side 统一为 买入/卖出）。§P0-1b（2026-09-15）：匹配键改为「物理事实键」
+	// 多重集合匹配——旧实现 brokerTrade.CorrKey 传 Serial+空 OrderID/TradedAt，网关不产出 serial 时
+	// 键塌缩为 "f:@@买入"，同向成交在 map 里互相覆盖（对账必出全量假差异）；本地 fills 又从不写
+	// Serial（网关回报不带），两侧键恒不匹配。新键 = 代码|方向|数量|价格(分)，同键多笔按列表逐一配对。
+	broker := map[string][]brokerTrade{}
 	var brokerFeeTotal float64
 	for _, t := range resp.Trades {
 		side := normalizeSide(t.Side)
@@ -78,22 +82,23 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 		}
 		bt := brokerTrade{
 			Code: t.TsCode, Side: side, Price: t.Price, Qty: t.Qty,
-			Fee: t.Fee + t.StampTax, Serial: t.Serial,
+			Fee: t.Fee + t.StampTax, OrderID: t.OrderID, TradedAt: t.TradedAt, Serial: t.Serial,
 		}
-		key := bt.CorrKey()
-		broker[key] = bt
+		k := settleFactKey(bt.Code, bt.Side, bt.Qty, bt.Price)
+		broker[k] = append(broker[k], bt)
 		brokerFeeTotal += bt.Fee
 	}
 
-	// 本地成交
+	// 本地成交（同样按物理事实键分桶）
 	localFills, err := c.store.ListFillsByDay(c.userID, day)
 	if err != nil {
 		return nil, err
 	}
-	local := map[string]store.RealFill{}
+	local := map[string][]store.RealFill{}
 	var localFeeTotal float64
 	for _, f := range localFills {
-		local[store.FillKey(f)] = f
+		k := settleFactKey(f.Code, f.Side, f.Qty, f.Price)
+		local[k] = append(local[k], f)
 		localFeeTotal += f.Fee + f.StampTax
 	}
 
@@ -103,22 +108,37 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 		BrokerFeeTotal: brokerFeeTotal,
 		FeeDiff:        brokerFeeTotal - localFeeTotal,
 	}
-	for key, bt := range broker {
-		if lf, ok := local[key]; ok {
-			// 同键存在：校验 量/价 一致
-			if lf.Qty != bt.Qty || abs(lf.Price-bt.Price) > 0.001 {
-				diff.Mismatch = append(diff.Mismatch, fmt.Sprintf("%s %s 量价不符 本地(%d@%.2f) vs 券商(%d@%.2f)",
-					key, bt.Code, lf.Qty, lf.Price, bt.Qty, bt.Price))
+	// 券商有 → 本地有无：同键列表逐一配对，券商多出的笔数即 MissingInLocal
+	type missingTrade struct {
+		bt brokerTrade
+		k  string
+	}
+	var missing []missingTrade
+	for k, bts := range broker {
+		lfs := local[k]
+		for i, bt := range bts {
+			if i < len(lfs) {
+				lf := lfs[i]
+				// 同键存在：校验 量/价 一致（键已含量价，此处防御价格分位舍入差）
+				if lf.Qty != bt.Qty || abs(lf.Price-bt.Price) > 0.011 {
+					diff.Mismatch = append(diff.Mismatch, fmt.Sprintf("%s %s 量价不符 本地(%d@%.2f) vs 券商(%d@%.2f)",
+						k, bt.Code, lf.Qty, lf.Price, bt.Qty, bt.Price))
+				}
+			} else {
+				diff.MissingInLocal = append(diff.MissingInLocal, fmt.Sprintf("%s %s %d@%.2f",
+					k, bt.Code, bt.Qty, bt.Price))
+				missing = append(missing, missingTrade{bt: bt, k: k})
 			}
-		} else {
-			diff.MissingInLocal = append(diff.MissingInLocal, fmt.Sprintf("%s %s %d@%.2f",
-				key, bt.Code, bt.Qty, bt.Price))
 		}
 	}
-	for key, lf := range local {
-		if _, ok := broker[key]; !ok {
-			diff.ExtraInLocal = append(diff.ExtraInLocal, fmt.Sprintf("%s %s %d@%.2f",
-				key, lf.Code, lf.Qty, lf.Price))
+	// 本地有 → 券商有无
+	for k, lfs := range local {
+		bts := broker[k]
+		for i, lf := range lfs {
+			if i >= len(bts) {
+				diff.ExtraInLocal = append(diff.ExtraInLocal, fmt.Sprintf("%s %s %d@%.2f",
+					k, lf.Code, lf.Qty, lf.Price))
+			}
 		}
 	}
 
@@ -129,19 +149,26 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 		}
 	}
 
-	// 纠偏
-	if mode == SettleModeSyncFills && len(diff.MissingInLocal) > 0 {
-		for key, bt := range broker {
-			if _, ok := local[key]; ok {
-				continue
+	// 纠偏。§P0-1c（2026-09-15）：补记不再用 OrderID=""/TradedAt=day 00:00:00 的占位键——
+	// 旧键与真实成交的 (order_id,traded_at,price,qty) 判重键永不重叠，ApplyRealFill 拦不住重复，
+	// real_positions 会被真实双倍累加（资损级）。现在回填券商真实委托号+真实成交时间
+	// （仅时间无日期时拼对账日），双层幂等：(order_id,traded_at,price,qty) 判重 + 事实键本身已配对。
+	if mode == SettleModeSyncFills && len(missing) > 0 {
+		for _, m := range missing {
+			bt := m.bt
+			tradedAt := bt.TradedAt
+			if tradedAt == "" {
+				tradedAt = day + " 00:00:00"
+			} else if len(tradedAt) == 8 { // 网关只回时间（HH:MM:SS）→ 拼对账日
+				tradedAt = day + " " + tradedAt
 			}
 			fill := store.RealFill{
-				OrderID: "", Code: bt.Code, Side: bt.Side, Price: bt.Price, Qty: bt.Qty,
-				Amount: bt.Price * float64(bt.Qty), TradedAt: day + " 00:00:00",
+				OrderID: bt.OrderID, Code: bt.Code, Side: bt.Side, Price: bt.Price, Qty: bt.Qty,
+				Amount: bt.Price * float64(bt.Qty), TradedAt: tradedAt,
 				SignalID: "settle:" + day, UserID: c.userID, Fee: bt.Fee, Serial: bt.Serial,
 			}
 			if err := c.store.ApplySettlementFill(fill); err != nil {
-				log.Printf("[settle] sync_fills 补记失败 %s: %v", key, err)
+				log.Printf("[settle] sync_fills 补记失败 %s: %v", m.k, err)
 			}
 		}
 	}
@@ -155,10 +182,16 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 	return diff, nil
 }
 
-// CorrKey 券商成交的关联键（复用 store.FillKey 口径：serial 优先）。
-// English: correlation key for a broker trade (mirrors store.FillKey: serial first).
-func (bt brokerTrade) CorrKey() string {
-	return store.FillKey(store.RealFill{Serial: bt.Serial, OrderID: "", TradedAt: "", Side: bt.Side})
+// settleFactKey 三方对账的「物理事实键」（§P0-1b，2026-09-15）：代码|方向|数量|价格(分)。
+// 刻意不依赖 serial/order_id/时间戳——网关不产出 serial、回报 order_id 形态随通道（xt 交易所号 /
+// queued seq 占位）变化、时间戳两侧口径不一，任何依赖它们的键都必然两侧永不匹配（旧实现实录）。
+// 物理事实（什么代码、什么方向、多少股、什么价）两侧必然一致，同键多笔用列表逐一配对。
+// English: §P0-1b — the "physical fact key" for reconciliation: code|side|qty|price(cents).
+// Deliberately independent of serial/order_id/timestamps (gateway never produced serials; order-id
+// shapes differ per channel; timestamp formats diverge) — any such key never matched across sides.
+// The physical facts must agree; multi-fill same keys are paired positionally via lists.
+func settleFactKey(code, side string, qty int, price float64) string {
+	return fmt.Sprintf("%s|%s|%d|%.2f", code, side, qty, price)
 }
 
 // normalizeSide 归一交割方向（买入/卖出）；无法识别返回空串。

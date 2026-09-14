@@ -15,6 +15,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
@@ -281,6 +283,11 @@ func ctrlTripped(s *Server, userID string) bool {
 	return c != nil && c.Tripped()
 }
 
+// regClientID §P1-7 客户端幂等键格式：UUID/字母数字-下划线，≤64 字符（入 signal_id 前校验，
+// 拒绝把任意用户串拼进幂等键）。
+// English: §P1-7 client idempotency key pattern (alnum + dash/underscore, ≤64 chars).
+var regClientID = regexp.MustCompile(`^[A-Za-z0-9_\-]{1,64}$`)
+
 // handleExecuteAction 执行 manual 下单（POST /api/positions/execute）。
 // 请求体：{code, side(买入/卖出), action(加仓/减仓/止盈/止损/清仓), qty, price, strategy, reason}
 // 熔断中/未启用 → 拒绝；写入 orders 表（signal_id 幂等）。
@@ -296,6 +303,13 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		Price    float64 `json:"price"`    // 参考价
 		Strategy string  `json:"strategy"` // 战法（白名单过滤用）
 		Reason   string  `json:"reason"`
+		// §P1-7（2026-09-15）客户端幂等键：旧实现 signalID=manual@code@秒级时间戳，跨秒双击/重试
+		// 生成两个不同键 → 两笔真实订单。前端对一次「确认」生成一次 UUID 并随重试复用，
+		// 服务端按其幂等（signal_id 唯一键天然拦截）。缺省时回退旧键（兼容旧客户端）。
+		ClientID string `json:"client_id"`
+		// §P1-7 限价偏离确认：参考价偏离实时价超 ±15% 时必须显式确认才受理（防手滑输错价
+		// 真金白银成交）。行情不可用时跳过校验（fail-open，与风控闸哲学一致）。
+		ConfirmDeviation bool `json:"confirm_deviation"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -336,8 +350,34 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// §P1-7 手动单行情上下文 + 价格合理性：拉一次实时行情（best-effort，失败即 fail-open
+	// 不阻断——与风控闸"无行情弃权"哲学一致）。成功时同时修掉三个历史缺口：
+	//   - checkLimitPrice 因手动单 PrevClose=0 恒 fail-open；
+	//   - 限价偏离市价 ±20% 也直发（手滑输错价 = 真金白银）；
+	//   - 陈旧度未提供（StaleQuoteGuard 恒跳过）。
+	var q *data.StockInfo
+	var staleMs int64 = -1
+	if s.market != nil {
+		if qq, qerr := s.market.GetRealtimeQuote(normalizeTsCode(req.Code)); qerr == nil && qq != nil && qq.Price > 0 {
+			q = qq
+		}
+	}
+	if q != nil {
+		if dev := (req.Price - q.Price) / q.Price; (dev > 0.15 || dev < -0.15) && !req.ConfirmDeviation {
+			writeError(w, 400, fmt.Sprintf("委托价 %.2f 偏离现价 %.2f 超 ±15%%（%.1f%%），请核对价格后确认提交",
+				req.Price, q.Price, dev*100))
+			return
+		}
+	}
+	clientID := ""
+	if cid := strings.TrimSpace(req.ClientID); cid != "" && len(cid) <= 64 && regClientID.MatchString(cid) {
+		clientID = cid
+	}
 	signalID := "manual@" + req.Code + "@" + time.Now().Format("20060102150405")
-	res, err := ctrl.PlaceOrder(trading.OrderRequest{
+	if clientID != "" {
+		signalID = "manual@" + req.Code + "@" + clientID
+	}
+	oreq := trading.OrderRequest{
 		SignalID:  signalID,
 		Code:      normalizeTsCode(req.Code),
 		Name:      s.stockName(req.Code),
@@ -348,7 +388,17 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		Qty:       qty,
 		Amount:    float64(qty) * req.Price,
 		CreatedAt: time.Now().Format(time.RFC3339),
-	})
+	}
+	if q != nil {
+		oreq.CurrentPrice = q.Price
+		oreq.PrevClose = q.PrevClose // §P1-5 显式昨收；未装配的源回退旧 Close 语义
+		if oreq.PrevClose <= 0 {
+			oreq.PrevClose = q.Close
+		}
+		staleMs = 0
+	}
+	oreq.StalenessMs = staleMs
+	res, err := ctrl.PlaceOrder(oreq)
 	if err != nil {
 		writeError(w, 400, "order rejected: "+err.Error())
 		return
@@ -369,24 +419,17 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 }
 
 // normalizeTsCode 把前端传入的股票代码补成带后缀形式（600000 → 600000.SH）。
-// English: normalizeTsCode appends the exchange suffix to a bare code.
+// §P1-6（2026-09-15）：实现收口到 data.ExchangeSuffix——旧内联 switch 把 `9` 前缀一律 .SH，
+// 920xxx 北交所新股会被补成 .SH 下发网关（发错交易所/写错账本代码），与 data.LimitUpPct
+// 的 92=北交所 30% 涨跌幅口径矛盾。
+// English: normalizeTsCode appends the exchange suffix to a bare code, delegating to
+// data.ExchangeSuffix (§P1-6) so the 920 BJ segment is no longer misrouted to .SH.
 func normalizeTsCode(code string) string {
 	if code == "" {
 		return code
 	}
-	code = strings.TrimSpace(code)
-	upper := strings.ToUpper(code)
-	if strings.HasSuffix(upper, ".SH") || strings.HasSuffix(upper, ".SZ") || strings.HasSuffix(upper, ".BJ") {
-		return upper
-	}
-	switch {
-	case upper[0] == '6', upper[0] == '9':
-		return upper + ".SH"
-	case upper[0] == '4', upper[0] == '8':
-		return upper + ".BJ"
-	default:
-		return upper + ".SZ"
-	}
+	upper := strings.ToUpper(strings.TrimSpace(code))
+	return data.ExchangeSuffix(upper)
 }
 
 // normalizeReportSide 将网关回报的 side 字段归一为账本内部标准串（"买入"/"卖出"）。

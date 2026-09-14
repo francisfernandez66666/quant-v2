@@ -33,6 +33,19 @@ log = logging.getLogger("qmt_gateway.handler")
 RETRY_DELAYS = [1, 2, 4]  # 秒，指数退避
 HEARTBEAT_SEC = 60        # §ROBUST 上行心跳间隔（尽力而为，不入持久化队列）
 
+# §P1-8（2026-09-15）永久拒绝的状态码：首尔 /api/qmt/report 对非法方向/未知 type 回 400——
+# 这类消息重发一万次也是 400，旧实现一律无限重试会永久卡死 outbox FIFO 队首（毒丸），
+# 阻塞其后全部成交/委托回报。永久 4xx 落死信表留痕并继续消费；401/403/408/425/429
+# 属瞬态（token 轮换窗口/限流/超时），保留重试。
+# English: §P1-8 — permanently-rejected statuses (client errors other than auth/rate-limit) are
+# dead-lettered instead of blocking the durable outbox FIFO forever.
+RETRYABLE_4XX = {401, 403, 408, 425, 429}
+
+
+def _is_permanent_reject(status):
+    """§P1-8 判定：4xx（除瞬态白名单）视为永久性拒绝。"""
+    return status is not None and 400 <= status < 500 and status not in RETRYABLE_4XX
+
 
 def _now_beijing():
     """返回当前北京时间（Asia/Shanghai）。zoneinfo 不可用时降级为 UTC+8 估算。"""
@@ -56,29 +69,46 @@ def is_active_trading_session():
     return dtime(9, 15) <= t < dtime(15, 0)
 
 
-def post_report(base_url, token, payload, retries=3):
-    """推送一条回报到首尔 /api/qmt/report。失败按退避重试。返回 bool。"""
-    # 拼接首尔上报地址并序列化 payload 为 JSON 字节流
+def post_report_status(base_url, token, payload, retries=3):
+    """§P1-8（2026-09-15）推送一条回报并返回 (ok, last_status)。
+
+    last_status 为最后一次失败的 HTTP 状态码（网络层错误为 None）——供 _send_loop
+    区分瞬态失败（重试）与永久性拒绝（4xx 死信）。成功时 status=200。
+    English: §P1-8 — push one report and also surface the last HTTP status so the sender can
+    dead-letter permanent client errors instead of retrying a poison message forever.
+    """
     url = base_url.rstrip("/") + "/api/qmt/report"
     data = json_dumps(payload).encode("utf-8")
     last_err = None
+    last_status = None
     for attempt in range(max(1, retries)):
-        # 构造 POST 请求，带 JSON 头与 Bearer 鉴权
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + token)
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status != 200:
-                    last_err = "HTTP %s" % resp.status
+                    last_err, last_status = "HTTP %s" % resp.status, resp.status
                 else:
-                    return True
+                    return True, 200
+        except urllib.error.HTTPError as e:  # 4xx/5xx：先于 URLError 捕获（HTTPError 是其子类）
+            last_err, last_status = str(e), e.code
+            # 永久性拒绝立即短路：重发同一条坏 payload 不会变好，别浪费退避周期
+            if _is_permanent_reject(e.code):
+                log.warning("[handler] report permanently rejected HTTP %s: %s", e.code, last_err)
+                return False, e.code
         except (urllib.error.URLError, OSError) as e:
-            last_err = str(e)
+            last_err, last_status = str(e), None
         if attempt + 1 < max(1, retries):
             time.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
     log.warning("[handler] report push failed after %d tries: %s", retries, last_err)
-    return False
+    return False, last_status
+
+
+def post_report(base_url, token, payload, retries=3):
+    """推送一条回报到首尔 /api/qmt/report。失败按退避重试。返回 bool。"""
+    ok, _ = post_report_status(base_url, token, payload, retries=retries)
+    return ok
 
 
 def json_dumps(o):
@@ -168,11 +198,22 @@ class ReportHandler:
                 log.error("[handler] outbox row %s unparsable — dropped", oid)
                 self.store.outbox_delete(oid)
                 continue
-            if post_report(self.report_url, self.report_token, payload):
+            ok, status = post_report_status(self.report_url, self.report_token, payload)
+            if ok:
+                self.store.outbox_delete(oid)
+                backoff = 2
+            elif _is_permanent_reject(status):
+                # §P1-8（2026-09-15）毒丸防护：首尔永久性拒绝（如非法方向/未知 type 的 400）
+                # 重发永不转好——旧实现滞留队首无限重试，单条毒丸卡死整个回报 FIFO，
+                # 其后全部成交/委托回报永不落账（2026-09-11 broker 事件刷屏即此形态的一次复发）。
+                # 现在移入 outbox_dead 死信表留痕（payload+reason），队列继续消费。
+                log.error("[handler] outbox row %s permanently rejected HTTP %s — dead-lettered: %s",
+                          oid, status, json_dumps(payload)[:200])
+                self.store.outbox_dead_enqueue(payload, "HTTP %s" % status)
                 self.store.outbox_delete(oid)
                 backoff = 2
             else:
-                # 滞留队首无限重试：交易回报不允许静默丢失
+                # 瞬态失败（网络/5xx/401/429）：滞留队首退避重试——交易回报不允许静默丢失
                 time.sleep(min(backoff, 30))
                 backoff *= 2
 

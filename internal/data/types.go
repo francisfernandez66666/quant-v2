@@ -18,7 +18,11 @@ type StockInfo struct {
 	Open      float64 `json:"open"`       // 今日开盘价（元）
 	High      float64 `json:"high"`       // 当日最高价（元）
 	Low       float64 `json:"low"`        // 当日最低价（元）
-	Close     float64 `json:"close"`      // 最新价 / 昨收价（依数据源而定）
+	Close     float64 `json:"close"`      // 最新价 / 昨收价（依数据源而定）——历史歧义字段，见 PrevClose
+	PrevClose float64 `json:"prev_close"` // §P1-5（2026-09-15）昨收价（元），>0 才可信。历史各数据源把昨收
+	// 混塞进 Close（Close 语义"依数据源而定"），风控闸 checkLimitPrice 的涨跌停判定以 PrevClose
+	// 为基准，基准歧义会让闸门"现价再涨 9.9% 才拦"或反向误拦。装配点逐源填充真实昨收；
+	// 消费方一律 PrevClose>0 优先、回退旧 Close 字段（向后兼容未改造的装配点）。
 	Volume    float64 `json:"volume"`     // 成交量（股）
 	Amount    float64 `json:"amount"`     // 成交额（元）
 	ChangePct float64 `json:"change_pct"` // 涨跌幅（%，如 1.23 表示 +1.23%）

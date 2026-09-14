@@ -318,6 +318,7 @@ func (c *HithinkClient) BatchQuotes(codes []string) (map[string]*StockInfo, erro
 			High:      it.HighPrice,
 			Low:       it.LowPrice,
 			Close:     it.PrevPrice,
+			PrevClose: it.PrevPrice, // §P1-5 显式昨收（同花顺 PrevPrice）
 			Volume:    it.Volume,
 			Amount:    it.Turnover,
 			ChangePct: it.PriceChangeRatioPct,

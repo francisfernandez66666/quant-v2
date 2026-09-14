@@ -3,12 +3,12 @@
 // enable/disable, expiry, and per-account strategy param delegation.
 import React, { useState, useEffect } from 'react'
 import {
-  Button, Input, InputNumber, Select, Dialog, DialogPlugin,
+  Button, Input, InputNumber, Select, Dialog,
   Table, Tag, Card, Form, Checkbox,
 } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
-import { showToast } from '../ui.jsx'
+import { showToast, confirmDialog } from '../ui.jsx'
 
 // 从 api 模块导入权限判断工具：isAdmin() 读取 localStorage 中缓存的 role（由 App 的 refreshMe 写入）
 // 守卫判断来源：web/src/api/index.js 的 isAdmin()（基于 STORAGE_ROLE），与 App.jsx 中侧边栏 canAdmin 一致
@@ -140,18 +140,6 @@ function expiryText(u) {
   return '有效期：' + fmtTime(u.expires_at) + '（剩 ' + days + ' 天）'
 }
 
-// 封装 tdesign 确认对话框为 Promise
-function confirmDialog(body, header = '确认') {
-  return new Promise((resolve) => {
-    const d = DialogPlugin.confirm({
-      header,
-      body,
-      theme: 'warning',
-      onConfirm: () => { d.hide(); resolve(true) },
-      onClose: () => { d.hide(); resolve(false) },
-    })
-  })
-}
 
 /**
  * 用户管理页面组件（仅 admin 可见）

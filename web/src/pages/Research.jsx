@@ -3,28 +3,15 @@
 // 全量使用 TDesign React 组件（Card / Table / Tag / Button / Dialog / Tabs / Select / Input）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
-  Card, Table, Tag, Button, Dialog, DialogPlugin, Select, Input, InputNumber,
+  Card, Table, Tag, Button, Dialog, Select, Input, InputNumber,
   Tabs, MessagePlugin,
 } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
 import ParetoChart from '../components/ParetoChart'
 import BacktestConfigPanel from '../components/BacktestConfigPanel'
 import * as api from '../api/index.js'
-import { showToast } from '../ui.jsx'
+import { showToast, confirmDialog } from '../ui.jsx'
 
-// 封装 tdesign 确认对话框为 Promise（与 Admin/Paper 保持一致）；用户确认时 resolve(true)，关闭时 resolve(false)
-function confirmDialog(body, header = '确认') {
-  return new Promise((resolve) => {
-    const d = DialogPlugin.confirm({
-    // 常量 d：局部定义
-      header,
-      body,
-      theme: 'warning',
-      onConfirm: () => { d.hide(); resolve(true) },
-      onClose: () => { d.hide(); resolve(false) },
-    })
-  })
-}
 
 // 将小数格式化为带百分号的字符串（如 12.34%）
 function fmtPctGlobal(v) {

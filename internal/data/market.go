@@ -447,6 +447,7 @@ func (m *MarketAPI) getSinaQuotes(codes []string) map[string]*StockInfo {
 		si.Volume, _ = strconv.ParseFloat(fields[8], 64)
 		si.Amount, _ = strconv.ParseFloat(fields[9], 64)
 		si.Close = prevClose
+		si.PrevClose = prevClose // §P1-5 显式昨收（新浪字段 2）
 		if prevClose > 0 && si.Price > 0 {
 			si.ChangePct = (si.Price - prevClose) / prevClose * 100
 		}
@@ -689,6 +690,7 @@ func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
 			High:      high,
 			Low:       low,
 			Close:     prevClose,
+			PrevClose: prevClose, // §P1-5 显式昨收（腾讯字段 4）
 			Volume:    vol * 100, // 手 → 股
 			ChangePct: chg,
 		}
@@ -750,6 +752,7 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 		High:      raw.Data.F44 / 100,
 		Low:       raw.Data.F45 / 100,
 		Close:     raw.Data.F60 / 100,
+		PrevClose: raw.Data.F60 / 100, // §P1-5 显式昨收（东财 F60）
 		Volume:    volHands * 100, // 手→股，与新浪日K/余量表单位对齐
 		Amount:    amount,
 		ChangePct: raw.Data.F170 / 100,
@@ -922,6 +925,7 @@ func parseSectorStocks(body []byte) ([]StockInfo, error) {
 			Low:       item.F16 / 100,
 			Open:      item.F17 / 100,
 			Close:     item.F18 / 100,
+			PrevClose: item.F18 / 100, // §P1-5 显式昨收（东财列表 F18）
 			Volume:    item.F5,
 			Amount:    item.F6,
 			Turnover:  item.F7,

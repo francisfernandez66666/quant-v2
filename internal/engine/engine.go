@@ -1202,7 +1202,12 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	}
 	if si != nil {
 		req.CurrentPrice = si.Price
-		req.PrevClose = si.Close
+		// §P1-5（2026-09-15）：昨收优先用显式 PrevClose 字段（各行情源已逐点填充）；
+		// 未改造源回退旧 Close 字段（语义"依数据源而定"，仍是历史口径）。
+		req.PrevClose = si.PrevClose
+		if req.PrevClose <= 0 {
+			req.PrevClose = si.Close
+		}
 	}
 	// （兼容未启动分发器的调用方，如测试与直调；保持原有行为）。
 	// §修复 FIX#8（2026-09-04）：满队不再静默丢弃——旧实现 select default 直接 drop，
@@ -1330,20 +1335,12 @@ func (e *Engine) SetScoringInterval(d time.Duration) {
 }
 
 // withSuffix 为纯数字股票代码补交易所后缀（600000 → 600000.SH；000001 → 000001.SZ；4/8 开头 → .BJ）。
-// English: withSuffix appends the exchange suffix to a bare digit code (600000→600000.SH, 000001→000001.SZ,
-// 4/8-prefix→.BJ).
+// §P1-6（2026-09-15）：实现收口到 data.ExchangeSuffix（旧内联 switch 把 `9` 前缀一律 .SH，
+// 920xxx 北交所新股被发错交易所——与 data.LimitUpPct 的 92=北交所口径矛盾）。
+// English: withSuffix appends the exchange suffix to a bare digit code; implementation delegates to
+// data.ExchangeSuffix (§P1-6) so the 920 BJ segment is no longer misrouted to .SH.
 func withSuffix(code string) string {
-	if strings.Contains(code, ".") {
-		return code
-	}
-	switch {
-	case strings.HasPrefix(code, "6"), strings.HasPrefix(code, "9"):
-		return code + ".SH"
-	case strings.HasPrefix(code, "4"), strings.HasPrefix(code, "8"):
-		return code + ".BJ"
-	default:
-		return code + ".SZ"
-	}
+	return data.ExchangeSuffix(code)
 }
 
 // paperMark 用实时快照刷新模拟盘估值与净值：优先按账号分发，回退全局引擎。

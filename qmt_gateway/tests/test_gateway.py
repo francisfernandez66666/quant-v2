@@ -259,6 +259,45 @@ class TestHandler(unittest.TestCase):
         self.assertEqual(s.list_positions()[0]["qty"], 100)
         self.assertTrue(h.disconnected)
 
+    def test_outbox_permanent_reject_dead_letter(self):
+        """§P1-8（2026-09-15）毒丸防护回归：首尔永久性拒绝（400）的回报落死信表，
+        队列继续消费后续回报——旧实现滞留队首无限重试，单条毒丸卡死整个 FIFO。"""
+        import handler as handler_mod
+        s = new_store()
+        h = handler_mod.ReportHandler(s, "http://seoul:8080", "tok")
+        delivered = []
+
+        def fake_status(url, token, payload, retries=3):
+            """首尔侧模拟：type=bad 永久 400，其余成功。"""
+            if payload.get("type") == "bad":
+                return False, 400
+            delivered.append(payload)
+            return True, 200
+
+        old_status = handler_mod.post_report_status
+        handler_mod.post_report_status = fake_status
+        h.start_sender()
+        try:
+            h._push({"type": "bad", "seq": 1})
+            h._push({"type": "trade", "seq": 2})
+            h._push({"type": "order", "seq": 3})
+            deadline = time.time() + 5
+            while s.outbox_count() > 0 and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(s.outbox_count(), 0, "毒丸不得滞留队首")
+            self.assertEqual([p.get("type") for p in delivered], ["trade", "order"],
+                             "毒丸之后的回报必须照常投递")
+            # 死信留痕
+            with s._lock:
+                rows = s._conn.execute(
+                    "SELECT payload, reason FROM outbox_dead").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertIn('"seq": 1', rows[0]["payload"])
+            self.assertIn("400", rows[0]["reason"])
+        finally:
+            h.stop_sender()
+            handler_mod.post_report_status = old_status
+
 
 class TestMockBroker(unittest.TestCase):
     def test_place_order_fill_updates_position(self):
@@ -407,6 +446,49 @@ class TestGatewayHTTP(unittest.TestCase):
         self.assertEqual(state["orders"][0]["order_id"], order_id)
         self.assertEqual(state["positions"][0]["ts_code"], "600519.SH")
         self.assertEqual(state["positions"][0]["qty"], 100)
+
+    def test_settlement_endpoint(self):
+        """§P0-1a（2026-09-15）：/settlement 日终对账权威源——此端点此前根本不存在，
+        Go 侧 FetchSettlement 一直 404，README §U-2 宣称的日终四方对账从未生效。"""
+        from datetime import datetime, timedelta, timezone
+        day = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        # 缺日期 → 400
+        status, body = self._req("GET", "/settlement")
+        self.assertEqual(status, 400)
+        status, body = self._req("GET", "/settlement?date=20260915")
+        self.assertEqual(status, 400)
+
+        # 下一单并等 mock 成交（fills 落库带 trade_id 流水号）
+        status, body = self._req("POST", "/order", {
+            "signal_id": "SETTLE1", "code": "600519.SH", "name": "贵州茅台", "side": "买入",
+            "price_type": "market", "price": 1510, "qty": 100, "amount": 151000,
+            "created_at": "t",
+        })
+        self.assertEqual(status, 200)
+        order_id = body["order_id"]
+        time.sleep(1.2)
+
+        status, body = self._req("GET", "/settlement?date=" + day)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["connected"])
+        self.assertEqual(body["date"], day)
+        self.assertEqual(len(body["trades"]), 1)
+        t = body["trades"][0]
+        self.assertEqual(t["ts_code"], "600519.SH")
+        self.assertEqual(t["side"], "买入")
+        self.assertEqual(t["price"], 1510)
+        self.assertEqual(t["qty"], 100)
+        self.assertEqual(t["order_id"], order_id)
+        # serial = §G1 唯一成交编号（Go 侧物理事实键之外的第二关联锚点）
+        self.assertTrue(t["serial"])
+        self.assertTrue(t["traded_at"].startswith(day))
+        # cash 快照缺失时为数值 dict（Go 侧按 cash.cash>0 才计现金差，不误报）
+        self.assertIsInstance(body["cash"].get("cash"), float)
+
+        # 无成交日期 → 空 trades 不误报
+        status, body = self._req("GET", "/settlement?date=2020-01-02")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["trades"], [])
 
     def test_empty_signal_id_rejected(self):
         """§G2 空 signal_id 一律 400，不进入下单路径。"""

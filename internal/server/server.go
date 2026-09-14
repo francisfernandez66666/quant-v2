@@ -552,6 +552,7 @@ func (s *Server) registerRoutes() {
 	// 自选股/持仓：读对所有登录用户开放（系统级共享的大盘自选）；写仅管理员可操作。
 	s.mux.HandleFunc("GET /api/holdings", s.authMiddleware(s.handleFixGetHoldings))
 	s.mux.HandleFunc("POST /api/holdings", s.adminMiddleware(s.handleFixSetHoldings))
+	s.mux.HandleFunc("POST /api/holdings/balance", s.adminMiddleware(s.handleFixSetBalance)) // §P1-11 窄口径改资金
 	s.mux.HandleFunc("POST /api/holdings/{code}/add", s.adminMiddleware(s.handleFixAddHoldingLot))
 	s.mux.HandleFunc("POST /api/holdings/{code}/cost", s.adminMiddleware(s.handleFixSetCost))
 	s.mux.HandleFunc("POST /api/holdings/{code}/sell", s.adminMiddleware(s.handleFixSellHolding))

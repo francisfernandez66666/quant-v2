@@ -70,8 +70,25 @@ type book struct {
 	orders    map[string]*order // 全部委托记录（键为 order_id）
 	positions map[string]*pos   // 持仓（键为 ts_code，加权成本聚合）
 	signal    map[string]string // signal_id → order_id 幂等索引（防止同信号重复下单）
+	fills     []fillRecord      // §P2-14（2026-09-15）成交流水（/settlement 对账源，serial 唯一）
 	account   string            // 模拟资金账号
 	nextID    int               // 委托 ID 自增计数器
+	nextSer   int               // §P2-14 成交流水号自增（serial=SER000001，对齐实网关 trade_id 语义）
+	cash      float64           // §P2-14 模拟现金（买入扣减/卖出回补，/settlement cash 口径）
+	fillMode  string            // §P2-14 成交模式：full（默认）/partial（部成→已成）/reject（废单）
+}
+
+// fillRecord 成交流水行（§P2-14 /settlement 装配源，字段对齐实网关 fills 表）。
+type fillRecord struct {
+	OrderID  string  `json:"order_id"`
+	Code     string  `json:"code"`
+	Side     string  `json:"side"`
+	Price    float64 `json:"price"`
+	Qty      int     `json:"qty"`
+	Amount   float64 `json:"amount"`
+	TradedAt string  `json:"traded_at"`
+	Serial   string  `json:"serial"` // 交割流水号（对齐实网关 trade_id/serial）
+	SignalID string  `json:"signal_id"`
 }
 
 // newBook 创建指定资金账号的内存账本（初始化订单/持仓映射与 signal→order 幂等索引）。
@@ -82,6 +99,8 @@ func newBook(account string) *book {
 		signal:    map[string]string{},
 		account:   account,
 		nextID:    1,
+		cash:      1000000, // §P2-14 默认模拟现金 100 万（-cash 可调）
+		fillMode:  "full",
 	}
 }
 
@@ -120,9 +139,9 @@ func (b *book) seedPositions(seeds []string) {
 }
 
 // applyFill 按成交更新持仓（买加仓加权成本/卖减仓，清仓删除行）并推进最高价。
-// （applyFill updates the book on a fill: buy adds with weighted cost, sell trims, close deletes, and
-// highest price only moves up.）
-func (b *book) applyFill(o *order, price float64) {
+// §P2-14：同步记成交流水（fills，serial 自增唯一）+ 现金变动（买扣/卖回补），
+// 供 /settlement 对账与 positions/account 事件回报。
+func (b *book) applyFill(o *order, price float64) (fillRecord, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	p := b.positions[o.Code]
@@ -141,18 +160,48 @@ func (b *book) applyFill(o *order, price float64) {
 		if price > p.HighestPrice {
 			p.HighestPrice = price
 		}
+		b.cash -= float64(o.Qty) * price
 	} else {
 		if p == nil {
-			return
+			return fillRecord{}, false
 		}
 		remain := p.Qty - o.Qty
+		b.cash += float64(o.Qty) * price
 		if remain <= 0 {
 			delete(b.positions, o.Code)
-			return
+		} else {
+			p.Qty = remain
+			p.Amount = float64(remain) * price
 		}
-		p.Qty = remain
-		p.Amount = float64(remain) * price
 	}
+	b.nextSer++
+	fr := fillRecord{
+		OrderID: o.OrderID, Code: o.Code, Side: o.Side, Price: price, Qty: o.Qty,
+		Amount: float64(o.Qty) * price, TradedAt: time.Now().Format(time.RFC3339),
+		Serial: fmt.Sprintf("SER%06d", b.nextSer), SignalID: o.SignalID,
+	}
+	b.fills = append(b.fills, fr)
+	return fr, true
+}
+
+// snapshotFills 导出某交易日（YYYY-MM-DD 前缀匹配）的成交流水（§P2-14 /settlement 用）。
+func (b *book) snapshotFills(day string) []fillRecord {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]fillRecord, 0, len(b.fills))
+	for _, f := range b.fills {
+		if day == "" || strings.HasPrefix(f.TradedAt, day) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// snapshotCash 导出当前现金（§P2-14 /settlement cash 口径）。
+func (b *book) snapshotCash() float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cash
 }
 
 // snapshotPositions 导出当前持仓（按市值排序）。
@@ -192,9 +241,18 @@ func main() {
 	delay := flag.Duration("delay", 3*time.Second, "模拟成交延时（下单受理后延时成交）")
 	account := flag.String("account", "MOCK0001", "模拟资金账号")
 	seed := flag.String("seed", "", "预置持仓（逗号分隔列表，每项 code,name,qty,cost；示例 600519.SH,贵州茅台,100,1500.00）")
+	cash := flag.Float64("cash", 1000000, "§P2-14 模拟初始现金（/settlement cash 与 account 事件口径）")
+	fillMode := flag.String("fill-mode", "full", "§P2-14 成交模式：full=整笔已成 / partial=先部成后已成 / reject=柜台废单（推废单事件）")
+	chaos := flag.Bool("chaos", false, "§P2-14 乱序回报：先推 trade 再推 order已成（回归引擎单调状态机守卫）")
 	flag.Parse()
 
 	b := newBook(*account)
+	b.cash = *cash
+	if *fillMode == "partial" || *fillMode == "reject" || *fillMode == "full" {
+		b.fillMode = *fillMode
+	} else {
+		log.Printf("[mock] unknown -fill-mode %q, fallback full", *fillMode)
+	}
 	if *seed != "" {
 		b.seedPositions(strings.Split(*seed, "|"))
 	}
@@ -217,7 +275,7 @@ func main() {
 		}
 	}
 
-	handler := buildHandler(b, *token, *delay, push)
+	handler := buildHandler(b, *token, *delay, push, *chaos)
 
 	srv := &http.Server{Addr: *listen, Handler: handler}
 	go func() {
@@ -237,6 +295,33 @@ func main() {
 	_ = srv.Close()
 }
 
+// pushBookSnapshot §P2-14：成交后推 positions + account 快照对账事件——引擎的
+// 清算 Guard（空快照守卫）与资金闸（AvailableCash）此前在 mock 环境零覆盖。
+// 字段形状对齐实网关 periodic_reconcile / on_account 回报。
+func pushBookSnapshot(b *book, push func(map[string]interface{})) {
+	if pos := b.snapshotPositions(); len(pos) >= 0 {
+		push(map[string]interface{}{"type": "positions", "positions": pos,
+			"at": time.Now().Format(time.RFC3339)})
+	}
+	push(map[string]interface{}{"type": "account", "asset": map[string]interface{}{
+		"cash":         b.snapshotCash(),
+		"frozen_cash":  0.0,
+		"total_asset":  b.snapshotCash() + bookMarketValue(b),
+		"market_value": bookMarketValue(b),
+	}, "at": time.Now().Format(time.RFC3339)})
+}
+
+// bookMarketValue 汇总当前持仓市值（§P2-14 account 事件 total_asset 口径）。
+func bookMarketValue(b *book) float64 {
+	total := 0.0
+	for _, p := range b.snapshotPositions() {
+		if v, ok := p["amount"].(float64); ok {
+			total += v
+		}
+	}
+	return total
+}
+
 // orderEvent 组一条委托状态回报：字段形状与真实网关（qmt_gateway/handler.py）的 order 回调
 // 一致，引擎侧按 signal_id 走单调状态机推进。提取为包级函数供 §U-4 生命周期单测复用。
 // English: builds an order-status report shaped like the real gateway's callback payload.
@@ -248,13 +333,28 @@ func orderEvent(o *order, status string) map[string]interface{} {
 	}
 }
 
-// buildHandler 组装 mock 网关的 HTTP 面（/health /state /order /cancel + Bearer 中间件）。
+// sideCN §P2-14 方向归一（对齐实网关 normalizeSide / 引擎 normalizeReportSide 口径）：
+// buy/b/买入 → 买入，sell/s/卖出 → 卖出；未知原样返回（成交按未知方向 no-op 不记账）。
+// 旧 mock 不归一，测试/联调传 "buy" 时 applyFill 走卖分支 no-op，成交事件与账本脱节。
+func sideCN(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "buy", "b", "买入", "买":
+		return "买入"
+	case "sell", "s", "卖出", "卖":
+		return "卖出"
+	}
+	return s
+}
+
+// buildHandler 组装 mock 网关的 HTTP 面（/health /state /order /cancel /settlement + Bearer 中间件）。
 // §U-4 测试化改造：路由逻辑原内联于 main（依赖 flag 全局），无法单测委托生命周期
 // （已报→已成/已撤 事件推送、撤单竞态守卫、终态 409 契约）；现抽为纯函数——账本 book、
 // 鉴权 token、成交延时、回报回调 push 全部注入，httptest 可直接驱动验证。
-// English: extracts the mock's HTTP surface into an injectable function so the §U-4 order
-// lifecycle (submit/fill/cancel events, race guard, 409 contract) is unit-testable.
-func buildHandler(b *book, token string, delay time.Duration, push func(map[string]interface{})) http.Handler {
+// §P2-14（2026-09-15）：补部成/废单/positions/account 事件与 /settlement——mock 此前缺失
+// 这些事件，引擎的清算守卫/熔断/拒因链路在 mock 环境完全测不到（契约差距见 UAT 文档 P2-14）。
+// English: extracts the mock's HTTP surface into an injectable function; §P2-14 adds partial-fill,
+// reject, positions/account reports and the /settlement reconciliation leg for contract parity.
+func buildHandler(b *book, token string, delay time.Duration, push func(map[string]interface{}), chaos bool) http.Handler {
 	mux := http.NewServeMux()
 
 	// /health 健康探测。§GAP2-W1 补 broker_connected=true：真实 qmt_gateway 的 /health 带该字段
@@ -309,6 +409,7 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			http.Error(w, `{"ok":false,"err":"code/qty required"}`, http.StatusBadRequest)
 			return
 		}
+		req.Side = sideCN(req.Side)
 		// signal_id 幂等：同 signal_id 已受理 → 返回原 order_id（不重复下单，与实网关语义一致）
 		if req.SignalID != "" {
 			b.mu.Lock()
@@ -340,7 +441,13 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 		// 引擎侧据此把委托生命周期纳入单调状态机观测（占位行幂等，不会误覆盖）。
 		push(orderEvent(o, "已报"))
 
-		// 延时模拟成交并回报。
+		// 延时模拟成交并回报。§P2-14：按 fill-mode 分档——
+		//   full（默认）：已报→已成+trade；
+		//   partial：已报→部成+半笔 trade→已成+余笔 trade（对齐实网关"按累计量合成状态"）；
+		//   reject：受理后柜台废单（推 order 废单事件，status=废单，无成交）——
+		//           引擎拒因链路此前在 mock 环境完全测不到。
+		// chaos（可选）：先推 trade 再推 order 已成，回归引擎单调状态机的乱序守卫。
+		// positions/account：每笔成交后推快照对账事件（清算 Guard/资金闸的 mock 覆盖）。
 		go func(o *order) {
 			time.Sleep(delay)
 			// §U-4 撤单竞态守卫：真实柜台里"已撤委托绝不会再成交"。旧 mock 延时到点无条件
@@ -353,22 +460,95 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 				log.Printf("[mock] skip fill: order %s already %s (not 已报)", o.OrderID, cur)
 				return
 			}
-			o.Status = "已成"
-			evtDone := orderEvent(o, "已成")
-			b.mu.Unlock()
-			b.applyFill(o, o.Price)
-			log.Printf("[mock] fill %s %s %d@%.2f", o.Side, o.Code, o.Qty, o.Price)
-
-			// §U-4 先推 order（已成）推进委托状态机，再推 trade 记账成交——两条同实网关契约。
-			push(evtDone)
-			push(map[string]interface{}{
-				"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
-				"price": o.Price, "qty": o.Qty, "amount": float64(o.Qty) * o.Price,
-				"traded_at": time.Now().Format(time.RFC3339), "signal_id": o.SignalID,
-			})
+			pushFills := func(fillQty int) {
+				o2 := *o
+				o2.Qty = fillQty
+				fr, okFill := b.applyFill(&o2, o.Price)
+				if !okFill {
+					return
+				}
+				trade := map[string]interface{}{
+					"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
+					"price": o.Price, "qty": fillQty, "amount": float64(fillQty) * o.Price,
+					"traded_at": fr.TradedAt, "signal_id": o.SignalID, "trade_id": fr.Serial,
+				}
+				ord := orderEvent(o, o.Status)
+				if chaos {
+					push(trade)
+					push(ord)
+				} else {
+					push(ord)
+					push(trade)
+				}
+			}
+			switch b.fillMode {
+			case "reject":
+				o.Status = "废单"
+				evt := orderEvent(o, "废单")
+				evt["reason"] = "mock reject mode: 模拟柜台废单（fill-mode=reject）"
+				b.mu.Unlock()
+				log.Printf("[mock] reject %s (fill-mode=reject)", o.OrderID)
+				push(evt)
+				return
+			case "partial":
+				if o.Qty >= 200 {
+					half := o.Qty / 2 / 100 * 100
+					if half > 0 && half < o.Qty {
+						o.Status = "部成"
+						b.mu.Unlock()
+						pushFills(half)
+						time.Sleep(200 * time.Millisecond)
+						b.mu.Lock()
+						o.Status = "已成"
+						b.mu.Unlock()
+						pushFills(o.Qty - half)
+						pushBookSnapshot(b, push)
+						return
+					}
+				}
+				o.Status = "已成"
+				b.mu.Unlock()
+				pushFills(o.Qty)
+				pushBookSnapshot(b, push)
+				return
+			default: // full
+				o.Status = "已成"
+				b.mu.Unlock()
+				pushFills(o.Qty)
+				pushBookSnapshot(b, push)
+			}
 		}(o)
 
 		writeJSON(w, map[string]interface{}{"ok": true, "order_id": orderID})
+	})
+
+	// /settlement §P2-14（2026-09-15）日终对账权威源（对齐实网关 §P0-1a 同名端点）：
+	// GET /settlement?date=YYYY-MM-DD → 当日成交流水（serial 唯一流水号）+ 现金快照。
+	// 此前 mock 404，Go 侧 SettleDay 的 e2e 只能靠 stub；现在全链路结算对账可在 mock 下回归。
+	mux.HandleFunc("/settlement", func(w http.ResponseWriter, r *http.Request) {
+		day := r.URL.Query().Get("date")
+		if len(day) != 10 || day[4] != '-' || day[7] != '-' {
+			http.Error(w, `{"ok":false,"err":"date required, format YYYY-MM-DD"}`, http.StatusBadRequest)
+			return
+		}
+		fills := b.snapshotFills(day)
+		trades := make([]map[string]interface{}, 0, len(fills))
+		for _, f := range fills {
+			trades = append(trades, map[string]interface{}{
+				"order_id": f.OrderID, "ts_code": f.Code, "side": f.Side,
+				"price": f.Price, "qty": f.Qty, "amount": f.Amount,
+				"fee": 0, "stamp_tax": 0, "serial": f.Serial,
+				"traded_at": f.TradedAt, "signal_id": f.SignalID,
+			})
+		}
+		cash := b.snapshotCash()
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "date": day, "account": b.account,
+			"trades": trades, "cash": map[string]interface{}{"cash": cash,
+				"frozen_cash": 0.0, "total_asset": cash + bookMarketValue(b),
+				"market_value": bookMarketValue(b)},
+			"connected": true,
+		})
 	})
 
 	// /cancel 撤单：仅未成委托可撤；未知 404、终态 409（与实网关 §R4-1 契约一致），

@@ -10,6 +10,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -147,6 +148,54 @@ func TestAutoExecuteRealSellsDisciplineSource(t *testing.T) {
 	}
 }
 
+// TestRealSoldOrOpenQtyInflight §P0-2（2026-09-15）回归：同轮 M8 清仓先占额度后，
+// 止损建议的剩余量必须把「在途卖单」并入扣减——旧实现只扣已成交（fills 尚未回报时为 0），
+// M8 与止损同轮各按全量下一笔全额卖单（第二笔靠柜台「证券不足」废单兜底）。
+// 同时锁 §P0-3：止盈类全平的已成交量也必须计入（fullCloseClasses 补齐）。
+func TestRealSoldOrOpenQtyInflight(t *testing.T) {
+	e, db, _, _ := newQMTEngine(t, func(c *config.QMTConfig) { c.AutoSell = true; c.Enabled = true; c.Mode = "auto" })
+	if _, err := db.UpsertRealPositions([]store.RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 500, CostPrice: 10, Amount: 5000, Strategy: "龙头"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	userID := e.UserID()
+	// 场景 A：止损单在途（已报未回报）→ 全平类不可再卖量 = 500
+	if _, err := db.UpsertRealOrder(store.RealOrder{OrderID: "GW-OPEN", SignalID: realSellSignalID("600000.SH", "止损"),
+		Code: "600000.SH", Side: "卖出", Status: "已报", Price: 9, Qty: 500, CreatedAt: time.Now().Format(time.RFC3339), UserID: userID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.realSoldOrOpenQtyToday(db, userID, "600000.SH"); got != 500 {
+		t.Fatalf("在途止损 500 应全额占额度, got %d", got)
+	}
+	// 场景 B：终态（废单）与「发送失败」占位行不占额度（各用独立幂等键，signal_id 唯一约束）
+	for i, st := range []struct {
+		status, class string
+		qty           int
+	}{{"废单", "m8", 300}, {"发送失败", "止盈", 400}} {
+		o := store.RealOrder{
+			OrderID: fmt.Sprintf("GW-T%d", i), SignalID: realSellSignalID("600000.SH", st.class),
+			Code: "600000.SH", Side: "卖出", Status: st.status, Price: 9, Qty: st.qty,
+			CreatedAt: time.Now().Format(time.RFC3339), UserID: userID,
+		}
+		if _, err := db.UpsertRealOrder(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := e.realSoldOrOpenQtyToday(db, userID, "600000.SH"); got != 500 {
+		t.Fatalf("终态/发送失败不得占额度（仍应=500）, got %d", got)
+	}
+	// 场景 C：止盈类已成交量计入（§P0-3 fullCloseClasses 补止盈）
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-TP", Code: "600000.SH", Side: "卖出",
+		Price: 12, Qty: 100, Amount: 1200, TradedAt: time.Now().Format(time.RFC3339),
+		SignalID: realSellSignalID("600000.SH", "止盈") + ":r100", UserID: userID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.realSoldOrOpenQtyToday(db, userID, "600000.SH"); got != 600 {
+		t.Fatalf("止盈已成交 100 必须并入全平类扣减（500在途+100已成）, got %d", got)
+	}
+}
+
 // TestAutoExecuteRealSellsTrimHalfOnce 减仓纪律：discipline 来源半平一次；同日重放去重不二次减仓。
 // English: discipline trim — a Source=discipline 减仓 sells half once and same-day re-fires are deduped.
 func TestAutoExecuteRealSellsTrimHalfOnce(t *testing.T) {
@@ -166,15 +215,15 @@ func TestAutoExecuteRealSellsTrimHalfOnce(t *testing.T) {
 		t.Fatalf("减仓无 discipline 来源不应自动卖出, got %d", len(*orders))
 	}
 
-	// 2. 减仓 Source=discipline → 半平 250（剩余 500/2）。
+	// 2. 减仓 Source=discipline → 半平整手 200（§P0-3：500/2=250 非整手会被柜台废单，取整到 200）。
 	e.autoExecuteRealSells(e.UserID(), ctrl, db, []trading.PositionAdvice{
 		{Code: "600000", TsCode: "600000.SH", Action: "减仓", Level: "高", RefPrice: 9, Source: "discipline", Reason: "首触止损未深破"},
 	})
 	if len(*orders) != 1 {
 		t.Fatalf("减仓 discipline 来源应自动卖出 1 单, got %d", len(*orders))
 	}
-	if o := (*orders)[0]; o["qty"].(float64) != 250 {
-		t.Fatalf("减仓应半平 250（500/2）, got %+v", o)
+	if o := (*orders)[0]; o["qty"].(float64) != 200 {
+		t.Fatalf("减仓应半平整手 200（500/2=250 → 取整手 200，§P0-3）, got %+v", o)
 	}
 
 	// 3. 同日重放同一减仓建议 → realTrimDone 去重，不再二次减仓。

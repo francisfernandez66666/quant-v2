@@ -154,6 +154,14 @@ class Store:
                 value       TEXT,
                 updated_at  TEXT
             );
+            -- §P1-8（2026-09-15）回报死信：被首尔侧永久拒绝（4xx，除 401/403/408/425/429）的
+            -- outbox 消息不再无限重试卡队首——落死信表留痕供人工排查，队列继续消费。
+            CREATE TABLE IF NOT EXISTS outbox_dead (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload     TEXT,
+                reason      TEXT,
+                created_at  TEXT DEFAULT ''
+            );
             """
         )
         self._conn.commit()
@@ -199,6 +207,13 @@ class Store:
                 key         TEXT PRIMARY KEY,
                 value       TEXT,
                 updated_at  TEXT
+            );
+            -- §P1-8（2026-09-15）：老库同样补建死信表（永久 4xx 回报留痕，不卡队首）
+            CREATE TABLE IF NOT EXISTS outbox_dead (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload     TEXT,
+                reason      TEXT,
+                created_at  TEXT DEFAULT ''
             );
             """
         )
@@ -504,6 +519,33 @@ class Store:
             self._conn.commit()
         return len(codes)
 
+    def settlement_trades(self, day):
+        """§P0-1a（2026-09-15）按交易日查当日全部成交，供 GET /settlement 三方对账装配。
+
+        day 为北京时 `YYYY-MM-DD`（fills.traded_at 落库口径 `_now_cn()` 即该前缀）。
+        返回 [{ts_code,side,price,qty,amount,order_id,traded_at,serial,signal_id}]；
+        serial 用 §G1 唯一成交编号 trade_id（真实网关的成交流水号，此前从不产出 serial
+        导致 Go 侧对账关联键塌缩——见 docs/UAT_20260915_FINDINGS.md P0-1）。
+        注意：本表 fee/stamp_tax 无列（回报通道不带费用字段），费用差对账以 Go 侧本地口径为准。
+        English: §P0-1a — lists the day's fills for the settlement reconciliation endpoint,
+        exposing trade_id as the broker serial (previously no serial was ever produced).
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT order_id, code, side, price, qty, amount, traded_at, signal_id, trade_id "
+                "FROM fills WHERE substr(traded_at,1,10) = ? ORDER BY traded_at, order_id",
+                (day,),
+            )
+            out = []
+            for r in cur.fetchall():
+                out.append({
+                    "ts_code": r["code"], "side": r["side"], "price": r["price"],
+                    "qty": r["qty"], "amount": r["amount"],
+                    "order_id": r["order_id"] or "", "traded_at": r["traded_at"] or "",
+                    "serial": r["trade_id"] or "", "signal_id": r["signal_id"] or "",
+                })
+            return out
+
     def close(self):
         """关闭 SQLite 连接（进程退出时调用）。"""
         with self._lock:
@@ -539,6 +581,22 @@ class Store:
         """发送成功后出队。"""
         with self._lock:
             self._conn.execute("DELETE FROM outbox WHERE id=?", (oid,))
+            self._conn.commit()
+
+    def outbox_dead_enqueue(self, payload, reason):
+        """§P1-8（2026-09-15）死信留痕：被首尔永久拒绝（4xx）的回报移入 outbox_dead。
+
+        毒丸防护：首尔 /api/qmt/report 对非法方向/未知 type 返回 400（永久性拒绝），
+        旧实现一律无限重试 → 单条毒丸永久卡死 FIFO 队首，阻塞后续全部回报。
+        现按状态码分流：永久 4xx 落死信表（payload + reason 留痕供人工排查）继续消费。
+        English: §P1-8 — permanently-rejected (4xx) reports are moved to the dead-letter table
+        with the failure reason instead of blocking the FIFO head forever.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO outbox_dead(payload, reason, created_at) VALUES(?,?,?)",
+                (json.dumps(payload, ensure_ascii=False, default=json_default), reason,
+                 time.strftime("%Y-%m-%dT%H:%M:%S+08:00")))
             self._conn.commit()
 
     def outbox_trim(self, cap):

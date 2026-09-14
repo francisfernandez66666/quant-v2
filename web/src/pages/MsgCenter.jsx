@@ -2,23 +2,12 @@
 // 展示所有提醒/告警消息，支持按等级过滤、交易信号二级战法分类、删除/清空、一键模拟卖出
 // 使用 TDesign React 组件（Card / Tag / Button / Select / Dialog）。
 import React, { useState, useEffect, useMemo } from 'react'
-import { Card, Tag, Button, Select, DialogPlugin, MessagePlugin } from 'tdesign-react'
+import { Card, Tag, Button, Select, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import useSseRefresh from '../useSseRefresh.js'
+import { confirmDialog } from '../ui.jsx'
 
-// 通用确认弹窗：返回 Promise<boolean>，确认 resolve(true)、关闭 resolve(false)
-function confirmDialog(body, header = '确认') {
-  return new Promise((resolve) => {
-    const d = DialogPlugin.confirm({
-      header,
-      body,
-      theme: 'warning',
-      onConfirm: () => { d.hide(); resolve(true) },
-      onClose: () => { d.hide(); resolve(false) },
-    })
-  })
-}
 
 // 消息等级过滤选项：key 对应过滤逻辑，label 为按钮文案
 export const filters = [

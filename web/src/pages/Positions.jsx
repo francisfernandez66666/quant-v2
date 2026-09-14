@@ -497,9 +497,16 @@ export default function Positions() {
   // 可用资金编辑
   // 进入可用资金编辑态：用当前余额预填输入框
   function editBalanceStart() { setBalanceInputVal(availableBalance); setEditingBalance(true) }
-  // 保存可用资金编辑结果并同步后端持仓数据
-  function editBalanceSave() {
-    setAvailableBalance(balanceInputVal); setEditingBalance(false); saveHoldings()
+  // 保存可用资金编辑结果：§P1-11（2026-09-15）改走窄口径 POST /api/holdings/balance——
+  // 此前整表 saveHoldings() 是 full-replace 语义且后端显式丢弃 balance 字段，
+  // 改资金既存不进、还会在并发下把手改持仓整体回写覆盖。
+  async function editBalanceSave() {
+    setAvailableBalance(balanceInputVal); setEditingBalance(false)
+    try {
+      await api.updateHoldingsBalance(balanceInputVal)
+    } catch (e) {
+      showToast('保存可用资金失败：' + (e && e.message ? e.message : e), 'error')
+    }
   }
   // 取消可用资金编辑，放弃本次修改
   function editBalanceCancel() { setEditingBalance(false) }

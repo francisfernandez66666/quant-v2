@@ -8,8 +8,9 @@
 // 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import ToggleSw from '../components/ToggleSw'
-import { Card, Form, Input, Button, Tag, Table, MessagePlugin, DialogPlugin } from 'tdesign-react'
+import { Card, Form, Input, Button, Tag, Table, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
+import { confirmDialog } from '../ui.jsx'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
@@ -60,31 +61,6 @@ function pnlColor(v) {
   return (v || 0) >= 0 ? 'var(--app-up)' : 'var(--app-down)'
 }
 
-// 通用确认弹窗：返回 Promise<boolean>，用户确认 resolve(true)、关闭/取消 resolve(false)。
-// 必须只 resolve 一次：TDesign 的 d.hide() 会同步触发 onClose，若 onConfirm 先 d.hide() 再 resolve(true)，
-// onClose 的 resolve(false) 会先一步生效（Promise 首次 resolve 即定型），导致"确认"被当作"取消"——
-// 表现为实盘总开关点了启用却存不进、瞬间弹回关闭。这里用 done 守卫保证首次 resolve 的值生效。
-// English: resolve-once guard. d.hide() synchronously fires onClose; without the guard a confirm could
-// resolve false (treated as cancel), so enabling the master switch would never persist.
-function confirmDialog(body, header = '确认') {
-  return new Promise((resolve) => {
-    let done = false
-    // resolve 一次性守卫：无论确认/取消/点遮罩先触发，首次结果生效
-    const finish = (val) => {
-      if (done) return
-      done = true
-      d.hide()
-      resolve(val)
-    }
-    const d = DialogPlugin.confirm({
-      header,
-      body,
-      theme: 'warning',
-      onConfirm: () => finish(true),
-      onClose: () => finish(false),
-    })
-  })
-}
 
 /**
  * 量化交易主页面组件。

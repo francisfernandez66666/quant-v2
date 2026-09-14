@@ -271,13 +271,19 @@ class TestQueuedHTTP(unittest.TestCase):
 
 
 class TestFailover(unittest.TestCase):
-    """自动翻转：交易时段 + xt 断连 ≥ failover_sec + 桥心跳新鲜 → 自动切 queued。"""
+    """自动翻转（2026-09-11 语义反转）：queued（文件桥）主 / xt 备。
 
-    def _make(self, failover_enable=True, failover_sec=1):
+    交易时段 active=queued 且桥心跳断 ≥ failover_sec 且 xt 在线 → 翻 xt 顶班；
+    active=xt 且桥恢复 → 自动回切 queued。
+    §P2-12（2026-09-15）：旧用例设置的是反转后的死字段 _xt_last_connected，
+    实际全走 failback 分支蒙混通过——「queued 断连→xt 顶班」此前零真实覆盖。
+    """
+
+    def _make(self, failover_enable=True, failover_sec=1, active="queued"):
         cfg = {
             "listen": "127.0.0.1:0",
             "token": "tk",
-            "broker": "xt",
+            "broker": active,
             "account": "T0001",
             "db": new_db_path(),
             "report_url": "",
@@ -301,41 +307,60 @@ class TestFailover(unittest.TestCase):
             self.server.shutdown()
             self.server.server_close()
 
-    def test_failover_when_xt_down_and_bridge_healthy(self):
-        """交易时段 + xt 断连超时 + 桥在线 → 自动切 queued。"""
-        self.gw = self._make()
+    def test_failover_when_bridge_stale_and_xt_up(self):
+        """交易时段 + 主接线 queued 桥心跳断 ≥ failover_sec + xt 在线 → 翻 xt 顶班。"""
+        self.gw = self._make(active="queued")
         gw_mod.is_active_trading_session = lambda: True  # 强制交易时段
-        self.gw.store.bridge_heartbeat()                  # 桥在线
-        self.gw._xt_last_connected = time.time() - 5      # 已断连 5s ≥ failover_sec=1
+        # 桥心跳缺失（bridge_state 无记录 → queued.is_connected()=False），
+        # 观察窗口已过（上次心跳时刻推到 5s 前 ≥ failover_sec=1）
+        self.gw._queued_last_connected = time.time() - 5
+        self.gw.brokers["xt"]._connected = True  # xt 备通道可用
+        self.assertEqual(self.gw.active_key, "queued")
+        self.gw._maybe_failover()
         self.assertEqual(self.gw.active_key, "xt")
+
+    def test_no_failover_when_xt_down(self):
+        """主接线断桥但 xt 备也不在线 → 保持 queued 继续观察，绝不翻到死通道。"""
+        self.gw = self._make(active="queued")
+        gw_mod.is_active_trading_session = lambda: True
+        self.gw._queued_last_connected = time.time() - 999
+        # xt._connected 保持 False（延迟 import 未连接）
+        self.gw._maybe_failover()
+        self.assertEqual(self.gw.active_key, "queued")
+
+    def test_failback_when_bridge_recovers(self):
+        """active=xt（顶班中）且桥心跳恢复新鲜 → 自动回切主接线 queued。"""
+        self.gw = self._make(active="xt")
+        gw_mod.is_active_trading_session = lambda: True
+        self.gw.store.bridge_heartbeat()  # 桥恢复在线
         self.gw._maybe_failover()
         self.assertEqual(self.gw.active_key, "queued")
 
     def test_no_failover_off_hours(self):
         """非交易时段断连不翻转（qmtctl 杀客户端属预期）。"""
-        self.gw = self._make()
+        self.gw = self._make(active="queued")
         gw_mod.is_active_trading_session = lambda: False
-        self.gw.store.bridge_heartbeat()
-        self.gw._xt_last_connected = time.time() - 999
+        self.gw._queued_last_connected = time.time() - 999
+        self.gw.brokers["xt"]._connected = True
         self.gw._maybe_failover()
-        self.assertEqual(self.gw.active_key, "xt")
+        self.assertEqual(self.gw.active_key, "queued")
 
     def test_no_failover_without_flag(self):
         """failover_enable=false 不自动翻转。"""
-        self.gw = self._make(failover_enable=False)
+        self.gw = self._make(failover_enable=False, active="queued")
         gw_mod.is_active_trading_session = lambda: True
-        self.gw.store.bridge_heartbeat()
-        self.gw._xt_last_connected = time.time() - 999
+        self.gw._queued_last_connected = time.time() - 999
+        self.gw.brokers["xt"]._connected = True
         self.gw._maybe_failover()
-        self.assertEqual(self.gw.active_key, "xt")
+        self.assertEqual(self.gw.active_key, "queued")
 
-    def test_no_failover_when_bridge_down(self):
-        """桥也不在线时不翻转（保持 xt 并继续观察）。"""
-        self.gw = self._make()
+    def test_no_failover_during_observation_window(self):
+        """启动后首次探测的观察窗口内不翻转（_queued_last_connected=0 → 先给窗口）。"""
+        self.gw = self._make(active="queued")
         gw_mod.is_active_trading_session = lambda: True
-        self.gw._xt_last_connected = time.time() - 999
-        self.gw._maybe_failover()  # 无桥心跳
-        self.assertEqual(self.gw.active_key, "xt")
+        self.gw.brokers["xt"]._connected = True
+        self.gw._maybe_failover()  # 无心跳记录且首次探测 → 只记观察起点
+        self.assertEqual(self.gw.active_key, "queued")
 
 
 if __name__ == "__main__":

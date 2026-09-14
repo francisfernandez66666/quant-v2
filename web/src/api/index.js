@@ -282,7 +282,8 @@ const REQUEST_TIMEOUT = 10000
  * @returns {Promise<object>} 响应 JSON
  * @returns {Promise<object>} response JSON
  */
-async function request(path, opts = {}) {
+// §P2-15（2026-09-15）：导出 request 供单测直接驱动四个错误分支（401 清态/超时/同源回退/非 JSON 错误体）
+export async function request(path, opts = {}) {
   // 拼接完整请求地址：服务器基础地址 + 相对路径
   // Build the full request URL: server base URL + relative path
   const base = baseUrl()
@@ -547,8 +548,14 @@ export async function fetchRealAdvice() {
 /** 实盘：执行 manual 下单（手动确认后的真实委托） */
 /** Live: execute a manual order (real ticket after manual confirmation) */
 // 对应 POST /api/positions/execute，body { code, side, action, qty, price, strategy, reason }
+// §P2-15（2026-09-15）：封装层自动补 client_id 幂等键（UUID，后端 regClientID 校验格式）
+// ——双击/网络重试同一次确认会带同一键，后端据此去重，不会重复下单；调用方显式传入时以调用方为准。
 export async function executeRealAction(data) {
-  return request('/api/positions/execute', { method: 'POST', data })
+  const body = { ...data }
+  if (!body.client_id && typeof crypto !== 'undefined' && crypto.randomUUID) {
+    body.client_id = crypto.randomUUID()
+  }
+  return request('/api/positions/execute', { method: 'POST', data: body })
 }
 
 /** 实盘：互通健康快照（下行探测时延/上行回报新鲜度/熔断详情） */
@@ -762,6 +769,14 @@ export async function resetPaper(initialCapital, maxPositions) {
 // Maps to POST /api/holdings; data is a full holdings snapshot saved as an overwrite
 export async function updateHoldings(data) {
   return request('/api/holdings', { method: 'POST', data })
+}
+
+/** §P1-11（2026-09-15）仅更新可用资金 */
+/** §P1-11: update available cash only — narrow endpoint, never touches the holdings list */
+// 对应 POST /api/holdings/balance；与整表 saveHoldings 解耦，避免并发整表覆盖
+// Maps to POST /api/holdings/balance; decoupled from the full-replace holdings sync
+export async function updateHoldingsBalance(availableBalance) {
+  return request('/api/holdings/balance', { method: 'POST', data: { available_balance: availableBalance } })
 }
 
 /** 增量买入/加仓：追加一笔(价格,数量)，后端按加权平均重算成本与累计数量 */
@@ -1033,6 +1048,8 @@ let sse = null
 let sseCallbacks = []
 // SSE 连续重连次数，用于退避重连与登录态失效探测（成功收到消息后重置为 0）
 let sseRetry = 0
+// §P1-10（2026-09-15）进行中的建链 promise（connectSSE 并发守卫用，见 connectSSE 内注释）
+let sseConnecting = null
 
 /**
  * 注册 SSE 消息回调，返回取消注册的函数
@@ -1066,54 +1083,71 @@ export function onSSE(fn) {
 //  - onerror closes the old connection and reconnects after 3 seconds (manual reconnect).
 export async function connectSSE() {
   if (sse) return
-  const token = getToken()
-  // 未登录时不建立连接
-  // Do not connect when not logged in
-  if (!token) return
+  // §P1-10（2026-09-15）：建链并发守卫。connectSSE 在取票据（await POST /api/events/ticket）
+  // 期间 sse 仍为 null，Dashboard/LLMDebug 等页面 effect 或 onerror 重连若在此窗口并发调用，
+  // 会各自通过 null 检查开出第二条 EventSource——后端将看到同一 token 的重复连接，事件被双份投递。
+  // 现以模块级 connecting promise 兜住：窗口内的并发调用直接复用同一次建链结果。
+  // English: race guard. The ticket fetch awaits while `sse` is still null, so concurrent
+  // connectSSE() calls (two page effects, or an onerror reconnect) would each pass the null
+  // check and open duplicate EventSources. A module-level connecting promise dedupes them.
+  if (sseConnecting) return sseConnecting
+  const run = async () => {
+    const token = getToken()
+    // 未登录时不建立连接
+    // Do not connect when not logged in
+    if (!token) return
   // 先取一次性票据：每次（重）建链都要重新签发（旧票已消费/过期）
   // Mint a fresh one-time ticket per (re)connect; the previous one is spent or expired
-  let ticket = ''
-  try {
-    const resp = await request('/api/events/ticket', { method: 'POST' })
-    ticket = resp && resp.ticket ? resp.ticket : ''
-  } catch (_) {}
-  if (!ticket) {
-    // 票据签发失败（如 token 失效）：走一次探测，交给上层统一回到登录态
-    // Ticket mint failed (e.g. dead token): probe once and let the app return to login
-    request('/api/status').catch(() => {})
-    return
-  }
-  // 说明：浏览器 EventSource 会自动携带 Last-Event-ID 头（来自服务端 `id:` 行），
-  //       服务端据此实现断线续传（见 handleFixSSE 读取 Last-Event-ID）。
-  // Note: the browser EventSource automatically sends the Last-Event-ID header
-  //       (from the server's `id:` line), enabling reconnect resume server-side.
-  sse = new EventSource(baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket))
-  sse.onmessage = (e) => {
-    // 成功收到一条消息即重置重连计数（连接已恢复）
-    sseRetry = 0
+    let ticket = ''
     try {
-      const msg = JSON.parse(e.data)
-      sseCallbacks.forEach(fn => fn(msg))
+      const resp = await request('/api/events/ticket', { method: 'POST' })
+      ticket = resp && resp.ticket ? resp.ticket : ''
     } catch (_) {}
-  }
-  sse.onerror = () => {
-    // 连接断开时先关闭，随后按退避重连
-    // Close on disconnect, then reconnect with backoff
-    disconnectSSE()
-    sseRetry++
-    // 退避延迟：3s 起，指数增长并封顶 30s，避免网络异常时无限快速重连风暴
-    // Backoff delay: starts at 3s, grows exponentially and caps at 30s to avoid a reconnect storm
-    const delay = Math.min(3000 * Math.pow(1.6, sseRetry - 1), 30000)
-    // 连续重连多次仍失败时，探测一次登录态：若 token 已失效（401），
-    // request() 内部会 clearAuth 并广播 auth:expired，App 层据此回到登录页，
-    // 从而终止对过期 token 的无限重连。
-    // After many consecutive failures, probe auth once; if the token is expired (401),
-    // request() clears auth and dispatches auth:expired so the app returns to login,
-    // stopping the infinite reconnect loop on a dead token.
-    if (sseRetry === 5) {
+    if (!ticket) {
+      // 票据签发失败（如 token 失效）：走一次探测，交给上层统一回到登录态
+      // Ticket mint failed (e.g. dead token): probe once and let the app return to login
       request('/api/status').catch(() => {})
+      return
     }
-    setTimeout(connectSSE, delay)
+    // 说明：浏览器 EventSource 会自动携带 Last-Event-ID 头（来自服务端 `id:` 行），
+    //       服务端据此实现断线续传（见 handleFixSSE 读取 Last-Event-ID）。
+    // Note: the browser EventSource automatically sends the Last-Event-ID header
+    //       (from the server's `id:` line), enabling reconnect resume server-side.
+    sse = new EventSource(baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket))
+    sse.onmessage = (e) => {
+      // 成功收到一条消息即重置重连计数（连接已恢复）
+      sseRetry = 0
+      try {
+        const msg = JSON.parse(e.data)
+        sseCallbacks.forEach(fn => fn(msg))
+      } catch (_) {}
+    }
+    sse.onerror = () => {
+      // 连接断开时先关闭，随后按退避重连
+      // Close on disconnect, then reconnect with backoff
+      disconnectSSE()
+      sseRetry++
+      // 退避延迟：3s 起，指数增长并封顶 30s，避免网络异常时无限快速重连风暴
+      // Backoff delay: starts at 3s, grows exponentially and caps at 30s to avoid a reconnect storm
+      const delay = Math.min(3000 * Math.pow(1.6, sseRetry - 1), 30000)
+      // 连续重连多次仍失败时，探测一次登录态：若 token 已失效（401），
+      // request() 内部会 clearAuth 并广播 auth:expired，App 层据此回到登录页，
+      // 从而终止对过期 token 的无限重连。
+      // After many consecutive failures, probe auth once; if the token is expired (401),
+      // request() clears auth and dispatches auth:expired so the app returns to login,
+      // stopping the infinite reconnect loop on a dead token.
+      if (sseRetry === 5) {
+        request('/api/status').catch(() => {})
+      }
+      setTimeout(connectSSE, delay)
+    }
+  }
+  // §P1-10 记录进行中的建链 promise，finally 里清除——成功/失败都不留悬挂守卫
+  sseConnecting = run()
+  try {
+    await sseConnecting
+  } finally {
+    sseConnecting = null
   }
 }
 

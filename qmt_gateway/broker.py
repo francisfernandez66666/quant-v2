@@ -439,6 +439,7 @@ class MockBroker(Broker):
         self._lock = threading.RLock()
         self._connected = False
         self._next_id = 1
+        self._next_tid = 0  # §P0-1a mock 成交编号自增（trade_id 契约对齐）
         self._orders = {}   # order_id -> dict
         self._positions = {}  # ts_code -> dict
         # §P1-17 显式现金模型：可用资金随成交实时扣减/回补，而非仅由市值反推
@@ -467,6 +468,11 @@ class MockBroker(Broker):
         # 自增生成 mock 委托号（MOCK 前缀 + 6 位序号），保证唯一
         self._next_id += 1
         return "MOCK%06d" % self._next_id
+
+    def _next_trade_id(self):
+        """自增生成 mock 成交编号（§P0-1a/P2-14 契约对齐真实桥的 trade_id）。"""
+        self._next_tid += 1
+        return self._next_tid
 
     def place_order(self, req):
         """mock 下单：登记内存账本 → 后台延时模拟成交 → 回调 handler（订单+成交回报）。
@@ -513,6 +519,9 @@ class MockBroker(Broker):
                     "amount": float(order.get("qty", 0)) * float(order.get("price", 0)),
                     "traded_at": ts,
                     "signal_id": order.get("signal_id", ""),
+                    # §P0-1a/P2-14 契约对齐：真实桥成交回报携带唯一成交编号 trade_id（fills 流水号、
+                    # /settlement 的 serial 锚点），mock 此前缺失导致对账 serial 恒空。
+                    "trade_id": "MOCKT%06d" % self._next_trade_id(),
                 })
 
         threading.Thread(target=_fill, daemon=True).start()

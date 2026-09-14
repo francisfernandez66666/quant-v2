@@ -62,7 +62,7 @@ func (e *eventRecorder) waitFor(pred func() bool, d time.Duration) bool {
 func newTestGateway() (http.Handler, *book, *eventRecorder) {
 	b := newBook("MOCK0001")
 	rec := &eventRecorder{}
-	h := buildHandler(b, "t0", 20*time.Millisecond, rec.record)
+	h := buildHandler(b, "t0", 20*time.Millisecond, rec.record, false)
 	return h, b, rec
 }
 
@@ -196,5 +196,154 @@ func TestMockAuthRequired(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("无 token 访问 /state 应 401, got %d", rec.Code)
+	}
+}
+
+// posOf 从持仓快照（切片）中按 ts_code 取单只持仓（§P2-14 断言辅助）。
+func posOf(b *book, code string) map[string]interface{} {
+	for _, p := range b.snapshotPositions() {
+		if p["ts_code"] == code {
+			return p
+		}
+	}
+	return nil
+}
+
+// newModeGateway 构造指定 fill-mode 的 mock 服务（§P2-14 部成/废单回归用）。
+func newModeGateway(mode string, chaos bool) (http.Handler, *book, *eventRecorder) {
+	b := newBook("MOCK0001")
+	b.fillMode = mode
+	rec := &eventRecorder{}
+	h := buildHandler(b, "t0", 20*time.Millisecond, rec.record, chaos)
+	return h, b, rec
+}
+
+// TestMockPartialFillLifecycle §P2-14：partial 模式下委托生命周期为
+// 已报→部成（半笔 trade）→已成（余笔 trade），两笔 trade 各带唯一 trade_id，
+// 持仓只入账一次总量（qty 精确累加，不重不漏）。
+func TestMockPartialFillLifecycle(t *testing.T) {
+	h, b, rec := newModeGateway("partial", false)
+	_, resp := post(t, h, "/order", `{"signal_id":"P1","code":"600519.SH","side":"买入","price":1500,"qty":400}`)
+	oid := resp["order_id"].(string)
+	if !rec.waitFor(func() bool { return len(rec.find("trade", "")) == 2 }, 3*time.Second) {
+		t.Fatalf("部成模式应推两笔 trade, got %d", len(rec.find("trade", "")))
+	}
+	// 生命周期顺序：已报 → 部成 → 已成
+	var seq []string
+	for _, ev := range rec.events {
+		if ev["type"] == "order" && ev["order_id"] == oid {
+			seq = append(seq, ev["status"].(string))
+		}
+	}
+	want := []string{"已报", "部成", "已成"}
+	if len(seq) != 3 || seq[0] != want[0] || seq[1] != want[1] || seq[2] != want[2] {
+		t.Fatalf("生命周期应 %v, got %v", want, seq)
+	}
+	// 两笔 trade 的 trade_id 唯一（serial 不塌缩，对齐 §P0-1b 幂等口径）
+	tid1, _ := rec.find("trade", "")[0]["trade_id"].(string)
+	tid2, _ := rec.find("trade", "")[1]["trade_id"].(string)
+	if tid1 == "" || tid2 == "" || tid1 == tid2 {
+		t.Fatalf("两笔 trade 的 trade_id 应唯一非空: %q vs %q", tid1, tid2)
+	}
+	// 持仓精确入账 400 股（半笔+余笔，不重复记账）
+	p := posOf(b, "600519.SH")
+	if p == nil || p["qty"].(int) != 400 {
+		t.Fatalf("持仓应精确 400 股, got %+v", p)
+	}
+}
+
+// TestMockRejectNoFill §P2-14：reject 模式下推 order 废单事件（带 reason），
+// 不推 trade、不建持仓——对齐实网关拒单链路（拒因回传/重报禁用）。
+func TestMockRejectNoFill(t *testing.T) {
+	h, b, rec := newModeGateway("reject", false)
+	_, resp := post(t, h, "/order", `{"signal_id":"R1","code":"600519.SH","side":"买入","price":1500,"qty":100}`)
+	oid := resp["order_id"].(string)
+	if !rec.waitFor(func() bool { return len(rec.find("order", "废单")) == 1 }, 2*time.Second) {
+		t.Fatal("reject 模式应推 废单 order 事件")
+	}
+	evt := rec.find("order", "废单")[0]
+	if evt["order_id"] != oid || evt["reason"] == nil {
+		t.Fatalf("废单事件缺 order_id/reason: %+v", evt)
+	}
+	if len(rec.find("trade", "")) != 0 {
+		t.Fatal("废单单绝不应产生 trade 成交")
+	}
+	if p := posOf(b, "600519.SH"); p != nil {
+		t.Fatalf("废单单不应建仓: %+v", p)
+	}
+	// 废单为终态：撤单 409（同已成）
+	if code, _ := post(t, h, "/cancel", `{"order_id":"`+oid+`"}`); code != http.StatusConflict {
+		t.Fatalf("废单单撤单应 409, got %d", code)
+	}
+}
+
+// TestMockSettlementEndpoint §P2-14：/settlement 返回当日成交流水（serial 唯一）
+// 与现金快照——引擎 SettleDay 对账权威源在 mock 下的 e2e 覆盖（§P0-1a 配套）。
+func TestMockSettlementEndpoint(t *testing.T) {
+	h, _, _ := newModeGateway("full", false)
+	post(t, h, "/order", `{"signal_id":"ST1","code":"600519.SH","side":"buy","price":1500,"qty":100}`)
+	get := func(path string) (int, map[string]interface{}) {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer t0")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var out map[string]interface{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	// 等待成交入账（成交流水在异步成交协程里落账）
+	day := time.Now().Format("2006-01-02")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, body := get("/settlement?date=" + day); len(body["trades"].([]interface{})) == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	code, body := get("/settlement?date=" + day)
+	if code != 200 {
+		t.Fatalf("/settlement 应 200, got %d", code)
+	}
+	trades, _ := body["trades"].([]interface{})
+	if len(trades) != 1 {
+		t.Fatalf("应返回 1 笔成交, got %d", len(trades))
+	}
+	tr := trades[0].(map[string]interface{})
+	if tr["serial"] == nil || tr["ts_code"] != "600519.SH" || tr["qty"].(float64) != 100 {
+		t.Fatalf("成交流水缺 serial/字段错: %+v", tr)
+	}
+	cashMap, _ := body["cash"].(map[string]interface{})
+	if cashMap == nil || cashMap["cash"] == nil {
+		t.Fatalf("/settlement 缺 cash 快照: %+v", body)
+	}
+	// 缺/错 date 参数 400
+	if c, _ := get("/settlement"); c != 400 {
+		t.Fatalf("缺 date 应 400, got %d", c)
+	}
+}
+
+// TestMockChaosTradeBeforeOrder §P2-14：chaos 模式 trade 先于 order 已成推送——
+// 引擎单调状态机的乱序守卫回归（成交先到不阻断委托状态推进，不重复记账）。
+func TestMockChaosTradeBeforeOrder(t *testing.T) {
+	h, b, rec := newModeGateway("full", true)
+	_, resp := post(t, h, "/order", `{"signal_id":"C1","code":"600519.SH","side":"buy","price":1500,"qty":100}`)
+	oid := resp["order_id"].(string)
+	if !rec.waitFor(func() bool { return len(rec.find("trade", "")) == 1 }, 2*time.Second) {
+		t.Fatal("chaos 模式应收到 trade")
+	}
+	idxTrade, idxDone := -1, -1
+	for i, ev := range rec.events {
+		if ev["type"] == "trade" && idxTrade < 0 {
+			idxTrade = i
+		}
+		if ev["type"] == "order" && ev["order_id"] == oid && ev["status"] == "已成" && idxDone < 0 {
+			idxDone = i
+		}
+	}
+	if idxTrade < 0 || idxDone < 0 || idxTrade > idxDone {
+		t.Fatalf("chaos 下 trade 应先于 order 已成: trade=%d done=%d", idxTrade, idxDone)
+	}
+	if p := posOf(b, "600519.SH"); p == nil || p["qty"].(int) != 100 {
+		t.Fatalf("乱序回报不应影响记账: %+v", p)
 	}
 }

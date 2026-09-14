@@ -776,7 +776,10 @@ type fixHolding struct {
 // 同时关联信号数据，标注持仓是否有活跃信号。
 func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 	// 自选股/持仓为运营数据，统一归属管理员（系统级共享），按 operatorID 读取。
+	// §P1-11（2026-09-15）：available_balance 从 real_account 行读取（管理员手动改资金 /
+	// 网关 account 回报共用一表），不再硬编码 0——此前编辑可用资金存不进、刷新即回 0。
 	userID := s.operatorID()
+	acc, _ := s.realDB().GetRealAccount(userID)
 	logs := s.rpt.ListFor("")
 	holdings := make([]fixHolding, 0)
 	for _, l := range logs {
@@ -787,9 +790,42 @@ func (s *Server) handleFixGetHoldings(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"holdings":           holdings,
-		"available_balance":  0,
+		"available_balance":  r2(acc.AvailableCash),
 		"total_realized_pnl": s.rpt.TotalRealizedPnl(userID),
 	})
+}
+
+// fixSetBalanceReq 可用资金更新请求体（§P1-11）。
+type fixSetBalanceReq struct {
+	AvailableBalance float64 `json:"available_balance"` // 新的可用资金
+}
+
+// handleFixSetBalance 处理 POST /api/holdings/balance 请求（§P1-11，2026-09-15）：
+// 仅更新可用资金，不动持仓表。此前前端改资金只能整表 POST /api/holdings（full-replace 语义，
+// 服务端还显式丢弃 AvailableBalance 字段），并发下会把手改持仓列表整体回写覆盖——
+// 现在资金编辑走这条窄口径端点，与持仓编辑彻底解耦。
+// English: narrow-scope endpoint that only updates available cash (real_account row), never
+// touching holdings — replacing the previous full-replace POST whose balance field was dropped.
+func (s *Server) handleFixSetBalance(w http.ResponseWriter, r *http.Request) {
+	var req fixSetBalanceReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.AvailableBalance < 0 {
+		writeError(w, 400, "available_balance must be >= 0")
+		return
+	}
+	uid := s.operatorID()
+	acc, _ := s.realDB().GetRealAccount(uid)
+	// 只改可用资金，保留冻结/总资产/市值（下一次网关 account 回报会整体覆盖，网关优先）
+	acc.UserID = uid
+	acc.AvailableCash = req.AvailableBalance
+	if err := s.realDB().UpsertRealAccount(acc); err != nil {
+		writeError(w, 500, "save balance failed: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"status": "ok", "available_balance": r2(acc.AvailableCash)})
 }
 
 // buildHolding 将一条持仓执行日志组装为前端 fixHolding 格式：

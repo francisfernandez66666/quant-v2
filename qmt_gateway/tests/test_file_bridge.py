@@ -38,6 +38,70 @@ class TestFileBridge(unittest.TestCase):
         })
         return gw
 
+    def test_reconcile_cmds_drops_done_keeps_inflight(self):
+        """§P2-13（2026-09-15）FIX 2026-09-14 drill-3 回归：cmd 文件 reconcile 为
+        「仅 inflight」——桥重启后重放 done 老单会被沙箱重复真实下单（221 次事故根因），
+        reconcile 必须把 done 残留洗掉、同时保留 inflight（掉线期间未消费单不丢）。"""
+        gw = self._new_gw(tempfile.mkdtemp())
+        # 两条派发：A 保持 inflight（桥已取走未回报），B 已 done（已回报）
+        gw.store.dispatch_enqueue_order({"signal_id": "RA", "code": "600519.SH",
+                                         "side": "买入", "price_type": "limit",
+                                         "price": 1500, "qty": 100})
+        gw.store.dispatch_enqueue_order({"signal_id": "RB", "code": "600519.SH",
+                                         "side": "卖出", "price_type": "limit",
+                                         "price": 1600, "qty": 100})
+        seq_a = gw.store.dispatch_pending(limit=1)[0]["seq"]
+        seq_b = gw.store.dispatch_pending(limit=1)[0]["seq"]
+        gw.store.dispatch_set_result(seq_b, {"ok": True, "order_id": "EXC-B", "err": ""})
+        try:
+            # 模拟桥重启后的 cmd 文件残留（含 done 的 B）
+            cmd_path = gw._file_bridge_cmd_path()
+            with open(cmd_path, "w", encoding="utf-8") as f:
+                json.dump({"ts": 1.0, "cmds": [
+                    {"seq": seq_a, "kind": "order"}, {"seq": seq_b, "kind": "order"},
+                ]}, f)
+            gw._file_bridge_reconcile_cmds(cmd_path, gw.store.dispatch_inflight())
+            with open(cmd_path, "rb") as f:
+                data = json.loads(f.read().decode("utf-8"))
+            seqs = [str(c.get("seq", "")) for c in (data.get("cmds") or [])]
+            self.assertEqual(seqs, [seq_a], "reconcile 必须只保留 inflight（done 老单洗掉）")
+            # inflight 无变化时幂等：不重写（内容一致直接 return）
+            mtime1 = os.path.getmtime(cmd_path)
+            time.sleep(0.02)
+            gw._file_bridge_reconcile_cmds(cmd_path, gw.store.dispatch_inflight())
+            self.assertEqual(os.path.getmtime(cmd_path), mtime1, "内容一致不得空转重写")
+        finally:
+            gw.stop()
+
+    def test_apply_trade_attributed_by_exchange_order_id(self):
+        """§P2-13（2026-09-15）FIX 2026-09-14 drill-3 回归：桥 DEAL 行 m_strRemark 实测为空，
+        成交回报缺 signal_id 时必须能按交易所委托号反查派发项归因，并推进委托终态——
+        否则成交无法归因、委托永远停留已报。"""
+        gw = self._new_gw(tempfile.mkdtemp())
+        gw.store.dispatch_enqueue_order({"signal_id": "FB3", "code": "600519.SH",
+                                         "side": "买入", "price_type": "limit",
+                                         "price": 1500, "qty": 100})
+        seq = gw.store.dispatch_pending(limit=1)[0]["seq"]
+        # 桥回填交易所委托号（order_result）
+        gw.store.dispatch_set_result(seq, {"ok": True, "order_id": "EXC-9", "err": ""})
+        # 成交回报只带交易所委托号（无 signal_id、无 seq——最恶劣形态）
+        gw._apply_trade({"order_id": "EXC-9", "price": 1500.0, "qty": 100,
+                         "amount": 150000.0})
+        try:
+            # fills 行归因到 FB3
+            with gw.store._lock:
+                rows = gw.store._conn.execute(
+                    "SELECT signal_id, order_id, qty FROM fills").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["signal_id"], "FB3")
+            self.assertEqual(rows[0]["order_id"], "EXC-9")
+            # 委托状态按累计成交量推进为 已成（不再是悬置的 已报）
+            order = gw.store.order_by_signal("FB3")
+            self.assertIsNotNone(order)
+            self.assertEqual(order["status"], "已成")
+        finally:
+            gw.stop()
+
     def test_report_heartbeat_drives_bridge_connected(self):
         """上报一行 heartbeat → sidecar 应用 → store.bridge_heartbeat() → 桥在线。"""
         gw = self._new_gw(tempfile.mkdtemp())

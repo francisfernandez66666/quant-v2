@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/combat_agent"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
@@ -705,6 +706,8 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	// §GAP1.1 实盘卖出自动化：mode=auto 且 qmt.auto_sell 开启时，止损级建议自动全仓卖出。
 	// signal_id 按"码+类+日"幂等——orders 表唯一键天然防重，跨重启/跨轮次不会二次下单。
 	if len(advices) > 0 {
+		// §P1-4（2026-09-15）：卖出自动执行链路透传行情快照（CurrentPrice/PrevClose 由
+		// sellRealPosition 注入 OrderRequest），涨跌停闸对自动卖单真正生效。
 		e.autoExecuteRealSells(sendTo, ctrl, realStore, advices)
 	}
 
@@ -735,25 +738,38 @@ func realSellSignalID(tsCode, class string) string {
 	return fmt.Sprintf("sell:%s:%s:%s", pureTsCode(tsCode), class, data.TradingDayDate(time.Now()))
 }
 
-// realSoldQtyToday P2#13 汇总某账号某持仓「今日各全平类」的累计已成交数量——与单类 SumFilledQty
-// 的区别：止损/清仓与 m8 是两个独立幂等键（sell:<码>:止损:<日> vs sell:<码>:m8:<日>），
-// 旧实现各自只计本类的成交，若同日 止损 先全平、m8 随后再触发，m8 侧剩余量仍按全量算 →
-// 对已无仓的持仓下第二单（超额卖出）。按全部全平类累加后，剩余 = 持仓量 - Σ已卖，任一类先
-// 卖多少另一类就看到剩余多少，从根源杜绝跨类重卖。
-// English: P2#13 — sums today's TOTAL filled qty across all full-close classes for a code. The
-// stop-loss and m8 paths use independent idempotency keys (sell:<code>:止损:<day> vs sell:<code>:m8:<day>),
-// and each used to subtract only its own class's fills — so after 止损 already fully sold a position, a
-// later same-day m8 recomputed remaining from the full quantity and placed a second sell on an empty
-// position (overselling). Aggregating every full-close class makes remaining = heldQty - Σsold, so
-// whichever class fires first, the others see what's left. No cross-class double-sell.
-func (e *Engine) realSoldQtyToday(realStore *store.DB, userID, tsCode string) int {
+// fullCloseClasses 「今日全部全平类」清单（§P0-3，2026-09-15）：止损/止盈/m8 三类全平卖出
+// 各持独立幂等键，剩余量必须对三类已成交做并集扣减。P2#13 只列了 止损+m8——同日 discipline
+// 止盈先全平、fills 回报滞后时，止损侧仍按旧持仓量计算剩余 → 对已空仓头寸再下卖单。
+// English: §P0-3 — the full set of full-close sell classes whose today's fills must be aggregated
+// when computing sell remaining (stop-loss / take-profit / m8 each use an independent idempotency key).
+var fullCloseClasses = []string{"止损", "止盈", "m8"}
+
+// realSoldOrOpenQtyToday P2#13 + §P0-2/§P0-3（2026-09-15）汇总某账号某持仓「今日不可再卖量」：
+//   - Σ已成交：今日各全平类（fullCloseClasses）的累计已成交数量——与单类 SumFilledQty 的区别：
+//     止损/止盈/m8 是三个独立幂等键，旧实现各自只计本类的成交，若同日 止损 先全平、m8 随后再触发，
+//     m8 侧剩余量仍按全量算 → 对已无仓的持仓下第二单（超额卖出）。按全部全平类累加后，
+//     剩余 = 持仓量 - Σ已卖，任一类先卖多少另一类就看到剩余多少，从根源杜绝跨类重卖。
+//   - Σ在途：当日非终态卖单（SumOpenSellQty）——P2#13 只覆盖「fills 已落库」的跨轮场景；
+//     M8 清仓与止损建议同轮触发时（M8 卖单 fills 尚未回报），两类各按全量各下一笔全额卖单，
+//     第二笔只能靠柜台「证券不足」废单兜底。把在途卖量并入后，先到者占额度，后到者剩余=0 自然跳过。
+//
+// English: P2#13 + §P0-2/§P0-3 — today's un-sellable qty for a code: Σfilled across ALL full-close
+// classes (stop-loss/take-profit/m8 use independent idempotency keys; aggregating every class makes
+// remaining = held − Σsold so no cross-class double-sell) plus Σopen sell qty (non-terminal tickets;
+// a same-round M8 liquidation + stop-loss advice can no longer both fire full-qty sells before fills
+// are reported — the first order holds the budget, the second sees remaining=0 and skips).
+func (e *Engine) realSoldOrOpenQtyToday(realStore *store.DB, userID, tsCode string) int {
 	if realStore == nil {
 		return 0
 	}
 	total := 0
-	for _, c := range []string{"止损", "m8"} {
+	for _, c := range fullCloseClasses {
 		total += realStore.SumFilledQty(userID, realSellSignalID(tsCode, c))
 	}
+	// §P0-2 在途卖单：终态（已成/已撤/部撤/废单）与「发送失败」占位行都不计入。
+	// 委托 created_at 为 RFC3339（yyyy-MM-ddT…+08:00），按北京时间「当日日期前缀」过滤。
+	total += realStore.SumOpenSellQty(userID, tsCode, cntime.In(time.Now()).Format("2006-01-02"))
 	return total
 }
 
@@ -770,14 +786,19 @@ func pureTsCode(tsCode string) string {
 }
 
 // sellRealPosition 通过控制器对单一实盘持仓下卖出单。行情缺失时跳过（宁可不卖不以错价报单）。
-// §修复 R6（2026-08-29）：qty 显式传入（补卖时传剩余量），signalID 由调用方按"剩余量桶"生成，
-// 确保首笔仅部成时仍能对剩余仓位开新单，而非被日级幂等键永久拦截。
+// §P1-4（2026-09-15）：卖出单注入 CurrentPrice/PrevClose 行情上下文——此前只填 StalenessMs，
+// 风控闸 checkLimitPrice 因 PrevClose<=0 恒 fail-open，即使打开 limit_down_block_sell，
+// 跌停日自动止损单照样发出（闸门宣称的能力与实际行为不符）。行情缺失时字段为 0，
+// 涨跌停闸维持 fail-open（风险敞口可退出的立场不变），但有行情即生效。
+// English: §P1-4 — sell orders now carry CurrentPrice/PrevClose so the limit-up/down risk gate
+// (which fail-opens on PrevClose<=0) actually sees market context; without quotes the gate stays
+// fail-open (positions remain exitable) instead of blocking protective sells.
 func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition, qty int, signalID string, price float64, class, reason string) error {
 	cfg := ctrl.Config()
 	if qty <= 0 || price <= 0 {
 		return nil
 	}
-	res, err := ctrl.PlaceOrder(trading.OrderRequest{
+	req := trading.OrderRequest{
 		SignalID:    signalID,
 		Code:        p.TsCode,
 		Name:        p.Name,
@@ -789,7 +810,19 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		Amount:      price * float64(qty),
 		CreatedAt:   time.Now().Format(time.RFC3339),
 		StalenessMs: e.quoteStalenessMs(p.TsCode),
-	})
+	}
+	// §P1-4（2026-09-15）：直接取 fetcher 最近一轮实时快照注入 CurrentPrice/PrevClose——
+	// 此前卖出单只填 StalenessMs，风控闸 checkLimitPrice 因 PrevClose<=0 恒 fail-open，
+	// 即使打开 limit_down_block_sell，跌停日自动止损单照样发出。快照缺失时字段为 0，
+	// 涨跌停闸维持 fail-open（风险敞口可退出的立场不变），但有行情即生效。
+	if q := e.snapshotQuotes()[pureTsCode(p.TsCode)]; q != nil {
+		req.CurrentPrice = q.Price
+		req.PrevClose = q.PrevClose // §P1-5 显式昨收字段（>0 才有值；旧语义回退见下）
+		if req.PrevClose <= 0 {
+			req.PrevClose = q.Close
+		}
+	}
+	res, err := ctrl.PlaceOrder(req)
 	if err != nil {
 		log.Printf("[qmt] 自动卖出 %s(%s) 失败: %v", p.TsCode, p.Name, err)
 		return err
@@ -882,10 +915,12 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 		// §修复 R6：日级幂等键 sell:<code>:<类别>:<交易日> 统计已成交数量，仅对"剩余未成交"部分补卖；
 		// 信号键追加 :r<剩余量> 桶——剩余量变化才开新单，避免部成后死循环重复下单，
 		// 也保证同日同剩余量不重复刷单（broker 仍在处理该笔时）。
-		// §修复 P2#13：剩余量按「今日全部全平类已成交」扣减（止损+m8），不再只看本类——
+		// §修复 P2#13：剩余量按「今日全部全平类已成交」扣减（止损+止盈+m8），不再只看本类——
 		// 否则同日 止损 全平后 m8 再触发会对已空仓的持仓下第二单（超额卖出）。
+		// §P0-2（2026-09-15）：再扣「今日在途卖单」——同轮 M8 清仓先占额度后，本函数即使看到
+		// 陈旧持仓快照（M8 fills 未回报）也不会再对同一持仓发第二笔全额卖单。
 		base := realSellSignalID(p.TsCode, class)
-		filled := e.realSoldQtyToday(realStore, userID, p.TsCode)
+		filled := e.realSoldOrOpenQtyToday(realStore, userID, p.TsCode)
 		remaining := p.Qty - filled
 		if remaining <= 0 {
 			continue
@@ -905,8 +940,13 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 			}
 			e.realTrimDone[p.TsCode] = day
 			e.mu.Unlock()
-			qty = remaining / 2
+			// §P0-3（2026-09-15）：减仓量必须整手（主板 100 股/手）——旧实现 remaining/2 会把
+			// 1500 股减成卖 750（非整手非全平）→ 柜台废单，既没减成还烧一次委托；paper 侧同逻辑
+			// 早有 /2/100*100 取整（paper.go），实盘路径补齐同款。取整后为 0（持仓<200 股）降级为
+			// 通知（syncLiveAdviceAlerts 已统一推送），不强凑全平。
+			qty = remaining / 2 / 100 * 100
 			if qty <= 0 {
+				log.Printf("[qmt] %s(%s) 减仓半平取整后为 0（持仓 %d 股<2 手），降级为提醒", p.TsCode, p.Name, remaining)
 				continue
 			}
 		} else {
@@ -994,10 +1034,12 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 			price = q.Price
 		}
 		// §修复 R6：M8 清仓同样走剩余量补卖逻辑（按 code:day 桶统计已成交，剩余量>0 才发单）。
-		// §修复 P2#13：剩余量按「今日全部全平类已成交」扣减（止损+m8），与止损路径同口径——
+		// §修复 P2#13：剩余量按「今日全部全平类已成交」扣减（止损+止盈+m8），与止损路径同口径——
 		// 防止 M8 在止损已全平后对空仓再下一单。
+		// §P0-2（2026-09-15）：同轮互斥——M8 卖单一旦报出即在途占额度，同轮后执行的止损路径
+		// （autoExecuteRealSells）看到剩余=0 自然跳过，杜绝同轮双笔全额卖单。
 		base := realSellSignalID(p.TsCode, "m8")
-		filled := e.realSoldQtyToday(realStore, userID, p.TsCode)
+		filled := e.realSoldOrOpenQtyToday(realStore, userID, p.TsCode)
 		remaining := p.Qty - filled
 		if remaining > 0 {
 			sid := fmt.Sprintf("%s:r%d", base, remaining)

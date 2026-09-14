@@ -48,7 +48,7 @@ import threading
 import time
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -177,9 +177,10 @@ class Gateway:
         # 桥以 JSONL 文件上报事件（bridge_report.jsonl 追加行），由本线程读文件
         # 并复用 _do_dispatch_result 语义（心跳/快照/派发回报/推量仔零改动）。
         self._file_bridge_thread = None
-        # xt 最近一次确认连接时间（自动翻转判定用；初始视为刚断开，避免一启动就误翻）
-        self._xt_last_connected = 0.0
-        # §主备反转：queued（桥）最近一次心跳确认时间（failover 判定用）
+        # §主备反转：queued（桥）最近一次心跳确认时间（failover 判定用）。
+        # §P2-12（2026-09-15）：删除死字段 _xt_last_connected——2026-09-11 主备语义反转为
+        # queued 主 / xt 备后，failover 判定只读 _queued_last_connected，旧字段仅剩误导读与
+        # 陈旧测试引用（test_queued_broker 曾据此整体失效，见 P2-12 修复）。
         self._queued_last_connected = 0.0
         # 来源 IP 白名单（由 main 从环境变量 ALLOWED_IPS 注入；空列表表示不做 IP 限制，仅依赖 token）
         self.allowed_ips = []
@@ -513,6 +514,12 @@ class Gateway:
             return 200, self._health_payload()
         if path == "/dispatch/pending" and method == "GET":
             return self._do_dispatch_pending()
+        if path == "/settlement" and method == "GET":
+            # §P0-1a（2026-09-15）券商交割单三方对账的网关权威源——此端点此前**根本不存在**
+            # （Go 侧 FetchSettlement 一直在调它，真实网关与 mock 同样 404，README §U-2 宣称的
+            # 日终四方对账从未真正生效）。放在连接门之前：断线时也返回 connected=false 让
+            # Go 侧按"交割单不可信跳过"处理，而不是把 503 当对账失败反复告警。
+            return self._do_settlement(request_handler)
         if path == "/dispatch/result" and method == "POST":
             return self._do_dispatch_result(body)
         if path == "/dispatch/enqueue" and method == "POST":
@@ -838,6 +845,47 @@ class Gateway:
         # §QMT-DUAL 透出 active 通道名，便于量仔/前端展示当前执行路径
         payload["broker_mode"] = self.active_key
         return 200, payload
+
+    def _do_settlement(self, request_handler=None):
+        """处理 GET /settlement?date=YYYY-MM-DD：日终结算三方对账的券商权威源（§P0-1a）。
+
+        装配口径：
+        - trades = 网关注销账本 fills 表当日全部成交（serial 用 §G1 唯一成交编号 trade_id，
+          Go 侧对账物理事实键匹配，不再依赖 serial 也成立）；
+        - connected = active 通道实时连接态（False 时 Go 侧按"交割单不可信"静默跳过）；
+        - cash = 最近一次账户资产快照（桥/xt 回报的 asset），缺失时为空 dict——
+          Go 侧仅当 cash.cash>0 才计算现金差，不误报。
+
+        English: §P0-1a — GET /settlement?date=YYYY-MM-DD serves the broker-authoritative leg of
+        three-way settlement from the gateway fills ledger (trade_id as serial), with connection
+        state and the latest asset snapshot for the cash-diff leg.
+        """
+        query = ""
+        if request_handler is not None:
+            query = urlparse(getattr(request_handler, "path", "") or "").query
+        params = parse_qs(query or "")
+        day = (params.get("date") or [""])[0].strip()
+        # 日期口径校验：只接受 YYYY-MM-DD（Go 侧 data.TradingDayDate 兼容由 Go 端负责）
+        if len(day) != 10 or day[4] != "-" or day[7] != "-" or not (day[:4] + day[5:7] + day[8:]).isdigit():
+            return 400, {"ok": False, "err": "date required, format YYYY-MM-DD"}
+        connected = bool(self.active_broker.is_connected())
+        trades = self.store.settlement_trades(day)
+        asset = getattr(self.handler, "_last_asset", None) or {}
+        cash = {}
+        for k in ("cash", "frozen_cash", "total_asset", "market_value"):
+            try:
+                cash[k] = float(asset.get(k) or 0.0)
+            except (TypeError, ValueError):
+                cash[k] = 0.0
+        return 200, {
+            "ok": True,
+            "date": day,
+            "account": self.cfg.get("account", ""),
+            "trades": trades,
+            "cash": cash,
+            "connected": connected,
+            "broker": self.active_key,
+        }
 
 
 class _Handler(BaseHTTPRequestHandler):
