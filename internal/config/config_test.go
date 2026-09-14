@@ -217,3 +217,29 @@ func TestQMTConfigPerAccount(t *testing.T) {
 		t.Errorf("无 store 应回退全局 rules.qmt, got %+v", got)
 	}
 }
+
+// TestStoredLLMConfig §UI-AUTHORITATIVE 修复：启动装配需要区分「运营账号在设置页真实
+// 保存过 LLM 配置」与「无保存回退全局」——前者重启后必须优先于环境变量恢复。
+// （无保存 → ok=false；SetLLMConfigFor 后 → ok=true 且快照为保存值，子账号解析到运营配置。）
+// English: distinguishes an explicitly saved operator LLM config from the global fallback,
+// so startup can give UI-saved values precedence over process env after restarts.
+func TestStoredLLMConfig(t *testing.T) {
+	m := NewManager(filepath.Join(t.TempDir(), "config.json"))
+	m.SetStore(&memKVStore{})
+	m.SetOperatorID("u_op")
+
+	// 未保存过：ok=false（启动应回落 env/全局链）
+	if _, ok := m.StoredLLMConfig("u_op"); ok {
+		t.Fatalf("无保存时不应报告已有账号级 LLM 配置")
+	}
+
+	m.SetLLMConfigFor("u_op", &LLMConfig{APIURL: "https://kiraai.vn/v1/chat/completions", Model: "qwen3.8-flash-free"})
+	saved, ok := m.StoredLLMConfig("u_op")
+	if !ok || saved.APIURL != "https://kiraai.vn/v1/chat/completions" || saved.Model != "qwen3.8-flash-free" {
+		t.Fatalf("保存后应可读出快照, got %+v ok=%v", saved, ok)
+	}
+	// 子账号经 ownerOf 解析到运营账号同一份保存（系统级共享语义）
+	if s2, ok2 := m.StoredLLMConfig("u_sub"); !ok2 || s2.Model != "qwen3.8-flash-free" {
+		t.Fatalf("子账号应解析到运营保存配置, got %+v ok=%v", s2, ok2)
+	}
+}

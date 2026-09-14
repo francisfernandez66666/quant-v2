@@ -158,6 +158,7 @@ type DemoteOpts struct {
 	MinDailyTrades int     // 单日样本下限（默认 3）
 }
 
+// fill 补齐降级阈值零值为默认（连续天数/样本数/回撤线），未配置不报错。
 func (o *DemoteOpts) fill() {
 	if o.ConsecDays <= 0 {
 		o.ConsecDays = 3
@@ -226,6 +227,7 @@ type tradeStats struct {
 	maxDrawdownPct float64
 }
 
+// summarizeTrades 汇总收益序列为基础统计（次数/均值/胜率/最大回撤近似）。
 func summarizeTrades(returns []float64) tradeStats {
 	var s tradeStats
 	if len(returns) == 0 {

@@ -1600,6 +1600,23 @@ func (m *Manager) SetLLMConfigFor(userID string, cfg *LLMConfig) {
 	m.saveUserRules(oid, r)
 }
 
+// StoredLLMConfig 返回该账号（解析到运营归属账号）是否显式保存过 LLM 配置及其快照。
+// 供启动装配区分「UI 真实保存过」与「无保存回退全局」——§UI-AUTHORITATIVE 修复：
+// 设置页保存过的配置重启后必须优先于环境变量，不再被 NSSM 里硬编码的旧 LLM_* 顶掉。
+// English: reports whether the account (resolved to its operator owner) explicitly saved an
+// LLM config, plus the snapshot; used to give UI-saved config precedence over env at startup.
+func (m *Manager) StoredLLMConfig(userID string) (*LLMConfig, bool) {
+	oid := m.ownerOf(userID)
+	if m.store == nil || oid == "" {
+		return nil, false
+	}
+	if r, ok := m.storedUserRules(oid); ok {
+		cp := r.LLM // 拷贝返回，避免调用方改写内存快照
+		return &cp, true
+	}
+	return nil, false
+}
+
 // GetQMTConfigFor 返回指定账号的 QMT 实盘配置（§2026-09-07 多账号实盘）。
 // 解析优先级：① 账号自身覆盖 → ② 运营账号覆盖（存量单账号行为：所有账号共享运营账号配置）
 // → ③ 全局 rules.qmt。引擎构建/热同步（registry.go:706、engine.go syncAccountConfig）按此

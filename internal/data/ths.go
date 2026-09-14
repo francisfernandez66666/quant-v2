@@ -37,8 +37,12 @@ type THSClient struct {
 }
 
 // thsUserAgent 同花顺请求使用的浏览器 User-Agent。
-// thsUserAgent is the browser User-Agent used for THS requests.
-const thsUserAgent = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36"
+// §2026-09-14 WAF 实录：原 Android 移动 UA 被 q.10jqka 的 Nginx 防火墙整段拉黑
+// （返回 "Nginx forbidden."，板块名单/行情接口全挂），桌面 Chrome UA 正常放行——
+// 固定用桌面主流浏览器指纹，勿改回移动端。
+// thsUserAgent is the browser User-Agent used for THS requests; the THS WAF blocks
+// mobile fingerprints (2026-09-14 incident), keep a desktop Chrome UA.
+const thsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 // thsReferer 同花顺请求 Referer。
 // thsReferer is the Referer used for THS requests.

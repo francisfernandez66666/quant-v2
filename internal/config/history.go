@@ -56,6 +56,7 @@ func SnapshotRules(m *Manager) (string, error) {
 	return filepath.Base(path[:len(path)-len(".json")]), nil
 }
 
+// fileExists 判断路径存在。
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil

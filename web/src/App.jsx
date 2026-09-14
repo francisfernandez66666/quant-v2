@@ -304,6 +304,7 @@ export default function App() {
   // 组合键本身罕见误触，直接 preventDefault 打开面板）。
   useEffect(() => {
     if (!loggedIn) return
+    // 全局快捷键：Ctrl/⌘+K 唤起/收起命令面板
     const onKey = (e) => {
       if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
         e.preventDefault()

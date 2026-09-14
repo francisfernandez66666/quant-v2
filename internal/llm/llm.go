@@ -83,6 +83,12 @@ const DefaultStreamIdleTimeout = 60 * time.Second
 // （Timeout returns the client's per-request timeout, for config validation/display.）
 func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 
+// KeyCount 返回实际生效的密钥池数量（启动日志/诊断用，不暴露密钥本身）。
+// §UI-AUTHORITATIVE 修复：此前部署自检只数环境变量里的 key，UI 保存的按账号密钥池
+// 生效时报告数对不上，误导排障。（English: reports the live key-pool size; the old
+// self-check only counted env keys and misreported UI-saved pools.）
+func (c *Client) KeyCount() int { return len(c.apiKeys) }
+
 // New 创建 LLM 客户端。
 // （New creates an LLM client.）
 func New(cfg Config) *Client {
@@ -1158,7 +1164,11 @@ func (c *Client) Ping() error {
 		return fmt.Errorf("LLM_API_KEY not set")
 	}
 	// 发起一次最小成本请求（单 token 非流式）探测 API 连通性。
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// §UI-AUTHORITATIVE 修复：超时从硬编码 10s 改为客户端自身超时（≥60s）——推理模型
+	// （如 qwen3.8-flash-free）即使 max_tokens=1 也要先走思维链，首字常超 10s，
+	// 旧值导致启动预检假阴性"降级运行"。（English: give Ping the client timeout; reasoning
+	// models routinely exceed the old hard-coded 10s even for one token.）
+	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout())
 	defer cancel()
 	payload := chatCompletionRequest{
 		ChatRequest: ChatRequest{

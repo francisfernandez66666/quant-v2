@@ -146,6 +146,7 @@ func prevCommented(lines []string, start, lookback int) bool {
 	return false
 }
 
+// truncate 按 rune 截断（避免中文半字），用于报告行。
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
 	r := []rune(s)

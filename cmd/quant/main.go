@@ -98,6 +98,10 @@ func main() {
 
 	// 配置管理器：读取数据目录下的 config.json（策略/风控/情绪/LLM 等）
 	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
+	// §UI-AUTHORITATIVE 修复：配置存储（trading.db KV）必须在下方 LLM 启动装配【之前】挂好，
+	// 否则 StoredLLMConfig 恒为 false，设置页保存的运营配置在重启后无法恢复（被 env 顶掉）。
+	// server.New 内部会再次 SetStore（幂等赋值，无副作用）。
+	cfgMgr.SetStore(authMgr)
 	// 运营数据统一归属管理员：把管理员账号 ID 注入配置管理器，使量化/模拟盘/策略/D1/LLM/
 	// 做多空等配置与持仓/告警等数据系统级共享，后端按角色鉴权（子账号只读公开部分）。
 	cfgMgr.SetOperatorID(authMgr.AdminID())
@@ -111,30 +115,63 @@ func main() {
 	// §GAP3.1 运行时交易日历：后台拉取法定节假日/临时休市日（失败按周末口径兜底，不阻断启动）。
 	data.LoadTradingCalendarAsync()
 
-	// LLM 配置优先级：环境变量 → 认证配置项 → 配置文件 → 默认值
+	// LLM 配置优先级（§UI-AUTHORITATIVE 修复 2026-09-14）：
+	// ① 运营账号在设置页保存的配置（userRules + 按账号 auth 密钥，UI 写入的唯一权威面）；
+	// ② 环境变量 LLM_API_KEY(S)/LLM_API_URL/LLM_MODEL（部署 bootstrap，UI 从未保存过时生效）；
+	// ③ 全局 auth 配置项（历史 "" 键）→ ④ 全局 config.json rules.llm → ⑤ 代码默认。
+	// 修复前问题：生产 NSSM 服务把 siliconflow 旧地址/旧 key 硬编码进环境变量，而 UI 保存
+	// 落在①，启动只读②③④——每次重启/发布后设置页保存的 LLM 配置被环境变量悄悄顶掉，
+	// 表现为"前端改了没起作用"。（English: UI-saved config now wins over process env at startup;
+	// previously env pinned the old provider and silently reverted every settings-page save.）
 	llmCfg := llm.Config{}
-	llmCfg.APIKey = os.Getenv("LLM_API_KEY")
-	llmCfg.APIURL = os.Getenv("LLM_API_URL")
-	llmCfg.Model = os.Getenv("LLM_MODEL")
-	// §LLM-ROTATE 多 key 池（2026-09-01）：LLM_API_KEYS 逗号分隔，首 key 为主用、其余备用，
-	// 供 §S6 健康轮换消费——某把 key 401/403 鉴权失效时自动冷却 30min 并切到下一把（429 按
-	// Retry-After、5xx 短冷却），主 key 恢复后冷却到期自动回归轮询池。避免单 key 误植/吊销
-	// （2026-08-31 13:23 实录：NSSM 环境变量 key 误植一字 → LLM 全线 401 降级 22h）导致整条
-	// 新闻分类/D1 评分链路瘫痪。
-	if rawKeys := os.Getenv("LLM_API_KEYS"); rawKeys != "" {
-		for _, k := range strings.Split(rawKeys, ",") {
-			if k = strings.TrimSpace(k); k != "" {
-				llmCfg.APIKeys = append(llmCfg.APIKeys, k)
+	adminID := authMgr.AdminID()
+	// ① 设置页保存的运营配置（URL/模型/超时/流式/并发/分类模型 + 按账号密钥）
+	if saved, ok := cfgMgr.StoredLLMConfig(adminID); ok && saved != nil {
+		llmCfg.APIURL = saved.APIURL
+		llmCfg.Model = saved.Model
+		llmCfg.Timeout = time.Duration(saved.TimeoutSec) * time.Second
+		llmCfg.Streaming = saved.StreamingEnabled()
+		llmCfg.BatchConcurrency = saved.BatchConcurrency
+		llmCfg.ClassifierModel = saved.ClassifierModel
+		// 运营账号的多 key（设置页保存形态：逗号分隔存 auth 配置）
+		if v, ok := authMgr.GetConfig(adminID, "llm_api_keys"); ok && v != "" {
+			for _, k := range strings.Split(v, ",") {
+				if k = strings.TrimSpace(k); k != "" {
+					llmCfg.APIKeys = append(llmCfg.APIKeys, k)
+				}
 			}
-		}
-		// 主 key 兼容字段：未显式设置 LLM_API_KEY 时取列表首把，保持单 key 语义（日志脱敏等）一致
-		if llmCfg.APIKey == "" && len(llmCfg.APIKeys) > 0 {
-			llmCfg.APIKey = llmCfg.APIKeys[0]
+		} else if v, ok := authMgr.GetConfig(adminID, "llm_api_key"); ok && v != "" {
+			llmCfg.APIKeys = append(llmCfg.APIKeys, v)
 		}
 	}
-	if llmCfg.APIKey == "" {
-		if v, ok := authMgr.GetConfig("", "llm_api_key"); ok {
-			llmCfg.APIKey = v
+	// ② 环境变量兜底（仅补①留空的字段，不覆盖已保存值）
+	if len(llmCfg.APIKeys) == 0 {
+		if rawKeys := os.Getenv("LLM_API_KEYS"); rawKeys != "" {
+			for _, k := range strings.Split(rawKeys, ",") {
+				if k = strings.TrimSpace(k); k != "" {
+					llmCfg.APIKeys = append(llmCfg.APIKeys, k)
+				}
+			}
+		} else if k := os.Getenv("LLM_API_KEY"); k != "" {
+			llmCfg.APIKeys = append(llmCfg.APIKeys, k)
+		}
+	}
+	if llmCfg.APIURL == "" {
+		llmCfg.APIURL = os.Getenv("LLM_API_URL")
+	}
+	if llmCfg.Model == "" {
+		llmCfg.Model = os.Getenv("LLM_MODEL")
+	}
+	// ③ 全局 auth 配置项（历史单账号形态）
+	if len(llmCfg.APIKeys) == 0 {
+		if v, ok := authMgr.GetConfig("", "llm_api_keys"); ok && v != "" {
+			for _, k := range strings.Split(v, ",") {
+				if k = strings.TrimSpace(k); k != "" {
+					llmCfg.APIKeys = append(llmCfg.APIKeys, k)
+				}
+			}
+		} else if v, ok := authMgr.GetConfig("", "llm_api_key"); ok && v != "" {
+			llmCfg.APIKeys = append(llmCfg.APIKeys, v)
 		}
 	}
 	if llmCfg.APIURL == "" {
@@ -142,27 +179,25 @@ func main() {
 			llmCfg.APIURL = v
 		}
 	}
+	// ④ 全局 config.json（无运营保存时的旧默认链）
 	if llmCfg.APIURL == "" {
 		llmCfg.APIURL = cfgMgr.Rules.LLM.APIURL
 	}
 	if llmCfg.Model == "" {
 		llmCfg.Model = cfgMgr.Rules.LLM.Model
 	}
-	llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
-	llmCfg.Streaming = cfgMgr.Rules.LLM.StreamingEnabled()
-	llmCfg.BatchConcurrency = cfgMgr.Rules.LLM.BatchConcurrency
-	// 可选分类专用模型：新闻归因 Stage0/1 等快速分类/初筛用它，主模型留给 D1/Stage2 深度分析。
-	llmCfg.ClassifierModel = cfgMgr.Rules.LLM.ClassifierModel
-	// 多 API 密钥：认证配置优先（逗号分隔），否则回退单 key
-	if v, ok := authMgr.GetConfig("", "llm_api_keys"); ok && v != "" {
-		for _, k := range strings.Split(v, ",") {
-			if k = strings.TrimSpace(k); k != "" {
-				llmCfg.APIKeys = append(llmCfg.APIKeys, k)
-			}
-		}
+	if llmCfg.Timeout == 0 {
+		llmCfg.Timeout = time.Duration(cfgMgr.Rules.LLM.TimeoutSec) * time.Second
 	}
-	if len(llmCfg.APIKeys) == 0 && llmCfg.APIKey != "" {
-		llmCfg.APIKeys = []string{llmCfg.APIKey}
+	if llmCfg.BatchConcurrency == 0 {
+		llmCfg.BatchConcurrency = cfgMgr.Rules.LLM.BatchConcurrency
+	}
+	if llmCfg.ClassifierModel == "" {
+		llmCfg.ClassifierModel = cfgMgr.Rules.LLM.ClassifierModel
+	}
+	// 主 key 兼容字段：日志脱敏等单 key 语义仍指向首把
+	if len(llmCfg.APIKeys) > 0 {
+		llmCfg.APIKey = llmCfg.APIKeys[0]
 	}
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
@@ -215,7 +250,11 @@ func main() {
 		effModel = llm.DefaultModel
 	}
 	srv.SetRuntimeLLM(llmCfg.APIURL, effModel)
-	log.Printf("[LLM] 运行模型: %s @ %s", effModel, llmCfg.APIURL)
+	poolN := 0
+	if llmClient != nil {
+		poolN = llmClient.KeyCount()
+	}
+	log.Printf("[LLM] 运行模型: %s @ %s (生效密钥池 %d 把)", effModel, llmCfg.APIURL, poolN)
 
 	// 模拟盘（纸面交易）：独立于真实持仓的虚拟撮合/净值/信号质量统计。
 	// 开启后引擎按实时快照价自动撮合 buy 信号；config.json 的 rules.paper 控制开关与参数。
@@ -429,7 +468,10 @@ func main() {
 		srv.ExportPaperToResearch(userID, pe)
 	})
 
-	// 前端修改 LLM 配置时热重建客户端，避免重启进程（对所有已创建账号引擎生效）
+	// 前端修改 LLM 配置时热重建客户端，避免重启进程。§UI-AUTHORITATIVE 修复：改走
+	// Registry.SetLLMClient 统一分发——同时更新注册表模板（覆盖之后懒加载新建的引擎）、
+	// 共享新闻归因代理与全部存活引擎；此前只刷当时存活的引擎，空注册表/新建账号会静默
+	// 沿用旧客户端（表现为设置页保存后归因仍是旧模型）。
 	srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) {
 		lc := llm.New(llm.Config{
 			APIKeys:          apiKeys,
@@ -440,9 +482,12 @@ func main() {
 			BatchConcurrency: batchConcurrency,
 			ClassifierModel:  classifierModel,
 		})
-		for _, e := range registry.All() {
-			e.SetLLMClient(lc)
+		registry.SetLLMClient(lc)
+		eff := model
+		if eff == "" {
+			eff = llm.DefaultModel
 		}
+		log.Printf("[LLM] 热重建生效: %s @ %s (keys=%d)", eff, apiURL, len(apiKeys))
 	})
 
 	// 实时触发引擎（daban式放量急拉检测，SSE 推送）

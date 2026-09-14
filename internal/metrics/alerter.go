@@ -129,6 +129,7 @@ type AlertEvent struct {
 	Message string  `json:"message"`
 }
 
+// String 告警事件的单行可读格式（级别/类型/消息/触发值）。
 func (e AlertEvent) String() string {
 	return fmt.Sprintf("[%s/%s] %s 值=%.2f", e.Level, e.Kind, e.Message, e.Value)
 }

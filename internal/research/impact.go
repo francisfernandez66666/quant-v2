@@ -82,6 +82,7 @@ func NewImpactTable(minSample int) *ImpactTable {
 	return &ImpactTable{Buckets: make(map[ImpactKey]*ImpactBucket), MinSample: minSample}
 }
 
+// bucket 取（无则懒建）指定键的事件影响分桶。
 func (t *ImpactTable) bucket(k ImpactKey) *ImpactBucket {
 	b, ok := t.Buckets[k]
 	if !ok {

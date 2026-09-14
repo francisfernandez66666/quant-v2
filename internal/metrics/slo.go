@@ -104,6 +104,7 @@ func WriteSLODaily(dataDir string, r SLOResult) error {
 	return nil
 }
 
+// sloMetStr SLO 达成状态的中文展示串。
 func sloMetStr(met bool) string {
 	if met {
 		return "达成"

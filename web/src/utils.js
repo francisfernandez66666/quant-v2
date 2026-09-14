@@ -7,6 +7,7 @@
  * @param {number} digits - 保留小数位数
  * @returns {string} 如 "12.34%" 或 "-"
  */
+// 百分比格式化（空值返回占位符 -）
 export function fmtPct(v, digits = 2) {
   if (v === null || v === undefined || isNaN(Number(v))) return '-'
   return Number(v).toFixed(digits) + '%'
@@ -18,6 +19,7 @@ export function fmtPct(v, digits = 2) {
  * @param {number} digits - 保留小数位数
  * @returns {string} 如 "12.34" 或 "-"
  */
+// 数值格式化：千分位 + 固定小数位
 export function fmtNum(v, digits = 2) {
   if (v === null || v === undefined || isNaN(Number(v))) return '-'
   return Number(v).toFixed(digits)
@@ -28,6 +30,7 @@ export function fmtNum(v, digits = 2) {
  * @param {number|string|null} v - 原始金额
  * @returns {string} 如 "1,234.56" 或 "-"
  */
+// 金额格式化（¥ 前缀 + 千分位）
 export function fmtMoney(v) {
   if (v === null || v === undefined || isNaN(Number(v))) return '-'
   return Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 })
@@ -38,6 +41,7 @@ export function fmtMoney(v) {
  * @param {number|string} v - 盈亏值
  * @returns {string} 'pnl-up' | 'pnl-down' | 'pnl-flat'
  */
+// 盈亏着色类名：正 red / 负 green / 零 flat
 export function pnlClass(v) {
   const n = Number(v)
   if (isNaN(n) || n === 0) return 'pnl-flat'
@@ -49,6 +53,7 @@ export function pnlClass(v) {
  * @param {number|string|Date} ts - 时间戳或日期对象
  * @returns {string} 格式化后的时间字符串或 "-"
  */
+// 时间戳→本地可读时间文本
 export function fmtTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts)
@@ -63,6 +68,7 @@ export function fmtTime(ts) {
  * @param {*} v - 原始值
  * @returns {string}
  */
+// 空值安全的字符串化
 export function toStr(v) {
   return v === null || v === undefined ? '' : String(v)
 }

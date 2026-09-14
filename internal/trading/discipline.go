@@ -49,6 +49,7 @@ const (
 	ActionConfirm
 )
 
+// String 纪律动作的稳定字符串形态（落库/日志用）。
 func (a DisciplineAction) String() string {
 	switch a {
 	case ActionClose:

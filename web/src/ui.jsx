@@ -9,6 +9,7 @@ import { MessagePlugin, NotificationPlugin } from 'tdesign-react'
  * @param {string} msg - 提示内容
  * @param {'info'|'success'|'warning'|'error'} type - 提示类型
  */
+// 轻提示 toast（type: info/success/warning/error）
 export function showToast(msg, type = 'info') {
   const fn = MessagePlugin[type] || MessagePlugin.info
   fn({ content: String(msg), duration: 3000 })
@@ -20,6 +21,7 @@ export function showToast(msg, type = 'info') {
  * @param {string} body - 通知正文
  * @param {object} opts - NotificationPlugin 额外选项
  */
+// 右上角系统风格通知条
 export function showNotify(title, body, opts = {}) {
   NotificationPlugin.info({
     title: String(title),
@@ -34,6 +36,7 @@ export function showNotify(title, body, opts = {}) {
  * 加载态组件
  * @param {{text?:string}} props
  */
+// 通用加载占位卡片
 export function Loading({ text = '加载中...' }) {
   return (
     <div className="card-dark" style={{ textAlign: 'center', color: '#888', padding: 32 }}>
@@ -46,6 +49,7 @@ export function Loading({ text = '加载中...' }) {
  * 空态组件
  * @param {{text?:string}} props
  */
+// 通用空数据占位卡片
 export function Empty({ text = '暂无数据' }) {
   return (
     <div className="card-dark" style={{ textAlign: 'center', color: '#666', padding: 32 }}>

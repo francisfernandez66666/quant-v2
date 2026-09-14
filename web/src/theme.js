@@ -48,6 +48,7 @@ function apply(t) {
  * @param {'light'|'dark'} t
  * @returns {'light'|'dark'} 实际生效主题
  */
+// 切换主题并持久化到本地
 export function setTheme(t) {
   const theme = apply(t)
   try { localStorage.setItem(THEME_KEY, theme) } catch (_) {}
@@ -63,6 +64,7 @@ export function toggleTheme() {
  * 订阅主题变化（返回取消订阅函数）。供 canvas 图表在非 React 语境下重绘。
  * English: subscribe to theme changes (returns an unsubscribe fn) for canvas repaints.
  */
+// 订阅主题变更，返回退订函数
 export function subscribeTheme(fn) {
   listeners.add(fn)
   return () => listeners.delete(fn)
@@ -72,6 +74,7 @@ export function subscribeTheme(fn) {
  * 应用启动时读取持久化主题并落到 DOM（在 main.jsx render 之前调用，避免闪烁）。
  * English: read the persisted theme and apply it to the DOM at boot (called before render).
  */
+// 启动时应用本地存储的主题
 export function initTheme() {
   return apply(readStored())
 }
@@ -80,6 +83,7 @@ export function initTheme() {
  * useTheme React 钩子：返回 [theme, setThemeFn, toggle]，内部监听广播保持多组件同步。
  * @returns {['light'|'dark', (t:string)=>void, ()=>void]}
  */
+// React hook：组件内跟随主题重渲染
 export function useTheme() {
   const [theme, setThemeState] = useState(getTheme)
   useEffect(() => {

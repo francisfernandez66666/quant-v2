@@ -71,9 +71,11 @@ export default function EmotionReview() {
     if (!series.length) return null
     const n = series.length
     const maxLU = Math.max(...series.map((d) => d.limit_up_count || 0), 10)
+    // 柱状图步宽
     const step = (W - PAD_L - PAD_R) / n
     const bars = series.map((d, i) => {
       const x = PAD_L + i * step
+      // 涨停数柱高（按序列最大值归一）
       const bh = ((d.limit_up_count || 0) / maxLU) * (H - PAD_T - PAD_B - 8)
       return { x, w: Math.max(step - 1.5, 1), y: H - PAD_B - bh, h: bh, lu: d.limit_up_count || 0, color: EMOTION_COLOR[d.emotion] || '#999' }
     })

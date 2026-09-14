@@ -42,6 +42,7 @@ export default function ParetoChart({ front = [], champion, recommended, gates, 
   const pts = useMemo(() => {
     const keyOf = (r) => [r?.params?.take_profit_pct, r?.params?.stop_loss_pct,
       r?.params?.hold_days, r?.params?.min_score].join('|')
+    // 前沿解集合：补稳定 key 与角色标记
     const list = (front || []).map((r, i) => ({ ...r, _k: keyOf(r) || 'p' + i, _role: 'front' }))
     const ck = keyOf(champion)
     const hitC = list.find((r) => r._k === ck)
@@ -62,6 +63,7 @@ export default function ParetoChart({ front = [], champion, recommended, gates, 
     const xMax = axisMax(xs, 10)
     const yMax = axisMax(ys, 1)
     const rMin = Math.min(...rs, 0); const rMax = Math.max(...rs, 1)
+    // 值→画布坐标映射：x 收益、y 回撤、点半径随夏普
     const px = (v) => PAD_L + (v / xMax) * (W - PAD_L - PAD_R)
     const py = (v) => H - PAD_B - (v / yMax) * (H - PAD_B - PAD_T)
     const pr = (v) => 3.5 + ((v - rMin) / Math.max(rMax - rMin, 1e-9)) * 5.5
@@ -79,6 +81,7 @@ export default function ParetoChart({ front = [], champion, recommended, gates, 
   // 简单刻度（5 档）
   const ticks = (max) => [0, 1, 2, 3, 4].map((i) => (max / 4) * i)
 
+  // 配色：推荐解红色高亮，其余按角色取色
   const colorOf = (p) => (p._role === 'recommended' || p._role === 'champ_rec') ? '#e34d59'
     : p._role === 'champion' ? '#b8860b' : '#4f7cff'
 

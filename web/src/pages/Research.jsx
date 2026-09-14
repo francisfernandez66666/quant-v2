@@ -565,6 +565,7 @@ export default function Research() {
     setOptLaunching(true)
     try {
       const res = await api.enqueueOptimize({ objective: optObjective })
+      // 目标函数回显：后端应答优先
       const objEcho = (res && res.objective) || optObjective
       showToast('已加入研究队列（task #' + (res && res.task_id) + '，目标 ' + objEcho + '）——盘后窗口执行，进度见「回测」tab。', 'success')
       // §W6：入队成功后主动刷新任务列表（此前只 setOptLaunching 不刷新，用户看不到队列位次）
@@ -638,8 +639,10 @@ export default function Research() {
   // 避免卡片与详情抽屉数字不一致）
     const objWant = (optObjective || 'profitFactor').toLowerCase()
     for (const t of optTasks) {
+      // 任务目标小写化做关键词匹配
       const tObj = (t.objective || '').toLowerCase()
       if (tObj && tObj !== objWant) continue
+      // 结果集中定位本战法对应条目
       const hit = (t.results || []).find((r) => (r.strategy_kind || r.strategy) === optSelected)
       if (hit) return { ...hit, task_id: t.task_id }
     }

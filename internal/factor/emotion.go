@@ -29,6 +29,7 @@ func emoArray(s *StockSeries, f func(*StockSeries) []float64) []float64 {
 	return f(s)
 }
 
+// init 注册情绪类因子（涨停家数等）到全局因子表。
 func init() {
 	Register(Def{
 		ID:   "emo_limit_up",

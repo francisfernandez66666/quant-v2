@@ -62,6 +62,10 @@ func (a *Agent) llmClientSnapshot() *llm.Client {
 	return a.llmClient
 }
 
+// LLMClient 返回当前 LLM 客户端快照（诊断与单测用：验证热替换是否生效）。
+// English: returns the current LLM client snapshot (for diagnostics/tests verifying hot-swap).
+func (a *Agent) LLMClient() *llm.Client { return a.llmClientSnapshot() }
+
 // currentMinScore 锁内读当前落盘过滤最低分。
 func (a *Agent) currentMinScore() float64 {
 	a.hotMu.RLock()

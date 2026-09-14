@@ -29,6 +29,7 @@ function remove(type, fn) {
  * @param {(msg:object)=>void} fn
  * @returns {() => void}
  */
+// 订阅一个或多个事件类型的回调
 export function on(types, fn) {
   const arr = Array.isArray(types) ? types : [types]
   arr.forEach((t) => add(t, fn))
@@ -40,10 +41,12 @@ export function on(types, fn) {
  * @param {object} msg 含 type 字段的已解析 SSE 消息
  * @returns {number} 被调用的回调数量
  */
+// 按消息 type 分发给订阅者（含 * 通配），返回命中数
 export function dispatch(msg) {
   if (!msg || typeof msg !== 'object') return 0
   const t = msg.type
   let n = 0
+  // 安全派发：单个订阅者抛错不阻断其余（n 记命中数）
   const call = (fn) => { try { fn(msg); n++ } catch (_) {} }
   const set = t ? handlers.get(t) : null
   if (set) set.forEach(call)

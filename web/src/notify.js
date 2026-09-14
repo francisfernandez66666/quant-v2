@@ -12,6 +12,7 @@
  *       检测到该桥即认为可走原生通道发系统通知；桌面浏览器返回 false。
  * @returns {boolean} true 表示原生桥可用
  */
+// 是否运行在原生 App 壳内（走原生通知通道）
 function isNative() {
   return (
     typeof window !== 'undefined' &&
@@ -26,6 +27,7 @@ function isNative() {
  * 浏览器环境要求支持 Notification API 且用户已授权（permission === 'granted'）。
  * @returns {boolean} true 表示当前可以发通知
  */
+// 当前环境能否发通知
 function canNotify() {
   if (isNative()) return true
   return typeof Notification !== 'undefined' && Notification.permission === 'granted'
@@ -38,6 +40,7 @@ function canNotify() {
  * 环境不支持时返回 'unsupported'，调用方据此跳过后续提示。
  * @returns {Promise<string>} 'granted' / 'denied' / 'default' / 'unsupported'
  */
+// 申请浏览器通知授权（原生壳直接放行）
 function requestPermission() {
   if (isNative()) return Promise.resolve('granted')
   if (typeof Notification === 'undefined') return Promise.resolve('unsupported')
@@ -52,6 +55,7 @@ function requestPermission() {
  *   原生桥以 show() 返回布尔为准（false=未获系统通知权限）；
  *   浏览器端 new Notification() 成功即 true，未授权或抛异常为 false。
  */
+// 发送一条系统通知（原生壳/浏览器双通道）
 function notify(title, body) {
   if (isNative()) {
     try {

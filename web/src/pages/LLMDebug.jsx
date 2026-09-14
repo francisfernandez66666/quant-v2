@@ -41,6 +41,7 @@ const emptyStyle = { textAlign: 'center', color: 'var(--app-muted)', padding: 24
  * @param {{visible:boolean, onClose:()=>void}} props
  * @returns {JSX.Element|null}
  */
+// 引擎流水线日志弹窗（LLM/信号双 tab）
 function LogModal({ visible, onClose }) {
   const [activeTab, setActiveTab] = useState('llm')
   const [loading, setLoading] = useState(false)

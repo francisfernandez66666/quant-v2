@@ -17,6 +17,7 @@ import MinuteView from './MinuteView.jsx'
 // English: tolerant code match — treats "600000" and "600000.SH" as the same symbol via its 6-digit prefix.
 function codeEq(a, b) {
   if (!a || !b) return false
+  // 代码取前 6 位数字做同股比对键
   const d = (x) => String(x).slice(0, 6)
   return String(a) === String(b) || d(a) === d(b)
 }
@@ -58,6 +59,7 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
   useEffect(() => {
     if (!open || !code) { setQuote(null); return }
     let alive = true
+    // 拉取行情快照回填抽屉头部
     const load = () => {
       api.fetchStockLookup(code)
         .then((r) => { if (alive && r) setQuote(r) })
@@ -70,6 +72,7 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
 
   useEffect(() => {
     if (!open) return
+    // Esc 关闭抽屉
     const h = (e) => { if (e.key === 'Escape' && onClose) onClose() }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
@@ -77,6 +80,7 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
 
   if (!open || !code) return null
 
+  // 展示名：行情返回优先，回落入参名称/代码
   const showName = (quote && quote.name) || name || code
   const showPrice = quote && Number.isFinite(Number(quote.price)) && Number(quote.price) > 0 ? Number(quote.price) : price
   const rawChg = changePct
@@ -84,6 +88,7 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
   const chgUp = chg != null && chg >= 0
 
   const rel = related || {}
+  // 关联数据按本股代码过滤（信号/持仓/消息）
   const mySignals = (rel.signals || []).filter((s) => codeEq(s.code, code))
   const myPositions = (rel.positions || []).filter((p) => codeEq(p.code, code))
   const myMessages = (rel.messages || []).filter((m) => codeEq(m.code, code))

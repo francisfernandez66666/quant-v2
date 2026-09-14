@@ -38,6 +38,7 @@ type signalQualityConfig struct {
 	TargetHitRate float64 // 目标命中率（默认 0.35）
 }
 
+// fill 补齐零值配置为默认（最小样本量/权重上下限等），避免未配置时统计口径漂移。
 func (c *signalQualityConfig) fill() {
 	if c.MinSample <= 0 {
 		c.MinSample = 20
@@ -65,6 +66,7 @@ func NewSignalQualityTable(minSample int) *SignalQualityTable {
 	return &SignalQualityTable{cfg: signalQualityConfig{MinSample: minSample, SlidePct: 0.10, TargetHitRate: 0.35}, Buckets: make(map[QualityBucketKey]*QualityBucket)}
 }
 
+// bucket 取（无则懒建）指定键的质量分桶，新桶初始权重 1.0。
 func (t *SignalQualityTable) bucket(k QualityBucketKey) *QualityBucket {
 	b, ok := t.Buckets[k]
 	if !ok {
@@ -121,6 +123,7 @@ func (t *SignalQualityTable) GateShift(key QualityBucketKey) float64 {
 	return b.Gate
 }
 
+// clampf 把 v 夹到 [lo,hi] 区间。
 func clampf(v, lo, hi float64) float64 {
 	if v < lo {
 		return lo

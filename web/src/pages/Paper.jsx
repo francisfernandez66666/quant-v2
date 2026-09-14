@@ -23,6 +23,7 @@ const clsColor = (c) => (c === 'up' ? UP : c === 'down' ? DOWN : undefined)
  * @param {string} [header='确认'] 弹窗标题
  * @returns {Promise<boolean>} 用户确认结果
  */
+// Promise 化确认对话框
 function confirmDialog(body, header = '确认') {
   return new Promise((resolve) => {
     const d = DialogPlugin.confirm({
@@ -82,6 +83,7 @@ function tradeSlippage(t) {
  * @param {object} t 成交记录
  * @returns {''|'up'|'down'} 无有效信号价时返回空串
  */
+// 买入滑点标记类名：成交价劣于信号价时高亮
 function tradeSlippageCls(t) {
   if (t.side !== 'buy' || !(t.signal_price > 0)) return ''
   return t.price >= t.signal_price ? 'down' : 'up'
@@ -309,6 +311,7 @@ export default function Paper() {
    * @param {object} p 持仓记录（含 code/name/strategy/mark/qty）
    * @param {'add'|'trim'|'close'} dir 交易方向
    */
+  // 打开模拟盘交易弹窗（指定持仓与方向）
   function openTrade(p, dir) {
     setTradeTarget(p); setTradeDir(dir)
     setTradeFormPrice(p.mark || 0)
@@ -874,6 +877,7 @@ export default function Paper() {
                 { colKey: 'open_price', title: '开仓价', width: 90, cell: ({ row }) => row.open_price?.toFixed(2) },
                 { colKey: 'mark', title: '现价', width: 90, cell: ({ row }) => row.mark?.toFixed(2) },
                 { colKey: 'float', title: '浮动盈亏', width: 130, cell: ({ row }) => {
+                  // 空头浮动盈亏 =（开仓价 − 现价）× 数量 − 累计费用
                   const pnl = (row.open_price - row.mark) * row.qty - (row.fee_accrued || 0)
                   const base = row.margin_used > 0 ? row.margin_used : row.open_price * row.qty
                   return (

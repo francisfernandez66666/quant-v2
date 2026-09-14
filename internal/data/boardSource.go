@@ -195,6 +195,7 @@ func (fb *FailoverBoard) cooldown() time.Duration {
 	}
 	return fb.Cooldown
 }
+// probeEvery 探测间隔（未配置时默认 10s）。
 func (fb *FailoverBoard) probeEvery() time.Duration {
 	if fb.ProbeEvery <= 0 {
 		return 10 * time.Second
@@ -209,5 +210,6 @@ type boardAdapter struct {
 	fn   func() ([]SectorInfo, error)
 }
 
+// boardAdapter 的接口方法：Name 返回源名，Sectors 调用注入的拉取函数。
 func (b boardAdapter) Name() string                   { return b.name }
 func (b boardAdapter) Sectors() ([]SectorInfo, error) { return b.fn() }

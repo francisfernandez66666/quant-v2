@@ -45,6 +45,7 @@ func FromBook(ob *OrderBook) OrderLevels {
 	return OrderLevels{BidVols: bid, AskVols: ask}
 }
 
+// sumF 浮点切片求和。
 func sumF(xs []float64) float64 {
 	var s float64
 	for _, v := range xs {
@@ -96,6 +97,7 @@ func ComputeOrderFlow(cur OrderLevels, prev *OrderLevels) OrderFlow {
 	return of
 }
 
+// firstOrZero 取首元素，空切片回 0。
 func firstOrZero(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0

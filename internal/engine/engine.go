@@ -5163,6 +5163,7 @@ func (e *Engine) SignalQualityWeight(tactic, sector, newsType, phase string) flo
 	return tb.Weight(research.MakeQualityKey(tactic, sector, newsType, phase))
 }
 
+// signalQualityTable 按 DynWeight 开关返回信号质量表；开关关闭返回 nil（不参与权重）。
 func (e *Engine) signalQualityTable() *research.SignalQualityTable {
 	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.DynWeight }) {
 		return nil

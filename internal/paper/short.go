@@ -97,6 +97,7 @@ func (e *Engine) ShortBookEnabled() bool {
 	return e.shortBookEnabledLocked()
 }
 
+// shortBookEnabledLocked 调用方持锁下判断做空账本是否启用（总开关+做空开关+有空头资金）。
 func (e *Engine) shortBookEnabledLocked() bool {
 	return e.cfg.Enabled && e.cfg.ShortEnabled && e.cfg.ShortCapital > 0
 }

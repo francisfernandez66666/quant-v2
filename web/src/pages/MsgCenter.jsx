@@ -163,6 +163,7 @@ export default function MsgCenter() {
     setReviewing(true)
     try {
       const r = await api.reviewPositions()
+      // 本次复盘完成只数
       const n = (r && typeof r.reviewed === 'number') ? r.reviewed : 0
       if (n > 0) { MessagePlugin.success(`复盘完成：${n} 只`); setActiveFilter('review') }
       else MessagePlugin.info('本次未生成复盘（无可复盘标的或数据不足）')

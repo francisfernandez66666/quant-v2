@@ -43,6 +43,7 @@ let PRICE_DOWN = '#16a34a' // 下跌绿
 function refreshPalette() {
   if (typeof document === 'undefined' || typeof getComputedStyle !== 'function') return
   const s = getComputedStyle(document.documentElement)
+  // 读 CSS 变量色，缺失回退默认值
   const g = (name, fb) => { const v = (s.getPropertyValue(name) || '').trim(); return v || fb }
   C.bg = g('--app-chart-bg', C.bg)
   C.grid = g('--app-chart-grid', C.grid)

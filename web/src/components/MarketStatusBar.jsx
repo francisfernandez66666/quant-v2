@@ -35,6 +35,7 @@ const RISK_STYLE = {
 // 全站顶部市场状态条：当前情绪相位 + 风险档 + 涨跌广度一行速览（SSE 驱动）。
 export default function MarketStatusBar({ env }) {
   if (!env) return null
+  // 情绪/市场状态/风险档位文本（去首尾空白）
   const emotion = (env.emotion || '').trim()
   const state = (env.marketState || '').trim()
   const risk = (env.riskTier || '').trim()

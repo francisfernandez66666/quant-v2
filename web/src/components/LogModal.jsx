@@ -22,6 +22,7 @@ function fmtTime(t) {
  * @param {string} q 关键词
  * @returns {boolean}
  */
+// 关键词大小写不敏感包含匹配
 function hasText(text, q) {
   if (!text || !q) return false
   return String(text).toUpperCase().includes(q)
@@ -33,6 +34,7 @@ function hasText(text, q) {
  * @param {string} q 关键词
  * @returns {boolean}
  */
+// 事件是否命中搜索词（标题/正文/个股）
 function eventHit(ev, q) {
   if (!ev) return false
   if (hasText(ev.title, q)) return true
@@ -49,6 +51,7 @@ function eventHit(ev, q) {
  * @param {string} q 关键词
  * @returns {boolean}
  */
+// 信号是否命中搜索词（代码/名称/理由）
 function sigHit(sg, q) {
   if (!sg) return false
   if (hasText(sg.code, q)) return true

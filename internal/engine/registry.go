@@ -986,6 +986,34 @@ func (r *Registry) Len() int {
 	return len(seen)
 }
 
+// SetLLMClient 热替换全局 LLM 客户端（设置页保存配置时调用）。
+// 三处一并更新：① 注册表依赖模板 opts.LLMClient —— 之后懒加载新建的引擎用新客户端；
+// ② 共享新闻归因代理 NewsAgent —— 归因主链路（Stage0/1/2）真正用的就是它；
+// ③ 全部存活引擎实例。
+// §UI-AUTHORITATIVE 修复（2026-09-14）：此前 main 的 llmRecreate 回调只遍历【当时存活】
+// 的引擎，注册表为空（无人登录/盘后回收）或保存后又新建账号引擎时，UI 保存的配置被静默
+// 旁路——表现为"设置页保存了但归因仍走旧模型"。
+// English: hot-swaps the shared LLM client across the registry template (so future lazily
+// built engines pick it up), the shared news agent (the real attribution path), and all
+// live engines — previously only live engines were updated, silently bypassing the UI save.
+func (r *Registry) SetLLMClient(c *llm.Client) {
+	r.mu.Lock()
+	r.opts.LLMClient = c // 模板更新：后续 GetOrBuild 新建引擎直接带新客户端
+	na := r.opts.NewsAgent
+	cores := make([]*Engine, 0, len(r.cores))
+	for _, e := range r.cores {
+		cores = append(cores, e)
+	}
+	r.mu.Unlock()
+	// 锁外分发：引擎/代理内部各自持锁，避免与本锁形成嵌套
+	if na != nil {
+		na.SetLLMClient(c)
+	}
+	for _, e := range cores {
+		e.SetLLMClient(c)
+	}
+}
+
 // All 返回所有已创建的计算引擎（共享引擎去重，用于主循环/打分循环驱动）。
 // English: returns all created compute engines (shared engines deduplicated), for the main/scoring
 // loops to drive.

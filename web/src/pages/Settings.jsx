@@ -275,6 +275,7 @@ export default function Settings() {
   const anyDirty = llmDirty || strategyDirty
   useEffect(() => {
     if (!anyDirty) return
+    // beforeunload 拦截：存在未保存修改时提示浏览器挽留
     const h = (e) => { e.preventDefault(); e.returnValue = '' }
     window.addEventListener('beforeunload', h)
     return () => window.removeEventListener('beforeunload', h)

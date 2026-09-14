@@ -17,6 +17,7 @@ import (
 	"quant-trading-v2/internal/commentcheck"
 )
 
+// main 注释门禁入口：--thr 连续无注释行阈值，扫描 cmd/internal 全部 Go 源码。
 func main() {
 	thr := flag.Int("thr", 15, "连续无注释行阈值")
 	flag.Parse()

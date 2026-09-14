@@ -44,6 +44,7 @@ export default function SentimentCard() {
   const [matrix, setMatrix] = useState(null)
   const [matrixErr, setMatrixErr] = useState('')
 
+  // 展开/收起情绪×战法矩阵，首次展开时拉数据
   function toggleMatrix() {
     const next = !matrixOpen
     setMatrixOpen(next)
@@ -190,12 +191,14 @@ export default function SentimentCard() {
                           <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>{row.kind}</span>
                         </td>
                         {['冰点', '启动', '发酵', '高潮', '退潮'].map((p) => {
+                          // 行内定位当前阶段的单元格
                           const cell = (row.cells || []).find((c) => c.phase === p)
                           if (!cell) return <td key={p} style={{ padding: '4px 8px', textAlign: 'center', color: 'var(--app-muted-2)' }}>—</td>
                           // 格值：主 horizon（最右列）平均超额；hover 出全 horizon + 命中率
                           // 后端 hit_rate 为 0-1 比例（chain.go:465 wins/n），展示乘 100
                           const hz = (row.horizons || []).slice(-1)[0]
                           const v = cell.avg_excess && cell.avg_excess[hz]
+                          // hover 提示：各持仓周期平均超额一览
                           const tip = (row.horizons || []).map((h) => 'H' + h + ': ' + fmtPct(cell.avg_excess && cell.avg_excess[h]) + ' /命中 ' + (cell.hit_rate && cell.hit_rate[h] != null ? (cell.hit_rate[h] * 100).toFixed(0) + '%' : '—')).join('\n')
                           return (
                             <td

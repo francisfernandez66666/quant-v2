@@ -15,6 +15,7 @@ export function filterCommands(items, query) {
   if (!q) return items.map((it) => ({ item: it, score: 0 }))
   const out = []
   for (const it of items) {
+    // 命令名小写化，供模糊匹配
     const label = (it.label || '').toLowerCase()
     const hay = label + ' ' + (it.hint || '').toLowerCase()
     // 优先完全子串（score 高），否则子序列匹配
@@ -58,6 +59,7 @@ export default function CommandPalette({ pages = [], onOpenStock, onClose }) {
   useEffect(() => { setActive(0) }, [query])
   useEffect(() => { inputRef.current && inputRef.current.focus() }, [])
 
+  // 键盘导航：Esc 关闭、上下移高亮、回车执行选中命令
   function onKeyDown(e) {
     if (e.key === 'Escape') { e.preventDefault(); onClose() }
     else if (e.key === 'ArrowDown') { e.preventDefault(); setActive((a) => Math.min(results.length - 1, a + 1)) }

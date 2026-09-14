@@ -16,6 +16,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// cmdRiskDailyBackfill 子命令：历史区间补算风险日评分（--dry 试算 / --force 覆盖权威行）。
 func cmdRiskDailyBackfill(db *store.DB, start, end string, args []string) {
 	fs := flag.NewFlagSet("risk-daily-backfill", flag.ExitOnError)
 	dry := fs.Bool("dry", false, "只打印不落库")
