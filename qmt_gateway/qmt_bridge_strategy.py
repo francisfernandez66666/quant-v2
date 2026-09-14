@@ -32,8 +32,11 @@ CMD_POLL_SEC = 2
 def _trace(msg):
     try:
         import time as _t
-        f = open(TRACE_PATH, "a")
-        f.write(_t.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+        line = _t.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n"
+        # FIX 2026-09-14: sandbox default text encoding is GBK; the gateway sidecar
+        # reads this file back as UTF-8. Always write explicit UTF-8 bytes.
+        f = open(TRACE_PATH, "ab")
+        f.write(line.encode("utf-8", errors="replace"))
         f.close()
     except Exception:
         pass
@@ -53,8 +56,11 @@ def _report(payload):
                 os.remove(REPORT_PATH)
             except Exception:
                 pass
-        fp = open(REPORT_PATH, "a")
-        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        fp = open(REPORT_PATH, "ab")
+        # FIX 2026-09-14 GBK incident: Chinese names/positions written by the sandbox
+        # defaulted to GBK while the gateway sidecar decodes UTF-8 -> mojibake in the
+        # engine ledger. ensure_ascii=True escapes every non-ASCII char, encoding-proof.
+        fp.write((json.dumps(payload, ensure_ascii=True) + "\n").encode("ascii", errors="replace"))
         fp.close()
         return True
     except Exception as e:
@@ -75,7 +81,7 @@ def _xtc_safe():
     """module-level xtconstant access with import-fallback (no env -> zeros)."""
     try:
         from xtquant import xtconstant as xtc
-        return xtconstant
+        return xtc
     except Exception:
         return None
 
@@ -108,6 +114,12 @@ def _expect_suffix(code):
 
 
 BUY_CONST_FALLBACK, SELL_CONST_FALLBACK = 23, 24
+# FIX 2026-09-14 drill-3: BUY/SELL were referenced but never defined since the
+# dry-run port -- the first REAL order died with NameError (sandbox has no
+# xtquant, place() only hits the name on the live path). Contract values match
+# broker.py Chinese side ("buy"/"sell" in utf-8), same as orders/fills ledger.
+# Written as unicode escapes to keep the file pure ASCII (sandbox taboo 3).
+BUY, SELL = "\u4e70\u5165", "\u5356\u51fa"
 
 
 class _XtOps:
@@ -127,6 +139,9 @@ class _XtOps:
         self._acc = None
         self._xtc = _xtc_safe()
         self._embed_ok = None  # None=not probed (2026-09-11: sandbox builtin API first)
+        self._acct_type_ok = None  # FIX 2026-09-14: set by probe_embed on first success;
+                                   # _gtdd read it unconditionally -> AttributeError on
+                                   # every order/position/trade query when it was missing.
         self._ctx = None       # QMT ContextInfo injected by init()
         # passorder slots differ across broker builds -> fully configurable,
         # defaults follow the classic DGZQ QMT convention.
@@ -200,7 +215,9 @@ class _XtOps:
                     names.append(n)
         except Exception:
             pass
-        _trace("embed trade fns: %s" % ",".join(sorted(names)))
+        if not getattr(self, "_probe_fns", None):
+            self._probe_fns = sorted(names)
+        _trace("embed trade fns: %s" % ",".join(self._probe_fns))
         gtdd = self._builtin("get_trade_detail_data")
         po = self._builtin("passorder")
         if not (gtdd and po):
@@ -220,7 +237,10 @@ class _XtOps:
                 return True
         # API present but ACCOUNT momentarily empty (session still syncing) -> stay builtin
         self._embed_ok = True
-        _trace("embed probe: API present, ACCOUNT empty -- keep builtin, retry each cycle")
+        self._probe_empty = getattr(self, "_probe_empty", 0) + 1
+        if self._probe_empty <= 1 or self._probe_empty % 10 == 0:
+            _trace("embed probe: API present, ACCOUNT empty -- keep builtin (n=%d)"
+                   % self._probe_empty)
         return True
 
     def embed_usable(self):
@@ -272,7 +292,29 @@ class _XtOps:
             if qty <= 0 or not code:
                 continue
             open_p = float(getattr(p, "m_dOpenPrice", 0) or getattr(p, "open_price", 0) or 0)
-            mv = float(getattr(p, "m_dBalance", 0) or getattr(p, "market_value", 0) or 0)
+            # FIX 2026-09-14: m_dBalance alone reads 0 on this build -> every snapshot
+            # carried amount=0 and the engine header showed total pnl = -total_cost
+            # (-113,927 for a ~-1k drawdown). Try the full field family, then estimate
+            # qty*last so the ledger always has a usable market value.
+            mv = 0.0
+            for attr in ("m_dBalance", "m_dMarketValue", "m_dInstrumentValue",
+                         "m_dPositionValue", "market_value"):
+                try:
+                    mv = float(getattr(p, attr, 0) or 0)
+                except Exception:
+                    mv = 0.0
+                if mv > 0:
+                    break
+            if mv <= 0:
+                last = 0.0
+                for attr in ("m_dLastPrice", "m_dInstrumentLastPrice", "last_price", "price"):
+                    try:
+                        last = float(getattr(p, attr, 0) or 0)
+                    except Exception:
+                        last = 0.0
+                    if last > 0:
+                        break
+                mv = last * qty
             out.append({
                 "ts_code": code,
                 "name": str(getattr(p, "m_strInstrumentName", "") or getattr(p, "name", "") or ""),
@@ -296,7 +338,18 @@ class _XtOps:
             price = float(getattr(t, "m_dPrice", 0) or getattr(t, "traded_price", 0) or 0)
             qty = int(getattr(t, "m_nVolume", 0) or getattr(t, "traded_volume", 0) or 0)
             ot = int(getattr(t, "m_nOrderType", 0) or getattr(t, "order_type", 0) or 0)
-            if ot == self.op_buy:
+            # FIX 2026-09-14 drill-3: DEAL rows carry m_nDirection=48/49 (ASCII
+            # '0'/'1') while m_nOrderType uses the counter's own codes -- the old
+            # mapping fell through to SELL on a real BUY fill. Direction first.
+            try:
+                drc = int(getattr(t, "m_nDirection", -1))
+            except (TypeError, ValueError):
+                drc = -1
+            if drc in (0, 48):
+                side = BUY
+            elif drc in (49, 1):
+                side = SELL
+            elif ot == self.op_buy:
                 side = BUY
             elif ot == self.op_sell:
                 side = SELL
@@ -329,25 +382,49 @@ class _XtOps:
         c6 = "%s.%s" % (head, expect)
         side = str(req.get("side", "") or "")
         op_type = self.op_buy if side == BUY else self.op_sell
-        ptype = self.pr_limit if str(req.get("price_type", "")).lower() == "limit" else self.pr_market
-        price = float(req.get("price", 0) or 0)
+        is_limit = str(req.get("price_type", "") or "").lower() == "limit"
+        ptype = self.pr_limit if is_limit else self.pr_market
+        price = float(req.get("price", 0) or 0) if is_limit else -1.0
         qty = int(req.get("qty", 0) or 0)
-        # official sandbox signature: passorder(opType, orderType, accountid, orderCode,
-        # prType, modelprice, volume[, ContextInfo]) -- 7 or 8 args by build
-        args7 = (op_type, self.order_type, self._embed_acct(), c6, ptype, price, qty)
-        try:
-            if self._ctx is not None:
-                try:
-                    po(*(args7 + (self._ctx,)))
-                except TypeError:
-                    po(*args7)
-            else:
-                po(*args7)
+        signal_id = str(req.get("signal_id", "") or "")[:24]
+        _trace("embed place side=%s op=%s limit=%s ptype=%s price=%s qty=%s sid=%s" % (
+            ascii(side), op_type, is_limit, ptype, price, qty, signal_id))
+        if not po:
+            return False, "", "builtin passorder unavailable"
+        # FIX 2026-09-14 drill-3: the 7-positional call left quickOrder at its
+        # default 0 (K-line mode) -> the client skipped every submission with
+        # "model not initialized yet" and NOTHING reached the counter. Official signature:
+        # passorder(opType, orderType, accountid, orderCode, prType, price,
+        #           volume, strategyName, quickOrder, userOrderId, ContextInfo)
+        # quickOrder=1 => submit immediately, independent of bar/init. Ladder:
+        # ladder keeps older builds (7/8 args) working via TypeError fallback.
+        core = (op_type, self.order_type, self._embed_acct(), c6, ptype, price, qty)
+        attempts = [
+            core + ("qmt_bridge", 2, signal_id, self._ctx),
+            core + ("qmt_bridge", 2, signal_id),
+            core + ("qmt_bridge", 1, signal_id, self._ctx),
+            core + ("qmt_bridge", 1, signal_id),
+            core + ("qmt_bridge", 1),
+            core + ("qmt_bridge",),
+            core,
+        ]
+        last_err = None
+        for args in attempts:
+            if len(args) == 11 and self._ctx is None:
+                continue
+            try:
+                po(*args)
+            except TypeError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                _trace("embed passorder error (n=%d): %s" % (len(args), repr(e)))
+                return False, "", "passorder error: %s" % e
             self._last_place = (head, op_type, price, qty, time.time())
+            _trace("passorder ok n_args=%d" % len(args))
             return True, "", ""
-        except Exception as e:
-            _trace("embed passorder error: " + repr(e))
-            return False, "", "passorder error: %s" % e
+        _trace("embed passorder all arities failed: %s" % repr(last_err))
+        return False, "", "passorder arity fail: %s" % last_err
 
     def embed_cancel(self, exchange_order_id, code=""):
         ca = self._builtin("cancel")
@@ -366,16 +443,31 @@ class _XtOps:
                 return False, "cancel error: %s" % e
         return False, "builtin cancel unavailable"
 
-    def embed_resolve(self, req, timeout_sec=8.0):
-        """poll ORDER for the just-placed order -> m_strOrderSysID. No userOrderId in
-        this build -> match by fingerprint (code/op/price/qty), first unclaimed row."""
-        code6 = str((req.get("code") or "").split(".")[0])
+    def embed_resolve(self, req, signal_id="", timeout_sec=8.0):
+        """poll ORDER for the just-placed order -> m_strOrderSysID. Prefer the remark
+        we submit as userOrderId (exact); fall back to fingerprint match (code/op/
+        price/qty, first unclaimed row). Defensive: legacy callers passed a bare
+        signal_id string here -- normalize instead of crashing (2026-09-14 storm)."""
+        sig = ""
+        if isinstance(req, dict):
+            code6 = str((req.get("code") or "").split(".")[0])
+            sig = str(req.get("signal_id", "") or "")
+        else:
+            sig = str(req or "")
+            code6 = ""
+        sig = str(signal_id or sig or "")
         _head, _op, _price, _qty, t0 = self._last_place or (code6, 0, 0.0, 0, time.time() - 5)
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             for o in self.embed_orders():
+                remark = str(getattr(o, "m_strRemark", "") or getattr(o, "order_remark", "")
+                             or getattr(o, "remark", "") or "")
                 c = str(getattr(o, "m_strInstrumentID", "") or getattr(o, "code", "") or "")
-                if c and c != code6:
+                if sig and remark == sig:
+                    oid = str(getattr(o, "m_strOrderSysID", "") or getattr(o, "order_id", "") or "")
+                    if oid:
+                        return oid
+                if code6 and c and c != code6:
                     continue
                 ot = int(getattr(o, "m_nOrderType", 0) or 0)
                 if _op and ot and ot != _op:
@@ -470,23 +562,32 @@ class _XtOps:
     def resolve_order_id(self, signal_id, pending_ref, req=None):
         """poll orders by order_remark(signal_id) -> exchange order id (for gateway
         seq->exchange mapping and later cancels). dry_run keeps the dry ref."""
-        if self.dry_run or not signal_id:
-            return pending_ref
-        if self.embed_usable():
-            oid = self.embed_resolve(signal_id)
-            return oid or pending_ref
-        for _ in range(3):
-            try:
-                orders = self._trader.query_stock_orders(self._acc) or []
-            except Exception:
+        # FIX 2026-09-14 drill-3: the embed call used to pass signal_id (a string)
+        # into embed_resolve(req) -> AttributeError on req.get("code") -> the whole
+        # _handle_cmd body after place() died before _report/_record_seen, so the
+        # gateway never got a result and the bridge re-PLACED the order every poll
+        # (~220 submissions in 4 min -- counter-side storm, caught by quickTrade=0
+        # only because none of them reached the exchange). Never trust callers.
+        try:
+            if self.dry_run or not signal_id:
                 return pending_ref
-            for o in orders:
-                remark = str(getattr(o, "order_remark", "") or getattr(o, "remark", "") or "")
-                if remark == signal_id:
-                    oid = str(getattr(o, "order_id", "") or "")
-                    if oid:
-                        return oid
-            time.sleep(1.0)
+            if self.embed_usable():
+                oid = self.embed_resolve(req or {}, signal_id)
+                return oid or pending_ref
+            for _ in range(3):
+                try:
+                    orders = self._trader.query_stock_orders(self._acc) or []
+                except Exception:
+                    return pending_ref
+                for o in orders:
+                    remark = str(getattr(o, "order_remark", "") or getattr(o, "remark", "") or "")
+                    if remark == signal_id:
+                        oid = str(getattr(o, "order_id", "") or "")
+                        if oid:
+                            return oid
+                time.sleep(1.0)
+        except Exception as e:
+            _trace("resolve_order_id error: " + repr(e))
         return pending_ref
 
     def cancel(self, seq, exchange_order_id, code=""):
@@ -680,130 +781,182 @@ def _handle_cmd(cmd, seen):
     if not seq or seq in seen:
         return False
     _trace("cmd kind=%s seq=%s" % (kind, seq))
-    if kind == "order":
-        try:
-            ok, order_id, err = _xt().place(cmd)
-        except Exception as e:
-            _trace("place error: " + repr(e))
-            ok, order_id, err = False, "", "place error: %s" % e
-        if ok:
-            # poll exchange order id so gateway can map seq->exchange id (for cancels)
-            order_id = _xt().resolve_order_id(str(cmd.get("signal_id", "")), order_id)
-        _report({"type": "order_result", "seq": seq, "ok": ok,
-                 "order_id": order_id, "err": err})
-        _trace("order_result seq=%s ok=%s oid=%s" % (seq, ok, order_id))
-    elif kind == "cancel":
-        try:
-            ok, err = _xt().cancel(seq, cmd.get("order_id"), cmd.get("code"))
-        except Exception as e:
-            _trace("cancel error: " + repr(e))
-            ok, err = False, "cancel error: %s" % e
-        _report({"type": "cancel_result", "seq": seq, "ok": bool(ok), "err": err})
-        _trace("cancel_result seq=%s ok=%s" % (seq, ok))
-    else:
-        # unknown kind: negative-ack so gateway can settle it rather than hang inflight
-        _report({"type": "order_result", "seq": seq, "ok": False,
-                 "order_id": "", "err": "unknown kind: %s" % kind})
+    # FIX 2026-09-14 drill-3: dedupe is registered BEFORE execution. A crash after
+    # the order actually left the bridge must NOT make the bridge re-place it every
+    # poll (old order: 221 duplicate submissions in ~4 minutes). Worst case of
+    # record-first is a stuck-inflight row -- recoverable by ops; a duplicated
+    # real order is not.
     _record_seen(seq)
+    seen.add(seq)
+    try:
+        if kind == "order":
+            try:
+                ok, order_id, err = _xt().place(cmd)
+            except Exception as e:
+                _trace("place error: " + repr(e))
+                ok, order_id, err = False, "", "place error: %s" % e
+            if ok:
+                # poll exchange order id so gateway can map seq->exchange id (for cancels)
+                try:
+                    order_id = _xt().resolve_order_id(str(cmd.get("signal_id", "")),
+                                                      order_id, cmd)
+                except Exception as e:
+                    _trace("resolve error (kept seq ref): " + repr(e))
+            _report({"type": "order_result", "seq": seq, "ok": ok,
+                     "order_id": order_id, "err": err})
+            _trace("order_result seq=%s ok=%s oid=%s" % (seq, ok, order_id))
+        elif kind == "cancel":
+            try:
+                ok, err = _xt().cancel(seq, cmd.get("order_id"), cmd.get("code"))
+            except Exception as e:
+                _trace("cancel error: " + repr(e))
+                ok, err = False, "cancel error: %s" % e
+            _report({"type": "cancel_result", "seq": seq, "ok": bool(ok), "err": err})
+            _trace("cancel_result seq=%s ok=%s" % (seq, ok))
+        elif kind == "diag":
+            # ops diagnostic: raw dump of trade-detail tables for the live session
+            dump = {}
+            adapter = _xt()
+            for table in ("ACCOUNT", "POSITION", "ORDER", "DEAL"):
+                try:
+                    rows = adapter._gtdd(table)
+                    e0 = {}
+                    if rows:
+                        p0 = rows[0]
+                        for a in dir(p0):
+                            if a.startswith("_"):
+                                continue
+                            try:
+                                v = getattr(p0, a)
+                                if callable(v):
+                                    continue
+                                e0[a] = str(v)[:40]
+                            except Exception:
+                                pass
+                    dump[table] = {"n": len(rows), "first": e0}
+                except Exception as e:
+                    dump[table] = {"err": repr(e)}
+            _report({"type": "diag", "seq": seq, "dump": dump})
+            _trace("diag done: " + ",".join("%s=%s" % (k, dump[k].get("n", dump[k].get("err"))) for k in dump))
+        else:
+            # unknown kind: negative-ack so gateway can settle it rather than hang inflight
+            _report({"type": "order_result", "seq": seq, "ok": False,
+                     "order_id": "", "err": "unknown kind: %s" % kind})
+    except Exception as e:
+        _trace("handle_cmd fatal seq=%s: %s" % (seq, repr(e)))
+        try:
+            _report({"type": "order_result", "seq": seq, "ok": False,
+                     "order_id": "", "err": "bridge internal error: %s" % e})
+        except Exception:
+            pass
     return True
 
 
-def run_forever():
-    import json
-    cfg = _read_cfg()
-    _trace("cfg loaded: dry=" + str(cfg.get("dry_run")))
+_TICK = {"cfg": None, "seen": None, "last_cmd_ts": 0.0, "n": 0,
+         "last_pos": 0.0, "last_hb": 0.0, "pos_sec": 30.0, "hb_sec": 5.0}
+
+
+def _bridge_tick():
+    """FIX 2026-09-14 drill-3 round 3: get_trade_detail_data only returns rows on
+    the model MAIN thread (init/handlebar callbacks). A background worker thread
+    saw ACCOUNT/POSITION/ORDER/DEAL empty FOREVER (diag dump n=0 x4 while the
+    account was logged in and an order had already filled on the counter), while
+    the same queries worked from the blocking-init main thread all morning. The
+    bridge therefore now runs ENTIRELY inline on the handlebar tick (~3s cadence
+    observed live) and the worker thread is retired -- which also kills the
+    thread-freeze-across-session-breaks failure mode. English: everything runs on
+    QMT's main callback thread; gtdd data is only visible there."""
+    st = _TICK
+    if st["cfg"] is None:
+        cfg = _read_cfg()
+        st["cfg"] = cfg
+        st["pos_sec"] = float(cfg.get("positions_sec", 30.0) or 30.0)
+        st["hb_sec"] = float(cfg.get("heartbeat_sec", 5.0) or 5.0)
+        _trace("cfg loaded: dry=" + str(cfg.get("dry_run")))
+    if st["seen"] is None:
+        st["seen"] = _load_seen()
+        _trace("seen seqs loaded: %d" % len(st["seen"]))
+    cfg = st["cfg"]
+    seen = st["seen"]
+    st["n"] += 1
+    now = time.time()
+    # 1) heartbeat (gateway drives queued_connected from this)
+    if now - st["last_hb"] >= st["hb_sec"]:
+        st["last_hb"] = now
+        try:
+            _report({"type": "heartbeat",
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                     "n": st["n"]})
+        except Exception as e:
+            _trace("report fail: " + repr(e))
+    # 2) commands (ts-gated + per-seq dedup; bridge_seen.jsonl reload on restart)
+    try:
+        csize = os.path.getsize(CMD_PATH)
+    except Exception:
+        csize = 0
+    if csize > 0:
+        try:
+            data = _load_cmds()
+            cts = float(data.get("ts", 0) or 0)
+            cmds = data.get("cmds") or []
+            if cts > st["last_cmd_ts"]:
+                st["last_cmd_ts"] = cts
+            else:
+                # FIX 2026-09-14 drill-3: gateway clock once jumped ahead (9/11
+                # file carried ts=2026-09-23); a cached future ts then silently
+                # gate-locked every real order after it. ts is change-detection
+                # only -- unknown seqs must still be handled (seen dedupe keeps
+                # this idempotent).
+                cmds = [c for c in cmds if str(c.get("seq", "")) not in seen]
+            for c in cmds:
+                handled = _handle_cmd(c, seen)
+                if handled and c.get("seq"):
+                    seen.add(str(c.get("seq")))
+        except Exception as e:
+            _trace("cmd parse fail: " + repr(e))
+    # 3) positions / asset / trades periodic snapshots -- main-thread gtdd only.
+    if now - st["last_pos"] >= st["pos_sec"]:
+        st["last_pos"] = now
+        adapter = _xt()
+        try:
+            poss = adapter.query_positions()
+            if poss:
+                _report({"type": "positions", "positions": poss})
+            else:
+                _trace("empty positions snapshot (session not synced?)")
+        except Exception as e:
+            _trace("positions snapshot error: " + repr(e))
+        try:
+            asset = adapter.query_asset()
+            if asset:
+                _report({"type": "account", "asset": asset})
+        except Exception as e:
+            _trace("asset snapshot error: " + repr(e))
+        try:
+            for trow in adapter.query_trades():
+                _report({"type": "trade", **trow})
+        except Exception as e:
+            _trace("trades snapshot error: " + repr(e))
+
+
+def init(ContextInfo):
+    _trace("init called (handlebar-tick mode)")
+    try:
+        _xt()._ctx = ContextInfo
+    except Exception as e:
+        _trace("ctx inject fail: " + repr(e))
     try:
         _xt().probe_embed()
     except Exception as e:
         _trace("probe error: " + repr(e))
-    seen = _load_seen()
-    _trace("seen seqs loaded: %d" % len(seen))
-    last_cmd_ts = 0.0
-    n = 0
-    last_pos = 0.0
-    last_hb = 0.0
-    pos_sec = float(cfg.get("positions_sec", 30.0) or 30.0)
-    hb_sec = float(cfg.get("heartbeat_sec", 5.0) or 5.0)
-    poll = float(cfg.get("poll_sec", 1.0) or 1.0)
-    adapter = _xt()
-    while True:
-        n += 1
-        now = time.time()
-        # 1) heartbeat (gateway drives queued_connected from this)
-        if now - last_hb >= hb_sec:
-            last_hb = now
-            try:
-                ev = json.dumps({"type": "heartbeat",
-                                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
-                                 "n": n}, ensure_ascii=False)
-                fp = open(REPORT_PATH, "a")
-                fp.write(ev + "\n")
-                fp.close()
-            except Exception as e:
-                _trace("report fail: " + repr(e))
-        # 2) commands (ts-gated + per-seq dedup; bridge_seen.jsonl reload on restart)
-        try:
-            csize = os.path.getsize(CMD_PATH)
-        except Exception:
-            csize = 0
-        if csize > 0:
-            try:
-                data = _load_cmds()
-                cts = float(data.get("ts", 0) or 0)
-                if cts > last_cmd_ts:
-                    last_cmd_ts = cts
-                    for c in (data.get("cmds") or []):
-                        handled = _handle_cmd(c, seen)
-                        if handled and c.get("seq"):
-                            seen.add(str(c.get("seq")))
-            except Exception as e:
-                _trace("cmd parse fail: " + repr(e))
-        # 3) positions / asset / trades periodic snapshots -- the core channel that
-        #    refills the engine real-book (positions reconcile) and account cash display.
-        if now - last_pos >= pos_sec:
-            last_pos = now
-            try:
-                poss = adapter.query_positions()
-                if poss:
-                    _report({"type": "positions", "positions": poss})
-                else:
-                    _trace("empty positions snapshot (session not synced?)")
-            except Exception as e:
-                _trace("positions snapshot error: " + repr(e))
-            try:
-                asset = adapter.query_asset()
-                if asset:
-                    _report({"type": "account", "asset": asset})
-            except Exception as e:
-                _trace("asset snapshot error: " + repr(e))
-            try:
-                for trow in adapter.query_trades():
-                    _report({"type": "trade", **trow})
-            except Exception as e:
-                _trace("trades snapshot error: " + repr(e))
-        time.sleep(poll)
-
-
-def run_forever_safe():
-    try:
-        run_forever()
-    except Exception as e:
-        _trace("EXCEPTION in run_forever: " + repr(e))
-
-
-def init(ContextInfo):
-    """Blocking init: loop forever HERE (sandbox daemon threads were being reaped
-    right after init returned; blocking guarantees the loop's lifetime)."""
-    _trace("init called (blocking cmdline loop)")
-    try:
-        try:
-            _xt()._ctx = ContextInfo
-        except Exception as e:
-            _trace("ctx inject fail: " + repr(e))
-        run_forever()
-    except Exception as e:
-        _trace("EXCEPTION in init loop: " + repr(e))
 
 
 def handlebar(ContextInfo):
-    return
+    try:
+        _xt()._ctx = ContextInfo
+    except Exception:
+        pass
+    try:
+        _bridge_tick()
+    except Exception as e:
+        _trace("tick fatal: " + repr(e))

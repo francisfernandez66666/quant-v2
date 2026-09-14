@@ -602,6 +602,20 @@ class Store:
             self._conn.commit()
             return seq
 
+    def dispatch_enqueue_diag(self, signal_id="", user_id=""):
+        """运维诊断项：让桥对交易明细表做一次原始 dump（无 code/qty 语义）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO dispatch(seq, signal_id, kind, status, created_at, user_id)
+                   VALUES(?,?,?,?, ?, ?)""",
+                ("", str(signal_id or ("DIAG-%d" % int(time.time()))), "diag",
+                 "pending", _now_cn(), user_id))
+            rowid = cur.lastrowid
+            seq = "seq:%d" % rowid
+            self._conn.execute("UPDATE dispatch SET seq=? WHERE id=?", (seq, rowid))
+            self._conn.commit()
+            return seq
+
     def dispatch_get(self, seq):
         """按 seq 查派发项（含结果）。不存在返回 None。"""
         with self._lock:
@@ -627,6 +641,18 @@ class Store:
             for r in rows:
                 self._conn.execute("UPDATE dispatch SET status = 'inflight' WHERE id = ?", (r["id"],))
             self._conn.commit()
+            return [dict(r) for r in rows]
+
+    def dispatch_inflight(self, limit=50):
+        """inflight（已派发未结算）派发项快照（不改状态）。§2026-09-14 演练③：
+        file 桥空推时把 cmd 文件同步为「仅 inflight」，done 残留即清，
+        杜绝桥重启重放老单（重复下单），同时保留桥掉线期间未消费单的续跑能力。
+        English: read-only inflight snapshot for cmd-file reconciliation.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dispatch WHERE status = 'inflight' ORDER BY id LIMIT ?",
+                (limit,)).fetchall()
             return [dict(r) for r in rows]
 
     def dispatch_set_result(self, seq, result):

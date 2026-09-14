@@ -679,12 +679,18 @@ export default function Quant() {
         </span>
       </>
     ) : <Tag theme="success">正常</Tag>
-    // 下行探测（quant→gateway 连通性）：在线态 + 延迟 + 最近探测时间
+    // 下行探测（quant→gateway 连通性）：在线态 + 延迟 + 最近探测时间。
+    // 零值时间戳（0001-…/缺失）= 引擎自启动还没探过测（探测只在交易时段随建议循环跑，
+    // 见 scoring_loop pushRealAdvice 的 IsActiveSession 门）——休市属正常，
+    // 不能报"失联"（与真断线告警混淆）。
+    const probeNever = !state.last_probe_at || String(state.last_probe_at).startsWith('0001-')
     const probe = (
       <span style={{ fontSize: 12 }}>
-        {state.last_probe_ok ? <Tag theme="success">连通</Tag> : <Tag theme="danger">失联</Tag>}
-        {typeof state.last_latency_ms === 'number' ? <span style={{ marginLeft: 8 }}>延迟 {state.last_latency_ms}ms</span> : null}
-        {state.last_probe_at ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>· {state.last_probe_at}</span> : null}
+        {probeNever
+          ? <Tag theme="default" title="下行探测仅在交易时段运行；休市/刚重启后无探测记录属正常">休市未探测</Tag>
+          : (state.last_probe_ok ? <Tag theme="success">连通</Tag> : <Tag theme="danger">失联</Tag>)}
+        {!probeNever && typeof state.last_latency_ms === 'number' ? <span style={{ marginLeft: 8 }}>延迟 {state.last_latency_ms}ms</span> : null}
+        {!probeNever && state.last_probe_at ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>· {state.last_probe_at}</span> : null}
       </span>
     )
     // 上行回报（gateway→quant 心跳/成交回执）新鲜度

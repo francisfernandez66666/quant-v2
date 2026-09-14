@@ -77,7 +77,8 @@ class TestFileBridge(unittest.TestCase):
             self.assertEqual(len(cmds), 1)
             self.assertEqual(str(cmds[0].get("kind")), "order")
             self.assertEqual(cmds[0].get("signal_id"), "FB1")
-            # 再推一次：pending 已被取走（inflight），不会重复推送
+            # 再推一次：pending 已被取走（inflight），不重复推送、也不清空
+            # （inflight 未结算的指令必须留在文件里，桥重启后才能续跑）。
             gw._file_bridge_push_pending()
             with open(cmd_path, "rb") as f:
                 data = json.loads(f.read().decode("utf-8"))

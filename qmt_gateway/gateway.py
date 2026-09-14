@@ -270,21 +270,21 @@ class Gateway:
         except Exception:  # noqa: BLE001
             log.exception("[file-bridge] dispatch_pending failed")
             return
-        if not pending:
-            return
         cmd_path = self._file_bridge_cmd_path()
+        if not pending:
+            # FIX 2026-09-14 drill-3：已结算指令留在 cmd 文件里 = 桥每次重启重放
+            # 老单（seq:7 重启即重投 3 次，幸而柜台以"可用数量不足"拒绝）。
+            # 空推时把文件同步为「仅 inflight」：done 清掉，桥掉线期间未消费的
+            # 单保留（清了=丢单）。English: reconcile cmd file to inflight-only.
+            try:
+                inflight = self.store.dispatch_inflight(limit=50)
+            except Exception:  # noqa: BLE001
+                return
+            self._file_bridge_reconcile_cmds(cmd_path, inflight)
+            return
         payload = {
             "ts": time.time(),
-            "cmds": [
-                {
-                    "seq": p.get("seq"), "kind": p.get("kind"),
-                    "signal_id": p.get("signal_id"), "code": p.get("code"),
-                    "side": p.get("side"), "price_type": p.get("price_type"),
-                    "price": p.get("price"), "qty": p.get("qty"),
-                    "order_id": p.get("order_id"),
-                }
-                for p in pending
-            ],
+            "cmds": [self._cmd_from_dispatch(p) for p in pending],
         }
         tmp = cmd_path + ".tmp"
         try:
@@ -297,12 +297,67 @@ class Gateway:
         else:
             log.info("[file-bridge] pushed %d pending cmd(s) to %s", len(pending), cmd_path)
 
+    def _cmd_from_dispatch(self, p):
+        """派发 DB 行 → 文件桥命令体（push 与 reconcile 共用，口径一致）。"""
+        return {
+            "seq": p.get("seq"), "kind": p.get("kind"),
+            "signal_id": p.get("signal_id"), "code": p.get("code"),
+            "side": p.get("side"), "price_type": p.get("price_type"),
+            "price": p.get("price"), "qty": p.get("qty"),
+            "order_id": p.get("order_id"),
+        }
+
+    def _file_bridge_reconcile_cmds(self, cmd_path, inflight):
+        """无 pending 轮次：cmd 文件应等于「当前 inflight 清单」。内容 seq 集合已
+        一致则不写（避免 0.5s 轮询空转）；done 残留或多余条目 → 原子重写。"""
+        want = [self._cmd_from_dispatch(r) for r in (inflight or [])]
+        try:
+            with open(cmd_path, "rb") as f:
+                cur = json.loads(f.read().decode("utf-8", errors="replace") or "{}")
+            cur_seqs = [str(c.get("seq", "")) for c in (cur.get("cmds") or [])]
+            if cur_seqs == [str(c["seq"]) for c in want]:
+                return
+        except OSError:
+            if not want:
+                return  # 文件不存在且 inflight 为空：已经是目标态
+        except Exception:  # noqa: BLE001 — 坏文件照重写
+            pass
+        tmp = cmd_path + ".tmp"
+        try:
+            body = json.dumps({"ts": time.time(), "cmds": want},
+                              ensure_ascii=False, default=json_default)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.replace(tmp, cmd_path)
+            log.info("[file-bridge] reconciled cmd file to %d inflight row(s)", len(want))
+        except Exception:  # noqa: BLE001
+            log.exception("[file-bridge] reconcile cmd file failed")
+
     def _file_bridge_loop(self):
         """§QMT-F16 文件桥 sidecar：读桥的 JSONL 上报 + 推 pending 命令文件，
         回报语义与 HTTP PATH 一字不差。上报文件被轮转缩小则回到 0 偏移。"""
         report_path = self._file_bridge_path()
-        pos = 0
-        log.info("[file-bridge] watching %s", report_path)
+        # FIX 2026-09-14 drill-3: restart used to re-read the report file from
+        # offset 0 -- a 3.6MB replay storm (thousands of stale positions/account
+        # applies, 12+ min of blocking, and stale heartbeats marking the bridge
+        # "connected" while it was dead). Persist the offset; on first run (or
+        # truncation) resume from EOF instead of replaying history. Events are
+        # live-flow only; the reconnect hook re-pushes a full reconcile anyway.
+        try:
+            _eof = os.path.getsize(report_path)
+        except OSError:
+            _eof = 0
+        saved = self.store.bridge_snapshot_get("report_pos", None)
+        try:
+            # 首次运行：只回放尾部 64KB（覆盖"离线期间到达的行"，跳过 3.6MB 历史风暴；
+            # 结算/成交回报幂等，尾部重复无害）。English: on first run replay only
+            # the tail window -- full history replay caused a 12-min apply storm.
+            pos = int(saved) if saved is not None else max(0, _eof - 65536)
+        except (TypeError, ValueError):
+            pos = max(0, _eof - 65536)
+        if pos > _eof:
+            pos = _eof
+        log.info("[file-bridge] watching %s pos=%d size=%d", report_path, pos, _eof)
         # §2026-09-11 主接线时延：0.5s 轮询（信号→下单→回传闭环秒级；本地文件读开销可忽略）
         while not self._stop.is_set():
             if self._stop.wait(0.5):
@@ -338,6 +393,10 @@ class Gateway:
                         log.debug("[file-bridge] %s -> %s", body.get("type"), code)
                     except Exception:  # noqa: BLE001 — 单事件失败不阻断后续行
                         log.exception("[file-bridge] apply %s failed", body.get("type"))
+                try:
+                    self.store.bridge_snapshot_set("report_pos", pos)
+                except Exception:  # noqa: BLE001 — 偏移写失败下轮重放，幂等无害
+                    log.exception("[file-bridge] persist report pos failed")
             # ② 推命令（无 pending 不打扰桥）
             self._file_bridge_push_pending()
 
@@ -456,6 +515,8 @@ class Gateway:
             return self._do_dispatch_pending()
         if path == "/dispatch/result" and method == "POST":
             return self._do_dispatch_result(body)
+        if path == "/dispatch/enqueue" and method == "POST":
+            return self._do_dispatch_enqueue(body)
         if path == "/admin/broker" and method == "POST":
             return self._do_admin_broker(body)
         if path == "/admin/status" and method == "GET":
@@ -491,6 +552,16 @@ class Gateway:
         items = self.store.dispatch_pending(limit=50)
         return 200, {"ok": True, "items": items}
 
+    def _do_dispatch_enqueue(self, body):
+        """运维注入派发项（当前仅 kind=diag：让桥做一次交易明细原始 dump）。
+        English: ops-only enqueue for diagnostic commands (bridge raw trade-detail dump)."""
+        req = body or {}
+        kind = str(req.get("kind", "") or "")
+        if kind != "diag":
+            return 400, {"ok": False, "err": "kind must be diag"}
+        seq = self.store.dispatch_enqueue_diag(req.get("signal_id", ""))
+        return 200, {"ok": True, "seq": seq}
+
     def _do_dispatch_result(self, body):
         """桥回报（POST /dispatch/result）：结算派发项 + 按现有协议推量仔。
 
@@ -522,6 +593,12 @@ class Gateway:
                 return self._apply_cancel_result(req)
             if etype == "trade":
                 return self._apply_trade(req)
+            if etype == "diag":
+                seq = str(req.get("seq", "") or "")
+                self.store.dispatch_set_result(seq, {"ok": True, "diag": req.get("dump")})
+                log.info("[gateway] diag report seq=%s dump=%s", seq,
+                         json.dumps(req.get("dump"), ensure_ascii=False, default=json_default)[:4000])
+                return 200, {"ok": True, "err": ""}
             return 400, {"ok": False, "err": "unknown dispatch result type: %s" % etype}
         except Exception as e:  # noqa: BLE001
             log.exception("[gateway] dispatch result failed: %s", etype)
@@ -590,6 +667,14 @@ class Gateway:
                 req["signal_id"] = row.get("signal_id", "")
                 req.setdefault("code", row.get("code", ""))
                 req.setdefault("side", row.get("side", ""))
+            elif req.get("order_id"):
+                # FIX 2026-09-14 drill-3: 桥的 DEAL 行 m_strRemark 实测为空（passorder
+                # userOrderId 不落 remark），成交归因必须能按交易所委托号反查派发项。
+                prow = self.store.dispatch_by_order_id(str(req.get("order_id")))
+                if prow:
+                    req["signal_id"] = prow.get("signal_id", "")
+                    req.setdefault("code", prow.get("code", ""))
+                    req.setdefault("side", prow.get("side", ""))
         self.handler.on_trade({
             "order_id": req.get("order_id", ""), "trade_id": req.get("trade_id", ""),
             "name": req.get("name", ""), "code": req.get("code", ""), "side": req.get("side", ""),
