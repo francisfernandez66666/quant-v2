@@ -2,7 +2,9 @@
 // 页面用途：实盘链路总开关、执行方式、仓位纪律与战法白名单的统一管理界面。
 // 主要功能：查看广州单机实盘链路状态/熔断；配置总开关、执行模式、委托价格、心跳超时、网关与 Token；
 //          设定最大持仓/单票金额/预算等仓位纪律；按战法开关实盘准入并展示交易流水与归因盈亏。
-//          定时轮询：链路状态 10s 一次、交易流水 30s 一次；配置修改提交后待交易时段生效。
+//          §U-2（2026-09-14）：链路状态卡内置 kill-switch 紧急停止按钮、当日委托卡支持逐笔撤单、
+//          日终结算卡一键三方对账并回看差异历史——三者后端早已就绪，本轮补上前端入口。
+//          定时轮询：链路状态/当日委托 10s 一次、交易流水 30s 一次；配置修改提交后待交易时段生效。
 // 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import ToggleSw from '../components/ToggleSw'
@@ -120,6 +122,16 @@ export default function Quant() {
   const [shortPoolOn, setShortPoolOn] = useState(false)
   const [saving, setSaving] = useState(false)
   const [trades, setTrades] = useState(null)
+  // §U-2（2026-09-14）运维三件套前端入口：kill-switch 紧急停止 / 当日委托手动撤单 / 交割单对账。
+  // 此前这些能力后端端点齐备但页面零入口（撤单尤其因缺 order_id 列表而无从挂按钮）。
+  // English: §U-2 frontend entries for the three ops capabilities that previously had backend
+  // endpoints but no UI — kill-switch halt, manual cancel (now fed by the orders list), settlement.
+  const [orders, setOrders] = useState(null)        // 当日委托（含 order_id / status）
+  const [killBusy, setKillBusy] = useState(false)   // kill-switch 请求中
+  const [settleBusy, setSettleBusy] = useState(false)
+  const [settle, setSettle] = useState(null)        // 最近一次对账结果/历史
+  const [halted, setHalted] = useState(false)       // kill-switch 当前态（来自 config.halted）
+  const ordersTimer = useRef(null)                  // 委托列表轮询定时器
 
   // 战法自定义金额输入（按 strategyId → 金额）
   const [amountsInput, setAmountsInput] = useState({})
@@ -178,6 +190,8 @@ export default function Quant() {
       }
       setForm(nextForm)
       writeCachedForm(nextForm)
+      // §U-2 kill-switch 当前态随配置回显（config.halted），供紧急停止按钮显示"置位/解除"
+      setHalted(!!c.halted)
       // 后端 known_strategies 可能为对象数组 [{id,name,kind}]（新）或纯 ID 数组（旧），统一归一
       let list = []
       if (Array.isArray(c.known_strategies)) {
@@ -230,6 +244,72 @@ export default function Quant() {
   // §QMT-DUAL 拉取网关 active 通道与双路径在线态（broker/xt_connected/queued_connected）
   async function loadBroker() {
     try { setBroker(await api.fetchQMTBroker()) } catch (_) {}
+  }
+
+  // §U-2 拉取当日委托列表（撤单按钮的数据源，含 order_id 与状态）；10s 随链路状态轮询
+  async function loadOrders() {
+    try {
+      const o = await api.fetchQMTOrders()
+      setOrders(Array.isArray(o) ? o : [])
+    } catch (_) { /* 无实盘库时 503：保留上次列表，不打断页面 */ }
+  }
+
+  // §U-2 kill-switch 紧急停止/解除：置位前二次确认（撤销一切在途未成交委托 + 拒绝新单），
+  // 走专用 /api/qmt/halt（立即生效，不入开关队列）；成功后刷新配置与委托列表。
+  async function toggleKillSwitch() {
+    if (killBusy) return
+    const engage = !halted
+    const msg = engage
+      ? '确认紧急停止（kill-switch）？\n将立即拒绝一切新下单（自动+手动），并撤销全部在途未成交委托。'
+      : '确认解除紧急停止？\n解除后恢复正常下单（熔断仍按健康探测独立生效）。'
+    if (!(await confirmDialog(msg, engage ? '紧急停止确认' : '解除停止确认'))) return
+    setKillBusy(true)
+    try {
+      const r = await api.qmtHalt(engage)
+      MessagePlugin.success(engage ? `已置位紧急停止，同步撤销 ${r && r.cancelled != null ? r.cancelled : 0} 笔在途委托` : '紧急停止已解除')
+      await loadConfig()
+      await loadOrders()
+    } catch (e) {
+      MessagePlugin.error('操作失败：' + (e && e.message ? e.message : e))
+    } finally {
+      setKillBusy(false)
+    }
+  }
+
+  // §U-2 手动撤单：仅未成交委托（已报/部成/部成待撤等）可撤；终态由后端 409 拒绝并如实回显。
+  async function cancelOrder(orderId) {
+    if (!(await confirmDialog(`确认撤单 ${orderId}？\n已成交/已撤/废单将返回错误。`, '撤单确认'))) return
+    try {
+      await api.qmtCancel(orderId)
+      MessagePlugin.success('撤单请求已提交')
+      await loadOrders()
+    } catch (e) {
+      MessagePlugin.error('撤单失败：' + (e && e.message ? e.message : e))
+    }
+  }
+
+  // §U-2/§WS-B 交割单三方对账（report_only 仅比对）：拉券商交割单↔本地账本，差异落库并告警。
+  async function runSettle(mode = 'report_only') {
+    if (settleBusy) return
+    setSettleBusy(true)
+    try {
+      const r = await api.qmtSettle({ mode })
+      setSettle({ result: r && r.diff ? r.diff : null, ok: true, mode })
+      MessagePlugin.success('对账完成')
+      await loadSettleHistory()
+    } catch (e) {
+      MessagePlugin.error('对账失败：' + (e && e.message ? e.message : e))
+    } finally {
+      setSettleBusy(false)
+    }
+  }
+
+  // 对账历史（最近差异快照）
+  async function loadSettleHistory() {
+    try {
+      const h = await api.fetchQMTSettleHistory()
+      if (h && Array.isArray(h.diffs)) setSettle((s) => ({ ...(s || {}), history: h.diffs }))
+    } catch (_) {}
   }
 
   // §QMT-DUAL 切换网关 active 通道（xt=miniQMT兼容主路径 / queued=QMT内置桥兜底）。
@@ -350,15 +430,20 @@ export default function Quant() {
     api.fetchPaperState().then((r) => setShortPoolOn(!!(r.short_book && r.short_book.enabled))).catch(() => {})
     // 链路状态每 10s 轮询一次（心跳/延迟/熔断实时性要求高）
     stateTimer.current = setInterval(loadState, 10000)
+    // §U-2 当日委托随链路状态同频轮询（在途单状态推进/撤单后回显）
+    loadOrders()
+    ordersTimer.current = setInterval(loadOrders, 10000)
+    loadSettleHistory()
     loadBroker()
     loadTrades()
     // 交易流水每 30s 轮询一次（成交频率低，降低刷新压力）
     tradesTimer.current = setInterval(loadTrades, 30000)
     loadConfig().catch((e) => MessagePlugin.error('加载实盘配置失败：' + (e && e.message ? e.message : e)))
-    // 卸载时清除两个定时器，防止内存泄漏与重复请求
+    // 卸载时清除定时器，防止内存泄漏与重复请求
     return () => {
       if (stateTimer.current) clearInterval(stateTimer.current)
       if (tradesTimer.current) clearInterval(tradesTimer.current)
+      if (ordersTimer.current) clearInterval(ordersTimer.current)
     }
   }, [])
 
@@ -719,9 +804,99 @@ export default function Quant() {
         </>)}
         {row('网关地址', state.gateway_url || '—')}
         {row('熔断', breaker)}
+        {/* §U-2 kill-switch（人工紧急停止）状态与入口：置位=拒绝一切新单+撤销在途委托，立即生效 */}
+        {row('紧急停止', <>
+          {halted ? <Tag theme="danger">已置位</Tag> : <Tag theme="success">未启用</Tag>}
+          <Button
+            size="xs" variant="outline"
+            theme={halted ? 'success' : 'danger'}
+            loading={killBusy}
+            onClick={toggleKillSwitch}
+            style={{ marginLeft: 10 }}
+          >
+            {halted ? '解除停止' : '紧急停止'}
+          </Button>
+          <span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 8 }}>
+            {halted ? '当前拒绝一切下单（自动+手动）' : '立即拒绝一切新下单并撤销在途未成交委托'}
+          </span>
+        </>)}
         {row('下行探测', probe)}
         {row('上行回报', report)}
         {row('执行路径', path)}
+      </Card>
+    )
+  }
+
+  // §U-2 委托可撤状态集（未成交/在途形态）；终态（已成/已撤/部撤/废单/发送失败）不显示撤单按钮
+  const CANCELABLE = new Set(['已报', '部成', '已报待撤', '部成待撤'])
+  // 委托状态 Tag 配色：终态绿/灰，在途蓝
+  const orderTagTheme = (st) => (
+    st === '已成' ? 'success' : (st === '已撤' || st === '部撤' || st === '废单' || st === '发送失败') ? 'danger' : 'primary'
+  )
+
+  /* §U-2 渲染"当日委托"卡：order_id/代码/方向/价格/数量/状态 + 未成交行的撤单按钮。
+     数据 10s 轮询（与链路状态同频）；成交推进依赖网关回报（order 事件单调状态机 §R4-4）。 */
+  function renderOrdersCard() {
+    const cols = [
+      { colKey: 'order_id', title: '委托号', width: 120, cell: ({ row }) => <span style={{ fontSize: 12 }}>{row.order_id}</span> },
+      { colKey: 'code', title: '代码', width: 100 },
+      { colKey: 'side', title: '方向', width: 70, cell: ({ row }) => <span style={{ color: row.side === '买入' ? 'var(--app-up)' : 'var(--app-down)' }}>{row.side}</span> },
+      { colKey: 'price', title: '价格', width: 80 },
+      { colKey: 'qty', title: '数量', width: 70 },
+      { colKey: 'status', title: '状态', width: 90, cell: ({ row }) => <Tag size="small" theme={orderTagTheme(row.status)}>{row.status}</Tag> },
+      { colKey: 'created_at', title: '时间', width: 130, cell: ({ row }) => <span style={{ fontSize: 12 }}>{(row.created_at || '').replace('T', ' ').slice(5, 19)}</span> },
+      {
+        colKey: 'op', title: '操作', width: 90,
+        cell: ({ row }) => (CANCELABLE.has(row.status)
+          ? <Button size="xs" variant="outline" theme="danger" onClick={() => cancelOrder(row.order_id)}>撤单</Button>
+          : <span style={{ color: 'var(--app-muted-2)', fontSize: 12 }}>—</span>),
+      },
+    ]
+    return (
+      <Card title="当日委托" style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤）；未成交委托可撤，10s 刷新</div>
+        {orders == null ? (
+          <div style={{ color: 'var(--app-text-2)', fontSize: 13 }}>加载委托列表…</div>
+        ) : orders.length ? (
+          <Table data={orders} columns={cols} rowKey="order_id" size="small"
+            pagination={{ pageSize: 10, showJumper: true, total: orders.length }} />
+        ) : (
+          <div style={{ padding: '8px 2px', color: 'var(--app-text-2)', fontSize: 13 }}>今日暂无实盘委托</div>
+        )}
+      </Card>
+    )
+  }
+
+  /* §U-2/§WS-B 渲染"日终结算"卡：一键三方对账（券商交割单↔本地账本）+ 最近差异历史。
+     report_only 仅比对不落补记；差异非空时后端已 P1 告警。 */
+  function renderSettleCard() {
+    const diff = settle && settle.result
+    return (
+      <Card title="日终结算对账" style={{ marginBottom: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
+          <Button size="small" theme="primary" variant="outline" loading={settleBusy} onClick={() => runSettle('report_only')}>立即对账</Button>
+          <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>拉券商交割单与本地委托/成交三方比对，差异自动 P1 告警（休市/盘后运行最佳）</span>
+        </div>
+        {diff && (
+          <div style={{ fontSize: 12, marginBottom: 10, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--app-border)', background: 'var(--app-bg-2, transparent)' }}>
+            最近对账 {diff.day || '—'}：本地缺失 {(diff.missing_in_local || []).length} · 本地多余 {(diff.extra_in_local || []).length} · 不符 {(diff.mismatch || []).length} · 费用差 {(diff.fee_diff || 0).toFixed(2)} · 现金差 {(diff.cash_diff || 0).toFixed(2)}
+          </div>
+        )}
+        {settle && Array.isArray(settle.history) && settle.history.length ? (
+          <Table
+            data={settle.history} rowKey={(r) => r.day + r.mode} size="small" pagination={false}
+            columns={[
+              { colKey: 'day', title: '交易日', width: 110 },
+              { colKey: 'missing', title: '本地缺失', width: 90, cell: ({ row }) => (row.missing_in_local || []).length },
+              { colKey: 'extra', title: '本地多余', width: 90, cell: ({ row }) => (row.extra_in_local || []).length },
+              { colKey: 'mismatch', title: '不符', width: 70, cell: ({ row }) => (row.mismatch || []).length },
+              { colKey: 'fee_diff', title: '费用差', width: 90, cell: ({ row }) => <span style={{ color: pnlColor(-(row.fee_diff || 0)) }}>{(row.fee_diff || 0).toFixed(2)}</span> },
+              { colKey: 'mode', title: '模式', width: 110 },
+            ]}
+          />
+        ) : (
+          <div style={{ color: 'var(--app-text-2)', fontSize: 12 }}>暂无对账记录——收盘后点「立即对账」建立日结留痕</div>
+        )}
       </Card>
     )
   }
@@ -747,8 +922,11 @@ export default function Quant() {
         </div>
       )}
 
-      {/* 链路状态卡片：显示网关地址/熔断状态/运行模式/执行路径切换 */}
+      {/* 链路状态卡片：显示网关地址/熔断状态/紧急停止(kill-switch)/运行模式/执行路径切换 */}
       {renderChainStatusCard()}
+
+      {/* §U-2 当日委托卡：撤单按钮的宿主（order_id 数据源） */}
+      {renderOrdersCard()}
 
       {/* 总开关与执行方式卡片：实盘开关、执行模式、委托价格、自动卖出等配置 */}
       <Card title="总开关与执行方式" style={{ marginBottom: 14 }}>
@@ -800,6 +978,9 @@ export default function Quant() {
           <div style={{ color: 'var(--app-text-2)', fontSize: 13 }}>加载交易流水…</div>
         )}
       </Card>
+
+      {/* §U-2/§WS-B 日终结算对账卡（三方比对 + 差异历史） */}
+      {renderSettleCard()}
     </div>
   )
 }

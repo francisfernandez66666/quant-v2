@@ -451,6 +451,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/admin/users/{id}/enabled", s.adminMiddleware(s.handleSetUserEnabled))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/expiry", s.adminMiddleware(s.handleSetUserExpiry))
 	s.mux.HandleFunc("DELETE /api/admin/users/{id}", s.adminMiddleware(s.handleDeleteUser))
+	// §U-5 脏账号批量清理（temp_/过期）。static 段 "cleanup" 优先于 {id}，二者路径段数不同不冲突。
+	s.mux.HandleFunc("POST /api/admin/users/cleanup", s.adminMiddleware(s.handleCleanupUsers))
 	// 管理员代配他人账号配置（strategy / d1 / longshort / llm）
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminGetStrategyConfig))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminSetStrategyConfig))
@@ -586,6 +588,8 @@ func (s *Server) registerRoutes() {
 	// QMT 实盘状态/成交：运营数据系统级共享，仅管理员可读（子账号无量化交易权限）。
 	s.mux.HandleFunc("GET /api/qmt/state", s.adminMiddleware(s.handleQMTState))
 	s.mux.HandleFunc("GET /api/qmt/trades", s.adminMiddleware(s.handleQMTTrades))
+	// §U-2 当日委托列表（撤单 UI 的 order_id 来源，admin 权限）
+	s.mux.HandleFunc("GET /api/qmt/orders", s.adminMiddleware(s.handleQMTOrders))
 	// §R4-1 kill-switch 与手动撤单（admin 权限：紧急停止/撤单属资损级操作）
 	s.mux.HandleFunc("POST /api/qmt/halt", s.adminMiddleware(s.handleQMTHalt))
 	s.mux.HandleFunc("POST /api/qmt/cancel/{order_id}", s.adminMiddleware(s.handleQMTCancel))

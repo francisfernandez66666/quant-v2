@@ -188,6 +188,8 @@ export default function Admin() {
   // 用户切到 50/100 后 refresh / 增删 / 角色变更触发重渲染就掉回 10。
   // English: D6 — controlled pagination so pageSize survives re-renders.
   const [userPage, setUserPage] = useState({ current: 1, pageSize: 10 })
+  // §U-5 脏账号清理请求中标志（防重复点击）
+  const [cleaning, setCleaning] = useState(false)
   const [opsLoading, setOpsLoading] = useState(false)
   const opsBodyRef = React.useRef(null)             // 内容区（自动滚到底部=最新事件）
 
@@ -206,6 +208,28 @@ export default function Admin() {
       setAllPerms(res.perms || [])
     } catch (e) {
       showToast('加载用户失败: ' + (e.message || e), 'error')
+    }
+  }
+
+  // §U-5（2026-09-14 像素级 UAT）脏账号清理：先 dry_run 预览命中清单，确认后再真删。
+  // 后端口径保守（过期非管理员账号 + 会话全部过期/已禁用的 temp_ 临时号），admin 与在用号绝不误删。
+  // English: §U-5 stale-account reaper — preview via dry_run, confirm, then delete. Backend policy
+  // is conservative (expired non-admins + dead/disabled temp accounts); never touches admin/live rows.
+  async function runUserCleanup() {
+    setCleaning(true)
+    try {
+      const preview = await api.cleanupAdminUsers(true)
+      const list = preview.deleted || []
+      if (!list.length) { showToast('没有可清理的账号（无过期/temp 僵尸号）'); return }
+      const names = list.slice(0, 8).map((x) => x.username).join('、') + (list.length > 8 ? ` 等 ${list.length} 个` : '')
+      if (!(await confirmDialog(`将清理 ${list.length} 个僵尸账号：${names}。\n（过期或已失效临时号，admin 与在用账号不会受影响）`, '清理账号确认'))) return
+      const done = await api.cleanupAdminUsers(false)
+      showToast(`已清理 ${done.count || 0} 个账号`)
+      loadUsers()
+    } catch (e) {
+      showToast('清理失败: ' + (e.message || e), 'error')
+    } finally {
+      setCleaning(false)
     }
   }
 
@@ -575,7 +599,13 @@ export default function Admin() {
         )}
       </Card>
 
-      <Card title="账号列表" style={{ marginBottom: 12 }}>
+      <Card title="账号列表" style={{ marginBottom: 12 }}
+        // §U-5 卡片右上角：僵尸账号清理入口（先预览后确认，非破坏式两步）
+        actions={
+          <Button size="small" variant="outline" theme="danger" loading={cleaning} onClick={runUserCleanup}>
+            清理失效账号
+          </Button>
+        }>
         <Table
           rowKey="id"
           data={users}

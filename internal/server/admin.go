@@ -5,9 +5,11 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/config"
@@ -42,6 +44,63 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		"users": users,
 		"perms": auth.AllPerms(),
 	})
+}
+
+// handleCleanupUsers 处理 POST /api/admin/users/cleanup（§U-5 2026-09-14 像素级 UAT）：
+// 批量清理"脏账号"——临时账号体系（CreateTemp，用户名 temp_ 前缀）到期后从不回收，
+// 长期部署 auth.json 积累数十条废行（UAT 副本实录 60 条 temp_* + 15 条测试号），
+// 拖慢列表分页、放大备份、混淆审计。temp 账号无密码、其可用性完全由会话到期决定，
+// 故过期判定用 HasActiveSession（全部会话过期=再也无法被使用），绝不按创建时间误伤在用号。
+// 删除口径（保守，可 dry_run 预览）：
+//   - 非 admin 且 已过账号级有效期（expires_at>0 且已过期，CreateUser 带 expires_days 的正式号）；
+//   - 非 admin 且 temp_ 前缀 且（会话全部过期 或 已禁用）。
+//
+// 请求体 {"dry_run":true} 仅返回将被清理的清单不落删除；响应 {"deleted":[...],"count":n,"dry_run":bool}。
+// 全过程 opslog 审计留痕。admin 自身与其他在用账号绝无删除路径。
+// English: §U-5 — bulk cleanup of stale accounts. Temp accounts (temp_ prefix from CreateTemp)
+// were never reaped, leaving dozens of dead rows (UAT copy: 60 temp_* + 15 test accounts) that
+// bloat the list page and backups. Password-less temps live only while a session is valid, so
+// expiry is judged by HasActiveSession (all sessions lapsed ⇒ unusable), never by creation time.
+// Targets: expired non-admin accounts, plus temp_ accounts with no live session or disabled.
+// dry_run previews without deleting. Admin and in-use accounts are never touched.
+func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DryRun bool `json:"dry_run"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	now := time.Now().Unix()
+	type cleaned struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+		Reason   string `json:"reason"`
+	}
+	var out []cleaned
+	for _, u := range s.auth.ListUsers() {
+		if u.Role == auth.RoleAdmin {
+			continue // 管理员账号绝无清理路径
+		}
+		reason := ""
+		switch {
+		case u.ExpiresAt > 0 && now > u.ExpiresAt:
+			reason = "expired"
+		case strings.HasPrefix(u.Username, "temp_") && !s.auth.HasActiveSession(u.ID):
+			reason = "temp_session_expired"
+		case strings.HasPrefix(u.Username, "temp_") && !u.Enabled:
+			reason = "temp_disabled"
+		}
+		if reason == "" {
+			continue
+		}
+		if !req.DryRun {
+			if err := s.auth.DeleteUser(u.ID); err != nil {
+				log.Printf("[admin] cleanup 删除 %s(%s) 失败: %v", u.Username, u.ID, err)
+				continue // 单个失败不阻断整批
+			}
+		}
+		out = append(out, cleaned{ID: u.ID, Username: u.Username, Reason: reason})
+	}
+	opslog.Audit("user_cleanup", userFromContext(r).ID, "users", fmt.Sprintf("dry_run=%v count=%d", req.DryRun, len(out)))
+	writeJSON(w, 200, map[string]interface{}{"deleted": out, "count": len(out), "dry_run": req.DryRun})
 }
 
 // createUserReq 管理员开户请求体。

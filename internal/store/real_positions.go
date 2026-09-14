@@ -571,12 +571,21 @@ func (d *DB) SumFilledQty(userID, signalID string) int {
 // §P0-2/P0-3 userID 为空时仅操作遗留全局行；非空时严格限定本账号，防止跨账号误更新。
 // §修复 FIX#2（2026-09-04）：加单调状态守卫——重试成功后该行可能已被回报线程推进到
 // 已成/部分成交（超时但券商实际受理），旧实现直接覆盖为"已报"会回退真实进度；现仅当
-// 新状态秩更高时才回填（对齐 §R4-4 单调状态机口径）。
+// 新状态秩不低于当前秩时才回填（对齐 §R4-4 单调状态机口径）。
+// §修复 U-1（2026-09-14 像素级 UAT 实录）：守卫由"秩更高才回填（<= 跳过）"改为"仅严格更低才跳过（< 跳过）"。
+// 旧实现占位行以"已报"落库、首次回填状态同为"已报"，秩相等被 `<=` 误杀 → 网关真实单号永不回填，
+// 本地委托行 order_id 恒停留 `pend:` 前缀；后续一切按网关单号的推进/撤单/对账 UPDATE 永不命中，
+// 委托生命周期在本端整体失真（成交回报靠 signal_id 记账故持仓/资金未受损）。等秩回填的语义恰恰是
+// "只换单号、状态原地"，不存在回退风险，真正要拦的仍是"高秩已被回报推进、低秩回填晚到"。
 // English: backfills the pending ticket (keyed by signal_id) with the gateway-assigned order id.
 // English: §GAP fix — placeholder rows previously stored an empty order_id, colliding on the primary
 // key so every later new order was swallowed as a "duplicate", and the status update by gateway id
-// never matched. §FIX#2 — a monotonic guard now skips the backfill when the row already advanced
-// past 已报 (e.g. a late fill landed), so real progress is never rolled back.
+// never matched. §FIX#2 — a monotonic guard skips the backfill when the row already advanced
+// past 已报 (e.g. a late fill landed), so real progress is never rolled back. §U-1 — the guard was
+// off-by-one strict: skipping equal ranks also killed the very first backfill (placeholder row and
+// backfill both carry 已报, rank 1 <= rank 1), so the gateway order id NEVER landed on the local row
+// and every later by-order-id update missed. Equal rank now backfills (it only swaps the id, the
+// status stays); strictly-lower ranks are still refused.
 func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string) error {
 	var cur string
 	var err error
@@ -591,8 +600,10 @@ func (d *DB) UpdateRealOrderBySignalID(userID, signalID, orderID, status string)
 	if err != nil {
 		return err
 	}
-	if orderStatusRank(status) <= orderStatusRank(cur) {
-		return nil // 乱序/回退：不回填（真实进度不被覆盖）
+	// §U-1：仅"严格更低秩"才视为回退并跳过；等秩（占位行与回填同为"已报"）放行——
+	// 这正是首次网关单号回填的唯一命中路径，旧 `<=` 把它误杀导致 order_id 永驻 pend:。
+	if orderStatusRank(status) < orderStatusRank(cur) {
+		return nil // 低秩回报晚到（已成/部成后被晚到的"已报"回填）：绝不回退真实进度
 	}
 	if userID == "" {
 		_, err = d.db.Exec(`UPDATE orders SET order_id=?, status=? WHERE signal_id=? AND user_id=''`, orderID, status, signalID)

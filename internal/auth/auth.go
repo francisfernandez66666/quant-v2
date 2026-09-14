@@ -705,6 +705,32 @@ func (u *User) PublicUser() User {
 	return out
 }
 
+// HasActiveSession 报告账号是否仍有至少一条未过期会话（Exp==0 视为永不过期）。
+// §U-5（2026-09-14 像素级 UAT）：temp 账号无密码，其生命周期完全由会话到期决定——
+// 全部会话过期后即成"再也无法被使用"的僵尸行（长期部署 auth.json 积累数十条）。
+// 清理端点以本方法判定"过期 temp"，绝不按创建时间误删仍在用的临时号。
+// English: §U-5 — reports whether the account still holds at least one live session (Exp==0 =
+// never expires). Password-less temp accounts live and die by their sessions; once all sessions
+// lapse the row can never be used again, which is how dozens of zombie rows accumulated in
+// long-lived deployments. The cleanup endpoint reaps exactly those, never a still-live temp.
+func (m *Manager) HasActiveSession(userID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	now := time.Now().Unix()
+	for _, u := range m.db.Users {
+		if u.ID != userID {
+			continue
+		}
+		for _, s := range u.Sessions {
+			if s.Exp == 0 || s.Exp > now {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // ListUsers 返回全部用户（公开视图，不含密码哈希与令牌）。
 // （ListUsers returns all users as public views, without password hashes or tokens.）
 func (m *Manager) ListUsers() []User {

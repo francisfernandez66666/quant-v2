@@ -337,6 +337,43 @@ func TestUpdateRealOrderBySignalIDMonotonic(t *testing.T) {
 	}
 }
 
+// TestUpdateRealOrderBySignalIDSameRankBackfill §修复 U-1（2026-09-14 像素级 UAT）：
+// 占位行（已报）与首次回填（已报）秩相等——旧 `<=` 守卫把这条唯一命中路径误杀，
+// 网关单号永不落库、order_id 恒为 pend:，其后一切按网关单号的推进/撤单/对账 UPDATE 永不命中。
+// 现守卫改 `<`：等秩必须回填成功（order_id 换真实单号、状态原地"已报"），
+// 且低秩晚到仍被拦（FIX#2 语义不回归）。
+// English: §U-1 regression — the placeholder row and the first gateway-id backfill both carry 已报
+// (equal rank); the old `<=` guard silently killed that path, leaving order_id stuck at pend:.
+// With the `<` guard the same-rank backfill must land (id swapped, status untouched), and a late
+// lower-rank backfill is still refused (FIX#2 semantics preserved).
+func TestUpdateRealOrderBySignalIDSameRankBackfill(t *testing.T) {
+	db := testDB(t)
+	o := RealOrder{OrderID: "pend:S3", SignalID: "S3", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-14T09:30:00+08:00", UserID: "u1"}
+	if _, err := db.UpsertRealOrder(o); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	// 首次回填：网关受理返回真实单号，状态仍"已报"（等秩）——必须落库
+	if err := db.UpdateRealOrderBySignalID("u1", "S3", "GW-3", "已报"); err != nil {
+		t.Fatalf("same-rank backfill: %v", err)
+	}
+	os, _ := db.RealOrdersForUser("u1")
+	if os[0].OrderID != "GW-3" || os[0].Status != "已报" {
+		t.Fatalf("等秩回填应换单号保状态, got %+v", os[0])
+	}
+	// 之后按网关单号推进到已成（R4-4 正常生命周期）
+	if ok, err := db.UpdateRealOrderStatusMonotonic("u1", "GW-3", "已成"); err != nil || !ok {
+		t.Fatalf("按网关单号推进已成应命中: ok=%v err=%v", ok, err)
+	}
+	// 再晚到的等秩回填（重试成功重复回调）不覆盖终态，也不改回 pend
+	if err := db.UpdateRealOrderBySignalID("u1", "S3", "GW-LATE", "已报"); err != nil {
+		t.Fatalf("late same-status backfill: %v", err)
+	}
+	os, _ = db.RealOrdersForUser("u1")
+	if os[0].Status != "已成" || os[0].OrderID != "GW-3" {
+		t.Fatalf("已成终态+原单号不得被低秩回填覆盖, got %+v", os[0])
+	}
+}
+
 // TestSchemaMigrationP01P02 §P0-1/P0-2 旧库主键/唯一约束迁移：
 // 模拟只含单 ts_code 主键的 real_positions 和单 signal_id 唯一的 orders，
 // Open 后应自动重建为 (ts_code, user_id) 与 (user_id, signal_id)。

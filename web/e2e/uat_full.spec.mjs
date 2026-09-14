@@ -459,3 +459,75 @@ test.describe('修复回归 · 安全与目标', () => {
     await modelInput.fill('')
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// §U-2/§U-3/§U-5（2026-09-14 修复批）：运维三件套前端入口 + kill-switch 即时性回归
+// 背景：/api/qmt/halt、/api/qmt/cancel/{id}、/api/qmt/settle、/api/admin/users/cleanup 此前
+// 后端齐备但前端零入口；且保存路径置 halted 走开关队列（休市不生效）属 fail-stop 漏洞。
+// English: §U-2/3/5 batch — ops UI entries (kill-switch / cancel / settlement / account reaper)
+// plus the halted-on-config-save immediate-effect regression (previously queued to next session).
+// ─────────────────────────────────────────────────────────────────────
+test.describe('修复回归 · 运维入口与即时熔断', () => {
+  test('Quant：kill-switch 按钮置位→execute 被拒→解除还原', async ({ page }) => {
+    await page.goto('/#/quant')
+    const card = page.locator('.t-card', { hasText: '链路状态' })
+    const btn = card.getByRole('button', { name: '紧急停止' })
+    await expect(btn, '紧急停止按钮可见').toBeVisible({ timeout: 10000 })
+    await btn.click()
+    const dlg = page.locator('.t-dialog')
+    await expect(dlg, '置位二次确认弹窗').toContainText('确认紧急停止', { timeout: 5000 })
+    await page.screenshot({ path: `${SHOT}/branch-killswitch-confirm.png` })
+    await dlg.getByRole('button', { name: /确认|确定/ }).first().click()
+    await expect(page.locator('.t-message'), '置位成功 toast').toBeVisible({ timeout: 8000 })
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    // 服务端 halted 持久化 + 即时生效：下单被 kill-switch 拒绝（休市时段同样拒绝——U-3 修复点）
+    await expect(async () => {
+      const r = await page.request.get('/api/config/qmt', { headers: hdr })
+      expect((await r.json()).halted, 'config.halted=true 持久化').toBe(true)
+    }).toPass({ timeout: 6000 })
+    const exec = await page.request.post('/api/positions/execute', {
+      headers: hdr, data: { code: '300750', side: '买入', action: '建仓', qty: 100, price: 180, strategy: 'manual' },
+    })
+    expect(exec.status(), 'halted 置位时下单被拒').toBeGreaterThanOrEqual(400)
+    expect(JSON.stringify(await exec.json()), '拒单原因含 kill-switch').toContain('kill-switch')
+    // 解除还原（不污染后续用例）
+    await page.reload()
+    const release = page.locator('.t-card', { hasText: '链路状态' }).getByRole('button', { name: '解除停止' })
+    await expect(release, '解除按钮出现（halted 态回显）').toBeVisible({ timeout: 10000 })
+    await release.click()
+    await page.locator('.t-dialog').getByRole('button', { name: /确认|确定/ }).first().click()
+    await expect(async () => {
+      const r = await page.request.get('/api/config/qmt', { headers: hdr })
+      expect((await r.json()).halted, '解除后 halted=false').toBe(false)
+    }).toPass({ timeout: 8000 })
+  })
+
+  test('Quant：当日委托卡渲染 + 日终结算卡 + 对账可触发', async ({ page }) => {
+    await page.goto('/#/quant')
+    await expect(page.getByText('当日委托'), '当日委托卡标题').toBeVisible({ timeout: 10000 })
+    await page.waitForTimeout(1500)
+    await page.screenshot({ path: `${SHOT}/branch-qmt-orders.png`, fullPage: true })
+    // 终态委托行撤单栏为 —；仅在途单有按钮（数量取决于当日真实单，不断言条数，断言行存在）
+    const body = await page.locator('.app-main').innerText()
+    expect(body, '委托状态列已渲染').toMatch(/已成|已报|已撤|—/)
+    await expect(page.getByText('日终结算对账'), '结算卡存在').toBeVisible()
+    const settleBtn = page.getByRole('button', { name: /立即对账/ })
+    await expect(settleBtn).toBeVisible()
+    await settleBtn.click() // mock 网关卡无交割单：成功/失败 toast 均算链路通
+    await expect(page.locator('.t-message'), '对账请求有响应').toBeVisible({ timeout: 12000 })
+  })
+
+  test('Admin：清理失效账号入口（dry_run 预览不动刀）', async ({ page }) => {
+    await page.goto('/#/admin')
+    const btn = page.getByRole('button', { name: /清理失效账号/ })
+    await expect(btn, '清理按钮存在').toBeVisible({ timeout: 10000 })
+    // 走 API 断 dry_run 契约（不真点删除，避免误删在用 temp）
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const r = await page.request.post('/api/admin/users/cleanup', { headers: hdr, data: { dry_run: true } })
+    expect(r.status(), 'cleanup dry_run 200').toBe(200)
+    const d = await r.json()
+    expect(typeof d.count, 'dry_run 返回 count').toBe('number')
+    expect(d.dry_run, 'dry_run 回显').toBe(true)
+    await page.screenshot({ path: `${SHOT}/branch-admin-cleanup.png`, fullPage: true })
+  })
+})

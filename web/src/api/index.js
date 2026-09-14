@@ -95,6 +95,7 @@ function storeAuth(token, account, expiresAt, role, perms) {
  * 同时移除 token 与账号，使 isLoggedIn() 立即失效
  * Removes both token and account so isLoggedIn() immediately becomes false
  */
+// 清空本地登录态（token/账号/角色/权限）
 export function clearAuth() {
   localStorage.removeItem(STORAGE_KEY)
   localStorage.removeItem(STORAGE_ACCOUNT)
@@ -106,6 +107,7 @@ export function clearAuth() {
  *  本地 clearAuth 立即执行（不 await 网络），避免用户快速重登时旧请求把新令牌误清；
  *  网络请求带 captured token 走 fetch 直连，不走 request() 的 getToken() 路径。
  *  English: clears local state synchronously then revokes server-side using the captured token. */
+// 登出：通知后端作废会话并清本地凭据
 export async function logout() {
   const base = baseUrl()
   const token = localStorage.getItem(STORAGE_KEY)
@@ -145,6 +147,7 @@ export async function fetchEmotionStrategyMatrix() {
  * @returns {boolean} true 表示已登录
  * @returns {boolean} true if logged in
  */
+// 是否已登录（存在 token 即视为已登录）
 export function isLoggedIn() {
   return !!getToken()
 }
@@ -155,6 +158,7 @@ export function isLoggedIn() {
  * @returns {string} 账号名，未登录时返回空字符串
  * @returns {string} account name, empty string when not logged in
  */
+// 本地缓存的登录账号名
 export function getAccount() {
   return localStorage.getItem(STORAGE_ACCOUNT) || ''
 }
@@ -163,6 +167,7 @@ export function getAccount() {
  * 获取当前登录用户角色（admin / user）
  * Returns the current logged-in user's role (admin / user)
  */
+// 本地缓存的角色（缺省 user）
 export function getRole() {
   return localStorage.getItem(STORAGE_ROLE) || 'user'
 }
@@ -172,6 +177,7 @@ export function getRole() {
  * Returns the current logged-in user's permission bits
  * @returns {string[]} 权限位数组
  */
+// 本地缓存的细粒度权限列表
 export function getPerms() {
   try {
     return JSON.parse(localStorage.getItem(STORAGE_PERMS) || '[]')
@@ -184,6 +190,7 @@ export function getPerms() {
  * 当前用户是否为管理员
  * Whether the current user is an admin
  */
+// 是否管理员角色
 export function isAdmin() {
   return getRole() === 'admin'
 }
@@ -193,6 +200,7 @@ export function isAdmin() {
  * Whether the current user holds a permission bit (admin implies all)
  * @param {string} perm - 权限位名
  */
+// 权限判定：管理员恒真，其余查权限表
 export function hasPerm(perm) {
   if (isAdmin()) return true
   return getPerms().indexOf(perm) >= 0
@@ -205,6 +213,7 @@ export function hasPerm(perm) {
  * 供 isAdmin()/hasPerm() 在换账号后读到最新权限
  * @returns {Promise<object>} { id, username, role, perms, enabled }
  */
+// 刷新当前用户角色/权限缓存
 export async function refreshMe() {
   const me = await request('/api/auth/me')
   localStorage.setItem(STORAGE_ROLE, me.role || 'user')
@@ -218,6 +227,7 @@ export async function refreshMe() {
  * @returns {string} 服务器地址，未配置时返回空字符串
  * @returns {string} server URL, empty string when not configured
  */
+// 读取本地保存的后端服务器地址
 export function getStoredServer() {
   return localStorage.getItem(STORAGE_SERVER) || ''
 }
@@ -230,6 +240,7 @@ export function getStoredServer() {
  * @param {string} url - 服务器地址
  * @param {string} url - server URL
  */
+// 保存后端服务器地址到本地
 export function setStoredServer(url) {
   localStorage.setItem(STORAGE_SERVER, url)
 }
@@ -370,6 +381,7 @@ async function request(path, opts = {}) {
  * 对应后端 POST /api/auth/login，请求体 { username, password }
  * @returns {Promise<object>} { token, account, expires_at }
  */
+// 登录：换取 token 并落盘账号/角色/权限
 export async function login(username, password) {
   const url = baseUrl() + '/api/auth/login'
   const res = await fetch(url, {
@@ -565,12 +577,13 @@ export async function switchQMTBroker(broker) {
 /** Live config: account's trading params and strategy whitelist (token masked) */
 // 对应 GET /api/config/qmt，返回 { enabled, mode, gateway_url, token_masked, price_type,
 //   fixed_amount, max_positions, initial_capital, strategies, daily_max_buys,
-//   daily_budget_amount, auto_sell, miss_heartbeat_sec, known_strategies }
+//   daily_budget_amount, auto_sell, miss_heartbeat_sec, known_strategies, halted }
 export async function fetchQMTConfig() {
   return request('/api/config/qmt')
 }
 
-/** 实盘配置保存：局部更新（仅传需要修改的字段，后端校验后进入待生效队列，交易时段自动生效） */
+/** 实盘配置保存：局部更新（仅传需要修改的字段，后端校验后进入待生效队列，交易时段自动生效；
+ *  例外：显式携带 halted 属 kill-switch 语义（§U-3），立即生效不入队） */
 /** Save live config: partial update — only send changed fields; backend validates then hot-reloads */
 // 对应 POST /api/config/qmt；token 留空或传脱敏哨兵=保持原值
 export async function updateQMTConfig(data) {
@@ -583,6 +596,41 @@ export async function updateQMTConfig(data) {
 //   trade_count, wins, losses}, by_strategy:[...], fills:[...最近100笔倒序] }
 export async function fetchQMTTrades() {
   return request('/api/qmt/trades')
+}
+
+/** 实盘：当日委托列表（§U-2 撤单 UI 数据源；仅当日，含 order_id 供撤单） */
+/** Live: today's order tickets (data source for the cancel UI) */
+// 对应 GET /api/qmt/orders，返回 [{ order_id, signal_id, code, side, status, price, qty, created_at }]
+export async function fetchQMTOrders() {
+  return request('/api/qmt/orders')
+}
+
+/** 实盘 kill-switch：置位/解除人工紧急停止（§R4-1/§U-2；资损级，仅 admin） */
+/** Live kill-switch: engage/release manual emergency halt (admin only) */
+// 对应 POST /api/qmt/halt，body { halted: true|false }，返回 { ok, halted, cancelled }
+export async function qmtHalt(halted) {
+  return request('/api/qmt/halt', { method: 'POST', data: { halted } })
+}
+
+/** 实盘：手动撤单（§R4-1/§U-2，仅未成交委托可撤；已成交/已撤回 409） */
+/** Live: manually cancel one order (unfilled only; terminal → 409) */
+// 对应 POST /api/qmt/cancel/{order_id}
+export async function qmtCancel(orderId) {
+  return request('/api/qmt/cancel/' + encodeURIComponent(orderId), { method: 'POST', data: {} })
+}
+
+/** 实盘：触发交割单三方对账（§WS-B/§U-2，report_only 仅比对 / sync_fills 补记缺失） */
+/** Live: trigger settlement reconciliation (report_only / sync_fills) */
+// 对应 POST /api/qmt/settle，body { day?, mode? }，返回 { ok, day, mode, diff }
+export async function qmtSettle(data = {}) {
+  return request('/api/qmt/settle', { method: 'POST', data })
+}
+
+/** 实盘：交割单对账历史（§WS-B/§U-2，最近差异快照） */
+/** Live: settlement reconciliation history (recent diffs) */
+// 对应 GET /api/qmt/settle/history，返回 { ok, diffs:[{day,missing_in_local,extra_in_local,mismatch,...}] }
+export async function fetchQMTSettleHistory() {
+  return request('/api/qmt/settle/history')
 }
 
 /** 模拟盘：总开关与绩效/信号质量统计 */
@@ -816,6 +864,7 @@ const IPO_CACHE_KEY = 'ipo_calendar_cache_v1'
  *  - 未命中则请求 GET /api/ipo/calendar，成功后把当天日期与数据一并写回 localStorage。
  *  - otherwise it requests GET /api/ipo/calendar and writes back both the date and data to localStorage on success.
  */
+// 打新日历：近两周新股（外部数据源，失败返回空）
 export async function fetchIPOCalendar() {
   const today = new Date().toISOString().slice(0, 10)
   try {
@@ -850,6 +899,7 @@ export async function fetchIPOCalendar() {
  * @param {string} code - the stock code
  * 对应后端 GET /api/stock/lookup?code=...，返回个股名称/现价等基础信息
  */
+// 个股速查：行情快照（抽屉头部数据源）
 export async function fetchStockLookup(code) {
   return request('/api/stock/lookup?code=' + encodeURIComponent(code))
 }
@@ -864,6 +914,7 @@ export async function fetchStockLookup(code) {
  * @param {boolean} [all] - whether to fetch all (including historical) news; appends ?all=true when true
  * 对应后端 GET /api/news（all=true 时追加 ?all=true，返回含历史的全部资讯）
  */
+// 资讯列表（all=true 含未过滤条目）
 export async function fetchNews(all) {
   return request(all ? '/api/news?all=true' : '/api/news')
 }
@@ -877,6 +928,7 @@ export async function fetchNews(all) {
  * Runs asynchronously; a 202 response means it has been triggered.
  * 对应后端 POST /api/news/reanalyze
  */
+// 手动触发一次新闻重新归因
 export async function reanalyzeNews() {
   return request('/api/news/reanalyze', { method: 'POST' })
 }
@@ -990,6 +1042,7 @@ let sseRetry = 0
  * @returns {Function} unsubscribe - 调用后将该回调从列表中移除
  * @returns {Function} unsubscribe - removes this callback from the list when invoked
  */
+// 注册 SSE 消息回调，返回注销函数
 export function onSSE(fn) {
   sseCallbacks.push(fn)
   return () => { sseCallbacks = sseCallbacks.filter(f => f !== fn) }
@@ -1332,6 +1385,7 @@ export async function rejectResearchCandidate(id) {
  *  params 可选 {start,end,top_k,min_stocks}：自定义回测时长与选股数（阶段3.3，透传执行参数）。
  *  English: enqueues a high-priority candidate backtest; the researchd worker runs it after hours.
  *  Same-ref duplicates return the existing task idempotently. Optional params pass through. */
+// 对研究候选发起回测（可选参数覆盖）
 export async function backtestResearchCandidate(id, params) {
   const qs = new URLSearchParams()
   if (params) {
@@ -1349,6 +1403,7 @@ export async function backtestResearchCandidate(id, params) {
  *  排队中(queued) → 直接置 cancelled 终态（尚未开始执行，无断点概念）。
  *  English: cancel — running rows are killed+interrupted (checkpoints stay valid); queued rows are
  *  cancelled outright (never started). */
+// 取消运行中的回测任务
 export async function cancelBacktest(id) {
   return request('/api/research/backtest/' + encodeURIComponent(id) + '/cancel', { method: 'POST' })
 }
@@ -1488,6 +1543,14 @@ export async function setAdminUserExpiry(id, expiresDays) {
 /** Delete a user (DELETE /api/admin/users/{id}; the admin account cannot be deleted) */
 export async function deleteAdminUser(id) {
   return request('/api/admin/users/' + encodeURIComponent(id), { method: 'DELETE' })
+}
+
+/** 批量清理脏账号（§U-5 POST /api/admin/users/cleanup）：过期账号 + 会话全部过期/已禁用的 temp_ 临时号。
+ *  dryRun=true 仅预览不落刀（返回将被清理的清单）。 */
+/** Bulk-reap stale accounts (§U-5): expired + dead/disabled temp_ temps; dryRun previews. */
+// 对应 POST /api/admin/users/cleanup，body { dry_run }，返回 { deleted:[{id,username,reason}], count, dry_run }
+export async function cleanupAdminUsers(dryRun = false) {
+  return request('/api/admin/users/cleanup', { method: 'POST', data: { dry_run: !!dryRun } })
 }
 
 /** 读取指定账号战法参数（GET /api/admin/users/{id}/config/strategy） */

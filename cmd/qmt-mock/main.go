@@ -202,19 +202,69 @@ func main() {
 		reportToken = token
 	}
 
+	// §U-4（2026-09-14 像素级 UAT）事件回报助手：把委托生命周期事件推回引擎
+	// （受理"已报"/成交"已成"+trade/撤单"已撤"，与实网关回调同口径）；
+	// -server 未配置时静默跳过，纯本地联调不受影响。
+	// orderEvent/路由面已抽为包级函数（buildHandler），供 §U-4 生命周期单测直接驱动。
+	push := func(payload map[string]interface{}) {
+		if *server == "" {
+			return
+		}
+		if err := postReport(*server, *reportToken, payload); err != nil {
+			log.Printf("[mock] report push failed: %v", err)
+		} else {
+			log.Printf("[mock] reported type=%v status=%v order=%v", payload["type"], payload["status"], payload["order_id"])
+		}
+	}
+
+	handler := buildHandler(b, *token, *delay, push)
+
+	srv := &http.Server{Addr: *listen, Handler: handler}
+	go func() {
+		log.Printf("[mock] MiniQMT mock gateway listening on %s (account=%s)", *listen, b.account)
+		if *server != "" {
+			log.Printf("[mock] fill reports → %s POST /api/qmt/report (token=%s)", *server, *reportToken)
+		}
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[mock] listen: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	log.Println("[mock] shutting down")
+	_ = srv.Close()
+}
+
+// orderEvent 组一条委托状态回报：字段形状与真实网关（qmt_gateway/handler.py）的 order 回调
+// 一致，引擎侧按 signal_id 走单调状态机推进。提取为包级函数供 §U-4 生命周期单测复用。
+// English: builds an order-status report shaped like the real gateway's callback payload.
+func orderEvent(o *order, status string) map[string]interface{} {
+	return map[string]interface{}{
+		"type": "order", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
+		"status": status, "price": o.Price, "qty": o.Qty,
+		"signal_id": o.SignalID, "at": time.Now().Format(time.RFC3339),
+	}
+}
+
+// buildHandler 组装 mock 网关的 HTTP 面（/health /state /order /cancel + Bearer 中间件）。
+// §U-4 测试化改造：路由逻辑原内联于 main（依赖 flag 全局），无法单测委托生命周期
+// （已报→已成/已撤 事件推送、撤单竞态守卫、终态 409 契约）；现抽为纯函数——账本 book、
+// 鉴权 token、成交延时、回报回调 push 全部注入，httptest 可直接驱动验证。
+// English: extracts the mock's HTTP surface into an injectable function so the §U-4 order
+// lifecycle (submit/fill/cancel events, race guard, 409 contract) is unit-testable.
+func buildHandler(b *book, token string, delay time.Duration, push func(map[string]interface{})) http.Handler {
 	mux := http.NewServeMux()
 
 	// /health 健康探测。§GAP2-W1 补 broker_connected=true：真实 qmt_gateway 的 /health 带该字段
-	// （反映 xtquant 通道状态），首尔侧 Health() 现在要求 ok && broker_connected 才算健康；
+	// （反映 xtquant 通道状态），引擎侧 Health() 要求 ok && broker_connected 才算健康；
 	// mock 必须对齐契约，否则全链路联调会因"通道未连"被熔断。
-	// （/health liveness probe. §GAP2-W1 adds broker_connected=true to mirror the real gateway
-	// contract; Seoul's Health() requires ok && broker_connected since the W1 fix.）
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": true, "broker_connected": true, "ts": time.Now().Format(time.RFC3339)})
 	})
 
 	// /state 网关状态与持仓/委托（对账源）。
-	// （/state gateway state and positions/orders, the reconciliation source.）
 	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
 		b.mu.Lock()
 		orders := make([]map[string]interface{}, 0, len(b.orders))
@@ -233,9 +283,7 @@ func main() {
 		})
 	})
 
-	// /order 下单：受理即返回 order_id，延时后模拟成交并回报。
-	// （/order places an order: returns order_id immediately, then simulates a fill after the delay and
-	// reports it back.）
+	// /order 下单：受理即返回 order_id 并推"已报"，延时后模拟成交推"已成"+trade。
 	mux.HandleFunc("/order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -261,7 +309,7 @@ func main() {
 			http.Error(w, `{"ok":false,"err":"code/qty required"}`, http.StatusBadRequest)
 			return
 		}
-		// signal_id 幂等：同 signal_id 已受理 → 返回原 order_id（不重复下单，与 M2 网关语义一致）
+		// signal_id 幂等：同 signal_id 已受理 → 返回原 order_id（不重复下单，与实网关语义一致）
 		if req.SignalID != "" {
 			b.mu.Lock()
 			if prev, dup := b.signal[req.SignalID]; dup {
@@ -288,36 +336,43 @@ func main() {
 		}
 		b.mu.Unlock()
 		log.Printf("[mock] order accepted %s %s %d@%.2f", req.Side, req.Code, req.Qty, req.Price)
+		// §U-4 受理即推 order 事件（已报），与实网关 on_order_response 回调同口径——
+		// 引擎侧据此把委托生命周期纳入单调状态机观测（占位行幂等，不会误覆盖）。
+		push(orderEvent(o, "已报"))
 
 		// 延时模拟成交并回报。
-		// Simulate the fill after the delay and report back.
 		go func(o *order) {
-			time.Sleep(*delay)
-			b.applyFill(o, o.Price)
+			time.Sleep(delay)
+			// §U-4 撤单竞态守卫：真实柜台里"已撤委托绝不会再成交"。旧 mock 延时到点无条件
+			// applyFill 并把状态强改"已成"，撤单窗口内的单被回填成交→幻影成交流入持仓
+			// （实测 MOCK000002 撤单仍持仓）。现成交前先判状态，非"已报"即跳过。
 			b.mu.Lock()
+			if o.Status != "已报" {
+				cur := o.Status
+				b.mu.Unlock()
+				log.Printf("[mock] skip fill: order %s already %s (not 已报)", o.OrderID, cur)
+				return
+			}
 			o.Status = "已成"
+			evtDone := orderEvent(o, "已成")
 			b.mu.Unlock()
+			b.applyFill(o, o.Price)
 			log.Printf("[mock] fill %s %s %d@%.2f", o.Side, o.Code, o.Qty, o.Price)
 
-			if *server != "" {
-				payload := map[string]interface{}{
-					"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
-					"price": o.Price, "qty": o.Qty, "amount": float64(o.Qty) * o.Price,
-					"traded_at": time.Now().Format(time.RFC3339), "signal_id": o.SignalID,
-				}
-				if err := postReport(*server, *reportToken, payload); err != nil {
-					log.Printf("[mock] report push failed: %v", err)
-				} else {
-					log.Printf("[mock] reported fill to %s", *server)
-				}
-			}
+			// §U-4 先推 order（已成）推进委托状态机，再推 trade 记账成交——两条同实网关契约。
+			push(evtDone)
+			push(map[string]interface{}{
+				"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
+				"price": o.Price, "qty": o.Qty, "amount": float64(o.Qty) * o.Price,
+				"traded_at": time.Now().Format(time.RFC3339), "signal_id": o.SignalID,
+			})
 		}(o)
 
 		writeJSON(w, map[string]interface{}{"ok": true, "order_id": orderID})
 	})
 
-	// /cancel 撤单：仅未成委托可撤。
-	// （/cancel cancels an order: only unfilled orders may be cancelled.）
+	// /cancel 撤单：仅未成委托可撤；未知 404、终态 409（与实网关 §R4-1 契约一致），
+	// 成功置"已撤"并推 order 事件。
 	mux.HandleFunc("/cancel", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			OrderID string `json:"order_id"`
@@ -327,47 +382,44 @@ func main() {
 			return
 		}
 		b.mu.Lock()
-		if o := b.orders[req.OrderID]; o != nil && o.Status == "已报" {
-			o.Status = "已撤"
+		o := b.orders[req.OrderID]
+		if o == nil {
+			b.mu.Unlock()
+			http.Error(w, `{"ok":false,"err":"unknown order_id"}`, http.StatusNotFound)
+			return
 		}
+		if o.Status != "已报" {
+			// 已成/已撤/废单等终态不可撤——真实柜台回 409，引擎侧 CancelOrder 据此如实报错，
+			// 绝不吞掉失败让引擎误判撤单成功（§R4-1）。旧 mock 无条件回 ok:true 掩盖了这条分支。
+			cur := o.Status
+			b.mu.Unlock()
+			http.Error(w, `{"ok":false,"err":"order not cancellable (status=`+cur+`)"}`, http.StatusConflict)
+			return
+		}
+		o.Status = "已撤"
+		evtCancel := orderEvent(o, "已撤")
 		b.mu.Unlock()
+		log.Printf("[mock] cancelled %s", req.OrderID)
+		push(evtCancel)
 		writeJSON(w, map[string]interface{}{"ok": true})
 	})
 
-	// Bearer 鉴权中间件（除 /health 外）。
-	// （Bearer auth middleware, /health excluded.）
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Bearer 鉴权中间件（/health 豁免，其余必须携带与引擎 qmt.token 一致的密钥）。
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			mux.ServeHTTP(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != *token {
+		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != token {
 			http.Error(w, `{"ok":false,"err":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		mux.ServeHTTP(w, r)
 	})
-
-	srv := &http.Server{Addr: *listen, Handler: handler}
-	go func() {
-		log.Printf("[mock] MiniQMT mock gateway listening on %s (account=%s)", *listen, b.account)
-		if *server != "" {
-			log.Printf("[mock] fill reports → %s POST /api/qmt/report (token=%s)", *server, *reportToken)
-		}
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[mock] listen: %v", err)
-		}
-	}()
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	log.Println("[mock] shutting down")
-	_ = srv.Close()
 }
 
-// postReport 推送回报到首尔服务器。
+// postReport 推送回报到引擎服务器。
 // （postReport pushes a report to the Seoul server.）
 func postReport(base, token string, payload map[string]interface{}) error {
 	body, err := json.Marshal(payload)

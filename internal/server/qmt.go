@@ -827,6 +827,12 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		return
 	}
 	s.cfg.SetQMTConfigFor(target, &cfg)
+	// §U-3（2026-09-14 像素级 UAT）：本端点其余字段走开关队列（休市不翻转实盘行为，§QMT-PENDING），
+	// 但请求显式携带 halted 属 kill-switch 语义——必须与 /api/qmt/halt 同口径立即生效，
+	// 否则"保存即熔断"会静默滞留到次日开盘（fail-stop 漏洞）。
+	if req.Halted != nil {
+		s.applyKillSwitchNow(target, &cfg, "config_save")
+	}
 	// §WS-K 维4 变更 diff → opslog 审计（可下载/前端历史可见）
 	if beforeBytes != nil {
 		if afterBytes, err := config.RestoreRulesContentCurrent(s.cfg); err == nil {
@@ -865,6 +871,37 @@ func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, ctrl.Snapshot())
 }
 
+// handleQMTOrders 处理 GET /api/qmt/orders（admin）：当日实盘委托列表。
+// §U-2（2026-09-14 像素级 UAT）：撤单端点 /api/qmt/cancel/{order_id} 一直存在但前端零入口——
+// 根因是列表缺口：前端拿不到 order_id 就无从挂"撤单"按钮。本端点把 live.db orders 行
+// 按北京时间当日过滤返回（created_at 前缀 yyyy-MM-dd），终态/在途由前端按 status 呈现，
+// 仅 已报/部成（含部成待撤等未终结态）允许撤单。遗留全局行（user_id=''）沿用
+// RealOrdersForUser 的可见性口径，不额外收权。
+// English: §U-2 — today's live-book orders for the admin UI. The cancel endpoint existed with no
+// frontend entry precisely because the list carried no order ids to anchor the button; this
+// returns same-day rows (Beijing-time prefix filter) so the UI can render per-order cancel
+// actions on non-terminal statuses.
+func (s *Server) handleQMTOrders(w http.ResponseWriter, r *http.Request) {
+	db := s.realDB()
+	if db == nil {
+		writeError(w, http.StatusServiceUnavailable, "real book not available")
+		return
+	}
+	orders, err := db.RealOrdersForUser(userIDFor(r))
+	if err != nil {
+		writeError(w, 500, "list orders: "+err.Error())
+		return
+	}
+	today := cntime.In(time.Now()).Format("2006-01-02")
+	out := make([]store.RealOrder, 0, len(orders))
+	for _, o := range orders {
+		if strings.HasPrefix(o.CreatedAt, today) {
+			out = append(out, o)
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
 // handleQMTHalt §R4-1 kill-switch 端点（POST /api/qmt/halt，admin 权限）：
 //   - 请求体 {"halted": true}：置位人工紧急停止——立即拒绝一切新下单（auto/manual 双路径），
 //     并同步撤销本地账本全部"已报"未成交委托（HaltAll），SSE 告警广播；
@@ -886,40 +923,51 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 	cfg := *(s.cfg.GetQMTConfigFor(uid))
 	cfg.Halted = *req.Halted
 	s.cfg.SetQMTConfigFor(uid, &cfg)
-	ctrl := s.qmtCtrlFor(uid)
+	cancelled := s.applyKillSwitchNow(uid, &cfg, "endpoint")
+	writeJSON(w, 200, map[string]interface{}{"ok": "1", "halted": *req.Halted, "cancelled": cancelled})
+}
+
+// applyKillSwitchNow §U-3（2026-09-14 像素级 UAT）：kill-switch 置位/解除的"立即生效"公共执行体，
+// 供 POST /api/qmt/halt 专用端点与 POST /api/config/qmt 携带 halted 字段两条路径共用。
+// 背景：普通配置变更走 §QMT-PENDING 开关队列（交易时段由 scoreCycle 消费），休市时保存的
+// halted 会滞留到次日开盘才生效——与 fail-stop 语义冲突（UAT 实录：盘后 config 路径置 halted
+// 等待 6s 仍可下单）。kill-switch 属紧急停止，必须绕过队列直接 ctrl.UpdateConfig 同步，
+// 置位时同步 HaltAll 撤销在途未成交委托、SSE 广播、opslog 审计留痕（来源 source 区分端点）。
+// 返回值：本次同步撤销的委托笔数（无控制器/解除时 0）。
+// English: §U-3 — shared immediate-effect body for the kill switch, used by both the dedicated
+// /api/qmt/halt endpoint and a halted field carried by /api/config/qmt. Normal config edits ride
+// the session-queued hot-sync (so an off-hours halted save would only bite at next open — a
+// fail-stop violation caught in UAT); the kill switch bypasses the queue via ctrl.UpdateConfig,
+// runs HaltAll on engagement, broadcasts SSE and writes the audit trail. Returns cancelled count.
+func (s *Server) applyKillSwitchNow(uid string, cfg *config.QMTConfig, source string) int {
 	cancelled := 0
+	ctrl := s.qmtCtrlFor(uid)
 	if ctrl != nil {
-		// §QMT-PENDING kill-switch 属紧急停止：必须立即生效（不入开关队列）——
-		// placeOrder 读 ctrl.cfg.Halted 拦截新单，若只靠引擎热同步（现为盘中队列消费）会推迟到
-		// 交易时段，置位瞬间仍有新单流入，违背 fail-stop 语义。此处直接 UpdateConfig 立即同步。
-		// English: kill-switch must take effect immediately (bypasses the switch queue) — placeOrder reads
-		// ctrl.cfg.Halted; delaying via the session-queued hot-sync would let new orders flow in the
-		// meantime, violating fail-stop semantics.
-		ctrl.UpdateConfig(cfg)
-		if *req.Halted {
+		ctrl.UpdateConfig(*cfg)
+		if cfg.Halted {
 			cancelled = ctrl.HaltAll()
 		}
 	}
-	log.Printf("[trading] ⚠️ kill-switch %s (用户=%s): 同步撤销未成交委托 %d 笔",
-		map[bool]string{true: "置位——紧急停止一切下单", false: "解除"}[*req.Halted], uid, cancelled)
+	log.Printf("[trading] ⚠️ kill-switch %s (用户=%s 来源=%s): 同步撤销未成交委托 %d 笔",
+		map[bool]string{true: "置位——紧急停止一切下单", false: "解除"}[cfg.Halted], uid, source, cancelled)
 	// §DAILY_OPSLOG kill-switch 属最高优先级留档事件
-	opslog.Logf("quant", "kill-switch %s 用户=%s 撤销未成交委托=%d",
-		map[bool]string{true: "置位(紧急停止)", false: "解除"}[*req.Halted], uid, cancelled)
-	// §WS-F C1 审计：kill-switch 翻转留痕
+	opslog.Logf("quant", "kill-switch %s 用户=%s 来源=%s 撤销未成交委托=%d",
+		map[bool]string{true: "置位(紧急停止)", false: "解除"}[cfg.Halted], uid, source, cancelled)
+	// §WS-F C1 审计：kill-switch 翻转留痕（来源区分专用端点/配置保存）
 	result := "clear"
-	if *req.Halted {
+	if cfg.Halted {
 		result = "set"
 	}
-	opslog.Audit("kill_switch", uid, "qmt", result)
+	opslog.Audit("kill_switch", uid, "qmt:"+source, result)
 	if s.sse != nil {
 		s.sse.BroadcastTo(uid, map[string]interface{}{
 			"type":      "qmt_halt",
-			"halted":    *req.Halted,
+			"halted":    cfg.Halted,
 			"cancelled": cancelled,
 			"time":      time.Now().Format("15:04:05"),
 		})
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": "1", "halted": *req.Halted, "cancelled": cancelled})
+	return cancelled
 }
 
 // handleQMTSettle §WS-B 交割单三方对账端点（POST /api/qmt/settle，admin 权限）：
