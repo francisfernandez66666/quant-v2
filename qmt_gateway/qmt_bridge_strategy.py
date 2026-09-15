@@ -3,6 +3,12 @@
 # -*- coding: ascii -*-
 """qmt_bridge_strategy v9 - file-transport bridge with command execution.
 
+[Comment policy] This is the ONLY deliberately Chinese-free source file in the repo --
+by design, not debt: the QMT model editor / trading sandbox loads it under GBK (taboo 3),
+and non-ASCII bytes in comments/literals get shredded there (BUY/SELL are \\u escapes for
+the same reason). Its protocol counterpart qmt_gateway/gateway.py carries the full
+Chinese commentary for both sides of this bridge.
+
 Transport: local files in BRIDGE_DIR (sandbox TCP is unavailable - no _socket pyd).
   bridge_report.jsonl  (bridge -> gateway, appended lines): heartbeat / order_result
     / cancel_result / trade / positions / account  (same JSON schema as the old

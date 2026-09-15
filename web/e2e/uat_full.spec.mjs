@@ -97,6 +97,40 @@ test.describe('交易相关分支', () => {
     void cap
   })
 
+  test('Quant：单笔金额绝对帽保存→回读→还原（§AUDIT-PM 新增字段）', async ({ page }) => {
+    // 锁定今日新增的 max_order_amount UI 面：服务端回填、保存持久、还原闭环。
+    // hydration/teardown 防竞态手法与「仓位纪律」用例同款（waitForResponse + 点击前 DOM 断言 + 服务端轮询）。
+    await page.goto('/#/quant')
+    const auth = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const c = await (await page.request.get('/api/config/qmt', { headers: auth })).json()
+    const baseline = String(c.max_order_amount ?? 0)
+    const capInput = page.locator('div', { hasText: /^单笔金额绝对帽/ }).locator('input').first()
+    await expect(capInput, '服务端值回填 hydration 完成').toHaveValue(baseline, { timeout: 10000 })
+    // 已知的 loadConfig 晚到 setForm 冲输入竞态（§AUDIT-PM 未修项）在此字段命中率高：基线 0 与
+    // 缓存种子 0 不可分辨，DOM 断言稳定后点击瞬间 state 仍可能被冲掉（全套连跑两次实锤）。
+    // 以服务端为权威重试「fill→点击→GET 校验」整环，直到真存上（保存幂等，重复点无副作用）。
+    await expect(async () => {
+      await capInput.fill('150000')
+      await page.getByRole('button', { name: '保存仓位纪律' }).click()
+      const c1 = await (await page.request.get('/api/config/qmt', { headers: auth })).json()
+      expect(String(c1.max_order_amount), '保存动作真正把 150000 写进服务端').toBe('150000')
+    }).toPass({ timeout: 20000 })
+    await expect(page.locator('.t-message')).toBeVisible()
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes('/api/config/qmt') && r.request().method() === 'GET', { timeout: 8000 }),
+      page.reload(),
+    ])
+    await expect(capInput, '刷新后 150000 持久化').toHaveValue('150000', { timeout: 10000 })
+    await capInput.fill(baseline)
+    await expect(capInput, '还原值在点击前仍保持').toHaveValue(baseline, { timeout: 3000 })
+    await page.getByRole('button', { name: '保存仓位纪律' }).click()
+    await expect(page.locator('.t-message'), '还原落库').toBeVisible({ timeout: 8000 })
+    await expect(async () => {
+      const c2 = await (await page.request.get('/api/config/qmt', { headers: auth })).json()
+      expect(String(c2.max_order_amount), '还原后服务端回到基线').toBe(baseline)
+    }).toPass({ timeout: 8000 })
+  })
+
   test('Quant：全自动切换弹二次确认，取消不生效', async ({ page }) => {
     await page.goto('/#/quant')
     await page.getByText('全自动', { exact: true }).first().click()

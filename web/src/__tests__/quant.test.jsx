@@ -5,7 +5,7 @@
 // English: §F6 regression — mount Quant and assert the link-status card renders; guards the class of
 // undefined-identifier ReferenceError that the bundler can't catch and that previously had no coverage.
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 // 整页 API mock：挂载态仅走只读拉取，返回合法字段（不触发任何写操作）。
 vi.mock('../api/index.js', () => ({
@@ -14,6 +14,7 @@ vi.mock('../api/index.js', () => ({
     enabled: true, mode: 'auto', price_type: 'market', auto_sell: false,
     gateway_url: 'http://127.0.0.1:8789', token_masked: '****',
     fixed_amount: 10000, max_positions: 10, initial_capital: 100000,
+    max_order_amount: 150000,
     daily_max_buys: 20, daily_budget_amount: 100000, miss_heartbeat_sec: 120,
     known_strategies: [{ id: 'dragon', name: '龙头识别', kind: 'form' }],
     strategies: [], strategy_amounts: {},
@@ -47,5 +48,21 @@ describe('Quant 页挂载（§链路状态卡回归）', () => {
     expect(screen.getByText(/当前：miniQMT兼容/)).toBeInTheDocument()
     // 网关地址回显
     expect(screen.getByText('http://127.0.0.1:8789')).toBeInTheDocument()
+  })
+})
+
+// §AUDIT-PM 2026-09-15 单笔金额绝对帽：仓位纪律卡渲染输入框、服务端值回填、
+// 编辑后保存的 payload 携带 max_order_amount（后端契约面见 Go 测试，此处锁前端不回退）。
+describe('Quant 页单笔金额绝对帽字段（§AUDIT-PM）', () => {
+  it('渲染标签与服务端值回填，保存 payload 携带该字段', async () => {
+    const api = await import('../api/index.js')
+    render(<Quant />)
+    expect(await screen.findByText('单笔金额绝对帽(元)')).toBeInTheDocument()
+    const input = await screen.findByDisplayValue('150000')
+    fireEvent.change(input, { target: { value: '200000' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存仓位纪律' }))
+    await waitFor(() => expect(api.updateQMTConfig).toHaveBeenCalled())
+    const payload = api.updateQMTConfig.mock.calls.at(-1)[0]
+    expect(payload.max_order_amount).toBe(200000)
   })
 })

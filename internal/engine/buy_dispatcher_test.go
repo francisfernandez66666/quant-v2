@@ -17,6 +17,7 @@ import (
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
@@ -175,4 +176,61 @@ func TestAsyncDispatcherIdempotentKey(t *testing.T) {
 // startsWith 字符串前缀判断（测试断言辅助）。
 func startsWith(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// TestBuyQueueDepthGauge §AUDIT-PM 2026-09-15：buy_queue_depth 量规随入队/出队实时跟踪
+// 队列深度——崩溃丢单观测面（buyCh 为内存队列，深度=重启瞬间可能丢失的待下单信号数）。
+// 两段断言：入队侧用手工 channel（无 worker，深度确定）；出队侧用真 worker（下单落定后
+// 深度必须归零，证明量规不是只增不减的死数字）。
+// English: the gauge tracks enqueue/dequeue in real time; enqueue side deterministic with a manual
+// channel, drain side asserts the gauge returns to 0 once a real worker has placed the order.
+func TestBuyQueueDepthGauge(t *testing.T) {
+	e, _, srv, _, _ := newAsyncEngine(t)
+	defer srv.Close()
+	e.mu.Lock()
+	e.buyCh = make(chan buyTask, 64)
+	e.buyStop = make(chan struct{})
+	e.mu.Unlock()
+
+	sig := combat_agent.Signal{
+		ID: "s1", Code: "600000", Name: "浦发银行", Strategy: "龙头",
+		Direction: "做多", Action: "买入", Price: 10,
+	}
+	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
+
+	e.autoPlace(sig, live)
+	if v, ok := metrics.GetGauge("buy_queue_depth"); !ok || v != 1 {
+		t.Fatalf("入队 1 笔后量规应为 1, got v=%d ok=%v", v, ok)
+	}
+	e.autoPlace(sig, live)
+	if v, _ := metrics.GetGauge("buy_queue_depth"); v != 2 {
+		t.Fatalf("入队 2 笔后量规应为 2, got %d", v)
+	}
+
+	// 出队侧：真 worker 引擎，等其下单落定后量规应归零。
+	e2, _, srv2, orders2, mu2 := newAsyncEngine(t)
+	defer srv2.Close()
+	e2.StartBuyDispatcher(1)
+	defer e2.StopBuyDispatcher()
+	e2.autoPlace(combat_agent.Signal{
+		ID: "s2", Code: "600000", Name: "浦发银行", Strategy: "龙头",
+		Direction: "做多", Action: "买入", Price: 10,
+	}, live)
+	deadline := time.After(5 * time.Second)
+	for {
+		mu2.Lock()
+		n := len(*orders2)
+		mu2.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("worker 5s 内未下单")
+		case <-time.After(30 * time.Millisecond):
+		}
+	}
+	if v, ok := metrics.GetGauge("buy_queue_depth"); !ok || v != 0 {
+		t.Fatalf("worker 消费后量规应归零, got v=%d ok=%v", v, ok)
+	}
 }

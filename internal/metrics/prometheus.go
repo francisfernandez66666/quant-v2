@@ -34,6 +34,18 @@ func SetGauge(name string, v int64) {
 	g.Store(v)
 }
 
+// GetGauge 读取量规当前值（不存在返回 ok=false）。只读快照，供测试与告警自诊断使用。
+// English: reads a gauge's current value (ok=false when absent); read-only accessor for tests.
+func GetGauge(name string) (int64, bool) {
+	gaugeMu.Lock()
+	defer gaugeMu.Unlock()
+	g, ok := gauges[name]
+	if !ok {
+		return 0, false
+	}
+	return g.Load(), true
+}
+
 // gaugeSnapshot 返回量规名的排序快照（确定性输出）。
 func gaugeSnapshot() map[string]int64 {
 	gaugeMu.Lock()
