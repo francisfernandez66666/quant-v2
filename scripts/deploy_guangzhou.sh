@@ -83,17 +83,48 @@ $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
 
 # ── 3. 数据目录 + 默认 config.json（影子模式：qmt.enabled=false）──
+# §UAT 20260915 部署加固：原内联 SSH 命令的 bash→PS 双层转义在每个部署日都报 ParserError
+# 噪音，现抽为独立脚本上传后执行（转义链路归零；已有 config 一律保留不覆盖）。
 echo "[3/5] 初始化数据目录 + 默认 config.json（影子模式）..."
-$SSH "powershell -NoProfile -Command \"
-if (-not (Test-Path '$DATA_DIR/config.json')) {
-  \$cfg = [ordered]@{
-    qmt = [ordered]@{ enabled = \$false; mode = 'manual'; gateway_url = 'http://127.0.0.1:8789' }
-    rules = [ordered]@{ scheduler = [ordered]@{} ; paper = [ordered]@{ enabled = \$false } }
-  }
-  [System.IO.File]::WriteAllText('$DATA_DIR/config.json', (\$cfg | ConvertTo-Json -Depth 4))
-  Write-Host '  已生成默认 config.json (qmt.enabled=false, 影子模式)'
-} else { Write-Host '  保留现有 config.json（未覆盖）' }
-\""
+$SCP deploy/qmt-win/init_default_config.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+$SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/init_default_config.ps1 -DataDir ${DATA_DIR}"
+
+# ── 3b. 重启 qmt_gateway（§UAT 20260915 新增）──
+# 背景：步 [2b] 同步了网关 .py，但旧流程不重启网关——新代码要等 5 分钟粒度的
+# QMT-Gateway-Ensure 计划任务"碰巧"拉起才生效（2026-09-15 部署实录：/settlement 端点
+# 延迟上线，手动 kill 网关 python 后由 ensure 任务自动拉起新代码）。现部署即重启：
+# 杀掉 gateway python 进程 → ensure/watchdog 守护自动重拉 → 轮询 /health 直至就绪。
+# RESTART_GATEWAY=0 可跳过（如只想同步文件、不动交易时段的网关连接）。
+if [ "${RESTART_GATEWAY:-1}" = "1" ]; then
+  echo "[3b/5] 重启 qmt_gateway（载入新网关代码）..."
+  # 杀进程逻辑抽为独立 PS1（避免 bash→SSH→PS 三层引号转义链，§UAT 20260915 教训）；
+  # ensure/watchdog 守护 3s 自动重拉，下方轮询 /health 确认就绪。
+  $SCP deploy/qmt-win/restart_gateway.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+  $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/restart_gateway.ps1"
+  # 轮询 /health 至多 120s：ensure 计划任务 5 分钟粒度，兜底主动触发一次
+  gw_ok=0
+  for i in $(seq 1 24); do
+    sleep 5
+    if $SSH "powershell -NoProfile -Command \"try { (Invoke-WebRequest -Uri http://127.0.0.1:8789/health -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 } catch { exit 1 }\"" 2>/dev/null; then
+      gw_ok=1
+      break
+    fi
+  done
+  if [ $gw_ok -eq 0 ]; then
+    echo "  /health 未就绪，主动触发 QMT-Gateway-Ensure 计划任务..."
+    $SSH "schtasks /Run /TN QMT-Gateway-Ensure" || true
+    for i in $(seq 1 24); do
+      sleep 5
+      if $SSH "powershell -NoProfile -Command \"try { (Invoke-WebRequest -Uri http://127.0.0.1:8789/health -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 } catch { exit 1 }\"" 2>/dev/null; then
+        gw_ok=1
+        break
+      fi
+    done
+  fi
+  [ $gw_ok -eq 1 ] && echo "  OK 网关已就绪 (127.0.0.1:8789/health)" || echo "  X 网关未就绪：远程查看 C:/qmt/quant-trading-v2/qmt_gateway/gateway*.log"
+else
+  echo "[3b/5] 跳过网关重启（RESTART_GATEWAY=0）"
+fi
 
 # ── 4. 注册 Windows 服务（NSSM）+ qmtctl 任务计划 ──
 if [ $SYNC_ONLY -eq 1 ]; then
@@ -107,16 +138,23 @@ else
   $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/register_engine_services.ps1 $REMOTE_ARGS"
 fi
 
-# ── 5. 健康检查 ──
-echo "[5/5] 健康检查（本机 127.0.0.1:8080）..."
+# ── 5. 健康检查（§UAT 20260915 升级：引擎/Caddy 前端/网关三探针）──
+echo "[5/5] 健康检查..."
 sleep 3
-if $SSH "powershell -NoProfile -Command \"(Invoke-WebRequest -Uri http://127.0.0.1:8080/setup -UseBasicParsing -TimeoutSec 10).StatusCode -eq 200\"" 2>/dev/null; then
-  echo "  OK 引擎已响应 (127.0.0.1:8080)"
+# 引擎（NSSM quant 服务 :8081，Caddy 反代 :8080）：/setup 未初始化时 200、已初始化时 404，
+# 两者都证明引擎存活——不再像旧版只探 8080/setup（现网拓扑下恒 404 误报"未就绪"）。
+if $SSH "powershell -NoProfile -Command \"try { (Invoke-WebRequest -Uri http://127.0.0.1:8081/setup -UseBasicParsing -TimeoutSec 10).StatusCode } catch { \$_.Exception.Response.StatusCode.value__ }\"" 2>/dev/null | grep -qE "^(200|404)$"; then
+  echo "  OK 引擎已响应 (127.0.0.1:8081)"
 else
   echo "  X 引擎未就绪，远程查看: Get-Service quant ; 日志在 $DATA_DIR/logs 或 nssm 日志"
 fi
+# 网关（步 [3b] 已重启）：/health ok 才算本次部署的网关代码生效
+if $SSH "powershell -NoProfile -Command \"try { (Invoke-WebRequest -Uri http://127.0.0.1:8789/health -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 } catch { exit 1 }\"" 2>/dev/null; then
+  echo "  OK 网关已响应 (127.0.0.1:8789/health)"
+else
+  echo "  X 网关未就绪（RESTART_GATEWAY=0 时属预期）；可用 scripts/verify_deploy_guangzhou.sh 复核"
+fi
 echo "=============================================="
-echo " 影子部署完成。当前 qmt.enabled=false -> 不下真实单，与首尔并行验证安全。"
-echo " 验证：http://${GZ_IP}:8080/setup（创建管理员）/ 看研究调度日志。"
-echo " 真正切流（M4）：见 docs/MIGRATION_GUANGZHOU_ALLINONE.md §2 切流清单。"
+echo " 部署完成（当前 config 原样保留，qmt 开关状态不受部署影响）。"
+echo " 验证：./scripts/verify_deploy_guangzhou.sh（buildCommit 指纹/新端点/服务状态全量复核）"
 echo "=============================================="
