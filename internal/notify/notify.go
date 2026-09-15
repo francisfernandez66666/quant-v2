@@ -47,6 +47,10 @@ type Notifier struct {
 	webhookURLs []string                // Webhook HTTP 回调地址列表
 	gateway     PushGateway             // 外部推送网关（极光/个推/通用 REST，APK 后台/离线触达）
 
+	// §HARDENING ntfy 独立通道：与 gateway（APK 业务消息）并行的运维告警通道——
+	// 服务商/进程/网络路径完全独立，引擎自身出问题时仍能报信（通道冗余）。nil=未启用。
+	ntfy PushGateway
+
 	// §GAP5.2 静默时段（"HH:MM" 分钟数，<0 = 未启用；可跨午夜）：窗口内仅 LevelHigh 放行，
 	// 低/中级别本地留痕不推送。English: quiet-hours gate — only LevelHigh passes inside the window.
 	quietStart int // 静默开始分钟数（<0=未启用）

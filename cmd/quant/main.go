@@ -278,6 +278,14 @@ func main() {
 			log.Printf("[main] 外部推送网关已启用: webhook(%s)", pushCfg.URL)
 		}
 	}
+	// §HARDENING ntfy 运维告警通道：与上面的 APK 网关并行、相互独立（服务商/进程/路径不同），
+	// 关键提醒双投；Topic 为空=关闭。备份/监控脚本也订阅同一 topic 报丧。
+	if nc := cfgMgr.GetNotifyConfig(); nc != nil && nc.NtfyTopic != "" {
+		if gw := notify.NewNtfyGateway(nc.NtfyURL, nc.NtfyTopic); gw != nil {
+			notifier.SetNtfy(gw)
+			log.Printf("[main] ntfy 运维告警通道已启用: %s/<topic>", gw.URL)
+		}
+	}
 
 	// 5秒实时行情采集器（激活 data.Fetcher：自选+持仓为监控池，供实时触发/快照使用）
 	baseStocks := append(wlMgr.All(), rpt.HeldPositionCodes()...)

@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -241,5 +242,41 @@ func TestStoredLLMConfig(t *testing.T) {
 	// 子账号经 ownerOf 解析到运营账号同一份保存（系统级共享语义）
 	if s2, ok2 := m.StoredLLMConfig("u_sub"); !ok2 || s2.Model != "qwen3.8-flash-free" {
 		t.Fatalf("子账号应解析到运营保存配置, got %+v ok=%v", s2, ok2)
+	}
+}
+
+// TestNotifyNtfyChannelRoundTrip §HARDENING ntfy 运维告警通道配置键：JSON 序列化往返不丢键，
+// 默认零值=通道关闭（main.go 的 Topic!="" 启用守卫依赖此语义）。
+// 注意：Manager.Rules 是指向包级单例 DefaultRules 的指针（运行时全局单实例语义），
+// SetNotifyConfig 会污染全局默认——本测试走纯 JSON 往返，不触碰全局状态。
+func TestNotifyNtfyChannelRoundTrip(t *testing.T) {
+	nc := NotifyConfig{
+		NtfyURL:   "https://ntfy.sh",
+		NtfyTopic: "topic-abc123",
+		Push:      PushConfig{Enabled: true, Provider: "jpush"}, // 并行通道不受影响
+	}
+	b, err := json.Marshal(Rules{Notify: nc})
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	var back Rules
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("反序列化失败: %v", err)
+	}
+	if back.Notify.NtfyURL != "https://ntfy.sh" || back.Notify.NtfyTopic != "topic-abc123" {
+		t.Fatalf("往返后 ntfy 键丢失: url=%q topic=%q", back.Notify.NtfyURL, back.Notify.NtfyTopic)
+	}
+	if !back.Notify.Push.Enabled || back.Notify.Push.Provider != "jpush" {
+		t.Fatalf("ntfy 键不应影响 push 网关配置: %+v", back.Notify.Push)
+	}
+
+	// 零值往返：omitempty 不落盘，反序列化回空 = 通道关闭
+	b2, _ := json.Marshal(Rules{})
+	var zero Rules
+	if err := json.Unmarshal(b2, &zero); err != nil {
+		t.Fatalf("零值反序列化失败: %v", err)
+	}
+	if zero.Notify.NtfyTopic != "" {
+		t.Fatalf("默认配置不应启用 ntfy 通道, got %q", zero.Notify.NtfyTopic)
 	}
 }

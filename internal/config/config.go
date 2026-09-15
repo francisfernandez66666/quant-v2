@@ -776,6 +776,12 @@ type NotifyConfig struct {
 	QuietStart string `json:"quiet_start,omitempty"`
 	// 静默时段结束（HH:MM）
 	QuietEnd string `json:"quiet_end,omitempty"`
+	// §HARDENING ntfy 运维告警通道（与 APK 推送网关并行的独立冗余通道）：
+	// 主题名即凭证（随机串）；Topic 为空=不启用。URL 空默认公共服务器 https://ntfy.sh，
+	// 自托管后改此处即可，代码零改动。
+	NtfyURL string `json:"ntfy_url,omitempty"`
+	// ntfy 订阅主题（随机串，泄露=可伪造告警，勿入日志/前端）
+	NtfyTopic string `json:"ntfy_topic,omitempty"`
 }
 
 // PushConfig 外部推送网关配置。

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- com.quant.backup.plist — Mac 每日备份拉取任务（HARDENING 件1 的 Mac 半边）
+     语义：每日 07:00 跑 restic_pull_backup.sh；机器休眠错过则唤醒后立即补跑一次（launchd CalendarInterval 特性）。
+     安装：cp 本文件到 ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.quant.backup.plist
+     查看：launchctl list | grep com.quant.backup；日志见 ~/backups/quant/pull_backup.log -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.quant.backup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/zhangzifei/Desktop/quant-trading-v2/deploy/mac/restic_pull_backup.sh</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>7</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/zhangzifei/backups/quant/launchd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/zhangzifei/backups/quant/launchd.err</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/Users/zhangzifei</string>
+	</dict>
+</dict>
+</plist>

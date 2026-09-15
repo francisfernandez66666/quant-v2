@@ -124,6 +124,17 @@ go test -count=1 ./internal/research/ -run 'TestPoolDailyStats|TestDemoteApplied
 go test -count=1 ./internal/scheduler/ -run 'TestLifecycleStepMapped' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
+echo "==> 9/9 加固件1/2 专项（2026-09-15 §HARDENING：ntfy 通道 + 备份/监控脚本在位）..."
+go vet ./internal/notify ./cmd/quant
+go test -count=1 ./internal/notify/ -run 'TestNtfy|TestPushGatewayDualDispatch|TestPushGatewayOnlyOneChannel' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+# 备份链路三件套在位：广州快照 ps1+py、Mac 拉取器、launchd 清单
+[ -f deploy/qmt-win/backup_snapshot.ps1 ] && [ -f deploy/qmt-win/backup_snap.py ] \
+	&& [ -f deploy/mac/restic_pull_backup.sh ] && [ -f deploy/mac/com.quant.backup.plist ] \
+	&& echo "ok - 备份链路脚本在位" || { echo "FAIL - 备份链路脚本缺失"; exit 1; }
+# Kuma 无头初始化脚本在位（监控重建的最小物料）
+[ -f deploy/mac/kuma_seed.js ] && echo "ok - kuma_seed.js 在位" || { echo "FAIL - kuma_seed.js 缺失"; exit 1; }
+
 if [ "${1:-}" = "-full" ]; then
 	echo ""
 	echo "==> 附加：QMT 网关 Python 全量单测（文件桥/保活/降级/清仓护栏）..."

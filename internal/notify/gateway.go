@@ -98,24 +98,55 @@ func (n *Notifier) SetGateway(g PushGateway) {
 	n.mu.Unlock()
 }
 
+// SetNtfy 设置 ntfy 运维告警通道（§HARDENING：与主网关并行的独立冗余通道；传 nil 关闭）。
+// （SetNtfy installs the ntfy ops-alert channel in parallel with the primary gateway; nil disables.）
+func (n *Notifier) SetNtfy(g PushGateway) {
+	n.mu.Lock()
+	n.ntfy = g
+	n.mu.Unlock()
+}
+
 // PushGateway 若已配置，把消息投递给推送网关；未启用则直接返回。
 // 供关键提醒（清仓/止损/交易信号）在 Webhook 之外再触达 APK 后台。
 // §GAP5.2 投递失败进 outbox 补投队列（指数退避，5 次后死信）。
+// §HARDENING 同时并投 ntfy 独立运维通道（同一 outbox 补投语义，key 区分网关）。
 // （PushGateway forwards the message to the configured gateway if present; no-op when disabled.
 // Failures land in the outbox retry queue.）
 func (n *Notifier) PushGateway(msg Message) {
 	n.mu.RLock()
 	g := n.gateway
+	nt := n.ntfy
 	n.mu.RUnlock()
-	if g == nil {
+	if g == nil && nt == nil {
 		return
 	}
 	go func() {
-		if err := g.Send(msg); err != nil {
-			log.Printf("[notify] 推送网关错误: %v（进入补投队列）", err)
-			n.outbox.enqueue("gateway", msg, deliverGateway(n))
+		if g != nil {
+			if err := g.Send(msg); err != nil {
+				log.Printf("[notify] 推送网关错误: %v（进入补投队列）", err)
+				n.outbox.enqueue("gateway", msg, deliverGateway(n))
+			}
+		}
+		if nt != nil {
+			if err := nt.Send(msg); err != nil {
+				log.Printf("[notify] ntfy 通道错误: %v（进入补投队列）", err)
+				n.outbox.enqueue("ntfy", msg, deliverNtfy(n))
+			}
 		}
 	}()
+}
+
+// deliverNtfy 返回 ntfy 通道投递函数（首次发送与 outbox 补投共用；通道下线视为成功出队）。
+func deliverNtfy(n *Notifier) func(string, Message) error {
+	return func(_ string, m Message) error {
+		n.mu.RLock()
+		nt := n.ntfy
+		n.mu.RUnlock()
+		if nt == nil {
+			return nil
+		}
+		return nt.Send(m)
+	}
 }
 
 // deliverGateway 返回网关投递函数（首次发送与 outbox 补投共用）。
