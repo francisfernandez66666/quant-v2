@@ -1,4 +1,4 @@
-﻿﻿# restart_gateway.ps1 — 部署步 [3b/5] 网关重启（§UAT 20260915 新增）。
+﻿# restart_gateway.ps1 — 部署步 [3b/5] 网关重启（§UAT 20260915 新增）。
 # 背景：deploy 同步了网关 .py 后旧流程不重启——新代码要等 5 分钟粒度的 QMT-Gateway-Ensure
 # 计划任务"碰巧"拉起才生效（2026-09-15 部署实录：/settlement 端点延迟上线）。本脚本：
 # 杀掉 gateway python 进程 → ensure/watchdog 守护 3s 自动重拉（由调用方轮询 /health 确认就绪）。

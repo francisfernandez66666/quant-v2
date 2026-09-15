@@ -48,6 +48,22 @@ cd "$APP_DIR"
 SSH="ssh -o StrictHostKeyChecking=accept-new ${GZ_USER}@${GZ_IP}"
 SCP="scp -o StrictHostKeyChecking=accept-new"
 
+# ps1_bom <file>：上传前把 Windows PowerShell 脚本归一为「UTF-8 单 BOM + CRLF」。
+# 为何需要：PS 5.1 读无 BOM 的 UTF-8 按 GBK 解析中文注释会撕裂字面量直接 ParserError（现网实录）；
+# 但历史上 restart_gateway.ps1 等已自带 BOM，若再无条件 cat 拼一个就成双 BOM——PS 报
+# 「无法将「?#」识别为 cmdlet」（本次部署实录：[3b] restart_gateway 首行噪音）。
+# 本函数幂等：先剥掉所有前导 BOM，再补恰好一个；不动已规范的字节序（CRLF 保留）。
+ps1_bom() {
+  python3 - "$1" <<'PY'
+import sys
+p = sys.argv[1]
+d = open(p, 'rb').read()
+while d.startswith(b'\xef\xbb\xbf'):
+    d = d[3:]
+open(p, 'wb').write(b'\xef\xbb\xbf' + d)
+PY
+}
+
 echo "=============================================="
 echo " quant-trading-v2 -> 广州 Win Server"
 echo " IP:      $GZ_IP"
@@ -86,6 +102,7 @@ $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
 # §UAT 20260915 部署加固：原内联 SSH 命令的 bash→PS 双层转义在每个部署日都报 ParserError
 # 噪音，现抽为独立脚本上传后执行（转义链路归零；已有 config 一律保留不覆盖）。
 echo "[3/5] 初始化数据目录 + 默认 config.json（影子模式）..."
+ps1_bom deploy/qmt-win/init_default_config.ps1
 $SCP deploy/qmt-win/init_default_config.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/init_default_config.ps1 -DataDir ${DATA_DIR}"
 
@@ -99,7 +116,8 @@ if [ "${RESTART_GATEWAY:-1}" = "1" ]; then
   echo "[3b/5] 重启 qmt_gateway（载入新网关代码）..."
   # 杀进程逻辑抽为独立 PS1（避免 bash→SSH→PS 三层引号转义链，§UAT 20260915 教训）；
   # ensure/watchdog 守护 3s 自动重拉，下方轮询 /health 确认就绪。
-  $SCP deploy/qmt-win/restart_gateway.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+  ps1_bom deploy/qmt-win/restart_gateway.ps1
+$SCP deploy/qmt-win/restart_gateway.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
   $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/restart_gateway.ps1"
   # 轮询 /health 至多 120s：ensure 计划任务 5 分钟粒度，兜底主动触发一次
   gw_ok=0
@@ -135,6 +153,7 @@ else
   if [ -n "$LLM_API_KEY" ]; then
     REMOTE_ARGS="$REMOTE_ARGS -LLMApiKey '$LLM_API_KEY' -LLMApiURL '$LLM_API_URL' -LLMModel '$LLM_MODEL'"
   fi
+  ps1_bom deploy/qmt-win/register_engine_services.ps1
   $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/register_engine_services.ps1 $REMOTE_ARGS"
 fi
 
