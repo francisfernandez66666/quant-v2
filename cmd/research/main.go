@@ -45,7 +45,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|risk-daily-backfill|lifecycle-eval")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|risk-daily-backfill|lifecycle-eval|lifecycle")
 	}
 	cmd := args[0]
 
@@ -103,6 +103,10 @@ func main() {
 		// §WS-H 维7 灰度晋升评估（CLI 触发，夜间调度器可配置周期执行）
 		dataDir := filepath.Dir(*dbPath)
 		cmdLifecycleEval(db, dataDir, args[1:])
+	case "lifecycle":
+		// §GAP-P1 20260915 完整生命周期：衰退自动降级 + 灰度晋升评估（夜间链 run-task 分发同源）
+		dataDir := filepath.Dir(*dbPath)
+		cmdLifecycle(db, dataDir, args[1:])
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}

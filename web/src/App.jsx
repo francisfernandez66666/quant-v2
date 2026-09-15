@@ -15,6 +15,7 @@ import RoleBar from './components/RoleBar'
 import CommandPalette from './components/CommandPalette'
 import StockDetailDrawer from './components/StockDetailDrawer'
 import Disclaimer from './components/Disclaimer'
+import IcpFooter from './components/IcpFooter'
 import ThemeToggle from './components/ThemeToggle'
 import { useTheme } from './theme.js'
 import * as api from './api/index.js'
@@ -345,6 +346,8 @@ export default function App() {
             <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
             {loginError && <p className="login-error">{loginError}</p>}
             <Disclaimer variant="login" />
+            {/* ICP 备案号页脚（管局要求：首页底部展示备案号并链接工信部首页） */}
+            <IcpFooter variant="login" />
           </div>
         </div>
       </ConfigProvider>
@@ -412,6 +415,8 @@ export default function App() {
             <Button theme="primary" loading={logging} onClick={handleLogin} block>登录</Button>
             {loginError && <p className="login-error">{loginError}</p>}
             <Disclaimer variant="login" />
+            {/* ICP 备案号页脚（管局要求：首页底部展示备案号并链接工信部首页） */}
+            <IcpFooter variant="login" />
           </div>
         </div>
       ) : (

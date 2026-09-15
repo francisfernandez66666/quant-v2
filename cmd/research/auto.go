@@ -17,6 +17,7 @@ import (
 	"quant-trading-v2/internal/backtest"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/factor"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
@@ -360,6 +361,72 @@ func cmdLifecycleEval(db *store.DB, dataDir string, args []string) {
 	}
 }
 
+// cmdLifecycle §GAP-P1 20260915：夜间链完整生命周期任务——先实盘衰退自动降级
+// （EvaluateDemote 落地通道），再灰度晋升评估（复用 cmdLifecycleEval 内核）。
+// 降级即时生效（Enabled=false 后注入器下一轮不再产信号），晋升仍走人工审批流。
+// English: nightly full lifecycle task — first auto-demote declining applied strategies via
+// EvaluateDemote, then run grayscale promotion evaluation (promotion still requires human approval).
+func cmdLifecycle(db *store.DB, dataDir string, args []string) {
+	fs := flag.NewFlagSet("lifecycle", flag.ExitOnError)
+	paperPath := fs.String("paper", "", "paper.json 路径（缺省 dataDir/paper.json）")
+	consecDays := fs.Int("consec-days", 0, "衰退降级：连续低于阈值的交易日数（0=默认 3）")
+	minIR := fs.Float64("min-ir", 0, "衰退降级：滚动 IR 下限（0=默认 0）")
+	minWin := fs.Float64("min-win-rate", 0, "衰退降级：胜率下限 %%（0=默认 35）")
+	minTrades := fs.Int("min-daily-trades", 0, "衰退降级：单日样本下限（0=默认 3）")
+	dryRun := fs.Bool("dry-run", false, "只报告不实际禁用")
+	fs.Parse(args)
+
+	// run-task 子进程无 opslog.Init——显式初始化，降级动作必须留审计行（§GAP-P1 落库要求）。
+	opslog.Init(filepath.Join(dataDir, "opslog"), 0)
+	opts := research.DemoteOpts{ConsecDays: *consecDays, MinIR: *minIR, MinWinRate: *minWin, MinDailyTrades: *minTrades}
+	paper := *paperPath
+	if paper == "" {
+		paper = filepath.Join(dataDir, "paper.json")
+	}
+	// —— 1. 实盘衰退自动降级 ——
+	actions, err := research.DemoteAppliedRules(dataDir, paper, opts, *dryRun)
+	if err != nil {
+		log.Fatalf("衰退降级评估失败: %v", err)
+	}
+	for _, a := range actions {
+		mark := "保持"
+		if a.Verdict.Verdict == "disable" {
+			mark = "降级"
+			if *dryRun {
+				mark = "降级(dry-run 未落库)"
+			} else if a.Disabled {
+				mark = "降级已落库"
+			}
+		}
+		log.Printf("[lifecycle] %s %s: %s（连续低位 %d 日）", a.Kind, a.Verdict.RuleID, mark, a.Verdict.ConsecLow)
+	}
+	log.Printf("[lifecycle] %s", research.LifecycleDemoteSummary(actions))
+	opslog.Logf("research", "夜间生命周期：衰退评估 %d 条规则，判降级 %d 条（dry-run=%v）",
+		len(actions), countDisable(actions), *dryRun)
+	// —— 2. 灰度晋升评估（既有内核，参数一致透传）——
+	// 灰度库未初始化（无文件）属正常早期状态：跳过晋升而非 Fatal，避免夜间任务永久失败重排。
+	if _, err := os.Stat(research.GrayscalePath(dataDir)); err != nil {
+		log.Printf("[lifecycle] 灰度库不存在（%v），跳过晋升评估", err)
+		return
+	}
+	promoteArgs := []string{}
+	if *paperPath != "" {
+		promoteArgs = append(promoteArgs, "--paper", *paperPath)
+	}
+	cmdLifecycleEval(db, dataDir, promoteArgs)
+}
+
+// countDisable 统计判降级条数（审计日志用）。
+func countDisable(actions []research.DemoteAction) int {
+	n := 0
+	for _, a := range actions {
+		if a.Verdict.Verdict == "disable" {
+			n++
+		}
+	}
+	return n
+}
+
 // paperPoolReturns 从 paper.json 聚合各策略池的逐笔净收益：
 // 卖出成交价/买入成本 → 单笔盈亏%，按池归类（fac_<id>/pat_<id>）。
 // 简化实现：卖出记录按 (code) 匹配该池最近一笔买入价计算收益率。
@@ -376,14 +443,15 @@ func paperPoolReturns(paperPath, dataDir string) map[string][]float64 {
 	}
 	var state struct {
 		Trades []struct {
-			Code     string  `json:"code"`
-			PoolKey  string  `json:"pool_key,omitempty"`
-			Strategy string  `json:"strategy"`
-			Side     string  `json:"side"`
-			Price    float64 `json:"price"`
-			Signal   float64 `json:"signal_price,omitempty"`
-			Qty      int     `json:"qty"`
-			Time     string  `json:"time"`
+			Code         string  `json:"code"`
+			PoolKey      string  `json:"pool_key,omitempty"`
+			StrategyType string  `json:"strategy_type,omitempty"` // §修复 20260915：撮合落库的池字段是 strategy_type（规则池 key 即 fac_<id>/pat_<id>），旧读 pool_key 恒缺席 → 全落 other 池，晋升评估永远无观测
+			Strategy     string  `json:"strategy"`
+			Side         string  `json:"side"`
+			Price        float64 `json:"price"`
+			Signal       float64 `json:"signal_price,omitempty"`
+			Qty          int     `json:"qty"`
+			Time         string  `json:"time"`
 		} `json:"trades"`
 	}
 	if err := json.Unmarshal(b, &state); err != nil {
@@ -394,6 +462,9 @@ func paperPoolReturns(paperPath, dataDir string) map[string][]float64 {
 	out := map[string][]float64{}
 	for _, t := range state.Trades {
 		pool := t.PoolKey
+		if pool == "" {
+			pool = t.StrategyType
+		}
 		if pool == "" {
 			pool = "other"
 		}

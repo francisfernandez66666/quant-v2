@@ -60,6 +60,10 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 		cmdSectorRebuild(db, payloadStr(p, "start", "20200101"), payloadStr(p, "end", today()))
 	case store.TaskPaperResearch:
 		cmdPaperResearch(db, nil)
+	case store.TaskLifecycle:
+		// §GAP-P1 20260915：夜间生命周期任务（衰退自动降级 + 灰度晋升评估）。
+		cmdLifecycle(db, dataDirOf(dbPath), payloadArgs(p,
+			"paper", "dry-run", "consec-days", "min-ir", "min-win-rate", "min-daily-trades"))
 	case store.TaskList:
 		cmdList(db, nil)
 	case store.TaskBacktestCandidate:

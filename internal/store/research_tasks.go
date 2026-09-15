@@ -29,6 +29,8 @@ const (
 	TaskBacktestNightly   = "backtest_nightly"  // 夜间全量回测（ref_id=0 取最近候选）
 	TaskList              = "list"
 	TaskDataload          = "dataload"
+	// TaskLifecycle §GAP-P1 20260915：策略生命周期评估（灰度晋升 + 实盘衰退自动降级）。
+	TaskLifecycle = "lifecycle"
 )
 
 // 任务状态（status 列取值）。

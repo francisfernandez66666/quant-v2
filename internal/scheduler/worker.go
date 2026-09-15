@@ -754,6 +754,29 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 		return store.TaskBacktestNightly, mustJSON(p), true
 	case "paper_research":
 		return store.TaskPaperResearch, "{}", true
+	case "lifecycle":
+		// §GAP-P1 20260915：策略生命周期评估（实盘衰退自动降级 + 灰度晋升候选生成）。
+		// 阈值零值走 research.DemoteOpts.fill 内置默认（连续 3 日 / IR≥0 / 胜率≥35% / 样本≥3）。
+		// English: nightly lifecycle task (auto-demote declining applied strategies + emit
+		// grayscale promotion candidates); zero thresholds fall back to built-in defaults.
+		l := cfg.Nightly.Lifecycle
+		p := map[string]any{}
+		if l.ConsecDays > 0 {
+			p["consec-days"] = l.ConsecDays
+		}
+		if l.MinIR != 0 {
+			p["min-ir"] = l.MinIR
+		}
+		if l.MinWinRate > 0 {
+			p["min-win-rate"] = l.MinWinRate
+		}
+		if l.MinDailyTrades > 0 {
+			p["min-daily-trades"] = l.MinDailyTrades
+		}
+		if l.DryRun {
+			p["dry-run"] = true
+		}
+		return store.TaskLifecycle, mustJSON(p), true
 	case "library_replay":
 		// 战法库全量回放（因子+形态启用规则一起）：夜间对现行战法做实盘口径的
 		// 胜率/盈亏比回归验证，结果落 backtest_jobs（kind=library）供「回测」tab 查看。

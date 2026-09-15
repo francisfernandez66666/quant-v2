@@ -670,6 +670,25 @@ type NightlyConfig struct {
 	ResearchRounds int `json:"research_rounds"`
 	// Discover 发现/护栏参数（多轮变体 + 护栏分级 + 去重阈值）。
 	Discover DiscoverConfig `json:"discover"`
+	// Lifecycle §GAP-P1 20260915：steps 含 "lifecycle" 时的衰退降级阈值
+	// （零值 = research.DemoteOpts 内置默认：连续 3 日低于线/胜率<35%/样本<3）。
+	// English: thresholds for the nightly lifecycle step (zero = evaluator defaults).
+	Lifecycle LifecycleConfig `json:"lifecycle"`
+}
+
+// LifecycleConfig 夜间生命周期任务（衰退自动降级）阈值；零值回落内置默认。
+// English: nightly lifecycle (strategy demotion) thresholds; zero values use built-in defaults.
+type LifecycleConfig struct {
+	// ConsecDays 连续低于阈值的交易日数（默认 3）
+	ConsecDays int `json:"consec_days"`
+	// MinIR 滚动 IR 下限（默认 0）
+	MinIR float64 `json:"min_ir"`
+	// MinWinRate 胜率下限（%，默认 35）
+	MinWinRate float64 `json:"min_win_rate"`
+	// MinDailyTrades 单日样本下限（默认 3）
+	MinDailyTrades int `json:"min_daily_trades"`
+	// DryRun 只报告不落库（上线初期观察用；确认误杀率后再关）
+	DryRun bool `json:"dry_run"`
 }
 
 // DataloadDuringTradeConfig 交易时段增量下载配置（只下载，不含任何研究/回测）。
@@ -695,12 +714,13 @@ func DefaultSchedulerConfig() SchedulerConfig {
 			StartHHMM:        1530,
 			WeekendStartHHMM: 1530,
 			// 默认夜间研究步骤序列：行情装载 → 板块重建 → 因子挖掘 → 形态挖掘 → 模拟盘研究
-			// （读取盘后落库的模拟盘成交/净值生成信号质量报告）→ 候选列表汇总。
+			// （读取盘后落库的模拟盘成交/净值生成信号质量报告）→ 生命周期评估（§GAP-P1
+			// 20260915：实盘战法衰退自动降级 + 灰度晋升候选生成）→ 候选列表汇总。
 			// backtest 由 BacktestEnabled 开关控制追加。
 			// English: default nightly steps — dataload → sector rebuild → factor discovery → pattern
-			// discovery → paper research (reads the post-close paper fills/snapshots for a signal-quality
-			// report) → candidate listing. The backtest step is appended by the BacktestEnabled toggle.
-			Steps:           []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "paper_research", "list"},
+			// discovery → paper research → lifecycle (auto-demote declining strategies + promotion
+			// candidates) → candidate listing. The backtest step is appended by BacktestEnabled.
+			Steps:           []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "paper_research", "lifecycle", "list"},
 			AbortOnError:    false,
 			BacktestEnabled: false,
 			BacktestEvents:  0,

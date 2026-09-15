@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 改动全量验证脚本（含 2026-08-05 实时链路改动专项 + 2026-09-11 回测自动增强专项 + 2026-09-12 做空策略链路专项
-#   + 2026-09-13 UAT 修复批/研究升级批/情绪面板 A/B/C 专项 + 2026-09-14 §DATA-OUTAGE 数据管道根治专项）
+#   + 2026-09-13 UAT 修复批/研究升级批/情绪面板 A/B/C 专项 + 2026-09-14 §DATA-OUTAGE 数据管道根治专项
+#   + 2026-09-15 §ICP 备案合规 + §LIFECYCLE-WIRING 衰退降级接线专项）
 #
 # 用实盘数据快照（internal/e2e/testdata/fixtures.json / fixtures_600580.json）离线 mock 全部外部数据源，
 # 专项验证改动：
@@ -53,35 +54,41 @@
 #   dataload 盘后保活：target 工作日回退、缺表安全弃权、三表全新鲜零调用短路、
 #   日线落后触发补数且池未到位不判成（unittest 4 组）
 #
+# §备案合规 + 生命周期接线（2026-09-15 §ICP + §GAP-P1）专项（见 8/8）：
+#   ICP 页脚       ：备案号常量（沪ICP备2026045551）+ 工信部外链 vitest；登录页/仪表盘两入口挂同一组件
+#   衰退降级接线  ：PoolDailyStats 分池逐日聚合（strategy_type 池键修复）+ DemoteAppliedRules
+#                  禁用落库/dry-run/无观测保守 keep（TestPoolDailyStats|TestDemoteAppliedRules 3 组）
+#                  + stepTask lifecycle 映射与默认 Steps 含 lifecycle（TestLifecycleStepMapped）
+#
 # 用法:
-#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路 + 风险因子 + 今日修复 + 数据管道根治专项
+#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路 + 风险因子 + 今日修复 + 数据管道根治 + 备案合规/生命周期专项
 #   ./scripts/verify_changes.sh -full          # 再连相关全量单测 + QMT 网关 py 全量 + 前端 vitest 一起跑
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "==> 1/7 编译检查..."
+echo "==> 1/8 编译检查..."
 go build ./...
 go vet ./internal/llm ./internal/combat_agent ./internal/engine ./internal/e2e ./internal/server ./internal/data ./internal/display ./cmd/quant \
-	./internal/config ./internal/btreplay ./internal/store ./internal/scheduler ./cmd/research
+	./internal/config ./internal/btreplay ./internal/store ./internal/scheduler ./internal/research ./cmd/research
 
-echo "==> 2/7 实时链路改动专项 e2e（实盘快照 mock）..."
+echo "==> 2/8 实时链路改动专项 e2e（实盘快照 mock）..."
 go test -count=1 -v ./internal/e2e/ \
 	-run 'TestLLMTimeoutConfig|TestD1RetryQueueAcrossRuns|TestNShapeGateD1AndTotal|TestEndToEndFullPipeline|TestConsult|TestHTTP|TestAttachLiveBar' 2>&1 \
 	| grep -E '^(=== RUN|--- (PASS|FAIL)|PASS|FAIL|ok)'
 
-echo "==> 3/7 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
+echo "==> 3/8 回测自动增强专项（A0+A+B+C+D，2026-09-11）..."
 go test -count=1 -v ./internal/config ./internal/btreplay ./internal/store ./internal/server ./internal/scheduler ./cmd/research \
 	-run 'TestValidateBacktest|TestFillDefaults|TestFillBacktestDefaults|TestBacktestSettingsRoundTrip|TestPaperSlippageCalib|TestBacktestConfigEndpoints|TestInjectBacktestPayload|TestPayloadBacktest|TestCostRoundTripPnlExCompat|TestSlippageTiers|TestSlippageBpsAsymmetric|TestFillRate|TestLimitBoardGating|TestCalibAudit|TestEntrySlipGating|TestUniformExit|TestFixAmountScale|TestAvgAmountWan|TestBuildSlipCtx|TestPareto|TestCapFront|TestRecommended|TestPointJSON|TestSaveSweepResultsParetoCarry' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 4/7 做空策略链路专项（§SHORT 2026-09-12：四战法/接线/自动卖出/融券/e2e）..."
+echo "==> 4/8 做空策略链路专项（§SHORT 2026-09-12：四战法/接线/自动卖出/融券/e2e）..."
 go test -count=1 ./internal/strategies/high_churn/... ./internal/strategies/break_down/... ./internal/strategies/leader_decay/... ./internal/strategies/good_news_fade/... ./internal/strategies/shortbase/... 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/combat_agent/... ./internal/paper/... ./internal/engine/... ./internal/e2e/ \
 	-run 'Short|BuildShort|StrategyDisplay|AutoExecuteRealSells|AutoExitReportSells|PaperSellSignals' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 5/7 市场风险因子专项（§MARKET_RISK_GATE 2026-09-12：P0 数据源 + P1 广度 + P2 状态机 + P3~P7 风险档）..."
+echo "==> 5/8 市场风险因子专项（§MARKET_RISK_GATE 2026-09-12：P0 数据源 + P1 广度 + P2 状态机 + P3~P7 风险档）..."
 go test -count=1 ./internal/data/ -run 'RiskPool|PoolLimit|PoolHelpers|Breadth|MasLowSlope|EmotionPhase|EmotionBreadth' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/config/ -run 'Data|Risk|Emotion|Macro|Scheduler|AutoCaution' 2>&1 \
@@ -91,7 +98,7 @@ go test -count=1 ./internal/research/ -run 'MarketState|StateTracker|Classify' 2
 go test -count=1 ./internal/combat_agent/ -run 'RiskTier|ApplyRiskTier|ComputeAndSet|Synthesize|MarketRisk|AutoCaution|MacroGate' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 6/7 今日修复专项（2026-09-13：UAT D1/D3/D5/D7 + 情绪面板 A/B + 研究升级 W6/W7）..."
+echo "==> 6/8 今日修复专项（2026-09-13：UAT D1/D3/D5/D7 + 情绪面板 A/B + 研究升级 W6/W7）..."
 go test -count=1 ./internal/auth/ ./cmd/quant/ -run 'TestPublicUserStripsSessionCredentials|TestEnabledSerializesWhenFalse|TestRevokeSessionSelfLogout|TestVerifyDeployment' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/store/ -run 'TestEmotionStrategyMatrixBuckets|TestEmotionMatrixFallbackPhase|TestEmotionMatrixBadJSONSkipped' 2>&1 \
@@ -101,11 +108,21 @@ go test -count=1 ./internal/server/ -run 'TestEmotionHistoryDateNormalize|TestEm
 go test -count=1 ./internal/btreplay/ -run 'TestMinTriggersForObjDefaults' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 7/7 数据管道停摆根治专项（§DATA-OUTAGE 2026-09-14：market_risk_daily 历史回放 + dataload 盘后保活）..."
+echo "==> 7/8 数据管道停摆根治专项（§DATA-OUTAGE 2026-09-14：market_risk_daily 历史回放 + dataload 盘后保活）..."
 go test -count=1 ./cmd/research/ -run 'TestRiskBackfill' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 python3 -m pytest qmt_gateway/tests/test_dataload_keepalive.py -q 2>&1 \
 	| grep -E "passed|failed|error"
+
+echo "==> 8/8 备案合规 + 生命周期接线专项（2026-09-15 §ICP + §GAP-P1）..."
+# ICP 备案号合规文案守护：常量改动即失败（管局备案文案，变更需先核对备案回执）
+grep -q '沪ICP备2026045551' web/src/components/IcpFooter.jsx && grep -q 'beian.miit.gov.cn' web/src/components/IcpFooter.jsx \
+	&& echo "ok - icp 备案常量在位" || { echo "FAIL - icp 备案常量缺失"; exit 1; }
+( cd web && npm test -- icp_footer ) 2>&1 | grep -E 'Test Files|passed|failed'
+go test -count=1 ./internal/research/ -run 'TestPoolDailyStats|TestDemoteAppliedRules' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/scheduler/ -run 'TestLifecycleStepMapped' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
 
 if [ "${1:-}" = "-full" ]; then
 	echo ""

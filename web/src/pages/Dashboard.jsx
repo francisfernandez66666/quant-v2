@@ -8,6 +8,7 @@ import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
 import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
+import IcpFooter from '../components/IcpFooter'
 import SentimentCard from '../components/SentimentCard.jsx'
 
 // 根据 IPO/上市日期计算倒计时或上市状态
@@ -383,6 +384,8 @@ export default function Dashboard() {
 
       {/* §F6 免责声明页脚（UAT 4.1） */}
       <Disclaimer variant="footer" />
+      {/* ICP 备案号页脚（管局要求：首页底部展示备案号并链接工信部首页，沪ICP备2026045551） */}
+      <IcpFooter variant="footer" />
       <LogModal visible={showLog} onClose={() => setShowLog(false)} />
     </div>
   )

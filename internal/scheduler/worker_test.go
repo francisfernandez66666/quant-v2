@@ -187,6 +187,32 @@ func TestLibraryReplayStepMappedAndInserted(t *testing.T) {
 	}
 }
 
+// TestLifecycleStepMapped §GAP-P1 20260915：lifecycle 步骤映射为 TaskLifecycle；
+// 阈值零值不带 payload 键（回落评估器默认），显式配置逐项透传，dry_run 显式下发；
+// 默认夜间链必须包含 lifecycle 步骤（EvaluateDemote 落地通道）。
+func TestLifecycleStepMapped(t *testing.T) {
+	typ, payload, ok := stepTask("lifecycle", config.DefaultSchedulerConfig(), "20260915")
+	if !ok || typ != store.TaskLifecycle {
+		t.Fatalf("lifecycle 映射错误: ok=%v typ=%s", ok, typ)
+	}
+	for _, k := range []string{"consec-days", "min-ir", "min-win-rate", "min-daily-trades", "dry-run"} {
+		if strings.Contains(payload, k) {
+			t.Fatalf("默认配置不应带 %s 键（回落内置默认）, 得 %s", k, payload)
+		}
+	}
+	cfg := config.DefaultSchedulerConfig()
+	cfg.Nightly.Lifecycle = config.LifecycleConfig{ConsecDays: 5, MinIR: 0.2, MinWinRate: 40, MinDailyTrades: 4, DryRun: true}
+	_, tp, _ := stepTask("lifecycle", cfg, "20260915")
+	for _, s := range []string{`"consec-days":5`, `"min-ir":0.2`, `"min-win-rate":40`, `"min-daily-trades":4`, `"dry-run":true`} {
+		if !strings.Contains(tp, s) {
+			t.Fatalf("payload 应含 %s, 得 %s", s, tp)
+		}
+	}
+	if !containsStep(cfg.Nightly.Steps, "lifecycle") {
+		t.Fatalf("默认 Steps 应含 lifecycle, 得 %v", cfg.Nightly.Steps)
+	}
+}
+
 // TestFailedTaskRequeuesAtTail §失败重排队：任务失败不落 error 终态——
 // 自动回队尾（先于它入队的健康任务 B/C 先跑），error 列留失败原因，
 // 冷却期内不重启；冷却过后自动重试，不设上限。
