@@ -86,6 +86,7 @@ export default function Quant() {
     gateway_url: '', token_masked: '',
     fixed_amount: 10000, max_positions: 10, initial_capital: 100000,
     daily_max_buys: 20, daily_budget_amount: 100000, miss_heartbeat_sec: 120,
+    max_order_amount: 0,
   })
 
   // 通用 UI 状态
@@ -163,6 +164,7 @@ export default function Quant() {
         initial_capital: c.initial_capital ?? 100000,
         daily_max_buys: c.daily_max_buys ?? 20, daily_budget_amount: c.daily_budget_amount ?? 100000,
         miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
+        max_order_amount: c.max_order_amount ?? 0,
       }
       setForm(nextForm)
       writeCachedForm(nextForm)
@@ -376,12 +378,12 @@ export default function Quant() {
     await patch(fields, '网关连接参数已保存')
   }
 
-  // 保存仓位纪律（最大持仓/单票金额/初始资金/日买笔数上限/日预算）
+  // 保存仓位纪律（最大持仓/单票金额/初始资金/日买笔数上限/日预算/单笔金额绝对帽）
   async function saveCaps() {
     await patch({
       max_positions: form.max_positions, fixed_amount: form.fixed_amount,
       initial_capital: form.initial_capital, daily_max_buys: form.daily_max_buys,
-      daily_budget_amount: form.daily_budget_amount,
+      daily_budget_amount: form.daily_budget_amount, max_order_amount: form.max_order_amount,
     }, '仓位纪律已保存')
   }
 
@@ -607,14 +609,23 @@ export default function Quant() {
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，超出拒绝新买入</span>
       </div>
     )
+    // §AUDIT-PM 2026-09-15 单笔金额绝对帽：0=关，手动/自动单统一封顶（保存即生效，不等开关队列）
+    const maxOrderAmt = (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单笔金额绝对帽(元)</label>
+        <Input type="number" value={form.max_order_amount} min={0} step={10000} onChange={(v) => setForm({ ...form, max_order_amount: parseFloat(v) })} />
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=关；买卖双向封顶，防胖手误</span>
+      </div>
+    )
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12 }}>
-        {/* 仓位纪律字段：最大持仓/单票金额/初始资金/日买笔数/日预算 */}
+        {/* 仓位纪律字段：最大持仓/单票金额/初始资金/日买笔数/日预算/单笔绝对帽 */}
         {maxPos}
         {fixedAmt}
         {initCap}
         {dailyBuys}
         {dailyBudget}
+        {maxOrderAmt}
       </div>
     )
   }

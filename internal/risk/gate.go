@@ -93,6 +93,7 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 	}{
 		{"st", false, func() string { return g.checkST(o) }},
 		{"blacklist", false, func() string { return g.checkBlacklist(cfg, o) }},
+		{"max_order_amount", true, func() string { return g.checkMaxOrderAmount(cfg, o) }},
 		{"t1_sellable", false, func() string { return g.checkT1Sellable(cfg, o) }},
 		{"limit_up_down", true, func() string { return g.checkLimitPrice(cfg, o) }},
 		{"stale_quote", true, func() string { return g.checkStaleQuote(cfg, o) }},
@@ -177,6 +178,28 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 			return fmt.Sprintf("T+1 不可卖: 当日买入锁定, 可卖 %d < 请求 %d（持仓 %d, 当日买入 %d）",
 				sellable, o.Qty, p.Qty, bought)
 		}
+	}
+	return ""
+}
+
+// checkMaxOrderAmount 单笔委托金额绝对帽（默认关，阈值 0=放行一切）：本单金额（装配缺失时
+// 回退 qty×参考价）超过 cfg.RiskGate.MaxOrderAmount → 买卖双向拒单+告警。
+// 定位（§AUDIT-PM 2026-09-15）：手动下单入口不经 sizing 通道，胖手误（多打一个 0）此前只有
+// 价格守卫与日预算兜底，缺一道与信号策略无关的绝对上限；自动单同享此帽做双保险。
+// English: absolute per-order amount cap (0 = off). Rejects buys and sells whose amount
+// (or qty×ref price when Amount is unset) exceeds the threshold — the hard ceiling for the
+// manual entry point, independent of strategy sizing.
+func (g *Gate) checkMaxOrderAmount(cfg config.QMTConfig, o LiveOrder) string {
+	if cfg.RiskGate.MaxOrderAmount <= 0 {
+		return ""
+	}
+	amt := o.Amount
+	if amt <= 0 {
+		amt = o.Price * float64(o.Qty)
+	}
+	if amt > cfg.RiskGate.MaxOrderAmount {
+		return fmt.Sprintf("单笔金额超限: %.0f > 绝对帽 %.0f（%s %s %d股，请核对数量与价格）",
+			amt, cfg.RiskGate.MaxOrderAmount, o.Side, o.Code, o.Qty)
 	}
 	return ""
 }

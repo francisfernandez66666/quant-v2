@@ -39,6 +39,8 @@ func (s *Server) handleRiskGates(w http.ResponseWriter, r *http.Request) {
 			switches["stale_quote"] = rg.StaleQuoteMs > 0
 			switches["limit_up_block_buy"] = rg.LimitUpBlockBuy
 			switches["limit_down_block_sell"] = rg.LimitDownBlockSell
+			// §AUDIT-PM 2026-09-15 单笔金额绝对帽开关（保存即生效，不走开关队列）
+			switches["max_order_amount"] = rg.MaxOrderAmount > 0
 		}
 	}
 	writeJSON(w, 200, map[string]interface{}{

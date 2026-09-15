@@ -60,8 +60,11 @@ fi
 
 echo "[staging] 启动影子引擎（端口 $PORT, dataDir=$STAGING_DIR）"
 # 后台运行，日志落 staging 数据目录
-env QUANT_ENV=staging QUANT_DATA_DIR="$STAGING_DIR" $EXTRA \
-  "$BIN" -listen ":$PORT" >> "$STAGING_DIR/staging.log" 2>&1 &
+# §AUDIT-PM 2026-09-15：quant 只读 QUANT_ADDR 环境变量决定监听地址——旧版传的 `-listen`
+# 参数根本不存在（cmd/quant 无 flag 定义），staging 实际绑 8080 再靠 pickListener 顺延碰巧
+# 落 8081。改为显式 QUANT_ADDR，并在探针里断言实际绑定端口==期望端口（防顺延假绿）。
+env QUANT_ENV=staging QUANT_DATA_DIR="$STAGING_DIR" QUANT_ADDR=":$PORT" $EXTRA \
+  "$BIN" >> "$STAGING_DIR/staging.log" 2>&1 &
 
 PID=$!
 echo "$PID" > "$STAGING_DIR/staging.pid"
@@ -70,8 +73,16 @@ echo "[staging] pid=$PID"
 # 探针冒烟：等待就绪后打 /api/health（无 token 401=已就绪）
 for i in $(seq 1 30); do
   if curl -s -o /dev/null -m 2 "http://127.0.0.1:$PORT/api/health"; then
+    # §AUDIT-PM 断言实际绑定端口==期望端口：日志行形如
+    # 「HTTP 服务已绑定 [::]:18080 (来源 :18080)」，防 pickListener 顺延假绿
+    # （旧版 -listen 无效时正是靠顺延躲过撞车，行为不可控）。
+    if ! grep -Eq "HTTP 服务已绑定 [^ ]+:$PORT " "$STAGING_DIR/staging.log" 2>/dev/null; then
+      echo "[staging] ✗ 实际绑定端口与期望 :$PORT 不符（日志未出现该端口的绑定行）——拒绝假绿"
+      tail -5 "$STAGING_DIR/staging.log"
+      exit 1
+    fi
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 "http://127.0.0.1:$PORT/api/health")
-    echo "[staging] 就绪: /api/health → $code（401=认证层正常）"
+    echo "[staging] 就绪: /api/health → $code（401=认证层正常），端口 :$PORT 断言通过"
     exit 0
   fi
   sleep 1

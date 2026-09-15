@@ -327,3 +327,56 @@ func TestGateCheckPortfolioM8(t *testing.T) {
 		t.Fatalf("M8 未启用应放行, got %+v", v)
 	}
 }
+
+// TestGateMaxOrderAmount §AUDIT-PM 2026-09-15 单笔金额绝对帽：超限双向拒单+告警、
+// Amount 缺省回退 qty×参考价、帽内放行、闸关放行。
+// English: per-order amount cap — oversize rejected (both sides) with alert, Amount==0 falls back
+// to qty×ref price, in-cap passes, gate off passes.
+func TestGateMaxOrderAmount(t *testing.T) {
+	alerts := 0
+	g := NewGate(gateDB(t), "u_g", func(level, title, content string) { alerts++ })
+	cfg := qmtCfg()
+	cfg.RiskGate.MaxOrderAmount = 200000
+	// 帽内放行
+	if v := g.CheckLiveOrder(cfg, liveOrder(SideBuy)); !v.Pass {
+		t.Fatalf("1000 元帽内应放行, got %+v", v)
+	}
+	// 超限买入拒绝
+	o := liveOrder(SideBuy)
+	o.Qty = 30000
+	o.Amount = 300000
+	v := g.CheckLiveOrder(cfg, o)
+	if v.Pass || v.Gate != "max_order_amount" {
+		t.Fatalf("30 万应拒单, got %+v", v)
+	}
+	// 超限卖出同样拒绝（绝对帽不分方向）
+	so := liveOrder(SideSell)
+	so.Qty = 30000
+	so.Amount = 300000
+	if v := g.CheckLiveOrder(cfg, so); v.Pass {
+		t.Fatalf("卖出超限同样应拒单, got %+v", v)
+	}
+	// Amount 缺省 → 回退 qty×参考价
+	noAmt := liveOrder(SideBuy)
+	noAmt.Qty = 30000
+	noAmt.Amount = 0 // 10×30000=300000 > 200000
+	if v := g.CheckLiveOrder(cfg, noAmt); v.Pass {
+		t.Fatalf("Amount 缺省应按 qty×价 回退判定, got %+v", v)
+	}
+	// 告警计数：本用例命中 3 次
+	if alerts != 3 {
+		t.Fatalf("超限应各触发高优告警, got %d", alerts)
+	}
+	// 闸关（0）放行（顺带关掉默认预算/资金闸，避免撞 buy_discipline 误读）
+	cfg.RiskGate.MaxOrderAmount = 0
+	cfg.DailyBudgetAmount = 0
+	cfg.DailyMaxBuys = 0
+	cfg.InitialCapital = 1000000
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("闸关闭应放行, got %+v", v)
+	}
+	// AnyEnabled 感知新闸
+	if !(config.RiskGateConfig{MaxOrderAmount: 1}).AnyEnabled() {
+		t.Fatal("AnyEnabled 应感知 max_order_amount")
+	}
+}

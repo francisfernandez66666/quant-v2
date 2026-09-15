@@ -36,6 +36,8 @@ func DefaultAlertRules() []AlertRule {
 		{Name: "quote_stale", Metric: "quote_staleness_sec", Op: "gt", Threshold: 60, For: "60s", Level: "p2", Message: "行情报价陈旧 >60s"},
 		{Name: "settlement_diff", Metric: "settlement_diff_count", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "交割单对账出现差异"},
 		{Name: "llm_cooldown", Metric: "llm_cooldown_count", Op: "gt", Threshold: 2, For: "60s", Level: "p2", Message: "LLM 冷却数超阈值"},
+		// §AUDIT-PM 2026-09-15 buyCh 深度预警：容量 64，过半仍在排 = 下单风暴或网关变慢（P2）。
+		{Name: "buy_queue_high", Metric: "buy_queue_depth", Op: "gt", Threshold: 32, For: "60s", Level: "p2", Message: "自动买入队列积压 >32（网关变慢或信号风暴）"},
 	}
 }
 

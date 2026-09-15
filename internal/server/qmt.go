@@ -499,6 +499,25 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 忽略 body 携带的 user_id——防止持有 A 账号网关 token 者借 ev.UserID 越权写入/清空任意账号持仓。
 		// 此前"网关 user_id > token uid"的优先级是越权写面。
 		owner := uid
+		// §AUDIT-PM 2026-09-15 空快照纵深守卫（第三层）：positions 语义是全量替换，而 broker.py
+		// 在通道断连时同样返回空列表——若仅靠 网关token(第一层)+网关 clear_guard(第二层)，
+		// Go 侧一个畸形/伪造的空数组仍会清空本账号持仓。规则：本地该账号仍有持仓而快照为空 →
+		// 不可信，拒收并告警（409=永久拒绝进 outbox_dead 隔离，不无限重推）。合法全平不受影响：
+		// 先经 trade 回报逐笔清零持仓行，或由 /state 周期对账（Controller.Reconcile 带 connected 守卫）落账。
+		if len(ev.Positions) == 0 {
+			if held, herr := db.RealPositionsForUser(owner); herr == nil && len(held) > 0 {
+				log.Printf("[trading] ⚠ positions 空快照但本地仍有 %d 持仓(用户=%s)——判定不可信，拒绝全清", len(held), owner)
+				opslog.Logf("quant", "持仓全清守卫触发 用户=%s 本地持仓=%d 空快照被拒（若为真实全平请走成交回报/对账通道）", owner, len(held))
+				if s.sse != nil {
+					s.sse.BroadcastTo(owner, map[string]interface{}{
+						"type": "positions_clear_guard", "held": len(held),
+						"time": time.Now().Format("15:04:05"),
+					})
+				}
+				writeError(w, 409, "positions 空快照但本地有持仓，拒绝全清（防断连空列表误清账；合法清仓走成交回报）")
+				return
+			}
+		}
 		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions); err != nil {
 			writeError(w, 500, "reconcile positions: "+err.Error())
 			return
@@ -673,6 +692,8 @@ func qmtConfigView(cfg *config.QMTConfig, known []knownStrategyInfo) map[string]
 		"halted":           cfg.Halted,
 		"cancel_stale_sec": cfg.CancelStaleSec,
 		"close_sweep_at":   cfg.CloseSweepAt,
+		// §AUDIT-PM 2026-09-15 单笔金额绝对帽（风控闸 risk_gate.max_order_amount，0=关）
+		"max_order_amount": cfg.RiskGate.MaxOrderAmount,
 		"known_strategies": known,
 	}
 }
@@ -697,6 +718,9 @@ type setQMTConfigReq struct {
 	Halted         *bool `json:"halted"`           // 全局熔断暂停
 	CancelStaleSec *int  `json:"cancel_stale_sec"` // 未成交撤单超时秒数
 	CloseSweepAt   *int  `json:"close_sweep_at"`   // 尾盘清仓时间（分钟）
+	// §AUDIT-PM 2026-09-15 单笔委托金额绝对帽（元；0=关）——安全封顶闸，保存即生效，
+	// 不随开关队列滞留到次日（与 §U-3 halted 即时语义同口径）。
+	MaxOrderAmount *float64 `json:"max_order_amount"`
 }
 
 // handleSetQMTConfig 处理 POST /api/config/qmt：局部合并保存当前账号实盘配置并热加载生效。
@@ -795,6 +819,19 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		}
 		cfg.DailyBudgetAmount = *req.DailyBudgetAmount
 	}
+	// §AUDIT-PM 2026-09-15 单笔金额绝对帽（0=关；上限 1e9 防误输成"天文数字"失去封顶意义）
+	if req.MaxOrderAmount != nil {
+		v := *req.MaxOrderAmount
+		if v < 0 {
+			writeError(w, 400, "max_order_amount 不能为负")
+			return
+		}
+		if v > 1000000000 {
+			writeError(w, 400, "max_order_amount 超出范围（0-1000000000）")
+			return
+		}
+		cfg.RiskGate.MaxOrderAmount = v
+	}
 	if req.MissHeartbeatSec != nil {
 		if *req.MissHeartbeatSec < 30 || *req.MissHeartbeatSec > 3600 {
 			writeError(w, 400, "miss_heartbeat_sec 超出范围（30-3600 秒）")
@@ -875,6 +912,14 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	// 否则"保存即熔断"会静默滞留到次日开盘（fail-stop 漏洞）。
 	if req.Halted != nil {
 		s.applyKillSwitchNow(target, &cfg, "config_save")
+	}
+	// §AUDIT-PM 2026-09-15：单笔金额绝对帽同样"保存即生效"——安全封顶闸若滞留开关队列到
+	// 次日，等于收盘设置的上限在次日开盘前形同虚设。UpdateConfig 只换 c.cfg 不动 executor，
+	// 引擎热同步下一轮仍会以 QueueConfigUpdate 对齐（同值幂等，无竞争）。
+	if req.MaxOrderAmount != nil {
+		if ctrl := s.qmtCtrlFor(target); ctrl != nil {
+			ctrl.UpdateConfig(cfg)
+		}
 	}
 	// §WS-K 维4 变更 diff → opslog 审计（可下载/前端历史可见）
 	if beforeBytes != nil {

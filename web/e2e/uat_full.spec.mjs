@@ -60,19 +60,40 @@ test.describe('交易相关分支', () => {
   })
 
   test('Quant：仓位纪律保存→回读一致（含还原）', async ({ page }) => {
+    // §AUDIT-PM 2026-09-15 修 hydration 竞态（测试自污染缺陷）：旧实现进入页面立刻 inputValue()
+    // 取基线，此时表单可能还停留在 localStorage 缓存默认值（readCachedForm 种子），还原步骤会把
+    // 陈旧缓存值回写服务端、静默覆盖真实配置（实测把 100 万预算改回 10 万）。现先取服务端权威值，
+    // 并等输入框 hydration 到服务端值后才允许写入。
     await page.goto('/#/quant')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const c = await (await page.request.get('/api/config/qmt', { headers: hdr })).json()
+    const baseline = String(c.daily_budget_amount ?? 0)
     const cap = page.getByLabel('最大持仓数').or(page.locator('input[type=number]').nth(2))
     await page.getByPlaceholder('未设置').waitFor({ timeout: 10000 }).catch(() => {})
     const budget = page.locator('div', { hasText: /^单日买入预算/ }).locator('input').first()
-    const old = await budget.inputValue()
+    await expect(budget, '等待服务端配置回填表单（hydration 完成）').toHaveValue(baseline, { timeout: 10000 })
     await budget.fill('88888')
     await page.getByRole('button', { name: '保存仓位纪律' }).click()
     await expect(page.locator('.t-message')).toBeVisible()
     await page.waitForTimeout(800)
-    await page.reload()
+    // 防「在途 GET 冲掉已输入值」竞态：reload 后必须等 /api/config/qmt 响应落地再 fill
+    // （loadConfig 的 setForm 晚到会覆盖用户输入——本用例曾被自己的还原步骤坑掉，两次实跑实锤）
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes('/api/config/qmt') && r.request().method() === 'GET', { timeout: 8000 }),
+      page.reload(),
+    ])
     const back = page.locator('div', { hasText: /^单日买入预算/ }).locator('input').first()
     await expect(back, '保存后重进页面数值持久化').toHaveValue('88888')
-    await back.fill(old); await page.getByRole('button', { name: '保存仓位纪律' }).click()
+    await back.fill(baseline)
+    await expect(back, '还原输入不被在途回填冲掉（点击前 DOM 必须是基线值）').toHaveValue(baseline, { timeout: 3000 })
+    await page.getByRole('button', { name: '保存仓位纪律' }).click()
+    // §AUDIT-PM 二次修复：还原保存必须等 toast 落地再结束用例——旧版点完即走，
+    // 用例 teardown 关闭 context 会掐掉在途 PATCH 请求，88888 残留污染服务端（实测复现）。
+    await expect(page.locator('.t-message'), '还原保存已落库（等响应，防 teardown 掐请求）').toBeVisible({ timeout: 8000 })
+    await expect(async () => {
+      const c2 = await (await page.request.get('/api/config/qmt', { headers: hdr })).json()
+      expect(String(c2.daily_budget_amount), '还原后服务端值回到基线').toBe(baseline)
+    }).toPass({ timeout: 8000 })
     void cap
   })
 
@@ -485,8 +506,14 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
       const r = await page.request.get('/api/config/qmt', { headers: hdr })
       expect((await r.json()).halted, 'config.halted=true 持久化').toBe(true)
     }).toPass({ timeout: 6000 })
+    // §AUDIT-PM 2026-09-15 修用例脆弱点：旧版写死 300750@180，标的现价涨超 +15% 后
+    // 价格守卫先于 kill-switch 拒单，断言"拒因含 kill-switch"必然失败（2026-09-15 实测 316 元）。
+    // 现下单前先取实时现价，用现价发起委托——价格守卫必然放行，拒因只剩 kill-switch。
+    const snap = await (await page.request.get('/api/snapshot?codes=300750', { headers: hdr })).json()
+    const live = Array.isArray(snap) ? (snap[0] && snap[0].price) || (snap.snapshots && snap.snapshots[0] && snap.snapshots[0].price) : (snap.price || 0)
+    expect(live, '取到 300750 实时现价（价格守卫基准）').toBeGreaterThan(0)
     const exec = await page.request.post('/api/positions/execute', {
-      headers: hdr, data: { code: '300750', side: '买入', action: '建仓', qty: 100, price: 180, strategy: 'manual' },
+      headers: hdr, data: { code: '300750', side: '买入', action: '建仓', qty: 100, price: live, strategy: 'manual' },
     })
     expect(exec.status(), 'halted 置位时下单被拒').toBeGreaterThanOrEqual(400)
     expect(JSON.stringify(await exec.json()), '拒单原因含 kill-switch').toContain('kill-switch')

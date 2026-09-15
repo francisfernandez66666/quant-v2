@@ -1228,6 +1228,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	if buyCh != nil {
 		select {
 		case buyCh <- buyTask{req: req, sig: sig}:
+			// §AUDIT-PM 2026-09-15 队列深度量规：崩溃丢单的观测面（buyCh 为纯内存队列，
+			// 重启后同 signal_id 自愈重发，故只观测不做持久化；深度逼近容量即预警风暴）。
+			metrics.SetGauge("buy_queue_depth", int64(len(buyCh)))
 			log.Printf("[trading] auto order queued %s(%s) qty=%d price=%.2f (async)", sig.Code, sig.Name, qty, price)
 		default:
 			log.Printf("[trading] auto order QUEUE FULL → 同步下单兜底 %s(%s) qty=%d price=%.2f", sig.Code, sig.Name, qty, price)
@@ -1278,6 +1281,7 @@ func (e *Engine) StartBuyDispatcher(n int) {
 			for {
 				select {
 				case t := <-e.buyCh:
+					metrics.SetGauge("buy_queue_depth", int64(len(e.buyCh))) // §AUDIT-PM 出队侧同步深度
 					e.placeOrderNow(t.req, t.sig)
 				case <-stop:
 					return

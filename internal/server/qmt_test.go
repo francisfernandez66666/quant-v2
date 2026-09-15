@@ -392,3 +392,41 @@ func TestQMTTradesPartialSellUsesPositionCost(t *testing.T) {
 		t.Fatalf("部分卖出已实现盈亏应=-4000(借用账本成本), got %v", out.Summary.RealizedPnl)
 	}
 }
+
+// TestHandleQMTReportPositionsClearGuard §AUDIT-PM 2026-09-15 空快照纵深守卫：
+// 本地有仓 + 空快照 → 409 拒清、持仓保留；非空快照正常对账；本地无仓时空快照放行（合法全平）。
+// English: empty-snapshot defense-in-depth — local rows + empty push ⇒ 409 and rows survive;
+// non-empty push reconciles normally; empty push on an empty book passes (legit flat).
+func TestHandleQMTReportPositionsClearGuard(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1280}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// ① 有仓 + 空快照 → 拒收，账本不动
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[]}`))
+	s.handleQMTReport(rr, r)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("空快照+有仓应 409, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if all, _ := db.RealPositions(); len(all) != 1 {
+		t.Fatalf("守卫拒清后持仓应保留, got %+v", all)
+	}
+	// ② 非空快照正常对账（覆盖为本账号快照口径）
+	rr = httptest.NewRecorder()
+	r = httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[{"ts_code":"000001.SZ","name":"平安银行","qty":200,"cost_price":12}]}`))
+	s.handleQMTReport(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("非空快照应 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// ③ 本地已无仓（清到空后）→ 空快照放行
+	if _, err := db.ReconcilePositionsForUser("", nil); err != nil {
+		t.Fatalf("flatten: %v", err)
+	}
+	rr = httptest.NewRecorder()
+	r = httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(`{"type":"positions","positions":[]}`))
+	s.handleQMTReport(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("空账本收空快照应放行（合法全平）, got %d: %s", rr.Code, rr.Body.String())
+	}
+}

@@ -380,13 +380,19 @@ type RiskGateConfig struct {
 	// English: block chasing a limit-down sell (default off): sell reference price ≤ prevClose×(1−board
 	// limit-up%) → reject.
 	LimitDownBlockSell bool `json:"limit_down_block_sell"`
+	// MaxOrderAmount 单笔委托金额绝对帽（元，默认 0=关）：本单金额（qty×参考价，缺省回退）
+	// 超过该值 → 拒一切新委托（买卖双向）。定位：手动下单入口（/api/positions/execute）不设
+	// sizing 通道天然限额，胖手误（多打一个 0）唯一封顶手段；自动单同享此帽做双保险。
+	// English: absolute per-order amount cap (0 = off). Rejects any new order whose amount
+	// (qty × ref price) exceeds it — the only hard ceiling on the manual entry point.
+	MaxOrderAmount float64 `json:"max_order_amount"`
 }
 
 // AnyEnabled 是否开启了至少一道 RiskGate（供 UI/健康展示与短路）。
 // English: AnyEnabled reports whether at least one risk gate is enabled.
 func (r RiskGateConfig) AnyEnabled() bool {
 	return r.DayLossLimitPct > 0 || r.SingleStockValuePct > 0 || r.StaleQuoteMs > 0 ||
-		r.LimitUpBlockBuy || r.LimitDownBlockSell
+		r.LimitUpBlockBuy || r.LimitDownBlockSell || r.MaxOrderAmount > 0
 }
 
 // SettleConfig §WS-B 交割单三方对账参数。

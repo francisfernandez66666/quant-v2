@@ -97,3 +97,13 @@ web/.auth/
 
 # 本地 QMT 网关 mock（UAT 用二进制，不入库）
 /qmt-mock
+# §AUDIT-PM 2026-09-15 仓库卫生：根目录大二进制产物（同 /quant /qmt-mock 口径），勿再裸提交
+/backtest
+/news_signal_latency
+/researchd
+/replay
+/dataload
+/fixturecapture
+/commentcheck
+/pydata
+/backtest_params.json.bak*

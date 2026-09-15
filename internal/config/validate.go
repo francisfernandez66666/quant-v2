@@ -55,6 +55,10 @@ func validateQMT(q *QMTConfig) error {
 	if q.DailyBudgetAmount < 0 {
 		return fmt.Errorf("qmt.daily_budget_amount 不能为负（%.2f）", q.DailyBudgetAmount)
 	}
+	// §AUDIT-PM 2026-09-15 单笔金额绝对帽（0=关）：负值=配置错误（应为 0），显式拒绝。
+	if q.RiskGate.MaxOrderAmount < 0 {
+		return fmt.Errorf("qmt.risk_gate.max_order_amount 不能为负（%.2f）", q.RiskGate.MaxOrderAmount)
+	}
 	if q.MissHeartbeatSec != 0 && (q.MissHeartbeatSec < 30 || q.MissHeartbeatSec > 3600) {
 		return fmt.Errorf("qmt.miss_heartbeat_sec 超出范围 30-3600（实际 %d）", q.MissHeartbeatSec)
 	}
