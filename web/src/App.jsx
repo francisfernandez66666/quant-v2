@@ -22,6 +22,7 @@ import * as api from './api/index.js'
 import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
+import { sseOpsAlert } from './utils.js'
 
 import Dashboard from './pages/Dashboard.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
@@ -217,6 +218,17 @@ export default function App() {
     // §F5 单连接扇出：先转投事件总线，供各页按类型订阅即时刷新（页面不再各自起高频轮询）。
     // English: fan out on the single connection so pages subscribing by type refresh on event.
     sseDispatch(msg)
+    // §UAT-D1（2026-09-16）：资损/运维级事件（熔断翻转、持仓清空守卫、交割对账差异、实时放量触发）
+    // 后端一直在广播，但前端零消费，只能靠 10s 轮询间接感知——现统一收敛成全局 Toast + 系统通知，
+    // 命中即返回（不与下方 scan/message 分支重复弹）。映射逻辑在 utils.sseOpsAlert（纯函数、单测覆盖）。
+    // English: surface the previously-broadcast-but-unconsumed ops/trading-safety SSE events via a
+    // global Toast + system notification; handled-and-return so they do not double-toast below.
+    const ops = sseOpsAlert(msg)
+    if (ops) {
+      showToast(ops.body, ops.tone)
+      notifyThrottled(ops.key, ops.title, ops.body)
+      return
+    }
     // §MARKET_RISK_GATE F2：每轮评分完成广播的 `score` 消息携带市场环境（情绪/状态/仓位档/风险档），
     // 驱动顶部市场环境条；score 不含信号字段，更新后立即返回，不影响下方 scan/message 分支。
     // English: each scoring round's `score` message carries the environment snapshot to drive the F2 bar.

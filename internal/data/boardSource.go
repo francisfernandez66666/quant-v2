@@ -195,6 +195,7 @@ func (fb *FailoverBoard) cooldown() time.Duration {
 	}
 	return fb.Cooldown
 }
+
 // probeEvery 探测间隔（未配置时默认 10s）。
 func (fb *FailoverBoard) probeEvery() time.Duration {
 	if fb.ProbeEvery <= 0 {

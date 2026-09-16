@@ -162,21 +162,26 @@ func (g *Gate) checkBlacklist(cfg config.QMTConfig, o LiveOrder) string {
 
 // checkT1Sellable §WS-A T+1 可卖量前置守卫（仅卖出）：当日买入份额当日不可卖。
 // **未知仓位 fail-open**：本地无该持仓行时跳过，交由券商柜台终裁——宁可多问柜台也不拦合法退出。
-// English: §WS-A T+1 sell-guard (sell-only): shares bought today can't be sold today. Fail-open when
-// no local position row exists — the broker has the final word so legitimate exits are never blocked.
+// §UAT-D4（2026-09-16）：可卖量同时扣减「当日在途卖单」（SumOpenSellQty：已报/部成等非终态行）——
+// 旧口径只数 持仓−当日买入（均已结算成交），并发双卖（手动双入口或 M8+止损同轮）两笔校验输入相同、
+// 双双放行，合计超过 T+1 可卖量（2026-09-16 实跑 01:16:36 两笔同秒卖单全成交复现）。柜台终裁仍在，
+// 但废单发生在真实交易所、留废单记录；并入在途量后先到者占额度，后到者在网关侧就被拦下。
+// English: §UAT-D4 — sellable now also deducts today's still-open (non-terminal) sell tickets, so
+// concurrent same-second sells can no longer both pass on identical settled-only inputs.
 func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 	if o.Side != SideSell || !cfg.EnforceT1Enabled() || g.st == nil {
 		return ""
 	}
 	if p, perr := g.st.RealPositionByCodeForUser(g.userID, o.Code); perr == nil && p.Qty > 0 {
 		bought := g.st.TodayBoughtQty(g.userID, o.Code, g.today())
-		sellable := p.Qty - bought
+		openSell := g.st.SumOpenSellQty(g.userID, o.Code, g.today())
+		sellable := p.Qty - bought - openSell
 		if sellable < 0 {
 			sellable = 0
 		}
 		if o.Qty > sellable {
-			return fmt.Sprintf("T+1 不可卖: 当日买入锁定, 可卖 %d < 请求 %d（持仓 %d, 当日买入 %d）",
-				sellable, o.Qty, p.Qty, bought)
+			return fmt.Sprintf("T+1 不可卖: 当日买入/在途卖单锁定, 可卖 %d < 请求 %d（持仓 %d, 当日买入 %d, 在途卖 %d）",
+				sellable, o.Qty, p.Qty, bought, openSell)
 		}
 	}
 	return ""

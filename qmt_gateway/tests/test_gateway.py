@@ -382,7 +382,7 @@ class TestGatewayHTTP(unittest.TestCase):
 
     def tearDown(self):
         """网关/账本单测：tearDown"""
-        self.gw._stop.set()
+        self.gw.stop()  # §UAT-D8 走完整优雅停机（置停+停 sender+join 后台线程）
         self.server.shutdown()
         self.server.server_close()
 

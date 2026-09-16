@@ -60,7 +60,7 @@ class TestBridgeLoop(unittest.TestCase):
                              positions_sec=5.0, dry_run=True)
 
     def tearDown(self):
-        self.gw._stop.set()
+        self.gw.stop()  # §UAT-D8 走完整优雅停机
         self.server.shutdown()
         self.server.server_close()
 

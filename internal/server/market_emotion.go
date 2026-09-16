@@ -8,6 +8,7 @@
 //   - 左：SSE score 事件推的当前 emotion + 判定时间戳
 //   - 中：本接口的 30 日色带（每日一段，按 EMOTION_STYLE 上色）
 //   - 右：涨停家数 / 最高连板 / 建议仓位
+//
 // English: Dashboard sentiment card backend — daily emotion/market-state series from
 // market_risk_daily, complemented by the live SSE "score" channel for the current phase.
 package server
@@ -140,8 +141,8 @@ func (s *Server) handleEmotionStrategyMatrix(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"phases": []string{"冰点", "启动", "发酵", "高潮", "退潮", "背离"},
+		"phases":     []string{"冰点", "启动", "发酵", "高潮", "退潮", "背离"},
 		"min_events": store.EmotionMatrixRowMinEvents,
-		"rows":   rows,
+		"rows":       rows,
 	})
 }

@@ -333,7 +333,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		var champions []sweepResult                // champions[bi] = 第 bi 批冠军（值语义，避免切片扩容指针失效）
 		all := make([]sweepResult, 0, len(combos)) // 全量留存供热力网格聚合（10万条 ≈ 12MB）
 		done := 0
-		lowSample := 0                // §W7 被样本门槛剔除的组合数（供兜底/审计）
+		lowSample := 0                   // §W7 被样本门槛剔除的组合数（供兜底/审计）
 		var fallbackChampion sweepResult // §W7 门槛杀光全部时的兜底冠军（未过门槛的原始最优）
 		var hasFallback bool
 		lastPct := -10
@@ -342,30 +342,30 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			lo, hi := bi*batchSize, min((bi+1)*batchSize, len(combos))
 			bestInBatch := sweepResult{}
 			hasChamp := false
-		for ci := lo; ci < hi; ci++ {
-			cb := combos[ci]
-			r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate, sc)
-			// §W7 小样本剔除：低于门槛的组合不入 all 池（也不参与 Pareto 前沿），
-			// 只在**全部**组合都低于门槛时兜底保留原始冠军，防止前端看到零结果。
-			// English: W7 sub-threshold combos skipped; if everything is below the gate we fall
-			// back to the raw champion so the UI doesn't see zero rows.
-			if r.Count < minTriggers {
-				lowSample++
-				rv := objectiveValue(obj, &r)
-				if !hasFallback || rv > objectiveValue(obj, &fallbackChampion) {
-					fallbackChampion = r
-					hasFallback = true
+			for ci := lo; ci < hi; ci++ {
+				cb := combos[ci]
+				r := simulateUniform(ad.Name(), kind, trigs, klines, cb.tp, cb.sl, cb.hold, cb.score, cb.atr, atrs, o.RiskFreeRate, sc)
+				// §W7 小样本剔除：低于门槛的组合不入 all 池（也不参与 Pareto 前沿），
+				// 只在**全部**组合都低于门槛时兜底保留原始冠军，防止前端看到零结果。
+				// English: W7 sub-threshold combos skipped; if everything is below the gate we fall
+				// back to the raw champion so the UI doesn't see zero rows.
+				if r.Count < minTriggers {
+					lowSample++
+					rv := objectiveValue(obj, &r)
+					if !hasFallback || rv > objectiveValue(obj, &fallbackChampion) {
+						fallbackChampion = r
+						hasFallback = true
+					}
+					done++
+					continue
 				}
-				done++
-				continue
-			}
-			r.ObjectiveScore = objectiveValue(obj, &r)
-			all = append(all, r)
-			cur := &all[len(all)-1]
-			if !hasChamp || betterOf(obj, cur, &bestInBatch) == cur {
-				bestInBatch = *cur
-				hasChamp = true
-			}
+				r.ObjectiveScore = objectiveValue(obj, &r)
+				all = append(all, r)
+				cur := &all[len(all)-1]
+				if !hasChamp || betterOf(obj, cur, &bestInBatch) == cur {
+					bestInBatch = *cur
+					hasChamp = true
+				}
 				done++
 				if pct := done * 100 / len(combos); pct >= lastPct+10 {
 					lastPct = pct

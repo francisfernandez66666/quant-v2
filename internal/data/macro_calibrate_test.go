@@ -40,7 +40,7 @@ func TestExternalToMacro(t *testing.T) {
 	ext := []ExternalEvent{
 		{Date: "2026-11-05", Title: "FOMC", Impact: "high", Level: "fomc"},
 		{Date: "not-a-date", Title: "坏日期", Impact: "high", Level: "cpi"}, // 跳过
-		{Date: "2026-12-01", Title: "无类型", Impact: "weird", Level: ""},    // level→other, impact→medium
+		{Date: "2026-12-01", Title: "无类型", Impact: "weird", Level: ""},   // level→other, impact→medium
 	}
 	got := externalToMacro(ext, "external")
 	if len(got) != 2 {

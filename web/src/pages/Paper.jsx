@@ -525,7 +525,7 @@ export default function Paper() {
 
   // 挂载时加载模拟盘数据；§F5 刷新由 SSE 事件驱动 + 60s 兜底（原 15s 高频轮询）
   useEffect(() => { load() }, [])
-  useSseRefresh(['message', 'scan', 'tick'], load)
+  useSseRefresh(['message', 'scan'], load) // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
 
   // ── 列定义 ──
   // 模拟盘持仓表格列定义：代码/名称/买卖时间/数量/成本/现价/浮盈/滑点/延迟/资金池/分时/操作

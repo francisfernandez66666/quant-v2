@@ -1163,6 +1163,27 @@ func clientIP(r *http.Request) string {
 // ctxUserKey 认证用户上下文键，authMiddleware 将校验通过的用户写入 request context。
 type ctxUserKey struct{}
 
+// userRateLimit §UAT-D6（2026-09-16）：高成本认证端点的按用户频控。
+// 旧 ipLimiter 只挂 login/setup 两个匿名口——登录用户可以单账号无限打 LLM 咨询/参数寻优/
+// 新闻补推/持仓复盘（每请求背后是数十秒 LLM/全参回测），成本放大且饿死他人。复用同一
+// 滑动窗实现，键优先用户 ID（未登录回落 IP）。超限返回 false，调用侧回 429。
+// English: §UAT-D6 — per-user sliding-window throttle for expensive authenticated endpoints
+// (LLM consult / backtest optimize / news re-analyze / position review), reusing ipLimiter.
+func (s *Server) userRateLimit(r *http.Request, bucket string, max int, window time.Duration) bool {
+	uid := requestUserID(r)
+	key := bucket + "|ip:" + clientIP(r)
+	if uid != "" {
+		key = bucket + "|u:" + uid
+	}
+	return s.limiter.allow(key, max, window)
+}
+
+// rejectRateLimit 统一 429 出口（带 Retry-After 提示窗口长度）。
+func rejectRateLimit(w http.ResponseWriter, window time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(window.Seconds())))
+	writeError(w, 429, fmt.Sprintf("请求过于频繁，请 %s 后再试", window))
+}
+
 // userFromContext 从请求上下文取出认证用户（由 authMiddleware 注入），未注入返回 nil。
 func userFromContext(r *http.Request) *auth.User {
 	u, _ := r.Context().Value(ctxUserKey{}).(*auth.User)
@@ -1425,6 +1446,11 @@ func (s *Server) handleNewsShowAllStatus(w http.ResponseWriter, r *http.Request)
 // handleNewsReanalyze 处理 POST /api/news/reanalyze：手动 LLM 补推。
 // 异步执行（拉取+LLM耗时），立即返回 202 表示已触发；结果打印到日志。
 func (s *Server) handleNewsReanalyze(w http.ResponseWriter, r *http.Request) {
+	// §UAT-D6 每次补推 = 全市场新闻拉取 + LLM 批量调用，按用户 6 次/分钟封顶。
+	if !s.userRateLimit(r, "news-reanalyze", 6, time.Minute) {
+		rejectRateLimit(w, time.Minute)
+		return
+	}
 	c := s.ctrlFor(requestUserID(r))
 	if c == nil {
 		writeError(w, 503, "engine not ready")
@@ -1991,6 +2017,11 @@ func (s *Server) consultProModeRateLimited(userID string, now time.Time) time.Du
 // 专业模式（开关打开）时注入该股全部实时行情，且盘中 15 分钟限流一次；
 // 普通模式不注入数据、不限流。未接入引擎或 LLM 未配置时返回对应错误提示。
 func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
+	// §UAT-D6 按用户频控（专业模式的 15 分钟数据注入限流仍在后面叠加，这里兜住普通模式刷调用）。
+	if !s.userRateLimit(r, "consult", 12, time.Minute) {
+		rejectRateLimit(w, time.Minute)
+		return
+	}
 	c := s.ctrlFor(requestUserID(r))
 	if c == nil {
 		writeError(w, 503, "引擎未启动")
@@ -2103,6 +2134,11 @@ func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Reques
 // English: force-runs the §DAILY_REVIEW position review for the calling account (synchronous LLM pass).
 // Returns {reviewed:N}; 502 when deps/LLM fail. Same message keys as the daily auto run (per-day upsert).
 func (s *Server) handleTriggerPositionReview(w http.ResponseWriter, r *http.Request) {
+	// §UAT-D6 同步 LLM 全持仓复盘，单次数十秒，按用户 4 次/5 分钟封顶。
+	if !s.userRateLimit(r, "pos-review", 4, 5*time.Minute) {
+		rejectRateLimit(w, 5*time.Minute)
+		return
+	}
 	uid := requestUserID(r)
 	if s.registry == nil {
 		writeError(w, 503, "引擎注册表未就绪")

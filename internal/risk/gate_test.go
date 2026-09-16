@@ -102,6 +102,52 @@ func TestGateT1Sellable(t *testing.T) {
 	}
 }
 
+// §UAT-D4（2026-09-16）：T+1 可卖量必须扣减当日在途卖单——并发双卖不得各自按全量放行。
+// 实录：两笔同秒卖单（合计超过 T+1 可卖量）先后通过旧守卫全部成交（校验输入相同、成交回报未回写）。
+// 本用例锁死：先到者占额度，后到者在网关侧被拦；在途单结算后额度自然回补/继续受持仓约束。
+// English: §UAT-D4 — T+1 sellable must deduct today's still-open sell tickets so concurrent sells
+// cannot each pass on the full settled quantity.
+func TestGateT1SellableCountsOpenSells(t *testing.T) {
+	db := gateDB(t)
+	g := NewGate(db, "u_g", nil)
+	cfg := qmtCfg() // EnforceT1 nil → 默认开
+	today := cntime.In(time.Now()).Format("2006-01-02")
+	// 隔夜持仓 300 股（无当日买入成交）
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "600000.SH", Name: "浦发", Qty: 300, CostPrice: 10, UserID: "u_g"}}); err != nil {
+		t.Fatalf("seed position: %v", err)
+	}
+	// 第一笔卖 200 已受理在途（已报，成交回报未回写）
+	if _, err := db.UpsertRealOrder(store.RealOrder{OrderID: "OS1", SignalID: "SS1", Code: "600000.SH",
+		Side: "卖出", Status: "已报", Price: 10, Qty: 200, CreatedAt: today + "T10:00:00+08:00", UserID: "u_g"}); err != nil {
+		t.Fatalf("seed open sell: %v", err)
+	}
+	// 第二笔卖 150：可卖 = 300 − 0 − 200(在途) = 100 < 150 → 拦
+	o := liveOrder(SideSell)
+	o.Qty = 150
+	if v := g.CheckLiveOrder(cfg, o); v.Pass {
+		t.Fatalf("并发第二笔超在途剩余额度应被拦, got %+v", v)
+	}
+	// 剩余额度内的 100 → 放行
+	o2 := liveOrder(SideSell)
+	o2.Qty = 100
+	if v := g.CheckLiveOrder(cfg, o2); !v.Pass {
+		t.Fatalf("剩余额度 100 应放行, got %+v", v)
+	}
+	// 在途单结算（成交回报回写持仓+终态）后再试 150：可卖 = 100 − 0 − 0 = 100 → 仍拦
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "OS1", Code: "600000.SH", Side: "卖出",
+		Price: 10, Qty: 200, Amount: 2000, TradedAt: today + "T10:00:05", SignalID: "SS1", UserID: "u_g"}); err != nil {
+		t.Fatalf("apply fill: %v", err)
+	}
+	if _, err := db.AdvanceRealOrderStatus("u_g", "SS1", "已成"); err != nil {
+		t.Fatalf("advance status: %v", err)
+	}
+	o3 := liveOrder(SideSell)
+	o3.Qty = 150
+	if v := g.CheckLiveOrder(cfg, o3); v.Pass {
+		t.Fatalf("结算后持仓仅剩 100，卖 150 应被拦")
+	}
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // TestGateLimitUpDown 涨停不可追买 / 跌停不可追卖：on 拦截、off 放行、无昨收 fail-open。

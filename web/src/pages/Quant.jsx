@@ -89,6 +89,18 @@ export default function Quant() {
     max_order_amount: 0,
   })
 
+  // §UAT-D3（2026-09-16）修复「loadConfig 晚到回填冲掉用户输入」竞态：
+  // 旧实现 fetchQMTConfig() 响应落地即无条件 setForm(nextForm)——挂载期慢响应 / 保存后刷新
+  // 都可能把用户刚敲进单笔金额帽/预算的字符覆盖掉（uat_full.spec.mjs:109-111 曾自注「未修项」，
+  // 测试被迫用服务端权威 toPass 重试兜底）。现约定：用户编辑一律走 setFormUser 置脏位，
+  // loadConfig 检测到脏位则跳过表单覆盖（halted 安全态仍照常回显），重新进页/刷新即恢复权威值。
+  // English: mark user edits; a late GET /api/config/qmt response must never clobber typed input.
+  const userEditedRef = useRef(false)
+  function setFormUser(updater) {
+    userEditedRef.current = true
+    setForm(updater)
+  }
+
   // 通用 UI 状态
   const [tokenInput, setTokenInput] = useState('')
   const [strategyList, setStrategyList] = useState([])
@@ -152,7 +164,8 @@ export default function Quant() {
   }
   // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启。
   // 失败时置 loadErr 告警（页面顶部显示），并向上抛出由调用方决定是否 toast。
-  async function loadConfig() {
+  // §UAT-D3 force=true：保存成功后的主动刷新（用户输入即服务端权威值，绕过脏守卫）。
+  async function loadConfig(force) {
     setSyncing(true)
     try {
       const c = await api.fetchQMTConfig()
@@ -166,6 +179,14 @@ export default function Quant() {
         miss_heartbeat_sec: c.miss_heartbeat_sec ?? 120,
         max_order_amount: c.max_order_amount ?? 0,
       }
+      // §UAT-D3 脏守卫：用户已编辑表单时，晚到的 GET 响应不得覆盖输入（见上方 userEditedRef 注释）。
+      // 合法全量回填时机：首次加载 / 保存成功或失败后的刷新（patch 内显式 force）。
+      if (!force && userEditedRef.current) {
+        setHalted(!!c.halted) // 安全态与本地编辑无关，照常回显
+        setSyncing(false)
+        return
+      }
+      userEditedRef.current = false
       setForm(nextForm)
       writeCachedForm(nextForm)
       // §U-2 kill-switch 当前态随配置回显（config.halted），供紧急停止按钮显示"置位/解除"
@@ -324,7 +345,7 @@ export default function Quant() {
     try {
       await api.updateQMTConfig(fields)
       MessagePlugin.success(okTip || '已保存')
-      await loadConfig()
+      await loadConfig(true) // §UAT-D3 保存成功=用户输入即服务端权威值，强制回填（清脏位）
     } catch (e) {
       MessagePlugin.error('保存失败：' + (e && e.message ? e.message : e))
       try { await loadConfig() } catch (_) {}
@@ -337,21 +358,21 @@ export default function Quant() {
   async function saveMode(mode) {
     if (saving) return
     if (mode === 'auto' && !(await confirmDialog('确认切换为「全自动」？信号将不经人工确认直接下单（受熔断/纪律约束）。', '切换全自动'))) return
-    setForm((f) => ({ ...f, mode }))
+    setFormUser((f) => ({ ...f, mode }))
     await patch({ mode }, mode === 'auto' ? '已切换为全自动' : '已切换为手动确认')
   }
 
   // 切换委托价格：点击立即保存到后端
   async function savePriceType(priceType) {
     if (saving) return
-    setForm((f) => ({ ...f, price_type: priceType }))
+    setFormUser((f) => ({ ...f, price_type: priceType }))
     await patch({ price_type: priceType }, '委托价格已保存')
   }
 
   // 切换自动卖出：点击立即保存到后端
   async function saveAutoSell(v) {
     if (saving) return
-    setForm((f) => ({ ...f, auto_sell: v }))
+    setFormUser((f) => ({ ...f, auto_sell: v }))
     await patch({ auto_sell: v }, v ? '已开启自动卖出' : '已关闭自动卖出')
   }
 
@@ -469,7 +490,7 @@ export default function Quant() {
         {syncing ? (
           <span style={{ fontSize: 13, color: 'var(--app-muted-2)' }}>同步中…</span>
         ) : (
-          <ToggleSw checked={form.enabled} onChange={(v) => { setForm({ ...form, enabled: v }); saveSwitches(v) }} />
+          <ToggleSw checked={form.enabled} onChange={(v) => { setFormUser({ ...form, enabled: v }); saveSwitches(v) }} />
         )}
         <span style={{ color: loadErr ? 'var(--app-up)' : 'var(--app-down)', fontSize: 11, marginLeft: 10 }}>
           {loadErr ? '⚠ 未同步服务器（下方为本地缓存，非真实状态）' : '已同步服务器 ✓'}
@@ -498,7 +519,7 @@ export default function Quant() {
     // 自动卖出：自动模式下止损/清仓级建议自动全仓卖出
     const autoSell = (
       <Form.FormItem label="自动卖出">
-        <ToggleSw checked={form.auto_sell} onChange={(v) => { setForm({ ...form, auto_sell: v }); saveAutoSell(v) }} />
+        <ToggleSw checked={form.auto_sell} onChange={(v) => { setFormUser({ ...form, auto_sell: v }); saveAutoSell(v) }} />
         <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>自动模式下止损/清仓级建议自动全仓卖出；止盈/减仓保持提醒</span>
       </Form.FormItem>
     )
@@ -526,7 +547,7 @@ export default function Quant() {
     const heartbeat = (
       <Form.FormItem label="心跳超时(秒)">
         <Input style={{ width: 140 }} type="number" value={form.miss_heartbeat_sec} min={30} max={3600}
-          onChange={(v) => setForm({ ...form, miss_heartbeat_sec: parseInt(v, 10) })} />
+          onChange={(v) => setFormUser({ ...form, miss_heartbeat_sec: parseInt(v, 10) })} />
         <span style={{ color: 'var(--app-text-2)', fontSize: 11, marginLeft: 10 }}>连续失联超过该值触发熔断暂停下单（30-3600）</span>
       </Form.FormItem>
     )
@@ -534,7 +555,7 @@ export default function Quant() {
     const gatewayUrl = (
       <Form.FormItem label="网关地址">
         <Input style={{ flex: 1, minWidth: 240 }} value={form.gateway_url} placeholder="http://81.71.69.17:8789"
-          onChange={(v) => setForm({ ...form, gateway_url: v })} />
+          onChange={(v) => setFormUser({ ...form, gateway_url: v })} />
       </Form.FormItem>
     )
     // 鉴权Token配置：显示为脱敏形态，留空保持原值
@@ -573,7 +594,7 @@ export default function Quant() {
     const maxPos = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>最大持仓数</label>
-        <Input type="number" value={form.max_positions} min={1} max={50} onChange={(v) => setForm({ ...form, max_positions: parseInt(v, 10) })} />
+        <Input type="number" value={form.max_positions} min={1} max={50} onChange={(v) => setFormUser({ ...form, max_positions: parseInt(v, 10) })} />
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>1-50，双端校验</span>
       </div>
     )
@@ -581,7 +602,7 @@ export default function Quant() {
     const fixedAmt = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单票金额(元)</label>
-        <Input type="number" value={form.fixed_amount} min={0} step={500} onChange={(v) => setForm({ ...form, fixed_amount: parseFloat(v) })} />
+        <Input type="number" value={form.fixed_amount} min={0} step={500} onChange={(v) => setFormUser({ ...form, fixed_amount: parseFloat(v) })} />
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>每次买入投入金额</span>
       </div>
     )
@@ -589,7 +610,7 @@ export default function Quant() {
     const initCap = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>初始资金(元)</label>
-        <Input type="number" value={form.initial_capital} min={0} step={10000} onChange={(v) => setForm({ ...form, initial_capital: parseFloat(v) })} />
+        <Input type="number" value={form.initial_capital} min={0} step={10000} onChange={(v) => setFormUser({ ...form, initial_capital: parseFloat(v) })} />
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>用于仓位约束预检</span>
       </div>
     )
@@ -597,7 +618,7 @@ export default function Quant() {
     const dailyBuys = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单日买入笔数上限</label>
-        <Input type="number" value={form.daily_max_buys} min={0} onChange={(v) => setForm({ ...form, daily_max_buys: parseInt(v, 10) })} />
+        <Input type="number" value={form.daily_max_buys} min={0} onChange={(v) => setFormUser({ ...form, daily_max_buys: parseInt(v, 10) })} />
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，防信号风暴</span>
       </div>
     )
@@ -605,7 +626,7 @@ export default function Quant() {
     const dailyBudget = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单日买入预算(元)</label>
-        <Input type="number" value={form.daily_budget_amount} min={0} step={10000} onChange={(v) => setForm({ ...form, daily_budget_amount: parseFloat(v) })} />
+        <Input type="number" value={form.daily_budget_amount} min={0} step={10000} onChange={(v) => setFormUser({ ...form, daily_budget_amount: parseFloat(v) })} />
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，超出拒绝新买入</span>
       </div>
     )
@@ -613,7 +634,7 @@ export default function Quant() {
     const maxOrderAmt = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单笔金额绝对帽(元)</label>
-        <Input type="number" value={form.max_order_amount} min={0} step={10000} onChange={(v) => setForm({ ...form, max_order_amount: parseFloat(v) })} />
+        <Input type="number" value={form.max_order_amount} min={0} step={10000} onChange={(v) => setFormUser({ ...form, max_order_amount: parseFloat(v) })} />
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=关；买卖双向封顶，防胖手误</span>
       </div>
     )

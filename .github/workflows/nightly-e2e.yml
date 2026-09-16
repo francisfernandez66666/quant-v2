@@ -1,0 +1,154 @@
+# nightly-e2e — §UAT-D7（2026-09-16）全栈端到端每日回归
+# 此前 Playwright e2e（web/e2e）从未进 CI：50 条用例只靠本机手工起栈跑，
+# 前端路由/接口契约/交易闭环的回归只能等人工想起来验证。本 job 复刻 UAT 实录栈：
+# qmt-mock(18789) + quant(18080, 独立数据目录) + vite dev(5173, VITE_BACKEND_PORT=18080)，
+# 初始化 admin/tester 账号、装配 QMT 配置、seed 情绪日线，再全量跑 spec。
+# English: nightly full-stack e2e — builds mock+engine+frontend, seeds accounts/config/sentiment,
+# then runs the Playwright suite that previously only existed as a manual drill.
+name: nightly-e2e
+
+on:
+  schedule:
+    # 21:00 北京时间（UTC 13:00），周二~周六 = A股交易日夜检
+    - cron: "0 13 * * 2-6"
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      QUANT_DATA_DIR: ${{ github.workspace }}/.uat-data
+      BACKEND: http://127.0.0.1:18080
+      E2E_USER: admin
+      E2E_PASS: Nightly!2026
+      E2E_USER2: tester
+      E2E_PASS2: Tester!2026
+      QMT_TOKEN: uat-secret
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" "$QUANT_DATA_DIR"
+          go build -o "$RUNNER_TEMP/bin/quant" ./cmd/quant
+          go build -o "$RUNNER_TEMP/bin/qmt-mock" ./cmd/qmt-mock
+
+      - name: Start qmt-mock
+        run: |
+          "$RUNNER_TEMP/bin/qmt-mock" -listen :18789 -token "$QMT_TOKEN" \
+            -server http://127.0.0.1:18080 -delay 1.5s \
+            -seed "600519.SH,贵州茅台,200,1500.00" \
+            > mock.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18789/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Start engine
+        run: |
+          QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine.log 2>&1 &
+          echo $! > engine.pid
+          for i in $(seq 1 60); do
+            curl -s -o /dev/null -w '%{http_code}' "$BACKEND/setup" | grep -qE '200|405' && break
+            sleep 1
+          done
+          cat engine.log
+
+      - name: Seed accounts + QMT config
+        run: |
+          TOKEN=$(curl -fsS -X POST "$BACKEND/setup" -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$E2E_USER\",\"password\":\"$E2E_PASS\"}" | jq -r .token)
+          echo "ADMIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          curl -fsS -X POST "$BACKEND/api/admin/users" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$E2E_USER2\",\"password\":\"$E2E_PASS2\",\"role\":\"user\"}"
+          # QMT 网关装配：手动模式 + mock 地址（休市时段部分参数重启后才装配生效，下一步统一重启）
+          curl -fsS -X POST "$BACKEND/api/config/qmt" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' -d '{
+              "enabled": true, "mode": "manual",
+              "gateway_url": "http://127.0.0.1:18789", "token": "uat-secret",
+              "price_type": "limit", "max_positions": 5, "fixed_amount": 20000,
+              "initial_capital": 500000, "daily_max_buys": 3,
+              "daily_budget_amount": 100000, "max_order_amount": 50000,
+              "miss_heartbeat_sec": 120
+            }'
+
+      - name: Seed market_risk_daily（情绪回看用例依赖）
+        run: |
+          python - <<'PY'
+          import os, sqlite3
+          db = sqlite3.connect(os.path.join(os.environ["QUANT_DATA_DIR"], "trading.db"))
+          from datetime import date, timedelta
+          d0 = date.today().strftime("%Y%m%d")
+          d1 = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+          for d, emo, tier in ((d1, "偏冷", "yellow"), (d0, "中性", "green")):
+              db.execute(
+                  "INSERT OR REPLACE INTO market_risk_daily(trade_date,emotion,market_state,risk_tier,reasons,up_ratio,break_rate,max_pos_pct,limit_up_count,ladder_height) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (d, emo, "震荡", tier, "nightly seed", 0.55, 0.12, 0.6, 30, 4))
+          db.commit()
+          print("seeded rows:", db.execute("SELECT COUNT(*) FROM market_risk_daily").fetchone()[0])
+          PY
+
+      - name: Restart engine（QMT 配置装配生效）
+        run: |
+          kill "$(cat engine.pid)" 2>/dev/null || true
+          sleep 2
+          QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine2.log 2>&1 &
+          echo $! > engine.pid
+          for i in $(seq 1 60); do
+            curl -s -o /dev/null -w '%{http_code}' "$BACKEND/api/health" -H "Authorization: Bearer $ADMIN_TOKEN" | grep -q 200 && break
+            sleep 1
+          done
+
+      - name: Install web deps + Playwright browser
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Start frontend (vite dev)
+        run: |
+          cd web
+          VITE_BACKEND_PORT=18080 npx vite --port 5173 --strictPort > ../vite.log 2>&1 &
+          echo $! > ../vite.pid
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:5173 >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Playwright 全量 e2e
+        working-directory: web
+        run: npx playwright test
+
+      - name: Upload report artifacts（失败时取证）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-e2e-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+            mock.log
+            engine.log
+            engine2.log
+            vite.log
+          if-no-files-found: ignore

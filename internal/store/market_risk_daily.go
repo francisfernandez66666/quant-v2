@@ -96,10 +96,10 @@ func (d *DB) ListMarketRiskDaily(from, to string) ([]MarketRiskDailyRow, error) 
 // MarketRiskTierSummary 按风险档分组聚合日数（None/Yellow/Red），供回测概览/看板。
 // English: groups the daily rows by tier (None/Yellow/Red) with day counts for a backtest overview.
 type MarketRiskTierSummary struct {
-	Tier    string
-	Days    int
-	AvgUp   *float64 // 该档平均上涨占比（全 NULL 时 nil）
-	AvgBrk  *float64 // 该档平均炸板率
+	Tier   string
+	Days   int
+	AvgUp  *float64 // 该档平均上涨占比（全 NULL 时 nil）
+	AvgBrk *float64 // 该档平均炸板率
 }
 
 // SummarizeMarketRiskDaily 统计 [from,to] 各风险档的日数 + 平均广度/炸板率（NULL 跳过）。
@@ -110,9 +110,9 @@ func (d *DB) SummarizeMarketRiskDaily(from, to string) ([]MarketRiskTierSummary,
 		return nil, err
 	}
 	type agg struct {
-		days          int
-		upSum, upN    float64
-		brSum, brN    float64
+		days       int
+		upSum, upN float64
+		brSum, brN float64
 	}
 	byTier := map[string]*agg{}
 	order := []string{"", "Yellow", "Red"}

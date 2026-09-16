@@ -72,3 +72,53 @@ export function fmtTime(ts) {
 export function toStr(v) {
   return v === null || v === undefined ? '' : String(v)
 }
+
+/**
+ * §UAT-D1（2026-09-16）把资损/运维级 SSE 事件映射为统一的告警展示描述。
+ * 后端广播但前端此前零订阅的四个 type（qmt_halt / positions_clear_guard / settlement_diff / trigger）
+ * 在此收敛成 {key,title,body,tone}，供 App.jsx 全局 Toast + 系统通知消费；非告警 type 返回 null。
+ * 字段口径对齐后端：qmt.go:1052（halted/cancelled）、qmt.go:513（held）、qmt.go:1106+
+ * store/settlement.go:18-28（diff.*）、trigger.go:188（signal.code/name/msg）。
+ * English: maps the resource-loss/ops-grade SSE events (previously broadcast-but-unsubscribed)
+ * to a uniform alert descriptor for the global Toast + system notification.
+ */
+export function sseOpsAlert(msg) {
+  if (!msg || typeof msg !== 'object') return null
+  switch (msg.type) {
+    case 'qmt_halt':
+      // halted=true=置位熔断（伴随撤在途单），false=解除；两者都必须让 UI 立刻知道
+      return msg.halted
+        ? { key: 'qmt_halt', title: '量仔 实盘熔断', tone: 'error',
+          body: '实盘已紧急停止，在途委托撤销 ' + (msg.cancelled || 0) + ' 笔' + (msg.time ? '（' + msg.time + '）' : '') }
+        : { key: 'qmt_halt', title: '量仔 实盘恢复', tone: 'success',
+          body: '熔断已解除，恢复正常下单' + (msg.time ? '（' + msg.time + '）' : '') }
+    case 'positions_clear_guard':
+      // 守卫触发：空快照试图清空持仓被拒（qmt.go:495-520），资损级安全事件，红色强提醒
+      return { key: 'pcg', title: '量仔 持仓清空守卫', tone: 'error',
+        body: '收到空持仓快照但本地仍有 ' + (msg.held || 0) + ' 条持仓，已拒收全清（防断连误清账）'
+          + (msg.time ? '（' + msg.time + '）' : '') }
+    case 'settlement_diff': {
+      const d = msg.diff || {}
+      const miss = (d.missing_in_local || []).length
+      const extra = (d.extra_in_local || []).length
+      const mism = (d.mismatch || []).length
+      if (!miss && !extra && !mism && !d.fee_diff && !d.cash_diff) return null
+      const parts = []
+      if (miss) parts.push('本地缺' + miss)
+      if (extra) parts.push('本地多' + extra)
+      if (mism) parts.push('不符' + mism)
+      if (d.fee_diff) parts.push('费用差' + Number(d.fee_diff).toFixed(2))
+      if (d.cash_diff) parts.push('现金差' + Number(d.cash_diff).toFixed(2))
+      return { key: 'settlediff', title: '量仔 交割对账差异', tone: 'warning',
+        body: (d.day || msg.time || '') + '：' + parts.join('、') + '，请到量化交易页复核' }
+    }
+    case 'trigger': {
+      const s = msg.signal || {}
+      if (!s.code && !s.msg) return null
+      return { key: 'trg', title: '量仔 实时放量急拉', tone: 'warning',
+        body: (s.code || '') + ' ' + (s.name || '') + '：' + (s.msg || '') }
+    }
+    default:
+      return null
+  }
+}

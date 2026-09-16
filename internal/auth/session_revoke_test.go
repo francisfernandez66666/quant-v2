@@ -1,7 +1,9 @@
 // Package auth — §D1/§D7 修复回归测试：
-//   D1: /api/admin/users 曾经把 Sessions[].Token（SHA-256 哈希）随 PublicUser() 一并序列化，
-//       配合 ValidateToken 路径二 matchPlain 可回放冒用；PublicUser 必须清空 Sessions/TokenExp。
-//   D7: 无自助退出——清 localStorage 后服务端会话仍有效到 TTL；新增 RevokeSession。
+//
+//	D1: /api/admin/users 曾经把 Sessions[].Token（SHA-256 哈希）随 PublicUser() 一并序列化，
+//	    配合 ValidateToken 路径二 matchPlain 可回放冒用；PublicUser 必须清空 Sessions/TokenExp。
+//	D7: 无自助退出——清 localStorage 后服务端会话仍有效到 TTL；新增 RevokeSession。
+//
 // English: §D1/D7 regression tests for session-credential stripping and self-service logout.
 package auth
 

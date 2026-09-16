@@ -2,6 +2,7 @@
 //   - GET /api/qmt/orders 当日过滤与 503 分支（撤单 UI 的数据源）；
 //   - POST /api/config/qmt 携带 halted 的持久化与即时生效挂点（kill-switch 不再滞留开关队列）；
 //   - POST /api/admin/users/cleanup 脏账号清理（过期/temp 禁用），dry_run 预览不误删。
+//
 // English: regression tests for the §U-2/§U-3/§U-5 fixes — the today-filtered orders endpoint
 // (data source for the new cancel UI), the halted-carrying config save (immediate kill switch),
 // and the stale-account cleanup endpoint with dry-run preview.

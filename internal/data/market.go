@@ -753,7 +753,7 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 		Low:       raw.Data.F45 / 100,
 		Close:     raw.Data.F60 / 100,
 		PrevClose: raw.Data.F60 / 100, // §P1-5 显式昨收（东财 F60）
-		Volume:    volHands * 100, // 手→股，与新浪日K/余量表单位对齐
+		Volume:    volHands * 100,     // 手→股，与新浪日K/余量表单位对齐
 		Amount:    amount,
 		ChangePct: raw.Data.F170 / 100,
 		Turnover:  raw.Data.F168 / 100,

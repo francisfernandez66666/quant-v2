@@ -402,9 +402,19 @@ class Gateway:
             self._file_bridge_push_pending()
 
     def stop(self):
-        """优雅停止：置停止信号并停掉回报发送线程（重连/对账线程随之退出）。"""
+        """优雅停止：置停止信号并停掉回报发送线程（重连/对账线程随之退出）。
+        §UAT-D8：join 各后台线程（短超时）——旧实现只置事件即返回，pytest teardown 时
+        守护线程仍在跑，解释器退出阶段刷 'Exception ignored in ... thread' 告警，
+        掩盖真实失败且污染 CI 日志。English: §UAT-D8 — join the background threads with a
+        short timeout so pytest teardown no longer leaks live daemon threads."""
         self._stop.set()
         self.handler.stop_sender()
+        for th in (getattr(self, "_broker_thread", None),
+                   getattr(self, "_failover_thread", None),
+                   getattr(self, "_file_bridge_thread", None),
+                   getattr(self, "_reconcile_thread", None)):
+            if th is not None and th.is_alive():
+                th.join(timeout=2)
 
     def _connect_loop(self):
         """后台线程：主动重连 XtBroker；任一 active 通道从断开转连接时推一次对账与资产。
@@ -445,23 +455,34 @@ class Gateway:
                 conn = b.is_connected()
                 # 仅当 active 通道发生「断开→连接」转换时推一次全量对账 + 资产
                 if conn and not prev[key] and key == self.active_key:
-                    self.handler.disconnected = False
-                    poss = b.query_positions()
-                    if poss:
-                        self.handler.on_positions(poss)
-                    else:
-                        log.warning("[gateway] post-connect empty positions snapshot — "
-                                    "reconcile skipped (account data may not be synced yet)")
-                    self.handler.on_account(b.query_asset())
+                    # §UAT-D8（2026-09-16）：对账查询整体包 try——一次 query_positions/query_asset
+                    # 抛异常（xtquant 抖动、通道半初始化）旧实现会**杀死整个重连/对账线程**，
+                    # 此后网关不再自动重连、不再推对账，决策侧静默失去实盘真相。降级为记日志+下一轮重试。
+                    # English: §UAT-D8 — guard the reconnect-transition reconcile so a transient
+                    # query error can't kill the whole loop thread (silent loss of auto-reconnect).
+                    try:
+                        self.handler.disconnected = False
+                        poss = b.query_positions()
+                        if poss:
+                            self.handler.on_positions(poss)
+                        else:
+                            log.warning("[gateway] post-connect empty positions snapshot — "
+                                        "reconcile skipped (account data may not be synced yet)")
+                        self.handler.on_account(b.query_asset())
+                    except Exception:  # noqa: BLE001
+                        log.exception("[gateway] post-connect reconcile failed (will retry on next transition)")
                 prev[key] = conn
-            time.sleep(1)
+            # §UAT-D8：可被停止信号即时打断（time.sleep 会让 stop() 的 join 白等满周期）
+            if self._stop.wait(1):
+                break
 
     def _failover_loop(self):
         """§QMT-DUAL 主备自动翻转循环（2026-09-11 语义反转：queued 主 / xt 备）：
         交易时段 active=queued 且桥心跳断 ≥ failover_sec 且 xt 在线 → 翻 xt 顶班；
         active=xt 且桥恢复新鲜 → 自动回切 queued。每 5s 轮询，异常不阻断。"""
         while not self._stop.is_set():
-            time.sleep(5)
+            if self._stop.wait(5):  # §UAT-D8 可中断等待，替代 time.sleep(5)
+                break
             try:
                 self._maybe_failover()
             except Exception:  # noqa: BLE001

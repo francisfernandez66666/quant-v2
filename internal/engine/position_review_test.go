@@ -27,8 +27,8 @@ func makeBars(n int, base, step, v0 float64) []data.KLine {
 	for i := 0; i < n; i++ {
 		c := base + step*float64(i)
 		out = append(out, data.KLine{
-			Date:   time.Date(2026, 9, 1, i, 0, 0, 0, reviewTestLoc),
-			Open:   c * 0.99, High: c * 1.01, Low: c * 0.98, Close: c,
+			Date: time.Date(2026, 9, 1, i, 0, 0, 0, reviewTestLoc),
+			Open: c * 0.99, High: c * 1.01, Low: c * 0.98, Close: c,
 			Volume: v0 * (1 + 0.02*float64(i)),
 		})
 	}
@@ -209,7 +209,10 @@ func TestReviewPositionsIfDueRunsOnce(t *testing.T) {
 	e := &Engine{userID: "u", msgStore: data.NewMessageStore(""), signalStore: ss, cfgMgr: &config.Manager{Rules: &config.Rules{}}}
 	e.reviewDailyK = func(string) ([]data.KLine, error) { return makeBars(60, 100, 1, 1e6), nil }
 	calls := 0
-	e.reviewAsk = func(string, string) (string, error) { calls++; return "600519|中性|震荡整理，量能平稳。", nil }
+	e.reviewAsk = func(string, string) (string, error) {
+		calls++
+		return "600519|中性|震荡整理，量能平稳。", nil
+	}
 	now := time.Date(2026, 9, 14, 15, 30, 0, 0, reviewTestLoc)
 	e.ReviewPositionsIfDue(now)
 	if calls != 1 {

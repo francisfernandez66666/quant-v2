@@ -136,7 +136,7 @@ func main() {
 	d1s := map[string]combat_agent.D1Score{}
 	var d1Ms time.Duration
 	am := auth.NewManager(*dataDir) // 须 Init：未建库时 AdminID/GetConfig 会 panic
-	_ = am.Init()                  // 运营库缺失不致命（回落 env/全局链）
+	_ = am.Init()                   // 运营库缺失不致命（回落 env/全局链）
 	if llmCfg := llmcfg.Resolve(cfgMgr, am); len(llmCfg.APIKeys) > 0 {
 		// §UI-AUTHORITATIVE：与引擎同源解析（设置页保存优先于环境变量），延迟工具测出的
 		// 新闻→D1 耗时才代表生产真实链路。

@@ -347,3 +347,61 @@ func TestMockChaosTradeBeforeOrder(t *testing.T) {
 		t.Fatalf("乱序回报不应影响记账: %+v", p)
 	}
 }
+
+// TestMockOversellReject §UAT-D5（2026-09-16）：卖出超仓必须整笔废单——
+// 旧 mock 对持仓不足的销售单要么静默不成交（委托永挂"已报"、无废单事件、无拒因），
+// 要么（partial/清仓）删整仓却按全部卖出量回补现金，制造幻影现金。
+// 真柜台"证券不足"→整笔废单、持仓/现金不动、拒因回传。本用例锁死该语义。
+// English: §UAT-D5 — a sell exceeding holdings must be a whole-ticket reject: no trade,
+// position/cash untouched, reject reason pushed (matching the real counter's insufficient-securities).
+func TestMockOversellReject(t *testing.T) {
+	h, b, rec := newModeGateway("full", false)
+	// 预置持仓 600519.SH 100 股 @1500，并记现金/持仓基线
+	b.mu.Lock()
+	b.positions["600519.SH"] = &pos{TsCode: "600519.SH", Name: "贵州茅台", Qty: 100, CostPrice: 1500, Amount: 150000, HighestPrice: 1500}
+	b.mu.Unlock()
+	cashBefore := b.snapshotCash()
+
+	// 卖 200（超仓 100）→ 期望整笔废单
+	_, resp := post(t, h, "/order", `{"signal_id":"OV1","code":"600519.SH","side":"卖出","price":1500,"qty":200}`)
+	oid := resp["order_id"].(string)
+	if !rec.waitFor(func() bool { return len(rec.find("order", "废单")) == 1 }, 2*time.Second) {
+		t.Fatalf("卖超仓应推 废单 事件, got orders=%+v", rec.find("order", ""))
+	}
+	evt := rec.find("order", "废单")[0]
+	if evt["order_id"] != oid || evt["reason"] == nil || evt["reason"] == "" {
+		t.Fatalf("废单事件应带 order_id+拒因: %+v", evt)
+	}
+	if len(rec.find("trade", "")) != 0 {
+		t.Fatal("超仓废单绝不应产生 trade 成交")
+	}
+	// 持仓与现金原封不动（幻影现金回归锁）
+	if p := posOf(b, "600519.SH"); p == nil || p["qty"].(int) != 100 {
+		t.Fatalf("超仓废单不应改动持仓: %+v", p)
+	}
+	if got := b.snapshotCash(); got != cashBefore {
+		t.Fatalf("超仓废单不应回补现金（幻影现金）: got %.2f want %.2f", got, cashBefore)
+	}
+	// 部分超仓（持 100，卖 150）同样整笔废单
+	if _, resp2 := post(t, h, "/order", `{"signal_id":"OV2","code":"600519.SH","side":"卖出","price":1500,"qty":150}`); true {
+		oid2 := resp2["order_id"].(string)
+		if !rec.waitFor(func() bool { return len(rec.find("order", "废单")) == 2 }, 2*time.Second) {
+			t.Fatalf("部分超仓也应整笔废单, oid=%s", oid2)
+		}
+	}
+	if len(rec.find("trade", "")) != 0 || posOf(b, "600519.SH")["qty"].(int) != 100 {
+		t.Fatal("部分超仓后仍不应有成交/改仓/回现金")
+	}
+	// 合法卖出（持 100 卖 100）→ 正常成交清仓（确保没把正常路径也拦死）
+	if _, _ = post(t, h, "/order", `{"signal_id":"OK1","code":"600519.SH","side":"卖出","price":1500,"qty":100}`); true {
+		if !rec.waitFor(func() bool { return len(rec.find("trade", "")) == 1 }, 2*time.Second) {
+			t.Fatal("合法全额卖出应正常成交")
+		}
+	}
+	if p := posOf(b, "600519.SH"); p != nil {
+		t.Fatalf("全额卖出应清仓, got %+v", p)
+	}
+	if got, want := b.snapshotCash(), cashBefore+100*1500.0; got != want {
+		t.Fatalf("合法卖出回补现金应 %.2f, got %.2f", want, got)
+	}
+}

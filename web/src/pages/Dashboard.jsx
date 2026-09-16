@@ -182,7 +182,7 @@ export default function Dashboard() {
     // QMT 链路状态每 15s 轮询刷新
     qmtTimer.current = setInterval(loadQMT, 15000)
     api.connectSSE()
-    sseUnsub.current = on(['scan', 'message', 'score', 'tick'], handleSSE)
+    sseUnsub.current = on(['scan', 'message', 'score'], handleSSE) // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
     visibilityHandler.current = () => {
       if (document.hidden) {
         if (timer.current) { clearInterval(timer.current); timer.current = null }

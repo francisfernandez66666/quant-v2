@@ -963,7 +963,7 @@ func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 // §U-2（2026-09-14 像素级 UAT）：撤单端点 /api/qmt/cancel/{order_id} 一直存在但前端零入口——
 // 根因是列表缺口：前端拿不到 order_id 就无从挂"撤单"按钮。本端点把 live.db orders 行
 // 按北京时间当日过滤返回（created_at 前缀 yyyy-MM-dd），终态/在途由前端按 status 呈现，
-// 仅 已报/部成（含部成待撤等未终结态）允许撤单。遗留全局行（user_id=''）沿用
+// 仅 已报/部成（含部成待撤等未终结态）允许撤单。遗留全局行（user_id=”）沿用
 // RealOrdersForUser 的可见性口径，不额外收权。
 // English: §U-2 — today's live-book orders for the admin UI. The cancel endpoint existed with no
 // frontend entry precisely because the list carried no order ids to anchor the button; this

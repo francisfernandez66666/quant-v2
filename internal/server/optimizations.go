@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/research"
@@ -27,6 +28,13 @@ import (
 // handleOptimizeEnqueue 处理 POST /api/backtest/optimize：
 // payload {kind:"optimize", objective, start?, end?, top_n?}，ref_id 固定 0（全库一次一个）。
 func (s *Server) handleOptimizeEnqueue(w http.ResponseWriter, r *http.Request) {
+	// §UAT-D6 寻优任务吃满 CPU/数据源配额，按用户 20 次/5 分钟封顶。
+	// 初版取 5/5min 过紧：W6 e2e 合法连发 4 objective + 1 幂等重发即 5 次，重跑或真实研究
+	// 多标的扫参秒撞墙。20 仍能拦失控脚本，却不误伤合法批处理（队列为串行为主，此处仅防刷）。
+	if !s.userRateLimit(r, "bt-optimize", 20, 5*time.Minute) {
+		rejectRateLimit(w, 5*time.Minute)
+		return
+	}
 	var body struct {
 		Objective string `json:"objective"`
 		Start     string `json:"start"`

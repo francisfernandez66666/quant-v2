@@ -124,7 +124,7 @@ class TestQueuedHTTP(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self):
-        self.gw._stop.set()
+        self.gw.stop()  # §UAT-D8 走完整优雅停机
         self.server.shutdown()
         self.server.server_close()
 
@@ -303,7 +303,7 @@ class TestFailover(unittest.TestCase):
 
     def tearDown(self):
         if getattr(self, "gw", None) is not None:
-            self.gw._stop.set()
+            self.gw.stop()  # §UAT-D8 走完整优雅停机
             self.server.shutdown()
             self.server.server_close()
 

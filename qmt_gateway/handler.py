@@ -474,7 +474,13 @@ def periodic_reconcile(handler, broker, interval_sec=60, stop=None):
     §QMT-DUAL 双路径下 active 通道可运行时切换，网关传入 callable 保证对账源实时正确。
     """
     while not stop or not stop.is_set():
-        time.sleep(interval_sec)
+        # §UAT-D8：可被停止信号即时打断；旧 time.sleep(interval) 在测试 teardown 时
+        # 让 Gateway.stop() 的 join 白等满整周期（默认 60s），泄漏活跃守护线程。
+        if stop is not None:
+            if stop.wait(interval_sec):
+                break
+        else:
+            time.sleep(interval_sec)
         try:
             b = broker() if callable(broker) else broker
             if b.is_connected():

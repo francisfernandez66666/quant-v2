@@ -162,7 +162,13 @@ func (b *book) applyFill(o *order, price float64) (fillRecord, bool) {
 		}
 		b.cash -= float64(o.Qty) * price
 	} else {
-		if p == nil {
+		// §UAT-D5（2026-09-16）：卖出超仓在真柜台是「证券不足」整笔废单——旧 mock
+		// p==nil 静默 false（委托永挂"已报"、无废单事件），p.Qty<o.Qty 又删整仓并按全部
+		// 卖量回补现金（幻影现金）。现统一：持仓不足直接判失败，交调用侧推废单。
+		// English: §UAT-D5 — a sell exceeding holdings is a whole-ticket reject at the real
+		// counter (insufficient securities); the old mock either silently hung the ticket
+		// (no reject event) or deleted the position while crediting full sell cash (phantom).
+		if p == nil || p.Qty < o.Qty {
 			return fillRecord{}, false
 		}
 		remain := p.Qty - o.Qty
@@ -460,12 +466,25 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 				log.Printf("[mock] skip fill: order %s already %s (not 已报)", o.OrderID, cur)
 				return
 			}
-			pushFills := func(fillQty int) {
+			pushFills := func(fillQty int) bool {
 				o2 := *o
 				o2.Qty = fillQty
 				fr, okFill := b.applyFill(&o2, o.Price)
 				if !okFill {
-					return
+					// §UAT-D5：入账失败（持仓不足）= 柜台废单——推 废单 终态事件（带拒因），
+					// 委托不再永挂"已报"等超时撤；引擎侧走真实拒因链路（重报禁用/告警）。
+					b.mu.Lock()
+					held := 0
+					if p := b.positions[o.Code]; p != nil {
+						held = p.Qty
+					}
+					o.Status = "废单"
+					rej := orderEvent(o, "废单")
+					rej["reason"] = fmt.Sprintf("mock 柜台废单: 卖量 %d 超过持仓 %d（证券不足）", fillQty, held)
+					b.mu.Unlock()
+					log.Printf("[mock] reject %s: sell %d > held %d", o.OrderID, fillQty, held)
+					push(rej)
+					return false
 				}
 				trade := map[string]interface{}{
 					"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
@@ -480,6 +499,7 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 					push(ord)
 					push(trade)
 				}
+				return true
 			}
 			switch b.fillMode {
 			case "reject":
@@ -496,12 +516,16 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 					if half > 0 && half < o.Qty {
 						o.Status = "部成"
 						b.mu.Unlock()
-						pushFills(half)
+						if !pushFills(half) {
+							return // §UAT-D5 首笔即废单：不再推进余量
+						}
 						time.Sleep(200 * time.Millisecond)
 						b.mu.Lock()
 						o.Status = "已成"
 						b.mu.Unlock()
-						pushFills(o.Qty - half)
+						if !pushFills(o.Qty - half) {
+							return
+						}
 						pushBookSnapshot(b, push)
 						return
 					}

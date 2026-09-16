@@ -25,7 +25,7 @@ func initConfig(t *testing.T) *config.Manager {
 func TestVerifyDeploymentQMTDisabled(t *testing.T) {
 	m := initConfig(t)
 	m.Rules.QMT = config.DefaultQMTConfig() // enabled=false
-	verifyDeployment(m, nil)  // 不应 panic
+	verifyDeployment(m, nil)                // 不应 panic
 }
 
 // TestVerifyDeploymentQMTEnabledNoToken QMT enabled=true 但缺 token → 必须输出 Noop 告警（开关白开根因）。
@@ -37,7 +37,7 @@ func TestVerifyDeploymentQMTEnabledNoToken(t *testing.T) {
 	q.GatewayURL = "http://127.0.0.1:8789"
 	q.Token = ""
 	m.Rules.QMT = q
-	verifyDeployment(m, nil)  // 仅验证不 panic；告警内容经由日志人工核对
+	verifyDeployment(m, nil) // 仅验证不 panic；告警内容经由日志人工核对
 }
 
 // TestVerifyDeploymentLLMKeys 短 key / 含空白 / 重复都只告警不阻断。

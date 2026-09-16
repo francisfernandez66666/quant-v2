@@ -1,9 +1,9 @@
 // ── 工具函数单元测试 utils.test.js ──
 // 覆盖 web/src/utils.js 中各格式化函数的边界与正常值：
-// fmtPct / fmtNum / fmtMoney / pnlClass / fmtTime / toStr。
+// fmtPct / fmtNum / fmtMoney / pnlClass / fmtTime / toStr / sseOpsAlert。
 // 重点验证 null/undefined/NaN/0 等边界返回 '-' 与正确的百分比/千分位格式。
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { fmtPct, fmtNum, fmtMoney, pnlClass, fmtTime, toStr } from '../utils.js'
+import { fmtPct, fmtNum, fmtMoney, pnlClass, fmtTime, toStr, sseOpsAlert } from '../utils.js'
 
 describe('fmtPct', () => {
   it('格式化正常小数（toFixed 精度）', () => {
@@ -90,5 +90,47 @@ describe('toStr', () => {
     expect(toStr(123)).toBe('123')
     expect(toStr('hello')).toBe('hello')
     expect(toStr(true)).toBe('true')
+  })
+})
+
+// §UAT-D1（2026-09-16）：资损/运维级 SSE 事件 → 告警描述映射（此前四个 type 后端在推、前端零消费）
+describe('sseOpsAlert', () => {
+  it('qmt_halt 置位=error、解除=success，撤单数入文案', () => {
+    const set = sseOpsAlert({ type: 'qmt_halt', halted: true, cancelled: 2, time: '10:00:01' })
+    expect(set.tone).toBe('error')
+    expect(set.body).toContain('紧急停止')
+    expect(set.body).toContain('2 笔')
+    const clr = sseOpsAlert({ type: 'qmt_halt', halted: false, cancelled: 0, time: '10:05:00' })
+    expect(clr.tone).toBe('success')
+    expect(clr.body).toContain('熔断已解除')
+  })
+  it('positions_clear_guard 带持仓条数强提醒', () => {
+    const a = sseOpsAlert({ type: 'positions_clear_guard', held: 3, time: '11:11:11' })
+    expect(a.tone).toBe('error')
+    expect(a.body).toContain('3')
+    expect(a.body).toContain('拒收')
+  })
+  it('settlement_diff 汇总缺失/多余/不符/费用差/现金差', () => {
+    const a = sseOpsAlert({ type: 'settlement_diff', diff: {
+      day: '2026-09-16', missing_in_local: ['F1', 'F2'], extra_in_local: ['F3'],
+      mismatch: [], fee_diff: -1.5, cash_diff: 0 } })
+    expect(a.tone).toBe('warning')
+    expect(a.body).toContain('本地缺2')
+    expect(a.body).toContain('本地多1')
+    expect(a.body).toContain('-1.50')
+    expect(a.body).toContain('2026-09-16')
+  })
+  it('settlement_diff 全零差异返回 null（不打扰）', () => {
+    expect(sseOpsAlert({ type: 'settlement_diff', diff: { day: 'x' } })).toBeNull()
+  })
+  it('trigger 取 signal.code/name/msg', () => {
+    const a = sseOpsAlert({ type: 'trigger', signal: { code: '600519', name: '贵州茅台', msg: '放量急拉: 秒涨1.2%' } })
+    expect(a.body).toContain('600519')
+    expect(a.body).toContain('放量急拉')
+  })
+  it('非告警 type / 空入参返回 null', () => {
+    expect(sseOpsAlert({ type: 'scan' })).toBeNull()
+    expect(sseOpsAlert(null)).toBeNull()
+    expect(sseOpsAlert('x')).toBeNull()
   })
 })
