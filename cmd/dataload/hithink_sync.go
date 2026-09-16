@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -27,7 +28,9 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	kind := fs.String("kind", string(data.HithinkDumpDailyK10d), "种类: daily-k-10d|daily-k|adjustment-factors|pools|anomaly")
 	since := fs.String("since", "20230801", "只导入 trade_date >= since 的行（yyyyMMdd）")
 	dateF := fs.String("date", "", "pools/anomaly 数据交易日 yyyyMMdd（缺省=今日）")
-	tmpPath := fs.String("tmp", "/tmp/hithink_dump.parquet", "parquet 落盘临时路径")
+	// 2026-09-16 修复：原默认 "/tmp/..." 是 Linux（首尔时代）路径，Windows 上不存在
+	// → daily-k-10d dump 自广州迁移起从未落盘成功（ths_daily 停摆至 0821 的根因）。
+	tmpPath := fs.String("tmp", filepath.Join(os.TempDir(), "hithink_dump.parquet"), "parquet 落盘临时路径")
 	batchSize := fs.Int("batch", 5000, "批量 upsert 行数")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("参数解析失败: %v", err)
@@ -148,6 +151,9 @@ func cmdHithinkSyncAdjFactors(client *data.HithinkClient, db *store.DB, tmpPath,
 	}
 	for _, code := range allCodes {
 		evs := events[code]
+		if len(evs) == 0 {
+			continue // 2026-09-16 修复：窗口内无复权事件的标的（占绝大多数）此前直接 evs[0] panic
+		}
 		sort.Slice(evs, func(i, j int) bool { return evs[i].ExDate < evs[j].ExDate })
 		dates, derr := db.ThsDatesSince(code, since)
 		if derr != nil || len(dates) == 0 {
