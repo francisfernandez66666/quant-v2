@@ -23,9 +23,15 @@ IDX = [("sh.000300", "000300.SH"), ("sh.000905", "000905.SH"), ("sh.000852", "00
 
 
 def log(msg):
+    # 2026-09-16：任务动作行 cmd /c python … >> 同名log 时，cmd 的独占追加句柄会让
+    # open(LOG,"a") 报 Errno 13 把进程崩在第一行日志上（断供 5 日才排查到）。
+    # 写日志失败不致命：stdout 兜底（重定向下经 cmd 继承句柄照样入档）。
     line = "%s %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
-    with io_open(LOG, "a") as f:
-        f.write(line + "\n")
+    try:
+        with io_open(LOG, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
     try:
         sys.stdout.write(line + "\n"); sys.stdout.flush()
     except Exception:

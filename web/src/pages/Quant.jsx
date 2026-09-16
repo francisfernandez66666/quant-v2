@@ -478,7 +478,7 @@ export default function Quant() {
     },
     { colKey: 'price', title: '价格', width: 90 },
     { colKey: 'qty', title: '数量', width: 80 },
-    { colKey: 'amount', title: '金额', width: 100 },
+    { colKey: 'amount', title: '金额', width: 100, cell: ({ row }) => (row.amount != null && !isNaN(Number(row.amount)) ? '¥' + Number(row.amount).toFixed(2) : '-') },
     { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => <span style={{ color: 'var(--app-text-2)' }}>{row.strategy}</span> },
   ]
 

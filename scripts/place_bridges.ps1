@@ -1,4 +1,4 @@
-# place_bridges.ps1 - copy new qmt_bridge.py to all candidate sandbox dirs (ASCII source, wildcard-safe)
+﻿# place_bridges.ps1 - copy new qmt_bridge.py to all candidate sandbox dirs (ASCII source, wildcard-safe)
 $root = (Get-Item 'C:\Program Files (x86)\*QMT*' | Select-Object -First 1).FullName
 Copy-Item 'C:\qmt\quant-trading-v2\qmt_gateway\qmt_bridge.py' (Join-Path $root 'python\qmt_bridge.py') -Force
 $sp = Join-Path $root 'bin.x64\lib\site-packages'
