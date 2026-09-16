@@ -56,23 +56,20 @@ func (c *Client) BatchConcurrency() int { return c.batchConcurrency }
 // （DefaultModel is the fallback model when none is explicitly specified.）
 const DefaultModel = "THUDM/GLM-Z1-9B-0414"
 
-// DefaultTimeout 未显式配置时的默认"等待响应头"超时（默认 30s）。
+// DefaultTimeout 未显式配置时的默认"等待响应头"超时（默认 60s）。
 // 主要防护上游"迟迟不开始生成"的故障：配合流式+空闲看门狗，让卡住的请求尽快失败进入重试/兜底；
 // 正常推理模型流式长输出（CoT 持续心跳）由 StreamIdleTimeout 与整体请求超时下限兜底，不受此值误杀。
-// （DefaultTimeout is the default response-header wait when not configured (30s). It mostly guards
-// "upstream never starts generating": with streaming + the idle watchdog, a stuck request fails fast into
-// the retry/fallback path. Legit reasoning-model streams are governed by StreamIdleTimeout and the total
-// request-timeout floor instead.）
-const DefaultTimeout = 30 * time.Second
+// 2026-09-16 固化：30s→60s。实测免费/排队型网关（cavoti Qwen3.8-Flash）首包 8~50s 抖动，
+// 30s 会把 Stage0/D1 的正常慢启动成片误杀（当日新闻事件池全空→D1 全员归 0→N 形只剩龙头）。
+// （Bumped 30s→60s: queued free gateways show 8-50s time-to-first-byte; 30s mass-killed legit
+// Stage0/D1 calls, emptying the news event pool and zeroing every D1 score.）
+const DefaultTimeout = 60 * time.Second
 
-// minTotalTimeout 流式请求整体超时的下限（保底 60s）：推理模型（GLM-Z1 等）单批流式长输出总时长
-// 可能超过 30s，若总超时随之收紧会把正常慢流误判为超时。故整体请求超时最低保底 60s，可经
+// minTotalTimeout 流式请求整体超时的下限（保底 120s）：推理模型（GLM-Z1 等）单批流式长输出总时长
+// 可能超过 60s，若总超时随之收紧会把正常慢流误判为超时。故整体请求超时最低保底 120s，可经
 // timeout_sec 调高；响应头等待单独用 DefaultTimeout/配置值，用于快速探测"不开始生成"。
-// （minTotalTimeout floors the whole-request timeout at 60s: reasoning-model streams can exceed 30s in
-// total, so a tight total timeout would misjudge legit slow streams as timed out. The total request
-// timeout stays ≥60s (raise via timeout_sec), while the response-header wait uses DefaultTimeout/config
-// to detect "never starts generating" fast.）
-const minTotalTimeout = 60 * time.Second
+// （2026-09-16 固化：60s→120s，同因——慢模型整批长输出被总超时腰斩。Floor raised to 120s.）
+const minTotalTimeout = 120 * time.Second
 
 // DefaultStreamIdleTimeout 流式下默认"相邻分片空闲"阈值：超过视为模型卡死。
 // （DefaultStreamIdleTimeout is the default idle threshold between adjacent stream chunks; exceeding

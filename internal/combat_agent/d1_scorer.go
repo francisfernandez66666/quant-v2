@@ -381,9 +381,24 @@ func (ds *D1Scorer) scoreChunk(codes []string, events []newsagent.NewsEvent, mar
 
 	var raw []D1Score
 	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
-		log.Printf("[D1Scorer] JSON解析失败→本批 %d 只标记待重试(入重试队列): %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
-		ds.markRetryPending(result, codes, "解析失败")
-		return result
+		// §固化 2026-09-16：解析失败先做一次"JSON 格式强约束"补救重发（prompt 级锁格式，
+		// 模型无关——爱闲聊/带推理前言的模型在此收敛），仍失败才入重试队列。
+		// (Format-enforcement retry before falling back to the retry queue; model-agnostic.)
+		fixed := false
+		resp2, err2 := ds.llmClient.ChatD1(d1SystemPrompt, prompt+
+			"\n\n重要：输出的第一个字符必须是 [ 、最后一个字符必须是 ] ，只输出 JSON 数组，禁止任何思考过程或解释文字。", ds.maxTokens)
+		if err2 == nil {
+			cleaned := cleanJSON(resp2)
+			if json.Unmarshal([]byte(cleaned), &raw) == nil {
+				resp, fixed = cleaned, true
+				log.Printf("[D1Scorer] JSON 强化重发成功（首批输出非纯 JSON，已收敛）")
+			}
+		}
+		if !fixed {
+			log.Printf("[D1Scorer] JSON解析失败→本批 %d 只标记待重试(入重试队列): %v (首300字符: %q)", len(codes), err, resp[:minInt(len(resp), 300)])
+			ds.markRetryPending(result, codes, "解析失败")
+			return result
+		}
 	}
 
 	for _, r := range raw {

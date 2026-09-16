@@ -18,18 +18,18 @@ import (
 	"quant-trading-v2/internal/llm"
 )
 
-// TestLLMTimeoutConfig 验证超时配置：默认 60s，自定义值生效。
+// TestLLMTimeoutConfig 验证超时配置：默认 120s（§固化 2026-09-16 慢模型总超时保底），自定义高于保底时生效。
 func TestLLMTimeoutConfig(t *testing.T) {
-	// 默认：未指定超时 → 60s
+	// 默认：未指定超时 → 120s（minTotalTimeout 保底）
 	def := llm.New(llm.Config{APIKey: "k", APIURL: "http://127.0.0.1:1"})
-	if def.Timeout() != 60*time.Second {
-		t.Fatalf("默认超时应为 60s, got %v", def.Timeout())
+	if def.Timeout() != 120*time.Second {
+		t.Fatalf("默认超时应为 120s, got %v", def.Timeout())
 	}
 
-	// 自定义：90s
-	custom := llm.New(llm.Config{APIKey: "k", APIURL: "http://127.0.0.1:1", Timeout: 90 * time.Second})
-	if custom.Timeout() != 90*time.Second {
-		t.Fatalf("自定义超时应为 90s, got %v", custom.Timeout())
+	// 自定义：180s（高于保底，按配置生效）
+	custom := llm.New(llm.Config{APIKey: "k", APIURL: "http://127.0.0.1:1", Timeout: 180 * time.Second})
+	if custom.Timeout() != 180*time.Second {
+		t.Fatalf("自定义超时应为 180s, got %v", custom.Timeout())
 	}
 }
 
