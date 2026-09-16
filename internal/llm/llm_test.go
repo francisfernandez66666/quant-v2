@@ -330,3 +330,42 @@ func TestPingUpstreamError(t *testing.T) {
 		t.Fatal("上游 500 探活应失败")
 	}
 }
+
+// TestStripThinkTags §生产 20260916：思考型模型（minimax-m3）把推理原文写进 content，
+// 必须剥离 <think>…</think>，否则漏进咨询回复/干扰 JSON 解析。
+func TestStripThinkTags(t *testing.T) {
+	in := "<think>用户说涨1%，判断为板块联动。</think>[{\"code\":\"600580\",\"score\":16}]"
+	want := "[{\"code\":\"600580\",\"score\":16}]"
+	if got := stripThinkTags(in); got != want {
+		t.Fatalf("think 剥离失败: got %q", got)
+	}
+	if got := stripThinkTags("[{\"code\":\"600580\",\"score\":16}]"); got != "[{\"code\":\"600580\",\"score\":16}]" {
+		t.Fatalf("无标签应原样返回: got %q", got)
+	}
+	if got := stripThinkTags("普通回答，无标签"); got != "普通回答，无标签" {
+		t.Fatalf("普通文本应原样返回: got %q", got)
+	}
+}
+
+// TestIsTransientLLMError §生产 20260916：5xx/网络类瞬时错误应重试，4xx（额度/鉴权）不重试。
+func TestIsTransientLLMError(t *testing.T) {
+	yes := []string{"LLM API 返回 502: error code: 502", "HTTP 503", "Post \"http://x\": connection reset by peer", "context deadline exceeded"}
+	no := []string{"LLM API 返回 402: payment required", "model_not_found", "LLM_API_KEY not set", ""}
+	for _, s := range yes {
+		if !isTransientLLMError(errString(s)) {
+			t.Fatalf("%q 应判定为瞬时错误", s)
+		}
+	}
+	for _, s := range no {
+		if isTransientLLMError(errString(s)) {
+			t.Fatalf("%q 不应判定为瞬时错误", s)
+		}
+	}
+	if isTransientLLMError(nil) {
+		t.Fatal("nil 不应判定为瞬时错误")
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }

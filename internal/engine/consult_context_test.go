@@ -6,6 +6,7 @@ package engine
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/newsagent"
 )
@@ -116,5 +117,23 @@ func TestAuditNumbersFiltersPercentTime(t *testing.T) {
 	}
 	if !strings.Contains(got, "振幅12%") {
 		t.Errorf("有出处的百分比应保留, got: %s", got)
+	}
+}
+
+// TestBuildStockBlockCacheHit §生产 20260916：数据上下文改默认注入后，同代码 60s 内
+// 必须命中缓存（收敛外部行情调用），不得重复直调行情源。
+func TestBuildStockBlockCacheHit(t *testing.T) {
+	e := &Engine{}
+	e.consultBlockCache = map[string]consultBlockEntry{
+		"600580": {text: "SENTINEL", at: time.Now()},
+	}
+	if got := e.buildStockBlock("600580", "卧龙电驱"); got != "SENTINEL" {
+		t.Fatalf("60s 内应命中缓存, got %q", got)
+	}
+	// 过期条目：应绕过缓存重建（marketAPI 为 nil → 返回未初始化提示块）
+	e.consultBlockCache["600580"] = consultBlockEntry{text: "STALE", at: time.Now().Add(-2 * consultBlockCacheTTL)}
+	got := e.buildStockBlock("600580", "卧龙电驱")
+	if got == "STALE" {
+		t.Fatal("过期缓存必须失效重建")
 	}
 }

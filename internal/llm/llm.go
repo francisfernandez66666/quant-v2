@@ -434,8 +434,8 @@ func isTransientLLMError(err error) bool {
 		return false
 	}
 	s := err.Error()
-	for _, code := range []string{" 500", " 502", " 503", " 504"} {
-		if strings.Contains(s, "HTTP "+code) || strings.Contains(s, "返回"+code) || strings.Contains(s, code+":") {
+	for _, code := range []string{"500", "502", "503", "504"} {
+		if strings.Contains(s, "HTTP "+code) || strings.Contains(s, "返回 "+code) || strings.Contains(s, " "+code+":") {
 			return true
 		}
 	}
