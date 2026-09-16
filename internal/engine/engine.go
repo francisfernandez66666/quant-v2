@@ -2272,13 +2272,23 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("以下是用户可能关心的股票今日实时行情实测数据（数据获取时间 " +
-		time.Now().Format("2006-01-02 15:04:05") + "）：\n")
-	sb.WriteString("【要求】仅可引用下列提供的数据；未提供的信息（如大盘资金、期指贴水、撤单、盘口等）如实说明" +
+	// §生产 20260916 头部语义强化：明确"本块=本次提问时刻实时抓取的最新数据"，杜绝模型把
+	// 对话历史里的旧数据误当成"手头只有的批次"（18:00 咨询实录）。
+	sb.WriteString("以下是本次提问时刻【实时抓取】的股票行情实测数据（抓取时间 " +
+		time.Now().Format("2006-01-2 15:04:05") + "，即最新数据，直接引用作答即可）：\n")
+	sb.WriteString("【要求】仅可引用下列提供的数据与对话历史；未提供的信息（如同板块个股、期指贴水、撤单、盘口等）如实说明" +
 		"无法获取，严禁编造净流入/成交量/涨跌/触发等任何具体数字；净流入口径=主力(超大单+大单)，东方财富。\n")
 
 	for code, name := range codes {
 		sb.WriteString(e.buildStockBlock(code, name))
+	}
+
+	// 大盘实测块（2026-09-16 补）：上证点位+全市场涨跌家数——用户口语里的"普涨/普跌"
+	// 从此有实测依据，模型不必再说"我没有今天大盘的数据"。
+	if e.marketAPI != nil {
+		if idx, _, up, down, err := e.marketAPI.GetIndexData(); err == nil && idx > 0 {
+			sb.WriteString(fmt.Sprintf("\n—— 大盘实测 ——\n上证指数 %.2f 点；全市场 上涨 %d 家 / 下跌 %d 家（上涨家数显著占优=普涨）\n", idx, up, down))
+		}
 	}
 	return sb.String()
 }
