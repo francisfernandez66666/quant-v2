@@ -35,8 +35,8 @@ func TestBuildConsultContextHasPureCode(t *testing.T) {
 	if !strings.Contains(ctx, "600580") {
 		t.Fatalf("上下文应包含股票代码 600580, got: %s", ctx)
 	}
-	if !strings.Contains(ctx, "数据获取时间") {
-		t.Fatal("上下文应包含数据获取时间头")
+	if !strings.Contains(ctx, "实时抓取") {
+		t.Fatal("上下文应包含本次实时抓取头（§生产 20260916 语义强化）")
 	}
 	if !strings.Contains(ctx, "严禁编造") {
 		t.Fatal("上下文应包含禁止编造数字的约束")
