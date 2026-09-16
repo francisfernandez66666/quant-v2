@@ -58,6 +58,12 @@ var llmDegradeCount int64
 type Engine struct {
 	mu sync.RWMutex // 保护全部可变字段的读写锁（多 goroutine：主循环 + 近实时打分循环 + SSE/HTTP 调用）
 
+	// consultBlockCache 咨询数据块按代码缓存（§生产 20260916）：数据上下文改为无条件注入后，
+	// 咨询可任意频次触发，单次单股 4 次外部行情调用必须收敛；60s 新鲜度对咨询足够。
+	// consultBlockMu 保护该 map（与 mu 分开，避免行情慢调用阻塞引擎主锁）。
+	consultBlockMu    sync.Mutex
+	consultBlockCache map[string]consultBlockEntry
+
 	// lastAlertEval §WS-L 阈值告警评估节流时间戳（scoreCycle 每 30s 跑一轮）。
 	lastAlertEval time.Time
 
@@ -2108,14 +2114,18 @@ func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error
 		return "", fmt.Errorf("未配置 LLM_API_KEY，请先在股票咨询页配置 API Key")
 	}
 
-	// system 起始即角色提示词；专业模式下把实时行情上下文并入同一段 system（只保留一条 system 且置于最前）。
+	// system 起始即角色提示词。§生产 20260916 翻转：带数据上下文改为**无条件注入**——
+	// 数据是咨询的默认构成（用户实录"AI 顾问空口谈逻辑"是缺陷），不再由开关决定有无；
+	// proMode 仅追加更定量化/结构化的深度分析风格要求。未识别到个股时给 noStock 提示词，
+	// 引导模型如实说明无数据、不编造。
 	system := llm.ConsultSystemPrompt()
+	if ctx := e.buildConsultContext(userMsg); ctx != "" {
+		system += "\n\n" + ctx
+	} else {
+		system += "\n\n" + consultNoStockPrompt
+	}
 	if proMode {
-		if ctx := e.buildConsultContext(userMsg); ctx != "" {
-			system += "\n\n" + ctx
-		} else {
-			system += "\n\n" + consultNoStockPrompt
-		}
+		system += "\n\n（专业模式：请在回答中给出更定量化、结构化的深度分析，明确列出数据依据与风险点。）"
 	}
 
 	// 历史：仅取最近 consultHistoryLimit 条（正序）。
@@ -2273,8 +2283,36 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 	return sb.String()
 }
 
-// buildStockBlock 组装单只股票的实时行情数据块。
+// consultBlockCacheTTL 咨询数据块缓存有效期（60s）：收敛外部行情调用频次，
+// 替代此前"盘中 15 分钟 429 拒绝"的粗暴限流（§生产 20260916）。
+const consultBlockCacheTTL = 60 * time.Second
+
+// consultBlockEntry 单股数据块缓存项。
+type consultBlockEntry struct {
+	text string
+	at   time.Time
+}
+
+// buildStockBlock 组装单只股票的实时行情数据块（含 60s 缓存）。
 func (e *Engine) buildStockBlock(code, name string) string {
+	e.consultBlockMu.Lock()
+	if e.consultBlockCache == nil {
+		e.consultBlockCache = map[string]consultBlockEntry{}
+	}
+	if ent, ok := e.consultBlockCache[code]; ok && time.Since(ent.at) < consultBlockCacheTTL {
+		e.consultBlockMu.Unlock()
+		return ent.text
+	}
+	e.consultBlockMu.Unlock()
+	text := e.buildStockBlockUncached(code, name)
+	e.consultBlockMu.Lock()
+	e.consultBlockCache[code] = consultBlockEntry{text: text, at: time.Now()}
+	e.consultBlockMu.Unlock()
+	return text
+}
+
+// buildStockBlockUncached 组装单只股票的实时行情数据块（无缓存，直调行情源）。
+func (e *Engine) buildStockBlockUncached(code, name string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("\n—— 股票 %s", code))
 	if name != "" {

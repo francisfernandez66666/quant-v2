@@ -427,18 +427,73 @@ func (c *Client) ChatMessages(messages []Message) (string, error) {
 	return c.do(ChatRequest{Model: c.model, Messages: messages})
 }
 
+// isTransientLLMError 判定是否值得重试的上游瞬时错误：HTTP 5xx（含 502/503/504，
+// cavoti 聚合网关偶发）与网络类错误（连接重置/超时）。4xx（鉴权/参数/额度）不重试。
+func isTransientLLMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, code := range []string{" 500", " 502", " 503", " 504"} {
+		if strings.Contains(s, "HTTP "+code) || strings.Contains(s, "返回"+code) || strings.Contains(s, code+":") {
+			return true
+		}
+	}
+	for _, kw := range []string{"connection reset", "EOF", "timeout", "context deadline", "broken pipe"} {
+		if strings.Contains(strings.ToLower(s), kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripThinkTags 剥离思考型模型（minimax-m3 等）混入 content 的 <think>…</think> 推理原文：
+// 这些模型不把思维链放 reasoning_content 字段而是直接写进正文，不剥离会漏进咨询回复/
+// 干扰 JSON 解析，且白耗 max_tokens。
+func stripThinkTags(s string) string {
+	if !strings.Contains(s, "<think>") {
+		return s
+	}
+	if a, b := strings.Index(s, "<think>"), strings.LastIndex(s, "</think>"); a >= 0 && b > a {
+		return strings.TrimSpace(s[:a] + s[b+len("</think>"):])
+	}
+	return s
+}
+
 // do 发起单次对话请求：优先流式解析，特定失败场景回落到非流式一次性取回。
 // §GAP5.1 入口处执行日预算熔断检查（超限当日拒绝，次日自动恢复）。
-// （do sends one chat request: it prefers streaming, falling back to one-shot non-streaming in specific failures.
-// The daily-budget circuit breaker runs at the entry.）
+// §固化 2026-09-16：对上游 5xx/网络类失败做最多 2 次补射（1s/3s 退避）——cavoti 等聚合网关
+// 在大上下文+推理模型下 502 偶发（用户实录 17:11 咨询 502），换任何模型网关都不应让
+// 用户直接看到 502。JSON 解析类失败不在此层重试。
+// （do sends one chat request with up to 2 extra attempts on transient upstream 5xx/network errors.）
 func (c *Client) do(req ChatRequest) (string, error) {
 	if err := c.preFlight(); err != nil {
 		return "", err
 	}
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second) // 1s, 2s…退避（第二次实际 2s）
+		}
+		content, err := c.doOnce(req)
+		if err == nil {
+			return content, nil
+		}
+		lastErr = err
+		if !isTransientLLMError(err) {
+			return "", err
+		}
+		log.Printf("LLM 上游瞬时失败(第%d次,至多重试2次): %v", attempt, err)
+	}
+	return "", lastErr
+}
+
+// doOnce 执行一次完整请求（流式优先+特定失败回落非流式），供 do 的重试循环调用。
+func (c *Client) doOnce(req ChatRequest) (string, error) {
 	if c.streaming {
 		content, streamErr := c.streamChat(req)
 		if streamErr == nil {
-			return content, nil
+			return stripThinkTags(content), nil
 		}
 		// §FIX-0921 流式卡死回落（2026-09-01 实录）：GLM-Z1 流式下上游长时间不吐增量分片
 		// （思维链被上游缓冲、无心跳）→ 空闲超时误杀"模型疑似卡死"；同一请求非流式可正常
@@ -447,7 +502,7 @@ func (c *Client) do(req ChatRequest) (string, error) {
 		if strings.Contains(streamErr.Error(), "no response") || strings.Contains(streamErr.Error(), "空闲超时") {
 			if content, err := c.nonStreamChat(req); err == nil {
 				log.Printf("LLM 流式无有效内容(%v), 已回落到非流式成功", streamErr)
-				return content, nil
+				return stripThinkTags(content), nil
 			}
 		}
 		return "", streamErr
@@ -630,7 +685,8 @@ func (c *Client) nonStreamChatMax(req ChatRequest, maxTokens int) (string, error
 	} else {
 		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(chatResp.Choices[0].Message.Content))
 	}
-	return chatResp.Choices[0].Message.Content, nil
+	// D1/Stage0 走本非流式通道：同样剥思考型模型的 <think> 正文（§生产 20260916）
+	return stripThinkTags(chatResp.Choices[0].Message.Content), nil
 }
 
 // post 构造并发送 chat/completions 请求，返回可读响应体。非 2xx 状态码读响应体构造错误。

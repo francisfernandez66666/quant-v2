@@ -1980,15 +1980,17 @@ type consultReq struct {
 
 // 专业模式相关配置键（per-user，落盘 auth.json，跨重启保留）。
 const (
-	consultProModeKey      = "consult_pro_mode"      // "1"/"0"，默认关
+	consultProModeKey      = "consult_pro_mode"      // "1"/"0"，默认开（§生产 20260916：咨询必须带近期+今日数据，关到"0"才关）
 	consultProModeLastUsed = "consult_pro_mode_last" // 最近一次专业咨询 Unix 秒
-	consultProModeInterval = 15 * time.Minute        // 盘中专业模式调用间隔上限
+	consultProModeInterval = 2 * time.Minute         // 盘中带数据咨询调用间隔上限（默认开启后由 15min 放宽重排，2026-09-16）
 )
 
-// consultProModeEnabled 读取当前用户专业模式开关状态（默认关）。
+// consultProModeEnabled 读取当前用户专业模式开关状态（默认开：显式设 "0" 才关）。
+// 2026-09-16 翻转：AI 顾问空口谈逻辑是产品缺陷（用户实录"我手头没数据"式回答），
+// 数据上下文必须是默认行为，"不带数据"反而是需要主动选择的降级。
 func (s *Server) consultProModeEnabled(userID string) bool {
 	v, _ := s.auth.GetConfig(userID, consultProModeKey)
-	return v == "1"
+	return v != "0"
 }
 
 // consultProModeRateLimited 判定专业模式是否命中盘中 15 分钟限流。
@@ -2045,20 +2047,16 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 	}
 	proMode := s.consultProModeEnabled(userID)
 
-	// 盘中限流：仅专业模式且交易时段生效（按用户，落盘跨重启保留）。
-	if proMode {
-		if wait := s.consultProModeRateLimited(userID, time.Now()); wait > 0 {
-			writeError(w, 429, fmt.Sprintf("盘中专业模式每 15 分钟可用一次，请 %s 后再试", wait.Round(time.Second)))
-			return
-		}
-	}
+	// §生产 20260916：盘中 429 限流拒绝已移除——带数据咨询改为默认能力后，拒绝回答
+	// 反而是产品缺陷；外部接口消耗由引擎侧按代码 60s 块缓存兜底（engine.buildStockBlock）。
+	// consultProModeRateLimited/lastUsed 仅作历史留档保留，不再参与请求路径。
 
 	reply, err := c.ConsultLLM(userID, req.Message, proMode)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	// 专业咨询成功后记录调用时间（供下次盘中限流判定）。
+	// 专业咨询成功后记录调用时间（留档；不再用于拦请求）。
 	if proMode {
 		_ = s.auth.SetConfig(userID, consultProModeLastUsed, strconv.FormatInt(time.Now().Unix(), 10))
 	}

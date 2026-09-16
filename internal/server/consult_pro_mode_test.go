@@ -23,11 +23,18 @@ func newTestServerAuth(t *testing.T) *Server {
 	return &Server{auth: mgr}
 }
 
-// TestConsultProModeDefaultOff 专业模式开关默认应为关。
-func TestConsultProModeDefaultOff(t *testing.T) {
+// TestConsultProModeDefaultOn §生产 20260916 翻转契约：带数据咨询是默认行为，
+// 未显式配置（或配 "1"）均为开；只有显式设 "0" 才关闭。
+func TestConsultProModeDefaultOn(t *testing.T) {
 	s := newTestServerAuth(t)
+	if !s.consultProModeEnabled("u_test") {
+		t.Fatal("专业模式（带数据咨询）默认应为开启")
+	}
+	if err := s.auth.SetConfig("u_test", consultProModeKey, "0"); err != nil {
+		t.Fatalf("set config: %v", err)
+	}
 	if s.consultProModeEnabled("u_test") {
-		t.Fatal("专业模式默认应为关闭")
+		t.Fatal("显式设 0 后应关闭")
 	}
 }
 
@@ -56,7 +63,7 @@ func TestConsultProModeSetAndGet(t *testing.T) {
 	}
 }
 
-// TestConsultProModeRateLimitInTradeTime 交易时段 15 分钟限流生效。
+// TestConsultProModeRateLimitInTradeTime 交易时段 2 分钟限流生效（§生产 20260916：默认开启后 15min→2min）。
 func TestConsultProModeRateLimitInTradeTime(t *testing.T) {
 	s := newTestServerAuth(t)
 	// 模拟交易日 10:00（周一）。§CI 2026-09-11：写作时刻固定用北京时区——
@@ -69,20 +76,20 @@ func TestConsultProModeRateLimitInTradeTime(t *testing.T) {
 	if wait := s.consultProModeRateLimited("u_test", now); wait != 0 {
 		t.Fatalf("首次调用不应限流, got %v", wait)
 	}
-	// 记录最近一次使用（5 分钟前），应命中限流
-	if err := s.auth.SetConfig("u_test", consultProModeLastUsed, fmt.Sprint(now.Add(-5*time.Minute).Unix())); err != nil {
+	// 记录最近一次使用（1 分钟前），应命中限流
+	if err := s.auth.SetConfig("u_test", consultProModeLastUsed, fmt.Sprint(now.Add(-1*time.Minute).Unix())); err != nil {
 		t.Fatalf("set last used: %v", err)
 	}
 	wait := s.consultProModeRateLimited("u_test", now)
-	if wait <= 0 || wait > 15*time.Minute {
-		t.Fatalf("5 分钟前用过应提示剩余约 10 分钟, got %v", wait)
+	if wait <= 0 || wait > 2*time.Minute {
+		t.Fatalf("1 分钟前用过应提示剩余约 1 分钟, got %v", wait)
 	}
-	// 16 分钟前用过，限流解除
-	if err := s.auth.SetConfig("u_test", consultProModeLastUsed, fmt.Sprint(now.Add(-16*time.Minute).Unix())); err != nil {
+	// 3 分钟前用过，限流解除
+	if err := s.auth.SetConfig("u_test", consultProModeLastUsed, fmt.Sprint(now.Add(-3*time.Minute).Unix())); err != nil {
 		t.Fatalf("set last used: %v", err)
 	}
 	if wait := s.consultProModeRateLimited("u_test", now); wait != 0 {
-		t.Fatalf("16 分钟前用过不应限流, got %v", wait)
+		t.Fatalf("3 分钟前用过不应限流, got %v", wait)
 	}
 }
 

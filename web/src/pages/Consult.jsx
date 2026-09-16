@@ -31,7 +31,8 @@ export default function Consult() {
   const [loading, setLoading] = useState(false)
   const chatBox = useRef(null) // 聊天消息容器引用（自动滚动到底部）
 
-  const [proMode, setProMode] = useState(false)
+  // 带数据咨询默认开（§生产 20260916：AI 顾问必须拿到个股近期+今日实测数据再回答）；挂载后以 GET /api/consult/pro-mode 为准
+  const [proMode, setProMode] = useState(true)
   const [proModeSaving, setProModeSaving] = useState(false)
 
   const [llmConfigured, setLlmConfigured] = useState(true)
