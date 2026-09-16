@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""xtquant 连通性探针（§MIGRATION_QMT_DUAL_PATH 方案 A 验证工具）。
+
+在全新进程里用 config.xt.json 凭据建 XtQuantTrader 连接并查资产/持仓/委托，
+验证"独立进程直连 miniQMT"可行性；stdout 逐行刷便于 ssh 轮询。只读，不下单。
+"""
 # probe_xtquant.py - Plan A validation: fresh-process single-trader xtquant connect (C:\Python312)
 # encoding: utf-8
 import json

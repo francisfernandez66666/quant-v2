@@ -26,6 +26,18 @@ export function fmtNum(v, digits = 2) {
 }
 
 /**
+ * 金额（人民币）定两位小数格式化：434.99999999999994 → "¥435.00"
+ * §生产 2026-09-16：成交流水 amount=qty×price 的浮点尾数直出，统一走此函数收口。
+ * @param {number|string|null} v - 原始金额
+ * @returns {string} "¥435.00" 或 "-"
+ */
+// Currency amount, always 2 decimals (kills float artifacts like 434.99999999999994).
+export function fmtCNY2(v) {
+  if (v === null || v === undefined || isNaN(Number(v))) return '-'
+  return '¥' + Number(v).toFixed(2)
+}
+
+/**
  * 格式化为金额（千分位，最多两位小数）
  * @param {number|string|null} v - 原始金额
  * @returns {string} 如 "1,234.56" 或 "-"

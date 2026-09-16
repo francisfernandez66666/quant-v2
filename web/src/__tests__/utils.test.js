@@ -3,7 +3,7 @@
 // fmtPct / fmtNum / fmtMoney / pnlClass / fmtTime / toStr / sseOpsAlert。
 // 重点验证 null/undefined/NaN/0 等边界返回 '-' 与正确的百分比/千分位格式。
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { fmtPct, fmtNum, fmtMoney, pnlClass, fmtTime, toStr, sseOpsAlert } from '../utils.js'
+import { fmtPct, fmtNum, fmtMoney, fmtCNY2, pnlClass, fmtTime, toStr, sseOpsAlert } from '../utils.js'
 
 describe('fmtPct', () => {
   it('格式化正常小数（toFixed 精度）', () => {
@@ -34,6 +34,19 @@ describe('fmtNum', () => {
   it('null/undefined/NaN 返回 "-"', () => {
     expect(fmtNum(null)).toBe('-')
     expect(fmtNum(NaN)).toBe('-')
+  })
+})
+
+describe('fmtCNY2（§生产 20260916 流水金额浮点收口）', () => {
+  it('浮点尾数定两位', () => {
+    expect(fmtCNY2(434.99999999999994)).toBe('¥435.00')
+  })
+  it('正常金额带 ¥ 前缀', () => {
+    expect(fmtCNY2(1234.5)).toBe('¥1234.50')
+  })
+  it('null/NaN 返回 "-"', () => {
+    expect(fmtCNY2(null)).toBe('-')
+    expect(fmtCNY2(NaN)).toBe('-')
   })
 })
 

@@ -369,9 +369,13 @@ class _XtOps:
                      getattr(t, "time", "") or "")
             # FIX 2026-09-14: counter DEAL carries date/time split ("20260914"+"131351");
             # reporting the bare HHMMSS broke the engine trade blotter (no time column).
-            # FIX 2026-09-16: 开盘半小时 DEAL 时间丢前导零（"9:57:20"→"95720" 5 位），
-            # 固定 6 位切片产出了 "95:72:20" 幽灵时间；先补齐 HHMMSS 再切。
-            tt = tt.zfill(6)
+            # FIX 2026-09-16: DEAL time drops the leading zero in the 9-o'clock hour
+            # ("09:57:20" -> 5-char "95720"); fixed-width HHMMSS slicing produced ghost
+            # times like "95:72:20" in the blotter. Left-pad to 6 digits before slicing --
+            # only when non-empty, since "".zfill(6) fakes "000000" and would corrupt
+            # the no-time fallback branch below. (ASCII discipline: this file must stay
+            # byte-clean for the Windows/GBK strategy sandbox.)
+            tt = tt.zfill(6) if tt else tt
             if td and tt:
                 traded = "%s-%s-%sT%s:%s:%s+08:00" % (td[0:4], td[4:6], td[6:8],
                                                       tt[0:2].zfill(2), tt[2:4].zfill(2),

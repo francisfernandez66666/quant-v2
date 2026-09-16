@@ -11,6 +11,7 @@ import ToggleSw from '../components/ToggleSw'
 import { Card, Form, Input, Button, Tag, Table, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { confirmDialog } from '../ui.jsx'
+import { fmtCNY2 } from '../utils'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
@@ -478,7 +479,7 @@ export default function Quant() {
     },
     { colKey: 'price', title: '价格', width: 90 },
     { colKey: 'qty', title: '数量', width: 80 },
-    { colKey: 'amount', title: '金额', width: 100, cell: ({ row }) => (row.amount != null && !isNaN(Number(row.amount)) ? '¥' + Number(row.amount).toFixed(2) : '-') },
+    { colKey: 'amount', title: '金额', width: 100, cell: ({ row }) => fmtCNY2(row.amount) },
     { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => <span style={{ color: 'var(--app-text-2)' }}>{row.strategy}</span> },
   ]
 

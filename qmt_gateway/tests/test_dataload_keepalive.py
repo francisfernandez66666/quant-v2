@@ -109,5 +109,23 @@ class TestOneRoundShortCircuit(TempDbCase):
         self.assertEqual(cmds, [])
 
 
+class TestLogResilience(unittest.TestCase):
+    """§生产 2026-09-16：cmd 重定向独占同名文件句柄下 open(LOG,'a') 必报 Errno 13。
+
+    旧 log() 未捕获 → 进程崩在第一行日志上、任务静默失败 5 日。修复后写文件失败
+    须降级 stdout，绝不抛出。
+    """
+
+    def test_log_open_failure_not_fatal(self):
+        orig = k.LOG
+        d = tempfile.mkdtemp()
+        k.LOG = d  # 目录路径：open(dir,'a') 必抛 IsADirectoryError，且不落任何字节
+        try:
+            k.log("resilience probe")  # 不得抛
+        finally:
+            k.LOG = orig
+            os.rmdir(d)
+
+
 if __name__ == "__main__":
     unittest.main()
