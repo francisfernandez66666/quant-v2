@@ -311,3 +311,101 @@ func TestStockMatchExactNoFragment(t *testing.T) {
 		t.Fatal("纯代码形态应命中")
 	}
 }
+
+// TestBatchScoreParseFailureEnforceRetry 验证 §固化 2026-09-16 的"JSON 格式强约束"补救路径：
+// 模型（换任何爱闲聊/带推理前言的都算）首批返回非纯 JSON 时，评分器应自动追加一次
+// "首字符必须 [ 、末字符必须 ]"的强化重发；重发成功则本批正常出分、不入重试队列。
+func TestBatchScoreParseFailureEnforceRetry(t *testing.T) {
+	var mu sync.Mutex
+	var n int
+	var prompts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req llm.ChatRequest
+		_ = json.Unmarshal(body, &req)
+		user := ""
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				user = m.Content
+			}
+		}
+		mu.Lock()
+		n++
+		prompts = append(prompts, user)
+		thisCall := n
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if thisCall == 1 {
+			// 首批故意输出带解释文字的"脏"响应，模拟不守格式模型
+			out, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "我来分析这些股票。 首先看基本面……"}}}})
+			w.Write(out)
+			return
+		}
+		var arr []map[string]any
+		for _, c := range []string{"600001", "600002"} {
+			arr = append(arr, map[string]any{"code": c, "score": 12, "blocked": false, "reason": "板块联动"})
+		}
+		b, _ := json.Marshal(arr)
+		out, _ := json.Marshal(map[string]any{"choices": []any{
+			map[string]any{"message": map[string]any{"content": string(b)}}}})
+		w.Write(out)
+	}))
+	defer srv.Close()
+	cl := llm.New(llm.Config{APIKey: "test", APIURL: srv.URL, Model: "m", Streaming: false})
+	ds := NewD1Scorer(cl, "")
+	events := []newsagent.NewsEvent{
+		{Title: "事件A", RelatedStocks: []string{"600001"}},
+		{Title: "事件B", RelatedStocks: []string{"600002"}},
+	}
+	got := ds.BatchScore([]string{"600001", "600002"}, events, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if n < 2 {
+		t.Fatalf("解析失败应触发强化重发, 调用次数=%d", n)
+	}
+	if !strings.Contains(prompts[len(prompts)-1], "第一个字符必须是") {
+		t.Fatalf("重发 prompt 必须含 JSON 格式强约束指令, got %q", prompts[len(prompts)-1][max(0, len(prompts[len(prompts)-1])-80):])
+	}
+	for _, c := range []string{"600001", "600002"} {
+		s, ok := got[c]
+		if !ok || s.RetryPending || s.Score != 12 {
+			t.Fatalf("%s 应经强化重发出分 12, got %+v", c, s)
+		}
+	}
+}
+
+// TestBatchScoreParseFailureBothDirtyGoesQueue 验证兜底：强化重发也拿不到合法 JSON 时，
+// 本批必须整批入重试队列（RetryPending），不得静默出 0 分冒充实评。
+func TestBatchScoreParseFailureBothDirtyGoesQueue(t *testing.T) {
+	var mu sync.Mutex
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		out, _ := json.Marshal(map[string]any{"choices": []any{
+			map[string]any{"message": map[string]any{"content": "抱歉，我无法完成该任务。"}}}})
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(out)
+	}))
+	defer srv.Close()
+	cl := llm.New(llm.Config{APIKey: "test", APIURL: srv.URL, Model: "m", Streaming: false})
+	ds := NewD1Scorer(cl, "")
+	events := []newsagent.NewsEvent{
+		{Title: "事件A", RelatedStocks: []string{"600001"}},
+		{Title: "事件B", RelatedStocks: []string{"600002"}},
+	}
+	got := ds.BatchScore([]string{"600001", "600002"}, events, nil)
+	mu.Lock()
+	calls := n
+	mu.Unlock()
+	if calls < 2 {
+		t.Fatalf("原调+强化重发至少 2 次, got %d", calls)
+	}
+	for _, c := range []string{"600001", "600002"} {
+		if s, ok := got[c]; !ok || !s.RetryPending {
+			t.Fatalf("%s 应 RetryPending=true 入队, got %+v ok=%v", c, s, ok)
+		}
+	}
+}

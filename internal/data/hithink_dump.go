@@ -16,6 +16,11 @@ import (
 	"github.com/parquet-go/parquet-go"
 )
 
+// hithinkDumpDownloadTimeout dump 下载整体超时（2026-09-16 固化）：10 年全量 dump 数百 MB，
+// 必须给足 30 分钟；曾被 30s 共用客户端超时掐死导致 ths_daily 空洞长期补不上。
+// 回归测试 TestHithinkDumpDownloadTimeoutFloor 锁定下限，防止后续改动再收紧。
+const hithinkDumpDownloadTimeout = 30 * time.Minute
+
 // HithinkDumpKind dump 种类（对应官方 dump_id）。
 type HithinkDumpKind string
 
@@ -50,7 +55,8 @@ func (c *HithinkClient) DownloadDumpFile(kind HithinkDumpKind, destPath string) 
 	}
 	// 2026-09-16 修复：原共用 c.http（30s 总超时）只够 10 日增量 dump；
 	// 10 年全量 daily-k dump 数百 MB，30s 必被 context deadline 掐断（ths_daily 空洞补不上的另一半根因）。
-	dumpHTTP := &http.Client{Timeout: 30 * time.Minute}
+	// 超时以 hithinkDumpDownloadTimeout 常量固化，回归测试锁定防止再被收紧。
+	dumpHTTP := &http.Client{Timeout: hithinkDumpDownloadTimeout}
 	resp, err := dumpHTTP.Get(u)
 	if err != nil {
 		return 0, fmt.Errorf("hithink: dump 下载失败: %w", err)

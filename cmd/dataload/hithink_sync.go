@@ -22,6 +22,13 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// defaultHithinkTmpPath 返回 dump parquet 的默认落盘临时路径：必须用 os.TempDir() 跨平台解析，
+// 不能写死 "/tmp/..."——那是 Linux（首尔时代）路径，Windows 上不存在，曾导致广州迁移后
+// daily-k-10d dump 从未落盘成功（ths_daily 停摆至 0821 的根因，2026-09-16 修复并加回归锁）。
+func defaultHithinkTmpPath() string {
+	return filepath.Join(os.TempDir(), "hithink_dump.parquet")
+}
+
 // cmdHithinkSync 执行一次同花顺（新）日K同步。
 func cmdHithinkSync(db *store.DB, args []string) {
 	fs := flag.NewFlagSet("hithink-sync", flag.ExitOnError)
@@ -30,7 +37,7 @@ func cmdHithinkSync(db *store.DB, args []string) {
 	dateF := fs.String("date", "", "pools/anomaly 数据交易日 yyyyMMdd（缺省=今日）")
 	// 2026-09-16 修复：原默认 "/tmp/..." 是 Linux（首尔时代）路径，Windows 上不存在
 	// → daily-k-10d dump 自广州迁移起从未落盘成功（ths_daily 停摆至 0821 的根因）。
-	tmpPath := fs.String("tmp", filepath.Join(os.TempDir(), "hithink_dump.parquet"), "parquet 落盘临时路径")
+	tmpPath := fs.String("tmp", defaultHithinkTmpPath(), "parquet 落盘临时路径")
 	batchSize := fs.Int("batch", 5000, "批量 upsert 行数")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("参数解析失败: %v", err)
