@@ -116,3 +116,14 @@ func TestInvarsChecked(t *testing.T) {
 		t.Error("SignalDragon 应=dragon")
 	}
 }
+
+// TestEvaluateStubLevel §P2-STUB 20260918：占位 Evaluate 返回 Level=stub（区别于 nodata）。
+func TestEvaluateStubLevel(t *testing.T) {
+	ev, err := New(nil).Evaluate("600000.SH", nil)
+	if err != nil || ev == nil || ev.Pass {
+		t.Fatalf("占位 Evaluate 应 Pass=false，got %+v err=%v", ev, err)
+	}
+	if ev.Level != "stub" {
+		t.Errorf("占位 Evaluate 应 Level=stub，实际 %q", ev.Level)
+	}
+}

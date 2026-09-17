@@ -85,6 +85,9 @@ export default function Signals() {
   const [detail, setDetail] = useState(null)
   // 模拟盘是否启用（决定是否显示「模拟买入」）
   const [paperOn, setPaperOn] = useState(false)
+  // §PERM-GATE 20260918：模拟买入走 POST /api/paper/buy（admin 守卫，server.go:600），
+  // 成员显示按钮必 403；仅管理员渲染入口。
+  const admin = api.isAdmin()
   // §SHORT-4 做空开关（决策⑤）：关闭时列表整体隐藏做空信号；开启后追加方向筛选与红徽标
   const [shortEnabled, setShortEnabled] = useState(false)
   // 当前方向筛选（all/做多/做空，仅做空开关开启时生效）
@@ -382,7 +385,7 @@ export default function Signals() {
             <span className="muted">—</span>
           )}
           {/* 模拟买入：仅已准入+有策略池的信号 */}
-          {paperOn && row.can_open && hasStrategyPool(row) && (
+          {admin && paperOn && row.can_open && hasStrategyPool(row) && (
             <Button size="small" variant="outline" theme="success" onClick={(e) => { e.stopPropagation(); paperBuy(row) }}
               title="模拟买入归入该信号所属战法资金池（非战法信号不可买）">模拟买入</Button>
           )}
@@ -477,7 +480,7 @@ export default function Signals() {
               <button style={sheetBtnStyle('#FF4D4F')} onClick={() => { const s = sheetSignal; setSheetSignal(null); confirmTrade(s, 'buy') }}>买入</button>
             )}
             {/* 模拟买入按钮：仅当信号可开仓且模拟盘已开启且信号属于某战法资金池时显示 */}
-            {sheetSignal.can_open && paperOn && hasStrategyPool(sheetSignal) && (
+            {sheetSignal.can_open && admin && paperOn && hasStrategyPool(sheetSignal) && (
               <button style={sheetBtnStyle('#52c41a')} onClick={() => { const s = sheetSignal; setSheetSignal(null); paperBuy(s) }}>模拟买入</button>
             )}
             {sheetSignal.action === 'buy' && (

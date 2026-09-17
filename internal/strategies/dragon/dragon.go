@@ -108,10 +108,11 @@ func (d *DragonStrategy) Type() strategy.SignalType {
 // Evaluate 标准接口（占位）。
 // 实际使用 EvaluateReal 传入结构化数据，这个方法仅作为 Strategy 接口的占位实现。
 // 返回空结果，表示无数据可评分。
-//
-// （Standard interface stub; real scoring uses EvaluateReal.）
+// §UAT-FIX 20260918：Level 由 nodata 改为 stub——生产仅 evalFor 的 md==nil/未特化两条防御
+// 死路会到达此处，用独立等级便于日志区分"真缺数据"与"走了占位实现"。
+// English: stub-level (not nodata) so the defensive evalFor fallback is observable in logs.
 func (d *DragonStrategy) Evaluate(code string, data interface{}) (*strategy.Evaluation, error) {
-	return &strategy.Evaluation{Pass: false, Level: "nodata", Confidence: 0}, nil
+	return &strategy.Evaluation{Pass: false, Level: "stub", Confidence: 0}, nil
 }
 
 // EvaluateReal 执行破局龙战法核心评分。

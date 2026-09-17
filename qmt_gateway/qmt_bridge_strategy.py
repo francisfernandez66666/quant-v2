@@ -119,6 +119,23 @@ def _expect_suffix(code):
     return ""
 
 
+def _fee_of(t):
+    """Best-effort per-fill fee from a DEAL/trade object (0 when no build exposes it).
+
+    P2-FEE 20260918: the reconciliation fee leg was structurally 0 because no
+    report path carried commission. Probe the known field spellings across QMT
+    builds; absent -> 0 keeps byte-compat with the old ledger. (ASCII only.)
+    """
+    for name in ("m_dCommission", "commission", "fee", "trade_fee", "total_fee"):
+        try:
+            v = float(getattr(t, name, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            return v
+    return 0.0
+
+
 BUY_CONST_FALLBACK, SELL_CONST_FALLBACK = 23, 24
 # FIX 2026-09-14 drill-3: BUY/SELL were referenced but never defined since the
 # dry-run port -- the first REAL order died with NameError (sandbox has no
@@ -392,6 +409,8 @@ class _XtOps:
                                 getattr(t, "trade_no", "") or getattr(t, "id", "") or ""),
                 "traded_at": traded,
                 "signal_id": remark,
+                # P2-FEE 20260918 best-effort fee leg from the DEAL object (0 when absent).
+                "fee": _fee_of(t),
             })
         return out
 
@@ -750,6 +769,8 @@ class _XtOps:
                 "trade_id": tid,
                 "traded_at": str(getattr(t, "trd_time", getattr(t, "trade_time", "")) or ""),
                 "signal_id": remark,
+                # P2-FEE 20260918 best-effort fee leg (0 when the build hides it).
+                "fee": _fee_of(t),
             })
         return out
 
@@ -799,12 +820,19 @@ def _load_cmds():
 
 
 def _record_seen(seq):
+    # P3-OPS 20260918: a failed seen-write used to be silently swallowed -- if the
+    # dedup record does not durably land, a bridge restart replays that seq (exactly
+    # the drill-3 duplicate-order shape), so the guard itself stopped being fail-safe.
+    # Now failure returns False and the caller refuses the order (prefer a stuck
+    # inflight row for ops over a duplicated real order).
     try:
         f = open(SEEN_PATH, "a")
         f.write(str(seq) + "\n")
         f.close()
-    except Exception:
-        pass
+        return True
+    except Exception as e:  # noqa: BLE001
+        _trace("seen record FAILED seq=%s err=%r" % (seq, e))
+        return False
 
 
 def _load_seen():
@@ -833,7 +861,12 @@ def _handle_cmd(cmd, seen):
     # poll (old order: 221 duplicate submissions in ~4 minutes). Worst case of
     # record-first is a stuck-inflight row -- recoverable by ops; a duplicated
     # real order is not.
-    _record_seen(seq)
+    # P3-OPS 20260918: record-before-execute is only safe if the record DURABLY
+    # lands. When seen-write fails we refuse the order (return False -> cmd stays
+    # pending, retried next tick) instead of executing an unreplay-safe order.
+    if not _record_seen(seq):
+        _trace("cmd refused (dedup not durable) kind=%s seq=%s" % (kind, seq))
+        return False
     seen.add(seq)
     try:
         if kind == "order":

@@ -124,7 +124,9 @@ class Store:
                 traded_at TEXT,
                 signal_id TEXT,
                 user_id       TEXT,          -- P1-9：多账号隔离归属
-                trade_id      TEXT DEFAULT '' -- §G1（2026-08-29）：唯一成交编号，部成去重
+                trade_id      TEXT DEFAULT '', -- §G1（2026-08-29）：唯一成交编号，部成去重
+                fee           REAL DEFAULT 0,  -- §UAT-FIX 20260918：经手费/佣金（尽力透传，缺=0）
+                stamp_tax     REAL DEFAULT 0   -- 印花税（卖方单边；缺=0）
             );
             -- §QMT-DUAL 派发队列（QueuedBroker + qmt_bridge.py 兜底路径）：
             -- 量仔下单先入此表，由 QMT 客户端内置策略桥消费执行；结果回填后按现有
@@ -181,6 +183,12 @@ class Store:
                 # §修复 G1（2026-08-29）：唯一成交编号列，用于去重（避免部成重复丢单）
                 self._conn.execute(
                     "ALTER TABLE fills ADD COLUMN trade_id TEXT DEFAULT ''")
+            if t == "fills" and "fee" not in cols:
+                # §UAT-FIX 20260918（P2-FEE）：成交费用腿——此前 fills 无费用列，
+                # 三方对账 fee_diff 恒 0。回报尽力携带则入库，缺省 0 与旧行为一致。
+                self._conn.execute("ALTER TABLE fills ADD COLUMN fee REAL DEFAULT 0")
+            if t == "fills" and "stamp_tax" not in cols:
+                self._conn.execute("ALTER TABLE fills ADD COLUMN stamp_tax REAL DEFAULT 0")
         # §QMT-DUAL：老库补建派发队列与桥状态表（dispatch/bridge_state）
         self._conn.executescript(
             """
@@ -469,12 +477,14 @@ class Store:
                             WHERE ts_code=?""",
                         (remain, remain * f["price"], f.get("traded_at", ""), f.get("user_id", ""), f["code"]),
                     )
+            # §P2-FEE 20260918：费用腿随成交同笔入账（回报缺费用字段时落 0，兼容旧通道）
             self._conn.execute(
-                """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, trade_id)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, trade_id, fee, stamp_tax)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (f.get("order_id", ""), f["code"], fill_side, f["price"], f["qty"],
                  f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", ""), f.get("user_id", ""),
-                 str(f.get("trade_id", "") or "")),
+                 str(f.get("trade_id", "") or ""),
+                 float(f.get("fee") or 0.0), float(f.get("stamp_tax") or 0.0)),
             )
             self._conn.commit()
             cur = self._conn.execute(
@@ -523,16 +533,18 @@ class Store:
         """§P0-1a（2026-09-15）按交易日查当日全部成交，供 GET /settlement 三方对账装配。
 
         day 为北京时 `YYYY-MM-DD`（fills.traded_at 落库口径 `_now_cn()` 即该前缀）。
-        返回 [{ts_code,side,price,qty,amount,order_id,traded_at,serial,signal_id}]；
+        返回 [{ts_code,side,price,qty,amount,order_id,traded_at,serial,signal_id,fee,stamp_tax}]；
         serial 用 §G1 唯一成交编号 trade_id（真实网关的成交流水号，此前从不产出 serial
         导致 Go 侧对账关联键塌缩——见 docs/UAT_20260915_FINDINGS.md P0-1）。
-        注意：本表 fee/stamp_tax 无列（回报通道不带费用字段），费用差对账以 Go 侧本地口径为准。
+        §UAT-FIX 20260918（P2-FEE）：fee/stamp_tax 自 fills 列尽力输出（回报通道未带费用时为 0，
+        与旧"费用腿恒 0"口径一致，不构成回归）。
         English: §P0-1a — lists the day's fills for the settlement reconciliation endpoint,
-        exposing trade_id as the broker serial (previously no serial was ever produced).
+        exposing trade_id as the broker serial and the best-effort fee/stamp_tax columns.
         """
         with self._lock:
             cur = self._conn.execute(
-                "SELECT order_id, code, side, price, qty, amount, traded_at, signal_id, trade_id "
+                "SELECT order_id, code, side, price, qty, amount, traded_at, signal_id, trade_id, "
+                "COALESCE(fee,0) AS fee, COALESCE(stamp_tax,0) AS stamp_tax "
                 "FROM fills WHERE substr(traded_at,1,10) = ? ORDER BY traded_at, order_id",
                 (day,),
             )
@@ -543,6 +555,7 @@ class Store:
                     "qty": r["qty"], "amount": r["amount"],
                     "order_id": r["order_id"] or "", "traded_at": r["traded_at"] or "",
                     "serial": r["trade_id"] or "", "signal_id": r["signal_id"] or "",
+                    "fee": r["fee"] or 0.0, "stamp_tax": r["stamp_tax"] or 0.0,
                 })
             return out
 

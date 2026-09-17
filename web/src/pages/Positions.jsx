@@ -142,6 +142,12 @@ export default function Positions() {
   // 移动端操作面板对应的持仓
   const [sheetHolding, setSheetHolding] = useState(null)
 
+  // §PERM-GATE 20260918：纸面持仓写操作（updateHoldings/addHoldingLot/setHoldingCost/
+  // closeHolding/sellHoldingLot/holdings/balance）与实盘读（/api/positions/real 系）后端均为
+  // admin 守卫（server.go:629-634/660-662）；成员点击必 403。前端按 admin 收敛写入口、
+  // 实盘 tab 显示无权限面板（此前 403 被 loadReal 的 catch 静默吞成"空表"，误导为无持仓）。
+  const admin = api.isAdmin()
+
   // 纸面持仓轮询定时器（30s）
   const timer = useRef(null)
   // SSE 订阅取消函数
@@ -437,6 +443,7 @@ export default function Positions() {
   }
   // 加载 QMT 状态与实盘持仓
   async function loadReal() {
+    if (!admin) return // §PERM-GATE：成员无实盘读权限（admin 守卫），不发起必 403 的请求
     try { const st = await api.fetchQMTState(); if (st) setQmtState(st) } catch (_) {}
     try {
       const data = await api.fetchRealPositions()
@@ -592,14 +599,14 @@ export default function Positions() {
     // 分时图展开按钮列
     { colKey: 'kline', title: '分时', width: 70, cell: ({ row }) => <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); toggleKline(row.code) }}>{klineOpen.has(row.code) ? '收起' : '分时'}</Button> },
 
-    // 操作列：加减仓/改成本/明细/编辑/清仓
+    // 操作列：加减仓/改成本/明细/编辑/清仓（写操作 admin 守卫，成员仅留只读明细/分时）
     { colKey: 'actions', title: '操作', width: 230, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 4, justifyContent: 'center', flexWrap: 'wrap' }}>
-        <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openAddLot(row) }}>加减仓</Button>
-        <Button size="small" variant="outline" theme="warning" onClick={(e) => { e.stopPropagation(); openSetCost(row) }}>改成本</Button>
+        {admin && <Button size="small" variant="outline" theme="primary" onClick={(e) => { e.stopPropagation(); openAddLot(row) }}>加减仓</Button>}
+        {admin && <Button size="small" variant="outline" theme="warning" onClick={(e) => { e.stopPropagation(); openSetCost(row) }}>改成本</Button>}
         <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); showLotsFor(row) }}>明细</Button>
-        <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); editHolding(row) }}>编辑</Button>
-        <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); openCloseHolding(row) }}>清仓</Button>
+        {admin && <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); editHolding(row) }}>编辑</Button>}
+        {admin && <Button size="small" variant="outline" theme="danger" onClick={(e) => { e.stopPropagation(); openCloseHolding(row) }}>清仓</Button>}
       </div>
     ) },
   ]
@@ -649,11 +656,13 @@ export default function Positions() {
                   <Button size="small" variant="outline" theme="default" onClick={resetPnl} style={{ marginLeft: 8 }}>清零</Button>
                 </div>
                 {!editingBalance
-                  ? <div onClick={editBalanceStart} style={{ cursor: 'pointer' }}>可用资金: ¥{availableBalance.toFixed(2)} ✏️</div>
+                  ? (admin
+                    ? <div onClick={editBalanceStart} style={{ cursor: 'pointer' }}>可用资金: ¥{availableBalance.toFixed(2)} ✏️</div>
+                    : <div>可用资金: ¥{availableBalance.toFixed(2)}</div>)
                   : <InputNumber value={balanceInputVal} min={0} step={0.01} onBlur={editBalanceSave} onEnter={editBalanceSave} onChange={(v) => setBalanceInputVal(Number(v) || 0)} style={{ width: 160 }} autoFocus />}
               </>
             )}
-            <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>
+            {admin && <Button theme="primary" onClick={openAddNew}>+ 新增持仓</Button>}
           </div>
         </div>
       </Card>
@@ -709,6 +718,16 @@ export default function Positions() {
         </Tabs.TabPanel>
 
         <Tabs.TabPanel value="real" label={realTripped ? '实盘持仓 !' : '实盘持仓'}>
+          {/* §PERM-GATE 20260918：实盘读端点均 admin 守卫（server.go:660-662），成员 403 曾被
+              loadReal 的 catch 静默吞成"空表"——改为显式无权限面板，与 Quant 页姿势一致 */}
+          {!admin ? (
+            <Card>
+              <div style={{ padding: 18, borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
+                🔒 无权限访问实盘持仓：当前登录「{api.getAccount() || '未知'}」为普通用户，实盘账本仅管理员账号可见。
+              </div>
+            </Card>
+          ) : (
+          <>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
             <span style={{ color: qmtState.enabled ? 'var(--app-down)' : 'var(--app-muted)' }}>{qmtState.enabled ? '已启用' : '未启用'}</span>
             <span className="muted">模式: {qmtState.mode || 'manual'}</span>
@@ -741,6 +760,8 @@ export default function Positions() {
               <Table data={realPositions} columns={realColumns} rowKey="ts_code" size="small" pagination={{ defaultPageSize: 20, pageSizeOptions: [20, 50, 100] }} />
             </Card>
           )}
+          </>
+          )}
         </Tabs.TabPanel>
       </Tabs>
 
@@ -748,11 +769,11 @@ export default function Positions() {
       <Dialog visible={!!sheetHolding} header={(sheetHolding ? sheetHolding.code : '') + ' ' + (sheetHolding ? sheetHolding.name : '')} onClose={() => setSheetHolding(null)} footer={false}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <Button variant="outline" theme="primary" onClick={() => { if (sheetHolding) toggleKline(sheetHolding.code); setSheetHolding(null) }}>{sheetHolding && klineOpen.has(sheetHolding.code) ? '收起分时' : '展开分时'}</Button>
-          <Button variant="outline" theme="primary" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openAddLot(h) }}>加减仓</Button>
-          <Button variant="outline" theme="warning" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openSetCost(h) }}>改成本</Button>
+          {admin && <Button variant="outline" theme="primary" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openAddLot(h) }}>加减仓</Button>}
+          {admin && <Button variant="outline" theme="warning" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openSetCost(h) }}>改成本</Button>}
           <Button variant="outline" theme="default" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) showLotsFor(h) }}>加仓明细</Button>
-          <Button variant="outline" theme="default" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) editHolding(h) }}>编辑持仓</Button>
-          <Button variant="outline" theme="danger" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openCloseHolding(h) }}>清仓</Button>
+          {admin && <Button variant="outline" theme="default" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) editHolding(h) }}>编辑持仓</Button>}
+          {admin && <Button variant="outline" theme="danger" onClick={() => { const h = sheetHolding; setSheetHolding(null); if (h) openCloseHolding(h) }}>清仓</Button>}
           <Button theme="default" onClick={() => setSheetHolding(null)}>取消</Button>
         </div>
       </Dialog>
@@ -900,7 +921,10 @@ export default function Positions() {
              />
            </Form.FormItem>
           <Form.FormItem label="战法">
-            <Input value={realFormStrategy} placeholder="策略名（可选）" onChange={(v) => setRealFormStrategy(v)} />
+            {/* §P3-UX 20260918：此字段是"归因战法"而非自由标签——买入侧若填写则必须是准入
+                白名单内的战法（risk/gate.go checkWhitelist 兜底校验，填错会被拒单）；留空则
+                不校验。原文案"（可选）"易被当作可随填的备注，误导成员。 */}
+            <Input value={realFormStrategy} placeholder="归因战法（留空=不校验；买入须填准入白名单内战法，否则拒单）" onChange={(v) => setRealFormStrategy(v)} />
           </Form.FormItem>
           {/* 预估金额：数量×参考价 */}
           {realFormQty > 0 && realFormPrice > 0 && (

@@ -47,6 +47,9 @@ export default function MsgCenter() {
   const [page, setPage] = useState(1)
   // §DAILY_REVIEW 手动触发复盘标志（按钮 loading）
   const [reviewing, setReviewing] = useState(false)
+  // §PERM-GATE 20260918：删除/清空/模拟卖出的后端守卫均为 admin（server.go:599/625/626），
+  // 成员显示按钮必 403；与 Quant/Paper 姿势对齐，非管理员隐藏这三个操作入口。
+  const admin = api.isAdmin()
   const PAGE_SIZE = 50
 
   // 按交易信号中的战法名称统计可选战法
@@ -237,10 +240,10 @@ export default function MsgCenter() {
         >{a.code} {a.name}</span>
         <span style={{ color: 'var(--app-text-2)', flex: 1, fontSize: 13 }}>{fmtMsgTime(a)}</span>
         <Tag theme={actionTagTheme(a)} size="small" variant="light">{actionText(a)}</Tag>
-        {isSellAlert(a) && (
+        {admin && isSellAlert(a) && (
           <Button size="small" variant="outline" theme="danger" onClick={() => onPaperSell(a)}>模拟卖出</Button>
         )}
-        <Button size="small" variant="text" theme="default" onClick={() => onDeleteOne(a)}>✕</Button>
+        {admin && <Button size="small" variant="text" theme="default" onClick={() => onDeleteOne(a)}>✕</Button>}
       </div>
     )
     // 卡片主体：标题 + 正文
@@ -269,7 +272,7 @@ export default function MsgCenter() {
           {/* §DAILY_REVIEW 手动复盘 + 清空 */}
           <div style={{ display: 'flex', gap: 8 }}>
             <Button theme="primary" variant="outline" size="small" loading={reviewing} onClick={onReviewNow}>立即复盘</Button>
-            <Button theme="danger" variant="outline" size="small" onClick={onClearAll}>清空全部</Button>
+            {admin && <Button theme="danger" variant="outline" size="small" onClick={onClearAll}>清空全部</Button>}
           </div>
         </div>
       </Card>

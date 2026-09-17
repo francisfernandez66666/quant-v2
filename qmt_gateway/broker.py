@@ -513,15 +513,21 @@ class MockBroker(Broker):
                     "created_at": filled_snapshot.get("created_at") or ts,
                     "at": ts,
                 })
+                amt = float(order.get("qty", 0)) * float(order.get("price", 0))
+                # §P2-FEE 20260918：mock 模拟单笔费用（佣金万2.5 最低5元；卖方印花税千0.5）。
+                # 仅作回报/对账费用腿元数据，不扣减 mock 现金（§P1-17 显式现金口径不变）。
+                mock_fee = max(5.0, amt * 0.00025)
+                mock_stamp = amt * 0.0005 if order.get("side") == "卖出" else 0.0
                 self.handler.on_trade({
                     "order_id": order_id, "code": order.get("code"), "side": order.get("side"),
                     "price": order.get("price", 0.0), "qty": order.get("qty", 0),
-                    "amount": float(order.get("qty", 0)) * float(order.get("price", 0)),
+                    "amount": amt,
                     "traded_at": ts,
                     "signal_id": order.get("signal_id", ""),
                     # §P0-1a/P2-14 契约对齐：真实桥成交回报携带唯一成交编号 trade_id（fills 流水号、
                     # /settlement 的 serial 锚点），mock 此前缺失导致对账 serial 恒空。
                     "trade_id": "MOCKT%06d" % self._next_trade_id(),
+                    "fee": mock_fee, "stamp_tax": mock_stamp,
                 })
 
         threading.Thread(target=_fill, daemon=True).start()

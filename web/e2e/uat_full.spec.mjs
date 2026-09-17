@@ -314,6 +314,19 @@ test.describe('权限与登录分支', () => {
     await expect(aside.getByText('用户管理')).toHaveCount(0)
     await expect(aside.getByText('设置')).toHaveCount(0)
     await expect(aside.getByText('自动研究')).toHaveCount(0)
+    // §PERM-GATE 20260918：LLM 诊断入口（数据源 admin 守卫）对普通用户收敛隐藏
+    await expect(aside.getByText('LLM诊断'), '成员侧栏不含 LLM 诊断').toHaveCount(0)
+    // §PERM-GATE 20260918：消息中心删除/清空/模拟卖出（admin 守卫）不向成员渲染
+    await page.goto('/#/msgcenter'); await page.waitForTimeout(1500)
+    await expect(page.getByText('清空全部'), '成员消息中心无清空入口').toHaveCount(0)
+    await expect(page.getByRole('button', { name: '立即复盘' })).toBeVisible()
+    // §PERM-GATE 20260918：持仓页实盘 Tab 对成员显示无权限面板（此前 403 被静默吞成空表）
+    await page.goto('/#/positions'); await page.waitForTimeout(1500)
+    await page.getByText('实盘持仓', { exact: true }).first().click(); await page.waitForTimeout(500)
+    await expect(page.locator('.app-main'), '成员实盘 Tab 显示无权限').toContainText('无权限访问实盘持仓', { timeout: 8000 })
+    // 纸面持仓写入口对成员隐藏（读/明细保留）
+    await page.getByText('纸面持仓', { exact: true }).first().click(); await page.waitForTimeout(500)
+    await expect(page.getByText('+ 新增持仓'), '成员无新增持仓入口').toHaveCount(0)
     await page.goto('/#/quant'); await page.waitForTimeout(2500)
     await expect(page.locator('.app-main'), '量化页显示无权限提示').toContainText('无权限', { timeout: 15000 })
     await page.screenshot({ path: `${SHOT}/branch-tester-quant403.png`, fullPage: true })

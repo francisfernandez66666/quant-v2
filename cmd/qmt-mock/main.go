@@ -89,6 +89,11 @@ type fillRecord struct {
 	TradedAt string  `json:"traded_at"`
 	Serial   string  `json:"serial"` // 交割流水号（对齐实网关 trade_id/serial）
 	SignalID string  `json:"signal_id"`
+	// §P2-FEE 20260918：模拟单笔费用（佣金万2.5 最低5元；卖方印花税千0.5 单边）。
+	// 仅作为回报/settlement 的费用腿元数据（对齐实网关尽力透传形态），不扣现金账——
+	// mock 显式现金口径（§P1-17）保持不变。
+	Fee      float64 `json:"fee"`
+	StampTax float64 `json:"stamp_tax"`
 }
 
 // newBook 创建指定资金账号的内存账本（初始化订单/持仓映射与 signal→order 幂等索引）。
@@ -181,10 +186,21 @@ func (b *book) applyFill(o *order, price float64) (fillRecord, bool) {
 		}
 	}
 	b.nextSer++
+	amt := float64(o.Qty) * price
+	// §P2-FEE 20260918：佣金万2.5 最低 5 元；卖方单边印花税千0.5（仅模拟费用腿元数据，不动现金）。
+	mockFee := amt * 0.00025
+	if mockFee < 5 {
+		mockFee = 5
+	}
+	var mockStamp float64
+	if o.Side == "卖出" {
+		mockStamp = amt * 0.0005
+	}
 	fr := fillRecord{
 		OrderID: o.OrderID, Code: o.Code, Side: o.Side, Price: price, Qty: o.Qty,
-		Amount: float64(o.Qty) * price, TradedAt: time.Now().Format(time.RFC3339),
+		Amount: amt, TradedAt: time.Now().Format(time.RFC3339),
 		Serial: fmt.Sprintf("SER%06d", b.nextSer), SignalID: o.SignalID,
+		Fee: mockFee, StampTax: mockStamp,
 	}
 	b.fills = append(b.fills, fr)
 	return fr, true
@@ -490,6 +506,8 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 					"type": "trade", "order_id": o.OrderID, "code": o.Code, "side": o.Side,
 					"price": o.Price, "qty": fillQty, "amount": float64(fillQty) * o.Price,
 					"traded_at": fr.TradedAt, "signal_id": o.SignalID, "trade_id": fr.Serial,
+					// §P2-FEE 20260918：回报带费用腿（与 /settlement 同源，Go 侧落本地 fills.fee）
+					"fee": fr.Fee, "stamp_tax": fr.StampTax,
 				}
 				ord := orderEvent(o, o.Status)
 				if chaos {
@@ -561,7 +579,8 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			trades = append(trades, map[string]interface{}{
 				"order_id": f.OrderID, "ts_code": f.Code, "side": f.Side,
 				"price": f.Price, "qty": f.Qty, "amount": f.Amount,
-				"fee": 0, "stamp_tax": 0, "serial": f.Serial,
+				// §P2-FEE 20260918：交割流水费用腿与成交回报同源（对账费用差腿可观测）
+				"fee": f.Fee, "stamp_tax": f.StampTax, "serial": f.Serial,
 				"traded_at": f.TradedAt, "signal_id": f.SignalID,
 			})
 		}

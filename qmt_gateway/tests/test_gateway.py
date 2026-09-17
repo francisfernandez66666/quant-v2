@@ -65,6 +65,29 @@ class TestStore(unittest.TestCase):
                       "amount": 1950, "traded_at": "t4", "signal_id": "S4"})
         self.assertEqual(s.list_positions(), [])
 
+    def test_fill_fee_leg_persisted_and_settled(self):
+        """§P2-FEE 20260918：成交费用腿入库并在 /settlement 装配输出。
+
+        此前 fills 表无 fee 列、settlement_trades 不输出费用 → Go 三方对账费用差腿恒 0。
+        现回报带 fee/stamp_tax 则落库，settlement_trades 逐行输出；缺省（旧格式回报）为 0，
+        与历史口径字节兼容。
+        """
+        s = new_store()
+        day = "2026-09-18"
+        # 先建仓（无持仓的卖出按设计不入账，见 sell-no-position 语义）
+        s.apply_fill({"code": "600519.SH", "side": "买入", "price": 1300, "qty": 100,
+                      "amount": 130000, "traded_at": day + "T09:30:00+08:00",
+                      "signal_id": "S-BUY"})  # 旧格式回报：不带费用字段 → 0
+        s.apply_fill({"code": "600519.SH", "side": "卖出", "price": 1300, "qty": 100,
+                      "amount": 130000, "traded_at": day + "T09:31:00+08:00",
+                      "signal_id": "S-FEE", "trade_id": "TID-FEE",
+                      "fee": 32.5, "stamp_tax": 65.0})
+        rows = {r["signal_id"]: r for r in s.settlement_trades(day)}
+        self.assertAlmostEqual(rows["S-FEE"]["fee"], 32.5)
+        self.assertAlmostEqual(rows["S-FEE"]["stamp_tax"], 65.0)
+        self.assertAlmostEqual(rows["S-BUY"]["fee"], 0.0)
+        self.assertAlmostEqual(rows["S-BUY"]["stamp_tax"], 0.0)
+
     def test_user_id_isolated_in_store(self):
         """§P1-9 成交/委托落库携带归属账号 ID（多账号隔离）。"""
         # §P1-9 成交/委托落库携带归属账号 ID（多账号隔离）。
@@ -258,6 +281,50 @@ class TestHandler(unittest.TestCase):
         # 落库校验
         self.assertEqual(s.list_positions()[0]["qty"], 100)
         self.assertTrue(h.disconnected)
+
+    def test_fee_of_multi_name_probe(self):
+        """§P2-FEE 20260918：费用字段多命名探测（xtquant 各构建字段名不一）。
+
+        commission/fee/trade_fee/total_fee 依序取正数；全不命中/非法值 → 0（绝不臆造费率）。
+        """
+        from handler import ReportHandler
+
+        class _T(object):
+            pass
+
+        t1 = _T()
+        t1.commission = 8.88
+        self.assertAlmostEqual(ReportHandler._fee_of(t1), 8.88)
+        t2 = _T()
+        t2.commission = 0
+        t2.total_fee = 1.5
+        self.assertAlmostEqual(ReportHandler._fee_of(t2), 1.5)
+        t3 = _T()
+        t3.fee = "bad"  # 非数值不炸，继续探测
+        self.assertAlmostEqual(ReportHandler._fee_of(t3), 0.0)
+        self.assertAlmostEqual(ReportHandler._fee_of(_T()), 0.0)
+
+    def test_trade_report_carries_fee(self):
+        """§P2-FEE 20260918：回报 payload 与网关账本同源携带费用腿（Go 落 fills.fee）。"""
+        s = new_store()
+        pushed = []
+        h = None
+        import handler as handler_mod
+        old = handler_mod.post_report
+        handler_mod.post_report = lambda *a, **k: True
+        try:
+            h = handler_mod.ReportHandler(s, "http://seoul:8080", "tok")
+            h._push = lambda p: pushed.append(p)
+            h.on_trade({"order_id": "O1", "code": "600519.SH", "side": "买入", "price": 10,
+                        "qty": 100, "amount": 1000, "traded_at": "2026-09-18T09:31:00+08:00",
+                        "signal_id": "S1", "trade_id": "T1", "fee": 5.0, "stamp_tax": 5.0})
+        finally:
+            handler_mod.post_report = old
+        self.assertEqual(pushed[0]["type"], "trade")
+        self.assertAlmostEqual(pushed[0]["fee"], 5.0)
+        rows = s.settlement_trades("2026-09-18")
+        self.assertAlmostEqual(rows[0]["fee"], 5.0)
+        self.assertAlmostEqual(rows[0]["stamp_tax"], 5.0)
 
     def test_outbox_permanent_reject_dead_letter(self):
         """§P1-8（2026-09-15）毒丸防护回归：首尔永久性拒绝（400）的回报落死信表，

@@ -98,6 +98,43 @@ func TestHandleQMTReportTrade(t *testing.T) {
 	}
 }
 
+// TestHandleQMTReportTradeFeeLeg §P2-FEE 20260918：成交回报费用腿透传入本地 fills。
+// 此前 handleQMTReport 的 trade 分支不落 fee/stamp_tax → 三方对账费用差腿恒 0。
+// 现回报带 fee/stamp_tax 则 ApplyRealFill 落库、ListFillsByDay 读回；缺省字段按 0（旧口径兼容）。
+// English: a trade report carrying fee/stamp_tax persists them into local fills; absent fields stay 0 (back-compat).
+func TestHandleQMTReportTradeFeeLeg(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+
+	// 带费用腿的卖出成交（fee=32.5 佣金 + stamp_tax=65 印花税）
+	body := `{"type":"trade","order_id":"OF1","code":"600519.SH","side":"买入","price":10,"qty":100,"amount":1000,` +
+		`"traded_at":"2026-09-18T10:00:00+08:00","signal_id":"SF1","trade_id":"TF1","fee":32.5,"stamp_tax":65}`
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("report HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 无费用字段的旧格式成交 → fee/stamp_tax 落 0（与历史口径字节兼容）
+	body2 := `{"type":"trade","order_id":"OF2","code":"600519.SH","side":"买入","price":10,"qty":100,"amount":1000,` +
+		`"traded_at":"2026-09-18T10:01:00+08:00","signal_id":"SF2"}`
+	s.handleQMTReport(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2)))
+
+	fills, err := db.ListFillsByDay("", "2026-09-18")
+	if err != nil {
+		t.Fatalf("list fills: %v", err)
+	}
+	bySig := map[string]store.RealFill{}
+	for _, f := range fills {
+		bySig[f.SignalID] = f
+	}
+	if f := bySig["SF1"]; f.Fee != 32.5 || f.StampTax != 65 {
+		t.Fatalf("费用腿未透传：SF1 fee=%.2f stamp=%.2f（应 32.5/65）", f.Fee, f.StampTax)
+	}
+	if f := bySig["SF2"]; f.Fee != 0 || f.StampTax != 0 {
+		t.Fatalf("旧格式成交费用应缺省为 0：SF2 fee=%.2f stamp=%.2f", f.Fee, f.StampTax)
+	}
+}
+
 // TestHandleQMTReportPositions 全量对账：upsert + 移除不在集合内的持仓。
 // English: full reconciliation upserts and drops positions absent from the push.
 func TestHandleQMTReportPositions(t *testing.T) {

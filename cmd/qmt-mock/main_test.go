@@ -312,6 +312,11 @@ func TestMockSettlementEndpoint(t *testing.T) {
 	if tr["serial"] == nil || tr["ts_code"] != "600519.SH" || tr["qty"].(float64) != 100 {
 		t.Fatalf("成交流水缺 serial/字段错: %+v", tr)
 	}
+	// §P2-FEE 20260918：mock 交割流水带模拟费用腿（150000×万2.5=37.5，最低 5 元），
+	// 与成交回报同源，供引擎三方对账的费用差腿在 UAT 下可观测。
+	if fee, _ := tr["fee"].(float64); fee <= 0 {
+		t.Fatalf("/settlement 成交应带非零 fee, got %+v", tr)
+	}
 	cashMap, _ := body["cash"].(map[string]interface{})
 	if cashMap == nil || cashMap["cash"] == nil {
 		t.Fatalf("/settlement 缺 cash 快照: %+v", body)

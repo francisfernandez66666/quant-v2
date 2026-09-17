@@ -36,9 +36,9 @@
 //
 // 【策略信号与行情】
 //   fetchSignals()          GET  /api/signals           策略信号列表
-//   fetchKline() / fetchMinute() / fetchDepth()
-//                           GET  /api/kline | /api/minute | /api/depth/{code}
-//                                                       K线 / 分时（含 MACD）/ 盘口五档
+//   fetchMinute() / fetchDepth()
+//                           GET  /api/minute | /api/depth/{code}
+//                                                       分时（含 MACD）/ 盘口五档
 //   fetchStatus() / fetchDashboard() / fetchEngineHealth()
 //                           GET  /api/status | /api/dashboard | /api/engine_health
 //                                                       系统状态 / 仪表盘 / 引擎健康
@@ -88,9 +88,9 @@
 //                           GET|POST /api/paper/strategies     战法黑白名单
 //   fetchPaperConfig() / updatePaperConfig()
 //                           GET|POST /api/paper/config         撮合配置（改后热生效）
-//   buyPaperPosition() / sellPaperPosition() / shortOpenPaper() / shortCoverPaper()
-//                           POST /api/paper/buy|sell|short_open|short_cover
-//                                                       手动买卖与融券开平仓
+//   buyPaperPosition() / sellPaperPosition() / shortCoverPaper()
+//                           POST /api/paper/buy|sell|short_cover
+//                                                       手动买卖与融券买平（开仓由信号自动触发）
 //   resetPaperPool() / configPaperPools() / resetPaper() / paperResetV2()
 //                           POST /api/paper/pool/reset|pool/config|reset
 //                                                       单池清盘 / 分仓配置 / 总清盘
@@ -99,8 +99,8 @@
 //   fetchSignalVerdicts()   GET  /api/signalctl/verdicts   信号裁定留痕
 //   fetchRiskGates()        GET  /api/risk/gates           风控闸口状态（admin）
 //   actionSignal()          POST /api/action               信号买入/忽略
-//   fetchShortStatus() / toggleShort() / fetchLongStatus() / toggleLong()
-//                           GET|POST /api/short|long/status|toggle   多空开关
+//   fetchShortStatus() / toggleShort()
+//                           GET|POST /api/short/status|toggle   做空开关（做多总闸 /api/long/* 由后端保留，暂无 UI）
 //   fetchNewsShowAllStatus() / toggleNewsShowAll()
 //                           GET|POST /api/news/showall      资讯显示全部开关
 //
@@ -571,16 +571,6 @@ export async function fetchSignals() {
   return request('/api/signals', { timeout: 20000 })
 }
 
-/** 获取个股 K 线数据 */
-/** Fetch a stock's K-line data */
-// 对应 GET /api/kline；code 必填，period 默认日线，count 默认 90，返回 [{ date, open, high, low, close, volume, amount }]
-// Maps to GET /api/kline; code is required, period defaults to daily, count defaults to 90; returns [{ date, open, high, low, close, volume, amount }]
-export async function fetchKline(code, period, count) {
-  const p = period || '101'
-  const c = count || 90
-  return request('/api/kline?code=' + encodeURIComponent(code) + '&period=' + encodeURIComponent(p) + '&count=' + c)
-}
-
 /** 获取个股分时数据（分时价格 + 成交量 + MACD） */
 /** Fetch a stock's intraday (分时) data: price line + volume + MACD */
 // 对应 GET /api/minute；code 必填，scale 分钟数（默认 1），count 点数（默认 241）；
@@ -931,12 +921,6 @@ export async function buyPaperPosition(code, name, strategy, signalPrice, price,
 // 对应 POST /api/paper/sell，data: { code, price, qty }
 export async function sellPaperPosition(code, price, qty) {
   return request('/api/paper/sell', { method: 'POST', data: { code, price: price || 0, qty: qty || 0 } })
-}
-
-/** §SHORT-4 模拟盘：手动融券开仓（price=0 走实时价；做空池未开设/已持空/同日重复返回中文错误） */
-// 对应 POST /api/paper/short_open，data: { code, name, strategy, price }
-export async function shortOpenPaper(code, name, strategy, price) {
-  return request('/api/paper/short_open', { method: 'POST', data: { code, name, strategy, price: price || 0 } })
 }
 
 /** §SHORT-4 模拟盘：融券买回平仓（price=0 走实时价）。返回 { ok, realized } */
@@ -1468,22 +1452,6 @@ export async function toggleShort(enabled) {
   return request('/api/short/toggle', { method: 'POST', data: { enabled } })
 }
 
-/** 查询当前做多状态 */
-/** Query the current long status */
-// 对应 GET /api/long/status，返回 { long_enabled } 布尔值
-// Maps to GET /api/long/status; returns the boolean { long_enabled }
-export async function fetchLongStatus() {
-  return request('/api/long/status')
-}
-
-/** 切换做多开关 */
-/** Toggle the long switch */
-// 对应 POST /api/long/toggle，请求体 { enabled } 传入目标开关状态，后端持久化
-// Maps to POST /api/long/toggle; the body { enabled } carries the target state, persisted by the backend
-export async function toggleLong(enabled) {
-  return request('/api/long/toggle', { method: 'POST', data: { enabled } })
-}
-
 // ── 资讯显示全部开关 ──
 // ── "Show all news" toggle ──
 
@@ -1829,17 +1797,10 @@ export async function updateTenant(id, data) {
   return request('/api/tenants/' + encodeURIComponent(id), { method: 'PUT', data })
 }
 
-/** §MT 本租户配额与用量（GET /api/tenant/usage）
- *  返回当前登录账号所属租户的配额上限与实际使用量 */
-export async function fetchTenantUsage() {
-  return request('/api/tenant/usage')
-}
-
-/** §MT 迁移用户到指定租户（PUT /api/admin/users/{id}/tenant，仅平台运营者）
- *  tenantId 为目标租户 ID，请求体 { tenant_id } */
-export async function moveUserTenant(id, tenantId) {
-  return request('/api/admin/users/' + encodeURIComponent(id) + '/tenant', { method: 'PUT', data: { tenant_id: tenantId } })
-}
+// §PERM-GATE/P2-FE-DEAD 20260918：以下死 wrapper 已删除（页面零调用）——
+//   fetchTenantUsage（用量已由 fetchTenants 行内返回）、moveUserTenant（迁移无 UI，待定产品决策）、
+//   fetchAdmin{D1,LongShort,LLM}Config / setAdmin…（按用户配置仅 strategy 有面板）。
+// 对应后端路由（server.go:512/513/517-522）保留，供脚本/后续台账页使用。
 
 /** 读取指定账号战法参数（GET /api/admin/users/{id}/config/strategy） */
 export async function fetchAdminStrategyConfig(id) {
@@ -1849,36 +1810,6 @@ export async function fetchAdminStrategyConfig(id) {
 /** 保存指定账号战法参数（POST /api/admin/users/{id}/config/strategy） */
 export async function setAdminStrategyConfig(id, cfg) {
   return request('/api/admin/users/' + encodeURIComponent(id) + '/config/strategy', { method: 'POST', data: cfg })
-}
-
-/** 读取指定账号 D1 规则（GET /api/admin/users/{id}/config/d1） */
-export async function fetchAdminD1Config(id) {
-  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/d1')
-}
-
-/** 保存指定账号 D1 规则（POST /api/admin/users/{id}/config/d1） */
-export async function setAdminD1Config(id, cfg) {
-  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/d1', { method: 'POST', data: cfg })
-}
-
-/** 读取指定账号做多/做空开关（GET /api/admin/users/{id}/config/longshort） */
-export async function fetchAdminLongShortConfig(id) {
-  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/longshort')
-}
-
-/** 保存指定账号做多/做空开关（POST /api/admin/users/{id}/config/longshort） */
-export async function setAdminLongShortConfig(id, cfg) {
-  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/longshort', { method: 'POST', data: cfg })
-}
-
-/** 读取指定账号 LLM 配置（GET /api/admin/users/{id}/config/llm） */
-export async function fetchAdminLLMConfig(id) {
-  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/llm')
-}
-
-/** 保存指定账号 LLM 配置（POST /api/admin/users/{id}/config/llm） */
-export async function setAdminLLMConfig(id, cfg) {
-  return request('/api/admin/users/' + encodeURIComponent(id) + '/config/llm', { method: 'POST', data: cfg })
 }
 
 /** §P2-f 参数优化：入队全库扫参任务（objective: profitFactor|winRate|avgWin；盘后窗口执行）。

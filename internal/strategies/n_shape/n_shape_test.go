@@ -127,11 +127,14 @@ func TestGenerateSignal(t *testing.T) {
 	}
 }
 
-// TestEvaluatePlaceholder 标准接口占位实现不 panic。
+// TestEvaluatePlaceholder 标准接口占位实现不 panic，且 Level 为 stub（区别于真缺数据的 nodata）。
 func TestEvaluatePlaceholder(t *testing.T) {
 	ev, err := newNS().Evaluate("x", nil)
 	if err != nil || ev.Pass {
 		t.Error("占位 Evaluate 应 Pass=false")
+	}
+	if ev.Level != "stub" {
+		t.Errorf("占位 Evaluate 应 Level=stub，实际 %q", ev.Level)
 	}
 }
 

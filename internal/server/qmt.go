@@ -524,7 +524,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		Amount    float64              `json:"amount"`
 		TradedAt  string               `json:"traded_at"`
 		SignalID  string               `json:"signal_id"`
-		Reason    string               `json:"reason"` // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
+		Reason    string               `json:"reason"`    // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
+		Fee       float64              `json:"fee"`       // §P2-FEE 20260918 经手费/佣金（尽力透传，缺=0）
+		StampTax  float64              `json:"stamp_tax"` // 印花税（卖方单边，缺=0）
 		Positions []store.RealPosition `json:"positions"`
 		Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
 		At        string               `json:"at"`
@@ -654,6 +656,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			OrderID: ev.OrderID, Code: ev.Code, Side: tradeSide, Price: ev.Price,
 			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: ev.SignalID,
 			UserID: uid, // §W2-10 成交流水打归属账号（幂等键冲突时整体回滚，持仓不重复累加）
+			// §P2-FEE 20260918：成交费用腿透传入本地 fills（网关回报缺省时为 0，与旧口径一致）。
+			Fee: ev.Fee, StampTax: ev.StampTax,
 		}); err != nil {
 			writeError(w, 500, "apply fill: "+err.Error())
 			return

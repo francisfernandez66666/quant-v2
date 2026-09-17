@@ -272,7 +272,29 @@ class ReportHandler:
             "amount": float(getattr(trade, "traded_amount", 0) or 0),
             "traded_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
             "signal_id": self._signal_of(trade),
+            # §P2-FEE 20260918：成交费用腿尽力透传（各 xtquant 构建字段名不一，缺省 0
+            # 与旧"费用恒 0"口径字节兼容，绝不臆造费用）。
+            "fee": self._fee_of(trade),
         })
+
+    @staticmethod
+    def _fee_of(obj):
+        """尽力从成交对象取单笔费用（佣金+过户费），多字段名探测，全不命中返回 0。
+
+        §P2-FEE 20260918：此前回报通道从不携带费用 → 三方对账费用差腿恒 0（费用类偏差
+        无人观测）。xtquant 各构建费用字段命名不一（commission/fee/trade_fee/total_fee），
+        逐一探测正数值；取不到即返回 0（保守：宁缺毋滥，不猜测费率）。
+        English: best-effort per-fill fee with multi-name probing; 0 when nothing matches
+        (never fabricate a rate).
+        """
+        for attr in ("commission", "fee", "trade_fee", "total_fee"):
+            try:
+                v = float(getattr(obj, attr, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+        return 0.0
 
     def on_disconnected(self):
         """断线：记录并（交易时段）推送首尔（首尔侧据此熔断暂停下单）。

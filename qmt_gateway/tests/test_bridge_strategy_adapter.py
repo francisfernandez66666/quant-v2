@@ -67,5 +67,35 @@ class TestXtOpsContract(unittest.TestCase):
                 self.assertFalse(cfg.get("dry_run"))
 
 
+    def test_record_seen_fail_closed(self):
+        """P3-OPS 20260918: dedup write failure must be fail-CLOSED.
+
+        _record_seen returns False when the seen file can't be written; _handle_cmd
+        must then refuse the order (return False) and NOT add it to the in-memory set,
+        so the command stays pending for a safe retry instead of executing a possibly
+        duplicated real order after a bridge restart. (Pure ASCII test: this module
+        runs under the GBK strategy sandbox.)
+        """
+        old_seen = bs.SEEN_PATH
+        old_trace = bs._trace
+        bs._trace = lambda m: None  # silence sandbox trace writer in CI
+        try:
+            # unwritable target: a directory path as the seen file forces open(a) to fail
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                bs.SEEN_PATH = td  # open(dir, "a") -> IsADirectoryError
+                self.assertFalse(bs._record_seen("SEQ-X"))
+                seen = set()
+                # kind=order with a failing seen-write must be refused before place()
+                # (no xtquant here; if it reached place() it would error/return True path)
+                ret = bs._handle_cmd({"kind": "order", "seq": "SEQ-X", "code": "600279.SH",
+                                      "side": "买入", "price": 10, "qty": 100}, seen)
+                self.assertFalse(ret, "cmd must be refused when dedup is not durable")
+                self.assertNotIn("SEQ-X", seen, "refused seq must NOT enter in-memory seen")
+        finally:
+            bs.SEEN_PATH = old_seen
+            bs._trace = old_trace
+
+
 if __name__ == "__main__":
     unittest.main()

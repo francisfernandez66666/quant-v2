@@ -129,11 +129,17 @@ jobs:
           print("seeded rows:", db.execute("SELECT COUNT(*) FROM market_risk_daily").fetchone()[0])
           # §D-1（GAP_VERIFY_20260917_PM）夜研报告 seed：paper_research_reports 一条最小报告
           # （D-1 e2e 用例断言"弹窗打开+日期条渲染"，正文形状与 researchd 产出一致）。
+          # §FIX-20260918（UAT_FULLCHAIN_VERIFY P1-CI1）：auth 已迁 auth.json（internal/auth/auth.go:232），
+          # trading.db 不再有 users 表——旧 SQL "SELECT id FROM users" 在本机复刻时实测
+          # sqlite3.OperationalError: no such table: users，夜检 CI 必红。改从 auth.json 取 admin id。
+          # English: users now live in auth.json, not trading.db — read the admin id from there.
           import json as _json
+          auth = _json.load(open(os.path.join(os.environ["QUANT_DATA_DIR"], "auth.json")))
+          admin_id = next(u["id"] for u in auth["users"] if u.get("role") == "admin")
           rep = {"generated_at": d0, "trades": [{"strategy_type": "dragon", "side": "buy", "count": 2,
                  "total_amount": 40000.0, "avg_price": 10.5, "avg_slippage": 0.12, "avg_latency": 2.0}],
                  "daily": [], "attribution": [], "emotion": {"days": 2, "last_phase": "中性", "phase_days": {}}}
-          admin_id = db.execute("SELECT id FROM users LIMIT 1").fetchone()[0]
+          # 读端 GET /api/research/paper-reports 走 researchDB=trading.db（server.go:147/455 实证）
           db.execute("INSERT OR REPLACE INTO paper_research_reports(date,user_id,summary_json,created_at) VALUES (?,?,?,datetime('now'))",
                      ("2026-09-17", admin_id, _json.dumps(rep)))
           db.commit()

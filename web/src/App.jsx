@@ -381,7 +381,9 @@ export default function App() {
     { to: '/quant', icon: <ChartLineIcon size="18px" />, label: '量化交易' },
     paperEnabled ? { to: '/paper', icon: <RocketIcon size="18px" />, label: '模拟盘' } : null,
     canAdmin ? { to: '/settings', icon: <SettingIcon size="18px" />, label: '设置' } : null,
-    { to: '/llm-debug', icon: <TerminalIcon size="18px" />, label: 'LLM诊断' },
+    // §PERM-GATE 20260918：LLM 诊断两个主数据源均为 admin 守卫（server.go:683/692），
+    // 成员常显入口进页必 403 —— 收敛为仅管理员可见。
+    canAdmin ? { to: '/llm-debug', icon: <TerminalIcon size="18px" />, label: 'LLM诊断' } : null,
     { to: '/consult', icon: <ChatBubble1Icon size="18px" />, label: '股票咨询' },
     canResearch ? { to: '/research', icon: <SearchIcon size="18px" />, label: '自动研究' } : null,
     // 条件项为 null 时由下方 filter(Boolean) 剔除，实现入口按权限显隐
@@ -567,8 +569,9 @@ export default function App() {
                      * 设置页：仅管理员（ProtectedRoute admin 守卫） */}
                     <Route path="/settings" element={<ProtectedRoute admin><Settings /></ProtectedRoute>} />
                     {/*
-                     * LLM 诊断页：查看大模型调用与结构化输出 */}
-                    <Route path="/llm-debug" element={<LLMDebug />} />
+                     * LLM 诊断页：查看大模型调用与结构化输出
+                     * §PERM-GATE 20260918：数据源 admin 守卫，套 ProtectedRoute admin 与侧栏一致 */}
+                    <Route path="/llm-debug" element={<ProtectedRoute admin><LLMDebug /></ProtectedRoute>} />
                     {/*
                      * 股票咨询页：自然语言问询个股/板块 */}
                     <Route path="/consult" element={<Consult />} />

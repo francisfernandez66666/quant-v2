@@ -710,6 +710,10 @@ class Gateway:
             "amount": float(req.get("amount", 0) or 0),
             "traded_at": req.get("traded_at") or time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
             "signal_id": req.get("signal_id", ""),
+            # §P2-FEE 20260918：费用腿透传（桥 DEAL 行尽力带 commission，缺=0；
+            # handler.on_trade → store.apply_fill 落 fills.fee，供 /settlement 费用差对账）。
+            "fee": float(req.get("fee", 0) or 0),
+            "stamp_tax": float(req.get("stamp_tax", 0) or 0),
         })
         # §QMT-DUAL 委托状态推进：按累计成交量对比申报量判已成/部成（对同一交易所委托号）
         oid = str(req.get("order_id", "") or "")
