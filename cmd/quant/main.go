@@ -1,3 +1,28 @@
+// 文件概述（cmd/quant/main.go）
+// ─────────────────────────────────────────────────────────────────────────────
+// 本文件是 quant-trading-v2 量化交易系统的【进程入口】，负责整个引擎进程的
+// 组装、启动与生命周期管理：
+//
+//  1. 进程级环境准备：强制 Asia/Shanghai 时区（交易时段判断依赖 time.Local）、
+//     初始化数据目录与每日运维日志（opslog）。
+//  2. 组件装配（按依赖顺序）：认证管理 → 行情 API（东财/同花顺/hithink 降级链）→
+//     事件匹配器 → 配置管理器（含热重载）→ LLM 客户端（未配 Key 自动降级）→
+//     新闻代理 → 策略引擎 → 板块扫描 → 报告/自选/持仓追踪 → HTTP 服务 →
+//     模拟盘 → 研究库/实盘账本（trading.db / live.db）→ 推送器（桌面/网关/ntfy）→
+//     5s 实时行情采集 → 多账号引擎注册表 → 实时触发引擎。
+//  3. 双层调度循环：
+//     - 近实时打分循环（默认 5s 节拍）：驱动所有账号引擎打分，休市时降频并执行
+//     交易日滚动清空、盘后复盘、监控池同步；
+//     - 主循环（main for-loop）：按市场时段（盘前/午前/盘中）异步驱动顶层编排
+//     引擎，盘前"跑完即排下一轮"，盘中用自适应等待（新新闻到达或超时兜底）。
+//  4. 信号处理与优雅停机：捕获 SIGTERM/SIGINT，先关 HTTP、停触发引擎与采集器、
+//     停新闻代理，再退出，保证状态文件完整落盘（不再走 defer 链）。
+//  5. 辅助函数：部署自检（verifyDeployment）、时段追回起点计算（sinceForSession）、
+//     数据目录解析（getDataDir）、端口绑定（pickListener）、密钥脱敏（redact）等。
+//
+// 所有后台常驻 goroutine（行情采集/触发引擎/打分循环）均通过 defer 或 ctx cancel
+// 与进程退出路径对齐；HTTP 监听采用 fail-fast 策略（端口被占即退出，防双实例写库）。
+//
 // Package main 量化交易系统入口：初始化所有模块（认证、行情、策略、板块、新闻、风控），
 // 按市场时段循环驱动顶层编排引擎。
 package main
@@ -46,6 +71,7 @@ var buildCommit = "unknown"
 // main 系统入口：初始化数据目录、认证、行情 API、LLM、新闻代理、策略引擎等所有组件，
 // 然后进入主循环，每 5 分钟驱动一次顶层编排引擎（engine.Engine）。
 func main() {
+	// §启动顺序 0：日志带文件:行号，便于多 goroutine 场景下定位输出来源；打印构建指纹。
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("[deploy] 二进制构建指纹: buildCommit=%s（未注入显示 unknown，用于比对代码头是否一致）", buildCommit)
 
@@ -99,7 +125,7 @@ func main() {
 
 	// 配置管理器：读取数据目录下的 config.json（策略/风控/情绪/LLM 等）
 	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
-	// §UI-AUTHORITATIVE 修复：配置存储（trading.db KV）必须在下方 LLM 启动装配【之前】挂好，
+	// §启动顺序 1：配置存储挂载。§UI-AUTHORITATIVE 修复：配置存储（trading.db KV）必须在下方 LLM 启动装配【之前】挂好，
 	// 否则 StoredLLMConfig 恒为 false，设置页保存的运营配置在重启后无法恢复（被 env 顶掉）。
 	// server.New 内部会再次 SetStore（幂等赋值，无副作用）。
 	cfgMgr.SetStore(authMgr)
@@ -110,6 +136,7 @@ func main() {
 	cfgMgr.Watch(context.Background(), 60*time.Second)
 
 	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN）：primary_source=hithink 时回测取数优先 ths_ 表。
+	// 两个包级开关是回测/存储层读取数据源的路由信号，由 config.json 的 rules.data 段驱动。
 	store.PrimarySourceThsDaily = strings.EqualFold(cfgMgr.Rules.Data.PrimarySource, "hithink")
 	store.ThsFactorsReady = cfgMgr.Rules.Data.ThsFactorsReady
 
@@ -121,6 +148,7 @@ func main() {
 	llmCfg := llmcfg.Resolve(cfgMgr, authMgr)
 
 	// LLM 客户端：未配置 API Key 时降级为纯关键词分析（新闻归因不可用）
+	// §启动顺序 2：llmCfg 已按权威链解析完毕，此处仅在有可用 Key 时才创建客户端。
 	var llmClient *llm.Client
 	if len(llmCfg.APIKeys) > 0 {
 		llmClient = llm.New(llmCfg)
@@ -163,13 +191,16 @@ func main() {
 	stockTracker := data.NewStockTracker(filepath.Join(dataDir, "tracked_stocks.json"))
 
 	// HTTP 服务：认证/前端/报告/自选股 + SSE 实时推送
+	// §启动顺序 3：先把服务端骨架建起来，随后逐步注入依赖（缓存目录/LLM 运行态/采集器/引擎注册表等）。
 	srv := server.New(authMgr, agg, cfgMgr, rpt, marketAPI, wlMgr, thsClient)
 	srv.SetCacheDir(dataDir) // 看板快照落盘，休市/重启后前端仍有最近一次有效数据
+	// 计算"生效模型名"用于展示与运行态注入：LLM 配置未显式指定模型时回退包级默认模型。
 	effModel := llmCfg.Model
 	if effModel == "" {
 		effModel = llm.DefaultModel
 	}
 	srv.SetRuntimeLLM(llmCfg.APIURL, effModel)
+	// 密钥池规模统计：仅在 LLM 客户端存在时才有意义（未配置 Key 时为 0），仅用于启动日志展示。
 	poolN := 0
 	if llmClient != nil {
 		poolN = llmClient.KeyCount()
@@ -182,33 +213,9 @@ func main() {
 	// When enabled, the engine auto-fills buy signals at the live snapshot price; rules.paper in
 	// config.json controls the switch and parameters.
 	paperCfg := cfgMgr.Rules.Paper
-	// §SHORT-3 零值归一：保证金率/年化费率/止损涨幅未配置时取 paper.DefaultConfig 真实口径
-	// （0 会退化为「无保证金约束/免费/无止损」，均不可接受）。
-	pd := paper.DefaultConfig()
-	shortMarginRate, shortFeeAnnual, shortStopPct := paperCfg.ShortMarginRate, paperCfg.ShortFeeAnnual, paperCfg.ShortStopLossPct
-	if shortMarginRate <= 0 {
-		shortMarginRate = pd.ShortMarginRate
-	}
-	if shortFeeAnnual <= 0 {
-		shortFeeAnnual = pd.ShortFeeAnnual
-	}
-	if shortStopPct <= 0 {
-		shortStopPct = pd.ShortStopLossPct
-	}
-	paperEngine := paper.New(paper.Config{
-		Enabled:        paperCfg.Enabled,
-		FixedAmount:    paperCfg.FixedAmount,
-		MaxPositions:   paperCfg.MaxPositions,
-		InitialCapital: paperCfg.InitialCapital,
-		AutoSell:       paperCfg.AutoSell == nil || *paperCfg.AutoSell, // 未配置默认全自动卖出
-		// §SHORT-3 融券做空侧：预算未配=池不开设（整侧关闭）；费率/保证金/止损零值回退默认。
-		ShortEnabled:     paperCfg.ShortEnabled == nil || *paperCfg.ShortEnabled,
-		ShortCapital:     paperCfg.ShortCapital,
-		ShortMarginRate:  shortMarginRate,
-		ShortFeeAnnual:   shortFeeAnnual,
-		ShortFixedAmount: paperCfg.ShortFixedAmount,
-		ShortStopLossPct: shortStopPct,
-	}, filepath.Join(dataDir, "paper.json"))
+	// §F-4（20260917 缺陷修复批）装配逻辑收敛到 paper.ConfigFromRules（零值归一口径不变），
+	// 与 POST /api/paper/config 热更新共用同一构建器，消灭"只有重启才生效"的独一份内联。
+	paperEngine := paper.New(paper.ConfigFromRules(paperCfg), filepath.Join(dataDir, "paper.json"))
 	srv.SetPaper(paperEngine)
 	if paperEngine.Enabled() {
 		log.Printf("[paper] 模拟盘已启用: 每票%.0f元 上限%d仓 初始%.0f元",
@@ -481,6 +488,7 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// 主循环根 ctx：驱动引擎异步 run 上下文（随进程生命周期存活，不做取消）。
 	ctx := context.Background()
 	log.Println("quant-trading-v2 已启动")
 
@@ -488,8 +496,11 @@ func main() {
 	// 各账号引擎内部按各自配置打分，持仓+自选持续打分 + 状态翻转信号。
 	// English: near-realtime 8a/8b scoring loop at a 5s cadence, driving every created account
 	// engine (shared engines deduplicated). Each engine scores by its own config over its pool.
+	// scoreLoopCtx 供打分循环退出用；cancel 经 defer 保证进程退出路径可终止该循环。
 	scoreLoopCtx, scoreLoopCancel := context.WithCancel(ctx)
 	defer scoreLoopCancel()
+	// 哨兵 goroutine：等待 scoreLoopCtx 取消信号（消费 Done 后即退出）。
+	// 当前除维持 ctx 被取消后有一处退出点外无其他逻辑；cancel 触发时与其配对唤醒。
 	go func() {
 		<-scoreLoopCtx.Done()
 	}()
@@ -770,8 +781,11 @@ func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
 	}
 
 	// —— 2. LLM 密钥池 ——
+	// 密钥来源只认环境变量：优先复数型 LLM_API_KEYS（逗号分隔、逐个去空白），
+	// 未配置时再退回单数型 LLM_API_KEY。注意此处仅采集展示，不参与实际客户端装配。
 	var keys []string
 	if raw := os.Getenv("LLM_API_KEYS"); raw != "" {
+		// 按【逗号】切分为多把 Key，逐项去掉两侧空白后过滤空项
 		for _, k := range strings.Split(raw, ",") {
 			if k = strings.TrimSpace(k); k != "" {
 				keys = append(keys, k)
@@ -779,10 +793,12 @@ func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
 		}
 	}
 	if len(keys) == 0 {
+		// 复数形态未配置时的单数兜底：整个 LLM_API_KEY 视为唯一一把 Key
 		if k := os.Getenv("LLM_API_KEY"); k != "" {
 			keys = []string{k}
 		}
 	}
+	// 顺序去重：seen 集合保证同一 Key 只进 uniq 一次（重复会影响池轮换语义）
 	seen := map[string]bool{}
 	var uniq []string
 	for _, k := range keys {
@@ -792,6 +808,7 @@ func verifyDeployment(cfgMgr *config.Manager, authMgr *auth.Manager) {
 		}
 	}
 	log.Printf("[deploy] LLM 密钥池: 配置 %d 把, 去重后 %d 把", len(keys), len(uniq))
+	// 可疑 Key 巡检：长度 <8 或含空白字符是"截断/拼写漂移"的常见特征（仅告警，不阻断）
 	for i, k := range uniq {
 		suspicious := len(k) < 8 || strings.ContainsAny(k, " \t\n")
 		if suspicious {
@@ -896,8 +913,10 @@ func pickListener(baseAddr string, maxTries int) net.Listener {
 }
 
 // bumpPort 将 host:port 地址中的端口号 +1（如 :8080 -> :8081）；解析失败时原样返回。
+// 当前生产路径已不再顺延端口（pickListener 改为 fail-fast），本函数仅保留供单元测试
+// （main_test.go）验证端口递增逻辑使用。
 // English: increments the port number of a host:port address (e.g. :8080 -> :8081);
-// returns the address unchanged when it cannot be parsed.
+// returns the address unchanged when it cannot be parsed. Retained for unit tests only.
 func bumpPort(addr string) string {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {

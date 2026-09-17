@@ -1,6 +1,30 @@
 // ── fix 兼容端点 ──
 // 本文件提供与前端兼容的 HTTP API 处理函数，
 // 将内部数据模型转换为前端期望的格式。
+//
+// ── 概述 ──
+// 本文件是「fix 前端兼容层」的路由处理器集合（HTTP 处理句柄集），由 server 包统一注册，
+// 覆盖信号、行情、持仓、热点、资讯、通知与 SSE 推流等前端页面所需的数据端点：
+//   - 信号：handleFixSignals（/api/signals 最新策略信号+实时复核剔除）
+//   - 行情：handleFixMinute（/api/minute 分时+MACD）、handleFixKLine（/api/kline K线）、
+//     handleFixSnapshot（/api/snapshot 快照）、handleFixHotSnapshot（/api/snapshot/hot 热门快照）、
+//     handleFixStockLookup（/api/stock/lookup 单票查询）、handleFixDepth（/api/depth/{code} 盘口）
+//   - 持仓：handleFixGetHoldings（/api/holdings 持仓列表+盈亏）、handleFixSetHoldings（POST 全量同步）、
+//     handleFixSetBalance（/api/holdings/balance 窄口径改可用资金）、handleFixAddHoldingLot（加仓）、
+//     handleFixSetCost（改成本）、handleFixSellHolding（减仓）、handleFixCloseHolding（清仓）
+//   - 热点/评分：handleFixSectorHot（/api/sector/hot 热门板块）、handleSectorHotRecords（热点轮次记录）、
+//     handleFixEvaluations（/api/evaluations 多维评分）、handleFixStatus（/api/status 运行状态）、
+//     handleFixEngineHealth（/api/engine_health 子系统健康）
+//   - 资讯/日历：handleFixNews（/api/news 多源聚合+30s TTL）、handleFixIPOCalendar（/api/ipo/calendar）
+//   - 自选股：handleFixGetWatchlist / handleFixAddWatchlist / handleFixRemoveWatchlist
+//   - 操作/QMT：handleFixAction（/api/action 手动指令；qmt.enabled+manual=admin 实盘下单，
+//     否则 noop stub）、handleFixNotifyTest（通知测试）
+//   - 推流：handleSSETicket（签发 60s 一次性建链票据）、handleFixSSE（/api/events SSE 长连接，含
+//     票据/token 双通道鉴权、断线续传、15s 心跳）
+//   - 消息中心：handleFixAlerts（/api/alerts）、handleClearAlerts、handleDeleteAlert
+//
+// 各 handler 共通约定：统一走 requestUserID/operatorID 做账号隔离；行情统一入口
+// quote/quoteSnapshot/quoteDisplay（快照优先，避免轮询打爆数据源）；JSON 输出走 writeJSON/writeError。
 
 package server
 
@@ -20,6 +44,7 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/trading"
 )
@@ -290,6 +315,8 @@ const (
 	minuteCacheTTL = 24 * time.Hour // 单条目存活上限
 )
 
+// minuteCacheMu 保护下面 minuteCache 分时缓存的读写锁；minuteCache 以股票代码为键，
+// 缓存各标的最近一次成功拉取的分时（容量上限/条目 TTL 见上方 minuteCacheMax/minuteCacheTTL）。
 var (
 	minuteCacheMu sync.RWMutex
 	minuteCache   = map[string]*minuteCacheEntry{}
@@ -1985,6 +2012,7 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code     string  `json:"code"`
 		Action   string  `json:"action"`
+		Strategy string  `json:"strategy"`  // §F-1 忽略定位用：信号所属战法（空=忽略该 code 当日全部）
 		SignalID string  `json:"signal_id"` // 信号 ID（幂等键）
 		Price    float64 `json:"price"`     // 参考价
 		Qty      int     `json:"qty"`       // 股数
@@ -2002,11 +2030,45 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "unauthorized")
 		return
 	}
+	// §F-1（20260917 缺陷修复批）action 白名单前置：旧实现把"其余一律视为买入"，
+	// 信号页「忽略」按钮发 action=ignore，在 qmt enabled+manual+admin 下会被静默转成
+	// 真实买入委托（100 股/实时价）——P0 级资金安全缺陷。现只允许 买入/卖出 进入下单通道，
+	// 忽略走信号墓碑（任何模式可用，不触下单），其余 action 直接 400。
+	// English: §F-1 — strict action whitelist. Previously any unrecognized action (including
+	// "ignore" from the Signals page) fell through to the BUY side of the live-order branch,
+	// so clicking "忽略" could place a real 100-share order. Now only buy/sell can reach the
+	// order path; ignore tombstones the signal (order-path-free); anything else is rejected.
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	switch action {
+	case "买入", "buy":
+		action = "buy"
+	case "卖出", "卖", "sell":
+		action = "sell"
+	case "忽略", "ignore":
+		action = "ignore"
+	default:
+		writeError(w, 400, "不支持的操作: "+req.Action+"（仅支持 买入/卖出/忽略）")
+		return
+	}
+	if action == "ignore" {
+		if req.Code == "" {
+			writeError(w, 400, "code required")
+			return
+		}
+		removed := 0
+		if c := s.ctrlFor(user.ID); c != nil {
+			removed = c.IgnoreSignal(req.Code, req.Strategy)
+		}
+		opslog.Audit("signal_ignore", user.ID, req.Code, fmt.Sprintf("strategy=%s removed=%d", req.Strategy, removed))
+		writeJSON(w, 200, map[string]interface{}{"status": "ignored", "removed": removed})
+		return
+	}
 	ctrl := s.qmtCtrlFor(user.ID)
 	if ctrl != nil && ctrl.Enabled() && ctrl.Mode() == "manual" {
-		// §GAP1.8（A5）：实盘下单分支独立权限位——仅 admin 可触发真实下单；
-		// 模拟买入等其余分支不受影响（普通用户仍可用）。
-		// English: §GAP1.8 (A5) — the live-order branch requires admin; other branches unaffected.
+		// §GAP1.8（A5）：实盘下单分支独立权限位——仅 admin 可触发真实下单。
+		// §F-3 修正旧注释漂移：本端点从未有过"模拟买入"分支，模拟成交走 /api/paper/buy。
+		// English: §GAP1.8 (A5) — the live-order branch requires admin. §F-3: this endpoint never had a
+		// paper-buy branch (that lives on /api/paper/buy); the old comment claimed otherwise.
 		if !user.IsAdmin() {
 			writeError(w, 403, "admin required for live orders")
 			return
@@ -2015,9 +2077,8 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "code required")
 			return
 		}
-		// 买卖方向：卖出/卖映射到卖出侧，其余默认买入。
 		side := trading.SideBuy
-		if req.Action == "卖出" || req.Action == "sell" {
+		if action == "sell" {
 			side = trading.SideSell
 		}
 		// 未传价格时取实时行情价；仍未取得则拒绝。
@@ -2062,8 +2123,12 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, res)
 		return
 	}
-	log.Printf("[action] %s %s (qmt disabled, stub)", req.Action, req.Code)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	// §F-3：链路未启用/非手动模式时不再伪装成功——显式 noop 语义 + 原因，前端可提示
+	// "模拟买入请用模拟买入"。旧实现在此返回 {"status":"ok"}，用户点了"买入"看到成功
+	// 但什么也没发生（假反馈）。English: §F-3 — no more silent success; the stub now reports
+	// status=noop with an explicit reason so the frontend can tell the user nothing was placed.
+	log.Printf("[action] %s %s (qmt 未启用/非 manual，noop)", action, req.Code)
+	writeJSON(w, 200, map[string]string{"status": "noop", "reason": "实盘链路未启用或非手动模式；模拟成交请使用模拟买入"})
 }
 
 // handleFixNotifyTest 处理 POST /api/notify-test 请求，通知测试接口。

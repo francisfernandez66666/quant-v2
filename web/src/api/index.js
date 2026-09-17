@@ -18,6 +18,160 @@
 // 5. 市场会话追踪：记录 session 期号，辅助判断非交易时段的首次加载。
 // 5. Market session tracking: records session id to help decide first load in non-trading hours.
 //
+// ── 模块分组端点函数清单（导出函数索引，全部经 request() 走统一封装）──
+//
+// 【认证与登录态】
+//   login()                 POST /api/auth/login        登录换取 token 并落盘账号/角色/权限
+//   logout()                POST /api/auth/logout       服务端吊销会话 + 立即清本地凭据
+//   clearAuth()             ——                          本地清除 token/账号/角色/权限
+//   isLoggedIn() / getAccount() / getRole() / getPerms() / isAdmin() / hasPerm()
+//                           ——                          本地登录态读取与权限判定
+//   refreshMe()             GET  /api/auth/me           拉取并缓存最新角色/权限位
+//   getStoredServer() / setStoredServer()
+//                           ——                          后端服务器地址的读取与持久化
+//
+// 【通用请求封装】
+//   request(path, opts)     ——                          统一 fetch：拼 baseUrl、自动附 Bearer 头、
+//                                                       超时中断、401 清态广播、错误归一、同源回退重试
+//
+// 【策略信号与行情】
+//   fetchSignals()          GET  /api/signals           策略信号列表
+//   fetchKline() / fetchMinute() / fetchDepth()
+//                           GET  /api/kline | /api/minute | /api/depth/{code}
+//                                                       K线 / 分时（含 MACD）/ 盘口五档
+//   fetchStatus() / fetchDashboard() / fetchEngineHealth()
+//                           GET  /api/status | /api/dashboard | /api/engine_health
+//                                                       系统状态 / 仪表盘 / 引擎健康
+//   fetchSectorHot() / fetchSectorHotRecords()
+//                           GET  /api/sector/hot[/records]   板块热点与轮次记录
+//   fetchSnapshot() / fetchHotSnapshot()
+//                           GET  /api/snapshot[/hot]    全市场 / 热门个股行情快照
+//   fetchEvaluations()      GET  /api/evaluations       个股多维度战法评分
+//   fetchStockLookup()      GET  /api/stock/lookup      个股速查（名称/现价）
+//   fetchDataSourceHealth() / fetchNewsSourceHealth()
+//                           GET  /api/data_source_health | /api/news_source_health
+//                                                       行情/新闻数据源健康探测
+//
+// 【消息提醒】
+//   fetchAlerts()           GET    /api/alerts          消息列表
+//   clearAlerts()           DELETE /api/alerts          清空全部消息
+//   deleteAlert(id)         DELETE /api/alerts/{id}     删除单条消息
+//   reviewPositions()       POST   /api/review/positions   手动触发盘后持仓 LLM 复盘
+//
+// 【持仓管理】
+//   fetchHoldings() / updateHoldings() / updateHoldingsBalance()
+//                           GET|POST /api/holdings[/balance]   持仓列表与可用资金
+//   addHoldingLot() / setHoldingCost() / closeHolding() / sellHoldingLot()
+//                           POST /api/holdings/{code}/add|cost|close|sell
+//                                                       加仓/改成本/清仓/减仓
+//   fetchRealPositions() / fetchRealAdvice() / executeRealAction()
+//                           GET|POST /api/positions/real|advice|execute
+//                                                       实盘真实持仓 / 处理建议 / 手动委托
+//
+// 【实盘 QMT 网关】
+//   fetchQMTState() / fetchQMTBroker() / switchQMTBroker()
+//                           GET|POST /api/qmt/state|broker     互通健康 / 双路径通道切换
+//   fetchQMTConfig() / updateQMTConfig()
+//                           GET|POST /api/config/qmt           实盘参数局部更新与热生效
+//   fetchQMTTrades() / fetchQMTOrders() / qmtHalt() / qmtCancel()
+//                           GET|POST /api/qmt/trades|orders|halt|cancel/{id}
+//                                                       流水 / 委托 / kill-switch / 撤单
+//   qmtSettle() / fetchQMTSettleHistory()
+//                           POST|GET /api/qmt/settle[/history] 交割单三方对账与历史
+//
+// 【模拟盘】
+//   fetchPaperState() / fetchPaperPositions() / fetchPaperTrades() / fetchPaperOrders()
+//   fetchPaperEquity() / fetchPaperSelfCheck()
+//                           GET /api/paper/state|positions|trades|orders|equity|selfcheck
+//                                                       模拟盘状态/持仓/成交/订单/净值/自检
+//   fetchPaperStrategies() / updatePaperStrategies()
+//                           GET|POST /api/paper/strategies     战法黑白名单
+//   fetchPaperConfig() / updatePaperConfig()
+//                           GET|POST /api/paper/config         撮合配置（改后热生效）
+//   buyPaperPosition() / sellPaperPosition() / shortOpenPaper() / shortCoverPaper()
+//                           POST /api/paper/buy|sell|short_open|short_cover
+//                                                       手动买卖与融券开平仓
+//   resetPaperPool() / configPaperPools() / resetPaper() / paperResetV2()
+//                           POST /api/paper/pool/reset|pool/config|reset
+//                                                       单池清盘 / 分仓配置 / 总清盘
+//
+// 【信号控制器、风控与开关】
+//   fetchSignalVerdicts()   GET  /api/signalctl/verdicts   信号裁定留痕
+//   fetchRiskGates()        GET  /api/risk/gates           风控闸口状态（admin）
+//   actionSignal()          POST /api/action               信号买入/忽略
+//   fetchShortStatus() / toggleShort() / fetchLongStatus() / toggleLong()
+//                           GET|POST /api/short|long/status|toggle   多空开关
+//   fetchNewsShowAllStatus() / toggleNewsShowAll()
+//                           GET|POST /api/news/showall      资讯显示全部开关
+//
+// 【资讯、自选与日历】
+//   fetchNews() / reanalyzeNews()
+//                           GET|POST /api/news[/reanalyze]  资讯列表与手动 LLM 重推
+//   fetchWatchlist() / addWatchlist() / removeWatchlist()
+//                           GET|POST|DELETE /api/watchlist  自选股增删查
+//   fetchIPOCalendar()      GET  /api/ipo/calendar          打新日历（按日本地缓存）
+//
+// 【LLM 与战法配置、诊断】
+//   fetchLLMConfig() / setLLMConfig()
+//                           GET|POST /api/config/llm        LLM 配置读写
+//   fetchStrategyConfig() / setStrategyConfig()
+//                           GET|POST /api/config/strategy   四战法参数读写
+//   fetchLLMDebug() / fetchStageRecords() / fetchSignalLogs()
+//                           GET  /api/llm-debug | /api/stage-records | /api/signal-logs
+//                                                       LLM 诊断与盘后复盘数据
+//   consultChat() / fetchConsultHistory() / clearConsultHistory()
+//   fetchConsultProMode() / setConsultProMode()
+//                           POST|GET|DELETE|PUT /api/consult*   股票咨询多轮对话与专业模式
+//
+// 【B5 研究候选与回测】
+//   fetchResearchProgress() / getSchedulerStatus() / getResearchTaskLog() / fetchResearchFactors()
+//                           GET  /api/research/progress | /api/scheduler/status
+//                                | /api/research/task/{id}/log | /api/research/factors
+//                                                       研究进度 / 调度快照 / 任务日志 / 因子元数据
+//   fetchResearchCandidates() / approveResearchCandidate() / grayscaleResearchCandidate()
+//   rejectResearchCandidate() / backtestResearchCandidate()
+//                           GET|POST /api/research/candidates*   候选列表与审批/灰度/驳回/回测
+//   cancelBacktest() / pauseBacktest() / resumeBacktest()
+//                           POST /api/research/backtest/{id}/cancel|pause|resume
+//                                                       回测任务的取消/暂停/恢复
+//   backtestLibraryRule() / fetchBacktestStatus() / fetchRunningBacktests() / fetchAllBacktests()
+//                           POST|GET /api/research/library/{id}/backtest | /api/research/backtest*
+//                                                       战法库回测与任务状态查询
+//   fetchResearchLibrary() / setResearchLibraryEnabled() / deleteResearchLibrary()
+//   renameResearchLibrary()
+//                           GET|POST /api/research/library*  战法库管理与启停
+//   fetchBacktestToggle() / setBacktestToggle()
+//                           GET|POST /api/research/backtest-toggle  全量回测总开关
+//   fetchBacktestConfig() / saveBacktestConfig()
+//                           GET|PUT  /api/research/backtest-config  回测增强配置
+//   fetchOptimizations() / approveOptimization() / rejectOptimization()
+//   fetchSweepPools() / saveSweepPool() / enqueueOptimize()
+//                           GET|POST|PUT /api/research/optimizations* | sweep-pools
+//                                | POST /api/backtest/optimize
+//                                                       参数寻优结果与审批、扫参任务
+//
+// 【用户/账号、租户与运维日志（admin）】
+//   fetchAdminUsers() / createAdminUser() / setAdminUserRole() / setAdminUserPerms()
+//   setAdminUserPassword() / setAdminUserEnabled() / setAdminUserExpiry() / deleteAdminUser()
+//   cleanupAdminUsers() / moveUserTenant()
+//                           CRUD /api/admin/users*          用户与权限/密码/有效期管理
+//   fetchAdminStrategyConfig() / setAdminStrategyConfig() / fetchAdminD1Config()
+//   setAdminD1Config() / fetchAdminLongShortConfig() / setAdminLongShortConfig()
+//   fetchAdminLLMConfig() / setAdminLLMConfig()
+//                           GET|POST /api/admin/users/{id}/config/*   按账号读取/保存各配置
+//   fetchTenants() / createTenant() / updateTenant() / fetchTenantUsage()
+//                           GET|POST|PUT /api/tenants*      租户管理与配额用量
+//   fetchOpslogDates() / fetchOpslog()
+//                           GET  /api/opslog[/dates]        每日系统运行日志（admin）
+//
+// 【SSE 实时推送与会话追踪】
+//   onSSE() / connectSSE() / disconnectSSE()
+//                           POST /api/events/ticket + GET /api/events?ticket=...
+//                                                       SSE 长连接（一次性票据鉴权）与回调分发
+//   getLastSession() / setLastSession() / isNewSession() / isTradingSession()
+//                           ——                              市场会话期号追踪（非交易时段仅首载）
+//
+//
 // 路径拼接原理：接口函数均传入相对路径（如 '/api/signals'），
 // URL joining: every API function takes a relative path (e.g. '/api/signals'),
 // 最终请求地址 = baseUrl()（用户配置的服务器地址）+ 相对路径，
@@ -296,7 +450,9 @@ export async function request(path, opts = {}) {
   // Single attempt: base is the server base (custom server URL or same-origin empty string)
   const doFetch = async (tryBase) => {
     const url = tryBase + path
+    // 合并请求头：默认 JSON 头在前，opts.headers 同名可覆盖默认值
     const headers = { 'Content-Type': 'application/json', ...opts.headers }
+    // 鉴权：本地持有 token 则自动附加 Authorization: Bearer 头
     const token = getToken()
     if (token) headers['Authorization'] = 'Bearer ' + token
     return fetch(url, {
@@ -362,6 +518,7 @@ export async function request(path, opts = {}) {
     } catch (_) {}
     throw new Error(msg)
   }
+  // 成功响应：解析 JSON 返回给调用方（后端接口约定均为 JSON 体）
   return res.json()
 }
 
@@ -676,6 +833,9 @@ export async function fetchPaperEquity() {
   return request('/api/paper/equity')
 }
 
+/** 模拟盘：自检诊断（持仓/成交/订单/净值是否为空 + paper.json 文件状态）
+ *  对应 GET /api/paper/selfcheck，用于排查模拟盘"数据为空"的成因
+ */
 /** Paper trading: self-check diagnostics (positions/trades/orders/equity emptiness + paper.json file state).
  * 对应 GET /api/paper/selfcheck */
 export async function fetchPaperSelfCheck() {
@@ -689,15 +849,33 @@ export async function fetchPaperStrategies() {
 }
 
 /** §SIGNAL_CONTROLLER 保存模拟盘战法白名单/黑名单：POST /api/paper/strategies
- * 空 strategies = 默认全集（内置四形态+库规则；动量需显式开启） */
+ * 空 strategies = 默认全集（内置四形态+已启用库规则；动量需显式开启） */
 export async function updatePaperStrategies(strategies, blacklist) {
   return request('/api/paper/strategies', { method: 'POST', data: { strategies, blacklist } })
+}
+
+/** §F-4（20260917 缺陷修复批）模拟盘撮合配置（总开关/自动卖出/单笔资金/做空预算等，改后即热生效）
+ * 对应 GET /api/paper/config：{enabled, auto_sell, fixed_amount, max_positions, initial_capital,
+ *  short_enabled, short_capital, engine_enabled, engine_auto_sell} */
+export async function fetchPaperConfig() {
+  return request('/api/paper/config')
+}
+
+/** §F-4 局部更新撮合配置：POST /api/paper/config（只传要改的字段，未传字段保持原值） */
+export async function updatePaperConfig(cfg) {
+  return request('/api/paper/config', { method: 'POST', data: cfg })
 }
 
 /** §SIGNAL_CONTROLLER 信号控制器裁定留痕：GET /api/signalctl/verdicts?limit=N
  * 返回 { verdicts:[{channel,verdict,stage,code,strategy,reason,shadow,at}], count } */
 export async function fetchSignalVerdicts(limit) {
   return request('/api/signalctl/verdicts?limit=' + (limit || 50))
+}
+
+/** §F-5（20260917 缺陷修复批）风控闸口状态：GET /api/risk/gates?day=YYYY-MM-DD（admin）。
+ * 返回 { day, gates:[{user_id,gate,hits,last_reason,updated_at}], switches:{...}, time } */
+export async function fetchRiskGates(day) {
+  return request('/api/risk/gates' + (day ? '?day=' + encodeURIComponent(day) : ''))
 }
 
 /** 模拟盘：手动买入（信号页"模拟买入"按钮触发）。qty>0 时按用户输入价格/手数成交（静态记账），
@@ -998,12 +1176,12 @@ export async function removeWatchlist(code) {
 
 /** 对某信号执行买入 / 忽略操作 */
 /** Perform a buy / ignore action on a signal */
-// 对应 POST /api/action，请求体 { code, action }；
-// Maps to POST /api/action; the body is { code, action };
-// action 取 'buy'（买入）或 'ignore'（忽略）
-// action is 'buy' or 'ignore'
-export async function actionSignal(code, action) {
-  return request('/api/action', { method: 'POST', data: { code, action } })
+// 对应 POST /api/action，请求体 { code, action, strategy }；
+// Maps to POST /api/action; the body is { code, action, strategy };
+// action 取 'buy'（买入）或 'ignore'（忽略，§F-1：带战法定位墓碑，绝不触达实盘下单通道）
+// action is 'buy' or 'ignore' (§F-1: ignore carries the strategy key for tombstoning and can never place orders)
+export async function actionSignal(code, action, strategy) {
+  return request('/api/action', { method: 'POST', data: { code, action, strategy: strategy || '' } })
 }
 
 // ── 市场时段追踪（非交易时段仅首次加载） ──
@@ -1605,27 +1783,32 @@ export async function cleanupAdminUsers(dryRun = false) {
   return request('/api/admin/users/cleanup', { method: 'POST', data: { dry_run: !!dryRun } })
 }
 
-/** §MT 租户列表（GET /api/tenants，仅平台运营者） */
+/** §MT 获取租户列表（GET /api/tenants，仅平台运营者角色可访问）
+ *  返回全部租户及其配额/启用状态 */
 export async function fetchTenants() {
   return request('/api/tenants')
 }
 
-/** §MT 创建租户（POST /api/tenants，可选随建租户管理员） */
+/** §MT 创建租户（POST /api/tenants，可选随建租户管理员）
+ *  data 为 { name, ... } 及可选的管理员账号信息，返回新租户对象 */
 export async function createTenant(data) {
   return request('/api/tenants', { method: 'POST', data })
 }
 
-/** §MT 更新租户（PUT /api/tenants/{id}：name/enabled/quota 局部更新） */
+/** §MT 更新租户（PUT /api/tenants/{id}：name/enabled/quota 局部更新）
+ *  仅传需要修改的字段，未传字段保持原值 */
 export async function updateTenant(id, data) {
   return request('/api/tenants/' + encodeURIComponent(id), { method: 'PUT', data })
 }
 
-/** §MT 本租户配额与用量（GET /api/tenant/usage） */
+/** §MT 本租户配额与用量（GET /api/tenant/usage）
+ *  返回当前登录账号所属租户的配额上限与实际使用量 */
 export async function fetchTenantUsage() {
   return request('/api/tenant/usage')
 }
 
-/** §MT 迁移用户到指定租户（PUT /api/admin/users/{id}/tenant，仅平台运营者） */
+/** §MT 迁移用户到指定租户（PUT /api/admin/users/{id}/tenant，仅平台运营者）
+ *  tenantId 为目标租户 ID，请求体 { tenant_id } */
 export async function moveUserTenant(id, tenantId) {
   return request('/api/admin/users/' + encodeURIComponent(id) + '/tenant', { method: 'PUT', data: { tenant_id: tenantId } })
 }

@@ -27,7 +27,10 @@ func (f *fakeReviewRegistry) AllControllers() []EngineController           { ret
 func (f *fakeReviewRegistry) PaperForUser(string) *paper.Engine            { return nil }
 func (f *fakeReviewRegistry) Len() int                                     { return 0 }
 func (f *fakeReviewRegistry) SetPaperPools([]string)                       {}
-func (f *fakeReviewRegistry) SetPaperLabelResolver(func(string) string)    {}
+
+// SetPaperConfig §F-4：本测试桩不消费热同步（端点热更行为由 F-4 专项测试覆盖）。
+func (f *fakeReviewRegistry) SetPaperConfig(paper.Config)               {}
+func (f *fakeReviewRegistry) SetPaperLabelResolver(func(string) string) {}
 func (f *fakeReviewRegistry) TriggerPositionReview(uid string) (int, error) {
 	f.gotUser = uid
 	return f.reviewN, f.reviewErr
@@ -38,6 +41,7 @@ func TestTriggerPositionReviewHandler(t *testing.T) {
 	s, admin := newAdminTestServer(t)
 
 	// 1) 注册表未注入 → 503（服务尚未就绪的降级保护）
+	// 为什么这样构造：真实引擎/LLM 依赖极重，用 nil registry 复现服务刚启动、注册表尚未装配的窗口期。
 	req := adminReq(s, admin, "POST", "/api/review/positions", "")
 	rr := adminDo(s, req)
 	if rr.Code != 503 {
@@ -45,6 +49,8 @@ func TestTriggerPositionReviewHandler(t *testing.T) {
 	}
 
 	// 2) 正常复盘 3 只 → 200 {"reviewed":3}，且 userID 来自认证上下文
+	// Arrange 2：注入成功桩（reviewN=3），断言点除了计数还有"handler 把认证出的 admin.ID 传给引擎"——
+	// 传错账号会导致复盘别人的持仓。
 	fake := &fakeReviewRegistry{reviewN: 3}
 	s.SetEngineRegistry(fake)
 	req = adminReq(s, admin, "POST", "/api/review/positions", "")
@@ -64,6 +70,7 @@ func TestTriggerPositionReviewHandler(t *testing.T) {
 	}
 
 	// 3) 引擎返回错误 → 502 + 错误文案（前端按钮据此弹"复盘失败"）
+	// Arrange 3：换上失败桩（stubErr 文案固定，便于断言透传而非端点自造错误信息）。
 	s.SetEngineRegistry(&fakeReviewRegistry{reviewErr: &stubErr{}})
 	req = adminReq(s, admin, "POST", "/api/review/positions", "")
 	rr = adminDo(s, req)

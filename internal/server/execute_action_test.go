@@ -73,6 +73,10 @@ type fakeCtrl struct {
 
 func (f fakeCtrl) QMTController() *trading.Controller { return f.qmt }
 
+// IgnoreSignal §F-1：/api/action 的 ignore 分支会触达该桩——返回 0（无可墓碑信号）；
+// 断言重点是"绝不触达 QMT 柜台"（exec.calls 保持 0），墓碑真实行为由 engine 层测试覆盖。
+func (f fakeCtrl) IgnoreSignal(string, string) int { return 0 }
+
 // newExecuteTestServer 装配带实盘控制器的测试服务：真实 trading.Controller + 计数执行器 + 新浪行情桩。
 func newExecuteTestServer(t *testing.T) (*Server, *auth.User, *execCountStub) {
 	t.Helper()
@@ -94,17 +98,20 @@ func newExecuteTestServer(t *testing.T) (*Server, *auth.User, *execCountStub) {
 
 // TestExecuteDeviationGate 委托价偏离现价 ±15% 未确认 → 400；显式 confirm_deviation → 放行。
 func TestExecuteDeviationGate(t *testing.T) {
+	// Arrange：全开链路 + 新浪行情桩（现价 10.00，±15% 偏离闸以此为基准）
 	s, admin, exec := newExecuteTestServer(t)
-	// 现价 10.00，委托价 12 → 偏离 +20% 超 ±15%，未确认应拒
+	// Act：现价 10.00，委托价 12 → 偏离 +20% 超 ±15%，未确认应拒
+	// 为什么这样构造：+20% 恰好越过闸门并远离现价，能固定复现"委托价偏离现价"路径。
 	req := adminReq(s, admin, "POST", "/api/positions/execute",
 		`{"code":"600000.SH","side":"买入","qty":100,"price":12,"client_id":"dev-test-1"}`)
 	if rr := adminDo(s, req); rr.Code != 400 || !strings.Contains(rr.Body.String(), "偏离") {
 		t.Fatalf("偏离未确认应 400+偏离文案, got %d body=%s", rr.Code, rr.Body.String())
 	}
+	// Assert：拒单绝不能触达柜台（曾出现闸门放行后才拒、造成幽灵委托的缺陷形态）
 	if exec.calls != 0 {
 		t.Fatalf("拒单不应触达柜台, calls=%d", exec.calls)
 	}
-	// 显式确认后放行
+	// Act：显式 confirm_deviation=true → 用户已知偏离，闸门放行
 	req = adminReq(s, admin, "POST", "/api/positions/execute",
 		`{"code":"600000.SH","side":"买入","qty":100,"price":12,"client_id":"dev-test-1","confirm_deviation":true}`)
 	if rr := adminDo(s, req); rr.Code != 200 {
@@ -116,10 +123,13 @@ func TestExecuteDeviationGate(t *testing.T) {
 // 第二次命中 signal_id 唯一键返回 duplicate（OK:false，柜台词绝不再触）——前端会收到明确提示
 // 而非第二笔真实委托，符合 §P1-7"一次确认最多一笔单"的幂等目标。
 func TestExecuteClientIDIdempotent(t *testing.T) {
+	// Arrange：全开链路；委托价 10 与桩现价 10.00 一致（只走幂等路径，不触发偏离闸）
 	s, admin, exec := newExecuteTestServer(t)
+	// Act ①：首次提交，构造同一请求体供两次复用（同 client_id=idem-abc）
 	body := `{"code":"600000.SH","side":"买入","qty":100,"price":10,"client_id":"idem-abc"}`
 	req := adminReq(s, admin, "POST", "/api/positions/execute", body)
 	rr := adminDo(s, req)
+	// Assert ①：首次 200 + ok=true + order_id 回执
 	if rr.Code != 200 {
 		t.Fatalf("首次提交应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
@@ -131,8 +141,11 @@ func TestExecuteClientIDIdempotent(t *testing.T) {
 		t.Fatalf("首次应受理成功: %v", res)
 	}
 	// 第二次同键提交：命中幂等键，不再触达柜台，返回 duplicate 提示
+	// Act ②：完全相同的请求再提交一次（模拟前端双击/网络层重试）
 	req = adminReq(s, admin, "POST", "/api/positions/execute", body)
 	rr = adminDo(s, req)
+	// Assert ②：HTTP 仍是 200（幂等命中不算错误），但 ok=false + err 含 duplicate，
+	// 且 exec.calls 保持 1——一次确认最多产生一笔真实委托（P1-7 契约）。
 	if rr.Code != 200 {
 		t.Fatalf("重复提交应 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
@@ -147,7 +160,10 @@ func TestExecuteClientIDIdempotent(t *testing.T) {
 
 // TestExecuteDirtyClientIDFallsBack 非法 client_id（超长/特殊字符）不拒单、不 panic，回退旧键。
 func TestExecuteDirtyClientIDFallsBack(t *testing.T) {
+	// Arrange：全开链路；样本覆盖"超长（80 字符，超 immortal 键长度约束）"与"含空格/特殊字符"两类脏输入
 	s, admin, _ := newExecuteTestServer(t)
+	// Act + Assert：非法 client_id 不拒单、不 panic——handler 回退到旧的"时间戳幂等键"路径放行 200。
+	// 回退而非拒绝的理由：幂等键是防重的增强手段，脏输入不应让用户的真实下单意图丢失。
 	for _, bad := range []string{strings.Repeat("x", 80), "bad id!@#"} {
 		req := adminReq(s, admin, "POST", "/api/positions/execute",
 			fmt.Sprintf(`{"code":"600000.SH","side":"买入","qty":100,"price":10,"client_id":%q}`, bad))

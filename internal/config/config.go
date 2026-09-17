@@ -8,6 +8,20 @@
 //   - 运行时内存治理/数据源/调度器/通知推送等
 //
 // 顶层 Rules 结构体聚合所有配置，Manager 负责加载/保存/按账号隔离。
+//
+// 本包职责概览：
+//   - 配置加载：Load 从 JSON 文件读取 rules/d1 两段（文件缺失/损坏时保留内存现状）。
+//   - 配置保存：Save 以原子写（fsync+唯一临时名）落盘，quant 与 researchd 双进程共享同一文件。
+//   - 配置热更新：Watch 轮询文件内容变化（sha256 比对，默认 30s）自动重载，免重启生效。
+//   - 多账号隔离：Manager 借助 KVStore（auth.Manager 实现）为每个账号保存独立的 Rules 快照，
+//     读走 userRules（账号覆盖→系统级""键兼容回退→全局副本），写走各 SetXxxConfigFor 落库。
+//   - 运营数据归属：SetOperatorID 注入管理员 ID，运营配置（策略/LLM/D1/模拟盘等）系统级
+//     共享归属管理员；逐账号独享配置（QMT 实盘）走 GetQMTConfigFor/SetQMTConfigFor 按 ID 隔离。
+//   - 模拟盘配置更新：SetPaperStrategyFor 只改战法白名单+个股黑名单（§SIGNAL_CONTROLLER），
+//     SetPaperConfigFor（§F-4 20260917 缺陷修复批）按回调局部更新其余 paper 字段
+//     （总开关/自动卖出/资金规模/做空侧等），两者语义分离、互不踩踏。
+//   - 出厂默认：DefaultRules/DefaultSchedulerConfig/DefaultQMTConfig/DefaultDisciplineConfig
+//     提供零配置可运行的合理默认值；LoadSchedulerConfig 供独立研究服务按键增量解析。
 package config
 
 import (
@@ -903,8 +917,8 @@ type EmotionConfig struct {
 	// thresholds only apply when >0 (0/unset = no correction, preserving existing behavior), and the
 	// correction abstains when up/down counts are missing. down/(up+down) ≥ Ice → force "ice";
 	// ≥ Retreat → demote to at least "retreat".
-	EmoBreadthIceDownRatio     float64 `json:"emo_breadth_ice_down_ratio"`
-	EmoBreadthRetreatDownRatio float64 `json:"emo_breadth_retreat_down_ratio"`
+	EmoBreadthIceDownRatio     float64 `json:"emo_breadth_ice_down_ratio"`     // 下跌占比达到此值强制判定"冰点"（0/未配置=不启用）
+	EmoBreadthRetreatDownRatio float64 `json:"emo_breadth_retreat_down_ratio"` // 下跌占比达到此值降级至少为"退潮"（0/未配置=不启用）
 	// BlockBuyPhases 禁止开仓的情绪周期阶段列表（C5）：这些阶段下四战法均不发买入信号
 	// （降级为 watch 观察）。空列表时默认仅 ["衰退"]（与 N 形既有情绪硬闸一致）。
 	// English: emotion phases in which buying is forbidden (C5) — all four strategies downgrade buy
@@ -1461,7 +1475,9 @@ func normalizeD1(d *D1Config) {
 // （KVStore abstracts per-user key-value persistence, implemented by auth.Manager so that
 // config.Manager can keep an independent Rules/D1 snapshot per account.）
 type KVStore interface {
+	// SetConfig 写入某账号指定 key 的配置值。
 	SetConfig(userID, key, value string) error
+	// GetConfig 读取某账号指定 key 的配置值（不存在时 ok=false）。
 	GetConfig(userID, key string) (string, bool)
 }
 
@@ -1746,6 +1762,25 @@ func (m *Manager) SetPaperStrategyFor(userID string, strategies, blacklist []str
 	m.saveUserRules(userID, r)
 }
 
+// SetPaperConfigFor §F-4（20260917 缺陷修复批）：按回调局部更新指定账号的 rules.paper
+// （总开关/自动卖出/单笔资金/初始资金/做空侧参数等），战法白名单与黑名单不经此路径
+// （走 SetPaperStrategyFor，语义已独立）。store 缺席时落全局快照（测试/单文件部署）。
+// English: §F-4 — mutator-style partial update of an account's rules.paper (master switch,
+// auto-sell, sizing, short-side params); strategies/blacklist keep their dedicated setter.
+func (m *Manager) SetPaperConfigFor(userID string, mutate func(*PaperConfig)) {
+	if mutate == nil {
+		return
+	}
+	if m.store == nil || userID == "" {
+		mutate(&m.Rules.Paper)
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	mutate(&r.Paper)
+	m.saveUserRules(userID, r)
+}
+
 // GetD1ConfigFor 返回运营数据归属账号（管理员）的 D1 事件匹配规则（运营配置系统级共享）。
 func (m *Manager) GetD1ConfigFor(userID string) *D1Config {
 	oid := m.ownerOf(userID)
@@ -1894,12 +1929,15 @@ func (m *Manager) SetLLMConfig(cfg *LLMConfig) {
 }
 
 // Load 从配置文件读取并解析 JSON，更新 Rules 和 D1 配置。
+// 文件缺失/不可读时静默保留内存现状（首次启动即用 DefaultRules）；
+// 解析失败仅记日志不清空已有配置；未出现的段不覆盖。
 // （Load reads and parses the JSON config file, updating the Rules and D1 config.）
 func (m *Manager) Load() {
 	data, err := os.ReadFile(m.path)
 	if err != nil {
-		return
+		return // 文件不存在/不可读：保留内存中的当前配置（首次启动即用出厂默认）
 	}
+	// wrapper 外层包装：JSON 根对象按 {"rules":..., "d1":...} 两段解析，未出现的段保留原值。
 	var wrapper struct {
 		Rules *Rules    `json:"rules"`
 		D1    *D1Config `json:"d1"`
@@ -1920,8 +1958,8 @@ func (m *Manager) Load() {
 // Save 将当前配置序列化为 JSON 并写入文件。// （Save serializes the current config to JSON and writes it to the file.）
 func (m *Manager) Save() {
 	wrapper := struct {
-		Rules *Rules    `json:"rules"`
-		D1    *D1Config `json:"d1"`
+		Rules *Rules    `json:"rules"` // 全局规则配置段
+		D1    *D1Config `json:"d1"`    // D1 事件匹配规则段
 	}{
 		Rules: m.Rules,
 		D1:    m.D1,
@@ -1996,14 +2034,15 @@ func LoadSchedulerConfig(path string) SchedulerConfig {
 		log.Printf("[scheduler] 读取配置 %s 失败(用默认): %v", path, err)
 		return def
 	}
+	// wrapper 解析根对象：rules.scheduler 段留作原始 JSON 逐键覆盖，rules.data 段做数据源路由。
 	var wrapper struct {
 		Rules struct {
-			Scheduler json.RawMessage `json:"scheduler"`
+			Scheduler json.RawMessage `json:"scheduler"` // scheduler 段原文（延迟解析，保缺省字段不覆盖默认）
 			Data      struct {
-				PrimarySource   string  `json:"primary_source"`
-				ThsFactorsReady bool    `json:"ths_factors_ready"`
-				OptimizeEnabled *bool   `json:"optimize_enabled"`
-				HithinkQPS      float64 `json:"hithink_qps"`
+				PrimarySource   string  `json:"primary_source"`    // 研究取数主源：hithink | baostock
+				ThsFactorsReady bool    `json:"ths_factors_ready"` // 复权因子对账门禁
+				OptimizeEnabled *bool   `json:"optimize_enabled"`  // 夜间自动寻优开关（nil=未配置，不覆盖默认）
+				HithinkQPS      float64 `json:"hithink_qps"`       // 同花顺源限流阈值（本段未消费，仅解析透传）
 			} `json:"data"`
 		} `json:"rules"`
 	}

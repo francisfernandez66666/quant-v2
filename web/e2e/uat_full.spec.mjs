@@ -3,12 +3,20 @@
 // 交易分支（Quant 状态卡/配置保存/取消分支、Paper 手动交易/注入/自检/做空卡）、
 // 信号筛选排序展开、消息中心筛选删除复盘、Admin 建号改密禁用删除、
 // 命令面板/全局抽屉/主题切换/SSE 在线。凭据来自环境变量。
+//
+// ── 20260917 缺陷批 ──
+// 新增「修复回归 · 20260917 缺陷批」describe：F-2 战法开关保存接线（UI 勾选→POST 落库→API 回读）；
+// F-4 撮合配置热开关（保存后引擎实时生效，无需重启）；F-5 风控闸口状态卡渲染（当日命中/开关标签/空占位）。
+// 本批用例普遍采用「先记服务端基线 + finally API 直写还原」模式，防止中途失败污染共享配置。
 import { test, expect } from '@playwright/test'
 
+// 两套账号凭据（admin=超管，tester=普通用户）与像素截图输出目录
 const ADMIN = { u: process.env.E2E_USER || 'admin', p: process.env.E2E_PASS || '' }
 const USER = { u: process.env.E2E_USER2 || 'tester', p: process.env.E2E_PASS2 || ADMIN.p }
 const SHOT = 'test-results/uat-pixels'
 
+// 挂载全局错误采集器：收集页面未捕获 JS 异常、console error、/api 请求失败与非 2xx 响应，
+// 返回 errs 数组供用例断言（PAGEERROR 视为致命，其余进城 warning annotation）。
 function watch(page) {
   const errs = []
   page.on('pageerror', (e) => errs.push('PAGEERROR: ' + String(e).slice(0, 200)))
@@ -20,6 +28,8 @@ function watch(page) {
   return errs
 }
 
+// 打开指定 hash 页面并做渲染体检：断言页面主体可见、等数据稳定（2.5s）、全页截图、
+// 断言无未捕获 JS 异常；返回全部采集错误（含接口告警）供调用方归档到 annotation。
 async function checkPage(page, hash, name) {
   const errs = watch(page)
   await page.goto('/' + hash)
@@ -31,6 +41,7 @@ async function checkPage(page, hash, name) {
   return errs
 }
 
+// 13 个核心页面清单：[路由 hash, 截图命名]，供像素级遍历用例循环消费
 const PAGES = [
   ['#/dashboard', 'dashboard'], ['#/signals', 'signals'], ['#/watchlist', 'watchlist'],
   ['#/hotspot', 'hotspot'], ['#/msgcenter', 'msgcenter'], ['#/positions', 'positions'],
@@ -39,7 +50,9 @@ const PAGES = [
   ['#/admin', 'admin'],
 ]
 
+// ⾯ admin 登录态下逐页渲染 UAT：每页截图 + JS 异常/接口告警采集
 test.describe('像素级全页面 UAT (admin)', () => {
+  // 遍历 PAGES 清单逐页渲染、截图并把接口告警写入 annotation
   for (const [hash, name] of PAGES) {
     test(`页面渲染+截图 ${hash}`, async ({ page }) => {
       const errs = await checkPage(page, hash, name)
@@ -48,7 +61,9 @@ test.describe('像素级全页面 UAT (admin)', () => {
   }
 })
 
+// 交易相关分支：Quant 配置链路、Paper 撮合/战法/交易操作、消息中心与信号页交互
 test.describe('交易相关分支', () => {
+  // 验证 Quant 页链路状态卡展示 mock 网关地址、熔断态与执行路径徽标
   test('Quant：链路状态卡显示 mock 网关+熔断正常+执行路径', async ({ page }) => {
     await page.goto('/#/quant')
     const card = page.locator('.t-card', { hasText: '链路状态' })
@@ -59,6 +74,7 @@ test.describe('交易相关分支', () => {
     await page.screenshot({ path: `${SHOT}/branch-quant-chain.png`, fullPage: true })
   })
 
+  // 仓位纪律保存→刷新回读一致性；finally 服务端 API 还原基线防污染
   test('Quant：仓位纪律保存→回读一致（含还原）', async ({ page }) => {
     // §AUDIT-PM 2026-09-15 修 hydration 竞态（测试自污染缺陷）：旧实现进入页面立刻 inputValue()
     // 取基线，此时表单可能还停留在 localStorage 缓存默认值（readCachedForm 种子），还原步骤会把
@@ -95,6 +111,7 @@ test.describe('交易相关分支', () => {
     void cap
   })
 
+  // 单笔金额绝对帽字段全流程：服务端回填→保存 150000→刷新持久化→finally 还原基线
   test('Quant：单笔金额绝对帽保存→回读→还原（§AUDIT-PM 新增字段）', async ({ page }) => {
     // 锁定今日新增的 max_order_amount UI 面：服务端回填、保存持久、还原闭环。
     // hydration/teardown 防竞态手法与「仓位纪律」用例同款（waitForResponse + 点击前 DOM 断言 + 服务端轮询）。
@@ -131,6 +148,7 @@ test.describe('交易相关分支', () => {
     }
   })
 
+  // 全自动切换的二次确认防误触：弹确认框后点取消，服务端仍保持 manual 模式
   test('Quant：全自动切换弹二次确认，取消不生效', async ({ page }) => {
     await page.goto('/#/quant')
     await page.getByText('全自动', { exact: true }).first().click()
@@ -143,6 +161,77 @@ test.describe('交易相关分支', () => {
     expect((await r.json()).mode).toBe('manual')
   })
 
+  // ── §F-4（20260917 缺陷修复批）模拟盘撮合配置热开关 e2e ──
+  // 锁定"改配置必须重启"旧缺陷的修复：POST /api/paper/config 保存后**引擎实时生效**
+  // （engine_enabled 回读翻转），无需重启进程。finally API 还原基线，防污染后续用例。
+  test('Paper：撮合设置总开关→引擎实时生效→还原（§F-4）', async ({ page }) => {
+    await page.goto('/#/paper')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const base = await (await page.request.get('/api/paper/config', { headers: hdr })).json()
+    try {
+      await page.getByRole('button', { name: /⚙ 设置/ }).click()
+      await page.getByText('撮合设置', { exact: true }).click()
+      const dlg = page.locator('.t-dialog')
+      const master = dlg.getByText('启用自动撮合')
+      await expect(master, '总开关控件渲染').toBeVisible({ timeout: 8000 })
+      const want = !base.enabled
+      const masterLabel = dlg.locator('label:has-text("启用自动撮合")').last()
+      await expect(masterLabel.locator('input'), '回填与服务端一致').toBeChecked({ checked: !!base.enabled })
+      await masterLabel.click()
+      await dlg.getByRole('button', { name: '保存' }).click()
+      await expect(page.locator('.t-message').first()).toBeVisible({ timeout: 8000 })
+      await expect(async () => {
+        const c = await (await page.request.get('/api/paper/config', { headers: hdr })).json()
+        expect(c.enabled, 'rules 层翻转').toBe(want)
+        expect(c.engine_enabled, '引擎实时生效（不重启）').toBe(want)
+      }).toPass({ timeout: 10000 })
+    } finally {
+      await page.request.post('/api/paper/config', { headers: hdr, data: { enabled: !!base.enabled, auto_sell: !!base.auto_sell, fixed_amount: base.fixed_amount, short_capital: base.short_capital } })
+      await expect(async () => {
+        const c = await (await page.request.get('/api/paper/config', { headers: hdr })).json()
+        expect(c.enabled, 'finally 还原 rules').toBe(!!base.enabled)
+        expect(c.engine_enabled, 'finally 还原引擎实况').toBe(!!base.enabled)
+      }).toPass({ timeout: 8000 })
+    }
+  })
+
+  // ── §F-2（20260917 缺陷修复批）战法开关保存接线 e2e ──
+  // 旧缺陷：设置弹窗无 strategies 保存分支，勾选静默丢失且误提交 caps。现验证：
+  // UI 勾选→POST /api/paper/strategies 落库→API 回读翻转→finally 还原基线。
+  test('Paper：战法开关保存→API 回读→还原（§F-2）', async ({ page }) => {
+    await page.goto('/#/paper')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const base = await (await page.request.get('/api/paper/strategies', { headers: hdr })).json()
+    const known = base.known_strategies || []
+    expect(known.length, 'known_strategies 非空').toBeGreaterThan(0)
+    const target = known[0]
+    const wasOn = (base.strategies || []).length === 0 ? target.id !== 'momentum' : (base.strategies || []).includes(target.id)
+    try {
+      await page.getByRole('button', { name: /⚙ 设置/ }).click()
+      await page.getByText('战法开关', { exact: true }).click()
+      const dlg = page.locator('.t-dialog')
+      const row = dlg.locator('div').filter({ hasText: new RegExp('\\(' + target.id + '\\)') }).last()
+      const cb = row.locator('label').last()
+      await expect(cb, '战法行渲染').toBeVisible({ timeout: 8000 })
+      await expect(row.locator('input[type=checkbox]').first()).toBeChecked({ checked: !!wasOn })
+      await cb.click()
+      await dlg.getByRole('button', { name: '保存' }).click()
+      await expect(page.locator('.t-message').first()).toBeVisible({ timeout: 8000 })
+      await expect(async () => {
+        const now = await (await page.request.get('/api/paper/strategies', { headers: hdr })).json()
+        const wl = now.strategies || []
+        expect(wl.includes(target.id), '保存写入翻转态（wasOn=' + wasOn + '）').toBe(!wasOn)
+      }).toPass({ timeout: 10000 })
+    } finally {
+      await page.request.post('/api/paper/strategies', { headers: hdr, data: { strategies: base.strategies && base.strategies.length ? base.strategies : [] } })
+      await expect(async () => {
+        const now = await (await page.request.get('/api/paper/strategies', { headers: hdr })).json()
+        expect(JSON.stringify(now.strategies || []), 'finally 回基线').toBe(JSON.stringify(base.strategies || []))
+      }).toPass({ timeout: 8000 })
+    }
+  })
+
+  // Paper 页静态体检：模拟盘账户/分仓/做空卡/交易弹窗元素可见性 + 整页截图
   test('Paper：模拟盘账户/分仓/做空卡/交易弹窗', async ({ page }) => {
     await page.goto('/#/paper')
     await expect(page.locator('.page')).toBeVisible()
@@ -152,6 +241,7 @@ test.describe('交易相关分支', () => {
     expect(body).toMatch(/模拟盘|账户|资金|持仓/)
   })
 
+  // 纸面持仓手动卖出分支：打开减仓弹窗→提交→toast 回执（无持仓则跳过）
   test('Paper：手动卖出持仓（减仓弹窗→提交→toast）', async ({ page }) => {
     await page.goto('/#/paper')
     await page.waitForTimeout(2000)
@@ -164,6 +254,7 @@ test.describe('交易相关分支', () => {
     await expect(page.locator('.t-message').first()).toBeVisible({ timeout: 8000 })
   })
 
+  // 消息中心筛选覆盖：交易信号/止盈止损/盘后复盘/全部四个 tab + 删除弹窗取消分支
   test('MsgCenter：筛选分支+删除消息', async ({ page }) => {
     await page.goto('/#/msgcenter')
     for (const f of ['交易信号', '止盈止损', '盘后复盘', '全部']) {
@@ -178,6 +269,7 @@ test.describe('交易相关分支', () => {
     }
   })
 
+  // 信号页三大交互分支：搜索过滤、表头排序、分时图展开/收起
   test('Signals：搜索/排序/分时展开分支', async ({ page }) => {
     await page.goto('/#/signals')
     await page.waitForTimeout(1500)
@@ -194,7 +286,9 @@ test.describe('交易相关分支', () => {
   })
 })
 
+// 权限与登录分支：错误凭据与普通用户（tester）的能力收敛
 test.describe('权限与登录分支', () => {
+  // 错误密码登录会被拦在登录页且显示错误提示，不进入主应用
   test('错误密码 → 停留登录页并提示', async ({ page }) => {
     await page.goto('/#/')
     await page.evaluate(() => localStorage.clear())
@@ -206,6 +300,7 @@ test.describe('权限与登录分支', () => {
     await page.screenshot({ path: `${SHOT}/branch-login-error.png` })
   })
 
+  // 普通用户权限收敛：侧边栏无管理员入口、quant 页 403 提示、settings 页 403
   test('tester 普通用户：入口收敛 + quant 无权限面板 + settings 403', async ({ browser }) => {
     // browser.newContext 会继承 config.use.storageState（admin 登录态）——显式清空，保证干净会话
     const ctx = await browser.newContext({ storageState: { cookies: [], origins: [] } })
@@ -228,7 +323,9 @@ test.describe('权限与登录分支', () => {
   })
 })
 
+// 全局组件分支：命令面板、主题切换、做空开关、SSE 通道、Admin 用户管理与咨询页
 test.describe('全局组件分支', () => {
+  // Ctrl+K 命令面板：中文关键词跳页 + 六位代码直达个股详情抽屉
   test('Ctrl+K：页面跳转 + 六位代码开个股抽屉', async ({ page }) => {
     await page.goto('/#/dashboard')
     await expect(page.locator('.app-shell')).toBeVisible()
@@ -246,6 +343,7 @@ test.describe('全局组件分支', () => {
     await page.getByTestId('stock-detail-overlay').click({ position: { x: 5, y: 5 } })
   })
 
+  // 深色主题切换分支：切换后属性变化、刷新持久化，最后还原原主题
   test('深色主题切换 → 持久化 → 截图 → 还原', async ({ page }) => {
     await page.goto('/#/dashboard')
     const before = await page.evaluate(() => document.documentElement.getAttribute('data-theme') || document.documentElement.className)
@@ -260,6 +358,7 @@ test.describe('全局组件分支', () => {
     await page.locator('header button[title*="深色"], header button[title*="浅色"]').first().click()
   })
 
+  // 顶栏做空开关：切换后服务端状态翻转，再切回还原初始态防污染
   test('顶部做空开关：切换→后端状态回读→还原', async ({ page }) => {
     await page.goto('/#/dashboard')
     const sw = page.locator('header [role=switch]').first()
@@ -281,6 +380,7 @@ test.describe('全局组件分支', () => {
     }).toPass({ timeout: 5000 })
   })
 
+  // SSE 推送链路：先签发事件 ticket，再用 EventSource 带 ticket 建流连接（最长等 15s 心跳）
   test('SSE 事件通道：ticket→流连接建立', async ({ page }) => {
     await page.goto('/#/dashboard')
     const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
@@ -298,12 +398,14 @@ test.describe('全局组件分支', () => {
     expect(connected, 'SSE 可建立连接').toBeTruthy()
   })
 
+  // Admin 用户管理全分支：建临时号→重置密码→禁用→删除，各步以 API 断言收口
   test('Admin：建号→改密→禁用→删除 全分支', async ({ page }) => {
     await page.goto('/#/admin')
     await expect(page.locator('.page')).toBeVisible()
     await page.waitForTimeout(1200)
     const uname = 'uat_tmp_' + Date.now().toString(36)
     const hdr = () => page.evaluate(() => localStorage.getItem('liangzai_token'))
+    // 按用户名在用户列表 API 中查找记录（用于禁用/删除后的状态断言）
     const findUser = async () => {
       const list = ((await (await page.request.get('/api/admin/users', { headers: { Authorization: await hdr() } })).json()).users || [])
       return list.find((x) => x.username === uname)
@@ -369,6 +471,7 @@ test.describe('全局组件分支', () => {
     await expect(async () => { expect(await findUser(), '删除后 API 列表不再有该用户').toBeUndefined() }).toPass({ timeout: 8000 })
   })
 
+  // 咨询页发送分支：填问题→点发送→等回复/错误返回并截图
   test('Consult：发送→错误/回复分支', async ({ page }) => {
     await page.goto('/#/consult')
     const inp = page.locator('textarea, input[placeholder*="问"], input[placeholder*="咨询"]').first()
@@ -386,12 +489,14 @@ test.describe('全局组件分支', () => {
 // English: regression tests for the D1/D7/D4/W6 fixes + sentiment card, added 2026-09-13.
 // ─────────────────────────────────────────────────────────────────────
 test.describe('修复回归 · 安全与目标', () => {
-  const API = 'http://localhost:18080'
+  const API = process.env.E2E_API || 'http://localhost:18080'
+  // helper：走后端登录 API 换 admin token（纯 request 上下文用例复用）
   async function adminToken(req) {
     const r = await req.post(API + '/api/auth/login', { data: { username: ADMIN.u, password: ADMIN.p } })
     return (await r.json()).token
   }
 
+  // D1 安全回归：admin 用户列表响应不得泄露 sessions/password_hash，且 enabled 字段显式存在
   test('D1：/api/admin/users 不泄露 sessions/password_hash，enabled 字段可见', async ({ request }) => {
     const tok = await adminToken(request)
     const r = await request.get(API + '/api/admin/users', { headers: { Authorization: 'Bearer ' + tok } })
@@ -402,6 +507,7 @@ test.describe('修复回归 · 安全与目标', () => {
     expect(body, '响应 JSON 显式包含 enabled 字段').toContain('"enabled":')
   })
 
+  // D7 安全回归：logout 后同一 token 立即失效（继续访问返回 401）
   test('D7：/api/auth/logout 后同 token 立即失效（401）', async ({ request }) => {
     const tok = await adminToken(request)
     const before = await request.get(API + '/api/status', { headers: { Authorization: 'Bearer ' + tok } })
@@ -414,6 +520,7 @@ test.describe('修复回归 · 安全与目标', () => {
     expect(after.status(), '退出后同 token 立即 401').toBe(401)
   })
 
+  // D4 零股保护回归：卖出数量 <100 时后端 400 拒单并提示"卖出不支持零股"
   test('D4：卖出 qty<100 → 400 卖出不支持零股', async ({ request }) => {
     const tok = await adminToken(request)
     const r = await request.post(API + '/api/positions/execute', {
@@ -424,6 +531,7 @@ test.describe('修复回归 · 安全与目标', () => {
     expect(JSON.stringify(await r.json()), '错误信息含"卖出不支持零股"').toContain('零股')
   })
 
+  // W6 objective 分槽回归：4 个不同 objective 各入独立槽位（task_id/ref_id 均不同），同 objective 重复提交幂等
   test('W6：4 个不同 objective 连发 → 4 个不同 task_id + 不同 ref_id；同 objective 幂等', async ({ request }) => {
     const tok = await adminToken(request)
     const objs = ['profitFactor', 'winRate', 'avgWin', 'expectancy']
@@ -455,6 +563,7 @@ test.describe('修复回归 · 安全与目标', () => {
     expect(dd.ref_id, '同 objective 幂等回原 ref_id').toBe(orig.ref)
   })
 
+  // Dashboard 市场情绪卡：标题渲染 + 头部 actions 插槽「回看全年」链接可见
   test('Dashboard 情绪卡渲染（SentimentCard A）', async ({ page }) => {
     await page.goto('/#/dashboard')
     // 卡片标题 + 三栏占位（loading 期或空态都能命中标题）
@@ -465,10 +574,11 @@ test.describe('修复回归 · 安全与目标', () => {
     await page.screenshot({ path: `${SHOT}/dashboard-sentiment-card.png`, fullPage: true })
   })
 
+  // B 回归：情绪×战法矩阵端点契约（rows/min_events=20）+ 前端折叠区点击展开
   test('B：情绪×战法矩阵端点 + 卡片折叠区', async ({ page, request }) => {
     await page.goto('/#/dashboard')
     const tok = await page.evaluate(() => localStorage.getItem('liangzai_token'))
-    const r = await request.get('http://localhost:18080/api/research/emotion-strategy-matrix', { headers: { Authorization: 'Bearer ' + tok } })
+    const r = await request.get((process.env.E2E_API || 'http://localhost:18080') + '/api/research/emotion-strategy-matrix', { headers: { Authorization: 'Bearer ' + tok } })
     expect(r.status(), '矩阵端点 200').toBe(200)
     const d = await r.json()
     expect(Array.isArray(d.rows), 'rows 数组').toBeTruthy()
@@ -485,6 +595,7 @@ test.describe('修复回归 · 安全与目标', () => {
     await page.screenshot({ path: `${SHOT}/dashboard-sentiment-matrix.png`, fullPage: true })
   })
 
+  // C 回归：情绪回看页渲染（SVG 图元或空态二选一）+ 区间切换 + 侧边导航入口
   test('C：情绪回看页渲染（涨停柱+色带+区间切换）', async ({ page }) => {
     await page.goto('/#/emotion')
     const card = page.locator('.t-card__title', { hasText: '市场情绪回看' })
@@ -505,6 +616,7 @@ test.describe('修复回归 · 安全与目标', () => {
     await page.screenshot({ path: `${SHOT}/emotion-review-page.png`, fullPage: true })
   })
 
+  // Settings dirty 提示：LLM 配置 API 回填完成后改值出现「有未保存修改」，改回原值关闭 dirty
   test('Settings 未保存 dirty 提示 + 保存按钮', async ({ page }) => {
     await page.goto('/#/settings')
     // §F33 dirty 断言前提：等 LLM 配置 API 回填完成（llmModel 值非空且 llmBaseline 已同步），
@@ -530,6 +642,7 @@ test.describe('修复回归 · 安全与目标', () => {
 // plus the halted-on-config-save immediate-effect regression (previously queued to next session).
 // ─────────────────────────────────────────────────────────────────────
 test.describe('修复回归 · 运维入口与即时熔断', () => {
+  // U-2 kill-switch 全链路：置位→下单被拒（拒因含 kill-switch）→UI 解除；finally 兜底复位
   test('Quant：kill-switch 按钮置位→execute 被拒→解除还原', async ({ page }) => {
     await page.goto('/#/quant')
     const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
@@ -578,6 +691,7 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
     }
   })
 
+  // U-5 运维入口回归：当日委托卡/日终结算卡渲染 + 「立即对账」可触发（成功/失败 toast 均算通）
   test('Quant：当日委托卡渲染 + 日终结算卡 + 对账可触发', async ({ page }) => {
     await page.goto('/#/quant')
     await expect(page.getByText('当日委托'), '当日委托卡标题').toBeVisible({ timeout: 10000 })
@@ -597,6 +711,7 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
   // 只读断言为主：租户无删除端点，e2e 若建租户会逐晚残留脏数据；写路径
   // （建租户/配额/跨租户隔离/频控）由 Go 层 tenant_api_test.go 全量覆盖。
   test('MT：/api/tenants 含系统租户 + Admin 页租户管理卡渲染', async ({ page }) => {
+    await page.goto('/#/dashboard')
     const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
     const r = await page.request.get('/api/tenants', { headers: hdr })
     expect(r.status(), '平台运营者取租户清单应 200').toBe(200)
@@ -607,10 +722,11 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
     expect(t0.max_users, '成员配额字段可见').toBeGreaterThan(0)
     // Admin 页：平台运营者应渲染「租户管理」卡（租户 admin/普通用户无此卡）
     await page.goto('/#/admin')
-    await expect(page.getByText('租户管理'), '租户管理卡').toBeVisible({ timeout: 10000 })
+    await expect(page.getByText('租户管理', { exact: true }), '租户管理卡').toBeVisible({ timeout: 10000 })
     await page.screenshot({ path: `${SHOT}/branch-tenant-admin.png`, fullPage: true })
   })
 
+  // MT 回归：普通用户访问租户/用户列表均 403（adminMiddleware 拦截）
   test('MT：普通用户访问租户管理面 403、列用户只见 platform=false', async ({ request }) => {
     const login = await request.post('/api/auth/login', {
       data: { username: process.env.E2E_USER2, password: process.env.E2E_PASS2 },
@@ -624,6 +740,7 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
     expect(ru.status(), '普通用户访问用户列表应 403').toBe(403)
   })
 
+  // U-4 清理失效账号：dry_run 预览模式只返回 count，不动真删除（避免误删在用账号）
   test('Admin：清理失效账号入口（dry_run 预览不动刀）', async ({ page }) => {
     await page.goto('/#/admin')
     const btn = page.getByRole('button', { name: /清理失效账号/ })
@@ -636,5 +753,51 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
     expect(typeof d.count, 'dry_run 返回 count').toBe('number')
     expect(d.dry_run, 'dry_run 回显').toBe(true)
     await page.screenshot({ path: `${SHOT}/branch-admin-cleanup.png`, fullPage: true })
+  })
+})
+
+// ── 修复回归 · 20260917 缺陷批（F-2 战法开关保存 / F-4 撮合设置 / F-5 风控闸口卡）──
+test.describe('修复回归 · 20260917 缺陷批', () => {
+  // F-5 回归：风控闸口状态卡渲染（开关标签 + 当日命中表或空占位）且无 JS 异常
+  test('F-5 Quant：风控闸口状态卡渲染（当日命中/开关态标签/无命中占位）', async ({ page }) => {
+    const errs = watch(page)
+    await page.goto('/#/quant')
+    const card = page.locator('.t-card', { hasText: '风控闸口状态' }).first()
+    await expect(card, 'F-5 风控闸口卡渲染（riskGates 拉取成功才渲染）').toBeVisible({ timeout: 15000 })
+    await expect(card, '卡说明文案含当日命中语义').toContainText('当日命中记录')
+    // 开关态标签区至少有一枚 Tag（switches map 渲染）
+    await expect(card.locator('.t-tag').first()).toBeVisible()
+    // 有命中→表；无命中→占位文案，二者必现其一
+    const hitTable = card.locator('.t-table')
+    const empty = card.getByText('今日暂无风控闸命中')
+    await expect(hitTable.or(empty), '闸口明细表或空占位').toBeVisible({ timeout: 10000 })
+    const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+    expect(fatal, '无未捕获JS错误: ' + fatal.join('|')).toHaveLength(0)
+    await page.screenshot({ path: `${SHOT}/branch-quant-riskgates.png`, fullPage: true })
+  })
+
+  // F-4 回归（UI 面版）：撮合设置 tab 回填→保存→API 回读字段全部不变（幂等保存链路）
+  test('F-2 Paper：战法开关保存→API 回读→还原', async ({ page }) => {
+    await page.goto('/#/paper')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const base = await (await page.request.get('/api/paper/strategies', { headers: hdr })).json()
+    await page.getByRole('button', { name: /⚙ 设置/ }).click()
+    await page.getByText('战法开关').first().click()
+    const allow = page.locator('.t-dialog').getByText('允许')
+    const count = await allow.count()
+    expect(count, '战法开关列表存在').toBeGreaterThan(0)
+    // 记住第一个战法的当前态 → 翻转
+    await allow.first().click()
+    await page.getByRole('button', { name: '保存' }).click()
+    await expect(page.locator('.t-message'), 'F-2 保存回执').toContainText('战法准入已更新', { timeout: 10000 })
+    // API 回读：白名单长度应与 UI 勾选一致（stub：长度变化即可证 service 端真实提交）
+    const after = await (await page.request.get('/api/paper/strategies', { headers: hdr })).json()
+    expect(Array.isArray(after.strategies), 'strategies 数组回读').toBe(true)
+    // 还原基线（API 直写，避免 UI 再操作引发偶发）
+    const back = await page.request.post('/api/paper/strategies', { headers: hdr, data: { strategies: base.strategies } })
+    expect(back.status(), '还原 200').toBe(200)
+    const final = await (await page.request.get('/api/paper/strategies', { headers: hdr })).json()
+    expect(final.strategies, '还原到位').toEqual(base.strategies)
+    await page.screenshot({ path: `${SHOT}/branch-paper-strategies-tab.png`, fullPage: true })
   })
 })

@@ -33,7 +33,9 @@ import (
 type Channel string
 
 const (
-	ChannelLive  Channel = "live"
+	// ChannelLive 实盘通道：裁定结果驱动真实下单执行器。
+	ChannelLive Channel = "live"
+	// ChannelPaper 模拟盘通道：裁定结果仅驱动纸面撮合，不影响实盘。
 	ChannelPaper Channel = "paper"
 )
 
@@ -42,8 +44,11 @@ const (
 type Verdict string
 
 const (
-	VerdictPass  Verdict = "pass"
-	VerdictHold  Verdict = "hold"
+	// VerdictPass 放行：交由该通道执行器继续处理。
+	VerdictPass Verdict = "pass"
+	// VerdictHold 暂缓：持续性探针在确认窗观测中，本轮不执行。
+	VerdictHold Verdict = "hold"
+	// VerdictBlock 拒绝：准入校验未通过，不进入任何执行流程。
 	VerdictBlock Verdict = "block"
 )
 
@@ -120,12 +125,15 @@ func New() *Controller {
 // English: canonical strategy key — StrategyType first (runner id / library rule id), then
 // StrategyID, then display-name normalization.
 func StrategyKeyOf(sig combat_agent.Signal) string {
+	// 优先取规范战法 ID（runner 规范 ID 或库规则 ID），与白名单/前端开关同键空间。
 	if sig.StrategyType != "" {
 		return sig.StrategyType
 	}
+	// 无规范 ID 时回退战法库规则 ID。
 	if sig.StrategyID != "" {
 		return sig.StrategyID
 	}
+	// 都没有时按显示名归一映射到内置键；无法映射则原样返回显示名。
 	switch combat_agent.NormalizeStrategyName(sig.Strategy) {
 	case "龙头":
 		return "dragon"
@@ -151,20 +159,25 @@ func StrategyKeyOf(sig combat_agent.Signal) string {
 // "all known built-ins on": the four form strategies plus library rules — momentum and unknown
 // keys are rejected.
 func AdmitStrategy(pol Policy, sig combat_agent.Signal) (bool, string) {
+	// 解析规范键；无法识别来源战法直接拒绝。
 	key := StrategyKeyOf(sig)
 	if key == "" {
 		return false, "无法识别信号来源战法"
 	}
+	// 分支一：白名单为空（前端"全部开启"存量语义）→ 只放行内置四形态与库规则聚合池；
+	// 动量与一切未知键必须显式列名，防止动量误交易（§20260917 根修语义）。
 	if len(pol.Strategies) == 0 {
 		switch key {
 		case "dragon", "double_bump", "n_shape", "dragon_return", "factor", "pattern":
 			return true, ""
 		}
+		// 库规则前缀（fac_1/pat_2…）视同已知放行。
 		if strings.HasPrefix(key, "fac_") || strings.HasPrefix(key, "pat_") {
 			return true, ""
 		}
 		return false, fmt.Sprintf("战法 %q 未在开关列表（默认全集不含动量/未知来源）", key)
 	}
+	// 分支二：白名单非空 → 必须"规范键 ∪ 显示名 ∪ 规则 ID"三键任一显式命中。
 	for _, s := range pol.Strategies {
 		if s == key || s == sig.Strategy || s == sig.StrategyID {
 			return true, ""
@@ -173,9 +186,11 @@ func AdmitStrategy(pol Policy, sig combat_agent.Signal) (bool, string) {
 	return false, fmt.Sprintf("战法 %q 白名单外", key)
 }
 
-// Admit 单信号裁定（不推进探针清理，供 risk 闸等无状态场景复用）。
+// Admit 单信号裁定（推进确认窗状态机——探针推进本就是裁定语义的一部分）。
+// §F-8（20260917 缺陷修复批）：旧 admit 尾参 advance 从未被函数体读取（"说谎参数"，
+// 注释宣称的只读判定模式从未实现），两调用方恒传 true——参数删除，语义不变。
 func (c *Controller) Admit(ch Channel, account string, sig combat_agent.Signal, pol Policy, now time.Time) Decision {
-	return c.admit(ch, account, sig, pol, now, true)
+	return c.admit(ch, account, sig, pol, now)
 }
 
 // Evaluate 批量裁定（流程引擎每轮唯一入口）：
@@ -187,12 +202,15 @@ func (c *Controller) Admit(ch Channel, account string, sig combat_agent.Signal, 
 // every signal, advancing the confirm state machine for buys. The returned slice is index-aligned.
 func (c *Controller) Evaluate(ch Channel, account string, sigs []combat_agent.Signal, pol Policy, now time.Time) []Decision {
 	c.mu.Lock()
+	// 记录本轮活跃的买入信号探针键（先建 seen 集合用于清理僵尸探针）。
 	seen := make(map[probeKey]bool, len(sigs))
 	for _, s := range sigs {
 		if isTradeBuy(s) {
 			seen[probeKey{ch, account, StrategyKeyOf(s), s.Code}] = true
 		}
 	}
+	// 清理本通道/本账号下，本轮活跃集中不存在的探针（信号消失即重置，
+	// 连续性要求：中断后重新出现需重新计时），以及超过最长存活窗的探针（超龄僵尸记录）。
 	for k, first := range c.probes {
 		if k.ch != ch || k.account != account {
 			continue
@@ -203,16 +221,17 @@ func (c *Controller) Evaluate(ch Channel, account string, sigs []combat_agent.Si
 	}
 	c.mu.Unlock()
 
+	// 第二阶段：逐信号裁定（与入参下标对齐返回）；买入信号的确认窗流推进在 admit 内完成。
 	out := make([]Decision, 0, len(sigs))
 	for _, s := range sigs {
-		d := c.admit(ch, account, s, pol, now, true)
+		d := c.admit(ch, account, s, pol, now)
 		out = append(out, d)
 	}
 	return out
 }
 
-// admit 内部裁定。advance=false 时只读判定不推进探针（供执行层最后防线复用，当前未启用）。
-func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, pol Policy, now time.Time, advance bool) Decision {
+// admit 内部裁定：买入信号推进确认窗状态机并留痕，非买入直通。
+func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, pol Policy, now time.Time) Decision {
 	d := Decision{Channel: ch, Verdict: VerdictPass, Code: sig.Code, Name: sig.Name,
 		Strategy: sig.Strategy, SKey: StrategyKeyOf(sig), At: now}
 
@@ -231,13 +250,13 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 		c.record(d)
 		return d
 	}
-	// 2. 个股黑名单（影子标志适用）
+	// 2. 个股黑名单（影子标志适用）：命中后交 blockOrShadow 决定硬拦或影子留痕。
 	if config.CodeInBlacklist(pol.CodeBlacklist, sig.Code) {
 		d.Stage = StageCodeBlacklist
 		d.Reason = fmt.Sprintf("个股黑名单(%s)", sig.Code)
 		return c.blockOrShadow(&d, pol)
 	}
-	// 3. 板块黑名单（影子标志适用）
+	// 3. 板块黑名单（影子标志适用）：Sector 为空的信号无法判定板块，跳过。
 	if sig.Sector != "" && inStringList(pol.SectorBlacklist, sig.Sector) {
 		d.Stage = StageSectorBlack
 		d.Reason = fmt.Sprintf("板块黑名单(%s)", sig.Sector)
@@ -245,14 +264,18 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 	}
 	// 4. 持续性监测（探针+确认窗；双窗≤0=未启用，买入直通）
 	disc := pol.Discipline
+	// 低置信窗：分钟级；高置信快车道窗：秒级。
 	lowWin := time.Duration(disc.BuyConfirmMin) * time.Minute
 	highWin := time.Duration(disc.BuyConfirmHighSec) * time.Second
+	// 两窗均未配置 → 关闭持续性监测，买入直接放行（与旧 paper discipline 缺省语义一致）。
 	if lowWin <= 0 && highWin <= 0 {
 		return d
 	}
+	// 探针键含通道+账号+战法键+代码，多账号/双通道确认态互不干扰。
 	key := probeKey{ch, account, d.SKey, sig.Code}
 	c.mu.Lock()
 	first, tracked := c.probes[key]
+	// 首次观测：登记首次出现时刻，本轮视为 hold（只观测不执行）。
 	if !tracked {
 		c.probes[key] = now
 	}
@@ -263,18 +286,21 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 		c.record(d)
 		return d
 	}
+	// 默认走低置信（分钟级）窗；高置信信号换秒级快窗。
 	win := lowWin
 	// 置信度口径归一：Signal.Confidence 为 0~1（显示×100），阈值存百分数（默认 85），
 	// 先放大再比，避免 0.9 ≥ 85 恒假导致高置信快车道永失（与旧实盘闸同修）。
 	if sig.Confidence*100 >= highConfThreshold(disc) {
 		win = highWin
 	}
+	// 确认窗未满：仍处于观测期，hold 并提示剩余时长。
 	if now.Sub(first) < win {
 		d.Verdict, d.Stage = VerdictHold, StageConfirm
 		d.Reason = fmt.Sprintf("确认窗未满(%.0fs/%.0fs)", now.Sub(first).Seconds(), win.Seconds())
 		c.record(d)
 		return d
 	}
+	// 探针已满窗确认：清探针放行（重复下单由执行层幂等键兜底）。
 	c.mu.Lock()
 	delete(c.probes, key) // 确认通过，清除探针（下单/撮合由执行层幂等键兜底重复）
 	c.mu.Unlock()
@@ -283,11 +309,14 @@ func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, 
 
 // blockOrShadow 影子模式：命中留痕但裁定 pass（新行为观察期用，方案 §八）。
 func (c *Controller) blockOrShadow(d *Decision, pol Policy) Decision {
+	// 影子模式（ShadowBlacklist=true）：裁定仍为 pass，但标注 Shadow 留痕——
+	// 黑名单补齐属新行为，观察期内"会拦但未拦"，先积累影子命中数据再灰度转硬拦。
 	if pol.ShadowBlacklist {
 		d.Shadow = true
 		c.record(*d)
 		return *d
 	}
+	// 正常模式：硬拦（block）。
 	d.Verdict = VerdictBlock
 	c.record(*d)
 	return *d
@@ -297,7 +326,9 @@ func (c *Controller) blockOrShadow(d *Decision, pol Policy) Decision {
 func (c *Controller) record(d Decision) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// 追加到尾部。
 	c.ring = append(c.ring, d)
+	// 超容量时重建切片，只保留最新 cap 条（丢弃最旧）。
 	if len(c.ring) > c.cap {
 		c.ring = append([]Decision(nil), c.ring[len(c.ring)-c.cap:]...)
 	}

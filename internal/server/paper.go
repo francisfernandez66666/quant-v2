@@ -17,10 +17,11 @@ import (
 // English: returns the injected global paper engine (legacy single-engine fallback; nil when not set).
 func (s *Server) paperEngine() *paper.Engine { return s.paper }
 
-// paperEngineFor 返回指定账号的独立模拟盘引擎（账户级）：优先走注册表按账号懒加载，
-// 未接入注册表时回退全局引擎。
-// English: returns an account's independent paper engine (account-level): prefers the registry's
-// per-account lazy-load, falling back to the global engine without a registry.
+// paperEngineFor 返回模拟盘账本引擎。§20260916 起模拟盘账本为系统级共享（运营账本）：
+// 恒返回操作者账号的引擎，入参 userID 仅作调用点上下文留痕，不参与账本路由。
+// （§F-9 注释修正：旧注释宣称"按账号懒加载"是账户级时代的残留，与实现矛盾易误读。）
+// English: returns the shared (operator-scoped) paper engine; the userID parameter is retained
+// for call-site context only and does NOT route books per account anymore (§F-9 comment fix).
 func (s *Server) paperEngineFor(userID string) *paper.Engine {
 	if s.registry != nil {
 		return s.registry.PaperForUser(s.operatorID())
@@ -41,12 +42,12 @@ func (s *Server) handlePaperState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"enabled":         pe.Enabled(),
-		"is_admin":        s.auth.IsAdmin(uid),
-		"stats":           pe.Stats(),
-		"initial_capital": pe.Cfg().InitialCapital,
-		"max_positions":   pe.Cfg().MaxPositions,
-		"strategy_pools":  pe.StrategyPools(),
+		"enabled":         pe.Enabled(),            // 模拟盘总开关
+		"is_admin":        s.auth.IsAdmin(uid),     // 账号角色（admin 额外支持回测/自动交易联动）
+		"stats":           pe.Stats(),              // 绩效/信号质量汇总（现金/净值/胜率等）
+		"initial_capital": pe.Cfg().InitialCapital, // 初始资金（收益基准）
+		"max_positions":   pe.Cfg().MaxPositions,   // 全局持仓上限
+		"strategy_pools":  pe.StrategyPools(),      // 战法资金池快照（各池现金/持仓/上限）
 		// §SHORT-3/决策⑤ 融券做空卡（负持仓/担保/利息/做空权益），enabled=false 时前端整卡隐藏。
 		// English: §SHORT-3 margin-short card payload; the frontend hides it entirely when disabled.
 		"short_book": pe.ShortBook(),
@@ -202,9 +203,9 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 		Code        string  `json:"code"`
 		Name        string  `json:"name"`
 		Strategy    string  `json:"strategy"`
-		SignalPrice float64 `json:"signal_price"`
-		Price       float64 `json:"price"` // 用户输入的买入价（>0 生效）
-		Qty         int     `json:"qty"`   // 用户输入的买入手数（>0 生效；<=0 回退固定金额）
+		SignalPrice float64 `json:"signal_price"` // 原信号触发价（供信号质量/滑点统计）
+		Price       float64 `json:"price"`        // 用户输入的买入价（>0 生效）
+		Qty         int     `json:"qty"`          // 用户输入的买入手数（>0 生效；<=0 回退固定金额）
 		// §C 归属字段：信号页模拟买入携带原信号的战法池/库规则 ID，
 		// 买入归入对应资金池（非空且池存在时）；纯手动不传 → 其他池（旧行为）。
 		StrategyType string `json:"strategy_type,omitempty"`
@@ -216,11 +217,12 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 	}
 	// 归属解析：规则 ID（fac_/pat_ 前缀）优先即池 key；否则用类型字段；
 	// 都为空 = 纯手动 → 其他池。引擎侧对不存在的池还会二次回退兜底。
+	// 前缀切片判断安全前提：len>=4 已先检查，避免对短 ID 越界。
 	poolKey := req.StrategyType
 	if len(req.StrategyID) >= 4 && (req.StrategyID[:4] == "fac_" || req.StrategyID[:4] == "pat_") {
 		poolKey = req.StrategyID
 	}
-	quotes := s.liveQuotes(req.Code)
+	quotes := s.liveQuotes(req.Code) // 行情快照（撮合价基准），一次构造供买入使用
 	if req.Qty > 0 {
 		// 输入价格+手数：按用户指定记账（price=0 时用实时价，仍按指定手数）
 		// English: typed price + lots: fills as specified (price=0 falls back to the live quote but
@@ -365,22 +367,25 @@ func (s *Server) handlePaperShortOpen(w http.ResponseWriter, r *http.Request) {
 		Code     string  `json:"code"`
 		Name     string  `json:"name"`
 		Strategy string  `json:"strategy"`
-		Price    float64 `json:"price"`
+		Price    float64 `json:"price"` // 用户指定开仓价（>0 生效；0=实时价）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
-	q := s.liveQuotes(req.Code)
+	q := s.liveQuotes(req.Code) // 行情快照（做空预算/开仓 proxy 依赖实时价）
 	if req.Price > 0 && q[req.Code] != nil {
+		// 用户指定开仓价：直接改写快照里该票的价格供引擎按指定价撮合；
+		// 快照缺失该票时不伪造，交由引擎侧拒绝（缺实时价时引擎自行处理）。
 		q[req.Code].Price = req.Price // 用户指定开仓价（缺实时价时引擎侧自行拒绝）
 	}
+	// ShortOpenManual 返回实际开仓手数（负持仓量）；失败（池未开/已持空/同日重复）返回中文错误。
 	qty, err := pe.ShortOpenManual(req.Code, req.Name, req.Strategy, "", req.Price, q)
 	if err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "qty": qty})
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "qty": qty}) // qty=开仓手数回显
 }
 
 // handlePaperShortCover §SHORT-4 融券买回平仓：{"code","price"}；price>0 用指定价（缺实时价也可），
@@ -394,18 +399,19 @@ func (s *Server) handlePaperShortCover(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Code  string  `json:"code"`
-		Price float64 `json:"price"`
+		Price float64 `json:"price"` // 回买价（>0 生效；0=按实时价撮合）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
+	// ShortCover 执行买回平仓：触发 T+1 解禁校验，按剩余空头结算已实现盈亏。
 	pnl, err := pe.ShortCover(req.Code, req.Price, s.liveQuotes(req.Code))
 	if err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "realized": pnl})
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "realized": pnl}) // realized=本次平仓已实现盈亏
 }
 
 // handlePaperPoolReset 单池清盘：只清指定战法资金池的持仓与持久化表现（平仓回池现金），
@@ -421,13 +427,13 @@ func (s *Server) handlePaperPoolReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Pool string `json:"pool"`
+		Pool string `json:"pool"` // 池 key（n_shape 等）；空串=清"其他池"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "无效请求体")
 		return
 	}
-	pe.ResetPool(req.Pool)
+	pe.ResetPool(req.Pool) // 引擎侧只清该池：平仓回池现金、清池级持久化，其余池不动
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "pool": req.Pool})
 }
 
@@ -470,14 +476,17 @@ func (s *Server) handlePaperPoolConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if v, ok := raw["pool_rules"]; ok {
+		// 池级买入规则：每池日内次数/冷却分钟/最低分/每日预算百分比。
+		// 四项全空视为"清除该池规则"（SetPoolBuyRule(pk, nil)），否则逐池写入。
 		var rules map[string]struct {
-			MaxDailyBuys    int     `json:"max_daily_buys"`
-			CooldownMinutes int     `json:"cooldown_minutes"`
-			MinScore        float64 `json:"min_score"`
-			BudgetPctPerDay float64 `json:"budget_pct_per_day"`
+			MaxDailyBuys    int     `json:"max_daily_buys"`     // 该池每日最大买入笔数
+			CooldownMinutes int     `json:"cooldown_minutes"`   // 同票冷却分钟数
+			MinScore        float64 `json:"min_score"`          // 触发买入的最低评分
+			BudgetPctPerDay float64 `json:"budget_pct_per_day"` // 每日预算占池现金百分比
 		}
 		if json.Unmarshal(v, &rules) == nil {
 			for pk, r := range rules {
+				// 任意一项 >0 即视为有效规则；全 0 = 清除该池自定义规则（回落全局口径）。
 				if r.MaxDailyBuys > 0 || r.CooldownMinutes > 0 || r.MinScore > 0 || r.BudgetPctPerDay > 0 {
 					pe.SetPoolBuyRule(pk, &paper.PoolBuyRule{
 						MaxDailyBuys:    r.MaxDailyBuys,
@@ -524,14 +533,15 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		InitialCapital float64 `json:"initial_capital"`
-		MaxPositions   int     `json:"max_positions"`
-		ResetTo        float64 `json:"reset_to"` // §反馈修复：清盘时显式指定重置后的初始资金
+		InitialCapital float64 `json:"initial_capital"` // >0 = 注入资金模式
+		MaxPositions   int     `json:"max_positions"`   // 可选持仓上限（注入模式 >=0 生效；清盘模式 >0 生效）
+		ResetTo        float64 `json:"reset_to"`        // §反馈修复：清盘时显式指定重置后的初始资金
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	_ = json.NewDecoder(r.Body).Decode(&req) // 请求体可选：三种语义见下方分支（缺省/注入/清盘）
 	if req.InitialCapital > 0 {
 		// 注入资金：增量加现金，保留持仓/净值/成交
 		pe.Deposit(req.InitialCapital)
+		// MaxPositions >=0 都生效（0=不设限）；负值视为未携带，不改上限。
 		if req.MaxPositions >= 0 {
 			pe.SetMaxPositions(req.MaxPositions)
 		}
@@ -541,14 +551,16 @@ func (s *Server) handlePaperReset(w http.ResponseWriter, r *http.Request) {
 		// 错误基数起跳。用户可通过 reset_to 显式指定其他金额。
 		resetAmount := 100000.0
 		if req.ResetTo > 0 {
-			resetAmount = req.ResetTo
+			resetAmount = req.ResetTo // 用户显式指定的重置金额优先
 		}
-		pe.SetInitialCapital(resetAmount)
+		pe.SetInitialCapital(resetAmount) // 先定新基准，再清盘（Reset 只清持仓/成交/净值）
 		pe.Reset()
+		// 清盘模式仅 >0 才改上限（0 会把上限清成"不设限"，与注入模式口径不同）。
 		if req.MaxPositions > 0 {
 			pe.SetMaxPositions(req.MaxPositions)
 		}
 	}
+	// 回显落库后的最终配置，前端据此刷新资金/上限显示。
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":              true,
 		"initial_capital": pe.Cfg().InitialCapital,

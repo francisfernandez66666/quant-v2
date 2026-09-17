@@ -14,9 +14,13 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 唯一 job：拉起"qmt-mock 柜台 + quant 引擎 + vite 前端"三件套后跑 Playwright 全量 spec。
+  # 40 分钟超时兜底：Playwright 卡死/等待期重试风暴时不至于烧满 runner 计费时长。
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # 全栈环境变量：数据目录隔离（独立于默认路径，避免污染 runner 缓存）、
+    # e2e 专用 admin/tester 双账号、QMT token 与 mock 网关对齐。
     env:
       QUANT_DATA_DIR: ${{ github.workspace }}/.uat-data
       BACKEND: http://127.0.0.1:18080
@@ -26,13 +30,16 @@ jobs:
       E2E_PASS2: Tester!2026
       QMT_TOKEN: uat-secret
     steps:
+      # 检出代码（Playwright spec 与后端二进制同仓构建）
       - uses: actions/checkout@v4
 
+      # Go 工具链按 go.mod 声明的版本安装，避免与本地开发环境漂移
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
+      # Node 20 + npm 缓存（按 web/package-lock.json 命中缓存提速）
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -40,17 +47,21 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      # Python 3.11 仅用于后续 seed 情绪日线（sqlite3 标准库直插 DB）
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # 编译 quant 引擎与 qmt-mock 假柜台二进制；数据目录随容器预建
       - name: Build binaries
         run: |
           mkdir -p "$RUNNER_TEMP/bin" "$QUANT_DATA_DIR"
           go build -o "$RUNNER_TEMP/bin/quant" ./cmd/quant
           go build -o "$RUNNER_TEMP/bin/qmt-mock" ./cmd/qmt-mock
 
+      # 先起 mock 柜台（:18789）：预置茅台持仓行情 + 1.5s 回报延迟模拟真实柜台节奏；
+      # 轮询 /health 最多 30s，起不来后续步骤会自然失败。
       - name: Start qmt-mock
         run: |
           "$RUNNER_TEMP/bin/qmt-mock" -listen :18789 -token "$QMT_TOKEN" \
@@ -62,6 +73,8 @@ jobs:
             sleep 1
           done
 
+      # 起 quant 引擎（:18080）并等 /setup 就绪（200 已初始化 / 405 未初始化均算服务可达）；
+      # 失败时 cat 日志留证，便于在 CI 界面直接看启动期报错。
       - name: Start engine
         run: |
           QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine.log 2>&1 &
@@ -80,6 +93,12 @@ jobs:
           curl -fsS -X POST "$BACKEND/api/admin/users" -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' \
             -d "{\"username\":\"$E2E_USER2\",\"password\":\"$E2E_PASS2\",\"role\":\"user\"}"
+          # §T-3（20260917 缺陷修复批）：§MT 租户级频控默认 600 次/分钟与全套 Playwright 突发
+          # 互踩（实测第 600 请求准时 429，失败集合随顺序漂移，CI 靠 retries 掩盖迟早漂绿）。
+          # 仅 nightly 的 UAT 栈上调配额；生产默认 600 不动。
+          curl -fsS -X PUT "$BACKEND/api/tenants/t_default" -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"quota":{"api_rate_per_min":100000}}'
           # QMT 网关装配：手动模式 + mock 地址（休市时段部分参数重启后才装配生效，下一步统一重启）
           curl -fsS -X POST "$BACKEND/api/config/qmt" -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' -d '{
@@ -92,6 +111,8 @@ jobs:
             }'
 
       - name: Seed market_risk_daily（情绪回看用例依赖）
+        # 休市时段引擎不会自行落情绪行情 → 用 sqlite 直插今昨两天记录：
+        # 昨日"偏冷/yellow"、今日"中性/green"，供 e2e 的情绪回看/风险档用例断言。
         run: |
           python - <<'PY'
           import os, sqlite3
@@ -109,6 +130,8 @@ jobs:
           PY
 
       - name: Restart engine（QMT 配置装配生效）
+        # kill 旧进程后带新数据目录重启：休市时段写入的 QMT 配置/lower 配额随重启装配；
+        # 用带 admin token 的 /api/health 探活，比首启的 /setup 更严格。
         run: |
           kill "$(cat engine.pid)" 2>/dev/null || true
           sleep 2
@@ -121,11 +144,14 @@ jobs:
 
       - name: Install web deps + Playwright browser
         working-directory: web
+        # npm ci 严格按 lockfile 安装；--with-deps 顺带装 chromium 系统依赖（Ubuntu 缺库会白屏）
         run: |
           npm ci
           npx playwright install --with-deps chromium
 
       - name: Start frontend (vite dev)
+        # 用 vite dev 而非 build+preview：与 UAT 实录口径一致且省构建时间；
+        # VITE_BACKEND_PORT 指向 :18080 引擎；--strictPort 保证探活端口即真实服务端口。
         run: |
           cd web
           VITE_BACKEND_PORT=18080 npx vite --port 5173 --strictPort > ../vite.log 2>&1 &
@@ -135,10 +161,12 @@ jobs:
             sleep 1
           done
 
+      # 全量跑 web/e2e Playwright spec（配置内自带 retries/trace，失败可上传回放）
       - name: Playwright 全量 e2e
         working-directory: web
         run: npx playwright test
 
+      # 仅失败时上传：Playwright 报告/trace + 三件套全量日志，供夜间失败次日取证回放
       - name: Upload report artifacts（失败时取证）
         if: failure()
         uses: actions/upload-artifact@v4

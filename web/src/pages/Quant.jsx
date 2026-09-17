@@ -77,11 +77,15 @@ function pnlColor(v) {
  * 副作用：挂载时拉取配置/状态/流水，并以定时器轮询刷新。
  */
 export default function Quant() {
+  // 链路运行状态（启用态/模式/心跳/延迟/熔断等），10s 轮询刷新
   const [state, setState] = useState(null)
   // §QMT-DUAL 网关 active 通道与双路径状态（broker: xt=miniQMT兼容 / queued=QMT桥兜底）
   const [broker, setBroker] = useState(null)
+  // 通道切换请求进行中（按钮 loading，防重复提交）
   const [switchingBroker, setSwitchingBroker] = useState(false)
+  // 首屏表单初值：优先取本账号 localStorage 缓存，无缓存时用内置默认值（避免开关闪回默认）
   const cachedForm = readCachedForm()
+  // 实盘配置表单数据（按分组整体回写后端；用户编辑必须走 setFormUser 置脏位）
   const [form, setForm] = useState(cachedForm || {
     enabled: false, mode: 'manual', price_type: 'market', auto_sell: false,
     gateway_url: '', token_masked: '',
@@ -103,14 +107,19 @@ export default function Quant() {
   }
 
   // 通用 UI 状态
+  // 鉴权 Token 明文输入（留空=沿用原值）
   const [tokenInput, setTokenInput] = useState('')
+  // 后端已知战法列表（归一化为 {id,name,kind}）
   const [strategyList, setStrategyList] = useState([])
+  // 各战法实盘准入开关映射 {id: bool}
   const [strategyOn, setStrategyOn] = useState({})
+  // 战法开关是否被改动（控制保存按钮可用性）
   const [strategyDirty, setStrategyDirty] = useState(false)
   // §SHORT-4 做空战法状态：全局做空开关 + 模拟盘融券池开设标记
   const [shortEnabled, setShortEnabled] = useState(false)
   const [shortPoolOn, setShortPoolOn] = useState(false)
   const [saving, setSaving] = useState(false)
+  // 交易流水数据（summary 汇总 + by_strategy 分战法 + fills 成交明细），30s 轮询刷新
   const [trades, setTrades] = useState(null)
   // §U-2（2026-09-14）运维三件套前端入口：kill-switch 紧急停止 / 当日委托手动撤单 / 交割单对账。
   // 此前这些能力后端端点齐备但页面零入口（撤单尤其因缺 order_id 列表而无从挂按钮）。
@@ -119,6 +128,8 @@ export default function Quant() {
   const [orders, setOrders] = useState(null)        // 当日委托（含 order_id / status）
   // §SIGNAL_CONTROLLER 信号裁定留痕（实盘/模拟盘两通道 hold/block 与原因，30s 随流水刷新）
   const [verdicts, setVerdicts] = useState([])
+  // §F-5（20260917 缺陷修复批）风控闸口状态（下单前 12 道闸的当日命中与开关，30s 随流水刷新）
+  const [riskGates, setRiskGates] = useState(null)
   const [killBusy, setKillBusy] = useState(false)   // kill-switch 请求中
   const [settleBusy, setSettleBusy] = useState(false)
   const [settle, setSettle] = useState(null)        // 最近一次对账结果/历史
@@ -173,6 +184,7 @@ export default function Quant() {
     try {
       const c = await api.fetchQMTConfig()
       setLoadErr('')
+      // 以服务端值为准组装表单快照（缺省字段回退默认值），待脏守卫判定后整体回填
       const nextForm = {
         enabled: !!c.enabled, mode: c.mode || 'manual', price_type: c.price_type || 'market',
         auto_sell: !!c.auto_sell, gateway_url: c.gateway_url || '', token_masked: c.token_masked || '',
@@ -242,6 +254,11 @@ export default function Quant() {
     try {
       const v = await api.fetchSignalVerdicts(50)
       if (v && Array.isArray(v.verdicts)) setVerdicts(v.verdicts)
+    } catch (_) {}
+    // §F-5 风控闸口状态（非 admin/无实盘账本时后端 403/503，静默降级不显示卡片）
+    try {
+      const g = await api.fetchRiskGates()
+      if (g && Array.isArray(g.gates)) setRiskGates(g)
     } catch (_) {}
   }
 
@@ -432,6 +449,9 @@ export default function Quant() {
     )
   }
 
+  // 挂载副作用：依赖数组 []——仅在首次挂载执行一次，后续刷新全部由下方定时器驱动
+  // （链路状态/委托 10s、流水 30s）；卸载时统一清除定时器，避免内存泄漏与重复请求。
+  // 配置加载失败在调用处 catch 提示，不阻塞轮询。
   useEffect(() => {
     loadState()
     // §SHORT-4 做空开关与融券池状态探测（开关与模拟盘 short_book.enabled）
@@ -502,6 +522,7 @@ export default function Quant() {
         ) : (
           <ToggleSw checked={form.enabled} onChange={(v) => { setFormUser({ ...form, enabled: v }); saveSwitches(v) }} />
         )}
+        {/* 同步状态指示：红=加载失败（当前展示本地缓存），绿=已同步服务器 */}
         <span style={{ color: loadErr ? 'var(--app-up)' : 'var(--app-down)', fontSize: 11, marginLeft: 10 }}>
           {loadErr ? '⚠ 未同步服务器（下方为本地缓存，非真实状态）' : '已同步服务器 ✓'}
         </span>
@@ -772,6 +793,7 @@ export default function Quant() {
         <span style={{ flex: 1, minWidth: 0, wordBreak: 'break-all' }}>{node}</span>
       </div>
     )
+    // 运行模式中文标签（auto/manual，未知值原样展示）
     const modeLabel = state.mode === 'auto' ? '全自动' : (state.mode === 'manual' ? '手动确认' : (state.mode || '—'))
     // 熔断：已熔断展示红 Tag + 原因/时间，正常展示绿 Tag
     const breaker = state.tripped ? (
@@ -816,11 +838,14 @@ export default function Quant() {
     )
     return (
       <Card title="链路状态" style={{ marginBottom: 14 }}>
+        {/* 实盘链路行：启用态 + 运行模式 */}
         {row('实盘链路', <>
           {state.enabled ? <Tag theme="success">已启用</Tag> : <Tag theme="default">未启用</Tag>}
           <span style={{ fontSize: 12, color: 'var(--app-text-2)', marginLeft: 8 }}>模式：{modeLabel}</span>
         </>)}
+        {/* 网关地址行：广州单机网关 URL */}
         {row('网关地址', state.gateway_url || '—')}
+        {/* 熔断行：健康探测触发的自动熔断（与 kill-switch 人工紧急停止相互独立） */}
         {row('熔断', breaker)}
         {/* §U-2 kill-switch（人工紧急停止）状态与入口：置位=拒绝一切新单+撤销在途委托，立即生效 */}
         {row('紧急停止', <>
@@ -864,6 +889,7 @@ export default function Quant() {
       { colKey: 'status', title: '状态', width: 90, cell: ({ row }) => <Tag size="small" theme={orderTagTheme(row.status)}>{row.status}</Tag> },
       { colKey: 'created_at', title: '时间', width: 130, cell: ({ row }) => <span style={{ fontSize: 12 }}>{(row.created_at || '').replace('T', ' ').slice(5, 19)}</span> },
       {
+        // 操作列：仅在可撤状态（CANCELABLE）显示撤单按钮，终态显示占位"—"
         colKey: 'op', title: '操作', width: 90,
         cell: ({ row }) => (CANCELABLE.has(row.status)
           ? <Button size="xs" variant="outline" theme="danger" onClick={() => cancelOrder(row.order_id)}>撤单</Button>
@@ -895,6 +921,7 @@ export default function Quant() {
           <Button size="small" theme="primary" variant="outline" loading={settleBusy} onClick={() => runSettle('report_only')}>立即对账</Button>
           <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>拉券商交割单与本地委托/成交三方比对，差异自动 P1 告警（休市/盘后运行最佳）</span>
         </div>
+        {/* 最近一次对账结果摘要：本地缺失/多余/不符笔数 + 费用差与现金差 */}
         {diff && (
           <div style={{ fontSize: 12, marginBottom: 10, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--app-border)', background: 'var(--app-bg-2, transparent)' }}>
             最近对账 {diff.day || '—'}：本地缺失 {(diff.missing_in_local || []).length} · 本地多余 {(diff.extra_in_local || []).length} · 不符 {(diff.mismatch || []).length} · 费用差 {(diff.fee_diff || 0).toFixed(2)} · 现金差 {(diff.cash_diff || 0).toFixed(2)}
@@ -993,6 +1020,38 @@ export default function Quant() {
           <div style={{ padding: '6px 2px', color: 'var(--app-text-2)', fontSize: 12 }}>暂无拦截/待确认记录——所有买入信号都直接过了准入裁定</div>
         )}
       </Card>
+
+      {/* §F-5（20260917 缺陷修复批）风控闸口卡：下单前 risk.Gate 12 道闸的当日命中明细与开关态。
+          旧缺口：GET /api/risk/gates 有数据面无消费方——闸拦了什么只有 opslog 可查，UI 不可见。 */}
+      {riskGates && (
+        <Card title="风控闸口状态" style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 8 }}>
+            下单前最后防线（ST/黑名单/单笔帽/T+1/涨跌停/陈旧价/日亏/集中度/买法纪律/战法准入/持仓数）当日命中记录 · {riskGates.day} {riskGates.time}
+          </div>
+          {/* 闸口开关状态标签组：any_enabled 为主开关（蓝/灰），其余开=绿、关=灰 */}
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
+            {Object.entries(riskGates.switches || {}).map(([k, v]) => (
+              <Tag key={k} theme={k === 'any_enabled' ? (v ? 'primary' : 'default') : (v ? 'success' : 'default')} variant="light-outline">
+                {k}{v ? ' 开' : ' 关'}
+              </Tag>
+            ))}
+          </div>
+          {/* 兼容后端历史 null 值：gates 为 null 时按空数组处理，避免 TypeError 拖垮整页渲染 */}
+          {(riskGates.gates || []).length ? (
+            <Table data={(riskGates.gates || [])} rowKey={(r) => r.user_id + r.gate} size="small" pagination={{ pageSize: 8, total: (riskGates.gates || []).length }}
+              columns={[
+                { colKey: 'gate', title: '闸口', width: 150 },
+                { colKey: 'hits', title: '当日命中', width: 90, cell: ({ row }) => <Tag theme="danger" variant="light">{row.hits}</Tag> },
+                { colKey: 'user_id', title: '账号', width: 130 },
+                { colKey: 'last_reason', title: '最近原因', cell: ({ row }) => <span title={row.last_reason}>{row.last_reason}</span> },
+                { colKey: 'updated_at', title: '更新', width: 150, cell: ({ row }) => (row.updated_at || '').slice(5, 16) },
+              ]}
+            />
+          ) : (
+            <div style={{ padding: '6px 2px', color: 'var(--app-text-2)', fontSize: 12 }}>今日暂无风控闸命中——所有实盘委托都通过了下单前闸门</div>
+          )}
+        </Card>
+      )}
 
       {/* 交易流水与整体盈亏卡片：汇总指标 + 分战法盈亏表 + 成交流水表 */}
       <Card title="交易流水与整体盈亏" style={{ marginBottom: 14 }}>

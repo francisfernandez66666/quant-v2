@@ -1,7 +1,12 @@
-// Package risk 实现风控引擎，提供信号级风控检查（黑名单/合规）、
-// 回撤检测、多信号冲突解决、M8组合兜底以及仓位限制校验。
-// （Package risk implements the risk engine: signal-level checks (blacklist/compliance), drawdown detection,
-// multi-signal conflict resolution, M8 portfolio fallback and position limit validation.）
+// Package risk 实现下单前风控闸门（gate.go 的 Gate 为生产唯一入口）与组合级 M8 兜底
+// 共享判定（M8CheckWith）。
+// §F-7（20260917 缺陷修复批）：删除旧 Engine（CheckSignal/CheckDrawdown/ResolveConflict/
+// M8Check/PositionLimitCheck 等）——生产零调用（信号准入已由 signalctl 单点化、下单风控由
+// Gate.CheckLiveOrder 承担，M8 实盘执行走 scoring_loop 调用本文件 M8CheckWith）；
+// 此前"三份 M8 判定并存"（旧 Engine / Gate.CheckPortfolio / scoring_loop 内联）收敛为一份。
+// English: the legacy Engine is removed (§F-7): zero production callers after signalctl admission
+// and the live Gate; M8 fallback now has exactly one judge (M8CheckWith) shared by the live loop,
+// Gate.CheckPortfolio and tests.
 package risk
 
 import (
@@ -9,20 +14,7 @@ import (
 
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/strategy"
-	"sort"
 )
-
-// Engine 风控引擎，依赖配置管理器进行各种风控检查。（Engine is the risk engine backed by the config manager.）
-type Engine struct {
-	cfg *config.Manager // 配置管理器（热加载）
-}
-
-// New 创建风控引擎。
-// 参数 cfg: 配置管理器（从 rules.json 读取风控参数）。
-// （New creates a risk engine; cfg is the config manager reading risk params from rules.json.）
-func New(cfg *config.Manager) *Engine {
-	return &Engine{cfg: cfg}
-}
 
 // CheckResult 风控检查结果。（CheckResult is the outcome of a risk check.）
 type CheckResult struct {
@@ -38,124 +30,34 @@ type CheckResult struct {
 	Blocked bool `json:"blocked"`
 }
 
-// CheckSignal 对单个交易信号执行风控检查。
-// 当前检查项：黑名单过滤 + 合规模式检查。
-// 参数 sig: 策略产生的交易信号。
-// 返回检查结果，若 Blocked 为 true 则信号不应被执行。
-// （CheckSignal runs signal-level checks (blacklist + compliance). When Blocked is true the signal must not execute.）
-func (e *Engine) CheckSignal(sig *strategy.Signal) *CheckResult {
-	cfg := e.cfg.Get()
-	rc := cfg.RiskCtrl
-
-	blacklisted := e.checkBlacklist(sig.Code, cfg)
-	if blacklisted {
-		return &CheckResult{Pass: false, Action: "block", Priority: strategy.P1, Reason: "黑名单股票", Blocked: true}
-	}
-
-	compliance := e.checkCompliance(rc.Compliance)
-	if !compliance.Pass {
-		return compliance
-	}
-
-	return &CheckResult{Pass: true, Action: "pass", Priority: sig.Priority, Reason: "风控通过", Blocked: false}
-}
-
-// CheckDrawdown 检查单笔持仓的回撤是否触发了指定的止损规则。
-// 参数 entryPrice: 入场价；currentPrice: 当前价；cfg: 回撤规则配置。
-// 若回撤幅度超过规则设定则返回不通过并附带建议动作。
-// （CheckDrawdown checks whether a position's drawdown hits the configured stop rule and returns the suggested action when triggered.）
-func (e *Engine) CheckDrawdown(entryPrice, currentPrice float64, cfg config.DrawdownRule) *CheckResult {
-	// 回撤幅度 = (当前价 - 入场价) / 入场价 * 100，正值盈利、负值亏损
-	drawdown := (currentPrice - entryPrice) / entryPrice * 100
-
-	// 回撤超过阈值（drawdown ≤ 阈值即触发，drawdown 为负值）则执行配置动作
-	if drawdown <= cfg.Pct {
-		return &CheckResult{
-			Pass:     false,
-			Action:   cfg.Action,
-			Priority: strategy.P3,
-			Reason:   "买入回撤触发",
-		}
-	}
-	return &CheckResult{Pass: true, Action: "hold"}
-}
-
-// ResolveConflict 在同一标的多信号冲突时按优先级+动作排序解决。
-// 排序规则：优先级高（数值小）优先；同级时卖出>买入>持有。
-// 参数 signals: 同一标的的多策略信号列表。
-// 返回优先级最高的信号。
-// （ResolveConflict resolves conflicts among multiple signals for the same stock: higher priority first,
-// then sell>buy>hold at equal priority. Returns the top signal.）
-func (e *Engine) ResolveConflict(signals []strategy.Signal) *strategy.Signal {
-	if len(signals) == 0 {
-		return nil
-	}
-
-	sort.Slice(signals, func(i, j int) bool {
-		if signals[i].Priority != signals[j].Priority {
-			return signals[i].Priority < signals[j].Priority
-		}
-		actionOrder := map[strategy.TradeAction]int{
-			strategy.ActionSell: 0,
-			strategy.ActionBuy:  1,
-			strategy.ActionHold: 2,
-		}
-		return actionOrder[signals[i].Action] < actionOrder[signals[j].Action]
-	})
-
-	return &signals[0]
-}
-
-// checkBlacklist 检查股票代码是否在黑名单中。
-// 黑名单中的股票直接被阻断。
-// §R3-8 P1-H 统一口径：此前精确字符串相等——配置 `600519.SH` 时裸码请求被风控放行、
-// 却被执行层拦截（两套判定结论相反）。现与执行层共用 config.CodeInBlacklist 归一匹配。
-// （checkBlacklist checks the blacklist via the shared suffix-normalized matcher so the risk
-// layer and the execution layer reach the same verdict for any code form.）
-func (e *Engine) checkBlacklist(code string, cfg *config.Rules) bool {
-	return config.CodeInBlacklist(cfg.Theme.BlackList, code)
-}
-
-// checkCompliance 检查合规模式是否开启。
-// 合规模式下直接放行（实际合规限制由外部系统执行）。
-// （checkCompliance returns pass when compliance mode is on; actual limits are enforced externally.）
-func (e *Engine) checkCompliance(cc config.ComplianceConfig) *CheckResult {
-	if cc.ComplianceMode {
-		return &CheckResult{Pass: true, Action: "pass", Priority: strategy.P4, Reason: "合规模式"}
-	}
-	return &CheckResult{Pass: true}
-}
-
-// M8Check 检查组合总市值从峰值回撤是否达到 M8 兜底阈值。
-// 当 currentTotal 从 peakTotal 的回撤超过配置值时触发全仓卖出。
-// 参数 currentTotal: 当前持仓总市值；peakTotal: 历史峰值市值。
-// 返回值中的 Blocked 为 true 时表示需要执行清仓操作。
-// （M8Check checks whether the portfolio drawdown from its peak hits the M8 fallback threshold,
-// triggering a sell-all when exceeded; Blocked=true means liquidation is required.）
-func (e *Engine) M8Check(currentTotal, peakTotal float64) *CheckResult {
-	var rules *config.Rules
-	if e != nil && e.cfg != nil {
-		rules = e.cfg.Get()
-	}
-	return M8CheckWith(rules, currentTotal, peakTotal)
-}
-
-// M8CheckWith M8 兜底判定共享实现（不依赖 Engine 实例，Gate.CheckPortfolio 与测试直接调用）。
-// §WS-C：原 M8Check 逻辑原样保留在此，Engine 委托同一口径。
-// English: M8CheckWith is the Engine-free shared M8 fallback used by Gate.CheckPortfolio and tests;
-// the original semantics are preserved verbatim.
+// M8CheckWith M8 组合回撤兜底判定——全系统唯一实现（Gate.CheckPortfolio 委托、
+// 实盘 scoring_loop.checkM8RealDrawdown 直调、测试直接调用）。
+// §R7 阈值归一（自 scoring_loop 内联版收敛来，20260917 §F-7 起为本函数职责）：
+// 阈值接受正数（"回撤 10% 触发"写 10）或负数（旧口径），一律归一为负值参与比较；
+// 0 或未设置视为关闭——避免误填 0/正值导致 M8 静默失效或恒触发。
+// English: the single authoritative M8 portfolio-drawdown judge shared by the live loop and the
+// gate; positive thresholds are normalized to the negative comparison scale (R7), and 0/unset
+// disables the check.
 func M8CheckWith(cfg *config.Rules, currentTotal, peakTotal float64) *CheckResult {
+	// 无配置 → 不做任何检查，视为通过（fail-open）。
 	if cfg == nil {
 		return &CheckResult{Pass: true}
 	}
 	rc := cfg.RiskCtrl
-	// M8 兜底未启用或无有效峰值时不检查
-	if !rc.M8Enabled || peakTotal <= 0 {
+	thr := rc.M8PortfolioDrawdownPct
+	// 阈值归一（§R7）：接受正数（"回撤 10% 触发"写 10）或旧口径负数，统一归一为负值再比较；
+	// 0 或未设置（归一后仍 ≥0）视为关闭。
+	if thr > 0 {
+		thr = -thr
+	}
+	// M8 兜底未启用、阈值未配置（归一后 ≥0）或无有效峰值时不检查
+	if !rc.M8Enabled || thr >= 0 || peakTotal <= 0 {
 		return &CheckResult{Pass: true}
 	}
 	// 组合回撤 = (当前市值 - 峰值市值) / 峰值市值 * 100
 	drawdown := (currentTotal - peakTotal) / peakTotal * 100
-	if drawdown <= rc.M8PortfolioDrawdownPct {
+	// 回撤跌破（≤）阈值 → 触发 M8 兜底：P1 优先级、清仓动作、彻底阻断后续加仓流程。
+	if drawdown <= thr {
 		return &CheckResult{
 			Pass:     false,
 			Action:   "sell_all",
@@ -164,37 +66,6 @@ func M8CheckWith(cfg *config.Rules, currentTotal, peakTotal float64) *CheckResul
 			Blocked:  true,
 		}
 	}
-	return &CheckResult{Pass: true}
-}
-
-// PositionLimitCheck 检查仓位是否超出限制。
-// 特殊规则：
-//   - N 形策略不受 30%/80% 限制，仅 90% 截断
-//   - 其他策略检查单票 PerStockMax 和总仓位 MaxTotalPositionPct
-//
-// 参数 currentPct: 当前单票仓位百分比；singlePct: 建议仓位百分比；
-// totalPct: 建议后总仓位百分比；strategyType: 策略类型。
-// （PositionLimitCheck validates position sizes: N-shape strategy is exempt from the 30%/80% limits with only
-// a 90% single-stock cap; other strategies check PerStockMax and MaxTotalPositionPct.）
-func (e *Engine) PositionLimitCheck(currentPct, singlePct, totalPct float64, strategyType strategy.SignalType) *CheckResult {
-	cfg := e.cfg.Get()
-	rc := cfg.RiskCtrl
-
-	// N 形策略特殊规则：不受 30%/80% 常规限制，仅做 90% 单票截断
-	if strategyType == strategy.SignalNShape {
-		if singlePct > 90 {
-			return &CheckResult{Pass: false, Action: "block", Priority: strategy.P1, Reason: "N形单票超90%截断"}
-		}
-		return &CheckResult{Pass: true}
-	}
-
-	// 常规策略：先检查单票仓位上限，再检查总仓位上限
-	if singlePct > rc.PerStockMax {
-		return &CheckResult{Pass: false, Action: "block", Priority: strategy.P3, Reason: "单票仓位超限"}
-	}
-	if totalPct > cfg.Position.MaxTotalPositionPct {
-		return &CheckResult{Pass: false, Action: "reduce", Priority: strategy.P3, Reason: "总仓位超限"}
-	}
-
+	// 回撤仍在阈值内 → 通过。
 	return &CheckResult{Pass: true}
 }

@@ -21,6 +21,7 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/opslog"
+	"quant-trading-v2/internal/risk"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
@@ -38,14 +39,14 @@ func (e *Engine) RunScoringLoop(ctx context.Context) {
 		return
 	}
 	log.Printf("[engine] 近实时 8a/8b 打分循环启动: 5s 节奏")
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(5 * time.Second) // 固定 5s 心跳：与快照源刷新节奏对齐
 	defer ticker.Stop()
-	for {
+	for { // select 主循环：ctx 取消即退出，取不到 tick 就继续等，绝不 busy-loop
 		select {
 		case <-ctx.Done():
 			log.Printf("[engine] 近实时打分循环停止")
 			return
-		case <-ticker.C:
+		case <-ticker.C: // 每 5s 执行一轮完整打分（单轮 panic 已在 scoreCycle 内 recover）
 			e.scoreCycle(ctx)
 		}
 	}
@@ -426,6 +427,8 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 // logNShapeDiag 打印本轮 N 形候选诊断概要 + 最可能出信号的若干明细。
 // 排序：Pass（含一突/二突标记）在前、其余按总分降序，最多展示 8 条，避免刷屏。
 func (e *Engine) logNShapeDiag(emotionPhase string, diags []combat_agent.NDiag) {
+	// 概览四桶计数：Pass/Fail、D1=0 拦截（事件缺失）、总分不足（D1 有值但分数不够）——
+	// 一眼区分"N 信号缺失"是事件问题还是评分问题
 	pass, fail, d1Zero, totalLow := 0, 0, 0, 0
 	for _, d := range diags {
 		if d.Pass {
@@ -434,18 +437,19 @@ func (e *Engine) logNShapeDiag(emotionPhase string, diags []combat_agent.NDiag) 
 			fail++
 		}
 		if d.D1 <= 0 {
-			d1Zero++
+			d1Zero++ // D1 被归 0（无实质事件）→ N 形直接失去入场支撑
 		} else if !d.Pass {
-			totalLow++
+			totalLow++ // 事件在但总分不够水位
 		}
 	}
 	log.Printf("[engine] N形诊断 emotion=%s 候选=%d pass=%d fail=%d d1=0拦截=%d 总分不足=%d",
 		emotionPhase, len(diags), pass, fail, d1Zero, totalLow)
+	// 概览打日志：Pass 优先 + 总分降序，最多 8 条明细，避免 294 条候选把日志刷成泥潭
 	sort.Slice(diags, func(i, j int) bool {
 		if diags[i].Pass != diags[j].Pass {
-			return diags[i].Pass
+			return diags[i].Pass // Pass 优先（含一突/二突标记），先给最可能出信号的
 		}
-		return diags[i].Total > diags[j].Total
+		return diags[i].Total > diags[j].Total // 同 Pass 状态比总分
 	})
 	for i, d := range diags {
 		if i >= 8 {
@@ -976,24 +980,18 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 	if peak <= 0 {
 		peak = e.loadM8Peak()
 	}
-	rc := cfgMgr.GetRulesFor(userID).RiskCtrl
-	// §修复 R7（2026-08-29）：阈值接受正数（更直观，"回撤 10% 触发"直接写 10）或负数（旧口径）；
-	// 一律归一为负值口径参与比较，避免误填 0/正值导致 M8 静默失效且无告警。
-	// 0 或未设置视为关闭。
-	thr := rc.M8PortfolioDrawdownPct
-	if thr > 0 {
-		thr = -thr
-	}
-	if !rc.M8Enabled || thr >= 0 {
-		return // 未启用或阈值未配置（0）
+	// §F-7（20260917 缺陷修复批）启用判定收敛：阈值归一/开关检查并入 risk.M8CheckWith
+	// （全系统唯一实现，R7 正数归一口径原样保留），此处只做"未启用快速返回"的预检。
+	if !cfgMgr.GetRulesFor(userID).RiskCtrl.M8Enabled {
+		return
 	}
 	total := 0.0
 	for _, p := range positions {
 		price := p.CostPrice
 		if q := quotes[pureTsCode(p.TsCode)]; q != nil && q.Price > 0 {
-			price = q.Price // 缺行情的持仓按成本价兜底，保证估值连续
+			price = q.Price // 有实时价用实时价；缺行情的持仓按成本价兜底，保证估值连续不漏仓
 		}
-		total += price * float64(p.Qty)
+		total += price * float64(p.Qty) // 组合总市值 = Σ(价×量)
 	}
 	if total <= 0 {
 		return
@@ -1009,13 +1007,13 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		e.saveM8Peak(newPeak)
 		peak = newPeak
 	}
-	// 组合回撤触发判定（drawdown 为负值，与归一后的 thr 同口径比较）
-	drawdown := (total - peak) / peak * 100
-	if drawdown > thr {
+	// 组合回撤触发判定（§F-7：调用唯一权威实现 risk.M8CheckWith，原内联口径已并入）
+	verdict := risk.M8CheckWith(cfgMgr.GetRulesFor(userID), total, peak)
+	if verdict.Pass {
 		return
 	}
-	log.Printf("[qmt] M8 兜底触发: 组合市值 %.0f 自峰值 %.0f 回撤 %.1f%% ≤ 阈值 %.1f%% —— 全部自动卖出",
-		total, peak, drawdown, thr)
+	log.Printf("[qmt] M8 兜底触发: 组合市值 %.0f 自峰值 %.0f %s —— 全部自动卖出",
+		total, peak, verdict.Reason)
 	for _, p := range positions {
 		price := p.CostPrice
 		if q := quotes[pureTsCode(p.TsCode)]; q != nil && q.Price > 0 {
@@ -1031,7 +1029,7 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		remaining := p.Qty - filled
 		if remaining > 0 {
 			sid := fmt.Sprintf("%s:r%d", base, remaining)
-			_ = e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", fmt.Sprintf("M8组合回撤%.1f%%兜底清仓", drawdown))
+			_ = e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", verdict.Reason+"兜底清仓")
 		}
 	}
 }

@@ -1,3 +1,40 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// 文件概述（internal/server/server.go）
+//
+// 本文件实现量化交易系统的 HTTP 服务端（quant-trading-v2 的 Web/ API 入口），
+// 主要职责：
+//
+//  1. 路由注册（registerRoutes）：在一个 http.ServeMux 上集中注册全部 REST 端点，
+//     覆盖认证/初始化、看板数据、策略/D1/LLM/QMT 配置、模拟盘、实盘交易、
+//     持仓台账、自选股、消息中心、新闻归因、研究候选/回测、运维指标等。
+//
+//  2. 鉴权与访问控制：基于 Bearer Token 的会话认证（authMiddleware）、
+//     管理员角色门槛（adminMiddleware）、细粒度权限位门槛（permMiddleware）；
+//     配套登录/初始化端点的 IP 滑动窗口频控（ipLimiter）与
+//     高成本业务端点的按用户频控（userRateLimit）。
+//
+//  3. 多租户 / 多账号：租户级 API 频控（tenantLimiter）、按账号隔离的引擎
+//     控制面路由（ctrlFor/liveCtrlFor/dashFor，经 EngineRegistry 懒加载），
+//     运营数据统一归属管理员账号（operatorID）。
+//
+//  4. SSE 实时推送：SSEBroker 事件广播 + 一次性票据（sseTickets）鉴权，
+//     供浏览器 EventSource 建立只读事件流。
+//
+//  5. 通用中间件链（chain）：panic 恢复（recoverMiddleware）在最外层兜底，
+//     CORS（corsMiddleware）按同源/白名单收紧放行，二者包裹全部请求。
+//
+//  6. 安全加固：请求体大小上限（maxBodyBytes）、可信代理下的真实客户端 IP
+//     提取（clientIP/trustedProxyCIDRs）、外呼 URL 的 SSRF 校验
+//     （validatePublicURL）、密钥脱敏回显（maskSecret）等。
+//
+//  7. 缓存与兜底：看板快照原子落盘/回读（cacheDash/loadCachedDash）、
+//     宏观日历/IPO/新闻/同花顺板块等多级 TTL 缓存，以及内存为空时
+//     从磁盘回读当日 stage/signal 记录的兜底链路。
+//
+// 处理器实现按业务域拆分在同目录的其他文件（admin.go/paper.go/qmt.go/
+// research.go/handlers_fix.go/sse.go 等），本文件承载服务骨架与核心中间件。
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Package server HTTP 服务端：提供看板数据、策略配置、持仓管理、做空开关等 REST API。
 package server
 
@@ -67,6 +104,9 @@ type EngineController interface {
 	// 实盘/模拟盘两通道 pass/hold/block+原因，供审计端点回答"提醒了为何没成交"。
 	// English: recent signal-controller verdict tail (newest first) for the audit endpoint.
 	SignalVerdicts(limit int) []signalctl.Decision
+	// IgnoreSignal §F-1（20260917）：手动忽略信号——对 code@strategy 打失效墓碑并移除消息，
+	// 返回墓碑条数；strategy 为空忽略该 code 当日全部。
+	IgnoreSignal(code, strategy string) int
 	// 战法库（因子战法）：热重载 / 运行统计 / 前向收益记录（效果监测）。
 	// English: factor-strategy library: hot-reload / run stats / forward-return recording (monitoring).
 	ReloadFactorRules(dataDir string)
@@ -164,6 +204,9 @@ type EngineRegistry interface {
 	// English: updates the global strategy pool-type template and syncs every account's paper book
 	// (allocation; used on hot reload).
 	SetPaperPools(types []string)
+	// SetPaperConfig §F-4（20260917）账户级模拟盘撮合配置热同步：更新注册表模板与全部
+	// 已建账号引擎（POST /api/paper/config 消费，自本批起转正）。
+	SetPaperConfig(cfg paper.Config)
 	// SetPaperLabelResolver §C 注入规则池 ID→显示名 解析器（fac_1→"因子战法#1"），
 	// 同步到全部已建账号并供懒加载引擎继承。English: injects the rule-pool label resolver.
 	SetPaperLabelResolver(fn func(string) string)
@@ -435,6 +478,7 @@ func (s *Server) GetSSE() *SSEBroker { return s.sse }
 // registerRoutes 注册全部 HTTP 路由：
 // 认证/初始化（register/temp/login/setup）无需鉴权；业务 API 统一包一层 authMiddleware。
 func (s *Server) registerRoutes() {
+	// ── 认证/初始化端点：完全匿名可达（注册/临时号实际已关闭，返回 403 提示文案）──
 	s.mux.HandleFunc("POST /auth/register", s.handleRegister)
 	s.mux.HandleFunc("POST /auth/temp", s.handleTemp)
 	s.mux.HandleFunc("POST /auth/login", s.handleLogin)
@@ -480,6 +524,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/qmt", s.adminMiddleware(s.handleAdminGetQMTConfig))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/qmt", s.adminMiddleware(s.handleAdminSetQMTConfig))
 
+	// §E-1（20260917 全量对账）运维/机器端点无 UI 消费方属**有意设计**（curl/监控脚本/网关回调），
+	// 不算前端断链；新增前端调用前先确认页面归属。
 	s.mux.HandleFunc("GET /api/health", s.authMiddleware(s.handleHealth))
 	// §DAILY_OPSLOG 每日系统运行日志（管理员只读）：日期列表 + 按日内容（tail 截尾）
 	s.mux.HandleFunc("GET /api/opslog/dates", s.adminMiddleware(s.handleOpslogDates))
@@ -498,13 +544,13 @@ func (s *Server) registerRoutes() {
 	// §Dashboard 情绪面板 B：情绪×战法回测矩阵（候选逐事件断点缓存分相聚合）
 	// English: emotion × strategy matrix (B4 event cache bucketed by daily sentiment phase).
 	s.mux.HandleFunc("GET /api/research/emotion-strategy-matrix", s.authMiddleware(s.handleEmotionStrategyMatrix))
-	// 做多/做空开关：属运营配置，仅管理员可切换；状态对所有登录用户可读（看板展示用）。
+	// ── 做多/做空开关：属运营配置，仅管理员可切换；状态对所有登录用户可读（看板展示用）。──
 	// （Long/short toggles are operator config: only admin may toggle; status is readable by all.）
 	s.mux.HandleFunc("POST /api/long/toggle", s.adminMiddleware(s.handleLongToggle))
 	s.mux.HandleFunc("GET /api/long/status", s.authMiddleware(s.handleLongStatus))
 	s.mux.HandleFunc("POST /api/short/toggle", s.adminMiddleware(s.handleShortToggle))
 	s.mux.HandleFunc("GET /api/short/status", s.authMiddleware(s.handleShortStatus))
-	// 策略/D1/LLM 配置：运营配置系统级共享、仅管理员可读写（写会热替换全部账号引擎/新闻管线客户端）。
+	// ── 策略/D1/LLM 配置：运营配置系统级共享、仅管理员可读写（写会热替换全部账号引擎/新闻管线客户端）。──
 	// （Strategy/D1/LLM configs are operator-owned: admin-only read+write.）
 	s.mux.HandleFunc("GET /api/config/strategy", s.adminMiddleware(s.handleGetStrategyConfig))
 	// §GAP2-W2 权限收口：全局战法参数影响所有账号的实盘/模拟决策，写权限收敛到 admin
@@ -542,6 +588,11 @@ func (s *Server) registerRoutes() {
 	// English: paper strategy whitelist endpoints (read for authed users, write admin-only).
 	s.mux.HandleFunc("GET /api/paper/strategies", s.authMiddleware(s.handleGetPaperStrategies))
 	s.mux.HandleFunc("POST /api/paper/strategies", s.adminMiddleware(s.handleSetPaperStrategies))
+	// §F-4（20260917 缺陷修复批）模拟盘撮合配置读写：总开关/自动卖出/单笔资金/初始资金/做空预算
+	// 改后即热同步（main.go 与 Registry.SetPaperConfig 共用 paper.ConfigFromRules，重启不再是
+	// 唯一生效路径）。GET 登录可见，POST 限管理员。
+	s.mux.HandleFunc("GET /api/paper/config", s.authMiddleware(s.handleGetPaperConfig))
+	s.mux.HandleFunc("POST /api/paper/config", s.adminMiddleware(s.handleSetPaperConfig))
 	// 信号控制器裁定留痕审计（"提醒了为何没成交"一屏定位）。
 	// English: signal-controller verdict audit endpoint.
 	s.mux.HandleFunc("GET /api/signalctl/verdicts", s.authMiddleware(s.handleSignalVerdicts))
@@ -555,6 +606,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/paper/pool/config", s.adminMiddleware(s.handlePaperPoolConfig))
 	// 持仓（运营账本）：读对所有登录用户开放（系统级共享的大盘持仓）；写仅管理员可操作。
 	// （Positions: readable by all; writes are admin-only.）
+	// §E-1 对账：/api/positions 台账 CRUD/exit 系运营账本 API（前端持仓页实际走 /api/holdings 系），
+	// 当前无 UI 调用方；保留供脚本/后续台账页使用（非断链）。
 	s.mux.HandleFunc("POST /api/positions", s.adminMiddleware(s.handleCreatePosition))
 	s.mux.HandleFunc("PUT /api/positions/{id}", s.adminMiddleware(s.handleUpdatePosition))
 	s.mux.HandleFunc("DELETE /api/positions/{id}", s.adminMiddleware(s.handleDeletePosition))
@@ -681,12 +734,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/research/backtest-toggle", s.authMiddleware(s.handleResearchBacktestToggle))
 	s.mux.HandleFunc("POST /api/research/backtest-toggle", s.permMiddleware(auth.PermResearchApprove, s.handleResearchBacktestToggle))
 	// §WS-H C2 参数版本化：历史快照列表（auth 可见）+ 回滚（admin 专属，原子恢复+审计）
+	// §E-1 对账：配置快照/回滚 API 面已就绪但 UI 未接（docs/DEFECT_FIX_PLAN_20260917 E-1 台账），按需接。
 	s.mux.HandleFunc("GET /api/research/strategies/snapshots", s.authMiddleware(s.handleStrategySnapshots))
 	s.mux.HandleFunc("POST /api/research/strategies/rollback", s.adminMiddleware(s.handleStrategyRollback))
 	// §WS-K 维4 配置历史/回滚：快照+diff 列表（admin）、回滚恢复（admin）
 	s.mux.HandleFunc("GET /api/config/history", s.adminMiddleware(s.handleConfigHistory))
 	s.mux.HandleFunc("POST /api/config/rollback", s.adminMiddleware(s.handleConfigRollback))
 	// §WS-F C4a SSE 一次性票据签发端点（需认证）；SSE 建链用 /api/events?ticket=xxx（60s 一次性）。
+	// ── SSE 事件流：建链端点自带票据校验（不走 authMiddleware，因 EventSource 无法带 Authorization 头）──
 	s.mux.HandleFunc("POST /api/events/ticket", s.authMiddleware(s.handleSSETicket))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)
 }
@@ -702,6 +757,7 @@ const maxBodyBytes = 64 << 10
 // English: Serve starts the HTTP server. If QUANT_TLS_CERT/QUANT_TLS_KEY are set, it serves HTTPS.
 // Production TLS termination stays with Caddy; plaintext 8080 must never be exposed to the public net.
 func (s *Server) Serve(addr string) error {
+	// 读取 TLS 证书/私钥环境变量：两者齐备则走 HTTPS 直连（本地加密）；否则明文 HTTP
 	cert, key := os.Getenv("QUANT_TLS_CERT"), os.Getenv("QUANT_TLS_KEY")
 	if cert != "" && key != "" {
 		log.Printf("HTTPS server starting on %s (TLS: %s)", addr, cert)
@@ -767,6 +823,7 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 // request Host) or on the ALLOWED_ORIGINS whitelist; non-browser requests without an Origin header
 // fall back to "*". Cross-origin requests get no Allow-Origin header, so browsers block them.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	// 启动时一次性解析 ALLOWED_ORIGINS 环境变量，构建放行源白名单（精确匹配 origin 或其 host）
 	allowed := map[string]bool{}
 	for _, o := range strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",") {
 		if o = strings.TrimSpace(o); o != "" {
@@ -774,6 +831,8 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 逐请求判定放行策略：无 Origin（非浏览器）回退 *；
+		// 命中白名单（完整源 / host / 与 Host 同源）则回显该源；跨域一律不写 Allow-Origin。
 		origin := r.Header.Get("Origin")
 		allow := ""
 		switch {
@@ -785,8 +844,10 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		if allow != "" {
 			w.Header().Set("Access-Control-Allow-Origin", allow)
 		}
+		// 预检响应通用头：允许的方法与请求头（token 走 Authorization，无 cookie，不开 Credentials）
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// OPTIONS 预检直接终结，不进入业务 handler
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
 			return
@@ -822,6 +883,7 @@ func originMatchesHost(r *http.Request, origin string) bool {
 // chain 将多个中间件按顺序包装 next（外层 → 内层）。
 // recoverMiddleware 在最外层兜底 panic。
 func (s *Server) chain(next http.Handler) http.Handler {
+	// 中间件链由外到内：recover（兜底 panic）→ CORS → 业务路由
 	return s.recoverMiddleware(s.corsMiddleware(next))
 }
 
@@ -1018,6 +1080,7 @@ type ipLimiter struct {
 }
 
 // allow 滑动窗口判定：window 内该 IP 已达 max 次则拒绝。
+// 首次调用惰性初始化 map；每 sweepMod 次调用触发一次过期清扫，防止长期运行内存膨胀。
 func (l *ipLimiter) allow(ip string, max int, window time.Duration) bool {
 	now := time.Now()
 	l.mu.Lock()
@@ -1034,6 +1097,7 @@ func (l *ipLimiter) allow(ip string, max int, window time.Duration) bool {
 		l.sweep(now, 24*time.Hour)
 	}
 	recent := l.hits[ip][:0]
+	// 原地过滤：仅保留窗口内的请求时间戳（复用底层数组，避免每请求分配）
 	for _, t := range l.hits[ip] {
 		if now.Sub(t) < window {
 			recent = append(recent, t)
@@ -1106,7 +1170,14 @@ func (l *ipLimiter) sweep(now time.Time, maxAge time.Duration) {
 // defeat every anonymous rate limit. Now: untrusted peer → use peer address only; trusted proxy →
 // walk XFF right-to-left skipping trusted hops; QUANT_TRUSTED_PROXIES overrides the default CIDR set.
 
+// trustedProxyCIDRs 可信代理网段列表（§GAP2-W1）：
+// 默认覆盖环回 + RFC1918 内网 + 链路本地（适配 Caddy 与应用同机的反代部署），
+// 可用环境变量 QUANT_TRUSTED_PROXIES（逗号分隔 CIDR）整体覆盖；
+// 仅当 TCP 对端落在这此网段内时，才会采信其 X-Forwarded-For 头。
+// English: trusted proxy CIDR set (loopback/RFC1918/link-local by default, overridable via
+// QUANT_TRUSTED_PROXIES); XFF is honored only when the TCP peer is inside this set.
 var trustedProxyCIDRs = func() []*net.IPNet {
+	// 默认网段：环回（同机 Caddy 反代）+ RFC1918 内网 + 链路本地
 	cidrs := []string{
 		"127.0.0.0/8", "::1/128", // 环回（Caddy 同机反代）
 		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", // RFC1918 内网

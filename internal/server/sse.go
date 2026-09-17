@@ -108,6 +108,17 @@ type SSEBroker struct {
 	clients map[string]map[chan SSEEvent]struct{} // 账号 -> 该账号下订阅客户端 channel 集合
 	history map[string][]SSEEvent                 // 账号 -> 最近事件环形缓冲（含 id，供断线补发）
 	seq     uint64                                // 全局事件自增序号
+	// §F-6（20260917 缺陷修复批）real_advice 最后一轮定向广播快照（按账号）：
+	// GET /api/positions/advice 用它做 REST 回填——旧实现恒返空列表，断线超补发窗
+	// （history 200 条）或页面重载后卖出建议无从补齐，只能等下一次 5s 循环广播。
+	advMu   sync.Mutex
+	lastAdv map[string]adviceSnapshot // userID -> 最近一次 real_advice 事件
+}
+
+// adviceSnapshot 一轮 real_advice 广播的原始 JSON 与时间戳（原样暂存，读取方自行解析）。
+type adviceSnapshot struct {
+	at   time.Time
+	data []byte
 }
 
 // NewSSEBroker 创建 SSEBroker 实例，初始化账号映射与历史缓冲表。
@@ -115,6 +126,7 @@ func NewSSEBroker() *SSEBroker {
 	return &SSEBroker{
 		clients: make(map[string]map[chan SSEEvent]struct{}),
 		history: make(map[string][]SSEEvent),
+		lastAdv: make(map[string]adviceSnapshot),
 	}
 }
 
@@ -231,6 +243,30 @@ func (b *SSEBroker) BroadcastTo(userID string, v interface{}) {
 		b.pushToCh(ch, ev)
 	}
 	b.mu.Unlock()
+	// §F-6：real_advice 事件额外留存一份最新快照（供 REST 回填；不影响广播主路径）。
+	if m, ok := v.(map[string]interface{}); ok && m["type"] == "real_advice" {
+		b.advMu.Lock()
+		if b.lastAdv == nil {
+			b.lastAdv = make(map[string]adviceSnapshot)
+		}
+		b.lastAdv[userID] = adviceSnapshot{at: time.Now(), data: append([]byte(nil), data...)}
+		b.advMu.Unlock()
+	}
+}
+
+// LastRealAdvice 返回某账号最近一轮 real_advice 广播的原始 JSON 与时间戳（无记录返回 ok=false）。
+// 供 GET /api/positions/advice 做断线/重载后的 REST 回填（§F-6）。
+func (b *SSEBroker) LastRealAdvice(userID string) (data []byte, at time.Time, ok bool) {
+	if b == nil || userID == "" {
+		return nil, time.Time{}, false
+	}
+	b.advMu.Lock()
+	defer b.advMu.Unlock()
+	snap, found := b.lastAdv[userID]
+	if !found {
+		return nil, time.Time{}, false
+	}
+	return snap.data, snap.at, true
 }
 
 // Len 返回当前连接的 SSE 客户端总数（跨账号分组）。

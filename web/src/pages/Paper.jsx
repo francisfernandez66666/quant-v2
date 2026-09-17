@@ -1,6 +1,14 @@
 // ── 模拟盘页面 Paper.jsx ──
 // Paper trading: account state, strategy pools, positions/fills/orders, equity curve,
 // manual buy/trim/close, deposit, pool/cap config, pool reset, full liquidation.
+// 【页面职责概述】模拟盘（纸面交易）页面，主要包含五大块：
+//   1) 账户总览：绩效统计卡（总资产/收益/现金/胜率/滑点成本）与净值曲线（SVG 折线）；
+//   2) 分仓资金池：按池筛选持仓/成交/订单，展示各池收益与现金，支持单池清盘；
+//   3) 三张数据表：当前持仓 / 成交日志 / 订单记录，行可展开分时+盘口视图（MinuteView）；
+//   4) 手动交易：加仓/减仓/清仓弹窗、注入资金、全局清盘重置、引擎自检诊断；
+//   5) 配置管理：设置弹窗（资金分配/仓位上限/撮合设置/战法开关/买入纪律）与融券做空池管理。
+//   数据刷新策略：挂载加载一次 + SSE 事件（message/scan）驱动 + useSseRefresh 兜底轮询（§F5）；
+//   权限：页面仅管理员可操作（后端 403 时前端展示无权限面板），普通用户为只读手动记账视图。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
   Button, Dialog, Table, Tag, Card, Form, InputNumber, Input, Select, Tabs, Checkbox,
@@ -134,55 +142,97 @@ function StatCard({ label, children }) {
  * @returns {JSX.Element}
  */
 export default function Paper() {
+  // 模拟盘总开关（后端 rules.paper.enabled），随 load() 每次刷新更新
   const [enabled, setEnabled] = useState(false)
+  // 当前账号是否管理员：联动版标签、统计卡可见性、买回平仓等权限点
   const [isAdmin, setIsAdmin] = useState(false)
   // 后端鉴权拒绝（403）：模拟盘仅管理员可访问，后端据此决定，前端只负责展示。
   const [forbidden, setForbidden] = useState(false)
+  // 初始资金输入草稿（注入资金弹窗回填用，仅在为空时从后端回填一次）
   const [initialCapital, setInitialCapital] = useState('')
+  // 持仓上限输入草稿（与初始资金一起在注入资金时提交）
   const [maxPos, setMaxPos] = useState('')
+  // 已生效的全局持仓上限（0=不设限），设置弹窗回填与页头标签展示用
   const [appliedMax, setAppliedMax] = useState(0)
+  // 主内容区 Tabs：positions=当前持仓 / trades=成交日志 / orders=订单
   const [tab, setTab] = useState('positions')
   // §SHORT-4 融券做空卡数据（short_book.enabled=false 时整卡隐藏，决策⑤）
   const [shortBook, setShortBook] = useState(null)
+  // 全局账户统计（总资产/收益/胜率/滑点成本等），来自 fetchPaperState().stats
   const [stats, setStats] = useState(null)
+  // 持仓列表（api.fetchPaperPositions）
   const [positions, setPositions] = useState([])
+  // 成交记录列表（api.fetchPaperTrades）
   const [trades, setTrades] = useState([])
+  // 委托记录列表（api.fetchPaperOrders）
   const [orders, setOrders] = useState([])
+  // 净值曲线点位数组（api.fetchPaperEquity，元素形如 {value}）
   const [equity, setEquity] = useState([])
+  // 分仓资金池列表（key/label/cash/max_pos/buy_rule/stats/return_pct 等）
   const [pools, setPools] = useState([])
+  // 当前选中资金池的规范化 key（null=全部；'__other__'=其他/手动）
   const [activePool, setActivePool] = useState(null)
 
+  // 注入资金弹窗开关
   const [showDepositModal, setShowDepositModal] = useState(false)
+  // 清盘重置弹窗开关
   const [showResetModal, setShowResetModal] = useState(false)
+  // 统一设置弹窗开关（资金分配/仓位上限/撮合设置/战法开关/买入纪律）
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // 设置弹窗当前标签页：alloc/caps/engine/strategies/rules
   const [settingsTab, setSettingsTab] = useState('alloc')
   // §SIGNAL_CONTROLLER 模拟盘战法开关（白名单）：known=后端全集，stratOn=勾选映射，stratList=当前已列名集合
   const [stratKnown, setStratKnown] = useState([])
+  // 各战法勾选映射 {id: 是否允许}（战法开关标签页表单数据）
   const [stratOn, setStratOn] = useState({})
+  // 黑名单观察期标记：true 时战法开关页提示「命中只记录不拦截」
   const [stratShadow, setStratShadow] = useState(true)
+  // 注入资金表单金额（元）
   const [depositAmount, setDepositAmount] = useState(0)
+  // 清盘重置表单：重置后初始资金（0=按当前累计投入总额）
   const [resetToCapital, setResetToCapital] = useState(0)
+  // 清盘重置表单：重置后持仓上限（0=不设限）
   const [resetMaxPos, setResetMaxPos] = useState(0)
+  // 设置弹窗-全局持仓上限草稿（caps 标签页）
   const [cfgMaxPos, setCfgMaxPos] = useState(0)
+  // 设置弹窗-各池资金分配草稿 {poolKey: 金额}（alloc 标签页）
   const [cfgAllocs, setCfgAllocs] = useState({})
+  // 设置弹窗-各池持仓上限草稿 {poolKey: 数量}（caps 标签页）
   const [cfgCaps, setCfgCaps] = useState({})
+  // 设置弹窗-各池买入纪律草稿 {poolKey: {max_daily_buys/cooldown_minutes/min_score/budget_pct_per_day}}
   const [cfgRules, setCfgRules] = useState({})
+  // 设置弹窗-买入纪律当前选中的资金池 key
   const [cfgRuleSel, setCfgRuleSel] = useState('')
+  // 设置弹窗表单校验告警文案（资金超额/上限超额/白名单全空等）
   const [cfgWarn, setCfgWarn] = useState('')
+  // §F-4（20260917 缺陷修复批）撮合设置：账户级模拟盘参数（总开关/自动卖出/单笔资金/做空池），
+  // openSettingsModal 拉取回填，保存走 POST /api/paper/config（改后即热生效，不再需要重启）。
+  const [engCfg, setEngCfg] = useState(null)
 
+  // 自检诊断结果数据（开关/管理员/引擎路径/持仓成交文件状态/池分布）
   const [selfCheck, setSelfCheck] = useState(null)
+  // 自检结果弹窗开关
   const [selfCheckOpen, setSelfCheckOpen] = useState(false)
+  // 自检请求进行中（按钮 loading，防重复提交）
   const [selfCheckLoading, setSelfCheckLoading] = useState(false)
 
+  // 已展开分时图的行 key 集合（持仓行用 code，成交行用 trade_序号）
   const [klineOpen, setKlineOpen] = useState(new Set())
   // §F3 全局个股详情抽屉目标（{code,name}），null=关闭
   const [detail, setDetail] = useState(null)
+  // 移动端持仓行底部操作面板目标（null=关闭）
   const [sheetPos, setSheetPos] = useState(null)
+  // 移动端成交行底部操作面板目标（含 idx 便于展开对应分时）
   const [sheetTradeRow, setSheetTradeRow] = useState(null)
+  // 手动交易弹窗（加仓/减仓/清仓共用）开关
   const [tradeModal, setTradeModal] = useState(false)
+  // 交易方向：add=加仓 / trim=减仓 / close=清仓
   const [tradeDir, setTradeDir] = useState('add')
+  // 交易目标持仓记录
   const [tradeTarget, setTradeTarget] = useState(null)
+  // 交易表单委托价（0=留空，后端按实时价撮合）
   const [tradeFormPrice, setTradeFormPrice] = useState(0)
+  // 交易表单手数（1手=100股；清仓时不可编辑、固定全部持仓）
   const [tradeFormQty, setTradeFormQty] = useState(1)
 
   const W = 900, H = 220 // 净值曲线 SVG 的逻辑尺寸（viewBox 坐标，非真实像素）
@@ -444,6 +494,8 @@ export default function Paper() {
       known.forEach((v) => { on[v.id] = wl.length === 0 ? v.id !== 'momentum' : wl.includes(v.id) })
       setStratKnown(known); setStratOn(on); setStratShadow(!!r.shadow_blacklist)
     }).catch(() => {})
+    // §F-4 拉取撮合配置回填"撮合设置"标签页（失败置 null，标签页内显示加载失败占位）
+    api.fetchPaperConfig().then((c) => setEngCfg(c)).catch(() => setEngCfg(null))
     setCfgMaxPos(appliedMax > 0 ? appliedMax : 0)
     const allocs = {}, caps = {}, rules = {}
     pools.forEach((p) => {
@@ -504,6 +556,37 @@ export default function Paper() {
       catch (e) { showToast(e.message || '保存失败','error') }
       return
     }
+    // §F-2（20260917 缺陷修复批）战法开关保存：旧实现缺本分支——在"战法开关"标签页点保存
+    // 会落到下方仓位上限(caps)兜底分支，勾选静默丢失且意外提交 caps 草稿。
+    // 后端契约：只传 strategies，blacklist 省略=保持原值（setPaperStrategiesReq 指针字段语义）。
+    // 全不勾等价清空白名单=恢复默认全集（后端语义），易误操作，故至少保留一项。
+    if (settingsTab === 'strategies') {
+      const onList = Object.keys(stratOn).filter((k) => stratOn[k])
+      if (onList.length === 0) { setCfgWarn('至少保留一个战法：全部取消=清空白名单，后端将恢复默认全集（动量除外）'); return }
+      try {
+        await api.updatePaperStrategies(onList)
+        setSettingsOpen(false)
+        showToast('战法准入已更新（' + onList.length + ' 项开启）', 'success')
+        await load()
+      } catch (e) { showToast(e.message || '保存失败', 'error') }
+      return
+    }
+    // §F-4 撮合设置保存：只提交账户级参数（分池上限/资金仍走各自标签页），后端热生效。
+    if (settingsTab === 'engine') {
+      if (!engCfg) { showToast('撮合配置未加载，请重开设置弹窗', 'warning'); return }
+      try {
+        const res = await api.updatePaperConfig({
+          enabled: !!engCfg.enabled,
+          auto_sell: !!engCfg.auto_sell,
+          fixed_amount: Number(engCfg.fixed_amount) || 0,
+          short_capital: Number(engCfg.short_capital) || 0,
+        })
+        setSettingsOpen(false)
+        showToast(res && res.engine_enabled ? '撮合配置已保存，模拟盘即时生效' : '撮合配置已保存（模拟盘当前为关闭态）', 'success')
+        await load()
+      } catch (e) { showToast(e.message || '保存失败', 'error') }
+      return
+    }
     const caps = {}; let capSum = 0
     pools.forEach((p) => {
       const c = parseInt(cfgCaps[p.key], 10)
@@ -535,30 +618,41 @@ export default function Paper() {
   }
 
   // 挂载时加载模拟盘数据；§F5 刷新由 SSE 事件驱动 + 60s 兜底（原 15s 高频轮询）
+  // 依赖数组 []：本 effect 仅在首次挂载执行一次；后续刷新不靠其重跑，
+  // 而由 SSE 事件与兜底轮询直接调用 load()（load 内部用的是首屏闭包，
+  // 因此开关判断必须依赖新拉取的 st.enabled，见 load 内注释）。
   useEffect(() => { load() }, [])
+  // 订阅 message/scan 两类 SSE 事件：事件到达即调用 load() 全量重拉，组件卸载自动解除订阅。
+  // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
   useSseRefresh(['message', 'scan'], load) // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
 
   // ── 列定义 ──
   // 模拟盘持仓表格列定义：代码/名称/买卖时间/数量/成本/现价/浮盈/滑点/延迟/资金池/分时/操作
   const posColumns = [
+    // 代码列：点击打开全局个股详情抽屉（stopPropagation 避免触发行点击/展开）
     { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 100 },
+    // 买入时间列：优先展示撮合成交时间，悬浮可见「信号发出 → 撮合成交」完整时间线
     { colKey: 'time', title: '买入时间', width: 160, cell: ({ row }) => (
       <span title={'信号发出 ' + fmtTime(row.signal_at) + ' · 撮合成交 ' + fmtTime(row.filled_at)}>{fmtTime(row.filled_at || row.signal_at)}</span>
     ) },
     { colKey: 'qty', title: '数量', width: 70 },
     { colKey: 'cost', title: '成本价', width: 90, cell: ({ row }) => (row.cost_price || 0).toFixed(2) },
     { colKey: 'mark', title: '现价', width: 90, cell: ({ row }) => (row.mark || 0).toFixed(2) },
+    // 浮盈 / 浮盈% / 滑点 三列：均按正负红涨绿跌着色
     { colKey: 'pnl', title: '浮盈', width: 100, cell: ({ row }) => <span style={{ color: row.pnl >= 0 ? UP : DOWN }}>{fmt(row.pnl)}</span> },
     { colKey: 'pnlPct', title: '浮盈%', width: 90, cell: ({ row }) => <span style={{ color: row.pnl >= 0 ? UP : DOWN }}>{fmt(row.pnl_pct)}%</span> },
     { colKey: 'slip', title: '滑点', width: 90, cell: ({ row }) => <span style={{ color: row.slippage_pct >= 0 ? UP : DOWN }}>{fmt(row.slippage_pct)}%</span> },
     { colKey: 'lat', title: '延迟', width: 70, cell: ({ row }) => row.latency_sec + 's' },
+    // 池列：资金池 key 翻译为中文标签
     { colKey: 'pool', title: '池', width: 100, cell: ({ row }) => <Tag>{poolLabel(row.strategy_type)}</Tag> },
+    // 分时列：切换该持仓行展开分时+盘口视图
     { colKey: 'kline', title: '分时', width: 80, cell: ({ row }) => (
       <Button size="small" variant="text" onClick={(e) => { e.stopPropagation(); toggleKline(row.__key) }}>
         {klineOpen.has(row.__key) ? '收起' : '分时'}
       </Button>
     ) },
+    // 操作列：加仓/减仓/清仓，打开对应方向的手动交易弹窗
     { colKey: 'ops', title: '操作', width: 200, cell: ({ row }) => (
       <div style={{ display: 'flex', gap: 6 }}>
         <Button size="small" onClick={(e) => { e.stopPropagation(); openTrade(row, 'add') }}>加仓</Button>
@@ -574,15 +668,19 @@ export default function Paper() {
     { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
     { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 100 },
+    // 战法列：成交归属战法标签
     { colKey: 'strategy', title: '战法', width: 100, cell: ({ row }) => <Tag>{row.strategy}</Tag> },
     { colKey: 'qty', title: '数量', width: 70 },
     { colKey: 'price', title: '价格', width: 90, cell: ({ row }) => (row.price || 0).toFixed(2) },
     { colKey: 'amount', title: '金额', width: 100, cell: ({ row }) => fmt(row.amount) },
+    // 滑点列：仅买入且信号价有效时展示；成交价劣于信号价=成本增加（绿），优则节省（红）
     { colKey: 'slip', title: '滑点', width: 90, cell: ({ row }) => {
       const c = tradeSlippageCls(row)
       return <span style={c ? { color: clsColor(c) } : undefined}>{tradeSlippage(row)}</span>
     } },
+    // 延迟列：仅买入方向有信号→成交撮合延迟，卖出显示"—"
     { colKey: 'lat', title: '延迟', width: 70, cell: ({ row }) => (row.side === 'buy' ? (row.latency_sec || 0) + 's' : '—') },
+    // 分时列：展开该成交标的的分时+盘口视图
     { colKey: 'kline', title: '分时', width: 80, cell: ({ row }) => (
       <Button size="small" variant="text" onClick={(e) => { e.stopPropagation(); toggleKline(row.__key) }}>
         {klineOpen.has(row.__key) ? '收起' : '分时'}
@@ -596,12 +694,16 @@ export default function Paper() {
     { colKey: 'side', title: '方向', width: 80, cell: ({ row }) => <Tag theme={row.side === 'buy' ? 'success' : 'danger'}>{row.side === 'buy' ? '买入' : '卖出'}</Tag> },
     { colKey: 'code', title: '代码', width: 90, cell: ({ row }) => <span role="button" title="查看个股详情" onClick={(e) => { e.stopPropagation(); setDetail({ code: row.code, name: row.name }) }} style={{ color: 'var(--app-accent)', fontFamily: 'monospace', cursor: 'pointer' }}>{row.code}</span> },
     { colKey: 'name', title: '名称', width: 100 },
+    // 战法列：产生委托的战法（手动单为空显示"—"）
     { colKey: 'strategy', title: '战法', width: 110, cell: ({ row }) => <Tag>{row.strategy || '—'}</Tag> },
+    // 来源列：委托产生渠道（战法信号/手动操作），空显示"—"
     { colKey: 'kind', title: '来源', width: 90, cell: ({ row }) => <Tag>{row.kind || '—'}</Tag> },
+    // 状态列：中文文案 + 主题色（全部成交绿/部分成交黄/已拒绝红）
     { colKey: 'status', title: '状态', width: 90, cell: ({ row }) => <Tag theme={orderStatusTheme(row.status)}>{orderStatusText(row.status)}</Tag> },
     { colKey: 'qty', title: '数量', width: 70 },
     { colKey: 'price', title: '成交价', width: 90, cell: ({ row }) => (row.price ? row.price.toFixed(2) : '—') },
     { colKey: 'signal', title: '信号价', width: 90, cell: ({ row }) => (row.signal_price ? row.signal_price.toFixed(2) : '—') },
+    // 说明列：悬浮展示完整原因，超 18 字截断显示
     { colKey: 'reason', title: '说明', width: 160, ellipsis: true, cell: ({ row }) => <span title={row.reason || ''}>{shortReason(row.reason)}</span> },
   ]
 
@@ -613,21 +715,31 @@ export default function Paper() {
 
   return (
     <div className="page">
+      {/* 页头：标题 + 运行状态标签组 + 管理操作按钮组 */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
         <h2 style={{ fontSize: 18, fontWeight: 600 }}>模拟盘</h2>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          {/* 联动版标记：仅管理员可见（自动撮合 + 自动估值模式） */}
           {isAdmin && <Tag theme="warning" style={{ cursor: 'default' }}>联动版</Tag>}
+          {/* 运行状态标签：管理员=自动撮合中，普通用户=手动记账（静态），未启用提示配置键 */}
           <Tag theme={enabled ? 'success' : 'default'}>
             {enabled ? (isAdmin ? '自动撮合中' : '手动记账（静态）') : '未启用（rules.paper.enabled）'}
           </Tag>
+          {/* 持仓上限标签：仅启用时展示（0=不设限） */}
           {enabled && <Tag>上限：{appliedMax > 0 ? appliedMax + ' 只' : '不设限'}</Tag>}
+          {/* 注入资金入口：未启用时禁用 */}
           <Button theme="primary" disabled={!enabled} onClick={() => setShowDepositModal(true)}>＋ 注入资金</Button>
-          <Button disabled={!enabled} onClick={openSettingsModal}>⚙ 设置</Button>
+          {/* §F-4：未启用时管理员也要能打开设置（否则总开关永远无法从 UI 打开——先有鸡问题）；
+              普通用户未启用时维持禁用（其无写权限）。 */}
+          <Button disabled={!enabled && !isAdmin} onClick={openSettingsModal}>⚙ 设置</Button>
+          {/* 自检诊断入口：拉取引擎快照一致性结果并弹窗展示 */}
           <Button theme="default" loading={selfCheckLoading} onClick={runSelfCheck}>🔍 自检</Button>
+          {/* 全局清盘入口：未启用时禁用 */}
           <Button theme="danger" disabled={!enabled} onClick={() => setShowResetModal(true)}>清盘</Button>
         </div>
       </div>
 
+      {/* 403 无权限提示面板：普通账号访问时展示，引导改用管理员登录 */}
       {forbidden && (
         <div style={{ marginBottom: 12, padding: '18px 16px', borderRadius: 8, background: '#fff7e6', border: '1px solid #ffd591', color: 'var(--td-warning-color)', fontSize: 13 }}>
           🔒 无权限访问模拟盘：当前登录「{api.getAccount() || '未知'}」为普通用户，该页面仅管理员账号可操作。请使用管理员账号（用户名 admin）登录后再进行管理。
@@ -643,6 +755,7 @@ export default function Paper() {
         confirmBtn="确认注入"
       >
         <Form layout="vertical">
+          {/* 注入金额输入：增量计入现金，不影响现有持仓/净值/成交 */}
           <Form.FormItem label="金额（元）">
             <InputNumber value={depositAmount} min={0} step={1000} placeholder="10000" onChange={(v) => setDepositAmount(v || 0)} style={{ width: 240 }} />
           </Form.FormItem>
@@ -659,6 +772,7 @@ export default function Paper() {
       >
         <div style={{ color: 'var(--td-warning-color)', marginBottom: 8 }}>将平仓全部持仓、清除成交日志与净值曲线。</div>
         <Form layout="vertical">
+          {/* 重置参数：初始资金（留空=按当前累计投入）与持仓上限（0=不设限） */}
           <Form.FormItem label="重置后初始资金">
             <InputNumber value={resetToCapital} min={0} step={10000} placeholder="默认 100000" onChange={(v) => setResetToCapital(v || 0)} style={{ width: 240 }} />
             <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>元（不填则按当前累计投入总额重置）</span>
@@ -713,6 +827,39 @@ export default function Paper() {
               </Form.FormItem>
             ))}
           </Tabs.TabPanel>
+          {/* §F-4 撮合设置标签页：账户级模拟盘参数（总开关/自动卖出/单笔资金/做空池预算）。
+              旧缺陷：这些参数只能手改 config.json 并重启进程才生效（无端点、热同步函数死代码）。 */}
+          <Tabs.TabPanel value="engine" label="撮合设置">
+            {!engCfg ? (
+              <div style={{ padding: '6px 2px', color: 'var(--app-text-2)', fontSize: 12 }}>撮合配置加载失败，请关闭弹窗重试</div>
+            ) : (
+              <>
+                <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 8 }}>
+                  账户级撮合参数，保存后立即生效（无需重启）。总开关关闭时买入信号只提醒、不撮合。
+                </div>
+                {/* §F-4（20260917）：这些表单项不用 Form.FormItem 包裹——tdesign-react(v1.18)的
+                    FormItem 在脱离 <Form> 时会把无 name 子控件的受控 checked/value 强制改写为
+                    formValue(undefined)，导致勾选态/数值回填全部丢失（e2e 实锤：表格外 same-props
+                    checkbox 勾选正确、FormItem 内恒 false）。与「战法开关」tab 同构用纯 div 布局。 */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
+                  <span>模拟盘总开关</span>
+                  <Checkbox checked={!!engCfg.enabled} onChange={(v) => setEngCfg({ ...engCfg, enabled: !!v })}>{'启用自动撮合'}</Checkbox>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
+                  <span>自动卖出</span>
+                  <Checkbox checked={!!engCfg.auto_sell} onChange={(v) => setEngCfg({ ...engCfg, auto_sell: !!v })}>{'止盈止损/清仓告警自动平仓'}</Checkbox>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
+                  <span>每票固定买入资金（元）</span>
+                  <InputNumber value={engCfg.fixed_amount} min={0} step={1000} onChange={(v) => setEngCfg({ ...engCfg, fixed_amount: v || 0 })} style={{ width: 240 }} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
+                  <span>做空池预算（元，0=关闭做空侧）</span>
+                  <InputNumber value={engCfg.short_capital} min={0} step={10000} onChange={(v) => setEngCfg({ ...engCfg, short_capital: v || 0 })} style={{ width: 240 }} />
+                </div>
+              </>
+            )}
+          </Tabs.TabPanel>
           {/* §SIGNAL_CONTROLLER 战法开关标签页：模拟盘买入准入白名单（与实盘量化页开关同构语义） */}
           <Tabs.TabPanel value="strategies" label="战法开关">
             <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 8 }}>
@@ -760,6 +907,7 @@ export default function Paper() {
             )}
           </Tabs.TabPanel>
         </Tabs>
+        {/* 设置表单校验告警行：资金超额/上限超额/白名单全空等提示 */}
         {cfgWarn && <div style={{ color: 'var(--td-warning-color)', marginTop: 8 }}>{cfgWarn}</div>}
       </Dialog>
 
@@ -767,12 +915,14 @@ export default function Paper() {
       {enabled && pools.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 12 }}>
           <span style={{ color: 'var(--app-muted)', fontSize: 13 }}>分仓资金池</span>
+          {/* 「全部」标签：清空池筛选，展示全账户持仓总数 */}
           <Tag
             style={{ cursor: 'pointer', background: activePool === null ? 'var(--td-brand-color)' : undefined, color: activePool === null ? '#ffffff' : undefined, borderColor: activePool === null ? 'var(--td-brand-color)' : undefined }}
             onClick={() => setActivePool(null)}
           >
             全部（{positions.length} 仓）
           </Tag>
+          {/* 逐池标签：累计涨跌幅（红涨绿跌）/剩余现金/资金占比/仓位数；点击选中，再点取消 */}
           {pools.map((p) => {
             const key = normPoolKey(p.key)
             const active = activePool === key
@@ -786,6 +936,7 @@ export default function Paper() {
               </Tag>
             )
           })}
+          {/* 选中池时显示「清盘本池」：仅平仓该池持仓并回补池现金，不影响其他池 */}
           {activePool !== null && (
             <Button size="small" theme="warning" disabled={!enabled} onClick={confirmPoolReset}>清盘本池</Button>
           )}
@@ -848,7 +999,9 @@ export default function Paper() {
         <Card title={<span>净值曲线 <em style={{ color: 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>（{stats?.equity_curve_points || 0} 个交易日）</em></span>} style={{ marginBottom: 12 }}>
           {equity.length > 1 ? (
             <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: H }}>
+              {/* 净值折线主体：linePoints 由 equity 序列归一化映射到 viewBox 坐标 */}
               <polyline points={linePoints} fill="none" stroke="#FF4D4F" strokeWidth="2" />
+              {/* 三条水平参考网格线（画布 1/4、2/4、3/4 高度） */}
               {gridLines.map((lvl) => <line key={lvl.y} x1="0" y1={lvl.y} x2={W} y2={lvl.y} style={{ stroke: 'var(--app-divider)' }} />)}
             </svg>
           ) : <div className="muted" style={{ padding: 24, textAlign: 'center' }}>净值数据不足（自动撮合开启并产生成交后显示）</div>}
@@ -858,6 +1011,7 @@ export default function Paper() {
       {/* §SHORT-4 融券做空卡：做空池启用时显示（负持仓/担保/利息/权益 + 手动买回） */}
       {shortBook?.enabled && (
         <Card title={<span>融券做空 <em style={{ color: 'var(--app-muted)', fontSize: 12, fontStyle: 'normal' }}>（独立做空池 · 做空战法信号自动开仓 · T+1 可平）</em></span>} style={{ marginBottom: 12 }}>
+          {/* 做空池权益指标卡组：权益/可用现金/冻结保证金/浮动与已实现盈亏/累计融券利息 */}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 8 }}>
             <StatCard label="做空权益">¥{fmt(shortBook.equity)}</StatCard>
             <StatCard label="池内可用现金">¥{fmt(shortBook.cash)}</StatCard>
@@ -874,6 +1028,7 @@ export default function Paper() {
             </StatCard>
             <StatCard label="已计融券利息">¥{fmt(shortBook.fee_accrued)}</StatCard>
           </div>
+          {/* 空头持仓表：欠券数/开仓价/现价/浮动盈亏（空头盈亏=开仓价−现价−费用，按保证金基数计百分比） */}
           {(shortBook.positions || []).length ? (
             <Table rowKey="code" size="small" data={shortBook.positions}
               columns={[
@@ -894,6 +1049,7 @@ export default function Paper() {
                   )
                 } },
                 { colKey: 'fee', title: '已计息', width: 80, cell: ({ row }) => fmt(row.fee_accrued || 0) },
+                // 操作列：手动买回平仓（qty 传 0=全额买回），仅管理员可操作
                 { colKey: 'op', title: '操作', width: 90, cell: ({ row }) => (
                   <Button size="small" variant="outline" theme="primary" disabled={!isAdmin}
                     onClick={async () => {
@@ -921,6 +1077,7 @@ export default function Paper() {
                 expandedRow={renderKline}
                 expandedRowKeys={[...klineOpen]}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
+                // 移动端整行点击打开底部操作面板（桌面端不响应）
                 onRowClick={({ row }) => onRowTap(row)}
                 bordered
                 size="small"
@@ -947,6 +1104,7 @@ export default function Paper() {
                 expandedRow={renderKline}
                 expandedRowKeys={[...klineOpen]}
                 onExpandChange={(keys) => setKlineOpen(new Set(keys))}
+                // 移动端整行点击打开底部操作面板（带序号便于展开对应分时）
                 onRowClick={({ row }) => onTradeTap(row, row.__idx)}
                 bordered
                 size="small"
@@ -975,6 +1133,7 @@ export default function Paper() {
       {/* 移动端：持仓行操作菜单 */}
       <Dialog visible={!!sheetPos} header={sheetPos ? sheetPos.code + ' ' + sheetPos.name : ''} onClose={() => setSheetPos(null)} footer={null}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {/* 操作按钮组：详情抽屉 / 分时切换 / 加仓 / 减仓 / 清仓 / 取消 */}
           <Button block theme="primary" onClick={() => { const p = sheetPos; setSheetPos(null); if (p) setDetail({ code: p.code, name: p.name }) }}>详情</Button>
           <Button block onClick={sheetKline}>{sheetPos && klineOpen.has(sheetPos.code) ? '收起分时' : '展开分时'}</Button>
           <Button block onClick={() => sheetTrade('add')}>加仓</Button>
@@ -999,20 +1158,25 @@ export default function Paper() {
         header={(tradeDir === 'add' ? '加仓' : tradeDir === 'trim' ? '减仓' : '清仓') + (tradeTarget ? ' ' + tradeTarget.code + ' ' + tradeTarget.name : '')}
         onClose={() => setTradeModal(false)}
         onConfirm={confirmTrade}
+        // 确认按钮：减仓超卖(tradeOverSell)时禁用；清仓按钮用危险色
         confirmBtn={{ content: '确定', disabled: tradeOverSell, theme: tradeDir === 'close' ? 'danger' : 'primary' }}
       >
         <Form layout="vertical">
+          {/* 当前持仓回显：股数与成本价 */}
           <Form.FormItem label="当前持仓">
             <span>{tradeTarget?.qty} 股 / 成本 ¥{tradeTarget?.cost_price?.toFixed(2)}</span>
           </Form.FormItem>
+          {/* 委托价输入：留空(0)则后端按实时价撮合 */}
           <Form.FormItem label="价格">
             <InputNumber value={tradeFormPrice} step={0.001} placeholder="成交价格（留空用实时价）" onChange={(v) => setTradeFormPrice(v || 0)} style={{ width: 240 }} />
           </Form.FormItem>
+          {/* 手数输入：加/减仓可编辑（1手=100股），清仓固定为全部持仓 */}
           <Form.FormItem label={tradeDir === 'add' ? '加仓手数' : tradeDir === 'trim' ? '减仓手数' : '清仓'}>
             {tradeDir !== 'close'
               ? <InputNumber value={tradeFormQty} step={1} placeholder="手数（1手=100股）" onChange={(v) => setTradeFormQty(v || 1)} style={{ width: 240 }} />
               : <span>{tradeTarget?.qty} 股（全部）</span>}
           </Form.FormItem>
+          {/* 减仓预览：按手数×100 实时计算减仓后剩余股数 */}
           {tradeDir === 'trim' && tradePreviewQty > 0 && (
             <div style={{ color: 'var(--td-warning-color)' }}>减仓后：剩余 {tradeTarget.qty - tradePreviewQty * 100} 股</div>
           )}

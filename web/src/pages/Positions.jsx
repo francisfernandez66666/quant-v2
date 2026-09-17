@@ -1,5 +1,7 @@
 // ── 持仓管理页面 Positions.jsx ──
 // 纸面持仓（增删改/加减仓/改成本/清仓/批次明细） + 实盘持仓（QMT 网关对账 + 手动下单）。
+// 收益展示：纸面总盈亏（已实现+浮动，可一键清零） / 实盘总盈亏（QMT trades 汇总优先）；
+// 建议回看：实盘持仓「建议」列由 SSE real_advice 实时推送 + 挂载 REST 回填（§F-6）点亮。
 // 纯 TDesign 组件（Tabs / TabPanel / Card / Table / Dialog / Form / Input / InputNumber / Button / Tag），无自定义 CSS。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { Tabs, Card, Table, Dialog, Form, Input, InputNumber, Button, Tag, MessagePlugin } from 'tdesign-react'
@@ -62,6 +64,19 @@ export default function Positions() {
   const [realTrades, setRealTrades] = useState(null)
   // 实盘持仓建议映射（ts_code -> 建议）
   const [realAdvices, setRealAdvices] = useState({})
+  // §F-6（20260917 缺陷修复批）建议映射统一入口：SSE 实时推送与挂载 REST 回填共用。
+  // 把建议数组按 ts_code（缺省回退 code）归一成 {code: {action,label,ref_price,reason,level}} 映射，
+  // 保证两个来源写入同一份 state，覆盖顺序为「REST 先回填、SSE 后覆盖」。
+  function applyAdviceMap(advices) {
+    const m = {}
+    for (const a of (advices || [])) {
+      if (a && (a.ts_code || a.code)) {
+        const key = a.ts_code || a.code
+        m[key] = { action: a.action, label: a.label || a.action, ref_price: a.ref_price, reason: a.reason, level: a.level }
+      }
+    }
+    setRealAdvices(m)
+  }
   // 实盘是否启用
   const realEnabled = !!qmtState.enabled
   // 实盘网关是否熔断（熔断后禁止下单）
@@ -72,9 +87,9 @@ export default function Positions() {
   const [realFormPrice, setRealFormPrice] = useState(0)
   const [realFormQty, setRealFormQty] = useState(0)
   const [realFormStrategy, setRealFormStrategy] = useState('')
-  // 实盘下单提交中标记
+  // 实盘下单提交中标记（防重复提交）
   const [realSubmitting, setRealSubmitting] = useState(false)
-  // 实盘轮询定时器（30s）
+  // 实盘轮询定时器（进入实盘标签时启动）
   const realTimer = useRef(null)
 
   // 编辑中的持仓下标（-1 表示新增）
@@ -85,6 +100,7 @@ export default function Positions() {
   const [formQty, setFormQty] = useState(0)
   const [lookupName, setLookupName] = useState('')
   const [lookupPrice, setLookupPrice] = useState(0)
+  // 止盈/止损百分比（默认 +8% / -5%）
   const [formTp, setFormTp] = useState(8)
   const [formSl, setFormSl] = useState(5)
 
@@ -94,10 +110,15 @@ export default function Positions() {
   const [showCost, setShowCost] = useState(false)
   // 批次明细弹窗状态
   const [showLots, setShowLots] = useState(false)
+  // 加减仓弹窗的目标持仓
   const [lotTarget, setLotTarget] = useState(null)
+  // 改成本弹窗的目标持仓
   const [costTarget, setCostTarget] = useState(null)
+  // 批次明细弹窗的目标持仓
   const [lotsTarget, setLotsTarget] = useState(null)
+  // 加减仓方向（add=加仓 / sell=减仓）
   const [lotDir, setLotDir] = useState('add')
+  // 加减仓表单：成交价、成交数量、该持仓最新现价、改成本表单新成本价
   const [lotFormPrice, setLotFormPrice] = useState(0)
   const [lotFormQty, setLotFormQty] = useState(0)
   const [lotCurrentPrice, setLotCurrentPrice] = useState(0)
@@ -105,10 +126,14 @@ export default function Positions() {
 
   // 清仓弹窗状态与表单（清仓价、预览盈亏金额/比例、预览是否有效）
   const [showClose, setShowClose] = useState(false)
+  // 清仓弹窗的目标持仓
   const [closeTarget, setCloseTarget] = useState(null)
+  // 清仓价输入值
   const [closeFormPrice, setCloseFormPrice] = useState(0)
+  // 清仓盈亏预览：金额与百分比
   const [closePnlAmount, setClosePnlAmount] = useState(0)
   const [closePnlPct, setClosePnlPct] = useState(0)
+  // 预览是否有效（持仓与价格均合法才显示盈亏预览）
   const [closePreviewValid, setClosePreviewValid] = useState(false)
 
   // 可用资金编辑状态与输入值
@@ -518,19 +543,17 @@ export default function Positions() {
     unsubSSE.current = on(['real_advice', 'qmt_report', 'real_order'], (msg) => {
       // 实盘操作建议：按 ts_code 汇总成建议映射
       if (msg.type === 'real_advice' && Array.isArray(msg.advices)) {
-        const m = {}
-        for (const a of msg.advices) {
-          if (a && (a.ts_code || a.code)) {
-            const key = a.ts_code || a.code
-            m[key] = { action: a.action, label: a.label || a.action, ref_price: a.ref_price, reason: a.reason, level: a.level }
-          }
-        }
-        setRealAdvices(m)
+        applyAdviceMap(msg.advices)
       } else if (msg.type === 'qmt_report' || msg.type === 'real_order') {
         setQmtState((prev) => ({ ...prev, tripped: !!msg.tripped }))
         loadReal()
       }
     })
+    // §F-6（20260917 缺陷修复批）挂载 REST 回填：SSE 断线超补发窗/页面重载后，
+    // 先用服务端留存的最近一轮建议点亮"建议"列，后续仍由 SSE 实时覆盖。
+    api.fetchRealAdvice().then((r) => {
+      if (r && Array.isArray(r.advices) && r.advices.length) applyAdviceMap(r.advices)
+    }).catch(() => {})
     // 卸载时清理：纸面轮询/实盘轮询/SSE订阅
     return () => {
       if (timer.current) clearInterval(timer.current)

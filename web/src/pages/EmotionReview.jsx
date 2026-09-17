@@ -22,17 +22,23 @@ const EMOTION_COLOR = {
 }
 // 可切换的回看区间（交易日数）：30/60/120/250
 const RANGES = [30, 60, 120, 250]
+// SVG 画布尺寸与内边距（viewBox 坐标系）：宽/高、色带高、底部/顶部/左右留白
 const W = 1000, H = 320, RIBBON_H = 18, PAD_B = 44, PAD_T = 16, PAD_L = 46, PAD_R = 60
 
 // 情绪回看页（§C 档）：涨停柱 + 净值折线 + 相位色带三合一，区间 30/60/120/250 交易日。
 export default function EmotionReview() {
+  // 当前回看区间（交易日数，改动触发重新拉取）
   const [days, setDays] = useState(120)
   const [series, setSeries] = useState([])      // 情绪日历史（YYYY-MM-DD 升序）
   const [equity, setEquity] = useState([])      // 净值点 [{date,value}]
+  // 首屏加载态
   const [loading, setLoading] = useState(true)
+  // 接口错误信息（非阻断式提示）
   const [error, setError] = useState('')
   const [hover, setHover] = useState(null)      // 悬停的日期索引（信息条显示）
 
+  // 区间变化时拉取数据：情绪历史必定请求；账户净值失败静默吞掉（无模拟盘/非 admin 时右轴无数据）
+  // alive 标记防止卸载/快速切换区间后旧请求回调写 state。
   useEffect(() => {
     let alive = true
     setLoading(true)
@@ -102,6 +108,7 @@ export default function EmotionReview() {
     return m
   }, [series])
 
+  // 当前悬停日（hover 索引对应序列项，未悬停或越界为 null）
   const hoverDay = hover != null && series[hover] ? series[hover] : null
 
   return (
@@ -117,6 +124,7 @@ export default function EmotionReview() {
       }>
         {error && <div style={{ color: 'var(--app-warn-text)', fontSize: 13 }}>{error}</div>}
         {loading && <div className="muted" style={{ fontSize: 13 }}>加载 {days} 日情绪与净值…</div>}
+        {/* 空态：引擎从未跑过评分循环时无留痕数据 */}
         {!loading && !error && !series.length && (
           <div className="muted" style={{ padding: 24, textAlign: 'center' }}>
             暂无情绪留痕数据——引擎在交易时段跑过评分循环后每日落一条 market_risk_daily
@@ -176,7 +184,7 @@ export default function EmotionReview() {
               ))}
               {/* X 轴日期刻度（首/中/尾三点） */}
               {[0, Math.floor(geo.n / 2), geo.n - 1].map((i) => (
-                <text key={i} x={PAD_L + i * geo.step + geo.step / 2} y={H - 6} textAnchor="middle" fontSize="10" fill="var(--app-muted)">
+                <text key={'t' + i} x={PAD_L + i * geo.step + geo.step / 2} y={H - 6} textAnchor="middle" fontSize="10" fill="var(--app-muted)">
                   {(series[i]?.date || '').slice(5)}
                 </text>
               ))}

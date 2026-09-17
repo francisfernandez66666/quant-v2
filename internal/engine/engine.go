@@ -242,8 +242,8 @@ type Engine struct {
 // buyTask §A+B 异步下单任务：守卫已过的 buy 信号 + 已折算的 OrderRequest。
 // English: A+B async order task — a buy signal that passed all synchronous guards, with its computed OrderRequest.
 type buyTask struct {
-	req trading.OrderRequest
-	sig combat_agent.Signal
+	req trading.OrderRequest // 已通过同步守卫并折算好的下单请求（SignalID 幂等键）
+	sig combat_agent.Signal  // 触发本轮下单的买入信号（worker 日志与审计上下文）
 }
 
 // LastRunTiming 返回最近一轮 Run 的分段耗时（可能为 nil，Run 未执行过时）。
@@ -852,7 +852,10 @@ func (e *Engine) syncAccountConfig() {
 	// GetRulesFor().QMT) so a Load()-reset of the global rules can't transiently disable a live link.
 	if c := e.QMTController(); c != nil {
 		q := *cfgMgr.GetQMTConfigFor(userID)
-		q.Blacklist = append(q.Blacklist, cfgMgr.GetRulesFor(userID).Theme.BlackList...)
+		// §F-9（20260917 缺陷修复批）不再把 Theme.BlackList（板块名）并进个股黑名单：
+		// 板块名永远匹配不到纯代码（CodeInBlacklist 无命中），实际拦截由 signalctl 两通道的
+		// SectorBlacklist 独立生效（liveSignalPolicy/paperSignalPolicy 直读 Theme.BlackList）。
+		// 旧并线只污染下单守卫黑名单语义（§GAP1.7 的历史补偿，风控死代码删除后失去意义）。
 		// §QMT-PENDING 开关队列：普通配置变更只入队不立即生效，交易时段由 scoreCycle 的
 		// ApplyPendingConfig 消费（重建 executor）。防止休市时配置立即翻转实盘行为。
 		c.QueueConfigUpdate(q)
@@ -1122,6 +1125,35 @@ func (e *Engine) filterPaperAdmitted(uid string, sigs []combat_agent.Signal, now
 // English: recent controller verdict tail for the audit endpoint.
 func (e *Engine) SignalVerdicts(limit int) []signalctl.Decision {
 	return e.SignalCtl().Recent(limit)
+}
+
+// IgnoreSignal §F-1（20260917 缺陷修复批）：用户手动忽略信号——对该 code@strategy 打
+// 失效墓碑并同步移除消息中心条目（与引擎自动失效墓碑同口径，见 scoring_loop 失效墓碑）。
+// strategy 为空时忽略该 code 当日全部活跃固化信号。返回实际打墓碑的信号条数。
+// English: user-driven signal ignore — tombstone the pinned signal (code@strategy) and delete
+// the matching message-center item, same mechanism as engine-side invalidation tombstones.
+// Empty strategy tombstones every pinned signal of the code for today; returns tombstoned count.
+func (e *Engine) IgnoreSignal(code, strategy string) int {
+	if code == "" {
+		return 0
+	}
+	if strategy != "" {
+		e.signalStore.Invalidate(code, strategy)
+		e.msgStore.Delete(code + "@交易信号@" + strategy)
+		log.Printf("[engine] 用户忽略信号: %s(%s) 已打墓碑并移除消息", code, strategy)
+		return 1
+	}
+	n := 0
+	for _, s := range e.signalStore.List() {
+		if s.Code != code {
+			continue
+		}
+		e.signalStore.Invalidate(code, s.Strategy)
+		e.msgStore.Delete(code + "@交易信号@" + s.Strategy)
+		n++
+	}
+	log.Printf("[engine] 用户忽略信号: %s 全部战法, 墓碑 %d 条", code, n)
+	return n
 }
 
 // autoPlace AUTO_TRADING_PLAN M1：qmt.enabled + mode=auto 时把做多买入信号直连网关下单。
@@ -1777,7 +1809,7 @@ func (e *Engine) pushFreshHotspots(valid []newsagent.NewsEvent) {
 func (e *Engine) mergeSectorStocksIntoScores(ctx context.Context, sr *strategy_engine.StrategyResult, verifiedBull, verifiedBear []sector_agent.VerifiedSector, peScores map[string]float64) map[string]string {
 	// 1. 收拢全部板块成分股（去重），并记录每个 code 所属板块的事件标题（做多板块种子）
 	type secInfo struct {
-		eventTitle string
+		eventTitle string // 该成分股所属利好板块的事件标题（做多板块种子，D1 上下文注入用）
 	}
 	secOf := make(map[string]secInfo)
 	// 遍历验证通过的做多板块：取正分板块的事件标题/板块名作为该板块成分股的归因事件标题。
@@ -2394,8 +2426,8 @@ const consultBlockCacheTTL = 60 * time.Second
 
 // consultBlockEntry 单股数据块缓存项。
 type consultBlockEntry struct {
-	text string
-	at   time.Time
+	text string    // 缓存的单股行情数据块文本（注入咨询 system 用）（cached quote context text）
+	at   time.Time // 写入时间（距 now < consultBlockCacheTTL 时命中缓存）（write time for TTL check）
 }
 
 // buildStockBlock 组装单只股票的实时行情数据块（含 60s 缓存）。
@@ -4385,7 +4417,7 @@ func (e *Engine) feedRPS(boards []data.SectorInfo) {
 		return
 	}
 	// br 板块行情行：代码 + 名称 + 当日/次日涨跌幅。
-	type br struct {
+	type br struct { // 板块行情行：代码 + 名称 + 当日/次日涨跌幅
 		code, name string
 		d1, d2     float64
 	}
@@ -4480,7 +4512,7 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 		return
 	}
 	if topN <= 0 {
-		topN = 20
+		topN = 20 // 未配置时的兜底默认值，保证每板块覆盖面稳定
 	}
 
 	// 第一遍：仅收集需要拉成分股的板块（串行、无网络 IO），按所属事件下标分组。
@@ -4526,9 +4558,9 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	// capped by the per-source rate limiters, so THS/EastMoney are never hammered; the serial
 	// O(N×T) cost over N sectors drops to ~O(T).）
 	type result struct {
-		code   string
-		stocks []data.StockInfo
-		err    error
+		code   string           // 板块代码（回传任务标识，串行注入按此对账）
+		stocks []data.StockInfo // 拉取到的板块成分股 topN（THS 优先、东财兜底）
+		err    error            // 拉取失败原因（非 nil 时该板块本轮不注入，仅记日志）
 	}
 	// sectorFetchWorkers 板块行情并发拉取的工作协程数。
 	const sectorFetchWorkers = 6
@@ -5122,6 +5154,8 @@ func (e *Engine) SectorLinkageLeaders(pool []data.LimitUpStock) []sector_agent.L
 // sectorLinkageObserve 板块联动观察钩子（§P2.2）：Enhance.SectorLinkage 开启时识别当日龙头并
 // 记录为观察字段/e.sectorLeaders，供前端与后续"板块成分股 × 板块资金流 → 联动候选"接入使用。
 // 完整候选生成依赖成分股与资金流源（接口 FindLinkageCandidates 已就绪并有单测）；此处先观察、
+// TODO(§F-7 状态标注)：本特性截至 20260917 为"仅观察、零行为变化"——sectorLeaders 只写不读、
+// FindLinkageCandidates 生产零调用；接入交易意图产出前不要依赖 Enhanced.SectorLinkage 开关。
 // 零行为变化。关闭时零操作。English: sector-linkage observation hook (P2.2). When enabled, records
 // today's leaders into e.sectorLeaders for the frontend and the future "constituents × flow →
 // candidates" wiring. Candidate generation needs the constituents/flow sources (FindLinkageCandidates
@@ -5237,7 +5271,7 @@ func (e *Engine) calibrateMacroCalendarOnceToday() {
 
 	var chat data.ChatFunc
 	if llm != nil {
-		chat = llm.Chat
+		chat = llm.Chat // 可选 LLM 出口：nil 时校准内部静默降级为公式推算，不阻断
 	}
 	src, n := data.CalibrateMacroCalendar(chat, mg.CalibrateAPIURL, e.macroCalCachePath, time.Now().Year(), mg.CalibrateHorizonMonths())
 	log.Printf("[engine] §P6 宏观日历校准完成: 来源=%s 校准事件=%d", src, n)

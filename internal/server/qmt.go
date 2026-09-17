@@ -50,6 +50,7 @@ type knownStrategyInfo struct {
 // "allow all" default (the mis-trade root cause).
 func (s *Server) knownStrategyList() []knownStrategyInfo {
 	list := []knownStrategyInfo{
+		// 内置形态战法五件套：kind 统一为 form（§20260917 动量战法显式入列受开关管控）。
 		{ID: "dragon", Name: "龙头战法 Dragon", Kind: "form"},
 		{ID: "double_bump", Name: "双响炮 DoubleBump", Kind: "form"},
 		{ID: "n_shape", Name: "N形超短 NShape", Kind: "form"},
@@ -57,7 +58,9 @@ func (s *Server) knownStrategyList() []knownStrategyInfo {
 		{ID: "momentum", Name: "动量战法 Momentum", Kind: "form"},
 	}
 	// 追加战法库已启用的规则进白名单（因子 fac_ 与形态 pat_）。
+	// researchDir 为空（研究库未配置）时跳过，白名单退化为仅内置战法。
 	if s.researchDir != "" {
+		// 因子规则：只透出 Enabled=true 的（停用规则不允许实盘准入）。
 		if es, err := research.ListAppliedFactorRules(s.researchDir); err == nil {
 			for _, e := range es {
 				if e.Enabled {
@@ -81,7 +84,7 @@ func (s *Server) knownStrategyList() []knownStrategyInfo {
 	hasFactorEntry := false
 	for _, k := range list {
 		if k.Kind == "factor" || k.Kind == "pattern" {
-			hasFactorEntry = true
+			hasFactorEntry = true // 已有因子/形态条目则无需再放"波动突破"入口
 			break
 		}
 	}
@@ -119,7 +122,9 @@ func (s *Server) qmtReportMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, 401, "missing authorization token")
 			return
 		}
-		// 仅允许携带「网关 token」的请求（回报/对账），普通用户 token 一律拒绝
+		// 仅允许携带「网关 token」的请求（回报/对账），普通用户 token 一律拒绝。
+		// 命中时把解析出的账号写入请求上下文（ctxUserKey），后续 handler 用 userIDFor 取用，
+		// 等价于普通用户鉴权中间件的效果，但身份来源是网关 token 而非会话。
 		if uid := s.userForQMTToken(token); uid != "" {
 			u := &auth.User{ID: uid}
 			next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, u)))
@@ -137,8 +142,10 @@ func (s *Server) qmtReportMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // removing the byte-level timing side channel; accounts without a configured token are skipped.
 func (s *Server) userForQMTToken(token string) string {
 	if s.cfg == nil || token == "" {
-		return ""
+		return "" // 配置层未接入/请求未带 token：直接无匹配
 	}
+	// 遍历所有账号：取每个账号 rules.qmt.token 与请求 token 常量时间比对。
+	// 账号量级有限（<百），线性扫描可接受；命中即返回（token 与账号一一对应）。
 	for _, u := range s.auth.ListUsers() {
 		cfgToken := s.cfg.GetRulesFor(u.ID).QMT.Token
 		if cfgToken == "" {
@@ -199,6 +206,7 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// English: §F2 name backfill — gateway reconciliation omits name; fill it from the quote
 	// snapshot so the real-positions table shows stock names, response-layer only (no persist).
 	for i := range positions {
+		// 名称兜底优先级：DB 已有名称 → stockName（基础信息表）→ quoteDisplay（行情快照）。
 		if positions[i].Name == "" {
 			if n := s.stockName(positions[i].TsCode); n != "" {
 				positions[i].Name = n
@@ -206,6 +214,7 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 				positions[i].Name = si.Name
 			}
 		}
+		// 现价兜底：行情快照有价才覆盖（快照缺失时保留 DB 侧 CurPrice，前端至少不显示 0）。
 		if si := s.quoteDisplay(positions[i].TsCode); si != nil && si.Price > 0 {
 			positions[i].CurPrice = si.Price
 		}
@@ -221,6 +230,8 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 	// positions (live price first, cost price as fallback); available cash stays 0 (unknowable here —
 	// the frontend distinguishes by updated_at).
 	if acc.UpdatedAt == "" && len(positions) > 0 {
+		// 兜底估值循环：逐只累加"现价×数量"（现价缺失回退成本价），得到近似市值/总值。
+		// 可用资金无法推算（本地无从知道冻结现金），保持 0 由前端按 updated_at 区分展示。
 		var mv float64
 		for i := range positions {
 			price := positions[i].CurPrice
@@ -233,11 +244,11 @@ func (s *Server) handleRealPositions(w http.ResponseWriter, r *http.Request) {
 		acc.TotalAsset = mv
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"positions": positions,
-		"account":   acc,
-		"enabled":   ctrl != nil && ctrl.Enabled(),
-		"tripped":   ctrl != nil && ctrl.Tripped(),
-		"mode":      ctrlMode(ctrl),
+		"positions": positions,                     // 持仓列表（已补名称/现价）
+		"account":   acc,                           // 账户资产快照（可能经市值兜底回填）
+		"enabled":   ctrl != nil && ctrl.Enabled(), // 实盘链路是否启用
+		"tripped":   ctrl != nil && ctrl.Tripped(), // 熔断是否触发
+		"mode":      ctrlMode(ctrl),                // 执行模式 manual/auto
 	})
 }
 
@@ -274,12 +285,40 @@ func (s *Server) handleRealAdvice(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]interface{}{"advices": []trading.PositionAdvice{}, "tripped": ctrlTripped(s, userIDFor(r))})
 		return
 	}
-	// 复用引擎分析能力：通过引擎暴露的行情/分数上下文不可得（分析在 5s 循环内实时推送），
-	// HTTP 端点仅返回最近一轮 SSE 已广播的建议（由前端 SSE 持续更新），此处返回空表由前端展示 SSE 数据。
-	// English: the advice is computed live inside the 5s scoring loop and pushed via SSE; this endpoint
-	// only acknowledges the source of truth (SSE). An empty list here is fine — the frontend consumes the
-	// SSE stream.
-	writeJSON(w, 200, map[string]interface{}{"advices": []trading.PositionAdvice{}, "tripped": ctrlTripped(s, userIDFor(r))})
+	// §F-6（20260917 缺陷修复批）REST 回填：返回 SSE 中心留存的最近一轮 real_advice 广播
+	// （断线超出补发缓冲或页面重载后不再丢建议；旧实现恒返空表只能等下一次 5s 广播）。
+	// 新鲜度：建议按 5s 循环滚动，超过 10 分钟视为过期回空表（休市陈旧快照不当作现值建议）。
+	// English: §F-6 — return the broker's last real_advice broadcast snapshot (reconnect/reload
+	// backfill); payloads older than 10 minutes are treated as stale and reported empty.
+	// 依次尝试调用方账号 → 运营账号两个缓存键（多账号实盘下子账号可能共享运营账号的引擎轮次）。
+	uid := userIDFor(r)
+	for _, key := range []string{uid, s.operatorID()} {
+		if key == "" {
+			continue // 空键跳过（未登录/未配置运营账号）
+		}
+		// LastRealAdvice 返回最近一次广播的原始 JSON 与时间戳；未广播过（ok=false）或
+		// 已过期（>10min）都继续尝试下一个键。
+		raw, at, ok := s.sse.LastRealAdvice(key)
+		if !ok || time.Since(at) > 10*time.Minute {
+			continue
+		}
+		// 解包广播 payload 中真正给前端的 advices 数组；解包失败视为缓存损坏，继续尝试。
+		var payload struct {
+			Advices []trading.PositionAdvice `json:"advices"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			continue
+		}
+		// 命中：返回缓存建议 + 缓存时间（cached_at 供前端展示新鲜度）。
+		writeJSON(w, 200, map[string]interface{}{
+			"advices":   payload.Advices,
+			"tripped":   ctrlTripped(s, uid),
+			"cached_at": at.Format(time.RFC3339),
+		})
+		return
+	}
+	// 从未广播过（引擎未跑/无建议轮次）：维持空表形状。
+	writeJSON(w, 200, map[string]interface{}{"advices": []trading.PositionAdvice{}, "tripped": ctrlTripped(s, uid)})
 }
 
 // ctrlTripped 返回某账号 QMT 控制器熔断状态。
@@ -326,10 +365,11 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "qmt not enabled")
 		return
 	}
-	side := req.Side
+	side := req.Side // 方向缺省按买入（与前端缺省行为一致）
 	if side == "" {
 		side = trading.SideBuy
 	}
+	// 基础参数校验：代码/数量/价格三者缺一不可（价格是限价参考价，0 价无意义）。
 	if req.Code == "" || req.Qty <= 0 || req.Price <= 0 {
 		writeError(w, 400, "code/qty/price required")
 		return
@@ -347,9 +387,10 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		}
 		qty = 100 // 不足一手按一手（100 股）
 	}
-	// 卖出侧校验：减仓数量不得超过当前持仓
+	// 卖出侧校验：减仓数量不得超过当前持仓（超卖会被网关拒，这里前置拦截给用户明确报错）。
 	if side == trading.SideSell {
 		if db := s.realDB(); db != nil {
+			// 只在能查到持仓且持仓 >0 时校验（DB 不可用/无持仓行时放行给引擎/网关裁决）。
 			if p, err := db.RealPositionByCodeForUser(uid, normalizeTsCode(req.Code)); err == nil && p.Qty > 0 && qty > p.Qty {
 				writeError(w, 400, "sell qty exceeds holding")
 				return
@@ -362,19 +403,23 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	//   - 限价偏离市价 ±20% 也直发（手滑输错价 = 真金白银）；
 	//   - 陈旧度未提供（StaleQuoteGuard 恒跳过）。
 	var q *data.StockInfo
-	var staleMs int64 = -1
+	var staleMs int64 = -1 // -1=无行情（StalenessMs 未知，守卫跳过）；取到行情后置 0（新鲜）
 	if s.market != nil {
+		// best-effort 拉实时行情：失败/无价不阻断下单（fail-open）。
 		if qq, qerr := s.market.GetRealtimeQuote(normalizeTsCode(req.Code)); qerr == nil && qq != nil && qq.Price > 0 {
 			q = qq
 		}
 	}
 	if q != nil {
+		// §P1-7 限价偏离检查：委托价偏离现价超 ±15% 且未显式确认 → 400 拒绝（防手滑输错价）。
 		if dev := (req.Price - q.Price) / q.Price; (dev > 0.15 || dev < -0.15) && !req.ConfirmDeviation {
 			writeError(w, 400, fmt.Sprintf("委托价 %.2f 偏离现价 %.2f 超 ±15%%（%.1f%%），请核对价格后确认提交",
 				req.Price, q.Price, dev*100))
 			return
 		}
 	}
+	// 幂等键构造：客户端 UUID 合法（格式/长度通过）则以 clientID 组键（重试复用同键防重复下单）；
+	// 缺省/非法回退秒级时间戳键（兼容旧客户端，双击跨秒会各自成单——旧行为）。
 	clientID := ""
 	if cid := strings.TrimSpace(req.ClientID); cid != "" && len(cid) <= 64 && regClientID.MatchString(cid) {
 		clientID = cid
@@ -396,6 +441,8 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 	if q != nil {
+		// 装配行情上下文：现价供风控闸；PrevClose 供涨跌幅校验（§P1-5 显式昨收，
+		// 源未提供时回退旧 Close 字段语义）；staleMs=0 表示行情新鲜。
 		oreq.CurrentPrice = q.Price
 		oreq.PrevClose = q.PrevClose // §P1-5 显式昨收；未装配的源回退旧 Close 语义
 		if oreq.PrevClose <= 0 {
@@ -404,6 +451,7 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		staleMs = 0
 	}
 	oreq.StalenessMs = staleMs
+	// 提交订单：走控制器全链路风控（风控闸/熔断/预算/白名单），拒绝原因原样回给前端。
 	res, err := ctrl.PlaceOrder(oreq)
 	if err != nil {
 		writeError(w, 400, "order rejected: "+err.Error())
@@ -490,7 +538,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 	}
 	ctrl := s.qmtCtrlFor(uid)
 	if ctrl != nil {
-		// 上行通道新鲜度：任何回报到达都刷新 last_report_at（互通健康展示用）
+		// 上行通道新鲜度：任何回报到达都刷新 last_report_at（互通健康展示用）。
+		// SetLastReport 同时记录事件类型，/api/qmt/state 据此渲染上行新鲜度与最近事件。
 		ctrl.SetLastReport(ev.Type)
 	}
 
@@ -510,8 +559,11 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// Go 侧一个畸形/伪造的空数组仍会清空本账号持仓。规则：本地该账号仍有持仓而快照为空 →
 		// 不可信，拒收并告警（409=永久拒绝进 outbox_dead 隔离，不无限重推）。合法全平不受影响：
 		// 先经 trade 回报逐笔清零持仓行，或由 /state 周期对账（Controller.Reconcile 带 connected 守卫）落账。
+		// 注意守卫只对"空快照"生效——非空快照仍按全量 reconcile 正常落账。
 		if len(ev.Positions) == 0 {
+			// 先查本地该账号当前持仓：仍有持仓却收到空快照 → 判定不可信。
 			if held, herr := db.RealPositionsForUser(owner); herr == nil && len(held) > 0 {
+				// 三路告警：服务端日志 + 运维日志 + 定向前端 SSE（positions_clear_guard 事件）。
 				log.Printf("[trading] ⚠ positions 空快照但本地仍有 %d 持仓(用户=%s)——判定不可信，拒绝全清", len(held), owner)
 				opslog.Logf("quant", "持仓全清守卫触发 用户=%s 本地持仓=%d 空快照被拒（若为真实全平请走成交回报/对账通道）", owner, len(held))
 				if s.sse != nil {
@@ -524,12 +576,15 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// 守卫通过（空快照且本地确实无持仓，或非空快照）：按用户范围全量对账落库。
+		// ReconcilePositionsForUser 以本账号为界做 upsert+删除，绝不触碰其它账号数据。
 		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions); err != nil {
 			writeError(w, 500, "reconcile positions: "+err.Error())
 			return
 		} else {
 			log.Printf("[trading] 网关全量对账(用户=%s): %d 持仓", owner, n)
-			// §DAILY_OPSLOG 每日至首次对账记一行（对账每分钟跑，全记会淹没核心记录）
+			// §DAILY_OPSLOG 每日至首次对账记一行（对账每分钟跑，全记会淹没核心记录）。
+			// DayOnce 以 "reconcile:<uid>" 为当日去重键，同日重复对账只记首次。
 			opslog.DayOnce("reconcile:"+owner, func() {
 				opslog.Logf("quant", "首次持仓对账 用户=%s 持仓=%d", owner, n)
 			})
@@ -555,6 +610,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[trading] advance order status: %v", err)
 			}
 			if !advanced {
+				// 本地无此单（网侧重放/对端先于下单回报到达）：补插完整委托行。
 				if _, err := db.UpsertRealOrder(store.RealOrder{
 					OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
 					Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
@@ -564,6 +620,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 					log.Printf("[trading] upsert order: %v", err)
 				}
 			} else if ev.Status != "已报" {
+				// 状态有实际推进（非停留在"已报"）：打日志留痕；Reason 是柜台废单/拒单原因（尽力透传）。
 				log.Printf("[trading] 委托状态推进 %s: %s (order=%s%s)", ev.SignalID, ev.Status, ev.OrderID,
 					func() string {
 						if ev.Reason != "" {
@@ -587,9 +644,12 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// §安全 T3：先归一方向，非预期值直接报错，避免误走卖分支清零持仓。
 		tradeSide, sErr := normalizeReportSide(ev.Side)
 		if sErr != nil {
+			// trade 直接拒收（400）：方向不明绝不能默认按卖处理，否则会静默清零持仓。
 			writeError(w, 400, sErr.Error())
 			return
 		}
+		// ApplyRealFill 事务内完成：成交流水插入（signal_id 幂等，重复回报整体回滚）
+		// + 持仓更新（买入加权成本 / 卖出按加权成本实现盈亏 / 清仓删行）。
 		if err := db.ApplyRealFill(store.RealFill{
 			OrderID: ev.OrderID, Code: ev.Code, Side: tradeSide, Price: ev.Price,
 			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: ev.SignalID,
@@ -647,7 +707,8 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SSE 推前端
+	// SSE 推前端：无论事件类型，统一以 qmt_report 事件向归属账号定向广播摘要
+	// （前端实盘页据此即时刷新；完整明细以 DB/各专用事件为准）。
 	if s.sse != nil {
 		s.sse.BroadcastTo(uid, map[string]interface{}{
 			"type":  "qmt_report",
@@ -659,6 +720,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			"time":  time.Now().Format("15:04:05"),
 		})
 	}
+	// 回报受理成功，返回 ok 让网关 outbox 标记完成（否则会重推）。
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
@@ -748,14 +810,17 @@ func (s *Server) handleSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 // endpoint and the admin per-account endpoint so validation/save semantics stay identical.
 func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, req setQMTConfigReq) {
 	// §WS-K 维4 保存前快照上一版 config.json（全局无 store 路径；best-effort，失败仅告警不阻断）。
+	// beforeBytes 留作之后 diff 审计用；快照文件供回滚/追溯。
 	// English: WS-K 维4 — snapshot the previous config.json before saving (best-effort).
 	beforeBytes, _ := config.RestoreRulesContentCurrent(s.cfg)
 	_, _ = config.SnapshotRules(s.cfg)
+	// 以目标账号当前配置为基线做局部合并（值拷贝，改完一次性写回）。
 	cfg := *(s.cfg.GetQMTConfigFor(target))
 
+	// ---- 以下逐字段按「指针非 nil 才生效」合并，枚举/范围非法直接 400 拒绝 ----
 	if req.Mode != nil {
 		m := strings.TrimSpace(*req.Mode)
-		if m != "manual" && m != "auto" {
+		if m != "manual" && m != "auto" { // 枚举校验：只允许手动/自动两种执行模式
 			writeError(w, 400, "mode 仅允许 manual/auto")
 			return
 		}
@@ -763,7 +828,7 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	}
 	if req.PriceType != nil {
 		p := strings.TrimSpace(*req.PriceType)
-		if p != "market" && p != "limit" {
+		if p != "market" && p != "limit" { // 枚举校验：市价/限价
 			writeError(w, 400, "price_type 仅允许 market/limit")
 			return
 		}
@@ -771,6 +836,7 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	}
 	if req.GatewayURL != nil {
 		u := strings.TrimSpace(*req.GatewayURL)
+		// 仅对"非空且发生变更"的新地址做校验，避免每次保存都外呼。
 		if u != "" && u != cfg.GatewayURL {
 			// 网关为内部可信端点（本机/局域网），用宽松校验（允许环回/私网），
 			// 不能用公网外呼的 validatePublicURL（会拒绝 127.0.0.1/内网地址）。
@@ -782,13 +848,14 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		cfg.GatewayURL = u
 	}
 	if req.Token != nil && *req.Token != "" && !isMaskedSecret(*req.Token) {
+		// token 三重条件：显式携带、非空、非脱敏哨兵（前端回显的掩码串不回写覆盖真值）。
 		cfg.Token = strings.TrimSpace(*req.Token)
 	}
 	if req.Enabled != nil {
-		cfg.Enabled = *req.Enabled
+		cfg.Enabled = *req.Enabled // 实盘总开关（热同步走 §QMT-PENDING 队列，halted 例外见后）
 	}
 	if req.AutoSell != nil {
-		cfg.AutoSell = *req.AutoSell
+		cfg.AutoSell = *req.AutoSell // 自动卖出开关（尾盘清仓等）
 	}
 	if req.FixedAmount != nil {
 		if *req.FixedAmount < 0 {
@@ -866,13 +933,15 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		cfg.CloseSweepAt = v
 	}
 	if req.Strategies != nil {
+		// 战法白名单：逐项去空格、去重、校验必须在已知战法集合内（未知战法 400 拒绝）。
+		// out 允许为空数组——空数组语义 = 不设白名单（全部允许），与引擎口径一致。
 		seen := map[string]bool{}
 		out := make([]string, 0, len(*req.Strategies))
 		knownSet := s.knownStrategyIDSet()
 		for _, v := range *req.Strategies {
 			v = strings.TrimSpace(v)
 			if v == "" || seen[v] {
-				continue
+				continue // 空串/重复项跳过
 			}
 			if !knownSet[v] {
 				writeError(w, 400, "未知战法: "+v)
@@ -884,12 +953,13 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 		cfg.Strategies = out // 空数组 = 不设白名单（全部允许）
 	}
 	if req.StrategyAmounts != nil {
+		// 各战法资金覆盖：key 同样必须在白名单集合内；金额范围 0-1000000。
 		out := map[string]float64{}
 		knownSet := s.knownStrategyIDSet()
 		for k, v := range *req.StrategyAmounts {
 			k = strings.TrimSpace(k)
 			if k == "" {
-				continue
+				continue // 空 key 忽略
 			}
 			if !knownSet[k] {
 				writeError(w, 400, "未知战法: "+k)
@@ -935,13 +1005,16 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 			}
 		}
 	}
-	// §WS-F C1 审计：QMT 配置变更留痕（enabled 翻转为"上线/下线"，其余为"hot_reload"）
+	// §WS-F C1 审计：QMT 配置变更留痕（enabled 翻转为"上线/下线"，其余为"hot_reload"）。
+	// 事件名映射：本次携带 enabled 字段时按落库后的 cfg.Enabled 定为上线(qmt_go_live)/
+	// 下线(qmt_shutdown)；未携带则统一记热更新。
 	event := "qmt_config_hot_reload"
 	if req.Enabled != nil {
 		event = map[bool]string{true: "qmt_go_live", false: "qmt_shutdown"}[cfg.Enabled]
 	}
 	opslog.Audit(event, actor, target, "ok")
 	// 诊断日志：记录每次保存的真实账号、目标 enabled 与落盘后回读值，确认是否真正写盘。
+	// saved 是落库后回读值——与 cfg.Enabled 不一致说明写盘链路有问题（排查"开关变回关闭"）。
 	saved := s.cfg.GetQMTConfigFor(target)
 	log.Printf("[diag-qmt] POST qmt config target=%s operator=%s reqEnabled=%v savedEnabled=%v", target, s.operatorID(), cfg.Enabled, saved.Enabled)
 	log.Printf("[trading] qmt 配置已更新: enabled=%v mode=%s price=%s max_pos=%d fixed=%.0f strategies=%v",
@@ -962,6 +1035,7 @@ func (s *Server) handleQMTState(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// 已接入：直接透出控制器健康快照（下行探测/上行回报新鲜度/熔断详情/资金等）。
 	writeJSON(w, 200, ctrl.Snapshot())
 }
 
@@ -986,9 +1060,10 @@ func (s *Server) handleQMTOrders(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "list orders: "+err.Error())
 		return
 	}
-	today := cntime.In(time.Now()).Format("2006-01-02")
+	today := cntime.In(time.Now()).Format("2006-01-02") // 北京时间当日（created_at 以北京时间落库）
 	out := make([]store.RealOrder, 0, len(orders))
 	for _, o := range orders {
+		// 按当日前缀过滤：created_at 形如 "2026-09-17 09:31:00"，前缀匹配即当日委托。
 		if strings.HasPrefix(o.CreatedAt, today) {
 			out = append(out, o)
 		}
@@ -1013,10 +1088,12 @@ func (s *Server) handleQMTHalt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body: 需要 {\"halted\": true|false}")
 		return
 	}
-	uid := userIDFor(r)
-	cfg := *(s.cfg.GetQMTConfigFor(uid))
-	cfg.Halted = *req.Halted
-	s.cfg.SetQMTConfigFor(uid, &cfg)
+	uid := userIDFor(r)                  // kill-switch 作用于当前登录账号（admin 权限中间件已保证）
+	cfg := *(s.cfg.GetQMTConfigFor(uid)) // 值拷贝：基于当前配置做单字段覆盖，避免读到一半被并发改写
+	cfg.Halted = *req.Halted             // 本次只翻转 halted 字段，其余保持原值
+	s.cfg.SetQMTConfigFor(uid, &cfg)     // 持久化（跨重启保留）
+	// 立即执行 kill-switch：绕过 §QMT-PENDING 开关队列（见 applyKillSwitchNow 注释），
+	// 返回本次同步撤销的在途未成交委托笔数。
 	cancelled := s.applyKillSwitchNow(uid, &cfg, "endpoint")
 	writeJSON(w, 200, map[string]interface{}{"ok": "1", "halted": *req.Halted, "cancelled": cancelled})
 }
@@ -1148,6 +1225,8 @@ func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := ctrl.CancelOrder(orderID); err != nil {
+		// 失败分类：报文含 not connected/circuit 属网关不可达或熔断 → 502（可稍后重试）；
+		// 其余（已成交/已撤/不可撤等状态冲突）→ 409（重试无意义）。
 		msg := err.Error()
 		if strings.Contains(msg, "not connected") || strings.Contains(msg, "circuit") {
 			writeError(w, 502, "撤单失败: "+msg)
@@ -1167,9 +1246,11 @@ func (s *Server) handleQMTCancel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleQMTBroker(w http.ResponseWriter, r *http.Request) {
 	ctrl := s.qmtCtrlFor(userIDFor(r))
 	if ctrl == nil {
+		// 未接入实盘：不报错（保持 200），由前端按 ok:false 展示"未接入"。
 		writeJSON(w, 200, map[string]interface{}{"ok": false, "broker": "", "err": "not enabled"})
 		return
 	}
+	// 查询网关 active 通道状态：err=网关探测失败（200+ok:false，不当作 HTTP 错误）。
 	st, err := ctrl.GatewayBrokerStatus()
 	if err != nil {
 		writeJSON(w, 200, map[string]interface{}{"ok": false, "broker": "", "err": err.Error()})
@@ -1183,7 +1264,7 @@ func (s *Server) handleQMTBroker(w http.ResponseWriter, r *http.Request) {
 // English: admin-only gateway broker switch (POST /api/qmt/broker).
 func (s *Server) handleQMTBrokerSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Broker string `json:"broker"`
+		Broker string `json:"broker"` // 目标通道：xt=miniqmt 兼容主路径 / queued=内置桥兜底
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Broker) == "" {
 		writeError(w, 400, "invalid request body: 需要 {\"broker\":\"xt\"|\"queued\"}")
@@ -1194,6 +1275,7 @@ func (s *Server) handleQMTBrokerSwitch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "real book not available")
 		return
 	}
+	// 切换校验与执行在控制器侧：非法通道名/切换中失败都会带原因返回。
 	if err := ctrl.SwitchGatewayBroker(req.Broker); err != nil {
 		writeError(w, 502, "切换失败: "+err.Error())
 		return
@@ -1207,12 +1289,14 @@ func (s *Server) handleQMTBrokerSwitch(w http.ResponseWriter, r *http.Request) {
 // English: derives the strategy tag from a buy signal_id; sells are attributed to the position's
 // entry strategy tracked during replay (the sell key encodes exit class, not origin strategy).
 func qmtStrategyOf(signalID string) string {
+	// 买入信号键形如 buy:600519.SH:龙抬头:2026-09-17，第 3 段即战法名。
 	if strings.HasPrefix(signalID, "buy:") {
 		parts := strings.Split(signalID, ":")
-		if len(parts) >= 3 && parts[2] != "" {
+		if len(parts) >= 3 && parts[2] != "" { // 战法段缺失/为空 → 回退 manual
 			return parts[2]
 		}
 	}
+	// sell:*/manual@… 等非买入键统一归 manual（卖出按持仓入场战法归因，见调用方）。
 	return "manual"
 }
 
@@ -1240,13 +1324,15 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "read fills: "+err.Error())
 		return
 	}
-	// 归属过滤：空 user_id = 遗留全局行，对所有人可见（§GAP1.10 口径）
+	// 归属过滤：空 user_id = 遗留全局行，对所有人可见（§GAP1.10 口径）；
+	// 非空行只保留本账号的，避免跨账号流水泄漏。
 	fills := make([]store.RealFill, 0, len(allFills))
 	for _, f := range allFills {
 		if f.UserID == "" || f.UserID == uid {
 			fills = append(fills, f)
 		}
 	}
+	// 按成交时间升序排序：盈亏重放（加权成本法）必须按时间序计算才准确。
 	sort.Slice(fills, func(i, j int) bool { return fills[i].TradedAt < fills[j].TradedAt })
 
 	// 当前实盘账本持仓：①计算浮动盈亏（unrealized）；②为"对账来源持仓"（成交簿无买入记录）的
@@ -1256,6 +1342,7 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "read positions: "+err.Error())
 		return
 	}
+	// posCost：当前实盘持仓的每股成本（代码→成本价），供"成交簿无买入口"的卖出定价。
 	posCost := make(map[string]float64, len(positions))
 	for _, p := range positions {
 		posCost[p.TsCode] = p.CostPrice
@@ -1285,23 +1372,24 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 		return v
 	}
 
-	realized := 0.0
+	realized := 0.0 // 累计已实现盈亏
 	wins, losses := 0, 0
 	for _, f := range fills {
-		ps := stratState[f.Code]
+		ps := stratState[f.Code] // 取该代码的重放状态（无则初始化空状态）
 		if ps == nil {
 			ps = &posState{}
 			stratState[f.Code] = ps
 		}
-		amt := f.Price * float64(f.Qty)
+		amt := f.Price * float64(f.Qty) // 本笔成交金额（买卖同式，直接进战法统计）
 		switch f.Side {
 		case "买入":
+			// 买入：新数量摊薄加权成本 =（旧成本×旧量+本笔金额）/ 新量。
 			newQty := ps.qty + f.Qty
 			if newQty > 0 {
 				ps.cost = (ps.cost*float64(ps.qty) + amt) / float64(newQty)
 			}
 			ps.qty = newQty
-			ps.strategy = qmtStrategyOf(f.SignalID)
+			ps.strategy = qmtStrategyOf(f.SignalID) // 记录该持仓的入场战法（卖出据此归因）
 			buyStat := statFor(ps.strategy)
 			buyStat.Buys += amt
 			buyStat.Count++
@@ -1340,19 +1428,21 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			sellStat := statFor(k)
 			sellStat.Sells += amt
 			if pricable {
-				sellStat.Realized += sellPnl
+				sellStat.Realized += sellPnl // 无成本基准的退出不计入战法盈亏
 			}
 			sellStat.Count++
-			ps.qty -= sellQty
+			ps.qty -= sellQty // 重放扣减持仓量（可为 0，不删除状态以便后续同码成交）
 		}
 	}
 
+	// 浮动盈亏 = Σ（最新市值 − 持仓量×成本价）；市值取最近一次网关对账快照的 Amount。
 	unrealized := 0.0
 	for _, p := range positions {
 		unrealized += p.Amount - float64(p.Qty)*p.CostPrice
 	}
 
-	// 流水倒序输出最近 100 笔并附战法标签
+	// 流水倒序输出最近 100 笔并附战法标签。
+	// start 为窗口起点：全量超过 100 笔时只展示末尾 100 笔（新的在前）。
 	outFills := make([]map[string]interface{}, 0, len(fills))
 	start := 0
 	if len(fills) > 100 {
@@ -1360,6 +1450,7 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := len(fills) - 1; i >= start; i-- {
 		f := fills[i]
+		// 标签策略：买入直接从 signal_id 解析；卖出沿用重放状态里的入场战法；兜底 manual。
 		strat := stratState[f.Code]
 		tag := "manual"
 		if f.Side == "买入" {

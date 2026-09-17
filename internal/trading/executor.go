@@ -8,7 +8,6 @@
 package trading
 
 import (
-	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
@@ -104,15 +103,9 @@ func (NoopExecutor) State() (*GatewayState, error) {
 // Health 空实现：返回未连接。
 func (NoopExecutor) Health() (bool, error) { return false, nil }
 
-// ConfigReader 配置读取接口：控制器从配置管理器热读 QMT 段（避免引入 config.Manager 依赖）。
-// English: ConfigReader abstracts hot-reading the QMT config section (avoids a hard dependency on the
-// config.Manager).
-type ConfigReader interface {
-	QMTConfigFor(userID string) config.QMTConfig
-}
-
 // QuoteProvider 实时行情提供接口：控制器计算建议/下单参考价时读取现价。
 // English: QuoteProvider abstracts realtime quote lookups for advice/order reference prices.
 type QuoteProvider interface {
+	// Quote 返回指定代码的实时行情快照（StockInfo）；无数据时返回 nil。
 	Quote(code string) *data.StockInfo
 }

@@ -87,10 +87,11 @@ export default function Signals() {
   const [paperOn, setPaperOn] = useState(false)
   // §SHORT-4 做空开关（决策⑤）：关闭时列表整体隐藏做空信号；开启后追加方向筛选与红徽标
   const [shortEnabled, setShortEnabled] = useState(false)
+  // 当前方向筛选（all/做多/做空，仅做空开关开启时生效）
   const [activeDir, setActiveDir] = useState('all')
   // 待确认交易的信号对象
   const [tradeTarget, setTradeTarget] = useState({})
-  // 待确认交易动作（buy/ignore）
+  // 待确认交易动作（buy=买入 / ignore=忽略）
   const [tradeAction, setTradeAction] = useState('')
   // §F5 兜底轮询定时器（20s，此前 5s；新信号主要靠 SSE scan 即时刷新）
   const timer = useRef(null)
@@ -102,7 +103,7 @@ export default function Signals() {
   // sorters at all) and the user's chosen sort survives the 5s signal-list poll.
   const [sort, setSort] = useState(null)
 
-  // 从信号列表中提取全部战法名称作为筛选下拉选项
+  // 从信号列表中提取全部战法名称作为筛选下拉选项（去重）
   const strategyOptions = Array.from(new Set(signals.map((s) => s.strategy).filter(Boolean)))
 
   // §SHORT-4 做空显隐（决策⑤）：开关关闭时做空战法信号不进列表；开启后按方向筛选
@@ -145,10 +146,17 @@ export default function Signals() {
   }
 
   // 执行买入或忽略操作并刷新信号列表
+  // §F-1/F-3（20260917）：忽略带战法定位（后端墓碑，绝不触下单）；买入在链路未启用时收到
+  // status=noop+原因，明确提示而非伪装成功。
   async function doAction(action) {
     try {
-      await api.actionSignal(tradeTarget.code, action)
+      const res = await api.actionSignal(tradeTarget.code, action, tradeTarget.strategy)
       setShowConfirm(false)
+      if (res && res.status === 'noop') {
+        MessagePlugin.warning(res.reason || '实盘链路未启用，本次操作未执行；模拟成交请用「模拟买入」')
+      } else if (res && res.status === 'ignored') {
+        MessagePlugin.success('已忽略 ' + tradeTarget.code)
+      }
       await load()
     } catch (e) {
       setShowConfirm(false)
@@ -231,6 +239,7 @@ export default function Signals() {
 
   // §F5 SSE 新信号/扫描到达时刷新列表（改走 App 单连接扇出的事件总线，不再各页自建 SSE 连接）
   const unsubBus = useRef(null)
+  // 事件总线回调：收到「新信号」或「完成一轮扫描」事件时重新拉取信号列表
   function handleSSE(msg) {
     if (msg.signal || msg.type === 'scan') load()
   }
