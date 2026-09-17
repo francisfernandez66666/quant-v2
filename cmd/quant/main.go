@@ -386,7 +386,8 @@ func main() {
 	registry.SetAutoPaperCheck(authMgr.IsAdmin)
 	// §P1-4 透传管理员判定，使共享引擎的实盘账本/QMT 控制器默认归属管理员账号。
 	registry.SetAdminCheck(authMgr.IsAdmin)
-	registry.SetPaperPools(server.ActivePaperPoolTypes(dataDir))
+	// §SIGNAL_CONTROLLER P3：池模板按运营账号的模拟盘战法白名单装配（momentum 显式列名才开池）。
+	registry.SetPaperPools(server.ActivePaperPoolTypes(dataDir, cfgMgr.GetRulesFor("").Paper.Strategies))
 	// §C 规则细分池显示名解析器：fac_1/pat_2 → "因子战法#1" 等（分仓条可读）
 	registry.SetPaperLabelResolver(server.LibraryLabelResolver(dataDir))
 	// 盘后落库：每个交易日收盘后把模拟盘当日成交 + 每日快照导出研究库，供自动研究消费。

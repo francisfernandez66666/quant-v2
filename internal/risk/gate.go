@@ -23,6 +23,7 @@ import (
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 )
 
@@ -38,15 +39,16 @@ const (
 // English: the risk view of an order — all fields the gate needs, assembled by the controller from the
 // order request; quote fields that are absent make their gates fail open.
 type LiveOrder struct {
-	SignalID   string
-	Code       string
-	Name       string
-	Strategy   string
-	StrategyID string
-	Side       string
-	Price      float64
-	Qty        int
-	Amount     float64
+	SignalID     string
+	Code         string
+	Name         string
+	Strategy     string
+	StrategyID   string
+	StrategyType string
+	Side         string
+	Price        float64
+	Qty          int
+	Amount       float64
 
 	// StalenessMs 行情快照陈旧度（毫秒；-1=未提供，StaleQuoteGuard 跳过）。
 	// CurrentPrice 现价（集中度闸用；0=未提供）。PrevClose 昨收（涨跌停闸用；0=未提供）。
@@ -309,18 +311,22 @@ func (g *Gate) checkConcentration(cfg config.QMTConfig, o LiveOrder) string {
 	return ""
 }
 
-// checkWhitelist 策略白名单过滤（仅买方向；卖出不受限——退出的持仓其战法可能不在白名单，
-// 拦截卖出会强迫扛单）。English: strategy whitelist filter (buy-only; sells exempt so exits aren't blocked).
+// checkWhitelist 策略白名单校验（仅买方向；卖出不受限——退出的持仓其战法可能不在白名单，
+// 拦截卖出会强迫扛单）。§SIGNAL_CONTROLLER 20260917：判定逻辑不再本地实现，统一调用
+// signalctl.AdmitStrategy——与信号控制器 live 通道同一成员资格规则（规范键 StrategyType 优先、
+// 空白名单=内置四形态+库规则默认全集、动量/未知来源必须显式列名），作为下单前最后防线保留
+// （正常路径信号已在控制器裁定时被拦，走到这里说明调用方绕过了编排——仍需兜底）。
+// English: delegates the strategy-membership check to signalctl.AdmitStrategy — single shared
+// rule, kept here as a last-line guard for paths that bypass the orchestrator's admission.
 func (g *Gate) checkWhitelist(cfg config.QMTConfig, o LiveOrder) string {
-	if o.Side != SideBuy || len(cfg.Strategies) == 0 || o.Strategy == "" {
+	if o.Side != SideBuy || o.Strategy == "" {
 		return ""
 	}
-	for _, s := range cfg.Strategies {
-		if s == o.Strategy || s == o.StrategyID {
-			return ""
-		}
+	sig := combat_agent.Signal{Code: o.Code, Strategy: o.Strategy, StrategyID: o.StrategyID, StrategyType: o.StrategyType}
+	if ok, _ := signalctl.AdmitStrategy(signalctl.Policy{Strategies: cfg.Strategies}, sig); !ok {
+		return fmt.Sprintf("strategy %q not in qmt whitelist", o.Strategy)
 	}
-	return fmt.Sprintf("strategy %q not in qmt whitelist", o.Strategy)
+	return ""
 }
 
 // checkMaxPositions 仓位上限校验（仅买方向，按账号过滤）：max_positions>0 且当前持仓数已达上限。

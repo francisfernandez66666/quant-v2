@@ -30,6 +30,7 @@ import (
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
@@ -62,6 +63,10 @@ type EngineController interface {
 	// DashboardData 返回该账号/引擎的当前看板快照（信号/评分/新闻事件/开关状态等）。
 	// English: returns the current dashboard snapshot for this account/engine (signals/scores/news/toggles).
 	DashboardData() *display.DashboardData
+	// SignalVerdicts §SIGNAL_CONTROLLER 返回该引擎信号控制器最近的裁定留痕（最新在前）——
+	// 实盘/模拟盘两通道 pass/hold/block+原因，供审计端点回答"提醒了为何没成交"。
+	// English: recent signal-controller verdict tail (newest first) for the audit endpoint.
+	SignalVerdicts(limit int) []signalctl.Decision
 	// 战法库（因子战法）：热重载 / 运行统计 / 前向收益记录（效果监测）。
 	// English: factor-strategy library: hot-reload / run stats / forward-return recording (monitoring).
 	ReloadFactorRules(dataDir string)
@@ -532,6 +537,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/paper/orders", s.authMiddleware(s.handlePaperOrders))
 	s.mux.HandleFunc("GET /api/paper/equity", s.authMiddleware(s.handlePaperEquity))
 	s.mux.HandleFunc("GET /api/paper/selfcheck", s.authMiddleware(s.handlePaperSelfCheck))
+	// §SIGNAL_CONTROLLER 模拟盘战法开关（白名单语义与实盘 /api/config/qmt.strategies 同构）：
+	// 读对已登录账号开放，写限管理员（模拟盘为运营数据）。
+	// English: paper strategy whitelist endpoints (read for authed users, write admin-only).
+	s.mux.HandleFunc("GET /api/paper/strategies", s.authMiddleware(s.handleGetPaperStrategies))
+	s.mux.HandleFunc("POST /api/paper/strategies", s.adminMiddleware(s.handleSetPaperStrategies))
+	// 信号控制器裁定留痕审计（"提醒了为何没成交"一屏定位）。
+	// English: signal-controller verdict audit endpoint.
+	s.mux.HandleFunc("GET /api/signalctl/verdicts", s.authMiddleware(s.handleSignalVerdicts))
 	s.mux.HandleFunc("POST /api/paper/sell", s.adminMiddleware(s.handlePaperSell))
 	s.mux.HandleFunc("POST /api/paper/buy", s.adminMiddleware(s.handlePaperBuy))
 	// §SHORT-4 融券做空手动端点（开仓/买回）

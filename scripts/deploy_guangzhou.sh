@@ -149,7 +149,10 @@ if [ $SYNC_ONLY -eq 1 ]; then
   echo "[4/5] 跳过服务注册（-s）"
 else
   echo "[4/5] 远程注册服务（管理员 PowerShell）..."
-  REMOTE_ARGS="-QuantExe ${DEPLOY_DIR}/quant.exe -ResearchExe ${DEPLOY_DIR}/researchd.exe -PydataVenv ${DEPLOY_DIR}/venv -QmtctlExe ${DEPLOY_DIR}/qmtctl.exe -MiniQmtPath ${MINIQMT_PATH} -DataDir ${DATA_DIR}"
+  # §UAT-20260917 转义修复：MiniQmtPath 含 "(x86) " 空格，裸传被远端 PowerShell 拆词
+  # （实录：报 `x86: 无法将…识别为 cmdlet`，register 整步失败）。所有路径参数统一加 PS 单引号——
+  # Windows OpenSSH 默认 shell 为 cmd，单引号原样透传给 powershell -File 解析为整体字面量。
+  REMOTE_ARGS="-QuantExe '${DEPLOY_DIR}/quant.exe' -ResearchExe '${DEPLOY_DIR}/researchd.exe' -PydataVenv '${DEPLOY_DIR}/venv' -QmtctlExe '${DEPLOY_DIR}/qmtctl.exe' -MiniQmtPath '${MINIQMT_PATH}' -DataDir '${DATA_DIR}'"
   if [ -n "$LLM_API_KEY" ]; then
     REMOTE_ARGS="$REMOTE_ARGS -LLMApiKey '$LLM_API_KEY' -LLMApiURL '$LLM_API_URL' -LLMModel '$LLM_MODEL'"
   fi

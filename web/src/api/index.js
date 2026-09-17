@@ -682,6 +682,24 @@ export async function fetchPaperSelfCheck() {
   return request('/api/paper/selfcheck')
 }
 
+/** §SIGNAL_CONTROLLER 模拟盘战法开关面板：GET /api/paper/strategies
+ * 返回 { strategies, blacklist, shadow_blacklist, known_strategies:[{id,name,kind}] } */
+export async function fetchPaperStrategies() {
+  return request('/api/paper/strategies')
+}
+
+/** §SIGNAL_CONTROLLER 保存模拟盘战法白名单/黑名单：POST /api/paper/strategies
+ * 空 strategies = 默认全集（内置四形态+库规则；动量需显式开启） */
+export async function updatePaperStrategies(strategies, blacklist) {
+  return request('/api/paper/strategies', { method: 'POST', data: { strategies, blacklist } })
+}
+
+/** §SIGNAL_CONTROLLER 信号控制器裁定留痕：GET /api/signalctl/verdicts?limit=N
+ * 返回 { verdicts:[{channel,verdict,stage,code,strategy,reason,shadow,at}], count } */
+export async function fetchSignalVerdicts(limit) {
+  return request('/api/signalctl/verdicts?limit=' + (limit || 50))
+}
+
 /** 模拟盘：手动买入（信号页"模拟买入"按钮触发）。qty>0 时按用户输入价格/手数成交（静态记账），
  *  price=0 回退实时价；qty<=0 回退固定金额整手（旧行为）。 */
 /** Paper trading: manual buy (signal-page "paper buy" button). qty>0 fills the typed price/lots (static

@@ -20,6 +20,7 @@ import (
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
@@ -160,17 +161,41 @@ func TestAutoPlaceIdempotencyKeyStable(t *testing.T) {
 	}
 }
 
-// TestAutoPlaceSkipsWhitelist 战法白名单外不下单。
-func TestAutoPlaceSkipsWhitelist(t *testing.T) {
-	e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.Strategies = []string{"N形"} })
-	e.autoPlace(combat_agent.Signal{ID: "S1", Code: "000001", Strategy: "龙头", Direction: "做多", Price: 10}, nil)
-	if len(*orders) != 0 {
-		t.Fatalf("whitelist excludes 龙头, should skip, got %d", len(*orders))
+// TestDispatchLiveSkipsWhitelist §SIGNAL_CONTROLLER：战法白名单裁定从 autoPlace 迁入信号控制器
+// live 通道（dispatchLive 收口）——白名单外战法满窗也不下单并标注拦截原因；列名后放行。
+// 动量（momentum）即使在"全部开启"（空白名单）下也不放行，必须显式列名（09-17 事故回归）。
+// English: whitelist adjudication now lives in the controller; autoPlace stays pure execution.
+func TestDispatchLiveSkipsWhitelist(t *testing.T) {
+	now := time.Now()
+	live := map[string]*data.StockInfo{"000001": {Code: "000001", Price: 10}, "000002": {Code: "000002", Price: 10}}
+	dragon := combat_agent.Signal{ID: "S1", Code: "000001", Name: "平安", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
+	nshape := combat_agent.Signal{ID: "S2", Code: "000002", Name: "万科", Strategy: "N形", StrategyType: "n_shape", Direction: "做多", Action: "buy", Price: 10}
+
+	e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.Strategies = []string{"n_shape"} })
+	// 两轮全量喂入（跨确认窗）：龙头始终拦截，N形第二轮满窗放行。
+	e.dispatchLive([]combat_agent.Signal{dragon, nshape}, live, true, now)
+	e.dispatchLive([]combat_agent.Signal{dragon, nshape}, live, true, now.Add(6*time.Minute))
+	if len(*orders) != 1 || (*orders)[0]["code"] != "000002.SZ" {
+		t.Fatalf("白名单 [n_shape] 应仅放行 N形, got %+v", *orders)
 	}
-	// 白名单命中 → 下单
-	e.autoPlace(combat_agent.Signal{ID: "S2", Code: "000002", Strategy: "N形", Direction: "做多", Price: 10}, nil)
-	if len(*orders) != 1 {
-		t.Fatalf("whitelist includes N形, should place, got %d", len(*orders))
+	if d := e.liveDecisionOf(dragon); d == nil || d.Verdict != signalctl.VerdictBlock || d.Stage != signalctl.StageStrategy {
+		t.Fatalf("龙头应标注白名单拦截, got %+v", d)
+	}
+
+	// 空白名单=默认全集（内置四形态+库规则），动量必须显式列名：默认不放行。
+	e2, _, _, orders2 := newQMTEngine(t, nil)
+	mom := combat_agent.Signal{ID: "S3", Code: "000001", Name: "平安", Strategy: "动量", StrategyType: "momentum", Direction: "做多", Action: "buy", Price: 10}
+	e2.dispatchLive([]combat_agent.Signal{mom}, live, true, now)
+	e2.dispatchLive([]combat_agent.Signal{mom}, live, true, now.Add(6*time.Minute))
+	if len(*orders2) != 0 {
+		t.Fatalf("空白名单不得放行动量（09-17 事故回归）, got %+v", *orders2)
+	}
+	// 动量显式列名后放行。
+	e3, _, _, orders3 := newQMTEngine(t, func(c *config.QMTConfig) { c.Strategies = []string{"momentum"} })
+	e3.dispatchLive([]combat_agent.Signal{mom}, live, true, now)
+	e3.dispatchLive([]combat_agent.Signal{mom}, live, true, now.Add(6*time.Minute))
+	if len(*orders3) != 1 {
+		t.Fatalf("显式列名后动量应放行, got %+v", *orders3)
 	}
 }
 

@@ -3,7 +3,7 @@
 // manual buy/trim/close, deposit, pool/cap config, pool reset, full liquidation.
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
-  Button, Dialog, Table, Tag, Card, Form, InputNumber, Input, Select, Tabs,
+  Button, Dialog, Table, Tag, Card, Form, InputNumber, Input, Select, Tabs, Checkbox,
 } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
@@ -156,6 +156,10 @@ export default function Paper() {
   const [showResetModal, setShowResetModal] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState('alloc')
+  // §SIGNAL_CONTROLLER 模拟盘战法开关（白名单）：known=后端全集，stratOn=勾选映射，stratList=当前已列名集合
+  const [stratKnown, setStratKnown] = useState([])
+  const [stratOn, setStratOn] = useState({})
+  const [stratShadow, setStratShadow] = useState(true)
   const [depositAmount, setDepositAmount] = useState(0)
   const [resetToCapital, setResetToCapital] = useState(0)
   const [resetMaxPos, setResetMaxPos] = useState(0)
@@ -433,6 +437,13 @@ export default function Paper() {
    */
   // 打开资金分配/仓位上限/买入纪律设置弹窗并回填当前配置
   function openSettingsModal() {
+    api.fetchPaperStrategies().then((r) => {
+      const known = Array.isArray(r.known_strategies) ? r.known_strategies : []
+      const wl = Array.isArray(r.strategies) ? r.strategies : []
+      const on = {}
+      known.forEach((v) => { on[v.id] = wl.length === 0 ? v.id !== 'momentum' : wl.includes(v.id) })
+      setStratKnown(known); setStratOn(on); setStratShadow(!!r.shadow_blacklist)
+    }).catch(() => {})
     setCfgMaxPos(appliedMax > 0 ? appliedMax : 0)
     const allocs = {}, caps = {}, rules = {}
     pools.forEach((p) => {
@@ -700,6 +711,20 @@ export default function Paper() {
                   style={{ width: 240 }}
                 />
               </Form.FormItem>
+            ))}
+          </Tabs.TabPanel>
+          {/* §SIGNAL_CONTROLLER 战法开关标签页：模拟盘买入准入白名单（与实盘量化页开关同构语义） */}
+          <Tabs.TabPanel value="strategies" label="战法开关">
+            <div style={{ fontSize: 12, color: 'var(--app-muted)', marginBottom: 8 }}>
+              只有打开的战法产生的买入信号会被模拟盘撮合；关闭的战法信号仅提示不建仓。
+              动量战法永不在默认全集内——需在此显式开启。卖出/止盈止损不受开关限制（不拦退出）。
+              {stratShadow ? '（黑名单观察期：命中只记录不拦截）' : ''}
+            </div>
+            {stratKnown.map((v) => (
+              <div key={'st-' + v.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0' }}>
+                <span>{v.name} <span style={{ color: 'var(--app-muted)', fontSize: 12 }}>({v.id})</span></span>
+                <Checkbox checked={!!stratOn[v.id]} onChange={(c) => setStratOn({ ...stratOn, [v.id]: c })}>{'允许'}</Checkbox>
+              </div>
             ))}
           </Tabs.TabPanel>
           {/* 买入纪律标签页：逐池配置日限次数/冷却/最低评分/日预算%，控制买入频率 */}

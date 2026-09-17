@@ -77,6 +77,29 @@ type Rules struct {
 	// English: signal & tactic enhancement toggles (see SIGNAL_EDGE_ENHANCEMENT_PLAN).
 	// All default off; zero value = all disabled, backward compatible with existing configs.
 	Enhance EnhanceConfig `json:"enhance"`
+	// 信号控制器灰度配置（§SIGNAL_CONTROLLER_PLAN_20260917）：准入/持续性监测统一组件的
+	// 新行为观察期开关。战法白名单不受影响（始终硬拦），仅黑名单补齐类新行为可灰度。
+	// English: signal-controller rollout knobs — shadow-observation for newly enforced gates
+	// (blacklists on the signal side); strategy whitelist is always hard, unaffected.
+	SignalCtl SignalCtlConfig `json:"signal_ctl"`
+}
+
+// SignalCtlConfig 信号控制器灰度配置（§SIGNAL_CONTROLLER_PLAN_20260917 §八）。
+// （Rollout knobs for the unified signal controller.）
+type SignalCtlConfig struct {
+	// ShadowBlacklist 黑名单影子模式（nil/true=默认影子）：个股/板块黑名单在信号控制器的命中
+	// 仅留痕观察不拦截——黑名单此前只在实盘下单侧消费，补齐到两通道属新行为，按方案要求
+	// 影子期验证后再切正式。战法白名单/确认窗不受本标志影响。
+	// 置 false 后控制器与风控闸的黑名单命中立即生效（重启/热更下一轮即达）。
+	// English: nil/true = blacklist hits on the signal side are recorded but not enforced (new
+	// behavior under observation per the plan); strategy whitelist & confirm windows are unaffected.
+	ShadowBlacklist *bool `json:"shadow_blacklist,omitempty"`
+}
+
+// BlacklistShadow 黑名单影子标志（nil 默认开=只留痕不拦）。
+// （Reports whether blacklist enforcement is still in shadow mode; nil defaults to shadow-on.）
+func (s SignalCtlConfig) BlacklistShadow() bool {
+	return s.ShadowBlacklist == nil || *s.ShadowBlacklist
 }
 
 // RuntimeConfig 运行时内存治理配置：盘后释放常驻服务内存，避免与夜间研究作业叠加触发 OOM。
@@ -190,6 +213,20 @@ type PaperConfig struct {
 	// Discipline 统一止盈止损纪律（探针+扳机）参数。实盘与模拟盘共用同一套口径。
 	// English: unified stop-loss/take-profit discipline (probe+trigger) parameters; shared by real and paper.
 	Discipline DisciplineConfig `json:"discipline,omitempty"`
+	// §SIGNAL_CONTROLLER 模拟盘战法白名单（20260917，与实盘 /api/config/qmt.strategies 同构语义）：
+	// 空=默认全集（内置四形态+已启用库规则），动量/未知来源战法必须显式列名才允许撮合；
+	// 非空=显式权威（只有列名的战法买入信号可进模拟盘）。由信号控制器（internal/signalctl）
+	// 在 paper 通道执行准入，模拟盘引擎不再持有交易裁决逻辑。
+	// 战法池资金分配模板同步跟随：momentum 仅在显式列名时开立动量池（不再恒开）。
+	// English: paper-side strategy whitelist mirroring the live one (§SIGNAL_CONTROLLER_PLAN):
+	// empty = default set (4 built-in forms + enabled library rules; momentum must be explicit);
+	// non-empty = only listed strategies may fill. Drives the pool template too (momentum pool
+	// opened only when explicitly named).
+	Strategies []string `json:"strategies,omitempty"`
+	// §SIGNAL_CONTROLLER 模拟盘个股黑名单（纯代码比对，与实盘同口径 config.CodeInBlacklist）。
+	// 此前黑名单仅实盘下单侧消费；信号控制器把它统一进两通道（灰度由 rules.signal_ctl.shadow_blacklist 控制）。
+	// English: paper-side code blacklist, enforced on the signal-controller paper channel (shadow-rolled).
+	Blacklist []string `json:"blacklist,omitempty"`
 	// §SHORT-3 融券做空侧（决策④）：ShortCapital>0 才开设做空池（默认 0=整侧关闭，影子期安全）。
 	// 保证金率/年化费率/单笔名义预算/止损涨幅可配，零值走 paper.DefaultConfig 真实券商口径。
 	// English: §SHORT-3 margin-short side — the pool is funded only when ShortCapital>0 (0 = side off,
@@ -1256,10 +1293,12 @@ type MomentumConfig struct {
 	TrendWeight float64 `json:"trend_weight"`
 	// 动量分触发信号阈值（默认 60）
 	SignalThreshold float64 `json:"signal_threshold"`
-	// BuySignalThreshold 动量买入阈值：动量分 ≥ 此值且数据有效时发 buy 级信号（进模拟盘自动撮合，
-	// 归动量池）。默认 75（高于 watch 阈值 60 一档，避免动量信号大量直接转买单）；≤0 时回退默认。
-	// English: momentum BUY threshold — score at/above this (with valid data) emits a buy signal that
-	// the paper engine auto-fills into the momentum pool. Default 75; <=0 falls back to default.
+	// BuySignalThreshold 动量买入阈值：动量分 ≥ 此值且数据有效时发 buy 级信号（经信号控制器
+	// 白名单准入后归动量池撮合；动量永不在默认白名单全集内，需在战法开关面板显式开启）。
+	// 默认 75（高于 watch 阈值 60 一档，避免动量信号大量直接转买单）；≤0 时回退默认。
+	// English: momentum BUY threshold — score at/above this (with valid data) emits a buy signal that,
+	// once admitted by the signal controller whitelist (momentum is never in the default set), routes
+	// to the momentum pool. Default 75; <=0 falls back to default.
 	// 动量买入阈值
 	BuySignalThreshold float64 `json:"buy_signal_threshold"`
 	// MomentumGateEnabled 动量分"提升才提醒"门槛开关：开启后仅当动量分明显提升时
@@ -1685,6 +1724,25 @@ func (m *Manager) SetQMTConfigFor(userID string, cfg *QMTConfig) {
 	}
 	r := m.userRules(userID)
 	r.QMT = *cfg
+	m.saveUserRules(userID, r)
+}
+
+// SetPaperStrategyFor 更新指定账号的模拟盘战法准入配置（§SIGNAL_CONTROLLER P3：
+// rules.paper.strategies 白名单 + rules.paper.blacklist 个股黑名单），仅改这两个字段、
+// 其余 paper 配置保持原值，落该账号规则快照（信号控制器 paper 通道 5s 内读到新值）。
+// 调用方负责白名单条目合法性校验（knownStrategyIDSet），这里只做落库。
+// English: persists an account's paper-side strategy admission (whitelist + code blacklist),
+// leaving the rest of rules.paper untouched; the signal controller picks it up on its next feed.
+func (m *Manager) SetPaperStrategyFor(userID string, strategies, blacklist []string) {
+	if m.store == nil || userID == "" {
+		m.Rules.Paper.Strategies = strategies
+		m.Rules.Paper.Blacklist = blacklist
+		m.Save()
+		return
+	}
+	r := m.userRules(userID)
+	r.Paper.Strategies = strategies
+	r.Paper.Blacklist = blacklist
 	m.saveUserRules(userID, r)
 }
 

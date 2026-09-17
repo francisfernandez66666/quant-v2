@@ -40,6 +40,7 @@ import (
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
+	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
@@ -206,13 +207,17 @@ type Engine struct {
 	realStore *store.DB           // 实盘账本库（live.db：real_positions/orders/fills 存取）
 	d1Store   *store.DB           // D1 评分历史库（trading.db：d1_scores 落库，与研究数据同库）
 
-	// buyConfirmReal 实盘买入确认状态机（§统一纪律·探针+扳机）：code → 买入信号首次出现的探针时刻。
-	// 信号需连续存在到确认窗（低置信 BuyConfirmMin / 高置信 BuyConfirmHighSec）才允许 autoPlace，
-	// 过滤盘中插针假买入信号。e.mu 保护；信号中断（本轮不再活跃）由 pruneRealBuyConfirm 清理。
-	// English: real-book buy-confirmation state machine — code → first probe time a buy signal appeared;
-	// the signal must persist for its window (low-conf BuyConfirmMin / high-conf BuyConfirmHighSec) before
-	// autoPlace, filtering intraday pin-bar fake buys. Guarded by e.mu; non-active codes are pruned each round.
-	buyConfirmReal map[string]time.Time
+	// §SIGNAL_CONTROLLER 20260917：实盘买入确认状态机（原 buyConfirmReal + realBuyConfirmPass）
+	// 已迁到信号控制器（internal/signalctl）live 通道——战法白名单/黑名单/个股/板块黑名单/持续性
+	// 确认窗的裁定统一在控制器完成，引擎按裁定分发交易器与模拟盘（方案 docs/SIGNAL_CONTROLLER_PLAN_20260917.md）。
+	// sigCtl 按引擎装配（共享引擎组内实盘配置经 FIX#11 指纹保证一致，live 通道状态键含账号维度）。
+	// English: the real-buy-confirm state machine moved into the signal controller (live channel);
+	// the engine now dispatches to traders strictly by explicit verdicts.
+	sigCtl *signalctl.Controller
+	// liveDecisions 最近一轮 live 通道裁定（键=pureCode|strategyKey），供消息中心标注
+	// "待确认/被拦+原因"（§SIGNAL_CONTROLLER 裁决④：消息与下单解耦，全部翻转照常进消息、
+	// 带拦截原因，下单只走 pass）。每轮 dispatchLive 覆盖，读侧无锁竞态容忍（展示用途）。
+	liveDecisions map[string]signalctl.Decision
 	// disciplineTracker 实盘统一止盈止损纪律状态机（§统一纪律 B：pushRealAdvice 经 trading.Advise
 	// 注入）。pushRealAdvice 惰性初始化（避免 build 顺序耦合）；nil = 未接入纪律裁决。
 	// English: the live unified-discipline tracker (wired into trading.Advise by pushRealAdvice).
@@ -534,6 +539,8 @@ func New(
 		scoreStore:        newScoreStore(scoreRecPath),
 		fastScoreStore:    newScoreStore(fastScoreRecPath),
 		prevPass:          make(map[string]map[string]bool),
+		sigCtl:            signalctl.New(),
+		liveDecisions:     make(map[string]signalctl.Decision),
 		prevBullBuy:       make(map[string]map[string]bool),
 		lastD1Scores:      make(map[string]combat_agent.D1Score),
 		d1ScoredSig:       make(map[string]string),
@@ -951,76 +958,180 @@ func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Si
 		return
 	}
 	if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
-		pe.OnSignals(combined, quotes)
+		// §SIGNAL_CONTROLLER：全局回退账本同样先过控制器 paper 通道（多账号 registry 路径已裁定，
+		// 此回退供无 registry 单引擎场景，准入语义一致、不留旁路）。
+		pe.OnSignals(e.filterPaperAdmitted(e.primaryMember(), combined, time.Now()), quotes)
 	}
 }
 
-// realBuyConfirmPass 实盘买入确认扳机（§统一纪律·探针+扳机）：返回 true 才允许实盘下单。
-// buyConfirmReal[code] 记录该股买入信号首现的探针时刻；连续出现累计，窗满放行；
-// 两窗（BuyConfirmMin/BuyConfirmHighSec）均 ≤0 = 未启用买入确认 → 直接放行（兼容旧行为）。
-// 信号中断（不再活跃）由调用方用本轮活跃集调 pruneRealBuyConfirm 清理重置。
-// English: real buy-confirmation gate — returns true only when the buy signal has persisted for its
-// window (low-conf BuyConfirmMin / high-conf BuyConfirmHighSec; both ≤0 = disabled, legacy instant pass).
-// buyConfirmReal[code] records the first probe time; callers prune non-active codes via pruneRealBuyConfirm.
-func (e *Engine) realBuyConfirmPass(code string, confidence float64, disc config.DisciplineConfig) bool {
-	if disc.BuyConfirmMin <= 0 && disc.BuyConfirmHighSec <= 0 {
-		return true
-	}
-	now := time.Now()
+// ── §SIGNAL_CONTROLLER 信号控制器接线（20260917，方案 docs/SIGNAL_CONTROLLER_PLAN_20260917.md）──
+//
+// 原实盘买入确认状态机（realBuyConfirmPass/pruneRealBuyConfirm/buyConfirmReal）已整体迁入
+// internal/signalctl：战法白名单、个股/板块黑名单、持续性确认窗（探针+扳机）统一在控制器
+// live 通道裁定；引擎按裁定分发 autoPlace。原"双入口各自比对白名单"（autoPlace 内联 +
+// risk.Gate）收敛为控制器唯一实现（gate 保留同源的成员判定作执行侧最后防线）。
+
+// SignalCtl 返回本引擎的信号控制器（registry/server 编排与审计端点消费）。
+// 惰性初始化：正常经 New() 装配；直接构造 Engine 的测试/旧路径也保证可用（不留 nil 旁路）。
+// English: returns this engine's signal controller, lazily initialized so no code path (including
+// struct-literal test engines) can bypass admission.
+func (e *Engine) SignalCtl() *signalctl.Controller {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.buyConfirmReal == nil {
-		e.buyConfirmReal = map[string]time.Time{}
+	if e.sigCtl == nil {
+		e.sigCtl = signalctl.New()
 	}
-	first, tracked := e.buyConfirmReal[code]
-	if !tracked {
-		e.buyConfirmReal[code] = now
-		return false
+	if e.liveDecisions == nil {
+		e.liveDecisions = make(map[string]signalctl.Decision)
 	}
-	win := time.Duration(disc.BuyConfirmMin) * time.Minute
-	// 置信度阈值归一：combat_agent.Confidence 为 0~1（显示时 ×100），后台阈值存百分数（默认 85），
-	// 统一先放大到百分数再比，避免 0.9 ≥ 85 恒假导致高置信快车道永远不触发。
-	// English: normalize the scale — Confidence is 0~1 (shown as ×100) while the config stores a percent
-	// threshold (default 85); compare in percent space so high-confidence signals take the fast lane.
-	if confidence*100 >= disc.HighConfThreshold {
-		win = time.Duration(disc.BuyConfirmHighSec) * time.Second
-	}
-	if now.Sub(first) < win {
-		return false
-	}
-	delete(e.buyConfirmReal, code) // 确认通过，下单后清除
-	return true
+	return e.sigCtl
 }
 
-// pruneRealBuyConfirm 清理实盘买入确认表：本轮未出现买入信号的记录清除（信号需连续存在），
-// 同时清除超过最大观察窗的僵尸记录，防表无限膨胀。seen = 本轮活跃买入信号代码集。
-// English: prunes the real buy-confirm table — codes without a buy signal this round are dropped (presence
-// must be continuous) and over-max-window zombies are cleaned so the table can't grow unbounded.
-func (e *Engine) pruneRealBuyConfirm(seen map[string]struct{}, disc config.DisciplineConfig) {
-	if len(e.buyConfirmReal) == 0 {
-		return
+// liveSignalPolicy 装配 live 通道准入策略快照：战法白名单/个股黑名单取实盘控制器**已生效**配置
+// （§QMT-PENDING 语义保持——休市变更不入裁定），板块黑名单取账号规则 Theme.BlackList（实盘侧
+// 此前只把板块名并进个股黑名单死匹配代码，现由控制器按 Sector 字段正确生效），
+// 持续性参数取 Discipline。
+// English: builds the live-channel policy from the controller's EFFECTIVE config (pending-queue
+// semantics preserved), theme sector blacklist and discipline.
+func (e *Engine) liveSignalPolicy() signalctl.Policy {
+	pol := signalctl.Policy{Discipline: config.DefaultDisciplineConfig()}
+	e.mu.RLock()
+	ctrl, cfgMgr, uid := e.qmtCtrl, e.cfgMgr, e.userID
+	e.mu.RUnlock()
+	if ctrl != nil {
+		q := ctrl.Config()
+		pol.Strategies = q.Strategies
+		pol.CodeBlacklist = q.Blacklist
+		pol.Discipline = q.Discipline
 	}
-	maxAge := time.Duration(disc.BuyConfirmMin) * time.Minute
-	if h := time.Duration(disc.BuyConfirmHighSec) * time.Second; h > maxAge {
-		maxAge = h
-	}
-	now := time.Now()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for code, first := range e.buyConfirmReal {
-		if _, ok := seen[code]; !ok || now.Sub(first) > maxAge {
-			delete(e.buyConfirmReal, code)
+	if cfgMgr != nil {
+		rules := cfgMgr.GetRulesFor(uid)
+		if rules != nil {
+			pol.SectorBlacklist = rules.Theme.BlackList
+			pol.ShadowBlacklist = rules.SignalCtl.BlacklistShadow()
 		}
 	}
+	return pol
+}
+
+// paperSignalPolicy 装配 paper 通道准入策略：账号级 rules.paper.strategies 白名单 +
+// rules.paper.blacklist 个股黑名单 + 全局主题板块黑名单 + 影子标志 + 账号级 paper 纪律。
+// 供 registry 分发前逐账号裁定（paper 引擎不再持有确认状态机）。
+// English: builds the paper-channel policy per account (whitelist/pools-following strategies,
+// blacklists, discipline) — the paper engine no longer holds any confirmation state.
+func (e *Engine) paperSignalPolicy(uid string) signalctl.Policy {
+	pol := signalctl.Policy{Discipline: config.DefaultDisciplineConfig(), ShadowBlacklist: true}
+	if uid == "" {
+		e.mu.RLock()
+		uid = e.userID
+		e.mu.RUnlock()
+	}
+	if cm := e.cfgMgr; cm != nil {
+		if rules := cm.GetRulesFor(uid); rules != nil {
+			pol.Strategies = rules.Paper.Strategies
+			pol.CodeBlacklist = rules.Paper.Blacklist
+			pol.SectorBlacklist = rules.Theme.BlackList
+			pol.ShadowBlacklist = rules.SignalCtl.BlacklistShadow()
+			pol.Discipline = rules.Paper.Discipline
+		}
+	}
+	return pol
+}
+
+// dispatchLive 实盘交易分发唯一入口（§SIGNAL_CONTROLLER 编排收口）：把本轮做多买入信号集交给
+// 信号控制器 live 通道裁定，pass 私送 autoPlace（纯执行守卫），hold/block 仅留痕（消息中心
+// 照常记录翻转信号并标注原因——消息与下单解耦，裁决④）。
+//   - prune=true：按本轮活跃集清理消失探针（近实时 5s 循环的全量喂入方）；
+//   - prune=false：只推进不清理（主循环等子集喂入方，清理权归全量方，防跨喂入方误清探针）。
+//
+// English: the single live dispatch entry — Evaluate on the live channel, autoPlace the passed
+// buys; hold/block are annotated into message decisions. Only the full-feed caller prunes probes.
+func (e *Engine) dispatchLive(buys []combat_agent.Signal, live map[string]*data.StockInfo, prune bool, now time.Time) {
+	if len(buys) == 0 {
+		return
+	}
+	ctl := e.SignalCtl()
+	acct := e.primaryMember()
+	pol := e.liveSignalPolicy()
+	var decisions []signalctl.Decision
+	if prune {
+		decisions = ctl.Evaluate(signalctl.ChannelLive, acct, buys, pol, now)
+	} else {
+		decisions = make([]signalctl.Decision, 0, len(buys))
+		for _, s := range buys {
+			decisions = append(decisions, ctl.Admit(signalctl.ChannelLive, acct, s, pol, now))
+		}
+	}
+	e.mu.Lock()
+	if e.liveDecisions == nil {
+		e.liveDecisions = map[string]signalctl.Decision{}
+	}
+	for i, d := range decisions {
+		if d.Verdict != signalctl.VerdictPass || d.Shadow {
+			e.liveDecisions[liveDecisionKey(buys[i].Code, d.SKey)] = d
+		} else {
+			delete(e.liveDecisions, liveDecisionKey(buys[i].Code, d.SKey))
+		}
+	}
+	e.mu.Unlock()
+	for i, d := range decisions {
+		if d.Verdict != signalctl.VerdictPass {
+			continue
+		}
+		e.autoPlace(buys[i], live)
+	}
+}
+
+// liveDecisionKey 裁定注解键：纯代码+规范战法键（消息标注与分发对齐用）。
+func liveDecisionKey(code, strategyKey string) string {
+	return pureTsCode(code) + "|" + strategyKey
+}
+
+// liveDecisionOf 查某买入信号的最近 live 裁定（消息中心标注"为何没下单"）；无记录=pass/未裁定。
+// English: looks up the latest live decision for annotation purposes (nil = admitted/silent).
+func (e *Engine) liveDecisionOf(sig combat_agent.Signal) *signalctl.Decision {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if d, ok := e.liveDecisions[liveDecisionKey(sig.Code, signalctl.StrategyKeyOf(sig))]; ok {
+		dd := d
+		return &dd
+	}
+	return nil
+}
+
+// filterPaperAdmitted 模拟盘通道的按账号准入过滤（registry 分发前调用）：信号集送信号控制器
+// paper 通道 Evaluate（白名单/黑名单/持续性确认窗，账号级参数），仅保留 pass 信号下发撮合。
+// 卖出/提醒信号在控制器恒 pass（拦退出=强迫扛单），本过滤零侵入。返回可直接 OnSignals 的集合。
+// English: per-account paper-channel admission filter used by the registry dispatch — only
+// controller-passed signals reach the (now execution-only) paper engine.
+func (e *Engine) filterPaperAdmitted(uid string, sigs []combat_agent.Signal, now time.Time) []combat_agent.Signal {
+	if len(sigs) == 0 {
+		return sigs
+	}
+	decisions := e.SignalCtl().Evaluate(signalctl.ChannelPaper, uid, sigs, e.paperSignalPolicy(uid), now)
+	out := make([]combat_agent.Signal, 0, len(sigs))
+	for i, s := range sigs {
+		if decisions[i].Verdict == signalctl.VerdictPass {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// SignalVerdicts 返回本引擎信号控制器的最近裁定留痕（审计端点用）。
+// English: recent controller verdict tail for the audit endpoint.
+func (e *Engine) SignalVerdicts(limit int) []signalctl.Decision {
+	return e.SignalCtl().Recent(limit)
 }
 
 // autoPlace AUTO_TRADING_PLAN M1：qmt.enabled + mode=auto 时把做多买入信号直连网关下单。
 // 幂等：signal_id 唯一键（Orders 表 UNIQUE），熔断中跳过；现价缺省时用信号触发价。
 // 金额按 fixed_amount（受 max_positions 预检约束）；code 补后缀便于网关识别交易所。
-// English: AUTO_TRADING_PLAN M1 — when qmt.enabled and mode=auto, places a real buy order for a long
-// signal straight to the gateway. Idempotent via the signal_id unique key (Orders table UNIQUE), skipped
-// while tripped; the live price is used when available, else the signal trigger price. Amount uses
-// fixed_amount (pre-checked against max_positions); the code gets its exchange suffix for the gateway.
+// §SIGNAL_CONTROLLER 20260917：本函数只负责执行（模式/涨停封板/整手/资金降档/幂等/下单），
+// 战法白名单与买入确认状态机已迁出——调用方必须先经信号控制器 pass 裁定（dispatchLive 收口，
+// 本函数包私不可外部直调，防绕过准入的后门）。
+// English: AUTO_TRADING_PLAN M1 — pure execution (mode/sealed-board/lot/cash/idempotency); strategy
+// whitelist & confirm moved to the signal controller; unexported so no path bypasses admission.
 func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockInfo) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
@@ -1044,26 +1155,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		return
 	}
 	cfg := ctrl.Config()
-	// §UAT-FIX 2026-08-31：白名单条目是战法 ID（n_shape/fac_1…，量化交易页保存的就是 ID），
-	// 而 sig.Strategy 是中文显示名（如"波动突破战法"）——旧逻辑只比显示名，ID 永远不命中，
-	// auto 全程静默跳过（连日志都没有）。现同时匹配 StrategyID（库规则 ID）与显示名。
-	if len(cfg.Strategies) > 0 && sig.Strategy != "" {
-		allowed := false
-		for _, s := range cfg.Strategies {
-			if s == sig.Strategy || s == sig.StrategyID {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			// §DIAG-0921 白名单外静默跳过同样打节流日志（此前完全无声，无法区分"没信号"与"被白名单拦"）
-			log.Printf("[qmt-gate] %s(%s) %s/%s 白名单外跳过: 允许=%v", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, cfg.Strategies)
-			opslog.DayOnce("auto-wl:"+sig.Code, func() {
-				opslog.Logf("quant", "auto白名单外跳过 %s(%s) 策略=%s/%s 允许=%v", sig.Code, sig.Name, sig.StrategyID, sig.Strategy, cfg.Strategies)
-			})
-			return
-		}
-	}
+	// §SIGNAL_CONTROLLER 20260917：此处原内联白名单（含 §20260917 热修键统一）已删除——
+	// 战法准入统一由信号控制器 live 通道裁定（dispatchLive 唯一喂入），执行层不再比对名单，
+	// 双写漂移（autoPlace 一份、risk.Gate 一份）就此终结。
 	price := sig.Price
 	var si *data.StockInfo
 	if q := live[sig.Code]; q != nil && q.Price > 0 {
@@ -1193,18 +1287,19 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	// English: §WS-C quote context for the risk gate (staleness / live price / prev close); gates
 	// fail open when the fields are missing.
 	req := trading.OrderRequest{
-		SignalID:    id,
-		Code:        withSuffix(sig.Code),
-		Name:        sig.Name,
-		Strategy:    sig.Strategy,
-		StrategyID:  sig.StrategyID,
-		Side:        trading.SideBuy,
-		PriceType:   cfg.PriceType,
-		Price:       price,
-		Qty:         qty,
-		Amount:      float64(qty) * price,
-		CreatedAt:   time.Now().Format(time.RFC3339),
-		StalenessMs: e.quoteStalenessMs(sig.Code),
+		SignalID:     id,
+		Code:         withSuffix(sig.Code),
+		Name:         sig.Name,
+		Strategy:     sig.Strategy,
+		StrategyID:   sig.StrategyID,
+		StrategyType: sig.StrategyType,
+		Side:         trading.SideBuy,
+		PriceType:    cfg.PriceType,
+		Price:        price,
+		Qty:          qty,
+		Amount:       float64(qty) * price,
+		CreatedAt:    time.Now().Format(time.RFC3339),
+		StalenessMs:  e.quoteStalenessMs(sig.Code),
 	}
 	if si != nil {
 		req.CurrentPrice = si.Price
@@ -2639,23 +2734,21 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 		// paper fillLocked, the SetMirror callback writes the report holding book (registry.paperMirror);
 		// paper is the single source of truth and rpt stays consistent via mirroring — the exit path
 		// activates as before, with no more dual-book drift.
-		// AUTO_TRADING_PLAN M1：qmt.enabled 且 mode=auto 时，做多买入信号直连网关真实下单
-		// （幂等：signal_id 唯一键，网关/首尔双端去重，熔断中自动跳过）。manual 模式不下单，
-		// 由前端持仓页实盘 tab 确认后经 POST /api/positions/execute 执行。
-		// English: AUTO_TRADING_PLAN M1 — when qmt.enabled and mode=auto, place a real order straight to the
-		// gateway for long buy signals (idempotent via signal_id; double-deduped gateway & Seoul; skipped
-		// while the breaker is open). manual mode sends nothing — the frontend live tab confirms first via
-		// POST /api/positions/execute.
+		// §SIGNAL_CONTROLLER 20260917（裁决④，docs/SIGNAL_CONTROLLER_PLAN_20260917.md）：
+		// 实盘下单不再从消息链路触发——流程引擎在本消息落盘前经 dispatchLive 让信号控制器
+		// live 通道统一裁定（战法白名单/个股·板块黑名单/持续性确认窗），仅 pass 进 autoPlace。
+		// 消息中心照常记录全部翻转信号并在正文标注非 pass 原因，"提醒了为何没成交"同屏可见
+		// （此前 §DIAG-0921 的静默门节流日志就此升级为结构化裁定）。
+		// English: live ordering moved out of the messaging path — only controller-passed buys are
+		// placed (upstream dispatchLive); messages always record, annotated with hold/block reason.
+		gateNote := ""
 		if direction == "做多" && action == "买入" {
-			// §统一纪律·实盘买入确认扳机：信号需持续存在到确认窗才真正下单（过滤插针假信号）。
-			// 近实时全量活跃集（scoring_loop）经同一闸门，双通道都不会绕过确认。
-			// English: unified buy-confirm gate — persist for the window before ordering (pin-bar filter);
-			// the near-realtime full-active loop applies the same gate, so neither channel bypasses it.
-			e.mu.RLock()
-			rc := e.qmtCtrl
-			e.mu.RUnlock()
-			if rc == nil || e.realBuyConfirmPass(sig.Code, sig.Confidence, rc.Config().Discipline) {
-				e.autoPlace(sig, live)
+			if d := e.liveDecisionOf(sig); d != nil && d.Verdict != signalctl.VerdictPass {
+				tag := "拦截"
+				if d.Verdict == signalctl.VerdictHold {
+					tag = "待确认"
+				}
+				gateNote = fmt.Sprintf(" ｜⛔%s:%s", tag, d.Reason)
 			}
 		}
 		// 现价与涨跌幅：优先实时行情（比信号触发价更新），行情失败则回退信号触发价，避免消息里"现价:0.00"
@@ -2676,6 +2769,7 @@ func (e *Engine) syncMessages(bull, bear, alertSignals []combat_agent.Signal, sr
 			body = fmt.Sprintf("%s 战法:%s 置信度:%.0f%% 现价:%.2f 涨跌幅:%+.2f%% %s",
 				action, sig.Strategy, sig.Confidence*100, price, changePct, sig.Reason)
 		}
+		body += gateNote
 		// 交易信号入消息中心：ID 含 code+战法保证去重，方向/行动供前端状态色展示。
 		items = append(items, data.MessageItem{
 			ID:          sig.Code + "@交易信号@" + sig.Strategy,
@@ -3908,6 +4002,9 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 	// skipped, and only non-Pass→Pass flips are emitted to avoid repeat buys.
 	{
 		// 筛选出纯买入信号 → 状态翻转去重 → 只把"新出现的买入"投给模拟盘。
+		// English: the main loop feeds its tradeable buy signals into the paper fill (leader-ID / limit-up
+		// enhancements only exist here — the near-realtime ScorePool excludes them); watch/alert signals are
+		// skipped, and only non-Pass→Pass flips are emitted to avoid repeat buys.
 		var buys []combat_agent.Signal
 		for _, sig := range bullSignals {
 			if sig.Action == "buy" {
@@ -3915,10 +4012,14 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			}
 		}
 		if len(buys) > 0 {
-			// §统一纪律·买入确认：主循环也喂全量活跃买入信号（非仅翻转），让模拟盘买入
-			// 确认状态机能观察"信号是否持续存在"（翻转一次即不再出现无法判连续性）。
-			// English: feed the FULL active buy set (not just flips) so the paper buy-confirm gate can
-			// observe signal persistence (a flip emits once and never re-appears).
+			// §SIGNAL_CONTROLLER 主循环 live 分发：全量活跃买入信号送信号控制器裁定，
+			// pass 私才 autoPlace 下单（消息与下单解耦：4102 的 syncMessages 照常记录并标注原因）。
+			// prune=false——探针清理权归近实时全量喂入方，本方只推进（与旧 realBuyConfirmPass
+			// 无 prune 的行为一致，防主循环子集喂入误清 5s 循环探针）。
+			// English: main-loop live dispatch — controller-passed buys only; no pruning here.
+			e.dispatchLive(buys, e.snapshotQuotes(), false, time.Now())
+			// §统一纪律·买入确认：主循环也喂全量活跃买入信号（非仅翻转），持续性确认由
+			// 信号控制器 paper 通道在 registry 分发时统一裁定（旧 paper 内嵌状态机已删除）。
 			e.paperSignals(buys, nil, e.snapshotQuotes())
 		}
 	}

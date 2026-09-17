@@ -458,6 +458,7 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 		Name:         req.Name,
 		Strategy:     req.Strategy,
 		StrategyID:   req.StrategyID,
+		StrategyType: req.StrategyType,
 		Side:         req.Side,
 		Price:        req.Price,
 		Qty:          req.Qty,

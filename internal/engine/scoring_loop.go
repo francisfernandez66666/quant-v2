@@ -342,26 +342,14 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		exitSell := append(append([]combat_agent.Signal{}, exitSigs...), alertSigs...)
 		e.paperSignals(buys, exitSell, quotes)
 
-		// 实盘 auto 下单（§FIX-0921f 接线点）接入买入确认扳机：
-		// autoPlace 内含模式/白名单/涨停封板/整手缩量/可用资金降档/幂等（signal_id=buy:code:strategy:交易日）
-		// 全套守卫，与主循环共享幂等键——双通道叠加也被 orders 表唯一约束拦重，不会重复下单。
-		// English: live auto-buy wired through the buy-confirm gate — autoPlace carries the full guard chain
-		// (mode/whitelist/sealed-board/lot-sizing/cash-downshift/idempotent key) shared with the main loop.
-		e.mu.RLock()
-		rc := e.qmtCtrl
-		e.mu.RUnlock()
-		disc := config.DefaultDisciplineConfig()
-		if rc != nil {
-			disc = rc.Config().Discipline
-		}
-		seen := make(map[string]struct{}, len(buys))
-		for _, sig := range buys {
-			seen[sig.Code] = struct{}{}
-			if e.realBuyConfirmPass(sig.Code, sig.Confidence, disc) {
-				e.autoPlace(sig, quotes)
-			}
-		}
-		e.pruneRealBuyConfirm(seen, disc)
+		// 实盘 auto 下单（§FIX-0921f 接线点 → §SIGNAL_CONTROLLER 20260917）：
+		// 全量活跃买入信号送信号控制器 live 通道统一裁定（战法白名单/黑名单/持续性确认窗，
+		// 原 realBuyConfirmPass+autoPlace 内联白名单两闸门收敛为此一处），pass 私才 autoPlace。
+		// 本方是探针清理权的全量喂入方（prune=true）；主循环子集喂入只推进不清理。
+		// autoPlace 与主循环共享幂等键（signal_id=buy:code:strategy:交易日），双通道叠加被
+		// orders 表唯一约束拦重，不会重复下单。
+		// English: single live dispatch entry — controller-admitted buys only; this full-feed prunes stale probes.
+		e.dispatchLive(buys, quotes, true, time.Now())
 	}
 
 	// 模拟盘估值与日净值：每轮用实时快照价刷新持仓市值，并记录当日净值点。

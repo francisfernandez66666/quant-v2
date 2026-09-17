@@ -38,17 +38,23 @@ type knownStrategyInfo struct {
 	Kind string `json:"kind"` // form/factor/pattern（内置形态/因子/形态自动发现）
 }
 
-// knownStrategyList 返回实盘战法白名单全集：内置四形态战法 + 已应用的因子/形态战法（fac_*/pat_*）。
+// knownStrategyList 返回实盘战法白名单全集：内置四形态战法 + 动量战法 + 已应用的因子/形态战法（fac_*/pat_*）。
 // 因子/形态战法审批注入 applied_factors.json / applied_patterns.json 后即出现在实盘准入列表，
 // 可独立开关并参与实盘量化交易（与模拟盘分池口径一致）。
-// English: the full live-whitelist — the four built-in form strategies plus any approved
-// factor/pattern rules (fac_*/pat_*) loaded from applied_*.json, each toggleable for live trading.
+// §20260917：动量战法显式入列——此前它不在白名单全集里、没有用户开关，却在动量分达阈值时
+// 自动产 buy 信号并被"空白名单=全部允许"放行实盘下单（误交易根因）。现入列受开关管控，
+// 且信号端 rules.strategy.momentum.enabled 默认关，双重严格 opt-in。
+// English: the full live-whitelist — four built-in form strategies plus momentum and any approved
+// factor/pattern rules (fac_*/pat_*), each toggleable for live trading. §20260917: momentum is now
+// explicitly listed — previously it had no toggle yet could auto-fill through the empty-whitelist
+// "allow all" default (the mis-trade root cause).
 func (s *Server) knownStrategyList() []knownStrategyInfo {
 	list := []knownStrategyInfo{
 		{ID: "dragon", Name: "龙头战法 Dragon", Kind: "form"},
 		{ID: "double_bump", Name: "双响炮 DoubleBump", Kind: "form"},
 		{ID: "n_shape", Name: "N形超短 NShape", Kind: "form"},
 		{ID: "dragon_return", Name: "龙回头(中线) DragonReturn", Kind: "form"},
+		{ID: "momentum", Name: "动量战法 Momentum", Kind: "form"},
 	}
 	// 追加战法库已启用的规则进白名单（因子 fac_ 与形态 pat_）。
 	if s.researchDir != "" {

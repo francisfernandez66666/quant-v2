@@ -23,7 +23,6 @@ import (
 
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
-	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 )
 
@@ -430,16 +429,11 @@ type Engine struct {
 	// English: re-entry cooldown tracker (§R1.4, paper_r12). Records close time; the fill pre-check calls
 	// canReEnter to block re-buys inside the cooldown window after a full close. nil-safe.
 	reEntry *reEntryTracker
-	// discipline 统一止盈止损纪律参数（探针5s + 扳机确认窗；rules.paper.discipline 注入，可空=走默认）。
-	// English: unified stop-loss/take-profit discipline params (probe 5s + trigger windows; injected from
-	// rules.paper.discipline, nil = defaults).
-	discipline *config.DisciplineConfig
-	// buyConfirm 买入确认状态机：code → 该股买入信号首次出现的探针时刻。信号需持续存在
-	// 达到确认窗（低置信5min / 高置信30s）才真正撮合，过滤插针假信号。nil = 未启用买入确认。
-	// English: buy-confirmation state machine — code → first probe time a buy signal appeared. The signal
-	// must persist for the confirmation window (low-conf 5min / high-conf 30s) before filling, filtering
-	// spurious pin-bar signals. nil = buy confirmation disabled.
-	buyConfirm map[string]time.Time
+	// §SIGNAL_CONTROLLER 20260917：买入确认状态机（discipline/buyConfirm/SetDiscipline）已整体迁出——
+	// 战法白名单、个股·板块黑名单与持续性确认窗由信号控制器（internal/signalctl）paper 通道
+	// 在 registry 分发前统一裁定；本引擎回归纯执行器（池/撮合/费率/上限），不再持有交易裁决状态。
+	// English: the buy-confirm state machine moved to the signal controller (paper channel, applied at
+	// registry dispatch); this engine is now execution-only.
 	// lastBuyReject 买入拒绝订单去重：code → 最近一次拒绝原因。探针改为每轮重放全量活跃
 	// 买入信号后，不可撮合信号（持仓上限/涨停/无行情等）会每 5s 触达一次——同一原因只留痕
 	// 一次，防止 orders 表与磁盘写被刷爆；成功成交时清除该码记录。
@@ -484,7 +478,6 @@ func New(cfg Config, path string) *Engine {
 		positions:      make(map[string]*Position),
 		trimDone:       make(map[string]string),
 		reEntry:        newReEntryTracker(), // §R1.4 再入场冷却追踪器（默认 0=不限制，仍构造以复用逻辑）
-		buyConfirm:     make(map[string]time.Time),
 		lastBuyReject:  make(map[string]string),
 		// §SHORT-3 做空侧初始化：shortCash 预算仅在 ShortCapital>0 时开设（默认 0=关闭）。
 		// load() 若磁盘已有做空持仓则保留恢复值不覆盖（见 paper.go load）。
@@ -561,18 +554,10 @@ func (e *Engine) SetMirror(open func(p Position), close func(code string, price,
 	e.mu.Unlock()
 }
 
-// SetDiscipline 注入统一止盈止损纪律参数（探针+扳机；rules.paper.discipline 热更新到运行账号）。
-// 传入的副本仅用于买入确认状态机（buyConfirm）的确认窗；nil 安全 = 禁用买入确认。
-// English: injects the unified discipline params (probe+trigger; hot-syncs rules.paper.discipline into a
-// running account). Only the buy-confirmation windows are read here; nil = buy confirmation disabled.
-func (e *Engine) SetDiscipline(d *config.DisciplineConfig) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.discipline = d
-	if e.buyConfirm == nil {
-		e.buyConfirm = make(map[string]time.Time)
-	}
-}
+// §SIGNAL_CONTROLLER 20260917：SetDiscipline（买入确认注入）随状态机一并移除——
+// 买入持续性确认窗参数改由信号控制器 paper 通道从 rules.paper.discipline 直读（引擎侧装配）。
+// English: SetDiscipline removed with the state machine; discipline is now read by the signal
+// controller's paper policy builder from rules.paper.discipline.
 
 // mirrorOpenLocked 触发开仓镜像（须持锁调用；副本传值防回调侧读到后续变更）。
 // English: fires the open mirror (caller must hold the lock; passes a copy so the callback never sees later mutations).
@@ -932,10 +917,11 @@ func (e *Engine) recordBuyRejectLocked(o Order, reason string) {
 // OnSignals 消费一轮策略信号做自动撮合：仅做多 buy 信号，用实时快照价成交固定资金。
 // 同一股票已持仓则跳过；达持仓上限跳过。行情缺失时跳过该信号（不伪造成交）。
 // 记录信号价作辅助参照 + 信号→成交延迟。
-// English: auto-fills a round of strategy signals: long buy signals only, filled at the live
-// snapshot price with a fixed capital per stock. Skip when already held or at max positions;
-// skip when no live quote (no fake fills). Records the signal price as a reference and the
-// signal-to-fill latency.
+// §SIGNAL_CONTROLLER 20260917：本函数只做执行——战法白名单/个股·板块黑名单/买入持续性
+// 确认已由信号控制器在 registry 分发前按账号裁定（filterPaperAdmitted），
+// 原内嵌 buyConfirm 状态机删除（假信号拦截不再依赖撮合引擎自带闸门）。
+// English: auto-fills a round of ALREADY-ADMITTED strategy signals: long buys only, live snapshot
+// price, fixed capital. Admission (whitelist/blacklists/persistence) moved to the signal controller.
 func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.StockInfo) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -947,7 +933,6 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		return
 	}
 	now := time.Now()
-	buySeen := make(map[string]struct{})
 	for i := range sigs {
 		s := sigs[i]
 		// §SHORT-3 融券做空侧：做空战法通过信号（sell=持仓走弱卖出 / watch=纯做空机会）先落独立
@@ -979,9 +964,6 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		// price (T+1-locked covers retry next round); the long fill proceeds independently.
 		if _, isShort := e.shorts[s.Code]; isShort {
 			e.shortCoverLocked(s.Code, 0, "做多信号回补平仓", quotes, now)
-		}
-		if e.buyConfirm != nil {
-			buySeen[s.Code] = struct{}{}
 		}
 		if _, held := e.positions[s.Code]; held {
 			continue
@@ -1050,45 +1032,11 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if poolMax := e.poolMaxPos[poolKey]; poolMax > 0 && e.poolPositionCountLocked(poolKey) >= poolMax {
 			continue
 		}
-		// §统一纪律·买入确认扳机（探针+扳机）：5s 探针太灵敏，盘中瞬间插针会产生假买入信号。
-		// 买入信号必须持续存在到确认窗才真正撮合——置信度 < 高置信阈值走 BuyConfirmMin（默认5分钟）
-		// 持续确认，≥ 高置信阈值也至少观察 BuyConfirmHighSec（默认30秒），过滤插针假信号。
-		// buyConfirm[code] 记录该股买入信号首次出现的探针时刻；连续出现累计，消失即重置。
-		// discipline 为 nil（未注入/未启用）时整闸门跳过，行为与旧版完全一致。
-		// English: unified buy-confirmation gate — a 5s probe is too twitchy, intraday pin-bars fabricate
-		// fake buy signals. A buy signal must persist for its confirmation window before filling: confidence
-		// below the high-conf threshold needs BuyConfirmMin (default 5min) of continuous presence, ≥ high-conf
-		// still observes at least BuyConfirmHighSec (default 30s). buyConfirm[code] records the first probe
-		// time; presence accumulates, absence resets. Skipped entirely when discipline is nil (unchanged legacy).
-		if e.discipline != nil {
-			d := *e.discipline
-			lowWin := time.Duration(d.BuyConfirmMin) * time.Minute
-			highWin := time.Duration(d.BuyConfirmHighSec) * time.Second
-			if lowWin > 0 || highWin > 0 {
-				first, tracked := e.buyConfirm[s.Code]
-				if !tracked {
-					e.buyConfirm[s.Code] = now
-					e.recordOrderLocked(Order{Code: s.Code, Name: s.Name, Strategy: s.Strategy,
-						StrategyType: poolKey, Side: "buy", Kind: "自动撮合",
-						SignalPrice: s.Price, Status: "rejected",
-						Reason: "买入信号待确认(探针观测中)", CreatedAt: now})
-					continue
-				}
-				win := lowWin
-				// 置信度阈值归一：combat_agent.Confidence 为 0~1（显示时 ×100），后台阈值存百分数（默认 85），
-				// 统一先放大到百分数再比，避免 0.9 ≥ 85 恒假导致高置信快车道永远不触发。
-				// English: normalize the scale — Confidence is 0~1 (shown as ×100) while the config stores a
-				// percent threshold (default 85); compare in percent space so 0.9 ≥ 85 never false-passes the
-				// high-confidence fast lane to dead.
-				if s.Confidence*100 >= d.HighConfThreshold {
-					win = highWin
-				}
-				if now.Sub(first) < win {
-					continue // 信号需连续存在到确认窗；每轮只累计，不重复刷订单留痕
-				}
-				delete(e.buyConfirm, s.Code) // 确认通过，撮合后清除
-			}
-		}
+		// §SIGNAL_CONTROLLER 20260917：此处原"统一纪律·买入确认扳机"（探针+双确认窗，
+		// discipline/buyConfirm 状态机）整体迁入信号控制器 paper 通道——到达本函数的信号均已经
+		// 控制器准入（白名单/黑名单/持续性确认），本引擎只负责撮合执行。
+		// English: the in-engine buy-confirm state machine moved to the signal controller; signals
+		// reaching here are already admitted — pure execution.
 		if err := e.fillLocked(poolKey, s.Code, s.Name, s.Strategy, s.Price, s.GeneratedAt, now, price, 0, s.Reason, s.Confidence, false); err != nil {
 			log.Printf("[paper] 撮合失败 %s(%s): %v", s.Code, s.Name, err)
 			// 订单留痕：买入被拒（现金不足/超上限/池上限/买不起一手）。
@@ -1114,23 +1062,6 @@ func (e *Engine) OnSignals(sigs []combat_agent.Signal, quotes map[string]*data.S
 		if p, ok := e.positions[s.Code]; ok {
 			p.ATR = s.ATR
 			e.mirrorOpenLocked(p)
-		}
-	}
-	// 清理买入确认表：本轮未出现买入信号的记录清除——信号需连续存在，一旦中断即重置
-	// （防跨轮累计触发）。同时清除已达最大观察期的僵尸记录防表无限膨胀。
-	// English: purge stale buy-confirm entries — codes with no buy signal this round are dropped so
-	// presence must be continuous (no cross-round accumulation); capped entries are also cleaned so the
-	// table can't grow unbounded.
-	if e.discipline != nil && len(e.buyConfirm) > 0 {
-		d := *e.discipline
-		maxAge := time.Duration(d.BuyConfirmMin) * time.Minute
-		if h := time.Duration(d.BuyConfirmHighSec) * time.Second; h > maxAge {
-			maxAge = h
-		}
-		for code, first := range e.buyConfirm {
-			if _, ok := buySeen[code]; !ok || now.Sub(first) > maxAge {
-				delete(e.buyConfirm, code)
-			}
 		}
 	}
 	e.persist()

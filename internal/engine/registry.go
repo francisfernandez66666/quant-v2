@@ -249,18 +249,9 @@ func (r *Registry) GetPaper(userID string) *paper.Engine {
 	// 的 5s 调度路径；改为锁外构建、重取锁二次检查后再注册。
 	cfg := r.opts.Paper.Cfg()
 	pe := paper.New(cfg, r.paperPath(userID))
-	// 统一纪律注入（探针+扳机；rules.paper.discipline 默认已挂进 DefaultRules.Paper.Discipline）：
-	// 买入确认状态机据此决定撮合确认窗（低置信5min/高置信30s），实盘与模拟盘同口径。
-	// English: inject the unified discipline (probe+trigger; rules.paper.discipline defaulted into
-	// DefaultRules.Paper.Discipline) — the buy-confirmation state machine derives its fill windows from
-	// it, unified with live. Falls back to factory defaults when the config manager is absent.
-	disc := config.DefaultDisciplineConfig()
-	if r.opts.CfgMgr != nil {
-		if rules := r.opts.CfgMgr.GetRulesFor(userID); rules != nil {
-			disc = rules.Paper.Discipline
-		}
-	}
-	pe.SetDiscipline(&disc)
+	// §SIGNAL_CONTROLLER 20260917：统一纪律（买入确认窗）注入已随 paper 状态机删除——
+	// rules.paper.discipline 现由引擎 paperSignalPolicy 装配进信号控制器 paper 通道裁定。
+	// English: discipline injection moved to the signal controller's paper policy builder.
 	// 两本账合一（阶段1.2）：paper 为唯一真实账本，开仓/清仓镜像写 report 持仓账，
 	// 使 CheckPositionsExits 离场路径、持仓页、打分池消费的 rpt 与模拟盘保持一致。
 	// English: unified books — paper is the single source of truth; opens/closes mirror into the report
@@ -394,6 +385,13 @@ func (r *Registry) dispatchPaperSignals(e *Engine, emit []combat_agent.Signal, e
 				acct = append(acct, s)
 			}
 		}
+		// §SIGNAL_CONTROLLER 20260917：模拟盘战法白名单/个股·板块黑名单/买入持续性确认统一在此
+		// 按账号裁定（paper 通道），非 pass 的买入信号不下发给撮合引擎——paper.Engine 由此
+		// 回归纯执行器（池/撮合/费率/持仓上限），不再内嵌交易裁决。裁定留痕在引擎控制器的
+		// 审计环（GET /api/signalctl/verdicts）。
+		// English: per-account paper-channel admission (strategy whitelist, blacklists, buy-confirm
+		// persistence) replaces the old in-engine confirmation; paper.OnSignals is now execution-only.
+		acct = e.filterPaperAdmitted(uid, acct, time.Now())
 		if len(acct) > 0 {
 			pe.OnSignals(acct, quotes)
 		}

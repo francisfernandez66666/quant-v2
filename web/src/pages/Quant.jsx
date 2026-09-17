@@ -117,6 +117,8 @@ export default function Quant() {
   // English: §U-2 frontend entries for the three ops capabilities that previously had backend
   // endpoints but no UI — kill-switch halt, manual cancel (now fed by the orders list), settlement.
   const [orders, setOrders] = useState(null)        // 当日委托（含 order_id / status）
+  // §SIGNAL_CONTROLLER 信号裁定留痕（实盘/模拟盘两通道 hold/block 与原因，30s 随流水刷新）
+  const [verdicts, setVerdicts] = useState([])
   const [killBusy, setKillBusy] = useState(false)   // kill-switch 请求中
   const [settleBusy, setSettleBusy] = useState(false)
   const [settle, setSettle] = useState(null)        // 最近一次对账结果/历史
@@ -202,10 +204,13 @@ export default function Quant() {
       }
       setStrategyList(list)
 
-      // 初始化策略开关状态：若后端无已启用列表则默认全开，否则按列表匹配
+      // 初始化策略开关状态：若后端无已启用列表则默认全开，否则按列表匹配。
+      // §20260917 严格开关：动量（momentum）不在"默认全开"之列——旧配置的空白名单
+      // 语义是"内置四形态+库规则全部允许"，动量当时根本没有开关入口；现它必须显式
+      // 出现在白名单里才算开启（后端空白名单同样不放行动量，双端口径一致）。
       const wl = Array.isArray(c.strategies) ? c.strategies : []
       const on = {}
-      list.forEach((v) => { on[v.id] = wl.length === 0 || wl.includes(v.id) })
+      list.forEach((v) => { on[v.id] = wl.length === 0 ? v.id !== 'momentum' : wl.includes(v.id) })
       setStrategyOn(on)
 
       // 初始化策略金额输入框：从配置读取已有金额，未设置的留空
@@ -233,6 +238,10 @@ export default function Quant() {
     try {
       const t = await api.fetchQMTTrades()
       if (t && t.summary) setTrades(t)
+    } catch (_) {}
+    try {
+      const v = await api.fetchSignalVerdicts(50)
+      if (v && Array.isArray(v.verdicts)) setVerdicts(v.verdicts)
     } catch (_) {}
   }
 
@@ -952,7 +961,7 @@ export default function Quant() {
 
       {/* 战法开关卡片：按类型分组展示各战法的准入开关与自定义金额 */}
       <Card title="战法开关" style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 12 }}>关闭的战法信号不会进入实盘链路（模拟盘不受影响）；全部开启 = 不设白名单。因子/形态战法需先在「自动研究」页审批应用后才会出现在此处。</div>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 12 }}>关闭的战法信号不会进入实盘链路；「全部开启」= 默认全集（内置四形态+已审批库规则），动量战法需在此显式开启。因子/形态战法需先在「自动研究」页审批应用后才会出现在此处。模拟盘撮合的独立开关在「模拟盘 → 设置 → 战法开关」。</div>
         {renderStrategyGroups()}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'flex-end', marginTop: 10 }}>
           <span style={{ fontSize: 11, color: 'var(--app-text-2)' }}>{strategyHint} · 仓位留空/0 = 使用全局单票金额</span>
@@ -960,6 +969,29 @@ export default function Quant() {
             {saving ? '保存中…' : (strategyDirty ? '保存战法开关 *' : '已同步')}
           </Button>
         </div>
+      </Card>
+
+      {/* §SIGNAL_CONTROLLER 信号裁定留痕卡：为何"提醒了却没成交"——白名单/黑名单/持续性确认窗的结构化答案 */}
+      <Card title="信号裁定留痕" style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 8 }}>
+          信号控制器（战法白名单/个股·板块黑名单/持续性确认窗）对买入信号的拦截与观察记录；消息中心对应条目带 ⛔ 标注。
+        </div>
+        {verdicts && verdicts.length ? (
+          <Table data={verdicts} rowKey={(r) => String(r.at) + r.channel + r.code + r.verdict} size="small" pagination={{ pageSize: 10, total: verdicts.length }}
+            columns={[
+              { colKey: 'at', title: '时间', width: 150, cell: ({ row }) => (row.at || '').slice(11, 19) },
+              { colKey: 'channel', title: '通道', width: 70, cell: ({ row }) => (row.channel === 'live' ? '实盘' : '模拟') },
+              { colKey: 'verdict', title: '裁定', width: 90, cell: ({ row }) => (
+                <Tag theme={row.verdict === 'block' ? 'danger' : 'warning'}>{row.verdict === 'block' ? (row.shadow ? '影子拦截' : '拦截') : '待确认'}</Tag>
+              ) },
+              { colKey: 'code', title: '代码', width: 90 },
+              { colKey: 'strategy', title: '战法', width: 120 },
+              { colKey: 'reason', title: '原因', cell: ({ row }) => <span title={row.reason}>{row.reason}</span> },
+            ]}
+          />
+        ) : (
+          <div style={{ padding: '6px 2px', color: 'var(--app-text-2)', fontSize: 12 }}>暂无拦截/待确认记录——所有买入信号都直接过了准入裁定</div>
+        )}
       </Card>
 
       {/* 交易流水与整体盈亏卡片：汇总指标 + 分战法盈亏表 + 成交流水表 */}

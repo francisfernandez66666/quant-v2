@@ -101,6 +101,7 @@ const strategyGroups = [
   },
   {
     // ── 动量分模型：量价/MACD/走势三因子权重与动量闸门（信号过滤开关） ──
+    // 注：动量"能不能交易"由战法开关白名单统一裁决（§SIGNAL_CONTROLLER），不在此参数页。
     key: 'momentum', title: '动量分权重（合计建议=100）',
     fields: [
       // 量价配合因子权重

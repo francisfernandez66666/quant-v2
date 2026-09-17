@@ -23,17 +23,22 @@ const (
 // OrderRequest 下单请求（首尔 → 网关 /order）。
 // English: order request (Seoul → gateway /order).
 type OrderRequest struct {
-	SignalID   string  `json:"signal_id"`             // 信号唯一标识（幂等键，网关去重）
-	Code       string  `json:"code"`                  // 股票代码（带后缀，如 600000.SH）
-	Name       string  `json:"name"`                  // 股票名称
-	Strategy   string  `json:"strategy"`              // 触发战法名称（显示名）
-	StrategyID string  `json:"strategy_id,omitempty"` // 战法库规则 ID（fac_1/pat_2/n_shape…，白名单同键）
-	Side       string  `json:"side"`                  // 买入/卖出
-	PriceType  string  `json:"price_type"`            // market=对手价 / limit=限价
-	Price      float64 `json:"price"`                 // 参考价（limit 时按此限价）
-	Qty        int     `json:"qty"`                   // 股数（整手）
-	Amount     float64 `json:"amount"`                // 金额（元）
-	CreatedAt  string  `json:"created_at"`            // 创建时间（RFC3339）
+	SignalID   string `json:"signal_id"`             // 信号唯一标识（幂等键，网关去重）
+	Code       string `json:"code"`                  // 股票代码（带后缀，如 600000.SH）
+	Name       string `json:"name"`                  // 股票名称
+	Strategy   string `json:"strategy"`              // 触发战法名称（显示名）
+	StrategyID string `json:"strategy_id,omitempty"` // 战法库规则 ID（fac_1/pat_2/n_shape…，白名单同键）
+	// StrategyType 规范战法 ID（dragon/double_bump/n_shape/dragon_return/momentum/fac_*/pat_*），
+	// 与实盘白名单/前端战法开关同键空间（§20260917 严格开关：白名单校验权威键）。
+	// English: canonical strategy id, the same key space as the live whitelist / UI toggles
+	// (§20260917 strict gating — the authoritative whitelist match key).
+	StrategyType string  `json:"strategy_type,omitempty"`
+	Side         string  `json:"side"`       // 买入/卖出
+	PriceType    string  `json:"price_type"` // market=对手价 / limit=限价
+	Price        float64 `json:"price"`      // 参考价（limit 时按此限价）
+	Qty          int     `json:"qty"`        // 股数（整手）
+	Amount       float64 `json:"amount"`     // 金额（元）
+	CreatedAt    string  `json:"created_at"` // 创建时间（RFC3339）
 	// StalenessMs §WS-C 行情快照陈旧度（毫秒；-1=未提供，StaleQuoteGuard 跳过）。由调用方（引擎）
 	// 从 fetcher.StalenessMs 装配；手动下单/未提供时闸 fail-open。
 	// English: §WS-C quote-staleness (ms; -1 = unavailable → StaleQuoteGuard skipped). Filled by the

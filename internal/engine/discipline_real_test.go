@@ -1,12 +1,12 @@
 // 本文件：统一纪律（探针+扳机）的实盘侧单元测试——
-//  1. 实盘买入确认扳机 realBuyConfirmPass / pruneRealBuyConfirm：
-//     低置信需持续满窗、高置信快车道、信号中断清理、确认后清除、禁用直通；
+//  1. §SIGNAL_CONTROLLER 20260917：实盘买入持续性确认（原 realBuyConfirmPass/pruneRealBuyConfirm）
+//     已迁入信号控制器 live 通道，由 dispatchLive 统一编排：首探针受阻、满窗放行、消失重置、
+//     放行后清除；
 //  2. autoExecuteRealSells 纪律来源门（§统一纪律）：止损任意来源自动执行；
 //     止盈/减仓仅 Source=discipline 自动执行；减仓半平每码每日一次（realTrimDone 去重）。
 //
-// English: live-side unified-discipline tests — the real buy-confirmation gate (realBuyConfirmPass /
-// pruneRealBuyConfirm) and the discipline-source gate in autoExecuteRealSells (stop-loss from any
-// source; TP/trim only when Source=discipline; trim half-qty dedup once per code per day).
+// English: live-side discipline tests — buy-confirmation now lives in the signal controller
+// (dispatchLive integration below) and the §unified-discipline source gate in autoExecuteRealSells.
 package engine
 
 import (
@@ -14,99 +14,78 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
 
-// TestRealBuyConfirmPass 实盘买入确认扳机：未启用（两窗≤0）直通；低置信首探针受阻并记录首现时刻，
-// 持续存在满 BuyConfirmMin 才放行且放行后清除；高置信（≥阈值对应 0~1）走 BuyConfirmHighSec 快车道。
-// English: the real buy-confirm gate — disabled (both windows ≤0) passes instantly; a low-confidence
-// signal is blocked on the first probe (first-appearance time recorded) and passes only after persisting
-// BuyConfirmMin, then the entry is cleared; high-confidence (≥ threshold in 0~1) uses the fast lane.
-func TestRealBuyConfirmPass(t *testing.T) {
-	e, _, _, _ := newQMTEngine(t, nil)
+// TestDispatchLiveBuyConfirmWindow 持续性确认窗（live 通道）：低置信首探针受阻、窗内受阻、
+// 满窗放行并清探针；高置信走快车道（30s）。参数取 DefaultQMTConfig().Discipline（5min/30s）。
+// English: dispatchLive confirm window — first probe holds, persistence under the window holds,
+// at-window passes and clears; high-confidence takes the 30s fast lane.
+func TestDispatchLiveBuyConfirmWindow(t *testing.T) {
+	e, _, _, orders := newQMTEngine(t, nil)
+	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
+	sig := combat_agent.Signal{ID: "S1", Code: "600000", Name: "浦发", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
+	now := time.Now()
 
-	// 1. 未启用（两窗 ≤0）→ 直通，不记录。
-	discDis := config.DefaultDisciplineConfig()
-	discDis.BuyConfirmMin, discDis.BuyConfirmHighSec = 0, 0
-	if !e.realBuyConfirmPass("600000", 0.5, discDis) {
-		t.Fatal("禁用买入确认时应直通放行")
+	e.dispatchLive([]combat_agent.Signal{sig}, live, true, now) // 首探针 → hold
+	if len(*orders) != 0 {
+		t.Fatalf("首探针不应下单, got %d", len(*orders))
 	}
-
-	// 2. 低置信：默认 5min 确认窗，首探针受阻。
-	disc := config.DefaultDisciplineConfig()
-	if e.realBuyConfirmPass("600000", 0.5, disc) {
-		t.Fatal("低置信首探针不应放行")
+	if d := e.liveDecisionOf(sig); d == nil || d.Verdict != signalctl.VerdictHold {
+		t.Fatalf("首探针应标注 hold, got %+v", d)
 	}
-	e.mu.RLock()
-	_, tracked := e.buyConfirmReal["600000"]
-	e.mu.RUnlock()
-	if !tracked {
-		t.Fatal("低置信首探针应记录首现时刻")
+	e.dispatchLive([]combat_agent.Signal{sig}, live, true, now.Add(4*time.Minute)) // 窗内
+	if len(*orders) != 0 {
+		t.Fatalf("未满窗不应下单, got %d", len(*orders))
 	}
-	// 同一轮（未满窗）仍受阻。
-	if e.realBuyConfirmPass("600000", 0.5, disc) {
-		t.Fatal("未满确认窗不应放行")
+	e.dispatchLive([]combat_agent.Signal{sig}, live, true, now.Add(6*time.Minute)) // 满窗 → pass
+	if len(*orders) != 1 {
+		t.Fatalf("满窗应放行 1 单, got %d", len(*orders))
+	}
+	if d := e.liveDecisionOf(sig); d != nil {
+		t.Fatal("放行后注解应清除")
 	}
 
-	// 3. 持续存在满窗：回拨首现时刻 → 放行，且放行后清除。
-	e.mu.Lock()
-	e.buyConfirmReal["600000"] = time.Now().Add(-time.Duration(disc.BuyConfirmMin+1) * time.Minute)
-	e.mu.Unlock()
-	if !e.realBuyConfirmPass("600000", 0.5, disc) {
-		t.Fatal("低置信满窗应放行")
+	// 高置信快车道：≥85% 阈值只需 BuyConfirmHighSec（默认30s）。
+	hs := combat_agent.Signal{ID: "S2", Code: "600001", Name: "测试", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10, Confidence: 0.9}
+	live1 := map[string]*data.StockInfo{"600001": {Code: "600001", Price: 10}}
+	e.dispatchLive([]combat_agent.Signal{hs}, live1, true, now)
+	if len(*orders) != 1 {
+		t.Fatalf("高置信首探针不应即买（30s 观察）, got %d", len(*orders))
 	}
-	e.mu.RLock()
-	_, still := e.buyConfirmReal["600000"]
-	e.mu.RUnlock()
-	if still {
-		t.Fatal("放行后应清除确认记录")
-	}
-
-	// 4. 高置信（0.9 ≥ 0.85 阈值归一）→ BuyConfirmHighSec 快车道：首探针受阻，满 30s 放行。
-	if e.realBuyConfirmPass("600001", 0.9, disc) {
-		t.Fatal("高置信首探针也不应即买（防插针）")
-	}
-	e.mu.Lock()
-	e.buyConfirmReal["600001"] = time.Now().Add(-time.Duration(disc.BuyConfirmHighSec+1) * time.Second)
-	e.mu.Unlock()
-	if !e.realBuyConfirmPass("600001", 0.9, disc) {
-		t.Fatal("高置信满 30s 观察应放行")
+	e.dispatchLive([]combat_agent.Signal{hs}, live1, true, now.Add(31*time.Second))
+	if len(*orders) != 2 {
+		t.Fatalf("高置信满 30s 应放行, got %d", len(*orders))
 	}
 }
 
-// TestPruneRealBuyConfirm 清理实盘买入确认表：本轮无信号的记录清除（信号须连续存在），
-// 超过最大观察窗的僵尸记录清除；活跃记录保留。
-// English: prunes the real buy-confirm table — codes without a signal this round are dropped (presence
-// must be continuous), over-max-window zombies cleaned, active entries preserved.
-func TestPruneRealBuyConfirm(t *testing.T) {
-	e, _, _, _ := newQMTEngine(t, nil)
-	disc := config.DefaultDisciplineConfig()
-	e.mu.Lock()
-	e.buyConfirmReal = map[string]time.Time{
-		"600000": time.Now().Add(-time.Minute),                                       // 活跃
-		"600001": time.Now().Add(-time.Minute),                                       // 本轮无信号 → 清
-		"600002": time.Now().Add(-time.Duration(disc.BuyConfirmMin+2) * time.Minute), // 僵尸 → 清
-	}
-	e.mu.Unlock()
+// TestDispatchLivePruneOnAbsence 信号消失即重置探针：A 码建探针后不再活跃，
+// 后续全量喂入（含 B 码）将其清理；A 码重现重新从首探针计窗（防跨轮累计插针）。
+// English: probes for vanished signals are pruned by the next full feed, so a re-appearing signal
+// restarts its confirmation window (no cross-gap accumulation).
+func TestDispatchLivePruneOnAbsence(t *testing.T) {
+	e, _, _, orders := newQMTEngine(t, nil)
+	a := combat_agent.Signal{ID: "A", Code: "600000", Name: "A", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
+	b := combat_agent.Signal{ID: "B", Code: "600001", Name: "B", Strategy: "龙头", StrategyType: "dragon", Direction: "做多", Action: "buy", Price: 10}
+	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}, "600001": {Code: "600001", Price: 10}}
+	now := time.Now()
 
-	seen := map[string]struct{}{"600000": {}, "600002": {}}
-	e.pruneRealBuyConfirm(seen, disc)
-
-	e.mu.RLock()
-	_, ok0 := e.buyConfirmReal["600000"]
-	_, ok1 := e.buyConfirmReal["600001"]
-	_, ok2 := e.buyConfirmReal["600002"]
-	e.mu.RUnlock()
-	if !ok0 {
-		t.Fatal("活跃记录应保留")
+	e.dispatchLive([]combat_agent.Signal{a}, live, true, now)                    // A 首探针
+	e.dispatchLive([]combat_agent.Signal{b}, live, true, now.Add(8*time.Minute)) // B 的活跃集缺席 A → A 探针清理
+	// A 重现于 t+14min：若旧探针仍在则早已满窗应放行；清理生效 → 视为首探针受阻。
+	e.dispatchLive([]combat_agent.Signal{a}, live, true, now.Add(14*time.Minute))
+	if len(*orders) != 0 {
+		t.Fatalf("A 探针应已被清理，重现重新计窗不得下单, got %d: %+v", len(*orders), *orders)
 	}
-	if ok1 {
-		t.Fatal("本轮无信号的记录应清除")
-	}
-	if ok2 {
-		t.Fatal("超最大观察窗的僵尸记录应清除")
+	// A 持续存在到满窗 → 正常放行（证明新探针从重现时刻起算）。
+	e.dispatchLive([]combat_agent.Signal{a}, live, true, now.Add(20*time.Minute))
+	if len(*orders) != 1 || (*orders)[0]["code"] != "600000.SH" {
+		t.Fatalf("A 从重现时刻满窗应放行 1 单, got %+v", *orders)
 	}
 }
 

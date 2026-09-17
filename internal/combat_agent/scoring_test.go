@@ -209,8 +209,10 @@ func (failStrategy) GenerateSignal(string, *strategy.Evaluation) (*strategy.Sign
 // TestScorePoolMomentumSignal 验证 Q2：四战法均不通过但动量分达阈值时，ScorePool 补发动量信号。
 // §动量入模拟盘：≥ 买入阈值(默认75) → buy（带 StrategyType=momentum 归动量池）；
 // 观察阈值 ≤ 分 < 买入阈值 → watch。
+// §20260917 严格开关：动量信号受 rules.strategy.momentum.enabled 显式门控，测试须显式开启。
 // English: verifies Q2 — buy at/above the buy threshold (StrategyType=momentum, routed to the paper
-// momentum pool), watch between thresholds.
+// momentum pool), watch between thresholds. Trading admission lives in the signal controller now
+// (§SIGNAL_CONTROLLER), so the agent must always produce these signals like any other strategy.
 func TestScorePoolMomentumSignal(t *testing.T) {
 	mc := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
 	mc.Momentum.SignalThreshold = 60
@@ -308,5 +310,31 @@ func TestScorePoolMomentumBelowThreshold(t *testing.T) {
 		if s.Strategy == "动量" {
 			t.Fatalf("低动量不应发信号: %+v", s)
 		}
+	}
+}
+
+// TestScorePoolMomentumAlwaysEmitted §SIGNAL_CONTROLLER 职责分离回归（2026-09-17 裁决：
+// "产，跟所有战法一样，根据我交易的开关来决定是否交易"）：
+// 动量信号产生端不设任何交易闸——达阈值即产 buy 信号（StrategyType=momentum）；
+// 能否成交完全由 signalctl 白名单在消费端裁决（动量永不在默认全集内）。
+// English: per the 2026-09-17 ruling, momentum emits signals like every other strategy;
+// whether they trade is decided solely by the signal controller whitelist downstream.
+func TestScorePoolMomentumAlwaysEmitted(t *testing.T) {
+	mc := config.NewManager(filepath.Join(t.TempDir(), "config.json")).GetStrategyConfig()
+	mc.Momentum.SignalThreshold = 60
+	mc.Momentum.BuySignalThreshold = 75
+	a := New(mc)
+	a.SetRunners([]StrategyRunner{{Type: strategy.SignalNShape, Strategy: failStrategy{}}})
+
+	md := mkBullMarketData()
+	if MomentumScore(md, mc.Momentum) < 75 {
+		t.Fatalf("测试数据动量分不足75, 无法验证恒产语义")
+	}
+	scores, sigs := a.ScorePool([]string{"600000"}, map[string]*strategy_engine.StockMarketData{"600000": md}, nil, "")
+	if len(sigs) != 1 || sigs[0].StrategyType != "momentum" || sigs[0].Action != "buy" {
+		t.Fatalf("动量达买入阈值应恒产 buy 信号（准入裁决归信号控制器）, got %+v", sigs)
+	}
+	if sc := scores["600000"]; sc.MomentumScore < 75 || !sc.MomentumValid {
+		t.Fatalf("动量分应正常写入打分结果, got %+v", sc)
 	}
 }

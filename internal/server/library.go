@@ -253,9 +253,23 @@ func (s *Server) reloadLibraries() {
 		c.ReloadFactorRules(s.researchDir)
 		c.ReloadPatternRules(s.researchDir)
 	}
-	s.registry.SetPaperPools(ActivePaperPoolTypes(s.researchDir))
+	s.registry.SetPaperPools(ActivePaperPoolTypes(s.researchDir, s.paperStrategiesForOperator()))
 	// §C 规则池显示名同步（改名/新增后前端分仓条立即用新名字）
 	s.registry.SetPaperLabelResolver(LibraryLabelResolver(s.researchDir))
+}
+
+// paperStrategiesForOperator 读取运营账号（管理员）的模拟盘战法白名单（rules.paper.strategies）——
+// 资金池模板按运营配置装配（§SIGNAL_CONTROLLER P3：momentum 池仅在显式列名时开立）。
+// English: reads the operator account's paper strategy whitelist that drives the pool template.
+func (s *Server) paperStrategiesForOperator() []string {
+	if s.cfg == nil {
+		return nil
+	}
+	rules := s.cfg.GetRulesFor(s.operatorID())
+	if rules == nil {
+		return nil
+	}
+	return rules.Paper.Strategies
 }
 
 // LibraryLabelResolver 构建规则池 ID → 显示名 解析器（含停用规则——历史持仓仍需可读名）。
@@ -279,21 +293,28 @@ func LibraryLabelResolver(dataDir string) func(string) string {
 }
 
 // ActivePaperPoolTypes 构建"当前启用战法"资金池类型列表：
-// 5 基础战法（四形态+动量）恒启用；factor/pattern 视 research 是否有启用规则才计入
-// （当前唯一因子规则=波动突破 → factor 池激活）。§动量入模拟盘：momentum 池随基础类型
-// 恒开立，动量 buy 信号自动归池撮合。
+// 4 内置形态战法恒开立；factor/pattern 视 research 是否有启用规则才计入。
+// §SIGNAL_CONTROLLER P3（20260917 动量误交易根因之一）：momentum 池不再恒开立——
+// 仅当账号模拟盘战法白名单（rules.paper.strategies）显式列名动量时才分配动量池资金；
+// 未列名时不占资金、无信号准入（信号控制器 paper 通道白名单同样拒绝，双端一致）。
 // 供 quant 启动与战法库热加载注入 registry.SetPaperPools（分仓防单战法垄断）。
-// English: builds the "currently enabled strategies" pool-type list — the four pattern strategies plus
-// momentum are always on; factor/pattern join only when the research store has enabled rules (the sole
-// enabled rule today, 波动突破, activates the factor pool). Feeds registry.SetPaperPools at startup
-// and hot reload.
-func ActivePaperPoolTypes(dataDir string) []string {
+// English: builds the enabled-strategy pool list — the four form strategies always; factor/pattern
+// join only when the research store has enabled rules. §SIGNAL_CONTROLLER P3: the momentum pool is
+// opened ONLY when the account's paper whitelist explicitly names momentum (previously always-open —
+// one root cause of the accidental momentum fill). Feeds registry.SetPaperPools at startup & hot reload.
+func ActivePaperPoolTypes(dataDir string, paperStrategies []string) []string {
 	types := []string{
 		string(strategy.SignalDragon),
 		string(strategy.SignalDoubleBump),
 		string(strategy.SignalNShape),
 		string(strategy.SignalDragonReturn),
-		string(strategy.SignalMomentum),
+	}
+	// 动量池显式 opt-in：白名单列名才开立（与 signalctl 默认全集不含动量同语义）。
+	for _, s := range paperStrategies {
+		if s == string(strategy.SignalMomentum) {
+			types = append(types, string(strategy.SignalMomentum))
+			break
+		}
 	}
 	// §C 规则细分池：每条启用规则独立成池（fac_1/pat_2 即池 key），不再用聚合池。
 	// 信号端 StrategyType 已改填规则 ID（combat_agent.libraryIDFromMeta），归池一一对应；

@@ -65,6 +65,8 @@ const strategyGroups = [
   },
   {
     // ── 动量分模型：三因子权重 + 动量闸门（信号过滤开关）──
+    // 注：动量"能不能交易"不在此页——与其他战法同权恒产信号，交易准入由「量化交易」页
+    // 战法开关（实盘白名单）与模拟盘战法开关统一裁决（§SIGNAL_CONTROLLER）。
     key: 'momentum', title: '动量分权重（合计建议=100）',
     fields: [
       { k: 'volume_price_weight', label: '量价权重', step: 5 },

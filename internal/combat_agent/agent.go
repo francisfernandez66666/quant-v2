@@ -1153,13 +1153,18 @@ func (a *Agent) evalAll(input *ScanInput, runners []StrategyRunner, code string,
 	sc.SignalActive = len(sigs) > 0
 
 	// Q2: 动量分达到阈值且四战法均未出信号时，补一条动量信号（§动量入模拟盘）：
-	//   ≥ 买入阈值 → Action=buy（进模拟盘自动撮合，归 momentum 池）
+	//   ≥ 买入阈值 → Action=buy（经信号控制器准入后归池撮合，归 momentum 池）
 	//   ≥ 观察阈值但 < 买入阈值 → Action=watch（仅观察不自动交易）
+	// §SIGNAL_CONTROLLER 20260917：动量与其他战法同权——信号产生不设交易闸，
+	// 能不能交易由 signalctl 白名单裁决（动量永不在默认全集内，必须用户在战法开关面板显式开启）。
+	// English: §SIGNAL_CONTROLLER — momentum produces signals like every other strategy; whether they
+	// trade is decided solely by the signal controller whitelist (momentum is never in the default set).
 	// 门控 sc.MomentumValid：竞价/盘前今日成交量=0 时动量数据不完整（无真实成交），
 	// 不发存量历史数据凑出来的动量信号，等 9:30 实盘有成交量后再出。
 	// English: Q2 — when momentum reaches the threshold but no other strategy fired, emit a momentum
-	// signal: buy at/above the buy threshold (auto-filled into the paper momentum pool), watch between
-	// the watch and buy thresholds. Gated on MomentumValid (pre-open volume of 0 = incomplete data).
+	// signal: buy at/above the buy threshold (routed to the paper momentum pool after controller
+	// admission), watch between the watch and buy thresholds. Gated on MomentumValid (pre-open volume
+	// of 0 = incomplete data).
 	if len(sigs) == 0 && sc.MomentumValid && sc.MomentumScore >= a.momentumSignalThreshold() {
 		action := "watch"
 		reasonPrefix := ""
