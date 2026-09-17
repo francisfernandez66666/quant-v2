@@ -37,6 +37,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	_ "time/tzdata" // §TZ1 内嵌 IANA 时区库：Windows/精简容器保证 Asia/Shanghai 可加载
@@ -542,6 +543,9 @@ func main() {
 					// against the latest base right away.
 					e.SyncMonitorBase()
 				}
+				// §D-4（GAP_VERIFY_20260917_PM）行情库覆盖断言（每日盘后一次）：
+				// 免费源断供时回测/情绪链会静默吃旧数据——滞后 >1 交易日即 ntfy/webhook 告警 + opslog 留痕。
+				checkDataCoverageOnce(researchDB, notifier)
 				d := data.DurationToNextActiveSession(time.Now())
 				if d > sleepChunk {
 					d = sleepChunk
@@ -927,4 +931,52 @@ func bumpPort(addr string) string {
 		return addr
 	}
 	return net.JoinHostPort(host, strconv.Itoa(p+1))
+}
+
+// coverageGuard §D-4 每日一次守卫：同日内重复调用直接返回（盘后循环节拍不等）。
+var coverageGuard = struct {
+	mu  sync.Mutex
+	day string
+}{}
+
+// checkDataCoverageOnce 行情库覆盖断言（§D-4）：trade_cal 可用且行情滞后 >1 交易日时
+// 投递 high 告警（ws/webhook + 网关 ntfy/JPush 双通道）并写 opslog；无从判定（无日历/未启动
+// 采集）与新鲜态只留 debug 日志。错误静默（旁路观测面，绝不影响主循环）。
+// English: §D-4 — once-per-day quote-DB coverage assertion; lagging >1 trading day fires a
+// high-severity ops alert (desktop/webhook + gateway/ntfy) plus an opslog line.
+func checkDataCoverageOnce(db *store.DB, n *notify.Notifier) {
+	if db == nil {
+		return
+	}
+	now := time.Now()
+	if now.Hour() < 16 { // 盘前/盘中不判（当日行情本就没有）
+		return
+	}
+	today := now.Format("20060102")
+	coverageGuard.mu.Lock()
+	if coverageGuard.day == today {
+		coverageGuard.mu.Unlock()
+		return
+	}
+	coverageGuard.day = today
+	coverageGuard.mu.Unlock()
+	f, err := db.CheckDataFreshness(today, 1)
+	if err != nil {
+		log.Printf("[coverage] 覆盖断言查询失败（忽略）: %v", err)
+		return
+	}
+	if f.OK {
+		if f.TradeCalOK && f.Latest != "" {
+			log.Printf("[coverage] 行情库覆盖正常: %s", f.String())
+		}
+		return
+	}
+	content := f.String() + "——请检查 dataload/hithink 同步链（断供期间回测与情绪链在用旧数据）"
+	opslog.Logf("quant", "行情库覆盖断言失败: %s", content)
+	log.Printf("[coverage] ⚠ %s", content)
+	if n != nil {
+		msg := notify.Message{Level: notify.LevelHigh, Title: "行情数据断供", Content: content}
+		n.Push(msg)
+		n.PushGateway(msg)
+	}
 }

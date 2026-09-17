@@ -2,7 +2,7 @@
 // 服务器连接、通知、账户信息、LLM 配置、五大战法参数、资讯显示开关、系统信息
 // 使用 TDesign React 组件（Card / Input / InputNumber / Switch / Button / Tag / Textarea）。
 import React, { useState, useEffect } from 'react'
-import { Card, Input, InputNumber, Button, Tag, Textarea } from 'tdesign-react'
+import { Card, Input, InputNumber, Button, Tag, Textarea, Dialog } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
 import { requestPermission, notify as sendNotify } from '../notify.js'
@@ -115,6 +115,53 @@ export default function Settings() {
   const [strategyBaseline, setStrategyBaseline] = useState(null)
 
   const [newsShowAll, setNewsShowAll] = useState(false)
+
+  // §D-3（GAP_VERIFY_20260917_PM）配置历史/回滚卡：接上早已就绪但零消费的两组端点
+  // （GET /api/config/history[?diff=TS] + POST /api/config/rollback 规则快照；
+  //   GET /api/research/strategies/snapshots + POST /api/research/strategies/rollback 战法参数）。
+  // admin-only：写侧端点是 adminMiddleware，成员看到卡也无意义（列表虽 auth 可读，统一隐藏避免误点）。
+  const [histRuleSnaps, setHistRuleSnaps] = useState([])
+  const [histStratSnaps, setHistStratSnaps] = useState([])
+  const [histDiff, setHistDiff] = useState(null) // {snapshot_ts, diff} | null
+  const [histRollback, setHistRollback] = useState(null) // {kind:'rules'|'strategy', ts} | null（确认弹窗目标）
+  const [histLoading, setHistLoading] = useState(false)
+  const histAdmin = api.getRole() === 'admin'
+
+  // 拉取两类快照列表（进卡/回滚后刷新）
+  async function loadHist() {
+    if (!histAdmin) return
+    setHistLoading(true)
+    try {
+      const [r, s] = await Promise.all([api.fetchConfigHistory(), api.fetchStrategySnapshots().catch(() => ({ snapshots: [] }))])
+      setHistRuleSnaps(Array.isArray(r.snapshots) ? r.snapshots : [])
+      setHistStratSnaps(Array.isArray(s.snapshots) ? s.snapshots : [])
+    } catch (e) {
+      showToast('配置历史拉取失败: ' + (e.message || ''), 'error')
+    } finally {
+      setHistLoading(false)
+    }
+  }
+  useEffect(() => { loadHist() }, [histAdmin]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 点开某条规则快照的 diff（与当前生效配置的逐行差异文本）
+  async function openHistDiff(ts) {
+    if (histDiff && histDiff.snapshot_ts === ts) { setHistDiff(null); return }
+    try { setHistDiff(await api.fetchConfigHistory(ts)) } catch (e) { showToast('diff 拉取失败: ' + (e.message || ''), 'error') }
+  }
+
+  // 确认弹窗→执行回滚（rules=config.json 原子恢复；strategy=参数快照恢复），成功后刷新列表
+  async function confirmHistRollback() {
+    if (!histRollback) return
+    try {
+      if (histRollback.kind === 'rules') await api.rollbackConfig(histRollback.ts)
+      else await api.rollbackStrategyParams(histRollback.ts)
+      showToast(`已回滚到快照 ${histRollback.ts}`, 'success')
+      setHistRollback(null)
+      await loadHist()
+    } catch (e) {
+      showToast('回滚失败: ' + (e.message || ''), 'error')
+    }
+  }
 
   // 保存战法参数配置
   async function saveStrategy() {
@@ -438,6 +485,61 @@ export default function Settings() {
         </div>
       </Card>
 
+      {/* §D-3 配置历史/回滚（admin）：防"自己偷偷改参数无痕迹"——每次配置写操作都有快照，
+          这里列表+diff+一键回滚。规则快照=config.json（LLM/风控/撮合等全部 rules 层）；
+          战法参数快照=参数版本化（审批应用/寻优写入时落）。 */}
+      {histAdmin && (
+        <Card title="配置历史与回滚" style={{ marginBottom: 16 }} loading={histLoading}>
+          <div style={{ fontSize: 12, color: 'var(--app-text-2)', marginBottom: 8 }}>
+            共 {histRuleSnaps.length} 个规则快照 / {histStratSnaps.length} 个战法参数快照。回滚为原子恢复并写入运维日志，操作前请确认当前时段。
+          </div>
+          {/* 规则配置快照表：diff 展开 + 回滚 */}
+          <div style={{ fontWeight: 600, margin: '6px 0 4px' }}>规则配置（config.json）</div>
+          {histRuleSnaps.length === 0 ? (
+            <div className="muted" style={{ fontSize: 12 }}>暂无快照（保存过设置后自动生成）</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <tbody>
+                {histRuleSnaps.slice(0, 20).map((sn) => (
+                  <tr key={sn.snapshot_ts} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ padding: '3px 6px', fontFamily: 'monospace', fontSize: 12 }}>{sn.snapshot_ts}</td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      <Button size="sm" variant="text" theme="primary" onClick={() => openHistDiff(sn.snapshot_ts)}>
+                        {histDiff && histDiff.snapshot_ts === sn.snapshot_ts ? '收起 diff' : 'diff'}
+                      </Button>
+                      <Button size="sm" variant="text" theme="danger" onClick={() => setHistRollback({ kind: 'rules', ts: sn.snapshot_ts })}>回滚</Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {histDiff && (
+            <pre style={{ background: 'var(--app-bg-2, #f6f7f9)', padding: 8, fontSize: 12, maxHeight: 240, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: '6px 0 10px' }}>
+              {histDiff.diff || '（无差异）'}
+            </pre>
+          )}
+          {/* 战法参数快照表：仅回滚（diff 面在研究页参数监测） */}
+          <div style={{ fontWeight: 600, margin: '10px 0 4px' }}>战法参数（版本化快照）</div>
+          {histStratSnaps.length === 0 ? (
+            <div className="muted" style={{ fontSize: 12 }}>暂无快照（审批/寻优应用战法参数时生成）</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <tbody>
+                {histStratSnaps.slice(0, 20).map((sn) => (
+                  <tr key={sn.snapshot_ts} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ padding: '3px 6px', fontFamily: 'monospace', fontSize: 12 }}>{sn.snapshot_ts}</td>
+                    <td style={{ padding: '3px 6px', textAlign: 'right' }}>
+                      <Button size="sm" variant="text" theme="danger" onClick={() => setHistRollback({ kind: 'strategy', ts: sn.snapshot_ts })}>回滚</Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Card>
+      )}
+
       <Card title="系统" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>版本</span>
@@ -448,6 +550,25 @@ export default function Settings() {
           <span>Go 1.22+ 单二进制</span>
         </div>
       </Card>
+
+      {/* §D-3 回滚二次确认：写清目标快照与影响面，确认才执行（原子恢复+审计在服务端） */}
+      <Dialog
+        visible={!!histRollback}
+        header="确认回滚配置"
+        onClose={() => setHistRollback(null)}
+        onCancel={() => setHistRollback(null)}
+        onConfirm={confirmHistRollback}
+        confirmBtn={{ content: '确认回滚', theme: 'danger' }}
+        cancelBtn="取消"
+      >
+        {histRollback && (
+          <div style={{ fontSize: 13 }}>
+            将把「{histRollback.kind === 'rules' ? '规则配置（LLM/风控/撮合等全部 rules 层）' : '战法参数'}」
+            原子恢复到快照 <b style={{ fontFamily: 'monospace' }}>{histRollback.ts}</b>。
+            <div style={{ color: 'var(--td-warning-color)', marginTop: 6 }}>⚠ 当前未保存的修改会被覆盖，操作将写入运维日志。</div>
+          </div>
+        )}
+      </Dialog>
     </div>
   )
 }

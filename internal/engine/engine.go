@@ -547,6 +547,14 @@ func New(
 		d1RetryQueue:      make(map[string]bool),
 		factorMon:         newFactorMonitor(dataDir, 5),
 	}
+	// §D-2（GAP_VERIFY_20260917_PM）裁定留痕落盘：JSONL 按日轮转 + 启动回灌当日环，
+	// quant 重启不再丢"为何没成交"的拦截原因。dataDir 空（纯内存测试路径）自动跳过；
+	// 绑定失败仅日志——审计是旁路观测面，绝不阻断引擎主装配。
+	if dataDir != "" {
+		if err := e.sigCtl.AttachAudit(filepath.Join(dataDir, "verdicts")); err != nil {
+			log.Printf("[engine] 裁定留痕落盘绑定失败（降级纯内存环）: %v", err)
+		}
+	}
 	e.syncMessages(nil, nil, nil, nil, nil) // 首次同步：把历史持仓/止盈止损提示并入消息中心（First sync: merge historical holdings/profit-loss notices into the message center）
 	// 启动时回填上次持久化的 8a/8b 打分与当日固化信号（重启后前端立即可见）
 	// English: on startup, backfill the last persisted 8a/8b scores and the day's pinned signals so the

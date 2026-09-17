@@ -19,7 +19,11 @@
 package signalctl
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +70,7 @@ const (
 // （A per-channel decision for one signal; also the audit-record shape.）
 type Decision struct {
 	Channel  Channel   `json:"channel"`
+	Account  string    `json:"account,omitempty"` // §D-1 留痕归属账号（多账号共享/独立引擎统一带出）
 	Verdict  Verdict   `json:"verdict"`
 	Stage    string    `json:"stage"`
 	Code     string    `json:"code"`
@@ -113,11 +118,70 @@ type Controller struct {
 	probes map[probeKey]time.Time // 买入信号首次出现时刻（连续存在累计，消失即重置）
 	ring   []Decision             // 裁定留痕环形缓冲（最新在尾）
 	cap    int
+	// §D-2（GAP_VERIFY_20260917_PM）留痕落盘目录：非空时 record() 逐条追写
+	// verdicts-YYYYMMDD.jsonl（按日自然轮转），重启经 AttachAudit 回灌当日环——
+	// 此前纯内存 512 环，quant 任何一次重启即丢"为何没成交"的拦截原因。
+	auditDir string
 }
 
 // New 创建控制器（留痕环默认 512 条）。
 func New() *Controller {
 	return &Controller{probes: make(map[probeKey]time.Time), cap: 512}
+}
+
+// auditFileFor 当日留痕 JSONL 路径（按 d.At 的本地日期分文件，跨日自动切换）。
+func auditFileFor(dir string, at time.Time) string {
+	return filepath.Join(dir, "verdicts-"+at.Format("20060102")+".jsonl")
+}
+
+// AttachAudit 绑定留痕落盘目录并回灌当日历史裁定（进程启动装配一次；
+// 目录为空串=纯内存模式，与旧行为一致）。回灌按 (at,channel,account,code,skey,verdict)
+// 与现有环去重，超容量保留最新。
+// English: §D-2 — binds the JSONL audit dir and replays today's verdicts into the ring so a
+// restart no longer wipes "why was this signal blocked" evidence.
+func (c *Controller) AttachAudit(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.Open(auditFileFor(dir, time.Now()))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	} else {
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 256*1024)
+		c.mu.Lock()
+		seen := make(map[[6]string]bool, len(c.ring))
+		keyOf := func(d Decision) [6]string {
+			return [6]string{d.At.String(), string(d.Channel), d.Account, d.Code, d.SKey, string(d.Verdict)}
+		}
+		for _, d := range c.ring {
+			seen[keyOf(d)] = true
+		}
+		for sc.Scan() {
+			var d Decision
+			if json.Unmarshal(sc.Bytes(), &d) != nil {
+				continue // 脏行跳过（进程被杀时的半行不影响后续）
+			}
+			if seen[keyOf(d)] {
+				continue
+			}
+			c.ring = append(c.ring, d)
+		}
+		if len(c.ring) > c.cap {
+			c.ring = append([]Decision(nil), c.ring[len(c.ring)-c.cap:]...)
+		}
+		c.mu.Unlock()
+	}
+	c.mu.Lock()
+	c.auditDir = dir
+	c.mu.Unlock()
+	return nil
 }
 
 // StrategyKeyOf 解析信号的规范战法键（白名单/探针统一键空间）：
@@ -232,7 +296,7 @@ func (c *Controller) Evaluate(ch Channel, account string, sigs []combat_agent.Si
 
 // admit 内部裁定：买入信号推进确认窗状态机并留痕，非买入直通。
 func (c *Controller) admit(ch Channel, account string, sig combat_agent.Signal, pol Policy, now time.Time) Decision {
-	d := Decision{Channel: ch, Verdict: VerdictPass, Code: sig.Code, Name: sig.Name,
+	d := Decision{Channel: ch, Account: account, Verdict: VerdictPass, Code: sig.Code, Name: sig.Name,
 		Strategy: sig.Strategy, SKey: StrategyKeyOf(sig), At: now}
 
 	// 非"买入/开仓"方向全部直通：卖出、离场、止盈止损提醒、watch 观察不参与准入控制
@@ -322,16 +386,29 @@ func (c *Controller) blockOrShadow(d *Decision, pol Policy) Decision {
 	return *d
 }
 
-// record 写入留痕环（最新在尾，满则丢最旧）。
+// record 写入留痕环（最新在尾，满则丢最旧），并按日追写 JSONL 审计文件（若已绑定）。
+// 落盘失败静默降级为纯内存（留痕是旁路观测面，绝不阻断裁定主流程）。
+// English: appends to the ring and, when §D-2 audit is attached, to the per-day JSONL file.
+// Write failures degrade silently to memory-only — the audit trail must never block admission.
 func (c *Controller) record(d Decision) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	// 追加到尾部。
 	c.ring = append(c.ring, d)
 	// 超容量时重建切片，只保留最新 cap 条（丢弃最旧）。
 	if len(c.ring) > c.cap {
 		c.ring = append([]Decision(nil), c.ring[len(c.ring)-c.cap:]...)
 	}
+	// §D-2 落盘（持锁写，串行化多 goroutine 追写，避免 JSONL 行交错撕裂）。
+	if c.auditDir != "" {
+		if b, err := json.Marshal(d); err == nil {
+			if f, ferr := os.OpenFile(auditFileFor(c.auditDir, d.At), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); ferr == nil {
+				f.Write(b)
+				f.Write([]byte("\n"))
+				f.Close()
+			}
+		}
+	}
+	c.mu.Unlock()
 }
 
 // Recent 返回最近 limit 条裁定留痕（最新在前），供审计端点消费。

@@ -191,3 +191,50 @@ func (d *DB) SavePaperResearchReport(date, userID, summaryJSON string) error {
 		date, userID, summaryJSON, time.Now().Format("2006-01-02 15:04:05"))
 	return err
 }
+
+// PaperResearchReport 一条夜间信号质量研究报告（§D-1 GAP_VERIFY_20260917_PM：有写无读补齐读端）。
+// Summary 为 research 侧生成的原始 JSON 字符串（generated_at/trades/daily/attribution/emotion），
+// HTTP 层按原样透传给前端解析展示，避免 store 侧耦合报告结构演进。
+// English: one nightly paper-research report row; Summary stays raw JSON so the store never couples
+// to the evolving report shape (the HTTP layer passes it through for frontend rendering).
+type PaperResearchReport struct {
+	Date      string `json:"date"`       // 报告日期 YYYY-MM-DD
+	UserID    string `json:"user_id"`    // 归属账号
+	Summary   string `json:"summary"`    // 报告正文（JSON 字符串）
+	CreatedAt string `json:"created_at"` // 落库时间
+}
+
+// ListPaperResearchReports 按日期倒序返回最近 limit 条报告（limit<=0 默认 30，上限 200）；
+// userID 非空时只返回该账号的行。空表返回空切片（HTTP 层序列化为 [] 而非 null）。
+// English: newest-first report tail (default 30, capped 200), optionally filtered by user;
+// never returns a nil slice so the JSON contract stays [].
+func (d *DB) ListPaperResearchReports(userID string, limit int) ([]PaperResearchReport, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	q := `SELECT date, user_id, summary_json, created_at FROM paper_research_reports`
+	args := []any{}
+	if userID != "" {
+		q += ` WHERE user_id=?`
+		args = append(args, userID)
+	}
+	q += ` ORDER BY date DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := d.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PaperResearchReport{}
+	for rows.Next() {
+		var r PaperResearchReport
+		if err := rows.Scan(&r.Date, &r.UserID, &r.Summary, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

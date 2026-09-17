@@ -435,3 +435,41 @@ func (s *Server) handleStrategyRollback(w http.ResponseWriter, r *http.Request) 
 	log.Printf("[research] 参数回滚到快照 %s（操作者=%s）", req.SnapshotTS, userIDFor(r))
 	writeJSON(w, 200, map[string]string{"status": "ok", "snapshot_ts": req.SnapshotTS})
 }
+
+// handlePaperResearchReports 处理 GET /api/research/paper-reports?limit=30：夜间信号质量研究
+// 报告历史（§D-1 GAP_VERIFY_20260917_PM：paper_research_reports 有写无读补齐读端）。
+// 报告正文含全账号 daily/归因聚合（生成侧即跨账号），故端点 admin-only，不做行级过滤——
+// 子账号越权在数据内容层就无法隔离（与 §WS-E 敏感管线隔离同一口径）。
+// English: serves the nightly paper-research report history. The report payload aggregates
+// cross-account daily/attribution data by construction, so the endpoint is admin-only — row
+// filtering cannot isolate content anyway (same policy as the §WS-E sensitive pipelines).
+func (s *Server) handlePaperResearchReports(w http.ResponseWriter, r *http.Request) {
+	if s.researchDB == nil {
+		writeError(w, 503, "研究库未接入")
+		return
+	}
+	limit := 30
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	reports, err := s.researchDB.ListPaperResearchReports("", limit)
+	if err != nil {
+		writeError(w, 500, "读取研究报告失败: "+err.Error())
+		return
+	}
+	// 正文以字符串入库，这里逐行解回对象，前端拿到的就是结构化报告（解失败的行保留原文并标注）。
+	out := make([]map[string]any, 0, len(reports))
+	for _, rp := range reports {
+		item := map[string]any{
+			"date": rp.Date, "user_id": rp.UserID, "created_at": rp.CreatedAt,
+		}
+		var body any
+		if err := json.Unmarshal([]byte(rp.Summary), &body); err != nil {
+			item["summary_text"] = rp.Summary
+		} else {
+			item["summary"] = body
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, 200, map[string]any{"reports": out, "count": len(out)})
+}

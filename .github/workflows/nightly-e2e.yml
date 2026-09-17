@@ -127,6 +127,17 @@ jobs:
                   (d, emo, "震荡", tier, "nightly seed", 0.55, 0.12, 0.6, 30, 4))
           db.commit()
           print("seeded rows:", db.execute("SELECT COUNT(*) FROM market_risk_daily").fetchone()[0])
+          # §D-1（GAP_VERIFY_20260917_PM）夜研报告 seed：paper_research_reports 一条最小报告
+          # （D-1 e2e 用例断言"弹窗打开+日期条渲染"，正文形状与 researchd 产出一致）。
+          import json as _json
+          rep = {"generated_at": d0, "trades": [{"strategy_type": "dragon", "side": "buy", "count": 2,
+                 "total_amount": 40000.0, "avg_price": 10.5, "avg_slippage": 0.12, "avg_latency": 2.0}],
+                 "daily": [], "attribution": [], "emotion": {"days": 2, "last_phase": "中性", "phase_days": {}}}
+          admin_id = db.execute("SELECT id FROM users LIMIT 1").fetchone()[0]
+          db.execute("INSERT OR REPLACE INTO paper_research_reports(date,user_id,summary_json,created_at) VALUES (?,?,?,datetime('now'))",
+                     ("2026-09-17", admin_id, _json.dumps(rep)))
+          db.commit()
+          print("seeded reports:", db.execute("SELECT COUNT(*) FROM paper_research_reports").fetchone()[0])
           PY
 
       - name: Restart engine（QMT 配置装配生效）

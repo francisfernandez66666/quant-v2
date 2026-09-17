@@ -46,6 +46,12 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	// §D-5（GAP_VERIFY_20260917_PM）库文件权限 0600：trading.db/live.db 含 LLM 密钥池与 QMT token
+	// 的 KV 快照，默认 0644 在共享主机/备份外泄面过大。auth.json 0600 先例（§A3）同口径收口。
+	// -wal/-shm 旁文件同样处理（WAL 下常驻）。个别平台 chmod 不支持时静默跳过。
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		_ = os.Chmod(p, 0o600)
+	}
 	return d, nil
 }
 

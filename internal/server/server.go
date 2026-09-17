@@ -702,6 +702,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/grayscale", s.permMiddleware(auth.PermResearchApprove, s.handleResearchGrayscale))
 	s.mux.HandleFunc("POST /api/research/candidates/{id}/backtest", s.permMiddleware(auth.PermResearchApprove, s.handleCandidateBacktest))
 	s.mux.HandleFunc("GET /api/research/backtest/{id}", s.authMiddleware(s.handleBacktestStatus))
+	// §D-1 夜间信号质量研究报告历史（正文跨账号聚合，admin-only）
+	s.mux.HandleFunc("GET /api/research/paper-reports", s.adminMiddleware(s.handlePaperResearchReports))
 	// 阶段3.2 回测运行控制：取消（kill+interrupted，断点缓存可续跑）/ 暂停（SIGSTOP）/ 继续（SIGCONT）
 	s.mux.HandleFunc("POST /api/research/backtest/{id}/cancel", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestCancel))
 	s.mux.HandleFunc("POST /api/research/backtest/{id}/pause", s.permMiddleware(auth.PermResearchApprove, s.handleBacktestPause))

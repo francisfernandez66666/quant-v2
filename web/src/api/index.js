@@ -878,6 +878,34 @@ export async function fetchRiskGates(day) {
   return request('/api/risk/gates' + (day ? '?day=' + encodeURIComponent(day) : ''))
 }
 
+/** §D-1（GAP_VERIFY_20260917_PM）夜间信号质量研究报告历史：GET /api/research/paper-reports?limit=N（admin）。
+ * 返回 { reports:[{date,user_id,created_at,summary:{generated_at,trades,daily,attribution,emotion}}], count } */
+export async function fetchPaperResearchReports(limit) {
+  return request('/api/research/paper-reports?limit=' + (limit || 30))
+}
+
+/** §D-3（GAP_VERIFY_20260917_PM）规则配置快照列表：GET /api/config/history（admin）。
+ * 返回 { snapshots:[{snapshot_ts,path}] }；?diff=TS 返回 { snapshot_ts, diff }（行级文本 diff） */
+export async function fetchConfigHistory(diffTs) {
+  return request('/api/config/history' + (diffTs ? '?diff=' + encodeURIComponent(diffTs) : ''))
+}
+
+/** §D-3 规则配置回滚：POST /api/config/rollback {snapshot_ts}（admin，原子恢复+审计） */
+export async function rollbackConfig(snapshotTs) {
+  return request('/api/config/rollback', { method: 'POST', data: { snapshot_ts: snapshotTs } })
+}
+
+/** §D-3 战法参数快照列表：GET /api/research/strategies/snapshots（auth）。
+ * 返回 { snapshots:[{snapshot_ts,path}] } */
+export async function fetchStrategySnapshots() {
+  return request('/api/research/strategies/snapshots')
+}
+
+/** §D-3 战法参数回滚：POST /api/research/strategies/rollback {snapshot_ts}（admin） */
+export async function rollbackStrategyParams(snapshotTs) {
+  return request('/api/research/strategies/rollback', { method: 'POST', data: { snapshot_ts: snapshotTs } })
+}
+
 /** 模拟盘：手动买入（信号页"模拟买入"按钮触发）。qty>0 时按用户输入价格/手数成交（静态记账），
  *  price=0 回退实时价；qty<=0 回退固定金额整手（旧行为）。 */
 /** Paper trading: manual buy (signal-page "paper buy" button). qty>0 fills the typed price/lots (static

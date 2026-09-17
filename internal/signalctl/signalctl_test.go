@@ -3,6 +3,8 @@
 package signalctl
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,5 +186,51 @@ func TestAuditRing(t *testing.T) {
 	r := c.Recent(10)
 	if len(r) != 1 || r[0].Code != "600001" || r[0].Verdict != VerdictBlock {
 		t.Fatalf("留痕环应只含拦截: %+v", r)
+	}
+}
+
+// TestAuditAttachReplayAndGarbageTolerant §D-2（GAP_VERIFY_20260917_PM）留痕落盘/回灌：
+// 拦截裁定写 JSONL → 新控制器（模拟重启）AttachAudit 回灌环；脏行（进程被杀半行）跳过；
+// Account 归属随行落盘。
+func TestAuditAttachReplayAndGarbageTolerant(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	c := New()
+	if err := c.AttachAudit(dir); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	// 白名单只列动量 → dragon 在战法层硬拦并留痕
+	pol := Policy{Strategies: []string{"momentum"}}
+	d := c.Admit(ChannelPaper, "u_alice", sig("buy", "dragon", "龙头", "600000"), pol, now)
+	if d.Verdict != VerdictBlock || d.Stage != StageStrategy {
+		t.Fatalf("应战法层拦截, got %+v", d)
+	}
+	if d.Account != "u_alice" {
+		t.Fatalf("裁定应携带账号归属, got %q", d.Account)
+	}
+	b, err := os.ReadFile(auditFileFor(dir, now))
+	if err != nil {
+		t.Fatalf("当日审计文件应存在: %v", err)
+	}
+	if !strings.Contains(string(b), `"account":"u_alice"`) || !strings.Contains(string(b), "600000") {
+		t.Fatalf("审计行应含账号与代码, got %s", string(b))
+	}
+	// 模拟进程被杀留下的半行脏数据 + 再回灌
+	f, _ := os.OpenFile(auditFileFor(dir, now), os.O_APPEND|os.O_WRONLY, 0o600)
+	f.WriteString(`{"channel":"paper","verdict":"block"`) // 无换行无闭合 = 脏行
+	f.Close()
+	c2 := New()
+	if err := c2.AttachAudit(dir); err != nil {
+		t.Fatalf("attach2: %v", err)
+	}
+	rec := c2.Recent(10)
+	if len(rec) != 1 || rec[0].Code != "600000" || rec[0].Account != "u_alice" {
+		t.Fatalf("回灌应得 1 条有效裁定（脏行跳过）, got %+v", rec)
+	}
+	// 纯内存模式（未绑定目录）不受影响：直接 New 记录零副作用
+	c3 := New()
+	c3.Admit(ChannelLive, "u_bob", sig("buy", "momentum", "动量", "000001"), Policy{Strategies: []string{"momentum"}}, now)
+	if len(c3.Recent(5)) != 0 {
+		t.Fatal("momentum 显式开启后 pass 不留痕（仅非常态入环）")
 	}
 }

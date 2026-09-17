@@ -801,3 +801,60 @@ test.describe('修复回归 · 20260917 缺陷批', () => {
     await page.screenshot({ path: `${SHOT}/branch-paper-strategies-tab.png`, fullPage: true })
   })
 })
+
+// ── 20260917 GAP_VERIFY D 批（个人产品口径缺陷修复回归）──
+// D-1：夜间信号质量报告卡（researchd 报告有写无读补齐读端：按钮→弹窗→聚合表/占位降级）；
+// D-3：Settings 配置历史卡（接上零消费的快照/回滚 API：列表渲染 + 回滚二次确认取消分支）。
+test.describe('修复回归 · GAP_VERIFY_20260917 D 批', () => {
+  // D-1 Paper 页"夜间报告"弹窗：有 seed 数据渲染聚合表，无数据显示占位文案（两态都算通）
+  test('D-1 Paper：夜间报告弹窗两态渲染', async ({ page }) => {
+    await page.goto('/#/paper')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const pre = await (await page.request.get('/api/research/paper-reports?limit=5', { headers: hdr })).json()
+    await page.getByRole('button', { name: /夜间报告/ }).click()
+    const dlg = page.locator('.t-dialog', { hasText: '夜间信号质量报告' })
+    await expect(dlg, 'D-1 弹窗打开').toBeVisible({ timeout: 8000 })
+    if ((pre.count || 0) > 0) {
+      await expect(dlg.getByText('成交聚合（战法×方向）'), 'D-1 聚合表标题').toBeVisible()
+      await expect(dlg.getByText(pre.reports[0].date, { exact: true }), 'D-1 报告日期条').toBeVisible()
+    } else {
+      await expect(dlg.getByText('暂无报告'), 'D-1 空态占位').toBeVisible()
+    }
+    await page.screenshot({ path: `${SHOT}/branch-paper-nightly.png` })
+    await page.keyboard.press('Escape')
+  })
+
+  // D-3 Settings 配置历史卡：admin 可见 + 列表/空态 + 回滚二次确认（取消不执行）
+  test('D-3 Settings：配置历史卡与回滚取消分支', async ({ page }) => {
+    await page.goto('/#/settings')
+    const card = page.locator('.t-card', { hasText: '配置历史与回滚' })
+    await expect(card, 'D-3 admin 配置历史卡渲染').toBeVisible({ timeout: 10000 })
+    const rollBtns = card.getByRole('button', { name: '回滚' })
+    if ((await rollBtns.count()) > 0) {
+      await rollBtns.first().click()
+      const dlg = page.locator('.t-dialog', { hasText: '确认回滚配置' })
+      await expect(dlg, 'D-3 回滚二次确认弹窗').toBeVisible({ timeout: 8000 })
+      await dlg.getByRole('button', { name: '取消' }).click()
+      await expect(dlg, 'D-3 取消后弹窗关闭').toBeHidden({ timeout: 8000 })
+    } else {
+      // 无快照环境（极新部署未触发过配置写）：两列表占位文案即证接线在
+      await expect(card.getByText('暂无快照').first(), 'D-3 空态占位').toBeVisible()
+    }
+    await page.screenshot({ path: `${SHOT}/branch-settings-hist.png`, fullPage: true })
+  })
+
+  // D-3 tester 权限分支：成员账号整卡隐藏（写端点 admin-only）
+  test('D-3 tester：Settings 无配置历史卡', async ({ page, context }) => {
+    // 用 tester 凭据现登（不动共享 storageState 会话）
+    const resp = await context.request.post('/api/auth/login', { data: { username: process.env.E2E_USER2 || 'tester', password: process.env.E2E_PASS2 || '' } })
+    expect(resp.ok(), 'tester 登录').toBe(true)
+    const t = (await resp.json()).token
+    const p2 = await context.newPage()
+    await p2.goto('/#/')
+    await p2.evaluate((tok) => localStorage.setItem('liangzai_token', tok), t)
+    await p2.goto('/#/settings')
+    await expect(p2.locator('.t-card', { hasText: '配置历史与回滚' })).toHaveCount(0)
+    await expect(p2.locator('.t-card', { hasText: '服务器连接' }).first(), '设置页本体正常渲染').toBeVisible()
+    await p2.close()
+  })
+})

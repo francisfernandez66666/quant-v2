@@ -216,6 +216,13 @@ export default function Paper() {
   // 自检请求进行中（按钮 loading，防重复提交）
   const [selfCheckLoading, setSelfCheckLoading] = useState(false)
 
+  // §D-1（GAP_VERIFY_20260917_PM）夜间信号质量报告：researchd 每晚落库 paper_research_reports，
+  // 此前有写无读；本卡补读端展示（日期列表→选中展开 trades/attribution 关键行）。
+  const [nReports, setNReports] = useState([])
+  const [nReportsOpen, setNReportsOpen] = useState(false)
+  const [nReportsLoading, setNReportsLoading] = useState(false)
+  const [nReportSel, setNReportSel] = useState(-1)
+
   // 已展开分时图的行 key 集合（持仓行用 code，成交行用 trade_序号）
   const [klineOpen, setKlineOpen] = useState(new Set())
   // §F3 全局个股详情抽屉目标（{code,name}），null=关闭
@@ -434,6 +441,21 @@ export default function Paper() {
       showToast(e && e.message ? e.message : '自检失败')
     } finally {
       setSelfCheckLoading(false)
+    }
+  }
+
+  // §D-1 拉取夜间信号质量报告历史（admin 端点；403 时静默——页面本身普通用户只读）
+  async function openNightlyReports() {
+    setNReportsLoading(true)
+    try {
+      const res = await api.fetchPaperResearchReports(30)
+      setNReports(Array.isArray(res.reports) ? res.reports : [])
+      setNReportSel(0)
+      setNReportsOpen(true)
+    } catch (e) {
+      showToast(e && e.message ? e.message : '夜间报告拉取失败')
+    } finally {
+      setNReportsLoading(false)
     }
   }
 
@@ -734,6 +756,8 @@ export default function Paper() {
           <Button disabled={!enabled && !isAdmin} onClick={openSettingsModal}>⚙ 设置</Button>
           {/* 自检诊断入口：拉取引擎快照一致性结果并弹窗展示 */}
           <Button theme="default" loading={selfCheckLoading} onClick={runSelfCheck}>🔍 自检</Button>
+          {/* §D-1 夜间信号质量报告入口（researchd 每晚落库，admin-only 端点） */}
+          <Button theme="default" loading={nReportsLoading} onClick={openNightlyReports}>📊 夜间报告</Button>
           {/* 全局清盘入口：未启用时禁用 */}
           <Button theme="danger" disabled={!enabled} onClick={() => setShowResetModal(true)}>清盘</Button>
         </div>
@@ -1241,6 +1265,90 @@ export default function Paper() {
               </div>
             )}
             <div style={{ marginTop: 10, color: 'var(--app-muted-2)' }}>提示：若「当前持仓数」&gt;0 但前端「全部」页为空，多半是前端拉取逻辑问题（已修复）；若持仓与文件都为空，则确属无数据。</div>
+          </div>
+        )}
+      </Dialog>
+
+      {/* §D-1（GAP_VERIFY_20260917_PM）夜间信号质量报告弹窗：researchd 每晚 paper-research 落库的
+          trades 聚合 / 归因 / 情绪相位（旧数据行 summary 解析失败时降级显示原文）。 */}
+      <Dialog visible={nReportsOpen} header="夜间信号质量报告（researchd）" onClose={() => setNReportsOpen(false)} footer={null} width={720}>
+        {nReports.length === 0 ? (
+          <div style={{ color: 'var(--app-muted-2)', fontSize: 13, padding: '12px 0' }}>暂无报告——researchd 夜间任务跑过 paper-research 步骤后生成。</div>
+        ) : (
+          <div style={{ fontSize: 13 }}>
+            {/* 日期选择条：倒序报告列表，点选切换正文 */}
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+              {nReports.map((r, i) => (
+                <Tag key={r.date + '_' + i} theme={i === nReportSel ? 'primary' : 'default'}
+                  style={{ cursor: 'pointer' }} onClick={() => setNReportSel(i)}>{r.date}</Tag>
+              ))}
+            </div>
+            {(() => {
+              const cur = nReports[nReportSel] || nReports[0]
+              const s = cur && cur.summary
+              if (!s) return <div style={{ wordBreak: 'break-all', fontFamily: 'monospace', color: 'var(--app-text-2)' }}>{cur?.summary_text || '（正文缺失）'}</div>
+              return (
+                <div>
+                  <div style={{ color: 'var(--app-muted-2)', marginBottom: 8 }}>生成于 {String(s.generated_at || cur.created_at || '—')}</div>
+                  {/* 成交聚合表：按战法池类型+方向（笔数/金额/均价/滑点/延迟） */}
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>成交聚合（战法×方向）</div>
+                  {Array.isArray(s.trades) && s.trades.length > 0 ? (
+                    <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: 12 }}>
+                      <thead>
+                        <tr style={{ color: 'var(--app-text-2)', textAlign: 'left' }}>
+                          {['战法', '方向', '笔数', '金额', '均价', '滑点%', '延迟s'].map((h) => <th key={h} style={{ padding: '3px 6px' }}>{h}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {s.trades.map((t, i) => (
+                          <tr key={i} style={{ borderBottom: '1px solid #eee' }}>
+                            <td style={{ padding: '3px 6px' }}>{t.strategy_type || '其他/手动'}</td>
+                            <td style={{ padding: '3px 6px' }}>{t.side === 'sell' ? '卖出' : t.side === 'buy' ? '买入' : t.side}</td>
+                            <td style={{ padding: '3px 6px' }}>{t.count}</td>
+                            <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{fmt(t.total_amount)}</td>
+                            <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{Number(t.avg_price || 0).toFixed(2)}</td>
+                            <td style={{ padding: '3px 6px', fontFamily: 'monospace', color: (t.avg_slippage || 0) > 0 ? 'var(--app-up)' : 'var(--app-down)' }}>{(t.avg_slippage || 0).toFixed(3)}</td>
+                            <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{(t.avg_latency || 0).toFixed(1)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : <div style={{ color: 'var(--app-muted-2)', marginBottom: 12 }}>无成交分组（研究库窗口内 paper_trades 为空）。</div>}
+                  {/* 归因表：用户+战法的信号→成交承接质量（admin 全账号视角） */}
+                  {Array.isArray(s.attribution) && s.attribution.length > 0 && (
+                    <>
+                      <div style={{ fontWeight: 600, marginBottom: 4 }}>信号承接归因</div>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: 12 }}>
+                        <thead>
+                          <tr style={{ color: 'var(--app-text-2)', textAlign: 'left' }}>
+                            {['账号', '战法', '笔数', '买/卖', '滑点%', '延迟s'].map((h) => <th key={h} style={{ padding: '3px 6px' }}>{h}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {s.attribution.map((a, i) => (
+                            <tr key={i} style={{ borderBottom: '1px solid #eee' }}>
+                              <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{a.user_id || a.UserID}</td>
+                              <td style={{ padding: '3px 6px' }}>{a.strategy || a.Strategy}</td>
+                              <td style={{ padding: '3px 6px' }}>{a.count ?? a.Count}</td>
+                              <td style={{ padding: '3px 6px' }}>{a.buy_count ?? a.BuyCount}/{a.sell_count ?? a.SellCount}</td>
+                              <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{Number(a.avg_slippage ?? a.AvgSlippage ?? 0).toFixed(3)}</td>
+                              <td style={{ padding: '3px 6px', fontFamily: 'monospace' }}>{Number(a.avg_latency ?? a.AvgLatency ?? 0).toFixed(1)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </>
+                  )}
+                  {/* 情绪相位锚点：最近阶段 + 分布天数 */}
+                  {s.emotion && (s.emotion.last_phase || s.emotion.phase_days) && (
+                    <div style={{ color: 'var(--app-text-2)' }}>
+                      情绪相位（近 {s.emotion.days} 交易日）：最近 <b>{String(s.emotion.last_phase || '—')}</b>
+                      {s.emotion.phase_days && Object.entries(s.emotion.phase_days).map(([p, n]) => ` ${p} ${n}天`).join('')}
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
           </div>
         )}
       </Dialog>
