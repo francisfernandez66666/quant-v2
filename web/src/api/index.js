@@ -1587,6 +1587,31 @@ export async function cleanupAdminUsers(dryRun = false) {
   return request('/api/admin/users/cleanup', { method: 'POST', data: { dry_run: !!dryRun } })
 }
 
+/** §MT 租户列表（GET /api/tenants，仅平台运营者） */
+export async function fetchTenants() {
+  return request('/api/tenants')
+}
+
+/** §MT 创建租户（POST /api/tenants，可选随建租户管理员） */
+export async function createTenant(data) {
+  return request('/api/tenants', { method: 'POST', data })
+}
+
+/** §MT 更新租户（PUT /api/tenants/{id}：name/enabled/quota 局部更新） */
+export async function updateTenant(id, data) {
+  return request('/api/tenants/' + encodeURIComponent(id), { method: 'PUT', data })
+}
+
+/** §MT 本租户配额与用量（GET /api/tenant/usage） */
+export async function fetchTenantUsage() {
+  return request('/api/tenant/usage')
+}
+
+/** §MT 迁移用户到指定租户（PUT /api/admin/users/{id}/tenant，仅平台运营者） */
+export async function moveUserTenant(id, tenantId) {
+  return request('/api/admin/users/' + encodeURIComponent(id) + '/tenant', { method: 'PUT', data: { tenant_id: tenantId } })
+}
+
 /** 读取指定账号战法参数（GET /api/admin/users/{id}/config/strategy） */
 export async function fetchAdminStrategyConfig(id) {
   return request('/api/admin/users/' + encodeURIComponent(id) + '/config/strategy')

@@ -27,22 +27,32 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"id":         user.ID,
-		"username":   user.Username,
-		"role":       user.Role,
-		"perms":      user.Perms,
-		"enabled":    user.Enabled,
-		"expires_at": user.ExpiresAt,
+		"id":          user.ID,
+		"username":    user.Username,
+		"role":        user.Role,
+		"perms":       user.Perms,
+		"enabled":     user.Enabled,
+		"expires_at":  user.ExpiresAt,
+		"tenant_id":   s.auth.TenantOf(user.ID), // §MT 所属租户
+		"tenant_name": s.auth.TenantName(s.auth.TenantOf(user.ID)),
 	})
 }
 
-// handleListUsers 处理 GET /api/admin/users：列出全部用户（公开视图，不含密码/令牌）。
-// English: handles GET /api/admin/users — lists all users (public view, no passwords/tokens).
+// handleListUsers 处理 GET /api/admin/users：列出可见用户（公开视图，不含密码/令牌）。
+// §MT 作用域：平台运营者=全部；租户 admin=仅本租户成员。附 tenant_name 便于前端展示。
+// English: §MT — platform admins list everyone; tenant admins list only their own members.
 func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
-	users := s.auth.ListUsers()
+	users := s.scopedUsers(r)
+	names := map[string]string{}
+	for _, t := range s.auth.ListTenants() {
+		names[t.ID] = t.Name
+	}
+	platform := s.isPlatformAdmin(r)
 	writeJSON(w, 200, map[string]interface{}{
-		"users": users,
-		"perms": auth.AllPerms(),
+		"users":        users,
+		"perms":        auth.AllPerms(),
+		"tenant_names": names,
+		"platform":     platform, // §MT 前端据此决定是否渲染租户管理区块
 	})
 }
 
@@ -75,10 +85,12 @@ func (s *Server) handleCleanupUsers(w http.ResponseWriter, r *http.Request) {
 		Reason   string `json:"reason"`
 	}
 	var out []cleaned
-	for _, u := range s.auth.ListUsers() {
+	// §MT 清理同样受租户作用域约束：租户 admin 只清本租户僵尸号。
+	for _, u := range s.scopedUsers(r) {
 		if u.Role == auth.RoleAdmin {
 			continue // 管理员账号绝无清理路径
 		}
+		// 清理口径三分支：账号级过期 / temp 会话全过期（僵尸） / temp 已禁用
 		reason := ""
 		switch {
 		case u.ExpiresAt > 0 && now > u.ExpiresAt:
@@ -114,6 +126,8 @@ type createUserReq struct {
 	// English: optional, list of permission bits.
 	ExpiresDays int `json:"expires_days"` // 可选，账号有效期天数（0=永久）
 	// English: optional, account validity in days (0 = permanent).
+	// §MT 目标租户：仅平台运营者可指定；租户 admin 建号恒落本租户。
+	TenantID string `json:"tenant_id"`
 }
 
 // handleCreateUser 处理 POST /api/admin/users：管理员创建正式用户并返回其公开视图。
@@ -132,12 +146,32 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "expires_days must be >= 0")
 		return
 	}
-	user, err := s.auth.CreateUser(req.Username, req.Password, req.Role, req.Perms, req.ExpiresDays)
+	// §MT 租户归属判定：租户 admin 强制本租户；平台运营者可指定 tenant_id（须存在）。
+	tenantID := s.actorTenant(r)
+	if req.TenantID != "" && req.TenantID != tenantID {
+		if !s.isPlatformAdmin(r) {
+			writeError(w, 403, "无权限：仅平台运营者可指定其他租户")
+			return
+		}
+		if s.auth.TenantByID(req.TenantID) == nil {
+			writeError(w, 400, "tenant not found")
+			return
+		}
+		tenantID = req.TenantID
+	}
+	// §MT 跨租户开户护栏：非平台运营者不得直接在他租户建 admin。
+	if req.Role == auth.RoleAdmin && !s.isPlatformAdmin(r) && tenantID != s.actorTenant(r) {
+		writeError(w, 403, "无权限：仅平台运营者可在其他租户创建管理员")
+		return
+	}
+	user, err := s.auth.CreateUserInTenant(tenantID, req.Username, req.Password, req.Role, req.Perms, req.ExpiresDays)
 	if err != nil {
+		// §MT 开户失败统一 409：用户名撞车/租户满额(ErrTenantQuota)/租户停用(ErrTenantDisabled)等
 		writeError(w, 409, err.Error())
 		return
 	}
-	log.Printf("[admin] 创建用户 %s (role=%s perms=%v expires_days=%d)", req.Username, user.Role, req.Perms, req.ExpiresDays)
+	opslog.Audit("user_create", userIDFor(r), user.ID, "tenant="+tenantID)
+	log.Printf("[admin] 创建用户 %s (role=%s perms=%v expires_days=%d tenant=%s)", req.Username, user.Role, req.Perms, req.ExpiresDays, tenantID)
 	writeJSON(w, 201, map[string]interface{}{"user": user.PublicUser()})
 }
 
@@ -151,6 +185,10 @@ type setUserRoleReq struct {
 // English: handles POST /api/admin/users/{id}/role — sets a user's role.
 func (s *Server) handleSetUserRole(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	var req setUserRoleReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -174,6 +212,10 @@ type setUserPermsReq struct {
 // English: handles POST /api/admin/users/{id}/perms — overwrites a user's whole permission-bit list.
 func (s *Server) handleSetUserPerms(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	var req setUserPermsReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -197,6 +239,10 @@ type setUserPasswordReq struct {
 // English: handles POST /api/admin/users/{id}/password — resets a user's password and re-issues the token.
 func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	var req setUserPasswordReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -228,6 +274,10 @@ type setUserExpiryReq struct {
 // English: handles POST /api/admin/users/{id}/expiry — sets an account's validity in days (0 = permanent).
 func (s *Server) handleSetUserExpiry(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	var req setUserExpiryReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -245,6 +295,10 @@ func (s *Server) handleSetUserExpiry(w http.ResponseWriter, r *http.Request) {
 // English: handles POST /api/admin/users/{id}/enabled — enables/disables an account.
 func (s *Server) handleSetUserEnabled(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	var req setUserEnabledReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -262,6 +316,10 @@ func (s *Server) handleSetUserEnabled(w http.ResponseWriter, r *http.Request) {
 // English: handles DELETE /api/admin/users/{id} — deletes a user (admins cannot be deleted).
 func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if err := s.auth.DeleteUser(id); err != nil {
 		writeError(w, 400, err.Error())
 		return
@@ -279,6 +337,10 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 // (account-level override wins, otherwise the global config).
 func (s *Server) handleAdminGetStrategyConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -291,6 +353,10 @@ func (s *Server) handleAdminGetStrategyConfig(w http.ResponseWriter, r *http.Req
 // English: handles POST /api/admin/users/{id}/config/strategy — saves the account's strategy param overrides.
 func (s *Server) handleAdminSetStrategyConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -309,6 +375,10 @@ func (s *Server) handleAdminSetStrategyConfig(w http.ResponseWriter, r *http.Req
 // English: handles GET /api/admin/users/{id}/config/d1.
 func (s *Server) handleAdminGetD1Config(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -320,6 +390,10 @@ func (s *Server) handleAdminGetD1Config(w http.ResponseWriter, r *http.Request) 
 // English: handles POST /api/admin/users/{id}/config/d1.
 func (s *Server) handleAdminSetD1Config(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -338,6 +412,10 @@ func (s *Server) handleAdminSetD1Config(w http.ResponseWriter, r *http.Request) 
 // English: handles GET /api/admin/users/{id}/config/longshort.
 func (s *Server) handleAdminGetLongShortConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -349,6 +427,10 @@ func (s *Server) handleAdminGetLongShortConfig(w http.ResponseWriter, r *http.Re
 // English: handles POST /api/admin/users/{id}/config/longshort.
 func (s *Server) handleAdminSetLongShortConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -368,6 +450,10 @@ func (s *Server) handleAdminSetLongShortConfig(w http.ResponseWriter, r *http.Re
 // English: handles GET /api/admin/users/{id}/config/llm — reads the account's LLM config (incl. multiple keys).
 func (s *Server) handleAdminGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -400,6 +486,10 @@ func (s *Server) handleAdminGetLLMConfig(w http.ResponseWriter, r *http.Request)
 // does not trigger a global llmRecreate so other accounts are not disturbed).
 func (s *Server) handleAdminSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -433,6 +523,10 @@ func (s *Server) handleAdminSetLLMConfig(w http.ResponseWriter, r *http.Request)
 // English: handles GET /api/admin/users/{id}/config/qmt — admin reads an account's QMT live config.
 func (s *Server) handleAdminGetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return
@@ -450,6 +544,10 @@ func (s *Server) handleAdminGetQMTConfig(w http.ResponseWriter, r *http.Request)
 // validation/semantics to the operator endpoint.
 func (s *Server) handleAdminSetQMTConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
+	if !s.denyOutOfScope(w, r, id) {
+		return
+	}
 	if s.cfg == nil {
 		writeError(w, 503, "配置未接入")
 		return

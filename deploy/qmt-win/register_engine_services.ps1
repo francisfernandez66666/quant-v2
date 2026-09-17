@@ -1,4 +1,4 @@
-# register_engine_services.ps1 - Guangzhou all-in-one: register engine Windows services (NSSM) + qmtctl task scheduler.
+﻿# register_engine_services.ps1 - Guangzhou all-in-one: register engine Windows services (NSSM) + qmtctl task scheduler.
 # Usage (admin PowerShell):
 #   powershell -ExecutionPolicy Bypass -File register_engine_services.ps1 `
 #       -QuantExe C:\opt\quant\quant.exe -ResearchExe C:\opt\quant\researchd.exe `
@@ -78,9 +78,12 @@ function Register-NssmService($name, $exe, $appArgs, $priority) {
 # 2. quant (NORMAL)
 if (-not (Test-Path $QuantExe)) { Die "missing $QuantExe" }
 Register-NssmService "quant" $QuantExe @() "NORMAL_PRIORITY_CLASS"
-& $nssm set quant AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" "QUANT_ADDR=0.0.0.0:8080" | Out-Null
+# §部署修复 2026-09-17：端口必须是 127.0.0.1:8081——广州拓扑下 Caddy 占用 :8080
+# （Caddyfile /api/* → reverse_proxy 127.0.0.1:8081）。旧值 0.0.0.0:8080 与 Caddy
+# 撞端口，配合 §W4-b fail-fast 会让 quant 服务起不来（5s 重启循环，部署实录）。
+& $nssm set quant AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" "QUANT_ADDR=127.0.0.1:8081" | Out-Null
 if ($LLMApiKey) {
-    & $nssm set quant AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" "QUANT_ADDR=0.0.0.0:8080" "LLM_API_KEY=$LLMApiKey" "LLM_API_URL=$LLMApiURL" "LLM_MODEL=$LLMModel" | Out-Null
+    & $nssm set quant AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" "QUANT_ADDR=127.0.0.1:8081" "LLM_API_KEY=$LLMApiKey" "LLM_API_URL=$LLMApiURL" "LLM_MODEL=$LLMModel" | Out-Null
 }
 & $nssm restart quant
 Start-Sleep -Seconds 2

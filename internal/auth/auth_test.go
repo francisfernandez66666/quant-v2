@@ -274,6 +274,10 @@ func TestSetRoleChangePasswordEnabled(t *testing.T) {
 	}
 
 	// 禁用：登录/令牌失效，管理员不可禁用
+	// §MT：先补一名平台 admin（t_default），否则"最后一名平台 admin 禁止降级"护栏会拦截本步
+	if _, err := m.CreateUser("root1", "pw", RoleAdmin, nil, 0); err != nil {
+		t.Fatalf("create second platform admin: %v", err)
+	}
 	if err := m.SetRole(u.ID, RoleUser); err != nil {
 		t.Fatalf("SetRole(user): %v", err)
 	}

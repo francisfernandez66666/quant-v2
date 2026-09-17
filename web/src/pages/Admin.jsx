@@ -152,7 +152,14 @@ export default function Admin() {
   const [creating, setCreating] = useState(false)
   const [createMsg, setCreateMsg] = useState('')
   const [createMsgType, setCreateMsgType] = useState('ok')
-  const [newUser, setNewUser] = useState({ username: '', password: '', role: 'user', perms: [], expiresDays: 0, permanent: true })
+  const [newUser, setNewUser] = useState({ username: '', password: '', role: 'user', perms: [], expiresDays: 0, permanent: true, tenantId: '' })
+  // §MT 多租户状态：tenant_names=ID→名称映射；platform=当前账号是否平台运营者；
+  // tenants=租户清单（含配额/用量）；tenantForm=新建租户表单。
+  const [tenantNames, setTenantNames] = useState({})
+  const [platform, setPlatform] = useState(false)
+  const [tenants, setTenants] = useState([])
+  const [tenantForm, setTenantForm] = useState({ name: '', maxUsers: 20, apiRate: 600, adminUser: '', adminPass: '' })
+  const [tenantSaving, setTenantSaving] = useState(false)
 
   const [activeUser, setActiveUser] = useState(null)
   const [activeStrategy, setActiveStrategy] = useState({})
@@ -194,9 +201,62 @@ export default function Admin() {
       const res = await api.fetchAdminUsers()
       setUsers(res.users || [])
       setAllPerms(res.perms || [])
+      setTenantNames(res.tenant_names || {})
+      setPlatform(!!res.platform)
+      if (res.platform) loadTenants()
     } catch (e) {
       showToast('加载用户失败: ' + (e.message || e), 'error')
     }
+  }
+
+  // §MT 租户清单加载（平台运营者专用）
+  async function loadTenants() {
+    try {
+      const res = await api.fetchTenants()
+      setTenants(res.tenants || [])
+    } catch (e) {
+      showToast('加载租户失败: ' + (e.message || e), 'error')
+    }
+  }
+
+  // §MT 创建租户（可选随建租户管理员）
+  async function createTenant() {
+    if (!tenantForm.name.trim()) { showToast('租户名称必填', 'error'); return }
+    setTenantSaving(true)
+    try {
+      const body = {
+        name: tenantForm.name.trim(),
+        quota: { max_users: Number(tenantForm.maxUsers) || 0, api_rate_per_min: Number(tenantForm.apiRate) || 0 },
+      }
+      if (tenantForm.adminUser) body.admin = { username: tenantForm.adminUser, password: tenantForm.adminPass }
+      await api.createTenant(body)
+      showToast('租户已创建')
+      setTenantForm({ name: '', maxUsers: 20, apiRate: 600, adminUser: '', adminPass: '' })
+      loadTenants(); loadUsers()
+    } catch (e) {
+      showToast('创建租户失败: ' + (e.message || e), 'error')
+    } finally { setTenantSaving(false) }
+  }
+
+  // §MT 启停租户 / 调整配额
+  async function toggleTenantEnabled(t) {
+    if (!(await confirmDialog(`${t.enabled ? '停用' : '启用'}租户「${t.name}」？停用后该租户禁止新增成员。`, '租户操作'))) return
+    try {
+      await api.updateTenant(t.id, { enabled: !t.enabled })
+      showToast('已更新'); loadTenants()
+    } catch (e) { showToast('操作失败: ' + (e.message || e), 'error') }
+  }
+
+  // §MT 调整租户配额：弹窗依次询问成员上限与每分钟 API 限流（0=恢复系统默认值）
+  async function editTenantQuota(t) {
+    const mv = prompt(`「${t.name}」成员上限（当前 ${t.max_users}）`, String(t.max_users))
+    if (mv === null) return
+    const ar = prompt(`每分钟 API 限流（当前 ${t.api_rate_per_min}，0=默认600）`, String(t.api_rate_per_min))
+    if (ar === null) return
+    try {
+      await api.updateTenant(t.id, { quota: { max_users: Number(mv) || 0, api_rate_per_min: Number(ar) || 0 } })
+      showToast('配额已更新'); loadTenants()
+    } catch (e) { showToast('更新失败: ' + (e.message || e), 'error') }
   }
 
   // §U-5（2026-09-14 像素级 UAT）脏账号清理：先 dry_run 预览命中清单，确认后再真删。
@@ -246,9 +306,11 @@ export default function Admin() {
       perms: newUser.perms,
       // 有效期天数：勾选"永久"时传 0 表示永不过期
       expires_days: newUser.permanent ? 0 : (newUser.expiresDays || 0),
+      // §MT 平台运营者可指定目标租户；租户 admin 不传（后端强制本租户）
+      tenant_id: platform && newUser.tenantId ? newUser.tenantId : undefined,
     }).then(() => {
       setCreateMsg('账号已创建'); setCreateMsgType('ok')
-      setNewUser({ username: '', password: '', role: 'user', perms: [], expiresDays: 0, permanent: true })
+      setNewUser({ username: '', password: '', role: 'user', perms: [], expiresDays: 0, permanent: true, tenantId: '' })
       loadUsers()
     }).catch((e) => {
       setCreateMsg('创建失败: ' + (e.message || e)); setCreateMsgType('err')
@@ -381,6 +443,10 @@ export default function Admin() {
             <Tag theme={row.role === 'admin' ? 'success' : 'primary'} variant="light">
               {row.role === 'admin' ? '管理员' : '用户'}
             </Tag>
+            {/* §MT 租户标签（平台视角下区分归属；租户 admin 全员同租户也统一展示） */}
+            {tenantNames[row.tenant_id || 't_default'] && (
+              <Tag variant="light" title="所属租户">{tenantNames[row.tenant_id || 't_default']}</Tag>
+            )}
             {!row.enabled && <Tag theme="danger" variant="light">已禁用</Tag>}
           </div>
           <div style={{ fontSize: 12, color: 'var(--app-muted)', marginTop: 4 }}>
@@ -545,6 +611,18 @@ export default function Admin() {
             </Select>
           </Form.FormItem>
           {
+            /* §MT 平台运营者可选目标租户；租户 admin 建号恒落本租户，不显示此项 */
+            platform && (
+            <Form.FormItem label="租户">
+              <Select value={newUser.tenantId} onChange={(v) => setNewUser({ ...newUser, tenantId: v })} style={{ width: 200 }}>
+                {tenants.map((t) => (
+                  <Select.Option key={t.id} value={t.id}>{t.name}（{t.used_users}/{t.max_users}）</Select.Option>
+                ))}
+              </Select>
+            </Form.FormItem>
+            )
+          }
+          {
             /* 权限勾选：把可用的权限位分配给新账号 */
           }
           <Form.FormItem label="权限">
@@ -606,6 +684,60 @@ export default function Admin() {
             onChange: (pi) => setUserPage((p) => ({ ...p, current: pi.current ?? p.current, pageSize: pi.pageSize ?? p.pageSize })) }}
         />
       </Card>
+
+      {/* ── §MT 租户管理（仅平台运营者可见：t_default 之外的租户签发/配额/启停）── */}
+      {platform && (
+      <Card title="租户管理" style={{ marginBottom: 12 }}
+        actions={<Button size="small" variant="outline" onClick={loadTenants}>刷新</Button>}>
+        <Table
+          rowKey="id"
+          data={tenants}
+          columns={[
+            { colKey: 'name', title: '租户', width: 180, cell: ({ row }) => (
+              <div>
+                <span style={{ fontWeight: 600 }}>{row.name}</span>
+                {row.is_default && <Tag variant="light" style={{ marginLeft: 6 }}>系统</Tag>}
+                <div style={{ fontSize: 12, color: 'var(--app-muted)' }}>{row.id}</div>
+              </div>
+            ) },
+            { colKey: 'usage', title: '成员', width: 110, cell: ({ row }) => `${row.used_users}/${row.max_users}` },
+            { colKey: 'rate', title: 'API限流/分', width: 110, cell: ({ row }) => row.api_rate_per_min },
+            { colKey: 'state', title: '状态', width: 90, cell: ({ row }) => (
+              <Tag theme={row.enabled ? 'success' : 'danger'} variant="light">{row.enabled ? '启用' : '停用'}</Tag>
+            ) },
+            { colKey: 'ops', title: '操作', width: 220, cell: ({ row }) => (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <Button size="small" theme="default" onClick={() => editTenantQuota(row)}>改配额</Button>
+                <Button size="small" theme="default" disabled={row.is_default} onClick={() => toggleTenantEnabled(row)}>
+                  {row.enabled ? '停用' : '启用'}
+                </Button>
+              </div>
+            ) },
+          ]}
+          bordered={false}
+          size="medium"
+          pagination={false}
+        />
+        <Form layout="inline" style={{ marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'flex-end' }}>
+          <Form.FormItem label="新租户名">
+            <Input value={tenantForm.name} onChange={(v) => setTenantForm({ ...tenantForm, name: v })} placeholder="如：某某私募" style={{ width: 160 }} />
+          </Form.FormItem>
+          <Form.FormItem label="成员上限">
+            <InputNumber value={tenantForm.maxUsers} min={1} onChange={(v) => setTenantForm({ ...tenantForm, maxUsers: v })} style={{ width: 110 }} />
+          </Form.FormItem>
+          <Form.FormItem label="API/分钟">
+            <InputNumber value={tenantForm.apiRate} min={0} onChange={(v) => setTenantForm({ ...tenantForm, apiRate: v })} style={{ width: 110 }} />
+          </Form.FormItem>
+          <Form.FormItem label="租户管理员(可选)">
+            <Input value={tenantForm.adminUser} onChange={(v) => setTenantForm({ ...tenantForm, adminUser: v })} placeholder="用户名" style={{ width: 130 }} />
+          </Form.FormItem>
+          <Form.FormItem label="初始密码">
+            <Input type="password" value={tenantForm.adminPass} onChange={(v) => setTenantForm({ ...tenantForm, adminPass: v })} placeholder="≥8位" style={{ width: 130 }} />
+          </Form.FormItem>
+          <Button theme="primary" loading={tenantSaving} onClick={createTenant}>创建租户</Button>
+        </Form>
+      </Card>
+      )}
 
       {/* ── §DAILY_OPSLOG 系统运行日志（每日核心记录，管理员可查）── */}
       <Card

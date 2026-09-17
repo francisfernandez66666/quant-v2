@@ -369,31 +369,33 @@ func TestHTTPConsultProModeAPI(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("GET pro-mode status=%d", code)
 	}
-	if !strings.Contains(body, `"enabled":false`) {
-		t.Errorf("默认专业模式应为关, body=%s", body)
+	// §生产 20260916 语义翻转：专业模式默认【开】（咨询必须带数据是默认能力），
+	// 显式 PUT {"enabled":false} 才关。断言随产品语义同步（本测试 2026-09-17 更新）。
+	if !strings.Contains(body, `"enabled":true`) {
+		t.Errorf("默认专业模式应为开, body=%s", body)
 	}
 
-	// 开启
-	code, body = apiReq(t, hr, hr.token, http.MethodPut, "/api/consult/pro-mode", []byte(`{"enabled":true}`))
-	if code != 200 || !strings.Contains(body, `"enabled":true`) {
-		t.Errorf("PUT pro-mode 开启失败 status=%d body=%s", code, body)
+	// 关闭
+	code, body = apiReq(t, hr, hr.token, http.MethodPut, "/api/consult/pro-mode", []byte(`{"enabled":false}`))
+	if code != 200 || !strings.Contains(body, `"enabled":false`) {
+		t.Errorf("PUT pro-mode 关闭失败 status=%d body=%s", code, body)
 	}
 
-	// 读回为开
+	// 读回为关
 	code, body = apiGet(t, hr, hr.token, "/api/consult/pro-mode")
-	if code != 200 || !strings.Contains(body, `"enabled":true`) {
-		t.Errorf("开启后读回应为true, status=%d body=%s", code, body)
+	if code != 200 || !strings.Contains(body, `"enabled":false`) {
+		t.Errorf("关闭后读回应为false, status=%d body=%s", code, body)
 	}
 
-	// 另一用户（tester2）读回仍为关（按用户隔离，开关落盘 auth.json）
+	// 另一用户（tester2）读回仍为默认开（按用户隔离，开关落盘 auth.json）
 	inv2, _ := hr.rig.auth.CreateInvite()
 	if _, err := hr.rig.auth.Register("tester2", "tester123", inv2); err != nil {
 		t.Fatalf("register tester2: %v", err)
 	}
 	token2 := hr.rig.auth.UserToken("tester2")
 	code, body = apiGet(t, hr, token2, "/api/consult/pro-mode")
-	if code != 200 || !strings.Contains(body, `"enabled":false`) {
-		t.Errorf("tester2 专业模式应默认关(按用户隔离), status=%d body=%s", code, body)
+	if code != 200 || !strings.Contains(body, `"enabled":true`) {
+		t.Errorf("tester2 专业模式应默认开(按用户隔离), status=%d body=%s", code, body)
 	}
 }
 

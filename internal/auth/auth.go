@@ -56,7 +56,68 @@ type User struct {
 	CreatedAt int64 `json:"created_at"`
 	// 账号有效期截止 Unix 时间戳（0=永久）
 	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// §MT 租户归属（空=t_default 系统租户，兼容全部存量账号）。
+	// 租户边界=账号管理/配额/用户级配置的隔离域；运营数据归属仍按 AdminID（平台运营者）。
+	// English: §MT tenant membership (empty ⇒ t_default, fully backward compatible).
+	TenantID string `json:"tenant_id,omitempty"`
 }
+
+// ── §MT 多租户（Multi-Tenancy, 2026-09-17）──
+// 模型：Tenant = 账号管理 + 配额的最小隔离单元。角色体系不变（admin/user），
+// 规则为「admin 默认只能管理本租户成员；唯一例外是 t_default（系统租户）里的 admin，
+// 即平台运营者，可跨租户管理并签发租户」。存量单租户部署升级后全员落入 t_default，
+// 原有 admin 天然就是平台运营者，行为与升级前完全一致。
+// English: a Tenant is the smallest isolation unit for account management & quota. Roles stay
+// admin/user; an admin manages only its own tenant, except admins of t_default (the platform
+// operator) who span tenants. Legacy installs migrate everyone into t_default unchanged.
+
+// DefaultTenantID 系统租户 ID：存量/未分租户账号的归属，其中的 admin 为平台运营者。
+const DefaultTenantID = "t_default"
+
+// defaultMaxUsers 租户成员数默认配额上限（MaxUsers<=0 时生效）。
+const defaultMaxUsers = 20
+
+// defaultAPIRatePerMin 租户业务 API 每分钟默认限流（APIRatePerMin<=0 时生效）。
+const defaultAPIRatePerMin = 600
+
+// TenantQuota 租户配额。零值字段按系统默认值执行。
+type TenantQuota struct {
+	// MaxUsers 成员账号数上限（不含 temp_ 临时号；0=默认 20）
+	MaxUsers int `json:"max_users"`
+	// APIRatePerMin 该租户成员业务 API 调用合计每分钟上限（0=默认 600）
+	APIRatePerMin int `json:"api_rate_per_min"`
+}
+
+// MaxUsersOr 返回生效的成员上限。
+func (q TenantQuota) MaxUsersOr() int {
+	if q.MaxUsers <= 0 {
+		return defaultMaxUsers
+	}
+	return q.MaxUsers
+}
+
+// APIRateOr 返回生效的每分钟限流。
+func (q TenantQuota) APIRateOr() int {
+	if q.APIRatePerMin <= 0 {
+		return defaultAPIRatePerMin
+	}
+	return q.APIRatePerMin
+}
+
+// Tenant 租户记录（落盘 auth.json）。
+type Tenant struct {
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	Enabled   bool        `json:"enabled"`
+	CreatedAt int64       `json:"created_at"`
+	Quota     TenantQuota `json:"quota"`
+}
+
+// ErrTenantQuota 租户配额耗尽哨兵错误（成员数超限）。HTTP 层映射 409。
+var ErrTenantQuota = errors.New("租户成员数已达配额上限")
+
+// ErrTenantDisabled 租户被停用（禁止新增成员）。
+var ErrTenantDisabled = errors.New("租户已停用")
 
 // Session 单个登录会话：一个设备/客户端对应一条，落盘仅存令牌哈希。
 // （Session is a single login session, one per device/client; only the token hash is persisted.）
@@ -159,6 +220,8 @@ type DB struct {
 	// Enabled=false 改回 true——管理员禁用的账号重启即复活，封禁形同虚设。
 	// 数据 schema 版本
 	SchemaVersion int `json:"schema_version,omitempty"`
+	// §MT 租户表（key=租户 ID）。t_default 恒存在（ensureTenantsLocked 兜底创建）。
+	Tenants map[string]*Tenant `json:"tenants,omitempty"`
 }
 
 // Manager 用户与登录认证管理器。
@@ -220,9 +283,12 @@ func (m *Manager) Init() error {
 		return fmt.Errorf("read auth db: %w", err)
 	} else {
 		// 首次运行：创建空库并落盘（§A1 新库即标记当前版本，永不进兼容迁移分支）
-		m.db = &DB{SchemaVersion: 1}
+		m.db = &DB{SchemaVersion: schemaVersion}
+		m.ensureTenantsLocked()
 		return m.save()
 	}
+
+	// （§MT 租户兜底放在 §A1 老迁移之后执行，见下）
 
 	// 兼容迁移：老库没有 Role/Enabled/Perms 字段，需补齐默认值并提升 admin。
 	// §A1 修复：迁移只在 SchemaVersion<1 时执行一次——此前每次启动都强制 Enabled=true，
@@ -281,12 +347,258 @@ func (m *Manager) Init() error {
 		m.db.SchemaVersion = 1
 		migrated = true
 	} // §A1 end SchemaVersion<1
+
+	// §MT 租户兜底（幂等，每次加载都跑）：t_default 缺失则补建；空 TenantID 的
+	// 存量账号迁入 t_default。必须在 §A1 老迁移之后执行，避免抢先升版本吞掉老迁移。
+	// English: §MT tenant invariant runs after the §A1 legacy migration so it can never
+	// preempt (and skip) the role/enabled promotion pass.
+	if m.ensureTenantsLocked() || m.db.SchemaVersion < schemaVersion {
+		m.db.SchemaVersion = schemaVersion
+		migrated = true
+	}
 	if migrated {
 		if err := m.save(); err != nil {
 			return fmt.Errorf("migrate auth db: %w", err)
 		}
 	}
 	return nil
+}
+
+// schemaVersion 当前库结构版本（§MT 起为 2）。
+const schemaVersion = 2
+
+// ensureTenantsLocked 幂等保证租户不变式（须持写锁）：
+//  1. t_default 恒存在且启用（平台运营者所在租户，不可删除）；
+//  2. 空 TenantID 的存量账号全部迁入 t_default（§MT 升级路径）。
+//
+// 返回是否发生了修改（调用方据此决定是否落盘）。
+// English: idempotent tenant invariant — the default tenant always exists; legacy users with an
+// empty tenant are folded into it. Reports whether anything changed so the caller can persist.
+func (m *Manager) ensureTenantsLocked() bool {
+	changed := false
+	if m.db.Tenants == nil {
+		m.db.Tenants = make(map[string]*Tenant)
+	}
+	if _, ok := m.db.Tenants[DefaultTenantID]; !ok {
+		m.db.Tenants[DefaultTenantID] = &Tenant{
+			ID: DefaultTenantID, Name: "系统租户", Enabled: true, CreatedAt: time.Now().Unix(),
+		}
+		changed = true
+	}
+	for i := range m.db.Users {
+		if m.db.Users[i].TenantID == "" {
+			m.db.Users[i].TenantID = DefaultTenantID
+			changed = true
+		}
+	}
+	return changed
+}
+
+// CreateTenant 新建租户（仅平台运营者路径调用）。名称去空白、租户 ID 自动生成 t_ 前缀纳秒串。
+// English: creates a tenant (platform-operator path).
+func (m *Manager) CreateTenant(name string, q TenantQuota) (*Tenant, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("租户名称必填")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureTenantsLocked()
+	for _, t := range m.db.Tenants {
+		if t.Name == name {
+			return nil, fmt.Errorf("租户名称已存在")
+		}
+	}
+	t := &Tenant{
+		ID: fmt.Sprintf("t_%d", time.Now().UnixNano()), Name: name,
+		Enabled: true, CreatedAt: time.Now().Unix(), Quota: q,
+	}
+	m.db.Tenants[t.ID] = t
+	if err := m.save(); err != nil {
+		return nil, err
+	}
+	cp := *t
+	return &cp, nil
+}
+
+// UpdateTenant 局部更新租户（名称/启停/配额；nil=保持原值）。t_default 禁止停用。
+// English: partially updates a tenant; the default tenant can never be disabled.
+func (m *Manager) UpdateTenant(id string, name *string, enabled *bool, q *TenantQuota) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.db.Tenants[id]
+	if !ok {
+		return fmt.Errorf("租户不存在")
+	}
+	if id == DefaultTenantID && enabled != nil && !*enabled {
+		return fmt.Errorf("系统租户不可停用")
+	}
+	if name != nil {
+		n := strings.TrimSpace(*name)
+		if n == "" {
+			return fmt.Errorf("租户名称必填")
+		}
+		for _, o := range m.db.Tenants {
+			if o.ID != id && o.Name == n {
+				return fmt.Errorf("租户名称已存在")
+			}
+		}
+		t.Name = n
+	}
+	if enabled != nil {
+		t.Enabled = *enabled
+	}
+	if q != nil {
+		t.Quota = *q
+	}
+	return m.save()
+}
+
+// SchemaVersion 返回当前库结构版本（测试/诊断用）。
+func (m *Manager) SchemaVersion() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.db.SchemaVersion
+}
+
+// TenantByID 返回租户副本（不存在返回 nil）。
+func (m *Manager) TenantByID(id string) *Tenant {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	t, ok := m.db.Tenants[id]
+	if !ok {
+		return nil
+	}
+	cp := *t
+	return &cp
+}
+
+// ListTenants 返回全部租户（按创建时间升序，t_default 恒最先）。
+func (m *Manager) ListTenants() []Tenant {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Tenant, 0, len(m.db.Tenants))
+	for _, t := range m.db.Tenants {
+		out = append(out, *t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if (out[i].ID == DefaultTenantID) != (out[j].ID == DefaultTenantID) {
+			return out[i].ID == DefaultTenantID
+		}
+		return out[i].CreatedAt < out[j].CreatedAt
+	})
+	return out
+}
+
+// TenantOf 返回用户所属租户 ID（空/未知一律归 t_default，与 ensureTenantsLocked 口径一致）。
+func (m *Manager) TenantOf(userID string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for i := range m.db.Users {
+		if m.db.Users[i].ID == userID {
+			if m.db.Users[i].TenantID == "" {
+				return DefaultTenantID
+			}
+			return m.db.Users[i].TenantID
+		}
+	}
+	return ""
+}
+
+// TenantName 返回租户名称（未知返回原 ID）。
+func (m *Manager) TenantName(tid string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if t, ok := m.db.Tenants[tid]; ok {
+		return t.Name
+	}
+	return tid
+}
+
+// UsersInTenant 返回指定租户的全部成员（公开视图）。
+func (m *Manager) UsersInTenant(tid string) []User {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]User, 0)
+	for _, u := range m.db.Users {
+		ut := u.TenantID
+		if ut == "" {
+			ut = DefaultTenantID
+		}
+		if ut == tid {
+			out = append(out, u.PublicUser())
+		}
+	}
+	return out
+}
+
+// countMembersLocked 统计租户内正式成员数（不含 tmp_ 临时号；须持锁）。
+func (m *Manager) countMembersLocked(tid string) int {
+	n := 0
+	for i := range m.db.Users {
+		u := &m.db.Users[i]
+		if strings.HasPrefix(u.ID, "tmp_") {
+			continue
+		}
+		ut := u.TenantID
+		if ut == "" {
+			ut = DefaultTenantID
+		}
+		if ut == tid {
+			n++
+		}
+	}
+	return n
+}
+
+// TenantMemberCount 返回租户正式成员数。
+func (m *Manager) TenantMemberCount(tid string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.countMembersLocked(tid)
+}
+
+// checkTenantAdmissionLocked 新增成员前置校验（须持锁）：租户存在、启用且未满配额。
+func (m *Manager) checkTenantAdmissionLocked(tid string) error {
+	t, ok := m.db.Tenants[tid]
+	if !ok {
+		return fmt.Errorf("租户不存在: %s", tid)
+	}
+	if !t.Enabled {
+		return ErrTenantDisabled
+	}
+	if m.countMembersLocked(tid) >= t.Quota.MaxUsersOr() {
+		return fmt.Errorf("%w（上限 %d）", ErrTenantQuota, t.Quota.MaxUsersOr())
+	}
+	return nil
+}
+
+// TenantAPIRate 返回租户生效的每分钟 API 限流（未知租户按默认值）。
+func (m *Manager) TenantAPIRate(tid string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if t, ok := m.db.Tenants[tid]; ok {
+		return t.Quota.APIRateOr()
+	}
+	return defaultAPIRatePerMin
+}
+
+// IsPlatformAdmin 判断用户是否平台运营者：admin 且归属 t_default，可跨租户管理与签发租户。
+// English: platform operator = an admin of the default tenant; spans tenants and can mint them.
+func (m *Manager) IsPlatformAdmin(userID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for i := range m.db.Users {
+		if m.db.Users[i].ID == userID {
+			u := &m.db.Users[i]
+			tid := u.TenantID
+			if tid == "" {
+				tid = DefaultTenantID
+			}
+			return u.Role == RoleAdmin && tid == DefaultTenantID
+		}
+	}
+	return false
 }
 
 // save 将内存数据库序列化为 JSON 并写入 auth.json。
@@ -369,13 +681,27 @@ type Invite struct {
 	UsedBy string `json:"used_by,omitempty"`
 	// 使用时间
 	UsedAt int64 `json:"used_at,omitempty"`
+	// §MT 签发时指定的归属租户（空=t_default）；注册者落入该租户并受其配额约束。
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
-// CreateInvite 签发一个新邀请码（仅 admin 路径调用）。
-// English: issues a fresh single-use invite code.
+// CreateInvite 签发一个 t_default 租户的邀请码（兼容既有调用方）。
 func (m *Manager) CreateInvite() (string, error) {
+	return m.CreateInviteFor(DefaultTenantID)
+}
+
+// CreateInviteFor §MT 为指定租户签发邀请码：先过租户准入（存在/启用/配额）。
+// English: issues a single-use invite code bound to a tenant, admission-checked up front.
+func (m *Manager) CreateInviteFor(tenantID string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.ensureTenantsLocked()
+	if tenantID == "" {
+		tenantID = DefaultTenantID
+	}
+	if err := m.checkTenantAdmissionLocked(tenantID); err != nil {
+		return "", err
+	}
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -384,7 +710,7 @@ func (m *Manager) CreateInvite() (string, error) {
 	if m.db.Invites == nil {
 		m.db.Invites = make(map[string]*Invite)
 	}
-	m.db.Invites[code] = &Invite{Code: code, CreatedAt: time.Now().Unix()}
+	m.db.Invites[code] = &Invite{Code: code, CreatedAt: time.Now().Unix(), TenantID: tenantID}
 	if err := m.save(); err != nil {
 		return "", err
 	}
@@ -437,6 +763,16 @@ func (m *Manager) Register(username, password, inviteCode string) (*User, error)
 		return nil, err
 	}
 
+	// §MT 注册者落入邀请码绑定的租户；签发到使用之间租户可能停用/满额，此处二次准入。
+	tenantID := DefaultTenantID
+	if inv, ok := m.db.Invites[inviteCode]; ok && inv.TenantID != "" {
+		tenantID = inv.TenantID
+	}
+	m.ensureTenantsLocked()
+	if err := m.checkTenantAdmissionLocked(tenantID); err != nil {
+		return nil, err
+	}
+
 	// 用户名唯一性校验
 	for _, u := range m.db.Users {
 		if u.Username == username {
@@ -457,6 +793,7 @@ func (m *Manager) Register(username, password, inviteCode string) (*User, error)
 		Role:         RoleUser, // 注册用户默认为普通用户
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
+		TenantID:     tenantID, // §MT 跟随邀请码租户
 	}
 	token, err := issueSession(&user, tokenTTL) // 首个会话（§A3 默认 30 天）
 	if err != nil {
@@ -486,11 +823,17 @@ func (m *Manager) CreateTemp(duration time.Duration, inviteCode string) (*User, 
 		return nil, err
 	}
 
+	// §MT 临时号跟随邀请码租户（不计入正式成员配额，但归属明确便于审计与隔离）。
+	tempTenant := DefaultTenantID
+	if inv, ok := m.db.Invites[inviteCode]; ok && inv.TenantID != "" {
+		tempTenant = inv.TenantID
+	}
 	user := User{
 		ID:        fmt.Sprintf("tmp_%d", time.Now().UnixNano()),
 		Role:      RoleUser,
 		Enabled:   true,
 		CreatedAt: time.Now().Unix(),
+		TenantID:  tempTenant,
 	}
 	token, err := issueSession(&user, duration) // 临时账户：会话有效期=账户有效期
 	if err != nil {
@@ -567,6 +910,7 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 			return nil, fmt.Errorf("already initialized")
 		}
 	}
+	m.ensureTenantsLocked() // §MT 保证 t_default 存在（首个 admin 归属其中=平台运营者）
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
@@ -578,6 +922,7 @@ func (m *Manager) SetupInitialAdmin(username, password string) (*User, error) {
 		Role:         RoleAdmin,
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
+		TenantID:     DefaultTenantID,
 	}
 	token, err := issueSession(&user, tokenTTL) // 首个会话
 	if err != nil {
@@ -819,14 +1164,66 @@ func (m *Manager) updateUser(userID string, mutate func(u *User) error) error {
 }
 
 // SetRole 设置用户角色（admin / user）。
+// §MT 保护：t_default（系统租户）的最后一名 admin 是唯一的平台运营者，禁止降级——
+// 降级成功=整个平台再无人能签发/跨租户管理，等于自锁。
 func (m *Manager) SetRole(userID, role string) error {
 	if role != RoleAdmin && role != RoleUser {
 		return fmt.Errorf("invalid role")
 	}
 	return m.updateUser(userID, func(u *User) error {
+		if role != RoleAdmin && u.Role == RoleAdmin && u.effectiveTenant() == DefaultTenantID {
+			n := 0
+			for i := range m.db.Users {
+				o := &m.db.Users[i]
+				if o.Role == RoleAdmin && o.effectiveTenant() == DefaultTenantID {
+					n++
+				}
+			}
+			if n <= 1 {
+				return fmt.Errorf("cannot demote the last platform admin")
+			}
+		}
 		u.Role = role
 		return nil
 	})
+}
+
+// effectiveTenant 用户生效租户（空=t_default，与 ensureTenantsLocked 口径一致；调用方须持锁）。
+func (u *User) effectiveTenant() string {
+	if u.TenantID == "" {
+		return DefaultTenantID
+	}
+	return u.TenantID
+}
+
+// MoveUser §MT 平台运营者把用户迁移到另一租户（目标租户过准入；不可移出/迁入自己？无此限制）。
+// English: platform operator moves a user across tenants with admission check on the target.
+func (m *Manager) MoveUser(userID, tenantID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureTenantsLocked()
+	if tenantID == "" {
+		tenantID = DefaultTenantID
+	}
+	var cur *User
+	for i := range m.db.Users {
+		if m.db.Users[i].ID == userID {
+			cur = &m.db.Users[i]
+			break
+		}
+	}
+	if cur == nil {
+		return fmt.Errorf("user not found")
+	}
+	if cur.effectiveTenant() == tenantID {
+		return nil // 幂等
+	}
+	// 准入时先视当前用户已离开原租户：直接查目标租户配额即可（当前用户不在目标内）
+	if err := m.checkTenantAdmissionLocked(tenantID); err != nil {
+		return err
+	}
+	cur.TenantID = tenantID
+	return m.save()
 }
 
 // GrantPerm 给用户追加一个权限位。
@@ -956,7 +1353,15 @@ func (u *User) expired() bool {
 // expiresDays>0 时账号在该天数后到期；0 表示永久有效。
 // （CreateUser lets an admin create a real user with username/password/role/perms;
 // a positive expiresDays makes the account lapse after that many days, 0 = permanent.）
+// CreateUser 平台口径创建用户（归属 t_default，兼容既有调用方）。
 func (m *Manager) CreateUser(username, password, role string, perms []string, expiresDays int) (*User, error) {
+	return m.CreateUserInTenant(DefaultTenantID, username, password, role, perms, expiresDays)
+}
+
+// CreateUserInTenant §MT 管理员开户：在指定租户内创建成员，先过租户准入
+// （存在/启用/成员配额，ErrTenantQuota/ErrTenantDisabled 哨兵可 errors.Is 判别）。
+// English: §MT admin-side account creation inside a tenant, subject to tenant admission.
+func (m *Manager) CreateUserInTenant(tenantID, username, password, role string, perms []string, expiresDays int) (*User, error) {
 	if role == "" {
 		role = RoleUser
 	}
@@ -968,6 +1373,13 @@ func (m *Manager) CreateUser(username, password, role string, perms []string, ex
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.ensureTenantsLocked()
+	if tenantID == "" {
+		tenantID = DefaultTenantID
+	}
+	if err := m.checkTenantAdmissionLocked(tenantID); err != nil {
+		return nil, err
+	}
 	for _, u := range m.db.Users {
 		if u.Username == username {
 			return nil, fmt.Errorf("username already exists")
@@ -985,6 +1397,7 @@ func (m *Manager) CreateUser(username, password, role string, perms []string, ex
 		Perms:        perms,
 		Enabled:      true,
 		CreatedAt:    time.Now().Unix(),
+		TenantID:     tenantID,
 	}
 	if expiresDays > 0 {
 		user.ExpiresAt = time.Now().AddDate(0, 0, expiresDays).Unix()

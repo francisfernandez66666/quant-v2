@@ -78,15 +78,20 @@ func TestConsultProModeNameOnlyResolution(t *testing.T) {
 	}
 }
 
-// TestConsultNormalModeNoContext 普通模式不注入 600580 实时行情 context。
+// TestConsultNormalModeNoContext §生产 20260916 语义翻转后同步：实时行情 context 改为
+// **无条件注入**（数据是咨询的默认构成），普通/专业模式都带数据块；两模式的差异只剩
+// 专业模式追加的定量化深度分析指令。本用例锁定：普通模式带数据块、但不带专业模式指令。
 func TestConsultNormalModeNoContext(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
 	rig := newTestEngine(t, loadTodayFixture(t))
 	ctx := todayConsult(t, rig, "卧龙电驱(600580) 今天主力净流入多少？", false)
-	if strings.Contains(ctx, "卧龙电驱 600580") || strings.Contains(ctx, "-22200.00万元") || strings.Contains(ctx, "现价 36.86") {
-		t.Errorf("普通模式不应注入实时行情 context\n---context---\n%s", ctx)
+	if !strings.Contains(ctx, "卧龙电驱") || !strings.Contains(ctx, "600580") || !strings.Contains(ctx, "-22200.00万元") {
+		t.Errorf("普通模式也应注入实时行情 context（2026-09-16 起无条件注入）\n---context---\n%s", ctx)
+	}
+	if strings.Contains(ctx, "专业模式：") {
+		t.Errorf("普通模式不应包含专业模式深度分析指令\n---context---\n%s", ctx)
 	}
 }
 
@@ -236,7 +241,8 @@ func TestConsultTimeInjected(t *testing.T) {
 	rig := newTestEngine(t, loadTodayFixture(t))
 	ctx := todayConsult(t, rig, "600580 今天怎么样？", true)
 	now := time.Now().Format("2006-01-02")
-	if !strings.Contains(ctx, "数据获取时间 "+now) {
+	// §生产 2026-09-16 头部文案改为「抓取时间」（强化"本次实时抓取"语义），断言同步。
+	if !strings.Contains(ctx, "抓取时间 "+now) {
 		t.Errorf("context 应含今日时间戳 %q\n---context---\n%s", now, ctx)
 	}
 }

@@ -27,6 +27,7 @@ const STATE_STYLE = {
   bear: { color: '#1e6091', label: '熊市' },
 }
 
+// 风险档位样式表：Red/Yellow 三档的配色与文案（§MARKET_RISK_GATE 市场风险门控前端呈现）
 const RISK_STYLE = {
   Red: { color: 'var(--app-up)', bg: 'var(--app-warn-bg)', label: '系统性风险日·做多收紧' },
   Yellow: { color: 'var(--td-warning-color)', bg: '#fff3e0', label: '警惕日·买入从严' },

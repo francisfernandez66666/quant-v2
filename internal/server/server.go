@@ -110,6 +110,9 @@ type Server struct {
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
 	runtimeURL string     // 运行时实际使用的 API 地址
 	limiter    ipLimiter  // §A4 匿名端点 IP 频控（register/temp/login/setup）
+	// tenantLimiter §MT 租户级业务 API 频控：key=租户 ID，窗口 1 分钟，
+	// 上限取租户配额 Quota.APIRatePerMin（0=默认 600/min）。
+	tenantLimiter ipLimiter
 	// §P1-5 初始化令牌：若环境变量 SETUP_TOKEN 非空，POST /setup 必须携带匹配令牌
 	// （body.setup_token 或 X-Setup-Token 头），否则拒绝。防止未授权者抢跑初始化。
 	// English: P1-5 setup token — when SETUP_TOKEN env is set, POST /setup requires the matching token.
@@ -453,6 +456,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/admin/users/{id}", s.adminMiddleware(s.handleDeleteUser))
 	// §U-5 脏账号批量清理（temp_/过期）。static 段 "cleanup" 优先于 {id}，二者路径段数不同不冲突。
 	s.mux.HandleFunc("POST /api/admin/users/cleanup", s.adminMiddleware(s.handleCleanupUsers))
+	// §MT 多租户：租户管理（平台运营者）+ 本租户用量 + 跨租户迁移
+	s.mux.HandleFunc("GET /api/tenants", s.adminMiddleware(s.handleListTenants))
+	s.mux.HandleFunc("POST /api/tenants", s.adminMiddleware(s.handleCreateTenant))
+	s.mux.HandleFunc("PUT /api/tenants/{id}", s.adminMiddleware(s.handleUpdateTenant))
+	s.mux.HandleFunc("GET /api/tenant/usage", s.adminMiddleware(s.handleTenantUsage))
+	s.mux.HandleFunc("PUT /api/admin/users/{id}/tenant", s.adminMiddleware(s.handleMoveUserTenant))
 	// 管理员代配他人账号配置（strategy / d1 / longshort / llm）
 	s.mux.HandleFunc("GET /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminGetStrategyConfig))
 	s.mux.HandleFunc("POST /api/admin/users/{id}/config/strategy", s.adminMiddleware(s.handleAdminSetStrategyConfig))
@@ -1206,6 +1215,13 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		if user == nil {
 			writeError(w, 401, "invalid or expired token")
 			return
+		}
+		// §MT 租户级频控：同一租户成员业务 API 合计超过配额 → 429（滑动窗口 1 分钟）。
+		if tid := s.auth.TenantOf(user.ID); tid != "" {
+			if !s.tenantLimiter.allow(tid, s.auth.TenantAPIRate(tid), time.Minute) {
+				writeError(w, http.StatusTooManyRequests, "tenant api rate limit exceeded")
+				return
+			}
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, user)))
 	}

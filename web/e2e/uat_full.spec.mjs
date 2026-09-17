@@ -593,6 +593,37 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
     await expect(page.locator('.t-message').first(), '对账请求有响应').toBeVisible({ timeout: 12000 })
   })
 
+  // ── §MT 多租户（2026-09-17）──
+  // 只读断言为主：租户无删除端点，e2e 若建租户会逐晚残留脏数据；写路径
+  // （建租户/配额/跨租户隔离/频控）由 Go 层 tenant_api_test.go 全量覆盖。
+  test('MT：/api/tenants 含系统租户 + Admin 页租户管理卡渲染', async ({ page }) => {
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const r = await page.request.get('/api/tenants', { headers: hdr })
+    expect(r.status(), '平台运营者取租户清单应 200').toBe(200)
+    const d = await r.json()
+    const t0 = (d.tenants || []).find((t) => t.id === 't_default')
+    expect(t0, '应存在系统租户 t_default').toBeTruthy()
+    expect(t0.is_default, 'is_default 标记').toBe(true)
+    expect(t0.max_users, '成员配额字段可见').toBeGreaterThan(0)
+    // Admin 页：平台运营者应渲染「租户管理」卡（租户 admin/普通用户无此卡）
+    await page.goto('/#/admin')
+    await expect(page.getByText('租户管理'), '租户管理卡').toBeVisible({ timeout: 10000 })
+    await page.screenshot({ path: `${SHOT}/branch-tenant-admin.png`, fullPage: true })
+  })
+
+  test('MT：普通用户访问租户管理面 403、列用户只见 platform=false', async ({ request }) => {
+    const login = await request.post('/api/auth/login', {
+      data: { username: process.env.E2E_USER2, password: process.env.E2E_PASS2 },
+    })
+    expect(login.status(), 'tester 登录').toBe(200)
+    const tk = (await login.json()).token
+    const h = { Authorization: tk }
+    const rt = await request.get('/api/tenants', { headers: h })
+    expect(rt.status(), '普通用户访问租户清单应 403（adminMiddleware）').toBe(403)
+    const ru = await request.get('/api/admin/users', { headers: h })
+    expect(ru.status(), '普通用户访问用户列表应 403').toBe(403)
+  })
+
   test('Admin：清理失效账号入口（dry_run 预览不动刀）', async ({ page }) => {
     await page.goto('/#/admin')
     const btn = page.getByRole('button', { name: /清理失效账号/ })
