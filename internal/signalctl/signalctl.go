@@ -209,6 +209,18 @@ func StrategyKeyOf(sig combat_agent.Signal) string {
 		return "dragon_return"
 	case "动量":
 		return "momentum"
+	// §WMQ-2（20260917）：做空四战法归一映射。旧实现对显示名原样返回（passthrough），
+	// 与白名单/前端开关的键空间脱节——做空信号若未来接入准入闸将 100% 被视为未知键。
+	// 规范键与 internal/strategies/{high_churn,break_down,leader_decay,good_news_fade} 的
+	// runner 规范 ID 一致。
+	case "高位滞涨":
+		return "high_churn"
+	case "放量破位":
+		return "break_down"
+	case "龙头断板":
+		return "leader_decay"
+	case "利好兑现砸盘":
+		return "good_news_fade"
 	}
 	return sig.Strategy
 }

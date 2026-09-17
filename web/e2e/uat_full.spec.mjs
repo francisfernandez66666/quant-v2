@@ -858,3 +858,52 @@ test.describe('修复回归 · GAP_VERIFY_20260917 D 批', () => {
     await p2.close()
   })
 })
+
+// ── 修复回归 · WL-FIX 自选股批（20260917）──
+// §WL-FIX：旧版整表合并的 wlRow 跨作用域引用被静默 catch 吞掉，线上表现为
+// 「看不到自选股、添加后刷新即丢」。本组用例锁定后端持久列表的前端整表渲染分支。
+test.describe('修复回归 · WL-FIX 20260917 自选股', () => {
+  // 流程：API 直写真实自选（持久到 watchlist_{uid}.json）→ 进入自选页断言整表出现该行
+  // → finally API 删除还原，不污染管理账号的线上自选（自清理=不落测试数据）。
+  test('WL-1 自选股：后端列表整表渲染 + 删除还原', async ({ page }) => {
+    const errs = watch(page)
+    await page.goto('/#/')
+    await page.waitForTimeout(500)
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    // 用确定性测试代码 WLTEST8888.SZ（行情缺失行走快照缺失补全/评估回退分支）
+    const code = 'WLTEST8888.SZ'
+    await page.request.post('/api/watchlist', { headers: hdr, data: { code } })
+    try {
+      await page.goto('/#/watchlist')
+      // §WL-FIX 回归点：整表合并不再被 ReferenceError 炸掉（修复前必渲染「暂无自选股」）
+      await expect(page.getByText(code).first(), '后端自选列表应在表格中可见').toBeVisible({ timeout: 15000 })
+      const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+      expect(fatal, '无未捕获JS异常: ' + fatal.join('|')).toHaveLength(0)
+      await page.screenshot({ path: `${SHOT}/branch-wl-fix.png`, fullPage: true })
+    } finally {
+      // 还原：删除测试自选（幂等；即使断言失败也执行，用例不留测试数据）
+      await page.request.delete('/api/watchlist', { headers: hdr, data: { code } }).catch(() => {})
+    }
+  })
+
+  // 删除分支：删完当前会话乐观行移除 + 后端持久化移除（刷新后仍不可见）。
+  test('WL-2 自选股：删除后不再出现', async ({ page }) => {
+    await page.goto('/#/')
+    await page.waitForTimeout(500)
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const code = 'WLTEST7777.SZ'
+    await page.request.post('/api/watchlist', { headers: hdr, data: { code } })
+    try {
+      await page.goto('/#/watchlist')
+      await expect(page.getByText(code).first(), '添加后可见').toBeVisible({ timeout: 15000 })
+      // 点击该行的删除（操作列 ✕）
+      const row = page.locator('tr', { hasText: code }).first()
+      await row.getByRole('button').last().click()
+      await page.waitForTimeout(800)
+      await page.reload()
+      await expect(page.getByText(code), '删除并刷新后不应再出现').toHaveCount(0, { timeout: 10000 })
+    } finally {
+      await page.request.delete('/api/watchlist', { headers: hdr, data: { code } }).catch(() => {})
+    }
+  })
+})

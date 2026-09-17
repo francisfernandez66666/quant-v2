@@ -97,13 +97,20 @@ export default function Watchlist() {
     })
   })()
 
+  // §WL-FIX（20260917）：库存经 stocksRef 供 load 读取——旧实现直接闭包引用 stocks，
+  // 60s 轮询持有的是首帧闭包（恒 []），「非交易时段且已有行情则跳过」的判定永远失真（恒不跳过）。
+  // English: WL-FIX — load reads stocksRef.current so the 60s poll no longer sees a stale closure.
+  const stocksRef = useRef([])
+  useEffect(() => { stocksRef.current = stocks }, [stocks])
+
   // 加载自选行情、评估数据并合并快照信息
   async function load() {
     try {
       const st = await api.fetchStatus()
-      const hasEmptyCode = stocks.some((s) => !s.code)
+      const cur = stocksRef.current
+      const hasEmptyCode = cur.some((s) => !s.code)
       // 非交易时段且已有关联行情时跳过刷新，避免无谓请求
-      if (!api.isTradingSession(st.session) && stocks.length && !hasEmptyCode) return
+      if (!api.isTradingSession(st.session) && cur.length && !hasEmptyCode) return
       api.setLastSession(st.session)
       const [snap, wl, ev] = await Promise.all([
         api.fetchSnapshot(), api.fetchWatchlist(), api.fetchEvaluations(),
@@ -116,29 +123,33 @@ export default function Watchlist() {
       wlStocks.forEach((c) => { wlMap[c.code] = c })
       const evMap = {}
       if (ev) ev.forEach((e) => { evMap[e.code] = e })
-      // 将行情快照、自选股列表、评估数据合并为统一展示行
-      // 优先用快照实时数据，回退到评估数据，缺失字段兜底默认值
-      const wlRow = (c) => {
-        const code = typeof c === 'string' ? c : (c && c.code)
-        return {
-          code,
-          name: wlMap[code]?.name || evMap[code]?.name || code,
-          price: Number(wlMap[code]?.price) || 0,
-          change_pct: Number(wlMap[code]?.change_pct) || 0,
-          n_score: evMap[code]?.n_score || 0, n_pass: evMap[code]?.n_pass || false,
-          dragon_score: evMap[code]?.dragon_score || 0, dragon_pass: evMap[code]?.dragon_pass || false,
-          db_score: evMap[code]?.db_score || 0, db_pass: evMap[code]?.db_pass || false,
-          dr_score: evMap[code]?.dr_score || 0, dr_pass: evMap[code]?.dr_pass || false,
-          m_score: evMap[code]?.m_score || 0, m_pass: evMap[code]?.m_pass || false,
-        }
-      }
+      // §WL-FIX（20260917）：显式传递 wlMap/evMap——旧实现把 wlRow 定义在 load 内、
+      // 却被组件级 buildDisplayList 调用，属于跨作用域引用，首屏整表合并必抛
+      // ReferenceError(wlRow is not defined) 且被静默 catch 吞掉 → 永远渲染「暂无自选股」，
+      // 只有当次会话内手动添加的乐观行可见（即线上「看不到自选/添加后刷新即丢」的根因）。
       // 组装最终展示列表：优先快照数据，回退评估数据，补全缺失股票
-      setStocks(buildDisplayList(snap, ev, codes))
-    } catch (_) { /* 保留旧数据 */ }
+      setStocks(buildDisplayList(snap, ev, codes, wlMap, evMap))
+    } catch (e) { console.warn('WL_LOAD_FAIL', e && (e.stack || e.message || String(e))) }
   }
 
   // 将快照/评估数据与自选股列表合并为统一展示行数组
-  function buildDisplayList(snap, ev, codes) {
+  // §WL-FIX：wlRow 提升为本函数内部闭包（同作用域），参数化 wlMap/evMap，不再依赖 load 局部变量。
+  function buildDisplayList(snap, ev, codes, wlMap, evMap) {
+    // 单行构造：行情快照、自选列表与评估数据合并，缺失字段兜底默认值
+    const wlRow = (c) => {
+      const code = typeof c === 'string' ? c : (c && c.code)
+      return {
+        code: typeof code === 'string' ? code : '',
+        name: wlMap[code]?.name || evMap[code]?.name || code,
+        price: Number(wlMap[code]?.price) || 0,
+        change_pct: Number(wlMap[code]?.change_pct) || 0,
+        n_score: evMap[code]?.n_score || 0, n_pass: evMap[code]?.n_pass || false,
+        dragon_score: evMap[code]?.dragon_score || 0, dragon_pass: evMap[code]?.dragon_pass || false,
+        db_score: evMap[code]?.db_score || 0, db_pass: evMap[code]?.db_pass || false,
+        dr_score: evMap[code]?.dr_score || 0, dr_pass: evMap[code]?.dr_pass || false,
+        m_score: evMap[code]?.m_score || 0, m_pass: evMap[code]?.m_pass || false,
+      }
+    }
     // 快照数据优先：过滤出自选股范围内的股票，合并行情与评估数据
     if (snap && snap.length) {
       const list = snap
@@ -149,7 +160,8 @@ export default function Watchlist() {
             ...base,
             name: s.name || base.name,
             price: Number(s.price) || base.price,
-            change_pct: Number(s.change_pct) ?? base.change_pct,
+            // §WL-FIX：Number() 失败会得 NaN（旧写法 ?? 对 NaN 不兜底）→ 直接用 || 归零
+            change_pct: Number(s.change_pct) || 0,
           }
         })
       // 补全快照中未覆盖的自选股

@@ -4,8 +4,10 @@
 //   - 层拆分：Base 底仓（昨日及以前买入，可卖）与 Intraday 机动仓（当日买入，当日不可卖）；
 //   - 机动仓上限（默认总仓 30%，不隔夜——尾盘须平掉等价量）；
 //   - 结算：价差与成本摊薄核算。
-// 纯核算（不读 config），引擎侧 Enhance.T0 门控决定是否启用（默认关）。实盘上柜台前需先确认
-// "当日卖旧+当日买新"支持度。English: base-position T+0 (P3). A-share T+1 means shares bought
+// 纯核算（不读 config）。§WMQ-0（20260917 缺口核证）：当前引擎/纸面账本无任何生产调用点
+// （仅本文件单测引用）——属"已设计未接线"，配置开关 Enhance.T0 尚无消费方。
+// 接线前置条件：先向柜台确认支持"当日卖旧+当日买新"申报顺序，再在 paper 卖出审计与
+// Enhance.T0 门控处接入（详见 docs/BUGFIX_WATCHLIST_20260917.md #1 决策记录）。English: base-position T+0 (P3). A-share T+1 means shares bought
 // today sellable only next day; with a base lot from prior days you can intraday-buy (intraday
 // layer) and sell an equal base amount same-day to lock in the intraday spread and lower cost.
 // Here we compute layers (base/sellable vs intraday), the intraday cap (default 30% of total,

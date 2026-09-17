@@ -841,6 +841,15 @@ func (r *Registry) build(userID string) *Engine {
 		// so pushRealAdvice read 0 positions and the live SL/TP/auto-sell/M8 chain silently stopped.
 		e.SetQMT(ctrl, opts.RealStore)
 		e.SetD1Store(opts.D1Store)
+		// §WMQ-1：共享引擎的 QMT 热同步源固定为本次装配账号（首建/管理员成员，与 FIX#11
+		// 契约的控制器归属一致）。旧实现缺此注入：共享引擎 userID=="" 时 syncAccountConfig
+		// 整体跳过，QueueConfigUpdate 永不入队、ApplyPendingConfig 永不消费、executor
+		// 类型（Noop↔QMTClient）在交易时段无法切换，配置变更只能靠重启生效。
+		// English: WMQ-1 — pin the hot-sync source to the member whose config owned the build-time
+		// controller; without it a shared engine never queues QMT config updates (restart-only).
+		if userID != "" {
+			e.SetQMTCfgSource(userID)
+		}
 	}
 	// 账号开关初始化（按共享组配置固化到引擎，运行期不随单账号变化）
 	ls := opts.CfgMgr.GetLongShortConfigFor(userID)

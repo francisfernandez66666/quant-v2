@@ -182,8 +182,8 @@ export default function EmotionReview() {
                   <title>{series[i].date + ' ' + series[i].emotion}</title>
                 </rect>
               ))}
-              {/* X 轴日期刻度（首/中/尾三点） */}
-              {[0, Math.floor(geo.n / 2), geo.n - 1].map((i) => (
+              {/* X 轴日期刻度（首/中/尾三点；§WMQ-3 区间天数≤2 时索引会重合，去重防 React 重复 key 告警） */}
+              {[...new Set([0, Math.floor(geo.n / 2), geo.n - 1])].map((i) => (
                 <text key={'t' + i} x={PAD_L + i * geo.step + geo.step / 2} y={H - 6} textAnchor="middle" fontSize="10" fill="var(--app-muted)">
                   {(series[i]?.date || '').slice(5)}
                 </text>

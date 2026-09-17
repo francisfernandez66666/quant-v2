@@ -95,8 +95,15 @@ type Engine struct {
 	ths          *data.THSClient         // 同花顺客户端（板块名单/行情表/实时报价降级）
 	scanner      *data.SectorScanner     // 板块扫描器（板块名单索引，板块验真与归因校验依赖）
 
-	userID  string   // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/scores）
-	members []string // §GAP2-W2 共享引擎服务的账号全集（registry 注入；私有消息/SSE 扇出依据）
+	userID string // 账号 ID（多账号独立引擎：该引擎只计算本账号的信号/评分）（Account ID; in multi-account mode this engine computes only this account's signals/分 scores）
+	// §WMQ-1（20260917）：共享引擎的 QMT 配置热同步源账号（首建/管理员成员，registry 注入）。
+	// 旧行为：共享引擎 userID=="" 时 syncAccountConfig 直接 return——QMT 配置从不进入
+	// 待生效队列 QueueConfigUpdate，交易时段 ApplyPendingConfig 无可消费、executor
+	// 类型（Noop↔QMTClient）也无法切换，需要重启进程才生效（资损敏感缺口）。
+	// 语义：共享引擎的 QMT 控制器归属 primaryMember（FIX#11 契约），热同步按该账号
+	// 的 GetQMTConfigFor 读取——与构建期 registry.go:802 同源。
+	qmtCfgUserID string   // 空 = 独占引擎，用 e.userID；非空 = 共享引擎，按此账号热同步 QMT 配置
+	members      []string // §GAP2-W2 共享引擎服务的账号全集（registry 注入；私有消息/SSE 扇出依据）
 	// §P1-4 管理员判定函数（main 注入 auth.IsAdmin）：primaryMember 优先返回管理员成员，
 	// 确保 friends 共享引擎的实盘账本/QMT 控制器默认归属创建者/管理员，而非首个普通成员。
 	// English: P1-4 admin predicate (wired from main's auth.IsAdmin) — primaryMember prefers an admin.
@@ -575,6 +582,16 @@ func (e *Engine) SetUserID(userID string) {
 	e.mu.Unlock()
 }
 
+// §WMQ-1 SetQMTCfgSource 设置共享引擎的 QMT 配置热同步源账号（registry 在装配 QMT
+// 控制器时调用，取共享组的首建/管理员成员）。空值维持旧的"跳过热同步"语义。
+// English: WMQ-1 — pins the shared engine's QMT hot-sync source account (primary member,
+// injected by the registry when the engine is built with a QMT controller).
+func (e *Engine) SetQMTCfgSource(uid string) {
+	e.mu.Lock()
+	e.qmtCfgUserID = uid
+	e.mu.Unlock()
+}
+
 // §GAP2-W2 账户隔离：共享引擎的成员账号列表与私有状态根目录。
 // 指纹相同的多个账号复用同一计算引擎（战法只算一遍），但"谁的持仓提醒/咨询历史"必须按账号隔离——
 // members 由 registry.registerUser 注入（去重后的服务账号全集），是私有消息生成与 SSE 定向扇出的依据；
@@ -831,25 +848,35 @@ func (e *Engine) SetLongShortConfig(longEnabled, shortEnabled bool) {
 func (e *Engine) syncAccountConfig() {
 	e.mu.RLock()
 	cfgMgr, userID := e.cfgMgr, e.userID
+	// §WMQ-1：共享引擎(空 userID)热同步源回退 qmtCfgUserID（首建账号）；
+	// 仍为空（无 QMT 控制器的表内共享）则维持旧跳过语义。
+	qmtSrc := userID
+	if qmtSrc == "" {
+		qmtSrc = e.qmtCfgUserID
+	}
 	e.mu.RUnlock()
-	if cfgMgr == nil || userID == "" {
+	if cfgMgr == nil || (userID == "" && qmtSrc == "") {
 		return
 	}
-	ls := cfgMgr.GetLongShortConfigFor(userID)
-	e.mu.Lock()
-	e.longEnabled = ls.LongEnabled
-	e.shortEnabled = ls.ShortEnabled
-	e.mu.Unlock()
-	// 把多空开关、D1 配置、仓位风控与战法参数同步到战斗代理（含止损/ATR 停损参数）。
-	if e.combatAgent != nil {
-		e.combatAgent.SetShortEnabled(ls.ShortEnabled)
-		e.combatAgent.SetD1Config(cfgMgr.GetD1ConfigFor(userID))
-		pos := cfgMgr.GetRulesFor(userID).Position
-		e.combatAgent.SetPositionDailyDropPct(pos.DailyDropAlertPct)
-		e.combatAgent.SetATRStop(pos.ATREnabled, pos.ATRStopMult)
-		sc := cfgMgr.GetStrategyConfigFor(userID)
-		if sc != nil {
-			e.combatAgent.HotReload(sc)
+	// 账号级作战配置（多空开关/战法参数）仍仅独占引擎应用：共享引擎各成员配置在
+	// 构建期固化，运行期混入任何单成员的账号级配置都会污染其他成员（保持原语义）。
+	if userID != "" {
+		ls := cfgMgr.GetLongShortConfigFor(userID)
+		e.mu.Lock()
+		e.longEnabled = ls.LongEnabled
+		e.shortEnabled = ls.ShortEnabled
+		e.mu.Unlock()
+		// 把多空开关、D1 配置、仓位风控与战法参数同步到战斗代理（含止损/ATR 停损参数）。
+		if e.combatAgent != nil {
+			e.combatAgent.SetShortEnabled(ls.ShortEnabled)
+			e.combatAgent.SetD1Config(cfgMgr.GetD1ConfigFor(userID))
+			pos := cfgMgr.GetRulesFor(userID).Position
+			e.combatAgent.SetPositionDailyDropPct(pos.DailyDropAlertPct)
+			e.combatAgent.SetATRStop(pos.ATREnabled, pos.ATRStopMult)
+			sc := cfgMgr.GetStrategyConfigFor(userID)
+			if sc != nil {
+				e.combatAgent.HotReload(sc)
+			}
 		}
 	}
 	// QMT 实盘配置热同步：每轮从配置管理器读取，控制器据此切换 enabled/mode/参数（5s 生效）。
@@ -858,8 +885,8 @@ func (e *Engine) syncAccountConfig() {
 	// §GAP1.7 黑名单接线：Theme.BlackList 一并同步进下单守卫（此前仅死代码 risk.go 消费）。
 	// English: hot-sync the per-user QMT config each cycle (GetQMTConfigFor, not the global
 	// GetRulesFor().QMT) so a Load()-reset of the global rules can't transiently disable a live link.
-	if c := e.QMTController(); c != nil {
-		q := *cfgMgr.GetQMTConfigFor(userID)
+	if c := e.QMTController(); c != nil && qmtSrc != "" {
+		q := *cfgMgr.GetQMTConfigFor(qmtSrc)
 		// §F-9（20260917 缺陷修复批）不再把 Theme.BlackList（板块名）并进个股黑名单：
 		// 板块名永远匹配不到纯代码（CodeInBlacklist 无命中），实际拦截由 signalctl 两通道的
 		// SectorBlacklist 独立生效（liveSignalPolicy/paperSignalPolicy 直读 Theme.BlackList）。

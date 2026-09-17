@@ -234,3 +234,27 @@ func TestAuditAttachReplayAndGarbageTolerant(t *testing.T) {
 		t.Fatal("momentum 显式开启后 pass 不留痕（仅非常态入环）")
 	}
 }
+
+// TestStrategyKeyOfShortTactics §WMQ-2（20260917）：做空四战法显示名归一到规范键，
+// 与白名单/前端开关同键空间（旧实现 passthrough 原名——缺契约（见 docs/BUGFIX_WATCHLIST_20260917.md #5）。
+func TestStrategyKeyOfShortTactics(t *testing.T) {
+	cases := map[string]string{
+		"高位滞涨":   "high_churn",
+		"放量破位":   "break_down",
+		"龙头断板":   "leader_decay",
+		"利好兑现砸盘": "good_news_fade",
+	}
+	for disp, want := range cases {
+		if got := StrategyKeyOf(combat_agent.Signal{Strategy: disp}); got != want {
+			t.Fatalf("StrategyKeyOf(%q)=%q want %q", disp, got, want)
+		}
+	}
+	// 英文/别名输入同样应命中（走 NormalizeStrategyName 归一）。
+	if got := StrategyKeyOf(combat_agent.Signal{Strategy: "high_churn"}); got != "high_churn" {
+		t.Fatalf("alias high_churn: %q", got)
+	}
+	// 未知键仍原样返回（可审计）。
+	if got := StrategyKeyOf(combat_agent.Signal{Strategy: "自研战法x"}); got != "自研战法x" {
+		t.Fatalf("unknown keep-through: %q", got)
+	}
+}
