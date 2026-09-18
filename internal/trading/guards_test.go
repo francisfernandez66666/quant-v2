@@ -133,8 +133,46 @@ func TestGuardDailyBudget(t *testing.T) {
 	}
 }
 
+// TestGuardBudgetFreezeLedger 冻结账回归（2026-09-18）：单日预算按「已成交 + 在途冻结」计——
+// 报单冻结、成交扣除、撤单解冻。钉住生命周期三态对预算的影响，防回退到「已报全额」旧口径。
+func TestGuardBudgetFreezeLedger(t *testing.T) {
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.DailyBudgetAmount = 1500
+	db := testDB(t)
+	ctrl := NewController(guardServer(), db, "u_g", cfg, nil)
+	// B1 1000 报出 → 在途冻结 1000；B2 600：1000+600 > 1500 → 拒（在途确实占着额度）
+	if _, err := ctrl.PlaceOrder(buyReq("FL-B1", 1000)); err != nil {
+		t.Fatalf("首单应放行: %v", err)
+	}
+	if _, err := ctrl.PlaceOrder(buyReq("FL-B2", 600)); err == nil || !strings.Contains(err.Error(), "预算不足") {
+		t.Fatalf("在途冻结应占预算: %v", err)
+	}
+	// 撤单解冻：B1 推进「已撤」→ 冻结释放；B2 600（0 成交 + 0 冻结 + 600 ≤ 1500）应放行。
+	// 旧「已报」口径下撤单行仍占 1000，B2 依旧被拒——这正是本次要修的事故形态。
+	if _, err := db.AdvanceRealOrderStatus("u_g", "FL-B1", "已撤"); err != nil {
+		t.Fatalf("推进已撤: %v", err)
+	}
+	if _, err := ctrl.PlaceOrder(buyReq("FL-B2", 600)); err != nil {
+		t.Fatalf("撤单解冻后应放行: %v", err)
+	}
+	// 成交扣除：B2 全额成交 → 已成交 600、冻结归零；B3 1000：600+1000 > 1500 → 仍拒。
+	// 占用从「在途冻结」转为「已成交」，总额度约束不因成交而松动。
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-X", Code: "600000.SH", Side: "买入",
+		Price: 10, Qty: 60, Amount: 600, SignalID: "FL-B2", UserID: "u_g",
+		TradedAt: time.Now().Format("2006-01-02 15:04:05")}); err != nil {
+		t.Fatalf("落成交: %v", err)
+	}
+	if _, err := db.AdvanceRealOrderStatus("u_g", "FL-B2", "已成"); err != nil {
+		t.Fatalf("推进已成: %v", err)
+	}
+	if _, err := ctrl.PlaceOrder(buyReq("FL-B3", 1000)); err == nil || !strings.Contains(err.Error(), "预算不足") {
+		t.Fatalf("已成交应继续占预算: %v", err)
+	}
+}
+
 // TestGuardCashPrecheck §GAP1.3：近似可用资金不足时拒绝买入
-// （本金 − Σ持仓成本市值 − 当日已报买单 < 本次金额）。
+// （冻结账口径：本金 − Σ持仓成本市值 − 当日已成交 − 在途冻结 < 本次金额）。
 func TestGuardCashPrecheck(t *testing.T) {
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
@@ -511,8 +549,13 @@ func TestGuardCashReserve(t *testing.T) {
 	}
 }
 
-// TestGuardLocalFrozen §WS-M：券商口径不可信且 TrustBrokerFreeze=false 时，
-// 本地已报未成交买单金额作为在途冻结从近似可用中扣除，防并发超买。
+// TestGuardLocalFrozen §WS-M：券商口径不可信时，本地冻结账（已成交 + 在途冻结）从近似可用中
+// 扣除，防并发超买。
+//
+// 2026-09-18 冻结账口径修正：旧断言按「本金 − 已报(6000) − 在途冻结(6000) = −2000」拒绝一切
+// 第二单——那是在途单被**扣两次**的重复记账（已报全额已含未成交余量，再扣一次冻结），
+// 旧实现只是恰好把错误算式当成了保守挡板。正确会计：6000 在途只占 6000，
+// 剩余 4000 可用——本测试改钉正确语义：额度内的第二单放行，超额的第三单被冻结挡住。
 func TestGuardLocalFrozen(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
@@ -522,12 +565,18 @@ func TestGuardLocalFrozen(t *testing.T) {
 	cfg.Money = config.MoneyMgmtConfig{TrustBrokerFreeze: &f}
 	ctrl := NewController(guardServer(), db, "u_fr", cfg, nil)
 
-	// 首单 6000 放行（占位行已报 6000 进入 orders 表）
+	// 首单 6000 放行（占位行已报 6000 进入 orders 表 → 在途冻结 6000）
 	if _, err := ctrl.PlaceOrder(buyReq("FR-B1", 6000)); err != nil {
 		t.Fatalf("首单应放行: %v", err)
 	}
-	// 第二单：近似可用 = 10000 − held(0) − spent(6000) − 在途冻结(6000) = −2000 → 拒
-	if _, err := ctrl.PlaceOrder(buyReq("FR-B2", 3000)); err == nil || !strings.Contains(err.Error(), "可用资金不足") {
-		t.Fatalf("本地在途冻结应把第二单拒掉, got %v", err)
+	// 第二单 3000：近似可用 = 10000 − held(0) − 已成交(0) − 在途冻结(6000) = 4000 ≥ 3000 → 放行
+	// （旧重复记账下这里会被 −2000 的负可用拒掉——那正是要修的缺陷形态）
+	if _, err := ctrl.PlaceOrder(buyReq("FR-B2", 3000)); err != nil {
+		t.Fatalf("冻结账不重复扣减：额度内第二单应放行, got %v", err)
+	}
+	// 第三单 5000：此时在途 9000（B1 6000 + B2 3000），可用 = 10000 − 9000 = 1000 < 5000 → 拒。
+	// 在途报单确实占着钱，冻结账必须把它挡住——防并发超买的能力不因口径修正而丢失。
+	if _, err := ctrl.PlaceOrder(buyReq("FR-B3", 5000)); err == nil || !strings.Contains(err.Error(), "可用资金不足") {
+		t.Fatalf("在途冻结应把超额第三单拒掉, got %v", err)
 	}
 }

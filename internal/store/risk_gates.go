@@ -103,6 +103,23 @@ func (d *DB) CountBuyFilledOrdersByDay(userID, day string) (int, error) {
 	return n, err
 }
 
+// SumBuyFilledAmountByDay 单日已成交买入金额（元）——闸2 单日预算的「已成交」口径。
+//
+// Σ amount（旧格式回报 amount<=0 时回退 price×qty）。与笔数口径（CountBuyFilledOrdersByDay）
+// 同源同表：fills 是柜台回报落下的客观成交事实，交割单 sync_fills 补记的手工成交（无本地
+// orders 行）一并计入。「在途冻结」由 LocalBuyFrozen 从 orders 状态派生，两者合起来才是
+// 完整冻结账：成交了多少算多少，撤单自动释放，挂单仍占额度。
+// English: today's filled buy amount in yuan — the "filled" half of the freeze ledger for the
+// daily-budget gate; Σ amount (falling back to price×qty for legacy rows), same fills table as the
+// count gate. In-flight freeze comes from LocalBuyFrozen (order-status derived).
+func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
+	var s float64
+	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
+		FROM fills WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
+		userID, day).Scan(&s)
+	return s, err
+}
+
 // TodayRealizedPnl 日内已实现盈亏（元，正=盈利，负=亏损）：
 // Σ 今日卖出成交 (fillPrice − 成本) × 数量。成本取该 code 当前持仓 CostPrice（已清仓则回落
 // 到今日买入均价兜底）；成本不可知（无持仓且无买入成交）时该笔 fail-open 不计入——

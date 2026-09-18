@@ -401,16 +401,21 @@ func (g *Gate) checkMaxPositions(cfg config.QMTConfig, o LiveOrder) string {
 // checkBuyDiscipline §GAP1.3/1.4 买入纪律预检（从 controller 原样迁入）：单日买入笔数上限、
 // 单日买入预算、近似可用资金 + §R4-3 券商口径可用资金双闸。守卫先于占位落库执行。
 //
-// 闸口各自的口径（三闸互补，别把它们混成同一个口径）：
+// 闸口各自的口径（三闸互补，别把它们混成同一个口径）——**统一冻结账模型（2026-09-18）**：
+// 占用 = 已成交（fills 客观成交事实）+ 在途冻结（orders 状态派生：已报=全额、部成=未成交余量、
+// 已撤/部撤/废单/已成=自动解冻）。这个口径下「撤单解冻」不再吃预算，「在途占着钱」仍然成立：
 //   - 闸1 笔数：数**今日已成交**买入笔数（fills 表，按委托去重）——「今天最多买成几笔」；
-//   - 闸2 预算 / 闸3、闸4 资金：按**今日已报金额 + 在途冻结**占用额度——在途报单确实占着钱；
-//
-// 这个分工让「报单即占额度」不再误伤笔数纪律，同时金额闸继续兜住信号风暴。
+//   - 闸2 预算：已成交金额 + 在途冻结 + 本次 > 预算即拒——挂单撤掉就释放，成交了多少算多少；
+//   - 闸3 近似资金：本金 − 持仓成本 − 已成交 − 在途冻结（仅在券商快照过期/缺失时兜底，
+//     本就发生在券商冻结不可信的场景，故恒扣本地冻结，与 TrustBrokerFreezeEnabled 无关；
+//     卖出回增由闸4 券商口径承担——近似口径的本金是静态配置，天然不随卖出增长）；
+//   - 闸4 券商口径：券商 AvailableCash 本身就是权威冻结账（报单冻结/成交扣除/撤单解冻都在
+//     柜台侧发生），本地只做 TrustBrokerFreezeEnabled=false 时的显式扣减防双算。
 //
 // English: §GAP1.3/1.4 buy-discipline precheck (migrated from the controller): daily buy-count cap,
 // daily budget and estimated/broker available-cash gates, run before the pending ticket persists.
-// Gate 1 counts *filled* buys (fills table, deduped per order); gates 2–4 stay amount-based and do
-// include in-flight submissions, which is what keeps a signal storm bounded by cash instead of count.
+// Unified freeze-ledger basis since 2026-09-18: occupied = filled (fills) + frozen-in-transit
+// (derived from order status — submitted freezes, fills deduct, cancels release).
 func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	if o.Side != SideBuy || g.st == nil {
 		return ""
@@ -420,32 +425,14 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	if amount <= 0 {
 		amount = o.Price * float64(o.Qty)
 	}
-	// 读取全部委托，统计今日已报买入的金额（供闸2/闸3 的额度占用口径——在途报单确实占着可用
-	// 资金，金额口径含未成交在途是对的；笔数口径的诉求不同，见下方闸1 注释）。
-	orders, err := g.st.RealOrdersForUser(g.userID)
-	if err != nil {
-		return fmt.Sprintf("read real orders: %v", err)
-	}
 	today := g.today()
-	spent := 0.0
-	// 只统计今日买入委托：排除卖出方向与本单自身（避免自计数）；排除非终态前占位/已撤等状态。
-	for _, ord := range orders {
-		if ord.Side != SideBuy || ord.SignalID == o.SignalID {
-			continue
-		}
-		// 仅"已报/部成/已成"三种有效状态计入今日已报金额。
-		switch ord.Status {
-		case "已报", "部成", "已成":
-		default:
-			continue
-		}
-		// 时间戳解析失败或非今日（北京时）的不计入。
-		at, perr := time.Parse(time.RFC3339, ord.CreatedAt)
-		if perr != nil || cntime.In(at).Format("2006-01-02") != today {
-			continue
-		}
-		spent += ord.Price * float64(ord.Qty)
+	// 冻结账两本账本各取一次：已成交金额（fills）与在途冻结（orders 状态派生）。
+	// filledAmt 是「真花掉的钱」，frozen 是「报出去还没成交、仍占着的钱」——撤单即消失。
+	filledAmt, ferr := g.st.SumBuyFilledAmountByDay(g.userID, today)
+	if ferr != nil {
+		return fmt.Sprintf("read buy fills: %v", ferr)
 	}
+	frozen := g.st.LocalBuyFrozen(g.userID, today)
 	// 闸1：单日买入笔数上限（0=不限）——**已成交**口径（2026-09-18 修正，原为已报口径）。
 	//
 	// 旧口径数 orders 里今日「已报/部成/已成」的委托数，等于报单即占额度：一笔报出去当场被券商
@@ -453,8 +440,8 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	// 锁死买入权（事故形态：daily_max_buys=5，当日 5 笔报单实际 0 成交，闸口仍报「今日已报 5 笔」）。
 	// 这条纪律的语义是「今天最多买成几笔」，故以 fills 表为准——柜台回报落下的客观成交事实。
 	// 附带收益：交割单 sync_fills 补记的手工成交（没有本地 orders 行）也能正确计入。
-	// 防信号风暴的能力不因此丢失：闸2 单日预算与闸3/闸4 可用资金仍按「已报金额 + 在途冻结」计算，
-	// 无节制报单会先在金额闸上撞墙（见 checkBuyDiscipline 头注的闸口分工）。
+	// 防信号风暴的能力不因此丢失：闸2 预算按「已成交 + 在途冻结」计——无节制报单会先在金额闸上
+	// 撞墙（见 checkBuyDiscipline 头注的闸口分工）。
 	if cfg.DailyMaxBuys > 0 {
 		filled, ferr := g.st.CountBuyFilledOrdersByDay(g.userID, today)
 		if ferr != nil {
@@ -464,9 +451,16 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 			return fmt.Sprintf("单日买入笔数达上限 %d（今日已成交 %d 笔）", cfg.DailyMaxBuys, filled)
 		}
 	}
-	// 闸2：单日买入预算（0=不限）：今日已报金额 + 本次金额超预算即拒。
-	if cfg.DailyBudgetAmount > 0 && spent+amount > cfg.DailyBudgetAmount {
-		return fmt.Sprintf("单日买入预算不足: 已报 %.0f + 本次 %.0f > 预算 %.0f", spent, amount, cfg.DailyBudgetAmount)
+	// 闸2：单日买入预算（0=不限）——**冻结账口径（2026-09-18 修正，原为已报口径）**。
+	//
+	// 占用 = 已成交金额（fills，真花掉的钱）+ 在途冻结（LocalBuyFrozen：已报=全额、
+	// 部成=未成交余量、已撤/部撤/废单/已成=自动解冻——撤单不再吃预算，在途仍占着钱）。
+	// 旧口径按 orders「已报/部成/已成」全额计：委托价≠成交价、部成后撤单的余量都算进占用，
+	// 表现就是「已报 19656 挡住了实际只成交了一部分的后续买入」。文案带三段分解，
+	// 让用户一眼看出额度被谁吃着。
+	if cfg.DailyBudgetAmount > 0 && filledAmt+frozen+amount > cfg.DailyBudgetAmount {
+		return fmt.Sprintf("单日买入预算不足: 已成交 %.0f + 在途冻结 %.0f + 本次 %.0f > 预算 %.0f",
+			filledAmt, frozen, amount, cfg.DailyBudgetAmount)
 	}
 	// 闸3：近似可用资金闸（依赖 InitialCapital 配置；无本金口径时跳过）。
 	if cfg.InitialCapital > 0 {
@@ -479,7 +473,10 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 			}
 		}
 		if !brokerFresh {
-			// 近似口径：预估可用 = 本金 − 持仓成本市值 − 今日已报买入。
+			// 近似口径（冻结账）：预估可用 = 本金 − 持仓成本市值 − 已成交 − 在途冻结。
+			// 走到这里的前提就是券商快照过期/缺失——券商冻结不可用，故**恒扣**本地冻结，
+			// 与 TrustBrokerFreezeEnabled 无关（该开关只影响闸4 对券商余额的扣减策略）。
+			// 旧实现按「今日已报」扣再叠加条件扣冻结，部成单被扣两次（已报全额 + 未成交余量）。
 			pos, perr := g.st.RealPositionsForUser(g.userID)
 			if perr != nil {
 				return fmt.Sprintf("read real positions: %v", perr)
@@ -488,22 +485,12 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 			for _, p := range pos {
 				held += p.CostPrice * float64(p.Qty)
 			}
-			avail := cfg.InitialCapital - held - spent
-			// 不信任券商冻结口径时，额外扣减本地在途买入冻结量。
-			if !cfg.Money.TrustBrokerFreezeEnabled() {
-				avail -= g.st.LocalBuyFrozen(g.userID, today)
-			}
+			avail := cfg.InitialCapital - held - filledAmt - frozen
 			// 再扣固定/比例保留现金后与本次金额比较。
 			avail -= cfg.Money.EffectiveReserve(avail)
 			if amount > avail {
-				return fmt.Sprintf("可用资金不足: 预估可用 %.0f（本金%.0f−持仓成本%.0f−今日已报%.0f%v%v）< 本次 %.0f",
-					avail, cfg.InitialCapital, held, spent,
-					func() string {
-						if !cfg.Money.TrustBrokerFreezeEnabled() {
-							return fmt.Sprintf("−在途冻结%.0f", g.st.LocalBuyFrozen(g.userID, today))
-						}
-						return ""
-					}(),
+				return fmt.Sprintf("可用资金不足: 预估可用 %.0f（本金%.0f−持仓成本%.0f−已成交%.0f−在途冻结%.0f%v）< 本次 %.0f",
+					avail, cfg.InitialCapital, held, filledAmt, frozen,
 					func() string {
 						if cfg.Money.EffectiveReserve(avail) > 0 {
 							return fmt.Sprintf("−保留现金%.0f", cfg.Money.EffectiveReserve(avail))
@@ -528,10 +515,10 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 			if !fresh {
 				label = "陈旧保守折算50%"
 			}
-			// 不信任券商冻结时扣本地在途冻结；再扣保留现金，得到可下单上限。
+			// 不信任券商冻结时扣本地在途冻结（复用闸3 取好的同一份冻结值）；再扣保留现金，得到可下单上限。
 			var frozenDed, reserveDed float64
 			if !cfg.Money.TrustBrokerFreezeEnabled() {
-				frozenDed = g.st.LocalBuyFrozen(g.userID, today)
+				frozenDed = frozen
 				cap -= frozenDed
 			}
 			reserveDed = cfg.Money.EffectiveReserve(cap)

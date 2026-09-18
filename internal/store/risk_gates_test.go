@@ -80,6 +80,49 @@ func TestCountBuyFilledOrdersByDay(t *testing.T) {
 	}
 }
 
+// TestSumBuyFilledAmountByDay 预算闸冻结账的「已成交」半边：Σ 当日买入成交金额
+// （amount 优先，旧数据缺失时回落 price×qty），卖出/非当日/他人账号不计。
+// 与 LocalBuyFrozen（orders 状态派生的「在途冻结」半边）合起来才是完整占用。
+func TestSumBuyFilledAmountByDay(t *testing.T) {
+	db := newRiskTestDB(t)
+	other := fill("O5", "", "600005.SH", "买入", "2026-09-18 11:00:00")
+	other.UserID = "u_other"
+	fills := []RealFill{
+		// 正常 amount 行：按 amount 计
+		fill("O1", "", "600001.SH", "买入", "2026-09-18 09:31:00"),
+		// 同一委托的另一笔部分成交：金额照加（金额口径不去重，笔数口径才去重）
+		fill("O1", "", "600001.SH", "买入", "2026-09-18 09:31:05"),
+		// 旧数据 amount=0：回落 price×qty = 10×100 = 1000
+		func() RealFill {
+			f := fill("O2", "", "600002.SH", "买入", "2026-09-18 10:00:00")
+			f.Amount = 0
+			return f
+		}(),
+		// 卖出 / 非当日 / 他账号不计
+		fill("O3", "", "600003.SH", "卖出", "2026-09-18 10:30:00"),
+		fill("O4", "", "600004.SH", "买入", "2026-09-17 10:00:00"),
+		other,
+	}
+	for i, f := range fills {
+		if err := db.ApplyRealFill(f); err != nil {
+			t.Fatalf("ApplyRealFill #%d: %v", i, err)
+		}
+	}
+	got, err := db.SumBuyFilledAmountByDay("u_rg", "2026-09-18")
+	if err != nil {
+		t.Fatalf("SumBuyFilledAmountByDay: %v", err)
+	}
+	if got != 3000 {
+		t.Fatalf("今日已成交买入金额应为 3000（1000×2 + 回落1000）got=%.0f", got)
+	}
+	if got, err = db.SumBuyFilledAmountByDay("u_rg", "2026-09-17"); err != nil || got != 1000 {
+		t.Fatalf("9-17 应为 1000, got %.0f err=%v", got, err)
+	}
+	if got, err = db.SumBuyFilledAmountByDay("u_none", "2026-09-18"); err != nil || got != 0 {
+		t.Fatalf("无成交账号应为 0, got %.0f err=%v", got, err)
+	}
+}
+
 // TestCountBuyFilledOrdersByDayIgnoresUnfilledOrders 「报单不占额度」的数据层对照：
 // 只有 orders 行（还没成交）时计数恒为 0——旧口径在这里会数出 N 笔。
 func TestCountBuyFilledOrdersByDayIgnoresUnfilledOrders(t *testing.T) {
