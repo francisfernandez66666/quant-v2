@@ -169,6 +169,61 @@ func TestGuardBudgetFreezeLedger(t *testing.T) {
 	if _, err := ctrl.PlaceOrder(buyReq("FL-B3", 1000)); err == nil || !strings.Contains(err.Error(), "预算不足") {
 		t.Fatalf("已成交应继续占预算: %v", err)
 	}
+	// 卖出回款回血：卖 300 → 占用 = max(0, 600−300) = 300 → B3 1000 应放行（300+1000 ≤ 1500）。
+	// 预算闸是活的：额度不够时卖一笔，回款实时释放额度——这是买入除笔数上限外唯一的「解锁」路径。
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-S1", Code: "600000.SH", Side: "卖出",
+		Price: 10, Qty: 30, Amount: 300, SignalID: "FL-SELL1", UserID: "u_g",
+		TradedAt: time.Now().Format("2006-01-02 15:04:05")}); err != nil {
+		t.Fatalf("落卖出成交: %v", err)
+	}
+	if _, err := ctrl.PlaceOrder(buyReq("FL-B3", 1000)); err != nil {
+		t.Fatalf("卖出回款后预算应放行: %v", err)
+	}
+}
+
+// TestGuardCashDynamicSell §GAP1.3 动态冻结账两件事一起钉：
+//  1. 闸3 不双扣：ApplyRealFill 同事务把成交成本落进持仓，今日已成交买入**已在 held 里**，
+//     预估可用不得再扣一遍成交额（旧公式 held+filledAmt 对当日成交单双扣，10000 本金成交 6000
+//     后可用被算成 −2000，后续买入全被误拒——比「已报口径」更隐蔽的同族缺陷）；
+//  2. 闸3 随卖出回血：卖出 = 持仓成本回落 + 已实现盈亏上升，卖完立刻能再买。
+func TestGuardCashDynamicSell(t *testing.T) {
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = true
+	cfg.InitialCapital = 10000
+	cfg.DailyBudgetAmount = 0 // 关预算闸，隔离闸3 行为
+	db := testDB(t)
+	ctrl := NewController(guardServer(), db, "u_cd", cfg, nil)
+	now := time.Now().Format("2006-01-02 15:04:05")
+
+	// A1 6000 报出并全额成交 → 持仓成本 6000 落账（fills 与 real_positions 同事务更新）
+	if _, err := ctrl.PlaceOrder(buyReq("CD-A1", 6000)); err != nil {
+		t.Fatalf("首单应放行: %v", err)
+	}
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-CD1", Code: "600000.SH", Side: "买入",
+		Price: 10, Qty: 600, Amount: 6000, SignalID: "CD-A1", UserID: "u_cd", TradedAt: now}); err != nil {
+		t.Fatalf("落成交: %v", err)
+	}
+	if _, err := db.AdvanceRealOrderStatus("u_cd", "CD-A1", "已成"); err != nil {
+		t.Fatalf("推进已成: %v", err)
+	}
+	// A2 4000：预估可用 = 10000 − held(6000) − 冻结(0) + 盈亏(0) = 4000 → 应放行。
+	// 旧双扣公式会算出 10000−6000−6000 = −2000 误拒。
+	if _, err := ctrl.PlaceOrder(buyReq("CD-A2", 4000)); err != nil {
+		t.Fatalf("成交成本已入持仓、不应再扣成交额: %v", err)
+	}
+	// A3 100：A2 在途冻结 4000 → 预估可用 0 → 拒
+	if _, err := ctrl.PlaceOrder(buyReq("CD-A3", 100)); err == nil || !strings.Contains(err.Error(), "可用资金不足") {
+		t.Fatalf("在途冻结应占用近似可用, got %v", err)
+	}
+	// 卖出回血：600 股全卖 6300 → 持仓清零、已实现盈亏 +300
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-CD2", Code: "600000.SH", Side: "卖出",
+		Price: 10.5, Qty: 600, Amount: 6300, SignalID: "CD-SELL1", UserID: "u_cd", TradedAt: now}); err != nil {
+		t.Fatalf("落卖出成交: %v", err)
+	}
+	// A4 4200：预估可用 = 10000 − 0 − 0 + 300 = 10300 → 放行（卖出即回血）
+	if _, err := ctrl.PlaceOrder(buyReq("CD-A4", 4200)); err != nil {
+		t.Fatalf("卖出回款后应放行: %v", err)
+	}
 }
 
 // TestGuardCashPrecheck §GAP1.3：近似可用资金不足时拒绝买入

@@ -23,12 +23,16 @@
 #
 # §单日买入笔数改「已成交」口径（2026-09-18 §BUY_COUNT_FILLED）专项（见 13/14）：
 #   口径         ：笔数闸从「orders 表已报笔数」改为「fills 表当日买入成交按委托去重」；
-#                  金额闸同日升级为统一冻结账模型（§BUDGET_FREEZE_LEDGER）：
+#                  金额闸同日升级为**动态冻结账模型**（§BUDGET_FREEZE_LEDGER）：
 #                  占用 = 已成交（fills）+ 在途冻结（LocalBuyFrozen：报单冻结/成交扣除/
-#                  撤单解冻）——撤单不再吃预算，在途报单仍占着钱，卖出回增走券商口径
+#                  撤单解冻）− 卖出回款（SumSellFilledAmountByDay，卖出即回血、钳 0 不放大预算）；
+#                  闸3 近似资金 = 本金 − 持仓成本 − 冻结 + 今日已实现盈亏（成交成本已入持仓，
+#                  不另扣成交额——修掉 held+filledAmt 双扣）；卖出方向永不设量闸
+#   买入终点     ：唯一硬终点是闸1 今日已成交笔数达上限；预算/资金闸全部动态伸缩
 #   附带效果     ：同一委托多次部分成交算 1 笔；QMT 客户端手工单（本地无 orders 行）计入额度
 #   回归         ：三处锁旧口径的断言（gate/guards/engine）改写为钉新语义 + store 层边界用例
-#                  + 冻结账端到端用例（TestGuardBudgetFreezeLedger）
+#                  + 冻结账端到端（TestGuardBudgetFreezeLedger 含卖出回血步）
+#                  + 闸3 双扣修复与卖出回血（TestGuardCashDynamicSell）
 #
 # §LLM 热更新稳定性 + 地址规范化（2026-09-18 §LLM_HOTUPDATE / §LLM_BASEURL）专项（见 14/14）：
 #   地址规范化   ：供应商 base URL（/v1、/v1beta、裸主机）自动补 /chat/completions；
@@ -275,21 +279,24 @@ print('ok - qmt_bridge_strategy.py 非 ASCII 字节 %d' % n if n == 0 else
 raise SystemExit(0 if n == 0 else 1)
 PY
 
-echo "==> 13/14 单日买入笔数改「已成交」口径 + 预算冻结账专项（2026-09-18 §BUY_COUNT_FILLED / §BUDGET_FREEZE_LEDGER）..."
-# 口径分工（统一冻结账模型，勿混成一个）：
-#   笔数闸 → fills 表当日买入成交，按委托去重（order_id → 券商交割流水号 → 行 ID 依次兜底）
-#   金额闸 → 占用 = 已成交金额（SumBuyFilledAmountByDay）+ 在途冻结（LocalBuyFrozen 状态派生：
-#            已报=全额、部成=未成交余量、已撤/废单/已成=自动解冻）——撤单释放、成交扣除
+echo "==> 13/14 单日买入笔数「已成交」口径 + 动态冻结账专项（2026-09-18 §BUY_COUNT_FILLED / §BUDGET_FREEZE_LEDGER）..."
+# 口径分工（动态冻结账模型，勿混成一个）：
+#   笔数闸 → fills 表当日买入成交，按委托去重（order_id → 券商交割流水号 → 行 ID 依次兜底）；
+#            **买入唯一硬终点**：今日已成交笔数达上限
+#   金额闸 → 占用 = 已成交金额（SumBuyFilledAmountByDay）+ 在途冻结（LocalBuyFrozen 状态派生）
+#            − 卖出回款（SumSellFilledAmountByDay，钳 0）——撤单释放、成交扣除、卖出回血；
+#            闸3 = 本金 − 持仓成本 − 冻结 + 今日已实现盈亏（成交成本已入持仓，不另扣成交额）
 # A store 层计数边界：部分成交去重 / 卖出不计 / 非当日不计 / 他账号不计 / 无委托号不合并
 go test -count=1 ./internal/store/ -run 'TestCountBuyFilled' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-# A2 store 层已成交金额聚合（冻结账「已成交」半边；旧数据 amount=0 回落 price×qty）
-go test -count=1 ./internal/store/ -run 'TestSumBuyFilledAmountByDay' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# A2 store 层冻结账金额聚合：买入占用半边 + 卖出回款半边（旧数据 amount=0 回落 price×qty）
+go test -count=1 ./internal/store/ -run 'TestSum.*FilledAmountByDay' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # B 闸口层：成交笔数达上限才拦（旧口径是报单即占额度，被废单会锁死当天买入权）
 go test -count=1 ./internal/risk/ -run 'TestGateBuyDiscipline' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # C 交易层：达上限后拒绝新买入、卖出不受限
 go test -count=1 ./internal/trading/ -run 'TestGuardDailyBuysCap' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
-# C2 交易层冻结账端到端：报单冻结 → 撤单解冻 → 成交扣除 → 成交后仍占预算
-go test -count=1 ./internal/trading/ -run 'TestGuardBudgetFreezeLedger|TestGuardLocalFrozen' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# C2 交易层动态冻结账：报单冻结 → 撤单解冻 → 成交扣除 → 卖出回款释放预算；
+#    闸3 不双扣成交成本、随卖出回血
+go test -count=1 ./internal/trading/ -run 'TestGuardBudgetFreezeLedger|TestGuardLocalFrozen|TestGuardCashDynamicSell' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # D 引擎层：auto 下单路径同口径（0 成交时不拦，成交满额才拦）
 go test -count=1 ./internal/engine/ -run 'TestAutoPlaceDailyCap' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 

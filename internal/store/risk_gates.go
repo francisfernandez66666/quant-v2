@@ -120,6 +120,21 @@ func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
 	return s, err
 }
 
+// SumSellFilledAmountByDay 当日卖出成交回款（元）：Σ 卖出 fills 金额（amount 优先，旧数据回落
+// price×qty）。冻结账的「回款」半边：卖出即回血——预算闸用回款对冲当日买入占用（上限钳到 0，
+// 不因清旧仓放大当日预算），近似资金闸经「持仓成本回落 + 已实现盈亏」两条路体现同一笔回款。
+// 手续费未扣（fills 金额为成交额口径），对额度判定偏保守方向无影响——回款少算只会更严不会放水。
+// English: today's sell proceeds in yuan — the "replenish" half of the freeze ledger; gates offset
+// today's buy occupancy with it (floored at zero so liquidating old inventory never enlarges the
+// daily budget). Fees not deducted; undercounting proceeds only tightens, never loosens.
+func (d *DB) SumSellFilledAmountByDay(userID, day string) (float64, error) {
+	var s float64
+	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
+		FROM fills WHERE user_id=? AND side='卖出' AND substr(traded_at,1,10)=?`,
+		userID, day).Scan(&s)
+	return s, err
+}
+
 // TodayRealizedPnl 日内已实现盈亏（元，正=盈利，负=亏损）：
 // Σ 今日卖出成交 (fillPrice − 成本) × 数量。成本取该 code 当前持仓 CostPrice（已清仓则回落
 // 到今日买入均价兜底）；成本不可知（无持仓且无买入成交）时该笔 fail-open 不计入——
