@@ -1,0 +1,14 @@
+{
+  "source": "internal/trading/executor.go OrderRequest",
+  "updated": "2026-09-18",
+  "fields": [
+    "signal_id", "code", "name", "strategy", "strategy_id", "strategy_type",
+    "side", "price_type", "price", "qty", "amount", "created_at",
+    "staleness_ms", "prev_close", "current_price"
+  ],
+  "consumed_by_gateway": [
+    "signal_id", "code", "side", "price_type", "price", "qty",
+    "amount", "created_at", "strategy_type", "strategy"
+  ],
+  "ignored_by_gateway": ["name", "strategy_id", "staleness_ms", "prev_close", "current_price"]
+}

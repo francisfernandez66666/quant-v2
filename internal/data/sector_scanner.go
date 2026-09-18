@@ -292,6 +292,8 @@ func (ss *SectorScanner) BuildEventMapFromNews(news []NewsItem, base map[string]
 		text := n.Title + " " + n.Content
 		textLower := strings.ToLower(text)
 
+		// 用板块名对新闻正文做子串匹配完成板块归因：命中即把标题挂到板块代码上，
+		// 已有归因的板块不覆盖，保留最早触达的那条消息。
 		for _, s := range sectors {
 			secName := strings.ToLower(s.Name)
 			if secName == "" {
@@ -316,6 +318,8 @@ func (ss *SectorScanner) ScoreSectorStocks(sectorCode string, maxStocks int) ([]
 		return nil, fmt.Errorf("no stocks for sector %s", sectorCode)
 	}
 
+	// 逐只成分股打分：先把行情字段原样搬进 ScoredStock，下面再按涨跌幅/换手/
+	// 成交额/量能/龙头五个因子分段累加。
 	scored := make([]ScoredStock, 0, len(allStocks))
 	for _, st := range allStocks {
 		si := ScoredStock{
@@ -435,6 +439,8 @@ func (ss *SectorScanner) ExpandWatchlist(hotSectors []HotSector, baseWatchlist [
 		}
 	}
 
+	// 逐个热点板块取前 topN 只成分股并入集合（set 去重，与基础自选合并）；
+	// topN 缺省补 3，单板块拉取失败只跳过该板块，不让整个扩池动作报错中断。
 	for _, hs := range hotSectors {
 		if topN <= 0 {
 			topN = 3

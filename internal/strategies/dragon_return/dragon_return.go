@@ -335,6 +335,8 @@ func (d *DragonReturnStrategy) pullbackHealth(sd *StockData) float64 {
 		score += 1
 	}
 
+	// 回调时长维度：5~8 个交易日最理想（洗盘充分又不拖沓）给满分 5，
+	// 3~4 天嫌短、9~12 天动能已在磨底中流失，各给 3 分，其余时长只拿 1 分底分。
 	days := sd.PullbackDays
 	if days >= 5 && days <= 8 {
 		score += 5
@@ -346,6 +348,8 @@ func (d *DragonReturnStrategy) pullbackHealth(sd *StockData) float64 {
 		score += 1
 	}
 
+	// 缩量维度：回调期量比越低说明抛压越轻（<0.3 拿满 8 分），
+	// 逐级递减到 ≥0.6 只给 1 分——放量回调意味着筹码松动，不是健康洗盘。
 	vr := sd.VolumeRatio
 	if vr < 0.3 {
 		score += 8
@@ -501,6 +505,8 @@ func (d *DragonReturnStrategy) GenerateSignal(code string, eval *strategy.Evalua
 	action := strategy.ActionWatch
 	priority := strategy.P3
 
+	// 总分分档同时决定动作与优先级：≥85 → P1、≥75 → P2、≥60 → P3_5，三档都转买入；
+	// 60 以下在上面的 Pass 闸已被拦掉，这里不会再产出弱信号抢占仓位额度。
 	total := eval.TotalScore
 	if total >= 85 {
 		action = strategy.ActionBuy
@@ -513,6 +519,8 @@ func (d *DragonReturnStrategy) GenerateSignal(code string, eval *strategy.Evalua
 		priority = strategy.P3_5
 	}
 
+	// 组装信号：Meta 直接挂评分明细（四因子分原样透传给前端与回放），
+	// Timestamp 取秒级 Unix 时间，与其它战法的信号口径保持一致。
 	return &strategy.Signal{
 		Code:       code,
 		Type:       strategy.SignalType("dragon_return"),

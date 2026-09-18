@@ -2,6 +2,7 @@
 // 服务器连接、通知、账户信息、LLM 配置、五大战法参数、资讯显示开关、系统信息
 // 使用 TDesign React 组件（Card / Input / InputNumber / Switch / Button / Tag / Textarea）。
 import React, { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Card, Input, InputNumber, Button, Tag, Textarea, Dialog } from 'tdesign-react'
 import ToggleSw from '../components/ToggleSw'
 import * as api from '../api/index.js'
@@ -90,6 +91,8 @@ const labelStyle = { width: 160, flexShrink: 0, color: 'var(--app-muted-2)', fon
  * @returns {JSX.Element}
  */
 export default function Settings() {
+  // §A5（20260918 审计批）：admin 数据首拉 403（本地角色缓存伪冒/会话中途被降权）统一跳 /403
+  const navigate = useNavigate()
   const [serverUrl, setServerUrl] = useState(api.getStoredServer() || '')
   const [serverOnline, setServerOnline] = useState(false)
 
@@ -388,7 +391,10 @@ export default function Settings() {
         const cfg = await api.fetchLLMConfig()
         // 回填口径统一走 applyLLMCfgToForm（与回滚后回读共用，避免两处各写一遍而分叉）
         if (cfg) applyLLMCfgToForm(cfg)
-      } catch (_) {}
+      } catch (e) {
+        // §A5：首个 admin 数据端点即 403=服务端权威角色非管理员，跳统一 403 页
+        if (api.isForbidden(e)) navigate('/403')
+      }
       // 3) 读取战法参数：先建五组空占位，再按分组归并后端返回
       try {
         const sc = await api.fetchStrategyConfig()
@@ -610,6 +616,7 @@ export default function Settings() {
         )}
       </Card>
 
+      {/* 各战法参数按分组（dragon/双凸/N 形/回头/动量）各自渲染一张卡，卡内逐字段走 renderField 编辑器 */}
       {strategyGroups.map((group) => (
         <Card key={group.key} title={group.title} style={{ marginBottom: 16 }}>
           {group.fields.map((f) => (

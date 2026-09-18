@@ -856,7 +856,10 @@ test.describe('修复回归 · GAP_VERIFY_20260917 D 批', () => {
     await page.screenshot({ path: `${SHOT}/branch-settings-hist.png`, fullPage: true })
   })
 
-  // D-3 tester 权限分支：成员账号整卡隐藏（写端点 admin-only）
+  // D-3 tester 权限分支：成员账号不得看到「配置历史与回滚」卡。
+  // §A5（20260918 审计批）行为变更：旧版成员伪造 localStorage 角色可渲染 Settings 本体
+  // （仅隐藏历史卡）；现在 admin 数据端点首拉 403 即由页面主动跳转统一 /403 页——
+  // 本用例改钉新语义：伪造角色 + 成员 token → 落 403，页面本体（服务器连接卡）不渲染。
   test('D-3 tester：Settings 无配置历史卡', async ({ page, context }) => {
     // 用 tester 凭据现登（不动共享 storageState 会话）
     const resp = await context.request.post('/api/auth/login', { data: { username: process.env.E2E_USER2 || 'tester', password: process.env.E2E_PASS2 || '' } })
@@ -867,7 +870,8 @@ test.describe('修复回归 · GAP_VERIFY_20260917 D 批', () => {
     await p2.evaluate((tok) => localStorage.setItem('liangzai_token', tok), t)
     await p2.goto('/#/settings')
     await expect(p2.locator('.t-card', { hasText: '配置历史与回滚' })).toHaveCount(0)
-    await expect(p2.locator('.t-card', { hasText: '服务器连接' }).first(), '设置页本体正常渲染').toBeVisible()
+    await expect(p2.getByRole('heading', { name: /403/ }), '§A5：成员 token 进 admin 页必落统一 403').toBeVisible({ timeout: 10000 })
+    await expect(p2.locator('.t-card', { hasText: '服务器连接' })).toHaveCount(0)
     await p2.close()
   })
 })

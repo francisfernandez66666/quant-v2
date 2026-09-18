@@ -1125,6 +1125,3 @@ func (r *Registry) fingerprint(userID string) string {
 	sum := sha256.Sum256(b)
 	return fmt.Sprintf("%x", sum[:16])
 }
-
-// ticker 占位保留：避免 time 未使用。
-var _ = time.Now

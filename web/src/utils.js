@@ -134,3 +134,20 @@ export function sseOpsAlert(msg) {
       return null
   }
 }
+
+// §A7（20260918 审计批）版本漂移告警判定（纯函数，单测覆盖）：
+// 比对前端本地构建指纹（vite define 注入的 __BUILD_COMMIT__）与后端 /api/status 下发的
+// build_commit。部署脚本用同一 checkout 先后构建后端二进制与前端 dist，两值一致即
+// "APK 内嵌前端与服务端配套"；不等说明 APK assets 落后（或前端先行），返回告警文案。
+// 哨兵值不比对：'dev'（vite 构建时 git 不可用）、'unknown'（后端裸 go build 未注入 ldflags）、
+// 空/缺失（旧版后端还没有该字段）——避免本地开发/UAT/旧部署误报。
+// English: §A7 — pure version-drift detector. The APK's embedded frontend compares its build-time
+// git SHA against /api/status build_commit (both stamped from the same checkout at deploy);
+// mismatch yields a banner. Sentinel values dev/unknown/empty never warn.
+export function versionMismatchNotice(local, remote) {
+  const sentinel = (v) => !v || v === 'dev' || v === 'unknown'
+  if (sentinel(local) || sentinel(remote)) return null
+  if (local === remote) return null
+  return '检测到前端与服务器版本不一致（本地 ' + local + ' / 服务器 ' + remote + '）：'
+    + 'APK 内嵌前端可能落后于线上后端，接口行为或有差异，请用 scripts/build_apk.sh 重新打包。'
+}

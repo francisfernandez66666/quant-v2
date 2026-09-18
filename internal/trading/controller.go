@@ -336,6 +336,8 @@ func (c *Controller) HealthCheck() {
 	c.lastHealthAt = time.Now()
 	c.mu.Unlock()
 
+	// 真正探活：计时调用柜台 Health 并记下往返耗时（前端健康条用），
+	// 配置与 miss 窗口都现场重取，保证热更新 MissHeartbeatSec 后本轮就生效。
 	started := time.Now()
 	ok, err := c.execRef().Health()
 	c.mu.Lock()
@@ -424,6 +426,8 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	c.orderMu.Lock()
 	defer c.orderMu.Unlock()
 
+	// 两道最前置的拒绝先过：熔断开着就把熔断原因带回调用方（前端能直接显示"为什么不下单"），
+	// 配置在读锁下取快照，避免热更新途中读到半份配置。
 	if c.Tripped() {
 		return nil, fmt.Errorf("qmt circuit-breaker open: %s", c.tripReasonLocked())
 	}

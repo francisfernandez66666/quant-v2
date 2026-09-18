@@ -5,6 +5,8 @@
 // "改了没生效、改不了"体感的直接来源。本文件钉住三种结果在界面上的呈现。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+// §A5：Settings 页接入 useNavigate（首拉 403 跳 /403），渲染需 Router 上下文
+import { MemoryRouter } from 'react-router-dom'
 
 // 三个写/探端点的可编程桩
 const setLLMConfig = vi.fn()
@@ -56,7 +58,7 @@ function llmCard() {
 
 // renderSettings 渲染设置页并等 LLM 表单被回填完成（否则提交的是空表单）。
 async function renderSettings() {
-  render(<Settings />)
+  render(<MemoryRouter><Settings /></MemoryRouter>)
   await screen.findByText('LLM 配置')
   await waitFor(() => expect(screen.getByDisplayValue(/api\.siliconflow\.cn/)).toBeInTheDocument())
   return llmCard()

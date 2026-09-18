@@ -431,6 +431,8 @@ func TestHotUpdateUsesRealProberAgainstUpstream(t *testing.T) {
 	s, admin := newAdminTestServer(t)
 	cap := captureRecreate(t, s)
 
+	// 假供应商的状态码用闭包变量按用例改写：先固定 401，
+	// 检验真实探测链路能否识别「密钥无效」并拒绝热切换。
 	status := http.StatusUnauthorized
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -56,6 +56,7 @@ func clsSign(params map[string]string) string {
 	}
 	sort.Strings(keys)
 
+	// 拼签名原文：k=v 用 & 连接、值做 urlencode，键序已在上一步排好。
 	var sb strings.Builder
 	for i, k := range keys {
 		if i > 0 {
@@ -104,6 +105,8 @@ func (m *MarketAPI) GetCLSNews(limit int) ([]NewsItem, error) {
 	req.Header.Set("Referer", clsRollReferer)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 
+	// 真正发请求：非 200 一律当失败（签名过期时接口返回 4xx 而非 JSON 错误体），
+	// 读体失败与解析失败分开报错，方便定位是网络抖动还是接口改版。
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cls news http: %v", err)

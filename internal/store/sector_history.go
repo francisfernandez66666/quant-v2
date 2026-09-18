@@ -125,6 +125,8 @@ func (d *DB) aggregateSectorDayFull(date string) ([]SectorDay, error) {
 		return nil, err
 	}
 
+	// 三份中间结果（行业涨幅聚合、涨停家数、领涨股）在这里拼成 SectorDay，
+	// 最后按行业名排序，保证同一天多次快照的输出顺序可比对。
 	out := make([]SectorDay, 0, len(aggs))
 	for _, a := range aggs {
 		out = append(out, SectorDay{

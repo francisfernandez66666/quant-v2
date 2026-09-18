@@ -109,6 +109,8 @@ func (c *StockCleaner) Clean(nameOrCode string) (string, string, error) {
 	code := normalizeCode(raw)
 	rePure := rePureCode.MatchString(code)
 
+	// 纯数字代码：先按裸代码查，再依次补 SH / SZ 前缀重试，
+	// 兼容清单里以带前缀形式登记的同一只股票；三档都落空才算无效代码。
 	if rePure {
 		if name, ok := c.codeToName[code]; ok {
 			return name, code, nil
@@ -124,6 +126,8 @@ func (c *StockCleaner) Clean(nameOrCode string) (string, string, error) {
 		return "", code, fmt.Errorf("代码 %s 未找到对应名称", code)
 	}
 
+	// 已带交易所前缀的代码：正查不到时再剥掉前两位按裸代码回查一次，
+	// 使用户手敲的 "sh600000"/"600000" 都能落到同一份清单。
 	if strings.HasPrefix(code, "SH") || strings.HasPrefix(code, "SZ") {
 		if name, ok := c.codeToName[code]; ok {
 			return name, code, nil

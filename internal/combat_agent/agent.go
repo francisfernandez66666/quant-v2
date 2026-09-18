@@ -1810,6 +1810,8 @@ func (a *Agent) evalShort(input *ScanInput, runners []StrategyRunner, code strin
 	held := input.HeldCodes[code]
 	sd := buildShortData(code, md, sector, input, sectorName, held, 0)
 
+	// 同一份短路数据依次过各个做空战法：过关的产出信号进 sigs，
+	// 未过关或评估报错只把原因记进 unSig 供决策解释，不影响其它战法继续评估。
 	var sigs []Signal
 	var unSig []string
 	for _, runner := range runners {

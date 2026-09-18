@@ -28,6 +28,8 @@ func TestComputeOrderFlow_WithPrev(t *testing.T) {
 	}
 }
 
+// TestTrigger 覆盖默认阈值下的三种盘口形态：持续买压触发买入、
+// 卖压叠加封单撤减触发卖出预警、温和波动两边都不触发（防噪声下单）。
 func TestTrigger(t *testing.T) {
 	buy := Trigger(OrderFlow{Imbalance: 0.6, ActiveBuyRatio: 0.8, BigNetInflow: 0.5}, TriggerDefaults)
 	if !buy.Buy {
@@ -50,6 +52,8 @@ func TestTrigger_ZeroCfgFallsBack(t *testing.T) {
 	}
 }
 
+// TestSmooth 校验滑窗均值：委比/量能为逐帧算术平均，空切片必须回零值，
+// 不能让差分噪声直接透传到触发判定里。
 func TestSmooth(t *testing.T) {
 	frames := []OrderFlow{
 		{Imbalance: 0.4, BigNetInflow: 0.2, ActiveBuyRatio: 0.6, TotalVol: 100},
@@ -68,6 +72,8 @@ func TestSmooth(t *testing.T) {
 	}
 }
 
+// TestFromBook 校验五档抽取的降级边界：只取买/卖各前 5 档、档位数量按实到长度截断，
+// 空盘口（nil）返回零值骨架而不是 panic，供上游继续差分。
 func TestFromBook(t *testing.T) {
 	ob := &OrderBook{
 		Bids: []OrderLevel{{Price: 10, Volume: 5}, {Price: 9.9, Volume: 4}},

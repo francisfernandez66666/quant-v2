@@ -346,6 +346,7 @@ export default function KLineChart({
       ctx.closePath()
       ctx.fill()
 
+      // 价格折线逐段描边：每段按下一点收盘相对昨收的涨跌单独取红/绿色，圆角连接避免折角毛刺
       ctx.lineWidth = 1.6
       ctx.lineJoin = 'round'
       for (let i = 0; i < n - 1; i++) {
@@ -449,6 +450,7 @@ export default function KLineChart({
     const volH = Math.round(innerH * 0.20)
     const macdH = innerH - priceH - volH
 
+    // 先扫一遍全量数据取最高/最低价，作为十字光标价格轴的原始上下界
     let mn = Infinity, mx = -Infinity
     for (const p of raw) { if (p.high > mx) mx = p.high; if (p.low < mn) mn = p.low }
     let lo, hi
@@ -468,6 +470,7 @@ export default function KLineChart({
     const cxOf = (i) => plotL + step * i + step / 2
     const priceY = (v) => plotT + (hi - v) / (hi - lo) * priceH
 
+    // 按横向像素距离就近命中最近的数据点：只比绝对距离，取出点后用于绘制十字光标与提示框
     let best = null, bestDist = Infinity
     for (let i = 0; i < raw.length; i++) {
       const cx = cxOf(i)

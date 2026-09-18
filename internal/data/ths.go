@@ -167,6 +167,8 @@ func (tc *THSClient) fetchDecoded(url string) (string, error) {
 		return "", fmt.Errorf("read body: %v", err)
 	}
 
+	// 同花顺老接口多按 GBK 回包：先校验是否已是合法 UTF-8，非法才走 GBK 解码；
+	// 解码失败时保留原始文本，宁可少解析几列也不要整页丢弃。
 	text := string(body)
 	if !utf8.Valid(body) {
 		decoded, _, err := transform.String(simplifiedchinese.GBK.NewDecoder(), text)
@@ -543,6 +545,8 @@ func parseTHSQuote(body []byte, code string) (*StockInfo, error) {
 		return nil, fmt.Errorf("ths json: %v", err)
 	}
 
+	// items 以证券 ID 为 key、值为字段数组：长度不足 10 项（列缺失）或代码空串的
+	// 脏条目先跳过，再进入下面的代码前缀清理与越界防御。
 	for _, arr := range raw.Data.Items {
 		if len(arr) < 10 {
 			continue

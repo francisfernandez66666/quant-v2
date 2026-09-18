@@ -233,6 +233,8 @@ func (e *Engine) benchChg() float64 {
 	}
 	e.benchChgMu.RUnlock()
 
+	// 缓存过期才真的取一次上证指数；行情拿不到就返回 0，
+	// 让相对强度退化成绝对评分而不是整轮打分失败。
 	si, err := e.marketAPI.GetIndexQuote("000001")
 	if err != nil || si == nil {
 		return 0
@@ -715,6 +717,7 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 		// 按 Score 符号决定事件归属的板块池：负分进利空池，否则进利好池（Pool selection by Score sign: negative → bear pool, else bull pool）
 		isBear := ev.Score < 0
 
+		// 一条事件可以命中多个板块：逐个板块并入上面按分数符号选好的利好/利空池。
 		for _, sec := range ev.Sectors {
 			if sec == "" {
 				continue
@@ -743,6 +746,7 @@ func (e *Engine) attribution(events []newsagent.NewsEvent) (bull, bear []SectorH
 		}
 	}
 
+	// 两池分别找 scanner 补齐板块行情（涨跌幅、龙头等），再把 map 拍平成切片供排序取用。
 	enrichSectorData(bullMap, e.scanner)
 	enrichSectorData(bearMap, e.scanner)
 	for _, s := range bullMap {

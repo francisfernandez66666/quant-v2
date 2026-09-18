@@ -49,6 +49,7 @@ export default function MarketStatusBar({ env }) {
   // 三段全缺失（盘前未算 / 各开关未开）→ 整条隐藏，不留空条占位
   if (!eStyle && !sStyle && !rStyle) return null
 
+  // 三段横向排布：风险档徽标 → 市场状态 → 情绪相位（缺项各自条件渲染，风险档存在时整条底色转警示）
   return (
     <div
       style={{

@@ -605,23 +605,25 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			// §R4-4 委托状态推进：回报的 部成/已成/已撤/部撤/废单 必须写入本地行——
 			// 旧实现 UpsertRealOrder 是 INSERT OR IGNORE（signal_id 冲突即忽略），状态回报被
 			// 静默吞掉、本地永远停留"已报"，撤单闭环/对账全部失真。现走单调守卫的
-			// AdvanceRealOrderStatus：秩高于本地才更新，乱序/重放/回退绝不覆盖真实进度。
-			// 本地无此单时（网侧重放等）回落原 INSERT OR IGNORE 行为补插。
-			advanced, err := db.AdvanceRealOrderStatus(uid, ev.SignalID, ev.Status)
+			// 秩比较：秩高于本地才更新，乱序/重放/回退绝不覆盖真实进度。
+			// §A4（20260918 全栈审计批）：旧实现"AdvanceRealOrderStatus 未命中 → 再 UpsertRealOrder
+			// 补插"是两步独立写，崩溃/并发插队会整体丢掉这条回报；现合并为单事务
+			// ApplyOrderReportTx（推进/补插/幂等 no-op 三选一，判定共享同一事务快照）。
+			// English: §A4 — advance-then-insert-if-absent folded into one atomic transaction call.
+			action, err := db.ApplyOrderReportTx(store.RealOrder{
+				OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
+				Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
+				CreatedAt: ev.At,
+				UserID:    uid, // §W2-10 委托行打归属账号
+			})
 			if err != nil {
-				log.Printf("[trading] advance order status: %v", err)
+				log.Printf("[trading] apply order report(signal=%s): %v", ev.SignalID, err)
 			}
-			if !advanced {
-				// 本地无此单（网侧重放/对端先于下单回报到达）：补插完整委托行。
-				if _, err := db.UpsertRealOrder(store.RealOrder{
-					OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
-					Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
-					CreatedAt: ev.At,
-					UserID:    uid, // §W2-10 委托行打归属账号
-				}); err != nil {
-					log.Printf("[trading] upsert order: %v", err)
+			switch action {
+			case store.OrderReportAdvanced:
+				if ev.Status == "已报" {
+					break
 				}
-			} else if ev.Status != "已报" {
 				// 状态有实际推进（非停留在"已报"）：打日志留痕；Reason 是柜台废单/拒单原因（尽力透传）。
 				log.Printf("[trading] 委托状态推进 %s: %s (order=%s%s)", ev.SignalID, ev.Status, ev.OrderID,
 					func() string {
@@ -639,6 +641,9 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 						}
 						return ""
 					}())
+			case store.OrderReportInserted:
+				// 本地无单（网侧重放/回报先于下单回填到达）：补插留痕，便于次日取证还原时间线
+				log.Printf("[trading] 委托回报本地无单，补插 %s %s status=%s order=%s", ev.SignalID, ev.Code, ev.Status, ev.OrderID)
 			}
 		}
 	case "trade":

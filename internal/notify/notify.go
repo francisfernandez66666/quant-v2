@@ -140,6 +140,8 @@ func (n *Notifier) Push(msg Message) {
 		}
 	}
 
+	// 每个 Webhook 各起一个 goroutine 异步发送：端点慢或挂了只影响自己，
+	// 失败的消息进 outbox 补投队列，由后台重试而不是阻塞本次推送。
 	for _, url := range n.webhookURLs {
 		go func(u string) {
 			if err := n.postWebhook(u, msg); err != nil {

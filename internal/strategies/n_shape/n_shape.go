@@ -185,6 +185,8 @@ func (n *NShapeStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		meta[k] = v
 	}
 
+	// 组装信号：动作与优先级已由上面的形态分档和一突提档逻辑定完，
+	// Reason 只带形态级别串，各维分数经 Meta 透传给前端与复盘。
 	return &strategy.Signal{
 		Action:     action,
 		Priority:   prio,

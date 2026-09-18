@@ -53,6 +53,8 @@ func (c *BaostockClient) call(method string, params map[string]string, strCols m
 	}
 	u.RawQuery = q.Encode()
 
+	// 向 sidecar 发 GET 取回 CSV 文本：连接失败与读体失败分开包装，
+	// 便于区分「Baostock 进程没起来」和「响应中途断开」两类故障。
 	resp, err := c.client.Get(u.String())
 	if err != nil {
 		return nil, fmt.Errorf("baostock %s: %v", method, err)

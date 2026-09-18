@@ -17,6 +17,8 @@ import (
 // alwaysPassStub 恒过闸的桩战法：验证 evalShort 的 sell/watch/字段装配逻辑。
 type alwaysPassStub struct{}
 
+// 接口方法全部给固定值：评估恒 80 分过关、信号恒为卖出，
+// 目的是把 evalShort 的接线（档位、分数、字段装配）单独钉住而不掺战法逻辑。
 func (alwaysPassStub) Name() string              { return "stub" }
 func (alwaysPassStub) Type() strategy.SignalType { return strategy.SignalHighChurn }
 func (alwaysPassStub) Evaluate(string, interface{}) (*strategy.Evaluation, error) {

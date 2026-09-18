@@ -322,6 +322,8 @@ func discoverPatternsWindowedRaw(db *store.DB, codes []string, start, end string
 	outN   int
 }, float64) {
 
+	// 参数兜底：调用方漏填时按默认口径补齐（持有 5 日、至少 20 次触发、平均超额 1%），
+	// 否则零值会让护栏形同虚设，把没有样本的参数组合也当成有效形态。
 	if opts.Horizon <= 0 {
 		opts.Horizon = 5
 	}
@@ -384,6 +386,8 @@ func discoverPatternsWindowedRaw(db *store.DB, codes []string, start, end string
 	log.Printf("[discover-patterns] 断点key=%s 窗口数=%d", rk, len(chunks))
 	prog := newStageProgress(5, 95, len(chunks))
 
+	// 逐窗口推进形态扫描：窗口结果先尝试从断点表复用，未命中才重新装配面板，
+	// 这样长时间跑批被中断后可以从上次完成的窗口续跑而不必全量重来。
 	for _, w := range chunks {
 		var wa patWinAgg
 		wck := winCkpt{db: db, resumeKey: rk, stage: "pattern"}

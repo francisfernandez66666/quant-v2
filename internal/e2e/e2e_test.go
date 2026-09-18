@@ -64,6 +64,8 @@ func applyScenarioOverrides(fix *Fixture) {
 			fix.Quotes["300308"] = strings.Join(parts, ",")
 		}
 	}
+	// 近 5 根日 K 改成阶梯上行（收盘价 84→95.21），配合上面的封板级涨幅，
+	// 让 Dragon 战法的回踩/溢价因子在快照数据上必然触发。
 	if kls, ok := fix.Klines["300308"]; ok && len(kls) >= 5 {
 		n := len(kls)
 		closes := []float64{84.00, 88.00, 92.00, 94.00, 95.21}
@@ -116,6 +118,8 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 
 	tmp := t.TempDir()
 
+	// 认证链路也走真实实现：在临时目录初始化用户库并注册 tester，
+	// 供后续 HTTP 级子测试登录拿 token（邀请码不校验，只为覆盖注册流程）。
 	authMgr := auth.NewManager(tmp)
 	if err := authMgr.Init(); err != nil {
 		t.Fatalf("auth init: %v", err)

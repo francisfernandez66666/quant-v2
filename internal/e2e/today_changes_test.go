@@ -218,6 +218,8 @@ func TestConsultMoneyFlow(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
+	// 资金流明细走今日快照：解析出超大单/大单/小单进出后，
+	// 按"主力 = 超大单净额 + 大单净额"复核，容差 100 元吸收浮点误差。
 	api := rigMarket(t, loadTodayFixture(t))
 	cf, err := api.GetStockMoneyFlow("600580")
 	if err != nil {

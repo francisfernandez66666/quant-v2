@@ -289,6 +289,8 @@ export default function Watchlist() {
         fixedHeader
         maxHeight="calc(100vh - 300px)"
 
+        // §F1 展开为受控模式：整行点击不展开（避免与移动端 onRowTap 打开底部面板冲突），
+        // 分时行的展开/收起只由「K线」列按钮与底部面板经 toggleKline 改 expandedKeys
         expandOnRowClick={false}
         expandedRowKeys={expandedKeys}
         onExpandChange={handleExpandChange}

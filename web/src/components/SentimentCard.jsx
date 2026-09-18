@@ -55,6 +55,7 @@ export default function SentimentCard() {
     }
   }
 
+  // 挂载时拉最近 30 日情绪序列；mounted 守卫防止请求回来时组件已卸载还 setState
   useEffect(() => {
     let mounted = true
     api.fetchEmotionHistory(30).then((r) => {

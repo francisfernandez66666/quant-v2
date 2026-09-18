@@ -128,6 +128,8 @@ class TestQueuedHTTP(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
+    # 测试用 HTTP 客户端：token 可覆写（默认 tk），返回 (状态码, 解析后的 JSON)；
+    # 4xx/5xx 走 HTTPError 分支同样以 (code, body) 返回，便于断言 401/403/503 拒绝码。
     def _req(self, method, path, body=None, token="tk"):
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None

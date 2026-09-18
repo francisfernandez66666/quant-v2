@@ -69,6 +69,8 @@ func ScanFile(path string, opts Options) []Gap {
 	var gaps []Gap
 	run, start, hasCtrl := 0, 0, false
 
+	// flush 收口当前累计的连续代码块：长度达阈值且含控制流才可能被判定为缺口，
+	// 再依次排除 import 块与"上方 Lookback 行内已有注释"两种情形。
 	flush := func() {
 		if run >= opts.Threshold && hasCtrl {
 			if opts.SkipImports && inImportBlock(lines, start) {

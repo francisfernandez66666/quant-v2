@@ -195,6 +195,10 @@ func main() {
 	// §启动顺序 3：先把服务端骨架建起来，随后逐步注入依赖（缓存目录/LLM 运行态/采集器/引擎注册表等）。
 	srv := server.New(authMgr, agg, cfgMgr, rpt, marketAPI, wlMgr, thsClient)
 	srv.SetCacheDir(dataDir) // 看板快照落盘，休市/重启后前端仍有最近一次有效数据
+	// §A7（20260918 审计批）：把构建期 git 指纹注入 HTTP 层，随 /api/status 的 build_commit
+	// 下发，供前端（尤其 APK 内嵌 assets）比对本地构建版本、过期即横幅告警。
+	// English: §A7 — pass the build-time git fingerprint to the server so /api/status reports it.
+	srv.SetBuildCommit(buildCommit)
 	// 计算"生效模型名"用于展示与运行态注入：LLM 配置未显式指定模型时回退包级默认模型。
 	effModel := llmCfg.Model
 	if effModel == "" {

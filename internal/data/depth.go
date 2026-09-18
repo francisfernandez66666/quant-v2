@@ -383,5 +383,3 @@ func (ob *OrderBook) Validate() error {
 	}
 	return nil
 }
-
-var _ = json.Marshal

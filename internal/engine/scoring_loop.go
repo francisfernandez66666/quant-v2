@@ -686,6 +686,12 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		BearReasons:  bearReasons, // FIX#13 利空归因接线：实盘持仓命中利空 → 止损级建议 → 自动清仓
 		Cfg:          ctrl.Config(),
 		DiscTracker:  dt, // 统一纪律裁决（探针+扳机）
+		// §PROD-T1（2026-09-18 生产实录）T+1 可卖量装配：可卖 = 持仓 − 当日买入成交
+		// （store.BuyableQtyForUserSell 既有账本口径，与下单闸 §WS-A 同源）。全锁持仓在
+		// Advise 内整体跳过卖出侧，杜绝"当日买入却提醒止盈/止损请手动处理"的误导提醒。
+		// English: §PROD-T1 — feed per-code sellable qty (held minus today's bought fills, same
+		// ledger math as the order gate) so T+1-locked positions get no sell-side advice.
+		SellableQty: sellableQtyByCode(realStore, sendTo, positions),
 	})
 
 	// §SHORT-2 做空战法卖出标记 → 实盘清仓级建议（Source=short_tactic，见 shortTacticCloseAdvices）。
@@ -947,6 +953,20 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 		sid := fmt.Sprintf("%s:r%d", base, qty)
 		_ = e.sellRealPosition(ctrl, p, qty, sid, a.RefPrice, class, a.Reason)
 	}
+}
+
+// sellableQtyByCode §PROD-T1（2026-09-18 生产实录）：为实盘持仓批量装配"今日可卖量"
+// （ts_code → 可卖 = 持仓 − 当日买入成交，走 store.BuyableQtyForUserSell 账本口径，
+// 与下单 T+1 硬闸 §WS-A 同源）。日期用北京时日历日（cntime 统一时区，防首尔时钟跨天错位）。
+// English: §PROD-T1 — builds per-position sellable qty (held minus today's bought fills) for the
+// T+1 advice gate, using the same ledger helper as the order guard; Beijing-time day boundary.
+func sellableQtyByCode(db *store.DB, userID string, positions []store.RealPosition) map[string]int {
+	day := cntime.In(time.Now()).Format("2006-01-02")
+	out := make(map[string]int, len(positions))
+	for _, p := range positions {
+		out[p.TsCode] = db.BuyableQtyForUserSell(userID, p.TsCode, day)
+	}
+	return out
 }
 
 // checkM8RealDrawdown §GAP1.2 M8 组合回撤兜底（risk.M8Check 口径接线到实盘）：

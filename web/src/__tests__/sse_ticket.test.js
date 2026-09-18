@@ -8,6 +8,8 @@ import * as api from '../api/index.js'
 describe('api - SSE 一次性票据（§WS-F C4a）', () => {
   let openedUrl = ''
 
+  // EventSource 替身：构造时把建链 URL 记到外层 openedUrl 供断言，
+  // 只保留 api 层真正会碰到的 onmessage/onerror 回调位与 close 计数桩，不做真实 SSE 连接。
   class FakeEventSource {
     constructor(url) {
       openedUrl = url

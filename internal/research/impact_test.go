@@ -56,6 +56,8 @@ func TestImpact_HalfLifeCalibration(t *testing.T) {
 	}
 }
 
+// TestImpact_ClampHalfLife 验证半衰期标定被夹在 [15,300] 分钟内：
+// 样本再少也不会给出低于 15 分钟的过短衰减，再长也不超过 300 分钟。
 func TestImpact_ClampHalfLife(t *testing.T) {
 	if c := clampHalfLife(5); c != 15*time.Minute {
 		t.Errorf("lower clamp, got %v", c)

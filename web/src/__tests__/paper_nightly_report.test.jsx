@@ -21,6 +21,9 @@ const REPORT = {
   }], count: 1,
 }
 
+// Paper 页首屏所需端点整体打桩：账户概览 fetchPaperState 给一份「模拟盘已开启」的完整 stats，
+// 持仓/成交/委托/净值等列表端点一律返回空数组，夜间报告 fetchPaperResearchReports 返回上面的 REPORT 夹具；
+// 第二个用例再用 mockResolvedValueOnce 换成空表，验证降级占位文案。
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
   fetchPaperState: vi.fn(async () => ({

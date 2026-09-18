@@ -119,6 +119,7 @@ func TestHandleQMTReportTradeFeeLeg(t *testing.T) {
 		`"traded_at":"2026-09-18T10:01:00+08:00","signal_id":"SF2"}`
 	s.handleQMTReport(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2)))
 
+	// 读回落库成交逐信号核对费用腿：SF1 必须透传 32.5/65，SF2（旧格式）落 0 而非 NULL。
 	fills, err := db.ListFillsByDay("", "2026-09-18")
 	if err != nil {
 		t.Fatalf("list fills: %v", err)
@@ -358,6 +359,8 @@ func TestQMTTradesUnknownBasisSellNotCountedAsWin(t *testing.T) {
 		t.Fatalf("seed fill: %v", err)
 	}
 
+	// 走 /api/qmt/trades 取汇总：成交簿里没有买入记录时，这笔退出属于「无成本基准」，
+	// 既不能凭空定价成盈亏，也不该计胜负，但仍要出现在流水里。
 	rr := httptest.NewRecorder()
 	s.handleQMTTrades(rr, httptest.NewRequest(http.MethodGet, "/api/qmt/trades", nil))
 	if rr.Code != http.StatusOK {
@@ -407,6 +410,8 @@ func TestQMTTradesPartialSellUsesPositionCost(t *testing.T) {
 		t.Fatalf("seed fill: %v", err)
 	}
 
+	// 同样打 /api/qmt/trades，但这里持仓还在账上（剩 60 股），
+	// 卖出的 40 股超出成交簿买量的部分要借用账本成本 1500 定价出 -4000 亏损。
 	rr := httptest.NewRecorder()
 	s.handleQMTTrades(rr, httptest.NewRequest(http.MethodGet, "/api/qmt/trades", nil))
 	if rr.Code != http.StatusOK {

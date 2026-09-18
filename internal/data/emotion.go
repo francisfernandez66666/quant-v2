@@ -19,6 +19,7 @@ func DetectEmotionPhase(snap *MarketSnapshot, cfg *config.EmotionConfig) string 
 		return "启动"
 	}
 
+	// 先全量遍历一次快照，统计涨停家数与炸板家数：这两项是六阶段判定的唯一输入。
 	limitUpCnt := 0
 	blastCnt := 0
 	for _, si := range snap.Stocks {

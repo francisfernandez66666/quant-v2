@@ -46,6 +46,8 @@ func cmdClusterFailures(db *store.DB, args []string) {
 		log.Fatalf("无优化结果可聚类（先运行 optimize/sweep 生成扫参结果）")
 	}
 
+	// 聚类结果一次性出：--json 走结构化输出给前端/脚本消费，附带簇定义元信息，
+	// 序列化失败视为致命（说明结果集里有不可编码值，不能静默出半份报告）。
 	stats, items := research.ClusterFailures(results)
 	if *asJSON {
 		b, err := json.MarshalIndent(map[string]any{

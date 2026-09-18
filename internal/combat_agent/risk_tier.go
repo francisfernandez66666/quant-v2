@@ -144,6 +144,8 @@ func SynthesizeRiskTier(emotionPhase, marketState string, upRatio float64, event
 		red = append(red, highImpactWindow+"×情绪转弱")
 	}
 
+	// 档位收敛：命中任一强条件即 Red，其次 Yellow，都没命中才无风险；
+	// 原因列表去重后透出，避免同一天多个事件重复刷同一句话。
 	if len(red) > 0 {
 		return RiskTierRed, dedupReasons(red)
 	}

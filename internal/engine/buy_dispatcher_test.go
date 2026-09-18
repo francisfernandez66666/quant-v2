@@ -30,6 +30,8 @@ func newAsyncEngine(t *testing.T) (*Engine, *store.DB, *httptest.Server, *[]map[
 		t.Fatalf("open store: %v", err)
 	}
 
+	// mock 柜台：/order 收到的每笔委托原样存进 orders 并固定回执 GW1，
+	// 用例据此断言实际下单条数与委托内容。
 	var mu sync.Mutex
 	var orders []map[string]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +52,8 @@ func newAsyncEngine(t *testing.T) (*Engine, *store.DB, *httptest.Server, *[]map[
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { db.Close() })
 
+	// 夹具统一装配：QMT 开成 auto 模式指向 mock 柜台、每单固定 1 万元，
+	// 让派发器用例只关心「信号有没有变成委托」。
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.Mode = "auto"

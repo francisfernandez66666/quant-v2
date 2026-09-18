@@ -46,6 +46,8 @@ func TestAuctionStrengthScore(t *testing.T) {
 	}
 }
 
+// TestSafediv 覆盖内部安全除法：分母为 0 时必须返回 0，
+// 避免竞价强度评分出现 NaN 后污染全市场排序。
 func TestSafediv(t *testing.T) {
 	if safediv(3, 0) != 0 {
 		t.Error("safediv by zero must be 0")

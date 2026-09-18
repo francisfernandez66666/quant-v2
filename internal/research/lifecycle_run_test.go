@@ -23,6 +23,8 @@ func writePaperJSON(t *testing.T, dir string, records []map[string]any) string {
 	return path
 }
 
+// sellRec 造一笔当日买、当日卖的成对成交记录（同池同代码），
+// 供降级链按「交易日 × 规则池」聚合成观测样本使用。
 func sellRec(pool, code string, buyPx, sellPx float64, day string) []map[string]any {
 	return []map[string]any{
 		{"code": code, "strategy_type": pool, "side": "buy", "price": buyPx, "qty": 100,
@@ -72,6 +74,8 @@ func TestPoolDailyStatsBuckets(t *testing.T) {
 	}
 }
 
+// TestDemoteAppliedRulesDisables 走完整降级链：连续衰退的 fac_7 被判定 disable 并落库禁用，
+// 健康的 fac_8 保持启用，完全没有观测的 fac_9 保守跳过（不误杀新规则）。
 func TestDemoteAppliedRulesDisables(t *testing.T) {
 	dir := t.TempDir()
 	var recs []map[string]any
@@ -97,6 +101,7 @@ func TestDemoteAppliedRulesDisables(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 正式执行（dryRun=false）：返回的 actions 按规则 ID 索引，便于逐条断言判定结果。
 	actions, err := DemoteAppliedRules(dir, "", DemoteOpts{}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -129,6 +134,8 @@ func TestDemoteAppliedRulesDisables(t *testing.T) {
 	}
 }
 
+// TestDemoteAppliedRulesDryRunKeepsEnabled 验证 dry-run 分支：
+// 判定结论照样产出（便于先看报表），但 applied_patterns.json 的 Enabled 不能被改动。
 func TestDemoteAppliedRulesDryRunKeepsEnabled(t *testing.T) {
 	dir := t.TempDir()
 	var recs []map[string]any

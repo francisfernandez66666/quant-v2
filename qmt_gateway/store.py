@@ -293,6 +293,9 @@ class Store:
                 self._conn.execute(
                     """INSERT INTO orders(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
                        VALUES(?,?,?,?,?,?,?,?,?)""",
+                    # 实参对齐列序 order_id,signal_id,code,side,status,price,qty,
+                    # created_at,user_id：拿不到真实委托号时先写 "pending:<sid>" 占位，
+                    # 后续事件按 order_id_rank 逐级升级（占位 → seq → 交易所号）
                     (
                         new_oid or ("pending:" + sid),
                         sid,
@@ -314,6 +317,8 @@ class Store:
             self._conn.execute(
                 """UPDATE orders SET order_id=?, status=?, price=?, qty=?, created_at=?, user_id=?
                    WHERE signal_id=?""",
+                # 实参对齐 SET 顺序：order_id=按等级挑定的最终号，status/price/created_at/
+                # user_id 缺省时回退存量值，qty 为 0 时保留存量（通道未报量≠清零）
                 (
                     final_oid,
                     order.get("status", row["status"]),
@@ -367,6 +372,8 @@ class Store:
         对应信号永不能再下单。此处删除「创建超过 max_age_sec 秒」的 pending 行，安全解锁。
         """
         import time as _time  # noqa: PLC0415
+        # 时间戳阈值（Unix 秒）：max_age_sec<=0 表示不限制，阈值取 0 → 一条都不删，
+        # 留给下面的 DELETE 语句统一判断，避免两个分支各写一遍清理逻辑
         threshold = (_time.time() - max_age_sec) if max_age_sec > 0 else 0
         with self._lock:
             cur = self._conn.execute(
@@ -451,6 +458,8 @@ class Store:
                         """INSERT INTO real_positions
                              (ts_code, name, qty, cost_price, amount, highest_price, updated_at, user_id)
                             VALUES(?,?,?,?,?,?,?,?)""",
+                        # 首笔建仓：成本价与最高价都用本笔成交价（没有历史价可比），
+                        # amount 取回报给的成交额，user_id 决定这笔挂在哪个租户下
                         (f["code"], f.get("name", ""), f.get("qty", 0), f.get("price", 0.0),
                          f.get("amount", 0.0), f.get("price", 0.0), f.get("traded_at", ""), uid),
                     )
@@ -463,6 +472,8 @@ class Store:
                         """UPDATE real_positions
                             SET qty=?, cost_price=?, amount=?, highest_price=?, updated_at=?, user_id=?
                             WHERE ts_code=?""",
+                        # 实参对齐 SET 子句：qty=加仓后总量，cost_price=按数量加权的
+                        # 新成本，amount 用最新成交额，highest_price 单调不回退
                         (new_qty, new_cost, new_qty * f["price"], highest, f.get("traded_at", ""), uid, f["code"]),
                     )
             else:
@@ -483,6 +494,8 @@ class Store:
             self._conn.execute(
                 """INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, trade_id, fee, stamp_tax)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                # 成交流水实参：side 用归一化后的 fill_side（"买入"/"卖出"，与量仔口径
+                # 一致而非通道原值），trade_id 缺失落空串（旧通道无此字段，不参与判重）
                 (f.get("order_id", ""), f["code"], fill_side, f["price"], f["qty"],
                  f.get("amount", 0.0), f.get("traded_at", ""), f.get("signal_id", ""), f.get("user_id", ""),
                  str(f.get("trade_id", "") or ""),
@@ -649,6 +662,8 @@ class Store:
                 """INSERT INTO dispatch(seq, signal_id, kind, code, side, price_type,
                                         price, qty, strategy, status, created_at, user_id)
                    VALUES(?,?,?,?,?,?,?,?,?, 'pending', ?, ?)""",
+                # 实参顺序与上面列名一一对应：seq 先落空串（拿到 rowid 后回填
+                # "seq:<id>"），status 固定 'pending' 由 SQL 常量给出，不进参数
                 ("", req.get("signal_id", ""), "order", req.get("code", ""),
                  req.get("side", ""), req.get("price_type", ""),
                  float(req.get("price", 0) or 0), int(req.get("qty", 0) or 0),

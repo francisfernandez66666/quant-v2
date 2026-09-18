@@ -80,6 +80,8 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 	weak := s.weaknessScore(sd)
 	total := pos + div + weak
 
+	// 门槛从配置取（rules.strategy.short.high_churn_min，缺省 60）：达标给 full_chain，
+	// 50~门槛只记 watch，高位换手派发要分数说话，避免仅凭单日高换手就提示做空。
 	thr := s.scoreThreshold()
 	level := "none"
 	pass := total >= thr

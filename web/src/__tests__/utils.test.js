@@ -1,9 +1,9 @@
 // ── 工具函数单元测试 utils.test.js ──
 // 覆盖 web/src/utils.js 中各格式化函数的边界与正常值：
-// fmtPct / fmtNum / fmtMoney / pnlClass / fmtTime / toStr / sseOpsAlert。
+// fmtPct / fmtNum / fmtMoney / pnlClass / fmtTime / toStr / sseOpsAlert / versionMismatchNotice。
 // 重点验证 null/undefined/NaN/0 等边界返回 '-' 与正确的百分比/千分位格式。
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { fmtPct, fmtNum, fmtMoney, fmtCNY2, pnlClass, fmtTime, toStr, sseOpsAlert } from '../utils.js'
+import { fmtPct, fmtNum, fmtMoney, fmtCNY2, pnlClass, fmtTime, toStr, sseOpsAlert, versionMismatchNotice } from '../utils.js'
 
 describe('fmtPct', () => {
   it('格式化正常小数（toFixed 精度）', () => {
@@ -145,5 +145,26 @@ describe('sseOpsAlert', () => {
     expect(sseOpsAlert({ type: 'scan' })).toBeNull()
     expect(sseOpsAlert(null)).toBeNull()
     expect(sseOpsAlert('x')).toBeNull()
+  })
+})
+
+// §A7（20260918 审计批）版本漂移告警判定：本地构建指纹 vs /api/status build_commit。
+// 一致/哨兵值（dev/unknown/空/缺字段）不告警；两侧真实且不等才出告警文案。
+describe('versionMismatchNotice', () => {
+  it('一致返回 null', () => {
+    expect(versionMismatchNotice('ab12cd3', 'ab12cd3')).toBeNull()
+  })
+  it('不一致返回含两侧指纹的告警文案', () => {
+    const n = versionMismatchNotice('ab12cd3', 'ff00ee9')
+    expect(n).toContain('ab12cd3')
+    expect(n).toContain('ff00ee9')
+    expect(n).toContain('build_apk.sh')
+  })
+  it('哨兵值不比对：dev/unknown/空/缺字段', () => {
+    expect(versionMismatchNotice('dev', 'ff00ee9')).toBeNull()
+    expect(versionMismatchNotice('ab12cd3', 'unknown')).toBeNull()
+    expect(versionMismatchNotice('ab12cd3', '')).toBeNull()
+    expect(versionMismatchNotice('ab12cd3', undefined)).toBeNull()
+    expect(versionMismatchNotice(null, null)).toBeNull()
   })
 })

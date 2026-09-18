@@ -14,6 +14,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"quant-trading-v2/internal/metrics"
 )
 
 // sseTicketTTL 一次性票据有效期（60s 足够 EventSource 完成建链；过短体验差，过长放大泄漏面）。
@@ -108,6 +110,14 @@ type SSEBroker struct {
 	clients map[string]map[chan SSEEvent]struct{} // 账号 -> 该账号下订阅客户端 channel 集合
 	history map[string][]SSEEvent                 // 账号 -> 最近事件环形缓冲（含 id，供断线补发）
 	seq     uint64                                // 全局事件自增序号
+	// §A3（AUDIT_FULLSTACK_20260918）慢客户端丢弃可见化与兜底断连：旧实现丢弃既无计数
+	// 也不迫使重连，连接存活的慢客户端会永久停在陈旧数据上。现记 per-client 连续丢弃数
+	// 与全局累计（进 quant_gauge_sse_dropped_total / sse_evictions_total）；连续丢弃达到
+	// sseDropEvictLimit（=channel 缓冲 16 全满未消费，客户端已实质失能）即主动回收连接，
+	// 迫使前端带 Last-Event-ID 重连走 history 补发路径。字段由 b.mu 保护。
+	drops      map[chan SSEEvent]int // ch -> 连续丢弃计数（写成功清零）
+	totalDrops int64                 // 进程生命周期累计丢弃事件数
+	evictions  int64                 // 因越阈被主动回收的连接数
 	// §F-6（20260917 缺陷修复批）real_advice 最后一轮定向广播快照（按账号）：
 	// GET /api/positions/advice 用它做 REST 回填——旧实现恒返空列表，断线超补发窗
 	// （history 200 条）或页面重载后卖出建议无从补齐，只能等下一次 5s 循环广播。
@@ -127,14 +137,28 @@ func NewSSEBroker() *SSEBroker {
 		clients: make(map[string]map[chan SSEEvent]struct{}),
 		history: make(map[string][]SSEEvent),
 		lastAdv: make(map[string]adviceSnapshot),
+		drops:   make(map[chan SSEEvent]int),
 	}
 }
 
-// pushToCh 向单个客户端 channel 非阻塞写入；channel 满则丢弃（慢客户端不阻塞发送方）。
-func (b *SSEBroker) pushToCh(ch chan SSEEvent, ev SSEEvent) {
+// sseDropEvictLimit 连续丢弃阈值（=SubscribeFor 的 channel 缓冲 16）：缓冲整体积满且仍
+// 追不上即判定客户端失能，主动断连换取带 Last-Event-ID 的重连补发（§A3）。
+const sseDropEvictLimit = 16
+
+// pushToCh 向单个客户端 channel 非阻塞写入；channel 满则丢弃（慢客户端不阻塞发送方）
+// 并记 §A3 连续丢弃计数；写成功清零计数。调用方持 b.mu。返回是否发生丢弃。
+func (b *SSEBroker) pushToCh(ch chan SSEEvent, ev SSEEvent) bool {
 	select {
 	case ch <- ev:
+		if b.drops[ch] > 0 {
+			b.drops[ch] = 0
+		}
+		return false
 	default:
+		b.totalDrops++
+		b.drops[ch]++
+		metrics.SetGauge("sse_dropped_total", b.totalDrops)
+		return true
 	}
 }
 
@@ -178,6 +202,9 @@ func (b *SSEBroker) SubscribeFor(userID string, lastID uint64) chan SSEEvent {
 				b.pushToCh(ch, ev)
 			}
 		}
+		// §A3：补发窗最多 200 条 > 缓冲 16，回放期溢满是常态而非客户端失能，
+		// 清掉回放产生的连丢计数，避免健康重连刚建立就被误回收。
+		b.drops[ch] = 0
 	}
 	b.mu.Unlock()
 	return ch
@@ -202,8 +229,54 @@ func (b *SSEBroker) UnsubscribeFor(userID string, ch chan SSEEvent) {
 			delete(b.clients, userID)
 		}
 	}
+	delete(b.drops, ch) // §A3 客户端注销即清失能计数
 	close(ch)
 	b.mu.Unlock()
+}
+
+// evictStalledLocked 在持 b.mu 的广播循环后调用：把连续丢弃越阈的客户端挑出来，
+// 返回 (userID, ch) 列表；真正的移除+close 由调用方在锁外经 UnsubscribeFor 完成
+// （FIX#5 语义：close 必须与广播在锁内互斥，UnsubscribeFor 自带锁，绝不可在持锁时调用）。
+func (b *SSEBroker) evictStalledLocked() []sseEvictTarget {
+	var out []sseEvictTarget
+	for userID, set := range b.clients {
+		for ch := range set {
+			if b.drops[ch] >= sseDropEvictLimit {
+				out = append(out, sseEvictTarget{userID: userID, ch: ch})
+			}
+		}
+	}
+	return out
+}
+
+// sseEvictTarget 一个待回收的失能客户端（账号分组 + channel）。
+type sseEvictTarget struct {
+	userID string
+	ch     chan SSEEvent
+}
+
+// evict 在锁外回收越阈连接：UnsubscribeFor 移除并 close → handleFixSSE 写循环收到
+// 关闭信号结束响应 → 前端 EventSource 自动重连并带 Last-Event-ID 走补发路径。
+func (b *SSEBroker) evict(targets []sseEvictTarget) {
+	if len(targets) == 0 {
+		return
+	}
+	for _, tg := range targets {
+		b.UnsubscribeFor(tg.userID, tg.ch)
+	}
+	b.mu.Lock()
+	b.evictions += int64(len(targets))
+	b.mu.Unlock()
+	metrics.SetGauge("sse_evictions_total", b.evictions)
+	log.Printf("[sse] §A3 回收 %d 个失能慢客户端连接（连续丢弃≥%d），等待 Last-Event-ID 重连补发",
+		len(targets), sseDropEvictLimit)
+}
+
+// SSEDropStats 返回累计丢弃数与累计回收连接数（测试与运维探针读取）。
+func (b *SSEBroker) SSEDropStats() (drops, evictions int64) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.totalDrops, b.evictions
 }
 
 // Broadcast 向所有账号的所有 SSE 客户端广播消息（全局事件，如 scan/score/trigger 状态事件）。
@@ -222,7 +295,9 @@ func (b *SSEBroker) Broadcast(v interface{}) {
 			b.pushToCh(ch, ev)
 		}
 	}
+	targets := b.evictStalledLocked() // §A3 挑出连续丢弃越阈者，锁外回收
 	b.mu.Unlock()
+	b.evict(targets)
 }
 
 // BroadcastTo 向指定账号的所有 SSE 客户端定向推送消息（账号隔离，如止盈/止损/清仓等关键消息）。
@@ -242,7 +317,9 @@ func (b *SSEBroker) BroadcastTo(userID string, v interface{}) {
 	for ch := range b.clients[userID] {
 		b.pushToCh(ch, ev)
 	}
+	targets := b.evictStalledLocked() // §A3 同 Broadcast：定向推送路径同样回收失能连接
 	b.mu.Unlock()
+	b.evict(targets)
 	// §F-6：real_advice 事件额外留存一份最新快照（供 REST 回填；不影响广播主路径）。
 	if m, ok := v.(map[string]interface{}); ok && m["type"] == "real_advice" {
 		b.advMu.Lock()

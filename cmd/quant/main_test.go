@@ -280,6 +280,8 @@ func TestLaodengScore(t *testing.T) {
 		{"小市值科技股(低分)", 50, 40, 0.5, "半导体", 0.0, 0.08},
 	}
 
+	// 三个代表性档位各跑一遍子测试：高市值低 PE 高换手应落在 0.10~0.20，
+	// 科技高估与小微盘低分依次下移，防止评分区间被单一用例掩盖。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := strategy.ScoreLaodeng(cfg, tt.cap, tt.pe, tt.turnover, tt.sector)
@@ -376,6 +378,8 @@ func TestFullPipeline(t *testing.T) {
 	}
 
 	// Step 3: CombatAgent ScanLong
+	// 只喂板块验证结果与 L1 评分/拦截名单：全链路冒烟不依赖真实行情，
+	// 因此这里断言的是"信号能否在给定板块下产出"，而非具体标的的选股质量。
 	bullInput := combat_agent.ScanInput{
 		Sectors:   verifiedBull,
 		L1Score:   sr.L1Score,
@@ -396,6 +400,8 @@ func TestFullPipeline(t *testing.T) {
 	}
 
 	// Step 5: Display
+	// 看板是前端唯一读取口：这里把上游各层结果整体灌一次，只为确认 Update
+	// 不 panic 且能立刻 Current() 出快照（各字段计数打日志供人工回看）。
 	agg.Update(sr, verifiedBull, verifiedBear, bullSignals, nil, alerts, nil, rpt)
 	dash := agg.Current()
 	if dash == nil {
@@ -507,6 +513,8 @@ func TestAPIEndpoints(t *testing.T) {
 		}
 	})
 
+	// 做空开关状态：接口须返回 200 且 JSON 能解成 map（short_enabled 只是记录，
+	// 默认关闭与否由配置决定，这里只保证读路径不被鉴权或路由挡掉）。
 	t.Run("ShortStatus", func(t *testing.T) {
 		w := runRequest("GET", "/api/short/status", "")
 		if w.Code != 200 {
@@ -524,6 +532,8 @@ func TestAPIEndpoints(t *testing.T) {
 		}
 	})
 
+	// 策略配置读取：设置页依赖这份 JSON，要求 200 且能解出键集合（只打日志不校验取值，
+	// 取值合法性由 config 包的用例负责）。
 	t.Run("StrategyConfig", func(t *testing.T) {
 		w := runRequest("GET", "/api/config/strategy", "")
 		if w.Code != 200 {
@@ -542,6 +552,8 @@ func TestAPIEndpoints(t *testing.T) {
 		}
 	})
 
+	// 持仓列表：上一步刚建仓，此处只要求 200 并截断打印响应体，
+	// 用于确认序列化链路（含空/非空持仓）不会 panic。
 	t.Run("ListPositions", func(t *testing.T) {
 		w := runRequest("GET", "/api/positions", "")
 		if w.Code != 200 {

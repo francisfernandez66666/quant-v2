@@ -19,6 +19,9 @@ type brokerStub struct {
 	switched   string
 }
 
+// ServeHTTP 只搭最小路由：/health 原样吐出预置 JSON（用例据此构造任意通道状态），
+// /admin/broker 记下请求里的 broker 并回固定 ok，其余路径回 404 与真实网关保持一致，
+// 这样客户端的路由写错时会拿到非 JSON 响应并被断言抓出。
 func (s *brokerStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/health":
@@ -40,6 +43,8 @@ func (s *brokerStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// TestQMTClientBrokerStatus 双通道状态解析：网关报"当前走 queued、queued 在线、xt 未连"时，
+// BrokerStatus 必须原样还原这三个字段，调用方据此判断当前走哪条通道、另一条是否可切换。
 func TestQMTClientBrokerStatus(t *testing.T) {
 	stub := &brokerStub{
 		t: t,

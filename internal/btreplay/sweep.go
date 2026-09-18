@@ -893,6 +893,8 @@ func objectiveValue(obj string, r *sweepResult) float64 {
 	case "calmar":
 		return r.Calmar
 	default: // profitfactor
+		// 零亏损组合的 PF 字段留 0，直接排名会被踩到底，故显式给封顶值 99；
+		// 其余同样以 99 截断，避免样本极少时 PF 发散支配排序。
 		if r.Loss == 0 && r.Win > 0 {
 			return 99
 		}

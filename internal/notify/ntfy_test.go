@@ -82,6 +82,8 @@ func (c *countGateway) Send(msg Message) error {
 	return nil
 }
 
+// waitCount 轮询等待网关累计收到 want 条消息，1 秒仍未达标即判失败：
+// 网关投递是异步的，用例不能取完就断言长度。
 func (c *countGateway) waitCount(t *testing.T, want int) {
 	t.Helper()
 	deadline := time.After(time.Second)

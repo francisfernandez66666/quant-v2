@@ -170,6 +170,8 @@ func (s *Server) prepareLLMCandidate(uid string, req setLLMConfigReq) (llmSnapsh
 	// §别名警告：GetLLMConfigFor 返回内部结构指针，必须立刻取值拷贝（见其注释）。
 	prev := *s.cfg.GetLLMConfigFor(uid)
 
+	// 地址与模型「留空即保持原值」：这里先合并，再交给下面的 SSRF 校验，
+	// 避免咨询页只提交密钥时把已存的供应商地址冲成空串。
 	apiURL := strings.TrimSpace(req.APIURL)
 	if apiURL == "" {
 		apiURL = prev.APIURL
@@ -215,6 +217,7 @@ func (s *Server) prepareLLMCandidate(uid string, req setLLMConfigReq) (llmSnapsh
 		classifierModel = prev.ClassifierModel
 	}
 
+	// 合并完成的候选快照：status/code 均为零值表示校验通过，由调用方决定落库并热重建 LLM 客户端。
 	return llmSnapshot{
 		Keys:             keys,
 		APIURL:           apiURL,

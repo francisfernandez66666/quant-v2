@@ -50,6 +50,8 @@ func (sinaStubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // execCountStub 下单执行器测试桩：永远受理并自增计数（断言实际触达柜台的下单次数）。
 type execCountStub struct{ calls int }
 
+// 买/卖两条路径共用「自增计数 + 直接受理」的实现，用例只看 calls 是否变化，
+// 以此判定 /api/action 有没有真的把单子推到柜台。
 func (e *execCountStub) PlaceBuy(req trading.OrderRequest) (*trading.OrderResult, error) {
 	e.calls++
 	return &trading.OrderResult{OK: true, OrderID: fmt.Sprintf("GW-%d", e.calls)}, nil

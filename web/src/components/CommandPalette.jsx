@@ -67,6 +67,8 @@ export default function CommandPalette({ pages = [], onOpenStock, onClose }) {
     else if (e.key === 'Enter') { e.preventDefault(); const r = results[active]; if (r) r.item.run() }
   }
 
+  // 渲染骨架：全屏遮罩（点击即关）→ 居中面板 → 搜索输入框 + 结果列表（见下方 JSX）
+  // 输入框常驻 autofocus，↑/↓ 高亮、Enter 执行由 onKeyDown 接管；无匹配时列表区渲染占位文案。
   return (
     <div className="cmdk-mask" data-testid="cmdk-mask" onClick={onClose}
       style={{ position: 'fixed', inset: 0, zIndex: 1200, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', paddingTop: '12vh' }}>

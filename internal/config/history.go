@@ -148,6 +148,8 @@ func diffJSON(path string, b, a any, lines *[]string) {
 		bt, bok := b.(map[string]any)
 		if !bok {
 			*lines = append(*lines, fmt.Sprintf("%s: %v -> %v", prefix(path), b, a))
+			// 一侧根本不是对象（整节点被换成标量或数组）：记一条「旧值→新值」就收工，
+			// 不再按键集合递归，否则会拿 nil 去比、产出满屏无意义的差异行。
 			return
 		}
 		keys := map[string]bool{}

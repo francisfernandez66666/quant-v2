@@ -107,6 +107,8 @@ func normalizeTSCode(code string) string {
 		return code
 	}
 	if len(code) >= 8 && (code[0:2] == "sh" || code[0:2] == "sz" || code[0:2] == "bj") && code[2] == '.' {
+		// 数据源常见的 sh./sz./bj. 前缀写法（baostock 风格）统一换成"6 位代码 + 交易所后缀"，
+		// 否则同一只票会在缓存键上分裂成两种形态。
 		// sh.600000 → 600000.SH
 		suffix := strings.ToUpper(code[0:2])
 		if suffix == "BJ" {

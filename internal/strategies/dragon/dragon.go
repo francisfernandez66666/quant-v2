@@ -207,6 +207,8 @@ func (d *DragonStrategy) EvaluateReal(code string, si *data.StockInfo, kLines []
 		level = "brief"
 	}
 
+	// 回传评分结果：四因子（封单/共振/溢价/相对强度）各自留分在 Details，
+	// 便于前端拆条展示，也便于复盘时定位是哪一维把龙头判定抬过门槛。
 	return &strategy.Evaluation{
 		TotalScore: total,
 		Details: map[string]float64{
@@ -256,6 +258,8 @@ func (d *DragonStrategy) GenerateSignal(code string, eval *strategy.Evaluation) 
 		meta[k] = v
 	}
 
+	// 组装信号：Reason 用级别串（full_chain/brief/watch）而不是自由文本，
+	// 下游风控与前端按串匹配即可稳定判断这条龙头信号的确信档位。
 	return &strategy.Signal{
 		Type:       strategy.SignalDragon,
 		Action:     action,

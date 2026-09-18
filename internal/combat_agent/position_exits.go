@@ -150,12 +150,24 @@ func buildExitContext(pos report.ExecLog, price float64, dayK []data.KLine, now 
 		meta[k] = v
 	}
 	meta["highest_price"] = stageHigh
+	// §PROD-T1（2026-09-18 生产实录）：EntryAt 零值必须传空串而不是 Format 出 "0001-01-01"——
+	// 实盘持仓建议视图（trading.execLogsFromReal）早期不携带开仓日，零值日期让全部超期判定
+	// （today ≥ entry+maxHoldDays 交易日）恒成立，当日买入的仓位开盘即被误判"持仓超期离场"
+	// 推送止盈提醒（津富士达 603468 实录：+0.66% 当日触发）。空串=开仓日未知，
+	// 各 exit 引擎的超期分支（`if ctx.EntryAt != ""`）自然跳过，宁可不提醒也不误提醒。
+	// English: §PROD-T1 — a zero entry time must map to "" instead of formatting "0001-01-01",
+	// which made every hold-timeout check vacuously true and fired false "overdue exit" alerts
+	// on same-day buys. Unknown entry date now skips the timeout branch (never warn, not warn wrongly).
+	entryAt := ""
+	if !pos.EntryAt.IsZero() {
+		entryAt = pos.EntryAt.Format("2006-01-02")
+	}
 	return &strategy.ExitContext{
 		Code:      pos.Code,
 		Name:      pos.Name,
 		CostPrice: pos.EntryPrice,
 		CurPrice:  price,
-		EntryAt:   pos.EntryAt.Format("2006-01-02"),
+		EntryAt:   entryAt,
 		EntryMeta: meta,
 		DailyK:    toStrategyKLine(dayK),
 		Now:       now,
@@ -338,6 +350,8 @@ func (a *Agent) CheckPositionsExits(rpt *report.Report, quotes map[string]*data.
 			continue
 		}
 
+		// 出场判定按持仓所属战法分派：四个内置战法各用独立配置，
+		// 因子/形态等其余战法走 default 的追踪止损兜底。
 		var res *strategy.ExitResult
 		switch classifyExitStrategy(pos.Strategy) {
 		case exitStrategyDragon:

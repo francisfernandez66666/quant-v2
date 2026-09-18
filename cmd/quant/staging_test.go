@@ -11,6 +11,8 @@ import (
 	"testing"
 )
 
+// setenv 在用例内临时改写环境变量：先记录原值与是否存在，再用 t.Cleanup 精确还原，
+// 因为 staging 判定读的是进程级 QUANT_ENV/QUANT_DATA_DIR，不还原会污染后续用例。
 func setenv(t *testing.T, k, v string) {
 	t.Helper()
 	old, had := os.LookupEnv(k)

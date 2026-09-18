@@ -14,6 +14,8 @@ import (
 	"quant-trading-v2/internal/trading"
 )
 
+// 回归钉：共享引擎（userID 为空）在管理员改过 QMT 配置后必须把新配置排进待生效队列，
+// 而不是像旧实现那样整体跳过、等到重启才生效。
 func TestSharedEngineQueuesQMTConfig(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "wmq1.db"))
 	if err != nil {

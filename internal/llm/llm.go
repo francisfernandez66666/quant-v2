@@ -131,6 +131,8 @@ func normalizeAPIURL(raw string) string {
 	schemeHost := s[:start+slash] // scheme://host
 	pathPart := s[start+slash:]   // /path[?query][#frag]
 	tail := ""                    // ?query / #frag
+	// 只对 path 段做 endpoint 规范化，?query / #frag 先摘出来最后原样拼回，
+	// 否则会拼出 /chat/completions?key=... 之类丢参数的地址。
 	path := pathPart
 	if i := strings.IndexAny(pathPart, "?#"); i >= 0 {
 		path, tail = pathPart[:i], pathPart[i:]
@@ -366,6 +368,11 @@ type Message struct {
 	Role string `json:"role"`
 	// 消息内容
 	Content string `json:"content"`
+	// §PROD-LLM2（2026-09-18 生产实录）响应侧思维链字段：部分推理模型/网关（非流式）把正文只写进
+	// reasoning_content 而 content 为空。请求体里恒为空串，omitempty 保证不出现在出站 JSON。
+	// English: §PROD-LLM2 — response-side chain-of-thought field; some reasoning models/gateways put the
+	// answer only in reasoning_content with empty content. omitempty keeps it out of request bodies.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ChatRequest 聊天补全请求体。
@@ -384,6 +391,9 @@ type ChatResponse struct {
 	Choices []struct {
 		// 回复消息
 		Message Message `json:"message"`
+		// §PROD-LLM2 结束原因（stop/length/content_filter…）——空响应诊断证据字段
+		// English: §PROD-LLM2 — finish reason, carried in the empty-response diagnostic error.
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	// §GAP5.1 token 用量（成本治理）
 	Usage llmUsage `json:"usage"`
@@ -583,7 +593,9 @@ type chatCompletionRequest struct {
 }
 
 // streamChat 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
-// 只累加 delta.content（忽略 reasoning_content 思维链），遇 [DONE] 结束；
+// 累加 delta.content；§PROD-LLM2（2026-09-18 生产实录「no response from LLM」）起 content 全空但
+// reasoning_content 非空时以思维链正文兜底（部分推理模型/网关只填 reasoning 字段），并打日志留痕；
+// 两者皆空时报错携带诊断证据（分片数/finish_reason/usage/原始行摘录），遇 [DONE] 结束。
 // §S5 根修：扫描在独立 goroutine 进行，外层 select 持空闲 ticker——
 // 此前空闲检查只在读到新行时执行，服务端真卡死时 Scan() 永久阻塞、idleTimeout 永不触发
 // （仅剩 http.Client 总超时兜底）；现在无论是否阻塞，空闲阈值到点即关连接返回错误。
@@ -608,10 +620,21 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 		sc.Split(bufio.ScanLines)
 
 		var sb strings.Builder
+		var reasoning strings.Builder
 		var lastUsage *llmUsage
+		var finishReason string
+		var chunkCount int
+		var rawSample strings.Builder // §PROD-LLM2 摘录响应开头若干行（含非 data 行，覆盖"200 但返回非 SSE"）
 		// 逐行解析 SSE 分片：非 data: 前缀跳过，[DONE] 结束，chunk 携带 usage 则记录。
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			if rawSample.Len() < 320 {
+				rawSample.WriteString(line)
+				rawSample.WriteString(" | ")
+			}
 			if !strings.HasPrefix(line, "data:") {
 				continue
 			}
@@ -623,6 +646,7 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				continue
 			}
+			chunkCount++
 			if chunk.Usage != nil {
 				lastUsage = chunk.Usage
 			}
@@ -630,6 +654,10 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 				continue
 			}
 			sb.WriteString(chunk.Choices[0].Delta.Content)
+			reasoning.WriteString(chunk.Choices[0].Delta.ReasoningContent)
+			if fr := chunk.Choices[0].FinishReason; fr != "" {
+				finishReason = fr
+			}
 		}
 		if serr := sc.Err(); serr != nil {
 			out <- streamOut{err: fmt.Errorf("流式读取失败: %w", serr)}
@@ -637,7 +665,13 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 		}
 		content := sb.String()
 		if strings.TrimSpace(content) == "" {
-			out <- streamOut{err: fmt.Errorf("no response from LLM")}
+			if r := strings.TrimSpace(reasoning.String()); r != "" {
+				log.Printf("LLM 流式 content 全空，改用 reasoning_content 兜底(len=%d, finish_reason=%s)", len(r), finishReason)
+				out <- streamOut{content: r, usage: lastUsage}
+				return
+			}
+			out <- streamOut{err: fmt.Errorf("no response from LLM (流式: data分片=%d, finish_reason=%q, reasoning字数=%d, usage=%s, 响应摘录=%.400s)",
+				chunkCount, finishReason, len([]rune(reasoning.String())), usageText(lastUsage), rawSample.String())}
 			return
 		}
 		out <- streamOut{content: content, usage: lastUsage}
@@ -703,10 +737,24 @@ type chatCompletionChunk struct {
 		Delta struct {
 			// 消息内容
 			Content string `json:"content"`
+			// §PROD-LLM2 思维链增量（content 全空时作为正文兜底，见 streamChat）
+			// English: §PROD-LLM2 — chain-of-thought delta, used as fallback text when content is empty.
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
+		// §PROD-LLM2 末分片结束原因，空响应诊断证据
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	// §GAP5.1 末分片常携带用量元数据
 	Usage *llmUsage `json:"usage"`
+}
+
+// usageText §PROD-LLM2 空响应诊断证据的 usage 摘要（nil 显示 none）。
+// English: §PROD-LLM2 — usage summary for the empty-response diagnostic error.
+func usageText(u *llmUsage) string {
+	if u == nil {
+		return "none"
+	}
+	return fmt.Sprintf("prompt=%d/completion=%d/total=%d", u.PromptTokens, u.CompletionTokens, u.TotalTokens)
 }
 
 // nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用）。
@@ -736,19 +784,36 @@ func (c *Client) nonStreamChatMax(req ChatRequest, maxTokens int) (string, error
 	}
 	var chatResp ChatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return "", fmt.Errorf("非流式响应解析失败: %v", err)
+		return "", fmt.Errorf("非流式响应解析失败: %v（响应摘录: %.400s）", err, strings.TrimSpace(string(respBody)))
 	}
+	// §PROD-LLM2（2026-09-18 生产实录）：旧实现在此抛裸 "no response from LLM"，零诊断信息。
+	// 现在错误携带 finish_reason/usage/原始响应摘录；choices 存在但 content 为空时先看
+	// message.reasoning_content（部分推理网关正文只落在该字段），仍空才报错。
+	// English: §PROD-LLM2 — the old code threw a bare "no response from LLM"; errors now carry
+	// finish_reason/usage/raw excerpt, and empty content falls back to message.reasoning_content.
 	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("no response from LLM")
+		return "", fmt.Errorf("no response from LLM (非流式: choices=0, usage=%s, 响应摘录: %.400s)",
+			usageText(&chatResp.Usage), strings.TrimSpace(string(respBody)))
+	}
+	msg := chatResp.Choices[0].Message
+	content := strings.TrimSpace(msg.Content)
+	if content == "" {
+		if r := strings.TrimSpace(msg.ReasoningContent); r != "" {
+			log.Printf("LLM 非流式 content 全空，改用 reasoning_content 兜底(len=%d, finish_reason=%s)", len(r), chatResp.Choices[0].FinishReason)
+			content = r
+		} else {
+			return "", fmt.Errorf("no response from LLM (非流式: choices=%d, finish_reason=%q, content为空, usage=%s, 响应摘录: %.400s)",
+				len(chatResp.Choices), chatResp.Choices[0].FinishReason, usageText(&chatResp.Usage), strings.TrimSpace(string(respBody)))
+		}
 	}
 	// §GAP5.1 用量入账（非流式响应自带 usage；缺失按内容粗估）
 	if chatResp.Usage.PromptTokens > 0 || chatResp.Usage.CompletionTokens > 0 {
 		c.recordUsage(chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 	} else {
-		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(chatResp.Choices[0].Message.Content))
+		c.recordUsage(estimateTokens(reqMessagesText(req)), estimateTokens(content))
 	}
 	// D1/Stage0 走本非流式通道：同样剥思考型模型的 <think> 正文（§生产 20260916）
-	return stripThinkTags(chatResp.Choices[0].Message.Content), nil
+	return stripThinkTags(content), nil
 }
 
 // post 构造并发送 chat/completions 请求，返回可读响应体。非 2xx 状态码读响应体构造错误。
@@ -1063,6 +1128,8 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, []int, erro
 		return result, nil, nil
 	}
 
+	// 并发度兜底：客户端没显式设置时回落到默认值，信号量按它限流，
+	// 避免一次热门题材批量分析把上游连接数瞬间打满。
 	concurrency := c.batchConcurrency
 	if concurrency < 1 {
 		concurrency = DefaultBatchConcurrency
@@ -1072,6 +1139,8 @@ func (c *Client) AnalyzeHotTopicBatch(titles []string) ([]*HotTopic, []int, erro
 	var failedMu sync.Mutex
 	var failedIdx []int
 
+	// 逐子批派发协程：先抢信号量再起 goroutine，子批失败只登记自己那段索引，
+	// 主干结果继续合并，不因为几个坏子批整批作废。
 	for _, b := range batchBounds(len(titles), llmBatchSize) {
 		start, end := b[0], b[1]
 		wg.Add(1)

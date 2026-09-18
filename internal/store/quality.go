@@ -136,6 +136,8 @@ func (d *DB) ScreenedCodes(s StockScreen) ([]string, error) {
 		rows.Close()
 	}
 
+	// 股票池主查询：前面命中的条件按顺序拼成 WHERE，参数与占位符一一对应，
+	// 排除退市股时把区间末作为「上市截止日期」传进去。
 	sql := `SELECT s.ts_code FROM stocks s`
 	if len(conds) > 0 {
 		sql += ` WHERE ` + strings.Join(conds, " AND ")

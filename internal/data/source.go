@@ -576,6 +576,8 @@ func (dc *DataCoordinator) GetHotNews(pageSize int) []NewsItem {
 	seen := make(map[string]bool)
 	var all []NewsItem
 
+	// 主源（同花顺快讯）先入列：拉取失败或空结果静默跳过，交给下面的新浪兜底。
+	// 去重键取标题前 60 字：只在 60 字之后才不同的长标题视作同一条，避免重复喂给下游。
 	if items, err := dc.eastMoney.GetTonghuashunNews(pageSize); err == nil && len(items) > 0 {
 		for _, n := range items {
 			key := truncateStr(n.Title, 60)
@@ -586,6 +588,8 @@ func (dc *DataCoordinator) GetHotNews(pageSize int) []NewsItem {
 		}
 	}
 
+	// 兜底源（新浪财经）：与主源共用 seen，撞题时保留主源那条，
+	// 主源整轮失败时这里仍能凑出可用新闻，不至于让新闻链路空转。
 	if items, err := dc.eastMoney.GetSinaNews(pageSize); err == nil && len(items) > 0 {
 		for _, n := range items {
 			key := truncateStr(n.Title, 60)

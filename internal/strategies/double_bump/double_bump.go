@@ -263,6 +263,8 @@ func (d *DoubleBumpStrategy) EvaluateReal(code string, si *data.StockInfo, kLine
 		level = "brief"
 	}
 
+	// 回传评分结果：三个因子分与回调深度原始值放 Details，
+	// Confidence 直接用总分折算，供下游 GenerateSignal 判优先级。
 	return &strategy.Evaluation{
 		TotalScore: total,
 		Details: map[string]float64{
@@ -318,6 +320,8 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 	prio := strategy.P3
 	action := strategy.ActionWatch
 
+	// 级别到动作的映射：只有 full_chain 才转买入，置信度 >0.8 抬到 P1、否则 P2；
+	// brief 保持观察但优先级抬到 P3_5；watch/未知级别沿用上面的默认 P3，不产生下单意图。
 	switch eval.Level {
 	case "full_chain":
 		action = strategy.ActionBuy
@@ -337,6 +341,8 @@ func (d *DoubleBumpStrategy) GenerateSignal(code string, eval *strategy.Evaluati
 		meta[k] = v
 	}
 
+	// 组装信号：Reason 直接落级别串（前端据此显示形态处于哪一档），
+	// Meta 带上评分明细，复盘时不必回读评分日志即可复原各因子贡献。
 	return &strategy.Signal{
 		Type:       strategy.SignalDoubleBump,
 		Action:     action,

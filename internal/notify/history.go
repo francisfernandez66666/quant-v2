@@ -113,6 +113,8 @@ func (h *History) Summary() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// 只统计当天记录（历史条目不进日报），分别累计强度档位与买/卖动作；
+	// 总信号数按 strong+observe 计，不让同一记录被买卖维度重复计入。
 	today := time.Now().Format("2006-01-02")
 	var strong, observe, buy, sell int
 	for _, r := range h.records {

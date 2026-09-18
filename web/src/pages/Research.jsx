@@ -153,7 +153,12 @@ export default function Research() {
           if (f && f.id) factorMeta.current[f.id] = f
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      // §A6（20260918 审计批）：拉取失败不再整体静默——因子名回退显示原始 id，
+      // 同时留 console 痕迹，避免"元数据接口挂了但页面看不出异常"的隐性降级。
+      // English: §A6 — surface the fetch failure instead of silently degrading.
+      if (typeof console !== 'undefined') console.warn('[research] 因子元数据拉取失败，因子名回退原始 id:', e && e.message)
+    }
   }
   function factorName(id) {
   // 将因子 id 转换为中文可读名称
@@ -1128,18 +1133,28 @@ export default function Research() {
   }, [optCurHeat])
 
   // ===== 生命周期 =====
-  // 启动研究进度定时轮询（每 30000ms = 30 秒刷新一次处理进度）
+  // 启动研究进度定时轮询
+  // §A6（20260918 审计批）频率 30s→60s 收敛：研究任务/回测由 researchd 独立进程执行
+  // （cmd/researchd），API 进程内无该生命周期事件可广播（复核证实：全仓 SSE 广播 type 词表
+  // 仅 scan/message/score/qmt_*/real_*/trigger/settlement_diff/positions_clear_guard，
+  // 无 backtest/research 事件），跨进程感知只有轮询一条路——旧「接 useSseRefresh」方案不成立，
+  // 改为对齐 §F5 页面统一的 60s 兜底档；任务态自查轮询（libPollTimer/backtestPollers）
+  // 仅在忙时存在且自停，维持原设计。
+  // English: §A6 — researchd is a separate process with no SSE channel into the API server,
+  // so page-level polling stays, converged from 30s to the app-wide 60s fallback cadence.
   function startPolling() {
     if (pollTimer.current) return
-    // 每 30 秒同时刷新「研究进度」与「回测任务列表」：回测任务列表此前未纳入轮询，
+    // 每 60 秒同时刷新「研究进度」与「回测任务列表」：回测任务列表此前未纳入轮询，
     // 导致任务排队 → 运行 → 完成的状态变化在前端不刷新（长时间停在「排队中」）。
-    pollTimer.current = setInterval(() => { loadProgress(); loadBacktests() }, 30000)
+    pollTimer.current = setInterval(() => { loadProgress(); loadBacktests() }, 60000)
   }
   function stopPolling() {
   // 停止全部研究轮询定时器（组件卸载时清理）
     if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null }
   }
 
+  // 首屏挂载：拉因子元数据、研究列表与因子库、回测开关，启动 60s 轮询并续跑重启前未完成的回测；
+  // 卸载时统一停掉研究轮询、因子库轮询与各回测任务的独立定时器，避免离开页面后仍打后端。
   useEffect(() => {
     loadFactorMeta()
     loadAll()

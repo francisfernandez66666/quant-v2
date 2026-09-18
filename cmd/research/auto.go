@@ -72,6 +72,8 @@ func cmdOptimize(db *store.DB, args []string) {
 		log.Fatalf("无有效面板")
 	}
 
+	// 面板就绪后组优化入参：只透传因子 ID（OptimizeWeights 不消费 Def 的元信息），
+	// 连同前瞻期、样本下限、目标指标与护栏门槛（最小 IR / 最少有效日）交给权重优化。
 	ids := make([]string, len(defs))
 	for i, d := range defs {
 		ids[i] = d.ID
@@ -457,6 +459,8 @@ func paperPoolReturns(paperPath, dataDir string) map[string][]float64 {
 	if err := json.Unmarshal(b, &state); err != nil {
 		return map[string][]float64{}
 	}
+	// lastBuy 存"池 → 代码 → 最近一笔买入价"，作为后续卖出的成本基准；
+	// 池 key 缺失时依次回退 strategy_type，仍为空才归入 other 池。
 	// poolKey → code → (qty cost basis via most recent buy price)
 	lastBuy := map[string]map[string]float64{}
 	out := map[string][]float64{}

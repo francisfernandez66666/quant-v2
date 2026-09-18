@@ -34,6 +34,8 @@ func TestShortPipelineTactics(t *testing.T) {
 	agent.SetShortRunners(combat_agent.NewShortRunners(nil))
 	agent.SetShortEnabled(true)
 
+	// 造两条同形态的破位行情：价格 13.6、跌幅 -6.2%、末根放量长阴（分钟线缺失，
+	// 逼战法只走日线口径），只用代码区分持仓股与非持仓股。
 	md := func(code, name string) *strategy_engine.StockMarketData {
 		m := &strategy_engine.StockMarketData{Code: code, Name: name, Price: 13.6, ChangePct: -6.2, KLines: brokenKLines()}
 		m.MinuteKLine = nil

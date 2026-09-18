@@ -40,6 +40,8 @@ func TestChineseCommentCoverage(t *testing.T) {
 func TestScannerBasics(t *testing.T) {
 	opts := DefaultOptions()
 
+	// 用例一：块前写了中文注释、且块内有空行的样例源码，扫描结果必须为空——
+	// 守住"注释打断连续块"这条口径，防止把已说明的段落误报成缺口。
 	t.Run("comment line breaks run", func(t *testing.T) {
 		src := strings.Join([]string{
 			"func f() {",
@@ -65,6 +67,8 @@ func TestScannerBasics(t *testing.T) {
 		}
 	})
 
+	// 用例二：现场拼一段 20 行无注释的 if 序列写进临时 y.go，
+	// 阈值取默认 15 行时必须报出缺口，否则说明审计器漏判（漏判会让注释约定形同虚设）。
 	t.Run("uncommented logic block is a gap", func(t *testing.T) {
 		var b strings.Builder
 		b.WriteString("func f() {\n")
@@ -82,6 +86,8 @@ func TestScannerBasics(t *testing.T) {
 		}
 	})
 
+	// 用例三：多行 import 块虽由代码行组成，但 SkipImports=true 时必须被豁免，
+	// 否则每个文件的依赖声明都会成为无法消除的假缺口。
 	t.Run("import block skipped", func(t *testing.T) {
 		src := strings.Join([]string{
 			"package p",

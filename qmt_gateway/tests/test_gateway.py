@@ -341,6 +341,8 @@ class TestHandler(unittest.TestCase):
             delivered.append(payload)
             return True, 200
 
+        # 打桩：临时替换模块级 post_report_status 模拟首尔侧应答（finally 里还原），
+        # 三条回报首条 type=bad 永久 400，须落死信且不阻塞后面的 trade/order
         old_status = handler_mod.post_report_status
         handler_mod.post_report_status = fake_status
         h.start_sender()

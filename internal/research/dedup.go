@@ -83,6 +83,8 @@ func DedupClusters(selected []string, icByFactor map[string][]ICRow, thresh floa
 	}
 	sort.Slice(scored, func(i, j int) bool { return scored[i].ic > scored[j].ic })
 
+	// 贪心去相关：|IC| 最高的未处理因子先当选簇代表进入保留集，
+	// 它与后继因子的相关系数一旦达阈值就被并簇剔除，避免同一信息被重复计入权重。
 	seen := make(map[string]bool, len(selected))
 	var kept []string
 	for _, c := range scored {

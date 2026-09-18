@@ -71,6 +71,8 @@ func main() {
 
 	bsClient := data.NewBaostockClient(*pyurl)
 
+	// 子命令分发：每个子命令都按 --provider 二选一（tushare 直连 / baostock 经 Python 网关），
+	// 两条实现落库口径一致，切换数据源不改变下游语义。
 	switch cmd {
 	case "full":
 		var err error

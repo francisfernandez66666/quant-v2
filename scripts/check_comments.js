@@ -28,8 +28,14 @@ const ROOTS = ['internal', 'cmd', 'qmt_gateway', 'web/src']
 const EXT = new Set(['.go', '.js', '.jsx', '.py'])
 // SKIP_DIRS：构建产物与第三方目录，不参与审计。
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '__pycache__', '.pytest_cache', 'vendor', 'testdata'])
-// THRESHOLD / LOOKBACK：与 internal/commentcheck.DefaultOptions 对齐。
-const THRESHOLD = 15
+// THRESHOLD / LOOKBACK：默认与 internal/commentcheck.DefaultOptions 对齐（15 行）；
+// 支持 `--thr N` 临时收紧做全量审计（如 --thr 8），N 越小越严格。
+// English: threshold defaults to 15 (aligned with internal/commentcheck); `--thr N` tightens the audit.
+let THRESHOLD = 15
+{
+  const i = process.argv.indexOf('--thr')
+  if (i >= 0 && Number(process.argv[i + 1]) > 0) THRESHOLD = Number(process.argv[i + 1])
+}
 const LOOKBACK = 3
 
 // 强制纯 ASCII 的文件（中文注释会导致 GBK 沙箱乱码）：只要求「有注释」，不要求「有中文」。

@@ -3,10 +3,15 @@
 // 成员账号整卡隐藏。后端契约与权限在 Go 侧已有测试，本文件只锁前端半边接线。
 import { describe, it, expect, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+// §A5：Settings 页接入 useNavigate（首拉 403 跳 /403），渲染需 Router 上下文
+import { MemoryRouter } from 'react-router-dom'
 
 let ROLE = 'admin'
 const SNAP = { snapshots: [{ snapshot_ts: '2026-09-17T10:00:00Z', path: '/x/rules-20260917.json' }, { snapshot_ts: '2026-09-16T09:00:00Z', path: '/x/rules-20260916.json' }] }
 
+// Settings 页首屏依赖的读端点整体打桩（服务器地址/账号角色/状态/LLM 配置/各战法参数），
+// 其中 fetchConfigHistory 与 fetchStrategySnapshots 返回两类快照夹具，
+// rollbackConfig / rollbackStrategyParams 两个写端点用 vi.fn 记录调用，供「取消不触达写端点」断言。
 vi.mock('../api/index.js', () => ({
   getStoredServer: () => 'http://127.0.0.1:8080',
   setStoredServer: vi.fn(),
@@ -28,7 +33,7 @@ describe('Settings 配置历史卡（§D-3）', () => {
   it('admin：进页拉快照列表，渲染两类快照 ts', async () => {
     ROLE = 'admin'
     const api = await import('../api/index.js')
-    render(<Settings />)
+    render(<MemoryRouter><Settings /></MemoryRouter>)
     expect(await screen.findByText('配置历史与回滚')).toBeInTheDocument()
     await waitFor(() => expect(api.fetchConfigHistory).toHaveBeenCalled())
     expect(screen.getByText('2026-09-17T10:00:00Z')).toBeInTheDocument()
@@ -39,7 +44,7 @@ describe('Settings 配置历史卡（§D-3）', () => {
   it('回滚按钮 → 二次确认弹窗；取消不触达写端点', async () => {
     ROLE = 'admin'
     const api = await import('../api/index.js')
-    render(<Settings />)
+    render(<MemoryRouter><Settings /></MemoryRouter>)
     await screen.findByText('2026-09-17T10:00:00Z') // 等列表数据落地（按钮在行内）
     fireEvent.click(screen.getAllByText('回滚')[0])
     expect(await screen.findByText('确认回滚配置')).toBeInTheDocument()
@@ -53,7 +58,7 @@ describe('Settings 配置历史卡（§D-3）', () => {
 
   it('成员账号整卡隐藏（写端点 admin-only）', async () => {
     ROLE = 'user'
-    render(<Settings />)
+    render(<MemoryRouter><Settings /></MemoryRouter>)
     // 等其它卡片渲染完成后仍无历史卡
     await screen.findByText('服务器连接')
     expect(screen.queryByText('配置历史与回滚')).not.toBeInTheDocument()

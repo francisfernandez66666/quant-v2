@@ -206,6 +206,8 @@ func CompositeICRange(panels []*Panel, factors []string, weights map[string]floa
 		}
 		// 每因子截面值
 		vals := make(map[string]map[string]float64, len(factors)) // fid → code → value
+		// 逐个面板取当日截面：面板没有该日（未上市/区间外）或因子值为 NaN 时直接跳过，
+		// 缺失值不参与后面的加权合成，等价于「缺一项计 0」。
 		for _, p := range panels {
 			idx, ok := p.DateIdx[d]
 			if !ok {

@@ -28,6 +28,8 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestDefaultConfig 校验零值配置归一化后的默认档位：
+// 牛市仓位上限不越界（≤1），且熊市仓位必须低于均衡市，最少停留 3 天。
 func TestDefaultConfig(t *testing.T) {
 	cfg := StateConfig{}.norm()
 	if cfg.MaxPosPct[StateBull] > 1 || cfg.MaxPosPct[StateBear] >= cfg.MaxPosPct[StateRange] {

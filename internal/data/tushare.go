@@ -105,6 +105,8 @@ func (c *TushareClient) Call(apiName string, params map[string]string, fields st
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
 
+	// 先过全局限流再发请求（Tushare 按积分限制每分钟调用次数，超配额会被拒）；
+	// 网络失败、读体失败、解析失败分别包错误，便于区分是接口不通还是响应结构改版。
 	TushareLimiter.Wait()
 	resp, err := c.client.Do(req)
 	if err != nil {

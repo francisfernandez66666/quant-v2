@@ -377,6 +377,8 @@ func (s *Server) handleFixMinute(w http.ResponseWriter, r *http.Request) {
 		count = 3000
 	}
 
+	// 分时取数按数据源优先级走：自建数据中心在位就用它，否则退回腾讯行情；
+	// 两路都拿不到时才落到下面的缓存回退分支。
 	var klines []data.KLine
 	var err error
 	if s.dc != nil {
@@ -497,6 +499,8 @@ func (s *Server) handleFixKLine(w http.ResponseWriter, r *http.Request) {
 		count = 500
 	}
 
+	// K 线取数与分时同源策略：dc 优先、行情兜底；拿不到就直接返回空数组而非报错，
+	// 让前端图表保持「有坐标轴、无数据」的可读状态。
 	var klines []data.KLine
 	var err error
 	if s.dc != nil {
@@ -510,6 +514,8 @@ func (s *Server) handleFixKLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 出参裁剪成前端约定的 fixKLine 结构：价格两位、量额取整、日期统一 YYYY-MM-DD，
+	// 不让带时区的 time.Time 直接参与 JSON 序列化。
 	out := make([]fixKLine, 0, len(klines))
 	for _, k := range klines {
 		out = append(out, fixKLine{
@@ -565,6 +571,13 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		"in_trade_time": inTrade,
 		"active":        active,
 		"signal_count":  finalCount,
+		// §A7（20260918 审计批）：下发后端二进制 git 指纹。部署脚本对后端与前端 dist 用同一
+		// checkout 构建（deploy_seoul.sh LDFLAGS 同源），故该值即"服务端配套前端版本"；
+		// APK 内嵌 assets 的构建指纹与之比对不一致时顶栏横幅告警。未注入时为 "unknown"，
+		// 前端约定 unknown/dev 一律不参与比对（避免本地裸 go build 误报）。
+		// English: §A7 — backend git fingerprint doubles as the server-side companion frontend
+		// version (same checkout builds both); the APK compares its embedded build id against it.
+		"build_commit": s.buildCommit,
 		"scan_stats": map[string]interface{}{
 			"total_stocks":     monitored,
 			"hot_sector_count": hotCount,

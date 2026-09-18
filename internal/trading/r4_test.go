@@ -174,6 +174,8 @@ func TestCancelPathMonotonic(t *testing.T) {
 	cfg.Enabled = true
 	ctrl := NewController(guardServer(), db, "u_cancel", cfg, nil)
 
+	// seed 按给定状态往订单表塞一条本地订单（同代码同方向，只差 order_id/signal_id），
+	// 下面用"已成/已撤/已报"三条分别覆盖终态与非终态两种落库路径。
 	seed := func(orderID, signalID, status string) {
 		if _, err := db.UpsertRealOrder(store.RealOrder{
 			OrderID: orderID, SignalID: signalID, Code: "600000.SH", Side: SideBuy,

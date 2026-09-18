@@ -2,6 +2,7 @@
 // Admin page (admin only): account creation, role/perm config, password reset,
 // enable/disable, expiry, and per-account strategy param delegation.
 import React, { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Button, Input, InputNumber, Select, Dialog,
   Table, Tag, Card, Form, Checkbox,
@@ -148,6 +149,9 @@ function expiryText(u) {
  * @returns {JSX.Element}
  */
 export default function Admin() {
+  // §A5（20260918 审计批）：数据首拉 403（本地角色缓存与服务端权威角色不一致，
+  // 如会话中途被降权）时统一重路由 /403，而非渲染错误 Toast。
+  const navigate = useNavigate()
   const [users, setUsers] = useState([])
   const [allPerms, setAllPerms] = useState([])
   const [creating, setCreating] = useState(false)
@@ -206,6 +210,8 @@ export default function Admin() {
       setPlatform(!!res.platform)
       if (res.platform) loadTenants()
     } catch (e) {
+      // §A5：首拉即 403=服务端权威角色已非管理员，跳统一 403 页而非停留在错误提示
+      if (api.isForbidden(e)) { navigate('/403'); return }
       showToast('加载用户失败: ' + (e.message || e), 'error')
     }
   }

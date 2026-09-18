@@ -137,6 +137,9 @@ func (f *Fetcher) EnsureStock(code string) {
 	}
 	f.mu.Unlock()
 
+	// 不等下一轮 scanCycle：立刻单独补拉一次行情再合并进快照，
+	// 让前端刚加完自选就能看到名称与价格。取价失败只记日志，
+	// 代码仍留在监控列表里，由常规轮询继续重试。
 	si, err := f.dc.GetQuote(code)
 	if err != nil {
 		log.Printf("EnsureStock(%s): %v", code, err)

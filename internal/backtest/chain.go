@@ -231,6 +231,8 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 	}
 	windows := research.WindowChunks(dates, 0)
 
+	// 先立报告骨架（区间/基准/规则/持有期），事件与统计由下面的窗口循环逐段追加，
+	// 即使中途中断也能拿到已完成窗口的部分结果。
 	rep := &ChainReport{
 		Start: opts.Start, End: opts.End, Benchmark: opts.Benchmark,
 		Rule: opts.Rule, Horizons: opts.Horizons,

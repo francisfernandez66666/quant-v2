@@ -93,6 +93,7 @@ export default function StockDetailDrawer({ open, code, name, price, changePct, 
   const myPositions = (rel.positions || []).filter((p) => codeEq(p.code, code))
   const myMessages = (rel.messages || []).filter((m) => codeEq(m.code, code))
 
+  // 抽屉骨架：全屏遮罩（点击关闭）+ 右侧滑入面板，面板内依次为头部行情、明细与关联信息各段（见下方 JSX）
   return (
     <div
       className="sdd-mask"

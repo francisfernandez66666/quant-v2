@@ -55,6 +55,8 @@ func main() {
 	}
 	defer db.Close()
 
+	// 子命令分发：研究流水线各阶段共用同一个研究库连接（上面已 Open/defer Close），
+	// 参数在此按命令需要二次解析——多数分支把 args[1:] 交给子命令自解析 flag。
 	switch cmd {
 	case "factor":
 		runFactor(db, *start, *end, *horizon, *quantiles, *minStocks, *codesFile, *outDir)

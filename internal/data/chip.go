@@ -205,6 +205,7 @@ func TriangularChipDistribution(klines []KLine, params ChipParams) *ChipAnalysis
 		score += 5
 	}
 
+	// 汇总输出筹码结构快照：MainCostPrice 直接取筹码峰价位（本模型不区分二者）。
 	return &ChipAnalysis{
 		Concentration70: c70,
 		Concentration90: c90,

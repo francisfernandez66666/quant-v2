@@ -10,6 +10,7 @@ func TestAllocLayers(t *testing.T) {
 	todayFill := now.Add(-1 * time.Hour)
 	yesterday := now.Add(-24 * time.Hour)
 
+	// 当日成交的 100 股全部落日内层（T+1 不可卖），隔日成交才整笔进可卖底仓，零数量则为空层。
 	l := AllocLayers(100, 10.0, todayFill, now)
 	if l.BaseQty != 0 || l.Sellable != 0 || l.IntradayQty != 100 {
 		t.Errorf("today fill -> all intraday, got %+v", l)
@@ -37,6 +38,8 @@ func TestAllocLayersAcross(t *testing.T) {
 	}
 }
 
+// T0Cap 单测：比例缺省走 30%、超 1 夹到总量、零持仓不产生额度，
+// 保证做 T 的可卖上限永远不超过真实底仓。
 func TestT0Cap(t *testing.T) {
 	if c := T0Cap(1000, 0.3); c != 300 {
 		t.Errorf("cap 30%% want 300 got %d", c)
@@ -52,6 +55,8 @@ func TestT0Cap(t *testing.T) {
 	}
 }
 
+// T0Settle 单测：高卖低买才记账（价差、成本改善、新成本），
+// 反向组合必须零影响，可卖量不足时按可卖量缩水成交但仍应改善成本。
 func TestT0Settle(t *testing.T) {
 	layers := PositionLayers{BaseQty: 500, Sellable: 500, TotalQty: 500, WeightedCost: 10.0}
 	spread, imp, cost := T0Settle(layers, 100, 9.8, 10.2)

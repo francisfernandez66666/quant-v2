@@ -69,6 +69,16 @@ type AdviceInput struct {
 	// English: the unified-discipline tracker (probe+trigger; §unified-discipline B). nil = discipline
 	// adjudication off (legacy instant TP/SL via CheckPositionAlerts). Injected by the engine per account.
 	DiscTracker *DisciplineTracker
+	// SellableQty §PROD-T1（2026-09-18 生产实录）：各持仓"今日可卖数量"（键=ts_code 原样，
+	// 由 engine 用 store.BuyableQtyForUserSell=持仓−当日买入成交 装配）。A 股 T+1：当日买入份额
+	// 锁定不可卖，旧建议层不感知，对当日新建仓位照常推送"止盈/止损，请手动处理"——用户照做却被
+	// 柜台 T+1 拒绝，提醒即误导。可卖量 ≤0 的代码整体跳过卖出侧（退出/纪律/卖点/退潮/利空），
+	// 加仓与格局持有不受限（买入无 T+1 约束）。缺 key=可卖量未知（未注入/测试），按不锁定处理，
+	// 保持旧行为兜底。
+	// English: §PROD-T1 — per-code sellable qty (held minus today's bought fills). Positions with zero
+	// sellable skip all sell-side advice (T+1 locked — a sell reminder the user cannot act on is
+	// misleading), while add/hold rules still run. Missing key = unknown = not locked.
+	SellableQty map[string]int
 }
 
 // Advise 生成实盘持仓处理建议：卖出侧（复用）→ 加仓 → 格局，按 action 排序输出。
@@ -82,8 +92,17 @@ func Advise(in AdviceInput) []PositionAdvice {
 	}
 	now := time.Now()
 
+	// §PROD-T1（2026-09-18 生产实录）卖出侧 T+1 闸：先剔除当日买入锁定（可卖量≤0）的持仓，
+	// 剩余才进入退出/纪律/卖点/退潮/利空五路卖出侧评估——被锁的仓位今天根本卖不动，
+	// 任何"止盈/止损请手动处理"都是误导（实录：603468 当日买入 14:13 即推超期止盈）。
+	// 加仓/格局走完整持仓列表（in.Positions）：买入方向不受 T+1 限制。
+	// English: §PROD-T1 — drop T+1-locked positions from the sell-side (they cannot be sold today;
+	// a sell reminder is misleading); add/hold rules still see the full book.
+	sellable := sellablePositions(in)
+	inSell := in
+	inSell.Positions = sellable
 	// 构造只读 Report 视图复用卖出侧函数（NewFromLogs 不持久化）
-	view := report.NewFromLogs(execLogsFromReal(in.Positions, in.Cfg.Discipline))
+	view := report.NewFromLogs(execLogsFromReal(sellable, in.Cfg.Discipline))
 
 	var advices []PositionAdvice
 	advByCode := make(map[string]*PositionAdvice)
@@ -103,12 +122,12 @@ func Advise(in AdviceInput) []PositionAdvice {
 		// with a fixed confirm window — no same-direction signal by settlement → exit, filtering pin-bars;
 		// strategy-native TP/SL degrade to notifications. Skipped when DiscTracker is nil.
 		if in.DiscTracker != nil {
-			for _, a := range in.DiscTracker.ProbeAll(in, in.Cfg.Discipline) {
+			for _, a := range in.DiscTracker.ProbeAll(inSell, in.Cfg.Discipline) {
 				mergeAdvice(advByCode, &a)
 			}
 		}
 		// 3. 卖出侧：卖点评估（利空D1/破MA/放量派发/动量衰竭）
-		held := heldCodes(in.Positions)
+		held := heldCodes(sellable)
 		if len(held) > 0 {
 			for _, sig := range in.Agent.AssessSellSide(held, in.MD, in.D1Scores, in.Scores, in.ShortEnabled) {
 				mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
@@ -146,6 +165,9 @@ func Advise(in AdviceInput) []PositionAdvice {
 		}
 	}
 
+	// 前面各步已保证一只票只留一条建议（卖出级优先，其次加仓、格局持有），
+	// 这里把按代码索引的 map 摊平成切片，再按 Action 字面排序，只为列表顺序稳定可预期，
+	// 排序本身不代表建议的紧迫程度。
 	for _, a := range advByCode {
 		advices = append(advices, *a)
 	}
@@ -187,9 +209,31 @@ func execLogsFromReal(positions []store.RealPosition, disc config.DisciplineConf
 			TakeProfitPct: tp,
 			StopLossPct:   sl,
 			Status:        "持仓中",
+			// §PROD-T1（2026-09-18 生产实录）：开仓日透传（ApplyRealFill 首笔买入成交落的
+			// real_positions.buy_date）。旧实现不填 EntryAt，零值经 buildExitContext 曾格式化为
+			// "0001-01-01"（现已改判空串）使超期判定恒真——当日买入即误推"持仓超期离场"。
+			// 有 buy_date 时按真实持仓交易日计超期；空（券商快照对账建的历史行）则未知、跳过超期。
+			// English: §PROD-T1 — carry the opening trade date so hold-timeout counts real trading
+			// days; unknown (broker-snapshot-created rows) stays zero → timeout check skips.
+			EntryAt: parseEntryDate(p.BuyDate),
 		})
 	}
 	return logs
+}
+
+// parseEntryDate §PROD-T1：real_positions.buy_date（"YYYY-MM-DD"，空=未知）→ time.Time。
+// 解析失败/为空返回零值，交由 buildExitContext 的空串守卫跳过超期判定，绝不伪造开仓日。
+// English: §PROD-T1 — parses the stored opening date; empty/unparseable yields the zero time,
+// which the exit-context guard treats as "unknown" (timeout check skipped).
+func parseEntryDate(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // heldCodes 返回实盘持仓纯数字代码集合。
@@ -198,6 +242,24 @@ func heldCodes(positions []store.RealPosition) []string {
 	out := make([]string, 0, len(positions))
 	for _, p := range positions {
 		out = append(out, pureCode(p.TsCode))
+	}
+	return out
+}
+
+// sellablePositions §PROD-T1：过滤掉当日买入 T+1 锁定（可卖量≤0）的持仓，供卖出侧五路评估使用。
+// SellableQty 为 nil 或缺 key 时按"未知=不锁定"放行（测试/未注入路径保持旧行为）。
+// English: §PROD-T1 — drop positions with zero sellable qty (T+1 locked) from the sell-side input;
+// unknown (nil map / missing key) fails open to the legacy behavior.
+func sellablePositions(in AdviceInput) []store.RealPosition {
+	if len(in.SellableQty) == 0 {
+		return in.Positions
+	}
+	out := make([]store.RealPosition, 0, len(in.Positions))
+	for _, p := range in.Positions {
+		if q, ok := in.SellableQty[p.TsCode]; ok && q <= 0 {
+			continue // T+1 全锁：今日不可卖，不进入卖出侧
+		}
+		out = append(out, p)
 	}
 	return out
 }

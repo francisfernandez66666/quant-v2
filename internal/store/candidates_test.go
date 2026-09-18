@@ -70,6 +70,8 @@ func TestCandidates(t *testing.T) {
 func TestCandidateGuardParams(t *testing.T) {
 	db := testDB(t)
 
+	// save 闭包统一造候选行：kind/status/因子串连同护栏档位与参数快照一起写入，
+	// 后续用例只改这几个字段即可复用。
 	save := func(kind, status, factors, guard, params string) int64 {
 		id, err := db.SaveCandidate(&Candidate{
 			Kind: kind, Status: status, Factors: factors,

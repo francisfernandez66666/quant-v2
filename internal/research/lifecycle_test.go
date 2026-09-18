@@ -8,6 +8,8 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// newTestStore 为每个用例开一个临时目录里的独立 SQLite 库，用例结束自动关闭，
+// 保证生命周期（灰度/降级）状态互不串台。
 func newTestStore(t *testing.T) *store.DB {
 	t.Helper()
 	db, err := store.Open(t.TempDir() + "/lifecycle.db")

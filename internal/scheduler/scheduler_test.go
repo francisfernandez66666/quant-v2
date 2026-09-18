@@ -179,6 +179,8 @@ func TestLoadSchedulerConfigBacktest(t *testing.T) {
 	}
 }
 
+// 周六 16:00 触发夜间流水线时，研究回测步骤必须被插入到编排序列里：
+// 断言 fake 脚本被调用、且状态文件把当日标记为已完成（周末开关打开才允许跑回测）。
 // TestNightlyBacktestStepInserted NightlyBacktestStepInserted。
 func TestNightlyBacktestStepInserted(t *testing.T) {
 	t.Setenv("FAKE_SLEEP", "0")
@@ -469,6 +471,8 @@ func TestNightlyJobKilledAtTradingOpen(t *testing.T) {
 	waitIdleAndSettle(t, s)
 }
 
+// 盘中数据下载限频：开启 dataload_during_trade 后，周二 10:00 首次 tick 触发一次下载，
+// 未到 interval_minutes（30 分钟）的第二次 tick 不得重复拉起脚本，避免盘中抢行情接口。
 // TestTradingDataloadThrottled TradingDataloadThrottled。
 func TestTradingDataloadThrottled(t *testing.T) {
 	t.Setenv("FAKE_SLEEP", "0")

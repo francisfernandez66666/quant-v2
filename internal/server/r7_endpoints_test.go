@@ -62,6 +62,7 @@ func TestConfigHistoryAndRollbackEndpoints(t *testing.T) {
 	// 先落一份初始 config.json，否则 SnapshotRules 读不到文件
 	writeTestConfig(t, s.cfg, cfgPath, `{"qmt":{"enabled":false,"price_type":"market"}}`)
 
+	// 造两个账号：admin 走正常的列表/diff/回滚流程，member 专门用来验证权限闸返回 403。
 	admin, err := s.auth.CreateUser("histadmin", "pw", "admin", nil, 0)
 	if err != nil {
 		t.Fatalf("create admin: %v", err)
@@ -98,6 +99,7 @@ func TestConfigHistoryAndRollbackEndpoints(t *testing.T) {
 	}
 	writeTestConfig(t, s.cfg, cfgPath, `{"qmt":{"enabled":true,"price_type":"limit"}}`)
 
+	// 带 diff=<ts1> 再查列表：响应必须给出 v1→v2 的字段级差异文本，供审批人回看改了什么。
 	rr = adminDo(s, adminReq(s, admin, http.MethodGet, "/api/config/history?diff="+ts1, ""))
 	if rr.Code != 200 {
 		t.Fatalf("diff → %d body=%s", rr.Code, rr.Body.String())

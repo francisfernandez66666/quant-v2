@@ -10,6 +10,8 @@ func tEvent(t *testing.T, dt string, score float64) *NewsEvent {
 	return &NewsEvent{Title: "T", Datetime: dt, Score: score, EventType: "公司"}
 }
 
+// 衰减表逐档核对：以 0.8 分为基准，每过一个半衰期（公司类 60 分钟）分数减半，
+// 超过 3 个半衰期视为过期归零，避免旧新闻继续顶着高分触发信号。
 func TestEffectiveScore(t *testing.T) {
 	base := "2026-09-09 09:30:00"
 	cases := []struct {

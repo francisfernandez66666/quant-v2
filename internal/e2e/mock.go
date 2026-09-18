@@ -359,6 +359,8 @@ func (t *fixtureTransport) thsQuote(req *http.Request) (*http.Response, error) {
 	code = strings.ReplaceAll(code, "1.", "")
 	code = strings.ReplaceAll(code, "0.", "")
 
+	// 按 parseTHSQuote 期望的 realhead 结构回放快照：items 以 secid 为键，
+	// 值是按位序填充的数组（未用到的下标留空即可）。
 	items := make(map[string]interface{})
 	if csv, ok := t.fix.Quotes[code]; ok {
 		p := strings.Split(csv, ",")
@@ -638,6 +640,7 @@ func newMockLLMServer() (*httptest.Server, *llmCalls) {
 			content = "[]"
 		}
 
+		// 统一按 chat completion 形态回包：只有 choices[0].message.content 被客户端读取。
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"choices": []map[string]interface{}{
 				{"message": map[string]interface{}{"role": "assistant", "content": content}},

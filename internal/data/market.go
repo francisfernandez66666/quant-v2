@@ -1183,6 +1183,8 @@ func ValidateKLine(klines []KLine) bool {
 	return true
 }
 
+// GetSinaNews 抓取新浪财经滚动快讯，pageSize 决定单次条数；走 SinaLimiter 限流，
+// 只回原始条目，正文补全交给下游 GetArticle。
 // GetSinaNews fetches Sina Finance flash/rolling news capped by pageSize.
 func (m *MarketAPI) GetSinaNews(pageSize int) ([]NewsItem, error) {
 	url := fmt.Sprintf("https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&knum=%d", pageSize)
@@ -1434,6 +1436,9 @@ func (m *MarketAPI) GetArticle(url string) (string, error) {
 		return "", fmt.Errorf("article request: %v", err)
 	}
 
+	// 按站点分派请求头：同花顺认移动 UA + 站内 Referer 直出正文，新浪要桌面 UA
+	// （移动 UA 会被 302 到网关页）；两家各自取自己的限流令牌。
+	// 不认识的域名直接报错返回，避免把限流配额浪费在抓不到正文的站上。
 	switch {
 	case strings.Contains(host, "10jqka.com.cn"):
 		THSLimiter.Wait()
@@ -1447,6 +1452,8 @@ func (m *MarketAPI) GetArticle(url string) (string, error) {
 		return "", fmt.Errorf("unsupported article host: %s", host)
 	}
 
+	// 执行抓取并逐层降级为"空正文"：非 200（跳转/风控页）与读体失败都只返回错误，
+	// 调用方拿到空串时保留原始摘要继续跑，不让一篇文章卡住新闻流水线。
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("article http: %v", err)
@@ -1460,6 +1467,8 @@ func (m *MarketAPI) GetArticle(url string) (string, error) {
 		return "", fmt.Errorf("article read: %v", err)
 	}
 
+	// 正文容器标记按站点各取各的：同花顺是 article-content 容器，新浪是 id="artibody"；
+	// 抽不到就返回空串，由调用方继续用摘要，不做全文兜底解析。
 	var content string
 	if strings.Contains(host, "10jqka.com.cn") {
 		content = extractArticleDiv(string(body), `class="news-content article-content"`)

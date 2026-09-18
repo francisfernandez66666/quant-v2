@@ -23,6 +23,8 @@ func testDB(t *testing.T) *DB {
 func TestInsertAndHfq(t *testing.T) {
 	db := testDB(t)
 
+	// 两天原始日线（close 10.5 / 11.8），配合下面的复权因子 2.0 / 2.5，
+	// 手算即可得到期望的后复权价，用来核对 HfqBars 的换算口径。
 	daily := []map[string]any{
 		{"ts_code": "600000.SH", "trade_date": "20250101", "open": 10.0, "high": 11.0, "low": 9.5, "close": 10.5, "vol": 1000, "amount": 1e6},
 		{"ts_code": "600000.SH", "trade_date": "20250102", "open": 10.6, "high": 12.0, "low": 10.4, "close": 11.8, "vol": 1200, "amount": 1.2e6},
@@ -66,6 +68,8 @@ func TestResume(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 
+	// 续传起点查询：全局最大交易日取到 0103，单票维度各取自己那侧的最新一天，
+	// 增量拉数就是靠这三类查询决定从哪天继续。
 	if v, _ := db.MaxTradeDateAll("daily"); v != "20250103" {
 		t.Fatalf("MaxTradeDateAll=%q", v)
 	}

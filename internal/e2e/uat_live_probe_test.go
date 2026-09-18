@@ -68,6 +68,8 @@ func newUATRig(t *testing.T, fix *Fixture) *uatRig {
 		t.Fatalf("mkdir opslog: %v", err)
 	}
 
+	// UAT 探针对齐前端登录态：先用 tester 登录，再提权为 admin 并标记初始化完成，
+	// 否则管理域接口会被"未初始化/无权限"拦截，探针拿到的 403 就不是真实缺陷。
 	u, err := rig.auth.Login("tester", "tester123")
 	if err != nil {
 		t.Fatalf("login tester: %v", err)
@@ -489,6 +491,8 @@ func TestUATLiveProbeAdmin(t *testing.T) {
 	ur := newUATRig(t, fix)
 	token := ur.rig.auth.UserToken("tester")
 
+	// 用户管理：列表可读，且带过期天数的新建请求不被路由/校验层直接拒掉
+	// （业务上可能因重名返回 400，故只排除 401/403/404/500 这类装配错误）。
 	_, code := ur.get(t, "/api/admin/users", token)
 	if code != 200 {
 		t.Errorf("GET /api/admin/users → %d", code)
@@ -499,6 +503,8 @@ func TestUATLiveProbeAdmin(t *testing.T) {
 		t.Errorf("POST /api/admin/users → %d (body=%s)", code, body)
 	}
 
+	// 配置域三个只读端点逐个探活后，再以一份完整 Dragon 权重 JSON 覆盖写策略配置，
+	// 验证"读-改-写"链路在真实 HTTP 栈上通（配置热更新是运维主入口）。
 	for _, p := range []string{"/api/config/strategy", "/api/config/d1", "/api/config/llm"} {
 		_, code := ur.get(t, p, token)
 		if code != 200 {

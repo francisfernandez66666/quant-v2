@@ -42,6 +42,7 @@ func TestMarketRiskDailyUpsertAndSummary(t *testing.T) {
 		t.Errorf("同日覆盖未生效, 9/12 break=%v", list[2].BreakRate)
 	}
 
+	// 区间汇总按风险档聚合：本例三笔样本应各落进 None/Yellow/Red 一天，验证分档计数口径。
 	summ, err := db.SummarizeMarketRiskDaily("2026-09-01", "2026-09-30")
 	if err != nil {
 		t.Fatal(err)

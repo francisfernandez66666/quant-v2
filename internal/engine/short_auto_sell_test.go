@@ -32,6 +32,8 @@ func TestShortSellMarkDayScope(t *testing.T) {
 	}
 }
 
+// 空单战术清仓建议的用例夹具：四只持仓分别命中「正常出建议 / 已有止损建议 / 无行情 / 零仓」
+// 四条分支，钉住 shortTacticCloseAdvices 的过滤口径。
 func TestShortTacticCloseAdvices(t *testing.T) {
 	fixed := time.Date(2026, 9, 11, 10, 0, 0, 0, time.Local)
 	mk := func() *Engine {

@@ -75,6 +75,7 @@ func LayerReturns(panels []*Panel, factorID string, h, quantiles, minStocks int)
 		}
 	}
 
+	// 汇总每层的样本数与均值收益；空层填 NaN，避免调用方把「无样本」误读成 0 收益。
 	out := make([]LayerSummary, quantiles)
 	for i := range out {
 		out[i] = LayerSummary{Layer: i, N: counts[i], MeanReturn: math.NaN()}

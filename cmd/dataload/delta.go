@@ -89,6 +89,8 @@ func cmdExportDelta(db *store.DB, args []string) {
 	w := bufio.NewWriter(gz)
 	defer w.Flush()
 
+	// 逐表写出增量包：未指定 --fill-from 时整表导出，
+	// 指定后以目标库该表已落的最大日期为起点，只补差量（避免重复搬运全量历史）。
 	total := 0
 	for _, t := range deltaTables {
 		cols := store.TableColumns(t.name)

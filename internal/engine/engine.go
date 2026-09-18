@@ -4382,6 +4382,7 @@ func (e *Engine) ReanalyzeNews() (map[string]int, error) {
 	// 落盘事件（供 /api/news 展示）
 	na.SaveEvents(events)
 
+	// 本轮补推的分阶段计数：既进日志便于事后排查，也原样返回给接口展示。
 	stat := map[string]int{
 		"raw":     len(raw),
 		"stock":   len(st0.StockIdx),
@@ -5005,6 +5006,8 @@ func clusterEvents(events []newsagent.NewsEvent) []newsagent.NewsEvent {
 		}
 	}
 
+	// 同簇事件收口成一条对外事件：单条直接透传，多条才走下面的标题拼接与属性择优，
+	// 避免同一利好被重复推成多条信号。
 	out := make([]newsagent.NewsEvent, 0, len(clusters))
 	for _, idxs := range clusters {
 		if len(idxs) == 0 {
@@ -5186,15 +5189,16 @@ func (e *Engine) SectorLinkageLeaders(pool []data.LimitUpStock) []sector_agent.L
 	return out
 }
 
-// sectorLinkageObserve 板块联动观察钩子（§P2.2）：Enhance.SectorLinkage 开启时识别当日龙头并
-// 记录为观察字段/e.sectorLeaders，供前端与后续"板块成分股 × 板块资金流 → 联动候选"接入使用。
-// 完整候选生成依赖成分股与资金流源（接口 FindLinkageCandidates 已就绪并有单测）；此处先观察、
-// TODO(§F-7 状态标注)：本特性截至 20260917 为"仅观察、零行为变化"——sectorLeaders 只写不读、
-// FindLinkageCandidates 生产零调用；接入交易意图产出前不要依赖 Enhanced.SectorLinkage 开关。
-// 零行为变化。关闭时零操作。English: sector-linkage observation hook (P2.2). When enabled, records
-// today's leaders into e.sectorLeaders for the frontend and the future "constituents × flow →
-// candidates" wiring. Candidate generation needs the constituents/flow sources (FindLinkageCandidates
-// is ready and unit-tested); this step only observes. No-op when disabled.
+// sectorLinkageObserve 板块联动观察钩子（§P2.2，观察版·零行为变化）：Enhance.SectorLinkage
+// 开启时把当日涨停池折算为龙头列表写入 e.sectorLeaders。
+// §F-7 状态标注（20260918 复核）：sectorLeaders 只写不读、FindLinkageCandidates 仅单测调用，
+// 开关也不在任何 Web UI 暴露（只有配置项 enhance.sector_linkage_enabled，默认关）——
+// 即"开与关对交易产出完全等价"。接入交易意图产出前不要依赖该开关。
+// English: §P2.2 sector-linkage observation hook, observation-only: when
+// Enhance.SectorLinkage is on it records today's leaders into e.sectorLeaders, which is
+// written-but-never-read and FindLinkageCandidates has zero production callers; the switch has
+// no Web UI surface (config key enhance.sector_linkage_enabled, off by default), so enabling it
+// changes no trading output. Do not rely on it before candidates feed trading intent.
 func (e *Engine) sectorLinkageObserve(pool []data.LimitUpStock) {
 	if !e.enhanceFlag(func(c config.EnhanceConfig) bool { return c.SectorLinkage }) || len(pool) == 0 {
 		return

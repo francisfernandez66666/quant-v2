@@ -173,6 +173,8 @@ func parseFlags() (*backtestOptions, error) {
 		operatorDir = llmcfg.DefaultDataDir()
 	}
 
+	// flag 解析在此收口为结构体：下游只读 backtestOptions 字段，不再触碰包级指针，
+	// since 缺省值与配置管理器都在返回前定型。
 	return &backtestOptions{
 		cycles:    *cyclesRaw,
 		since:     since,
@@ -276,6 +278,8 @@ func (o *backtestOptions) run() error {
 	watcher := newSSEWatcher(sse)
 	defer func() { watcher.close() }()
 
+	// 与实盘同参装配引擎后，只按开关裁剪多空：longOff 关掉多头信号、shortOn 打开融券做空，
+	// 使回测的触发链与 cmd/quant 运行期一致（差异只保留在数据注入侧）。
 	eng := engine.New(marketAPI, nAgent, strategyEngine, sAgent, cAgent, agg, rpt,
 		stockTracker, wlMgr, sse, llmClient, thsClient, o.dataDir)
 	eng.SetScanner(scanner)

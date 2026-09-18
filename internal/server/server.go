@@ -149,6 +149,12 @@ type Server struct {
 	liveDB *store.DB
 
 	cacheDir string // 看板快照落盘目录（休市/重启后前端仍可读取最近一次有效数据）
+	// §A7（20260918 审计批）buildCommit：构建期 -ldflags 注入的 git 短指纹，经 SetBuildCommit
+	// 传入，随 GET /api/status 的 build_commit 字段下发。前端（尤其 APK 内嵌 assets）在启动与
+	// 60s 轮询中比对本地构建指纹与服务端报告值，不一致即顶栏横幅告警"内嵌前端已过期"。
+	// English: §A7 — git short SHA stamped at build time, exposed via /api/status so the
+	// (APK-bundled) frontend can detect its embedded assets drifting behind the deployed backend.
+	buildCommit string
 
 	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 与 LLM 快照的互斥锁
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
@@ -273,6 +279,10 @@ func (s *Server) dashFor(userID string) *display.DashboardData {
 
 // SetCacheDir 设置看板快照落盘目录（缓存最近一次有效看板，解决派生数据不持久化导致休市期前端空白的问题）。
 func (s *Server) SetCacheDir(dir string) { s.cacheDir = dir }
+
+// SetBuildCommit 注入构建期 git 指纹（main.buildCommit），供 /api/status 下发给前端做版本比对（§A7）。
+// English: §A7 — injects the build-time git commit so /api/status can report it to the frontend.
+func (s *Server) SetBuildCommit(c string) { s.buildCommit = c }
 
 // cacheDashPath 返回看板快照落盘路径。
 func (s *Server) cacheDashPath() string {
@@ -1052,6 +1062,7 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 只有空库未初始化时才允许建首个管理员；已初始化一律 409，防止覆盖既有账号口令。
 	user, err := s.auth.SetupInitialAdmin(req.Username, req.Password)
 	if err != nil {
 		if strings.Contains(err.Error(), "already initialized") {
@@ -1062,6 +1073,7 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 初始化时顺带提交的三方凭据按用户维度落 auth 配置；空值跳过，绝不覆盖成空串。
 	if req.LLMApiURL != "" {
 		s.auth.SetConfig(user.ID, "llm_api_url", req.LLMApiURL)
 	}
@@ -1736,6 +1748,7 @@ func (s *Server) handleDeletePosition(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.ownsPosition(r, id) { // §A2
+		// 越权保护放在最前面：持仓不属于当前账号时直接 403，不再触碰后面的平仓落库。
 		writeError(w, 403, "not your position")
 		return
 	}
@@ -1744,6 +1757,7 @@ func (s *Server) handleExitPosition(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	// 平仓价必须显式给出且为正数：缺价平仓会让盈亏按 0 计，统计口径直接失真。
 	if req.ExitPrice <= 0 {
 		writeError(w, 400, "exit_price required")
 		return

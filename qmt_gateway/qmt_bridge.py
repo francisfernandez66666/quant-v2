@@ -432,6 +432,8 @@ class Bridge:
         try:
             trades = self.adapter.query_trades()
         except Exception:  # noqa: BLE001
+            # 查询成交失败只丢本轮回补（trade_id 去重集合不动，下一轮还会再查到），
+            # 因此记完异常直接返回，不影响心跳、取单等其余职责
             log.exception("[bridge] query trades failed")
             return
         for t in trades:
@@ -503,6 +505,8 @@ def main(argv=None):
     import argparse  # noqa: PLC0415
     import os  # noqa: PLC0415
     import json  # noqa: PLC0415
+    # 默认配置文件 = 脚本同目录 config.bridge.json：真机在 QMT 沙箱里无法传参，
+    # 把网关地址/token/账号写进该文件即可（见 config.bridge.example.json）
     default_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.bridge.json")
     ap = argparse.ArgumentParser(description="QMT in-client bridge (standalone/dry-run)")
     ap.add_argument("--config", default=default_cfg, help="bridge config JSON path")
@@ -532,6 +536,8 @@ def main(argv=None):
     pos = args.pos or float(cfg.get("positions_sec", 30.0))
     dry_run = cfg.get("dry_run", False) if args.dry_run is None else args.dry_run
 
+    # 命令行模式统一走 stdout 日志（真机在 QMT 内置环境由 start_from_config 挂
+    # RotatingFileHandler，落不到文件时也不影响桥取单/回报）
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

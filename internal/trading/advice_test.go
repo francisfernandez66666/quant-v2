@@ -278,3 +278,86 @@ func (failingExecutor) State() (*GatewayState, error) { return nil, context.Dead
 
 // Health Health。
 func (failingExecutor) Health() (bool, error) { return false, context.DeadlineExceeded }
+
+// TestExecLogsFromRealEntryDate §PROD-T1（2026-09-18 生产实录）：buy_date 必须映射为
+// ExecLog.EntryAt（超期判定按真实持仓交易日），空 buy_date 保持零值（下游按未知跳过）。
+// English: §PROD-T1 — execLogsFromReal must carry buy_date into ExecLog.EntryAt; empty stays zero.
+func TestExecLogsFromRealEntryDate(t *testing.T) {
+	positions := []store.RealPosition{
+		{TsCode: "603468.SH", Name: "津富士达", Qty: 100, CostPrice: 22.61, Amount: 2261, HighestPrice: 22.61, BuyDate: "2026-09-18"},
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 10}, // 券商快照行无开仓日
+	}
+	logs := execLogsFromReal(positions, config.DefaultDisciplineConfig())
+	if len(logs) != 2 {
+		t.Fatalf("应映射 2 条, got %d", len(logs))
+	}
+	if got := logs[0].EntryAt.Format("2006-01-02"); got != "2026-09-18" {
+		t.Fatalf("buy_date 应透传为 EntryAt 2026-09-18, got %s", got)
+	}
+	if !logs[1].EntryAt.IsZero() {
+		t.Fatalf("空 buy_date 必须保持零值（未知），got %v", logs[1].EntryAt)
+	}
+}
+
+// TestAdviseT1LockedSkipsSellSide §PROD-T1：可卖量≤0（当日买入全锁）的持仓不得进入卖出侧——
+// 生产实录形态复刻：两仓同为"远古开仓"（本应触发持仓超期离场），其一注入当日买入
+// SellableQty=0 → 只剩另一只收到卖出级建议。
+// English: §PROD-T1 — positions with zero sellable qty (T+1 locked) skip all sell-side advice;
+// two identically overdue positions, one locked → only the unlocked one receives the exit advice.
+func TestAdviseT1LockedSkipsSellSide(t *testing.T) {
+	old := time.Now().AddDate(0, -2, 0).Format("2006-01-02")
+	positions := []store.RealPosition{
+		{TsCode: "600000.SH", Name: "可卖仓", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 10, BuyDate: old},
+		{TsCode: "000001.SZ", Name: "锁仓", Qty: 200, CostPrice: 20, Amount: 4000, HighestPrice: 20, BuyDate: old},
+	}
+	quotes := map[string]*data.StockInfo{
+		"600000": {Price: 10.05},
+		"000001": {Price: 20.05},
+	}
+	in := AdviceInput{
+		Agent:     combat_agent.New(&config.StrategyConfig{}),
+		Positions: positions,
+		Quotes:    quotes,
+		Cfg:       config.QMTConfig{},
+	}
+	// 基线：无 SellableQty（未知=不锁）时两只都应触发卖出侧超期建议
+	if codes := baseOf(in); len(codes) != 2 {
+		t.Fatalf("基线应产出 2 条卖出级建议（超期），got %v", codes)
+	}
+	// 注入 000001 全锁：其卖出建议必须消失，600000 保留
+	in.SellableQty = map[string]int{"600000.SH": 100, "000001.SZ": 0}
+	out := Advise(in)
+	var sellCodes []string
+	for _, a := range out {
+		switch a.Action {
+		case "止盈", "止损", "减仓":
+			sellCodes = append(sellCodes, a.Code)
+		}
+	}
+	for _, c := range sellCodes {
+		if c == "000001" {
+			t.Fatalf("T+1 全锁持仓不得出卖出建议，got %v", sellCodes)
+		}
+	}
+	found := false
+	for _, c := range sellCodes {
+		if c == "600000" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("未锁持仓应保留超期卖出建议，got %v", sellCodes)
+	}
+}
+
+// baseOf 基线建议中的卖出级代码（辅助）。
+func baseOf(in AdviceInput) []string {
+	var codes []string
+	for _, a := range Advise(in) {
+		switch a.Action {
+		case "止盈", "止损", "减仓":
+			codes = append(codes, a.Code)
+		}
+	}
+	return codes
+}

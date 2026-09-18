@@ -125,9 +125,6 @@ func priorityOf(t int, d1 float64, isLeader bool, emotion string) PriorityResult
 	if base < 0 {
 		base = 0
 	}
-	if base < 0 {
-		base = 0
-	}
 
 	switch emotion {
 	case "退潮":
@@ -139,6 +136,8 @@ func priorityOf(t int, d1 float64, isLeader bool, emotion string) PriorityResult
 		return PriorityResult{-1, "mute", false}
 	}
 
+	// 分数落到三档标签：≥StrongMin 记 strong 并允许开仓，<ObserveMin 记 mute
+	// （连提示都不给），中间档只 observe 观察，不开仓也不告警。
 	label := "observe"
 	canOpen := false
 	if base >= StrongMin {
@@ -542,6 +541,8 @@ func (s *LeftSideScorer) calcD4(ib *IntradayB, avgVol float64) float64 {
 	if ib.CumVol > 0 && avgVol > 0 {
 		// 当天时间进度 (从9:30开始到15:00 = 330分钟)（Time progress from 9:30 to 15:00 = 330 minutes）
 		mins := float64(ib.TTime/100*60 + ib.TTime%100 - 570) // 570=9:30（570 = 9:30）
+		// 时间进度归一：先把分钟数夹在 [0,330]（盘前与收盘后的数据不让进度为负或超过全天），
+		// 再给进度设 10% 下限，避免开盘瞬间期望量太小、把普通成交误判成放量。
 		if mins < 0 {
 			mins = 0
 		}

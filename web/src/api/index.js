@@ -376,6 +376,16 @@ export async function refreshMe() {
 }
 
 /**
+ * §A5（20260918 审计批）错误是否为后端 403（无权限）。
+ * 依赖 request() 在非 2xx 抛错上挂载的 status；网络层错误无 status 一律 false。
+ * English: §A5 — true only for backend 403 responses surfaced by request().
+ * @param {Error|any} e - request() 抛出的错误对象
+ */
+export function isForbidden(e) {
+  return !!(e && e.status === 403)
+}
+
+/**
  * 获取持久化的服务器地址
  * Returns the persisted server URL
  * @returns {string} 服务器地址，未配置时返回空字符串
@@ -504,7 +514,9 @@ export async function request(path, opts = {}) {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new Event('auth:expired'))
     }
-    throw new Error('登录已过期')
+    const expired = new Error('登录已过期')
+    expired.status = 401 // §A5：过期同样携带状态码，便于调用方分支
+    throw expired
   }
   // 非 2xx：尝试解析后端错误信息，解析失败则给出明确状态码提示，
   // Non-2xx: try to parse the backend error message; fall back to a clear status-code note if parsing fails,
@@ -516,7 +528,13 @@ export async function request(path, opts = {}) {
       const e = await res.json()
       if (e && e.error) msg = e.error
     } catch (_) {}
-    throw new Error(msg)
+    // §A5（20260918 审计批）：错误对象挂载 HTTP 状态码——此前调用方只能拿 message 做关键字
+    // 匹配（如 e.message.indexOf('无权限')），无法机读判定 403；现页面/守卫可用 isForbidden()
+    // 把"数据首拉即 403"统一重路由到 /403。
+    // English: §A5 — non-2xx errors now carry res.status so callers can test 403 programmatically.
+    const err = new Error(msg)
+    err.status = res.status
+    throw err
   }
   // 成功响应：解析 JSON 返回给调用方（后端接口约定均为 JSON 体）
   return res.json()
@@ -604,8 +622,8 @@ export async function fetchDepth(code) {
 /** Fetch the server runtime status (scan stats, uptime, etc.) */
 // 对应 GET /api/status，返回 { signal_count, in_trade_time, ... }，
 // Maps to GET /api/status; returns { signal_count, in_trade_time, ... },
-// 顶部状态栏与 15 秒轮询均依赖该接口
-// used by the top status bar and the 15s polling
+// 顶部状态栏与 60s 状态轮询（App.refreshStatus）均依赖该接口
+// used by the top status bar and the 60s status poll (App.refreshStatus)
 export async function fetchStatus() {
   return request('/api/status')
 }
@@ -1310,7 +1328,12 @@ export async function connectSSE() {
     try {
       const resp = await request('/api/events/ticket', { method: 'POST' })
       ticket = resp && resp.ticket ? resp.ticket : ''
-    } catch (_) {}
+    } catch (e) {
+      // §A6（20260918 审计批）：取票失败不再整体静默——旧行为下 SSE 链路断裂但页面
+      // 毫无痕迹，只能靠 60s 轮询兜底续命；留 warn 便于控制台直确认"实时通道没通"。
+      // English: §A6 — log ticket-mint failure instead of silently losing the realtime channel.
+      if (typeof console !== 'undefined') console.warn('[api] SSE 票据签发失败，实时推送暂不可用:', (e && e.message) || e)
+    }
     if (!ticket) {
       // 票据签发失败（如 token 失效）：走一次探测，交给上层统一回到登录态
       // Ticket mint failed (e.g. dead token): probe once and let the app return to login

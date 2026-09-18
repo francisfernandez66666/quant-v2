@@ -93,6 +93,12 @@ def _xtc_safe():
 
 
 def _price_type_const(price_type, code, xtc=None):
+    """passorder price-type constant: limit -> FIX_PRICE; market -> SH uses the
+    convert-5-limit quote, every other venue falls back to peer-price-first.
+
+    Defaults (11/43/14) are the well-known xtconstant values, kept as fallback
+    when the sandbox cannot import xtconstant at all. (ASCII only.)
+    """
     fix, sh_conv, peer = 11, 43, 14
     try:
         if xtc is not None:
@@ -392,6 +398,7 @@ class _XtOps:
 
     @staticmethod
     def _obj_code(o):
+        """Counter object -> "600519.SH" style code, deriving the suffix when absent."""
         c = str(getattr(o, "m_strInstrumentID", "") or getattr(o, "code", "") or
                 getattr(o, "stock_code", "") or "")
         ex = str(getattr(o, "m_strExchangeID", "") or getattr(o, "sector_name", "") or "")
@@ -403,6 +410,7 @@ class _XtOps:
         return c
 
     def embed_asset(self):
+        """ACCOUNT row -> engine asset dict (None when the session has no asset snapshot)."""
         rows = self._gtdd("ACCOUNT")
         out = None
         for r in rows:
@@ -464,6 +472,7 @@ class _XtOps:
         return self._gtdd("ORDER")
 
     def embed_trades_rows(self):
+        """Raw DEAL rows mapped to the bridge trade-event shape (side via _deal_side)."""
         rows = self._gtdd("DEAL")
         out = []
         for t in rows:
@@ -695,6 +704,9 @@ class _XtOps:
         trader = XtQuantTrader(self.xt_path, self.session_id)
         try:
             if trader.start() is not None:  # 0 = started
+                # Non-zero/None means the QMT client is closed or auto-login is off --
+                # raise (not return) so the caller stops() this trader and retries with
+                # a fresh session instead of keeping a half-started one.
                 raise RuntimeError("XtQuantTrader.start() failed")
             if trader.connect() != 0:
                 raise RuntimeError("XtQuantTrader.connect() failed")
@@ -934,6 +946,7 @@ def _read_cfg():
 
 
 def _xt():
+    """Lazy singleton XtOps adapter shared by init/handlebar (QMT gives no instance state)."""
     global _XtAdapter_holder
     if _XtAdapter_holder is None:
         cfg = _read_cfg()
@@ -947,6 +960,7 @@ def _xt():
 
 
 def _load_cmds():
+    """Read the gateway-pushed cmd file; any read/parse failure -> empty round (never raise)."""
     import json
     try:
         f = open(CMD_PATH, "rb")
@@ -976,6 +990,7 @@ def _record_seen(seq):
 
 
 def _load_seen():
+    """Rebuild the executed-seq dedup set from the append-only seen file (empty if absent)."""
     out = set()
     try:
         f = open(SEEN_PATH, "rb")
@@ -1160,6 +1175,7 @@ def _bridge_tick():
 
 
 def init(ContextInfo):
+    """QMT strategy init: inject ContextInfo into the adapter and probe the session."""
     _trace("init called (handlebar-tick mode)")
     try:
         _xt()._ctx = ContextInfo
@@ -1172,6 +1188,7 @@ def init(ContextInfo):
 
 
 def handlebar(ContextInfo):
+    """QMT per-bar entry point: re-bind ContextInfo and run one bridge tick."""
     try:
         _xt()._ctx = ContextInfo
     except Exception:

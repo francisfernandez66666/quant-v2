@@ -3,6 +3,7 @@
 // 并内嵌 Dialog + Tabs 弹窗用于按批次查看 LLM 分析与信号批次日志。
 // 使用 TDesign React 组件（Card / Table / Tag / Button / Dialog / Tabs / Input / Select）。
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Card, Table, Tag, Button, Dialog, Tabs, Input, Select } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
@@ -510,6 +511,8 @@ function LogModal({ visible, onClose }) {
  * @returns {JSX.Element}
  */
 export default function LLMDebug() {
+  // §A5（20260918 审计批）：admin 数据源首拉 403（角色缓存伪冒/中途被降权）统一跳 /403
+  const navigate = useNavigate()
   const [loading, setLoading] = useState(false)
   const [records, setRecords] = useState([])
   const [data, setData] = useState(null)
@@ -564,6 +567,7 @@ export default function LLMDebug() {
     let mainOk = false
     let fbOk = false
     let errMsg = ''
+    let forbidden = false // §A5：双源任一回 403 即视为服务端权威角色不足
     // 主源：当日全量轮次记录
     try {
       recs = await api.fetchStageRecords()
@@ -571,6 +575,7 @@ export default function LLMDebug() {
     } catch (e) {
       recs = null
       errMsg = (e && e.message) || String(e)
+      if (api.isForbidden(e)) forbidden = true
     }
     // 引擎未启动：直接置"Agent 未就绪"空态并返回
     if (recs && recs.status === 'no_engine') {
@@ -593,6 +598,7 @@ export default function LLMDebug() {
         }
       } catch (e2) {
         if (!errMsg) errMsg = (e2 && e2.message) || String(e2)
+        if (api.isForbidden(e2)) forbidden = true
       }
     }
     // 双源任一生效：展示记录并应用最新一轮
@@ -600,6 +606,9 @@ export default function LLMDebug() {
       setRecords(recs)
       applyLatest(recs) // §FIX-0921e 传入本次取到的记录，避免读到 setState 前的旧闭包
       setDiag({ n: recs.length, mainOk, fbOk, ms: Date.now() - t0, err: '' })
+    } else if (forbidden) {
+      // §A5：数据首拉即 403——不再渲染"暂无数据"白板掩盖权限问题，重路由统一 403 页
+      navigate('/403')
     } else {
       // 双源皆失败：置无数据空态并记录诊断错误
       setNoData(true)

@@ -13,6 +13,8 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// trackerInput 把四类输入（实盘持仓、行情、评分、利空理由）拼成一次建议计算的最小入参；
+// 传 nil 的维度走降级分支，用来单独验证纪律状态机自身的产出。
 func trackerInput(positions []store.RealPosition, quotes map[string]*data.StockInfo, scores map[string]combat_agent.StockScores, bears map[string]string) AdviceInput {
 	return AdviceInput{
 		Positions:   positions,

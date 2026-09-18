@@ -97,6 +97,8 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 	retreat := s.retreatScore(sd)
 	total := board + weak + retreat
 
+	// 门槛从配置取（rules.strategy.short.leader_decay_min，缺省 65，四战法最严——断板存在反包风险）：
+	// 达标给 full_chain，50~门槛只记 watch。
 	thr := s.scoreThreshold()
 	level := "none"
 	pass := total >= thr

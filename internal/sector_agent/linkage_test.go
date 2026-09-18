@@ -20,6 +20,8 @@ func TestIsLeader(t *testing.T) {
 	}
 }
 
+// 强度打分的前置闸：非龙头（封单或连板不达标）必须直接 0 分，
+// 龙头则给出 (0,10] 的连板强度，供后续按强度排龙二龙三。
 func TestLeaderStrength(t *testing.T) {
 	if got := LeaderStrength(LinkageLeader{SealRatio: 1, BoardHeight: 3}); got != 0 {
 		t.Errorf("non-leader strength must be 0, got %v", got)

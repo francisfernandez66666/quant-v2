@@ -96,6 +96,8 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 		propagationDiscount = true
 	}
 
+	// 门槛从配置取（见 scoreThreshold）：达标给 full_chain，50~门槛只记 watch，
+	// 让"利好兑现"在盘面上先被看见，再由上层决定是否转成做空动作。
 	thr := s.scoreThreshold()
 	level := "none"
 	pass := total >= thr
@@ -114,6 +116,8 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 		conf = 0.95
 	}
 
+	// 组装评分结果：三因子分 + 事件年龄/强度/兑现幅度等原始指标 + 中文理由，
+	// prop_disc 记录本次是否被"传导类利好"打折，复盘时能区分原始分与折扣分。
 	return &strategy.Evaluation{
 		TotalScore: total,
 		Pass:       pass,

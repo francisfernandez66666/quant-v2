@@ -85,6 +85,8 @@ func TestTopNExclusiveReruns(t *testing.T) {
 	db := seedWindowDB(t)
 	codes, _ := db.StockCodes()
 
+	// 五个候选因子、持有 5 日、70/30 样本内外拆分；护栏门槛压到最低，
+	// 只为让贪心搜索在合成数据上真产出组合，重点断言排他性而非收益。
 	opts := DiscoverOpts{
 		Factors:    []string{"Mom20", "STO20", "Brk20", "RSI14", "AtrRatio14"},
 		Horizon:    5,
@@ -247,6 +249,8 @@ func TestDiscoveryResumeKeyAndCkpt(t *testing.T) {
 		t.Fatal("已驳回组合集合不同必须换 key")
 	}
 
+	// 断点缓存落库往返：临时库里先空查不应命中，save 之后按同 resumeKey+stage 读回，
+	// 确认窗口结果能原样复用（这是长任务断点续跑的正确性底座）。
 	dbPath := filepath.Join(t.TempDir(), "t.db")
 	db, err := store.Open(dbPath)
 	if err != nil {

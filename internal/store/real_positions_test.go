@@ -530,3 +530,42 @@ func TestScopedDeleteAfterClose(t *testing.T) {
 		t.Fatalf("u1 清仓后应无持仓, err=%v", err)
 	}
 }
+
+// TestRealPositionsBuyDateRoundTrip §PROD-T1（2026-09-18 生产实录）：RealPositionsForUser
+// 必须回读 buy_date——实盘建议层依赖开仓日判定"持仓超期离场"，且券商快照对账建的历史行
+// （无 buy_date）要读出空串=未知，不得伪造。加仓成交不改写既有开仓日（保守取最早）。
+// English: §PROD-T1 — RealPositionsForUser must expose buy_date (first-buy fill date),
+// empty for broker-snapshot rows; later adds never rewrite the recorded opening date.
+func TestRealPositionsBuyDateRoundTrip(t *testing.T) {
+	db := testDB(t)
+	// 券商快照对账先行：全量语义会删除快照外持仓，故先建"无 buy_date 的历史行"再走成交建仓
+	if _, err := db.ReconcilePositionsForUser("u_boss", []RealPosition{{TsCode: "600000.SH", Name: "浦发", Qty: 300, CostPrice: 10}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if err := db.ApplyRealFill(RealFill{OrderID: "A7O1", Code: "603468.SH", Name: "津富士达", Side: "买入", Price: 22.61, Qty: 100, Amount: 2261, TradedAt: "2026-09-18 09:40:00", UserID: "u_boss", SignalID: "SIG-A7-1"}); err != nil {
+		t.Fatalf("buy fill: %v", err)
+	}
+	// 同日加仓：开仓日保持首笔成交日期，不得被清空或改写
+	if err := db.ApplyRealFill(RealFill{OrderID: "A7O2", Code: "603468.SH", Name: "津富士达", Side: "买入", Price: 23.00, Qty: 100, Amount: 2300, TradedAt: "2026-09-18 10:00:00", UserID: "u_boss", SignalID: "SIG-A7-2"}); err != nil {
+		t.Fatalf("add fill: %v", err)
+	}
+	ps, err := db.RealPositionsForUser("u_boss")
+	if err != nil || len(ps) != 2 {
+		t.Fatalf("期望 2 持仓, got %d err=%v", len(ps), err)
+	}
+	var filled, snap *RealPosition
+	for i := range ps {
+		switch ps[i].TsCode {
+		case "603468.SH":
+			filled = &ps[i]
+		case "600000.SH":
+			snap = &ps[i]
+		}
+	}
+	if filled == nil || filled.BuyDate != "2026-09-18" {
+		t.Fatalf("成交建仓行 buy_date 应为 2026-09-18, got %+v", filled)
+	}
+	if snap == nil || snap.BuyDate != "" {
+		t.Fatalf("券商快照行 buy_date 应为空(未知), got %+v", snap)
+	}
+}

@@ -290,6 +290,7 @@ func (l *latencyTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	resp, err := l.fix.RoundTrip(req)
 	elapsed := time.Since(start)
 
+	// 本次请求耗时按类别归入对应分项统计，最终用于对比"注入时延 vs 实测链路时延"。
 	switch cat {
 	case "news":
 		l.metrics.addNews(elapsed)
@@ -357,6 +358,7 @@ func newLatencyLLM(profile *LatencyProfile, metrics *simMetrics) (*httptest.Serv
 			metrics.addOther(0)
 		}
 
+		// 以 OpenAI chat completion 的最小字段集回包，保证 llm 客户端能正常解析。
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"choices": []map[string]interface{}{
 				{"message": map[string]interface{}{"role": "assistant", "content": content}},

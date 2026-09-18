@@ -215,6 +215,8 @@ func (o *Outbox) pump() {
 					o.items = append(o.items[:j.idx], o.items[j.idx+1:]...)
 				} else {
 					delay := outboxBaseDelay << (it.attempts - 1) // 30s/1min/2min/4min/8min
+					// 指数退避要封顶，否则尝试次数一多位移出来的下次时间会漂到几天后；
+					// 封顶后把条目留在队列里，等 saveLocked 落盘继续排班。
 					if delay > outboxMaxDelay {
 						delay = outboxMaxDelay
 					}

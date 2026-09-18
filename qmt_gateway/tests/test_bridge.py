@@ -64,6 +64,8 @@ class TestBridgeLoop(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
+    # 测试用 HTTP 客户端：自带 Bearer tk，返回 (状态码, 解析后的 JSON)；
+    # 4xx/5xx 由 HTTPError 分支同样返回而不抛异常，方便断言网关的拒绝姿态。
     def _req(self, method, path, body=None):
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None

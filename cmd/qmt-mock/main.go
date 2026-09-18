@@ -268,6 +268,8 @@ func main() {
 	chaos := flag.Bool("chaos", false, "§P2-14 乱序回报：先推 trade 再推 order已成（回归引擎单调状态机守卫）")
 	flag.Parse()
 
+	// 内存账本在启动期一次性定型：初始现金、成交模式（非法值退回 full 并打日志）、
+	// 预置持仓与回报推送 token；之后所有 HTTP 处理与后台成交回调共享这一份状态。
 	b := newBook(*account)
 	b.cash = *cash
 	if *fillMode == "partial" || *fillMode == "reject" || *fillMode == "full" {
@@ -299,6 +301,8 @@ func main() {
 
 	handler := buildHandler(b, *token, *delay, push, *chaos)
 
+	// 监听放到后台 goroutine，主 goroutine 留给后面的信号等待；启动日志把监听地址、
+	// 资金账号与回报去向一次打全，排查联调问题时不必再猜当前进程的配置。
 	srv := &http.Server{Addr: *listen, Handler: handler}
 	go func() {
 		log.Printf("[mock] MiniQMT mock gateway listening on %s (account=%s)", *listen, b.account)
@@ -422,6 +426,9 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			Qty       int     `json:"qty"`
 			Amount    float64 `json:"amount"`
 			CreatedAt string  `json:"created_at"`
+			// §A2（AUDIT_FULLSTACK_20260918）契约字段全量声明：mock 与实网关消费面对齐；
+			// mock 不复算白名单/金额闸（那是实网关 §A1 闸口），仅受理保形态一致。
+			StrategyType string `json:"strategy_type"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, `{"ok":false,"err":"bad body"}`, http.StatusBadRequest)

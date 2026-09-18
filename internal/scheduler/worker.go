@@ -548,6 +548,8 @@ func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
 		s.ensureNightlyEnqueue(db, cfg, now)
 	}
 
+	// 一次性取出"当前槽位"快照（是否在跑 + 在跑任务的 ID/优先级），供紧随其后的
+	// 抢占判定使用；锁内只复制字段不做 IO，避免调度循环被慢任务阻塞。
 	s.mu.Lock()
 	busy := s.busy
 	var curID int64
@@ -1043,6 +1045,8 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
 	}
 
+	// 重活一律交给子进程：先解析该任务类型对应的可执行文件与参数，解析失败（如缺二进制、
+	// 缺配置）直接走 fail 回队尾；再给本次执行套上步骤超时，未配置时兜底 90 分钟。
 	bin, args, err := s.taskCommand(cfg, &tk)
 	if err != nil {
 		fail(err.Error())

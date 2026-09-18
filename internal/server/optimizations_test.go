@@ -34,6 +34,8 @@ func seedOptLib(t *testing.T, dir string) {
 }
 
 // TestOptimizationEndpoints OptimizationEndpoints。
+// 端到端串一遍寻优审批链：内置策略行审批写统一出场旋钮、规则行审批覆盖规则库并把状态推到
+// approved，再看列表分组与 reject 淘汰；数据落在临时 SQLite + 临时规则库目录里。
 func TestOptimizationEndpoints(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "trading.db"))

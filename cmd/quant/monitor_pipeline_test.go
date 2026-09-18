@@ -126,6 +126,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	// Stage 1: Engine.Evaluate
 	// ════════════════════════════════════
+	// 阶段 1 验收点：新闻事件灌进 Engine.Evaluate 后，利好板块至少 2 个、利空至少 1 个，
+	// 并把多空候选池与 L1 拦截名单拼进 detail，失败时可直接从日志定位是哪一层断了链路。
 	t.Log("\n=== STAGE 1 ===")
 	r1 := runStage("1_EngineEvaluate", func() (bool, string) {
 		sr := engine.Evaluate(context.Background(), mockEvents, positions, nil)
@@ -202,6 +204,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	vBull := sAgent.Verify(sr.HotSectors)
 	vBear := sAgent.Verify(sr.BearSectors)
 
+	// 上面已算出多空板块验证结果，这里只负责把它们排版成日志可读的 detail：
+	// 通过条件是牛市板块非空且至少带出一只成分股（7a/7b 任一侧断链都会暴露）。
 	r4 := runStage("4_SectorVerify", func() (bool, string) {
 		var bullDetail, bearDetail []string
 		for _, v := range vBull {
@@ -223,6 +227,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	// Stage 5: CombatAgent.ScanLong（8a）
 	// ════════════════════════════════════
+	// 多头选股（8a）：D1 评分器传 nil LLM 客户端，走"无评分=0 分"分支，
+	// 因此本阶段只关心 ScanLong 能否在缺评分的情况下正常返回而不 panic。
 	t.Log("\n=== STAGE 5 ===")
 	r5 := runStage("5_ScanLong", func() (bool, string) {
 		sr := engine.Evaluate(context.Background(), mockEvents, positions, nil)
@@ -277,6 +283,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	// Stage 7: StockTracker
 	// ════════════════════════════════════
+	// 信号跟踪：每条多头信号按"当日入库、1 个交易日后过期"写入 StockTracker，
+	// 再取当日活跃列表，验证过期口径（交易日而非自然日）没写反。
 	t.Log("\n=== STAGE 7 ===")
 	r7 := runStage("7_StockTracker", func() (bool, string) {
 		st := data.NewStockTracker(filepath.Join(dir, "tracked.json"))
@@ -304,6 +312,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	// Stage 8: CheckPositionAlerts
 	// ════════════════════════════════════
+	// 持仓告警：用真实 rpt（已预置两笔持仓）+ mock 行情检查止盈止损，
+	// 无行情时告警为空也属正常，本阶段只保证不报错并打印命中的告警类型。
 	t.Log("\n=== STAGE 8 ===")
 	r8 := runStage("8_PositionAlerts", func() (bool, string) {
 		alerts := cAgent.CheckPositionAlerts(rpt, api, nil, map[string]combat_agent.StockScores{})
@@ -319,6 +329,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	// Stage 9: Display Aggregator
 	// ════════════════════════════════════
+	// 看板收口：把前面各层产物（事件/板块/多空信号/告警）一次灌进 display.Aggregator，
+	// 再读快照核对各计数与最终信号列表——这是前端拿到的同一份数据结构。
 	t.Log("\n=== STAGE 9 ===")
 	r9 := runStage("9_Dashboard", func() (bool, string) {
 		sr := engine.Evaluate(context.Background(), mockEvents, positions, nil)
@@ -393,6 +405,8 @@ func TestMonitorPipelineStages(t *testing.T) {
 	// ════════════════════════════════════
 	// Summary
 	// ════════════════════════════════════
+	// 汇总各阶段结果：只要有一个阶段失败就 t.Errorf 挂掉测试，
+	// 并把失败的阶段编号（取 name 下划线前缀）串起来打印，便于直接跳到对应 Stage。
 	passCount, failCount := 0, 0
 	var failIDs []string
 	for _, r := range allResults {

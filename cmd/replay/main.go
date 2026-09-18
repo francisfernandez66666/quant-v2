@@ -53,6 +53,8 @@ func main() {
 	}
 	defer db.Close()
 
+	// 命令行参数逐项落到回测选项上：事件门槛、每日事件上限、基准与选股/因子配置，
+	// 前瞻天数单独解析成 []int（非法值立刻退出，避免跑完再报无意义结果）。
 	opts := backtest.DefaultOptions()
 	opts.Start, opts.End = *start, *end
 	opts.MinLimitUps, opts.MaxPerDay = *minLimitUps, *maxPerDay

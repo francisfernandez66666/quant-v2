@@ -94,6 +94,8 @@ func TestThreshold65Default(t *testing.T) {
 	}
 }
 
+// TestWeakRetreatLowScore 退潮证据全为 0（无情绪阶段、板块涨停降幅 0、量比不足 1、当日未触板）时，
+// 情绪退潮维度必须给 0 分，防止把"没有跟风退潮"误当成龙头自身走弱。
 func TestWeakRetreatLowScore(t *testing.T) {
 	s := New(nil)
 	d := decayData()

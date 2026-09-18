@@ -61,6 +61,8 @@ func bsLoadMeta(db *store.DB, c *data.BaostockClient) error {
 		log.Printf("[dataload] stocks 写入 %d 行", n)
 	}
 
+	// 交易日历自 2015 年起全量落库：交易时段判定、回测区间对齐都依赖 trade_cal，
+	// 缺它就只能按自然日推进（周末/节假日会产出空行情周期）。
 	cal, err := c.TradeDays("2015-01-01", time.Now().Format("2006-01-02"))
 	if err != nil {
 		return err
@@ -231,6 +233,8 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 		}
 	}
 
+	// 复权因子是 baostock K 线里拿不到的独立数据集：按分红实施日对齐 backadjustfactor，
+	// 供下游把未复权价还原成可比价格序列。
 	adj, err := c.AdjFactor(bsCode, isoFrom, isoEnd)
 	if err != nil {
 		return 0, err

@@ -80,6 +80,8 @@ func betainc(x, a, b float64) float64 {
 	if x >= 1 {
 		return 1
 	}
+	// 前置因子 bt：在对数域算 xa^pa·(1-xa)^pb/B(pa,pb)，直接求幂极易下溢，
+	// 故用 lgamma 展开成加减对数后一次 Exp，端点 x=0/1 按定义取 0。
 	// bt(pa,pb,xa) = xa^pa·(1-xa)^pb / B(pa,pb)
 	bt := func(pa, pb, xa float64) float64 {
 		if xa == 0 || xa == 1 {
@@ -113,6 +115,8 @@ func betacf(a, b, x float64) float64 {
 	d = 1 / d
 	h := d
 
+	// 修正的 Lentz 连分式迭代：每轮先算偶数项系数 aa = m(b-m)x/((a-1+2m)(a+2m))，
+	// 分别更新 d、c（分母过小时用 tiny 顶住防除零）并累乘到 h。
 	for i := 1; i <= maxIter; i++ {
 		m := float64(i)
 		m2 := 2 * m
@@ -128,6 +132,8 @@ func betacf(a, b, x float64) float64 {
 		d = 1 / d
 		h *= d * c
 
+		// 奇数项系数 aa = -(a+m)(a+b+m)x/((a+2m)(a+1+2m))：同样更新 d、c 后取
+		// del=d*c 累乘；|del-1| 小于 eps 即收敛，提前退出省掉无谓迭代。
 		aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
 		d = 1 + aa*d
 		if math.Abs(d) < tiny {

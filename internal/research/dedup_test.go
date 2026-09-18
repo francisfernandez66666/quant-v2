@@ -40,6 +40,7 @@ func TestDedupClusters(t *testing.T) {
 	c := []ICRow{mkRow("01", 0.5), mkRow("02", -0.4), mkRow("03", 0.2), mkRow("04", -0.6)}
 	base["A"], base["B"], base["C"] = a, b, c
 
+	// 阈值 0.7 下 A/B 应被并成一簇（只留 |IC| 更高的那个），C 独立保留。
 	clusters, kept := DedupClusters([]string{"A", "B", "C"}, base, 0.7)
 	_ = clusters
 	if len(kept) != 2 {
@@ -71,6 +72,7 @@ func TestDedupClusters(t *testing.T) {
 	}
 }
 
+// TestDedupWeights 校验权重按 |IC| 归一到 L1=1，且 IC 更强的因子权重更大。
 func TestDedupWeights(t *testing.T) {
 	base := map[string][]ICRow{
 		"X": {mkRow("01", 0.2), mkRow("02", 0.4)},

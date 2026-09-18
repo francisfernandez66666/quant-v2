@@ -5,10 +5,14 @@
 // tenant tags on account rows and the tenant picker; tenant admins see none of it.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
+// §A5：Admin 页接入 useNavigate（首拉 403 跳 /403），渲染需 Router 上下文
+import { MemoryRouter } from 'react-router-dom'
 
 const adminUsers = vi.fn()
 const fetchTenants = vi.fn()
 
+// api 层打桩：账号列表与租户列表转调上面的 vi.fn（每个用例可各自 mockResolvedValue 换身份/租户数据），
+// 其余只读端点给空返回值；不注入 createTenant/updateTenant 的调用，写链路只在 Go 侧覆盖。
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
   isAdmin: () => true,
@@ -42,7 +46,7 @@ describe('Admin 页 §MT 多租户', () => {
       platform: true,
     })
     fetchTenants.mockResolvedValue({ tenants: TENANTS })
-    render(<Admin />)
+    render(<MemoryRouter><Admin /></MemoryRouter>)
     await waitFor(() => expect(screen.getByText('租户管理')).toBeInTheDocument())
     expect(screen.getAllByText('某某私募').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByText('3/3')).toBeInTheDocument() // 配额用满
@@ -60,7 +64,7 @@ describe('Admin 页 §MT 多租户', () => {
       tenant_names: { t_x: '某某私募' },
       platform: false,
     })
-    render(<Admin />)
+    render(<MemoryRouter><Admin /></MemoryRouter>)
     await waitFor(() => expect(screen.getByText('账号列表')).toBeInTheDocument())
     expect(screen.queryByText('租户管理')).not.toBeInTheDocument()
     expect(fetchTenants).not.toHaveBeenCalled()

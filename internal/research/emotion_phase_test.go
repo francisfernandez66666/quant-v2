@@ -31,6 +31,8 @@ func phaseCfgStub() *config.EmotionConfig {
 	}
 }
 
+// TestPhaseFromEmotionStat 用「涨停家数 + 最高连板」桩配置跑一遍情绪周期判定，
+// 覆盖高潮/发酵/启动/冰点各档，并确认 cfg 为 nil 时回落到内置默认阈值。
 func TestPhaseFromEmotionStat(t *testing.T) {
 	cfg := phaseCfgStub()
 	cases := []struct {

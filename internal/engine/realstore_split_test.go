@@ -22,6 +22,8 @@ import (
 	"quant-trading-v2/internal/trading"
 )
 
+// 拆库装配回归：realStore 指向实盘账本库、d1Store 指向研究库，两个句柄必须各自独立打开，
+// 后续用例再验证「实盘读实盘、研究读研究」不串库。
 func TestSplitRealAndD1StoreWiring(t *testing.T) {
 	realDB, err := store.Open(filepath.Join(t.TempDir(), "live.db"))
 	if err != nil {

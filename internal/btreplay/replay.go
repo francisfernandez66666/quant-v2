@@ -202,6 +202,8 @@ func (a *nShapeAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[
 		macd = data.CalcMACD(klines)
 	}
 
+	// 把日线摊成 n_shape 期望的两段输入：WaveA 取前一交易日的 OHLCV，
+	// A 浪涨幅以再前一根收盘为基准（chgPct(prev, k[-3])），与实盘 A 浪定义一致。
 	wa := &n_shape.WaveA{
 		ADate: prev.Date.Format("2006-01-02"),
 		AOpen: prev.Open, AHigh: prev.High, ALow: prev.Low, AClose: prev.Close,

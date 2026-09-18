@@ -176,6 +176,7 @@ export default function Hotspot() {
       })
     }
 
+    // 指定了排序键：字符串列走 localeCompare，数值列直接相减，末了乘方向系数实现升/降序切换
     const dir = sortDir
     return arr.sort((a, b) => {
       const va = val(a, sk)

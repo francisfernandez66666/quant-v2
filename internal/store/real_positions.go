@@ -28,6 +28,12 @@ type RealPosition struct {
 	Strategy     string  `json:"strategy"`      // 战法
 	SignalID     string  `json:"signal_id"`     // 信号ID
 	UpdatedAt    string  `json:"updated_at"`    // 更新时间
+	// BuyDate §PROD-T1（2026-09-18）：建仓交易日（YYYY-MM-DD，ApplyRealFill 买入首成交落库）。
+	// 实盘建议视图 trading.execLogsFromReal 用它填 ExecLog.EntryAt，让"持仓超期离场"按真实
+	// 持仓天数判定；空串=开仓日未知（如券商快照对账建的行），下游超期判定自动跳过。
+	// English: §PROD-T1 — opening trade date recorded on the first buy fill; empty = unknown
+	// (e.g. rows created by broker-snapshot reconcile), and timeout checks skip when unknown.
+	BuyDate string `json:"buy_date,omitempty"`
 	// CurPrice §前端实盘持仓现价/盈亏展示用：由 handleRealPositions 装配实时行情快照填充，
 	// 网关回报本身不含实时价（仅 cost_price）。English: live price for the real-position table;
 	// filled from the quote snapshot by handleRealPositions, not carried in gateway reports.
@@ -287,7 +293,7 @@ func (d *DB) RealPositions() ([]RealPosition, error) {
 // English: §GAP1.10 — positions owned by the account plus legacy global (empty user_id) rows.
 func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 	rows, err := d.db.Query(`SELECT ts_code, name, qty, cost_price, amount, highest_price,
-		strategy, signal_id, updated_at, COALESCE(user_id,'') FROM real_positions
+		strategy, signal_id, updated_at, COALESCE(user_id,''), COALESCE(buy_date,'') FROM real_positions
 		WHERE user_id = '' OR user_id = ? ORDER BY ts_code`, userID)
 	if err != nil {
 		return nil, err
@@ -297,7 +303,7 @@ func (d *DB) RealPositionsForUser(userID string) ([]RealPosition, error) {
 	for rows.Next() {
 		var p RealPosition
 		if err := rows.Scan(&p.TsCode, &p.Name, &p.Qty, &p.CostPrice, &p.Amount,
-			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID); err != nil {
+			&p.HighestPrice, &p.Strategy, &p.SignalID, &p.UpdatedAt, &p.UserID, &p.BuyDate); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -832,6 +838,88 @@ func (d *DB) AdvanceRealOrderStatus(userID, signalID, status string) (bool, erro
 	return n > 0, nil
 }
 
+// §A4（20260918 全栈审计批）委托回报（order 事件）处理动作枚举：ApplyOrderReportTx 返回值。
+// English: §A4 outcome vocabulary for ApplyOrderReportTx.
+const (
+	OrderReportAdvanced = "advanced" // 本地已有单且秩推进成功（updated）
+	OrderReportInserted = "inserted" // 本地无单，补插完整委托行（inserted）
+	OrderReportIgnored  = "ignored"  // 乱序/重放/回退或唯一键冲突，未写任何数据（no-op）
+)
+
+// ApplyOrderReportTx §A4（20260918 全栈审计批）委托状态回报的单事务原子落库：
+// 把旧 server/qmt.go "case order" 路径的两步独立写——AdvanceRealOrderStatus（按 signal_id
+// 单调推进）→ 未命中再 UpsertRealOrder（补插）——合并为一个事务内的 SELECT+UPDATE/INSERT。
+// 旧实现的竞态窗口：进程在"推进失败"与"补插"两步之间崩溃或被并发插入打断时，
+// 回报可能整体丢失（outbox 重放前本地状态空洞）；合并后要么推进、要么补插、要么
+// 明确 no-op，三步判定共享同一事务快照。语义与两步版严格一致：
+//   - 本地有行且回报秩 > 当前秩 → UPDATE status，返回 advanced；
+//   - 本地有行且秩不升 → 返回 ignored（绝不回退真实进度，§R4-4 单调守卫）；
+//   - 本地无行 → INSERT OR IGNORE 完整委托行，插入生效返回 inserted、
+//     唯一键 (user_id, signal_id) 冲突返回 ignored。
+//
+// userID 作用域口径与 AdvanceRealOrderStatus 相同：空=仅遗留全局行，非空=严格本账号。
+// English: §A4 — folds the order-report path (guarded advance, then insert-if-absent) into a
+// single transaction so a crash or a concurrent insert between the two former statements can no
+// longer drop a report. Monotonic rank guard, signal_id scoping and INSERT OR IGNORE idempotency
+// are preserved verbatim; returns one of advanced/inserted/ignored.
+func (d *DB) ApplyOrderReportTx(o RealOrder) (string, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	// 先按 user_id 作用域读出本地状态：空账号只匹配遗留的全局行，
+	// 拿到 cur 才能在下面做「只升不降」的秩比较。
+	var cur string
+	if o.UserID == "" {
+		err = tx.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=''`, o.SignalID).Scan(&cur)
+	} else {
+		err = tx.QueryRow(`SELECT status FROM orders WHERE signal_id=? AND user_id=?`, o.SignalID, o.UserID).Scan(&cur)
+	}
+	switch err {
+	case nil:
+		// 本地有行：仅高秩才推进（与 AdvanceRealOrderStatus 同守卫）。
+		if orderStatusRank(o.Status) <= orderStatusRank(cur) {
+			return OrderReportIgnored, nil // defer Rollback：无写入
+		}
+		if o.UserID == "" {
+			_, err = tx.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=''`, o.Status, o.SignalID)
+		} else {
+			_, err = tx.Exec(`UPDATE orders SET status=? WHERE signal_id=? AND user_id=?`, o.Status, o.SignalID, o.UserID)
+		}
+		if err != nil {
+			return "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return OrderReportAdvanced, nil
+	case sql.ErrNoRows:
+		// 本地无此单（网侧重放/回报先于下单回填到达）：补插完整委托行。
+		res, err := tx.Exec(`INSERT OR IGNORE INTO orders
+			(order_id, signal_id, code, side, status, price, qty, created_at, user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			o.OrderID, o.SignalID, o.Code, o.Side, o.Status, o.Price, o.Qty, o.CreatedAt, o.UserID)
+		if err != nil {
+			return "", err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		if n > 0 {
+			return OrderReportInserted, nil
+		}
+		return OrderReportIgnored, nil // 同事务内唯一键冲突（并发对手机已插入）：幂等 no-op
+	default:
+		return "", err
+	}
+}
+
 // UpdateRealOrderStatusMonotonic §P0-4 撤单路径单调状态机：仅当目标状态秩高于当前秩时才更新。
 // 防止"网关撤单响应晚于成交回报"时把 已成/已撤 回退为 已撤，或把部成回退为已报。
 // userID 为空时仅操作遗留全局行。
@@ -922,6 +1010,7 @@ func MigrateRealTablesIfEmpty(dst, src *DB) (bool, error) {
 		return false, nil
 	}
 
+	// 搬迁整体在 dst 的一个事务里完成：任何一张表出错都整体回滚，避免出现半本实盘账。
 	tx, err := dst.db.Begin()
 	if err != nil {
 		return false, err
@@ -932,6 +1021,7 @@ func MigrateRealTablesIfEmpty(dst, src *DB) (bool, error) {
 		}
 	}()
 
+	// 持仓表逐行搬：INSERT OR REPLACE 以主键覆盖，重复迁移不会把数量翻倍。
 	// real_positions
 	if rows, rerr := src.db.Query(`SELECT ts_code,name,qty,cost_price,amount,highest_price,strategy,signal_id,updated_at,user_id FROM real_positions`); rerr == nil {
 		for rows.Next() {
@@ -949,6 +1039,7 @@ func MigrateRealTablesIfEmpty(dst, src *DB) (bool, error) {
 		rows.Close()
 	}
 
+	// 委托单同样按 order_id 覆盖式搬迁，迁移中断后重跑不会造出重复委托。
 	// orders
 	if oRows, oerr := src.db.Query(`SELECT order_id,signal_id,code,side,status,price,qty,created_at,user_id FROM orders`); oerr == nil {
 		for oRows.Next() {
@@ -966,6 +1057,7 @@ func MigrateRealTablesIfEmpty(dst, src *DB) (bool, error) {
 		oRows.Close()
 	}
 
+	// 成交簿是只增流水，这里用普通 INSERT 追加（重复迁移的可能已由「dst 非空即跳过」拦住）。
 	// fills
 	if fRows, ferr := src.db.Query(`SELECT order_id,code,side,price,qty,amount,traded_at,signal_id,user_id FROM fills`); ferr == nil {
 		for fRows.Next() {

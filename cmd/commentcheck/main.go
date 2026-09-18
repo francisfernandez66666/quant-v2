@@ -22,6 +22,8 @@ func main() {
 	thr := flag.Int("thr", 15, "连续无注释行阈值")
 	flag.Parse()
 
+	// 该命令约定在仓库根执行：先取 cwd 作为拼相对目录的基准，取不到就直接退出 2，
+	// 避免扫描范围静默退化成当前子目录。
 	root, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "getwd:", err)

@@ -222,6 +222,9 @@ func (f *FactorStrategy) Evaluate(code string, data interface{}) (*strategy.Eval
 	}
 	series := seriesFromKLines(md.KLines, md.Fina)
 
+	// 逐条启用规则各自独立打分，只保留原始分最高的一条作为本次结果（没有规则达标时也返回
+	// 最高分，由上层门槛决定放不放行）；最高分连同其规则存进 pending，
+	// 供随后的 GenerateSignal 还原"这条信号出自哪条规则"。
 	best := &pendingEval{}
 	var bestScore = -1.0
 	for _, r := range rules {

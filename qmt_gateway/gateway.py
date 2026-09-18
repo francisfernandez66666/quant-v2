@@ -3,10 +3,18 @@
 """qmt_gateway.gateway — 东莞证券 MiniQMT 网关 REST 服务（AUTO_TRADING_PLAN M2）。
 
 零第三方依赖（标准库 http.server）。接口与首尔侧 trading.QMTClient 契约一致：
-  POST /order   {"signal_id","code","name","strategy","side","price_type","price","qty","amount","created_at"} → {"ok","order_id","err"}
+  POST /order   {"signal_id","code","name","strategy","strategy_id","strategy_type","side",
+                 "price_type","price","qty","amount","created_at","staleness_ms","prev_close","current_price"}
+                → {"ok","order_id","err"}
   POST /cancel  {"order_id"}                                                    → {"ok","err"}
   GET  /state   → {"connected","account","positions","orders"}
   GET  /health  → {"ok","ts","broker","broker_connected"}   （免鉴权；broker_connected 反映通道真实状态）
+
+§A1/A2（AUDIT_FULLSTACK_20260918）字段消费口径——/order 15 字段逐字段显式声明：
+  消费：signal_id/code/side/price_type/price/qty/amount/created_at/strategy_type/strategy（broker 备注）；
+  忽略：name/strategy_id/staleness_ms/prev_close/current_price（首尔侧专属闸的输入，网关不复算）。
+  集合以 qmt_gateway/contract/order_fields.json 为 golden，Go 侧 internal/trading 契约测试与
+  本文件 CONTRACT_CONSUMED_FIELDS/CONTRACT_IGNORED_FIELDS 三点校验，新增字段漏声明即双红。
 
 Bearer token 双向鉴权。§G1 下单改为「claim 占位 → 下单 → settle 回填」三段式，
 signal_id 原子幂等（并发重试/崩溃窗口均不重复真实下单）；§G2 空 signal_id 直接 400；
@@ -80,7 +88,20 @@ DEFAULT_CONFIG = {
     "failover_enable": False,           # 自动翻转开关（xt 断连 N 秒→queued，交易时段）
     "failover_sec": 60,                 # xt 断连超过该秒数触发自动翻转
     "bridge_heartbeat_timeout_sec": 15,  # 桥心跳新鲜窗口（超时视为离线）
+    # §A1（AUDIT_FULLSTACK_20260918）网关侧独立风控（与首尔 risk.Gate 同语义，0/空=闸关闭）
+    "max_order_amount": 0,              # 单笔金额绝对帽（元，买卖双向；amount 缺失回退 qty×price）
+    "allowed_strategies": [],           # 战法白名单（非空时买入单 strategy_type 必须命中）
+    "strict_fields": False,             # 白名单启用时缺 strategy_type 是否 fail-close 拒单
 }
+
+# §A2 契约字段显式声明集（与 contract/order_fields.json、Go OrderRequest 三点校验）：
+# consumed = 网关/ broker 链路真实读取的 /order 字段；ignored = 首尔侧专属闸输入，网关不复算。
+# 新增 OrderRequest 字段必须同时进本集与 golden，否则 pytest + go test 双红。
+CONTRACT_CONSUMED_FIELDS = {
+    "signal_id", "code", "side", "price_type", "price", "qty",
+    "amount", "created_at", "strategy_type", "strategy",
+}
+CONTRACT_IGNORED_FIELDS = {"name", "strategy_id", "staleness_ms", "prev_close", "current_price"}
 
 
 def load_config(path):
@@ -280,6 +301,8 @@ class Gateway:
             try:
                 inflight = self.store.dispatch_inflight(limit=50)
             except Exception:  # noqa: BLE001
+                # 取 inflight 失败就整轮跳过：宁可不重写命令文件，也不能写空——
+                # 写空 = 桥侧丢掉未消费的在途单（丢单比留一份旧命令文件更危险）
                 return
             self._file_bridge_reconcile_cmds(cmd_path, inflight)
             return
@@ -445,6 +468,8 @@ class Gateway:
                         b.connect()
                         log.info("[gateway] broker %s connected", key)
                     except Exception as e:  # noqa: BLE001
+                        # 连接失败：失败计数递增后按指数退避等待（封顶 60s），
+                        # continue 跳过本轮其余通道的重连，避免每秒猛戳 QMT 客户端
                         xt_fail_streak += 1
                         backoff = min(60, int(self.cfg.get("reconnect_sec", 5)) * (2 ** min(xt_fail_streak, 4)))
                         log.warning("[gateway] %s connect failed: %s (backoff %ss, streak=%d)",
@@ -834,6 +859,34 @@ class Gateway:
             held_codes = [p["ts_code"] for p in held_list]
             if len(held_list) >= max_pos and code not in held_codes:
                 return 400, {"ok": False, "err": "max_positions reached"}
+
+        # §A1（AUDIT_FULLSTACK_20260918）网关侧独立金额帽：与首尔 risk.Gate.checkMaxOrderAmount
+        # 同语义——0=关闭，买卖双向拒单；amount 缺失/非正回退 qty×参考价（首尔同款回退）。
+        # 拒单发生在 claim 之前，不消耗幂等占位，首尔可安全修正后重试。
+        max_amt = float(self.cfg.get("max_order_amount", 0) or 0)
+        if max_amt > 0:
+            try:
+                amt = float(req.get("amount", 0) or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            if amt <= 0:
+                amt = qty * price
+            if amt > max_amt:
+                return 400, {"ok": False,
+                             "err": "amount %.2f exceeds gateway cap %.2f" % (amt, max_amt)}
+
+        # §A1 战法白名单（网关第二道闸）：空列表=关闭（与首尔开关的存量语义一致）；
+        # 非空时买入方向必须显式命中 strategy_type（卖出/零股清仓不设准入，同 signalctl 直通语义）。
+        # strict_fields=true 时缺键 fail-close 拒单；默认 false 缺键放行（旧客户端兼容窗口）。
+        allowed = [str(x) for x in (self.cfg.get("allowed_strategies") or [])]
+        if allowed and side == "买入":
+            stype = str(req.get("strategy_type", "") or "")
+            if not stype:
+                if bool(self.cfg.get("strict_fields", False)):
+                    return 400, {"ok": False, "err": "strategy_type required (strict_fields)"}
+            elif stype not in allowed:
+                return 400, {"ok": False,
+                             "err": "strategy %s not in gateway whitelist" % stype}
 
         # §G1 原子占位：抢不到 = 已处理过（幂等返回）或正在下单中（409 防并发穿透）
         draft = {

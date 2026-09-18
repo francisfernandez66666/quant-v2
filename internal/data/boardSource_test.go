@@ -20,6 +20,8 @@ type mockBoard struct {
 	sector []SectorInfo
 }
 
+// mockBoard 的 BoardSource 实现：Sectors 按预设的 fail/empty 分支返回结果，
+// 并累加 calls 计数，供断言「熔断之后不再调用该源」。
 func (m *mockBoard) Name() string { return m.name }
 func (m *mockBoard) Sectors() ([]SectorInfo, error) {
 	m.calls++

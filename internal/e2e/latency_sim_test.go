@@ -75,6 +75,8 @@ func newRehearsalRig(t *testing.T, fix *Fixture, profile *LatencyProfile, metric
 
 	tmp := t.TempDir()
 
+	// 时延演练同样要跑真实认证装配：初始化临时用户库并注册 tester，
+	// 让咨询/复盘等依赖登录态的链路在演练里不被跳过。
 	authMgr := auth.NewManager(tmp)
 	if err := authMgr.Init(); err != nil {
 		t.Fatalf("auth init: %v", err)

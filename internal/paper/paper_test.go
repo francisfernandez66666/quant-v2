@@ -194,6 +194,8 @@ func TestPoolPerfBackfillLegacy(t *testing.T) {
 	raw, _ := json.Marshal(st)
 	_ = os.WriteFile(path, raw, 0644)
 
+	// 用同一路径重新 New，等价于进程重启后按 state 文件恢复账本：
+	// 恢复过程要把缺失的池成本回填成持仓成本合计。
 	e2 := New(c, path)
 	var f *StrategyPoolState
 	for i := range e2.StrategyPools() {

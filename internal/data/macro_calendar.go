@@ -226,6 +226,8 @@ func AddGeopoliticalEvent(events *[]MacroEvent, title string) {
 func GetActiveMacroEvents(events []MacroEvent, now time.Time) []MacroEvent {
 	var active []MacroEvent
 
+	// 事件类别权重表：战争/贸易合约这类突发冲击排在美联储与经济数据之前，
+	// 供下面的排序使用，数值只表示相对强弱不是绝对影响度。
 	priority := map[string]int{
 		"war":      100,
 		"contract": 90,

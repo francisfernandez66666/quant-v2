@@ -1,6 +1,6 @@
 // ── 根组件 App.jsx ──
 // 主布局：侧边栏导航（TDesign Menu）+ 顶部栏（TDesign Header）+ 内容区（Routes）；未登录显示登录页。
-// 全局逻辑：登录态恢复、15s 状态轮询、SSE 推送订阅、做空开关、通知测试、Toast 提示。
+// 全局逻辑：登录态恢复、60s 状态轮询、SSE 推送订阅、做空开关、通知测试、Toast 提示。
 // 全站使用 TDesign React 组件 + 浅色主题（默认，不设置 theme 即为浅色）。
 import React, { useState, useEffect, useRef, Suspense, lazy } from 'react'
 import { NavLink, Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
@@ -22,7 +22,12 @@ import * as api from './api/index.js'
 import { dispatch as sseDispatch } from './sseBus.js'
 import { isNative, canNotify, requestPermission, notify as sendNotify, notifyThrottled } from './notify.js'
 import { showToast, showNotify } from './ui.jsx'
-import { sseOpsAlert } from './utils.js'
+import { sseOpsAlert, versionMismatchNotice } from './utils.js'
+
+// §A7（20260918 审计批）本地构建指纹：vite define 在构建期把 __BUILD_COMMIT__ 文本替换为
+// git 短 SHA 字符串字面量（见 vite.config.js）。dev/undefined 走哨兵值不参与比对。
+// English: §A7 — build-time git SHA injected by vite define; falls back to the 'dev' sentinel.
+const APP_BUILD_COMMIT = typeof __BUILD_COMMIT__ !== 'undefined' ? __BUILD_COMMIT__ : 'dev'
 
 import Dashboard from './pages/Dashboard.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
@@ -69,11 +74,19 @@ function Forbidden() {
 // 路由级权限守卫：根据后端已下发的角色/权限位决定是否渲染，无权限则重定向到 403。
 // 后端接口已做鉴权兜底，此处仅作体验层保护（避免直接渲染无权页面）。
 //   admin: 仅管理员可访问；perm: 指定权限位（管理员隐式全部）。
-function ProtectedRoute({ admin, perm, children }) {
+//   §A5（20260918 审计批）checked: 服务端权威角色是否已完成对账（/api/auth/me 首拉返回）。
+//   未完成前不放行也不重定向（渲染加载占位），杜绝篡改 localStorage 角色后
+//   admin 壳先渲染、逐屏吃 403 的窗口期。
+//   English: §A5 — guarded routes stay on a loading placeholder until the authoritative role
+//   from GET /api/auth/me has been reconciled into storage.
+function ProtectedRoute({ admin, perm, checked, children }) {
   // §P1-13 路由守卫：未登录先跳转登录页（/ 由顶层 loggedIn 切换为登录视图），
   // 已登录但权限/角色不足才落到 /403，避免未登录直接暴露 401 空页面。
   if (!api.isLoggedIn()) {
     return <Navigate to="/" replace />
+  }
+  if (!checked) {
+    return <PageFallback />
   }
   const allowed = admin ? api.isAdmin() : perm ? api.hasPerm(perm) : true
   return allowed ? children : <Navigate to="/403" replace />
@@ -98,6 +111,11 @@ export default function App() {
   const [shortEnabled, setShortEnabled] = useState(false)
   const [canResearch, setCanResearch] = useState(false)
   const [canAdmin, setCanAdmin] = useState(false)
+  // §A5（20260918 审计批）服务端权威角色对账完成位：ProtectedRoute 在其为 false 前不放行
+  const [meChecked, setMeChecked] = useState(false)
+  // §A7（20260918 审计批）版本漂移告警文案：refreshStatus 比对本地构建指纹与 /api/status
+  // build_commit 得出；null=一致或双方有哨兵值（dev/unknown/缺字段）不告警。
+  const [versionNotice, setVersionNotice] = useState(null)
   // 权限入口状态位：研究审批/管理员/模拟盘三个入口由后端角色与开关决定
   const [paperEnabled, setPaperEnabled] = useState(false)
   // §MARKET_RISK_GATE F2：市场环境条状态（情绪相位/市场状态/仓位档/风险档），由 SSE `score` 广播驱动
@@ -130,7 +148,14 @@ export default function App() {
       setLoggedIn(true)
       setAccount(api.getAccount())
       api.setStoredServer(serverUrl)
+      // §A5（20260918 审计批）强对账门：受 ProtectedRoute 保护的路由在 meChecked 置真前
+      // 只显示加载占位——localStorage 角色（可被手工篡改）不再决定 admin 壳是否渲染，
+      // 一切以 GET /api/auth/me 回读的服务端权威角色为准。对账失败（服务器不可达）
+      // 仍放行：可用性优先，后端逐接口鉴权兜底不变；401 由 request() 广播 auth:expired 回登录页。
+      // English: §A5 — guarded routes wait for the authoritative GET /api/auth/me reconciliation;
+      // a failed reconcile (offline server) still lets the app render with cached roles.
       try { await api.refreshMe() } catch (_) {}
+      setMeChecked(true)
       applyRoleGates()
       return true
     }
@@ -149,6 +174,8 @@ export default function App() {
       await api.login(username, password)
       setAccount(api.getAccount())
       setLoggedIn(true)
+      // §A5：登录响应本身即服务端权威角色（storeAuth 落盘 role/perms），对账门直接放行
+      setMeChecked(true)
       applyRoleGates()
       startPolling()
       MessagePlugin.success('登录成功')
@@ -170,6 +197,7 @@ export default function App() {
     stopPolling()
     setLoggedIn(false)
     setMenuOpen(false)
+    setMeChecked(false) // §A5：换账号后对账门重置，下次恢复登录态必须重新过 /api/auth/me
     applyRoleGates()
     navigate('/')
   }
@@ -182,7 +210,9 @@ export default function App() {
       setSignalCount(st.signal_count || 0)
       setInTradeTime(st.in_trade_time)
       setActiveWindow(st.active)
-    } catch (_) { setServerOnline(false) }
+      // §A7：APK/页面向导比对——服务器 build_commit 与本地构建指纹不一致即顶栏横幅告警
+      setVersionNotice(versionMismatchNotice(APP_BUILD_COMMIT, st.build_commit))
+    } catch (_) { setServerOnline(false); setVersionNotice(null) }
     // 独立轮询未读消息数：失败不影响主状态展示
     try {
       const alerts = await api.fetchAlerts()
@@ -481,6 +511,14 @@ export default function App() {
                若填了自定义地址请改为留空（使用当前域名 quant-trading.top），或确认该地址可达。
              </div>
            )}
+           {/* §A7 版本漂移横幅：内嵌前端构建指纹与后端 /api/status build_commit 不一致时常驻提示
+               （典型场景：APK 未随服务器重新打包）。样式沿用断联横幅的 warn 变量。
+               English: §A7 — persistent banner when the embedded build id lags the server's. */}
+           {versionNotice && (
+             <div style={{ margin: '8px 12px 0', padding: '8px 12px', borderRadius: 6, background: 'var(--app-warn-bg)', border: '1px solid var(--app-warn-border)', color: 'var(--app-warn-text)', fontSize: 13 }}>
+               🔄 {versionNotice}
+             </div>
+           )}
            <div className="app-body">
             {/* 中部主体注释起点：以下为 app-body（左栏 aside + 右栏 main） */}
             {/*
@@ -520,6 +558,8 @@ export default function App() {
                 <div className={canAdmin ? 'role-badge role-admin' : 'role-badge role-user'}>
                   {canAdmin ? '管理员' : '普通用户'}
                 </div>
+                {/* §A7 内嵌前端构建指纹常驻展示（APK 排查"这份壳到底是什么版本打包的"一眼可辨） */}
+                <div style={{ fontSize: 11, opacity: .6, marginTop: 4 }}>build {APP_BUILD_COMMIT}</div>
               </div>
             </aside>
             {/*
@@ -567,20 +607,20 @@ export default function App() {
                     <Route path="/msgcenter" element={<MsgCenter />} />
                     {/*
                      * 设置页：仅管理员（ProtectedRoute admin 守卫） */}
-                    <Route path="/settings" element={<ProtectedRoute admin><Settings /></ProtectedRoute>} />
+                    <Route path="/settings" element={<ProtectedRoute admin checked={meChecked}><Settings /></ProtectedRoute>} />
                     {/*
                      * LLM 诊断页：查看大模型调用与结构化输出
                      * §PERM-GATE 20260918：数据源 admin 守卫，套 ProtectedRoute admin 与侧栏一致 */}
-                    <Route path="/llm-debug" element={<ProtectedRoute admin><LLMDebug /></ProtectedRoute>} />
+                    <Route path="/llm-debug" element={<ProtectedRoute admin checked={meChecked}><LLMDebug /></ProtectedRoute>} />
                     {/*
                      * 股票咨询页：自然语言问询个股/板块 */}
                     <Route path="/consult" element={<Consult />} />
                     {/*
                      * 自动研究页：需 research_approve 权限（研究闭环审批入口） */}
-                    <Route path="/research" element={<ProtectedRoute perm="research_approve"><Research /></ProtectedRoute>} />
+                    <Route path="/research" element={<ProtectedRoute perm="research_approve" checked={meChecked}><Research /></ProtectedRoute>} />
                     {/*
                      * 用户管理页：仅管理员 */}
-                    <Route path="/admin" element={<ProtectedRoute admin><Admin /></ProtectedRoute>} />
+                    <Route path="/admin" element={<ProtectedRoute admin checked={meChecked}><Admin /></ProtectedRoute>} />
                     {/*
                      * 模拟盘页：纸面交易记账/自动撮合（入口受 paperEnabled 开关控制） */}
                     <Route path="/paper" element={<Paper />} />

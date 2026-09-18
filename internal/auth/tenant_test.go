@@ -12,6 +12,8 @@ import (
 	"testing"
 )
 
+// newTenantMgr 在临时目录里建好并 Init 一个多租户管理器，
+// 让各用例的 users.json 落盘互不干扰。
 func newTenantMgr(t *testing.T) *Manager {
 	t.Helper()
 	m := NewManager(t.TempDir())

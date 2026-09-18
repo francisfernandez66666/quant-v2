@@ -91,6 +91,8 @@ func (s *Strategy) Evaluate(code string, data interface{}) (*strategy.Evaluation
 		shakeoutDiscount = true
 	}
 
+	// 门槛从配置取（rules.strategy.short.break_down_min，缺省 60）：达标给 full_chain，
+	// 50~门槛只记 watch，让前端看见但不下单。
 	thr := s.scoreThreshold()
 	level := "none"
 	pass := total >= thr

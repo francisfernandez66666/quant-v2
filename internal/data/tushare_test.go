@@ -39,6 +39,8 @@ func TestCallParse(t *testing.T) {
 		[][]any{{"600000.SH", "20250102", 11.8, 3.2, 1}, {"000001.SZ", "20250103", nil, -1.5, nil}},
 		nil)
 
+	// 客户端指向上面的 mock 服务正常调用一次 daily：先确认行数与无错误，
+	// 字段名与取值的具体断言放在后面。
 	c := NewTushareClient("test-token")
 	rows, err := c.Call("daily", map[string]string{"trade_date": "20250102"}, "ts_code,trade_date,close,pct_chg,is_open")
 	if err != nil {
