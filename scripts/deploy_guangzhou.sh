@@ -45,8 +45,12 @@ MINIQMT_PATH="${MINIQMT_PATH:-C:/Program Files (x86)/东莞证券QMT实盘交易
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_DIR"
 
-SSH="ssh -o StrictHostKeyChecking=accept-new ${GZ_USER}@${GZ_IP}"
-SCP="scp -o StrictHostKeyChecking=accept-new"
+# IdentitiesOnly + 指定密钥：agent 里若挂多把 key，ssh 会逐把尝试直至撞服务端
+# MaxAuthTries 上限跌落到密码认证（2026-09-18 部署实录：脚本卡在 password 提示，
+# 手工 BatchMode ssh 正常——差异即在 agent key 枚举）。~/.ssh/config 的 Host 条目
+# 已指定 IdentityFile ~/.ssh/id_rsa，此处显式声明与之对齐，保证任何会话形态下确定性行为。
+SSH="ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $HOME/.ssh/id_rsa ${GZ_USER}@${GZ_IP}"
+SCP="scp -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $HOME/.ssh/id_rsa"
 
 # ps1_bom <file>：上传前把 Windows PowerShell 脚本归一为「UTF-8 单 BOM + CRLF」。
 # 为何需要：PS 5.1 读无 BOM 的 UTF-8 按 GBK 解析中文注释会撕裂字面量直接 ParserError（现网实录）；
