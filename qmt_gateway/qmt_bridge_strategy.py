@@ -144,6 +144,106 @@ BUY_CONST_FALLBACK, SELL_CONST_FALLBACK = 23, 24
 # Written as unicode escapes to keep the file pure ASCII (sandbox taboo 3).
 BUY, SELL = "\u4e70\u5165", "\u5356\u51fa"
 
+# ---------------------------------------------------------------------------
+# P0 2026-09-18 "buy/sell mixed up" incident: DEAL-row direction resolution.
+#
+# A fill's direction reaches the ledger only through this function, so any wrong
+# guess here silently corrupts fills.side (and with it cost basis, realized PnL
+# and win-rate attribution -- real_positions itself is re-synced by the 30s full
+# reconciliation, but the blotter row is permanent).
+#
+# Known counter enum spaces (docs/archive/AUTO_TRADING_UAT_20260831.md sec.10.3,
+# plus the 2026-09-14 drill-3 DEAL dump):
+#   m_nDirection           48='0'=buy / 49='1'=sell   (DEAL row, drill-3)
+#   m_nOffsetFlag/offset   48=buy       / 50=sell     (counter push-back, proven
+#                                                      by cash-flow direction)
+#   m_nOrderType/order_type 23=buy/24=sell (this DGZQ build) or 1101/1102
+#                            (mainstream docs)
+# 48 means buy in BOTH the direction and the offset space, and sells show up as
+# either 49 or 50 depending on the build -- so BOTH are accepted for sell.
+#
+# 2026-09-18 hardening (the reason this helper exists):
+#   1. every readable field votes; the old code returned BUY as soon as ONE field
+#      read 48, so a stale/renamed 48 field could flip a real SELL to BUY;
+#   2. unanimous vote -> that side; CONFLICT -> do not guess blindly: fall through
+#      to order_type and then to the conservative default (SELL), tracing the raw
+#      fields once so the real enum space can be pinned from bridge_boot.log;
+#   3. every unresolved combination is traced ONCE (bounded, no log storm) instead
+#      of failing silently -- the previous silent fallback hid this bug for days.
+# (ASCII only: this file must stay byte-clean for the Windows/GBK sandbox.)
+# ---------------------------------------------------------------------------
+_DIR_BUY = (0, 48)          # direction space (int or ASCII '0')
+_DIR_SELL = (1, 49, 50)     # direction space (int or ASCII '1') + offset sell 50
+_OFF_BUY = (48,)
+_OFF_SELL = (50,)
+_DIR_ATTRS = ("m_nDirection", "m_nOffsetFlag", "offset_type")
+_DIR_TRACE_SEEN = set()
+
+
+def _int_or(v, default=-1):
+    """int(v) or default on TypeError/ValueError/None (never raises)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _deal_side(t, op_buy=BUY_CONST_FALLBACK, op_sell=SELL_CONST_FALLBACK):
+    """Resolve one DEAL row's side -> (BUY|SELL, ascii descriptor of what was read).
+
+    See the enum-space table above. The descriptor is ASCII-only (safe for the GBK
+    sandbox trace file) and is emitted exactly once per distinct unresolved combo.
+    """
+    votes = []
+    raw_dirs = {}
+    for attr in _DIR_ATTRS:
+        v = getattr(t, attr, None)
+        if v is None:
+            continue
+        v = _int_or(v)
+        raw_dirs[attr] = v
+        if attr in ("m_nDirection",):
+            if v in _DIR_BUY:
+                votes.append((BUY, attr))
+            elif v in _DIR_SELL:
+                votes.append((SELL, attr))
+        else:  # offset / entype space
+            if v in _OFF_BUY:
+                votes.append((BUY, attr))
+            elif v in _OFF_SELL:
+                votes.append((SELL, attr))
+    sides = set(s for s, _ in votes)
+    if len(sides) == 1:
+        return sides.pop(), "%s=%s" % (votes[0][1], raw_dirs[votes[0][1]])
+    # order_type / m_nOrderType as the next authority (both build spaces).
+    ot = _int_or(getattr(t, "m_nOrderType", None))
+    if ot == -1:
+        ot = _int_or(getattr(t, "order_type", None), 0)
+    if ot in (23, 1101) or ot == op_buy:
+        return BUY, "order_type=%s" % ot
+    if ot in (24, 1102) or ot == op_sell:
+        return SELL, "order_type=%s" % ot
+    # Last resort: an explicit direction string, if this build exposes one.
+    # Attr order matters little; first non-empty wins. "0"/"1" strings cover the
+    # entrust_bs style (0=buy / 1=sell) seen on some counters.
+    raw = ""
+    for attr in ("direction", "bs_type", "entrust_bs"):
+        raw = str(getattr(t, attr, "") or "")
+        if raw:
+            break
+    up = raw.upper()
+    if raw.strip() == "0" or "BUY" in up or "\u4e70" in raw:
+        return BUY, "direction=%s" % ascii(raw)
+    if raw.strip() == "1" or "SELL" in up or "\u5356" in raw:
+        return SELL, "direction=%s" % ascii(raw)
+    desc = "dirs=%s order_type=%s direction=%s" % (
+        sorted(raw_dirs.items()), ot, ascii(raw))
+    if desc not in _DIR_TRACE_SEEN:
+        _DIR_TRACE_SEEN.add(desc)
+        _trace("DEAL direction UNRESOLVED (%s) -> conservative fallback SELL; "
+               "extend the enum map in _deal_side" % desc)
+    return SELL, desc
+
 
 class _XtOps:
     """canonical embedded adapter (XtQuantTrader instance), lazy at first non-dry call.
@@ -204,7 +304,12 @@ class _XtOps:
         return b if callable(b) else None
 
     def _embed_acct(self):
-        """Resolve the funding accountID for sandbox trade queries (NOT literal 'stock')."""
+        """Resolve the funding accountID for sandbox trade queries (NOT literal 'stock').
+
+        Resolve-once-then-cache: repeated get_account() calls per query would spam the
+        sandbox and risk cross-account drift mid-session if the client returns a
+        different order. Fallback chain: resolved id -> self.account -> embed_account_id.
+        """
         if getattr(self, "_acct_resolved", None):
             return self._acct_resolved
         self._acct_resolved = None
@@ -227,6 +332,9 @@ class _XtOps:
     def probe_embed(self):
         """Capability probe; dumps the sandbox trade-function surface to boot.log so
         per-build signature differences are diagnosable at a glance."""
+        # Collect candidate trade functions from BOTH builtins and module globals:
+        # sandbox builds inject them in either place (or both), and the actual set
+        # differs per broker build -- this list is the diagnosis baseline.
         names = []
         try:
             import builtins as _b
@@ -307,6 +415,9 @@ class _XtOps:
         return out
 
     def embed_positions(self):
+        # Map raw position rows to the engine ledger shape. Two hard filters first:
+        # qty<=0 rows are closed-but-not-cleared shells (booked positions would be
+        # resurrected as ghosts), and code-less rows cannot be attributed at all.
         rows = self._gtdd("POSITION")
         out = []
         for p in rows:
@@ -361,25 +472,24 @@ class _XtOps:
             price = float(getattr(t, "m_dPrice", 0) or getattr(t, "traded_price", 0) or 0)
             qty = int(getattr(t, "m_nVolume", 0) or getattr(t, "traded_volume", 0) or 0)
             ot = int(getattr(t, "m_nOrderType", 0) or getattr(t, "order_type", 0) or 0)
-            # FIX 2026-09-14 drill-3: DEAL rows carry m_nDirection=48/49 (ASCII
-            # '0'/'1') while m_nOrderType uses the counter's own codes -- the old
-            # mapping fell through to SELL on a real BUY fill. Direction first.
-            try:
-                drc = int(getattr(t, "m_nDirection", -1))
-            except (TypeError, ValueError):
-                drc = -1
-            if drc in (0, 48):
-                side = BUY
-            elif drc in (49, 1):
-                side = SELL
-            elif ot == self.op_buy:
-                side = BUY
-            elif ot == self.op_sell:
-                side = SELL
-            else:
-                side_raw = str(getattr(t, "direction", "") or getattr(t, "bs_type", "") or "")
-                up = side_raw.upper()
-                side = BUY if ("BUY" in up or "\u4e70" in side_raw) else SELL
+            # FIX 2026-09-14 drill-3: DEAL rows carry m_nDirection=48 (ASCII '0') while
+            # m_nOrderType uses the counter's own codes -- the old mapping fell through to
+            # SELL on a real BUY fill. P0 2026-09-18: the single-field shortcut was itself
+            # the next bug (a real SELL booked as BUY); direction resolution now lives in
+            # _deal_side(), which votes across every known enum space, refuses to let one
+            # field override a conflicting one, and traces unresolved combos once.
+            side, side_src = _deal_side(t, self.op_buy, self.op_sell)
+            # Cross-check against the counter's order type: if the direction field(s) say BUY
+            # while m_nOrderType is this build's SELL op, the enum space is not what we think.
+            # Trace once per combination (bounded) so it shows up in bridge_boot.log.
+            if side == BUY and ot == self.op_sell:
+                ck = "conflict:%s:%s" % (side_src, ot)
+                if ck not in _DIR_TRACE_SEEN:
+                    _DIR_TRACE_SEEN.add(ck)
+                    _trace("DEAL side CONFLICT: %s says BUY but m_nOrderType=%s (sell) code=%s"
+                           % (side_src, ot, code))
+            # From here on we assemble the fill row. Direction/amount/time come from
+            # different field families per build; each keeps its own documented fallback.
             amount = float(getattr(t, "m_dTradeAmount", 0) or getattr(t, "amount", 0) or price * qty)
             td = str(getattr(t, "m_strTradeDate", "") or getattr(t, "trade_date", "") or "")
             tt = str(getattr(t, "m_strTradeTime", "") or getattr(t, "traded_time", "") or
@@ -415,6 +525,9 @@ class _XtOps:
         return out
 
     def embed_place(self, req):
+        # Normalize the request into counter primitives. Code suffix is validated
+        # against the exchange rules (SH/SZ) BEFORE any order leaves -- a mismatched
+        # suffix means the request was assembled wrong upstream, not a counter issue.
         po = self._builtin("passorder")
         code = str(req.get("code", "") or "")
         expect = _expect_suffix(code)
@@ -443,6 +556,10 @@ class _XtOps:
         #           volume, strategyName, quickOrder, userOrderId, ContextInfo)
         # quickOrder=1 => submit immediately, independent of bar/init. Ladder:
         # ladder keeps older builds (7/8 args) working via TypeError fallback.
+        # core = the 7 mandatory positionals shared by every signature variant.
+        # attempts walks from the FULL official signature down to bare 7-arg: each
+        # step only drops optional/sandbox-specific args, so older builds fail with
+        # TypeError (never a real submission) and fall through to the next variant.
         core = (op_type, self.order_type, self._embed_acct(), c6, ptype, price, qty)
         attempts = [
             core + ("qmt_bridge", 2, signal_id, self._ctx),
@@ -454,6 +571,9 @@ class _XtOps:
             core,
         ]
         last_err = None
+        # TypeError = signature mismatch on THIS build -> try next variant.
+        # Any other exception = real submission failure -> stop immediately
+        # (the request may have partially reached the counter; caller must see it).
         for args in attempts:
             if len(args) == 11 and self._ctx is None:
                 continue
@@ -514,6 +634,10 @@ class _XtOps:
         we submit as userOrderId (exact); fall back to fingerprint match (code/op/
         price/qty, first unclaimed row). Defensive: legacy callers passed a bare
         signal_id string here -- normalize instead of crashing (2026-09-14 storm)."""
+        # Normalize legacy callers: req may be a dict or a bare signal_id string.
+        # The fingerprint (code/op/price/qty) comes from _last_place, set at place()
+        # time -- it must NOT come from req alone, since remark-based attribution is
+        # exactly what we are trying to recover when remark is empty.
         sig = ""
         if isinstance(req, dict):
             code6 = str((req.get("code") or "").split(".")[0])
@@ -552,6 +676,10 @@ class _XtOps:
 
     # ---- legacy miniQMT XtQuantTrader fallback (kept; broker may retire miniQMT) ----
     def ensure(self):
+        # Import once, remember the verdict: repeated import attempts per call would
+        # mask the first failure cause. Every connect step is verified against a
+        # REAL query (asset) -- start()/connect() returning 0 does not guarantee the
+        # client side is logged in, and an unverified trader poisons later calls.
         if self._import_tried:
             if self._trader is None:
                 raise RuntimeError("embedded xtquant unavailable (previous import failed)")
@@ -575,6 +703,9 @@ class _XtOps:
             if trader.query_stock_asset(acc) is None:
                 raise RuntimeError("query_stock_asset() None -- client not logged in / trade unlocked?")
         except Exception:
+            # stop() on ANY failure: a half-started trader keeps shared-memory writer
+            # threads alive and each retry cycle leaks another set (WaitingFreeWriter
+            # limit) until the QMT client needs a manual restart.
             try:
                 trader.stop()
             except Exception:
@@ -588,6 +719,9 @@ class _XtOps:
     def place(self, req):
         """place one order -> (ok, order_ref, err). order_ref "seq:<n>"; resolve_order_id
         maps it to the exchange order id for gateway-side seq mapping / future cancels."""
+        # Route order: dry-run -> embedded sandbox -> legacy miniQMT. Code suffix is
+        # re-validated here too (embed_place does the same for its path); duplicated
+        # on purpose because the two paths share no normalization step.
         signal_id = str(req.get("signal_id", "") or "")
         if self.dry_run:
             _trace("dry place %s %s %s qty=%s signal=%s" % (
@@ -657,6 +791,8 @@ class _XtOps:
         return pending_ref
 
     def cancel(self, seq, exchange_order_id, code=""):
+        """cancel by exchange order id -> (ok, err). dry_run -> success stub;
+        embed path first, legacy miniQMT cancel_order_stock as fallback."""
         if self.dry_run:
             _trace("dry cancel order_id=%s" % exchange_order_id)
             return True, ""
@@ -753,10 +889,14 @@ class _XtOps:
             return []
         xtc = self._xtc
         buy_c = int(getattr(xtc, "STOCK_BUY", BUY_CONST_FALLBACK))
+        sell_c = int(getattr(xtc, "STOCK_SELL", SELL_CONST_FALLBACK))
         out = []
         for t in raw:
-            ot = int(getattr(t, "order_type", 0) or 0)
-            side = BUY if ot == buy_c else SELL
+            # P0 2026-09-18: same policy as the embed path. The old
+            # `BUY if ot == buy_c else SELL` booked every fill whose order_type did
+            # not match as a SELL (the 2026-08-31 incident shape, mirrored). Now both
+            # paths share _deal_side (multi-space vote + once-only unresolved trace).
+            side, _src = _deal_side(t, buy_c, sell_c)
             price = float(getattr(t, "executed_price", getattr(t, "trd_price", 0.0)) or 0.0)
             qty = int(getattr(t, "executed_volume", getattr(t, "trd_volume", getattr(t, "volume", 0))) or 0)
             amount = float(getattr(t, "executed_amount", getattr(t, "trd_amount", price * qty)) or 0)

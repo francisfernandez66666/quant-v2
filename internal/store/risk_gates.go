@@ -78,6 +78,31 @@ func (d *DB) RiskGateDay(tradeDate string, limit int) ([]RiskGateHit, error) {
 	return out, rows.Err()
 }
 
+// CountBuyFilledOrdersByDay 今日已成交买入「笔数」（同一委托去重）——单日买入笔数纪律闸的口径。
+//
+// 2026-09-18 口径修正：该闸原先统计 orders 表里「今日已报」的委托数（status ∈ 已报/部成/已成），
+// 一笔报出去就被券商废掉、或一直挂着没成交的单，同样占掉当天额度——用户会因为一堆根本没成交的
+// 报单被锁死买入权。纪律的语义是「今天最多买成几笔」，故改为只数**真实成交**：fills 表是柜台
+// 回报落下来的客观事实，同时天然覆盖交割单 sync_fills 补记的手工成交（那些没有本地 orders 行）。
+//
+// 去重键：同一笔委托被拆成多次部分成交仍算 1 笔——order_id 优先，缺失回落券商交割流水号
+// （serial），再缺失回落行 ID（各自算一笔，避免多笔无归因成交被并成 1 笔而少计额度）。
+//
+// English: today's *filled* buy count for the daily-buy-count discipline gate, deduped per order —
+// partial fills of one order count once; keyed by order_id, falling back to the broker serial, then
+// to the row id. Filled count (not submitted count) is the ledger-level truth, and it also covers
+// broker-only manual fills backfilled by sync_fills (which have no local orders row).
+func (d *DB) CountBuyFilledOrdersByDay(userID, day string) (int, error) {
+	var n int
+	err := d.db.QueryRow(`SELECT COUNT(DISTINCT CASE
+			WHEN COALESCE(order_id,'') <> '' THEN 'o:' || order_id
+			WHEN COALESCE(serial,'')   <> '' THEN 's:' || serial
+			ELSE 'r:' || id END)
+		FROM fills WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
+		userID, day).Scan(&n)
+	return n, err
+}
+
 // TodayRealizedPnl 日内已实现盈亏（元，正=盈利，负=亏损）：
 // Σ 今日卖出成交 (fillPrice − 成本) × 数量。成本取该 code 当前持仓 CostPrice（已清仓则回落
 // 到今日买入均价兜底）；成本不可知（无持仓且无买入成交）时该笔 fail-open 不计入——

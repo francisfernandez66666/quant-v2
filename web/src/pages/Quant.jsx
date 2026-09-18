@@ -645,12 +645,12 @@ export default function Quant() {
         <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>用于仓位约束预检</span>
       </div>
     )
-    // 单日买入笔数上限：0=不设限，防信号风暴
+    // 单日买入笔数上限：0=不设限，按当日【已成交】笔数计（2026-09-18 口径修正：未成交/被废的报单不占额度）
     const dailyBuys = (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         <label style={{ fontSize: 12, color: 'var(--app-faint)' }}>单日买入笔数上限</label>
         <Input type="number" value={form.daily_max_buys} min={0} onChange={(v) => setFormUser({ ...form, daily_max_buys: parseInt(v, 10) })} />
-        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，防信号风暴</span>
+        <span style={{ fontSize: 10, color: 'var(--app-text-2)' }}>0=不设限，按当日已成交笔数计（未成交的报单不占额度）</span>
       </div>
     )
     // 单日买入预算：0=不设限，超出拒绝新买入

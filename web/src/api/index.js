@@ -1380,10 +1380,32 @@ export async function fetchLLMConfig() {
 
 /** 设置 LLM 配置（API URL / Key / 模型名） */
 /** Set the LLM configuration (API URL / Key / model name) */
-// 对应 POST /api/config/llm，cfg 为完整配置对象，后端持久化到 config.json
-// Maps to POST /api/config/llm; cfg is the full config object, persisted to config.json by the backend
+// 对应 POST /api/config/llm。
+// 后端语义：先探测候选配置能否真的调通 → 通过才切换运行时并落库；探测确认配置有错则 409 拒绝
+// （运行时与磁盘都不动，error 字段里是可显示的原因）。返回 { status, result }。
+// Maps to POST /api/config/llm; the backend probes the candidate first and only swaps/persists when
+// it works, returning 409 (with a human-readable reason) when the config is provably broken.
 export async function setLLMConfig(cfg) {
   return request('/api/config/llm', { method: 'POST', data: cfg })
+}
+
+/** 测试 LLM 连接（只探测，不改任何状态） */
+/** Probe the LLM channel (read-only: changes nothing) */
+// 对应 POST /api/config/llm/probe。不带 cfg 时探测**当前已生效**的配置；
+// 带 cfg 时探测候选配置（与 setLLMConfig 同形，支持脱敏哨兵回填）。
+// 返回 { status, result: { verified, probes[], api_url, model, ... } }。
+// Maps to POST /api/config/llm/probe — probes the live config when cfg is omitted.
+export async function probeLLMConfig(cfg) {
+  return request('/api/config/llm/probe', { method: 'POST', data: cfg || {} })
+}
+
+/** 回滚到上一个已验证可用的 LLM 配置 */
+/** Roll back to the last verified-working LLM config */
+// 对应 POST /api/config/llm/rollback。热更新翻车（例如强制应用了不可用的配置）时的兜底动作，
+// 不必重启、不必回忆上次填了什么。返回 { status, result }。
+// Maps to POST /api/config/llm/rollback — the escape hatch after a bad hot update.
+export async function rollbackLLMConfig() {
+  return request('/api/config/llm/rollback', { method: 'POST', data: {} })
 }
 
 // ── 战法参数配置 ──

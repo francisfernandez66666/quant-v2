@@ -598,6 +598,8 @@ class Gateway:
         English: applies a bridge report — settles the dispatch row and routes the event
         through the existing handler protocol to the decision side.
         """
+        # 按事件类型分发：快照类先落 bridge_snapshot（供启动期回放），事件类走 _apply_*。
+        # 未知类型必须 400 而不是静默吞掉——桥升级新增事件时这里要能被发现。
         req = body or {}
         etype = req.get("type", "")
         try:
@@ -634,6 +636,7 @@ class Gateway:
 
     def _apply_order_result(self, req):
         """下单结果回报：结算派发项；ok→已报（回填交易所委托号），失败→已废（带拒因）。"""
+        # seq 是派发项主键：桥回执只带 seq + 结果，方向/代码等语义字段从派发行取（权威在本端）。
         seq = str(req.get("seq", "") or "")
         ok = bool(req.get("ok"))
         order_id = str(req.get("order_id", "") or "")
@@ -687,22 +690,54 @@ class Gateway:
 
         成交隐含委托状态推进（部成/已成），与 mock/xt 回调口径一致——桥回报不含委托
         状态事件，量仔侧需据此感知订单终结态。
+
+        §P0 方向权威化（2026-09-18 买入卖出不分事故）：凡本端派发过的单，其「方向」以派发项
+        （dispatch.side，等于我们下单时请求的方向）为**唯一权威**，桥/柜台 DEAL 行携带的方向
+        推断一律不得覆盖。理由：桥侧方向只能从柜台对象字段反推（m_nDirection/m_nOffsetFlag/
+        m_nOrderType 的枚举空间跨券商构建不一致，本项目已两次踩坑：2026-08-31 order_type 判反、
+        2026-09-14 DEAL 方向补丁），而派发项是我们自己写下的物理事实——零推断、零歧义。
+        旧实现用 `setdefault("side", …)`：键已存在（桥行恒带 side）即不覆盖 —— 桥的误判方向
+        会原样落进 fills，把一笔真实卖出记成买入（持仓成本/已实现盈亏/胜率全线污染）。
+        English: §P0 — for any order this gateway actually dispatched, the dispatch row's side is
+        authoritative and the bridge's inferred DEAL direction must never override it. The old
+        `setdefault` was a no-op whenever the bridge row already carried a (possibly wrong) side.
         """
+        # 归因回填 + 派发项定位：seq → 交易所委托号 → signal_id 三级回落。
+        # FIX 2026-09-14 drill-3: 桥的 DEAL 行 m_strRemark 实测为空（passorder userOrderId
+        # 不落 remark），成交归因必须能按交易所委托号反查派发项。
+        # §P0 2026-09-18：补 signal_id 一级——xt/桥路径在 remark 非空时把 order_id 填成
+        # remark（signal_id），按委托号反查必落空，方向权威化会被静默跳过。
+        drow = None
         if not req.get("signal_id"):
             seq = str(req.get("seq", "") or "")
-            row = self.store.dispatch_get(seq) if seq else None
-            if row:
-                req["signal_id"] = row.get("signal_id", "")
-                req.setdefault("code", row.get("code", ""))
-                req.setdefault("side", row.get("side", ""))
-            elif req.get("order_id"):
-                # FIX 2026-09-14 drill-3: 桥的 DEAL 行 m_strRemark 实测为空（passorder
-                # userOrderId 不落 remark），成交归因必须能按交易所委托号反查派发项。
-                prow = self.store.dispatch_by_order_id(str(req.get("order_id")))
-                if prow:
-                    req["signal_id"] = prow.get("signal_id", "")
-                    req.setdefault("code", prow.get("code", ""))
-                    req.setdefault("side", prow.get("side", ""))
+            drow = self.store.dispatch_get(seq) if seq else None
+            if drow is None and req.get("order_id"):
+                drow = self.store.dispatch_by_order_id(str(req.get("order_id")))
+            if drow:
+                req["signal_id"] = drow.get("signal_id", "")
+                req.setdefault("code", drow.get("code", ""))
+        if drow is None:
+            oid = str(req.get("order_id", "") or "")
+            drow = self.store.dispatch_by_order_id(oid) if oid else None
+        if drow is None and req.get("signal_id"):
+            drow = self.store.dispatch_by_signal_id(str(req.get("signal_id")))
+        if drow:
+            # 代码回填（与方向同源的权威性）：带 signal_id 的回报不再走上面的归因分支，
+            # 若其 code 缺失，同样以派发项为准——否则 apply_fill 会拿空代码查持仓、
+            # 卖出被判为"无底仓 no-op"而静默漏账。
+            if not req.get("code"):
+                req["code"] = drow.get("code", "")
+            auth = str(drow.get("side", "") or "")
+            inferred = str(req.get("side", "") or "")
+            if auth:
+                if inferred and inferred != auth:
+                    # 方向推断与派发事实不符——枚举空间漂移的信号，必须留痕（不可静默采纳）。
+                    log.warning(
+                        "[gateway] trade side mismatch: dispatch=%s inferred=%s code=%s oid=%s seq=%s"
+                        " — using dispatch side", auth, inferred,
+                        drow.get("code", ""), req.get("order_id", ""), drow.get("seq", ""))
+                # 权威覆盖（非 setdefault）：本端下单方向 > 柜台字段反推。
+                req["side"] = auth
         self.handler.on_trade({
             "order_id": req.get("order_id", ""), "trade_id": req.get("trade_id", ""),
             "name": req.get("name", ""), "code": req.get("code", ""), "side": req.get("side", ""),

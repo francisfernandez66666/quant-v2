@@ -104,6 +104,14 @@ export default function Settings() {
   const [llmD1MaxTokens, setLlmD1MaxTokens] = useState(2048)
   const [llmConfigured, setLlmConfigured] = useState(false)
   const [llmSaving, setLlmSaving] = useState(false)
+  // llmProbing / llmRolling：测试连接与回滚各自的进行态（与保存互不阻塞）
+  const [llmProbing, setLlmProbing] = useState(false)
+  const [llmRolling, setLlmRolling] = useState(false)
+  // llmForce 强制应用：跳过"探测未通过则拒绝"的保护。默认关——盘中误存一把坏 key 会把
+  // 整条 LLM 链路（新闻归因/D1/咨询）连同落库配置一起打坏，且重启也救不回来。
+  const [llmForce, setLlmForce] = useState(false)
+  // llmNote 结果回报 { kind, head, text, probes }：保存/探测/回滚到底生效了没有、哪把 key 为什么没生效。
+  const [llmNote, setLlmNote] = useState(null)
 
   const [strategyCfg, setStrategyCfg] = useState(emptyStrategy())
   const [strategySaving, setStrategySaving] = useState(false)
@@ -219,29 +227,144 @@ export default function Settings() {
   }
 
   // 保存 LLM API 地址、Key、模型与并发配置
+  //
+  // 2026-09-18 重写：此前无论后端是否真的生效都弹"已保存并热生效"，而热更新存在两条真实的
+  // 失败路径（配置被探测判定为不可用 → 拒绝；无法判定 → 采用但未验证）。UI 说"已生效"而
+  // 实际没生效，正是"改了没生效"体感的来源。现在按后端回报如实展示，并把逐把 key 的结论摆出来。
   async function saveLLM() {
     setLlmSaving(true)
+    setLlmNote(null)
     try {
-          await api.setLLMConfig({
-            // 多 Key 支持：按换行或逗号拆分并去除空白，过滤空串
-            api_keys: llmApiKeys.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
-        api_url: llmApiUrl,
-        model: llmModel,
-        classifier_model: llmClassifierModel,
-        batch_concurrency: llmBatchConcurrency,
-        d1_max_tokens: llmD1MaxTokens,
-      })
-      setLlmConfigured(!!llmApiKeys)
-      // §F33 保存成功后基线跟随当前值，dirty 归零
-      setLlmBaseline({
-        api_url: llmApiUrl, model: llmModel, classifier_model: llmClassifierModel,
-        batch_concurrency: llmBatchConcurrency, d1_max_tokens: llmD1MaxTokens, api_keys: llmApiKeys,
-      })
-      showToast('LLM 配置已保存并热生效', 'success')
+      const resp = await api.setLLMConfig(llmPayload({ force: llmForce }))
+      const res = resp?.result || {}
+      // 只有后端确认 applied 才更新基线与"已配置"标记（否则页面显示与运行时会不一致）
+      if (res.applied) {
+        setLlmConfigured(true)
+        setLlmForce(false)
+        // §F33 保存成功后基线跟随当前值，dirty 归零
+        setLlmBaseline({
+          api_url: llmApiUrl, model: llmModel, classifier_model: llmClassifierModel,
+          batch_concurrency: llmBatchConcurrency, d1_max_tokens: llmD1MaxTokens, api_keys: llmApiKeys,
+        })
+      }
+      setLlmNote(llmNoteFromResult(res, res.warning ? '已生效，但有保留意见' : '已生效且验证通过'))
+      if (res.warning) {
+        showToast('LLM 配置已生效，但有保留意见（详见下方说明）', 'warning')
+      } else {
+        showToast('LLM 配置已热生效并验证通过', 'success')
+      }
     } catch (e) {
-      showToast('保存失败: ' + (e.message || '未知错误'), 'error')
+      // 409 = 探测未通过被拒绝：运行时与磁盘**都没有动**，当前可用配置仍在跑。
+      setLlmNote({ kind: 'error', head: '未生效（探测未通过，已保留当前可用配置）', text: e.message || '未知错误' })
+      showToast('LLM 配置未生效：' + (e.message || '未知错误'), 'error')
     }
     setLlmSaving(false)
+  }
+
+  // 测试连接：只探测、不改任何状态。盘中排查"现在到底能不能用"的第一动作。
+  async function probeLLM() {
+    setLlmProbing(true)
+    setLlmNote(null)
+    try {
+      const resp = await api.probeLLMConfig(llmPayload())
+      const res = resp?.result || {}
+      setLlmNote(llmNoteFromResult(res, res.verified ? '连通正常（配置可用）' : '未通过：当前填写的配置无法确认可用'))
+      showToast(res.verified ? 'LLM 连接正常' : 'LLM 连接未通过（详见下方说明）', res.verified ? 'success' : 'warning')
+    } catch (e) {
+      setLlmNote({ kind: 'error', head: '探测失败', text: e.message || '未知错误' })
+      showToast('探测失败: ' + (e.message || '未知错误'), 'error')
+    }
+    setLlmProbing(false)
+  }
+
+  // 回滚到上一个**已验证可用**的配置：热更新翻车（例如强制应用了不可用的配置）时的兜底动作，
+  // 不必重启、不必回忆上次填了什么。回滚后回读表单，保证页面显示与运行时一致。
+  async function rollbackLLM() {
+    setLlmRolling(true)
+    setLlmNote(null)
+    try {
+      const resp = await api.rollbackLLMConfig()
+      const res = resp?.result || {}
+      setLlmNote(llmNoteFromResult(res, '已回滚到上一个可用配置'))
+      showToast('已回滚到上一个可用配置', 'success')
+      try {
+        const cfg = await api.fetchLLMConfig()
+        if (cfg) applyLLMCfgToForm(cfg)
+      } catch (_) {}
+    } catch (e) {
+      setLlmNote({ kind: 'error', head: '回滚失败', text: e.message || '未知错误' })
+      showToast('回滚失败: ' + (e.message || '未知错误'), 'error')
+    }
+    setLlmRolling(false)
+  }
+
+  // llmPayload 组装提交体；force 只在显式勾选时带上（默认走"探测未通过则拒绝"的保护）。
+  function llmPayload(extra = {}) {
+    return {
+      // 多 Key 支持：按换行或逗号拆分并去除空白，过滤空串
+      api_keys: llmApiKeys.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
+      api_url: llmApiUrl,
+      model: llmModel,
+      classifier_model: llmClassifierModel,
+      batch_concurrency: llmBatchConcurrency,
+      d1_max_tokens: llmD1MaxTokens,
+      ...extra,
+    }
+  }
+
+  // llmNoteFromResult 把后端的 result 渲染成可读回报：结论 + 逐把 key 的原因 + 保留意见。
+  // 逐把列出是刻意的：用户要拿着"第几把 key 为什么不行"去改输入框的对应行。
+  function llmNoteFromResult(res, head) {
+    const lines = []
+    const probes = Array.isArray(res?.probes) ? res.probes : []
+    probes.forEach((p) => {
+      const status = p.status ? `HTTP ${p.status}` : '无响应'
+      const detail = p.detail ? ` — ${p.detail}` : ''
+      lines.push(`第 ${p.index + 1} 把：${probeKindLabel(p.kind)}（${status}）${detail}`)
+    })
+    if (typeof res?.effective_keys === 'number') {
+      lines.push(`生效密钥 ${res.effective_keys} 把；被剔除 ${res.dropped_keys || 0} 把`)
+    }
+    if (res?.api_url) lines.push(`地址 ${res.api_url}；模型 ${res.model || '（默认）'}`)
+    const kind = res?.rejected ? 'error' : (res?.warning ? 'warn' : 'success')
+    return { kind, head, text: res?.warning || '', lines }
+  }
+
+  // probeKindLabel 探测结论的中文名（与后端 llm.ProbeKind 对齐，仅用于展示）。
+  function probeKindLabel(kind) {
+    const map = {
+      ok: '可用', auth: '密钥无效/无权限', model: '地址或模型不可用', quota: '余额/额度不足',
+      rate_limited: '被限流（密钥有效）', bad_request: '请求被拒（未能验证）',
+      server: '供应商故障（未能验证）', network: '网络不可达（未能验证）', no_key: '未提供密钥',
+    }
+    return map[kind] || kind || '未知'
+  }
+
+  // applyLLMCfgToForm 把后端 LLM 配置回填到表单（初始化与回滚后共用同一份口径）。
+  function applyLLMCfgToForm(cfg) {
+    setLlmApiUrl(cfg.api_url || '')
+    setLlmModel(cfg.model || '')
+    setLlmClassifierModel(cfg.classifier_model || '')
+    if (cfg.batch_concurrency > 0) setLlmBatchConcurrency(cfg.batch_concurrency)
+    if (cfg.d1_max_tokens > 0) setLlmD1MaxTokens(cfg.d1_max_tokens)
+    // 多 Key 场景：数组按换行合并为一段文本；兼容旧版单 api_key 字段
+    let keys = ''
+    if (Array.isArray(cfg.api_keys) && cfg.api_keys.length) {
+      keys = cfg.api_keys.join('\n')
+    } else if (cfg.api_key) {
+      keys = cfg.api_key
+    }
+    setLlmApiKeys(keys)
+    // 已配置判定：有 Key 或有地址即视为已配置
+    setLlmConfigured(!!(keys || cfg.api_url))
+    // §F33 基线同步：与上面 set* 一一对应，用于计算 dirty
+    setLlmBaseline({
+      api_url: cfg.api_url || '', model: cfg.model || '',
+      classifier_model: cfg.classifier_model || '',
+      batch_concurrency: cfg.batch_concurrency > 0 ? cfg.batch_concurrency : 4,
+      d1_max_tokens: cfg.d1_max_tokens > 0 ? cfg.d1_max_tokens : 2048,
+      api_keys: keys,
+    })
   }
 
   // 更新指定战法分组中的某个参数字段
@@ -263,31 +386,8 @@ export default function Settings() {
       // 2) 读取 LLM 配置回填到表单
       try {
         const cfg = await api.fetchLLMConfig()
-        if (cfg) {
-          setLlmApiUrl(cfg.api_url || '')
-          setLlmModel(cfg.model || '')
-          setLlmClassifierModel(cfg.classifier_model || '')
-          if (cfg.batch_concurrency > 0) setLlmBatchConcurrency(cfg.batch_concurrency)
-          if (cfg.d1_max_tokens > 0) setLlmD1MaxTokens(cfg.d1_max_tokens)
-          // 多 Key 场景：数组按换行合并为一段文本；兼容旧版单 api_key 字段
-          let keys = ''
-          if (Array.isArray(cfg.api_keys) && cfg.api_keys.length) {
-            keys = cfg.api_keys.join('\n')
-          } else if (cfg.api_key) {
-            keys = cfg.api_key
-          }
-          setLlmApiKeys(keys)
-          // 已配置判定：有 Key 或有地址即视为已配置
-          setLlmConfigured(!!(keys || cfg.api_url))
-          // §F33 基线同步：与上面 set* 一一对应，用于计算 dirty
-          setLlmBaseline({
-            api_url: cfg.api_url || '', model: cfg.model || '',
-            classifier_model: cfg.classifier_model || '',
-            batch_concurrency: cfg.batch_concurrency > 0 ? cfg.batch_concurrency : 4,
-            d1_max_tokens: cfg.d1_max_tokens > 0 ? cfg.d1_max_tokens : 2048,
-            api_keys: keys,
-          })
-        }
+        // 回填口径统一走 applyLLMCfgToForm（与回滚后回读共用，避免两处各写一遍而分叉）
+        if (cfg) applyLLMCfgToForm(cfg)
       } catch (_) {}
       // 3) 读取战法参数：先建五组空占位，再按分组归并后端返回
       try {
@@ -402,14 +502,31 @@ export default function Settings() {
       <Card title="LLM 配置" style={{ marginBottom: 16 }}>
         <div style={rowStyle}>
           <span style={labelStyle}>API URL</span>
-          <Input value={llmApiUrl} onChange={(v) => setLlmApiUrl(v)} placeholder="https://api.openai.com/v1" style={{ width: 280 }} />
+          <Input value={llmApiUrl} onChange={(v) => setLlmApiUrl(v)} placeholder="https://api.siliconflow.cn/v1/chat/completions" style={{ width: 280 }} />
+        </div>
+        <div style={{ ...rowStyle, alignItems: 'flex-start' }}>
+          <span style={labelStyle} />
+          <span style={{ fontSize: 10, color: 'var(--app-text-2)', maxWidth: 280 }}>
+            填供应商文档里的 base URL（如 https://api.siliconflow.cn/v1）也可以，会自动补上
+            /chat/completions；已带完整路径的原样使用。
+          </span>
         </div>
         {
-          /* API Key 文本域：每行一个 Key，多 Key 后端轮询分发 */
+          /* API Key 文本域：每行一个 Key，多 Key 后端轮询分发。
+             2026-09-18：补脱敏回显提示——回读是掩码（sk-…1234），保持掩码=沿用库中原值；
+             要换 Key 必须整框替换，掩码与新 Key 并存时掩码那一槽位仍指向旧 Key（曾导致
+             "改了 Key 却不生效"的误判）。 */
         }
         <div style={rowStyle}>
           <span style={labelStyle}>API Key(s)</span>
           <Textarea value={llmApiKeys} onChange={(v) => setLlmApiKeys(v)} placeholder="sk-...&#10;sk-...（每行一个，多个则轮询分发）" autosize={{ minRows: 4, maxRows: 8 }} style={{ width: 280 }} />
+        </div>
+        <div style={{ ...rowStyle, alignItems: 'flex-start' }}>
+          <span style={labelStyle} />
+          <span style={{ fontSize: 10, color: 'var(--app-text-2)', maxWidth: 280 }}>
+            显示的是脱敏值（如 sk-…1234）：保持不动＝沿用库中已存的 Key。
+            要换 Key 请<strong>整框替换</strong>（掩码与新 Key 同行并存时，掩码那一行仍指向旧 Key）。
+          </span>
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>模型</span>
@@ -447,8 +564,50 @@ export default function Settings() {
           </Tag>
         </div>
         {/* §F33 dirty=true 时右侧圆点+文字提示，避免"改了忘保存切页丢" */}
-        <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
-        {llmDirty && <span style={{ marginLeft: 8, color: 'var(--app-warn-text)', fontSize: 12 }}>● 有未保存修改</span>}
+        {/* 三个动作：保存（探测→切换→落库）/ 测试连接（只探测）/ 回滚（回到上个已验证可用配置） */}
+        <div style={{ ...rowStyle, flexWrap: 'wrap', gap: 8 }}>
+          <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
+          <Button variant="outline" onClick={probeLLM} loading={llmProbing}>测试连接</Button>
+          <Button variant="outline" onClick={rollbackLLM} loading={llmRolling}>回滚到上一个可用配置</Button>
+          {llmDirty && <span style={{ marginLeft: 8, color: 'var(--app-warn-text)', fontSize: 12 }}>● 有未保存修改</span>}
+        </div>
+        {
+          /* 强制应用开关：只在探测明确判定配置不可用、但用户确信是环境问题时才打开。
+             默认关闭——误存一把坏 key 会同时打坏运行时与落库配置，且重启也救不回来。 */
+        }
+        <div style={{ ...rowStyle, alignItems: 'flex-start' }}>
+          <span style={labelStyle}>强制应用</span>
+          <ToggleSw checked={llmForce} onChange={setLlmForce} />
+          <span style={{ fontSize: 10, color: 'var(--app-text-2)', maxWidth: 280, marginLeft: 8 }}>
+            默认关闭。开启后即使探测判定配置不可用也照样切换并落库（用于供应商抖动、本机代理不通
+            等与配置无关的失败）。启用前请先看清下方逐把结论——翻车可用"回滚"退回。
+          </span>
+        </div>
+        {
+          /* 结果回报：生效了没有 / 哪把 key 为什么没生效 / 是否已验证。 */
+        }
+        {llmNote && (
+          <div style={{
+            margin: '4px 0 8px',
+            padding: '8px 10px',
+            borderRadius: 4,
+            fontSize: 12,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-all',
+            maxWidth: 520,
+            background: llmNote.kind === 'error' ? 'var(--app-danger-bg, #fdecee)' : (llmNote.kind === 'warn' ? 'var(--app-warn-bg, #fff7e6)' : 'var(--app-success-bg, #e8f5e9)'),
+            color: 'var(--app-text-1, #333)',
+            border: '1px solid var(--app-border, #e0e0e0)',
+          }}>
+            <div style={{ fontWeight: 600 }}>
+              {llmNote.kind === 'error' ? '✕ ' : (llmNote.kind === 'warn' ? '! ' : '✓ ')}{llmNote.head}
+            </div>
+            {llmNote.text && <div style={{ marginTop: 4 }}>{llmNote.text}</div>}
+            {(llmNote.lines || []).map((l, i) => (
+              <div key={i} style={{ marginTop: 2, color: 'var(--app-text-2)' }}>· {l}</div>
+            ))}
+          </div>
+        )}
       </Card>
 
       {strategyGroups.map((group) => (

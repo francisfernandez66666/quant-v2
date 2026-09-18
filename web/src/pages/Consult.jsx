@@ -113,22 +113,32 @@ export default function Consult() {
   }
 
   // 保存 LLM API 地址、Key 与模型配置
+  //
+  // 2026-09-18：这里只提交用户填了的字段（`|| undefined`）——后端已把"未提交"定义成
+  // **保持原值**（此前会解成空串并清掉已存的供应商地址/模型）。响应也改为如实回报：
+  // 只有后端确认 applied 才算保存成功，否则展示探测给出的原因（含逐把 key 的结论）。
   async function saveLLM() {
     setLlmSaving(true)
     setLlmMsg('')
     try {
       // 调用后端保存 LLM 配置接口
-      await api.setLLMConfig({
+      const resp = await api.setLLMConfig({
         api_keys: cfgApiKey ? [cfgApiKey] : undefined,
         api_url: cfgApiUrl || undefined,
         model: cfgModel || undefined,
       })
-      // 保存成功：标记已配置、显示成功提示
-      setLlmConfigured(true)
-      setLlmMsg('LLM 配置已保存')
-      setLlmMsgType('ok')
+      const res = resp?.result || {}
+      if (!res.applied) {
+        setLlmMsg('LLM 配置未生效（探测未通过）：' + (res.reason || res.warning || '请检查配置'))
+        setLlmMsgType('err')
+      } else {
+        // 已生效：标记已配置。未验证/有保留意见时如实说明，不谎报"成功"。
+        setLlmConfigured(true)
+        setLlmMsg(res.warning ? 'LLM 配置已生效，但有保留意见：' + res.warning : 'LLM 配置已热生效并验证通过')
+        setLlmMsgType(res.warning ? 'err' : 'ok')
+      }
     } catch (e) {
-      // 保存失败：显示错误提示
+      // 保存失败：显示错误提示（409 拒绝时 e.message 即后端给出的逐把探测结论）
       setLlmMsg('保存失败: ' + (e.message || '未知错误'))
       setLlmMsgType('err')
     }

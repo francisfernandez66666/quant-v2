@@ -369,3 +369,47 @@ func TestIsTransientLLMError(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestProviderBaseURLIsNormalized §P0 2026-09-18「按供应商文档填了 API URL 却一直用不了」回归。
+//
+// 客户端把 APIURL **原样**当请求地址（post/streamPost 都是 http.NewRequest(POST, c.apiURL)），
+// 但各家文档给的都是 base URL（https://api.siliconflow.cn/v1），设置页的占位符也是 base 形态
+// （https://api.openai.com/v1）—— 照抄进去就会 POST 到 /v1 上，供应商回 404/405：
+// 配置存对了、页面回显也对，就是一次都调不通（表现为「LLM 挂了 / 改了没生效」）。
+func TestProviderBaseURLIsNormalized(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"供应商 base URL（SiliconFlow 文档形态）", "https://api.siliconflow.cn/v1", "https://api.siliconflow.cn/v1/chat/completions"},
+		{"base URL 带尾斜杠", "https://api.siliconflow.cn/v1/", "https://api.siliconflow.cn/v1/chat/completions"},
+		{"只有主机名", "https://api.siliconflow.cn", "https://api.siliconflow.cn/v1/chat/completions"},
+		{"OpenAI 形态", "https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"},
+		{"DeepSeek 形态", "https://api.deepseek.com/v1", "https://api.deepseek.com/v1/chat/completions"},
+		{"版本段带后缀", "https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1beta/chat/completions"},
+		{"已是完整 endpoint：保持不动", "https://api.siliconflow.cn/v1/chat/completions", "https://api.siliconflow.cn/v1/chat/completions"},
+		{"自建网关非标准路径：不猜", "https://gw.example.com/llm/complete", "https://gw.example.com/llm/complete"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := New(Config{APIKey: "k", APIURL: tc.in, Model: "m"}).apiURL; got != tc.want {
+				t.Fatalf("APIURL 规范化不符: in=%s got=%s want=%s", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestChatHitsChatCompletionsPath 端到端：给 base URL 时，真实请求路径必须是 /v1/chat/completions。
+func TestChatHitsChatCompletionsPath(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+	c := New(Config{APIKey: "k", APIURL: srv.URL + "/v1", Model: "m", Streaming: false, Timeout: 5 * time.Second})
+	if _, err := c.Chat("sys", "hi"); err != nil {
+		t.Fatalf("Chat 应成功: %v", err)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Fatalf("请求路径应为 /v1/chat/completions，实际 %q —— 打到 base 路径上就是供应商 404/405", gotPath)
+	}
+}

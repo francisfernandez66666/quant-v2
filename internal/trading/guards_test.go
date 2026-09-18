@@ -79,20 +79,34 @@ func TestGuardSTRejected(t *testing.T) {
 	}
 }
 
-// TestGuardDailyBuysCap §GAP1.4：单日买入笔数达上限后拒绝新买入，卖出不受限。
+// TestGuardDailyBuysCap §GAP1.4：单日买入笔数上限按**已成交**计（2026-09-18 口径修正）。
+//
+// 旧口径数 orders 表里「今日已报」的委托数——报单即占额度，一笔被券商废掉或挂在委托簿上没成交的
+// 报单同样吃掉一天的买入额度，用户会因为一堆没成交的报单被锁死买入权。现在只有真实成交
+// （fills）才占额度；卖出始终不受买入纪律限制。
 func TestGuardDailyBuysCap(t *testing.T) {
 	db := testDB(t)
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.DailyMaxBuys = 2
 	ctrl := NewController(guardServer(), db, "u_g", cfg, nil)
-	for i := 0; i < 2; i++ {
+	// 连续报 3 笔（今日 0 成交）全部放行——旧口径会在第 3 笔拦下。
+	for i := 0; i < 3; i++ {
 		if _, err := ctrl.PlaceOrder(buyReq("SIG-B"+string(rune('A'+i)), 1000)); err != nil {
-			t.Fatalf("第 %d 笔应放行: %v", i+1, err)
+			t.Fatalf("第 %d 笔报单（今日 0 成交）应放行: %v", i+1, err)
+		}
+	}
+	// 落 2 笔真实成交 → 当日额度用尽，再报即拦。
+	for i, code := range []string{"600001.SH", "600002.SH"} {
+		if err := db.ApplyRealFill(store.RealFill{
+			OrderID: "GW-F" + code, Code: code, Side: SideBuy, Price: 10, Qty: 100, Amount: 1000,
+			UserID: "u_g", TradedAt: cntime.Now().Format("2006-01-02 15:04:05"),
+		}); err != nil {
+			t.Fatalf("落成交 #%d: %v", i+1, err)
 		}
 	}
 	if _, err := ctrl.PlaceOrder(buyReq("SIG-C", 1000)); err == nil || !strings.Contains(err.Error(), "单日买入笔数达上限") {
-		t.Fatalf("第 3 笔应被笔数上限拦截, got %v", err)
+		t.Fatalf("已成交 2 笔后应被笔数上限拦截, got %v", err)
 	}
 	// 卖出不受限
 	if _, err := ctrl.PlaceOrder(OrderRequest{SignalID: "SIG-S", Code: "600000.SH", Name: "浦发",

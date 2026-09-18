@@ -51,6 +51,8 @@ data.db
 # Python
 __pycache__/
 *.pyc
+# pytest 会自带 .gitignore 兜底，这里显式声明以防裸 pytest 版本不写（缓存可随时重建，不入库）
+.pytest_cache/
 
 # 本地回测工具（不入库）
 bt_jq/

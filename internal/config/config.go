@@ -312,9 +312,13 @@ type QMTConfig struct {
 	// 心跳超时秒数
 	MissHeartbeatSec int `json:"miss_heartbeat_sec"`
 	// DailyMaxBuys 单日累计买入笔数上限（§GAP1.4 实盘买入纪律；0=不设限，默认 20）。
-	// 与模拟盘 PoolBuyRule.MaxDailyBuys 同语义：防止单日信号风暴打满资金。
-	// English: max buy orders per day for the real book (0 = unlimited, default 20) — mirrors the
-	// paper book's MaxDailyBuys discipline against signal storms.
+	// **按今日已成交笔数计**（fills 表，同一委托的多次部分成交算 1 笔）——2026-09-18 口径修正：
+	// 原按「今日已报」委托数计，报单即占额度，一笔被券商废掉或挂着没成交的报单同样吃掉一天额度，
+	// 会把买入权锁死。金额类闸（DailyBudgetAmount 与可用资金）仍按已报金额+在途冻结占用额度，
+	// 信号风暴由金额闸兜住。
+	// English: daily cap on *filled* buys for the real book (0 = unlimited, default 20) — counts
+	// today's fills, deduped per order, so an unfilled/rejected submission does not burn the quota;
+	// the amount-based gates still reserve in-flight submissions.
 	// 日最大买入笔数
 	DailyMaxBuys int `json:"daily_max_buys"`
 	// DailyBudgetAmount 单日累计买入金额预算（元；0=不设限，默认 100000）。
@@ -1670,8 +1674,24 @@ func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
 }
 
 // GetLLMConfigFor 返回运营数据归属账号（管理员）的 LLM 配置（运营配置系统级共享）。
+//
+// §警告 返回的是**内部结构的指针**，不是拷贝：调用方必须**立即取值拷贝**再使用，
+// 更不能通过它写字段（那样会绕过持久化，只在内存里生效，进程重启即丢）。
+// 需要改配置一律走 SetLLMConfigFor（传值拷贝进去）。
+// English: returns a pointer INTO the live config — copy the value out immediately and never
+// mutate through it; all writes must go through SetLLMConfigFor.
 func (m *Manager) GetLLMConfigFor(userID string) *LLMConfig {
 	return &m.userRules(m.ownerOf(userID)).LLM
+}
+
+// ConfigOwnerID 返回该账号的运营数据归属账号：所有账号的 LLM / 量化 / 看板配置都写入
+// 归属账号名下（见 ownerOf）。管理端在改某个账号的 LLM 配置前必须据此判断"这次写入到底
+// 会不会改变全局运行时配置"——归属账号就是运营账号时，它与设置页改的是同一份配置，
+// 就必须走同一套「探测 → 热切换 → 落库」，否则会出现"管理端改了不生效"的第二个入口。
+// English: resolves which account actually owns the config; used by the admin endpoint to tell
+// whether a write touches the global runtime LLM config (and therefore must hot-apply too).
+func (m *Manager) ConfigOwnerID(userID string) string {
+	return m.ownerOf(userID)
 }
 
 // SetLLMConfigFor 更新运营数据归属账号（管理员）的 LLM 配置并持久化（系统级共享）。

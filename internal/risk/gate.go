@@ -120,7 +120,7 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 		{"stale_quote", true, func() string { return g.checkStaleQuote(cfg, o) }},          // 行情新鲜度硬闸
 		{"day_loss", true, func() string { return g.checkDayLoss(cfg, o) }},                // 日内已实现亏损熔断
 		{"concentration", true, func() string { return g.checkConcentration(cfg, o) }},     // 单票市值集中度
-		{"buy_discipline", false, func() string { return g.checkBuyDiscipline(cfg, o) }},   // 买入纪律（笔数/预算/可用资金）
+		{"buy_discipline", false, func() string { return g.checkBuyDiscipline(cfg, o) }},   // 买入纪律（已成交笔数/预算/可用资金）
 		{"whitelist", false, func() string { return g.checkWhitelist(cfg, o) }},            // 战法白名单
 		{"max_positions", false, func() string { return g.checkMaxPositions(cfg, o) }},     // 持仓数上限
 	}
@@ -400,8 +400,17 @@ func (g *Gate) checkMaxPositions(cfg config.QMTConfig, o LiveOrder) string {
 
 // checkBuyDiscipline §GAP1.3/1.4 买入纪律预检（从 controller 原样迁入）：单日买入笔数上限、
 // 单日买入预算、近似可用资金 + §R4-3 券商口径可用资金双闸。守卫先于占位落库执行。
-// English: §GAP1.3/1.4 buy-discipline precheck (migrated verbatim from the controller): daily buy-count
-// cap, daily budget and estimated/broker available-cash gates, run before the pending ticket persists.
+//
+// 闸口各自的口径（三闸互补，别把它们混成同一个口径）：
+//   - 闸1 笔数：数**今日已成交**买入笔数（fills 表，按委托去重）——「今天最多买成几笔」；
+//   - 闸2 预算 / 闸3、闸4 资金：按**今日已报金额 + 在途冻结**占用额度——在途报单确实占着钱；
+//
+// 这个分工让「报单即占额度」不再误伤笔数纪律，同时金额闸继续兜住信号风暴。
+//
+// English: §GAP1.3/1.4 buy-discipline precheck (migrated from the controller): daily buy-count cap,
+// daily budget and estimated/broker available-cash gates, run before the pending ticket persists.
+// Gate 1 counts *filled* buys (fills table, deduped per order); gates 2–4 stay amount-based and do
+// include in-flight submissions, which is what keeps a signal storm bounded by cash instead of count.
 func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	if o.Side != SideBuy || g.st == nil {
 		return ""
@@ -411,20 +420,20 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	if amount <= 0 {
 		amount = o.Price * float64(o.Qty)
 	}
-	// 读取全部委托，统计今日已报买入的笔数与金额。
+	// 读取全部委托，统计今日已报买入的金额（供闸2/闸3 的额度占用口径——在途报单确实占着可用
+	// 资金，金额口径含未成交在途是对的；笔数口径的诉求不同，见下方闸1 注释）。
 	orders, err := g.st.RealOrdersForUser(g.userID)
 	if err != nil {
 		return fmt.Sprintf("read real orders: %v", err)
 	}
 	today := g.today()
-	buys := 0
 	spent := 0.0
 	// 只统计今日买入委托：排除卖出方向与本单自身（避免自计数）；排除非终态前占位/已撤等状态。
 	for _, ord := range orders {
 		if ord.Side != SideBuy || ord.SignalID == o.SignalID {
 			continue
 		}
-		// 仅"已报/部成/已成"三种有效状态计入今日预算与笔数。
+		// 仅"已报/部成/已成"三种有效状态计入今日已报金额。
 		switch ord.Status {
 		case "已报", "部成", "已成":
 		default:
@@ -435,12 +444,25 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 		if perr != nil || cntime.In(at).Format("2006-01-02") != today {
 			continue
 		}
-		buys++
 		spent += ord.Price * float64(ord.Qty)
 	}
-	// 闸1：单日买入笔数上限（0=不限）。
-	if cfg.DailyMaxBuys > 0 && buys >= cfg.DailyMaxBuys {
-		return fmt.Sprintf("单日买入笔数达上限 %d（今日已报 %d 笔）", cfg.DailyMaxBuys, buys)
+	// 闸1：单日买入笔数上限（0=不限）——**已成交**口径（2026-09-18 修正，原为已报口径）。
+	//
+	// 旧口径数 orders 里今日「已报/部成/已成」的委托数，等于报单即占额度：一笔报出去当场被券商
+	// 废掉、或一直挂在委托簿上没成交，同样吃掉一天的买入额度，用户会因为一堆根本没成交的报单被
+	// 锁死买入权（事故形态：daily_max_buys=5，当日 5 笔报单实际 0 成交，闸口仍报「今日已报 5 笔」）。
+	// 这条纪律的语义是「今天最多买成几笔」，故以 fills 表为准——柜台回报落下的客观成交事实。
+	// 附带收益：交割单 sync_fills 补记的手工成交（没有本地 orders 行）也能正确计入。
+	// 防信号风暴的能力不因此丢失：闸2 单日预算与闸3/闸4 可用资金仍按「已报金额 + 在途冻结」计算，
+	// 无节制报单会先在金额闸上撞墙（见 checkBuyDiscipline 头注的闸口分工）。
+	if cfg.DailyMaxBuys > 0 {
+		filled, ferr := g.st.CountBuyFilledOrdersByDay(g.userID, today)
+		if ferr != nil {
+			return fmt.Sprintf("read buy fills: %v", ferr)
+		}
+		if filled >= cfg.DailyMaxBuys {
+			return fmt.Sprintf("单日买入笔数达上限 %d（今日已成交 %d 笔）", cfg.DailyMaxBuys, filled)
+		}
 	}
 	// 闸2：单日买入预算（0=不限）：今日已报金额 + 本次金额超预算即拒。
 	if cfg.DailyBudgetAmount > 0 && spent+amount > cfg.DailyBudgetAmount {

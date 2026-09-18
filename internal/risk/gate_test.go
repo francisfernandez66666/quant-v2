@@ -4,6 +4,7 @@ package risk
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -281,24 +282,43 @@ func TestGateConcentration(t *testing.T) {
 	}
 }
 
-// TestGateBuyDiscipline 买入纪律迁入闸口：预算超限拦截。
+// TestGateBuyDiscipline 买入纪律迁入闸口：笔数按「已成交」计 + 预算超限拦截。
+//
+// §P0 2026-09-18 口径修正回归：笔数闸原先数 orders 表里「今日已报」的委托数——报单即占额度，
+// 一笔被券商废掉或挂在委托簿上没成交的报单同样吃掉一天的买入额度（事故形态：daily_max_buys=5，
+// 当日 5 笔报单实际 0 成交，闸口仍报「今日已报 5 笔」）。现在只有真实成交（fills）才占额度。
 func TestGateBuyDiscipline(t *testing.T) {
 	db := gateDB(t)
 	g := NewGate(db, "u_g", nil)
 	cfg := qmtCfg()
 	cfg.DailyMaxBuys = 2
-	// 第一笔放行，两笔后再买被笔数上限拦截
-	if v := g.CheckLiveOrder(cfg, liveOrder(SideBuy)); !v.Pass {
-		t.Fatalf("首笔应放行, got %+v", v)
+	// Gate 只判定（占位由 controller 落库）：无成交时连续放行——旧口径在第 3 笔就拦了。
+	for i := 0; i < 3; i++ {
+		if v := g.CheckLiveOrder(cfg, liveOrder(SideBuy)); !v.Pass {
+			t.Fatalf("第 %d 笔（今日 0 成交）应放行, got %+v", i+1, v)
+		}
 	}
-	if v := g.CheckLiveOrder(cfg, liveOrder(SideBuy)); !v.Pass {
-		t.Fatalf("次笔应放行, got %+v", v)
+	// 落 2 笔真实成交 → 当日额度用尽。
+	for i, code := range []string{"600001.SH", "600002.SH"} {
+		if err := db.ApplyRealFill(store.RealFill{
+			OrderID: "GW-" + code, Code: code, Side: SideBuy, Price: 10, Qty: 100,
+			Amount: 1000, UserID: "u_g",
+			TradedAt: cntime.Now().Format("2006-01-02 15:04:05"),
+		}); err != nil {
+			t.Fatalf("落成交 #%d: %v", i+1, err)
+		}
 	}
-	// 前两笔订单未落库（Gate 只判定）→ 仍放行；补充落库场景由 trading 层测试覆盖。
-	if v := g.CheckLiveOrder(cfg, liveOrder(SideBuy)); !v.Pass {
-		t.Fatalf("Gate 无账本占用时应继续放行（占位由 controller 落库）, got %+v", v)
+	v := g.CheckLiveOrder(cfg, liveOrder(SideBuy))
+	if v.Pass || v.Gate != "buy_discipline" {
+		t.Fatalf("已成交 2 笔应被 buy_discipline 拦截, got %+v", v)
 	}
-	_ = db
+	if !strings.Contains(v.Reason, "今日已成交 2 笔") {
+		t.Fatalf("拦截原因须说明「已成交」口径（避免再次混淆报单/成交）: %s", v.Reason)
+	}
+	// 卖出不受买入纪律限制
+	if v := g.CheckLiveOrder(cfg, liveOrder(SideSell)); !v.Pass {
+		t.Fatalf("卖出不受买入纪律限制, got %+v", v)
+	}
 }
 
 // TestGateWhitelistAndMaxPositions 白名单/仓位上限收口。

@@ -102,6 +102,82 @@ class TestFileBridge(unittest.TestCase):
         finally:
             gw.stop()
 
+    @staticmethod
+    def _seed_600580(gw, qty=800, price=25.0):
+        """先用一笔正常买入成交建出 600580.SH 底仓（复刻事故账户形态）。
+
+        必须走成交回报而非直接写库：卖出成交在无底仓时不会落 fills（apply_fill 的
+        "卖出空仓 = no-op" 语义），底仓是让本用例能观测到 fills.side 的前提。
+        """
+        gw.handler._push = lambda p: None
+        gw.handler.on_trade({"order_id": "EXC-BUY", "code": "600580.SH", "side": "买入",
+                             "price": price, "qty": qty, "amount": price * qty,
+                             "traded_at": "2026-09-16T10:00:00+08:00",
+                             "signal_id": "buy:600580:manual:2026-09-16"})
+
+    def test_apply_trade_dispatch_side_is_authoritative(self):
+        """§P0 2026-09-18「买入卖出不分」回归：本端派发过的单，成交方向以派发项为权威。
+
+        事故形态：600580.SH 一笔真实手动卖出（800 股 @26.71）在成交流水里显示为「买入」。
+        方向来源链只有柜台 DEAL 行字段反推（枚举空间跨券商构建不定），而本地派发项
+        dispatch.side 是我们下单时写下的物理事实。旧实现用 setdefault —— 桥行恒带 side，
+        覆盖从未发生，误判方向原样落进 fills（成本/已实现盈亏/胜率全线污染）。
+        """
+        gw = self._new_gw(tempfile.mkdtemp())
+        pushed = []
+        self._seed_600580(gw)
+        gw.handler._push = lambda p: pushed.append(p)
+        # 派发一笔真实卖出（与事故同形的量价）
+        gw.store.dispatch_enqueue_order({"signal_id": "manual@600580.SH@20260917100026",
+                                         "code": "600580.SH", "side": "卖出",
+                                         "price_type": "limit", "price": 26.71, "qty": 800})
+        seq = gw.store.dispatch_pending(limit=1)[0]["seq"]
+        gw.store.dispatch_set_result(seq, {"ok": True, "order_id": "EXC-600580", "err": ""})
+        try:
+            # 桥报来「买入」但归因正确（最恶劣形态：signal_id 对、方向反）；code 故意留空，
+            # 顺带钉住"代码也必须按派发项回填"（否则卖出会拿空代码查底仓而漏账）。
+            gw._apply_trade({"order_id": "EXC-600580",
+                             "signal_id": "manual@600580.SH@20260917100026",
+                             "side": "买入", "price": 26.71, "qty": 800,
+                             "amount": 21368.0,
+                             "traded_at": "2026-09-17T10:00:26+08:00"})
+            with gw.store._lock:
+                rows = gw.store._conn.execute(
+                    "SELECT side, qty FROM fills WHERE order_id = ?",
+                    ("EXC-600580",)).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "卖出",
+                             "派发项方向（卖出）必须覆盖桥的误判方向（买入）")
+            # 上报量仔的 payload 同源为卖出
+            self.assertEqual(pushed[0]["side"], "卖出")
+            # 反向回归：误判为买入会把 800 股卖出记成加仓（底仓变 1600 股）
+            held = {p["ts_code"]: p["qty"] for p in gw.store.list_positions()}
+            self.assertNotIn("600580.SH", held, "清仓卖出后不得残留持仓：%s" % held)
+        finally:
+            gw.stop()
+
+    def test_apply_trade_unattributed_keeps_reported_side(self):
+        """未派发过的成交（客户端手工单/对账来源）：无权威方向可依，回报方向原样保留。
+
+        防止上面那条权威化改动扩大到"所有成交一律改写"——只有本端派发过的单才有权威方向。
+        """
+        gw = self._new_gw(tempfile.mkdtemp())
+        pushed = []
+        self._seed_600580(gw)
+        gw.handler._push = lambda p: pushed.append(p)
+        try:
+            gw._apply_trade({"order_id": "EXC-CLIENT", "side": "卖出", "code": "600580.SH",
+                             "price": 26.71, "qty": 800, "amount": 21368.0,
+                             "traded_at": "2026-09-17T10:00:26+08:00"})
+            with gw.store._lock:
+                rows = gw.store._conn.execute(
+                    "SELECT side FROM fills WHERE order_id = ?", ("EXC-CLIENT",)).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "卖出")
+            self.assertEqual(pushed[0]["side"], "卖出")
+        finally:
+            gw.stop()
+
     def test_report_heartbeat_drives_bridge_connected(self):
         """上报一行 heartbeat → sidecar 应用 → store.bridge_heartbeat() → 桥在线。"""
         gw = self._new_gw(tempfile.mkdtemp())
@@ -153,7 +229,8 @@ class TestFileBridge(unittest.TestCase):
     def test_report_order_result_settles_dispatch(self):
         """order_result JSONL 行 → sidecar → 派发项 done + 委托号回填（实盘语义 dry 也通）。"""
         gw = self._new_gw(tempfile.mkdtemp())
-        # 准备一条已完成下单的派发行（pending 派发并标记 inflight，模拟桥取单后）
+        # 准备一条已完成下单的派发行（pending 派发并标记 inflight，模拟桥取单后）。
+        # 量价用 600519 一手：与实盘最小委托同形，顺带验证 qty=100 整手约束不拦内部派发。
         gw.store.dispatch_enqueue_order({"signal_id": "FB2", "code": "600519.SH",
                                          "side": "买入", "price_type": "limit",
                                          "price": 1500, "qty": 100})

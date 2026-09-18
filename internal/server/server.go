@@ -62,7 +62,6 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
-	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
@@ -151,10 +150,19 @@ type Server struct {
 
 	cacheDir string // 看板快照落盘目录（休市/重启后前端仍可读取最近一次有效数据）
 
-	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 的互斥锁
+	llmMu      sync.Mutex // 保护 runtimeLLM/runtimeURL 与 LLM 快照的互斥锁
 	runtimeLLM string     // 运行时实际使用的 model（与文件配置可能不同）
 	runtimeURL string     // 运行时实际使用的 API 地址
-	limiter    ipLimiter  // §A4 匿名端点 IP 频控（register/temp/login/setup）
+	// llmApplyMu 串行化「探测 → 热切换 → 落库」这一整套动作（见 llm_apply.go）。
+	// 盘中连点保存、或保存与回滚并发时，两个流程交错会让"谁最后生效"不可预测——
+	// 而这里预测错就是线上 LLM 客户端被换错。只保护写路径，不参与请求路径。
+	llmApplyMu sync.Mutex
+	// llmLastApplied 最后一次**生效**的运行时配置快照（含明文密钥，仅内存）。
+	llmLastApplied *llmSnapshot
+	// llmLastGood 最后一次**经验证可用**的运行时配置快照：一键回滚的目标。
+	// 与 lastApplied 分开维护——正是"force 强行应用了未验证配置"这条路径才需要回滚。
+	llmLastGood *llmSnapshot
+	limiter     ipLimiter // §A4 匿名端点 IP 频控（register/temp/login/setup）
 	// tenantLimiter §MT 租户级业务 API 频控：key=租户 ID，窗口 1 分钟，
 	// 上限取租户配额 Quota.APIRatePerMin（0=默认 600/min）。
 	tenantLimiter ipLimiter
@@ -563,6 +571,12 @@ func (s *Server) registerRoutes() {
 	// §GAP2-W2 权限收口（P1-3）：普通用户保存自己的 LLM 配置会经 llmRecreate 热替换【全部账号】
 	// 引擎与新闻管线的客户端（归因上下文外送/计费劫持），故写权限收敛到 admin；普通用户 GET 只读。
 	s.mux.HandleFunc("POST /api/config/llm", s.adminMiddleware(s.handleSetLLMConfig))
+	// LLM 通道自检：盘中"现在到底能不能用"的唯一快速手段（此前只能读日志或重启进程）。
+	// 只读、不改任何状态，支持带候选配置探测（与 POST /api/config/llm 同形，含脱敏哨兵回填）。
+	s.mux.HandleFunc("POST /api/config/llm/probe", s.adminMiddleware(s.handleProbeLLMConfig))
+	// 一键回滚：热更新翻车（例如强制应用了一个其实不能用的配置）时回到上一个已验证可用的配置，
+	// 不必重启、不必回忆上次填了什么。与写接口同权限（会改运行时与落库）。
+	s.mux.HandleFunc("POST /api/config/llm/rollback", s.adminMiddleware(s.handleRollbackLLMConfig))
 
 	// QMT 实盘配置：运营数据统一归属管理员（系统级共享），仅管理员可读写。
 	// 子账号不拥有/不操作量化交易，后端据此鉴权，前端不自行判定权限。
@@ -1814,6 +1828,15 @@ type setLLMConfigReq struct {
 	// ClassifierModel 可选分类专用模型（Stage0/1 等快速分类/初筛），留空用主模型。
 	// （ClassifierModel is an optional dedicated model for cheap classification/screening; empty = main model.）
 	ClassifierModel string `json:"classifier_model,omitempty"`
+	// Force 强制应用：跳过「探测未通过则拒绝」的保护，无条件切换并落库。
+	//
+	// 为什么需要这个开关：探测可能因为**与配置无关**的原因失败（供应商正在抖动、本机代理不通、
+	// 网关不认我们探测请求体里的某个字段）。这类情况不该永久堵死用户——盘中他必须能改。
+	// 默认 false（拒绝并给出确凿原因），只有用户显式勾选才走强制路径，且强制路径会：
+	// ① 在响应里如实回告"未经验证"；② 保留回滚点，随时可一键退回上一个可用配置。
+	// English: force-apply, bypassing the "probe must pass" guard. Only an explicit opt-in, and it
+	// still reports "unverified" and keeps the rollback point intact.
+	Force bool `json:"force,omitempty"`
 }
 
 // handleGetLLMConfig 处理 GET /api/config/llm：返回当前账号的 API 地址、运行时生效模型与流式开关。
@@ -1843,7 +1866,49 @@ func (s *Server) handleGetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		"max_retry_times":   cfg.MaxRetryTimes,
 		"classifier_model":  cfg.ClassifierModel,
 		"d1_max_tokens":     cfg.D1MaxTokens,
+		// runtime 回报**运行时实际生效**的那一份（进程内存里的客户端用的就是它）。
+		// 为什么必须单独回报：库里的配置与内存里的客户端可能不一致（历史事故形态），
+		// 而"页面上看到的值"此前无法区分是"已保存"还是"代码默认值"（内置默认供应商恰好
+		// 也是 SiliconFlow），用户只能靠猜。这里给出确切事实 + 有无回滚点。
+		"runtime": s.runtimeLLMView(),
 	})
+}
+
+// runtimeLLMView 运行时 LLM 状态视图（供 GET /api/config/llm 回报）。
+//
+// 只暴露"是什么状态"，绝不带密钥本身：key 数、生效地址/模型、是否经验证、有无回滚点。
+func (s *Server) runtimeLLMView() map[string]interface{} {
+	s.llmMu.Lock()
+	applied := s.llmLastApplied
+	good := s.llmLastGood
+	s.llmMu.Unlock()
+
+	// 组装视图：运行时快照缺省时 available=false（前端据此提示"尚未热生效过"），
+	// 有 lastGood 才允许回滚按钮亮起——两个字段都来自锁内拷贝，组装放锁外避免长持锁。
+	view := map[string]interface{}{
+		"available":    applied != nil,
+		"url":          s.runtimeURLOf(),
+		"model":        s.runtimeModel(),
+		"can_rollback": good != nil,
+	}
+	if applied != nil {
+		view["keys"] = len(applied.Keys)
+		view["verified"] = applied.Verified
+		view["applied_at"] = applied.At.Format(time.RFC3339)
+	}
+	if good != nil {
+		view["last_good_at"] = good.At.Format(time.RFC3339)
+		view["last_good_url"] = good.APIURL
+		view["last_good_keys"] = len(good.Keys)
+	}
+	return view
+}
+
+// runtimeURLOf 返回运行时实际使用的 API 地址（无记录时为空串）。
+func (s *Server) runtimeURLOf() string {
+	s.llmMu.Lock()
+	defer s.llmMu.Unlock()
+	return s.runtimeURL
 }
 
 // splitLLMKeys 解析逗号分隔（含空白）的 API 密钥列表为去空去重数组。
@@ -1961,8 +2026,26 @@ func validatePublicURL(raw string) error {
 }
 
 // handleSetLLMConfig 处理 POST /api/config/llm：保存当前账号的 LLM 配置并热重建客户端。
-// 依次执行：APIURL+Model 写入当前账号配置 → APIKey 写入 auth 配置 → 触发 llmRecreate
-// 回调重建客户端 → 记录运行时实际生效的 model（空值兜底为默认模型）。
+// 依次执行：APIURL+Model 写入当前账号配置（URL 留空=保持原值）→ 密钥槽位一次性解析为真钥
+// （脱敏哨兵映射回库中原值）→ 落 auth 配置 → 用**同一份真钥**触发 llmRecreate 重建客户端
+// → 记录运行时实际生效的 model（空值兜底为默认模型）。
+//
+// §P0 2026-09-18：落库与热重建必须共用同一份解析结果——历史上热重建直接吃 req.APIKeys，
+// 把 GET 回显的脱敏掩码当成了真钥（详见下方密钥解析处注释）。
+// English: persists the account's LLM config and hot-rebuilds the client from the SAME resolved
+// key list that was persisted (masked sentinels map back to the stored real keys).
+// handleSetLLMConfig 处理 POST /api/config/llm：保存当前账号的 LLM 配置并热生效。
+//
+// 实现已收口到 llm_apply.go 的 runSetLLMConfig —— 设置页 / 管理端 / 咨询页三个入口共用同一份，
+// 完整语义（探测 → 切换 → 落库，"拒绝必须有确凿证据"，回滚点维护）见该文件头部说明。
+// 口径分叉正是历次"改了不生效"的根源：同一件事两处各写一遍，迟早有一处漏。
+//
+// 这里只留两条历史事故的索引（细节见 llm_apply.go 的对应注释）：
+//   - 脱敏哨兵必须解析回库中真钥，且**落库与热切换共用同一份解析结果**：否则线上客户端的密钥
+//     会变成字面量掩码 → 全线 401，而库里那把好钥还在、页面回读还是老样子（"改了没生效"）。
+//   - api_url / model 留空 = 保持原值：咨询页只提交 Key 时，空串曾把已配好的供应商静默清空。
+//
+// English: the implementation now lives in llm_apply.go and is shared by every write path.
 func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
 	var req setLLMConfigReq
@@ -1970,86 +2053,52 @@ func (s *Server) handleSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	res, status, msg := s.runSetLLMConfig(uid, req)
+	if msg != "" {
+		writeError(w, status, msg)
+		return
+	}
+	writeLLMApplyResult(w, status, res, res.Reason)
+}
 
-	// 保存 APIURL + Model 到当前账号配置（多账号多配置隔离）
-	s.cfg.SetLLMConfigFor(uid, &config.LLMConfig{
-		APIURL:           req.APIURL,
-		Model:            req.Model,
-		TimeoutSec:       req.TimeoutSec,
-		Stream:           req.Stream,
-		BatchConcurrency: req.BatchConcurrency,
-		ClassifierModel:  req.ClassifierModel,
-		D1MaxTokens:      req.D1MaxTokens,
-	})
-
-	// §GAP2-W2 出呼地址校验（SSRF 面收口）：非法直接拒绝，不落任何配置
-	if req.APIURL != "" {
-		if err := validatePublicURL(req.APIURL); err != nil {
-			writeError(w, 400, "api_url "+err.Error())
-			return
+// resolveSubmittedLLMKeys 把设置页提交的密钥槽位解析为**可实际使用**的真钥列表，
+// 返回 (真钥列表, 提交中被识别为脱敏哨兵的槽位数)。
+//
+// 槽位对齐规则（与 GET 的回显顺序一一对应）：第 i 个哨兵 → 库中原值的第 i 把；
+// 哨兵但库中无对应槽位（异常提交）→ 跳过，绝不把掩码当真钥；明文槽位原样保留。
+// 库中原值优先多 key（llm_api_keys），为空时回退旧版单 key（llm_api_key）——
+// 旧账号只存了单 key，哨兵此前会因对不上而静默丢弃。
+//
+// English: maps each submitted masked sentinel back to the stored real key at the same index
+// (multi-key store first, legacy single-key as fallback), passes plaintext through, and drops
+// sentinels that have no stored original — a mask must never survive as a key.
+func (s *Server) resolveSubmittedLLMKeys(uid string, submitted []string) ([]string, int) {
+	if len(submitted) == 0 {
+		return nil, 0
+	}
+	old := []string{}
+	if v, ok := s.auth.GetConfig(uid, "llm_api_keys"); ok && v != "" {
+		old = splitLLMKeys(v)
+	}
+	if len(old) == 0 {
+		if v, ok := s.auth.GetConfig(uid, "llm_api_key"); ok && v != "" {
+			old = []string{v}
 		}
 	}
-
-	// 保存 APIKey 到 auth config（按账号隔离）；§GAP2-W2 脱敏哨兵不覆盖原值
-	if req.APIKey != "" && !isMaskedSecret(req.APIKey) {
-		s.auth.SetConfig(uid, "llm_api_key", req.APIKey)
-	}
-
-	// 保存多 API 密钥到 auth config（逗号分隔）；为空时维持现状；
-	// §GAP2-W2 逐位处理脱敏哨兵——提交 "sk-…abcd" 形态的槽位保留库中原值
-	if len(req.APIKeys) > 0 {
-		existing := ""
-		if v, ok := s.auth.GetConfig(uid, "llm_api_keys"); ok {
-			existing = v
-		}
-		old := splitLLMKeys(existing)
-		out := make([]string, 0, len(req.APIKeys))
-		for i, k := range req.APIKeys {
-			switch {
-			case isMaskedSecret(k) && i < len(old):
-				out = append(out, old[i]) // 哨兵 → 原值
-			case isMaskedSecret(k):
-				// 哨兵但无对应原值（异常提交）：跳过，避免把掩码存成真钥
-			default:
-				out = append(out, k)
-			}
-		}
-		if len(out) > 0 {
-			s.auth.SetConfig(uid, "llm_api_keys", strings.Join(out, ","))
+	out := make([]string, 0, len(submitted))
+	masked := 0
+	for i, k := range submitted {
+		switch {
+		case !isMaskedSecret(k):
+			out = append(out, k)
+		case i < len(old):
+			out = append(out, old[i]) // 哨兵 → 库中原值
+			masked++
+		default:
+			masked++ // 哨兵且无对应原值：跳过（不得把掩码存成/当成真钥）
 		}
 	}
-
-	// 热重建 LLM 客户端（如果提供了回调）
-	if s.llmRecreate != nil {
-		// 优先用请求里的多 key；未提供则读已保存的多 key；再无则回退单 key
-		keys := req.APIKeys
-		if len(keys) == 0 {
-			if v, ok := s.auth.GetConfig(uid, "llm_api_keys"); ok && v != "" {
-				keys = splitLLMKeys(v)
-			}
-		}
-		if len(keys) == 0 {
-			key := req.APIKey
-			if key == "" {
-				if v, ok := s.auth.GetConfig(uid, "llm_api_key"); ok {
-					key = v
-				}
-			}
-			if key != "" {
-				keys = []string{key}
-			}
-		}
-		s.llmRecreate(keys, req.APIURL, req.Model, req.TimeoutSec, streamingEnabled(req.Stream), req.BatchConcurrency, req.ClassifierModel)
-	}
-
-	// 记录运行时实际生效的 model（空值会被 llm 客户端按默认模型兜底）
-	model := req.Model
-	if model == "" {
-		model = llm.DefaultModel
-	}
-	s.SetRuntimeLLM(req.APIURL, model)
-
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	return out, masked
 }
 
 // handleLLMDebug 处理 GET /api/llm-debug：返回引擎的 LLM 流水线调试信息。

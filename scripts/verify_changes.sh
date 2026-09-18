@@ -13,6 +13,30 @@
 #   CI-seed      ：nightly 工作流 admin id 改读 auth.json（users 表引用设 grep 守卫）
 #   桥防线       ：_record_seen 落盘失败 → _handle_cmd 拒执行（fail-closed，drill-3 补全）
 #
+# §买卖方向权威化（2026-09-18 §TRADE_SIDE）专项（见 12/14）：
+#   现象         ：600580.SH 一笔真实手动卖出（800 股 @26.71）在成交流水里显示为「买入」。
+#   桥侧         ：_deal_side 多字段投票（m_nDirection 0/48=买、1/49/50=卖；m_nOffsetFlag 48=买/50=卖；
+#                  order_type 交叉否决；冲突不盲判、未命中组合留痕不抛异常）+ embed/xt 两路径同源
+#   网关侧       ：本端派发过的单，dispatch.side 是方向唯一权威（旧 setdefault 从未生效——桥行恒带
+#                  side）；未派发过的成交保持回报方向；派发项定位链 seq → 交易所委托号 → signal_id
+#   纯净度       ：qmt_bridge_strategy.py 纯 ASCII 守卫（GBK 沙箱，中文注释同样乱码）
+#
+# §单日买入笔数改「已成交」口径（2026-09-18 §BUY_COUNT_FILLED）专项（见 13/14）：
+#   口径         ：笔数闸从「orders 表已报笔数」改为「fills 表当日买入成交按委托去重」；
+#                  金额闸（单日预算 / 可用资金）仍按「已报金额 + 在途冻结」——在途报单确实占着钱
+#   附带效果     ：同一委托多次部分成交算 1 笔；QMT 客户端手工单（本地无 orders 行）计入额度
+#   回归         ：三处锁旧口径的断言（gate/guards/engine）改写为钉新语义 + store 层边界用例
+#
+# §LLM 热更新稳定性 + 地址规范化（2026-09-18 §LLM_HOTUPDATE / §LLM_BASEURL）专项（见 14/14）：
+#   地址规范化   ：供应商 base URL（/v1、/v1beta、裸主机）自动补 /chat/completions；
+#                  完整 endpoint 与自建网关非标准路径原样不动（不猜）
+#   健康探测     ：ProbeConfig 逐把 key 并发发一次真实最小 chat 调用，一次验完鉴权+地址形态+模型名；
+#                  429 算可用、仅 auth/model/quota 算「配置错」、超时夹逼 [15s,60s]
+#   热更新语义   ：探测 → 切换 → 落库（落库失败只影响重启自愈、不回滚运行时）；
+#                  拒绝必须有确凿证据（network/5xx/400 不算）；三入口共用 runLLMApplyFor；
+#                  哨兵不落库也不成钥；force 不污染回滚点；探测端点只读
+#   前端         ：拒绝时不得谎报「已热生效」，逐把展示探测结论
+#
 # §信号控制器（2026-09-17 §SIGNAL_CONTROLLER）专项（见 10/10）：
 #   组件层       ：internal/signalctl 全包——白名单（空白名单=内置四形态+库规则默认全集、动量/未知严格 opt-in）、
 #                  个股/板块黑名单与影子模式、买入持续性确认窗（探针+双窗+两通道两账号隔离+消失重置）、
@@ -80,10 +104,46 @@
 #                  + stepTask lifecycle 映射与默认 Steps 含 lifecycle（TestLifecycleStepMapped）
 #
 # 用法:
-#   ./scripts/verify_changes.sh                # 编译 + 实时链路 e2e + 回测增强 + 做空链路 + 风险因子 + 今日修复 + 数据管道根治 + 备案合规/生命周期专项
+#   ./scripts/verify_changes.sh                # 编译 + 全部专项（12 个历史专项 + 今日 3 个：方向权威化/笔数成交口径/LLM 热更新）
 #   ./scripts/verify_changes.sh -full          # 再连相关全量单测 + QMT 网关 py 全量 + 前端 vitest 一起跑
+#
+# 说明：本机通常没有 pytest，脚本内 py_tests() 会自动退回标准库 unittest（CI 仍走 pytest）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# py_tests <目标文件或目录> [-k 过滤表达式]
+#
+# 运行 Python 测试。CI 装了 pytest，本机（macOS 开发机）通常没有，因此做一次能力探测后
+# 退回标准库 unittest —— 否则脚本在本机会因「No module named pytest」而假失败，
+# 让人误以为是被测代码坏了（二者现象一样、成因完全不同，最耗排查时间）。
+py_tests() {
+	local target="$1"
+	local filter="${2:-}"
+	if python3 -c 'import pytest' >/dev/null 2>&1; then
+		if [ -n "$filter" ]; then
+			python3 -m pytest "$target" -q -k "$filter"
+		else
+			python3 -m pytest "$target" -q
+		fi
+		return
+	fi
+	# 过滤串统一接受 pytest 的 "a or b" 写法：unittest 的 -k **不支持** or 表达式，
+	# 每个 -k 是一个独立模式（pytest 的 '-k "a or b"' 在 unittest 下会静默匹配 0 个用例），
+	# 因此在这里拆成多个 -k。$kstr 有意不加引号——模式都是脚本里写死的单词，依赖分词展开。
+	local kstr=""
+	for p in ${filter// or/ }; do kstr="$kstr -k $p"; done
+	if [ -d "$target" ]; then
+		# 目录形态：unittest 用 discover
+		python3 -m unittest discover -s "$target" -p 'test_*.py' $kstr -v
+	else
+		# 文件形态：<dir>/tests/test_x.py → cd <dir> 后按模块 tests.test_x 运行
+		# （unittest 的模块名相对 cwd 解析，直接把完整路径转模块名会导入失败）
+		local pkg base
+		pkg=$(basename "$(dirname "$target")")
+		base=$(basename "$target" .py)
+		( cd "$(dirname "$target")/.." && python3 -m unittest "$pkg.$base" $kstr -v )
+	fi
+}
 
 echo "==> 1/8 编译检查..."
 go build ./...
@@ -130,8 +190,8 @@ go test -count=1 ./internal/btreplay/ -run 'TestMinTriggersForObjDefaults' 2>&1 
 echo "==> 7/8 数据管道停摆根治专项（§DATA-OUTAGE 2026-09-14：market_risk_daily 历史回放 + dataload 盘后保活）..."
 go test -count=1 ./cmd/research/ -run 'TestRiskBackfill' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
-python3 -m pytest qmt_gateway/tests/test_dataload_keepalive.py -q 2>&1 \
-	| grep -E "passed|failed|error"
+py_tests qmt_gateway/tests/test_dataload_keepalive.py 2>&1 \
+	| grep -E "passed|failed|error|Ran [0-9]+ test|OK"
 
 echo "==> 8/8 备案合规 + 生命周期接线专项（2026-09-15 §ICP + §GAP-P1）..."
 # ICP 备案号合规文案守护：常量改动即失败（管局备案文案，变更需先核对备案回执）
@@ -172,14 +232,14 @@ go test -count=1 ./internal/server/ ./internal/risk/ ./internal/config/ \
 	-run 'TestPaperStrategiesEndpoints|TestGateWhitelistAndMaxPositions|TestGateSTAndBlacklist' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
 
-echo "==> 11/11 全链路 UAT 修复批专项（2026-09-18 §UAT_FULLCHAIN_VERIFY：费用腿 + 权限门控 + 死代码 + CI-seed 守卫）..."
+echo "==> 11/14 全链路 UAT 修复批专项（2026-09-18 §UAT_FULLCHAIN_VERIFY：费用腿 + 权限门控 + 死代码 + CI-seed 守卫）..."
 # A 费用腿（P2-FEE）：Go 回报→ApplyRealFill 落 fills.fee（旧格式缺省 0 兼容）、
 #   mock /settlement 费用腿非零、网关 store 入库/输出、handler 多字段名探测、桥 fail-closed
 go test -count=1 ./internal/server/ ./cmd/qmt-mock/ -run 'TestHandleQMTReportTradeFeeLeg|TestMockSettlementEndpoint' 2>&1 \
 	| grep -E '^(--- FAIL|FAIL|ok)'
-python3 -m pytest qmt_gateway/tests/test_gateway.py -q \
-	-k 'fee or settlement_endpoint or trade_push' 2>&1 | grep -E "passed|failed|error"
-python3 -m pytest qmt_gateway/tests/test_bridge_strategy_adapter.py -q -k 'record_seen' 2>&1 | grep -E "passed|failed|error"
+py_tests qmt_gateway/tests/test_gateway.py 'fee or settlement_endpoint or trade_push' 2>&1 \
+	| grep -E "passed|failed|error|Ran [0-9]+ test|OK"
+py_tests qmt_gateway/tests/test_bridge_strategy_adapter.py 'record_seen' 2>&1 | grep -E "passed|failed|error|Ran [0-9]+ test|OK"
 # B 占位可观测（P2-STUB）：dragon/double_bump/n_shape 占位 Evaluate 必返回 Level=stub
 go test -count=1 ./internal/strategies/dragon/ ./internal/strategies/double_bump/ ./internal/strategies/n_shape/ \
 	-run 'TestEvaluateStubLevel|TestEvaluatePlaceholder' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
@@ -193,10 +253,60 @@ grep -q 'auth.json' .github/workflows/nightly-e2e.yml && echo "ok - nightly seed
 [ ! -d internal/calendar ] && echo "ok - internal/calendar 已移除（真实现在 data/trade_time.go）" || { echo "FAIL - calendar 包复活"; exit 1; }
 grep -q 'func (a \*Agent) Scan(' internal/combat_agent/agent.go && { echo "FAIL - 无调用方的 Agent.Scan 通用入口复活"; exit 1; } || true
 
+echo "==> 12/14 买卖方向权威化专项（2026-09-18 §TRADE_SIDE：派发项方向唯一权威 + 桥侧多字段投票）..."
+# A 桥侧方向解析（qmt_gateway/tests/test_deal_direction.py）：
+#   m_nDirection 双枚举空间（0/48=买、1/49/50=卖，柜台既有 offset 口径也有 ASCII '0'/'1' 口径）、
+#   m_nOffsetFlag 48=买/50=卖（08-31 现金流出实证口径，49 从未被真实卖出验证过）、
+#   order_type 交叉否决、冲突不盲判落到下一权威、未命中组合留痕且不抛异常、描述串保持纯 ASCII
+py_tests qmt_gateway/tests/test_deal_direction.py
+# B 网关侧方向权威化（qmt_gateway/tests/test_file_bridge.py）：
+#   本端派发过的单 → dispatch.side 覆盖桥的误判方向（最恶劣形态：归因对、方向反）；
+#   未派发过的成交（客户端手工单/对账来源）→ 无权威方向可依，回报方向原样保留
+py_tests qmt_gateway/tests/test_file_bridge.py 'dispatch or unattributed'
+# C 桥脚本纯 ASCII 守卫：该脚本在 GBK 沙箱执行，任何非 ASCII 字节（含中文注释）都会乱码
+python3 - <<'PY'
+b = open('qmt_gateway/qmt_bridge_strategy.py', 'rb').read()
+n = sum(1 for c in b if c > 127)
+print('ok - qmt_bridge_strategy.py 非 ASCII 字节 %d' % n if n == 0 else
+      'FAIL - qmt_bridge_strategy.py 出现非 ASCII 字节 %d（GBK 沙箱会乱码）' % n)
+raise SystemExit(0 if n == 0 else 1)
+PY
+
+echo "==> 13/14 单日买入笔数改「已成交」口径专项（2026-09-18 §BUY_COUNT_FILLED）..."
+# 口径分工（设计决定，勿混成一个）：
+#   笔数闸 → fills 表当日买入成交，按委托去重（order_id → 券商交割流水号 → 行 ID 依次兜底）
+#   金额闸 → orders 表当日已报金额 + 在途冻结（在途报单确实占着钱，改成只看成交等于可无限挂单）
+# A store 层计数边界：部分成交去重 / 卖出不计 / 非当日不计 / 他账号不计 / 无委托号不合并
+go test -count=1 ./internal/store/ -run 'TestCountBuyFilled' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# B 闸口层：成交笔数达上限才拦（旧口径是报单即占额度，被废单会锁死当天买入权）
+go test -count=1 ./internal/risk/ -run 'TestGateBuyDiscipline' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# C 交易层：达上限后拒绝新买入、卖出不受限
+go test -count=1 ./internal/trading/ -run 'TestGuardDailyBuysCap' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# D 引擎层：auto 下单路径同口径（0 成交时不拦，成交满额才拦）
+go test -count=1 ./internal/engine/ -run 'TestAutoPlaceDailyCap' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+
+echo "==> 14/14 LLM 热更新稳定性 + 地址规范化专项（2026-09-18 §LLM_HOTUPDATE / §LLM_BASEURL）..."
+# A 地址规范化（internal/llm）：供应商 base URL（/v1、/v1beta、裸主机、带尾斜杠）自动补
+#   /chat/completions；已是完整 endpoint 或自建网关非标准路径**原样不动**（不猜）；
+#   端到端断言真实请求路径，防止只改了字符串却仍打到 base 路径（供应商 404/405）
+go test -count=1 ./internal/llm/ -run 'TestProviderBaseURLIsNormalized|TestChatHitsChatCompletionsPath' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+# B 候选配置健康探测：逐把 key 真实最小调用；429 算可用（证明鉴权已过）、
+#   仅 auth/model/quota 算「配置错」、超时夹逼 [15s,60s]、max_tokens 过小自动放宽、不泄漏密钥
+go test -count=1 ./internal/llm/ -run 'TestProbe' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# C 热更新语义（internal/server）：探测 → 切换 → 落库；拒绝时运行时与磁盘**都不动**；
+#   network/5xx/400 不构成拒绝证据（采用 + 标记未验证）；三入口共用一份实现；
+#   全哨兵且无原值 → 400 且不重建；force 不污染回滚点；探测/回滚端点只读语义
+go test -count=1 ./internal/server/ -run 'TestHotUpdate|TestSetLLMConfig|TestAdminSetLLM' 2>&1 \
+	| grep -E '^(--- FAIL|FAIL|ok)'
+# D 前端不得谎报（web/src/__tests__/llm_hotupdate_ui.test.jsx）：拒绝时不得出现「已热生效」，
+#   逐把展示探测结论；只有 applied 才更新基线与「已配置」状态
+( cd web && npm test -- llm_hotupdate_ui ) 2>&1 | grep -E 'Test Files|passed|failed'
+
 if [ "${1:-}" = "-full" ]; then
 	echo ""
-	echo "==> 附加：QMT 网关 Python 全量单测（文件桥/保活/降级/清仓护栏）..."
-	python3 -m pytest qmt_gateway/tests/ -q
+	echo "==> 附加：QMT 网关 Python 全量单测（文件桥/保活/降级/清仓护栏/成交方向解析）..."
+	py_tests qmt_gateway/tests/
 	echo ""
 	echo "==> 附加：实时链路相关全量单测..."
 	go test -count=1 ./internal/combat_agent/... ./internal/engine/... ./internal/llm/... ./internal/strategies/... ./internal/paper/... \

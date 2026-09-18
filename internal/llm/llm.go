@@ -86,13 +86,75 @@ func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 // self-check only counted env keys and misreported UI-saved pools.）
 func (c *Client) KeyCount() int { return len(c.apiKeys) }
 
+// providerBaseVersionRe 供应商 base URL 的「版本段」形态：v1 / v2 / v1beta / v1.0 …
+var providerBaseVersionRe = regexp.MustCompile(`^v\d+([a-z0-9.\-]*)$`)
+
+// defaultAPIURL 内置默认供应商地址（SiliconFlow）——完整 chat/completions endpoint。
+// 单一常量：客户端缺省值与探测缺省值必须同源，否则"探测通过但客户端打到别的地址"的
+// 鬼故事会再次出现。注意它同时是 `llm.DefaultModel` 的配套供应商，因此
+// **「页面上看到 SiliconFlow」无法区分是用户存的值还是代码默认值**。
+const defaultAPIURL = "https://api.siliconflow.cn/v1/chat/completions"
+
+// normalizeAPIURL 把「供应商 base URL」规范成可调用的 chat/completions 完整地址。
+//
+// §P0 2026-09-18（用户报障「前端填了 LLM 的 api 和 key 却一直用不了」）：
+// 客户端把 APIURL **原样**当请求地址（post/streamPost 都是 http.NewRequest(POST, c.apiURL, …)，
+// 全仓没有任何拼接补全），而各家文档给的都是 base URL（如 https://api.siliconflow.cn/v1），
+// 设置页的占位符也是 base 形态（https://api.openai.com/v1）——照抄进去就会 POST 到 /v1 上，
+// 供应商回 404/405：**配置存对了、页面回显也对，就是一次都调不通**，极难自查。
+//
+// 规则（保守：只补两种明确的 base 形态，绝不猜非标准路径）：
+//  1. 只有主机名（https://api.siliconflow.cn）→ 补 /v1/chat/completions（OpenAI 兼容通例）；
+//  2. 路径末段是版本段（/v1、/v1/、/v1beta …）→ 补 /chat/completions；
+//     其余一律原样保留（已带完整 endpoint，或自建网关的非版本路径）。
+//
+// query/fragment 原样保留（自建网关常把鉴权参数挂在 query 上）。
+//
+// English: normalizes a provider *base* URL into the callable chat/completions endpoint the client
+// needs, since the request URL is used verbatim. Only the two unambiguous base shapes are completed;
+// anything else is left untouched.
+func normalizeAPIURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return s
+	}
+	// scheme://host 之后的第一个 '/' 才是 path 起点（跳过 "://"）。
+	start := 0
+	if i := strings.Index(s, "://"); i >= 0 {
+		start = i + 3
+	}
+	slash := strings.Index(s[start:], "/")
+	if slash < 0 {
+		// 只有主机名。
+		return s + "/v1/chat/completions"
+	}
+	schemeHost := s[:start+slash] // scheme://host
+	pathPart := s[start+slash:]   // /path[?query][#frag]
+	tail := ""                    // ?query / #frag
+	path := pathPart
+	if i := strings.IndexAny(pathPart, "?#"); i >= 0 {
+		path, tail = pathPart[:i], pathPart[i:]
+	}
+	p := strings.TrimRight(path, "/")
+	if p == "" {
+		return schemeHost + "/v1/chat/completions" + tail
+	}
+	last := p[strings.LastIndex(p, "/")+1:]
+	if providerBaseVersionRe.MatchString(last) {
+		return schemeHost + p + "/chat/completions" + tail
+	}
+	return s
+}
+
 // New 创建 LLM 客户端。
 // （New creates an LLM client.）
 func New(cfg Config) *Client {
 	// 未指定地址/模型/超时时填充默认值，保证客户端可直接使用
 	if cfg.APIURL == "" {
-		cfg.APIURL = "https://api.siliconflow.cn/v1/chat/completions"
+		cfg.APIURL = defaultAPIURL
 	}
+	// §P0 2026-09-18：把供应商 base URL 规范成可调用的完整 endpoint（详见 normalizeAPIURL）。
+	cfg.APIURL = normalizeAPIURL(cfg.APIURL)
 	if cfg.Model == "" {
 		cfg.Model = DefaultModel
 	}
@@ -1223,6 +1285,7 @@ func (c *Client) Ping() error {
 	// models routinely exceed the old hard-coded 10s even for one token.）
 	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout())
 	defer cancel()
+	// 探测请求体：单条中文消息 + max_tokens=1 非流式——成本最小化，且顺带验证中文编解码。
 	payload := chatCompletionRequest{
 		ChatRequest: ChatRequest{
 			Model: c.model,

@@ -481,9 +481,18 @@ func (s *Server) handleAdminGetLLMConfig(w http.ResponseWriter, r *http.Request)
 }
 
 // handleAdminSetLLMConfig 处理 POST /api/admin/users/{id}/config/llm：
-// 保存指定账号的 LLM 配置（仅落盘，不触发全局 llmRecreate，避免干扰其它账号）。
-// English: handles POST /api/admin/users/{id}/config/llm — saves the account's LLM config (disk only; it
-// does not trigger a global llmRecreate so other accounts are not disturbed).
+// 管理员保存指定账号的 LLM 配置。
+//
+// §P0 2026-09-18 收口：本端点此前是**独立实现**（只落盘、不热生效，且不做脱敏哨兵解析、
+// 不保留空值原义）——与设置页那条路径口径分叉，于是它同时继承了那两个老缺陷：
+// 把回显的掩码当成真钥落库、把只改 Key 的提交里的空 api_url/model 写成空串。
+// 现在统一走 applyLLM 这一份实现（探测 → 热切换 → 落库），口径与设置页完全一致。
+//
+// 是否热生效仍按归属判定：LLM 配置归属运营账号（ownerOf），因此**只有当被改账号的配置
+// 归属到运营账号时**才动全局运行时客户端——这正是"改的到底是不是那一份全局配置"的判据。
+// 多租户下改的是别家运营者的配置时，只落库、不动本进程的全局客户端（避免互相扰动）。
+// English: unified with the settings-page path. It hot-applies only when the edited account's
+// config resolves to this process's operator account (i.e. it IS the global runtime config).
 func (s *Server) handleAdminSetLLMConfig(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// §MT 租户作用域护栏：租户 admin 仅可操作本租户成员，平台运营者不限。
@@ -500,22 +509,18 @@ func (s *Server) handleAdminSetLLMConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.cfg.SetLLMConfigFor(id, &config.LLMConfig{
-		APIURL:           req.APIURL,
-		Model:            req.Model,
-		TimeoutSec:       req.TimeoutSec,
-		Stream:           req.Stream,
-		BatchConcurrency: req.BatchConcurrency,
-		ClassifierModel:  req.ClassifierModel,
-	})
-	if req.APIKey != "" {
-		s.auth.SetConfig(id, "llm_api_key", req.APIKey)
+	// 归属判定：改为运营账号的配置 = 改全局运行时配置 → 与设置页同走「探测 → 切换 → 落库」。
+	owner := s.cfg.ConfigOwnerID(id)
+	hot := owner != "" && owner == s.operatorID() && s.llmRecreate != nil
+	res, status, msg := s.runLLMApplyFor(id, req, hot)
+	if msg != "" {
+		writeError(w, status, msg)
+		return
 	}
-	if len(req.APIKeys) > 0 {
-		s.auth.SetConfig(id, "llm_api_keys", strings.Join(req.APIKeys, ","))
+	if !hot {
+		log.Printf("[admin] 用户 %s 的 LLM 配置已保存（归属 %s，非本机运营账号 → 仅落库不热切换）", id, owner)
 	}
-	log.Printf("[admin] 用户 %s LLM 配置已保存", id)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	writeLLMApplyResult(w, status, res, res.Reason)
 }
 
 // handleAdminGetQMTConfig 处理 GET /api/admin/users/{id}/config/qmt（§2026-09-07 多账号实盘）：

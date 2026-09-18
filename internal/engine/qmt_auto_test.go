@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
@@ -34,6 +35,8 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 	}
 	t.Cleanup(func() { db.Close() })
 
+	// 假网关：记录收到的委托体（orders + mu 供用例断言用了几笔额度），/health 保活。
+	// mu 必不可少：auto 下单走异步 buyCh，回调与用例断言分属不同 goroutine。
 	var mu sync.Mutex
 	orders := []map[string]interface{}{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +60,7 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 	}))
 	t.Cleanup(srv.Close)
 
+	// 基线配置：auto 模式 + 指向假网关，默认两把风控闸（笔数/预算）由 mutate 覆盖。
 	cfg := config.DefaultQMTConfig()
 	cfg.Enabled = true
 	cfg.Mode = "auto"
@@ -284,15 +288,34 @@ func TestAutoPlaceSkipsST(t *testing.T) {
 	}
 }
 
-// TestAutoPlaceDailyCap §GAP1.4 回归：单日买入笔数达上限后 auto 不再下单。
+// TestAutoPlaceDailyCap §GAP1.4 回归：单日买入笔数按**已成交**计（2026-09-18 口径修正）——
+// 报单不占额度（被券商废掉、或挂在委托簿上没成交的报单不再锁死买入权），只有真实成交才占。
+//
+// English: the daily buy-count cap counts *filled* buys, not submitted orders — a rejected or
+// still-working order no longer consumes the day's quota.
 func TestAutoPlaceDailyCap(t *testing.T) {
-	e, _, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.DailyMaxBuys = 2 })
+	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.DailyMaxBuys = 2 })
+	// 3 个信号全部下单（今日 0 成交）——旧口径只会下 2 单。
 	for i, id := range []string{"C1", "C2", "C3"} {
 		sig := combat_agent.Signal{ID: id, Code: "60000" + string(rune('0'+i)), Name: "股" + id, Strategy: "龙头", Direction: "做多", Price: 10}
 		e.autoPlace(sig, map[string]*data.StockInfo{sig.Code: {Code: sig.Code, Price: 10}})
 	}
-	if len(*orders) != 2 {
-		t.Fatalf("daily_max_buys=2 应只下 2 单, got %d", len(*orders))
+	if len(*orders) != 3 {
+		t.Fatalf("未成交时报单不受笔数上限限制，应下 3 单, got %d", len(*orders))
+	}
+	// 落 2 笔真实成交 → 当日额度用尽，第 4 个信号不再下单。
+	for i, code := range []string{"600010", "600011"} {
+		if err := db.ApplyRealFill(store.RealFill{
+			OrderID: "GW-" + code, Code: code + ".SH", Side: "买入", Price: 10, Qty: 100, Amount: 1000,
+			UserID: "u_1", TradedAt: cntime.Now().Format("2006-01-02 15:04:05"),
+		}); err != nil {
+			t.Fatalf("落成交 #%d: %v", i+1, err)
+		}
+	}
+	sig := combat_agent.Signal{ID: "C4", Code: "600012", Name: "股C4", Strategy: "龙头", Direction: "做多", Price: 10}
+	e.autoPlace(sig, map[string]*data.StockInfo{"600012": {Code: "600012", Price: 10}})
+	if len(*orders) != 3 {
+		t.Fatalf("已成交 2 笔应拦住第 4 个信号, got %d orders", len(*orders))
 	}
 }
 

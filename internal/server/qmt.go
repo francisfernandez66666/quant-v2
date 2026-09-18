@@ -782,7 +782,7 @@ type setQMTConfigReq struct {
 	InitialCapital    *float64            `json:"initial_capital"`     // 初始资金
 	Strategies        *[]string           `json:"strategies"`          // 启用战法列表
 	StrategyAmounts   *map[string]float64 `json:"strategy_amounts"`    // 各战法分配资金
-	DailyMaxBuys      *int                `json:"daily_max_buys"`      // 每日最大买入笔数
+	DailyMaxBuys      *int                `json:"daily_max_buys"`      // 每日最大买入笔数（按当日已成交计，2026-09-18 口径修正）
 	DailyBudgetAmount *float64            `json:"daily_budget_amount"` // 每日买入预算
 	AutoSell          *bool               `json:"auto_sell"`           // 是否自动卖出
 	MissHeartbeatSec  *int                `json:"miss_heartbeat_sec"`  // 心跳超时秒数

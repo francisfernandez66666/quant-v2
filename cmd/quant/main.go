@@ -424,8 +424,14 @@ func main() {
 		if eff == "" {
 			eff = llm.DefaultModel
 		}
-		log.Printf("[LLM] 热重建生效: %s @ %s (keys=%d)", eff, apiURL, len(apiKeys))
+		log.Printf("[LLM] 热重建生效: %s @ %s (keys=%d, timeout=%ds, stream=%v)",
+			eff, apiURL, len(apiKeys), timeoutSec, streaming)
 	})
+	// 把进程**实际加载**的这份配置注入为初始快照，作为"上一个可用配置"的回滚起点。
+	// 不注入的话，进程刚起来时回滚点为空——而"刚重启、启动预检失败、想退回上一次能用的那份"
+	// 恰恰是最需要回滚的时刻。注意它是"当前加载的"，不等于"已验证可用"（verified=false）。
+	srv.SeedLLMSnapshot(llmCfg.APIKeys, llmCfg.APIURL, effModel,
+		int(llmCfg.Timeout/time.Second), llmCfg.Streaming, llmCfg.BatchConcurrency, llmCfg.ClassifierModel)
 
 	// 实时触发引擎（daban式放量急拉检测，SSE 推送）
 	trigCtx, trigCancel := context.WithCancel(context.Background())

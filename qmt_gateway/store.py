@@ -244,6 +244,8 @@ class Store:
                    VALUES(?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(signal_id) DO NOTHING""",
                 (
+                    # 占位行约定：order_id 前缀 "pending:" 标记未报单状态，
+                    # 券商回执落地时由 upsert 覆盖为真实委托号。
                     "pending:" + sid,
                     sid,
                     draft.get("code", ""),
@@ -541,6 +543,8 @@ class Store:
         English: §P0-1a — lists the day's fills for the settlement reconciliation endpoint,
         exposing trade_id as the broker serial and the best-effort fee/stamp_tax columns.
         """
+        # 锁内一次性查当日全量：对账端点调用频度低（盘后），一致性优先于并发吞吐。
+        # COALESCE 兜底旧格式回报落库时 fee/stamp_tax 为 NULL 的行。
         with self._lock:
             cur = self._conn.execute(
                 "SELECT order_id, code, side, price, qty, amount, traded_at, signal_id, trade_id, "
@@ -700,6 +704,26 @@ class Store:
             cur = self._conn.execute(
                 "SELECT * FROM dispatch WHERE order_id = ? ORDER BY id DESC LIMIT 1",
                 (str(exchange_order_id),))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def dispatch_by_signal_id(self, signal_id):
+        """按 signal_id 反查派发项（§P0 2026-09-18 方向权威化用）。
+
+        为什么需要它：成交回报里 order_id 未必是交易所委托号——文件桥/xt 路径在 remark
+        （即 signal_id）非空时会把 order_id 直接填成 remark，此时按委托号反查必然落空；
+        signal_id 是本端下单时自己写入派发项的键，命中即说明「这笔成交是本端派的单」，
+        其方向以派发项为准（零推断）。取最新一条（同 signal_id 因重试轮换占位单号可能多行）。
+        English: §P0 — lookup by signal_id, needed because the fill's order_id field may carry
+        the remark (signal_id) rather than the exchange order id, which makes the by-order-id
+        lookup miss and silently voids the authoritative-side override.
+        """
+        if not signal_id:
+            return None
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM dispatch WHERE signal_id = ? ORDER BY id DESC LIMIT 1",
+                (str(signal_id),))
             row = cur.fetchone()
             return dict(row) if row else None
 
