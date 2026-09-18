@@ -146,12 +146,47 @@ jobs:
           print("seeded reports:", db.execute("SELECT COUNT(*) FROM paper_research_reports").fetchone()[0])
           PY
 
+      # §FIX-8(20260919) 模拟盘持仓 seed：nightly 此前从不建仓 → uat_full 的手动卖出分支永远 skip，
+      # P0 手/股错位正是在这条"永远绿"的缝里隐形的。开总开关 + 两笔手动买入（qty=股数契约，§FIX-1），
+      # 当日 filled_at 的 T+1 问题由下一步"隔日改写"解决。runner 一次性，跑完无需 reset。
+      - name: Seed paper positions
+        run: |
+          curl -fsS -X POST "$BACKEND/api/paper/config" -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -H 'Content-Type: application/json' -d '{"enabled": true, "auto_sell": false}'
+          for p in '600000.SH|浦发银行|10|500' '000001.SZ|平安银行|12|200'; do
+            IFS='|' read -r code name price qty <<< "$p"
+            curl -fsS -X POST "$BACKEND/api/paper/buy" -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "{\"code\":\"$code\",\"name\":\"$name\",\"strategy\":\"手动\",\"price\":$price,\"qty\":$qty}"
+          done
+          curl -fsS "$BACKEND/api/paper/positions" -H "Authorization: Bearer $ADMIN_TOKEN" \
+            | jq -e 'length == 2'
+
       - name: Restart engine（QMT 配置装配生效）
         # kill 旧进程后带新数据目录重启：休市时段写入的 QMT 配置/lower 配额随重启装配；
         # 用带 admin token 的 /api/health 探活，比首启的 /setup 更严格。
+        # §FIX-8：停机窗口内把 paper.json 持仓 filled_at 隔日改写（北京时区 -2 天），
+        # 引擎重启 load() 后即"昨日建仓"——卖出分支不再被 T+1 拦截（只动 CI 临时账本）。
         run: |
           kill "$(cat engine.pid)" 2>/dev/null || true
           sleep 2
+          python - <<'PY'
+          import glob, json, os
+          from datetime import datetime, timedelta, timezone
+          # 账本按账号落盘（$QUANT_DATA_DIR/accounts/<uid>/paper.json），逐文件改写持仓 filled_at
+          files = glob.glob(os.path.join(os.environ["QUANT_DATA_DIR"], "accounts", "*", "paper.json"))
+          old = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=2)).isoformat()
+          n = 0
+          for path in files:
+              st = json.load(open(path))
+              positions = st.get("positions") or {}
+              for p in positions.values():
+                  p["filled_at"] = old
+                  n += 1
+              if positions:
+                  json.dump(st, open(path, "w"))
+          print("backdated positions:", n, "files:", len(files))
+          PY
           QUANT_ADDR=:18080 "$RUNNER_TEMP/bin/quant" > engine2.log 2>&1 &
           echo $! > engine.pid
           for i in $(seq 1 60); do
@@ -179,9 +214,18 @@ jobs:
           done
 
       # 全量跑 web/e2e Playwright spec（配置内自带 retries/trace，失败可上传回放）
+      # §FIX-8：skip 视为黄牌——本 job 已有 paper 持仓 seed，卖出分支再 skip 即 seed 覆盖退化信号，
+      # 在 CI 界面显式告警而不是无声放过（历史教训：手/股 P0 就藏在"永远 skip"的分支里）。
       - name: Playwright 全量 e2e
         working-directory: web
-        run: npx playwright test
+        run: |
+          set +e
+          npx playwright test 2>&1 | tee pw.log
+          status=${PIPESTATUS[0]}
+          if grep -qE '[0-9]+ skipped' pw.log; then
+            echo "::warning title=FIX-8-skip-yellow-card::存在 skipped 用例——seed 覆盖可能退化，请核对（历史假绿源：卖出分支常年 skip）"
+          fi
+          exit $status
 
       # 仅失败时上传：Playwright 报告/trace + 三件套全量日志，供夜间失败次日取证回放
       - name: Upload report artifacts（失败时取证）

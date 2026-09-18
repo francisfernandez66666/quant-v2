@@ -358,7 +358,8 @@ export default function Paper() {
   function openTrade(p, dir) {
     setTradeTarget(p); setTradeDir(dir)
     setTradeFormPrice(p.mark || 0)
-    setTradeFormQty(dir === 'close' ? p.qty : 1)
+    // close 时持仓 qty 为股数，表单口径是手——回填换算成整手展示（不足一手按 1 手）
+    setTradeFormQty(dir === 'close' ? Math.max(1, Math.round((p.qty || 0) / 100)) : 1)
     setTradeModal(true)
   }
 
@@ -369,18 +370,21 @@ export default function Paper() {
    * @returns {Promise<void>}
    */
   // 提交模拟盘加仓/减仓/清仓委托
+  // §FIX-1(20260919) 手/股单位收敛：弹窗输入与后端契约解耦——表单是手数（1手=100股），
+  // API qty 一律为股数（引擎按股记账，见 internal/paper/paper_test.go 口径注释），提交前在此唯一换算点 ×100。
   async function confirmTrade() {
     const p = tradeTarget
     if (!p) return
     const price = parseFloat(tradeFormPrice)
     const qty = parseInt(tradeFormQty, 10)
     if (tradeDir !== 'close' && (isNaN(qty) || qty <= 0)) { showToast('请输入有效的数量','warning'); return }
+    const shares = qty * 100 // 手→股；close 不走此值（传 0=全平）
     try {
       if (tradeDir === 'add') {
-        await api.buyPaperPosition(p.code, p.name || '', p.strategy || '', 0, price > 0 ? price : 0, qty)
+        await api.buyPaperPosition(p.code, p.name || '', p.strategy || '', 0, price > 0 ? price : 0, shares)
         showToast(`已加仓 ${p.code} ${qty} 手`,'success')
       } else {
-        await api.sellPaperPosition(p.code, price > 0 ? price : 0, tradeDir === 'close' ? 0 : qty)
+        await api.sellPaperPosition(p.code, price > 0 ? price : 0, tradeDir === 'close' ? 0 : shares)
         showToast(`已${tradeDir === 'close' ? '清仓' : '减仓'} ${p.code}`,'success')
       }
       setTradeModal(false)

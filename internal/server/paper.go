@@ -182,16 +182,19 @@ func (s *Server) handlePaperSelfCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePaperBuy 手动买入一只股票（前端信号页/持仓页"模拟买入/加仓"）。请求体：
-// {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8,"price":9.5,"qty":10}。
-//   - qty > 0：按用户输入的买入手数（10=10 手=1000 股）撮合，price > 0 时按用户输入价成交（静态记账），
-//     price = 0 时回退实时价——普通用户"搬运持仓"记账场景。
+// {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8,"price":9.5,"qty":1000}。
+// §FIX-1(20260919) 单位收敛：qty 对外唯一口径=股数（引擎按股记账，见 paper_test.go:682 契约注释），
+// 手数→股数的换算只发生在前端提交前（Paper.jsx/Signals.jsx 各一处 ×100）。
+//   - qty > 0：按用户输入的买入股数撮合（须为 100 股整数倍，对齐实盘整手纪律），price > 0 时按用户
+//     输入价成交（静态记账），price = 0 时回退实时价——普通用户"搬运持仓"记账场景。
 //   - qty <= 0：回退固定金额（FixedAmount）整手买入（旧行为，实时价成交）。
 //
 // English: manually buys one stock (frontend/APK signal page or positions page "paper buy/add").
-// Body: {"code":"600000.SH","name":"浦发银行","strategy":"N形","signal_price":9.8,"price":9.5,"qty":10}.
-//   - qty > 0: fills the typed lot count (10 = 10 lots = 1000 shares); price > 0 fills at the typed
-//     price (static bookkeeping), price = 0 falls back to the live quote — the "copy real positions"
-//     scenario for normal users.
+// Body: {"code":"600000.SH",...,"price":9.5,"qty":1000}. §FIX-1: qty is in SHARES (the engine books
+// shares; lots→shares conversion happens once in the frontend before submit).
+//   - qty > 0: fills the typed share count (must be a whole multiple of 100); price > 0 fills at the
+//     typed price (static bookkeeping), price = 0 falls back to the live quote — the "copy real
+//     positions" scenario for normal users.
 //   - qty <= 0: legacy fixed-amount whole-lot buy at the live price.
 func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 	pe := s.paperEngineFor(requestUserID(r))
@@ -205,7 +208,7 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 		Strategy    string  `json:"strategy"`
 		SignalPrice float64 `json:"signal_price"` // 原信号触发价（供信号质量/滑点统计）
 		Price       float64 `json:"price"`        // 用户输入的买入价（>0 生效）
-		Qty         int     `json:"qty"`          // 用户输入的买入手数（>0 生效；<=0 回退固定金额）
+		Qty         int     `json:"qty"`          // 用户输入的买入股数（>0 生效且须 100 整数倍；<=0 回退固定金额）
 		// §C 归属字段：信号页模拟买入携带原信号的战法池/库规则 ID，
 		// 买入归入对应资金池（非空且池存在时）；纯手动不传 → 其他池（旧行为）。
 		StrategyType string `json:"strategy_type,omitempty"`
@@ -213,6 +216,13 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, 400, "缺少股票代码")
+		return
+	}
+	// §FIX-1(20260919) 整手纪律闸：显式股数必须是 100 的整数倍，防止把"手数"当"股数"提交后
+	// 以 1/100 规模建仓（历史 P0：UI 传手数、引擎按股记账导致账本 100 倍错位）。
+	// English: explicit share counts must be whole lots; this blocks the historic lots-vs-shares P0.
+	if req.Qty > 0 && req.Qty%100 != 0 {
+		writeError(w, 400, "买入数量需为 100 股整数倍（1 手 = 100 股）")
 		return
 	}
 	// 归属解析：规则 ID（fac_/pat_ 前缀）优先即池 key；否则用类型字段；
@@ -224,9 +234,9 @@ func (s *Server) handlePaperBuy(w http.ResponseWriter, r *http.Request) {
 	}
 	quotes := s.liveQuotes(req.Code) // 行情快照（撮合价基准），一次构造供买入使用
 	if req.Qty > 0 {
-		// 输入价格+手数：按用户指定记账（price=0 时用实时价，仍按指定手数）
-		// English: typed price + lots: fills as specified (price=0 falls back to the live quote but
-		// still respects the typed lot count).
+		// 输入价格+股数：按用户指定记账（price=0 时用实时价，仍按指定股数）
+		// English: typed price + share count: fills as specified (price=0 falls back to the live quote
+		// but still respects the typed share count).
 		if err := pe.BuyExInPool(req.Code, req.Name, req.Strategy, poolKey, req.SignalPrice, req.Price, req.Qty, quotes); err != nil {
 			writeError(w, 400, err.Error())
 			return
@@ -316,13 +326,16 @@ func (s *Server) liveQuotes(code string) map[string]*data.StockInfo {
 	return quotes
 }
 
-// handlePaperSell 手动卖出指定模拟持仓。请求体 {"code":"600000.SH","price":9.5,"qty":5}：
-//   - qty > 0：按用户输入数量减仓（price > 0 用输入价，price = 0 回退实时价）；数量 >= 持仓=清仓。
+// handlePaperSell 手动卖出指定模拟持仓。请求体 {"code":"600000.SH","price":9.5,"qty":500}：
+// §FIX-1(20260919) 单位收敛：qty 对外唯一口径=股数（同 handlePaperBuy）。
+//   - qty > 0：按用户输入股数减仓（price > 0 用输入价，price = 0 回退实时价）；数量 >= 持仓=清仓。
+//     部分减仓（qty < 持仓）须为 100 股整数倍，否则拒绝（不留零股）；清仓允许零股（尾仓随仓平掉）。
 //   - qty <= 0：清仓（实时价，旧行为）。
 //
-// English: manually sells a paper position. Body {"code":"600000.SH","price":9.5,"qty":5}:
-//   - qty > 0: trims the typed lot count (price > 0 uses the typed price, price = 0 falls back to the
-//     live quote); qty >= the position closes it.
+// English: manually sells a paper position. Body {"code":"600000.SH","price":9.5,"qty":500}:
+//   - qty > 0: trims the typed share count (price > 0 uses the typed price, price = 0 falls back to
+//     the live quote); qty >= the position closes it. A partial trim must be whole lots; zero-lot
+//     remainders are only allowed on a full close.
 //   - qty <= 0: closes the position at the live price (legacy behavior).
 func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 	pe := s.paperEngineFor(requestUserID(r))
@@ -333,13 +346,23 @@ func (s *Server) handlePaperSell(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code  string  `json:"code"`
 		Price float64 `json:"price"` // 用户输入的卖出价（>0 生效）
-		Qty   int     `json:"qty"`   // 用户输入的减仓手数（>0 生效；<=0 清仓）
+		Qty   int     `json:"qty"`   // 用户输入的减仓股数（>0 生效；<=0 清仓）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
 		writeError(w, 400, "缺少股票代码")
 		return
 	}
-	// qty>0 按手数减仓，否则整仓卖出（价格按用户输入，缺省走实时价）。
+	// §FIX-1(20260919) 零股守卫：部分减仓留下非整手尾仓会污染后续清仓口径，与实盘零股纪律
+	// （handlers_fix.go/qmt.go 卖出守卫）对齐；qty>=持仓=清仓不拦（尾仓零股须能平掉）。
+	if req.Qty > 0 && req.Qty%100 != 0 {
+		for _, p := range pe.Positions() {
+			if p.Code == req.Code && req.Qty < p.Qty {
+				writeError(w, 400, "减仓数量需为 100 股整数倍（1 手 = 100 股），零股请清仓卖出")
+				return
+			}
+		}
+	}
+	// qty>0 按股数减仓，否则整仓卖出（价格按用户输入，缺省走实时价）。
 	if req.Qty > 0 {
 		if err := pe.SellEx(req.Code, req.Price, req.Qty, s.liveQuotes(req.Code)); err != nil {
 			writeError(w, 400, err.Error())

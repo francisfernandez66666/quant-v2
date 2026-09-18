@@ -215,8 +215,10 @@ export default function Signals() {
     }
 
     // 调用后端模拟买入接口：code/name/strategy/price/qty/type/id
+    // §FIX-1(20260919) 手/股单位收敛：prompt 输入的是手数，API qty 契约为股数（引擎按股记账），
+    // 提交前在此唯一换算点 ×100。
     try {
-      await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty, s.strategy_type || '', s.strategy_id || '')
+      await api.buyPaperPosition(s.code, s.name || '', s.strategy || '', s.price || 0, isNaN(price) || price <= 0 ? 0 : price, qty * 100, s.strategy_type || '', s.strategy_id || '')
       window.alert(`已模拟买入 ${s.code} ${qty} 手`)
     } catch (e) {
       window.alert(e.message || '模拟买入失败')

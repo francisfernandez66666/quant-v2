@@ -1363,13 +1363,15 @@ func (e *Engine) BuyInPool(code, name, strategy, poolKey string, signalPrice flo
 	return nil
 }
 
-// BuyEx 手动按指定价格与手数买入一只股票（普通用户模拟盘：输入买入价+买入手数，静态记账）。
+// BuyEx 手动按指定价格与数量买入一只股票（普通用户模拟盘：输入买入价+买入数量，静态记账）。
 // price > 0 时按用户输入价成交（不依赖行情）；price = 0 时回退实时价。
-// qty 为手数（A 股一手 100 股，调用方已换算；<=0 拒绝）。手动买入归"其他池"，不挤占战法池。
+// qty 单位=股数（§FIX-1(20260919) 口径收敛：A 股 1 手=100 股，手数→股数换算在调用方/HTTP 前端完成，
+// 引擎一律按股记账；<=0 拒绝）。手动买入归"其他池"，不挤占战法池。
 // 已持仓时自动合并为加仓（加权平均成本，追加买入记录）。
-// English: manually buys a stock at an explicit price and lot count (normal users' paper book: the buyer
-// types the price and lots; static bookkeeping). A price > 0 fills at the typed price (no quote needed);
-// price = 0 falls back to the live quote. qty is in board lots (1 lot = 100 shares; <=0 rejected).
+// English: manually buys a stock at an explicit price and share count (normal users' paper book: the
+// buyer types the price and quantity; static bookkeeping). A price > 0 fills at the typed price (no
+// quote needed); price = 0 falls back to the live quote. qty is in SHARES (1 lot = 100 shares; the
+// lots→shares conversion is the caller's job, §FIX-1 20260919; <=0 rejected).
 // Manual buys debit the "other" pool and never crowd a strategy pool. An already-held code merges as an
 // add-on (quantity added, cost averaged, extra fill appended).
 func (e *Engine) BuyEx(code, name, strategy string, signalPrice, price float64, qty int, quotes map[string]*data.StockInfo) error {
@@ -1595,11 +1597,15 @@ func (e *Engine) Sell(code string, quotes map[string]*data.StockInfo) error {
 	return err
 }
 
-// SellEx 手动按指定价格与数量减仓（部分卖出）。qty 手数；price > 0 用输入价，price = 0 回退实时价。
-// 数量 >= 当前持仓时退化为清仓（复用 sellAllLocked）。
-// English: manually trims a position at an explicit price and count. qty is in board lots; price > 0 uses
-// the typed price, price = 0 falls back to the live quote. A qty >= the position degrades to a full close
-// (reuses sellAllLocked).
+// SellEx 手动按指定价格与数量减仓（部分卖出）。qty 单位=股数（§FIX-1(20260919) 口径收敛：手数→股数
+// 换算在调用方完成，引擎一律按股记账，同 BuyExInPool/paper_test.go:682）；price > 0 用输入价，
+// price = 0 回退实时价。数量 >= 当前持仓时退化为清仓（复用 sellAllLocked）。
+// 整手/零股纪律由 HTTP 入口守卫（internal/server/paper.go handlePaperBuy/Sell）负责，引擎不重复校验
+// ——引擎测试与自动路径允许任意股数（如减仓 50 股的成本摊销用例）。
+// English: manually trims a position at an explicit price and share count (qty is in SHARES — the
+// lots→shares conversion is the caller's job, §FIX-1 20260919); price > 0 uses the typed price,
+// price = 0 falls back to the live quote. A qty >= the position degrades to a full close (reuses
+// sellAllLocked). Lot discipline is enforced at the HTTP entry, not here.
 func (e *Engine) SellEx(code string, price float64, qty int, quotes map[string]*data.StockInfo) error {
 	if !e.cfg.Enabled {
 		return errDisabled

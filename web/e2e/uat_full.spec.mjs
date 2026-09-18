@@ -241,17 +241,42 @@ test.describe('交易相关分支', () => {
     expect(body).toMatch(/模拟盘|账户|资金|持仓/)
   })
 
-  // 纸面持仓手动卖出分支：打开减仓弹窗→提交→toast 回执（无持仓则跳过）
-  test('Paper：手动卖出持仓（减仓弹窗→提交→toast）', async ({ page }) => {
+  // 纸面持仓手动卖出分支（§FIX-8(20260919) 假绿修复）：
+  // 旧断言只看 .t-message 出现——后端 T+1/参数错误的红 toast 同样让它通过，且 nightly 从不 seed
+  // 持仓使本分支永远 skip，错位长期隐形。新契约：服务端回读持仓 → UI 减仓 1 手 → 断言 success
+  // 色 toast → 再回读服务端，该票股数恰 -100（端到端钉死 FIX-1"表单手数→契约股数 ×100"换算）。
+  test('Paper：手动卖出（减仓 1 手→服务端回读 -100 股）（§FIX-8）', async ({ page }) => {
     await page.goto('/#/paper')
     await page.waitForTimeout(2000)
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const posOf = async (code) => {
+      const list = await (await page.request.get('/api/paper/positions', { headers: hdr })).json()
+      return (Array.isArray(list) ? list : []).find((p) => p.code === code)
+    }
+    const before = await (await page.request.get('/api/paper/positions', { headers: hdr })).json()
+    const target = (Array.isArray(before) ? before : []).find((p) => p.qty > 100)
+    if (!target) { test.skip(true, '纸面无 >100 股的持仓，跳过卖出分支'); return }
     const rows = page.locator('.t-table__body tr')
-    if ((await rows.count()) === 0) { test.skip(true, '纸面无持仓，跳过卖出分支'); return }
-    await page.getByRole('button', { name: /减仓/ }).first().click()
-    await expect(page.locator('.t-dialog')).toBeVisible()
+    expect((await rows.count()) > 0, '有持仓时表格不得为空（skip 兜底仅对真空仓）').toBe(true)
+    // 精确定位目标持仓行（Positions() 来自 map 遍历，行序不保证，不能拿首行赌同一只）
+    const row = rows.filter({ hasText: target.code }).first()
+    await expect(row, '目标持仓行渲染').toBeVisible()
+    await row.getByRole('button', { name: /减仓/ }).click()
+    const dlg = page.locator('.t-dialog')
+    await expect(dlg).toBeVisible()
+    await dlg.getByPlaceholder('成交价格（留空用实时价）').fill(String(target.mark || 10))
+    await dlg.getByPlaceholder('手数（1手=100股）').fill('1')
     await page.screenshot({ path: `${SHOT}/branch-paper-sell-dialog.png` })
-    await page.locator('.t-dialog').getByRole('button', { name: /确认|确定/ }).click()
-    await expect(page.locator('.t-message').first()).toBeVisible({ timeout: 8000 })
+    await dlg.getByRole('button', { name: /确认|确定/ }).click()
+    // success 主题 toast（tdesign MessagePlugin 主题类为 t-is-success；错误 toast 不算通过）
+    await expect(page.locator('.t-message.t-is-success').first()).toBeVisible({ timeout: 8000 })
+    // 服务端效果回读：qty 必须真实减少 100 股（不是"接口 200 但账本没动"）
+    const code = target.code
+    await expect(async () => {
+      const now = await posOf(code)
+      expect(now, '卖出后持仓应仍存在（部分减仓）').toBeTruthy()
+      expect(now.qty, `减仓 1 手应 -100 股（was ${target.qty}）`).toBe(target.qty - 100)
+    }).toPass({ timeout: 10000 })
   })
 
   // 消息中心筛选覆盖：交易信号/止盈止损/盘后复盘/全部四个 tab + 删除弹窗取消分支

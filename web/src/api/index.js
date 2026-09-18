@@ -914,10 +914,12 @@ export async function rollbackStrategyParams(snapshotTs) {
   return request('/api/research/strategies/rollback', { method: 'POST', data: { snapshot_ts: snapshotTs } })
 }
 
-/** 模拟盘：手动买入（信号页"模拟买入"按钮触发）。qty>0 时按用户输入价格/手数成交（静态记账），
- *  price=0 回退实时价；qty<=0 回退固定金额整手（旧行为）。 */
-/** Paper trading: manual buy (signal-page "paper buy" button). qty>0 fills the typed price/lots (static
- *  bookkeeping), price=0 falls back to the live quote; qty<=0 falls back to fixed-amount whole lots. */
+/** 模拟盘：手动买入（信号页"模拟买入"按钮触发）。qty>0 时按用户输入价格/数量成交（静态记账，
+ *  qty 单位为股数——调用方负责手数×100 换算，见 §FIX-1(20260919)），price=0 回退实时价；
+ *  qty<=0 回退固定金额整手（旧行为）。 */
+/** Paper trading: manual buy (signal-page "paper buy" button). qty>0 fills the typed price/count in
+ *  SHARES (callers convert lots ×100, see §FIX-1 20260919); price=0 falls back to the live quote;
+ *  qty<=0 falls back to fixed-amount whole lots. */
 // 对应 POST /api/paper/buy，data: { code, name, strategy, strategy_type, strategy_id, signal_price, price, qty }
 // §C 归属字段：信号页模拟买入传原信号的 strategy_type/strategy_id，买入归入对应战法资金池；
 // 纯手动（持仓页）不传 → 其他池（旧行为）。
@@ -932,10 +934,11 @@ export async function buyPaperPosition(code, name, strategy, signalPrice, price,
   })
 }
 
-/** 模拟盘：手动卖出。qty>0 时按指定数量减仓（price>0 用输入价，price=0 回退实时价；qty>=持仓=清仓），
- *  qty<=0 时按实时价清仓（旧行为）。 */
-/** Paper trading: manual sell. qty>0 trims the typed lot count (price>0 uses the typed price, price=0
- *  falls back to the live quote; qty>=position closes it), qty<=0 closes at the live price (legacy). */
+/** 模拟盘：手动卖出。qty>0 时按指定数量减仓（股数，调用方手数×100 换算；price>0 用输入价，
+ *  price=0 回退实时价；qty>=持仓=清仓），qty<=0 时按实时价清仓（旧行为）。 */
+/** Paper trading: manual sell. qty>0 trims the typed count in SHARES (callers convert lots ×100;
+ *  price>0 uses the typed price, price=0 falls back to the live quote; qty>=position closes it),
+ *  qty<=0 closes at the live price (legacy). */
 // 对应 POST /api/paper/sell，data: { code, price, qty }
 export async function sellPaperPosition(code, price, qty) {
   return request('/api/paper/sell', { method: 'POST', data: { code, price: price || 0, qty: qty || 0 } })
