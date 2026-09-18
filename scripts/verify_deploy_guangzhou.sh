@@ -36,7 +36,9 @@ SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ${GZ_USER}@${G
 SCP="scp -o StrictHostKeyChecking=accept-new"
 
 # ── 生成探针脚本（quoted heredoc：PS 的 $ 原样落盘，不经 bash 展开）──
-PROBES=$(mktemp /tmp/vd_probes_XXXX.ps1)
+# BSD mktemp（macOS）只认 X 在结尾的模板（2026-09-18 实录：`vd_probes_XXXX.ps1`
+# 报 "File exists" 后靠 shell 容错侥幸跑通）——X 移尾、.ps1 前缀名自拼。
+PROBES="$(mktemp /tmp/vd_probes_XXXXXX).ps1" || { echo "mktemp 失败"; exit 1; }
 cat > "$PROBES" <<'PSEOF'
 # verify_probes.ps1 — 部署后探针（由 verify_deploy_guangzhou.sh 现场生成上传执行）。
 # 输出协议：每行 "PASS|探针名" 或 "FAIL|探针名|附加信息"；bash 层汇总计数定退出码。

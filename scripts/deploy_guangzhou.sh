@@ -88,6 +88,10 @@ echo "      产物: $(ls -lh /tmp/*.exe | awk '{print $5, $9}') (quant buildComm
 
 # ── 2. 上传二进制 + 部署脚本 + qmtctl ──
 echo "[2/5] 上传二进制/脚本到 $DEPLOY_DIR ..."
+# 2026-09-18 部署实录：NSSM 运行中的 quant/quant-research 锁死旧 exe，scp 直接
+# "dest open Failure"（register 脚本是 stop→install→start，救不了上传阶段的锁）。
+# 先显式停服释放文件锁——服务重启本就属于本次部署语义（步 [4/5] 注册即拉起）。
+$SSH "powershell -NoProfile -Command \"net stop quant; net stop quant-research; exit 0\"" >/dev/null 2>&1 || true
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata | Out-Null\""
 $SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/qmtctl.exe "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
 $SCP deploy/qmt-win/register_engine_services.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
