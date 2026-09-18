@@ -62,8 +62,14 @@ type Engine struct {
 	// consultBlockCache 咨询数据块按代码缓存（§生产 20260916）：数据上下文改为无条件注入后，
 	// 咨询可任意频次触发，单次单股 4 次外部行情调用必须收敛；60s 新鲜度对咨询足够。
 	// consultBlockMu 保护该 map（与 mu 分开，避免行情慢调用阻塞引擎主锁）。
+	// §FIX-6(20260919 批四)：consultFlight 为同代码 single-flight（并发首查只穿透一路行情），
+	// consultBlockCache 加条数上限（超限淘汰最旧，防无界增长）。
 	consultBlockMu    sync.Mutex
 	consultBlockCache map[string]consultBlockEntry
+	consultFlight     map[string]*consultBlockFlight
+	// consultBlockLoad §FIX-6 测试缝：非 nil 时替代 buildStockBlockUncached 作为穿透加载器
+	// （单测用它统计并发穿透次数；生产恒 nil 走行情源直调）。
+	consultBlockLoad func(code, name string) string
 
 	// lastAlertEval §WS-L 阈值告警评估节流时间戳（scoreCycle 每 30s 跑一轮）。
 	lastAlertEval time.Time
@@ -2277,6 +2283,14 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 		return "", fmt.Errorf("未配置 LLM_API_KEY，请先在股票咨询页配置 API Key")
 	}
 
+	// §FIX-10(20260919 批四)：出呼前先确认账号隔离存储可用——不可用（nil）时整轮咨询
+	// 无法落盘，历史会静默丢失且跨账号有串号风险，直接拒绝（上层映射 503）。
+	// 放在数据块抓取与付费调用**之前**：拒绝即零外呼、零计费。
+	store := e.consultStoreFor(userID)
+	if store == nil {
+		return "", fmt.Errorf("咨询: %w", data.ErrStoreUnavailable)
+	}
+
 	// system 起始即角色提示词。§生产 20260916 翻转：带数据上下文改为**无条件注入**——
 	// 数据是咨询的默认构成（用户实录"AI 顾问空口谈逻辑"是缺陷），不再由开关决定有无；
 	// proMode 仅追加更定量化/结构化的深度分析风格要求。未识别到个股时给 noStock 提示词，
@@ -2296,10 +2310,9 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 		system += "\n\n（专业模式：请在回答中给出更定量化、结构化的深度分析，明确列出数据依据与风险点。）"
 	}
 
-	// 历史：仅取最近 consultHistoryLimit 条（正序）。
+	// 历史：仅取最近 consultHistoryLimit 条（正序）。store 可用性已在函数入口校验（§FIX-10）。
 	messages := make([]llm.Message, 0, consultHistoryLimit+2)
-	if store := e.consultStoreFor(userID); store != nil {
-		hist := store.List()
+	if hist := store.List(); len(hist) > 0 {
 		if len(hist) > consultHistoryLimit {
 			hist = hist[len(hist)-consultHistoryLimit:]
 		}
@@ -2331,11 +2344,10 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 	trusted.addDerivedPct(dataCtx)
 	reply = auditNumbers(reply, trusted)
 
-	// 对话历史落盘：用户提问 + 模型回复（§GAP2-W2 写入本人账号目录）
-	if store := e.consultStoreFor(userID); store != nil {
-		store.Append("user", userMsg)
-		store.Append("assistant", reply)
-	}
+	// 对话历史落盘：一轮"提问+回复"合并为一次落盘（§FIX-10：fsync 减半、无半轮窗口；
+	// §GAP2-W2 写入本人账号目录）。
+	store.AppendPair(data.ConsultMessage{Role: "user", Content: userMsg},
+		data.ConsultMessage{Role: "assistant", Content: reply})
 	return reply, nil
 }
 
@@ -2555,11 +2567,35 @@ const consultNoStockPrompt = `当前消息中未识别到明确的股票名称�
 3. 严禁编造任何个股或板块的具体数字（成交额、净流入、撤单、振幅、持仓、涨幅、收益率、期货合约价、板块内具体个股名等），数据里没有就如实说"没有数据，无法确认"。
 4. 措辞审慎，不承诺收益、不给绝对化的买卖指令。`
 
+// consultMaxStocks §FIX-6(20260919 批四)：单条咨询最多处理的股票数。
+// 每只股票至多 4 类行情外呼，且东财报价/资金流走**进程级全局 3/s 令牌桶**
+// （与实盘主行情循环共用）——不设上限时一条含数百代码的消息=阻塞行情配额数百秒
+// + 数百 KB 文本进付费 prompt。超出部分只处理前 5 只并在数据块尾部如实注明。
+const consultMaxStocks = 5
+
 // buildConsultContext 从用户消息解析提到的股票，拉取真实实时行情组装为上下文文本。
 // 返回空串表示未解析出任何股票（调用方应提示用户指明股票）。
 // 数据来源：东财 push2 实时价（含主力净流入 F162）+ 东财资金流明细 + 新浪日K/分钟K + 引擎战法信号。
 func (e *Engine) buildConsultContext(userMsg string) string {
-	codes := make(map[string]string) // code → name
+	// §FIX-6：按**出现顺序**收集代码并截断至前 consultMaxStocks 只（map 无序，旧实现
+	// 逐 code 全量外呼是行情配额与 prompt 体积的放大器）。
+	var order []string           // 出现顺序（截断后 ≤consultMaxStocks）
+	codes := map[string]string{} // code → name（仅用于去重与名称回查）
+	dropped := 0                 // 因超限被丢弃的代码数
+	addCode := func(code, name string) {
+		if code == "" {
+			return
+		}
+		if _, dup := codes[code]; dup {
+			return
+		}
+		if len(order) >= consultMaxStocks {
+			dropped++
+			return
+		}
+		codes[code] = name
+		order = append(order, code)
+	}
 
 	// 1. 名称 → 代码：解析文本中出现的股票名称，再清洗为代码
 	var names []string
@@ -2570,17 +2606,15 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 			if len(parts) != 2 || parts[0] == "" {
 				continue
 			}
-			codes[parts[1]] = parts[0]
+			addCode(parts[1], parts[0])
 		}
 	}
 	// 2. 文本中的纯 6 位代码
 	for _, m := range consultCodeRe.FindAllString(userMsg, -1) {
-		if _, ok := codes[m]; !ok {
-			codes[m] = ""
-		}
+		addCode(m, "")
 	}
 
-	if len(codes) == 0 {
+	if len(order) == 0 {
 		return ""
 	}
 
@@ -2592,8 +2626,13 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 	sb.WriteString("【要求】仅可引用下列提供的数据与对话历史；未提供的信息（如同板块个股、期指贴水、撤单、盘口等）如实说明" +
 		"无法获取，严禁编造净流入/成交量/涨跌/触发等任何具体数字；净流入口径=主力(超大单+大单)，东方财富。\n")
 
-	for code, name := range codes {
-		sb.WriteString(e.buildStockBlock(code, name))
+	for _, code := range order {
+		sb.WriteString(e.buildStockBlock(code, codes[code]))
+	}
+	// §FIX-6：截断必须对用户可见——否则模型以为全量、用户以为全答。
+	if dropped > 0 {
+		sb.WriteString(fmt.Sprintf("\n（注意：本条消息共提到 %d 只股票，本轮仅处理前 %d 只，其余 %d 只未取数据，请提示用户分次提问。）\n",
+			len(order)+dropped, consultMaxStocks, dropped))
 	}
 
 	// 大盘实测块（2026-09-16 补）：上证点位+全市场涨跌家数——用户口语里的"普涨/普跌"
@@ -2616,7 +2655,19 @@ type consultBlockEntry struct {
 	at   time.Time // 写入时间（距 now < consultBlockCacheTTL 时命中缓存）（write time for TTL check）
 }
 
-// buildStockBlock 组装单只股票的实时行情数据块（含 60s 缓存）。
+// consultBlockFlight §FIX-6(20260919 批四)：同代码 single-flight 通道——并发首查时
+// 只有第一个请求穿透行情源，其余等同一个结果（旧实现 10 路并发=10 组外呼，
+// 每组至多 4 次东财请求，全挤进程级 3/s 令牌桶，把实盘行情链路一起拖慢）。
+type consultBlockFlight struct {
+	done chan struct{} // 关闭=结果就绪
+	text string        // 就绪后的数据块文本（close(done) 前写入，读方经通道同步可见）
+}
+
+// consultBlockCacheMax §FIX-6：缓存条目上限。超限写入时先清过期项，仍超限则淘汰最旧一条
+// （自用场景 50 只覆盖日常轮询面，map 无界增长问题就此封死）。
+const consultBlockCacheMax = 50
+
+// buildStockBlock 组装单只股票的实时行情数据块（含 60s 缓存 + §FIX-6 single-flight/条数上限）。
 func (e *Engine) buildStockBlock(code, name string) string {
 	e.consultBlockMu.Lock()
 	if e.consultBlockCache == nil {
@@ -2626,12 +2677,55 @@ func (e *Engine) buildStockBlock(code, name string) string {
 		e.consultBlockMu.Unlock()
 		return ent.text
 	}
+	// 已有同代码在途构建：挂等其结果，绝不重复穿透（single-flight）。
+	if fl, ok := e.consultFlight[code]; ok {
+		e.consultBlockMu.Unlock()
+		<-fl.done
+		return fl.text
+	}
+	fl := &consultBlockFlight{done: make(chan struct{})}
+	if e.consultFlight == nil {
+		e.consultFlight = map[string]*consultBlockFlight{}
+	}
+	e.consultFlight[code] = fl
 	e.consultBlockMu.Unlock()
-	text := e.buildStockBlockUncached(code, name)
+
+	load := e.buildStockBlockUncached // 生产默认：直调行情源组装
+	if e.consultBlockLoad != nil {
+		load = e.consultBlockLoad // §FIX-6 测试缝
+	}
+	text := load(code, name) // 慢调用在锁外，行情挂死不影响其他代码
+
 	e.consultBlockMu.Lock()
+	delete(e.consultFlight, code)
+	e.evictConsultBlocksLocked()
 	e.consultBlockCache[code] = consultBlockEntry{text: text, at: time.Now()}
 	e.consultBlockMu.Unlock()
+	fl.text = text
+	close(fl.done)
 	return text
+}
+
+// evictConsultBlocksLocked 缓存条数治理（调用方持 consultBlockMu）：先清 TTL 过期项，
+// 仍在上限外则按写入时间淘汰最旧。
+func (e *Engine) evictConsultBlocksLocked() {
+	for k, ent := range e.consultBlockCache {
+		if time.Since(ent.at) >= consultBlockCacheTTL {
+			delete(e.consultBlockCache, k)
+		}
+	}
+	for len(e.consultBlockCache) >= consultBlockCacheMax {
+		oldestKey, oldestAt := "", time.Now()
+		for k, ent := range e.consultBlockCache {
+			if ent.at.Before(oldestAt) {
+				oldestKey, oldestAt = k, ent.at
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(e.consultBlockCache, oldestKey)
+	}
 }
 
 // buildStockBlockUncached 组装单只股票的实时行情数据块（无缓存，直调行情源）。
@@ -2786,10 +2880,12 @@ func consultMATrend(kl []data.KLine) string {
 }
 
 // consultStoreFor 返回指定账号的咨询历史存储（§GAP2-W2 I-1 私有状态按账号寻址）：
-// accountsRoot 注入时落 accounts/<uid>/consult_history.json（各自目录互不可见），
-// 未注入（旧部署/测试）回退引擎级共享 store 保持兼容。懒加载并发安全。
-// English: per-account consult history store under accounts/<uid>/; falls back to the shared engine
-// store when accountsRoot isn't injected (legacy deploys/tests). Lazily built, concurrency-safe.
+// accountsRoot 注入时落 accounts/<uid>/consult_history.json（各自目录互不可见）。
+// §FIX-10(20260919 批四)：登录用户遇 accountsRoot 未注入时**返回 nil 拒绝服务**，
+// 不再回退引擎级共享 store——共享回退=A 的提问会出现在 B 的历史里（串号），
+// 宁可 503 不可串号。匿名（userID==""，旧单机形态）仍走共享 store 保持兼容。
+// English: returns nil (caller must refuse) instead of silently sharing one store
+// across logged-in users when accountsRoot is missing; anonymous legacy mode keeps the shared store.
 func (e *Engine) consultStoreFor(userID string) *data.ConsultStore {
 	if userID == "" {
 		return e.consultStore
@@ -2798,13 +2894,16 @@ func (e *Engine) consultStoreFor(userID string) *data.ConsultStore {
 	root := e.accountsRoot
 	e.mu.RUnlock()
 	if root == "" {
-		return e.consultStore
+		return nil // §FIX-10：隔离不可用 → 拒绝，不共享
 	}
 	// 懒加载：每个账号首次访问时创建独立咨询存储并缓存（锁内完成建目录+初始化）。
 	e.consultMu.Lock()
 	defer e.consultMu.Unlock()
 	if st, ok := e.consultByUser[userID]; ok {
 		return st
+	}
+	if e.consultByUser == nil {
+		e.consultByUser = map[string]*data.ConsultStore{}
 	}
 	dir := filepath.Join(root, userID)
 	_ = os.MkdirAll(dir, 0755)
@@ -2814,13 +2913,21 @@ func (e *Engine) consultStoreFor(userID string) *data.ConsultStore {
 }
 
 // GetConsultHistory 返回指定账号的当日咨询对话历史（§GAP2-W2 账户隔离）。
+// §FIX-10：隔离不可用（nil store）时返回空列表——读不到别人的，也读不到自己的，宁缺不漏。
 func (e *Engine) GetConsultHistoryFor(userID string) []data.ConsultMessage {
-	return e.consultStoreFor(userID).List()
+	st := e.consultStoreFor(userID)
+	if st == nil {
+		return nil
+	}
+	return st.List()
 }
 
 // ClearConsultHistory 清空指定账号的当日咨询对话历史（§GAP2-W2 只清本人的）。
+// §FIX-10：nil store（隔离不可用）时为空操作（无历史可清，也绝不触碰共享存储）。
 func (e *Engine) ClearConsultHistoryFor(userID string) {
-	e.consultStoreFor(userID).Clear()
+	if st := e.consultStoreFor(userID); st != nil {
+		st.Clear()
+	}
 }
 
 // buildPolicyRetaliationSignals 将政策反制事件转为可展示信号：

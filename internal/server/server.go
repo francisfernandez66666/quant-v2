@@ -57,6 +57,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/combat_agent"
@@ -916,8 +917,27 @@ func originMatchesHost(r *http.Request, origin string) bool {
 // chain 将多个中间件按顺序包装 next（外层 → 内层）。
 // recoverMiddleware 在最外层兜底 panic。
 func (s *Server) chain(next http.Handler) http.Handler {
-	// 中间件链由外到内：recover（兜底 panic）→ CORS → 业务路由
-	return s.recoverMiddleware(s.corsMiddleware(next))
+	// 中间件链由外到内：recover（兜底 panic）→ CORS → bodyLimit（§FIX-6 全局请求体闸）→ 业务路由
+	return s.recoverMiddleware(s.corsMiddleware(bodyLimit(next)))
+}
+
+// bodyLimit §FIX-6(20260919 批四)：全局请求体上限 64KB。此前 170 条路由仅 4 处各自包了
+// MaxBytesReader，其余端点（含 /api/consult）裸读 r.Body——超大 body 直打内存与解码器。
+// 全仓端点均为 JSON 请求体（无文件上传类大 body 端点，已逐处核对），统一封顶安全；
+// 已知 ContentLength 超限直接 413 拒掉（不读 body），chunked 传输由 MaxBytesReader
+// 在读取越限时令解码失败兜底。处理器内自包的 MaxBytesReader 不受影响（内层更严者生效）。
+// English: global 64KB request-body cap; all endpoints are JSON-only, so no upload exemption exists.
+func bodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > maxBodyBytes {
+			writeError(w, http.StatusRequestEntityTooLarge, "请求体超过 64KB 上限")
+			return
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // GetServeMux 返回路由注册表。
@@ -2150,6 +2170,10 @@ type consultReq struct {
 	Message string `json:"message"` // 用户咨询消息
 }
 
+// consultMessageMaxRunes §FIX-6(20260919 批四)：咨询消息长度上限（rune 计）。
+// 正常提问几十字，2000 已极宽松；超限=灌 prompt/灌历史/放大外呼的恶意或误操作载荷。
+const consultMessageMaxRunes = 2000
+
 // 专业模式相关配置键（per-user，落盘 auth.json，跨重启保留）。
 const (
 	consultProModeKey      = "consult_pro_mode"      // "1"/"0"，默认开（§生产 20260916：咨询必须带近期+今日数据，关到"0"才关）
@@ -2207,8 +2231,16 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	// §FIX-6(20260919 批四)：消息长度闸——纯空白按空处理；上限 2000 字符（rune 计，
+	// 中文一字一符）。不限长=数百 KB 文本进付费 prompt 与历史文件，且代码扫描类
+	// 载荷会把外呼量放大到行情配额极限（引擎侧另有前 5 只截断兜底）。
+	req.Message = strings.TrimSpace(req.Message)
 	if req.Message == "" {
 		writeError(w, 400, "message required")
+		return
+	}
+	if utf8.RuneCountInString(req.Message) > consultMessageMaxRunes {
+		writeError(w, 400, fmt.Sprintf("咨询内容过长（上限 %d 字），请精简后分次提问", consultMessageMaxRunes))
 		return
 	}
 	// 提取用户 ID（未登录时为空串），用于专业模式与私有历史寻址。
@@ -2243,6 +2275,12 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 		// 次日自动恢复），不该混进 500 让用户以为是系统坏了。
 		if errors.Is(err, llm.ErrBudgetExceeded) {
 			writeError(w, 429, err.Error())
+			return
+		}
+		// §FIX-10(20260919 批四)：账号隔离存储不可用=依赖未就绪（503 语义，可重试），
+		// 与上游 5xx 故障（500）分流；引擎已保证拒绝发生在付费调用之前。
+		if errors.Is(err, data.ErrStoreUnavailable) {
+			writeError(w, 503, err.Error())
 			return
 		}
 		writeError(w, 500, err.Error())

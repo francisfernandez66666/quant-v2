@@ -4,11 +4,25 @@ package data
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"sync"
 	"time"
 )
+
+// ErrStoreUnavailable §FIX-10(20260919 批四)：账号隔离存储不可用（accountsRoot 未注入等）。
+// 咨询历史**绝不回退共享 store**——宁可拒绝服务（HTTP 503）也不可 A 的对话漏进 B 的历史
+// （串号）。engine.ConsultLLM 用 %w 包装本哨兵，server 用 errors.Is 映射 503。
+// English: per-user consult isolation is unavailable; refuse service rather than leak
+// conversations across accounts (mapped to HTTP 503).
+var ErrStoreUnavailable = errors.New("咨询历史存储不可用（账号隔离未就绪），已拒绝服务以防串号")
+
+// consultStoreMaxMessages §FIX-10：单账号当日历史条数上限（user+assistant 各算一条）。
+// 无上限时"每轮两次全量重写"的代价随对话长度线性膨胀（大文件 fsync + 付费 prompt 注入）；
+// 超限后丢弃最旧条目，保留最近对话。
+// （cap on per-day stored messages; oldest entries are trimmed beyond the limit.）
+const consultStoreMaxMessages = 500
 
 // ConsultMessage 一条咨询对话消息。
 type ConsultMessage struct {
@@ -65,18 +79,33 @@ func (s *ConsultStore) persist() {
 	}
 }
 
-// Append 追加一条用户或助手消息到当日对话历史（跨日自动清空）。
+// Append 追加一条用户或助手消息到当日对话历史（跨日自动清空，超上限淘汰最旧）。
 func (s *ConsultStore) Append(role, content string) {
+	s.AppendPair(ConsultMessage{Role: role, Content: content})
+}
+
+// AppendPair §FIX-10(20260919 批四)：一轮咨询的"提问+回复"合并为一次落盘。
+// 旧实现每轮 Append×2 = 两次全量 atomicWrite/fsync，且两条之间存在"半轮"窗口
+// （进程崩溃时历史里留下无回复的提问）。整轮合并后原子落盘。
+// （append a whole turn in ONE persist — halves fsync traffic and removes the half-turn window.）
+func (s *ConsultStore) AppendPair(msgs ...ConsultMessage) {
+	if len(msgs) == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.file.TradingDay != TradingDayDate(time.Now()) {
 		s.file.Messages = nil
 	}
-	s.file.Messages = append(s.file.Messages, ConsultMessage{
-		Role:    role,
-		Content: content,
-		Time:    time.Now(),
-	})
+	now := time.Now()
+	for _, m := range msgs {
+		m.Time = now
+		s.file.Messages = append(s.file.Messages, m)
+	}
+	// 条数上限：超限丢最旧（保留最近 consultStoreMaxMessages 条）。
+	if over := len(s.file.Messages) - consultStoreMaxMessages; over > 0 {
+		s.file.Messages = append([]ConsultMessage(nil), s.file.Messages[over:]...)
+	}
 	s.persist()
 }
 

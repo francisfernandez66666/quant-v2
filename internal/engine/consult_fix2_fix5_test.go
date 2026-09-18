@@ -49,6 +49,8 @@ func TestAuditNumbersIgnoresPromptDecoys(t *testing.T) {
 	defer srv.Close()
 
 	e := &Engine{}
+	// §FIX-10(20260919 批四)：咨询改为"账号隔离存储不可用即拒绝"，测试须注入 accountsRoot。
+	e.SetAccountsRoot(t.TempDir())
 	// 预置单股数据块缓存：绕开行情源，注入含真实数字的数据块（buildStockBlock 60s 内命中）。
 	e.consultBlockCache = map[string]consultBlockEntry{
 		"600580": {text: "\n—— 股票 600580 卧龙电驱 ——\n现价 36.10元 涨跌幅-5.67%（即下跌5.67%） 今开36.50元 最高36.80元 最低35.90元 昨收 38.27元\n", at: time.Now()},

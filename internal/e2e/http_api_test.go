@@ -420,8 +420,13 @@ func TestHTTPConsultHistory(t *testing.T) {
 		t.Fatalf("初始咨询历史应为空, got %d", len(hist))
 	}
 
-	// 引擎驱动一条咨询
-	if _, err := hr.rig.eng.ConsultLLM(context.Background(), "tester", "你好", true); err != nil {
+	// 引擎驱动一条咨询。§FIX-10 后历史按账号目录寻址，必须用 token 对应的真实 user.ID
+	// （"tester" 是用户名非 ID），与下方 GET /api/consult/history 的 requestUserID 同源。
+	tu := hr.rig.auth.ValidateToken(hr.token)
+	if tu == nil {
+		t.Fatal("tester token 校验失败")
+	}
+	if _, err := hr.rig.eng.ConsultLLM(context.Background(), tu.ID, "你好", true); err != nil {
 		t.Fatalf("ConsultLLM: %v", err)
 	}
 

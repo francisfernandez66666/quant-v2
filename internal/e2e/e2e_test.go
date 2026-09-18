@@ -167,6 +167,10 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 		stockTracker, wlMgr, sse, llmClient, thsClient, tmp)
 	eng.SetScanner(scanner)
 	eng.SetEmotionConfig(&cfgMgr.Rules.Emotion)
+	// §FIX-10(20260919 批四)：注入 accountsRoot——生产经 registry 恒注入；rig 此前从未设置
+	// （全仓无一处 SetAccountsRoot 用例），而咨询已改为"隔离不可用即拒绝服务"，
+	// 不注入则所有 ConsultLLM 用例会走 503 分支。顺带让 rig 与生产寻址口径一致。
+	eng.SetAccountsRoot(filepath.Join(tmp, "accounts"))
 	// §时钟注入：固定在交易日 10:30（fixture 新闻日期同日）——
 	// 此前读真实 time.Now，凌晨/盘前跑测试时主循环"盘前抑制"把全部信号清空（时刻漂移 flaky）。
 	fixed := time.Date(2026, 8, 4, 10, 30, 0, 0,
