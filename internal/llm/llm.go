@@ -1009,6 +1009,10 @@ func (c *Client) postCtx(ctx context.Context, req ChatRequest, stream bool, maxT
 // （consultSystemPrompt is the system prompt for the multi-turn stock-consultation dialogue: it sets the
 // role of an A-share advisor with independent analysis. It must answer questions directly with plain
 // language, only cite the injected real-time data, and never fabricate any terms or numbers.）
+// §FIX-2(20260919 批三)钉死：下方"错误示范"里的假数字（2383万/1.2亿/25305 等）只是反面教材，
+// 严禁被采集为 trusted——引擎侧 ConsultLLM 的数字白名单只吃 ⟦DATA⟧ 边界内数据块、用户消息与
+// 历史，本模板整体出局。改采集链的人注意：把 system 再传进 collectTrustedNumbers = 守卫自击穿
+// （模型原样复现提示词假数字即被放行，历史上真出过这个洞）。
 var consultSystemPrompt = `你是专业的A股股票投资顾问，负责回答用户的股市问题。回答要像和对股票有了解、但听不懂花哨术语的朋友解释一样，把逻辑讲清楚、说人话，让用户听完能明白"到底怎么回事、该怎么办"。
 
 你的信息来源只有两个，除此之外任何内容都不得出现：

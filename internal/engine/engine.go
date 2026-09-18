@@ -2281,9 +2281,14 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 	// 数据是咨询的默认构成（用户实录"AI 顾问空口谈逻辑"是缺陷），不再由开关决定有无；
 	// proMode 仅追加更定量化/结构化的深度分析风格要求。未识别到个股时给 noStock 提示词，
 	// 引导模型如实说明无数据、不编造。
+	// §FIX-2(20260919 批三)：数据块用 ⟦DATA⟧/⟦/DATA⟧ 边界包裹后注入——边界让模型能区分
+	// "实测数据"与"角色指令"，更重要的是 trusted 白名单从此**只采边界内数据块 + 用户消息 +
+	// 历史**，提示词模板彻底出局（旧实现连 system 一起抽，"错误示范"假数字 2383万/1.2亿
+	// 被模型原样复现即放行，守卫自击穿）。
 	system := llm.ConsultSystemPrompt()
-	if dataCtx := e.buildConsultContext(userMsg); dataCtx != "" {
-		system += "\n\n" + dataCtx
+	dataCtx := e.buildConsultContext(userMsg)
+	if dataCtx != "" {
+		system += "\n\n⟦DATA⟧\n" + dataCtx + "\n⟦/DATA⟧"
 	} else {
 		system += "\n\n" + consultNoStockPrompt
 	}
@@ -2315,12 +2320,15 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 	}
 
 	// 数字审计：剔除模型编造、没有任何可信出处的金钱/数量类数字（金额、成交量、笔数等）。
-	// 可信来源=注入的实时行情上下文 + 用户自己的描述 + 此前已落盘的历史（已在此前被审计过）。
+	// 可信来源=注入的实时行情数据块 + 用户自己的描述 + 此前已落盘的历史（已在此前被审计过）。
+	// §FIX-2：来源清单里**没有** system——提示词模板（含反面教材假数字）不参与白名单采集。
 	histTexts := make([]string, 0, len(messages))
 	for _, m := range messages {
 		histTexts = append(histTexts, m.Content)
 	}
-	trusted := collectTrustedNumbers(append([]string{system, userMsg}, histTexts...)...)
+	trusted := collectTrustedNumbers(append([]string{dataCtx, userMsg}, histTexts...)...)
+	// §FIX-5(4)：提示词允许模型用现价/昨收推算涨跌幅，推算值按 ±0.5pp 容差放行。
+	trusted.addDerivedPct(dataCtx)
 	reply = auditNumbers(reply, trusted)
 
 	// 对话历史落盘：用户提问 + 模型回复（§GAP2-W2 写入本人账号目录）
@@ -2334,42 +2342,182 @@ func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode
 // auditedNumberRe 匹配带金融单位的数字：金额（万元/亿元/元）、成交量（万股/亿股）、笔数/手数，
 // 及百分比与倍数（% / 倍）——这些同样是模型幻觉的高发区。
 // 支持"万/亿"紧邻 笔/手/股 的组合（如 2.3万笔、1.2亿股）。
-// 刻意不匹配：时间、股票代码、时长、日期——避免误伤。
-var auditedNumberRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?(?:万元|亿元|元|万股|亿股|万|亿|手|笔|[%％]|倍)`)
+// §FIX-5(20260919 批三)：数字与单位之间允许空白（模型常写"净流出 2.22 亿元"），否则漏审。
+// 刻意不匹配：时间、股票代码、时长、日期，以及"点/个"等无单位口径字段——避免误伤，
+// 数据块里的无单位复述（如"12个点"）天然不进白名单也不被审，后人勿再加宽单位表。
+// English: matches unit-bearing finance numbers (space between digits and unit allowed);
+// deliberately skips times/codes/dates and unit-less phrasings.
+var auditedNumberRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?\s*(?:万元|亿元|元|万股|亿股|万|亿|手|笔|[%％]|倍)`)
 
-// collectTrustedNumbers 从可信文本（实时行情上下文、用户描述、历史消息）中收集"有出处的数字"集合。
-// 数值归一化后存储，便于匹配不同写法（"-22200.00万元" 与 "-22200万元" 视为同一值）。
-func collectTrustedNumbers(texts ...string) map[string]bool {
-	trusted := make(map[string]bool)
-	for _, t := range texts {
-		for _, tok := range auditedNumberRe.FindAllString(t, -1) {
-			if v, ok := normNumberToken(tok); ok {
-				trusted[v] = true
+// numCat §FIX-5：带单位数字的量纲类别。金额/股数/笔数/百分比/倍数互不等价，
+// 只在同类内做单位换算归一（万元↔亿元）；catAmbiguous 专治裸"万/亿"（"2.3万笔"
+// 会被正则截成 "2.3万"，量纲未知），允许命中任意类别的基础量。
+type numCat int
+
+const (
+	catAmbiguous numCat = iota // 裸"万/亿"，量纲未知
+	catMoney                   // 元/万元/亿元
+	catShares                  // 万股/亿股
+	catCount                   // 手/笔
+	catPct                     // % / ％
+	catMult                    // 倍
+)
+
+// numUnitTable token 后缀 →（量纲类别, 归一到基础量的乘数）。长后缀必须排在前，
+// 保证 "万元" 先于 "万" 命中（HasSuffix 顺序扫描）。
+var numUnitTable = []struct {
+	suffix string
+	cat    numCat
+	mult   float64
+}{
+	{"万元", catMoney, 1e4}, {"亿元", catMoney, 1e8},
+	{"万股", catShares, 1e4}, {"亿股", catShares, 1e8},
+	{"元", catMoney, 1}, {"万", catAmbiguous, 1e4}, {"亿", catAmbiguous, 1e8},
+	{"手", catCount, 1}, {"笔", catCount, 1},
+	{"%", catPct, 1}, {"％", catPct, 1}, {"倍", catMult, 1},
+}
+
+// parseAuditedNumberToken 把 "-22200.00 万元" 这类 token 拆成（量纲类别, 基础量纲数值）。
+// 换算归一是 FIX-5 的核心："-22200万元" 与 "2.22亿元" 落到同一个基础值 -2.22e8，
+// 模型换口径复述不再被当成编造。
+func parseAuditedNumberToken(tok string) (numCat, float64, bool) {
+	// 数字与单位间的空白先剥掉（正则允许 \s*）。
+	trimmed := strings.TrimRight(tok[:strings.LastIndexAny(tok, "0123456789.")+1], " ")
+	suffix := strings.TrimSpace(tok[len(trimmed):])
+	for _, u := range numUnitTable {
+		if suffix == u.suffix {
+			f, err := strconv.ParseFloat(trimmed, 64)
+			if err != nil {
+				return 0, 0, false
+			}
+			return u.cat, f * u.mult, true
+		}
+	}
+	return 0, 0, false
+}
+
+// trustedNumbers §FIX-5：可信数字集合——按量纲分组的"有出处"基础量 + 推算涨跌幅容差清单。
+type trustedNumbers struct {
+	vals       map[numCat]map[float64]bool // 类别 → 集合（保留正负号）
+	derivedPct []float64                   // 现价/昨收推算值，±0.5pp 容差放行（FIX-5(4)）
+}
+
+// derivedPctTolerance 推算涨跌幅的放行容差（百分点）：模型按现价/昨收手算常四舍五入到 1~2 位小数。
+const derivedPctTolerance = 0.5
+
+// collectTrustedNumbers 从可信文本（数据块边界内原文、用户描述、历史消息）收集"有出处的数字"。
+// §FIX-2(20260919 批三)：调用方**严禁**再把 system 提示词模板传进来——模板"错误示范"里的
+// 假数字（2383万/1.2亿）一旦入白名单，守卫即被模型原样复现击穿。
+func collectTrustedNumbers(texts ...string) *trustedNumbers {
+	t := &trustedNumbers{vals: map[numCat]map[float64]bool{}}
+	for _, text := range texts {
+		for _, tok := range auditedNumberRe.FindAllString(text, -1) {
+			cat, val, ok := parseAuditedNumberToken(tok)
+			if !ok {
+				continue
+			}
+			if t.vals[cat] == nil {
+				t.vals[cat] = map[float64]bool{}
+			}
+			t.vals[cat][val] = true
+		}
+	}
+	return t
+}
+
+// isEmpty 无任何可信数字：审计整体跳过（维持历史语义——无锚点时宁可放行不误伤）。
+func (t *trustedNumbers) isEmpty() bool {
+	return len(t.vals) == 0 && len(t.derivedPct) == 0
+}
+
+// consultDerivedPairRe 在数据块同一行内配对"现价 X元 … 昨收 Y元"，供推算涨跌幅白名单。
+var consultDerivedPairRe = regexp.MustCompile(`现价\s*([-+]?\d+(?:\.\d+)?)\s*元[^\n]*?昨收\s*([-+]?\d+(?:\.\d+)?)\s*元`)
+
+// addDerivedPct §FIX-5(4)：提示词明确允许模型用现价/昨收推算涨跌幅，推算值天然不在
+// 白名单——从数据块抽出（现价,昨收）对算出推算锚点，审计按 ±0.5pp 容差放行。
+func (t *trustedNumbers) addDerivedPct(dataCtx string) {
+	for _, m := range consultDerivedPairRe.FindAllStringSubmatch(dataCtx, -1) {
+		price, err1 := strconv.ParseFloat(m[1], 64)
+		prevClose, err2 := strconv.ParseFloat(m[2], 64)
+		if err1 != nil || err2 != nil || prevClose <= 0 {
+			continue
+		}
+		t.derivedPct = append(t.derivedPct, (price/prevClose-1)*100)
+	}
+}
+
+// reverseWordAnchors §FIX-5(3)：反向措辞保守锚——仅当模型用**正数**复述、数据侧存在同绝对值
+// **负数**、且数字前文含下列词时才放行（数据"-22200万元" ↔ 回复"净流出2.22亿元"）。
+// 反向（负数复述正数锚点）刻意不放行：数据里"涨5.67%"配"跌5.67%"的表述更可能是方向性编造。
+var reverseWordAnchors = []string{"跌", "流出", "下降", "回落", "减少", "亏损", "下挫", "下滑"}
+
+// hasReverseAnchor 只看数字前 10 个字符的近邻上下文，避免远距离词误配。
+func hasReverseAnchor(prefix string) bool {
+	r := []rune(prefix)
+	if len(r) > 10 {
+		r = r[len(r)-10:]
+	}
+	s := string(r)
+	for _, w := range reverseWordAnchors {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// approxEqual 浮点相等（相对容差 1e-6）：吸收 万↔亿 换算噪声（2.22×1e8 与 22200×1e4 尾差）。
+func approxEqual(a, b float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= 1e-6*math.Max(1, math.Abs(b))
+}
+
+// setHit 集合内是否有与 val 近似相等的成员（集合规模只有几十，线性扫描即可）。
+func setHit(set map[float64]bool, val float64) bool {
+	for v := range set {
+		if approxEqual(v, val) {
+			return true
+		}
+	}
+	return false
+}
+
+// allows 判定回复中一个数字 token（类别+基础量）是否有可信出处；prefix 为该数字之前的回复文本。
+func (t *trustedNumbers) allows(cat numCat, val float64, prefix string) bool {
+	// 1) 同量纲精确命中（含单位换算归一后的相等）。
+	if setHit(t.vals[cat], val) {
+		return true
+	}
+	// 2) 裸"万/亿"量纲未知：任意类别命中即放行（"2.3万笔"截自 "2.3万" 的兼容路径）。
+	if cat == catAmbiguous {
+		for _, set := range t.vals {
+			if setHit(set, val) {
+				return true
 			}
 		}
 	}
-	return trusted
-}
-
-// normNumberToken 抽取带单位数字 token 的数值部分并做浮点归一化，返回规范形式。
-// "-22200.00万元" → "-22200"；"2.3万笔" → "2.3"；"12%" → "12"；"3倍" → "3"。归一化失败返回 ok=false。
-func normNumberToken(tok string) (string, bool) {
-	i := strings.IndexAny(tok, "万亿元亿手股%％倍")
-	if i < 0 {
-		return "", false
+	// 3) 同号相反 + 反向措辞锚（保守规则，见 reverseWordAnchors 注释）。
+	if val > 0 && setHit(t.vals[cat], -val) && hasReverseAnchor(prefix) {
+		return true
 	}
-	numStr := tok[:i]
-	f, err := strconv.ParseFloat(numStr, 64)
-	if err != nil {
-		return "", false
+	// 4) 百分比推算容差：现价/昨收推算值 ±0.5pp 内放行（正负两种措辞都按绝对值比对）。
+	if cat == catPct {
+		for _, d := range t.derivedPct {
+			if math.Abs(val-d) <= derivedPctTolerance || math.Abs(math.Abs(val)-math.Abs(d)) <= derivedPctTolerance {
+				return true
+			}
+		}
 	}
-	return strconv.FormatFloat(f, 'f', -1, 64), true
+	return false
 }
 
 // auditNumbers 扫描模型回复中的金融数字，凡数值无可信出处（不在 trusted 集合中）即替换为数据缺失标注。
 // 仅替换带单位的金钱/数量类数字，避免误伤百分比、时间、代码等。
-func auditNumbers(reply string, trusted map[string]bool) string {
-	if len(trusted) == 0 {
+func auditNumbers(reply string, trusted *trustedNumbers) string {
+	if trusted == nil || trusted.isEmpty() {
 		return reply
 	}
 	// 用正则定位全部候选数字片段；无候选则原样返回。
@@ -2383,8 +2531,8 @@ func auditNumbers(reply string, trusted map[string]bool) string {
 	last := 0
 	for _, m := range idx {
 		tok := reply[m[0]:m[1]]
-		v, ok := normNumberToken(tok)
-		if ok && trusted[v] {
+		cat, val, ok := parseAuditedNumberToken(tok)
+		if ok && trusted.allows(cat, val, reply[:m[0]]) {
 			sb.WriteString(reply[last:m[1]])
 		} else {
 			sb.WriteString(reply[last:m[0]])
@@ -2507,8 +2655,15 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		if si.Name != "" {
 			name = si.Name
 		}
-		b.WriteString(fmt.Sprintf("现价 %.2f元 涨跌幅%.2f%% 今开%.2f 最高%.2f 最低%.2f 昨收%.2f\n",
-			si.Price, si.ChangePct, si.Open, si.High, si.Low, si.Close))
+		// §FIX-5(1)：今开/最高/最低/昨收统一带"元"单位（旧格式无单位，模型规范复述
+		// "今开 36.10 元"反被审计当编造替换）；涨跌幅同时输出带符号叙述锚"（即下跌5.67%）"，
+		// 让"涨跌幅-5.67%"与"跌幅5.67%"两种常见复述形态天然进白名单。
+		dirWord := "上涨"
+		if si.ChangePct < 0 {
+			dirWord = "下跌"
+		}
+		b.WriteString(fmt.Sprintf("现价 %.2f元 涨跌幅%.2f%%（即%s%.2f%%） 今开%.2f元 最高%.2f元 最低%.2f元 昨收%.2f元\n",
+			si.Price, si.ChangePct, dirWord, math.Abs(si.ChangePct), si.Open, si.High, si.Low, si.Close))
 		b.WriteString(fmt.Sprintf("成交量 %.0f股 成交额%.0f元 换手率 %.2f%%\n",
 			si.Volume, si.Amount, si.Turnover))
 		if si.NetInflow != 0 {
