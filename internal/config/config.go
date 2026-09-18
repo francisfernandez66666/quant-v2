@@ -987,6 +987,16 @@ type LLMConfig struct {
 	DailyCallBudget int64 `json:"daily_call_budget"`
 	// Daily鉴权TokenBudget
 	DailyTokenBudget int64 `json:"daily_token_budget"`
+	// StreamIdleTimeoutSec 流式"相邻分片空闲"阈值（秒）。<=0 时 llm 包回落默认 60s。
+	// §FIX-3(20260919) 语义修正后该值恢复本义：分片到达即重置，只掐"真的停止吐字"的卡流，
+	// 不再是整段硬超时（旧实现把慢而正常的长推理流式误杀）。
+	// Stream idle timeout in seconds
+	StreamIdleTimeoutSec int `json:"stream_idle_timeout_sec"`
+	// ConsultDailyCalls §FIX-7(20260919)：AI 顾问（咨询）单独的当日调用预算（0=不设限）。
+	// 咨询出呼走运营账号统一密钥、全体用户共用，总日预算之外再给咨询封顶，
+	// 防高频问答吃光新闻归因/D1 当日配额。超限当日 429，次日自动恢复。
+	// Consultation daily call budget
+	ConsultDailyCalls int64 `json:"consult_daily_calls"`
 }
 
 // StreamingEnabled 返回流式响应是否启用：未显式配置（nil）时默认开启。

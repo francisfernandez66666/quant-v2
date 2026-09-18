@@ -414,14 +414,22 @@ func main() {
 	// 共享新闻归因代理与全部存活引擎；此前只刷当时存活的引擎，空注册表/新建账号会静默
 	// 沿用旧客户端（表现为设置页保存后归因仍是旧模型）。
 	srv.SetLLMRecreate(func(apiKeys []string, apiURL, model string, timeoutSec int, streaming bool, batchConcurrency int, classifierModel string) {
+		// §FIX-7(20260919) 热重建必须带回成本治理与空闲阈值：热更新请求体不含这些字段，
+		// 若不回读运营账号已落库配置，重建出的客户端永远 0=不限/默认空闲——这正是此前
+		// "预算形同虚设"缺陷在热更新路径上的复现点。
+		opCfg := *cfgMgr.GetLLMConfigFor(authMgr.AdminID()) // 取值拷贝（GetLLMConfigFor 别名警告）
 		lc := llm.New(llm.Config{
-			APIKeys:          apiKeys,
-			APIURL:           apiURL,
-			Model:            model,
-			Timeout:          time.Duration(timeoutSec) * time.Second,
-			Streaming:        streaming,
-			BatchConcurrency: batchConcurrency,
-			ClassifierModel:  classifierModel,
+			APIKeys:           apiKeys,
+			APIURL:            apiURL,
+			Model:             model,
+			Timeout:           time.Duration(timeoutSec) * time.Second,
+			Streaming:         streaming,
+			BatchConcurrency:  batchConcurrency,
+			ClassifierModel:   classifierModel,
+			StreamIdleTimeout: time.Duration(opCfg.StreamIdleTimeoutSec) * time.Second,
+			DailyCallBudget:   opCfg.DailyCallBudget,
+			DailyTokenBudget:  opCfg.DailyTokenBudget,
+			ConsultDailyCalls: opCfg.ConsultDailyCalls, // §FIX-7 咨询专属预算同样回读，热重建不丢成本治理
 		})
 		registry.SetLLMClient(lc)
 		eff := model

@@ -36,6 +36,12 @@ export default function Consult() {
   const [proModeSaving, setProModeSaving] = useState(false)
 
   const [llmConfigured, setLlmConfigured] = useState(true)
+  // §FIX-7(a)(20260919) llmGated：LLM 配置由管理员统一维护（GET 回 403）时置真——
+  // 旧实现把 403 吞成"未配置"，给子账号弹一张保存必然失败的配置卡（误导性常驻）。
+  const [llmGated, setLlmGated] = useState(false)
+  // §FIX-7(a)：LLM 写入端点是 admin-only（全员咨询共用运营 key 计费，配置属运营级动作），
+  // 非管理员不再展示可编辑配置卡。
+  const admin = api.isAdmin()
   const [llmSaving, setLlmSaving] = useState(false)
   const [llmMsg, setLlmMsg] = useState('')
   const [llmMsgType, setLlmMsgType] = useState('ok')
@@ -167,7 +173,15 @@ export default function Consult() {
         } else {
           setLlmConfigured(false)
         }
-      } catch (_) { setLlmConfigured(false) }
+      } catch (e) {
+        // §FIX-7(a)(20260919)：403=无权限查看（管理员统一配置），不是"未配置"。
+        if (api.isForbidden(e)) {
+          setLlmGated(true)
+          setLlmConfigured(true) // 不弹可编辑卡；咨询是否可用以实际发送结果为准
+        } else {
+          setLlmConfigured(false)
+        }
+      }
       await loadProMode()
       await loadHistory()
     })()
@@ -241,8 +255,10 @@ export default function Consult() {
         </div>
       </div>
 
-      {/* LLM 配置卡片：首次使用或未配置 API Key 时显示，可填写地址/Key/模型 */}
-      {!llmConfigured && (
+      {/* LLM 配置卡片：首次使用或未配置 API Key 时显示，可填写地址/Key/模型。
+          §FIX-7(a)(20260919)：仅管理员可见可编辑——LLM 属运营级共享配置（全员咨询/新闻归因/D1
+          共用这一份 key），子账号拿到卡也只会撞后端 403；无权限者改为只读提示卡。 */}
+      {!llmConfigured && admin && !llmGated && (
         <Card title="🔑 LLM 配置（首次使用请填写 API Key）" style={{ marginBottom: 12 }}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <Input value={cfgApiUrl} onChange={(v) => setCfgApiUrl(v)} placeholder="API 地址（如 https://api.siliconflow.cn/v1/chat/completions）" style={{ minWidth: 240, flex: 1 }} />
@@ -251,6 +267,13 @@ export default function Consult() {
             <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
           </div>
           {llmMsg && <div style={{ marginTop: 8 }}><Tag theme={llmMsgType === 'ok' ? 'success' : 'danger'} variant="light">{llmMsg}</Tag></div>}
+        </Card>
+      )}
+      {(llmGated || !llmConfigured) && !admin && (
+        <Card title="ℹ️ AI 顾问由管理员统一配置" style={{ marginBottom: 12 }}>
+          <div className="muted" style={{ fontSize: 13 }}>
+            LLM 密钥与模型由管理员在设置页统一维护；若咨询不可用或提示当日额度用尽，请联系管理员调整，无需在本页配置。
+          </div>
         </Card>
       )}
 

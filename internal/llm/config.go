@@ -30,6 +30,10 @@ type Config struct {
 	// 流式空闲超时
 	StreamIdleTimeout time.Duration
 
+	// StreamTotalTimeout 流式响应总时长硬上限（§FIX-3(20260919)）：空闲阈值改为分片到达即
+	// 重置后，需要一个独立的总时长兜底防"永远在滴"型慢速卡流。<=0 时 New 兜底为 300s。
+	StreamTotalTimeout time.Duration
+
 	// BatchConcurrency LLM 批量分析（Stage0/Stage2 分批）的最大并发批次数量。
 	// <=0 时 New 兜底为 8。API 配额充足时可调高以加快盘前新闻归因吞吐。
 	// （BatchConcurrency caps how many LLM batch calls (Stage0/Stage2 chunked analysis) run concurrently;
@@ -53,4 +57,9 @@ type Config struct {
 	DailyCallBudget int64
 	// 日 token 预算（0=不限）
 	DailyTokenBudget int64
+
+	// ConsultDailyCalls §FIX-7(20260919) 咨询（ChatMessagesCtx）单独的当日调用预算（0=不设限）。
+	// 全体用户咨询共用运营账号 key 计费（ctrlFor 恒指向运营引擎），总日预算之外再给咨询单独
+	// 封顶，防"子账号刷咨询"吃光主链路（新闻归因/D1）当日配额。
+	ConsultDailyCalls int64
 }

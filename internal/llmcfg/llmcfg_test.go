@@ -10,9 +10,11 @@ package llmcfg
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/llm"
 )
 
 // newHarness 建一套临时 认证+配置 管理器并创建管理员（运营归属账号）。
@@ -64,6 +66,42 @@ func TestResolveEnvFallbackWhenNothingSaved(t *testing.T) {
 	got := Resolve(cm, am)
 	if got.APIURL != "https://env.example/v1/chat/completions" || got.Model != "env-model" || got.APIKey != "sk-env-only" {
 		t.Fatalf("env 兜底失效: %+v", got)
+	}
+}
+
+// TestResolveBudgetsWired §FIX-7(20260919)：Resolve 必须把成本治理三件套与流式空闲阈值
+// 透传给 llm.Config——此前从不输出，客户端永远 0=不限（preFlight 熔断形同虚设）。
+// ①级取运营保存值；无保存时④级回退 config.json rules.llm。
+func TestResolveBudgetsWired(t *testing.T) {
+	t.Run("运营保存优先", func(t *testing.T) {
+		cm, am, uid := newHarness(t)
+		cm.SetLLMConfigFor(uid, &config.LLMConfig{
+			APIURL: "https://p.example/v1", Model: "m",
+			StreamIdleTimeoutSec: 45, DailyCallBudget: 800, DailyTokenBudget: 900000,
+			ConsultDailyCalls: 50,
+		})
+		got := Resolve(cm, am)
+		if got.StreamIdleTimeout != 45*time.Second || got.DailyCallBudget != 800 ||
+			got.DailyTokenBudget != 900000 || got.ConsultDailyCalls != 50 {
+			t.Fatalf("①级预算透传失败: %+v", got)
+		}
+	})
+	t.Run("全局config兜底", func(t *testing.T) {
+		cm, am, _ := newHarness(t)
+		cm.Rules.LLM.StreamIdleTimeoutSec = 30
+		cm.Rules.LLM.DailyCallBudget = 100
+		cm.Rules.LLM.DailyTokenBudget = 20000
+		cm.Rules.LLM.ConsultDailyCalls = 5
+		got := Resolve(cm, am)
+		if got.StreamIdleTimeout != 30*time.Second || got.DailyCallBudget != 100 ||
+			got.DailyTokenBudget != 20000 || got.ConsultDailyCalls != 5 {
+			t.Fatalf("④级预算兜底失败: %+v", got)
+		}
+	})
+	// llm.New 消费端锁死：配置进客户端即生效（0 保持不设限）。
+	c := llm.New(llm.Config{APIKey: "k", StreamIdleTimeout: 45 * time.Second, DailyCallBudget: 800})
+	if c.Timeout() <= 0 { // 冒烟：客户端可构建
+		t.Fatal("New 异常")
 	}
 }
 

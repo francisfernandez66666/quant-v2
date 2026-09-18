@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,24 +24,34 @@ import (
 // Client LLM API 客户端，封装与 SiliconFlow 对话接口的通信。
 // （Client is the LLM API client wrapping communication with the SiliconFlow chat interface.）
 type Client struct {
-	httpClient       *http.Client  // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
-	apiKey           string        // API 密钥（Authorization: Bearer，单 key 兼容字段）
-	apiKeys          []string      // 多 API 密钥（并发请求按 key 轮询分发，突破单 key 限流）
-	keyIdx           uint64        // 轮询分发计数（sync/atomic）
-	apiURL           string        // chat/completions 请求地址
-	model            string        // 模型名称
-	streaming        bool          // 是否启用流式（SSE）响应；false 走一次性非流式
-	idleTimeout      time.Duration // 流式下相邻分片空闲阈值（超过视为卡死）
-	batchConcurrency int           // 批量分析最大并发批次（默认 8）
-	classifierModel  string        // 可选分类专用模型（Stage0/1 等快速分类/初筛，空则用主模型）
+	httpClient *http.Client // HTTP 客户端（超时可配置，默认 60s；禁用 HTTP2 强制走 HTTP1.1）
+	apiKey     string       // API 密钥（Authorization: Bearer，单 key 兼容字段）
+	apiKeys    []string     // 多 API 密钥（并发请求按 key 轮询分发，突破单 key 限流）
+	keyIdx     uint64       // 轮询分发计数（sync/atomic）
+	apiURL     string       // chat/completions 请求地址
+	model      string       // 模型名称
+	streaming  bool         // 是否启用流式（SSE）响应；false 走一次性非流式
+	// idleTimeout 流式"相邻分片空闲"阈值——§FIX-3(20260919) 语义修正：旧实现分片到达从不重置
+	// ticker，该值实为整段硬超时（与注释相反）。现在读循环每收到一行即 Reset，恢复"空闲"本义；
+	// 整段防卡死改由 streamTotalTimeout 独立兜底。
+	idleTimeout time.Duration
+	// streamTotalTimeout 流式响应总时长硬上限（§FIX-3）：即便分片一直在滴，超总限也掐断，
+	// 防"永远在滴"型慢速卡流占住请求与计费。默认 DefaultStreamTotalTimeout。
+	streamTotalTimeout time.Duration
+
+	batchConcurrency int    // 批量分析最大并发批次（默认 8）
+	classifierModel  string // 可选分类专用模型（Stage0/1 等快速分类/初筛，空则用主模型）
 
 	// §GAP5.1 成本治理：当日调用/token 计数与预算熔断。计数原子维护，跨日自动归零。
-	usageDay     atomic.Int64 // 当日戳 yyyymmdd（变更即重置计数）
-	usageCalls   atomic.Int64 // 当日已发请求数
-	usageTokens  atomic.Int64 // 当日 prompt+completion token 总量
-	callBudget   atomic.Int64 // 日调用预算（0=不设限）
-	tokenBudget  atomic.Int64 // 日 token 预算（0=不设限）
-	keyCoolUntil []atomic.Int64
+	usageDay    atomic.Int64 // 当日戳 yyyymmdd（变更即重置计数）
+	usageCalls  atomic.Int64 // 当日已发请求数
+	usageTokens atomic.Int64 // 当日 prompt+completion token 总量
+	callBudget  atomic.Int64 // 日调用预算（0=不设限）
+	tokenBudget atomic.Int64 // 日 token 预算（0=不设限）
+	// §FIX-7(20260919) 咨询单独当日预算计数：全体用户共用运营 key，总预算之外咨询再封顶。
+	consultCalls  atomic.Int64 // 当日咨询调用数
+	consultBudget atomic.Int64 // 咨询日调用预算（0=不设限）
+	keyCoolUntil  []atomic.Int64
 }
 
 // DefaultBatchConcurrency 未显式配置时的批量分析默认并发批次。
@@ -72,9 +83,15 @@ const DefaultTimeout = 60 * time.Second
 const minTotalTimeout = 120 * time.Second
 
 // DefaultStreamIdleTimeout 流式下默认"相邻分片空闲"阈值：超过视为模型卡死。
-// （DefaultStreamIdleTimeout is the default idle threshold between adjacent stream chunks; exceeding
+// §FIX-3(20260919)：该阈值现在是真·空闲（每个分片到达即重置），不再是整段硬超时。
+// （DefaultStreamIdleTimeout is the idle threshold between adjacent stream chunks; exceeding
 // it means the model is considered stuck.）
 const DefaultStreamIdleTimeout = 60 * time.Second
+
+// DefaultStreamTotalTimeout 流式响应总时长硬上限（§FIX-3）：空闲阈值修正后，"每 59s 滴一个
+// 分片、永远滴不完"的慢速卡流不再被误伤为空闲超时，需要独立的总时长兜底，防其占住请求
+// 与计费。默认 300s，可经 Config.StreamTotalTimeout 调整（测试用）。
+const DefaultStreamTotalTimeout = 300 * time.Second
 
 // Timeout 返回客户端单次请求超时时间（供配置校验/展示）。
 // （Timeout returns the client's per-request timeout, for config validation/display.）
@@ -166,6 +183,9 @@ func New(cfg Config) *Client {
 	if cfg.StreamIdleTimeout <= 0 {
 		cfg.StreamIdleTimeout = DefaultStreamIdleTimeout
 	}
+	if cfg.StreamTotalTimeout <= 0 {
+		cfg.StreamTotalTimeout = DefaultStreamTotalTimeout
+	}
 
 	// 响应头等待用 cfg.Timeout（快速探测"不开始生成"）；整体请求超时保底 minTotalTimeout，
 	// 防止收紧后的默认超时误杀推理模型流式长输出（CoT 期间有持续心跳，不依赖总超时兜底）。
@@ -212,18 +232,20 @@ func New(cfg Config) *Client {
 			Timeout:   totalTimeout,
 			Transport: transport,
 		},
-		apiKey:           first,
-		apiKeys:          keys,
-		apiURL:           cfg.APIURL,
-		model:            cfg.Model,
-		streaming:        cfg.Streaming,
-		idleTimeout:      cfg.StreamIdleTimeout,
-		batchConcurrency: bc,
-		classifierModel:  cfg.ClassifierModel,
+		apiKey:             first,
+		apiKeys:            keys,
+		apiURL:             cfg.APIURL,
+		model:              cfg.Model,
+		streaming:          cfg.Streaming,
+		idleTimeout:        cfg.StreamIdleTimeout,
+		streamTotalTimeout: cfg.StreamTotalTimeout,
+		batchConcurrency:   bc,
+		classifierModel:    cfg.ClassifierModel,
 	}
 	c.usageDay.Store(llmToday())
 	c.callBudget.Store(cfg.DailyCallBudget)
 	c.tokenBudget.Store(cfg.DailyTokenBudget)
+	c.consultBudget.Store(cfg.ConsultDailyCalls) // §FIX-7
 	// §S6 多 key 健康度：每 key 独立冷却槽
 	c.keyCoolUntil = make([]atomic.Int64, len(keys))
 	return c
@@ -306,6 +328,14 @@ func (c *Client) SetBudgets(dailyCalls, dailyTokens int64) {
 	c.tokenBudget.Store(dailyTokens)
 }
 
+// SetConsultBudget §FIX-7(20260919) 咨询当日调用预算热更新（0=不设限）。
+func (c *Client) SetConsultBudget(dailyCalls int64) { c.consultBudget.Store(dailyCalls) }
+
+// ErrBudgetExceeded 预算熔断哨兵错误：preFlight/preFlightConsult 超限时以 %w 包裹返回，
+// HTTP 层据此把"当日额度用尽"映射为 429（区别于 500 上游故障），用户看到的是额度文案而非裸堆栈。
+// English: sentinel so handlers can map budget exhaustion to 429 instead of a generic 500.
+var ErrBudgetExceeded = errors.New("LLM 预算已用尽")
+
 // llmToday 返回本地日期戳 yyyymmdd（预算跨日归零依据）。
 func llmToday() int64 {
 	t := time.Now()
@@ -323,20 +353,33 @@ func (c *Client) rollUsageDay() {
 		if c.usageDay.CompareAndSwap(d, today) {
 			c.usageCalls.Store(0)
 			c.usageTokens.Store(0)
+			c.consultCalls.Store(0) // §FIX-7 咨询计数同日归零
 		}
 	}
 }
 
 // preFlight §GAP5.1 预算熔断检查 + 计一次调用。超限返回错误（当日不再发新请求）。
+// §FIX-7：错误以 ErrBudgetExceeded 包装，HTTP 层据此回 429。
 func (c *Client) preFlight() error {
 	c.rollUsageDay()
 	if b := c.callBudget.Load(); b > 0 && c.usageCalls.Load() >= b {
-		return fmt.Errorf("LLM 日调用预算已用尽(%d 次)，次日自动恢复", b)
+		return fmt.Errorf("LLM 日调用预算已用尽(%d 次)，次日自动恢复: %w", b, ErrBudgetExceeded)
 	}
 	if b := c.tokenBudget.Load(); b > 0 && c.usageTokens.Load() >= b {
-		return fmt.Errorf("LLM 日 token 预算已用尽(%d)，次日自动恢复", b)
+		return fmt.Errorf("LLM 日 token 预算已用尽(%d)，次日自动恢复: %w", b, ErrBudgetExceeded)
 	}
 	c.usageCalls.Add(1)
+	return nil
+}
+
+// preFlightConsult §FIX-7(20260919) 咨询单独当日预算检查 + 计数（在总预算之外再封顶）。
+// 计数落本方法而非调用方：进程内咨询只有 ChatMessagesCtx 一个入口，入口收紧一处即可证明完备。
+func (c *Client) preFlightConsult() error {
+	c.rollUsageDay()
+	if b := c.consultBudget.Load(); b > 0 && c.consultCalls.Load() >= b {
+		return fmt.Errorf("咨询日调用预算已用尽(%d 次)，次日自动恢复: %w", b, ErrBudgetExceeded)
+	}
+	c.consultCalls.Add(1)
 	return nil
 }
 
@@ -358,6 +401,9 @@ func (c *Client) UsageStats() map[string]int64 {
 		"tokens":       c.usageTokens.Load(),
 		"call_budget":  c.callBudget.Load(),
 		"token_budget": c.tokenBudget.Load(),
+		// §FIX-7 咨询专属预算观测（设置页/管理端可见缺口）
+		"consult_calls":  c.consultCalls.Load(),
+		"consult_budget": c.consultBudget.Load(),
 	}
 }
 
@@ -493,10 +539,23 @@ const defaultD1MaxTokens = 2048
 // appended—to avoid multi/mid-list system roles corrupting the model context. Like Chat it streams by
 // default and falls back to non-streaming on parse failure.）
 func (c *Client) ChatMessages(messages []Message) (string, error) {
+	return c.ChatMessagesCtx(context.Background(), messages)
+}
+
+// ChatMessagesCtx 带取消语义的多轮对话调用（§FIX-4(20260919)）：调用方 ctx（咨询请求 =
+// r.Context()）取消时，整条链路（退避 sleep → 流式读 → 出呼 HTTP）随之中止，不再出现
+// "用户早已断开、服务端还在为它出呼计费"的悬空请求。
+// English: ctx-aware ChatMessages; cancellation propagates through retry backoff, stream reading
+// and the outbound HTTP request.
+func (c *Client) ChatMessagesCtx(ctx context.Context, messages []Message) (string, error) {
 	if len(c.apiKeys) == 0 {
 		return "", fmt.Errorf("LLM_API_KEY not set")
 	}
-	return c.do(ChatRequest{Model: c.model, Messages: messages})
+	// §FIX-7(20260919)：咨询专属日预算（总预算之外再封顶，超限 ErrBudgetExceeded→429）。
+	if err := c.preFlightConsult(); err != nil {
+		return "", err
+	}
+	return c.doCtx(ctx, ChatRequest{Model: c.model, Messages: messages})
 }
 
 // isTransientLLMError 判定是否值得重试的上游瞬时错误：HTTP 5xx（含 502/503/504，
@@ -532,22 +591,31 @@ func stripThinkTags(s string) string {
 	return s
 }
 
+// do 发起单次对话请求（无 ctx 变体，转发 doCtx(Background)）。
+func (c *Client) do(req ChatRequest) (string, error) {
+	return c.doCtx(context.Background(), req)
+}
+
 // do 发起单次对话请求：优先流式解析，特定失败场景回落到非流式一次性取回。
 // §GAP5.1 入口处执行日预算熔断检查（超限当日拒绝，次日自动恢复）。
 // §固化 2026-09-16：对上游 5xx/网络类失败做最多 2 次补射（1s/3s 退避）——cavoti 等聚合网关
 // 在大上下文+推理模型下 502 偶发（用户实录 17:11 咨询 502），换任何模型网关都不应让
 // 用户直接看到 502。JSON 解析类失败不在此层重试。
+// §FIX-4(20260919)：退避 sleep 改为 ctx 感知——请求已被取消（用户断开咨询）时立刻放弃重试，
+// 不再白占 1~3s 与上游配额。
 // （do sends one chat request with up to 2 extra attempts on transient upstream 5xx/network errors.）
-func (c *Client) do(req ChatRequest) (string, error) {
+func (c *Client) doCtx(ctx context.Context, req ChatRequest) (string, error) {
 	if err := c.preFlight(); err != nil {
 		return "", err
 	}
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		if attempt > 1 {
-			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second) // 1s, 2s…退避（第二次实际 2s）
+			if err := sleepCtx(ctx, time.Duration(1<<(attempt-1))*time.Second); err != nil {
+				return "", err
+			}
 		}
-		content, err := c.doOnce(req)
+		content, err := c.doOnceCtx(ctx, req)
 		if err == nil {
 			return content, nil
 		}
@@ -560,10 +628,30 @@ func (c *Client) do(req ChatRequest) (string, error) {
 	return "", lastErr
 }
 
-// doOnce 执行一次完整请求（流式优先+特定失败回落非流式），供 do 的重试循环调用。
+// sleepCtx 可取消退避：ctx 先结束则返回 ctx.Err()。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// doOnce 执行一次完整请求（流式优先+特定失败回落非流式），供 do 的重试循环调用（无 ctx 变体）。
 func (c *Client) doOnce(req ChatRequest) (string, error) {
+	return c.doOnceCtx(context.Background(), req)
+}
+
+// doOnceCtx 执行一次完整请求（流式优先+特定失败回落非流式），供 doCtx 的重试循环调用。
+func (c *Client) doOnceCtx(ctx context.Context, req ChatRequest) (string, error) {
 	if c.streaming {
-		content, streamErr := c.streamChat(req)
+		content, streamErr := c.streamChatCtx(ctx, req)
 		if streamErr == nil {
 			return stripThinkTags(content), nil
 		}
@@ -571,15 +659,16 @@ func (c *Client) doOnce(req ChatRequest) (string, error) {
 		// （思维链被上游缓冲、无心跳）→ 空闲超时误杀"模型疑似卡死"；同一请求非流式可正常
 		// 完成（实测 200）。空闲超时与"无有效内容"两类失败回落非流式重试一次；其余（网络/
 		// 5xx/已收到分片后中途死亡）仍直接返回交由上层重试，避免重复放大延迟。
-		if strings.Contains(streamErr.Error(), "no response") || strings.Contains(streamErr.Error(), "空闲超时") {
-			if content, err := c.nonStreamChat(req); err == nil {
+		// §FIX-3：回落判定依赖 streamChatCtx 错误文案中的「空闲超时」子串，改文案勿破坏该契约。
+		if ctx.Err() == nil && (strings.Contains(streamErr.Error(), "no response") || strings.Contains(streamErr.Error(), "空闲超时")) {
+			if content, err := c.nonStreamChatCtx(ctx, req); err == nil {
 				log.Printf("LLM 流式无有效内容(%v), 已回落到非流式成功", streamErr)
 				return stripThinkTags(content), nil
 			}
 		}
 		return "", streamErr
 	}
-	return c.nonStreamChat(req)
+	return c.nonStreamChatCtx(ctx, req)
 }
 
 // chatCompletionRequest 透传给上游的完整请求体（ChatRequest 上叠加流式/长度控制参数）。
@@ -592,15 +681,25 @@ type chatCompletionRequest struct {
 	MaxTokens int `json:"max_tokens,omitempty"`
 }
 
-// streamChat 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
+// streamChat 以 SSE 流式读取完整对话响应（无 ctx 变体，转发 streamChatCtx(Background)）。
+func (c *Client) streamChat(req ChatRequest) (string, error) {
+	return c.streamChatCtx(context.Background(), req)
+}
+
+// streamChatCtx 以 SSE 流式读取完整对话响应，返回累加后的最终 content。
 // 累加 delta.content；§PROD-LLM2（2026-09-18 生产实录「no response from LLM」）起 content 全空但
 // reasoning_content 非空时以思维链正文兜底（部分推理模型/网关只填 reasoning 字段），并打日志留痕；
 // 两者皆空时报错携带诊断证据（分片数/finish_reason/usage/原始行摘录），遇 [DONE] 结束。
 // §S5 根修：扫描在独立 goroutine 进行，外层 select 持空闲 ticker——
 // 此前空闲检查只在读到新行时执行，服务端真卡死时 Scan() 永久阻塞、idleTimeout 永不触发
 // （仅剩 http.Client 总超时兜底）；现在无论是否阻塞，空闲阈值到点即关连接返回错误。
-func (c *Client) streamChat(req ChatRequest) (string, error) {
-	body, err := c.post(req, true, 0)
+// §FIX-3(20260919) 语义修正：§S5 的重构遗留了"分片到达永不重置 ticker"的缺陷——idleTimeout
+// 实际是整段硬超时，与注释/配置项本义（相邻分片间隔）相反，慢而正常的长推理流式被误杀。
+// 现在读 goroutine 每收到一行向 progress 通道打一个非阻塞心跳，外层循环收到心跳即 Reset 空闲
+// ticker；"整段不卡死"改由两个独立兜底负责：streamTotalTimeout 总时长硬上限 + ctx 取消。
+// 错误文案保留「空闲超时」子串——doOnce 的流式→非流式回落判定依赖它（llm.go 回落分支）。
+func (c *Client) streamChatCtx(ctx context.Context, req ChatRequest) (string, error) {
+	body, err := c.postCtx(ctx, req, true, 0)
 	if err != nil {
 		return "", err
 	}
@@ -613,6 +712,8 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 		err     error
 	}
 	out := make(chan streamOut, 1)
+	// progress 分片心跳（§FIX-3）：容量 64 + 非阻塞发送，心跳丢失只影响重置精度，绝不阻塞读 goroutine。
+	progress := make(chan struct{}, 64)
 
 	go func() {
 		sc := bufio.NewScanner(body)
@@ -627,6 +728,11 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 		var rawSample strings.Builder // §PROD-LLM2 摘录响应开头若干行（含非 data 行，覆盖"200 但返回非 SSE"）
 		// 逐行解析 SSE 分片：非 data: 前缀跳过，[DONE] 结束，chunk 携带 usage 则记录。
 		for sc.Scan() {
+			// §FIX-3：每读到一行（含 SSE 心跳空行以外的任意行）即上报一次"流仍在滴"。
+			select {
+			case progress <- struct{}{}:
+			default:
+			}
 			line := strings.TrimSpace(sc.Text())
 			if line == "" {
 				continue
@@ -679,12 +785,32 @@ func (c *Client) streamChat(req ChatRequest) (string, error) {
 
 	idle := time.NewTicker(c.idleTimeout)
 	defer idle.Stop()
+	// total §FIX-3 整段硬上限：空闲会 reset、总时长不 reset，兜住"永远在滴"型慢速卡流。
+	total := time.NewTimer(c.streamTotalTimeout)
+	defer total.Stop()
 	var res streamOut
-	select {
-	case res = <-out:
-	case <-idle.C:
-		body.Close() // 关连接解除 goroutine 的 Scan 阻塞（其结果发入带缓冲 channel 后自然退出）
-		return "", fmt.Errorf("流式响应空闲超时(%s): 模型疑似卡死", c.idleTimeout)
+	// 外层循环四条退路：读完(out) / 空闲(idle，收到分片即重置) / 总限(total) / 取消(ctx)。
+	// 后三条均先 body.Close() 解除 goroutine 的 Scan 阻塞——结果发入带缓冲 channel 后自然退出，
+	// 不留 goroutine 悬挂。
+	// English: any of the last three cases closes the body to unblock Scan; the buffered channels
+	// guarantee the reader goroutine exits even after we've returned.
+waitLoop:
+	for {
+		select {
+		case res = <-out:
+			break waitLoop
+		case <-progress:
+			idle.Reset(c.idleTimeout)
+		case <-idle.C:
+			body.Close()
+			return "", fmt.Errorf("流式响应空闲超时(%s): 模型疑似卡死", c.idleTimeout)
+		case <-total.C:
+			body.Close()
+			return "", fmt.Errorf("流式响应总时长超限(%s): 分片持续但未在限内读完，已掐断", c.streamTotalTimeout)
+		case <-ctx.Done():
+			body.Close()
+			return "", ctx.Err()
+		}
 	}
 	if res.err != nil {
 		return "", res.err
@@ -757,10 +883,14 @@ func usageText(u *llmUsage) string {
 	return fmt.Sprintf("prompt=%d/completion=%d/total=%d", u.PromptTokens, u.CompletionTokens, u.TotalTokens)
 }
 
-// nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用）。
+// nonStreamChat 非流式一次性取回完整响应（回落/关闭流式时使用，无 ctx 变体）。
 // （nonStreamChat fetches the full response in one non-streaming call (used on fallback/streaming off).）
 func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
-	return c.nonStreamChatMax(req, defaultNonStreamMaxTokens)
+	return c.nonStreamChatCtx(context.Background(), req)
+}
+
+func (c *Client) nonStreamChatCtx(ctx context.Context, req ChatRequest) (string, error) {
+	return c.nonStreamChatMaxCtx(ctx, req, defaultNonStreamMaxTokens)
 }
 
 // defaultNonStreamMaxTokens 非流式调用的默认 max_tokens（防超长输出触发上游 504/截断）。
@@ -772,7 +902,11 @@ const defaultNonStreamMaxTokens = 4096
 // (§speed S3: D1 scoring emits structured JSON needing no long chain-of-thought, so capping length cuts
 // per-stock latency).
 func (c *Client) nonStreamChatMax(req ChatRequest, maxTokens int) (string, error) {
-	body, err := c.post(req, false, maxTokens)
+	return c.nonStreamChatMaxCtx(context.Background(), req, maxTokens)
+}
+
+func (c *Client) nonStreamChatMaxCtx(ctx context.Context, req ChatRequest, maxTokens int) (string, error) {
+	body, err := c.postCtx(ctx, req, false, maxTokens)
 	if err != nil {
 		return "", err
 	}
@@ -816,14 +950,24 @@ func (c *Client) nonStreamChatMax(req ChatRequest, maxTokens int) (string, error
 	return stripThinkTags(content), nil
 }
 
-// post 构造并发送 chat/completions 请求，返回可读响应体。非 2xx 状态码读响应体构造错误。
+// post 构造并发送 chat/completions 请求（无 ctx 变体，转发 postCtx(Background)）。
+func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadCloser, error) {
+	return c.postCtx(context.Background(), req, stream, maxTokens)
+}
+
+// postCtx 构造并发送 chat/completions 请求，返回可读响应体。非 2xx 状态码读响应体构造错误。
 // stream=true 时请求带 stream 参数且不设 max_tokens（避免截断思维链/长输出，靠空闲看门狗防卡死）；
 // 非流式时设 max_tokens 兜底，防超长输出触发上游 504/截断。
-// （post builds and sends the chat/completions request, returning a readable response body. Non-2xx
-// status codes are turned into errors from the response body. With stream=true the request carries the
-// stream flag and no max_tokens (to avoid truncating chain-of-thought/long output; the idle watchdog
-// guards against stalls); non-streaming sets max_tokens as a guard against upstream 504/truncation.）
-func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadCloser, error) {
+// §FIX-4(20260919) 两处根修：
+//  1. 连接泄漏：旧实现在非 2xx 分支 io.ReadAll(resp.Body) 后直接 return，从不 Close——错误响应
+//     每一发就漏一条 HTTP 连接（HTTP1.1 强制不复用放大此问题），盘中高频失败会耗尽本地端口。
+//     现在读取截断到 4KB（错误体只需给人看的摘录）并显式 Close。
+//  2. ctx 断链：旧实现用裸 http.NewRequest，请求无法随调用方（如咨询请求被客户端断开）取消。
+//     现在 NewRequestWithContext，ctx 取消即中止出呼、释放连接。
+//
+// （English: postCtx binds the outbound request to ctx and closes/limits the error-response body —
+// the old non-2xx branch leaked the connection on every failed call and ignored cancellation.）
+func (c *Client) postCtx(ctx context.Context, req ChatRequest, stream bool, maxTokens int) (io.ReadCloser, error) {
 	payload := chatCompletionRequest{
 		ChatRequest: req,
 		Stream:      stream,
@@ -833,7 +977,10 @@ func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadClose
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequest("POST", c.apiURL, bytes.NewReader(data))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.apiURL, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -846,7 +993,9 @@ func (c *Client) post(req ChatRequest, stream bool, maxTokens int) (io.ReadClose
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(resp.Body)
+		// §FIX-4 错误分支必须 Close：先掐成 4KB 摘录再关，供逐把 key 探测/日志使用。
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
 		// §S6 健康度记忆：按状态给该 key 记冷却（429 优先读 Retry-After）
 		c.markKeyStatus(key, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")))
 		return nil, fmt.Errorf("LLM API 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))

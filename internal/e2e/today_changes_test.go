@@ -4,6 +4,7 @@
 package e2e
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,7 +26,7 @@ func loadTodayFixture(t *testing.T) *Fixture {
 // todayConsult 驱动专业模式咨询并返回注入的 system prompt（最后一个 consult 请求）。
 func todayConsult(t *testing.T, rig *testRig, msg string, proMode bool) string {
 	t.Helper()
-	if _, err := rig.eng.ConsultLLM("tester", msg, proMode); err != nil {
+	if _, err := rig.eng.ConsultLLM(context.Background(), "tester", msg, proMode); err != nil {
 		t.Fatalf("ConsultLLM(%q): %v", msg, err)
 	}
 	if len(rig.calls.consult) == 0 {
@@ -40,7 +41,7 @@ func TestConsultProModeInjectsRealData(t *testing.T) {
 	defer func() { data.DisableAll = false }()
 
 	rig := newTestEngine(t, loadTodayFixture(t))
-	got, err := rig.eng.ConsultLLM("tester", "卧龙电驱(600580) 今天主力净流入多少？", true)
+	got, err := rig.eng.ConsultLLM(context.Background(), "tester", "卧龙电驱(600580) 今天主力净流入多少？", true)
 	if err != nil {
 		t.Fatalf("ConsultLLM: %v", err)
 	}
@@ -296,7 +297,7 @@ func TestConsultHistoryLimitedTo6Rounds(t *testing.T) {
 	rig := newTestEngine(t, loadTodayFixture(t))
 	// 连续 8 轮咨询填充历史（每轮写入 1 条 user + 1 条 assistant，共 16 条历史）
 	for i := 0; i < 8; i++ {
-		if _, err := rig.eng.ConsultLLM("tester", "第"+string(rune('A'+i))+"轮问题", false); err != nil {
+		if _, err := rig.eng.ConsultLLM(context.Background(), "tester", "第"+string(rune('A'+i))+"轮问题", false); err != nil {
 			t.Fatalf("第%d轮 ConsultLLM: %v", i, err)
 		}
 	}

@@ -895,11 +895,10 @@ func (e *Engine) syncAccountConfig() {
 		// ApplyPendingConfig 消费（重建 executor）。防止休市时配置立即翻转实盘行为。
 		c.QueueConfigUpdate(q)
 	}
-	// §GAP5.1 LLM 成本治理：日预算热同步（0=不设限）。
-	if c := e.LLMClient(); c != nil {
-		lc := cfgMgr.GetRulesFor(userID).LLM
-		c.SetBudgets(lc.DailyCallBudget, lc.DailyTokenBudget)
-	}
+	// §GAP5.1→§FIX-7(20260919)：日预算同步已从打分循环移除——LLM 客户端是进程级共享实例，
+	// 各引擎按自己的 userRules 反复 SetBudgets 会互相覆盖（谁最后刷分谁说了算，且咨询/
+	// 共享路径可能整体跳过，见旧守卫 engine.go:858）。预算现由配置装配（llmcfg.Resolve→New）
+	// 与热更新（main.go SetLLMRecreate→SetBudgets）两条必经路径统一写入。
 }
 
 // SetNotifier 设置推送器（P1 清仓/止损强提醒走桌面/Webhook）。
@@ -2268,7 +2267,9 @@ const consultHistoryLimit = 6
 // ConsultLLM 以多轮对话方式调用 LLM 生成咨询回复（股票咨询页使用）。
 // 组装顺序：唯一一条 system（角色提示词，专业模式时并入实时行情数据）→ 历史最近 N 条 → 当前提问。
 // LLM 未配置时返回错误提示前端引导配置；回复生成后同步追加到当日对话历史（跨交易日自动清空）。
-func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error) {
+// §FIX-4(20260919)：首参改为请求 ctx（handleConsult 传 r.Context()）——用户断开/超时取消后，
+// 出呼链（退避→流式读→HTTP）随之中止，不再悬空计费。
+func (e *Engine) ConsultLLM(ctx context.Context, userID, userMsg string, proMode bool) (string, error) {
 	e.mu.RLock()
 	client := e.llmClient
 	e.mu.RUnlock()
@@ -2281,8 +2282,8 @@ func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error
 	// proMode 仅追加更定量化/结构化的深度分析风格要求。未识别到个股时给 noStock 提示词，
 	// 引导模型如实说明无数据、不编造。
 	system := llm.ConsultSystemPrompt()
-	if ctx := e.buildConsultContext(userMsg); ctx != "" {
-		system += "\n\n" + ctx
+	if dataCtx := e.buildConsultContext(userMsg); dataCtx != "" {
+		system += "\n\n" + dataCtx
 	} else {
 		system += "\n\n" + consultNoStockPrompt
 	}
@@ -2306,9 +2307,11 @@ func (e *Engine) ConsultLLM(userID, userMsg string, proMode bool) (string, error
 	// 完整消息序列：system 在最前，后接历史与当前提问。
 	msgs := append([]llm.Message{{Role: "system", Content: system}}, messages...)
 
-	reply, err := client.ChatMessages(msgs)
+	reply, err := client.ChatMessagesCtx(ctx, msgs)
 	if err != nil {
-		return "", fmt.Errorf("咨询调用失败: %v", err)
+		// %w 保留错误链：handleConsult 用 errors.Is(err, llm.ErrBudgetExceeded) 区分"额度用尽(429)"
+		// 与上游故障(500)。用 %v 会截断链路，429 语义静默退化为 500。
+		return "", fmt.Errorf("咨询调用失败: %w", err)
 	}
 
 	// 数字审计：剔除模型编造、没有任何可信出处的金钱/数量类数字（金额、成交量、笔数等）。

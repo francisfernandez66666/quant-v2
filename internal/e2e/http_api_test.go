@@ -421,7 +421,7 @@ func TestHTTPConsultHistory(t *testing.T) {
 	}
 
 	// 引擎驱动一条咨询
-	if _, err := hr.rig.eng.ConsultLLM("tester", "你好", true); err != nil {
+	if _, err := hr.rig.eng.ConsultLLM(context.Background(), "tester", "你好", true); err != nil {
 		t.Fatalf("ConsultLLM: %v", err)
 	}
 

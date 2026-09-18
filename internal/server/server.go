@@ -42,6 +42,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"log"
@@ -62,6 +63,7 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
+	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
@@ -93,7 +95,8 @@ type EngineController interface {
 	ClearMessages()
 	DeleteMessage(id string)
 	RefreshMessageName(code, name string)
-	ConsultLLM(userID, userMsg string, proMode bool) (string, error)
+	// ConsultLLM §FIX-4(20260919)：首参为请求 ctx（r.Context()），用户断开即中止出呼链。
+	ConsultLLM(ctx context.Context, userID, userMsg string, proMode bool) (string, error)
 	GetConsultHistoryFor(userID string) []data.ConsultMessage // §GAP2-W2 按账号隔离的咨询历史
 	ClearConsultHistoryFor(userID string)                     // §GAP2-W2 只清本人的
 	// DashboardData 返回该账号/引擎的当前看板快照（信号/评分/新闻事件/开关状态等）。
@@ -168,7 +171,11 @@ type Server struct {
 	// llmLastGood 最后一次**经验证可用**的运行时配置快照：一键回滚的目标。
 	// 与 lastApplied 分开维护——正是"force 强行应用了未验证配置"这条路径才需要回滚。
 	llmLastGood *llmSnapshot
-	limiter     ipLimiter // §A4 匿名端点 IP 频控（register/temp/login/setup）
+	// consultInflight §FIX-4(20260919) 每用户咨询并发闸门（uid → struct{}）：一次咨询出呼
+	// 可长达分钟级，同一用户连点发送会让多条出呼并行（费用×N、且共用会话历史互相污染）。
+	// busy 时第二个请求直接 429，回复落定（defer）即释放。
+	consultInflight sync.Map
+	limiter         ipLimiter // §A4 匿名端点 IP 频控（register/temp/login/setup）
 	// tenantLimiter §MT 租户级业务 API 频控：key=租户 ID，窗口 1 分钟，
 	// 上限取租户配额 Quota.APIRatePerMin（0=默认 600/min）。
 	tenantLimiter ipLimiter
@@ -2216,8 +2223,28 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 	// 反而是产品缺陷；外部接口消耗由引擎侧按代码 60s 块缓存兜底（engine.buildStockBlock）。
 	// consultProModeRateLimited/lastUsed 仅作历史留档保留，不再参与请求路径。
 
-	reply, err := c.ConsultLLM(userID, req.Message, proMode)
+	// §FIX-4(20260919) 每用户 in-flight=1：一次出呼分钟级，连点发送=并行多条计费 + 共用历史
+	// 互相污染。与"刷调用"的 12/min 频控正交——这条兜的是"同时"，那条兜的是"频次"。
+	if _, busy := s.consultInflight.LoadOrStore(userID, struct{}{}); busy {
+		writeError(w, 429, "上一条咨询仍在处理中，请等待回复完成后再发送")
+		return
+	}
+	defer s.consultInflight.Delete(userID)
+
+	// §FIX-4(20260919)：传 r.Context()——用户断开/页面刷新即中止出呼链（退避/流式读/HTTP）。
+	reply, err := c.ConsultLLM(r.Context(), userID, req.Message, proMode)
 	if err != nil {
+		if r.Context().Err() != nil {
+			// 客户端已断开，写响应只是徒劳，如实留痕即可。
+			log.Printf("[consult] 请求被取消（用户断开）: uid=%s err=%v", userID, err)
+			return
+		}
+		// §FIX-7(20260919)：预算熔断与上游故障分流——"当日额度用尽"是配额语义（429 +
+		// 次日自动恢复），不该混进 500 让用户以为是系统坏了。
+		if errors.Is(err, llm.ErrBudgetExceeded) {
+			writeError(w, 429, err.Error())
+			return
+		}
 		writeError(w, 500, err.Error())
 		return
 	}

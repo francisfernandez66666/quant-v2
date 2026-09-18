@@ -52,6 +52,12 @@ func Resolve(cfgMgr *config.Manager, authMgr *auth.Manager) llm.Config {
 		llmCfg.Streaming = saved.StreamingEnabled()
 		llmCfg.BatchConcurrency = saved.BatchConcurrency
 		llmCfg.ClassifierModel = saved.ClassifierModel
+		// §FIX-7(20260919) 成本熔断接线：预算/空闲阈值必须随启动装配与热重建抵达
+		// llm.New——此前 Resolve 从不透出这三项，客户端永远 0=不限（preFlight 形同虚设）。
+		llmCfg.StreamIdleTimeout = time.Duration(saved.StreamIdleTimeoutSec) * time.Second
+		llmCfg.DailyCallBudget = saved.DailyCallBudget
+		llmCfg.DailyTokenBudget = saved.DailyTokenBudget
+		llmCfg.ConsultDailyCalls = saved.ConsultDailyCalls
 		// 运营账号的多 key（设置页保存形态：逗号分隔存 auth 配置）
 		if v, ok := authMgr.GetConfig(adminID, "llm_api_keys"); ok && v != "" {
 			llmCfg.APIKeys = splitKeys(v)
@@ -101,6 +107,20 @@ func Resolve(cfgMgr *config.Manager, authMgr *auth.Manager) llm.Config {
 	}
 	if llmCfg.ClassifierModel == "" {
 		llmCfg.ClassifierModel = cfgMgr.Rules.LLM.ClassifierModel
+	}
+	// §FIX-7(20260919) 预算/空闲阈值的④级兜底：运营没在设置页保存过这些项时，
+	// 沿用 config.json rules.llm 的同名字段（与超时/并发同一口径的逐级回退链）。
+	if llmCfg.StreamIdleTimeout <= 0 {
+		llmCfg.StreamIdleTimeout = time.Duration(cfgMgr.Rules.LLM.StreamIdleTimeoutSec) * time.Second
+	}
+	if llmCfg.DailyCallBudget <= 0 {
+		llmCfg.DailyCallBudget = cfgMgr.Rules.LLM.DailyCallBudget
+	}
+	if llmCfg.DailyTokenBudget <= 0 {
+		llmCfg.DailyTokenBudget = cfgMgr.Rules.LLM.DailyTokenBudget
+	}
+	if llmCfg.ConsultDailyCalls <= 0 {
+		llmCfg.ConsultDailyCalls = cfgMgr.Rules.LLM.ConsultDailyCalls
 	}
 	// 主 key 兼容字段：日志脱敏等单 key 语义仍指向首把
 	if len(llmCfg.APIKeys) > 0 {
