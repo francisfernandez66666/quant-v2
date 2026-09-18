@@ -236,17 +236,21 @@ func TestConsultMoneyFlow(t *testing.T) {
 	}
 }
 
-// TestConsultTimeInjected 注入上下文带数据抓取时间戳（今日）。
+// TestConsultTimeInjected 注入上下文带数据抓取时间戳，且与引擎时钟一致。
 func TestConsultTimeInjected(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
 	rig := newTestEngine(t, loadTodayFixture(t))
 	ctx := todayConsult(t, rig, "600580 今天怎么样？", true)
-	now := time.Now().Format("2006-01-02")
-	// §生产 2026-09-16 头部文案改为「抓取时间」（强化"本次实时抓取"语义），断言同步。
-	if !strings.Contains(ctx, "抓取时间 "+now) {
-		t.Errorf("context 应含今日时间戳 %q\n---context---\n%s", now, ctx)
+	// §FIX-9f(20260919 批五)：头部时间戳改走引擎时钟 nowTime()（不再读真实墙钟），盘中判定
+	// 同源受控。rig 注入固定时刻=交易日 2026-08-04 10:30，断言与注入时钟对齐并命中盘中口径文案。
+	want := time.Date(2026, 8, 4, 10, 30, 0, 0, time.FixedZone("CST", 8*3600)).Format("2006-01-2 15:04:05")
+	if !strings.Contains(ctx, "抓取时间 "+want) {
+		t.Errorf("context 应含引擎时钟时间戳 %q\n---context---\n%s", want, ctx)
+	}
+	if !strings.Contains(ctx, "即最新盘中实测数据") {
+		t.Errorf("固定时刻为盘中，头部应为盘中口径文案\n---context---\n%s", ctx)
 	}
 }
 
@@ -348,5 +352,31 @@ func TestConsultNetInflowMissingHint(t *testing.T) {
 	ctx := rig.calls.consult[len(rig.calls.consult)-1]
 	if !strings.Contains(ctx, "数据源未返回") {
 		t.Errorf("净流入缺失时应提示数据源未返回\n---context---\n%s", ctx)
+	}
+}
+
+// TestConsultNetInflowTrueZero §FIX-9e(20260919 批五)：东财**真返回 0**（f62=0，买卖完全对冲）
+// 是合法实测值，必须输出"主力净流入 0.00万元"，不得再借 NetInflow==0 误报"数据源未返回"
+// ——旧口径诱导模型答"没有数据"，把真 0 当成缺数。
+func TestConsultNetInflowTrueZero(t *testing.T) {
+	data.DisableAll = true
+	defer func() { data.DisableAll = false }()
+
+	fix := loadTodayFixture(t)
+	fix2 := *fix
+	// 显式给 600580 注入 f62=0（fixture 其他票不受影响），与"字段缺失"形态严格区分。
+	fix2.NetInflows = map[string]float64{"600580": 0}
+
+	rig := newTestEngine(t, &fix2)
+	_ = todayConsult(t, rig, "卧龙电驱(600580) 今天主力净流入多少？", true)
+	if len(rig.calls.consult) == 0 {
+		t.Fatal("mock 未记录咨询")
+	}
+	ctx := rig.calls.consult[len(rig.calls.consult)-1]
+	if !strings.Contains(ctx, "主力净流入 0.00万元") {
+		t.Errorf("真 0 应如实输出 0.00万元\n---context---\n%s", ctx)
+	}
+	if strings.Contains(ctx, "数据源未返回") {
+		t.Errorf("真 0 不得误报缺数\n---context---\n%s", ctx)
 	}
 }

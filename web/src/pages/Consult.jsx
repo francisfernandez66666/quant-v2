@@ -107,8 +107,9 @@ export default function Consult() {
     } catch (e) {
       // 请求失败：追加错误消息到聊天列表
       setMessages((m) => [...m, { role: 'assistant', content: '⚠️ ' + (e.message || '咨询失败'), time: new Date().toISOString() }])
-      // 错误信息包含 LLM_API_KEY 或配置关键字时，标记需要配置
-      if ((e.message || '').includes('LLM_API_KEY') || (e.message || '').includes('配置')) {
+      // §FIX-9d(20260919)：改按后端机读错误码判定"未配置"，不再拿 message 猜"配置"关键字
+      // （旧逻辑任何含"配置"二字的错误——如"上游模型服务拒绝了请求…核查配置"——都会误弹配置卡）。
+      if (e.code === 'llm_not_configured') {
         setLlmConfigured(false)
       }
     } finally {
@@ -152,11 +153,15 @@ export default function Consult() {
   }
 
   // 清空后端咨询历史记录
+  // §FIX-9g(20260919)：先服务端确认、后清屏——后端引擎缺失已改回 503（不再假 ok），
+  // 失败时保留消息并给出可见提示，杜绝"界面清空、刷新复活"的分裂态。
   async function onClear() {
     try {
       await api.clearConsultHistory()
       setMessages([])
-    } catch (_) {}
+    } catch (e) {
+      setMessages((m) => [...m, { role: 'assistant', content: '⚠️ 清空失败：' + (e.message || '服务端未确认') + '（历史仍在，请稍后重试）', time: new Date().toISOString() }])
+    }
   }
 
   // 初始化：加载 LLM 配置、专业模式与历史记录
@@ -247,7 +252,9 @@ export default function Consult() {
       <div className="toolbar" style={{ justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
         <SectionLabel>股票咨询</SectionLabel>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <label className="muted" title="开启后咨询将注入该股全部实时行情（现价/净流入/大单明细/均线/MACD/策略信号）。盘中每 15 分钟限流一次，盘前盘后不限。" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+          {/* §FIX-9a(20260919)：提示语删除"盘中每 15 分钟限流一次"承诺——该限流早已随
+              "带数据咨询改默认能力"（§生产 20260916）整体移除，UI 继续承诺会误导用户等待。 */}
+          <label className="muted" title="开启后咨询将注入该股全部实时行情（现价/净流入/大单明细/均线/MACD/策略信号）。" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
             <ToggleSw checked={proMode} disabled={proModeSaving} onChange={onToggleProMode} />
             专业模式
           </label>

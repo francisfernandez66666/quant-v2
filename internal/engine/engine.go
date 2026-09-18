@@ -2621,10 +2621,19 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 	var sb strings.Builder
 	// §生产 20260916 头部语义强化：明确"本块=本次提问时刻实时抓取的最新数据"，杜绝模型把
 	// 对话历史里的旧数据误当成"手头只有的批次"（18:00 咨询实录）。
+	// §FIX-9f(20260919)：新鲜度口径必须诚实——"实时抓取"只说明取数动作发生在此刻；
+	// 非交易时段（夜间/周末/节假日）交易所返回的是最近收盘价，让模型说"最新盘中数据"
+	// 就是误导。按交易日历判定，非盘中改口"最近收盘口径"，模型据此措辞。
+	now := e.nowTime() // §FIX-9f：走引擎时钟（测试/演练可注入固定时刻），盘中判定同样受控
+	freshness := "即最新盘中实测数据，直接引用作答即可"
+	if !data.IsTradeTime(now) {
+		freshness = "当前非交易时段，以下为最近收盘/最后更新口径——请向用户说明数据截止口径，勿表述为实时盘口"
+	}
 	sb.WriteString("以下是本次提问时刻【实时抓取】的股票行情实测数据（抓取时间 " +
-		time.Now().Format("2006-01-2 15:04:05") + "，即最新数据，直接引用作答即可）：\n")
+		now.Format("2006-01-2 15:04:05") + "，" + freshness + "）：\n")
 	sb.WriteString("【要求】仅可引用下列提供的数据与对话历史；未提供的信息（如同板块个股、期指贴水、撤单、盘口等）如实说明" +
-		"无法获取，严禁编造净流入/成交量/涨跌/触发等任何具体数字；净流入口径=主力(超大单+大单)，东方财富。\n")
+		"无法获取，严禁编造净流入/成交量/涨跌/触发等任何具体数字；净流入口径=主力(超大单+大单)，东方财富；" +
+		"资金明细/净流入均为抓取当日累计口径（非盘中即时增量），引用时须带【当日累计】限定。\n")
 
 	for _, code := range order {
 		sb.WriteString(e.buildStockBlock(code, codes[code]))
@@ -2760,7 +2769,9 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 			si.Price, si.ChangePct, dirWord, math.Abs(si.ChangePct), si.Open, si.High, si.Low, si.Close))
 		b.WriteString(fmt.Sprintf("成交量 %.0f股 成交额%.0f元 换手率 %.2f%%\n",
 			si.Volume, si.Amount, si.Turnover))
-		if si.NetInflow != 0 {
+		// §FIX-9e(20260919)：判"缺数"必须看 HasFlow——东财真返回 0（买卖完全对冲）是合法
+		// 实测值，旧口径 NetInflow==0 一律说"数据源未返回"，诱导模型答"没有数据"。
+		if si.HasFlow {
 			b.WriteString(fmt.Sprintf("主力净流入 %.2f万元\n", si.NetInflow/1e4))
 		} else {
 			b.WriteString("主力净流入: 数据源未返回（无法获取该字段，请勿编造）\n")

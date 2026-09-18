@@ -336,6 +336,25 @@ func (c *Client) SetConsultBudget(dailyCalls int64) { c.consultBudget.Store(dail
 // English: sentinel so handlers can map budget exhaustion to 429 instead of a generic 500.
 var ErrBudgetExceeded = errors.New("LLM 预算已用尽")
 
+// ErrNoAPIKey 未配置任何 API Key 的哨兵错误（§FIX-9d）：消息与旧裸串完全一致
+// （"LLM_API_KEY not set"，兼容关键字匹配的历史消费方），但允许 HTTP 层 errors.Is
+// 机读分流为"依赖未配置"（503 + llm_not_configured），不再混入 500。
+// English: sentinel for missing API keys; message kept byte-identical to the legacy string.
+var ErrNoAPIKey = errors.New("LLM_API_KEY not set")
+
+// UpstreamError 上游供应商返回非 2xx 的结构化错误（§FIX-9d）：Status 供 HTTP 层按
+// 语义归类（429/5xx→503 可重试，其余 4xx→502），Detail 保留原始响应摘录仅供日志——
+// 外发文案不再直出上游 body（可能含 URL/密钥回显）。Error() 与旧消息串逐字一致。
+// English: typed upstream-HTTP failure; status for handler classification, detail for logs only.
+type UpstreamError struct {
+	Status int    // 上游 HTTP 状态码
+	Detail string // 上游响应摘录（仅供日志，勿直出客户端）
+}
+
+func (e *UpstreamError) Error() string {
+	return fmt.Sprintf("LLM API 返回 %d: %s", e.Status, e.Detail)
+}
+
 // llmToday 返回本地日期戳 yyyymmdd（预算跨日归零依据）。
 func llmToday() int64 {
 	t := time.Now()
@@ -467,7 +486,7 @@ type llmUsage struct {
 // upstream API failure/timeout let callers retry or fall back.）
 func (c *Client) Chat(system, user string) (string, error) {
 	if len(c.apiKeys) == 0 {
-		return "", fmt.Errorf("LLM_API_KEY not set") // 未配置任何 key，直接报错
+		return "", ErrNoAPIKey // 未配置任何 key，直接报错（§FIX-9d 哨兵化，消息不变）
 	}
 
 	req := ChatRequest{
@@ -512,7 +531,7 @@ func (c *Client) ChatClassifier(system, user string) (string, error) {
 // non-streaming path hardcoded 4096).
 func (c *Client) ChatD1(system, user string, maxTokens int) (string, error) {
 	if len(c.apiKeys) == 0 {
-		return "", fmt.Errorf("LLM_API_KEY not set")
+		return "", ErrNoAPIKey // 未配置任何 key，直接报错（§FIX-9d 哨兵化，消息不变）
 	}
 	if maxTokens <= 0 {
 		maxTokens = defaultD1MaxTokens // 未显式指定时用默认 D1 输出上限
@@ -549,7 +568,7 @@ func (c *Client) ChatMessages(messages []Message) (string, error) {
 // and the outbound HTTP request.
 func (c *Client) ChatMessagesCtx(ctx context.Context, messages []Message) (string, error) {
 	if len(c.apiKeys) == 0 {
-		return "", fmt.Errorf("LLM_API_KEY not set")
+		return "", ErrNoAPIKey // 未配置任何 key，直接报错（§FIX-9d 哨兵化，消息不变）
 	}
 	// §FIX-7(20260919)：咨询专属日预算（总预算之外再封顶，超限 ErrBudgetExceeded→429）。
 	if err := c.preFlightConsult(); err != nil {
@@ -998,7 +1017,7 @@ func (c *Client) postCtx(ctx context.Context, req ChatRequest, stream bool, maxT
 		resp.Body.Close()
 		// §S6 健康度记忆：按状态给该 key 记冷却（429 优先读 Retry-After）
 		c.markKeyStatus(key, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")))
-		return nil, fmt.Errorf("LLM API 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return nil, &UpstreamError{Status: resp.StatusCode, Detail: strings.TrimSpace(string(msg))}
 	}
 	return resp.Body, nil
 }
@@ -1498,7 +1517,7 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 // The startup sequence pings before pre-market news analysis to surface key/network issues early.）
 func (c *Client) Ping() error {
 	if len(c.apiKeys) == 0 {
-		return fmt.Errorf("LLM_API_KEY not set")
+		return ErrNoAPIKey // §FIX-9d 哨兵化，消息不变
 	}
 	// 发起一次最小成本请求（单 token 非流式）探测 API 连通性。
 	// §UI-AUTHORITATIVE 修复：超时从硬编码 10s 改为客户端自身超时（≥60s）——推理模型
@@ -1535,7 +1554,7 @@ func (c *Client) Ping() error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("LLM API 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return &UpstreamError{Status: resp.StatusCode, Detail: strings.TrimSpace(string(msg))}
 	}
 	return nil
 }

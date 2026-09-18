@@ -410,3 +410,40 @@ func TestMockOversellReject(t *testing.T) {
 		t.Fatalf("合法卖出回补现金应 %.2f, got %.2f", want, got)
 	}
 }
+
+// TestMockAdminBrokerSwitch §FIX-9j：/admin/broker 切换 + /health 回读对齐实网关契约。
+// 此前 mock 无该路由（404），双通道切换链路在 e2e/演练栈完全测不到。
+func TestMockAdminBrokerSwitch(t *testing.T) {
+	h, b, _ := newTestGateway()
+	// /health 免鉴权，默认 active=xt 且带 BrokerStatus() 解析所需字段
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	var hs map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &hs); err != nil {
+		t.Fatalf("/health 非法 json: %v", err)
+	}
+	if hs["broker"] != "xt" || hs["broker_mode"] != "xt" || hs["xt_connected"] != true || hs["queued_connected"] != true {
+		t.Fatalf("/health 初始应报 xt 双通道在线, got %+v", hs)
+	}
+	// 切到 queued（携带鉴权，与实网关 admin 面一致）
+	code, resp := post(t, h, "/admin/broker", `{"broker":"queued"}`)
+	if code != 200 || resp["ok"] != true || resp["broker"] != "queued" {
+		t.Fatalf("切换 queued 应 200 ok, got %d %+v", code, resp)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	_ = json.Unmarshal(rec.Body.Bytes(), &hs)
+	if hs["broker"] != "queued" {
+		t.Fatalf("切换后 /health 应回读 queued, got %+v", hs)
+	}
+	// 非法值 400（对齐网关 "broker must be one of"），且不改状态
+	code, resp = post(t, h, "/admin/broker", `{"broker":"nope"}`)
+	if code != http.StatusBadRequest || resp["ok"] != false {
+		t.Fatalf("非法通道应 400 ok=false, got %d %+v", code, resp)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeBroker != "queued" {
+		t.Fatalf("非法切换不得改状态, got %s", b.activeBroker)
+	}
+}

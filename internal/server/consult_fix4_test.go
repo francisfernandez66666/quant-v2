@@ -128,9 +128,17 @@ func TestConsultBudgetMapsTo429(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || !strings.Contains(body["error"], "预算") {
 		t.Fatalf("429 响应应含额度文案: %s", rec.Body.String())
 	}
+	// §FIX-9d(20260919)：错误体必须带机读 code，前端免关键字猜测。
+	if body["code"] != "consult_budget_exceeded" {
+		t.Fatalf("429 应带 code=consult_budget_exceeded, got %q", body["code"])
+	}
+	// §FIX-9d：上游 5xx 故障不再 500 直出原始串——归类 503（可重试）+ 脱敏文案 + code。
 	rec2 := doConsult(newConsultServer(t, &consultCtrl{mode: "fail"}), consultRequest("u_a"))
-	if rec2.Code != http.StatusInternalServerError {
-		t.Fatalf("上游 502 类故障应 500, got %d", rec2.Code)
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("上游 502 类故障应 503（§FIX-9d 分流）, got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	if b := rec2.Body.String(); !strings.Contains(b, "上游模型服务暂不可用") || strings.Contains(b, "bad gateway") {
+		t.Fatalf("503 应为脱敏归类文案且不含上游原始串: %s", b)
 	}
 }
 

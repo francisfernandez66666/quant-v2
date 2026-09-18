@@ -472,11 +472,12 @@ const stockQuoteFields = "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f55,f57,f58,f6
 // 结果按 quoteTTL 短期缓存，同一股票在窗口内的重复请求直接命中缓存。
 // 东财 push2 接口返回的价格字段（F43/F44/F45/F46/F60）单位为分，需 ÷100 转换为元。
 // 返回 StockInfo，包含名称、价格、涨跌幅、成交量、换手率、主力净流入等。
-// 注：主力净流入（NetInflow）仅东财提供，新浪/腾讯命中时该字段为 0（buildStockBlock 已按 0 判空处理）。
+// 注：主力净流入（NetInflow）仅东财提供且以 HasFlow 显式标注（§FIX-9e）；新浪/腾讯命中时
+// HasFlow=false（缺数），东财返回真 0 时 HasFlow=true——消费方判"源未返回"必须看 HasFlow，不得再以 0 判空。
 // GetRealtimeQuote returns a realtime quote via the §S4 chain Sina→Tencent→EastMoney (EastMoney last as
 // the final fallback). Results are cached for quoteTTL; prices from EastMoney come back in cents (/100).
-// NetInflow (main-force flow) is only provided by EastMoney — Sina/Tencent hits leave it 0 (buildStockBlock
-// already treats 0 as "source did not return the field").
+// NetInflow (main-force flow) is only provided by EastMoney, flagged by HasFlow (§FIX-9e): Sina/Tencent
+// hits leave HasFlow=false; consumers must check HasFlow, never treat 0 as "missing".
 func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 	code = stripSuffix(code)
 	if c, ok := m.quoteHit(code); ok {
@@ -715,21 +716,21 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	}
 	var raw struct {
 		Data struct {
-			F43  float64 `json:"f43"`  // 当前价（分）
-			F44  float64 `json:"f44"`  // 最高（分）
-			F45  float64 `json:"f45"`  // 最低（分）
-			F46  float64 `json:"f46"`  // 开盘（分）
-			F60  float64 `json:"f60"`  // 昨收（分）
-			F47  float64 `json:"f47"`  // 成交量（手，1手=100股）
-			F48  float64 `json:"f48"`  // 成交额（元）
-			F49  float64 `json:"f49"`  // 成交额辅助字段（与 F48 同口径，冗余）
-			F50  float64 `json:"f50"`  // 量比（非涨跌幅）
-			F57  string  `json:"f57"`  // 代码
-			F58  string  `json:"f58"`  // 名称
-			F168 float64 `json:"f168"` // 换手率 ×100
-			F169 float64 `json:"f169"` // 涨跌额 ×100
-			F170 float64 `json:"f170"` // 涨跌幅 ×100
-			F62  float64 `json:"f62"`  // 主力净流入（元）
+			F43  float64  `json:"f43"`  // 当前价（分）
+			F44  float64  `json:"f44"`  // 最高（分）
+			F45  float64  `json:"f45"`  // 最低（分）
+			F46  float64  `json:"f46"`  // 开盘（分）
+			F60  float64  `json:"f60"`  // 昨收（分）
+			F47  float64  `json:"f47"`  // 成交量（手，1手=100股）
+			F48  float64  `json:"f48"`  // 成交额（元）
+			F49  float64  `json:"f49"`  // 成交额辅助字段（与 F48 同口径，冗余）
+			F50  float64  `json:"f50"`  // 量比（非涨跌幅）
+			F57  string   `json:"f57"`  // 代码
+			F58  string   `json:"f58"`  // 名称
+			F168 float64  `json:"f168"` // 换手率 ×100
+			F169 float64  `json:"f169"` // 涨跌额 ×100
+			F170 float64  `json:"f170"` // 涨跌幅 ×100
+			F62  *float64 `json:"f62"`  // 主力净流入（元）§FIX-9e：指针区分"字段缺失"与真 0
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -744,7 +745,8 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 	if amount == 0 {
 		amount = raw.Data.F49
 	}
-	return &StockInfo{
+	// §FIX-9e(20260919)：f62 用指针解析——响应缺字段≠净流入为 0，HasFlow 显式携带可信度。
+	si := &StockInfo{
 		Code:      code,
 		Name:      raw.Data.F58,
 		Price:     raw.Data.F43 / 100,
@@ -757,8 +759,12 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 		Amount:    amount,
 		ChangePct: raw.Data.F170 / 100,
 		Turnover:  raw.Data.F168 / 100,
-		NetInflow: raw.Data.F62,
-	}, nil
+	}
+	if raw.Data.F62 != nil {
+		si.NetInflow = *raw.Data.F62
+		si.HasFlow = true
+	}
+	return si, nil
 }
 
 // GetAuctionData 获取指定股票的集合竞价数据（9:15-9:25 时段）。

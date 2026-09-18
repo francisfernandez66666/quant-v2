@@ -985,7 +985,8 @@ type LLMConfig struct {
 	// 次日自动恢复。LLM 是系统最大可变成本，此前用量完全不可见、无任何上限。
 	// 当日 LLM 调用次数预算
 	DailyCallBudget int64 `json:"daily_call_budget"`
-	// Daily鉴权TokenBudget
+	// 当日 token 总量预算（0=不设限），超限当日熔断、次日自动恢复（§FIX-7 接线）。
+	// Daily token budget; 0 = unlimited; trips today, auto-recovers next day.
 	DailyTokenBudget int64 `json:"daily_token_budget"`
 	// StreamIdleTimeoutSec 流式"相邻分片空闲"阈值（秒）。<=0 时 llm 包回落默认 60s。
 	// §FIX-3(20260919) 语义修正后该值恢复本义：分片到达即重置，只掐"真的停止吐字"的卡流，

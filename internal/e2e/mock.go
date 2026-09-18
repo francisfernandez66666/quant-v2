@@ -240,17 +240,19 @@ func (t *fixtureTransport) emStockGet(req *http.Request) (*http.Response, error)
 	if prev > 0 {
 		changePct = (price - prev) / prev * 100
 	}
-	netInflow := 0.0
-	if t.fix.NetInflows != nil {
-		netInflow = t.fix.NetInflows[code]
+	// §FIX-9e(20260919)：f62 仅在 fixture 显式提供时输出——此前恒输出（缺省 0），
+	// 与"HasFlow 区分缺数/真 0"的新契约相悖，TestConsultNetInflowMissingHint 需要真缺字段形态。
+	data := map[string]interface{}{
+		"f43": price * 100, "f44": high * 100, "f45": low * 100, "f46": open * 100,
+		"f60": prev * 100, "f48": parse(8), "f49": parse(9), "f50": changePct,
+		"f57": code, "f58": name, "f170": changePct * 100,
 	}
-	return t.json(map[string]interface{}{
-		"data": map[string]interface{}{
-			"f43": price * 100, "f44": high * 100, "f45": low * 100, "f46": open * 100,
-			"f60": prev * 100, "f48": parse(8), "f49": parse(9), "f50": changePct,
-			"f57": code, "f58": name, "f170": changePct * 100, "f62": netInflow,
-		},
-	})
+	if t.fix.NetInflows != nil {
+		if v, has := t.fix.NetInflows[code]; has {
+			data["f62"] = v
+		}
+	}
+	return t.json(map[string]interface{}{"data": data})
 }
 
 // emMoneyFlow 东财个股资金流 fflow klines。

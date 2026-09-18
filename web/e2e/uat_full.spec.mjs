@@ -729,6 +729,35 @@ test.describe('修复回归 · 运维入口与即时熔断', () => {
     }
   })
 
+  // §FIX-9j(20260919) 双通道切换链路 nightly 回归：qmt-mock 补 /admin/broker + /health broker 字段后，
+  // "UI/API 切换网关 active 通道"在演练栈首次可测——GET 回读 → POST 切到对面通道 → 回读生效 →
+  // finally 还原基线（服务端共享状态，中途失败会毒化后续用例，同 halt 用例的 teardown 纪律）。
+  test('BROKER-1：网关 active 通道切换 + /health 回读生效', async ({ page }) => {
+    await page.goto('/#/quant')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const base = await (await page.request.get('/api/qmt/broker', { headers: hdr })).json()
+    test.skip(base.ok !== true, `网关未接入/不可达（ok=false: ${base.err || ''}），切换用例不适用`)
+    const cur = base.broker === 'xt' ? 'xt' : 'queued'
+    const target = cur === 'xt' ? 'queued' : 'xt'
+    try {
+      const sw = await page.request.post('/api/qmt/broker', { headers: hdr, data: { broker: target } })
+      expect(sw.status(), '切换应 200').toBe(200)
+      await expect.poll(async () => {
+        const s = await (await page.request.get('/api/qmt/broker', { headers: hdr })).json()
+        return s.ok === true && s.broker === target
+      }, { timeout: 8000, message: `切换后 active 通道应回读为 ${target}` }).toBe(true)
+      // 非法通道名必须被拒（实网关契约：400 "broker must be one of"，经 Go 侧 502 包装）
+      const bad = await page.request.post('/api/qmt/broker', { headers: hdr, data: { broker: 'nope' } })
+      expect([400, 502], `非法通道应被拒, got ${bad.status()}`).toContain(bad.status())
+    } finally {
+      await page.request.post('/api/qmt/broker', { headers: hdr, data: { broker: cur } })
+      await expect.poll(async () => {
+        const s = await (await page.request.get('/api/qmt/broker', { headers: hdr })).json()
+        return s.broker === cur
+      }, { timeout: 8000, message: `finally 应还原 active=${cur}` }).toBe(true)
+    }
+  })
+
   // U-5 运维入口回归：当日委托卡/日终结算卡渲染 + 「立即对账」可触发（成功/失败 toast 均算通）
   test('Quant：当日委托卡渲染 + 日终结算卡 + 对账可触发', async ({ page }) => {
     await page.goto('/#/quant')

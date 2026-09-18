@@ -51,6 +51,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -2176,9 +2177,7 @@ const consultMessageMaxRunes = 2000
 
 // 专业模式相关配置键（per-user，落盘 auth.json，跨重启保留）。
 const (
-	consultProModeKey      = "consult_pro_mode"      // "1"/"0"，默认开（§生产 20260916：咨询必须带近期+今日数据，关到"0"才关）
-	consultProModeLastUsed = "consult_pro_mode_last" // 最近一次专业咨询 Unix 秒
-	consultProModeInterval = 2 * time.Minute         // 盘中带数据咨询调用间隔上限（默认开启后由 15min 放宽重排，2026-09-16）
+	consultProModeKey = "consult_pro_mode" // "1"/"0"，默认开（§生产 20260916：咨询必须带近期+今日数据，关到"0"才关）
 )
 
 // consultProModeEnabled 读取当前用户专业模式开关状态（默认开：显式设 "0" 才关）。
@@ -2189,33 +2188,12 @@ func (s *Server) consultProModeEnabled(userID string) bool {
 	return v != "0"
 }
 
-// consultProModeRateLimited 判定专业模式是否命中盘中 15 分钟限流。
-// 仅交易时段（周一至周五 9:15-15:00）受限；盘前/盘后/周末不限。
-// 命中限流返回剩余等待时长；未命中返回 0。
-func (s *Server) consultProModeRateLimited(userID string, now time.Time) time.Duration {
-	if !data.IsTradeTime(now) {
-		return 0
-	}
-	v, ok := s.auth.GetConfig(userID, consultProModeLastUsed)
-	if !ok || v == "" {
-		return 0
-	}
-	last, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return 0
-	}
-	elapsed := now.Sub(time.Unix(last, 0))
-	if elapsed >= consultProModeInterval {
-		return 0
-	}
-	return consultProModeInterval - elapsed
-}
-
 // handleConsult 处理 POST /api/consult：多轮 LLM 咨询。
-// 专业模式（开关打开）时注入该股全部实时行情，且盘中 15 分钟限流一次；
-// 普通模式不注入数据、不限流。未接入引擎或 LLM 未配置时返回对应错误提示。
+// 专业模式（开关打开）时注入该股全部实时行情；普通模式仅追加深度分析风格要求。
+// 未接入引擎或 LLM 未配置时返回对应错误提示（§FIX-9d：错误经机读 code 分流）。
 func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
-	// §UAT-D6 按用户频控（专业模式的 15 分钟数据注入限流仍在后面叠加，这里兜住普通模式刷调用）。
+	// §UAT-D6 按用户频控（12 次/分钟）兜住刷调用。§FIX-9a(20260919)：旧"盘中 15 分钟注入限流"
+	// 已在 §生产 20260916 移除，此处频控是请求路径唯一的频次闸。
 	if !s.userRateLimit(r, "consult", 12, time.Minute) {
 		rejectRateLimit(w, time.Minute)
 		return
@@ -2253,12 +2231,13 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 
 	// §生产 20260916：盘中 429 限流拒绝已移除——带数据咨询改为默认能力后，拒绝回答
 	// 反而是产品缺陷；外部接口消耗由引擎侧按代码 60s 块缓存兜底（engine.buildStockBlock）。
-	// consultProModeRateLimited/lastUsed 仅作历史留档保留，不再参与请求路径。
+	// §FIX-9a/9c(20260919)：旧的 consultProModeRateLimited/lastUsed 留档链路已整体删除——
+	// 限流不复存在后仍每轮咨询重写 auth.json（含全部口令哈希的认证库）纯属无谓 IO 与风险面。
 
 	// §FIX-4(20260919) 每用户 in-flight=1：一次出呼分钟级，连点发送=并行多条计费 + 共用历史
 	// 互相污染。与"刷调用"的 12/min 频控正交——这条兜的是"同时"，那条兜的是"频次"。
 	if _, busy := s.consultInflight.LoadOrStore(userID, struct{}{}); busy {
-		writeError(w, 429, "上一条咨询仍在处理中，请等待回复完成后再发送")
+		writeErrCode(w, 429, "consult_inflight", "上一条咨询仍在处理中，请等待回复完成后再发送")
 		return
 	}
 	defer s.consultInflight.Delete(userID)
@@ -2271,26 +2250,76 @@ func (s *Server) handleConsult(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[consult] 请求被取消（用户断开）: uid=%s err=%v", userID, err)
 			return
 		}
-		// §FIX-7(20260919)：预算熔断与上游故障分流——"当日额度用尽"是配额语义（429 +
-		// 次日自动恢复），不该混进 500 让用户以为是系统坏了。
-		if errors.Is(err, llm.ErrBudgetExceeded) {
-			writeError(w, 429, err.Error())
-			return
+		// §FIX-9d(20260919)：出呼错误统一分流（含 §FIX-7 预算 429、§FIX-10 隔离 503）——
+		// 状态码按语义归类，外发文案脱敏截断，响应附机读 code 供前端免关键字猜测。
+		status, code, msg := consultErrorResponse(err)
+		if status == 500 {
+			// 500=真未知故障，留全量错误日志；上游/超时类已归类，不再灌 error 日志。
+			log.Printf("[consult] 引擎错误: uid=%s err=%v", userID, err)
 		}
-		// §FIX-10(20260919 批四)：账号隔离存储不可用=依赖未就绪（503 语义，可重试），
-		// 与上游 5xx 故障（500）分流；引擎已保证拒绝发生在付费调用之前。
-		if errors.Is(err, data.ErrStoreUnavailable) {
-			writeError(w, 503, err.Error())
-			return
-		}
-		writeError(w, 500, err.Error())
+		writeErrCode(w, status, code, msg)
 		return
 	}
-	// 专业咨询成功后记录调用时间（留档；不再用于拦请求）。
-	if proMode {
-		_ = s.auth.SetConfig(userID, consultProModeLastUsed, strconv.FormatInt(time.Now().Unix(), 10))
+	// §FIX-9h(20260919)：免责尾注在 HTTP 出口统一追加（不再只靠前端组件）——
+	// 脚本/APK 等非浏览器客户端直连时同样覆盖。历史存储保持干净（引擎侧已落盘原文）。
+	writeJSON(w, 200, map[string]string{"reply": reply + consultDisclaimer})
+}
+
+// consultDisclaimer §FIX-9h：咨询回复出口的固定免责句（与前端 Disclaimer 文案同口径）。
+const consultDisclaimer = "\n\n（以上内容由 AI 生成，仅供参考，不构成投资建议。）"
+
+// consultUpstreamStatusRe 兜底匹配旧式裸错误串"LLM API 返回 %d"（llm.UpstreamError 之外的历史形态）。
+var consultUpstreamStatusRe = regexp.MustCompile(`LLM API 返回 (\d{3})`)
+
+// consultErrorResponse §FIX-9d(20260919)：把咨询出呼错误分流为「HTTP 状态 + 机读 code +
+// 脱敏文案」三元组。此前一律 500 直出 err.Error()——上游供应商响应体（可能含 URL/密钥回显）
+// 原样进客户端，且前端只能拿 message 做"配置"关键字猜测。
+// 分类优先级：预算熔断(429) > 隔离存储未就绪(503) > LLM 未配置(503) > 模型超时(504) >
+// 上游故障(429/5xx→503 可重试，其余 4xx→502) > 未知(500，文案截断 200 字符)。
+// English: maps consult pipeline errors to (status, machine-readable code, sanitized message).
+func consultErrorResponse(err error) (int, string, string) {
+	// §FIX-7：预算熔断是配额语义（次日自动恢复），文案本就面向用户，原样透传。
+	if errors.Is(err, llm.ErrBudgetExceeded) {
+		return 429, "consult_budget_exceeded", err.Error()
 	}
-	writeJSON(w, 200, map[string]string{"reply": reply})
+	// §FIX-10：账号隔离存储未就绪=依赖缺失（可重试），拒绝发生在付费调用之前。
+	if errors.Is(err, data.ErrStoreUnavailable) {
+		return 503, "consult_store_unavailable", err.Error()
+	}
+	// LLM 未配置：引导配置文案面向管理员，不含任何 key 材料。
+	if errors.Is(err, llm.ErrNoAPIKey) || strings.Contains(err.Error(), "未配置 LLM_API_KEY") {
+		return 503, "llm_not_configured", "AI 顾问暂不可用：LLM 未配置 API Key，请管理员在咨询页完成配置"
+	}
+	// §FIX-3 超时速记：空闲超时/总时长超限都是"模型卡死/回包过慢"，504 语义可重试。
+	msg := err.Error()
+	if strings.Contains(msg, "空闲超时") || strings.Contains(msg, "总时长超限") {
+		return 504, "llm_timeout", "模型响应超时，已中止本轮出呼，请稍后重试或精简提问"
+	}
+	// 上游 HTTP 故障：优先机读类型，兜底旧式消息串。
+	status := 0
+	var ue *llm.UpstreamError
+	if errors.As(err, &ue) {
+		status = ue.Status
+	} else if m := consultUpstreamStatusRe.FindStringSubmatch(msg); m != nil {
+		status, _ = strconv.Atoi(m[1])
+	}
+	if status > 0 {
+		if status == http.StatusTooManyRequests || status >= 500 {
+			return 503, "llm_upstream_unavailable", fmt.Sprintf("上游模型服务暂不可用（HTTP %d），请稍后重试", status)
+		}
+		return 502, "llm_upstream_error", fmt.Sprintf("上游模型服务拒绝了请求（HTTP %d），请联系管理员核查配置", status)
+	}
+	// 未知错误：截断脱敏后透传（可能含用户可见的诊断信息），全量已进日志。
+	runes := []rune(msg)
+	if len(runes) > 200 {
+		msg = string(runes[:200]) + "…（详情见服务端日志）"
+	}
+	return 500, "consult_failed", msg
+}
+
+// writeErrCode 标准错误结构扩展：{"error": msg, "code": 机读错误码}（§FIX-9d）。
+func writeErrCode(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }
 
 // handleGetConsultProMode 处理 GET /api/consult/pro-mode：返回当前用户专业模式开关状态。
@@ -2348,12 +2377,16 @@ func (s *Server) handleConsultHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleClearConsultHistory 处理 DELETE /api/consult/history：清空当日咨询对话。
+// §FIX-9g(20260919)：引擎缺失时不再回"ok"假成功——前端 await 后清屏会造成
+// "界面已清空、服务端历史仍在、刷新复现"的分裂态，如实 503 让调用方保留原界面。
 func (s *Server) handleClearConsultHistory(w http.ResponseWriter, r *http.Request) {
 	uid := requestUserID(r)
 	if c := s.ctrlFor(uid); c != nil {
 		c.ClearConsultHistoryFor(uid) // §GAP2-W2 只清本人账号的历史
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+		return
 	}
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	writeErrCode(w, 503, "engine_unavailable", "引擎未启动，历史未清空，请稍后重试")
 }
 
 // handleTriggerPositionReview 处理 POST /api/review/positions：§DAILY_REVIEW 手动触发当前账号的盘后

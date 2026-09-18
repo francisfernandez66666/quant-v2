@@ -76,6 +76,10 @@ type book struct {
 	nextSer   int               // §P2-14 成交流水号自增（serial=SER000001，对齐实网关 trade_id 语义）
 	cash      float64           // §P2-14 模拟现金（买入扣减/卖出回补，/settlement cash 口径）
 	fillMode  string            // §P2-14 成交模式：full（默认）/partial（部成→已成）/reject（废单）
+	// activeBroker §FIX-9j(20260919)：模拟网关 active 通道（xt=miniQMT / queued=QMT 桥）。
+	// 真实 qmt_gateway 有 /admin/broker 切换 + /health 回报 active；mock 此前两者皆缺，
+	// 双通道切换链路（Quant 页按钮→/api/qmt/broker→网关）在 e2e/演练栈完全测不到。
+	activeBroker string // 当前 active 通道，默认 xt，POST /admin/broker 可切
 }
 
 // fillRecord 成交流水行（§P2-14 /settlement 装配源，字段对齐实网关 fills 表）。
@@ -387,7 +391,45 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 	// （反映 xtquant 通道状态），引擎侧 Health() 要求 ok && broker_connected 才算健康；
 	// mock 必须对齐契约，否则全链路联调会因"通道未连"被熔断。
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]interface{}{"ok": true, "broker_connected": true, "ts": time.Now().Format(time.RFC3339)})
+		// §FIX-9j：对齐真实网关 _health_payload——broker/broker_mode 回报 active 通道，
+		// Go 侧 BrokerStatus()（GET /health）解析后供 /api/qmt/broker 观察/切换回读。
+		b.mu.Lock()
+		ab := b.activeBroker
+		b.mu.Unlock()
+		if ab == "" {
+			ab = "xt"
+		}
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "broker_connected": true, "ts": time.Now().Format(time.RFC3339),
+			"broker": ab, "broker_mode": ab, "xt_connected": true, "queued_connected": true,
+		})
+	})
+
+	// /admin/broker §FIX-9j：手动切换 active 通道（{"broker":"xt|queued"}），契约对齐
+	// 真实网关 _do_admin_broker：非法值 400；成功回 {ok:true, broker:目标通道}。
+	// mock 只改状态位（双通道数据本就同一份内存账本），切换语义供 e2e 验证链路贯通。
+	mux.HandleFunc("/admin/broker", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Broker string `json:"broker"` // 目标通道：xt（miniQMT 兼容）/ queued（QMT 桥兜底）
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "err": "invalid json"})
+			return
+		}
+		if req.Broker != "xt" && req.Broker != "queued" {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, map[string]interface{}{"ok": false, "err": "broker must be one of: xt, queued"})
+			return
+		}
+		b.mu.Lock()
+		b.activeBroker = req.Broker
+		b.mu.Unlock()
+		log.Printf("[mock] admin 切换 active 通道 -> %s", req.Broker)
+		writeJSON(w, map[string]interface{}{"ok": true, "broker": req.Broker, "err": ""})
 	})
 
 	// /state 网关状态与持仓/委托（对账源）。

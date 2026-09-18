@@ -34,6 +34,10 @@ func (f *fix6Ctrl) ConsultLLM(ctx context.Context, userID, userMsg string, proMo
 	return "答复", nil
 }
 
+// ClearConsultHistoryFor §FIX-9g 用例需要清空路径可走通：本 fake 无真实存储，no-op 即可
+// （嵌入的 nil EngineController 若被穿透会 panic，必须显式覆盖）。
+func (f *fix6Ctrl) ClearConsultHistoryFor(userID string) {}
+
 // TestBodyLimitContentLengthTooLarge §FIX-6：已知 ContentLength 超 64KB → 413 中文错误，且不读 body。
 // English: known ContentLength over 64KB → 413 with a Chinese error, body never read.
 func TestBodyLimitContentLengthTooLarge(t *testing.T) {

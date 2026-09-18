@@ -487,8 +487,13 @@ export async function request(path, opts = {}) {
       clearTimeout(timer)
       throw new Error('请求超时')
     }
-    // 非超时类网络错误：若配置了自定义服务器，则回退当前页面同源地址重试一次
-    if (base !== '') {
+    // 非超时类网络错误：若配置了自定义服务器，则回退当前页面同源地址重试一次。
+    // §FIX-9i(2026-09-19)：回退重发仅限幂等的 GET——此前不分方法，POST /api/consult
+    // 这类"计费 + 写历史"的请求在自定义地址网络失败后会被原样重发一次，等于用户
+    // 点一次发送花两份钱、落两条历史。非幂等方法（POST/PUT/PATCH 等）直接抛原始错误。
+    // English: same-origin fallback retry is now restricted to idempotent GET; billable
+    // POSTs (e.g. consult) must never be auto-resent.
+    if (base !== '' && (opts.method || 'GET') === 'GET') {
       try {
         if (typeof console !== 'undefined') {
           console.warn('[api] 自定义服务器地址不可达，回退同源请求:', base + path)
@@ -498,7 +503,7 @@ export async function request(path, opts = {}) {
         clearTimeout(timer)
         throw e2 || e
       }
-      // 未配置自定义服务器（base 为空同源请求）：无回退余地，直接抛出原始网络错误
+      // 未配置自定义服务器（base 为空同源请求）或不可重发方法：无回退余地，直接抛出原始网络错误
     } else {
       clearTimeout(timer)
       throw e
@@ -524,9 +529,13 @@ export async function request(path, opts = {}) {
   // avoiding cryptic errors from downstream res.json() on non-JSON responses such as HTML.
   if (!res.ok) {
     let msg = '请求失败 ' + res.status
+    let code = ''
     try {
       const e = await res.json()
       if (e && e.error) msg = e.error
+      // §FIX-9d(2026-09-19)：后端错误体新增机读 code（如 llm_not_configured/consult_budget_exceeded），
+      // 随错误对象透传——调用方从此不再拿 message 做"配置"等关键字猜测。
+      if (e && e.code) code = e.code
     } catch (_) {}
     // §A5（20260918 审计批）：错误对象挂载 HTTP 状态码——此前调用方只能拿 message 做关键字
     // 匹配（如 e.message.indexOf('无权限')），无法机读判定 403；现页面/守卫可用 isForbidden()
@@ -534,6 +543,7 @@ export async function request(path, opts = {}) {
     // English: §A5 — non-2xx errors now carry res.status so callers can test 403 programmatically.
     const err = new Error(msg)
     err.status = res.status
+    err.code = code
     throw err
   }
   // 成功响应：解析 JSON 返回给调用方（后端接口约定均为 JSON 体）
@@ -1581,10 +1591,10 @@ export async function fetchConsultProMode() {
 
 /** 切换专业模式开关 */
 /** Toggle pro mode */
-// 对应 PUT /api/consult/pro-mode，请求体 { enabled }；开启后咨询会注入全部实时行情，
-// Maps to PUT /api/consult/pro-mode; body { enabled }; when enabled, consultations inject full realtime quotes,
-// 盘中每 15 分钟限流一次，盘前盘后不限
-// throttled to once every 15 minutes intraday, unlimited pre/post market
+// 对应 PUT /api/consult/pro-mode，请求体 { enabled }；开启后咨询会注入全部实时行情。
+// Maps to PUT /api/consult/pro-mode; body { enabled }; when enabled, consultations inject full realtime quotes.
+// §FIX-9a(2026-09-19)：删除"盘中每 15 分钟限流一次"承诺——该限流已于 §生产 20260916
+// 整体移除（带数据咨询改默认能力），请求路径仅保留 12 次/分钟的用户频控。
 export async function setConsultProMode(enabled) {
   return request('/api/consult/pro-mode', { method: 'PUT', data: { enabled } })
 }
