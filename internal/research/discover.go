@@ -206,7 +206,8 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 		return res
 	}
 
-	// 3) 方向：按因子类别默认方向（价值/成长/质量/动量/流动性看多，规模/波动率看空）
+	// 3) 方向：按因子类别默认方向（价值/成长/质量/动量/流动性看多，规模/波动率看空），
+	// 随后由 §RFIX-2 样本内方向拟合可能整体翻转（与窗口内核 DiscoverFactorsWindowedN 同口径）。
 	for _, fid := range selected {
 		if d, ok := factor.Get(fid); ok {
 			dirs[fid] = dirOfCat(d.Cat)
@@ -221,18 +222,27 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 		GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
 		End: splitDate,
 	})
+
+	// 4) E3 分段 + 反推验证
+	inRows := CompositeICRange(panels, selected, opt.Weights, opts.Horizon, opts.MinStocks, "", splitDate)
+	outRows := CompositeICRange(panels, selected, opt.Weights, opts.Horizon, opts.MinStocks, splitDate, "")
+
+	// §RFIX-2 样本内方向拟合（与窗口内核共用 fitDirsByInSampleSign，两口径一致）：
+	// dirOfCat 先验下样本内带符号 IR<0 → 全量翻转 dirs，报告口径乘 fitSign。
+	// 旧口径此处取 |IR|（abs），与窗口内核带符号口径不一致；统一为拟合后的带符号值
+	// （样本内恒非负、样本外符号反映方向延续性）。裁决只用样本内数据，OOS 真反转救不回来。
+	fitSign := fitDirsByInSampleSign(IR(inRows), dirs)
+
 	res.Factors = selected
 	res.Directions = dirs
 	res.Weights = opt.Weights
-	res.ICMean = opt.ICMean
-	res.IR = opt.IR
+	res.ICMean = opt.ICMean * fitSign
+	res.IR = opt.IR * fitSign
 	res.NDays = opt.NDays
 	res.PassGuard = opt.PassGuard
 	res.Reason = opt.Reason
-
-	// 4) E3 分段 + 反推验证
-	res.InsampleIR = compositeIRInRange(panels, selected, opt.Weights, opts, "", splitDate)
-	res.OutsampleIR = compositeIRInRange(panels, selected, opt.Weights, opts, splitDate, "")
+	res.InsampleIR = irOrZero(inRows) * fitSign
+	res.OutsampleIR = irOrZero(outRows) * fitSign
 	res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT = reverseExtension(panels, selected, dirs, opt.Weights, opts, splitDate, "")
 
 	// 样本外护栏：样本外 IR 也需达标才视为稳健
@@ -334,17 +344,6 @@ func rowsUntil(rows []ICRow, end string) []ICRow {
 		}
 	}
 	return out
-}
-
-// compositeIRInRange 计算复合权重在某日期范围内的 |IR|。
-// English: computes the |IR| of a weighted factor composite within a date range.
-func compositeIRInRange(panels []*Panel, factors []string, weights map[string]float64, opts DiscoverOpts, start, end string) float64 {
-	rows := CompositeICRange(panels, factors, weights, opts.Horizon, opts.MinStocks, start, end)
-	ir := IR(rows)
-	if isNaN(ir) {
-		return 0
-	}
-	return math.Abs(ir)
 }
 
 // reverseExtension 反推泛化：在 [start,end] 区间，每日按复合分排序，

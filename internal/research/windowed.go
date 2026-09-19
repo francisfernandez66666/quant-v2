@@ -681,8 +681,17 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		irCk := func() *winCkpt { return &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(opt.Weights)} }
 		inRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, headChunks, dates, irCk())
 		outRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, splitChunks, dates, irCk())
-		res.InsampleIR = irOrZero(inRows)
-		res.OutsampleIR = irOrZero(outRows)
+
+		// §RFIX-2 样本内方向拟合：dirOfCat 编译期先验可能与市场实际定价方向相反——复合 IC
+		// 内核（CompositeICRange）不消费 dirs，带符号 IR 可为负，而 C2 落库门用带符号
+		// OutsampleIR，导致 |IR| 0.8~1.3 的反向强信号被整晚清零（生产 09-19 实录）。
+		// 裁决只看到样本内（与权重拟合同一纪律，杜绝未来函数）；样本外仍按带符号门
+		// 检验「样本内方向是否延续」，真方向反转的信号（IS正/OOS负）fit 救不回来。
+		// English: in-sample direction fitting — flip all dirs when the IS signed IR of the fitted
+		// weights is negative; OOS still judges whether the fitted direction persisted.
+		fitSign := fitDirsByInSampleSign(IR(inRows), dirs)
+		res.InsampleIR = irOrZero(inRows) * fitSign
+		res.OutsampleIR = irOrZero(outRows) * fitSign
 		if opts.MinYrSign > 0 {
 			res.YearlyConsistentYears, res.YearlyTotalYears = yearlySignConsistency(outRows, 5)
 		}
@@ -692,8 +701,8 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		res.Factors = selected
 		res.Directions = dirs
 		res.Weights = opt.Weights
-		res.ICMean = opt.ICMean
-		res.IR = opt.IR
+		res.ICMean = opt.ICMean * fitSign
+		res.IR = opt.IR * fitSign
 		res.NDays = opt.NDays
 		res.PassGuard = opt.PassGuard
 		res.Reason = opt.Reason
@@ -722,6 +731,23 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		return empty("前向选择未选出因子")
 	}
 	return results
+}
+
+// fitDirsByInSampleSign §RFIX-2 样本内方向拟合（两内核共用）：以加权组合在样本内段的
+// 带符号 IR 裁决组合方向——isIR<0 时全量翻转 dirs 并返回 -1（报告口径乘该符号；
+// runner 的 w·dir·pct 贡献随之整体单调反向，等价于翻转 composite 后重算 IC：
+// Spearman(-x,y)=-Spearman(x,y)）。isIR≥0 或 NaN（无观测不判定，保守）返回 +1 不动。
+// 方向裁决只允许使用样本内数据（与权重拟合同一纪律，杜绝未来函数）。
+// English: §RFIX-2 shared in-sample direction fit — flips all dirs and returns -1 when the
+// signed in-sample IR is negative; NaN keeps +1 (no observation, no verdict).
+func fitDirsByInSampleSign(isIR float64, dirs map[string]int) float64 {
+	if isNaN(isIR) || isIR >= 0 {
+		return 1
+	}
+	for f := range dirs {
+		dirs[f] = -dirs[f]
+	}
+	return -1
 }
 
 // irOrZero 返回 IR（NaN 归 0）。English: IR with NaN → 0.

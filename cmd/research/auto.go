@@ -673,12 +673,14 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 			continue
 		}
 		// C4 参数快照：精确复现审批战法的全量参数 JSON。
+		// §RFIX-2 dir_fit 标记：候选方向为样本内符号拟合（dirOfCat 先验 + IS 带符号 IR 裁决），
+		// 供审计复现时区分新旧口径。
 		params, _ := json.Marshal(map[string]any{
 			"start": *start, "end": *end, "h": *h, "variant": i + 1, "top_n": *topN,
 			"pool": *pool, "min_stocks": *minStocks, "max_factors": *maxFactors,
 			"split": *split, "min_ir": *minIR, "min_days": *minDays, "min_gen_t": *minGenT,
 			"metric": *metric, "guard_strong": *guardStrong, "guard_weak": *guardWeak,
-			"min_yr_sign": *minYrSign,
+			"min_yr_sign": *minYrSign, "dir_fit": "in-sample-sign",
 		})
 		fj, _ := json.Marshal(res.Factors)
 		// E6：方向与权重一并存盘，供实盘因子 runner 恢复完整规则。
