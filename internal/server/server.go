@@ -727,6 +727,7 @@ func (s *Server) registerRoutes() {
 	// B5 研究候选审批（仅拥有 research_approve 权限位或 admin 可操作；列表可见）
 	s.mux.HandleFunc("GET /api/scheduler/status", s.authMiddleware(s.handleSchedulerStatus))
 	s.mux.HandleFunc("GET /api/research/task/{id}/log", s.authMiddleware(s.handleResearchTaskLog))
+	s.mux.HandleFunc("GET /api/research/event-factor", s.authMiddleware(s.handleResearchEventFactor))
 	s.mux.HandleFunc("GET /api/research/progress", s.permMiddleware(auth.PermResearchApprove, s.handleResearchProgress))
 	s.mux.HandleFunc("GET /api/research/factors", s.authMiddleware(s.handleResearchFactors))
 	s.mux.HandleFunc("GET /api/research/candidates", s.permMiddleware(auth.PermResearchApprove, s.handleResearchCandidates))

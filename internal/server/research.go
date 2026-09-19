@@ -74,6 +74,31 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, st)
 }
 
+// handleResearchEventFactor 处理 GET /api/research/event-factor：返回 §ENH-4 事件因子检验
+// 报告（cmd/research event-layers 落盘的 event_factor_report.json，FactorReport 数组）。
+// 未生成时返回 {exists:false}，前端事件因子卡显示引导语，不报 500。
+// English: serves the event-factor validation report produced by the research CLI.
+func (s *Server) handleResearchEventFactor(w http.ResponseWriter, r *http.Request) {
+	raw, err := os.ReadFile(filepath.Join(s.researchDir, "event_factor_report.json"))
+	if err != nil || len(raw) == 0 {
+		writeJSON(w, 200, map[string]any{"exists": false})
+		return
+	}
+	// 体积守卫：逐日 IC 行可能很大，超 4MB 视为异常文件，按未生成处理并透传标记。
+	if len(raw) > 4*1024*1024 {
+		writeJSON(w, 200, map[string]any{"exists": false, "too_large": true})
+		return
+	}
+	// 重序列化前校验 JSON 合法性，防被外部工具写坏导致前端 JSON.parse 崩。
+	var check any
+	if json.Unmarshal(raw, &check) != nil {
+		writeJSON(w, 200, map[string]any{"exists": false, "corrupt": true})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Write(raw)
+}
+
 // handleResearchTaskLog 处理 GET /api/research/task/{id}/log：读取 researchd 为每条研究任务
 // 落盘的 task_logs/task_<id>.log（子进程 stdout/stderr），让前端直接查看回测/研究日志，
 // 无需 SSH 翻服务器。文件不存在时返回 exists=false。English: serves the per-task log file so the

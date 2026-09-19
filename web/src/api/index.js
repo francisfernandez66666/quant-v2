@@ -1627,6 +1627,13 @@ export async function getResearchTaskLog(id) {
   return request('/api/research/task/' + id + '/log')
 }
 
+/** 获取 §ENH-4 事件因子检验报告（GET /api/research/event-factor） */
+/** Fetch the event-factor validation report (news_score@stock/@sector IC/layer studies) */
+// 正常返回 FactorReport 数组；未生成时返回 { exists: false }（cmd/research event-layers 落盘后才有）。
+export async function fetchResearchEventFactor() {
+  return request('/api/research/event-factor')
+}
+
 /** 获取全部因子元数据（GET /api/research/factors） */
 /** Fetch factor metadata (GET /api/research/factors) */
 // 返回 { factors: [{ id, name, cat, desc }, ...] }，供自动研究页把因子规则渲染成中文可读文案

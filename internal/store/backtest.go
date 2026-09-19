@@ -20,6 +20,26 @@ func (d *DB) Industries() (map[string]string, error) {
 	return out, rows.Err()
 }
 
+// StockIndustries 返回全量上市公司的行业映射（ts_code → industry，空行业名剔除）。
+// §ENH-4 事件因子 news_score@sector 的行业传导用。
+// English: StockIndustries maps every listed ts_code to its industry name (empty names dropped).
+func (d *DB) StockIndustries() (map[string]string, error) {
+	rows, err := d.db.Query(`SELECT ts_code, industry FROM stocks WHERE industry IS NOT NULL AND industry != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var code, ind string
+		if err := rows.Scan(&code, &ind); err != nil {
+			return nil, err
+		}
+		out[code] = ind
+	}
+	return out, rows.Err()
+}
+
 // IndustryConstituents 返回某行业在 date 当日有成交的股票代码。
 // （IndustryConstituents returns codes of an industry that traded on date.）
 func (d *DB) IndustryConstituents(industry, date string) ([]string, error) {

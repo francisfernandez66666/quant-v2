@@ -79,6 +79,8 @@ export default function Research() {
   // 常量 strategyRefs：局部定义
   const [showMetricHelp, setShowMetricHelp] = useState(false)
   const [adviceOpen, setAdviceOpen] = useState(0)
+  // §ENH-4 事件因子报告（news_score@stock/@sector）：由服务器端 research event-layers 落盘，前端只读展示
+  const [eventFactor, setEventFactor] = useState(null) // null=未加载；数组=报告；{exists:false}=未生成
 
   const canApprove = api.hasPerm('research_approve')
   // 常量 canApprove：局部定义
@@ -90,6 +92,14 @@ export default function Research() {
     { value: 'backtests', label: '回测' },
     { value: 'settings', label: '设置' },
   ]
+  // §ENH-4 首次进入"回测"tab 拉一次事件因子报告；接口异常按未生成降级（卡内给引导语）
+  useEffect(() => {
+    if (activeTab === 'backtests' && eventFactor === null) {
+      api.fetchResearchEventFactor()
+        .then((r) => setEventFactor(r))
+        .catch(() => setEventFactor({ exists: false }))
+    }
+  }, [activeTab, eventFactor])
   const builtinPatterns = [
   // 内置形态战法枚举（双响炮/龙头/龙回头/N形），用于回测与战法库归类
     { id: 'double_bump', name: '双响炮' },
@@ -1707,6 +1717,32 @@ export default function Research() {
               <div style={{ marginTop: 8, fontSize: 12, color: 'var(--app-muted)' }}>
                 任务统一走研究队列：手动回测为高优先级，夜间自动研究为低优先级；高优先级到来会自动让路（被抢占任务断点续跑）。所有任务仅在盘后窗口执行。
               </div>
+            </Card>
+
+            {/* §ENH-4 事件因子检验卡：news_score@stock/@sector 的 IC/IR/单调性结论（research event-layers 产出） */}
+            <Card title="事件因子检验（新闻冲击分）" style={{ marginTop: 12 }}>
+              {eventFactor === null && <span style={{ fontSize: 12, color: 'var(--app-muted)' }}>加载中…</span>}
+              {Array.isArray(eventFactor) && eventFactor.length > 0 && (
+                <Table
+                  data={eventFactor}
+                  rowKey={(r) => r.id + ':' + r.horizon}
+                  size="small"
+                  pagination={{ pageSize: 8, total: eventFactor.length }}
+                  columns={[
+                    { colKey: 'id', title: '因子', cell: ({ row }) => `${row.name}（${row.id}）` },
+                    { colKey: 'horizon', title: '前瞻天数', width: 90 },
+                    { colKey: 'ic_mean', title: 'IC均值', cell: ({ row }) => <span style={{ color: signColor(row.ic_mean) }}>{fmt(row.ic_mean)}</span> },
+                    { colKey: 'ir', title: 'IR', cell: ({ row }) => <span style={{ color: signColor(row.ir) }}>{fmt(row.ir)}</span> },
+                    { colKey: 'days', title: '有效日', cell: ({ row }) => (Array.isArray(row.ic) ? row.ic.length : 0), width: 80 },
+                    { colKey: 'mono', title: '分层单调', cell: ({ row }) => (row.monotonic ? (row.monotonic_dir > 0 ? '是（递增）' : '是（递减）') : '否') },
+                  ]}
+                />
+              )}
+              {(eventFactor && !Array.isArray(eventFactor)) || (Array.isArray(eventFactor) && eventFactor.length === 0) ? (
+                <div style={{ fontSize: 12, color: 'var(--app-muted)' }}>
+                  尚未生成报告：需在服务器上执行 <code>research event-layers</code>（依赖每日新闻事件换日归档，批 B 起自动积累）。
+                </div>
+              ) : null}
             </Card>
 
             <Card title="指标说明">
