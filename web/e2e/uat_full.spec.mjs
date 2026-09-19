@@ -978,3 +978,52 @@ test.describe('修复回归 · WL-FIX 20260917 自选股', () => {
     }
   })
 })
+
+// §ENH-5 批E：QMT Level-1 行情 feed 契约回归（2026-09-19）。
+// 交易时段外 feed 不轮询（IsActiveSession 闸门），故这里锁"回显契约"而非 QMT-L1 值本身：
+// /api/status 必须始终携带 quote_source/quote_age_sec 两字段——nightly 在盘中窗口
+// 开启 qmt_feed_enabled 后，quote_source 即变 "QMT-L1"，前端/巡检零改动即可观测。
+test.describe('修复回归 · §ENH-5 L1 行情 feed 回显', () => {
+  test('L1-1 /api/status 携带 quote_source/quote_age_sec 契约字段', async ({ page }) => {
+    await page.goto('/#/dashboard')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const st = await (await page.request.get('/api/status', { headers: hdr })).json()
+    expect(st, 'quote_source 字段必须存在（可为空串=快照未就绪）').toHaveProperty('quote_source')
+    expect(st.quote_age_sec, 'quote_age_sec 必须为数值').toEqual(expect.any(Number))
+    expect(st.quote_age_sec).toBeGreaterThanOrEqual(0)
+    if (st.quote_source) {
+      // 有源时必须落在已知集合内（防拼写漂移导致巡检误报）
+      expect(['QMT-L1', '同花顺（新）', '新浪', '腾讯', '东方财富', '东财', 'tushare', 'Tushare', 'test'])
+        .toContain(st.quote_source)
+    }
+  })
+
+  test('L1-2 mock 网关 /quotes 契约：Bearer + ticks 字段齐备', async ({ page }) => {
+    // 直连 qmt-mock（18789，token 与引擎配置同源）：证明 Go feed 的数据面在本地栈可用。
+    // mock 无 Bearer 时 401——浏览器 fetch 无法带 mock token？可以：token 固定 uat-secret。
+    let resp = null
+    let lastErr = ''
+    for (let i = 0; i < 3 && !resp; i++) { // mock 刚重启/瞬时繁忙时重试三轮，仍失败才按"独立部署"跳过
+      await page.waitForTimeout(500)
+      resp = await page.request.get('http://127.0.0.1:18789/quotes?codes=600000.SH', {
+        headers: { Authorization: 'Bearer uat-secret' },
+      }).catch((e) => { lastErr = String(e && e.message || e); return null })
+    }
+    test.info().annotations.push({ type: 'l1-2-diag', description: 'resp=' + (!!resp) + ' err=' + lastErr })
+    test.skip(!resp, 'qmt-mock 未就绪（独立部署场景跳过，不算失败）' + (lastErr ? ': ' + lastErr : ''))
+    expect(resp.status()).toBe(200)
+    const body = await resp.json()
+    expect(body.ok).toBe(true)
+    const tk = body.ticks['600000.SH']
+    expect(tk, 'tick 必须含 lastPrice').toBeTruthy()
+    for (const f of ['lastPrice', 'open', 'high', 'low', 'prevClose', 'volume', 'amount', 'tickTime']) {
+      expect(tk, `tick 缺字段 ${f}`).toHaveProperty(f)
+    }
+    expect(tk.lastPrice).toBeGreaterThan(0)
+    // 缺 codes → 400 契约
+    const bad = await page.request.get('http://127.0.0.1:18789/quotes', {
+      headers: { Authorization: 'Bearer uat-secret' },
+    })
+    expect(bad.status()).toBe(400)
+  })
+})

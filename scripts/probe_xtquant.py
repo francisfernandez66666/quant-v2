@@ -21,6 +21,28 @@ xt_path = cfg.get("xt_path", "")
 account = cfg.get("account", "")
 print("cfg: xt_path=%s account=%s" % (xt_path, account))
 
+print("=== 2. §ENH-5 xtdata L1 tick 单位校准探针（上线前必跑一次）==="
+# quote_feed.py / Go qmt_feed 的 volume 字段原样透传、不猜单位（§FIX-1 教训）。
+# 本探针打印同一 tick 的 volume/amount 与"amount/lastPrice 推算的均价量"比值，
+# 人工比对结论二选一：volume≈股数（比值≈1，Go 侧系数保持 1）
+#                     volume≈手数（比值≈100，Go 侧 SetVolumeToShares(100) 固化）。
+try:
+    from xtquant import xtdata as _xd
+    _xd.connect()
+    _codes = ["600519.SH", "600000.SH"]
+    _tick = _xd.get_full_tick(_codes) or {}
+    for _c, _t in _tick.items():
+        _lp = float(_t.get("lastPrice") or 0)
+        _vol = float(_t.get("volume") or 0)
+        _amt = float(_t.get("amount") or 0)
+        _ratio = (_amt / _lp / _vol) if (_lp > 0 and _vol > 0) else 0.0
+        print("tick %s: lastPrice=%s volume=%s amount=%s time=%s" % (_c, _lp, _vol, _amt, _t.get("time")))
+        print("  amount/(price*volume)=%.2f  （≈1→volume单位=股；≈100→单位=手，须配 SetVolumeToShares(100)）" % _ratio)
+    if not _tick:
+        print("get_full_tick 返回空（客户端未就绪/非交易时段无 tick），请在盘中重跑")
+except Exception as _e:
+    print("xtdata 单位探针失败（不影响 trader 探针结论）: %r" % _e)
+
 print("=== 1. xtquant trader connect (fresh process, session 77) ===")
 ok = False
 try:

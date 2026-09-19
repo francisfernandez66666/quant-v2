@@ -58,6 +58,7 @@ import (
 	"quant-trading-v2/internal/server"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy_engine"
+	"quant-trading-v2/internal/trading"
 	"quant-trading-v2/internal/trigger"
 )
 
@@ -336,6 +337,24 @@ func main() {
 	}
 	go fetcher.Start()
 	defer fetcher.Stop()
+	// §ENH-5 批E：QMT Level-1 全推行情 feed（默认关，生产决策机开启）。
+	// 命中代码合并覆盖快照 Source=QMT-L1；任何失败静默——5s 新浪链照常兜底，
+	// Staleness 自然增长，交易熔断判定（/health ok&&broker_connected）不含行情态。
+	// English: §ENH-5 Level-1 quote feed (off by default; production decision machine only).
+	// Failures are silent — the 5s Sina chain keeps running and health trading-gates stay untouched.
+	if cfgMgr.Rules.Runtime.QMTFeedEnabled && cfgMgr.Rules.QMT.GatewayURL != "" {
+		intervalSec := cfgMgr.Rules.Runtime.QMTFeedIntervalSec
+		if intervalSec <= 0 {
+			intervalSec = 3
+		}
+		feedClient := trading.NewQMTClient(cfgMgr.Rules.QMT.GatewayURL, cfgMgr.Rules.QMT.Token, 3*time.Second, 0)
+		qmtFeed := data.NewQMTFeed(fetcher, feedClient, time.Duration(intervalSec)*time.Second, 30*time.Second, 1)
+		go qmtFeed.Start()
+		defer qmtFeed.Stop()
+		log.Printf("[main] §ENH-5 QMT Level-1 行情 feed 已启用: %s, 轮询 %ds", cfgMgr.Rules.QMT.GatewayURL, intervalSec)
+	} else if cfgMgr.Rules.Runtime.QMTFeedEnabled {
+		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
+	}
 	srv.SetFetcher(fetcher) // 报价接口优先读 5s 快照，缺失再降级拉取
 	srv.SetCoordinator(dc)  // HTTP 展示层统一走该降级链，保证跨页价格一致
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))

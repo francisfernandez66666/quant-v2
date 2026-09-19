@@ -141,6 +141,15 @@ type RuntimeConfig struct {
 	// market-change → signal-detection latency (signal→trade optimization A+B / B: fast executor).
 	// Too-low values raise upstream request rate & CPU; validate against server resources in prod.
 	FeedIntervalSec int `json:"feed_interval_sec"`
+	// QMTFeedEnabled §ENH-5 批E：QMT Level-1 全推行情 feed 总开关（默认 false）。
+	// 开启且 qmt.gateway_url 非空时，引擎按 qmt_feed_interval_sec 轮询网关 /quotes，
+	// 命中代码覆盖行情快照（Source=QMT-L1）；feed 故障静默回退既有 5s 新浪链，不参与交易熔断。
+	// 仅生产决策机（Windows + qmt_gateway + xtquant）有意义，mac 开发态保持关闭。
+	// English: §ENH-5 master switch for the QMT Level-1 quote feed (default off, prod-only).
+	QMTFeedEnabled bool `json:"qmt_feed_enabled"`
+	// QMTFeedIntervalSec L1 feed 轮询间隔（秒，默认 0 → 取 3s；建议 1~3）。
+	// English: L1 feed polling interval in seconds (0 → 3s default; 1-3 recommended).
+	QMTFeedIntervalSec int `json:"qmt_feed_interval_sec"`
 	// ScoringIntervalSec 近实时 8a/8b 打分循环间隔（秒，默认 0 → 回退 5s）。
 	// 降低可让战法信号翻转更快被检出并触发下单（信号→交易链路优化 A+B 之 B）。
 	// English: near-realtime 8a/8b scoring-loop interval in seconds (0 → fallback 5s). Lowering it

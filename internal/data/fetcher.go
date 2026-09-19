@@ -96,6 +96,12 @@ func (f *Fetcher) watchCounts() (base, hot int) {
 	return len(f.baseStocks), len(f.hotStocks)
 }
 
+// WatchCodes 返回当前完整监控池（base+hot 去重副本），供 §ENH-5 L1 行情 feed 轮询取码。
+// English: WatchCodes exposes the deduped base+hot monitoring pool for the L1 quote feed poller.
+func (f *Fetcher) WatchCodes() []string {
+	return f.allStocks()
+}
+
 // SetBaseStocks 设置自选+持仓监控列表（无上限）。
 // 这些股票始终在监控池中，不受热点轮换影响。
 // SetBaseStocks sets the base watch list (watchlist+positions, unlimited).

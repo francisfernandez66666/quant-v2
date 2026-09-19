@@ -447,3 +447,63 @@ func TestMockAdminBrokerSwitch(t *testing.T) {
 		t.Fatalf("非法切换不得改状态, got %s", b.activeBroker)
 	}
 }
+
+// TestMockQuotesEndpoint §ENH-5 批E：/quotes 契约回归——鉴权面（无 token 401）、
+// 缺参 400、正常回 ticks（字段齐、价格为正、逐秒可变、tickTime 毫秒）。
+// mock 的 /quotes 是 nightly/本地 e2e 里 QMT-L1 feed 的数据源，字段必须与
+// 真实网关 quote_feed 及 Go 侧 data.QMTTick 解析对齐。
+func TestMockQuotesEndpoint(t *testing.T) {
+	h, _, _ := newTestGateway()
+	get := func(path, token string) (int, map[string]interface{}) {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var out map[string]interface{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	if code, _ := get("/quotes?codes=600000.SH", ""); code != http.StatusUnauthorized {
+		t.Fatalf("/quotes 无 token 应 401, got %d", code)
+	}
+	if code, out := get("/quotes", "t0"); code != http.StatusBadRequest || out["ok"] != false {
+		t.Fatalf("缺 codes 应 400+ok:false, got %d %v", code, out)
+	}
+	code, out := get("/quotes?codes=600000.SH,000001.SZ", "t0")
+	if code != http.StatusOK || out["ok"] != true {
+		t.Fatalf("/quotes 应 200, got %d %v", code, out)
+	}
+	ticks, _ := out["ticks"].(map[string]interface{})
+	if len(ticks) != 2 {
+		t.Fatalf("应回 2 只 tick, got %v", out["ticks"])
+	}
+	for _, c := range []string{"600000.SH", "000001.SZ"} {
+		tk, _ := ticks[c].(map[string]interface{})
+		if tk == nil {
+			t.Fatalf("缺 %s tick", c)
+		}
+		for _, f := range []string{"lastPrice", "open", "high", "low", "prevClose", "volume", "amount"} {
+			v, ok := tk[f].(float64)
+			if !ok || v <= 0 {
+				t.Fatalf("%s.%s 应为正数, got %v", c, f, tk[f])
+			}
+		}
+		if ms, _ := tk["tickTime"].(float64); ms < 1e12 {
+			t.Fatalf("tickTime 应为毫秒时间戳, got %v", tk["tickTime"])
+		}
+	}
+	// 确定性伪 tick 可重复拉取：二次请求结构一致（tick 随秒推进由真实网关保证，这里锁接口稳定）。
+	code2, out2 := get("/quotes?codes=600000.SH", "t0")
+	if code2 != http.StatusOK || out2["ok"] != true {
+		t.Fatalf("二次请求应稳定 200, got %d %v", code2, out2)
+	}
+	if ticks2, _ := out2["ticks"].(map[string]interface{}); len(ticks2) != 1 {
+		t.Fatalf("二次 ticks 结构错误: %v", out2["ticks"])
+	}
+	// /health 观察字段：feed_connected 存在（Go 侧 Health 判定不解析它，仅回显）
+	if _, hb := get("/health", ""); hb["feed_connected"] != true {
+		t.Fatalf("/health 应带 feed_connected=true 观察字段, got %v", hb["feed_connected"])
+	}
+}

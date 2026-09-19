@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )
 
@@ -303,4 +304,36 @@ func (c *QMTClient) FetchSettlement(date string) (*SettlementResponse, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// Quotes §ENH-5 批E：拉取 Level-1 全推行情（GET /quotes?codes=...）。
+// 入参/返回 key 均为裸 6 位码（网关侧代码带 .SH/.SZ/.BJ 后缀，收发两头做归一）；
+// 走 do() 复用 Bearer/transport/错误格式，但**不重试**——feed 是高频轮询，
+// 瞬断重试只会放大请求量，丢一轮由 1~3s 后的下一轮自然补。
+// English: §ENH-5 batch-E Level-1 feed. Bare-code in/out (suffix added for the gateway call);
+// no retries — the 1-3s poll loop self-heals, retrying would only amplify request volume.
+func (c *QMTClient) Quotes(ctx context.Context, codes []string) (map[string]data.QMTTick, error) {
+	if len(codes) == 0 {
+		return map[string]data.QMTTick{}, nil
+	}
+	suffixed := make([]string, 0, len(codes))
+	for _, code := range codes {
+		suffixed = append(suffixed, data.ExchangeSuffix(code)) // 已带后缀原样返回，未带按 6→SH/4·8·920→BJ/其余→SZ
+	}
+	var out struct {
+		OK    bool                    `json:"ok"`
+		Ticks map[string]data.QMTTick `json:"ticks"`
+	}
+	path := "/quotes?codes=" + strings.Join(suffixed, ",")
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	ticks := make(map[string]data.QMTTick, len(out.Ticks))
+	for k, v := range out.Ticks {
+		if i := strings.IndexByte(k, '.'); i > 0 {
+			k = k[:i] // 带后缀 key → 裸码，与 Fetcher.Stocks 的键口径一致
+		}
+		ticks[k] = v
+	}
+	return ticks, nil
 }

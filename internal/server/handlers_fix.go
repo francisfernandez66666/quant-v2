@@ -543,6 +543,10 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	finalCount := 0
 	monitored := 0
 	session := 99
+	// §ENH-5 批E：行情快照来源回显（"QMT-L1"=Level-1 feed 生效；其余为新浪/同花顺等降级链）
+	// 与快照陈旧度——供 nightly/Playwright 断言 feed 链路，纯观察不参与任何判定。
+	quoteSource := ""
+	quoteAgeSec := 0.0
 	if dash != nil {
 		rawCount = len(dash.NewsEvents)
 		matCount = rawCount
@@ -554,7 +558,9 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 	if s.fetcher != nil {
 		if snap := s.fetcher.Snapshot(); snap != nil {
 			monitored = len(snap.Stocks)
+			quoteSource = snap.Source
 		}
+		quoteAgeSec = s.fetcher.Staleness().Seconds()
 	}
 	now := time.Now()
 	// 交易时段判定统一走 data 包（含周末/休市）：9:15 集合竞价开盘，15:30 收盘后进入静默释放期。
@@ -571,6 +577,8 @@ func (s *Server) handleFixStatus(w http.ResponseWriter, r *http.Request) {
 		"in_trade_time": inTrade,
 		"active":        active,
 		"signal_count":  finalCount,
+		"quote_source":  quoteSource,
+		"quote_age_sec": quoteAgeSec,
 		// §A7（20260918 审计批）：下发后端二进制 git 指纹。部署脚本对后端与前端 dist 用同一
 		// checkout 构建（deploy_seoul.sh LDFLAGS 同源），故该值即"服务端配套前端版本"；
 		// APK 内嵌 assets 的构建指纹与之比对不一致时顶栏横幅告警。未注入时为 "unknown"，

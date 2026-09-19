@@ -64,6 +64,7 @@ from store import Store, is_placeholder_order_id, json_default  # noqa: E402
 from ids import Idempotency  # noqa: E402
 from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
 from handler import ReportHandler, periodic_reconcile, is_active_trading_session  # noqa: E402
+from quote_feed import QuoteFeed  # noqa: E402
 
 # 模块级日志器
 log = logging.getLogger("qmt_gateway")
@@ -89,6 +90,9 @@ DEFAULT_CONFIG = {
     "failover_sec": 60,                 # xt 断连超过该秒数触发自动翻转
     "bridge_heartbeat_timeout_sec": 15,  # 桥心跳新鲜窗口（超时视为离线）
     # §A1（AUDIT_FULLSTACK_20260918）网关侧独立风控（与首尔 risk.Gate 同语义，0/空=闸关闭）
+    # §ENH-5 批E 只读 L1 行情通道（xtdata get_full_tick 轮询；与交易链路完全隔离）
+    "quote_feed": True,             # feed 总开关（xtdata 缺失环境自动静默停用）
+    "feed_poll_sec": 3,             # 轮询间隔（秒，下限 1s）
     "max_order_amount": 0,              # 单笔金额绝对帽（元，买卖双向；amount 缺失回退 qty×price）
     "allowed_strategies": [],           # 战法白名单（非空时买入单 strategy_type 必须命中）
     "strict_fields": False,             # 白名单启用时缺 strategy_type 是否 fail-close 拒单
@@ -198,6 +202,8 @@ class Gateway:
         # 桥以 JSONL 文件上报事件（bridge_report.jsonl 追加行），由本线程读文件
         # 并复用 _do_dispatch_result 语义（心跳/快照/派发回报/推量仔零改动）。
         self._file_bridge_thread = None
+        # §ENH-5 批E：只读 L1 行情 feed（独立线程/独立异常域；断连只影响 feed_connected 观察字段）
+        self.feed = QuoteFeed(cfg)
         # §主备反转：queued（桥）最近一次心跳确认时间（failover 判定用）。
         # §P2-12（2026-09-15）：删除死字段 _xt_last_connected——2026-09-11 主备语义反转为
         # queued 主 / xt 备后，failover 判定只读 _queued_last_connected，旧字段仅剩误导读与
@@ -260,6 +266,8 @@ class Gateway:
         self._file_bridge_thread = threading.Thread(
             target=self._file_bridge_loop, daemon=True, name="file-bridge")
         self._file_bridge_thread.start()
+        # §ENH-5 批E：L1 行情 feed 线程（enable 关或 xtdata 缺失时内部静默降级）
+        self.feed.start()
         if self.cfg.get("reconcile_sec", 0) > 0:
             # active 通道运行时可变（自动翻转），对账源用 callable 取当前 active
             self._reconcile_thread = threading.Thread(
@@ -432,6 +440,7 @@ class Gateway:
         short timeout so pytest teardown no longer leaks live daemon threads."""
         self._stop.set()
         self.handler.stop_sender()
+        self.feed.stop()  # §ENH-5：feed 线程同样登记回收，防 pytest teardown 泄漏守护线程
         for th in (getattr(self, "_broker_thread", None),
                    getattr(self, "_failover_thread", None),
                    getattr(self, "_file_bridge_thread", None),
@@ -574,6 +583,10 @@ class Gateway:
             return self._do_admin_broker(body)
         if path == "/admin/status" and method == "GET":
             return self._do_admin_status()
+        if path.startswith("/quotes") and method == "GET":
+            # §ENH-5 批E：只读行情通道放在 broker 连接闸之前——xtdata 与 xttrader 是
+            # 两条独立通道，交易断连时行情应照常可查（行情可用性绝不与交易熔断互相污染）
+            return self._do_quotes(request_handler)
         if not self.active_broker.is_connected():
             return 503, {"ok": False, "err": "broker not connected"}
         if path == "/order" and method == "POST":
@@ -583,6 +596,34 @@ class Gateway:
         if path == "/state" and method == "GET":
             return self._do_state()
         return 404, {"ok": False, "err": "not found"}
+
+    def _do_quotes(self, request_handler=None):
+        """处理 GET /quotes?codes=600519.SH,600000.SH：Level-1 tick 只读查询（§ENH-5 批E）。
+
+        codes 必填（Go 侧 qmt_feed 每 1~3s 带全监控池来询）；返回体里 ticks 只含
+        命中的代码——feed 未接通（xtdata 缺失/刚启动）时为空 dict + 200，
+        Go 侧按"无命中不注入"处理，新浪链照常兜底。
+        English: read-only L1 tick query; empty ticks + 200 when the feed is not connected —
+        the Go side simply skips injection.
+        """
+        query = ""
+        if request_handler is not None:
+            query = urlparse(getattr(request_handler, "path", "") or "").query
+        params = parse_qs(query or "")
+        raw_codes = (params.get("codes") or [""])[0]
+        codes = [c.strip() for c in raw_codes.split(",") if c.strip()]
+        if not codes:
+            return 400, {"ok": False, "err": "codes required (comma separated, e.g. 600519.SH)"}
+        if not self.feed.enable:
+            return 200, {"ok": True, "ticks": {}, "feed_connected": False,
+                         "err": "quote feed disabled by config"}
+        ticks = self.feed.snapshot(codes)
+        return 200, {
+            "ok": True,
+            "ticks": ticks,
+            "feed_connected": self.feed.is_connected(),
+            "feed_age_sec": self.feed.age_sec(),
+        }
 
     def _health_payload(self):
         """组装 /health 响应：active 通道状态 + 双通道（xt/queued）状态。"""
@@ -598,6 +639,10 @@ class Gateway:
             payload["xt_connected"] = bool(self.brokers["xt"].is_connected())
         if "queued" in self.brokers:
             payload["queued_connected"] = bool(self.brokers["queued"].is_connected())
+        # §ENH-5：行情 feed 状态仅作观察字段——Go 侧 Health() 只解析 ok/broker_connected，
+        # xtdata 断连绝不参与交易熔断判定（计划铁律：行情面不得污染 §GAP2-W1 fail-closed 面）
+        payload["feed_connected"] = self.feed.is_connected()
+        payload["feed_age_sec"] = self.feed.age_sec()
         return payload
 
     def _do_dispatch_pending(self):

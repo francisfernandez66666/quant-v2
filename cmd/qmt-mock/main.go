@@ -402,6 +402,9 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 		writeJSON(w, map[string]interface{}{
 			"ok": true, "broker_connected": true, "ts": time.Now().Format(time.RFC3339),
 			"broker": ab, "broker_mode": ab, "xt_connected": true, "queued_connected": true,
+			// §ENH-5：feed_connected 仅为观察字段——Go 侧 Health() 判定 ok&&broker_connected
+			// 不含它，行情通道状态绝不参与交易熔断（防 §GAP2-W1 面被行情污染）。
+			"feed_connected": true,
 		})
 	})
 
@@ -449,6 +452,56 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			"positions": b.snapshotPositions(),
 			"orders":    orders,
 		})
+	})
+
+	// /quotes §ENH-5 批E：mock Level-1 全推行情（契约对齐真实网关 quote_feed：
+	// codes 逗号分隔带后缀、返回 {ok,ticks:{code:{lastPrice,open,high,low,prevClose,volume,amount,tickTime}}}）。
+	// tick 为确定性伪值：基价取自代码数字（10~100 元区间），秒级 ±1% 三角波扰动，
+	// 让 Go 侧 qmt_feed / nightly 能稳定断言"数据在动且可复现"。
+	// volume 单位=股（与新浪链一致；真实 xtdata 单位须在生产机 probe 校准）。
+	mux.HandleFunc("/quotes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		codesParam := r.URL.Query().Get("codes")
+		if strings.TrimSpace(codesParam) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, map[string]interface{}{"ok": false, "err": "codes required (comma separated)"})
+			return
+		}
+		nowSec := time.Now().Unix()
+		nowMs := nowSec * 1000
+		ticks := make(map[string]interface{})
+		for _, c := range strings.Split(codesParam, ",") {
+			c = strings.TrimSpace(c)
+			if c == "" {
+				continue
+			}
+			// 基价：代码数字部分模 90 + 10（元），保留两位小数
+			digits := int64(0)
+			for _, ch := range c {
+				if ch >= '0' && ch <= '9' {
+					digits = digits*10 + int64(ch-'0')
+				}
+			}
+			baseCent := (digits%90 + 10) * 100 // 元→分，1000~9900 分
+			// 三角波：秒数模 100 映射到 ±1% 振幅（分），保证价格逐秒变化且可复现
+			phase := (nowSec % 100) - 50
+			priceCent := baseCent + baseCent*phase/5000
+			vol := float64(baseCent*1000 + (nowSec%60)*1000) // 股，单调递增的假累计量
+			ticks[c] = map[string]interface{}{
+				"lastPrice": float64(priceCent) / 100,
+				"open":      float64(baseCent-50) / 100,
+				"high":      float64(priceCent+30) / 100,
+				"low":       float64(priceCent-30) / 100,
+				"prevClose": float64(baseCent) / 100,
+				"volume":    vol,
+				"amount":    vol * float64(priceCent) / 100,
+				"tickTime":  nowMs,
+			}
+		}
+		writeJSON(w, map[string]interface{}{"ok": true, "ticks": ticks, "feed_connected": true})
 	})
 
 	// /order 下单：受理即返回 order_id 并推"已报"，延时后模拟成交推"已成"+trade。
