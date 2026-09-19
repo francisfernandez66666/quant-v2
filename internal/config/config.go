@@ -759,6 +759,12 @@ type LifecycleConfig struct {
 	MinDailyTrades int `json:"min_daily_trades"`
 	// DryRun 只报告不落库（上线初期观察用；确认误杀率后再关）
 	DryRun bool `json:"dry_run"`
+	// ZeroObsDays §RFIX-3 零观测告警阈值（天）：已启用战法连续零成交 ≥ 该天数 → 推送告警。
+	// 0=走 research 内置默认 30，负数=关闭告警。
+	ZeroObsDays int `json:"zero_obs_days"`
+	// PendingExpireDays §RFIX-4 寻优 pending 过期天数：夜间 lifecycle 步骤把超过该天数
+	// 仍未审批的 optimization_results 行置 expired。0=默认 30。
+	PendingExpireDays int `json:"pending_expire_days"`
 }
 
 // DataloadDuringTradeConfig 交易时段增量下载配置（只下载，不含任何研究/回测）。
