@@ -128,4 +128,13 @@ describe('api - approveOptimization 请求体', () => {
     const [, opts] = global.fetch.mock.calls[0]
     expect(JSON.parse(opts.body)).toEqual({ params: p })
   })
+
+  // §RFIX-3 应用守卫：后端在非阻断应用成功后回 {status, warning}，api 层必须原样透出
+  // warning 字段（页面据此弹提示）——丢字段=守卫失效。
+  it('§RFIX-3 响应 warning 字段原样透出', async () => {
+    const warn = '已把买入阈值覆盖为 95（候选缺省 70），且候选产出期样本内预期触发=0 只/日'
+    jsonReply({ status: 'approved', id: 7, warning: warn })
+    const res = await api.approveOptimization(7, { min_score: 95 })
+    expect(res).toMatchObject({ status: 'approved', warning: warn })
+  })
 })

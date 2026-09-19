@@ -1056,3 +1056,36 @@ test.describe('修复回归 · §ENH-4 事件因子展示', () => {
     await page.screenshot({ path: `${SHOT}/branch-research-eventfactor.png`, fullPage: true })
   })
 })
+
+// §RFIX-3/4 批（2026-09-19 战法层修复）：寻优列表状态机契约——expired 新终态
+// 默认过滤（夜间 lifecycle 把超期 pending 置 expired），?all=1 全量可见且只出现
+// 合法四态；阈值覆盖守卫（warning 回显）的数据侧语义由 Go 单测
+// TestThresholdOverrideWarning 锁死，本用例只做接口契约不审批（避免污染共享栈）。
+test.describe('修复回归 · §RFIX 寻优状态机契约', () => {
+  test('RW-1 /api/research/optimizations：默认列表无 expired 行', async ({ page }) => {
+    await page.goto('/#/research')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const resp = await page.request.get('/api/research/optimizations', { headers: hdr })
+    expect(resp.status()).toBe(200)
+    const body = await resp.json()
+    for (const t of (body.optimizations || [])) {
+      for (const r of (t.results || [])) {
+        expect(r.status, '默认列表不得混入 expired 行').not.toBe('expired')
+      }
+    }
+  })
+
+  test('RW-2 ?all=1：状态只落合法四态集合', async ({ page }) => {
+    await page.goto('/#/research')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const resp = await page.request.get('/api/research/optimizations?all=1', { headers: hdr })
+    expect(resp.status()).toBe(200)
+    const body = await resp.json()
+    const valid = new Set(['pending', 'approved', 'rejected', 'expired'])
+    for (const t of (body.optimizations || [])) {
+      for (const r of (t.results || [])) {
+        expect(valid.has(r.status), '非法状态: ' + r.status).toBe(true)
+      }
+    }
+  })
+})
