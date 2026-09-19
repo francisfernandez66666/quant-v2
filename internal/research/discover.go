@@ -82,6 +82,11 @@ type DiscoverResult struct {
 	Trig70   float64
 	Trig95   float64
 	TrigDays int
+	// §ENH-B 多重检验稳健性：Trials=坐标上升评估过的组合数（DSR 折减基数）；
+	// PBO=样本外 4 块同号块数/非平凡块数（PBOTotal=0 表示样本外不足以分块）。
+	Trials        int
+	PBOConsistent int
+	PBOTotal      int
 }
 
 // DiscoverFactors 执行因子子集选择 + 分段/反推验证。
@@ -255,6 +260,9 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 	res.TrigDays = est.Days
 	res.Trig70 = est.PerDay[70]
 	res.Trig95 = est.PerDay[95]
+	// §ENH-B 稳健性原料：试验计数（DSR 折减基数）+ PBO-lite 样本外 4 块符号一致性。
+	res.Trials = opt.Trials
+	res.PBOConsistent, res.PBOTotal = PBOSignConsistency(outRows, 4, 5)
 
 	// 样本外护栏：样本外 IR 也需达标才视为稳健
 	if res.OutsampleIR < opts.MinIR {

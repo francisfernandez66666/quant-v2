@@ -723,6 +723,29 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 			log.Printf("§C2 护栏不够（样本外IR=%.3f<%.3f），不落库：因子=%v", res.OutsampleIR, *guardWeak, res.Factors)
 			continue
 		}
+		// §ENH-B 多重检验软降级（观察期不硬 reject）：坐标上升共评估 trials 个组合，
+		// 纯噪声海选最优 IR 的期望 ≈ sqrt(2lnN/T)；DSR<0 = 冠军与噪声最优不可区分 →
+		// C2 档位下调一级（strong→standard→weak），reason/params 全量透出供审计。
+		trials := res.Trials
+		if trials < 1 {
+			trials = 1
+		}
+		dsr := research.DeflatedIR(res.InsampleIR, trials, res.NDays)
+		robustNote := fmt.Sprintf(" DSR=%.3f trials=%d", dsr, trials)
+		if dsr < 0 {
+			if dt := downgradeGuardTier(tier); dt != tier {
+				robustNote = fmt.Sprintf("[多重检验软降级 %s→%s]", tier, dt) + robustNote
+				tier = dt
+			} else {
+				robustNote = "[多重检验不足-已在最低档]" + robustNote
+			}
+		}
+		if res.PBOTotal > 0 {
+			robustNote += fmt.Sprintf(" PBO=%d/%d", res.PBOConsistent, res.PBOTotal)
+			if res.PBOConsistent*2 < res.PBOTotal {
+				robustNote += "(跨块稳定性不足)"
+			}
+		}
 		// C4 参数快照：精确复现审批战法的全量参数 JSON。
 		// §RFIX-2 dir_fit 标记：候选方向为样本内符号拟合（dirOfCat 先验 + IS 带符号 IR 裁决），
 		// 供审计复现时区分新旧口径。
@@ -732,6 +755,9 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 			"split": *split, "min_ir": *minIR, "min_days": *minDays, "min_gen_t": *minGenT,
 			"metric": *metric, "guard_strong": *guardStrong, "guard_weak": *guardWeak,
 			"min_yr_sign": *minYrSign, "dir_fit": "in-sample-sign",
+			// §ENH-B 稳健性审计字段：DSR 折减后 IR、试验次数、PBO-lite 同号块/非平凡块。
+			"dsr": fmt.Sprintf("%.3f", dsr), "trials": trials,
+			"pbo": fmt.Sprintf("%d/%d", res.PBOConsistent, res.PBOTotal),
 		})
 		fj, _ := json.Marshal(res.Factors)
 		// E6：方向与权重一并存盘，供实盘因子 runner 恢复完整规则。
@@ -755,6 +781,8 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 		if tier == "weak" {
 			reason = "[弱护栏-观察] " + reason
 		}
+		// §ENH-B 稳健性摘要（DSR/PBO/软降级标记）随 reason 落库，审批页直接可见。
+		reason += robustNote
 		id, err := db.SaveCandidate(&store.Candidate{
 			Kind: "factor", Status: store.CandProposed, Guard: tier, Params: string(params),
 			Factors: string(fj), Weights: string(ruleJSON),
@@ -793,6 +821,19 @@ func factorTrigNote(res research.DiscoverResult) string {
 		return fmt.Sprintf(" 预期触发=0（阈值70，样本内%d日均未触发，应用前请校准阈值）", res.TrigDays)
 	}
 	return fmt.Sprintf(" 预期触发≈%.1f只/日(阈值70) %.1f只/日(阈值95)", res.Trig70, res.Trig95)
+}
+
+// downgradeGuardTier §ENH-B DSR 软降级一档：strong→standard→weak（weak 已最低，原样返回）。
+// 只降档不 reject——观察期先看标注效果，误杀率确认后再议硬门。
+// English: one-notch guard downgrade (strong→standard→weak); never a hard reject during the trial period.
+func downgradeGuardTier(tier string) string {
+	switch tier {
+	case "strong":
+		return "standard"
+	case "standard":
+		return "weak"
+	}
+	return tier
 }
 
 // factorGuardTier §C2 护栏分级：基于样本外 IR 判定 strong/standard/weak/reject。

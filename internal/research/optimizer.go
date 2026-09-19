@@ -49,6 +49,9 @@ type OptResult struct {
 	NDays     int     // 有效评估天数
 	PassGuard bool    // 是否通过护栏校验
 	Reason    string  // 护栏判定理由（未通过时说明原因）
+	// Trials §ENH-B 试验计数：坐标上升累计评估过的权重组合数（含初值），
+	// 供 DSR 多重检验折减（DeflatedIR）使用。
+	Trials int
 }
 
 // OptimizeWeights 用坐标上升搜索因子权重，最大化复合 |IR|（或 |IC|）。
@@ -82,6 +85,7 @@ func OptimizeWeights(panels []*Panel, opts OptimizeOpts) OptResult {
 	}
 	w = cloneWeights(w)
 	best := evaluate(panels, opts, w)
+	trials := 1 // §ENH-B 试验计数：初值 + 每次坐标上升评估都算一次试验（DSR 折减基数）
 
 	// 坐标上升：对每个因子试"增/减 step 后归一化"，保留最优
 	// English: coordinate ascent: for each factor try "increase/decrease by step then normalize", keep the best.
@@ -95,6 +99,7 @@ func OptimizeWeights(panels []*Panel, opts OptimizeOpts) OptResult {
 					cand[f] = 0
 				}
 				r := evaluate(panels, opts, cand)
+				trials++
 				if better(r, best, opts.Metric) {
 					best = r
 					w = cand
@@ -106,6 +111,7 @@ func OptimizeWeights(panels []*Panel, opts OptimizeOpts) OptResult {
 			break
 		}
 	}
+	best.Trials = trials
 	best.Weights = cloneWeights(w) // 末尾再归一化一次（候选 bump 后未归一）
 	// English: re-normalize once at the end (candidate was not normalized after the bump).
 	// 护栏判定

@@ -494,6 +494,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 	}
 	w = cloneWeights(w)
 	best := windowEval(db, codes, opts, w, chunks, dates)
+	trials := 1 // §ENH-B 试验计数（与 OptimizeWeights 同口径：初值+每次候选评估）
 	for it := 0; it < opts.MaxIter; it++ {
 		improved := false
 		for _, f := range opts.Factors {
@@ -504,6 +505,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 					cand[f] = 0
 				}
 				r := windowEval(db, codes, opts, cand, chunks, dates)
+				trials++
 				if better(r, best, opts.Metric) {
 					best = r
 					w = cand
@@ -515,6 +517,7 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 			break
 		}
 	}
+	best.Trials = trials
 	best.Weights = cloneWeights(w)
 	ir := math.Abs(best.IR)
 	switch {
@@ -731,6 +734,9 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		res.TrigDays = est.Days
 		res.Trig70 = est.PerDay[70]
 		res.Trig95 = est.PerDay[95]
+		// §ENH-B 稳健性原料（与 legacy 内核同口径）：试验计数 + PBO-lite 4 块符号一致性。
+		res.Trials = opt.Trials
+		res.PBOConsistent, res.PBOTotal = PBOSignConsistency(outRows, 4, 5)
 
 		res.Factors = selected
 		res.Directions = dirs
