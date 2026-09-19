@@ -1027,3 +1027,32 @@ test.describe('修复回归 · §ENH-5 L1 行情 feed 回显', () => {
     expect(bad.status()).toBe(400)
   })
 })
+
+// §ENH-4 批D：事件因子检验（研究页回测 tab 卡 + /api/research/event-factor 契约）。
+// UAT 栈未生成 event_factor_report.json，故断言"未生成"分支的诚实回显与卡片指引文案；
+// 已生成场景（exists:true 渲染表格）由 Go 单测 TestEventFactor* 锁数据侧语义。
+test.describe('修复回归 · §ENH-4 事件因子展示', () => {
+  test('EF-1 /api/research/event-factor 契约：200 + exists 布尔回显', async ({ page }) => {
+    await page.goto('/#/research')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const resp = await page.request.get('/api/research/event-factor', { headers: hdr })
+    expect(resp.status()).toBe(200)
+    const body = await resp.json()
+    if (Array.isArray(body)) {
+      // 报告已生成：直接是 FactorReport 数组，逐条必须带验证口径字段
+      for (const r of body) expect(r, '报告行需含 horizon').toHaveProperty('horizon')
+    } else {
+      expect(body, '未生成时必须回 {exists:false} 显式空态').toHaveProperty('exists', false)
+    }
+  })
+
+  test('EF-2 研究页回测 tab：事件因子卡渲染 + 未生成指引', async ({ page }) => {
+    await page.goto('/#/research')
+    await page.getByText('回测').first().click()
+    const card = page.locator('.t-card', { hasText: '事件因子检验' })
+    await expect(card, '回测 tab 必须含事件因子卡').toBeVisible({ timeout: 10000 })
+    // 报告未生成 → 指引文案（诚实空态，禁止假表格/假数字）
+    await expect(card).toContainText(/尚未生成|执行.*event-layers|暂无/, { timeout: 8000 })
+    await page.screenshot({ path: `${SHOT}/branch-research-eventfactor.png`, fullPage: true })
+  })
+})
