@@ -146,6 +146,9 @@ func main() {
 	case "hithink-sync":
 		// §同花顺（新）主源同步：dump 拉取 → 流式解析 → ths_daily 幂等入库。
 		cmdHithinkSync(db, args[1:])
+	case "ths-backfill":
+		// §ENH-A 盘口三池历史回填（涨停微结构因子面板需要 ≥1 年事件历史）。
+		cmdThsBackfill(db, args[1:])
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}

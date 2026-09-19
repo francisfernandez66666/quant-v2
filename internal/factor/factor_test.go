@@ -51,8 +51,9 @@ func TestRegistry(t *testing.T) {
 		}
 		lastID = d.ID
 	}
-	if len(cats) != 8 {
-		t.Fatalf("应覆盖 8 大类，实际 %d: %v", len(cats), cats)
+	// §ENH-A 新增第 9 大类 CatLimit（涨停微结构）：注册表覆盖 9 大类。
+	if len(cats) != 9 {
+		t.Fatalf("应覆盖 9 大类，实际 %d: %v", len(cats), cats)
 	}
 	// 每类中文名有效
 	// English: Chinese name valid for every category.

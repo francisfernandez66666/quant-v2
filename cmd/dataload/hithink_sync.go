@@ -224,18 +224,53 @@ func prevStr(d string) string {
 // cmdHithinkSyncPools 盘后三池+连板天梯入库。
 // dateFlag 为 yyyyMMdd；缺省=今日（API 缺省当日）。
 func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag string) {
+	n1, err := syncPoolsForDate(client, db, dateFlag)
+	if err != nil {
+		log.Fatalf("盘口同步失败: %v", err)
+	}
 	tradeDate := dateFlag
-	var dateMs int64
 	if tradeDate == "" {
 		tradeDate = time.Now().Format("20060102")
 	}
+	// 连板天梯为当日快照接口（无历史参数），仅在同步"今日"时追加。
+	if tradeDate == time.Now().Format("20060102") {
+		lad, lerr := client.LimitUpLadderEntries()
+		if lerr != nil {
+			log.Fatalf("连板天梯拉取失败: %v", lerr)
+		}
+		ladRows := make([]store.ThsLadderRow, 0, len(lad))
+		for _, e := range lad {
+			ladRows = append(ladRows, store.ThsLadderRow{TradeDate: e.TradeDate,
+				BoardNum: e.BoardNum, TsCode: e.ThsCode, Name: e.Name,
+				SealNextDay: e.SealNextDay, SignLevel: e.SignLevel})
+		}
+		n4, err := db.UpsertThsLadder(ladRows)
+		if err != nil {
+			log.Fatalf("天梯写入失败: %v", err)
+		}
+		log.Printf("[hithink] 连板天梯 %d 行", n4)
+	}
+	cnt, _ := db.LimitUpCountOnDate(tradeDate)
+	log.Printf("[hithink] 盘口同步完成(trade_date=%s)：涨停池 %d 行(当日家数 %d)", tradeDate, n1, cnt)
+}
+
+// syncPoolsForDate 三池（涨停/跌停/炸板）单日同步核心：拉取+幂等 upsert，返回涨停池行数。
+// 错误一律上抛（供 §ENH-A ths-backfill 逐日循环容错续跑；pools 子命令外层转 Fatal）。
+// English: per-date three-pool sync core returning an error so the backfill loop can
+// skip/retry days instead of aborting.
+func syncPoolsForDate(client *data.HithinkClient, db *store.DB, dateFlag string) (int64, error) {
+	tradeDate := dateFlag
+	if tradeDate == "" {
+		tradeDate = time.Now().Format("20060102")
+	}
+	var dateMs int64
 	if t, err := time.ParseInLocation("20060102", tradeDate, time.Local); err == nil {
 		dateMs = t.UnixMilli()
 	}
 
 	up, err := client.LimitUpPool(dateMs)
 	if err != nil {
-		log.Fatalf("涨停池拉取失败: %v", err)
+		return 0, fmt.Errorf("涨停池拉取失败(%s): %w", tradeDate, err)
 	}
 	luRows := make([]store.ThsLimitUpRow, 0, len(up))
 	for _, it := range up {
@@ -250,26 +285,25 @@ func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag stri
 	}
 	n1, err := db.UpsertThsLimitUps(luRows)
 	if err != nil {
-		log.Fatalf("涨停池写入失败: %v", err)
+		return n1, fmt.Errorf("涨停池写入失败(%s): %w", tradeDate, err)
 	}
 
 	dn, err := client.LimitDownPool(dateMs)
 	if err != nil {
-		log.Fatalf("跌停池拉取失败: %v", err)
+		return n1, fmt.Errorf("跌停池拉取失败(%s): %w", tradeDate, err)
 	}
 	dnMap := make(map[string]store.ThsPoolSimple, len(dn))
 	for _, it := range dn {
 		dnMap[it.ThsCode] = store.ThsPoolSimple{Name: it.Name, Price: it.LastPrice,
 			PctChg: it.PriceChangeRatioPct, TurnoverRatioPct: it.TurnoverRatioPct}
 	}
-	n2, err := db.UpsertThsSimplePool("ths_limit_down_daily", tradeDate, dnMap)
-	if err != nil {
-		log.Fatalf("跌停池写入失败: %v", err)
+	if _, err := db.UpsertThsSimplePool("ths_limit_down_daily", tradeDate, dnMap); err != nil {
+		return n1, fmt.Errorf("跌停池写入失败(%s): %w", tradeDate, err)
 	}
 
 	bk, err := client.LimitBreakPool(dateMs)
 	if err != nil {
-		log.Fatalf("炸板池拉取失败: %v", err)
+		return n1, fmt.Errorf("炸板池拉取失败(%s): %w", tradeDate, err)
 	}
 	bkMap := make(map[string]store.ThsPoolSimple, len(bk))
 	for _, it := range bk {
@@ -277,29 +311,10 @@ func cmdHithinkSyncPools(client *data.HithinkClient, db *store.DB, dateFlag stri
 			PctChg: it.PriceChangeRatioPct, OpenTimes: it.OpenTimes,
 			TurnoverRatioPct: it.TurnoverRatioPct, Turnover: it.Turnover}
 	}
-	n3, err := db.UpsertThsSimplePool("ths_break_pool_daily", tradeDate, bkMap)
-	if err != nil {
-		log.Fatalf("炸板池写入失败: %v", err)
+	if _, err := db.UpsertThsSimplePool("ths_break_pool_daily", tradeDate, bkMap); err != nil {
+		return n1, fmt.Errorf("炸板池写入失败(%s): %w", tradeDate, err)
 	}
-
-	lad, err := client.LimitUpLadderEntries()
-	if err != nil {
-		log.Fatalf("连板天梯拉取失败: %v", err)
-	}
-	ladRows := make([]store.ThsLadderRow, 0, len(lad))
-	for _, e := range lad {
-		ladRows = append(ladRows, store.ThsLadderRow{TradeDate: e.TradeDate,
-			BoardNum: e.BoardNum, TsCode: e.ThsCode, Name: e.Name,
-			SealNextDay: e.SealNextDay, SignLevel: e.SignLevel})
-	}
-	n4, err := db.UpsertThsLadder(ladRows)
-	if err != nil {
-		log.Fatalf("天梯写入失败: %v", err)
-	}
-
-	cnt, _ := db.LimitUpCountOnDate(tradeDate)
-	log.Printf("[hithink] 盘口同步完成(trade_date=%s)：涨停池 %d 行(当日家数 %d) / 跌停 %d / 炸板 %d / 天梯 %d",
-		tradeDate, n1, cnt, n2, n3, n4)
+	return n1, nil
 }
 
 // cmdHithinkSyncAnomaly 当日全市场异动原因入库（D1 归因辅证 + 消息推送数据源）。

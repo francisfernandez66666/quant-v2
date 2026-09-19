@@ -548,6 +548,10 @@ func (d *DB) migrate() error {
 			factor REAL NOT NULL,
 			PRIMARY KEY (ts_code, trade_date)
 		)`,
+		// §ENH-A 单票涨停微结构因子面板装配：逐股 (ts_code, trade_date) 索引 seek，
+		// 免全表扫（夜间逐窗 5000 股装配；置于三池建表之后，fresh DB 顺序安全）。
+		`CREATE INDEX IF NOT EXISTS idx_ths_lu_code ON ths_limit_up_daily(ts_code, trade_date)`,
+		`CREATE INDEX IF NOT EXISTS idx_ths_bk_code ON ths_break_pool_daily(ts_code, trade_date)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {

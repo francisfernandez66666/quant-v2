@@ -505,14 +505,16 @@ func compositeScore(p *Panel, factors []string, dirs map[string]int, weights map
 	return total
 }
 
-// dirOfCat 因子类别 → 默认方向：价值/成长/质量/动量/流动性看多（+1），规模/波动率看空（-1）。
+// dirOfCat 因子类别 → 默认方向：价值/成长/质量/动量/流动性/涨停微结构看多（+1），规模/波动率看空（-1）。
 // 与 backtest.dirOf 语义一致，保证发现的组合在 B4 回测中方向自洽。
-// English: factor-category default direction — value/growth/quality/momentum/liquidity long (+1),
-// size/volatility short (-1). Consistent with backtest.dirOf so discovered combos backtest coherently.
+// §ENH-A：CatLimit（连板/封单/首封）语义"数值越高越强势"取先验 +1；最终方向仍由
+// §RFIX-2 样本内符号拟合裁决。
+// English: factor-category default direction — value/growth/quality/momentum/liquidity/limit-up-micro
+// long (+1), size/volatility short (-1). Consistent with backtest.dirOf so discovered combos backtest coherently.
 func dirOfCat(c factor.Category) int {
 	switch c {
 	case factor.CatValue, factor.CatGrowth, factor.CatQuality,
-		factor.CatMomentum, factor.CatLiquidity:
+		factor.CatMomentum, factor.CatLiquidity, factor.CatLimit:
 		return 1
 	default: // 规模/波动率
 		return -1

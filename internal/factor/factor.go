@@ -40,6 +40,8 @@ const (
 	CatMomentum                   // 动量/反转
 	CatLiquidity                  // 流动性
 	CatSentiment                  // 情绪（涨停/炸板/连板高度市场状态）
+	// CatLimit §ENH-A 涨停微结构（单票连板/封单/炸板/首封时间——同花顺三池按日对齐）。
+	CatLimit
 )
 
 // CategoryName 返回类别中文名。
@@ -61,6 +63,8 @@ func (c Category) CategoryName() string {
 		return "流动性"
 	case CatSentiment:
 		return "情绪"
+	case CatLimit:
+		return "涨停微结构"
 	}
 	return "未知"
 }
@@ -100,6 +104,14 @@ type StockSeries struct {
 	EmoBreakCnt  []float64 // 当日炸板家数
 	EmoMaxBoard  []float64 // 当日最高连板
 	EmoBlastRate []float64 // 当日炸板率（%）
+
+	// §ENH-A 单票涨停微结构（ths_limit_up_daily / ths_break_pool_daily 按日对齐；
+	// 由 research.Assemble 逐股索引 seek 装载。非事件日：连板数/炸板次数/封单比=0，
+	// 首封分钟=NaN；数据收录范围外整列 NaN 由因子层过滤）。
+	LimitBoard   []float64 // 当日连板数（非涨停日 0）
+	SealAmtRatio []float64 // 峰值封单额/流通市值（非涨停日 0；流通市值缺失 NaN）
+	BreakCnt     []float64 // 当日开板（炸板）次数（炸板池 open_times；无记录 0）
+	FirstSealMin []float64 // 首封时间（当日 0 点起分钟数，如 09:35=575；非涨停日 NaN）
 }
 
 // Len 返回序列长度。

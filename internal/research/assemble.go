@@ -114,7 +114,55 @@ func Assemble(db *store.DB, code, start, end string) (*factor.StockSeries, error
 			s.SingleQuarterNIYoy[i] = f.sue
 		}
 	}
+	// §ENH-A 单票涨停微结构装载：ths 三池按 (ts_code, trade_date) 索引 seek 取该股事件行，
+	// 按日对齐进 StockSeries（非涨停日 连板数/炸板次数/封单比=0、首封=NaN）。
+	// 面板逐股每窗一次查询、行数=该股涨停事件数（几十行），成本可忽略。
+	luEvents, luErr := db.LimitUpsForCode(code, start, end)
+	breakCntByDate, bkErr := db.BreakCntForCode(code, start, end)
+	if luErr == nil || bkErr == nil {
+		dateIdx := make(map[string]int, len(s.Dates))
+		for i, d := range s.Dates {
+			dateIdx[d] = i
+		}
+		for i, d := range s.Dates {
+			s.LimitBoard[i], s.SealAmtRatio[i], s.BreakCnt[i] = 0, 0, math.NaN()
+			s.FirstSealMin[i] = math.NaN()
+			if n, ok := breakCntByDate[d]; ok {
+				s.BreakCnt[i] = float64(n)
+			}
+		}
+		for _, ev := range luEvents {
+			i, ok := dateIdx[ev.TradeDate]
+			if !ok {
+				continue
+			}
+			s.LimitBoard[i] = float64(ev.ContinueCnt)
+			s.FirstSealMin[i] = parseHHMMToMin(ev.FirstSealTime)
+			// 封单比 = 峰值封单额 / 流通市值（daily_basic 万元口径 ×1e4 归元）；
+			// 流通市值缺失记 NaN（不能折算成 0——那会把"缺数据"误判成"无封单"）。
+			if cmv := basicByDate[ev.TradeDate].CircMV; cmv > 0 && ev.MaxSealMoney > 0 {
+				s.SealAmtRatio[i] = ev.MaxSealMoney / (cmv * 1e4)
+			} else if ev.MaxSealMoney > 0 {
+				s.SealAmtRatio[i] = math.NaN()
+			} else {
+				s.SealAmtRatio[i] = 0
+			}
+		}
+	}
 	return s, nil
+}
+
+// parseHHMMToMin "HH:MM" → 当日 0 点起分钟数（"09:35"=575）；空/非法返回 NaN。
+// English: "HH:MM" to minutes-from-midnight; empty/invalid → NaN.
+func parseHHMMToMin(hhmm string) float64 {
+	if len(hhmm) < 4 {
+		return math.NaN()
+	}
+	var h, m int
+	if _, err := fmt.Sscanf(hhmm[:5], "%d:%d", &h, &m); err != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return math.NaN()
+	}
+	return float64(h*60 + m)
 }
 
 // finaPITValue 点对时后的财务值。
@@ -191,6 +239,11 @@ func fillSlices(s *factor.StockSeries, n int) {
 	s.EmoBreakCnt = make([]float64, n)
 	s.EmoMaxBoard = make([]float64, n)
 	s.EmoBlastRate = make([]float64, n)
+	// §ENH-A 涨停微结构四列（默认 NaN，Assemble 装载后非事件日为 0/NaN 语义）。
+	s.LimitBoard = make([]float64, n)
+	s.SealAmtRatio = make([]float64, n)
+	s.BreakCnt = make([]float64, n)
+	s.FirstSealMin = make([]float64, n)
 	s.Turnover = make([]float64, n)
 	s.PeTTM = make([]float64, n)
 	s.Pb = make([]float64, n)

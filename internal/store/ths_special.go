@@ -88,6 +88,60 @@ func (d *DB) LimitUpCountOnDate(date string) (int, error) {
 	return n, err
 }
 
+// ── §ENH-A 单票涨停微结构查询（因子面板装配用）──
+
+// LuEventRow 涨停池个股事件行（面板装配消费的最小字段集）。
+type LuEventRow struct {
+	TradeDate     string  // 交易日 yyyyMMdd
+	ContinueCnt   int     // 连板数
+	FirstSealTime string  // 首封时间 HH:MM
+	MaxSealMoney  float64 // 峰值封单额（元）
+}
+
+// LimitUpsForCode 某标的区间内的涨停池事件行（升序）。索引 (ts_code, trade_date) 支持
+// 面板逐股装配 O(事件数) 读取（生产 5000 股×逐窗调用，不能全表扫）。
+// English: per-code limit-up events over a range, ascending — index-backed for panel assembly.
+func (d *DB) LimitUpsForCode(code, from, to string) ([]LuEventRow, error) {
+	rows, err := d.db.Query(`SELECT trade_date, continue_cnt, first_seal_time, max_seal_money
+		FROM ths_limit_up_daily WHERE ts_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date`,
+		code, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LuEventRow
+	for rows.Next() {
+		var r LuEventRow
+		var fts string
+		if err := rows.Scan(&r.TradeDate, &r.ContinueCnt, &fts, &r.MaxSealMoney); err != nil {
+			return nil, err
+		}
+		r.FirstSealTime = fts
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// BreakCntForCode 某标的区间内逐日开板（炸板）次数：date → open_times。
+// English: per-code daily blast (re-open) counts over a range.
+func (d *DB) BreakCntForCode(code, from, to string) (map[string]int, error) {
+	rows, err := d.db.Query(`SELECT trade_date, open_times FROM ths_break_pool_daily
+		WHERE ts_code=? AND trade_date BETWEEN ? AND ?`, code, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var dt string
+		var n int
+		if err := rows.Scan(&dt, &n); err == nil {
+			out[dt] = n
+		}
+	}
+	return out, rows.Err()
+}
+
 // ── 跌停池 / 炸板池（结构对称，字段较少）──
 
 // ThsBreakRow 炸板池单行（开板次数 = 炸板证据）。

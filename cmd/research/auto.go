@@ -837,6 +837,7 @@ func resolveFactorPool(explicit, pool string) []string {
 		"volatility":    factor.CatVolatility,
 		"momentum":      factor.CatMomentum,
 		"liquidity":     factor.CatLiquidity,
+		"limit":         factor.CatLimit, // §ENH-A 涨停微结构子池（打板/情绪战法搜索空间）
 		"mom_liq":       factor.CatMomentum,
 		"value_quality": factor.CatValue,
 		"vol_size":      factor.CatVolatility,
