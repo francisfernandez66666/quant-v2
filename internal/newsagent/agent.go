@@ -33,6 +33,10 @@ type Agent struct {
 	// English: news-event local persistence file path (news_events.json)
 	frozenPath string // 固化事件持久化文件路径（frozen_events.json）
 	// English: frozen-event persistence file path (frozen_events.json)
+	historyPath string // §ENH-3 历史事件归档 JSONL（news_event_history.jsonl，换日追加、永不清空）
+	// English: append-only event history archive (rollover flush, never cleared)
+	histCache historyCache // 归档内存缓存（mtime+size 失效）
+	// English: in-memory archive cache keyed by mtime+size
 	minScore float64 // 落盘过滤最低分（默认 0.25；前端"显示全部"开关可改为 0）
 	// English: minimum |score| to persist (default 0.25; the frontend "show all" toggle can set 0)
 	bootCache map[string]bool // IPO启动分析缓存：交易日:代码 → 已分析
@@ -97,7 +101,9 @@ func New(marketAPI *data.MarketAPI, llmClient *llm.Client, cleaner *data.StockCl
 		dataDir:    dataDir,
 		newsDBPath: filepath.Join(dataDir, "news_events.json"),
 		frozenPath: filepath.Join(dataDir, "frozen_events.json"),
-		minScore:   0.25, // 默认最低落盘分 0.25（前端"显示全部"可降为 0）
+		// §ENH-3(20260919 批B)：历史事件归档 JSONL——咨询 RAG 与事件因子研究的共同地基
+		historyPath: filepath.Join(dataDir, "news_event_history.jsonl"),
+		minScore:    0.25, // 默认最低落盘分 0.25（前端"显示全部"可降为 0）
 		// English: default minimum persist score 0.25 (the frontend "show all" toggle can lower it to 0)
 	}
 }
@@ -336,6 +342,11 @@ func (a *Agent) saveNewsEvents(events []NewsEvent) {
 	// 跨交易日则清空旧事件，重新按新交易日归档
 	// English: on a new trading day, clear old events and re-archive under the new trading day
 	if existing.TradingDay != td {
+		// §ENH-3：清空前先把旧事件归档（旧交易日 → JSONL 追加一行一条）；
+		// TradingDay 为空（首启/坏文件）时旧事件本就没有，跳过。
+		if existing.TradingDay != "" && len(existing.Events) > 0 {
+			a.appendEventHistory(existing.TradingDay, existing.Events)
+		}
 		existing.TradingDay = td
 		existing.Events = nil
 	}

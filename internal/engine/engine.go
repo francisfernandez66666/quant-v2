@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
@@ -2633,7 +2634,8 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 		now.Format("2006-01-2 15:04:05") + "，" + freshness + "）：\n")
 	sb.WriteString("【要求】仅可引用下列提供的数据与对话历史；未提供的信息（如同板块个股、期指贴水、撤单、盘口等）如实说明" +
 		"无法获取，严禁编造净流入/成交量/涨跌/触发等任何具体数字；净流入口径=主力(超大单+大单)，东方财富；" +
-		"资金明细/净流入均为抓取当日累计口径（非盘中即时增量），引用时须带【当日累计】限定。\n")
+		"资金明细/净流入均为抓取当日累计口径（非盘中即时增量），引用时须带【当日累计】限定；" +
+		"如有『历史同类事件』段，其中的数字与走向均属往日发生，引用必须带发生日期，且不得当作今日行情。\n")
 
 	for _, code := range order {
 		sb.WriteString(e.buildStockBlock(code, codes[code]))
@@ -2649,6 +2651,30 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 	if e.marketAPI != nil {
 		if idx, _, up, down, err := e.marketAPI.GetIndexData(); err == nil && idx > 0 {
 			sb.WriteString(fmt.Sprintf("\n—— 大盘实测 ——\n上证指数 %.2f 点；全市场 上涨 %d 家 / 下跌 %d 家（上涨家数显著占优=普涨）\n", idx, up, down))
+		}
+	}
+	// §ENH-3(20260919 批B) RAG：历史同类事件注入——此前 news_events 跨日清空，顾问没有任何
+	// "上次类似情况后来怎样"的记忆。检索严格早于本交易日、命中本轮个股代码的归档事件 top4，
+	// 总长限 600 rune 防 prompt 膨胀；仍在 ⟦DATA⟧ 边界内，反幻觉白名单自动覆盖（§FIX-2 语义不变）。
+	if e.newsAgent != nil {
+		if hits := e.newsAgent.SearchEventHistory(order, data.TradingDayDate(now), 4); len(hits) > 0 {
+			sb.WriteString("\n—— 历史同类事件（往日发生，引用必须带日期，非今日数据）——\n")
+			histBudget := 600 // rune 预算：超限即截断剩余条目（宁少注入不可撑爆上下文）
+			for _, h := range hits {
+				stocks := strings.Join(h.Event.CleanedStocks, "、")
+				if stocks == "" {
+					stocks = strings.Join(h.Event.RelatedStocks, "、")
+				}
+				line := fmt.Sprintf("- %s-%s-%s %s(%.2f) [%s]「%s」关联:%s 来源:%s\n",
+					h.Day[0:4], h.Day[4:6], h.Day[6:8],
+					h.Event.Direction, h.Event.Score, h.Event.Level,
+					h.Event.Title, stocks, h.Event.Source)
+				if n := utf8.RuneCountInString(line); n > histBudget {
+					break
+				}
+				histBudget -= utf8.RuneCountInString(line)
+				sb.WriteString(line)
+			}
 		}
 	}
 	return sb.String()
