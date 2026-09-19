@@ -44,6 +44,8 @@ Environment=QUANT_ADDR=127.0.0.1:8080
 Environment=QUANT_DATA_DIR=/var/lib/quant-trading-v2
 
 # 敏感项从 /etc/quant.env 注入：LLM_API_KEY / LLM_API_URL / LLM_MODEL / TUSHARE_TOKEN
+#   / HITHINK_FINANCE_API_KEY（§ENH-0 2026-09-19：交易日历+行情主源密钥，缺省时日历按
+#   周末口径兜底、法定节假日会误判为交易日，强烈建议配置；scripts/deploy_seoul.sh 可写入）
 # 未提供该文件时下方内容被忽略（EnvironmentFile 文件缺失不报错）
 EnvironmentFile=-/etc/quant.env
 

@@ -4,9 +4,12 @@
 #       -QuantExe C:\opt\quant\quant.exe -ResearchExe C:\opt\quant\researchd.exe `
 #       -PydataVenv C:\opt\quant\venv -QmtctlExe C:\opt\quant\qmtctl.exe `
 #       -MiniQmtPath "C:\Program Files (x86)\东莞证券QMT实盘交易端\bin.x64\XtItClient.exe" `
-#       -DataDir C:\var\lib\quant-trading-v2 -LLMApiKey "..." -LLMApiURL "..." -LLMModel "..."
+#       -DataDir C:\var\lib\quant-trading-v2 -LLMApiKey "..." -LLMApiURL "..." -LLMModel "..." `
+#       -HithinkApiKey "..."
 # NOTE: MiniQmtPath MUST be the full client XtItClient.exe (auto-login + trading). XtMiniQmt.exe
 #       cannot auto-login → broker never connects.
+# NOTE (§ENH-0 2026-09-19): HithinkApiKey = HITHINK_FINANCE_API_KEY，交易日历/行情主源密钥。
+#       旧脚本从不注入它 → quant 主服务永远"周末口径兜底"，法定节假日误判为交易日。请随部署传入。
 # Design (docs/MIGRATION_GUANGZHOU_ALLINONE.md section 4):
 #   quant          NSSM service, NORMAL priority
 #   quant-research NSSM service, BELOW_NORMAL priority (session-gated off-hours)
@@ -25,6 +28,7 @@ param(
     [string]$LLMApiKey = "",
     [string]$LLMApiURL = "https://api.siliconflow.cn/v1/chat/completions",
     [string]$LLMModel = "THUDM/GLM-Z1-9B-0414",
+    [string]$HithinkApiKey = "",
     [string]$NSSMUrl = "https://nssm.cc/release/nssm-2.24.zip"
 )
 $ErrorActionPreference = "Stop"
@@ -33,6 +37,16 @@ function Info($m) { Write-Host "[eng] $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "[ ok ] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[warn] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[fail] $m" -ForegroundColor Red; exit 1 }
+
+# §ENH-0(2026-09-19)：统一构造服务级环境变量。此前 LLM 三元组之外的密钥（尤其
+# HITHINK_FINANCE_API_KEY=交易日历/行情主源）从不注入，quant 生产进程一直缺它。
+# 逗号 return 防 PowerShell 单元素数组被标量化。
+function Get-BaseEnvExtra {
+    $e = @("TZ=Asia/Shanghai", "QUANT_DATA_DIR=$DataDir")
+    if ($LLMApiKey)     { $e += @("LLM_API_KEY=$LLMApiKey", "LLM_API_URL=$LLMApiURL", "LLM_MODEL=$LLMModel") }
+    if ($HithinkApiKey) { $e += @("HITHINK_FINANCE_API_KEY=$HithinkApiKey") }
+    return ,$e
+}
 
 # 0. admin check
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -68,11 +82,7 @@ function Register-NssmService($name, $exe, $appArgs, $priority) {
     & $nssm set $name AppRotateOnline 1 | Out-Null
     & $nssm set $name AppRotateBytes 10485760 | Out-Null
     & $nssm set $name Start SERVICE_AUTO_START | Out-Null
-    if ($LLMApiKey) {
-        & $nssm set $name AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" "LLM_API_KEY=$LLMApiKey" "LLM_API_URL=$LLMApiURL" "LLM_MODEL=$LLMModel" | Out-Null
-    } else {
-        & $nssm set $name AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" | Out-Null
-    }
+    & $nssm set $name AppEnvironmentExtra (Get-BaseEnvExtra) | Out-Null
 }
 
 # 2. quant (NORMAL)
@@ -81,9 +91,11 @@ Register-NssmService "quant" $QuantExe @() "NORMAL_PRIORITY_CLASS"
 # §部署修复 2026-09-17：端口必须是 127.0.0.1:8081——广州拓扑下 Caddy 占用 :8080
 # （Caddyfile /api/* → reverse_proxy 127.0.0.1:8081）。旧值 0.0.0.0:8080 与 Caddy
 # 撞端口，配合 §W4-b fail-fast 会让 quant 服务起不来（5s 重启循环，部署实录）。
-& $nssm set quant AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" "QUANT_ADDR=127.0.0.1:8081" | Out-Null
-if ($LLMApiKey) {
-    & $nssm set quant AppEnvironmentExtra "TZ=Asia/Shanghai" "QUANT_DATA_DIR=$DataDir" "QUANT_ADDR=127.0.0.1:8081" "LLM_API_KEY=$LLMApiKey" "LLM_API_URL=$LLMApiURL" "LLM_MODEL=$LLMModel" | Out-Null
+# §ENH-0(2026-09-19)：env 统一走 Get-BaseEnvExtra（含可选 HITHINK_FINANCE_API_KEY），
+# 覆盖注册函数刚才写入的集合——AppEnvironmentExtra 是整体替换语义，必须带全量再叠 QUANT_ADDR。
+& $nssm set quant AppEnvironmentExtra ((Get-BaseEnvExtra) + @("QUANT_ADDR=127.0.0.1:8081")) | Out-Null
+if (-not $HithinkApiKey) {
+    Warn "HithinkApiKey 未提供：交易日历将按周末口径兜底（法定节假日会误判为交易日，直到首次成功拉取后的磁盘缓存生效）"
 }
 & $nssm restart quant
 Start-Sleep -Seconds 2

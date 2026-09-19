@@ -12,6 +12,7 @@
 #   LLM_API_KEY       LLM 服务 API Key（写入 /etc/quant.env）
 #   LLM_API_URL       LLM API 地址（可选，默认 https://api.siliconflow.cn/v1/chat/completions）
 #   LLM_MODEL         LLM 模型名（可选，默认 THUDM/GLM-Z1-9B-0414）
+#   HITHINK_FINANCE_API_KEY  同花顺数据密钥（可选，§ENH-0：交易日历/行情主源，强烈建议提供）
 #   DEPLOY_DIR        服务器代码目录（默认 /opt/quant）
 #   QUANT_DATA_DIR    服务器数据目录（默认 /var/lib/quant-trading-v2）
 
@@ -24,6 +25,8 @@ SERVER_USER="${SERVER_USER:-root}"
 LLM_API_KEY="${LLM_API_KEY:-}"
 LLM_API_URL="${LLM_API_URL:-https://api.siliconflow.cn/v1/chat/completions}"
 LLM_MODEL="${LLM_MODEL:-THUDM/GLM-Z1-9B-0414}"
+# §ENH-0(2026-09-19)：hithink 密钥（交易日历/行情主源），可选；缺省时日历按周末口径兜底。
+HITHINK_FINANCE_API_KEY="${HITHINK_FINANCE_API_KEY:-}"
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/quant}"
 QUANT_DATA_DIR="${QUANT_DATA_DIR:-/var/lib/quant-trading-v2}"
 
@@ -118,21 +121,34 @@ $SSH "which python3 >/dev/null 2>&1 || (sudo apt-get update -qq && DEBIAN_FRONTE
 $SSH "sudo -u quant python3 -m venv $DEPLOY_DIR/venv"
 $SSH "sudo -u quant $DEPLOY_DIR/venv/bin/pip install --quiet -r $DEPLOY_DIR/pydata/requirements.txt"
 
-# ── 4. 写入环境变量文件（LLM Key 等敏感项）──
+# ── 4. 写入环境变量文件（LLM Key / hithink Key 等敏感项）──
 echo "[4/8] 写入 /etc/quant.env..."
-# 未提供 LLM_API_KEY 时（云端后台已配）保留服务器现有文件，避免误覆盖
+# §ENH-0(2026-09-19)：HITHINK_FINANCE_API_KEY（交易日历/行情主源）此前从不写入，
+# quant 进程日历永远"周末口径兜底"。现与 LLM 三项同通道注入；任一提供即重写，
+# 全未提供时保留服务器现有文件（云端后台已配场景），避免误覆盖。
+ENV_CONTENT=""
 if [ -n "$LLM_API_KEY" ]; then
     ENV_CONTENT="LLM_API_KEY=$LLM_API_KEY"
     [ -n "$LLM_API_URL" ] && ENV_CONTENT="$ENV_CONTENT
 LLM_API_URL=$LLM_API_URL"
     [ -n "$LLM_MODEL" ] && ENV_CONTENT="$ENV_CONTENT
 LLM_MODEL=$LLM_MODEL"
+fi
+if [ -n "$HITHINK_FINANCE_API_KEY" ]; then
+    if [ -n "$ENV_CONTENT" ]; then
+        ENV_CONTENT="$ENV_CONTENT
+HITHINK_FINANCE_API_KEY=$HITHINK_FINANCE_API_KEY"
+    else
+        ENV_CONTENT="HITHINK_FINANCE_API_KEY=$HITHINK_FINANCE_API_KEY"
+    fi
+fi
+if [ -n "$ENV_CONTENT" ]; then
     $SSH "sudo tee /etc/quant.env >/dev/null" <<EOF
 $ENV_CONTENT
 EOF
     $SSH "sudo chmod 600 /etc/quant.env"
 else
-    echo "      LLM_API_KEY 未提供，保留服务器现有 /etc/quant.env（云端后台配置）"
+    echo "      LLM/hithink key 均未提供，保留服务器现有 /etc/quant.env（云端后台配置）"
 fi
 
 # ── 5. 域名占位符替换 + 安装 Caddy ──
