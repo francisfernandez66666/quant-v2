@@ -5,6 +5,7 @@ package data
 
 import "testing"
 
+// 按代码号段校验交易所后缀映射（SH/SZ/BJ）。
 func TestExchangeSuffixSegments(t *testing.T) {
 	cases := map[string]string{
 		"600519":    "600519.SH", // 沪主板

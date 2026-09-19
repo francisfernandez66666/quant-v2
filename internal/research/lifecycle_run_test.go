@@ -34,6 +34,7 @@ func sellRec(pool, code string, buyPx, sellPx float64, day string) []map[string]
 	}
 }
 
+// 股票池生命周期按日分桶统计。
 func TestPoolDailyStatsBuckets(t *testing.T) {
 	dir := t.TempDir()
 	var recs []map[string]any

@@ -54,6 +54,7 @@ class TempDbCase(unittest.TestCase):
         c.close()
 
 
+# last_trade_date 单测：目标日恒为工作日（周末回退周五）。
 class TestLastTradeDate(TempDbCase):
     def test_format_and_no_weekend(self):
         # target 恒为工作日（周末自动回退到周五），格式 yyyyMMdd。
@@ -61,6 +62,7 @@ class TestLastTradeDate(TempDbCase):
         self.assertLess(d.weekday(), 5)
 
 
+# latest 查询单测：空表/缺表安全弃权，有行取最大交易日。
 class TestLatestFreshness(TempDbCase):
     def test_max_and_missing_table(self):
         # 空表 → 空串；有行 → 最大 trade_date；缺表 → 空串（查询异常安全弃权）。
@@ -71,6 +73,7 @@ class TestLatestFreshness(TempDbCase):
         self.assertEqual(k.latest("no_such_table"), "")
 
 
+# 单轮检查短路：三表均已到目标日则零外部调用直接判真。
 class TestOneRoundShortCircuit(TempDbCase):
     def test_all_fresh_no_calls(self):
         # 三表都已到 target：不发任何外部调用，直接判 True。

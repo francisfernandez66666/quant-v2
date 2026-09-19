@@ -36,6 +36,7 @@ def new_store():
     return Store(path)
 
 
+# 本地账本单测：加权成本/最高价回填等成交落账规则。
 class TestStore(unittest.TestCase):
     def test_apply_fill_weighted_cost_and_highest(self):
         """网关/账本单测：test_apply_fill_weighted_cost_and_highest"""
@@ -203,6 +204,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(s.list_positions(), [])
 
 
+# 整手规则单测：按板块（主板/科创/北交所）判定最小申报单位。
 class TestLotRule(unittest.TestCase):
     def test_lot_rule_by_board(self):
         """网关/账本单测：test_lot_rule_by_board"""
@@ -236,6 +238,7 @@ class TestLotRule(unittest.TestCase):
             gw.stop()
 
 
+# 幂等守卫单测：check_and_record 防同一 signal 重复下单。
 class TestIdempotency(unittest.TestCase):
     def test_check_and_record(self):
         """网关/账本单测：test_check_and_record"""
@@ -248,6 +251,7 @@ class TestIdempotency(unittest.TestCase):
         self.assertEqual(existing["order_id"], "A")
 
 
+# HTTP 处理器单测：路由/鉴权/成交推送与断连行为。
 class TestHandler(unittest.TestCase):
     def test_trade_push_and_disconnect(self):
         """网关/账本单测：test_trade_push_and_disconnect"""
@@ -368,6 +372,7 @@ class TestHandler(unittest.TestCase):
             handler_mod.post_report_status = old_status
 
 
+# 模拟成交引擎单测：mock 通道下的委托撮合与持仓更新。
 class TestMockBroker(unittest.TestCase):
     def test_place_order_fill_updates_position(self):
         """网关/账本单测：test_place_order_fill_updates_position"""
@@ -406,6 +411,7 @@ class TestMockBroker(unittest.TestCase):
         self.assertEqual(b.query_asset()["market_value"], 0.0)
 
 
+# xtquant 延迟导入单测：无 xtquant 环境可实例化，connect 时才报错。
 class TestXtBrokerLazyImport(unittest.TestCase):
     def test_importable_without_xtquant(self):
         """无 xtquant 的环境应能实例化；connect 时才报错（延迟 import）"""
@@ -425,6 +431,7 @@ class TestXtBrokerLazyImport(unittest.TestCase):
         self.assertIsInstance(build_broker({"broker": "xt"}), XtBroker)
 
 
+# 网关 HTTP 集成单测：起真实 ThreadingHTTPServer 走全链路。
 class TestGatewayHTTP(unittest.TestCase):
     def setUp(self):
         """网关/账本单测：setUp"""

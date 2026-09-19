@@ -38,6 +38,7 @@ func fullData() *shortbase.Data {
 	}
 }
 
+// 全链路通过：高换手条件齐备。
 func TestPassFullChain(t *testing.T) {
 	s := New(nil)
 	ev, err := s.Evaluate("600519.SH", fullData())
@@ -56,6 +57,7 @@ func TestPassFullChain(t *testing.T) {
 	}
 }
 
+// 换手未过门槛时拒绝。
 func TestBelowGate(t *testing.T) {
 	s := New(nil)
 	d := fullData()
@@ -72,6 +74,7 @@ func TestBelowGate(t *testing.T) {
 	}
 }
 
+// 量价背离时置信度减半。
 func TestDivergenceHalf(t *testing.T) {
 	s := New(nil)
 	d := fullData()
@@ -82,6 +85,7 @@ func TestDivergenceHalf(t *testing.T) {
 	}
 }
 
+// 无数据安全拒绝。
 func TestNoData(t *testing.T) {
 	s := New(nil)
 	d := fullData()
@@ -96,6 +100,7 @@ func TestNoData(t *testing.T) {
 	}
 }
 
+// 置信度不越上限帽。
 func TestConfidenceCap(t *testing.T) {
 	s := New(nil)
 	ev, _ := s.Evaluate("600519.SH", fullData())

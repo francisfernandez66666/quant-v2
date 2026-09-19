@@ -38,6 +38,7 @@ def log(msg):
         pass
 
 
+# 统一文本打开方式：UTF-8 + 错误替换，避免不同 locale 下解码崩溃。
 def io_open(path, mode):
     return open(path, mode, encoding="utf-8", errors="replace")
 
@@ -52,6 +53,7 @@ def run(cmd, timeout=7200):
         return -1, repr(e)[:160]
 
 
+# 查询指定表最新交易日（默认 trade_date 列），失败返回 (-1, 错误摘录)。
 def latest(table, col="trade_date"):
     try:
         c = sqlite3.connect(DB, timeout=30)
@@ -129,6 +131,7 @@ def one_round(target):
     return ok
 
 
+# 保活主流程：取最新交易日并对数据加载链路做一轮心跳检查/补数。
 def main():
     log("keepalive run start pid=%d" % os.getpid())
     target = last_trade_date()

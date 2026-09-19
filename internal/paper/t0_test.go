@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// T0 分仓分配：同日多层级装桶。
 func TestAllocLayers(t *testing.T) {
 	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.Local)
 	todayFill := now.Add(-1 * time.Hour)
@@ -24,6 +25,7 @@ func TestAllocLayers(t *testing.T) {
 	}
 }
 
+// T0 分仓分配：跨日额度累计约束。
 func TestAllocLayersAcross(t *testing.T) {
 	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.Local)
 	a := &Position{Code: "X", Qty: 100, CostPrice: 10, FilledAt: now.Add(-24 * time.Hour)}

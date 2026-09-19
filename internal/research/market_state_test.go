@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// 按指标阈值分类市场状态。
 func TestClassify(t *testing.T) {
 	cfg := StateConfig{}
 	// 全面牛信号
@@ -40,6 +41,7 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+// 状态机在最短停留日内保持原状态，防抖。
 func TestStateTrackerStaysInMinStay(t *testing.T) {
 	tk := NewStateTracker(StateConfig{MinStayDays: 3})
 	now := time.Date(2026, 9, 9, 9, 30, 0, 0, time.Local)
@@ -63,6 +65,7 @@ func TestStateTrackerStaysInMinStay(t *testing.T) {
 	}
 }
 
+// 各市场状态映射正确的仓位上限。
 func TestStateTrackerMaxPos(t *testing.T) {
 	tk := NewStateTracker(StateConfig{})
 	if tk.MaxPosPct() <= 0 {

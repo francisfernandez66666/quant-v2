@@ -26,6 +26,7 @@ def deal_row(td, tt, price=4.35, qty=100):
     })()
 
 
+# 成交时间字段解析回归测试：不同 xtquant build 的时间格式统一归一化。
 class TestDealTimeParsing(unittest.TestCase):
     def _ops_with(self, rows):
         ops = bs._XtOps(account="ACC", dry_run=True, xt_path="", session_id=2)

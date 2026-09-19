@@ -35,6 +35,7 @@ func writeConsultHistory(t *testing.T, rig *testRig, entries []struct {
 	}
 }
 
+// 验证历史事件归档被注入 AI 顾问咨询上下文（§ENH-2）。
 func TestConsultHistoryEventsInjected(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
@@ -68,6 +69,7 @@ func TestConsultHistoryEventsInjected(t *testing.T) {
 	}
 }
 
+// 验证历史归档缺失时咨询链路静默降级、不报错。
 func TestConsultNoHistoryFileSilent(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()

@@ -2,10 +2,12 @@ package research
 
 import "testing"
 
+// k 为构造 QualityBucketKey 的简写。
 func k(tac, sec, nt, ph string) QualityBucketKey {
 	return MakeQualityKey(tac, sec, nt, ph)
 }
 
+// 样本不足桶权重回落 1。
 func TestQualityUnderSample_IsOne(t *testing.T) {
 	tb := NewSignalQualityTable(20)
 	tb.Update(k("龙头", "AI", "行业", "发酵"), true)
@@ -17,6 +19,7 @@ func TestQualityUnderSample_IsOne(t *testing.T) {
 	}
 }
 
+// 桶内高命中抬升信号权重。
 func TestQualityRaisesWeightWithGoodHit(t *testing.T) {
 	key := k("龙头", "AI", "行业", "发酵")
 	tb := NewSignalQualityTable(20)
@@ -32,6 +35,7 @@ func TestQualityRaisesWeightWithGoodHit(t *testing.T) {
 	}
 }
 
+// 桶内低命中压低信号权重。
 func TestQualityTrimsWeightWithBadHit(t *testing.T) {
 	key := k("双响炮", "新能源", "公司", "退潮")
 	tb := NewSignalQualityTable(20)
@@ -46,6 +50,7 @@ func TestQualityTrimsWeightWithBadHit(t *testing.T) {
 	}
 }
 
+// 权重始终夹在安全上下限内。
 func TestQualityClamped(t *testing.T) {
 	key := k("动量", "券商", "宏观", "启动")
 	tb := NewSignalQualityTable(5)
@@ -60,6 +65,7 @@ func TestQualityClamped(t *testing.T) {
 	}
 }
 
+// key 段为空/含空格时规范化正确。
 func TestQualityKeyNormalization(t *testing.T) {
 	if got := MakeQualityKey("龙头", "AI", "", "发酵"); len(got) == 0 {
 		t.Errorf("key must not be empty, got %q", got)

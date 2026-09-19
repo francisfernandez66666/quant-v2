@@ -368,6 +368,7 @@ func TestIsTransientLLMError(t *testing.T) {
 
 type errString string
 
+// errString 让字符串直接充当 error。
 func (e errString) Error() string { return string(e) }
 
 // TestProviderBaseURLIsNormalized §P0 2026-09-18「按供应商文档填了 API URL 却一直用不了」回归。

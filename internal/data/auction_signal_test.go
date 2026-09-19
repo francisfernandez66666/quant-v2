@@ -2,6 +2,7 @@ package data
 
 import "testing"
 
+// 表驱动校验集合竞价强度评分的输出。
 func TestAuctionStrengthScore(t *testing.T) {
 	cases := []struct {
 		name string

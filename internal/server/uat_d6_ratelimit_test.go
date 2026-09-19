@@ -24,6 +24,7 @@ func ctxRequest(userID, ip string) *http.Request {
 	return r
 }
 
+// 限流按用户独立计数、互不影响。
 func TestUserRateLimitPerUser(t *testing.T) {
 	s := &Server{}
 	// 用户 u_a：窗口内 3 次放行、第 4 次拒绝
@@ -56,6 +57,7 @@ func TestUserRateLimitPerUser(t *testing.T) {
 	}
 }
 
+// 限流拒绝响应为 429 且结构统一。
 func TestRejectRateLimitResponse(t *testing.T) {
 	rec := httptest.NewRecorder()
 	rejectRateLimit(rec, 5*time.Minute)

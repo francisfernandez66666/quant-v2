@@ -149,6 +149,7 @@ func TestGateT1SellableCountsOpenSells(t *testing.T) {
 	}
 }
 
+// boolPtr 取 bool 地址（夹具可选字段）。
 func boolPtr(b bool) *bool { return &b }
 
 // TestGateLimitUpDown 涨停不可追买 / 跌停不可追卖：on 拦截、off 放行、无昨收 fail-open。

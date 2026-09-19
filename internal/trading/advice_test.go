@@ -266,6 +266,7 @@ func (failingExecutor) PlaceBuy(req OrderRequest) (*OrderResult, error) {
 }
 
 // PlaceSell PlaceSell。
+// 桩：卖出恒超时，模拟下单失败的建议路径。
 func (failingExecutor) PlaceSell(req OrderRequest) (*OrderResult, error) {
 	return nil, context.DeadlineExceeded
 }
@@ -277,6 +278,7 @@ func (failingExecutor) Cancel(orderID string) error { return context.DeadlineExc
 func (failingExecutor) State() (*GatewayState, error) { return nil, context.DeadlineExceeded }
 
 // Health Health。
+// 桩：健康检查失败，触发熔断建议文案。
 func (failingExecutor) Health() (bool, error) { return false, context.DeadlineExceeded }
 
 // TestExecLogsFromRealEntryDate §PROD-T1（2026-09-18 生产实录）：buy_date 必须映射为

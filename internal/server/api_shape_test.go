@@ -11,6 +11,7 @@ import (
 )
 
 // TestOptimizationsJSONShape OptimizationsJSONShape。
+// 优化结果接口的 JSON 字段结构契约。
 func TestOptimizationsJSONShape(t *testing.T) {
 	db, _ := store.Open(filepath.Join(t.TempDir(), "t.db"))
 	defer db.Close()

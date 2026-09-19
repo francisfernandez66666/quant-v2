@@ -19,6 +19,7 @@ func seedSweepResults() []map[string]any {
 }
 
 // TestOptimizationResultsCRUD OptimizationResultsCRUD。
+// 优化结果增删改查往返。
 func TestOptimizationResultsCRUD(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"))

@@ -23,6 +23,8 @@ type mockBoard struct {
 // mockBoard 的 BoardSource 实现：Sectors 按预设的 fail/empty 分支返回结果，
 // 并累加 calls 计数，供断言「熔断之后不再调用该源」。
 func (m *mockBoard) Name() string { return m.name }
+
+// 桩方法：记录调用次数并返回预置板块列表。
 func (m *mockBoard) Sectors() ([]SectorInfo, error) {
 	m.calls++
 	if m.fail {
@@ -34,6 +36,7 @@ func (m *mockBoard) Sectors() ([]SectorInfo, error) {
 	return m.sector, nil
 }
 
+// sector 构造单板块的板块列表夹具。
 func sector(name string) []SectorInfo {
 	return []SectorInfo{{Code: "BK0001", Name: name}}
 }

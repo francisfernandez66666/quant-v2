@@ -149,6 +149,7 @@ def inject(stocks):
     return n
 
 
+# 主流程：把北交所股票纳入股票池（幂等：已纳入则直接退出）。
 def main():
     log("北交所纳入脚本启动，DB=%s" % DB)
     # 1) 幂等：已纳入过则直接退出

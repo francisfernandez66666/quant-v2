@@ -67,6 +67,7 @@ func TestQMTClientBrokerStatus(t *testing.T) {
 	}
 }
 
+// BrokerStatus 兼容旧网关 broker_mode 别名字段。
 func TestQMTClientBrokerStatusLegacyField(t *testing.T) {
 	// 兼容老网关：无 broker_mode 别名，broker 字段缺省 → 回退 broker_mode。
 	stub := &brokerStub{t: t, healthBody: `{"ok":true,"broker_mode":"xt","broker_connected":false}`}
@@ -82,6 +83,7 @@ func TestQMTClientBrokerStatusLegacyField(t *testing.T) {
 	}
 }
 
+// 客户端 POST /admin/broker 的切换调用。
 func TestQMTClientSwitchBroker(t *testing.T) {
 	stub := &brokerStub{t: t, healthBody: `{"ok":true,"broker":"xt"}`}
 	srv := httptest.NewServer(stub)
@@ -96,6 +98,7 @@ func TestQMTClientSwitchBroker(t *testing.T) {
 	}
 }
 
+// 控制器经配置的客户端读取网关 broker 状态。
 func TestControllerGatewayBrokerStatusUsesConfig(t *testing.T) {
 	stub := &brokerStub{t: t, healthBody: `{"ok":true,"broker":"queued","queued_connected":true}`}
 	srv := httptest.NewServer(stub)
@@ -112,6 +115,7 @@ func TestControllerGatewayBrokerStatusUsesConfig(t *testing.T) {
 	}
 }
 
+// QMT 未启用时控制器返回明确的未启用态。
 func TestControllerGatewayBrokerStatusDisabled(t *testing.T) {
 	c := NewController(NoopExecutor{}, nil, "uA", config.QMTConfig{Enabled: false}, nil)
 	if _, err := c.GatewayBrokerStatus(); err == nil {
@@ -119,6 +123,7 @@ func TestControllerGatewayBrokerStatusDisabled(t *testing.T) {
 	}
 }
 
+// 切换 broker 的非法参数校验拒绝。
 func TestControllerSwitchGatewayBrokerValidates(t *testing.T) {
 	stub := &brokerStub{t: t, healthBody: `{}`}
 	srv := httptest.NewServer(stub)

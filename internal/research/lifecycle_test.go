@@ -20,6 +20,7 @@ func newTestStore(t *testing.T) *store.DB {
 	return db
 }
 
+// todayString 返回夹具用的当前时间字符串。
 func todayString() string {
 	return time.Now().Format("2006-01-02 15:04:05")
 }

@@ -31,6 +31,7 @@ func (c *Controller) execIsClient() bool {
 	return ok
 }
 
+// 空队列时应用配置变更不产生副作用。
 func TestApplyPendingConfig_EmptyQueueNotApplied(t *testing.T) {
 	c := NewController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
 	if c.ApplyPendingConfig() {
@@ -41,6 +42,7 @@ func TestApplyPendingConfig_EmptyQueueNotApplied(t *testing.T) {
 	}
 }
 
+// 待切换未启用时保持 no-op。
 func TestApplyPendingConfig_DisabledStaysNoop(t *testing.T) {
 	c := NewController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)
 	c.QueueConfigUpdate(qmtCfg(false, "http://127.0.0.1:8789"))
@@ -58,6 +60,7 @@ func TestApplyPendingConfig_DisabledStaysNoop(t *testing.T) {
 	}
 }
 
+// 启用待切换后执行器切到网关客户端。
 func TestApplyPendingConfig_EnableSwitchesToClient(t *testing.T) {
 	// 构建期 disabled + URL 为空 → 固化 Noop（历史"executor 固化 bug"的初始形态）。
 	c := NewController(NoopExecutor{}, nil, "u1", qmtCfg(false, ""), nil)

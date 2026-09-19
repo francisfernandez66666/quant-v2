@@ -130,6 +130,7 @@ func TestPerfMetricsRFDailyFrequency(t *testing.T) {
 	}
 }
 
+// repeat 生成 n 个重复值 v 的序列（指标输入用的夹具）。
 func repeat(v float64, n int) []float64 {
 	out := make([]float64, n)
 	for i := range out {

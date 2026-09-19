@@ -43,6 +43,7 @@ func seedBase(t *testing.T) *Fetcher {
 	return f
 }
 
+// freshTick 生成指定价格、tickTime=当前时刻的新鲜 QMT tick。
 func freshTick(px float64) QMTTick {
 	return QMTTick{LastPrice: px, Open: px - 0.1, High: px + 0.2, Low: px - 0.2,
 		PrevClose: 10, Volume: 200000, Amount: 200000 * px,

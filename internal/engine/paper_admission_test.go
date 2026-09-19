@@ -48,6 +48,7 @@ func dispatchRound(e *Engine, sigs []combat_agent.Signal, now time.Time) map[str
 	return got
 }
 
+// 硬黑名单拦截买入信号。
 func TestFilterPaperAdmitted_HardBlacklistBlocksBuy(t *testing.T) {
 	e := newPaperAdmissionEngine(t, nil, []string{"600000"}, false)
 	t0 := time.Now()
@@ -65,6 +66,7 @@ func TestFilterPaperAdmitted_HardBlacklistBlocksBuy(t *testing.T) {
 	}
 }
 
+// 影子黑名单只观察不拦截，买入信号保留。
 func TestFilterPaperAdmitted_ShadowBlacklistKeepsBuys(t *testing.T) {
 	// 影子模式（默认）：黑名单命中留痕但裁定 pass —— 对齐 ShadowBlacklist 默认开语义。
 	e := newPaperAdmissionEngine(t, nil, []string{"600000"}, true)
@@ -76,6 +78,7 @@ func TestFilterPaperAdmitted_ShadowBlacklistKeepsBuys(t *testing.T) {
 	}
 }
 
+// 动量准入下空白名单拒绝全部买入。
 func TestFilterPaperAdmitted_EmptyWhitelistRejectsMomentumBuys(t *testing.T) {
 	e := newPaperAdmissionEngine(t, nil, nil, true)
 	t0 := time.Now()
@@ -97,6 +100,7 @@ func TestFilterPaperAdmitted_EmptyWhitelistRejectsMomentumBuys(t *testing.T) {
 	}
 }
 
+// 显式白名单只约束买入，卖出不受影响。
 func TestFilterPaperAdmitted_ExplicitWhitelistGatesBuysOnly(t *testing.T) {
 	// 白名单仅动量：dragon 买入白名单外被拒；动量买入满窗通过；卖出恒 pass。
 	e := newPaperAdmissionEngine(t, []string{"momentum"}, nil, true)

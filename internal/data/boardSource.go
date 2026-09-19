@@ -212,5 +212,8 @@ type boardAdapter struct {
 }
 
 // boardAdapter 的接口方法：Name 返回源名，Sectors 调用注入的拉取函数。
-func (b boardAdapter) Name() string                   { return b.name }
+// Name 返回板块源名称（日志与降级归因用）。
+func (b boardAdapter) Name() string { return b.name }
+
+// Sectors 调用构造时注入的拉取函数返回板块列表（错误原样透传给上层降级链）。
 func (b boardAdapter) Sectors() ([]SectorInfo, error) { return b.fn() }

@@ -25,6 +25,7 @@ def new_db_path():
     return path
 
 
+# 文件桥协议单测：指令下发/回报读取的文件桥闭环。
 class TestFileBridge(unittest.TestCase):
     def _new_gw(self, tmp_dir):
         """构造最小 Gateway（mock 通道 + 临时 bridge_report_dir，不起后台线程）。"""

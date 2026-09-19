@@ -59,6 +59,7 @@ func TestPhaseFromEmotionStat(t *testing.T) {
 	}
 }
 
+// 情绪周期历史分位分桶构建。
 func TestEmotionPhaseHist(t *testing.T) {
 	stats := []store.EmotionStat{
 		{Date: "20260101", LimitUp: 8, MaxBoard: 1},  // 冰点

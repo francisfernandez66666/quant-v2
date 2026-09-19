@@ -6,8 +6,10 @@ import (
 	"testing"
 )
 
+// fp 取浮点地址（可选列夹具）。
 func fp(x float64) *float64 { return &x }
 
+// 市场风险日记录 upsert 幂等且汇总读取正确。
 func TestMarketRiskDailyUpsertAndSummary(t *testing.T) {
 	db, err := Open(t.TempDir() + "/risk.db")
 	if err != nil {
@@ -60,6 +62,7 @@ func TestMarketRiskDailyUpsertAndSummary(t *testing.T) {
 	}
 }
 
+// NaN 落库转 NULL，不产出非法 JSON。
 func TestMarketRiskDailyNaNToNull(t *testing.T) {
 	db, _ := Open(t.TempDir() + "/risk2.db")
 	defer db.Close()

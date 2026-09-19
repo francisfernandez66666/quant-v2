@@ -163,6 +163,7 @@ func TestFactorCandidatesForBackfill(t *testing.T) {
 	}
 }
 
+// ids 提取候选 ID 列表（集合比对用）。
 func ids(cs []store.Candidate) []int64 {
 	out := make([]int64, len(cs))
 	for i := range cs {

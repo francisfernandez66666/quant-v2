@@ -28,6 +28,7 @@ def dump_table(cur, table, cols, out):
     return n
 
 
+# 主流程：从生产库导出财务数据为迁移 SQL（默认输出 /tmp/fina_migration.sql）。
 def main():
     src_db = sys.argv[1] if len(sys.argv) > 1 else "/Users/zhangzifei/.quant-trading-v2/trading.db"
     out_sql = sys.argv[2] if len(sys.argv) > 2 else "/tmp/fina_migration.sql"

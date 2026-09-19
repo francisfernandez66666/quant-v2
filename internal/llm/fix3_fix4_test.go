@@ -28,6 +28,7 @@ func sseChunk(text string) string {
 // roundTripperFunc 函数式 RoundTripper（注入确定性传输层，隔离 post 的错误分支测试）。
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
+// 桩 RoundTrip：把请求转交注入的函数处理。
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // TestStreamIdleResetsOnChunks §FIX-3 反向用例（核心）：服务端每 60ms 滴一个分片、共 10 片，
@@ -173,6 +174,7 @@ type trackedBody struct {
 	once   sync.Once
 }
 
+// trackedBody.Close 记录 body 已关闭（§FIX-4 连接泄漏断言点）。
 func (b *trackedBody) Close() error {
 	b.once.Do(func() { close(b.closed) })
 	return nil

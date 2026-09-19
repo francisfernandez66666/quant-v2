@@ -158,6 +158,7 @@ type memKVStore struct {
 	m map[string]string
 }
 
+// 桩：把配置写入内存 KV（非真实数据库）。
 func (m *memKVStore) SetConfig(userID, key, value string) error {
 	if m.m == nil {
 		m.m = map[string]string{}
@@ -166,6 +167,7 @@ func (m *memKVStore) SetConfig(userID, key, value string) error {
 	return nil
 }
 
+// 桩：从内存 KV 读取配置。
 func (m *memKVStore) GetConfig(userID, key string) (string, bool) {
 	if m.m == nil {
 		return "", false

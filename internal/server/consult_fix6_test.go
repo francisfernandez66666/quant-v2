@@ -27,6 +27,7 @@ type fix6Ctrl struct {
 	err error // 非 nil 时 ConsultLLM 直接返回该错误
 }
 
+// 桩控制器：可控错误或超长应答，供 §FIX-6 截断断言。
 func (f *fix6Ctrl) ConsultLLM(ctx context.Context, userID, userMsg string, proMode bool) (string, error) {
 	if f.err != nil {
 		return "", f.err

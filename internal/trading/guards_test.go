@@ -577,6 +577,7 @@ func TestGuardT1SellLocked(t *testing.T) {
 	}
 }
 
+// sellOtherQty 执行一笔 000002 卖出并返回错误供断言。
 func sellOtherQty(t *testing.T, ctrl *Controller) error {
 	_, err := ctrl.PlaceOrder(OrderRequest{SignalID: "T1-SELL-OTHER", Code: "000002.SZ", Name: "万科",
 		Side: SideSell, Price: 10, Qty: 100, Amount: 1000,

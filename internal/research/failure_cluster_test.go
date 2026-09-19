@@ -8,6 +8,7 @@ import (
 	"quant-trading-v2/internal/store"
 )
 
+// 失败样本按特征聚类为模式簇。
 func TestClusterFailures(t *testing.T) {
 	results := []*store.OptimizationResult{
 		// 正常战法：不应进入失败聚类
@@ -63,6 +64,7 @@ func TestClusterFailures(t *testing.T) {
 	}
 }
 
+// 达标回测不计失败，聚类结果为空。
 func TestClassifyFailureNonFailure(t *testing.T) {
 	r := &store.OptimizationResult{ID: 9, Expectancy: 0.8, ProfitFactor: 1.5, WinRate: 52, TriggerCount: 80}
 	if cl := classifyFailure(r); cl != "" {

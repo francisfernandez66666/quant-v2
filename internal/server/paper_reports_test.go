@@ -30,6 +30,7 @@ func newPaperReportsTestServer(t *testing.T) (*Server, *auth.User, *auth.User, *
 	return s, admin, user, db
 }
 
+// 有库时模拟盘研报接口返回完整结构。
 func TestPaperResearchReportsEndpoint(t *testing.T) {
 	s, admin, user, db := newPaperReportsTestServer(t)
 
@@ -87,6 +88,7 @@ func TestPaperResearchReportsEndpoint(t *testing.T) {
 	}
 }
 
+// 无库配置时研报接口诚实降级、不编造。
 func TestPaperResearchReportsNoDB(t *testing.T) {
 	// Arrange：未 SetResearch 的服务 → 503（研究进程分离部署时 quant 可无研究库）
 	s, admin := newAdminTestServer(t)

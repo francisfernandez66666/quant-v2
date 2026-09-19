@@ -35,6 +35,7 @@ func makeBars(n int, base, step, v0 float64) []data.KLine {
 	return out
 }
 
+// sig 构造一条做多信号夹具（复盘输入）。
 func sig(code, name string) combat_agent.Signal {
 	return combat_agent.Signal{Code: code, Name: name, Strategy: "dragon", Direction: "做多", Action: "买入"}
 }

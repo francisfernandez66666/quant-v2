@@ -49,6 +49,7 @@ func TestSharedEngineQueuesQMTConfig(t *testing.T) {
 	}
 }
 
+// 共享引擎未配置 QMT 数据源时跳过同步。
 func TestSharedEngineWithoutQMTSourceSkipsSync(t *testing.T) {
 	// 无 QMT 控制器 & 无热同步源的纯共享引擎：syncAccountConfig 不应 panic（维持旧跳过语义）。
 	e := &Engine{}

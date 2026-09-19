@@ -19,6 +19,7 @@ func mkBars(n int, start, end, vol float64) []data.KLine {
 	return kl
 }
 
+// brokenData 构造「破位下跌」形态数据夹具。
 func brokenData() *shortbase.Data {
 	kl := mkBars(40, 20, 15, 1e6)
 	last := &kl[len(kl)-1]
@@ -36,6 +37,7 @@ func brokenData() *shortbase.Data {
 	}
 }
 
+// 全链路通过：评分达阈值并产出信号。
 func TestPassFullChain(t *testing.T) {
 	s := New(nil)
 	ev, err := s.Evaluate("000001.SZ", brokenData())
@@ -51,6 +53,7 @@ func TestPassFullChain(t *testing.T) {
 	}
 }
 
+// 未形成破位形态则拒绝。
 func TestNoBreak(t *testing.T) {
 	s := New(nil)
 	d := brokenData()
@@ -61,6 +64,7 @@ func TestNoBreak(t *testing.T) {
 	}
 }
 
+// 洗盘式下跌降权，不按真破位处理。
 func TestShakeoutDiscount(t *testing.T) {
 	s := New(nil)
 	d := brokenData()
@@ -73,6 +77,7 @@ func TestShakeoutDiscount(t *testing.T) {
 	}
 }
 
+// 缩量时置信度减半（防无量假破位）。
 func TestLowVolHalved(t *testing.T) {
 	s := New(nil)
 	d := brokenData()
@@ -83,6 +88,7 @@ func TestLowVolHalved(t *testing.T) {
 	}
 }
 
+// 无数据场景安全拒绝、不抛异常。
 func TestNoData(t *testing.T) {
 	s := New(nil)
 	d := brokenData()

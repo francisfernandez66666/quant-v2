@@ -19,11 +19,17 @@ type alwaysPassStub struct{}
 
 // 接口方法全部给固定值：评估恒 80 分过关、信号恒为卖出，
 // 目的是把 evalShort 的接线（档位、分数、字段装配）单独钉住而不掺战法逻辑。
-func (alwaysPassStub) Name() string              { return "stub" }
+func (alwaysPassStub) Name() string { return "stub" }
+
+// 桩方法：声明高换手信号类型。
 func (alwaysPassStub) Type() strategy.SignalType { return strategy.SignalHighChurn }
+
+// 桩方法：恒返回达标的全分评估。
 func (alwaysPassStub) Evaluate(string, interface{}) (*strategy.Evaluation, error) {
 	return &strategy.Evaluation{TotalScore: 80, Pass: true, Level: "full_chain", Confidence: 0.8}, nil
 }
+
+// 桩方法：生成高换手卖出信号。
 func (alwaysPassStub) GenerateSignal(string, *strategy.Evaluation) (*strategy.Signal, error) {
 	return &strategy.Signal{Type: strategy.SignalHighChurn, Action: strategy.ActionSell, Confidence: 0.8, Reason: "stub"}, nil
 }
@@ -38,6 +44,7 @@ func stubMD(name string) *strategy_engine.StockMarketData {
 	return &strategy_engine.StockMarketData{Code: "600001.SH", Name: name, Price: kl[59].Close, KLines: kl}
 }
 
+// newShortAgent 组装注入恒通过桩的做空链路测试代理。
 func newShortAgent(t *testing.T) *Agent {
 	t.Helper()
 	a := New(&config.StrategyConfig{})

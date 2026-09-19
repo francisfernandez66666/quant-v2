@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// 校验合并语义：校准值覆盖公式推算值。
 func TestMergeCalibratedOverride(t *testing.T) {
 	formula := []MacroEvent{
 		{Date: time.Date(2026, 9, 13, 0, 0, 0, 0, time.Local), Title: "8月CPI(估)", Level: "cpi", Impact: "high", Duration: 3, Source: "formula"},
@@ -36,6 +37,7 @@ func TestMergeCalibratedOverride(t *testing.T) {
 	}
 }
 
+// 校验外部事件结构到 MacroEvent 的字段映射。
 func TestExternalToMacro(t *testing.T) {
 	ext := []ExternalEvent{
 		{Date: "2026-11-05", Title: "FOMC", Impact: "high", Level: "fomc"},
@@ -54,6 +56,7 @@ func TestExternalToMacro(t *testing.T) {
 	}
 }
 
+// 校验标定文件版本变化时缓存失效重载。
 func TestCalibratedStoreVersion(t *testing.T) {
 	v0 := CalibratedVersion()
 	SetCalibratedEvents([]MacroEvent{{Level: "cpi", Date: time.Now()}})

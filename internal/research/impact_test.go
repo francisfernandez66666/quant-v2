@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// 置信度随命中上升并按时间衰减回修。
 func TestImpact_Confidence_RisingAndTrim(t *testing.T) {
 	tb := NewImpactTable(3)
 	// 灌入 3 个正样本（30 分钟窗中位 >0）
@@ -34,6 +35,7 @@ func TestImpact_Confidence_RisingAndTrim(t *testing.T) {
 	}
 }
 
+// 样本不足桶回落置信度 1（防小样本误判）。
 func TestImpact_Confidence_UnderSample_IsOne(t *testing.T) {
 	tb := NewImpactTable(10)
 	tb.Update("公司", "发酵", "利好", nil, []float64{0.2}, nil, 0) // 样本 1 < 10
@@ -42,6 +44,7 @@ func TestImpact_Confidence_UnderSample_IsOne(t *testing.T) {
 	}
 }
 
+// 半衰期标定的衰减速度。
 func TestImpact_HalfLifeCalibration(t *testing.T) {
 	tb := NewImpactTable(2)
 	tb.Update("公司", "发酵", "利好", nil, []float64{0.05}, nil, 90)
@@ -67,6 +70,7 @@ func TestImpact_ClampHalfLife(t *testing.T) {
 	}
 }
 
+// 表快照合并与权重累加。
 func TestImpact_Merge(t *testing.T) {
 	a := NewImpactTable(1)
 	a.Update("公司", "发酵", "利好", nil, []float64{0.05}, nil, 60)
@@ -81,6 +85,7 @@ func TestImpact_Merge(t *testing.T) {
 	}
 }
 
+// 影响度 key 的规范化拼接。
 func TestMakeImpactKey(t *testing.T) {
 	k := MakeImpactKey("行业", "高潮", "利好")
 	want := "行业|高潮|利好"

@@ -21,16 +21,31 @@ type fakeReviewRegistry struct {
 	gotUser   string // 记录传入的 userID，验证上下文透传
 }
 
-func (f *fakeReviewRegistry) GetController(string) EngineController        { return nil }
+// 桩注册表：无真实控制器。
+func (f *fakeReviewRegistry) GetController(string) EngineController { return nil }
+
+// 桩注册表：初始化状态恒空。
 func (f *fakeReviewRegistry) InitStatusJSON(string) map[string]interface{} { return nil }
-func (f *fakeReviewRegistry) AllControllers() []EngineController           { return nil }
-func (f *fakeReviewRegistry) PaperForUser(string) *paper.Engine            { return nil }
-func (f *fakeReviewRegistry) Len() int                                     { return 0 }
-func (f *fakeReviewRegistry) SetPaperPools([]string)                       {}
+
+// 桩注册表：控制器列表恒空。
+func (f *fakeReviewRegistry) AllControllers() []EngineController { return nil }
+
+// 桩注册表：不提供 paper 引擎。
+func (f *fakeReviewRegistry) PaperForUser(string) *paper.Engine { return nil }
+
+// 桩注册表：长度恒 0。
+func (f *fakeReviewRegistry) Len() int { return 0 }
+
+// 桩注册表：设置模拟盘股票池为 no-op。
+func (f *fakeReviewRegistry) SetPaperPools([]string) {}
 
 // SetPaperConfig §F-4：本测试桩不消费热同步（端点热更行为由 F-4 专项测试覆盖）。
-func (f *fakeReviewRegistry) SetPaperConfig(paper.Config)               {}
+func (f *fakeReviewRegistry) SetPaperConfig(paper.Config) {}
+
+// 桩注册表：设置标签解析器为 no-op。
 func (f *fakeReviewRegistry) SetPaperLabelResolver(func(string) string) {}
+
+// 桩注册表：记录触发复盘的 uid 并返回固定结果。
 func (f *fakeReviewRegistry) TriggerPositionReview(uid string) (int, error) {
 	f.gotUser = uid
 	return f.reviewN, f.reviewErr

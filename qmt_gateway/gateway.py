@@ -172,6 +172,7 @@ def lot_rule(code, side):
     return 100, 100     # 主板/其他：100 股整手
 
 
+# 网关核心：组装本地账本 / 幂等守卫 / 交易通道 / 回报处理器，并驱动 HTTP 服务与行情全推（QuoteFeed）。
 class Gateway:
     def __init__(self, cfg):
         """构造网关实例：组装本地账本 / 幂等守卫 / 交易通道 / 回报处理器四大组件。

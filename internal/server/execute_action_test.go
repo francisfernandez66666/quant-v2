@@ -32,6 +32,7 @@ import (
 // 其余请求一律报错——deviation 闸依赖实时行情，该桩让 GetRealtimeQuote 走新浪主源拿到确定报价。
 type sinaStubTransport struct{}
 
+// 桩 transport：Sina 域名直供固定行情，隔离外网。
 func (sinaStubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !strings.Contains(req.URL.Host, "sinajs.cn") {
 		return nil, fmt.Errorf("stub: unexpected host %s", req.URL.Host)
@@ -56,14 +57,22 @@ func (e *execCountStub) PlaceBuy(req trading.OrderRequest) (*trading.OrderResult
 	e.calls++
 	return &trading.OrderResult{OK: true, OrderID: fmt.Sprintf("GW-%d", e.calls)}, nil
 }
+
+// 桩：记录卖出调用次数。
 func (e *execCountStub) PlaceSell(req trading.OrderRequest) (*trading.OrderResult, error) {
 	e.calls++
 	return &trading.OrderResult{OK: true, OrderID: fmt.Sprintf("GW-%d", e.calls)}, nil
 }
+
+// 桩：撤单恒成功。
 func (e *execCountStub) Cancel(orderID string) error { return nil }
+
+// 桩：返回已连接的网关状态。
 func (e *execCountStub) State() (*trading.GatewayState, error) {
 	return &trading.GatewayState{Connected: true}, nil
 }
+
+// 桩：健康检查恒通过。
 func (e *execCountStub) Health() (bool, error) { return true, nil }
 
 // fakeCtrl 只覆盖 QMTController（handleExecuteAction 唯一用到的控制面能力）；
@@ -73,6 +82,7 @@ type fakeCtrl struct {
 	qmt *trading.Controller
 }
 
+// 桩：向调用方暴露注入的 QMT 控制器。
 func (f fakeCtrl) QMTController() *trading.Controller { return f.qmt }
 
 // IgnoreSignal §F-1：/api/action 的 ignore 分支会触达该桩——返回 0（无可墓碑信号）；

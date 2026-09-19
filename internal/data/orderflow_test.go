@@ -2,6 +2,7 @@ package data
 
 import "testing"
 
+// 单快照盘口失衡指标计算。
 func TestComputeOrderFlow(t *testing.T) {
 	cur := OrderLevels{BidVols: []float64{100, 80, 60, 40, 20}, AskVols: []float64{30, 30, 30, 30, 30}}
 	of := ComputeOrderFlow(cur, nil)
@@ -18,6 +19,7 @@ func TestComputeOrderFlow(t *testing.T) {
 	}
 }
 
+// 结合上一快照的盘口失衡增量计算。
 func TestComputeOrderFlow_WithPrev(t *testing.T) {
 	prev := OrderLevels{BidVols: []float64{90, 70, 50, 30, 10}, AskVols: []float64{40, 40, 40, 40, 40}}
 	cur := OrderLevels{BidVols: []float64{140, 80, 60, 40, 20}, AskVols: []float64{30, 30, 30, 30, 30}}
@@ -45,6 +47,7 @@ func TestTrigger(t *testing.T) {
 	}
 }
 
+// 零值配置回落默认触发阈值。
 func TestTrigger_ZeroCfgFallsBack(t *testing.T) {
 	res := Trigger(OrderFlow{Imbalance: 0.9, ActiveBuyRatio: 0.9, BigNetInflow: 0.9}, TriggerRule{})
 	if !res.Buy {

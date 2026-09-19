@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+// TestMain 统一设置 Asia/Shanghai 时区后再跑全部用例。
 func TestMain(m *testing.M) {
 	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
 		time.Local = loc

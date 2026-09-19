@@ -5,8 +5,10 @@ import (
 	"testing"
 )
 
+// mkRow 构造一条 IC 时序行夹具。
 func mkRow(d string, ic float64) ICRow { return ICRow{Date: d, IC: ic} }
 
+// 因子 IC 序列相关系数计算的正确性。
 func TestFactorICCorr(t *testing.T) {
 	// 完全正相关
 	a := []ICRow{mkRow("01", 0.3), mkRow("02", 0.5), mkRow("03", 0.7)}
@@ -32,6 +34,7 @@ func TestFactorICCorr(t *testing.T) {
 	}
 }
 
+// 高相关因子被聚入同一冗余簇。
 func TestDedupClusters(t *testing.T) {
 	// 三因子：A 与 B 强相关，A 与 C 不相关
 	base := make(map[string][]ICRow)
@@ -91,6 +94,7 @@ func TestDedupWeights(t *testing.T) {
 	}
 }
 
+// 冗余簇内只保留代表因子，其余剔除。
 func TestApplyDedup(t *testing.T) {
 	base := map[string][]ICRow{
 		"A": {mkRow("01", 0.3), mkRow("02", 0.5), mkRow("03", 0.7), mkRow("04", 0.4)},

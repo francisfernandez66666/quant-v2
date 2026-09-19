@@ -19,6 +19,7 @@ type mockSettle struct {
 	err  error
 }
 
+// 桩：返回预置交割单或错误。
 func (m *mockSettle) FetchSettlement(date string) (*SettlementResponse, error) {
 	return m.resp, m.err
 }
@@ -31,10 +32,12 @@ type settleExecutor struct {
 	src *mockSettle
 }
 
+// 桩执行器：把交割拉取转发给内嵌客户端。
 func (s *settleExecutor) FetchSettlement(date string) (*SettlementResponse, error) {
 	return s.src.FetchSettlement(date)
 }
 
+// configDefault 返回默认 QMT 配置夹具。
 func configDefault() config.QMTConfig {
 	return config.DefaultQMTConfig()
 }

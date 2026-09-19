@@ -18,6 +18,7 @@ import (
 	"quant-trading-v2/internal/data"
 )
 
+// shortCfg 构造开启做空与保证金隔离的配置夹具。
 func shortCfg() Config {
 	return Config{
 		Enabled: true, FixedAmount: 10000, InitialCapital: 100000, AutoSell: true,
@@ -26,6 +27,7 @@ func shortCfg() Config {
 	}
 }
 
+// 默认不开启时做空账本拒绝记账。
 func TestShortBookDisabledByDefault(t *testing.T) {
 	e := New(Config{Enabled: true, FixedAmount: 10000, InitialCapital: 100000}, "")
 	if e.ShortBookEnabled() {
@@ -36,6 +38,7 @@ func TestShortBookDisabledByDefault(t *testing.T) {
 	}
 }
 
+// 开空冻结保证金，账户与担保品相互隔离。
 func TestShortOpenMarginAndCashIsolation(t *testing.T) {
 	e := New(shortCfg(), "")
 	longCashBefore, poolsBefore := e.cash, e.pools[""]
@@ -63,6 +66,7 @@ func TestShortOpenMarginAndCashIsolation(t *testing.T) {
 	}
 }
 
+// 空头回补的 T+1 约束与盈亏计算。
 func TestShortCoverT1AndPnl(t *testing.T) {
 	e := New(shortCfg(), "")
 	q := map[string]*data.StockInfo{"600000": {Price: 10}}
@@ -92,6 +96,7 @@ func TestShortCoverT1AndPnl(t *testing.T) {
 	}
 }
 
+// 融券利息每日计提一次、不重复计。
 func TestShortInterestAccrualOncePerDay(t *testing.T) {
 	cfg := shortCfg()
 	cfg.ShortFeeAnnual = 0.083
@@ -115,6 +120,7 @@ func TestShortInterestAccrualOncePerDay(t *testing.T) {
 	}
 }
 
+// 价格上涨触发止损强平。
 func TestShortStopLossOnRally(t *testing.T) {
 	cfg := shortCfg()
 	cfg.ShortStopLossPct = 8
@@ -146,6 +152,7 @@ func TestShortStopLossOnRally(t *testing.T) {
 	}
 }
 
+// OnSignals 路由：做空信号进空头账本且权益正确。
 func TestShortOnSignalsRoutingAndEquity(t *testing.T) {
 	e := New(shortCfg(), "")
 	e.SetStrategyPools([]string{"dragon"})
@@ -187,6 +194,7 @@ func TestShortOnSignalsRoutingAndEquity(t *testing.T) {
 	}
 }
 
+// 空头账本随模拟盘账户文件持久化并可恢复。
 func TestShortBookPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "paper.json")
 	e := New(shortCfg(), path)
@@ -206,6 +214,7 @@ func TestShortBookPersistence(t *testing.T) {
 	}
 }
 
+// 跌停封死护栏：无法回补时不记虚假平仓。
 func TestShortLimitDownGuard(t *testing.T) {
 	e := New(shortCfg(), "")
 	q := map[string]*data.StockInfo{"600000": {Price: 9, ChangePct: -10}}

@@ -10,6 +10,7 @@ import (
 	"quant-trading-v2/internal/signalctl"
 )
 
+// 验证 Engine 构造时接线了结论审计上报。
 func TestEngineNewWiresVerdictAudit(t *testing.T) {
 	dir := t.TempDir()
 	e := New(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, dir)

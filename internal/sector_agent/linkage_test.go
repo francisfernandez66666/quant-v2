@@ -2,6 +2,7 @@ package sector_agent
 
 import "testing"
 
+// 龙头判定阈值（封单/连板高度）。
 func TestIsLeader(t *testing.T) {
 	cases := []struct {
 		name string
@@ -32,6 +33,7 @@ func TestLeaderStrength(t *testing.T) {
 	}
 }
 
+// 同板块联动候选的筛选逻辑。
 func TestFindLinkageCandidates(t *testing.T) {
 	ld := LinkageLeader{Code: "A", Name: "龙头A", Sector: "X", SealRatio: 6, BoardHeight: 3}
 	consti := map[string][]LinkageCandidate{

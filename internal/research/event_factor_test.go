@@ -37,6 +37,7 @@ func histRow(t *testing.T, day, level string, score float64, sectors, stocks []s
 	return string(body)
 }
 
+// 校验从历史归档聚合样本并构建事件因子（§ENH-4）。
 func TestEventFactorBuildAndAggregate(t *testing.T) {
 	path := writeHistory(t, []string{
 		// 个股事件两条：同日同票 卧龙电驱，|−0.8| > 0.5 应取 −0.8。
@@ -85,6 +86,7 @@ func TestEventFactorBuildAndAggregate(t *testing.T) {
 	}
 }
 
+// 校验事件因子值按日期对齐回填进面板。
 func TestEventFactorApplyToPanels(t *testing.T) {
 	// 手工构造两只股票面板（日期键与归档 trading_day 同为 YYYYMMDD）。
 	mk := func(code string, dates []string) *Panel {

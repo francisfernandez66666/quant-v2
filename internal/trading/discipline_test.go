@@ -7,11 +7,13 @@ import (
 	"quant-trading-v2/internal/config"
 )
 
+// testCfg 返回默认纪律配置夹具。
 func testCfg() config.DisciplineConfig {
 	c := config.DefaultDisciplineConfig()
 	return c
 }
 
+// at 构造 2026-09-07 指定时刻（时区一致的夹具）。
 func at(day, hh, mm int) time.Time {
 	return time.Date(2026, 9, 7, hh, mm, 0, 0, time.Local)
 }

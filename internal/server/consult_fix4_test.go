@@ -29,6 +29,7 @@ type consultCtrl struct {
 	gotMsg           chan string
 }
 
+// 桩控制器：按 mode 走不同咨询响应路径（超时/错误等）。
 func (f *consultCtrl) ConsultLLM(ctx context.Context, userID, userMsg string, proMode bool) (string, error) {
 	switch f.mode {
 	case "block":
@@ -55,6 +56,7 @@ func (f *consultCtrl) ConsultLLM(ctx context.Context, userID, userMsg string, pr
 	return "答复", nil
 }
 
+// newConsultServer 组装注入桩控制器的咨询测试服务。
 func newConsultServer(t *testing.T, ctrl EngineController) *Server {
 	t.Helper()
 	am := auth.NewManager(t.TempDir())
@@ -66,6 +68,7 @@ func newConsultServer(t *testing.T, ctrl EngineController) *Server {
 	return s
 }
 
+// consultRequest 构造带登录态的咨询 POST 请求。
 func consultRequest(userID string) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/api/consult", strings.NewReader(`{"message":"这只票能买吗"}`))
 	r.RemoteAddr = "10.0.0.1:1234"
@@ -75,6 +78,7 @@ func consultRequest(userID string) *http.Request {
 	return r
 }
 
+// doConsult 执行一次请求并返回 recorder 供断言。
 func doConsult(s *Server, r *http.Request) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	s.handleConsult(rec, r)

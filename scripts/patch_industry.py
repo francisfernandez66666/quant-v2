@@ -14,6 +14,7 @@ import sys
 
 import baostock as bs
 
+# 主流程：登录 baostock 匿名接口，按股票代码回填行业分类到本地库。
 def main():
     db_path = sys.argv[1] if len(sys.argv) > 1 else "/Users/zhangzifei/.quant-trading-v2/trading.db"
     # 登录 baostock（匿名）

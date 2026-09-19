@@ -24,6 +24,7 @@ func boardBars(n, boards int, base float64) []data.KLine {
 	return kl
 }
 
+// decayData 构造「龙头退潮」形态夹具。
 func decayData() *shortbase.Data {
 	n := 20
 	kl := boardBars(n, 3, 10.0) // 此前 3 连板
@@ -42,6 +43,7 @@ func decayData() *shortbase.Data {
 	}
 }
 
+// 全链路通过：龙头退潮条件齐备。
 func TestPassFullChain(t *testing.T) {
 	s := New(nil)
 	ev, err := s.Evaluate("600000.SH", decayData())
@@ -57,6 +59,7 @@ func TestPassFullChain(t *testing.T) {
 	}
 }
 
+// 非龙头不触发退潮信号。
 func TestNotLeader(t *testing.T) {
 	s := New(nil)
 	d := decayData()
@@ -67,6 +70,7 @@ func TestNotLeader(t *testing.T) {
 	}
 }
 
+// 仍封涨停的票不算退潮。
 func TestStillSealed(t *testing.T) {
 	s := New(nil)
 	d := decayData()
@@ -77,6 +81,7 @@ func TestStillSealed(t *testing.T) {
 	}
 }
 
+// 回封保护：退潮判定降档。
 func TestResealProtection(t *testing.T) {
 	s := New(nil)
 	d := decayData()
@@ -87,6 +92,7 @@ func TestResealProtection(t *testing.T) {
 	}
 }
 
+// 退潮阈值默认 65 分。
 func TestThreshold65Default(t *testing.T) {
 	s := New(nil)
 	if got := s.scoreThreshold(); got != 65 {

@@ -16,6 +16,7 @@ import (
 )
 
 // TestStatusBuildCommitField statusBuildCommitField。
+// /api/status 响应应带 build_commit 字段。
 func TestStatusBuildCommitField(t *testing.T) {
 	// 构造最小可运行的 Server：agg 用零值聚合器（Current 返回 nil，走 dashboard 空分支）
 	s := &Server{startTime: time.Now(), agg: &display.Aggregator{}}

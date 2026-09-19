@@ -14,9 +14,12 @@ import (
 	"quant-trading-v2/internal/strategy"
 )
 
+// contractTodayEvent 构造「今日为股指期货交割日」宏观事件夹具。
 func contractTodayEvent(now time.Time) data.MacroEvent {
 	return data.MacroEvent{Date: now, Level: "contract", Title: "股指期货交割日", Impact: "high", Duration: 2}
 }
+
+// cpiWindowEvent 构造「明日发布 CPI」宏观事件夹具。
 func cpiWindowEvent(now time.Time) data.MacroEvent {
 	return data.MacroEvent{Date: now.AddDate(0, 0, 1), Level: "cpi", Title: "9月CPI", Impact: "high", Duration: 2, DaysLeft: 1}
 }

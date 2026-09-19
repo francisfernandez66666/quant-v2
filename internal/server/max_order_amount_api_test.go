@@ -26,8 +26,10 @@ type capFakeEngine struct {
 	qmt *trading.Controller
 }
 
+// 桩：暴露带单笔帽的 QMT 控制器。
 func (f *capFakeEngine) QMTController() *trading.Controller { return f.qmt }
 
+// 单笔金额上限配置的读写与校验拒绝。
 func TestMaxOrderAmountConfigAPI(t *testing.T) {
 	s, admin := newAdminTestServer(t)
 

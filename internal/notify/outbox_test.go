@@ -9,6 +9,7 @@ import (
 )
 
 // TestQuietHoursWindow QuietHoursWindow。
+// 静默时段窗口判定（含跨零点）。
 func TestQuietHoursWindow(t *testing.T) {
 	n := New()
 	n.SetQuietHours("22:00", "08:00")
@@ -33,6 +34,7 @@ func TestQuietHoursWindow(t *testing.T) {
 }
 
 // TestQuietHoursSuppressesLowOnly QuietHoursSuppressesLowOnly。
+// 静默时段只压低优先级消息、放行高优先级。
 func TestQuietHoursSuppressesLowOnly(t *testing.T) {
 	n := New()
 	n.SetQuietHours("00:00", "23:59") // 全天静默
@@ -62,6 +64,7 @@ func TestQuietHoursSuppressesLowOnly(t *testing.T) {
 }
 
 // TestOutboxRetriesThenDelivers OutboxRetriesThenDelivers。
+// outbox 对失败消息按序重试直至送达。
 func TestOutboxRetriesThenDelivers(t *testing.T) {
 	o := &Outbox{}
 	calls := 0
@@ -111,6 +114,7 @@ func TestOutboxDeadLetter(t *testing.T) {
 type errFake struct{}
 
 // Error Error。
+// 返回固定失败串，模拟投递失败。
 func (errFake) Error() string { return "fake delivery failure" }
 
 // TestOutboxPersistsAcrossRestart §R3-8 P1-D 回归：入队即落盘、新实例加载续发——

@@ -19,6 +19,7 @@ func mkBars(n int, start, end, vol float64) []data.KLine {
 	return kl
 }
 
+// fadeData 构造「利好冲高回落」形态夹具。
 func fadeData() *shortbase.Data {
 	n := 30
 	kl := mkBars(n, 8, 10, 1e6) // 事件日 idx=25 收盘≈10（前段温和上行）
@@ -38,6 +39,7 @@ func fadeData() *shortbase.Data {
 	}
 }
 
+// 全链路通过：利好+冲高+回落齐备产出信号。
 func TestPassFullChain(t *testing.T) {
 	s := New(nil)
 	ev, err := s.Evaluate("600519.SH", fadeData())
@@ -56,6 +58,7 @@ func TestPassFullChain(t *testing.T) {
 	}
 }
 
+// 无利好事件时拒绝。
 func TestNoEvent(t *testing.T) {
 	s := New(nil)
 	d := fadeData()
@@ -66,6 +69,7 @@ func TestNoEvent(t *testing.T) {
 	}
 }
 
+// 涨幅不足门槛时拒绝。
 func TestGainTooSmall(t *testing.T) {
 	s := New(nil)
 	d := fadeData()
@@ -79,6 +83,7 @@ func TestGainTooSmall(t *testing.T) {
 	}
 }
 
+// 过新主升浪被抑制（不追高）。
 func TestFreshSurgeSuppress(t *testing.T) {
 	s := New(nil)
 	d := fadeData()
@@ -91,6 +96,7 @@ func TestFreshSurgeSuppress(t *testing.T) {
 	}
 }
 
+// 板块扩散型上涨降权。
 func TestPropagationDiscount(t *testing.T) {
 	s := New(nil)
 	ev1, _ := s.Evaluate("x", fadeData())
@@ -102,6 +108,7 @@ func TestPropagationDiscount(t *testing.T) {
 	}
 }
 
+// 无数据安全拒绝。
 func TestNoData(t *testing.T) {
 	s := New(nil)
 	d := fadeData()

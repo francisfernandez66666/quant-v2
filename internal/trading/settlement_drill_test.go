@@ -45,6 +45,7 @@ func drillGateway(t *testing.T, trades []map[string]any, cash map[string]float64
 	return srv
 }
 
+// 交割对账演练：按网关成交回填本地成交流水。
 func TestSettleSyncFillsDrillRealGateway(t *testing.T) {
 	db := testDB(t)
 	// 券商侧当日两笔成交（600519 买 100@1280、平安 卖 200@12）；本地一笔都没收到回报（①回报丢失）
@@ -111,6 +112,7 @@ func TestSettleSyncFillsDrillRealGateway(t *testing.T) {
 	}
 }
 
+// 纯幽灵交割行（无本地对应委托）被标记异常。
 func TestSettleSyncFillsDrillPhantomOnlyFlagged(t *testing.T) {
 	db := testDB(t)
 	// 券商交割单为空；本地有一笔"幽灵"成交（券商从未受理）

@@ -35,6 +35,7 @@ func TestEffectiveScore(t *testing.T) {
 	}
 }
 
+// 政策类新闻取更长半衰期、衰减更慢。
 func TestEffectiveScore_PolicySlowHalfLife(t *testing.T) {
 	ev := &NewsEvent{Title: "P", Datetime: "2026-09-09 09:30:00", Score: 1.0, EventType: "政策"}
 	now := time.Date(2026, 9, 9, 9, 30, 0, 0, time.Local).Add(60 * time.Minute)
@@ -45,6 +46,7 @@ func TestEffectiveScore_PolicySlowHalfLife(t *testing.T) {
 	}
 }
 
+// 时间不可解析时保留原分，不做衰减。
 func TestEffectiveScore_BadDatetimeKeepsOriginal(t *testing.T) {
 	ev := &NewsEvent{Title: "B", Datetime: "not-a-date", Score: 0.9}
 	if got := ev.EffectiveScore(time.Now()); got != 0.9 {
@@ -52,6 +54,7 @@ func TestEffectiveScore_BadDatetimeKeepsOriginal(t *testing.T) {
 	}
 }
 
+// 时间在未来时保留原分（不做负时间衰减）。
 func TestEffectiveScore_FutureKeepsOriginal(t *testing.T) {
 	ev := &NewsEvent{Title: "F", Datetime: "2026-09-09 15:00:00", Score: 0.7}
 	now := time.Date(2026, 9, 9, 9, 30, 0, 0, time.Local)
@@ -60,6 +63,7 @@ func TestEffectiveScore_FutureKeepsOriginal(t *testing.T) {
 	}
 }
 
+// 未知事件类型回落默认 120 分钟半衰期。
 func TestDefaultHalfLifeFallback(t *testing.T) {
 	if hl := decayHalfLife(&NewsEvent{EventType: "未知类型"}); hl != 120*time.Minute {
 		t.Errorf("unknown type fallback: want 120m got %v", hl)
@@ -69,6 +73,7 @@ func TestDefaultHalfLifeFallback(t *testing.T) {
 	}
 }
 
+// pow2 支持负指数（2^-1=0.5）。
 func TestPow2Negative(t *testing.T) {
 	if got := pow2(-1); got != 0.5 {
 		t.Errorf("pow2(-1): want 0.5 got %v", got)

@@ -29,6 +29,7 @@ func brokenKLines() []data.KLine {
 	return kl
 }
 
+// 验证做空信号在完整策略管线中的路由与执行。
 func TestShortPipelineTactics(t *testing.T) {
 	agent := combat_agent.New(&config.StrategyConfig{})
 	agent.SetShortRunners(combat_agent.NewShortRunners(nil))

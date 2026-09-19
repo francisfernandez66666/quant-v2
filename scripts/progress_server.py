@@ -673,6 +673,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "not found", "text/plain")
 
 
+# 启动本地自动研究进度页 HTTP 服务（仅监听 127.0.0.1）。
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print("本地自动研究进度页: http://localhost:%d" % PORT)

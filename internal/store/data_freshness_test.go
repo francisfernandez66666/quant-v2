@@ -29,6 +29,7 @@ func newFreshDB(t *testing.T) *DB {
 	return db
 }
 
+// 三表对目标交易日的数据新鲜度检查。
 func TestCheckDataFreshness(t *testing.T) {
 	const today = "20260917"
 

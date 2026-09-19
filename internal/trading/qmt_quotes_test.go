@@ -37,6 +37,7 @@ func (s *quotesStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(s.respBody))
 }
 
+// /quotes 的 URL 后缀拼接、Bearer 鉴权与 key 归一化。
 func TestQMTClientQuotes(t *testing.T) {
 	stub := &quotesStub{respBody: `{"ok":true,"ticks":{
 		"600519.SH":{"lastPrice":1500.5,"open":1490,"high":1510,"low":1488,
@@ -74,6 +75,7 @@ func TestQMTClientQuotes(t *testing.T) {
 	}
 }
 
+// /quotes 网关 503 时错误透传。
 func TestQMTClientQuotesError(t *testing.T) {
 	// broker 断连时 /quotes 仍应可用（真实网关把它放在连接闸之前）；
 	// 这里锁客户端侧：网关回 503 时错误必须透传，供 feed 节流日志并回退新浪链。

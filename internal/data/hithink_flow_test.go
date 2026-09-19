@@ -31,8 +31,10 @@ func flowJSON(ts int64, slIn, slOut, slNet, lgIn, lgOut, lgNet, mdIn, mdOut, mdN
 		`,"small":` + flowLeg(smIn, smOut, smNet) + `}}`
 }
 
+// pf 取浮点值地址，供夹具拼装可选指针字段。
 func pf(v float64) *float64 { return &v }
 
+// 校验 hithink 资金流请求的参数组装与响应解析。
 func TestHithinkStockMoneyFlowAssembly(t *testing.T) {
 	var gotQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +74,7 @@ func TestHithinkStockMoneyFlowAssembly(t *testing.T) {
 	}
 }
 
+// 校验 hithink 返回净额为 null 时安全降级、不虚构数据。
 func TestHithinkStockMoneyFlowNullNet(t *testing.T) {
 	// 超大单净额 null（缺数）：主力净流入不可用"大单净额+0"拼凑，必须报错交调用方降级。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +101,7 @@ func (failEMTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return testResp(404, ""), nil
 }
 
+// 校验主源失败时 GetStockMoneyFlow 回落 hithink 第二源。
 func TestGetStockMoneyFlowFallbackToHithink(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(flowJSON(1,
@@ -126,6 +130,7 @@ func TestGetStockMoneyFlowFallbackToHithink(t *testing.T) {
 	}
 }
 
+// 校验 Sina 源缺资金流时由 hithink 回填（§ENH-3）。
 func TestEnrichFlowFromHithinkOnSina(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(flowJSON(1,

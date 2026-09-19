@@ -17,6 +17,7 @@ import (
 	"quant-trading-v2/internal/trading"
 )
 
+// 当日空头标记按日作用域，不跨日泄漏。
 func TestShortSellMarkDayScope(t *testing.T) {
 	e := &Engine{}
 	fixed := time.Date(2026, 9, 11, 10, 0, 0, 0, time.Local)
@@ -72,6 +73,7 @@ func TestShortTacticCloseAdvices(t *testing.T) {
 	}
 }
 
+// 自动执行路径：做空战法信号按真实卖出执行。
 func TestAutoExecuteRealSellsShortTactic(t *testing.T) {
 	e, db, _, orders := newQMTEngine(t, func(c *config.QMTConfig) { c.AutoSell = true })
 	if _, err := db.UpsertRealPositions([]store.RealPosition{

@@ -51,6 +51,7 @@ func cfgSamples(fakeBin, db string) config.SchedulerConfig {
 }
 
 // TestNightlyEligible NightlyEligible。
+// 夜间任务合格的时间窗口判定。
 func TestNightlyEligible(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	cfg := cfgSamples("fake", "/tmp/x.db")
@@ -91,6 +92,7 @@ func TestNightlyEligible(t *testing.T) {
 }
 
 // TestTradingDataloadDue TradingDataloadDue。
+// 交易日盘后数据补载触发条件。
 func TestTradingDataloadDue(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	base := time.Date(2026, 8, 18, 10, 0, 0, 0, loc) // 周二 10:00 盘中
@@ -212,6 +214,7 @@ func TestNightlyBacktestStepInserted(t *testing.T) {
 }
 
 // TestInsertAfter InsertAfter。
+// 任务顺序：在锚点任务之后插入新任务。
 func TestInsertAfter(t *testing.T) {
 	got := insertAfter([]string{"a", "discover_factors", "c"}, "discover_factors", "backtest")
 	if len(got) != 4 || got[2] != "backtest" {

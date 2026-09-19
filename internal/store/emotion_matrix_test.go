@@ -25,6 +25,7 @@ func insertEventResult(t *testing.T, d *DB, candID int64, date, industry string,
 	}
 }
 
+// 情绪×策略矩阵的分桶聚合统计。
 func TestEmotionStrategyMatrixBuckets(t *testing.T) {
 	d := testDB(t)
 	// 候选 1：高潮 2 事件 + 启动 1 事件；候选 2：全部退潮 3 事件

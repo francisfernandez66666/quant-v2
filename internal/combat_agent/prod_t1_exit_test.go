@@ -17,6 +17,7 @@ import (
 )
 
 // TestBuildExitContextZeroEntryAtIsEmpty buildExitContextZeroEntryAtIsEmpty。
+// 验证入场日最高价=0 时出场上下文退化为空值，不误用持仓期最高价。
 func TestBuildExitContextZeroEntryAtIsEmpty(t *testing.T) {
 	pos := report.ExecLog{Code: "603468", Name: "津富士达", EntryPrice: 22.61, HighestPrice: 22.61, Status: "持仓中"}
 	// EntryAt 零值（未开仓日场景）：必须得到空串而非 "0001-01-01"

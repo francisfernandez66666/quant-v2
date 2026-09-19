@@ -12,6 +12,7 @@ import (
 	"quant-trading-v2/internal/config"
 )
 
+// sig 构造指定动作的信号夹具。
 func sig(action, strategyType, strategy, code string) combat_agent.Signal {
 	return combat_agent.Signal{Code: code, Name: "测试", Action: action, Direction: "做多",
 		Strategy: strategy, StrategyType: strategyType}

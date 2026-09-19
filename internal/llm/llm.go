@@ -351,6 +351,7 @@ type UpstreamError struct {
 	Detail string // 上游响应摘录（仅供日志，勿直出客户端）
 }
 
+// Error 拼装对外错误串（格式与旧消息串逐字一致；供日志与归类，Status 才是分类依据）。
 func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("LLM API 返回 %d: %s", e.Status, e.Detail)
 }
@@ -908,6 +909,7 @@ func (c *Client) nonStreamChat(req ChatRequest) (string, error) {
 	return c.nonStreamChatCtx(context.Background(), req)
 }
 
+// nonStreamChatCtx 带 ctx 的非流式一次性取回，max_tokens 用默认值。
 func (c *Client) nonStreamChatCtx(ctx context.Context, req ChatRequest) (string, error) {
 	return c.nonStreamChatMaxCtx(ctx, req, defaultNonStreamMaxTokens)
 }
@@ -924,6 +926,7 @@ func (c *Client) nonStreamChatMax(req ChatRequest, maxTokens int) (string, error
 	return c.nonStreamChatMaxCtx(context.Background(), req, maxTokens)
 }
 
+// nonStreamChatMaxCtx 非流式调用的最终实现：带 ctx 与显式 max_tokens，其余三个变体均汇聚于此。
 func (c *Client) nonStreamChatMaxCtx(ctx context.Context, req ChatRequest, maxTokens int) (string, error) {
 	body, err := c.postCtx(ctx, req, false, maxTokens)
 	if err != nil {

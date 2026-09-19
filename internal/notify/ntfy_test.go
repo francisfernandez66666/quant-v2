@@ -75,6 +75,7 @@ type countGateway struct {
 	msgs []Message
 }
 
+// 桩：计数型推送网关，记录消息条数。
 func (c *countGateway) Send(msg Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
