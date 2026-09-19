@@ -241,6 +241,16 @@ func main() {
 	researchDB, dbErr := store.Open(filepath.Join(dataDir, "trading.db"))
 	if researchDB != nil && dbErr == nil {
 		srv.SetResearch(researchDB, dataDir)
+		// §RFIX-4 启动恢复：backtest_jobs 残留 running 僵尸行标 interrupted（上次进程崩溃/
+		// 重启遗留）。MarkRunningInterrupted 此前是死代码——research_tasks 的启动接管只覆盖
+		// 任务队列表，backtest_jobs 表恢复职责丢失（生产 id=3 自 08-21 挂 running）。
+		// 与 researchd 侧双写幂等（同一 trading.db，UPDATE WHERE status='running'）。
+		if n, merr := researchDB.MarkRunningInterrupted(); merr != nil {
+			log.Printf("[research] backtest_jobs 启动恢复失败(忽略): %v", merr)
+		} else if n > 0 {
+			log.Printf("[research] backtest_jobs 启动恢复：%d 个遗留 running 回放作业标记为 interrupted", n)
+			opslog.Logf("engine", "backtest_jobs 启动恢复 %d 个遗留 running 为 interrupted", n)
+		}
 		// 实盘财务因子查询：取研究库 fina_indicator 最新报告期（点对时）作为该股财务指标。
 		// 带进程内 TTL 缓存，避免 5s 打分循环反复查库；缓存缺失/过期时读库。
 		finaCache := newFinaCache(researchDB)

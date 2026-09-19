@@ -77,6 +77,11 @@ type DiscoverResult struct {
 	// YearlyConsistentYears/TotalYears §C3a 样本外分年度 IR 符号一致性（MinYrSign 启用时有效）。
 	YearlyConsistentYears int
 	YearlyTotalYears      int
+	// §RFIX-3 预期触发（样本内 runner 口径近似估算，只展示不判护栏）：
+	// 复合分 ≥70 / ≥95 的日均触发只数与统计天数（TrigDays=0 表示未估算）。
+	Trig70   float64
+	Trig95   float64
+	TrigDays int
 }
 
 // DiscoverFactors 执行因子子集选择 + 分段/反推验证。
@@ -244,6 +249,12 @@ func DiscoverFactors(panels []*Panel, opts DiscoverOpts) DiscoverResult {
 	res.InsampleIR = irOrZero(inRows) * fitSign
 	res.OutsampleIR = irOrZero(outRows) * fitSign
 	res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT = reverseExtension(panels, selected, dirs, opt.Weights, opts, splitDate, "")
+	// §RFIX-3 预期触发率透出（样本内、拟合后方向，近似口径只展示不判护栏——生产 fac_1
+	// 阈值 95 实盘零信号数月无人知，此处让审批人在落库 reason 里直接看到日均触发只数）。
+	est := TriggerRateFromPanels(panels, selected, dirs, opt.Weights, []float64{70, 95}, "", splitDate, opts.MinStocks)
+	res.TrigDays = est.Days
+	res.Trig70 = est.PerDay[70]
+	res.Trig95 = est.PerDay[95]
 
 	// 样本外护栏：样本外 IR 也需达标才视为稳健
 	if res.OutsampleIR < opts.MinIR {

@@ -62,8 +62,10 @@ func cmdRunTask(db *store.DB, dbPath string, args []string) {
 		cmdPaperResearch(db, nil)
 	case store.TaskLifecycle:
 		// §GAP-P1 20260915：夜间生命周期任务（衰退自动降级 + 灰度晋升评估）。
+		// §RFIX-3/4 新增 zero-obs-days（零观测告警阈值）与 pending-expire-days（寻优过期天数）透传。
 		cmdLifecycle(db, dataDirOf(dbPath), payloadArgs(p,
-			"paper", "dry-run", "consec-days", "min-ir", "min-win-rate", "min-daily-trades"))
+			"paper", "dry-run", "consec-days", "min-ir", "min-win-rate", "min-daily-trades",
+			"zero-obs-days", "pending-expire-days"))
 	case store.TaskList:
 		cmdList(db, nil)
 	case store.TaskBacktestCandidate:

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"quant-trading-v2/internal/config"
@@ -137,5 +138,37 @@ func TestOptRefIDForSlots(t *testing.T) {
 	}
 	if optRefIDFor("sharpe") == optRefIDFor("mdd") {
 		t.Fatalf("不同未知目标不应同槽")
+	}
+}
+
+// §RFIX-3 阈值覆盖守卫：候选 reason 含「预期触发=0」且审批把阈值覆盖上调 →
+// 返回非阻断 warning；未上调/无特征 token/非 fac 行均不告警。
+func TestThresholdOverrideWarning(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "trading.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cid, err := db.SaveCandidate(&store.Candidate{
+		Kind: "factor", Status: "proposed",
+		Factors: `["Mom20"]`, Weights: `{"weights":{"Mom20":1},"directions":{"Mom20":1},"buy_threshold":70}`,
+		Reason: "通过护栏 | 样本内IR=0.5 预期触发=0（阈值70，样本内3日均未触发，应用前请校准阈值）",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "fac_" + strconv.FormatInt(cid, 10)
+	if w := thresholdOverrideWarning(db, key, 95); w == "" {
+		t.Fatal("95>70 且预期触发=0 应告警")
+	}
+	if w := thresholdOverrideWarning(db, key, 60); w != "" {
+		t.Fatalf("阈值未上调不应告警: %q", w)
+	}
+	if w := thresholdOverrideWarning(db, "pat_1", 95); w != "" {
+		t.Fatalf("非因子行不应告警: %q", w)
+	}
+	if w := thresholdOverrideWarning(db, "fac_999", 95); w != "" {
+		t.Fatalf("候选不存在不应告警: %q", w)
 	}
 }

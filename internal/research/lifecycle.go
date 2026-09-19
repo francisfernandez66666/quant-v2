@@ -156,6 +156,9 @@ type DemoteOpts struct {
 	MinIR          float64 // 滚动 IR 下限（默认 0）
 	MinWinRate     float64 // 滚动胜率下限（%），默认 35
 	MinDailyTrades int     // 单日样本下限（默认 3）
+	// ZeroObsDays §RFIX-3 零观测告警阈值：已启用战法连续零成交观测 ≥ 该天数 → 上层推告警
+	// （默认 30；0 走默认，负数关闭告警）。
+	ZeroObsDays int
 }
 
 // fill 补齐降级阈值零值为默认（连续天数/样本数/回撤线），未配置不报错。
@@ -168,6 +171,9 @@ func (o *DemoteOpts) fill() {
 	}
 	if o.MinDailyTrades <= 0 {
 		o.MinDailyTrades = 3
+	}
+	if o.ZeroObsDays == 0 {
+		o.ZeroObsDays = 30
 	}
 }
 

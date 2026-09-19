@@ -347,6 +347,16 @@ func (s *Scheduler) openStore(cfg config.SchedulerConfig) *store.DB {
 			log.Printf("[scheduler] 启动恢复：%d 个遗留运行任务标记为 preempted（盘后自动续跑）", n)
 			opslog.Logf("research", "启动恢复 %d 个遗留任务为 preempted（盘后续跑）", n)
 		}
+		// §RFIX-4 复活 MarkRunningInterrupted：research_tasks.go:350 注释声称该函数职责已被
+		// 任务队列接管，但接管只覆盖 research_tasks 表——backtest_jobs 的 running 僵尸行
+		// （生产 id=3 自 08-21 挂死）无人回收。研究进程启动同样把残留 running 回放作业标
+		// interrupted（与 quant 侧双写幂等，共用 trading.db）。
+		if n, err := opened.MarkRunningInterrupted(); err != nil {
+			log.Printf("[scheduler] backtest_jobs 启动恢复失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[scheduler] backtest_jobs 恢复：%d 个遗留 running 回放作业标记为 interrupted", n)
+			opslog.Logf("research", "backtest_jobs 启动恢复 %d 个遗留 running 为 interrupted", n)
+		}
 		s.mu.Lock()
 		s.storeReset = true
 		s.mu.Unlock()
@@ -777,6 +787,14 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 		}
 		if l.DryRun {
 			p["dry-run"] = true
+		}
+		// §RFIX-3/4 透传（>0 才下发；缺省走 research 内置默认 30 天）：
+		// zero-obs-days 零观测告警阈值 / pending-expire-days 寻优 pending 过期天数。
+		if l.ZeroObsDays != 0 {
+			p["zero-obs-days"] = l.ZeroObsDays
+		}
+		if l.PendingExpireDays > 0 {
+			p["pending-expire-days"] = l.PendingExpireDays
 		}
 		return store.TaskLifecycle, mustJSON(p), true
 	case "library_replay":
@@ -1399,6 +1417,11 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		case store.TaskBacktestCandidate, store.TaskBacktestNightly:
 			if m := avgExcessRe.FindStringSubmatch(fullOut); len(m) == 2 {
 				resultNum, _ = strconv.ParseFloat(m[1], 64)
+			}
+			// §RFIX-4 空转步显性化：夜间配对回测无待验候选时秒完（started==finished），
+			// 旧行为 result_text 空白、观感同任务丢失——补明确文案（仅文案，无逻辑变化）。
+			if tk.Type == store.TaskBacktestNightly && strings.Contains(fullOut, "无可回测的因子候选") {
+				resultText = "无待验候选，跳过"
 			}
 		case store.TaskBacktestStrategy:
 			if strings.Contains(fullOut, "SWEEP_JSON:") {

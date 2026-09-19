@@ -112,6 +112,26 @@ func (s *Server) handleOptimizationList(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// §RFIX-4 expired 终态默认过滤（?all=1 可见）：夜间 lifecycle 会把超期未审批的 pending
+	// 行置 expired，历史过期行不再淹没审批列表。请求为 nil（形状契约测试）时不过滤不 panic。
+	if r != nil && r.URL.Query().Get("all") != "1" {
+		filtered := make([]map[string]any, 0, len(list))
+		for _, task := range list {
+			results, _ := task["results"].([]*store.OptimizationResult)
+			kept := make([]*store.OptimizationResult, 0, len(results))
+			for _, row := range results {
+				if row.Status != "expired" {
+					kept = append(kept, row)
+				}
+			}
+			if len(kept) == 0 {
+				continue // 整任务全过期 → 不再展示
+			}
+			task["results"] = kept
+			filtered = append(filtered, task)
+		}
+		list = filtered
+	}
 	pe := s.paperEngineFor(requestUserIDSafe(r))
 	for _, task := range list {
 		results, _ := task["results"].([]*store.OptimizationResult)
@@ -194,7 +214,37 @@ func (s *Server) handleOptimizationApprove(w http.ResponseWriter, r *http.Reques
 	s.reloadRulesByKind(row.StrategyKind) // 热重载对应库文件，实盘即时生效
 	// §A2 库规则行同样把门槛下发 factor/pattern 池纪律（模拟盘入场同步过滤）
 	s.applyPoolMinScore(requestUserID(r), row)
-	writeJSON(w, 200, map[string]any{"status": "approved", "id": id})
+	// §RFIX-3 应用守卫：阈值覆盖 + 候选预期触发=0 → 响应带非阻断 warning（审批人决策）。
+	writeJSON(w, 200, map[string]any{"status": "approved", "id": id,
+		"warning": thresholdOverrideWarning(s.researchDB, row.StrategyKind, p.MinScore)})
+}
+
+// thresholdOverrideWarning §RFIX-3 阈值覆盖守卫提示：扫参审批把因子战法 buy_threshold
+// 覆盖为更高值时，若来源候选的 reason 含「预期触发=0」（发现期样本内日均触发估算，
+// §RFIX-3 item1 落库），提示该战法应用后大概率仍零信号。只提示不阻断。
+// 生产教训：fac_1 应用 min_score=95 后实盘零信号数月（候选缺省阈值 70 都没触发过）。
+// English: non-blocking apply guard — warn when an approved sweep threshold exceeds the
+// candidate default AND the candidate reason says in-sample expected triggers are zero.
+func thresholdOverrideWarning(db *store.DB, kind string, minScore float64) string {
+	if db == nil || minScore <= 0 || !strings.HasPrefix(kind, "fac_") {
+		return ""
+	}
+	cid, err := strconv.ParseInt(strings.TrimPrefix(kind, "fac_"), 10, 64)
+	if err != nil || cid <= 0 {
+		return ""
+	}
+	c, err := db.CandidateByID(cid)
+	if err != nil || c == nil || !strings.Contains(c.Reason, "预期触发=0") {
+		return ""
+	}
+	var rule struct {
+		BuyThreshold float64 `json:"buy_threshold"`
+	}
+	_ = json.Unmarshal([]byte(c.Weights), &rule)
+	if minScore > rule.BuyThreshold {
+		return fmt.Sprintf("已把买入阈值覆盖为 %.0f（候选缺省 %.0f），且候选产出期样本内预期触发=0 只/日——应用后大概率仍无信号，建议降低阈值或待重新发现候选。", minScore, rule.BuyThreshold)
+	}
+	return ""
 }
 
 // applyPoolMinScore 把寻优排名行的门槛分数写入对应模拟盘战法池的买入纪律（§A2）。

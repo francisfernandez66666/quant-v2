@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/backtest"
+	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/factor"
+	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
@@ -375,12 +377,14 @@ func cmdLifecycle(db *store.DB, dataDir string, args []string) {
 	minIR := fs.Float64("min-ir", 0, "衰退降级：滚动 IR 下限（0=默认 0）")
 	minWin := fs.Float64("min-win-rate", 0, "衰退降级：胜率下限 %%（0=默认 35）")
 	minTrades := fs.Int("min-daily-trades", 0, "衰退降级：单日样本下限（0=默认 3）")
+	zeroObsDays := fs.Int("zero-obs-days", 0, "§RFIX-3 零观测告警阈值天数（0=默认30，负数=关闭告警）")
+	pendingExpireDays := fs.Int("pending-expire-days", 30, "§RFIX-4 寻优 pending 过期天数（≤0 兜底 30）")
 	dryRun := fs.Bool("dry-run", false, "只报告不实际禁用")
 	fs.Parse(args)
 
 	// run-task 子进程无 opslog.Init——显式初始化，降级动作必须留审计行（§GAP-P1 落库要求）。
 	opslog.Init(filepath.Join(dataDir, "opslog"), 0)
-	opts := research.DemoteOpts{ConsecDays: *consecDays, MinIR: *minIR, MinWinRate: *minWin, MinDailyTrades: *minTrades}
+	opts := research.DemoteOpts{ConsecDays: *consecDays, MinIR: *minIR, MinWinRate: *minWin, MinDailyTrades: *minTrades, ZeroObsDays: *zeroObsDays}
 	paper := *paperPath
 	if paper == "" {
 		paper = filepath.Join(dataDir, "paper.json")
@@ -405,6 +409,16 @@ func cmdLifecycle(db *store.DB, dataDir string, args []string) {
 	log.Printf("[lifecycle] %s", research.LifecycleDemoteSummary(actions))
 	opslog.Logf("research", "夜间生命周期：衰退评估 %d 条规则，判降级 %d 条（dry-run=%v）",
 		len(actions), countDisable(actions), *dryRun)
+	// —— 1b. §RFIX-3 零观测告警：连续零成交观测超阈值的已启用战法推运维通知（ntfy/webhook，
+	// 未配置通道时 Push 自然落空只留日志；夜间静默窗内中级别不弹窗属预期）。——
+	pushZeroObsAlerts(dataDir, actions)
+	// —— 1c. §RFIX-4 寻优 pending 过期：把过期未审批的扫参行置 expired（幂等）。——
+	if n, err := db.ExpireStalePendingOptimizations(*pendingExpireDays); err != nil {
+		log.Printf("[lifecycle] 寻优 pending 过期清理失败（不阻断夜间链）: %v", err)
+	} else if n > 0 {
+		log.Printf("[lifecycle] §RFIX-4 过期寻优 pending %d 条（>%d 天未审批）", n, *pendingExpireDays)
+		opslog.Logf("research", "寻优 pending 过期清理 %d 条（阈值 %d 天）", n, *pendingExpireDays)
+	}
 	// —— 2. 灰度晋升评估（既有内核，参数一致透传）——
 	// 灰度库未初始化（无文件）属正常早期状态：跳过晋升而非 Fatal，避免夜间任务永久失败重排。
 	if _, err := os.Stat(research.GrayscalePath(dataDir)); err != nil {
@@ -416,6 +430,42 @@ func cmdLifecycle(db *store.DB, dataDir string, args []string) {
 		promoteArgs = append(promoteArgs, "--paper", *paperPath)
 	}
 	cmdLifecycleEval(db, dataDir, promoteArgs)
+}
+
+// pushZeroObsAlerts §RFIX-3 零观测告警推送：已启用战法连续零成交观测超阈值 → 运维通知
+// （ntfy/webhook 通道按 config.json notify 段构建；未配置通道 Push 自然落空，仅日志留痕，
+// 不影响任务成败）。生产教训：fac_1 阈值 95 上线数月 signal_count=0，lifecycle 因
+// "无观测=不判定"整晚静默，闭环断链无人知晓。
+// English: §RFIX-3 zero-observation alert push via the configured ntfy/webhook channels;
+// best-effort — absent channels degrade to logs and never fail the nightly task.
+func pushZeroObsAlerts(dataDir string, actions []research.DemoteAction) {
+	var ids []string
+	for _, a := range actions {
+		if a.ZeroObs {
+			ids = append(ids, fmt.Sprintf("%s(%d日)", a.Verdict.RuleID, a.DaysSinceApply))
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	nc := config.NewManager(filepath.Join(dataDir, "config.json")).GetNotifyConfig()
+	n := notify.New()
+	if nc != nil {
+		if len(nc.WebhookURLs) > 0 {
+			n.SetWebhooks(nc.WebhookURLs)
+		}
+		if nc.NtfyTopic != "" {
+			if gw := notify.NewNtfyGateway(nc.NtfyURL, nc.NtfyTopic); gw != nil {
+				n.SetNtfy(gw)
+			}
+		}
+	}
+	n.Push(notify.Message{
+		Level:   notify.LevelMedium,
+		Title:   "战法零观测告警",
+		Content: "以下已启用战法上线超阈值天数仍零成交观测，请核查阈值/池注入：" + strings.Join(ids, "、"),
+	})
+	log.Printf("[lifecycle] §RFIX-3 零观测告警已推送: %v", ids)
 }
 
 // countDisable 统计判降级条数（审计日志用）。
@@ -658,10 +708,11 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 			}
 		}
 		// C4 滞回：与最新 applied 组合相同且 |ΔIR|<hysteresis → 跳过（防边际改进噪音顶掉实盘战法）。
+		// §RFIX-4 口径统一：比较基准用样本内 IR（与候选入库字段同源，见 SaveCandidate）。
 		if *hysteresis > 0 {
 			if app, err := db.LatestCandidate("factor", store.CandApplied); err == nil && app != nil && comboEqual(res.Factors, app.Factors) {
-				if math.Abs(res.IR-app.IR) < *hysteresis {
-					log.Printf("§C4 滞回：组合与最新 applied 相同且 |ΔIR|=%.3f<%.3f，跳过", math.Abs(res.IR-app.IR), *hysteresis)
+				if math.Abs(res.InsampleIR-app.IR) < *hysteresis {
+					log.Printf("§C4 滞回：组合与最新 applied 相同且 |ΔIR|=%.3f<%.3f，跳过", math.Abs(res.InsampleIR-app.IR), *hysteresis)
 					continue
 				}
 			}
@@ -696,6 +747,8 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 		}
 		reason := fmt.Sprintf("%s | 样本内IR=%.3f 样本外IR=%.3f 反推超额=%.4f 反推t=%.2f 排他第%d",
 			res.Reason, res.InsampleIR, res.OutsampleIR, res.GenExcess, res.GenT, i+1)
+		// §RFIX-3 预期触发率透出：审批前就暴露「阈值-触发率失校准」（fac_1 阈值95 数月零信号教训）。
+		reason += factorTrigNote(*res)
 		if res.YearlyTotalYears > 0 {
 			reason += fmt.Sprintf(" 年度符号一致(%d/%d)", res.YearlyConsistentYears, res.YearlyTotalYears)
 		}
@@ -705,7 +758,10 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 		id, err := db.SaveCandidate(&store.Candidate{
 			Kind: "factor", Status: store.CandProposed, Guard: tier, Params: string(params),
 			Factors: string(fj), Weights: string(ruleJSON),
-			Metric: res.IR, ICMean: res.ICMean, IR: res.IR,
+			// §RFIX-4 口径统一：候选 metric/IR 存样本内 IR（§RFIX-2 拟合后恒为可解释的
+			// 带符号值，与 reason 里「样本内IR」同源）——旧值取优化器窗口带符号 IR，
+			// 与 reason 打架（生产 #1：IR=-0.501 vs reason 样本内=0.553）。
+			Metric: res.InsampleIR, ICMean: res.ICMean, IR: res.InsampleIR,
 			Horizon: *h, Reason: reason,
 		})
 		if err != nil {
@@ -722,6 +778,21 @@ func cmdDiscoverFactors(db *store.DB, args []string) {
 			log.Printf("  %s%s %.3f", dir, f, res.Weights[f])
 		}
 	}
+}
+
+// factorTrigNote §RFIX-3 预期触发率 reason 尾巴（样本内 runner 口径近似估算，仅 70/95
+// 两档——与候选缺省阈值 70、扫参常见覆盖 95 对齐）。TrigDays=0（未估算）返回空串。
+// 「预期触发=0」是审批应用守卫识别的特征 token（apply 覆盖阈值超过候选缺省时提示核查）。
+// English: §RFIX-3 expected-trigger note appended to candidate reason; "预期触发=0" is the
+// feature token the apply-time guard checks when a sweep threshold overrides the default.
+func factorTrigNote(res research.DiscoverResult) string {
+	if res.TrigDays <= 0 {
+		return ""
+	}
+	if res.Trig70 <= 0 {
+		return fmt.Sprintf(" 预期触发=0（阈值70，样本内%d日均未触发，应用前请校准阈值）", res.TrigDays)
+	}
+	return fmt.Sprintf(" 预期触发≈%.1f只/日(阈值70) %.1f只/日(阈值95)", res.Trig70, res.Trig95)
 }
 
 // factorGuardTier §C2 护栏分级：基于样本外 IR 判定 strong/standard/weak/reject。

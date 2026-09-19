@@ -127,12 +127,16 @@ type rowScanner interface {
 
 // MarkRunningInterrupted 把全部残留 running 任务标记为 interrupted（quant 启动恢复：上次崩溃遗留）。
 // 返回被标记的任务数。
+// §RFIX-4 复活：本函数此前是死代码（research_tasks 启动接管只覆盖任务队列表，
+// backtest_jobs 僵尸行无人回收，生产 id=3 running 挂死近一月）；现由 researchd 与
+// quant 双启动路径调用（同一 trading.db，幂等）。finished_at 用 NULLIF 容空串——
+// 本表以 ”（非 NULL）落库空值，旧 COALESCE 永远不回填。
 // English: marks every leftover running job as interrupted (startup recovery for crashed runs).
 // Returns how many jobs were flagged.
 func (d *DB) MarkRunningInterrupted() (int, error) {
 	res, err := d.db.Exec(`UPDATE backtest_jobs SET status='interrupted',
 		error=COALESCE(NULLIF(error,''),'服务重启，任务中断（可重新发起续跑）'),
-		finished_at=COALESCE(finished_at, datetime('now','localtime')),
+		finished_at=COALESCE(NULLIF(finished_at,''), datetime('now','localtime')),
 		updated_at=datetime('now','localtime')
 		WHERE status='running'`)
 	if err != nil {

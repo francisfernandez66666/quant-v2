@@ -591,9 +591,12 @@ export default function Research() {
       ((p || {}).min_score ? ' · 门槛 ' + fmtNum(p.min_score) : '') + '\n审批后立即热重载生效。'
     if (!(await confirmDialog(msg))) return
     try {
-      await api.approveOptimization(r.id, overrideParams)
+      const res = await api.approveOptimization(r.id, overrideParams)
       r.status = 'approved'
       showToast(overrideParams ? '已应用推荐解参数' : '已应用参数', 'success')
+      // §RFIX-3 应用守卫：后端在「阈值覆盖上调 + 候选预期触发=0」时返回非阻断 warning，
+      // 审批人当场知晓该战法应用后可能仍零信号（fac_1 阈值95 静默零信号数月教训）。
+      if (res && res.warning) showToast(res.warning, 'error')
       loadOptimizations() // §F5：后端 params 列 override 已回写，重取才能同步前端
     } catch (e) { showToast('入库失败: ' + (e.message || e), 'error') }
   }
@@ -1226,7 +1229,9 @@ export default function Research() {
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>样本内测试</span><span>前一段历史回放：IR {fmt(parseReason(c, '样本内IR'))}</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>样本外测试</span><span>另一段没用过的历史回放：IR {fmt(parseReason(c, '样本外IR'))}</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>反推超额</span><span>高分股比全市场平均多赚 {fmtPct(parseReason(c, '反推超额'))}</span></div>
-              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>全样本 IR</span><span>{fmt(c.ir)}（参考）</span></div>
+              {/* §RFIX-4 口径统一：候选 ir 字段自 2026-09-19 起存「样本内IR」（与 reason 同源，
+                  §RFIX-2 方向拟合后恒为可解释带符号值）；旧数据行仍为优化器口径，以 reason 为准 */}
+              <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>样本内 IR</span><span>{fmt(c.ir)}（参考，历史行以命中原因标注为准）</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>全样本 IC</span><span>{fmt(c.ic_mean)}（参考）</span></div>
               <div style={{ display: 'flex', gap: 8, fontSize: 13, margin: '4px 0' }}><span style={{ color: 'var(--app-muted)', minWidth: 90 }}>全链路回测</span><span>{btTested(c) ? (c.backtest_result_text || fmt(c.avg_excess)) : '未测'}</span></div>
               {paramsLines(c).length > 0 && (

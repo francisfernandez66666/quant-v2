@@ -178,6 +178,34 @@ func weightsTag(w map[string]float64) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
+// windowTriggerRate §RFIX-3：窗口分块版预期触发率估算（逐窗装配-统计-释放，内存 ~单窗）。
+// 各窗按天数加权合并为全局日均；分位历史仅覆盖窗内（60 日）——runner 用全史分位，
+// 此处为近似口径，只做展示/告警输入，不参与护栏判定。
+// English: chunked expected-trigger-rate estimate; per-window percentile history is an
+// approximation of the runner's full-history percentile — display/alert input only.
+func windowTriggerRate(db *store.DB, codes []string, factors []string, dirs map[string]int, weights map[string]float64, minStocks int, chunks [][2]string, dates []string) TriggerEstimate {
+	out := TriggerEstimate{PerDay: map[float64]float64{}}
+	tot := map[float64]float64{}
+	defs := windowDefs(factors)
+	for _, w := range chunks {
+		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), w[1], defs)
+		if err != nil {
+			continue
+		}
+		est := TriggerRateFromPanels(panels, factors, dirs, weights, []float64{70, 95}, w[0], w[1], minStocks)
+		for th, per := range est.PerDay {
+			tot[th] += per * float64(est.Days)
+		}
+		out.Days += est.Days
+	}
+	if out.Days > 0 {
+		for th, s := range tot {
+			out.PerDay[th] = s / float64(out.Days)
+		}
+	}
+	return out
+}
+
 // windowCompositeIC 按窗口分块装配，累积 CompositeIC 的逐日 IC 行（全区间）。
 // 每窗口：BuildPanels 装配 [winStart, endPlusH]（多算 h 天尾巴保证前瞻收益完整），
 // 然后 CompositeICRange 只统计窗口内日期。窗口算完释放。
@@ -697,6 +725,12 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		}
 		res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT =
 			windowReverseExtension(db, codes, selected, dirs, opt.Weights, opts, splitChunks, dates, rk)
+
+		// §RFIX-3 预期触发率透出（样本内逐窗估算、拟合后方向；近似口径只进 reason 不判护栏）。
+		est := windowTriggerRate(db, codes, selected, dirs, opt.Weights, opts.MinStocks, inChunks, dates[:splitIdx+1])
+		res.TrigDays = est.Days
+		res.Trig70 = est.PerDay[70]
+		res.Trig95 = est.PerDay[95]
 
 		res.Factors = selected
 		res.Directions = dirs

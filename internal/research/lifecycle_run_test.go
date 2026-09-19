@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -117,8 +118,16 @@ func TestDemoteAppliedRulesDisables(t *testing.T) {
 	if got["fac_8"].Verdict.Verdict != "keep" {
 		t.Fatalf("fac_8 健康应保持: %+v", got["fac_8"])
 	}
-	if _, ok := got["fac_9"]; ok {
-		t.Fatal("fac_9 无观测不应产出判定（保守不误杀）")
+	if got["fac_9"].Verdict.Verdict != "keep" {
+		t.Fatalf("fac_9 无观测应保守 keep: %+v", got["fac_9"])
+	}
+	// §RFIX-3 反静默：无观测战法不再被静默跳过——留痕 keep+零观测说明；
+	// fac_9 AppliedAt 缺失（days=0 < 默认 30）不置 ZeroObs 告警位。
+	if got["fac_9"].ZeroObs {
+		t.Fatalf("fac_9 上线 0 日不应触发零观测告警: %+v", got["fac_9"])
+	}
+	if !strings.Contains(got["fac_9"].Verdict.Reason, "零成交观测") {
+		t.Fatalf("fac_9 reason 应含零观测提示: %+v", got["fac_9"])
 	}
 	// 落库校验：applied_factors.json 中 fac_7 Enabled=false
 	after, err := ListAppliedFactorRules(dir)

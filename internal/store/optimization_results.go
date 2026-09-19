@@ -11,6 +11,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -229,6 +230,26 @@ func (d *DB) GetOptimization(id int64) (*OptimizationResult, error) {
 func (d *DB) UpdateOptimizationStatus(id int64, status string) error {
 	_, err := d.db.Exec(`UPDATE optimization_results SET status = ? WHERE id = ?`, status, id)
 	return err
+}
+
+// ExpireStalePendingOptimizations §RFIX-4 pending 过期治理：把创建超过 days 天仍未审批的
+// pending 排名行置为 expired（新终态；列表默认过滤，前端 --all 可见）。生产实证：
+// optimization_results 119 行中 85 行 pending 堆积无出口，审批页长期被过期扫参淹没。
+// 返回过期行数；days<=0 视为 30 天兜底。幂等 UPDATE，双进程并发安全。
+// English: §RFIX-4 — pending sweep rows older than `days` become `expired` (new terminal state,
+// hidden from default listings); idempotent and safe to run from either process.
+func (d *DB) ExpireStalePendingOptimizations(days int) (int, error) {
+	if days <= 0 {
+		days = 30
+	}
+	res, err := d.db.Exec(`UPDATE optimization_results SET status = 'expired'
+		WHERE status = 'pending' AND created_at < datetime('now','localtime', ?)`,
+		fmt.Sprintf("-%d days", days))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // UpdateOptimizationParams 覆写排名行的 params_json 列（§F4 修复：Pareto 推荐解覆盖冠军行时，

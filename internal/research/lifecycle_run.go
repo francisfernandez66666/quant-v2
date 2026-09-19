@@ -7,6 +7,7 @@ package research
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -140,6 +141,10 @@ type DemoteAction struct {
 	Verdict  DemoteVerdict `json:"verdict"`
 	Kind     string        `json:"kind"` // factor | pattern
 	Disabled bool          `json:"disabled"`
+	// §RFIX-3 反静默：已启用但零成交观测的战法也记入 actions（verdict=keep），
+	// DaysSinceApply=自上线天数；ZeroObs=零观测已超过告警阈值天数（调用方据此推告警）。
+	DaysSinceApply int  `json:"days_since_apply,omitempty"`
+	ZeroObs        bool `json:"zero_obs,omitempty"`
 }
 
 // DemoteAppliedRules 衰退降级主流程：遍历战法库**启用中**的因子/形态规则，按规则池
@@ -149,6 +154,9 @@ type DemoteAction struct {
 // English: evaluates every enabled applied rule against its pool's daily stats and disables
 // declining ones (dryRun = report only); rules without observations stay untouched.
 func DemoteAppliedRules(dataDir, paperPath string, opts DemoteOpts, dryRun bool) ([]DemoteAction, error) {
+	// §RFIX-3：先补默认（EvaluateDemote 的 fill 作用在它自己的值副本上，
+	// 零观测分支要在本函数内读到 ZeroObsDays 默认值）。
+	opts.fill()
 	if paperPath == "" {
 		paperPath = filepath.Join(dataDir, "paper.json")
 	}
@@ -162,9 +170,23 @@ func DemoteAppliedRules(dataDir, paperPath string, opts DemoteOpts, dryRun bool)
 		return nil, err
 	}
 	var actions []DemoteAction
-	evaluate := func(id, kind string) {
+	evaluate := func(id, kind, appliedAt string) {
 		if _, ok := stats[id]; !ok {
-			return // 无观测 = 不判定（保守：新上/无成交战法不能被静默禁用）
+			// §RFIX-3 反静默：无观测 = 不判定（保守，新上/无成交战法不能被静默禁用），
+			// 但必须**留痕**——旧实现直接 return，lifecycle 输出"无已启用战法需要衰退评估"
+			// 的误导空话，fac_1 阈值失校准导致数月零信号无人察觉（生产 #265 实录）。
+			// 现记入 actions（keep + 上线天数），连续零观测 ≥ZeroObsDays 置 ZeroObs 供告警。
+			days := daysSince(appliedAt)
+			a := DemoteAction{
+				Verdict:        DemoteVerdict{RuleID: id, Verdict: "keep", Reason: fmt.Sprintf("上线%d日零成交观测，不判定衰退（请核查阈值/池注入是否失校准）", days)},
+				Kind:           kind,
+				DaysSinceApply: days,
+			}
+			if opts.ZeroObsDays > 0 && days >= opts.ZeroObsDays {
+				a.ZeroObs = true
+			}
+			actions = append(actions, a)
+			return
 		}
 		v := EvaluateDemote(stats[id], opts)
 		v.RuleID = id
@@ -186,15 +208,33 @@ func DemoteAppliedRules(dataDir, paperPath string, opts DemoteOpts, dryRun bool)
 	}
 	for _, e := range factors {
 		if e.Enabled {
-			evaluate(e.ID, "factor")
+			evaluate(e.ID, "factor", e.AppliedAt)
 		}
 	}
 	for _, e := range patterns {
 		if e.Enabled {
-			evaluate(e.ID, "pattern")
+			evaluate(e.ID, "pattern", e.AppliedAt)
 		}
 	}
 	return actions, nil
+}
+
+// daysSince 解析 "2006-01-02 15:04:05" 应用时间，返回距今天数（解析失败/未来时间=0）。
+// English: whole days elapsed since an "applied_at" timestamp; unparsable or future = 0.
+func daysSince(appliedAt string) int {
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", appliedAt, time.Local)
+	if err != nil {
+		// 兼容仅日期形态（旧数据/手工编辑）
+		t, err = time.ParseInLocation("2006-01-02", appliedAt, time.Local)
+		if err != nil {
+			return 0
+		}
+	}
+	d := int(time.Since(t).Hours() / 24)
+	if d < 0 {
+		d = 0
+	}
+	return d
 }
 
 // LifecycleDemoteSummary 供审计日志/任务输出的一行式降级摘要。
@@ -204,10 +244,19 @@ func LifecycleDemoteSummary(actions []DemoteAction) string {
 		return "无已启用战法需要衰退评估（战法库为空或全部无观测）"
 	}
 	disabled := 0
+	zeroObs := 0
 	for _, a := range actions {
 		if a.Verdict.Verdict == "disable" {
 			disabled++
 		}
+		if a.ZeroObs {
+			zeroObs++
+		}
 	}
-	return "衰退评估 " + strconv.Itoa(len(actions)) + " 条规则，判降级 " + strconv.Itoa(disabled) + " 条"
+	s := "衰退评估 " + strconv.Itoa(len(actions)) + " 条规则，判降级 " + strconv.Itoa(disabled) + " 条"
+	// §RFIX-3 反静默：零观测超阈值的战法在摘要里点名（旧输出对 fac_1 式失校准完全无声）。
+	if zeroObs > 0 {
+		s += "，零观测告警 " + strconv.Itoa(zeroObs) + " 条（上线超阈值天数无成交，核查阈值/池注入）"
+	}
+	return s
 }
