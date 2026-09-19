@@ -1,4 +1,4 @@
-# prune_logs.ps1 - §RFIX-5 研究/引擎轮转日志保留任务（由计划任务 Quant-Log-Prune 每日 07:30 触发）。
+﻿# prune_logs.ps1 - §RFIX-5 研究/引擎轮转日志保留任务（由计划任务 Quant-Log-Prune 每日 07:30 触发）。
 # 背景：NSSM 只设单文件 10MB 轮转阈值、不清历史——现网实录 researchd-*.log 累计 702MB、
 # quant_stderr 轮转 150+ 文件，C 盘仅剩 ~11.7GB，而同盘还住着 5.1GB trading.db + WAL。
 # 语义：按基名分组（researchd / quant_stderr），各组仅保留最近 -Keep 个轮转文件（默认 20）；
