@@ -143,4 +143,14 @@ if (-not (Test-Path $QmtctlExe)) {
     else { Warn "schtasks create failed (exit=$LASTEXITCODE); create manually (current user, not SYSTEM)" }
 }
 
+# 6. §RFIX-5 日志保留计划任务（每日 07:30，SYSTEM 可无窗执行——纯文件清理不涉 GUI）
+$prune = Join-Path $PSScriptRoot "prune_logs.ps1"
+if (Test-Path $prune) {
+    schtasks /Create /F /SC DAILY /ST 07:30 /TN "Quant-Log-Prune" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $prune" | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok "task Quant-Log-Prune created (daily 07:30, keep 20 rotations)" }
+    else { Warn "Quant-Log-Prune 创建失败（exit=$LASTEXITCODE）：轮转日志将无限累积，请手动创建" }
+} else {
+    Warn "missing $prune - skip log-prune task（researchd/quant_stderr 轮转日志不会自动清理）"
+}
+
 Ok "engine services registered. Verify: Get-Service quant,quant-research,pydata ; schtasks /Query /TN QMT-Ensure-Running"

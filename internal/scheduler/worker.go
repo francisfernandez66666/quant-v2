@@ -1382,8 +1382,17 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		status = store.TaskPreempted
 		errMsg = "调度器停止，断点缓存有效（下次启动自动回队续跑）"
 	case waitErr != nil:
-		status = store.TaskFailedRetry
-		errMsg = fmt.Sprintf("运行失败(%v)，已回队尾重试", waitErr)
+		// §RFIX-5 确定性崩溃 fail-fast：子进程输出带 panic/fatal error 特征时，同输入
+		// 必然复现，回队重试只会整晚重复烧 CPU（生产实录：backtest_strategy 每晚 5 次
+		// ×40 分钟重试全损 + 单夜 ~90MB goroutine 栈日志）——直接落终态 error，
+		// error 列截存崩溃首行供排障；网络/数据类失败维持回队语义不变。
+		if crash := crashMarkerLine(fullOut); crash != "" {
+			status = store.TaskError
+			errMsg = "确定性崩溃，未回队: " + crash
+		} else {
+			status = store.TaskFailedRetry
+			errMsg = fmt.Sprintf("运行失败(%v)，已回队尾重试", waitErr)
+		}
 	}
 	if status == store.TaskDone {
 		switch tk.Type {
@@ -1516,6 +1525,41 @@ func tailOf(msg string) string {
 		return ""
 	}
 	return "（" + msg + "）"
+}
+
+// crashMarkerLine §RFIX-5 确定性崩溃特征提取：在子进程合并输出中寻找 Go 运行时崩溃
+// 首行（`panic: runtime error:` / `fatal error:`），返回「首行 + 首个仓库栈帧」的短摘要
+// （≤300 字节）；无特征返回空串（普通非零退出仍按可重试失败回队）。
+// 说明：任务日志行带 `[task#id:type]` 前缀，特征匹配按行扫描不受前缀影响。
+func crashMarkerLine(out string) string {
+	lines := strings.Split(out, "\n")
+	for i, ln := range lines {
+		idx := strings.Index(ln, "panic: runtime error:")
+		if idx < 0 {
+			idx = strings.Index(ln, "fatal error:")
+		}
+		if idx < 0 {
+			continue
+		}
+		head := strings.TrimSpace(ln[idx:])
+		// 附带首个仓库栈帧行（下一非空且含 .go: 的行），定位崩溃点免翻日志。
+		frame := ""
+		for j := i + 1; j < len(lines) && j <= i+6; j++ {
+			if s := strings.TrimSpace(lines[j]); strings.Contains(s, ".go:") {
+				frame = s
+				break
+			}
+		}
+		msg := head // head 自带 "panic: runtime error:"/"fatal error:" 前缀，不再叠加级别标签
+		if frame != "" {
+			msg += " @ " + frame
+		}
+		if len(msg) > 300 {
+			msg = msg[:300]
+		}
+		return msg
+	}
+	return ""
 }
 
 // execDataload 交易时段增量下载直连通道（不入研究队列；只下载绝不研究）。

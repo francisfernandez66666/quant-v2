@@ -95,6 +95,10 @@ $SSH "powershell -NoProfile -Command \"net stop quant; net stop quant-research; 
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata | Out-Null\""
 $SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/qmtctl.exe "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
 $SCP deploy/qmt-win/register_engine_services.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+# §RFIX-5 日志保留脚本（register 第 6 段据此注册 Quant-Log-Prune 计划任务；新增部署文件
+# 必须入本清单——教训见 §ENH-5 quote_feed.py 漏列导致网关 ImportError 起不来）
+ps1_bom deploy/qmt-win/prune_logs.ps1
+$SCP deploy/qmt-win/prune_logs.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # baostock sidecar
 $SCP cmd/pydata/server.py cmd/pydata/requirements.txt "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/pydata/"
 

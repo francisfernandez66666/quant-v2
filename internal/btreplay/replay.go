@@ -178,7 +178,7 @@ type nShapeAdapter struct {
 	st         *n_shape.NShapeStrategy
 	cfg        *config.NShapeConfig
 	d1Score    float64     // 规则 D1 分（日K近似假设的中性事件分；0=不触发）
-	macdSeries []data.MACD // 预计算的日线 MACD 序列（由 backtestStock 一次性填充，避免每日重复 O(n²)）
+	macdSeries []data.MACD // 预计算的日线 MACD 序列（由 backtestStock 逐股重算填充，见 §RFIX-1）
 	curIdx     int         // 当前判定日在 macdSeries 中的索引（由 backtestStock 逐日设置）
 }
 
@@ -196,7 +196,9 @@ func (a *nShapeAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (map[
 	avgVol := avgVolK(klines, len(klines)-1, 20)
 	// 日线 MACD 近似分钟 MACD（D4 资金确认：DIF>DEA 且 DIF>0）
 	var macd data.MACD
-	if a.macdSeries != nil {
+	// §RFIX-1 索引钳位兜底：macdSeries 由 backtestStock 逐股重算，长度恒与该股 K 线一致；
+	// 任何未来错位（如复用旧适配器）退化为逐日重算而非越界崩溃。
+	if a.macdSeries != nil && a.curIdx >= 0 && a.curIdx < len(a.macdSeries) {
 		macd = a.macdSeries[a.curIdx]
 	} else {
 		macd = data.CalcMACD(klines)
@@ -930,8 +932,11 @@ func toDataKLine(bars []store.Bar) []data.KLine {
 // distinction, slippage is resolved per trade, and the exit walk honors limit-down sealing + partial fills.
 func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, industryChgByDate map[string]float64) []trade {
 	var trades []trade
-	// n_shape：预计算整条日线 MACD 序列（一次性，避免逐日重复 O(n²)）
-	if na, ok := ad.(*nShapeAdapter); ok && na.macdSeries == nil {
+	// §RFIX-1 n_shape：MACD 序列必须逐股重算。旧实现 `macdSeries == nil` 守卫使序列
+	// 只按池内第一只股票计算一次——后续股票全部跨股污染 D4 资金确认（结果失真），
+	// 且更长序列股票的 curIdx 直接越界 panic（生产 09-18/19 实录 index out of range）。
+	// CalcMACDSeries 为 O(n) 单遍递推，逐股重算成本可忽略。
+	if na, ok := ad.(*nShapeAdapter); ok {
 		na.macdSeries = data.CalcMACDSeries(klines)
 	}
 	// 从第 30 根起才有足够前视窗（MA/主升段）
