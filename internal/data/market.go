@@ -510,8 +510,8 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 
 // GetRealtimeQuoteWithFlow 获取含主力净流入的实时行情（consult 手动路径专用）。
 // 与 GetRealtimeQuote 不同：主循环高频路径 §S4 走 新浪→腾讯→东财（东财末位兜底，降熔断冲击）；
-// 但主力净流入（NetInflow/f62）只有东财提供，consult 手动咨询路径（buildStockBlock）需要它，
-// 故这里改为 东财→新浪→腾讯（东财优先），保证净流入可注入。consult 为低频用户操作，不构成东财压力。
+// 主力净流入优先东财 f62（东财优先），东财失败时用同花顺官方 capital-flow 快照补流（§ENH-2），
+// 再不行才落 新浪/腾讯（HasFlow=false）。consult 为低频用户操作，不构成东财压力。
 // 不走 quoteTTL 共享缓存（避免主循环缓存的新浪无净流入快照被复用），每次直连。
 // GetRealtimeQuoteWithFlow returns a quote with main-force net inflow, used by the consult manual path.
 // Unlike GetRealtimeQuote (S4: Sina→Tencent→EastMoney for the hot loop), NetInflow (f62) only exists on
@@ -519,18 +519,35 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 // does not pressure EastMoney; it also bypasses the shared quoteTTL cache (a cached Sina snapshot lacks flow).
 func (m *MarketAPI) GetRealtimeQuoteWithFlow(code string) (*StockInfo, error) {
 	code = stripSuffix(code)
-	// 东财行情自带资金流，故优先东财，失败再依次降级新浪/腾讯
+	// 东财行情自带资金流，故优先东财；失败降级新浪/腾讯后用同花顺官方快照补流（§ENH-2）。
 	info, emErr := m.getEastMoneyQuote(code)
 	if emErr == nil {
 		return info, nil
 	}
 	if sina, serr := m.GetSinaQuote(code); serr == nil {
+		m.enrichFlowFromHithink(sina)
 		return sina, nil
 	}
 	if ten, terr := m.getTencentQuote(code); terr == nil {
+		m.enrichFlowFromHithink(ten)
 		return ten, nil
 	}
 	return nil, fmt.Errorf("eastmoney: %v; sina/tencent unavailable", emErr)
+}
+
+// enrichFlowFromHithink §ENH-2：新浪/腾讯快照本身无主力净流入字段（HasFlow=false），
+// 东财熔断时用同花顺官方 capital-flow 快照补 NetInflow（单位=元，口径同 f62=超大+大净额）
+// 并置 HasFlow=true；补数失败静默保持 HasFlow=false（§FIX-9e 缺数语义不破坏）。
+func (m *MarketAPI) enrichFlowFromHithink(si *StockInfo) {
+	if si == nil || si.HasFlow {
+		return
+	}
+	cf, err := hithinkStockMoneyFlow(si.Code)
+	if err != nil || cf == nil {
+		return
+	}
+	si.NetInflow = cf.NetInflow
+	si.HasFlow = true
 }
 
 // checkEastMoneyHealth 探测东财行情源是否可用。
@@ -1806,18 +1823,33 @@ func (m *MarketAPI) GetIndexQuote(code string) (*StockInfo, error) {
 
 // ── 资金流向 ──
 
-// GetStockMoneyFlow 获取东方财富个股资金流向。
-// 返回 CapitalFlow，包含超大单/大单/中单/小单的买卖金额及主力净流入。
-// GetStockMoneyFlow returns an individual stock's capital-flow breakdown
-// (super-large/large/medium/small orders and main-capital net inflow).
+// GetStockMoneyFlow 获取个股资金流向：东财主源 → 同花顺官方 capital-flow 第二源（§ENH-2）。
+// 返回 CapitalFlow，包含超大单/大单/中单/小单的买卖金额及主力净流入（单位=元）。
+// GetStockMoneyFlow returns an individual stock's capital-flow breakdown via EastMoney first,
+// falling back to the official THS capital-flow snapshot (§ENH-2); all amounts in CNY.
 func (m *MarketAPI) GetStockMoneyFlow(code string) (*CapitalFlow, error) {
+	cf, emErr := m.getEastMoneyMoneyFlow(code)
+	if emErr == nil {
+		return cf, nil
+	}
+	// §ENH-2(2026-09-19)：东财单点失败改走同花顺官方 capital-flow 第二源（口径同为
+	// "主力=超大+大净额"、单位=元）；第二源也失败时错误合并透传，不编造。
+	hcf, thErr := hithinkStockMoneyFlow(code)
+	if thErr == nil {
+		return hcf, nil
+	}
+	return nil, fmt.Errorf("eastmoney: %v; ths-hithink: %v", emErr, thErr)
+}
+
+// getEastMoneyMoneyFlow 东财 push2 个股资金流向主源（原 GetStockMoneyFlow 主体）。
+func (m *MarketAPI) getEastMoneyMoneyFlow(code string) (*CapitalFlow, error) {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63", sid)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
-		// 资金流向为东财单点主源，失败需告警并快速返回，交由上层降级（无第二源，需补第二源）。
-		log.Printf("[market] 东财个股资金流向获取失败，快速返回错误（需补第二源）: %v", err)
+		// 资金流向主源（东财）失败告警后快速返回，§ENH-2 已补同花顺官方第二源降级。
+		log.Printf("[market] 东财个股资金流向获取失败，尝试同花顺第二源: %v", err)
 		return nil, fmt.Errorf("eastmoney moneyflow http: %v", err)
 	}
 	defer resp.Body.Close()
