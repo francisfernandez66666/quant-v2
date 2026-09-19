@@ -103,6 +103,7 @@ echo "[2b/5] 同步 qmt_gateway 到 $QMT_GATEWAY_DIR ..."
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $QMT_GATEWAY_DIR | Out-Null\""
 $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
      qmt_gateway/store.py qmt_gateway/ids.py qmt_gateway/qmt_bridge.py \
+     qmt_gateway/quote_feed.py \
      qmt_gateway/config.bridge.example.json \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
 
