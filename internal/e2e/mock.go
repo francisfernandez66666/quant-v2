@@ -28,14 +28,17 @@ func (t *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	path := req.URL.Path
 
 	// 按 主机+路径 路由到各 mock handler；无匹配时返回空 JSON。
+	// §修复 EM-MIRROR(20260920)：stock/get 与 clist/get 允许走镜像域名 push2delay（生产故障转移），
+	// kline/fflow 不参与转移（镜像上返回 rc:102），故其 mock 仍只挂主域名。
+	push2QuoteHost := host == "push2.eastmoney.com" || host == "push2delay.eastmoney.com"
 	switch {
 	case host == "hq.sinajs.cn":
 		return t.sinaQuotes(req)
 	case host == "money.finance.sina.com.cn" && strings.Contains(path, "getKLineData"):
 		return t.sinaKLine(req)
-	case host == "push2.eastmoney.com" && path == "/api/qt/clist/get":
+	case push2QuoteHost && path == "/api/qt/clist/get":
 		return t.emClist(req)
-	case host == "push2.eastmoney.com" && path == "/api/qt/stock/get":
+	case push2QuoteHost && path == "/api/qt/stock/get":
 		return t.emStockGet(req)
 	case host == "push2.eastmoney.com" && path == "/api/qt/stock/fflow/kline/get":
 		return t.emMoneyFlow(req)
@@ -160,12 +163,14 @@ func (t *fixtureTransport) emClist(req *http.Request) (*http.Response, error) {
 	fs := req.URL.Query().Get("fs")
 
 	// b: 前缀 → 板块成分股列表（f 字段以分/基点换算）。
+	// §修复 SECTOR-STOCKS(20260920)：真实 clist 响应的行集合字段是 data.diff（旧夹具返回
+	// 不存在的 data.items，正好把"解析器读错字段、恒返回空表"的缺陷掩盖成绿灯）。
 	if strings.HasPrefix(fs, "b:") {
 		code := strings.TrimPrefix(fs, "b:")
 		stocks := t.fix.SectorStocks[code]
-		items := make([]map[string]interface{}, 0, len(stocks))
+		diff := make([]map[string]interface{}, 0, len(stocks))
 		for _, s := range stocks {
-			items = append(items, map[string]interface{}{
+			diff = append(diff, map[string]interface{}{
 				"f12": s.Code, "f14": s.Name,
 				"f2": s.Price * 100, "f3": s.ChangePct * 100,
 				"f15": s.High * 100, "f16": s.Low * 100,
@@ -174,7 +179,7 @@ func (t *fixtureTransport) emClist(req *http.Request) (*http.Response, error) {
 			})
 		}
 		return t.json(map[string]interface{}{
-			"data": map[string]interface{}{"total": len(items), "items": items},
+			"data": map[string]interface{}{"total": len(diff), "diff": diff},
 		})
 	}
 
@@ -204,7 +209,7 @@ func (t *fixtureTransport) emClist(req *http.Request) (*http.Response, error) {
 	})
 }
 
-// emStockGet 东财个股：industry(f128) / 实时行情(f43...) / 指数(000001)。
+// emStockGet 东财个股：industry(f127 行业 / f128 地域板块) / 实时行情(f43...) / 指数(000001)。
 func (t *fixtureTransport) emStockGet(req *http.Request) (*http.Response, error) {
 	secid := req.URL.Query().Get("secid")
 	fields := req.URL.Query().Get("fields")
@@ -213,10 +218,14 @@ func (t *fixtureTransport) emStockGet(req *http.Request) (*http.Response, error)
 		code = code[idx+1:]
 	}
 
-	if strings.Contains(fields, "f128") {
-		return t.json(map[string]interface{}{
-			"data": map[string]interface{}{"f128": t.fix.Industries[code]},
-		})
+	// §修复 EM-F127(20260920)：真实接口 f127=行业、f128=地域板块；夹具 Industries 存的正是行业名，
+	// 故按真实字段位返回 f127，并另给 f128 地域值——用于锁住"必须返回行业、不得返回地域板块"。
+	if strings.Contains(fields, "f127") {
+		data := map[string]interface{}{"f127": t.fix.Industries[code]}
+		if reg := t.fix.Regions[code]; reg != "" {
+			data["f128"] = reg
+		}
+		return t.json(map[string]interface{}{"data": data})
 	}
 
 	if code == "000001" {

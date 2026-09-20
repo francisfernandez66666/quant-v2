@@ -42,9 +42,15 @@ type Fixture struct {
 	// 板块成分股
 	SectorStocks map[string][]data.StockInfo `json:"sector_stocks"`
 
-	// 个股行业代码 -> 行业名（GetStockIndustry f128）。
+	// 个股行业代码 -> 行业名（东财 f127；GetStockIndustry 优先返回该字段）。
 	// 行业数据
 	Industries map[string]string `json:"industries"`
+
+	// 个股代码 -> 所属地域板块（东财 f128，如 "福建板块"）。
+	// §修复 EM-F127(20260920)：真实接口 f127=行业、f128=地域板块；本映射用于锁住
+	// "GetStockIndustry 必须返回行业、不得返回地域板块"。未填写的代码不返回 f128。
+	// 地域板块
+	Regions map[string]string `json:"regions"`
 
 	// 个股行情：code -> 新浪 CSV 字段串（逗号分隔，首字段为名称）。
 	// 字段序：name,open,prev_close,price,high,low,...,volume,amount,...

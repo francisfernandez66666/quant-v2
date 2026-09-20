@@ -664,9 +664,13 @@ func TestEndToEndFullPipeline(t *testing.T) {
 			t.Errorf("板块成分股解析失败: %d err=%v", len(stk), err)
 		}
 
-		// 东财实时行情（emStockGet f128 行业 + f43 指数）
-		if row := rig.market.GetStockIndustry("300750"); row == "" {
-			t.Error("GetStockIndustry 应解析出行业")
+		// 东财实时行情（emStockGet f127 行业 + f128 地域板块 + f43 指数）
+		// §修复 EM-F127(20260920)：必须取 f127 行业，不得误取 f128 地域板块（旧实现即取错字段）。
+		if row := rig.market.GetStockIndustry("300750"); row != fix.Industries["300750"] {
+			t.Errorf("GetStockIndustry 应返回行业 f127=%q, got %q", fix.Industries["300750"], row)
+		}
+		if row := rig.market.GetStockIndustry("300750"); row == fix.Regions["300750"] {
+			t.Errorf("GetStockIndustry 误取地域板块 f128=%q（应取 f127 行业）", row)
 		}
 		if idx, _, up, down, err := rig.market.GetIndexData(); err != nil || idx <= 0 || up <= 0 || down <= 0 {
 			t.Errorf("指数行情应解析: idx=%.2f up=%d down=%d err=%v", idx, up, down, err)

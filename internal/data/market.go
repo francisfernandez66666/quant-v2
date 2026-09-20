@@ -246,25 +246,109 @@ func (m *MarketAPI) emRecord(scope string, err error) {
 	}
 }
 
+// emPrimaryPush2Host 东财 push2 主域名；emMirrorPush2Host 为同族镜像域名。
+// §修复 EM-MIRROR(20260920)：实测主域名在部分地区/线路 TCP 可建连但 TLS 握手即被重置
+// （curl 报空回复 HTTP=000，Go 报 EOF），而镜像可达且 stock/get、clist/get 返回与主站
+// 完全一致的数据（换手率 f168、主力净流入 f62、行业 f127、地域板块 f128）。
+// English: EastMoney push2 primary host and its mirror. Measured 2026-09-20: the primary resets
+// the TLS handshake (curl HTTP=000 / Go EOF) while the mirror serves identical stock/get +
+// clist/get payloads (turnover f168, net inflow f62, industry f127, region f128).
+const (
+	emPrimaryPush2Host = "push2.eastmoney.com"
+	emMirrorPush2Host  = "push2delay.eastmoney.com"
+)
+
+// emFailoverPaths 允许故障转移到镜像的 push2 路径白名单。
+// §修复 EM-MIRROR(20260920)：镜像只对 stock/get 与 clist/get 返回真实数据；
+// stock/kline/get 与 stock/fflow/kline/get 在镜像上返回 HTTP 200 + rc:102 + data:null，
+// 若一并纳入转移，"HTTP 成功但无数据"会顶掉上层既有的同花顺/新浪第二源降级（更差形态），
+// 故显式排除——这两个接口在主站不可达时仍走原有降级链。
+// English: paths allowed to fail over. The mirror only serves stock/get and clist/get; kline and
+// fflow return rc:102 + data:null there, and counting that as success would suppress the existing
+// THS/Sina second-source fallback, so they are excluded on purpose.
+var emFailoverPaths = map[string]bool{
+	"/api/qt/stock/get": true,
+	"/api/qt/clist/get": true,
+}
+
+// emMirrorMaxPageSize 镜像对 clist 的 pz 硬性封顶（实测 2026-09-20：pz=10000 仍只返回 100 条，
+// 而全市场 total=5560）。不加限制就转移会让 GetStockList(pz=10000) 只拿到 100 只、
+// GetSectorList(pz=500) 只拿到 100/496 个板块——**静默截断比"取不到走兜底"危险得多**
+// （错而不报）。故 clist 仅在 pz ≤ 100 时转移：覆盖个股 PE 单查(pz=1)与板块成分股
+// (GetSectorStocks，默认 topN≤100)，这两类正是"分页量充足、镜像完整可服务"的场景。
+// English: the mirror caps clist page size at 100 (measured 2026-09-20: pz=10000 still returns 100 of
+// a 5560-row total). Failing over unconditionally would silently truncate GetStockList (pz=10000) and
+// GetSectorList (pz=500) — wrong-but-silent is worse than unavailable-and-fallback. clist therefore
+// fails over only when pz <= 100, which covers the PE single query (pz=1) and sector constituents
+// (GetSectorStocks, topN <= 100) — exactly the calls the mirror can serve in full.
+const emMirrorMaxPageSize = 100
+
+// emFailoverURLs 返回一个东财 URL 的候选请求序列：主域名在前、镜像兜底。
+// 非主域名、不在白名单路径、或 clist 分页超出镜像能力（pz > emMirrorMaxPageSize）时
+// 原样返回单元素，行为与改造前完全一致。
+// English: candidate URLs for an EastMoney call — primary first, mirror as fallback; returns the
+// original single URL when the host/path is not eligible or a clist page size exceeds the mirror cap.
+func emFailoverURLs(raw string) []string {
+	u, err := urlpkg.Parse(raw)
+	if err != nil || u.Host != emPrimaryPush2Host || !emFailoverPaths[u.Path] {
+		return []string{raw}
+	}
+	if u.Path == "/api/qt/clist/get" {
+		// 缺省 pz 由东财默认页大小决定（远小于 100），按 0 处理即视为可分页充足。
+		if pz, perr := strconv.Atoi(u.Query().Get("pz")); perr == nil && pz > emMirrorMaxPageSize {
+			return []string{raw}
+		}
+	}
+	alt := *u
+	alt.Host = emMirrorPush2Host
+	return []string{raw, alt.String()}
+}
+
 // getWithHeaders 发起带浏览器头部模拟的 GET 请求。
 // 解决东财 CDN 对无头请求的 geo-block / anti-crawler 封锁。
 // 内置单点熔断：处于熔断窗口内直接快速失败，避免挂起拖垮全链路。
-// getWithHeaders issues a GET with simulated browser headers to bypass
-// EastMoney CDN geo-blocking / anti-crawler filters, wrapped with the
-// single-point circuit breaker so callers can fast-fail during outages.
+// §修复 EM-MIRROR(20260920)：主域名不可达时按候选序列降级到镜像域名（见 emFailoverURLs），
+// 使"东财某一主机不可达"不再等于"换手率/主力净流入/行业全缺数"。
+// getWithHeaders issues a GET with simulated browser headers to bypass EastMoney CDN
+// geo-blocking / anti-crawler filters, wrapped with the single-point circuit breaker so callers
+// can fast-fail during outages; on primary-host failure it degrades to the mirror host.
 func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) {
-	// 以请求路径作为熔断 scope，使各东财接口独立熔断、互不拖累。
-	scope := url
-	if u, perr := urlpkg.Parse(url); perr == nil {
-		scope = u.Path
+	cands := emFailoverURLs(url)
+	var lastErr error
+	for i, cand := range cands {
+		// 熔断 scope = 主机 + 路径：主机维度隔离保证"主域名熔断不吃掉镜像的取数机会"，
+		// 路径维度隔离沿用既有语义（单接口故障不拖垮其他接口）。
+		scope := cand
+		if u, perr := urlpkg.Parse(cand); perr == nil {
+			scope = u.Host + u.Path
+		}
+		// 熔断窗口内直接快速失败，触发上层既有降级/缓存路径，不发起网络请求。
+		if !m.emAllow(scope) {
+			lastErr = fmt.Errorf("eastmoney circuit-breaker open (%s): fast-fail (cooldown)", scope)
+			continue
+		}
+		resp, err := m.doWithHeaders(cand, referer)
+		if err != nil {
+			m.emRecord(scope, err)
+			lastErr = err
+			if i+1 < len(cands) {
+				log.Printf("[market] 东财主机降级: %v（%s 不可达）→ 改试镜像 %s", err, scope, emMirrorPush2Host)
+			}
+			continue
+		}
+		// 到达 HTTP 层且确为 JSON 即视为该主机连通，清零其熔断计数（业务层解析错误由调用方另判）。
+		m.emRecord(scope, nil)
+		return resp, nil
 	}
-	// 熔断窗口内直接快速失败，触发上层既有降级/缓存路径，不发起网络请求。
-	if !m.emAllow(scope) {
-		return nil, fmt.Errorf("eastmoney circuit-breaker open (%s): fast-fail (cooldown)", scope)
-	}
+	return nil, lastErr
+}
+
+// doWithHeaders 执行单次带浏览器头部的 GET，并做反爬空体/HTML 判定（不含主机降级与熔断记账）。
+// English: performs one browser-header GET with anti-crawler empty-body/HTML detection;
+// host failover and breaker accounting live in getWithHeaders.
+func (m *MarketAPI) doWithHeaders(url, referer string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		m.emRecord(scope, err)
 		return nil, err
 	}
 	req.Header.Set("User-Agent", emUserAgent)
@@ -273,8 +357,7 @@ func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) 
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	resp, err := m.client.Do(req)
 	if err != nil {
-		// HTTP 层失败：累计该接口熔断计数。
-		m.emRecord(scope, err)
+		// HTTP 层失败：交由 getWithHeaders 累计该主机+接口的熔断计数。
 		return nil, err
 	}
 	// §修复 D2（2026-08-29）：东财反爬常返回 200 但空体/非 JSON（geo-block 或风控），
@@ -283,8 +366,7 @@ func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) 
 	// 计为失败并快速失败，让熔断窗口正确开启、走既有降级/缓存路径。
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		m.emRecord(scope, fmt.Errorf("eastmoney http status %d", resp.StatusCode))
-		return nil, fmt.Errorf("eastmoney http status %d (%s)", resp.StatusCode, scope)
+		return nil, fmt.Errorf("eastmoney http status %d (%s)", resp.StatusCode, url)
 	}
 	// §修复 D2（2026-08-29）：东财反爬常返回 200 + HTML（geo-block/风控）而非 JSON。
 	// 旧逻辑仅 HTTP 失败才计熔断、到达 HTTP 层即清零 → 反爬风暴下熔断永不触发，
@@ -296,12 +378,9 @@ func (m *MarketAPI) getWithHeaders(url, referer string) (*http.Response, error) 
 		return nil, fmt.Errorf("eastmoney read: %v", rerr)
 	}
 	if len(raw) > 0 && raw[0] == '<' {
-		m.emRecord(scope, fmt.Errorf("eastmoney anti-crawler html"))
-		return nil, fmt.Errorf("eastmoney returned html (anti-crawler) (%s)", scope)
+		return nil, fmt.Errorf("eastmoney returned html (anti-crawler) (%s)", url)
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(raw))
-	// 到达 HTTP 层且确为 JSON 即视为东财连通，清零该接口熔断计数（业务层解析错误由调用方另判）。
-	m.emRecord(scope, nil)
 	return resp, nil
 }
 
@@ -700,7 +779,7 @@ func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
 		high, _ := strconv.ParseFloat(fields[33], 64)
 		low, _ := strconv.ParseFloat(fields[34], 64)
 		vol, _ := strconv.ParseFloat(fields[6], 64)
-		out[code] = &StockInfo{
+		si := &StockInfo{
 			Code:      code,
 			Name:      fields[1],
 			Price:     price,
@@ -712,6 +791,20 @@ func (m *MarketAPI) getTencentQuotes(codes []string) map[string]*StockInfo {
 			Volume:    vol * 100, // 手 → 股
 			ChangePct: chg,
 		}
+		// §修复 TX-TURNOVER(20260920)：腾讯字段 37=成交额(万元)、38=换手率(%)。
+		// 此前只取成交量，导致东财不可达降级到腾讯时换手率/成交额恒为 0——咨询数据块出现
+		// "换手率 0.00%"，而反幻觉审计(engine.auditNumbers)又会把模型口中的真实换手率
+		// 判为编造替换成 [数据缺失]（实测 2026-09-20 光智科技 11.70%）。
+		// 字段 38 需要 len(fields) > 38，故单独做长度判定，不抬高上面的基础长度门槛。
+		if len(fields) > 38 {
+			if amt, aerr := strconv.ParseFloat(fields[37], 64); aerr == nil {
+				si.Amount = amt * 1e4 // 万元 → 元
+			}
+			if to, terr := strconv.ParseFloat(fields[38], 64); terr == nil {
+				si.Turnover = to
+			}
+		}
+		out[code] = si
 	}
 	return out
 }
@@ -905,37 +998,92 @@ func (m *MarketAPI) GetSectorStocks(sectorCode string, topN int) ([]StockInfo, e
 	return parseSectorStocks(body)
 }
 
+// sectorStockRow 东财 clist 的单行原始字段（板块成分股口径）。
+// sectorStockRow is one raw row of the EastMoney clist response (sector-constituent flavor).
+type sectorStockRow struct {
+	F12 string  `json:"f12"` // 代码
+	F14 string  `json:"f14"` // 名称
+	F2  float64 `json:"f2"`  // 最新价
+	F3  float64 `json:"f3"`  // 涨跌幅
+	F4  float64 `json:"f4"`  // 涨跌额
+	F15 float64 `json:"f15"` // 最高
+	F16 float64 `json:"f16"` // 最低
+	F17 float64 `json:"f17"` // 开盘
+	F18 float64 `json:"f18"` // 昨收
+	F5  float64 `json:"f5"`  // 成交量
+	F6  float64 `json:"f6"`  // 成交额
+	F7  float64 `json:"f7"`  // 换手率
+}
+
+// decodeClistRows 解出 clist 响应中的行集合（diff 数组形态 / diff 映射形态 / items 别名）。
+// §修复 SECTOR-STOCKS(20260920)：东财 clist 的行集合字段是 data.diff，旧实现却去读
+// data.items（该字段在 clist 响应中并不存在），导致 GetSectorStocks **恒返回空表且不报错**——
+// 板块成分股/热点池静默为空。实测 2026-09-20：fs=b:BK0739 返回 {"data":{"total":35,"diff":[...]}}。
+// diff 有两种形态：带 np/po 参数时为数组，部分调用为 {"0":{…},"1":{…}} 映射；
+// 映射形态按 key 的数值序还原（保持 po 排序语义），非数值 key 的项原序追加不丢数据。
+// items 仅作兼容别名保留，不作为首选。
+// English: clist rows live under data.diff — the old code read data.items, a field clist never
+// returns, so GetSectorStocks silently yielded an empty list (sector constituents / hot pool empty).
+// diff arrives either as an array or as an index-keyed map; the map form is re-ordered by numeric
+// key to preserve the server's po ordering. items is kept only as a compatibility alias.
+func decodeClistRows(raw json.RawMessage) []sectorStockRow {
+	if len(raw) == 0 {
+		return nil
+	}
+	var arr []sectorStockRow
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return arr
+	}
+	var m map[string]sectorStockRow
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	rows := make([]sectorStockRow, 0, len(m))
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		if n, aerr := strconv.Atoi(k); aerr == nil {
+			keys = append(keys, n)
+		}
+	}
+	sort.Ints(keys)
+	for _, k := range keys {
+		rows = append(rows, m[strconv.Itoa(k)])
+	}
+	if len(keys) != len(m) {
+		// 非数值 key：按 map 原序补齐，宁可顺序不确定也不丢行。
+		for k, v := range m {
+			if _, aerr := strconv.Atoi(k); aerr != nil {
+				rows = append(rows, v)
+			}
+		}
+	}
+	return rows
+}
+
 // parseSectorStocks 解析东方财富板块成分股 JSON。
-// 从 data.items 中提取每只股票的代码、名称、价格、涨跌幅、成交量等。
+// 行集合取 data.diff（数组或索引映射两种形态，见 decodeClistRows），data.items 作兼容别名。
 // 价格字段 F2/F15/F16/F17/F18 单位为分，需 ÷100 转换为元。
 // 涨跌幅 F3 单位为基点（1 基点 = 0.01%），需 ÷100 转换为百分数。
-// parseSectorStocks parses the EastMoney sector-constituent JSON. Price fields
-// (F2/F15/F16/F17/F18) are in cents (/100 to Yuan); F3 is a basis-point value.
+// parseSectorStocks parses the EastMoney sector-constituent JSON. Rows come from data.diff
+// (array or index-keyed map — see decodeClistRows), with data.items accepted as an alias.
+// Price fields (F2/F15/F16/F17/F18) are in cents (/100 to Yuan); F3 is a basis-point value.
 func parseSectorStocks(body []byte) ([]StockInfo, error) {
 	var raw struct {
 		Data struct {
-			Items []struct {
-				F12 string  `json:"f12"` // 代码
-				F14 string  `json:"f14"` // 名称
-				F2  float64 `json:"f2"`  // 最新价
-				F3  float64 `json:"f3"`  // 涨跌幅
-				F4  float64 `json:"f4"`  // 涨跌额
-				F15 float64 `json:"f15"` // 最高
-				F16 float64 `json:"f16"` // 最低
-				F17 float64 `json:"f17"` // 开盘
-				F18 float64 `json:"f18"` // 昨收
-				F5  float64 `json:"f5"`  // 成交量
-				F6  float64 `json:"f6"`  // 成交额
-				F7  float64 `json:"f7"`  // 换手率
-			} `json:"items"`
+			Diff  json.RawMessage `json:"diff"`  // 首选行集合（数组或索引映射）
+			Items json.RawMessage `json:"items"` // 兼容别名（历史上游/夹具形态）
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("eastmoney sector stocks json: %v", err)
 	}
+	rows := decodeClistRows(raw.Data.Diff)
+	if len(rows) == 0 {
+		rows = decodeClistRows(raw.Data.Items)
+	}
 	// 逐行组装板块成分股列表（价格字段以「分」为单位需 ÷100，涨跌幅为 ×100 的千分数）。
-	stocks := make([]StockInfo, 0, len(raw.Data.Items))
-	for _, item := range raw.Data.Items {
+	stocks := make([]StockInfo, 0, len(rows))
+	for _, item := range rows {
 		if item.F12 == "" {
 			continue
 		}
@@ -1951,8 +2099,15 @@ func maxSectorChange(sectors []SectorInfo) float64 {
 
 // GetStockIndustry 获取个股所属行业（东财 push2）。
 // 返回行业名称（如"白酒""半导体"），查询失败返回空串。
+// §修复 EM-F127(20260920)：东财 stock/get 的 f127 才是【行业】（"光学光电子"/"电池"/"半导体"），
+// f128 是【地域板块】("浙江板块"/"福建板块")。旧实现取 f128 却按"行业名称"返回，
+// 属字段接错（实测 300489 f127=光学光电子 / f128=浙江板块，5 只样本无一例外）。
+// 现优先 f127；f127 缺失时回退 f128，以兼容只提供 f128 的数据源与测试夹具。
 // GetStockIndustry returns a stock's industry name via EastMoney push2
 // (e.g. "白酒"/"半导体"), or "" on failure.
+// Fix EM-F127(20260920): on stock/get, f127 is the industry ("光学光电子") while f128 is the
+// region board ("浙江板块"). The old implementation returned f128 as if it were the industry —
+// a wrong-field bug. Now f127 wins, with f128 kept only as a fallback for sources that omit f127.
 func (m *MarketAPI) GetStockIndustry(code string) string {
 	sid := secID(code)
 	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f57,f58,f127,f128", sid)
@@ -1968,11 +2123,16 @@ func (m *MarketAPI) GetStockIndustry(code string) string {
 	}
 	var raw struct {
 		Data struct {
-			F128 string `json:"f128"` // 行业名称
+			F127 string `json:"f127"` // 行业名称（如 "光学光电子"、"电池"）
+			F128 string `json:"f128"` // 所属地域板块（如 "浙江板块"、"福建板块"）
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return ""
+	}
+	// 优先行业(f127)；缺失才回退地域板块(f128)，避免"答不出行业"退化成"答成地域"。
+	if raw.Data.F127 != "" {
+		return raw.Data.F127
 	}
 	return raw.Data.F128
 }

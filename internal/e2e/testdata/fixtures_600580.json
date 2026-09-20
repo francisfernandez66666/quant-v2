@@ -836,6 +836,9 @@
  "industries": {
   "600580": "电机"
  },
+ "regions": {
+  "600580": "浙江板块"
+ },
  "sector_stocks": {},
  "ths_industries_html": "",
  "ths_concepts_html": "",

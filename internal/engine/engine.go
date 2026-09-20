@@ -2648,9 +2648,26 @@ func (e *Engine) buildConsultContext(userMsg string) string {
 
 	// 大盘实测块（2026-09-16 补）：上证点位+全市场涨跌家数——用户口语里的"普涨/普跌"
 	// 从此有实测依据，模型不必再说"我没有今天大盘的数据"。
+	// §修复 BREADTH-FAKE(20260920)：涨跌家数改走 GetBreadth（真实弃权语义）。GetIndexData 在
+	// 接口失败时会**伪造 1500/1500 中性值**（该函数注释已声明此设计，风险因子侧正是为此另立
+	// GetBreadth），而本块开头已声明"仅可引用下列提供的数据"——把伪造值当"大盘实测"喂给模型，
+	// 等于诱导它据假数据下"涨跌基本持平"的结论（实测 2026-09-20 东财不可达时即输出 1500/1500）。
+	// 取不到就整段不写（宁缺勿假），与全仓 GetBreadth 的口径一致。
+	// English: breadth now goes through GetBreadth (true abstention). GetIndexData deliberately
+	// fabricates a neutral 1500/1500 when its endpoint fails, and feeding that to the model as
+	// "measured market breadth" would make it reason from a fake number; when unavailable we emit
+	// no breadth clause at all instead.
 	if e.marketAPI != nil {
-		if idx, _, up, down, err := e.marketAPI.GetIndexData(); err == nil && idx > 0 {
-			sb.WriteString(fmt.Sprintf("\n—— 大盘实测 ——\n上证指数 %.2f 点；全市场 上涨 %d 家 / 下跌 %d 家（上涨家数显著占优=普涨）\n", idx, up, down))
+		if idx, _, _, _, err := e.marketAPI.GetIndexData(); err == nil && idx > 0 {
+			sb.WriteString(fmt.Sprintf("\n—— 大盘实测 ——\n上证指数 %.2f 点", idx))
+			if up, down, berr := e.marketAPI.GetBreadth(); berr == nil {
+				sb.WriteString(fmt.Sprintf("；全市场 上涨 %d 家 / 下跌 %d 家（上涨家数显著占优=普涨）\n", up, down))
+			} else {
+				// 措辞刻意避开"数据源未返回"——该短语是 §FIX-9e 净流入守卫（e2e
+				// TestConsultNetInflowTrueZero）在全段上下文中独占的断言词，复用会让
+				// "真 0 不得误报缺数"用例假红。这里只需表达"没有就别编"。
+				sb.WriteString("；全市场涨跌家数本次未取得（请勿编造具体家数）\n")
+			}
 		}
 	}
 	// §ENH-3(20260919 批B) RAG：历史同类事件注入——此前 news_events 跨日清空，顾问没有任何
@@ -2804,6 +2821,14 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		}
 	} else {
 		b.WriteString("实时行情获取失败。\n")
+	}
+
+	// 所属行业（东财 f127）§修复 SECTOR-CTX(20260920)：此前数据块完全不含行业/板块字段，
+	// 模型被问"这股票什么板块"时只能凭自身记忆作答——实测 2026-09-20 光智科技(300489)被答成
+	// "智能驾驶、光伏"（实际东财行业=光学光电子），且这类错误是本块内唯一不被 auditNumbers
+	// 拦下的编造形态（审计只查数字，不查板块名）。补实测依据后模型有据可依、无需猜测。
+	if ind := e.marketAPI.GetStockIndustry(code); ind != "" {
+		b.WriteString(fmt.Sprintf("所属行业: %s（东方财富行业分类；如需概念板块请说明该口径未提供）\n", ind))
 	}
 
 	// 资金流明细（超大/大/中/小单，均以万元计）
