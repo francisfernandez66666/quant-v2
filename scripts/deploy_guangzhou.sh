@@ -5,6 +5,9 @@
 #   * 首次部署默认「影子模式」：引擎启动但 qmt.enabled=false → NoopExecutor，只做评分/记账，
 #     不下真实单，与现有首尔决策链路零冲突（可并行一周验证，见 M3）。
 #   * 真正切流（gateway report_url 改 localhost + qmt.enabled=true + 关首尔）在 M4 手动执行。
+#   * §A7 前端指纹一致性（2026-09-20 补）：本脚本必须同步 web/dist → 云端 Caddy 站点根
+#     $DEPLOY_DIR/web。漏传会让浏览器端内嵌/访问的前端冻结在旧 buildCommit，持续误报
+#     「前端与服务器版本不一致」。见步 [2c]（含 npm 构建兜底 + tar 打包 + 清 ._* 垃圾）。
 #
 # 用法（本地 macOS，需 Windows OpenSSH 已开、且本机公钥已加入管理员 authorized_keys）：
 #   GZ_IP=81.71.69.17 LLM_API_KEY=sk-xxx ./scripts/deploy_guangzhou.sh
@@ -110,6 +113,27 @@ $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
      qmt_gateway/quote_feed.py \
      qmt_gateway/config.bridge.example.json \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
+
+# ── 2c. 同步前端 web/dist 到云端 Caddy 站点根（§A7 版本漂移根治）──
+# 根因：旧版脚本只同步二进制/gateway/pydata，从不传 web/dist → 云端 Caddy 前端
+#       冻结在旧 buildCommit，浏览器端触发「前端与服务器版本不一致」横幅（2026-09-20 实录）。
+#       现改为：本地 web/dist 缺失则先 npm run build 生成，再 tar 打包传云端解包到
+#       $DEPLOY_DIR/web（Caddy :8080 站点根）；并清除 macOS 打包产生的 ._* 垃圾。
+echo "[2c/5] 同步前端 web/dist 到 $DEPLOY_DIR/web ..."
+if [ ! -d web/dist ]; then
+  echo "  web/dist 不存在，先构建前端 (web npm run build)..."
+  ( cd web && { npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund >/dev/null 2>&1; } && npm run build )
+fi
+if [ -d web/dist ]; then
+  $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path ${DEPLOY_DIR}/web | Out-Null\""
+  tar -czf /tmp/webdist.tgz -C web/dist .
+  $SCP /tmp/webdist.tgz "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/webdist.tgz"
+  $SSH "powershell -NoProfile -Command \"tar -xzf ${DEPLOY_DIR}/webdist.tgz -C ${DEPLOY_DIR}/web; Remove-Item -Force ${DEPLOY_DIR}/webdist.tgz; Get-ChildItem -Path ${DEPLOY_DIR}/web -Recurse -Filter '._*' | Remove-Item -Force -ErrorAction SilentlyContinue\""
+  rm -f /tmp/webdist.tgz
+  echo "  OK 前端已同步到 ${DEPLOY_DIR}/web"
+else
+  echo "  X web/dist 构建失败，跳过前端同步（其余部署照常进行）"
+fi
 
 # ── 3. 数据目录 + 默认 config.json（影子模式：qmt.enabled=false）──
 # §UAT 20260915 部署加固：原内联 SSH 命令的 bash→PS 双层转义在每个部署日都报 ParserError

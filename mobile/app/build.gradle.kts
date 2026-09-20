@@ -16,10 +16,10 @@ android {
 
     defaultConfig {
         applicationId = "com.liangzai.quant"
-        minSdk = 24
-        targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        minSdk = 24          // Android 7.0：覆盖仍活跃的低版本机型；低于此的 WebView 不支持 SSE
+        targetSdk = 35        // 目标 Android 15：新装/更新走最新隐私与权限模型
+        versionCode = 1       // 整数递增版本号（每次上架 +1，Google Play 与覆盖安装据此判新旧）
+        versionName = "1.0.0" // 展示用语义版本号（首版 1.0.0）
 
         // 极光推送 JPush：包名 + AppKey（极光控制台创建应用后获得）+ 渠道号
         // （JPush placeholders: package name, AppKey from the JPush console, channel label.）
@@ -36,6 +36,13 @@ android {
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
+    }
+
+    // §A7 修复（2026-09-20）：MainActivity.kt 引用 com.liangzai.quant.BuildConfig（BuildConfig.DEBUG
+    // 用于 debug/release 下服务器地址校验策略分流），AGP 8.x 默认不再为应用模块生成 BuildConfig，
+    // 必须显式开启，否则 compileDebugKotlin 报 "Unresolved reference: BuildConfig"。
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {
