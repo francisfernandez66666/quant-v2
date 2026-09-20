@@ -254,6 +254,13 @@ type StateSnapshot struct {
 	LastLatencyMs  int64     `json:"last_latency_ms"`  // 最近一次探测延迟毫秒
 	LastReportAt   time.Time `json:"last_report_at"`   // 最近一次上行回报时间
 	LastReportKind string    `json:"last_report_kind"` // 最近一次上行回报类型
+	// PendingEnabled §FIX-2：待生效队列中的 enabled（§QMT-PENDING）。非 nil 表示存在一笔尚未在
+	// 交易时段被 ApplyPendingConfig 消费的开关变更——前端据此显示"已配置，将于下一交易时段生效"，
+	// 而不是把延迟生效误判为"开关没打开"。为 nil 表示当前无待生效变更（已收敛到 c.cfg.Enabled）。
+	// English: PendingEnabled — the enabled value sitting in the §QMT-PENDING queue; non-nil means a
+	// switch change is queued but not yet consumed at a trading session (so the UI can show
+	// "configured, takes effect next session" instead of misreading deferred apply as "switch off").
+	PendingEnabled *bool `json:"pending_enabled"`
 }
 
 // Snapshot 返回当前互通健康快照（纯读，不加锁副作用）。
@@ -261,6 +268,11 @@ type StateSnapshot struct {
 func (c *Controller) Snapshot() StateSnapshot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	var pendingEnabled *bool
+	if c.pendingCfg != nil {
+		v := c.pendingCfg.Enabled
+		pendingEnabled = &v
+	}
 	return StateSnapshot{
 		Enabled:        c.cfg.Enabled,
 		Mode:           c.cfg.Mode,
@@ -273,6 +285,7 @@ func (c *Controller) Snapshot() StateSnapshot {
 		LastLatencyMs:  c.lastLatencyMs,
 		LastReportAt:   c.lastReportAt,
 		LastReportKind: c.lastReportKind,
+		PendingEnabled: pendingEnabled,
 	}
 }
 

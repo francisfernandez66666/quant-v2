@@ -4,6 +4,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -166,4 +167,21 @@ func TestCandidateDedupQueries(t *testing.T) {
 		t.Fatalf("应取到 ≥2 条当日 proposed 因子候选, got %d", len(proposed))
 	}
 	_ = other
+}
+
+// TestCandidateByID_NotFoundReturnsErr §FIX-1 回归：不存在的 id 必须返回 ErrCandidateNotFound
+// （而非 (nil, nil)），否则调用方只判 err 会漏掉 nil 并解引用 panic。
+// English: regression guard — CandidateByID must return ErrCandidateNotFound on missing id.
+func TestCandidateByID_NotFoundReturnsErr(t *testing.T) {
+	db := testDB(t)
+	c, err := db.CandidateByID(9_999_999_999)
+	if err == nil {
+		t.Fatalf("不存在的候选应返回错误, got c=%+v err=nil", c)
+	}
+	if !errors.Is(err, ErrCandidateNotFound) {
+		t.Fatalf("错误应为 ErrCandidateNotFound, got %v", err)
+	}
+	if c != nil {
+		t.Fatalf("不存在的候选 c 应为 nil, got %+v", c)
+	}
 }

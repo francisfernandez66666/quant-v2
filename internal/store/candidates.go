@@ -3,6 +3,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -124,6 +125,12 @@ func (d *DB) ListCandidates(status string) ([]Candidate, error) {
 	return out, rows.Err()
 }
 
+// ErrCandidateNotFound 候选不存在（no rows）。统一哨兵错误：调用方只需判 err 即可，
+// 不必再额外判 c == nil —— 此前返回 (nil, nil) 的反模式导致多处调用点 nil 解引用 panic（FIX-1）。
+// English: ErrCandidateNotFound — sentinel returned when a candidate id does not exist; callers
+// check err only, removing the (nil, nil) anti-pattern that caused nil-deref panics at call sites.
+var ErrCandidateNotFound = errors.New("candidate not found")
+
 // CandidateByID 按 ID 取候选。
 // （CandidateByID fetches one candidate by ID.）
 func (d *DB) CandidateByID(id int64) (*Candidate, error) {
@@ -131,7 +138,7 @@ func (d *DB) CandidateByID(id int64) (*Candidate, error) {
 	c, err := scanCandidate(row)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
-			return nil, nil
+			return nil, ErrCandidateNotFound
 		}
 		return nil, err
 	}

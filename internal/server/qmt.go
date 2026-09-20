@@ -1023,9 +1023,15 @@ func (s *Server) applySetQMTConfig(w http.ResponseWriter, actor, target string, 
 	}
 	opslog.Audit(event, actor, target, "ok")
 	// 诊断日志：记录每次保存的真实账号、目标 enabled 与落盘后回读值，确认是否真正写盘。
-	// saved 是落库后回读值——与 cfg.Enabled 不一致说明写盘链路有问题（排查"开关变回关闭"）。
+	// saved 是落库后回读值（持久化配置，立即生效口径）；ctrlEnabled 是控制器当前 applied 值
+	// （§QMT-PENDING 延迟到下一交易时段才翻转）。两者在休市期间本就不同——区分它俩可避免把
+	// "延迟生效" 误判为 "开关变回关闭 / 写盘失败"（§FIX-2）。
 	saved := s.cfg.GetQMTConfigFor(target)
-	log.Printf("[diag-qmt] POST qmt config target=%s operator=%s reqEnabled=%v savedEnabled=%v", target, s.operatorID(), cfg.Enabled, saved.Enabled)
+	ctrlEnabled := false
+	if ctrl := s.qmtCtrlFor(target); ctrl != nil {
+		ctrlEnabled = ctrl.Enabled()
+	}
+	log.Printf("[diag-qmt] POST qmt config target=%s operator=%s reqEnabled=%v savedEnabled=%v ctrlEnabled=%v", target, s.operatorID(), cfg.Enabled, saved.Enabled, ctrlEnabled)
 	log.Printf("[trading] qmt 配置已更新: enabled=%v mode=%s price=%s max_pos=%d fixed=%.0f strategies=%v",
 		cfg.Enabled, cfg.Mode, cfg.PriceType, cfg.MaxPositions, cfg.FixedAmount, cfg.Strategies)
 	writeJSON(w, 200, map[string]string{"ok": "1"})

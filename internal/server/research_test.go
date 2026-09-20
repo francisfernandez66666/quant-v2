@@ -101,6 +101,27 @@ func TestResearchCandidateApproveFlow(t *testing.T) {
 	}
 }
 
+// TestResearchApproveMissingCandidate §FIX-1 回归：对不存在的候选审批/灰度必须返回 404，
+// 绝不能因 (nil, nil) 反模式解引用 panic 再被 recoverMiddleware 吞成 500。
+// English: regression guard — approve/grayscale on a missing candidate must 404, never panic→500.
+func TestResearchApproveMissingCandidate(t *testing.T) {
+	s, _, _ := newTestResearchServer(t)
+	for _, action := range []string{"approve", "grayscale"} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/research/candidates/"+itoa(9_999_999)+"/"+action, nil)
+		req.SetPathValue("id", itoa(9_999_999))
+		switch action {
+		case "approve":
+			s.handleResearchApprove(rr, req)
+		case "grayscale":
+			s.handleResearchGrayscale(rr, req)
+		}
+		if rr.Code != 404 {
+			t.Fatalf("action=%s 不存在候选应 404, got %d body=%s", action, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 // TestResearchCandidatesNoDB 未接入研究库时应返回 503。
 // English: TestResearchCandidatesNoDB should return 503 when no research DB is attached.
 func TestResearchCandidatesNoDB(t *testing.T) {

@@ -41,6 +41,8 @@ package server
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"expvar"
@@ -819,18 +821,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.chain(s.mux).ServeHTTP(w, r)
 }
 
+// genTraceID 生成 16 字节十六进制 trace-id（crypto/rand，不可预测），用于把一次请求
+// 的 panic/500 与排障日志关联。crypto/rand 失败（极罕见）时退化为时间戳串，不阻断。
+// English: genTraceID returns a 16-byte hex trace id for correlating a request's 500/panic with logs.
+func genTraceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("t-fallback-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // recoverMiddleware 恢复中间件：捕获请求处理链中的 panic，记录日志并返回 500，
 // 避免单个 handler 崩溃把整个 HTTP 服务进程打挂（配合 systemd Restart=always 双保险）。
-// 已开始写入的响应无法再改状态码，此时仅记录日志并中止该连接。
+// 已开始写入的响应无法再改状态码，此时仅记录日志并中止该连接。§FIX-4：panic 时生成 trace-id
+// 并回写响应头 X-Trace-Id 与 body，便于把 500 与排障日志关联。
 // （recoverMiddleware catches panics in the request chain, logs them and returns 500
 // so a single handler crash cannot take down the whole HTTP process.）
 func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				traceID := genTraceID()
 				stack := make([]byte, 1<<16)
 				n := runtime.Stack(stack, false)
-				log.Printf("[server] PANIC recovered: %v\n%s", rec, stack[:n])
+				// §FIX-4：结构化日志带 trace-id，便于把 500 与排障日志关联（此前只能看到裸 stack）。
+				log.Printf("[server] PANIC recovered trace_id=%s path=%s method=%s: %v\n%s",
+					traceID, r.URL.Path, r.Method, rec, stack[:n])
 				// 响应尚未写入时返回 500；已写入则放弃改写状态码
 				if rw, ok := w.(http.Hijacker); ok && rw != nil {
 					_ = rw
@@ -838,11 +855,17 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 				// 尽力尝试写入错误响应（若头已发送则 WriteHeader 无效，不报错）
 				defer func() {
 					if rec2 := recover(); rec2 != nil {
-						log.Printf("[server] panic-response write also panicked: %v", rec2)
+						log.Printf("[server] panic-response write also panicked trace_id=%s: %v", traceID, rec2)
 					}
 				}()
 				w.Header().Set("Content-Type", "application/json")
-				writeError(w, 500, "internal server error")
+				// 把 trace-id 同时写响应头与 body，前端 500 页可展示供用户/排障回传。
+				w.Header().Set("X-Trace-Id", traceID)
+				w.WriteHeader(500)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error":    "internal server error",
+					"trace_id": traceID,
+				})
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -1358,12 +1381,14 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		// §MT 租户级频控：同一租户成员业务 API 合计超过配额 → 429（滑动窗口 1 分钟）。
-		if tid := s.auth.TenantOf(user.ID); tid != "" {
-			if !s.tenantLimiter.allow(tid, s.auth.TenantAPIRate(tid), time.Minute) {
-				writeError(w, http.StatusTooManyRequests, "tenant api rate limit exceeded")
-				return
-			}
+	if tid := s.auth.TenantOf(user.ID); tid != "" {
+		if !s.tenantLimiter.allow(tid, s.auth.TenantAPIRate(tid), time.Minute) {
+			// §FIX-3：与匿名滑动窗限流一致，统一走 rejectRateLimit 带 Retry-After，
+			// 避免租户级 429 缺头导致前端无法判定重试窗口。
+			rejectRateLimit(w, time.Minute)
+			return
 		}
+	}
 		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, user)))
 	}
 }

@@ -97,6 +97,9 @@ web/playwright-report/
 web/playwright/.cache/
 web/.auth/
 
+# §FIX-5 UAT 自举的临时栈（独立数据目录 + 构建产物 + 日志，不入库）
+.uat-data/
+
 # 本地 QMT 网关 mock（UAT 用二进制，不入库）
 /qmt-mock
 # §AUDIT-PM 2026-09-15 仓库卫生：根目录大二进制产物（同 /quant /qmt-mock 口径），勿再裸提交

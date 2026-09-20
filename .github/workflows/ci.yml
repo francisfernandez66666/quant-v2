@@ -97,3 +97,22 @@ jobs:
       - name: Build（§R4-10 前端构建门禁：JSX 语法/路由懒加载分包/vendor 拆分回归）
         working-directory: web
         run: npm run build
+
+  # §FIX-5 UAT 自举脚本静态守卫：全栈 UAT 流程必须可从本地一键复跑。
+  # 背景：mock+engine+前端+seed 的启动流程此前只内联在 nightly-e2e.yml，本机无处可跑；
+  # 脚本退化成空脚本/被误删将导致 UAT 再次不可复跑——用静态守卫锁死。
+  uat-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: uat_bootstrap.sh 静态守卫
+        run: |
+          ub=scripts/uat_bootstrap.sh
+          test -f "$ub" || { echo "缺 $ub"; exit 1; }
+          test -x "$ub" || { echo "$ub 不可执行"; exit 1; }
+          bash -n "$ub" || { echo "$ub 语法错误"; exit 1; }
+          grep -q 'api/paper/buy' "$ub" || { echo "$ub 缺模拟盘持仓 seed"; exit 1; }
+          grep -q 'market_risk_daily' "$ub" || { echo "$ub 缺情绪日线 seed"; exit 1; }
+          grep -q 'api/tenants/t_default' "$ub" || { echo "$ub 缺租户配额上调"; exit 1; }
+          echo "ok - uat_bootstrap.sh 自举流程完整"
