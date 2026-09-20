@@ -202,7 +202,9 @@ if [ -d web/dist ]; then
     echo "    排查：web/vite.config.js 的 buildCommit() 是否拿不到 git（回退 'dev'）。"
     exit 1
   fi
-  echo "  OK 前端指纹校验通过（BUILD_COMMIT=$ds）"
+  # ${ds} 必须带花括号：紧跟其后的全角「）」会被 bash 并入变量名（实测报
+  # `ds）: unbound variable`，在 set -u 下直接中止部署）——本行曾因此漏过首次上传。
+  echo "  OK 前端指纹校验通过（BUILD_COMMIT=${ds}）"
   $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path ${DEPLOY_DIR}/web | Out-Null\""
   tar -czf /tmp/webdist.tgz -C web/dist .
   $SCP /tmp/webdist.tgz "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/webdist.tgz"

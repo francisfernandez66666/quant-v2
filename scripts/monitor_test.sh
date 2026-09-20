@@ -503,7 +503,7 @@ ensure_server() {
 		export QUANT_DATA_DIR="$DATA_DIR"
 		nohup "$quant_bin" > "$LOG_DIR/server_${TIMESTAMP}.log" 2>&1 &
 		local srv_pid=$!
-		log_summary "后端已启动: PID=$srv_pid，等待就绪..."
+		log_summary "后端已启动: PID=${srv_pid}，等待就绪..."
 		for i in $(seq 1 30); do
 			sleep 1
 			if curl -s --max-time 2 "${BASE_URL}/api/health" >/dev/null 2>&1; then

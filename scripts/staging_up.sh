@@ -58,7 +58,7 @@ if [ "$RECORD" = "1" ]; then
   EXTRA="QUANT_RECORD_STREAM=1"
 fi
 
-echo "[staging] 启动影子引擎（端口 $PORT, dataDir=$STAGING_DIR）"
+echo "[staging] 启动影子引擎（端口 $PORT, dataDir=${STAGING_DIR}）"
 # 后台运行，日志落 staging 数据目录
 # §AUDIT-PM 2026-09-15：quant 只读 QUANT_ADDR 环境变量决定监听地址——旧版传的 `-listen`
 # 参数根本不存在（cmd/quant 无 flag 定义），staging 实际绑 8080 再靠 pickListener 顺延碰巧
@@ -82,7 +82,7 @@ for i in $(seq 1 30); do
       exit 1
     fi
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 "http://127.0.0.1:$PORT/api/health")
-    echo "[staging] 就绪: /api/health → $code（401=认证层正常），端口 :$PORT 断言通过"
+    echo "[staging] 就绪: /api/health → ${code}（401=认证层正常），端口 :$PORT 断言通过"
     exit 0
   fi
   sleep 1

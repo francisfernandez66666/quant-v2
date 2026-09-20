@@ -76,7 +76,7 @@ echo "[3/5] 构建前端并拷入 assets/..."
 MK="$APP_DIR/web/dist/BUILD_COMMIT"
 APK_SHA="$( [ -f "$MK" ] && tr -d '\r\n' < "$MK" || echo "" )"
 HEAD_SHA="$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-echo "      APK 内嵌前端指纹 = ${APK_SHA:-缺失}（本地 HEAD = $HEAD_SHA）"
+echo "      APK 内嵌前端指纹 = ${APK_SHA:-缺失}（本地 HEAD = ${HEAD_SHA}）"
 case "$APK_SHA" in
   ""|dev|unknown)
     echo "      [!] 指纹为哨兵值/缺失：不参与版本比对（不会弹横幅），但也就失去了漂移自检。" ;;
@@ -129,7 +129,7 @@ if [ "$MODE" = "release" ]; then
     else
         KSPASS="$(openssl rand -base64 24 | tr -d '\n')"
         umask 177; printf '%s' "$KSPASS" > "$PASSFILE"; umask 022
-        echo "      已生成随机签名口令 → $PASSFILE（请离线另存一份；切勿提交仓库）"
+        echo "      已生成随机签名口令 → ${PASSFILE}（请离线另存一份；切勿提交仓库）"
     fi
     if [ ! -f "$KS" ]; then
         echo "      生成自签名 keystore: $KS"

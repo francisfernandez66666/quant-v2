@@ -26,7 +26,7 @@ echo "===== $(date '+%F %T') 本地全链路回测开始 区间 $START~$END ====
 
 # 0) 检查研究库
 if [ ! -f "$DB" ]; then
-    echo "研究库不存在: $DB（请先下载云端 trading.db）" | tee -a "$LOG"
+    echo "研究库不存在: ${DB}（请先下载云端 trading.db）" | tee -a "$LOG"
     exit 1
 fi
 echo "研究库: $DB" | tee -a "$LOG"

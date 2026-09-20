@@ -72,12 +72,12 @@ EOF
   exit 0
 fi
 
-[[ "$MODE" == "up" || "$MODE" == "run" ]] || die "未知模式：$MODE（可用 up|run|stop|env）"
+[[ "$MODE" == "up" || "$MODE" == "run" ]] || die "未知模式：${MODE}（可用 up|run|stop|env）"
 
 # ── 前置检查 ────────────────────────────────────────────────────────────────
 command -v go >/dev/null   || die "缺 go 工具链"
 command -v node >/dev/null || die "缺 node（vite 前端）"
-command -v "$PY" >/dev/null || die "缺 $PY（seed 脚本依赖）"
+command -v "$PY" >/dev/null || die "缺 ${PY}（seed 脚本依赖）"
 
 # ── 1) 干净数据目录 + 构建二进制 ───────────────────────────────────────────
 log "数据目录：$DATA_DIR"

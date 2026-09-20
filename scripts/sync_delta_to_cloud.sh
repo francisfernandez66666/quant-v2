@@ -155,9 +155,9 @@ fi
 # ── 5. 上传 + 云端导入 ──
 log "[5/6] 上传并云端导入..."
 remote_retry "scp 上传 delta" $SCP "$DELTA_FILE" "$SERVER_USER@$SERVER_IP:/tmp/" \
-    || { log "scp 失败（delta 已保留: $DELTA_FILE）"; exit 1; }
+    || { log "scp 失败（delta 已保留: ${DELTA_FILE}）"; exit 1; }
 remote_retry "云端 import-delta" $SSH "$CLOUD_BIN --db ${QUANT_DATA_DIR}/trading.db import-delta --file /tmp/$(basename "$DELTA_FILE")" \
-    || { log "云端 import 失败（delta 已保留: $DELTA_FILE）"; exit 1; }
+    || { log "云端 import 失败（delta 已保留: ${DELTA_FILE}）"; exit 1; }
 remote_retry "清理云端临时文件" $SSH "rm -f /tmp/$(basename "$DELTA_FILE")"
 
 # ── 6. 校验输出 ──
