@@ -70,6 +70,17 @@ const (
 	// 归入 ConfigInvalid：这条**是确凿证据**——一个能用的 OpenAI 兼容端点不可能对
 	// chat/completions 回一页 HTML。留着它不拦，等于把每次调用都送去解析 HTML。
 	ProbeNotEndpoint ProbeKind = "not_endpoint"
+	// ProbeBudget 这次探测**没来得及判定**：一次探测的总时长预算（ProbeMaxTotalBudget）
+	// 已经用尽，这把 key 还没轮到 / 或刚发出就被总预算掐断。
+	//
+	// 为什么单独开一类而不是并进 ProbeNetwork：network 的说法是"对端不可达"，那是**对端**的事；
+	// 这条是**我们自己**的预算不够（key 太多、上游太慢），把它说成"网络不可达"会让用户
+	// 跑去查网络、甚至以为 key 坏了。§2026-09-20 广州实测：同一把 key 一次报超时、一次
+	// 报可用（18:08 轮 key#2 超时、18:09 轮 key#2 18958ms 可用）——结论本身就是噪声，
+	// 措辞必须诚实。
+	//
+	// **不进 ConfigInvalid**：预算用尽完全不能说明配置有错，据此剔除同样会误删好 key。
+	ProbeBudget ProbeKind = "budget"
 )
 
 const (
@@ -88,6 +99,19 @@ const (
 	// ProbeMinTimeout 探测超时下限：账号超时配得过小时（如 5s）也不能把好配置误判成超时。
 	// 30s 之上的理由同 DefaultProbeTimeout —— 低于实测正常延迟的下限只会制造假阴性。
 	ProbeMinTimeout = 30 * time.Second
+	// ProbeMaxTotalBudget 一次探测（不论提交多少把 key）消耗的**总时长上界**。
+	//
+	// §2026-09-20 为什么需要有这个上界（这不是保守加码，是修一个真实故障）：
+	// 后端真正出网逐把探测时，单把最长 ProbeMaxTimeout=60s、并发 probeConcurrency=4 路，
+	// 于是 N 把 key 的最坏耗时 = ceil(N/4) × 单把超时 —— **随 key 数线性增长、无上界**。
+	// 而调用方（设置页"测试连接"/保存）是**同步等待**的 HTTP 请求：它必须先知道
+	// "最长等多久"才能把超时设成够大。没有上界 ⇒ 前端超时永远可能不够 ⇒
+	// 用户看到的是「探测失败: 请求超时」，而后端那次探测其实**成功了**
+	// （2026-09-20 生产实录：后端 probe=53975ms / 58214ms / 59421ms，前端 10s 就放弃）。
+	//
+	// 90s = 两波（8 把） × 45s，正好覆盖当前池规模；更大的池子里排在后面的 key 会报
+	// ProbeBudget（"未完成判定"，**保留在池里**），而不是把用户无限期挂在页面上。
+	ProbeMaxTotalBudget = 90 * time.Second
 
 	// probeMaxTokens 探测请求的 max_tokens。够短（成本≈0）但有意留余量：个别推理模型/
 	// 网关对"过小的 max_tokens"直接回 400，那会把好配置误判成坏配置。
@@ -140,6 +164,10 @@ func (p KeyProbe) Usable() bool { return p.Kind == ProbeOK || p.Kind == ProbeRat
 // §2026-09-20 增补 not_endpoint：上游回 2xx 但响应体是网页/非 LLM 结构，这是**地址配错**的
 // 直接证据（比 401/404 更硬），故与 auth/model/quota 同列。这是对原「只有三类可拒绝」口径的
 // 有意扩展，理由与依据见 docs/BUGFIX_LLM_CONSOLE_URL_20260920.md。
+//
+// **不要**把 ProbeBudget / ProbeNetwork / ProbeServer / ProbeBadRequest 加进来：它们的
+// 共同点是"错的一方不是配置"（是我们预算不够 / 对端抖动 / 我们构造的请求体不被某个网关认），
+// 拿它们当拒绝依据等于把供应商抖动中的用户堵死在坏状态里 —— 详见文件头不变量②。
 func (p KeyProbe) ConfigInvalid() bool {
 	switch p.Kind {
 	case ProbeAuth, ProbeModel, ProbeQuota, ProbeNotEndpoint:
@@ -181,6 +209,8 @@ func kindLabel(k ProbeKind) string {
 		return "供应商故障"
 	case ProbeNetwork:
 		return "网络不可达"
+	case ProbeBudget:
+		return "未完成判定"
 	case ProbeNotEndpoint:
 		return "地址不是 API 端点"
 	case ProbeNoKey:
@@ -206,10 +236,37 @@ func ProbeTimeoutFor(configuredSec int) time.Duration {
 	return d
 }
 
+// ProbeTotalBudget 一次探测的总时长上界：按 key 数与并发度估出"波数 × 单把超时"，
+// 再夹到 ProbeMaxTotalBudget。
+//
+// 存在的意义是**给调用方一个可依赖的等待上界**。设置页的"测试连接/保存"是同步 HTTP 请求，
+// 它的前端超时必须 ≥ 这个值：否则会出现"后端还在探测、浏览器已经放弃"，用户看到
+// 「探测失败: 请求超时」，而后端日志里那次探测其实是成功的（2026-09-20 生产实录）。
+// English: a hard upper bound on one probe run — the caller's request timeout must be ≥ this,
+// otherwise the browser gives up while the server is still probing.
+func ProbeTotalBudget(timeout time.Duration, keyCount int) time.Duration {
+	if timeout <= 0 {
+		timeout = DefaultProbeTimeout
+	}
+	if keyCount <= 0 {
+		return timeout
+	}
+	// 并发 probeConcurrency 路 ⇒ ceil(N/4) 波，每波最坏等一把 key 的超时。
+	waves := (keyCount + probeConcurrency - 1) / probeConcurrency
+	total := time.Duration(waves) * timeout
+	if total > ProbeMaxTotalBudget {
+		total = ProbeMaxTotalBudget
+	}
+	return total
+}
+
 // ProbeConfig 用候选配置对**每一把密钥**做一次真实最小调用，逐把给出可用性结论。
 //
-// 逐把并发（最多 probeConcurrency 路）：一把 key 的 30s 超时不会拖住其它把，总耗时≈最慢那把。
+// 逐把并发（最多 probeConcurrency 路）：一把 key 吃满自己的超时不会拖住其它把。
 // 返回值与入参密钥列表**同序同长**，位次即可用于回告"第几把坏了"。
+//
+// 整个探测过程受 ProbeTotalBudget 约束：到点仍未判定的 key 报 ProbeBudget（保留在池里），
+// 绝不会让调用方无限期等待——这是前端能把超时设成确定值的**前提**。
 //
 // 不做任何落库/切换：纯查询，供上层决定是否切换运行时客户端。
 // English: probes every candidate key with one real minimal call, concurrently, in input order.
@@ -230,13 +287,26 @@ func ProbeConfig(cfg Config, timeout time.Duration) []KeyProbe {
 	if timeout <= 0 {
 		timeout = DefaultProbeTimeout
 	}
-	hc := &http.Client{
+	// 总预算落成 ctx：整个探测（含排队等并发位）都在这个 deadline 内结束。
+	// 有意以 context.Background() 为父，而不是挂到触发它的 HTTP 请求 ctx 上 ——
+	// 浏览器/代理提前断开只应影响"响应能否送达"，不该把服务端的判定一起取消；
+	// 否则日志里连"这次探测其实是好的"都看不到，排查时会把责任错判给上游。
+	budget := ProbeTotalBudget(timeout, len(keys))
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	return probeKeys(ctx, &http.Client{
 		Timeout: timeout,
 		// 与正式客户端同口径：禁 HTTP2，规避连接复用类偶发问题（探测结论要与线上一致）。
 		Transport: &http.Transport{ForceAttemptHTTP2: false},
-	}
+	}, apiURL, model, keys, timeout, budget)
+}
 
-	// 逐把并发探测：一把 key 吃满 30s 超时不会拖住其它把，总耗时≈最慢那把。
+// probeKeys 在给定 ctx 下并发探测 keys；ctx 到点后仍未判定的 key 报 ProbeBudget。
+//
+// 单独成函数是为了**这条路径可测**：若它埋在 ProbeConfig 里，要触发总预算用尽就真的得等
+// 90s（或塞 9 把以上 key），单测没法在毫秒级覆盖。现在把"已经到点的 ctx"直接喂进来即可，
+// 见 probe_test.go::TestProbeKeysBudgetExhaustedIsNotNetwork。
+func probeKeys(ctx context.Context, hc *http.Client, apiURL, model string, keys []string, timeout, budget time.Duration) []KeyProbe {
 	// out 与 keys 同序同长，位次即"第几把"，上游据此回告用户去改哪一行。
 	out := make([]KeyProbe, len(keys))
 	var wg sync.WaitGroup
@@ -247,11 +317,35 @@ func ProbeConfig(cfg Config, timeout time.Duration) []KeyProbe {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out[i] = probeOne(hc, apiURL, model, k, i)
+			// 排到并发位时总预算可能已经用尽（前面的波次吃满了）：直接报"未轮到"，
+			// 不要发一个注定被立刻掐断的请求、再把它说成"网络不可达"。
+			if err := ctx.Err(); err != nil {
+				out[i] = budgetExhaustedProbe(i, timeout, budget, err)
+				return
+			}
+			out[i] = probeOne(ctx, hc, apiURL, model, k, i, timeout, budget)
 		}(i, k)
 	}
 	wg.Wait()
 	return out
+}
+
+// budgetExhaustedProbe 构造"时限内未完成判定"的结论。
+//
+// Detail 里必须写明**这不代表密钥不可用**：用户在设置页看到红字时最容易的误判就是
+// "我的 key 坏了"，而这条结论的全部证据只是"我们自己没等到"。
+func budgetExhaustedProbe(idx int, timeout, budget time.Duration, err error) KeyProbe {
+	if err == nil {
+		err = context.DeadlineExceeded
+	}
+	return KeyProbe{
+		Index: idx,
+		Kind:  ProbeBudget,
+		Detail: fmt.Sprintf(
+			"未能在时限内完成判定（单把上限 %s，本次总预算 %s）: %v；上游慢或密钥较多时会出现，"+
+				"**不代表密钥不可用**（该密钥仍留在轮询池里）",
+			timeout, budget, err),
+	}
 }
 
 // normalizeKeys 与 llm.New 完全同口径地整理密钥列表（单 key 兜底、去空白、去重）。
@@ -278,16 +372,26 @@ func normalizeKeys(cfg Config) []string {
 }
 
 // probeOne 探测单把密钥；命中「max_tokens 太小」类 400 时放宽上限重试一次。
-func probeOne(hc *http.Client, apiURL, model, key string, idx int) KeyProbe {
+func probeOne(ctx context.Context, hc *http.Client, apiURL, model, key string, idx int, timeout, budget time.Duration) KeyProbe {
 	p := KeyProbe{Index: idx, Kind: ProbeOK}
 	start := time.Now()
-	status, detail, kind := probeRound(hc, apiURL, model, key, probeMaxTokens)
+	status, detail, kind := probeRound(ctx, hc, apiURL, model, key, probeMaxTokens)
 	if kind == ProbeBadRequest && looksLikeTokenLimit(detail) {
 		// 上游可能是"max_tokens 太小"而非配置错：放宽再试一次。
 		// 仍不通过则保留首个结论（bad_request），由上层策略决定是否阻断。
-		if s2, d2, k2 := probeRound(hc, apiURL, model, key, probeRetryMaxTokens); k2 == ProbeOK {
+		if s2, d2, k2 := probeRound(ctx, hc, apiURL, model, key, probeRetryMaxTokens); k2 == ProbeOK {
 			status, detail, kind = s2, d2, k2
 		}
+	}
+	// 请求发出去了、却倒在**我们自己的总预算**上：这不是"对端不可达"，别把结论说错。
+	// 判据是父 ctx 已到点（单把超时由内层 ctx 造成，不会让父 ctx 到点）。
+	// 两者同时到点（4 把 key 时 单把 45s == 总预算 45s）时归到 ProbeBudget 也更诚实：
+	// 我们确实**没能判定**，而不是"测出网络不通"。
+	if kind == ProbeNetwork && ctx.Err() != nil {
+		bp := budgetExhaustedProbe(idx, timeout, budget, ctx.Err())
+		bp.Latency = time.Since(start)
+		bp.LatencyMS = bp.Latency.Milliseconds()
+		return bp
 	}
 	p.Status, p.Detail, p.Kind = status, detail, kind
 	p.Latency = time.Since(start)
@@ -297,7 +401,12 @@ func probeOne(hc *http.Client, apiURL, model, key string, idx int) KeyProbe {
 
 // probeRound 发一次非流式最小请求，返回 (状态码, 原因摘要, 结论分类)。
 // 2xx 时状态码为 200 占位（部分网关对成功响应不回 200 而回 201/204，统一归一）。
-func probeRound(hc *http.Client, apiURL, model, key string, maxTokens int) (int, string, ProbeKind) {
+//
+// ctx 是**整个探测过程**的总预算；单把超时在其下再夹一层，两者取更早的 deadline。
+// 用 context.Background() 起头是刻意的：探测不能挂到 HTTP 请求的 ctx 上——浏览器/代理
+// 提前断开（例如前端超时太短）只应影响"响应能不能送达"，不该把服务端的判定也一起取消，
+// 否则日志里会连"这次探测其实是好的"都看不到。
+func probeRound(ctx context.Context, hc *http.Client, apiURL, model, key string, maxTokens int) (int, string, ProbeKind) {
 	payload, err := json.Marshal(chatCompletionRequest{
 		ChatRequest: ChatRequest{
 			Model:    model,
@@ -309,9 +418,10 @@ func probeRound(hc *http.Client, apiURL, model, key string, maxTokens int) (int,
 	if err != nil {
 		return 0, "构造探测请求失败: " + err.Error(), ProbeBadRequest
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), hc.Timeout)
+	// 单把超时夹在总预算之下（context.WithTimeout 取更早的 deadline）。
+	rctx, cancel := context.WithTimeout(ctx, hc.Timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(rctx, "POST", apiURL, bytes.NewReader(payload))
 	if err != nil {
 		return 0, "请求地址不合法: " + err.Error(), ProbeNetwork
 	}

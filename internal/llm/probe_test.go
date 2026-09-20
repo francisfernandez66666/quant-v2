@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -371,5 +372,116 @@ func TestProbeSummaryKeepsInputOrder(t *testing.T) {
 	}
 	if got := fmt.Sprintf("%d", probes[2].Index); got != "2" {
 		t.Fatalf("第三把的 Index 应为 2, got %s", got)
+	}
+}
+
+// ── §2026-09-20 探测总预算：前端「探测失败: 请求超时」的真因 ───────────────────────
+//
+// 事故形态：后端在 /api/config/llm/probe 里真的出网逐把探测（单把 45s、并发 4 路），
+// 生产实测一次要 54~60s（日志 probe=53975ms/58214ms/59421ms），而前端走的是通用默认
+// 10s 超时 ⇒ 浏览器在 10s 就 abort，用户看到「探测失败: 请求超时」，后端那次探测其实成功。
+//
+// 修法两头收口：后端必须有**有限的总预算**（下面三条断言），前端才有确定值可对齐
+// （web/src/api/index.js::LLM_PROBE_TIMEOUT，前端侧由 llm_probe_timeout.test.jsx 锁）。
+
+// TestProbeTotalBudgetBounds 总预算必须"够用且有限"：
+//   - 够用：= 波数 × 单把超时（4 把一波 45s、8 把两波 90s），否则健康配置会在最后一波被预算掐断；
+//   - 有限：不得超过 ProbeMaxTotalBudget —— 这正是"前端能把超时设成确定值"的前提。
+func TestProbeTotalBudgetBounds(t *testing.T) {
+	cases := []struct {
+		name     string
+		timeout  time.Duration
+		keyCount int
+		want     time.Duration
+	}{
+		{"4 把 key = 一波", 45 * time.Second, 4, 45 * time.Second},
+		{"8 把 key = 两波", 45 * time.Second, 8, 90 * time.Second},
+		{"12 把 key 夹到上限", 45 * time.Second, 12, ProbeMaxTotalBudget},
+		{"未指定单把超时则取默认", 0, 4, DefaultProbeTimeout},
+		{"无 key 时退回单把预算", 45 * time.Second, 0, 45 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := ProbeTotalBudget(tc.timeout, tc.keyCount); got != tc.want {
+			t.Fatalf("%s: ProbeTotalBudget(%v,%d) got %v want %v",
+				tc.name, tc.timeout, tc.keyCount, got, tc.want)
+		}
+	}
+	// 跨层契约（后端这一侧）：总预算必须小于前端给这三个接口的请求超时。
+	// 前端常量是 120s；这里钉住"后端永远来得及回话"，避免以后有人把预算加到超过 120s。
+	if ProbeMaxTotalBudget >= 120*time.Second {
+		t.Fatalf("总预算(%v)已 ≥ 前端 LLM_PROBE_TIMEOUT(120s)：浏览器会先放弃，"+
+			"又回到「后端还在探测、页面报请求超时」的老故障", ProbeMaxTotalBudget)
+	}
+}
+
+// TestProbeKeysBudgetExhaustedIsNotNetwork 总预算用尽时的结论必须**不是** ProbeNetwork，
+// 且这些 key 必须留在轮询池里。
+//
+// 为什么值得单测：把"我们自己没等到"说成"网络不可达"，用户会跑去查网络、甚至以为 key 坏了；
+// 而处置侧只要把它当 ConfigInvalid，就会**永久删掉好 key**（2026-09-20 生产实录 8 把变 4 把）。
+// 这条断言同时锁住"说法"（Kind + Detail）与"处置"（ConfigInvalid / RuntimeKeys）。
+func TestProbeKeysBudgetExhaustedIsNotNetwork(t *testing.T) {
+	keys := []string{"sk-a", "sk-b", "sk-c"}
+	expired, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-expired.Done() // 确保真的到点
+
+	probes := probeKeys(expired, &http.Client{Timeout: 5 * time.Second},
+		"http://127.0.0.1:1/v1", "m", keys, 45*time.Second, 90*time.Second)
+	if len(probes) != len(keys) {
+		t.Fatalf("结论数应与 key 数一致, got %d", len(probes))
+	}
+	for i, p := range probes {
+		if p.Kind == ProbeNetwork {
+			t.Fatalf("key#%d 被误报为网络不可达：预算用尽不是对端的问题", i+1)
+		}
+		if p.Kind != ProbeBudget {
+			t.Fatalf("key#%d 应为 budget, got %s (%s)", i+1, p.Kind, p.Detail)
+		}
+		if p.ConfigInvalid() {
+			t.Fatalf("key#%d 的 budget 结论不得算「配置确凿有错」——据此会删掉好 key", i+1)
+		}
+		if !strings.Contains(p.Detail, "不代表密钥不可用") {
+			t.Fatalf("key#%d 的说明必须写明与密钥可用性无关, got %q", i+1, p.Detail)
+		}
+		if p.Index != i {
+			t.Fatalf("key#%d 的 Index 应为 %d, got %d（位次要能对上设置页行号）", i+1, i, p.Index)
+		}
+	}
+	if AllConfigInvalid(probes) {
+		t.Fatal("全 budget 不得被当成「配置确凿有错」——那会拒绝一次完全健康的保存")
+	}
+	if kept := RuntimeKeys(keys, probes); len(kept) != len(keys) {
+		t.Fatalf("预算用尽的 key 必须留在池里（不删好 key）, got %v", kept)
+	}
+}
+
+// TestProbeMidflightBudgetIsNotNetwork 请求已发出、中途被总预算掐断，同样归 budget 而非 network。
+//
+// 这是 4 把 key 的真实形态：单把超时(45s) 与总预算(45s) 同时到点。此时"我们没能判定"是
+// 唯一诚实的说法——上游慢到跑满预算，并不等于它不可达。
+func TestProbeMidflightBudgetIsNotNetwork(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1s 足够跑过 250ms 的总预算；httptest.Close() 会等在途请求收尾，
+		// 所以这个 sleep 直接决定本用例耗时（别调大）。
+		time.Sleep(1 * time.Second)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(okBody))
+	}))
+	defer slow.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	// 单把超时(10s) 远大于总预算(250ms) ⇒ 到点的一定是总预算。
+	probes := probeKeys(ctx, &http.Client{Timeout: 10 * time.Second},
+		slow.URL+"/v1", "m", []string{"sk-a"}, 10*time.Second, 250*time.Millisecond)
+	if len(probes) != 1 {
+		t.Fatalf("应回 1 条结论, got %d", len(probes))
+	}
+	if probes[0].Kind != ProbeBudget {
+		t.Fatalf("中途被总预算掐断应归 budget, got %s (%s)", probes[0].Kind, probes[0].Detail)
+	}
+	if probes[0].LatencyMS < 200 {
+		t.Fatalf("应确实等到了预算到点(%dms 偏小)", probes[0].LatencyMS)
 	}
 }

@@ -419,6 +419,29 @@ export function setStoredServer(url) {
 const REQUEST_TIMEOUT = 10000
 
 /**
+ * LLM 配置类接口（测试连接 / 保存 / 回滚）的请求超时。
+ * Request timeout for LLM-config endpoints (probe / save / rollback), in ms.
+ *
+ * 为什么必须单独给这三个接口一个长超时：后端在它们里面**真的出网逐把探测**候选密钥
+ * （internal/llm/probe.go：单把 DefaultProbeTimeout=45s、并发 4 路、总预算
+ * ProbeMaxTotalBudget=90s）。用通用默认 10s 的后果是"后端还在探测、浏览器已经放弃"，
+ * 用户看到「探测失败: 请求超时」，而后端日志里那次探测其实是成功的
+ * （2026-09-20 生产实录：后端 probe=53975ms/58214ms/59421ms，前端 10s 断）。
+ *
+ * 取值依据：必须 ≥ 后端总预算（90s），再留出等 llmApplyMu 互斥锁 + 网络往返的余量。
+ * 后端已有硬上界 ⇒ 这里**不会**在正常路径上先到点，超时只可能发生在真异常时。
+ *
+ * Why these three endpoints need their own longer timeout: the backend performs *real* network
+ * probes inside them (45s per key, 4 concurrent, 90s total budget). With the generic 10s default
+ * the browser gives up while the server is still probing — the user sees "请求超时" even though
+ * the probe succeeded server-side. Must be ≥ the backend budget (90s) plus lock/round-trip slack.
+ */
+const LLM_PROBE_TIMEOUT = 120000
+
+/** 导出供单测锁"前端超时 ≥ 后端探测预算"这条契约（改了后端预算就必须同步改这里）。 */
+export const LLM_PROBE_TIMEOUT_MS = LLM_PROBE_TIMEOUT
+
+/**
  * 统一的 HTTP 请求封装，自动附加认证头、处理 401 过期
  * Unified HTTP request wrapper that auto-attaches the auth header and handles 401 expiry
  * 原理：
@@ -1422,7 +1445,8 @@ export async function fetchLLMConfig() {
 // Maps to POST /api/config/llm; the backend probes the candidate first and only swaps/persists when
 // it works, returning 409 (with a human-readable reason) when the config is provably broken.
 export async function setLLMConfig(cfg) {
-  return request('/api/config/llm', { method: 'POST', data: cfg })
+  // timeout 必须显式给：后端会先探测候选配置（详见 LLM_PROBE_TIMEOUT 注释）。
+  return request('/api/config/llm', { method: 'POST', data: cfg, timeout: LLM_PROBE_TIMEOUT })
 }
 
 /** 测试 LLM 连接（只探测，不改任何状态） */
@@ -1432,7 +1456,9 @@ export async function setLLMConfig(cfg) {
 // 返回 { status, result: { verified, probes[], api_url, model, ... } }。
 // Maps to POST /api/config/llm/probe — probes the live config when cfg is omitted.
 export async function probeLLMConfig(cfg) {
-  return request('/api/config/llm/probe', { method: 'POST', data: cfg || {} })
+  // §2026-09-20：这里曾走通用默认 10s —— 后端要 45~90s，于是"测试连接"必然报「请求超时」。
+  // 详见 LLM_PROBE_TIMEOUT 的注释。
+  return request('/api/config/llm/probe', { method: 'POST', data: cfg || {}, timeout: LLM_PROBE_TIMEOUT })
 }
 
 /** 回滚到上一个已验证可用的 LLM 配置 */
@@ -1441,7 +1467,8 @@ export async function probeLLMConfig(cfg) {
 // 不必重启、不必回忆上次填了什么。返回 { status, result }。
 // Maps to POST /api/config/llm/rollback — the escape hatch after a bad hot update.
 export async function rollbackLLMConfig() {
-  return request('/api/config/llm/rollback', { method: 'POST', data: {} })
+  // 回滚同样会重跑一次探测（handleRollbackLLMConfig → applyLLMSnapshot），所以也要长超时。
+  return request('/api/config/llm/rollback', { method: 'POST', data: {}, timeout: LLM_PROBE_TIMEOUT })
 }
 
 // ── 战法参数配置 ──

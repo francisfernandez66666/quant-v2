@@ -294,6 +294,9 @@ func (s *Server) applyLLMSnapshot(uid string, cand llmSnapshot, force, persist, 
 	}
 
 	timeout := llm.ProbeTimeoutFor(cand.TimeoutSec)
+	// 总预算：单把 timeout × 波数，夹到 ProbeMaxTotalBudget。透出到日志是为了让"这次到底
+	// 是单把超时还是总预算到点"能一眼看出来 —— 只报 probe=NNNNms 时两者长得一样。
+	budget := llm.ProbeTotalBudget(timeout, len(cand.Keys))
 	started := time.Now()
 	probes := llmProber(llm.Config{
 		APIKeys: cand.Keys,
@@ -376,10 +379,10 @@ func (s *Server) applyLLMSnapshot(uid string, cand llmSnapshot, force, persist, 
 		}
 	}
 
-	log.Printf("[llm] 热更新%s: uid=%s keys=%d/%d (探测通过 %d) verified=%v url=%s model=%s probe=%dms %s",
+	log.Printf("[llm] 热更新%s: uid=%s keys=%d/%d (探测通过 %d) verified=%v url=%s model=%s probe=%dms timeout=%s budget=%s %s",
 		map[bool]string{true: "已生效", false: "仅探测"}[hotSwap],
 		uid, len(cand.Keys), submitted, len(usable), verified, cand.APIURL, cand.Model, res.ProbeMS,
-		llm.ProbeSummary(probes))
+		timeout, budget, llm.ProbeSummary(probes))
 	return res, http.StatusOK
 }
 

@@ -344,6 +344,9 @@ export default function Settings() {
       server: '供应商故障（未能验证）', network: '网络不可达（未能验证）', no_key: '未提供密钥',
       // §P0 2026-09-20：地址不是 API 端点（典型：填了供应商网页控制台域名，被 307 跳到登录页）。
       not_endpoint: '地址不是 API 端点（上游返回网页）',
+      // §2026-09-20：后端探测总预算（默认 90s）用尽，这把没来得及判定——
+      // **不是**"密钥坏了"，所以文案必须与 network（网络不可达）区分开。
+      budget: '未完成判定（探测超时预算用尽，不代表密钥不可用）',
     }
     return map[kind] || kind || '未知'
   }
@@ -578,9 +581,18 @@ export default function Settings() {
         {/* 三个动作：保存（探测→切换→落库）/ 测试连接（只探测）/ 回滚（回到上个已验证可用配置） */}
         <div style={{ ...rowStyle, flexWrap: 'wrap', gap: 8 }}>
           <Button theme="primary" onClick={saveLLM} loading={llmSaving}>保存</Button>
-          <Button variant="outline" onClick={probeLLM} loading={llmProbing}>测试连接</Button>
+          <Button variant="outline" onClick={probeLLM} loading={llmProbing}>
+            {llmProbing ? '探测中…' : '测试连接'}
+          </Button>
           <Button variant="outline" onClick={rollbackLLM} loading={llmRolling}>回滚到上一个可用配置</Button>
           {llmDirty && <span style={{ marginLeft: 8, color: 'var(--app-warn-text)', fontSize: 12 }}>● 有未保存修改</span>}
+          {/* 探测是**真出网**逐把打供应商（单把最长 45s，密钥多时要分波），必然要点时间。
+              不提示出来，用户会以为卡死而反复点；后端总预算是硬上界（见 api 里 LLM_PROBE_TIMEOUT）。 */}
+          {llmProbing && (
+            <div style={{ width: '100%', color: 'var(--app-text-2)', fontSize: 12, marginTop: 4 }}>
+              正在逐把探测：每把一次真实最小调用，最多约 1 分钟（不动不是死机，请勿重复点击）
+            </div>
+          )}
         </div>
         {
           /* 强制应用开关：只在探测明确判定配置不可用、但用户确信是环境问题时才打开。
