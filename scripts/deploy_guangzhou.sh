@@ -68,6 +68,31 @@ if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-n
   exit 1
 fi
 
+# §A7-C（2026-09-20 实录补）：停服必须有兜底拉起，否则「停」是不可逆的。
+#
+# [2/5] 为释放 exe 文件锁会 `net stop quant; net stop quant-research`，此后**只有 [4/5]
+# register 会拉起它们**。这条链有两个口子会把线上引擎永久留在停机态：
+#   ① `-s`（仅同步）模式下 [4/5] 被跳过 —— 而 `-s` 恰恰是 RUNBOOK §4.1b 推荐的发布命令；
+#   ② 任何早于 [4/5] 的失败（scp 失败、[2c] 指纹校验中止、构建失败…）在 `set -e` 下直接退出。
+# 2026-09-20 实录踩中 ②：前端重建被本机 node 删除守卫拦下 → 脚本在 [2c] 退出，
+# 线上引擎停在停机态约 3 分钟，靠人工 `nssm start` 才救回（当时无任何提示说明服务已停）。
+# 现加 EXIT 兜底：只要本次停过服务且尚未被拉起，无论脚本以何种方式退出都补一次 start。
+NSSM='C:/opt/quant/qmt-win/tools/nssm-2.24/win64/nssm.exe'
+SERVICES_STOPPED=0
+start_engine_services() {
+  echo "[cleanup] 拉起部署期间停掉的服务（quant / quant-research）..."
+  $SSH "powershell -NoProfile -Command \"& '${NSSM}' start quant ; & '${NSSM}' start quant-research\"" 2>/dev/null || true
+}
+restore_services_on_exit() {
+  rc=$?
+  # 用 if 而非 `[ … ] && fn`：后者在条件不成立时返回 1，会让 set -e 在 exit 之前打断本函数。
+  if [ "$SERVICES_STOPPED" = "1" ]; then
+    start_engine_services
+  fi
+  exit $rc
+}
+trap restore_services_on_exit EXIT
+
 # ps1_bom <file>：上传前把 Windows PowerShell 脚本归一为「UTF-8 单 BOM + CRLF」。
 # 为何需要：PS 5.1 读无 BOM 的 UTF-8 按 GBK 解析中文注释会撕裂字面量直接 ParserError（现网实录）；
 # 但历史上 restart_gateway.ps1 等已自带 BOM，若再无条件 cat 拼一个就成双 BOM——PS 报
@@ -110,6 +135,7 @@ echo "[2/5] 上传二进制/脚本到 $DEPLOY_DIR ..."
 # "dest open Failure"（register 脚本是 stop→install→start，救不了上传阶段的锁）。
 # 先显式停服释放文件锁——服务重启本就属于本次部署语义（步 [4/5] 注册即拉起）。
 $SSH "powershell -NoProfile -Command \"net stop quant; net stop quant-research; exit 0\"" >/dev/null 2>&1 || true
+SERVICES_STOPPED=1   # 置位后由 [4/5]/[4/5]-s 拉起，任何提前退出都由 EXIT 兜底补 start
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata | Out-Null\""
 $SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/qmtctl.exe "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
 $SCP deploy/qmt-win/register_engine_services.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
@@ -160,7 +186,12 @@ else
   fi
 fi
 if [ "$NEED_BUILD" = "1" ]; then
-  ( cd web && { npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund >/dev/null 2>&1; } && npm run build )
+  # 构建失败**不能**直接让脚本在 set -e 下退出：那会跳过下面的指纹校验（真正的判据），
+  # 也跳过后面的收尾（2026-09-20 实录：构建失败 → 脚本静默退出 → 服务停在停机态）。
+  # 这里吞掉退出码，把结论交给指纹校验统一裁决：等 → 上传；不等 → 明确中止并给排查指引。
+  if ! ( cd web && { npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund >/dev/null 2>&1; } && npm run build ); then
+    echo "  [!] 前端构建失败（退出码非 0，详情见上方 vite 输出）——交由下一步指纹校验裁决。"
+  fi
 fi
 
 if [ -d web/dist ]; then
@@ -230,7 +261,11 @@ fi
 
 # ── 4. 注册 Windows 服务（NSSM）+ qmtctl 任务计划 ──
 if [ $SYNC_ONLY -eq 1 ]; then
-  echo "[4/5] 跳过服务注册（-s）"
+  # §A7-C：`-s` 跳过 [4/5] 注册，但那一步原本是**唯一**拉起服务的地方 ——
+  # 若不在此显式拉起，`-s`（RUNBOOK §4.1b 推荐命令）每次都会把引擎留在停机态。
+  echo "[4/5] 跳过服务注册（-s）；拉起 [2/5] 为释放文件锁而停掉的服务..."
+  start_engine_services
+  SERVICES_STOPPED=0   # 已拉起，EXIT 兜底无需重复；启动失败由 [5/5] 健康检查暴露
 else
   echo "[4/5] 远程注册服务（管理员 PowerShell）..."
   # §UAT-20260917 转义修复：MiniQmtPath 含 "(x86) " 空格，裸传被远端 PowerShell 拆词
@@ -242,6 +277,7 @@ else
   fi
   ps1_bom deploy/qmt-win/register_engine_services.ps1
   $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/register_engine_services.ps1 $REMOTE_ARGS"
+  SERVICES_STOPPED=0   # register 内已 nssm restart/start，EXIT 兜底无需重复
 fi
 
 # ── 5. 健康检查（§UAT 20260915 升级：引擎/Caddy 前端/网关三探针）──
