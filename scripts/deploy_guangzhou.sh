@@ -55,6 +55,19 @@ cd "$APP_DIR"
 SSH="ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $HOME/.ssh/id_rsa ${GZ_USER}@${GZ_IP}"
 SCP="scp -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $HOME/.ssh/id_rsa"
 
+# §DEPLOY-PREFLIGHT（2026-09-20）：本脚本若被放进「网络可通但私钥不可读」的执行上下文
+# （沙箱/受限会话），ssh 会静默回退密码认证并把提示写向 tty —— 脚本自身的 stdout 重定向
+# 吞不掉它，表现为**无任何输出的挂死**（实测白等 30 分钟、服务一条都没停，远端零副作用）。
+# 因此开跑前先做一次 BatchMode 探活：认证不可用就立刻失败，绝不进入可能挂起的路径。
+# 手工 ssh 会被放行、脚本内 ssh 不会，是本机环境的既有差异（见 RUNBOOK §4.1b.1 ⑦）。
+if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+         -o IdentitiesOnly=yes -i "$HOME/.ssh/id_rsa" "${GZ_USER}@${GZ_IP}" 'echo ok' >/dev/null 2>&1; then
+  echo "X 非交互 SSH 认证失败，已中止（避免静默挂死在密码提示上）。" >&2
+  echo "  排查：① $HOME/.ssh/id_rsa 是否可读（权限/沙箱）② 公钥是否在远端 authorized_keys" >&2
+  echo "  提示：若在受限执行上下文里跑本脚本，网络可能通但私钥不可读 → ssh 回退密码认证。" >&2
+  exit 1
+fi
+
 # ps1_bom <file>：上传前把 Windows PowerShell 脚本归一为「UTF-8 单 BOM + CRLF」。
 # 为何需要：PS 5.1 读无 BOM 的 UTF-8 按 GBK 解析中文注释会撕裂字面量直接 ParserError（现网实录）；
 # 但历史上 restart_gateway.ps1 等已自带 BOM，若再无条件 cat 拼一个就成双 BOM——PS 报
