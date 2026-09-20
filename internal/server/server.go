@@ -2318,6 +2318,15 @@ func consultErrorResponse(err error) (int, string, string) {
 	if errors.Is(err, llm.ErrNoAPIKey) || strings.Contains(err.Error(), "未配置 LLM_API_KEY") {
 		return 503, "llm_not_configured", "AI 顾问暂不可用：LLM 未配置 API Key，请管理员在咨询页完成配置"
 	}
+	// §P0 2026-09-20：上游返回的是网页（HTML）而不是模型接口 —— 这是**配置问题**，不是上游故障，
+	// 文案必须把用户直接引到"地址填错了"上（旧行为：混进 500 并把 160 字 HTML 摘录当线索，
+	// 用户完全看不出是地址问题）。详见 docs/BUGFIX_LLM_CONSOLE_URL_20260920.md。
+	if errors.Is(err, llm.ErrUpstreamNotAPI) {
+		return 502, "llm_upstream_not_api",
+			"AI 顾问暂不可用：LLM 返回的是网页而不是模型接口响应 —— 地址很可能填成了供应商的" +
+				"网页控制台/登录页地址。请在设置页把 LLM 地址改为 API 端点" +
+				"（形如 https://api.<供应商域名>/v1/chat/completions）后重存"
+	}
 	// §FIX-3 超时速记：空闲超时/总时长超限都是"模型卡死/回包过慢"，504 语义可重试。
 	msg := err.Error()
 	if strings.Contains(msg, "空闲超时") || strings.Contains(msg, "总时长超限") {

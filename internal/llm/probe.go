@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,16 @@ import (
 //     /v1/models 只能验第一件。
 //  2. 不少自建网关 / 聚合网关根本不实现 /v1/models。
 //  3. 成本约等于 0（max_tokens 32，实测 SiliconFlow 上 0.1s 级）。
+//
+// §P0 2026-09-20（广州线上实录「股票咨询报错 no response from LLM，响应摘录=<!DOCTYPE html>」）：
+// 上面第 1 条**曾经是假的**——旧实现拿到 2xx 就返回 ProbeOK，**从不看响应体**，于是
+// 「api_url 填成供应商网页控制台域名（cloud.<vendor>.cn）」这种地址：控制台对任意路径都
+// 307 跳到 account.<vendor>.cn/login，客户端跟随重定向拿到登录页 HTML + HTTP 200 →
+// 探测报告"8/8 可用 verified=true" → 热更新照常生效 → 运行时每次咨询都拿到一页 HTML，
+// 数据分片为 0。**本该拦住坏配置的那道闸，恰好成了放行它的那道门。**
+// 现在 2xx 也必须通过响应体校验（ProbeNotEndpoint），"地址形态/模型名"才算真的验过。
+// English: a 2xx is no longer sufficient — the body must actually be a chat-completion
+// response, otherwise a provider *console* URL (307 → login page HTML + 200) sails through.
 type ProbeKind string
 
 const (
@@ -53,16 +64,30 @@ const (
 	ProbeNetwork ProbeKind = "network"
 	// ProbeNoKey 根本没有可探测的密钥。
 	ProbeNoKey ProbeKind = "no_key"
+	// ProbeNotEndpoint 2xx，但响应体不是 LLM 接口响应（HTML 网页 / 非 JSON / 无 choices）：
+	// 地址本身就不是 API 端点（典型：填了供应商网页控制台域名，被 307 重定向到登录页）。
+	//
+	// 归入 ConfigInvalid：这条**是确凿证据**——一个能用的 OpenAI 兼容端点不可能对
+	// chat/completions 回一页 HTML。留着它不拦，等于把每次调用都送去解析 HTML。
+	ProbeNotEndpoint ProbeKind = "not_endpoint"
 )
 
 const (
 	// DefaultProbeTimeout 单把密钥的探测超时。推理模型即使只要几十个 token 也要先走思维链，
-	// 给足 30s；探测只影响保存动作的响应时间，不阻塞交易主链路。
-	DefaultProbeTimeout = 30 * time.Second
+	// 给足 45s；探测只影响保存动作的响应时间，不阻塞交易主链路。
+	//
+	// §2026-09-20 由 30s 上调到 45s（**实测依据，不是保守加码**）：广州机上对同一地址/同一密钥
+	// 用 curl 实测（gz_llm_probe5.ps1），串行 3 次 = 9.5s / 17.7s / 21.8s，4 路并发 =
+	// 24.7s / 12.1s / 22.9s / 30.0s（全部 HTTP 200）。即**正常**调用就能跑到 30s ——
+	// 旧值恰好压在延迟分布最右端，于是 8 把 key 一轮探测里有 3~5 把被误报"网络不可达"，
+	// 而下一版旧代码会据此把它们从池里与库里删掉（2026-09-20 生产实录：8 把变 4 把）。
+	// 45s 相对实测 p100（30.0s）留 1.5 倍余量。
+	DefaultProbeTimeout = 45 * time.Second
 	// ProbeMaxTimeout 探测超时上限：账号配置了 240s 这类长超时时不能让保存动作跟着等 4 分钟。
 	ProbeMaxTimeout = 60 * time.Second
 	// ProbeMinTimeout 探测超时下限：账号超时配得过小时（如 5s）也不能把好配置误判成超时。
-	ProbeMinTimeout = 15 * time.Second
+	// 30s 之上的理由同 DefaultProbeTimeout —— 低于实测正常延迟的下限只会制造假阴性。
+	ProbeMinTimeout = 30 * time.Second
 
 	// probeMaxTokens 探测请求的 max_tokens。够短（成本≈0）但有意留余量：个别推理模型/
 	// 网关对"过小的 max_tokens"直接回 400，那会把好配置误判成坏配置。
@@ -70,9 +95,19 @@ const (
 	// probeRetryMaxTokens 命中「max_tokens 太小」类 400 时的二次探测上限。
 	probeRetryMaxTokens = 256
 	// probeConcurrency 逐把密钥并发探测的最大并行度。
+	//
+	// §2026-09-20 实测判定**不要**上调（有人会想"8 把 key 一趟并发完更省时间"）：
+	// 广州机上同一地址/同一密钥实测（gz_llm_probe5/6.ps1）——
+	//   4 路并发：4/4 全部 HTTP 200，耗时 12.1s / 22.9s / 24.7s / 30.0s；
+	//   8 路并发：6/8 成功（4.9s~56.7s），**2 路 60s 内 0 字节超时**。
+	// 也就是上游会拖挂高并发下的部分连接 —— 加到 8 只会把"假超时"从 1/4 变成 2/8，
+	// 反而更像"探测不可靠"。默认 4 是当前上游条件下的安全点。
 	probeConcurrency = 4
 	// probeBodyLimit 供应商响应体截断上限（只用于错误摘要，避免把整页 HTML 灌进日志/响应）。
 	probeBodyLimit = 2048
+	// probeShapeBodyLimit 「响应体是不是 LLM 响应」这条判定的读取上限：探测响应只有
+	// max_tokens=32，64KB 足以读全任何正常回包，同时又不至于被一页巨型 HTML 拖住。
+	probeShapeBodyLimit = 64 << 10
 )
 
 // KeyProbe 单把密钥的探测结论。
@@ -101,9 +136,13 @@ func (p KeyProbe) Usable() bool { return p.Kind == ProbeOK || p.Kind == ProbeRat
 //
 // 只有这一类才允许作为拒绝热更新的依据：拒绝必须有确凿证据。网络不可达、供应商 5xx、
 // 我们自己的请求体被拒（400）都不算证据 —— 详见文件头的设计说明。
+//
+// §2026-09-20 增补 not_endpoint：上游回 2xx 但响应体是网页/非 LLM 结构，这是**地址配错**的
+// 直接证据（比 401/404 更硬），故与 auth/model/quota 同列。这是对原「只有三类可拒绝」口径的
+// 有意扩展，理由与依据见 docs/BUGFIX_LLM_CONSOLE_URL_20260920.md。
 func (p KeyProbe) ConfigInvalid() bool {
 	switch p.Kind {
-	case ProbeAuth, ProbeModel, ProbeQuota:
+	case ProbeAuth, ProbeModel, ProbeQuota, ProbeNotEndpoint:
 		return true
 	}
 	return false
@@ -142,6 +181,8 @@ func kindLabel(k ProbeKind) string {
 		return "供应商故障"
 	case ProbeNetwork:
 		return "网络不可达"
+	case ProbeNotEndpoint:
+		return "地址不是 API 端点"
 	case ProbeNoKey:
 		return "未提供密钥"
 	}
@@ -282,14 +323,180 @@ func probeRound(hc *http.Client, apiURL, model, key string, maxTokens int) (int,
 		return 0, networkDetail(err), ProbeNetwork
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, probeBodyLimit))
+	// 判定用读上限（64KB）：探测响应只有 32 token，够读全；既保证"响应体是不是 LLM 响应"
+	// 的判断建立在完整报文上，也不至于被一页巨大的 HTML 拖住。
+	body, truncated := readLimited(resp.Body, probeShapeBodyLimit)
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// §P0 2026-09-20：2xx 不再等于"可用"——必须确认响应体真的是 chat completion。
+		// 见文件头「§P0 2026-09-20」段：网页控制台地址会 307 → 登录页 HTML + 200。
+		if ok, isJSON, why := llmBodyShape(body, truncated); !ok {
+			if !isJSON {
+				// HTML / 空体 / 非 JSON：地址根本不是 API 端点（确凿证据）。
+				return resp.StatusCode, notEndpointDetail(apiURL, resp, body, why), ProbeNotEndpoint
+			}
+			// 是 JSON 但没有 choices（多半是 {"error":{...}} 而状态码却是 2xx）：
+			// 沿用 4xx 那套分类，能识别出"模型名错/欠费"就照实说，别一律归成地址错。
+			msg := compactProviderMessage(body)
+			return resp.StatusCode, msg, classifyProbeStatus(http.StatusBadRequest, msg)
+		}
 		return 200, "", ProbeOK
 	}
 	msg := compactProviderMessage(body)
 	kind := classifyProbeStatus(resp.StatusCode, msg)
 	return resp.StatusCode, msg, kind
+}
+
+// readLimited 读至多 limit 字节，返回 (内容, 是否被截断)。
+func readLimited(r io.Reader, limit int64) ([]byte, bool) {
+	b, _ := io.ReadAll(io.LimitReader(r, limit))
+	return b, int64(len(b)) == limit
+}
+
+// llmBodyShape 判定一次 2xx 响应体是否真的是「LLM 接口响应」。
+// 返回 (是否可用, 是否是结构化 JSON, 不通过的原因)。
+//
+// 通过的三条形态（覆盖 OpenAI 兼容网关的实际回法）：
+//  1. JSON 对象且 choices 非空、无顶层 error —— 标准 chat completion；
+//  2. SSE 事件流里带 choices —— 少数网关忽略 stream:false，收到 SSE 也算通；
+//  3. 其他一律不通过。
+//
+// 这里有意**不做**严格 schema 校验：目的只是区分"这是一份模型响应"与"这是一页 HTML"，
+// 验得太细会把自建网关的合法变体误杀（与"拒绝必须有确凿证据"同源）。
+//
+// truncated=true（响应体超过判定上限）：JSON 解析失败时不否定——截断是**我们**造成的，
+// 不能拿它当"地址不对"的证据。HTML 判定不受截断影响（只看开头），仍然生效。
+func llmBodyShape(body []byte, truncated bool) (ok bool, isJSON bool, why string) {
+	t := bytes.TrimSpace(bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})) // 去 BOM
+	if len(t) == 0 {
+		return false, false, "响应体为空"
+	}
+	if looksLikeHTMLPage(t) {
+		return false, false, "响应体是 HTML 网页（不是 API 响应）"
+	}
+	if t[0] == '{' || t[0] == '[' {
+		var probe struct {
+			Choices []json.RawMessage `json:"choices"`
+			Error   json.RawMessage   `json:"error"`
+		}
+		if err := json.Unmarshal(t, &probe); err != nil {
+			if truncated {
+				return true, true, ""
+			}
+			return false, false, "响应体不是合法 JSON: " + err.Error()
+		}
+		switch {
+		case len(probe.Error) > 0:
+			return false, true, "响应体带 error 字段（状态码却是 2xx）"
+		case len(probe.Choices) == 0:
+			return false, true, "JSON 里没有 choices 字段"
+		}
+		return true, true, ""
+	}
+	if bytes.HasPrefix(t, []byte("data:")) {
+		if bytes.Contains(t, []byte(`"choices"`)) {
+			return true, false, ""
+		}
+		return false, false, "SSE 事件流里没有 choices"
+	}
+	return false, false, "响应体既不是 JSON 也不是 SSE"
+}
+
+// looksLikeHTMLPage 响应开头是否是网页（HTML）。运行时的 diagnose 与探测共用这一份判定，
+// 避免两处各写一套前缀列表（判据分叉 = 一处认出来、另一处认不出来）。
+func looksLikeHTMLPage(t []byte) bool {
+	s := bytes.ToLower(bytes.TrimSpace(t))
+	for _, p := range [][]byte{
+		[]byte("<!doctype"), []byte("<html"), []byte("<head"), []byte("<body"),
+		[]byte("<!--"), []byte("<?xml"),
+	} {
+		if bytes.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// notEndpointDetail 拼装「地址不是 API 端点」的可读原因：含状态码、Content-Type、
+// **重定向落点**（这是识破"控制台域名 → 登录页"的关键证据）与响应摘录，最后给一句怎么改。
+// 不含任何密钥材料。
+func notEndpointDetail(configuredURL string, resp *http.Response, body []byte, why string) string {
+	var b strings.Builder
+	b.WriteString(why)
+	fmt.Fprintf(&b, "；HTTP %d", resp.StatusCode)
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		b.WriteString(", Content-Type=" + ct)
+	}
+	if fin := finalURL(resp); fin != "" && !sameHost(fin, configuredURL) {
+		b.WriteString("；请求被跨域重定向到 " + fin)
+	}
+	if excerpt := htmlOrCompactExcerpt(body); excerpt != "" {
+		b.WriteString("；响应摘录: " + excerpt)
+	}
+	b.WriteString("；提示：网页控制台/登录页地址不是 API 地址，API 端点通常形如 " +
+		"https://api.<供应商域名>/v1/chat/completions")
+	return b.String()
+}
+
+// finalURL 客户端跟随重定向后真正落到的地址（去掉 query/fragment/userinfo，避免把参数里的
+// 一次性令牌带进日志与错误文案）；拿不到则返回空串。
+func finalURL(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	u := *resp.Request.URL
+	u.RawQuery, u.Fragment, u.RawFragment, u.User = "", "", "", nil
+	return u.String()
+}
+
+// sameHost 两个 URL 是否同一个主机（host:port）。无法解析时按"视为相同"处理——
+// 宁可少报一句重定向，也不要把同主机上的正常跳转报成"被劫持到别处"。
+func sameHost(a, b string) bool {
+	ua, err1 := url.Parse(a)
+	ub, err2 := url.Parse(b)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return strings.EqualFold(ua.Host, ub.Host)
+}
+
+// htmlOrCompactExcerpt 响应体 → 单行短摘录：HTML 只报标题（整页 HTML 灌进错误文案没有
+// 任何信息量，还会把 200 字符的前端截断额度吃光）；其余沿用 compactProviderMessage。
+func htmlOrCompactExcerpt(body []byte) string {
+	t := bytes.TrimSpace(body)
+	if int64(len(t)) > probeBodyLimit {
+		t = t[:probeBodyLimit]
+	}
+	if looksLikeHTMLPage(t) {
+		if title := htmlTitle(t); title != "" {
+			return "HTML 网页（<title>" + title + "</title>）"
+		}
+		return "HTML 网页"
+	}
+	return compactProviderMessage(body)
+}
+
+// htmlTitle 从 HTML 里抠出 <title>…</title>（截断 120 字符）；没有则返回空串。
+func htmlTitle(body []byte) string {
+	lower := bytes.ToLower(body)
+	i := bytes.Index(lower, []byte("<title"))
+	if i < 0 {
+		return ""
+	}
+	j := bytes.IndexByte(lower[i:], '>')
+	if j < 0 {
+		return ""
+	}
+	rest := body[i+j+1:]
+	k := bytes.Index(bytes.ToLower(rest), []byte("</title"))
+	if k < 0 {
+		return ""
+	}
+	t := strings.Join(strings.Fields(string(rest[:k])), " ")
+	if len(t) > 120 {
+		t = t[:120] + "…"
+	}
+	return t
 }
 
 // networkDetail 网络层错误的可读摘要。http.Client 的错误里可能带完整 URL，
@@ -421,6 +628,26 @@ func UsableKeys(keys []string, probes []KeyProbe) []string {
 	out := make([]string, 0, len(keys))
 	for i, p := range probes {
 		if i < len(keys) && p.Usable() {
+			out = append(out, keys[i])
+		}
+	}
+	return out
+}
+
+// RuntimeKeys 运行时轮询池（同时也是落库集合）的密钥：**只剔除"确凿不可用"的**。
+//
+// 与 UsableKeys 的分工（§2026-09-20）：
+//   - UsableKeys 回答"这次探测谁明确通过了"——用于判断 verified，不能拿它决定删 key；
+//   - RuntimeKeys 回答"谁有资格留在池子里"——可用 / 限流 / **未能判定**（network、5xx、
+//     请求被拒）都留，只有 auth、model、quota、not_endpoint 这四类确凿证据才剔。
+//
+// 为什么必须分开：广州实测一轮 8 key 探测里有 4 把报"连接超时"（30s 探测上限 + 2 核小机器
+// 并发 4 路推理模型），而同一把 key 单独直连是 200。若按 UsableKeys 落库，用户点一次保存
+// 就会**永久删掉 4 把好 key**（库里与页面列表里都没有了），证据却只是"我们自己的超时"。
+func RuntimeKeys(keys []string, probes []KeyProbe) []string {
+	out := make([]string, 0, len(keys))
+	for i, p := range probes {
+		if i < len(keys) && !p.ConfigInvalid() {
 			out = append(out, keys[i])
 		}
 	}

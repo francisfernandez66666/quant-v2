@@ -39,6 +39,10 @@ func TestConsultErrorResponseClassification(t *testing.T) {
 		{"上游429机读", &llm.UpstreamError{Status: 429, Detail: "rate limited"}, 503, "llm_upstream_unavailable", "HTTP 429", "rate limited"},
 		{"上游401机读", &llm.UpstreamError{Status: 401, Detail: "invalid api key sk-abcdef"}, 502, "llm_upstream_error", "核查配置", "sk-abcdef"},
 		{"上游500旧式串", fmt.Errorf("LLM API 返回 500: internal server error url=https://private.vendor"), 503, "llm_upstream_unavailable", "暂不可用", "private.vendor"},
+		// §P0 2026-09-20：地址填成网页控制台 → 上游回登录页 HTML。必须归到"配置问题"（502）并
+		// 直指地址，而不是混进 500 把 160 字 HTML 摘录当线索（广州线上实录）。
+		{"上游回网页(地址错)", fmt.Errorf("咨询调用失败: %w", llm.ErrUpstreamNotAPI), 502, "llm_upstream_not_api", "网页控制台", "sk-"},
+		{"上游回网页(带原文)", fmt.Errorf("咨询调用失败: %w：上游返回的是网页(HTML)…", llm.ErrUpstreamNotAPI), 502, "llm_upstream_not_api", "API 端点", ""},
 		{"未知截断", fmt.Errorf("some unknown failure %s", strings.Repeat("未", 300)), 500, "consult_failed", "详情见服务端日志", ""},
 	}
 	for _, c := range cases {

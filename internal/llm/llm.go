@@ -13,6 +13,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -341,6 +342,63 @@ var ErrBudgetExceeded = errors.New("LLM 预算已用尽")
 // 机读分流为"依赖未配置"（503 + llm_not_configured），不再混入 500。
 // English: sentinel for missing API keys; message kept byte-identical to the legacy string.
 var ErrNoAPIKey = errors.New("LLM_API_KEY not set")
+
+// ErrUpstreamNotAPI 上游回了 2xx，但响应体不是 LLM 接口响应（网页 HTML / 非 JSON）。
+//
+// §P0 2026-09-20（生产实录）：用户把 api_url 填成了供应商**网页控制台**域名
+// （cloud.<vendor>.cn）。该域名对任意路径都 307 跳到 account.<vendor>.cn/login，
+// 而 Go 的 http.Client 默认跟随重定向 → 客户端拿到**登录页 HTML + HTTP 200**：
+//   - 启动预检 Ping 只看状态码 → "启动预检通过"，每轮启动日志都显示一切正常；
+//   - 配置探测只看状态码 → "8/8 key 可用 verified=true"，热更新照常生效；
+//   - 咨询时才炸，报的是 "no response from LLM (流式: data分片=0, 响应摘录=<!DOCTYPE html>…)"，
+//     **用户完全看不出是地址填错了**（HTML 摘录等于没给线索）。
+//
+// 这条哨兵让三个出口都说同一句人话："上游返回的是网页，不是模型接口 —— 地址很可能填成了
+// 网页控制台/登录页"，由 server 层映射成 502 + llm_upstream_not_api。
+// English: sentinel for "upstream answered 2xx with a web page, not a chat completion",
+// i.e. the configured api_url is not an LLM endpoint at all.
+var ErrUpstreamNotAPI = errors.New("上游返回的不是 LLM 接口响应")
+
+// notAPIError 组装"上游回的是网页"的可操作错误：带最终落点（重定向后地址）与原始配置地址，
+// 让用户一眼看出该改哪里。**不含密钥材料**。
+func notAPIError(configured, final, excerpt string) error {
+	var b strings.Builder
+	b.WriteString("上游返回的是网页(HTML)而不是模型接口响应。当前 api_url=")
+	b.WriteString(redactURL(configured))
+	if final != "" && final != redactURL(configured) {
+		b.WriteString("，请求实际被重定向到 " + final)
+	}
+	b.WriteString("；这通常是把供应商的**网页控制台/登录页**地址当成了 API 地址，" +
+		"请改成 API 端点（形如 https://api.<供应商域名>/v1/chat/completions）")
+	if excerpt != "" {
+		b.WriteString("；响应摘录: " + excerpt)
+	}
+	return fmt.Errorf("%w：%s", ErrUpstreamNotAPI, b.String())
+}
+
+// redactURL 去掉 URL 的 query/fragment/userinfo —— 记录地址时避免把挂在 query 上的
+// 一次性令牌/鉴权参数带进日志与错误文案。
+func redactURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return raw
+	}
+	u.RawQuery, u.Fragment, u.RawFragment, u.User = "", "", "", nil
+	return u.String()
+}
+
+// isHTMLContentType 响应头是否声明为网页。
+func isHTMLContentType(resp *http.Response) bool {
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	return strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml")
+}
+
+// peekBodyExcerpt 取响应体开头一小段用于判定"是不是网页"（不消耗流式解析：仅在
+// postCtx 的 2xx 分支用于早退，此时请求即将被判为失败）。
+func peekBodyExcerpt(body io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(body, 512))
+	return strings.Join(strings.Fields(string(b)), " ")
+}
 
 // UpstreamError 上游供应商返回非 2xx 的结构化错误（§FIX-9d）：Status 供 HTTP 层按
 // 语义归类（429/5xx→503 可重试，其余 4xx→502），Detail 保留原始响应摘录仅供日志——
@@ -796,6 +854,13 @@ func (c *Client) streamChatCtx(ctx context.Context, req ChatRequest) (string, er
 				out <- streamOut{content: r, usage: lastUsage}
 				return
 			}
+			// §P0 2026-09-20：0 分片 + 摘录看着像网页 → 这是"地址不是 API 端点"，不是模型出错。
+			// 网关若不声明 Content-Type: text/html，postCtx 那道判断题就漏过去了，这里兜底：
+			// 与其报"no response from LLM"，不如直接说清是地址填成了网页控制台/登录页。
+			if looksLikeHTMLPage([]byte(rawSample.String())) {
+				out <- streamOut{err: notAPIError(c.apiURL, "", truncateRunes(strings.TrimSpace(rawSample.String()), 160))}
+				return
+			}
 			out <- streamOut{err: fmt.Errorf("no response from LLM (流式: data分片=%d, finish_reason=%q, reasoning字数=%d, usage=%s, 响应摘录=%.400s)",
 				chunkCount, finishReason, len([]rune(reasoning.String())), usageText(lastUsage), rawSample.String())}
 			return
@@ -940,6 +1005,10 @@ func (c *Client) nonStreamChatMaxCtx(ctx context.Context, req ChatRequest, maxTo
 	}
 	var chatResp ChatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		// §P0 2026-09-20：解析失败且响应体是网页 → 地址不是 API 端点（而非"响应格式怪"）。
+		if looksLikeHTMLPage(respBody) {
+			return "", notAPIError(c.apiURL, "", truncateRunes(strings.Join(strings.Fields(string(respBody)), " "), 160))
+		}
 		return "", fmt.Errorf("非流式响应解析失败: %v（响应摘录: %.400s）", err, strings.TrimSpace(string(respBody)))
 	}
 	// §PROD-LLM2（2026-09-18 生产实录）：旧实现在此抛裸 "no response from LLM"，零诊断信息。
@@ -1022,7 +1091,35 @@ func (c *Client) postCtx(ctx context.Context, req ChatRequest, stream bool, maxT
 		c.markKeyStatus(key, resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After")))
 		return nil, &UpstreamError{Status: resp.StatusCode, Detail: strings.TrimSpace(string(msg))}
 	}
+	// §P0 2026-09-20：2xx 也可能是"一页网页"。地址填成供应商网页控制台域名时，
+	// 控制台会 307 跳到登录页，而 http.Client 默认跟随重定向 → 这里拿到 HTML + 200，
+	// 下游 SSE 解析出 0 个 data 分片，最终报"no response from LLM"（用户看不出是地址错）。
+	// 在唯一出呼出口就识别掉，错误文案直接指向"地址填成了网页控制台"。
+	// 这里只看响应头（Content-Type）——读 body 会与流式解析抢数据，不安全的窥探不做；
+	// 响应体形态的兜底判定放在流式/非流式的出口（那时 body 已经在手上）。
+	if isHTMLContentType(resp) {
+		excerpt := peekBodyExcerpt(resp.Body)
+		resp.Body.Close()
+		return nil, notAPIError(c.apiURL, redactURL(respURL(resp)), truncateRunes(excerpt, 160))
+	}
 	return resp.Body, nil
+}
+
+// respURL 客户端跟随重定向后真正落到的地址（去 query/fragment）；拿不到返回空串。
+func respURL(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	return resp.Request.URL.String()
+}
+
+// truncateRunes 按字符（非字节）截断，避免把多字节字符切成乱码。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // consultSystemPrompt 股票咨询多轮对话的系统提示词：设定有独立分析能力的 A 股顾问角色。
@@ -1558,6 +1655,14 @@ func (c *Client) Ping() error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(resp.Body)
 		return &UpstreamError{Status: resp.StatusCode, Detail: strings.TrimSpace(string(msg))}
+	}
+	// §P0 2026-09-20：预检也必须看响应体。此前只看状态码，于是"api_url 填成网页控制台"
+	// 这种地址在启动预检里**永远是"通过"**（307 → 登录页 HTML + 200），
+	// 每轮启动日志都打印"[LLM] 启动预检通过"，把排查方向彻底带偏。
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if isHTMLContentType(resp) || looksLikeHTMLPage(head) {
+		return notAPIError(c.apiURL, redactURL(respURL(resp)),
+			truncateRunes(strings.Join(strings.Fields(string(head)), " "), 160))
 	}
 	return nil
 }

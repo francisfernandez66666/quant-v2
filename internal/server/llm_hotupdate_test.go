@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,10 @@ import (
 	"quant-trading-v2/internal/auth"
 	"quant-trading-v2/internal/llm"
 )
+
+// htmlLoginPage 与 internal/llm 侧同形的"登录页 HTML"样本（网页控制台的重定向落点）。
+const htmlLoginPage = `<!DOCTYPE html><html lang="zh"><head><meta charSet="utf-8"/>` +
+	`<title>登录 - 硅基流动</title></head><body>请登录</body></html>`
 
 // ── LLM 热更新稳定性回归 ──────────────────────────────────────────────────────
 //
@@ -316,6 +321,82 @@ func TestHotUpdateDropsUnhealthyKeys(t *testing.T) {
 	}
 	if got := storedKey(t, s, admin.ID); got != "sk-good,sk-slow" {
 		t.Fatalf("落库应只含可用子集, got %q", got)
+	}
+}
+
+// TestHotUpdateKeepsUnverifiableKeys §2026-09-20：**未能判定**的 key（探测超时/5xx/请求被拒）
+// 必须同时留在运行时池与库里 —— 剔除也要凭确凿证据。
+//
+// 事故形态（广州实测）：8 把 key 一轮探测 4 把报"连接超时"（30s 探测上限 + 2 核机器并发 4 路
+// 推理模型），单把直连却是 200。旧实现按"探测未通过"落库 → 用户点一次保存就把 4 把好 key
+// 从配置里**永久删掉**（页面列表里也没了，他根本不知道被删了），而证据只是"我们超时了"。
+func TestHotUpdateKeepsUnverifiableKeys(t *testing.T) {
+	s, admin := newAdminTestServer(t)
+	cap := captureRecreate(t, s)
+	// #1 探测超时（未能判定）、#2 真可用
+	stubProbeWith(t, llm.ProbeNetwork, llm.ProbeOK)
+
+	rr := postLLM(t, s, admin, "/api/config/llm",
+		`{"api_keys":["sk-timeout","sk-good"],"api_url":"https://example.com/prov-base/v1/chat/completions","model":"m"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("有可用 key 时应 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	res := llmResult(t, rr)
+	if res["effective_keys"] != float64(2) || res["dropped_keys"] != float64(0) {
+		t.Fatalf("未能判定的 key 不得被剔除: got %v", res)
+	}
+	// 断言下游真的收到了两把 —— 只断言库值会漏掉"库里留了、运行时却没下发"的分叉。
+	if len(cap.keys) != 2 || cap.keys[0] != "sk-timeout" || cap.keys[1] != "sk-good" {
+		t.Fatalf("热切换应下发两把, got %v", cap.keys)
+	}
+	if got := storedKey(t, s, admin.ID); got != "sk-timeout,sk-good" {
+		t.Fatalf("未能判定的 key 必须保留在库里, got %q", got)
+	}
+	// 告警要说清"保留了"，否则用户会以为探测报红的 key 被删了。
+	w, _ := res["warning"].(string)
+	if !strings.Contains(w, "保留") {
+		t.Fatalf("告警须说明未判定的 key 被保留, got %q", w)
+	}
+}
+
+// TestHotUpdateConsoleURLIsRejected 事故主线的端到端断言（真实探测 + 假"网页控制台"上游）：
+// api_url 填成控制台地址（307 → 登录页 HTML + 200）必须被**拒绝**，运行时与磁盘都不动。
+//
+// 这是 2026-09-20 广州事故的复现用例：旧实现会判"8/8 可用 verified=true"并热更新生效，
+// 于是每次股票咨询都拿到一页登录页 HTML。
+func TestHotUpdateConsoleURLIsRejected(t *testing.T) {
+	s, admin := newAdminTestServer(t)
+	cap := captureRecreate(t, s)
+	withRealProber(t)
+
+	login := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, htmlLoginPage)
+	}))
+	defer login.Close()
+	console := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, login.URL+"/login", http.StatusTemporaryRedirect)
+	}))
+	defer console.Close()
+
+	// 直接构造快照（validatePublicURL 会拦 127.0.0.1，故不走 HTTP 入口——见文件头说明）。
+	cand := llmSnapshot{
+		Keys:   []string{"sk-real"},
+		APIURL: console.URL + "/v1/chat/completions",
+		Model:  "m",
+	}
+	res, code := s.applyLLMSnapshot(admin.ID, cand, false /*force*/, true /*persist*/, true /*hotSwap*/)
+	if code != http.StatusConflict || !res.Rejected {
+		t.Fatalf("网页控制台地址必须被拒绝, got code=%d res=%+v", code, res)
+	}
+	if cap.calls != 0 {
+		t.Fatalf("被拒绝时不得热切换运行时客户端, got %d 次", cap.calls)
+	}
+	if got := storedKey(t, s, admin.ID); got != "" {
+		t.Fatalf("被拒绝时不得落库, got %q", got)
+	}
+	if !strings.Contains(res.Reason, "地址不是 API 端点") {
+		t.Fatalf("拒绝原因须点明『地址不是 API 端点』, got %q", res.Reason)
 	}
 }
 

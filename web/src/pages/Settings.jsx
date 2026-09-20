@@ -326,7 +326,10 @@ export default function Settings() {
       lines.push(`第 ${p.index + 1} 把：${probeKindLabel(p.kind)}（${status}）${detail}`)
     })
     if (typeof res?.effective_keys === 'number') {
-      lines.push(`生效密钥 ${res.effective_keys} 把；被剔除 ${res.dropped_keys || 0} 把`)
+      // 「被剔除」只数**确凿不可用**的（密钥无效/模型或地址不存在/欠费/地址不是 API 端点）；
+      // 探测超时、上游 5xx 这类"未能判定"的 key 是**保留**在池里与配置里的，不算剔除
+      // （§2026-09-20：否则用户会以为探测报红的 key 被删了）。
+      lines.push(`生效密钥 ${res.effective_keys} 把；确认不可用已剔除 ${res.dropped_keys || 0} 把`)
     }
     if (res?.api_url) lines.push(`地址 ${res.api_url}；模型 ${res.model || '（默认）'}`)
     const kind = res?.rejected ? 'error' : (res?.warning ? 'warn' : 'success')
@@ -339,6 +342,8 @@ export default function Settings() {
       ok: '可用', auth: '密钥无效/无权限', model: '地址或模型不可用', quota: '余额/额度不足',
       rate_limited: '被限流（密钥有效）', bad_request: '请求被拒（未能验证）',
       server: '供应商故障（未能验证）', network: '网络不可达（未能验证）', no_key: '未提供密钥',
+      // §P0 2026-09-20：地址不是 API 端点（典型：填了供应商网页控制台域名，被 307 跳到登录页）。
+      not_endpoint: '地址不是 API 端点（上游返回网页）',
     }
     return map[kind] || kind || '未知'
   }

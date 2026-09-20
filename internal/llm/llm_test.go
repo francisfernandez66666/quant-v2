@@ -3,6 +3,7 @@ package llm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -328,6 +329,101 @@ func TestPingUpstreamError(t *testing.T) {
 	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: false})
 	if err := c.Ping(); err == nil {
 		t.Fatal("上游 500 探活应失败")
+	}
+}
+
+// htmlLoginPage 定义在 probe_test.go（探测侧的控制台重定向夹具），两处共用同一份样本，
+// 避免"探测认得出、运行时认不出"的判据分叉。
+
+// TestPingRejectsHTMLPage §P0 2026-09-20：启动预检必须看响应体。
+//
+// 旧实现只看状态码，于是"api_url 填成供应商网页控制台域名"这种地址**永远是"启动预检通过"**
+// （控制台 307 → 登录页 HTML + HTTP 200），每轮启动日志都在报平安，把排查方向彻底带偏。
+func TestPingRejectsHTMLPage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, htmlLoginPage)
+	}))
+	defer srv.Close()
+	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: false, Timeout: 5 * time.Second})
+	err := c.Ping()
+	if err == nil {
+		t.Fatal("上游回网页时预检必须失败——但旧实现会报『通过』")
+	}
+	if !errors.Is(err, ErrUpstreamNotAPI) {
+		t.Fatalf("应判定为 ErrUpstreamNotAPI, got %v", err)
+	}
+}
+
+// TestChatHTMLUpstreamIsDiagnosedAsWrongEndpoint §P0 2026-09-20（广州线上实录）：
+// 上游回网页时，错误必须**直指"地址填成了网页控制台"**，而不是旧的
+// "no response from LLM (流式: data分片=0, 响应摘录=<!DOCTYPE html>…)"——后者等于没给线索。
+//
+// 两种上游都要覆盖：诚实声明 text/html 的（postCtx 拦下），以及 Content-Type 谎报
+// application/json 的（只能靠响应体形态在流式出口拦下）。
+func TestChatHTMLUpstreamIsDiagnosedAsWrongEndpoint(t *testing.T) {
+	cases := []struct {
+		name  string
+		ctype string
+	}{
+		{"上游声明 text/html", "text/html; charset=utf-8"},
+		{"上游谎报 application/json", "application/json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.ctype)
+				fmt.Fprint(w, htmlLoginPage)
+			}))
+			defer srv.Close()
+			c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: true, Timeout: 5 * time.Second})
+			_, err := c.Chat("sys", "user")
+			if err == nil {
+				t.Fatal("上游回网页不得被当成成功")
+			}
+			if !errors.Is(err, ErrUpstreamNotAPI) {
+				t.Fatalf("应判定为 ErrUpstreamNotAPI, got %v", err)
+			}
+			if strings.Contains(err.Error(), "no response from LLM") {
+				t.Fatalf("不得停留在旧的无线索形态: %v", err)
+			}
+			if !strings.Contains(err.Error(), "网页控制台") {
+				t.Fatalf("文案必须给出可操作指引（地址填成了网页控制台）: %v", err)
+			}
+		})
+	}
+}
+
+// TestNonStreamHTMLUpstreamIsDiagnosed 非流式通道同样要识别"上游回网页"。
+// 非流式是 D1 评分/新闻归因走的路，若只有流式能识别，那些链路仍会把 HTML 当"响应格式怪"。
+func TestNonStreamHTMLUpstreamIsDiagnosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 谎报 JSON：绕过 Content-Type 快判，逼出"看响应体"这条兜底路径。
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, htmlLoginPage)
+	}))
+	defer srv.Close()
+	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: false, Timeout: 5 * time.Second})
+	_, err := c.nonStreamChat(ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err == nil || !errors.Is(err, ErrUpstreamNotAPI) {
+		t.Fatalf("非流式遇 HTML 应判定为 ErrUpstreamNotAPI, got %v", err)
+	}
+}
+
+// TestNormalizedURLApiStillWorks 反向护栏：正常的 JSON 响应（含 choices）不得被新判定误杀。
+// 没有这条，一次"过度收紧"就会把全部链路打死。
+func TestNormalizedURLApiStillWorks(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"好"}}]}`)
+	}))
+	defer srv.Close()
+	c := New(Config{APIKey: "k", APIURL: srv.URL, Streaming: false, Timeout: 5 * time.Second})
+	if err := c.Ping(); err != nil {
+		t.Fatalf("正常 JSON 响应不得被误判: %v", err)
+	}
+	if got, err := c.Chat("s", "u"); err != nil || got != "好" {
+		t.Fatalf("正常链路应可用: got=%q err=%v", got, err)
 	}
 }
 

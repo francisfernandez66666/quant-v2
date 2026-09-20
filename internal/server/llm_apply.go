@@ -31,8 +31,10 @@ import (
 // 三条不变量（改动本文件前请先读）：
 //
 //	① **拒绝必须有确凿证据**：只有探测明确指向"配置本身有错"（密钥无效 / 模型或地址不存在 /
-//	   余额不足）才拒绝；网络不可达、供应商 5xx、请求体被拒都**不能**当成配置错的证据，
-//	   否则供应商抖动时用户会被"保存都不让"堵死在坏状态里。此时给出原文 + 提供 force 显式覆盖。
+//	   余额不足 / **地址不是 API 端点**）才拒绝；网络不可达、供应商 5xx、请求体被拒都**不能**
+//	   当成配置错的证据，否则供应商抖动时用户会被"保存都不让"堵死在坏状态里。此时给出原文 +
+//	   提供 force 显式覆盖。（§2026-09-20 新增第四类 not_endpoint，依据见
+//	   docs/BUGFIX_LLM_CONSOLE_URL_20260920.md：它是"地址配错"的直接证据，比 401/404 更硬。）
 //	② **落库晚于切换**：任何情况下都不允许出现"库里是坏的、运行时也是坏的"这种重启救不回的
 //	   状态。落库失败只影响重启后的自愈，不回滚运行时（盘中先保证能用）。
 //	③ **三个入口共用这一份实现**：口径分叉正是历次"改了不生效"的根源
@@ -87,9 +89,9 @@ type llmApplyResult struct {
 	Verified bool `json:"verified"`
 	// Probes 逐把密钥的探测结论（位次即设置页输入框行号）。
 	Probes []llm.KeyProbe `json:"probes,omitempty"`
-	// EffectiveKeys 本次实际进入运行时轮询池的密钥数。
+	// EffectiveKeys 本次实际进入运行时轮询池（且落库）的密钥数。
 	EffectiveKeys int `json:"effective_keys"`
-	// DroppedKeys 因探测未通过而被剔除的密钥数。
+	// DroppedKeys 因**确凿不可用**而被剔除的密钥数（未能判定的不算，见 RuntimeKeys）。
 	DroppedKeys int `json:"dropped_keys"`
 	// ProbeMS 探测总耗时。
 	ProbeMS int64 `json:"probe_ms"`
@@ -307,8 +309,11 @@ func (s *Server) applyLLMSnapshot(uid string, cand llmSnapshot, force, persist, 
 
 	switch {
 	case verified:
-		// 正常路径：至少一把 key 探测通过。只把验证过的 key 放进轮询池——
-		// 一把欠费的 key 混在池子里，会让每 N 个请求里有一个必然失败（且难归因）。
+		// 正常路径：至少一把 key 探测通过。进池的集合用 RuntimeKeys（可用 + **未能判定**），
+		// 只剔"确凿不可用"的 —— 详见下面对 droppedKeysWarning 的说明与 probe.go::RuntimeKeys。
+		//
+		// 告警条件用「有 key 没干净通过」而非「有 key 被剔除」：既剔也留，用户都得被告知
+		// 那把"网络不可达"的 key 后来怎么了（留着 / 删了），否则探测报告里的红字无从解释。
 		if len(usable) < len(cand.Keys) {
 			res.Warning = droppedKeysWarning(cand.Keys, probes)
 		}
@@ -324,22 +329,36 @@ func (s *Server) applyLLMSnapshot(uid string, cand llmSnapshot, force, persist, 
 		// 不可判定（网络不可达 / 供应商 5xx / 请求体被拒）或用户显式 force。
 		// 这类情况**没有证据说配置是错的**，拒绝会把"运行时已经坏了、想靠换配置救"的用户
 		// 堵死在坏状态里，所以采用但如实回告"未经验证"，并留下回滚点。
-		usable = append([]string(nil), cand.Keys...)
 		res.Warning = unverifiedWarning(probes, force)
 	}
 
+	// 进池/落库集合：可用 ∪ 未能判定，只剔"确凿不可用"。
+	//
+	// §2026-09-20 为什么要这样收口（广州实测）：8 把 key 一轮探测里 4 把报"连接超时"
+	// （30s 探测上限 + 2 核小机器并发 4 路推理模型），而同一把 key 单独直连是 200 ——
+	// 这些失败**完全是我们自己的探测条件造成的**。若据此把 key 从池里/库里删掉，
+	// 用户点一次保存就永久丢掉几把好 key（库里和页面上都不见了），证据却只是"我们超时了"。
+	// 这就是本文件不变量①在 key 集合上的延伸：剔除也必须凭确凿证据。
+	// 仍然剔除的是 auth/model/quota/not_endpoint 四类（欠费的 key 混在池里 = 每 N 个请求
+	// 必然失败一个，那才是要防的）。
+	keep := llm.RuntimeKeys(cand.Keys, probes)
+	if len(keep) == 0 && len(cand.Keys) > 0 {
+		keep = append([]string(nil), cand.Keys...) // 极端兜底：绝不建一个空池
+	}
 	submitted := len(cand.Keys)
-	res.EffectiveKeys = len(usable)
-	res.DroppedKeys = submitted - len(usable)
+	res.EffectiveKeys = len(keep)
+	res.DroppedKeys = submitted - len(keep)
 	res.Verified = verified
-	cand.Keys = usable
+	cand.Keys = keep
 
 	// ① 切换运行时（先于落库：盘中优先保证"现在能用"；落库只影响重启后能否自愈）。
 	// 仅探测（"测试连接"）路径不切换、不更新快照——探测是只读动作，绝不能改变运行态。
 	if hotSwap {
 		res.Applied = true
 		if s.llmRecreate != nil {
-			s.llmRecreate(usable, cand.APIURL, cand.Model, cand.TimeoutSec, cand.streamingOn(), cand.BatchConcurrency, cand.ClassifierModel)
+			// 下发的必须是 cand.Keys（= keep）：用 usable 会漏掉"未能判定但保留"的 key，
+			// 于是"库里有 8 把、运行时只有 4 把"——落库与运行时分叉正是本文件的头号事故形态。
+			s.llmRecreate(cand.Keys, cand.APIURL, cand.Model, cand.TimeoutSec, cand.streamingOn(), cand.BatchConcurrency, cand.ClassifierModel)
 		}
 		s.rememberLLMSnapshot(cand, verified)
 		s.SetRuntimeLLM(cand.APIURL, effectiveModelName(cand.Model))
@@ -357,9 +376,9 @@ func (s *Server) applyLLMSnapshot(uid string, cand llmSnapshot, force, persist, 
 		}
 	}
 
-	log.Printf("[llm] 热更新%s: uid=%s keys=%d/%d verified=%v url=%s model=%s probe=%dms %s",
+	log.Printf("[llm] 热更新%s: uid=%s keys=%d/%d (探测通过 %d) verified=%v url=%s model=%s probe=%dms %s",
 		map[bool]string{true: "已生效", false: "仅探测"}[hotSwap],
-		uid, len(usable), submitted, verified, cand.APIURL, cand.Model, res.ProbeMS,
+		uid, len(cand.Keys), submitted, len(usable), verified, cand.APIURL, cand.Model, res.ProbeMS,
 		llm.ProbeSummary(probes))
 	return res, http.StatusOK
 }
@@ -411,16 +430,39 @@ func rejectReason(probes []llm.KeyProbe) string {
 	return b.String()
 }
 
-// droppedKeysWarning 部分密钥被剔除的告警。
+// droppedKeysWarning 密钥集合被收窄的告警（§2026-09-20 改：分「剔除」与「暂留」两类）。
+//
+// 为什么必须分开说：进池/落库用的是 RuntimeKeys —— 只有"确凿不可用"（密钥无效 / 模型或地址
+// 不存在 / 欠费 / 地址不是 API 端点）才会被剔；"未能判定"（网络超时 / 供应商 5xx / 我们自己的
+// 请求体被拒）**保留**。两类都不说明白，用户就会以为"探测报红的 key 被删了"，而实际是留着的；
+// 反过来只报"剔除"，会让"我们超时了"被误读成"key 坏了"。
 func droppedKeysWarning(keys []string, probes []llm.KeyProbe) string {
-	bad := make([]string, 0, len(probes))
+	dropped := make([]string, 0, len(probes))
+	keptUnsure := make([]string, 0, len(probes))
 	for i, p := range probes {
-		if i < len(keys) && !p.Usable() {
-			bad = append(bad, p.Summary())
+		if i >= len(keys) {
+			continue
+		}
+		if p.ConfigInvalid() {
+			dropped = append(dropped, p.Summary())
+		} else if !p.Usable() {
+			keptUnsure = append(keptUnsure, p.Summary())
 		}
 	}
-	return "已剔除 " + strconv.Itoa(len(bad)) + " 把未通过探测的密钥（未纳入轮询池、未落库）：\n· " +
-		strings.Join(bad, "\n· ")
+	var b strings.Builder
+	if len(dropped) > 0 {
+		b.WriteString("已剔除 " + strconv.Itoa(len(dropped)) +
+			" 把确认不可用的密钥（未纳入轮询池、未落库）：\n· " + strings.Join(dropped, "\n· "))
+	}
+	if len(keptUnsure) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("另有 " + strconv.Itoa(len(keptUnsure)) +
+			" 把本轮**未能判定**（网络/供应商侧原因，非配置错），已保留在轮询池与配置中：\n· " +
+			strings.Join(keptUnsure, "\n· "))
+	}
+	return b.String()
 }
 
 // unverifiedWarning 未经证实即采用的告警。
