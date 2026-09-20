@@ -7,6 +7,7 @@ import ToggleSw from '../components/ToggleSw'
 import Disclaimer from '../components/Disclaimer.jsx'
 import * as api from '../api/index.js'
 import { showToast } from '../ui.jsx'
+import Markdown from '../components/Markdown.jsx'
 
 // 将 ISO 时间格式化为 HH:mm:ss，用于消息气泡展示
 function fmtTime(t) {
@@ -202,7 +203,7 @@ export default function Consult() {
           ...bubbleStyle,
           background: m.role === 'user' ? 'var(--td-brand-color)' : 'var(--app-surface-2)',
           color: m.role === 'user' ? '#fff' : 'var(--app-text)',
-        }}>{m.content}</div>
+        }}>{m.role === 'user' ? m.content : <Markdown text={m.content} />}</div>
         {m.time && <div className="muted" style={{ fontSize: 12, marginTop: 2, textAlign: m.role === 'user' ? 'right' : 'left' }}>{fmtTime(m.time)}</div>}
       </div>
     )

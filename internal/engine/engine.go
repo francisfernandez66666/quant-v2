@@ -2810,8 +2810,11 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		}
 		b.WriteString(fmt.Sprintf("现价 %.2f元 涨跌幅%.2f%%（即%s%.2f%%） 今开%.2f元 最高%.2f元 最低%.2f元 昨收%.2f元\n",
 			si.Price, si.ChangePct, dirWord, math.Abs(si.ChangePct), si.Open, si.High, si.Low, si.Close))
-		b.WriteString(fmt.Sprintf("成交量 %.0f股 成交额%.0f元 换手率 %.2f%%\n",
-			si.Volume, si.Amount, si.Turnover))
+		// §CONSULT-UX(20260921)：成交量同时给"股"与"手"双口径。auditNumbers 只认白名单里的
+		// 原样数字——模型把"股"改写成"手"会被判为编造、整段隐成"[数据缺失]"。给双口径后模型
+		// 任选其一原样照抄即可过关（与 llm.go 的"数字引用铁律"提示词配套）。
+		b.WriteString(fmt.Sprintf("成交量 %.0f股（约%.0f手） 成交额%.0f元 换手率 %.2f%%\n",
+			si.Volume, si.Volume/100, si.Amount, si.Turnover))
 		// §FIX-9e(20260919)：判"缺数"必须看 HasFlow——东财真返回 0（买卖完全对冲）是合法
 		// 实测值，旧口径 NetInflow==0 一律说"数据源未返回"，诱导模型答"没有数据"。
 		if si.HasFlow {
@@ -2854,7 +2857,8 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 		}
 		// 近5日量能
 		avg5 := consultMAVolume(kl)
-		b.WriteString(fmt.Sprintf("近5日平均成交量 %.0f股，最新一根量 %.0f股\n", avg5, last.Volume))
+		// §CONSULT-UX(20260921)：近5日量能同样给双口径，与上一条成交量口径一致，避免模型复述时单位改写触发"[数据缺失]"。
+		b.WriteString(fmt.Sprintf("近5日平均成交量 %.0f股（约%.0f手），最新一根量 %.0f股（约%.0f手）\n", avg5, avg5/100, last.Volume, last.Volume/100))
 	}
 
 	// 分钟K（5分钟）MACD 状态

@@ -343,6 +343,16 @@ func TestConsultHistoryLimitedTo6Rounds(t *testing.T) {
 	}
 }
 
+// dataBlockOf 取出上下文里 ⟦DATA⟧ 之后的数据块。提示词里也会提到"数据源未返回"作为用法说明，
+// 因此"是否误报缺数"的断言必须只看数据块，不能命中提示词规则文本——否则 consult-UX 提示词
+// 新增"数字引用铁律/数据源未返回"说明后，全上下文断言会误判（2026-09-21 修复）。
+func dataBlockOf(ctx string) string {
+	if i := strings.Index(ctx, "⟦DATA⟧"); i >= 0 {
+		return ctx[i:]
+	}
+	return ctx
+}
+
 // TestConsultNetInflowMissingHint 两个资金流源都拿不到时，上下文提示"数据源未返回"而非误导为 0。
 // §修复 EM-FFLOW(20260920)：资金流口径源改为 fflow（GetStockMoneyFlow），故"缺数"场景
 // 用清空 money_flow 快照来构造（旧版清 NetInflows/f62；f62 在唯一可达链路上实测恒为占位值 2，
@@ -363,7 +373,8 @@ func TestConsultNetInflowMissingHint(t *testing.T) {
 		t.Fatal("mock 未记录咨询")
 	}
 	ctx := rig.calls.consult[len(rig.calls.consult)-1]
-	if !strings.Contains(ctx, "数据源未返回") {
+	// 只看数据块：提示词规则里也出现了"数据源未返回"字样，全上下文断言会误判。
+	if !strings.Contains(dataBlockOf(ctx), "数据源未返回") {
 		t.Errorf("净流入缺失时应提示数据源未返回\n---context---\n%s", ctx)
 	}
 }
@@ -392,7 +403,8 @@ func TestConsultNetInflowTrueZero(t *testing.T) {
 	if !strings.Contains(ctx, "主力净流入 0.00万元") {
 		t.Errorf("真 0 应如实输出 0.00万元\n---context---\n%s", ctx)
 	}
-	if strings.Contains(ctx, "数据源未返回") {
+	// 只看数据块：提示词规则里也出现了"数据源未返回"字样，全上下文断言会误判（2026-09-21 修复）。
+	if strings.Contains(dataBlockOf(ctx), "数据源未返回") {
 		t.Errorf("真 0 不得误报缺数\n---context---\n%s", ctx)
 	}
 }

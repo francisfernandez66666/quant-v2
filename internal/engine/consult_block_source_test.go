@@ -86,6 +86,10 @@ func TestConsultBlockCarriesTurnoverAndIndustryOnPrimaryOutage(t *testing.T) {
 	if !strings.Contains(block, "成交量 16119800股") || !strings.Contains(block, "成交额3594643946元") {
 		t.Errorf("数据块缺少成交量/成交额\n--- 块内容 ---\n%s", block)
 	}
+	// §CONSULT-UX(20260921)：成交量同时给"股"与"手"双口径，避免模型换算成手后被反幻觉审计判编造。
+	if !strings.Contains(block, "161198手") {
+		t.Errorf("数据块应同时给成交量(手)口径\n--- 块内容 ---\n%s", block)
+	}
 	// 主力净流入有值时必须走"有数"分支（HasFlow=true），而非"数据源未返回"。
 	// §修复 EM-FFLOW(20260920)：值来自 fflow（东财 fflow 是资金流口径基准），不是行情接口的 f62。
 	if !strings.Contains(block, "主力净流入 -22200.00万元") {
