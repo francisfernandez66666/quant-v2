@@ -208,7 +208,13 @@ if [ -d web/dist ]; then
   $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path ${DEPLOY_DIR}/web | Out-Null\""
   tar -czf /tmp/webdist.tgz -C web/dist .
   $SCP /tmp/webdist.tgz "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/webdist.tgz"
-  $SSH "powershell -NoProfile -Command \"tar -xzf ${DEPLOY_DIR}/webdist.tgz -C ${DEPLOY_DIR}/web; Remove-Item -Force ${DEPLOY_DIR}/webdist.tgz; Get-ChildItem -Path ${DEPLOY_DIR}/web -Recurse -Filter '._*' | Remove-Item -Force -ErrorAction SilentlyContinue\""
+  # 尾部的 `; exit 0` 是必需的，不是保守写法：`Get-ChildItem -Filter '._*'` 在**没有匹配项**时
+  # 会置 $? 为 false → powershell.exe 退出码 1 → 它是本条 ssh 的最后一条语句 → `set -e` 直接
+  # 把脚本打死在 [2c]。2026-09-20 实测（新解压的 web 目录天然没有 ._* 文件，即**首次必踩**）：
+  # 前端其实已同步成功，但脚本在收尾处静默退出，[3/5] 之后的全部步骤被跳过。
+  # 这正是 RUNBOOK 长期把「前端 dist 发布」列为"脚本外手动流程"的原因——[2c] 从未跑完过。
+  # 本步是尽力而为的垃圾清理，失败不得中断部署。
+  $SSH "powershell -NoProfile -Command \"tar -xzf ${DEPLOY_DIR}/webdist.tgz -C ${DEPLOY_DIR}/web; Remove-Item -Force ${DEPLOY_DIR}/webdist.tgz; Get-ChildItem -Path ${DEPLOY_DIR}/web -Recurse -Filter '._*' | Remove-Item -Force -ErrorAction SilentlyContinue; exit 0\"" || true
   rm -f /tmp/webdist.tgz
   echo "  OK 前端已同步到 $DEPLOY_DIR/web"
 else
