@@ -94,7 +94,9 @@ echo "=============================================="
 # ── 1. 交叉编译 windows/amd64 ──
 echo "[1/5] 交叉编译 windows/amd64..."
 # §R6 P1-1 二进制指纹：把 git 短 SHA 注入 quant buildCommit，启动自检可比对线上版本是否漂移
-LDFLAGS="-X main.buildCommit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# §A7-B（2026-09-20）：同一份 SHA 也用于校验前端产物是否配套（见步 [2c]），所以提到外面只算一次。
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+LDFLAGS="-X main.buildCommit=${GIT_SHA}"
 GOOS=windows GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o /tmp/quant.exe      ./cmd/quant
 GOOS=windows GOARCH=amd64 go build -o /tmp/researchd.exe  ./cmd/researchd
 GOOS=windows GOARCH=amd64 go build -o /tmp/dataload.exe   ./cmd/dataload
@@ -132,18 +134,50 @@ $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
 #       冻结在旧 buildCommit，浏览器端触发「前端与服务器版本不一致」横幅（2026-09-20 实录）。
 #       现改为：本地 web/dist 缺失则先 npm run build 生成，再 tar 打包传云端解包到
 #       $DEPLOY_DIR/web（Caddy :8080 站点根）；并清除 macOS 打包产生的 ._* 垃圾。
+#
+# §A7-B（2026-09-20 补，第二次同类事故）：**光"传前端"不够，还得保证传的是"这一版"前端**。
+#   实录：本地先 `npm run build`、之后才 commit，于是 dist 内嵌指纹停在上一版（50f3594），
+#   后端用新 SHA（f78c74b）上线 → 用户立刻看到版本不一致横幅。旧脚本的
+#   `if [ ! -d web/dist ]` 分支写了"产物存在就原样上传"，所以**部署成功 ≠ 产物是新的**。
+#   现改为三道校验，任一不过即重建/中止，不再靠人记得"先提交再构建"：
+#     ① 产物不存在        → 构建
+#     ② 产物自称的 SHA ≠ 待部署 SHA（dist/BUILD_COMMIT，由 vite closeBundle 落盘）→ 强制重建
+#     ③ 构建完仍不相等（git 不可用会退化成 'dev'）→ 中止，绝不把漂移的前端传上去
 echo "[2c/5] 同步前端 web/dist 到 $DEPLOY_DIR/web ..."
+DIST_SHA_FILE="web/dist/BUILD_COMMIT"
+dist_sha() { [ -f "$DIST_SHA_FILE" ] && tr -d '\r\n' < "$DIST_SHA_FILE" || echo ""; }
+
+NEED_BUILD=0
 if [ ! -d web/dist ]; then
-  echo "  web/dist 不存在，先构建前端 (web npm run build)..."
+  echo "  web/dist 不存在，先构建前端..."
+  NEED_BUILD=1
+else
+  ds="$(dist_sha)"
+  if [ "$ds" != "$GIT_SHA" ]; then
+    echo "  [!] 前端产物陈旧：dist/BUILD_COMMIT='${ds:-缺失}' ≠ 待部署 '${GIT_SHA}' → 强制重建"
+    echo "      （这正是「前端与服务器版本不一致」横幅的成因：先 build 后 commit）"
+    NEED_BUILD=1
+  fi
+fi
+if [ "$NEED_BUILD" = "1" ]; then
   ( cd web && { npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund >/dev/null 2>&1; } && npm run build )
 fi
+
 if [ -d web/dist ]; then
+  ds="$(dist_sha)"
+  if [ "$GIT_SHA" != "unknown" ] && [ "$ds" != "$GIT_SHA" ]; then
+    echo "  X 前端产物指纹 '${ds:-缺失}' 与待部署 '${GIT_SHA}' 不一致，中止部署。"
+    echo "    这会让线上前端与后端指纹不符，用户端必然出现版本不一致横幅。"
+    echo "    排查：web/vite.config.js 的 buildCommit() 是否拿不到 git（回退 'dev'）。"
+    exit 1
+  fi
+  echo "  OK 前端指纹校验通过（BUILD_COMMIT=$ds）"
   $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path ${DEPLOY_DIR}/web | Out-Null\""
   tar -czf /tmp/webdist.tgz -C web/dist .
   $SCP /tmp/webdist.tgz "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/webdist.tgz"
   $SSH "powershell -NoProfile -Command \"tar -xzf ${DEPLOY_DIR}/webdist.tgz -C ${DEPLOY_DIR}/web; Remove-Item -Force ${DEPLOY_DIR}/webdist.tgz; Get-ChildItem -Path ${DEPLOY_DIR}/web -Recurse -Filter '._*' | Remove-Item -Force -ErrorAction SilentlyContinue\""
   rm -f /tmp/webdist.tgz
-  echo "  OK 前端已同步到 ${DEPLOY_DIR}/web"
+  echo "  OK 前端已同步到 $DEPLOY_DIR/web"
 else
   echo "  X web/dist 构建失败，跳过前端同步（其余部署照常进行）"
 fi

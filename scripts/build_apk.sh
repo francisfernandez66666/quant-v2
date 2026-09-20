@@ -68,6 +68,26 @@ EOF
 # ── 3. 前端构建 + 拷入 assets/ 根 ──
 echo "[3/5] 构建前端并拷入 assets/..."
 (cd "$APP_DIR/web" && npm run build >/dev/null)
+
+# §A7-B（2026-09-20 补）：打 APK 前先把"内嵌前端是哪一版"摆出来。
+# 装机后 App.jsx 会拿这个指纹与 /api/status 的 build_commit 比对，**不等即弹版本不一致横幅**；
+# 而横幅出现的常见原因就是"先 npm run build、之后才 commit"——包内嵌指纹停在上一版。
+# 这里让错误在打包时就暴露，而不是等用户装到手机上才看见横幅。
+MK="$APP_DIR/web/dist/BUILD_COMMIT"
+APK_SHA="$( [ -f "$MK" ] && tr -d '\r\n' < "$MK" || echo "" )"
+HEAD_SHA="$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+echo "      APK 内嵌前端指纹 = ${APK_SHA:-缺失}（本地 HEAD = $HEAD_SHA）"
+case "$APK_SHA" in
+  ""|dev|unknown)
+    echo "      [!] 指纹为哨兵值/缺失：不参与版本比对（不会弹横幅），但也就失去了漂移自检。" ;;
+  *)
+    if [ "$APK_SHA" != "$HEAD_SHA" ]; then
+      echo "      X APK 内嵌指纹与 HEAD 不一致 —— 装到手机后必然出现「前端与服务器版本不一致」横幅。"
+      echo "        请先提交代码、再重新运行本脚本（顺序：commit → build）。"
+      exit 1
+    fi ;;
+esac
+
 rm -rf "$APP_DIR/mobile/app/src/main/assets"
 mkdir -p "$APP_DIR/mobile/app/src/main/assets"
 cp -R "$APP_DIR/web/dist/." "$APP_DIR/mobile/app/src/main/assets/"

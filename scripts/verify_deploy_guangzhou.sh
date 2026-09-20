@@ -13,6 +13,8 @@
 #   2) 二进制指纹：quant.exe 内含期望的 git 短 SHA（buildCommit 漂移自检）
 #   3) 引擎：/setup → 200/404（存在即存活）；/api/status 未鉴权 → 401（鉴权面完好）
 #   4) 前端：GET :8080/ → 200（Caddy 静态资源）
+#   4b) 前端指纹（§A7-B，2026-09-20 补）：被服务的 index-*.js 内必须含期望 SHA
+#       —— 旧版只查首页 200，产物陈旧（先 build 后 commit）时 12/12 全绿却仍报版本不一致横幅
 #   5) 网关：/health ok:true；/settlement 未鉴权 → 401（§P0-1a 新端点路由已上线）
 #   6) 引擎新端点：POST /api/holdings/balance、/api/positions/execute 未鉴权 → 401
 #
@@ -87,6 +89,36 @@ Probe "engine:/api/status unauth=401" ($code -eq "401") ("got=" + $code)
 # 4) 前端（Caddy 静态）
 $code = HCode "GET" ("http://127.0.0.1:" + $WebPort + "/")
 Probe "web:/" ($code -eq "200") ("got=" + $code)
+
+# 4b) §A7-B 前端指纹（2026-09-20 补）：**线上实际服务的那个 bundle 必须内嵌待部署 SHA**。
+#
+# 为什么单列一条探针（旧版只查首页 200，12/12 全绿也照样漏掉版本漂移横幅）：
+# 用户端的「前端与服务器版本不一致」判定是 App.jsx 用 bundle 内嵌的 __BUILD_COMMIT__
+# 与 /api/status 的 build_commit **严格不等即告警**。所以"前端传上去了"不等于"传的是这一版"——
+# 实录：本地先 npm run build、之后才 commit，dist 内嵌指纹停在上一版，后端换新 SHA 上线，
+# 横幅立刻出现，而旧探针全绿（2026-09-20 两次）。
+# 这里直接在被服务的 assets 里找期望 SHA：找不到即真实漂移，与用户看到的横幅一一对应。
+$webRoot = "C:\opt\quant\web"
+$idxHtml = Join-Path $webRoot "index.html"
+$hit = $false
+$detail = ""
+if (Test-Path $idxHtml) {
+    $m = [regex]::Match((Get-Content $idxHtml -Raw), 'assets/index-[A-Za-z0-9_\-]+\.js')
+    if ($m.Success) {
+        $chunk = Join-Path $webRoot $m.Value
+        if (Test-Path $chunk) {
+            $hit = (Select-String -Path $chunk -Pattern $Commit -Quiet -ErrorAction SilentlyContinue) -eq $true
+            $detail = "index.html->" + $m.Value + " 内" + $(if ($hit) { "含" } else { "不含" }) + " " + $Commit
+        } else {
+            $detail = "index.html 引用的 " + $m.Value + " 在站点根不存在"
+        }
+    } else {
+        $detail = "index.html 里找不到 assets/index-*.js 引用"
+    }
+} else {
+    $detail = ($webRoot + "\index.html 不存在")
+}
+Probe ("web:fingerprint:" + $Commit) $hit $detail
 
 # 5) 网关：/health + §P0-1a /settlement 新端点路由
 try {
