@@ -14,6 +14,7 @@ package data
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -349,14 +350,77 @@ func (tc *THSClient) getTopBoardPage(url string) ([]SectorInfo, error) {
 	return out, nil
 }
 
+// 同花顺 v6 K 线 scale 码（全表实测钉死 2026-09-20，样本 300489，穷举 00..99）。
+// 有效（每档另有 +1/+2 别名，含义相同）：
+//
+//	0x=日线  1x=周线  2x=月线  3x=5分钟  4x=30分钟  5x=60分钟  6x=1分钟
+//	7x=日线快照(带时间戳)  8x=年线  9x=季线
+//
+// 无效（上游 404）：x3..x9 全部。**无 15 分钟档**。
+// THS v6 K-line scale codes, exhaustively measured 2026-09-20 over 00..99 (each has +1/+2 aliases).
+// There is no 15-minute scale.
+const (
+	thsScaleDaily  = "01" // 日线
+	thsScaleOneMin = "60" // 1 分钟
+	thsScale5Min   = "30" // 5 分钟
+	thsScale30Min  = "40" // 30 分钟
+	thsScale60Min  = "50" // 60 分钟
+)
+
+// ErrTHSUnsupportedPeriod 表示"该周期同花顺不提供"——**客户端能力缺失**，不是供应商故障。
+// §修复 THS-BREAKER(20260920)：调用方必须用 errors.Is 区分出来并**跳过熔断**，
+// 否则一个 15 分钟周期请求就会把同花顺整源按"故障"关掉 60s（连带报价/板块一起失效）。
+// English: unsupported period is a client-side capability miss, NOT a provider outage;
+// callers must detect it via errors.Is and must NOT trip the breaker.
+var ErrTHSUnsupportedPeriod = errors.New("ths: unsupported intraday period")
+
+// thsIntradayScale 把"分钟周期"映射为同花顺 scale 码；不支持的周期返回 false。
+// §2026-09-20：不支持的周期必须让调用方降级，**绝不拿别的周期顶替**——
+// 5 分钟 MACD 与 1 分钟 MACD 数值完全不同，静默替换等于给出错误指标。
+// thsIntradayScale maps a period in minutes to the THS scale code; unsupported periods
+// return false so the caller degrades instead of silently substituting another period.
+func thsIntradayScale(minutes int) (string, bool) {
+	switch minutes {
+	case 1:
+		return thsScaleOneMin, true
+	case 5:
+		return thsScale5Min, true
+	case 30:
+		return thsScale30Min, true
+	case 60:
+		return thsScale60Min, true
+	}
+	return "", false
+}
+
+// thsRealheadURL 同花顺 realhead 实时行情 URL。
+// §修复 THS-URL(20260920)：真实路径为 hs_{6 位代码}，**不带市场前缀**。
+// 旧实现经 thsSecID 生成 hs_0.300489 / hs_1.600519 → 上游一律 404（实测 2026-09-20），
+// 这个"同花顺兜底"因此从未真正生效（且失败后还会触发 60s 熔断，把后续尝试一并挡掉）。
+// thsRealheadURL builds the THS realhead quote URL: hs_{code} with no market prefix.
+// The old build produced hs_{marketid}.{code}, which upstream answers with 404, so this
+// fallback source never actually worked.
+func thsRealheadURL(code string) string {
+	return fmt.Sprintf("https://d.10jqka.com.cn/v2/realhead/hs_%s/last.js", stripSuffix(strings.TrimSpace(code)))
+}
+
+// thsLineURL 同花顺 v6 K 线 URL（scale 见下表）。
+// §修复 THS-URL(20260920)：与 realhead 同病——路径用 hs_{6 位代码}，带市场前缀会 404/504。
+// 实测 scale 语义（2026-09-20，300489）：01/00=日线 10=周线 20=月线 40=30分钟 50=60分钟
+// 60=1分钟；03/04/06/11/12/13/15 上游返回 502（无效值）。
+// thsLineURL builds the THS v6 K-line URL. Measured scale codes (2026-09-20): 01/00 daily,
+// 10 weekly, 20 monthly, 40 30-min, 50 60-min, 60 1-min; 03/04/06/11/12/13/15 return 502.
+func thsLineURL(code, scale string) string {
+	return fmt.Sprintf("https://d.10jqka.com.cn/v6/line/hs_%s/%s/last.js", stripSuffix(strings.TrimSpace(code)), scale)
+}
+
 // GetQuote 获取同花顺实时行情。
-// code 为股票代码（如 "600519"），自动处理沪/深前缀。
-// GetQuote fetches a THS realtime quote for a code like "600519",
-// automatically handling the exchange prefix.
+// code 为股票代码（如 "600519"，可带 .SH/.SZ 后缀，内部剥离）。
+// GetQuote fetches a THS realtime quote for a code like "600519"
+// (an exchange suffix is stripped internally).
 func (tc *THSClient) GetQuote(code string) (*StockInfo, error) {
-	code = strings.TrimSpace(code)
-	secID := thsSecID(code)
-	url := fmt.Sprintf("https://d.10jqka.com.cn/v2/realhead/hs_%s/last.js", secID)
+	code = stripSuffix(strings.TrimSpace(code))
+	url := thsRealheadURL(code)
 
 	THSLimiter.Wait()
 	resp, err := tc.getWithHeaders(url)
@@ -373,67 +437,107 @@ func (tc *THSClient) GetQuote(code string) (*StockInfo, error) {
 	return parseTHSQuote(body, code)
 }
 
-// thsSecID 将股票代码转换为同花顺证券 ID 格式。
-// 沪市（6/5 开头）加 "1." 前缀，深市加 "0." 前缀。
-// thsSecID converts a stock code to the THS security-id format:
-// "1." prefix for Shanghai (6/5), "0." for Shenzhen.
-func thsSecID(code string) string {
-	if strings.HasPrefix(code, "6") || strings.HasPrefix(code, "5") {
-		return "1." + code
+// thsLineRowFields 同花顺 K 线单行的最小字段数。
+// 实测行形如：20260302,43.45,43.72,42.55,42.68,2660990,114529247.00,1.940,,0.00,0
+// 即 [日期,开,高,低,收,成交量(股),成交额(元),换手率(%),…] 共 11 列；取前 7 列即足够。
+// thsLineRowFields is the minimum column count of one THS K-line row.
+const thsLineRowFields = 7
+
+// thsSplitLineRows 从 K 线响应的 data 字段取出逐行字符串。
+// §实测（2026-09-20）：data 为单条 JSON **字符串**，行间以 ";" 分隔、行内以 "," 分隔。
+// 为兼容上游改型，同时接受 JSON 数组形态；两种都拿不到行时返回错误（调用方降级）。
+// thsSplitLineRows extracts the per-row strings from the K-line `data` field: in practice a
+// single JSON string with ";" between rows (a JSON array is also tolerated).
+func thsSplitLineRows(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("ths kline: data missing")
 	}
-	return "0." + code
+	// 主形态：JSON 字符串 → 按 ";" 切行。
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		rows := make([]string, 0, 256)
+		for _, line := range strings.Split(s, ";") {
+			if line = strings.TrimSpace(line); line != "" {
+				rows = append(rows, line)
+			}
+		}
+		if len(rows) == 0 {
+			return nil, fmt.Errorf("ths kline: data empty")
+		}
+		return rows, nil
+	}
+	// 兼容形态：JSON 数组。
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+		return arr, nil
+	}
+	return nil, fmt.Errorf("ths kline: data not parseable")
+}
+
+// parseTHSLineTime 解析同花顺 K 线的时间列。
+// 实测格式：日/周/月线为 `20060102`；分钟线（scale 40/50/60）为 `200601021504`（12 位）。
+// 两种都按中国时区 cst 解析，与东财/新浪口径一致，消灭 8 小时错位。
+// parseTHSLineTime parses the THS K-line time column (daily: yyyyMMdd; intraday:
+// yyyyMMddHHmm), always in China Standard Time to match the EastMoney/Sina convention.
+func parseTHSLineTime(col string, isMinute bool) (time.Time, bool) {
+	col = strings.TrimSpace(col)
+	// 先按含连字符的宽松格式试一次，再看是否分钟级长格式。
+	for _, layout := range []string{"2006-01-02 15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, col, cst); err == nil {
+			return t, true
+		}
+	}
+	if isMinute {
+		for _, layout := range []string{"200601021504", "20060102150405"} {
+			if t, err := time.ParseInLocation(layout, col, cst); err == nil {
+				return t, true
+			}
+		}
+	}
+	if t, err := time.ParseInLocation("20060102", col, cst); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 // parseTHSLine 解析同花顺 K 线 JSONP 响应。
-// 响应为 `quotebridge_v6_line_..._last({...})` 联牌格式，内部 data 为 K 线 CSV 字符串数组
-// （行内字段同东财：[date,open,high,low,close,volume,amount]）。
-// 采用松散提取：先剥 JSONP 括号，再取 data 数组，逐行严格校验数值，脏行直接跳过，
-// 无有效行时返回错误（调用方据此降级到下一源）。isMinute 为 true 时时间含 "HH:MM"。
-// parseTHSLine parses a THS JSONP K-line response, loosely unwrapping the JSONP
-// wrapper and validating each row; dirty rows are skipped and an error is returned
-// when no valid rows remain so callers can degrade to the next source.
+// 响应为 `quotebridge_v6_line_hs_{code}_{scale}_last({...})` 联牌格式。
+// §修复 THS-KLINE(20260920)：真实 `data` 是**以 ";" 分隔的单条字符串**（不是 JSON 数组），
+// 旧实现按 `[]string` 反序列化 → 恒定报 "no data"，同花顺 K 线降级源因此从未生效。
+// 逐行严格校验数值，脏行直接跳过，无有效行时返回错误（调用方据此降级到下一源）。
+// 时间格式：日/周/月线为 `yyyyMMdd`；分钟线为 `yyyyMMddHHmm`（实测 scale 60 即此形）。
+// parseTHSLine parses a THS JSONP K-line response. The real payload's `data` is a single
+// ";"-separated string, not a JSON array — the old `[]string` unmarshal therefore always
+// failed, so this THS K-line fallback never actually worked.
 func parseTHSLine(body []byte, isMinute bool) ([]KLine, error) {
 	text := strings.TrimSpace(string(body))
-	// 剥 JSONP 包裹：e.g. quotebridge_v6_line_hs_1.600206_01_last({...})
+	// 剥 JSONP 包裹：e.g. quotebridge_v6_line_hs_300489_01_last({...})
 	if i := strings.Index(text, "("); i >= 0 {
 		text = text[i+1:]
 	}
 	if i := strings.LastIndex(text, ")"); i >= 0 {
 		text = text[:i]
 	}
+	// data 兼容两种形态：主形态为字符串（真实现状），另容忍数组（上游若改型不至于整源失能）。
 	var wrapper struct {
-		Data []string `json:"data"`
+		Data json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal([]byte(text), &wrapper); err != nil || len(wrapper.Data) == 0 {
-		return nil, fmt.Errorf("ths kline json: no data")
+	if err := json.Unmarshal([]byte(text), &wrapper); err != nil {
+		return nil, fmt.Errorf("ths kline json: %v", err)
 	}
-	klines := make([]KLine, 0, len(wrapper.Data))
-	for _, line := range wrapper.Data {
+	rows, err := thsSplitLineRows(wrapper.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	klines := make([]KLine, 0, len(rows))
+	for _, line := range rows {
 		parts := strings.Split(line, ",")
-		if len(parts) < 7 {
+		if len(parts) < thsLineRowFields {
 			continue
 		}
-		var t time.Time
-		var err error
-		if isMinute {
-			if len(parts[0]) >= 15 {
-				// "yyyyMMddHHmmss" 或 "yyyyMMdd HH:MM"，统一按中国时区 cst 解析。
-				t, err = time.ParseInLocation("20060102150405", parts[0], cst)
-				if err != nil {
-					t, err = time.ParseInLocation("20060102 15:04", parts[0], cst)
-				}
-			} else {
-				// 分钟级别短格式仍按中国时区 cst 解析，消灭 8 小时错位。
-				t, err = time.ParseInLocation("2006-01-02", parts[0], cst)
-			}
-		} else {
-			// 日线按中国时区 cst 解析，与东财/新浪K线口径一致。
-			t, err = time.ParseInLocation("2006-01-02", parts[0], cst)
-			if err != nil {
-				t, err = time.ParseInLocation("20060102", parts[0], cst)
-			}
-		}
-		if err != nil {
+		t, ok := parseTHSLineTime(parts[0], isMinute)
+		if !ok {
 			continue
 		}
 		open := toFloat64(parts[1])
@@ -464,11 +568,12 @@ func parseTHSLine(body []byte, isMinute bool) ([]KLine, error) {
 }
 
 // GetTHSKLine 获取同花顺日 K 线（best-effort，作为降级链第二源）。
-// 走 d.10jqka.com.cn/v6/line/hs_{secid}/01/last.js。解析失败/空返回错误，由上层降级。
+// 走 d.10jqka.com.cn/v6/line/hs_{code}/01/last.js（scale 01=日线）。
+// 解析失败/空返回错误，由上层降级。
 // GetTHSKLine fetches THS daily K-lines (best-effort, second source in the chain);
 // parse failures/empty results return errors so the caller can fall back.
 func (tc *THSClient) GetTHSKLine(code string) ([]KLine, error) {
-	url := fmt.Sprintf("https://d.10jqka.com.cn/v6/line/hs_%s/01/last.js", thsSecID(code))
+	url := thsLineURL(code, thsScaleDaily)
 	THSLimiter.Wait()
 	resp, err := tc.getWithHeaders(url)
 	if err != nil {
@@ -482,12 +587,21 @@ func (tc *THSClient) GetTHSKLine(code string) ([]KLine, error) {
 	return parseTHSLine(body, false)
 }
 
-// GetTHSMinuteKLine 获取同花顺分钟 K 线（best-effort，作为降级链第二源）。
-// 走 d.10jqka.com.cn/v6/line/hs_{secid}/06/last.js（06=分钟线）。
-// GetTHSMinuteKLine fetches THS minute K-lines (best-effort second source)
-// via the 06 (minute) endpoint.
-func (tc *THSClient) GetTHSMinuteKLine(code string) ([]KLine, error) {
-	url := fmt.Sprintf("https://d.10jqka.com.cn/v6/line/hs_%s/06/last.js", thsSecID(code))
+// GetTHSMinuteKLine 获取同花顺分钟 K 线（best-effort，作为降级链中段源）。
+// scale 为**分钟周期**（1/5/30/60），内部映射到同花顺 scale 码；不支持的周期（如 15）
+// 直接返回错误由调用方降级——宁可降级到别的源，也不拿不匹配的周期冒充。
+// §修复 THS-KLINE(20260920)：旧实现写死 scale 06（上游 404/502 的无效值）且忽略调用方周期，
+// 该源从未生效；同时它若"修好"成固定取 1 分钟，会被误当 5 分钟喂给 MACD —— 故一并接入周期映射。
+// GetTHSMinuteKLine fetches THS minute K-lines; scale is a period in MINUTES (1/5/30/60) mapped
+// to THS scale codes internally. Unsupported periods error out so the caller degrades rather
+// than substituting a mismatched period.
+func (tc *THSClient) GetTHSMinuteKLine(code string, scale int) ([]KLine, error) {
+	sc, ok := thsIntradayScale(scale)
+	if !ok {
+		// 包一层 sentinel：调用方据此判定"客户端能力缺失"，不得按供应商故障熔断。
+		return nil, fmt.Errorf("%w: %d 分钟（支持 1/5/30/60）", ErrTHSUnsupportedPeriod, scale)
+	}
+	url := thsLineURL(code, sc)
 	THSLimiter.Wait()
 	resp, err := tc.getWithHeaders(url)
 	if err != nil {
@@ -501,124 +615,104 @@ func (tc *THSClient) GetTHSMinuteKLine(code string) ([]KLine, error) {
 	return parseTHSLine(body, true)
 }
 
-// thsQuoteRaw 同花顺行情 JSON 响应结构（备用，实际解析用更松散的 []interface{}）。
-// thsQuoteRaw is the typed form of the THS quote response (backup; actual parsing
-// uses a looser []interface{} form).
-type thsQuoteRaw struct {
-	Items map[string]struct {
-		Code      string  `json:"code"`       // 股票代码
-		Name      string  `json:"name"`       // 股票名称
-		Price     float64 `json:"price"`      // 最新价
-		High      float64 `json:"high"`       // 最高价
-		Low       float64 `json:"low"`        // 最低价
-		Open      float64 `json:"open"`       // 开盘价
-		Volume    float64 `json:"volume"`     // 成交量
-		Amount    float64 `json:"amount"`     // 成交额
-		ChangePct float64 `json:"change_pct"` // 涨跌幅（%）
-	} `json:"items"` // 代码 → 行情
-}
+// 同花顺 realhead 字段 id。
+// §实测钉死（2026-09-20）：300489 与 600519 两只样本的 14 个字段与腾讯行情逐项交叉验证一致
+// （现价/昨收/今开/最高/最低/成交量/成交额/涨跌幅/换手率/涨跌额/振幅/流通市值/总市值/量比）。
+// 注意：这些是**同花顺自有的无规律数字 id**，不是位序数组下标——旧解析器按位序读，因而恒失败。
+// THS realhead field ids, verified 2026-09-20 against Tencent quotes on two independent samples.
+// These are THS-specific opaque numeric ids, NOT positional array indexes.
+const (
+	thsFCode      = "5"       // 6 位证券代码
+	thsFPrevClose = "6"       // 昨收（元）
+	thsFOpen      = "7"       // 今开（元）
+	thsFHigh      = "8"       // 最高（元）
+	thsFLow       = "9"       // 最低（元）
+	thsFPrice     = "10"      // 现价（元）
+	thsFVolume    = "13"      // 成交量（股）
+	thsFAmount    = "19"      // 成交额（元）
+	thsFChangePct = "199112"  // 涨跌幅（%）
+	thsFTurnover  = "1968584" // 换手率（%）
+	thsFName      = "name"    // 证券名称
+)
 
-// parseTHSQuote 解析同花顺实时行情响应体。
-// 响应格式为 JavaScript 填充 JSON（JSONP），需先提取 {} 部分再反序列化。
-// 数据以 map[string][]interface{} 形式返回，按数组索引读取各字段。
-// parseTHSQuote parses the THS realtime quote response (JSONP): it extracts the
-// {} object and reads fields from each symbol's array by index.
+// parseTHSQuote 解析同花顺 realhead 实时行情响应体。
+// 响应为 JSONP（quotebridge_v2_realhead_hs_{code}_last({...})），需先剥壳。
+// §修复 THS-QUOTE(20260920)：真实结构是顶层 {"items":{"<字段id>": <值>, ...}}——
+// 即"单个证券的字段 id → 值"扁平字典（值为字符串），**不是** data.items 下按证券 id 索引的
+// 位置数组。旧解析器按后者写（夹具也按后者造），故线上恒定报 "no data"，
+// 同花顺报价源其实一直没工作过；而换手率正是靠这个源才能在东财以外拿到。
+// parseTHSQuote parses the THS realhead JSONP payload. The real shape is a top-level
+// {"items":{"<field id>":<value>}} flat dict for the single requested security — not a
+// data.items map of positional arrays (what the old parser and the fixture both assumed).
 func parseTHSQuote(body []byte, code string) (*StockInfo, error) {
+	// 剥 JSONP 包裹：quotebridge_v2_realhead_hs_300489_last({...})
 	text := string(body)
-	idx := strings.Index(text, "{")
-	if idx < 0 {
+	if i := strings.Index(text, "{"); i >= 0 {
+		text = text[i:]
+	} else {
 		return nil, fmt.Errorf("ths: no json in response")
 	}
-	text = text[idx:]
-	idx = strings.LastIndex(text, "}")
-	if idx < 0 {
+	if j := strings.LastIndex(text, "}"); j >= 0 {
+		text = text[:j+1]
+	} else {
 		return nil, fmt.Errorf("ths: no closing brace")
 	}
-	text = text[:idx+1]
 
 	var raw struct {
-		Data struct {
-			Items map[string][]interface{} `json:"items"` // 个股数组，key 为证券ID
-		} `json:"data"`
+		Items map[string]interface{} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {
 		return nil, fmt.Errorf("ths json: %v", err)
 	}
-
-	// items 以证券 ID 为 key、值为字段数组：长度不足 10 项（列缺失）或代码空串的
-	// 脏条目先跳过，再进入下面的代码前缀清理与越界防御。
-	for _, arr := range raw.Data.Items {
-		if len(arr) < 10 {
-			continue
-		}
-		c, _ := arr[1].(string)
-		if c == "" {
-			continue
-		}
-		// 清理代码前缀："hs_1.600519" → "600519"
-		c = strings.TrimPrefix(c, "hs_")
-		c = strings.ReplaceAll(c, "1.", "")
-		c = strings.ReplaceAll(c, "0.", "")
-		// §R3-2 P0-D4 越界防御：清理后不足 6 位（脏数据/上游格式变化）直接跳过，
-		// 此前 c[len(c)-6:] 对短串会 slice bounds out of range panic 杀死整轮解析。
-		if len(c) < 6 {
-			continue
-		}
-		if !strings.HasSuffix(code, c[len(c)-6:]) {
-			continue
-		}
-		si := &StockInfo{
-			Code: code,
-		}
-		// 数组索引约定：[..., code, name, open, high, low, price, volume, amount, ...]
-		if len(arr) > 2 {
-			si.Name, _ = arr[2].(string)
-		}
-		if len(arr) > 3 {
-			if v, ok := arr[3].(float64); ok {
-				si.Open = v
-			}
-		}
-		if len(arr) > 4 {
-			if v, ok := arr[4].(float64); ok {
-				si.High = v
-			}
-		}
-		if len(arr) > 5 {
-			if v, ok := arr[5].(float64); ok {
-				si.Low = v
-			}
-		}
-		if len(arr) > 6 {
-			if v, ok := arr[6].(float64); ok {
-				si.Price = v
-			}
-		}
-		if len(arr) > 7 {
-			if v, ok := arr[7].(float64); ok {
-				si.Volume = v
-			}
-		}
-		if len(arr) > 8 {
-			if v, ok := arr[8].(float64); ok {
-				si.Amount = v
-			}
-		}
-		// 昨收（同花顺 realhead 数组中多数版本位于索引 9）：
-		// 仅在确实存在且数值合理时用于推算涨跌幅，避免猜测错误索引污染现有字段。
-		if len(arr) > 9 {
-			if v, ok := arr[9].(float64); ok && v > 0 && si.Price > 0 {
-				ratio := si.Price / v
-				if ratio > 0.5 && ratio < 5 {
-					si.Close = v
-					si.ChangePct = (si.Price - v) / v * 100
-				}
-			}
-		}
-		if si.Price > 0 {
-			return si, nil
-		}
+	if len(raw.Items) == 0 {
+		return nil, fmt.Errorf("ths: no items for %s", code)
 	}
 
-	return nil, fmt.Errorf("ths: no data for %s", code)
+	// 取值辅助：字段值实际为字符串，但容忍上游改回数值型。
+	num := func(id string) float64 {
+		switch v := raw.Items[id].(type) {
+		case string:
+			return toFloat64(v)
+		case float64:
+			return v
+		}
+		return 0
+	}
+	str := func(id string) string {
+		s, _ := raw.Items[id].(string)
+		return s
+	}
+
+	// 代码交叉校验：代码由 URL 决定，响应自称不一致（含**缺失**）说明上游串号或改了形状 ——
+	// 一律报错交给上层降级。绝不把别人的价格当成这只票的（错而不报比取不到危险得多）；
+	// 字段 5 在实测样本中恒定存在，缺失即视为上游改形，宁可失能也不要静默错值。
+	// 用 HasSuffix 而非等值比较：兼容传入 "600519.SH" 这类带后缀形式，且不会按长度切片。
+	respCode := str(thsFCode)
+	if respCode == "" || !strings.HasSuffix(code, respCode) {
+		return nil, fmt.Errorf("ths: code mismatch (want %s, got %q)", code, respCode)
+	}
+	price := num(thsFPrice)
+	if price <= 0 {
+		return nil, fmt.Errorf("ths: no data for %s (price missing)", code)
+	}
+
+	si := &StockInfo{
+		Code:      code,
+		Name:      str(thsFName),
+		Price:     price,
+		Open:      num(thsFOpen),
+		High:      num(thsFHigh),
+		Low:       num(thsFLow),
+		Close:     num(thsFPrevClose),
+		PrevClose: num(thsFPrevClose), // 显式昨收（字段 6）
+		Volume:    num(thsFVolume),    // 已为股，与新浪/东财口径一致
+		Amount:    num(thsFAmount),    // 已为元
+		Turnover:  num(thsFTurnover),  // 换手率（%）——新浪无此字段，此源可补
+		ChangePct: num(thsFChangePct),
+	}
+	// 涨跌幅字段缺失时才用昨收推算；字段存在则以字段为准，避免口径分歧。
+	if _, ok := raw.Items[thsFChangePct]; !ok && si.PrevClose > 0 {
+		si.ChangePct = (si.Price - si.PrevClose) / si.PrevClose * 100
+	}
+	return si, nil
 }

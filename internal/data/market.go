@@ -113,6 +113,12 @@ type MarketAPI struct {
 
 	emBreakerMu sync.Mutex            // 保护东财熔断计数器的读写
 	emBreakers  map[string]*emBreaker // 按接口路径(scope)隔离的熔断器，避免单接口故障拖垮其他接口
+
+	// ths consult 行情链的首选源（同花顺 realhead，免费口且自带换手率）。
+	// §2026-09-20：可选注入（未注入=nil 时自动跳过该步，链退化为新浪→腾讯→东财），
+	// 仅被 GetRealtimeQuoteWithFlow 使用；主循环高频路径不受影响。
+	// Optional THS client used only by the consult quote chain (nil degrades gracefully).
+	ths *THSClient
 }
 
 // emBreaker 单接口熔断器状态：记录该接口连续失败次数与熔断到期时间。
@@ -260,15 +266,24 @@ const (
 
 // emFailoverPaths 允许故障转移到镜像的 push2 路径白名单。
 // §修复 EM-MIRROR(20260920)：镜像只对 stock/get 与 clist/get 返回真实数据；
-// stock/kline/get 与 stock/fflow/kline/get 在镜像上返回 HTTP 200 + rc:102 + data:null，
-// 若一并纳入转移，"HTTP 成功但无数据"会顶掉上层既有的同花顺/新浪第二源降级（更差形态），
-// 故显式排除——这两个接口在主站不可达时仍走原有降级链。
-// English: paths allowed to fail over. The mirror only serves stock/get and clist/get; kline and
-// fflow return rc:102 + data:null there, and counting that as success would suppress the existing
-// THS/Sina second-source fallback, so they are excluded on purpose.
+// stock/kline/get 在镜像上返回 HTTP 200 + rc:102 + data:null，若纳入转移会"HTTP 成功但无数据"
+// 并顶掉上层既有的同花顺/新浪第二源降级（更差形态），故显式排除，该接口在主站不可达时走原降级链。
+//
+// §修复 EM-FFLOW(20260920) —— 与既有方案的偏差声明：
+//   - 上一版把 stock/fflow/kline/get 也一并排除，依据是"镜像对它同样返回 rc:102+data:null"。
+//     该结论**基于不完整的探测**：当时请求 URL 缺 `klt`/`lmt` 两个必填参数。
+//     实测（2026-09-20）补上 klt=1&lmt=0 后镜像返回 rc:0 且 klines 完整（300489 当日 09:31~15:00 全量）。
+//   - 因此 fflow **可以且应当**转移：它是资金流的口径基准，排除它等于让 GetStockMoneyFlow
+//     在主站不可达时恒定失败（实测：主力净流入因此长期缺失、资金明细整行不出）。
+//   - kline 仍排除（未发现可用的补偿参数，行为与上述结论一致）。
+//
+// English: paths allowed to fail over. The previous revision also excluded fflow, based on a probe
+// that omitted the REQUIRED klt/lmt params; with them the mirror serves fflow correctly, so fflow is
+// allowed to fail over now. kline stays excluded.
 var emFailoverPaths = map[string]bool{
-	"/api/qt/stock/get": true,
-	"/api/qt/clist/get": true,
+	"/api/qt/stock/get":             true,
+	"/api/qt/clist/get":             true,
+	"/api/qt/stock/fflow/kline/get": true,
 }
 
 // emMirrorMaxPageSize 镜像对 clist 的 pz 硬性封顶（实测 2026-09-20：pz=10000 仍只返回 100 条，
@@ -281,7 +296,26 @@ var emFailoverPaths = map[string]bool{
 // GetSectorList (pz=500) — wrong-but-silent is worse than unavailable-and-fallback. clist therefore
 // fails over only when pz <= 100, which covers the PE single query (pz=1) and sector constituents
 // (GetSectorStocks, topN <= 100) — exactly the calls the mirror can serve in full.
+//
+// §修复 EM-SECTOR-PAGE(20260920)：板块列表**不走**这条转移规则（pz=500 超出门槛），
+// 而是走 `getSectorListFromMirror` 的**显式分页**——门槛本身不动，
+// 因为它的语义是"单页请求不得顶替全量"，分页则是明着把全量取回来。两条路不冲突：
+// 门槛管"哪些单页请求可以转移"，分页管"多页请求怎么拼成全量"。
+// English: the sector list deliberately does NOT use this rule; it uses explicit pagination
+// (getSectorListFromMirror) instead. The guard stays untouched — it governs which single-page
+// requests may fail over, while pagination is how the full list gets fetched.
 const emMirrorMaxPageSize = 100
+
+// emSectorListPrimaryPageSize 主站单次取全板块列表的页大小（约 496 个板块，一次取全留足余量）。
+// English: page size for the primary-host single-call sector list (~496 boards).
+const emSectorListPrimaryPageSize = 500
+
+// emSectorListMaxPages 镜像分页页数硬顶。
+// 按实测 496/100 = 5 页，留一倍余量；上游 total 异常时宁可报错也不做无界请求
+// （见 getSectorListFromMirror）。
+// English: hard cap on mirror pagination pages (496/100 = 5 measured; 2x headroom). An anomalous
+// upstream total must produce an error, never unbounded requests.
+const emSectorListMaxPages = 12
 
 // emFailoverURLs 返回一个东财 URL 的候选请求序列：主域名在前、镜像兜底。
 // 非主域名、不在白名单路径、或 clist 分页超出镜像能力（pz > emMirrorMaxPageSize）时
@@ -588,30 +622,97 @@ func (m *MarketAPI) GetRealtimeQuote(code string) (*StockInfo, error) {
 }
 
 // GetRealtimeQuoteWithFlow 获取含主力净流入的实时行情（consult 手动路径专用）。
-// 与 GetRealtimeQuote 不同：主循环高频路径 §S4 走 新浪→腾讯→东财（东财末位兜底，降熔断冲击）；
-// 主力净流入优先东财 f62（东财优先），东财失败时用同花顺官方 capital-flow 快照补流（§ENH-2），
-// 再不行才落 新浪/腾讯（HasFlow=false）。consult 为低频用户操作，不构成东财压力。
-// 不走 quoteTTL 共享缓存（避免主循环缓存的新浪无净流入快照被复用），每次直连。
-// GetRealtimeQuoteWithFlow returns a quote with main-force net inflow, used by the consult manual path.
-// Unlike GetRealtimeQuote (S4: Sina→Tencent→EastMoney for the hot loop), NetInflow (f62) only exists on
-// EastMoney, so this consults EastMoney first (EastMoney→Sina→Tencent). Consult is low-frequency, so this
-// does not pressure EastMoney; it also bypasses the shared quoteTTL cache (a cached Sina snapshot lacks flow).
+// 行情链 §修复 QUOTE-CHAIN(20260920)（用户裁决「东财不行就用同花顺，东财兜底」）：
+//
+//	① 同花顺 realhead（首选：免费口，且是**唯一**带换手率的免费源）
+//	② 新浪 ③ 腾讯（无换手率，仅作可用性兜底）
+//	④ 东财（末位兜底，绝不作第一/主源）
+//
+// 之所以把东财从首位挪到末位：push2 主站不可达时旧链（东财优先）会一路落到新浪，
+// 而新浪/腾讯都没有换手率字段 → 咨询页换手率恒为 0 → 模型只能答"数据缺失"。
+// 净流入补数（见 §FLOW-ENRICH，只取流字段、绝不覆盖价/量/换手率）：
+// 走 GetStockMoneyFlow = 东财 fflow/kline（口径基准）→ 同花顺官方 hithink capital-flow
+// 快照（§ENH-2，需 HITHINK_FINANCE_API_KEY）。两者都拿不到时才沿用行情源自带的流值
+// （§修复 EM-F62-MIRROR(20260920)：东财行情腿的 f62 在镜像服务时已被标记为不可信，
+// 见 getEastMoneyQuote）；仍无流值则保持 HasFlow=false
+// （§FIX-9e 缺数语义：模型须答"数据源未返回"而不是编造 0）。
+// 不走 quoteTTL 共享缓存（避免复用主循环缓存的无换手率快照），每次直连。
+// GetRealtimeQuoteWithFlow returns a quote with main-force net inflow, used by the consult
+// manual path. Quote chain: THS → Sina → Tencent → EastMoney (EastMoney last). THS is the
+// only free source carrying turnover, which is why it leads. Net inflow is enriched separately
+// via GetStockMoneyFlow (EastMoney fflow first, hithink snapshot second) without touching
+// price/volume.
 func (m *MarketAPI) GetRealtimeQuoteWithFlow(code string) (*StockInfo, error) {
 	code = stripSuffix(code)
-	// 东财行情自带资金流，故优先东财；失败降级新浪/腾讯后用同花顺官方快照补流（§ENH-2）。
-	info, emErr := m.getEastMoneyQuote(code)
-	if emErr == nil {
-		return info, nil
+	var info *StockInfo
+	var errs []string
+
+	// ① 同花顺 realhead（首选）
+	if ths, terr := m.getTHSQuote(code); terr == nil && ths != nil && ths.Price > 0 {
+		info = ths
+	} else {
+		errs = append(errs, fmt.Sprintf("ths: %v", terr))
 	}
-	if sina, serr := m.GetSinaQuote(code); serr == nil {
-		m.enrichFlowFromHithink(sina)
-		return sina, nil
+
+	// ② 新浪
+	if info == nil {
+		if sina, serr := m.GetSinaQuote(code); serr == nil && sina != nil && sina.Price > 0 {
+			info = sina
+		} else {
+			errs = append(errs, fmt.Sprintf("sina: %v", serr))
+		}
 	}
-	if ten, terr := m.getTencentQuote(code); terr == nil {
-		m.enrichFlowFromHithink(ten)
-		return ten, nil
+
+	// ③ 腾讯
+	if info == nil {
+		if ten, terr := m.getTencentQuote(code); terr == nil && ten != nil && ten.Price > 0 {
+			info = ten
+		} else {
+			errs = append(errs, fmt.Sprintf("tencent: %v", terr))
+		}
 	}
-	return nil, fmt.Errorf("eastmoney: %v; sina/tencent unavailable", emErr)
+
+	// ④ 东财（末位兜底）
+	if info == nil {
+		if em, eerr := m.getEastMoneyQuote(code); eerr == nil && em != nil && em.Price > 0 {
+			info = em
+		} else {
+			errs = append(errs, fmt.Sprintf("eastmoney: %v", eerr))
+		}
+	}
+	if info == nil {
+		return nil, fmt.Errorf("所有行情源均失败 for %s: %s", code, strings.Join(errs, "; "))
+	}
+
+	// §FLOW-ENRICH：补主力净流入（只补流字段，绝不覆盖价/量/换手率）。
+	// §修复 EM-FFLOW(20260920)：口径基准是 fflow（GetStockMoneyFlow：东财 fflow → 同花顺官方快照），
+	// **不再**拿行情接口自带的 f62 当唯一来源——实测 2026-09-20 唯一可达的东财主机（delay 镜像）
+	// 对 stock/get 的 f62 恒定返回占位值 2（6 只样本全部为 2，真值应为 ±亿元量级），
+	// 据此展示等于长期输出"主力净流入 0.00万元"。仅当 fflow/hithink 都拿不到时，
+	// 才沿用行情源自带的流值（如东财行情命中且其 f62 可信时）。
+	quoteHasFlow := info.HasFlow
+	if cf, cerr := m.GetStockMoneyFlow(code); cerr == nil && cf != nil {
+		info.NetInflow, info.HasFlow = cf.NetInflow, true
+	} else if !quoteHasFlow {
+		// 两个可信来源都失败 → 老实报缺数（§FIX-9e：不得编造 0）。
+		info.NetInflow, info.HasFlow = 0, false
+	}
+	return info, nil
+}
+
+// getTHSQuote 取同花顺实时行情；未注入 THS 客户端时返回错误（调用方据此降级下一步）。
+// getTHSQuote fetches a THS quote; errors out when no client is injected so the chain degrades.
+func (m *MarketAPI) getTHSQuote(code string) (*StockInfo, error) {
+	if m.ths == nil {
+		return nil, fmt.Errorf("同花顺客户端未注入")
+	}
+	return m.ths.GetQuote(code)
+}
+
+// SetTHSClient 注入同花顺客户端（consult 行情链首选源）。传 nil 表示不启用该步。
+// SetTHSClient injects the THS client used as the consult quote chain's first source.
+func (m *MarketAPI) SetTHSClient(ths *THSClient) {
+	m.ths = ths
 }
 
 // enrichFlowFromHithink §ENH-2：新浪/腾讯快照本身无主力净流入字段（HasFlow=false），
@@ -628,6 +729,13 @@ func (m *MarketAPI) enrichFlowFromHithink(si *StockInfo) {
 	si.NetInflow = cf.NetInflow
 	si.HasFlow = true
 }
+
+// 注：原 enrichFlowFromEastMoney（用行情接口 f62 补流）已删除——§修复 EM-FFLOW(20260920)：
+// 唯一可达的东财主机（delay 镜像）对 stock/get 的 f62 恒返回占位值 2，据此补流等于写入错值。
+// 资金流统一改由 GetStockMoneyFlow（东财 fflow → 同花顺官方快照）提供，见 GetRealtimeQuoteWithFlow。
+// The old f62-based helper was removed: the only reachable EastMoney host returns a placeholder 2
+// for stock/get's f62, so filling flow from it wrote a wrong value. Flow now comes from
+// GetStockMoneyFlow (EastMoney fflow → official THS snapshot).
 
 // checkEastMoneyHealth 探测东财行情源是否可用。
 // （checkEastMoneyHealth probes whether the EastMoney data source is available.）
@@ -820,6 +928,17 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 		return nil, fmt.Errorf("eastmoney http: %v", err)
 	}
 	defer resp.Body.Close()
+	// §修复 EM-F62-MIRROR(20260920)：f62 可信度**按实际服务主机**判定。
+	// 实测 2026-09-20：唯一可达的镜像主机对 stock/get 的 f62 恒定返回占位值 2
+	// （6 只样本全部为 2，真值应为 ±亿元量级）；而**同一镜像**的 clist/get f62 返回真值
+	// （航空机场 92,713,920 等）——说明这是 stock/get 的**端点级**缺陷，不是供应商级。
+	// 因此只在地由**主站**服务时采信 f62；镜像服务时宁可不给流值（HasFlow=false），
+	// 也不把 2 元当"主力净流入"透出（错而不报比缺数更危险）。
+	// 注：无法识别服务主机时按"可信"处理（保持既有行为，仅测试构造的响应可能无 Request）。
+	f62Trusted := true
+	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.Host == emMirrorPush2Host {
+		f62Trusted = false
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("eastmoney read: %v", err)
@@ -870,7 +989,7 @@ func (m *MarketAPI) getEastMoneyQuote(code string) (*StockInfo, error) {
 		ChangePct: raw.Data.F170 / 100,
 		Turnover:  raw.Data.F168 / 100,
 	}
-	if raw.Data.F62 != nil {
+	if raw.Data.F62 != nil && f62Trusted {
 		si.NetInflow = *raw.Data.F62
 		si.HasFlow = true
 	}
@@ -896,28 +1015,157 @@ const sectorListFields = "f12,f14,f3,f20,f62,f104,f105,f184"
 // §R3-8 P1-L 分页截断修复：此前 pz=50 单页当全量用——东财行业板块约 86 个，
 // 板块扫描/热点评分/情绪面建立在残缺列表上且无任何告警。现 pz=500 一次取全，
 // 并在 total > 返回数时打警告日志（防御上游再变）。
-// English: R3-8 P1-L — the old pz=50 single page silently truncated the board list (~86
-// industry boards); now fetch pz=500 in one call and warn when total exceeds what came back.
+//
+// §修复 EM-SECTOR-PAGE(20260920)：主站不可达时**改走镜像显式分页**取全（见 getSectorListFromMirror）。
+// 此前主站一挂，东财板块列表就整表失败 → `GetSectors` 的"同花顺买结构 + 东财填行情"
+// 合并策略退化成只有同花顺（板块 net_inflow/涨停家数长期没有东财侧来源）。
+// 注意这里**没有**放宽 `emFailoverPaths` 的 `pz ≤ 100` 门槛：那次转移会把 496 个板块
+// 静默截断成 100 个（正是门槛要防的形态）；分页是**把"取全"这件事显式做掉**，
+// 而不是让单页请求去顶替全量。
+// English: R3-8 P1-L — pz=500 in one call, warn when total exceeds what came back.
+// EM-SECTOR-PAGE(20260920): when the primary host is down, fall back to EXPLICIT pagination on
+// the mirror rather than relaxing the pz<=100 failover guard (which would silently truncate 496
+// boards to 100). Pagination makes "fetch them all" explicit instead of letting one page stand in
+// for the whole list.
 func (m *MarketAPI) GetSectorList() ([]SectorInfo, error) {
-	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=500&fs=m:90+t:2&fields=%s", sectorListFields)
+	// ① 主站单次取全（pz=500）：与改造前完全一致，主站可用时行为零变化。
+	sectors, err := m.getSectorListPrimary()
+	if err == nil && len(sectors) > 0 {
+		return sectors, nil
+	}
+	// ② 主站不可达/空 → 镜像分页取全（镜像对 clist 的 pz 硬封顶 100，故必须翻页）。
+	mirror, merr := m.getSectorListFromMirror()
+	if merr != nil {
+		// 双路皆败：两段错误都带上，避免上层误标失败源。
+		return nil, fmt.Errorf("eastmoney sector list: 主站: %v; 镜像分页: %v", err, merr)
+	}
+	log.Printf("[market] 东财板块列表: 主站不可用，经镜像分页取回 %d 个板块", len(mirror))
+	return mirror, nil
+}
+
+// getSectorListPrimary 主站单页取全板块列表（pz=500）。
+// English: primary-host single-call sector list (pz=500).
+func (m *MarketAPI) getSectorListPrimary() ([]SectorInfo, error) {
+	url := fmt.Sprintf("https://%s/api/qt/clist/get?pn=1&pz=%d&fs=m:90+t:2&fields=%s",
+		emPrimaryPush2Host, emSectorListPrimaryPageSize, sectorListFields)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
-		return nil, fmt.Errorf("eastmoney sector list http: %v", err)
+		return nil, fmt.Errorf("http: %v", err)
 	}
 	log.Printf("eastmoney sector list status: %d", resp.StatusCode)
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("eastmoney sector list read: %v", err)
+		return nil, fmt.Errorf("read: %v", err)
 	}
 	sectors, err := parseSectorList(body)
-	if err == nil && len(sectors) > 0 {
-		if total := parseSectorListTotal(body); total > len(sectors) {
-			log.Printf("[market] 警告: 东财板块 total=%d 但仅取回 %d（分页参数需跟进）", total, len(sectors))
+	if err != nil {
+		return nil, fmt.Errorf("parse: %v", err)
+	}
+	if len(sectors) == 0 {
+		return nil, fmt.Errorf("空列表")
+	}
+	if total := parseSectorListTotal(body); total > len(sectors) {
+		log.Printf("[market] 警告: 东财板块 total=%d 但仅取回 %d（分页参数需跟进）", total, len(sectors))
+	}
+	return sectors, nil
+}
+
+// getSectorListFromMirror 经镜像**显式分页**取全板块列表。
+//
+// §修复 EM-SECTOR-PAGE(20260920) 实测依据（2026-09-20，本机直连镜像）：
+//
+//	pn=1  total=496 returned=100  BK0420 → BK1225
+//	pn=2  total=496 returned=100  BK1226 → BK1329
+//	pn=3  total=496 returned=100  BK1330 → BK1431
+//	pn=4  total=496 returned=100  BK1432 → BK1531
+//	pn=5  total=496 returned= 96  BK1532 → BK1627
+//	pn=6  rc=102  data:null（越界）
+//	→ 累计 496 条，**去重后仍 496，跨页零重复**，每页 total 恒为 496。
+//
+// 分页契约（本函数的核心不变量）：**要么返回完整全量，要么返回错误**。
+// 绝不把部分结果当完整列表返回——"静默截断"正是当初把 pz>100 排除在转移之外要防的形态，
+// 分页只是换了个地方取数，不能把该形态重新引入。
+// 另设页数硬顶 `emSectorListMaxPages`：上游 total 异常（如返回天文数字）时宁可报错，
+// 也不做无界请求。
+// English: explicit mirror pagination for the sector list. Contract: either the COMPLETE list or
+// an error — never a partial list presented as complete. Pages are capped so an anomalous upstream
+// `total` cannot trigger unbounded requests.
+func (m *MarketAPI) getSectorListFromMirror() ([]SectorInfo, error) {
+	first, total, err := m.fetchSectorListMirrorPage(1, emMirrorMaxPageSize)
+	if err != nil {
+		return nil, fmt.Errorf("第 1 页: %w", err)
+	}
+	if len(first) == 0 {
+		return nil, fmt.Errorf("第 1 页为空")
+	}
+	// 首页即全量（板块数 ≤ 100）时无需翻页。
+	if total <= len(first) {
+		return first, nil
+	}
+	want := (total + emMirrorMaxPageSize - 1) / emMirrorMaxPageSize
+	if want > emSectorListMaxPages {
+		return nil, fmt.Errorf("total=%d 需 %d 页，超出上限 %d，拒绝分页（防无界请求）",
+			total, want, emSectorListMaxPages)
+	}
+	out := make([]SectorInfo, 0, total)
+	seen := make(map[string]bool, total)
+	addPage := func(page []SectorInfo) int {
+		added := 0
+		for _, s := range page {
+			if s.Code == "" || seen[s.Code] {
+				continue
+			}
+			seen[s.Code] = true
+			out = append(out, s)
+			added++
+		}
+		return added
+	}
+	addPage(first)
+	for pn := 2; pn <= want; pn++ {
+		page, _, perr := m.fetchSectorListMirrorPage(pn, emMirrorMaxPageSize)
+		if perr != nil {
+			return nil, fmt.Errorf("第 %d/%d 页失败: %w（已取 %d/%d，不返回部分结果）",
+				pn, want, perr, len(out), total)
+		}
+		added := addPage(page)
+		// 该页一条新数据都没有却仍未凑齐 → 分页错位（或上游改了分页语义）。
+		// 继续翻只会把同一批数据重复取一遍，静默返回"看起来 496 条其实有空洞"的列表。
+		if added == 0 && len(out) < total {
+			return nil, fmt.Errorf("第 %d/%d 页无新增（已取 %d/%d），分页疑似错位，不返回部分结果",
+				pn, want, len(out), total)
 		}
 	}
-	return sectors, err
+	if len(out) < total {
+		return nil, fmt.Errorf("分页取回 %d/%d，不返回部分结果", len(out), total)
+	}
+	return out, nil
+}
+
+// fetchSectorListMirrorPage 取镜像上的一页板块列表，同时返回该页声明的 data.total。
+// 复用 getWithHeaders 以继承限流与"主机+路径"维度的熔断记账（镜像自身故障时快速失败）。
+// English: fetches one paginated sector page from the mirror, reusing getWithHeaders so rate
+// limiting and per-host+path circuit breaking still apply.
+func (m *MarketAPI) fetchSectorListMirrorPage(pn, pz int) ([]SectorInfo, int, error) {
+	url := fmt.Sprintf("https://%s/api/qt/clist/get?pn=%d&pz=%d&fs=m:90+t:2&fields=%s",
+		emMirrorPush2Host, pn, pz, sectorListFields)
+	EastMoneyLimiter.Wait()
+	resp, err := m.getWithHeaders(url, emReferer)
+	if err != nil {
+		return nil, 0, fmt.Errorf("http: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read: %v", err)
+	}
+	sectors, err := parseSectorList(body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parse: %v", err)
+	}
+	return sectors, parseSectorListTotal(body), nil
 }
 
 // parseSectorListTotal 读取响应里的 data.total（解析失败返回 0，不阻断调用方）。
@@ -1990,9 +2238,15 @@ func (m *MarketAPI) GetStockMoneyFlow(code string) (*CapitalFlow, error) {
 }
 
 // getEastMoneyMoneyFlow 东财 push2 个股资金流向主源（原 GetStockMoneyFlow 主体）。
+// §修复 EM-FFLOW(20260920)：URL 必须带 `klt=1&lmt=0`——镜像域名对**缺这两个参数**的同一请求
+// 返回 rc:102 + data:null（实测 2026-09-20），这正是资金流在主站不可达时长期整行缺失的原因之一。
+// lmt=0 表示取当日全部分时点，解析方取最后一行（15:00 累计值）。
+// getEastMoneyMoneyFlow fetches the per-stock capital-flow series from push2. The URL must carry
+// klt/lmt: without them the mirror answers rc:102 + data:null (measured 2026-09-20).
 func (m *MarketAPI) getEastMoneyMoneyFlow(code string) (*CapitalFlow, error) {
 	sid := secID(code)
-	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63", sid)
+	url := fmt.Sprintf("https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=%s&klt=%d&lmt=%d",
+		sid, emFFlowFields2, emFFlowKLType, emFFlowLimitAll)
 	EastMoneyLimiter.Wait()
 	resp, err := m.getWithHeaders(url, emReferer)
 	if err != nil {
@@ -2008,11 +2262,33 @@ func (m *MarketAPI) getEastMoneyMoneyFlow(code string) (*CapitalFlow, error) {
 	return parseMoneyFlow(body, code)
 }
 
+// ── 东财 fflow（个股资金流）字段约定 ──
+// §实测钉死（2026-09-20，300489/600519）：请求 fields2=f51..f56 时，返回行**恰好 6 列**：
+//
+//	idx0 日期（"2026-09-18 15:00"）
+//	idx1 主力净流入（元）
+//	idx2 小单净流入（元）
+//	idx3 中单净流入（元）
+//	idx4 大单净流入（元）
+//	idx5 超大单净流入（元）
+//
+// 自洽校验：idx4+idx5 == idx1（300489 实测 186881392+15680981 = 202562373 ✓）。
+// **不再返回** 各档 inflow/outflow 对（旧解析器按 13 列 in/out 排列读，故恒定报 "fields too short"）。
+// English: with fields2=f51..f56 the row is exactly 6 columns: date, main-net, small-net, medium-net,
+// large-net, super-large-net (CNY). Sanity check: large-net + super-large-net == main-net.
+const (
+	emFFlowFields2   = "f51,f52,f53,f54,f55,f56" // 日期 + 主力/小/中/大/超大 净额
+	emFFlowKLType    = 1                         // klt=1 → 1 分钟（当日分时）
+	emFFlowLimitAll  = 0                         // lmt=0 → 取当日全部点
+	emFFlowRowFields = 6                         // 实测行宽
+)
+
 // parseMoneyFlow 解析东方财富资金流向 JSON。
-// klines 中最近的 N 行分别对应超大单/大单/中单/小单的各方向金额。
-// 字段索引：buy_elg, sell_elg, buy_lg, sell_lg, buy_md, sell_md, buy_sm, sell_sm, net
-// parseMoneyFlow parses the EastMoney capital-flow JSON; the last K-line row is
-// the latest cumulative day, with fields in Yunt order by order size; amounts are in 万元.
+// 取最后一根（当日 15:00 累计）作为当日资金流；金额单位上游即为元，无需换算。
+// 四档净额直取字段，同时按净额填充 In/Out 的**可推导部分**：上游不给流入/流出对，
+// 故 In/Out 保持 0，消费方一律读 *Net（见 CapitalFlow 注释）。
+// parseMoneyFlow parses the EastMoney capital-flow JSON, taking the last (15:00 cumulative) row.
+// Amounts are already in CNY. Only nets are available upstream, so consumers must read *Net.
 func parseMoneyFlow(body []byte, code string) (*CapitalFlow, error) {
 	var raw struct {
 		Data struct {
@@ -2026,24 +2302,20 @@ func parseMoneyFlow(body []byte, code string) (*CapitalFlow, error) {
 		return nil, fmt.Errorf("eastmoney: no moneyflow data for %s", code)
 	}
 
-	// 取最新一行（当日累计）
+	// 取最新一行（当日累计收盘值）
 	lastLine := raw.Data.KLines[len(raw.Data.KLines)-1]
 	parts := strings.Split(lastLine, ",")
-	if len(parts) < 13 {
-		return nil, fmt.Errorf("eastmoney: moneyflow fields too short (%d)", len(parts))
+	if len(parts) < emFFlowRowFields {
+		return nil, fmt.Errorf("eastmoney: moneyflow fields too short (%d, want >=%d)", len(parts), emFFlowRowFields)
 	}
 
 	cf := &CapitalFlow{
 		Code:          code,
-		SuperLargeIn:  toFloat64(parts[1]) * 10000, // 超大单流入
-		SuperLargeOut: toFloat64(parts[2]) * 10000, // 超大单流出
-		LargeIn:       toFloat64(parts[3]) * 10000, // 大单流入
-		LargeOut:      toFloat64(parts[4]) * 10000, // 大单流出
-		MediumIn:      toFloat64(parts[5]) * 10000, // 中单流入
-		MediumOut:     toFloat64(parts[6]) * 10000, // 中单流出
-		SmallIn:       toFloat64(parts[7]) * 10000, // 小单流入
-		SmallOut:      toFloat64(parts[8]) * 10000, // 小单流出
-		NetInflow:     toFloat64(parts[9]) * 10000, // 主力净流入
+		NetInflow:     toFloat64(parts[1]), // 主力净流入（元）
+		SmallNet:      toFloat64(parts[2]), // 小单净流入（元）
+		MediumNet:     toFloat64(parts[3]), // 中单净流入（元）
+		LargeNet:      toFloat64(parts[4]), // 大单净流入（元）
+		SuperLargeNet: toFloat64(parts[5]), // 超大单净流入（元）
 		Time:          time.Now(),
 	}
 	return cf, nil

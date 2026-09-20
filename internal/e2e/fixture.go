@@ -57,6 +57,12 @@ type Fixture struct {
 	// 行情快照
 	Quotes map[string]string `json:"quotes"`
 
+	// 个股换手率（%）：code -> 同花顺字段 1968584。
+	// §2026-09-20：换手率是新浪/腾讯 CSV **都不携带**的列，只能由同花顺 realhead 提供，
+	// 因此单独成字段而非塞进 Quotes 的 CSV（避免污染既有列序）。取值为实测抓取值。
+	// THS-only turnover (%), field id 1968584 — neither Sina nor Tencent CSV carries it.
+	THSTurnovers map[string]float64 `json:"ths_turnovers"`
+
 	// 个股日K线（升序，同花顺/新浪口径），同时供新浪/东财两种 K 线接口重放。
 	// 日 K 线
 	Klines map[string][]data.KLine `json:"klines"`

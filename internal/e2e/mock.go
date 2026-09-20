@@ -351,48 +351,64 @@ func (t *fixtureTransport) emLHB(req *http.Request) (*http.Response, error) {
 	})
 }
 
-// thsQuote 同花顺实时行情 JSONP：与 parseTHSQuote 预期一致
-// （items 内每只股票为数组，索引约定 [.., code, name, open, high, low, price, volume, amount, ..]，长度须≥10）。
-// 真实 URL 形态为 /v2/realhead/hs_{secid}/last.js，secid 位于 path 倒数第二段。
+// thsQuote 同花顺 realhead 实时行情 JSONP 重放。
+// §修复 THS-MOCK(20260920)：真实响应是顶层 {"items":{"<字段id>":"<字符串值>"}} 的**扁平字典**
+// （单只证券的字段 id → 值），**不是** data.items 下按证券 id 索引的位置数组。
+// 旧 mock 按后者造（且 Quotes 夹具缺失时恒返回空 items）→ 既掩盖了解析器缺陷，
+// 也让人误以为"同花顺兜底已覆盖"。此处按线上真实形状重放，字段 id 与 ths.go 常量一一对应。
+// 真实 URL 形态为 /v2/realhead/hs_{code}/last.js，代码位于 path 的 hs_ 段（无市场前缀）。
+// thsQuote replays the real flat {"items":{"<field id>":"<value>"}} payload (the old mock
+// emitted positional arrays under data.items, which masked the parser defect).
 func (t *fixtureTransport) thsQuote(req *http.Request) (*http.Response, error) {
-	segs := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
-	secID := ""
-	for i := len(segs) - 1; i >= 0; i-- {
-		if strings.HasPrefix(segs[i], "hs_") {
-			secID = strings.TrimPrefix(segs[i], "hs_")
+	code := ""
+	for _, seg := range strings.Split(strings.Trim(req.URL.Path, "/"), "/") {
+		if strings.HasPrefix(seg, "hs_") {
+			code = strings.TrimPrefix(seg, "hs_")
 			break
 		}
 	}
-	if secID == "" {
-		return t.json(map[string]interface{}{"data": map[string]interface{}{"items": map[string]interface{}{}}})
+	empty := map[string]interface{}{"items": map[string]interface{}{}}
+	if code == "" {
+		return t.json(empty)
 	}
-	code := secID
-	code = strings.ReplaceAll(code, "1.", "")
-	code = strings.ReplaceAll(code, "0.", "")
 
-	// 按 parseTHSQuote 期望的 realhead 结构回放快照：items 以 secid 为键，
-	// 值是按位序填充的数组（未用到的下标留空即可）。
-	items := make(map[string]interface{})
-	if csv, ok := t.fix.Quotes[code]; ok {
-		p := strings.Split(csv, ",")
-		parse := func(i int) float64 {
-			f, _ := strconv.ParseFloat(p[i], 64)
-			return f
-		}
-		arr := make([]interface{}, 12)
-		arr[1] = "hs_" + secID // 代码（含前缀，parseTHSQuote 内部剥离）
-		arr[2] = p[0]          // 名称
-		arr[3] = parse(1)      // 今开
-		arr[4] = parse(4)      // 最高
-		arr[5] = parse(5)      // 最低
-		arr[6] = parse(3)      // 现价
-		arr[7] = parse(8)      // 成交量
-		arr[8] = parse(9)      // 成交额
-		items[secID] = arr
+	csv, ok := t.fix.Quotes[code]
+	if !ok {
+		return t.json(empty)
 	}
-	return t.json(map[string]interface{}{
-		"data": map[string]interface{}{"items": items},
-	})
+	p := strings.Split(csv, ",")
+	if len(p) < 10 {
+		return t.json(empty)
+	}
+	parse := func(i int) float64 {
+		f, _ := strconv.ParseFloat(p[i], 64)
+		return f
+	}
+	name, open, prev, price, high, low := p[0], parse(1), parse(2), parse(3), parse(4), parse(5)
+	volume, amount := parse(8), parse(9)
+	changePct := 0.0
+	if prev > 0 {
+		changePct = (price - prev) / prev * 100
+	}
+	turnover, hasTurnover := t.fix.THSTurnovers[code]
+
+	// 值一律为字符串——这是线上实测形态，mock 若给数值就会掩盖"只认数值型"的解析回归。
+	items := map[string]interface{}{
+		"5":      code,                           // 代码（解析器据此做串号交叉校验）
+		"6":      fmt.Sprintf("%.2f", prev),      // 昨收
+		"7":      fmt.Sprintf("%.2f", open),      // 今开
+		"8":      fmt.Sprintf("%.2f", high),      // 最高
+		"9":      fmt.Sprintf("%.2f", low),       // 最低
+		"10":     fmt.Sprintf("%.2f", price),     // 现价
+		"13":     fmt.Sprintf("%.0f", volume),    // 成交量（股）
+		"19":     fmt.Sprintf("%.2f", amount),    // 成交额（元）
+		"199112": fmt.Sprintf("%.2f", changePct), // 涨跌幅（%）
+		"name":   name,
+	}
+	if hasTurnover {
+		items["1968584"] = fmt.Sprintf("%.3f", turnover) // 换手率（%）——新浪/腾讯均无
+	}
+	return t.json(map[string]interface{}{"items": items})
 }
 
 // thsNews 同花顺快讯：page 1 返回全部 ths 场景新闻，后续页为空。

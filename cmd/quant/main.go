@@ -116,7 +116,10 @@ func main() {
 
 	// 行情客户端：东财行情 API + 同花顺板块出口（板块列表/涨跌幅/主力净流入）
 	marketAPI := data.NewMarketAPI()
-	thsClient := data.NewTHSClient() // 同花顺出口（板块列表/涨跌幅/主力净流入）
+	thsClient := data.NewTHSClient() // 同花顺出口（板块列表/涨跌幅/主力净流入、个股换手率）
+	// §QUOTE-CHAIN(20260920)：把同花顺注入行情客户端，使其成为**咨询页行情链首选源**。
+	// 换手率只有同花顺（免费）能提供，东财 push2 不可达时旧链会退到新浪从而丢掉该字段。
+	marketAPI.SetTHSClient(thsClient)
 
 	// 事件匹配器：加载左侧事件规则（config/events_leftside.yaml），失败时禁用事件匹配
 	var matcher *data.EventMatcher

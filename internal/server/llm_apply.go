@@ -1,3 +1,8 @@
+// Package server 提供 HTTP / SSE 服务层：行情、配置、咨询、研究、风险闸门、模拟盘等 REST 接口，
+// 以及向浏览器推送打分与信号的 SSE 广播。各 handler 直接调用 engine 与 store 层，自身不含业务判断。
+//
+// 本文件（llm_apply.go）聚焦 LLM 配置热更新：三个写入入口（设置页 / 管理端 / 咨询页）共用同一份
+// 实现，遵循"先探测候选配置可用 → 再切换运行时 → 最后落库"的语义，详见下方文件头说明。
 package server
 
 import (

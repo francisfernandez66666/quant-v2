@@ -105,17 +105,29 @@ type EmotionData struct {
 // CapitalFlow is capital-flow data broken down by order size (super-large/large/
 // medium/small), sourced from EastMoney.
 type CapitalFlow struct {
-	Code          string    `json:"code"`            // 股票代码
-	NetInflow     float64   `json:"net_inflow"`      // 主力净流入（元），超大单+大单净流入
-	SuperLargeIn  float64   `json:"super_large_in"`  // 超大单流入（元），>=500 万元
-	SuperLargeOut float64   `json:"super_large_out"` // 超大单流出（元）
-	LargeIn       float64   `json:"large_in"`        // 大单流入（元），>=100 万元且 <500 万元
-	LargeOut      float64   `json:"large_out"`       // 大单流出（元）
-	MediumIn      float64   `json:"medium_in"`       // 中单流入（元），>=20 万元且 <100 万元
-	MediumOut     float64   `json:"medium_out"`      // 中单流出（元）
-	SmallIn       float64   `json:"small_in"`        // 小单流入（元），<20 万元
-	SmallOut      float64   `json:"small_out"`       // 小单流出（元）
-	Time          time.Time `json:"time"`            // 数据获取时间
+	Code          string  `json:"code"`            // 股票代码
+	NetInflow     float64 `json:"net_inflow"`      // 主力净流入（元），超大单+大单净流入
+	SuperLargeIn  float64 `json:"super_large_in"`  // 超大单流入（元），>=500 万元
+	SuperLargeOut float64 `json:"super_large_out"` // 超大单流出（元）
+	LargeIn       float64 `json:"large_in"`        // 大单流入（元），>=100 万元且 <500 万元
+	LargeOut      float64 `json:"large_out"`       // 大单流出（元）
+	MediumIn      float64 `json:"medium_in"`       // 中单流入（元），>=20 万元且 <100 万元
+	MediumOut     float64 `json:"medium_out"`      // 中单流出（元）
+	SmallIn       float64 `json:"small_in"`        // 小单流入（元），<20 万元
+	SmallOut      float64 `json:"small_out"`       // 小单流出（元）
+
+	// 四档**净额**（元，= 流入 − 流出）。§修复 EM-FFLOW(20260920)：
+	// 东财 fflow 实际只返回净额（6 列：日期 + 主力/小/中/大/超大 净额），**不返回** 流入/流出对，
+	// 故 In/Out 两列在该源上恒为空，只有 Net 列有值。消费方必须读 Net，不能用 In−Out 反推
+	// （那会恒得 0）。hithink 第二源同时有 in/out，落库时一并把 Net 算好，两源口径统一。
+	// Per-bucket NET (CNY). EastMoney's fflow only returns nets (6 columns), so In/Out stay zero
+	// there and consumers must read Net instead of deriving In-Out (which would always be 0).
+	SuperLargeNet float64 `json:"super_large_net"` // 超大单净流入（元）
+	LargeNet      float64 `json:"large_net"`       // 大单净流入（元）
+	MediumNet     float64 `json:"medium_net"`      // 中单净流入（元）
+	SmallNet      float64 `json:"small_net"`       // 小单净流入（元）
+
+	Time time.Time `json:"time"` // 数据获取时间
 }
 
 // NewsItem 财经快讯 / 新闻条目。

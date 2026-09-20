@@ -538,7 +538,9 @@ func (e *Engine) fetchMinuteKLine(code string) []data.KLine {
 		return klines
 	}
 	if e.ths != nil {
-		if klines, err := e.ths.GetTHSMinuteKLine(code); err == nil && len(klines) >= 2 {
+		// §修复 THS-KLINE(20260920)：本链要的是**5 分钟**K（供 5 分钟 MACD），
+		// 必须把 5 传下去——同花顺默认/旧实现的 1 分钟数据会把 MACD 算成另一个口径。
+		if klines, err := e.ths.GetTHSMinuteKLine(code, 5); err == nil && len(klines) >= 2 {
 			e.bumpKLineSrc("同花顺分钟")
 			return klines
 		}

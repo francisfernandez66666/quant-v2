@@ -176,9 +176,11 @@ func TestConsultMultipleStocks(t *testing.T) {
 	defer func() { data.DisableAll = false }()
 
 	fix := loadTodayFixture(t)
+	// §修复 EM-FFLOW(20260920)：资金流口径源为 fflow，故 300750 需同时替换行情与资金流快照
+	// （-5000万元 = -5000000 元：主力净额 = 大净 + 超大净）。
 	fix.Quotes["300750"] = fix.Quotes["600580"]
 	fix.Klines["300750"] = fix.Klines["600580"]
-	fix.MoneyFlow["300750"] = fix.MoneyFlow["600580"]
+	fix.MoneyFlow["300750"] = []string{"2026-08-05,-50000000,-10000000,-10000000,-20000000,-30000000"}
 	fix.NetInflows["300750"] = -50000000.0
 
 	rig := newTestEngine(t, fix)
@@ -215,24 +217,31 @@ func TestConsultRealtimeQuoteNetInflow(t *testing.T) {
 }
 
 // TestConsultMoneyFlow 今日资金流明细可解析，且主力净流入（超大+大）-22200万与 f162 一致。
+// §修复 EM-FFLOW(20260920)：东财 fflow 实测只返回**净额**（6 列），不返回各档 inflow/outflow 对，
+// 故断言改走 *Net 字段（旧断言按 In−Out 计算，在真实行宽下恒得 0）。
 func TestConsultMoneyFlow(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
-	// 资金流明细走今日快照：解析出超大单/大单/小单进出后，
-	// 按"主力 = 超大单净额 + 大单净额"复核，容差 100 元吸收浮点误差。
+	// 资金流明细走今日快照：按"主力 = 超大单净额 + 大单净额"复核，容差 100 元吸收浮点误差。
 	api := rigMarket(t, loadTodayFixture(t))
 	cf, err := api.GetStockMoneyFlow("600580")
 	if err != nil {
 		t.Fatalf("GetStockMoneyFlow: %v", err)
 	}
-	mainNet := (cf.SuperLargeIn - cf.SuperLargeOut) + (cf.LargeIn - cf.LargeOut)
+	mainNet := cf.SuperLargeNet + cf.LargeNet
 	want := -22200.0 * 1e4
 	if diff := mainNet - want; diff > 100 || diff < -100 {
 		t.Errorf("主力净流入(超大+大)=%.0f, want %.0f (-22200万)", mainNet, want)
 	}
-	if cf.SmallIn <= 0 {
-		t.Errorf("小单流入应>0, got %.0f", cf.SmallIn)
+	if cf.NetInflow != mainNet {
+		t.Errorf("NetInflow=%.0f 应等于超大净+大净=%.0f", cf.NetInflow, mainNet)
+	}
+	if cf.SmallNet <= 0 {
+		t.Errorf("小单净流入应>0, got %.0f", cf.SmallNet)
+	}
+	if cf.MediumNet <= 0 {
+		t.Errorf("中单净流入应>0, got %.0f", cf.MediumNet)
 	}
 }
 
@@ -334,14 +343,18 @@ func TestConsultHistoryLimitedTo6Rounds(t *testing.T) {
 	}
 }
 
-// TestConsultNetInflowMissingHint 东财未返回净流入(走新浪兜底)时，上下文提示"数据源未返回"而非误导为 0。
+// TestConsultNetInflowMissingHint 两个资金流源都拿不到时，上下文提示"数据源未返回"而非误导为 0。
+// §修复 EM-FFLOW(20260920)：资金流口径源改为 fflow（GetStockMoneyFlow），故"缺数"场景
+// 用清空 money_flow 快照来构造（旧版清 NetInflows/f62；f62 在唯一可达链路上实测恒为占位值 2，
+// 已不再作为资金流来源）。§FIX-9e 的 HasFlow 契约本身不变。
 func TestConsultNetInflowMissingHint(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
 	fix := loadTodayFixture(t)
-	// 清空东财净流入：模拟东财未返回 f62，走新浪兜底（新浪无净流入字段 → 0）
+	// 清空东财资金流：模拟 fflow 与 hithink 均未返回 → 新浪/腾讯兜底行情无净流入字段 → 缺数
 	fix2 := *fix
+	fix2.MoneyFlow = nil
 	fix2.NetInflows = nil
 
 	rig := newTestEngine(t, &fix2)
@@ -355,16 +368,19 @@ func TestConsultNetInflowMissingHint(t *testing.T) {
 	}
 }
 
-// TestConsultNetInflowTrueZero §FIX-9e(20260919 批五)：东财**真返回 0**（f62=0，买卖完全对冲）
+// TestConsultNetInflowTrueZero §FIX-9e(20260919 批五)：数据源**真返回 0**（买卖完全对冲）
 // 是合法实测值，必须输出"主力净流入 0.00万元"，不得再借 NetInflow==0 误报"数据源未返回"
 // ——旧口径诱导模型答"没有数据"，把真 0 当成缺数。
+// §修复 EM-FFLOW(20260920)：真 0 现在通过 fflow 行构造（主力净额全 0），而非 f62=0。
 func TestConsultNetInflowTrueZero(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
 
 	fix := loadTodayFixture(t)
 	fix2 := *fix
-	// 显式给 600580 注入 f62=0（fixture 其他票不受影响），与"字段缺失"形态严格区分。
+	// 显式给 600580 注入净额全 0 的 fflow 行（其余票不受影响），与"字段缺失"形态严格区分。
+	fix2.MoneyFlow = map[string][]string{"600580": {"2026-08-05,0,0,0,0,0"}}
+	// 行情源侧也给真 0（f62=0），锁住"两个来源都给真 0 时仍不得误报缺数"。
 	fix2.NetInflows = map[string]float64{"600580": 0}
 
 	rig := newTestEngine(t, &fix2)

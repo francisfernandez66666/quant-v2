@@ -18,6 +18,7 @@
 package data
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -48,8 +49,15 @@ type DataCoordinator struct {
 
 	mu sync.RWMutex
 
-	thsDeadline time.Time // 同花顺熔断截止时间（失败后 60s 内不再尝试）
-	// English: THS circuit-break deadline (no retry within 60s after a failure).
+	// thsDeadlines 同花顺熔断截止时间，**按操作域隔离**（失败后 60s 内不再尝试该操作）。
+	// §修复 THS-BREAKER(20260920)：原实现用单个 thsDeadline 给 5 条能力共用一把闸，
+	// 任一子能力失败都会把同花顺整源关掉 60s。最典型的自伤：分钟 K 线要 15 分钟周期
+	// （同花顺无此档）被判"不支持"，却按"供应商故障"熔断 → 连带把已正常工作的
+	// 同花顺**报价/板块**一起挡掉。熔断的语义应是"这个能力现在不可用"，不是"这家供应商挂了"。
+	// English: per-operation THS circuit-break deadlines. A single shared deadline let any one
+	// capability's failure disable the entire THS source for 60s (e.g. an unsupported intraday
+	// period being treated as a provider outage and killing the working quote/board paths).
+	thsDeadlines map[string]time.Time
 
 	sectorCache      []SectorInfo                  // 板块列表缓存
 	sectorCacheAt    time.Time                     // 板块缓存写入时间（30s TTL）
@@ -101,22 +109,39 @@ func (dc *DataCoordinator) SetHithink(h *HithinkClient) {
 	dc.mu.Unlock()
 }
 
+// 同花顺操作域标识：熔断按域隔离（见 DataCoordinator.thsDeadlines 注释）。
+// THS operation domains used as circuit-breaker keys.
+const (
+	thsOpQuote      = "quote"       // 个股实时行情
+	thsOpKLine      = "kline"       // 日 K 线
+	thsOpMinute     = "minute"      // 分钟 K 线
+	thsOpBoards     = "boards"      // 板块列表
+	thsOpBoardStock = "boardstocks" // 板块成分股
+)
+
 // thsAvailable §R3-2 P0-D1 熔断状态锁内读取：thsDeadline 此前被 GetQuote/GetKLine/
 // GetMinuteKLine/GetSectors/GetSectorStocks 五条并发路径（fetcher 5s 循环 × HTTP handler ×
 // 打分循环）裸读写——data race 且熔断时间戳撕裂会导致熔断失效或提前熔断。统一走本封装。
-// English: R3-2 P0-D1 — locked read of the THS circuit-break deadline (previously read/written
-// unlocked from five concurrent paths).
-func (dc *DataCoordinator) thsAvailable() bool {
+// §修复 THS-BREAKER(20260920)：入参改为操作域 op，只判断该域自己的熔断窗口。
+// English: R3-2 P0-D1 — locked read of the THS circuit-break deadline; scoped by operation domain.
+func (dc *DataCoordinator) thsAvailable(op string) bool {
 	dc.mu.RLock()
 	defer dc.mu.RUnlock()
-	return dc.ths != nil && time.Now().After(dc.thsDeadline)
+	return dc.ths != nil && time.Now().After(dc.thsDeadlines[op])
 }
 
 // tripThs §R3-2 P0-D1 熔断置位锁内写入（默认 60s，与历史口径一致）。
-// English: R3-2 P0-D1 — locked write that trips the THS breaker for d.
-func (dc *DataCoordinator) tripThs() {
+// §修复 THS-BREAKER(20260920)：只熔断指定操作域；op 为空时不做任何事（防误用成全局熔断）。
+// English: trips the breaker for one operation domain only (op == "" is a no-op).
+func (dc *DataCoordinator) tripThs(op string) {
+	if op == "" {
+		return
+	}
 	dc.mu.Lock()
-	dc.thsDeadline = time.Now().Add(60 * time.Second)
+	if dc.thsDeadlines == nil {
+		dc.thsDeadlines = make(map[string]time.Time, 5)
+	}
+	dc.thsDeadlines[op] = time.Now().Add(60 * time.Second)
 	dc.mu.Unlock()
 }
 
@@ -204,15 +229,15 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 		log.Printf("新浪行情失败 (%s): %v, 降级同花顺", code, err)
 	}
 
-	// ③ 同花顺（旧）ths：保留原链，失败按既有逻辑熔断 60s。
-	if dc.thsAvailable() {
+	// ③ 同花顺（旧）ths：保留原链，失败按既有逻辑熔断 60s（熔断按操作域隔离，见 thsDeadlines）。
+	if dc.thsAvailable(thsOpQuote) {
 		thsSi, thsErr := dc.ths.GetQuote(code)
 		if thsErr == nil && thsSi != nil && thsSi.Price > 0 {
 			dc.setLastSource("ths")
 			log.Printf("同花顺返回 %s 最新价 %.2f", code, thsSi.Price)
 			return thsSi, nil
 		} else if thsErr != nil {
-			dc.tripThs()
+			dc.tripThs(thsOpQuote)
 			log.Printf("同花顺失败 (%s): %v, 熔断60s", code, thsErr)
 		}
 	}
@@ -282,12 +307,12 @@ func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, er
 		if klines, err := dc.eastMoney.GetTencentKLine(code, count); err == nil && ValidateKLine(klines) {
 			return klines, nil
 		}
-		if dc.thsAvailable() {
+		if dc.thsAvailable(thsOpKLine) {
 			thsKL, thsErr := dc.ths.GetTHSKLine(code)
 			if thsErr == nil && ValidateKLine(thsKL) {
 				return thsKL, nil
 			} else if thsErr != nil {
-				dc.tripThs()
+				dc.tripThs(thsOpKLine)
 				log.Printf("同花顺日线失败 (%s): %v, 熔断60s", code, thsErr)
 			}
 		}
@@ -306,13 +331,21 @@ func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLin
 		return klines, nil
 	}
 
-	if dc.thsAvailable() {
-		thsKL, thsErr := dc.ths.GetTHSMinuteKLine(code)
+	if dc.thsAvailable(thsOpMinute) {
+		// §修复 THS-KLINE(20260920)：把调用方要的周期透传给同花顺（旧实现忽略 scale、
+		// 且写死无效的 06 码，该源从未生效）。不支持 15 分钟等周期时同花顺返回错误，此处降级。
+		thsKL, thsErr := dc.ths.GetTHSMinuteKLine(code, scale)
 		if thsErr == nil && len(thsKL) > 0 {
 			return thsKL, nil
 		} else if thsErr != nil {
-			dc.tripThs()
-			log.Printf("同花顺分钟线失败 (%s): %v, 熔断60s", code, thsErr)
+			// §修复 THS-BREAKER(20260920)：周期不受支持是**客户端能力缺失**，不是供应商故障，
+			// 绝不能熔断——否则一次 15 分钟请求就会把同花顺整源按故障关掉 60s。
+			if !errors.Is(thsErr, ErrTHSUnsupportedPeriod) {
+				dc.tripThs(thsOpMinute)
+				log.Printf("同花顺分钟线失败 (%s): %v, 熔断60s", code, thsErr)
+			} else {
+				log.Printf("同花顺不支持该分钟周期 (%s, %d 分钟)，跳过该源不熔断", code, scale)
+			}
 		}
 	}
 
@@ -342,13 +375,13 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 	dc.mu.RUnlock()
 
 	var thsSectors []SectorInfo
-	if dc.thsAvailable() {
+	if dc.thsAvailable(thsOpBoards) {
 		var thsErr error
 		thsSectors, thsErr = dc.ths.GetBoardList()
 		if thsErr == nil && len(thsSectors) > 0 {
 			log.Printf("GetSectors: 同花顺 (%d个板块)", len(thsSectors))
 		} else if thsErr != nil {
-			dc.tripThs()
+			dc.tripThs(thsOpBoards)
 			log.Printf("同花顺板块列表失败: %v, 熔断60s", thsErr)
 		}
 	}
@@ -434,7 +467,7 @@ func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]Stock
 	// 同花顺优先：东财被限流时板块成分股改走同花顺。
 	// English: THS-first: when EastMoney is rate-limited, sector constituents route to THS.
 	// THS-first: when EastMoney is rate-limited, sector constituents come from THS.
-	if dc.thsAvailable() {
+	if dc.thsAvailable(thsOpBoardStock) {
 		thsCode, thsName := dc.matchTHSBoardCode(sectorCode)
 		if thsCode == "" {
 			thsCode = sectorCode

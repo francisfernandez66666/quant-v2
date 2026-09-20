@@ -1,4 +1,4 @@
-// scoring.go — 统一打分（归一化）模块：研究与实盘共享的唯一打分口径。
+// Package scoring 统一打分（归一化）模块：研究与实盘共享的唯一打分口径。
 //
 // 背景（修复「研究↔实盘打分语义断层」）：
 //   - 因子发现/回测（internal/research/backtest、internal/research/ic.go 等）旧实现用「截面 z 标准化」

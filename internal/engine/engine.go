@@ -2832,10 +2832,11 @@ func (e *Engine) buildStockBlockUncached(code, name string) string {
 	}
 
 	// 资金流明细（超大/大/中/小单，均以万元计）
+	// §修复 EM-FFLOW(20260920)：必须读 **净额字段**（*Net）而非 In−Out——东财 fflow 只返回
+	// 净额、In/Out 恒为 0，按 In−Out 算会恒得 0.00 万（这一行此前就是恒 0 的）。
 	if cf, err := e.marketAPI.GetStockMoneyFlow(code); err == nil && cf != nil {
 		b.WriteString(fmt.Sprintf("资金明细: 超大单净流入%.0f万 大单净流入%.0f万 中单净流入%.0f万 小单净流入%.0f万\n",
-			(cf.SuperLargeIn-cf.SuperLargeOut)/1e4, (cf.LargeIn-cf.LargeOut)/1e4,
-			(cf.MediumIn-cf.MediumOut)/1e4, (cf.SmallIn-cf.SmallOut)/1e4))
+			cf.SuperLargeNet/1e4, cf.LargeNet/1e4, cf.MediumNet/1e4, cf.SmallNet/1e4))
 	}
 
 	// 日K：当日振幅、MA5/MA10、近5日量能

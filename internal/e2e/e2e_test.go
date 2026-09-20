@@ -107,6 +107,8 @@ func newTestEngine(t *testing.T, fix *Fixture) *testRig {
 
 	thsClient := data.NewTHSClient()
 	thsClient.SetTransport(rt)
+	// §QUOTE-CHAIN(20260920)：与生产装配保持一致——同花顺是咨询页行情链首选源。
+	marketAPI.SetTHSClient(thsClient)
 
 	var matcher *data.EventMatcher
 	if cfg, err := data.LoadEvents(filepath.Join("..", "..", "events_leftside.yaml")); err == nil {
@@ -645,8 +647,23 @@ func TestEndToEndFullPipeline(t *testing.T) {
 		}
 
 		// 同花顺 realhead 行情（d.10jqka.com.cn/v2/realhead）— 兜底分支修复后必须可解析
-		if si, err := rig.ths.GetQuote("300750"); err != nil || si == nil || si.Price <= 0 {
+		// §QUOTE-CHAIN(20260920)：同花顺现已升为咨询行情链**首选源**，且换手率只有它能给（新浪/腾讯无此列）。
+		si, err := rig.ths.GetQuote("300750")
+		if err != nil || si == nil || si.Price <= 0 {
 			t.Errorf("同花顺 GetQuote(300750) 应解析成功, got price=%v err=%v", nilOrPrice(si), err)
+		} else {
+			if si.Turnover != fix.THSTurnovers["300750"] {
+				t.Errorf("同花顺换手率应=%.3f%%, got %.3f%%", fix.THSTurnovers["300750"], si.Turnover)
+			}
+			if si.Name != "宁德时代" {
+				t.Errorf("同花顺名称应=宁德时代, got %q", si.Name)
+			}
+		}
+		// 咨询链走同花顺时，数据块必须带上"同花顺给的换手率"而不是退化成新浪的空换手率。
+		if q, err := rig.market.GetRealtimeQuoteWithFlow("300750"); err != nil || q == nil {
+			t.Errorf("GetRealtimeQuoteWithFlow 应成功: %v", err)
+		} else if q.Turnover != fix.THSTurnovers["300750"] {
+			t.Errorf("首选源应为同花顺（换手率 %.3f%%）, got %.3f%%", fix.THSTurnovers["300750"], q.Turnover)
 		}
 
 		// 新浪日K（money.finance.sina.com.cn getKLineData）

@@ -3,6 +3,7 @@ package data
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -183,7 +184,9 @@ func TestEmFailoverURLCandidates(t *testing.T) {
 		{"clist/get pz=500 (板块列表) 不可转移", "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=500&fs=m:90+t:2", 1},
 		{"clist/get pz=10000 (全市场列表) 不可转移", "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10000", 1},
 		{"kline 不可转移", "https://push2.eastmoney.com/api/qt/stock/kline/get?secid=0.300489", 1},
-		{"fflow 不可转移", "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=1.000001", 1},
+		// §修复 EM-FFLOW(20260920)：fflow 现可转移——镜像在带 klt/lmt 时返回 rc:0 且 klines 完整；
+		// 上一版"不可转移"的断言源自缺参数的探测，已修正（见 emFailoverPaths 注释）。
+		{"fflow 可转移", "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?secid=1.000001&klt=1&lmt=0", 2},
 		{"push2ex 主机不转移", "https://push2ex.eastmoney.com/getTopicZTPool?dpt=wz.ztzt", 1},
 		{"datacenter 主机不转移", "https://datacenter-web.eastmoney.com/api/data/v1/get", 1},
 	}
@@ -339,5 +342,194 @@ func TestParseSectorStocksDiffShapes(t *testing.T) {
 	// 空代码行必须跳过（避免脏行污染成分股列表）。
 	if got, _ := parseSectorStocks([]byte(`{"data":{"diff":[{"f12":""},{"f12":"000157"}]}}`)); len(got) != 1 {
 		t.Errorf("空代码行应被跳过, got %d 行", len(got))
+	}
+}
+
+// TestParseMoneyFlowRealRowShape §修复 EM-FFLOW(20260920)：东财 fflow 实测行宽为 **6 列**
+// （日期,主力净额,小单净额,中单净额,大单净额,超大单净额，单位=元），不是旧实现假设的 13 列 in/out 对。
+// 旧实现按 13 列校验 → 在真实响应上恒定报 "fields too short (6)"，资金流因此长期整行缺失。
+// 报文取自线上实测（300489，2026-09-18 15:00 累计值）。
+// English: locks the real 6-column fflow row shape (the old 13-column assumption always errored).
+func TestParseMoneyFlowRealRowShape(t *testing.T) {
+	body := []byte(`{"rc":0,"data":{"code":"300489","name":"光智科技","klines":[
+		"2026-09-18 14:59,202562373.0,-306067702.0,103505330.0,186881392.0,15680981.0",
+		"2026-09-18 15:00,202562373.0,-306067702.0,103505330.0,186881392.0,15680981.0"]}}`)
+	cf, err := parseMoneyFlow(body, "300489")
+	if err != nil {
+		t.Fatalf("parseMoneyFlow: %v", err)
+	}
+	// 取最后一根（15:00 累计）。
+	if cf.NetInflow != 202562373 {
+		t.Errorf("主力净流入应=202562373 元, got %.0f", cf.NetInflow)
+	}
+	if cf.SmallNet != -306067702 || cf.MediumNet != 103505330 {
+		t.Errorf("小/中单净额错误: %.0f/%.0f", cf.SmallNet, cf.MediumNet)
+	}
+	if cf.LargeNet != 186881392 || cf.SuperLargeNet != 15680981 {
+		t.Errorf("大/超大单净额错误: %.0f/%.0f", cf.LargeNet, cf.SuperLargeNet)
+	}
+	// 实测恒等式 ①：主力净 = 大净 + 超大净。
+	if got := cf.LargeNet + cf.SuperLargeNet; got != cf.NetInflow {
+		t.Errorf("主力净应=大净+超大净: %.0f vs %.0f", got, cf.NetInflow)
+	}
+	// 实测恒等式 ②：四档净额之和 ≈ 0（资金守恒，允许上游取整误差）。
+	sum := cf.SmallNet + cf.MediumNet + cf.LargeNet + cf.SuperLargeNet
+	if sum > 10 || sum < -10 {
+		t.Errorf("四档净额之和应≈0, got %.0f", sum)
+	}
+	// 上游只给净额，In/Out 必须保持 0——消费方据此改用 *Net，不得用 In−Out 反推。
+	if cf.SuperLargeIn != 0 || cf.SuperLargeOut != 0 || cf.SmallIn != 0 || cf.SmallOut != 0 {
+		t.Errorf("fflow 不提供 in/out，应保持 0: %.0f/%.0f/%.0f/%.0f",
+			cf.SuperLargeIn, cf.SuperLargeOut, cf.SmallIn, cf.SmallOut)
+	}
+	// 单位必须是"元"而非"万元"：旧实现乘 1e4，会把这个真实值放大 1 万倍。
+	if cf.NetInflow > 1e9 {
+		t.Errorf("净额被误当万元放大: %.0f", cf.NetInflow)
+	}
+}
+
+// TestParseMoneyFlowShortRowRejected 行宽不足（旧 13 列表述不可能再出现）必须报错，不得静默取错列。
+// English: rows shorter than the real 6-column shape must error rather than silently mis-index.
+func TestParseMoneyFlowShortRowRejected(t *testing.T) {
+	body := []byte(`{"data":{"klines":["2026-09-18 15:00,1,2,3"]}}`)
+	if _, err := parseMoneyFlow(body, "300489"); err == nil {
+		t.Fatal("行宽不足应返回错误")
+	}
+	if _, err := parseMoneyFlow([]byte(`{"data":{"klines":[]}}`), "300489"); err == nil {
+		t.Fatal("空 klines 应返回错误")
+	}
+	// 行宽大于 6（如旧夹具的 13 列）时，只按**前 6 列**读净额——
+	// 绝不退回"1..8 列是 in/out 对、第 10 列是主力净额"的旧解释（那套列语义上游根本不返回）。
+	legacy := []byte(`{"data":{"klines":["2026-07-29,48000,8000,40000,16000,24000,24000,16000,32000,80000,0,0,0"]}}`)
+	cf, err := parseMoneyFlow(legacy, "300489")
+	if err != nil {
+		t.Fatalf("行宽大于 6 时应按前 6 列解析: %v", err)
+	}
+	if cf.NetInflow != 48000 {
+		t.Errorf("主力净额应取第 2 列 48000, got %.0f", cf.NetInflow)
+	}
+	if cf.SmallNet != 8000 || cf.MediumNet != 40000 {
+		t.Errorf("小/中单净额应取第 3/4 列, got %.0f/%.0f", cf.SmallNet, cf.MediumNet)
+	}
+	if cf.SuperLargeIn != 0 || cf.SuperLargeOut != 0 {
+		t.Errorf("不得按旧 in/out 语义解释列: in=%.0f out=%.0f", cf.SuperLargeIn, cf.SuperLargeOut)
+	}
+}
+
+// TestEmFFlowURLHasRequiredParams §修复 EM-FFLOW(20260920)：fflow URL 必须带 klt/lmt，
+// 缺这两个参数时镜像域名返回 rc:102 + data:null（实测 2026-09-20），资金流会整行缺失。
+// English: the fflow URL must carry klt/lmt, otherwise the mirror answers rc:102 + data:null.
+func TestEmFFlowURLHasRequiredParams(t *testing.T) {
+	if emFFlowFields2 != "f51,f52,f53,f54,f55,f56" {
+		t.Errorf("fields2 应为 6 个净额字段, got %q", emFFlowFields2)
+	}
+	if emFFlowKLType != 1 || emFFlowLimitAll != 0 {
+		t.Errorf("klt/lmt 应为 1/0, got %d/%d", emFFlowKLType, emFFlowLimitAll)
+	}
+	m := NewMarketAPI()
+	DisableAll = true
+	defer func() { DisableAll = false }()
+	rec := &urlRecorderTransport{body: `{"data":{"klines":["2026-09-18 15:00,1,2,3,4,5"]}}`}
+	m.SetTransport(rec)
+	if _, err := m.GetStockMoneyFlow("300489"); err != nil {
+		t.Fatalf("GetStockMoneyFlow: %v", err)
+	}
+	gotURL := rec.lastURL()
+	for _, want := range []string{"klt=1", "lmt=0", "fields2=f51,f52,f53,f54,f55,f56"} {
+		if !strings.Contains(gotURL, want) {
+			t.Errorf("请求 URL 缺少 %q: %s", want, gotURL)
+		}
+	}
+}
+
+// urlRecorderTransport 记录请求到的 URL 并回放固定响应体（用于断言出站请求形态）。
+// urlRecorderTransport records requested URLs and replays a canned body.
+type urlRecorderTransport struct {
+	body string
+	urls []string
+}
+
+func (t *urlRecorderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.urls = append(t.urls, req.URL.String())
+	return &http.Response{
+		StatusCode: 200,
+		Status:     "OK",
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(t.body)),
+	}, nil
+}
+
+// lastURL 返回最后一次请求的 URL（无请求时为空串）。
+func (t *urlRecorderTransport) lastURL() string {
+	if len(t.urls) == 0 {
+		return ""
+	}
+	return t.urls[len(t.urls)-1]
+}
+
+// ── §修复 EM-F62-MIRROR(20260920) ──
+
+// emStockGetTransport 模拟 stock/get 请求：可按需令主站不可达（实测形态：TLS 握手被重置）
+// 从而落到镜像；并在响应上回填 Request —— 生产 http.Client 会设置 Response.Request，
+// f62 可信度判定正依赖它（缺省 testResp 不带 Request，故此处必须显式回填）。
+type emStockGetTransport struct {
+	primaryDown bool
+	body        string
+	hosts       []string
+}
+
+func (t *emStockGetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.hosts = append(t.hosts, req.URL.Host)
+	if t.primaryDown && req.URL.Host == emPrimaryPush2Host {
+		return nil, fmt.Errorf("EOF (主站 TLS 握手被重置)")
+	}
+	r := testResp(200, t.body)
+	r.Request = req
+	return r, nil
+}
+
+// emStockGetBody 单股行情报文：f43=2727（27.27 元）、f62=2（镜像占位值）。
+const emStockGetBody = `{"data":{"f43":2727,"f44":2763,"f45":2700,"f46":2725,` +
+	`"f47":247123,"f48":672864810,"f58":"\u5367\u9f99\u7535\u9a71",` +
+	`"f168":158,"f169":18,"f170":66,"f62":2}}`
+
+// TestEastMoneyQuoteF62TrustedOnlyFromPrimary 主站服务时 f62 采信（HasFlow=true）。
+func TestEastMoneyQuoteF62TrustedOnlyFromPrimary(t *testing.T) {
+	tr := &emStockGetTransport{body: emStockGetBody}
+	m := NewMarketAPI()
+	m.SetTransport(tr)
+
+	si, err := m.getEastMoneyQuote("600580")
+	if err != nil {
+		t.Fatalf("主站可用时应成功: %v", err)
+	}
+	if len(tr.hosts) != 1 || tr.hosts[0] != emPrimaryPush2Host {
+		t.Fatalf("应只请求主站, got %v", tr.hosts)
+	}
+	if !si.HasFlow || si.NetInflow != 2 {
+		t.Fatalf("主站服务的 f62 应采信: HasFlow=%v NetInflow=%v", si.HasFlow, si.NetInflow)
+	}
+}
+
+// TestEastMoneyQuoteF62UntrustedFromMirror 镜像服务时 f62 必须弃用——不得把占位值 2
+// 当成"主力净流入 2 元"透出（错而不报比缺数更危险）；但价/量等其余字段照常可用。
+func TestEastMoneyQuoteF62UntrustedFromMirror(t *testing.T) {
+	tr := &emStockGetTransport{primaryDown: true, body: emStockGetBody}
+	m := NewMarketAPI()
+	m.SetTransport(tr)
+
+	si, err := m.getEastMoneyQuote("600580")
+	if err != nil {
+		t.Fatalf("主站不可达时应降级镜像成功: %v", err)
+	}
+	if len(tr.hosts) != 2 || tr.hosts[1] != emMirrorPush2Host {
+		t.Fatalf("应先主站后镜像, got %v", tr.hosts)
+	}
+	if si.HasFlow || si.NetInflow != 0 {
+		t.Fatalf("镜像服务的 f62 为已知占位值，必须弃用: HasFlow=%v NetInflow=%v", si.HasFlow, si.NetInflow)
+	}
+	// 弃用 f62 不得牵连其余字段
+	if si.Price != 27.27 || si.High != 27.63 || si.Low != 27.00 || si.Turnover != 1.58 {
+		t.Fatalf("除 f62 外字段应照常解析: %+v", si)
 	}
 }

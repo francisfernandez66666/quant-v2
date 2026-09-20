@@ -1,4 +1,10 @@
-// 回测报告：JSON 数据 + HTML 展示。
+// Package backtest B4 全链路回测引擎（纯离线，库化供 B5 优化器调用）。
+//
+// 流程：合成"板块涨停潮"事件（SynthesizeEvents）→ 按事件对板块成分股装配因子序列 →
+// 多因子复合打分选股（SignalRule + 单股时序分位）→ 从事件次日开盘入场、前瞻 N 日
+// 计算个股净收益与相对基准的超额收益（含 B4 成本模型、滑点/佣金/印花税）。
+// Run 支持按交易日窗口分块装配（控制峰值内存）与候选级断点续跑（backtest_event_results 缓存，
+// 键带规则参数指纹）。ChainReport 可序列化为 JSON 或自包含 HTML 报告。
 package backtest
 
 import (

@@ -166,12 +166,13 @@ func main() {
 			log.Printf("K线缺失 %s: %v", code, err)
 		}
 
-		// 资金流：东财易被反爬拦截，需带重试；金额单位换算为万元后存为 CSV 行
+		// 资金流：东财易被反爬拦截，需带重试；存为**东财 fflow 真实行形态**
+		// §修复 EM-FFLOW(20260920)：6 列 = 日期,主力净额,小单净额,中单净额,大单净额,超大单净额，
+		// 单位=元（上游原样，不再换算成万元——旧 13 列 in/out 形态上游根本不返回）。
 		if cf, err := retry("资金流", 4, func() (*data.CapitalFlow, error) { return api.GetStockMoneyFlow(code) }); err == nil && cf != nil {
 			fix.MoneyFlow[code] = []string{
-				fmt.Sprintf("2026-07-29,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,0,0,0",
-					cf.SuperLargeIn/10000, cf.SuperLargeOut/10000, cf.LargeIn/10000, cf.LargeOut/10000,
-					cf.MediumIn/10000, cf.MediumOut/10000, cf.SmallIn/10000, cf.SmallOut/10000, cf.NetInflow/10000),
+				fmt.Sprintf("2026-07-29,%.0f,%.0f,%.0f,%.0f,%.0f",
+					cf.NetInflow, cf.SmallNet, cf.MediumNet, cf.LargeNet, cf.SuperLargeNet),
 			}
 		} else {
 			log.Printf("资金流缺失 %s: %v", code, err)
@@ -243,6 +244,9 @@ func applyFallbacks(fix *e2e.Fixture, api *data.MarketAPI, sinaQuotes map[string
 	}
 
 	// 资金流向：真实代码 + 确定性主力净流入（正/负）
+	// §修复 EM-FFLOW(20260920)：按东财 fflow 真实行形态落盘——6 列、单位=元，
+	// 且满足两条实测恒等式：主力净 = 大净 + 超大净；四档净额之和 ≈ 0（资金守恒）。
+	// 故：超大净=大净=主力净/2，中净=小净=−主力净/2。net 表单位为**亿元**。
 	if len(fix.MoneyFlow) == 0 {
 		net := map[string]float64{
 			"300750": 8.0, "600519": -5.0, "688981": 3.0, "300308": 2.5,
@@ -253,12 +257,10 @@ func applyFallbacks(fix *e2e.Fixture, api *data.MarketAPI, sinaQuotes map[string
 			if n == 0 {
 				n = 1.0
 			}
-			supIn, supOut := n*0.6, n*0.1
-			lgIn, lgOut := n*0.5, n*0.2
-			mdIn, mdOut := n*0.3, n*0.3
-			smIn, smOut := n*0.2, n*0.4
-			fix.MoneyFlow[code] = []string{fmt.Sprintf("2026-07-29,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,0,0,0",
-				supIn*10000, supOut*10000, lgIn*10000, lgOut*10000, mdIn*10000, mdOut*10000, smIn*10000, smOut*10000, n*10000)}
+			main := n * 1e8 // 亿元 → 元
+			half := main / 2
+			fix.MoneyFlow[code] = []string{fmt.Sprintf("2026-07-29,%.0f,%.0f,%.0f,%.0f,%.0f",
+				main, -half, -half, half, half)} // 日期,主力,小,中,大,超大
 		}
 		log.Printf("fallback: money_flow %d 只", len(fix.MoneyFlow))
 	}

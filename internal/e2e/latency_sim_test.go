@@ -64,6 +64,8 @@ func newRehearsalRig(t *testing.T, fix *Fixture, profile *LatencyProfile, metric
 
 	thsClient := data.NewTHSClient()
 	thsClient.SetTransport(rt)
+	// §QUOTE-CHAIN(20260920)：与生产装配一致，同花顺为咨询行情链首选源。
+	marketAPI.SetTHSClient(thsClient)
 
 	var matcher *data.EventMatcher
 	if cfg, err := data.LoadEvents(filepath.Join("..", "..", "events_leftside.yaml")); err == nil {

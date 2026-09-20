@@ -63,7 +63,13 @@ func (c *HithinkClient) StockMoneyFlow(code string) (*CapitalFlow, error) {
 		MediumOut:     derefFlow(out.Medium.OutflowAmount),     // 中单流出（元）
 		SmallIn:       derefFlow(out.Small.InflowAmount),       // 小单流入（元）
 		SmallOut:      derefFlow(out.Small.OutflowAmount),      // 小单流出（元）
-		Time:          time.Now(),                              // 兜底为本地抓取时间
+		// §修复 EM-FFLOW(20260920)：本源同时有 in/out，落库时把四档净额一并算好，
+		// 与东财 fflow（只给净额）口径统一——消费方一律读 *Net，无需区分来源。
+		SuperLargeNet: derefFlow(out.SuperLarge.InflowAmount) - derefFlow(out.SuperLarge.OutflowAmount),
+		LargeNet:      derefFlow(out.Large.InflowAmount) - derefFlow(out.Large.OutflowAmount),
+		MediumNet:     derefFlow(out.Medium.InflowAmount) - derefFlow(out.Medium.OutflowAmount),
+		SmallNet:      derefFlow(out.Small.InflowAmount) - derefFlow(out.Small.OutflowAmount),
+		Time:          time.Now(), // 兜底为本地抓取时间
 	}
 	// 上游给出有效数据时间戳（毫秒）时以它为准，避免把"数据时刻"混同为"抓取时刻"。
 	if out.Timestamp > 0 {

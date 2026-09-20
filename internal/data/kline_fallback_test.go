@@ -86,16 +86,16 @@ func TestParseTencentKLineInvalid(t *testing.T) {
 	}
 }
 
-// TestParseTHSLine 同花顺 JSONP K线（data 为 CSV 字符串数组，字段同东财顺序）。
-// English: TestParseTHSLine Tonghuashun JSONP K-line (data is a CSV string array, field order same as Eastmoney).
+// TestParseTHSLine 同花顺 JSONP K线：data 为 **";" 分隔的单条字符串**（实测 2026-09-20）。
+// 行内字段序与东财一致：[日期,开,高,低,收,成交量(股),成交额(元),换手率(%),…]。
+// English: TestParseTHSLine THS JSONP K-line — data is a single ";"-separated string
+// (measured 2026-09-20); row field order matches Eastmoney.
 func TestParseTHSLine(t *testing.T) {
-	body := []byte(`quotebridge_v6_line_hs_1.600206_01_last({
-		"data":[
-			"2026-08-04,33.67,36.36,32.93,35.00,967576,355000000",
-			"2026-08-05,35.00,39.81,35.00,39.00,881698,350000000",
-			"2026-08-06,39.00,43.79,39.00,43.79,1030100,420000000"
-		]
-	})`)
+	// 报文按线上真实形状抓取（含 JSONP 外壳 + 字符串 data + 11 列行），非人工构造。
+	body := []byte(`quotebridge_v6_line_hs_600206_01_last({"num":3,"name":"\u6709\u7814\u65b0\u6750","total":"3",` +
+		`"data":"20260804,33.67,36.36,32.93,35.00,967576,355000000.00,1.200,,0.00,0;` +
+		`20260805,35.00,39.81,35.00,39.00,881698,350000000.00,1.150,,0.00,0;` +
+		`20260806,39.00,43.79,39.00,43.79,1030100,420000000.00,1.480,,0.00,0"})`)
 	klines, err := parseTHSLine(body, false)
 	if err != nil {
 		t.Fatalf("parseTHSLine: %v", err)
@@ -109,6 +109,59 @@ func TestParseTHSLine(t *testing.T) {
 	if klines[2].Amount != 420000000 {
 		t.Errorf("末根 amount 应420000000, got %.0f", klines[2].Amount)
 	}
+	if klines[0].Date.Format("2006-01-02") != "2026-08-04" {
+		t.Errorf("首根日期应2026-08-04, got %s", klines[0].Date.Format("2006-01-02"))
+	}
+	if klines[0].Volume != 967576 {
+		t.Errorf("首根 volume 应967576(股), got %.0f", klines[0].Volume)
+	}
+}
+
+// TestParseTHSLineDataStringShape 字符串 data（主形态）必须能解析——这是 2026-09-20 修复的缺陷本体：
+// 旧实现按 []string 反序列化，线上恒定 "no data"，同花顺 K 线降级源从未生效。
+// English: locks the bug fixed on 2026-09-20 — the old []string unmarshal always failed on the
+// real string-shaped data, so the THS K-line fallback never worked.
+func TestParseTHSLineDataStringShape(t *testing.T) {
+	body := []byte(`quotebridge_v6_line_hs_300489_01_last({"total":"2",` +
+		`"data":"20260917,222.00,226.50,219.80,223.60,15000000,3350000000.00,10.900,,0.00,0;` +
+		`20260918,227.00,231.80,215.02,224.62,16119800,3594643900.00,11.696,,0.00,0"})`)
+	klines, err := parseTHSLine(body, false)
+	if err != nil {
+		t.Fatalf("字符串 data 应可解析, got err=%v", err)
+	}
+	if len(klines) != 2 {
+		t.Fatalf("应2根, got %d", len(klines))
+	}
+	if klines[1].Close != 224.62 || klines[1].Low != 215.02 {
+		t.Errorf("末根 close/low 错误: %.2f/%.2f", klines[1].Close, klines[1].Low)
+	}
+	// 数组形态保留兼容（上游若改型不至于整源失能）。
+	arr := []byte(`quotebridge_v6_line_hs_300489_01_last({"data":["20260918,227.00,231.80,215.02,224.62,16119800,3594643900.00,11.696"]})`)
+	if kl, err := parseTHSLine(arr, false); err != nil || len(kl) != 1 {
+		t.Errorf("数组 data 兼容形态应可解析, got err=%v n=%d", err, len(kl))
+	}
+}
+
+// TestParseTHSLineMinuteTime 分钟线时间列为 12 位 yyyyMMddHHmm（实测 scale 60）。
+// English: minute K-line time column is the 12-digit yyyyMMddHHmm form (measured at scale 60).
+func TestParseTHSLineMinuteTime(t *testing.T) {
+	body := []byte(`quotebridge_v6_line_hs_300489_60_last({"total":"3",` +
+		`"data":"202609181500,224.50,224.62,224.40,224.62,313100,70300000.00,0.210,,,0;` +
+		`202609181459,224.30,224.55,224.28,224.50,120000,26900000.00,0.081,,,0;` +
+		`202609181458,224.10,224.35,224.05,224.30,98000,21900000.00,0.066,,,0"})`)
+	klines, err := parseTHSLine(body, true)
+	if err != nil {
+		t.Fatalf("parseTHSLine minute: %v", err)
+	}
+	if len(klines) != 3 {
+		t.Fatalf("应3根, got %d", len(klines))
+	}
+	if got := klines[0].Date.Format("2006-01-02 15:04"); got != "2026-09-18 15:00" {
+		t.Errorf("首根时间应2026-09-18 15:00, got %s (12位 yyyyMMddHHmm 未识别?)", got)
+	}
+	if klines[0].Close != 224.62 {
+		t.Errorf("首根 close 应224.62, got %.2f", klines[0].Close)
+	}
 }
 
 // TestParseTHSLineInvalid 非法内容/空 data 应返回错误（保证降级链不会喂入脏数据）。
@@ -119,5 +172,10 @@ func TestParseTHSLineInvalid(t *testing.T) {
 	}
 	if _, err := parseTHSLine([]byte(`not json`), true); err == nil {
 		t.Fatal("非法 JSONP 应返回错误")
+	}
+	// 全脏行（high<low / 数值为 0）也必须报错而非静默返回半截数据。
+	dirty := []byte(`quotebridge_v6_line_hs_300489_01_last({"data":"20260918,227.00,215.02,231.80,224.62,1,1.00,1.000,,0.00,0;bad-date,1,2,0.5,1.5,1,1.00,1.000,,0.00,0"})`)
+	if _, err := parseTHSLine(dirty, false); err == nil {
+		t.Fatal("全脏行应返回错误")
 	}
 }

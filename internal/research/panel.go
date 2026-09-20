@@ -1,5 +1,19 @@
-// 股票面板：单只股票的研究序列 + 全量因子值，供横截面 IC/分层/回测。
-// English: stock panel: one stock's research series + all factor values, for cross-sectional IC / layering / backtests.
+// Package research 因子研究库（纯离线，供研究 CLI / B4 全链路回测 / B5 优化器调用）。
+//
+// 核心对象是 Panel（单只股票的因子面板）与 StockSeries：基于研究 SQLite 库装配行情与因子值，
+// 在其上做横截面分析——IC（信息系数）与分层回测（LayerReturns/Monotonic）、因子发现
+// （DiscoverFactors，按样本内方向拟合选股）、去重聚类（Dedup*）、稳健性（Robust*）与
+// 合成复合 IC（CompositeIC）。另含：
+//   - 战法/因子规则的落地与统计（apply.go：ApplyFactorRule/ApplyPatternRule/UpdateAppliedFactorStats）；
+//   - 灰度发布与晋级（grayscale.go + lifecycle*.go：EvaluateGrayscale）；
+//   - 事件因子（event_factor.go）、情绪相位（emotion_phase.go）、事件冲击表（impact.go）；
+//   - 失败聚类诊断（failure_cluster.go）、窗口分块装配（windowed.go / WindowChunks）、版本管理（versioning.go）；
+//   - B5 参数优化（optimizer.go）。
+//
+// 全部函数无副作用（除落库类 Apply*），输入为面板/序列，输出为指标，便于单测与复算。
+// English: the factor-research library — panel assembly + cross-sectional IC / layering / discovery /
+// dedup / robustness, plus rule persistence, grayscale promotion, event & emotion factors, impact
+// tables, failure clustering, windowed assembly and the B5 optimizer.
 package research
 
 import (
