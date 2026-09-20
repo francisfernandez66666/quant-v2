@@ -478,7 +478,7 @@ grep -q 'X-Trace-Id' internal/server/server.go || { echo "--- FAIL: recover 未�
 grep -q 'asyncUtilTimeout' web/src/__tests__/setup.js || { echo "--- FAIL: setup.js 未放宽 asyncUtilTimeout（FIX-6）"; exit 1; }
 # ⑥ FIX-7 python sqlite 关闭：reset_test_row.py 用 contextlib.closing
 grep -q 'closing(' scripts/reset_test_row.py || { echo "--- FAIL: reset_test_row.py 未用 closing（FIX-7）"; exit 1; }
-echo "ok - 静态守卫 9/9 通过"
+echo "ok - 静态守卫 10/10 通过"
 # 动态：FIX-1 回归用例——候选不存在须 404 且不 panic→500
 go test -count=1 ./internal/store/ -run 'TestCandidateByID_NotFoundReturnsErr' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/server/ -run 'TestResearchApproveMissingCandidate' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
