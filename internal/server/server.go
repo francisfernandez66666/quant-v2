@@ -1020,7 +1020,8 @@ type loginReq struct {
 // 错误文案统一 "invalid credentials"（此前区分"用户不存在/密码错"可枚举用户名）。
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.limiter.allow("login|"+clientIP(r), 10, time.Minute) {
-		writeError(w, 429, "too many attempts")
+		// §FIX-3：429 一律走统一出口（带 Retry-After 重试窗口），不再裸吐无头 429。
+		rejectRateLimit(w, time.Minute)
 		return
 	}
 	var req loginReq
@@ -1087,7 +1088,8 @@ type setupReq struct {
 // CreateUser 之间存在 TOCTOU，并发双请求可产生两个 admin）；已初始化返回 400。
 func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 	if !s.limiter.allow("setup|"+clientIP(r), 5, time.Minute) {
-		writeError(w, 429, "too many attempts")
+		// §FIX-3：429 一律走统一出口（带 Retry-After 重试窗口），不再裸吐无头 429。
+		rejectRateLimit(w, time.Minute)
 		return
 	}
 
@@ -1381,14 +1383,14 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		// §MT 租户级频控：同一租户成员业务 API 合计超过配额 → 429（滑动窗口 1 分钟）。
-	if tid := s.auth.TenantOf(user.ID); tid != "" {
-		if !s.tenantLimiter.allow(tid, s.auth.TenantAPIRate(tid), time.Minute) {
-			// §FIX-3：与匿名滑动窗限流一致，统一走 rejectRateLimit 带 Retry-After，
-			// 避免租户级 429 缺头导致前端无法判定重试窗口。
-			rejectRateLimit(w, time.Minute)
-			return
+		if tid := s.auth.TenantOf(user.ID); tid != "" {
+			if !s.tenantLimiter.allow(tid, s.auth.TenantAPIRate(tid), time.Minute) {
+				// §FIX-3：与匿名滑动窗限流一致，统一走 rejectRateLimit 带 Retry-After，
+				// 避免租户级 429 缺头导致前端无法判定重试窗口。
+				rejectRateLimit(w, time.Minute)
+				return
+			}
 		}
-	}
 		next(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey{}, user)))
 	}
 }
