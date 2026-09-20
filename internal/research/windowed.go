@@ -88,6 +88,9 @@ func (p *stageProgress) tick() {
 		return
 	}
 	p.done++
+	if p.done > p.total {
+		p.done = p.total
+	}
 	pct := p.lo + (p.hi-p.lo)*p.done/p.total
 	log.Printf("发现进度 %d%%", pct)
 }
@@ -467,10 +470,16 @@ func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs
 // windowOptimizeWeights 坐标上升权重优化（窗口分块版）。复刻 OptimizeWeights 的算法，
 // 但内部用 windowCompositeIC 代替全量面板的 CompositeIC。权重候选是瞬态的（坐标上升每步
 // 组合都不同），不做窗口断点——断点只覆盖输入确定的阶段（预筛/贪心/分段IR/反推）。
+// §WD-1 该阶段既无窗口断点也不打进度行，而调度器看门狗仅以"发现进度 xx%"行判活性 →
+// 长耗时会被当停滞 terminate（2026-09-20 广州 #268 实录：~336min 的真实计算被 320min 阈值
+// 反复误杀成死循环）。故新增 onTrial 回调：每完成一次真实 trial 评估回调一次，由调用方映射
+// 成进度行喂看门狗。onTrial 为 nil 时行为与旧版完全一致。
 // English: window-chunked coordinate-ascent weight optimization. Candidate weights are transient
 // (different every ascent step), so no window checkpoints here — checkpoints only cover
-// deterministic stages (pre-screen / greedy / split-IR / reverse-extension).
-func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chunks [][2]string, dates []string) OptResult {
+// deterministic stages (pre-screen / greedy / split-IR / reverse-extension). onTrial is invoked
+// after every real trial evaluation so the caller can emit watchdog-recognizable progress; nil
+// reproduces the legacy behaviour exactly.
+func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chunks [][2]string, dates []string, onTrial func()) OptResult {
 	if len(opts.Factors) == 0 {
 		return OptResult{Reason: "因子池为空"}
 	}
@@ -495,6 +504,9 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 	w = cloneWeights(w)
 	best := windowEval(db, codes, opts, w, chunks, dates)
 	trials := 1 // §ENH-B 试验计数（与 OptimizeWeights 同口径：初值+每次候选评估）
+	if onTrial != nil {
+		onTrial()
+	}
 	for it := 0; it < opts.MaxIter; it++ {
 		improved := false
 		for _, f := range opts.Factors {
@@ -506,6 +518,9 @@ func windowOptimizeWeights(db *store.DB, codes []string, opts OptimizeOpts, chun
 				}
 				r := windowEval(db, codes, opts, cand, chunks, dates)
 				trials++
+				if onTrial != nil {
+					onTrial()
+				}
 				if better(r, best, opts.Metric) {
 					best = r
 					w = cand
@@ -645,6 +660,24 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		return empty("预筛后无有效因子")
 	}
 
+	// §WD-1 后段进度透出（36–99%）：贪心 / 坐标上升权重优化 / 分段泛化三个阶段原先既不写进度行、
+	// 也无窗口断点，而调度器看门狗只认"发现进度 xx%"行 → 静默数小时被判停滞 kill
+	//（2026-09-20 广州 #268 实录：~336min 的真实计算被 320min 阈值反复误杀成死循环）。
+	// 复用 stageProgress 按真实工作单元 tick：只在该单元完成后再打一行，
+	// 故"长时间无进度行"仍等价于真停滞，不削弱看门狗。
+	// English: emit real progress for the previously-silent post-pre phases so the stall watchdog
+	// can distinguish "still working" from "hung" (2026-09-20 Guangzhou #268 death-loop).
+	postN := topN
+	if postN < 1 {
+		postN = 1
+	}
+	// 坐标上升迭代上限固定为 6（见下方 windowOptimizeWeights 调用点的 MaxIter: 6）；
+	// 这里仅用它估算试验总数以划分进度带，估偏不影响正确性（tick 会钳到带上限）。
+	maxIterEst := 6
+	greedyProg := newStageProgress(36, 52, postN*opts.MaxFactors)
+	optProg := newStageProgress(53, 88, postN*(1+maxIterEst*opts.MaxFactors*2))
+	segProg := newStageProgress(89, 99, postN*3)
+
 	var results []DiscoverResult
 	exclude := append([][]string{}, opts.ExcludeCombos...)
 	for r := 0; r < topN; r++ {
@@ -666,6 +699,7 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 			bestCandIR := bestIR
 			subsetIC := windowCompositeICForSubsets(db, codes, selected, cands, opts.Horizon, opts.MinStocks, inChunks, dates[:splitIdx+1],
 				&winCkpt{db: db, resumeKey: rkBase, stage: "greedy|" + strings.Join(selected, "+")})
+			greedyProg.tick()
 			for _, fid := range cands {
 				if comboExcluded(selected, fid, exclude) {
 					continue
@@ -706,12 +740,13 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 			Metric: opts.Metric, Step: opts.Step, MaxIter: 6,
 			GuardMinIR: opts.MinIR, GuardMinDays: opts.MinDays,
 			End: dates[splitIdx],
-		}, inChunks, dates[:splitIdx+1])
+		}, inChunks, dates[:splitIdx+1], optProg.tick)
 
 		// 4) E3 分段 + 反推验证（窗口分块，IR 行与 gen 都走 per-rerun rk，跨排他轮隔离）
 		irCk := func() *winCkpt { return &winCkpt{db: db, resumeKey: rk, stage: "ir|" + weightsTag(opt.Weights)} }
 		inRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, headChunks, dates, irCk())
 		outRows := windowCompositeIC(db, codes, selected, opt.Weights, opts.Horizon, opts.MinStocks, splitChunks, dates, irCk())
+		segProg.tick()
 
 		// §RFIX-2 样本内方向拟合：dirOfCat 编译期先验可能与市场实际定价方向相反——复合 IC
 		// 内核（CompositeICRange）不消费 dirs，带符号 IR 可为负，而 C2 落库门用带符号
@@ -728,10 +763,12 @@ func DiscoverFactorsWindowedN(db *store.DB, codes []string, start, end string, o
 		}
 		res.GenTopMean, res.GenAllMean, res.GenExcess, res.GenStdErr, res.GenT =
 			windowReverseExtension(db, codes, selected, dirs, opt.Weights, opts, splitChunks, dates, rk)
+		segProg.tick()
 
 		// §RFIX-3 预期触发率透出（样本内逐窗估算、拟合后方向；近似口径只进 reason 不判护栏）。
 		est := windowTriggerRate(db, codes, selected, dirs, opt.Weights, opts.MinStocks, inChunks, dates[:splitIdx+1])
 		res.TrigDays = est.Days
+		segProg.tick()
 		res.Trig70 = est.PerDay[70]
 		res.Trig95 = est.PerDay[95]
 		// §ENH-B 稳健性原料（与 legacy 内核同口径）：试验计数 + PBO-lite 4 块符号一致性。

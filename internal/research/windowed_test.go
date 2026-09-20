@@ -5,8 +5,12 @@
 package research
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
 
 	"quant-trading-v2/internal/factor"
@@ -274,4 +278,50 @@ func TestDiscoveryResumeKeyAndCkpt(t *testing.T) {
 	if ck3.load(w, &got) {
 		t.Fatal("stage 应相互隔离")
 	}
+}
+
+// TestPostPreProgressEmitted §WD-1 回归：预筛（5–35%）之后的三段——贪心前向选择 / 坐标上升
+// 权重优化 / 分段泛化——原先既不写进度行、也无窗口断点。调度器看门狗只以"发现进度 xx%"行
+// 判活性，于长耗时阶段误判停滞并 kill（2026-09-20 广州 #268 实录：~336min 的真实计算被
+// 320min 停滞阈值反复误杀，重启后 step3 无断点从头重算 → 死循环）。
+// 本测试断言后段确实打出落在 [36,99] 的进度行。
+// English: §WD-1 regression — the three phases after the pre-screen (greedy forward selection /
+// coordinate-ascent weight optimization / split+reverse-extension) used to emit no progress lines
+// and hold no window checkpoints. The scheduler's stall watchdog judges liveness only from
+// "发现进度 xx%" lines, so it terminated those long silent phases as stalled (2026-09-20 Guangzhou
+// #268: ~336min of real work repeatedly killed by a 320min threshold → death loop, as the
+// un-checkpointed weight-optimization stage restarts from scratch). Assert the post phases emit
+// progress in [36,99].
+func TestPostPreProgressEmitted(t *testing.T) {
+	db := seedWindowDB(t)
+	codes, _ := db.StockCodes()
+
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	opts := DiscoverOpts{
+		Factors:    []string{"Mom20", "STO20", "Brk20", "RSI14", "AtrRatio14"},
+		Horizon:    5,
+		MinStocks:  3,
+		MaxFactors: 4,
+		SplitPct:   0.7,
+		MinIR:      0.1,
+		MinDays:    5,
+	}
+	_ = DiscoverFactorsWindowedN(db, codes, "20230101", datesEnd(db), opts, 2)
+
+	out := buf.String()
+	re := regexp.MustCompile(`发现进度 (\d+)%`)
+	postLines := 0
+	for _, m := range re.FindAllStringSubmatch(out, -1) {
+		if p, err := strconv.Atoi(m[1]); err == nil && p >= 36 && p <= 99 {
+			postLines++
+		}
+	}
+	if postLines == 0 {
+		t.Fatalf("预筛之后应打出 [36,99] 进度行（否则长阶段会被看门狗误判停滞）\n实际日志:\n%s", out)
+	}
+	t.Logf("后段进度行 %d 条", postLines)
 }
