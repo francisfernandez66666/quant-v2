@@ -80,6 +80,15 @@ type Rules struct {
 	Paper PaperConfig `json:"paper"`
 	// 东莞证券 MiniQMT 实盘交易配置
 	QMT QMTConfig `json:"qmt"`
+	// AppRelease §APPVER 2026-09-22 C批：APK 服务端驱动强制更新发布单（公开端点
+	// GET /api/app/version 的唯一数据源）。零值=未发布（min=0 时客户端不拦，行为与无此
+	// 配置完全一致）；强制更新自 versionCode≥2 的 APK 起生效（v1 包不发版本头、无法自报
+	// 版本，只能由 owner 重装过渡）。供 APK 原生壳在**登录前**拉取做更新检查，故该端点
+	// 必须免鉴权（见 server.registerRoutes 注释）。
+	// English: §APPVER APK release manifest backing the public GET /api/app/version endpoint.
+	// Zero value = nothing published (min=0 → client never blocks); enforcement only applies from
+	// versionCode 2 upward; the endpoint stays auth-free because the native shell checks before login.
+	AppRelease AppReleaseConfig `json:"app_release,omitempty"`
 	// 运行时内存治理配置
 	Runtime RuntimeConfig `json:"runtime"`
 	// 数据源配置（§HITHINK_DATA_SOURCE_PLAN）
@@ -96,6 +105,26 @@ type Rules struct {
 	// English: signal-controller rollout knobs — shadow-observation for newly enforced gates
 	// (blacklists on the signal side); strategy whitelist is always hard, unaffected.
 	SignalCtl SignalCtlConfig `json:"signal_ctl"`
+}
+
+// AppReleaseConfig §APPVER 2026-09-22 C批：APK 版本发布单，经公开端点
+// GET /api/app/version 暴露给原生壳做登录前强制更新检查。
+// （§APPVER APK release manifest, served by the public pre-auth version endpoint.）
+type AppReleaseConfig struct {
+	// MinVersionCode 最低可接受 versionCode：客户端 BuildConfig.VERSION_CODE 低于此值即弹
+	// 不可取消的强制更新框。0=未发布/不拦（默认，旧配置零行为变化）。
+	// 强制更新自 versionCode≥2 的 APK 起生效（v1 无版本头，服务端无法远程识别）。
+	// Minimum acceptable versionCode; 0 = nothing enforced (unpublished default).
+	MinVersionCode int `json:"min_version_code"`
+	// LatestVersionCode 当前最新发布 versionCode（客户端展示"最新版"用，不参与拦截判定）。
+	// Latest published versionCode (informational; never blocks by itself).
+	LatestVersionCode int `json:"latest_version_code"`
+	// ApkURL 新版 APK 下载地址（如 https://…/dl/quant-latest.apk）；空则客户端不显示下载按钮。
+	// Download URL of the latest APK; empty hides the download action in the update dialog.
+	ApkURL string `json:"apk_url"`
+	// Note 更新说明（弹窗文案，如"安全更新：登录凭据迁入系统级加密存储，请升级"）。
+	// Release note shown verbatim in the forced-update dialog.
+	Note string `json:"note"`
 }
 
 // SignalCtlConfig 信号控制器灰度配置（§SIGNAL_CONTROLLER_PLAN_20260917 §八）。
@@ -457,13 +486,39 @@ type RiskGateConfig struct {
 	// English: absolute per-order amount cap (0 = off). Rejects any new order whose amount
 	// (qty × ref price) exceeds it — the only hard ceiling on the manual entry point.
 	MaxOrderAmount float64 `json:"max_order_amount"`
+	// CrossCheckPct §XCHECK 2026-09-22 C批：价格复核闸阈值（%），0=关（默认）。
+	// 委托参考价与独立复核源价（DataCoordinator.CrossCheckPrice，多源行情链独立于本单快照）
+	// 的偏离上限：|参考价−复核价|/复核价×100 超过该值即命中。为什么要这道闸：既有闸只判
+	// 「快照陈旧度」，判不了「两源同刻价差」（单源脏数据/除权错位价），复核闸补上这一维。
+	// 注意执行位点：本闸在 controller orderMu 锁内同步调一次行情 HTTP（GetRealtimeQuote 自带
+	// 超时链），低频可接受（下单本身即低频动作，一次秒级超时远小于锁内其它 DB 往返的累计耗时）。
+	// 影子期语义见 CrossCheckShadow：默认影子=命中仅 risk_gates 留痕放行，正式化后才拒单。
+	// English: §XCHECK price cross-check threshold in % (0 = off, default). Deviation cap between
+	// the order reference price and an independent quote source; runs synchronously inside the
+	// controller orderMu lock as one HTTP call with its own timeout — acceptable at order frequency.
+	CrossCheckPct float64 `json:"cross_check_pct"`
+	// CrossCheckShadow §XCHECK 2026-09-22 C批：价格复核闸影子模式（nil/true=默认影子）：
+	// 命中仅写 risk_gates 留痕（原因带 [shadow] 前缀）并放行，供 owner 观察误拦率；
+	// 置 false 切正式——命中即拒单+高优告警。仿 SignalCtlConfig.ShadowBlacklist 惯例：
+	// 新行为先影子验证再硬拦，零配置永不改变现有下单行为，可随时回滚。
+	// English: nil/true = cross-check hits are recorded ([shadow]-prefixed) but not enforced;
+	// explicit false turns the gate into a hard reject. Mirrors the shadow_blacklist convention.
+	CrossCheckShadow *bool `json:"cross_check_shadow,omitempty"`
+}
+
+// CrossCheckEnforce §XCHECK 价格复核闸是否已切正式（拒单）模式：仅显式 false 时为 true；
+// nil/true 均维持影子（命中留痕放行）。判定姿势与 ShadowBlacklist 同款。
+// English: reports whether the cross-check gate has left shadow mode and hard-rejects — only an
+// explicit cross_check_shadow=false enforces; unset/true keep record-and-pass behavior.
+func (r RiskGateConfig) CrossCheckEnforce() bool {
+	return r.CrossCheckShadow != nil && !*r.CrossCheckShadow
 }
 
 // AnyEnabled 是否开启了至少一道 RiskGate（供 UI/健康展示与短路）。
 // English: AnyEnabled reports whether at least one risk gate is enabled.
 func (r RiskGateConfig) AnyEnabled() bool {
 	return r.DayLossLimitPct > 0 || r.SingleStockValuePct > 0 || r.StaleQuoteMs > 0 ||
-		r.LimitUpBlockBuy || r.LimitDownBlockSell || r.MaxOrderAmount > 0
+		r.LimitUpBlockBuy || r.LimitDownBlockSell || r.MaxOrderAmount > 0 || r.CrossCheckPct > 0
 }
 
 // SettleConfig §WS-B 交割单三方对账参数。

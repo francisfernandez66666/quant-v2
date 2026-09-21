@@ -238,3 +238,28 @@ jobs:
           grep -q 'BuildConfig.DEBUG' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "M12 release 调试面复活"; exit 1; }
           grep -q 'jsQuote' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "M12 注入转义通道丢失"; exit 1; }
           echo "ok - §20260922 修复批二波静态锁全过"
+
+      - name: §20260922-C 批静态锁（XCHECK/NATIVEAUTH/ROOTQMT/APPVER）
+        run: |
+          # §XCHECK 价格复核闸：接线链与配置键在位；CrossCheckPrice 不得回到零消费者死代码
+          grep -q 'price_cross_check' internal/risk/gate.go || { echo "XCHECK 复核闸从闸清单消失"; exit 1; }
+          grep -q 'SetCrossPriceSource' internal/engine/registry.go || { echo "XCHECK registry 注入脱链"; exit 1; }
+          grep -q 'cross_check_pct' internal/config/config.go || { echo "XCHECK 配置键丢失"; exit 1; }
+          if ! grep -rn 'CrossCheckPrice' internal cmd --include='*.go' | grep -v _test.go | grep -v 'internal/data/source.go' | grep -q .; then echo "XCHECK 复活死代码形态：CrossCheckPrice 零生产消费者"; exit 1; fi
+          # §NATIVEAUTH token 迁原生：桥/依赖/前端探测三件套；直读负锁（滤注释与存储层单点）
+          test -f mobile/app/src/main/java/com/liangzai/quant/SecureAuthStore.kt || { echo "NATIVEAUTH 原生加密存储缺失"; exit 1; }
+          grep -q '"AndroidAuth"' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "NATIVEAUTH 桥未注册"; exit 1; }
+          grep -q 'security-crypto' mobile/app/build.gradle.kts || { echo "NATIVEAUTH 依赖丢失"; exit 1; }
+          grep -q 'nativeAuthBridge' web/src/api/index.js || { echo "NATIVEAUTH 前端桥探测丢失"; exit 1; }
+          if grep -rn "liangzai_token" web/src --include='*.js' --include='*.jsx' | grep -v __tests__ | grep -v 'src/api/index.js' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -q .; then echo "NATIVEAUTH 业务代码直读 token 复活"; exit 1; fi
+          # §ROOTQMT 死键防回潮：清理脚本在位且挂部署链
+          test -f deploy/qmt-win/clean_root_qmt.ps1 || { echo "ROOTQMT 清理脚本缺失"; exit 1; }
+          grep -q 'clean_root_qmt' scripts/deploy_guangzhou.sh || { echo "ROOTQMT 清理脱部署链（防回潮失效）"; exit 1; }
+          # §APPVER 强制更新通道：公开端点（不得套鉴权）+ /dl 分发 + 原生闸 + 版本跃迁
+          grep -q 'GET /api/app/version' internal/server/server.go || { echo "APPVER 版本端点丢失"; exit 1; }
+          if grep -n 'GET /api/app/version' internal/server/server.go | grep -q 'authMiddleware'; then echo "APPVER 端点被套鉴权（登录前检查死锁复活）"; exit 1; fi
+          grep -q 'handle /dl/\*' deploy/caddy/guangzhou.conf || { echo "APPVER Caddy 分发块丢失"; exit 1; }
+          grep -q 'quant-latest.apk' scripts/deploy_guangzhou.sh || { echo "APPVER APK 同步步丢失"; exit 1; }
+          grep -q 'UpdateGate' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "APPVER 原生更新闸未接线"; exit 1; }
+          grep -qE 'versionCode = ([2-9]|[1-9][0-9])' mobile/app/build.gradle.kts || { echo "APPVER 版本停在没有更新通道的 1"; exit 1; }
+          echo "ok - §20260922-C 批静态锁全过"

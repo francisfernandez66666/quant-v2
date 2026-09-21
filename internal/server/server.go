@@ -517,6 +517,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /auth/temp", s.handleTemp)
 	s.mux.HandleFunc("POST /auth/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	// §APPVER 2026-09-22 C批：APK 强制更新的版本检查端点。**故意不套 authMiddleware**——
+	// 原生壳在登录前就要拉取更新单（旧版本可能因鉴权链路缺陷根本登不进来，更新通道若依赖
+	// 登录即死锁），只读发布单无副作用，泄露面仅为「公开可知的自家 APK 版本号+下载地址」。
+	// English: §APPVER public by design — the native shell checks for updates *before* login,
+	// so this read-only endpoint must stay auth-free (a login-gated update channel would deadlock).
+	s.mux.HandleFunc("GET /api/app/version", s.handleAppVersion)
 	// §D7 自助退出：吊销当前 Bearer 对应的服务端会话（旧行为只清浏览器 localStorage，
 	// 令牌在服务端 Sessions 里长期有效，换设备/清缓存后仍可被截获回放）。
 	// English: self-service logout revokes the presenting token's server-side session.

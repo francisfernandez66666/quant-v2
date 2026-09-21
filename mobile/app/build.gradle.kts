@@ -18,8 +18,12 @@ android {
         applicationId = "com.liangzai.quant"
         minSdk = 24          // Android 7.0：覆盖仍活跃的低版本机型；低于此的 WebView 不支持 SSE
         targetSdk = 35        // 目标 Android 15：新装/更新走最新隐私与权限模型
-        versionCode = 1       // 整数递增版本号（每次上架 +1，Google Play 与覆盖安装据此判新旧）
-        versionName = "1.0.0" // 展示用语义版本号（首版 1.0.0）
+        // §NATIVEAUTH+§APPVER（2026-09-22 C批）：版本跃迁 1→2 / 1.0.0→1.1.0。
+        // 为什么直接跳 2：v1 包没有任何更新通道（服务端驱动强制更新自 v2 起才生效），
+        // 旧 v1 用户无法被远程引导升级，须由 owner 重装一次 v2；此后 v2+ 由 UpdateGate
+        // 强制更新链路接管（min_version_code 门槛拦截）。
+        versionCode = 2       // 整数递增版本号（每次上架 +1，Google Play 与覆盖安装据此判新旧）
+        versionName = "1.1.0" // 展示用语义版本号（v2：登录 token 迁原生加密存储 + 强制更新闸）
 
         // 极光推送 JPush：包名 + AppKey（极光控制台创建应用后获得）+ 渠道号
         // （JPush placeholders: package name, AppKey from the JPush console, channel label.）
@@ -62,4 +66,8 @@ dependencies {
     implementation("androidx.webkit:webkit:1.11.0")
     // 极光推送 JPush Android SDK（5.0.0 起自动拉取 JCore，无需单独配置）
     implementation("cn.jiguang.sdk:jpush:5.8.0")
+    // §NATIVEAUTH（2026-09-22 C批）：EncryptedSharedPreferences——AES256_GCM 主密钥托管于
+    // AndroidKeyStore（密钥本身不出安全硬件/系统密钥区），登录 token 静态落盘加密，
+    // 收小 root/adb backup 场景直接读库拿明文票的攻击面（详见 SecureAuthStore.kt 文件头）。
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 }

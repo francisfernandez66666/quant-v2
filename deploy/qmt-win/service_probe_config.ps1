@@ -1,4 +1,4 @@
-# service_probe_config.ps1 — §H8（2026-09-22 修复批）运维探针端口/端点唯一来源
+﻿# service_probe_config.ps1 — §H8（2026-09-22 修复批）运维探针端口/端点唯一来源
 # 消费方：all_service_watchdog.ps1、daily_ops_check.ps1、register_engine_services.ps1（兜底回退同源字面量）。
 # 教训（H8 三连错实录）：旧版各运维脚本独立硬编码 URL——
 #   ① quant 探 :8080/api/status：:8080 是 Caddy 应急直连口，引擎实听 :8081（register 注入

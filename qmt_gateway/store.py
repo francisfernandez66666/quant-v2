@@ -796,6 +796,7 @@ class Store:
         them as rejected (never re-queued, since the bridge may already have ordered).
         """
         import time as _time  # noqa: PLC0415
+        # 收割线：inflight 行 updated_at 早于 (now - max_age_sec) 即视为卡死；max_age_sec≤0 时阈值取 0（不收割）。
         threshold = (_time.time() - max_age_sec) if max_age_sec > 0 else 0
         with self._lock:
             rows = self._conn.execute(

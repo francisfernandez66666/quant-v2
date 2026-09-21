@@ -1,4 +1,4 @@
-# register_web_service.ps1 — §M7b（2026-09-22 修复批）：quant-web（Caddy）站点注册收编进部署清单。
+﻿# register_web_service.ps1 — §M7b（2026-09-22 修复批）：quant-web（Caddy）站点注册收编进部署清单。
 # 背景：verify_deploy_guangzhou.sh 一直要求 quant / quant-research / pydata / quant-web 四服务全部
 # Running，但 deploy_guangzhou.sh 从不注册/刷新 web 站点——Caddy 服务与 Caddyfile 是当年的手工
 # 一次性操作（步骤散落在 deploy/GUANGZHOU_CADDY.md），部署面与校验面各说各话（§M7 审计实录）。

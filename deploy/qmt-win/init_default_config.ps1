@@ -18,11 +18,13 @@ if (Test-Path $cfgPath) {
     Write-Host "  保留现有 config.json（未覆盖）"
     # §M7a 兼容检测：现网若存有更早版本生成的"根级 qmt"旧文件，提醒运维（只告警，不改写、不拦截）。
     # Go 解析侧（internal/config/config.go Manager.Load 的 wrapper 只有 rules/d1 两段）从不读取
-    # 根级 qmt——该段是死数据，留着无害但会误导人工排障，应择机清理。
+    # 根级 qmt——该段是死数据，留着无害但会误导人工排障。
+    # §ROOTQMT（2026-09-22 C批）：清理已收编进部署链，无需手工——见同目录 clean_root_qmt.ps1
+    # 与 deploy_guangzhou.sh 步 [3a]（每次部署幂等清理根级 qmt，备份 + 自校验 + 原子写回）。
     try {
         $parsed = Get-Content $cfgPath -Raw | ConvertFrom-Json
         if ($parsed.PSObject.Properties.Name -contains "qmt") {
-            Write-Warning "检测到 config.json 根级残留 `"qmt`" 段（旧生成器产物，Go 侧静默忽略，见 §M7a 注释）——建议运维确认后手工移除，或待设置页保存后由引擎整体重写落盘。"
+            Write-Warning "检测到 config.json 根级残留 `"qmt`" 段（旧生成器产物，Go 侧静默忽略，见 §M7a 注释）——本脚本不改写既有配置；清理由部署链步 [3a] 自动执行，脚本见 deploy/qmt-win/clean_root_qmt.ps1（§ROOTQMT），也可手工重跑：powershell -File clean_root_qmt.ps1 -ConfigPath $cfgPath"
         }
     } catch {
         Write-Warning "现有 config.json 解析失败（仅影响 §M7a 残留检测，不影响保留策略）: $($_.Exception.Message)"

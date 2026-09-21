@@ -3,6 +3,7 @@
 package risk
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -467,5 +468,109 @@ func TestGateMaxOrderAmount(t *testing.T) {
 	// AnyEnabled 感知新闸
 	if !(config.RiskGateConfig{MaxOrderAmount: 1}).AnyEnabled() {
 		t.Fatal("AnyEnabled 应感知 max_order_amount")
+	}
+	// §XCHECK 2026-09-22 C批：AnyEnabled 同样须感知价格复核闸——只开 cross_check_pct
+	// 也算"有闸在管"，否则 UI 闸口卡片/健康展示会在唯一启用的正是本闸时谎报全关。
+	if !(config.RiskGateConfig{CrossCheckPct: 3}).AnyEnabled() {
+		t.Fatal("AnyEnabled 应感知 cross_check_pct")
+	}
+}
+
+// TestGatePriceCrossCheck §XCHECK 2026-09-22 C批 价格复核闸四态表驱动：
+// 关闭跳过 / 复核源出错 fail-open / 影子命中→放行但 risk_gates 留 [shadow] 痕 / 正式命中→拒单。
+// English: §XCHECK cross-check gate, table-driven over four states — disabled, fail-open on
+// source error, shadow hit (pass + [shadow] record), enforce hit (reject + high alert).
+func TestGatePriceCrossCheck(t *testing.T) {
+	// 参考价 10 元 vs 复核价 12 元 → 偏差 |10−12|/12×100 = 16.67% > 3%（必命中）；
+	// vs 复核价 10.1 元 → 偏差 ~0.99% ≤ 3%（必不命中）。
+	cases := []struct {
+		name      string
+		pct       float64
+		shadow    *bool
+		cross     float64
+		srcErr    bool
+		wantPass  bool
+		wantTrace bool // risk_gates 应出现 price_cross_check 行（影子/正式均留痕，原因前缀不同）
+	}{
+		{"关闭跳过", 0, nil, 999, false, true, false},                  // pct=0：源给什么价都不拦
+		{"源出错fail-open", 3, boolPtr(false), 0, true, true, false},  // 数据缺口不误拦（即便已切正式）
+		{"源无价fail-open", 3, boolPtr(false), 0, false, true, false}, // 复核价 ≤0 同样跳过
+		{"偏差阈内放行", 3, boolPtr(false), 10.1, false, true, false},    // 0.99% ≤ 3%
+		{"影子命中放行留痕", 3, nil, 12, false, true, true},                // 默认影子：放行 + [shadow] 留痕
+		{"正式命中拒单", 3, boolPtr(false), 12, false, false, true},      // shadow=false：拒单
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db := gateDB(t)
+			alerts := 0
+			g := NewGate(db, "u_g", func(level, title, content string) { alerts++ })
+			// 注入独立复核源（stub：固定返回用例价或错误）。
+			g.SetCrossPriceSource(func(code string) (float64, error) {
+				if c.srcErr {
+					return 0, errors.New("quote unavailable")
+				}
+				return c.cross, nil
+			})
+			cfg := qmtCfg()
+			cfg.RiskGate.CrossCheckPct = c.pct
+			cfg.RiskGate.CrossCheckShadow = c.shadow
+			v := g.CheckLiveOrder(cfg, liveOrder(SideBuy))
+			if v.Pass != c.wantPass {
+				t.Fatalf("Pass=%v, want %v (verdict %+v)", v.Pass, c.wantPass, v)
+			}
+			if !c.wantPass {
+				if v.Gate != "price_cross_check" {
+					t.Fatalf("应命中 price_cross_check 闸, got %q", v.Gate)
+				}
+				// 拒单文案必须含代码、两价与偏差/阈值，供审计直读。
+				for _, frag := range []string{"600000.SH", "10.000", "12.000", "16.67", "3.00"} {
+					if !strings.Contains(v.Reason, frag) {
+						t.Fatalf("拒单原因缺少 %q: %s", frag, v.Reason)
+					}
+				}
+				if alerts != 1 {
+					t.Fatalf("正式命中应触发 1 次高优告警, got %d", alerts)
+				}
+			} else {
+				if alerts != 0 {
+					t.Fatalf("放行路径不得告警, got %d", alerts)
+				}
+			}
+			// risk_gates 留痕核验：影子命中=放行但记 [shadow] 行；正式命中=verdict 统一落库。
+			today := cntime.In(time.Now()).Format("2006-01-02")
+			hits, err := db.RiskGateHits("u_g", today)
+			if err != nil {
+				t.Fatalf("RiskGateHits: %v", err)
+			}
+			if !c.wantTrace {
+				if hits["price_cross_check"] != 0 {
+					t.Fatalf("本态不应留痕, got %v", hits)
+				}
+				return
+			}
+			if hits["price_cross_check"] != 1 {
+				t.Fatalf("应有 price_cross_check 留痕 1 次, got %v", hits)
+			}
+			rows, err := db.RiskGateDay(today, 10)
+			if err != nil || len(rows) == 0 {
+				t.Fatalf("RiskGateDay: %v rows=%d", err, len(rows))
+			}
+			var reason string
+			for _, r := range rows {
+				if r.Gate == "price_cross_check" {
+					reason = r.LastReason
+				}
+			}
+			if reason == "" {
+				t.Fatal("未找到 price_cross_check 留痕行")
+			}
+			if c.wantPass { // 影子：原因必须带 [shadow] 前缀（与正式拒单留痕可区分）
+				if !strings.HasPrefix(reason, "[shadow] ") {
+					t.Fatalf("影子留痕应带 [shadow] 前缀, got %q", reason)
+				}
+			} else if strings.HasPrefix(reason, "[shadow]") {
+				t.Fatalf("正式拒单留痕不应带 [shadow] 前缀, got %q", reason)
+			}
+		})
 	}
 }

@@ -30,6 +30,9 @@ import org.json.JSONObject
  *    使 localStorage / EventSource(SSE) / fetch 均按标准 https 语义工作，且无需明文权限。
  *  - 服务器地址：登录页输入框填写（前端已有该功能，存 localStorage）。
  *    若配置了 DEFAULT_SERVER_URL，首次打开会预填，减少输入成本。
+ *  - JS 桥三件套：AndroidNotify（系统通知）、AndroidConfig（服务器地址持久化）、
+ *    AndroidAuth（§NATIVEAUTH 2026-09-22 C批：登录 token 迁原生加密存储）。
+ *  - UpdateGate（§APPVER 同批）：启动后台强更检查，v1 无更新通道故版本直接跃迁到 2。
  *
  * 等云资源就绪后要改的地方（只此一处）：
  *  - DEFAULT_SERVER_URL：预填的服务器地址（如 https://your-domain.com），
@@ -75,6 +78,11 @@ class MainActivity : AppCompatActivity() {
         requestNotificationPermission()
         setupJPushAlias()
 
+        // §NATIVEAUTH（2026-09-22 C批）：加密偏好存储初始化，必须先于 AndroidAuth 桥注册——
+        // 桥回调随时可能被前端调用，init 只缓存 applicationContext，实际密钥解锁懒到首次读写，
+        // 不阻塞 onCreate。
+        SecureAuthStore.init(this)
+
         val webView = findViewById<WebView>(R.id.webview)
 
         // assets/ → https://appassets.androidplatform.net/
@@ -83,14 +91,13 @@ class MainActivity : AppCompatActivity() {
             .build()
 
         webView.settings.javaScriptEnabled = true
-        // §M12c 残余风险（本次不迁移机制，交 owner 裁决）：登录 token 由前端存在 WebView
-        // localStorage（domStorage 落设备加密存储）。风险面：① root/越狱设备或 adb backup 场景可
-        // 直接读库取 token；② 任何注入进该 Origin 的 JS 都能 getItem 拿票。本次已收掉两个放大器：
-        // release 远程调试改 BuildConfig.DEBUG 门控（见 onCreate 上方 §M12 注释）、注入字符串走
-        // jsQuote 完整转义。根治方向（未排期）：token 迁入原生层（EncryptedSharedPreferences）由
-        // JS 桥取用，或后端下发 HttpOnly Cookie 供 /api 携带——涉及前端鉴权链路与发版节奏，
-        // 需 owner 决策后单独立项，此处注释即风险台账（AUDIT M12 / FIX_PLAN §3 M12 行）。
-        webView.settings.domStorageEnabled = true          // localStorage 持久化（token 风险面见上）
+        // §M12c 残余风险——沿革标注（AUDIT M12 / FIX_PLAN §3 M12 行）：2026-09-22 C批已由本批
+        // AndroidAuth 桥收口，登录 token 不再落 WebView localStorage，改存原生加密偏好
+        // （EncryptedSharedPreferences，见 SecureAuthStore.kt 文件头），静态落盘面（root/adb backup
+        // 直接读域文件取票）已消除；动态注入面另由 §M12（release 远程调试 DEBUG 门控）+ §M12
+        // jsQuote 完整转义收掉。domStorage 本身仍需保留：server_url/账号角色等非敏感数据与旧前端
+        // 回落路径都依赖 localStorage，故此处只留台账注释、不加机制说明。
+        webView.settings.domStorageEnabled = true          // localStorage 持久化（token 已迁原生，见 §NATIVEAUTH）
         webView.settings.databaseEnabled = true
         webView.settings.allowFileAccess = false
         webView.settings.loadsImagesAutomatically = true
@@ -196,7 +203,41 @@ class MainActivity : AppCompatActivity() {
             }
         }, "AndroidConfig")
 
+        // §NATIVEAUTH（2026-09-22 C批）原生鉴权存储桥：登录 token 迁出 WebView localStorage，
+        // 存入原生加密偏好（SecureAuthStore/EncryptedSharedPreferences），收小静态落盘读取面。
+        // 前端 api/index.js 的 nativeAuthBridge() 检测到 window.AndroidAuth 即改走原生存取；
+        // 旧前端/纯浏览器无感——不检测就不使用，行为与迁移前完全一致。
+        // setToken 入参校验：非空白 + UTF-8 字节数 ≤4096（token 合理量级远小于此，超限即
+        // 视为异常写入拒绝，防任意大对象塞进加密偏好）。
+        webView.addJavascriptInterface(object {
+            @android.webkit.JavascriptInterface
+            fun getToken(): String = SecureAuthStore.getToken()
+
+            @android.webkit.JavascriptInterface
+            fun setToken(t: String): Boolean {
+                if (t.isBlank() || t.toByteArray(Charsets.UTF_8).size > 4096) return false
+                return SecureAuthStore.putToken(t)
+            }
+
+            @android.webkit.JavascriptInterface
+            fun clearToken(): Boolean {
+                SecureAuthStore.clearToken()
+                return true
+            }
+        }, "AndroidAuth")
+
         webView.loadUrl("https://appassets.androidplatform.net/index.html")
+
+        // §APPVER（2026-09-22 C批）服务端驱动强制更新闸：后台查询 /api/app/version，
+        // versionCode 低于服务端 min_version_code 时弹不可取消更新框；网络/解析失败一律
+        // fail-open 静默（离线可用性优先，更新检查不得成为启动阻塞）。
+        // baseUrl 优先级与 onPageStarted 预填一致：SharedPreferences server_url > DEFAULT_SERVER_URL。
+        UpdateGate.start(this) {
+            getSharedPreferences("quant_prefs", MODE_PRIVATE)
+                .getString("server_url", "")
+                ?.takeIf { it.isNotBlank() }
+                ?: DEFAULT_SERVER_URL
+        }
     }
 
     /** 创建通知渠道（Android 8+ 通知必需要有渠道，否则 WebView 内 Notification 静默丢弃） */

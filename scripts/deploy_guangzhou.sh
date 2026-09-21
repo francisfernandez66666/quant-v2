@@ -277,6 +277,20 @@ ps1_bom deploy/qmt-win/init_default_config.ps1
 $SCP deploy/qmt-win/init_default_config.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/init_default_config.ps1 -DataDir ${DATA_DIR}"
 
+# ── 3a. 根级 qmt 死键清理（§ROOTQMT，2026-09-22 C批）──
+# 背景：旧生成器曾把 qmt 写在 config.json **根级**，而 Go 解析侧 wrapper 只认 rules/d1 两段
+#       （internal/config/config.go Manager.Load），根级残留被静默忽略——行为无差但持续误导排障。
+#       层级修正（§M7a）后新写的文件已正确落在 rules.qmt，存量残留靠本步收口。
+# 竞态澄清：引擎/researchd 的 Save 是全量落盘且只写 {rules,d1}，清理后不存在回写风险；
+#           引擎每分钟热载（§P1-6），改完自动生效，无需重启服务。
+# 语义：脚本幂等（无残留输出 ROOTQMT: CLEAN），有残留则先备份再原子写回；本步失败**不中断部署**
+#       （与 [2d] 同姿势）——配置面残留不该让整条链半途停在停机态，交人工在 verify 前处理。
+echo "[3a/5] 清理 config.json 根级 qmt 死键 (§ROOTQMT) ..."
+ps1_bom deploy/qmt-win/clean_root_qmt.ps1
+$SCP deploy/qmt-win/clean_root_qmt.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+$SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/clean_root_qmt.ps1 -ConfigPath '${DATA_DIR}/config.json'" \
+  || echo "  [!] 根级 qmt 清理未通过（PARSE_FAIL/ROLLBACK，详见上方 ROOTQMT 输出）——不阻断部署，verify 前人工处理"
+
 # ── 3b. 重启 qmt_gateway（§UAT 20260915 新增）──
 # 背景：步 [2b] 同步了网关 .py，但旧流程不重启网关——新代码要等 5 分钟粒度的
 # QMT-Gateway-Ensure 计划任务"碰巧"拉起才生效（2026-09-15 部署实录：/settlement 端点
@@ -313,6 +327,26 @@ $SCP deploy/qmt-win/restart_gateway.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-w
   [ $gw_ok -eq 1 ] && echo "  OK 网关已就绪 (127.0.0.1:8789/health)" || echo "  X 网关未就绪：远程查看 C:/qmt/quant-trading-v2/qmt_gateway/gateway*.log"
 else
   echo "[3b/5] 跳过网关重启（RESTART_GATEWAY=0）"
+fi
+
+# ── 3c. APK 分发同步（§APPVER 可选步，2026-09-22 C批）──
+# 背景：客户端强制更新改为服务端驱动（GET /api/app/version 下发 apk_url），安装包二进制不入库，
+#       由本机 release 构建产物随部署上传，Caddy 以 /dl/* 暴露（见 deploy/caddy/guangzhou.conf）。
+# 落盘目录必须与 Caddy /dl 块的 root 同源：C:\opt\quant\apk（即 ${DEPLOY_DIR}/apk，
+#       不要写成 ${DEPLOY_DIR}/../apk —— 那会跑到 C:/opt/apk，下载必 404）。
+# 语义：**可选** —— 本机没有 release 产物（缺 MOBILE_KEYSTORE_PASS）时只提示不失败，
+#       APK 缺失不该阻塞前后端发布。
+echo "[3c/5] APK 分发同步（§APPVER 可选步）..."
+APK_LOCAL="mobile/app/build/outputs/apk/release/app-release.apk"
+if [ -f "$APK_LOCAL" ]; then
+  $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path ${DEPLOY_DIR}/apk | Out-Null; exit 0\""
+  if $SCP "$APK_LOCAL" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/apk/quant-latest.apk"; then
+    echo "  OK APK 已同步 -> ${DEPLOY_DIR}/apk/quant-latest.apk（外网下载入口 /dl/quant-latest.apk）"
+  else
+    echo "  [!] APK 上传失败——不阻断部署，可稍后单独重跑本步或手工 scp"
+  fi
+else
+  echo "[ ] 本机无 release APK，跳过上传（需先 MOBILE_KEYSTORE_PASS=xxx ./scripts/build_apk.sh release）"
 fi
 
 # ── 4. 注册 Windows 服务（NSSM）+ qmtctl 任务计划 ──

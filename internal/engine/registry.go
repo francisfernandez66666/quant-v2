@@ -855,6 +855,15 @@ func (r *Registry) build(userID string) *Engine {
 				time.Duration(qmtCfg.TimeoutSec)*time.Second, 1)
 		}
 		ctrl := trading.NewController(exec, opts.RealStore, userID, qmtCfg, onAlert)
+		// §XCHECK 2026-09-22 C批：价格复核闸接线——把统一行情协调器的独立复核取价
+		// （CrossCheckPrice，新浪→腾讯→东财多源链）注入该账号控制器风控闸。
+		// Coordinator 缺席（未装配行情源）时不注入，闸自然跳过；闸默认关（cross_check_pct=0）
+		// 且开启后默认影子（命中仅留痕放行），本接线本身零行为变化。
+		// English: §XCHECK wires the coordinator's independent cross-check price source into the
+		// per-account gate; absent coordinator or pct=0 keeps the gate inert (shadow by default).
+		if opts.Coordinator != nil {
+			ctrl.SetCrossPriceSource(opts.Coordinator.CrossCheckPrice)
+		}
 		// 引擎侧两个库职责分离（§UAT-2026-09-08 修复）：
 		//  - realStore = 实盘账本库（live.db）：pushRealAdvice 读 real_positions 生成建议/自动卖出；
 		//  - d1Store   = 研究库（trading.db）：d1_scores 历史落库（研究侧数据）。

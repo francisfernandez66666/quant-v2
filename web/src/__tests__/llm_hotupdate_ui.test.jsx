@@ -19,6 +19,8 @@ vi.mock('../api/index.js', () => ({
   getStoredServer: () => 'http://127.0.0.1:8080',
   setStoredServer: vi.fn(),
   getAccount: () => 'admin',
+  // §NATIVEAUTH（2026-09-22 C批）：Settings 诊断行改走 api.getToken() 统一读取点，mock 须补齐该导出
+  getToken: () => 'tok',
   getRole: () => 'admin',
   fetchStatus: vi.fn(async () => ({})),
   fetchLLMConfig: vi.fn(async () => ({

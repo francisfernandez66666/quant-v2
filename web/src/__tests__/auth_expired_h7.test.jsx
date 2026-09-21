@@ -13,6 +13,7 @@ import { MemoryRouter } from 'react-router-dom'
 // 每个用例独立控制 isLoggedIn 的返回值（vi.doMock 工厂在动态 import 时才求值，闭包安全）
 let loggedFlag = true
 
+// §H7 用例共用 API mock 基座：默认全接口成功，单测按需覆写个别方法；loggedFlag 控制登录态。
 function apiMockBase() {
   return {
     isLoggedIn: () => loggedFlag,

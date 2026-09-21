@@ -1,4 +1,4 @@
-# ensure_gateway_config.ps1 — §M7c（2026-09-22 修复批）：config.xt.json 收编进部署清单。
+﻿# ensure_gateway_config.ps1 — §M7c（2026-09-22 修复批）：config.xt.json 收编进部署清单。
 # 背景：gateway_watchdog.ps1:31 以 `-c <gw>\config.xt.json` 拉起网关，但该文件过去只有
 # setup_windows.ps1 这一条**手工**路径生成（且要求交互输入资金账号）——全新机器按
 # deploy_guangzhou.sh 部署后文件不存在，网关秒起秒死、watchdog 3 秒一轮刷错误日志

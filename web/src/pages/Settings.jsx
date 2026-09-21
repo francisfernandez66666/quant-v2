@@ -97,7 +97,13 @@ export default function Settings() {
   const [serverOnline, setServerOnline] = useState(false)
 
   const [account] = useState(api.getAccount())
-  const [token] = useState(localStorage.getItem('liangzai_token') || '')
+  // §NATIVEAUTH（2026-09-22 C批）：改走 api.getToken() 统一读取点，不再直读 localStorage 'liangzai_token'
+  // §NATIVEAUTH (2026-09-22 batch C): read through api.getToken() instead of touching localStorage directly —
+  // 原生桥路径下 token 已迁 EncryptedSharedPreferences，直读会显示为空；getToken() 内含原生优先+迁移逻辑。
+  // (with the native bridge the token lives in EncryptedSharedPreferences and a direct read would show empty;
+  //  getToken() handles native-first lookup plus legacy migration). 该行仍是展示当前 token 的诊断行，逻辑不变。
+  //  This line remains a diagnostic display of the current token; behavior unchanged.
+  const [token] = useState(api.getToken() || '')
 
   const [llmApiUrl, setLlmApiUrl] = useState('')
   const [llmApiKeys, setLlmApiKeys] = useState('')

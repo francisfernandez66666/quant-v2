@@ -17,6 +17,8 @@ vi.mock('../api/index.js', () => ({
   setStoredServer: vi.fn(),
   getAccount: () => 'admin',
   getRole: () => ROLE,
+  // §NATIVEAUTH（2026-09-22 C批）：Settings 诊断行改走 api.getToken() 统一读取点，mock 须补齐该导出
+  getToken: () => 'tok',
   fetchStatus: vi.fn(async () => ({})),
   fetchLLMConfig: vi.fn(async () => ({ api_url: '', model: '', classifier_model: '', batch_concurrency: 4, d1_max_tokens: 2048, api_keys: [], configured: false })),
   fetchStrategyConfig: vi.fn(async () => ({ dragon: {}, double_bump: {}, n_shape: {}, dragon_return: {}, momentum: {} })),

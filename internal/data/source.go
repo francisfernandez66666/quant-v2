@@ -682,12 +682,17 @@ func (dc *DataCoordinator) GetIndexData() (indexPrice float64, ma20 float64, upC
 // English: CrossCheckPrice fetches a stock price via EastMoney push2 for signal cross-checking.
 // CrossCheckPrice returns a price via EastMoney push2 for signal cross-checking.
 //
-// §LOW(a) 现状标注（20260922 修复批 G，交主代理裁决，勿顺手删）：
-//   - 全仓 grep 显示本方法当前**零生产消费者**（仅定义处命中），属"死代码但保留"：
-//     按本仓"实现优先于删除"规范未删除，等待 owner 裁决接线（信号复核链路启用）或删除；
-//   - 名不副实提示：注释写"仅东财"，但实际调用的 GetRealtimeQuote 内部已自带
-//     新浪→腾讯→东财 多源链（market.go §S4），故其并非真正的东财单点（SPOF 三方法
-//     兜底批不含它，理由见修复报告）。
+// §XCHECK 接线（2026-09-22 C批）：本方法不再是死代码——
+//   - 消费者：risk.Gate.checkPriceCross（价格复核闸），经 engine/registry.go 装配时
+//     ctrl.SetCrossPriceSource(opts.Coordinator.CrossCheckPrice) 注入各账号实盘控制器；
+//   - 语义：下单参考价与本源取价的偏离超过 qmt.risk_gate.cross_check_pct 即命中；
+//     闸默认关闭（pct=0），开启后默认影子（命中仅 risk_gates 留痕放行，shadow=false 才拒单），
+//     取价失败/价格非法时闸 fail-open 跳过，绝不让复核源故障阻断下单主链路。
+//
+// 沿革说明（§LOW(a) 20260922 修复批 G）：本方法曾长期零消费者，按本仓"实现优先于删除"
+// 规范保留并交 owner 裁决，最终裁决为接线复用（即上）。名不副实提示仍有效：注释写"仅东财"，
+// 但实际调用的 GetRealtimeQuote 内部已自带新浪→腾讯→东财多源链（market.go §S4），
+// 并非真正的东财单点——这恰是复核闸需要的"独立于本单快照的多源链"属性。
 func (dc *DataCoordinator) CrossCheckPrice(code string) (price float64, err error) {
 	si, err := dc.eastMoney.GetRealtimeQuote(code)
 	if err != nil || si == nil {

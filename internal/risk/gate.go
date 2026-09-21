@@ -92,6 +92,12 @@ type Gate struct {
 	now func() time.Time
 	// onGate 告警回调（可空；仅 alert=true 的新闸命中时以 high 级别触发）。
 	onGate func(level, title, content string)
+	// crossPrice §XCHECK 2026-09-22 C批：独立复核价格源（code→价格，可空=闸跳过）。
+	// 由装配层注入 DataCoordinator.CrossCheckPrice（新浪→腾讯→东财多源链），与本单行情
+	// 快照来源解耦——复核的是「两源同刻价差」，快照自身脏了也能被这层抓出来。
+	// English: §XCHECK independent cross-check price source (nil = gate skipped), wired from the
+	// data coordinator so the reference price is verified against a different multi-source chain.
+	crossPrice func(code string) (float64, error)
 }
 
 // NewGate 创建风控闸。onGate 可空（命中时告警回调；新闸默认高优告警，存量守卫不告警）。
@@ -100,13 +106,24 @@ func NewGate(st *store.DB, userID string, onGate func(level, title, content stri
 	return &Gate{st: st, userID: userID, now: time.Now, onGate: onGate}
 }
 
+// SetCrossPriceSource §XCHECK 2026-09-22 C批：注入价格复核闸的独立复核源（可空=闸保持跳过，
+// 零行为变化）。setter 而非构造参数：复核源在引擎装配尾段（registry）才就绪，且旧调用方
+// 无需感知本闸存在。
+// English: §XCHECK injects the cross-check price source (nil keeps the gate inert); a setter
+// because the coordinator is only available late in engine assembly.
+func (g *Gate) SetCrossPriceSource(fn func(code string) (float64, error)) {
+	g.crossPrice = fn
+}
+
 // CheckLiveOrder 下单前置守卫统一入口：按序执行全部闸口，首个命中即返回阻断裁定
 // （后续闸不再评估，行为与既有 controller 短路语义一致）。全部放行返回 Pass。
 // English: single entry for all live-order pre-checks — runs every gate in order and returns the first
 // blocking verdict (later gates are not evaluated, matching the existing short-circuit semantics).
 func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 	// 闸口清单：按序评估，gate=留痕标识，alert=命中是否触发高优告警（新机构级闸为 true），
-	// run 返回非空字符串即视为命中并携带原因。前四项为存量守卫（不告警），后七项含新增机构闸。
+	// run 返回非空字符串即视为命中并携带原因。共 12 道闸（§XCHECK 2026-09-22 C批 新增第 12 道
+	// price_cross_check）：其中 st/blacklist/t1_sellable/buy_discipline/whitelist/max_positions
+	// 为存量守卫（不告警），其余为新增机构闸（命中高优告警）。
 	checks := []struct {
 		gate  string
 		alert bool
@@ -118,6 +135,7 @@ func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
 		{"t1_sellable", false, func() string { return g.checkT1Sellable(cfg, o) }},         // T+1 可卖量（含在途卖单）
 		{"limit_up_down", true, func() string { return g.checkLimitPrice(cfg, o) }},        // 涨停不可追买/跌停不可追卖
 		{"stale_quote", true, func() string { return g.checkStaleQuote(cfg, o) }},          // 行情新鲜度硬闸
+		{"price_cross_check", true, func() string { return g.checkPriceCross(cfg, o) }},    // §XCHECK 价格复核闸（数据类闸与上闸聚拢）
 		{"day_loss", true, func() string { return g.checkDayLoss(cfg, o) }},                // 日内已实现亏损熔断
 		{"concentration", true, func() string { return g.checkConcentration(cfg, o) }},     // 单票市值集中度
 		{"buy_discipline", false, func() string { return g.checkBuyDiscipline(cfg, o) }},   // 买入纪律（已成交笔数/预算/可用资金）
@@ -286,6 +304,54 @@ func (g *Gate) checkStaleQuote(cfg config.QMTConfig, o LiveOrder) string {
 		return fmt.Sprintf("行情快照陈旧: %dms > 阈值 %dms", o.StalenessMs, cfg.RiskGate.StaleQuoteMs)
 	}
 	return ""
+}
+
+// checkPriceCross §XCHECK 2026-09-22 C批 价格复核闸（默认关，买卖双向都查）：
+// 委托参考价与独立复核源价的偏离 |o.Price−cross|/cross×100 超过 cfg.RiskGate.CrossCheckPct 即命中。
+// 与 stale_quote 的分工：新鲜度闸只看「快照多旧」，看不到「快照虽然新但价格本身脏」
+// （单源数据错、除权口径错位等）——本闸用另一条取价链同刻对价，专防这类单源污染价。
+// 复核的是「两源同刻价差」而非趋势判断，故买卖双向同视。
+// 命中姿势（§WS-C 影子惯例，同 signal_ctl.shadow_blacklist）：
+//   - 影子（CrossCheckShadow 非显式 false，默认）→ 仅写 risk_gates 留痕（[shadow] 前缀）+ 放行；
+//   - 正式（shadow=false）→ 返回拒单原因，由 verdict 统一落库并触发高优告警。
+//
+// 跳过/放行（fail-open）分支：闸关闭（pct≤0）/ 未注入复核源 / 参考价缺失（o.Price≤0）/
+// 复核源取价出错或返回 ≤0 ——数据缺口不误拦，与同族数据类闸（stale_quote/limit 无昨收）一致姿势。
+// English: §XCHECK price cross-check (off by default, both sides). Compares the order reference
+// price against an independent quote chain; fails open on any data gap; shadow hits record-and-pass
+// ([shadow] prefix in risk_gates), enforced hits (cross_check_shadow=false) reject + alert.
+func (g *Gate) checkPriceCross(cfg config.QMTConfig, o LiveOrder) string {
+	// 关闭 / 未注入复核源 / 无参考价 → 跳过（零配置零行为变化）。
+	pct := cfg.RiskGate.CrossCheckPct
+	if pct <= 0 || g.crossPrice == nil || o.Price <= 0 {
+		return ""
+	}
+	// 独立源取价：失败或价格非法一律 fail-open——复核的意义是拦「两源同刻真实价差」，
+	// 拿不到复核价时没有判定依据，宁可放行也不因数据缺口误拦（与同族数据类闸一致）。
+	cross, err := g.crossPrice(o.Code)
+	if err != nil || cross <= 0 {
+		return ""
+	}
+	// 偏离度 = |参考价 − 复核价| / 复核价 × 100（分母取复核侧，与"以独立源为准"语义一致）。
+	dev := (o.Price - cross) / cross * 100
+	if dev < 0 {
+		dev = -dev
+	}
+	if dev <= pct {
+		return ""
+	}
+	// 中文格式化拒单文案：含代码、两价、实测偏差与阈值，供 risk_gates 留痕与告警直读。
+	reason := fmt.Sprintf("价格复核偏差超限: %s 参考价 %.3f 与独立复核价 %.3f 偏离 %.2f%% > 阈值 %.2f%%（两源同刻价差，疑似单源脏价）",
+		o.Code, o.Price, cross, dev, pct)
+	// 影子期（默认）：只留痕放行——留痕走 RecordRiskGate 直写（不经 verdict，verdict 语义是拒单），
+	// 原因带 [shadow] 前缀供前端闸口卡片/审计区分；正式化（shadow=false）才返回原因拒单。
+	if !cfg.RiskGate.CrossCheckEnforce() {
+		if g.st != nil {
+			_ = g.st.RecordRiskGate(g.userID, g.today(), "price_cross_check", "[shadow] "+reason)
+		}
+		return ""
+	}
+	return reason
 }
 
 // checkDayLoss 日内已实现亏损熔断（默认关）：今日卖出已实现亏损占总资产比例达阈值 → 熔断当日新买入

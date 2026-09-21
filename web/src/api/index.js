@@ -201,6 +201,24 @@ const STORAGE_ROLE = 'liangzai_role'
 // STORAGE_ROLE holds the logged-in account role (admin/member); the role bitmap is written from the login response
 const STORAGE_PERMS = 'liangzai_perms'
 
+// §NATIVEAUTH（2026-09-22 C批）：探测移动端原生壳注入的安全存储桥 window.AndroidAuth
+// §NATIVEAUTH (2026-09-22 batch C): detect the native-shell bridge window.AndroidAuth for secure token storage
+// 桥只存在于新版 APK 内嵌 WebView（getToken/setToken(str):bool/clearToken():bool 三个同步方法），
+// 纯浏览器与旧 APK 均无此桥，自然回落 localStorage 路径，行为完全不变。
+// The bridge only exists inside the new APK's embedded WebView (three sync methods:
+// getToken/setToken(str):bool/clearToken():bool); plain browsers & old APK have none and fall back to localStorage.
+// 为什么不做 origin 判定：原生注入本身即信任边界（只对 appassets 内嵌页注入），
+// Why no origin check: the native injection itself is the trust boundary (injected only into the appassets page),
+// token 由此落入 EncryptedSharedPreferences（AndroidKeyStore 托管主密钥），root/adb-backup 的静态读取面收小；
+// the token then lives in EncryptedSharedPreferences (master key held by AndroidKeyStore), shrinking the static
+// read surface via root/adb-backup;
+// JS 运行时可达性与 localStorage 等价（威胁模型不劣化）。
+// JS-runtime reachability stays equivalent to localStorage (no threat-model regression).
+function nativeAuthBridge() {
+  return (typeof window !== 'undefined' && window.AndroidAuth &&
+          typeof window.AndroidAuth.setToken === 'function') ? window.AndroidAuth : null
+}
+
 // 从 localStorage 读取服务器基础地址
 // Reads the base server URL from localStorage
 // 说明：所有请求均基于该地址拼接相对路径；未配置时返回空串，表示使用同源相对请求
@@ -220,24 +238,80 @@ function baseUrl() {
   return ''
 }
 
-// 从 localStorage 读取 JWT 令牌
-// Reads the JWT token from localStorage
+// 读取当前 JWT 令牌：原生桥优先，无桥回落 localStorage
+// Reads the JWT token: native secure-storage bridge first, falls back to localStorage when absent
 // 说明：令牌由登录接口写入，后续每个请求都会携带该令牌完成鉴权
 // Note: the token is written by the login endpoint; every later request carries it for authentication
-function getToken() {
-  return localStorage.getItem(STORAGE_KEY)
+// §NATIVEAUTH（2026-09-22 C批）迁移语义：新版 APK 首启且用户未重新登录时，桥内为空但
+// §NATIVEAUTH (2026-09-22 batch C) migration semantics: on the new APK's first launch without a re-login,
+// localStorage 里还留着旧版明文 token —— 读到即自动上桥迁移（setToken 成功才删本地明文副本），
+// the bridge is empty while localStorage still holds the legacy plaintext token — migrate it up on read
+// 失败则暂留 localStorage 继续返回旧值，保证升级后不掉登录态。
+// (setToken success is required before removing the local plaintext copy; on failure keep and return it,
+//  so an upgrade never drops the logged-in state).
+// 导出供 Settings.jsx 替换对 'liangzai_token' 的直读（诊断展示当前 token）。
+// Exported so Settings.jsx replaces its direct 'liangzai_token' read (diagnostic token display).
+export function getToken() {
+  const bridge = nativeAuthBridge()
+  if (!bridge) return localStorage.getItem(STORAGE_KEY)
+  try {
+    const native = bridge.getToken()
+    if (native) return native
+  } catch (e) {
+    // 桥调用异常（理论上不该发生）：回落 localStorage，鉴权不因桥故障而中断
+    // Bridge call threw (shouldn't happen in theory): fall back to localStorage, auth survives bridge faults
+    if (typeof console !== 'undefined') console.warn('[api] AndroidAuth.getToken 异常，回落 localStorage:', e && e.message)
+    return localStorage.getItem(STORAGE_KEY)
+  }
+  // 桥内为空 → 迁移旧版明文 token 上桥
+  // Bridge empty → migrate the legacy plaintext token up to the bridge
+  const legacy = localStorage.getItem(STORAGE_KEY)
+  if (!legacy) return null
+  try {
+    if (bridge.setToken(legacy)) {
+      localStorage.removeItem(STORAGE_KEY) // 明文已入加密存储，立即清除历史副本
+      return legacy
+    }
+  } catch (e) {
+    if (typeof console !== 'undefined') console.warn('[api] AndroidAuth.setToken 迁移失败:', e && e.message)
+  }
+  return legacy // 上桥失败：暂留 localStorage 明文（下次读取再尝试迁移），登录态优先
 }
 
-// 将登录成功后返回的 token、账号等信息持久化到 localStorage
-// Persists the token / account returned after a successful login into localStorage
+// 将登录成功后返回的 token、账号等信息持久化：token 原生桥优先，账号/角色/权限仍留 localStorage
+// Persists the token / account returned after a successful login: token goes to the native bridge first,
+// account/role/perms stay in localStorage
 // @param {string} token      - JWT 访问令牌
 // @param {string} token      - JWT access token
 // @param {string} account    - 登录账号名（可空）
 // @param {string} account    - logged-in account name (may be empty)
 // @param {string} expiresAt  - 令牌过期时间（预留参数，当前未使用，用于将来做本地过期校验）
 // @param {string} expiresAt  - token expiry time (reserved, currently unused, for future local expiry checks)
-function storeAuth(token, account, expiresAt, role, perms) {
-  localStorage.setItem(STORAGE_KEY, token)
+// §NATIVEAUTH（2026-09-22 C批）：有桥时 token 只写原生加密存储、不再写 STORAGE_KEY，
+// §NATIVEAUTH (2026-09-22 batch C): with the bridge, the token is written only to native secure storage
+// 并顺手 removeItem(STORAGE_KEY) 清掉历史明文副本（旧版本残留）；
+// and the leftover plaintext copy from older versions is removed;
+// account/role/perms 为非敏感展示信息维持 localStorage（无迁移价值）。
+// account/role/perms are non-sensitive display info and stay in localStorage (not worth migrating).
+// 无桥（纯浏览器/旧 APK）行为完全不变。导出供 native_auth 单测直接驱动写入路径。
+// Without the bridge (plain browser / old APK) behavior is unchanged. Exported for the native_auth unit tests.
+export function storeAuth(token, account, expiresAt, role, perms) {
+  const bridge = nativeAuthBridge()
+  if (bridge) {
+    let stored = false
+    try {
+      stored = !!bridge.setToken(token)
+    } catch (e) {
+      if (typeof console !== 'undefined') console.warn('[api] AndroidAuth.setToken 异常，回落 localStorage:', e && e.message)
+    }
+    if (stored) {
+      localStorage.removeItem(STORAGE_KEY) // 清历史明文副本：token 已落 EncryptedSharedPreferences
+    } else {
+      localStorage.setItem(STORAGE_KEY, token) // 上桥失败兜底：宁可留明文也不丢登录态
+    }
+  } else {
+    localStorage.setItem(STORAGE_KEY, token)
+  }
   localStorage.setItem(STORAGE_ACCOUNT, account || '')
   localStorage.setItem(STORAGE_ROLE, role || 'user')
   localStorage.setItem(STORAGE_PERMS, JSON.stringify(perms || []))
@@ -250,7 +324,19 @@ function storeAuth(token, account, expiresAt, role, perms) {
  * Removes both token and account so isLoggedIn() immediately becomes false
  */
 // 清空本地登录态（token/账号/角色/权限）
+// §NATIVEAUTH（2026-09-22 C批）：有桥时同步 clearToken()——localStorage 与原生加密存储双清，
+// §NATIVEAUTH (2026-09-22 batch C): with the bridge also call clearToken() — clearing both
+// 防残票（只清一边会留下可用令牌成"残票"，退出后仍可被请求携带续用）。
+// localStorage and native secure storage, so no residual token survives logout.
 export function clearAuth() {
+  const bridge = nativeAuthBridge()
+  if (bridge) {
+    try {
+      bridge.clearToken()
+    } catch (e) {
+      if (typeof console !== 'undefined') console.warn('[api] AndroidAuth.clearToken 异常:', e && e.message)
+    }
+  }
   localStorage.removeItem(STORAGE_KEY)
   localStorage.removeItem(STORAGE_ACCOUNT)
   localStorage.removeItem(STORAGE_ROLE)
@@ -264,7 +350,13 @@ export function clearAuth() {
 // 登出：通知后端作废会话并清本地凭据
 export async function logout() {
   const base = baseUrl()
-  const token = localStorage.getItem(STORAGE_KEY)
+  // §NATIVEAUTH（2026-09-22 C批）：改走 getToken() 而非直读 localStorage——token 在原生路径下
+  // §NATIVEAUTH (2026-09-22 batch C): read via getToken() instead of raw localStorage — under the native
+  // bridge the token lives in secure storage, a direct localStorage read would miss it and the server-side
+  // session would never be revoked（拿不到票 → 服务端会话不吊销）。
+  // 必须在 clearAuth() 前捕获（快照 token 供吊销请求使用）。
+  // Must capture before clearAuth() (snapshot token carried by the revoke request).
+  const token = getToken()
   clearAuth() // 立即清，网络请求带快照 token 继续跑
   if (!token) return
   try {

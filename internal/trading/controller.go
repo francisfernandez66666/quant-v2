@@ -241,6 +241,15 @@ func (c *Controller) SetLastReport(kind string) {
 	c.mu.Unlock()
 }
 
+// SetCrossPriceSource §XCHECK 2026-09-22 C批：为风控闸注入价格复核的独立复核源
+// （透明委托给 risk.Gate——复核逻辑全部在闸内，控制器只做装配透传）。gate 在
+// NewController 恒非 nil（见构造函数 :107 装配），无需判空；fn 传 nil 即令本闸保持跳过。
+// English: §XCHECK wires the independent cross-check price source through to the risk gate
+// (pass-through only — all logic lives in the gate; the gate is always non-nil here).
+func (c *Controller) SetCrossPriceSource(fn func(code string) (float64, error)) {
+	c.gate.SetCrossPriceSource(fn)
+}
+
 // StateSnapshot 互通健康快照：下行（首尔探测网关）+ 上行（网关回报到首尔）两侧状态，
 // 供 /api/qmt/state、仪表盘系统行与量化交易页消费。零值时间表示"从未发生"。
 // English: connectivity snapshot for the dashboard/system row and quant page — downlink probe
