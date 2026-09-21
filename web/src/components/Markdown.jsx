@@ -5,6 +5,7 @@
 // React 节点而非拼接 HTML 字符串——任何用户输入都无法注入标签。
 import React from 'react'
 
+// 根容器样式：字号/行高贴合聊天气泡，word-break 防长代码/URL 撑破布局。
 const rootStyle = { fontSize: 14, lineHeight: 1.62, wordBreak: 'break-word' }
 const headingStyle = (level) =>
   level === 2

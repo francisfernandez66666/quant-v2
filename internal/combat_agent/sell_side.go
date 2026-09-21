@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -26,19 +27,30 @@ import (
 // volume distribution > momentum exhaustion). One sell-side signal per stock, leveled by the most
 // severe factor, with the Reason summarizing all tripped factors.
 type sellSideFactor struct {
+	kind   string // 结构化因子类别：event/break/dist/momentum（供两轮确认按类摘除，不靠 reason 文本识别）
 	level  string // 级别：清仓(利空事件)/减仓(破位·派发)/提示(动量衰竭)
 	action string // 操作建议：卖出（一律卖出方向，仅提醒）
 	reason string // 该因素命中说明
 	score  int    // 严重度（越大越严重，决定最终级别）
 }
 
+// 因子类别常量（§P4 缺陷1：放量派发需连续两轮命中才确认，按 kind 摘除未确认因子）。
+const (
+	kindEvent        = "event"    // 利空D1 事件面
+	kindBreak        = "break"    // 破MA5·MA20 趋势破位
+	kindDistribution = "dist"     // 放量派发
+	kindMomentum     = "momentum" // 动量衰竭
+)
+
 // assessSellFactor 判定单只个股的四项卖点因素并返回命中集合（未命中则空）。
 // 数据全部取自分池快照：事件面用 d1Scores（Blocked=负面过滤拦截），
 // 行情面用 md 的日K/实时量价（破位/派发），动量用分钟 MACD 与动量分（衰竭）。
+// now 显式传入：派发判据依赖时段阈值折算，测试需要确定时刻（P4 缺陷2）。
 // English: judges the four sell factors for one stock and returns the tripped set (empty when none).
 // Event face uses d1Scores (Blocked = negative-filter interception); price face uses md's daily bars
 // and live quote (breakdown/distribution); momentum uses the minute MACD and the momentum score.
-func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Score, mScore float64, mThreshold float64) []sellSideFactor {
+// now is explicit: the distribution gate is time-of-day dependent, so tests pin the clock.
+func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Score, mScore float64, mThreshold float64, now time.Time) []sellSideFactor {
 	var factors []sellSideFactor
 
 	// 1. 利空D1：负面过滤拦截（立案/减持/质押/解禁等），属于事件面强卖点 → 清仓级
@@ -46,6 +58,7 @@ func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Sco
 	// pledge/restricted-unlock…), a strong event-based sell point → close-out level.
 	if d1.Blocked {
 		factors = append(factors, sellSideFactor{
+			kind:   kindEvent,
 			level:  "清仓",
 			action: "卖出",
 			reason: fmt.Sprintf("利空事件(负面过滤拦截): %s", d1.Reason),
@@ -68,6 +81,7 @@ func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Sco
 		}
 		if ma5 > 0 && ma20 > 0 && cur < ma5 && cur < ma20 {
 			factors = append(factors, sellSideFactor{
+				kind:   kindBreak,
 				level:  "减仓",
 				action: "卖出",
 				reason: fmt.Sprintf("现价%.2f 同时跌破MA5(%.2f)/MA20(%.2f),短期趋势转弱", cur, ma5, ma20),
@@ -76,21 +90,29 @@ func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Sco
 		}
 	}
 
-	// 3. 放量派发：当日实时量明显放大（>1.5倍前20日均量）且价格下跌 → 资金派发特征。
+	// 3. 放量派发：三重判据（§P4 缺陷1/2 收紧，旧版「折算量比>1.5 且跌幅<0」上午把缩量洗盘
+	//    都报成派发）——① 原始累计量≥前20日均量（缩量一票否决，任何时段不得命中）；
+	//    ② 折算量比超时段阈值（上午线性外推虚高，阈值提到 2.2，午后 1.5）；
+	//    ③ 跌幅有下限 −1.5%（-0.13% ≈ 平盘不算派发）。另需连续两轮命中才出信号（防单轮插针），
+	//    确认状态机在 AssessSellSide 侧按 kind 摘除未确认因子。
 	// §修复 P2#26：今日累计量按已流逝交易时间折算全天等值后与均量比较（旧实现直接比，
-	// 上午的放量下跌常因累计量不足被漏判成不放量）。English: P2#26 — prorate today's cumulative
-	// volume to a full-day equivalent before comparing (the raw comparison missed morning distribution).
-	// English: volume distribution — today's live volume expands (>1.5× prior 20-day average) while the
-	// price falls, a capital-distribution signature.
+	// 上午的放量下跌常因累计量不足被漏判成不放量）。
+	// English: distribution — triple gate (P4 tightened): raw cumulative volume must already reach
+	// the 20-day average (a shrinking tape can never trip it at any hour), the prorated ratio must beat
+	// the time-of-day threshold (2.2 in the morning where linear proration over-extrapolates, 1.5
+	// after lunch), and the decline must be at least 1.5%. Two consecutive tripping rounds are then
+	// required in AssessSellSide (no single-tick spike).
 	if q := md.Quote; q != nil && q.Price > 0 && q.Volume > 0 {
 		kl := md.KLines
 		if len(kl) >= 21 {
 			avgV := avgVol(kl[:len(kl)-1], 20)
-			if avgV > 0 && intradayVolumeRatio(time.Now(), q.Volume, avgV) > 1.5 && md.ChangePct < 0 {
+			ratio := intradayVolumeRatio(now, q.Volume, avgV)
+			if avgV > 0 && q.Volume >= avgV && ratio > distributionRatioThreshold(now) && md.ChangePct <= -1.5 {
 				factors = append(factors, sellSideFactor{
+					kind:   kindDistribution,
 					level:  "减仓",
 					action: "卖出",
-					reason: fmt.Sprintf("放量下跌: 折算日量=%.1f倍均量, 跌幅%.2f%%, 有资金派发迹象", intradayVolumeRatio(time.Now(), q.Volume, avgV), md.ChangePct),
+					reason: fmt.Sprintf("放量下跌: 折算日量=%.1f倍均量, 跌幅%.2f%%, 有资金派发迹象", ratio, md.ChangePct),
 					score:  2,
 				})
 			}
@@ -104,6 +126,7 @@ func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Sco
 		m := md.MinuteMACD
 		if m.DIF != 0 && m.DEA != 0 && m.DIF < 0 && m.DIF < m.DEA && m.Bar < 0 {
 			factors = append(factors, sellSideFactor{
+				kind:   kindMomentum,
 				level:  "提示",
 				action: "卖出",
 				reason: fmt.Sprintf("动量衰减: 动量分%.0f<%.0f/2, 分钟MACD零下死叉(DIF=%.3f DEA=%.3f), 上涨动能衰竭", mScore, mThreshold, m.DIF, m.DEA),
@@ -122,16 +145,37 @@ func assessSellFactor(code string, md *strategy_engine.StockMarketData, d1 D1Sco
 	return factors
 }
 
+// distConfirmed 放量派发「连续两轮命中」确认器（§P4 缺陷1 防单轮插针）：
+// 本轮命中则计数+1，未命中则清零（delete）；计数≥2 才视为确认。
+// 跨交易日整表清零（同 momentumPrev 口径），避免昨日计数带到今天。
+// English: the two-consecutive-round confirmer for volume distribution — a tripping round increments
+// the per-code counter, a non-tripping round resets it, and only counter>=2 confirms. The map is wiped
+// across trading days like the momentum gate's.
+func (a *Agent) distConfirmed(code string, hit bool, now time.Time) bool {
+	day := cntime.In(now).Format("20060102")
+	a.distMu.Lock()
+	defer a.distMu.Unlock()
+	if a.distHits == nil || a.distDay != day {
+		a.distHits = make(map[string]int)
+		a.distDay = day
+	}
+	if !hit {
+		delete(a.distHits, code)
+		return false
+	}
+	a.distHits[code]++
+	return a.distHits[code] >= 2
+}
+
 // AssessSellSide 对打分池内每只个股执行逐股卖出评估，返回卖点提醒信号（仅提醒，不自动执行）。
 // 入参 codes 为个股列表，md 为行情快照，d1Scores 为最近一轮 D1 评分，scores 为 8a/8b 打分结果，
 // shortEnabled 为做空开关：关闭（仅做多）时调用方应只传持仓代码，本方法按卖出方向输出；
-// 开启（做多+做空）时卖点评估的级别徽标改为方向词"做空"（卖出方向），Reason 保留原清仓/减仓/提示等级。
-// 数据或评分缺失的个股跳过，未命中任何因素的个股不产生信号。
+// 开启（做多+做空）时卖点评估的级别徽标改为方向词"做空"（卖出方向），原级别改由结构化字段
+// SellLevel 携带（§P4 缺陷3：展示层不再从 reason 子串/默认帽猜级别），Reason 保留等级文本兼容旧展示。
+// 放量派发因子需连续两轮命中才计入信号（§P4 缺陷1）。数据或评分缺失的个股跳过，未命中任何因素的个股不产生信号。
 // English: runs the per-stock sell-point assessment for every code in the pool and returns the pull
-// reminders (reminder-only). Inputs are the code list, market snapshot, the latest D1 scores and the
-// 8a/8b score table; when shortEnabled is set the level badge becomes the direction word "做空" (sell
-// direction) while the original 清仓/减仓/提示 severity stays in the Reason. Stocks with missing
-// data/scores are skipped, and those hitting nothing get none.
+// reminders (reminder-only). Distribution needs two consecutive tripping rounds; in short mode the level
+// travels in the structured SellLevel instead of being guessed from the reason text.
 func (a *Agent) AssessSellSide(codes []string, md map[string]*strategy_engine.StockMarketData, d1Scores map[string]D1Score, scores map[string]StockScores, shortEnabled bool) []Signal {
 	now := time.Now()
 	mThreshold := a.momentumSignalThreshold()
@@ -145,7 +189,28 @@ func (a *Agent) AssessSellSide(codes []string, md map[string]*strategy_engine.St
 		if sc, ok := scores[code]; ok {
 			mScore = sc.MomentumScore
 		}
-		factors := assessSellFactor(code, sd, d1Scores[code], mScore, mThreshold)
+		factors := assessSellFactor(code, sd, d1Scores[code], mScore, mThreshold, now)
+		// 派发两轮确认：本轮命中派发因子但尚未连续两轮 → 摘除该因子（其余因素照常评估）
+		// English: drop the distribution factor until it has tripped two consecutive rounds.
+		hitDist := false
+		for _, f := range factors {
+			if f.kind == kindDistribution {
+				hitDist = true
+			}
+		}
+		if hitDist {
+			if !a.distConfirmed(code, true, now) {
+				kept := factors[:0:0]
+				for _, f := range factors {
+					if f.kind != kindDistribution {
+						kept = append(kept, f)
+					}
+				}
+				factors = kept
+			}
+		} else {
+			a.distConfirmed(code, false, now) // 未命中轮清零计数
+		}
 		if len(factors) == 0 {
 			continue
 		}
@@ -172,6 +237,7 @@ func (a *Agent) AssessSellSide(codes []string, md map[string]*strategy_engine.St
 			Direction:   direction,
 			Action:      alpha.action,
 			AlertType:   alertType,
+			SellLevel:   alpha.level, // 结构化原级别（清仓/减仓/提示），做空模式下展示层靠它定帽
 			Price:       sd.Price,
 			Confidence:  float64(len(factors)) * 0.25,
 			Reason:      reason,

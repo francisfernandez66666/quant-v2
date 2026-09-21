@@ -530,6 +530,7 @@ func parseTHSLine(body []byte, isMinute bool) ([]KLine, error) {
 		return nil, err
 	}
 
+	// 逐行解析 CSV → K线结构：字段数不足/数值解析失败的脏行直接跳过（不因一行坏数据废整段历史）。
 	klines := make([]KLine, 0, len(rows))
 	for _, line := range rows {
 		parts := strings.Split(line, ",")

@@ -115,4 +115,35 @@ jobs:
           grep -q 'api/paper/buy' "$ub" || { echo "$ub 缺模拟盘持仓 seed"; exit 1; }
           grep -q 'market_risk_daily' "$ub" || { echo "$ub 缺情绪日线 seed"; exit 1; }
           grep -q 'api/tenants/t_default' "$ub" || { echo "$ub 缺租户配额上调"; exit 1; }
+          grep -q 'sell_unified_mode' "$ub" || { echo "$ub 缺 §SELLPOINT-UNIFY 卖出统一模式 seed（应与 nightly 同口径显式 pin shadow）"; exit 1; }
           echo "ok - uat_bootstrap.sh 自举流程完整"
+
+      # §SELLPOINT-UNIFY（2026-09-21）卖出并轨静态锁：go 测试矩阵已随 `go test ./...` 全量覆盖
+      # （signalctl/sell_test、engine 影子与切闸、trading fromSignal、combat_agent 派发门、
+      # data cleaner、e2e 全链路），此处只补「防复活」类守卫——回归测试会随重构漂移，
+      # 而这些负向锁是 owner 拍板语义的物理保证（scripts/verify_changes.sh §27 同口径子集）。
+      - name: §SELLPOINT-UNIFY 卖出并轨静态锁
+        run: |
+          bash -n scripts/verify_changes.sh || { echo "verify_changes.sh 语法错误"; exit 1; }
+          # 锁① 利空/抛售子串→止损高 的映射必须已物理删除（护栏①，防复活）
+          if grep -q 'Contains(sig.Reason, "利空")' internal/trading/advice.go; then
+            echo "advice.go 利空子串→止损映射复活（§SELLPOINT 护栏①）"; exit 1
+          fi
+          # 锁② 派发判据三要素 + 两轮确认状态机在位（P4 缺陷1/2）
+          grep -q 'md.ChangePct <= -1.5' internal/combat_agent/sell_side.go || { echo "派发跌幅下限丢失"; exit 1; }
+          grep -q 'q.Volume >= avgV' internal/combat_agent/sell_side.go || { echo "缩量地板丢失"; exit 1; }
+          grep -q 'distributionRatioThreshold' internal/combat_agent/sell_side.go || { echo "时段阈值未接线"; exit 1; }
+          grep -q 'distConfirmed' internal/combat_agent/sell_side.go || { echo "两轮确认状态机丢失"; exit 1; }
+          # 锁③ 灰度开关在位且提交口径绝不默认 on（三态 ""/shadow→off→on，切闸须 owner 手动改配置）
+          grep -q 'SellUnifiedMode' internal/config/config.go || { echo "sell_unified_mode 配置项缺失"; exit 1; }
+          if grep -rn --exclude=ci.yml --include='*.go' --include='*.sh' --include='*.yml' \
+              'SellUnifiedMode: *"on"\|"sell_unified_mode": *"on"' \
+              internal/ scripts/ .github/workflows/ | grep -v '_test.go'; then
+            echo "提交内容中出现 sell_unified_mode=on 硬编码（切闸只允许运行期配置）"; exit 1
+          fi
+          # 锁④ paper 自动卖出唯一出口 + 主循环每轮裁决钩子（P3 双账一口径）
+          grep -q 'func (e \*Engine) ApplyUnifiedSell' internal/paper/unified_sell.go || { echo "paper 统一出口缺失"; exit 1; }
+          grep -q 'judgePaperLedgers' internal/engine/engine.go || { echo "主循环 paper/report 裁决未接线"; exit 1; }
+          # 锁⑤ CI 两套 UAT 栈（nightly / 本机自举）必须显式 pin shadow，防"未配置即随机模式"漂移
+          grep -q '"sell_unified_mode": "shadow"' .github/workflows/nightly-e2e.yml || { echo "nightly-e2e 未显式 pin shadow"; exit 1; }
+          echo "ok - §SELLPOINT-UNIFY 静态锁 5 道全过"

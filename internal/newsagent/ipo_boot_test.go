@@ -84,8 +84,11 @@ func TestBuildIPOBootEvents(t *testing.T) {
 	if !foundRobot {
 		t.Fatalf("事件应归因机器人板块, got %v", ev.Sectors)
 	}
-	if !containsStr(ev.RelatedStocks, "卧龙电驱") || !containsStr(ev.RelatedStocks, "三花智控") {
-		t.Fatalf("事件应含上下游影响个股(卧龙电驱/三花智控), got %v", ev.RelatedStocks)
+	// §D1 归因护栏1（2026-09-21）反向锁：mock LLM 照常吐出 related_stocks/upstream/downstream，
+	// 解析层必须物理丢弃（个股名单只允许数据源供给：标题点名/stock_list/成分股传播）。
+	// 本例 IPO 启动标题不含任何 A 股公司全名 → 事件个股必须为空。
+	if len(ev.RelatedStocks) != 0 {
+		t.Fatalf("LLM 提案个股必须被丢弃（护栏1），got %v", ev.RelatedStocks)
 	}
 	if ev.Score <= 0 || ev.Direction != "利好" {
 		t.Fatalf("IPO启动事件应利好正分, got score=%v dir=%s", ev.Score, ev.Direction)

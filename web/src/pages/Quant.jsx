@@ -12,6 +12,7 @@ import { Card, Form, Input, Button, Tag, Table, MessagePlugin } from 'tdesign-re
 import * as api from '../api/index.js'
 import { confirmDialog } from '../ui.jsx'
 import { fmtCNY2 } from '../utils'
+import { verdictDisplay } from './quantVerdicts.js'
 
 // 战法分组标签：form=内置形态战法、factor=因子战法、pattern=形态自动发现战法。
 // 后端 /api/config/qmt 的 known_strategies 为 [{id,name,kind}]；因子/形态战法审批注入后自动出现。
@@ -999,26 +1000,34 @@ export default function Quant() {
         </div>
       </Card>
 
-      {/* §SIGNAL_CONTROLLER 信号裁定留痕卡：为何"提醒了却没成交"——白名单/黑名单/持续性确认窗的结构化答案 */}
+      {/* §SIGNAL_CONTROLLER 信号裁定留痕卡：为何"提醒了却没成交"——白名单/黑名单/持续性确认窗的结构化答案。
+          §SELLPOINT-UNIFY（2026-09-21）：卖出统一裁决（stage=sell_discipline）与买入共用本环，
+          文案按环节翻译（处置/观察窗预警 vs 拦截/待确认），映射抽到 quantVerdicts.js 由 vitest 锁死。 */}
       <Card title="信号裁定留痕" style={{ marginBottom: 14 }}>
         <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 8 }}>
-          信号控制器（战法白名单/个股·板块黑名单/持续性确认窗）对买入信号的拦截与观察记录；消息中心对应条目带 ⛔ 标注。
+          信号控制器对买入信号的拦截与观察记录（白名单/个股·板块黑名单/持续性确认窗），以及卖出纪律裁决留痕
+          （触线进窗=观察窗预警、窗结算处置=卖出「处置」行；shadow 灰度期处置行不执行只投影）；消息中心对应条目带 ⛔ 标注。
         </div>
         {verdicts && verdicts.length ? (
           <Table data={verdicts} rowKey={(r) => String(r.at) + r.channel + r.code + r.verdict} size="small" pagination={{ pageSize: 10, total: verdicts.length }}
             columns={[
               { colKey: 'at', title: '时间', width: 150, cell: ({ row }) => (row.at || '').slice(11, 19) },
+              { colKey: 'stage', title: '环节', width: 70, cell: ({ row }) => {
+                  const d = verdictDisplay(row)
+                  return <Tag theme={d.stageLabel === '卖出' ? 'primary' : 'default'} variant="light-outline">{d.stageLabel}</Tag>
+                } },
               { colKey: 'channel', title: '通道', width: 70, cell: ({ row }) => (row.channel === 'live' ? '实盘' : '模拟') },
-              { colKey: 'verdict', title: '裁定', width: 90, cell: ({ row }) => (
-                <Tag theme={row.verdict === 'block' ? 'danger' : 'warning'}>{row.verdict === 'block' ? (row.shadow ? '影子拦截' : '拦截') : '待确认'}</Tag>
-              ) },
+              { colKey: 'verdict', title: '裁定', width: 110, cell: ({ row }) => {
+                  const d = verdictDisplay(row)
+                  return <Tag theme={d.theme}>{d.label}</Tag>
+                } },
               { colKey: 'code', title: '代码', width: 90 },
               { colKey: 'strategy', title: '战法', width: 120 },
               { colKey: 'reason', title: '原因', cell: ({ row }) => <span title={row.reason}>{row.reason}</span> },
             ]}
           />
         ) : (
-          <div style={{ padding: '6px 2px', color: 'var(--app-text-2)', fontSize: 12 }}>暂无拦截/待确认记录——所有买入信号都直接过了准入裁定</div>
+          <div style={{ padding: '6px 2px', color: 'var(--app-text-2)', fontSize: 12 }}>暂无拦截/待确认/卖出裁决记录——买卖信号都直接过了裁定</div>
         )}
       </Card>
 

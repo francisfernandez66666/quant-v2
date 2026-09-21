@@ -372,6 +372,7 @@ func (t *fixtureTransport) thsQuote(req *http.Request) (*http.Response, error) {
 		return t.json(empty)
 	}
 
+	// 同花顺行情按 fixture CSV 组装：未收录代码/字段不足回空 items（真实源无数据即空，不造数）。
 	csv, ok := t.fix.Quotes[code]
 	if !ok {
 		return t.json(empty)

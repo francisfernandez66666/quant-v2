@@ -281,6 +281,8 @@ type overlapPageTransport struct {
 	overlap int
 }
 
+// RoundTrip 假传输：主站推送2域名一律回 EOF（模拟镜像故障），其余域名按 pageCounts 造成分股页。
+// English: fake transport — primary push2 host always EOFs (mirror outage), others serve canned pages.
 func (t *overlapPageTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Hostname() == emPrimaryPush2Host {
 		return nil, fmt.Errorf("EOF")

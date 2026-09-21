@@ -107,7 +107,8 @@ jobs:
               "price_type": "limit", "max_positions": 5, "fixed_amount": 20000,
               "initial_capital": 500000, "daily_max_buys": 3,
               "daily_budget_amount": 100000, "max_order_amount": 50000,
-              "miss_heartbeat_sec": 120
+              "miss_heartbeat_sec": 120,
+              "sell_unified_mode": "shadow"
             }'
 
       - name: Seed market_risk_daily（情绪回看用例依赖）

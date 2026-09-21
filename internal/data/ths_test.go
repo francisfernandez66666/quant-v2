@@ -25,6 +25,8 @@ type thsRecorderTransport struct {
 	gotURL     []string
 }
 
+// RoundTrip 记录器传输：按 URL 关键字返回预置的日线/分钟线固定报文，同时登记请求 URL 供断言。
+// English: recorder transport — returns canned daily/minute payloads by URL keyword and logs URLs.
 func (t *thsRecorderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.gotURL = append(t.gotURL, req.URL.String())
 	body := t.dailyBody

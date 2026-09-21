@@ -60,3 +60,18 @@ func intradayVolumeRatio(now time.Time, cumVol, avgDailyVol float64) float64 {
 	}
 	return cumVol * (240 / elapsed) / avgDailyVol
 }
+
+// distributionRatioThreshold 放量派发分支的折算量比阈值，随时段取 U 形权重（§P4 缺陷2）：
+// A股日内量分布偏重早盘（前 85 分钟常见占全天 40~50%，高于线性折算假设的 35.4%），
+// 线性外推在上午必然虚高——11:30 前（含午休，elapsed≤120）阈值从 1.5 提到 2.2 抵消虚高，
+// 午后维持 1.5。配合 sell_side 的「原始累计量≥日均量」缩量地板，缩量大跌不再报派发。
+// English: time-of-day threshold for the distribution branch — A-share volume skews to the morning
+// (the first ~85 minutes often carry 40-50% of the day, above the 35.4% linear proration assumes),
+// so the prorated ratio is inflated before noon: the threshold rises to 2.2 until 11:30 and stays
+// 1.5 in the afternoon.
+func distributionRatioThreshold(now time.Time) float64 {
+	if tradingMinutesElapsed(now) <= 120 {
+		return 2.2
+	}
+	return 1.5
+}

@@ -342,6 +342,13 @@ type QMTConfig struct {
 	// closes the position automatically; TP/trim stay reminder-only. Idempotent per day via signal_id.
 	// 自动卖出
 	AutoSell bool `json:"auto_sell"`
+	// SellUnifiedMode §SELLPOINT-UNIFY（2026-09-21）卖出统一裁决灰度开关：
+	// shadow（默认）=signalctl 卖出裁决层影子运行，只留痕对照、不改现行展示与执行；
+	// on = 卖出建议/自动卖出全部改由裁决层 pass 处置驱动（五路直连拼装退役）。
+	// English: §SELLPOINT-UNIFY staged rollout — "shadow" (default) runs the unified sell judge in
+	// signalctl for audit comparison only; "on" switches advice + auto-sell to judge-driven disposals.
+	// 卖出统一裁决模式
+	SellUnifiedMode string `json:"sell_unified_mode,omitempty"`
 	// Blacklist §GAP1.7 下单黑名单（纯数字或带后缀代码均可）：命中即拒绝下单。
 	// 引擎每轮把 Theme.BlackList 一并同步进来；也可在 qmt 段单独配置。
 	// English: §GAP1.7 order blacklist; the engine merges Theme.BlackList in every cycle.
@@ -551,6 +558,13 @@ type DisciplineConfig struct {
 	ProbeSec int `json:"probe_sec"`
 	// 高置信度阈值（百分数）：≥此值视为高置信买入（默认 85）
 	HighConfThreshold float64 `json:"high_conf_threshold"`
+	// SellSignalMaxAgeSec §SELLPOINT-UNIFY 边界⑥（延持信号必须新鲜）：卖出观察窗内用做多
+	// SignalActive 判定延持时，信号产出时刻超过该秒数即按"无信号"处理（默认 300=一个打分周期，
+	// 防 5s 探针读到陈旧缓存信号导致该离场不退）。
+	// English: §unify boundary ⑥ — a bull signal older than this many seconds (default 300, one scoring
+	// cycle) counts as absent when the sell window decides whether to extend the hold.
+	// 卖出延持信号新鲜度上限秒数
+	SellSignalMaxAgeSec int `json:"sell_signal_max_age_sec"`
 }
 
 // DefaultQMTConfig 返回 QMT 实盘配置出厂默认：enabled=false（默认关闭）、manual 半自动、对手价。
@@ -2427,6 +2441,8 @@ func DefaultDisciplineConfig() DisciplineConfig {
 		TrailConfirmMin:   45,
 		ProbeSec:          5,
 		HighConfThreshold: 85,
+		// §SELLPOINT-UNIFY 边界⑥：延持信号默认一个打分周期（5min）内有效
+		SellSignalMaxAgeSec: 300,
 	}
 }
 

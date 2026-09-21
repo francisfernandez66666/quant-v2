@@ -208,6 +208,10 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 
 	md := e.strategy.BuildScoringData(ctx, pool, quotes)
 	scores, sigs := e.combatAgent.ScorePool(pool, md, d1Scores, emotionPhase)
+	// §SELLPOINT-UNIFY 边界⑥：登记本轮打分时刻，卖出裁决通道的做多新鲜度基准。
+	e.mu.Lock()
+	e.scoresAt = time.Now()
+	e.mu.Unlock()
 
 	// B2 失效墓碑：以最新行情校验当日固化买入信号，跌破触发价（买入依据破坏）即打墓碑：
 	// 移出固化存储 + 删除消息中心对应条目，防"已失效信号持续展示/再提醒"。
@@ -352,6 +356,19 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		// English: single live dispatch entry — controller-admitted buys only; this full-feed prunes stale probes.
 		e.dispatchLive(buys, quotes, true, time.Now())
 	}
+
+	// §SELLPOINT-UNIFY P3 模拟盘并轨：5s 轮同样推进纸面双账统一卖出裁决（与主循环 13e-pre
+	// 共享同一 (通道,账号,代码) 状态机，窗口以真实时钟推进；close/trim 各自幂等去重，双轮
+	// 叠加不会重复卖）。放在撮合分发之外无条件跑——本轮无信号也要推进观察窗。
+	// English: the 5s round also advances the paper-ledger unified sell judge (same state machine,
+	// wall-clock windows; idempotent close/trim dedup makes the dual-round overlay safe).
+	e.judgePaperLedgers(sellJudgeFeed{
+		Scores:      scores,
+		D1Scores:    d1Scores,
+		BearReasons: bearReasons,
+		PoolQuotes:  exitQuotes,
+		SnapQuotes:  quotes,
+	})
 
 	// 模拟盘估值与日净值：每轮用实时快照价刷新持仓市值，并记录当日净值点。
 	// English: paper mark-to-market + daily equity point each round, using the live snapshot.
@@ -678,6 +695,20 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	dt := e.disciplineTracker
 	e.mu.Unlock()
 
+	// §REFACTOR_UNIFIED_SELL P2：统一卖出裁决先于展示拼装运行（同轮行情/信号，留痕与卡片时刻对齐）。
+	// shadow（缺省）只留痕不改行为；on 时本轮裁决处置/观察结论经 unifiedSellViews 投影为卖出卡片
+	// 唯一来源，旧五路在 Advise 内整体跳过。
+	// English: P2 — the unified sell judge runs before display assembly; under mode=on its projection
+	// is the only sell-card source (legacy five-way assembly is skipped inside Advise).
+	sellMode := sellUnifiedModeOf(ctrl.Config())
+	sellVerdicts := e.runSellUnifiedJudge(sendTo, positions, exitQuotes, quotes, scores, d1Scores, bearReasons)
+	// §PROD-T1 可卖量一次装配：Advise 的 T+1 卖出闸与 P2 处置降级共用同一口径。
+	sellableQty := sellableQtyByCode(realStore, sendTo, positions)
+	var sellProjection []trading.UnifiedSellView
+	if sellMode == "on" {
+		sellProjection = e.unifiedSellViews(positions, sellVerdicts, sellableQty)
+	}
+
 	advices := trading.Advise(trading.AdviceInput{
 		Agent:        agent,
 		MarketAPI:    marketAPI,
@@ -697,7 +728,10 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		// Advise 内整体跳过卖出侧，杜绝"当日买入却提醒止盈/止损请手动处理"的误导提醒。
 		// English: §PROD-T1 — feed per-code sellable qty (held minus today's bought fills, same
 		// ledger math as the order gate) so T+1-locked positions get no sell-side advice.
-		SellableQty: sellableQtyByCode(realStore, sendTo, positions),
+		SellableQty: sellableQty,
+		// §REFACTOR_UNIFIED_SELL P2：切闸开关 + 裁决投影卡片（on 时卖出建议唯一来源）。
+		SellUnifiedOn:  sellMode == "on",
+		SellProjection: sellProjection,
 	})
 
 	// §SHORT-2 做空战法卖出标记 → 实盘清仓级建议（Source=short_tactic，见 shortTacticCloseAdvices）。
@@ -714,6 +748,9 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 		// sellRealPosition 注入 OrderRequest），涨跌停闸对自动卖单真正生效。
 		e.autoExecuteRealSells(sendTo, ctrl, realStore, advices)
 	}
+
+	// §SELLPOINT-UNIFY P1-b/P2：卖出统一裁决通道已上移至 trading.Advise 之前运行（见上方
+	// runSellUnifiedJudge），shadow 只留痕、on 走投影+来源闸执行，此处不再重复调用。
 
 	// §统一纪律补充（2026-09-08）：无论自动卖出开关，止损/止盈/减仓建议都进消息中心 + P1 强提醒。
 	// 用户关闭自动交易（mode≠auto / auto_sell=false）时，实时持仓触发止盈止损仍需强提醒手动处理；
@@ -884,6 +921,13 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 	if err != nil || len(positions) == 0 {
 		return
 	}
+	// §REFACTOR_UNIFIED_SELL P2 切闸：sell_unified_mode=on 时唯一执行出口=裁决层 pass 处置单
+	//（Source=unified）。旧「止损级任意来源直放」后门与 short_tactic 直卖后门被来源闸一并关闭；
+	// M8 组合回撤熔断不经本函数（checkM8RealDrawdown 直调 sellRealPosition，独立保险丝保留）。
+	// English: P2 gate — under mode=on only unified-adjudicator disposals may execute here; the
+	// any-source stop-loss backdoor and the short_tactic direct-sell path are closed. M8 stays a
+	// separate fuse outside this function.
+	sellUnifiedOnly := sellUnifiedModeOf(ctrl.Config()) == "on"
 	byCode := make(map[string]store.RealPosition, len(positions))
 	for _, p := range positions {
 		byCode[pureTsCode(p.TsCode)] = p
@@ -893,23 +937,28 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 		if !ok || a.RefPrice <= 0 {
 			continue
 		}
+		if sellUnifiedOnly && a.Source != trading.UnifiedSellSourceAction {
+			continue
+		}
 		// §统一纪律：止损级建议任何来源都自动执行（保护性不变）；止盈/减仓仅在来源为统一纪律
-		// 裁决引擎（Source=discipline）时自动执行——战法自带止盈止损降级为触发通知，不动作。
-		// English: stop-loss advice auto-executes from any source (unchanged protection); TP/trim only
-		// auto-execute when they come from the unified discipline engine — strategy-native TP/SL are
-		// notification-only.
+		// 裁决引擎（Source=discipline）或统一卖出裁决层（Source=unified，§SELLPOINT-UNIFY P2）时
+		// 自动执行——战法自带止盈止损降级为触发通知，不动作。
+		// English: stop-loss advice auto-executes from any source (unchanged protection; in P2 on-mode
+		// the source gate above already restricts to unified disposals only); TP/trim only auto-execute
+		// from the discipline engine or the unified sell adjudicator.
 		var class string
 		var qty int
+		executableSellSource := a.Source == "discipline" || a.Source == trading.UnifiedSellSourceAction
 		switch a.Action {
 		case "止损":
 			class = "止损"
 		case "止盈":
-			if a.Source != "discipline" {
+			if !executableSellSource {
 				continue
 			}
 			class = "止盈"
 		case "减仓":
-			if a.Source != "discipline" {
+			if !executableSellSource {
 				continue
 			}
 			class = "减仓"

@@ -14,6 +14,7 @@ const POS = {
   slippage_pct: 0, latency_sec: 2, signal_at: '2026-09-18 09:35:00', filled_at: '2026-09-18 09:35:02',
 }
 
+// api 层整体 mock：页面只消费 fetchPaperState 固定账本 + 空行情/空统计，聚焦"手→股"换算呈现。
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
   fetchPaperState: vi.fn(async () => ({

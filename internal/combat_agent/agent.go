@@ -229,6 +229,12 @@ type Agent struct {
 	momentumPrevDay string
 	momentumPrevMu  sync.Mutex
 
+	// §P4 缺陷1：放量派发「连续两轮命中」确认状态（code→连续命中轮数，跨交易日整表清零）。
+	// （per-code consecutive distribution-trip counter for the two-round confirmation gate.）
+	distHits map[string]int
+	distDay  string
+	distMu   sync.Mutex
+
 	// d1Boost D1 软加成配置（C1）：BoostWeight>0 时对非 N 战法总分做加成；负面 blocked 硬 veto。
 	// 由 Engine 在构建/热更时注入（见 SetD1Config），零值视为未启用。
 	// English: C1 D1 soft-boost settings — when BoostWeight>0, non-N strategy totals get boosted;

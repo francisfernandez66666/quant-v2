@@ -148,3 +148,33 @@ func TestSyncLiveAdviceAlertsNoStorePerRound(t *testing.T) {
 	e := &Engine{}
 	e.syncLiveAdviceAlerts("u123", nil, false)
 }
+
+// TestSyncLiveAdviceAlertsNoPositiveDrawdown §P4 缺陷4 锁：现价新高（DrawdownPct≥0）时
+// 正文不得渲染「回撤:+0.64%」这种正值语义噪声；仅真实回撤（<0）才渲染。
+// English: P4 defect-4 lock — a new stage high (drawdown ≥ 0) must not render the positive
+// "回撤:+x%" noise; only a real pullback (<0) is rendered.
+func TestSyncLiveAdviceAlertsNoPositiveDrawdown(t *testing.T) {
+	e := &Engine{msgStore: data.NewMessageStore("")}
+	high := liveAdvice("600004", "新高股", "止盈", "移动止盈触线")
+	high.DrawdownPct = 0.64 // 旧实现会渲染成「回撤:+0.64%」
+	down := liveAdvice("600005", "回撤股", "止盈", "移动止盈触线")
+	down.DrawdownPct = -3.2
+	e.syncLiveAdviceAlerts("u123", []trading.PositionAdvice{high, down}, false)
+
+	list := e.msgStore.ListVisible("u123")
+	if len(list) != 2 {
+		t.Fatalf("应落库 2 条, got %d", len(list))
+	}
+	for _, it := range list {
+		switch {
+		case strings.Contains(it.ID, "600004"):
+			if strings.Contains(it.Body, "回撤:") {
+				t.Errorf("新高股正文不应渲染正值回撤: %s", it.Body)
+			}
+		case strings.Contains(it.ID, "600005"):
+			if !strings.Contains(it.Body, "回撤:-3.20%") {
+				t.Errorf("真实回撤应照常渲染: %s", it.Body)
+			}
+		}
+	}
+}

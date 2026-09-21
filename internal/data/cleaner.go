@@ -64,6 +64,12 @@ var rePureCode = regexp.MustCompile(`^\d{6}$`)              // 纯 6 位数字�
 var reSHCode = regexp.MustCompile(`^(SH|sh)(\d{6})$`)       // 带沪市前缀，如 "SH600519"/"sh600519"
 var reSZCode = regexp.MustCompile(`^(SZ|sz)(\d{6})$`)       // 带深市前缀，如 "SZ000001"/"sz000001"
 var reDotCode = regexp.MustCompile(`^(\d{6})\.(SH|SZ|BJ)$`) // 带点号交易所后缀，如 "600519.SH"
+// reNameParenCode 匹配「名称(代码)」标签格式（板块成分股传播注入事件 RelatedStocks 的既有口径），
+// 如 "中际旭创(300308)"。§D1 护栏1 后 LLM 不再产出个股名单，该标签成为板块级事件唯一的个股来源，
+// Clean 必须能解析它，否则成分股会在 CleanBatch 里被整批丢弃。
+// English: matches the "名称(代码)" constituent label — after guardrail-1 it is the only per-stock
+// source for sector events, so Clean must parse it or all constituents would be dropped.
+var reNameParenCode = regexp.MustCompile(`^(.+)\((\d{6})\)$`)
 
 // normalizeCode 将各种格式的股票代码统一为纯 6 位数字代码。
 // 支持的格式：
@@ -137,6 +143,41 @@ func (c *StockCleaner) Clean(nameOrCode string) (string, string, error) {
 			return name, pure, nil
 		}
 		return "", code, fmt.Errorf("代码 %s 未找到", code)
+	}
+
+	// 「名称(代码)」标签（板块成分股传播注入格式）：优先按括号内代码查（代码是硬事实），
+	// 代码不在清单时回退按名称查；两者都落空按未匹配丢弃（与其他非法输入同口径）。
+	// English: "名称(代码)" constituent label — resolve by the code first (hard fact),
+	// fall back to the name; miss both → drop like any other unmatched input.
+	if m := reNameParenCode.FindStringSubmatch(raw); len(m) == 3 {
+		name, code := m[1], m[2]
+		if mapped, ok := c.codeToName[code]; ok {
+			return mapped, code, nil
+		}
+		if code2, ok := c.nameToCode[name]; ok {
+			return name, code2, nil
+		}
+		return "", "", fmt.Errorf("未匹配到 %q", raw)
+	}
+
+	// 「名称|代码」标准输出格式：CleanBatch 的输出会被 Stage2/护栏1 写回 RelatedStocks，
+	// 下一轮再次进 Clean 时必须可解析（幂等），否则已清洗条目会被整批丢弃，
+	// 导致个股分流/CleanedStocks 链路断流。优先按代码查（硬事实），回退按名称查。
+	// English: "name|code" is CleanBatch's own output format which flows back into RelatedStocks
+	// (Stage2 / guardrail-1) — re-cleaning must be idempotent or already-cleaned entries are
+	// dropped, starving the CleanedStocks/stock-routing chain. Resolve by code first, name fallback.
+	if name, codePart, ok := strings.Cut(raw, "|"); ok {
+		code := normalizeCode(strings.TrimSpace(codePart))
+		if rePureCode.MatchString(code) {
+			if mapped, hit := c.codeToName[code]; hit {
+				return mapped, code, nil
+			}
+		}
+		name = strings.TrimSpace(name)
+		if code2, hit := c.nameToCode[name]; hit {
+			return name, code2, nil
+		}
+		return "", "", fmt.Errorf("未匹配到 %q", raw)
 	}
 
 	if code2, ok := c.nameToCode[raw]; ok {

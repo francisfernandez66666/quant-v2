@@ -785,6 +785,29 @@ func (r *Registry) build(userID string) *Engine {
 		},
 		func(quotes map[string]*data.StockInfo) { r.dispatchPaperMark(e, quotes) },
 	)
+	// §SELLPOINT-UNIFY P3 模拟盘并轨：注入按账号纸面账卖出裁决回调（ChannelPaper，
+	// 键=(通道,账号,纯码)，参数取账号级 paper 纪律）。裁决必须每轮无条件推进
+	//（观察窗窗长/结算栅格以真实时钟为准），不能依附"本轮恰好有信号"的撮合分发时机，
+	// 故与 dispatchPaperSignals 解耦、由主循环每轮经 judgePaperLedgers 调用。
+	// mode=on 时处置经 paper.ApplyUnifiedSell 唯一出口执行；探测器卖出直达撮合
+	// 已在 paperSignals 的证据闸（unifiedSellGateSigs）关闭。
+	// English: per-account paper-channel unified sell judge hook — runs every round (wall-clock
+	// windows), decoupled from fill dispatch; disposals execute only via paper ApplyUnifiedSell.
+	e.SetPaperSellJudge(func(feed sellJudgeFeed) {
+		if !data.IsFullTradingHours(time.Now()) {
+			return
+		}
+		for _, uid := range r.usersOf(e) {
+			if !r.isAutoPaper(uid) {
+				continue
+			}
+			pe := r.GetPaper(uid)
+			if pe == nil || !pe.Enabled() {
+				continue
+			}
+			e.runPaperUnifiedJudge(uid, pe, feed, e.paperSignalPolicy(uid))
+		}
+	})
 	// §QUOTE_POOL_SPLIT: 注入全账号模拟盘持仓聚合——5s 监控池 base 重建（syncMonitorBase）把
 	// 每个账号的纸面持仓永久钉入行情监控，持仓估值/自动卖出不再因掉出 hot 池而缺行情。
 	// English: inject the all-accounts paper-held aggregator so the base-pool rebuild pins every

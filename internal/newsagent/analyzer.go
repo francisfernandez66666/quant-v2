@@ -67,7 +67,27 @@ func (a *Agent) analyzeDeep(items []data.NewsItem) (events []NewsEvent, failedIt
 		// 后置校正：档位归一 + 中性强制归零
 		// English: post-processing: tier normalization + forced zeroing of neutral cases
 		postProcess(ht)
-		events = append(events, buildChainEvents(ht, items[i])...)
+		evs := buildChainEvents(ht, items[i])
+		// §D1 归因护栏1（个股归因=数据源硬事实）：LLM 不再产出受益个股名单，此处用
+		// 全量股票库的标题全称匹配补齐"新闻标题点名"的个股（确定性数据，非模型发明），
+		// 与来源自带 stock_list 合并；板块级未点名个股交由板块成分股传播注入。
+		// English: guardrail-1 — top up attribution with deterministic title/name-map hits only;
+		// the LLM no longer emits beneficiary stocks.
+		if a.cleaner != nil {
+			if hits := a.cleaner.FindStocksInText(items[i].Title); len(hits) > 0 {
+				// 命中的是名称，统一过 CleanBatch 洗成「名称|代码」标准格式再并入——
+				// RelatedStocks 全链路都携带代码（展示/评分/去重都按该口径消费）。
+				// English: map title hits through CleanBatch into the standard "名称|代码"
+				// form before merging — RelatedStocks carries codes across the whole chain.
+				cleaned := a.cleaner.CleanBatch(hits)
+				if len(cleaned) > 0 {
+					for j := range evs {
+						evs[j].RelatedStocks = mergeStr(evs[j].RelatedStocks, cleaned)
+					}
+				}
+			}
+		}
+		events = append(events, evs...)
 	}
 
 	log.Printf("[newsagent] Stage2全量分析: %d 个事件, %d 条未归因留队重试", len(events), len(failedItems))
@@ -87,9 +107,11 @@ func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 	if dt == "" {
 		dt = time.Now().Format("2006-01-02 15:04:05")
 	}
-	// 来源自带的个股标签（如财联社 stock_list）并入归因，交 cleaner 清洗
-	// English: the source's own stock tags (e.g. Cailian Press stock_list) are merged into the attribution and cleaned by the cleaner
-	sourceStocks := mergeStr(ht.RelatedStocks, item.Stocks)
+	// 来源自带的个股标签（如财联社 stock_list）——§D1 护栏1 后这是 LLM 路径唯一的个股来源
+	// （数据硬事实），LLM 的 related/upstream/downstream_stocks 字段已物理删除。
+	// English: guardrail-1 — the source's own stock tags (e.g. Cailian Press stock_list) are now the
+	// only per-event stock input (a data fact); the LLM stock fields no longer exist.
+	sourceStocks := item.Stocks
 
 	// 组装基础新闻事件：字段缺省补默认（Region=国内、Relation=不涉及）。
 	base := NewsEvent{
@@ -115,25 +137,22 @@ func buildChainEvents(ht *llm.HotTopic, item data.NewsItem) []NewsEvent {
 
 	if ht.UpstreamDirection != "" && ht.DownstreamDirection != "" && ht.UpstreamDirection != ht.DownstreamDirection {
 		// 分化：上游与下游各自独立方向事件。
-		// English: divergence: upstream and downstream each become an independent directional event. The upstream event prefers upstream_stocks, falling back to the full related_stocks when missing (models often fold upstream contractors into it); the downstream event uses only downstream_stocks, left empty when missing (sector propagation injects constituents), avoiding upstream-bull stocks polluting the downstream-bear event.
-		// 上游事件优先用 upstream_stocks，缺失时回落全量 related_stocks（模型常把上游承包商并入其中）；
-		// 下游事件只用 downstream_stocks，缺失时留空（交给板块传播注入成分股），
-		// 避免把上游利好个股污染进下游利空事件。
-		upStocks := ht.UpstreamStocks
-		if len(upStocks) == 0 {
-			upStocks = sourceStocks
-		}
-		dnStocks := ht.DownstreamStocks
+		// §D1 护栏1：上游事件只用数据源个股（stock_list ∪ 标题点名，analyzeDeep 补），
+		// 下游事件个股一律留空、交给板块成分股传播注入——不再有 LLM 上下游名单可污染，
+		// 上下游污染防线由"源头无个股输出"天然满足。
+		// English: guardrail-1 — upstream event carries only data-source stocks; downstream stays
+		// empty for sector-constituent propagation to fill (no LLM stock lists exist anymore).
+		var upStocks, dnStocks []string
+		upStocks = sourceStocks
 		return []NewsEvent{
 			buildChainEvent(base, ht, ht.Sectors, upStocks, ht.UpstreamSectors, ht.UpstreamDirection, "上游"),
 			buildChainEvent(base, ht, ht.Sectors, dnStocks, ht.DownstreamSectors, ht.DownstreamDirection, "下游"),
 		}
 	}
-	// 同向：合并为单事件（上/下游板块与个股并入）
-	// English: same direction: merge into a single event (upstream/downstream sectors and stocks merged in)
-	allStocks := mergeStr(sourceStocks, mergeStr(ht.UpstreamStocks, ht.DownstreamStocks))
+	// 同向：合并为单事件（上/下游板块并入；个股=数据源名单）
+	// English: same direction: merge into a single event (sectors merged; stocks = data-source list only)
 	allSectors := mergeStr(ht.Sectors, mergeStr(ht.UpstreamSectors, ht.DownstreamSectors))
-	return []NewsEvent{buildChainEvent(base, ht, ht.Sectors, allStocks, allSectors, chainDirection(ht), "全链")}
+	return []NewsEvent{buildChainEvent(base, ht, ht.Sectors, sourceStocks, allSectors, chainDirection(ht), "全链")}
 }
 
 // titleWithDigest 把正文摘要（≤80 字）拼进标题，供 LLM 获取制裁/管制等背景。

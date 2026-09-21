@@ -49,6 +49,28 @@ type PositionAdvice struct {
 	Source string `json:"source,omitempty"`
 }
 
+// UnifiedSellView 统一卖出裁决层（signalctl.JudgeSell）对单持仓的展示投影输入。
+// P2 切闸后 Advise 不再自行拼装卖出结论，改由引擎把裁决层裁定投影为本结构注入，
+// 展示卡片的 Action/Level/Reason 只可能来自裁决三态（§REFACTOR_UNIFIED_SELL P2）。
+// English: a per-position projection of the unified sell adjudication (signalctl.JudgeSell), injected
+// into Advise once P2 is on — the display card can only reflect the adjudicator's verdict.
+type UnifiedSellView struct {
+	TsCode   string  // 带后缀代码（与 RealPosition.TsCode 同键）
+	Action   string  // 止损/止盈/减仓/持有（持有=观察/预警卡）
+	Level    string  // 高/中/低
+	Reason   string  // 卡片理由（含裁决留痕文本）
+	RefPrice float64 // 参考价（裁决轮现价；≤0 时自动卖出守卫自然跳过）
+	Source   string  // UnifiedSellSourceAction=可执行处置 / UnifiedSellSourceWatch=观察·预警（永不执行）
+}
+
+// 统一卖出投影的来源常量（PositionAdvice.Source 复用同一字段值域）。
+const (
+	// UnifiedSellSourceAction 裁决层 pass 处置的投影——实盘自动卖出唯一放行来源。
+	UnifiedSellSourceAction = "unified"
+	// UnifiedSellSourceWatch 观察中/利空预警投影——只展示，永不进执行。
+	UnifiedSellSourceWatch = "unified-watch"
+)
+
 // AdviceInput 持仓分析入参（由引擎每轮组装传入）。
 // English: AdviceInput aggregates the inputs for one advice round (assembled by the engine per cycle).
 type AdviceInput struct {
@@ -79,6 +101,15 @@ type AdviceInput struct {
 	// sellable skip all sell-side advice (T+1 locked — a sell reminder the user cannot act on is
 	// misleading), while add/hold rules still run. Missing key = unknown = not locked.
 	SellableQty map[string]int
+	// SellUnifiedOn §REFACTOR_UNIFIED_SELL P2（sell_unified_mode=on）：统一卖出裁决层已切闸，
+	// 五路卖出拼装（战法退出/纪律探针/卖点评估/情绪退潮/利空归因）全部跳过，卖出结论只允许来自
+	// SellProjection（裁决层三态的展示投影）。false=影子/关闭期，旧五路照常拼装（零行为变化）。
+	// English: P2 gate on — the legacy five-way sell assembly is skipped and sell cards come only from
+	// the adjudication projection below. False = shadow/off: legacy path runs unchanged.
+	SellUnifiedOn bool
+	// SellProjection 裁决层投影卡片（仅 SellUnifiedOn=true 时生效），在加仓/格局判定之前注入，
+	// 保证同一持仓"裁决优先、不再叠加加仓建议"的既有合并语义不变。
+	SellProjection []UnifiedSellView
 }
 
 // Advise 生成实盘持仓处理建议：卖出侧（复用）→ 加仓 → 格局，按 action 排序输出。
@@ -107,8 +138,12 @@ func Advise(in AdviceInput) []PositionAdvice {
 	var advices []PositionAdvice
 	advByCode := make(map[string]*PositionAdvice)
 
-	// 卖出侧复用仅在 Agent 可用时执行
-	if in.Agent != nil {
+	// 卖出侧复用仅在 Agent 可用时执行。§REFACTOR_UNIFIED_SELL P2 切闸后（SellUnifiedOn）五路拼装
+	// 整体跳过——卖出结论的唯一来源改为下方 SellProjection（裁决层投影），探测器保留为证据生产者
+	//（影子期喂裁决层），不再直达展示。
+	// English: legacy five-way sell assembly; skipped entirely once the unified adjudicator is on (P2).
+	// Sell conclusions then come only from the injected adjudication projection below.
+	if in.Agent != nil && !in.SellUnifiedOn {
 		// 1. 卖出侧：战法退出引擎（移动止盈/硬止损/尾盘强平/超期）
 		for _, sig := range in.Agent.CheckPositionsExits(view, in.Quotes, in.DayKLines, now) {
 			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
@@ -140,6 +175,31 @@ func Advise(in AdviceInput) []PositionAdvice {
 		// 5. 卖出侧：利空归因 → 尽快抛掉
 		for _, sig := range in.Agent.BearishAttributionAlerts(view, in.Quotes, in.BearReasons, now) {
 			mergeAdvice(advByCode, fromSignal(sig, in, now, ""))
+		}
+	}
+
+	// 5'. §REFACTOR_UNIFIED_SELL P2：统一裁决层投影注入（切闸后卖出卡片唯一来源）。
+	// 卡片由引擎 projectSellView 从 SellVerdict 三态翻译而来（处置=止损/止盈/减仓 Source=unified；
+	// 观察/利空预警=持有级 Source=unified-watch），这里只做持仓上下文补全（数量/盈亏/市值），
+	// 不改变任何结论字段——展示与决策自此解耦，误报卡不可能绕过裁决层出现。
+	// English: P2 — inject the adjudication projection (the only sell-card source once the gate is on);
+	// enrich with position context only, never mutating verdict fields.
+	if in.SellUnifiedOn {
+		posByTs := make(map[string]*store.RealPosition, len(in.Positions))
+		for i := range in.Positions {
+			posByTs[in.Positions[i].TsCode] = &in.Positions[i]
+		}
+		for _, v := range in.SellProjection {
+			p := posByTs[v.TsCode]
+			if p == nil {
+				continue // 已不在持仓（对账延迟/已平）：投影作废，不留幽灵卡
+			}
+			pa := baseAdvice(*p, v.RefPrice, now)
+			pa.Action = v.Action
+			pa.Level = v.Level
+			pa.Reason = v.Reason
+			pa.Source = v.Source
+			advByCode[pa.Code] = pa
 		}
 	}
 
@@ -345,11 +405,38 @@ func fromSignal(sig combat_agent.Signal, in AdviceInput, now time.Time, _ string
 	// wrong-priced one. Display still estimates value at cost (ProfitPct=0, meaning "live price unknown").
 	pa.RefPrice = sig.Price
 	pa.Reason = sig.Reason
-	switch sig.AlertType {
-	case "清仓":
+	// §P4 缺陷3 标签映射收口（BUGFIX_SELLPOINT_FALSEPOSITIVE §三.3）：
+	//   - 做空模式（卖点评估方向词徽标）按结构化 SellLevel 定帽，超期离场（提示）/未知类型
+	//     落 default 按盈亏符号出 止盈/减仓——亏损票永不叫止盈；
+	//   - 利空归因路改由结构化 AlertType="利空抛售" 承接（FIX#13 清仓级语义不变）；
+	//   - 废除「reason 含 利空/抛售 子串 → 止损(高)」：展示层子串判定曾把任何含该子串的
+	//     提醒（含"该票无利空迹象"否定句式）升级为止损帽（敞口 B 的展示侧根源），
+	//     利空即时硬清现由统一裁决层双源验证（signalctl bearTier=dual）把关，不再靠子串。
+	// English: P4 defect-3 label cleanup — short-mode badges map from the structured SellLevel; the
+	// default branch follows the P/L sign so a losing position is never labeled 止盈; the bearish
+	// substring → forced 止损(hi) heuristic is removed (guardrail-①), verified hard clears now live
+	// in the unified adjudicator.
+	closeLevel := func() {
 		pa.Action, pa.Level = "止盈", "高"
 		if pa.ProfitPct <= 0 {
 			pa.Action, pa.Level = "止损", "高"
+		}
+	}
+	switch sig.AlertType {
+	case "清仓", "利空抛售":
+		closeLevel()
+	case "做空":
+		switch sig.SellLevel {
+		case "清仓":
+			closeLevel()
+		case "减仓":
+			pa.Action, pa.Level = "减仓", "高"
+		default: // 提示级/级别缺失：按盈亏符号走 default 同款口径
+			if pa.ProfitPct > 0 {
+				pa.Action, pa.Level = "止盈", "中"
+			} else {
+				pa.Action, pa.Level = "减仓", "中"
+			}
 		}
 	case "止损":
 		pa.Action, pa.Level = "止损", "高"
@@ -361,11 +448,11 @@ func fromSignal(sig combat_agent.Signal, in AdviceInput, now time.Time, _ string
 			pa.Action, pa.Level = "止损", "中"
 		}
 	default:
-		pa.Action, pa.Level = "止盈", "中"
-	}
-	// 利空归因/抛售类理由 → 直接止损（强度最高）
-	if strings.Contains(sig.Reason, "利空") || strings.Contains(sig.Reason, "抛售") {
-		pa.Action, pa.Level = "止损", "高"
+		if pa.ProfitPct > 0 {
+			pa.Action, pa.Level = "止盈", "中"
+		} else {
+			pa.Action, pa.Level = "减仓", "中"
+		}
 	}
 	return pa
 }

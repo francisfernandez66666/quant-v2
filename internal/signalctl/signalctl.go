@@ -116,8 +116,11 @@ type probeKey struct {
 type Controller struct {
 	mu     sync.Mutex
 	probes map[probeKey]time.Time // 买入信号首次出现时刻（连续存在累计，消失即重置）
-	ring   []Decision             // 裁定留痕环形缓冲（最新在尾）
-	cap    int
+	// §SELLPOINT-UNIFY 卖出裁决跨轮状态（键=通道+账号+代码；与买入探针同构，live/paper 隔离）。
+	// 由 JudgeSell 惰性建表，平仓/换仓由 PruneSellStates/ResetSell 清理（internal/signalctl/sell.go）。
+	sellStates map[sellKey]*sellState
+	ring       []Decision // 裁定留痕环形缓冲（最新在尾）
+	cap        int
 	// §D-2（GAP_VERIFY_20260917_PM）留痕落盘目录：非空时 record() 逐条追写
 	// verdicts-YYYYMMDD.jsonl（按日自然轮转），重启经 AttachAudit 回灌当日环——
 	// 此前纯内存 512 环，quant 任何一次重启即丢"为何没成交"的拦截原因。
@@ -126,7 +129,7 @@ type Controller struct {
 
 // New 创建控制器（留痕环默认 512 条）。
 func New() *Controller {
-	return &Controller{probes: make(map[probeKey]time.Time), cap: 512}
+	return &Controller{probes: make(map[probeKey]time.Time), sellStates: make(map[sellKey]*sellState), cap: 512}
 }
 
 // auditFileFor 当日留痕 JSONL 路径（按 d.At 的本地日期分文件，跨日自动切换）。

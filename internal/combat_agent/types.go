@@ -134,20 +134,25 @@ type StockScores struct {
 //   - Meta: 策略评分明细，供前端展示真实维度分
 //   - DepthFactors: 盘口派生因子，供战法读取买卖压力/封单量
 type Signal struct {
-	ID          string    `json:"id"`                   // 信号唯一标识
-	Code        string    `json:"code"`                 // 股票代码
-	Name        string    `json:"name"`                 // 股票名称
-	Strategy    string    `json:"strategy"`             // 策略名称
-	Direction   string    `json:"direction"`            // 方向：做多/做空/提醒
-	Action      string    `json:"action"`               // 操作：买入/卖出/watch
-	Tag         string    `json:"tag,omitempty"`        // 信号标记（如 N形 一突/二突）
-	AlertType   string    `json:"alert_type,omitempty"` // 提醒类型：止盈/止损
-	Price       float64   `json:"price"`                // 触发价格
-	Confidence  float64   `json:"confidence"`           // 置信度（0~1）
-	ATR         float64   `json:"atr,omitempty"`        // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
-	Reason      string    `json:"reason"`               // 信号生成原因
-	Sector      string    `json:"sector"`               // 所属板块
-	GeneratedAt time.Time `json:"generated_at"`         // 信号生成时间
+	ID        string `json:"id"`                   // 信号唯一标识
+	Code      string `json:"code"`                 // 股票代码
+	Name      string `json:"name"`                 // 股票名称
+	Strategy  string `json:"strategy"`             // 策略名称
+	Direction string `json:"direction"`            // 方向：做多/做空/提醒
+	Action    string `json:"action"`               // 操作：买入/卖出/watch
+	Tag       string `json:"tag,omitempty"`        // 信号标记（如 N形 一突/二突）
+	AlertType string `json:"alert_type,omitempty"` // 提醒类型：止盈/止损
+	// SellLevel 卖点评估的结构化原级别（清仓/减仓/提示）。做空模式下 AlertType 被方向词"做空"
+	// 顶掉，展示层（trading.Advise）据本字段定帽，不再从 Reason 子串猜级别（§P4 缺陷3）。
+	// （SellLevel carries the structured sell-point severity for short mode, where AlertType is the
+	// direction word 做空; the display layer maps the cap from this field instead of reason substrings.）
+	SellLevel   string    `json:"sell_level,omitempty"`
+	Price       float64   `json:"price"`         // 触发价格
+	Confidence  float64   `json:"confidence"`    // 置信度（0~1）
+	ATR         float64   `json:"atr,omitempty"` // 标的 ATR14（C4/C6 仓位管理与动态止损参考；日K不足时为 0）
+	Reason      string    `json:"reason"`        // 信号生成原因
+	Sector      string    `json:"sector"`        // 所属板块
+	GeneratedAt time.Time `json:"generated_at"`  // 信号生成时间
 
 	// StrategyID 战法库规则 ID（如 "fac_1"）。用于效果监测：把触发信号归属到具体已应用战法规则。
 	// 仅多规则战法（因子战法库）填充；其余战法为空。

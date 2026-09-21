@@ -186,6 +186,7 @@ type Engine struct {
 	paper             *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
 	paperOnSignals    func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
 	paperMarkFn       func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
+	paperSellJudgeFn  func(feed sellJudgeFeed)                                                                        // §SELLPOINT-UNIFY P3：按账号遍历模拟盘账本的统一卖出裁决（registry 注入；nil=回退全局 e.paper 单账本）
 	paperHeldCodes    func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
 	lastBaseLog       time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
 	lastTrim          time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
@@ -242,6 +243,23 @@ type Engine struct {
 	// English: live discipline-trim dedup — code → trading day (at most one 减仓 per code per day, so the
 	// discipline state machine's per-round ActionTrim can't keep halving the position). Guarded by e.mu.
 	realTrimDone map[string]string
+
+	// §SELLPOINT-UNIFY 边界⑥：最近一轮做多打分（ScorePool）的产出时刻，e.mu 保护。
+	// 卖出裁决通道的做多信号新鲜度基准——打分轮停摆（池空/熔断/异常）时 scoresAt 不再前进，
+	// 陈旧的 SignalActive 自然超龄按"无信号"处理，绝不给已失效的做多信号延持资格。
+	// English: timestamp of the latest bull scoring round — the sell judge's signal-freshness basis
+	// (boundary ⑥): when scoring stalls, stale SignalActive ages out and can no longer extend holds.
+	scoresAt time.Time
+
+	// §D1 护栏4（利空验证分级·生产侧）：纯6位代码 → 利空板块成分双源验证等级，主循环
+	// propagateSectorToStocks 每轮刷新——利空板块成分股同时命中「同花顺 ∩ 东财」两份真实成分名单
+	// → dual（触线可即时硬清）；仅单源命中 → single（只预警）。消费方（sell_shadow/P2 裁决）对
+	// 无记录/过期一律按 single 处理：缺数据只失去硬清资格，绝不误判"无利空"（护栏5口径）。
+	// English: verification tier of bearish attribution (pure code → dual/single), produced by
+	// sector propagation each round; consumers treat missing/stale entries as single (warn-only).
+	bearTier map[string]bearTierEntry
+	// §D1 护栏4：东财板块「名称→BK代码」映射（refreshSectors 每轮刷新），利空板块双源验证的第二源入口。
+	emBoardCodes map[string]string
 
 	// §A+B 信号→交易低延迟：异步下单分发器（事件驱动热路径）。
 	// autoPlace 完成同步守卫（模式/白名单/涨停封板/金额）后把 OrderRequest 投入 buyCh，
@@ -933,6 +951,17 @@ func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, exi
 	e.mu.Unlock()
 }
 
+// SetPaperSellJudge 注入 §SELLPOINT-UNIFY P3 的按账号纸面账本卖出裁决回调：
+// 裁决必须每 5s 推进（观察窗窗长/结算栅格以真实时钟为准），不能依附"本轮恰好有信号"的
+// paperSignals 分发时机，故独立于撮合分发单设注入口。
+// English: injects the P3 per-account paper sell-judge callback — the adjudicator must advance
+// every 5s (its windows are wall-clock based), independent of whether a round has fillable signals.
+func (e *Engine) SetPaperSellJudge(judge func(feed sellJudgeFeed)) {
+	e.mu.Lock()
+	e.paperSellJudgeFn = judge
+	e.mu.Unlock()
+}
+
 // SetPaperHeldCodesFn 注入"全账号模拟盘持仓代码"聚合函数（多账号模式由注册表注入，
 // 用于 5s 监控池 base 重建时把纸面持仓永久钉入行情监控；nil=回退全局 e.paper 账本）。
 // English: injects the all-accounts paper-held-codes aggregator (wired by the registry in
@@ -985,15 +1014,24 @@ func (e *Engine) QMTController() *trading.Controller {
 // 优先按账号分发，回退全局引擎。仅交易时段执行（盘后停自动撮合，省内存）。
 // exit 为卖出侧纪律信号（CheckPositionsExits/CheckPositionAlerts 产出），并入撮合，
 // 让模拟盘能因止损/止盈/移动止盈线自动离场（此前只发消息不执行——-11.55% 未止损根因）。
-// English: feeds this round's flipped signals PLUS sell-side discipline signals (stop-loss/take-profit/
-// trailing) into paper filling — per-account dispatch first, global engine fallback. Trading hours only.
-// exit merges CheckPositionsExits/CheckPositionAlerts outputs so the paper book auto-exits on stop-loss/
-// take-profit/trailing lines (previously message-only — the -11.55% never-stopped root cause).
+// §SELLPOINT-UNIFY P3：sell_unified_mode=on 时探测器卖出信号（做多向）降级为证据、不再直达
+// 撮合——纸面账处置唯一出口=统一裁决层（runPaperUnifiedJudge→ApplyUnifiedSell，双账一口径）；
+// 做空方向信号（融券空单开/平仓流程）不在本次并轨范围，原样透传。
+// 纸面账裁决本身不在本函数执行——观察窗以真实时钟推进，裁决必须每轮无条件跑，
+// 不能依附"本轮恰好有信号"的分发时机（见 judgePaperLedgers，主循环每轮调用）。
+// English: feeds flipped + sell-side discipline signals into paper filling; with the P3 gate on,
+// long-side detector sells become evidence only (the unified adjudicator is the sole exit) while
+// short-book signals pass through. The judge itself runs every round via judgePaperLedgers, not here.
 func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
 	e.mu.RLock()
 	dispatch := e.paperOnSignals
 	pe := e.paper
 	e.mu.RUnlock()
+	unifiedOn := e.sellUnifiedModeEngine() == "on"
+	if unifiedOn {
+		emit = unifiedSellGateSigs(emit)
+		exit = unifiedSellGateSigs(exit)
+	}
 	combined := make([]combat_agent.Signal, 0, len(emit)+len(exit))
 	combined = append(combined, emit...)
 	combined = append(combined, exit...)
@@ -1006,6 +1044,25 @@ func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Si
 		// 此回退供无 registry 单引擎场景，准入语义一致、不留旁路）。
 		pe.OnSignals(e.filterPaperAdmitted(e.primaryMember(), combined, time.Now()), quotes)
 	}
+}
+
+// unifiedSellGateSigs §SELLPOINT-UNIFY P3 卖出证据闸：剔除"做多向且 SellAction 命中（close/trim）"
+// 的探测器卖出信号（切闸后它们只是证据，供裁决层内核与展示消费），买入信号与做空方向信号
+// （融券空单的开/平流程不经统一卖出通道）原样保留。
+// English: P3 evidence gate — drops long-side detector sells (close/trim) once the unified gate is on;
+// buys and short-book signals pass through.
+func unifiedSellGateSigs(sigs []combat_agent.Signal) []combat_agent.Signal {
+	if len(sigs) == 0 {
+		return sigs
+	}
+	out := make([]combat_agent.Signal, 0, len(sigs))
+	for _, s := range sigs {
+		if s.Direction != "做空" && combat_agent.SellAction(s) != "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // ── §SIGNAL_CONTROLLER 信号控制器接线（20260917，方案 docs/SIGNAL_CONTROLLER_PLAN_20260917.md）──
@@ -3427,7 +3484,11 @@ func (e *Engine) syncLiveAdviceAlerts(sendTo string, advices []trading.PositionA
 			if math.Abs(a.ProfitPct) > 0.001 {
 				fmt.Fprintf(&b, " 盈亏:%+.2f%%", a.ProfitPct)
 			}
-			if math.Abs(a.DrawdownPct) > 0.001 {
+			// §P4 缺陷4：只在真实回撤（现价低于阶段高点）时渲染——现价新高时
+			// DrawdownPct≥0 顶出「回撤:+0.64%」纯语义噪声，强化"这不是止盈止损点位"的困惑。
+			// English: P4 defect-4 — render drawdown only for a real pullback; a positive value at a new
+			// stage high was pure semantic noise.
+			if a.DrawdownPct < -0.001 {
 				fmt.Fprintf(&b, " 回撤:%+.2f%%", a.DrawdownPct)
 			}
 		} else {
@@ -4493,6 +4554,20 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		alertSignals = append(alertSignals, e.combatAgent.AssessSellSide(sellCodes, sr.MarketData, d1Scores, stockScores, e.ShortEnabled())...)
 	}
 
+	// 13e-pre. §SELLPOINT-UNIFY P3 模拟盘并轨：纸面双账（paper 引擎 + report 手动账本）每轮走
+	// 与 live 同一卖出裁决内核（ChannelPaper 通道）。必须无条件每轮跑——观察窗窗长/结算栅格以
+	// 真实时钟推进，不依附"本轮恰好有卖出信号"的撮合分发时机；shadow/on 的取舍在裁决层内部按
+	// qmt.sell_unified_mode 判定（off=直接返回，shadow=只留痕，on=处置经唯一出口执行）。
+	// English: P3 — the paper ledgers are judged every round (wall-clock windows), independent of
+	// fill timing; the mode switch inside decides record-only vs execute.
+	e.judgePaperLedgers(sellJudgeFeed{
+		Scores:      stockScores,
+		D1Scores:    d1Scores,
+		BearReasons: bearHitReasons(sr),
+		PoolQuotes:  exitQuotes,
+		SnapQuotes:  e.snapshotQuotes(),
+	})
+
 	// 13e 卖出提醒自动执行（阶段1.1 全自动卖出）：把本轮 清仓/减仓/硬止盈/硬止损 告警
 	// （combat_agent.SellAction 归一为 close/trim）送入模拟盘自动成交——清仓类全平、
 	// 减仓类半仓（paper 引擎内每码每日一次去重）。仅提醒级（提示/关注/跌幅提醒）不动作。
@@ -4523,10 +4598,15 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			e.paperSignals(sells, nil, exitQuotes)
 			// FIX#15 report 账本（用户手动录入持仓）也自动执行卖出：close→LogExit 全平、
 			// trim→SellLot 半仓（每码每日一次）。只处理 paper 引擎未持有的（避免双账簿重复卖）。
+			// §SELLPOINT-UNIFY P3：mode=on 时 report 账本已由 13e-pre 的统一裁决处置
+			//（judgePaperLedgers→judgeReportLedger），此旧链出口关闭，杜绝双写。
 			// English: FIX#15 auto-execute sells on the report book (manually entered holdings) as well —
 			// close→LogExit full exit, trim→SellLot half (once per code per day); only codes not held
-			// by the paper engine are handled here to avoid double-selling both books.
-			e.autoExitReportSells(sells, exitQuotes)
+			// by the paper engine are handled here to avoid double-selling both books. Under P3 on-mode
+			// the report book is exited by the unified adjudicator instead, so this legacy exit is closed.
+			if e.sellUnifiedModeEngine() != "on" {
+				e.autoExitReportSells(sells, exitQuotes)
+			}
 		}
 	}
 
@@ -4770,8 +4850,61 @@ func (e *Engine) refreshSectors() {
 	}
 	scanner.Update(boards, 0, 0, 0)
 	e.feedRPS(boards)
-	log.Printf("[engine] 板块名单刷新: %d 个 (一级行业+概念)", len(boards))
+	// §D1 护栏2（板块归因目录点选）：把真实板块名单注入 LLM 层——Stage2 板块归因只能从该
+	// 白名单逐字点选，禁止自由发明板块名（LLM 发明板块/偏移归因是 D1 误判的主要来源）。
+	names := make([]string, 0, len(boards))
+	for _, b := range boards {
+		if b.Name != "" {
+			names = append(names, b.Name)
+		}
+	}
+	llm.SetSectorCatalog(names)
+	// §D1 护栏4（生产侧前置）：刷新东财「板块名→BK代码」映射，供利空板块成分股做第二源验证。
+	e.refreshEMBoardCodes()
+	log.Printf("[engine] 板块名单刷新: %d 个 (一级行业+概念), 板块点选白名单已注入 LLM", len(boards))
 }
+
+// refreshEMBoardCodes §D1 护栏4：拉取东财板块列表并缓存「名称→BK代码」映射，
+// 作为利空板块成分股双源验证的第二源入口（THS 881xxx 代码无法直接查东财，只认 BK）。
+// 失败保留旧映射（归因不受影响，仅可能把 dual 降级为 single，方向安全）。
+// （refreshEMBoardCodes caches EastMoney sector name→BK code for the dual-source constituent
+// verification of bearish sectors; failures keep the previous map (tier can only downgrade to single).）
+func (e *Engine) refreshEMBoardCodes() {
+	e.mu.RLock()
+	marketAPI := e.marketAPI
+	e.mu.RUnlock()
+	if marketAPI == nil {
+		return
+	}
+	list, err := marketAPI.GetSectorList()
+	if err != nil {
+		log.Printf("[engine] 东财板块列表刷新失败(保留旧映射，双源验证可能降为 single): %v", err)
+		return
+	}
+	m := make(map[string]string, len(list))
+	for _, s := range list {
+		if s.Name != "" && strings.HasPrefix(s.Code, "BK") {
+			m[s.Name] = s.Code
+		}
+	}
+	e.mu.Lock()
+	e.emBoardCodes = m
+	e.mu.Unlock()
+}
+
+// bearTierEntry §D1 护栏4：利空验证等级单条记录——等级（signalctl.BearVerified*）+ 盖章时刻（过期判据）。
+type bearTierEntry struct {
+	verified string
+	at       time.Time
+}
+
+// bearTierTTL §D1 护栏4：验证等级新鲜度窗。主循环每轮刷新；流水线停摆或利空板块事件消退后，
+// 旧等级超窗即失效（消费侧降回 single 只预警），防止拿几小时前的归因做即时硬清。
+const bearTierTTL = 60 * time.Minute
+
+// bearTierEMTopN §D1 护栏4：东财第二源成分名单拉取上限。放大到远超注入 topN，
+// 避免两源排序不同导致交集近空、把真实双源成分误判为 single。
+const bearTierEMTopN = 100
 
 // feedRPS §修复 D3（2026-08-29）：按多个可得周期构造 RPS 近似值（此前 RPS20/RPS60 用同一
 // 单日涨幅，等价无效）。可用字段：当日涨跌幅 ChangePct（短周期≈RPS20）、两日涨幅 Gain2d
@@ -4888,9 +5021,10 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	// （Pass 1: collect which sectors need constituents, grouped by owning event index,
 	// serially and without any network I/O. Each sector is fetched once per round.）
 	type needFetch struct {
-		evIdx int    // 所属事件下标（events 切片）
-		code  string // 板块代码
-		name  string // 板块名（日志用）
+		evIdx   int    // 所属事件下标（events 切片）
+		code    string // 板块代码
+		name    string // 板块名（日志用/东财 BK 映射键）
+		bearish bool   // §D1 护栏4：事件为利空——只有利空板块触发双源成分验证（判定等级供卖出硬清资格）
 	}
 	fetched := make(map[string]bool)
 	var needs []needFetch
@@ -4899,6 +5033,8 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 		if ev.Level != "板块" || absScore(ev.Score) < 0.5 {
 			continue
 		}
+		// 利空判定：方向=利空或带符号分为负（chainScore 保证利空事件分数为负，两口径取并以防字段缺省）。
+		isBear := ev.Direction == "利空" || ev.Score < 0
 		// 汇总直接板块 + 上游 + 下游板块一并传播（上游/下游为空时 append 无副作用）。
 		allSectors := append([]string{}, ev.Sectors...)
 		allSectors = append(allSectors, ev.UpstreamSectors...)
@@ -4913,7 +5049,7 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 				continue
 			}
 			fetched[si.Code] = true
-			needs = append(needs, needFetch{evIdx: i, code: si.Code, name: name})
+			needs = append(needs, needFetch{evIdx: i, code: si.Code, name: name, bearish: isBear})
 		}
 	}
 	if len(needs) == 0 {
@@ -4926,9 +5062,12 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	// capped by the per-source rate limiters, so THS/EastMoney are never hammered; the serial
 	// O(N×T) cost over N sectors drops to ~O(T).）
 	type result struct {
-		code   string           // 板块代码（回传任务标识，串行注入按此对账）
-		stocks []data.StockInfo // 拉取到的板块成分股 topN（THS 优先、东财兜底）
-		err    error            // 拉取失败原因（非 nil 时该板块本轮不注入，仅记日志）
+		code    string           // 板块代码（回传任务标识，串行注入按此对账）
+		stocks  []data.StockInfo // 拉取到的板块成分股 topN（THS 优先、东财兜底）
+		err     error            // 拉取失败原因（非 nil 时该板块本轮不注入，仅记日志）
+		bearish bool             // §D1 护栏4：透传任务的利空标记（决定是否需要验证等级）
+		thsSet  map[string]bool  // §D1 护栏4：同花顺成分股纯代码集合（仅利空板块填充）
+		emSet   map[string]bool  // §D1 护栏4：东财成分股纯代码集合（仅利空板块填充；BK 映射缺失时为 nil）
 	}
 	// sectorFetchWorkers 板块行情并发拉取的工作协程数。
 	const sectorFetchWorkers = 6
@@ -4941,8 +5080,15 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 		go func() {
 			defer wg.Done()
 			for nf := range jobs {
-				stocks, err := e.sectorConstituents(nf.code, topN)
-				results <- result{code: nf.code, stocks: stocks, err: err}
+				r := result{code: nf.code, bearish: nf.bearish}
+				if nf.bearish {
+					// 利空板块：双源各取一份成分名单（注入列表 THS 优先/东财兜底，与旧口径一致），
+					// 两份集合同时回传用于判定 双源(dual)/单源(single) 验证等级。
+					r.stocks, r.thsSet, r.emSet, r.err = e.sectorConstituentsDual(nf.code, nf.name, topN)
+				} else {
+					r.stocks, r.err = e.sectorConstituents(nf.code, topN)
+				}
+				results <- r
 			}
 		}()
 	}
@@ -4956,22 +5102,31 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 
 	// 第三遍：按板块代码暂存结果，再串行注入各自事件（避免并发写 events 切片）。
 	// （Pass 3: stage results by sector code, then inject serially to avoid racing on events.）
-	byCode := make(map[string][]data.StockInfo, len(needs))
-	// 失败板块记日志但不中断；成功结果按板块代码暂存。
+	byCode := make(map[string]result, len(needs))
+	// §D1 护栏5：本轮利空板块是否有「双源俱失」的取数失败——有则验证等级只做增量合并，
+	// 保留失败板块旧条目（缺数据绝不判"无利空"、绝不把已验证的 dual 悄悄降格）。
+	failedBear := false
 	for r := range results {
 		if r.err != nil {
 			log.Printf("[engine] 板块成分股获取失败 %s: %v", r.code, r.err)
+			if r.bearish {
+				failedBear = true
+				opslog.DayOnce("bear-tier-degrade:"+r.code, func() {
+					opslog.Logf("news", "利空板块成分股双源均获取失败 %s，保留上次验证等级（数据缺失不否定利空，硬清资格按旧级）: %v", r.code, r.err)
+				})
+			}
 			continue
 		}
-		byCode[r.code] = r.stocks
+		byCode[r.code] = r
 	}
 	injected := 0
 	for _, nf := range needs {
 		ev := &events[nf.evIdx]
-		stocks, ok := byCode[nf.code]
+		r, ok := byCode[nf.code]
 		if !ok {
 			continue
 		}
+		stocks := r.stocks
 		// 成分股注入事件相关股票列表（同名称/同标签去重）。
 		added := 0
 		for _, st := range stocks {
@@ -4990,6 +5145,65 @@ func (e *Engine) propagateSectorToStocks(events []newsagent.NewsEvent) {
 	if injected > 0 {
 		log.Printf("[engine] 板块→个股传播: 注入 %d 只成分股", injected)
 	}
+
+	// §D1 护栏4（生产侧）：按本轮利空板块计算成分股验证等级——
+	// dual=同花顺∩东财双源名单均命中（唯一具备「触线+利空即时硬清」资格的来源），
+	// single=仅单源命中（只预警）。护栏3 在此天然成立：能进入 byCode 的板块都经过
+	// sectorByName/verifySectorAttribution 的真实板块验真，新题材未验真通道永远到不了 dual 集合。
+	at := time.Now()
+	newTier := make(map[string]bearTierEntry)
+	for _, r := range byCode {
+		if !r.bearish {
+			continue
+		}
+		for code, tier := range classifyBearTier(r.thsSet, r.emSet) {
+			newTier[code] = bearTierEntry{verified: tier, at: at}
+		}
+	}
+	e.mu.Lock()
+	e.bearTier = mergeBearTier(e.bearTier, newTier, failedBear)
+	e.mu.Unlock()
+}
+
+// classifyBearTier §D1 护栏4（纯函数）：按双源命中集合给出 代码→验证等级——
+// 两源交集=dual；仅任一源命中=single。emSet/thsSet 为 nil（该源不可用）时对应代码只能判 single。
+// （classifyBearTier is a pure helper: intersection of the two source sets is dual,
+// membership in a single source is single; a nil set (source unavailable) can only yield single.）
+func classifyBearTier(thsSet, emSet map[string]bool) map[string]string {
+	out := make(map[string]string, len(thsSet)+len(emSet))
+	for code := range thsSet {
+		if emSet[code] {
+			out[code] = signalctl.BearVerifiedDual
+		} else {
+			out[code] = signalctl.BearVerifiedSingle
+		}
+	}
+	for code := range emSet {
+		if _, ok := out[code]; !ok {
+			out[code] = signalctl.BearVerifiedSingle
+		}
+	}
+	return out
+}
+
+// mergeBearTier §D1 护栏4/5（纯函数）：本轮算出的等级写回引擎——
+// keepOld=false（全部利空板块取数成功）整表替换，事件消退的成分股等级自然出表；
+// keepOld=true（存在双源俱失板块）保留旧表全部条目、仅覆盖本轮成功算出的——失败源不得把
+// 已验证的 dual 悄悄降格（缺数据不否定利空，护栏5口径）。
+// （mergeBearTier swaps the tier map in: full replace when every bearish sector fetched OK,
+// otherwise old entries are kept and only freshly-computed codes are overwritten.）
+func mergeBearTier(old, updated map[string]bearTierEntry, keepOld bool) map[string]bearTierEntry {
+	if !keepOld {
+		return updated
+	}
+	out := make(map[string]bearTierEntry, len(old)+len(updated))
+	for k, v := range old {
+		out[k] = v
+	}
+	for k, v := range updated {
+		out[k] = v
+	}
+	return out
 }
 
 // sectorConstituents 获取板块成分股：同花顺优先（东财限流时的兜底源），失败/为空回退东财。
@@ -5007,6 +5221,89 @@ func (e *Engine) sectorConstituents(sectorCode string, topN int) ([]data.StockIn
 		}
 	}
 	return marketAPI.GetSectorStocks(sectorCode, topN)
+}
+
+// sectorConstituentsDual §D1 护栏4：利空板块成分股的双源拉取——同花顺（主源，代码与扫描器缓存一致）
+// + 东财（经「板块名→BK代码」映射的第二源；映射缺失=东财无此板块，只能算单源）。
+// 返回：注入列表（THS 优先、东财兜底，与旧口径一致）+ 两源各自的纯代码命中集合（判 dual/single 用）。
+// 仅当两源同时失败才回传 err（调用方保留旧等级并按护栏5告警）。
+// （sectorConstituentsDual fetches a bearish sector's constituents from BOTH THS and EastMoney
+// (via name→BK mapping); returns injection list plus per-source code sets for tier classification.
+// Error only when both sources fail — the caller keeps the previous tier (§八 guardrail 5).）
+func (e *Engine) sectorConstituentsDual(sectorCode, sectorName string, topN int) ([]data.StockInfo, map[string]bool, map[string]bool, error) {
+	e.mu.RLock()
+	ths := e.ths
+	marketAPI := e.marketAPI
+	emCode := e.emBoardCodes[sectorName] // 东财 BK 代码；未命中映射=东财无同名板块，第二源视为不可用
+	e.mu.RUnlock()
+
+	var thsList []data.StockInfo
+	var thsSet map[string]bool
+	var thsErr error
+	if ths != nil {
+		thsList, thsErr = ths.GetBoardStocks(sectorCode, topN)
+		if thsErr == nil && len(thsList) > 0 {
+			thsSet = stockCodeSet(thsList)
+		}
+	}
+	// 东财第二源名单放大拉取（bearTierEMTopN）：两源排序不同，只取 topN 会让真双源成分误判 single。
+	var emList []data.StockInfo
+	var emSet map[string]bool
+	var emErr error
+	if marketAPI != nil && emCode != "" {
+		emList, emErr = marketAPI.GetSectorStocks(emCode, bearTierEMTopN)
+		if emErr == nil && len(emList) > 0 {
+			emSet = stockCodeSet(emList)
+		} else if emErr == nil {
+			emErr = fmt.Errorf("东财成分股为空 (%s)", emCode)
+		}
+	} else if marketAPI != nil {
+		emErr = fmt.Errorf("东财板块名未命中BK映射(%s)", sectorName)
+	} else {
+		emErr = fmt.Errorf("行情接口未装配")
+	}
+	if ths == nil {
+		thsErr = fmt.Errorf("同花顺客户端未装配")
+	}
+	if thsSet == nil && thsErr == nil {
+		thsErr = fmt.Errorf("同花顺成分股为空 (%s)", sectorCode) // 空名单等同失败，保证双失错误信息完整
+	}
+
+	switch {
+	case thsSet != nil:
+		return thsList, thsSet, emSet, nil // 主源命中（emSet 可为 nil=东财缺失，只判 single）
+	case emSet != nil:
+		return emList, nil, emSet, nil // THS 失败，东财兜底注入（无交集可言，全判 single）
+	}
+	return nil, nil, nil, fmt.Errorf("双源成分股均失败: ths=%v em=%v", thsErr, emErr)
+}
+
+// stockCodeSet 把成分股列表转为纯 6 位代码集合（双源交集判定口径；THS/东财返回均为 6 位码，防御性去后缀）。
+func stockCodeSet(list []data.StockInfo) map[string]bool {
+	set := make(map[string]bool, len(list))
+	for _, st := range list {
+		if c := pureTsCode(st.Code); c != "" {
+			set[c] = true
+		}
+	}
+	return set
+}
+
+// bearTierFor §D1 护栏4（消费侧）：查某股的利空验证等级。无记录/等级为空/超 TTL 一律按 single——
+// 缺数据只失去「触线即时硬清」资格（降回预警/窗结算），绝不误判为"无利空"（护栏5口径）。
+// （bearTierFor looks up a code's bearish verification tier; missing or stale entries degrade to
+// single (warn-only), never to "no bearish" — guardrail 5 semantics.）
+func (e *Engine) bearTierFor(pureCode string) string {
+	e.mu.RLock()
+	entry, ok := e.bearTier[pureCode]
+	e.mu.RUnlock()
+	if !ok || entry.verified == "" {
+		return signalctl.BearVerifiedSingle
+	}
+	if time.Since(entry.at) > bearTierTTL {
+		return signalctl.BearVerifiedSingle // 超龄等级不再给硬清资格
+	}
+	return entry.verified
 }
 
 // sectorByName 精确匹配板块名称返回 SectorInfo，未命中返回 nil。

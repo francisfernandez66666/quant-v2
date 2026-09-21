@@ -135,7 +135,8 @@ api -X POST "$BACKEND/api/config/qmt" -H "Authorization: Bearer $TOKEN" \
     \"price_type\": \"limit\", \"max_positions\": 5, \"fixed_amount\": 20000,
     \"initial_capital\": 500000, \"daily_max_buys\": 3,
     \"daily_budget_amount\": 100000, \"max_order_amount\": 50000,
-    \"miss_heartbeat_sec\": 120
+    \"miss_heartbeat_sec\": 120,
+    \"sell_unified_mode\": \"shadow\"
   }" > /dev/null
 
 # ── 5) seed 情绪日线 + 夜研报告（否则情绪回看/报告弹窗用例无数据可断言）──────

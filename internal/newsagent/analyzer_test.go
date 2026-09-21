@@ -100,7 +100,8 @@ func TestPostProcessFallbackPollutionCleared(t *testing.T) {
 }
 
 // TestBuildChainEventsDifferentialSplit 对抗制裁型：上游利好/下游利空 → 拆成两个独立方向事件。
-// 上游事件带上游板块与上游个股、方向利好、正分；下游事件方向利空、负分。
+// §D1 护栏1（2026-09-21）回归锁：个股只能来自数据源（新闻自带 stock_list）——
+// 上游事件携带数据源个股，下游事件个股恒为空（交板块成分股传播注入），LLM 名单字段已物理删除。
 func TestBuildChainEventsDifferentialSplit(t *testing.T) {
 	ht := &llm.HotTopic{
 		Title:               "诺基亚收购恩智浦一工厂 计划自产磷化铟半导体",
@@ -112,14 +113,11 @@ func TestBuildChainEventsDifferentialSplit(t *testing.T) {
 		Sectors:             []string{"光模块"},
 		UpstreamSectors:     []string{"半导体材料", "小金属"},
 		DownstreamSectors:   []string{"光模块"},
-		RelatedStocks:       []string{"云南锗业", "有研新材"},
-		UpstreamStocks:      []string{"云南锗业", "有研新材", "光智科技"},
-		DownstreamStocks:    []string{"中际旭创"},
 		UpstreamDirection:   "利好",
 		DownstreamDirection: "利空",
 		Reason:              "海外自产确认磷化铟核心价值，利好国内上游",
 	}
-	item := data.NewsItem{Title: ht.Title, Datetime: "2026-08-06 10:00:00"}
+	item := data.NewsItem{Title: ht.Title, Datetime: "2026-08-06 10:00:00", Stocks: []string{"云南锗业", "有研新材"}}
 
 	evs := buildChainEvents(ht, item)
 	if len(evs) != 2 {
@@ -133,22 +131,22 @@ func TestBuildChainEventsDifferentialSplit(t *testing.T) {
 		t.Fatalf("上游事件应带上游板块，实际 %v", up.Sectors)
 	}
 	if !containsStr(up.RelatedStocks, "云南锗业") || !containsStr(up.RelatedStocks, "有研新材") {
-		t.Fatalf("上游事件应含云南锗业/有研新材，实际 %v", up.RelatedStocks)
+		t.Fatalf("上游事件应含数据源个股（stock_list），实际 %v", up.RelatedStocks)
 	}
 	if dn.Direction != "利空" || dn.Score >= 0 {
 		t.Fatalf("下游事件应利空负分，实际 direction=%s score=%v", dn.Direction, dn.Score)
 	}
-	if !containsStr(dn.RelatedStocks, "中际旭创") {
-		t.Fatalf("下游事件应含中际旭创，实际 %v", dn.RelatedStocks)
+	if len(dn.RelatedStocks) != 0 {
+		t.Fatalf("下游事件个股必须为空（护栏1：无 LLM 名单可注入，靠成分股传播），实际 %v", dn.RelatedStocks)
 	}
 	if up.Region != "海外" || up.Relation != "对抗制裁" {
 		t.Fatalf("地域/关系字段应透传，实际 region=%s relation=%s", up.Region, up.Relation)
 	}
 }
 
-// TestBuildChainEventsEmptyDownstreamStocks 下游个股缺失时不得回落全量 related_stocks，
-// 避免把上游利好个股污染进下游利空事件。
-func TestBuildChainEventsEmptyDownstreamStocks(t *testing.T) {
+// TestBuildChainEventsNoSourceStocksKeepsEmpty §D1 护栏1 反向锁：数据源无个股标签时，
+// buildChainEvents 不得凭空产出任何个股（旧实现里 LLM related_stocks 的洞已从结构上封死）。
+func TestBuildChainEventsNoSourceStocksKeepsEmpty(t *testing.T) {
 	ht := &llm.HotTopic{
 		Title:               "诺基亚收购恩智浦一工厂 计划自产磷化铟半导体",
 		Level:               "板块",
@@ -159,8 +157,6 @@ func TestBuildChainEventsEmptyDownstreamStocks(t *testing.T) {
 		Sectors:             []string{"光模块"},
 		UpstreamSectors:     []string{"半导体材料", "小金属"},
 		DownstreamSectors:   []string{"光模块"},
-		RelatedStocks:       []string{"云南锗业", "有研新材"},
-		UpstreamStocks:      []string{"云南锗业", "有研新材"},
 		UpstreamDirection:   "利好",
 		DownstreamDirection: "利空",
 	}
@@ -170,17 +166,15 @@ func TestBuildChainEventsEmptyDownstreamStocks(t *testing.T) {
 	if len(evs) != 2 {
 		t.Fatalf("差分事件应拆为 2 个，实际 %d", len(evs))
 	}
-	dn := evs[1]
-	if dn.Direction != "利空" {
-		t.Fatalf("下游事件应利空，实际 %s", dn.Direction)
-	}
-	if len(dn.RelatedStocks) != 0 {
-		t.Fatalf("下游个股缺失时不得回落全量 related_stocks（防止污染），实际 %v", dn.RelatedStocks)
+	for _, ev := range evs {
+		if len(ev.RelatedStocks) != 0 {
+			t.Fatalf("数据源无标签时不得产出个股（防发明归因复活），事件 %s 实际 %v", ev.Direction, ev.RelatedStocks)
+		}
 	}
 }
 
 // TestBuildChainEventsSameDirectionMerge 国内事件全链同向 → 合并为单事件，
-// 上/下游板块与个股并入同一事件。
+// 上/下游板块并入；个股=数据源标签（护栏1，无 LLM 名单）。
 func TestBuildChainEventsSameDirectionMerge(t *testing.T) {
 	ht := &llm.HotTopic{
 		Title:             "国内磷化铟扩产项目落地",
@@ -192,11 +186,8 @@ func TestBuildChainEventsSameDirectionMerge(t *testing.T) {
 		Sectors:           []string{"半导体材料"},
 		UpstreamSectors:   []string{"小金属"},
 		DownstreamSectors: []string{"光通信"},
-		UpstreamStocks:    []string{"云南锗业"},
-		DownstreamStocks:  []string{"中际旭创"},
-		RelatedStocks:     []string{"有研新材"},
 	}
-	item := data.NewsItem{Title: ht.Title, Datetime: "2026-08-06 10:00:00"}
+	item := data.NewsItem{Title: ht.Title, Datetime: "2026-08-06 10:00:00", Stocks: []string{"有研新材"}}
 
 	evs := buildChainEvents(ht, item)
 	if len(evs) != 1 {
@@ -209,8 +200,11 @@ func TestBuildChainEventsSameDirectionMerge(t *testing.T) {
 	if !containsStr(ev.Sectors, "小金属") || !containsStr(ev.Sectors, "光通信") {
 		t.Fatalf("合并事件应含上下游板块，实际 %v", ev.Sectors)
 	}
-	if !containsStr(ev.RelatedStocks, "云南锗业") || !containsStr(ev.RelatedStocks, "中际旭创") {
-		t.Fatalf("合并事件应含上下游个股，实际 %v", ev.RelatedStocks)
+	if !containsStr(ev.RelatedStocks, "有研新材") {
+		t.Fatalf("合并事件应含数据源个股，实际 %v", ev.RelatedStocks)
+	}
+	if len(ev.RelatedStocks) != 1 {
+		t.Fatalf("合并事件个股只能来自数据源（1 个），不得凭空扩散，实际 %v", ev.RelatedStocks)
 	}
 }
 

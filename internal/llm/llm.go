@@ -1199,12 +1199,12 @@ type HotTopic struct {
 	UpstreamSectors []string `json:"upstream_sectors"`
 	// 下游产业链受影响板块
 	DownstreamSectors []string `json:"downstream_sectors"`
-	// 关联个股名称或代码
-	RelatedStocks []string `json:"related_stocks"`
-	// 上游产业链关联个股（具体核心供应商）
-	UpstreamStocks []string `json:"upstream_stocks"`
-	// 下游产业链关联个股（具体核心应用/终端）
-	DownstreamStocks []string `json:"downstream_stocks"`
+	// §D1 归因护栏1（2026-09-21，docs/REFACTOR_UNIFIED_SELL_20260921.md §八）：
+	// 原 related_stocks/upstream_stocks/downstream_stocks 三个自由归因字段已物理删除——
+	// LLM 发明受益个股是打分偏移主源，个股名单改由数据源供给（新闻自带 stock_list、
+	// 标题全称匹配、板块成分股表），LLM 只保留板块目录点选权（护栏2）。
+	// English: guardrail-1 — the LLM no longer emits beneficiary stock lists; individual-stock
+	// attribution comes from data sources only, the model just picks sectors from the real catalog.
 	// 匹配战法：N形/龙头/双凸/龙回头/无
 	Strategy string `json:"strategy"`
 	// 简要分析理由
@@ -1217,6 +1217,44 @@ type HotTopic struct {
 	UpstreamDirection string `json:"upstream_direction"`
 	// 下游传导方向：利好/利空/中性
 	DownstreamDirection string `json:"downstream_direction"`
+}
+
+// sectorCatalog §D1 归因护栏2（2026-09-21）：真实板块目录（同花顺行业+概念名清单），
+// 由引擎在 refreshSectors 后注入。板块归因从"LLM 发明"降级为"目录点选"——提示词尾部
+// 追加白名单，模型只能逐字复制目录内板块名；目录未注入（冷启动/数据源全断）时不加白名单，
+// 由引擎侧 verifySectorAttribution 的验真剔除兜底（行为与旧版一致，不放任也不报错）。
+// English: guardrail-2 — the real sector catalog injected by the engine; the prompt gains a
+// whitelist suffix so the model can only copy sector names verbatim (selection, not invention).
+var sectorCatalog atomic.Value // []string
+
+// SetSectorCatalog 注入/刷新板块点选白名单（空列表不清旧目录：宁可用略旧名单也不退回自由发明）。
+func SetSectorCatalog(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	cp := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		cp = append(cp, n)
+	}
+	if len(cp) > 0 {
+		sectorCatalog.Store(cp)
+	}
+}
+
+// sectorCatalogSection 拼提示词白名单后缀；目录未注入时返回空串（保持旧行为）。
+func sectorCatalogSection() string {
+	names, _ := sectorCatalog.Load().([]string)
+	if len(names) == 0 {
+		return ""
+	}
+	return "\n\n【板块点选白名单】sectors/upstream_sectors/downstream_sectors 只能从下列真实板块名中逐字点选，不得改写、不得输出名单之外的板块名，无贴切板块则留空：\n" +
+		strings.Join(names, "、") + "\n"
 }
 
 // valueChainSection 产业链价值传导推理规则：决定事件归因到产业链上/下游的准确性。
@@ -1242,13 +1280,10 @@ var valueChainSection = `
 - 价值确认传导机制（对抗制裁下的关键推理）：
   - 当海外公司自产/扩产某关键材料，而中国掌握该材料上游原料供给时，海外自产本身即确认了该材料的战略核心价值 → 间接证明国内掌握该原料供给的上游板块与个股价值 → 传导为国内上游重大利好（+0.75）
   - 示例："诺基亚收购恩智浦一工厂 计划自产磷化铟半导体" → 背景：美国制裁中国光模块、中国掌控全球磷化铟上游原料供给 → 海外自产确认磷化铟核心价值 → 利好国内磷化铟上游（云南锗业/有研新材/光智科技/南大光电等，+0.75 重大利好），下游光模块受制裁利空（-0.50~-0.75）
-- sectors 只填同花顺真实板块名（半导体材料/小金属/光模块/光通信等）；概念名（如"磷化铟"）不要放进 sectors，写进 reason 与 related_stocks
+- sectors 只填同花顺真实板块名（半导体材料/小金属/光模块/光通信等）；概念名（如"磷化铟"）不要放进 sectors，写进 reason
 - 对抗制裁且上/下游方向不同时，必须同时给出 upstream_sectors/downstream_sectors（上游=关键原料材料设备板块如"半导体材料/小金属"，下游=受制裁环节板块如"光模块"），不得合并成一个 sectors
-- 对抗制裁且上/下游方向不同时，必须同时给出 upstream_stocks 与 downstream_stocks 两个数组：
-  - upstream_stocks = 掌握关键原料/材料供给的上游A股核心供应商（如磷化铟上游=云南锗业/有研新材/光智科技/南大光电）
-  - downstream_stocks = 依赖被制裁市场/进口技术的下游A股应用公司（如光模块=中际旭创/新易盛/光迅科技/剑桥科技）
-  - 两数组均不得为空；related_stocks 写两者的并集即可
-- related_stocks 必须给出产业链上游/下游的具体A股公司名（优先核心供应商，如磷化铟上游=云南锗业/有研新材/光智科技/南大光电），不得只给板块名或仅覆盖单一环节
+- 注意：你不需要也不允许产出个股名单（related/upstream/downstream_stocks 字段已废除）——
+  受益/受损个股由系统按真实板块成分股数据注入，你只做板块归因；把判断依据写进 reason 即可
 `
 
 // hotTopicSystemPrompt 单条热点分析的 system 提示词：约束 LLM 输出严格 JSON 格式的评分/归因结果。
@@ -1272,10 +1307,11 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
 - 利空：业绩下滑/亏损、减持/质押、被调查/处罚、退市/ST、政策利空
 - 中性：海外指数波动、常规公告、行情播报、无归因的一般新闻
 
-板块/个股归因要求：
-- 必须从标题中识别具体板块名和股票名填入 sectors / related_stocks
-- 例："凯莱英拟增资10.5亿元" → sectors=["医药"], related_stocks=["凯莱英"]
-- 例："SpaceX美股盘前涨超2%" → 无A股板块/个股归因 → score=0 中性
+板块归因要求（§D1 护栏2：只许点选、不许发明）：
+- sectors/upstream_sectors/downstream_sectors 只能从系统注入的真实板块目录中逐字点选（见板块点选白名单）；目录中没有的板块名一律不得输出，找不到贴切板块就留空
+- 不输出个股名单（related/upstream/downstream_stocks 字段已废除）：个股级事件由系统按新闻自带标签与标题公司名自动关联，板块级个股由系统按成分股表注入
+- 例："凯莱英拟增资10.5亿元" → level=个股, sectors=[]
+- 例："SpaceX美股盘前涨超2%" → 无A股板块归因 → score=0 中性
 
 字段说明：
 {
@@ -1289,9 +1325,6 @@ var hotTopicSystemPrompt = `你是一个A股多维度热点分析专家。对提
   "sectors": ["直接影响板块"],
   "upstream_sectors": ["上游产业链受影响板块"],
   "downstream_sectors": ["下游产业链受影响板块"],
-  "related_stocks": ["关联个股名称或代码"],
-  "upstream_stocks": ["上游产业链关联个股（具体核心供应商）"],
-  "downstream_stocks": ["下游产业链关联个股（具体核心应用/终端）"],
   "strategy": "N形|龙头|双凸|龙回头|无",
   "reason": "简要分析理由",
   "region": "国内|海外",
@@ -1336,10 +1369,11 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
 - 利空：业绩下滑/亏损、减持/质押、被调查/处罚、退市/ST、政策利空
 - 中性：海外指数波动、常规公告、行情播报、无归因的一般新闻
 
-板块/个股归因要求：
-- 必须从标题中识别具体板块名和股票名填入 sectors / related_stocks
-- 例："凯莱英拟增资10.5亿元" → sectors=["医药"], related_stocks=["凯莱英"]
-- 例："SpaceX美股盘前涨超2%" → 无A股板块/个股归因 → score=0 中性
+板块归因要求（§D1 护栏2：只许点选、不许发明）：
+- sectors/upstream_sectors/downstream_sectors 只能从系统注入的真实板块目录中逐字点选（见板块点选白名单）；目录中没有的板块名一律不得输出，找不到贴切板块就留空
+- 不输出个股名单（related/upstream/downstream_stocks 字段已废除）：个股级事件由系统按新闻自带标签与标题公司名自动关联，板块级个股由系统按成分股表注入
+- 例："凯莱英拟增资10.5亿元" → level=个股, sectors=[]
+- 例："SpaceX美股盘前涨超2%" → 无A股板块归因 → score=0 中性
 
 每条新闻的格式: "序号. 标题"
 返回格式:
@@ -1356,9 +1390,6 @@ var batchSystemPrompt = `你是一个A股多维度热点分析专家。从以下
     "sectors": ["直接影响板块"],
     "upstream_sectors": ["上游产业链受影响板块"],
     "downstream_sectors": ["下游产业链受影响板块"],
-    "related_stocks": ["关联个股名称或代码"],
-    "upstream_stocks": ["上游产业链关联个股（具体核心供应商）"],
-    "downstream_stocks": ["下游产业链关联个股（具体核心应用/终端）"],
     "strategy": "N形|龙头|双凸|龙回头|无",
     "reason": "简要分析理由",
     "region": "国内|海外",
@@ -1471,7 +1502,7 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 	var lastErr error
 	ok := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, err := c.Chat(batchSystemPrompt, prompt)
+		resp, err := c.Chat(batchSystemPrompt+sectorCatalogSection(), prompt)
 		if err == nil {
 			resp = cleanJSON(resp)
 			raw, err = parseHotTopicBatch(resp)
@@ -1491,16 +1522,15 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 		return nil, lastErr
 	}
 
-	// 日志：LLM返回了哪些板块和个股
+	// 日志：LLM返回了哪些板块（§D1 护栏1 后个股名单不再由 LLM 产出）
 	for _, r := range raw {
 		sectors := strings.Join(r.Sectors, ",")
-		stocks := strings.Join(r.RelatedStocks, ",")
 		idx := int(r.Index) - 1
 		title := ""
 		if idx >= 0 && idx < len(titles) {
 			title = titles[idx][:minInt(len(titles[idx]), 30)]
 		}
-		log.Printf("LLM打标: %s → 方向=%s 板块=[%s] 个股=[%s]", title, r.Direction, sectors, stocks)
+		log.Printf("LLM打标: %s → 方向=%s 板块=[%s]", title, r.Direction, sectors)
 	}
 
 	result := make([]*HotTopic, len(titles))
@@ -1525,15 +1555,6 @@ func (c *Client) analyzeBatch(titles []string) ([]*HotTopic, error) {
 				}
 				if len(r.DownstreamSectors) > 0 {
 					ht.DownstreamSectors = r.DownstreamSectors
-				}
-				if len(r.RelatedStocks) > 0 {
-					ht.RelatedStocks = r.RelatedStocks
-				}
-				if len(r.UpstreamStocks) > 0 {
-					ht.UpstreamStocks = r.UpstreamStocks
-				}
-				if len(r.DownstreamStocks) > 0 {
-					ht.DownstreamStocks = r.DownstreamStocks
 				}
 				if r.Strategy != "" {
 					ht.Strategy = r.Strategy
@@ -1586,7 +1607,7 @@ func (c *Client) AnalyzeHotTopic(title string) (*HotTopic, error) {
 	var resp string
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, err = c.Chat(hotTopicSystemPrompt, title)
+		resp, err = c.Chat(hotTopicSystemPrompt+sectorCatalogSection(), title)
 		if err == nil {
 			break
 		}
@@ -1835,12 +1856,8 @@ type stage2Row struct {
 	UpstreamSectors []string `json:"upstream_sectors"`
 	// 下游板块
 	DownstreamSectors []string `json:"downstream_sectors"`
-	// 相关个股
-	RelatedStocks []string `json:"related_stocks"`
-	// 上游个股
-	UpstreamStocks []string `json:"upstream_stocks"`
-	// 下游个股
-	DownstreamStocks []string `json:"downstream_stocks"`
+	// §D1 护栏1：related/upstream/downstream_stocks 已从解析层删除——
+	// 即使存量模型照旧吐出这三键也直接丢弃（物理不透传，防旧习惯复活自由归因）。
 	// 策略建议
 	Strategy string `json:"strategy"`
 	// 归因理由
