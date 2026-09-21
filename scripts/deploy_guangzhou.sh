@@ -146,11 +146,14 @@ $SCP deploy/qmt-win/prune_logs.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # baostock sidecar
 $SCP cmd/pydata/server.py cmd/pydata/requirements.txt "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/pydata/"
 
-# ── 2b. 同步 qmt_gateway Python 网关（§QMT-DUAL：含 qmt_bridge.py 策略桥）──
+# ── 2b. 同步 qmt_gateway Python 网关（§QMT-DUAL：含 qmt_bridge.py 策略桥；
+#      §CB-TICKWINDOW 2026-09-21 起 qmt_bridge_strategy.py 也入列——曾因不在清单，
+#      现网策略文件停在 9/18 手工拷贝，桥侧修复不会随部署下发）──
 echo "[2b/5] 同步 qmt_gateway 到 $QMT_GATEWAY_DIR ..."
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $QMT_GATEWAY_DIR | Out-Null\""
 $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
      qmt_gateway/store.py qmt_gateway/ids.py qmt_gateway/qmt_bridge.py \
+     qmt_gateway/qmt_bridge_strategy.py \
      qmt_gateway/quote_feed.py \
      qmt_gateway/config.bridge.example.json \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"

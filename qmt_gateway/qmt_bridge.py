@@ -206,7 +206,7 @@ class XtAdapter:
             out.append({
                 "ts_code": ts_code, "name": name, "qty": volume,
                 "cost_price": cost, "amount": mv, "highest_price": cost,
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "updated_at": _now_bj().strftime("%Y-%m-%dT%H:%M:%S+08:00"),
             })
         return out
 
@@ -254,7 +254,7 @@ class XtAdapter:
                 "price": float(self._field(item, "traded_price", "m_dTradedPrice") or 0),
                 "qty": int(self._field(item, "traded_volume", "m_nTradedVolume") or 0),
                 "amount": float(self._field(item, "traded_amount", "m_dTradedAmount") or 0),
-                "traded_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "traded_at": _now_bj().strftime("%Y-%m-%dT%H:%M:%S+08:00"),
             })
         return out
 
@@ -352,7 +352,7 @@ class Bridge:
         now = now or time.time()
         # 1) 心跳（驱动网关 QueuedBroker.is_connected）
         if now - self._last_hb >= self.heartbeat_sec:
-            self._post("/dispatch/result", {"type": "heartbeat", "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+            self._post("/dispatch/result", {"type": "heartbeat", "ts": _now_bj().strftime("%Y-%m-%dT%H:%M:%S+08:00")})
             self._last_hb = now
         # 2) 持仓/资产快照（周期性；网关 /state 与对账数据源）
         if now - self._last_pos >= self.positions_sec:

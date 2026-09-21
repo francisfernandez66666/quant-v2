@@ -805,14 +805,15 @@ export default function Quant() {
       </>
     ) : <Tag theme="success">正常</Tag>
     // 下行探测（quant→gateway 连通性）：在线态 + 延迟 + 最近探测时间。
-    // 零值时间戳（0001-…/缺失）= 引擎自启动还没探过测（探测只在交易时段随建议循环跑，
-    // 见 scoring_loop pushRealAdvice 的 IsActiveSession 门）——休市属正常，
+    // 零值时间戳（0001-…/缺失）= 引擎自启动还没探过测（探测只在连续竞价窗口跑，
+    // 见 scoring_loop pushRealAdvice 的 IsContinuousTrade 门——桥心跳由 QMT tick 驱动，
+    // 盘前/竞价/午休静默属正常，计入失联会每天误熔）——休市属正常，
     // 不能报"失联"（与真断线告警混淆）。
     const probeNever = !state.last_probe_at || String(state.last_probe_at).startsWith('0001-')
     const probe = (
       <span style={{ fontSize: 12 }}>
         {probeNever
-          ? <Tag theme="default" title="下行探测仅在交易时段运行；休市/刚重启后无探测记录属正常">休市未探测</Tag>
+          ? <Tag theme="default" title="下行探测仅在连续竞价时段（9:30-11:30 / 13:00-14:57）运行；休市/刚重启后无探测记录属正常">休市未探测</Tag>
           : (state.last_probe_ok ? <Tag theme="success">连通</Tag> : <Tag theme="danger">失联</Tag>)}
         {!probeNever && typeof state.last_latency_ms === 'number' ? <span style={{ marginLeft: 8 }}>延迟 {state.last_latency_ms}ms</span> : null}
         {!probeNever && state.last_probe_at ? <span style={{ marginLeft: 8, color: 'var(--app-text-2)' }}>· {state.last_probe_at}</span> : null}

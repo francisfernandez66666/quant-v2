@@ -61,7 +61,7 @@ type Controller struct {
 	tripReason   string    // 熔断原因
 	lastHealthAt time.Time // 最近一次健康探测时间（节流）
 	lastHealthy  bool      // 最近一次健康探测是否成功
-	lastFailAt   time.Time // 最近一次失败探测时间（熔断判定窗口用）
+	lastFailAt   time.Time // §CB-RUNSTART 本轮连续失联的起点时间（探测成功即清零；非"最近一次失败时间"）
 
 	// 互通健康展示数据（仪表盘-系统）：下行=首尔探测广州网关，上行=广州网关回报到首尔。
 	lastLatencyMs  int64     // 最近一次健康探测往返时延（毫秒）
@@ -364,6 +364,12 @@ func (c *Controller) HealthCheck() {
 		miss = 120 * time.Second
 	}
 	if err == nil && ok {
+		// §CB-RUNSTART（2026-09-21 误熔实录）：探测成功即代表链路此刻连通，清零失联窗口起点。
+		// 旧实现 lastFailAt 从不清零，桥心跳"爆发式"推进（QMT 回调只在行情动时跑）时，
+		// 两次被成功隔开的失败也能凑满 2 分钟窗口而误熔（09:10:27 即此形态）。
+		c.mu.Lock()
+		c.lastFailAt = time.Time{}
+		c.mu.Unlock()
 		if !c.Tripped() {
 			// 正常：刷新健康标记（熔断时保持 tripped 直到心跳持续恢复）
 			c.mu.Lock()
@@ -375,11 +381,15 @@ func (c *Controller) HealthCheck() {
 		}
 		return
 	}
-	// 探测失败：连续失败超过 miss 窗口才真正熔断
+	// 探测失败：lastFailAt 语义为「本轮连续失联起点」——首个失败只开窗并返回，
+	// 窗口内后续不再刷新起点，只有连续失败时长 ≥ miss 才熔断。旧实现每轮都覆写为
+	// "最近一次失败时间"，相邻失败间隔恒等于探测周期（miss/2），真·彻底断线反而永不熔断。
 	c.mu.Lock()
 	prevHealthy := c.lastHealthy
-	lastFail := c.lastFailAt
-	c.lastFailAt = time.Now()
+	runStart := c.lastFailAt
+	if runStart.IsZero() {
+		c.lastFailAt = time.Now()
+	}
 	c.lastHealthy = false
 	firstFailAfterHealthy := prevHealthy && !c.warnedUnhealthy
 	if firstFailAfterHealthy {
@@ -391,10 +401,10 @@ func (c *Controller) HealthCheck() {
 		c.fireOnAlert("medium", "QMT 网关探测失败",
 			fmt.Sprintf("最近一次 /health 探测失败: %v（连续失联将熔断暂停下单）", err))
 	}
-	if lastFail.IsZero() {
-		return
+	if runStart.IsZero() {
+		return // 本轮失联开窗：首个失败只记账，不计入失联时长
 	}
-	if time.Since(lastFail) >= miss {
+	if time.Since(runStart) >= miss {
 		c.setTripped(true, "网关心跳连续失联超过 "+miss.String())
 	}
 }

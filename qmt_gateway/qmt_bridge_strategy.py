@@ -35,10 +35,18 @@ HEARTBEAT_SEC = 5
 CMD_POLL_SEC = 2
 
 
+def _now_cn_str(fmt="%Y-%m-%dT%H:%M:%S+08:00"):
+    """Beijing wall clock. The embedded interpreter's local TZ is NOT guaranteed to be
+    Asia/Shanghai (live incident 2026-09-21: heartbeat ts carried the raw local clock
+    under a hardcoded +08:00 label and read 8 hours behind -- "02:25+08:00" was 09:25).
+    Expand epoch+8h as UTC so the label and the wall clock always agree.
+    (ASCII-only: this file is loaded under GBK by the QMT editor -- see header.)"""
+    return time.strftime(fmt, time.gmtime(time.time() + 8 * 3600))
+
+
 def _trace(msg):
     try:
-        import time as _t
-        line = _t.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n"
+        line = _now_cn_str("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n"
         # FIX 2026-09-14: sandbox default text encoding is GBK; the gateway sidecar
         # reads this file back as UTF-8. Always write explicit UTF-8 bytes.
         f = open(TRACE_PATH, "ab")
@@ -464,7 +472,7 @@ class _XtOps:
                 "can_use_qty": int(getattr(p, "m_nCanUseVolume", 0) or getattr(p, "can_use_volume", 0) or 0),
                 "open_price": open_p, "cost_price": open_p, "amount": mv,
                 "highest_price": open_p,
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "updated_at": _now_cn_str(),
             })
         return out
 
@@ -850,7 +858,7 @@ class _XtOps:
                 "cost_price": float(getattr(p, "open_price", 0) or 0),
                 "amount": float(getattr(p, "market_value", 0) or 0),
                 "highest_price": float(getattr(p, "open_price", 0) or 0),
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "updated_at": _now_cn_str(),
             })
         return out
 
@@ -1120,7 +1128,7 @@ def _bridge_tick():
         st["last_hb"] = now
         try:
             _report({"type": "heartbeat",
-                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                     "ts": _now_cn_str(),
                      "n": st["n"]})
         except Exception as e:
             _trace("report fail: " + repr(e))

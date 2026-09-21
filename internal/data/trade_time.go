@@ -281,6 +281,24 @@ func BeforeOpenTrade(now time.Time) bool {
 	return now.Hour()*100+now.Minute() < 930
 }
 
+// IsContinuousTrade 判断当前是否处于 A 股「连续竞价」推送窗口：工作日 9:30-11:30 与 13:00-14:57。
+// 与 SessionMorningTrade/SessionAfternoonTrade 的差异在于掐头（9:15-9:25 开盘集合竞价、
+// 9:25-9:30 冻结期）去尾（14:57-15:00 收盘集合竞价）——这些窗口交易所不推进连续行情，
+// QMT 内嵌桥（handlebar-tick 驱动）不会稳定产心跳，按失联判定必然误熔
+// （2026-09-21 实录：09:10 盘前误熔、09:25-09:30 竞价冻结期无心跳）。
+// 头 930 为 A 股连续竞价开始固定钟点（与 BeforeOpenTrade 同源）；尾 1457 为沪深收盘
+// 集合竞价开始时刻。English: continuous-auction push window (9:30-11:30, 13:00-14:57) —
+// the only period where the tick-driven QMT bridge beats reliably.
+func IsContinuousTrade(now time.Time) bool {
+	now = cntime.In(now) // §TZ1 北京时区统一
+	wd := now.Weekday()
+	if wd == time.Saturday || wd == time.Sunday {
+		return false
+	}
+	m := now.Hour()*100 + now.Minute()
+	return (m >= 930 && m < 1130) || (m >= defaultTradeTime.AfternoonStart && m < 1457)
+}
+
 // NextTradeOpen 返回距离下一个交易时段开盘的等待时长。
 func NextTradeOpen(now time.Time) time.Duration {
 	now = cntime.In(now) // §TZ1 北京时区统一

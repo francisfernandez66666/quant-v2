@@ -96,6 +96,17 @@ class TestXtOpsContract(unittest.TestCase):
             bs.SEEN_PATH = old_seen
             bs._trace = old_trace
 
+    def test_now_cn_str_matches_epoch_plus8(self):
+        """§CB-TICKWINDOW regression (live 2026-09-21): the embedded interpreter may run
+        on a UTC clock, so ts must be derived from epoch+8h (not the local wall clock)
+        and carry a truthful +08:00 label. Skew against real UTC now must be ~0."""
+        import datetime
+        got = bs._now_cn_str()
+        parsed = datetime.datetime.fromisoformat(got)
+        skew = abs((parsed - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+        self.assertLess(skew, 5, "ts clock face must track epoch (+08:00 label honest): " + got)
+        self.assertTrue(got.endswith("+08:00"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,3 +53,33 @@ func TestIsPreAfternoon(t *testing.T) {
 		}
 	}
 }
+
+// TestIsContinuousTrade 连续竞价推送窗口（9:30-11:30 / 13:00-14:57）边界判定：
+// §CB-TICKWINDOW 回归——盘前/开盘竞价/午休/收盘竞价必须为 false（桥心跳 tick 驱动，
+// 这些窗口静默属正常，计入失联会每天误熔，2026-09-21 实录）。
+func TestIsContinuousTrade(t *testing.T) {
+	tue := time.Date(2026, 8, 4, 0, 0, 0, 0, cntime.Loc) // 2026-08-04 是周二（按北京墙钟）
+	cases := []struct {
+		name string
+		time time.Time
+		want bool
+	}{
+		{"09:00 盘前", tue.Add(9 * time.Hour), false},
+		{"09:15 开盘竞价", tue.Add(9*time.Hour + 15*time.Minute), false},
+		{"09:29:59 竞价结束前", tue.Add(9*time.Hour + 29*time.Minute + 59*time.Second), false},
+		{"09:30:00 连续竞价开始", tue.Add(9*time.Hour + 30*time.Minute), true},
+		{"11:29:59 上午盘末", tue.Add(11*time.Hour + 29*time.Minute + 59*time.Second), true},
+		{"11:30 午休", tue.Add(11*time.Hour + 30*time.Minute), false},
+		{"12:59 午休末", tue.Add(12*time.Hour + 59*time.Minute), false},
+		{"13:00 下午盘开始", tue.Add(13 * time.Hour), true},
+		{"14:56:59 收盘竞价前", tue.Add(14*time.Hour + 56*time.Minute + 59*time.Second), true},
+		{"14:57 收盘竞价", tue.Add(14*time.Hour + 57*time.Minute), false},
+		{"15:30 盘后", tue.Add(15*time.Hour + 30*time.Minute), false},
+		{"周末 10:00", time.Date(2026, 8, 8, 10, 0, 0, 0, cntime.Loc), false},
+	}
+	for _, c := range cases {
+		if got := IsContinuousTrade(c.time); got != c.want {
+			t.Errorf("%s: IsContinuousTrade(%v) = %v, want %v", c.name, c.time, got, c.want)
+		}
+	}
+}

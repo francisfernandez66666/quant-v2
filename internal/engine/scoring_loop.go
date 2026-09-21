@@ -611,7 +611,13 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	}
 
 	// 熔断健康探测（节流：miss_heartbeat_sec/2）
-	ctrl.HealthCheck()
+	// §CB-TICKWINDOW（2026-09-21 误熔实录）：只在连续竞价窗口探测/计失联。QMT 内嵌桥的心跳由
+	// handlebar-tick 驱动，盘前/开盘竞价（9:15-9:30）与收盘竞价（14:57-15:00）行情不推进，
+	// 桥必然静默——按失联口径会计时误熔（当日 09:10:27 误熔、09:25-09:30 断流）。真断线仍有
+	// 双保险：网关 disconnect 回报即时 SetTripped 熔断 + 9:30/13:00 后探测 2 分钟内熔断。
+	if data.IsContinuousTrade(time.Now()) {
+		ctrl.HealthCheck()
+	}
 	// §W6-a 周期对账（默认 5min 节流）：首尔侧主动拉网关持仓落库，终结"双向对账均不存在"的盲区
 	ctrl.MaybeReconcile(5 * time.Minute)
 	// §R4-1 撤单闭环（30s 节流 + 每日收盘清单）：未成交超时自动撤 / 占位行降级 / 收盘清单，
