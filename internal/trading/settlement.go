@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/metrics"
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 )
 
@@ -44,11 +46,35 @@ type brokerTrade struct {
 	Serial   string // 交割流水号（网关 trade_id）；缺失时不参与匹配（见 factKey）
 }
 
+// normalizeSettleDay §H1（2026-09-22 修复批）对账日期口径归一：YYYYMMDD → YYYY-MM-DD。
+// 网关 /settlement 只受理 `YYYY-MM-DD`（gateway.py 校验），本地 fills 侧 ListFillsByDay 也用
+// `substr(traded_at,1,10)=?` 的带杠日期——而自动调度路 engine 传入的是 data.TradingDayDate 的
+// 无杠 20060102（qmt_client.go 旧注释还写着 "date=YYYYMMDD" 误导），结果自动三方对账**恒 400**、
+// 从未真正跑过一次。在唯一入口做防御式归一，两路口径一次收编；无法归一的原样透传给网关报错。
+// English: §H1 — normalize YYYYMMDD to YYYY-MM-DD at the settlement entry; the auto path passed
+// undashed dates the gateway rejects, so scheduled three-way reconciliation always 400'd.
+func normalizeSettleDay(day string) string {
+	if len(day) == 8 {
+		digits := true
+		for _, r := range day {
+			if r < '0' || r > '9' {
+				digits = false
+				break
+			}
+		}
+		if digits {
+			return day[0:4] + "-" + day[4:6] + "-" + day[6:8]
+		}
+	}
+	return day
+}
+
 // SettleDay 执行某交易日三方对账：券商交割单 ↔ 本地 fills ↔ real_account。
 // 返回差异摘要；gateway 不支持交割单时返回 (nil, nil)（静默跳过，不误告警）。
 // English: runs three-way settlement for a day; returns the diff summary. When the gateway lacks
 // settlement support it returns (nil, nil) silently (no false alarms).
 func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) {
+	day = normalizeSettleDay(day) // §H1 口径归一先于一切（落库键/拉取参数/补记时间戳共用）
 	if c.store == nil {
 		return nil, fmt.Errorf("real book not set")
 	}
@@ -224,6 +250,7 @@ func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabl
 	if !enabled || c.store == nil || !c.Enabled() {
 		return
 	}
+	day = normalizeSettleDay(day) // §H1 归一先于幂等比较，lastSettleDay 恒为带杠口径
 	c.mu.RLock()
 	last := c.lastSettleDay
 	c.mu.RUnlock()
@@ -242,7 +269,10 @@ func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabl
 	c.mu.Unlock()
 	diff, err := c.SettleDay(day, mode)
 	if err != nil {
+		// §H1：失败不再只留一行日志——计指标 + opslog 留痕，网关 400/断连可被监控侧发现。
 		log.Printf("[settle] 对账失败: %v", err)
+		metrics.SettleFailed()
+		opslog.Logf("quant", "交割单三方对账失败 账户=%s 日=%s: %v", c.userID, day, err)
 		return
 	}
 	if diff != nil && (len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch) > 0) {

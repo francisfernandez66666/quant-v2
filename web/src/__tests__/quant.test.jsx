@@ -10,6 +10,8 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 // 整页 API mock：挂载态仅走只读拉取，返回合法字段（不触发任何写操作）。
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
+  // §M13：补齐 mock 缺失导出（与 api/index.js 真实实现一致，仅按状态码判定，不改变本文件既有断言）。
+  isForbidden: (e) => !!(e && e.status === 403),
   fetchQMTConfig: vi.fn(async () => ({
     enabled: true, mode: 'auto', price_type: 'market', auto_sell: false,
     gateway_url: 'http://127.0.0.1:8789', token_masked: '****',

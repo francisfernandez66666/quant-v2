@@ -26,6 +26,10 @@
 #   MINIQMT_PATH     QMT 完整交易端 XtItClient.exe 路径（默认 C:/Program Files (x86)/东莞证券QMT实盘交易端/bin.x64/XtItClient.exe；
 #                    注意：必须是 XtItClient.exe——可自动登录交易；不能是 XtMiniQmt.exe，后者无法自动登录，
 #                    会导致 broker 永远连不上）
+#   GATEWAY_TOKEN    §M7c 网关 config.xt.json 的 token（留空则首次生成时现场随机 48 位 hex 并打印，
+#                    需抄存并同步到引擎 rules.qmt.token；已存在的 config.xt.json 不会被覆盖）
+#   GATEWAY_ACCOUNT  §M7c 东莞证券资金账号（留空 → broker=mock 影子期存活，不接真实柜台）
+#   XT_USERDATA_PATH §M7c QMT userdata_mini 目录（broker=xt 时必需）
 
 set -euo pipefail
 
@@ -139,6 +143,10 @@ SERVICES_STOPPED=1   # 置位后由 [4/5]/[4/5]-s 拉起，任何提前退出都
 $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $DEPLOY_DIR, $DATA_DIR, ${DEPLOY_DIR}/qmt-win, ${DEPLOY_DIR}/pydata | Out-Null\""
 $SCP /tmp/quant.exe /tmp/researchd.exe /tmp/dataload.exe /tmp/research.exe /tmp/qmtctl.exe "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/"
 $SCP deploy/qmt-win/register_engine_services.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+# §H8(2026-09-22) 探针端口/端点同源配置文件——register 与运维探针（all_service_watchdog/
+# daily_ops_check）都 dot-source 它，必须随 register 同目录上传，缺了 register 会回退字面量并告警。
+ps1_bom deploy/qmt-win/service_probe_config.ps1
+$SCP deploy/qmt-win/service_probe_config.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # §RFIX-5 日志保留脚本（register 第 6 段据此注册 Quant-Log-Prune 计划任务；新增部署文件
 # 必须入本清单——教训见 §ENH-5 quote_feed.py 漏列导致网关 ImportError 起不来）
 ps1_bom deploy/qmt-win/prune_logs.ps1
@@ -157,6 +165,17 @@ $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
      qmt_gateway/quote_feed.py \
      qmt_gateway/config.bridge.example.json \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
+# §M7c（2026-09-22 修复批）config.xt.json 收编：gateway_watchdog.ps1 依赖的
+# <QMT_GATEWAY_DIR>/config.xt.json 过去只有 setup_windows.ps1 手工路径才生成，脚本化部署
+# 从不下发 → 全新机器网关秒起秒死、watchdog 空转。现随部署执行幂等 ensure（已存在不覆盖；
+# listen 端口 dot-source §H8 service_probe_config.ps1 同源）。可选注入：
+#   GATEWAY_TOKEN 网关 token（留空现场随机生成并打印，需抄到引擎 rules.qmt.token）
+#   GATEWAY_ACCOUNT 资金账号（留空 broker=mock 影子期存活）
+#   XT_USERDATA_PATH QMT userdata_mini 目录（broker=xt 时必需）
+ps1_bom deploy/qmt-win/ensure_gateway_config.ps1
+$SCP deploy/qmt-win/ensure_gateway_config.ps1 deploy/qmt-win/config.xt.template.json \
+     "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
+$SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${QMT_GATEWAY_DIR}/ensure_gateway_config.ps1 -GatewayDir '${QMT_GATEWAY_DIR}' -Token '${GATEWAY_TOKEN:-}' -Account '${GATEWAY_ACCOUNT:-}' -XtPath '${XT_USERDATA_PATH:-}' -ProbeConfigPath '${DEPLOY_DIR}/qmt-win/service_probe_config.ps1'"
 
 # ── 2c. 同步前端 web/dist 到云端 Caddy 站点根（§A7 版本漂移根治）──
 # 根因：旧版脚本只同步二进制/gateway/pydata，从不传 web/dist → 云端 Caddy 前端
@@ -223,6 +242,25 @@ if [ -d web/dist ]; then
 else
   echo "  X web/dist 构建失败，跳过前端同步（其余部署照常进行）"
 fi
+
+# ── 2d. quant-web（Caddy）站点注册与配置刷新（§M7b，2026-09-22 修复批）──
+# 根因：verify_deploy_guangzhou.sh 的探针清单一直要求 quant/quant-research/pydata/quant-web
+#       四服务全 Running，但 quant-web（Caddy）的注册与 Caddyfile 只存在于 GUANGZHOU_CADDY.md
+#       的手工流程里，部署脚本从不管它——「部署面」与「校验面」各说各话（§M7 审计）。
+# 现状：注册脚本 deploy/qmt-win/register_web_service.ps1 幂等收编三件事——
+#       ① caddy.exe 缺失自动下载预置；② Caddyfile validate 通过且内容变化才 .bak 备份替换；
+#       ③ NSSM 服务 quant-web 不存在则 install、存在则纠正参数后按需 restart（配置没变不闪断）。
+#       健康口取自 §H8 service_probe_config.ps1 的 $ProbeCaddyPort，与运维探针同源。
+# -s（仅同步）模式同样执行：同步发布也应保证站点配置随代码走（脚本自身幂等，代价仅一次校验/比对）。
+echo "[2d/5] 同步 Caddy 站点配置并确保 quant-web 服务注册 (§M7b) ..."
+if [ ! -d web/dist ]; then
+  echo "  [!] web/dist 缺失（上一步构建失败？）——Caddy 站点根将为空，仍注册服务但前端必然 404，先修构建"
+fi
+ps1_bom deploy/qmt-win/register_web_service.ps1
+$SCP deploy/caddy/guangzhou.conf "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/guangzhou.conf.new"
+$SCP deploy/qmt-win/register_web_service.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+$SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/register_web_service.ps1 -DeployDir '${DEPLOY_DIR}' -CaddyConfSrc '${DEPLOY_DIR}/guangzhou.conf.new' -ProbeConfigPath '${DEPLOY_DIR}/qmt-win/service_probe_config.ps1'" \
+  || echo "  [!] quant-web 注册/健康确认未通过（退出码非 0）——引擎与网关部署不受影响，但 verify_deploy 的 svc:quant-web / web:/ 探针会红，按上方输出修复后单独重跑本步或 ./scripts/verify_deploy_guangzhou.sh 复核"
 
 # ── 3. 数据目录 + 默认 config.json（影子模式：qmt.enabled=false）──
 # §UAT 20260915 部署加固：原内联 SSH 命令的 bash→PS 双层转义在每个部署日都报 ParserError

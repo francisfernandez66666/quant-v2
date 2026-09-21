@@ -1,0 +1,115 @@
+{
+  "source": "internal/trading/settlement.go + internal/server/qmt.go + qmt_gateway/{store,handler,gateway,broker,qmt_bridge,qmt_bridge_strategy}.py + cmd/dataload + cmd/pydata/server.py + scripts/dataload_keepalive.py",
+  "updated": "2026-09-22",
+  "notes": "§3.1-5（2026-09-22 修复批）时间格式契约 golden：登记 Go↔网关↔数据链路全部日期/时间字段格式（H1 对账日期串、M5/LOW 族 +08:00 偏移收敛即此二族的收口锚）。ISO 时间串一律显式北京时区（§TZ：store._now_cn() 为网关落库唯一收敛点，桥端 _now_cn_str 同风格），禁止本地钟面贴假 +08:00。回归测：qmt_gateway/tests/test_time_formats.py（实际产出串 %z 可解析且偏移 +0800、/settlement date 校验、全生产文件裸 strftime 负向静态锁、本 golden 与产出格式一致性）。Go 侧消费者如需读该 golden 做契约测试（如 settlement 日期归一断言），由 Go 测试文件自行 json 解析，不改 Go 生产代码。",
+  "formats": {
+    "iso_beijing": {
+      "format": "YYYY-MM-DDTHH:MM:SS+08:00",
+      "strptime": "%Y-%m-%dT%H:%M:%S%z",
+      "regex": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\+08:00$",
+      "rule": "钟面恒为北京墙钟（UTC+8 定区取值后格式化），偏移标签恒 +08:00；任何时区部署产出不变"
+    },
+    "date_dash": {
+      "format": "YYYY-MM-DD",
+      "strptime": "%Y-%m-%d",
+      "regex": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "date_compact": {
+      "format": "YYYYMMDD",
+      "strptime": "%Y%m%d",
+      "regex": "^\\d{8}$"
+    }
+  },
+  "fields": [
+    {
+      "id": "settlement.query.date",
+      "interface": "Go → 网关 GET /settlement?date=",
+      "field": "date",
+      "format": "YYYY-MM-DD",
+      "producer": "internal/trading/settlement.go normalizeSettleDay（20060102 归一为带杠后透传）",
+      "consumer": "qmt_gateway/gateway.py _do_settlement（非 10 位带杠一律 400）",
+      "note": "§H1：对账日期恒 400 死配的根治锚——两侧只认 YYYY-MM-DD"
+    },
+    {
+      "id": "report.trade.traded_at",
+      "interface": "网关 → Go POST /api/qmt/report (type=trade)",
+      "field": "traded_at",
+      "format": "YYYY-MM-DDTHH:MM:SS+08:00",
+      "producer": "qmt_gateway/handler.py on_stock_trade / gateway.py _apply_trade（缺省 _now_cn()）/ 桥端 _now_cn_str()",
+      "consumer": "internal/server/qmt.go ApplyRealFill 落 fills；internal/trading/settlement.go ListFillsByDay 取 substr(traded_at,1,10) 作日键",
+      "note": "§TZ 假 +08:00 根治；§REJECT 不影响本字段格式"
+    },
+    {
+      "id": "report.order.at",
+      "interface": "网关 → Go POST /api/qmt/report (type=order)",
+      "field": "at / created_at",
+      "format": "YYYY-MM-DDTHH:MM:SS+08:00",
+      "producer": "qmt_gateway/handler.py on_stock_order、gateway.py _apply_order_result/_apply_cancel_result/_reap_dispatch_inflight（_now_cn()）",
+      "consumer": "internal/server/qmt.go ApplyOrderReportTx（orders.created_at 原样入库展示）",
+      "note": "§TZ"
+    },
+    {
+      "id": "report.positions.updated_at",
+      "interface": "网关 → Go POST /api/qmt/report (type=positions)",
+      "field": "positions[].updated_at",
+      "format": "YYYY-MM-DDTHH:MM:SS+08:00",
+      "producer": "qmt_gateway/broker.py query_positions / qmt_bridge.py 持仓快照（_now_cn()/_now_cn_str()）",
+      "consumer": "internal/server/qmt.go ReconcilePositionsForUser（字符串原样入 real_positions.updated_at）",
+      "note": "§TZ"
+    },
+    {
+      "id": "report.disconnect.at",
+      "interface": "网关 → Go POST /api/qmt/report (type=disconnect)",
+      "field": "at",
+      "format": "YYYY-MM-DDTHH:MM:SS+08:00",
+      "producer": "qmt_gateway/handler.py on_disconnected（_now_cn()）",
+      "consumer": "internal/server/qmt.go（仅置熔断，时间不入库）",
+      "note": "§TZ"
+    },
+    {
+      "id": "dispatch.result.ts",
+      "interface": "桥 → 网关 POST /dispatch/result（heartbeat/trade 等）",
+      "field": "ts / traded_at / updated_at",
+      "format": "YYYY-MM-DDTHH:MM:SS+08:00",
+      "producer": "qmt_gateway/qmt_bridge.py _now_cn_str()、qmt_bridge_strategy.py _now_cn_str()（epoch+8h 展开，非本地钟面）",
+      "consumer": "qmt_gateway/gateway.py _do_dispatch_result / store.py bridge_heartbeat",
+      "note": "§CB-C 静态锁同源：桥端 ts 必须显式北京钟面"
+    },
+    {
+      "id": "gateway.store.created_at",
+      "interface": "网关本地账本（orders/fills/dispatch/outbox/outbox_dead/bridge_state 时间列）",
+      "field": "created_at / traded_at / inflight_at / updated_at / at",
+      "format": "YYYY-MM-DDTHH:MM:SS+08:00",
+      "producer": "qmt_gateway/store.py _now_cn()（唯一收敛点）",
+      "consumer": "GET /settlement 日键 substr(x,1,10)→YYYY-MM-DD；sqlite strftime('%s') 超时收割比较",
+      "note": "§TZ：本 golden 的网关侧权威定义"
+    },
+    {
+      "id": "pydata.csv.date",
+      "interface": "Go dataload / dataload_keepalive ← pydata sidecar GET /kline /index_kline",
+      "field": "date（CSV 列）",
+      "format": "YYYY-MM-DD",
+      "producer": "cmd/pydata/server.py（baostock 原样；akshare 降级行 _ak_*_daily 也归一为无杠 8 位再落列——消费端统一去杠）",
+      "consumer": "cmd/dataload normDate / scripts/dataload_keepalive.py fetch_index（replace('-','') 归一为 YYYYMMDD 落库）",
+      "note": "表头字段名大小写契约同样在此登记：指数集为 _INDEX_FIELDS（含 pctChg，驼峰）——§M6 事故锚"
+    },
+    {
+      "id": "pydata.csv.trade_days.calendar_date",
+      "interface": "dataload_keepalive / Go dataload ← pydata sidecar GET /trade_days",
+      "field": "calendar_date",
+      "format": "YYYY-MM-DD（baostock 主源）或 YYYYMMDD（akshare 新浪降级源）",
+      "producer": "cmd/pydata/server.py r_trade_days",
+      "consumer": "scripts/dataload_keepalive.py _pydata_latest_open（去杠归一后取 ≤今日 最大 is_open=1 日）/ cmd/dataload bsLoadMeta normDate",
+      "note": "消费端必须两形态兼容——golden 登记即防单侧改格式互踩"
+    },
+    {
+      "id": "db.trade_date",
+      "interface": "SQLite 研究库落库键（daily/index_daily/ths_daily/ths_limit_up_daily.trade_date、trade_cal.cal_date、keepalive target）",
+      "field": "trade_date / cal_date",
+      "format": "YYYYMMDD",
+      "producer": "cmd/dataload normDate / scripts/dataload_keepalive.py last_trade_date+fetch_index",
+      "consumer": "internal/store 数据新鲜度（MAX(trade_date)、trade_cal is_open=1 口径）/ keepalive latest() 字符串比较",
+      "note": "§M6-② 交易日历数据源即本表（trade_cal），keepalive 优先查它推导 target"
+    }
+  ]
+}

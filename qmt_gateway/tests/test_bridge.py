@@ -137,6 +137,36 @@ class TestBridgeLoop(unittest.TestCase):
         _, state = self._req("GET", "/state")
         self.assertEqual(state["orders"][0]["status"], "已废")
 
+    # ── §M16（2026-09-22）：HTTP 桥 inflight 收割配套——diag kind 识别 + unknown kind 负回执 ──
+
+    def test_diag_dispatch_end_to_end_no_more_hang(self):
+        """§M16：/dispatch/enqueue 注入 diag → 桥取走并回 type=diag → 派发行结算 done。
+
+        旧实现桥不识别 diag kind（只 warn 不回执），该行永久卡 inflight——本用例即回归锁。
+        """
+        status, body = self._req("POST", "/dispatch/enqueue", {"kind": "diag", "signal_id": "DIAG-M16"})
+        self.assertEqual(status, 200, body)
+        seq = body["seq"]
+        for _ in range(5):
+            self.bridge.run_once()
+            time.sleep(0.03)
+        row = self.gw.store.dispatch_get(seq)
+        self.assertEqual(row["status"], "done", row)
+        self.assertEqual(self.gw.store.dispatch_stats().get("inflight", 0), 0)
+
+    def test_unknown_kind_negative_ack(self):
+        """§M16：unknown kind 也必须负回执（order_result ok=false），网关据此判废结算。"""
+        posts = []
+        self.bridge._get = lambda path: (200, {"ok": True, "items": [{"seq": "seq:77", "kind": "bogus"}]})
+        self.bridge._post = lambda path, payload: (posts.append((path, payload)), (200, {"ok": True}))[1]
+        self.bridge._process_pending()
+        acks = [p for (path, p) in posts if path == "/dispatch/result"]
+        self.assertEqual(len(acks), 1, posts)
+        self.assertEqual(acks[0]["type"], "order_result")
+        self.assertEqual(acks[0]["seq"], "seq:77")
+        self.assertFalse(acks[0]["ok"])
+        self.assertIn("unknown kind", acks[0]["err"])
+
 
 if __name__ == "__main__":
     unittest.main()

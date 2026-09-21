@@ -146,4 +146,95 @@ jobs:
           grep -q 'judgePaperLedgers' internal/engine/engine.go || { echo "主循环 paper/report 裁决未接线"; exit 1; }
           # 锁⑤ CI 两套 UAT 栈（nightly / 本机自举）必须显式 pin shadow，防"未配置即随机模式"漂移
           grep -q '"sell_unified_mode": "shadow"' .github/workflows/nightly-e2e.yml || { echo "nightly-e2e 未显式 pin shadow"; exit 1; }
-          echo "ok - §SELLPOINT-UNIFY 静态锁 5 道全过"
+          # 锁⑥ §C2（2026-09-22）深破升级不得回到只认止损线的旧形态：
+          # `line == SellLineDeepBreach && st.Line == SellLineStopLoss` 前置条件一旦复活，
+          # 止盈/移动止盈锁线砸穿 −12% 又会绕过边界④（FIX#12 事故形态）。
+          if grep -q 'SellLineDeepBreach && st.Line == SellLineStopLoss' internal/signalctl/sell.go; then
+            echo "sell.go 深破升级复活 StopLoss 前置条件（§C2 回归，边界④被架空）"; exit 1
+          fi
+          echo "ok - §SELLPOINT-UNIFY 静态锁 6 道全过"
+
+      # §20260922 修复批（FIX_PLAN_20260922）静态锁：P0/P1/P2 十八项的 CI 侧子集，
+      # 与 scripts/verify_changes.sh §28~§37 同口径——行为回归随重构漂移，这里只钉
+      # 「负向防复活」语义（资金安全/越权/假成功/静默丢弃四族）。
+      - name: §20260922 修复批静态锁
+        run: |
+          # §C1 冻结账：当日过滤 + 吞错单值形态不得复活
+          grep -A6 'func (d \*DB) LocalBuyFrozen' internal/store/real_positions.go | grep -q "substr(created_at,1,10)=?" || { echo "LocalBuyFrozen 日期过滤丢失（§C1）"; exit 1; }
+          if grep -q 'frozen := g.st.LocalBuyFrozen' internal/risk/gate.go; then echo "冻结账读取错误被吞（§C1 fail-open 复活）"; exit 1; fi
+          grep -q 'lastStaleSweepAt' internal/trading/controller.go || { echo "§C1b 跨日清扫节流戳丢失"; exit 1; }
+          # §F1/§F12 费用腿与成交额单口径
+          grep -q 'sellPnl := (f.Price-ps.cost)\*float64(sellQty) - (f.Fee + f.StampTax)' internal/server/qmt.go || { echo "trades 重放卖出费用减项丢失（§F1）"; exit 1; }
+          grep -q 'f.Price\*float64(f.Qty) + f.Fee) / float64(newQty)' internal/store/real_positions.go || { echo "ApplyRealFill 加仓含费摊薄丢失（§F1）"; exit 1; }
+          # §H1 交割日期归一
+          grep -q 'func normalizeSettleDay' internal/trading/settlement.go || { echo "§H1 归一函数丢失"; exit 1; }
+          # §H2 跃迁判定值快照（防 prev/st 别名）
+          grep -q 'prevSnap = \*prev' internal/signalctl/sell.go || { echo "§H2 快照丢失，VerdictHold 永不留痕复活"; exit 1; }
+          # §H3 全局写端点收权
+          grep -q 'POST /api/action", s.adminMiddleware(s.handleFixAction)' internal/server/server.go || { echo "/api/action 回退 authMiddleware（§H3）"; exit 1; }
+          grep -q 'POST /api/news/reanalyze", s.adminMiddleware(s.handleNewsReanalyze)' internal/server/server.go || { echo "reanalyze 回退 authMiddleware（§H3）"; exit 1; }
+          # §H4 卖单吞错防复活 + 减仓槽先成功后烧
+          if grep -q '_ = e.sellRealPosition' internal/engine/scoring_loop.go; then echo "卖单错误回退吞错形态（§H4）"; exit 1; fi
+          grep -q 'realTrimDone\[p.TsCode\] = trimDay' internal/engine/scoring_loop.go || { echo "减仓槽成功回写丢失（§H4）"; exit 1; }
+          # §H5 新鲜度主判据
+          grep -q 'at := sc.UpdatedAt' internal/engine/sell_shadow.go || { echo "新鲜度回退全局时钟（§H5）"; exit 1; }
+          # §H6/§H7 前端 SSE 续传与登出闭包
+          grep -q 'sseReconnectTimer' web/src/api/index.js || { echo "§H6 重建定时器丢失"; exit 1; }
+          grep -q 'loggedInRef.current' web/src/App.jsx || { echo "§H7 登出回调读陈旧闭包复活"; exit 1; }
+          # §H9 outbox 下标定位防复活
+          if grep -q 'jobs = append(jobs, job{idx: i' internal/notify/outbox.go; then echo "pump 回退数组下标定位（§H9 风暴复活）"; exit 1; fi
+          # §M16 网关 inflight 收割与桥回执
+          grep -q 'inflight_at' qmt_gateway/store.py || { echo "§M16 取单时刻列丢失"; exit 1; }
+          grep -q '_execute_diag' qmt_gateway/qmt_bridge.py || { echo "§M16 桥 diag 回执丢失（永挂复活）"; exit 1; }
+          # §F2/§F5/§M5/§F3 回报接入段
+          grep -q 'errors.Is(err, store.ErrInvalidPositionReport)' internal/server/qmt.go || { echo "§F2 校验失败 400 映射丢失"; exit 1; }
+          if grep -q 'if ev.OrderID != "" && ev.SignalID != "" {' internal/server/qmt.go; then echo "缺键回报静默丢弃复活（§F5）"; exit 1; fi
+          grep -q 'COALESCE(NULLIF(excluded.strategy' internal/store/real_positions.go || { echo "对账洗空保护丢失（§M5）"; exit 1; }
+          grep -q 'muxWithJSONErrors' internal/server/server.go || { echo "404/405 JSON 信封丢失（§F3）"; exit 1; }
+          grep -q 'can_use_qty' qmt_gateway/broker.py || { echo "xt 通道 T+1 可卖量字段丢失（§M5）"; exit 1; }
+          # §M14/§M15 队列熔断与夜链自愈
+          grep -q 'SameReasonFailLimit = 10' internal/store/research_tasks.go || { echo "§M14 阈值丢失"; exit 1; }
+          if grep -q 'researchTaskRetryCap' internal/store/research_tasks.go; then echo "旧异因混计上限复活（§M14）"; exit 1; fi
+          grep -q 'ChainTaskSeqs' internal/scheduler/worker.go || { echo "夜链序位补缺丢失（§M15）"; exit 1; }
+          grep -q 'SetAlertFunc' cmd/researchd/main.go || { echo "researchd 告警未接线（§M14）"; exit 1; }
+          # §H8/§F6 探针同源与构建指纹
+          test -f deploy/qmt-win/service_probe_config.ps1 || { echo "§H8 探针同源配置缺失"; exit 1; }
+          if grep -qE '127\.0\.0\.1:9091|127\.0\.0\.1:8080/api/status' deploy/qmt-win/all_service_watchdog.ps1 scripts/daily_ops_check.ps1; then echo "旧误熔探针形态复活（§H8）"; exit 1; fi
+          grep -q 'main.buildCommit' scripts/uat_bootstrap.sh || { echo "UAT 构建指纹注入丢失（§F6）"; exit 1; }
+          echo "ok - §20260922 修复批静态锁全过"
+
+      - name: §20260922 修复批二波静态锁（M1~M13）
+        run: |
+          # §M1 行情源契约 golden 单源（散落六处 → contract/quote_sources.json）
+          test -f qmt_gateway/contract/quote_sources.json || { echo "golden 源清单缺失（M1 各写各的复活）"; exit 1; }
+          grep -q 'quote_sources.json' scripts/uat_bootstrap.sh || { echo "uat_bootstrap 未读 golden（§3.1-1 复活）"; exit 1; }
+          grep -q 'quote_sources.json' web/e2e/quote_sources.mjs || { echo "E2E golden 加载器丢失（M1）"; exit 1; }
+          # §M2/M3 降级报成功族
+          grep -q 'last-known-good' internal/data/fetcher.go || { echo "M2 全源失败保底语义丢失"; exit 1; }
+          grep -q 'NewsSourceHealth' internal/data/source.go || { echo "M3 真实探测结构丢失"; exit 1; }
+          if grep -rn 'cainanshe' internal web/src cmd 2>/dev/null | grep -v '//' | grep -v '_test\.go' | grep -v Binary >/dev/null; then echo "笔误键 cainanshe 复活（M3）"; exit 1; fi
+          # §M6/§TZ/§REJECT 数据管道 py 批
+          grep -q 'INDEX_PCT_COL = "pctChg"' scripts/dataload_keepalive.py || { echo "M6 pctChg 契约键回退"; exit 1; }
+          test -f qmt_gateway/contract/time_formats.json || { echo "时间格式 golden 缺失（§TZ/§3.1-5）"; exit 1; }
+          if grep -rn --include='*.py' -E 'time\.strftime\([^)\n]*\+08:00' qmt_gateway scripts 2>/dev/null | grep -v '/tests/' >/dev/null; then echo "假 +08:00 裸 strftime 复活（§TZ）"; exit 1; fi
+          grep -q '§REJECT' qmt_gateway/handler.py || { echo "双空回报入库拒收丢失（M-REJECT）"; exit 1; }
+          grep -q '§REJECT' qmt_gateway/gateway.py || { echo "双空回报 400 拒收丢失（M-REJECT）"; exit 1; }
+          # §M8 禁双发铁律：业务调用方不得在 Push 之外直调 PushGateway
+          if grep -rn '\.PushGateway(' internal/engine cmd/quant --include='*.go' | grep -v _test.go | grep -v 'New.*Gateway' >/dev/null; then echo "M8 双发复活——业务侧绕过 Push 直调网关通道"; exit 1; fi
+          grep -q 'gatewayMinLevel' internal/notify/notify.go || { echo "M8 网关级别闸丢失"; exit 1; }
+          # §M9/M10/M11 快照与落盘批
+          grep -q '轮首快照' internal/engine/engine.go || { echo "M9 轮首快照语义丢失"; exit 1; }
+          grep -q 'paper_sell_anchors.json' internal/engine/sell_anchor.go || { echo "M10 锚点落盘丢失（重启清零复活）"; exit 1; }
+          grep -q 'validateInsertSurface' internal/store/store.go || { echo "M11 InsertRows 面校验丢失"; exit 1; }
+          # §M7 部署清单收编（web 注册 + 网关配置生成入链，静态锁总闸可跑则跑）
+          grep -q 'register_web_service.ps1' scripts/deploy_guangzhou.sh || { echo "M7b web 注册脱链"; exit 1; }
+          grep -q 'ensure_gateway_config.ps1' scripts/deploy_guangzhou.sh || { echo "M7c 网关配置生成脱链"; exit 1; }
+          bash ./scripts/check_deploy_static_locks.sh || { echo "部署口径静态锁漂移（M7）"; exit 1; }
+          # §M13 前端权限一致性（403 只认状态码；负锁过滤"旧写法不得复活"说明注释）
+          if grep -nE "indexOf\('无权限'\)|includes\('无权限'\)" web/src/pages/Quant.jsx web/src/pages/Paper.jsx | grep -vE ':[0-9]+:[[:space:]]*//' >/dev/null; then echo "M13 中文文案判 403 复活"; exit 1; fi
+          grep -q 'isForbidden' web/src/pages/Quant.jsx || { echo "M13 Quant 状态码判定丢失"; exit 1; }
+          grep -q 'isForbidden' web/src/pages/Paper.jsx || { echo "M13 Paper 状态码判定丢失"; exit 1; }
+          # §M12 移动壳：调试门控 + 注入转义
+          grep -q 'BuildConfig.DEBUG' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "M12 release 调试面复活"; exit 1; }
+          grep -q 'jsQuote' mobile/app/src/main/java/com/liangzai/quant/MainActivity.kt || { echo "M12 注入转义通道丢失"; exit 1; }
+          echo "ok - §20260922 修复批二波静态锁全过"

@@ -378,10 +378,12 @@ export default function Signals() {
       colKey: 'action', title: '操作', width: 180,
       cell: ({ row }) => (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {/* 主操作：买入（可开仓）/忽略（已标记）/无操作 */}
-          {row.can_open ? (
+          {/* 主操作：买入（可开仓）/忽略（已标记）/无操作。
+              §H3（2026-09-22）：POST /api/action 已升 adminMiddleware——ignore 写的是运营账号
+              引擎的信号簿（ctrlFor 恒取 operator），成员按钮点了只会 403，对非管理员隐藏。 */}
+          {admin && row.can_open ? (
             <Button size="small" theme="danger" onClick={(e) => { e.stopPropagation(); confirmTrade(row, 'buy') }}>买入</Button>
-          ) : row.action === 'buy' ? (
+          ) : admin && row.action === 'buy' ? (
             <Button size="small" variant="outline" theme="default" onClick={(e) => { e.stopPropagation(); confirmTrade(row, 'ignore') }}>忽略</Button>
           ) : (
             <span className="muted">—</span>

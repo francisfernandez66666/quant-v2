@@ -1,0 +1,24 @@
+{
+  "source": "internal/server/qmt.go qmtReportEvent + internal/store/real_positions.go RealPosition",
+  "updated": "2026-09-22",
+  "notes": "§F2（2026-09-22 修复批）回报方向 golden 契约：与 order_fields.json（下单方向）互补。report_event_fields = 回报信封（qmtReportEvent）反射 JSON tag 集；positions_row_fields = positions 事件行（store.RealPosition）反射集；consumed_by_event = 各事件类型在 handleQMTReport 实际消费的信封字段子集（文档性锁，测试校验其为信封集子集）。回归测：internal/server/report_contract_test.go（REPORT_CONTRACT_UPDATE=1 重生成信封/持仓行两面）。",
+  "report_event_fields": [
+    "amount", "asset", "at", "broker", "code", "fee", "from", "order_id",
+    "positions", "price", "qty", "reason", "side", "signal_id", "stamp_tax",
+    "status", "traded_at", "type", "user_id"
+  ],
+  "positions_row_fields": [
+    "amount", "buy_date", "cost_price", "cur_price", "highest_price", "name",
+    "qty", "signal_id", "strategy", "ts_code", "updated_at", "user_id"
+  ],
+  "account_asset_keys": ["cash", "frozen_cash", "market_value", "total_asset"],
+  "consumed_by_event": {
+    "trade": ["order_id", "code", "side", "price", "qty", "amount", "traded_at", "signal_id", "fee", "stamp_tax"],
+    "order": ["order_id", "code", "side", "status", "price", "qty", "signal_id", "reason", "at"],
+    "positions": ["positions"],
+    "account": ["asset"],
+    "disconnect": [],
+    "heartbeat": ["type"],
+    "broker": ["broker", "from", "at"]
+  }
+}

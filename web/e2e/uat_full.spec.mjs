@@ -1,5 +1,5 @@
 // ── 全场景全流程分支 像素级 UAT（qoder UAT run 2026-09-13）──
-// 覆盖：13 页面渲染+截图+JS异常/接口失败采集、登录分支、权限分支（tester）、
+// 覆盖：14 页面渲染+截图+JS异常/接口失败采集（§F7 后含 #/emotion）、登录分支、权限分支（tester）、
 // 交易分支（Quant 状态卡/配置保存/取消分支、Paper 手动交易/注入/自检/做空卡）、
 // 信号筛选排序展开、消息中心筛选删除复盘、Admin 建号改密禁用删除、
 // 命令面板/全局抽屉/主题切换/SSE 在线。凭据来自环境变量。
@@ -9,6 +9,9 @@
 // F-4 撮合配置热开关（保存后引擎实时生效，无需重启）；F-5 风控闸口状态卡渲染（当日命中/开关标签/空占位）。
 // 本批用例普遍采用「先记服务端基线 + finally API 直写还原」模式，防止中途失败污染共享配置。
 import { test, expect } from '@playwright/test'
+// §M1/§F4（2026-09-22 修复批 K）：quote_source 枚举不再在本文件硬编，改读后端 golden 单源
+// （qmt_gateway/contract/quote_sources.json）；helper 内含「golden 缺失 → 显式失败」口径。
+import { loadQuoteSources } from './quote_sources.mjs'
 
 // 两套账号凭据（admin=超管，tester=普通用户）与像素截图输出目录
 const ADMIN = { u: process.env.E2E_USER || 'admin', p: process.env.E2E_PASS || '' }
@@ -42,12 +45,17 @@ async function checkPage(page, hash, name) {
 }
 
 // 13 个核心页面清单：[路由 hash, 截图命名]，供像素级遍历用例循环消费
+// §F7（2026-09-22 修复批 K · FIX_PLAN_20260922 §6.4「推翻一半」的残余）：情绪回看页 #/emotion
+// 早有专项功能用例（:637-655 渲染二选一断言 + 区间切换 + 导航 + fullPage 截图），
+// 但一直没进这份「统一 JS 异常/接口告警采集」循环——本行补上，缺的只是这一件事。
+// 路由核实：web/src/App.jsx:652 <Route path="/emotion" element={<EmotionReview />} />，
+// 且 main.jsx 用 HashRouter → 真实 hash 即 '#/emotion'。
 const PAGES = [
   ['#/dashboard', 'dashboard'], ['#/signals', 'signals'], ['#/watchlist', 'watchlist'],
   ['#/hotspot', 'hotspot'], ['#/msgcenter', 'msgcenter'], ['#/positions', 'positions'],
   ['#/quant', 'quant'], ['#/paper', 'paper'], ['#/settings', 'settings'],
   ['#/llm-debug', 'llmdebug'], ['#/consult', 'consult'], ['#/research', 'research'],
-  ['#/admin', 'admin'],
+  ['#/admin', 'admin'], ['#/emotion', 'emotion'],
 ]
 
 // ⾯ admin 登录态下逐页渲染 UAT：每页截图 + JS 异常/接口告警采集
@@ -983,18 +991,42 @@ test.describe('修复回归 · WL-FIX 20260917 自选股', () => {
 // 交易时段外 feed 不轮询（IsActiveSession 闸门），故这里锁"回显契约"而非 QMT-L1 值本身：
 // /api/status 必须始终携带 quote_source/quote_age_sec 两字段——nightly 在盘中窗口
 // 开启 qmt_feed_enabled 后，quote_source 即变 "QMT-L1"，前端/巡检零改动即可观测。
+//
+// §M1/§F4（2026-09-22 修复批 K）改造点：原先这里的「已知集合」是硬编在 spec 里的一份中文白名单
+// （['QMT-L1','同花顺（新）','新浪','腾讯',...]），而 Go 侧实际吐的是小写英文
+// （internal/data/source.go 的 setLastSource("hithink"/"sina"/"ths"/"eastmoney")）——
+// 词表漂移 + 盘外空串直接放过 = 这条断言从未真正生效（假绿）。现白名单从 golden
+// qmt_gateway/contract/quote_sources.json 单源读取；「盘外允许空串」保留，
+// 但当自举脚本已注入盘内快照形态（E2E_QUOTE_SOURCE 在场，见 scripts/uat_bootstrap.sh §3.1-1）时，
+// quote_source 必须非空且命中枚举——空串即红，假绿路径关闭。
 test.describe('修复回归 · §ENH-5 L1 行情 feed 回显', () => {
   test('L1-1 /api/status 携带 quote_source/quote_age_sec 契约字段', async ({ page }) => {
+    const golden = loadQuoteSources() // golden 缺失即抛错=显式失败（不放行、不退回旧硬编表）
     await page.goto('/#/dashboard')
     const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
     const st = await (await page.request.get('/api/status', { headers: hdr })).json()
-    expect(st, 'quote_source 字段必须存在（可为空串=快照未就绪）').toHaveProperty('quote_source')
+    expect(st, 'quote_source 字段必须存在（盘外未注入时可为空串）').toHaveProperty('quote_source')
     expect(st.quote_age_sec, 'quote_age_sec 必须为数值').toEqual(expect.any(Number))
-    expect(st.quote_age_sec).toBeGreaterThanOrEqual(0)
+    // §M2（2026-09-22）后 -1 是「从未采集」未知哨兵（Go 侧 Staleness() 新语义），
+    // 合法值域 = -1 或 ≥0；旧断言 >=0 会把诚实的未知态误判成缺陷（反向假红）。
+    expect(st.quote_age_sec, 'quote_age_sec 必须为 -1（未知哨兵）或非负秒数，实际=' + st.quote_age_sec)
+      .toBeGreaterThanOrEqual(-1)
+    expect(st.quote_age_sec > -1 && st.quote_age_sec < 0, '负数只允许恰为 -1').toBe(false)
+    const injected = process.env.E2E_QUOTE_SOURCE || ''
+    test.info().annotations.push({
+      type: 'quote-source-contract',
+      description: 'golden=' + golden.file + ' matchedBy=' + golden.matchedBy
+        + ' enum=' + golden.sources.join('|') + ' injected=' + (injected || '(无)')
+        + ' actual=' + JSON.stringify(st.quote_source),
+    })
+    if (injected) {
+      // §3.1-1 盘内形态已注入：这里绝不允许空串（旧版正是靠空串分支躲过断言）
+      expect(st.quote_source, '已注入盘内快照形态（E2E_QUOTE_SOURCE=' + injected + '），quote_source 仍为空串=假绿复发')
+        .not.toBe('')
+    }
     if (st.quote_source) {
-      // 有源时必须落在已知集合内（防拼写漂移导致巡检误报）
-      expect(['QMT-L1', '同花顺（新）', '新浪', '腾讯', '东方财富', '东财', 'tushare', 'Tushare', 'test'])
-        .toContain(st.quote_source)
+      // 有源时必须命中 golden 枚举（防拼写漂移导致巡检误报；枚举本身由后端单源导出）
+      expect(golden.sources, 'quote_source 越出 golden 枚举：' + st.quote_source).toContain(st.quote_source)
     }
   })
 
@@ -1086,6 +1118,169 @@ test.describe('修复回归 · §RFIX 寻优状态机契约', () => {
       for (const r of (t.results || [])) {
         expect(valid.has(r.status), '非法状态: ' + r.status).toBe(true)
       }
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §3.1-1 / §M1（FIX_PLAN_20260922，2026-09-22 修复批 K）quote_source 契约单源化
+//
+// 三件事分别钉死：
+//   QS-1 golden 自身必须收录引擎今天真实会吐出的源名（Go 侧导出面的负向锁：漏一个即红）；
+//   QS-2 mock 柜台的行情注入面（scripts/uat_bootstrap.sh §3.1-1 传的 -quote-source）
+//        回显值必须落在 golden 枚举内——注入面不能成为绕过契约的后门；
+//   QS-3 盘外环境经注入即得「盘内有源快照」形态：/api/status.quote_source 非空且命中枚举
+//        （L1-1 是同一条链路的宽松版式，这里是不允许空串的硬版式）。
+// ─────────────────────────────────────────────────────────────────────────────
+test.describe('修复回归 · §3.1-1/§M1 quote_source 契约单源化', () => {
+  // ENGINE_SOURCES：Go 侧当前实际写入 snapshot.Source 的全集（回码核实位置见注释）。
+  // 这是 golden 的**下界**：golden 可以更多（历史中文别名/巡检口径），但绝不能少——
+  // 少一个就是 M1 词表漂移复发（后端吐一个 E2E 不认的值）。
+  const ENGINE_SOURCES = ['QMT-L1', 'hithink', 'sina', 'ths', 'eastmoney', '同花顺（新）']
+  // 位置：internal/data/qmt_feed.go:211（"QMT-L1"）、internal/data/source.go:213/225/236/248
+  // （setLastSource 四英文源）、internal/data/fetcher.go:398（主导源标注 "同花顺（新）"）。
+
+  test('QS-1 golden 枚举覆盖引擎真实源名（防词表漂移复发）', async () => {
+    const golden = loadQuoteSources()
+    test.info().annotations.push({
+      type: 'quote-sources-golden',
+      description: golden.file + ' matchedBy=' + golden.matchedBy + ' enum=' + golden.sources.join('|'),
+    })
+    const missing = ENGINE_SOURCES.filter((s) => !golden.sources.includes(s))
+    expect(missing, 'golden 缺引擎实际会吐出的 quote_source（后端导出面漂移）: ' + missing.join(',')).toEqual([])
+    // 枚举本身不许有重复/空串（契约文件形态锁）
+    expect(new Set(golden.sources).size, 'golden 枚举存在重复项: ' + golden.sources.join('|')).toBe(golden.sources.length)
+    expect(golden.sources.includes(''), 'golden 枚举不得含空串（空串=无源，属另一语义）').toBe(false)
+  })
+
+  test('QS-2 mock 柜台注入面回显 quote_source 且落在 golden 枚举内', async ({ request }) => {
+    const golden = loadQuoteSources()
+    const injected = process.env.E2E_QUOTE_SOURCE || ''
+    const base = process.env.E2E_MOCK_URL || 'http://127.0.0.1:18789'
+    const token = process.env.QMT_TOKEN || 'uat-secret'
+    let resp = null
+    let lastErr = ''
+    for (let i = 0; i < 3 && !resp; i++) { // mock 刚重启/瞬时繁忙时重试三轮（与 L1-2 同手法）
+      await new Promise((r) => setTimeout(r, 500))
+      resp = await request.get(base + '/quotes?codes=600000.SH', {
+        headers: { Authorization: 'Bearer ' + token },
+      }).catch((e) => { lastErr = String((e && e.message) || e); return null })
+    }
+    test.info().annotations.push({
+      type: 'qs2-diag',
+      description: 'resp=' + (!!resp) + ' err=' + lastErr + ' injected=' + (injected || '(无)'),
+    })
+    test.skip(!resp, 'qmt-mock 未就绪（独立部署场景跳过，不算失败）' + (lastErr ? ': ' + lastErr : ''))
+    expect(resp.status()).toBe(200)
+    const body = await resp.json()
+    if (!injected) {
+      // 未开启注入面（旧栈/手工起的 mock）：只锁「不注入就不该冒出 quote_source 字段」，
+      // 免得 mock 侧默认行为漂移出没人声明过的字段。
+      expect(body, '未注入 -quote-source 时不应回显 quote_source 字段').not.toHaveProperty('quote_source')
+      test.info().annotations.push({ type: 'qs2-note', description: '自举未注入（E2E_QUOTE_SOURCE 空），只跑负向字段锁' })
+      return
+    }
+    expect(body.quote_source, 'mock 注入的 quote_source 未回显: ' + JSON.stringify(body).slice(0, 200))
+      .toBe(injected)
+    expect(golden.sources, 'mock 注入值越出 golden 枚举: ' + body.quote_source).toContain(body.quote_source)
+    // 行情时间戳注入面：默认形态 tickTime 必须是"现在"（±60s）——盘内快照的新鲜度基准
+    const tk = body.ticks && body.ticks['600000.SH']
+    expect(tk, 'tick 缺失').toBeTruthy()
+    expect(Math.abs(Date.now() - tk.tickTime), 'tickTime 应为毫秒级且≈now: ' + tk.tickTime)
+      .toBeLessThan(60000)
+  })
+
+  test('QS-3 注入形态下 /api/status.quote_source 非空且命中枚举（关死盘外假绿）', async ({ page }) => {
+    const injected = process.env.E2E_QUOTE_SOURCE || ''
+    test.skip(!injected, '自举未注入盘内快照形态（E2E_QUOTE_SOURCE 空）——由 L1-1 跑宽松断言')
+    const golden = loadQuoteSources()
+    await page.goto('/#/dashboard')
+    const hdr = { Authorization: await page.evaluate(() => localStorage.getItem('liangzai_token')) }
+    const st = await (await page.request.get('/api/status', { headers: hdr })).json()
+    expect(st.quote_source, '注入形态下引擎仍回空串=「有源快照」未生效（查 snapshot_latest.json seed）')
+      .not.toBe('')
+    expect(golden.sources, '引擎 quote_source 越出 golden 枚举: ' + st.quote_source).toContain(st.quote_source)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §3.1-4（FIX_PLAN_20260922 E2E 盲区补法第 4 条，2026-09-22 修复批 K）成员直连 API
+//
+// 旧覆盖只有「tester 看不到某个卡 / 落到 /403 页」的 UI 断言——UI 隐藏可被伪造角色、
+// 可直接打接口绕过。这里用 tester 的登录态直接 fetch 两类门槛端点，钉住后端本身：
+//   adminMiddleware（server.go 注册面，403 中文「无权限」）
+//   permMiddleware （research 端点，403 英文 "no permission: <perm>"）
+// 顺带把 §M13 的判定口径钉住：两类端点 403 文案语言不同 → 前端只能按状态码判权限，
+// 不得按文案 indexOf('无权限') 匹配（英文 403 会漏判）。
+// ─────────────────────────────────────────────────────────────────────────────
+const USER2 = { u: process.env.E2E_USER2 || 'tester', p: process.env.E2E_PASS2 || '' }
+let testerToken = null // 模块级缓存：全 spec 只登录一次，避后端 login 5/min 匿名频控
+
+// loginTester 用 tester 凭据换 token（复用已缓存的，避免多用例连打登录被频控成 429 假红）。
+async function loginTester(request) {
+  if (testerToken) return testerToken
+  const resp = await request.post('/api/auth/login', { data: { username: USER2.u, password: USER2.p } })
+  expect(resp.ok(), 'tester 登录应 200（凭据缺失时请设 E2E_PASS2）').toBe(true)
+  testerToken = (await resp.json()).token
+  expect(testerToken, 'tester token 非空').toBeTruthy()
+  return testerToken
+}
+
+test.describe('权限硬锁 · §3.1-4 成员直连 API + §M13 轮询止血', () => {
+  // MP-1 adminMiddleware 只读端点：成员直连必须 403，管理员同端点必须 200（对照组防"全 403"糊过去）
+  test('MP-1 tester 直连 GET /api/config/qmt → 403（admin 对照 200）', async ({ page, request }) => {
+    const tok = await loginTester(request)
+    const denied = await page.request.get('/api/config/qmt', { headers: { Authorization: 'Bearer ' + tok } })
+    const body = await denied.text()
+    test.info().annotations.push({ type: 'mp1', description: 'tester ' + denied.status() + ' body=' + body.slice(0, 160) })
+    expect(denied.status(), '成员直连 admin 端点必须 403，实际 body=' + body.slice(0, 160)).toBe(403)
+    // 403 不得泄漏配置内容
+    expect(body, '403 响应体不应携带实盘配置字段').not.toContain('gateway_url')
+    // 对照：admin 会话（storageState 默认即 admin）同端点 200——防"接口整体挂了也全 403"糊过这条锁
+    await page.goto('/#/dashboard')
+    const adminTok = await page.evaluate(() => localStorage.getItem('liangzai_token'))
+    const ok = await page.request.get('/api/config/qmt', { headers: { Authorization: 'Bearer ' + adminTok } })
+    expect(ok.status(), 'admin 会话读同一端点应 200').toBe(200)
+    expect(await ok.json(), 'admin 200 应回实盘配置体').toHaveProperty('gateway_url')
+  })
+
+  // MP-2 permMiddleware 端点：成员直连 403，且 403 文案是英文 no permission ——
+  // 这条即 §M13 的反例证据：按中文文案匹配的判定在这里必然漏判。
+  test('MP-2 tester 直连 GET /api/research/progress → 403（英文文案，锁"按状态码判定"）', async ({ page, request }) => {
+    const tok = await loginTester(request)
+    const denied = await page.request.get('/api/research/progress', { headers: { Authorization: 'Bearer ' + tok } })
+    const body = await denied.text()
+    test.info().annotations.push({ type: 'mp2', description: 'tester ' + denied.status() + ' body=' + body.slice(0, 160) })
+    expect(denied.status(), '成员无 research.approve 权限位直连应 403，body=' + body.slice(0, 160)).toBe(403)
+    // 机读口径：403 判定只能靠状态码（admin 端点回中文「无权限」、perm 端点回英文 no permission）
+    expect(/无权限|no permission/i.test(body), '403 响应体应是权限文案，实际=' + body.slice(0, 160)).toBe(true)
+  })
+
+  // MP-3 §M13：成员停在 /#/quant 页，403 面板出现后 admin 端点轮询必须彻底停下
+  // （修复前：stateTimer/ordersTimer 10s + tradesTimer 30s 三根定时器继续打，opslog 被 403 灌满）。
+  test('MP-3 tester 停留 /#/quant：403 后 admin 端点请求数不再增长', async ({ page, request, context }) => {
+    const tok = await loginTester(request)
+    // 用 tester 会话开新页（不动共享 storageState 的 admin 会话，与 D-3 用例同手法）
+    const p2 = await context.newPage()
+    try {
+      await p2.goto('/#/')
+      await p2.evaluate((t) => localStorage.setItem('liangzai_token', t), tok)
+      // 采集窗口：只盯 Quant 页轮询的那几个 admin 端点，别把 App 外壳的只读拉取算进来
+      const hits = []
+      const ADMIN_EP = /\/api\/(config\/qmt|qmt\/(state|orders|trades|broker|settle)|risk\/gates|paper\/state|short\/status)/
+      p2.on('request', (r) => { if (ADMIN_EP.test(r.url())) hits.push(r.url().replace(/^[^/]*\/\/[^/]*/, '')) })
+      await p2.goto('/#/quant')
+      await expect(p2.getByText('无权限访问量化交易'), 'tester 进 Quant 页应落无权限面板')
+        .toBeVisible({ timeout: 20000 })
+      const before = hits.length
+      expect(before, '首屏至少打过 admin 端点（否则本用例没测到东西）').toBeGreaterThan(0)
+      // 等过 10s 与 30s 两根定时器的节拍（留 2s 余量）：修复后不得再有新请求
+      await p2.waitForTimeout(14000)
+      const grew = hits.slice(before)
+      expect(grew, '§M13：forbidden 后仍在刷 admin 端点（403 灌 opslog）: ' + grew.join(' , ')).toEqual([])
+      await p2.screenshot({ path: `${SHOT}/branch-m13-quant-403-stop.png`, fullPage: true })
+    } finally {
+      await p2.close()
     }
   })
 })

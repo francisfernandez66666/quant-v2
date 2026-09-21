@@ -186,7 +186,7 @@ type Engine struct {
 	paper             *paper.Engine                                                                                   // 模拟盘引擎（独立纸面交易，可空=未启用）
 	paperOnSignals    func(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) // 按账号分发 buy+卖出纪律信号撮合（registry 注入）
 	paperMarkFn       func(quotes map[string]*data.StockInfo)                                                         // 按账号分发估值/净值（registry 注入）
-	paperSellJudgeFn  func(feed sellJudgeFeed)                                                                        // §SELLPOINT-UNIFY P3：按账号遍历模拟盘账本的统一卖出裁决（registry 注入；nil=回退全局 e.paper 单账本）
+	paperSellJudgeFn  func(feed sellJudgeFeed, sellMode string)                                                       // §SELLPOINT-UNIFY P3：按账号遍历模拟盘账本的统一卖出裁决（registry 注入；nil=回退全局 e.paper 单账本）；sellMode=§M9 轮首快照透传
 	paperHeldCodes    func() []string                                                                                 // 全账号模拟盘持仓代码聚合（registry 注入；nil=回退 e.paper 全局账本）
 	lastBaseLog       time.Time                                                                                       // §QUOTE_POOL_SPLIT 持仓池 base 构成观测日志节流点
 	lastTrim          time.Time                                                                                       // 盘后内存释放最近一次执行时间（节流用）
@@ -244,11 +244,13 @@ type Engine struct {
 	// discipline state machine's per-round ActionTrim can't keep halving the position). Guarded by e.mu.
 	realTrimDone map[string]string
 
-	// §SELLPOINT-UNIFY 边界⑥：最近一轮做多打分（ScorePool）的产出时刻，e.mu 保护。
-	// 卖出裁决通道的做多信号新鲜度基准——打分轮停摆（池空/熔断/异常）时 scoresAt 不再前进，
-	// 陈旧的 SignalActive 自然超龄按"无信号"处理，绝不给已失效的做多信号延持资格。
-	// English: timestamp of the latest bull scoring round — the sell judge's signal-freshness basis
-	// (boundary ⑥): when scoring stalls, stale SignalActive ages out and can no longer extend holds.
+	// §SELLPOINT-UNIFY 边界⑥ / §H5（2026-09-22 修复批）：最近一轮做多打分（ScorePool/ScanLong）
+	// 的产出时刻，e.mu 保护。卖出裁决通道的做多信号新鲜度**兜底**基准——主判据已改为打分自身
+	// StockScores.UpdatedAt（见 sell_shadow.go judgeSellPositions）：旧口径只在 5s 近实时轮写入、
+	// 池空提前 return 即冻结时钟，5min 批量轮信号被误判过期；现批量轮同样推进本字段，且它只服务
+	// 无自带时刻的存量/测试装配，零值=尚无打分，兜底路径下做多信号一律不新鲜。
+	// English: timestamp of the latest bull scoring round — now only the FALLBACK freshness basis
+	// (§H5); per-signal StockScores.UpdatedAt is the primary basis, and both scoring loops advance it.
 	scoresAt time.Time
 
 	// §D1 护栏4（利空验证分级·生产侧）：纯6位代码 → 利空板块成分双源验证等级，主循环
@@ -267,6 +269,22 @@ type Engine struct {
 	buyCh   chan buyTask
 	buyStop chan struct{}
 	buyWg   sync.WaitGroup
+	// §M11（2026-09-22 修复批）停机队列落盘路径（<acctDir>/buy_queue_pending.json，dataDir 空=禁用）。
+	// buyCh 是 64 槽内存队列，停机时已排队未消费的买单随重启蒸发。StopBuyDispatcher 排空队列
+	// 原子落盘、StartBuyDispatcher 恢复入队（按 SignalID 去重）；恢复后与原链路共用 orders 表
+	// signal_id 唯一键幂等，不会重复下单。
+	// English: shutdown-drain persistence path for the in-memory buy queue (§M11).
+	buyQueuePath string
+	// §M10（2026-09-22 修复批）paper 账本移动止盈锚点跨重启持久化：裁决内核的持仓期最高价
+	// 锚点原是纯内存状态机「每轮自抬」（paper 账本不存 high），进程重启即清零 → 高点回落到
+	// 成本价、移动止盈重启后永不触发。引擎侧按账号维护 账号→代码→锚点 嵌套表 + 原子 JSON
+	// 文件（生命周期与裁决状态一致：平仓即删，见 syncPaperSellAnchors）。
+	// English: cross-restart persistence of the paper trailing-stop high anchor (kernel state was
+	// memory-only; a restart reset it to cost and the trail never fired again).
+	paperAnchorMu     sync.Mutex                    // 保护下面三字段（懒加载 + 轮次同步）
+	paperAnchorPath   string                        // <acctDir>/paper_sell_anchors.json（空=纯内存禁用落盘）
+	paperAnchors      map[string]map[string]float64 // 账号 → 持仓代码 → 持仓期最高价锚点
+	paperAnchorLoaded bool                          // 懒加载标记（首次访问读一次文件）
 	// §A+B 近实时打分循环间隔（默认 0 → 回退 5s），可配置为 1-2s 以加快信号翻转检出。
 	scoringInterval time.Duration
 }
@@ -530,11 +548,17 @@ func New(
 	signalRecPath := ""
 	signalStorePath := ""
 	macroCalCachePath := "" // §MARKET_RISK_GATE P6 日历校准落盘缓存（dataDir 空则禁用）
+	// §M10/§M11（2026-09-22 修复批）：paper 移动止盈锚点文件与停机买单队列文件，
+	// 均落在账号数据目录下（per-acctDir 装配天然按账号隔离；dataDir 空=纯内存禁用）。
+	paperAnchorPath := ""
+	buyQueuePath := ""
 	if dataDir != "" {
 		hotRecPath = filepath.Join(dataDir, "hot_records.json")
 		signalRecPath = filepath.Join(dataDir, "signal_records.json")
 		signalStorePath = filepath.Join(dataDir, "signals_today.json")
 		macroCalCachePath = filepath.Join(dataDir, "macro_calendar_cache.json")
+		paperAnchorPath = filepath.Join(dataDir, "paper_sell_anchors.json")
+		buyQueuePath = filepath.Join(dataDir, "buy_queue_pending.json")
 	}
 	// 组装引擎结构体：注入各数据源依赖 + 预加载历史持久化文件 + 初始化空容器。
 	e := &Engine{
@@ -578,6 +602,8 @@ func New(
 		d1ScoredSig:       make(map[string]string),
 		d1RetryQueue:      make(map[string]bool),
 		factorMon:         newFactorMonitor(dataDir, 5),
+		paperAnchorPath:   paperAnchorPath, // §M10 paper 移动止盈锚点文件（空=纯内存不落盘）
+		buyQueuePath:      buyQueuePath,    // §M11 停机买单队列落盘路径（空=禁用）
 	}
 	// §D-2（GAP_VERIFY_20260917_PM）裁定留痕落盘：JSONL 按日轮转 + 启动回灌当日环，
 	// quant 重启不再丢"为何没成交"的拦截原因。dataDir 空（纯内存测试路径）自动跳过；
@@ -956,7 +982,9 @@ func (e *Engine) SetPaperDispatch(onSignals func(emit []combat_agent.Signal, exi
 // paperSignals 分发时机，故独立于撮合分发单设注入口。
 // English: injects the P3 per-account paper sell-judge callback — the adjudicator must advance
 // every 5s (its windows are wall-clock based), independent of whether a round has fillable signals.
-func (e *Engine) SetPaperSellJudge(judge func(feed sellJudgeFeed)) {
+// §M9：回调签名带本轮 sell_unified_mode 快照（registry 闭包透传给 runPaperUnifiedJudge），
+// 禁止回调内部再独立读配置——轮中翻转会造成同一轮半新半旧。
+func (e *Engine) SetPaperSellJudge(judge func(feed sellJudgeFeed, sellMode string)) {
 	e.mu.Lock()
 	e.paperSellJudgeFn = judge
 	e.mu.Unlock()
@@ -1022,12 +1050,14 @@ func (e *Engine) QMTController() *trading.Controller {
 // English: feeds flipped + sell-side discipline signals into paper filling; with the P3 gate on,
 // long-side detector sells become evidence only (the unified adjudicator is the sole exit) while
 // short-book signals pass through. The judge itself runs every round via judgePaperLedgers, not here.
-func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo) {
+// §M9：sellMode 为轮首快照（调用方在轮首读一次配置后逐层透传），本函数内不再现读配置，
+// 避免轮中 shadow→on 翻转导致同一轮前半用旧口径、后半用新口径的「保护空窗」。
+func (e *Engine) paperSignals(emit []combat_agent.Signal, exit []combat_agent.Signal, quotes map[string]*data.StockInfo, sellMode string) {
 	e.mu.RLock()
 	dispatch := e.paperOnSignals
 	pe := e.paper
 	e.mu.RUnlock()
-	unifiedOn := e.sellUnifiedModeEngine() == "on"
+	unifiedOn := sellMode == "on"
 	if unifiedOn {
 		emit = unifiedSellGateSigs(emit)
 		exit = unifiedSellGateSigs(exit)
@@ -1459,8 +1489,10 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	if buyCh != nil {
 		select {
 		case buyCh <- buyTask{req: req, sig: sig}:
-			// §AUDIT-PM 2026-09-15 队列深度量规：崩溃丢单的观测面（buyCh 为纯内存队列，
-			// 重启后同 signal_id 自愈重发，故只观测不做持久化；深度逼近容量即预警风暴）。
+			// §AUDIT-PM 2026-09-15 队列深度量规：崩溃丢单的观测面（深度逼近容量即预警风暴）。
+			// §M11（2026-09-22 修复批）推翻旧口径「重启后同 signal_id 自愈重发、不做持久化」——
+			// 自愈依赖战法当日重新翻转，重启后条件变化即不再翻转发单；排队单现随停机排空落盘
+			// （见 buy_queue_persist.go），下单侧幂等仍由 orders 表 signal_id 唯一键兜底。
 			metrics.SetGauge("buy_queue_depth", int64(len(buyCh)))
 			log.Printf("[trading] auto order queued %s(%s) qty=%d price=%.2f (async)", sig.Code, sig.Name, qty, price)
 		default:
@@ -1483,7 +1515,9 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 }
 
 // StartBuyDispatcher §A+B 启动异步下单 worker 池（事件驱动热路径）。在 RunScoringLoop 启动时调用一次。
-// English: A+B — starts the async order worker pool (event-driven hot path). Called once when the scoring loop starts.
+// §M11（2026-09-22 修复批）：启动时先恢复上次停机落盘的排队买单（SignalID 去重后重新入队），
+// 修复旧行为——buyCh 是 64 槽纯内存队列，停机时已排队未消费的买单随重启蒸发、当日无人重放。
+// English: A+B — starts the async order worker pool; §M11 restores the shutdown-drained queue first.
 func (e *Engine) StartBuyDispatcher(n int) {
 	if n <= 0 {
 		n = 4
@@ -1495,24 +1529,30 @@ func (e *Engine) StartBuyDispatcher(n int) {
 	}
 	e.buyCh = make(chan buyTask, 64)
 	e.buyStop = make(chan struct{})
+	ch := e.buyCh
 	e.mu.Unlock()
+	// §M11 恢复停机排队买单（worker 启动前先入队，恢复单与原单同走幂等键链路）。
+	e.restoreBuyQueue(ch)
 	for i := 0; i < n; i++ {
 		e.buyWg.Add(1)
 		go func() {
 			defer e.buyWg.Done()
 			// 加锁读取，避免与 StopBuyDispatcher 写 e.buyStop=nil 形成数据竞争
 			// English: read under lock to avoid a data race with StopBuyDispatcher.
+			// §M11：buyCh 同样锁内快照取局部引用——Stop 现在会在排空后把字段置 nil 支持
+			// 原地重启，worker 事件循环不得再直读 e.buyCh。
 			e.mu.RLock()
 			stop := e.buyStop
+			queue := e.buyCh
 			e.mu.RUnlock()
-			if stop == nil {
+			if stop == nil || queue == nil {
 				return
 			}
 			// 事件循环：收到投递则下单，收到停止信号则退出 worker。
 			for {
 				select {
-				case t := <-e.buyCh:
-					metrics.SetGauge("buy_queue_depth", int64(len(e.buyCh))) // §AUDIT-PM 出队侧同步深度
+				case t := <-queue:
+					metrics.SetGauge("buy_queue_depth", int64(len(queue))) // §AUDIT-PM 出队侧同步深度
 					e.placeOrderNow(t.req, t.sig)
 				case <-stop:
 					return
@@ -1523,7 +1563,13 @@ func (e *Engine) StartBuyDispatcher(n int) {
 }
 
 // StopBuyDispatcher 停止 worker 池（进程退出时）。
-// English: stops the worker pool (on process shutdown).
+// §M11（2026-09-22 修复批）：worker 退出（buyWg.Wait 已等其完成在途 PlaceOrder）后把队列中
+// 已排队未消费的买单排空原子落盘（<acctDir>/buy_queue_pending.json），下次 StartBuyDispatcher
+// 恢复入队。语义边界：已出队、PlaceOrder 进行中的在途单不在落盘范围——worker 会先完成该单
+// 再退出，且 orders 表 signal_id 唯一键幂等兜底，恢复链路不会造成重复下单。
+// English: stops the worker pool and (M11) drains the still-queued tasks to an atomic JSON file
+// for restore on next start; in-flight dequeued tasks complete before the drain, and the
+// orders-table signal_id key dedupes any overlap.
 func (e *Engine) StopBuyDispatcher() {
 	// 交换取走 stop 信号通道（置空避免二次停止时重复 close panic）。
 	e.mu.Lock()
@@ -1539,6 +1585,29 @@ func (e *Engine) StopBuyDispatcher() {
 		close(stop)
 	}
 	e.buyWg.Wait()
+	// §M11 排空残余队列：在锁内取出队列引用并清空（此刻无 worker 消费；持锁排空把
+	// 「autoPlace 快照旧 ch 后又塞单」的窗口压到最小——该残余竞态窗口与 §P2#23 快照
+	// 语义同源，orders 表幂等键 + 当日信号重发兜底，不追求零窗口）。排空结果锁外落盘。
+	e.mu.Lock()
+	ch := e.buyCh
+	var pending []buyTask
+	if ch != nil {
+	drain:
+		for {
+			select {
+			case t := <-ch:
+				pending = append(pending, t)
+			default:
+				break drain
+			}
+		}
+		// 仅当字段仍指向本队列才置 nil（期间若有新 Start 装配了新队列，绝不误清）。
+		if e.buyCh == ch {
+			e.buyCh = nil
+		}
+	}
+	e.mu.Unlock()
+	e.persistBuyQueue(pending)
 }
 
 // placeOrderNow §A+B worker 实际下单：每次读取最新 qmtCtrl（配置热重载安全），调用网关。
@@ -3433,9 +3502,10 @@ func (e *Engine) pushCriticalAlerts(items []data.MessageItem) {
 			// 公共信号保持默认别名（owner 手机）——朋友的止损提醒不再打到 owner 手机上。
 			Alias: it.Scope,
 		}
+		// §M8（2026-09-22 修复批）：Push 已内聚 WS/Webhook/手机网关三路扇出，
+		// 此处不再直调 PushGateway——原「Push + PushGateway」双调用在同一路内聚后必双发，
+		// 去重设计见 internal/notify/notify.go Push 注释。
 		nt.Push(msg)
-		// 同步转发到外部推送网关（若已配置），让关键提醒触达 APK 后台/离线场景
-		nt.PushGateway(msg)
 	}
 }
 
@@ -4404,6 +4474,18 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		individualSignals = append(individualSignals, e.combatAgent.ScanShort(in)...)
 	}
 
+	// §H5（2026-09-22 修复批）5min 批量轮同样推进全局打分时钟 scoresAt：旧实现只在 5s 近实时轮
+	// 写入（scoring_loop.go，且池空提前 return 时整体冻结），却被卖出裁决当全源新鲜度基准，
+	// 批量轮产出的做多信号被陈旧全局时钟误判过期。新鲜度主判据已改为打分自身 UpdatedAt，
+	// 本时钟仅兜底无自带时刻的装配——批量轮打分完成即前进，不再被 5s 轮独占冻结。
+	// English: §H5 — the 5-minute batch round also advances the fallback global scoring clock,
+	// which used to be written only by the 5s round (frozen when its pool was empty).
+	if e.LongEnabled() && e.combatAgent != nil {
+		e.mu.Lock()
+		e.scoresAt = time.Now()
+		e.mu.Unlock()
+	}
+
 	// 将本轮的个股信号写入跟踪池：有效期至下一交易日（到期后自动移出监测池）
 	_stepTracker := time.Now()
 	if e.stockTracker != nil {
@@ -4455,6 +4537,12 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		bearSignals = nil
 	}
 
+	// §M9 轮首快照：本轮所有 sell_unified_mode 消费方（paperSignals 证据闸 / judgePaperLedgers /
+	// 13e report 旧链出口）共用同一个值——轮中配置翻转（shadow→on）不再造成「本轮旧口径把出口
+	// 关了、新口径裁决又没跑」的保护空窗。快照只在轮首读一次，消费方一律透传、禁止现读。
+	// English: round-start snapshot of sell_unified_mode, threaded to every same-round consumer.
+	roundSellMode := e.sellUnifiedModeEngine()
+
 	// 主循环把可交易 buy 信号送入模拟盘撮合（龙头识别/涨停增强等仅在主循环产生的信号，
 	// 近实时循环的 ScorePool 不含它们；watch/提醒不撮合，只做翻转去重防重复买入）。
 	// English: the main loop feeds its tradeable buy signals into the paper fill (leader-ID / limit-up
@@ -4480,7 +4568,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			e.dispatchLive(buys, e.snapshotQuotes(), false, time.Now())
 			// §统一纪律·买入确认：主循环也喂全量活跃买入信号（非仅翻转），持续性确认由
 			// 信号控制器 paper 通道在 registry 分发时统一裁定（旧 paper 内嵌状态机已删除）。
-			e.paperSignals(buys, nil, e.snapshotQuotes())
+			e.paperSignals(buys, nil, e.snapshotQuotes(), roundSellMode)
 		}
 	}
 
@@ -4566,7 +4654,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 		BearReasons: bearHitReasons(sr),
 		PoolQuotes:  exitQuotes,
 		SnapQuotes:  e.snapshotQuotes(),
-	})
+	}, roundSellMode)
 
 	// 13e 卖出提醒自动执行（阶段1.1 全自动卖出）：把本轮 清仓/减仓/硬止盈/硬止损 告警
 	// （combat_agent.SellAction 归一为 close/trim）送入模拟盘自动成交——清仓类全平、
@@ -4595,7 +4683,7 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			}
 		}
 		if len(sells) > 0 {
-			e.paperSignals(sells, nil, exitQuotes)
+			e.paperSignals(sells, nil, exitQuotes, roundSellMode)
 			// FIX#15 report 账本（用户手动录入持仓）也自动执行卖出：close→LogExit 全平、
 			// trim→SellLot 半仓（每码每日一次）。只处理 paper 引擎未持有的（避免双账簿重复卖）。
 			// §SELLPOINT-UNIFY P3：mode=on 时 report 账本已由 13e-pre 的统一裁决处置
@@ -4604,7 +4692,8 @@ func (e *Engine) Run(ctx context.Context, since time.Time) *strategy_engine.Stra
 			// close→LogExit full exit, trim→SellLot half (once per code per day); only codes not held
 			// by the paper engine are handled here to avoid double-selling both books. Under P3 on-mode
 			// the report book is exited by the unified adjudicator instead, so this legacy exit is closed.
-			if e.sellUnifiedModeEngine() != "on" {
+			// §M9：这里复用轮首快照 roundSellMode，不再现读配置——同一轮内口径必须一致。
+			if roundSellMode != "on" {
 				e.autoExitReportSells(sells, exitQuotes)
 			}
 		}

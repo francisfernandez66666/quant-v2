@@ -1,8 +1,13 @@
 // Package data — 5 秒轮询数据采集器。
 // 启动独立协程定时拉取自选股行情和板块数据，以 MarketSnapshot 形式提供最新快照。
+// §M2（20260922 修复批 G）：整轮行情全源失败时保留 last-known-good 快照、不刷新 lastOK，
+// Staleness 持续累加并经 checkStaleAlert 触发告警；从未采集时 Staleness 回 -1（未知）。
+// §M1：快照 Source 字面量改引 data 包 QuoteSource* 枚举常量（/api/status 契约单源化）。
 // Package data — a 5s polling data collector.
 // It runs a background goroutine fetching watchlist quotes and sector data,
 // exposing the latest state as a MarketSnapshot.
+// §M2: on an all-source-failed round the previous snapshot and lastOK are kept, so
+// staleness keeps accumulating and warns; never-fetched staleness is -1 (unknown).
 package data
 
 import (
@@ -22,7 +27,10 @@ type MarketSnapshot struct {
 	Stocks map[string]*StockInfo // 个股行情，key 为股票代码
 	Sector []SectorInfo          // 板块行情列表
 	Time   time.Time             // 快照时间戳
-	Source string                // 数据来源名称（如 "Tushare"/"EastMoney"）
+	// Source 数据来源名，取值必须落在 §M1 枚举 data.QuoteSource*（见 AllQuoteSources 与
+	// golden qmt_gateway/contract/quote_sources.json）；空串=快照未就绪/盘外，非枚举值。
+	// §WS-C 陈旧闸/巡检消费方禁止把空串当任意源名处理。
+	Source string
 }
 
 // maxWatchStocks 热点监控股票上限。
@@ -364,11 +372,9 @@ func (f *Fetcher) loop() {
 				}()
 				f.fetch()
 			}()
-			// §GAP3.3 盘中延迟告警：快照陈旧超 60s 说明上游源整体异常（节流 1 条/分钟）
-			if s := f.Staleness(); s > 60*time.Second && time.Now().Unix()-f.lastStaleWarn.Load() >= 60 {
-				f.lastStaleWarn.Store(time.Now().Unix())
-				log.Printf("[fetcher] 警告: 快照已陈旧 %s，上游行情源可能整体异常", s.Round(time.Second))
-			}
+			// §GAP3.3 盘中延迟告警（§M2 起统一走 checkStaleAlert 出口）：快照陈旧超 60s
+			// 说明上游源整体异常（全失败轮 fetch 不刷 lastOK，陈旧度得以持续累加到这里）。
+			f.checkStaleAlert()
 		}
 	}
 }
@@ -395,7 +401,7 @@ func (f *Fetcher) fetch() {
 				snapshot.Stocks[code] = si
 			}
 			if len(quotes) > 0 {
-				snapshot.Source = "同花顺（新）" // 主导来源标注（其余源仅补缺）
+				snapshot.Source = QuoteSourceHithinkBatch // §M1 枚举常量：主导来源标注（其余源仅补缺）
 			}
 		} else if firstDegraded := f.hithinkState.markFailure(); firstDegraded {
 			log.Printf("[fetcher] 同花顺（新）连续失败 %d 次进入降级，改走 同花顺（老）/sina/东财: %v",
@@ -457,12 +463,45 @@ func (f *Fetcher) fetch() {
 
 	log.Printf("数据采集: %d/%d 只 %d 板块 (兜底%d) [%s]", len(snapshot.Stocks), len(all), len(snapshot.Sector), miss, snapshot.Source)
 
+	// §M2 反「全挂仍替换快照+刷 lastOK」：本轮监控池非空、但四路行情源
+	// （hithink 批量 / 新浪批量 / 腾讯批量 / 单股降级链 同花顺→东财）全部失败、一股未回时，
+	// 绝不用空快照顶掉上一份 last-known-good，也不刷新 lastOK——
+	// 旧缺陷后果：快照被清空 + 陈旧度归零，§WS-C 陈旧行情闸被"伪造新鲜"解除（比空快照更危险，
+	// 因为它让下游误以为行情刚更新过）。现让 Staleness 继续累加并经 checkStaleAlert 触发告警。
+	// 从未成功采集过时 snapshot 保持 nil（消费端读到空 = 未知，不编造）。
+	// English: §M2 — when the pool is non-empty but every quote source returned nothing,
+	// keep the last-known-good snapshot, do NOT refresh lastOK, and let staleness keep
+	// growing (the old code wiped the snapshot AND reset staleness, forging freshness for
+	// the §WS-C stale-quote gate).
+	if len(all) > 0 && len(snapshot.Stocks) == 0 {
+		log.Printf("[fetcher] §M2 本轮行情全源失败 (0/%d 只)，保留上一份快照、不刷新 lastOK", len(all))
+		f.checkStaleAlert()
+		return
+	}
+
 	f.mu.Lock()
 	f.snapshot = snapshot
 	f.mu.Unlock()
 	f.lastOK.Store(time.Now().Unix())
 	f.emitSink(snapshot)
 	f.persistSnapshotMaybe(snapshot)
+	// 成功轮 lastOK 刚刷新，Staleness≈0，无需陈旧告警（全败分支才需要）。
+}
+
+// checkStaleAlert §M2/§GAP3.3 快照陈旧告警统一出口：Staleness 持续 > 60s 说明上游源整体
+// 异常，按 1 条/分钟节流打告警日志；返回 true 表示本轮触发了告警。
+// 从未采集（Staleness 回 -1，见 §M2）不告警——尚无基线可陈旧，避免启动期噪音。
+// 采集轮 loop() 与 §M2 全败分支共用本出口，保证"全失败时告警仍可达"。
+// English: §M2/§GAP3.3 — single exit for the 60s-staleness warning (throttled 1/min).
+// Never-fetched (-1, unknown) never warns: there is no baseline to be stale against.
+func (f *Fetcher) checkStaleAlert() bool {
+	s := f.Staleness()
+	if s > 60*time.Second && time.Now().Unix()-f.lastStaleWarn.Load() >= 60 {
+		f.lastStaleWarn.Store(time.Now().Unix())
+		log.Printf("[fetcher] 警告: 快照已陈旧 %s，上游行情源可能整体异常", s.Round(time.Second))
+		return true
+	}
+	return false
 }
 
 // SetSnapshotSink §WS-G 注册快照流接收器（staging 录制 / 回放对比用；可空）。
@@ -558,12 +597,17 @@ func (f *Fetcher) LoadPersistedSnapshot(dir string) {
 	log.Printf("[fetcher] 已恢复持久化快照: %d 只 (%s)", len(snap.Stocks), snap.Time.Format("15:04:05"))
 }
 
-// Staleness §GAP3.3 快照陈旧度：距最近一次成功采集的时长；从未采集返回 0。
+// Staleness §GAP3.3 快照陈旧度：距最近一次成功采集的时长。
+// §M2 语义修正：**从未采集返回 -1 秒**（负值=未知，消费端须按 -1 显示"未知"），
+// 旧实现回 0 会让"从没拿到过行情"与"行情绝对新鲜"不可区分（盘外空串假绿的同族形态）。
+// 消费口径：/api/status 的 quote_age_sec、loop/checkStaleAlert 陈旧告警（负值不触发）。
 // 盘中该值持续 > 30s 说明上游源整体异常——供健康检查/告警消费。
+// English: §M2 — staleness of the last successful fetch; NEVER-fetched now returns -1s
+// (unknown) instead of 0, so "no data yet" can never masquerade as "perfectly fresh".
 func (f *Fetcher) Staleness() time.Duration {
 	ts := f.lastOK.Load()
 	if ts == 0 {
-		return 0
+		return -1 * time.Second // §M2：-1=从未采集（未知），消费端禁止当 0（新鲜）用
 	}
 	return time.Since(time.Unix(ts, 0))
 }

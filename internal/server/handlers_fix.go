@@ -2141,6 +2141,10 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[action] %s %s(%s) qty=%d price=%.2f → %+v", side, req.Code, s.stockName(req.Code), qty, price, res)
+		// §H3（2026-09-22 修复批）：手动实盘指令必须落操作人审计（旧实现只进 stdout 日志，
+		// 进程重启即失忆；ignore 分支本有 opslog.Audit，此路补齐同姿势）。
+		opslog.Audit("live_order", user.ID, req.Code, fmt.Sprintf("action=%s qty=%d price=%.2f signal=%s order=%s",
+			side, qty, price, signalID, res.OrderID))
 		writeJSON(w, 200, res)
 		return
 	}

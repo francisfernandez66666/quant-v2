@@ -435,6 +435,67 @@ func TestQMTTradesPartialSellUsesPositionCost(t *testing.T) {
 	}
 }
 
+// TestQMTTradesFeeInclusiveReplay §F1+§F12（2026-09-22 修复批）反例锁：/api/qmt/trades
+// 重放必须含费——买入佣金摊入加权成本、卖出 pnl 扣 fee+stamp_tax（与 paper 含费口径一致）；
+// 流水回显必须带非零 fee/stamp_tax；金额统计取落库 Amount 而非重算 Price×Qty（§F12 单口径）。
+// 构造：买 100@10 fee5（成本 10.05）→ 卖 100@11 fee6.5 印6.5
+// → realized=(11−10.05)×100−13=82（旧不含费实现会虚报 100）。
+// English: §F1/§F12 regression — trades replay is fee-inclusive (buy commission amortized into
+// weighted cost, sell pnl net of fee+stamp), ledger echo carries non-zero fee legs, and amount
+// stats use the stored Amount instead of a recomputed Price×Qty.
+func TestQMTTradesFeeInclusiveReplay(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "F-F1-B", Code: "600519.SH", Side: "买入",
+		Price: 10, Qty: 100, Amount: 1000, Fee: 5, TradedAt: "2026-09-22 09:31:00"}); err != nil {
+		t.Fatalf("seed buy: %v", err)
+	}
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "F-F1-S", Code: "600519.SH", Side: "卖出",
+		Price: 11, Qty: 100, Amount: 1100, Fee: 6.5, StampTax: 6.5, TradedAt: "2026-09-22 14:00:00"}); err != nil {
+		t.Fatalf("seed sell: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	s.handleQMTTrades(rr, httptest.NewRequest(http.MethodGet, "/api/qmt/trades", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("trades HTTP %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Summary struct {
+			RealizedPnl float64 `json:"realized_pnl"`
+			Wins        int     `json:"wins"`
+		} `json:"summary"`
+		Fills []struct {
+			OrderID  string  `json:"order_id"`
+			Amount   float64 `json:"amount"`
+			Fee      float64 `json:"fee"`
+			StampTax float64 `json:"stamp_tax"`
+		} `json:"fills"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Summary.RealizedPnl != 82 {
+		t.Fatalf("含费重放已实现应=82（(11−10.05)×100−13），旧不含费口径会是 100, got %v", out.Summary.RealizedPnl)
+	}
+	if out.Summary.Wins != 1 {
+		t.Fatalf("含费后仍为盈利应计 1 胜, got %d", out.Summary.Wins)
+	}
+	if len(out.Fills) != 2 {
+		t.Fatalf("流水应 2 笔, got %d", len(out.Fills))
+	}
+	for _, f := range out.Fills {
+		switch f.OrderID {
+		case "F-F1-B":
+			if f.Fee != 5 || f.StampTax != 0 {
+				t.Fatalf("买入流水费用腿回显错误: %+v", f)
+			}
+		case "F-F1-S":
+			if f.Fee != 6.5 || f.StampTax != 6.5 {
+				t.Fatalf("卖出流水费用腿回显错误: %+v", f)
+			}
+		}
+	}
+}
+
 // TestHandleQMTReportPositionsClearGuard §AUDIT-PM 2026-09-15 空快照纵深守卫：
 // 本地有仓 + 空快照 → 409 拒清、持仓保留；非空快照正常对账；本地无仓时空快照放行（合法全平）。
 // English: empty-snapshot defense-in-depth — local rows + empty push ⇒ 409 and rows survive;
@@ -470,5 +531,160 @@ func TestHandleQMTReportPositionsClearGuard(t *testing.T) {
 	s.handleQMTReport(rr, r)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("空账本收空快照应放行（合法全平）, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandleQMTReportPositionsInvalidTsCode400 §F2（2026-09-22 修复批）HTTP 面：
+// positions 上报混入 ts_code=” 或非法格式行 → 整批拒 400，账本一行不动（含批内合法行）。
+// 合法快照不受影响；「本地有仓+空快照 409」守卫保留（见 TestHandleQMTReportPositionsClearGuard）。
+// English: §F2 — a snapshot containing any invalid ts_code is rejected wholesale with 400
+// and nothing lands; valid snapshots keep flowing.
+func TestHandleQMTReportPositionsInvalidTsCode400(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "000001.SZ", Name: "平安", Qty: 100, CostPrice: 12}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	body := `{"type":"positions","positions":[{"ts_code":"600519.SH","name":"贵州茅台","qty":100,"cost_price":1500},{"ts_code":"","name":"垃圾行","qty":100}]}`
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("含空 ts_code 的快照应整批 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	all, _ := db.RealPositions()
+	if len(all) != 1 || all[0].TsCode != "000001.SZ" {
+		t.Fatalf("拒收后账本应原样不动, got %+v", all)
+	}
+	// 非法后缀格式同样拒
+	body2 := `{"type":"positions","positions":[{"ts_code":"600519","name":"缺后缀","qty":100}]}`
+	rr = httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("缺交易所后缀应 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandleQMTReportOrderStoreError500 §M4（2026-09-22 修复批）：委托状态腿落库失败
+// 不得吞错回 200 ok——旧实现让网关 outbox 误判投递成功、状态回报永久丢失。
+// 现回 500 触发 outbox 重推（成交腿同口径）。
+// English: §M4 — order-status persistence failure must answer 500 (retryable by the gateway
+// outbox) instead of the old swallowed-error 200 ok.
+func TestHandleQMTReportOrderStoreError500(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+	body := `{"type":"order","order_id":"O-M4","signal_id":"S-M4","code":"600519.SH","side":"买入","status":"部成","price":1500,"qty":100,"at":"2026-09-22T10:00:00+08:00"}`
+	// 关闭底层库模拟 store 落库报错（Begin 即失败）
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	if rr.Code >= 200 && rr.Code < 300 {
+		t.Fatalf("落库失败必须非 2xx（让 outbox 重推）, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("落库失败应 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandleQMTReportOrderMissingKeys §F5（2026-09-22 修复批）：缺键委托回报不再静默丢弃——
+// ① 缺 signal_id（手工单形态）：以 ext:<order_id> 占位键落一条可查的最小状态行，同单号后续
+//
+//	状态回报正常单调推进；② 缺 order_id（主键不可落行）：显式拒收 400 并 log+opslog 留痕
+//	（网关 outbox 对 4xx 走死信留痕，不无限重推）。
+//
+// English: §F5 — reports lacking signal_id land a queryable minimal row keyed by ext:<order_id>;
+// reports lacking order_id (the primary key) are explicitly rejected with a durable trace.
+func TestHandleQMTReportOrderMissingKeys(t *testing.T) {
+	s, db, _ := newTestResearchServer(t)
+
+	// ① 缺 signal_id：已报 → 落最小行
+	body := `{"type":"order","order_id":"MANUAL-77","code":"600000.SH","side":"买入","status":"已报","price":10,"qty":100,"at":"2026-09-22T10:00:00+08:00"}`
+	rr := httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("缺 signal_id 的 order 回报应落最小行并 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	orders, _ := db.RealOrders()
+	var row *store.RealOrder
+	for i := range orders {
+		if orders[i].OrderID == "MANUAL-77" {
+			row = &orders[i]
+		}
+	}
+	if row == nil {
+		t.Fatal("手工单委托行应可查（此前静默丢弃形态）")
+	}
+	if row.SignalID != "ext:MANUAL-77" || row.Status != "已报" {
+		t.Fatalf("最小状态行键值不符: %+v", row)
+	}
+	// 同单号后续 已成 → 单调推进（占位键幂等）
+	body2 := `{"type":"order","order_id":"MANUAL-77","code":"600000.SH","side":"买入","status":"已成","price":10,"qty":100,"at":"2026-09-22T10:05:00+08:00"}`
+	rr = httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body2)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("推进回报应 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	orders, _ = db.RealOrders()
+	for _, o := range orders {
+		if o.OrderID == "MANUAL-77" && o.Status != "已成" {
+			t.Fatalf("状态应推进为 已成, got %s", o.Status)
+		}
+	}
+
+	// ② 缺 order_id：显式拒收 400，不落库
+	body3 := `{"type":"order","signal_id":"S-NOORD","code":"600000.SH","side":"买入","status":"已成","price":10,"qty":100,"at":"2026-09-22T10:06:00+08:00"}`
+	rr = httptest.NewRecorder()
+	s.handleQMTReport(rr, httptest.NewRequest(http.MethodPost, "/api/qmt/report", bytes.NewBufferString(body3)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("缺 order_id 应显式拒收 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	orders, _ = db.RealOrders()
+	for _, o := range orders {
+		if o.SignalID == "S-NOORD" {
+			t.Fatal("拒收回报不得落库")
+		}
+	}
+}
+
+// TestJSONErrorEnvelopeFor404405 §F3（2026-09-22 修复批）：404/405 必须走统一 JSON 错误信封
+// （{"error":…}，Content-Type=application/json），不再是 Go ServeMux 默认 text/plain。
+// English: §F3 — unmatched routes (404) and wrong methods (405) answer with the standard
+// {"error":…} JSON envelope instead of ServeMux's plain-text default.
+func TestJSONErrorEnvelopeFor404405(t *testing.T) {
+	s, _ := newAdminTestServer(t)
+
+	do := func(method, path string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		// 走完整 chain(muxWithJSONErrors)：与生产 Serve 同一接线点
+		s.ServeHTTP(rr, httptest.NewRequest(method, path, nil))
+		return rr
+	}
+
+	// 404：不存在的路径
+	rr := do(http.MethodGet, "/api/definitely-not-a-route")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("未注册路径应 404, got %d", rr.Code)
+	}
+	assertJSONError(t, rr, "404")
+
+	// 405：/api/health 只注册了 GET，POST 应 405
+	rr = do(http.MethodPost, "/api/health")
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("方法不匹配应 405, got %d", rr.Code)
+	}
+	assertJSONError(t, rr, "405")
+}
+
+// assertJSONError 校验响应为 Content-Type=application/json 且体含 "error" 键的统一信封。
+func assertJSONError(t *testing.T, rr *httptest.ResponseRecorder, what string) {
+	t.Helper()
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("%s 响应 Content-Type 应为 application/json, got %q body=%s", what, ct, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("%s 响应体应为 JSON 信封, 解析失败: %v body=%s", what, err, rr.Body.String())
+	}
+	if body["error"] == "" {
+		t.Fatalf("%s 响应体应含非空 error 字段: %s", what, rr.Body.String())
 	}
 }

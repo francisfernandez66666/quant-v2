@@ -38,6 +38,21 @@ function Ok($m)   { Write-Host "[ ok ] $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[warn] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[fail] $m" -ForegroundColor Red; exit 1 }
 
+# §H8(2026-09-22)：端口/端点唯一来源收编到 service_probe_config.ps1——本脚本与运维探针
+# （all_service_watchdog.ps1 / daily_ops_check.ps1）读同一组变量，根除"部署端口与探针端口各改各的"
+# （H8 实录：watchdog 硬编码 :8080/api/status，而这里早已改注 QUANT_ADDR=127.0.0.1:8081）。
+# 配置缺失时回退为本文件旧字面量并告警，不阻断注册流程。
+$probeCfg = Join-Path $PSScriptRoot "service_probe_config.ps1"
+if (Test-Path $probeCfg) {
+    . $probeCfg
+    Info "probe config loaded: $probeCfg (§H8 端口同源)"
+} else {
+    Warn "missing $probeCfg - fallback to in-script literals (§H8：运维探针将与本脚本端口脱钩，请补齐部署清单)"
+    $ProbeQuantPort  = 8081
+    $ProbePydataPort = 8787
+    $ProbeGatewayUrl = "http://127.0.0.1:8789/health"
+}
+
 # §ENH-0(2026-09-19)：统一构造服务级环境变量。此前 LLM 三元组之外的密钥（尤其
 # HITHINK_FINANCE_API_KEY=交易日历/行情主源）从不注入，quant 生产进程一直缺它。
 # 逗号 return 防 PowerShell 单元素数组被标量化。
@@ -93,7 +108,7 @@ Register-NssmService "quant" $QuantExe @() "NORMAL_PRIORITY_CLASS"
 # 撞端口，配合 §W4-b fail-fast 会让 quant 服务起不来（5s 重启循环，部署实录）。
 # §ENH-0(2026-09-19)：env 统一走 Get-BaseEnvExtra（含可选 HITHINK_FINANCE_API_KEY），
 # 覆盖注册函数刚才写入的集合——AppEnvironmentExtra 是整体替换语义，必须带全量再叠 QUANT_ADDR。
-& $nssm set quant AppEnvironmentExtra ((Get-BaseEnvExtra) + @("QUANT_ADDR=127.0.0.1:8081")) | Out-Null
+& $nssm set quant AppEnvironmentExtra ((Get-BaseEnvExtra) + @("QUANT_ADDR=127.0.0.1:$ProbeQuantPort")) | Out-Null
 if (-not $HithinkApiKey) {
     Warn "HithinkApiKey 未提供：交易日历将按周末口径兜底（法定节假日会误判为交易日，直到首次成功拉取后的磁盘缓存生效）"
 }
@@ -116,11 +131,11 @@ if (-not (Test-Path $pyScript)) {
 } elseif (-not (Test-Path $pyExe)) {
     Warn "missing venv python $pyExe - skip pydata (run setup_venv first)"
 } else {
-    Register-NssmService "pydata" $pyExe @("$pyScript", "--host", "127.0.0.1", "--port", "8787") "BELOW_NORMAL_PRIORITY_CLASS"
+    Register-NssmService "pydata" $pyExe @("$pyScript", "--host", "127.0.0.1", "--port", "$ProbePydataPort") "BELOW_NORMAL_PRIORITY_CLASS"
     & $nssm set pydata AppDirectory "C:\opt\quant\pydata" | Out-Null
     & $nssm restart pydata
     Start-Sleep -Seconds 2
-    Ok "pydata registered/restarted (127.0.0.1:8787)"
+    Ok "pydata registered/restarted (127.0.0.1:$ProbePydataPort)"
 }
 
 # 5. qmtctl scheduled task (interactive session) - generate a wrapper ps1 to avoid nested quoting
@@ -128,7 +143,7 @@ if (-not (Test-Path $QmtctlExe)) {
     Warn "missing $QmtctlExe - skip qmtctl task"
 } else {
     $wrapper = Join-Path $PSScriptRoot "ensure_miniqmt.ps1"
-    $wrapContent = "& '$QmtctlExe' ensure-miniqmt -path '$MiniQmtPath' -gateway-url http://127.0.0.1:8789/health"
+    $wrapContent = "& '$QmtctlExe' ensure-miniqmt -path '$MiniQmtPath' -gateway-url $ProbeGatewayUrl"
     # UTF8（PS5.1 带 BOM）：MiniQmtPath 常含中文安装目录，ASCII 会写成 '?' 导致启动失败
     Set-Content -Path $wrapper -Value $wrapContent -Encoding UTF8
     $taskName = "QMT-Ensure-Running"

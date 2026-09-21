@@ -4,6 +4,10 @@
 
 覆盖：上报文件逐行 _do_dispatch_result 语义（heartbeat 回执 / order_result 派发结算）、
 pending 派发原子推送 bridge_cmd.json、文件轮转（缩短）回读。无需 Windows/xtquant。
+
+§TZ（2026-09-22 修复批）：夹具里模拟沙箱侧产出的 ts 一律走 store._now_cn()（显式北京
+时区），不再用「本地钟面 strftime + 硬编码 +08:00」的假偏移写法——非北京时区部署机上
+那种写法会自产漂移样本，掩盖真实时钟缺陷。
 """
 import json
 import os
@@ -15,6 +19,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gateway import Gateway  # noqa: E402
+from store import _now_cn  # §TZ 夹具时间串统一显式北京时区  # noqa: E402
 
 
 def new_db_path():
@@ -186,7 +191,7 @@ class TestFileBridge(unittest.TestCase):
         # 先写一条心跳 JSONL 行（沙箱侧产出）
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"type": "heartbeat",
-                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                                "ts": _now_cn(),
                                 "n": 1}, ensure_ascii=False) + "\n")
         th = None
         try:
@@ -266,7 +271,7 @@ class TestFileBridge(unittest.TestCase):
         path = gw._file_bridge_path()
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"type": "heartbeat",
-                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"), "n": 1},
+                                "ts": _now_cn(), "n": 1},
                                ensure_ascii=False) + "\n")
         th = threading.Thread(target=gw._file_bridge_loop, daemon=True)
         try:
@@ -279,10 +284,10 @@ class TestFileBridge(unittest.TestCase):
             self.assertTrue(os.path.exists(path))
             with open(path, "w", encoding="utf-8") as f:
                 f.write(json.dumps({"type": "heartbeat",
-                                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"), "n": 999},
+                                    "ts": _now_cn(), "n": 999},
                                    ensure_ascii=False) + "\n")
                 f.write(json.dumps({"type": "heartbeat",
-                                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"), "n": 2},
+                                    "ts": _now_cn(), "n": 2},
                                    ensure_ascii=False) + "\n")
             # 等待 sidecar 处理（2s/轮 * 3 轮兜底）
             deadline = time.time() + 8

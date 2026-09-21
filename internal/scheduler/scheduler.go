@@ -76,7 +76,17 @@ type Scheduler struct {
 	// failCool §失败重排队防自旋：taskID → 最近一次失败时间。失败任务自动回队尾，
 	// 空队时会立即再次被取到——冷却期内不出队，避免快速失败的任务烧 CPU。
 	failCool map[int64]time.Time // 任务失败冷却表（taskID → 最近失败时间）
-	state    stateFile           // 展示兼容状态文件
+	// §M14（2026-09-22）同因连败熔断告警回调（researchd 启动装配经 SetAlertFunc 注入）：
+	// 任务被挂起为 failed_needs_attention 时高优告警一次；nil=静默（仅 opslog 留痕）。
+	alertFn func(title, content string)
+	// §M15 夜链入队测试缝：非 nil 时替代真实 EnqueueResearchTask（单测注入指定序位失败）。
+	nightlyEnqueueOverride func(t *store.ResearchTask) (int64, error)
+	// §M14 留痕观察测试缝：非 nil 时收到每一次 recordStepState 的 (step, status, errMsg)。
+	// 生产恒 nil；单测用它锁定熔断挂起 needs_attention 留痕确实落过状态上报——
+	// LastStatus 是「最近一次覆盖式」全局字段，后台排水跑完任何下一个任务就会把它冲掉，
+	// 直接快照断言属于时序竞态（同因连败挂起后 dataload 秒完即翻 done）。
+	stepStateObserver func(step, status, errMsg string)
+	state             stateFile // 展示兼容状态文件
 }
 
 // stateFile 展示兼容状态：交易时段下载节流时间戳 + 最近任务结果上报（前端可见）。
@@ -89,6 +99,10 @@ type stateFile struct {
 	LastStatus   string `json:"last_status,omitempty"` // 最近状态：done/error/interrupted/paused
 	LastError    string `json:"last_error,omitempty"`  // 最近一次错误信息
 	LastAt       string `json:"last_at,omitempty"`     // 最近任务时间
+	// §M15（2026-09-22）夜链半截留痕：当日链应入队序位总数 / 实际已入队数。
+	// 入队中途失败不再早退（缺额由后续 tick 自动补投），issued<total 即半截可见，绝不静默。
+	ChainIssued int `json:"chain_issued,omitempty"` // 当日夜链已入队任务数
+	ChainTotal  int `json:"chain_total,omitempty"`  // 当日夜链应入队任务数
 }
 
 // New 创建调度器。cfgPath/statePath 为空时由 dataDir 推导。
@@ -126,6 +140,15 @@ func (s *Scheduler) setNow(f func() time.Time) {
 	s.nowMu.Lock()
 	defer s.nowMu.Unlock()
 	s.nowFn = f
+}
+
+// SetAlertFunc §M14 注入告警通道（researchd 启动装配调用一次）：同因连败熔断挂起、
+// 夜链半截等运维事件经此直达推送网关（ntfy/APK），传 nil 关闭。
+// English: M14 installs the ops alert callback used by the same-cause breaker (nil disables).
+func (s *Scheduler) SetAlertFunc(fn func(title, content string)) {
+	s.mu.Lock()
+	s.alertFn = fn
+	s.mu.Unlock()
 }
 
 // Run 启动调度循环，直到 ctx 取消。

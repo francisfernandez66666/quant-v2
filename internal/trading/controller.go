@@ -74,6 +74,9 @@ type Controller struct {
 	// §R4-1 撤单闭环节流状态（mu 保护）
 	lastSweepAt       time.Time // 最近一次 SweepOrders 执行时间（30s 节流）
 	lastCloseSweepDay string    // 最近一次执行收盘清单的交易日（每日一次）
+	// §C1b 跨日陈旧买单无条件清扫的独立节流戳（mu 保护）：不受 Enabled/Tripped 管辖，
+	// 故不能复用 lastSweepAt（后者在早退分支之前不被推进）。
+	lastStaleSweepAt time.Time
 
 	// §WS-B 交割单对账节流：lastSettleDay 记录最近对账交易日（每日一次，mu 保护）
 	lastSettleDay string // 最近一次 SettleDay 的交易日
@@ -726,7 +729,30 @@ type SweepResult struct {
 // 熔断中跳过（网关不可达时撤单必然失败，避免错误风暴）。English: §R4-1 cancel-loop entry
 // (30s throttled, called from the engine's 5s cycle): stale unfilled auto-cancel, placeholder
 // demotion, and the once-a-day pre-close cancel list. Skipped while the breaker is open.
+// §C1b：函数最前面有一段**不受** Enabled/Tripped/cancel_stale_sec 管辖的跨日陈旧买单无条件
+// 降级（纯本地账），下面的网关撤单主循环才受既有早退约束。
 func (c *Controller) SweepOrders(now time.Time) *SweepResult {
+	// §C1b（2026-09-22 修复批）跨日陈旧买单无条件清扫：A 股委托收盘即失效，前日的
+	// 已报/部成 买单必然是僵尸行；此路解冻不依赖网关可达（旧行为在熔断/关闭/
+	// cancel_stale_sec=-1 下整体早退，网关崩溃遗留挂单永无兜底）。30s 独立节流。
+	if c.store != nil {
+		c.mu.RLock()
+		lastStale := c.lastStaleSweepAt
+		c.mu.RUnlock()
+		if now.Sub(lastStale) >= 30*time.Second {
+			c.mu.Lock()
+			c.lastStaleSweepAt = now
+			c.mu.Unlock()
+			beforeDay := cntime.In(now).Format("2006-01-02")
+			n, err := c.store.SweepStaleBuyOrders(c.userID, beforeDay)
+			if err != nil {
+				log.Printf("[trading] §C1b 跨日陈旧买单清扫失败: %v", err)
+			} else if n > 0 {
+				log.Printf("[trading] §C1b 跨日陈旧买单降级废单 %d 笔（账户=%s，早于 %s）", n, c.userID, beforeDay)
+				opslog.Logf("quant", "跨日陈旧买单无条件降级 %d笔 账户=%s 早于%s（网关撤单路未覆盖部分的本地兜底）", n, c.userID, beforeDay)
+			}
+		}
+	}
 	c.mu.RLock()
 	cfg := c.cfg
 	last := c.lastSweepAt

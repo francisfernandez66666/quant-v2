@@ -1,5 +1,8 @@
 // sell_shadow_test.go — §SELLPOINT-UNIFY P1-b 影子接线的引擎侧行为锁。
 //
+// §M9（2026-09-22 修复批）：sell_unified_mode 收编为「轮首快照显式传参」，本文件调用点
+// 同步补 e.sellUnifiedModeEngine() 实参——纯签名对齐，断言与行为口径一律未动。
+//
 // 钉死四件事：
 //
 //	① 默认（mode 缺省=shadow）每轮持仓探针会进 signalctl 留痕环（stage=sell_discipline），
@@ -60,7 +63,7 @@ func TestSellShadowRecordsHoldOnFirstTouch(t *testing.T) {
 	positions := []store.RealPosition{{TsCode: "600580.SH", Name: "影子测试", Qty: 100, CostPrice: 10}}
 	quotes := map[string]*data.StockInfo{"600580": {Price: 9.3}}
 
-	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil)
+	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil, e.sellUnifiedModeEngine())
 	if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictHold); n != 1 {
 		t.Fatalf("首触应留痕 1 条 hold，得 %d", n)
 	}
@@ -68,13 +71,13 @@ func TestSellShadowRecordsHoldOnFirstTouch(t *testing.T) {
 		t.Fatalf("影子观察窗内不得有处置留痕，得 %d", n)
 	}
 	// 第二轮同状态：不重复留痕（5s 探针防刷屏）。
-	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil)
+	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil, e.sellUnifiedModeEngine())
 	if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictHold); n != 1 {
 		t.Fatalf("同状态重复探针不应再留痕，得 %d", n)
 	}
 	// 平仓（持仓清空）→ 状态被 Prune；重新入场按新首触再留一条 hold。
-	e.runSellUnifiedJudge("u_1", nil, nil, quotes, nil, nil, nil)
-	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil)
+	e.runSellUnifiedJudge("u_1", nil, nil, quotes, nil, nil, nil, e.sellUnifiedModeEngine())
+	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil, e.sellUnifiedModeEngine())
 	if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictHold); n != 2 {
 		t.Fatalf("平仓清理+重新入场应重新计时留痕（累计 2 条 hold），得 %d", n)
 	}
@@ -85,7 +88,7 @@ func TestSellShadowOffIsSilent(t *testing.T) {
 	e := shadowTestEnv(t, "off")
 	positions := []store.RealPosition{{TsCode: "600580.SH", Name: "影子测试", Qty: 100, CostPrice: 10}}
 	quotes := map[string]*data.StockInfo{"600580": {Price: 9.3}}
-	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil)
+	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, nil, e.sellUnifiedModeEngine())
 	if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictHold) + countSellVerdicts(e, "600580.SH", signalctl.VerdictPass); n != 0 {
 		t.Fatalf("off 模式必须完全静默，得 %d 条留痕", n)
 	}
@@ -95,7 +98,7 @@ func TestSellShadowOffIsSilent(t *testing.T) {
 func TestSellShadowIgnoresUnheldAndInvalidPrice(t *testing.T) {
 	e := shadowTestEnv(t, "shadow")
 	positions := []store.RealPosition{{TsCode: "600580.SH", Name: "影子测试", Qty: 100, CostPrice: 10}}
-	e.runSellUnifiedJudge("u_1", positions, nil, map[string]*data.StockInfo{}, nil, nil, nil)
+	e.runSellUnifiedJudge("u_1", positions, nil, map[string]*data.StockInfo{}, nil, nil, nil, e.sellUnifiedModeEngine())
 	if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictHold) + countSellVerdicts(e, "600580.SH", signalctl.VerdictPass); n != 0 {
 		t.Fatalf("无现价轮次不得有任何留痕，得 %d", n)
 	}
@@ -108,7 +111,7 @@ func TestSellShadowDualBearHardClearsOnTouch(t *testing.T) {
 	e.bearTier = map[string]bearTierEntry{"600580": {verified: signalctl.BearVerifiedDual, at: time.Now()}}
 	positions := []store.RealPosition{{TsCode: "600580.SH", Name: "影子测试", Qty: 100, CostPrice: 10}}
 	quotes := map[string]*data.StockInfo{"600580": {Price: 9.3}} // −7% 触 6% 止损线（未深破）
-	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, map[string]string{"600580": "贵金属板块利空"})
+	e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, map[string]string{"600580": "贵金属板块利空"}, e.sellUnifiedModeEngine())
 	if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictPass); n != 1 {
 		t.Fatalf("触线+双源验证利空应当轮留 1 条处置（即时硬清），得 %d", n)
 	}
@@ -131,7 +134,7 @@ func TestSellShadowSingleBearNeverHardClears(t *testing.T) {
 	cases["single级"].bearTier = map[string]bearTierEntry{"600580": {verified: signalctl.BearVerifiedSingle, at: time.Now()}}
 	cases["超龄dual"].bearTier = map[string]bearTierEntry{"600580": {verified: signalctl.BearVerifiedDual, at: time.Now().Add(-bearTierTTL - time.Minute)}}
 	for name, e := range cases {
-		e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, bear)
+		e.runSellUnifiedJudge("u_1", positions, nil, quotes, nil, nil, bear, e.sellUnifiedModeEngine())
 		if n := countSellVerdicts(e, "600580.SH", signalctl.VerdictPass); n != 0 {
 			t.Fatalf("%s：非新鲜双源利空不得给硬清处置，得 %d", name, n)
 		}

@@ -440,7 +440,12 @@ func (g *Gate) checkBuyDiscipline(cfg config.QMTConfig, o LiveOrder) string {
 	if ferr != nil {
 		return fmt.Sprintf("read buy fills: %v", ferr)
 	}
-	frozen := g.st.LocalBuyFrozen(g.userID, today)
+	// §C1（2026-09-22 修复批）：冻结查询错误不再吞成 0——读取失败按拒绝放行处理（fail-closed），
+	// 与相邻两本账（ferr/serr）同一姿势：宁可少买，DB 故障期间绝不放水超买。
+	frozen, frerr := g.st.LocalBuyFrozen(g.userID, today)
+	if frerr != nil {
+		return fmt.Sprintf("read frozen: %v", frerr)
+	}
 	sellProceeds, serr := g.st.SumSellFilledAmountByDay(g.userID, today)
 	if serr != nil {
 		return fmt.Sprintf("read sell fills: %v", serr)

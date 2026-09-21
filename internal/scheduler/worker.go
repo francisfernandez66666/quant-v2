@@ -584,22 +584,24 @@ func (s *Scheduler) workerTick(cfg config.SchedulerConfig, now time.Time) {
 	s.tryStartNext(db, cfg)
 }
 
-// ensureNightlyEnqueue 幂等入队当日夜间步骤链（low、chain_day=今天、chain_seq 递增）。
+// ensureNightlyEnqueue 幂等入队当日夜间步骤链（low、chain_day=今天、chain_seq=序位）。
 // 队列即断点：researchd 重启后已入队未完成的任务天然续跑，不再依赖 research_state.json 步骤下标。
 // 跨日残留的旧链任务按 chain_day 升序先于今日执行（保留已完成工作量，优于旧的直接杀掉重来）。
 // §2026-09-05 多轮发现：原单个 discover_factors 展开为 variants 个变体任务（各自产出 top_n
 // 个排他最优组合），回测开关开启时在其后追加一次 --since 的配对 backtest（回填全部当日候选）。
-// English: idempotently enqueues today's nightly step chain (low priority). The queue itself is the
-// checkpoint — restarts resume naturally; leftover chains from prior days drain first by chain_day.
-// §2026-09-05 multi-round: discover_factors expands into `variants` variant tasks (each emitting
-// top_n exclusion-distinct combos); the backtest toggle appends one --since paired backtest that
-// backfills every today-created candidate.
+// §M15（2026-09-22）半截链自愈：旧实现「ChainHasTasks 有任一任务即整链短路 + enqueue 中途
+// 失败立即 return（Day 也不推进）」——某环入库失败时当晚链永久半截且不再补。现改为：
+//  1. 先把步骤表展开成完整计划（plan），链任务序位 chain_seq=计划下标（序位即身份）；
+//  2. 以当日已占用序位集合（含全部终态）为断点，仅补缺口——重启/中途失败后由后续 tick
+//     （30s）自动补投缺额，全部就位后走无操作稳态路径；
+//  3. 单个序位入队失败只记录并继续投其余环，绝不中断整链；
+//  4. state 照常推进 Day 并留痕 chain_issued/chain_total，缺额在状态文件与 opslog 可见。
+//
+// English: idempotently enqueues today's nightly chain. M15: half-chain self-healing — the plan
+// positions (chain_seq) are the checkpoint; a failing enqueue no longer aborts the chain, and
+// every later tick backfills only the missing positions, with issued/total recorded in state.
 func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfig, now time.Time) {
 	today := cntime.DayCompactOf(now) // §TZ1 北京日历定链日
-	has, err := db.ChainHasTasks(today)
-	if err != nil || has {
-		return
-	}
 	steps := cfg.Nightly.Steps
 	if len(steps) == 0 {
 		steps = config.DefaultSchedulerConfig().Nightly.Steps
@@ -622,25 +624,10 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 		steps = insertAfter(steps, "library_replay", "optimize")
 		log.Printf("[scheduler] 策略自优化引擎开启：夜间链追加 optimize 任务（全库参数寻优）")
 	}
-	seq := 0
-	enqueue := func(typ, step, payload string) bool {
-		// §回测自动增强 A0：夜间链战法回放/寻优任务注入 backtest 配置（enabled 才注入，
-		// 无记录=旧行为）——与 server 端 enqueueBacktestTask 同一管线。
-		if typ == store.TaskBacktestStrategy {
-			payload = s.injectBacktestPayload(db, payload)
-		}
-		if _, err := db.EnqueueResearchTask(&store.ResearchTask{
-			Type: typ, Priority: "low", Status: store.TaskQueued,
-			Payload: payload, ChainDay: today, ChainSeq: seq,
-		}); err != nil {
-			log.Printf("[scheduler] 入队夜间任务 %s 失败: %v", step, err)
-			return false
-		}
-		seq++
-		return true
-	}
+	// §M15 第一步：把步骤表展开为完整计划（不触库，纯计算）——计划下标即 chain_seq。
 	// §多轮发现：expand discover_factors → variants 个变体任务；配对 backtest 仅放置一次，
 	// 之后的显式/auto-inserted "backtest" 步骤跳过，避免重复回测。
+	var plan []chainPlanItem
 	variants := discoverVariants(cfg)
 	backtestPlaced := false
 	for _, step := range steps {
@@ -651,16 +638,11 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 				if !ok {
 					continue
 				}
-				if !enqueue(typ, fmt.Sprintf("discover_factors 变体#%d", v), payload) {
-					return
-				}
+				plan = append(plan, chainPlanItem{typ: typ, step: fmt.Sprintf("discover_factors 变体#%d", v), payload: payload})
 			}
 			log.Printf("[scheduler] 多轮发现：discover_factors 展开为 %d 个变体任务（每变体 top_n 排他最优组合）", variants)
 			if cfg.Nightly.BacktestEnabled {
-				if !enqueue(store.TaskBacktestNightly, "backtest(配对)",
-					nightlyBacktestPayload(cfg, today)) {
-					return
-				}
+				plan = append(plan, chainPlanItem{store.TaskBacktestNightly, "backtest(配对)", nightlyBacktestPayload(cfg, today)})
 				backtestPlaced = true
 				log.Printf("[scheduler] 夜间链追加配对 backtest（--since %s 回填多候选）", today)
 			}
@@ -674,27 +656,97 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 				log.Printf("[scheduler] 未知夜间步骤 %q 跳过", step)
 				continue
 			}
-			if !enqueue(typ, step, payload) {
-				return
-			}
+			plan = append(plan, chainPlanItem{typ, step, payload})
 		default:
 			typ, payload, ok := stepTask(step, cfg, today)
 			if !ok {
 				log.Printf("[scheduler] 未知夜间步骤 %q 跳过", step)
 				continue
 			}
-			if !enqueue(typ, step, payload) {
-				return
-			}
+			plan = append(plan, chainPlanItem{typ, step, payload})
 		}
 	}
+	// §M15 第二步：当日已占用序位（全状态：done/error/cancelled/挂起都算已投）——只补缺口。
+	existing, err := db.ChainTaskSeqs(today)
+	if err != nil {
+		log.Printf("[scheduler] 查询当日夜链序位失败(%s): %v", today, err)
+		return
+	}
+	covered, newly, failures := 0, 0, []string{}
+	for i, it := range plan {
+		if existing[i] > 0 {
+			covered++
+			continue
+		}
+		if err := s.enqueueChainStep(db, it, today, i); err != nil {
+			failures = append(failures, it.step) // §M15 失败环显式记录，绝不中断其余环入队
+			continue
+		}
+		newly++
+	}
+	if newly == 0 && len(failures) == 0 {
+		return // 稳态路径：当日链全序位已就位（旧版 ChainHasTasks 短路职责由序位补缺取代）
+	}
+	// §M15 照常推进 Day（旧版入队中途 return 连 Day 都不推进）+ 半截留痕 chain_issued/total。
 	s.mu.Lock()
 	s.state.Day = today
 	s.state.Done = false
+	s.state.ChainTotal = len(plan)
+	s.state.ChainIssued = covered + newly
 	s.mu.Unlock()
 	s.saveState()
-	log.Printf("[scheduler] 夜间链 %s 已入队 %d 个 low 任务: %v", today, seq, steps)
-	opslog.Logf("research", "夜间链 %s 入队 %d 个任务: %v", today, seq, steps)
+	if len(failures) > 0 {
+		log.Printf("[scheduler] §M15 夜间链 %s 本轮入队半截：%d/%d 已就位，缺额 %v——后续 tick 自动补投",
+			today, covered+newly, len(plan), failures)
+		// opslog 节流（半小时一条）：缺额持续存在时不刷屏，但每日巡检必留痕。
+		opslog.OncePer("nightchain-gap:"+today, 30*time.Minute, func() {
+			opslog.Logf("research", "§M15 夜间链 %s 入队半截 %d/%d，缺额 %v（自动补投中，持续失败需查队列库）",
+				today, covered+newly, len(plan), failures)
+		})
+		return
+	}
+	if covered > 0 {
+		log.Printf("[scheduler] §M15 夜间链 %s 缺额补投 %d 个任务完成，全链 %d/%d 就位", today, newly, covered+newly, len(plan))
+		opslog.Logf("research", "§M15 夜间链 %s 缺额补投 %d 个，全链 %d/%d 就位", today, newly, covered+newly, len(plan))
+		return
+	}
+	log.Printf("[scheduler] 夜间链 %s 已入队 %d 个 low 任务: %v", today, newly, steps)
+	opslog.Logf("research", "夜间链 %s 入队 %d 个任务: %v", today, newly, steps)
+}
+
+// chainPlanItem §M15 夜间链计划中的一个序位（环节）：typ/payload 入库载荷，step 供日志可读。
+type chainPlanItem struct {
+	typ     string
+	step    string
+	payload string
+}
+
+// enqueueChainStep 入队夜链计划中的一个序位（chain_seq=计划下标）。
+// §M15 测试缝：nightlyEnqueueOverride 非 nil 时替代真实入队（单测注入指定序位入库失败）。
+func (s *Scheduler) enqueueChainStep(db *store.DB, it chainPlanItem, today string, seq int) error {
+	// §回测自动增强 A0：夜间链战法回放/寻优任务注入 backtest 配置（enabled 才注入，
+	// 无记录=旧行为）——与 server 端 enqueueBacktestTask 同一管线。
+	payload := it.payload
+	if it.typ == store.TaskBacktestStrategy {
+		payload = s.injectBacktestPayload(db, payload)
+	}
+	t := &store.ResearchTask{
+		Type: it.typ, Priority: "low", Status: store.TaskQueued,
+		Payload: payload, ChainDay: today, ChainSeq: seq,
+	}
+	s.mu.Lock()
+	override := s.nightlyEnqueueOverride
+	s.mu.Unlock()
+	var err error
+	if override != nil {
+		_, err = override(t)
+	} else {
+		_, err = db.EnqueueResearchTask(t)
+	}
+	if err != nil {
+		log.Printf("[scheduler] §M15 入队夜间任务 %s(seq=%d) 失败: %v", it.step, seq, err)
+	}
+	return err
 }
 
 // containsStep 报告 steps 中是否包含指定步骤。
@@ -1026,8 +1078,9 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			if e := db.RequeueFailedTask(tk.ID, errMsg); e != nil {
 				log.Printf("[scheduler] 任务 #%d panic 后回队落库失败: %v", tk.ID, e)
 			}
-			s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
 			s.noteFailure(tk.ID)
+			s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
+			s.notifySameCauseBreaker(db, &tk, errMsg) // §M14 熔断挂起检测（留痕+告警；置于链收尾后，覆盖展示态为 needs_attention）
 		}
 		s.mu.Lock()
 		s.busy = false
@@ -1053,7 +1106,10 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		tk.ID, tk.Type, tk.Priority, tk.RefID, tk.ChainDay, tk.ChainSeq)
 	opslog.Logf("research", "任务 #%d(%s) 启动 prio=%s chain=%s/%d", tk.ID, tk.Type, tk.Priority, tk.ChainDay, tk.ChainSeq)
 
-	// §失败重排队：失败不再落 error 终态——回队尾（updated_at 尾键沉底），不设重试上限；
+	// §失败重排队：失败不再落 error 终态——回队尾（updated_at 尾键沉底）；异因失败不设重试上限
+	// （瞬态失败此设计正确），§M14（2026-09-22）新增「同因连败熔断」兜底确定性失败
+	// （参数非法/数据必缺/缺二进制）：error 指纹连续 store.SameReasonFailLimit 次相同 →
+	// store 置 failed_needs_attention 挂起，本 worker 高优告警一次，不再秒级/冷却级重投。
 	// error 列保留最后失败原因。冷却窗防快速失败自旋。
 	fail := func(errMsg string) {
 		log.Printf("[scheduler] 任务 #%d(%s) 失败→回队尾重试: %s", tk.ID, tk.Type, errMsg)
@@ -1061,6 +1117,7 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 		_ = db.RequeueFailedTask(tk.ID, errMsg)
 		s.noteFailure(tk.ID)
 		s.finishTask(db, cfg, &tk, store.TaskError, errMsg)
+		s.notifySameCauseBreaker(db, &tk, errMsg) // §M14 熔断挂起检测（置于链收尾后，见其注释）
 	}
 
 	// 重活一律交给子进程：先解析该任务类型对应的可执行文件与参数，解析失败（如缺二进制、
@@ -1376,8 +1433,9 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	}
 
 	// 终态判定（优先级：抢占 > 用户取消 > 单步超时 > 运行错误 > 成功）
-	// §失败重排队：超时/运行错误不再落 error 终态——统一回队尾重试（不设上限），
-	// error 列记最后一次原因；仅用户取消保持终态。
+	// §失败重排队：超时/运行错误不再落 error 终态——统一回队尾重试（异因不设上限），
+	// error 列记最后一次失败原因；仅用户取消保持终态。
+	// §M14 同因连败达阈值时 RequeueFailedTask 不再回队，改挂起 failed_needs_attention+告警。
 	status := store.TaskDone
 	errMsg := ""
 	var resultNum float64
@@ -1409,7 +1467,9 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 			errMsg = "确定性崩溃，未回队: " + crash
 		} else {
 			status = store.TaskFailedRetry
-			errMsg = fmt.Sprintf("运行失败(%v)，已回队尾重试", waitErr)
+			// §M14 失败原因带上子进程最后一行输出：exit status 本身分不出「参数非法/数据必缺/
+			// 瞬断」，而 error 列正是同因连败熔断的指纹来源——不带原因，异因会被误判同因误伤。
+			errMsg = fmt.Sprintf("运行失败(%v)%s，已回队尾重试", waitErr, failReasonOf(fullOut))
 		}
 	}
 	if status == store.TaskDone {
@@ -1449,6 +1509,8 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	if status == store.TaskFailedRetry {
 		// §失败重排队：回队尾（updated_at 沉底），error 列留最后失败原因，冷却后重试。
 		// 状态落库交给 RequeueFailedTask 一步完成（避免中间态被 peek 到）。
+		// §M14：该步内 store 同步做同因连败计数，达阈值直接挂起不再回队——
+		// 回队落库后立即检测挂起态并告警留痕。
 		if err := db.RequeueFailedTask(tk.ID, errMsg); err != nil {
 			log.Printf("[scheduler] 任务 #%d 失败回队落库失败: %v", tk.ID, err)
 			_ = db.UpdateTaskRunState(tk.ID, store.TaskError, "", 0, "", errMsg)
@@ -1460,6 +1522,10 @@ func (s *Scheduler) runTask(db *store.DB, cfg config.SchedulerConfig, tk store.R
 	log.Printf("[scheduler] 任务 #%d(%s) -> %s%s", tk.ID, tk.Type, status, tailOf(errMsg))
 	opslog.Logf("research", "任务 #%d(%s) 终态=%s%s", tk.ID, tk.Type, status, tailOf(errMsg))
 	s.finishTask(db, cfg, &tk, status, errMsg)
+	if status == store.TaskFailedRetry {
+		// §M14 熔断挂起检测：置于链收尾之后——挂起时把展示态覆盖为 needs_attention 并高优告警一次。
+		s.notifySameCauseBreaker(db, &tk, errMsg)
+	}
 }
 
 // failRetryCooldown §失败重排队防自旋冷却窗：刚失败回队的任务在此窗口内不出队。
@@ -1481,6 +1547,54 @@ func (s *Scheduler) clearFailure(taskID int64) {
 	s.mu.Lock()
 	delete(s.failCool, taskID)
 	s.mu.Unlock()
+}
+
+// notifySameCauseBreaker §M14（2026-09-22）同因连败熔断挂起处理：每次失败回队落库后重读
+// 任务行，若 store 侧已按「同指纹连败达阈值」将其挂为 failed_needs_attention（不再回队），则：
+//   - opslog/日志双留痕（error 列本身含「同因连败熔断」标记，挂起可审计）；
+//   - 清除冷却表占位（挂起终态不会再被出队，留着只占内存）；
+//   - state 文件记 needs_attention（前端 /api/research/progress 可见）；
+//   - 经 SetAlertFunc 注入的推送通道高优告警一次——挂起是瞬时跃迁（queued→挂起只发生
+//     在触阈值那一次 RequeueFailedTask），天然去重，不会每轮重复告警。
+//
+// English: M14 — after each failed-requeue write, detect the same-cause breaker trip
+// (failed_needs_attention) and leave an audit trail + fire the one-shot ops alert.
+func (s *Scheduler) notifySameCauseBreaker(db *store.DB, tk *store.ResearchTask, errMsg string) {
+	cur, err := db.GetResearchTask(tk.ID)
+	if err != nil || cur == nil || cur.Status != store.TaskNeedsAttention {
+		return // 常态：任务已回队尾重试，无需熔断处理
+	}
+	log.Printf("[scheduler] §M14 任务 #%d(%s) 同因 %d 连败→熔断挂起（failed_needs_attention，不再重排队，待人工 Requeue）",
+		tk.ID, tk.Type, cur.FailStreak)
+	opslog.Logf("research", "§M14 任务 #%d(%s) 同因连败熔断挂起（%d 连败，高优告警已发）: %s",
+		tk.ID, tk.Type, cur.FailStreak, cur.Error)
+	s.clearFailure(tk.ID)
+	s.recordStepState(tk.Type, "needs_attention", cur.Error)
+	s.mu.Lock()
+	fn := s.alertFn
+	s.mu.Unlock()
+	if fn != nil {
+		fn("研究任务同因连败熔断", fmt.Sprintf("任务 #%d(%s) 连续 %d 次同因失败已挂起，不再重排队（原因：%s）。请排查后经 RequeueTask 人工复活。",
+			tk.ID, tk.Type, cur.FailStreak, tailOf(errMsg)))
+	}
+}
+
+// failReasonOf §M14 取子进程输出最后一行非空文本作为失败原因后缀（形如「：xxx」，
+// 按 rune 截 200 字符防超长堆栈洗指纹）。error 列是同因连败熔断的指纹来源，必须能
+// 区分「参数非法 / 数据必缺 / 网络瞬断」等可观察原因，而不是只剩 exit status。
+func failReasonOf(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		ln := strings.TrimSpace(lines[i])
+		if ln == "" {
+			continue
+		}
+		if r := []rune(ln); len(r) > 200 {
+			ln = string(r[:200])
+		}
+		return "：" + ln
+	}
+	return ""
 }
 
 // stackTrace 当前 goroutine 堆栈（panic 日志用）。
@@ -1532,13 +1646,18 @@ func (s *Scheduler) finishTask(db *store.DB, cfg config.SchedulerConfig, tk *sto
 }
 
 // recordStepState 把任务结果写入状态文件（前端 /api/research/progress 可见，排障用）。
+// §M14 测试缝：stepStateObserver 非 nil 时同步收到本次留痕（生产为 nil，零开销）。
 func (s *Scheduler) recordStepState(step, status, errMsg string) {
 	s.mu.Lock()
 	s.state.LastStep = step
 	s.state.LastStatus = status
 	s.state.LastError = errMsg
 	s.state.LastAt = time.Now().Format("2006-01-02 15:04:05")
+	obs := s.stepStateObserver
 	s.mu.Unlock()
+	if obs != nil {
+		obs(step, status, errMsg)
+	}
 	s.saveState()
 }
 

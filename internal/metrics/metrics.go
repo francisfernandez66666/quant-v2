@@ -18,6 +18,7 @@ var (
 	breakerTrips    atomic.Int64 // 熔断触发次数（状态变化时计一次）
 	llmDegrades     atomic.Int64 // LLM 降级事件次数（评分失败/解析失败占位等）
 	httpPanics      atomic.Int64 // panic 恢复次数（引擎/HTTP 顶层异常保护命中）
+	settleFailures  atomic.Int64 // §H1 交割单三方对账失败次数（旧实现只打一行日志，不可观测）
 )
 
 // countersVar expvar 发布用的可序列化快照。
@@ -33,7 +34,8 @@ func publish() {
 		`,"orders_cancelled":` + itoa(ordersCancelled.Load()) +
 		`,"breaker_trips":` + itoa(breakerTrips.Load()) +
 		`,"llm_degrades":` + itoa(llmDegrades.Load()) +
-		`,"panics_recovered":` + itoa(httpPanics.Load()) + `}`)
+		`,"panics_recovered":` + itoa(httpPanics.Load()) +
+		`,"settle_failures":` + itoa(settleFailures.Load()) + `}`)
 }
 
 // itoa 手写 int64→十进制字符串（无符号分支处理），避免为 6 个计数器引入 strconv 别名噪音。
@@ -77,3 +79,7 @@ func LLMDegraded() { llmDegrades.Add(1); publish() }
 
 // PanicRecovered 引擎/HTTP 顶层 panic 恢复 +1（观测未预期异常频率）。
 func PanicRecovered() { httpPanics.Add(1); publish() }
+
+// SettleFailed §H1（2026-09-22 修复批）三方对账失败 +1——自动调度路的对账失败旧实现只
+// log 一行即吞，网关 400/网络故障均不可观测；现计入指标面并同步 opslog。
+func SettleFailed() { settleFailures.Add(1); publish() }

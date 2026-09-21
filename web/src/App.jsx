@@ -135,6 +135,15 @@ export default function App() {
 
   const statusTimer = useRef(null) // 状态轮询定时器句柄
   const unsubSSE = useRef(null)     // SSE 取消订阅函数引用
+  // §H7（2026-09-22 修复批）auth:expired 闭包死亡：挂载 effect 只注册一次监听器，旧实现的
+  // onAuthExpired 直接捕获渲染态 loggedIn——首帧为 false 被永久冻结在闭包里，登录成功
+  // （checkAuth 异步置真 / handleLogin）之后 auth:expired 事件到达仍恒早退，
+  // 登出提示在部分路径永不出现在。改法：latest 值镜像进 ref，回调只读 ref。
+  // English: §H7 — mirror the latest render values into refs so the once-registered
+  // auth:expired listener never runs against the stale first-frame closure.
+  const loggedInRef = useRef(false)
+  // §H7：同样镜像最新 onAuthExpired 闭包（内含最新 logout/navigate），挂载 effect 经 ref 转发调用
+  const authExpiredHandler = useRef(null)
 
   // 根据当前用户权限刷新研究/管理入口可见性
   function applyRoleGates() {
@@ -311,10 +320,18 @@ export default function App() {
 
   // 全局认证过期事件回调：提示并安全退出
   function onAuthExpired() {
-    if (!loggedIn) return
+    // §H7：改读 ref 最新登录态——旧实现在此读渲染态 loggedIn（挂载闭包里恒为首帧 false），
+    // 登录成功后的 auth:expired 事件被错误早退，登出提示丢失。未登录时仍应静默跳过。
+    if (!loggedInRef.current) return
     MessagePlugin.error('登录已过期，请重新登录')
     logout()
   }
+
+  // §H7：每次渲染后把最新值/最新闭包镜像进 ref（无 deps，随每个 commit 执行）
+  useEffect(() => {
+    loggedInRef.current = loggedIn
+    authExpiredHandler.current = onAuthExpired
+  })
 
   // 启动状态轮询并订阅 SSE 推送
   function startPolling() {
@@ -335,9 +352,15 @@ export default function App() {
   useEffect(() => {
     checkAuth().then((ok) => { if (ok) startPolling() })
     api.fetchPaperState().then(d => setPaperEnabled(!!d.enabled)).catch(() => setPaperEnabled(false))
-    window.addEventListener('auth:expired', onAuthExpired)
+    // §H7：deps 保持 []（监听器只在挂载注册一次），但注册的是转发壳——
+    // 经 authExpiredHandler.current 取最新闭包执行，彻底绕开首帧陈旧闭包；
+    // 卸载时按同一壳引用注销。
+    const onExpired = () => {
+      if (authExpiredHandler.current) authExpiredHandler.current()
+    }
+    window.addEventListener('auth:expired', onExpired)
     return () => {
-      window.removeEventListener('auth:expired', onAuthExpired)
+      window.removeEventListener('auth:expired', onExpired)
       stopPolling()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

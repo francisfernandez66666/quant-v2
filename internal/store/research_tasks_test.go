@@ -3,6 +3,7 @@
 package store
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -184,14 +185,18 @@ func TestD1ScoresUpsertAndQuery(t *testing.T) {
 	}
 }
 
-// TestTaskRetryCap §P1-11 失败重试上限：连续失败达上限后任务转终态 error，不再重新入队。
-func TestTaskRetryCap(t *testing.T) {
+// TestTaskSameCauseBreaker §M14（2026-09-22）同因连败熔断（取代 §P1-11 异因混计上限）：
+//  1. 同一失败指纹连败达阈值 → failed_needs_attention 挂起终态，不再出队；
+//  2. 异因失败不误伤——指纹每次不同则连败恒为 1，队列语义不变；
+//  3. 人工 Requeue 复活 → 回到 queued 且连败计数清零（重新起算）。
+func TestTaskSameCauseBreaker(t *testing.T) {
 	db := testDB(t)
 	id, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	for i := 1; i <= researchTaskRetryCap; i++ {
+	// 1) 同因连败：前 N-1 次仍回队尾可重试，第 N 次挂起
+	for i := 1; i <= SameReasonFailLimit; i++ {
 		if err := db.RequeueFailedTask(id, "boom"); err != nil {
 			t.Fatalf("第 %d 次重入队: %v", i, err)
 		}
@@ -199,26 +204,66 @@ func TestTaskRetryCap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get: %v", err)
 		}
-		if i < researchTaskRetryCap {
+		if i < SameReasonFailLimit {
 			if tk.Status != TaskQueued {
 				t.Fatalf("第 %d 次应仍为 queued, 实际 %s", i, tk.Status)
 			}
-			// 失败任务仍可被出队重试
+			if tk.FailStreak != i {
+				t.Fatalf("第 %d 次 fail_streak 应为 %d, 实际 %d", i, i, tk.FailStreak)
+			}
 			next, _ := db.DequeueHighestTask()
 			if next == nil || next.ID != id {
 				t.Fatalf("第 %d 次失败任务应能出队重试", i)
 			}
 		} else {
-			if tk.Status != TaskError {
-				t.Fatalf("达上限应转 error, 实际 %s", tk.Status)
+			if tk.Status != TaskNeedsAttention {
+				t.Fatalf("同因 %d 连败应挂起 failed_needs_attention, 实际 %s", i, tk.Status)
 			}
-			if tk.RetryCount != researchTaskRetryCap {
-				t.Fatalf("retry_count 应为 %d, 实际 %d", researchTaskRetryCap, tk.RetryCount)
+			if !strings.Contains(tk.Error, "同因连败熔断") || !strings.Contains(tk.Error, "boom") {
+				t.Fatalf("挂起留痕应含熔断标记+原因, got %q", tk.Error)
 			}
 		}
 	}
-	// 终态 error 不再出队
+	// 挂起终态不再出队（同因失败任务的死亡证明）
 	if next, _ := db.DequeueHighestTask(); next != nil {
-		t.Fatalf("终态 error 不应出队, 取到 %v", next)
+		t.Fatalf("failed_needs_attention 不应出队, 取到 %+v", next)
+	}
+	// 3) 人工 Requeue 复活 + 计数清零
+	if err := db.RequeueTask(id); err != nil {
+		t.Fatalf("人工 Requeue: %v", err)
+	}
+	tk, _ := db.GetResearchTask(id)
+	if tk == nil || tk.Status != TaskQueued || tk.FailStreak != 0 {
+		t.Fatalf("复活后应 queued 且连败清零, got %+v", tk)
+	}
+	// 复活后再 1 次同因失败：连败从 1 重新计（不吃挂起前旧账）
+	if err := db.RequeueFailedTask(id, "boom"); err != nil {
+		t.Fatalf("复活后重入队: %v", err)
+	}
+	tk, _ = db.GetResearchTask(id)
+	if tk.FailStreak != 1 || tk.Status != TaskQueued {
+		t.Fatalf("复活后同因首败应 streak=1 且回队, got %+v", tk)
+	}
+	// 成功清零同因连败计数（2 连败后成功，再来同因 2 连败不应触熔断）
+	if err := db.UpdateTaskRunState(id, TaskDone, "100%", 0, "", ""); err != nil {
+		t.Fatalf("done: %v", err)
+	}
+	tk, _ = db.GetResearchTask(id)
+	if tk.FailStreak != 0 || tk.FailFP != "" {
+		t.Fatalf("成功后连败计数应清零, got %+v", tk)
+	}
+	// 2) 异因失败不误伤：每次指纹不同 → 恒为 1，远超阈值仍留队
+	id2, err := db.EnqueueResearchTask(&ResearchTask{Type: TaskDataload, Payload: `{}`})
+	if err != nil {
+		t.Fatalf("enqueue2: %v", err)
+	}
+	for i := 1; i <= SameReasonFailLimit*2; i++ {
+		if err := db.RequeueFailedTask(id2, "boom-异因-"+itoa(i)); err != nil {
+			t.Fatalf("异因第 %d 次: %v", i, err)
+		}
+	}
+	tk2, _ := db.GetResearchTask(id2)
+	if tk2 == nil || tk2.Status != TaskQueued || tk2.FailStreak != 1 {
+		t.Fatalf("异因循环 %d 次不应熔断且计数恒 1, got %+v", SameReasonFailLimit*2, tk2)
 	}
 }

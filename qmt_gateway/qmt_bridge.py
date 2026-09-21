@@ -46,6 +46,16 @@ def _now_bj():
     return datetime.utcnow() + timedelta(hours=8)
 
 
+def _now_cn_str(fmt="%Y-%m-%dT%H:%M:%S+08:00"):
+    """§TZ 统一口径：桥端全部落库/上报时间串经此产出（显式北京时区取值 + 格式化）。
+
+    与 store._now_cn()/qmt_bridge_strategy._now_cn_str() 同风格——桥是独立进程
+    （沙箱内不便 import store），保留本地实现，但取值恒为北京墙钟（_now_bj），
+    +08:00 标签与钟面恒一致；tests/test_time_formats.py 静态锁 + golden 双防线。
+    """
+    return _now_bj().strftime(fmt)
+
+
 def is_trading_window(now=None):
     """与网关/引擎对齐的活跃窗口：工作日 9:15~15:00（简化为工作日即交易日，非交易时段
     抑制不影响正确性）。桥在该窗口外也可心跳保活（客户端被 qmtctl 杀掉前）。"""
@@ -206,7 +216,7 @@ class XtAdapter:
             out.append({
                 "ts_code": ts_code, "name": name, "qty": volume,
                 "cost_price": cost, "amount": mv, "highest_price": cost,
-                "updated_at": _now_bj().strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "updated_at": _now_cn_str(),  # §TZ
             })
         return out
 
@@ -254,7 +264,7 @@ class XtAdapter:
                 "price": float(self._field(item, "traded_price", "m_dTradedPrice") or 0),
                 "qty": int(self._field(item, "traded_volume", "m_nTradedVolume") or 0),
                 "amount": float(self._field(item, "traded_amount", "m_dTradedAmount") or 0),
-                "traded_at": _now_bj().strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "traded_at": _now_cn_str(),  # §TZ
             })
         return out
 
@@ -352,7 +362,7 @@ class Bridge:
         now = now or time.time()
         # 1) 心跳（驱动网关 QueuedBroker.is_connected）
         if now - self._last_hb >= self.heartbeat_sec:
-            self._post("/dispatch/result", {"type": "heartbeat", "ts": _now_bj().strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+            self._post("/dispatch/result", {"type": "heartbeat", "ts": _now_cn_str()})  # §TZ
             self._last_hb = now
         # 2) 持仓/资产快照（周期性；网关 /state 与对账数据源）
         if now - self._last_pos >= self.positions_sec:
@@ -378,7 +388,14 @@ class Bridge:
             log.exception("[bridge] asset snapshot failed")
 
     def _process_pending(self):
-        """取派发队列并逐个执行订单/撤单，回报结果。"""
+        """取派发队列并逐个执行订单/撤单，回报结果。
+
+        §M16：每个取走的 seq 必须回执——此前 diag kind 不识别、unknown kind 只 warn 不回执，
+        派发行永久卡 inflight（网关侧再无结算路径）。现对齐生产策略桥（qmt_bridge_strategy
+        handle_cmd）语义：diag 走诊断快照上报，unknown 回负 order_result 让网关判废结算。
+        English: §M16 — every claimed seq must be acked; diag dumps a snapshot and unknown
+        kinds get a negative order_result so the gateway settles instead of hanging inflight.
+        """
         status, body = self._get("/dispatch/pending")
         if status != 200 or not body or not body.get("ok"):
             return
@@ -390,8 +407,13 @@ class Bridge:
                     self._execute_order(item)
                 elif kind == "cancel":
                     self._execute_cancel(item)
+                elif kind == "diag":
+                    self._execute_diag(item)
                 else:
-                    log.warning("[bridge] unknown dispatch kind=%s seq=%s", kind, seq)
+                    # §M16 负回执：未知 kind 也必须结算（与策略桥 unknown-kind 同语义）
+                    log.warning("[bridge] unknown dispatch kind=%s seq=%s (negative-ack)", kind, seq)
+                    self._post("/dispatch/result", {"type": "order_result", "seq": seq,
+                                                    "ok": False, "err": "unknown kind: %s" % kind})
             except Exception:  # noqa: BLE001
                 log.exception("[bridge] execute %s seq=%s failed", kind, seq)
                 self._post("/dispatch/result", {"type": "order_result", "seq": seq,
@@ -426,6 +448,29 @@ class Bridge:
         else:
             log.warning("[bridge] cancel failed seq=%s order_id=%s: %s", seq, exchange_id, err)
         self._post("/dispatch/result", {"type": "cancel_result", "seq": seq, "ok": ok, "err": err})
+
+    def _execute_diag(self, item):
+        """§M16 运维诊断：HTTP 桥环境无策略桥的 _gtdd 原始表 dump，降级为
+        三个查询接口的结构化快照（positions/asset/trades + dry_run 标记）上报。
+        无论查询成败都必须回 type=diag 回执，让网关结算该派发行（不永挂 inflight）。
+        English: §M16 diag handler — dumps adapter snapshots and always acks so the row settles.
+        """
+        seq = str(item.get("seq", "") or "")
+        dump = {"dry_run": self.dry_run}
+        try:
+            dump["positions"] = self.adapter.query_positions()
+        except Exception as e:  # noqa: BLE001 — 单项查询失败只记错误，不影响回执结算
+            dump["positions"] = {"err": repr(e)}
+        try:
+            dump["asset"] = self.adapter.query_asset()
+        except Exception as e:  # noqa: BLE001
+            dump["asset"] = {"err": repr(e)}
+        try:
+            dump["trades"] = self.adapter.query_trades()
+        except Exception as e:  # noqa: BLE001
+            dump["trades"] = {"err": repr(e)}
+        log.info("[bridge] diag done seq=%s", seq)
+        self._post("/dispatch/result", {"type": "diag", "seq": seq, "dump": dump})
 
     def _report_new_trades(self):
         """回补成交：query_stock_trades 里未上报的（trade_id 去重）→ type=trade。"""

@@ -20,6 +20,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.webkit.WebViewAssetLoader
 import cn.jpush.android.api.JPushInterface
+import org.json.JSONObject
 
 /**
  * 移动端薄壳：加载内嵌前端 assets/（web/dist 构建产物），API/SSE 指向云服务器。
@@ -47,12 +48,26 @@ class MainActivity : AppCompatActivity() {
         const val JPUSH_ALIAS_SEQ = 1
     }
 
+    /**
+     * §M12（2026-09-22 修复批）注入 JS 字符串的完整转义。
+     * 旧实现只对单引号做「反斜杠+单引号」替换（单引号伪转义）——值里若含反斜杠、换行、双引号或
+     * U+2028/U+2029 等即可撕裂字符串字面量，向 evaluateJavascript 注入任意 JS（服务器地址来自
+     * SharedPreferences/用户输入，非纯可信源）。现统一走 org.json.JSONObject.quote：
+     * 输出自带双引号的完整 JSON 字符串字面量（转义 `"`、`\`、控制字符），JSON 转义集是 JS 的
+     * 子集，可直接作为表达式拼进注入脚本。
+     */
+    private fun jsQuote(raw: String): String = JSONObject.quote(raw)
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+        // §M12（2026-09-22 修复批）：旧版 release 也恒开 WebView 远程调试——设备一旦被物理接触，
+        // chrome://devtools / adb 即可挂载 WebView，直接翻读 localStorage 里的登录 token 与全部
+        // 会话数据（凭据暴露面）。现在仅 debug 构建开启（BuildConfig.DEBUG 由 AGP buildConfig=true
+        // 生成，见 app/build.gradle.kts）；release 进程默认即为关，无需显式调用。
+        if (BuildConfig.DEBUG) {
             android.webkit.WebView.setWebContentsDebuggingEnabled(true)
         }
 
@@ -68,7 +83,14 @@ class MainActivity : AppCompatActivity() {
             .build()
 
         webView.settings.javaScriptEnabled = true
-        webView.settings.domStorageEnabled = true          // localStorage 持久化
+        // §M12c 残余风险（本次不迁移机制，交 owner 裁决）：登录 token 由前端存在 WebView
+        // localStorage（domStorage 落设备加密存储）。风险面：① root/越狱设备或 adb backup 场景可
+        // 直接读库取 token；② 任何注入进该 Origin 的 JS 都能 getItem 拿票。本次已收掉两个放大器：
+        // release 远程调试改 BuildConfig.DEBUG 门控（见 onCreate 上方 §M12 注释）、注入字符串走
+        // jsQuote 完整转义。根治方向（未排期）：token 迁入原生层（EncryptedSharedPreferences）由
+        // JS 桥取用，或后端下发 HttpOnly Cookie 供 /api 携带——涉及前端鉴权链路与发版节奏，
+        // 需 owner 决策后单独立项，此处注释即风险台账（AUDIT M12 / FIX_PLAN §3 M12 行）。
+        webView.settings.domStorageEnabled = true          // localStorage 持久化（token 风险面见上）
         webView.settings.databaseEnabled = true
         webView.settings.allowFileAccess = false
         webView.settings.loadsImagesAutomatically = true
@@ -100,10 +122,11 @@ class MainActivity : AppCompatActivity() {
                 val nativeUrl = prefs.getString("server_url", "") ?: ""
                 val seed = if (nativeUrl.isNotEmpty()) nativeUrl else DEFAULT_SERVER_URL
                 if (seed.isNotEmpty()) {
+                    // §M12：seed 含 SharedPreferences 持久化值，不可信源一律走 jsQuote 完整转义
                     view.evaluateJavascript(
                         "(function(){var v=localStorage.getItem('liangzai_server_url');" +
                         "if(!v||!/^https?:\\/\\//i.test(v)){" +
-                        "localStorage.setItem('liangzai_server_url','" + seed.replace("'", "\\'") + "');}})();",
+                        "localStorage.setItem('liangzai_server_url'," + jsQuote(seed) + ");}})();",
                         null
                     )
                 }
@@ -163,8 +186,10 @@ class MainActivity : AppCompatActivity() {
                 if (!java.util.regex.Pattern.matches(pattern, value)) return false
                 getSharedPreferences("quant_prefs", MODE_PRIVATE)
                     .edit().putString("server_url", value).apply()
+                // §M12：value 已通过 https 正则门（debug 构建放宽到 http），但正则只约束前缀，
+                // 仍不可依赖其内容安全——注入 JS 一律走 jsQuote 完整转义，不再手工 replace 单引号。
                 webView.evaluateJavascript(
-                    "localStorage.setItem('liangzai_server_url','" + value.replace("'", "\\'") + "');",
+                    "localStorage.setItem('liangzai_server_url'," + jsQuote(value) + ");",
                     null
                 )
                 return true

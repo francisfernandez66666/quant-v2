@@ -9,11 +9,15 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"quant-trading-v2/internal/opslog"
 )
 
 // RealPosition 实盘持仓行。
@@ -76,10 +80,44 @@ type RealFill struct {
 	Serial   string  `json:"serial,omitempty"`    // §WS-B 券商交割流水号（三方对账关联键）
 }
 
+// realTsCodeRe §F2（2026-09-22 修复批）：持仓对账行 ts_code 的合法格式——
+// 6位数字 + .SH/.SZ/.BJ 交易所后缀（与 data.ExchangeSuffix 产出口径一致）。
+// English: §F2 — the only accepted ts_code shape on reconcile rows: 6 digits + .SH/.SZ/.BJ.
+var realTsCodeRe = regexp.MustCompile(`^[0-9]{6}\.(SH|SZ|BJ)$`)
+
+// ErrInvalidPositionReport §F2：对账快照字段级校验失败的哨兵错误——任一行 ts_code 为空或
+// 非法格式即整批拒收（不落库），上层（handleQMTReport）据 errors.Is 映射为 HTTP 400。
+// 锤实背景（FIX_PLAN §6.2）：一行 ts_code=” 的垃圾行会永久误触发「本地有仓+空快照 409
+// 守卫」，真实全平再也无法经对账通道落账；且主键 (ts_code,user_id) 下的空串行本身就是脏数据。
+// English: §F2 sentinel — any invalid ts_code rejects the whole snapshot before any write;
+// the HTTP layer maps it to 400 via errors.Is.
+var ErrInvalidPositionReport = errors.New("positions 快照字段校验失败")
+
+// validateRealPositions §F2：全量对账入口校验。空快照（len==0，合法全平语义）直接放行；
+// 任一行 ts_code 空或非法格式 → 返回包装了 ErrInvalidPositionReport 的错误（含行号与原值），
+// 调用方必须整批拒收并 opslog 留痕，绝不部分落库。
+// English: §F2 entry validation for full reconciliation snapshots; empty = legit flat passes,
+// any malformed ts_code rejects the entire batch with row context.
+func validateRealPositions(pos []RealPosition) error {
+	for i := range pos {
+		if !realTsCodeRe.MatchString(pos[i].TsCode) {
+			return fmt.Errorf("%w: 第 %d 行 ts_code=%q 为空或非法格式（应为 6位数字+.SH/.SZ/.BJ）",
+				ErrInvalidPositionReport, i, pos[i].TsCode)
+		}
+	}
+	return nil
+}
+
 // UpsertRealPositions 全量对账写入：以网关推送的持仓集合为准，逐条 upsert 并移除已不在集合内的旧持仓。
 // 返回替换后的持仓数量。English: full-reconciliation write — upserts every gateway position and drops
 // rows absent from the push; returns the resulting position count.
 func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
+	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 非法即整批拒收不落库。
+	if err := validateRealPositions(pos); err != nil {
+		log.Printf("[store] §F2 持仓对账整批拒收: %v", err)
+		opslog.Logf("quant", "持仓对账整批拒收(§F2 字段校验)：%v", err)
+		return 0, err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
@@ -100,7 +138,12 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
-				amount=excluded.amount, strategy=excluded.strategy, updated_at=excluded.updated_at,
+				amount=excluded.amount,
+				-- §M5（2026-09-22 修复批）：strategy 仅在快照携带非空值时覆盖——券商快照不带
+				-- 战法归因，旧实现 excluded.strategy('') 直插会把本地战法标记洗成空串。
+				-- 对照同语句 highest_price 的 CASE 保护，同函数保护口径现已补齐。
+				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
+				updated_at=excluded.updated_at,
 				user_id=excluded.user_id,
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
@@ -193,6 +236,13 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 // deletes only this account's rows plus legacy global rows; never touches other accounts' rows.
 // An empty pos means "gateway flat" — the caller must have verified the channel is connected.
 func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, error) {
+	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 非法即整批拒收不落库，
+	// 上层据 ErrInvalidPositionReport 回 400（网关 outbox 按 4xx 永久拒绝进死信，不无限重推）。
+	if err := validateRealPositions(pos); err != nil {
+		log.Printf("[store] §F2 持仓对账整批拒收(用户=%s): %v", userID, err)
+		opslog.Logf("quant", "持仓对账整批拒收(§F2 字段校验) 用户=%s：%v", userID, err)
+		return 0, err
+	}
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
@@ -217,7 +267,13 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
-				amount=excluded.amount, strategy=excluded.strategy, signal_id=excluded.signal_id,
+				amount=excluded.amount,
+				-- §M5（2026-09-22 修复批）：strategy/signal_id 是本地战法归因链（复盘/审计/补卖
+				-- 定位都靠它），券商对账快照恒不带这两字段——旧实现 excluded.* 直插等于每次对账
+				-- 把归因洗成空串。仅当来源非空才覆盖（COALESCE(NULLIF(新,''),旧)），
+				-- 与同语句 highest_price 的 CASE 保护同口径。
+				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
+				signal_id=COALESCE(NULLIF(excluded.signal_id,''), real_positions.signal_id),
 				updated_at=excluded.updated_at, user_id=excluded.user_id,
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
@@ -370,10 +426,20 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			// 导致实盘持仓页个股名称为空）。
 			// §WS-A T+1：建仓记录买入交易日 buy_date（北京时，T+1 可卖量判定用）。
 			buyDate := buyDateOf(f.TradedAt)
+			// §F1（2026-09-22 修复批）：佣金摊入持仓成本（每股 =(成交额+fee)/量），
+			// 与 paper 口径 `p.Cost += cost + fee`（paper.go:1480）对齐——旧实现成本只含
+			// 成交均价，费用腿被凭空抹掉，实盘账面系统性偏乐观、settlement_diff.fee_diff
+			// 永不收敛。印花税为卖出环节税费，不摊买入成本。
+			buyCostPerShare := f.Price
+			amountWithFee := f.Price * float64(f.Qty)
+			if f.Qty > 0 {
+				amountWithFee = f.Price*float64(f.Qty) + f.Fee
+				buyCostPerShare = amountWithFee / float64(f.Qty)
+			}
 			_, err = tx.Exec(`INSERT INTO real_positions
 				(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id, buy_date)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				f.Code, f.Name, f.Qty, f.Price, f.Price*float64(f.Qty), f.Price, "", f.SignalID,
+				f.Code, f.Name, f.Qty, buyCostPerShare, amountWithFee, f.Price, "", f.SignalID,
 				time.Now().Format("2006-01-02 15:04:05"), f.UserID, buyDate)
 		}
 	case err == nil:
@@ -387,7 +453,9 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 			newQty := p.Qty + f.Qty
 			var newCost float64
 			if newQty > 0 {
-				newCost = (p.Amount + f.Price*float64(f.Qty)) / float64(newQty)
+				// §F1：加仓加权平均同样把佣金摊入本笔成本（p.Amount 本身已是含费累计账，
+				// 首仓/历史加仓都按含费口径滚动），与 paper `p.Cost += cost + fee` 同式。
+				newCost = (p.Amount + f.Price*float64(f.Qty) + f.Fee) / float64(newQty)
 			}
 			hi := p.HighestPrice
 			if f.Price > hi {
@@ -494,13 +562,21 @@ func (d *DB) BuyableQtyForUserSell(userID, tsCode, day string) int {
 //   - 发送失败/已撤/已成/废单：不计。
 //
 // 用途：券商口径不可信（过期/缺失）时，用本地账本显式计冻结，防并发信号超买。
-// English: §WS-M local frozen-in-transit — today's 已报/部成 buy orders' unfilled amount, used as a
-// local-freeze proxy when the broker cash snapshot is stale/missing (never double-counts vs broker).
-func (d *DB) LocalBuyFrozen(userID, day string) float64 {
+// §C1（2026-09-22 修复批）：day 参数（北京日 2006-01-02）此前声明而未使用——历史停在
+// 已报/部成 的买单会跨日永久占用当日冻结额，静默锁死买入预算（调用方 gate.go 一直按
+// 「撤单即消失」的当日语义使用）。现按 substr(created_at,1,10)=day 过滤（RFC3339 与
+// "2006-01-02 15:04:05" 两种存量格式前 10 位均为北京日，一并覆盖）；created_at 为空的
+// 行不计入冻结（与旧口径差异仅限异常行）。查询错误改为上抛而非吞成 0——旧 fail-open
+// 会让 DB 故障期间的冻结直接归零放水。
+// English: §C1 — the day argument is now enforced (Beijing-date prefix match on created_at) so
+// cross-day stale 已报/部成 buys no longer freeze the daily budget forever; query errors surface
+// to the caller (fail-closed) instead of silently returning 0.
+func (d *DB) LocalBuyFrozen(userID, day string) (float64, error) {
 	rows, err := d.db.Query(`SELECT signal_id, status, price, qty FROM orders
-		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')`, userID)
+		WHERE user_id=? AND side='买入' AND (status='已报' OR status='部成')
+		AND substr(created_at,1,10)=?`, userID, day)
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	defer rows.Close()
 	frozen := 0.0
@@ -518,7 +594,33 @@ func (d *DB) LocalBuyFrozen(userID, day string) float64 {
 		}
 		frozen += price * float64(remain)
 	}
-	return frozen
+	// 游标迭代错误同样上抛（旧实现静默丢弃半截结果当全额有效）。
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return frozen, nil
+}
+
+// SweepStaleBuyOrders §C1b（2026-09-22 修复批）跨日陈旧买单无条件降级：
+// created_at 早于 beforeDay（北京日，不含）且仍停在 已报/部成 的买单一律置为 废单终态留痕。
+// A 股委托当日收盘即失效，跨日挂单永不可能是活单；旧行为下这些行的解冻完全依赖
+// SweepOrders 的网关撤单路（!Enabled/Tripped/cancel_stale_sec=-1 时整体跳过），
+// 网关崩溃/断连留下的 已报 行会长期以僵尸单形态滞留委托簿。本方法是纯本地账操作，
+// 不触网关、不受熔断管辖，作为 C1 日期过滤之外的终态兜底。
+// English: §C1b — unconditional local demotion of cross-day 已报/部成 buys to terminal 废单;
+// A-share orders die at close, and this path must not depend on gateway reachability.
+func (d *DB) SweepStaleBuyOrders(userID, beforeDay string) (int64, error) {
+	if beforeDay == "" {
+		return 0, nil
+	}
+	res, err := d.db.Exec(`UPDATE orders SET status='废单'
+		WHERE user_id=? AND side='买入' AND status IN ('已报','部成')
+		AND substr(created_at,1,10) <> '' AND substr(created_at,1,10) < ?`,
+		userID, beforeDay)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // UpsertRealOrder 写入/更新委托单；signal_id 冲突时返回已存在（幂等，不重复下单）。
@@ -959,9 +1061,13 @@ func (d *DB) UpdateRealOrderStatusMonotonic(userID, orderID, status string) (boo
 }
 
 // RealFills 返回全部实盘成交回报（倒序）。
-// （RealFills returns all live fills, newest first.）
+// §F1（2026-09-22 修复批）：SELECT 补齐 user_id/fee/stamp_tax 三列——此前读出恒为
+// 零值，导致 ① /api/qmt/trades 的账号归属过滤形同虚设（f.UserID 恒空按遗留全局放行），
+// ② 盈亏重放拿不到费用腿。COALESCE 兜底 ALTER 前的历史 NULL。
+// （RealFills returns all live fills, newest first; now carrying fee/stamp_tax/user legs.）
 func (d *DB) RealFills() ([]RealFill, error) {
-	rows, err := d.db.Query(`SELECT id, order_id, code, side, price, qty, amount, traded_at, signal_id
+	rows, err := d.db.Query(`SELECT id, order_id, code, side, price, qty, amount, traded_at, signal_id,
+		COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0)
 		FROM fills ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -970,7 +1076,8 @@ func (d *DB) RealFills() ([]RealFill, error) {
 	var out []RealFill
 	for rows.Next() {
 		var f RealFill
-		if err := rows.Scan(&f.ID, &f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount, &f.TradedAt, &f.SignalID); err != nil {
+		if err := rows.Scan(&f.ID, &f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount, &f.TradedAt, &f.SignalID,
+			&f.UserID, &f.Fee, &f.StampTax); err != nil {
 			return nil, err
 		}
 		out = append(out, f)

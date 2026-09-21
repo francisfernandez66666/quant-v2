@@ -19,6 +19,10 @@ import logging
 import threading
 import time
 
+# §TZ（2026-09-22 修复批）：通道产出的时间串统一走 store._now_cn()（显式北京时区），
+# 不再裸 strftime 把本地钟面贴假 +08:00。
+from store import _now_cn  # noqa: E402
+
 # 模块级日志器：各 broker 统一记录连接/断线/回调异常
 log = logging.getLogger("qmt_gateway.broker")
 
@@ -376,14 +380,20 @@ class XtBroker(Broker):
         out = []
         for p in poss or []:
             # 将 xtquant 持仓对象字段映射为网关统一持仓字典
+            # §M5（2026-09-22 修复批）字段对齐：补齐 can_use_qty（T+1 可卖量）与 open_price，
+            # 与策略桥 qmt_bridge_strategy.query_positions/embed_positions 的字段集完全一致。
+            # 此前 xt 直连通道丢 can_use_qty——同一账户走不同通道回报的字段集不同，
+            # T+1 可卖量在直连通道不可见（tests/test_channel_position_fields.py 锁死 diff 为空）。
             out.append({
                 "ts_code": getattr(p, "stock_code", ""),
                 "name": getattr(p, "stock_name", ""),
                 "qty": int(getattr(p, "volume", 0) or 0),
+                "can_use_qty": int(getattr(p, "can_use_volume", 0) or getattr(p, "available_volume", 0) or 0),
+                "open_price": float(getattr(p, "open_price", 0) or 0),
                 "cost_price": float(getattr(p, "open_price", 0) or 0),
                 "amount": float(getattr(p, "market_value", 0) or 0),
                 "highest_price": float(getattr(p, "open_price", 0) or 0),
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "updated_at": _now_cn(),  # §TZ
             })
         return out
 
@@ -503,7 +513,7 @@ class MockBroker(Broker):
                 o["status"] = "已成"
                 self._apply_fill_locked(order, req.get("price", 0.0))
                 filled_snapshot = dict(o)
-            ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+            ts = _now_cn()  # §TZ
             if self.handler:
                 self.handler.on_order({
                     "order_id": order_id, "signal_id": order.get("signal_id", ""),

@@ -220,3 +220,48 @@ func TestCancelPathMonotonic(t *testing.T) {
 		}
 	}
 }
+
+// TestSweepOrdersStaleBuyUnconditional §C1b：跨日陈旧买单无条件降级——
+// Enabled=false / 熔断 / cancel_stale_sec=-1 等网关撤单主循环早退路径下也必须兜住
+// （纯本地账，不依赖网关可达）；当日买单与前日卖单不动。
+// English: §C1b regression — cross-day stale buys are demoted even when the gateway
+// cancel-loop early-returns (disabled/breaker/throttle-off).
+func TestSweepOrdersStaleBuyUnconditional(t *testing.T) {
+	db := testDB(t)
+	cfg := config.DefaultQMTConfig()
+	cfg.Enabled = false // 主循环整体早退：本例恰好验证 C1b 本地清扫不受早退影响
+	ctrl := NewController(guardServer(), db, "u_c1b", cfg, nil)
+
+	// 播种按北京时区取日期前缀，与 beforeDay 的 cntime 口径一致——
+	// CI(UTC) 机器在 16:00~24:00 窗口自然日与北京日不同，用裸 time.Now 会误伤当日单。
+	now := time.Now()
+	prevDay := cntime.In(now).AddDate(0, 0, -1).Format(time.RFC3339)
+	sameDay := cntime.In(now).Format(time.RFC3339)
+	seed := []store.RealOrder{
+		{OrderID: "GW-C1B-1", SignalID: "SIG-C1B-STALE-BUY", Code: "600000.SH", Side: SideBuy, Status: "已报", Price: 10, Qty: 100, CreatedAt: prevDay, UserID: "u_c1b"},
+		{OrderID: "GW-C1B-2", SignalID: "SIG-C1B-TODAY", Code: "600000.SH", Side: SideBuy, Status: "已报", Price: 10, Qty: 100, CreatedAt: sameDay, UserID: "u_c1b"},
+		{OrderID: "GW-C1B-3", SignalID: "SIG-C1B-STALE-SELL", Code: "600000.SH", Side: SideSell, Status: "已报", Price: 10, Qty: 100, CreatedAt: prevDay, UserID: "u_c1b"},
+	}
+	for _, o := range seed {
+		if _, err := db.UpsertRealOrder(o); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if res := ctrl.SweepOrders(now); res != nil {
+		t.Fatalf("Enabled=false 时网关撤单主循环应早退(nil)，C1b 本地清扫不改变返回值, got %+v", res)
+	}
+	got := map[string]string{}
+	orders, _ := db.RealOrdersForUser("u_c1b")
+	for _, o := range orders {
+		got[o.SignalID] = o.Status
+	}
+	if got["SIG-C1B-STALE-BUY"] != "废单" {
+		t.Fatalf("前日已报买单应无条件降级废单, got %s", got["SIG-C1B-STALE-BUY"])
+	}
+	if got["SIG-C1B-TODAY"] != "已报" {
+		t.Fatalf("当日买单不应被清扫, got %s", got["SIG-C1B-TODAY"])
+	}
+	if got["SIG-C1B-STALE-SELL"] != "已报" {
+		t.Fatalf("跨日清扫仅限买侧（卖侧保留可退出语义），前日卖单不应被扫, got %s", got["SIG-C1B-STALE-SELL"])
+	}
+}

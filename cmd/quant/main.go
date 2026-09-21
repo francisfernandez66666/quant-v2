@@ -1026,7 +1026,8 @@ func checkDataCoverageOnce(db *store.DB, n *notify.Notifier) {
 	log.Printf("[coverage] ⚠ %s", content)
 	if n != nil {
 		msg := notify.Message{Level: notify.LevelHigh, Title: "行情数据断供", Content: content}
+		// §M8（2026-09-22 修复批）：Push 已内聚 WS/Webhook/手机网关三路（高级别必过网关门槛），
+		// 不再额外直调 PushGateway（双发去重设计见 internal/notify/notify.go Push 注释）。
 		n.Push(msg)
-		n.PushGateway(msg)
 	}
 }

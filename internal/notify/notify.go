@@ -57,6 +57,12 @@ type Notifier struct {
 	quietEnd   int // 静默结束分钟数（<0=未启用）
 
 	outbox *Outbox // §GAP5.2 失败补投队列
+
+	// §M8（2026-09-22）Push 内聚三路：网关（gateway+ntfy）扇出的最低级别门槛。
+	// 默认 LevelMedium——普通信号（P3 中级别）与交易提醒自此触达手机；
+	// LevelLow 的命中提醒默认不打扰手机端，可经 SetGatewayMinLevel 调整。
+	// English: minimum alert level for the push-gateway fan-out folded into Push (M8).
+	gatewayMinLevel AlertLevel
 }
 
 // New 创建推送器实例。（Creates a Notifier instance.）
@@ -66,6 +72,9 @@ func New() *Notifier {
 		quietStart: -1,
 		quietEnd:   -1,
 		outbox:     &Outbox{},
+		// §M8 默认中级别（含）以上触达手机网关：普通信号（P3→中）与交易提醒（高）均达，
+		// 低级别命中提醒不轰炸手机端。
+		gatewayMinLevel: LevelMedium,
 	}
 	n.outbox.bindOwner(n) // §R3-8 P1-D：持久化条目重启后重建投递函数用
 	return n
@@ -118,19 +127,31 @@ func (n *Notifier) inQuietHours(now time.Time) bool {
 	return cur >= s || cur < e // 跨午夜（如 22:00~08:00）
 }
 
-// Push 向所有 WS 客户端和 Webhook 地址推送消息（非阻塞）。
+// Push 三路内聚推送：WS 客户端 + Webhook + 手机推送网关（§M8）。
 // §GAP5.2 静默时段内仅 LevelHigh 放行（交易信号/清仓/止损），低中级别留痕跳过；
-// WS 客户端通道已满时直接丢弃该消息（防止慢消费者阻塞推送方）；Webhook 为异步 goroutine 发送，
+// WS 客户端通道已满时直接丢弃该消息（防止慢消费者阻塞推送）；Webhook 为异步 goroutine 发送，
 // 失败进 outbox 补投队列。
-// （Push delivers a message to all WS clients and Webhook URLs non-blockingly; quiet hours pass only
-// LevelHigh; drops when a WS channel is full and sends to each Webhook async — failures land in the outbox.）
+// §M8（2026-09-22 修复）：此前 Push 只走 WS/Webhook 两路，PushGateway 全生产仅 2 个直调点，
+// 普通信号/成交消息（PushSignal/PushTrade/registry 熔断告警等经 Push 的消息）不触达手机。
+// 现于 Push 内聚第三路网关扇出：级别 ≥ gatewayMinLevel（默认中级别，SetGatewayMinLevel 可调）
+// 且已配置 gateway/ntfy 时投递（nil 门控自然落空，WS/Webhook 不受网关配置影响）。
+// ——去重设计（显式声明）：扇出内聚后，调用方**不得**在 Push 之后再直调 PushGateway，
+// 否则同一条消息双发。生产原 2 个直调点已按此收敛为仅 Push：
+//   - internal/engine/engine.go pushCriticalAlerts（清仓/止损/交易强提醒）
+//   - cmd/quant/main.go 行情覆盖断言告警
+//
+// cmd/researchd 的 SetAlertFunc 不经 Push（只走网关），语义独立、无需去重。
+// PushGateway 方法保留给「不走 WS/Webhook 的纯网关提醒」使用。
+// （Push now fans out to three channels: WS clients, Webhooks and — since M8 — the mobile push
+// gateway, level-gated. Callers must not additionally invoke PushGateway for a message already
+// handed to Push; the two former production double-call sites were collapsed into Push only.）
 func (n *Notifier) Push(msg Message) {
 	if msg.Level < LevelHigh && n.inQuietHours(time.Now()) {
 		log.Printf("[notify] 静默时段抑制 level=%d title=%q", msg.Level, msg.Title)
 		return
 	}
 	n.mu.RLock()
-	defer n.mu.RUnlock()
+	gwMin := n.gatewayMinLevel
 
 	for id, ch := range n.wsClients {
 		select {
@@ -149,6 +170,22 @@ func (n *Notifier) Push(msg Message) {
 			}
 		}(url)
 	}
+	n.mu.RUnlock()
+
+	// §M8 第三路：手机推送网关扇出。必须在释放 RLock 之后调用——PushGateway 内部
+	// 会再次 RLock 读取 gateway/ntfy，Go 的 RWMutex 在持有读锁时重入取读锁、期间有
+	// 写者排队即死锁。级别门槛按 gwMin（锁内快照）判定；补投/失败语义由 PushGateway 自理。
+	if msg.Level >= gwMin {
+		n.PushGateway(msg)
+	}
+}
+
+// SetGatewayMinLevel §M8 设置 Push 网关扇出的最低告警级别（LevelLow=全部触达手机，
+// LevelHigh=只有关键提醒触达）。English: sets the minimum level for M8's folded gateway fan-out.
+func (n *Notifier) SetGatewayMinLevel(lvl AlertLevel) {
+	n.mu.Lock()
+	n.gatewayMinLevel = lvl
+	n.mu.Unlock()
 }
 
 // deliverWebhook 返回指定 URL 的投递函数（首次发送与 outbox 补投共用同一实现）。
@@ -158,6 +195,8 @@ func deliverWebhook(n *Notifier, url string) func(string, Message) error {
 
 // PushSignal 根据信号优先级自动选择告警级别并推送。
 // 级别映射：P1/P2→高（弹桌面通知），P4→低，其余→中。
+// §M8：经 Push 内聚三路，P1/P2/P3 信号（级别≥网关门槛默认中级）自此同步触达手机推送网关；
+// P4 低级别仅 WS/Webhook，不轰炸手机端。
 // （PushSignal maps a signal's priority to an alert level (P1/P2→high with desktop popup, P4→low, else medium) and pushes.）
 func (n *Notifier) PushSignal(sig *strategy.Signal) {
 	level := LevelMedium

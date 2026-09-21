@@ -297,6 +297,64 @@ func TestSellConfirmedReplay(t *testing.T) {
 	}
 }
 
+// TestSellDeepBreachUpgradesTakeProfit §C2 反例锁①（2026-09-22 修复批）：止盈锁线期间
+// 砸穿 −12% 必须无条件升级深破全清——旧实现升级判定只认 StopLoss，止盈线下深破落到
+// bullLive 延持，边界④被架空（FIX#12 事故形态）。
+// English: §C2 lock① — deep breach upgrades ANY locked line (take-profit shown here).
+func TestSellDeepBreachUpgradesTakeProfit(t *testing.T) {
+	c := New()
+	judge(c, "600031", sellIn("600031", 11.6), st(10, 0)) // +16% 无做多 → 首触止盈线，结算点 10:15
+	if s := stateOf(t, c, "600031"); s.Line != SellLineTakeProfit {
+		t.Fatalf("应锁定止盈线, got %v", s.Line)
+	}
+	deep := sellIn("600031", 8.5) // −15% ≤ 深破 −12
+	deep.Bull = freshBull(st(10, 15))
+	d := judge(c, "600031", deep, st(10, 15))
+	if d == nil || d.Action != SellActionClose || d.Line != SellLineDeepBreach {
+		t.Fatalf("止盈窗内砸穿 −12%% 应升级深破无条件全平（有做多也不行），得 %+v", d)
+	}
+}
+
+// TestSellDeepBreachUpgradesTrail §C2 反例锁②：移动止盈锁线砸穿 −12% 同样升级全清。
+func TestSellDeepBreachUpgradesTrail(t *testing.T) {
+	c := New()
+	in := sellIn("600032", 11.2)
+	in.HighPrice = 12 // 有利润回撤 6.7% ≥ 6 → 移动止盈 45 分钟窗，结算点 10:15
+	judge(c, "600032", in, st(10, 0))
+	if s := stateOf(t, c, "600032"); s.Line != SellLineTrail {
+		t.Fatalf("应锁定移动止盈线, got %v", s.Line)
+	}
+	deep := sellIn("600032", 8.4) // −16% ≤ 深破
+	deep.Bull = freshBull(st(10, 15))
+	d := judge(c, "600032", deep, st(10, 15))
+	if d == nil || d.Action != SellActionClose || d.Line != SellLineDeepBreach {
+		t.Fatalf("移动止盈窗内砸穿 −12%% 应升级深破无条件全平，得 %+v", d)
+	}
+}
+
+// TestSellDeepBreachUpgradeIsOneWay §C2 反例锁③：升级是单向棘轮——窗内砸穿即覆写
+// DeepBreach（未到结算点不处置），价格回血到 −10% 不得回退线型，结算照旧无条件全清。
+func TestSellDeepBreachUpgradeIsOneWay(t *testing.T) {
+	c := New()
+	judge(c, "600033", sellIn("600033", 11.6), st(10, 0)) // 止盈窗，结算点 10:15
+	if d := judge(c, "600033", sellIn("600033", 8.5), st(10, 5)); d != nil {
+		t.Fatalf("窗内升级轮未到结算点不应处置，得 %+v", d)
+	}
+	if s := stateOf(t, c, "600033"); s.Line != SellLineDeepBreach {
+		t.Fatalf("砸穿当轮即应升级深破, got %v", s.Line)
+	}
+	judge(c, "600033", sellIn("600033", 9.0), st(10, 10)) // 回血 −10%：本轮判定为止损级，线型不回退
+	if s := stateOf(t, c, "600033"); s.Line != SellLineDeepBreach {
+		t.Fatalf("回血不得把深破线改回任何浅线（单向棘轮）, got %v", s.Line)
+	}
+	in := sellIn("600033", 9.0)
+	in.Bull = freshBull(st(10, 15))
+	d := judge(c, "600033", in, st(10, 15))
+	if d == nil || d.Action != SellActionClose || d.Line != SellLineDeepBreach {
+		t.Fatalf("升级后结算应无条件全平（新鲜做多也不行），得 %+v", d)
+	}
+}
+
 // TestSellInvalidPriceNoConclusion 停牌/行情缺失（价格非法）→ 不下结论且状态原样保留。
 func TestSellInvalidPriceNoConclusion(t *testing.T) {
 	c := New()
@@ -373,4 +431,35 @@ func containsStr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestSellTransitionRecords §H2（2026-09-22 修复批）反例锁：跃迁留痕必须逐跳入环——
+// 首触进窗(hold) → 窗内重复轮(不留痕防刷屏) → 延持(SettleStart 位移, hold) → 结算(pass)，
+// 共 3 条。旧实现 sellProbe 原地改指针后拿 prev==st 自比较，延持/升级等中段跃迁恒判
+// 「无变化」不入环，只剩首触+处置两条，观察面对延持全盲。
+// English: §H2 regression — every state transition (first-touch, extend) must enter the
+// decision ring; duplicate in-window rounds stay silent.
+func TestSellTransitionRecords(t *testing.T) {
+	c := New()
+	judge(c, "600041", sellIn("600041", 9.3), st(10, 0)) // 首触锁止损线 → hold ①
+	judge(c, "600041", sellIn("600041", 9.3), st(10, 5)) // 窗内重复轮 → 不留痕
+	ext := sellIn("600041", 9.3)
+	ext.Bull = freshBull(st(10, 15))
+	judge(c, "600041", ext, st(10, 15))                   // 结算点延持 → hold ②
+	judge(c, "600041", sellIn("600041", 9.3), st(10, 30)) // 二次结算 trim → pass ③
+	var holds, passes int
+	for _, r := range c.Recent(20) {
+		if r.Stage != StageSell || r.Code != "600041" {
+			continue
+		}
+		switch r.Verdict {
+		case VerdictHold:
+			holds++
+		case VerdictPass:
+			passes++
+		}
+	}
+	if holds != 2 || passes != 1 {
+		t.Fatalf("跃迁留痕应 首触hold+延持hold+结算pass 共3条（延持跃迁丢失即 §H2 复活），got holds=%d passes=%d", holds, passes)
+	}
 }

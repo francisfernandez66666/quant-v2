@@ -1299,8 +1299,10 @@ export function isTradingSession(session) {
 //  - the token is read before connecting and sent to the backend as a ?token=... query param for auth;
 //  - 收到消息后按 JSON 解析，广播给所有已注册回调（sseCallbacks）；
 //  - incoming messages are parsed as JSON and broadcast to all registered callbacks (sseCallbacks);
-//  - 连接出错时主动 close 后延时 3 秒重连，避免依赖浏览器自带的指数退避重连。
-//  - on error the connection is closed and reconnected after 3s, rather than relying on the browser's exponential backoff.
+//  - 连接出错时不再主动 close：§H6 起优先让浏览器原生自动重连接管（携带 Last-Event-ID 走服务端补发），
+//    仅实例被判 CLOSED 后退避手动重建。
+//  - §H6: on error the browser's native reconnect takes over first (it alone carries the
+//    Last-Event-ID header for server-side replay); manual backoff-rebuild only after a fatal CLOSED.
 
 // 当前 SSE 连接对象（EventSource 实例），null 表示未连接
 // The current SSE connection object (an EventSource instance); null means disconnected
@@ -1312,6 +1314,9 @@ let sseCallbacks = []
 let sseRetry = 0
 // §P1-10（2026-09-15）进行中的建链 promise（connectSSE 并发守卫用，见 connectSSE 内注释）
 let sseConnecting = null
+// §H6（2026-09-22 修复批）：兜底重建定时器。仅当 EventSource 被判 CLOSED、需要手动换票重建时
+// 使用；同一轮断开只允许挂一个定时器（去重），退出登录时由 disconnectSSE 一并清除。
+let sseReconnectTimer = null
 
 /**
  * 注册 SSE 消息回调，返回取消注册的函数
@@ -1341,8 +1346,12 @@ export function onSSE(fn) {
 //    first use and expires, so a leaked URL cannot open a second stream.
 //  - 收到消息时解析 JSON 并依次调用 sseCallbacks 中的回调；
 //  - received messages are parsed as JSON and dispatched to each callback in sseCallbacks;
-//  - onerror 触发时关闭旧连接，3 秒后重新建立，实现手动重连。
-//  - onerror closes the old connection and reconnects after 3 seconds (manual reconnect).
+//  - onerror 触发时：§H6 起不再手动 close+新建——非 CLOSED 态交给浏览器原生自动重连
+//    （原生重连会自动携带 Last-Event-ID 头，服务端据此补发断流期间错过的事件）；
+//    仅当 EventSource 被彻底关闭（CLOSED，如一次性票据消费后原生重连 401）才手动换票重建兜底。
+//  - English: §H6 — on error the client now lets the browser's native auto-reconnect run untouched
+//    (native reconnect is the only path that carries the Last-Event-ID header the server's replay
+//    ring reads); a manual close-and-recreate happens only after the EventSource fatally CLOSED.
 export async function connectSSE() {
   if (sse) return
   // §P1-10（2026-09-15）：建链并发守卫。connectSSE 在取票据（await POST /api/events/ticket）
@@ -1380,7 +1389,12 @@ export async function connectSSE() {
     //       服务端据此实现断线续传（见 handleFixSSE 读取 Last-Event-ID）。
     // Note: the browser EventSource automatically sends the Last-Event-ID header
     //       (from the server's `id:` line), enabling reconnect resume server-side.
+    // §H6：上面这句注释描述的正是本修复要保住的通道——该头只有「同一 EventSource 实例的浏览器
+    // 原生自动重连」才会携带；手动 new EventSource 无法附加自定义头，而服务端只读 header、
+    // 不收 query 形态（internal/server/handlers_fix.go:2224），故重建即丢失补发能力。
     sse = new EventSource(baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket))
+    // §H6：实例身份守卫——旧实例（已被替换/关闭）迟到的回调不应再操作当前连接状态
+    const es = sse
     sse.onmessage = (e) => {
       // 成功收到一条消息即重置重连计数（连接已恢复）
       sseRetry = 0
@@ -1390,23 +1404,41 @@ export async function connectSSE() {
       } catch (_) {}
     }
     sse.onerror = () => {
-      // 连接断开时先关闭，随后按退避重连
-      // Close on disconnect, then reconnect with backoff
+      // §H6（2026-09-22 修复批）冷启动丢补发：旧实现在此先 disconnectSSE() 手动 close、
+      // 再 setTimeout 新建 EventSource——恰好打断了浏览器原生自动重连通道。Last-Event-ID
+      // 请求头只有原生重连才会自动携带（服务端补发环 sse.go SubscribeFor(lastID) 只认这个），
+      // close+new 后服务端永远收不到该头，断流期间错过的事件无法恢复。
+      // 现策略：只要实例还没被判 CLOSED（CONNECTING 表示浏览器正按其 `retry:` 提示自行
+      // 退避重连），绝不触碰连接、也不手动重建，把补发机会完整留给原生通道；期间仅按
+      // 计数做登录态探测（token 失效时 request() 广播 auth:expired → App 层登出并
+      // disconnectSSE，从而终止无限重连，§P1-9 语义不变）。
+      // English: §H6 — never close-and-resurrect while the browser's native reconnect (the only
+      // carrier of the Last-Event-ID header) is still alive; manual rebuild is a fatal-CLOSED fallback.
+      if (sse !== es) return
+      if (sse.readyState !== 2 /* EventSource.CLOSED */) {
+        sseRetry++
+        // 连续多次原生重连仍失败时，探测一次登录态：若 token 已失效（401），
+        // request() 内部会 clearAuth 并广播 auth:expired，App 层据此回到登录页，
+        // 从而终止对过期 token 的无限重连。
+        if (sseRetry === 5) {
+          request('/api/status').catch(() => {})
+        }
+        return
+      }
+      // 走到这里说明 EventSource 已被浏览器彻底放弃（CLOSED，典型：一次性票据被消费后
+      // 原生重连收到 401）——原生通道已不可用，只能手动换票重建兜底。此跳补发环不可达是
+      // 票据鉴权一次性语义下的已知降级（服务端不收 last_event_id query），维持现状不动后端。
       disconnectSSE()
       sseRetry++
       // 退避延迟：3s 起，指数增长并封顶 30s，避免网络异常时无限快速重连风暴
       // Backoff delay: starts at 3s, grows exponentially and caps at 30s to avoid a reconnect storm
       const delay = Math.min(3000 * Math.pow(1.6, sseRetry - 1), 30000)
-      // 连续重连多次仍失败时，探测一次登录态：若 token 已失效（401），
-      // request() 内部会 clearAuth 并广播 auth:expired，App 层据此回到登录页，
-      // 从而终止对过期 token 的无限重连。
-      // After many consecutive failures, probe auth once; if the token is expired (401),
-      // request() clears auth and dispatches auth:expired so the app returns to login,
-      // stopping the infinite reconnect loop on a dead token.
-      if (sseRetry === 5) {
-        request('/api/status').catch(() => {})
-      }
-      setTimeout(connectSSE, delay)
+      // §H6：去重守卫——同一次断开的连环 error 只挂一个重建定时器
+      if (sseReconnectTimer) return
+      sseReconnectTimer = setTimeout(() => {
+        sseReconnectTimer = null
+        connectSSE()
+      }, delay)
     }
   }
   // §P1-10 记录进行中的建链 promise，finally 里清除——成功/失败都不留悬挂守卫
@@ -1424,6 +1456,11 @@ export async function connectSSE() {
 // Note: closes the connection and nulls `sse` so the next connectSSE() can reconnect
 export function disconnectSSE() {
   if (sse) { sse.close(); sse = null }
+  // §H6：主动断开（登出/卸载）时同步清掉待触发的兜底重建定时器，
+  // 避免旧定时器在退出登录后把连接复活（登录页挂死连接）。
+  // English: §H6 — an explicit disconnect also cancels a pending backoff rebuild so a
+  // stale timer cannot resurrect the stream after logout.
+  if (sseReconnectTimer) { clearTimeout(sseReconnectTimer); sseReconnectTimer = null }
 }
 
 // ── LLM 配置 ──
@@ -1571,7 +1608,11 @@ export async function fetchDataSourceHealth() {
 
 // 对应 GET /api/news_source_health，返回新闻源健康探测结果
 // Maps to GET /api/news_source_health
-// 返回 { cainanshe: true|false, kuaixun: true|false }
+// §M3（2026-09-22）后端已从布尔表升级为真实探测结构体，键名修正 cainanshe→cailanshe：
+// 返回 { cailanshe|kuaixun|sina: { status: 'ok'|'down'|'unknown', last_success_at?,
+// consecutive_errors, total_errors } }——unknown=从未探测，消费端不得当作健康布尔用。
+// （Since M3 the payload is a per-source struct with a tri-state status; 'unknown' means
+// never probed and must not be rendered as healthy.）
 /**
  * 获取新闻源健康探测结果 · 对应后端 GET /api/news_source_health
  */

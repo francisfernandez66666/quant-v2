@@ -80,6 +80,19 @@ type book struct {
 	// 真实 qmt_gateway 有 /admin/broker 切换 + /health 回报 active；mock 此前两者皆缺，
 	// 双通道切换链路（Quant 页按钮→/api/qmt/broker→网关）在 e2e/演练栈完全测不到。
 	activeBroker string // 当前 active 通道，默认 xt，POST /admin/broker 可切
+	// §3.1-1（2026-09-22 修复批 K · FIX_PLAN_20260922 M1/F4）行情注入面：
+	// 「盘内形态可测化」的 mock 侧开关。此前 /quotes 的 tickTime 恒为 now、且响应体不带任何
+	// 行情源标识，E2E 在盘外既造不出「有源快照」也造不出「超龄 tick」，M1 的词表漂移只能靠
+	// 「盘外空串」假绿放过。三个字段全为 0/空即与旧行为逐字节一致（未注入 = 不改变契约）。
+	//   quoteSource   —— 非空时 /quotes 响应体顶层回显 quote_source 字段（实网关无此字段，
+	//                    Go 侧 QMTTick 不消费未知字段，纯观察/契约面；引擎的 Source 由
+	//                    qmt_feed 硬编码 "QMT-L1"，见 internal/data/qmt_feed.go applyTicks）。
+	//   tickAgeSec    —— >0 时把 tickTime 回拨到 now-age（造「超龄 tick」形态：引擎 maxAge=30s
+	//                    应丢弃注入、快照退回新浪链，是 §ENH-5 新鲜度闸的可测入口）。
+	//   tickTimeFixed —— >0 时优先于 tickAgeSec，直接给定绝对毫秒时间戳。
+	quoteSource   string
+	tickAgeSec    float64
+	tickTimeFixed int64
 }
 
 // fillRecord 成交流水行（§P2-14 /settlement 装配源，字段对齐实网关 fills 表）。
@@ -120,6 +133,21 @@ func (b *book) nextOrderID() string {
 	id := fmt.Sprintf("MOCK%06d", b.nextID)
 	b.nextID++
 	return id
+}
+
+// quoteTickTimeMs §3.1-1（2026-09-22 修复批 K）计算 /quotes 回包的 tick 时间戳（毫秒）。
+// 优先级：绝对注入（-quote-tick-time-ms）> 相对回拨（-quote-tick-age-sec）> 当前时间。
+// 两个注入参数都为 0 时返回值与旧版 now.UnixMilli 同口径（仅统一到毫秒精度）。
+// English: resolves the tick timestamp — fixed value wins, then the age rollback, else "now";
+// with no injection the behaviour is identical to the previous implementation.
+func (b *book) quoteTickTimeMs(now time.Time) int64 {
+	if b.tickTimeFixed > 0 {
+		return b.tickTimeFixed
+	}
+	if b.tickAgeSec > 0 {
+		return now.Add(-time.Duration(b.tickAgeSec * float64(time.Second))).UnixMilli()
+	}
+	return now.UnixMilli()
 }
 
 // seedPositions 预置初始持仓（联调看板用）。
@@ -270,6 +298,11 @@ func main() {
 	cash := flag.Float64("cash", 1000000, "§P2-14 模拟初始现金（/settlement cash 与 account 事件口径）")
 	fillMode := flag.String("fill-mode", "full", "§P2-14 成交模式：full=整笔已成 / partial=先部成后已成 / reject=柜台废单（推废单事件）")
 	chaos := flag.Bool("chaos", false, "§P2-14 乱序回报：先推 trade 再推 order已成（回归引擎单调状态机守卫）")
+	// §3.1-1（2026-09-22 修复批 K · FIX_PLAN_20260922 M1/F4）行情注入面：三参数全默认时
+	// /quotes 输出与旧版逐字节一致，零行为变更；仅在 UAT 自举脚本显式注入时才生效。
+	quoteSource := flag.String("quote-source", "", "§3.1-1 /quotes 响应体回显的 quote_source（空=不带该字段）")
+	quoteTickAge := flag.Float64("quote-tick-age-sec", 0, "§3.1-1 tickTime 回拨秒数（>0 造『超龄 tick』形态，供引擎 30s maxAge 闸回归）")
+	quoteTickTime := flag.Int64("quote-tick-time-ms", 0, "§3.1-1 绝对 tickTime 毫秒时间戳（>0 时优先于 -quote-tick-age-sec）")
 	flag.Parse()
 
 	// 内存账本在启动期一次性定型：初始现金、成交模式（非法值退回 full 并打日志）、
@@ -280,6 +313,14 @@ func main() {
 		b.fillMode = *fillMode
 	} else {
 		log.Printf("[mock] unknown -fill-mode %q, fallback full", *fillMode)
+	}
+	// §3.1-1 行情注入面落地到账本（启动期一次性写、只读消费，无需加锁）。
+	b.quoteSource = strings.TrimSpace(*quoteSource)
+	b.tickAgeSec = *quoteTickAge
+	b.tickTimeFixed = *quoteTickTime
+	if b.quoteSource != "" || b.tickAgeSec > 0 || b.tickTimeFixed > 0 {
+		log.Printf("[mock] §3.1-1 行情注入面已开启: quote_source=%q tick_age_sec=%v tick_time_ms=%d",
+			b.quoteSource, b.tickAgeSec, b.tickTimeFixed)
 	}
 	if *seed != "" {
 		b.seedPositions(strings.Split(*seed, "|"))
@@ -471,7 +512,8 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 			return
 		}
 		nowSec := time.Now().Unix()
-		nowMs := nowSec * 1000
+		// §3.1-1（2026-09-22 修复批 K）：tickTime 走注入面（未注入时=now 毫秒，与旧版同口径）。
+		nowMs := b.quoteTickTimeMs(time.Now())
 		ticks := make(map[string]interface{})
 		for _, c := range strings.Split(codesParam, ",") {
 			c = strings.TrimSpace(c)
@@ -501,7 +543,13 @@ func buildHandler(b *book, token string, delay time.Duration, push func(map[stri
 				"tickTime":  nowMs,
 			}
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "ticks": ticks, "feed_connected": true})
+		out := map[string]interface{}{"ok": true, "ticks": ticks, "feed_connected": true}
+		// §3.1-1：注入 quote_source 时顶层回显同名观察字段（实网关无此字段、Go 侧 QMTTick 亦不解析，
+		// 故仅在显式注入时出现——E2E 用它把「mock 侧注入的行情源名」与 golden 枚举对齐做硬断言）。
+		if b.quoteSource != "" {
+			out["quote_source"] = b.quoteSource
+		}
+		writeJSON(w, out)
 	})
 
 	// /order 下单：受理即返回 order_id 并推"已报"，延时后模拟成交推"已成"+trade。

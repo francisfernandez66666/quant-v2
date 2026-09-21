@@ -4,6 +4,7 @@ package notify
 import (
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -116,6 +117,115 @@ type errFake struct{}
 // Error Error。
 // 返回固定失败串，模拟投递失败。
 func (errFake) Error() string { return "fake delivery failure" }
+
+// forceAllDue 把队列内全部条目推到已到期（真实退避 30s 起步，测试不等钟）。
+func forceAllDue(o *Outbox) {
+	o.mu.Lock()
+	for i := range o.items {
+		o.items[i].nextAt = time.Now().Add(-time.Second)
+	}
+	o.mu.Unlock()
+}
+
+// TestOutboxBatchPumpSingleDelivery §H9 回归：同一轮多条到期条目应各自恰好投递一次、
+// 队列清空、后续空轮零重投。旧实现快照后按数组下标做身份校验——首条成功出队使后续条目
+// 在队列中整体前移、校验必然失败 → 既不删除也不退避，每秒整批重投（重投风暴）。
+// English: H9 — a batch of due items must each deliver exactly once and drain the queue.
+func TestOutboxBatchPumpSingleDelivery(t *testing.T) {
+	o := &Outbox{}
+	titles := []string{"A", "B", "C"}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	for _, title := range titles {
+		title := title
+		o.enqueue("webhook:x", Message{Level: LevelHigh, Title: title}, func(string, Message) error {
+			mu.Lock()
+			calls[title]++
+			mu.Unlock()
+			return nil
+		})
+	}
+	o.Stop() // 停掉惰性启动的后台协程，测试内只由 pump 同步驱动，杜绝计时器干扰
+
+	forceAllDue(o)
+	o.pump()
+	if got := o.pendingLen(); got != 0 {
+		t.Fatalf("同轮 %d 条到期应一次 pump 全部出队, pending=%d", len(titles), got)
+	}
+	mu.Lock()
+	for _, title := range titles {
+		if calls[title] != 1 {
+			t.Fatalf("%s 应恰好投递一次, got %d", title, calls[title])
+		}
+	}
+	mu.Unlock()
+
+	// 空轮补验：无到期项时不得产生任何重投
+	o.pump()
+	mu.Lock()
+	defer mu.Unlock()
+	for _, title := range titles {
+		if calls[title] != 1 {
+			t.Fatalf("空轮不应重投 %s, got %d", title, calls[title])
+		}
+	}
+}
+
+// TestOutboxBatchPumpMixedOutcome §H9 回归（成败混合形态）：同轮 3 条到期，中间一条持续失败，
+// 前序出队不得使后序成功条目定位漂移——A/C 恰投一次出队，B 失败一次后退避留在队列，
+// 而非旧实现下整批每秒重投。
+// English: H9 — a mid-batch failure must not shift the later successes out of the queue either.
+func TestOutboxBatchPumpMixedOutcome(t *testing.T) {
+	o := &Outbox{}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	for _, title := range []string{"A", "B", "C"} {
+		title := title
+		o.enqueue("webhook:x", Message{Level: LevelHigh, Title: title}, func(string, Message) error {
+			mu.Lock()
+			calls[title]++
+			mu.Unlock()
+			if title == "B" {
+				return errFake{} // 中间条持续失败
+			}
+			return nil
+		})
+	}
+	o.Stop()
+
+	forceAllDue(o)
+	o.pump()
+	if got := o.pendingLen(); got != 1 {
+		t.Fatalf("A/C 应出队、B 应退避留队, pending=%d", got)
+	}
+	mu.Lock()
+	gotA, gotB, gotC := calls["A"], calls["B"], calls["C"]
+	mu.Unlock()
+	if gotA != 1 || gotB != 1 || gotC != 1 {
+		t.Fatalf("首轮每条应各投一次, A=%d B=%d C=%d", gotA, gotB, gotC)
+	}
+	o.mu.Lock()
+	bDue := !o.items[0].nextAt.After(time.Now())
+	o.mu.Unlock()
+	if bDue {
+		t.Fatal("B 失败后应退避到未来时间（非秒级重投）")
+	}
+
+	// 再驱动一轮：仅 B 到期重投，A/C 已出队不得复现
+	forceAllDue(o)
+	o.pump()
+	if got := o.pendingLen(); got != 1 {
+		t.Fatalf("B 再失败应仍留队退避, pending=%d", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls["A"] != 1 || calls["C"] != 1 {
+		t.Fatalf("已出队条目不得被重投, A=%d C=%d", calls["A"], calls["C"])
+	}
+	if calls["B"] != 2 {
+		t.Fatalf("B 应累计投递 2 次, got %d", calls["B"])
+	}
+}
 
 // TestOutboxPersistsAcrossRestart §R3-8 P1-D 回归：入队即落盘、新实例加载续发——
 // 此前补投队列纯内存，进程重启丢全部待补投的止损/清仓提醒。

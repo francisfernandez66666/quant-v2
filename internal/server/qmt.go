@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -501,6 +502,34 @@ func normalizeReportSide(raw string) (string, error) {
 	return "", fmt.Errorf("未知回报方向(side=%q)", raw)
 }
 
+// qmtReportEvent 网关回报（POST /api/qmt/report）的载荷结构。
+// §F2（2026-09-22 修复批）：由 handleQMTReport 内匿名结构升级为具名类型——回报字段面是
+// Go↔网关的对外契约，golden 回归测（report_contract_test.go ↔ qmt_gateway/contract/
+// report_fields.json）通过反射本结构锁定字段集，任何一侧加/删字段漏改即测试红。
+// English: named report payload (was an anonymous struct) so the golden contract test can
+// reflect over its JSON tags; event types trade/order/positions/account share this envelope.
+type qmtReportEvent struct {
+	Type      string               `json:"type"`
+	OrderID   string               `json:"order_id"`
+	Code      string               `json:"code"`
+	Side      string               `json:"side"`
+	Status    string               `json:"status"`
+	Price     float64              `json:"price"`
+	Qty       int                  `json:"qty"`
+	Amount    float64              `json:"amount"`
+	TradedAt  string               `json:"traded_at"`
+	SignalID  string               `json:"signal_id"`
+	Reason    string               `json:"reason"`    // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
+	Fee       float64              `json:"fee"`       // §P2-FEE 20260918 经手费/佣金（尽力透传，缺=0）
+	StampTax  float64              `json:"stamp_tax"` // 印花税（卖方单边，缺=0）
+	Positions []store.RealPosition `json:"positions"`
+	Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
+	At        string               `json:"at"`
+	UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
+	Broker    string               `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
+	From      string               `json:"from"`    // §QMT-DUAL 通道切换事件：来源通道
+}
+
 // handleQMTReport 接收网关回报（POST /api/qmt/report，Bearer token 鉴权）。
 // 事件类型：trade（成交）/ order（委托）/ positions（全量对账）/ disconnect（断线）。
 // 落库 → SSE 推前端 → 断线触发熔断并告警。
@@ -513,27 +542,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "real book not available")
 		return
 	}
-	var ev struct {
-		Type      string               `json:"type"`
-		OrderID   string               `json:"order_id"`
-		Code      string               `json:"code"`
-		Side      string               `json:"side"`
-		Status    string               `json:"status"`
-		Price     float64              `json:"price"`
-		Qty       int                  `json:"qty"`
-		Amount    float64              `json:"amount"`
-		TradedAt  string               `json:"traded_at"`
-		SignalID  string               `json:"signal_id"`
-		Reason    string               `json:"reason"`    // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
-		Fee       float64              `json:"fee"`       // §P2-FEE 20260918 经手费/佣金（尽力透传，缺=0）
-		StampTax  float64              `json:"stamp_tax"` // 印花税（卖方单边，缺=0）
-		Positions []store.RealPosition `json:"positions"`
-		Asset     map[string]float64   `json:"asset"` // §可用资金：账户资产（cash/frozen_cash/total_asset/market_value）
-		At        string               `json:"at"`
-		UserID    string               `json:"user_id"` // §GAP1.10 网关配置的归属账号
-		Broker    string               `json:"broker"`  // §QMT-DUAL 通道切换事件：目标通道
-		From      string               `json:"from"`    // §QMT-DUAL 通道切换事件：来源通道
-	}
+	var ev qmtReportEvent
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 		writeError(w, 400, "invalid report body")
 		return
@@ -581,6 +590,14 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		// 守卫通过（空快照且本地确实无持仓，或非空快照）：按用户范围全量对账落库。
 		// ReconcilePositionsForUser 以本账号为界做 upsert+删除，绝不触碰其它账号数据。
 		if n, err := db.ReconcilePositionsForUser(owner, ev.Positions); err != nil {
+			// §F2（2026-09-22 修复批）：store 入口的字段级校验失败（任一行 ts_code 空/非法格式）
+			// → 整批拒收 400（留痕已在 store 侧 opslog 完成）。4xx 会被网关 outbox 按永久拒绝
+			// 移入死信表，不会无限重推刷屏；其余落库错误仍回 500 触发重推。
+			if errors.Is(err, store.ErrInvalidPositionReport) {
+				log.Printf("[trading] ⚠ positions 快照字段校验整批拒收(用户=%s): %v", owner, err)
+				writeError(w, 400, err.Error())
+				return
+			}
 			writeError(w, 500, "reconcile positions: "+err.Error())
 			return
 		} else {
@@ -601,7 +618,33 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[trading] 委托回报方向异常(signal=%s status=%s): %v，按原样落库仅展示", ev.SignalID, ev.Status, ev.Side)
 			orderSide = ev.Side
 		}
-		if ev.OrderID != "" && ev.SignalID != "" {
+		// §M4/§F5（2026-09-22 修复批）委托状态回报接入段重构，同块并修两病：
+		//  §M4 旧实现 ApplyOrderReportTx 出错只打日志、末尾仍回 200 ok——网关 outbox 据此
+		//     标记投递成功不再重推，状态回报在落库失败时永久丢失（成交腿正确姿势是回 500）。
+		//     现落库失败回 500，让 outbox 按可重试路径重推。
+		//  §F5 旧实现要求 signal_id/order_id 齐全才进块、缺键回报无 else 无日志静默丢弃——
+		//     手工单（无 signal_id）委托状态永久隐身。语义选择：
+		//     ① order_id 是 orders 表主键，缺失时既无法定位也无法幂等落行 → 显式拒收 400
+		//        （网关 outbox 对 4xx 走死信留痕，不无限重推），并 log+opslog 双留痕；
+		//     ② 仅缺 signal_id 时不再丢弃：用 `ext:<order_id>` 占位信号键落一条可查的最小
+		//        状态行（orders.signal_id 有 UNIQUE(user_id,signal_id) 约束，空串会互撞，
+		//        ext: 前缀按单号天然唯一且不与业务信号前缀 buy:/sell:/pend: 冲突），
+		//        同一单号的后续状态回报经秩守卫正常推进，撤单/对账面板可见可查。
+		if ev.OrderID == "" {
+			log.Printf("[trading] ⚠ order 回报缺主键 order_id(signal=%s code=%s status=%s)——拒收留痕",
+				ev.SignalID, ev.Code, ev.Status)
+			opslog.Logf("quant", "委托状态回报缺 order_id 被拒收(§F5) signal=%s code=%s status=%s",
+				ev.SignalID, ev.Code, ev.Status)
+			writeError(w, 400, "order 回报缺 order_id，拒收留痕")
+			return
+		}
+		orderSignalID := ev.SignalID
+		if orderSignalID == "" {
+			orderSignalID = "ext:" + ev.OrderID // §F5 手工单占位信号键
+			log.Printf("[trading] §F5 order 回报缺 signal_id，以占位键 %s 落最小状态行(code=%s status=%s)",
+				orderSignalID, ev.Code, ev.Status)
+		}
+		{
 			// §R4-4 委托状态推进：回报的 部成/已成/已撤/部撤/废单 必须写入本地行——
 			// 旧实现 UpsertRealOrder 是 INSERT OR IGNORE（signal_id 冲突即忽略），状态回报被
 			// 静默吞掉、本地永远停留"已报"，撤单闭环/对账全部失真。现走单调守卫的
@@ -611,13 +654,16 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			// ApplyOrderReportTx（推进/补插/幂等 no-op 三选一，判定共享同一事务快照）。
 			// English: §A4 — advance-then-insert-if-absent folded into one atomic transaction call.
 			action, err := db.ApplyOrderReportTx(store.RealOrder{
-				OrderID: ev.OrderID, SignalID: ev.SignalID, Code: ev.Code,
+				OrderID: ev.OrderID, SignalID: orderSignalID, Code: ev.Code,
 				Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
 				CreatedAt: ev.At,
 				UserID:    uid, // §W2-10 委托行打归属账号
 			})
 			if err != nil {
-				log.Printf("[trading] apply order report(signal=%s): %v", ev.SignalID, err)
+				// §M4：状态腿落库失败绝不再吞错回 ok——500 让网关 outbox 重推（成交腿同口径）。
+				log.Printf("[trading] apply order report(signal=%s): %v", orderSignalID, err)
+				writeError(w, 500, "apply order report: "+err.Error())
+				return
 			}
 			switch action {
 			case store.OrderReportAdvanced:
@@ -634,7 +680,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 					}())
 				// §DAILY_OPSLOG 状态推进是委托生命周期的核心节点（已成/已撤/废单…）
 				opslog.Logf("quant", "委托状态推进 %s %s %s qty=%d status=%s order=%s%s",
-					ev.SignalID, orderSide, ev.Code, ev.Qty, ev.Status, ev.OrderID,
+					orderSignalID, orderSide, ev.Code, ev.Qty, ev.Status, ev.OrderID,
 					func() string {
 						if ev.Reason != "" {
 							return " 拒因=" + ev.Reason
@@ -643,7 +689,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 					}())
 			case store.OrderReportInserted:
 				// 本地无单（网侧重放/回报先于下单回填到达）：补插留痕，便于次日取证还原时间线
-				log.Printf("[trading] 委托回报本地无单，补插 %s %s status=%s order=%s", ev.SignalID, ev.Code, ev.Status, ev.OrderID)
+				log.Printf("[trading] 委托回报本地无单，补插 %s %s status=%s order=%s", orderSignalID, ev.Code, ev.Status, ev.OrderID)
 			}
 		}
 	case "trade":
@@ -1317,9 +1363,11 @@ func qmtStrategyOf(signalID string) string {
 
 // handleQMTTrades 处理 GET /api/qmt/trades：交易流水 + 整体盈亏 + 按战法归因统计。
 // 盈亏口径：
-//   - 已实现：按时间升序重放全部成交（加权成本法），卖出对 (卖价-加权成本)×数量 累计；
+//   - 已实现：按时间升序重放全部成交（加权成本法），买入成本摊入佣金、卖出 pnl 扣
+//     fee+stamp_tax（§F1，2026-09-22 起与 paper 含费口径一致）；
 //   - 浮动：real_positions 的 市值-数量×成本（市值为最近一次网关对账快照）；
 //   - 总盈亏 = 已实现 + 浮动；胜/亏按单笔卖出 pnl 正负计数。
+//   - 金额统计优先取落库 Amount（§F12 单口径），旧格式回报回退 Price×Qty。
 //
 // 飞轮数据面：by_strategy 即「research 出战法 → 信号 → 实盘结果」回流评估的输入源，
 // research 侧可直接读同一 researchDB 的 fills/orders 表或消费本端点。
@@ -1396,12 +1444,22 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			stratState[f.Code] = ps
 		}
 		amt := f.Price * float64(f.Qty) // 本笔成交金额（买卖同式，直接进战法统计）
+		// §F12（2026-09-22 修复批）：统计金额优先取**落库 Amount**（柜台成交额口径），
+		// 消除「重算 Price×Qty vs 库内 Amount」双口径漂移；旧格式回报 Amount<=0 回退重算值
+		// （与 SumBuyFilledAmountByDay 的回退姿势一致）。
+		if f.Amount > 0 {
+			amt = f.Amount
+		}
+		// §F1 费用腿：买入佣金摊入重放成本（与 ApplyRealFill 同式），卖出已实现盈亏扣
+		// fee+stamp_tax——与 paper 口径（buy: cost+fee；sell: net=gross-fee）对齐，
+		// 实盘/模拟两账盈亏从此同基准，不再系统性偏乐观。
 		switch f.Side {
 		case "买入":
-			// 买入：新数量摊薄加权成本 =（旧成本×旧量+本笔金额）/ 新量。
+			// 买入：新数量摊薄加权成本 =（旧成本×旧量+本笔含费金额）/ 新量。
 			newQty := ps.qty + f.Qty
+			costAmt := f.Price*float64(f.Qty) + f.Fee
 			if newQty > 0 {
-				ps.cost = (ps.cost*float64(ps.qty) + amt) / float64(newQty)
+				ps.cost = (ps.cost*float64(ps.qty) + costAmt) / float64(newQty)
 			}
 			ps.qty = newQty
 			ps.strategy = qmtStrategyOf(f.SignalID) // 记录该持仓的入场战法（卖出据此归因）
@@ -1409,12 +1467,12 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			buyStat.Buys += amt
 			buyStat.Count++
 		case "卖出":
-			// 卖出：按持仓剩余量钳制成交，计已实现盈亏与胜负次数。
+			// 卖出：按持仓剩余量钳制成交，计已实现盈亏（扣卖出费用腿）与胜负次数。
 			sellQty := f.Qty
 			if sellQty > ps.qty {
 				sellQty = ps.qty // 超卖钳制（与 ApplyRealFill 同口径）
 			}
-			sellPnl := (f.Price - ps.cost) * float64(sellQty)
+			sellPnl := (f.Price-ps.cost)*float64(sellQty) - (f.Fee + f.StampTax)
 			// §2026-09-08 验证②修复：超出成交簿买量的部分（对账来源持仓）无重放成本基准——
 			// 旧实现 sellQty=0 → pnl=0 → 一律 wins++，把亏损退出伪造成"胜"并吞掉已实现盈亏。
 			// 改用当前实盘账本成本 pricing；账本亦无该持仓（已全仓卖光）则放弃定价，不计胜/负
@@ -1477,6 +1535,9 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			"order_id": f.OrderID, "code": f.Code, "side": f.Side, "price": f.Price,
 			"qty": f.Qty, "amount": f.Amount, "traded_at": f.TradedAt,
 			"signal_id": f.SignalID, "strategy": tag,
+			// §F1：费用腿回显——此前 trades 含费重算但流水不展示 fee/stamp_tax，
+			// 前端对不上账时无从核对；RealFills 现已带回两列。
+			"fee": f.Fee, "stamp_tax": f.StampTax,
 		})
 	}
 

@@ -3,6 +3,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -567,5 +568,259 @@ func TestRealPositionsBuyDateRoundTrip(t *testing.T) {
 	}
 	if snap == nil || snap.BuyDate != "" {
 		t.Fatalf("券商快照行 buy_date 应为空(未知), got %+v", snap)
+	}
+}
+
+// TestLocalBuyFrozenDayFilter §C1（2026-09-22 修复批）反例锁：冻结账必须只统计**当日**
+// 已报/部成买单——前日滞留行绝不许跨日占用预算（旧 SQL 收了 day 参数却不用，卡死买单
+// 永久锁死 daily_budget_amount）；撤单后即时释放；两种存量 created_at 格式（RFC3339 /
+// 空格分隔）都须命中日期前缀；查询错误必须上抛而非吞成 0。
+// English: §C1 regression — frozen amount is scoped to `day` (both stored timestamp shapes),
+// releases on cancel, and surfaces query errors instead of silently returning 0.
+func TestLocalBuyFrozenDayFilter(t *testing.T) {
+	db := testDB(t)
+	up := func(o RealOrder) {
+		t.Helper()
+		if _, err := db.UpsertRealOrder(o); err != nil {
+			t.Fatalf("upsert order %s: %v", o.SignalID, err)
+		}
+	}
+	base := RealOrder{Code: "600000.SH", Side: "买入", Price: 10, UserID: "u1"}
+	// 今日(RFC3339) 已报 100 股 → 全额 1000 计入冻结
+	o1 := base
+	o1.OrderID, o1.SignalID, o1.Status, o1.Qty = "O1", "S1", "已报", 100
+	o1.CreatedAt = "2026-09-22T09:35:00+08:00"
+	up(o1)
+	// 今日(空格格式) 部成 300 股，其中 200 已成交 → 剩余 100 股计 1000
+	o2 := base
+	o2.OrderID, o2.SignalID, o2.Status, o2.Qty = "O2", "S2", "部成", 300
+	o2.CreatedAt = "2026-09-22 10:00:00"
+	up(o2)
+	if err := db.ApplyRealFill(RealFill{OrderID: "O2", Code: "600000.SH", Side: "买入", Price: 10, Qty: 200, Amount: 2000, TradedAt: "2026-09-22 10:05:00", SignalID: "S2", UserID: "u1"}); err != nil {
+		t.Fatalf("partial fill: %v", err)
+	}
+	// 前日 已报 1000 股：旧缺陷会永久计入，现必须被日期过滤排除
+	o3 := base
+	o3.OrderID, o3.SignalID, o3.Status, o3.Qty = "O3", "S3", "已报", 1000
+	o3.CreatedAt = "2026-09-21T14:50:00+08:00"
+	up(o3)
+
+	frozen, err := db.LocalBuyFrozen("u1", "2026-09-22")
+	if err != nil {
+		t.Fatalf("frozen: %v", err)
+	}
+	if want := 2000.0; frozen != want {
+		t.Fatalf("当日冻结应为 %v（S1 全额+S2 剩余），got %v（含前日僵尸行即 C1 复发）", want, frozen)
+	}
+	// 撤单即释放：S1 → 已撤 后冻结只剩 S2 的 1000
+	if ok, err := db.UpdateRealOrderStatusMonotonic("u1", "O1", "已撤"); err != nil || !ok {
+		t.Fatalf("撤单推进: ok=%v err=%v", ok, err)
+	}
+	frozen, _ = db.LocalBuyFrozen("u1", "2026-09-22")
+	if frozen != 1000.0 {
+		t.Fatalf("撤单后冻结应释放至 1000，got %v", frozen)
+	}
+	// 查询错误必须上抛（fail-closed 前置）：关库后调用得 err≠nil 而非 (0,nil)
+	closed := testDB(t)
+	_ = closed.db.Close()
+	if _, err2 := closed.LocalBuyFrozen("u1", "2026-09-22"); err2 == nil {
+		t.Fatal("库不可读时必须返回错误（旧实现吞错回 0 = fail-open 放水）")
+	}
+}
+
+// TestSweepStaleBuyOrders §C1b（2026-09-22 修复批）反例锁：跨日仍停在 已报/部成 的
+// 买单无条件降级 废单——买方向、严格早于 beforeDay 才动；当日行、卖方向、终态行、
+// created_at 空值行一律不碰。
+// English: §C1b regression — cross-day open buys demote to terminal 废单; today/sell/terminal/
+// blank-timestamp rows stay untouched.
+func TestSweepStaleBuyOrders(t *testing.T) {
+	db := testDB(t)
+	up := func(o RealOrder) {
+		t.Helper()
+		if _, err := db.UpsertRealOrder(o); err != nil {
+			t.Fatalf("upsert %s: %v", o.SignalID, err)
+		}
+	}
+	up(RealOrder{OrderID: "O1", SignalID: "S1", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-21T14:50:00+08:00", UserID: "u1"})
+	up(RealOrder{OrderID: "O2", SignalID: "S2", Code: "600000.SH", Side: "买入", Status: "部成", Price: 10, Qty: 100, CreatedAt: "2026-09-20 14:50:00", UserID: "u1"})
+	up(RealOrder{OrderID: "O3", SignalID: "S3", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-22T09:35:00+08:00", UserID: "u1"})
+	up(RealOrder{OrderID: "O4", SignalID: "S4", Code: "600000.SH", Side: "卖出", Status: "已报", Price: 10, Qty: 100, CreatedAt: "2026-09-21T14:50:00+08:00", UserID: "u1"})
+	up(RealOrder{OrderID: "O5", SignalID: "S5", Code: "600000.SH", Side: "买入", Status: "已成", Price: 10, Qty: 100, CreatedAt: "2026-09-21T14:50:00+08:00", UserID: "u1"})
+	up(RealOrder{OrderID: "O6", SignalID: "S6", Code: "600000.SH", Side: "买入", Status: "已报", Price: 10, Qty: 100, CreatedAt: "", UserID: "u1"})
+
+	n, err := db.SweepStaleBuyOrders("u1", "2026-09-22")
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("应恰降级 O1/O2 两笔跨日买单，got %d", n)
+	}
+	status := map[string]string{}
+	orders, _ := db.RealOrdersForUser("u1")
+	for _, o := range orders {
+		status[o.OrderID] = o.Status
+	}
+	if status["O1"] != "废单" || status["O2"] != "废单" {
+		t.Fatalf("跨日买单应变废单: O1=%s O2=%s", status["O1"], status["O2"])
+	}
+	if status["O3"] != "已报" {
+		t.Fatalf("当日买单不许动，got %s", status["O3"])
+	}
+	if status["O4"] != "已报" {
+		t.Fatalf("卖方向不在本路管辖，got %s", status["O4"])
+	}
+	if status["O5"] != "已成" || status["O6"] != "已报" {
+		t.Fatalf("终态/时间戳空行不许动: O5=%s O6=%s", status["O5"], status["O6"])
+	}
+	// beforeDay 为空 = 不清扫（防御）
+	if n, err := db.SweepStaleBuyOrders("u1", ""); err != nil || n != 0 {
+		t.Fatalf("空 beforeDay 应无操作: n=%d err=%v", n, err)
+	}
+}
+
+// TestApplyRealFillBuyCostIncludesFee §F1（2026-09-22 修复批）反例锁：买入成交的佣金
+// 必须摊入持仓成本（含费加权平均，与 paper `p.Cost += cost + fee` 同口径）——
+// 首仓每股成本 =(成交额+fee)/量；加仓 =(旧含费账+成交额+fee)/新量；印花税属卖出腿不摊买。
+// 旧实现成本只记成交均价，费用腿凭空蒸发，实盘账面系统性偏乐观。
+// English: §F1 regression — buy commission amortizes into position cost (fee-inclusive weighted
+// average, same convention as paper); stamp tax (a sell-leg tax) stays out of buy cost.
+func TestApplyRealFillBuyCostIncludesFee(t *testing.T) {
+	db := testDB(t)
+	if err := db.ApplyRealFill(RealFill{OrderID: "F-F1-1", Code: "600519.SH", Side: "买入",
+		Price: 10, Qty: 100, Amount: 1000, Fee: 5, TradedAt: "2026-09-22 09:31:00", UserID: "u1"}); err != nil {
+		t.Fatalf("buy#1: %v", err)
+	}
+	p, err := db.RealPositionByCode("600519.SH")
+	if err != nil {
+		t.Fatalf("read pos: %v", err)
+	}
+	if p.CostPrice != 10.05 || p.Amount != 1005 {
+		t.Fatalf("首仓应含费摊薄 cost=10.05/amount=1005, got %v/%v", p.CostPrice, p.Amount)
+	}
+	// 加仓 100@12 fee=6 → 含费总账 1005+1200+6=2211 → 每股 11.055
+	if err := db.ApplyRealFill(RealFill{OrderID: "F-F1-2", Code: "600519.SH", Side: "买入",
+		Price: 12, Qty: 100, Amount: 1200, Fee: 6, TradedAt: "2026-09-22 10:00:00", UserID: "u1"}); err != nil {
+		t.Fatalf("buy#2: %v", err)
+	}
+	if p, _ = db.RealPositionByCode("600519.SH"); p.CostPrice != 11.055 || p.Amount != 2211 {
+		t.Fatalf("加仓含费加权应得 11.055/2211, got %v/%v", p.CostPrice, p.Amount)
+	}
+	// 卖出费用腿不改持仓成本（印花税/佣金只进成交行，供盈亏统计扣减）
+	if err := db.ApplyRealFill(RealFill{OrderID: "F-F1-3", Code: "600519.SH", Side: "卖出",
+		Price: 13, Qty: 100, Amount: 1300, Fee: 6.5, StampTax: 6.5, TradedAt: "2026-09-22 14:00:00", UserID: "u1"}); err != nil {
+		t.Fatalf("sell: %v", err)
+	}
+	if p, _ = db.RealPositionByCode("600519.SH"); p.Qty != 100 || p.CostPrice != 11.055 {
+		t.Fatalf("卖出不改写每股成本, got qty=%d cost=%v", p.Qty, p.CostPrice)
+	}
+	// RealFills 读回必须带 fee/stamp_tax/user_id 腿（旧 SELECT 丢列——重放拿不到费用）
+	fills, err := db.RealFills()
+	if err != nil {
+		t.Fatalf("fills: %v", err)
+	}
+	if len(fills) != 3 {
+		t.Fatalf("应有 3 笔成交, got %d", len(fills))
+	}
+	var sawBuyFee, sawSellStamp bool
+	for _, f := range fills {
+		if f.OrderID == "F-F1-1" && f.Fee == 5 && f.UserID == "u1" {
+			sawBuyFee = true
+		}
+		if f.OrderID == "F-F1-3" && f.StampTax == 6.5 && f.Fee == 6.5 {
+			sawSellStamp = true
+		}
+	}
+	if !sawBuyFee || !sawSellStamp {
+		t.Fatalf("RealFills 费用腿回读失败: buyFee=%v sellStamp=%v", sawBuyFee, sawSellStamp)
+	}
+}
+
+// TestReconcileRejectsInvalidTsCode §F2（2026-09-22 修复批）：对账入口字段级校验——
+// 任一行 ts_code 为空或非法格式 → 整批拒收（ErrInvalidPositionReport），一行都不落库。
+// 锤实形态：一行 ts_code=” 垃圾行会让上层「本地有仓+空快照 409 守卫」永久误触发，
+// 真实全平无法经对账通道落账；且空主键行本身即脏数据。
+// English: §F2 — any blank/malformed ts_code rejects the whole snapshot, nothing is written.
+func TestReconcileRejectsInvalidTsCode(t *testing.T) {
+	db := testDB(t)
+	// 合法行 + 一行空 ts_code + 一行缺后缀：混批必须整体拒收
+	bad := []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10},
+		{TsCode: "", Name: "垃圾行", Qty: 100, CostPrice: 1},
+		{TsCode: "600519", Name: "缺后缀", Qty: 100, CostPrice: 1},
+	}
+	if _, err := db.ReconcilePositionsForUser("u_f2", bad); err == nil {
+		t.Fatal("混入非法 ts_code 的快照应整批拒收")
+	} else if !errors.Is(err, ErrInvalidPositionReport) {
+		t.Fatalf("拒收错误应包装 ErrInvalidPositionReport, got %v", err)
+	}
+	if _, err := db.UpsertRealPositions(bad); err == nil || !errors.Is(err, ErrInvalidPositionReport) {
+		t.Fatalf("UpsertRealPositions 同样必须整批拒收, got %v", err)
+	}
+	// 一行都未落库（含批内合法行）
+	all, err := db.RealPositions()
+	if err != nil || len(all) != 0 {
+		t.Fatalf("拒收后不得有任何落库, rows=%+v err=%v", all, err)
+	}
+	// 合法格式（含北交所 920 前缀 / 空快照=合法全平）放行
+	ok := []RealPosition{
+		{TsCode: "920001.BJ", Name: "北交所", Qty: 100, CostPrice: 10},
+		{TsCode: "000001.SZ", Name: "平安", Qty: 100, CostPrice: 12},
+	}
+	if n, err := db.ReconcilePositionsForUser("u_f2", ok); err != nil || n != 2 {
+		t.Fatalf("合法快照应正常对账, n=%d err=%v", n, err)
+	}
+	if _, err := db.ReconcilePositionsForUser("u_f2", nil); err != nil {
+		t.Fatalf("空快照（合法全平语义）不应被校验拒收: %v", err)
+	}
+}
+
+// TestReconcileDoesNotWashStrategyAttribution §M5（2026-09-22 修复批）：券商对账快照不带
+// strategy/signal_id，旧实现无保护覆写会把本地战法归因洗成空串（对照同函数 highest_price
+// 有 CASE 保护）。现仅当来源字段非空才覆盖；来源非空时新归因仍然生效（覆盖式修正）。
+// English: §M5 — reconcile must not wipe local strategy/signal_id when the snapshot
+// carries empty values; a non-empty snapshot value still wins.
+func TestReconcileDoesNotWashStrategyAttribution(t *testing.T) {
+	db := testDB(t)
+	// 本地持仓带战法归因（模拟 ApplyRealFill 建仓后的行）
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10, Strategy: "N字反包", SignalID: "buy:600000"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// 快照不带 strategy/signal_id（券商口径），仅数量变化
+	if _, err := db.ReconcilePositionsForUser("", []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 120, CostPrice: 10},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	p, err := db.RealPositionByCode("600000.SH")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if p.Qty != 120 {
+		t.Fatalf("数量应被快照刷新为 120, got %d", p.Qty)
+	}
+	if p.Strategy != "N字反包" || p.SignalID != "buy:600000" {
+		t.Fatalf("§M5 空快照归因被洗白: strategy=%q signal_id=%q", p.Strategy, p.SignalID)
+	}
+	// 快照携带非空 strategy/signal_id → 新值覆盖（归因修正通道不被守卫误锁）
+	if _, err := db.ReconcilePositionsForUser("", []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 120, CostPrice: 10, Strategy: "龙头首阴", SignalID: "manual-fix"},
+	}); err != nil {
+		t.Fatalf("reconcile2: %v", err)
+	}
+	p, _ = db.RealPositionByCode("600000.SH")
+	if p.Strategy != "龙头首阴" || p.SignalID != "manual-fix" {
+		t.Fatalf("非空来源字段应覆盖旧值: strategy=%q signal_id=%q", p.Strategy, p.SignalID)
+	}
+	// UpsertRealPositions 的 strategy 同样受洗白保护
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10},
+	}); err != nil {
+		t.Fatalf("upsert2: %v", err)
+	}
+	p, _ = db.RealPositionByCode("600000.SH")
+	if p.Strategy != "龙头首阴" {
+		t.Fatalf("§M5 UpsertRealPositions 空 strategy 不应洗掉归因, got %q", p.Strategy)
 	}
 }

@@ -208,7 +208,7 @@ func (f *QMTFeed) applyTicks(ticks map[string]QMTTick) int {
 	if hits == 0 {
 		return 0
 	}
-	base.Source = "QMT-L1"
+	base.Source = QuoteSourceQMTL1 // §M1 枚举常量（/api/status quote_source 契约单源化）
 	base.Time = now
 	f.fetcher.IngestSnapshot(base)
 	return hits

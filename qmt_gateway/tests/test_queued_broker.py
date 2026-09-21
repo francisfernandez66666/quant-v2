@@ -98,6 +98,49 @@ class TestQueuedBrokerStore(unittest.TestCase):
         self.assertEqual(b.query_positions()[0]["qty"], 100)
         self.assertEqual(b.query_asset()["cash"], 100000)
 
+    def test_dispatch_reap_stale_inflight(self):
+        """§M16：取单落 inflight_at；超龄 inflight 收割判废落 done，新鲜不误收。"""
+        seq = self.store.dispatch_enqueue_order(
+            {"signal_id": "S9", "code": "600519.SH", "side": "买入", "qty": 100})
+        items = self.store.dispatch_pending()
+        self.assertEqual(len(items), 1)
+        row = self.store.dispatch_get(seq)
+        self.assertEqual(row["status"], "inflight")
+        self.assertTrue(row["inflight_at"])  # §M16 转 inflight 即落取单时刻
+        # 阈值内：一条不收（回报窗口未过）
+        self.assertEqual(self.store.dispatch_reap_stale_inflight(1800), [])
+        # 人为推老取单时刻 → 收割：status done、result 判废留痕
+        with self.store._lock:
+            self.store._conn.execute(
+                "UPDATE dispatch SET inflight_at = ?", ("2020-01-01T00:00:00+08:00",))
+            self.store._conn.commit()
+        reaped = self.store.dispatch_reap_stale_inflight(1800)
+        self.assertEqual([r["seq"] for r in reaped], [seq])
+        done = self.store.dispatch_get(seq)
+        self.assertEqual(done["status"], "done")
+        result = json.loads(done["result"])
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("reaped"))
+        self.assertEqual(self.store.dispatch_stats().get("inflight", 0), 0)
+
+    def test_dispatch_reap_fallback_created_at_and_disabled(self):
+        """§M16：老行（无 inflight_at）回退 created_at 判龄；阈值<=0 视为关闭收割。"""
+        seq = self.store.dispatch_enqueue_order(
+            {"signal_id": "S10", "code": "000001.SZ", "side": "买入"})
+        self.store.dispatch_pending()
+        with self.store._lock:
+            self.store._conn.execute(
+                "UPDATE dispatch SET inflight_at = '', created_at = ? WHERE seq = ?",
+                ("2020-01-01T00:00:00+08:00", seq))
+            self.store._conn.commit()
+        # 关闭态（<=0）不收割
+        self.assertEqual(self.store.dispatch_reap_stale_inflight(0), [])
+        self.assertEqual(self.store.dispatch_get(seq)["status"], "inflight")
+        # 打开后按 created_at 龄收割
+        reaped = self.store.dispatch_reap_stale_inflight(1800)
+        self.assertEqual([r["seq"] for r in reaped], [seq])
+        self.assertEqual(self.store.dispatch_get(seq)["status"], "done")
+
 
 class TestQueuedHTTP(unittest.TestCase):
     """HTTP 端到端：queued 模式 /order → 派发 → 假桥取单成交 → 量仔事件 → /state。"""
@@ -246,6 +289,31 @@ class TestQueuedHTTP(unittest.TestCase):
         self.assertEqual(status, 200)
         _, state = self._req("GET", "/state")
         self.assertEqual(state["orders"][0]["status"], "已撤")
+
+    def test_reap_stale_inflight_downgrades_order(self):
+        """§M16：桥取单后回报丢失、inflight 超龄 → 网关收割并回写 orders「已废」，不再永挂。"""
+        self._bridge_online()
+        status, body = self._req("POST", "/order", {
+            "signal_id": "S9", "code": "600519.SH", "side": "买入",
+            "price": 1510, "qty": 100, "created_at": "t"})
+        self.assertEqual(status, 200)
+        seq = body["order_id"]
+        # 桥取单（inflight），随后"回报丢失"（不再回 order_result）
+        status, pend = self._req("GET", "/dispatch/pending")
+        self.assertEqual([i["seq"] for i in pend["items"]], [seq])
+        # 收割龄推到超龄（测试不等 30min 钟）
+        with self.gw.store._lock:
+            self.gw.store._conn.execute(
+                "UPDATE dispatch SET inflight_at = ?", ("2020-01-01T00:00:00+08:00",))
+            self.gw.store._conn.commit()
+        n = self.gw._reap_dispatch_inflight("测试")
+        self.assertEqual(n, 1)
+        # orders 侧降级：已废（对账闭环），dispatch 队列 inflight 清零
+        _, state = self._req("GET", "/state")
+        self.assertEqual(state["orders"][0]["status"], "已废")
+        stats = self.gw.store.dispatch_stats()
+        self.assertEqual(stats.get("inflight", 0), 0)
+        self.assertEqual(self.gw.store.dispatch_get(seq)["status"], "done")
 
     def test_admin_broker_switch(self):
         """/admin/broker 切换 active 通道；/health 透出双状态。"""

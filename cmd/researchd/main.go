@@ -20,6 +20,8 @@ import (
 	"time"
 	_ "time/tzdata" // §TZ1 内嵌 IANA 时区库：Windows/精简容器保证 Asia/Shanghai 可加载
 
+	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/scheduler"
 )
@@ -56,6 +58,27 @@ func main() {
 	opslog.Logf("research", "研究调度服务启动 dataDir=%s tz=%s", dataDir, time.Local.String())
 
 	sch := scheduler.New(dataDir, "", "")
+
+	// §M14（2026-09-22）同因连败熔断告警接线：researchd 此前无任何推送通道（PushGateway
+	// 生产仅 quant 侧在用），任务被熔断挂起若只落 opslog 等于静默死亡。现按 config.json
+	// notify 段装配推送网关（APK 极光/webhook + ntfy 运维独立通道），经 SetAlertFunc 注入
+	// 调度器——熔断触发时以 LevelHigh 高优推送一次（静默时段亦放行）。
+	notifier := notify.New()
+	if nc := config.NewManager(filepath.Join(dataDir, "config.json")).GetNotifyConfig(); nc != nil {
+		if nc.Push.Enabled {
+			if nc.Push.Provider == "jpush" {
+				notifier.SetGateway(notify.NewJPushGateway(nc.Push.AppKey, nc.Push.Secret, nc.Push.Alias))
+			} else if nc.Push.URL != "" {
+				notifier.SetGateway(notify.NewWebhookGateway(nc.Push.URL))
+			}
+		}
+		if gw := notify.NewNtfyGateway(nc.NtfyURL, nc.NtfyTopic); gw != nil {
+			notifier.SetNtfy(gw)
+		}
+	}
+	sch.SetAlertFunc(func(title, content string) {
+		notifier.PushGateway(notify.Message{Level: notify.LevelHigh, Title: title, Content: content})
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

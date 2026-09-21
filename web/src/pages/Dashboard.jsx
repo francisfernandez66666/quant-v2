@@ -61,6 +61,13 @@ function chgColor(v) {
  * 聚合展示策略信号、热门个股、宏观日历、IPO、热门板块、数据源与引擎健康等。
  * @returns {JSX.Element}
  */
+// newsMark §M3（2026-09-22）新闻源健康点渲染：后端已改真实探测结构体
+// （{status: ok|down|unknown, ...}，键名 cailanshe 修正拼写）。三态口径——
+// ok=●（绿点）、down=○（确证失败）、unknown=–（从未探测，绝不伪装成健康）。
+// （Tri-state glyph for M3's real probe payload: ok ● / down ○ / unknown –.）
+const newsMark = (entry) =>
+  entry?.status === 'ok' ? '●' : entry?.status === 'unknown' || !entry ? '–' : '○'
+
 export default function Dashboard() {
   // 策略信号列表（来自后端扫描结果）
   const [signals, setSignals] = useState([])
@@ -374,7 +381,7 @@ export default function Dashboard() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
           <span>运行 {status.uptime || '-'}</span>
           <span>数据源：东财{dataSourceHealth.eastmoney ? '●' : '○'} 新浪{dataSourceHealth.sina ? '●' : '○'} 腾讯{dataSourceHealth.tencent ? '●' : '○'} 同花顺{dataSourceHealth.ths ? '●' : '○'}</span>
-          <span>新闻：财联社{newsSourceHealth.cainanshe ? '●' : '○'} 同花顺{newsSourceHealth.kuaixun ? '●' : '○'} 新浪{newsSourceHealth.sina ? '●' : '○'}</span>
+          <span>新闻：财联社{newsMark(newsSourceHealth.cailanshe)} 同花顺{newsMark(newsSourceHealth.kuaixun)} 新浪{newsMark(newsSourceHealth.sina)}</span>
           <span>快照 {scanStats.total_stocks || 0}股 / {scanStats.hot_sector_count || 0}板块</span>
           <span>原始 {scanStats.raw_signals || 0} → 最终 {scanStats.final_signals || 0}</span>
           <span>流程引擎：新闻抓取{engineHealth.news_agent ? '●' : '○'} 策略引擎{engineHealth.strategy_engine ? '●' : '○'} 板块验证{engineHealth.sector_agent ? '●' : '○'} 战法扫描{engineHealth.combat_agent ? '●' : '○'} LLM{engineHealth.llm ? '●' : '○'} 同花顺{engineHealth.ths ? '●' : '○'} 聚合器{engineHealth.aggregator ? '●' : '○'}</span>

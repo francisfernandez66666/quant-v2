@@ -119,6 +119,11 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	d1Scores := e.lastD1Scores         // 复用主循环最近一轮 D1 评分，不每 5s 调 LLM
 	bearReasons := e.lastBearReasons   // FIX#13 复用主循环利空归因（实盘建议利空→自动清仓）
 	e.mu.RUnlock()
+	// §M9 轮首快照：本 5s 轮所有 sell_unified_mode 消费方（pushRealAdvice 统一卖出裁决 /
+	// autoExecuteRealSells 来源闸 / paperSignals 证据闸 / judgePaperLedgers）共用此一个值。
+	// 轮中配置翻转（shadow→on）不再产生「旧口径已关旧出口、新口径裁决未跑」的保护空窗轮。
+	// English: round-start snapshot of sell_unified_mode threaded to all same-round consumers.
+	roundSellMode := e.sellUnifiedModeEngine()
 	if f == nil {
 		return
 	}
@@ -209,6 +214,10 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	md := e.strategy.BuildScoringData(ctx, pool, quotes)
 	scores, sigs := e.combatAgent.ScorePool(pool, md, d1Scores, emotionPhase)
 	// §SELLPOINT-UNIFY 边界⑥：登记本轮打分时刻，卖出裁决通道的做多新鲜度基准。
+	// §H5（2026-09-22 修复批）此全局时钟语义降级为「兜底基准」：新鲜度主判据改为打分自身
+	// 产分时刻（StockScores.UpdatedAt，5s 轮与 5min 批量轮都自带），本字段只兜底无时刻的
+	// 存量装配。5min 批量轮同样推进该时钟（见 engine.go 主循环第 12 步后），池空提前 return
+	// 不再冻结全源新鲜度判定。
 	e.mu.Lock()
 	e.scoresAt = time.Now()
 	e.mu.Unlock()
@@ -266,7 +275,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// English: live position advice (AUTO_TRADING_PLAN M1) — when qmt.enabled, generates 加仓/减仓/止盈/
 	// 止损/格局 advice for the real book (real_positions) and pushes it to the frontend live tab via SSE.
 	// Trading-hours only; no cost when disabled or no holdings. Never touches the paper book.
-	e.pushRealAdvice(md, scores, d1Scores, emotionPhase, quotes, bearReasons)
+	e.pushRealAdvice(md, scores, d1Scores, emotionPhase, quotes, bearReasons, roundSellMode)
 
 	// 开市(9:30)前及午休(11:30-13:00)只更新评分数字，不发布任何战法信号：
 	// 盘前无实盘成交量，双响炮/龙头等易基于存量历史数据误报（如整池双响炮全 70、9:11 龙头）；
@@ -345,7 +354,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		// price once confirmed (paper and live both benefit), removing whole-round "signal present, no quote" rejects.
 		e.ensureBuyQuotes(buys, quotes)
 		exitSell := append(append([]combat_agent.Signal{}, exitSigs...), alertSigs...)
-		e.paperSignals(buys, exitSell, quotes)
+		e.paperSignals(buys, exitSell, quotes, roundSellMode)
 
 		// 实盘 auto 下单（§FIX-0921f 接线点 → §SIGNAL_CONTROLLER 20260917）：
 		// 全量活跃买入信号送信号控制器 live 通道统一裁定（战法白名单/黑名单/持续性确认窗，
@@ -368,7 +377,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 		BearReasons: bearReasons,
 		PoolQuotes:  exitQuotes,
 		SnapQuotes:  quotes,
-	})
+	}, roundSellMode)
 
 	// 模拟盘估值与日净值：每轮用实时快照价刷新持仓市值，并记录当日净值点。
 	// English: paper mark-to-market + daily equity point each round, using the live snapshot.
@@ -608,11 +617,14 @@ func filterTransitionSignals(sigs []combat_agent.Signal, prev map[string]map[str
 // pushRealAdvice 实盘持仓处理分析（AUTO_TRADING_PLAN M1）：qmt.enabled 时对真实持仓生成建议。
 // 每 5s 读 real_positions → trading.Advise（复用卖出侧 + 加仓/格局规则）→ SSE 推前端实盘 tab。
 // 熔断健康探测也在此节流执行（网关失联 → 暂停下单并告警）。仅交易时段运行（盘后省内存）。
-// English: live position advice (AUTO_TRADING_PLAN M1) — when qmt.enabled, reads real_positions each 5s,
-// runs trading.Advise (sell-side reuse + add/hold rules), and pushes the advice to the frontend live tab
-// via SSE. Circuit-breaker health probing is also throttled here (gateway loss pauses orders and alerts).
-// Trading-hours only (after-hours skips to save memory).
-func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, scores map[string]combat_agent.StockScores, d1Scores map[string]combat_agent.D1Score, emotionPhase string, quotes map[string]*data.StockInfo, bearReasons map[string]string) {
+// sellMode=§M9（2026-09-22 修复批）轮首快照：sell_unified_mode 由宿主循环本轮开始时读一次注入，
+// 本函数内三个消费点（统一裁决 runSellUnifiedJudge / 投影与旧五路取舍 Advise / 来源闸
+// autoExecuteRealSellsRound）共用同一快照——旧实现各自独立读配置，shadow→on 中途翻转会出现
+// 「旧路被来源闸关闭、统一投影又没生成」的既无卖出也无裁决的保护空轮（保护性止损跳过一轮）。
+// English: live position advice — sellMode is the round-start sell_unified_mode snapshot (§M9);
+// every consumer inside this round reads the snapshot, never the live config, so a mid-round flip
+// can no longer produce a round with neither the legacy path nor the unified projection.
+func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, scores map[string]combat_agent.StockScores, d1Scores map[string]combat_agent.D1Score, emotionPhase string, quotes map[string]*data.StockInfo, bearReasons map[string]string, sellMode string) {
 	e.mu.RLock()
 	ctrl := e.qmtCtrl
 	realStore := e.realStore
@@ -698,10 +710,12 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	// §REFACTOR_UNIFIED_SELL P2：统一卖出裁决先于展示拼装运行（同轮行情/信号，留痕与卡片时刻对齐）。
 	// shadow（缺省）只留痕不改行为；on 时本轮裁决处置/观察结论经 unifiedSellViews 投影为卖出卡片
 	// 唯一来源，旧五路在 Advise 内整体跳过。
-	// English: P2 — the unified sell judge runs before display assembly; under mode=on its projection
-	// is the only sell-card source (legacy five-way assembly is skipped inside Advise).
-	sellMode := sellUnifiedModeOf(ctrl.Config())
-	sellVerdicts := e.runSellUnifiedJudge(sendTo, positions, exitQuotes, quotes, scores, d1Scores, bearReasons)
+	// §M9（2026-09-22 修复批）sellMode=轮首快照（入参），本轮所有消费点（裁决/投影/来源闸）
+	// 一律用它，函数内不再读配置——旧实现此处+runSellUnifiedJudge+autoExecuteRealSells 一轮三读，
+	// 翻转时机不当即产生「既无旧路卖出也无统一投影」的保护空轮。
+	// English: §M9 — sellMode is the round-start snapshot threaded in by the host loop; every
+	// consumer in this round uses it instead of re-reading config.
+	sellVerdicts := e.runSellUnifiedJudge(sendTo, positions, exitQuotes, quotes, scores, d1Scores, bearReasons, sellMode)
 	// §PROD-T1 可卖量一次装配：Advise 的 T+1 卖出闸与 P2 处置降级共用同一口径。
 	sellableQty := sellableQtyByCode(realStore, sendTo, positions)
 	var sellProjection []trading.UnifiedSellView
@@ -746,7 +760,8 @@ func (e *Engine) pushRealAdvice(md map[string]*strategy_engine.StockMarketData, 
 	if len(advices) > 0 {
 		// §P1-4（2026-09-15）：卖出自动执行链路透传行情快照（CurrentPrice/PrevClose 由
 		// sellRealPosition 注入 OrderRequest），涨跌停闸对自动卖单真正生效。
-		e.autoExecuteRealSells(sendTo, ctrl, realStore, advices)
+		// §M9：来源闸吃轮首快照，与上方投影/裁决同一口径（见 pushRealAdvice 头注释）。
+		e.autoExecuteRealSellsRound(sendTo, ctrl, realStore, advices, sellMode)
 	}
 
 	// §SELLPOINT-UNIFY P1-b/P2：卖出统一裁决通道已上移至 trading.Advise 之前运行（见上方
@@ -868,25 +883,43 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 		log.Printf("[qmt] 自动卖出 %s(%s) 失败: %v", p.TsCode, p.Name, err)
 		return err
 	}
-	if res != nil && !res.OK && strings.Contains(res.Err, "duplicate") {
-		// §GAP2-W1 语义更新：duplicate 现在只可能意味着"当日同类卖单已真实报出"
-		// （发送失败的单会经 MarkRealOrderSendFailed→ResetFailedRealOrder 放行重试，
-		// 不再以 duplicate 形态出现），因此幂等命中=目标已达成，静默返回是正确行为。
-		return nil // 当日已下过同类卖单（幂等命中），静默
+	if res != nil && !res.OK {
+		if strings.Contains(res.Err, "duplicate") {
+			// §GAP2-W1 语义更新：duplicate 现在只可能意味着"当日同类卖单已真实报出"
+			// （发送失败的单会经 MarkRealOrderSendFailed→ResetFailedRealOrder 放行重试，
+			// 不再以 duplicate 形态出现），因此幂等命中=目标已达成，静默返回是正确行为。
+			return nil // 当日已下过同类卖单（幂等命中），静默
+		}
+		// §H4（2026-09-22 修复批）业务拒单不再假成功：网关 200+ok:false（券商拒单等）时
+		// err 为 nil，旧实现只打日志就返回 nil——调用方把"没卖出去"当成功，幂等槽（realTrimDone）
+		// 被假成功烧掉，当日永不再试。控制器已把占位行降级"发送失败"（§R3-1 P0-A，同键可重试），
+		// 此处按失败返回错误，由调用方决定"槽不烧、下一轮重试"。
+		reject := res.Err
+		if reject == "" {
+			reject = "网关未受理"
+		}
+		log.Printf("[qmt] 自动卖出 %s(%s) 被网关拒单: %s", p.TsCode, p.Name, reject)
+		return fmt.Errorf("sell %s rejected: %s", p.TsCode, reject)
 	}
 	log.Printf("[qmt] 自动卖出 %s(%s) %d股 @%.2f 类别=%s 原因=%s → %+v",
 		p.TsCode, p.Name, qty, price, class, reason, res)
 	return nil
 }
 
-// autoExecuteRealSells §GAP1.1 止损级建议自动全仓卖出（qmt.auto_sell + mode=auto）。
-// 仅 Action=止损 触发（止盈/减仓保持提醒半自动，由前端确认执行）；行情缺失跳过。
+// autoExecuteRealSells §GAP1.1 的兼容入口（未指定轮次快照的调用方/测试用）：
+// 以调用时刻的配置读取作为「本轮」快照。生产链路（pushRealAdvice）一律改走
+// autoExecuteRealSellsRound 并吃轮首快照（§M9），杜绝同轮内各消费点各读各的。
+func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, realStore *store.DB, advices []trading.PositionAdvice) {
+	e.autoExecuteRealSellsRound(userID, ctrl, realStore, advices, e.sellUnifiedModeEngine())
+}
+
+// autoExecuteRealSellsRound 自动卖出执行体（§M9：sellMode=轮首快照，函数内不读配置）。
 // §R3-1 P0-B 按账号过滤：此前读全表 RealPositions()——多账号部署下 A 账号的止损建议可能
 // 匹配到 byCode 映射里 B 账号的同名持仓并真实卖出（资损级）。与建议生成路径的
 // §GAP2-W2 收敛口径对齐，统一走 RealPositionsForUser(userID)。
 // English: R3-1 P0-B — filter positions by account: the old full-table RealPositions() could pair
 // account A's stop-loss advice with account B's same-code position and really sell it.
-func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, realStore *store.DB, advices []trading.PositionAdvice) {
+func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controller, realStore *store.DB, advices []trading.PositionAdvice, sellMode string) {
 	if realStore == nil || ctrl == nil {
 		return
 	}
@@ -924,10 +957,12 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 	// §REFACTOR_UNIFIED_SELL P2 切闸：sell_unified_mode=on 时唯一执行出口=裁决层 pass 处置单
 	//（Source=unified）。旧「止损级任意来源直放」后门与 short_tactic 直卖后门被来源闸一并关闭；
 	// M8 组合回撤熔断不经本函数（checkM8RealDrawdown 直调 sellRealPosition，独立保险丝保留）。
+	// §M9：判定取轮首快照入参，与同轮 runSellUnifiedJudge/投影同一口径——旧实现在此独立读配置，
+	// shadow→on 翻转时本轮既关旧路又无投影（保护空轮）。
 	// English: P2 gate — under mode=on only unified-adjudicator disposals may execute here; the
 	// any-source stop-loss backdoor and the short_tactic direct-sell path are closed. M8 stays a
-	// separate fuse outside this function.
-	sellUnifiedOnly := sellUnifiedModeOf(ctrl.Config()) == "on"
+	// separate fuse outside this function. §M9: the mode is the round-start snapshot param.
+	sellUnifiedOnly := sellMode == "on"
 	byCode := make(map[string]store.RealPosition, len(positions))
 	for _, p := range positions {
 		byCode[pureTsCode(p.TsCode)] = p
@@ -981,6 +1016,11 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 		// §统一纪律：减仓半平每码每日一次（纪律状态机每轮重放 ActionTrim，须去重防反复减半）。
 		// English: trim halves at most once per code per day (the discipline state machine re-fires
 		// ActionTrim every round — dedup prevents repeated halving).
+		// §H4（2026-09-22 修复批）幂等槽「先成功后烧」：旧实现在下卖单前置 realTrimDone、随后
+		// sellRealPosition 的错误又被 `_ =` 丢弃——卖单失败（熔断/风控拒单/网关业务拒单）时当日
+		// 减仓槽位已烧，之后每轮重放全被去重拦截，减仓永久错过。现在预检只读不写，卖单成功返回
+		// （含 duplicate 幂等命中=目标已达成）后才回写槽位；失败打 log+opslog，槽位不烧、下一轮可重试。
+		trimDay := ""
 		if class == "减仓" {
 			e.mu.Lock()
 			if e.realTrimDone == nil {
@@ -991,8 +1031,8 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 				e.mu.Unlock()
 				continue
 			}
-			e.realTrimDone[p.TsCode] = day
 			e.mu.Unlock()
+			trimDay = day
 			// §P0-3（2026-09-15）：减仓量必须整手（主板 100 股/手）——旧实现 remaining/2 会把
 			// 1500 股减成卖 750（非整手非全平）→ 柜台废单，既没减成还烧一次委托；paper 侧同逻辑
 			// 早有 /2/100*100 取整（paper.go），实盘路径补齐同款。取整后为 0（持仓<200 股）降级为
@@ -1006,7 +1046,24 @@ func (e *Engine) autoExecuteRealSells(userID string, ctrl *trading.Controller, r
 			qty = remaining
 		}
 		sid := fmt.Sprintf("%s:r%d", base, qty)
-		_ = e.sellRealPosition(ctrl, p, qty, sid, a.RefPrice, class, a.Reason)
+		// §H4（2026-09-22 修复批）错误不再吞：卖单失败即 log + opslog 留档（5s 轮高频，opslog 按
+		// 码+类别 1 分钟节流），幂等槽不烧，纪律状态机下一轮重放同键补卖（占位行已降级"发送失败"可重试）。
+		if serr := e.sellRealPosition(ctrl, p, qty, sid, a.RefPrice, class, a.Reason); serr != nil {
+			log.Printf("[qmt] 实盘自动卖单失败 %s(%s) 类别=%s: %v（幂等槽未烧，下一轮可重试）", p.TsCode, p.Name, class, serr)
+			opslog.OncePer("real-sell-fail:"+pureTsCode(p.TsCode)+":"+class, time.Minute, func() {
+				opslog.Logf("quant", "实盘自动卖单失败 %s(%s) 类别=%s 建议原因=%s: %v", p.TsCode, p.Name, class, a.Reason, serr)
+			})
+			continue
+		}
+		if class == "减仓" {
+			// §H4 卖单成功后才烧当日减仓槽（duplicate 幂等命中同样视为目标达成，一样烧槽）。
+			e.mu.Lock()
+			if e.realTrimDone == nil {
+				e.realTrimDone = map[string]string{}
+			}
+			e.realTrimDone[p.TsCode] = trimDay
+			e.mu.Unlock()
+		}
 	}
 }
 
@@ -1104,7 +1161,11 @@ func (e *Engine) checkM8RealDrawdown(ctrl *trading.Controller, realStore *store.
 		remaining := p.Qty - filled
 		if remaining > 0 {
 			sid := fmt.Sprintf("%s:r%d", base, remaining)
-			_ = e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", verdict.Reason+"兜底清仓")
+			// §H4（2026-09-22 修复批）同批止吞错：M8 清仓失败不再 `_ =` 静默——占位行已降级
+			// "发送失败"，下一轮 M8 仍触发时同键可重试；这里补一条显式失败日志留证。
+			if serr := e.sellRealPosition(ctrl, p, remaining, sid, price, "m8", verdict.Reason+"兜底清仓"); serr != nil {
+				log.Printf("[qmt] M8 兜底清仓卖单失败 %s(%s): %v（下一轮 M8 触发可重试）", p.TsCode, p.Name, serr)
+			}
 		}
 	}
 }

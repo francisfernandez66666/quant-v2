@@ -17,6 +17,8 @@ const POS = {
 // api 层整体 mock：页面只消费 fetchPaperState 固定账本 + 空行情/空统计，聚焦"手→股"换算呈现。
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
+  // §M13：补齐 mock 缺失导出（与 api/index.js 真实实现一致，仅按状态码判定，不改变本文件既有断言）。
+  isForbidden: (e) => !!(e && e.status === 403),
   fetchPaperState: vi.fn(async () => ({
     is_admin: true, enabled: true,
     stats: { initial_capital: 100000, cash: 95000, market_value: 4900, total_value: 99900, total_return_pct: -0.1, today_return_pct: 0, realized_pnl: 0, open_positions: 1, win_rate_pct: 0, filled_buys: 1, avg_slippage_pct: 0, avg_latency_sec: 2, max_latency_sec: 2, slippage_cost: 0, signal_amount_pct: 0 },

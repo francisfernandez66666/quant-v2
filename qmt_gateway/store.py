@@ -146,6 +146,7 @@ class Store:
                 status      TEXT DEFAULT 'pending', -- pending|inflight|done
                 result      TEXT DEFAULT '',      -- JSON 结果（ok/err/order_id 等）
                 created_at  TEXT DEFAULT '',
+                inflight_at TEXT DEFAULT '',      -- §M16 取单转 inflight 时刻（超时收割龄判据）
                 user_id     TEXT DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_dispatch_status ON dispatch(status);
@@ -207,6 +208,7 @@ class Store:
                 status      TEXT DEFAULT 'pending',
                 result      TEXT DEFAULT '',
                 created_at  TEXT DEFAULT '',
+                inflight_at TEXT DEFAULT '',      -- §M16 取单转 inflight 时刻（超时收割龄判据）
                 user_id     TEXT DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_dispatch_status ON dispatch(status);
@@ -225,6 +227,11 @@ class Store:
             );
             """
         )
+        # §M16（2026-09-22）：既有 dispatch 表（列建于更早版本）补 inflight_at 列——
+        # inflight 超时收割的龄判据；SQLite ALTER 无 IF NOT EXISTS，先查 PRAGMA 再按需加。
+        dcols = [r[1] for r in self._conn.execute("PRAGMA table_info(dispatch)").fetchall()]
+        if dcols and "inflight_at" not in dcols:
+            self._conn.execute("ALTER TABLE dispatch ADD COLUMN inflight_at TEXT DEFAULT ''")
         self._conn.commit()
 
     # ── orders ──
@@ -591,7 +598,7 @@ class Store:
             cur = self._conn.execute(
                 "INSERT INTO outbox(payload, created_at) VALUES(?,?)",
                 (json.dumps(payload, ensure_ascii=False, default=json_default),
-                 time.strftime("%Y-%m-%dT%H:%M:%S+08:00")))
+                 _now_cn()))  # §TZ 统一显式北京时区，不再裸 strftime 贴假 +08:00
             self._conn.commit()
             return cur.lastrowid
 
@@ -626,7 +633,7 @@ class Store:
             self._conn.execute(
                 "INSERT INTO outbox_dead(payload, reason, created_at) VALUES(?,?,?)",
                 (json.dumps(payload, ensure_ascii=False, default=json_default), reason,
-                 time.strftime("%Y-%m-%dT%H:%M:%S+08:00")))
+                 _now_cn()))  # §TZ 统一显式北京时区
             self._conn.commit()
 
     def outbox_trim(self, cap):
@@ -743,13 +750,20 @@ class Store:
             return dict(row) if row else None
 
     def dispatch_pending(self, limit=50):
-        """原子取出 pending 派发项并标记 inflight（桥取单，防并发双执行）。返回 dict 列表。"""
+        """原子取出 pending 派发项并标记 inflight（桥取单，防并发双执行）。返回 dict 列表。
+
+        §M16：转 inflight 同时落 inflight_at 取单时刻——收割龄以「被取走的时间」计，
+        而非入队时间（在 pending 排到阈值附近才被取走的单不该立刻被收割）。
+        """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM dispatch WHERE status = 'pending' ORDER BY id LIMIT ?",
                 (limit,)).fetchall()
+            now = _now_cn()
             for r in rows:
-                self._conn.execute("UPDATE dispatch SET status = 'inflight' WHERE id = ?", (r["id"],))
+                self._conn.execute(
+                    "UPDATE dispatch SET status = 'inflight', inflight_at = ? WHERE id = ?",
+                    (now, r["id"]))
             self._conn.commit()
             return [dict(r) for r in rows]
 
@@ -763,6 +777,47 @@ class Store:
             rows = self._conn.execute(
                 "SELECT * FROM dispatch WHERE status = 'inflight' ORDER BY id LIMIT ?",
                 (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def dispatch_reap_stale_inflight(self, max_age_sec, reason="inflight 超时未回报，网关收割"):
+        """§M16（2026-09-22）：收割超龄 inflight 派发项——inflight 永挂的兜底闭环。
+
+        背景：/dispatch/pending 取单即置 inflight，此后完全依赖桥回报结算。HTTP 桥
+        不识别 diag kind、unknown kind 只 warn 不回执、桥崩溃/重启丢回执——该行就永久
+        停在 inflight：dispatch_stats 只增不减，orders 侧「已报」无人推进（与 §R4-1
+        撤单闭环对真实委托的覆盖不对称）。此处把「取单时刻（inflight_at，老行回退
+        created_at）超过 max_age_sec 仍未结算」的行统一判废落 done：
+          - 不回 pending：桥可能已真实下单，重新排队 = 重复真实下单（策略桥 :989 同论），
+            安全侧判废留痕，由人工/对账兜底；
+          - result 落 {ok:false, err:reason, reaped:true}，与桥负回执同构，
+            orders 回写「已废」由网关侧（gateway._reap_dispatch_inflight）完成。
+        max_age_sec<=0 视为不收割（阈值置 0，一条不删）。返回被收割行的结算前快照列表。
+        English: §M16 — reaps dispatch rows stuck in inflight past the timeout and settles
+        them as rejected (never re-queued, since the bridge may already have ordered).
+        """
+        import time as _time  # noqa: PLC0415
+        threshold = (_time.time() - max_age_sec) if max_age_sec > 0 else 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dispatch WHERE status = 'inflight' "
+                "AND COALESCE(NULLIF(inflight_at, ''), created_at) <> '' "
+                "AND CAST(strftime('%s', COALESCE(NULLIF(inflight_at, ''), created_at)) AS INTEGER) < ?",
+                (threshold,),
+            ).fetchall()
+            if not rows:
+                return []
+            for r in rows:
+                merged = {}
+                if r["result"]:
+                    try:
+                        merged.update(json.loads(r["result"]))
+                    except ValueError:  # noqa: BLE001 — 脏 result 行直接覆盖
+                        pass
+                merged.update({"ok": False, "err": reason, "reaped": True})
+                self._conn.execute(
+                    "UPDATE dispatch SET status='done', result=? WHERE id=?",
+                    (json.dumps(merged, ensure_ascii=False, default=json_default), r["id"]))
+            self._conn.commit()
             return [dict(r) for r in rows]
 
     def dispatch_set_result(self, seq, result):
@@ -843,8 +898,14 @@ def _now_cn():
 
     用于订单/成交时间落库的统一口径，保证本机（广州）时区语义一致。
     English: returns the current Beijing-time ISO timestamp for consistent order/fill timestamps.
+
+    §TZ（2026-09-22 修复批，LOW「strftime 假 +08:00」根治）：旧实现用**本机钟面**的
+    strftime 直接拼出带 +08:00 后缀的字符串 —— 展开的是本地墙钟却硬贴东八区标签，
+    部署到非北京时区机器（如首尔 UAT/迁移机）即产出偏移造假的时间串。
+    现改为显式北京时区（CN_TZ=UTC+8 定区，不依赖本机 TZ 与 tzdata）取值后再格式化，
+    钟面与标签恒一致；本函数是全网关落库时间串的唯一收敛点（§M16 风格的延续）。
     """
-    return time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    return datetime.now(CN_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
 def json_default(o):

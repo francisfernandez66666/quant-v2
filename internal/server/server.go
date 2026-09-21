@@ -39,6 +39,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -506,6 +507,10 @@ func (s *Server) GetSSE() *SSEBroker { return s.sse }
 
 // registerRoutes 注册全部 HTTP 路由：
 // 认证/初始化（register/temp/login/setup）无需鉴权；业务 API 统一包一层 authMiddleware。
+// §F3（2026-09-22 修复批）404/405 统一 JSON 信封的接线在 muxWithJSONErrors（同文件）：
+// 本工具链（go1.26 路由重构版）的 http.ServeMux 已无 NotFound/MethodNotAllowed 挂载字段，
+// 改为在 mux 出口前用 mux.Handler(r) 预判「未命中任何注册 pattern」并走 writeError。
+// 若上游 Go 恢复该字段，可迁移为 s.mux.NotFound/s.mux.MethodNotAllowed 直挂同一出口。
 func (s *Server) registerRoutes() {
 	// ── 认证/初始化端点：完全匿名可达（注册/临时号实际已关闭，返回 403 提示文案）──
 	s.mux.HandleFunc("POST /auth/register", s.handleRegister)
@@ -560,7 +565,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/opslog/dates", s.adminMiddleware(s.handleOpslogDates))
 	s.mux.HandleFunc("GET /api/opslog", s.adminMiddleware(s.handleOpslog))
 	// §R4-9 指标面（鉴权后导出 expvar：下单/熔断/撤单/LLM 降级等关键事件计数）
-	s.mux.HandleFunc("GET /api/metrics", s.authMiddleware(http.HandlerFunc(expvar.Handler().ServeHTTP)))
+	// §EXPVAR（2026-09-22 LOW 族收口）：expvar.Handler() 即 /debug/vars 的整套默认注册表
+	// （含 cmdline/memstats/全部业务计数器），属运维面数据，此前仅 authMiddleware——
+	// 任意登录成员可枚举。现升 adminMiddleware，与同文件 :565 opslog 及 prometheus/alerts
+	// 等运维端点鉴权口径一致。另锤实：本服务只听自有 mux（muxWithJSONErrors），
+	// expvar 包 init 注册的 http.DefaultServeMux /debug/vars 从未被挂载/监听，无第二暴露面；
+	// 路由守卫测试见 expvar_admin_guard_test.go（含 /debug/vars 404 现状锁）。
+	s.mux.HandleFunc("GET /api/metrics", s.adminMiddleware(http.HandlerFunc(expvar.Handler().ServeHTTP)))
 	// §WS-L 维5 Prometheus text 导出（admin 鉴权，promtool 可校验）+ 阈值告警状态
 	s.mux.HandleFunc("GET /api/metrics/prometheus", s.adminMiddleware(s.handlePrometheusMetrics))
 	s.mux.HandleFunc("GET /api/metrics/alerts", s.adminMiddleware(s.handleAlertState))
@@ -676,15 +687,24 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/stock/lookup", s.authMiddleware(s.handleFixStockLookup))
 	s.mux.HandleFunc("GET /api/depth/{code}", s.authMiddleware(s.handleFixDepth))
 	s.mux.HandleFunc("GET /api/news", s.authMiddleware(s.handleFixNews))
-	s.mux.HandleFunc("POST /api/news/showall", s.authMiddleware(s.handleNewsShowAllToggle))
+	// §H3（2026-09-22 修复批）成员越权写全局收口：showall 开关与 reanalyze 补推都落在
+	// **运营账号引擎**的进程内全局状态（ctrlFor 恒取 operatorID，见 server.go ctrlFor 注释），
+	// 旧路由只挂 authMiddleware——任何成员可改写 admin 的资讯过滤开关、随时发起全量 LLM
+	// 补推（成本/状态污染）。与 /api/action 一起升 adminMiddleware（GET showall 只读不动）。
+	// English: §H3 — global-state write endpoints (news showall toggle, reanalyze, manual action)
+	// now require admin: they mutate the operator account's in-process engine regardless of caller.
+	s.mux.HandleFunc("POST /api/news/showall", s.adminMiddleware(s.handleNewsShowAllToggle))
 	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
-	s.mux.HandleFunc("POST /api/news/reanalyze", s.authMiddleware(s.handleNewsReanalyze))
+	s.mux.HandleFunc("POST /api/news/reanalyze", s.adminMiddleware(s.handleNewsReanalyze))
 	s.mux.HandleFunc("POST /api/news/test-attribution", s.authMiddleware(s.handleNewsTestAttribution))
 	s.mux.HandleFunc("GET /api/engine/init-status", s.authMiddleware(s.handleEngineInitStatus))
 	s.mux.HandleFunc("GET /api/watchlist", s.authMiddleware(s.handleFixGetWatchlist))
 	s.mux.HandleFunc("POST /api/watchlist", s.authMiddleware(s.handleFixAddWatchlist))
 	s.mux.HandleFunc("DELETE /api/watchlist", s.authMiddleware(s.handleFixRemoveWatchlist))
-	s.mux.HandleFunc("POST /api/action", s.authMiddleware(s.handleFixAction))
+	// §H3：/api/action 的 ignore 分支写运营账号引擎信号簿（墓碑全局生效）、buy/sell 分支
+	// 触实盘下单（内部本已 admin 闸）——路由整体升 adminMiddleware，成员点「忽略」不再能
+	// 静默改写他人信号簿；前端信号页忽略按钮对成员隐藏（见 web 侧 isForbidden 兜底）。
+	s.mux.HandleFunc("POST /api/action", s.adminMiddleware(s.handleFixAction))
 	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
 	// 实盘交易（AUTO_TRADING_PLAN M1）：持仓页实盘 tab 拉真实持仓/建议/执行 + 网关回报/状态。
 	// English: live trading (AUTO_TRADING_PLAN M1) — live tab real positions/advice/execute + gateway report/state.
@@ -799,10 +819,10 @@ func (s *Server) Serve(addr string) error {
 	cert, key := os.Getenv("QUANT_TLS_CERT"), os.Getenv("QUANT_TLS_KEY")
 	if cert != "" && key != "" {
 		log.Printf("HTTPS server starting on %s (TLS: %s)", addr, cert)
-		return http.ListenAndServeTLS(addr, cert, key, s.chain(s.mux))
+		return http.ListenAndServeTLS(addr, cert, key, s.chain(s.muxWithJSONErrors()))
 	}
 	log.Printf("HTTP server starting on %s", addr)
-	return http.ListenAndServe(addr, s.chain(s.mux))
+	return http.ListenAndServe(addr, s.chain(s.muxWithJSONErrors()))
 }
 
 // ServeListener 使用已创建的监听器启动 HTTP 服务。
@@ -813,12 +833,75 @@ func (s *Server) Serve(addr string) error {
 // "probe the port, then ListenAndServe".
 func (s *Server) ServeListener(ln net.Listener) error {
 	log.Printf("HTTP server serving on %s", ln.Addr().String())
-	return http.Serve(ln, s.chain(s.mux))
+	return http.Serve(ln, s.chain(s.muxWithJSONErrors()))
 }
 
 // ServeHTTP 实现 http.Handler 接口，供 httptest / 内嵌路由直接驱动（测试与复用场景）。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.chain(s.mux).ServeHTTP(w, r)
+	s.chain(s.muxWithJSONErrors()).ServeHTTP(w, r)
+}
+
+// muxWithJSONErrors §F3（2026-09-22 修复批）：给路由表套一层 404/405 JSON 信封出口。
+// 背景：全仓 API 错误统一走 writeError（{"error":…}，application/json），但 Go ServeMux
+// 对「未注册路径/方法不匹配」兜底回 text/plain（"404 page not found"）——前端 request()
+// JSON 解析抛语法错、E2E Content-Type 断言在此分裂。FIX_PLAN §6.3 的修法本应直挂
+// s.mux.NotFound/MethodNotAllowed，但本工具链（go1.26 路由重构版）已移除该字段，
+// 改为用 mux.Handler(r) 预判：命中注册 pattern 的请求原样直通透传（SSE 流式响应零扰动）；
+// 未命中（pattern==""）时先在缓冲里跑兜底 handler——3xx（路径规范化重定向）原样放行，
+// 其余（plain-text 404/405）替换为同状态码的 JSON 信封。
+// English: §F3 — wraps the mux so unmatched routes (404) and wrong methods (405) answer with
+// the standard {"error":…} JSON envelope; matched requests pass through untouched (streaming
+// included), and canonicalization redirects still flow as-is.
+func (s *Server) muxWithJSONErrors() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// "*" 请求与非法 URI 交由 mux 自身的 400 早退分支，不做兜底预判。
+		if r.RequestURI == "*" {
+			s.mux.ServeHTTP(w, r)
+			return
+		}
+		h, pattern := s.mux.Handler(r)
+		if pattern != "" {
+			s.mux.ServeHTTP(w, r) // 命中注册路由：原样直通（不缓冲、不影响 SSE 流式写出）
+			return
+		}
+		if h == nil {
+			writeError(w, http.StatusNotFound, "接口不存在: "+r.Method+" "+r.URL.Path)
+			return
+		}
+		// 未命中：兜底 handler 无副作用（只写状态码/文本），先在缓冲里跑一遍拿状态码，
+		// 以区分「规范化重定向(3xx，放行)」与「404/405（改走 JSON 信封）」。
+		buf := &statusCapture{header: w.Header()}
+		h.ServeHTTP(buf, r)
+		switch {
+		case buf.status >= 300 && buf.status < 400:
+			w.WriteHeader(buf.status)
+			_, _ = w.Write(buf.body.Bytes())
+		case buf.status == http.StatusMethodNotAllowed:
+			writeError(w, http.StatusMethodNotAllowed, "方法不允许: "+r.Method+" "+r.URL.Path)
+		default:
+			writeError(w, http.StatusNotFound, "接口不存在: "+r.Method+" "+r.URL.Path)
+		}
+	})
+}
+
+// statusCapture §F3 辅助：捕获式 ResponseWriter（Header 与真实 writer 共享，状态码/体先落缓冲）。
+type statusCapture struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (c *statusCapture) Header() http.Header { return c.header }
+func (c *statusCapture) WriteHeader(code int) {
+	if c.status == 0 {
+		c.status = code
+	}
+}
+func (c *statusCapture) Write(p []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	return c.body.Write(p)
 }
 
 // genTraceID 生成 16 字节十六进制 trace-id（crypto/rand，不可预测），用于把一次请求

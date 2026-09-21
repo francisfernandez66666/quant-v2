@@ -249,6 +249,8 @@ func (d *DB) migrate() error {
 			chain_seq INTEGER DEFAULT 0,
 			control TEXT DEFAULT '',
 			retry_count INTEGER NOT NULL DEFAULT 0,
+			fail_fp TEXT NOT NULL DEFAULT '',
+			fail_streak INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			started_at TEXT DEFAULT '',
 			finished_at TEXT DEFAULT '',
@@ -635,6 +637,20 @@ func (d *DB) migrate() error {
 			return fmt.Errorf("store migrate research_tasks.retry_count: %w", err)
 		}
 	}
+	// §M14 同因连败熔断（2026-09-22）：fail_fp=最近一次失败指纹（error 前 200 字），
+	// fail_streak=同指纹连败计数（换因即从 1 重计，成功/人工 Requeue 清零）。旧库增量迁移，幂等。
+	// English: M14 same-cause breaker columns — last error fingerprint and its consecutive-failure
+	// streak; added to pre-existing DBs idempotently.
+	if ok, err := d.hasColumn("research_tasks", "fail_fp"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN fail_fp TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.fail_fp: %w", err)
+		}
+	}
+	if ok, err := d.hasColumn("research_tasks", "fail_streak"); err == nil && !ok {
+		if _, err := d.db.Exec(`ALTER TABLE research_tasks ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store migrate research_tasks.fail_streak: %w", err)
+		}
+	}
 	// §P0-1 real_positions 主键迁移为 (ts_code, user_id)：旧库单主键重建。
 	// English: P0-1 migrate real_positions primary key to (ts_code, user_id) for multi-tenant isolation.
 	if err := d.migrateRealPositionsPK(); err != nil {
@@ -980,11 +996,18 @@ func (d *DB) QueryRows(query string, args ...any) ([]map[string]any, error) {
 
 // InsertRows 批量 INSERT OR REPLACE（单事务），用于各表的断点续传式装载。
 // cols 为与 Tushare 返回字段一致的小写列名；值为 nil 的单元格写入 NULL。
+// §INSERTLOCK（2026-09-22 修复批）：表名/列名直进 fmt.Sprintf 拼语句，写入前强制做
+// 「裸标识符 + 真实 schema」双层校验（见 validateInsertSurface）——未知列/非法标识符
+// 显式报错，杜绝导入面（delta import/dataload）被伪列名注入或写错列静默失败。
 // （InsertRows bulk-upserts rows in one transaction per call, for resumable loading.
 // cols are lowercase column names matching Tushare's returned fields; nil cells become NULL.）
 func (d *DB) InsertRows(table string, cols []string, rows []map[string]any) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
+	}
+	// §INSERTLOCK 写入面校验：非法标识符 / 白名单外表列 / 实际 schema 缺列 → 显式报错。
+	if err := d.validateInsertSurface(table, cols); err != nil {
+		return 0, err
 	}
 	// 生成占位符与 INSERT OR REPLACE 语句（列名来自调用方，与表结构对齐）。
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",")
@@ -1045,6 +1068,84 @@ func TableColumns(table string) []string {
 		return []string{"ts_code", "end_date", "n_cashflow_act", "n_cashflow_inv_act", "n_cashflow_fnc_act"}
 	case "sector_history":
 		return []string{"trade_date", "industry", "limitup_cnt", "change_pct", "member_count", "top_stocks"}
+	}
+	return nil
+}
+
+// isBareInsertIdent §INSERTLOCK 第一层防线：仅接受裸 SQL 标识符（字母/下划线开头，
+// 其后字母/数字/下划线，长度 ≤ 64）——引号/反引号/空白/括号/逗号/分号/连字符一律拒绝。
+// 表名列名以 fmt.Sprintf 直进语句文本，本校验把「列名位注入」（如 "a) , (SELECT ..."）
+// 挡在拼语句之前。
+func isBareInsertIdent(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateInsertSurface §INSERTLOCK 写入面校验（InsertRows 前置闸）：
+//  1. 表名与每个列名必须是裸标识符（isBareInsertIdent，防语句拼接注入）；
+//  2. 表在 TableColumns 白名单内 → 列必须全部 ∈ 白名单（大小写不敏感，SQLite 列名不区分），
+//     未知列显式报错；
+//  3. 表不在白名单（migrations 扩展表/研究临时表，如 ths_break_pool_daily）→ 回退运行时
+//     PRAGMA table_info 按实际 schema 校验：表不存在（schema 为空）或列缺失都显式报错。
+//
+// 拒绝而非静默容忍的取向：拼错列名旧行为依赖 SQLite 报错（信息含原始语句）或干脆写歪数据，
+// 本闸在本地给出精确缺列信息，防导入脚本带错列继续跑。
+// English: pre-flight write-surface validation — bare identifiers only, subset of the
+// TableColumns whitelist when the table is known, runtime PRAGMA schema check otherwise;
+// unknown columns error explicitly.
+func (d *DB) validateInsertSurface(table string, cols []string) error {
+	if !isBareInsertIdent(table) {
+		return fmt.Errorf("store insert %q: 非法表名（仅允许裸标识符，禁止引号/空白/括号等）", table)
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("store insert %s: 列清单为空", table)
+	}
+	for _, c := range cols {
+		if !isBareInsertIdent(c) {
+			return fmt.Errorf("store insert %s: 非法列名 %q（仅允许裸标识符）", table, c)
+		}
+	}
+	allow := make(map[string]bool)
+	if known := TableColumns(table); known != nil {
+		for _, c := range known {
+			allow[strings.ToLower(c)] = true
+		}
+	} else {
+		// 白名单外表：以数据库实际 schema 为准（表不存在时 allow 为空 → 显式拒绝）。
+		rows, err := d.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+		if err != nil {
+			return fmt.Errorf("store insert %s: 查询表结构失败: %w", table, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return fmt.Errorf("store insert %s: 读取表结构失败: %w", table, err)
+			}
+			allow[strings.ToLower(name)] = true
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("store insert %s: 读取表结构失败: %w", table, err)
+		}
+		if len(allow) == 0 {
+			return fmt.Errorf("store insert %s: 表不存在或无列结构（写入面白名单拒绝未知表）", table)
+		}
+	}
+	for _, c := range cols {
+		if !allow[strings.ToLower(c)] {
+			return fmt.Errorf("store insert %s: 未知列 %q（不在该表写入白名单/实际结构中）", table, c)
+		}
 	}
 	return nil
 }

@@ -218,6 +218,17 @@ func (c *Controller) JudgeSellView(ch Channel, account string, in SellInput, pol
 		c.sellStates = map[sellKey]*sellState{}
 	}
 	prev, existed := c.sellStates[key]
+	// §H2（2026-09-22 修复批）：sellProbe 对传入状态**原地修改**并返回同一指针，
+	// 旧实现直接拿 prev 做跃迁比较 → `st.Line != prev.Line`/Settled/SettleStart 三判据
+	// 恒假，除首见外的所有跃迁（进窗锁定、延持顺延、深破升级）都不入裁定环，
+	// 留痕面只剩处置、观察面全盲。比较前先值拷贝一份旧快照。
+	// English: §H2 — sellProbe mutates the given state in place and returns the same pointer;
+	// snapshot prev by value before the call, otherwise the transition-detection compares a
+	// struct with itself and every hold-stage record silently vanishes.
+	var prevSnap sellState
+	if prev != nil {
+		prevSnap = *prev
+	}
 	st, disposal, holdReason := sellProbe(prev, in, now, p)
 	if st == nil {
 		// 价格无效等不可裁决轮次：状态原样保留（含首见时的占位不落）。
@@ -231,7 +242,7 @@ func (c *Controller) JudgeSellView(ch Channel, account string, in SellInput, pol
 	case disposal != nil:
 		record.Verdict = VerdictPass
 		record.Reason = disposal.Reason
-	case !existed || st.Line != prev.Line || !st.SettleStart.Equal(prev.SettleStart) || st.Settled != prev.Settled:
+	case !existed || st.Line != prevSnap.Line || !st.SettleStart.Equal(prevSnap.SettleStart) || st.Settled != prevSnap.Settled:
 		if holdReason != "" {
 			record.Verdict = VerdictHold
 			record.Reason = holdReason
@@ -341,9 +352,17 @@ func sellProbe(st *sellState, in SellInput, now time.Time, p sellParams) (*sellS
 		return st, nil, fmt.Sprintf("命中%s(盈亏%.2f%%)，进入%d分钟观察窗", st.Line, pnl, st.WindowMin) + evi
 	}
 
-	// 线升级（止损→深破）：新的更严判定视为新触发条件，窗时序不动、结算口径按新线。
-	if line == SellLineDeepBreach && st.Line == SellLineStopLoss {
+	// 线升级（任意线型→深破）：§C2（2026-09-22 修复批）旧的升级判定只认 StopLoss→DeepBreach，
+	// 线已锁定为 TakeProfit/Trail 时砸穿 −12% 不进深破分支、落到下方 bullLive 延持——
+	// 边界④（深破无条件全清）在两类盈利线下被架空（FIX#12 事故形态）。现为本轮判定命中
+	// 深破即无条件覆写线型；Settled/Confirmed 一并清零是对存量持久化状态的防御（正常路径
+	// 到不了已确认态，① 已提前重放返回）。窗时序不动，结算口径按新线（⑤ 无条件全清）。
+	// English: §C2 — a fresh deep-breach verdict upgrades st.Line from ANY locked line
+	// (StopLoss/TakeProfit/Trail) to DeepBreach unconditionally; boundary-④ full clear must
+	// not be bypassed just because a profit line was locked first.
+	if line == SellLineDeepBreach {
 		st.Line = SellLineDeepBreach
+		st.Settled, st.Confirmed = false, false
 	}
 
 	// ④ 未到结算点：窗内等待。

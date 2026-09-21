@@ -294,8 +294,11 @@ type SettlementResponse struct {
 	Connected bool               `json:"connected"`
 }
 
-// FetchSettlement 拉取券商交割单（GET /settlement?date=YYYYMMDD，§WS-B 三方对账权威源）。
-// English: fetches the broker settlement for a day (three-way reconciliation authoritative leg).
+// FetchSettlement 拉取券商交割单（GET /settlement?date=YYYY-MM-DD，§WS-B 三方对账权威源）。
+// §H1（2026-09-22）注释纠错：旧注释写 `date=YYYYMMDD`，与网关校验（gateway.py 只收
+// YYYY-MM-DD）相反，正是自动对账恒 400 的误导源；调用方经 SettleDay 入口已归一为带杠口径。
+// English: fetches the broker settlement for a day (three-way reconciliation authoritative leg);
+// the gateway only accepts YYYY-MM-DD.
 func (c *QMTClient) FetchSettlement(date string) (*SettlementResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()

@@ -429,8 +429,10 @@ export default function Paper() {
       try { setOrders(await api.fetchPaperOrders()) } catch (_) {}
       try { setEquity(await api.fetchPaperEquity()) } catch (_) {}
     } catch (e) {
-      // 后端返回 403（无权限）时，展示「无权限」面板，不再静默兜底。
-      if (e && e.message && e.message.indexOf('无权限') >= 0) { setForbidden(true); return }
+      // §M13/§A5：后端 403 时展示「无权限」面板，不再静默兜底。
+      // 判定改为状态码 api.isForbidden(e)——旧写法 e.message.indexOf('无权限') 只认
+      // adminMiddleware 的中文文案，对 permMiddleware 的英文 "no permission: <perm>" 会漏判。
+      if (api.isForbidden(e)) { setForbidden(true); return }
     }
   }
 
@@ -650,7 +652,9 @@ export default function Paper() {
   useEffect(() => { load() }, [])
   // 订阅 message/scan 两类 SSE 事件：事件到达即调用 load() 全量重拉，组件卸载自动解除订阅。
   // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
-  useSseRefresh(['message', 'scan'], load) // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
+  // §M13（2026-09-22 修复批 K）：enabled 绑 !forbidden——成员账号 403 后 60s 兜底轮询与
+  // SSE 驱动的整页重拉一并停用（/api/paper/state 在 adminMiddleware 下，继续打只会刷 403 噪声）。
+  useSseRefresh(['message', 'scan'], load, { enabled: !forbidden }) // §UAT-D2 原订阅的 'tick' 后端从未广播（死订阅），移除
 
   // ── 列定义 ──
   // 模拟盘持仓表格列定义：代码/名称/买卖时间/数量/成本/现价/浮盈/滑点/延迟/资金池/分时/操作

@@ -322,6 +322,28 @@ func TestGateBuyDiscipline(t *testing.T) {
 	}
 }
 
+// TestGateBuyDisciplineFailClosedOnReadError §C1（2026-09-22 修复批）反例锁：
+// 冻结账读取 DB 错误绝不吞成 0 放行——三本账（已成交/在途冻结/卖出回款）任何一本读失败，
+// checkBuyDiscipline 必须返回拒绝原因（fail-closed，宁可少买不放水超买）。
+// 旧形态 LocalBuyFrozen 单值返回把错误压成 frozen=0，DB 故障期间预算闸整体失效。
+// English: §C1 regression — any freeze-ledger read error must fail closed (reject the buy),
+// never be swallowed into frozen=0 which silently disables the budget gates.
+func TestGateBuyDisciplineFailClosedOnReadError(t *testing.T) {
+	db := gateDB(t)
+	g := NewGate(db, "u_g", nil)
+	// 健康库 + 零配置：三本账读取成功，买入纪律不设防（放行）。
+	if r := g.checkBuyDiscipline(qmtCfg(), liveOrder(SideBuy)); r != "" {
+		t.Fatalf("健康库零配置应放行, got %q", r)
+	}
+	// 关库模拟存储故障：必须拒绝而非按 0 冻结放行。
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if r := g.checkBuyDiscipline(qmtCfg(), liveOrder(SideBuy)); r == "" {
+		t.Fatal("三本账读取失败时买入纪律必须 fail-closed 拒绝（§C1 回归）")
+	}
+}
+
 // TestGateWhitelistAndMaxPositions 白名单/仓位上限收口。
 func TestGateWhitelistAndMaxPositions(t *testing.T) {
 	g := NewGate(gateDB(t), "u_g", nil)

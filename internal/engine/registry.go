@@ -793,7 +793,7 @@ func (r *Registry) build(userID string) *Engine {
 	// 已在 paperSignals 的证据闸（unifiedSellGateSigs）关闭。
 	// English: per-account paper-channel unified sell judge hook — runs every round (wall-clock
 	// windows), decoupled from fill dispatch; disposals execute only via paper ApplyUnifiedSell.
-	e.SetPaperSellJudge(func(feed sellJudgeFeed) {
+	e.SetPaperSellJudge(func(feed sellJudgeFeed, sellMode string) {
 		if !data.IsFullTradingHours(time.Now()) {
 			return
 		}
@@ -805,7 +805,8 @@ func (r *Registry) build(userID string) *Engine {
 			if pe == nil || !pe.Enabled() {
 				continue
 			}
-			e.runPaperUnifiedJudge(uid, pe, feed, e.paperSignalPolicy(uid))
+			// §M9 sellMode=宿主轮首快照原样透传（回调内不再读配置）。
+			e.runPaperUnifiedJudge(uid, pe, feed, e.paperSignalPolicy(uid), sellMode)
 		}
 	})
 	// §QUOTE_POOL_SPLIT: 注入全账号模拟盘持仓聚合——5s 监控池 base 重建（syncMonitorBase）把

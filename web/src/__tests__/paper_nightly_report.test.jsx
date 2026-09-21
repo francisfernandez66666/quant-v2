@@ -26,6 +26,8 @@ const REPORT = {
 // 第二个用例再用 mockResolvedValueOnce 换成空表，验证降级占位文案。
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
+  // §M13：补齐 mock 缺失导出（与 api/index.js 真实实现一致，仅按状态码判定，不改变本文件既有断言）。
+  isForbidden: (e) => !!(e && e.status === 403),
   fetchPaperState: vi.fn(async () => ({
     is_admin: true, enabled: true,
     stats: { initial_capital: 100000, cash: 100000, market_value: 0, total_value: 100000, total_return_pct: 0, today_return_pct: 0, realized_pnl: 0, open_positions: 0, win_rate_pct: 0, filled_buys: 0, avg_slippage_pct: 0, avg_latency_sec: 0, max_latency_sec: 0, slippage_cost: 0, signal_amount_pct: 0 },

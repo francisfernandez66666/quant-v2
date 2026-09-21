@@ -5,6 +5,8 @@
 //          §U-2（2026-09-14）：链路状态卡内置 kill-switch 紧急停止按钮、当日委托卡支持逐笔撤单、
 //          日终结算卡一键三方对账并回看差异历史——三者后端早已就绪，本轮补上前端入口。
 //          定时轮询：链路状态/当日委托 10s 一次、交易流水 30s 一次；配置修改提交后待交易时段生效。
+//          §M13（2026-09-22 修复批 K）：权限判定改走 api.isForbidden()（HTTP 状态码），
+//          且任一 admin 端点回 403 时立即停掉全部轮询定时器——成员停在本页不再持续刷 403 灌 opslog。
 // 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import ToggleSw from '../components/ToggleSw'
@@ -177,6 +179,33 @@ export default function Quant() {
     const n = Number(v) || 0
     return (n > 0 ? '+' : '') + n.toFixed(2)
   }
+  // §M13（FIX_PLAN_20260922，2026-09-22 修复批 K）轮询止血三件套 ──────────────────
+  // 缺陷原文：本页所有端点（/api/config/qmt、/api/qmt/state|orders|trades|broker|settle、
+  //   /api/risk/gates）都挂在 adminMiddleware 上；成员账号首屏拿到 403、页面渲染「无权限」面板，
+  //   但挂载副作用里起的 stateTimer(10s)/ordersTimer(10s)/tradesTimer(30s) 继续跑——
+  //   每 10 秒三发 403 灌进 opslog，审计面被噪声淹没（M13 的"降级不停摆"半边）。
+  // stopPolling 幂等清除全部轮询定时器（定时器句柄置 null，重复调用安全）。
+  function stopPolling() {
+    for (const ref of [stateTimer, ordersTimer, tradesTimer]) {
+      if (ref && ref.current) {
+        clearInterval(ref.current)
+        ref.current = null
+      }
+    }
+  }
+  // noteForbidden §M13/§A5：任一 admin 端点回 403 即认定当前会话无权限——停轮询 + 落无权限面板。
+  // 判定一律走 api.isForbidden(e)（HTTP 状态码），不再用 e.message.indexOf('无权限')：
+  // adminMiddleware 回中文「无权限」、permMiddleware 回英文 "no permission: <perm>"，
+  // 按文案匹配对英文 403 必然漏判（E2E MP-2 用例即锁这组差异）。
+  // English: §M13 — any 403 from the admin endpoints halts all polling and renders the
+  // forbidden panel; detection is status-code based (api.isForbidden), never message-text based.
+  function noteForbidden(e) {
+    if (!api.isForbidden(e)) return false
+    stopPolling()
+    setForbidden(true)
+    return true
+  }
+
   // 拉取实盘配置并回填表单/战法开关/自定义金额；白名单为空数组时默认全部开启。
   // 失败时置 loadErr 告警（页面顶部显示），并向上抛出由调用方决定是否 toast。
   // §UAT-D3 force=true：保存成功后的主动刷新（用户输入即服务端权威值，绕过脏守卫）。
@@ -234,9 +263,10 @@ export default function Quant() {
       setStrategyDirty(false)
       setSyncing(false)
     } catch (e) {
-      // 后端返回 403（无权限）时，直接展示「无权限」面板，不再走缓存兜底提示。
-      if (e && e.message && e.message.indexOf('无权限') >= 0) {
-        setForbidden(true)
+      // §M13/§A5：后端 403（无权限）时展示「无权限」面板并停掉全部轮询；
+      // 判定改为状态码（api.isForbidden），旧写法 e.message.indexOf('无权限') 对
+      // permMiddleware 的英文 "no permission: xxx" 会漏判——这里同时是文案解耦点。
+      if (noteForbidden(e)) {
         setSyncing(false)
         return
       }
@@ -251,26 +281,28 @@ export default function Quant() {
     try {
       const t = await api.fetchQMTTrades()
       if (t && t.summary) setTrades(t)
-    } catch (_) {}
+    } catch (e) { noteForbidden(e) } // §M13：403 即停轮询（此端点在 adminMiddleware 下）
     try {
       const v = await api.fetchSignalVerdicts(50)
       if (v && Array.isArray(v.verdicts)) setVerdicts(v.verdicts)
     } catch (_) {}
     // §F-5 风控闸口状态（非 admin/无实盘账本时后端 403/503，静默降级不显示卡片）
+    // §M13：其中 403 不再"静默"——它是权限判定信号，必须参与停轮询；503 等其他错误仍降级。
     try {
       const g = await api.fetchRiskGates()
       if (g && Array.isArray(g.gates)) setRiskGates(g)
-    } catch (_) {}
+    } catch (e) { noteForbidden(e) }
   }
 
   // 拉取链路运行状态（心跳/延迟/熔断等）
   async function loadState() {
-    try { setState(await api.fetchQMTState()) } catch (_) {}
+    // §M13：/api/qmt/state 在 adminMiddleware 下，成员 403 要能触发停轮询（10s 定时器的主要噪声源）
+    try { setState(await api.fetchQMTState()) } catch (e) { noteForbidden(e) }
   }
 
   // §QMT-DUAL 拉取网关 active 通道与双路径在线态（broker/xt_connected/queued_connected）
   async function loadBroker() {
-    try { setBroker(await api.fetchQMTBroker()) } catch (_) {}
+    try { setBroker(await api.fetchQMTBroker()) } catch (e) { noteForbidden(e) } // §M13 同上
   }
 
   // §U-2 拉取当日委托列表（撤单按钮的数据源，含 order_id 与状态）；10s 随链路状态轮询
@@ -278,7 +310,10 @@ export default function Quant() {
     try {
       const o = await api.fetchQMTOrders()
       setOrders(Array.isArray(o) ? o : [])
-    } catch (_) { /* 无实盘库时 503：保留上次列表，不打断页面 */ }
+    } catch (e) {
+      // 无实盘库时 503：静默降级（保留上次列表，不打断页面）；403 则落无权限面板并停轮询（§M13）
+      noteForbidden(e)
+    }
   }
 
   // §U-2 kill-switch 紧急停止/解除：置位前二次确认（撤销一切在途未成交委托 + 拒绝新单），
@@ -336,7 +371,7 @@ export default function Quant() {
     try {
       const h = await api.fetchQMTSettleHistory()
       if (h && Array.isArray(h.diffs)) setSettle((s) => ({ ...(s || {}), history: h.diffs }))
-    } catch (_) {}
+    } catch (e) { noteForbidden(e) } // §M13：/api/qmt/settle/history 亦在 adminMiddleware 下
   }
 
   // §QMT-DUAL 切换网关 active 通道（xt=miniQMT兼容主路径 / queued=QMT内置桥兜底）。
@@ -453,6 +488,9 @@ export default function Quant() {
   // 挂载副作用：依赖数组 []——仅在首次挂载执行一次，后续刷新全部由下方定时器驱动
   // （链路状态/委托 10s、流水 30s）；卸载时统一清除定时器，避免内存泄漏与重复请求。
   // 配置加载失败在调用处 catch 提示，不阻塞轮询。
+  // §M13 补充：forbidden 语义由 noteForbidden() 在任一 admin 端点回 403 时触发——
+  // 它会调用与卸载清理同一个 stopPolling()，所以"成员停在页面被 403 灌 opslog"这条路被掐断；
+  // 定时器句柄统一在这里赋值，回调里的清理只认句柄，不存在"清了旧的留下新的"竞态。
   useEffect(() => {
     loadState()
     // §SHORT-4 做空开关与融券池状态探测（开关与模拟盘 short_book.enabled）
@@ -469,12 +507,8 @@ export default function Quant() {
     // 交易流水每 30s 轮询一次（成交频率低，降低刷新压力）
     tradesTimer.current = setInterval(loadTrades, 30000)
     loadConfig().catch((e) => MessagePlugin.error('加载实盘配置失败：' + (e && e.message ? e.message : e)))
-    // 卸载时清除定时器，防止内存泄漏与重复请求
-    return () => {
-      if (stateTimer.current) clearInterval(stateTimer.current)
-      if (tradesTimer.current) clearInterval(tradesTimer.current)
-      if (ordersTimer.current) clearInterval(ordersTimer.current)
-    }
+    // 卸载时清除定时器，防止内存泄漏与重复请求（§M13：与 forbidden 停用共用同一清理函数）
+    return () => { stopPolling() }
   }, [])
 
   // 执行模式 / 委托价格 的分段切换按钮样式工厂：active 为当前选中项（高饱和蓝，避免选中态过浅）

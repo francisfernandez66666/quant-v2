@@ -17,10 +17,14 @@ import (
 type mockSettle struct {
 	resp *SettlementResponse
 	err  error
+	// §H1 gotDate 记录 FetchSettlement 实收日期串——网关只认 YYYY-MM-DD，
+	// 用于断言调用链没有再把 20060102 无杠格式漏下去。
+	gotDate string
 }
 
 // 桩：返回预置交割单或错误。
 func (m *mockSettle) FetchSettlement(date string) (*SettlementResponse, error) {
+	m.gotDate = date
 	return m.resp, m.err
 }
 
@@ -86,6 +90,45 @@ func TestSettleThreeWay(t *testing.T) {
 	diffs, _ := db.ListSettlementDiffs(5)
 	if len(diffs) != 1 {
 		t.Fatalf("对账差异应落库 1 条, got %d", len(diffs))
+	}
+}
+
+// TestSettleDayFormatNormalized §H1（2026-09-22 修复批）反例锁：自动调度路传的
+// `20060102` 无杠交易日必须在入口归一为 `YYYY-MM-DD`——旧形态下网关校验直接 400
+// （自动三方对账从未成功过一次），且本地 ListFillsByDay 按带杠前缀匹配恒空、
+// 本地成交全被误报 ExtraInLocal。
+// English: §H1 regression — undashed trading day is normalized at the entry for both the
+// gateway fetch and the local fills bucketing.
+func TestSettleDayFormatNormalized(t *testing.T) {
+	db := testDB(t)
+	cfg := configDefault()
+	cfg.Enabled = true
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-H1", Code: "600000.SH", Side: "买入",
+		Price: 10, Qty: 100, Amount: 1000, TradedAt: "2026-09-08 09:35:00",
+		SignalID: "SIG-H1", UserID: "u_st", Fee: 2.5, Serial: "SER-H1"}); err != nil {
+		t.Fatalf("local fill: %v", err)
+	}
+	src := &settleExecutor{src: &mockSettle{resp: &SettlementResponse{
+		Date: "2026-09-08", Connected: true,
+		Trades: []SettlementTrade{
+			{OrderID: "GW-H1", TsCode: "600000.SH", Side: "买入", Price: 10, Qty: 100, Fee: 2.5, Serial: "SER-H1", TradedAt: "09:35:00"},
+		},
+	}}}
+	ctrl := NewController(src, db, "u_st", cfg, nil)
+	// 关键：入参为 data.TradingDayDate 的无杠格式
+	diff, err := ctrl.SettleDay("20260908", SettleModeReportOnly)
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if src.src.gotDate != "2026-09-08" {
+		t.Fatalf("网关侧实收日期必须已归一为 YYYY-MM-DD, got %q", src.src.gotDate)
+	}
+	if len(diff.ExtraInLocal) != 0 || len(diff.MissingInLocal) != 0 {
+		t.Fatalf("本地/券商一致应 0 差异（归一失败时本地桶恒空会假报 Extra）: extra=%v missing=%v",
+			diff.ExtraInLocal, diff.MissingInLocal)
+	}
+	if diff.Day != "2026-09-08" {
+		t.Fatalf("落库对账日应为归一后口径, got %q", diff.Day)
 	}
 }
 

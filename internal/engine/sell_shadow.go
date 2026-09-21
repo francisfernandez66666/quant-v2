@@ -45,11 +45,14 @@ type sellRoundVerdict struct {
 
 // sellJudgeFeed 一轮裁决的共用证据装配（live/paper 同构输入）。
 type sellJudgeFeed struct {
-	Scores      map[string]combat_agent.StockScores // 做多打分（延持唯一信号源，配 scoresAt 判新鲜）
-	D1Scores    map[string]combat_agent.D1Score     // D1 负面拦截证据
-	BearReasons map[string]string                   // 利空归因证据（纯码 → 原因）
-	PoolQuotes  map[string]*data.StockInfo          // 打分池行情（优先）
-	SnapQuotes  map[string]*data.StockInfo          // 5s 全量快照（打分池外持仓兜底，§R4-6 同口径）
+	// Scores 做多打分（延持唯一信号源）。§H5（2026-09-22 修复批）：新鲜度按信号自带产分时刻
+	// StockScores.UpdatedAt 判断（5s 近实时轮与 5min 批量轮各自写入），不再以全局 e.scoresAt
+	// 为唯一基准（旧口径下批量轮信号被 5s 轮时钟误判过期）。
+	Scores      map[string]combat_agent.StockScores
+	D1Scores    map[string]combat_agent.D1Score // D1 负面拦截证据
+	BearReasons map[string]string               // 利空归因证据（纯码 → 原因）
+	PoolQuotes  map[string]*data.StockInfo      // 打分池行情（优先）
+	SnapQuotes  map[string]*data.StockInfo      // 5s 全量快照（打分池外持仓兜底，§R4-6 同口径）
 }
 
 // sellProbeRow 裁决探针的账本中性行（live 真实持仓 / paper 纸面持仓统一映射）。
@@ -57,17 +60,21 @@ type sellProbeRow struct {
 	Code       string // 裁决状态键代码
 	Name       string
 	EntryPrice float64
-	HighPrice  float64 // 持仓期最高价（≤0 内核回退成本价；paper 恒 0=状态机每轮自抬）
+	HighPrice  float64 // 持仓期最高价（≤0 内核回退成本价；live=账本 highest_price，paper=§M10 引擎侧持久化锚点）
 }
 
 // runSellUnifiedJudge live 卖出裁决主入口（pushRealAdvice 每轮调用；仅交易时段，随宿主循环）。
 // account=实盘主账号（§GAP2-W2 定向口径）；positions=该账号真实持仓；exitQuotes=本轮打分池行情；
-// quotes=5s 实时快照（打分池外持仓的兜底价）；scores=本轮做多打分（延持信号源，配 scoresAt 判新鲜）；
+// quotes=5s 实时快照（打分池外持仓的兜底价）；scores=本轮做多打分（延持信号源，新鲜度按打分自身
+// UpdatedAt 判断，§H5）；
 // d1Scores/bearReasons=利空证据源；验证等级由 §D1 护栏4 的 bearTier 双源判定注入（dual 才给硬清资格，
 // 无记录/超龄按 single 只预警）。
-// 返回本轮有效裁决（仅现价有效的持仓）；mode=off 返回 nil（不裁决不留痕）。
-// English: per-round live unified sell judge; the returned verdicts feed the P2 projection/execution,
-// while shadow mode only records them and nothing executes.
+// sellMode=§M9（2026-09-22 修复批）轮首快照：qmt.sell_unified_mode 由调用方在**本轮开始时读一次**
+// 注入，函数内不再独立读配置——旧实现一轮三读（scoring_loop 轮首 / 本函数 / autoExecuteRealSells），
+// shadow→on 中途翻转会出现「旧路被来源闸关闭、统一投影又没生成」的保护空轮（止损跳过一轮）。
+// 返回本轮有效裁决（仅现价有效的持仓）；sellMode=off 返回 nil（不裁决不留痕）。
+// English: per-round live unified sell judge; sellMode is the round-start config snapshot (§M9) —
+// the function never re-reads config mid-round. Under off it returns nil.
 func (e *Engine) runSellUnifiedJudge(
 	account string,
 	positions []store.RealPosition,
@@ -75,12 +82,13 @@ func (e *Engine) runSellUnifiedJudge(
 	scores map[string]combat_agent.StockScores,
 	d1Scores map[string]combat_agent.D1Score,
 	bearReasons map[string]string,
+	sellMode string,
 ) []sellRoundVerdict {
 	ctl := e.qmtCtrlRef()
 	if ctl == nil {
 		return nil
 	}
-	mode := sellUnifiedModeOf(ctl.Config())
+	mode := sellMode // §M9 轮首快照，本轮唯一起源（""=缺省 shadow 语义）
 	if mode == "off" {
 		return nil // 整体停用：不裁决、不留痕
 	}
@@ -106,10 +114,11 @@ func (e *Engine) runSellUnifiedJudge(
 // 不碰账（探测器直卖旧链此时仍照常跑，用于切闸前证据对照）；on 时探测器卖出直达撮合
 // 已被上游证据闸（unifiedSellGateSigs）阻断（做空账本不在并轨范围，方向=做空的信号原样走 OnSignals）。
 // pol 由调用方传入（paperSignalPolicy(uid)：账号级 paper 纪律参数，双账同口径的另一半）。
-// English: P3 — the paper book is judged by the same kernel on the paper channel; only mode=on
-// executes disposals, and solely through paper.Engine.ApplyUnifiedSell.
-func (e *Engine) runPaperUnifiedJudge(account string, pe *paper.Engine, feed sellJudgeFeed, pol signalctl.Policy) []sellRoundVerdict {
-	mode := e.sellUnifiedModeEngine()
+// sellMode=§M9 轮首快照（调用方每轮读一次注入，本函数不再独立读配置，理由见 runSellUnifiedJudge 注释）。
+// English: P3 — the paper book is judged by the same kernel on the paper channel; sellMode is the
+// round-start snapshot; only mode=on executes disposals, and solely through paper.Engine.ApplyUnifiedSell.
+func (e *Engine) runPaperUnifiedJudge(account string, pe *paper.Engine, feed sellJudgeFeed, pol signalctl.Policy, sellMode string) []sellRoundVerdict {
+	mode := sellMode // §M9 轮首快照
 	if mode == "off" || pe == nil {
 		return nil
 	}
@@ -117,11 +126,18 @@ func (e *Engine) runPaperUnifiedJudge(account string, pe *paper.Engine, feed sel
 	rows := make([]sellProbeRow, 0, len(probes))
 	held := make(map[string]bool, len(probes))
 	for _, pr := range probes {
-		rows = append(rows, sellProbeRow{Code: pr.Code, Name: pr.Name, EntryPrice: pr.EntryPrice})
+		// §M10（2026-09-22 修复批）移动止盈锚点跨重启恢复：paper 账本不持久化持仓期最高价
+		// （SellProbe.HighPrice 恒 0），旧语义「状态机每轮自抬」意味着进程重启即锚点清零——
+		// 高点回落到成本价，移动止盈在重启后永不触发。裁决前先取引擎侧持久化锚点注入探针。
+		rows = append(rows, sellProbeRow{Code: pr.Code, Name: pr.Name, EntryPrice: pr.EntryPrice,
+			HighPrice: e.paperSellAnchor(account, pr.Code)})
 		held[pr.Code] = true
 	}
 	verdicts := e.judgeSellPositions(signalctl.ChannelPaper, account, rows, pol, feed, orDefault(mode, "shadow"))
 	e.SignalCtl().PruneSellStates(signalctl.ChannelPaper, account, held)
+	// §M10 锚点随轮次持久化：本轮有效现价抬高锚点、平仓代码删除锚点（重新入场从零起算，
+	// 与裁决状态 Prune 同生命周期），有变更才原子落盘。
+	e.syncPaperSellAnchors(account, held, verdicts)
 	if mode != "on" {
 		return verdicts // shadow：只留痕，处置不执行（资金行为零变化）
 	}
@@ -145,14 +161,15 @@ func (e *Engine) runPaperUnifiedJudge(account string, pe *paper.Engine, feed sel
 
 // judgeSellPositions 两账共用的裁决内核：逐仓装配 SellInput → JudgeSellView → 有效裁决表。
 // 价格解析与旧口径一致：打分池价优先、5s 快照兜底，两者皆缺=无效价轮（不下结论、状态不动）。
-// 做多信号新鲜度以 e.scoresAt 为基准（边界⑥）；利空验证等级取 bearTierFor（护栏4，dual 才有硬清资格）。
+// §H5（2026-09-22 修复批）做多信号新鲜度按信号自身产分时刻（StockScores.UpdatedAt）判断；
+// e.scoresAt 只兜底无时刻的存量装配（边界⑥）。利空验证等级取 bearTierFor（护栏4，dual 才有硬清资格）。
 func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows []sellProbeRow, pol signalctl.Policy, feed sellJudgeFeed, modeTag string) []sellRoundVerdict {
 	if len(rows) == 0 {
 		return nil
 	}
 	now := time.Now()
 	e.mu.RLock()
-	scoresAt := e.scoresAt // 边界⑥基准；零值=本轮尚无打分，做多信号一律不新鲜
+	scoresAt := e.scoresAt // §H5 兜底基准：打分缺失自带时刻（测试/存量装配）时回退全局时钟；零值=尚无打分，做多信号一律不新鲜
 	e.mu.RUnlock()
 
 	verdicts := make([]sellRoundVerdict, 0, len(rows))
@@ -171,8 +188,16 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows [
 			CurPrice:   price,
 		}
 		// 做多信号（延持唯一资格源，语义②）：带打分轮次时间戳（边界⑥）。
+		// §H5（2026-09-22 修复批）产分时刻优先取信号自身 UpdatedAt（combat_agent 打分链路
+		// 5s 轮/5min 批量轮均写入）——旧实现统一取全局 e.scoresAt（只在 5s 近实时轮前进，
+		// 且池空提前 return 会整体冻结），批量轮信号在全局时钟陈旧时被误判过期、失去延持资格。
+		// 信号自身无时刻（存量/测试装配）才回退全局时钟，保持旧兜底语义。
 		if sc, ok := feed.Scores[code]; ok && sc.SignalActive {
-			in.Bull = signalctl.SignalFresh{Active: true, At: scoresAt}
+			at := sc.UpdatedAt
+			if at.IsZero() {
+				at = scoresAt
+			}
+			in.Bull = signalctl.SignalFresh{Active: true, At: at}
 		}
 		// 利空证据（§D1 护栏4）：验证等级取 propagateSectorToStocks 的双源判定——
 		// dual（同花顺∩东财成分名单均命中）+触线 → 即时硬清；single/未验真/超龄 → 只预警。
@@ -218,12 +243,14 @@ func (e *Engine) judgeSellPositions(ch signalctl.Channel, account string, rows [
 //     LogExit/SellLot（13e 旧链出口此时已被来源闸关闭，杜绝双写）。
 //
 // mode=off 直接返回（不裁决不留痕）；shadow 只留痕不执行（资金行为零变化）。
+// sellMode=§M9 轮首快照：由宿主循环（5s scoreCycle / 主循环 13e-pre）本轮开始时读取注入，
+// 本函数与其下游（registry 回调 / 回退账本 / report 账本 / 13e 旧链出口闸）共用同一快照——
+// 杜绝「裁决层读到 on、旧链出口闸读到 shadow」的同轮双口径（翻转窗口内双写或双双不卖的保护空轮）。
 // English: per-round entry for the P3 paper-ledger unified sell judge (called by both the main
-// loop and the 5s round); dispatches to the injected per-account hook or the global fallback
-// engine, plus the report book pass. off = no-op; shadow = record only; on = execute via the
-// single exits.
-func (e *Engine) judgePaperLedgers(feed sellJudgeFeed) {
-	mode := e.sellUnifiedModeEngine()
+// loop and the 5s round); sellMode is the round-start snapshot (§M9) shared by every consumer in
+// this round. off = no-op; shadow = record only; on = execute via the single exits.
+func (e *Engine) judgePaperLedgers(feed sellJudgeFeed, sellMode string) {
+	mode := sellMode // §M9 轮首快照，本轮唯一起源
 	if mode == "off" {
 		return
 	}
@@ -233,10 +260,10 @@ func (e *Engine) judgePaperLedgers(feed sellJudgeFeed) {
 	e.mu.RUnlock()
 	if judge != nil {
 		// registry 回调内部已含交易时段/账号过滤（与 dispatchPaperSignals 同口径）。
-		judge(feed)
+		judge(feed, mode)
 	} else if pe != nil && pe.Enabled() && data.IsFullTradingHours(time.Now()) {
 		owner := e.primaryMember()
-		e.runPaperUnifiedJudge(owner, pe, feed, e.paperSignalPolicy(owner))
+		e.runPaperUnifiedJudge(owner, pe, feed, e.paperSignalPolicy(owner), mode)
 	}
 	e.judgeReportLedger(feed, mode)
 }

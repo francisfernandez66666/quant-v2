@@ -507,3 +507,76 @@ func TestMockQuotesEndpoint(t *testing.T) {
 		t.Fatalf("/health 应带 feed_connected=true 观察字段, got %v", hb["feed_connected"])
 	}
 }
+
+// TestMockQuoteInjection §3.1-1（2026-09-22 修复批 K · M1/F4）行情注入面反例锁。
+// 缺陷原文：mock 的 /quotes 恒回 now 时间戳、且不带任何行情源标识，E2E 在盘外造不出
+// 「盘内有源快照」形态，M1 的 quote_source 词表漂移只能靠「盘外空串」分支假绿放过。
+// 本用例锁三件事：
+//  1. 未注入时行为逐字节回退旧版（响应体不含 quote_source 字段，tickTime≈now）——注入面零副作用；
+//  2. 注入 quote_source 时只在顶层回显，tick 字段集不得被污染（防 mock 侧新增字段把 Go 解析带偏）；
+//  3. 行情时间戳注入生效且优先级正确（绝对毫秒 > 相对回拨），供引擎 30s maxAge 闸造「超龄 tick」反例。
+func TestMockQuoteInjection(t *testing.T) {
+	h, b, _ := newTestGateway()
+	get := func(path string) (int, map[string]interface{}) {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer t0")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var out map[string]interface{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	tickMs := func(t *testing.T, out map[string]interface{}, code string) int64 {
+		t.Helper()
+		ticks, _ := out["ticks"].(map[string]interface{})
+		tk, _ := ticks[code].(map[string]interface{})
+		if tk == nil {
+			t.Fatalf("缺 %s tick: %v", code, out["ticks"])
+		}
+		ms, _ := tk["tickTime"].(float64)
+		return int64(ms)
+	}
+
+	// ① 未注入：不得出现 quote_source 字段，tickTime 必须是"现在"（±5s）
+	if _, out := get("/quotes?codes=600000.SH"); out["quote_source"] != nil {
+		t.Fatalf("未注入时不得回显 quote_source, got %v", out["quote_source"])
+	}
+	_, out := get("/quotes?codes=600000.SH")
+	if d := time.Now().UnixMilli() - tickMs(t, out, "600000.SH"); d > 5000 || d < -5000 {
+		t.Fatalf("未注入时 tickTime 应≈now, 偏差 %d ms", d)
+	}
+
+	// ② 注入 quote_source：顶层回显 + tick 字段集不变
+	b.quoteSource = "QMT-L1"
+	code, out := get("/quotes?codes=600000.SH")
+	if code != http.StatusOK || out["quote_source"] != "QMT-L1" {
+		t.Fatalf("注入 quote_source 未回显, code=%d body=%v", code, out)
+	}
+	ticks, _ := out["ticks"].(map[string]interface{})
+	tk, _ := ticks["600000.SH"].(map[string]interface{})
+	want := map[string]bool{"lastPrice": true, "open": true, "high": true, "low": true,
+		"prevClose": true, "volume": true, "amount": true, "tickTime": true}
+	if len(tk) != len(want) {
+		t.Fatalf("注入不得污染 tick 字段集, got %v", tk)
+	}
+	for f := range tk {
+		if !want[f] {
+			t.Fatalf("tick 多出未知字段 %q（Go 侧 data.QMTTick 无此字段）", f)
+		}
+	}
+
+	// ③ 行情时间戳注入：相对回拨 120s（引擎 maxAge=30s 应判超龄丢弃）
+	b.tickAgeSec = 120
+	_, out = get("/quotes?codes=600000.SH")
+	aged := tickMs(t, out, "600000.SH")
+	if d := time.Now().UnixMilli() - aged; d < 115000 || d > 125000 {
+		t.Fatalf("tickAgeSec=120 应回拨约 120s, 实际偏差 %d ms", d)
+	}
+	// 绝对时间戳优先级高于相对回拨（E2E 需要钉死一个可复现的时间点）
+	fixed := time.Now().Add(-time.Hour).UnixMilli()
+	b.tickTimeFixed = fixed
+	_, out = get("/quotes?codes=600000.SH")
+	if got := tickMs(t, out, "600000.SH"); got != fixed {
+		t.Fatalf("tickTimeFixed 应优先, want %d got %d", fixed, got)
+	}
+}

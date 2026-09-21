@@ -715,9 +715,13 @@ export default function Hotspot() {
       <Card style={{ marginTop: 14 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
           <span>📰 热点资讯</span>
-          <Button size="small" variant="outline" theme="primary" disabled={reanalyzing} onClick={onReanalyze}>
-            {reanalyzing ? '补推中…' : '🔁 手动补推'}
-          </Button>
+          {/* §H3（2026-09-22）：POST /api/news/reanalyze 已升 adminMiddleware（写全局引擎+烧 LLM 额度），
+              手动补推按钮对非管理员隐藏，成员不再看到必然 403 的入口 */}
+          {api.isAdmin() && (
+            <Button size="small" variant="outline" theme="primary" disabled={reanalyzing} onClick={onReanalyze}>
+              {reanalyzing ? '补推中…' : '🔁 手动补推'}
+            </Button>
+          )}
         </div>
         {newsData.length ? (
           <Table data={newsData} columns={newsColumns} rowKey="id" size="small" pagination={false} maxHeight={400} />

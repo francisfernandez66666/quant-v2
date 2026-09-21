@@ -1,5 +1,9 @@
 // sell_unified_paper_test.go — §SELLPOINT-UNIFY P3 模拟盘并轨的 engine 侧行为锁。
 //
+// §M9（2026-09-22 修复批）：判卖模式/纸面策略改为轮首快照贯传形参，本文件调用点同步补
+// e.paperSignalPolicy()/sellMode 实参、SetPaperSellJudge 回调签名补 sellMode——纯签名对齐，
+// 断言与行为口径一律未动。
+//
 // 钉死四件事：
 //
 //	① unifiedSellGateSigs 证据闸：切闸后探测器「做多向卖出」只作证据不再直达撮合，
@@ -85,7 +89,7 @@ func TestRunPaperUnifiedJudgeShadowNoExecute(t *testing.T) {
 	e.bearTier = map[string]bearTierEntry{"300001": {verified: signalctl.BearVerifiedDual, at: time.Now()}}
 	pe := sellTestPaper(t)
 	before := len(pe.Orders())
-	e.runPaperUnifiedJudge("u_1", pe, hardClearFeed(), e.paperSignalPolicy("u_1"))
+	e.runPaperUnifiedJudge("u_1", pe, hardClearFeed(), e.paperSignalPolicy("u_1"), "shadow")
 	if n := countSellVerdicts(e, "300001", signalctl.VerdictPass); n != 1 {
 		t.Fatalf("shadow 下触线+双源利空应留 1 条处置留痕（证据对照），得 %d", n)
 	}
@@ -103,7 +107,7 @@ func TestRunPaperUnifiedJudgeOnExecutes(t *testing.T) {
 	e := shadowTestEnv(t, "on")
 	e.bearTier = map[string]bearTierEntry{"300001": {verified: signalctl.BearVerifiedDual, at: time.Now()}}
 	pe := sellTestPaper(t)
-	e.runPaperUnifiedJudge("u_1", pe, hardClearFeed(), e.paperSignalPolicy("u_1"))
+	e.runPaperUnifiedJudge("u_1", pe, hardClearFeed(), e.paperSignalPolicy("u_1"), "on")
 	orders := pe.Orders()
 	if len(orders) == 0 {
 		t.Fatal("on 模式处置应到达 ApplyUnifiedSell（产生卖单留痕）")
@@ -131,14 +135,14 @@ func TestRunPaperUnifiedJudgeOnExecutes(t *testing.T) {
 func TestJudgePaperLedgersDispatch(t *testing.T) {
 	called := 0
 	e := shadowTestEnv(t, "shadow")
-	e.SetPaperSellJudge(func(feed sellJudgeFeed) { called++ })
-	e.judgePaperLedgers(hardClearFeed())
+	e.SetPaperSellJudge(func(feed sellJudgeFeed, sellMode string) { called++ })
+	e.judgePaperLedgers(hardClearFeed(), "shadow")
 	if called != 1 {
 		t.Fatalf("shadow/on 均应调用按账号裁决回调，得 %d", called)
 	}
 	off := shadowTestEnv(t, "off")
-	off.SetPaperSellJudge(func(feed sellJudgeFeed) { called++ })
-	off.judgePaperLedgers(hardClearFeed())
+	off.SetPaperSellJudge(func(feed sellJudgeFeed, sellMode string) { called++ })
+	off.judgePaperLedgers(hardClearFeed(), "off")
 	if called != 1 {
 		t.Fatalf("off 模式必须完全静默（回调不得被调用），得 %d", called)
 	}

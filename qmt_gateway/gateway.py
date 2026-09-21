@@ -21,6 +21,10 @@ signal_id 原子幂等（并发重试/崩溃窗口均不重复真实下单）；
 §G7 整手规则分板块（创业板/科创板最低 200 股、1 股递增；卖出允许零股清仓）；
 §G8 _dispatch 顶层异常保护，任何 handler 异常返回 500 JSON 而非裸断连。
 broker 由 config 选择（xt/mock）。回报经 outbox 后台线程推送（handler.py）。
+§TZ（2026-09-22）：本文件所有落库/上报时间串统一 store._now_cn()（显式北京时区），
+  根治裸 strftime 本地钟面贴假 +08:00（LOW 族）。
+§REJECT（2026-09-22）：/dispatch/result 的 trade 回报在 trade_id 与 order_id 皆空时
+  拒收 400 留痕（与 §F5 缺 order_id 拒 400 同口径；handler.on_trade 为第二道防线）。
 
 运行：
   pip install -r qmt_gateway/requirements.txt   # 仅 mock 联调可不装任何依赖
@@ -60,7 +64,10 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import Store, is_placeholder_order_id, json_default  # noqa: E402
+# §TZ（2026-09-22 修复批）：网关内全部落库/上报时间串统一走 store._now_cn()
+# （显式北京时区，见其 §TZ 说明）；禁止再用「本地 strftime + 硬编码 +08:00 后缀」的写法
+# ——那会把非北京时区部署机的本地钟面贴上 +08:00 假偏移（LOW 族根治项）。
+from store import Store, is_placeholder_order_id, json_default, _now_cn  # noqa: E402
 from ids import Idempotency  # noqa: E402
 from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
 from handler import ReportHandler, periodic_reconcile, is_active_trading_session  # noqa: E402
@@ -89,6 +96,9 @@ DEFAULT_CONFIG = {
     "failover_enable": False,           # 自动翻转开关（xt 断连 N 秒→queued，交易时段）
     "failover_sec": 60,                 # xt 断连超过该秒数触发自动翻转
     "bridge_heartbeat_timeout_sec": 15,  # 桥心跳新鲜窗口（超时视为离线）
+    # §M16（2026-09-22）：inflight 派发项超时收割阈值（秒，0=关闭）——桥回报丢失/重启后
+    # dispatch 行不再永挂；回收后 order 类回写「已废」（判废不重排，防重复真实下单）
+    "dispatch_inflight_reap_sec": 1800,
     # §A1（AUDIT_FULLSTACK_20260918）网关侧独立风控（与首尔 risk.Gate 同语义，0/空=闸关闭）
     # §ENH-5 批E 只读 L1 行情通道（xtdata get_full_tick 轮询；与交易链路完全隔离）
     "quote_feed": True,             # feed 总开关（xtdata 缺失环境自动静默停用）
@@ -203,6 +213,8 @@ class Gateway:
         # 桥以 JSONL 文件上报事件（bridge_report.jsonl 追加行），由本线程读文件
         # 并复用 _do_dispatch_result 语义（心跳/快照/派发回报/推量仔零改动）。
         self._file_bridge_thread = None
+        # §M16：inflight 派发项超时收割线程（启动先清一次 + 周期巡检）
+        self._dispatch_reap_thread = None
         # §ENH-5 批E：只读 L1 行情 feed（独立线程/独立异常域；断连只影响 feed_connected 观察字段）
         self.feed = QuoteFeed(cfg)
         # §主备反转：queued（桥）最近一次心跳确认时间（failover 判定用）。
@@ -226,7 +238,7 @@ class Gateway:
         # 推送 broker 变更事件到量仔（/api/qmt/report 未知 type 会被忽略，仅观察用）
         try:
             self.handler._push({"type": "broker", "broker": key, "from": old,
-                                "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+                                "at": _now_cn()})
         except Exception:  # noqa: BLE001
             log.exception("[gateway] push broker-change event failed")
         return True, ""
@@ -255,6 +267,13 @@ class Gateway:
             log.warning("[gateway] STALE pending order (within 10min, verify against broker): signal_id=%s "
                         "code=%s side=%s qty=%s",
                         p.get("signal_id"), p.get("code"), p.get("side"), p.get("qty"))
+        # §M16：dispatch 表与 orders 同批做启动清理——上次进程存活期内被桥取走（inflight）
+        # 但回报丢失/桥重启未结算的超龄派发项，启动先收割一次，随后周期巡检兜底。
+        self._reap_dispatch_inflight("启动")
+        if int(self.cfg.get("dispatch_inflight_reap_sec", 1800) or 0) > 0:
+            self._dispatch_reap_thread = threading.Thread(
+                target=self._dispatch_reap_loop, daemon=True, name="dispatch-reap")
+            self._dispatch_reap_thread.start()
         # 回报 outbox 发送线程
         self.handler.start_sender()
         # 连接 broker（失败则后台重试，不阻塞 HTTP 起服）
@@ -433,6 +452,55 @@ class Gateway:
             # ② 推命令（无 pending 不打扰桥）
             self._file_bridge_push_pending()
 
+    def _reap_dispatch_inflight(self, where=""):
+        """§M16：收割超龄 inflight 派发项并做对账降级回写。
+
+        收割动作本身在 store（dispatch_reap_stale_inflight：inflight→done 判废留痕，
+        不回 pending——桥可能已真实下单，重排=重复下单）；此处负责把结果透传到业务面：
+          - kind=order 且有 signal_id：按 _apply_order_result 失败分支同语义回写 orders
+            「已废」（带收割拒因），量仔侧委托不再永挂「已报」，与 §R4-1 撤单闭环对称；
+          - kind=cancel/diag：只结算派发列并告警留痕——撤单超时不代表底层委托状态变化，
+            不代为推进 orders；桥若迟到回报，dispatch_set_result 仍可覆盖 result 幂等落 done。
+        返回收割条数；配置阈值<=0 表示关闭（不收割）。
+        English: §M16 — reaps stale inflight dispatch rows and down-settles order rows as
+        rejected so nothing hangs in inflight after lost bridge reports.
+        """
+        reap_sec = int(self.cfg.get("dispatch_inflight_reap_sec", 1800) or 0)
+        if reap_sec <= 0:
+            return 0
+        try:
+            reason = "inflight 超时（>%ds）未回报，网关收割（§M16%s）" % (
+                reap_sec, ("，" + where) if where else "")
+            rows = self.store.dispatch_reap_stale_inflight(reap_sec, reason=reason)
+        except Exception:  # noqa: BLE001 — 收割失败不影响主循环，下轮重试
+            log.exception("[gateway] §M16 dispatch inflight 收割失败")
+            return 0
+        for r in rows:
+            log.warning("[gateway] §M16 收割超龄 inflight 派发项 seq=%s kind=%s signal=%s code=%s",
+                        r.get("seq"), r.get("kind"), r.get("signal_id"), r.get("code"))
+            if r.get("kind") == "order" and r.get("signal_id"):
+                ts = _now_cn()  # §TZ
+                try:
+                    self.handler.on_order({
+                        "order_id": r.get("order_id") or r.get("seq"), "signal_id": r.get("signal_id"),
+                        "code": r.get("code"), "side": r.get("side"), "status": "已废", "reason": reason,
+                        "price": float(r.get("price", 0) or 0), "qty": int(r.get("qty", 0) or 0),
+                        "created_at": r.get("created_at") or ts, "at": ts,
+                    })
+                except Exception:  # noqa: BLE001 — 回写失败已有 dispatch 判废留痕，不阻断其余收割
+                    log.exception("[gateway] §M16 收割回写已废失败 seq=%s", r.get("seq"))
+        return len(rows)
+
+    def _dispatch_reap_loop(self):
+        """§M16 周期收割：每 60s 巡检一次 inflight 超龄派发项（阈值见配置，默认 30min）。"""
+        while not self._stop.is_set():
+            if self._stop.wait(60):
+                break
+            try:
+                self._reap_dispatch_inflight()
+            except Exception:  # noqa: BLE001 — 巡检线程永不因异常退出
+                log.exception("[gateway] §M16 dispatch reap loop error")
+
     def stop(self):
         """优雅停止：置停止信号并停掉回报发送线程（重连/对账线程随之退出）。
         §UAT-D8：join 各后台线程（短超时）——旧实现只置事件即返回，pytest teardown 时
@@ -445,6 +513,7 @@ class Gateway:
         for th in (getattr(self, "_broker_thread", None),
                    getattr(self, "_failover_thread", None),
                    getattr(self, "_file_bridge_thread", None),
+                   getattr(self, "_dispatch_reap_thread", None),  # §M16 inflight 收割巡检
                    getattr(self, "_reconcile_thread", None)):
             if th is not None and th.is_alive():
                 th.join(timeout=2)
@@ -631,7 +700,7 @@ class Gateway:
         broker_connected = self.active_broker.is_connected()
         payload = {
             "ok": True,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "ts": _now_cn(),
             "broker": self.active_key,
             "broker_connected": bool(broker_connected),
             "broker_mode": self.active_key,  # 与 Go 侧解析字段兼容的别名
@@ -719,7 +788,7 @@ class Gateway:
         if not signal_id:
             log.warning("[gateway] order_result without signal_id: seq=%s", seq)
             return 200, {"ok": True, "err": ""}
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        ts = _now_cn()  # §TZ
         if ok:
             self.handler.on_order({
                 "order_id": order_id or seq, "signal_id": signal_id, "code": row.get("code"),
@@ -747,7 +816,7 @@ class Gateway:
         signal_id = row.get("signal_id", "")
         if not signal_id:
             return 200, {"ok": True, "err": ""}
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        ts = _now_cn()  # §TZ
         self.handler.on_order({
             "order_id": row.get("order_id") or seq, "signal_id": signal_id, "code": row.get("code"),
             "side": row.get("side"), "status": "已撤" if ok else "已报",
@@ -809,12 +878,30 @@ class Gateway:
                         drow.get("code", ""), req.get("order_id", ""), drow.get("seq", ""))
                 # 权威覆盖（非 setdefault）：本端下单方向 > 柜台字段反推。
                 req["side"] = auth
+        # §REJECT（2026-09-22 修复批，LOW「trade_id 空且 order_id 空回报拒收」）：
+        # 归因回填后仍两把身份锚皆空 → 400 显式拒收（桥回报走 HTTP/文件桥回执语义，
+        # 与 §F5 Go 侧 order 回报缺 order_id 拒 400 同口径；网关 handler.on_trade 侧
+        # 另有第二道拒收，双防线）。不落库=不产生无法去重/无法对账的 fills 垃圾行。
+        _tid = str(req.get("trade_id", "") or "").strip()
+        _oid = str(req.get("order_id", "") or "").strip()
+        if not _oid and drow:
+            _oid = str(drow.get("order_id", "") or "").strip()
+            if _oid:
+                req["order_id"] = _oid
+        if not _tid and not _oid:
+            log.warning("[gateway] §REJECT trade 回报 trade_id/order_id 皆空，拒收 400: "
+                        "code=%s side=%s qty=%s signal=%s seq=%s",
+                        req.get("code"), req.get("side"), req.get("qty"),
+                        req.get("signal_id"), req.get("seq", ""))
+            return 400, {"ok": False, "err": "trade report has neither trade_id nor order_id — rejected"}
+        # on_trade 返回值（False=重放去重命中/第二道拒收）不改变本端 200 语义：
+        # 重放本就该被幂等吞掉，桥据此结算回报不重投。
         self.handler.on_trade({
             "order_id": req.get("order_id", ""), "trade_id": req.get("trade_id", ""),
             "name": req.get("name", ""), "code": req.get("code", ""), "side": req.get("side", ""),
             "price": float(req.get("price", 0) or 0), "qty": int(req.get("qty", 0) or 0),
             "amount": float(req.get("amount", 0) or 0),
-            "traded_at": req.get("traded_at") or time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "traded_at": req.get("traded_at") or _now_cn(),
             "signal_id": req.get("signal_id", ""),
             # §P2-FEE 20260918：费用腿透传（桥 DEAL 行尽力带 commission，缺=0；
             # handler.on_trade → store.apply_fill 落 fills.fee，供 /settlement 费用差对账）。
@@ -833,7 +920,7 @@ class Gateway:
                 "code": prow.get("code", ""), "side": prow.get("side", ""), "status": status,
                 "price": float(prow.get("price", 0) or 0), "qty": int(prow.get("qty", 0) or 0),
                 "created_at": prow.get("created_at", ""),
-                "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "at": _now_cn(),
             })
         return 200, {"ok": True, "err": ""}
 
@@ -851,7 +938,7 @@ class Gateway:
         """观察端点（GET /admin/status）：active 通道、双通道在线态、派发队列统计。"""
         payload = {
             "ok": True,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "ts": _now_cn(),
             "active": self.active_key,
             "failover_enable": bool(self.cfg.get("failover_enable", False)),
         }
@@ -961,7 +1048,7 @@ class Gateway:
         self.ids.settle({
             "order_id": order_ref, "signal_id": signal_id, "code": code, "side": side,
             "status": "已报", "price": price, "qty": qty,
-            "created_at": req.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "created_at": req.get("created_at") or _now_cn(),
             "user_id": self.user_id,  # §P1-9 多账号隔离归属
         })
         log.info("[gateway] order accept: signal=%s code=%s side=%s qty=%s ref=%s "

@@ -10,6 +10,8 @@ import { render, screen, waitFor } from '@testing-library/react'
 // Quant 页只读拉取 mock：含当日委托两条（一条可撤"已报"、一条终态"已成"）
 vi.mock('../api/index.js', () => ({
   getAccount: () => 'admin',
+  // §M13：补齐 mock 缺失导出（与 api/index.js 真实实现一致，仅按状态码判定，不改变本文件既有断言）。
+  isForbidden: (e) => !!(e && e.status === 403),
   fetchQMTConfig: vi.fn(async () => ({
     enabled: true, mode: 'manual', price_type: 'market', auto_sell: false, halted: false,
     gateway_url: 'http://127.0.0.1:18789', token_masked: '****',

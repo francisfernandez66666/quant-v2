@@ -525,7 +525,11 @@ class _XtOps:
                                                       tt[0:2].zfill(2), tt[2:4].zfill(2),
                                                       tt[4:6].zfill(2))
             elif tt:
-                traded = time.strftime("%Y-%m-%dT", time.localtime()) + \
+                # TZ 2026-09-22 fix batch: the date part used the RAW LOCAL clock
+                # (time.localtime) while the +08:00 label was hardcoded -- a fake
+                # offset on any non-Beijing host. _now_cn_str expands epoch+8h so the
+                # date and the label always agree (same helper as heartbeats).
+                traded = _now_cn_str("%Y-%m-%dT") + \
                     tt[0:2].zfill(2) + ":" + tt[2:4].zfill(2) + ":" + tt[4:6].zfill(2) + "+08:00"
             else:
                 traded = td or ""

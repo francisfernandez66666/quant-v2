@@ -10,6 +10,10 @@
 回调只入队，发送由独立线程按序完成。
 §G5 改造：on_positions 空快照守卫——未连接/数据未同步时的空持仓不再触发对账清空，
 连续 ≥2 次空快照且本地确有持仓时才接受"全平"语义。
+§TZ（2026-09-22）：本模块产出的全部时间串改走 store._now_cn()（显式北京时区），
+不再裸 strftime 本地钟面贴假 +08:00。
+§REJECT（2026-09-22）：trade_id 与 order_id 皆空的成交回报在入库入口显式拒收
+（不落库/不上报/error 留痕），与 §F5 缺 order_id 拒 400 同口径（详见 on_trade）。
 （English: report handling — callbacks only enqueue; a dedicated sender thread drains the outbox
 in order with bounded retries, so slow Seoul never blocks channel callbacks nor loses events.
 Empty position snapshots are ignored (with warning) unless seen twice consecutively.）
@@ -20,6 +24,10 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, time as dtime, timedelta
+
+# §TZ（2026-09-22 修复批）：回报时间串统一走 store._now_cn()（显式北京时区）——
+# 旧裸 strftime 在本地钟面贴假 +08:00，非北京时区部署即偏移造假。
+from store import _now_cn  # noqa: E402
 
 # 北京时间解析（Python 3.9+ 内置 zoneinfo；降级到 UTC+8 估算）。
 try:
@@ -245,7 +253,7 @@ class ReportHandler:
             if v:
                 reason = str(v)
                 break
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        ts = _now_cn()  # §TZ
         self.on_order({
             "order_id": str(getattr(order, "order_id", "")),
             "signal_id": self._signal_of(order),
@@ -262,7 +270,7 @@ class ReportHandler:
     def on_stock_trade(self, trade):
         """成交回报（xtquant trade 对象）。"""
         self.on_trade({
-            "order_id": str(getattr(trade, "order_id", "")),
+            "order_id": str(getattr(trade, "order_id", "") or ""),
             "trade_id": str(getattr(trade, "trade_id", "") or getattr(trade, "order_sysid", "") or ""),
             "name": getattr(trade, "stock_name", "") or "",
             "code": getattr(trade, "stock_code", ""),
@@ -270,7 +278,7 @@ class ReportHandler:
             "price": float(getattr(trade, "traded_price", 0) or 0),
             "qty": int(getattr(trade, "traded_volume", 0) or 0),
             "amount": float(getattr(trade, "traded_amount", 0) or 0),
-            "traded_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+            "traded_at": _now_cn(),  # §TZ
             "signal_id": self._signal_of(trade),
             # §P2-FEE 20260918：成交费用腿尽力透传（各 xtquant 构建字段名不一，缺省 0
             # 与旧"费用恒 0"口径字节兼容，绝不臆造费用）。
@@ -305,7 +313,7 @@ class ReportHandler:
         self.disconnected = True
         if is_active_trading_session():
             log.warning("[handler] channel disconnected during trading session — reporting to Seoul (triggers fuse)")
-            self._push({"type": "disconnect", "at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00")})
+            self._push({"type": "disconnect", "at": _now_cn()})  # §TZ
         else:
             log.info("[handler] channel disconnected off-hours (MiniQMT killed by qmtctl) — silent, no fuse")
 
@@ -386,7 +394,26 @@ class ReportHandler:
         §修复 G3：回调异常保护（见 on_order 说明）。§P1-9 落库携带归属账号 ID。
         English: trade/fill callback — persists, de-duplicates and pushes to the decision
         side; replayed duplicates are dropped to avoid doubling positions.
+
+        §REJECT（2026-09-22 修复批，LOW「trade_id 空且 order_id 空的回报拒收」）：
+        trade_id 与 order_id 是成交回报仅有的两把身份锚——皆空则既无法幂等去重
+        （store._fill_is_duplicate 两把键全落空 → 恒判"非重放"，通道抖动一次即多记一笔）、
+        也无法与委托/派发项对账归因（/settlement serial 与 order_id 双列皆空，垃圾行）。
+        现显式拒收：不落库、不推首尔、error 日志留痕，返回 False（调用方/网关 HTTP 路
+        径据此回 4xx，见 gateway._apply_trade）。语义与 §F5 对齐：Go 侧 order 回报缺
+        order_id 即 400 拒收留痕，trade 回报同样不允许无身份落账；仅缺 signal_id 不受影响
+        （可经 ext:<order_id>/派发回填归因，不在此拒收面）。report_fields.json 契约字段
+        集不变，只收紧"两键皆空"这一非法组合。返回 True=已受理。
         """
+        # §REJECT 身份锚校验：trade_id/order_id 皆空 → 显式拒收（绝不静默落垃圾行）
+        tid = str(ev.get("trade_id", "") or "").strip()
+        oid = str(ev.get("order_id", "") or "").strip()
+        if not tid and not oid:
+            log.error("[handler] §REJECT trade 回报 trade_id 与 order_id 皆空——拒收（不落库/不上报）: "
+                      "code=%s side=%s price=%s qty=%s signal_id=%s",
+                      ev.get("code"), ev.get("side"), ev.get("price"), ev.get("qty"),
+                      ev.get("signal_id"))
+            return False
         # §修复 G3（2026-08-29）：回调异常保护（见 on_order 说明）。
         try:
             # 成交先落库并去重；重复重放不推送，避免持仓翻倍
@@ -397,10 +424,12 @@ class ReportHandler:
                 log.warning("[handler] duplicate trade replay ignored: %s %s %s@%s x%s",
                             ev.get("order_id"), ev.get("side"), ev.get("code"),
                             ev.get("price"), ev.get("qty"))
-                return
+                return False
             self._push({"type": "trade", **ev})
+            return True
         except Exception:  # noqa: BLE001
             log.exception("[handler] on_trade failed, event skipped: %s", ev)
+            return False
 
     def on_positions(self, positions):
         """全量对账 + 推送。§G5：空快照守卫——只有连续两次空快照且本地有持仓才接受清空。

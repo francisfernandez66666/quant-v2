@@ -4,6 +4,16 @@
 //   - 板块/IPO：同花顺 → 东财，带 30s/60s TTL 缓存；
 //   - 新闻：同花顺(主) → 新浪(兜底) 去重合并。
 //
+// §M1/F4：本文件定义行情源名枚举 QuoteSource*（/api/status quote_source 契约的 Go 侧
+// 唯一事实源），golden 落在 qmt_gateway/contract/quote_sources.json，由
+// quote_sources_contract_test.go 做 AST 双向锁；§M3：NewsSourceHealth 只消费真实抓取
+// 统计（MarketAPI.recordNewsFetch），从未探测的源一律回 unknown，不再由指针就绪推导。
+//
+// English: batch-G hardening notes — §M1: the QuoteSource* enum below is the single source
+// of truth for /api/status quote_source, mirrored by the golden file
+// qmt_gateway/contract/quote_sources.json (AST-locked both ways); §M3: NewsSourceHealth
+// reports real fetch stats only, unknown-for-never-probed.
+//
 // English: Package data — a multi-source dispatch and circuit-breaker coordination layer.
 // English: It uniformly wraps the dispatch strategy of EastMoney (MarketAPI) and Tonghuashun (THSClient):
 // English:   - Quotes: Sina → THS → EastMoney 3-level fallback chain; THS auto-breaks for 60s on failure;
@@ -73,8 +83,47 @@ type DataCoordinator struct {
 	// English: ipoRefreshing: an IPO-calendar refresh is in flight (prevents concurrent
 	// English: duplicate refreshes when multiple callers hit the expired-TTL path at once).
 
-	lastSource string // §P1-10 最近一次成功命中的行情源名称（hithink/sina/ths/eastmoney）
-	// English: name of the last successful quote source.
+	lastSource string // §P1-10 最近一次成功命中的行情源名称（取值见 §M1 QuoteSource* 枚举）
+	// English: name of the last successful quote source (values locked to the §M1 QuoteSource* enum).
+}
+
+// ── §M1/F4 行情源名枚举——契约单源化（single source of truth）──
+// 背景：/api/status 的 quote_source 取自 MarketSnapshot.Source，历史上该值由
+// 三处字面量各写各的（降级链小写英文名 / fetcher 中文"同花顺（新）" / qmt_feed "QMT-L1"），
+// 而 web/e2e 白名单硬编码中文，两端漂移导致巡检假绿/假红。本组常量 + golden 文件
+// qmt_gateway/contract/quote_sources.json 即唯一事实源：Go 侧所有写入点必须引用常量，
+// E2E 白名单必须从 golden 读取；golden 契约测试（quote_sources_contract_test.go）
+// 做 AST 双向锁——源文件字面量 ⊆ golden、golden ⊆ 源文件字面量，任何一侧漂移即红。
+// 空串 "" 语义：**盘外/快照未就绪**（fetcher 未跑过一轮或整轮无数据），它不是源名、
+// 不进 golden 枚举；消费端须按"未知/盘外"处理，禁止与任何源名混同。
+// English: §M1/F4 — the canonical quote-source vocabulary. Every writer of
+// MarketSnapshot.Source / DataCoordinator.lastSource must use these constants; the golden
+// file qmt_gateway/contract/quote_sources.json mirrors them and the E2E whitelist must read
+// that file instead of hardcoding. The empty string means "outside session / snapshot not
+// ready" — deliberately NOT part of the enum.
+const (
+	QuoteSourceHithink      = "hithink"   // 降级链：同花顺（新）官方单票命中
+	QuoteSourceSina         = "sina"      // 降级链：新浪实时命中
+	QuoteSourceTHS          = "ths"       // 降级链：同花顺（老）命中
+	QuoteSourceEastMoney    = "eastmoney" // 降级链：东财末位兜底命中
+	QuoteSourceHithinkBatch = "同花顺（新）"    // fetcher 批量轮主导来源标注（中文，历史口径）
+	QuoteSourceQMTL1        = "QMT-L1"    // §ENH-5 Level-1 feed 合并注入
+)
+
+// AllQuoteSources 返回全部合法的行情源名取值（golden 契约的 Go 侧镜像）。
+// 顺序不保证，调用方自行排序；新增源必须同时：加常量 + 加本函数 + 重新生成 golden
+// （go test ./internal/data -run TestQuoteSourcesGolden -update）。
+// English: the full legal vocabulary of quote_source values; adding a source requires
+// updating the constant, this function, and regenerating the golden JSON.
+func AllQuoteSources() []string {
+	return []string{
+		QuoteSourceHithink,
+		QuoteSourceSina,
+		QuoteSourceTHS,
+		QuoteSourceEastMoney,
+		QuoteSourceHithinkBatch,
+		QuoteSourceQMTL1,
+	}
 }
 
 // cachedSectorStocks 板块成分股缓存条目。
@@ -166,28 +215,61 @@ func (dc *DataCoordinator) HealthCheck() map[string]bool {
 	return base
 }
 
-// NewsSourceHealth 探测新闻资讯源的可用性。
-// English: NewsSourceHealth probes the availability of news information sources.
-// （NewsSourceHealth probes the availability of news information sources.）
-// 探测三大主流资讯源：财联社、同花顺快讯、新浪
-// English: Probes the three major news sources: CLS (Cailianshe), THS flash news, Sina.
-// Probe the three major news sources: CLS, THS flash news, Sina
-func (dc *DataCoordinator) NewsSourceHealth() map[string]bool {
-	// 探测财联社：检查 eastMoney client 是否就绪（CLS 为主要新闻源）
-	// English: Probe CLS: check whether the eastMoney client is ready (CLS is the primary news source).
-	clsOk := dc.eastMoney != nil && dc.eastMoney.client != nil
-	// 探测同花顺快讯：检查 THSClient 是否就绪
-	// English: Probe THS flash news: check whether THSClient is ready.
-	thsOk := dc.ths != nil
-	// 探测新浪：简化判断，检查 eastMoney client 是否就绪
-	// (新浪新闻通过 GetSinaNews 接口获取，同东财 client 就绪视为可用)
-	// English: Probe Sina: simplified check on eastMoney client readiness (Sina news comes via GetSinaNews, available when the EastMoney client is ready).
-	sinaOk := dc.eastMoney != nil && dc.eastMoney.client != nil
-	return map[string]bool{
-		"cainanshe": clsOk,
-		"kuaixun":   thsOk,
-		"sina":      sinaOk,
+// NewsSourceHealth 探测新闻资讯源的真实可用性（§M3 重写）。
+// 旧缺陷：状态由 `eastMoney.client != nil` 之类指针就绪推导——只要客户端构造过就恒真，
+// 属纯编造；且键名 "cainanshe" 拼写错误。现改为消费 MarketAPI 的逐源真实抓取统计
+// （财联社/同花顺快讯/新浪各自的 最近成功时间、连续错误数、累计错误数）：
+//   - 从未发生过任何一次抓取 → 状态 "unknown"（绝不回 "ok"，杜绝零探测编造）；
+//   - 最近一次抓取失败（连续错误数>0） → "down"；
+//   - 最近一次抓取成功 → "ok"。
+//
+// 注意：键名已修正为 "cailanshe"，web 消费端需同步（见修复报告，主代理收尾）。
+// English: §M3 — real per-source news fetch statistics (last success / consecutive errors /
+// total errors) replace the old client-pointer fabrication; a source never fetched must
+// report "unknown", never "ok". Key typo cainanshe→cailanshe fixed (frontend follows later).
+func (dc *DataCoordinator) NewsSourceHealth() map[string]NewsSourceStatus {
+	out := make(map[string]NewsSourceStatus, 3)
+	for _, key := range []string{NewsSourceCLS, NewsSourceTHSFlash, NewsSourceSina} {
+		var snap NewsSourceStatSnapshot
+		if dc != nil && dc.eastMoney != nil {
+			snap = dc.eastMoney.newsSourceStatFor(key)
+		}
+		out[key] = newsStatusFrom(snap)
 	}
+	return out
+}
+
+// NewsSourceStatus 单个新闻源的对外健康结构（/api/news_source_health JSON 形态）。
+// Status 枚举：ok / down / unknown（unknown=从未探测，禁止误读为健康）。
+// English: one news source's public health struct; status ∈ {ok, down, unknown}.
+type NewsSourceStatus struct {
+	Status        string `json:"status"` // ok / down / unknown（§M3：无探测数据必为 unknown）
+	LastSuccessAt string `json:"last_success_at,omitempty"`
+	// 最近成功抓取时间（RFC3339，本地/北京时区）；从未成功=省略
+	ConsecutiveErrors int   `json:"consecutive_errors"` // 连续失败计数
+	TotalErrors       int64 `json:"total_errors"`       // 累计失败计数
+}
+
+// newsStatusFrom 把内部统计映射为对外状态。语义钉死：无探测数据 → unknown。
+// newsStatusFrom maps internal stats to the public status; no probe data ⇒ unknown.
+func newsStatusFrom(snap NewsSourceStatSnapshot) NewsSourceStatus {
+	st := NewsSourceStatus{
+		ConsecutiveErrors: snap.ConsecutiveErrs,
+		TotalErrors:       snap.TotalErrs,
+	}
+	if !snap.Probed {
+		st.Status = "unknown"
+		return st
+	}
+	if !snap.LastSuccessAt.IsZero() {
+		st.LastSuccessAt = snap.LastSuccessAt.Format(time.RFC3339)
+	}
+	if snap.ConsecutiveErrs > 0 {
+		st.Status = "down"
+	} else {
+		st.Status = "ok"
+	}
+	return st
 }
 
 // GetQuote 获取个股实时行情：同花顺（新）hithink → 新浪 → 同花顺 → 东财 四级降级链，
@@ -210,7 +292,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	if hk := dc.hithink; hk != nil {
 		if hkQuotes, hkErr := hk.BatchQuotes([]string{code}); hkErr == nil {
 			if si := lookupHithinkQuote(hkQuotes, code); si != nil && si.Price > 0 {
-				dc.setLastSource("hithink")
+				dc.setLastSource(QuoteSourceHithink) // §M1 枚举常量，禁止裸字面量
 				log.Printf("hithink(新)返回 %s 最新价 %.2f", code, si.Price)
 				return si, nil
 			}
@@ -222,7 +304,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	// ② 新浪：hithink 缺失/失败时的主用源。
 	si, err := dc.eastMoney.GetSinaQuote(code)
 	if err == nil && si != nil && si.Price > 0 {
-		dc.setLastSource("sina")
+		dc.setLastSource(QuoteSourceSina) // §M1 枚举常量
 		return si, nil
 	}
 	if err != nil {
@@ -233,7 +315,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	if dc.thsAvailable(thsOpQuote) {
 		thsSi, thsErr := dc.ths.GetQuote(code)
 		if thsErr == nil && thsSi != nil && thsSi.Price > 0 {
-			dc.setLastSource("ths")
+			dc.setLastSource(QuoteSourceTHS) // §M1 枚举常量
 			log.Printf("同花顺返回 %s 最新价 %.2f", code, thsSi.Price)
 			return thsSi, nil
 		} else if thsErr != nil {
@@ -245,7 +327,7 @@ func (dc *DataCoordinator) GetQuote(code string) (*StockInfo, error) {
 	// ④ 东财：永远处于最末兜底位（绝不作为第一/主源）。
 	emSI, emErr := dc.eastMoney.GetRealtimeQuote(code)
 	if emErr == nil && emSI != nil && emSI.Price > 0 {
-		dc.setLastSource("eastmoney")
+		dc.setLastSource(QuoteSourceEastMoney) // §M1 枚举常量
 		return emSI, nil
 	}
 	if emErr != nil {
@@ -446,6 +528,22 @@ func (dc *DataCoordinator) GetSectors() ([]SectorInfo, error) {
 		return s, nil
 	}
 
+	// §LOW(SPOF) 双源皆败的 last-known-good 兜底：同花顺+东财（含镜像分页）整轮失败时，
+	// 回退过期板块缓存（真实但陈旧）并打显式「陈旧回退」告警——板块列表用于展示与扫描的
+	// 结构性输入，旧结构 > 整段空白；告警可见故不构成静默报成功。无缓存可回退时仍回 error。
+	// English: §LOW(SPOF) last-known-good on total failure: serve the expired sector cache with
+	// a loud stale-warning instead of a hard error; without any cache the error still propagates.
+	dc.mu.RLock()
+	stale := dc.sectorCache
+	staleAt := dc.sectorCacheAt
+	dc.mu.RUnlock()
+	if len(stale) > 0 {
+		log.Printf("[source] §LOW(SPOF) 板块双源皆败，回退 %v 前的板块缓存 (%d个板块)", time.Since(staleAt).Round(time.Second), len(stale))
+		out := make([]SectorInfo, len(stale))
+		copy(out, stale)
+		return out, nil
+	}
+
 	return nil, fmt.Errorf("所有板块源均失败")
 }
 
@@ -504,6 +602,22 @@ func (dc *DataCoordinator) GetSectorStocks(sectorCode string, topN int) ([]Stock
 	}
 	if err != nil {
 		log.Printf("东财板块成分股失败 (%s): %v", sectorCode, err)
+	}
+
+	// §LOW(SPOF) 同花顺+东财双源皆败的 last-known-good 兜底：回退该板块的过期成分股缓存
+	// （真实但陈旧）并显式告警；成分股列表用于热点扫描的结构性输入，旧列表 > 整轮空转。
+	// 无任何历史缓存时仍透传错误，不编造。
+	// English: §LOW(SPOF) both sources failed — serve this sector's expired constituent cache
+	// with a loud stale warning (structure-relevant list: old beats empty); error otherwise.
+	dc.mu.RLock()
+	c, has := dc.sectorStockCache[sectorCode]
+	dc.mu.RUnlock()
+	if has && len(c.stocks) > 0 {
+		log.Printf("[source] §LOW(SPOF) 板块成分股双源皆败，回退 %s 的过期缓存 (%d只, %v 前)",
+			sectorCode, len(c.stocks), time.Since(c.at).Round(time.Second))
+		out := make([]StockInfo, len(c.stocks))
+		copy(out, c.stocks)
+		return out, nil
 	}
 	return s, err
 }
@@ -567,6 +681,13 @@ func (dc *DataCoordinator) GetIndexData() (indexPrice float64, ma20 float64, upC
 // CrossCheckPrice 用东财 push2 获取个股价格，用于信号复核。
 // English: CrossCheckPrice fetches a stock price via EastMoney push2 for signal cross-checking.
 // CrossCheckPrice returns a price via EastMoney push2 for signal cross-checking.
+//
+// §LOW(a) 现状标注（20260922 修复批 G，交主代理裁决，勿顺手删）：
+//   - 全仓 grep 显示本方法当前**零生产消费者**（仅定义处命中），属"死代码但保留"：
+//     按本仓"实现优先于删除"规范未删除，等待 owner 裁决接线（信号复核链路启用）或删除；
+//   - 名不副实提示：注释写"仅东财"，但实际调用的 GetRealtimeQuote 内部已自带
+//     新浪→腾讯→东财 多源链（market.go §S4），故其并非真正的东财单点（SPOF 三方法
+//     兜底批不含它，理由见修复报告）。
 func (dc *DataCoordinator) CrossCheckPrice(code string) (price float64, err error) {
 	si, err := dc.eastMoney.GetRealtimeQuote(code)
 	if err != nil || si == nil {

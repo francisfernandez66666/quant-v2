@@ -75,9 +75,18 @@ func clsSign(params map[string]string) string {
 
 // GetCLSNews 获取财联社电报滚动新闻。
 // limit 限制返回条数（≤ 50）。正文全量自带，ctime 为 Unix 秒。
+// §M3：出口统一记账真实健康数据（cailanshe 键），供 NewsSourceHealth 消费。
 // GetCLSNews fetches the CLS telegraph rolling news (limit ≤ 50); full bodies
 // are included and ctime is Unix seconds.
 func (m *MarketAPI) GetCLSNews(limit int) ([]NewsItem, error) {
+	items, err := m.fetchCLSNews(limit)
+	m.recordNewsFetch(NewsSourceCLS, err) // §M3 真实探测记账
+	return items, err
+}
+
+// fetchCLSNews 财联社电报抓取主体（原 GetCLSNews 实现，逻辑未变）。
+// fetchCLSNews is the original CLS telegraph body (logic unchanged).
+func (m *MarketAPI) fetchCLSNews(limit int) ([]NewsItem, error) {
 	if limit <= 0 || limit > 50 {
 		limit = clsDefaultLimit
 	}

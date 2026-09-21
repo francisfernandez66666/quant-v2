@@ -46,10 +46,14 @@ func TestSnapshotCrossDayDropped(t *testing.T) {
 	}
 }
 
-// TestStalenessZeroWhenNeverFetched 验证从未采集时 Staleness 返回 0。
-func TestStalenessZeroWhenNeverFetched(t *testing.T) {
+// TestStalenessNegativeWhenNeverFetched §M2 语义修正回归：从未采集时 Staleness 必须回 -1 秒
+// （未知），不再回 0——旧断言锁的正是缺陷语义（0 让"从未有行情"伪装成"绝对新鲜"）。
+func TestStalenessNegativeWhenNeverFetched(t *testing.T) {
 	f := NewFetcher(nil, &MarketAPI{}, nil)
-	if f.Staleness() != 0 {
-		t.Fatal("从未采集时 Staleness 应为 0")
+	if f.Staleness() != -1*time.Second {
+		t.Fatalf("从未采集时 Staleness 应为 -1s（未知），得到 %v", f.Staleness())
+	}
+	if f.StalenessMs("600000") != -1 {
+		t.Fatalf("StalenessMs 从未采集应为 -1，得到 %d", f.StalenessMs("600000"))
 	}
 }

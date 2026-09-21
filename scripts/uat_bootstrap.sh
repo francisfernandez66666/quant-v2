@@ -61,6 +61,11 @@ fi
 
 # ── env：只打印环境变量 ─────────────────────────────────────────────────────
 if [[ "$MODE" == "env" ]]; then
+  # §3.1-1：E2E_QUOTE_SOURCE = 本次自举注入 mock 的行情源名（up 阶段落盘的文件）；
+  # 消费方（web/e2e/uat_full.spec.mjs）据此判定「盘内形态是否已注入」，注入在场时
+  # /api/status.quote_source 必须非空且命中 golden 枚举——空=旧盘外形态，只跑宽松断言。
+  QS_FILE="$DATA_DIR/quote_source.txt"
+  QS="$([[ -f "$QS_FILE" ]] && cat "$QS_FILE" || true)"
   cat <<EOF
 export E2E_BASE_URL=http://localhost:${FRONT_PORT}
 export E2E_API=${BACKEND}
@@ -68,6 +73,7 @@ export E2E_USER=${E2E_USER}
 export E2E_PASS='${E2E_PASS}'
 export E2E_USER2=${E2E_USER2}
 export E2E_PASS2='${E2E_PASS2}'
+export E2E_QUOTE_SOURCE='${QS}'
 EOF
   exit 0
 fi
@@ -85,14 +91,125 @@ rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR" "$PIDDIR"
 
 log "构建 quant 引擎与 qmt-mock 假柜台..."
-( cd "$ROOT" && go build -o "$PIDDIR/quant" ./cmd/quant )
+# §F6（2026-09-22）：与生产部署同款式注入 git 指纹（deploy_guangzhou.sh 步[1/5] / deploy_seoul.sh 步[1/8]
+# 的 LDFLAGS="-X main.buildCommit=..."）。旧版裸 go build → UAT 栈 buildCommit 恒为 unknown，
+# 引擎启动自检（cmd/quant/main.go）走"未注入指纹"告警分支，A7 真栈用例与线上口径脱节。
+LDFLAGS="-X main.buildCommit=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+( cd "$ROOT" && go build -ldflags "${LDFLAGS}" -o "$PIDDIR/quant" ./cmd/quant )
 ( cd "$ROOT" && go build -o "$PIDDIR/qmt-mock" ./cmd/qmt-mock )
+
+# ── 1b) §3.1-1/FIX_PLAN_20260922（M1/F4）盘内形态可测化：注入 quote_source + 行情时间戳 ──
+# 缺陷原文：引擎 /api/status.quote_source 只在「盘内 + 行情链跑通」时才有值，盘外恒为空串，
+#   E2E 的白名单断言（uat_full.spec.mjs 旧 :994-997）永远走 if(quote_source) 的假分支 → 词表漂移
+#   （Go 侧恒吐小写英文 hithink/sina/ths/eastmoney，白名单只收中文）在 nightly 里从不被触发。
+# 本步做法（零改 internal/**）：
+#   ① 单一事实源：注入值只从 qmt_gateway/contract/quote_sources.json 解析（golden 缺失时显式告警
+#      并退回旧行为=不注入，绝不在脚本里硬编一份中文/英文词表——那正是 M1 的病根）；
+#   ② mock 注入面：qmt-mock 新增 -quote-source/-quote-tick-age-sec/-quote-tick-time-ms（见 cmd/qmt-mock），
+#      /quotes 顶层回显注入的源名，E2E 据此把「mock 侧声明的源」与 golden 对齐做硬断言；
+#   ③ 引擎侧「有源快照」：走引擎既有的 §GAP3.2 同日快照恢复通道（fetcher.LoadPersistedSnapshot 读
+#      snapshot_latest.json，盘外 5s 采集循环本就暂停 → 快照原样保留），把注入源写成当日快照。
+#      注：不伪造 tick 级数据、不改判定链，只让"快照带来源"这一盘内形态在盘外可复现。
+GOLDEN_SOURCES="$ROOT/qmt_gateway/contract/quote_sources.json"
+QUOTE_SOURCE="${UAT_QUOTE_SOURCE:-}"
+if [[ -z "$QUOTE_SOURCE" ]]; then
+  QUOTE_SOURCE="$("$PY" - "$GOLDEN_SOURCES" <<'PY' || true
+# 解析 quote_source golden：输出本次自举要注入的源名（golden 缺失/无枚举时输出空串=不注入）。
+# 选取口径：优先 "QMT-L1"（=mock 柜台驱动 L1 feed 的真实盘内形态），否则取枚举末位。
+# 注：`$PY - <脚本路径>` 是本仓库既有约定（见下方 seed 段）。写成 `$PY <json> <<PY` 会让
+# python 把 json 文件当程序执行（这份 golden 恰好是合法 Python 列表字面量 → 静默无输出、注入失效），
+# 属真机踩点，务必保留 "-"。
+import json, os, sys
+
+path = sys.argv[1]
+if not os.path.exists(path):
+    sys.stderr.write("[uat-boot] golden 缺失: %s（quote_source 注入停用，E2E 侧将显式失败）\n" % path)
+    print("")
+    raise SystemExit(0)
+
+raw = json.load(open(path))
+
+
+def collect(obj):
+    """按候选键取枚举串列表；候选键全不命中时退回"所有顶层字符串数组并集"。"""
+    if isinstance(obj, list):
+        return [x for x in obj if isinstance(x, str)]
+    if not isinstance(obj, dict):
+        return []
+    for k in ("quote_sources", "sources", "values", "enum", "names"):
+        v = obj.get(k)
+        if isinstance(v, list):
+            got = [x for x in v if isinstance(x, str)]
+            if got:
+                return got
+    out = []
+    for v in obj.values():
+        if isinstance(v, list):
+            out += [x for x in v if isinstance(x, str)]
+    return out
+
+
+vals = collect(raw)
+if not vals:
+    sys.stderr.write("[uat-boot] golden 无可用枚举: %s\n" % path)
+    print("")
+    raise SystemExit(0)
+print("QMT-L1" if "QMT-L1" in vals else vals[-1])
+PY
+)"
+fi
+if [[ -n "$QUOTE_SOURCE" ]]; then
+  log "§3.1-1 行情注入源=${QUOTE_SOURCE}（golden: ${GOLDEN_SOURCES#$ROOT/}）"
+  echo "$QUOTE_SOURCE" > "$DATA_DIR/quote_source.txt"
+else
+  warn "§3.1-1 未取到 quote_source golden（$GOLDEN_SOURCES 缺失或无枚举）——本轮不注入，"
+  warn "  /api/status.quote_source 将维持盘外空串，消费 golden 的 E2E 用例会显式失败提示。"
+fi
+
+# 预置「盘内快照」形态：snapshot_latest.json 字段形态与 Go 侧 data.MarketSnapshot 一致
+# （无 json tag → Stocks/Sector/Time/Source 原样大写；StockInfo 用其 json tag）。
+# 伪价格取 mock /quotes 的同一公式（digits%90+10 元），保证盘内外读到的价一致。
+if [[ -n "$QUOTE_SOURCE" ]]; then
+  QUOTE_SOURCE="$QUOTE_SOURCE" QUANT_DATA_DIR="$DATA_DIR" "$PY" - <<'PY'
+import json, os
+from datetime import datetime, timedelta, timezone
+# 与 mock /quotes / 自举持仓 seed 同源的三只标的（600000.SH / 000001.SZ 亦即步骤 6 的模拟盘持仓）
+codes = [("600000.SH", "浦发银行"), ("000001.SZ", "平安银行")]
+def base_price(code):
+    digits = int("".join(ch for ch in code if ch.isdigit()) or "0")
+    return float((digits % 90 + 10))
+stocks = {}
+for code, name in codes:
+    p = base_price(code)
+    stocks[code] = {
+        "code": code, "name": name, "price": p, "open": p - 0.5, "high": p + 0.3,
+        "low": p - 0.3, "close": p, "prev_close": p, "volume": 1000000, "amount": p * 1000000,
+        "change_pct": 0.0, "turnover": 0.0, "net_inflow": 0.0, "has_flow": False, "sector": "UAT",
+    }
+snap = {
+    "Stocks": stocks,
+    "Sector": [],
+    # §LOW 族时区口径：显式 +08:00 偏移（不自签本机时区），与引擎 TradingDayDate 的北京日一致
+    "Time": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
+    "Source": os.environ["QUOTE_SOURCE"],
+}
+path = os.path.join(os.environ["QUANT_DATA_DIR"], "snapshot_latest.json")
+json.dump(snap, open(path, "w"), ensure_ascii=False)
+print("seeded snapshot_latest.json source=%s codes=%d" % (snap["Source"], len(stocks)))
+PY
+fi
 
 # ── 2) 起 qmt-mock 假柜台（预置茅台持仓行情 + 1.5s 回报延迟）──────────────────
 log "启动 qmt-mock (:${MOCK_PORT})..."
+# §3.1-1：注入面参数按可用性拼接（golden 缺失时 MOCK_QUOTE_ARGS 为空数组 → 命令与旧版逐字一致）
+MOCK_QUOTE_ARGS=()
+if [[ -n "$QUOTE_SOURCE" ]]; then
+  MOCK_QUOTE_ARGS=(-quote-source "$QUOTE_SOURCE")
+fi
 "$PIDDIR/qmt-mock" -listen ":${MOCK_PORT}" -token "$QMT_TOKEN" \
   -server "$BACKEND" -delay 1.5s \
   -seed "600519.SH,贵州茅台,200,1500.00" \
+  "${MOCK_QUOTE_ARGS[@]+"${MOCK_QUOTE_ARGS[@]}"}" \
   > "$DATA_DIR/mock.log" 2>&1 &
 echo $! > "$PIDDIR/mock.pid"
 
@@ -239,5 +356,6 @@ if [[ "$MODE" == "run" ]]; then
     E2E_BASE_URL="http://localhost:${FRONT_PORT}" E2E_API="$BACKEND" \
     E2E_USER="$E2E_USER" E2E_PASS="$E2E_PASS" \
     E2E_USER2="$E2E_USER2" E2E_PASS2="$E2E_PASS2" \
+    E2E_QUOTE_SOURCE="$QUOTE_SOURCE" \
     npx playwright test )
 fi

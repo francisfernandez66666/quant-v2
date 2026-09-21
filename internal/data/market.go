@@ -119,6 +119,119 @@ type MarketAPI struct {
 	// 仅被 GetRealtimeQuoteWithFlow 使用；主循环高频路径不受影响。
 	// Optional THS client used only by the consult quote chain (nil degrades gracefully).
 	ths *THSClient
+
+	// §M3 新闻源真实健康记录：每个资讯源（财联社/同花顺快讯/新浪）的新闻抓取在
+	// 公开方法出口处记录 最近成功时间/连续错误数/累计错误数；NewsSourceHealth 只读这些
+	// 真实探测数据，绝不由「client 指针非 nil」推导可用性（旧实现即此纯编造）。
+	// English: §M3 — real per-news-source fetch statistics recorded at every public news-fetch
+	// exit; NewsSourceHealth reports from these observations only (the old code derived
+	// "ok" from client-pointer readiness, which was pure fabrication).
+	newsHealthMu sync.Mutex
+	newsHealth   map[string]*newsSourceStat
+
+	// §LOW(SPOF) GetIndexData 的 last-known-good 缓存：东财是指数行情的唯一上游
+	// （源码注释自认"无第二源"），整链失败时短窗口内回退陈旧真实值并显式告警，
+	// 优于向下游返回错误导致行情面整段空白。
+	// English: §LOW(SPOF) last-known-good cache for GetIndexData (EastMoney is its single
+	// upstream); within a short window a failed round serves the stale-but-real value loudly.
+	indexLKG   *indexLKGEntry // 上一份成功的指数行情（nil=从未成功）
+	indexLKGMu sync.Mutex     // 保护 indexLKG 读写
+}
+
+// ── §M3 新闻源健康记录 ──
+
+// 新闻源健康键名（对外 /api/news_source_health 的 JSON 键，也是内部记录键）。
+// §M3 键名修正：旧实现把财联社写成 "cainanshe"（正确拼音 cailianshe），且 web 端跟着
+// 错键消费——Go 侧已改，web 消费端（Dashboard.jsx/api/index.js）需同步（由主代理收尾）。
+// English: canonical news-source keys; the historical "cainanshe" typo is fixed to "cailanshe".
+const (
+	NewsSourceCLS      = "cailanshe" // 财联社电报
+	NewsSourceTHSFlash = "kuaixun"   // 同花顺快讯
+	NewsSourceSina     = "sina"      // 新浪财经滚动新闻
+)
+
+// newsSourceStat 单个新闻源的真实探测统计。零值=从未探测（everProbed=false），
+// 此时对外状态必须是 "unknown" 而绝不能是 "ok"。
+// newsSourceStat holds real per-source fetch stats; a never-probed source (everProbed=false)
+// must surface as "unknown", never "ok".
+type newsSourceStat struct {
+	everProbed     bool      // 是否发生过至少一次抓取（成功或失败都算）
+	lastSuccessAt  time.Time // 最近一次抓取成功时间
+	lastAttemptAt  time.Time // 最近一次抓取时间（成功/失败皆有）
+	lastErr        string    // 最近一次错误信息（成功时保留，仅供排障）
+	consecutiveErr int       // 连续失败计数（任一成功即清零）
+	totalErr       int64     // 进程生命周期内累计失败次数
+	totalOK        int64     // 进程生命周期内累计成功次数
+}
+
+// recordNewsFetch 在新闻抓取公开方法出口统一记账（src 取 NewsSource* 常量）。
+// nil error → 成功：清连续失败、更新最近成功时间；非 nil → 失败：连续/累计计数递增。
+// English: single accounting exit for all public news fetches.
+func (m *MarketAPI) recordNewsFetch(src string, err error) {
+	m.newsHealthMu.Lock()
+	defer m.newsHealthMu.Unlock()
+	if m.newsHealth == nil {
+		m.newsHealth = make(map[string]*newsSourceStat, 3)
+	}
+	st := m.newsHealth[src]
+	if st == nil {
+		st = &newsSourceStat{}
+		m.newsHealth[src] = st
+	}
+	now := time.Now()
+	st.everProbed = true
+	st.lastAttemptAt = now
+	if err == nil {
+		st.totalOK++
+		st.consecutiveErr = 0
+		st.lastSuccessAt = now
+		return
+	}
+	st.totalErr++
+	st.consecutiveErr++
+	st.lastErr = err.Error()
+}
+
+// NewsSourceStatSnapshot 是单源健康快照（对外经 dc.NewsSourceHealth 组装）。
+// NewsSourceStatSnapshot is one source's health snapshot consumed by DataCoordinator.
+type NewsSourceStatSnapshot struct {
+	Probed          bool      // 是否探测过（false → 状态必须为 unknown）
+	LastSuccessAt   time.Time // 最近成功时间（零值=从未成功）
+	ConsecutiveErrs int       // 连续失败数
+	TotalErrs       int64     // 累计失败数
+}
+
+// newsSourceStatFor 锁内读取单源统计（不存在=从未探测）。
+// English: locked read of one source's stats (absent == never probed).
+func (m *MarketAPI) newsSourceStatFor(src string) NewsSourceStatSnapshot {
+	m.newsHealthMu.Lock()
+	defer m.newsHealthMu.Unlock()
+	st := m.newsHealth[src]
+	if st == nil || !st.everProbed {
+		return NewsSourceStatSnapshot{}
+	}
+	return NewsSourceStatSnapshot{
+		Probed:          true,
+		LastSuccessAt:   st.lastSuccessAt,
+		ConsecutiveErrs: st.consecutiveErr,
+		TotalErrs:       st.totalErr,
+	}
+}
+
+// ── §LOW(SPOF) GetIndexData last-known-good ──
+
+// indexLKGMaxAge 陈旧指数行情的最大可回退窗口：窗口内失败轮次回退上一份真实值并告警；
+// 超出窗口宁可回 error（旧值已无参考价值，下游按缺失降级/弃权）。
+// English: max staleness window for serving the last-known-good index data.
+const indexLKGMaxAge = 10 * time.Minute
+
+// indexLKGEntry GetIndexData 的上一份成功结果。
+// indexLKGEntry is the previous successful GetIndexData result.
+type indexLKGEntry struct {
+	indexPrice float64
+	ma20       float64
+	up, down   int
+	at         time.Time
 }
 
 // emBreaker 单接口熔断器状态：记录该接口连续失败次数与熔断到期时间。
@@ -1604,8 +1717,17 @@ func ValidateKLine(klines []KLine) bool {
 
 // GetSinaNews 抓取新浪财经滚动快讯，pageSize 决定单次条数；走 SinaLimiter 限流，
 // 只回原始条目，正文补全交给下游 GetArticle。
+// §M3：出口统一记账真实健康数据（成功时间/连续错误数），供 NewsSourceHealth 消费。
 // GetSinaNews fetches Sina Finance flash/rolling news capped by pageSize.
 func (m *MarketAPI) GetSinaNews(pageSize int) ([]NewsItem, error) {
+	items, err := m.fetchSinaNews(pageSize)
+	m.recordNewsFetch(NewsSourceSina, err) // §M3 真实探测记账
+	return items, err
+}
+
+// fetchSinaNews 新浪快讯抓取主体（原 GetSinaNews 实现，未改动逻辑）。
+// fetchSinaNews is the original Sina news body (logic unchanged), wrapped by GetSinaNews.
+func (m *MarketAPI) fetchSinaNews(pageSize int) ([]NewsItem, error) {
 	url := fmt.Sprintf("https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&knum=%d", pageSize)
 	SinaLimiter.Wait()
 	req, err := http.NewRequest("GET", url, nil)
@@ -1728,9 +1850,18 @@ func parseEastMoneyNews(body []byte) ([]NewsItem, error) {
 // API 端点：https://news.10jqka.com.cn/tapp/news/push/stock
 // 当同花顺不可用时，降级到新浪或东方财富新闻。
 // pageSize 限制返回条数。
+// §M3：出口统一记账真实健康数据（kuaixun 键）。
 // GetTonghuashunNews fetches Tonghuashun flash news (the preferred news source,
 // fastest pump); falls back to Sina/EastMoney when unavailable.
 func (m *MarketAPI) GetTonghuashunNews(pageSize int) ([]NewsItem, error) {
+	items, err := m.fetchTonghuashunNews(pageSize)
+	m.recordNewsFetch(NewsSourceTHSFlash, err) // §M3 真实探测记账
+	return items, err
+}
+
+// fetchTonghuashunNews 同花顺快讯抓取主体（原 GetTonghuashunNews 实现，逻辑未变）。
+// fetchTonghuashunNews is the original THS news body (logic unchanged).
+func (m *MarketAPI) fetchTonghuashunNews(pageSize int) ([]NewsItem, error) {
 	if pageSize <= 0 {
 		pageSize = 20
 	}
@@ -1755,8 +1886,17 @@ func (m *MarketAPI) GetTonghuashunNews(pageSize int) ([]NewsItem, error) {
 }
 
 // GetTonghuashunNewsPage 获取指定页的同花顺快讯（用于分页历史追回）。
+// §M3：与 GetTonghuashunNews 共用 kuaixun 健康键记账。
 // GetTonghuashunNewsPage fetches a specific page of THS news for historical backfill.
 func (m *MarketAPI) GetTonghuashunNewsPage(page, pageSize int) ([]NewsItem, error) {
+	items, err := m.fetchTonghuashunNewsPage(page, pageSize)
+	m.recordNewsFetch(NewsSourceTHSFlash, err) // §M3 真实探测记账
+	return items, err
+}
+
+// fetchTonghuashunNewsPage 同花顺快讯分页抓取主体（原实现，逻辑未变）。
+// fetchTonghuashunNewsPage is the original paged THS news body (logic unchanged).
+func (m *MarketAPI) fetchTonghuashunNewsPage(page, pageSize int) ([]NewsItem, error) {
 	if pageSize <= 0 {
 		pageSize = 20
 	}
@@ -2049,17 +2189,36 @@ func shortDate(s string) string {
 
 // ── 指数行情 ──
 
-// GetIndexData 获取上证指数行情和全市场涨跌家数。
-// 指数 F43 字段单位为分，需 ÷100 还原为实际指数点位。
-// 返回：
-//   - indexPrice: 上证指数当前价
-//   - ma20: 上证指数 20 日均线
-//   - upCount: 上涨家数
-//   - downCount: 下跌家数
-//
-// GetIndexData returns the SH index price, its MA20, and the market-wide
-// up/down counts for sentiment gauging.
+// GetIndexData 获取上证指数行情和全市场涨跌家数（对外入口，带 §LOW(SPOF) last-known-good 兜底）。
+// 东财 push2 是本方法唯一上游（旧注释自认"无第二源，需补第二源"）：主链一旦失败，
+// 整链原本无任何兜底、直接回 error。现补上：①成功轮次写 LKG 缓存；②失败轮次若 LKG 在
+// indexLKGMaxAge 窗口内，回退上一份真实值并打「陈旧回退」告警（真实但旧 > 整段空白，
+// 且告警可见不构成静默降级报成功）；③无 LKG 或超窗仍回 error，下游按缺失降级/弃权。
+// English: public entry with a §LOW(SPOF) last-known-good fallback: successes refresh the
+// cache; failures within indexLKGMaxAge serve the stale-but-real value with a loud warning;
+// without cache (or too old) the error still propagates for downstream abstention.
 func (m *MarketAPI) GetIndexData() (indexPrice float64, ma20 float64, upCount, downCount int, err error) {
+	indexPrice, ma20, upCount, downCount, err = m.getEastMoneyIndexData()
+	if err == nil {
+		m.indexLKGMu.Lock()
+		m.indexLKG = &indexLKGEntry{indexPrice: indexPrice, ma20: ma20, up: upCount, down: downCount, at: time.Now()}
+		m.indexLKGMu.Unlock()
+		return indexPrice, ma20, upCount, downCount, nil
+	}
+	m.indexLKGMu.Lock()
+	lkg := m.indexLKG
+	m.indexLKGMu.Unlock()
+	if lkg != nil && time.Since(lkg.at) <= indexLKGMaxAge {
+		log.Printf("[market] §LOW(SPOF) 指数行情主链失败，回退 %v 前的 last-known-good（点位 %.2f，涨跌家数 %d/%d）: %v",
+			time.Since(lkg.at).Round(time.Second), lkg.indexPrice, lkg.up, lkg.down, err)
+		return lkg.indexPrice, lkg.ma20, lkg.up, lkg.down, nil
+	}
+	return 0, 0, 0, 0, err
+}
+
+// getEastMoneyIndexData 东财单源指数行情主体（原 GetIndexData 实现，逻辑未变）。
+// getEastMoneyIndexData is the original EastMoney-only index fetch (logic unchanged).
+func (m *MarketAPI) getEastMoneyIndexData() (indexPrice float64, ma20 float64, upCount, downCount int, err error) {
 	// §D1 修复：上证指数必须用沪市前缀 "1.000001"——secID("000001") 会生成深市
 	// 前缀 "0.000001"，取到的是平安银行而非上证指数（点位/涨跌全错）。
 	// English: D1 fix — the SH index must use the explicit "1.000001" secid; secID() maps

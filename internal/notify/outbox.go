@@ -35,6 +35,7 @@ const (
 
 // outboxItem 运行时待补投条目：deliver 为闭包（不可序列化），持久化走 outboxPersistItem。
 type outboxItem struct {
+	id       int64                       // §H9 队列内唯一 ID（入队时分配）：批量投递回写定位用，不依赖易漂移的数组下标
 	kind     string                      // 目标标识："webhook:<url>" | "gateway"（同时是投递通道稳定键）
 	msg      Message                     // 原始消息体
 	attempts int                         // 已尝试次数
@@ -60,6 +61,7 @@ type outboxPersistItem struct {
 type Outbox struct {
 	mu          sync.Mutex     // 保护队列状态的互斥锁
 	items       []outboxItem   // 待补投消息条目
+	nextID      int64          // §H9 条目唯一 ID 计数器（进程内单调递增；持久化行加载时重新分配）
 	started     bool           // 后台重试协程是否已启动
 	stop        chan struct{}  // 停止后台协程的信号通道
 	owner       *Notifier      // 重建持久化条目的投递函数用（New 时绑定）
@@ -94,8 +96,9 @@ func (o *Outbox) SetPersistPath(path string) {
 		if !ok {
 			continue
 		}
+		o.nextID++ // §H9 ID 只在进程内有意义：持久化行加载时重新分配，避免与在途计数冲突
 		o.items = append(o.items, outboxItem{
-			kind: p.Kind, msg: p.Msg, attempts: p.Attempts,
+			id: o.nextID, kind: p.Kind, msg: p.Msg, attempts: p.Attempts,
 			nextAt: p.NextAt, deliver: dl,
 		})
 		n++
@@ -129,8 +132,9 @@ func (o *Outbox) enqueue(kind string, msg Message, deliver func(string, Message)
 		return
 	}
 	o.mu.Lock()
+	o.nextID++ // §H9 入队即分配进程内唯一 ID，投递回写按 ID 定位（不再依赖数组下标）
 	o.items = append(o.items, outboxItem{
-		kind: kind, msg: msg, attempts: 1,
+		id: o.nextID, kind: kind, msg: msg, attempts: 1,
 		nextAt:  time.Now().Add(outboxBaseDelay),
 		deliver: deliver,
 	})
@@ -179,12 +183,16 @@ func (o *Outbox) Stop() {
 
 // pump 扫描到期项逐条重试。§R3-8 P1-D：收集与状态回写持锁、HTTP 投递放锁外——
 // 此前全程持锁，单条 10s 超时会阻塞 Push()/enqueue() 主路径。
+// §H9：回写定位改按条目唯一 id 而非快照数组下标——同一批内前一条成功出队会让后续条目
+// 在队列中整体前移，按 idx 做的身份校验必然失败，条目既不删除也不退避，每秒整批重投（风暴）。
 // English: R3-8 P1-D — due items are collected under lock but delivered outside it, so a slow
 // webhook can no longer stall the main push path.
+// English: H9 — write-back locates items by their unique id instead of the snapshot index; an
+// earlier successful dequeue shifts the rest of the queue and broke the old index-based check.
 func (o *Outbox) pump() {
-	// job 待投递任务：队列内下标 + 对应 outboxItem。
+	// job 待投递任务：条目唯一 ID + 对应 outboxItem 快照。
 	type job struct {
-		idx  int
+		id   int64
 		item outboxItem
 	}
 	o.mu.Lock()
@@ -192,7 +200,7 @@ func (o *Outbox) pump() {
 	jobs := make([]job, 0, len(o.items))
 	for i := range o.items {
 		if !o.items[i].nextAt.After(now) {
-			jobs = append(jobs, job{idx: i, item: o.items[i]})
+			jobs = append(jobs, job{id: o.items[i].id, item: o.items[i]})
 		}
 	}
 	o.mu.Unlock()
@@ -200,19 +208,26 @@ func (o *Outbox) pump() {
 	for _, j := range jobs {
 		err := j.item.deliver(j.item.kind, j.item.msg)
 		o.mu.Lock()
-		// 队列可能已被并发 enqueue 改动：按 idx 定位并校验身份（kind+title+nextAt）后再改写。
-		if j.idx < len(o.items) && o.items[j.idx].nextAt.Equal(j.item.nextAt) &&
-			o.items[j.idx].kind == j.item.kind && o.items[j.idx].msg.Title == j.item.msg.Title {
+		// §H9 按 id 在最新队列中定位本条：deliver 期间队列可能被并发 enqueue 追加、
+		// 或同批次前序条目出队而整体移位，id 是唯一稳定锚点；找不到 = 已被处置，跳过。
+		idx := -1
+		for i := range o.items {
+			if o.items[i].id == j.id {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
 			if err == nil {
 				log.Printf("[notify][outbox] 补投成功 kind=%s title=%q", j.item.kind, j.item.msg.Title)
-				o.items = append(o.items[:j.idx], o.items[j.idx+1:]...) // 成功出队
+				o.items = append(o.items[:idx], o.items[idx+1:]...) // 成功出队
 			} else {
-				it := o.items[j.idx]
+				it := o.items[idx]
 				it.attempts++
 				if it.attempts > outboxMaxAttempts {
 					log.Printf("[notify][outbox] 死信：kind=%s title=%q 已尝试 %d 次仍失败，放弃",
 						it.kind, it.msg.Title, it.attempts-1)
-					o.items = append(o.items[:j.idx], o.items[j.idx+1:]...)
+					o.items = append(o.items[:idx], o.items[idx+1:]...)
 				} else {
 					delay := outboxBaseDelay << (it.attempts - 1) // 30s/1min/2min/4min/8min
 					// 指数退避要封顶，否则尝试次数一多位移出来的下次时间会漂到几天后；
@@ -221,7 +236,7 @@ func (o *Outbox) pump() {
 						delay = outboxMaxDelay
 					}
 					it.nextAt = time.Now().Add(delay)
-					o.items[j.idx] = it
+					o.items[idx] = it
 				}
 			}
 			o.saveLocked()
