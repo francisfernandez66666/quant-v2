@@ -175,7 +175,14 @@ $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
 ps1_bom deploy/qmt-win/ensure_gateway_config.ps1
 $SCP deploy/qmt-win/ensure_gateway_config.ps1 deploy/qmt-win/config.xt.template.json \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
-$SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${QMT_GATEWAY_DIR}/ensure_gateway_config.ps1 -GatewayDir '${QMT_GATEWAY_DIR}' -Token '${GATEWAY_TOKEN:-}' -Account '${GATEWAY_ACCOUNT:-}' -XtPath '${XT_USERDATA_PATH:-}' -ProbeConfigPath '${DEPLOY_DIR}/qmt-win/service_probe_config.ps1'"
+# §M7c 实参拼装：powershell -File 会把空引号参数 '' 整个吞掉（2026-09-22 部署实录：
+# 留空 Token 时 PS 报 MissingArgument「缺少参数 Token」，[2b] 直接中断部署链）。
+# 故三个可选参数只在非空时传递，缺省值交给脚本自身的 param 默认。
+gw_extra=""
+[ -n "${GATEWAY_TOKEN:-}" ]   && gw_extra="$gw_extra -Token '$GATEWAY_TOKEN'"
+[ -n "${GATEWAY_ACCOUNT:-}" ] && gw_extra="$gw_extra -Account '$GATEWAY_ACCOUNT'"
+[ -n "${XT_USERDATA_PATH:-}" ] && gw_extra="$gw_extra -XtPath '$XT_USERDATA_PATH'"
+$SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${QMT_GATEWAY_DIR}/ensure_gateway_config.ps1 -GatewayDir '${QMT_GATEWAY_DIR}'${gw_extra} -ProbeConfigPath '${DEPLOY_DIR}/qmt-win/service_probe_config.ps1'"
 
 # ── 2c. 同步前端 web/dist 到云端 Caddy 站点根（§A7 版本漂移根治）──
 # 根因：旧版脚本只同步二进制/gateway/pydata，从不传 web/dist → 云端 Caddy 前端
