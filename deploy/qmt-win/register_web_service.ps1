@@ -81,10 +81,22 @@ if (-not (Test-Path $exe)) {
 }
 
 # ---- 4. Caddyfile：validate 通过且内容有变化才替换（幂等 + 变更留底 .bak）----
+# §M7b-1（2026-09-22 部署实录，双重根因）：
+#  ①caddy validate 的 INFO JSON 日志写 stderr，PS 5.1 在 $ErrorActionPreference=Stop +
+#    2>&1 合并下把每行 stderr 变成终止性错误记录——脚本曾在替换 Caddyfile 之前直接死亡
+#    （部署链 [2d] 外层告警吞掉，现网配置不变更=validate-then-swap 的保守面反而救了线上，
+#    但 /dl 等新路由永远推不上去）。修法：validate 段临时降为 Continue，成败只认 $LASTEXITCODE。
+#  ②暂存文件名 guangzhou.conf.new 不带 "Caddyfile" 字样，caddy 的适配器按文件名猜——猜不到
+#    默认 JSON，直接报 "config is not valid JSON" 假阴性。必须显式 --adapter caddyfile。
 $confChanged = $false
 if ($CaddyConfSrc -and (Test-Path $CaddyConfSrc)) {
-    & $exe validate --config $CaddyConfSrc 2>&1 | ForEach-Object { Write-Host "  $_" }
-    if ($LASTEXITCODE -ne 0) { Die "guangzhou.conf validate 失败——保留现网 Caddyfile，不替换（先修配置再重跑）" }
+    $eapPrev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $validateLines = @(& $exe validate --adapter caddyfile --config $CaddyConfSrc 2>&1)
+    $validateCode = $LASTEXITCODE
+    $ErrorActionPreference = $eapPrev
+    $validateLines | ForEach-Object { Write-Host "  $_" }
+    if ($validateCode -ne 0) { Die "guangzhou.conf validate 失败——保留现网 Caddyfile，不替换（先修配置再重跑）" }
     $newHash = (Get-FileHash $CaddyConfSrc -Algorithm SHA256).Hash
     $oldHash = if (Test-Path $conf) { (Get-FileHash $conf -Algorithm SHA256).Hash } else { "" }
     if ($newHash -ne $oldHash) {

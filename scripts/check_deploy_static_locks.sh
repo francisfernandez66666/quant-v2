@@ -107,6 +107,13 @@ check("L3.deploy 上传并执行 ensure_gateway_config.ps1 + 模板（M7c）",
 check("L3.deploy 继续上传 §H8 探针单源（不得回退）", "service_probe_config.ps1" in dep)
 webps = rd("deploy/qmt-win/register_web_service.ps1")
 check("L3.register_web_service 引用 ${ProbeCaddyPort}（§H8 同源）", "$ProbeCaddyPort" in webps)
+# §M7b-1（2026-09-22 部署实录，双重根因）：①caddy validate 的 INFO 日志走 stderr，PS 5.1 在
+# ErrorActionPreference=Stop + `2>&1 | ForEach-Object` 合并下把每行 stderr 变终止性错误——
+# [2d] 曾在替换 Caddyfile 前死亡且被外层告警吞掉；②暂存文件名不带 "Caddyfile" 字样时 caddy
+# 按 JSON 解析假阴性。锁：validate 必须「临时降 Continue + --adapter caddyfile + 认 $LASTEXITCODE」。
+check("L3.register validate stderr 撕裂+适配器已修（M7b-1）",
+      '$eapPrev' in webps and '--adapter caddyfile --config $CaddyConfSrc' in webps
+      and '2>&1 | ForEach-Object { Write-Host "  $_" }' not in webps)
 conf = rd("deploy/caddy/guangzhou.conf")
 cm = re.search(r"\$ProbeCaddyPort\s*=\s*(\d+)", probe)
 qm = re.search(r"\$ProbeQuantPort\s*=\s*(\d+)", probe)
