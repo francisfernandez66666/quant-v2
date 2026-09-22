@@ -19,6 +19,7 @@ import (
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
+	"quant-trading-v2/internal/signalctl"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/trading"
 )
@@ -116,7 +117,8 @@ func TestAsyncDispatcherPlacesOrder(t *testing.T) {
 		t.Errorf("code=%v, want 600000.SH", code)
 	}
 	sid, _ := o["signal_id"].(string)
-	if want := "buy:600000:龙头:"; !startsWith(sid, want) {
+	// §C6：战法分量走规范键（StrategyKeyOf）——内置「龙头」归一为 dragon，与准入探针同键空间。
+	if want := "buy:600000:dragon:"; !startsWith(sid, want) {
 		t.Errorf("signal_id=%q, want prefix %q", sid, want)
 	}
 }
@@ -177,10 +179,10 @@ func TestAsyncDispatcherIdempotentKey(t *testing.T) {
 	if got, want := len(e.buyCh), 2; got != want {
 		t.Errorf("buyCh 深度=%d, want %d", got, want)
 	}
-	// 验证唯一键格式（与 autoPlace 内一致）：buy:<code>:<strategy>:<交易日>
-	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), sig.Strategy, data.TradingDayDate(time.Now()))
-	if !startsWith(id, "buy:600000:龙头:") {
-		t.Errorf("signal_id=%q, want prefix buy:600000:龙头:", id)
+	// 验证唯一键格式（与 autoPlace 内一致）：buy:<code>:<规范战法键>:<交易日>（§C6 与探针同源）
+	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), signalctl.StrategyKeyOf(sig), data.TradingDayDate(time.Now()))
+	if !startsWith(id, "buy:600000:dragon:") {
+		t.Errorf("signal_id=%q, want prefix buy:600000:dragon:", id)
 	}
 }
 

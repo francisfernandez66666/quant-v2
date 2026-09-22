@@ -123,9 +123,10 @@ func TestAutoPlacePlacesOrder(t *testing.T) {
 		t.Fatalf("expected 1 order, got %d", len(*orders))
 	}
 	o := (*orders)[0]
-	// §GAP2-W1 确定性幂等键：buy:<纯代码>:<战法>:<交易日>——不再使用每轮重生成的 sig.ID，
+	// §GAP2-W1 确定性幂等键：buy:<纯代码>:<规范战法键>:<交易日>——不再使用每轮重生成的 sig.ID，
 	// 同股同战法当日重复触发/重启重放全部被 orders 表唯一键拦截。
-	wantID := fmt.Sprintf("buy:600000:龙头:%s", data.TradingDayDate(time.Now()))
+	// §C6：战法分量与 signalctl 准入探针同源（StrategyKeyOf），内置「龙头」归一为 dragon。
+	wantID := fmt.Sprintf("buy:600000:dragon:%s", data.TradingDayDate(time.Now()))
 	if o["signal_id"] != wantID {
 		t.Fatalf("signal_id: got %v want %v", o["signal_id"], wantID)
 	}
@@ -172,6 +173,29 @@ func TestAutoPlaceIdempotencyKeyStable(t *testing.T) {
 	want := fmt.Sprintf("buy:600000:fac_1:%s", data.TradingDayDate(time.Now()))
 	if o := (*orders)[0]; o["signal_id"] != want {
 		t.Fatalf("signal_id: got %v want %v", o["signal_id"], want)
+	}
+}
+
+// TestAutoPlaceIdempotencyKeyC6Unified §C6（2026-09-22 PM 批清扫）回归：幂等键与准入探针同源。
+// 旧派生 StrategyID?:Strategy 与探针的 StrategyKeyOf（StrategyType 优先）分叉——库规则重建
+// （fac_1→fac_2 同 StrategyType）时探针按同一战法合并准入、幂等键却各自成键，同日同股
+// 理论可两单。现两键统一由 StrategyKeyOf 派生：同 Type 换 ID 仍是同一个幂等键。
+// English: §C6 — buy idempotency key and admission probe now share one derivation (StrategyKeyOf);
+// same StrategyType with a rebuilt StrategyID must still collapse to a single order per day.
+func TestAutoPlaceIdempotencyKeyC6Unified(t *testing.T) {
+	e, _, _, orders := newQMTEngine(t, nil)
+	live := map[string]*data.StockInfo{"600000": {Code: "600000", Price: 10}}
+	// 库规则重建：StrategyType 同为聚合池 "factor"（空白名单默认全集放行），StrategyID 由 fac_1 变 fac_2。
+	e.autoPlace(combat_agent.Signal{ID: "S1", Code: "600000", Name: "浦发",
+		Strategy: "AI选股V1", StrategyID: "fac_1", StrategyType: "factor", Direction: "做多", Price: 10}, live)
+	e.autoPlace(combat_agent.Signal{ID: "S2", Code: "600000", Name: "浦发",
+		Strategy: "AI选股V2", StrategyID: "fac_2", StrategyType: "factor", Direction: "做多", Price: 10}, live)
+	if len(*orders) != 1 {
+		t.Fatalf("同 StrategyType 换 StrategyID 应命中同一幂等键（§C6 同源），got %d 单: %+v", len(*orders), *orders)
+	}
+	want := fmt.Sprintf("buy:600000:factor:%s", data.TradingDayDate(time.Now()))
+	if o := (*orders)[0]; o["signal_id"] != want {
+		t.Fatalf("signal_id: got %v want %v（应为 StrategyKeyOf 规范键）", o["signal_id"], want)
 	}
 }
 

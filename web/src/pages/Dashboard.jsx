@@ -6,6 +6,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { Card, Table, Tag, Button } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { on } from '../sseBus.js'
+import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import LogModal from '../components/LogModal.jsx'
 import Disclaimer from '../components/Disclaimer.jsx'
 import IcpFooter from '../components/IcpFooter'
@@ -118,6 +119,13 @@ export default function Dashboard() {
   // 页面可见性变化处理函数引用
   const visibilityHandler = useRef(null)
 
+  // §M-10（2026-09-22 PM 批清扫）轮询请求代号守卫：10s 主轮询/15s QMT 轮询与 SSE 触发
+  // 可交错，旧请求的迟到响应必须整包丢弃，不得覆盖更新一轮已写入的数据（数据倒挂）。
+  const loadGuard = useRef(null)
+  if (!loadGuard.current) loadGuard.current = createStaleGuard()
+  const qmtGuard = useRef(null)
+  if (!qmtGuard.current) qmtGuard.current = createStaleGuard()
+
   // 从引擎状态中提取扫描统计（监控个股数/板块数等），供指标卡与系统卡展示
   const scanStats = useMemo(() => status.scan_stats || {}, [status])
 
@@ -155,8 +163,14 @@ export default function Dashboard() {
   }, [qmtState])
 
   // 加载实盘/QMT 状态（接口异常不阻断整页）
+  // §M-10：15s 轮询与可见性恢复触发可交错，旧响应后到不得覆盖新快照。
   async function loadQMT() {
-    try { setQmtState(await api.fetchQMTState()) } catch (e) { /* 接口异常不影响整页 */ }
+    const token = qmtGuard.current.begin()
+    try {
+      const st = await api.fetchQMTState()
+      if (qmtGuard.current.isStale(token)) return
+      setQMTState(st)
+    } catch (e) { /* 接口异常不影响整页 */ }
   }
 
   // §M-9（2026-09-22 修复批）三个健康端点独立拉取函数：随 load() 进入 10s 轮询。
@@ -175,13 +189,16 @@ export default function Dashboard() {
   }
 
   // 并行加载仪表盘所需的信号、状态、新闻、板块、快照、IPO 与战法统计
+  // §M-10：本轮代号先取后发——allSettled 返回时若已有更新的轮次在途/完成，整包丢弃。
   async function load() {
+    const token = loadGuard.current.begin()
     // §M-9 健康端点并入主轮询（10s）；独立 allSettled，不阻断主数据
     loadHealth()
     const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes, dashRes] = await Promise.allSettled([
       api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(),
       api.fetchHotSnapshot(), api.fetchIPOCalendar(), api.fetchDashboard(),
     ])
+    if (loadGuard.current.isStale(token)) return // 后到的旧轮次响应：不得覆盖新数据
     // 逐项处理各接口返回结果，任一失败不阻断其他数据展示
     if (sigRes.status === 'fulfilled' && Array.isArray(sigRes.value)) setSignals(sigRes.value)
     if (stRes.status === 'fulfilled' && stRes.value) setStatus(stRes.value)

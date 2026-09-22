@@ -70,6 +70,7 @@ import (
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
@@ -214,6 +215,10 @@ type Server struct {
 	newsCacheAt time.Time         // news 缓存最近刷新时间（TTL 30s）
 
 	registry EngineRegistry // 多账号引擎注册表（懒加载/按配置指纹共享计算引擎）
+
+	// §C9-UX（2026-09-22 PM 批清扫）通知器注入：/api/notify-test 从空 stub 升级为
+	// 真实连通性探测（webhook/网关/ntfy 逐通道试发）。nil=独立 server 模式，接口回显 noop。
+	notifier *notify.Notifier
 }
 
 // EngineRegistry 引擎注册表的 HTTP 可见接口（由 engine.Registry 实现，避免 server→engine 依赖环）。
@@ -367,6 +372,10 @@ func (s *Server) SetCoordinator(dc *data.DataCoordinator) { s.dc = dc }
 // SetPaper 注入模拟盘引擎（nil 表示未启用）。
 // English: injects the paper-trading engine (nil = disabled).
 func (s *Server) SetPaper(p *paper.Engine) { s.paper = p }
+
+// SetNotifier §C9-UX 注入全局通知器（/api/notify-test 真实探测用；nil 时接口回显 noop）。
+// English: §C9-UX — installs the global notifier so /api/notify-test can probe live channels.
+func (s *Server) SetNotifier(n *notify.Notifier) { s.notifier = n }
 
 // SetEngineController 设置引擎控制器。
 func (s *Server) SetEngineController(c EngineController) { s.ctrl = c }
@@ -703,7 +712,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/news/showall", s.adminMiddleware(s.handleNewsShowAllToggle))
 	s.mux.HandleFunc("GET /api/news/showall", s.authMiddleware(s.handleNewsShowAllStatus))
 	s.mux.HandleFunc("POST /api/news/reanalyze", s.adminMiddleware(s.handleNewsReanalyze))
-	s.mux.HandleFunc("POST /api/news/test-attribution", s.authMiddleware(s.handleNewsTestAttribution))
+	// §M-14（2026-09-22 PM 批清扫）：test-attribution 是运营引擎 Stage2 的手动试跑口，
+	// 每次调用消耗老板 LLM key 配额且前端零调用——旧路由只挂 authMiddleware，普通成员
+	// 可无限把任意新闻推进 Stage2。与 §H3 同族收权 adminMiddleware（保留端点供 admin 排障，
+	// 不删——能力尺寸在，权限收口）。
+	// English: §M-14 — Stage2 attribution test endpoint burns LLM quota and has zero frontend
+	// callers; raised from authMiddleware to adminMiddleware (kept for admin debugging, gated).
+	s.mux.HandleFunc("POST /api/news/test-attribution", s.adminMiddleware(s.handleNewsTestAttribution))
 	s.mux.HandleFunc("GET /api/engine/init-status", s.authMiddleware(s.handleEngineInitStatus))
 	s.mux.HandleFunc("GET /api/watchlist", s.authMiddleware(s.handleFixGetWatchlist))
 	s.mux.HandleFunc("POST /api/watchlist", s.authMiddleware(s.handleFixAddWatchlist))

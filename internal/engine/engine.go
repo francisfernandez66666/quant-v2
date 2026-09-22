@@ -1447,11 +1447,15 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 	// (two non-colliding keys → the same signal could re-fire a real order intraday), and duplicate display
 	// names across rules collapsed distinct buys into one. Prefer StrategyID (fac_1/pat_2, stable & unique);
 	// built-ins without an ID fall back to their canonical display name (龙头/N形, immutable).
-	// 幂等键：优先用稳定战法 ID（改名不改键），空则回退显示名；同一 code+战法+交易日 只下一单。
-	stratKey := sig.StrategyID
-	if stratKey == "" {
-		stratKey = sig.Strategy
-	}
+	// §C6（2026-09-22 PM 批清扫）：幂等键与准入探针**必须同键空间**。
+	// 旧派生是 StrategyID?:Strategy，而 signalctl 准入探针用 StrategyKeyOf（StrategyType 优先）——
+	// 同一 StrategyType 换 StrategyID（库规则重建 fac_old→fac_new）时探针视为同一战法合并准入，
+	// 幂等键却不同，同日同股同战法理论上可放行两单（重复下单敞口）。现两键统一由
+	// StrategyKeyOf 单点派生：改一处两把闸同步漂移，永不再分叉。
+	// English: §C6 — the idempotent buy key now derives from signalctl.StrategyKeyOf (the same single
+	// source the admission probe uses), closing the fork where same-Type-but-different-ID rules passed
+	// one merged admission yet carried two distinct buy keys (theoretical double-order per day).
+	stratKey := signalctl.StrategyKeyOf(sig)
 	id := fmt.Sprintf("buy:%s:%s:%s", pureTsCode(sig.Code), stratKey, data.TradingDayDate(time.Now()))
 	// 组装买入订单请求：金额按数量×价格计算，幂等键随信号 ID 传递。
 	// §WS-C 行情上下文装配：StalenessMs（fetcher 快照陈旧度）/ CurrentPrice / PrevClose 供

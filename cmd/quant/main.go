@@ -368,8 +368,9 @@ func main() {
 	} else if cfgMgr.Rules.Runtime.QMTFeedEnabled {
 		log.Printf("[main] §ENH-5 qmt_feed_enabled=true 但 gateway_url 未配置，feed 保持停用（新浪链兜底）")
 	}
-	srv.SetFetcher(fetcher) // 报价接口优先读 5s 快照，缺失再降级拉取
-	srv.SetCoordinator(dc)  // HTTP 展示层统一走该降级链，保证跨页价格一致
+	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
+	srv.SetCoordinator(dc)    // HTTP 展示层统一走该降级链，保证跨页价格一致
+	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
 
 	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/strategy"
 )
 
@@ -152,7 +153,25 @@ func (n *Notifier) Push(msg Message) {
 	}
 	n.mu.RLock()
 	gwMin := n.gatewayMinLevel
+	n.mu.RUnlock()
 
+	n.fanoutLocal(msg)
+
+	// §M8 第三路：手机推送网关扇出。必须在释放 RLock 之后调用——PushGateway 内部
+	// 会再次 RLock 读取 gateway/ntfy，Go 的 RWMutex 在持有读锁时重入取读锁、期间有
+	// 写者排队即死锁。级别门槛按 gwMin（锁内快照）判定；补投/失败语义由 PushGateway 自理。
+	if msg.Level >= gwMin {
+		n.PushGateway(msg)
+	}
+}
+
+// fanoutLocal 站内两路广播：WS 客户端 + Webhook（各自异步、失败入 outbox 补投）。
+// §C9 从 Push 抽出，供「告警通道自监控播报」复用——旁路网关扇出，天然不成环。
+// English: fan out to the in-process channels (WS + Webhook), extracted from Push so
+// §C9's channel-down announcement can reuse it without re-entering the gateway path.
+func (n *Notifier) fanoutLocal(msg Message) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	for id, ch := range n.wsClients {
 		select {
 		case ch <- msg:
@@ -170,14 +189,20 @@ func (n *Notifier) Push(msg Message) {
 			}
 		}(url)
 	}
-	n.mu.RUnlock()
+}
 
-	// §M8 第三路：手机推送网关扇出。必须在释放 RLock 之后调用——PushGateway 内部
-	// 会再次 RLock 读取 gateway/ntfy，Go 的 RWMutex 在持有读锁时重入取读锁、期间有
-	// 写者排队即死锁。级别门槛按 gwMin（锁内快照）判定；补投/失败语义由 PushGateway 自理。
-	if msg.Level >= gwMin {
-		n.PushGateway(msg)
-	}
+// alertChannelDown §C9 告警通道自监控：某条推送通道整体短路时，用"还活着的通道"
+// （WS/Webhook）播报故障本身——报丧鸟哑了这件事必须被报出来。短路只播报一次
+// （开闸瞬间触发），冷却后半开探测成功另有恢复日志；opslog 按天留痕。
+// 递归防护：本方法只走 fanoutLocal（站内两路），不经网关扇出，通道间不可能成环。
+// English: §C9 — when a push channel trips, announce the trip itself through the surviving
+// in-process channels (WS/Webhook only, so no recursion). One announcement per trip.
+func (n *Notifier) alertChannelDown(title, reason string) {
+	log.Printf("[notify][C9] %s：%s", title, reason)
+	opslog.DayOnce("notify-channel-trip", func() {
+		opslog.Logf("notify", "%s：%s（短路冷却 10 分钟后自动探测恢复）", title, reason)
+	})
+	n.fanoutLocal(Message{Level: LevelHigh, Title: "【自监控】" + title, Content: reason})
 }
 
 // SetGatewayMinLevel §M8 设置 Push 网关扇出的最低告警级别（LevelLow=全部触达手机，
@@ -186,6 +211,32 @@ func (n *Notifier) SetGatewayMinLevel(lvl AlertLevel) {
 	n.mu.Lock()
 	n.gatewayMinLevel = lvl
 	n.mu.Unlock()
+}
+
+// TestChannels §C9-清扫 同步连通性探测：把一条测试消息逐通道真实试发
+// （Webhook 逐个 postWebhook、主推送网关、ntfy），返回 通道名→错误（nil=成功）。
+// 与 Push 的差异：不经静默时段、不进 outbox 补投、不广播 WS——诊断要的是
+// 「每通道当下的真实结果」，排队补投会把失败伪装成延迟成功。
+// 未配置的通道不出现在结果里（全空=没有任何通道，调用方按 noop 处置）。
+// English: §C9 — synchronous per-channel connectivity probe used by /api/notify-test:
+// real sends, no quiet-hours, no outbox retries, so a failure can never masquerade as
+// a delayed success. Unconfigured channels are absent from the result map.
+func (n *Notifier) TestChannels(msg Message) map[string]error {
+	n.mu.RLock()
+	urls := append([]string(nil), n.webhookURLs...)
+	g, nt := n.gateway, n.ntfy
+	n.mu.RUnlock()
+	out := make(map[string]error, len(urls)+2)
+	for _, u := range urls {
+		out["webhook:"+u] = n.postWebhook(u, msg)
+	}
+	if g != nil {
+		out["gateway"] = g.Send(msg)
+	}
+	if nt != nil {
+		out["ntfy"] = nt.Send(msg)
+	}
+	return out
 }
 
 // deliverWebhook 返回指定 URL 的投递函数（首次发送与 outbox 补投共用同一实现）。

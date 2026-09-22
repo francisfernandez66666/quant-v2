@@ -56,12 +56,35 @@ def _now_cn_str(fmt="%Y-%m-%dT%H:%M:%S+08:00"):
     return _now_bj().strftime(fmt)
 
 
+try:
+    # §A5（2026-09-22 PM 批清扫）：QMT 沙箱内 __file__ 所在目录未必在 sys.path，
+    # 显式补一次再导入日历模块；导入失败退化为周末口径旧启发式（零破坏）。
+    # English: §A5 — the QMT sandbox may not have this dir on sys.path; add it before
+    # importing the calendar, degrade to weekday-only heuristic if unavailable.
+    import sys as _sys
+    import os as _os
+    _bridge_dir = _os.path.dirname(_os.path.abspath(__file__))
+    if _bridge_dir not in _sys.path:
+        _sys.path.insert(0, _bridge_dir)
+    from trading_calendar import is_trading_day as _is_trading_day
+except Exception:  # noqa: BLE001
+    _is_trading_day = None
+
+
 def is_trading_window(now=None):
-    """与网关/引擎对齐的活跃窗口：工作日 9:15~15:00（简化为工作日即交易日，非交易时段
-    抑制不影响正确性）。桥在该窗口外也可心跳保活（客户端被 qmtctl 杀掉前）。"""
+    """与网关/引擎对齐的活跃窗口：交易日 9:15~15:00。桥在该窗口外也可心跳保活
+    （客户端被 qmtctl 杀掉前）。§A5：节假日经 Go 日历 closed_days 判定，
+    日历不可得时退回「工作日即交易日」旧口径。"""
     now = now or _now_bj()
-    if now.weekday() >= 5:
-        return False
+    if _is_trading_day is not None:
+        try:
+            if not _is_trading_day(now):
+                return False
+        except Exception:  # noqa: BLE001 —— 日历异常不崩主判定
+            pass
+    else:
+        if now.weekday() >= 5:
+            return False
     t = now.time()
     return dtime(9, 15) <= t < dtime(15, 0)
 

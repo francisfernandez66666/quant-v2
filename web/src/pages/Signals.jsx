@@ -5,6 +5,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { Table, Card, Tag, Button, Select, Dialog, MessagePlugin, Input } from 'tdesign-react'
 import * as api from '../api/index.js'
+import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 import MinuteView from '../components/MinuteView.jsx'
 import LogModal from '../components/LogModal.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
@@ -102,6 +103,10 @@ export default function Signals() {
   const [tradeAction, setTradeAction] = useState('')
   // §F5 兜底轮询定时器（20s，此前 5s；新信号主要靠 SSE scan 即时刷新）
   const timer = useRef(null)
+
+  // §M-10 轮询请求代号守卫（本页单一 load 通道）
+  const loadGuard = useRef(null)
+  if (!loadGuard.current) loadGuard.current = createStaleGuard()
   // 页面可见性变化处理函数
   const visHandler = useRef(null)
   // §修复 P2#23：受控排序——所有列可点击表头排序（此前表格完全没有 sorter，点表头无反应），
@@ -233,12 +238,19 @@ export default function Signals() {
   // §M-9（2026-09-22 修复批）失败置 error 态（可重试横幅），成功清态；
   // 轮询期间的瞬时失败保留旧列表，只在列表尚空时展示错误分支，避免闪扰。
   async function load() {
+    // §M-10（2026-09-22 PM 批清扫）：20s 轮询与 SSE/操作触发可交错，
+    // 旧请求的迟到响应不得覆盖更新一轮数据（整包丢弃，loading 态由最新一轮收口）。
+    const token = loadGuard.current.begin()
     try {
-      setSignals(await api.fetchSignals())
+      const list = await api.fetchSignals()
+      if (loadGuard.current.isStale(token)) return
+      setSignals(list)
       setLoadErr('')
     } catch (e) {
+      if (loadGuard.current.isStale(token)) return
       setLoadErr(e && e.message ? String(e.message) : '信号列表加载失败（网络/服务异常）')
     }
+    if (loadGuard.current.isStale(token)) return
     // §F1 首屏 loading 结束（后续 5s 轮询不重复转 loading，仅首帧需要）
     setLoading(false)
   }

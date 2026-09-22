@@ -44,6 +44,7 @@ import (
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/display"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/trading"
@@ -2157,10 +2158,42 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleFixNotifyTest 处理 POST /api/notify-test 请求，通知测试接口。
-// 用于前端测试通知功能的连通性。
+// §C9-清扫（2026-09-22 PM 批）：旧实现是空 stub——只 log 一行就回 {"status":"ok"}，
+// 用户点了「测试通知」永远看到成功但什么都没发（§F-3 同款假反馈）。现升级为真实探测：
+// 经 Notifier.TestChannels 逐通道（Webhook/推送网关/ntfy）同步试发一条测试消息，
+// 返回每通道成败；通知器未注入（独立 server 测试模式）显式回 noop+原因，不再伪装。
+// English: §C9 — the former no-op stub (always "ok", sent nothing) now performs a real
+// per-channel connectivity probe via TestChannels; absent notifier replies noop with a reason.
 func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[notify] 通知测试")
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	if s.notifier == nil {
+		writeJSON(w, 200, map[string]string{"status": "noop", "reason": "通知服务未接入（独立服务模式），无可测通道"})
+		return
+	}
+	channels := s.notifier.TestChannels(notify.Message{
+		Level:   notify.LevelHigh,
+		Title:   "通知通道测试",
+		Content: "这是一条来自「测试通知」按钮的连通性探测消息；收到即表示该通道可用。",
+	})
+	if len(channels) == 0 {
+		writeJSON(w, 200, map[string]string{"status": "noop", "reason": "未配置任何通知通道（Webhook/推送网关/ntfy 均为空）"})
+		return
+	}
+	ok := true
+	results := make(map[string]string, len(channels))
+	for name, err := range channels {
+		if err != nil {
+			ok = false
+			results[name] = "失败: " + err.Error()
+			continue
+		}
+		results[name] = "ok"
+	}
+	status := "ok"
+	if !ok {
+		status = "partial"
+	}
+	log.Printf("[notify] 通知测试完成 status=%s channels=%d", status, len(channels))
+	writeJSON(w, 200, map[string]interface{}{"status": status, "channels": results})
 }
 
 // handleSSETicket 处理 POST /api/events/ticket（需认证）：签发一个 60s 有效、绑定当前账号的

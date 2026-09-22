@@ -9,6 +9,7 @@ import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
+import { createStaleGuard } from '../utils/staleGuard.js' // §M-10 轮询后到丢弃
 // §H-2（2026-09-22 修复批）：editBalanceSave 的失败分支调用 showToast，但导入区一直没有
 // ui.jsx —— 保存可用资金一旦失败即抛 ReferenceError（异步未捕获、用户零提示）。补齐导入。
 // English: §H-2 — showToast was called without being imported; the save-failure branch died
@@ -100,6 +101,12 @@ export default function Positions() {
   const [realSubmitting, setRealSubmitting] = useState(false)
   // 实盘轮询定时器（进入实盘标签时启动）
   const realTimer = useRef(null)
+  // §M-10（2026-09-22 PM 批清扫）轮询请求代号守卫：纸面 load 与实盘 loadReal 各自独立代号，
+  // 60s 轮询/SSE 触发/手动刷新交错时，旧请求的迟到响应整包丢弃（防数据倒挂）。
+  const paperGuard = useRef(null)
+  if (!paperGuard.current) paperGuard.current = createStaleGuard()
+  const realGuard = useRef(null)
+  if (!realGuard.current) realGuard.current = createStaleGuard()
 
   // 编辑中的持仓下标（-1 表示新增）
   const [editingIdx, setEditingIdx] = useState(-1)
@@ -263,10 +270,13 @@ export default function Positions() {
 
   // 加载纸面持仓、资金与已实现盈亏
   async function load() {
+    const token = paperGuard.current.begin() // §M-10 本轮代号
     try {
       const st = await api.fetchStatus()
+      if (paperGuard.current.isStale(token)) return // 后到的旧轮次：整包丢弃
       api.setLastSession(st.session)
       const data = await api.fetchHoldings()
+      if (paperGuard.current.isStale(token)) return
       if (data) {
         setHoldings(data.holdings || [])
         setAvailableBalance(data.available_balance || 0)
@@ -464,15 +474,18 @@ export default function Positions() {
   // 加载 QMT 状态与实盘持仓
   async function loadReal() {
     if (!admin) return // §PERM-GATE：成员无实盘读权限（admin 守卫），不发起必 403 的请求
-    try { const st = await api.fetchQMTState(); if (st) setQmtState(st) } catch (_) {}
+    const token = realGuard.current.begin() // §M-10 本轮代号（三段拉取共用一次判定）
+    try { const st = await api.fetchQMTState(); if (st && !realGuard.current.isStale(token)) setQmtState(st) } catch (_) {}
     try {
       const data = await api.fetchRealPositions()
+      if (realGuard.current.isStale(token)) return
       if (data && Array.isArray(data.positions)) setRealPositions(data.positions)
       if (data && data.account) setRealAccount(data.account)
     } catch (_) {}
     // §F1 实盘整体盈亏（已实现+浮动）：页头优先展示，无实盘才回落纸面
     try {
       const t = await api.fetchQMTTrades()
+      if (realGuard.current.isStale(token)) return
       if (t && t.summary) setRealTrades(t.summary)
     } catch (_) {}
   }

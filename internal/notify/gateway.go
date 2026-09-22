@@ -9,6 +9,7 @@ package notify
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -99,8 +100,16 @@ func (n *Notifier) SetGateway(g PushGateway) {
 }
 
 // SetNtfy 设置 ntfy 运维告警通道（§HARDENING：与主网关并行的独立冗余通道；传 nil 关闭）。
-// （SetNtfy installs the ntfy ops-alert channel in parallel with the primary gateway; nil disables.）
+// §C9：自动注入短路自监控回调——ntfy 连续失败开闸时经 alertChannelDown 用"还活着的通道"
+// （WS/Webhook）播报"报丧鸟哑了"，并 opslog 留痕；调用方无需感知。
+// （SetNtfy installs the ntfy ops-alert channel; §C9 it also wires the trip callback so a
+// short-circuited ntfy announces itself through the surviving channels.）
 func (n *Notifier) SetNtfy(g PushGateway) {
+	if ng, ok := g.(*NtfyGateway); ok && ng != nil {
+		ng.bmu.Lock()
+		ng.onTrip = func(reason string) { n.alertChannelDown("ntfy 运维告警通道短路", reason) }
+		ng.bmu.Unlock()
+	}
 	n.mu.Lock()
 	n.ntfy = g
 	n.mu.Unlock()
@@ -129,6 +138,11 @@ func (n *Notifier) PushGateway(msg Message) {
 		}
 		if nt != nil {
 			if err := nt.Send(msg); err != nil {
+				// §C9 短路窗内的快速失败：不逐条 log、不入补投队列（触发时已有一次自监控
+				// 播报；每条都排队只会把通道宕机放大成队列风暴）。
+				if errors.Is(err, ErrNtfyShortCircuit) {
+					return
+				}
 				log.Printf("[notify] ntfy 通道错误: %v（进入补投队列）", err)
 				n.outbox.enqueue("ntfy", msg, deliverNtfy(n))
 			}

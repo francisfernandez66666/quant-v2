@@ -62,16 +62,37 @@ def _now_beijing():
     return datetime.utcnow() + timedelta(hours=8)
 
 
+# §A5（2026-09-22 PM 批清扫）：接 Go 引擎落盘的真交易日历（trading_calendar.json）。
+# 导入失败/文件缺失时 _CAL_OK=False，判定退回旧「周末口径」启发式——网关单独部署零破坏。
+# English: §A5 — consume the Go engine's on-disk trading calendar; any import/load failure
+# degrades to the legacy weekday-only heuristic (a standalone gateway is never broken).
+try:
+    from trading_calendar import is_trading_day as _is_trading_day  # noqa: E402
+
+    _CAL_OK = True
+except Exception:  # noqa: BLE001
+    _is_trading_day = None
+    _CAL_OK = False
+
+
 def is_active_trading_session():
-    """活跃交易窗口判定（与引擎 data.CurrentSession 对齐）：工作日 9:15~15:00。
+    """活跃交易窗口判定（与引擎 data.CurrentSession 对齐）：交易日 9:15~15:00。
 
     非交易时段（盘前/盘后/周末/节假日）返回 False——此时 MiniQMT 被 qmtctl 关闭属预期，
     断连不上报熔断，避免每天收盘刷 high 告警污染信号（见
-    docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。节假日简化为工作日即交易日，
-    因为非交易时段本就抑制上报，误判影响为零。
+    docs/MIGRATION_GUANGZHOU_ALLINONE.md §3.4）。
+    §A5：节假日判定从「工作日即交易日」启发式升级为读 Go 日历 closed_days；
+    日历不可得时保留旧口径（宁误宽松不误收紧——收紧会把真交易时段误判为休市，
+    断连熔断静默化才是危险方向）。
     """
     now = _now_beijing()
-    if now.weekday() >= 5:  # 周六/周日
+    if _CAL_OK:
+        try:
+            if not _is_trading_day(now):  # 周末或节假日命中日历休市
+                return False
+        except Exception:  # noqa: BLE001 —— 日历模块异常绝不让主判定崩
+            pass
+    elif now.weekday() >= 5:  # 周六/周日（无日历兜底）
         return False
     t = now.time()
     return dtime(9, 15) <= t < dtime(15, 0)
