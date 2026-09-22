@@ -129,8 +129,10 @@ class TestGatewayApplyTradeReject(unittest.TestCase):
 
 
 class TestReportFieldsContractIntact(unittest.TestCase):
-    """§REJECT 只收紧"两键皆空"非法组合，report_fields.json 契约字段集不得变动
-    （F2 golden 三方锁的网关侧一极）。"""
+    """§REJECT 只收紧"两键皆空"非法组合，report_fields.json 契约字段集不得**无意**变动
+    （F2 golden 三方锁的网关侧一极）。§M4（2026-09-22 PM 批）系有意的契约修复：
+    created_at/name/trade_id 三条网关一直在发、Go 信封却没接的"丢腿"补上 tag 后并入金标，
+    双向锁见 tests/test_report_contract.py 与 internal/server/report_contract_test.go。"""
 
     def test_contract_sets_unchanged(self):
         with open(os.path.join(_ROOT, "qmt_gateway", "contract", "report_fields.json"),
@@ -138,9 +140,10 @@ class TestReportFieldsContractIntact(unittest.TestCase):
             c = json.load(f)
         self.assertEqual(
             sorted(c["report_event_fields"]),
-            sorted(["amount", "asset", "at", "broker", "code", "fee", "from", "order_id",
-                    "positions", "price", "qty", "reason", "side", "signal_id", "stamp_tax",
-                    "status", "traded_at", "type", "user_id"]))
+            sorted(["amount", "asset", "at", "broker", "code", "created_at", "fee", "from",
+                    "name", "order_id", "positions", "price", "qty", "reason", "side",
+                    "signal_id", "stamp_tax", "status", "trade_id", "traded_at", "type",
+                    "user_id"]))
         self.assertIn("order_id", c["consumed_by_event"]["trade"])  # 身份锚语义保持
 
 

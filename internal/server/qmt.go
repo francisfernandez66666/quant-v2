@@ -527,16 +527,30 @@ func normalizeReportSide(raw string) (string, error) {
 // report_fields.json）通过反射本结构锁定字段集，任何一侧加/删字段漏改即测试红。
 // English: named report payload (was an anonymous struct) so the golden contract test can
 // reflect over its JSON tags; event types trade/order/positions/account share this envelope.
+// §M4（2026-09-22 PM 批）双向契约收口：golden 现在同时记录"网关实际发出的字段"，
+// 测试要求**发出集 ⊆ 信封集**——旧契约只反射 Go 这一侧，于是网关常年发的
+// trade_id / name 在 Go 无 tag、被 encoding/json 静默丢弃（"丢腿"），单看 Go 侧永远不自洽。
+// English: §M4 — the golden now also records the fields the gateway actually emits, and the test
+// asserts emitted ⊆ envelope. The old one-sided lock let trade_id/name fall off the floor because
+// encoding/json drops untagged keys without any error.
 type qmtReportEvent struct {
-	Type      string               `json:"type"`
-	OrderID   string               `json:"order_id"`
-	Code      string               `json:"code"`
-	Side      string               `json:"side"`
-	Status    string               `json:"status"`
-	Price     float64              `json:"price"`
-	Qty       int                  `json:"qty"`
-	Amount    float64              `json:"amount"`
-	TradedAt  string               `json:"traded_at"`
+	Type     string  `json:"type"`
+	OrderID  string  `json:"order_id"`
+	TradeID  string  `json:"trade_id"` // §M4 券商成交编号（成交判重的精确身份锚）
+	Code     string  `json:"code"`
+	Name     string  `json:"name"` // §M4 证券名称（网关成交回报携带，建仓回填）
+	Side     string  `json:"side"`
+	Status   string  `json:"status"`
+	Price    float64 `json:"price"`
+	Qty      int     `json:"qty"`
+	Amount   float64 `json:"amount"`
+	TradedAt string  `json:"traded_at"`
+	// CreatedAt §M4：order 回报的委托创建时间。网关 on_stock_order 一直同时发 at 与
+	// created_at（双字段兼容契约），旧信封只有 at → created_at 被静默丢弃，委托行的
+	// created_at 实际记成了回报时刻。现在优先取 created_at，缺失才退回 at。
+	// English: §M4 — the gateway sends both `at` and `created_at`; the old envelope only had `at`,
+	// so created_at was dropped and order rows stored the report time as creation time.
+	CreatedAt string               `json:"created_at"`
 	SignalID  string               `json:"signal_id"`
 	Reason    string               `json:"reason"`    // §FIX-0921 柜台废单/拒单原因（网关尽力透传 status_msg）
 	Fee       float64              `json:"fee"`       // §P2-FEE 20260918 经手费/佣金（尽力透传，缺=0）
@@ -672,10 +686,14 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			// 补插"是两步独立写，崩溃/并发插队会整体丢掉这条回报；现合并为单事务
 			// ApplyOrderReportTx（推进/补插/幂等 no-op 三选一，判定共享同一事务快照）。
 			// English: §A4 — advance-then-insert-if-absent folded into one atomic transaction call.
+			created := ev.CreatedAt // §M4 优先网关的委托创建时间
+			if created == "" {
+				created = ev.At // 缺省退回回报时刻（旧口径）
+			}
 			action, err := db.ApplyOrderReportTx(store.RealOrder{
 				OrderID: ev.OrderID, SignalID: orderSignalID, Code: ev.Code,
 				Side: orderSide, Status: ev.Status, Price: ev.Price, Qty: ev.Qty,
-				CreatedAt: ev.At,
+				CreatedAt: created,
 				UserID:    uid, // §W2-10 委托行打归属账号
 			})
 			if err != nil {
@@ -725,6 +743,12 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		if err := db.ApplyRealFill(store.RealFill{
 			OrderID: ev.OrderID, Code: ev.Code, Side: tradeSide, Price: ev.Price,
 			Qty: ev.Qty, Amount: ev.Amount, TradedAt: ev.TradedAt, SignalID: ev.SignalID,
+			// §M4（2026-09-22 PM 批）两条腿接进账本：name 回填建仓持仓（R8 回填路径一直在等它，
+			// 但信封没 tag 所以恒空），trade_id 成交判重精确锚（同委托同秒同价同量的两笔真实
+			// 部成不再被复合键误判为重放）。
+			// English: §M4 — carry the two legs the old envelope dropped: name feeds the position
+			// backfill path, trade_id gives fills an exact replay anchor.
+			Name: ev.Name, TradeID: ev.TradeID,
 			UserID: uid, // §W2-10 成交流水打归属账号（幂等键冲突时整体回滚，持仓不重复累加）
 			// §P2-FEE 20260918：成交费用腿透传入本地 fills（网关回报缺省时为 0，与旧口径一致）。
 			Fee: ev.Fee, StampTax: ev.StampTax,
@@ -732,7 +756,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, "apply fill: "+err.Error())
 			return
 		}
-		log.Printf("[trading] 成交回报 %s %s qty=%d price=%.2f", ev.Side, ev.Code, ev.Qty, ev.Price)
+		log.Printf("[trading] 成交回报 %s %s qty=%d price=%.2f trade_id=%s", ev.Side, ev.Code, ev.Qty, ev.Price, ev.TradeID)
 		// §DAILY_OPSLOG 成交是每日核心记录的第一等事件（信号归因一并落档）
 		opslog.Logf("quant", "成交 %s %s qty=%d price=%.2f 金额=%.2f signal=%s order=%s",
 			tradeSide, ev.Code, ev.Qty, ev.Price, ev.Amount, ev.SignalID, ev.OrderID)

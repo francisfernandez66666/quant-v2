@@ -6,10 +6,12 @@
 package main
 
 import (
+	"log"
 	"strings"
 	"sync"
 	"time"
 
+	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -64,7 +66,21 @@ func (c *finaCache) Lookup(code string) *strategy_engine.FinancialData {
 
 	var fina *strategy_engine.FinancialData
 	if c.db != nil {
-		if rows, err := c.db.FinaHistory(ts); err == nil && len(rows) > 0 {
+		rows, err := c.db.FinaHistory(ts)
+		switch {
+		case err != nil:
+			// §N-5（2026-09-22 PM 批）查库失败不再静默当"没有财务数据"：旧实现 `err == nil && len>0`
+			// 一个条件同时吞掉错误与空结果，打分就此按七项全 0 计入且日志无痕。
+			// English: §N-5 — a DB error is no longer conflated with "no financials"; the old single
+			// condition swallowed both, so scoring silently used all-zero factors.
+			log.Printf("[fina] %s 财务指标查询失败（本轮按缺失处理，不代表该股真的没有财报）: %v", ts, err)
+			opslog.DayOnce("fina-query-error", func() {
+				opslog.Logf("quant", "财务因子查库失败（打分按缺失计入）：%v", err)
+			})
+			return nil // 错误不写缓存：下一轮重试，避免把一次抖动固化 10 分钟
+		case len(rows) == 0:
+			// 真缺失（库里没有这只票）
+		default:
 			// 取最新报告期（FinaHistory 按 end_date 升序）
 			last := rows[len(rows)-1]
 			fina = &strategy_engine.FinancialData{
@@ -75,6 +91,12 @@ func (c *finaCache) Lookup(code string) *strategy_engine.FinancialData {
 				DebtToAssets: last.DebtToAssets,
 				Eps:          last.EPS,
 				YoyOR:        last.YoyOR,
+				// §N-5（2026-09-22 PM 批）报告期/披露日一并带出：没有这两个字段，下游就无从
+				// 判断这行财务有多旧（研究库断更时打分照用旧财报且无人知晓）。
+				// English: §N-5 — carry the reporting period and announcement date so downstream
+				// freshness gates can tell how stale this row actually is.
+				EndDate: last.EndDate,
+				AnnDate: last.AnnDate,
 			}
 		}
 	}

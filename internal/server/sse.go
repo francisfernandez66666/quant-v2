@@ -18,22 +18,25 @@ import (
 	"quant-trading-v2/internal/metrics"
 )
 
-// sseTicketTTL 一次性票据有效期（60s 足够 EventSource 完成建链；过短体验差，过长放大泄漏面）。
+// sseTicketTTL 短时效建链票据有效期（60s 足够 EventSource 完成建链；过短体验差，过长放大泄漏面）。
+// §M5（2026-09-22 PM 批）：票据在 TTL 内可复用（见 useSSETicket），60s 上限即复用窗口。
 const sseTicketTTL = 60 * time.Second
 
 // sseTicketMaxLive 同时存活的票据上限：超过后新票挤出最旧票（防票据池内存放大）。
 const sseTicketMaxLive = 1024
 
-// sseTicket 一次有效的 SSE 建链票据：绑定签发用户，60s 后过期，消费后立即作废。
+// sseTicket 短时效 SSE 建链票据：绑定签发用户，60s 后过期；§M5 起 TTL 内可复用
+// （浏览器原生重连会原样重发同一 URL，一次性票会让重连必然 401，补发通道被掐死）。
+// A short-lived SSE connect ticket bound to the minting user; reusable within the 60s TTL (§M5).
 type sseTicket struct {
 	userID   string
 	expireAt time.Time
 }
 
 // newSSETicket 生成一个 24 字节随机 hex 票据；随机源失败时降级为时间戳+随机数拼接（仍满足
-// 不可枚举，因为票据仅 60s 有效且一次性）。
-// English: mintSSETicket generates a 24-byte random hex ticket (with a degraded fallback if the
-// CSPRNG fails; the 60s one-time window still defeats enumeration).
+// 不可枚举，因为票据仅 60s 短时效且绑定账号）。
+// English: newSSETicket generates a 24-byte random hex ticket (with a degraded fallback if the
+// CSPRNG fails; the 60s window plus account binding still defeats enumeration).
 func (s *Server) newSSETicket(userID string) string {
 	var b [24]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -62,19 +65,26 @@ func (s *Server) newSSETicket(userID string) string {
 	return tk
 }
 
-// consumeSSETicket 校验并作废票据：不存在/已消费（已被 delete）→ 失败；命中即删除（一次性），
-// 并返回票据绑定的账号。票据只由已认证用户签发，故命中票据即代表该账号已通过认证。
-// English: consumeSSETicket validates and atomically consumes a one-time ticket (deleted on first
-// use), returning the account the ticket was minted for. A valid ticket implies prior authentication.
-func (s *Server) consumeSSETicket(tk string) (string, bool) {
+// useSSETicket 校验票据：不存在/已过期 → 失败；命中且未过期 → 返回绑定账号，票据不作废。
+// §M5（2026-09-22 PM 批，owner 裁决）：旧语义「消费即废」让浏览器原生重连必然 401——原生重连
+// 只会原样重发同一 URL（含同一张票），401 直接把 EventSource 打成 CLOSED，唯一能携带
+// Last-Event-ID 头的补发通道就此断绝（断流期间事件永久丢失）。改为 TTL（60s）内可复用后：
+// 短暂断流的原生重连在窗口内直接成功并带回头补发；超窗则由前端换票重建并以
+// ?last_event_id= query 续传（见 handleFixSSE）。泄漏面变化：URL 泄漏的可利用窗口从"一次"
+// 放宽为"≤60s"，且票据只授予**绑定账号自己**的只读事件流，不扩权。
+// English: §M5 — validate a ticket without destroying it: reuse within the 60s TTL is what makes
+// the browser's native EventSource reconnect (which replays the exact same URL) succeed instead of
+// dying on a guaranteed 401. A leaked ticket URL is now usable for at most 60s and only ever grants
+// a read-only event stream of the account the ticket was minted for.
+func (s *Server) useSSETicket(tk string) (string, bool) {
 	s.sseTicketsMu.Lock()
 	defer s.sseTicketsMu.Unlock()
 	v, ok := s.sseTickets[tk]
 	if !ok {
 		return "", false
 	}
-	delete(s.sseTickets, tk)
 	if time.Now().After(v.expireAt) {
+		delete(s.sseTickets, tk)
 		return "", false
 	}
 	return v.userID, true

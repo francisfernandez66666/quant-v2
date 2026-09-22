@@ -400,7 +400,12 @@ func (d *DB) migrate() error {
 			user_id TEXT DEFAULT '',
 			fee REAL DEFAULT 0,
 			stamp_tax REAL DEFAULT 0,
-			serial TEXT DEFAULT ''
+			serial TEXT DEFAULT '',
+			-- §M4（2026-09-22 PM 批）券商成交编号：网关一直发 trade_id，旧 Go 信封没有这个 tag
+			-- → 字段被静默丢弃，本地 fills 只剩 (order_id,traded_at,price,qty) 复合键这一把身份锚。
+			-- English: broker trade number — the gateway always sent it, the old Go envelope had no
+			-- tag, so it was silently dropped and fills had no exact identity anchor.
+			trade_id TEXT DEFAULT ''
 		)`,
 		// §W3-b 成交回报幂等唯一键：同一委托+同一回报时间戳+同价同量只入账一次，
 		// 根除 outbox 重试遇响应丢失时的双倍记账（首尔侧此前零幂等）。
@@ -604,6 +609,8 @@ func (d *DB) migrate() error {
 		{"fills", "serial", "ALTER TABLE fills ADD COLUMN serial TEXT DEFAULT ''"},
 		//  real_positions.buy_date：买入交易日（T+1 可卖量判定 + 日终对账关联）
 		{"real_positions", "buy_date", "ALTER TABLE real_positions ADD COLUMN buy_date TEXT DEFAULT ''"},
+		// §M4 券商成交编号列（成交回报最精确的身份锚；旧库回填为空串=未知）
+		{"fills", "trade_id", "ALTER TABLE fills ADD COLUMN trade_id TEXT DEFAULT ''"},
 	} {
 		has, err := d.hasColumn(mig.table, mig.column)
 		if err != nil {
@@ -660,6 +667,28 @@ func (d *DB) migrate() error {
 	// English: P0-2 migrate orders signal_id uniqueness to (user_id, signal_id).
 	if err := d.migrateOrdersSignalUnique(); err != nil {
 		return fmt.Errorf("store migrate orders signal unique: %w", err)
+	}
+	// §M4（2026-09-22 PM 批）fills 判重键升级：成交编号优先、无编号退回复合键。
+	// 旧复合唯一索引 (order_id,traded_at,price,qty) 把"同委托同秒同价同量的两笔真实部成"
+	// 也判成重放——第二笔直接被唯一约束拒绝（回报 500 → 网关 outbox 无限重推 → 死信），
+	// 券商侧两笔的 trade_id 本来就不同。现拆成两段部分索引：
+	//   ① trade_id 非空 → 按 trade_id 唯一（券商成交编号是权威身份锚）；
+	//   ② trade_id 为空（旧行/交割单回灌）→ 沿用复合键唯一。
+	// 先建新索引再删旧索引：新索引建失败时旧保护仍在，不会留下无幂等保护的窗口。
+	// English: §M4 — split the fills replay key: broker trade_id wins when present, the old
+	// composite key only guards rows without one. Build before drop, so protection never lapses.
+	if ok, err := d.hasColumn("fills", "trade_id"); err != nil {
+		return err
+	} else if ok {
+		for _, s := range []string{
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_trade ON fills(trade_id) WHERE trade_id <> ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_idem_notid ON fills(order_id, traded_at, price, qty) WHERE trade_id = '' OR trade_id IS NULL`,
+			`DROP INDEX IF EXISTS idx_fills_idem`,
+		} {
+			if _, err := d.db.Exec(s); err != nil {
+				return fmt.Errorf("store migrate fills trade_id index: %w\n%s", err, s)
+			}
+		}
 	}
 	return nil
 }
@@ -1469,10 +1498,15 @@ func (d *DB) IncomeHistory(tsCode string) ([]IncomeRow, error) {
 
 // FinaHistory 读取某股票全部财务指标快照（按报告期升序），供成长/质量因子。
 // 含 ann_date（公告日），供回测做点对时（point-in-time）过滤、避免未来函数。
-// （FinaHistory reads a stock's financial-indicator snapshots for quality/growth factors.
-// ann_date (announcement date) enables point-in-time filtering to avoid lookahead bias.）
+// §N-5（2026-09-22 PM 批）：ann_date 在旧装载行里可以是 NULL（baostock 某些期不给披露日），
+// 而 Scan 进 string 会直接报错 → 整次查询失败 → 上游 fina_cache 把 err 吞掉返回 nil，
+// 表现是"这只票没有财务因子"（七项指标静默全 0），实际只是披露日缺失。现 COALESCE 成空串，
+// 缺失=不可知（下游新鲜度判定据此处理），不再连带丢掉整行数据。
+// English: §N-5 — ann_date may be NULL on legacy rows; scanning NULL into a string failed the whole
+// query, and the caller swallowed the error, so the stock silently lost all seven financial factors.
+// COALESCE to "" now: unknown announcement date, but the row still counts.
 func (d *DB) FinaHistory(tsCode string) ([]FinaRow, error) {
-	query := `SELECT end_date, ann_date,
+	query := `SELECT end_date, COALESCE(ann_date,''),
 		COALESCE(eps,0), COALESCE(roe,0), COALESCE(roa,0), COALESCE(grossprofit_margin,0),
 		COALESCE(netprofit_margin,0), COALESCE(debt_to_assets,0), COALESCE(yoy_or,0),
 		COALESCE(yoy_net_profit,0)

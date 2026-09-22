@@ -190,11 +190,12 @@ func TestHTTPCORSHardening(t *testing.T) {
 	}
 }
 
-// TestHTTPSSeTicket §WS-F C4a：POST /api/events/ticket 取一次性票据；
-// /api/events?ticket= 建链 200；同票二次使用 401；伪造/过期票 401；无票无 token 401；
+// TestHTTPSSeTicket §WS-F C4a + §M5：POST /api/events/ticket 取 60s 建链票据；
+// /api/events?ticket= 建链 200；**TTL 内同票复用 200**（§M5：浏览器原生重连原样重发同 URL，
+// 消费即废会让重连必然 401、Last-Event-ID 补发通道断绝）；伪造票 401；无票无 token 401；
 // 旧版 token query 兼容仍可用。
-// English: §WS-F C4a — mint a one-time SSE ticket, connect with it (200), reuse → 401, bogus → 401,
-// no credential → 401, and the legacy token query still works.
+// English: §M5 — the ticket is reusable within its 60s TTL (native EventSource reconnect replays the
+// same URL); bogus tickets and missing credentials still get 401; legacy token query still works.
 func TestHTTPSSeTicket(t *testing.T) {
 	data.DisableAll = true
 	defer func() { data.DisableAll = false }()
@@ -225,9 +226,9 @@ func TestHTTPSSeTicket(t *testing.T) {
 	if code := sseConnectStatus(t, hr, "ticket="+resp.Ticket); code != 200 {
 		t.Errorf("有效票据建链应 200, got %d", code)
 	}
-	// 同一票据复用 → 401（一次性）
-	if code, _ := apiGet(t, hr, hr.token, "/api/events?ticket="+resp.Ticket); code != 401 {
-		t.Errorf("已用票据应 401, got %d", code)
+	// §M5：TTL 内同票复用 → 200（旧「消费即废 401」语义杀死原生重连，不得回退）
+	if code := sseConnectStatus(t, hr, "ticket="+resp.Ticket); code != 200 {
+		t.Errorf("§M5 TTL 内复用票据应 200（重连可用），got %d", code)
 	}
 	// 未认证取票 → 401
 	if code, _ := apiReq(t, hr, "", http.MethodPost, "/api/events/ticket", nil); code != 401 {

@@ -64,16 +64,22 @@ type RealOrder struct {
 // RealFill 实盘成交回报行。
 // （RealFill is one live fill report.）
 type RealFill struct {
-	ID       int64   `json:"id"`                  // 自增 ID
-	OrderID  string  `json:"order_id"`            // 订单ID
-	Code     string  `json:"code"`                // 代码
-	Name     string  `json:"name"`                // 名称（成交回报携带，建仓回填）
-	Side     string  `json:"side"`                // 方向
-	Price    float64 `json:"price"`               // 价格
-	Qty      int     `json:"qty"`                 // 数量
-	Amount   float64 `json:"amount"`              // 成交额
-	TradedAt string  `json:"traded_at"`           // 成交时间
-	SignalID string  `json:"signal_id"`           // 信号ID
+	ID       int64   `json:"id"`        // 自增 ID
+	OrderID  string  `json:"order_id"`  // 订单ID
+	Code     string  `json:"code"`      // 代码
+	Name     string  `json:"name"`      // 名称（成交回报携带，建仓回填）
+	Side     string  `json:"side"`      // 方向
+	Price    float64 `json:"price"`     // 价格
+	Qty      int     `json:"qty"`       // 数量
+	Amount   float64 `json:"amount"`    // 成交额
+	TradedAt string  `json:"traded_at"` // 成交时间
+	SignalID string  `json:"signal_id"` // 信号ID
+	// TradeID §M4（2026-09-22 PM 批）券商成交编号：网关回报一直携带，旧 Go 信封没有该 tag
+	// → 本地 fills 只剩复合键判重（同委托同秒同价同量的两笔真实部成会被误判为重放丢单）。
+	// 空串=券商未给（旧行/交割单回灌路径），判重自动退回复合键。
+	// English: §M4 — broker trade number, long emitted by the gateway but silently dropped by the
+	// old Go envelope. Empty (legacy rows / settlement backfill) falls back to composite dedup.
+	TradeID  string  `json:"trade_id,omitempty"`
 	UserID   string  `json:"user_id,omitempty"`   // §W2-10 归属账号
 	Fee      float64 `json:"fee,omitempty"`       // §WS-B 手续费（交割单回灌）
 	StampTax float64 `json:"stamp_tax,omitempty"` // §WS-B 印花税（交割单回灌）
@@ -137,7 +143,12 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
-				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
+				-- §M4（2026-09-22 PM 批）空名快照不得抹空已有名称：券商持仓快照常不带 name，
+				-- 旧实现 excluded.name('') 直覆盖 → 实盘持仓页只剩代码。与同语句 strategy 的
+				-- §M5 保护同口径（COALESCE(NULLIF(新,''),旧)）。
+				-- English: §M4 — keep the stored name when the snapshot carries none (same guard as §M5).
+				name=COALESCE(NULLIF(excluded.name,''), real_positions.name),
+				qty=excluded.qty, cost_price=excluded.cost_price,
 				amount=excluded.amount,
 				-- §M5（2026-09-22 修复批）：strategy 仅在快照携带非空值时覆盖——券商快照不带
 				-- 战法归因，旧实现 excluded.strategy('') 直插会把本地战法标记洗成空串。
@@ -266,7 +277,9 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
-				name=excluded.name, qty=excluded.qty, cost_price=excluded.cost_price,
+				-- §M4（2026-09-22 PM 批）与 UpsertRealPositions 同口径：空名快照不抹空已有名称。
+				name=COALESCE(NULLIF(excluded.name,''), real_positions.name),
+				qty=excluded.qty, cost_price=excluded.cost_price,
 				amount=excluded.amount,
 				-- §M5（2026-09-22 修复批）：strategy/signal_id 是本地战法归因链（复盘/审计/补卖
 				-- 定位都靠它），券商对账快照恒不带这两字段——旧实现 excluded.* 直插等于每次对账
@@ -495,18 +508,31 @@ func (d *DB) ApplyRealFill(f RealFill) error {
 	// §WS-A A2 结构化幂等：先按复合唯一键 (order_id,traded_at,price,qty) 显式判重——
 	// 网关 outbox 对同笔回报重试时，命中即视为已入账，整体事务回滚并返回幂等成功，
 	// 持仓数量不再被二次累加（此前依赖 SQLite 错误文案匹配，驱动措辞变化即静默失效）。
+	// §M4（2026-09-22 PM 批）判重锚优先券商成交编号：复合键把"同委托+同秒+同价+同量"的两笔
+	// 真实部成也判成重放——第二笔被静默丢弃（少记成交 → 持仓虚高、卖出侧会拿不存在的量下单）。
+	// trade_id 券商保证唯一，非空时以它为准；缺省时退回复合键，行为与旧版兼容。
+	// English: §M4 — prefer the broker's unique trade number for replay detection; the composite
+	// key could silently discard a second genuine partial fill in the same second. Fall back to
+	// the composite key when the gateway reports no trade_id.
 	var dup int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM fills WHERE order_id=? AND traded_at=? AND price=? AND qty=?`,
-		f.OrderID, f.TradedAt, f.Price, f.Qty).Scan(&dup); err != nil {
-		return err
+	if f.TradeID != "" {
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM fills WHERE trade_id=?`, f.TradeID).Scan(&dup); err != nil {
+			return err
+		}
+	} else {
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM fills WHERE order_id=? AND traded_at=? AND price=? AND qty=?`,
+			f.OrderID, f.TradedAt, f.Price, f.Qty).Scan(&dup); err != nil {
+			return err
+		}
 	}
 	if dup > 0 {
-		log.Printf("[store] fills 幂等命中(重复回报): order=%s traded_at=%s qty=%d", f.OrderID, f.TradedAt, f.Qty)
+		log.Printf("[store] fills 幂等命中(重复回报): order=%s trade_id=%s traded_at=%s qty=%d",
+			f.OrderID, f.TradeID, f.TradedAt, f.Qty)
 		return tx.Rollback()
 	}
-	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial); err != nil {
+	if _, err := tx.Exec(`INSERT INTO fills (order_id, code, side, price, qty, amount, traded_at, signal_id, user_id, fee, stamp_tax, serial, trade_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.OrderID, f.Code, f.Side, f.Price, f.Qty, f.Amount, f.TradedAt, f.SignalID, f.UserID, f.Fee, f.StampTax, f.Serial, f.TradeID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1070,7 +1096,7 @@ func (d *DB) UpdateRealOrderStatusMonotonic(userID, orderID, status string) (boo
 // （RealFills returns all live fills, newest first; now carrying fee/stamp_tax/user legs.）
 func (d *DB) RealFills() ([]RealFill, error) {
 	rows, err := d.db.Query(`SELECT id, order_id, code, side, price, qty, amount, traded_at, signal_id,
-		COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0)
+		COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(trade_id,'')
 		FROM fills ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
@@ -1080,7 +1106,7 @@ func (d *DB) RealFills() ([]RealFill, error) {
 	for rows.Next() {
 		var f RealFill
 		if err := rows.Scan(&f.ID, &f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount, &f.TradedAt, &f.SignalID,
-			&f.UserID, &f.Fee, &f.StampTax); err != nil {
+			&f.UserID, &f.Fee, &f.StampTax, &f.TradeID); err != nil {
 			return nil, err
 		}
 		out = append(out, f)

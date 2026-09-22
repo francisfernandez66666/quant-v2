@@ -3,6 +3,7 @@
 // 混写成同一个返回值——消费端 `if cash > 0` 判空即跳过资金降档门控：
 //   - 冻结碎钱（H-4 实录的 0.03）落进 cash>0 分支 → 当日买入全拦；
 //   - 冻结值恰为 0 / 回报断供 → 「不设限」全量放行，引擎在无任何资金约束下继续下单。
+//
 // 修法断言的三态：fresh 真值→按可负担整手降档；fresh 真 0→「买不起一手」拒单；
 // stale/未接账本→整腿 fail-close 不自动买（本文件核心断言：0 张委托抵达网关）。
 // English: §M12-A behavior tests — three cash states drive three outcomes:
@@ -14,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/store"
 )

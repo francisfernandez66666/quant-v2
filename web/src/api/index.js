@@ -167,7 +167,7 @@
 // 【SSE 实时推送与会话追踪】
 //   onSSE() / connectSSE() / disconnectSSE()
 //                           POST /api/events/ticket + GET /api/events?ticket=...
-//                                                       SSE 长连接（一次性票据鉴权）与回调分发
+//                                                       SSE 长连接（短时效票据鉴权）与回调分发
 //   getLastSession() / setLastSession() / isNewSession() / isTradingSession()
 //                           ——                              市场会话期号追踪（非交易时段仅首载）
 //
@@ -1440,6 +1440,15 @@ let sseConnecting = null
 // §H6（2026-09-22 修复批）：兜底重建定时器。仅当 EventSource 被判 CLOSED、需要手动换票重建时
 // 使用；同一轮断开只允许挂一个定时器（去重），退出登录时由 disconnectSSE 一并清除。
 let sseReconnectTimer = null
+// §M5（2026-09-22 PM 批）：客户端记录的最后一个事件序号（EventSource 的 lastEventId，
+// 来自服务端 `id:` 行）。手动换票重建的新 EventSource 附加不了 Last-Event-ID 请求头
+// （该头只有浏览器原生重连会自动携带），故把续读位置以 `?last_event_id=` query 带进
+// 重建 URL，服务端补发环按 (账号, 序号) 查询（handlers_fix.go handleFixSSE）。
+// 注意：disconnectSSE 不清此值——CLOSED 兜底重建正是「disconnectSSE → 退避 → connectSSE」
+// 一条链，在这里清等于又把续读位置丢了。
+// English: §M5 — last seen SSE event id, replayed on manual rebuild via the ?last_event_id=
+// query (headers are reserved for the browser's native reconnect).
+let sseLastEventId = ''
 
 /**
  * 注册 SSE 消息回调，返回取消注册的函数
@@ -1461,17 +1470,20 @@ export function onSSE(fn) {
 // Notes:
 //  - 已有连接或未登录时直接返回（幂等操作，避免重复建连）；
 //  - returns immediately if already connected or not logged in (idempotent, avoids duplicate connections);
-//  - §WS-F C4a：先 POST /api/events/ticket 取 60s 一次性票据，再以
+//  - §WS-F C4a：先 POST /api/events/ticket 取 60s 短时效票据，再以
 //    connection URL = baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket) 建链；
-//    票据一次性（用后即废）、过期即废，即使泄漏进 access log 也无法复用/冒充他人建链。
-//  - §WS-F C4a: mint a one-time 60s ticket at POST /api/events/ticket, then connect to
-//    baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket). The ticket is consumed on
-//    first use and expires, so a leaked URL cannot open a second stream.
-//  - 收到消息时解析 JSON 并依次调用 sseCallbacks 中的回调；
+//    §M5 起票据 TTL 内可复用——浏览器原生重连只会原样重发同一 URL，旧「消费即废」语义
+//    让每次重连必然 401，唯一带 Last-Event-ID 头的通道被掐死。
+//  - §WS-F C4a: mint a 60s ticket at POST /api/events/ticket, then connect with
+//    baseUrl() + '/api/events?ticket='. Since §M5 the ticket stays valid (read-only, account-bound)
+//    for the rest of its TTL so the browser's native reconnect — which replays the exact same URL —
+//    succeeds instead of dying on a guaranteed 401.
+//  - 收到消息时解析 JSON 并依次调用 sseCallbacks 中的回调；同时记录 lastEventId（§M5 重建续传用）；
 //  - received messages are parsed as JSON and dispatched to each callback in sseCallbacks;
 //  - onerror 触发时：§H6 起不再手动 close+新建——非 CLOSED 态交给浏览器原生自动重连
 //    （原生重连会自动携带 Last-Event-ID 头，服务端据此补发断流期间错过的事件）；
-//    仅当 EventSource 被彻底关闭（CLOSED，如一次性票据消费后原生重连 401）才手动换票重建兜底。
+//    仅当 EventSource 被彻底关闭（CLOSED，如票据 60s TTL 已耗尽后重连 401）才手动换票重建，
+//    并以 ?last_event_id= query 携带续读位置（§M5），补发环不再对重建路径不可达。
 //  - English: §H6 — on error the client now lets the browser's native auto-reconnect run untouched
 //    (native reconnect is the only path that carries the Last-Event-ID header the server's replay
 //    ring reads); a manual close-and-recreate happens only after the EventSource fatally CLOSED.
@@ -1490,8 +1502,8 @@ export async function connectSSE() {
     // 未登录时不建立连接
     // Do not connect when not logged in
     if (!token) return
-  // 先取一次性票据：每次（重）建链都要重新签发（旧票已消费/过期）
-  // Mint a fresh one-time ticket per (re)connect; the previous one is spent or expired
+  // 每次（重）建链都新签一张票：旧票即便 TTL 内可复用也可能已过期，换新的最稳
+  // Mint a fresh ticket per (re)connect; the previous one may have expired
     let ticket = ''
     try {
       const resp = await request('/api/events/ticket', { method: 'POST' })
@@ -1512,15 +1524,18 @@ export async function connectSSE() {
     //       服务端据此实现断线续传（见 handleFixSSE 读取 Last-Event-ID）。
     // Note: the browser EventSource automatically sends the Last-Event-ID header
     //       (from the server's `id:` line), enabling reconnect resume server-side.
-    // §H6：上面这句注释描述的正是本修复要保住的通道——该头只有「同一 EventSource 实例的浏览器
-    // 原生自动重连」才会携带；手动 new EventSource 无法附加自定义头，而服务端只读 header、
-    // 不收 query 形态（internal/server/handlers_fix.go:2224），故重建即丢失补发能力。
-    sse = new EventSource(baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket))
+    // §H6 保住的是「原生重连带请求头」这条通道；§M5 补上另一条：手动换票重建附加不了
+    // 请求头，改以 `?last_event_id=` query 携带同一续读位置，服务端两种载体共用补发环。
+    let url = baseUrl() + '/api/events?ticket=' + encodeURIComponent(ticket)
+    if (sseLastEventId) url += '&last_event_id=' + encodeURIComponent(sseLastEventId)
+    sse = new EventSource(url)
     // §H6：实例身份守卫——旧实例（已被替换/关闭）迟到的回调不应再操作当前连接状态
     const es = sse
     sse.onmessage = (e) => {
       // 成功收到一条消息即重置重连计数（连接已恢复）
       sseRetry = 0
+      // §M5：记录续读位置（服务端 `id:` 行），CLOSED 重建时以 query 带回
+      if (e.lastEventId) sseLastEventId = e.lastEventId
       try {
         const msg = JSON.parse(e.data)
         sseCallbacks.forEach(fn => fn(msg))
@@ -1548,9 +1563,13 @@ export async function connectSSE() {
         }
         return
       }
-      // 走到这里说明 EventSource 已被浏览器彻底放弃（CLOSED，典型：一次性票据被消费后
-      // 原生重连收到 401）——原生通道已不可用，只能手动换票重建兜底。此跳补发环不可达是
-      // 票据鉴权一次性语义下的已知降级（服务端不收 last_event_id query），维持现状不动后端。
+      // 走到这里说明 EventSource 已被浏览器彻底放弃（CLOSED，典型：断流超过票据 60s TTL 后
+      // 重连收到 401）——原生通道已不可用，只能手动换票重建兜底。§M5：重建 URL 带
+      // ?last_event_id=（见 connectSSE 建链处），补发环对这条路径同样可达，断流期间
+      // 错过的事件不再永久丢失。
+      // English: §M5 — the fatal-CLOSED manual rebuild carries the resume position as a query, so the
+      // server's replay ring is reachable on this path too (previously events missed during the
+      // outage were silently dropped, the "known degradation" the old comment conceded).
       disconnectSSE()
       sseRetry++
       // 退避延迟：3s 起，指数增长并封顶 30s，避免网络异常时无限快速重连风暴

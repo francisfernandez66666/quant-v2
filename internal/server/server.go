@@ -17,7 +17,7 @@
 //     控制面路由（ctrlFor/liveCtrlFor/dashFor，经 EngineRegistry 懒加载），
 //     运营数据统一归属管理员账号（operatorID）。
 //
-//  4. SSE 实时推送：SSEBroker 事件广播 + 一次性票据（sseTickets）鉴权，
+//  4. SSE 实时推送：SSEBroker 事件广播 + 短时效建链票据（sseTickets，§M5 起 TTL 内可复用）鉴权，
 //     供浏览器 EventSource 建立只读事件流。
 //
 //  5. 通用中间件链（chain）：panic 恢复（recoverMiddleware）在最外层兜底，
@@ -189,12 +189,13 @@ type Server struct {
 	// English: P1-5 setup token — when SETUP_TOKEN env is set, POST /setup requires the matching token.
 	setupToken string
 
-	// §WS-F C4a SSE 一次性票据：SSE 用 Authorization 头（浏览器 EventSource 不支持），
-	// 改为「短时 one-time ticket」——POST /api/events/ticket 取 60s 有效随机票，
-	// SSE URL /api/events?ticket=xxx 校验并立即作废。access log 里的 ticket 不可复用。
+	// §WS-F C4a SSE 建链票据：SSE 用 Authorization 头（浏览器 EventSource 不支持），
+	// 改为「短时 ticket」——POST /api/events/ticket 取 60s 有效随机票，
+	// SSE URL /api/events?ticket=xxx 校验。§M5 起票据 TTL 内可复用（保原生重连），
+	// 泄漏可利用窗口 ≤60s 且只授予本账号只读事件流。
 	// English: WS-F C4a — EventSource cannot set Authorization headers, so SSE uses a short-lived
-	// one-time ticket minted at POST /api/events/ticket (60s TTL, bound to the issuing user,
-	// consumed on first use).
+	// ticket minted at POST /api/events/ticket (60s TTL, bound to the issuing user; reusable within
+	// the TTL since §M5 so the browser's native reconnect keeps working).
 	sseTicketsMu sync.Mutex
 	sseTickets   map[string]sseTicket
 
@@ -804,7 +805,7 @@ func (s *Server) registerRoutes() {
 	// §WS-K 维4 配置历史/回滚：快照+diff 列表（admin）、回滚恢复（admin）
 	s.mux.HandleFunc("GET /api/config/history", s.adminMiddleware(s.handleConfigHistory))
 	s.mux.HandleFunc("POST /api/config/rollback", s.adminMiddleware(s.handleConfigRollback))
-	// §WS-F C4a SSE 一次性票据签发端点（需认证）；SSE 建链用 /api/events?ticket=xxx（60s 一次性）。
+	// §WS-F C4a SSE 建链票据签发端点（需认证）；SSE 建链用 /api/events?ticket=xxx（60s 有效，§M5 起 TTL 内可复用）。
 	// ── SSE 事件流：建链端点自带票据校验（不走 authMiddleware，因 EventSource 无法带 Authorization 头）──
 	s.mux.HandleFunc("POST /api/events/ticket", s.authMiddleware(s.handleSSETicket))
 	s.mux.HandleFunc("GET /api/events", s.handleFixSSE)

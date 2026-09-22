@@ -56,6 +56,15 @@ type FinancialData struct {
 	DebtToAssets float64 `json:"debt_to_assets,omitempty"` // 资产负债率（%）
 	Eps          float64 `json:"eps,omitempty"`            // 每股收益
 	YoyOR        float64 `json:"yoy_or,omitempty"`         // 营收同比（%）
+	// EndDate/AnnDate §N-5（2026-09-22 PM 批）报告期与披露日：这两个字段此前**根本不存在**，
+	// 于是运行侧财务因子拿的是"库里最后一行"，无从判断它有多旧——研究库断更三个月，
+	// 打分照样按最新财报计分（研究侧有 PIT 装配 `ann_date ≤ 当日`，运行侧没有对应闸门）。
+	// 空串=来源未带（旧数据/降级路径），下游新鲜度判定按"不可知"处理而不是"很旧"。
+	// English: §N-5 — reporting period end and announcement date. These did not exist at all, so the
+	// live scorer consumed "last row in the table" with no way to tell how stale it was. Empty means
+	// the source carried none (unknown, not "ancient").
+	EndDate string `json:"end_date,omitempty"` // 报告期（YYYY-MM-DD，如 2026-06-30）
+	AnnDate string `json:"ann_date,omitempty"` // 披露日（YYYY-MM-DD，PIT 可见性边界）
 }
 
 // StockMarketData 个股行情数据：实时价、K线、资金流向、分钟级量价/MACD等。

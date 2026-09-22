@@ -323,7 +323,7 @@ func (c *Controller) Snapshot() StateSnapshot {
 		LastLatencyMs:  c.lastLatencyMs,
 		LastReportAt:   c.lastReportAt,
 		LastReportKind: c.lastReportKind,
-		Cash:           cash,  // §M12-A 原始最近值（过期时仅供参考）
+		Cash:           cash, // §M12-A 原始最近值（过期时仅供参考）
 		CashStale:      !cashFresh,
 		PendingEnabled: pendingEnabled,
 	}

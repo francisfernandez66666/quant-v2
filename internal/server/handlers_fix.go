@@ -2163,11 +2163,12 @@ func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-// handleSSETicket 处理 POST /api/events/ticket（需认证）：签发一个 60s 有效、绑定当前账号、
-// 一次性（消费即废）的 SSE 建链票据。理由：浏览器 EventSource 无法自定义 Authorization 头，
-// 直接走 URL query token 会进 access log 且长期有效；票据把暴露面收敛到 60s 且不可复用。
-// English: §WS-F C4a — mint a 60s one-time SSE ticket bound to the authenticated user; consumed on
-// first use so a leaked URL can never be reused to open a second stream.
+// handleSSETicket 处理 POST /api/events/ticket（需认证）：签发一个 60s 有效、绑定当前账号的
+// SSE 建链票据；§M5 起票据在 TTL 内可复用（原生重连原样重发同 URL，消费即废会让其必然 401）。
+// 理由：浏览器 EventSource 无法自定义 Authorization 头，直接走 URL query token 会进 access log
+// 且长期有效；票据把暴露面收敛到 ≤60s、只授予本账号只读事件流。
+// English: §M5 — mint a 60s ticket bound to the authenticated user, reusable within the TTL so the
+// browser's native EventSource reconnect (same URL) keeps working and can carry Last-Event-ID.
 func (s *Server) handleSSETicket(w http.ResponseWriter, r *http.Request) {
 	uid := userIDFor(r)
 	s.sweepSSETickets()
@@ -2183,14 +2184,15 @@ func (s *Server) handleSSETicket(w http.ResponseWriter, r *http.Request) {
 // 连接建立后：15 秒发送一次心跳保活，有数据时立即推送。
 // 账号隔离：按 token 解析 userID，仅订阅该账号定向事件；断线续传：读取 Last-Event-ID 补发漏掉的事件。
 func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
-	// §WS-F C4a 鉴权：优先一次性票据（推荐，URL 不留长期 token，票据消费即废）；兼容旧客户端
-	// token query 回退。无票据亦无 token → 401；票据已用/过期 → 401。
-	// English: SSE auth prefers a one-time ticket (consumed on use; the URL never carries a long-lived
-	// token); legacy token query still works as a fallback.
+	// §WS-F C4a 鉴权：优先短时效票据（推荐，URL 不留长期 token；§M5 起 TTL 内可复用，
+	// 原生重连不再必然 401）；兼容旧客户端 token query 回退。无票据亦无 token → 401；
+	// 票据过期/伪造 → 401。
+	// English: SSE auth prefers the 60s ticket (reusable within its TTL since §M5, so native
+	// reconnect works); legacy token query still works as a fallback.
 	userID := ""
 	if tk := r.URL.Query().Get("ticket"); tk != "" {
 		s.sweepSSETickets()
-		if uid, ok := s.consumeSSETicket(tk); ok {
+		if uid, ok := s.useSSETicket(tk); ok {
 			userID = uid
 		}
 		if userID == "" {
@@ -2219,9 +2221,17 @@ func (s *Server) handleFixSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// 读取 Last-Event-ID 头实现断线续传：>0 时按账号补发历史中该序号之后的事件
+	// 读取 Last-Event-ID 头实现断线续传：>0 时按账号补发历史中该序号之后的事件。
+	// §M5：手动换票重建的新 EventSource 附加不了请求头（该头只有浏览器原生重连会自动携带），
+	// 故补发序号另收 query 形态 `?last_event_id=`——仅在请求头缺席时生效，头优先保持
+	// SSE 协议原生语义。补发环本就按 (userID, lastID) 在服务端查询（SubscribeFor），
+	// 两种载体共用同一条补发路径。
+	// English: §M5 — accept the resume position as ?last_event_id= when the native header is absent
+	// (manual rebuild cannot set headers); the header keeps precedence for protocol semantics.
 	var lastID uint64
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
+		fmt.Sscanf(v, "%d", &lastID)
+	} else if v := r.URL.Query().Get("last_event_id"); v != "" {
 		fmt.Sscanf(v, "%d", &lastID)
 	}
 	ch := s.sse.SubscribeFor(userID, lastID)

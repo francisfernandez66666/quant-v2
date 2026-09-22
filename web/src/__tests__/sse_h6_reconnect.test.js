@@ -1,11 +1,11 @@
-// ── §H6（2026-09-22 修复批）SSE 冷启动丢补发 回归用例 ──
+// ── §H6（2026-09-22 修复批）+ §M5（PM 批）SSE 断线续传回归用例 ──
 // 锁死行为：断流回调（onerror）触发时，只要 EventSource 还没被判 CLOSED（浏览器正在原生
 // 自动重连、唯一能携带 Last-Event-ID 请求头的通道），前端不得手动 close+新建打断它；
-// 仅当实例 CLOSED（典型：一次性票据被消费后原生重连 401）才走「换票 + 退避重建」兜底。
-// 背景：服务端补发环只读 Last-Event-ID 头（internal/server/handlers_fix.go:2224，不收 query 形态），
-// 旧实现 onerror 先 disconnectSSE 再 new EventSource，重建实例无法附加头 → 补发永远不可达。
-// English: §H6 regression — native reconnect (the only Last-Event-ID carrier) must not be
-// interrupted by a manual close-and-resurrect; manual rebuild stays a fatal-CLOSED fallback.
+// 仅当实例 CLOSED（典型：断流超过票据 60s TTL 后重连 401）才走「换票 + 退避重建」兜底，
+// 且 §M5 起重建 URL 必须带 ?last_event_id=<最后收到的事件序号>——新 EventSource 附加不了
+// 请求头，query 是这条路径唯一可达的补发载体（服务端 handlers_fix.go 头缺位时收 query）。
+// English: §H6 — native reconnect must not be interrupted; §M5 — the fatal-CLOSED rebuild must
+// carry the resume position as ?last_event_id= so the server-side replay ring stays reachable.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 describe('api - SSE 断流不再手动打断原生重连（§H6）', () => {
@@ -80,12 +80,16 @@ describe('api - SSE 断流不再手动打断原生重连（§H6）', () => {
     expect(fetchCallsTo('/api/events/ticket')).toBe(1) // 也没有提前换票
   })
 
-  it('实例 CLOSED 后：才走兜底重建，且换新票据重新建链', async () => {
+  it('实例 CLOSED 后：才走兜底重建，换新票据且带 ?last_event_id= 续传（§M5）', async () => {
     const mod = await import('../api/index.js')
     await mod.connectSSE()
     const es1 = instances[0]
+    expect(es1.url).not.toContain('last_event_id=') // 首连没有历史序号，不带续传参数
 
-    // 一次性票据被消费后原生重连 401 → 浏览器彻底放弃（CLOSED）→ 触发兜底重建路径
+    // 先正常收到一条带序号的事件（服务端 `id:` 行 → e.lastEventId）
+    es1.onmessage({ data: JSON.stringify({ type: 'score' }), lastEventId: '42' })
+
+    // 断流超过票据 TTL 后重连 401 → 浏览器彻底放弃（CLOSED）→ 触发兜底重建路径
     es1.readyState = 2
     es1.onerror(new Event('error'))
     expect(es1.close).toHaveBeenCalled() // 回收旧实例引用（disconnectSSE）
@@ -95,8 +99,11 @@ describe('api - SSE 断流不再手动打断原生重连（§H6）', () => {
     expect(instances.length).toBe(1)     // 3s 退避未到
     await vi.advanceTimersByTimeAsync(2)
     expect(instances.length).toBe(2)     // 退避到点，兜底重建
-    expect(instances[1].url).toContain('ticket=tk2') // 重建必换新票（旧票已消费）
+    expect(instances[1].url).toContain('ticket=tk2') // 重建必换新票（旧票可能已过期）
     expect(instances[1].url).not.toBe(instances[0].url)
+    // §M5 核心断言：手动重建附加不了 Last-Event-ID 请求头，续读位置必须以 query 携带，
+    // 否则服务端补发环对这条路径不可达、断流期间错过的事件永久丢失（旧行为）。
+    expect(instances[1].url).toContain('last_event_id=42')
   })
 
   it('连续 5 次重连失败探测一次 /api/status 登录态（保留 §P1-9 过期 token 终止语义）', async () => {

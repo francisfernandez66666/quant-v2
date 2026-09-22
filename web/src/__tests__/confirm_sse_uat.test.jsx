@@ -73,7 +73,7 @@ describe('connectSSE 并发守卫（§P1-10）', () => {
       }
       close() {}
     })
-    // 票据签发走 request() → fetch：返回固定一次性票据
+    // 票据签发走 request() → fetch：返回固定短时效票据（§M5 起 TTL 内可复用）
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ticket: 't-1' }), { status: 200 })))
   })
   afterEach(() => {

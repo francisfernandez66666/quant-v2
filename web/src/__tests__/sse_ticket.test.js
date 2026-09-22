@@ -1,11 +1,11 @@
-// ── WS-F C4a SSE 一次性票据流程单元测试 ──
-// 覆盖 web/src/api/index.js 的 connectSSE 变更：先 POST /api/events/ticket 取 60s 一次性票据，
-// 再用 /api/events?ticket=<tk> 建链（URL 不再携带长期 token）；票据失败走 auth 探测。
-// 通过 mock EventSource 与全局 fetch 验证建链 URL 与鉴权头。
+// ── WS-F C4a SSE 建链票据流程单元测试 ──
+// 覆盖 web/src/api/index.js 的 connectSSE 变更：先 POST /api/events/ticket 取 60s 短时效票据
+// （§M5 起 TTL 内可复用），再用 /api/events?ticket=<tk> 建链（URL 不再携带长期 token）；
+// 票据失败走 auth 探测。通过 mock EventSource 与全局 fetch 验证建链 URL 与鉴权头。
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import * as api from '../api/index.js'
 
-describe('api - SSE 一次性票据（§WS-F C4a）', () => {
+describe('api - SSE 建链票据（§WS-F C4a + §M5）', () => {
   let openedUrl = ''
 
   // EventSource 替身：构造时把建链 URL 记到外层 openedUrl 供断言，

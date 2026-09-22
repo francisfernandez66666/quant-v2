@@ -7,12 +7,18 @@
 //	① qmtReportEvent 反射 JSON tag 集 == report_event_fields；
 //	② store.RealPosition 反射 JSON tag 集 == positions_row_fields；
 //	③ account_asset_keys 必须逐一在 qmt.go 中以 ev.Asset["key"] 形态被消费；
-//	④ consumed_by_event 各事件消费集必须是信封字段集的子集（文档面自洽）。
+//	④ consumed_by_event 各事件消费集必须是信封字段集的子集（文档面自洽）；
+//	⑤ §M4 双向锁——gateway_emitted_fields（网关实际发出集，由 qmt_gateway/tests/
+//	   test_report_contract.py 在 Python 侧钉住）必须是信封集的子集：网关发了而 Go
+//	   没有 tag = encoding/json 静默丢腿（实录：trade_id / name / created_at）；
+//	⑥ positions_row_emitted_fields ⊆ RealPosition 反射集（对账行同锁）；
+//	⑦ consumed_by_event ⊆ gateway_emitted_fields（Go 不许消费网关从未发出的字段）。
 //
 // 任一侧加/删字段漏改 golden 即红。重生成信封/持仓行两面：
 // REPORT_CONTRACT_UPDATE=1 go test ./internal/server -run TestReportContractGolden
-// English: golden contract lock for the gateway-report direction (mirror of the order-direction
-// A2 test) — reflect qmtReportEvent and store.RealPosition against report_fields.json.
+// English: golden contract lock for the gateway-report direction, now bidirectional since §M4 —
+// the emit side is pinned by the Python test, the receive side by reflection here, and
+// emitted ⊆ envelope is asserted so an untagged (silently dropped) leg can never come back.
 package server
 
 import (
@@ -38,25 +44,29 @@ func TestReportContractGolden(t *testing.T) {
 		t.Fatalf("读取回报 golden 失败: %v", err)
 	}
 	var doc struct {
-		ReportEventFields  []string            `json:"report_event_fields"`
-		PositionsRowFields []string            `json:"positions_row_fields"`
-		AccountAssetKeys   []string            `json:"account_asset_keys"`
-		ConsumedByEvent    map[string][]string `json:"consumed_by_event"`
+		ReportEventFields    []string            `json:"report_event_fields"`
+		PositionsRowFields   []string            `json:"positions_row_fields"`
+		PositionsRowEmitted  []string            `json:"positions_row_emitted_fields"`
+		AccountAssetKeys     []string            `json:"account_asset_keys"`
+		ConsumedByEvent      map[string][]string `json:"consumed_by_event"`
+		GatewayEmittedFields map[string][]string `json:"gateway_emitted_fields"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("golden JSON 解析失败: %v", err)
 	}
 
-	// 显式重生成模式：只覆写两面反射集，asset keys / consumed_by_event 需人工对照 qmt.go 复核。
+	// 显式重生成模式：只覆写两面反射集，asset keys / consumed_by_event / gateway_emitted 需人工复核。
 	if os.Getenv("REPORT_CONTRACT_UPDATE") == "1" {
 		out, merr := json.MarshalIndent(map[string]any{
-			"source":               docSourceLine(),
-			"updated":              docSourceUpdated(),
-			"notes":                docSourceNotes(raw),
-			"report_event_fields":  envFields,
-			"positions_row_fields": posFields,
-			"account_asset_keys":   doc.AccountAssetKeys,
-			"consumed_by_event":    doc.ConsumedByEvent,
+			"source":                       docSourceLine(),
+			"updated":                      docSourceUpdated(),
+			"notes":                        docSourceNotes(raw),
+			"report_event_fields":          envFields,
+			"positions_row_fields":         posFields,
+			"positions_row_emitted_fields": doc.PositionsRowEmitted,
+			"account_asset_keys":           doc.AccountAssetKeys,
+			"gateway_emitted_fields":       doc.GatewayEmittedFields,
+			"consumed_by_event":            doc.ConsumedByEvent,
 		}, "", "  ")
 		if merr != nil {
 			t.Fatal(merr)
@@ -91,6 +101,42 @@ func TestReportContractGolden(t *testing.T) {
 		for _, f := range consumed {
 			if !envSet[f] {
 				t.Errorf("consumed_by_event[%s] 引用了信封中不存在的字段 %q", evType, f)
+			}
+		}
+	}
+
+	// ⑤ §M4（2026-09-22 PM 批）双向丢腿锁：网关实际发出的每个字段都必须在 Go 信封里有 tag。
+	// ①~④ 全部只反射 Go 一侧，所以"网关发了、Go 没接"永远绿——实录丢掉的三条腿是
+	// trade_id（成交判重的精确锚）、name（建仓名称回填）、created_at（委托创建时间）。
+	// encoding/json 对未声明字段静默丢弃，不报错、不留日志，只有这条跨侧断言能拦住它。
+	// English: §M4 — every field the gateway emits must carry a JSON tag here, otherwise
+	// encoding/json drops it silently (that is how trade_id/name/created_at were lost for ages).
+	for evType, emitted := range doc.GatewayEmittedFields {
+		for _, f := range emitted {
+			if !envSet[f] {
+				t.Errorf("§M4 丢腿：网关在 %s 事件发出字段 %q，但 qmtReportEvent 没有该 json tag（会被静默丢弃）", evType, f)
+			}
+		}
+	}
+	// ⑥ 对账行侧同锁：桥/xt 发出的持仓行字段必须能被 store.RealPosition 接住。
+	posSet := map[string]bool{}
+	for _, f := range posFields {
+		posSet[f] = true
+	}
+	for _, f := range doc.PositionsRowEmitted {
+		if !posSet[f] {
+			t.Errorf("§M4 丢腿：对账行发出字段 %q 不在 store.RealPosition 反射集内", f)
+		}
+	}
+	// ⑦ 消费面必须真被发出（Go 声称消费的字段若网关从不发，消费的是恒零假腿）。
+	for evType, consumed := range doc.ConsumedByEvent {
+		emitted := map[string]bool{}
+		for _, f := range doc.GatewayEmittedFields[evType] {
+			emitted[f] = true
+		}
+		for _, f := range consumed {
+			if len(emitted) > 0 && !emitted[f] {
+				t.Errorf("§M4 假腿：consumed_by_event[%s] 消费了网关从未发出的字段 %q", evType, f)
 			}
 		}
 	}
