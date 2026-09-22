@@ -17,6 +17,7 @@
 #       —— 旧版只查首页 200，产物陈旧（先 build 后 commit）时 12/12 全绿却仍报版本不一致横幅
 #   5) 网关：/health ok:true；/settlement 未鉴权 → 401（§P0-1a 新端点路由已上线）
 #   6) 引擎新端点：POST /api/holdings/balance、/api/positions/execute 未鉴权 → 401
+#   7) §20260922PM：POST /api/news/test-attribution 未鉴权 → 401（M-14 收权 admin 生效复核）
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
@@ -133,6 +134,10 @@ $code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/holdings/balance
 Probe "engine:/api/holdings/balance unauth=401" ($code -eq "401") ("got=" + $code)
 $code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/positions/execute") '{}'
 Probe "engine:/api/positions/execute unauth=401" ($code -eq "401") ("got=" + $code)
+
+# 7) §20260922PM 收口面探针：test-attribution 已收权 admin（未鉴权必须 401，404=旧二进制）
+$code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/news/test-attribution") '{}'
+Probe "engine:/api/news/test-attribution unauth=401" ($code -eq "401") ("got=" + $code + "；404=二进制未更新，200=收权未生效（成员越权面仍在）")
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，

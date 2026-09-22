@@ -162,6 +162,7 @@ $SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path
 $SCP qmt_gateway/gateway.py qmt_gateway/broker.py qmt_gateway/handler.py \
      qmt_gateway/store.py qmt_gateway/ids.py qmt_gateway/qmt_bridge.py \
      qmt_gateway/qmt_bridge_strategy.py \
+     qmt_gateway/trading_calendar.py \
      qmt_gateway/quote_feed.py \
      qmt_gateway/config.bridge.example.json \
      "${GZ_USER}@${GZ_IP}:${QMT_GATEWAY_DIR}/"
