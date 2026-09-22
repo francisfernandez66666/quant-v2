@@ -54,14 +54,33 @@ func (c *winCkpt) load(w [2]string, dst any) bool {
 }
 
 // save 把当前窗口的产物落库（序列化失败静默跳过，不阻断发现主流程）。
+// §M-8/N-6（2026-09-22 PM 批）：双吞改为留痕——断点是加速件不是正确性件，失败可继续，
+// 但"整晚断点全没存上"必须看得见（否则续跑收益凭空消失且无人知晓）。
+// English: §M-8/N-6 — checkpoints stay best-effort, but both swallow sites now leave a log trace.
 func (c *winCkpt) save(w [2]string, v any) {
 	if c == nil || c.db == nil {
 		return
 	}
 	js, err := json.Marshal(v)
-	if err == nil {
-		_ = c.db.PutWindowCkpt(c.resumeKey, c.stage, w[0], w[1], string(js))
+	if err != nil {
+		log.Printf("[research] 断点序列化失败（跳过缓存 %s %s-%s）: %v", c.stage, w[0], w[1], err)
+		return
 	}
+	if err := c.db.PutWindowCkpt(c.resumeKey, c.stage, w[0], w[1], string(js)); err != nil {
+		log.Printf("[research] 断点落库失败（下次将重算该窗 %s %s-%s）: %v", c.stage, w[0], w[1], err)
+	}
+}
+
+// noteWindowFail §M-8/N-6 窗口装配失败留痕：逐窗 BuildPanels 失败旧实现静默 continue，
+// IC/触发率/反推结论照常基于"缺窗"样本产出，与全窗成功同形。现统一在阶段收尾打
+// 降级行（失败数/总数+首例），不中断——研究侧缺窗产出仍是有效子集，但必须可辨识。
+// English: §M-8/N-6 — window assembly failures used to vanish under bare `continue`; each stage now
+// emits one degraded line (failed/total + first error) so a missing-window result is identifiable.
+func noteWindowFail(stage string, total, failed int, firstErr error) {
+	if failed == 0 {
+		return
+	}
+	log.Printf("[research] %s 阶段窗口装配降级：%d/%d 窗失败（首例：%v）——结论仅覆盖剩余窗口", stage, failed, total, firstErr)
 }
 
 // stageProgress 阶段进度：把窗口完成数映射到全局百分比带并打印"发现进度 xx%"
@@ -190,9 +209,16 @@ func windowTriggerRate(db *store.DB, codes []string, factors []string, dirs map[
 	out := TriggerEstimate{PerDay: map[float64]float64{}}
 	tot := map[float64]float64{}
 	defs := windowDefs(factors)
+	failed := 0
+	var firstErr error
 	for _, w := range chunks {
 		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), w[1], defs)
 		if err != nil {
+			// §M-8/N-6 留痕（旧：静默 continue 后触发率照常产出，缺窗不可见）
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		est := TriggerRateFromPanels(panels, factors, dirs, weights, []float64{70, 95}, w[0], w[1], minStocks)
@@ -201,6 +227,7 @@ func windowTriggerRate(db *store.DB, codes []string, factors []string, dirs map[
 		}
 		out.Days += est.Days
 	}
+	noteWindowFail("触发率估算", len(chunks), failed, firstErr)
 	if out.Days > 0 {
 		for th, s := range tot {
 			out.PerDay[th] = s / float64(out.Days)
@@ -218,6 +245,8 @@ func windowTriggerRate(db *store.DB, codes []string, factors []string, dirs map[
 func windowCompositeIC(db *store.DB, codes []string, factors []string, weights map[string]float64, h, min int, chunks [][2]string, dates []string, ck *winCkpt) []ICRow {
 	defs := windowDefs(factors)
 	var all []ICRow
+	failed := 0
+	var firstErr error
 	for _, w := range chunks {
 		var rows []ICRow
 		if ck.load(w, &rows) {
@@ -230,12 +259,18 @@ func windowCompositeIC(db *store.DB, codes []string, factors []string, weights m
 		}
 		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
 		if err != nil {
+			// §M-8/N-6 留痕：缺窗 IC 照常累积，但收尾必须透出降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		rows = CompositeICRange(panels, factors, weights, h, min, w[0], w[1])
 		ck.save(w, rows)
 		all = append(all, rows...)
 	}
+	noteWindowFail("复合IC", len(chunks), failed, firstErr)
 	return all
 }
 
@@ -249,6 +284,8 @@ func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min in
 		return out
 	}
 	defs := windowDefs(fids)
+	failed := 0
+	var firstErr error
 	for _, w := range chunks {
 		var winAll map[string][]ICRow
 		if ck.load(w, &winAll) && len(winAll) > 0 {
@@ -264,6 +301,11 @@ func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min in
 		}
 		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
 		if err != nil {
+			// §M-8/N-6 留痕：预筛缺窗照常 tick 推进进度带（避免看门狗误停），但失败计入降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
 			prog.tick()
 			continue
 		}
@@ -282,6 +324,7 @@ func windowICByAllFactors(db *store.DB, codes []string, fids []string, h, min in
 		ck.save(w, winAll)
 		prog.tick()
 	}
+	noteWindowFail("单因子预筛", len(chunks), failed, firstErr)
 	return out
 }
 
@@ -334,6 +377,8 @@ func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []str
 	// 装配用的因子 = base + 全部候选
 	fids := append(append([]string{}, base...), cands...)
 	defs := windowDefs(fids)
+	failed := 0
+	var firstErr error
 	for _, w := range chunks {
 		var winOut map[string][]ICRow
 		if ck.load(w, &winOut) && len(winOut) > 0 {
@@ -348,6 +393,11 @@ func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []str
 		}
 		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
 		if err != nil {
+			// §M-8/N-6 留痕：贪心缺窗的候选 IC 基于剩余窗口比较，收尾透出降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		winOut = make(map[string][]ICRow, len(cands))
@@ -363,6 +413,7 @@ func windowCompositeICForSubsets(db *store.DB, codes []string, base, cands []str
 		}
 		ck.save(w, winOut)
 	}
+	noteWindowFail("贪心子集IC", len(chunks), failed, firstErr)
 	return out
 }
 
@@ -373,6 +424,8 @@ func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs
 	defs := windowDefs(factors)
 	ck := &winCkpt{db: db, resumeKey: rk, stage: "gen"}
 	var topRets, restRets []float64
+	failed := 0
+	var firstErr error
 	for _, w := range chunks {
 		var winTR struct {
 			Top  []float64 `json:"top"`
@@ -389,6 +442,11 @@ func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs
 		}
 		panels, err := BuildPanels(db, codes, windowAsmStart(dates, w[0]), asmbEnd, defs)
 		if err != nil {
+			// §M-8/N-6 留痕：反推缺窗照常 t 检验，但失败计入降级行
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		// 逐日截面（限定窗口内日期），累积 top/rest 收益
@@ -449,6 +507,7 @@ func windowReverseExtension(db *store.DB, codes []string, factors []string, dirs
 		}
 		ck.save(w, winTR)
 	}
+	noteWindowFail("反推泛化", len(chunks), failed, firstErr)
 	if len(topRets) == 0 || len(restRets) == 0 {
 		return 0, 0, 0, 0, nan()
 	}

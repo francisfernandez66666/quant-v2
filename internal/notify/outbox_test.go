@@ -2,6 +2,8 @@
 package notify
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -288,6 +290,35 @@ type fakeGatewayOK struct{}
 
 // Send 测试桩：总是成功。
 func (fakeGatewayOK) Send(Message) error { return nil }
+
+// TestOutboxSingleWriterDurableOnStop §N-7（2026-09-22 PM 批）回归：高频入队后 Stop——
+// 旧实现 saveLocked 每次变更各起一个写协程并发 AtomicWrite 同一文件（Windows 上多个
+// rename 互相踩踏即 Access is denied → 落盘持续失败），且各协程持不同时刻快照、
+// 完成顺序无保证，盘上终态可能倒回更早的更小规模队列。现收敛为单写者 +
+// 最新快照胜出 + 退出前终刷：Stop() 返回即要求文件与内存队列全量一致。
+// English: §N-7 — Stop must leave the file equal to the full in-memory queue: the old per-change
+// writer goroutines raced on one file (Access denied on Windows) and could let an older snapshot win.
+func TestOutboxSingleWriterDurableOnStop(t *testing.T) {
+	path := t.TempDir() + "/outbox.json"
+	n := New()
+	n.SetOutboxPersistPath(path)
+	for i := 0; i < 50; i++ {
+		n.outbox.enqueue("gateway", Message{Level: LevelHigh, Title: fmt.Sprintf("t%02d", i)},
+			func(string, Message) error { return errFake{} })
+	}
+	n.outbox.Stop() // 返回=唯一落盘协程已终刷（saveWG 覆盖 loop 生命周期）
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("Stop 后应已落盘: %v", err)
+	}
+	var items []outboxPersistItem
+	if err := json.Unmarshal(data, &items); err != nil {
+		t.Fatalf("落盘内容应为合法 JSON（并发写撕裂?）: %v", err)
+	}
+	if len(items) != 50 {
+		t.Fatalf("Stop 返回时盘上队列应与内存全量一致（最新快照胜出），got %d/50", len(items))
+	}
+}
 
 // TestParseHM 验证 "HH:MM" 解析：正常时间转分钟数、非法值解析失败。
 func TestParseHM(t *testing.T) {

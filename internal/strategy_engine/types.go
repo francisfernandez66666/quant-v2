@@ -63,8 +63,8 @@ type FinancialData struct {
 	// English: §N-5 — reporting period end and announcement date. These did not exist at all, so the
 	// live scorer consumed "last row in the table" with no way to tell how stale it was. Empty means
 	// the source carried none (unknown, not "ancient").
-	EndDate string `json:"end_date,omitempty"` // 报告期（YYYY-MM-DD，如 2026-06-30）
-	AnnDate string `json:"ann_date,omitempty"` // 披露日（YYYY-MM-DD，PIT 可见性边界）
+	EndDate string `json:"end_date,omitempty"` // 报告期（YYYYMMDD，如 20260630，与研究库同格式）
+	AnnDate string `json:"ann_date,omitempty"` // 披露日（YYYYMMDD，PIT 可见性边界）
 }
 
 // StockMarketData 个股行情数据：实时价、K线、资金流向、分钟级量价/MACD等。

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"quant-trading-v2/internal/fileutil"
+	"quant-trading-v2/internal/opslog"
 )
 
 // 外发重试参数：单条最大尝试次数与退避时间上下限。
@@ -59,14 +60,27 @@ type outboxPersistItem struct {
 
 // Outbox 补投队列：惰性启动后台重试协程（首条入队时拉起），进程生命周期内有效。
 type Outbox struct {
-	mu          sync.Mutex     // 保护队列状态的互斥锁
-	items       []outboxItem   // 待补投消息条目
-	nextID      int64          // §H9 条目唯一 ID 计数器（进程内单调递增；持久化行加载时重新分配）
-	started     bool           // 后台重试协程是否已启动
-	stop        chan struct{}  // 停止后台协程的信号通道
-	owner       *Notifier      // 重建持久化条目的投递函数用（New 时绑定）
-	persistPath string         // 非空时启用磁盘持久化（重启续发）
-	saveWG      sync.WaitGroup // 追踪在途持久化写，Stop 时等待其完成以免退出后仍在重写文件
+	mu          sync.Mutex    // 保护队列状态的互斥锁
+	items       []outboxItem  // 待补投消息条目
+	nextID      int64         // §H9 条目唯一 ID 计数器（进程内单调递增；持久化行加载时重新分配）
+	started     bool          // 后台重试协程是否已启动
+	stop        chan struct{} // 停止后台协程的信号通道
+	owner       *Notifier     // 重建持久化条目的投递函数用（New 时绑定）
+	persistPath string        // 非空时启用磁盘持久化（重启续发）
+	// §N-7（2026-09-22 PM 批）落盘收敛为单写者：旧实现 saveLocked 每次变更各起一个 goroutine
+	// 做 AtomicWrite，多个 rename 并发砸同一目标文件——Windows 上目标正被另一 rename/读方
+	// 占住即 Access is denied，通知队列落盘持续失败；且 goroutine 拿锁顺序无保证，
+	// 旧快照可能后写覆盖新快照。现改为：变更只更新 pending 快照 + 给唯一落盘协程(loop)
+	// 发合并信号（dirty chan，容量 1 天然合批）。
+	// English: §N-7 — persistence collapsed to a single writer: mutations only stash the latest
+	// snapshot and signal the one loop goroutine (cap-1 dirty chan coalesces bursts), so concurrent
+	// renames of the same file (Access is denied on Windows) and old-overwrites-new snapshots are gone.
+	dirty   chan struct{}       // 容量 1：合并"请落盘"信号，仅由 loop/兜底写者消费
+	pending []outboxPersistItem // 待落盘最新快照（持锁读写）
+	saving  bool                // pending 是否有效（区分"空队列待落盘"与"无变更"）
+	saveMu  sync.Mutex          // flushPending 串行闸：loop 落盘与 Stop 兜底/无协程兜底不并发
+	saveWG  sync.WaitGroup      // 追踪落盘协程（loop 与兜底写者），Stop 时等待其退出
+	failSeq int                 // §N-7 连续落盘失败计数（计入告警节流，成功即清零）
 }
 
 // SetPersistPath 启用磁盘持久化并加载既有队列（须在首次 enqueue 前调用；文件不存在/损坏则从空队开始）。
@@ -140,8 +154,19 @@ func (o *Outbox) enqueue(kind string, msg Message, deliver func(string, Message)
 	})
 	if !o.started {
 		o.started = true
-		o.stop = make(chan struct{})
-		go o.loop(o.stop)
+		// §N-7 计数在启动方（持锁、go 之前）登记，而非 loop 协程内部：
+		// Add 落在协程内会与 Stop() 的 saveWG.Wait() 形成"Wait 已返回后才 Add"的竞态窗口。
+		// English: register the WaitGroup count in the starter (under lock, before go), not inside
+		// loop — otherwise Stop()'s Wait could observe zero and return before the goroutine Adds.
+		o.saveWG.Add(1)
+		stopCh := make(chan struct{})
+		o.stop = stopCh
+		o.dirty = make(chan struct{}, 1) // §N-7 与 loop 同生命周期：唯一落盘协程的合并信号
+		// 传局部变量而非 o.stop 字段：go 语句的实参在新协程内求值时会与 Stop() 对字段的
+		// 写形成数据竞争（-race 实测），局部副本彻底隔离。
+		// English: pass a local, not the o.stop field — evaluating the field inside the new
+		// goroutine races with Stop()'s writes (caught by -race).
+		go o.loop(stopCh)
 	}
 	o.saveLocked()
 	o.mu.Unlock()
@@ -149,15 +174,23 @@ func (o *Outbox) enqueue(kind string, msg Message, deliver func(string, Message)
 }
 
 // loop 重试主循环：每秒检查到期项，指数退避（30s 起步 ×2，封顶 10min），5 次后死信。
+// §N-7：loop 同时是持久化的唯一落盘协程——消费 dirty 合并信号做增量写，
+// 退出前（收到 stop）最后补一次 flush，保证 Stop() 返回时已入队变更全部落盘。
+// English: the loop is also the single persistence writer — it consumes coalesced dirty signals
+// and performs one final flush on stop, so everything enqueued before Stop() is on disk when it returns.
 func (o *Outbox) loop(stop chan struct{}) {
+	defer o.saveWG.Done()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
 		select {
 		case <-stop:
+			o.flushPending()
 			return
 		case <-tick.C:
 			o.pump()
+		case <-o.dirty:
+			o.flushPending()
 		}
 	}
 }
@@ -245,8 +278,11 @@ func (o *Outbox) pump() {
 	}
 }
 
-// saveLocked 变更落盘（调用方须持锁；异步原子写不阻塞推送路径）。
-// English: persists the queue asynchronously after mutations; caller holds the lock.
+// saveLocked 登记落盘请求（调用方须持锁）。§N-7：不再每次变更各起一个写协程——
+// 只把最新快照放进 pending，并给唯一落盘协程发合并信号；无在跑写者时兜底起一个
+// 短命写者（saveMu 保证任何时刻至多一个写在进行）。推送路径仍不被文件 IO 阻塞。
+// English: stashes the latest snapshot and signals the single writer (cap-1 coalescing); if no
+// writer is running, spawns a short-lived one, serialized by saveMu. The push path never blocks on IO.
 func (o *Outbox) saveLocked() {
 	if o.persistPath == "" {
 		return
@@ -258,17 +294,60 @@ func (o *Outbox) saveLocked() {
 			NextAt: it.nextAt, DeliverStr: it.kind,
 		}
 	}
+	o.pending = items // 最新快照胜出：旧快照永不后写覆盖新状态
+	o.saving = true
+	if o.started && o.dirty != nil {
+		select {
+		case o.dirty <- struct{}{}:
+		default: // 已有待处理信号——合并，loop 消费时自会取最新 pending
+		}
+		return
+	}
 	o.saveWG.Add(1)
-	go func(path string, items []outboxPersistItem) {
+	go func() {
 		defer o.saveWG.Done()
-		data, err := json.Marshal(items)
-		if err != nil {
-			return
+		o.flushPending()
+	}()
+}
+
+// flushPending 取走最新快照并原子写盘（saveMu 串行化的单写者临界区）。
+// 失败处理：连续失败只首报+每 10 次一报（防刷日志），同时经 opslog 计入当日告警——
+// 落盘持续失败意味着重启会丢补投队列（止损/清仓提醒），必须可见。
+// English: drains the pending snapshot under saveMu; failures are counted, throttled in logs and
+// escalated once per day via opslog (a stalled persistence means the restart loses retry items).
+func (o *Outbox) flushPending() {
+	// saveMu 先行：取快照+写盘整体串行，杜绝"取旧快照者后写覆盖取新快照者"的顺序倒挂
+	o.saveMu.Lock()
+	defer o.saveMu.Unlock()
+	o.mu.Lock()
+	if !o.saving {
+		o.mu.Unlock()
+		return
+	}
+	items := o.pending
+	o.pending = nil
+	o.saving = false
+	path := o.persistPath
+	o.mu.Unlock()
+	if path == "" {
+		return
+	}
+	data, err := json.Marshal(items)
+	if err != nil {
+		log.Printf("[notify][outbox] 持久化序列化失败（跳过本次落盘）: %v", err)
+		return
+	}
+	if err := fileutil.AtomicWrite(path, data, 0o600); err != nil {
+		o.failSeq++
+		if o.failSeq == 1 || o.failSeq%10 == 0 {
+			log.Printf("[notify][outbox] 持久化失败（连续第 %d 次）: %v", o.failSeq, err)
 		}
-		if err := fileutil.AtomicWrite(path, data, 0o600); err != nil {
-			log.Printf("[notify][outbox] 持久化失败: %v", err)
-		}
-	}(o.persistPath, items)
+		opslog.DayOnce("outbox-persist-fail", func() {
+			opslog.Logf("notify", "通知 outbox 落盘失败（重启将丢补投队列）: %v", err)
+		})
+		return
+	}
+	o.failSeq = 0
 }
 
 // pendingLen 待补投数量（诊断用）。

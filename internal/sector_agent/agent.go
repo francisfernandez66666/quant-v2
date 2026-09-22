@@ -102,6 +102,7 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 	}
 
 	var result []VerifiedSector
+	verifyFailed := 0 // §M-8/N-6 成分股验证失败计数（见下方注释）
 	for _, s := range sectors {
 		// 组装基础信息：方向/分数/涨跌幅/资金流/涨停数，并按状态机推断板块阶段
 		vs := VerifiedSector{
@@ -129,21 +130,34 @@ func (a *Agent) Verify(sectors []strategy_engine.SectorHot) []VerifiedSector {
 		}
 
 		// 成分股验证：按板块代码评分前 N 只成分股，取其代码作为可操作标的
+		// §M-8/N-6（2026-09-22 PM 批）：定位/评分失败不再零留痕——旧实现 err 分支什么都不做，
+		// 末尾照打「验证 N 个板块」，全部板块成分股验证挂掉与全成功输出同形。
+		// English: §M-8/N-6 — constituent verification failures are counted so the summary line
+		// degrades visibly instead of the old unconditional "verified N sectors".
 		if a.scanner != nil {
 			sectorsInfo := a.scanner.FindSectorsByNames([]string{s.Name})
 			if len(sectorsInfo) > 0 {
 				stocks, err := a.scanner.ScoreSectorStocks(sectorsInfo[0].Code, a.constituentTopN)
-				if err == nil {
-					for _, st := range stocks {
-						vs.Stocks = append(vs.Stocks, st.Code)
-					}
+				if err != nil {
+					verifyFailed++
+					log.Printf("[sector_agent] 板块 %s 成分股评分失败（本板块标的置空）: %v", s.Name, err)
 				}
+				for _, st := range stocks {
+					vs.Stocks = append(vs.Stocks, st.Code)
+				}
+			} else {
+				verifyFailed++
+				log.Printf("[sector_agent] 板块 %s 在板块池中定位失败（本板块标的置空）", s.Name)
 			}
 		}
 
 		result = append(result, vs)
 	}
 
-	log.Printf("[sector_agent] 验证 %d 个板块 (%s)", len(result), sectors[0].Direction)
+	if verifyFailed > 0 {
+		log.Printf("[sector_agent] 验证 %d 个板块降级（%d 个成分股验证失败，%s）", len(result), verifyFailed, sectors[0].Direction)
+	} else {
+		log.Printf("[sector_agent] 验证 %d 个板块 (%s)", len(result), sectors[0].Direction)
+	}
 	return result
 }

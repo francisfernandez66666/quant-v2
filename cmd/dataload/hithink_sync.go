@@ -61,11 +61,16 @@ func cmdHithinkSync(db *store.DB, args []string) {
 		return
 	}
 	if *kind == "valuations" {
-		cmdHithinkSyncValuations(client, db)
+		// §M-8：降级错误在此转成非零退出（旧版失败批次只打日志，exit 0 骗过调度器）
+		if err := cmdHithinkSyncValuations(client, db); err != nil {
+			log.Fatalf("[hithink] %v", err)
+		}
 		return
 	}
 	if *kind == "fin-indicators" {
-		cmdHithinkSyncFinIndicators(client, db, fs.Args())
+		if err := cmdHithinkSyncFinIndicators(client, db, fs.Args()); err != nil {
+			log.Fatalf("[hithink] %v", err)
+		}
 		return
 	}
 
@@ -373,21 +378,29 @@ func deref(s *string) string {
 
 // cmdHithinkSyncValuations 全市场估值快照批量入库（§E）。
 // 从 ths_daily 取全部标的，100 只/批分页调 API；trade_date=今日。
-func cmdHithinkSyncValuations(client *data.HithinkClient, db *store.DB) {
+// §M-8/N-6（2026-09-22 PM 批）：批次失败不再"跳过仍报完成"——计失败数，>0 时返回
+// 降级错误由调用方非零退出（旧实现全批挂掉也只打"同步完成 0 只"且 exit 0）。
+// English: §M-8/N-6 — batch failures are counted; any failure returns a degraded error so the
+// process exits non-zero instead of the old "sync complete" + exit 0.
+func cmdHithinkSyncValuations(client *data.HithinkClient, db *store.DB) error {
 	codes, cerr := db.ThsAllCodes()
 	if cerr != nil {
 		log.Fatalf("读标的清单失败: %v", cerr)
 	}
 	tradeDate := time.Now().Format("20060102")
 	total := 0
+	failed := 0
+	batches := 0
 	batchSize := 100
 	for i := 0; i < len(codes); i += batchSize {
 		end := i + batchSize
 		if end > len(codes) {
 			end = len(codes)
 		}
+		batches++
 		items, err := client.ValuationsSnapshot(codes[i:end])
 		if err != nil {
+			failed++
 			log.Printf("[hithink] 估值批次 %d-%d 失败(跳过): %v", i, end, err)
 			continue
 		}
@@ -400,17 +413,29 @@ func cmdHithinkSyncValuations(client *data.HithinkClient, db *store.DB) {
 			})
 		}
 		if _, uerr := db.UpsertThsValuations(rows); uerr != nil {
+			failed++
 			log.Printf("[hithink] 估值写入失败(跳过): %v", uerr)
 			continue
 		}
 		total += len(rows)
 	}
+	if failed > 0 {
+		return fmt.Errorf("估值快照同步降级：%d/%d 批失败，仅 %d 只入库（trade_date=%s，当日估值不完整）",
+			failed, batches, total, tradeDate)
+	}
 	log.Printf("[hithink] 估值快照同步完成：%d 只（trade_date=%s）", total, tradeDate)
+	return nil
 }
 
 // cmdHithinkSyncFinIndicators 财务指标同步：对 --codes 指定池内标的逐个拉取
 // 最近年报+最新季报的指标入库。codesFile 每行一个 ts_code。
-func cmdHithinkSyncFinIndicators(client *data.HithinkClient, db *store.DB, args []string) {
+// §M-8/N-6（2026-09-22 PM 批）：旧实现拉取失败 `continue` 零留痕、写入失败
+// `uerr == nil` 直接丢弃计数分支，末了照打"同步完成 N 条"且 exit 0——断供当晚
+// 与满盘成功在退出码/文案上完全同形。现按拉取/写入两类分别计数并全部透出，
+// 任一 >0 即降级返回错误（非零退出）。
+// English: §M-8/N-6 — fetch and write failures are each counted and surfaced; any failure makes
+// this return a degraded error (non-zero exit) instead of the old unconditional "complete" + exit 0.
+func cmdHithinkSyncFinIndicators(client *data.HithinkClient, db *store.DB, args []string) error {
 	fs := flag.NewFlagSet("fin-indicators", flag.ExitOnError)
 	codesFile := fs.String("codes", "", "标的清单文件（每行一个 thscode，如 600519.SH）")
 	year := fs.Int("year", time.Now().Year(), "报告期年份")
@@ -436,14 +461,21 @@ func cmdHithinkSyncFinIndicators(client *data.HithinkClient, db *store.DB, args 
 	for _, r := range strings.Split(*reports, ",") {
 		repNums = append(repNums, strings.TrimSpace(r))
 	}
-	// 逐标的逐报告期拉取财务指标并组装入库，单次失败静默跳过。
+	// 逐标的逐报告期拉取财务指标并组装入库；失败不再静默——分类计数后统一透出。
 	total := 0
+	fetchErrs := 0
+	writeErrs := 0
+	var firstFetchErr string
 	for _, code := range codes {
 		for _, rn := range repNums {
 			report := fmt.Sprintf("%d-%s", *year, rn)
 			fi, err := client.FinancialIndicators(code, report)
 			if err != nil {
-				continue // 无数据/未披露静默跳过
+				fetchErrs++
+				if firstFetchErr == "" {
+					firstFetchErr = fmt.Sprintf("%s %s: %v", code, report, err)
+				}
+				continue // 无数据/未披露与真实故障在此无法区分，一律计入失败数
 			}
 			var rows []store.ThsFinIndicatorRow
 			for _, ab := range fi.Abilities {
@@ -454,10 +486,18 @@ func cmdHithinkSyncFinIndicators(client *data.HithinkClient, db *store.DB, args 
 					})
 				}
 			}
-			if _, uerr := db.UpsertThsFinIndicators(rows); uerr == nil {
-				total += len(rows)
+			if _, uerr := db.UpsertThsFinIndicators(rows); uerr != nil {
+				writeErrs++
+				log.Printf("[hithink] 财务指标写入失败 %s %s: %v", code, report, uerr)
+				continue
 			}
+			total += len(rows)
 		}
 	}
+	if fetchErrs+writeErrs > 0 {
+		return fmt.Errorf("财务指标同步降级：入库 %d 条（%d 只 × %d 报告期），拉取失败 %d 次（首例：%s）、写入失败 %d 次——财务数据可能不完整",
+			total, len(codes), len(repNums), fetchErrs, firstFetchErr, writeErrs)
+	}
 	log.Printf("[hithink] 财务指标同步完成：%d 条（%d 只 × %d 报告期）", total, len(codes), len(repNums))
+	return nil
 }

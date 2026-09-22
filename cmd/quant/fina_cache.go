@@ -29,6 +29,8 @@ type finaCache struct {
 	mu sync.Mutex
 	// cache 各股最新财务指标缓存（键为 ts_code）
 	cache map[string]*cacheEntry
+	// staleSeen §M-7：已告警过的过旧股（限制每票一条 log，防 5s 循环刷屏）
+	staleSeen map[string]bool
 }
 
 // cacheEntry 一条财务缓存。
@@ -43,13 +45,49 @@ type cacheEntry struct {
 // newFinaCache 创建财务查询缓存。
 // English: creates a financial lookup cache.
 func newFinaCache(db *store.DB) *finaCache {
-	return &finaCache{db: db, cache: make(map[string]*cacheEntry)}
+	return &finaCache{db: db, cache: make(map[string]*cacheEntry), staleSeen: make(map[string]bool)}
+}
+
+// finaStaleMaxDays §M-7（2026-09-22 PM 批）：财务报告期最大可容忍滞后（日历天）。
+// A 股披露规则下最长寿的合法空窗 ≈140 天（1231 年报 → 次年 430 披露截止；Q3 与年报
+// 交接期同理），240 天留足保护带：只有研究库 fina_indicator 真断更才会触发，
+// 不误伤合法迟披露的个股。
+// English: max tolerated report lag in calendar days; 240 sits well above the ~140-day
+// legitimate disclosure-gap ceiling, so only a stalled research sync trips it.
+const finaStaleMaxDays = 240
+
+// finaReportStale 判定一条财务数据的报告期是否过旧（§M7 停用闸，true=过旧）。
+// ann_date（披露日，PIT 可见边界）优先，缺失退回 end_date；两者皆缺按「不可知」放行
+// ——§N-5 语义：不把数据没支撑的判定做过头。日期非法同样按不可知处理。
+// English: stale iff the newest known report date (ann_date preferred, end_date fallback) is
+// older than finaStaleMaxDays; absent/undecodable dates pass as "unknown", never auto-block.
+func finaReportStale(f *strategy_engine.FinancialData, now time.Time) (bool, string) {
+	if f == nil {
+		return false, ""
+	}
+	d := f.AnnDate
+	if len(d) != 8 {
+		d = f.EndDate
+	}
+	if len(d) != 8 {
+		return false, ""
+	}
+	t, err := time.Parse("20060102", d)
+	if err != nil {
+		return false, ""
+	}
+	if now.Sub(t) > finaStaleMaxDays*24*time.Hour {
+		return true, d
+	}
+	return false, d
 }
 
 // Lookup 返回某股最新财务指标（缺失/查库失败返回 nil）。
 // code 支持 6 位（600519）或带后缀（600519.SH）两种格式，统一映射到研究库 ts_code（XXXXXX.SH/SZ/BJ）。
-// English: returns a stock's latest financials, or nil when missing/error. Accepts both 6-digit
-// (600519) and suffixed (600519.SH) codes, normalizing to the research DB ts_code format.
+// §M-7：报告期滞后超 finaStaleMaxDays 的旧财报**停用**（按缺失计入打分并告警）——
+// 研究库断更时打分不再照用半年前的财报且无人知晓。
+// English: returns a stock's latest financials, or nil when missing/error. Since §M-7 a report
+// older than finaStaleMaxDays is refused (scored as missing) with a throttled opslog alert.
 func (c *finaCache) Lookup(code string) *strategy_engine.FinancialData {
 	ts := normalizeTSCode(code)
 	if ts == "" {
@@ -97,6 +135,26 @@ func (c *finaCache) Lookup(code string) *strategy_engine.FinancialData {
 				// freshness gates can tell how stale this row actually is.
 				EndDate: last.EndDate,
 				AnnDate: last.AnnDate,
+			}
+			// §M-7（2026-09-22 PM 批）报告期过旧 → 停用：按缺失计入（缓存 nil 10 分钟，
+			// 与真缺失同语义），并留痕告警。研究库断更时打分不再静默照用半年前的财报。
+			// English: §M-7 — a stale report is refused (cached as missing like a real miss)
+			// with a per-stock log line plus throttled opslog alert.
+			if stale, asof := finaReportStale(fina, time.Now()); stale {
+				c.mu.Lock()
+				if c.staleSeen == nil {
+					c.staleSeen = make(map[string]bool)
+				}
+				first := !c.staleSeen[ts]
+				c.staleSeen[ts] = true
+				c.mu.Unlock()
+				if first {
+					log.Printf("[fina] %s 报告期过旧（asof %s > %d 天），财务因子停用（按缺失计入打分）", ts, asof, finaStaleMaxDays)
+				}
+				opslog.DayOnce("fina-stale-report", func() {
+					opslog.Logf("quant", "财务因子新鲜度闸触发：%s 报告期 %s 滞后超 %d 天，已停用并按缺失计入（研究库 fina_indicator 可能断更）", ts, asof, finaStaleMaxDays)
+				})
+				fina = nil
 			}
 		}
 	}
