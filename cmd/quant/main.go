@@ -49,6 +49,7 @@ import (
 	"quant-trading-v2/internal/engine"
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/llmcfg"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/newsagent"
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
@@ -140,10 +141,11 @@ func main() {
 	// §P1-6 配置热重载：每分钟轮询 config.json，内容变更自动重载（无需重启）。
 	cfgMgr.Watch(context.Background(), 60*time.Second)
 
-	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN）：primary_source=hithink 时回测取数优先 ths_ 表。
-	// 两个包级开关是回测/存储层读取数据源的路由信号，由 config.json 的 rules.data 段驱动。
-	store.PrimarySourceThsDaily = strings.EqualFold(cfgMgr.Rules.Data.PrimarySource, "hithink")
-	store.ThsFactorsReady = cfgMgr.Rules.Data.ThsFactorsReady
+	// §数据源路由装配（§HITHINK_DATA_SOURCE_PLAN + §ADJ P0-A 三轮补强）：
+	// primary_source=hithink 时回测取数优先 ths_ 表。路由开关已收为 store 包内私有，
+	// 这里是**唯一写入口 ConfigureSource**（禁止各 main 自己 set 包级变量），
+	// "hithink" 的大小写匹配语义也只在该函数里实现一次。
+	store.ConfigureSource(cfgMgr.Rules.Data.PrimarySource, cfgMgr.Rules.Data.ThsFactorsReady)
 
 	// §GAP3.1 运行时交易日历：后台拉取法定节假日/临时休市日（失败按周末口径兜底，不阻断启动）。
 	data.LoadTradingCalendarAsync()
@@ -371,6 +373,21 @@ func main() {
 	srv.SetFetcher(fetcher)   // 报价接口优先读 5s 快照，缺失再降级拉取
 	srv.SetCoordinator(dc)    // HTTP 展示层统一走该降级链，保证跨页价格一致
 	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
+	// §高-3（2026-09-23 修复批）指标型告警出口接线。此前 internal/metrics 的评估器只
+	// `log.Printf` 一条就返回，9 条指标规则**从不出站**（R7 验收单 D1/维5 却打了 ✅，属
+	// 「声称已做」）。路由表与冷却窗在 metrics 包内自持（必推 5 条 / 日汇总 4 条），这里
+	// 只提供出口闭包：p1→LevelHigh 走既有高优通道、其余→LevelMedium。
+	// 一律经 Push —— M8 已把 WS/Webhook/推送网关三路内聚在 Push 里，绝不再直调
+	// PushGateway，否则就是当日「双发」事故的同族复犯。
+	// English: wires the metrics alert egress (previously evaluation-only). p1 maps to
+	// LevelHigh; everything goes through Push, never PushGateway (M8 already fans out 3 channels).
+	metrics.SetAlertSink(func(d metrics.AlertDelivery) {
+		lvl := notify.LevelMedium
+		if d.Level == "p1" {
+			lvl = notify.LevelHigh
+		}
+		notifier.Push(notify.Message{Level: lvl, Title: d.Title, Content: d.Body})
+	})
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
 
 	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选

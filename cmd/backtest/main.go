@@ -43,6 +43,7 @@ import (
 	"quant-trading-v2/internal/report"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
+	"quant-trading-v2/internal/store" // §ADJ P0-A：仅用于数据源路由装配（ConfigureSource 唯一写入口）
 	"quant-trading-v2/internal/strategy_engine"
 )
 
@@ -152,6 +153,10 @@ func parseFlags() (*backtestOptions, error) {
 		cfgPath = filepath.Join(*dataDir, "config.json")
 	}
 	cfgMgr := config.NewManager(cfgPath)
+	// §数据源路由装配（§ADJ P0-A 三轮补强）：与 cmd/quant 完全同一条入口 store.ConfigureSource
+	// （路由变量已收为 store 包内私有，各 main 不再自己 set），保证本工具与常驻引擎
+	// 读到同一套复权体系；配置路径就是上面的 cfgPath，不另起一套约定。
+	store.ConfigureSource(cfgMgr.Rules.Data.PrimarySource, cfgMgr.Rules.Data.ThsFactorsReady)
 	if *configRaw != "" {
 		log.Printf("[backtest] 已加载全量配置: %s", cfgPath)
 	}

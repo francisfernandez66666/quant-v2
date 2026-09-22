@@ -169,8 +169,11 @@ export default function Dashboard() {
     try {
       const st = await api.fetchQMTState()
       if (qmtGuard.current.isStale(token)) return
-      setQMTState(st)
-    } catch (e) { /* 接口异常不影响整页 */ }
+      // §N-1（2026-09-22 傍晚批）此前误写成 setQMTState（声明是 :111 的 setQmtState），
+      // ReferenceError 被下面的空 catch 吞掉 → qmtState 恒 null → 「实盘链路」指示永不渲染，
+      // 且 15s 轮询每 tick 静默抛一次。改名归位 + catch 不再声明未使用的形参。
+      setQmtState(st)
+    } catch { /* 接口异常不影响整页 */ }
   }
 
   // §M-9（2026-09-22 修复批）三个健康端点独立拉取函数：随 load() 进入 10s 轮询。

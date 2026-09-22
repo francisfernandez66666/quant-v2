@@ -515,7 +515,7 @@ python3 - <<'PY' || { echo "--- FAIL: shell 脚本存在「变量名后紧跟非
 import pathlib, re, sys
 pat = re.compile(r'\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7F])')
 bad = []
-for p in sorted(pathlib.Path('scripts').rglob('*.sh')):
+for p in sorted(list(pathlib.Path('scripts').rglob('*.sh')) + list(pathlib.Path('deploy').rglob('*.sh'))):
     for i, line in enumerate(p.read_text(encoding='utf-8').splitlines(), 1):
         if line.lstrip().startswith('#'):
             continue
@@ -1195,6 +1195,225 @@ for f in Dashboard Signals Positions; do
 	grep -q 'isStale(' "web/src/pages/$f.jsx" || { echo "--- FAIL: §M-10 $f 页只建守卫不用（begin/isStale 半接线）"; exit 1; }
 done
 echo "ok - §清扫批 专项守卫通过（行为锁 5 组 + 静态锁 12 道 + 负锁 4 道）"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 57~68：2026-09-22 傍晚/夜间审计批（AUDIT_REPORT_20260922EVE + FIX_PLAN_20260922EVE）
+# 编号说明：FIX_PLAN 施工时把本节占位写作「锁 57~66」，实际落地为 57~68 共 12 节。
+# English: sections 57-68 lock the 2026-09-22 evening batch fixes (P0-A/B/C, N-1..N-8, 高-3).
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "==> 57 §ADJ 后复权因子前向填充 + 数据源路由唯一入口（傍晚批 P0-A）..."
+# 现象：adj_factor 是【事件稀疏】表（只在分红实施日有行），HfqBars 却按「因子日==行情日」等值
+# LEFT JOIN → 非除权日全部落空 → COALESCE 兜成 1 → 后复权价退化为不复权价，回测/因子/图表全链路
+# 失真且零报错。路由开关（PrimarySourceThsDaily/ThsFactorsReady）曾是包级导出变量，装配点只有
+# cmd/quant ⇒ researchd/dataload/replay/backtest/research 各自按默认值（旧表）跑，同一份数据
+# 两条口径。修法：前向填充子查询（与 LegacyAdjFactorAt 语义同源）+ 开关收私有、唯一入口装配。
+go test -count=1 ./internal/store/ -run 'TestHfqBarsAdj|TestConfigureSourceSingleEntry' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'ORDER BY a.trade_date DESC LIMIT 1), 1) AS adj' internal/store/store.go || { echo "--- FAIL: §P0-A 因子前向填充子查询丢失（后复权又退化成不复权）"; exit 1; }
+# 负锁：baostock 侧 daily×adj_factor 的等值 JOIN 绝迹。ths 侧（ths_adj_factor 日累计全覆盖表）
+# 等值语义正确，由 allow-legacy-adj-join-eq 显式豁免——把两个同名 JOIN 一起判红会造出永久性假红。
+if grep -qE 'FROM daily d LEFT JOIN adj_factor a ON a\.ts_code=d\.ts_code AND a\.trade_date=d\.trade_date' internal/store/store.go; then
+	echo "--- FAIL: §P0-A 旧等值 JOIN 复活（除权日之外因子恒为 1）"; exit 1; fi
+[ "$(grep -c 'trade_date=b\.trade_date' internal/store/store.go)" -eq 1 ] || { echo "--- FAIL: 等值因子 JOIN 处数≠1（ths 日累计表那一处之外又冒出一处），§P0-A"; exit 1; }
+# 路由唯一入口：导出变量形态绝迹 + 任何进程不得直改 + 装配点覆盖 8 个入口文件。
+if grep -rqE '^var (PrimarySourceThsDaily|ThsFactorsReady) ' internal/store/*.go; then
+	echo "--- FAIL: 路由开关又被导出成包级变量（cmd 可绕过唯一入口裸赋值，§P0-A）"; exit 1; fi
+if grep -rn 'store\.PrimarySourceThsDaily\|store\.ThsFactorsReady' --include='*.go' cmd internal 2>/dev/null | grep -q .; then
+	echo "--- FAIL: 又出现 store.PrimarySourceThsDaily 直改（§P0-A 唯一入口失效）"; exit 1; fi
+[ "$(grep -rlE 'store\.ConfigureSource' --include='*.go' cmd internal | wc -l | tr -d ' ')" -ge 8 ] || { echo "--- FAIL: 路由装配点 < 8 个文件（有进程又走默认旧表口径）"; exit 1; }
+echo "ok - §ADJ 专项守卫通过（行为锁 3 例 + 静态锁 5 道 + 负锁 3 道）"
+
+echo "==> 58 §PARTFILL 部成在途按未成交余量占额（傍晚批 N-3）..."
+# 现象：卖出「剩余量 = 持仓 − Σ已成交 − 在途量」里的在途量按**整笔委托量**计，部成 500/1000 的
+# 单子既进了 Σ已成交、又整笔留在在途里 = 同一段成交被扣两次 → 补卖量被压成 0/半量，该退的仓位
+# 留过夜（止损单尤其致命）。修法：在途按净额（qty − 该单 fills 之和）计，成交归属 order_id 或
+# signal_id 双键（order_id 回填失败时行仍是 pend: 前缀，只按 order_id 关联恒得 0 → 又退化整笔）。
+go test -count=1 ./internal/engine/ -run 'TestN3' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/store/ -run 'TestSumOpenSellQty|TestRealPosition' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'COALESCE((SELECT SUM(f.qty) FROM fills f' internal/store/real_positions.go || { echo "--- FAIL: §N-3 在途净额子查询丢失（又按整笔委托量占额，部成单被双扣）"; exit 1; }
+# 双键归属（order_id OR signal_id）必须在位：只按 order_id 是本缺陷的隐蔽半态。
+grep -q "OR (o.signal_id <> '' AND f.signal_id = o.signal_id)" internal/store/real_positions.go || { echo "--- FAIL: §N-3 成交归属又只认 order_id（pend: 占位行恒得 0 成交）"; exit 1; }
+# 净额下限钳 0：负在途量会把剩余量抬高 → 超卖敞口。
+grep -q 'if remain := qty - filled; remain > 0' internal/store/real_positions.go || { echo "--- FAIL: §N-3 负在途量钳 0 丢失（filled>qty 异常行会抬高剩余量）"; exit 1; }
+# 查询失败必须留痕（本函数是卖出剩余量与 T+1 可卖量两道闸的共同输入，静默回 0 = 两道闸同盲）。
+grep -q '§N-3 在途卖量查询失败' internal/store/real_positions.go || { echo "--- FAIL: §N-3 fail-open 又静默（降级不得无痕迹）"; exit 1; }
+echo "ok - §PARTFILL 专项守卫通过（行为锁 2 组 + 静态锁 4 道）"
+
+echo "==> 59 §COSTBASIS 对账不得用不含费成本覆盖本地含费账（傍晚批 N-6）..."
+# 现象：柜台/网关快照的 cost_price 是**不含手续费**口径（券商摊薄算法另算），旧 Reconcile 无条件
+# 用快照值裸写本地 cost_price/amount → 本地含费成本被洗成不含费，且**字段缺失时把成本清零并永久
+# 落库**；下游 ProfitPct 从虚低成本起算 → 止损/止盈判定线整体错位（资金安全，非显示问题）。
+# 裁决 11：本地含费基准优先；快照仅在本地为 0 时回填；丢弃必须留痕（CostGuardDrops + loud log）。
+go test -count=1 ./internal/trading/ -run 'TestN6' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+[ "$(grep -c 'cost_price=CASE WHEN real_positions.cost_price > 0' internal/store/real_positions.go)" -ge 2 ] || { echo "--- FAIL: §N-6 成本守卫只在一处生效（另一条对账写路径又裸覆盖）"; exit 1; }
+[ "$(grep -c 'amount=(CASE WHEN real_positions.cost_price > 0' internal/store/real_positions.go)" -ge 2 ] || { echo "--- FAIL: §N-6 amount 未与成本同源（数量×新成本，账实自相矛盾）"; exit 1; }
+grep -q 'func (d \*DB) CostGuardDrops()' internal/store/real_positions.go || { echo "--- FAIL: §N-6 丢弃计数丢失（静默保护也算静默失效）"; exit 1; }
+# 负锁：快照成本直写形态（SET cost_price=?）绝迹。
+if grep -nE 'SET[[:space:]]+cost_price=\?[[:space:]]*,?[[:space:]]*amount=\?' internal/store/real_positions.go | grep -q .; then
+	echo "--- FAIL: §N-6 又出现 cost_price=? 裸写（快照不含费值覆盖本地含费账）"; exit 1; fi
+echo "ok - §COSTBASIS 专项守卫通过（行为锁 2 例 + 静态锁 3 道 + 负锁 1 道）"
+
+echo "==> 60 §LIVEANCHOR 移动止盈锚点回写落账（傍晚批 N-7）..."
+# 现象：移动止盈锚点（持仓期最高价）只活在 signalctl 内存态，实盘三本账（positions/paper/anchors）
+# 不记 ⇒ 引擎重启即把锚点退回「建仓价」，回撤容忍度被重置为满格——重启后一波正常回撤直接触发
+# 卖出，或该止盈的票永不止盈。修法：裁决时回读 ctl.SellHighAnchor 写回本地持仓，回写失败只留痕
+# 不阻断裁决（宁可锚点滞后，不可交易停摆）。
+go test -count=1 ./internal/engine/ -run 'TestN7' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'func (c \*Controller) SellHighAnchor(' internal/signalctl/sell.go || { echo "--- FAIL: §N-7 锚点回读接口丢失（内存态无处落地）"; exit 1; }
+grep -q 'ctl.SellHighAnchor(signalctl.ChannelLive' internal/engine/sell_anchor.go || { echo "--- FAIL: §N-7 实盘锚点回写未被调用（定义了个寂寞）"; exit 1; }
+echo "ok - §LIVEANCHOR 专项守卫通过（行为锁 2 例 + 静态锁 2 道）"
+
+echo "==> 61 §CLAIMRELEASE 占位释放不得拆掉幂等防线 + 测试静音卫生（傍晚批 N-8）..."
+# 现象：桥通道「入队即成功」，随后 ids.settle 抛错时 finally 无条件 _release_order_claim 删占位
+# = 把 orders.signal_id UNIQUE 这条**唯一**幂等防线拆掉；调用方重试再次 claim 成功，而 dispatch
+# 表当时没有 signal_id 约束 → 同信号第二笔入队 = 双卖/双买。修法：未交给通道才删占位（§M-2 原
+# 语义保留），已交给通道转第三态「待核对」+ 同 sid 一律 409 + error 告警 + 超时清理不碰第三态，
+# 收敛出口＝回报到达或 POST /admin/order-confirm；dispatch 侧另有部分唯一索引做 DB 层纵深。
+py_tests qmt_gateway/tests/test_claim_release.py
+grep -q 'UNRESOLVED_STATUS = "待核对"' qmt_gateway/store.py || { echo "--- FAIL: §N-8 第三态常量丢失（又回到删占位）"; exit 1; }
+grep -q 'def release_unresolved_pending' qmt_gateway/store.py || { echo "--- FAIL: §N-8 人工收敛出口丢失（待核对成为死态）"; exit 1; }
+grep -q "_ensure_dispatch_signal_guard" qmt_gateway/store.py || { echo "--- FAIL: §N-8 dispatch signal_id 纵深唯一索引丢失"; exit 1; }
+grep -q 'def _alert_unresolved_pending' qmt_gateway/gateway.py || { echo "--- FAIL: §N-8 待核对告警丢失（挂起态无人知晓）"; exit 1; }
+# 负锁：超时清理只认 status='pending'，不得把第三态当陈旧占位删掉（删了就等于回到旧缺陷）。
+if grep -nE "DELETE FROM orders WHERE status[[:space:]]+IN[[:space:]]*\([^)]*待核对" qmt_gateway/store.py | grep -q .; then
+	echo "--- FAIL: §N-8 超时清理又把「待核对」当陈旧占位删除"; exit 1; fi
+# 测试卫生锁（本批真实踩坑）：同目录别的模块在 import 期 logging.disable(CRITICAL)，pytest 单进程
+# 收集后 assertLogs 会假阴性——**凡是断言日志的测试类必须逐个继承 _LogCaptureMixin**，
+# 并按「日志断言处数」核对（只数类数会放过「整类一条断言都没挂 mixin」的形态）。
+LOG_ASSERTS=$(grep -cE 'self\.assertLogs\(' qmt_gateway/tests/test_claim_release.py)
+MIXED_CLASSES=$(grep -cE '^class Test[A-Za-z0-9_]*\(_LogCaptureMixin\)' qmt_gateway/tests/test_claim_release.py)
+BARE_LOG=$(awk '/^class Test/{inh=($0 ~ /_LogCaptureMixin/)} /self\.assertLogs\(/{if (!inh) n++} END{print n+0}' qmt_gateway/tests/test_claim_release.py)
+[ "$LOG_ASSERTS" -gt 0 ] && [ "$MIXED_CLASSES" -gt 0 ] || { echo "--- FAIL: §N-8 日志卫生 mixin 或断言丢失（$MIXED_CLASSES/${LOG_ASSERTS}）"; exit 1; }
+[ "$BARE_LOG" -eq 0 ] || { echo "--- FAIL: §N-8 有 $BARE_LOG 处 assertLogs 挂在未继承 _LogCaptureMixin 的类里（全局静音下会假绿）"; exit 1; }
+echo "ok - §CLAIMRELEASE 专项守卫通过（行为锁 1 套 + 静态锁 4 道 + 负锁 1 道 + 卫生锁 1 道）"
+
+echo "==> 62 §DISCIPLINE 延持态终失明止血 + 重评估非对称守卫（傍晚批 P0-C 走 B）..."
+# 现象：纪律引擎一旦置位 Settled&&!Confirmed（延持），下一轮直接 early-return 不再出卡，
+# 价格继续跌破更深一档线也视而不见 = 终态失明（该走的仓位永远不走）。修法：延持态每轮重评估，
+# 出卡需「本轮仍破线且不轻于原始锁定线」（reevalAllowsSettle）；反向情形（止损延持后反弹进止盈
+# 区）一律不收卡，避免把失明换成「按反弹后的止盈价挂止损标签卖」。
+go test -count=1 ./internal/trading/ -run 'TestDiscipline' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'func reevalAllowsSettle(' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 重评估准入判据丢失"; exit 1; }
+grep -q 'if extendHold && !reevalAllowsSettle(st.Line, line)' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 准入判据未被调用（定义了个寂寞）"; exit 1; }
+grep -q 'func isLossLine(' internal/trading/discipline.go || { echo "--- FAIL: §P0-C 损失族判定丢失（止盈延持跌进损失线无法识别）"; exit 1; }
+# 负锁：延持态无条件 early-return 的旧形态绝迹（同族教训：只在注释里说改过、代码没改）。
+if grep -nE 'if st\.Settled && !st\.Confirmed \{[[:space:]]*return' internal/trading/discipline.go | grep -q .; then
+	echo "--- FAIL: §P0-C 延持态又无条件 early-return（终态失明复活）"; exit 1; fi
+echo "ok - §DISCIPLINE 专项守卫通过（行为锁 3 例 + 静态锁 3 道 + 负锁 1 道）"
+
+echo "==> 63 §ALERTROUTE 指标型告警出口接线（傍晚批 高-3 收窄版）..."
+# 现象：内部指标告警（9 条规则）只写内存/日志，生产无任何推送出口 = 等价于没有告警；
+# 同时缺「推给谁、多久推一次、恢复通知配对」的显式路由。修法：AlertRoute(push/daily/log) +
+# 冷却（P1 30min / 其余 10min）+ 日切汇总 + SetAlertSink 注入；未注入 sink 时 loud warn
+# （告警系统自己哑了必须吵）。范围按 owner 裁决收窄：只接指标型，事件型不动。
+go test -count=1 ./internal/metrics/ -run 'TestPushRule|TestResolved|TestDailySummary|TestUnwiredSink|TestSinkReceives|TestRoutingCovers|TestRunAlertEvaluation|TestConfigureAlertRouting' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -race -count=1 ./internal/metrics/ 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q 'func DefaultAlertRouting()' internal/metrics/alert_routing.go || { echo "--- FAIL: §高-3 默认路由表丢失（规则无出口）"; exit 1; }
+grep -q 'metrics.SetAlertSink(' cmd/quant/main.go || { echo "--- FAIL: §高-3 生产进程未注入 sink（路由表成为死码）"; exit 1; }
+grep -q 'AlertSinkInjected()' internal/metrics/alert_routing.go || { echo "--- FAIL: §高-3 未接线自检丢失"; exit 1; }
+echo "ok - §ALERTROUTE 专项守卫通过（行为锁 8 例 + -race + 静态锁 3 道）"
+
+echo "==> 64 §CFGSMASH 战法参数稀疏 merge + 版本戳 + 并发加锁（傍晚批 N-4/中-6）..."
+# 现象（三重叠加，缺一不至于丢参数）：① 前端加载失败被 catch 吞 → 表单落在空对象；
+# ② 数字字段 `?? 0` 把「键缺失」渲染成 0（缺失与真实 0 混同）；③ 后端把 body 反序列化成完整
+# StrategyConfig 后**全量替换**落盘 ⇒ 一次「加载失败 + 保存」即把五套战法阈值清零、重启救不回。
+# 另：GetStrategyConfig 返回内部指针、Set 系无锁写 map，与打分/热更新并发（-race 已复现）。
+# 修法：逐字段 JSON 递归稀疏 merge（没传=保留旧值，要清 0 请明写 0）+ updated_at 乐观锁 409
+# + 全部 getter 改快照拷贝、setter 加锁 + 前端缺失渲空并保存前必填校验。
+go test -count=1 ./internal/config/ -run 'TestMergeStrategyConfig|TestSetStrategyConfig|TestStrategyConfigSaveWhileScoringRace' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -race -count=1 ./internal/config/ 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/server/ -run 'TestSetStrategyConfig' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+( cd web && npm test -- n4_cfg_smash )
+grep -q 'func (m \*Manager) MergeStrategyConfig(patch map\[string\]json.RawMessage' internal/config/config.go || { echo "--- FAIL: §N-4 稀疏 merge 入口签名变更（回到整 struct 反序列化=缺键即清零）"; exit 1; }
+grep -q 'var ErrStrategyVersionConflict' internal/config/config.go || { echo "--- FAIL: §中-6 乐观锁哨兵错误丢失"; exit 1; }
+[ "$(grep -c 'next.UpdatedAt = time.Now().UTC()' internal/config/config.go)" -ge 3 ] || { echo "--- FAIL: 版本戳推进点 < 3 处（有写路径不刷新 updated_at，409 形同虚设）"; exit 1; }
+# 负锁 1：handler 又整份反序列化到 StrategyConfig（全量替换形态）——函数体内必须仍有 RawMessage 稀疏 merge。
+if ! grep -q 'json.RawMessage' <(sed -n '/func (s \*Server) handleSetStrategyConfig/,/^}/p' internal/server/server.go); then
+	echo "--- FAIL: §N-4 handleSetStrategyConfig 不再走稀疏 merge（缺键清零复活）"; exit 1; fi
+# 负锁 2：前端 renderField 的 `?? 0` 兜底绝迹（缺失渲染成 0 是本缺陷的第二重）。
+if grep -nE '\?\? 0[[:space:]]*\}[[:space:]]*$|value=\{[^}]*\?\? 0\}' web/src/pages/Settings.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: §N-4 前端又用 ?? 0 渲染缺失字段（空表单被提交成全 0）"; exit 1; fi
+echo "ok - §CFGSMASH 专项守卫通过（行为锁 4 组含 -race + 静态锁 3 道 + 负锁 2 道）"
+
+echo "==> 65 §NOTIFYADMIN 全局推送探测端点抬档 + 频控（傍晚批 N-2）..."
+# 现象：/api/notify-test 在 §C9 从空 stub 升级为**逐通道实弹探测**（消息级 LevelHigh），
+# 但档位仍是 authMiddleware ⇒ 任何登录成员一次 POST 就能向 owner 的全部推送通道发实弹，
+# 用噪声淹没真告警（告警通道本身成为攻击面）。修法：抬 adminMiddleware + 全进程 60s 最小间隔
+# （探测打的是 server 级单例通道，按账号限流挡不住多管理员合流）+ 全路径 opslog 审计。
+go test -count=1 ./internal/server/ -run 'TestNotifyTestAdminOnlyAndRateLimited' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+grep -q '"POST /api/notify-test", s.adminMiddleware' internal/server/server.go || { echo "--- FAIL: §N-2 notify-test 抬档丢失（成员可轰炸 owner 推送通道）"; exit 1; }
+if grep -q '"POST /api/notify-test", s.authMiddleware' internal/server/server.go; then
+	echo "--- FAIL: §N-2 notify-test 又回退 authMiddleware"; exit 1; fi
+grep -q 'Retry-After' internal/server/handlers_fix.go || { echo "--- FAIL: §N-2 频控未回 Retry-After（429 无语义，调用方盲重试）"; exit 1; }
+# 空 stub 绝迹（§C9 的实探升级不得被回退掉）。
+if grep -A 3 'func (s \*Server) handleFixNotifyTest' internal/server/handlers_fix.go | grep -q 'writeJSON(w, 200, map\[string\]string{"status": "ok"})$'; then
+	echo "--- FAIL: §N-2 notify-test 又回退成永远 ok 的空 stub"; exit 1; fi
+echo "ok - §NOTIFYADMIN 专项守卫通过（行为锁 1 组 + 静态锁 3 道 + 负锁 2 道）"
+
+echo "==> 66 §LINTGATE 前端 no-undef 静态门禁（傍晚批 N-1）..."
+# 现象：Dashboard.jsx 轮询回调写 setQMTState（声明是 setQmtState）→ ReferenceError 被同函数
+# 空 catch 吞掉 → qmtState 恒 null → 「实盘链路」健康指示永不渲染，且 15s 轮询每 tick 静默抛
+# 一次。类型检查不覆盖 .jsx、vitest 未渲染该卡片 ⇒ 只有静态 lint 能抓，而仓库没有 lint 门。
+# 取舍（owner 裁决 7）：最小集起步——no-undef 锁 error（运行时炸弹），no-unused-vars 降 warn
+# （存量 104 条多为无害死码，首日判红会让门禁失去可用性）。
+grep -q "'no-undef': 'error'" web/eslint.config.js || { echo "--- FAIL: §N-1 no-undef 未锁 error（同类拼写错误又能静默上线）"; exit 1; }
+grep -q '"lint": "eslint src"' web/package.json || { echo "--- FAIL: §N-1 lint 脚本丢失（门禁无从挂起）"; exit 1; }
+grep -q 'npm run lint -- --quiet' .github/workflows/ci.yml || { echo "--- FAIL: §N-1 CI 未跑 lint（本地门禁不约束合并）"; exit 1; }
+# 行为锁：实盘链路卡片真的渲染出来（改名回归即刻可见）。
+( cd web && npm test -- n1_qmt_link )
+if grep -n 'setQMTState' web/src/pages/Dashboard.jsx | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: §N-1 又出现 setQMTState 实调用（未声明符号，被空 catch 吞掉）"; exit 1; fi
+( cd web && npm run lint -- --quiet ) || { echo "--- FAIL: §N-1 eslint --quiet 判红（只允许 error 阻塞）"; exit 1; }
+echo "ok - §LINTGATE 专项守卫通过（静态锁 4 道 + 行为锁 1 组 + lint 实跑）"
+
+echo "==> 67 §NSSMENV 服务运行环境缺键即部署判失败（傍晚批 N-5）..."
+# 现象（三重叠加）：① -LLMApiKey/-HithinkApiKey 默认 ""；② 只在值非空时追加对应键（条件追加）；
+# ③ nssm set AppEnvironmentExtra 是**整体替换**语义 ⇒ 任何一次不带密钥参数的重跑（改端口/修故障/
+# 二次部署）都会静默删掉上次注入的 LLM_*/HITHINK_*，而且照打 "engine services registered"。
+# RUNBOOK 甚至把「注册脚本不要顺手重跑」写成运维纪律——那是用规矩绕脚本缺陷。
+# 修法：密钥解析优先级（显式参数 > 磁盘密钥文件 > 机器级环境变量 > 内置默认）+ 写前读回现值做
+# **并集**（未被提及的键原样保留 ⇒ 从根上取消「少传一个参数=删一个变量」这条路径）+ 尾部按**键名**
+# 断言、缺键 Warn + exit 1。**全程只打印键名，任何路径不得回显密钥值。**
+grep -q 'function Set-ServiceEnvExtra' deploy/qmt-win/register_engine_services.ps1 || { echo "--- FAIL: §N-5 服务 env 唯一写入点丢失（并集语义退化为整体替换）"; exit 1; }
+grep -q 'function Get-ExistingEnvExtra' deploy/qmt-win/register_engine_services.ps1 || { echo "--- FAIL: §N-5 写前读回现值丢失（并集无从谈起）"; exit 1; }
+grep -q 'function Read-SecretFile' deploy/qmt-win/register_engine_services.ps1 || { echo "--- FAIL: §N-5 磁盘密钥文件解析丢失（缺省即跳过复活）"; exit 1; }
+# 语句位置（行首缩进后直接调用）才是真实写入点：函数定义行与注释里的提及都不算。
+[ "$(grep -cE '^[[:space:]]*Set-ServiceEnvExtra ' deploy/qmt-win/register_engine_services.ps1)" -ge 2 ] || { echo "--- FAIL: Set-ServiceEnvExtra 实调用点 < 2（quant 之外的注册路径绕过并集写入）"; exit 1; }
+# 负锁：AppEnvironmentExtra 的裸 set 必须只剩 Set-ServiceEnvExtra 内部那一条实现点
+# （注释里出现的「旧版裸 nssm set」说明文字按 # 起行排除）。
+RAW_SET=$(grep -nE 'nssm[[:space:]]+(set)[[:space:]]+\$?[a-zA-Z"]*[[:space:]]*AppEnvironmentExtra' deploy/qmt-win/register_engine_services.ps1 | grep -vE '^[0-9]+:[[:space:]]*#' | wc -l | tr -d ' ')
+[ "$RAW_SET" -eq 1 ] || { echo "--- FAIL: 裸 nssm set AppEnvironmentExtra 出现 $RAW_SET 处（期望仅函数内 1 处，§N-5）"; exit 1; }
+# 部署面独立复核（校验面不得依附施工面，§M7 同族教训）：第 15 号探针 + 只看键名。
+grep -q 'quant env LLM/HITHINK key names' scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL: §N-5 部署后键名复核探针丢失"; exit 1; }
+if grep -nE 'Get-BaseEnvExtra|AppEnvironmentExtra' scripts/verify_deploy_guangzhou.sh | grep -qE 'Write-Output.*\$raw|echo.*\$l\b'; then
+	echo "--- FAIL: §N-5 探针疑似回显环境变量值（密钥明文泄露按事故处理）"; exit 1; fi
+echo "ok - §NSSMENV 专项守卫通过（静态锁 4 道 + 负锁 1 道 + 探针锁 2 道）"
+
+echo "==> 68 §LIVEBACKUP 广州灾备纳入 live.db + accounts（跨机集合逐相等，傍晚批 P0-B）..."
+# 现象：live.db（实盘持仓/委托/成交/资产四本账，cmd/quant 独立打开）**此前没有任何一份灾备方案
+# 覆盖它**——Mac 侧 scripts/backup.sh 有，广州侧 backup_snapshot.ps1 只快照 trading.db；
+# 而广州是唯一的实盘执行机。广州盘坏 = 实盘账本全损且无补救。accounts/（per-user 模拟盘账本 +
+# 移动止盈锚点 + 当日信号留痕）同理：Mac 有、广州没有。
+# 铁律一：禁止把 sqlite3 backup API 换成裸 cp/Copy-Item（两库都是 WAL 且引擎在写，裸拷贝会得到
+# 大小正常、能打开、账本却错位的撕裂快照）。铁律二：备份对象集合两侧必须逐相等（本节即该锁）。
+# 铁律三：缺库即失败并写 ok:false，不得静默跳过（降级不得报成功）。
+# 跨机集合逐相等（铁律二）：两行的库集合必须字面一致，任一侧增删库都要同步改这里。
+grep -q 'for DB in trading.db live.db' scripts/backup.sh || { echo "--- FAIL: §P0-B Mac 侧库集合锚点变更（锁与 $DbItems 需同步）"; exit 1; }
+grep -q '\$DbItems = @("trading.db", "live.db")' deploy/qmt-win/backup_snapshot.ps1 || { echo "--- FAIL: §P0-B 广州侧库集合与 Mac 不逐相等（有一库无人备）"; exit 1; }
+grep -q '\$AccountsDirName = "accounts"' deploy/qmt-win/backup_snapshot.ps1 || { echo "--- FAIL: §P0-B 广州侧 accounts/ 目录未纳入快照（per-user 账本+锚点全丢且无报错）"; exit 1; }
+grep -q 'cp -r "${DATA_DIR}/accounts"' scripts/backup.sh || { echo "--- FAIL: §P0-B Mac 侧 accounts 锚点变更（锁需同步）"; exit 1; }
+grep -qE 'dbs[[:space:]]*=[[:space:]]*\$dbBytes' deploy/qmt-win/backup_snapshot.ps1 || { echo "--- FAIL: §P0-B SNAPSHOT_OK 未记录逐库字节数（产物侧无法复核「哪几个库真被快照」）"; exit 1; }
+# 铁律三：源库缺失必须 throw（静默跳过 = 当晚少备一个库而产物仍标 ok）。
+grep -q 'source db missing' deploy/qmt-win/backup_snapshot.ps1 || { echo "--- FAIL: §P0-B 缺库硬失败腿丢失（live.db 缺失又静默报成功）"; exit 1; }
+grep -qE 'ok[[:space:]]*=[[:space:]]*\$false' deploy/qmt-win/backup_snapshot.ps1 || { echo "--- FAIL: §P0-B 失败分支不再写 ok:false（Mac 拉取器读不到降级信号）"; exit 1; }
+# 铁律一：两库快照必须经 backup_snap.py（SQLite backup API），裸拷贝形态绝迹。
+if grep -nE 'Copy-Item.*(trading|live)\.db' deploy/qmt-win/backup_snapshot.ps1 | grep -vE ':[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: §P0-B 又用 Copy-Item 拷库（WAL 撕裂快照，账本错位且能正常打开）"; exit 1; fi
+# 恢复演练必须认识两种产物布局（用 Mac 结构验广州产物 = 自己验自己，全绿而广州其实没这些文件）。
+grep -q 'detect_artifact_layout' scripts/restore_drill.sh || { echo "--- FAIL: §P0-B 恢复演练产物布局分支丢失（跨机假绿复活）"; exit 1; }
+[ -x deploy/mac/verify_restore.sh ] || [ -f deploy/mac/verify_restore.sh ] || { echo "--- FAIL: §P0-B restic 恢复复核脚本丢失"; exit 1; }
+python3 -m py_compile qmt_gateway/../deploy/qmt-win/backup_snap.py && echo "  ok backup_snap.py 语法通过"
+echo "ok - §LIVEBACKUP 专项守卫通过（等值锁 2 组 + 静态锁 7 道 + 负锁 2 道 + 语法锁 1 道）"
 
 echo ""
 echo "==> 全部通过"

@@ -28,6 +28,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -1180,6 +1182,13 @@ type StrategyConfig struct {
 	MacroGate MacroGateConfig `json:"macro_gate"`
 	// §SHORT-1 做空四战法配置（高位滞涨/放量破位/龙头断板/利好兑现砸盘）
 	Short ShortStrategiesConfig `json:"short"`
+	// UpdatedAt §中-6 配置版本戳（2026-09-22 傍晚批）：最近一次服务端写入时间（RFC3339Nano，UTC）。
+	// 由 MergeStrategyConfig/SetStrategyConfig 统一盖戳，**客户端提交值不参与 merge**（只用于
+	// 写请求的乐观锁比对）——两个管理员先后保存时，后写者版本对不上即回 409，不再静默覆盖。
+	// 空串=历史配置尚无版本，首个写请求跳过比对并补盖。
+	// English: §mid-6 server-stamped version of the strategy config; POST bodies echo it back for
+	// optimistic-locking (mismatch → 409 instead of silent last-write-wins overwrite).
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 // ShortStrategiesConfig §SHORT-1 做空战法配置（docs/SHORT_STRATEGIES_PLAN_20260912.md）。
@@ -1748,23 +1757,40 @@ func (m *Manager) GetRulesFor(userID string) *Rules {
 	return m.userRules(userID)
 }
 
-// GetStrategyConfigFor 返回指定账号的策略参数配置（账号级覆盖优先，否则全局）。
-// （GetStrategyConfigFor returns the strategy config for a user (account override wins, else global).）
 // GetStrategyConfigFor 返回运营数据归属账号（管理员）的策略参数（运营配置系统级共享）。
+// §N-4/§CFGSMASH-concurrency（2026-09-22 傍晚批）：与 GetStrategyConfig 同口径，返回**快照
+// 拷贝的指针**而非内部活体——store 未注入时 userRules 直接回别名 m.Rules，旧写法等于把全局
+// Rules.Strategy 的活体指针交给打分循环跨 goroutine 持有。拷贝语义钉死在方法上，调用方零改动。
+// English: per-owner strategy config, returned as a pointer to a snapshot COPY (never the live
+// internal field) so long-held pointers cannot race the config writers.
 func (m *Manager) GetStrategyConfigFor(userID string) *StrategyConfig {
-	return &m.userRules(m.ownerOf(userID)).Strategy
+	r := m.userRules(m.ownerOf(userID))
+	cp := r.Strategy
+	return &cp
 }
 
 // SetStrategyConfigFor 更新运营数据归属账号（管理员）的策略参数并持久化（系统级共享）。
+// §CFGSMASH-concurrency：无 store 的 fallback 分支旧实现裸写 m.Rules.Strategy 不持 m.mu
+// （三轮补强锤实的不对称锁遗漏），现补锁 + 统一盖 §中-6 版本戳。HTTP 管理端整份 POST 的
+// 全量替换语义暂保留（见 N-4 报告的同族漏网清单），但不再是无锁裸写。
+// English: per-owner full-replace writer; the no-store fallback branch now takes m.mu (it was an
+// unguarded cross-goroutine write) and stamps the mid-6 version.
 func (m *Manager) SetStrategyConfigFor(userID string, cfg *StrategyConfig) {
+	if cfg == nil {
+		return
+	}
 	oid := m.ownerOf(userID)
+	next := *cfg
+	next.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano) // §中-6 任何服务端写入都推进版本
 	if m.store == nil || oid == "" {
-		m.Rules.Strategy = *cfg
+		m.mu.Lock()
+		m.Rules.Strategy = next
+		m.mu.Unlock()
 		m.Save()
 		return
 	}
 	r := m.userRules(oid)
-	r.Strategy = *cfg
+	r.Strategy = next
 	m.saveUserRules(oid, r)
 }
 
@@ -1978,16 +2004,129 @@ func (m *Manager) SetLongShortConfigFor(userID string, c LongShortConfig) {
 }
 
 // GetStrategyConfig 返回全局策略参数配置（无账号隔离时使用）。
-// （GetStrategyConfig returns the global strategy config.）
+// §N-4/§CFGSMASH-concurrency（2026-09-22 傍晚批）：本 getter 起返回**快照拷贝的指针**，
+// 不再别名内部活体 —— 旧实现 `return &m.Rules.Strategy` 让跨 goroutine 的持有者
+// （combat_agent 打分循环、engine registry）与 setter 的裸写构成数据 race；拷贝语义下
+// 调用方可自由解引用/长期持有，看到的热更新由 config.json fsnotify 通道（Agent.StartHotReload）
+// 与 registry 指纹重建保证，不依赖别名实时透写。签名保持 *StrategyConfig，波及面为零。
+// English: returns a pointer to a SNAPSHOT COPY (not the live internal field) — holders may
+// dereference/retain across goroutines without racing the setters.
 func (m *Manager) GetStrategyConfig() *StrategyConfig {
-	return &m.Rules.Strategy
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp := m.Rules.Strategy
+	return &cp
 }
 
-// SetStrategyConfig 更新全局策略参数并持久化到文件。
-// （SetStrategyConfig updates the global strategy params and persists them.）
+// StrategyConfigSnapshot 返回全局策略参数配置的深拷贝值（推荐的新读取入口，语义与
+// GetStrategyConfig 相同，命名上明确"这是快照"）。
+// English: value-form snapshot of the global strategy config (preferred new read entry).
+func (m *Manager) StrategyConfigSnapshot() StrategyConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Rules.Strategy
+}
+
+// ErrStrategyVersionConflict §中-6 乐观锁哨兵：写请求携带的 updated_at 与服务端当前版本
+// 不一致（另一个管理员先落了一步）时 MergeStrategyConfig 返回本错误，handler 映射为 409。
+// English: sentinel for the §mid-6 optimistic-lock conflict (client base version != server).
+var ErrStrategyVersionConflict = errors.New("strategy config version conflict")
+
+// SetStrategyConfig 更新全局策略参数并持久化到文件（**全量替换**语义，供内部程序化入口
+// 使用，如寻优一键应用 optimizations.go）。
+// §CFGSMASH-concurrency 补锁：旧实现裸写 `m.Rules.Strategy = *cfg` 不持 m.mu，而同文件
+// 其余 6 处 setter 是加锁的——加锁不对称属遗漏而非设计（三轮补强锤实）。HTTP 端点不再走
+// 本方法（改走 MergeStrategyConfig 稀疏 merge），但保留全量语义给"构造完整快照后落盘"的调用方。
+// English: full-replace global strategy config under m.mu (internal programmatic entry; the
+// HTTP endpoint now uses MergeStrategyConfig instead).
 func (m *Manager) SetStrategyConfig(cfg *StrategyConfig) {
-	m.Rules.Strategy = *cfg
+	if cfg == nil {
+		return
+	}
+	m.mu.Lock()
+	next := *cfg
+	next.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano) // §中-6 服务端统一盖版本戳
+	m.Rules.Strategy = next
+	m.mu.Unlock()
 	m.Save()
+}
+
+// MergeStrategyConfig §N-4（2026-09-22 傍晚批 §CFGSMASH）稀疏 merge 写入口：
+// 只更新 patch 中出现的键，未出现的键保留旧值——修复「前端一次失败加载 + 一次整份保存 =
+// 五套战法阈值落 0 且已落库、重启救不回」的写端点半边（§LLM 族已钉过"缺失/空值不得折叠成
+// 写 0"，strategy 端点是该族漏网）。判定粒度=**逐字段递归**（JSON 语义深合并）：
+//  1. 当前配置 marshal 成 map 基底，patch（body 顶层键→原始 JSON）逐层覆盖——
+//     对象遇对象递归合并，标量/数组整体替换；
+//  2. 合并结果 typed-unmarshal 回 StrategyConfig：body 里的未知键被自然丢弃，等效白名单，
+//     无需手写反射或字段清单（战法分组以后增删字段这里零维护）；
+//  3. updated_at 为服务端专属字段：从 patch 剔除、由本方法盖戳，body 值只作 §中-6 版本比对。
+//
+// baseVersion（客户端 GET 到的 updated_at）非空且与服务端不一致 → 返回 (当前快照,
+// ErrStrategyVersionConflict)，**不落盘**；baseVersion 为空 = 不比对（兼容旧调用方/脚本直 POST）。
+// 全程持 m.mu（写侧互斥 + 与快照读配对），落盘 Save 在锁外（与 SetSchedulerConfig 同范式）。
+// English: sparse-merge writer for the global strategy config — only keys present in `patch`
+// are updated (object-into-object merges recursively; scalars/arrays replace wholesale; unknown
+// keys are dropped by the final typed unmarshal). baseVersion implements the §mid-6 optimistic
+// lock: mismatch => ErrStrategyVersionConflict without persisting.
+func (m *Manager) MergeStrategyConfig(patch map[string]json.RawMessage, baseVersion string) (StrategyConfig, error) {
+	delete(patch, "updated_at") // 版本字段服务端所有：body 值只用于比对，绝不参与 merge
+	m.mu.Lock()
+	cur := m.Rules.Strategy
+	if baseVersion != "" && cur.UpdatedAt != "" && baseVersion != cur.UpdatedAt {
+		m.mu.Unlock()
+		return cur, ErrStrategyVersionConflict
+	}
+	// ① 当前值 → map 基底（json round-trip，保证与 patch 同域可递归合并）
+	baseMap := map[string]any{}
+	if raw, err := json.Marshal(cur); err == nil {
+		if err := json.Unmarshal(raw, &baseMap); err != nil {
+			m.mu.Unlock()
+			return cur, fmt.Errorf("当前策略配置序列化异常: %w", err)
+		}
+	}
+	// ② patch 原始 JSON → any，任一顶层键 JSON 非法即 400（不吞、不带病落盘）
+	patchMap := make(map[string]any, len(patch))
+	for k, raw := range patch {
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			m.mu.Unlock()
+			return cur, fmt.Errorf("字段 %s 不是合法 JSON: %w", k, err)
+		}
+		patchMap[k] = v
+	}
+	deepMergeAny(baseMap, patchMap)
+	// ③ 合并结果回 typed struct：类型不符/结构非法 → 400，旧配置原样保留
+	mergedRaw, err := json.Marshal(baseMap)
+	if err != nil {
+		m.mu.Unlock()
+		return cur, fmt.Errorf("合并结果序列化失败: %w", err)
+	}
+	var next StrategyConfig
+	if err := json.Unmarshal(mergedRaw, &next); err != nil {
+		m.mu.Unlock()
+		return cur, fmt.Errorf("策略参数校验失败: %w", err)
+	}
+	next.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	m.Rules.Strategy = next
+	m.mu.Unlock()
+	m.Save()
+	return next, nil
+}
+
+// deepMergeAny 递归合并 src 进 dst：两侧同为对象→逐键递归；否则 src 整体替换
+// （数组与标量不做元素级合并——阈值数组这类字段半合更危险）。nil 值按"显式 null"处理，
+// 由下游 typed-unmarshal 决定语义（数值字段 null 会被 Go json 忽略=保留旧值，不折叠成 0）。
+// English: recursive JSON-map merge; object×object merges key-by-key, anything else replaces.
+func deepMergeAny(dst, src map[string]any) {
+	for k, sv := range src {
+		if sm, ok := sv.(map[string]any); ok {
+			if dm, ok := dst[k].(map[string]any); ok {
+				deepMergeAny(dm, sm)
+				continue
+			}
+		}
+		dst[k] = sv
+	}
 }
 
 // GetD1Config 返回全局 D1 事件匹配规则配置。
@@ -2070,16 +2209,23 @@ func (m *Manager) Load() {
 	log.Printf("[config] 已加载配置文件: %s", m.path)
 }
 
-// Save 将当前配置序列化为 JSON 并写入文件。// （Save serializes the current config to JSON and writes it to the file.）
+// Save 将当前配置序列化为 JSON 并写入文件。
+// §N-4/并发补强（2026-09-22 傍晚批）：marshal 阶段收进 m.mu.RLock——序列化会逐字段遍历
+// Rules/D1 活体内存，旧实现在锁外 marshal，与「A 持锁写、B 已解锁进 Save」的并发保存构成
+// 数据 race（-race「边保存边打分」用例实测触发）。全部既有调用点都是**先解锁再 Save**，
+// 此处取 RLock 无重入死锁风险；磁盘 IO 留在锁外，读路径（打分循环）不被写盘拖住。
+// English: marshalling now runs under RLock (it walks the live Rules tree); the atomic file
+// write stays outside the lock. All existing call sites already release the lock before Save.
 func (m *Manager) Save() {
 	wrapper := struct {
 		Rules *Rules    `json:"rules"` // 全局规则配置段
 		D1    *D1Config `json:"d1"`    // D1 事件匹配规则段
-	}{
-		Rules: m.Rules,
-		D1:    m.D1,
-	}
+	}{}
+	m.mu.RLock()
+	wrapper.Rules = m.Rules
+	wrapper.D1 = m.D1
 	data, err := json.MarshalIndent(wrapper, "", "  ")
+	m.mu.RUnlock()
 	if err != nil {
 		log.Printf("[config] 序列化失败: %v", err)
 		return

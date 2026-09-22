@@ -2164,8 +2164,36 @@ func (s *Server) handleFixAction(w http.ResponseWriter, r *http.Request) {
 // 返回每通道成败；通知器未注入（独立 server 测试模式）显式回 noop+原因，不再伪装。
 // English: §C9 — the former no-op stub (always "ok", sent nothing) now performs a real
 // per-channel connectivity probe via TestChannels; absent notifier replies noop with a reason.
+//
+// §N-2（2026-09-22 傍晚批 §NOTIFYADMIN）加固三层：
+//  1. 路由档位已抬到 adminMiddleware（见 server.go 注册处）——本端点打全局推送通道，成员不可触发；
+//  2. 进程内 60s 最小间隔频控：命中回 429 + Retry-After 秒数。选全进程而非按账号，因为噪声
+//     受害者是 owner 的一套通道，多管理员各限各的等于没限（§零 教训「一个入口已保护≠全部入口收口」）；
+//     频控放在 notifier 判空之前——noop 路径同样计数限流，语义统一、不给探测外的刷屏留缝。
+//  3. 每次调用（受理/限流拒绝均算）写 opslog 审计：出了告警风暴时能回答"谁在什么时候打的"。
 func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
+	actor := userFromContext(r).ID
+	// ② 频控：进程内最小间隔 60s，未到间隔直接拒绝，不触任何通道。
+	const notifyTestMinInterval = 60 * time.Second
+	s.notifyTestMu.Lock()
+	since := time.Since(s.notifyTestLastAt)
+	if !s.notifyTestLastAt.IsZero() && since < notifyTestMinInterval {
+		retry := int64((notifyTestMinInterval - since).Seconds())
+		if retry < 1 {
+			retry = 1
+		}
+		s.notifyTestMu.Unlock()
+		// 被限流的尝试同样留审计痕迹（事后取证要能区分"没打"和"打了但被闸住"）。
+		opslog.Audit("notify_test", actor, "channels", fmt.Sprintf("deny: rate_limited retry_after=%ds", retry))
+		w.Header().Set("Retry-After", strconv.FormatInt(retry, 10))
+		writeError(w, http.StatusTooManyRequests, fmt.Sprintf("通知测试过于频繁，请 %d 秒后再试（全进程 60s 最小间隔）", retry))
+		return
+	}
+	s.notifyTestLastAt = time.Now() // 受理即计时（含稍后失败的尝试），避免失败重试变成连发
+	s.notifyTestMu.Unlock()
+
 	if s.notifier == nil {
+		opslog.Audit("notify_test", actor, "channels", "noop: notifier_not_injected")
 		writeJSON(w, 200, map[string]string{"status": "noop", "reason": "通知服务未接入（独立服务模式），无可测通道"})
 		return
 	}
@@ -2175,6 +2203,7 @@ func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
 		Content: "这是一条来自「测试通知」按钮的连通性探测消息；收到即表示该通道可用。",
 	})
 	if len(channels) == 0 {
+		opslog.Audit("notify_test", actor, "channels", "noop: no_channel_configured")
 		writeJSON(w, 200, map[string]string{"status": "noop", "reason": "未配置任何通知通道（Webhook/推送网关/ntfy 均为空）"})
 		return
 	}
@@ -2192,6 +2221,8 @@ func (s *Server) handleFixNotifyTest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		status = "partial"
 	}
+	// ③ 每次真实探测写审计：事件=notify_test，结果带逐通道成败（不含消息正文，防敏感外泄）。
+	opslog.Audit("notify_test", actor, "channels", fmt.Sprintf("%s channels=%d", status, len(channels)))
 	log.Printf("[notify] 通知测试完成 status=%s channels=%d", status, len(channels))
 	writeJSON(w, 200, map[string]interface{}{"status": status, "channels": results})
 }

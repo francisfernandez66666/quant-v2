@@ -6,6 +6,9 @@
 HTTP 端到端（/order → mock 成交 → handler 推送首尔 → /state 校验）。无需 Windows/xtquant。
 §M-2（2026-09-22 修复批）：见 TestM2PendingLeak——下单窗口抛异常不再遗留 pending 占位
 （同 signal_id 可再次受理），运行期巡检只解锁超龄本地占位、绝不重发。
+§CLAIMRELEASE（2026-09-22 晚批 N-8）：上面那条"不再遗留"收窄为「只有从未交给通道的路径才
+删占位」；place_order 已成功而 settle 失败时占位保留并转第三态「待核对」（见
+tests/test_claim_release.py 的完整行为链）。
 """
 import json
 import inspect
@@ -20,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from store import Store  # noqa: E402
+from store import Store, UNRESOLVED_STATUS  # noqa: E402
 from ids import Idempotency  # noqa: E402
 from broker import MockBroker, XtBroker, build_broker  # noqa: E402
 from handler import ReportHandler, post_report  # noqa: E402
@@ -627,9 +630,13 @@ class TestM2PendingLeak(unittest.TestCase):
     运行期 `_dispatch_reap_loop`（:494-502）只清 dispatch 的 inflight 不清 orders 的
     pending → 同 signal_id 之后每次重试恒 409「duplicate signal_id in-flight」，
     该信号永久死锁。
-    本类锁两个不变式：① 未 settle 的路径（异常/settle 失败）绝不遗留占位，且网关
+    本类锁两个不变式：① 未 settle 的路径（异常/settle 失败）绝不**原地遗留**占位，且网关
     自身不重发；② 运行期巡检只解锁超龄**本地占位**，不重排、不重发（ids.py 的
     「不重复下单」fail-safe 语义必须原样保留）。
+    §CLAIMRELEASE（2026-09-22 晚批 N-8）对 ① 的收窄：「不遗留」不等于「一律删除」——
+    place_order 已返回成功（订单已交给通道）而 settle 失败时删除占位 = 拆掉唯一幂等防线 =
+    同信号双卖。现在 ① 的形态是「未交给通道 → 删占位（本类两条用例锁死）」+
+    「已交给通道 → 保留并转第三态（test_claim_release.py 锁死）」，②（只解锁不重发）不变。
     """
 
     def _gw(self):
@@ -679,15 +686,24 @@ class TestM2PendingLeak(unittest.TestCase):
             gw.active_broker = real
             gw.stop()
 
-    def test_settle_exception_also_releases_claim(self):
-        """settle 自身抛异常（DB 抖动）同样不留占位——finally 兜底覆盖整个未 settle 窗口。"""
+    def test_settle_exception_keeps_claim_as_unresolved(self):
+        """§CLAIMRELEASE（N-8 收紧 §M-2）settle 抛异常时占位**不再被删除**，而是转第三态。
+
+        本用例的前身是 `test_settle_exception_also_releases_claim`（断言"settle 失败也留不下
+        占位"）。那条断言正是 N-8 的双卖门：place_order 已经返回 True（桥通道 = 入队即成功、
+        订单不可撤回地排队），此时删掉占位会让调用方的有限重试再次 claim 成功并二次入队。
+        不变式由「未 settle 即释放」收窄为「**未交给通道**才释放」；本用例改锁新语义，
+        完整行为链（第二次 /order 不再入队 + 告警 + 收敛）见 tests/test_claim_release.py。
+        """
         gw = self._gw()
         original = gw.ids.settle
         try:
             gw.ids.settle = lambda order: (_ for _ in ()).throw(RuntimeError("db locked"))
             status, body = gw._do_order(self._body("M2B"))
             self.assertEqual(status, 500)
-            self.assertIsNone(gw.store.order_by_signal("M2B"))
+            row = gw.store.order_by_signal("M2B")
+            self.assertIsNotNone(row, "订单已交给通道，占位不得被删除（N-8 双卖门）")
+            self.assertEqual(row["status"], UNRESOLVED_STATUS)
         finally:
             gw.ids.settle = original
             gw.stop()

@@ -1,7 +1,13 @@
-// sell_anchor.go — §M10（2026-09-22 修复批）paper 账本移动止盈锚点的跨重启持久化。
+// sell_anchor.go — 卖出裁决「移动止盈锚点（持仓期最高价）」的跨重启持久化。
+// §M10（2026-09-22 修复批）覆盖 paper 账本（json 文件）；
+// §N-7（2026-09-22 晚间批）补上 live 账本（回写 real_positions.highest_price）。
 //
 // 背景：卖出裁决的移动止盈锚点（持仓期最高价）三本账来源不同——
-//   - live：real_positions.highest_price（账本持久化，§M5 已有保护）；
+//   - live：real_positions.highest_price（账本持久化，§M5 已有只增保护）；
+//     ⚠ 该列历史上只有「建仓价/成交价」两个来源（对账快照 open_price、成交回报
+//     成交价），期间最高价从未写回，live 的移动止盈锚点重启后必然退回建仓价——
+//     §N-7（本批）起由 persistLiveSellAnchors 把内核自抬出的锚点回写账本，
+//     本文件的 json 持久化只覆盖 paper 账本，别把两者混为一谈。
 //   - report：ExecLog.HighestPrice（账本持久化）；
 //   - paper：账本无该字段，裁决内核靠状态机从 EntryPrice「每轮自抬」
 //     （signalctl.sellState.HighPrice 纯内存）→ 进程重启锚点清零，高点回落成
@@ -20,18 +26,23 @@
 // 该残留为已接受口径——窗口只影响裁定节奏、不产生误平仓，锚点恢复后移动线在重启后
 // 首个有效价轮即重新锁线；窗口状态账本化牵动 signalctl 内核，留待 F11 拆分批次。
 //
-// English: persists the paper-book trailing-stop high anchor across process restarts
-// (the kernel's anchor was memory-only, so a restart reset it to entry price and the
-// trailing take-profit could never fire again). Atomic JSON per account data dir;
-// empty dataDir keeps the old memory-only semantics.
+// English: persists the trailing-stop high anchor across process restarts (the kernel's
+// anchor was memory-only, so a restart reset it to entry price and the trailing take-profit
+// could never fire again). Paper: atomic JSON per account data dir, empty dataDir keeps the
+// old memory-only semantics. Live (§N-7): the raised anchor is written back to the ledger
+// column real_positions.highest_price, which previously only ever carried entry/fill prices.
 package engine
 
 import (
 	"encoding/json"
 	"log"
 	"os"
+	"time"
 
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/opslog"
+	"quant-trading-v2/internal/signalctl"
+	"quant-trading-v2/internal/store"
 )
 
 // paperSellAnchor 取指定账号/代码的 paper 移动止盈锚点（§M10）。
@@ -138,5 +149,61 @@ func (e *Engine) savePaperAnchorsLocked() {
 	ensureParentDir(e.paperAnchorPath)
 	if err := data.AtomicWrite(e.paperAnchorPath, raw, 0644); err != nil {
 		log.Printf("[sell-anchor] §M10 锚点文件原子写入失败: %v", err)
+	}
+}
+
+// persistLiveSellAnchors §N-7（2026-09-22 傍晚批复验）live 账本移动止盈锚点回写：
+// 把裁决内核本轮自抬出来的持仓期最高价写进 real_positions.highest_price。
+//
+// 为什么必须做（owner 裁决 12=回写账本）：live 侧探针的播种值就是该列
+// （sell_shadow.go 的 sellProbeRow.HighPrice = p.HighestPrice），而该列此前只有三个写入源
+// ——券商对账快照的 open_price、成交回报成交价、以及 §M5 的只增 CASE，**期间最高价从来没有
+// 任何写入路径**。内核的 HighPrice 是纯内存「播种 + 每轮自抬」，进程一重启锚点就退回建仓价：
+// 涨过 tp（默认 15%）再回撤的仓位，移动止盈线永远锁不上，本批主题「静默失效」的典型样本。
+//
+// 为什么不开 json：paper 用 <acctDir>/paper_sell_anchors.json 是因为纸面账本根本没有可承载
+// 锚点的列；live 的账本就是 sqlite，再落一份文件等于给同一条规则两份真相（重启后谁覆盖谁、
+// 手工清账时谁失效都说不清）。落库后 §M5/N-6 的只增 CASE 天然就是它的合并规则。
+//
+// 与 §N-6 在同一条 upsert 上的协调（这就是两条并给一个人的原因）：本函数走**独立的单调
+// UPDATE**（RaiseRealPositionHigh，WHERE highest_price < ?），不与对账 upsert 争同一写路径；
+// 而对账 upsert 里 highest_price 的 CASE 是 max(excluded, 现值)，券商快照的 open_price 只可能
+// 抬高、不可能把已回写的锚点拉回。两条路径都单调不降 ⇒ 谁先谁后都不丢高点。
+//
+// English: §N-7 — writes the kernel's in-process trailing-stop anchor back to
+// real_positions.highest_price (live's ledger is the source of truth for the seed, and that
+// column previously only ever carried entry/fill prices, so a restart reset the anchor).
+// Uses a separate monotonic UPDATE, coordinated with §N-6 by both sides being only-up.
+func (e *Engine) persistLiveSellAnchors(account string, positions []store.RealPosition) {
+	e.mu.RLock()
+	realDB := e.realStore
+	e.mu.RUnlock()
+	if realDB == nil || len(positions) == 0 {
+		return // 未接实盘账本（纯内存/测试路径）或无持仓：无事可做
+	}
+	ctl := e.SignalCtl()
+	for i := range positions {
+		p := positions[i]
+		// 内核锚点：本轮无有效价的持仓状态仍在（sellState 只在跃迁时更新），取到的是历史高点。
+		anchor := ctl.SellHighAnchor(signalctl.ChannelLive, account, p.TsCode)
+		if anchor <= p.HighestPrice {
+			continue // 账本已不低于内核锚点：无变更不写库（5s 轮高频，避免无谓 IO 与 updated_at 抖动）
+		}
+		raised, err := realDB.RaiseRealPositionHigh(account, p.TsCode, anchor)
+		if err != nil {
+			// 写失败只影响「下次重启后的播种值」，不影响本轮裁决与执行：降级为日志、绝不打断卖出主链。
+			log.Printf("[sell-anchor] §N-7 live 锚点回写失败（不影响本轮裁决） %s 锚点=%.4f: %v", p.TsCode, anchor, err)
+			continue
+		}
+		if !raised {
+			continue // 并发轮已抢先抬高（WHERE 只增守卫拦下）：正常竞态，不记日志
+		}
+		// 留痕限流：单边上涨行情下每轮都可能创新高，只按码节流输出，写入本身不限流。
+		code := p.TsCode
+		before := p.HighestPrice
+		opslog.OncePer("live-anchor-raise:"+account+"|"+code, time.Minute, func() {
+			log.Printf("[sell-anchor] §N-7 live 锚点已回写账本 %s 账本最高 %.4f → %.4f（重启后移动止盈线仍在此锚上锁线）",
+				code, before, anchor)
+		})
 	}
 }

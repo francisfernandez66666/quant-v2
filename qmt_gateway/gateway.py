@@ -25,12 +25,26 @@ broker 由 config 选择（xt/mock）。回报经 outbox 后台线程推送（ha
   根治裸 strftime 本地钟面贴假 +08:00（LOW 族）。
 §REJECT（2026-09-22）：/dispatch/result 的 trade 回报在 trade_id 与 order_id 皆空时
   拒收 400 留痕（与 §F5 缺 order_id 拒 400 同口径；handler.on_trade 为第二道防线）。
+§CLAIMRELEASE（2026-09-22 晚批 N-8）占位释放分流 + 派发队列纵深防线（详见 _do_order /
+  _release_order_claim / _alert_unresolved_pending 各处说明）：
+  §M-2 的「未 settle 即释放」不变式过宽，把「从未发送」与「已交给通道但结算失败」混为
+  一谈，后者被释放后 Go 侧按「重试次数+1」的有限重试会再走一遍下单窗口 → 同 signal_id
+  第二笔入队 = 双卖/双买，且旧日志事后无法区分这两种。现在：
+    - _release_order_claim 必须显式收到 sent_to_broker（关键字必传，裸调即 TypeError），
+      未发送 → 照旧删占位（保留 §M-2 治死锁的原语义）；已发送/已入队 → 保留占位行并
+      提升为第三态「待核对」，同 sid 后续 claim 一律 409，同时立即 error 日志告警；
+    - 所有超时清理路径只认 status='pending'，第三态由 _alert_unresolved_pending 用**独立
+      可配置阈值**反复告警（绝不自动删行），收敛出口＝回报到达（upsert_order 推进）
+      或 POST /admin/order-confirm 的显式人工确认；
+    - store.dispatch 的部分唯一索引 idx_dispatch_signal_active 兜住"上层防线被拆掉"那一格。
+  释放点日志一律写清 reason 与「当时是否已入队」，供事后取证。
 §2026-09-22 修复批（本文件四项，详见各处同名 §编号说明；桥侧 qmt_bridge_strategy.py 的
   中文说明按仓库既定策略由本文件承载）：
   §SIDEGATE-PY（M-1）/order 方向白名单：side ∉ {买入,卖出} 一律 400（错误里带实际取值）。
     旧实现只判 `side=="卖出"`，非法串按买入整手校验、却被 broker/桥的三元式下成卖单。
   §M-2 place_order 异常不再遗留 pending 占位（try/finally 释放）+ 运行期 60s 巡检
     `_sweep_stale_pending` 释放超龄（默认 600s）本地占位；两条路径都**只解锁不重发**。
+    （§CLAIMRELEASE 收紧：释放前先看「是否已交给通道」——已交付的那一路不再删行，见上。）
   §M-3 委托腿二次确认：桥回报带 order_confirmed，未确认单在 reason/dispatch result/日志里
     显式标注（状态字面量仍为「已报」，原因见 _apply_order_result 的说明）。
   §A4 文件桥位点改为「逐行、apply 成功后推进」，坏行/连续失败行落
@@ -68,6 +82,7 @@ import ssl
 import sys
 import threading
 import time
+from datetime import datetime  # §CLAIMRELEASE：「待核对」滞留龄计算（显式北京时区比较）
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -77,7 +92,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # §TZ（2026-09-22 修复批）：网关内全部落库/上报时间串统一走 store._now_cn()
 # （显式北京时区，见其 §TZ 说明）；禁止再用「本地 strftime + 硬编码 +08:00 后缀」的写法
 # ——那会把非北京时区部署机的本地钟面贴上 +08:00 假偏移（LOW 族根治项）。
-from store import Store, is_placeholder_order_id, json_default, _now_cn  # noqa: E402
+from store import (  # noqa: E402
+    Store, is_placeholder_order_id, json_default, _now_cn, CN_TZ,
+    # §CLAIMRELEASE 第三态字面量与派发队列重复入队的可识别异常（分流与告警两条路都要认它）
+    UNRESOLVED_STATUS, DispatchDuplicateSignal,
+)
 from ids import Idempotency  # noqa: E402
 from broker import build_brokers, XtBroker, QueuedBroker  # noqa: E402
 from handler import ReportHandler, periodic_reconcile, is_active_trading_session  # noqa: E402
@@ -114,6 +133,10 @@ DEFAULT_CONFIG = {
     # 「claim 成功但 place_order 抛异常/settle 失败」遗留的占位再无人清理，
     # 同 signal_id 永 409。阈值与启动期同用 600s，运行期巡检复用 _dispatch_reap_loop。
     "pending_stale_sec": 600,
+    # §CLAIMRELEASE（2026-09-22 晚批 N-8）第三态「待核对」占位的滞留告警阈值（秒，0=关闭告警）——
+    # 它与 pending_stale_sec 是**两件事**：普通占位超龄 = 解锁（删行），第三态超龄 = 只告警不解锁
+    # （那笔单大概率已在券商侧，删行等于放行第二笔）。默认 3600s：给回报/对账留出收敛窗口。
+    "pending_unresolved_alert_sec": 3600,
     # §A1（AUDIT_FULLSTACK_20260918）网关侧独立风控（与首尔 risk.Gate 同语义，0/空=闸关闭）
     # §ENH-5 批E 只读 L1 行情通道（xtdata get_full_tick 轮询；与交易链路完全隔离）
     "quote_feed": True,             # feed 总开关（xtdata 缺失环境自动静默停用）
@@ -250,6 +273,9 @@ class Gateway:
         self._queued_last_connected = 0.0
         # 来源 IP 白名单（由 main 从环境变量 ALLOWED_IPS 注入；空列表表示不做 IP 限制，仅依赖 token）
         self.allowed_ips = []
+        # §CLAIMRELEASE 第三态「待核对」告警的去重集（同一 signal_id 每进程只主动 error 一次，
+        # 之后由 /admin/status 与超龄巡检持续可见）——巡检 60s 一轮，无去重会刷屏。
+        self._unresolved_alerted = set()
 
     def switch_broker(self, key, reason=""):
         """原子切换 active 通道（xt/queued/mock）。返回 (ok:bool, err:str)。"""
@@ -296,6 +322,9 @@ class Gateway:
             log.warning("[gateway] STALE pending order (within 10min, verify against broker): signal_id=%s "
                         "code=%s side=%s qty=%s",
                         p.get("signal_id"), p.get("code"), p.get("side"), p.get("qty"))
+        # §CLAIMRELEASE：启动期同样要把第三态「待核对」行暴露出来（重启不丢证据、也不被上面
+        # 那条超时清理误删）——它们是上一次进程"已把订单交给通道却没结算完"的现场。
+        self._alert_unresolved_pending("启动")
         # §M16：dispatch 表与 orders 同批做启动清理——上次进程存活期内被桥取走（inflight）
         # 但回报丢失/桥重启未结算的超龄派发项，启动先收割一次，随后周期巡检兜底。
         self._reap_dispatch_inflight("启动")
@@ -669,7 +698,59 @@ class Gateway:
             log.warning("[gateway] §M-2 运行期释放 %d 个超龄（>%ds）pending 占位（%s）——"
                         "仅解锁本地占位，网关未重发任何订单，请核对柜台侧是否已有委托",
                         n, stale_sec, where or "周期巡检")
+        # §CLAIMRELEASE：同一条巡检顺带盯第三态（**只告警不删行**，见其方法说明）。
+        # 放在这里而不是新开线程：巡检本来就是"本地占位体检"的唯一收敛点，两条共用 60s 节奏，
+        # 且第三态绝不能被上面的 release 顺手清掉——两条 SQL 的 status 谓词天然互斥。
+        self._alert_unresolved_pending(where or "周期巡检")
         return n
+
+    def _alert_unresolved_pending(self, where=""):
+        """§CLAIMRELEASE 第三态「待核对」占位的滞留告警：**只告警、绝不自动删行**。
+
+        为什么必须与 _sweep_stale_pending 分开：普通 pending 占位超龄 = 从未发送的残骸，
+        删掉解锁是安全的（§M-2/§T5）；第三态那一行代表「订单已交给通道、结果未知」，
+        按同一个 600s 阈值删掉它就等于把第三态降级回普通 pending —— N-8 的双卖门原样 reopened。
+        所以这里：
+          - 阈值独立可配（pending_unresolved_alert_sec，默认 3600s；0=关闭超龄告警）；
+          - 动作只有 error 日志（网关既有告警出口：本仓 Python 侧无独立告警通道，
+            log.error + /admin/status 观察位是既有惯例，见 §REJECT/§M-3 的处置口径），
+            同一 signal_id 每进程只重复告一次，避免 60s 巡检刷屏；
+          - 收敛出口不在这里：回报到达（upsert_order 推进）/ §M16 派发收割回写「已废」
+            / 人工 POST /admin/order-confirm。
+        返回本轮新告警条数（单测断言用）。
+        English: §CLAIMRELEASE — alert-only dwell warning for the third state; it never
+        deletes the row, because deleting it is exactly the double-sell path.
+        """
+        alert_sec = int(self.cfg.get("pending_unresolved_alert_sec", 3600) or 0)
+        try:
+            rows = self.store.list_unresolved_pending()
+        except Exception:  # noqa: BLE001 — 巡检线程永不因异常退出
+            log.exception("[gateway] §CLAIMRELEASE 读取「待核对」占位失败")
+            return 0
+        now = datetime.now(CN_TZ)
+        alerted = 0
+        for r in rows:
+            sid = str(r.get("signal_id", "") or "")
+            if not sid or sid in self._unresolved_alerted:
+                continue
+            age = 0.0
+            try:
+                # created_at 是"占位被抢走"的时刻 = 订单交给通道的时间锚（与 §T5 同源）；
+                # 用带 +08:00 的显式北京时区比较，不受本机时区影响（§TZ 口径）
+                ts = str(r.get("created_at", "") or "")
+                age = (now - datetime.fromisoformat(ts)).total_seconds()
+            except Exception:  # noqa: BLE001 — 时间串形态异常（老数据/测试值）不影响告警本身
+                age = 0.0
+            # 首次出现即告（不等超龄）：这是资金安全级事实；超龄后再告一次（阈值 0 = 不重复）
+            self._unresolved_alerted.add(sid)
+            alerted += 1
+            log.error("[gateway] §CLAIMRELEASE 告警：signal_id=%s 处于「结果未知/待核对」"
+                      "（code=%s side=%s qty=%s 已滞留 %.0fs，%s）——该行代表订单可能已在券商侧，"
+                      "网关拒绝同信号重复下单且**不会自动清理**；请核对柜台后用 "
+                      "POST /admin/order-confirm 收敛（超龄阈值=%ds）",
+                      sid, r.get("code"), r.get("side"), r.get("qty"), age,
+                      where or "周期巡检", alert_sec)
+        return alerted
 
     def _dispatch_reap_loop(self):
         """§M16 周期收割：每 60s 巡检一次 inflight 超龄派发项（阈值见配置，默认 30min）。
@@ -841,6 +922,10 @@ class Gateway:
             return self._do_admin_broker(body)
         if path == "/admin/status" and method == "GET":
             return self._do_admin_status()
+        if path == "/admin/order-confirm" and method == "POST":
+            # §CLAIMRELEASE 第三态人工确认出口：放在 broker 连接闸之前——要核对的正是
+            # "通道状态不明"的单，绝不能因为通道断开就没法收敛
+            return self._do_admin_order_confirm(body)
         if path.startswith("/quotes") and method == "GET":
             # §ENH-5 批E：只读行情通道放在 broker 连接闸之前——xtdata 与 xttrader 是
             # 两条独立通道，交易断连时行情应照常可查（行情可用性绝不与交易熔断互相污染）
@@ -1168,7 +1253,74 @@ class Gateway:
         payload["brokers"] = {k: bool(b.is_connected()) for k, b in self.brokers.items()}
         if "queued" in self.brokers:
             payload["dispatch"] = self.store.dispatch_stats()
+        # §CLAIMRELEASE 观察位：第三态「待核对」清单 + 派发队列纵深索引是否在位。
+        # 这两项都是"要人去看才知道"的资金安全事实，塞进既有运维端点而不是另开告警通道
+        # （网关侧没有独立告警出口，log.error + /admin/status 是本仓既有惯例）。
+        try:
+            unresolved = self.store.list_unresolved_pending()
+        except Exception:  # noqa: BLE001 — 观察端点绝不因账本异常而 500
+            unresolved = []
+        payload["unresolved_orders"] = [
+            {"signal_id": r.get("signal_id"), "code": r.get("code"), "side": r.get("side"),
+             "qty": r.get("qty"), "created_at": r.get("created_at"),
+             # 取证用：这条「待核对」信号是否还在派发队列里（在 = 桥迟早会回报并自动收敛；
+             # 不在 = 只能人工核对柜台，走 POST /admin/order-confirm）
+             "dispatch_in_flight": self.store.dispatch_active_order_exists(
+                 str(r.get("signal_id", "") or ""))}
+            for r in unresolved[:20]]
+        payload["unresolved_count"] = len(unresolved)
+        payload["dispatch_signal_guard"] = bool(getattr(self.store, "dispatch_signal_guard", False))
         return 200, payload
+
+    def _do_admin_order_confirm(self, body):
+        """§CLAIMRELEASE 第三态的**人工确认**收敛出口（POST /admin/order-confirm）。
+
+        用法：核对券商侧委托后二选一——
+          {"signal_id":"...","decision":"released"}        柜台确无此单 → 删占位、解锁该信号，
+                                                          后续同 sid 可正常重新下单；
+          {"signal_id":"...","decision":"settled","order_id":"123"}（可选）
+                                                          柜台已有此单 → 把占位行改写成正常
+                                                          终态（默认「已撤」，可指定），
+                                                          order_id 给了就一并回填。
+        为什么只认第三态行：released 的谓词是 status='待核对'，误传 signal_id 不会把正常委托
+        或普通 pending 占位删掉；本端点**不重发**任何订单（与 §M-2 的"只解锁不重发"一致）。
+        English: §CLAIMRELEASE — the manual reconciliation exit for the third state; it only
+        touches rows in 待核对 and never re-issues an order.
+        """
+        req = body or {}
+        sid = str(req.get("signal_id", "") or "")
+        decision = str(req.get("decision", "") or "").strip().lower()
+        if not sid:
+            return 400, {"ok": False, "err": "signal_id required"}
+        if decision not in ("released", "settled"):
+            return 400, {"ok": False, "err": "decision must be 'released' or 'settled'"}
+        row = self.store.order_by_signal(sid)
+        if row is None:
+            return 404, {"ok": False, "err": "no such signal_id in local book"}
+        row = dict(row)  # store.order_by_signal 返回 sqlite3.Row，统一转 dict 后再取字段
+        if row.get("status") != UNRESOLVED_STATUS:
+            return 409, {"ok": False,
+                         "err": "order is not in %s state (status=%s) — nothing to confirm" % (
+                             UNRESOLVED_STATUS, row.get("status"))}
+        if decision == "released":
+            n = self.store.release_unresolved_pending(sid)
+            self._unresolved_alerted.discard(sid)
+            log.warning("[gateway] §CLAIMRELEASE 人工确认：signal_id=%s 柜台侧无此委托，"
+                        "已删除「待核对」占位解锁该信号（本端未重发任何订单）→ 可重新下单", sid)
+            return 200, {"ok": True, "released": bool(n), "err": ""}
+        # settled：回填真实委托号（可空）并推进到正常终态，之后 claim 走幂等返回分支
+        status = str(req.get("status", "") or "已撤")
+        order = dict(row)
+        order["status"] = status
+        oid = str(req.get("order_id", "") or "")
+        if oid:
+            order["order_id"] = oid
+        self.store.upsert_order(order)
+        self._unresolved_alerted.discard(sid)
+        log.warning("[gateway] §CLAIMRELEASE 人工确认：signal_id=%s 转正常终态 status=%s "
+                    "order_id=%s（占位保留为正式委托行，同 sid 后续下单走幂等返回）",
+                    sid, status, oid or "(未提供，沿用占位引用)")
+        return 200, {"ok": True, "status": status, "err": ""}
 
     def _do_order(self, body):
         """处理 POST /order 下单：参数校验 → 幂等占位 → 真实下单 → 回填委托号。
@@ -1176,12 +1328,15 @@ class Gateway:
         校验 code/qty/signal_id（非空）、限价单必须有价格；按板块整手规则校验买入数量；
         signal_id 为空一律拒绝（幂等与审计唯一锚点，§G2）；同 signal_id 幂等去重。
         §SIDEGATE-PY（M-1）方向白名单：side ∉ {买入,卖出} 一律 400（不再"按买入校验、
-        下成卖单"）；§M-2 下单窗口 try/finally：place_order/settle 任何异常路径都释放
-        本地占位，同 signal_id 可再次受理（网关自身永不重发）。
+        下成卖单"）；§M-2 下单窗口 try/finally：place_order/settle 任何异常路径都不遗留
+        占位（网关自身永不重发）。
+        §CLAIMRELEASE（N-8）把 §M-2 那条不变式收窄为「按是否已交给通道分流」：
+        未交给通道 → 释放占位（同信号可重试）；已交给通道而结算失败 → 占位保留并转
+        第三态「待核对」，同 sid 后续一律 409 + 告警（宁可拒单也不双卖）。
         English: handles POST /order — validates params (incl. the hard side whitelist),
         takes the idempotent placeholder, places the order via the broker, and fills back
-        the exchange order id; §M-2 guarantees the placeholder is released on every path
-        that does not settle.
+        the exchange order id; the placeholder is only released on paths where the order
+        never reached the broker (§CLAIMRELEASE).
         """
         # 下单主流程：参数校验 → 幂等占位 → 真实下单 → 回填
         req = body or {}
@@ -1282,6 +1437,16 @@ class Gateway:
         if not claimed:
             existing = existing or {}
             oid = existing.get("order_id") or ""
+            # §CLAIMRELEASE 第三态单独一条错误文案：普通 in-flight 与「已交给通道但结果未知」
+            # 在处置上完全不同（前者等一等就好，后者必须人工核对柜台），共用一句
+            # "duplicate signal_id in-flight" 会让运维与首尔侧都看不出差别。
+            if existing.get("status") == UNRESOLVED_STATUS:
+                log.error("[gateway] §CLAIMRELEASE signal=%s 处于「结果未知/待核对」态，本次 /order "
+                          "直接拒绝（该行代表订单可能已在券商侧，宁可拒单也不重复下单）；"
+                          "请核对柜台委托后用 POST /admin/order-confirm 收敛", signal_id)
+                return 409, {"ok": False,
+                             "err": "signal_id unresolved (already handed to broker, awaiting "
+                                     "reconciliation) — 结果未知/待核对，拒绝重复下单"}
             if is_placeholder_order_id(oid):
                 return 409, {"ok": False, "err": "duplicate signal_id in-flight"}
             # 幂等：已下过 → 返回原委托引用（不重复下单）
@@ -1299,16 +1464,32 @@ class Gateway:
         # 语义边界（ids.py:5-10 的 fail-safe 结论保持不变）：这里释放的只是**本地占位行**，
         # 网关绝不自动重发；单可能已到达柜台，是否重试由调用方（首尔）决策，
         # 防重复下单的最后防线仍是 claim 的 signal_id 唯一键 + 「只清理未结算占位」。
-        # English: §M-2 — the claim is now released on every non-settled path (exception
-        # included), so a raising broker call can no longer deadlock the signal_id forever.
+        # English: §M-2 — the claim is no longer left rotting on any non-settled path.
+        #
+        # §CLAIMRELEASE（2026-09-22 晚批 N-8）把这条不变式**收窄**：「未 settle 即释放」过宽——
+        # 它把「从未发送」与「已入队但结算失败」混为一谈。后者被释放后，Go 侧按
+        # 「重试次数+1」的有限重试会再次 claim 成功并二次入队（dispatch 表当时没有
+        # signal_id 唯一约束）= 双卖/双买。现在 finally 按 sent_to_broker 分流：
+        #   False（place_order 抛异常或显式返回失败 = 通道没受理）→ 删占位，§M-2 治死锁的
+        #     原语义原样保留（该信号还能再下单）；这一路的残余风险（异常恰好发生在
+        #     "已写进 dispatch"之后）由 store 侧部分唯一索引 idx_dispatch_signal_active 兜住
+        #     ——"已入队"在 DB 里留了行，索引不看占位，所以重试到不了第二笔。
+        #   True（place_order 已返回 ok：订单不可撤回地进了队列/柜台）→ **保留**占位行并提升为
+        #     第三态「待核对」：同 sid 后续 claim 一律 409（宁可拒单也不双卖）+ 立即告警，
+        #     回报/对账到达后由 upsert_order 自然收敛为正常终态。
         accepted = False
+        sent_to_broker = False  # §CLAIMRELEASE 分流判据：这一笔是否已不可撤回地交给通道
         why = ""
         try:
             ok, order_ref, err = self.active_broker.place_order(req)
             if not ok:
-                # 失败释放占位，允许后续重试真正重新下单（原有语义，现由 finally 统一兜底）
+                # 失败释放占位，允许后续重试真正重新下单（原有语义，现由 finally 统一兜底）；
+                # ok=False 是通道的**显式拒绝**（方向闸/未连接/柜台 seq<=0），发生在报送之前
                 why = "place_order 返回失败: %s" % (err or "")
                 return 400, {"ok": False, "err": err or "place order failed"}
+            # 走到这里订单已落进派发队列/已被柜台受理（QueuedBroker 是「入队即 return True」），
+            # 之后任何一步失败都不许再把这块地抽走——这正是 §CLAIMRELEASE 的分流点
+            sent_to_broker = True
             # settle：占位行回填真实委托引用（seq:<n> 或 mock 单号；交易所号随后续回报替换）
             self.ids.settle({
                 "order_id": order_ref, "signal_id": signal_id, "code": code, "side": side,
@@ -1321,6 +1502,16 @@ class Gateway:
                      "accept_ms=%.1f broker=%s", signal_id, code, side, qty, order_ref,
                      (time.time() - _t0) * 1000, self.active_key)
             return 200, {"ok": True, "order_id": order_ref, "err": ""}
+        except DispatchDuplicateSignal as e:
+            # 派发队列的纵深防线拦下这一笔：同 sid 已有在途 order 行 = 「订单已在队列里」是
+            # 既成事实（多半来自上一次占位被释放后的重试），所以**按已入队分流**（保留占位转
+            # 第三态），绝不允许因为"本轮没写进行"就把信号解锁——那正是 N-8 的双卖路径。
+            why = "派发队列拒绝重复入队: %s" % e
+            sent_to_broker = True
+            log.error("[gateway] §CLAIMRELEASE 派发队列纵深防线拦下同 signal_id 的第二笔入队"
+                      "（signal=%s code=%s side=%s qty=%s）——本端不重发，占位转「待核对」：%s",
+                      signal_id, code, side, qty, e)
+            return 500, {"ok": False, "err": str(e)}
         except Exception as e:  # noqa: BLE001 — §M-2 异常绝不冒泡成"占位遗留"
             why = "下单窗口异常: %s" % e
             log.exception("[gateway] §M-2 下单窗口异常（signal=%s code=%s side=%s）——"
@@ -1328,21 +1519,42 @@ class Gateway:
             return 500, {"ok": False, "err": "place order error: %s" % e}
         finally:
             if not accepted:
-                self._release_order_claim(signal_id, why)
+                # §CLAIMRELEASE 负向锁落点：sent_to_broker 是**关键字必传**参数，漏传即 TypeError，
+                # 让"不区分是否已发送就删占位"的写法无法再被新增（N-8 的成因正是这个分叉缺失）。
+                self._release_order_claim(signal_id, why, sent_to_broker=sent_to_broker)
 
-    def _release_order_claim(self, signal_id, why=""):
-        """§M-2 释放本地 pending 占位（幂等 + 绝不冒泡）。
+    def _release_order_claim(self, signal_id, why="", *, sent_to_broker):
+        """§M-2 + §CLAIMRELEASE 占位收尾：按「是否已交给通道」决定删占位还是转第三态。
 
-        只删未结算的占位行（store.release_pending 的 status='pending' 条件保证已 settle
-        的正式委托行不受影响），本方法不重发、不入队任何订单。
-        English: §M-2 — release the local placeholder only (never re-issue the order).
+        :param sent_to_broker: 必填关键字参数——本轮是否已进入 broker 发送/入队阶段。
+          False：订单从未离开本端 → 删占位（§M-2 原语义，避免同信号永久 409 死锁）。
+          True：订单已不可撤回地入队/报送 → **保留**占位行并提升为第三态「待核对」，
+          同 signal_id 的后续下单一律 409（宁可拒单也不双卖），并立即走网关告警出口
+          （error 级日志 + /admin/status 的 unresolved_orders 观察位）。
+        两条路径都不重发、不入队任何订单；日志都写清 reason 与「当时是否已入队」，
+        事后取证能一眼分辨（旧实现两种情况同一句「已释放占位」，取证为零）。
+        English: §CLAIMRELEASE — release the local placeholder only when the order never
+        reached the broker; otherwise keep the claim row in the unresolved third state.
         """
         try:
-            self.ids.release(signal_id)
-            log.warning("[gateway] §M-2 已释放 signal_id=%s 的本地占位（%s）；"
-                        "网关不自动重发，重试由调用方决策", signal_id, why or "未说明")
-        except Exception:  # noqa: BLE001 — 释放失败只能等运行期巡检兜底，不得再吞掉原始错误
-            log.exception("[gateway] §M-2 释放占位失败 signal_id=%s（等待巡检兜底）", signal_id)
+            if not sent_to_broker:
+                self.ids.release(signal_id)
+                log.warning("[gateway] §M-2 已释放 signal_id=%s 的本地占位（原因：%s；"
+                            "sent_to_broker=False，本笔**从未进入** broker 发送/入队）——"
+                            "网关不自动重发，重试由调用方决策", signal_id, why or "未说明")
+                return
+            # 已交给通道：占位行保留（signal_id UNIQUE 这道幂等防线不拆），只换状态 + 告警
+            moved = self.store.mark_pending_unresolved(signal_id)
+            self._unresolved_alerted.discard(signal_id)  # 让巡检线程对这个新第三态再告一次
+            log.error("[gateway] §CLAIMRELEASE signal_id=%s 本地占位**保留并转「待核对」**"
+                      "（sent_to_broker=True：订单已交给通道/入队，结算未落账；原因：%s）。"
+                      "同一 signal_id 的后续下单一律 409——宁可拒单也不重复下单；"
+                      "回报到达后自动收敛，或人工核对券商侧后用 POST /admin/order-confirm 解锁%s",
+                      signal_id, why or "未说明",
+                      "" if moved else "（注：该行已不是 pending，可能已被回报推进）")
+        except Exception:  # noqa: BLE001 — 收尾失败只能等运行期巡检兜底，不得再吞掉原始错误
+            log.exception("[gateway] §CLAIMRELEASE 占位收尾失败 signal_id=%s "
+                          "（sent_to_broker=%s，等待巡检兜底）", signal_id, sent_to_broker)
 
     def _do_cancel(self, body):
         """处理 POST /cancel 撤单：校验委托引用后委托 broker，结果如实返回。

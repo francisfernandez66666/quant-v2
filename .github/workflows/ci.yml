@@ -90,6 +90,14 @@ jobs:
         working-directory: web
         run: npm ci
 
+      # §N-1（2026-09-22 傍晚批）静态门禁：ESLint 以 --quiet 跑 = **只让 error 判红**（存量
+      # no-unused-vars 104 条按预授权降 warn，不阻塞），而 no-undef 锁在 error 档——正是本批
+      # 事故形态（Dashboard.jsx 调用未声明的 setQMTState，被空 catch 吞掉 → 实盘链路永不渲染，
+      # 类型检查与 vitest 都抓不到）。不进门禁 = 同类拼写错误下次照样静默上线。
+      - name: Lint（§N-1 no-undef 静态门禁，--quiet 只判 error）
+        working-directory: web
+        run: npm run lint -- --quiet
+
       - name: Test（§WS-I vitest 门禁：SSE 票据/认证/UI 组件回归）
         working-directory: web
         run: npm test

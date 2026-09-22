@@ -235,6 +235,14 @@ func bsLoadStockTables(db *store.DB, c *data.BaostockClient, code, start, end st
 
 	// 复权因子是 baostock K 线里拿不到的独立数据集：按分红实施日对齐 backadjustfactor，
 	// 供下游把未复权价还原成可比价格序列。
+	//
+	// §ADJ(P0-A 20260922) 落库口径声明（下游取数语义以本行为准）：adj_factor 是
+	// 【事件稀疏点】表——trade_date 写入的是分红实施日 normDate(dividoperatedate)，
+	// 一只票一年通常只有 0~3 行，而不是每个交易日一行。因此下游读取必须按
+	// "不晚于该交易日的最近一个事件日" **前向填充**（实现见 internal/store 的
+	// HfqBars 相关子查询 与 ths_tables.go 的 LegacyAdjFactorAt，两处语义一致）；
+	// 任何"因子日与行情日相等"的等值 JOIN 都会让非除权日因子落空、COALESCE 兜成 1，
+	// 使后复价退化为不复权价。
 	adj, err := c.AdjFactor(bsCode, isoFrom, isoEnd)
 	if err != nil {
 		return 0, err
@@ -373,6 +381,8 @@ func bsInsertFinancial(db *store.DB, code string, profit, growth, balance []data
 }
 
 // bsLoadAdjFactor 专项补齐 adj_factor 表（复权因子）。
+// 落库口径与 bsLoadStockTables 内的因子腿完全一致：trade_date = 分红实施日，事件稀疏点，
+// 下游按前向填充取数（见本文件 §ADJ(P0-A 20260922) 口径声明）。
 // 背景：daily 表已最新但 adj_factor 可能单独缺失（如 baostock 对 adjust_factor 接口失败时）。
 // bsLoadStockTables 的断点只看 daily 表，daily 满了会跳过整只股票，补不了缺失的因子。
 // 本函数按 adj_factor 单票断点续拉：一次调用覆盖整段区间，空则全量拉，非空则从最近之后补。

@@ -6029,7 +6029,12 @@ func (e *Engine) calibrateMacroCalendarOnceToday() {
 	if cm == nil {
 		return
 	}
-	mg := cm.Rules.Strategy.MacroGate
+	// §N-4/§CFGSMASH-concurrency（2026-09-22 傍晚批）：旧写法 `cm.Rules.Strategy.MacroGate`
+	// 直接跨 goroutine 读配置管理器活体字段，与战法保存（MergeStrategyConfig 持锁写）构成
+	// 数据 race。改走快照 getter（内部 RLock + 值拷贝），MacroGate 读的是本轮一致快照。
+	// English: read MacroGate through the locked snapshot getter instead of dereferencing the
+	// live Rules field, which raced with concurrent strategy-config writes.
+	mg := cm.StrategyConfigSnapshot().MacroGate
 	if !mg.RiskGateOn() || !mg.CalibrateOn() {
 		return
 	}

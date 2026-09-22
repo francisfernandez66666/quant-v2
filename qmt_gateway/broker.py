@@ -678,6 +678,15 @@ class QueuedBroker(Broker):
         §SIDEGATE-PY（2026-09-22 修复批）方向白名单前置：派发行一旦带非法方向，
         桥侧 `side == 买入 才买、否则卖` 会把它下成卖单（M-1 的方向翻转），
         所以入队之前就必须 fail-close 拒掉，绝不让"未知方向"进入派发队列。
+
+        §CLAIMRELEASE（2026-09-22 晚批 N-8）本函数的返回契约成为网关分流的依据，务必看清：
+        **入队即 return True**——从 store.dispatch_enqueue_order 返回那一刻起，这笔单已经
+        不可撤回地躺在派发队列里等桥来取。因此调用方（gateway._do_order）在此之后遇到的
+        任何失败（settle 抛错、DB busy、结果装配 KeyError）都不再允许删除 orders 占位行，
+        只能把它转成第三态「待核对」，否则上层重试就会双卖。
+        同理：store 侧的派发队列重复入队保护会抛 DispatchDuplicateSignal，这里**不捕获**、
+        原样向上抛给 _do_order——它需要知道"这一笔已经有人在队列里了"这个既成事实，
+        按已入队分流（在这里吞成 (False, "", err) 会被误判为"从未发送"而解锁占位）。
         """
         if not is_valid_side(req.get("side", "")):
             return side_reject(req.get("side", ""))

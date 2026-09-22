@@ -53,6 +53,14 @@ func main() {
 	}
 	defer db.Close()
 
+	// §数据源路由装配（§ADJ P0-A 三轮补强）：本工具读 HfqBars/RawBars 做全链路回测，
+	// 必须与引擎打分走同一套复权体系。本 main 手上没有 config 对象，故用统一入口
+	// store.ConfigureSourceFromFile 直接读 config.json（传空串 = 走 QUANT_DATA_DIR /
+	// $HOME/.quant-trading-v2 的缺省配置路径，与 -db 指到哪里无关，保证口径来源唯一）。
+	if err := store.ConfigureSourceFromFile(""); err != nil {
+		log.Printf("[replay] 数据源路由按默认装配（旧表 baostock），继续运行: %v", err)
+	}
+
 	// 命令行参数逐项落到回测选项上：事件门槛、每日事件上限、基准与选股/因子配置，
 	// 前瞻天数单独解析成 []int（非法值立刻退出，避免跑完再报无意义结果）。
 	opts := backtest.DefaultOptions()

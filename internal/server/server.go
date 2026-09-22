@@ -219,6 +219,14 @@ type Server struct {
 	// §C9-UX（2026-09-22 PM 批清扫）通知器注入：/api/notify-test 从空 stub 升级为
 	// 真实连通性探测（webhook/网关/ntfy 逐通道试发）。nil=独立 server 模式，接口回显 noop。
 	notifier *notify.Notifier
+	// §N-2（2026-09-22 傍晚批）notify-test 进程内频控：该端点打的是全局推送通道（server 级
+	// 单例 notifier），按账号限流挡不住多管理员合流刷 owner 手机，故取**全进程最小间隔 60s**
+	// 这一最严口径——命中回 429 + Retry-After。仅内存态（重启即清零）：探测本身无副作用
+	// 持久化诉求，没必要为它落库。
+	// English: §N-2 — process-wide minimum interval (60s) for /api/notify-test; the endpoint
+	// blasts the GLOBAL channels, so the throttle is per-process rather than per-account.
+	notifyTestMu     sync.Mutex
+	notifyTestLastAt time.Time // 最近一次被受理的探测时刻（零值=从未）
 }
 
 // EngineRegistry 引擎注册表的 HTTP 可见接口（由 engine.Registry 实现，避免 server→engine 依赖环）。
@@ -727,7 +735,14 @@ func (s *Server) registerRoutes() {
 	// 触实盘下单（内部本已 admin 闸）——路由整体升 adminMiddleware，成员点「忽略」不再能
 	// 静默改写他人信号簿；前端信号页忽略按钮对成员隐藏（见 web 侧 isForbidden 兜底）。
 	s.mux.HandleFunc("POST /api/action", s.adminMiddleware(s.handleFixAction))
-	s.mux.HandleFunc("POST /api/notify-test", s.authMiddleware(s.handleFixNotifyTest))
+	// §N-2（2026-09-22 傍晚批 §NOTIFYADMIN）档位抬升：/api/notify-test 打的是 server 级单例
+	// 通知器（全局 Webhook/推送网关/ntfy 通道，非本用户配置），消息级 LevelHigh——此前只挂
+	// authMiddleware，任何登录成员一次 POST 就能向 owner 全部推送通道发实弹，可用噪声淹没真
+	// 告警（§C9 把空 stub 升级成真探测时漏抬的档位）。web/src 对该端点零调用，抬 admin 不破坏
+	// 现网流程；配套进程内 60s 最小间隔频控 + opslog 审计（见 handleFixNotifyTest）。
+	// English: §N-2 — raised to adminMiddleware: the probe fires on the GLOBAL notifier channels
+	// with LevelHigh; any logged-in member could previously flood the owner's push channels.
+	s.mux.HandleFunc("POST /api/notify-test", s.adminMiddleware(s.handleFixNotifyTest))
 	// 实盘交易（AUTO_TRADING_PLAN M1）：持仓页实盘 tab 拉真实持仓/建议/执行 + 网关回报/状态。
 	// English: live trading (AUTO_TRADING_PLAN M1) — live tab real positions/advice/execute + gateway report/state.
 	// §GAP1.8/1.10 实盘端点收权：实盘账本/建议/手动执行仅 admin（单一实盘账户归属老板账号，
@@ -913,12 +928,23 @@ type statusCapture struct {
 	body   bytes.Buffer
 }
 
+// Header 复用真实 writer 的 header map（不缓冲）：中间件在 WriteHeader 前塞进去的头必须原样透传。
+// English: shares the real writer's header map so headers set before WriteHeader still land.
 func (c *statusCapture) Header() http.Header { return c.header }
+
+// WriteHeader 只认第一次调用的状态码（http.ResponseWriter 契约：重复调用应被忽略）。
+// English: keeps only the first status code, per the ResponseWriter contract.
 func (c *statusCapture) WriteHeader(code int) {
 	if c.status == 0 {
 		c.status = code
 	}
 }
+
+// Write 把响应体先落缓冲：兜底 handler 要跑完才知道状态码——3xx 原样回写这条体，
+// 404/405 丢弃它改走 JSON 信封（分支见 :914）。未显式 WriteHeader 时按 200 记，
+// 与 net/http 的隐式行为一致（否则成功请求会被误判成异常）。
+// English: buffers the body because the fallback handler reveals its status only after running;
+// 3xx replays the buffered body, 404/405 replaces it with the JSON envelope, absent header => 200.
 func (c *statusCapture) Write(p []byte) (int, error) {
 	if c.status == 0 {
 		c.status = http.StatusOK
@@ -1951,19 +1977,60 @@ func (s *Server) handleListPositions(w http.ResponseWriter, r *http.Request) {
 
 // handleGetStrategyConfig 处理 GET /api/config/strategy：返回全局策略参数配置。
 // 战法参数全局共享（多账号一致），不按账号隔离。
+// §N-4：响应体含 updated_at（§中-6 版本戳），前端保存时原样回传做写前比对。
 func (s *Server) handleGetStrategyConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.cfg.GetStrategyConfig())
 }
 
-// handleSetStrategyConfig 处理 POST /api/config/strategy：保存全局策略参数配置。
+// handleSetStrategyConfig 处理 POST /api/config/strategy：稀疏 merge 保存全局策略参数配置。
+//
+// §N-4（2026-09-22 傍晚批 §CFGSMASH）**对外语义变更**：旧实现把 body 反序列化成完整
+// StrategyConfig 后全量替换（json 缺键=零值），前端一次加载失败 + 一次整份保存即把五套战法
+// 阈值落 0、已落库、重启救不回。现改为「**没传=保留旧值**」的稀疏 merge（逐字段递归，详见
+// config.Manager.MergeStrategyConfig）；显式传某个键仍会更新该键（要清 0 请明写 0）。
+// §中-6 乐观锁：body 可携带 GET 读到的 updated_at——与服务端当前版本不一致回 409
+// （附 current_updated_at，前端提示"配置已被他人更新，请重载"）；不带 = 不比对（兼容脚本直 POST）。
+// 端点注释即对外契约：响应回传本次写入后的新 updated_at。
+// English: §N-4 — the write is now a SPARSE MERGE ("absent key keeps the stored value", the old
+// decode-then-replace-all turned a failed page load + save into zeroed tactics); optional
+// optimistic locking via updated_at, mismatch => 409 with current_updated_at.
 func (s *Server) handleSetStrategyConfig(w http.ResponseWriter, r *http.Request) {
-	var cfg config.StrategyConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	// 先解成「顶层键→原始 JSON」而不是 typed struct：typed 解码会把缺失键折叠成零值，
+	// 正是本缺陷的成因；RawMessage 保留了"键到底出现过没有"这一稀疏 merge 的唯一判据。
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	s.cfg.SetStrategyConfig(&cfg)
-	writeJSON(w, 200, map[string]string{"status": "ok"})
+	// §中-6：取出客户端基线版本（允许缺省=不比对），非法类型宽容忽略而非 400——
+	// 版本只是比对输入，不值得为它拒绝一次合法参数写入。
+	baseVersion := ""
+	if raw, ok := body["updated_at"]; ok {
+		var v string
+		if err := json.Unmarshal(raw, &v); err == nil {
+			baseVersion = v
+		}
+	}
+	merged, err := s.cfg.MergeStrategyConfig(body, baseVersion)
+	if errors.Is(err, config.ErrStrategyVersionConflict) {
+		// 后写不覆盖前写：回 409 让管理员重载后再改（静默覆盖=两个人互相"改没了"）。
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":              "战法参数已被其他操作更新（版本不一致），请重新加载后再保存",
+			"current_updated_at": merged.UpdatedAt,
+		})
+		return
+	}
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	// 操作留痕：merge 写改了哪些顶层键（不含数值正文，配合配置历史快照可追溯）。
+	keys := make([]string, 0, len(body))
+	for k := range body {
+		keys = append(keys, k)
+	}
+	opslog.Audit("config_strategy_merge", userIDFor(r), "strategy", fmt.Sprintf("keys=%v version=%s", keys, merged.UpdatedAt))
+	writeJSON(w, 200, map[string]string{"status": "ok", "updated_at": merged.UpdatedAt})
 }
 
 // ── D1 规则配置 ──

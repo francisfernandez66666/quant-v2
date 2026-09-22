@@ -263,6 +263,24 @@ func (c *Controller) JudgeSell(ch Channel, account string, in SellInput, pol Pol
 	return c.JudgeSellView(ch, account, in, pol, now).Disposal
 }
 
+// SellHighAnchor 回读某持仓裁决状态机当前的**移动止盈锚点**（持仓期最高价，含内核每轮自抬的部分）。
+// 无状态/无锚点回 0（调用方按"无锚点"处理，不得据此把账本高点写成 0）。
+// 为什么需要这个只读口（§N-7 2026-09-22 傍晚批复验）：内核 sellState.HighPrice 是"播种 + 每轮自抬"
+// 的运行期真值，live 账本列 real_positions.highest_price 此前只被建仓价/成交价写过，期间最高价
+// 从未入账 → 重启即回落到建仓价，涨过 15% 再回落的仓位移动止盈永不触发。回写账本需要把这份
+// 运行期真值取出来，而 sellState 是包内私有类型，只能由本包提供受控只读访问器（不让 engine
+// 直接改状态，避免绕过裁决的单调语义）。
+// English: §N-7 — read-only accessor for the kernel's live trailing-stop anchor (the high it has
+// raised during this process), so the engine can persist it back to the ledger.
+func (c *Controller) SellHighAnchor(ch Channel, account, code string) float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st := c.sellStates[sellKey{ch, account, code}]; st != nil {
+		return st.HighPrice
+	}
+	return 0
+}
+
 // PruneSellStates 清理该通道/账号下本轮已不在持仓的裁决状态（重新入场从零开始）。
 // English: drop sell-judge states for codes no longer held (re-entry starts fresh).
 func (c *Controller) PruneSellStates(ch Channel, account string, held map[string]bool) {

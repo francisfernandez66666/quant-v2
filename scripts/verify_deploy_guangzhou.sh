@@ -18,6 +18,8 @@
 #   5) 网关：/health ok:true；/settlement 未鉴权 → 401（§P0-1a 新端点路由已上线）
 #   6) 引擎新端点：POST /api/holdings/balance、/api/positions/execute 未鉴权 → 401
 #   7) §20260922PM：POST /api/news/test-attribution 未鉴权 → 401（M-14 收权 admin 生效复核）
+#   8) §N-5（2026-09-23 晚批，第 15 探针）：quant 服务运行环境必须含 LLM/HITHINK 两组**键名**
+#      ——注册脚本洗掉密钥后仍会打印"registered"，故必须在部署面独立复核（只报键名，绝不报值）
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
@@ -138,6 +140,43 @@ Probe "engine:/api/positions/execute unauth=401" ($code -eq "401") ("got=" + $co
 # 7) §20260922PM 收口面探针：test-attribution 已收权 admin（未鉴权必须 401，404=旧二进制）
 $code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/news/test-attribution") '{}'
 Probe "engine:/api/news/test-attribution unauth=401" ($code -eq "401") ("got=" + $code + "；404=二进制未更新，200=收权未生效（成员越权面仍在）")
+
+# 8) §N-5（2026-09-23 晚批）第 15 探针：quant 服务运行环境必须含 LLM/HITHINK 两组**键名**。
+#
+# 为什么要单列一条（注册脚本尾部已经断言过了）：register_engine_services.ps1 的
+#   AppEnvironmentExtra 是整体替换语义，旧版任何一次不带密钥参数的重跑（改端口/修故障/二次部署）
+#   都会静默删掉 LLM_API_KEY/LLM_API_URL/LLM_MODEL，而且**照打 "engine services registered"**。
+#   修完之后注册步会自己判红，但现网态仍可能被一次手工 nssm set / 旧脚本副本洗掉——
+#   所以校验面必须独立于施工面（与 §M7「verify 面要求 quant-web Running、deploy 面没人管」同族教训）。
+# 硬规矩：**只看键名，绝不回显值**。nssm get 的输出含密钥明文，这里只截取 '=' 左侧，
+#   失败信息里也只拼键名；日志/终端出现密钥明文按事故处理。
+# 判定口径 = 服务级 AppEnvironmentExtra ∪ 机器级环境变量：NSSM 的 extra 是**追加**语义，
+#   进程照样继承机器级 env，而现网 HITHINK_FINANCE_API_KEY 长期只存在于机器级
+#   （RUNBOOK §4.1b.2「顺带核查」+ deploy/qmt-win/run_ths_backfill.ps1:10 的读取口径）。
+#   只查 extra 会造出一条永久性假红，且掩盖不了真缺键——两者取并集才是「进程实际能不能拿到」。
+$envNeed = @("LLM_API_KEY", "LLM_API_URL", "LLM_MODEL", "HITHINK_FINANCE_API_KEY")
+$nssmCandidates = @(
+    "C:\opt\quant\qmt-win\tools\nssm-2.24\win64\nssm.exe",       # deploy_guangzhou.sh 上传位（现网）
+    "C:\opt\quant\deploy\qmt-win\tools\nssm-2.24\win64\nssm.exe",# 备份任务安装位（register_backup_task.ps1）
+    "C:\opt\quant\tools\nssm-2.24\win64\nssm.exe"
+)
+$haveKeys = @()
+$nssmFound = $null
+foreach ($np in $nssmCandidates) { if (Test-Path $np) { $nssmFound = $np; break } }
+if ($nssmFound) {
+    $raw = & $nssmFound get quant AppEnvironmentExtra 2>$null
+    foreach ($l in (("$raw" | Out-String) -split "`r?`n")) {
+        $t = $l.Replace([char]0, '').Trim()
+        $i = $t.IndexOf("=")
+        if ($i -gt 0) { $haveKeys += $t.Substring(0, $i) }      # 只留键名，值就地丢弃
+    }
+}
+foreach ($k in $envNeed) {
+    if ([Environment]::GetEnvironmentVariable($k, 'Machine')) { $haveKeys += $k }   # 机器级同样算拿到
+}
+$envMissing = @($envNeed | Where-Object { $haveKeys -notcontains $_ })
+$envDetail = "nssm=" + $(if ($nssmFound) { "ok" } else { "not-found(只按机器级判定)" }) + " 缺键=" + ($envMissing -join ",") + "（只报键名，未回显值）"
+Probe "engine:quant env LLM/HITHINK key names" ($envMissing.Count -eq 0) $envDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，

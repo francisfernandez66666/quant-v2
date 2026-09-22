@@ -124,6 +124,18 @@ export default function Settings() {
 
   const [strategyCfg, setStrategyCfg] = useState(emptyStrategy())
   const [strategySaving, setStrategySaving] = useState(false)
+  // §N-4（2026-09-22 傍晚批 §CFGSMASH）战法参数加载三态：loading / loaded / error。
+  // 旧实现 `catch (_) {}` 把加载失败静默吞掉 → 表单落在空对象上 → 数字缺失被 `?? 0` 渲染成 0
+  // → 一次整份保存把五套战法阈值清零落库。现在 error 态**禁用保存 + 红条警示**，
+  // 数字缺失渲染为空（不把「缺失」和「0」混同）+ 保存前必填校验。
+  // English: §N-4 — tri-state loader for the tactics form; load-failed disables saving
+  // (red banner), missing numbers render empty instead of 0, and save validates all fields.
+  const [strategyLoadState, setStrategyLoadState] = useState('loading')
+  const [strategyLoadError, setStrategyLoadError] = useState('')
+  // §中-6 乐观锁基线：GET /api/config/strategy 回传的 updated_at，保存时原样带上；
+  // 服务端版本已前进 → 409（banner 变「版本冲突」，必须重载后才能再存，禁止盲覆盖）。
+  const [strategyVersion, setStrategyVersion] = useState('')
+  const [strategyConflict, setStrategyConflict] = useState(false)
   // §F33 修复：保存前 dirty tracking 基线（LLM/战法配置分别），load 完成时同步，
   // 保存成功后重置。dirty=true 时按钮右上角亮小圆点 + 页面关闭前 beforeunload 拦截。
   // English: F33 — baseline snapshots for LLM/strategy configs; dirty indicator + unload guard
@@ -180,15 +192,69 @@ export default function Settings() {
     }
   }
 
+  // 加载战法参数（初始化与「重载」按钮共用同一份口径，避免两处各写一遍而分叉）。
+  // §N-4：失败不再 `catch(_) {}` 静默——置 error 态禁用保存，并把原因显示在红条里。
+  async function loadStrategyCfg() {
+    setStrategyLoadState('loading')
+    setStrategyLoadError('')
+    setStrategyConflict(false)
+    try {
+      const sc = await api.fetchStrategyConfig()
+      if (!sc || typeof sc !== 'object') throw new Error('返回载荷为空/非对象')
+      const next = emptyStrategy()
+      for (const group of strategyGroups) {
+        const src = sc[group.key]
+        if (src) Object.assign(next[group.key], src)
+      }
+      setStrategyCfg(next)
+      setStrategyBaseline(JSON.parse(JSON.stringify(next))) // §F33 深拷贝基线
+      setStrategyVersion(typeof sc.updated_at === 'string' ? sc.updated_at : '') // §中-6 版本基线
+      setStrategyLoadState('loaded')
+    } catch (e) {
+      if (api.isForbidden(e)) { navigate('/403'); return } // §A5 同口径：权威角色非管理员跳 403
+      setStrategyLoadError(String((e && e.message) || e))
+      setStrategyLoadState('error')
+    }
+  }
+
   // 保存战法参数配置
+  // §N-4 三重闸：① 非 loaded 态禁存（按钮已禁用，这里再兜一道，防回车/脚本触发）；
+  // ② 必填校验——数字字段缺失（undefined/null/NaN）不得折叠成 0 提交，列出缺失项拒绝保存；
+  // ③ 请求体带 §中-6 的 updated_at 基线，409=他人已先落一步 → 红条+禁止覆盖，只给「重载」。
   async function saveStrategy() {
+    if (strategyLoadState !== 'loaded') return
+    const missing = []
+    for (const group of strategyGroups) {
+      for (const f of group.fields) {
+        if (f.type === 'switch') continue // 布尔开关无「缺失=0」歧义，缺省即 false 明示
+        const v = strategyCfg[group.key][f.k]
+        if (v === undefined || v === null || v === '' || !Number.isFinite(Number(v))) {
+          missing.push(`${group.title}·${f.label}`)
+        }
+      }
+    }
+    if (missing.length) {
+      showToast(`以下战法参数缺失，禁止保存（缺失≠0，请补齐或点「重载」）：${missing.slice(0, 5).join('、')}${missing.length > 5 ? ` 等 ${missing.length} 项` : ''}`, 'error')
+      return
+    }
     setStrategySaving(true)
     try {
-      await api.setStrategyConfig(strategyCfg)
+      // 后端（§N-4 起）为稀疏 merge：body 未出现的键保留库中原值；updated_at 仅作版本比对，
+      // 服务端统一盖新戳并回传——保存成功后把基线推进，防自我冲突（自己刚写的又被判为他人）。
+      const res = await api.setStrategyConfig({ ...JSON.parse(JSON.stringify(strategyCfg)), updated_at: strategyVersion || undefined })
+      if (res && typeof res.updated_at === 'string') setStrategyVersion(res.updated_at)
       setStrategyBaseline(JSON.parse(JSON.stringify(strategyCfg))) // §F33 基线跟随
       showToast('战法参数已保存，热更新即时生效', 'success')
     } catch (e) {
-      showToast('保存失败: ' + (e.message || '未知错误'), 'error')
+      if (e && e.status === 409) {
+        // §中-6 冲突：绝不自动重放（后写覆盖前写正是本缺陷要杀的行为），强制人工重载比对。
+        setStrategyLoadError('战法参数已被其他管理员更新（版本冲突），已禁止本次覆盖保存；请点「重载」读取最新参数后重新修改。')
+        setStrategyLoadState('error')
+        setStrategyConflict(true)
+        showToast('保存被拒绝：参数版本冲突，请重载后重试', 'error')
+      } else {
+        showToast('保存失败: ' + (e.message || '未知错误'), 'error')
+      }
     }
     setStrategySaving(false)
   }
@@ -409,19 +475,8 @@ export default function Settings() {
         // §A5：首个 admin 数据端点即 403=服务端权威角色非管理员，跳统一 403 页
         if (api.isForbidden(e)) navigate('/403')
       }
-      // 3) 读取战法参数：先建五组空占位，再按分组归并后端返回
-      try {
-        const sc = await api.fetchStrategyConfig()
-        if (sc) {
-          const next = emptyStrategy()
-          for (const group of strategyGroups) {
-            const src = sc[group.key]
-            if (src) Object.assign(next[group.key], src)
-          }
-          setStrategyCfg(next)
-          setStrategyBaseline(JSON.parse(JSON.stringify(next))) // §F33 深拷贝基线
-        }
-      } catch (_) {}
+      // 3) 读取战法参数（§N-4 三态加载，统一走 loadStrategyCfg：失败=禁保存+红条）
+      await loadStrategyCfg()
       // 4) 读取"显示全部资讯"开关状态
       try {
         const ns = await api.fetchNewsShowAllStatus()
@@ -462,9 +517,14 @@ export default function Settings() {
       )
     }
     // 数字型字段：渲染 InputNumber（默认步进 1，列式布局）
+    // §N-4：旧写法 `?? 0` 把「后端没给这个键」渲染成 0——缺失与真实 0 混同，
+    // 用户没碰过它也会以 0 提交（配合后端旧全量替换=静默清零）。现缺失渲染为**空**，
+    // 由保存前必填校验兜底；真实存 0 的字段后端回 0，0 ?? undefined=0，不受影响。
+    // English: §N-4 — a missing key now renders EMPTY (validated as required on save)
+    // instead of 0; an actually-stored 0 still renders 0.
     return (
       <InputNumber
-        value={strategyCfg[group.key][f.k] ?? 0}
+        value={strategyCfg[group.key][f.k] ?? undefined}
         onChange={(v) => setStrategyField(group.key, f.k, v)}
         step={f.step || 1}
         theme="column"
@@ -652,11 +712,43 @@ export default function Settings() {
       ))}
 
       <Card title="战法参数" style={{ marginBottom: 16 }}>
+        {/* §N-4 保存闸三态提示：error=红条「读取失败，禁止保存」（版本冲突复用此条，措辞换版）；
+            loading=灰字进行态；loaded=原说明。error 态禁用保存按钮并给「重载」出口。 */}
+        {strategyLoadState === 'error' && (
+          <div
+            role="alert"
+            style={{
+              margin: '0 0 10px',
+              padding: '8px 10px',
+              borderRadius: 4,
+              fontSize: 12,
+              background: 'var(--app-danger-bg, #fdecee)',
+              border: '1px solid var(--app-border, #e0e0e0)',
+              color: 'var(--app-text-1, #333)',
+            }}
+          >
+            <div style={{ fontWeight: 600 }}>
+              {strategyConflict ? '⛔ 版本冲突，禁止保存' : '⛔ 读取失败，禁止保存'}
+            </div>
+            <div style={{ marginTop: 4 }}>{strategyLoadError || '战法参数读取失败（原因未知），为避免把缺失值写成 0，已禁止保存。'}</div>
+          </div>
+        )}
         <div style={rowStyle}>
           <span style={labelStyle}>说明</span>
-          <span className="muted" style={{ fontSize: 12 }}>参数保存后重启后端生效；权重请保持各策略合计 ≤ 1</span>
+          <span className="muted" style={{ fontSize: 12 }}>
+            {strategyLoadState === 'loading' && '战法参数读取中…'}
+            {strategyLoadState === 'loaded' && '参数保存后热更新生效；权重请保持各策略合计 ≤ 1；后端为稀疏保存（未改动/缺失字段保留库中原值）'}
+            {strategyLoadState === 'error' && '当前不可保存：先「重载」'}
+          </span>
         </div>
-        <Button theme="primary" onClick={saveStrategy} loading={strategySaving}>保存战法参数</Button>
+        <div style={{ ...rowStyle, gap: 8 }}>
+          <Button theme="primary" onClick={saveStrategy} loading={strategySaving} disabled={strategyLoadState !== 'loaded'}>
+            保存战法参数
+          </Button>
+          {strategyLoadState !== 'loaded' && (
+            <Button variant="outline" onClick={loadStrategyCfg} disabled={strategyLoadState === 'loading'}>重载</Button>
+          )}
+        </div>
         {strategyDirty && <span style={{ marginLeft: 8, color: 'var(--app-warn-text)', fontSize: 12 }}>● 有未保存修改</span>}
       </Card>
 

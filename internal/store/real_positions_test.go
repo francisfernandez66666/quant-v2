@@ -11,6 +11,9 @@ import (
 )
 
 // TestUpsertRealPositions 验证全量对账：upsert 覆盖 + 移除已清仓行 + highest_price 单调不回退。
+// §N-6（2026-09-22 傍晚批，裁决 11=本地含费优先）追加断言：qty 仍随快照刷新（份额数以柜台为准），
+// cost_price/amount 则**不再**被快照的不含费 open_price 覆盖——本地已有非零含费成本时快照值仅作
+// 兜底；amount 由「选定成本 × 快照数量」同源推导（400×10=4000，不是快照的 4200）。
 func TestUpsertRealPositions(t *testing.T) {
 	db := testDB(t)
 	base := []RealPosition{
@@ -31,14 +34,31 @@ func TestUpsertRealPositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("by code: %v", err)
 	}
-	if p.Qty != 400 || p.CostPrice != 10.5 {
-		t.Fatalf("upsert 覆盖失败: %+v", p)
+	if p.Qty != 400 {
+		t.Fatalf("qty 应随快照刷新为 400: %+v", p)
+	}
+	if p.CostPrice != 10 || p.Amount != 4000 {
+		t.Fatalf("§N-6 本地含费成本不得被快照(10.5/4200)覆盖，且 amount 须=成本×数量: %+v", p)
 	}
 	if p.HighestPrice != 11 {
 		t.Fatalf("highest_price 应保留旧峰值 11，got %v", p.HighestPrice)
 	}
 	if _, err := db.RealPositionByCode("000001.SZ"); err != sql.ErrNoRows {
 		t.Fatalf("000001 应被移除，err=%v", err)
+	}
+	// 本地成本为 0（历史脏行/券商快照先建行）时快照仍可兜底回填——守卫不得把纠正通道焊死。
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "301001.SZ", Name: "新代码", Qty: 100, CostPrice: 0, Amount: 0, HighestPrice: 0},
+	}); err != nil {
+		t.Fatalf("seed zero-cost row: %v", err)
+	}
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "301001.SZ", Name: "新代码", Qty: 100, CostPrice: 12.5, Amount: 1250, HighestPrice: 12.5},
+	}); err != nil {
+		t.Fatalf("backfill snapshot: %v", err)
+	}
+	if p, _ = db.RealPositionByCode("301001.SZ"); p.CostPrice != 12.5 || p.Amount != 1250 {
+		t.Fatalf("本地成本为 0 时快照应兜底回填: %+v", p)
 	}
 }
 
@@ -822,5 +842,214 @@ func TestReconcileDoesNotWashStrategyAttribution(t *testing.T) {
 	p, _ = db.RealPositionByCode("600000.SH")
 	if p.Strategy != "龙头首阴" {
 		t.Fatalf("§M5 UpsertRealPositions 空 strategy 不应洗掉归因, got %q", p.Strategy)
+	}
+}
+
+// TestSumOpenSellQtyNet §N-3（2026-09-22 傍晚批复验）行为用例：当日在途卖量必须按
+// 「每笔委托的未成交余量」计，而不是整笔委托量——调用方 realSoldOrOpenQtyToday 的算式是
+// 「持仓 − Σ已成交 − Σ在途」，Σ已成交 已经数过部成单的那部分成交，整笔口径等于同一笔成交
+// 扣两次，剩余量被压成负数 → 当天永不补卖（少卖=敞口留过夜）。
+// 断言面：部成净额 / 回填失败（order_id 停留 pend: 前缀）靠 signal_id 关联成交 / 终态不计 /
+// 发送失败不计 / 跨日不计 / 买入方向不计 / 他账号不串账 / filled>qty 异常钳 0。
+// English: §N-3 — SumOpenSellQty must sum each open sell at its unfilled remainder (net of that
+// ticket's own fills), matching the buy-side §BUDGET_FREEZE definition of 部成.
+func TestSumOpenSellQtyNet(t *testing.T) {
+	db := testDB(t)
+	const day = "2026-09-22"
+	odr := func(uid, orderID, sid, code, side, status string, qty int, createdAt string) {
+		t.Helper()
+		if _, err := db.UpsertRealOrder(RealOrder{OrderID: orderID, SignalID: sid, Code: code,
+			Side: side, Status: status, Price: 10, Qty: qty, CreatedAt: createdAt, UserID: uid}); err != nil {
+			t.Fatalf("insert order %s: %v", sid, err)
+		}
+	}
+	fil := func(orderID, sid, code string, qty int) {
+		t.Helper()
+		if _, err := db.db.Exec(`INSERT INTO fills(order_id, code, side, price, qty, amount, traded_at, signal_id, user_id)
+			VALUES (?, ?, '卖出', 10, ?, 10*?, ?, ?, 'u1')`,
+			orderID, code, qty, qty, day+" 09:40:00", sid); err != nil {
+			t.Fatalf("insert fill %s: %v", sid, err)
+		}
+	}
+
+	// ① 挂 1000 部成 500：在途只占 500（旧口径会占满 1000 → 与 Σ已成交 重复扣 500）
+	sid1 := "sell:600000:止损:" + day
+	odr("u1", "GW1", sid1, "600000.SH", "卖出", "部成", 1000, day+" 09:35:00")
+	fil("GW1", sid1+":r1000", "600000.SH", 500)
+	if got := db.SumOpenSellQty("u1", "600000.SH", day); got != 500 {
+		t.Fatalf("① 部成 500 的 1000 股在途卖单应按净额 500 计, got %d", got)
+	}
+	// ② 同一 base 的第二桶（补卖 500 全部未成）：净额相加 = 500 + 500
+	sid2 := sid1 + ":r500"
+	odr("u1", "GW2", sid2, "600000.SH", "卖出", "已报", 500, day+" 09:50:00")
+	if got := db.SumOpenSellQty("u1", "600000.SH", day); got != 1000 {
+		t.Fatalf("② 两笔在途（净 500 + 未成 500）应合计 1000, got %d", got)
+	}
+	// ③ 首桶再部成 300（累计 800）：净额降到 200，总在途 700
+	fil("GW1", sid1+":r1000", "600000.SH", 300)
+	if got := db.SumOpenSellQty("u1", "600000.SH", day); got != 700 {
+		t.Fatalf("③ 累计成交 800 后首桶净额应为 200（+第二桶 500）=700, got %d", got)
+	}
+	// ④ 首桶全成（1000）：净额 0，只剩第二桶 500
+	fil("GW1", sid1+":r1000", "600000.SH", 200)
+	if got := db.SumOpenSellQty("u1", "600000.SH", day); got != 500 {
+		t.Fatalf("④ 全成桶应按 0 计（终态前也只计未成交余量）, got %d", got)
+	}
+	if _, err := db.UpdateRealOrderStatusMonotonic("u1", "GW1", "已成"); err != nil {
+		t.Fatalf("mark filled: %v", err)
+	}
+	if got := db.SumOpenSellQty("u1", "600000.SH", day); got != 500 {
+		t.Fatalf("④ 已成终态后仍为 500, got %d", got)
+	}
+
+	// ⑤ 网关单号回填失败（本地 order_id 停留 pend: 前缀）：成交只能按 signal_id 关联，
+	//    若只认 order_id 会得 0 成交 → 整笔占额，正是本条要根除的双扣形态。
+	sid5 := "sell:600519:止盈:" + day
+	odr("u1", "pend:"+sid5, sid5, "600519.SH", "卖出", "部成", 1000, day+" 10:00:00")
+	fil("GW-elsewhere", sid5, "600519.SH", 400)
+	if got := db.SumOpenSellQty("u1", "600519.SH", day); got != 600 {
+		t.Fatalf("⑤ pend: 占位行需按 signal_id 关联成交（净额 600）, got %d", got)
+	}
+
+	// ⑥ 终态/失败/跨日/反向一律不占额度
+	odr("u1", "GW6", "sell:000001:已撤:"+day, "000001.SZ", "卖出", "已撤", 500, day+" 09:31:00")
+	odr("u1", "GW7", "sell:000001:发送失败:"+day, "000001.SZ", "卖出", "发送失败", 500, day+" 09:32:00")
+	odr("u1", "GW8", "sell:000001:昨日:"+day, "000001.SZ", "卖出", "已报", 500, "2026-09-21 14:55:00")
+	odr("u1", "GW9", "buy:000001:"+day, "000001.SZ", "买入", "已报", 500, day+" 09:33:00")
+	if got := db.SumOpenSellQty("u1", "000001.SZ", day); got != 0 {
+		t.Fatalf("⑥ 终态/发送失败/跨日/买入都不该占在途卖量, got %d", got)
+	}
+
+	// ⑦ 他账号不串账（1000 股在途属于 u2）
+	odr("u2", "GW10", "sell:600000:other:"+day, "600000.SH", "卖出", "已报", 1000, day+" 09:36:00")
+	if got := db.SumOpenSellQty("u1", "600000.SH", day); got != 500 {
+		t.Fatalf("⑦ 他账号在途卖单不得计入, got %d", got)
+	}
+	if got := db.SumOpenSellQty("u2", "600000.SH", day); got != 1000 {
+		t.Fatalf("⑦ u2 自身在途应为 1000, got %d", got)
+	}
+
+	// ⑧ 异常行 filled>qty（网关重放/交割单回灌）：净额钳 0，绝不给出负在途把剩余量抬高成超卖
+	odr("u1", "GW11", "sell:000002:异常:"+day, "000002.SZ", "卖出", "部成", 300, day+" 09:37:00")
+	fil("GW11", "sell:000002:异常:"+day, "000002.SZ", 500)
+	if got := db.SumOpenSellQty("u1", "000002.SZ", day); got != 0 {
+		t.Fatalf("⑧ filled>qty 异常行净额须钳 0, got %d", got)
+	}
+}
+
+// TestReconcileKeepsFeeInclusiveCost §N-6（2026-09-22 傍晚批复验，owner 裁决 11=本地含费优先）：
+// 对账快照的不含费 open_price 不得裸写覆盖成交回报算出的含费成本；本地成本为 0/缺失时快照
+// 仍可兜底回填；amount 必须由「选定成本 × 快照数量」同源推导，杜绝 qty×cost≠amount 错配；
+// 守卫丢弃快照值时必须留痕（计数，本批主题是「静默失效」）。
+// English: §N-6 — reconcile keeps the local fee-inclusive cost basis (ruling 11), back-fills only
+// when local cost is missing, derives amount from the chosen cost × snapshot qty, and counts drops.
+func TestReconcileKeepsFeeInclusiveCost(t *testing.T) {
+	db := testDB(t)
+	// 建仓：100 股 @10 佣金 5 → 含费成本 10.05（ApplyRealFill §F1 口径）
+	if err := db.ApplyRealFill(RealFill{OrderID: "N6-1", Code: "600000.SH", Side: "买入",
+		Price: 10, Qty: 100, Amount: 1000, Fee: 5, TradedAt: "2026-09-22 09:31:00", UserID: "u1"}); err != nil {
+		t.Fatalf("buy: %v", err)
+	}
+	// 券商快照：不含费 10.00 / amount 1000 / 数量 120（柜台加了 20 股）
+	if _, err := db.ReconcilePositionsForUser("u1", []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 120, CostPrice: 10, Amount: 1200, UserID: "u1"},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	p, err := db.RealPositionByCode("600000.SH")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if p.CostPrice != 10.05 {
+		t.Fatalf("§N-6 含费成本 10.05 不得被不含费快照 10 覆盖, got %v", p.CostPrice)
+	}
+	if p.Qty != 120 || p.Amount != 10.05*120 {
+		t.Fatalf("§N-6 amount 须=选定成本×快照数量(10.05×120=%v), got qty=%d amount=%v", 10.05*120, p.Qty, p.Amount)
+	}
+	if db.CostGuardDrops() != 1 {
+		t.Fatalf("§N-6 守卫丢弃快照值必须留痕计数, got %d", db.CostGuardDrops())
+	}
+	// 快照缺成本（0/缺失）：本地含费值原样保留，绝不退化成 0
+	if _, err := db.ReconcilePositionsForUser("u1", []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 120, CostPrice: 0, Amount: 0, UserID: "u1"},
+	}); err != nil {
+		t.Fatalf("reconcile zero-cost snapshot: %v", err)
+	}
+	if p, _ = db.RealPositionByCode("600000.SH"); p.CostPrice != 10.05 || p.Amount != 10.05*120 {
+		t.Fatalf("§N-6 快照成本为 0 时不得清零本地含费账, got %v/%v", p.CostPrice, p.Amount)
+	}
+	// 本地成本为 0（历史脏行/券商先建行）：快照仍是唯一纠正通道
+	// （账号用 u9 隔离——UpsertRealPositions 是全量对账语义，混在同一账号会把上面的 600000 行删掉）
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "301002.SZ", Name: "脏行", Qty: 100, CostPrice: 0, Amount: 0, UserID: "u9"},
+	}); err != nil {
+		t.Fatalf("seed zero row: %v", err)
+	}
+	if _, err := db.ReconcilePositionsForUser("u9", []RealPosition{
+		{TsCode: "301002.SZ", Name: "脏行", Qty: 100, CostPrice: 12.5, Amount: 1250},
+	}); err != nil {
+		t.Fatalf("reconcile backfill: %v", err)
+	}
+	if p, _ = db.RealPositionByCode("301002.SZ"); p.CostPrice != 12.5 || p.Amount != 1250 {
+		t.Fatalf("§N-6 本地无成本时快照必须兜底回填 12.5/1250, got %v/%v", p.CostPrice, p.Amount)
+	}
+	// 券商快照 highest_price 更低时不得拉回已回写的锚点（§N-7 与 §N-6 同一条 upsert 的协调点）
+	if raised, err := db.RaiseRealPositionHigh("u1", "600000.SH", 20); err != nil || !raised {
+		t.Fatalf("§N-7 锚点回写应成功且报变更: raised=%v err=%v", raised, err)
+	}
+	if _, err := db.ReconcilePositionsForUser("u1", []RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 120, CostPrice: 10, Amount: 1200, HighestPrice: 11, UserID: "u1"},
+	}); err != nil {
+		t.Fatalf("reconcile anchor: %v", err)
+	}
+	if p, _ = db.RealPositionByCode("600000.SH"); p.HighestPrice != 20 {
+		t.Fatalf("§N-7 已回写的移动止盈锚点不得被对账快照(11)拉回, got %v", p.HighestPrice)
+	}
+}
+
+// TestRaiseRealPositionHighOnlyUp §N-7 账本侧单调语义：只增不减、无有效锚点（≤0）绝不落库、
+// 遗留全局行（user_id=”）对账号查询同样可回写。
+// English: §N-7 — the anchor write-back is strictly monotonic, refuses non-positive highs, and
+// still reaches legacy global rows.
+func TestRaiseRealPositionHighOnlyUp(t *testing.T) {
+	db := testDB(t)
+	if _, err := db.UpsertRealPositions([]RealPosition{
+		{TsCode: "600000.SH", Name: "浦发", Qty: 100, CostPrice: 10, Amount: 1000, HighestPrice: 12, UserID: "u1"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if raised, err := db.RaiseRealPositionHigh("u1", "600000.SH", 11); err != nil || raised {
+		t.Fatalf("更低的锚点必须被只增守卫拒写: raised=%v err=%v", raised, err)
+	}
+	if p, _ := db.RealPositionByCode("600000.SH"); p.HighestPrice != 12 {
+		t.Fatalf("只增语义不得改写现值, got %v", p.HighestPrice)
+	}
+	if raised, err := db.RaiseRealPositionHigh("u1", "600000.SH", 0); err != nil || raised {
+		t.Fatalf("锚点≤0 应直接跳过（绝不写 0 失明下游）: raised=%v err=%v", raised, err)
+	}
+	if raised, err := db.RaiseRealPositionHigh("u1", "600000.SH", 18); err != nil || !raised {
+		t.Fatalf("更高锚点应写入并报告变更: raised=%v err=%v", raised, err)
+	}
+	if p, _ := db.RealPositionByCode("600000.SH"); p.HighestPrice != 18 {
+		t.Fatalf("锚点应为 18, got %v", p.HighestPrice)
+	}
+	// 遗留全局行（user_id 空串）：按任意账号回写都要命中
+	if _, err := db.db.Exec(`INSERT INTO real_positions(ts_code, name, qty, cost_price, amount, highest_price, user_id, updated_at)
+		VALUES ('000001.SZ','平安',100,20,2000,21,'','2026-09-22 09:30:00')`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	if raised, err := db.RaiseRealPositionHigh("u1", "000001.SZ", 25); err != nil || !raised {
+		t.Fatalf("遗留全局行应可回写: raised=%v err=%v", raised, err)
+	}
+	// 他账号私有行不得被误改
+	if _, err := db.db.Exec(`INSERT INTO real_positions(ts_code, name, qty, cost_price, amount, highest_price, user_id, updated_at)
+		VALUES ('000002.SZ','万科',100,5,500,6,'u2','2026-09-22 09:30:00')`); err != nil {
+		t.Fatalf("seed u2 row: %v", err)
+	}
+	if raised, err := db.RaiseRealPositionHigh("u1", "000002.SZ", 99); err != nil || raised {
+		t.Fatalf("跨账号不得改写他人行: raised=%v err=%v", raised, err)
+	}
+	if p, _ := db.RealPositionByCode("000002.SZ"); p.HighestPrice != 6 {
+		t.Fatalf("u2 行 highest_price 应保持 6, got %v", p.HighestPrice)
 	}
 }

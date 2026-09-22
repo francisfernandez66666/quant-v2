@@ -99,6 +99,21 @@ var realTsCodeRe = regexp.MustCompile(`^[0-9]{6}\.(SH|SZ|BJ)$`)
 // the HTTP layer maps it to 400 via errors.Is.
 var ErrInvalidPositionReport = errors.New("positions 快照字段校验失败")
 
+// costBasisDropped §N-6（2026-09-22 傍晚批复验，裁决 11=本地含费优先）守卫**留痕**判定：
+// 本轮对账快照的 cost_price 是否会被保护丢弃。它不参与落库——保护由 upsert 里的 CASE 完成，
+// 本函数只负责让保护不再"自身静默"（本批主题是静默失效）。两处口径必须逐项一致：
+// 本地 >0 即保留本地，此时快照值只要与本地不同就是被丢弃的那个值。
+// English: §N-6 observability predicate — whether the snapshot's fee-less cost is being dropped
+// by the local-wins guard (the guard itself lives in SQL; this only makes it visible).
+func costBasisDropped(localCost, snapshotCost float64) bool {
+	return localCost > 0 && snapshotCost != localCost
+}
+
+// CostGuardDrops §N-6 累计计数：对账快照成本被本地含费基准丢弃的次数（进程内，重启归零）。
+// 用途：排障时区分"守卫从没触发"与"守卫一直在挡"——现网若持续增长说明券商侧 open_price
+// 缺失/口径不符，是数据源问题而非账本问题；测试用它断言守卫确实生效过。
+func (d *DB) CostGuardDrops() int64 { return d.costGuardDrops.Load() }
+
 // validateRealPositions §F2：全量对账入口校验。空快照（len==0，合法全平语义）直接放行；
 // 任一行 ts_code 空或非法格式 → 返回包装了 ErrInvalidPositionReport 的错误（含行号与原值），
 // 调用方必须整批拒收并 opslog 留痕，绝不部分落库。
@@ -117,6 +132,12 @@ func validateRealPositions(pos []RealPosition) error {
 // UpsertRealPositions 全量对账写入：以网关推送的持仓集合为准，逐条 upsert 并移除已不在集合内的旧持仓。
 // 返回替换后的持仓数量。English: full-reconciliation write — upserts every gateway position and drops
 // rows absent from the push; returns the resulting position count.
+//
+// ⚠ 入口定位（§N-6 复验登记，2026-09-22 傍晚批）：**测试专用入口**。生产链路（Controller.Reconcile
+// / MaybeReconcile / handleQMTReport 的 positions 事件）一律走账号隔离版 ReconcilePositionsForUser，
+// 全仓 grep 证实本函数只有 *_test.go 调用者（多租户下它的"空快照 DELETE 全表"分支是历史清库炸弹，
+// 现按 user_id 作用域收敛，但仍不该被生产复用）。函数按要求保留不删，改动与 ReconcilePositionsForUser
+// 同步：列保护口径、§N-6 成本基准守卫两边一致，避免"测试路径测的是一条生产不再走的语句"。
 func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 	// §F2（2026-09-22 修复批）：字段级校验前置——任一行 ts_code 非法即整批拒收不落库。
 	if err := validateRealPositions(pos); err != nil {
@@ -139,6 +160,18 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				return 0, fmt.Errorf("claim legacy position %s: %w", p.TsCode, err)
 			}
 		}
+		// §N-6 守卫留痕（与 ReconcilePositionsForUser 同款，测试专用入口同步）：
+		// 快照成本被本地含费账丢弃时打 debug 日志 + 计数，保护不得自身静默。
+		var localCost float64
+		if err := tx.QueryRow(`SELECT cost_price FROM real_positions WHERE ts_code=? AND user_id=?`,
+			p.TsCode, p.UserID).Scan(&localCost); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("read local cost %s: %w", p.TsCode, err)
+		}
+		if costBasisDropped(localCost, p.CostPrice) {
+			d.costGuardDrops.Add(1)
+			log.Printf("[store] §N-6 快照成本被本地含费账丢弃(裁决11，测试专用入口) %s 用户=%s：快照 %.4f → 保留本地 %.4f",
+				p.TsCode, p.UserID, p.CostPrice, localCost)
+		}
 		_, err := tx.Exec(`INSERT INTO real_positions
 			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -148,14 +181,23 @@ func (d *DB) UpsertRealPositions(pos []RealPosition) (int, error) {
 				-- §M5 保护同口径（COALESCE(NULLIF(新,''),旧)）。
 				-- English: §M4 — keep the stored name when the snapshot carries none (same guard as §M5).
 				name=COALESCE(NULLIF(excluded.name,''), real_positions.name),
-				qty=excluded.qty, cost_price=excluded.cost_price,
-				amount=excluded.amount,
+				-- qty 有意裸写（份额数以柜台为准，只增守卫会把已卖出的量永久留在账上→超卖）。
+				qty=excluded.qty,
+				-- §N-6（裁决 11=本地含费优先）与 ReconcilePositionsForUser 同款 CASE 保护：
+				-- 券商快照的不含费 open_price（缺失时=0）绝不覆盖本地已有的非零含费成本。
+				cost_price=CASE WHEN real_positions.cost_price > 0
+					THEN real_positions.cost_price ELSE excluded.cost_price END,
+				-- amount 与 cost_price 同源推导（选定成本 × 快照数量），杜绝 qty×cost≠amount 错配。
+				amount=(CASE WHEN real_positions.cost_price > 0
+					THEN real_positions.cost_price ELSE excluded.cost_price END) * excluded.qty,
 				-- §M5（2026-09-22 修复批）：strategy 仅在快照携带非空值时覆盖——券商快照不带
 				-- 战法归因，旧实现 excluded.strategy('') 直插会把本地战法标记洗成空串。
 				-- 对照同语句 highest_price 的 CASE 保护，同函数保护口径现已补齐。
 				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
 				updated_at=excluded.updated_at,
 				user_id=excluded.user_id,
+				-- signal_id 有意不出现在 SET 列表：本入口无归因来源时保持旧值（与
+				-- ReconcilePositionsForUser 的 COALESCE 非空才覆盖等效，见 §N-6 同族裸写盘点）。
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
 			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
@@ -273,14 +315,47 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 				return 0, fmt.Errorf("claim legacy position %s: %w", p.TsCode, err)
 			}
 		}
+		// §N-6（2026-09-22 傍晚批复验，owner 裁决 11=本地含费优先）成本基准守卫留痕：
+		// 先读本地既有成本，判断本轮快照是否会被丢弃——守卫本身若也"静默"，就还是本批要根治的
+		// 那类静默失效（券商 open_price 缺失时按 0 落库、含费成本被洗掉，下游三条判定线输入消失
+		// 却零日志）。故命中丢弃时打一条 debug 日志 + 递增计数（CostGuardDrops 可读）。
+		var localCost float64
+		if err := tx.QueryRow(`SELECT cost_price FROM real_positions WHERE ts_code=? AND user_id=?`,
+			p.TsCode, p.UserID).Scan(&localCost); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("read local cost %s: %w", p.TsCode, err)
+		}
+		if costBasisDropped(localCost, p.CostPrice) {
+			d.costGuardDrops.Add(1)
+			opslog.OncePer("reconcile-cost-basis:"+p.UserID+"|"+p.TsCode, 10*time.Minute, func() {
+				log.Printf("[store] §N-6 对账成本守卫生效(本地含费优先，裁决11) %s 用户=%s：券商快照 cost_price=%.4f 已丢弃，保留本地 %.4f（amount 同步按本地成本×快照数量推导）",
+					p.TsCode, p.UserID, p.CostPrice, localCost)
+			})
+		}
 		_, err := tx.Exec(`INSERT INTO real_positions
 			(ts_code, name, qty, cost_price, amount, highest_price, strategy, signal_id, updated_at, user_id)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(ts_code, user_id) DO UPDATE SET
 				-- §M4（2026-09-22 PM 批）与 UpsertRealPositions 同口径：空名快照不抹空已有名称。
 				name=COALESCE(NULLIF(excluded.name,''), real_positions.name),
-				qty=excluded.qty, cost_price=excluded.cost_price,
-				amount=excluded.amount,
+				-- qty 有意保持裸写：份额数量只有券商柜台知道（本地卖出成交虽会同步扣减，但
+				-- 断连期间的成交只有快照能纠正），加"只增"守卫会把已卖出的量永久留在账上→超卖。
+				qty=excluded.qty,
+				-- §N-6 裁决 11=本地含费优先：cost_price/amount 是**含费**成本基准（成交回报路径
+				-- ApplyRealFill 按 (旧含费账+成交额+佣金)/新量 落同一列），券商快照给的是**不含费**
+				-- open_price（缺失时更是直接 or 0，与 0 同归 0）→ 旧实现裸写 excluded.* 等于每 5 分钟
+				-- 对账把含费成本洗成不含费、甚至归零，且已落库、重启救不回。现只在本地为 0/缺失时
+				-- 用快照兜底，已有非零含费值一律保留（与下方 highest_price 的 CASE 同款保护）。
+				-- ⚠ 副作用（裁决已知并接受）：券商侧对"非零但错"的成本不再有纠正通道，人工纠偏须走
+				-- 成交回报或直接改库。
+				-- English: §N-6 ruling 11 — the fee-inclusive local cost basis wins; the snapshot only
+				-- back-fills when the local value is 0/missing.
+				cost_price=CASE WHEN real_positions.cost_price > 0
+					THEN real_positions.cost_price ELSE excluded.cost_price END,
+				-- amount 与 cost_price **同源推导**（=上面选定的每股成本 × 本行最终数量），
+				-- 绝不允许"新快照量 × 旧成本"与"旧 amount"两套口径并存 → qty×cost≠amount 的错配
+				-- 会让 ApplyRealFill 的加仓加权（以 p.Amount 为含费累计账）从错误基数起算。
+				amount=(CASE WHEN real_positions.cost_price > 0
+					THEN real_positions.cost_price ELSE excluded.cost_price END) * excluded.qty,
 				-- §M5（2026-09-22 修复批）：strategy/signal_id 是本地战法归因链（复盘/审计/补卖
 				-- 定位都靠它），券商对账快照恒不带这两字段——旧实现 excluded.* 直插等于每次对账
 				-- 把归因洗成空串。仅当来源非空才覆盖（COALESCE(NULLIF(新,''),旧)），
@@ -288,6 +363,9 @@ func (d *DB) ReconcilePositionsForUser(userID string, pos []RealPosition) (int, 
 				strategy=COALESCE(NULLIF(excluded.strategy,''), real_positions.strategy),
 				signal_id=COALESCE(NULLIF(excluded.signal_id,''), real_positions.signal_id),
 				updated_at=excluded.updated_at, user_id=excluded.user_id,
+				-- §M5 只增锚 → §N-7 起本地锚点会由 RaiseRealPositionHigh 持续抬高：这里
+				-- max(本地, 快照) 的只增语义保证快照 open_price（券商口径=开仓价）绝不会把
+				-- 已回写的期间最高价拉回，两条写路径（对账 upsert / 锚点 UPDATE）因此互不覆盖。
 				highest_price=CASE WHEN excluded.highest_price > real_positions.highest_price
 					THEN excluded.highest_price ELSE real_positions.highest_price END`,
 			p.TsCode, p.Name, p.Qty, p.CostPrice, p.Amount, p.HighestPrice, p.Strategy, p.SignalID, p.UpdatedAt, p.UserID)
@@ -699,26 +777,100 @@ func (d *DB) SumFilledQty(userID, signalID string) int {
 	return total
 }
 
-// SumOpenSellQty §P0-2（2026-09-15）汇总某账号某代码「当日仍在途的卖单」股数——
-// 状态 ∈ {已报,部成,已报待撤,部成待撤}（可能继续成交），不含已成/已撤/部撤/废单终态，
-// 也不含「发送失败」占位行（从未到达券商，重试前不该占额度）。
-// 用途：卖出剩余量 = 持仓量 − Σ已成交 − Σ在途。P2#13 只并了已成交口径，M8 清仓与止损
-// 建议同轮触发时（M8 卖单 fills 尚未回报），两类各按全量各下一笔全额卖单，第二笔只能靠
-// 柜台「证券不足」废单兜底；把在途卖量并入后，先到者占额度，后到者看到剩余=0 自然跳过。
+// SumOpenSellQty §P0-2（2026-09-15）+ §N-3（2026-09-22 傍晚批复验）汇总某账号某代码
+// 「当日仍在途卖单的**未成交余量**」股数——状态 ∈ {已报,部成,已报待撤,部成待撤}（可能继续成交），
+// 不含已成/已撤/部撤/废单终态，也不含「发送失败」占位行（从未到达券商，重试前不该占额度）。
+// 用途算式（三项扣减，调用方 scoring_loop.realSoldOrOpenQtyToday 逐项对应）：
+//
+//	卖出剩余量 = 持仓量 − Σ已成交(SumFilledQty) − Σ在途(SumOpenSellQty，本函数=未成交余量)
+//
 // 只统计「卖出」方向且当日（created_at 北京时前缀）的委托，买入在途不受影响。
-// English: §P0-2 — sums today's still-open sell qty for a code (statuses 已报/部成/已报待撤/部成待撤;
-// terminal and send-failed rows excluded). Sell remaining = held − Σfilled − Σopen, so a same-round
-// M8 liquidation + stop-loss advice can no longer both fire a full-qty sell before fills are reported.
+//
+// §N-3 口径改写（资金缺陷）：旧实现对 `status='部成'` 的委托按**整笔委托 qty** 计入在途，
+// 而调用方 `scoring_loop.realSoldOrOpenQtyToday` 的算式是「Σ已成交 + Σ在途」，其中 Σ已成交
+// （SumFilledQty）已经把该单的成交部分数过一次 → **同一笔成交被扣两次**。
+// 数值反例（持仓 2000 / 挂单 1000 / 部成 500，成交回报已把账面持仓降到 1500）：
+//   - 旧：remaining = 1500 −(500+1000) = 0 → 剩余量恒为 0，当天**永不补卖**（少卖=敞口留过夜）；
+//   - 新：remaining = 1500 −(500+500) = 500 → 以 500 补卖；再部成 300 后以 200 补；全成后归 0 不再发单。
+//
+// 标准来源（**买卖两侧「部成」定义必须同源**）：docs/BUGFIX_BUDGET_FREEZE_LEDGER_20260918.md
+// §BUDGET_FREEZE 在买入侧钉死的「部成 = 未成交余量、一笔在途单不得被扣两次」，与本函数净额口径
+// 逐字一致（同族实现见 LocalBuyFrozen 的 remain = qty − 已成交）。
+// 成交归属按 order_id **或** signal_id 双键匹配：下单回填（UpdateRealOrderBySignalID）失败时本地行
+// order_id 仍停留 `pend:` 前缀，只按 order_id 关联会恒得 0 成交 → 退化成整笔占额，正是本条要根除的
+// 双扣形态；signal_id 在 orders 上有 UNIQUE(user_id,signal_id)，一单一行不会串到别的委托。
+//
+// 剩余量下限钳 0：成交理论上不会超过委托量，但网关重放/交割单回灌可造成 filled>qty 的异常行，
+// 此时按 0 计——宁可少占额度，也不许出现「负在途量」把剩余量抬高造成超卖。
+//
+// English: §N-3 — sums today's still-open sell tickets at their **unfilled remainder**
+// (qty minus that ticket's fills), the same definition the buy-side §BUDGET_FREEZE ledger pins for 部成.
+// The old whole-order qty double-counted the filled part against the caller's Σfilled term, so a
+// partially filled sell could never be topped up during the rest of the day.
 func (d *DB) SumOpenSellQty(userID, tsCode, day string) int {
-	var total int
-	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM orders
-		WHERE (user_id = '' OR user_id = ?) AND code = ? AND side = '卖出'
-		  AND created_at LIKE ?||'%'
-		  AND status IN ('已报','部成','已报待撤','部成待撤')`,
-		userID, tsCode, day).Scan(&total); err != nil {
+	rows, err := d.db.Query(`SELECT o.qty,
+		COALESCE((SELECT SUM(f.qty) FROM fills f
+			WHERE f.order_id = o.order_id
+			   OR (o.signal_id <> '' AND f.signal_id = o.signal_id)), 0)
+		FROM orders o
+		WHERE (o.user_id = '' OR o.user_id = ?) AND o.code = ? AND o.side = '卖出'
+		  AND o.created_at LIKE ?||'%'
+		  AND o.status IN ('已报','部成','已报待撤','部成待撤')`,
+		userID, tsCode, day)
+	if err != nil {
+		// 与旧实现同为 fail-open（回 0 = 不占额度），但不再静默：本函数是「卖出剩余量」与
+		// 「T+1 可卖量」两道闸的共同输入，查询失败会让两道闸同时失明，必须留下可见痕迹。
+		log.Printf("[store] §N-3 在途卖量查询失败(按 0 计，不占额度) user=%s code=%s: %v", userID, tsCode, err)
 		return 0
 	}
+	defer rows.Close()
+	total := 0
+	for rows.Next() {
+		var qty, filled int
+		if err := rows.Scan(&qty, &filled); err != nil {
+			log.Printf("[store] §N-3 在途卖量行读取失败(跳过该行): %v", err)
+			continue
+		}
+		if remain := qty - filled; remain > 0 {
+			total += remain
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[store] §N-3 在途卖量游标错误(已累计 %d 股，按不完整值计): %v", total, err)
+	}
 	return total
+}
+
+// RaiseRealPositionHigh §N-7（2026-09-22 傍晚批复验）把运行期抬高的**持仓期最高价**回写实盘账本，
+// 语义与对账 upsert 里 highest_price 的 CASE 只增完全一致（单调不降）。
+//   - 为什么需要它：卖出裁决内核（signalctl.sellProbe）的锚点是「播种 + 每轮自抬」，live 侧的播种值
+//     就取自本列（engine/sell_shadow.go 探针 HighPrice）。此前该列只有三个写入源（券商快照
+//     open_price、成交回报成交价、CASE 只增的比较），**期间最高价从无写入路径** → 进程重启即回落到
+//     建仓价，涨过 15% 再回落的仓位移动止盈永不触发（§LIVEANCHOR）。
+//   - 为什么不学 paper 新增 json：live 的账本就是 sqlite，再开一份文件会让同一规则有两份真相
+//     （§M10 的 json 持久化按设计只覆盖 paper 一本）。
+//   - WHERE 上的 `highest_price < ?` 就是只增守卫本体（并发/重放下都不会把高点拉回），返回值表示
+//     是否真的写了一行——调用方据此决定留痕，不做无变更写盘。
+//
+// English: §N-7 — raises real_positions.highest_price with the in-process trailing-stop anchor
+// (monotonic; the WHERE clause is the same only-up rule the reconcile CASE applies). The boolean
+// reports whether a row actually changed.
+func (d *DB) RaiseRealPositionHigh(userID, tsCode string, high float64) (bool, error) {
+	if high <= 0 {
+		return false, nil // 无有效锚点绝不写 0：0 会让下游 DrawdownPct 与移动止盈整条线失明
+	}
+	res, err := d.db.Exec(`UPDATE real_positions
+		SET highest_price = CASE WHEN highest_price < ? THEN ? ELSE highest_price END, updated_at = ?
+		WHERE ts_code = ? AND (user_id = '' OR user_id = ?) AND highest_price < ?`,
+		high, high, time.Now().Format("2006-01-02 15:04:05"), tsCode, userID, high)
+	if err != nil {
+		return false, fmt.Errorf("raise real position high %s: %w", tsCode, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("raise real position high rows affected %s: %w", tsCode, err)
+	}
+	return n > 0, nil
 }
 
 // UpdateRealOrderBySignalID 下单回填：把 pend:<signal_id> 占位行的 order_id 替换为网关真实委托号并更新状态。

@@ -1296,3 +1296,90 @@ test.describe('权限硬锁 · §3.1-4 成员直连 API + §M13 轮询止血', (
     }
   })
 })
+
+// ── 修复回归 · 2026-09-22 傍晚审计批（AUDIT_REPORT_20260922EVE / FIX_PLAN_20260922EVE）──
+// 本批四项都在「界面/接口面上看得见的地方」，故进 Playwright 真栈而不是只留单测：
+//   §N-1 Dashboard 调未声明的 setQMTState → 空 catch 吞 ReferenceError → 「实盘链路」卡永不渲染；
+//   §N-4 战法参数整份反序列化全量替换 → 一次「加载失败+保存」把五套阈值清零且落库不可回；
+//   §中-6 配置无版本戳 → 两人同开设置页后写者静默覆盖先写者；
+//   §N-2 /api/notify-test 只挂 authMiddleware → 任意成员一次 POST 即可轰炸 owner 全部推送通道。
+// English: browser-level regression for the 2026-09-22 evening batch (undefined symbol card,
+// config zeroing on save, optimistic-lock 409, member-forbidden notify probe).
+test.describe('修复回归 · 2026-09-22 傍晚批', () => {
+  const API = process.env.E2E_API || 'http://localhost:18080'
+  // helper：登录换 token（本 describe 混用 admin 与 tester 两档，显式取各自的头）
+  async function tokenOf(request, username, password) {
+    const r = await request.post(API + '/api/auth/login', { data: { username, password } })
+    expect(r.status(), `${username} 登录`).toBe(200)
+    const tk = (await r.json()).token
+    expect(tk, `${username} 登录响应含 token`).toBeTruthy()
+    return { Authorization: 'Bearer ' + tk }
+  }
+
+  // §N-1：以 mock 的 /api/qmt/state 驱动真实轮询链路——断言「实盘链路」文本渲染出来。
+  // 为什么用 route mock 而不是直连现网态：卡片要 enabled=true 才渲染，而 UAT 栈的 qmt 开关
+  // 默认关（该端点回 enabled=false 时文本本就该缺席）——把开关状态交给用例，断言才确定。
+  test('N-1：Dashboard「实盘链路」卡在状态接口正常时渲染（未定义符号回归）', async ({ page }) => {
+    await page.route('**/api/qmt/state', (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ enabled: true, mode: 'auto', last_probe_ok: true, tripped: false }),
+    }))
+    const errs = watch(page)
+    await page.goto('/#/dashboard')
+    // 轮询 15s 一次，首帧就应出文本；等 3s 足够覆盖 load() 的初次拉取
+    await expect(page.getByText('实盘链路：● 自动 正常'), '实盘链路指示渲染').toBeVisible({ timeout: 15000 })
+    await page.screenshot({ path: `${SHOT}/branch-n1-qmt-line.png`, fullPage: true })
+    const fatal = errs.filter((e) => e.startsWith('PAGEERROR'))
+    expect(fatal, '无未捕获 JS 错误（setQMTState 形态会在此现形）: ' + fatal.join('|')).toHaveLength(0)
+  })
+
+  // §N-4 界面面：战法参数卡必须落到 loaded 三态（无「读取失败，禁止保存」红条、保存按钮可用）。
+  // 旧形态是 catch 吞错后停在空对象上——页面看起来一切正常，保存即清零，故必须断言这一态。
+  test('N-4：Settings 战法参数卡落 loaded 态（红条缺席 + 保存可用）', async ({ page }) => {
+    await page.goto('/#/settings')
+    const card = page.locator('.t-card', { hasText: '战法参数' }).first()
+    await expect(card, '战法参数卡渲染').toBeVisible({ timeout: 15000 })
+    await expect(card.getByText('读取失败，禁止保存'), '无禁止保存红条').toHaveCount(0)
+    await expect(card.getByText('版本冲突，禁止保存'), '无版本冲突红条').toHaveCount(0)
+    await expect(card.getByRole('button', { name: '重载' }), 'loaded 态不出重载按钮').toHaveCount(0)
+    await expect(card.getByRole('button', { name: '保存战法参数' })).toBeEnabled({ timeout: 15000 })
+    await page.screenshot({ path: `${SHOT}/branch-n4-settings-loaded.png`, fullPage: true })
+  })
+
+  // §N-4 接口面（最强证据，不依赖表单实现）：整份 GET → POST 空对象 → 再 GET 必须逐字段等值。
+  // 旧实现这里会把所有未提交字段写成零值；稀疏 merge 后「没传=保留原值」。finally 用原始全量
+  // body 还原，避免中途失败污染共享配置（本文件既有 §F-2/§F-4 的同款模式）。
+  test('N-4：POST {} 不清零 + 陈旧 updated_at 回 409（稀疏 merge 与乐观锁）', async ({ request }) => {
+    const hdr = await tokenOf(request, ADMIN.u, ADMIN.p)
+    const get = async () => (await (await request.get(API + '/api/config/strategy', { headers: hdr })).json())
+    const before = await get()
+    const strip = (o) => { const c = { ...o }; delete c.updated_at; return JSON.stringify(c) }
+    try {
+      const merged = await request.post(API + '/api/config/strategy', { headers: hdr, data: {} })
+      expect(merged.status(), '空对象保存应 200（稀疏 merge 语义）').toBe(200)
+      const after = await get()
+      expect(strip(after), 'POST {} 后逐字段等值（有字段被清零=§N-4 复活）').toEqual(strip(before))
+      expect(after.updated_at, '服务端写入必须推进版本戳（§中-6）').toBeTruthy()
+      expect(after.updated_at !== before.updated_at, '版本戳随写入刷新').toBe(true)
+      // 陈旧版本 → 409 且回带服务端当前版本，供前端提示重载
+      const stale = await request.post(API + '/api/config/strategy', {
+        headers: hdr, data: { updated_at: '2000-01-01T00:00:00Z' },
+      })
+      expect(stale.status(), '陈旧版本保存必须 409（后写者静默覆盖先写者的通道）').toBe(409)
+      const sj = await stale.json()
+      expect(JSON.stringify(sj), '409 载荷回带 current_updated_at').toContain('current_updated_at')
+      const unchanged = await get()
+      expect(strip(unchanged), '409 一律不落盘').toEqual(strip(after))
+    } finally {
+      await request.post(API + '/api/config/strategy', { headers: hdr, data: { ...before, updated_at: '' } })
+    }
+  })
+
+  // §N-2：推送实弹探测端点收权 admin——普通成员必须 403（旧形态 authMiddleware 即放行）。
+  // 不打 admin 那一次：本端点会向真实通道发 LevelHigh 消息，UAT 里没必要给 owner 手机发消息。
+  test('N-2：成员 POST /api/notify-test 被 403 拦在全局推送通道之外', async ({ request }) => {
+    const member = await tokenOf(request, process.env.E2E_USER2 || 'tester', USER.p)
+    const r = await request.post(API + '/api/notify-test', { headers: member, data: {} })
+    expect(r.status(), '成员不得触发全局推送通道实弹探测').toBe(403)
+  })
+})

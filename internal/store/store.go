@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动（driver 名 "sqlite"）
@@ -23,6 +24,10 @@ import (
 // （DB wraps the research database handle.）
 type DB struct {
 	db *sql.DB // SQLite 数据库连接
+	// costGuardDrops §N-6（2026-09-22 傍晚批复验）：实盘对账 upsert 里「本地含费成本优先」守卫
+	// 丢弃快照值的累计次数（进程内计数，重启归零）。放在实例上而非包级全局：计数与库连接同
+	// 生命周期，测试可对各自 DB 独立断言。本批主题是「静默失效」——保护本身也不许静默生效。
+	costGuardDrops atomic.Int64
 }
 
 // Open 打开（必要时创建）研究数据库并初始化表结构。
@@ -1314,16 +1319,12 @@ func (d *DB) ReadyStockCount() (int, error) {
 }
 
 // HfqBars 读取某股票 hfq 后复权日线（升序）。
-// PrimarySourceThsDaily 数据源路由开关：true 时 RawBars 优先读 ths_daily（同花顺（新）），
-// 该股无数据回退旧 daily 表。由 config data.primary_source 在启动时装配。
-// 注意：HfqBars 不受此开关影响——ths 复权因子尚在草稿态（对账门禁未过，见
-// docs/HITHINK_DATA_SOURCE_PLAN.md §6.3），hfq 仍走旧表直到门禁放行。
-var PrimarySourceThsDaily = false
-
-// ThsFactorsReady 同花顺复权因子对账门禁：true 时 HfqBars 走 ths_daily×ths_adj_factor；
-// false（默认）时 hfq 仍走旧表——门禁未过前禁止消费（docs/HITHINK_DATA_SOURCE_PLAN §6.3）。
-var ThsFactorsReady = false
-
+// 数据源路由开关（PrimarySourceThsDaily / ThsFactorsReady）已收为包内私有，
+// 唯一写入口见 source_routing.go 的 ConfigureSource / ConfigureSourceFromFile；
+// 本文件只经 useThsDaily()/useThsHfq() 读取。
+// 注意：门禁未过时 hfq 仍走旧表——ths 复权因子尚在草稿态（对账门禁未过，见
+// docs/HITHINK_DATA_SOURCE_PLAN.md §6.3）。
+//
 // 换算：hfq_close = close * adj_factor（基座因子在收益率/动量等比例型因子里自然抵消；
 // 价格类因子如 MA/52周高距在同一基准下自洽，不影响相对结论）。
 // （HfqBars reads a stock's hfq back-adjusted daily bars (ascending). hfq_close = close * adj_factor;
@@ -1331,18 +1332,31 @@ var ThsFactorsReady = false
 func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
 	// §数据源路由：主源=hithink 且复权门禁通过 → ths 双表 join；
 	// 否则走旧表（baostock）——因子口径未定稿前绝不混用两套复权体系。
-	if PrimarySourceThsDaily && ThsFactorsReady {
+	if useThsHfq() {
 		var n int
 		if err := d.db.QueryRow(`SELECT COUNT(*) FROM ths_adj_factor WHERE ts_code=?`,
 			tsCode).Scan(&n); err == nil && n > 0 {
 			return d.thsHfqBars(tsCode, start, end)
 		}
 	}
-	// 主源路径：日线 JOIN 复权因子（缺因子按 1 兜底），后复权口径计算。
+	// 主源路径：日线 × 复权因子（缺因子按 1 兜底），后复权口径计算。
+	//
+	// §ADJ(P0-A 20260922)：adj_factor 是【事件稀疏点】表——写入口 cmd/dataload/baostock.go
+	// （bsLoadStockTables 的 adjRows 构造处、bsLoadAdjFactor 专项补齐处）存的 trade_date =
+	// normDate(dividoperatedate)（分红实施日），一只票一年通常只有 0~3 行，而不是每个交易日一行。
+	// 因此因子必须**前向填充**：取"不晚于该交易日的最近一个事件日"的因子
+	// （与同包 ths_tables.go 的 LegacyAdjFactorAt 语义严格一致）。
+	// 若写成等值 JOIN（因子日 == 行情日），非除权日全部落空 → COALESCE 兜成 1 →
+	// **后复权价退化为不复权价**，回测/因子研究/图表复权口径全链路失真——这正是本处缺陷。
+	// 允许例外：allow-legacy-adj-join-eq —— 本函数为前向填充的合法实现点，注释中出现的
+	// "因子日 == 行情日" 仅为反面说明，SQL 内不含等值 JOIN 形态。
 	query := `SELECT d.trade_date,
 		COALESCE(d.open,0), COALESCE(d.high,0), COALESCE(d.low,0), COALESCE(d.close,0),
-		COALESCE(d.vol,0), COALESCE(d.amount,0), COALESCE(a.adj_factor,1) AS adj
-		FROM daily d LEFT JOIN adj_factor a ON a.ts_code=d.ts_code AND a.trade_date=d.trade_date
+		COALESCE(d.vol,0), COALESCE(d.amount,0),
+		COALESCE((SELECT a.adj_factor FROM adj_factor a
+		          WHERE a.ts_code=d.ts_code AND a.trade_date<=d.trade_date
+		          ORDER BY a.trade_date DESC LIMIT 1), 1) AS adj
+		FROM daily d
 		WHERE d.ts_code=? AND d.trade_date>=? AND d.trade_date<=?
 		ORDER BY d.trade_date`
 	rows, err := d.db.Query(query, tsCode, start, end)
@@ -1373,7 +1387,7 @@ func (d *DB) HfqBars(tsCode, start, end string) ([]Bar, error) {
 func (d *DB) RawBars(tsCode, start, end string) ([]Bar, error) {
 	// §数据源路由：主源=同花顺（新）且该股有 ths 数据 → 读 ths_daily；
 	// 无数据回退旧 daily 表（缺口登记重试队列的 provenance 机制随 Phase E 补齐）。
-	if PrimarySourceThsDaily {
+	if useThsDaily() {
 		var n int
 		if err := d.db.QueryRow(`SELECT COUNT(*) FROM ths_daily WHERE ts_code=? AND trade_date<=?`,
 			tsCode, end).Scan(&n); err == nil && n > 0 {
@@ -1425,6 +1439,20 @@ func (d *DB) thsRawBars(tsCode, start, end string) ([]Bar, error) {
 }
 
 // thsHfqBars 读同花顺（新）日K×因子的后复权序列（hfq_close = close × factor）。
+//
+// §ADJ 两源同核对（P0-A 20260922 施工核实，以代码为准不看文档）：
+// ths_adj_factor 的**唯一写入口** cmd/dataload/hithink_sync.go 的 cmdHithinkSyncAdjFactors：
+//   - 先 `db.ThsDatesSince(code, since)` 取该标的窗口内**全部交易日**；
+//   - 再对每个交易日 `batch = append(batch, ThsAdjFactorRow{TsCode, TradeDate: dt, Factor: cur})`
+//     逐日物化**累计**因子（cur 只在跨过除权事件时乘一次乘数，之后原样续写到下一个事件日）。
+//
+// 即 ths 侧是【日粒度全覆盖的累计值】，与 baostock 侧的【事件稀疏点】形态根本不同 ⇒
+// 这里的等值 JOIN 语义**正确**，不需要前向填充（若强行改成子查询反而掩盖"因子未按日物化"
+// 的数据缺陷）。允许例外：allow-legacy-adj-join-eq —— 等值 JOIN 作用于 ths_adj_factor
+// （日累计全覆盖表），不是事件稀疏的 adj_factor。
+// 已知覆盖缺口（门禁放行前须补，本次登记不修）：hithink_sync 只为"窗口内有事件"的标的展开
+// （无事件即 continue，与同文件"无事件也物化恒等基线行"的注释不符），且只覆盖 since 之后
+// 的日期 —— 门禁切换后，跨 since 之前的区间会被这条内连接丢行。
 func (d *DB) thsHfqBars(tsCode, start, end string) ([]Bar, error) {
 	// ths_daily JOIN ths_adj_factor：价格类在 SQL 层直接乘因子做后复权（量能不换算）。
 	query := `SELECT b.trade_date,

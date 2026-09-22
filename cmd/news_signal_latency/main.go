@@ -23,6 +23,7 @@ import (
 	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/llmcfg"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/store" // §ADJ P0-A：仅用于数据源路由装配（ConfigureSource 唯一写入口）
 	"quant-trading-v2/internal/strategy"
 	"quant-trading-v2/internal/strategy_engine"
 )
@@ -99,6 +100,11 @@ func main() {
 
 	// 配置：优先真实生产 config.json，缺失用默认
 	cfgMgr := config.NewManager(filepath.Join(*dataDir, "config.json"))
+	// §数据源路由装配（§ADJ P0-A 三轮补强）：本工具当前不直接 store.Open 取行情，
+	// 装配在此是为把"所有可能读复权序列的入口都经同一个写入口、读同一份 config.json"
+	// 变成不变式（历史上正是"引擎装配了、手工工具没装配"造成两套口径）；写入口唯一
+	// （路由变量已收为 store 包内私有）。
+	store.ConfigureSource(cfgMgr.Rules.Data.PrimarySource, cfgMgr.Rules.Data.ThsFactorsReady)
 
 	// —— 真实行情数据客户端（不注入 mock transport，走真实网络降级链） ——
 	marketAPI := data.NewMarketAPI()

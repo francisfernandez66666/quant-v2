@@ -124,6 +124,19 @@ func cmdHithinkSync(db *store.DB, args []string) {
 // 基线衔接：每标的窗口内首个事件之前的累计因子取旧 baostock 表在该日前的最近值
 // （无缝续接历史）；窗口内乘数用 THS 事件 + ths_daily 前收盘精确计算。
 // 锚定语义与 baostock 一致：因子随时间递增，历史小、当前大。
+//
+// §ADJ(P0-A 20260922) 两源口径对照（施工核实结论，以本函数代码为准不以文档为准）：
+// ths_adj_factor 是【日粒度全覆盖的累计因子】——下面的日期循环对
+// db.ThsDatesSince(code, since) 返回的**每一个交易日**都 append 一行（cur 只在跨过
+// 除权事件时乘一次乘数，之后原样续写到下一个事件日），与 baostock 侧
+// adj_factor 的【事件稀疏点】形态（trade_date=分红实施日，一年 0~3 行）根本不同。
+// ⇒ internal/store/store.go 的 thsHfqBars 用等值 JOIN 读取是**正确**的，不需要前向填充；
+// 而旧表路径必须前向填充。若日后把本函数改成"只写事件日"，thsHfqBars 那条等值 JOIN
+// 会静默退化成不复权——改动务必同步跟随（该约束已在 store.go 注释里留证据行号）。
+// 已知覆盖缺口（门禁放行前须补，本次只登记不修）：无事件的标的在下面的
+// `if len(evs) == 0 { continue }`（cmdHithinkSyncAdjFactors 内）直接跳过，与上方
+// "无事件标的也要物化恒等基线行"的注释不符；且日期只覆盖 since 之后。
+// 现状影响有限：HfqBars 的路由门禁按 ts_code 查 ths_adj_factor 有无行，无行即回退旧表。
 func cmdHithinkSyncAdjFactors(client *data.HithinkClient, db *store.DB, tmpPath, since string, batchSize int) {
 	log.Printf("[hithink] 拉取 adjustment-factors 全量 dump…")
 	size, err := client.DownloadDumpFile(data.HithinkDumpAdjFactors, tmpPath)

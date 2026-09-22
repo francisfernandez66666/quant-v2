@@ -181,10 +181,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 // visibility snapshot so the UI can explain why tasks are queued without server logs.
 func (s *Scheduler) tick() {
 	cfg := config.LoadSchedulerConfig(s.cfgPath)
-	// §数据源路由装配（热生效）：primary_source=hithink 时回测取数优先 ths_ 表；
-	// 复权门禁独立开关——两者都通过前引擎不会混合两套复权体系。
-	store.PrimarySourceThsDaily = strings.EqualFold(cfg.PrimarySource, "hithink")
-	store.ThsFactorsReady = cfg.ThsFactorsReady
+	// §数据源路由装配（热生效，§HITHINK_DATA_SOURCE_PLAN + §ADJ P0-A 三轮补强）：
+	// primary_source=hithink 时回测取数优先 ths_ 表；复权门禁独立开关——两者都通过前
+	// 引擎不会混合两套复权体系。写入口统一为 store.ConfigureSource（路由变量已不导出）。
+	store.ConfigureSource(cfg.PrimarySource, cfg.ThsFactorsReady)
 	now := s.nowTime()
 	if !cfg.Enabled {
 		s.preemptCurrent("调度器已禁用")

@@ -18,8 +18,11 @@ func TestRawBarsRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	PrimarySourceThsDaily = true
-	defer func() { PrimarySourceThsDaily = false }()
+	// §P0-A 装配收口后的等价迁移：PrimarySourceThsDaily/ThsFactorsReady 已由包级导出变量
+	// 收为私有 + ConfigureSource 唯一写入口（本文件当时未跟着改，导致包内测试整体编译失败）。
+	// 语义与旧赋值逐字一致，仅走唯一入口，断言未动。
+	ConfigureSource("hithink", false)
+	defer func() { ConfigureSource("", false) }()
 
 	bars, err := db.RawBars("000001.SZ", "20260801", "20260831")
 	if err != nil || len(bars) != 2 {
@@ -29,14 +32,14 @@ func TestRawBarsRouting(t *testing.T) {
 		t.Fatalf("应读到 ths_daily 价格: %+v", bars[0])
 	}
 
-	PrimarySourceThsDaily = false
+	ConfigureSource("", false)
 	bars2, err := db.RawBars("000001.SZ", "20260801", "20260831")
 	if err != nil || len(bars2) != 2 || bars2[0].Close != 99 {
 		t.Fatalf("关闭路由应回退旧表: %v %+v", err, bars2[0])
 	}
 
 	// 无 ths 数据的代码：开路由也自动回退旧表（缺口回退语义）
-	PrimarySourceThsDaily = true
+	ConfigureSource("hithink", false)
 	bars3, err := db.RawBars("600519.SH", "20260801", "20260831")
 	if err != nil {
 		t.Fatalf("无数据回退不应报错: %v", err)
@@ -54,17 +57,16 @@ func TestHfqBarsGate(t *testing.T) {
 	if err := setupRoutingFixture(db); err != nil {
 		t.Fatal(err)
 	}
-	PrimarySourceThsDaily = true
-	ThsFactorsReady = false
-	defer func() { ThsFactorsReady = false }()
+	// 同上：改走唯一写入口，门禁 off→on 的两段断言与旧赋值等价。
+	ConfigureSource("hithink", false)
+	defer func() { ConfigureSource("", false) }()
 
 	hfq, err := db.HfqBars("000001.SZ", "20260801", "20260831")
 	if err != nil || len(hfq) == 0 || hfq[0].Close != 99 {
 		t.Fatalf("门禁关闭应走旧表: %v %+v", err, hfq[:1])
 	}
 	// 门禁开 → ths join（close×factor）
-	ThsFactorsReady = true
-	defer func() { ThsFactorsReady = false }()
+	ConfigureSource("hithink", true)
 	hfq2, err := db.HfqBars("000001.SZ", "20260801", "20260831")
 	if err != nil || len(hfq2) == 0 {
 		t.Fatalf("门禁开启读取失败: %v", err)

@@ -574,3 +574,76 @@ func TestGatePriceCrossCheck(t *testing.T) {
 		})
 	}
 }
+
+// TestGateT1SellableUsesNetOpenSellQty §N-3（2026-09-22 傍晚批复验）联动断言：T+1 可卖量里的
+// 在途项改为「未成交余量」后，本闸的三项扣减必须逐项读通——
+//   - p.Qty 已由 ApplyRealFill 即时扣掉该单已成交的部分；
+//   - bought 是当日买入（T+1 锁定）；
+//   - openSell 只剩该单**未成交**的余量。
+//
+// 旧整笔口径等于把同一笔成交扣两次（p.Qty 已减 + openSell 仍含）→ 可卖量虚低，把合法的
+// 手动/补卖退出一起拦死。本用例同时锁"不得反向变松"：净额之外超量的请求照样要拦。
+// English: §N-3 — the T+1 gate's open-sell term is now the unfilled remainder (the settled part is
+// already gone from p.Qty), so legitimate exits are no longer locked out; over-quantity requests
+// are still rejected.
+func TestGateT1SellableUsesNetOpenSellQty(t *testing.T) {
+	db := gateDB(t)
+	g := NewGate(db, "u_g", nil)
+	cfg := qmtCfg() // EnforceT1 默认开
+	today := cntime.In(time.Now()).Format("2006-01-02")
+	// 隔夜持仓 2000 股（无当日买入成交）
+	if _, err := db.UpsertRealPositions([]store.RealPosition{{TsCode: "600000.SH", Name: "浦发",
+		Qty: 2000, CostPrice: 10, Amount: 20000, UserID: "u_g"}}); err != nil {
+		t.Fatalf("seed position: %v", err)
+	}
+	// 当日卖出委托 1000 股，已成交 500（ApplyRealFill 即时把持仓降到 1500）
+	sid := "sell:600000:止损:" + today
+	if _, err := db.UpsertRealOrder(store.RealOrder{OrderID: "GW-N3", SignalID: sid, Code: "600000.SH",
+		Side: "卖出", Status: "部成", Price: 11, Qty: 1000, CreatedAt: today + "T09:35:00+08:00", UserID: "u_g"}); err != nil {
+		t.Fatalf("seed open sell: %v", err)
+	}
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-N3", Code: "600000.SH", Side: "卖出",
+		Price: 11, Qty: 500, Amount: 5500, TradedAt: today + "T09:40:00", SignalID: sid, UserID: "u_g"}); err != nil {
+		t.Fatalf("apply partial fill: %v", err)
+	}
+	// 台账前提：持仓 1500、在途净额 500 → 可卖 1000
+	if p, err := db.RealPositionByCodeForUser("u_g", "600000.SH"); err != nil || p.Qty != 1500 {
+		t.Fatalf("持仓应已被成交扣到 1500: %+v err=%v", p, err)
+	}
+	if got := db.SumOpenSellQty("u_g", "600000.SH", today); got != 500 {
+		t.Fatalf("在途卖量应为未成交余量 500, got %d", got)
+	}
+	// 卖 800（≤ 净额口径可卖 1000，> 旧口径可卖 500）→ 必须放行（旧口径在此拦死合法退出）
+	o := liveOrder(SideSell)
+	o.Qty = 800
+	if v := g.CheckLiveOrder(cfg, o); !v.Pass {
+		t.Fatalf("§N-3 净额口径下卖 800 应放行（旧整笔口径误拦），got %+v", v)
+	}
+	// 反向锁：超过净额可卖量的请求照样拦（本闸不得因净额口径变松）
+	o2 := liveOrder(SideSell)
+	o2.Qty = 1001
+	if v := g.CheckLiveOrder(cfg, o2); v.Pass {
+		t.Fatalf("超净额可卖量(1000)的 1001 股应被拦, got %+v", v)
+	}
+	// 在途单结清（剩余 500 亦成交 + 终态）：可卖量回到持仓量 1000
+	if err := db.ApplyRealFill(store.RealFill{OrderID: "GW-N3", Code: "600000.SH", Side: "卖出",
+		Price: 11, Qty: 500, Amount: 5500, TradedAt: today + "T10:00:00", SignalID: sid, UserID: "u_g"}); err != nil {
+		t.Fatalf("apply rest fill: %v", err)
+	}
+	if _, err := db.AdvanceRealOrderStatus("u_g", sid, "已成"); err != nil {
+		t.Fatalf("settle order: %v", err)
+	}
+	if got := db.SumOpenSellQty("u_g", "600000.SH", today); got != 0 {
+		t.Fatalf("已成终态后在途应为 0, got %d", got)
+	}
+	o3 := liveOrder(SideSell)
+	o3.Qty = 1000
+	if v := g.CheckLiveOrder(cfg, o3); !v.Pass {
+		t.Fatalf("结清后可卖量应=持仓 1000，卖 1000 应放行, got %+v", v)
+	}
+	o4 := liveOrder(SideSell)
+	o4.Qty = 1100
+	if v := g.CheckLiveOrder(cfg, o4); v.Pass {
+		t.Fatalf("持仓仅 1000，卖 1100 应被拦, got %+v", v)
+	}
+}

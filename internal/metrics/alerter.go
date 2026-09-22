@@ -1,15 +1,16 @@
 // alerter.go 阈值告警（§WS-L 维5）：对量规/计数器做规则评估，支持
 // 「持续 for 时长才触发」（防毛刺）、去重（触发后不重复推送）、恢复通知。
-// 复用 opslog/通知链路；评估器为纯函数可单测，scoreCycle 周期性调用。
+// 复用 opslog 留痕；评估器为纯函数可单测，scoreCycle 周期性调用。
+// §高-3（2026-09-22 傍晚批）：评估出的事件不再只落日志——出站路由/限频/日汇总见
+// alert_routing.go（同包），本文件保持"纯评估器"职责。
 //
 // English: threshold alerting (WS-L 维5). Rules over gauges/counters with a "sustained for"
 // state machine (noise-free), dedup (fire once), and recovery notifications. Pure evaluator for
-// tests; the engine score cycle invokes it periodically.
+// tests; the engine score cycle invokes it periodically. Egress/routing lives in alert_routing.go.
 package metrics
 
 import (
 	"fmt"
-	"log"
 	"time"
 
 	"quant-trading-v2/internal/opslog"
@@ -165,11 +166,17 @@ var globalAlerter = NewAlerter()
 // English: returns the process-wide alert evaluator.
 func GlobalAlerter() *Alerter { return globalAlerter }
 
-// RunAlertEvaluation 用当前量规跑一轮告警评估并把事件打到标准日志（供 scoreCycle 节流调用）。
-// English: runs one alert-evaluation round against registered gauges and logs events (throttled by
-// the score cycle).
+// RunAlertEvaluation 用当前量规跑一轮告警评估，并把事件按路由表送出站（供 scoreCycle 节流调用）。
+// §高-3（2026-09-22 傍晚批）：这里以前只做 log.Printf——规则触发但事件从不出站（"有评估、无出口"
+// 的静默失效）。现在必推类（熔断/降级）走注入的 AlertSink（带冷却限频 + alert/resolved 成对），
+// 日汇总类当天聚合、跨日补发。签名保持不变：调用点是 engine 的 30s 无参节流调用。
+// 即使本轮没有任何事件也要调 Route()：冷却窗后悬置的销案、以及跨日的日汇总都靠这个节拍放行。
+// English: runs one evaluation round and routes the resulting events out (push-class rules go to
+// the injected AlertSink with cooldown + paired alert/resolved; the rest are aggregated daily).
+// Signature is unchanged — the engine calls it with no arguments every ~30s.
 func RunAlertEvaluation() {
-	for _, e := range globalAlerter.Evaluate(DefaultAlertRules(), gaugeSnapshot()) {
-		log.Printf("[metrics] 告警事件 %s", e)
+	events := globalAlerter.Evaluate(DefaultAlertRules(), gaugeSnapshot())
+	for _, d := range globalAlertRouter.Route(events) {
+		alertOutput.emit(d)
 	}
 }

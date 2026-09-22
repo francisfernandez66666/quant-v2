@@ -17,6 +17,16 @@ release on failure; crash-left pending rows stay blocked by design — fail-safe
 （gateway._sweep_stale_pending，默认 600s 超龄）。两者清理的都只是**本地占位行**：
 既不自动重发、也不把单子重新排进队列，是否重试仍由调用方决策——
 防重复真实下单的物理保证（signal_id 唯一键 + 不重排）一字未改。
+
+§CLAIMRELEASE（2026-09-22 晚批 N-8）再收一条边界，`release` 的适用范围据此缩小：
+上面那句「释放未 settle 的占位」只能用于**订单从未离开本端**的路径。若 place_order 已经
+返回成功（桥通道是「入队即 return True」，订单已不可撤回地排队）而 settle 才失败，
+release 掉占位就等于把 ids.claim 这道**唯一**幂等防线拆掉——调用方的有限重试会再次 claim
+成功、二次入队，变成同信号双卖/双买。现在 gateway._release_order_claim 按 sent_to_broker
+分流：False → 照旧 release；True → 调 store.mark_pending_unresolved 把该行提升为第三态
+「待核对」并保留（本模块的 release 不认这个状态，SQL 谓词 status='pending' 天然挡着），
+超时清理（store.release_stale_pending）同样只删 pending。本文件自身不改一行代码——
+改的是它对"什么时候允许被调用"的约束。
 """
 import logging
 

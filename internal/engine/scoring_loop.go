@@ -807,15 +807,19 @@ var fullCloseClasses = []string{"止损", "止盈", "m8"}
 //     止损/止盈/m8 是三个独立幂等键，旧实现各自只计本类的成交，若同日 止损 先全平、m8 随后再触发，
 //     m8 侧剩余量仍按全量算 → 对已无仓的持仓下第二单（超额卖出）。按全部全平类累加后，
 //     剩余 = 持仓量 - Σ已卖，任一类先卖多少另一类就看到剩余多少，从根源杜绝跨类重卖。
-//   - Σ在途：当日非终态卖单（SumOpenSellQty）——P2#13 只覆盖「fills 已落库」的跨轮场景；
+//   - Σ在途：当日非终态卖单的**未成交余量**（SumOpenSellQty）——P2#13 只覆盖「fills 已落库」的跨轮场景；
 //     M8 清仓与止损建议同轮触发时（M8 卖单 fills 尚未回报），两类各按全量各下一笔全额卖单，
 //     第二笔只能靠柜台「证券不足」废单兜底。把在途卖量并入后，先到者占额度，后到者剩余=0 自然跳过。
+//     §N-3（2026-09-22 傍晚批复验）：在途项旧口径对 `部成` 单按**整笔委托量**计，与本函数第一项
+//     Σ已成交重复数了一遍同一笔成交（双扣 → 部成后剩余量恒 ≤0，当天永不补卖）；现按订单净额
+//     （qty − 该单已成交）计，两项相加恰等于「该单占住的量」。买卖两侧「部成」定义同源，
+//     见 store.SumOpenSellQty 与 docs/BUGFIX_BUDGET_FREEZE_LEDGER_20260918.md（买入侧 §BUDGET_FREEZE）。
 //
-// English: P2#13 + §P0-2/§P0-3 — today's un-sellable qty for a code: Σfilled across ALL full-close
+// English: P2#13 + §P0-2/§P0-3 + §N-3 — today's un-sellable qty for a code: Σfilled across ALL full-close
 // classes (stop-loss/take-profit/m8 use independent idempotency keys; aggregating every class makes
-// remaining = held − Σsold so no cross-class double-sell) plus Σopen sell qty (non-terminal tickets;
-// a same-round M8 liquidation + stop-loss advice can no longer both fire full-qty sells before fills
-// are reported — the first order holds the budget, the second sees remaining=0 and skips).
+// remaining = held − Σsold so no cross-class double-sell) plus Σ open sell **unfilled remainder**
+// (non-terminal tickets; §N-3 counts a 部成 ticket at qty−filled, never its whole qty, otherwise the
+// filled part is deducted twice and the remainder can never be topped up the same day).
 func (e *Engine) realSoldOrOpenQtyToday(realStore *store.DB, userID, tsCode string) int {
 	if realStore == nil {
 		return 0
@@ -1009,6 +1013,15 @@ func (e *Engine) autoExecuteRealSellsRound(userID string, ctrl *trading.Controll
 		// 否则同日 止损 全平后 m8 再触发会对已空仓的持仓下第二单（超额卖出）。
 		// §P0-2（2026-09-15）：再扣「今日在途卖单」——同轮 M8 清仓先占额度后，本函数即使看到
 		// 陈旧持仓快照（M8 fills 未回报）也不会再对同一持仓发第二笔全额卖单。
+		// §N-3（2026-09-22 傍晚批）同剩余量幂等桶的复核结论（本条不能盲改的唯一原因）：
+		//   在途项由「整笔 qty」改成「未成交余量」后，桶键仍然安全，因为**一笔被受理的新卖单会
+		//   等额抬高 Σ在途**——发单成功那一刻 remaining 就下降，同轮/下轮再算必然得到更小的剩余量，
+		//   于是「同剩余量」这一条件只有在①无新单被受理（duplicate/失败）或②在途单结清（终态）时
+		//   才可能重现，两种情形都不该再刷单/都已被唯一键拦下。反例（旧口径）恰是相反方向：部成
+		//   推进把 remaining 压成负数，`:r` 桶永不刷新 → 少卖。
+		//   唯一需要留意的残余形态：某桶订单被撤且零成交时 remaining 会回到该桶旧值，此时
+		//   signal_id 唯一键命中已有行 → 走 ResetFailedRealOrder（§H1-MG 已撤零成交可重试）放行，
+		//   不是新缺陷，也不在本条范围。
 		base := realSellSignalID(p.TsCode, class)
 		filled := e.realSoldOrOpenQtyToday(realStore, userID, p.TsCode)
 		remaining := p.Qty - filled

@@ -234,8 +234,18 @@ func (g *Gate) checkBlacklist(cfg config.QMTConfig, o LiveOrder) string {
 // 旧口径只数 持仓−当日买入（均已结算成交），并发双卖（手动双入口或 M8+止损同轮）两笔校验输入相同、
 // 双双放行，合计超过 T+1 可卖量（2026-09-16 实跑 01:16:36 两笔同秒卖单全成交复现）。柜台终裁仍在，
 // 但废单发生在真实交易所、留废单记录；并入在途量后先到者占额度，后到者在网关侧就被拦下。
-// English: §UAT-D4 — sellable now also deducts today's still-open (non-terminal) sell tickets, so
-// concurrent same-second sells can no longer both pass on identical settled-only inputs.
+// §N-3（2026-09-22 傍晚批）联动：在途项口径由「整笔委托量」改为「未成交余量」，本闸随之改变可卖量，
+// 三项扣减的算式必须逐项读通才算对：
+//   - p.Qty 是**已扣掉当日卖出成交**的账面持仓（ApplyRealFill 卖成交即时减仓，与对账快照同源）；
+//   - bought 是当日买入成交（T+1 锁定，未结算不可卖）；
+//   - openSell 是当日非终态卖单的未成交余量（§N-3 后不再重复计入该单已成交的部分）。
+//     旧整笔口径下 部成 单的成交腿被 p.Qty（已减）与 openSell（仍含）扣两次 → 可卖量虚低，
+//     把合法的手动/补卖退出一起拦死（本条修的是卖出侧，绝不能把 T+1 侧改坏）。
+//
+// English: §UAT-D4 — sellable deducts today's still-open sell tickets so concurrent sells can't both
+// pass on identical settled-only inputs. §N-3 — those tickets now count at their unfilled remainder,
+// because the settled part is already gone from p.Qty; the old whole-order figure subtracted the same
+// fills twice and locked up legitimate exits.
 func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 	// 仅卖出方向且开关启用且账本可用时才检查；其余情况跳过。
 	if o.Side != SideSell || !cfg.EnforceT1Enabled() || g.st == nil {
@@ -243,7 +253,8 @@ func (g *Gate) checkT1Sellable(cfg config.QMTConfig, o LiveOrder) string {
 	}
 	// 未知仓位 fail-open：本地查不到该持仓行时跳过校验，交由券商柜台终裁（不拦合法退出）。
 	if p, perr := g.st.RealPositionByCodeForUser(g.userID, o.Code); perr == nil && p.Qty > 0 {
-		// 可卖量 = 持仓 − 当日已买入（未结算不可卖） − 当日在途卖单（已报/部成等非终态，占用额度）。
+		// 可卖量 = 持仓 − 当日已买入（未结算不可卖） − 当日在途卖单的未成交余量（§N-3 净额口径：
+		// 已报/部成/待撤等非终态行按 qty−已成交 占额度，成交腿已由 p.Qty 扣过，不在此重复）。
 		bought := g.st.TodayBoughtQty(g.userID, o.Code, g.today())
 		openSell := g.st.SumOpenSellQty(g.userID, o.Code, g.today())
 		sellable := p.Qty - bought - openSell

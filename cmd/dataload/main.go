@@ -69,6 +69,13 @@ func main() {
 	}
 	defer db.Close()
 
+	// §数据源路由装配（§ADJ P0-A 三轮补强）：`bars` 子命令用 HfqBars 抽验行情，
+	// 若这里不装配就会与引擎/回测走两套复权体系（历史上正是这个盲区）。
+	// 传空串 = 由 store 按缺省 config.json 路径读取 rules.data。
+	if err := store.ConfigureSourceFromFile(""); err != nil {
+		log.Printf("[dataload] 数据源路由按默认装配（旧表 baostock），继续运行: %v", err)
+	}
+
 	bsClient := data.NewBaostockClient(*pyurl)
 
 	// 子命令分发：每个子命令都按 --provider 二选一（tushare 直连 / baostock 经 Python 网关），

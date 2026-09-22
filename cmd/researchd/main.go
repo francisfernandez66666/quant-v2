@@ -24,6 +24,7 @@ import (
 	"quant-trading-v2/internal/notify"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/scheduler"
+	"quant-trading-v2/internal/store" // §ADJ P0-A：启动时经唯一入口装配数据源路由
 )
 
 // main 研究调度服务入口：固定进程时区为 Asia/Shanghai，确定数据目录，启动 scheduler 调度循环，
@@ -56,6 +57,14 @@ func main() {
 	// §DAILY_OPSLOG 每日系统运行日志：research 侧与 quant 共写同目录（按日核心记录）。
 	opslog.Init(filepath.Join(dataDir, "opslog"), 0)
 	opslog.Logf("research", "研究调度服务启动 dataDir=%s tz=%s", dataDir, time.Local.String())
+
+	// §数据源路由装配（§ADJ P0-A 三轮补强）：启动即按唯一入口 store.ConfigureSourceFromFile
+	// 装配一次（scheduler 每个 tick 仍会重读 rules.data 以支持热生效，两者是同一条入口、
+	// 同一套语义，不存在第二处赋值）。这样在任何 worker 拉起【之前】路由已确定，
+	// researchd 全生命周期与 quant/手工工具同口径。
+	if err := store.ConfigureSourceFromFile(filepath.Join(dataDir, "config.json")); err != nil {
+		log.Printf("[researchd] 数据源路由按默认装配（旧表 baostock），继续启动: %v", err)
+	}
 
 	sch := scheduler.New(dataDir, "", "")
 

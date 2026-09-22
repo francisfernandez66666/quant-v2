@@ -55,6 +55,13 @@ func main() {
 	}
 	defer db.Close()
 
+	// §数据源路由装配（§ADJ P0-A 三轮补强）：因子装配（internal/research.assemble）读
+	// HfqBars/RawBars，必须与引擎打分同一套复权体系。空串 = 走缺省 config.json 路径，
+	// 装配语义只由 store.ConfigureSource* 一处实现（各 main 不再自己 set 包级变量）。
+	if err := store.ConfigureSourceFromFile(""); err != nil {
+		log.Printf("[research] 数据源路由按默认装配（旧表 baostock），继续运行: %v", err)
+	}
+
 	// 子命令分发：研究流水线各阶段共用同一个研究库连接（上面已 Open/defer Close），
 	// 参数在此按命令需要二次解析——多数分支把 args[1:] 交给子命令自解析 flag。
 	switch cmd {

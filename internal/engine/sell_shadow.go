@@ -105,6 +105,11 @@ func (e *Engine) runSellUnifiedJudge(
 		held[p.TsCode] = true
 	}
 	e.SignalCtl().PruneSellStates(signalctl.ChannelLive, account, held)
+	// §N-7（2026-09-22 傍晚批复验）：本轮内核自抬的锚点回写 real_positions.highest_price——
+	// 上面 rows 的播种值就取自该列，不回写则重启后移动止盈锚点退回建仓价（静默失效）。
+	// 三种模式下都要写：shadow 模式虽不执行处置，锚点账本化与其「只留痕不改资金」不冲突，
+	// 且切闸瞬间线上已有的高点不会因为一次重启凭空消失。
+	e.persistLiveSellAnchors(account, positions)
 	return verdicts
 }
 

@@ -11,12 +11,22 @@ POST /api/qmt/report。
 原子抢占，杜绝 check→place→record 窗口内的重复真实下单与崩溃后重下；
 首个非占位 order_id 一旦落库不再被覆盖（回调回报的交易所委托号只做一次替换）。
 §G10 成交去重：fills 按 (order_id,side,price,qty) 在时间窗内判重，防通道重放导致持仓翻倍。
+§CLAIMRELEASE（2026-09-22 晚批 N-8）幂等防线的两处收紧：
+  ① orders.status 增加第三态「待核对」（UNRESOLVED_STATUS）——订单已交给通道而结算失败时
+     占位**保留**而非删除，同 signal_id 的后续 claim 一律失败（宁可拒单不双卖）；
+     所有超时清理路径只认 status='pending'，因此第三态永不被当作普通占位清掉；
+  ② dispatch 表增加部分唯一索引 idx_dispatch_signal_active（在途 order 行按 signal_id 唯一），
+     dispatch_enqueue_order 在"上层 claim 保证幂等"这句话失效的地方自己把关。
 （English: local SQLite book aligned with the Seoul-side Go store. Single connection guarded by an
 RLock for ALL reads/writes. Claim-before-place idempotency on orders.signal_id UNIQUE prevents
 duplicate real orders across concurrent retries and crashes; the first real order_id wins and is
-never overwritten. Trade fills are de-duplicated in a sliding time window against channel replays.）
+never overwritten. Trade fills are de-duplicated in a sliding time window against channel replays.
+§CLAIMRELEASE: an unresolved third status keeps the claim row alive when the order was already
+handed to the broker, and a partial unique index on dispatch makes the enqueue idempotent on its
+own instead of trusting the upper layer.）
 """
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -26,6 +36,30 @@ from datetime import datetime, timedelta, timezone
 # 占位 order_id 前缀：pending:<signal_id>（下单前占位）；真实委托号落库后不可被占位值覆盖
 CN_TZ = timezone(timedelta(hours=8))  # 北京时间（UTC+8），用于时间戳字段统一
 FILL_DEDUP_WINDOW_SEC = 120  # 成交去重时间窗（秒）
+
+log = logging.getLogger("qmt_gateway.store")
+
+# §CLAIMRELEASE（2026-09-22 晚批 N-8）：orders.status 的**第三态**字面量「结果未知/待核对」。
+# 用在哪儿：place_order 已经返回成功（订单已不可撤回地入队/报送）而随后的 settle 结算失败时，
+# 占位行**不删**、由 pending 提升为本值——同一 signal_id 的后续 claim 依旧抢不到 → 恒 409
+# （宁可拒单也绝不双卖），并要求人工/回报侧核对。
+# 为什么用 status 取值、而不是加列或改 order_id 哨兵：
+#   ① 幂等防线本体是 orders.signal_id 的 UNIQUE 约束，第三态只要「行还在」就同时满足
+#      「挡住重试」与「超时清理不误删（清理只认 status='pending'）」两件事，无需改任何 SQL 谓词；
+#   ② 零迁移：orders 表字段与首尔侧 Go store 对齐，加列会外溢到 /state 契约面；
+#   ③ 收敛天然：任何后续回报（handler.on_order/_apply_order_result/§M16 收割）都经
+#      upsert_order 直接改写 status → 自动回到正常终态，不需要额外的状态清除代码。
+UNRESOLVED_STATUS = "待核对"
+
+
+class DispatchDuplicateSignal(Exception):
+    """§CLAIMRELEASE：同一 signal_id 已有在途 order 派发行，入队被纵深防线拒绝。
+
+    为什么要有独立异常类型：`dispatch_enqueue_order` 的幂等原本"由上层 ids.claim 保证"
+    （见其 docstring），而上层那道防线在 N-8 里被证实可被拆（占位被释放后 Go 重试直达此处）。
+    DB 层拦下时必须给调用方一个**可识别**的错误（而非裸 sqlite3.IntegrityError），
+    网关据此写清日志并回明确 err 文案，运维不会误判成"数据库故障"。
+    """
 
 
 def is_placeholder_order_id(oid):
@@ -79,6 +113,8 @@ class Store:
                     created_at TEXT
                 )""")
             self._conn.commit()
+        # §CLAIMRELEASE：派发队列 signal_id 纵深唯一索引（新老库都尝试建立，独立容错）
+        self.dispatch_signal_guard = self._ensure_dispatch_signal_guard()
 
     def _init_schema(self):
         """新建数据库时初始化全量表结构：持仓/委托/成交/幂等/outbox 等核心表。
@@ -234,6 +270,60 @@ class Store:
             self._conn.execute("ALTER TABLE dispatch ADD COLUMN inflight_at TEXT DEFAULT ''")
         self._conn.commit()
 
+    # §CLAIMRELEASE（2026-09-22 晚批 N-8）：dispatch 侧 signal_id 纵深唯一索引。
+    # 索引 SQL 单独成常量，便于单测/巡检直接断言其谓词。
+    # 为什么谓词是 ('pending','inflight') 而不是审计原文的 ('pending','已报')：
+    #   dispatch.status 的实际取值集是 pending|inflight|done（'已报' 属 orders 侧字面量，
+    #   桥与派发路径永不写入 dispatch），桥一取单该行就离开 'pending' —— 只锁 pending
+    #   等于给最常见的那一种（已被取走、正在真实下单）敞开重复入队的门。
+    # 为什么排除空 signal_id：dispatch.signal_id DEFAULT ''，历史/运维行（diag 等）可能留空，
+    #   空串之间不该互相排斥（否则会拦住与业务信号无关的行）。
+    _DISPATCH_GUARD_NAME = "idx_dispatch_signal_active"
+    _DISPATCH_GUARD_SQL = (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_signal_active ON dispatch(signal_id) "
+        "WHERE kind = 'order' AND status IN ('pending','inflight') AND signal_id <> ''")
+
+    def _ensure_dispatch_signal_guard(self):
+        """建立/确认 dispatch 的 signal_id 部分唯一索引，返回该纵深防线是否在位。
+
+        老库里若已存在「同 signal_id 两条在途 order 行」（N-8 现场遗留），建索引会失败——
+        此时**绝不自作主张删行**（那些行可能对应真实已报柜台委托），改为 loud log +
+        返回 False（/admin/status 可见 `dispatch_signal_guard=false`），
+        由人工核对后用 release_unresolved_pending / 显式清理收敛。
+        English: creates the partial unique index that keeps a second in-flight order row
+        for the same signal_id from ever being enqueued; never deletes legacy rows.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(self._DISPATCH_GUARD_SQL)
+                self._conn.commit()
+            return True
+        except sqlite3.IntegrityError as e:
+            log.error("[store] §CLAIMRELEASE 派发队列 signal_id 唯一索引建立失败（库内存量重复在途行）："
+                      "%s —— 纵深防线未生效，请人工核对 dispatch 表同 signal_id 的多条在途 order 行"
+                      "（本方法不自动删任何派发行，那些行可能对应真实已报柜台的委托）", e)
+            return False
+        except sqlite3.Error as e:  # noqa: BLE001 — 建索引失败不能阻断网关启动（表结构异常另有日志）
+            log.error("[store] §CLAIMRELEASE 派发队列 signal_id 唯一索引创建异常：%s", e)
+            return False
+
+    def dispatch_active_order_exists(self, signal_id):
+        """§CLAIMRELEASE 查同 signal_id 是否已有在途（pending/inflight）order 派发行。
+
+        仅用于观察/取证（运维查单、测试断言）——**入队判定不依赖它**：
+        dispatch_enqueue_order 的判重写在同一条 INSERT…SELECT…WHERE NOT EXISTS 里，
+        用"先查后写"来做幂等会把进程内锁之外的并发窗口留给第二笔（本方法本身就是这样
+        一个危险的写法，所以把它挡在写路径之外）。
+        """
+        if not signal_id:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM dispatch WHERE kind='order' AND signal_id = ? "
+                "AND status IN ('pending','inflight') LIMIT 1",
+                (str(signal_id),)).fetchone()
+            return row is not None
+
     # ── orders ──
     def claim_order(self, draft):
         """§G1 原子占位：以 signal_id 抢占一个 pending 行。
@@ -241,6 +331,8 @@ class Store:
         返回 (claimed:bool, existing:dict|None)。已存在时返回既有行（含 pending 占位），
         调用方据此实现幂等或拒绝进行中请求。崩溃残留的 pending 行会永久阻塞该 signal_id
         （安全侧失效：宁可拒绝也不重复真实下单），启动时由 Gateway 打警告日志。
+        §CLAIMRELEASE：第三态「待核对」行同样落在这道 UNIQUE 之下——这正是保留那行的全部
+        意义（同 sid 重试在这里 claim 失败 → 409），调用方按 existing.status 区分两种拒绝。
         """
         # 取出幂等键 signal_id，作为占位行的唯一约束
         sid = draft.get("signal_id", "")
@@ -274,13 +366,57 @@ class Store:
             return True, None
 
     def release_pending(self, signal_id):
-        """下单失败时释放 pending 占位，允许后续重试。仅删未结算的占位行。"""
+        """下单失败时释放 pending 占位，允许后续重试。仅删未结算的占位行。
+
+        §CLAIMRELEASE 语义边界（此处**不**放宽）：谓词是 status='pending'，因此第三态
+        「待核对」行不受影响——「已入队但结算失败」的信号绝不允许被这条路径静默解锁。
+        """
         with self._lock:
             self._conn.execute(
                 "DELETE FROM orders WHERE signal_id = ? AND status = 'pending'",
                 (signal_id,),
             )
             self._conn.commit()
+
+    def mark_pending_unresolved(self, signal_id):
+        """§CLAIMRELEASE 把未结算占位提升为第三态「结果未知/待核对」（只动 pending 行）。
+
+        用于「place_order 已返回成功（订单已不可撤回地入队/报送）而 settle 失败」这一路：
+        保留占位行 = 保留 orders.signal_id UNIQUE 这道唯一幂等防线，后续重试一律 409。
+        只认 status='pending' 是为了不覆盖任何已到达的回报（回报先到即已是正常态）。
+        返回受影响行数（0 = 行已被 settle/别的路径推进，调用方只需留痕不必再报警）。
+        English: promote the placeholder to the unresolved third state (row kept on purpose).
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE orders SET status = ? WHERE signal_id = ? AND status = 'pending'",
+                (UNRESOLVED_STATUS, signal_id),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def list_unresolved_pending(self):
+        """§CLAIMRELEASE 第三态「待核对」占位清单（结果未知、需人工/对账核对的信号）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM orders WHERE status = ? ORDER BY created_at", (UNRESOLVED_STATUS,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def release_unresolved_pending(self, signal_id):
+        """§CLAIMRELEASE 显式人工确认收敛：删除一条「待核对」占位，解锁该 signal_id。
+
+        这是第三态唯一的**主动**出口（回报到达/upsert_order 推进是被动收敛）：
+        运维在券商侧核实「这笔单确实没有到达柜台」后调用它放行重试。绝不自动调用，
+        也不进任何超时清理路径 —— 否则等于把第三态又降级回普通 pending（N-8 原缺陷）。
+        返回受影响行数（0 = 该 sid 不在第三态）。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM orders WHERE signal_id = ? AND status = ?",
+                (signal_id, UNRESOLVED_STATUS),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def upsert_order(self, order):
         """插入/更新委托。返回是否新订单。
@@ -377,6 +513,12 @@ class Store:
         claim 成功→settle 前崩溃会在 orders 表留下 status='pending' 行，进程重启后若只 warning
         不释放，该 signal_id 永久被 claim 占位阻塞（首尔重试恒得 409 'duplicate in-flight'），
         对应信号永不能再下单。此处删除「创建超过 max_age_sec 秒」的 pending 行，安全解锁。
+
+        §CLAIMRELEASE（2026-09-22 晚批 N-8）不变式收紧：本方法**只**删 status='pending'，
+        第三态「待核对」（订单已交给通道、结果未知）刻意不在清理范围内 —— 那条行代表的
+        是"券商侧很可能已有委托"的既成事实，超时删掉它 = 放行同信号第二笔 = 双卖，
+        正是本条缺陷的成因。它的滞留告警/收敛见 gateway._alert_unresolved_pending
+        与 gateway._do_admin_order_confirm（独立阈值、只告警不删行）。
         """
         import time as _time  # noqa: PLC0415
         # 时间戳阈值（Unix 秒）：max_age_sec<=0 表示不限制，阈值取 0 → 一条都不删，
@@ -661,20 +803,70 @@ class Store:
     def dispatch_enqueue_order(self, req, user_id=""):
         """把一笔待执行单写入派发队列，返回 "seq:<id>" 不透明引用。
 
-        幂等由上层 ids.claim（orders.signal_id UNIQUE）保证——同一 signal_id 重复
-        入队只会有一方进入（网关 /order 的 claim 段已在入队前完成互斥）。
+        §CLAIMRELEASE（2026-09-22 晚批 N-8）幂等口径修正 —— 旧 docstring 写「幂等由上层
+        ids.claim（orders.signal_id UNIQUE）保证」，而那句话在 N-8 里被证实**不成立**：
+        上层那道防线可以在「已入队 + settle 失败」这一路被 _release_order_claim 拆掉，
+        拆掉后 Go 侧的有限重试（次数 = 重试配置 + 1）会再次走到这里，同 signal_id
+        第二笔入队 = 双卖/双买。
+        现在本函数自带纵深防线（不依赖调用方是否遗留占位），两道都在 **DB 层**：
+          ① 写入语句本身是 `INSERT … SELECT … WHERE NOT EXISTS(同 sid 的在途 order 行)`——
+             判重与写入是同一条 SQL，SQLite 单写者语义下不存在"读了没有→写之前被别人插了"的
+             窗口（旧写法是先 SELECT 再 INSERT 的 check-then-write，进程内的 _lock 挡不住
+             同库第二个连接）；影响 0 行即代表被拦，直接抛可识别异常；
+          ② 部分唯一索引 idx_dispatch_signal_active（见 _ensure_dispatch_signal_guard）：
+             在 ① 之外再钉一层约束，即使未来新增别的入队路径绕过 ① 也写不进去。
+        两者命中都抛 DispatchDuplicateSignal（可识别异常，不是裸 sqlite3 报错），
+        由 gateway._do_order 的 except 分支写清日志并回 500/拒单。
+        索引建立失败时（老库存量重复行）self.dispatch_signal_guard=False，
+        此时 ① 仍然完整生效（它是 SQL，不依赖索引）——启动日志会 error 留痕，
+        /admin/status 的 dispatch_signal_guard 字段可见，须人工清重后重启。
+        English: §CLAIMRELEASE — the enqueue enforces its own idempotency in SQL
+        (conditional insert + partial unique index) instead of trusting the upper-layer
+        claim, whose placeholder was provably releasable on the settle-failure path.
         """
+        sid = str(req.get("signal_id", "") or "")
+        in_flight_sql = ("SELECT 1 FROM dispatch WHERE kind = 'order' AND signal_id = ? "
+                         "AND status IN ('pending','inflight')")
         with self._lock:
-            cur = self._conn.execute(
-                """INSERT INTO dispatch(seq, signal_id, kind, code, side, price_type,
-                                        price, qty, strategy, status, created_at, user_id)
-                   VALUES(?,?,?,?,?,?,?,?,?, 'pending', ?, ?)""",
-                # 实参顺序与上面列名一一对应：seq 先落空串（拿到 rowid 后回填
-                # "seq:<id>"），status 固定 'pending' 由 SQL 常量给出，不进参数
-                ("", req.get("signal_id", ""), "order", req.get("code", ""),
-                 req.get("side", ""), req.get("price_type", ""),
-                 float(req.get("price", 0) or 0), int(req.get("qty", 0) or 0),
-                 req.get("strategy", ""), req.get("created_at", "") or _now_cn(), user_id))
+            try:
+                if sid:
+                    # 防线①：带 NOT EXISTS 的条件写入——判重与插入同一语句，无 check-then-write 窗口
+                    cur = self._conn.execute(
+                        """INSERT INTO dispatch(seq, signal_id, kind, code, side, price_type,
+                                                price, qty, strategy, status, created_at, user_id)
+                           SELECT ?,?,?,?,?,?,?,?,?, 'pending', ?, ?
+                           WHERE NOT EXISTS (""" + in_flight_sql + """)""",
+                        # 实参顺序与上面列名一一对应：seq 先落空串（拿到 rowid 后回填
+                        # "seq:<id>"），status 固定 'pending' 由 SQL 常量给出，不进参数；
+                        # 末尾一个 ? 给 NOT EXISTS 子查询的 signal_id
+                        ("", sid, "order", req.get("code", ""),
+                         req.get("side", ""), req.get("price_type", ""),
+                         float(req.get("price", 0) or 0), int(req.get("qty", 0) or 0),
+                         req.get("strategy", ""), req.get("created_at", "") or _now_cn(),
+                         user_id, sid))
+                    if cur.rowcount == 0:
+                        # 同 sid 已有在途 order 行：一笔都没写进去（条件分支为假）
+                        self._conn.rollback()
+                        raise DispatchDuplicateSignal(
+                            "signal_id %s 已有在途派发单（pending/inflight），拒绝重复入队（§CLAIMRELEASE）"
+                            % sid)
+                else:
+                    # 无 signal_id 的派发行（运维/历史路径）：不参与幂等判定，按原语义直接入队
+                    cur = self._conn.execute(
+                        """INSERT INTO dispatch(seq, signal_id, kind, code, side, price_type,
+                                                price, qty, strategy, status, created_at, user_id)
+                           VALUES(?,?,?,?,?,?,?,?,?, 'pending', ?, ?)""",
+                        ("", sid, "order", req.get("code", ""),
+                         req.get("side", ""), req.get("price_type", ""),
+                         float(req.get("price", 0) or 0), int(req.get("qty", 0) or 0),
+                         req.get("strategy", ""), req.get("created_at", "") or _now_cn(), user_id))
+            except sqlite3.IntegrityError as e:
+                # 防线②：条件写入绕过去了（并发/旁路路径）→ 由部分唯一索引拦下，翻译成可识别异常。
+                # 注意 seq 列的 UNIQUE 也可能抛 IntegrityError，但 seq 是先插空串再回填，
+                # 空串只有一条、回填值由 rowid 派生恒唯一，故这里归因为 signal_id 重复。
+                self._conn.rollback()
+                raise DispatchDuplicateSignal(
+                    "signal_id %s 重复入队被派发队列唯一索引拦下（§CLAIMRELEASE）：%s" % (sid, e)) from e
             rowid = cur.lastrowid
             seq = "seq:%d" % rowid
             self._conn.execute("UPDATE dispatch SET seq=? WHERE id=?", (seq, rowid))
