@@ -1384,10 +1384,21 @@ grep -q 'function Read-SecretFile' deploy/qmt-win/register_engine_services.ps1 |
 RAW_SET=$(grep -nE 'nssm[[:space:]]+(set)[[:space:]]+\$?[a-zA-Z"]*[[:space:]]*AppEnvironmentExtra' deploy/qmt-win/register_engine_services.ps1 | grep -vE '^[0-9]+:[[:space:]]*#' | wc -l | tr -d ' ')
 [ "$RAW_SET" -eq 1 ] || { echo "--- FAIL: 裸 nssm set AppEnvironmentExtra 出现 $RAW_SET 处（期望仅函数内 1 处，§N-5）"; exit 1; }
 # 部署面独立复核（校验面不得依附施工面，§M7 同族教训）：第 15 号探针 + 只看键名。
-grep -q 'quant env LLM/HITHINK key names' scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL: §N-5 部署后键名复核探针丢失"; exit 1; }
+grep -q 'quant env HITHINK key + LLM source' scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL: §N-5 部署后键名复核探针丢失"; exit 1; }
+# ⚠ 口径修正锁（2026-09-23 部署实录：这条探针首跑把自己判红）：LLM_* 三元组**不得**当硬 env 键要求。
+#   LLM 的权威源是设置页保存（auth.json per-account 配置项，internal/llmcfg/llmcfg.go 解析链
+#   ①设置页>②env>…），env 只是 bootstrap；把 ② 写成必需键 = 永久性假红，还会诱使操作人为了
+#   凑绿把密钥再抄一份进 env/密钥文件（扩大泄露面）。两侧断言都必须承认「auth.json 已保存」这条路。
+grep -q 'function Test-LlmSavedInAuthJson' deploy/qmt-win/register_engine_services.ps1 || { echo "--- FAIL: §N-5 LLM 权威源判定丢失（注册步会把 bootstrap-only 的 env 当硬要求）"; exit 1; }
+grep -q "llm_api_keys" scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL: §N-5 探针不再认 auth.json 已保存密钥（LLM 假红复活，部署后验证将永久红）"; exit 1; }
+# 负锁：硬必需键清单里不得再出现 LLM_API_KEY（HITHINK 才是 env-only 的真硬键）。
+if grep -qE '^\s*"(quant|quant-research)"[[:space:]]*=[[:space:]]*@\(.*LLM_API_KEY.*\)' deploy/qmt-win/register_engine_services.ps1; then
+	echo "--- FAIL: §N-5 LLM_API_KEY 又被写回硬必需键清单（§UI-AUTHORITATIVE 假红复活）"; exit 1; fi
+if grep -qE '^\$envNeed = @\(.*LLM_API_KEY' scripts/verify_deploy_guangzhou.sh; then
+	echo "--- FAIL: §N-5 探针 envNeed 又含 LLM_API_KEY（同上）"; exit 1; fi
 if grep -nE 'Get-BaseEnvExtra|AppEnvironmentExtra' scripts/verify_deploy_guangzhou.sh | grep -qE 'Write-Output.*\$raw|echo.*\$l\b'; then
 	echo "--- FAIL: §N-5 探针疑似回显环境变量值（密钥明文泄露按事故处理）"; exit 1; fi
-echo "ok - §NSSMENV 专项守卫通过（静态锁 4 道 + 负锁 1 道 + 探针锁 2 道）"
+echo "ok - §NSSMENV 专项守卫通过（静态锁 4 道 + 负锁 3 道 + 探针锁 3 道，含 §N-5 LLM 来源口径锁）"
 
 echo "==> 68 §LIVEBACKUP 广州灾备纳入 live.db + accounts（跨机集合逐相等，傍晚批 P0-B）..."
 # 现象：live.db（实盘持仓/委托/成交/资产四本账，cmd/quant 独立打开）**此前没有任何一份灾备方案

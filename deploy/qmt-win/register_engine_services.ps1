@@ -295,9 +295,32 @@ if (Test-Path $prune) {
 #   与同批 N-6「降级不得报成功」同口径：宁可这次部署失败并吵起来，也不交出缺键的运行态。
 # 注意：quant-research 不监听端口，故不要求 QUANT_ADDR；pydata 是 baostock sidecar，
 #   不吃 LLM/HITHINK 键，故不进断言（把不该有的键写成要求会造出永久性假红）。
+# ⚠ 口径修正（2026-09-23 部署实录，本断言首跑即判红暴露）：**LLM_* 三元组不是硬 env 要求**。
+#   §UI-AUTHORITATIVE 起 LLM 的权威源是「设置页保存」= auth.json 的 per-account 配置项
+#   （internal/llmcfg/llmcfg.go 的解析链：①设置页 > ②env > ③全局 auth > ④config.json > ⑤代码默认），
+#   env 只是 bootstrap。现网 LLM 密钥一直在 ①，把 ② 写成硬性必需键 = 造出一条永远修不好的假红，
+#   且会诱使操作人为了"让部署变绿"把密钥明文再抄一份进 env/密钥文件——反而扩大泄露面。
+#   所以 LLM 只断言「有可用来源」：env 键名在位 **或** auth.json 里存在非空 llm_api_key(s)。
+#   HITHINK_FINANCE_API_KEY 不同——它**只有 env 这一条路**（internal/data/hithink.go:29 只认环境变量），
+#   机器级环境变量也算（NSSM 服务继承机器级），故仍是硬要求。
 $envRequired = @{
-    "quant"          = @("TZ", "QUANT_DATA_DIR", "QUANT_ADDR", "LLM_API_KEY", "LLM_API_URL", "LLM_MODEL", "HITHINK_FINANCE_API_KEY")
-    "quant-research" = @("TZ", "QUANT_DATA_DIR", "LLM_API_KEY", "LLM_API_URL", "LLM_MODEL", "HITHINK_FINANCE_API_KEY")
+    "quant"          = @("TZ", "QUANT_DATA_DIR", "QUANT_ADDR", "HITHINK_FINANCE_API_KEY")
+    "quant-research" = @("TZ", "QUANT_DATA_DIR", "HITHINK_FINANCE_API_KEY")
+}
+# 判断 LLM 密钥是否已在权威源（①设置页保存）里落好：只看 configs[].key/value 是否为空，
+# **任何情况下都不打印值**。auth.json 结构见 internal/auth/auth.go:199 ConfigEntry{key,value,user_id}。
+function Test-LlmSavedInAuthJson([string]$path) {
+    if (-not (Test-Path $path)) { return $false }
+    try {
+        $j = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($c in @($j.configs)) {
+            if ($null -eq $c) { continue }
+            if ($c.key -eq 'llm_api_key' -or $c.key -eq 'llm_api_keys') {
+                if (("$($c.value)").Trim()) { return $true }
+            }
+        }
+    } catch { return $false }   # 解析失败按"未确认"处理，让断言吵起来而不是静默放行
+    return $false
 }
 $envMissing = @()
 foreach ($svc in ($envRequired.Keys | Sort-Object)) {
@@ -312,13 +335,21 @@ foreach ($svc in ($envRequired.Keys | Sort-Object)) {
             $envMissing += ("{0}.{1}" -f $svc, $k)
         }
     }
+    # LLM 来源断言：env 键名（服务级或机器级）在位，或设置页已保存密钥 —— 二者皆无才是真缺。
+    $llmOk = $have.ContainsKey('LLM_API_KEY') -or [bool][Environment]::GetEnvironmentVariable('LLM_API_KEY', 'Machine')
+    if (-not $llmOk) { $llmOk = Test-LlmSavedInAuthJson (Join-Path $DataDir 'auth.json') }
+    if (-not $llmOk) {
+        Warn "服务 $svc 的 LLM 无任何可用来源（env 无 LLM_API_KEY 且 auth.json 无已保存密钥）——咨询/夜间研究将降级为关键词模式"
+        $envMissing += ("{0}.LLM-source" -f $svc)
+    }
 }
 if ($envMissing.Count -gt 0) {
-    Warn ("§N-5 部署判失败：服务运行环境缺 " + $envMissing.Count + " 个键 -> " + ($envMissing -join ", "))
+    Warn ("§N-5 部署判失败：服务运行环境缺 " + $envMissing.Count + " 项 -> " + ($envMissing -join ", "))
     Warn ("排查：把缺失键写进密钥文件 ${SecretFile}（KEY=VALUE）或机器级环境变量，或用 -LLMApiKey/-HithinkApiKey 传入后重跑；" +
+          "LLM 若已在设置页保存则无需再配 env（§UI-AUTHORITATIVE）；" +
           "验证命令（只看键名）：& `"$nssm`" get quant AppEnvironmentExtra")
     exit 1
 }
-Ok "服务 env 键名断言通过：quant 7 键 / quant-research 6 键在位（全程未回显任何值）"
+Ok "服务 env 键名断言通过：quant 4 硬键 + quant-research 3 硬键在位，LLM 来源已确认（全程未回显任何值）"
 
 Ok "engine services registered. Verify: Get-Service quant,quant-research,pydata ; schtasks /Query /TN QMT-Ensure-Running"

@@ -18,8 +18,11 @@
 #   5) 网关：/health ok:true；/settlement 未鉴权 → 401（§P0-1a 新端点路由已上线）
 #   6) 引擎新端点：POST /api/holdings/balance、/api/positions/execute 未鉴权 → 401
 #   7) §20260922PM：POST /api/news/test-attribution 未鉴权 → 401（M-14 收权 admin 生效复核）
-#   8) §N-5（2026-09-23 晚批，第 15 探针）：quant 服务运行环境必须含 LLM/HITHINK 两组**键名**
-#      ——注册脚本洗掉密钥后仍会打印"registered"，故必须在部署面独立复核（只报键名，绝不报值）
+#   8) §N-5（2026-09-23 晚批，第 15 探针）：HITHINK_FINANCE_API_KEY 键名必须在位（它只有 env
+#      这一条路）+ LLM 必须有**任一可用来源**（服务级/机器级 env 键名，或 auth.json 里设置页
+#      已保存的非空 llm_api_key(s)——§UI-AUTHORITATIVE 下 env 只是 bootstrap，硬要求 env 会造
+#      永久性假红）。注册脚本洗掉密钥后仍会打印"registered"，故必须在部署面独立复核
+#      （只报键名/布尔，绝不报值）
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
@@ -33,6 +36,7 @@ GZ_USER="${GZ_USER:-Administrator}"
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 COMMIT="${COMMIT:-$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 DEPLOY_DIR="${DEPLOY_DIR:-C:/opt/quant}"
+DATA_DIR="${DATA_DIR:-C:/var/lib/quant-trading-v2}"   # §N-5 第 15 探针：auth.json（LLM 权威源）所在
 ENGINE_PORT="${ENGINE_PORT:-8081}"
 WEB_PORT="${WEB_PORT:-8080}"
 GW_PORT="${GW_PORT:-8789}"
@@ -52,7 +56,9 @@ param(
     [string]$Commit = "unknown",
     [int]$EnginePort = 8081,
     [int]$WebPort = 8080,
-    [int]$GwPort = 8789
+    [int]$GwPort = 8789,
+    # §N-5 第 15 探针用：运营数据目录（auth.json 落这里，LLM 权威源＝设置页保存）。
+    [string]$DataDir = "C:\var\lib\quant-trading-v2"
 )
 $ErrorActionPreference = "Continue"
 
@@ -141,20 +147,27 @@ Probe "engine:/api/positions/execute unauth=401" ($code -eq "401") ("got=" + $co
 $code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/news/test-attribution") '{}'
 Probe "engine:/api/news/test-attribution unauth=401" ($code -eq "401") ("got=" + $code + "；404=二进制未更新，200=收权未生效（成员越权面仍在）")
 
-# 8) §N-5（2026-09-23 晚批）第 15 探针：quant 服务运行环境必须含 LLM/HITHINK 两组**键名**。
+# 8) §N-5（2026-09-23 晚批）第 15 探针：HITHINK 键名必须在位 + LLM 必须有可用来源。
 #
 # 为什么要单列一条（注册脚本尾部已经断言过了）：register_engine_services.ps1 的
 #   AppEnvironmentExtra 是整体替换语义，旧版任何一次不带密钥参数的重跑（改端口/修故障/二次部署）
 #   都会静默删掉 LLM_API_KEY/LLM_API_URL/LLM_MODEL，而且**照打 "engine services registered"**。
 #   修完之后注册步会自己判红，但现网态仍可能被一次手工 nssm set / 旧脚本副本洗掉——
 #   所以校验面必须独立于施工面（与 §M7「verify 面要求 quant-web Running、deploy 面没人管」同族教训）。
-# 硬规矩：**只看键名，绝不回显值**。nssm get 的输出含密钥明文，这里只截取 '=' 左侧，
+# ⚠ 口径修正（2026-09-23 部署首跑就是这条把它自己判红的）：**LLM 三元组不得当硬 env 键要求**。
+#   §UI-AUTHORITATIVE 起 LLM 权威源是设置页保存（auth.json per-account 配置项），
+#   env 只是 bootstrap（internal/llmcfg/llmcfg.go 解析链 ①设置页>②env>③全局auth>④config>⑤默认）。
+#   现网密钥在 ①，硬要求 ② = 一条永久性假红，还会诱使人为凑绿把密钥再抄一份进 env/密钥文件
+#   （扩大泄露面）。故 LLM 判定改为「有任一可用来源」：服务级/机器级 env 键名 **或** auth.json 有非空 llm_api_key(s)。
+#   HITHINK_FINANCE_API_KEY 仍是硬要求：internal/data/hithink.go:29 只认环境变量，没有第二来源。
+# 硬规矩：**只看键名/只看布尔，绝不回显值**。nssm get 的输出含密钥明文，这里只截取 '=' 左侧，
 #   失败信息里也只拼键名；日志/终端出现密钥明文按事故处理。
 # 判定口径 = 服务级 AppEnvironmentExtra ∪ 机器级环境变量：NSSM 的 extra 是**追加**语义，
 #   进程照样继承机器级 env，而现网 HITHINK_FINANCE_API_KEY 长期只存在于机器级
 #   （RUNBOOK §4.1b.2「顺带核查」+ deploy/qmt-win/run_ths_backfill.ps1:10 的读取口径）。
 #   只查 extra 会造出一条永久性假红，且掩盖不了真缺键——两者取并集才是「进程实际能不能拿到」。
-$envNeed = @("LLM_API_KEY", "LLM_API_URL", "LLM_MODEL", "HITHINK_FINANCE_API_KEY")
+$envNeed = @("HITHINK_FINANCE_API_KEY")
+# nssm.exe 的三个可能安装位（现网 = 第一个；备份任务/手工安装可能落在后两个）。
 $nssmCandidates = @(
     "C:\opt\quant\qmt-win\tools\nssm-2.24\win64\nssm.exe",       # deploy_guangzhou.sh 上传位（现网）
     "C:\opt\quant\deploy\qmt-win\tools\nssm-2.24\win64\nssm.exe",# 备份任务安装位（register_backup_task.ps1）
@@ -171,12 +184,28 @@ if ($nssmFound) {
         if ($i -gt 0) { $haveKeys += $t.Substring(0, $i) }      # 只留键名，值就地丢弃
     }
 }
-foreach ($k in $envNeed) {
+foreach ($k in $envNeed + @("LLM_API_KEY")) {
     if ([Environment]::GetEnvironmentVariable($k, 'Machine')) { $haveKeys += $k }   # 机器级同样算拿到
 }
+# LLM 来源第三条路：设置页已保存（auth.json 的 configs[].key=llm_api_key/llm_api_keys 且值非空）。
+# 只取布尔结果，值不进任何变量之外的地方，也不参与下面 $envDetail 的拼接。
+$llmSaved = $false
+$authPath = $DataDir + "\auth.json"
+if (Test-Path $authPath) {
+    try {
+        $aj = Get-Content -Path $authPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($c in @($aj.configs)) {
+            if ($null -eq $c) { continue }
+            if ($c.key -eq 'llm_api_key' -or $c.key -eq 'llm_api_keys') {
+                if (("$($c.value)").Trim()) { $llmSaved = $true }
+            }
+        }
+    } catch { $llmSaved = $false }
+}
 $envMissing = @($envNeed | Where-Object { $haveKeys -notcontains $_ })
-$envDetail = "nssm=" + $(if ($nssmFound) { "ok" } else { "not-found(只按机器级判定)" }) + " 缺键=" + ($envMissing -join ",") + "（只报键名，未回显值）"
-Probe "engine:quant env LLM/HITHINK key names" ($envMissing.Count -eq 0) $envDetail
+if ($haveKeys -notcontains 'LLM_API_KEY') { if (-not $llmSaved) { $envMissing += 'LLM-source' } }
+$envDetail = "nssm=" + $(if ($nssmFound) { "ok" } else { "not-found(只按机器级判定)" }) + " 缺项=" + ($envMissing -join ",") + "（只报键名/布尔，未回显值）"
+Probe "engine:quant env HITHINK key + LLM source" ($envMissing.Count -eq 0) $envDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -185,7 +214,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
-out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT}" 2>&1 | LC_ALL=C tr -d '\r')
+out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
 
 PASS=0
 FAIL=0
