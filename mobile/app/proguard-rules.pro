@@ -19,3 +19,7 @@
 -keep class * extends cn.jpush.android.service.JPushMessageReceiver { *; }
 -dontwarn cn.jiguang.**
 -keep class cn.jiguang.** { *; }
+# §NATIVEAUTH（2026-09-22 C批）：androidx.security→crypto.tink 引用的编译期注解类不进 APK（compileOnly 依赖），
+# R8 全量混淆期按引用检查看不到即报错。两类均纯注解、无运行期语义，官方口径 -dontwarn。
+-dontwarn javax.annotation.Nullable
+-dontwarn javax.annotation.concurrent.GuardedBy

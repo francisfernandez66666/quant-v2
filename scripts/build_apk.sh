@@ -121,7 +121,7 @@ if [ "$MODE" = "release" ]; then
     # 并保存到本地不入库的 mobile/keystore.pass（chmod 600）。
     KS="${MOBILE_KEYSTORE:-$APP_DIR/mobile/keystore.jks}"
     PASSFILE="$APP_DIR/mobile/keystore.pass"
-    if [ -n "$MOBILE_KEYSTORE_PASS" ]; then
+    if [ -n "${MOBILE_KEYSTORE_PASS:-}" ]; then
         KSPASS="$MOBILE_KEYSTORE_PASS"
     elif [ -f "$PASSFILE" ] && [ "$KS" = "$APP_DIR/mobile/keystore.jks" ]; then
         # 复用首跑生成的随机口令（文件仅本机，已被 .gitignore 覆盖）

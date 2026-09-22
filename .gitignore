@@ -63,7 +63,7 @@ mobile/build/
 mobile/app/build/
 mobile/local.properties
 mobile/.kotlin/
-mobile/keystore.jks
+mobile/keystore*.jks
 mobile/gradle/wrapper/gradle-wrapper.jar
 mobile/gradle/wrapper/gradle-wrapper.jar.*
 # APK 内嵌的前端产物（由 build_apk.sh 从 web/dist 生成，不入库）
