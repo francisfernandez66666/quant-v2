@@ -27,7 +27,9 @@
 #   否则 PS5.1 按 GBK 解析中文注释直接 ParserError（教训见 §ENH-A run_ths_backfill.ps1 锁）。
 #   本文件自 2026-09-23（§P0-B 收编）起随 scripts/deploy_guangzhou.sh 步 [2e] 自动下发到
 #   C:\opt\quant\deploy\qmt-win\（与计划任务指向同源），不再依赖手工安装；部署链会先跑
-#   ps1_bom 归一（UTF-8 单 BOM + CRLF）。手工上机口径保留在 RUNBOOK_LIVEBACKUP.md §2 作应急路径。
+#   ps1_bom 归一（**只保证 UTF-8 单 BOM，不改行尾**——本文件历史上是 BOM+LF，现网 PS5.1 实跑通过，
+#   所以别再照旧文档"顺手转 CRLF"，那只会让仓库副本与现网字节不一致）。手工上机口径保留在
+#   RUNBOOK_LIVEBACKUP.md §2 作应急路径。
 $ErrorActionPreference = "Stop"
 
 $DataDir  = "C:\var\lib\quant-trading-v2"
@@ -81,6 +83,44 @@ New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
 
 try {
     Log "=== snapshot start ==="
+
+    # -1) 单写者锁（§SNAP-LOCK，2026-09-23 现网实录锤实）：快照产物路径是**固定名覆盖**
+    #     （SnapRoot\trading.db / live.db 每晚被下一次跑重写），所以"两个快照进程同时在跑"不是
+    #     浪费一次 IO 那么简单——两份 sqlite backup 交替写同一个目标文件，产出一个大小正常、
+    #     PRAGMA integrity_check 却可能通过的混合页快照，比缺一次备份更危险（坏在恢复那天才暴露）。
+    #     实录：SSH 中断把一个交互 powershell 留在远端继续跑，紧接着计划任务又被触发，第二次的
+    #     `restic forget --prune` 直接撞上第一次的仓库锁（exit=11 repo already locked）。
+    #     不变量必须写在**被调用的脚本**里：入口有三种（04:00 计划任务 / 部署步 [6/6] 触发 /
+    #     运维手工 RUNBOOK §2 步骤 3），任何调用方都只看得见自己那一种，靠调用方"先看任务状态
+    #     再决定要不要触发"的守卫必然漏（我今天就先写了一版那样的假守卫）。
+    # 接管口径：持有者 PID 仍是活动 powershell ⇒ 拒跑（抛错→ok:false，吵而不是等）；PID 解析不出、
+    #     进程名不是 powershell/pwsh、或锁龄超过 $LockMaxMin ⇒ 视为陈旧锁，Log 一行 WARN 后接管。
+    #     为什么要有龄上界：PID 会被回收复用，复用到一个无关 powershell 上时会把后来者永久锁死；
+    #     留上界的最坏后果只是"拒跑到龄满"，且每次接管都带 WARN 行可查。上界取 6h：单次快照在夜间
+    #     窗口内跑完是设计前提（04:00 触发、06:00 前研究链要用盘），超过即认定那一轮已经死了。
+    #     （本仓库现网整轮真实耗时尚未取证——09-23 那次被 SSH 中断，日志未读到，故这里只给上界、
+    #     不谎称"实测分钟级"。）
+    $Lock = Join-Path $SnapRoot ".backup.lock"
+    $LockMaxMin = 360
+    $holderTaken = $false
+    if (Test-Path $Lock) {
+        $lk = ""
+        try { $lk = [string](Get-Content -Path $Lock -Raw -Encoding ASCII) } catch { $lk = "" }
+        $ageMin = $LockMaxMin + 1
+        try { $ageMin = [int]((Get-Date) - (Get-Item $Lock).LastWriteTime).TotalMinutes } catch { }
+        $holderPid = 0
+        if ($lk -match 'pid=(\d+)') { $holderPid = [int]$Matches[1] }
+        $holder = $null
+        if ($holderPid -gt 0) { $holder = Get-Process -Id $holderPid -ErrorAction SilentlyContinue }
+        if ($holder -and $holder.ProcessName -match '^(powershell|pwsh)$' -and $ageMin -lt $LockMaxMin) {
+            throw ("another snapshot run is active: " + $lk.Trim())
+        }
+        Log ("WARN: stale snapshot lock taken over (age_min=" + $ageMin + " content=" + $lk.Trim() + ")")
+    }
+    # 锁内容只放排障需要的三元组（谁/在哪台/何时起），不放任何密钥或路径之外的信息。
+    Set-Content -Path $Lock -Encoding ascii -NoNewline -Value ("pid=" + $PID + " host=" + $env:COMPUTERNAME + " started=" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+    # 从此行起才是"我持有锁"——catch 里的释锁只对持有者生效，拒跑分支（上面那条 throw）永不释别人锁。
+    $holderTaken = $true
 
     # 0) Disk guard: now TWO databases land here (trading.db ~5GB + live.db), plus the relay repo
     #    needs headroom on C:. Refuse if <8GB free (unchanged threshold; see HARDENING plan risk note).
@@ -208,11 +248,17 @@ try {
     }
     ($marker | ConvertTo-Json -Compress) | Set-Content -Path (Join-Path $SnapRoot "SNAPSHOT_OK") -Encoding ascii -NoNewline
     Log ("=== snapshot+restic done dbs=" + (($dbBytes.Keys | Sort-Object) -join ","))
+    # 释锁在两个出口各写一次，不用 finally：`try 内 exit` 是否跑 finally 在 PS 各版本语义不一，
+    # 而本文件没有 pwsh 可实跑验证——留一个"跑成功却不释锁"的锁，最坏会让下一夜白拒一次。
+    Remove-Item -LiteralPath $Lock -Force -ErrorAction SilentlyContinue
     exit 0
 }
 catch {
     Log ("ERROR: " + $_.Exception.Message)
     $bad = [ordered]@{ ok=$false; ts=(Get-Date).ToString("yyyy-MM-ddTHH:mm:ss"); err=$_.Exception.Message }
     ($bad | ConvertTo-Json -Compress) | Set-Content -Path (Join-Path $SnapRoot "SNAPSHOT_OK") -Encoding ascii -NoNewline
+    # 只在**自己拿到过锁**时释锁：拒跑分支（"another snapshot run is active"）抛错前根本没写锁文件，
+    # 此处若无条件 Remove-Item 就会把真在跑的那位的锁删掉，单写者保护当场失效——正是要防的形态。
+    if ($Lock -and $holderTaken) { Remove-Item -LiteralPath $Lock -Force -ErrorAction SilentlyContinue }
     exit 1
 }

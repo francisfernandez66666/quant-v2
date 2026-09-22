@@ -1575,5 +1575,86 @@ if ! go test ./internal/research -run 'TestDiscoveryResumeKeyCarriesAdjBasis|Tes
 	echo "--- FAIL: §ADJ-BASIS 断点键回归测试未通过（旧键复用/新键不稳定）"; exit 1; fi
 echo "ok - §ADJ-BASIS 守卫通过（键位正锁 3 + 常量锁 1 + 回归测试 2）"
 
+# ── 72. §P0-B-HEADROOM 磁盘余量探针 + 护栏阈值等值锁（2026-09-23 现网首跑实录）──
+# 现象：LIVEBACKUP_FIRST_RUN=1 首跑被 backup_snapshot.ps1 step 0 护栏挡下——`C: free space
+#       6.9GB < 8GB guard`。同一天 04:00 那次计划任务却过了护栏（那时余量 ≥8GB）。
+# 根因：磁盘余量是**单调递减**的前置条件，而它只在"备份真跑的那一刻"才被检查；部署面第 16 探针
+#       读的是 SNAPSHOT_OK 的 ok/err，要人主动去读那一行 err 才知道是盘不够。余量不足时备份
+#       永远不会发生 ⇒ 标记要么陈旧要么 ok=false，实盘账本照旧无灾备。
+# 为什么不能直接把护栏调小：护栏守的是"GB 级快照写到一半盘满"这种比不备更糟的形态（撕裂快照
+#       比缺快照更难发现），阈值属于资金安全侧，只能扩盘或清盘，不能改数凑跑。
+# 修法前置：新增第 17 探针（只读）把余量抬成部署面日检项，并用**等值锁**钉住两处阈值同源——
+#       单向锁（"探针必须 ≥8"）会让两侧各自漂移，故这里比对的是两侧解析出的同一个数。
+echo ""
+echo "==> 72 §P0-B-HEADROOM 余量探针与护栏阈值等值锁..."
+grep -qF 'backup:disk headroom (guard=8GB)' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 17 余量探针丢失（盘不足将再次只在备份失败当晚才知情）"; exit 1; }
+# 明细必须带四个数，否则判红后还要上机二查是谁吃的盘。
+grep -qF 'free=" + $freeGB + "GB snapshot="' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 余量探针不再输出 free/snapshot/relay/datadir 明细"; exit 1; }
+# 等值锁：脚本护栏与探针阈值必须是同一个 GB 数（各自 grep 出数字再比相等）。
+guardN=$(grep -oE '\$c\.Free -lt [0-9]+GB' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1)
+probeN=$(grep -oE '\$pc\.Free -lt [0-9]+GB' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1)
+[ -n "$guardN" ] && [ -n "$probeN" ] \
+	|| { echo "--- FAIL: 护栏/探针阈值写法变更（等值锁取不到数，两侧判据失去同源）"; exit 1; }
+[ "$guardN" = "$probeN" ] \
+	|| { echo "--- FAIL: 磁盘阈值漂移 护栏=${guardN}GB vs 探针=${probeN}GB（探针判绿而备份必失败）"; exit 1; }
+# 负锁：探针不得退化成"再读一次 SNAPSHOT_OK"（那与第 16 项重复，永远看不到未来的失败）。
+if grep -qE '^\s*\$freeGB = .*SNAPSHOT_OK' scripts/verify_deploy_guangzhou.sh; then
+	echo "--- FAIL: 余量探针改从 SNAPSHOT_OK 取数（自证式假绿）"; exit 1; fi
+# §RESTIC-LOCK 补锁：Invoke-Native 的参数名绝不能叫 $Args——PS 自动变量，占用会静默改语义。
+if grep -qE 'function Invoke-Native[\s\S]{0,80}\$Args' deploy/qmt-win/backup_snapshot.ps1; then
+	echo "--- FAIL: Invoke-Native 参数占用 \$Args 自动变量"; exit 1; fi
+grep -qE 'param\(\[string\]\$Exe, \[string\[\]\]\$CmdArgs\)' deploy/qmt-win/backup_snapshot.ps1 \
+	|| { echo "--- FAIL: Invoke-Native 参数签名形态变更（请同步本锁）"; exit 1; }
+# ps1_bom 只管 BOM：文档/注释口径必须与实现一致，"UTF-8 单 BOM + CRLF"是错话，出现在这个文件里
+# 任何位置（含注释）都会诱导人工去转行尾、制造仓库与现网字节不一致（§BOM-REPO 同族）。
+if grep -qF 'ps1_bom 归一（UTF-8 单 BOM + CRLF）' deploy/qmt-win/backup_snapshot.ps1; then
+	echo "--- FAIL: backup_snapshot.ps1 重新声称 ps1_bom 会转 CRLF"; exit 1; fi
+echo "ok - §P0-B-HEADROOM 守卫通过（探针正锁 2 + 阈值等值锁 1 + 负锁 3）"
+
+# ── 73. §SNAP-LOCK 快照单写者锁（2026-09-23 当日自曝缺陷的收口 + 防"保护自己变成新停更入口"）──
+# 现象：部署步 [2e] 里直跑的一次首跑被 SSH 中断留下孤儿 powershell，随后计划任务又被触发，第二次的
+#       `restic forget --prune` 撞上第一次的仓库锁（exit=11 repo already locked），SNAPSHOT_OK 写成
+#       ok=false——而两个快照进程此刻正在**同时往 SnapRoot\trading.db 覆盖写**。
+# 根因：产物是固定名覆盖 ⇒ "谁在跑"这个不变量只有被调用脚本自己看得见；入口有三种（04:00 计划任务 /
+#       部署触发 / 运维手工 RUNBOOK §2），调用方互相看不见。我第一版写的正是调用方守卫
+#       （`schtasks /Query` 状态 + grep "正在运行"），而且是道**恒绿的假守卫**：远端回传的是 GBK
+#       字节，UTF-8 模式下的中文 grep 永不命中（本仓 verify 明细一直有乱码即同一现象）。
+# 因此本段锁三件事：①锁文件两侧同名（脚本写、探针读，路径漂移=探针自证式假绿）；②接管龄上界两侧
+#       同数（等值锁，单向锁会让"探针判绿、脚本永久拒跑"）；③拒跑分支不得释别人的锁。
+echo ""
+echo "==> 73 §SNAP-LOCK 单写者锁与锁文件同源..."
+# ① 锁文件名同源（脚本端 Join-Path $SnapRoot，探针端 Join-Path $SnapDir）。
+grep -qE '\$Lock = Join-Path \$SnapRoot "\.backup\.lock"' deploy/qmt-win/backup_snapshot.ps1 \
+	|| { echo "--- FAIL: 脚本端锁文件名/位置形态变更（探针将读到不存在的锁=恒绿）"; exit 1; }
+grep -qE '\$Lk = Join-Path \$SnapDir "\.backup\.lock"' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 探针端锁文件路径与脚本不再同源"; exit 1; }
+grep -qF 'backup:single-writer lock' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 18 单写者探针丢失"; exit 1; }
+# ② 接管龄上界等值：脚本用分钟（$LockMaxMin），探针用小时，换算后必须相等。
+lockMin=$(grep -oE '\$LockMaxMin = [0-9]+' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1)
+probeH=$(grep -oE 'if \(\$lkAgeH -ge [0-9]+\)' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1)
+[ -n "$lockMin" ] && [ -n "$probeH" ] \
+	|| { echo "--- FAIL: 锁龄上界写法变更（等值锁取不到数，两侧判据失去同源）"; exit 1; }
+[ "$lockMin" -eq $((probeH * 60)) ] \
+	|| { echo "--- FAIL: 锁龄上界漂移 脚本=${lockMin}min vs 探针=${probeH}h（探针判绿而脚本永久接管/永久拒跑）"; exit 1; }
+# ③ 释锁：成功出口必须无条件释，失败出口必须带 holderTaken 条件（否则拒跑那次会删掉真跑着的锁）。
+python3 - deploy/qmt-win/backup_snapshot.ps1 <<'PY' || { echo "--- FAIL: §SNAP-LOCK 释锁位置不符（成功出口缺释锁 / catch 无条件释锁）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+ok_leg = re.search(r'snapshot\+restic done.*?exit 0', t, re.S)
+bad_leg = re.search(r'\ncatch \{.*?exit 1', t, re.S)
+assert ok_leg and 'Remove-Item -LiteralPath $Lock' in ok_leg.group(0), '成功出口未释锁'
+assert bad_leg and 'if ($Lock -and $holderTaken) { Remove-Item -LiteralPath $Lock' in bad_leg.group(0), 'catch 未条件释锁'
+PY
+# ④ 负锁：不靠 finally 释锁（try 内 exit 是否执行 finally 在 PS 各版本语义不一，本机无 pwsh 可验）。
+if grep -qE '^\s*finally\s*\{' deploy/qmt-win/backup_snapshot.ps1; then
+	echo "--- FAIL: 出现 finally 释锁（未实跑验证过的语义，改成两出口显式释）"; exit 1; fi
+# ⑤ 负锁：调用方那道"看任务状态再触发"的假守卫不得复活（GBK 回传 + 看不见非任务入口）。
+if grep -qF 'schtasks /Query /TN quant-backup-snap /FO LIST' scripts/deploy_guangzhou.sh; then
+	echo "--- FAIL: 部署步重新用 schtasks 状态做触发前守卫（中文状态 grep 恒不命中=假守卫）"; exit 1; fi
+echo "ok - §SNAP-LOCK 守卫通过（同源锁 2 + 龄上界等值锁 1 + 释锁锁 2 + 负锁 2）"
+
 echo ""
 echo "==> 全部通过"

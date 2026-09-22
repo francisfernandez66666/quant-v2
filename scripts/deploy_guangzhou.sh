@@ -295,19 +295,7 @@ $SCP deploy/qmt-win/backup_snapshot.ps1 deploy/qmt-win/backup_snap.py deploy/qmt
      "${GZ_USER}@${GZ_IP}:${BACKUP_DIR}/"
 $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${BACKUP_DIR}/register_backup_task.ps1 -ScriptPath ${BACKUP_DIR}/backup_snapshot.ps1" \
   || echo "  [!] 快照计划任务注册未通过（退出码非 0）——前后端发布不受影响，但 §P0-B 灾备尚未生效：按 RUNBOOK_LIVEBACKUP.md §2 处理后重跑本步即可"
-# §P0-B 首跑（默认关，LIVEBACKUP_FIRST_RUN=1 打开）：注册成功只证明"任务在、脚本在位"，不证明
-#   备份会成功——09-23 现网实录是任务与脚本俱在、每晚却因中转仓库陈旧锁抛错，文件级快照看起来
-#   一切正常而 restic 增量早已停更。这个开关把"等下一次 04:00 才知道"压成"部署当场知道"。
-#   刻意不做成默认：首跑要整份快照 trading.db（GB 级）并喂 restic 中转仓库，磁盘余量虽由脚本自身
-#   8GB 护栏兜住（不足即 ok:false 退 1），仍是需要运维择窗的动作，不该随每次部署自动发生。
-if [ "${LIVEBACKUP_FIRST_RUN:-0}" = "1" ]; then
-  echo "  [2e] LIVEBACKUP_FIRST_RUN=1 -> 当场首跑快照链 ..."
-  if $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${BACKUP_DIR}/backup_snapshot.ps1"; then
-    echo "  OK 首跑退出码 0（判据：verify_deploy_guangzhou.sh 第 16 探针，或 SNAPSHOT_OK 的 dbs 两库齐）"
-  else
-    echo "  [!] 首跑非零退出——失败原因已写进 SNAPSHOT_OK(ok:false,err=...) 与 _snapshot.log，按 RUNBOOK §2 步骤 4 逐条对判据"
-  fi
-fi
+# 注意：本步**只上传与注册**，不首跑。首跑在 [6/6]——理由见那里的 §P0-B-FIRSTRUN 注释。
 
 # ── 3. 数据目录 + 默认 config.json（影子模式：qmt.enabled=false）──
 # §UAT 20260915 部署加固：原内联 SSH 命令的 bash→PS 双层转义在每个部署日都报 ParserError
@@ -426,6 +414,34 @@ if $SSH "powershell -NoProfile -Command \"try { (Invoke-WebRequest -Uri http://1
 else
   echo "  X 网关未就绪（RESTART_GATEWAY=0 时属预期）；可用 scripts/verify_deploy_guangzhou.sh 复核"
 fi
+# ── 6. §P0-B 快照链首跑（默认关，LIVEBACKUP_FIRST_RUN=1 打开；**必须在服务已拉起之后**）──
+# 为什么注册步 [2e] 不首跑、要挪到这里（2026-09-23 当日自曝缺陷）：首版把首跑内联在 [2e]，
+#   而 [2/5] 已经为释放 quant.exe 文件锁停掉了 quant / quant-research，[4/5] 才拉起——于是
+#   "当场验证灾备"变成了"把实盘引擎按在停机态等一份 GB 级快照跑完"（09-23 07:17 那次我在 [2e]
+#   直跑，SSH 挂了 25min 仍未回，我把部署杀掉时它还在跑；整轮真实耗时未取证，但"部署期间引擎停机
+#   等备份"这件事本身就已经是事故形态）。盘后窗口尚可，盘前/盘中就是事故；且 SSH 一断，远端子
+#   进程与部署脚本一起悬住——那次留下的孤儿进程后来还撞掉了计划任务的 restic（见 §SNAP-LOCK）。
+# 现在的语义：① 服务与健康检查已完成，引擎在写、快照照读（SQLite backup API 正是为此选的，
+#   绝不能用裸拷贝）；② **不阻塞部署**——用 schtasks /Run 触发那个真正每晚在跑的任务
+#   （SYSTEM 账号、PATH/python 解析与夜间完全同路径，比我在 SSH 里直跑 powershell 更可信），
+#   触发后立即返回；③ 结果由 verify 第 16/17 探针事后判定，本步只报"是否成功交给任务"。
+# 仍默认关：首跑会实打实拷 GB 级库并喂 restic 中转仓（磁盘余量由脚本自身 8GB 护栏兜，
+#   不足即 ok:false 退 1），属需运维择窗的动作，不该随每次部署自动发生。
+if [ "${LIVEBACKUP_FIRST_RUN:-0}" = "1" ]; then
+  echo "[6/6] §P0-B 首跑：交给计划任务 quant-backup-snap（不阻塞部署）..."
+  # 这里**不再做**"先看任务是否在跑再决定触发"的守卫（首版就是这么写的，是一道假守卫）：
+  #   ① `schtasks /Query` 的状态文案随系统码页变（现网回传是 GBK 字节，UTF-8 模式下的
+  #      `grep -c "正在运行"` 永不命中，等于守卫恒为"未在跑"）；② 计划任务状态也看不见非任务入口
+  #      的跑批（SSH 里直跑、上一版部署留下的交互进程）。单写者不变量已下沉到
+  #      backup_snapshot.ps1 的 .backup.lock（§SNAP-LOCK，唯一看得见全部入口的位置）；本步只管触发，
+  #   ③ 撞车后果由脚本自己拒跑（抛错→SNAPSHOT_OK ok:false→第 16 探针判红），是**响**而不是静默。
+  if $SSH "schtasks /Run /TN quant-backup-snap" >/dev/null 2>&1; then
+    echo "  OK 已触发。判据不看时长、只看产物：GZ_IP=${GZ_IP} ./scripts/verify_deploy_guangzhou.sh 第 16/17/18 探针"
+  else
+    echo "  [!] schtasks /Run 失败——按 RUNBOOK_LIVEBACKUP.md §2 步骤 3 手工触发；灾备未首跑前第 16 探针会持续判红"
+  fi
+fi
+
 echo "=============================================="
 echo " 部署完成（当前 config 原样保留，qmt 开关状态不受部署影响）。"
 echo " 验证：./scripts/verify_deploy_guangzhou.sh（buildCommit 指纹/新端点/服务状态全量复核）"

@@ -27,6 +27,10 @@
 #      + 落盘脚本在位且**内容认识 live.db**（旧版只快照 trading.db，光看"任务在跑"会完全假绿）
 #      + 产物 SNAPSHOT_OK.ok=true 且 dbs 同时含 trading.db/live.db（字节>0）、accounts_files>0、
 #      标记新鲜度 ≤30h（任务存在但每晚失败只有时间戳能暴露）
+#  10) §P0-B-HEADROOM（2026-09-23，第 17 探针）：备份护栏的**前置条件**本身要日检——C: 余量必须
+#      ≥ backup_snapshot.ps1 step 0 的 8GB 护栏（同数由 verify_changes.sh §72 等值锁钉住）。
+#      实录：04:00 那次护栏还过、07:1x 首跑只剩 6.9GB，余量是单调往下走的；只读 SNAPSHOT_OK 的
+#      ok=false 要等人去读 err 才发现根因，本探针判红明细直接带 free/snapshot/relay/datadir 四数。
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
@@ -262,6 +266,53 @@ if (-not (Test-Path $bkMark)) {
     } catch { $bkMissing += "产物:SNAPSHOT_OK 解析失败" }
 }
 Probe "backup:snap task+script(live.db)+artifacts" ($bkMissing.Count -eq 0) ("缺项=" + ($bkMissing -join ","))
+
+# 10) §P0-B-HEADROOM（2026-09-23，第 17 探针）：快照链的**前置条件**磁盘余量。
+#
+# 为什么第 16 探针不够：它读的是 SNAPSHOT_OK，而 ok:false 的 err 文本要等人去读那一行才知道
+#   根因；04:00 那次护栏还过（≥8GB），07:1x 首跑时已经只剩 6.9GB ⇒ **余量是随时间往下走的**，
+#   "昨晚的失败原因"和"今晚会不会失败"不是同一件事。护栏本身是设计正确的（不足即 ok:false
+#   退 1，绝不撕裂快照），但它只在备份脚本里生效——没人跑备份就没人知道盘已经不够了。
+#   同族缺陷主题：降级只在动作发生时才吵 = 事实上无人值守。本探针把余量抬成部署面日检项。
+# 判据与 backup_snapshot.ps1 的 step 0 护栏**同数**（8GB；由 verify_changes.sh §72 等值锁钉住，
+#   改任一侧必须同改，否则探针判绿而脚本必失败）。
+# 明细顺带报三个大目录的占用（SnapRoot/中转仓/数据目录），这样判红时不需要再上机找是谁吃的盘。
+function DirGB($p) {
+    if (-not (Test-Path $p)) { return -1.0 }
+    try {
+        $s = (Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+        return [math]::Round($s / 1GB, 1)
+    } catch { return -1.0 }
+}
+$hd = @()
+$pc = Get-PSDrive -Name C
+$freeGB = [math]::Round($pc.Free / 1GB, 1)
+if ($pc.Free -lt 8GB) { $hd += ("C: free " + $freeGB + "GB < 8GB guard") }
+$snapGB = DirGB $SnapDir
+$repoGB = DirGB "C:\var\lib\quant-restic-repo"   # 与 backup_snapshot.ps1 的 $RepoDir 同一路径（无参数入口，故此处同为字面量）
+$dataGB = DirGB $DataDir
+Probe "backup:disk headroom (guard=8GB)" ($hd.Count -eq 0) ("free=" + $freeGB + "GB snapshot=" + $snapGB + "GB relay=" + $repoGB + "GB datadir=" + $dataGB + "GB 缺项=" + ($hd -join ","))
+
+# 11) §SNAP-LOCK（2026-09-23，第 18 探针）：快照单写者锁的健康度。
+# 为什么需要：快照产物是**固定名覆盖**，两个进程同跑会写出混合页的"看着正常"备份；拒跑保护写在
+#   backup_snapshot.ps1 里（唯一看得见所有入口的地方），但保护本身也会咬人——一次崩在跑中间的
+#   进程留下死锁，此后每夜都会被"age<6h 才接管"的规则挡在门外直到龄满 6h，表现为**灾备静默停更**
+#   （正是本仓反复踩的那族：任务在跑、看起来正常、其实早已断）。
+# 判据：锁文件不存在=空闲（绿）；存在且龄 <6h=正在跑或刚跑完（绿，明细带 pid）；龄 ≥6h=有进程死在
+#   中途（红，明细直接给 pid/host/started，不必上机）。阈值 6h 与脚本 $LockMaxMin 同数，由 §73 等值锁钉。
+# 明细全 ASCII：PS 的中文输出经 SSH→bash 回传会变乱码（本脚本既有 FAIL 明细已现），而锁内容本就是
+#   ASCII，直接透传最稳。
+$lkMissing = @()
+$lkTxt = "none"
+$Lk = Join-Path $SnapDir ".backup.lock"
+if (Test-Path $Lk) {
+    try { $lkTxt = [string](Get-Content -Path $Lk -Raw -Encoding ASCII) } catch { $lkTxt = "unreadable" }
+    $lkAgeH = 99999
+    try { $lkAgeH = [math]::Round(((Get-Date) - (Get-Item $Lk).LastWriteTime).TotalHours, 1) } catch { }
+    if ($lkAgeH -ge 6) { $lkMissing += ("lock age " + $lkAgeH + "h >= 6h (a run died mid-way)") }
+    $lkTxt = $lkTxt.Trim() + " age_h=" + $lkAgeH
+}
+Probe "backup:single-writer lock" ($lkMissing.Count -eq 0) ("lock=" + $lkTxt + " miss=" + ($lkMissing -join ","))
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
