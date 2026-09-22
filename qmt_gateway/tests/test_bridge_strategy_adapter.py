@@ -108,5 +108,94 @@ class TestXtOpsContract(unittest.TestCase):
         self.assertTrue(got.endswith("+08:00"))
 
 
+class TestM3OrderLegConfirmation(unittest.TestCase):
+    """M-3 (2026-09-22 fix batch) -- bridge side of the order-leg second confirmation.
+
+    Defect: embed_place() returned True as soon as passorder() did not raise, that was
+    forwarded as ok=True and the gateway reported a plain "accepted". The deal leg has
+    _bridge_tick's DEAL polling as a compensation loop; the ORDER leg had none, so a
+    counter-side refusal after the call left the order stuck in "accepted" forever.
+    Fix: resolve_order_id() records whether the ORDER-table poll really saw the order,
+    and _handle_cmd() publishes it as an EXTRA order_confirmed field. The idempotency
+    anchor (ok / seq settlement / never re-sending) is untouched -- asserted below.
+    (Pure ASCII test: this module runs under the GBK strategy sandbox.)
+    """
+
+    CMD = {"kind": "order", "seq": "SEQ-M3", "signal_id": "SIG-M3", "code": "600279.SH",
+           "side": "\u4e70\u5165", "price_type": "limit", "price": 10, "qty": 100}
+
+    def test_resolve_flags_unconfirmed_when_order_never_seen(self):
+        """embed_resolve returns "" -> last_resolve_confirmed False, seq ref kept."""
+        ops = bs._XtOps(account="ACC", dry_run=False, xt_path="", session_id=2)
+        ops.embed_usable = lambda: True
+        ops.embed_resolve = lambda req, signal_id="", timeout_sec=8.0: ""
+        ref = ops.resolve_order_id("SIG-M3", "seq:5", {"code": "600279.SH", "signal_id": "SIG-M3"})
+        self.assertEqual(ref, "seq:5", "unresolved must fall back to the seq ref (anchor)")
+        self.assertFalse(ops.last_resolve_confirmed)
+
+    def test_resolve_confirms_exchange_order_id_when_seen(self):
+        """embed_resolve finds the order -> confirmed True and the exchange id returned."""
+        ops = bs._XtOps(account="ACC", dry_run=False, xt_path="", session_id=2)
+        ops.embed_usable = lambda: True
+        ops.embed_resolve = lambda req, signal_id="", timeout_sec=8.0: "123456"
+        self.assertEqual(ops.resolve_order_id("SIG-M3", "seq:5", {}), "123456")
+        self.assertTrue(ops.last_resolve_confirmed)
+
+    def test_dry_run_resolve_stays_confirmed(self):
+        """dry-run has no counter to confirm against -> must NOT be flagged unconfirmed."""
+        ops = bs._XtOps(account="ACC", dry_run=True, xt_path="", session_id=2)
+        self.assertEqual(ops.resolve_order_id("SIG-M3", "DRYRUN-1", {}), "DRYRUN-1")
+        self.assertTrue(ops.last_resolve_confirmed)
+
+    def _run_handle_cmd(self, confirmed_flag, place_result):
+        """Drive _handle_cmd with a stub adapter + captured report lines."""
+        old = (bs._trace, bs._report, bs._record_seen, bs._xt)
+        reports = []
+
+        class _Stub(object):
+            def __init__(self, flag):
+                self.last_resolve_confirmed = flag
+
+            def place(self, req):
+                return place_result
+
+            def resolve_order_id(self, signal_id, pending_ref, req=None):
+                return pending_ref
+
+        stub = _Stub(confirmed_flag)
+        bs._trace = lambda m: None
+        bs._report = lambda payload: reports.append(payload)
+        bs._record_seen = lambda seq: True
+        bs._xt = lambda: stub
+        try:
+            handled = bs._handle_cmd(dict(self.CMD), set())
+        finally:
+            bs._trace, bs._report, bs._record_seen, bs._xt = old
+        return handled, reports
+
+    def test_handle_cmd_publishes_unconfirmed_flag(self):
+        """ORDER never seen -> order_result keeps ok=True (anchor) but says confirmed=False."""
+        handled, reports = self._run_handle_cmd(False, (True, "seq:5", ""))
+        self.assertTrue(handled)
+        self.assertEqual(len(reports), 1)
+        rep = reports[0]
+        self.assertEqual(rep["type"], "order_result")
+        self.assertEqual(rep["seq"], "SEQ-M3")
+        self.assertTrue(rep["ok"], "ok must not be flipped: dispatch settlement anchor")
+        self.assertIs(rep["order_confirmed"], False)
+
+    def test_handle_cmd_publishes_confirmed_flag(self):
+        handled, reports = self._run_handle_cmd(True, (True, "seq:5", ""))
+        self.assertIs(reports[0]["order_confirmed"], True)
+        self.assertTrue(reports[0]["ok"])
+
+    def test_handle_cmd_rejected_order_has_no_confirm_field(self):
+        """ok=False path unchanged (no order_confirmed key on failures)."""
+        handled, reports = self._run_handle_cmd(True, (False, "", "insufficient funds"))
+        self.assertTrue(handled)
+        self.assertFalse(reports[0]["ok"])
+        self.assertNotIn("order_confirmed", reports[0])
+
+
 if __name__ == "__main__":
     unittest.main()

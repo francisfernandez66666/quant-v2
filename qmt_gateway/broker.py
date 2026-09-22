@@ -26,6 +26,28 @@ from store import _now_cn  # noqa: E402
 # 模块级日志器：各 broker 统一记录连接/断线/回调异常
 log = logging.getLogger("qmt_gateway.broker")
 
+# §SIDEGATE-PY（2026-09-22 修复批，M-1）通道层方向白名单（gateway.ORDER_SIDES 的第二道闸）。
+# 缺陷原文：下面两条真实通道都是 `STOCK_BUY if side=="买入" else STOCK_SELL` 的三元式
+# （旧 broker.py:310；桥侧 qmt_bridge_strategy.py:563/769 同型）——**任何**非"买入"的方向
+# 取值都会被下成卖单，而网关的整手校验却按买入规则放行它，一道拼错的方向就同时完成
+# 「方向翻转」和「让首尔 risk.Gate 里按 Side 精确匹配的三道闸全部失效」。
+# 为什么这一层还要再收一次：网关 /order 入口已经 400 拒非法方向，但 place_order 是通道
+# 原语，除 /order 外还有派发注入、对账重放、未来新调用方等潜在入口；把"未知方向 = 卖出"
+# 这种静默翻转改成显式失败（fail-close），才让上面那句 grep 形态（`else STOCK_SELL`）
+# 永远不可能被非法方向踩到。返回 False 走调用方的既有失败分支（释放占位 + 400），
+# 不引入任何重试语义。
+VALID_SIDES = ("买入", "卖出")
+
+
+def is_valid_side(value):
+    """§SIDEGATE-PY 方向是否合法：必须逐字等于买入/卖出（不做 strip/大小写归一）。"""
+    return isinstance(value, str) and value in VALID_SIDES
+
+
+def side_reject(value):
+    """§SIDEGATE-PY 统一拒单三元组（place_order 的 (ok, ref, err) 返回口径）。"""
+    return False, "", "invalid side %r (must be one of %s)" % (value, "/".join(VALID_SIDES))
+
 
 class Broker:
     """交易通道基类。"""
@@ -282,6 +304,10 @@ class XtBroker(Broker):
         """
         if not self._connected:
             return False, "", "not connected"
+        # §SIDEGATE-PY 通道层方向白名单（第二道闸，理由见模块头）
+        if not is_valid_side(req.get("side", "")):
+            return False, "", "invalid side %r (must be one of %s)" % (
+                req.get("side", ""), "/".join(VALID_SIDES))
         code = str(req.get("code", "") or "")
         # ── 交易所后缀前置校验 ──
         # 柜台对代码/交易所不匹配的委托只返回 seq=-1（无原因），在下单前本地拦截并
@@ -647,7 +673,14 @@ class QueuedBroker(Broker):
             return False
 
     def place_order(self, req):
-        """把订单写入派发队列，返回 (True, "seq:<n>", "")。"""
+        """把订单写入派发队列，返回 (True, "seq:<n>", "")。
+
+        §SIDEGATE-PY（2026-09-22 修复批）方向白名单前置：派发行一旦带非法方向，
+        桥侧 `side == 买入 才买、否则卖` 会把它下成卖单（M-1 的方向翻转），
+        所以入队之前就必须 fail-close 拒掉，绝不让"未知方向"进入派发队列。
+        """
+        if not is_valid_side(req.get("side", "")):
+            return side_reject(req.get("side", ""))
         seq = self.store.dispatch_enqueue_order(req, user_id=self.user_id)
         log.info("[queued] order enqueued %s seq=%s signal=%s", req.get("side"), seq,
                  req.get("signal_id"))

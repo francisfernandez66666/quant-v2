@@ -32,8 +32,15 @@ class JPushMessageReceiver : JPushMessageReceiver() {
             Log.d(TAG, "JPush alias 设置成功: $alias")
             // §修复 F6（2026-08-29）：成功后清空重试计数，否则一次失败周期把计数顶到上限后，
             // 后续真实失败将永远放弃重试（计数不再清零 → scheduleRetry 直接 return）。
+            // §M-11（2026-09-22 修复批）：成功标记从布尔 alias_set 升级为「注册成功的具体别名」
+            // alias_registered——MainActivity 换号重设的幂等判定要按别名对账，布尔会把
+            // 「曾经成功」误当「当前别名仍成功」，正是旧缺陷里抑制重设的那一环。
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putBoolean(KEY_ALIAS_SET, true).remove(KEY_RETRY_COUNT).apply()
+                .edit()
+                .putString(KEY_ALIAS_REGISTERED, alias)
+                .remove(KEY_RETRY_COUNT)
+                .remove(KEY_ALIAS_SET_LEGACY)
+                .apply()
         } else {
             Log.e(TAG, "JPush alias 设置失败 code=$code alias=$alias，将重试")
             scheduleRetry(context, alias)
@@ -59,9 +66,21 @@ class JPushMessageReceiver : JPushMessageReceiver() {
             return
         }
         prefs.edit().putInt(KEY_RETRY_COUNT, attempts + 1).apply()
-        val seq = attempts + 1
+        // §M-11（2026-09-22 修复批）seq 统一走 alias_seq 持久化自增（与 MainActivity 同一计数）：
+        // 旧式 attempts+1 会和换号重设的 seq 撞号，极光回调按 seq 匹配，撞号即错配结果。
         Handler(Looper.getMainLooper()).postDelayed({
-            Log.i(TAG, "JPush alias 第 $seq 次重试…")
+            // §M-11（2026-09-22 修复批）换号竞态收口：等待 20s 期间用户可能已换账号并发起
+            // 新的 setAlias——此时用旧别名重试会把新别名覆盖回旧账号（定向推送再度串号）。
+            // 重试前对账 alias_desired，别名已过时就放弃本轮。
+            val live = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val desired = live.getString(MainActivity.KEY_ALIAS_DESIRED, null)
+            if (desired != null && desired != alias) {
+                Log.i(TAG, "alias 重试跳过：$alias 已非期望别名 $desired（§M-11 换号竞态）")
+                return@postDelayed
+            }
+            val seq = live.getInt(MainActivity.KEY_ALIAS_SEQ, 0) + 1
+            live.edit().putInt(MainActivity.KEY_ALIAS_SEQ, seq).apply()
+            Log.i(TAG, "JPush alias 第 $seq 次重试（尝试计数 $attempts）…")
             try {
                 JPushInterface.setAlias(context.applicationContext, seq, alias)
             } catch (e: Exception) {
@@ -76,8 +95,11 @@ class JPushMessageReceiver : JPushMessageReceiver() {
         /** SharedPreferences 文件名：alias 成功标记与重试次数共用 */
         const val PREFS_NAME = "jpush_prefs"
 
-        /** alias 已设置成功的标记（避免每次启动重复设置触发 6022） */
-        const val KEY_ALIAS_SET = "alias_set"
+        /** §M-11 已废弃的布尔标记键（旧「一次性已设置」语义），读到即清除 */
+        const val KEY_ALIAS_SET_LEGACY = "alias_set"
+
+        /** §M-11 极光确证注册成功的别名（与 MainActivity.KEY_ALIAS_REGISTERED 同名） */
+        const val KEY_ALIAS_REGISTERED = "alias_registered"
 
         /** 重试计数 */
         const val KEY_RETRY_COUNT = "alias_retry_count"

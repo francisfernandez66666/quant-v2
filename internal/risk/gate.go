@@ -43,7 +43,8 @@ const (
 //   - Name         证券名称（ST/退市风险判定依据）；
 //   - Strategy     战法显示名；StrategyID 战法库规则 ID；StrategyType 规范战法 ID
 //     （白名单判定三键，任一命中即视为在白名单内）；
-//   - Side         买卖方向（SideBuy/SideSell）；
+//   - Side         买卖方向（SideBuy/SideSell）；§N-4（2026-09-22 修复批）：**方向不做 fail-open**——
+//     非这两值的订单在 CheckLiveOrder 入口即拒（fail-close），理由见该函数注释；
 //   - Price        参考委托价；Qty 股数；Amount 委托金额（元；缺失时按 Qty×Price 回退估算）。
 type LiveOrder struct {
 	SignalID     string
@@ -120,6 +121,28 @@ func (g *Gate) SetCrossPriceSource(fn func(code string) (float64, error)) {
 // English: single entry for all live-order pre-checks — runs every gate in order and returns the first
 // blocking verdict (later gates are not evaluated, matching the existing short-circuit semantics).
 func (g *Gate) CheckLiveOrder(cfg config.QMTConfig, o LiveOrder) *Verdict {
+	// §N-4（2026-09-22 修复批，M-1 升级项之一）方向白名单前置 fail-close：未知方向直接拒单。
+	// 缺陷原文：本文件多数闸按 `o.Side == SideBuy` / `o.Side != SideSell` 精确匹配来区分方向
+	// （checkST:184、checkBlacklist:198、checkT1Sellable:218、checkLimitPrice:277/284、
+	// checkDayLoss:365、checkConcentration:399、checkWhitelist:436、checkMaxPositions:452、
+	// checkBuyDiscipline:493）。传入 "buy"/"SELL"/" 买入"（带空格）等非法串时，这些闸的
+	// 「非买」与「非卖」两个分支同时不成立 → **T+1 卖出限制闸、涨停拒买闸、跌停拒卖闸三道方向性
+	// 闸一起静默跳过**（还捎带 ST/黑名单/买入纪律），而下游 executor 是 `Side == SideSell ? 卖 : 买`
+	// 的二分，非法值最终会被默认成某个真实方向落到柜台。
+	// 为何这么改：未知方向不得享受任何方向性闸的"跳过红利"——方向是全部方向性守卫的判定前提，
+	// 前提本身不可信时唯一安全的姿势是拒单（fail-close），而不是让每道闸各自弃权。
+	// 放在 CheckLiveOrder 开头而不是各闸内部：这里是唯一权威入口（生产仅 controller.placeOrder
+	// 一处调用），一次性前置即可覆盖全部现有与后续新增闸，杜绝"新闸忘了装"这一族失效。
+	// English: §N-4 fail-close side whitelist at the single authoritative entry — an unknown side
+	// would silently skip every directional gate (T+1 sellable / limit-up buy / limit-down sell, plus
+	// ST/blacklist/buy-discipline) while the executor still folds it into one real side. An unknown
+	// direction must never collect the skip dividend of directional gates, so we reject once here
+	// instead of letting each gate abstain on its own.
+	if o.Side != SideBuy && o.Side != SideSell {
+		return g.verdict("side_unknown", fmt.Sprintf(
+			"非法下单方向(side=%q)：只接受 %s/%s（不做任何归一/缺省），未知方向一律拒单（fail-close，防止方向性风控闸被静默跳过）",
+			o.Side, SideBuy, SideSell), true)
+	}
 	// 闸口清单：按序评估，gate=留痕标识，alert=命中是否触发高优告警（新机构级闸为 true），
 	// run 返回非空字符串即视为命中并携带原因。共 12 道闸（§XCHECK 2026-09-22 C批 新增第 12 道
 	// price_cross_check）：其中 st/blacklist/t1_sellable/buy_discipline/whitelist/max_positions

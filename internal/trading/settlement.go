@@ -242,10 +242,25 @@ func abs(v float64) float64 {
 	return v
 }
 
+// settleRetryInterval §D4（2026-09-22 修复批）对账失败后的当日重试间隔（节流窗）。
+// 变量而非常量：单测要能在毫秒级跑完「失败→立即可再试」与「窗口内不再试」两极。
+// 取值理由：scoreCycle 每轮（约 60s）都会调用 MaybeSettleDay，10 分钟 ≈ 10 次机会/小时，
+// 盘后网关抖动通常几十分钟内恢复；同时绝不退化成"每轮死循环重投"打爆网关。
+// English: §D4 — in-day retry throttle after a failed settlement (var so tests can shrink it).
+var settleRetryInterval = 10 * time.Minute
+
 // MaybeSettleDay §WS-B 调度入口（节流+交易日门控）：每天只对账一次指定日期，
 // 且仅在到达 settle_at（默认 15:30，北京时）之后触发（交割单常盘后 15:30 才全）。
-// English: §WS-B scheduled settlement entry — runs once per day, after the configurable settle_at
-// (default 15:30 Beijing) when the broker settlement is typically complete.
+// §D4（2026-09-22 修复批）：语义由「尝试一次即视为完成」改为「**成功一次**才算完成」。
+// 缺陷原文：旧实现把 `c.lastSettleDay = day` 放在调用 SettleDay **之前**（:267-269），
+// 而顶部的 `if last == day { return }`（:256-258）按同一字段判定同日是否已对账——
+// 于是一次网关超时/落库报错就永久烧掉当日唯一一次对账机会（失败分支 :271-277 只 log+计指标，
+// 没有任何补偿路径），三方对账这道日终安全网事实上"每天最多跑一次、且跑砸就当跑过"。
+// 修法：① 置位移到成功之后（失败绝不写 lastSettleDay）；② 失败后按 settleRetryInterval 节流
+// 重试（attempt 戳在调用前置，防止 scoreCycle 每 60s 打爆网关）；③ 当日失败次数计入 opslog
+// 留痕（"第 N 次"），让连续失败在运维日志里可数、可判定是偶发抖动还是系统性故障。
+// English: §D4 — the day is marked done only on success; failures retry under a throttle window and
+// are counted in the ops log, instead of being burned by a pre-set idempotency stamp.
 func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabled bool) {
 	if !enabled || c.store == nil || !c.Enabled() {
 		return
@@ -253,9 +268,10 @@ func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabl
 	day = normalizeSettleDay(day) // §H1 归一先于幂等比较，lastSettleDay 恒为带杠口径
 	c.mu.RLock()
 	last := c.lastSettleDay
+	lastAttempt := c.lastSettleAttemptAt
 	c.mu.RUnlock()
 	if last == day {
-		return // 当日已对账，跳过
+		return // 当日已成功对账，跳过（§D4：本字段现在只代表"成功"）
 	}
 	if settleAt <= 0 {
 		settleAt = 1530
@@ -264,17 +280,51 @@ func (c *Controller) MaybeSettleDay(day string, mode string, settleAt int, enabl
 	if now.Hour()*100+now.Minute() < settleAt {
 		return // 未到对账时刻
 	}
+	// §D4 节流：距最近一次尝试不足 retry 窗口时不再重投（attempt 为零值=当日首次，直接放行）。
+	if !lastAttempt.IsZero() && time.Since(lastAttempt) < settleRetryInterval {
+		return
+	}
+	// 尝试戳先置位（持锁写）：这是防死循环的唯一护栏——成功与否都不回滚它，只回滚"当日已完成"标记。
 	c.mu.Lock()
-	c.lastSettleDay = day
+	c.lastSettleAttemptAt = time.Now()
 	c.mu.Unlock()
 	diff, err := c.SettleDay(day, mode)
 	if err != nil {
-		// §H1：失败不再只留一行日志——计指标 + opslog 留痕，网关 400/断连可被监控侧发现。
-		log.Printf("[settle] 对账失败: %v", err)
+		// §D4：失败**不置** lastSettleDay（旧实现是在调用前置位，等于把失败当成功记账），
+		// 下一个 retry 窗口会再试一次；同时保留 §H1 的指标计数与 opslog 留痕，并把当日
+		// 第几次失败写进留痕（连续失败与偶发抖动的处置动作不同，必须可数）。
+		c.mu.Lock()
+		if c.settleFailDay != day {
+			c.settleFailDay = day
+			c.settleFailCount = 0
+		}
+		c.settleFailCount++
+		attempt := c.settleFailCount
+		c.mu.Unlock()
+		log.Printf("[settle] 对账失败（当日第 %d 次，%s 后重试）: %v", attempt, settleRetryInterval, err)
 		metrics.SettleFailed()
-		opslog.Logf("quant", "交割单三方对账失败 账户=%s 日=%s: %v", c.userID, day, err)
+		// §N-1 教训（死规则）：告警规则必须有生产侧真实赋值点，否则规则永不触发。
+		// settle_fail_streak = 当日连续失败次数（成功即归零），供 alerter 规则 settle_failed 消费；
+		// 用「 streak 量规」而非「累计计数器」，是为了让规则能在恢复后自动发 recover 事件。
+		// English: §N-1 lesson — the gauge feeding the future settle_failed rule is set here in
+		// production code (streak, not cumulative counter, so recovery is observable).
+		metrics.SetGauge("settle_fail_streak", int64(attempt))
+		opslog.Logf("quant", "交割单三方对账失败 账户=%s 日=%s 当日第%d次（%s 后自动重试，成功后才记为已对账）: %v",
+			c.userID, day, attempt, settleRetryInterval, err)
 		return
 	}
+	// 成功（含 SettleDay 返回 (nil,nil) 的"网关不支持/未连接，静默跳过"分支）：
+	// 当日记账完成，后续窗口不再重投。
+	c.mu.Lock()
+	c.lastSettleDay = day
+	if c.settleFailDay == day && c.settleFailCount > 0 {
+		opslog.Logf("quant", "交割单三方对账恢复 账户=%s 日=%s（此前当日失败 %d 次后成功）", c.userID, day, c.settleFailCount)
+		c.settleFailCount = 0
+	}
+	c.mu.Unlock()
+	// §N-1：成功即把 streak 量规归零——alerter 的 settle_failed 规则据此发 recover 事件，
+	// 否则失败后会一直停在触发态（告警只 fire 不 recover 等于没有恢复通知）。
+	metrics.SetGauge("settle_fail_streak", 0)
 	if diff != nil && (len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch) > 0) {
 		c.fireOnAlert("high", "券商交割单三方对账差异",
 			fmt.Sprintf("%s: 缺失%d 多余%d 不符%d 费用差%.2f（详见 settlement_diff）",

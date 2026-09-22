@@ -220,3 +220,96 @@ describe('§M13 前端权限一致性（403 停轮询 + 状态码判定）', () 
     expect(quant).toMatch(/setForbidden\(true\)/)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §M-6（FIX_PLAN_20260922PM §三 M-6 行，2026-09-22 修复批）止血残余：
+// 在飞 promise 链的链尾漏发 + 挂载期壳端点 catch 吞 403。
+//
+// 为什么 L1 测不到：L1 的 snapshot 取在 `settle()` 之后——整条 loadTrades 链
+// （trades → verdicts → risk/gates）已经跑完，比较的是「之后不再涨」；
+// 缺陷发生在「403 落地那一刻链还挂在半路、链尾 fetchRiskGates 随后照发」的窗口里，
+// 定时器快照对此完全失明（本轮唯一红 MP-3 的代码半就是这么漏的）。
+// L5 用受控 deferred 把该窗口钉开：trades 第一步按住不 release，期间 state 的
+// 403 先落地触发 noteForbidden，再 release trades——修复后链上守卫必须拦住
+// verdicts 与链尾 risk/gates 两次后续请求。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('§M-6 在飞链止血（链尾不漏发 + 挂载壳端点 403/非 403 分流）', () => {
+  beforeEach(async () => {
+    cleanup()
+    localStorage.clear()
+    vi.useFakeTimers()
+    await resetStubs()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    cleanup()
+  })
+
+  // L5：403 在链第一步在飞期间落地 → 链后续步骤（含链尾 admin 端点 fetchRiskGates）一发都不许再出网
+  it('L5 在飞 loadTrades 链：403 落地后链尾不得漏发 /api/risk/gates', async () => {
+    const api = await import('../api/index.js')
+    // trades 按住（可控 release），state 立即 403——真实还原"链在飞的瞬间 403 到达"
+    let resolveTrades
+    api.fetchQMTTrades.mockImplementation(() => new Promise((res) => { resolveTrades = res }))
+    api.fetchQMTState.mockImplementation(async () => { throw ZH403() })
+    render(<Quant />)
+    await settle() // 让 state 的 403 完成 noteForbidden → stopPolling + pollingDeadRef 置位
+    expect(screen.getByText(/无权限访问量化交易/), '前置：无权限面板已落地').toBeInTheDocument()
+    // 此刻链第一步仍 pending；修复前它 release 后会连发 verdicts + risk/gates（链尾漏发）
+    expect(api.fetchRiskGates, '前置：链尚未走到链尾').not.toHaveBeenCalled()
+    await act(async () => { resolveTrades({ summary: {} }) })
+    await flushMicrotasks()
+    expect(api.fetchRiskGates, '§M-6：403 后在飞链尾仍漏发 /api/risk/gates').not.toHaveBeenCalled()
+    expect(api.fetchSignalVerdicts, '§M-6：链上守卫应拦掉后续所有步骤（verdicts 同样不发）').not.toHaveBeenCalled()
+    // 反向确认链首确实执行过（防"整链没跑"造成的空锁假绿）
+    expect(api.fetchQMTTrades.mock.calls.length, '前置：链首 trades 确实发过').toBeGreaterThan(0)
+  })
+
+  // L6：挂载期 fetchShortStatus / fetchPaperState 的 catch 参与 noteForbidden——
+  // 403 必须止血落面板；500/503 必须只降级、绝不冒成"无权限"（分流反例各锁一把）。
+  it('L6 壳端点 403 参与止血；503/500 不误判成无权限', async () => {
+    const api = await import('../api/index.js')
+    // ① 只让 fetchShortStatus 回英文 403，其余 admin 端点全部正常——旧实现 catch(()=>{})
+    //    会把它整个吞掉：面板不出、轮询不停（§M-6 修的正是这类"链外 403 漏判"）。
+    api.fetchShortStatus.mockRejectedValue(EN403())
+    const { unmount } = render(<Quant />)
+    await settle()
+    expect(screen.getByText(/无权限访问量化交易/), 'fetchShortStatus 的 403 必须触发无权限面板').toBeInTheDocument()
+    const before = api.fetchQMTState.mock.calls.length
+    await act(async () => { await vi.advanceTimersByTimeAsync(60000) })
+    await flushMicrotasks()
+    expect(api.fetchQMTState.mock.calls.length, '面板落地后轮询必须已停').toBe(before)
+    unmount()
+
+    // ② 分流反例：两个壳端点回 500（服务异常）——不得被误判成无权限
+    cleanup()
+    await resetStubs()
+    api.fetchShortStatus.mockRejectedValue(Object.assign(new Error('short/status 炸了'), { status: 500 }))
+    api.fetchPaperState.mockRejectedValue(Object.assign(new Error('paper/state 不可用'), { status: 503 }))
+    render(<Quant />)
+    await settle()
+    expect(screen.queryByText(/无权限访问量化交易/), '500/503 绝不能分流成无权限（§M-6）').not.toBeInTheDocument()
+    // 且轮询照常活着（未被误杀）：推进 60s，state 至少又打了 5 次
+    const b2 = api.fetchQMTState.mock.calls.length
+    await act(async () => { await vi.advanceTimersByTimeAsync(60000) })
+    expect(api.fetchQMTState.mock.calls.length, '非 403 不得误停轮询').toBeGreaterThan(b2)
+  })
+
+  // L7：静态锁——stopPolling 必须同时置失效标志，链上必须存在逐步守卫（防回潮）
+  it('L7 静态锁：stopPolling 置 pollingDeadRef 且 loadTrades 链上逐步检查', () => {
+    const src = fs.readFileSync(path.join(HERE, '..', 'pages', 'Quant.jsx'), 'utf8')
+    expect(src).toMatch(/const pollingDeadRef = useRef\(false\)/)
+    // stopPolling 体内必须置位（clearInterval 管不住在飞链）
+    const stopBody = src.slice(src.indexOf('function stopPolling()'), src.indexOf('function noteForbidden'))
+    expect(stopBody).toMatch(/pollingDeadRef\.current = true/)
+    // 链上守卫次数：入口 + 每步 await 后（≥3 处）
+    const loadTradesBody = src.slice(src.indexOf('async function loadTrades()'), src.indexOf('async function loadState()'))
+    const guards = loadTradesBody.match(/pollingDeadRef\.current/g) || []
+    expect(guards.length, 'loadTrades 链上守卫不足（§M-6）').toBeGreaterThanOrEqual(3)
+    // StrictMode 双挂载兼容：挂载 effect 必须复位标志
+    expect(src).toMatch(/pollingDeadRef\.current = false/)
+    // 壳端点 catch 不得再回退成吞错（catch(()=>{}) 形态）
+    expect(src).toMatch(/fetchShortStatus\(\)[\s\S]{0,200}?catch\(\(e\) => \{ noteForbidden\(e\)/)
+    expect(src).toMatch(/fetchPaperState\(\)[\s\S]{0,200}?catch\(\(e\) => \{ noteForbidden\(e\)/)
+  })
+})

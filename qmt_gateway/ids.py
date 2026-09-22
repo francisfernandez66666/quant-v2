@@ -8,6 +8,15 @@
 pending 行永久阻塞该 signal_id（安全侧失效，杜绝重复真实下单）。
 （English: one order per signal_id via atomic claim-before-place on the unique key;
 release on failure; crash-left pending rows stay blocked by design — fail-safe.）
+
+§M-2（2026-09-22 修复批）补充上述 fail-safe 的**边界**，结论本身不变：
+「阻塞」只应发生在**本端尚未取得结果**的窗口内，而不是永久的——旧实现 place_order 抛
+异常时既不 release 也没人收尾（release_stale_pending 只在 start() 调一次），
+同 signal_id 从此恒 409，比"重复下单"更早发生的是"信号永久死锁"。
+现由 gateway._do_order 的 try/finally 释放未 settle 的占位，并加了运行期巡检
+（gateway._sweep_stale_pending，默认 600s 超龄）。两者清理的都只是**本地占位行**：
+既不自动重发、也不把单子重新排进队列，是否重试仍由调用方决策——
+防重复真实下单的物理保证（signal_id 唯一键 + 不重排）一字未改。
 """
 import logging
 

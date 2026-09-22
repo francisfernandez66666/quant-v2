@@ -68,6 +68,17 @@ function chgColor(v) {
 const newsMark = (entry) =>
   entry?.status === 'ok' ? '●' : entry?.status === 'unknown' || !entry ? '–' : '○'
 
+// §M-9（2026-09-22 修复批）数据源/引擎健康点统一三态（参照同文件 newsMark 样板）：
+// true|'ok' → ●（确证健康）；false|down → ○（确证失败）；字段缺失/健康接口没拉到 → –（unknown）。
+// 旧实现 `x ? '●' : '○'` 把「从未拉到/接口挂了」画成 ○，与真实故障同形（永远灰点的根因之一）。
+// English: §M-9 — tri-state health glyph; a missing/never-fetched entry renders '–' (unknown),
+// never a fake '○' that masquerades as a confirmed failure.
+const healthMark = (v) => {
+  if (v === undefined || v === null) return '–'
+  if (typeof v === 'object') return v.status === 'ok' ? '●' : v.status === 'down' ? '○' : '–'
+  return v ? '●' : '○'
+}
+
 export default function Dashboard() {
   // 策略信号列表（来自后端扫描结果）
   const [signals, setSignals] = useState([])
@@ -148,8 +159,25 @@ export default function Dashboard() {
     try { setQmtState(await api.fetchQMTState()) } catch (e) { /* 接口异常不影响整页 */ }
   }
 
+  // §M-9（2026-09-22 修复批）三个健康端点独立拉取函数：随 load() 进入 10s 轮询。
+  // 旧实现仅挂载拉一次且 catch(()=>{}) 吞错——首次失败后 :383/:387 的健康点永远停在
+  // 「○（伪故障）」，成功过之后也再不更新（永远展示陈旧快照）。失败时保留上次值，
+  // 从未成功则由 healthMark 以 '–'（unknown）如实展示，不伪装成 ● 或 ○。
+  // English: §M-9 — health probes now ride the 10s poll; a failed fetch keeps the last snapshot
+  // and a never-fetched one shows the '–' unknown glyph instead of a fake state.
+  async function loadHealth() {
+    const [dsRes, nsRes, ehRes] = await Promise.allSettled([
+      api.fetchDataSourceHealth(), api.fetchNewsSourceHealth(), api.fetchEngineHealth(),
+    ])
+    if (dsRes.status === 'fulfilled' && dsRes.value) setDataSourceHealth(dsRes.value)
+    if (nsRes.status === 'fulfilled' && nsRes.value) setNewsSourceHealth(nsRes.value)
+    if (ehRes.status === 'fulfilled' && ehRes.value) setEngineHealth((ehRes.value.engine) || ehRes.value || {})
+  }
+
   // 并行加载仪表盘所需的信号、状态、新闻、板块、快照、IPO 与战法统计
   async function load() {
+    // §M-9 健康端点并入主轮询（10s）；独立 allSettled，不阻断主数据
+    loadHealth()
     const [sigRes, stRes, newsRes, secRes, snapRes, ipoRes, dashRes] = await Promise.allSettled([
       api.fetchSignals(), api.fetchStatus(), api.fetchNews(true), api.fetchSectorHot(),
       api.fetchHotSnapshot(), api.fetchIPOCalendar(), api.fetchDashboard(),
@@ -208,9 +236,8 @@ export default function Dashboard() {
       }
     }
     document.addEventListener('visibilitychange', visibilityHandler.current)
-    api.fetchDataSourceHealth().then((r) => setDataSourceHealth(r)).catch(() => {})
-    api.fetchNewsSourceHealth().then((r) => setNewsSourceHealth(r)).catch(() => {})
-    api.fetchEngineHealth().then((r) => setEngineHealth((r && r.engine) || r || {})).catch(() => {})
+    // §M-9（2026-09-22 修复批）三个健康端点不再单独"挂载拉一次 + catch 吞"：
+    // 已并入 load()→loadHealth()，随挂载/10s 轮询/SSE/可见性恢复统一刷新。
     return () => {
       if (timer.current) clearInterval(timer.current)
       if (qmtTimer.current) clearInterval(qmtTimer.current)
@@ -380,11 +407,13 @@ export default function Dashboard() {
       <Card title="系统">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
           <span>运行 {status.uptime || '-'}</span>
-          <span>数据源：东财{dataSourceHealth.eastmoney ? '●' : '○'} 新浪{dataSourceHealth.sina ? '●' : '○'} 腾讯{dataSourceHealth.tencent ? '●' : '○'} 同花顺{dataSourceHealth.ths ? '●' : '○'}</span>
+          {/* §M-9（2026-09-22 修复批）健康点走 healthMark 三态：●=确证健康 / ○=确证故障 / –=未取到（unknown），
+              旧的 `x ? '●' : '○'` 二态会把「接口没拉到」画成故障点、把「故障」与「无数据」混为一谈 */}
+          <span>数据源：东财{healthMark(dataSourceHealth.eastmoney)} 新浪{healthMark(dataSourceHealth.sina)} 腾讯{healthMark(dataSourceHealth.tencent)} 同花顺{healthMark(dataSourceHealth.ths)}</span>
           <span>新闻：财联社{newsMark(newsSourceHealth.cailanshe)} 同花顺{newsMark(newsSourceHealth.kuaixun)} 新浪{newsMark(newsSourceHealth.sina)}</span>
           <span>快照 {scanStats.total_stocks || 0}股 / {scanStats.hot_sector_count || 0}板块</span>
           <span>原始 {scanStats.raw_signals || 0} → 最终 {scanStats.final_signals || 0}</span>
-          <span>流程引擎：新闻抓取{engineHealth.news_agent ? '●' : '○'} 策略引擎{engineHealth.strategy_engine ? '●' : '○'} 板块验证{engineHealth.sector_agent ? '●' : '○'} 战法扫描{engineHealth.combat_agent ? '●' : '○'} LLM{engineHealth.llm ? '●' : '○'} 同花顺{engineHealth.ths ? '●' : '○'} 聚合器{engineHealth.aggregator ? '●' : '○'}</span>
+          <span>流程引擎：新闻抓取{healthMark(engineHealth.news_agent)} 策略引擎{healthMark(engineHealth.strategy_engine)} 板块验证{healthMark(engineHealth.sector_agent)} 战法扫描{healthMark(engineHealth.combat_agent)} LLM{healthMark(engineHealth.llm)} 同花顺{healthMark(engineHealth.ths)} 聚合器{healthMark(engineHealth.aggregator)}</span>
           {qmtLine && <span>实盘链路：{qmtLine}</span>}
         </div>
       </Card>

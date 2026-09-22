@@ -79,7 +79,15 @@ type Controller struct {
 	lastStaleSweepAt time.Time
 
 	// §WS-B 交割单对账节流：lastSettleDay 记录最近对账交易日（每日一次，mu 保护）
-	lastSettleDay string // 最近一次 SettleDay 的交易日
+	// §D4（2026-09-22 修复批）语义收紧：**只在 SettleDay 成功后**才写本字段（失败回滚/不置位），
+	// 否则一次网关故障就把当日对账永久跳过。English: only a successful settlement marks the day done.
+	lastSettleDay string // 最近一次 SettleDay **成功**的交易日
+	// §D4 失败节流重试：lastSettleAttemptAt=最近一次对账尝试时刻（无论成败，防死循环重投），
+	// settleFailDay/settleFailCount=当日失败次数（opslog 留痕可数）。三处均 mu 保护。
+	// English: §D4 retry throttle + per-day failure counter (attempt stamp guards against hot looping).
+	lastSettleAttemptAt time.Time // 最近一次对账尝试时刻（成功或失败都推进）
+	settleFailDay       string    // 失败计数归属的交易日
+	settleFailCount     int       // 该交易日累计失败次数
 
 	// §WS-C 风控闸口统一入口：placeOrder 的全部前置守卫收敛到 risk.Gate.CheckLiveOrder
 	//（controller 只保留 orderMu 串行、幂等与 executor 分发）。新闸命中即记录+告警。
@@ -198,9 +206,16 @@ func (c *Controller) Mode() string {
 // English: returns the latest gateway-reported available cash; 0 when unknown/stale(>30min)/error —
 // callers treat 0 as "no cap", keeping the pre-existing fixed_amount behavior instead of gating
 // orders on stale numbers.
+// §D5（2026-09-22 修复批）注释口径统一：0 的唯一含义是**「资金口径不可得 → 调用方不设限」**，
+// 不是「账户一分钱都没有」。旧行内注释写的是后者、与本函数头（及 engine.go 消费端
+// `if cash := ctrl.AvailableCash(); cash > 0` 判空即跳过门控）相反——按实现取「不设限」。
+// **本次只统一注释，不改行为语义**：0 到底 fail-open（现行）还是 fail-close（三态化）属 §M12
+// 资金安全裁决项，由 owner 定调后单独动工。
+// English: §D5 aligns the inner comment with the header wording (0 = "cash basis unknown → no cap",
+// never "zero money"); semantics are untouched — that question is the separate §M12 decision.
 func (c *Controller) AvailableCash() float64 {
 	if c.store == nil {
-		return 0 // 未接账本库时视为无可用资金（不上限门控，避免卡死下单）
+		return 0 // 未接账本库=资金口径不可得 → 返回 0，调用方视为"不设限"（不做上限门控；口径见函数头 §D5）
 	}
 	acc, err := c.store.GetRealAccount(c.userID)
 	if err != nil || acc.AvailableCash <= 0 {
@@ -464,7 +479,8 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// 两道最前置的拒绝先过：熔断开着就把熔断原因带回调用方（前端能直接显示"为什么不下单"），
 	// 配置在读锁下取快照，避免热更新途中读到半份配置。
 	if c.Tripped() {
-		return nil, fmt.Errorf("qmt circuit-breaker open: %s", c.tripReasonLocked())
+		// §D5：currentTripReason 自带 RLock，此处调用方未持锁（安全）；旧名 tripReasonLocked 误导。
+		return nil, fmt.Errorf("qmt circuit-breaker open: %s", c.currentTripReason())
 	}
 	c.mu.RLock()
 	cfg := c.cfg
@@ -634,10 +650,20 @@ func (c *Controller) Reconcile() error {
 }
 
 // MaybeReconcile §W6-a 周期对账接线（此前 Controller.Reconcile 是零调用死代码，
-// report_url 未配时双向对账均不存在）：按 interval 节流（默认 5min）主动拉网关全量持仓
-// 落库（券商为准），差异仅记日志告警——自动纠偏留给显式人工/后续策略，避免误覆盖在途状态。
-// English: §W6-A wires the previously-dead Reconcile into a throttled periodic call; diffs are logged
-// as warnings while auto-correction is deliberately left out to avoid stomping in-flight states.
+// report_url 未配时双向对账均不存在）：按 interval 节流（默认 5min）主动拉网关全量持仓落库。
+//
+// §D5（2026-09-22 修复批）注释与实现对齐：旧注释写「差异仅记日志告警——自动纠偏留给显式人工/
+// 后续策略，避免误覆盖在途状态」，而实现走的正是 Reconcile → store.ReconcilePositionsForUser
+// **以网关快照为唯一真值的全量覆盖**（本账号行 upsert + 快照里没有的行删除）——也就是说
+// "自动纠偏"从来就发生了，注释把它否认掉会让后来人按错误心智模型改这段代码（例如以为
+// 覆盖要人工授权而在别处重复实现纠偏）。按实现改注释：
+//   - 持仓腿：**自动全量覆盖**（券商为准），可信前提是 Reconcile 内部的"空快照 + 未连接 → 拒清"
+//     守卫（§R3-8 P1-G）；
+//   - 委托腿：仅比对条数、记差异日志，**不**自动纠偏（状态推进以回报线程为准）。
+//
+// English: §D5 — the comment now matches the code: the positions leg IS auto-corrected (gateway
+// snapshot wins, via user-scoped ReconcilePositionsForUser, guarded by the empty-snapshot/
+// not-connected check), while only the orders leg is log-and-wait-for-reports.
 func (c *Controller) MaybeReconcile(interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Minute
@@ -867,9 +893,19 @@ func (c *Controller) SweepOrders(now time.Time) *SweepResult {
 	return res
 }
 
-// tripReasonLocked 返回熔断原因（不加锁，调用方需持锁/已检查）。
-// English: tripReasonLocked returns the breaker reason without locking.
-func (c *Controller) tripReasonLocked() string {
+// currentTripReason 返回熔断原因（**自带 RLock**，调用方无需持锁）。
+// §D5（2026-09-22 修复批）注释与命名对齐实现：旧名 tripReasonLocked 的 `Locked` 后缀在 Go 惯例里
+// 表示"调用方需持锁、本函数不加锁"，而注释也这么写（"不加锁，调用方需持锁/已检查"），实现却自己
+// `c.mu.RLock()`——注释与名字双双说谎。当前唯一调用点 placeOrder 在未持锁状态下调用，暂时没死锁，
+// 但按名传锁（未来有人在持有 c.mu 的路径上复用）就是自锁死锁（RWMutex 不可重入）。
+// 二选一里取了「按实现改注释+改名」：不改成真正的 unlocked 版本，因为 placeOrder 调用点没有现成的
+// 持锁上下文（那里紧接着才 RLock 取 cfg 快照），做成 unlocked 版本反而扩大临界区。
+// 未直接叫 tripReason：与同名字段 c.tripReason 冲突（Go 不允许类型上字段与方法同名），故用 current- 前缀。
+// English: §D5 — renamed to match the implementation: the function DOES lock (RLock) itself, so the
+// `Locked` suffix and its "caller must hold the lock" comment were both wrong and could have caused a
+// self-deadlock if reused from a locked path. `currentTripReason` (not `tripReason`) because the
+// controller already has a field with that exact name.
+func (c *Controller) currentTripReason() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.tripReason

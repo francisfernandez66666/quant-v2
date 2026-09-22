@@ -44,11 +44,54 @@ class MainActivity : AppCompatActivity() {
         /** 预填服务器地址。改为 https://你的域名 后，首次打开登录页即带出。 */
         const val DEFAULT_SERVER_URL = "https://quant-trading.top"
 
-        /** 极光推送设备别名（必须与后端 config.json notify.push.alias 一致，默认 quant_owner）。 */
+        /**
+         * §M-11（2026-09-22 修复批）极光推送默认别名：仅作为「未登录 / 历史设备」的兜底值
+         * （与后端 config.json notify.push.alias 默认一致）。
+         * 缺陷原文：旧版把该常量当成全App唯一别名无条件 setAlias，且 alias_set 标记让它只在
+         * 首装生效一次——换账号后别名仍指向 quant_owner，服务端 §GAP2-W2 的按用户 alias 下发
+         * 因设备根本没注册账号别名而失效，定向推送退化成广播。
+         * 现在别名由登录 uid 派生（见 pushAliasFor），此常量只留未登录兜底语义。
+         */
         const val QUANT_PUSH_ALIAS = "quant_owner"
 
-        /** setAlias 请求序列号（极光要求递增，用于回调匹配；单次设置固定值即可）。 */
+        /**
+         * §M-11 pushAliasFor：按登录账号派生设备别名，统一 quant_ 前缀——
+         * 账号名全部落在极光合法字符集（字母/数字/_ - = .）内时拼可读别名 quant_<uid>；
+         * 含非法字符（如中文账号名）时不做有损替换，直接退化到 quant_<账号hashCode十六进制>，
+         * 防不同账号被过滤成同一串互相碰撞。总长截到 64 字节内。
+         * English: derive the JPush alias from the logged-in uid so per-user targeted pushes
+         * actually land on the owner's device instead of the shared quant_owner broadcast alias.
+         */
+        fun pushAliasFor(account: String?): String {
+            val acc = (account ?: "").trim()
+            if (acc.isEmpty()) return QUANT_PUSH_ALIAS // 未登录/登出：回落默认别名（与后端默认一致）
+            val legal = acc.all { ch ->
+                ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' ||
+                    ch == '_' || ch == '-' || ch == '=' || ch == '.'
+            }
+            // 账号名本身全合法（admin/tester 等）：直接拼可读别名；
+            // 含非法字符（如中文账号名）不做有损替换——改用 hashCode 十六进制，
+            // 避免「过滤成下划线后不同账号互相碰撞、推送又串了」。
+            return if (legal) "quant_$acc".take(64)
+            else "quant_${Integer.toHexString(acc.hashCode())}".take(64)
+        }
+
+        /** 旧的固定 setAlias 请求序列号。§M-11 起改用 alias_seq 持久化自增（换号重设需要新 seq），本常量仅留档。 */
+        @Deprecated("§M-11：改用 jpush_prefs/alias_seq 自增序列，固定值 1 无法支撑换号重设。")
         const val JPUSH_ALIAS_SEQ = 1
+
+        // §M-11 jpush_prefs 键名（与 JPushMessageReceiver 内部常量必须保持一致，两处各自声明）：
+        // alias_desired    = 当前期望别名（换账号即更新）
+        // alias_registered = 极光回调确证设置成功的别名
+        // alias_seq        = 单调递增的请求序列号（替代旧固定 JPUSH_ALIAS_SEQ=1）
+        const val PREFS_JPUSH = "jpush_prefs"
+        const val KEY_ALIAS_DESIRED = "alias_desired"
+        const val KEY_ALIAS_REGISTERED = "alias_registered"
+        const val KEY_ALIAS_SEQ = "alias_seq"
+        const val KEY_ALIAS_RETRY = "alias_retry_count"
+
+        /** §M-11 登录账号在 quant_prefs 中的持久化键（AndroidAuth.setAccount 桥写入）。 */
+        const val KEY_PUSH_ACCOUNT = "push_account"
     }
 
     /**
@@ -224,6 +267,24 @@ class MainActivity : AppCompatActivity() {
                 SecureAuthStore.clearToken()
                 return true
             }
+
+            /**
+             * §M-11（2026-09-22 修复批）推送别名随登录账号走：前端 storeAuth/clearAuth 时经本桥
+             * 上报当前登录账号名（登出传空串），原生持久化后立即重设极光别名。
+             * 不校验身份的账号串只做「派生别名的材料」，且别名派生自带字符白名单/哈希退化，
+             * 不会被拼进任何 JS 注入面；长度上限 64，防异常长串塞进偏好。
+             * English: §M-11 — the frontend reports the logged-in account on login/logout; the
+             * JPush alias is re-derived and re-registered immediately, so targeted pushes stop
+             * being a global broadcast after an account switch.
+             */
+            @android.webkit.JavascriptInterface
+            fun setAccount(account: String): Boolean {
+                val acc = account.trim().take(64)
+                getSharedPreferences("quant_prefs", MODE_PRIVATE)
+                    .edit().putString(KEY_PUSH_ACCOUNT, acc).apply()
+                setupJPushAlias()
+                return true
+            }
         }, "AndroidAuth")
 
         webView.loadUrl("https://appassets.androidplatform.net/index.html")
@@ -266,18 +327,41 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 设置极光推送设备别名：与服务端 config.json 的 push.alias（默认 quant_owner）保持一致，
-     * 服务端按该别名下发关键提醒，后台/离线也能收到系统通知。
-     * 设置结果通过 JPushMessageReceiver.onAliasOperatorResult 回调确认。
-     * 已设置成功过则跳过（避免重复设置触发极光 6022「alias 操作进行中」）。
+     * 设置极光推送设备别名：§M-11（2026-09-22 修复批）后别名由登录账号派生（pushAliasFor），
+     * 服务端按「quant_<uid>」别名定向下发关键提醒，后台/离线也能收到系统通知。
+     * 幂等策略重写（旧缺陷半）：
+     *  - 旧版用布尔 alias_set「一旦成功永不重设」——换账号后别名永远停在 quant_owner 上
+     *    变广播。现改为记「期望别名 alias_desired」：期望值变了（登录/换号/登出）必须重设，
+     *    期望值没变才跳过（防 6022「alias 操作进行中」重复触发）。
+     *  - 序列号不再固定为 1：极光要求同一进程内递增，alias_seq 持久化自增，
+     *    换号重设与冷启动首设共用一条正确序列。
+     * 设置结果通过 JPushMessageReceiver.onAliasOperatorResult 回调确认（成功落 alias_registered，
+     * 失败按其既有 20s×3 重试，且只重试仍与 alias_desired 一致的别名）。
      */
     private fun setupJPushAlias() {
-        val prefs = getSharedPreferences("jpush_prefs", MODE_PRIVATE)
-        if (prefs.getBoolean("alias_set", false)) {
+        val prefs = getSharedPreferences(PREFS_JPUSH, MODE_PRIVATE)
+        // §M-11 清理旧布尔标记：它只表示"曾经成功过"，正是它抑制了换号重设（保留会误导排查）
+        if (prefs.contains("alias_set")) {
+            prefs.edit().remove("alias_set").apply()
+        }
+        val account = getSharedPreferences("quant_prefs", MODE_PRIVATE)
+            .getString(KEY_PUSH_ACCOUNT, "") ?: ""
+        val desired = pushAliasFor(account)
+        if (prefs.getString(KEY_ALIAS_DESIRED, null) == desired &&
+            prefs.getString(KEY_ALIAS_REGISTERED, null) == desired
+        ) {
+            // 期望别名未变且极光确证注册成功过：不重复设置（等价旧版"已设置"跳过语义，
+            // 但基准从"设备级一次性"改为"账号级当前态"）
             return
         }
+        val seq = prefs.getInt(KEY_ALIAS_SEQ, 0) + 1
+        prefs.edit()
+            .putInt(KEY_ALIAS_SEQ, seq)
+            .putString(KEY_ALIAS_DESIRED, desired)
+            .remove(KEY_ALIAS_RETRY) // 换号即新一轮设置，重试计数归零
+            .apply()
         try {
-            JPushInterface.setAlias(this, JPUSH_ALIAS_SEQ, QUANT_PUSH_ALIAS)
+            JPushInterface.setAlias(this, seq, desired)
         } catch (e: Exception) {
             android.util.Log.e("QUANT_JPUSH", "setAlias 调用异常: ${e.message}")
         }

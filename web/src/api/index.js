@@ -315,6 +315,30 @@ export function storeAuth(token, account, expiresAt, role, perms) {
   localStorage.setItem(STORAGE_ACCOUNT, account || '')
   localStorage.setItem(STORAGE_ROLE, role || 'user')
   localStorage.setItem(STORAGE_PERMS, JSON.stringify(perms || []))
+  // §M-11（2026-09-22 修复批）登录账号上桥：移动端原生壳据此派生并即时重设极光别名
+  // （quant_<uid>），换账号不再停留在默认别名 quant_owner（定向推送变广播的根因）。
+  // 旧版 APK 无 setAccount 方法——typeof 守卫后静默跳过，行为与迁移前一致。
+  // English: §M-11 — report the logged-in account to the native shell so it can re-derive and
+  // re-register the per-user JPush alias; old APKs without the method are skipped silently.
+  if (bridge && typeof bridge.setAccount === 'function') {
+    try { bridge.setAccount(account || '') } catch (e) {
+      if (typeof console !== 'undefined') console.warn('[api] AndroidAuth.setAccount 异常（不影响登录态）:', e && e.message)
+    }
+  }
+}
+
+/**
+ * §M-11（2026-09-22 修复批）把当前账号重新上报原生壳（登录态恢复路径用）。
+ * 场景：App 冷启动、token 已持久化（storeAuth 在上一进程已跑过，但旧版 APK 升级 / 首装
+ * 迁移场景壳侧可能从未收到过账号）——恢复登录态时补报一次，壳侧按期望别名幂等对账，
+ * 无变化不会重复触发 setAlias。无桥（纯浏览器/旧 APK）为空操作。
+ * English: re-report the current account to the native shell on session restore; the shell
+ * dedupes against its desired-alias record, and is a no-op without the bridge.
+ */
+export function syncPushAccount() {
+  const bridge = nativeAuthBridge()
+  if (!bridge || typeof bridge.setAccount !== 'function') return
+  try { bridge.setAccount(getAccount() || '') } catch (_) { /* 推送别名失败不影响会话 */ }
 }
 
 /**
@@ -335,6 +359,13 @@ export function clearAuth() {
       bridge.clearToken()
     } catch (e) {
       if (typeof console !== 'undefined') console.warn('[api] AndroidAuth.clearToken 异常:', e && e.message)
+    }
+    // §M-11（2026-09-22 修复批）登出同步下桥：账号别名退回壳侧默认值（quant_owner），
+    // 登出后设备不再挂在前一账号的定向推送别名上。
+    if (typeof bridge.setAccount === 'function') {
+      try { bridge.setAccount('') } catch (e) {
+        if (typeof console !== 'undefined') console.warn('[api] AndroidAuth.setAccount(登出) 异常:', e && e.message)
+      }
     }
   }
   localStorage.removeItem(STORAGE_KEY)

@@ -129,6 +129,11 @@ export default function Quant() {
   // English: §U-2 frontend entries for the three ops capabilities that previously had backend
   // endpoints but no UI — kill-switch halt, manual cancel (now fed by the orders list), settlement.
   const [orders, setOrders] = useState(null)        // 当日委托（含 order_id / status）
+  // §M-9（2026-09-22 修复批）委托列表 error 独立态：旧实现 loadOrders 失败既不 setOrders
+  // 也不记错误，:939 的分支永远停在「加载委托列表…」——错误被伪装成永久加载态。
+  // English: §M-9 — a failed orders fetch sets ordersError so the card shows a retryable
+  // error instead of hanging on the loading placeholder forever.
+  const [ordersError, setOrdersError] = useState('')
   // §SIGNAL_CONTROLLER 信号裁定留痕（实盘/模拟盘两通道 hold/block 与原因，30s 随流水刷新）
   const [verdicts, setVerdicts] = useState([])
   // §F-5（20260917 缺陷修复批）风控闸口状态（下单前 12 道闸的当日命中与开关，30s 随流水刷新）
@@ -155,6 +160,16 @@ export default function Quant() {
 
   const stateTimer = useRef(null)  // 链路状态轮询定时器
   const tradesTimer = useRef(null) // 交易流水轮询定时器
+
+  // §M-6（2026-09-22 修复批）轮询/在飞链失效标志：stopPolling() 过去只 clearInterval，
+  // 管不住已经跑在半路的 promise 链——Quant.jsx loadTrades 是「trades → verdicts → risk/gates」
+  // 串行链，403 落地时链尾 fetchRiskGates 照发；React.StrictMode（main.jsx:19）双挂载更让
+  // 两条链各漏一发（本轮唯一红 MP-3 的代码半）。现在 stopPolling 同时置位本标志，
+  // 链上每一步 await 前后都查它，置位后整条链早退。
+  // English: §M-6 — clearInterval alone cannot stop in-flight promise chains; the mount effect
+  // resets this flag (StrictMode double-invoke), stopPolling sets it, and every chain step
+  // checks it before firing the next request.
+  const pollingDeadRef = useRef(false)
 
   // 按 kind 分组（form → factor → pattern），便于分别展示"形态战法 / 因子战法"
   const strategyGroups = useMemo(() => {
@@ -185,7 +200,10 @@ export default function Quant() {
   //   但挂载副作用里起的 stateTimer(10s)/ordersTimer(10s)/tradesTimer(30s) 继续跑——
   //   每 10 秒三发 403 灌进 opslog，审计面被噪声淹没（M13 的"降级不停摆"半边）。
   // stopPolling 幂等清除全部轮询定时器（定时器句柄置 null，重复调用安全）。
+  // §M-6（2026-09-22 修复批）同时置位 pollingDeadRef——clearInterval 只能挡「下一次定时触发」，
+  // 挡不住已在飞的 promise 链；标志位让链上未执行的步骤全部早退（含 StrictMode 双挂载的第二条链）。
   function stopPolling() {
+    pollingDeadRef.current = true
     for (const ref of [stateTimer, ordersTimer, tradesTimer]) {
       if (ref && ref.current) {
         clearInterval(ref.current)
@@ -197,6 +215,8 @@ export default function Quant() {
   // 判定一律走 api.isForbidden(e)（HTTP 状态码），不再用 e.message.indexOf('无权限')：
   // adminMiddleware 回中文「无权限」、permMiddleware 回英文 "no permission: <perm>"，
   // 按文案匹配对英文 403 必然漏判（E2E MP-2 用例即锁这组差异）。
+  // §M-6 补充：非 403（500/503 等）在这里返回 false，调用方照常走各自降级分支——
+  // 「服务异常」绝不能被分流成「无权限」（fetchShortStatus/fetchPaperState 挂载拉取同此口径）。
   // English: §M13 — any 403 from the admin endpoints halts all polling and renders the
   // forbidden panel; detection is status-code based (api.isForbidden), never message-text based.
   function noteForbidden(e) {
@@ -277,19 +297,31 @@ export default function Quant() {
   }
 
   // 拉取交易流水（含汇总与分战法/成交流水），仅在返回合法时更新
+  // §M-6（2026-09-22 修复批）串行链每步执行前查 pollingDeadRef：本函数是
+  // 「fetchQMTTrades → fetchSignalVerdicts → fetchRiskGates」三步 await 链，
+  // 旧实现 403 停轮询后在飞的链仍会走到链尾发出 /api/risk/gates（双挂载 ×2 发，MP-3 真漏网点）。
   async function loadTrades() {
+    if (pollingDeadRef.current) return // §M-6 链入口即失效（forbidden/卸载后不再发起任何一步）
     try {
       const t = await api.fetchQMTTrades()
+      if (pollingDeadRef.current) return // §M-6 上一步 await 期间 403 落地 → 链尾禁发
       if (t && t.summary) setTrades(t)
-    } catch (e) { noteForbidden(e) } // §M13：403 即停轮询（此端点在 adminMiddleware 下）
+    } catch (e) {
+      noteForbidden(e) // §M13：403 即停轮询（此端点在 adminMiddleware 下）
+      if (pollingDeadRef.current) return
+    }
     try {
       const v = await api.fetchSignalVerdicts(50)
+      if (pollingDeadRef.current) return // §M-6
       if (v && Array.isArray(v.verdicts)) setVerdicts(v.verdicts)
-    } catch (_) {}
+    } catch (_) {
+      if (pollingDeadRef.current) return // §M-6：verdicts 失败不再连带放行链尾 admin 端点
+    }
     // §F-5 风控闸口状态（非 admin/无实盘账本时后端 403/503，静默降级不显示卡片）
     // §M13：其中 403 不再"静默"——它是权限判定信号，必须参与停轮询；503 等其他错误仍降级。
     try {
       const g = await api.fetchRiskGates()
+      if (pollingDeadRef.current) return // §M-6：链尾响应落地时已失效则不再回写 state
       if (g && Array.isArray(g.gates)) setRiskGates(g)
     } catch (e) { noteForbidden(e) }
   }
@@ -309,10 +341,16 @@ export default function Quant() {
   async function loadOrders() {
     try {
       const o = await api.fetchQMTOrders()
+      if (pollingDeadRef.current) return // §M-6：失效后不回写
       setOrders(Array.isArray(o) ? o : [])
+      setOrdersError('') // §M-9 成功即清错误态
     } catch (e) {
       // 无实盘库时 503：静默降级（保留上次列表，不打断页面）；403 则落无权限面板并停轮询（§M13）
-      noteForbidden(e)
+      if (!noteForbidden(e)) {
+        // §M-9（2026-09-22 修复批）非 403 的失败也要留痕：列表尚空时渲染可重试错误，
+        // 不再让「加载委托列表…」无限转圈冒充加载态。
+        setOrdersError(e && e.message ? String(e.message) : '委托列表加载失败（网络/服务异常）')
+      }
     }
   }
 
@@ -492,10 +530,19 @@ export default function Quant() {
   // 它会调用与卸载清理同一个 stopPolling()，所以"成员停在页面被 403 灌 opslog"这条路被掐断；
   // 定时器句柄统一在这里赋值，回调里的清理只认句柄，不存在"清了旧的留下新的"竞态。
   useEffect(() => {
+    // §M-6（2026-09-22 修复批）StrictMode 双挂载兼容：React 18 dev 下 effect 会
+    // mount→cleanup→remount 同实例跑一遍，cleanup 走 stopPolling 把 pollingDeadRef 置了 true；
+    // 第二次挂载必须在这里复位，否则整页轮询被自己的止血标志锁死。
+    pollingDeadRef.current = false
     loadState()
     // §SHORT-4 做空开关与融券池状态探测（开关与模拟盘 short_book.enabled）
-    api.fetchShortStatus().then((r) => setShortEnabled(!!r.short_enabled)).catch(() => {})
-    api.fetchPaperState().then((r) => setShortPoolOn(!!(r.short_book && r.short_book.enabled))).catch(() => {})
+    // §M-6（2026-09-22 修复批）：两个挂载期拉取的 catch(()=>{}) 改为参与 noteForbidden 判定——
+    // 403 是权限信号（应停轮询落无权限面板），旧实现直接吞掉；非 403（500/503）仍静默降级，
+    // noteForbidden 内按状态码分流，绝不会被服务异常误判成无权限。
+    // English: §M-6 — the swallowed catches now feed noteForbidden (status-code based), so a 403
+    // halts polling; any non-403 error still degrades silently and cannot fake "forbidden".
+    api.fetchShortStatus().then((r) => { if (!pollingDeadRef.current) setShortEnabled(!!r.short_enabled) }).catch((e) => { noteForbidden(e) })
+    api.fetchPaperState().then((r) => { if (!pollingDeadRef.current) setShortPoolOn(!!(r.short_book && r.short_book.enabled)) }).catch((e) => { noteForbidden(e) })
     // 链路状态每 10s 轮询一次（心跳/延迟/熔断实时性要求高）
     stateTimer.current = setInterval(loadState, 10000)
     // §U-2 当日委托随链路状态同频轮询（在途单状态推进/撤单后回显）
@@ -935,7 +982,14 @@ export default function Quant() {
     return (
       <Card title="当日委托" style={{ marginBottom: 14 }}>
         <div style={{ fontSize: 11, color: 'var(--app-text-2)', marginBottom: 10 }}>状态由网关回报单调推进（已报→部成/已成/已撤）；未成交委托可撤，10s 刷新</div>
-        {orders == null ? (
+        {/* §M-9（2026-09-22 修复批）三态分离：loading（orders==null 且无错误）/
+            error（可重试提示，不再无限「加载中」）/ 空（今日暂无委托）/ 有数据（表格）。 */}
+        {orders == null && ordersError ? (
+          <div style={{ color: 'var(--td-warning-color)', fontSize: 13, padding: '6px 2px' }}>
+            ⚠ {ordersError}
+            <Button size="xs" variant="outline" theme="warning" style={{ marginLeft: 10 }} onClick={loadOrders}>重试</Button>
+          </div>
+        ) : orders == null ? (
           <div style={{ color: 'var(--app-text-2)', fontSize: 13 }}>加载委托列表…</div>
         ) : orders.length ? (
           <Table data={orders} columns={cols} rowKey="order_id" size="small"

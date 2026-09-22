@@ -5,6 +5,10 @@
 覆盖：上报文件逐行 _do_dispatch_result 语义（heartbeat 回执 / order_result 派发结算）、
 pending 派发原子推送 bridge_cmd.json、文件轮转（缩短）回读。无需 Windows/xtquant。
 
+§A4（2026-09-22 修复批）新增锁：位点只在**该行 apply 成功后**推进（旧实现先推位点
+再 apply，异常行被永久静默跳过）、apply 失败行先重试后落 bridge_report_dead.jsonl 死信、
+坏 JSON 行同样落死信、末段无换行的半行本轮不消费（详见 TestFileBridge 内 §A4 用例）。
+
 §TZ（2026-09-22 修复批）：夹具里模拟沙箱侧产出的 ts 一律走 store._now_cn()（显式北京
 时区），不再用「本地钟面 strftime + 硬编码 +08:00」的假偏移写法——非北京时区部署机上
 那种写法会自产漂移样本，掩盖真实时钟缺陷。
@@ -264,6 +268,123 @@ class TestFileBridge(unittest.TestCase):
             self.assertEqual(row.get("order_id"), "DRYRUN-1")
         finally:
             gw._stop.set()
+
+    # ── §A4（2026-09-22 修复批）位点只在 apply 成功后推进 + 死信留痕 ──
+
+    def _write_lines(self, path, lines):
+        """按 JSONL 原样写入若干行（每行补换行符，与桥的追加写同形）。"""
+        with open(path, "w", encoding="utf-8") as f:
+            for ln in lines:
+                f.write(ln + "\n")
+
+    def test_apply_exception_line_keeps_offset_and_dead_letters_after_retries(self):
+        """§A4 主断言：apply 抛异常的行**位点不推进**，重试超限后落死信文件而非静默跳过。
+
+        缺陷原文：旧实现先 `pos = f.tell()` 把位点推到块尾再逐行 apply，
+        apply 异常只 `log.exception` → 该行的事件永久丢失（成交/结算回报丢失＝账本失真）。
+        """
+        gw = self._new_gw(tempfile.mkdtemp())
+        path = gw._file_bridge_path()
+        boom = json.dumps({"type": "boom", "n": 1}, ensure_ascii=False)
+        after = json.dumps({"type": "heartbeat", "ts": _now_cn(), "n": 7}, ensure_ascii=False)
+        self._write_lines(path, [boom, after])
+        seen = []
+        real_apply = gw._do_dispatch_result
+
+        def _fake_apply(body):
+            """桩：boom 类型必抛（模拟 store/handler 侧异常），其余走真实应用逻辑。"""
+            seen.append(body.get("type"))
+            if body.get("type") == "boom":
+                raise RuntimeError("apply boom")
+            return real_apply(body)
+
+        gw._do_dispatch_result = _fake_apply
+        retries = {}
+        try:
+            size = os.path.getsize(path)
+            # 第 1 轮：毒行失败 → 位点必须停在它之前（旧实现此时已推到块尾）
+            pos = gw._bridge_consume_report(path, 0, retries)
+            self.assertEqual(pos, 0, "§A4 apply 失败时位点不得推进")
+            self.assertEqual(seen, ["boom"], "失败行之后的行不得被越过消费（保序）")
+            self.assertFalse(os.path.exists(gw._file_bridge_dead_path()),
+                             "未超限就落死信 = 放弃了重试")
+            # 继续巡检：重试到超限后必须落死信并越过该行，后续行随后被正常应用
+            for _ in range(4):
+                pos = gw._bridge_consume_report(path, pos, retries)
+            self.assertEqual(pos, size, "死信后位点应越过毒行、消费到块尾")
+            self.assertEqual(seen.count("boom"), gw._BRIDGE_LINE_RETRY_MAX,
+                             "重试次数应等于 §A4 上限")
+            self.assertEqual(seen.count("heartbeat"), 1, "后续行必须在毒行放行后被应用")
+            self.assertTrue(gw.store.bridge_connected(60), "心跳事件未被应用（死信流程异常）")
+            with open(gw._file_bridge_dead_path(), encoding="utf-8") as f:
+                dead = [json.loads(x) for x in f if x.strip()]
+            self.assertEqual(len(dead), 1, "超限行必须且只能落一条死信")
+            self.assertIn("apply boom", dead[0]["reason"])
+            self.assertIn("boom", dead[0]["line"])
+            self.assertTrue(dead[0].get("at"), "死信必须带留痕时间")
+        finally:
+            gw._stop.set()
+            gw.stop()
+
+    def test_bad_json_line_goes_to_dead_letter_not_silently_skipped(self):
+        """§A4：坏 JSON 行落死信并推进位点（确定性缺陷不重试），其后正常行照常消费。"""
+        gw = self._new_gw(tempfile.mkdtemp())
+        path = gw._file_bridge_path()
+        broken = '{"type": "heartbeat", "n": 1,   <-- 桥被 kill 时留下的半截/畸形行'
+        good = json.dumps({"type": "heartbeat", "ts": _now_cn(), "n": 3}, ensure_ascii=False)
+        self._write_lines(path, [broken, good])
+        gw._do_dispatch_result = lambda body: (200, {"ok": True})
+        retries = {}
+        try:
+            pos = gw._bridge_consume_report(path, 0, retries)
+            self.assertEqual(pos, os.path.getsize(path), "坏行不得卡住后续事件的消费")
+            with open(gw._file_bridge_dead_path(), encoding="utf-8") as f:
+                dead = [json.loads(x) for x in f if x.strip()]
+            self.assertEqual(len(dead), 1)
+            self.assertIn("bad_json", dead[0]["reason"])
+            self.assertIn("heartbeat", dead[0]["line"])
+        finally:
+            gw.stop()
+
+    def test_incomplete_tail_line_is_not_consumed_or_dead_lettered(self):
+        """§A4 附带修复：末段无换行 = 桥可能还在写，本轮不消费、不误判为坏行；补全后正常消费。"""
+        gw = self._new_gw(tempfile.mkdtemp())
+        path = gw._file_bridge_path()
+        line = json.dumps({"type": "heartbeat", "ts": _now_cn(), "n": 11}, ensure_ascii=False)
+        retries = {}   # 不打桩：走真实 _do_dispatch_result，半行消费后桥心跳必须真的落库
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(line[:20])  # 半行（无换行符）
+            pos = gw._bridge_consume_report(path, 0, retries)
+            self.assertEqual(pos, 0, "半行必须留在原地等下一轮补全")
+            self.assertFalse(os.path.exists(gw._file_bridge_dead_path()), "半行不得进死信")
+            # 桥补全这一行并加换行 → 正常消费
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line[20:] + "\n")
+            pos = gw._bridge_consume_report(path, pos, retries)
+            self.assertEqual(pos, os.path.getsize(path))
+            self.assertTrue(gw.store.bridge_connected(60))
+        finally:
+            gw.stop()
+
+    def test_report_pos_persisted_only_after_line_consumed(self):
+        """§A4 端到端：sidecar 循环持久化的 report_pos 不含未消费行（重启不丢事件）。"""
+        gw = self._new_gw(tempfile.mkdtemp())
+        path = gw._file_bridge_path()
+        boom = json.dumps({"type": "boom"}, ensure_ascii=False)
+        self._write_lines(path, [boom])
+        gw._do_dispatch_result = lambda body: (_ for _ in ()).throw(RuntimeError("boom"))
+        th = threading.Thread(target=gw._file_bridge_loop, daemon=True)
+        try:
+            th.start()
+            time.sleep(1.5)  # 至少跑两轮（0.5s/轮）
+            saved = gw.store.bridge_snapshot_get("report_pos", None)
+            self.assertEqual(int(saved or 0), 0,
+                             "未消费行的位点被持久化 = 网关重启后该行永久丢失")
+        finally:
+            gw._stop.set()
+            th.join(timeout=3)
+            gw.stop()
 
     def test_report_file_rotation_rescanned_from_zero(self):
         """上报文件被沙箱重写（长度缩短）→ sidecar 偏移回退重读，不丢事件。"""

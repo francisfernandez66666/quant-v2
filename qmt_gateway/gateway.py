@@ -25,6 +25,16 @@ broker 由 config 选择（xt/mock）。回报经 outbox 后台线程推送（ha
   根治裸 strftime 本地钟面贴假 +08:00（LOW 族）。
 §REJECT（2026-09-22）：/dispatch/result 的 trade 回报在 trade_id 与 order_id 皆空时
   拒收 400 留痕（与 §F5 缺 order_id 拒 400 同口径；handler.on_trade 为第二道防线）。
+§2026-09-22 修复批（本文件四项，详见各处同名 §编号说明；桥侧 qmt_bridge_strategy.py 的
+  中文说明按仓库既定策略由本文件承载）：
+  §SIDEGATE-PY（M-1）/order 方向白名单：side ∉ {买入,卖出} 一律 400（错误里带实际取值）。
+    旧实现只判 `side=="卖出"`，非法串按买入整手校验、却被 broker/桥的三元式下成卖单。
+  §M-2 place_order 异常不再遗留 pending 占位（try/finally 释放）+ 运行期 60s 巡检
+    `_sweep_stale_pending` 释放超龄（默认 600s）本地占位；两条路径都**只解锁不重发**。
+  §M-3 委托腿二次确认：桥回报带 order_confirmed，未确认单在 reason/dispatch result/日志里
+    显式标注（状态字面量仍为「已报」，原因见 _apply_order_result 的说明）。
+  §A4 文件桥位点改为「逐行、apply 成功后推进」，坏行/连续失败行落
+    bridge_report_dead.jsonl 死信文件留痕（旧实现先推位点再 apply，异常行被永久跳过）。
 
 运行：
   pip install -r qmt_gateway/requirements.txt   # 仅 mock 联调可不装任何依赖
@@ -99,6 +109,11 @@ DEFAULT_CONFIG = {
     # §M16（2026-09-22）：inflight 派发项超时收割阈值（秒，0=关闭）——桥回报丢失/重启后
     # dispatch 行不再永挂；回收后 order 类回写「已废」（判废不重排，防重复真实下单）
     "dispatch_inflight_reap_sec": 1800,
+    # §M-2（2026-09-22 修复批）orders 本地 pending 占位的超时阈值（秒，0=关闭巡检）——
+    # 旧实现只有 start() 里 release_stale_pending 调一次（:258-262），进程长活期间
+    # 「claim 成功但 place_order 抛异常/settle 失败」遗留的占位再无人清理，
+    # 同 signal_id 永 409。阈值与启动期同用 600s，运行期巡检复用 _dispatch_reap_loop。
+    "pending_stale_sec": 600,
     # §A1（AUDIT_FULLSTACK_20260918）网关侧独立风控（与首尔 risk.Gate 同语义，0/空=闸关闭）
     # §ENH-5 批E 只读 L1 行情通道（xtdata get_full_tick 轮询；与交易链路完全隔离）
     "quote_feed": True,             # feed 总开关（xtdata 缺失环境自动静默停用）
@@ -116,6 +131,17 @@ CONTRACT_CONSUMED_FIELDS = {
     "amount", "created_at", "strategy_type", "strategy",
 }
 CONTRACT_IGNORED_FIELDS = {"name", "strategy_id", "staleness_ms", "prev_close", "current_price"}
+
+# §SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）下单方向白名单：网关接单的唯一合法取值集。
+# 与 Go internal/trading 的 SideBuy/SideSell、桥侧 BUY/SELL（\\u 转义）以及 handler 的方向
+# 判定同集；任何其它形态（英文 buy/SELL、空串、带空格的 " 买入 "）都是上游装配错误，
+# 绝不允许「按买入校验、下成卖单」。
+# English: the only legal order sides accepted at the gateway door — everything else is a 400.
+ORDER_SIDES = ("买入", "卖出")
+
+# §A4（2026-09-22 修复批）文件桥"逐行推进位点"的重试计数表里，末段无换行残段的特殊键。
+# 用不会与任何 JSON 行文本相等的前缀键，避免和正常行的计数互相污染。
+_BRIDGE_TAIL_KEY = "\x00__tail__"
 
 
 def load_config(path):
@@ -255,9 +281,12 @@ class Gateway:
         # 留下的 pending 行会永久阻塞 signal_id（首尔重试恒得 409 duplicate in-flight）。删除超过
         # 10 分钟的残留占位行，安全解锁；仍在 10 分钟内的（极短窗口内刚崩溃）保留并告警，避免
         # 与可能已真实发出的券商委托冲突。
+        # §M-2：pending 占位超时阈值改为配置项（默认仍 600s，与历史硬编码同值，行为零变化），
+        # 启动期清理与运行期巡检共用这一个口径。
+        pending_stale_sec = int(self.cfg.get("pending_stale_sec", 600) or 0)
         released = 0
         try:
-            released = self.store.release_stale_pending(max_age_sec=600)
+            released = self.store.release_stale_pending(max_age_sec=pending_stale_sec)
         except Exception as _e:  # noqa: BLE001 — 清理解放失败不应阻断启动
             log.warning("[gateway] 清理残留 pending 失败: %s", _e)
         if released:
@@ -270,7 +299,10 @@ class Gateway:
         # §M16：dispatch 表与 orders 同批做启动清理——上次进程存活期内被桥取走（inflight）
         # 但回报丢失/桥重启未结算的超龄派发项，启动先收割一次，随后周期巡检兜底。
         self._reap_dispatch_inflight("启动")
-        if int(self.cfg.get("dispatch_inflight_reap_sec", 1800) or 0) > 0:
+        # §M-2：巡检线程同时负责 orders 的 pending 占位超时释放——旧实现只在这里
+        # 启动「inflight 收割」，运行期对 pending 完全无兜底（M-2 的第二半）。
+        # 两个阈值任一开启即起线程；两者皆 0 才不起（保持"可完全关闭巡检"的运维口径）。
+        if int(self.cfg.get("dispatch_inflight_reap_sec", 1800) or 0) > 0 or pending_stale_sec > 0:
             self._dispatch_reap_thread = threading.Thread(
                 target=self._dispatch_reap_loop, daemon=True, name="dispatch-reap")
             self._dispatch_reap_thread.start()
@@ -387,7 +419,13 @@ class Gateway:
 
     def _file_bridge_loop(self):
         """§QMT-F16 文件桥 sidecar：读桥的 JSONL 上报 + 推 pending 命令文件，
-        回报语义与 HTTP PATH 一字不差。上报文件被轮转缩小则回到 0 偏移。"""
+        回报语义与 HTTP PATH 一字不差。上报文件被轮转缩小则回到 0 偏移。
+
+        §A4（2026-09-22 修复批）：单行消费/位点推进/死信留痕的细则在
+        `_bridge_consume_report`；本循环只负责轮转判定、位点持久化与命令推送。
+        `line_retry` 是**本进程内存态**的行级重试计数（重启即清零，最坏是多试一轮，
+        事件应用幂等无害），刻意不落库——为一条畸形行去加持久化状态不值得。
+        """
         report_path = self._file_bridge_path()
         # FIX 2026-09-14 drill-3: restart used to re-read the report file from
         # offset 0 -- a 3.6MB replay storm (thousands of stale positions/account
@@ -410,6 +448,7 @@ class Gateway:
         if pos > _eof:
             pos = _eof
         log.info("[file-bridge] watching %s pos=%d size=%d", report_path, pos, _eof)
+        line_retry = {}  # §A4 行级重试计数（含末段半行等待轮数），仅本进程内存态
         # §2026-09-11 主接线时延：0.5s 轮询（信号→下单→回传闭环秒级；本地文件读开销可忽略）
         while not self._stop.is_set():
             if self._stop.wait(0.5):
@@ -423,34 +462,146 @@ class Gateway:
             if size < pos:  # 文件被重写（轮转），从头再读
                 pos = 0
             if size != pos:
-                try:
-                    with open(report_path, "rb") as f:
-                        f.seek(pos)
-                        block = f.read().decode("utf-8", errors="replace")
-                        pos = f.tell()
-                except OSError as e:  # noqa: BLE001 — 文件被占用等瞬态，跳过本轮
-                    log.warning("[file-bridge] read failed: %s", e)
-                    block = ""
-                for line in block.splitlines():
-                    text = line.strip()
-                    if not text:
-                        continue
-                    try:
-                        body = json.loads(text)
-                    except Exception as e:  # noqa: BLE001 — 残行不中断流
-                        log.warning("[file-bridge] bad line skipped: %s (%s)", text[:80], e)
-                        continue
-                    try:
-                        code, resp = self._do_dispatch_result(body)
-                        log.debug("[file-bridge] %s -> %s", body.get("type"), code)
-                    except Exception:  # noqa: BLE001 — 单事件失败不阻断后续行
-                        log.exception("[file-bridge] apply %s failed", body.get("type"))
+                # §A4（2026-09-22 修复批）位点推进改「逐行、且只在处理成功后推进」，
+                # 具体缺陷与理由见 _bridge_consume_report 的说明。
+                pos = self._bridge_consume_report(report_path, pos, line_retry)
                 try:
                     self.store.bridge_snapshot_set("report_pos", pos)
                 except Exception:  # noqa: BLE001 — 偏移写失败下轮重放，幂等无害
                     log.exception("[file-bridge] persist report pos failed")
             # ② 推命令（无 pending 不打扰桥）
             self._file_bridge_push_pending()
+
+    # §A4 单行 apply 连续失败的最大重试轮数（0.5s/轮 → 约 1.5s），超限落死信并跳过：
+    # 既保住「异常行不再被静默跳过」，也不允许一条毒行把 tail 循环卡死。
+    _BRIDGE_LINE_RETRY_MAX = 3
+    # §A4 末段无换行残段的最大等待轮数（约 10s）：桥正常追加写会在下一轮补全换行符，
+    # 超龄说明这是桥崩溃留下的半行，按整行处理（解析失败即死信推进），不再阻塞后续事件。
+    _BRIDGE_TAIL_STALL_ROUNDS = 20
+
+    def _file_bridge_dead_path(self):
+        """§A4 死信文件路径：与上报文件同目录的 bridge_report_dead.jsonl（运维取证入口）。"""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(self.cfg.get("bridge_report_dir") or base_dir,
+                            "bridge_report_dead.jsonl")
+
+    def _bridge_dead_letter(self, text, reason):
+        """§A4 死信落盘：把无法应用的原始行连同原因追加一行，写失败只告警不抛出。
+
+        绝不因为"留痕写不下去"反过来打断 tail 循环——位点推进由调用方决定。
+        """
+        try:
+            with open(self._file_bridge_dead_path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"at": _now_cn(), "reason": str(reason)[:300],
+                                    "line": str(text)[:2000]}, ensure_ascii=False,
+                                   default=json_default) + "\n")
+        except Exception:  # noqa: BLE001 — 死信写失败退回日志，绝不影响主循环
+            log.exception("[file-bridge] §A4 死信落盘失败（原始行见本日志）: %s", str(text)[:200])
+
+    def _bridge_apply_line(self, text, retries):
+        """§A4 应用单行上报。返回 True=可以把位点推过这一行，False=本轮保留、下轮重试。
+
+        判定口径：
+          - JSON 解析失败 → 确定性缺陷，重试无意义：直接死信 + 推进（旧实现是静默 continue）；
+          - apply 抛异常 / 网关回 5xx（_do_dispatch_result 内部吞异常后也是 5xx）→ 视作瞬态，
+            同一行最多重试 _BRIDGE_LINE_RETRY_MAX 轮，超限落死信并推进（防毒行卡死 tail）；
+          - 4xx（unknown seq / 未知 type 等）→ 网关权威判定，确定性拒绝，推进并告警留痕。
+        """
+        try:
+            body = json.loads(text)
+        except Exception as e:  # noqa: BLE001 — §A4 坏行不再静默跳过：落死信留痕
+            log.warning("[file-bridge] §A4 坏 JSON 行 → 死信: %s (%s)", text[:120], e)
+            self._bridge_dead_letter(text, "bad_json: %s" % e)
+            return True
+        try:
+            code, resp = self._do_dispatch_result(body)
+        except Exception as e:  # noqa: BLE001 — 单事件失败不阻断后续行（但位点不再越过它）
+            return self._bridge_line_failed(text, body, retries, "apply raised: %s" % e)
+        if int(code or 0) >= 500:
+            return self._bridge_line_failed(text, body, retries,
+                                            "gateway 5xx: %s" % str(resp)[:160])
+        if int(code or 0) >= 400:
+            # 确定性拒绝（seq 不存在/类型未知）：推进位点，但必须留痕——旧实现只打 debug，
+            # 生产 INFO 级别下等于静默丢弃。
+            log.warning("[file-bridge] 回报被拒 %s -> %s %s（推进位点，不重试）",
+                        (body or {}).get("type") if isinstance(body, dict) else "?",
+                        code, str(resp)[:160])
+        else:
+            log.debug("[file-bridge] %s -> %s", (body or {}).get("type"), code)
+        retries.pop(text, None)
+        return True
+
+    def _bridge_line_failed(self, text, body, retries, reason):
+        """§A4 单行应用失败：未超限保留原位点重试，超限落死信并放行位点（防毒行卡死）。"""
+        n = int(retries.get(text, 0)) + 1
+        etype = (body or {}).get("type") if isinstance(body, dict) else "?"
+        if n < self._BRIDGE_LINE_RETRY_MAX:
+            retries[text] = n
+            log.warning("[file-bridge] §A4 apply %s 失败（第 %d/%d 次，位点不推进、下轮重试）: %s",
+                        etype, n, self._BRIDGE_LINE_RETRY_MAX, reason)
+            return False
+        retries.pop(text, None)
+        log.error("[file-bridge] §A4 apply %s 连续 %d 次失败 → 死信留痕并跳过: %s",
+                  etype, n, reason)
+        self._bridge_dead_letter(text, "apply_failed_x%d: %s" % (n, reason))
+        return True
+
+    def _bridge_consume_report(self, report_path, pos, retries):
+        """§A4（2026-09-22 修复批）读并逐行应用上报文件，返回**实际消费到**的位点。
+
+        缺陷原文：旧实现（:428-430）先 `pos = f.tell()` 把位点一次性推到本次读到的块尾，
+        再逐行 apply，:443-447 的 apply 异常只 `log.exception` 就继续、:448-451 才把
+        已经越过失败行的位点持久化 → **异常行被永久跳过、事件彻底丢失**（成交/结算回报
+        丢失＝账本失真），:438-442 的坏 JSON 行同样是 `continue` 静默吞掉。
+        为什么这么改：位点是"已处理到哪"的唯一事实，只能在**该行处理成功后**推进；
+        失败行先重试（事件应用是幂等的，重复无害），连续失败超限则写死信文件
+        `bridge_report_dead.jsonl` 留痕后再越过——既不静默丢，也不让一条毒行卡死 tail。
+        另外补上末段半行保护：桥是追加写，读到结尾无换行符的残段时本轮不消费，
+        等下一轮补全（避免把正常行的一部分误判成坏行）。
+        English: §A4 — advance the offset only after a line has actually been applied;
+        failing lines are retried and finally dead-lettered instead of being skipped
+        with the offset already moved past them.
+        """
+        try:
+            with open(report_path, "rb") as f:
+                f.seek(pos)
+                data = f.read()
+        except OSError as e:  # noqa: BLE001 — 文件被占用等瞬态：位点不动，下轮重试
+            log.warning("[file-bridge] read failed: %s", e)
+            return pos
+        if not data:
+            return pos
+        segs = data.split(b"\n")
+        tail_consumed = False            # 末段"死半行"是否被强制当整行消费（字节数不带换行符）
+        if data.endswith(b"\n"):
+            lines = segs[:-1]          # 末尾空段就是换行符本身，不是一行
+            tail = b""
+        else:
+            lines = segs[:-1]          # 末段无换行：可能是桥正在写的半行
+            tail = segs[-1]
+        if tail:
+            stalled = int(retries.get(_BRIDGE_TAIL_KEY, 0)) + 1
+            if stalled >= self._BRIDGE_TAIL_STALL_ROUNDS:
+                retries.pop(_BRIDGE_TAIL_KEY, None)
+                lines.append(tail)      # 残段确认不会再被补全 → 当整行处理（坏行→死信）
+                tail_consumed = True
+            else:
+                retries[_BRIDGE_TAIL_KEY] = stalled
+        else:
+            retries.pop(_BRIDGE_TAIL_KEY, None)
+        consumed = 0
+        for idx, raw in enumerate(lines):
+            # 该行占用的字节 = 内容 + 1 个换行符；唯一例外是"被确认消费的死半行"（无换行符）
+            is_last = idx == len(lines) - 1
+            step = len(raw) + (0 if (is_last and tail_consumed) else 1)
+            text = raw.decode("utf-8", errors="replace").strip()
+            if not text:
+                consumed += step
+                continue
+            if not self._bridge_apply_line(text, retries):
+                break                   # 该行未消费：位点停在它之前，其余留到下轮
+            consumed += step
+        return pos + consumed
 
     def _reap_dispatch_inflight(self, where=""):
         """§M16：收割超龄 inflight 派发项并做对账降级回写。
@@ -491,8 +642,41 @@ class Gateway:
                     log.exception("[gateway] §M16 收割回写已废失败 seq=%s", r.get("seq"))
         return len(rows)
 
+    def _sweep_stale_pending(self, where=""):
+        """§M-2（2026-09-22 修复批）运行期 pending 占位超时释放。
+
+        缺陷原文：`release_stale_pending` 只在 `start()` 里调一次（:258-262），
+        而运行期 `_dispatch_reap_loop`（:494-502）只清 dispatch 的 inflight、
+        从不清 orders 的 pending → 进程长活期间遗留的占位（异常路径、settle 失败、
+        线程被 kill）永无人解锁，同 signal_id 后续请求恒 409「duplicate in-flight」。
+        为什么这么改：把启动期那一条清理搬进 60s 巡检，阈值共用 `pending_stale_sec`
+        （默认 600s，与启动期同口径），并保留 ids.py:5-10 记录的 fail-safe 语义——
+        **只删本地未结算占位行（status='pending'），绝不自动重发/重排下单**，
+        重复真实下单的防线仍然是 claim 的 signal_id 唯一键 + 「不重排」这一条。
+        未超龄的 pending（可能是本端正在下单的毫秒级窗口）只告警留痕，交人工核对。
+        English: §M-2 — runtime sweep that releases only over-aged *local* placeholders
+        (never re-issues an order), reusing the same 600s threshold as the boot cleanup.
+        """
+        stale_sec = int(self.cfg.get("pending_stale_sec", 600) or 0)
+        if stale_sec <= 0:
+            return 0
+        try:
+            n = self.store.release_stale_pending(max_age_sec=stale_sec)
+        except Exception:  # noqa: BLE001 — 巡检释放失败下轮重试，绝不影响其它巡检
+            log.exception("[gateway] §M-2 pending 占位巡检释放失败")
+            return 0
+        if n:
+            log.warning("[gateway] §M-2 运行期释放 %d 个超龄（>%ds）pending 占位（%s）——"
+                        "仅解锁本地占位，网关未重发任何订单，请核对柜台侧是否已有委托",
+                        n, stale_sec, where or "周期巡检")
+        return n
+
     def _dispatch_reap_loop(self):
-        """§M16 周期收割：每 60s 巡检一次 inflight 超龄派发项（阈值见配置，默认 30min）。"""
+        """§M16 周期收割：每 60s 巡检一次 inflight 超龄派发项（阈值见配置，默认 30min）。
+
+        §M-2：同一条巡检线程顺带跑 orders 的 pending 占位超时释放（旧实现只收 inflight，
+        pending 无人解锁 = 本条缺陷的另一半）。两条各自 try 保护，互不牵连。
+        """
         while not self._stop.is_set():
             if self._stop.wait(60):
                 break
@@ -500,6 +684,10 @@ class Gateway:
                 self._reap_dispatch_inflight()
             except Exception:  # noqa: BLE001 — 巡检线程永不因异常退出
                 log.exception("[gateway] §M16 dispatch reap loop error")
+            try:
+                self._sweep_stale_pending()
+            except Exception:  # noqa: BLE001 — 巡检线程永不因异常退出
+                log.exception("[gateway] §M-2 pending sweep loop error")
 
     def stop(self):
         """优雅停止：置停止信号并停掉回报发送线程（重连/对账线程随之退出）。
@@ -775,13 +963,41 @@ class Gateway:
             return 500, {"ok": False, "err": "dispatch result error: %s" % e}
 
     def _apply_order_result(self, req):
-        """下单结果回报：结算派发项；ok→已报（回填交易所委托号），失败→已废（带拒因）。"""
+        """下单结果回报：结算派发项；ok→已报（回填交易所委托号），失败→已废（带拒因）。
+
+        §M-3（2026-09-22 修复批）委托腿二次确认：桥的 passorder 只要「不抛异常」就
+        return True（qmt_bridge_strategy.py:601-611），旧实现据此一路上报「已报」，
+        而柜台**事后**拒绝（资金/权限/涨跌停/合约状态）时委托腿没有任何补偿轮询——
+        成交腿有 `_bridge_tick` 的 DEAL 轮询，委托腿没有 → 本地永驻「已报」。
+        现在桥在回报里附带 `order_confirmed`（ORDER 表轮询是否真的见到这笔委托，
+        复用 embed_resolve 那条 8s 轮 ORDER 的路径），本端据此把「已报」降级为
+        **显式未确认**：状态字面量仍保持「已报」，理由是首尔侧的委托状态机与资金/
+        敞口闸全部按 `status IN ('已报','部成',…)` 精确匹配（internal/store/real_positions.go
+        LocalBuyFrozen / SumOpenSellQty、qmt.go 的可撤判定），改成任何未知状态字面量
+        会让在途单从冻结额与可撤集合里凭空消失（比"停在已报"更危险，且不在本次可改的
+        Go 侧范围内）。因此这里做到的是**可区分 + 可取证**：
+          - reason 带 §M-3 显式拒因文案（回报载荷字段集不变，Go 已按 reason 落日志/运维流水）；
+          - dispatch 行 result JSON 记 `confirmed: false`（对账/巡检可查）；
+          - WARNING 日志留痕，网关绝不因"未确认"重发订单（幂等锚 ok/seq 语义一字未动）。
+        English: §M-3 — the bridge now publishes whether the counter's ORDER table really
+        showed the order. Unconfirmed accepts keep the 已报 literal (the Seoul-side state
+        machine and the cash/open-qty gates match on it exactly) but carry an explicit
+        §M-3 reason, a `confirmed:false` dispatch marker and a warning log; nothing is
+        ever re-sent here, and the ok/seq idempotency anchor is unchanged.
+        """
         # seq 是派发项主键：桥回执只带 seq + 结果，方向/代码等语义字段从派发行取（权威在本端）。
         seq = str(req.get("seq", "") or "")
         ok = bool(req.get("ok"))
         order_id = str(req.get("order_id", "") or "")
         err = str(req.get("err", "") or "")
-        row = self.store.dispatch_set_result(seq, {"ok": ok, "order_id": order_id, "err": err})
+        # §M-3 未确认标记：只在 ok 且桥**显式**回报 order_confirmed=false 时降级；
+        # 字段缺失（旧版桥/mock）按已确认处理，避免把存量通道一律打成可疑单。
+        confirmed_raw = req.get("order_confirmed", True)
+        confirmed = False if (ok and confirmed_raw is False) else True
+        unconfirm_reason = ("§M-3 柜台委托未确认：下单已被客户端受理但桥在 ORDER 表轮询窗口内"
+                            "未见到该委托，请人工核对柜台侧（网关未重发）")
+        row = self.store.dispatch_set_result(
+            seq, {"ok": ok, "order_id": order_id, "err": err, "confirmed": bool(confirmed)})
         if row is None:
             return 404, {"ok": False, "err": "unknown seq: %s" % seq}
         signal_id = row.get("signal_id", "")
@@ -790,9 +1006,16 @@ class Gateway:
             return 200, {"ok": True, "err": ""}
         ts = _now_cn()  # §TZ
         if ok:
+            if not confirmed:
+                log.warning("[gateway] §M-3 委托腿未获柜台确认 seq=%s signal=%s code=%s side=%s "
+                            "ref=%s —— 上报 reason 已标注未确认，状态字面量保持已报（见 §M-3 说明）",
+                            seq, signal_id, row.get("code"), row.get("side"), order_id or seq)
             self.handler.on_order({
                 "order_id": order_id or seq, "signal_id": signal_id, "code": row.get("code"),
                 "side": row.get("side"), "status": "已报",
+                # §M-3 未确认单必须让首尔/运维看得见：复用契约里已有的 reason 字段承载
+                # 显式文案（不新增契约字段，避免 §A2/§F2 三点契约校验漂移）。
+                "reason": "" if confirmed else unconfirm_reason,
                 "price": float(row.get("price", 0) or 0), "qty": int(row.get("qty", 0) or 0),
                 "created_at": row.get("created_at") or ts, "at": ts,
             })
@@ -952,8 +1175,13 @@ class Gateway:
 
         校验 code/qty/signal_id（非空）、限价单必须有价格；按板块整手规则校验买入数量；
         signal_id 为空一律拒绝（幂等与审计唯一锚点，§G2）；同 signal_id 幂等去重。
-        English: handles POST /order — validates params, takes the idempotent placeholder,
-        places the order via the broker, and fills back the exchange order id.
+        §SIDEGATE-PY（M-1）方向白名单：side ∉ {买入,卖出} 一律 400（不再"按买入校验、
+        下成卖单"）；§M-2 下单窗口 try/finally：place_order/settle 任何异常路径都释放
+        本地占位，同 signal_id 可再次受理（网关自身永不重发）。
+        English: handles POST /order — validates params (incl. the hard side whitelist),
+        takes the idempotent placeholder, places the order via the broker, and fills back
+        the exchange order id; §M-2 guarantees the placeholder is released on every path
+        that does not settle.
         """
         # 下单主流程：参数校验 → 幂等占位 → 真实下单 → 回填
         req = body or {}
@@ -973,8 +1201,28 @@ class Gateway:
         if not signal_id:
             return 400, {"ok": False, "err": "signal_id required"}
 
-        side = req.get("side", "")
-        # 按板块取申报单位规则后做整手校验
+        # §SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）方向白名单——缺陷原文：
+        # 旧实现 `side = req.get("side","")` 之后**没有任何取值校验**，只在下一步判
+        # `if side == "卖出"`，else 分支把「一切非法串」按买入整手规则放行；而真正决定
+        # 柜台方向的 broker.py:310 与 qmt_bridge_strategy.py:563/769 都是
+        # `买入 才买、否则卖` 的三元式 → 一个拼错的方向（"buy"/"SELL"/" 买入 "/"")
+        # 会被「按买入校验、下成卖单」，并顺带让首尔 risk.Gate 中按 Side 精确匹配的
+        # T+1 限售/涨停拒买/跌停拒卖三道闸同时不触发（M-1 定性：方向翻转 + 风控失效）。
+        # 为什么这么改：在入口即拒（400）而不是在末端猜——网关不复算方向语义，
+        # 任何非白名单取值都无法安全落地。错误信息带上实际收到的值（repr，含引号/空格）
+        # 便于排障一眼看出是上游装配错还是编码错。校验刻意发生在 claim 之前：
+        # 与 §A1 金额帽同口径，不消耗 signal_id 幂等占位；4xx 让 Go 下单口直接失败返回，
+        # 不进 outbox 重试链（重试也不会改变入参，无限重试只会刷屏）。
+        # English: §SIDEGATE-PY — hard whitelist at the door; previously any junk side was
+        # validated as a buy but *executed* as a sell by the broker-side ternary.
+        raw_side = req.get("side", "")
+        if not (isinstance(raw_side, str) and raw_side in ORDER_SIDES):
+            log.warning("[gateway] §SIDEGATE-PY 非法下单方向，拒 400: side=%r signal=%s code=%s",
+                        raw_side, signal_id, code)
+            return 400, {"ok": False,
+                         "err": "side must be one of %s, got %r" % ("/".join(ORDER_SIDES), raw_side)}
+        side = raw_side
+        # 按板块取申报单位规则后做整手校验（方向已被白名单收口：else 分支必为买入）
         min_qty, step = lot_rule(code, side)
         if side == "卖出":
             if qty < 1:
@@ -1039,22 +1287,62 @@ class Gateway:
             # 幂等：已下过 → 返回原委托引用（不重复下单）
             return 200, {"ok": True, "order_id": oid, "err": ""}
 
-        ok, order_ref, err = self.active_broker.place_order(req)
-        if not ok:
-            # 失败释放占位，允许后续重试真正重新下单
+        # §M-2（2026-09-22 修复批）下单窗口异常保护——缺陷原文：旧实现
+        # `ok, order_ref, err = self.active_broker.place_order(req)`（旧 :1042）裸调用，
+        # 通道抛异常（xt IPC 抖动、桥写命令文件失败、结果装配 KeyError…）时异常冒泡到
+        # _Handler._dispatch（:1225 的 §G8 顶层保护）被吞成 500，**但本函数已抢到的
+        # pending 占位不会 release** → 同 signal_id 之后每次重试都恒 409
+        # 「duplicate signal_id in-flight」，该信号永久死锁（M-2 定性）。
+        # 为什么这么改：try/finally 守住「未 settle 即释放占位」这一条不变式——无论异常
+        # 从 place_order 还是 settle 冒出，占位都不会遗留；异常仍回 500（与旧 HTTP 状态码
+        # 一致，Go 侧不新增重试语义），并由运行期巡检 _sweep_stale_pending 兜底。
+        # 语义边界（ids.py:5-10 的 fail-safe 结论保持不变）：这里释放的只是**本地占位行**，
+        # 网关绝不自动重发；单可能已到达柜台，是否重试由调用方（首尔）决策，
+        # 防重复下单的最后防线仍是 claim 的 signal_id 唯一键 + 「只清理未结算占位」。
+        # English: §M-2 — the claim is now released on every non-settled path (exception
+        # included), so a raising broker call can no longer deadlock the signal_id forever.
+        accepted = False
+        why = ""
+        try:
+            ok, order_ref, err = self.active_broker.place_order(req)
+            if not ok:
+                # 失败释放占位，允许后续重试真正重新下单（原有语义，现由 finally 统一兜底）
+                why = "place_order 返回失败: %s" % (err or "")
+                return 400, {"ok": False, "err": err or "place order failed"}
+            # settle：占位行回填真实委托引用（seq:<n> 或 mock 单号；交易所号随后续回报替换）
+            self.ids.settle({
+                "order_id": order_ref, "signal_id": signal_id, "code": code, "side": side,
+                "status": "已报", "price": price, "qty": qty,
+                "created_at": req.get("created_at") or _now_cn(),
+                "user_id": self.user_id,  # §P1-9 多账号隔离归属
+            })
+            accepted = True
+            log.info("[gateway] order accept: signal=%s code=%s side=%s qty=%s ref=%s "
+                     "accept_ms=%.1f broker=%s", signal_id, code, side, qty, order_ref,
+                     (time.time() - _t0) * 1000, self.active_key)
+            return 200, {"ok": True, "order_id": order_ref, "err": ""}
+        except Exception as e:  # noqa: BLE001 — §M-2 异常绝不冒泡成"占位遗留"
+            why = "下单窗口异常: %s" % e
+            log.exception("[gateway] §M-2 下单窗口异常（signal=%s code=%s side=%s）——"
+                          "本端不重发，释放占位后由调用方决定是否重试", signal_id, code, side)
+            return 500, {"ok": False, "err": "place order error: %s" % e}
+        finally:
+            if not accepted:
+                self._release_order_claim(signal_id, why)
+
+    def _release_order_claim(self, signal_id, why=""):
+        """§M-2 释放本地 pending 占位（幂等 + 绝不冒泡）。
+
+        只删未结算的占位行（store.release_pending 的 status='pending' 条件保证已 settle
+        的正式委托行不受影响），本方法不重发、不入队任何订单。
+        English: §M-2 — release the local placeholder only (never re-issue the order).
+        """
+        try:
             self.ids.release(signal_id)
-            return 400, {"ok": False, "err": err or "place order failed"}
-        # settle：占位行回填真实委托引用（seq:<n> 或 mock 单号；交易所号随后续回报替换）
-        self.ids.settle({
-            "order_id": order_ref, "signal_id": signal_id, "code": code, "side": side,
-            "status": "已报", "price": price, "qty": qty,
-            "created_at": req.get("created_at") or _now_cn(),
-            "user_id": self.user_id,  # §P1-9 多账号隔离归属
-        })
-        log.info("[gateway] order accept: signal=%s code=%s side=%s qty=%s ref=%s "
-                 "accept_ms=%.1f broker=%s", signal_id, code, side, qty, order_ref,
-                 (time.time() - _t0) * 1000, self.active_key)
-        return 200, {"ok": True, "order_id": order_ref, "err": ""}
+            log.warning("[gateway] §M-2 已释放 signal_id=%s 的本地占位（%s）；"
+                        "网关不自动重发，重试由调用方决策", signal_id, why or "未说明")
+        except Exception:  # noqa: BLE001 — 释放失败只能等运行期巡检兜底，不得再吞掉原始错误
+            log.exception("[gateway] §M-2 释放占位失败 signal_id=%s（等待巡检兜底）", signal_id)
 
     def _do_cancel(self, body):
         """处理 POST /cancel 撤单：校验委托引用后委托 broker，结果如实返回。

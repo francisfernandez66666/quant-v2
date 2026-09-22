@@ -5,6 +5,10 @@
 无需 Windows/xtquant：用 XtAdapter(dry_run=True) 走通「心跳→快照→取单→下单回报」
 真实代码路径，验证桥侧协议（GET /dispatch/pending + POST /dispatch/result）与网关侧
 （入队/结算/回报/心跳连通）端到端闭环。真机仅在 XtAdapter 内部换真实 xttrader。
+
+§M-3（2026-09-22 修复批）：TestM3OrderLegConfirmation 锁「委托腿二次确认」的网关侧
+消费口径——桥显式回报 order_confirmed=false 时上报必须可区分（reason + dispatch
+confirmed 标记 + 留痕），而幂等锚与状态字面量保持不变。
 """
 import json
 import os
@@ -112,6 +116,12 @@ class TestBridgeLoop(unittest.TestCase):
         _, pend = self._req("GET", "/dispatch/pending")
         self.assertEqual(pend["items"], [])  # 已全部取走执行
         _, state = self._req("GET", "/state")
+        # §M-3（2026-09-22 修复批）口径确认：这里「已报」依然是对的，但**不再**是
+        # 「无回执即已报」——dry-run 通道没有柜台可确认，桥侧 resolve_order_id 对
+        # dry_run/无 signal_id 显式保持 last_resolve_confirmed=True，回报不带
+        # order_confirmed=false；只有策略桥在 ORDER 表轮询窗口内真的没见到委托时才降级。
+        # 也就是说：本断言锁的是"已确认/无柜台可确认 → 已报"，未确认分支由
+        # TestM3OrderLegConfirmation 与 test_bridge_strategy_adapter 的新用例锁住。
         self.assertEqual(state["orders"][0]["status"], "已报")
         self.assertTrue(str(state["orders"][0]["order_id"]).startswith("DRYRUN-"),
                         state["orders"][0]["order_id"])
@@ -166,6 +176,107 @@ class TestBridgeLoop(unittest.TestCase):
         self.assertEqual(acks[0]["seq"], "seq:77")
         self.assertFalse(acks[0]["ok"])
         self.assertIn("unknown kind", acks[0]["err"])
+
+
+class TestM3OrderLegConfirmation(unittest.TestCase):
+    """§M-3（2026-09-22 修复批）委托腿二次确认（网关侧消费 order_confirmed）。
+
+    缺陷原文：qmt_bridge_strategy.py:601-611 的 passorder 只要「不抛异常」就 return True
+    → :1052 回报 ok=True → gateway.py:792-795 据此上报「已报」。成交腿有 _bridge_tick 的
+    DEAL 轮询做补偿，委托腿**没有任何二次确认** → 柜台事后拒绝时本地永驻「已报」。
+    现在桥在回报里附带 order_confirmed（embed_resolve 那条 8s 轮 ORDER 的路径复用），
+    本端把「已受理但未确认」显式区分出来：reason 带 §M-3 文案、dispatch result 记
+    confirmed=false、WARNING 留痕；而状态字面量**刻意仍保持「已报」**——首尔侧的撤单资格、
+    资金冻结、在途卖量全部按 status IN ('已报','部成',…) 精确匹配（internal/store/
+    real_positions.go LocalBuyFrozen / SumOpenSellQty、qmt.go 可撤判定），换成任何未知
+    字面量会让在途单从这些集合里凭空消失，比"停在已报"更危险。
+    幂等锚（ok/seq 结算、不重发）在本条修复里一字未动，测试同时锁住这一点。
+    """
+
+    def setUp(self):
+        """构造 queued 通道网关（不启 HTTP），把 _push 换成内存收集器观察上报载荷。"""
+        cfg = {"listen": "127.0.0.1:0", "token": "tk", "broker": "queued",
+               "account": "T0001", "db": _tmp(), "report_url": "", "reconcile_sec": 0,
+               "failover_enable": False, "user_id": "uM3"}
+        self.gw = Gateway(cfg)
+        self.pushed = []
+        self.gw.handler._push = lambda p: self.pushed.append(p)
+
+    def tearDown(self):
+        """停用网关后台线程（未 start()，只停 handler sender 与线程 join 的兜底）。"""
+        self.gw._stop.set()
+        self.gw.handler.stop_sender()
+
+    def _enqueue(self, sid="M3-1"):
+        """塞一条待结算的 order 派发行，返回其 seq。"""
+        self.gw.store.dispatch_enqueue_order({"signal_id": sid, "code": "600519.SH",
+                                              "side": "买入", "price_type": "limit",
+                                              "price": 10, "qty": 100})
+        return self.gw.store.dispatch_pending(limit=1)[0]["seq"]
+
+    def _order_events(self):
+        """收集器里筛出 type=order 的上报载荷。"""
+        return [p for p in self.pushed if p.get("type") == "order"]
+
+    def test_unconfirmed_accept_is_distinguishable(self):
+        """order_confirmed=false → 上报带 §M-3 未确认拒因 + dispatch 记 confirmed=false。"""
+        seq = self._enqueue("M3-NO")
+        code, body = self.gw._apply_order_result({
+            "type": "order_result", "seq": seq, "ok": True,
+            "order_id": "seq:9", "err": "", "order_confirmed": False})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["ok"])
+        row = self.gw.store.dispatch_get(seq)
+        self.assertEqual(row["status"], "done", "派发行必须照常结算（幂等锚不变）")
+        result = json.loads(row["result"] or "{}")
+        self.assertIs(result.get("confirmed"), False, "未确认标记未落 dispatch result")
+        ev = self._order_events()[-1]
+        self.assertEqual(ev["status"], "已报",
+                         "状态字面量保持已报（见类文档：改字面量会击穿首尔的资金/可撤闸）")
+        self.assertIn("§M-3", ev.get("reason", ""))
+        self.assertIn("未确认", ev.get("reason", ""))
+        # 未确认绝不等于重发：派发队列不得再出现任何行
+        self.assertEqual(self.gw.store.dispatch_pending(limit=5), [],
+                         "§M-3 未确认不得触发自动重发")
+
+    def test_confirmed_report_has_no_unconfirm_reason(self):
+        """order_confirmed=true → 干净回报，reason 为空（不误伤已确认单）。"""
+        seq = self._enqueue("M3-OK")
+        code, _ = self.gw._apply_order_result({
+            "type": "order_result", "seq": seq, "ok": True,
+            "order_id": "123456", "err": "", "order_confirmed": True})
+        self.assertEqual(code, 200)
+        ev = self._order_events()[-1]
+        self.assertEqual(ev["status"], "已报")
+        self.assertEqual(ev.get("reason", ""), "")
+        self.assertIs(json.loads(self.gw.store.dispatch_get(seq)["result"])["confirmed"], True)
+
+    def test_missing_field_from_older_bridge_keeps_legacy_semantics(self):
+        """字段缺失（旧版桥 / dry-run / mock）→ 按已确认处理，保持 test_full_loop 的旧口径。
+
+        这条用例专门钉住「无回执即已报」在新语义下的边界：不是所有 ok=true 都可疑，
+        只有桥**显式**说没确认（order_confirmed=false）才降级标注。
+        """
+        seq = self._enqueue("M3-LEGACY")
+        code, _ = self.gw._apply_order_result({
+            "type": "order_result", "seq": seq, "ok": True, "order_id": "DRYRUN-1", "err": ""})
+        self.assertEqual(code, 200)
+        ev = self._order_events()[-1]
+        self.assertEqual(ev["status"], "已报")
+        self.assertEqual(ev.get("reason", ""), "")
+        self.assertIs(json.loads(self.gw.store.dispatch_get(seq)["result"])["confirmed"], True)
+
+    def test_rejected_order_still_reported_as_waste(self):
+        """ok=false 路径不受 §M-3 影响：依旧已废 + 桥给的拒因（防把失败单标成未确认）。"""
+        seq = self._enqueue("M3-REJ")
+        code, _ = self.gw._apply_order_result({
+            "type": "order_result", "seq": seq, "ok": False, "order_id": "",
+            "err": "资金不足", "order_confirmed": False})
+        self.assertEqual(code, 200)
+        ev = self._order_events()[-1]
+        self.assertEqual(ev["status"], "已废")
+        self.assertEqual(ev["reason"], "资金不足")
+        self.assertIs(json.loads(self.gw.store.dispatch_get(seq)["result"])["confirmed"], True)
 
 
 if __name__ == "__main__":

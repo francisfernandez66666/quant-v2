@@ -9,6 +9,11 @@ import * as api from '../api/index.js'
 import MinuteView from '../components/MinuteView.jsx'
 import StockDetailDrawer from '../components/StockDetailDrawer.jsx'
 import { on } from '../sseBus.js'
+// §H-2（2026-09-22 修复批）：editBalanceSave 的失败分支调用 showToast，但导入区一直没有
+// ui.jsx —— 保存可用资金一旦失败即抛 ReferenceError（异步未捕获、用户零提示）。补齐导入。
+// English: §H-2 — showToast was called without being imported; the save-failure branch died
+// with an uncaught ReferenceError (no toast at all). Import added.
+import { showToast } from '../ui.jsx'
 
 // 持仓与资金数据的 localStorage 缓存键
 const CACHE_KEY = 'pos_cache_v1'
@@ -45,6 +50,10 @@ export default function Positions() {
   const [detail, setDetail] = useState(null)
   // 可用资金余额
   const [availableBalance, setAvailableBalance] = useState(cache.balance)
+  // §H-2（2026-09-22 修复批）资金保存在途标记 + 服务端已确认余额：
+  // 在途期间 persistCache 一律用确认值，乐观值/回滚前的脏值绝不进缓存。
+  const balancePendingRef = useRef(false)
+  const balanceConfirmedRef = useRef(cache.balance)
   // 新增/编辑持仓弹窗显隐
   const [showAdd, setShowAdd] = useState(false)
   // 盈亏显示偏移量（用于「清零」显示，持久化到 localStorage）
@@ -228,7 +237,16 @@ export default function Positions() {
   }, [lotTarget, lotFormQty, lotFormPrice, lotDir])
 
   // 持仓与资金变动时持久化到 localStorage，供下次进入恢复
-  useEffect(() => { persistCache(holdings, availableBalance) }, [holdings, availableBalance])
+  // §H-2（2026-09-22 修复批）缓存写入口加守卫：可用资金保存请求在途时，乐观新值不落缓存，
+  // 改按「服务端确认值」持久化——失败回滚后缓存里也绝不会残留错误余额（跨刷新污染根断）；
+  // 持仓变化仍照常随写。
+  // English: §H-2 — while a balance save is in flight the optimistic value is never written to
+  // the localStorage cache; the last server-confirmed balance is persisted instead, so a failed
+  // save can no longer poison pos_cache_v1 across refreshes.
+  useEffect(() => {
+    const safeBalance = balancePendingRef.current ? balanceConfirmedRef.current : availableBalance
+    persistCache(holdings, safeBalance)
+  }, [holdings, availableBalance])
 
   // 以当前总盈亏为基准设置偏移量，实现「清零」显示
   function resetPnl() {
@@ -252,6 +270,8 @@ export default function Positions() {
       if (data) {
         setHoldings(data.holdings || [])
         setAvailableBalance(data.available_balance || 0)
+        // §H-2（2026-09-22 修复批）服务端回读即权威确认值，同步更新缓存写守卫的基准
+        balanceConfirmedRef.current = data.available_balance || 0
         setTotalRealizedPnl(data.total_realized_pnl || 0)
       }
     } catch (_) {}
@@ -533,12 +553,27 @@ export default function Positions() {
   // 此前整表 saveHoldings() 是 full-replace 语义且后端显式丢弃 balance 字段，
   // 改资金既存不进、还会在并发下把手改持仓整体回写覆盖。
   async function editBalanceSave() {
-    setAvailableBalance(balanceInputVal); setEditingBalance(false)
+    // §H-2（2026-09-22 修复批）保存失败三处收口：
+    // ① showToast 已补导入（旧码此调用直接 ReferenceError，用户零提示）；
+    // ② catch 内回滚乐观写到编辑前值（旧码不回滚，界面长期显示未保存成功的余额）；
+    // ③ 在途/失败期间 persistCache 走 balancePendingRef 守卫（见挂载副作用），错误余额
+    //    绝不写进 pos_cache_v1 —— 旧码 :231 的无条件持久化会把脏值带到下次刷新。
+    // English: §H-2 — on save failure the optimistic write is rolled back, a real toast is
+    // shown (showToast import was missing), and the dirty balance never reaches the
+    // localStorage cache (guarded by balancePendingRef in the persist effect).
+    const prev = availableBalance
+    const next = balanceInputVal
+    balancePendingRef.current = true
+    setAvailableBalance(next); setEditingBalance(false)
     try {
-      await api.updateHoldingsBalance(balanceInputVal)
+      await api.updateHoldingsBalance(next)
+      balanceConfirmedRef.current = next
     } catch (e) {
+      balancePendingRef.current = false
+      setAvailableBalance(prev) // 回滚到编辑前值
       showToast('保存可用资金失败：' + (e && e.message ? e.message : e), 'error')
     }
+    balancePendingRef.current = false
   }
   // 取消可用资金编辑，放弃本次修改
   function editBalanceCancel() { setEditingBalance(false) }
@@ -552,7 +587,14 @@ export default function Positions() {
       if (msg.type === 'real_advice' && Array.isArray(msg.advices)) {
         applyAdviceMap(msg.advices)
       } else if (msg.type === 'qmt_report' || msg.type === 'real_order') {
-        setQmtState((prev) => ({ ...prev, tripped: !!msg.tripped }))
+        // §M-13（2026-09-22 修复批）前端半：旧写法 `tripped: !!msg.tripped` 在后端
+        // qmt_report 广播载荷缺 tripped 字段时被 !!undefined=false 命中，任意一发热报
+        // 都把熔断徽标瞬清成「正常」，靠同行 loadReal 一个 RTT 才纠正回来（徽标闪烁，
+        // 熔断拦截窗口内用户可能误判网关正常）。现只在载荷确实带该字段时才更新这一位，
+        // 缺字段保持原值，由随后的 loadReal REST 权威刷新。
+        // English: §M13 (frontend half) — only overwrite the tripped bit when the broadcast
+        // actually carries it; a missing field must leave the badge untouched, not clear it.
+        setQmtState((prev) => (msg.tripped === undefined ? prev : { ...prev, tripped: !!msg.tripped }))
         loadReal()
       }
     })

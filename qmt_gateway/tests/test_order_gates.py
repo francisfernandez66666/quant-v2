@@ -7,6 +7,8 @@
   A1 行为面：max_order_amount 金额帽（买卖双向、amount 缺省回退 qty×price）、
      allowed_strategies 白名单（仅买入方向）、strict_fields 缺键 fail-close；
      且闸口拒单发生在 claim 之前，不消耗 signal_id 幂等占位。
+  §SIDEGATE-PY（2026-09-22 修复批，M-1）方向白名单：非法 side（英文/空串/带空格/非字符串）
+     在网关入口 400、在通道层入队前 fail-close——旧实现「按买入校验、下成卖单」。
   A2 契约面：contract/order_fields.json golden == gateway.CONTRACT_CONSUMED/IGNORED
      == _do_order/broker 源码实际字段引用（consumed 必须被引用、ignored 必须不被引用），
      配合 Go 侧 internal/trading/order_contract_test.go 形成三点闭环。
@@ -21,7 +23,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gateway import Gateway, CONTRACT_CONSUMED_FIELDS, CONTRACT_IGNORED_FIELDS  # noqa: E402
-from broker import MockBroker, XtBroker  # noqa: E402
+from broker import MockBroker, XtBroker, QueuedBroker  # noqa: E402
 
 CONTRACT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "contract", "order_fields.json")
@@ -36,6 +38,89 @@ def make_gw(**gate_cfg):
            "db": dbpath, "report_url": "", "reconcile_sec": 0, "seed": []}
     cfg.update(gate_cfg)
     return Gateway(cfg)
+
+
+class TestGatewaySideWhitelist(unittest.TestCase):
+    """§SIDEGATE-PY（2026-09-22 修复批，M-1 升级 H-5）方向白名单。
+
+    缺陷原文：`_do_order` 取 `side = req.get("side","")` 后**没有任何取值校验**，
+    只判 `if side == "卖出"`，else 分支把一切非法串按买入整手规则放行；而真正决定
+    柜台方向的 broker.py:310 / qmt_bridge_strategy.py:563,769 都是
+    `STOCK_BUY if side=="买入" else STOCK_SELL` → 一个拼错的方向会「按买入校验、
+    下成卖单」，并顺带让首尔 risk.Gate 里按 Side 精确匹配的 T+1/涨停/跌停三道闸
+    同时不触发（M-1 定性：方向翻转 + 风控闸失效）。
+    本类锁三件事：① 非法方向三形态（英文/空串/带空格）一律 400 且错误里带实际取值；
+    ② 拒单发生在 claim 之前（不消耗幂等占位，修正后可重试）；
+    ③ 通道层第二道闸（QueuedBroker 入队前 fail-close），非法方向绝不进派发队列。
+    """
+
+    # 非法形态样本：含审计点名的三形态（英文 / 空串 / 带空格）+ 非字符串取值
+    ILLEGAL = [("英文买入", "buy"), ("英文卖出", "SELL"), ("空串", ""),
+               ("带空格", " 买入 "), ("全角大小写混写", "MaiRu"),
+               ("None 取值", None), ("数字取值", 1)]
+
+    def _body(self, sid, side):
+        """构造一笔 600519 一手限价买入单，只把方向换成待测值。"""
+        return {"signal_id": sid, "code": "600519.SH", "side": side,
+                "price_type": "limit", "price": 10, "qty": 100,
+                "amount": 1000, "created_at": "t"}
+
+    def test_illegal_side_forms_all_rejected_400(self):
+        """六种非法方向取值全部 400，错误信息点名 side 并回显实际收到的值（排障用）。"""
+        gw = make_gw()
+        try:
+            for i, (tag, value) in enumerate(self.ILLEGAL):
+                sid = "SG%d" % i
+                status, body = gw._do_order(self._body(sid, value))
+                self.assertEqual(status, 400, "%s 未被拒绝: %s" % (tag, body))
+                self.assertFalse(body["ok"])
+                self.assertIn("side", body["err"])
+                # 错误里必须带「实际收到的值」——空串/空格这类肉眼不可见的形态尤其需要 repr
+                self.assertIn(repr(value), body["err"], "%s 错误未回显原值: %s" % (tag, body))
+                # 非法方向绝不允许留下任何委托行（占位或已报都不行）
+                self.assertIsNone(gw.store.order_by_signal(sid),
+                                  "%s 拒单后仍留下委托行" % tag)
+        finally:
+            gw.stop()
+
+    def test_illegal_side_does_not_consume_idempotency_slot(self):
+        """方向拒单与金额帽同口径：发生在 claim 之前 → 同 signal_id 修正方向后真正受理。"""
+        gw = make_gw()
+        try:
+            s1, _ = gw._do_order(self._body("SG-RETRY", "buy"))
+            self.assertEqual(s1, 400)
+            s2, b2 = gw._do_order(self._body("SG-RETRY", "买入"))
+            self.assertEqual(s2, 200, "非法方向拒单不应锁死 signal_id（§M-2 同族死锁）: %s" % b2)
+            self.assertTrue(b2["ok"])
+        finally:
+            gw.stop()
+
+    def test_valid_sides_still_pass(self):
+        """白名单不误伤存量合法方向：买入/卖出照常受理。"""
+        gw = make_gw(seed=[{"ts_code": "600519.SH", "name": "贵州茅台", "qty": 200,
+                            "cost_price": 10, "highest_price": 10}])
+        try:
+            s1, b1 = gw._do_order(self._body("SG-OK-BUY", "买入"))
+            self.assertEqual(s1, 200, b1)
+            s2, b2 = gw._do_order(self._body("SG-OK-SELL", "卖出"))
+            self.assertEqual(s2, 200, b2)
+        finally:
+            gw.stop()
+
+    def test_channel_layer_rejects_illegal_side_before_enqueue(self):
+        """§SIDEGATE-PY 第二道闸：QueuedBroker 入队前拒非法方向（派发队列必须为空）。"""
+        gw = make_gw()
+        try:
+            qb = QueuedBroker(gw.store, account="M", heartbeat_timeout_sec=15, user_id="u")
+            for value in ("buy", "", " 买入 "):
+                ok, ref, err = qb.place_order(self._body("SG-CH", value))
+                self.assertFalse(ok, "非法方向 %r 竟然入队" % value)
+                self.assertEqual(ref, "")
+                self.assertIn("invalid side", err)
+            self.assertEqual(gw.store.dispatch_pending(limit=5), [],
+                             "非法方向不得进入派发队列（桥侧 else 分支会下成卖单）")
+        finally:
+            gw.stop()
 
 
 class TestGatewayAmountCap(unittest.TestCase):

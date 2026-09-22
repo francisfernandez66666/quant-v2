@@ -1267,16 +1267,28 @@ test.describe('权限硬锁 · §3.1-4 成员直连 API + §M13 轮询止血', (
       await p2.evaluate((t) => localStorage.setItem('liangzai_token', t), tok)
       // 采集窗口：只盯 Quant 页轮询的那几个 admin 端点，别把 App 外壳的只读拉取算进来
       const hits = []
-      const ADMIN_EP = /\/api\/(config\/qmt|qmt\/(state|orders|trades|broker|settle)|risk\/gates|paper\/state|short\/status)/
-      p2.on('request', (r) => { if (ADMIN_EP.test(r.url())) hits.push(r.url().replace(/^[^/]*\/\/[^/]*/, '')) })
+      // §N-2（FIX_PLAN_20260922PM，2026-09-22 修复批）断言口径拆分：
+      // 旧 ADMIN_EP 一把正则把 /api/short/status、/api/paper/state 也算进「Quant 页 admin 组」，
+      // 与上一行注释自相矛盾——/api/short/status 那发实际来自 App.jsx:232 的壳层 60s 轮询
+      // （与 Quant 页止血无关），把它计入「403 后零增长」必然假红（MP-3 的测试口径半）。
+      // 现在拆两组：QUANT_POLL_EP=Quant 页自身轮询的 admin 端点（纳入零增长断言）；
+      // SHELL_EP=App 外壳只读拉取（照常采集进 hits 供首屏反查，但不纳入本用例断言）。
+      // English: §N-2 — split the over-broad ADMIN_EP: only the Quant page's own admin polling
+      // endpoints must show zero growth after 403; shell-level read pulls are collected but excluded.
+      const QUANT_POLL_EP = /\/api\/(config\/qmt|qmt\/(state|orders|trades|broker|settle)|risk\/gates)/
+      const SHELL_EP = /\/api\/(paper\/state|short\/status)/
+      p2.on('request', (r) => { const u = r.url(); if (QUANT_POLL_EP.test(u) || SHELL_EP.test(u)) hits.push(u.replace(/^[^/]*\/\/[^/]*/, '')) })
       await p2.goto('/#/quant')
       await expect(p2.getByText('无权限访问量化交易'), 'tester 进 Quant 页应落无权限面板')
         .toBeVisible({ timeout: 20000 })
-      const before = hits.length
-      expect(before, '首屏至少打过 admin 端点（否则本用例没测到东西）').toBeGreaterThan(0)
+      // §N-2：断言只对 Quant 页自身轮询端点收口（shell 组仅采集不断言，见上方拆分注释）。
+      // 注意 hits 是监听器持续 push 的数组，前后计数都必须在各自时刻现算，不能先 slice 快照。
+      const quantOnly = () => hits.filter((u) => QUANT_POLL_EP.test(u))
+      const before = quantOnly().length
+      expect(before, '首屏至少打过 Quant 页 admin 端点（否则本用例没测到东西）').toBeGreaterThan(0)
       // 等过 10s 与 30s 两根定时器的节拍（留 2s 余量）：修复后不得再有新请求
       await p2.waitForTimeout(14000)
-      const grew = hits.slice(before)
+      const grew = quantOnly().slice(before)
       expect(grew, '§M13：forbidden 后仍在刷 admin 端点（403 灌 opslog）: ' + grew.join(' , ')).toEqual([])
       await p2.screenshot({ path: `${SHOT}/branch-m13-quant-403-stop.png`, fullPage: true })
     } finally {

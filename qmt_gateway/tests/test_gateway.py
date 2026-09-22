@@ -4,8 +4,11 @@
 
 覆盖：store 加权成本/最高价单调/清仓删行、全量对账、signal_id 幂等、handler 回报推送、
 HTTP 端到端（/order → mock 成交 → handler 推送首尔 → /state 校验）。无需 Windows/xtquant。
+§M-2（2026-09-22 修复批）：见 TestM2PendingLeak——下单窗口抛异常不再遗留 pending 占位
+（同 signal_id 可再次受理），运行期巡检只解锁超龄本地占位、绝不重发。
 """
 import json
+import inspect
 import os
 import sys
 import tempfile
@@ -613,6 +616,148 @@ class TestGatewayHTTP(unittest.TestCase):
             "price": "abc", "qty": "xyz", "created_at": "t",
         })
         self.assertEqual(status, 400)
+
+
+class TestM2PendingLeak(unittest.TestCase):
+    """§M-2（2026-09-22 修复批）下单窗口异常不再遗留 pending 占位 + 运行期巡检兜底。
+
+    缺陷原文：`gateway.py:1042` 的 `place_order` 裸调用没有 try 包裹，通道抛异常时
+    异常被 `_Handler._dispatch`（:1225 的 §G8 顶层保护）吞成 500，**但已抢到的 pending
+    占位不会 release**；而 `release_stale_pending` 只在 `start()`（:258-262）调一次、
+    运行期 `_dispatch_reap_loop`（:494-502）只清 dispatch 的 inflight 不清 orders 的
+    pending → 同 signal_id 之后每次重试恒 409「duplicate signal_id in-flight」，
+    该信号永久死锁。
+    本类锁两个不变式：① 未 settle 的路径（异常/settle 失败）绝不遗留占位，且网关
+    自身不重发；② 运行期巡检只解锁超龄**本地占位**，不重排、不重发（ids.py 的
+    「不重复下单」fail-safe 语义必须原样保留）。
+    """
+
+    def _gw(self):
+        """构造一台不启动 HTTP 的 mock 通道网关（只驱动 _do_order 的业务段）。"""
+        fd, dbpath = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(dbpath)
+        return Gateway({"listen": "127.0.0.1:0", "token": "tk", "broker": "mock",
+                        "account": "M", "db": dbpath, "report_url": "",
+                        "reconcile_sec": 0, "seed": []})
+
+    def _body(self, sid, side="买入"):
+        """600519 一手限价单：只换 signal_id/方向，其余与实盘同形。"""
+        return {"signal_id": sid, "code": "600519.SH", "side": side,
+                "price_type": "limit", "price": 10, "qty": 100,
+                "amount": 1000, "created_at": "t"}
+
+    def test_place_order_exception_releases_claim_and_allows_retry(self):
+        """place_order 抛异常 → 500 且占位释放 → 同 signal_id 可再次真正受理。"""
+        gw = self._gw()
+        real = gw.active_broker
+
+        class _BoomBroker(object):
+            """通道桩：place_order 必抛异常（复刻 xt IPC 抖动 / 桥写文件失败）。"""
+
+            def is_connected(self):
+                return True
+
+            def place_order(self, req):
+                raise RuntimeError("xt IPC boom")
+
+        gw.active_broker = _BoomBroker()
+        try:
+            status, body = gw._do_order(self._body("M2A"))
+            self.assertEqual(status, 500, "异常必须显式回 500（不得静默成 200/409）")
+            self.assertFalse(body["ok"])
+            self.assertIn("boom", body["err"])
+            # 关键断言：占位已释放，orders 里不留 pending 行
+            self.assertIsNone(gw.store.order_by_signal("M2A"),
+                              "§M-2 异常路径遗留了 pending 占位（旧缺陷现场）")
+            # 通道恢复后同 signal_id 重试：旧实现此处恒 409
+            gw.active_broker = real
+            s2, b2 = gw._do_order(self._body("M2A"))
+            self.assertEqual(s2, 200, "异常后同 signal_id 无法再次受理: %s" % b2)
+            self.assertTrue(b2["ok"])
+        finally:
+            gw.active_broker = real
+            gw.stop()
+
+    def test_settle_exception_also_releases_claim(self):
+        """settle 自身抛异常（DB 抖动）同样不留占位——finally 兜底覆盖整个未 settle 窗口。"""
+        gw = self._gw()
+        original = gw.ids.settle
+        try:
+            gw.ids.settle = lambda order: (_ for _ in ()).throw(RuntimeError("db locked"))
+            status, body = gw._do_order(self._body("M2B"))
+            self.assertEqual(status, 500)
+            self.assertIsNone(gw.store.order_by_signal("M2B"))
+        finally:
+            gw.ids.settle = original
+            gw.stop()
+
+    def test_failed_place_still_releases_once_only(self):
+        """broker 返回失败的既有语义不变：释放占位 + 400，且不会留下 pending 行。"""
+        gw = self._gw()
+        real = gw.active_broker
+
+        class _Reject(object):
+            def is_connected(self):
+                return True
+
+            def place_order(self, req):
+                return False, "", "counter rejected"
+
+        gw.active_broker = _Reject()
+        try:
+            status, body = gw._do_order(self._body("M2C"))
+            self.assertEqual(status, 400)
+            self.assertIn("counter rejected", body["err"])
+            self.assertIsNone(gw.store.order_by_signal("M2C"))
+        finally:
+            gw.active_broker = real
+            gw.stop()
+
+    def test_runtime_sweep_releases_only_stale_local_placeholder(self):
+        """§M-2 巡检：只删超龄本地占位（默认 600s），未超龄保留，且**绝不重发**订单。"""
+        gw = self._gw()
+        old_ts = (datetime.now(CN_TZ) - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        fresh_ts = (datetime.now(CN_TZ) - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        try:
+            self.assertTrue(gw.store.claim_order({
+                "signal_id": "M2-OLD", "code": "600519.SH", "side": "买入",
+                "price": 10.0, "qty": 100, "created_at": old_ts})[0])
+            self.assertTrue(gw.store.claim_order({
+                "signal_id": "M2-NEW", "code": "600519.SH", "side": "买入",
+                "price": 10.0, "qty": 100, "created_at": fresh_ts})[0])
+            n = gw._sweep_stale_pending("单测")
+            self.assertEqual(n, 1, "只应释放超龄的那一条占位")
+            self.assertIsNone(gw.store.order_by_signal("M2-OLD"), "超龄占位未解锁")
+            row = gw.store.order_by_signal("M2-NEW")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "pending", "未超龄占位被误删（在途单窗口）")
+            # 「只解锁不重发」硬断言：清理只是删掉超龄占位行，行数不增、也不产生新单
+            self.assertEqual(len(gw.store.list_orders()), 1,
+                             "巡检后委托行数 != 1 → 要么多删了未超龄行，要么发生了隐式重发")
+            self.assertEqual(gw.store.dispatch_pending(limit=5), [],
+                             "§M-2 巡检不得把清理掉的占位重新排进派发队列")
+        finally:
+            gw.stop()
+
+    def test_sweep_disabled_by_zero_threshold(self):
+        """pending_stale_sec=0 → 巡检关闭（保留运维"完全关闭自动解锁"的开关）。"""
+        gw = self._gw()
+        gw.cfg["pending_stale_sec"] = 0
+        old_ts = (datetime.now(CN_TZ) - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        try:
+            gw.store.claim_order({"signal_id": "M2-OFF", "code": "600519.SH", "side": "买入",
+                                  "price": 10.0, "qty": 100, "created_at": old_ts})
+            self.assertEqual(gw._sweep_stale_pending(), 0)
+            self.assertIsNotNone(gw.store.order_by_signal("M2-OFF"), "关闭开关后仍被清理")
+        finally:
+            gw.stop()
+
+    def test_reap_loop_calls_pending_sweep(self):
+        """§M-2 巡检接线：运行期 reap 循环必须真的调用 pending 清理（旧循环只清 inflight）。"""
+        src = inspect.getsource(Gateway._dispatch_reap_loop)
+        self.assertIn("_sweep_stale_pending()", src,
+                      "reap 循环未接入 pending 巡检 → 运行期占位依旧无人解锁")
 
 
 if __name__ == "__main__":

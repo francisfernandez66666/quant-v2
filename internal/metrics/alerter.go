@@ -42,6 +42,10 @@ func DefaultAlertRules() []AlertRule {
 		// 一次超预算即异常，不等第二十五次）。
 		{Name: "sse_broadcast_skipped", Metric: "sse_broadcast_skipped_total", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "SSE 广播锁超预算丢推送（上行回报入口曾被堵住的同族形态）"},
 		{Name: "settlement_diff", Metric: "settlement_diff_count", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "交割单对账出现差异"},
+		// §D4（2026-09-22 PM 修复批）：日终结算失败当日会按 10 分钟节流自动重试，本规则盯"当日
+		// 连续失败次数"（settlement.go 失败抬升、成功归零，是真实赋值不是 N-1 那种死规则）。
+		// 触发即说明三方对账这道日终安全网今天到目前为止没跑成——差异/漏单不会被发现。
+		{Name: "settle_failed", Metric: "settle_fail_streak", Op: "gt", Threshold: 0, For: "0s", Level: "p2", Message: "交割单三方对账失败（当日自动重试中，成功后自动恢复）"},
 		{Name: "llm_cooldown", Metric: "llm_cooldown_count", Op: "gt", Threshold: 2, For: "60s", Level: "p2", Message: "LLM 冷却数超阈值"},
 		// §AUDIT-PM 2026-09-15 buyCh 深度预警：容量 64，过半仍在排 = 下单风暴或网关变慢（P2）。
 		{Name: "buy_queue_high", Metric: "buy_queue_depth", Op: "gt", Threshold: 32, For: "60s", Level: "p2", Message: "自动买入队列积压 >32（网关变慢或信号风暴）"},

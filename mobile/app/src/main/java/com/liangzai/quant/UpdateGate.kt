@@ -92,7 +92,16 @@ object UpdateGate {
         }
     }
 
-    /** 强制更新对话框：不可取消（点外/back 均拦），正按钮去下载、负按钮退出。 */
+    /**
+     * 更新对话框。两条分支（§N-3，2026-09-22 修复批，由低危升中危后收口）：
+     *  ① apk_url 非空：维持「不可取消」强更语义——点外不关、BACK 显式吞掉，
+     *    出口只有「去下载 / 退出」，低版本确知有害才配 min_version_code；
+     *  ② apk_url 为空（服务端漏配下载直链）：降级为可取消/可跳过的升级提醒。
+     *    旧实现此形态下唯一出口是「退出」，旧包设备被硬闸在门外——那是配置事故而非
+     *    版本有害，不该由用户买单；提示照常弹，但点外/BACK/「暂不更新」都能继续使用。
+     * English: §N-3 — a hard gate is only legitimate when a download path exists; with an empty
+     * apk_url the dialog degrades to a dismissible reminder instead of trapping the device on "Exit".
+     */
     private fun showDialog(activity: MainActivity, note: String, apkUrl: String) {
         if (activity.isFinishing || activity.isDestroyed) {
             return
@@ -102,26 +111,34 @@ object UpdateGate {
         } else {
             note
         }
+        if (apkUrl.isBlank()) {
+            // §N-3 分支②：无下载通道的「软提醒」——可取消、不吞 BACK、给「暂不更新」出口
+            val soft = AlertDialog.Builder(activity)
+                .setTitle("版本更新提醒")
+                .setMessage(message + "\n\n（服务器暂未提供新版本下载地址，本次提醒可直接关闭，不影响使用。）")
+                .setCancelable(true)
+                .setPositiveButton("暂不更新") { d, _ -> d.dismiss() }
+                .setNegativeButton("退出") { _, _ -> activity.finish() }
+                .create()
+            soft.show()
+            return
+        }
         val dialog = AlertDialog.Builder(activity)
             .setTitle("需要更新")
             .setMessage(message)
             .setCancelable(false)
             // back 键拦截：setCancelable(false) 已挡点外取消，这里再显式吞掉 BACK 按下事件，
-            // 双保险确保对话框只能走「去下载/退出」两个出口
+            // 双保险确保对话框只能走「去下载/退出」两个出口（仅 apk_url 非空的硬闸分支保留此语义）
             .setOnKeyListener { _, keyCode, _ -> keyCode == KeyEvent.KEYCODE_BACK }
-            .apply {
-                if (apkUrl.isNotBlank()) {
-                    setPositiveButton("去下载") { _, _ ->
-                        try {
-                            // 交给系统浏览器/下载器打开 APK 直链；无匹配应用时兜底 Toast 提示
-                            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(apkUrl)))
-                        } catch (e: ActivityNotFoundException) {
-                            Toast.makeText(activity, "未找到可打开下载链接的应用", Toast.LENGTH_LONG).show()
-                        }
-                    }
+            .setPositiveButton("去下载") { _, _ ->
+                try {
+                    // 交给系统浏览器/下载器打开 APK 直链；无匹配应用时兜底 Toast 提示
+                    activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(apkUrl)))
+                } catch (e: ActivityNotFoundException) {
+                    Toast.makeText(activity, "未找到可打开下载链接的应用", Toast.LENGTH_LONG).show()
                 }
-                setNegativeButton("退出") { _, _ -> activity.finish() }
             }
+            .setNegativeButton("退出") { _, _ -> activity.finish() }
             .create()
         dialog.show()
     }

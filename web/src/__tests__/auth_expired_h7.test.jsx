@@ -25,6 +25,9 @@ function apiMockBase() {
     refreshMe: vi.fn(async () => ({ role: 'user', perms: [] })),
     login: vi.fn(async () => ({})),
     logout: vi.fn(),
+    // §M-11（2026-09-22 修复批）App.checkAuth 恢复登录态后会补报推送账号（api.syncPushAccount），
+    // mock 基座必须覆盖该导出，否则属性访问即抛「No export defined on mock」。
+    syncPushAccount: vi.fn(),
     fetchStatus: vi.fn(async () => ({ signal_count: 0, in_trade_time: false, active: false })),
     fetchAlerts: vi.fn(async () => []),
     fetchShortStatus: vi.fn(async () => ({ short_enabled: false })),

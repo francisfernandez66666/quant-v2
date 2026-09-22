@@ -288,6 +288,14 @@ class _XtOps:
         self.order_type = int(pp.get("order_type", 1101))
         self.pr_limit = int(pp.get("pr_limit", 11))
         self.pr_market = int(pp.get("pr_market", 5))
+        # M-3 (2026-09-22 fix batch, carried in gateway.py's Chinese commentary): did the
+        # LAST resolve_order_id() actually see the order in the counter's ORDER table?
+        # passorder() not raising is NOT proof of acceptance -- the counter can still
+        # refuse the order a moment later, and the order leg used to be reported as
+        # plain "accepted" forever (the fill leg has _bridge_tick DEAL polling as a
+        # compensation loop, the order leg had none). Default True keeps every legacy
+        # caller/test behaviour; only a confirmed "ORDER never showed up" flips it False.
+        self.last_resolve_confirmed = True
 
     # ---- QMT model-sandbox BUILTIN API (primary since 2026-09-11) ------------------
     # XtQuantTrader is the miniQMT/standalone-trading EXTERNAL interface. The strategy
@@ -785,33 +793,57 @@ class _XtOps:
 
     def resolve_order_id(self, signal_id, pending_ref, req=None):
         """poll orders by order_remark(signal_id) -> exchange order id (for gateway
-        seq->exchange mapping and later cancels). dry_run keeps the dry ref."""
+        seq->exchange mapping and later cancels). dry_run keeps the dry ref.
+
+        M-3 (2026-09-22 fix batch) second leg of the order-status confirmation:
+        besides the resolved id this call now records WHETHER the counter actually
+        showed our order (self.last_resolve_confirmed). Rationale: embed_place()
+        returns True as soon as passorder() does not raise, which is only proof that
+        the call was accepted by the client -- the counter can still refuse the order
+        a moment later, and with no confirmation the gateway used to report a plain
+        "accepted" forever (the deal leg has _bridge_tick's DEAL polling, the order
+        leg had no second check at all). This flag is pure observability: it never
+        changes ok, never re-sends, and the seq-based idempotency anchor is intact.
+        """
+        # Default to "confirmed": dry-run and signal-less legacy calls have no counter
+        # lookup to confirm against and must not be downgraded by this change.
         # FIX 2026-09-14 drill-3: the embed call used to pass signal_id (a string)
         # into embed_resolve(req) -> AttributeError on req.get("code") -> the whole
         # _handle_cmd body after place() died before _report/_record_seen, so the
         # gateway never got a result and the bridge re-PLACED the order every poll
         # (~220 submissions in 4 min -- counter-side storm, caught by quickTrade=0
         # only because none of them reached the exchange). Never trust callers.
+        self.last_resolve_confirmed = True
         try:
             if self.dry_run or not signal_id:
                 return pending_ref
             if self.embed_usable():
                 oid = self.embed_resolve(req or {}, signal_id)
+                # Empty result == the ORDER table never showed this order inside the
+                # poll window (8s). Keep the seq ref as the reference, but say so.
+                self.last_resolve_confirmed = bool(oid)
                 return oid or pending_ref
             for _ in range(3):
                 try:
                     orders = self._trader.query_stock_orders(self._acc) or []
                 except Exception:
+                    # Query failed => we genuinely do not know: report unconfirmed.
+                    self.last_resolve_confirmed = False
                     return pending_ref
                 for o in orders:
                     remark = str(getattr(o, "order_remark", "") or getattr(o, "remark", "") or "")
                     if remark == signal_id:
                         oid = str(getattr(o, "order_id", "") or "")
                         if oid:
+                            self.last_resolve_confirmed = True
                             return oid
                 time.sleep(1.0)
+            self.last_resolve_confirmed = False  # polled 3 rounds, order never seen
         except Exception as e:
             _trace("resolve_order_id error: " + repr(e))
+            # A crash here is exactly the "we do not know" case (the old code fell
+            # through silently while the gateway still reported accepted).
+            self.last_resolve_confirmed = False
         return pending_ref
 
     def cancel(self, seq, exchange_order_id, code=""):
@@ -1049,9 +1081,22 @@ def _handle_cmd(cmd, seen):
                                                       order_id, cmd)
                 except Exception as e:
                     _trace("resolve error (kept seq ref): " + repr(e))
-            _report({"type": "order_result", "seq": seq, "ok": ok,
-                     "order_id": order_id, "err": err})
-            _trace("order_result seq=%s ok=%s oid=%s" % (seq, ok, order_id))
+            result = {"type": "order_result", "seq": seq, "ok": ok,
+                      "order_id": order_id, "err": err}
+            # M-3 (2026-09-22 fix batch) order-leg second confirmation.
+            # Defect: passorder() not raising was taken as "the counter accepted the
+            # order", so the bridge reported ok=True and the gateway forwarded a plain
+            # "accepted" status -- if the counter refused it a moment later nothing ever
+            # corrected that row (the deal leg has DEAL polling, the order leg had none).
+            # Fix: publish whether the ORDER-table lookup actually saw the order. This
+            # is an EXTRA field only -- ok/seq keep their exact meaning (idempotency
+            # anchor untouched, no re-send, dispatch row still settles on this report),
+            # so an older gateway simply ignores it.
+            if ok:
+                result["order_confirmed"] = bool(getattr(_xt(), "last_resolve_confirmed", True))
+            _report(result)
+            _trace("order_result seq=%s ok=%s oid=%s confirmed=%s" % (
+                seq, ok, order_id, result.get("order_confirmed")))
         elif kind == "cancel":
             try:
                 ok, err = _xt().cancel(seq, cmd.get("order_id"), cmd.get("code"))

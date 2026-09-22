@@ -166,6 +166,10 @@ export default function App() {
       try { await api.refreshMe() } catch (_) {}
       setMeChecked(true)
       applyRoleGates()
+      // §M-11（2026-09-22 修复批）恢复登录态时把账号补报原生壳（仅 WebView 桥存在时生效）：
+      // 覆盖旧版 APK 升级/首装迁移后壳侧从未收到账号、极光别名仍停在默认 quant_owner 的窗口。
+      // typeof 守卫：测试桩/裁剪版 api 模块可能整体未导出该函数，缺即跳过不炸登录链。
+      if (typeof api.syncPushAccount === 'function') api.syncPushAccount()
       return true
     }
     setLoggedIn(false)

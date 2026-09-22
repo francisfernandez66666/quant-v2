@@ -366,9 +366,28 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "qmt not enabled")
 		return
 	}
+	// §SIDEGATE-GO（2026-09-22 修复批，M-1/N-4 Go 层收口）方向白名单：只接受 买入/卖出 两值。
+	// 缺陷原文：旧实现 `side := req.Side; if side == "" { side = trading.SideBuy }` 只把**空串**
+	// 缺省成买入，其余任意字符串（"buy"/"SELL"/"卖出 "带空格/"买"）都原样透传到控制器→网关→broker，
+	// 而 broker 的语义是「side 不等于 '买入' 就下卖单」——用户在前端选了买入、请求体里方向被写成
+	// "BUY"，实际落到柜台的是一张**卖单**（方向翻转），同时因 risk.Gate 各闸按精确串匹配而连带
+	// 跳过 T+1/涨停/跌停三道方向闸（该族失效已在 §N-4 于闸内 fail-close 兜底）。
+	// 为何在 HTTP 入口就拒：方向翻转属于资金安全级错误，必须在最外层以 400 明确告知调用方
+	// 「你传的方向我们不认」，而不是猜一个默认值继续往下走；空串仍保留"缺省买入"的既有契约
+	// （前端缺省行为不变），仅非法值拒。
+	// English: §SIDEGATE-GO — hard whitelist at the manual-order HTTP entry. Anything other than the
+	// two canonical sides (empty string still defaults to buy for back-compat) is rejected with 400,
+	// because downstream the broker treats "not 买入" as a SELL: a non-canonical side would flip the
+	// direction and simultaneously skip every directional risk gate.
 	side := req.Side // 方向缺省按买入（与前端缺省行为一致）
 	if side == "" {
 		side = trading.SideBuy
+	}
+	if side != trading.SideBuy && side != trading.SideSell {
+		log.Printf("[security] 手动下单方向非法被拒 用户=%s code=%s side=%q", uid, req.Code, req.Side)
+		opslog.Audit("live_order_side_reject", uid, req.Code, fmt.Sprintf("side=%q 只接受 %s/%s", req.Side, trading.SideBuy, trading.SideSell))
+		writeError(w, 400, fmt.Sprintf("非法下单方向(side=%q)：只接受 %s/%s", req.Side, trading.SideBuy, trading.SideSell))
+		return
 	}
 	// 基础参数校验：代码/数量/价格三者缺一不可（价格是限价参考价，0 价无意义）。
 	if req.Code == "" || req.Qty <= 0 || req.Price <= 0 {
@@ -764,19 +783,30 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 
 	// SSE 推前端：无论事件类型，统一以 qmt_report 事件向归属账号定向广播摘要
 	// （前端实盘页据此即时刷新；完整明细以 DB/各专用事件为准）。
-	// §UPDLINK（2026-09-22 H-4）：这里改用**有界广播**（2s 预算）。账本已经落库、前端刷新只是
+	// §M13（2026-09-22 修复批）载荷补 tripped：Positions.jsx 用 `!!msg.tripped` 直接覆盖熔断位，
+	// 而旧载荷**根本没有 tripped 字段** → 任意一笔成交/委托回报都会把「熔断中」徽标瞬清成
+	// 「正常」，要等同账号下一次 loadReal（一个 RTT）才纠回来。资金拦截本身没失守
+	// （下单口有权威闸），坏的是呈现层——所以后端必须把权威熔断状态随广播带出去。
+	// 只读语义：ctrl.Tripped() 是 RLock 读，不改变任何熔断状态；无控制器（未启用实盘）时为 false，
+	// 与 REST 侧 ctrlTripped 的口径完全一致。event/at 两个键保留既有形状（type 已是 event 值、
+	// time 仍是 HH:MM:SS），此处只增字段、不改名不删字段，前端旧消费者零影响。
+	// English: §M13 — the qmt_report payload now carries the authoritative breaker state (read-only)
+	// so the frontend badge can't be silently cleared by an unrelated report; fields are additive only.
+	// §UPDLINK（2026-09-22 H-4）：这里用**有界广播**（2s 预算）。账本已经落库、前端刷新只是
 	// 尽力而为（轮询/REST 兜底在位），而 2026-09-22 的生产实录证明无界等待会把整条上行入口
 	// 陪葬：SSE 广播锁被一次 double-close panic 永久占住后，每个回报 POST 都堵在 BroadcastTo 上，
 	// positions/account 冻结 1h45m、资金闸拿着上午的碎钱值把当日买入全拦。宁可丢推送不丢账。
 	if s.sse != nil {
 		s.sse.BroadcastToWithin(uid, map[string]interface{}{
-			"type":  "qmt_report",
-			"event": ev.Type,
-			"code":  ev.Code,
-			"side":  ev.Side,
-			"price": ev.Price,
-			"qty":   ev.Qty,
-			"time":  time.Now().Format("15:04:05"),
+			"type":    "qmt_report",
+			"event":   ev.Type,
+			"code":    ev.Code,
+			"side":    ev.Side,
+			"price":   ev.Price,
+			"qty":     ev.Qty,
+			"time":    time.Now().Format("15:04:05"),
+			"at":      time.Now().Format(time.RFC3339),
+			"tripped": ctrl != nil && ctrl.Tripped(),
 		}, 2*time.Second)
 	}
 	// 回报受理成功，返回 ok 让网关 outbox 标记完成（否则会重推）。

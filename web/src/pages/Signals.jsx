@@ -75,6 +75,10 @@ export default function Signals() {
   const [q, setQ] = useState('')
   // §F1 首屏加载态：区分"还没取到数据"与"取到了但没有信号"
   const [loading, setLoading] = useState(true)
+  // §M-9（2026-09-22 修复批）三态分离：error 独立成态。旧实现首载失败被 catch 吞掉后
+  // 落到 :466 的 empty="暂无信号"，用户把「后端 500」读成「今天真没信号」。
+  // English: §M-9 — load errors render their own retryable banner instead of the empty state.
+  const [loadErr, setLoadErr] = useState('')
   // 买入/忽略确认弹窗显隐
   const [showConfirm, setShowConfirm] = useState(false)
   // 日志弹窗显隐
@@ -226,8 +230,15 @@ export default function Signals() {
   }
 
   // 加载当前策略信号列表
+  // §M-9（2026-09-22 修复批）失败置 error 态（可重试横幅），成功清态；
+  // 轮询期间的瞬时失败保留旧列表，只在列表尚空时展示错误分支，避免闪扰。
   async function load() {
-    try { setSignals(await api.fetchSignals()) } catch (_) {}
+    try {
+      setSignals(await api.fetchSignals())
+      setLoadErr('')
+    } catch (e) {
+      setLoadErr(e && e.message ? String(e.message) : '信号列表加载失败（网络/服务异常）')
+    }
     // §F1 首屏 loading 结束（后续 5s 轮询不重复转 loading，仅首帧需要）
     setLoading(false)
   }
@@ -441,6 +452,15 @@ export default function Signals() {
         </div>
       </Card>
 
+      {/* §M-9（2026-09-22 修复批）错误态独立横幅：轮询失败但仍有旧列表时保留数据展示、另给可重试提示；
+          空列表分支见下方 Table empty 三态（loading / error / empty 互不共用）。 */}
+      {loadErr && (
+        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 6, background: 'var(--app-warn-bg, #fff7e6)', border: '1px solid var(--app-warn-border, #ffd591)', color: 'var(--td-warning-color)', fontSize: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span>⚠ 信号加载失败：{loadErr}（下方列表为上一次成功数据或空，不代表服务器现状）</span>
+          <Button size="small" variant="outline" theme="warning" onClick={load}>重试</Button>
+        </div>
+      )}
+
       {/* 信号表格：展示筛选后的策略信号列表，支持表头排序、展开行时图、行点击触发移动端面板 */}
       <Card>
         <Table
@@ -463,7 +483,9 @@ export default function Signals() {
           // §F1 长列表固定表头：滚动时列名不再消失（信号一页全显后尤其需要）
           fixedHeader
           maxHeight="calc(100vh - 268px)"
-          empty="暂无信号"
+          // §M-9（2026-09-22 修复批）空行三态分离：loading=加载中 / error=失败可重试（上方横幅已含
+          // 详情，这里只给短文案）/ 真空=「暂无信号」。旧实现错误伪装成空态。
+          empty={loading ? '加载信号中…' : loadErr ? '信号加载失败，请点上方「重试」' : '暂无信号'}
         />
       </Card>
 
