@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -119,7 +120,14 @@ func (m *MarketAPI) GetTencentKLine(code string, count int) ([]KLine, error) {
 		}
 		rows := stk.QfqDay
 		if len(rows) == 0 {
-			rows = stk.Day
+			// §H3（2026-09-22 PM 批）：旧实现在此静默回退 stk.Day（**不复权**数组）——调用方
+			// 按函数名/注释拿到的却是"前复权"数据，全系统复权契约（market.go klineFQT）当场
+			// 击穿，除权日 MA/涨跌幅失真且无任何痕迹。现明确拒收：降级与否交给调用链
+			// （打分链 §H3 会把本源拒绝视为"qfq 不可用"，落到带标记的不复权兜底）。
+			// English: §H3 — refuse the silent unadjusted fallback; callers treat this source
+			// as unavailable rather than receiving mislabeled bars.
+			log.Printf("[tencent] %s qfqday 缺失，拒绝回退不复权日K（§H3 复权契约）", code)
+			return nil, fmt.Errorf("tencent %s qfqday missing (unadjusted fallback refused, §H3)", code)
 		}
 		return parseTencentKLine(rows, false)
 	})

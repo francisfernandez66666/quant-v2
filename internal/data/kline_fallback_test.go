@@ -2,6 +2,8 @@
 package data
 
 import (
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -83,6 +85,26 @@ func TestParseTencentKLineInvalid(t *testing.T) {
 	}
 	if err != nil && !strings.Contains(err.Error(), "no valid rows") {
 		t.Errorf("错误信息应含 no valid rows, got %v", err)
+	}
+}
+
+// TestGetTencentKLineRefusesUnadjustedFallback §H3（2026-09-22 PM 批）：响应只有不复权
+// "day" 数组（无 qfqday）时 GetTencentKLine 必须**报错拒收**——旧实现静默回退 stk.Day，
+// 调用方按"前复权"名义拿到不复权数据，除权日 MA/涨跌幅失真且无痕。
+// English: §H3 — with qfqday absent the client must refuse instead of passing unadjusted bars
+// under the qfq label.
+func TestGetTencentKLineRefusesUnadjustedFallback(t *testing.T) {
+	m := NewMarketAPI()
+	m.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"code":0,"msg":"","data":{"sh600206":{"day":[["2026-08-06","45.80","48.79","48.79","45.50","1030100.000"]]}}}`
+		return &http.Response{
+			StatusCode: 200, Status: "200 OK",
+			Header: http.Header{"Content-Type": []string{"application/json"}},
+			Body:   io.NopCloser(strings.NewReader(body)),
+		}, nil
+	}))
+	if _, err := m.GetTencentKLine("600206", 5); err == nil || !strings.Contains(err.Error(), "qfqday missing") {
+		t.Fatalf("无 qfqday 应拒收并报错，got err=%v", err)
 	}
 }
 

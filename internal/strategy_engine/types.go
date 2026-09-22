@@ -72,11 +72,17 @@ type FinancialData struct {
 // （StockMarketData holds one stock's market data: live price, bars, money flow, minute volume/MACD. Filled by
 // Evaluate / BuildScoringData and consumed by 8a/8b scoring, strategy scoring and signal scanning.）
 type StockMarketData struct {
-	Code        string            `json:"code"`                   // 股票代码（Stock code）
-	Name        string            `json:"name"`                   // 股票名称（Stock name）
-	Price       float64           `json:"price"`                  // 最新价（Latest price）
-	ChangePct   float64           `json:"change_pct"`             // 涨跌幅（Change %）
-	KLines      []data.KLine      `json:"k_lines,omitempty"`      // 日K线数据（近120根，趋势/均线类战法使用）（Daily bars, ~120, for trend/MA strategies）
+	Code      string       `json:"code"`              // 股票代码（Stock code）
+	Name      string       `json:"name"`              // 股票名称（Stock name）
+	Price     float64      `json:"price"`             // 最新价（Latest price）
+	ChangePct float64      `json:"change_pct"`        // 涨跌幅（Change %）
+	KLines    []data.KLine `json:"k_lines,omitempty"` // 日K线数据（近120根，趋势/均线类战法使用；§H3 起**只装复权源**）（Daily bars, adjusted-only since §H3）
+	// KLineUnadj §H3（2026-09-22 PM 批）：true = 该股日K当前只能从**不复权源**兜底取到
+	// （东财/腾讯两条 qfq 链全挂）。不复权序列不会写进 KLines（因子战法自然拒参与），
+	// 此标记供运维/前端识别降级态；除权日 MA/动量/止损价按不复权算会系统性失真。
+	// English: §H3 — true when daily bars are only available from unadjusted sources; such
+	// bars are withheld from KLines so factor strategies refuse them.
+	KLineUnadj  bool              `json:"kline_unadjusted,omitempty"`
 	MoneyFlow   *data.CapitalFlow `json:"money_flow,omitempty"`   // 资金流向（主力净流入）（Capital flow, main-force net inflow）
 	Quote       *data.StockInfo   `json:"quote,omitempty"`        // 实时量价快照（新浪批量/同花顺兜底）（Live quote snapshot, Sina batch / THS fallback）
 	MinuteKLine []data.KLine      `json:"minute_kline,omitempty"` // 分钟K线（5分钟，用于 MACD/动量）（Minute bars, 5-min, for MACD/momentum）

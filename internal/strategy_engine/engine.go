@@ -4,7 +4,7 @@
 //   - Evaluate: 策略评估入口，从新闻事件到交易信号的完整流程
 //   - BuildScoringData: 为近实时打分循环构建行情数据
 //   - 事件归因：将新闻事件按利好/利空方向分流到板块
-//   - 行情数据获取：支持新浪/同花顺/腾讯/东财多源降级
+//   - 行情数据获取：日K复权优先（东财/腾讯 qfq），不复权源仅标记兜底（§H3）
 //
 // （Package strategy_engine is the strategy engine: event attribution, market-data fetching and scoring-pool collection.）
 package strategy_engine
@@ -20,13 +20,14 @@ import (
 
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/newsagent"
+	"quant-trading-v2/internal/opslog"
 )
 
 // Engine 策略引擎，负责事件归因、行情数据拉取、评分池收拢。
 // 这是策略引擎的核心结构体，包含多个缓存和锁机制以支持并发安全的实时评分。
 // 主要职责：
 //   - 事件归因：将新闻事件分流到板块和个股
-//   - 行情数据获取：支持多数据源降级链路（新浪→同花顺→腾讯→东财）
+//   - 行情数据获取：日K复权优先降级链（东财 qfq→腾讯 qfq→不复权源带标记兜底，§H3）
 //   - 评分池收拢：合并Stage2个股、持仓和自选池
 //   - K线和资金流数据缓存（TTL 5分钟）
 //   - 分钟K线数据缓存（TTL 60秒）
@@ -86,6 +87,11 @@ type klineCacheEntry struct {
 	klines    []data.KLine      // 日K线数据（近120根，趋势/均线类战法使用）（Daily bars, ~120, for trend/MA strategies）
 	moneyFlow *data.CapitalFlow // 资金流向（主力净流入）（Capital flow, main-force net inflow）
 	fetchedAt time.Time         // 拉取时间（用于 5 分钟 TTL 判过期）（Fetch time, for the 5-minute TTL check）
+	// §H3（2026-09-22 PM 批）：true = 本轮日K只来自**不复权源**（新浪/同花顺兜底），
+	// 因子打分拒参与（见 applyDayKLine），但 LastClose 等「末根现价」用途仍可用。
+	// English: §H3 — true means the bars came from an UNADJUSTED fallback source; factor
+	// scoring must skip them while last-close style valuation may still use them.
+	unadj bool
 }
 
 // minuteKCacheEntry 分钟K线缓存条目（5分钟48根≈当日；60s TTL）。
@@ -318,8 +324,9 @@ func (e *Engine) fetchMarketData(ctx context.Context, codes []string) map[string
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// 日K：统一降级链 新浪→同花顺→腾讯→东财（Daily bars: unified fallback chain Sina→THS→Tencent→Eastmoney）
-			md.KLines = e.fetchDayKLine(code)
+			// 日K：复权优先降级链 东财(qfq)→腾讯(qfq)→[标记]新浪→[标记]同花顺（§H3）
+			kl, unadj := e.fetchDayKLine(code)
+			applyDayKLine(md, kl, unadj)
 			e.attachLiveBar(md)
 
 			// §信号速度 S0：资金流（fflow）批量调用已停用——全库无评分代码消费 md.MoneyFlow，
@@ -399,7 +406,9 @@ func (e *Engine) BuildScoringData(ctx context.Context, codes []string, quotes ma
 		go func(code string, md *StockMarketData) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			md.KLines, md.MoneyFlow = e.cachedKLine(code)
+			kl, cf, unadj := e.cachedKLine(code)
+			md.MoneyFlow = cf
+			applyDayKLine(md, kl, unadj) // §H3：不复权兜底不进 KLines，只置 KLineUnadj
 			e.attachLiveBar(md)
 			minKL := e.cachedMinuteKLine(code)
 			if len(minKL) >= 2 {
@@ -457,20 +466,20 @@ func (e *Engine) fetchQuotes(codes []string) map[string]*data.StockInfo {
 	return out
 }
 
-// cachedKLine 返回个股日K + 资金流，走 5 分钟 TTL 缓存；缓存缺失/过期时重新拉取。
-// 日K 使用统一降级链：新浪 → 同花顺 → 腾讯 → 东财（任一源可出）。
-// （cachedKLine returns daily bars + capital flow via a 5-minute TTL cache, refetching when missing or expired. Daily bars
-// use the unified Sina→THS→Tencent→Eastmoney fallback chain — any source may satisfy the request.）
-func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
+// cachedKLine 返回个股日K + 资金流 + 不复权标记（§H3），走 5 分钟 TTL 缓存；缓存缺失/过期时重新拉取。
+// 日K 使用复权优先降级链：东财(qfq) → 腾讯(qfq) →（不复权兜底，标记 unadj）新浪 → 同花顺。
+// （cachedKLine returns daily bars + capital flow + the §H3 unadjusted flag via a 5-min TTL cache.
+// Daily bars use the qfq-first chain EastMoney→Tencent, with marked unadjusted Sina/THS last resorts.）
+func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow, bool) {
 	now := time.Now()
 	e.klineCacheMu.RLock()
 	ent, ok := e.klineCache[code]
 	e.klineCacheMu.RUnlock()
 	if ok && now.Sub(ent.fetchedAt) < 5*time.Minute && len(ent.klines) > 0 {
-		return ent.klines, ent.moneyFlow
+		return ent.klines, ent.moneyFlow, ent.unadj
 	}
 
-	klines := e.fetchDayKLine(code)
+	klines, unadj := e.fetchDayKLine(code)
 
 	// §信号速度 S0：资金流批量抓取已停用（无评分消费，见 BuildScoringData 同款注释），
 	// 返回 nil 资金流；手动咨询路径 internal/engine buildStockBlock 直连 GetStockMoneyFlow 不受影响。
@@ -479,9 +488,9 @@ func (e *Engine) cachedKLine(code string) ([]data.KLine, *data.CapitalFlow) {
 	var cf *data.CapitalFlow
 
 	e.klineCacheMu.Lock()
-	e.klineCache[code] = &klineCacheEntry{klines: klines, moneyFlow: cf, fetchedAt: now}
+	e.klineCache[code] = &klineCacheEntry{klines: klines, moneyFlow: cf, fetchedAt: now, unadj: unadj}
 	e.klineCacheMu.Unlock()
-	return klines, cf
+	return klines, cf, unadj
 }
 
 // LastClose 返回个股最近一根日K的收盘价（走日K缓存，非交易时段/停牌也有昨收），无数据返回 0。
@@ -494,38 +503,72 @@ func (e *Engine) LastClose(code string) float64 {
 	if e == nil {
 		return 0
 	}
-	klines, _ := e.cachedKLine(code)
+	klines, _, _ := e.cachedKLine(code)
 	if len(klines) == 0 {
 		return 0 // 无缓存 K 线（停牌等）返回 0
 	}
 	return klines[len(klines)-1].Close
 }
 
-// fetchDayKLine 按 新浪→同花顺→腾讯→东财 降级链拉取日 K 线（120 根）。
-// 任一源返回有效数据即停；全失败时统计"失败"并返回 nil。
-// （fetchDayKLine fetches 120 daily bars via the Sina→THS→Tencent→Eastmoney chain. Stops at the first valid source;
-// counts a "失败" (failure) and returns nil if all sources fail.）
-func (e *Engine) fetchDayKLine(code string) []data.KLine {
-	if klines, err := e.marketAPI.GetSinaKLine(code, 120); err == nil && len(klines) > 0 {
+// fetchDayKLine 拉取 120 根日 K，返回 (序列, 是否不复权)。全链统一过 ValidateKLine（§D8 口径）。
+// §H3（2026-09-22 PM 批）：降级链改为**复权源优先**——东财 push2（fqt=qfq 恒定，§D6 已定
+// 为最稳复权源）→ 腾讯（只认 qfqday；qfq 缺失即拒收，见 internal/data/tencent.go）。
+// 旧链把不复权的新浪排第一、且只判 len>0，除权日 MA/动量/止损价系统性失真，
+// 与全系统前复权契约（internal/data/market.go klineFQT 注释）冲突——§D6 修复的漏网链。
+// 新浪/同花顺为不复权源，仅当两个复权源全挂时末位兜底，并以 unadj=true 显式标记，
+// 由调用方经 applyDayKLine 拒绝其参与因子计算（而不是静默使用）。
+// English: §H3 — qfq-first chain (EastMoney fqt=1 → Tencent qfq-only), every source gated by
+// ValidateKLine; Sina/THS stay only as marked unadjusted last resorts and never feed factor math.
+func (e *Engine) fetchDayKLine(code string) ([]data.KLine, bool) {
+	if klines, err := e.marketAPI.GetKLine(code, "101", 120); err == nil && data.ValidateKLine(klines) {
+		e.bumpKLineSrc("东财")
+		return klines, false
+	}
+	if klines, err := e.marketAPI.GetTencentKLine(code, 120); err == nil && data.ValidateKLine(klines) {
+		e.bumpKLineSrc("腾讯")
+		return klines, false
+	}
+	if klines, err := e.marketAPI.GetSinaKLine(code, 120); err == nil && data.ValidateKLine(klines) {
 		e.bumpKLineSrc("新浪")
-		return klines
+		e.noteUnadjustedFallback(code)
+		return klines, true // 不复权兜底：只供 LastClose/现价类用途（not for factors）
 	}
 	if e.ths != nil {
-		if klines, err := e.ths.GetTHSKLine(code); err == nil && len(klines) > 0 {
+		if klines, err := e.ths.GetTHSKLine(code); err == nil && data.ValidateKLine(klines) {
 			e.bumpKLineSrc("同花顺")
-			return klines
+			e.noteUnadjustedFallback(code)
+			return klines, true
 		}
 	}
-	if klines, err := e.marketAPI.GetTencentKLine(code, 120); err == nil && len(klines) > 0 {
-		e.bumpKLineSrc("腾讯")
-		return klines
-	}
-	if klines, err := e.marketAPI.GetKLine(code, "101", 120); err == nil && len(klines) > 0 {
-		e.bumpKLineSrc("东财")
-		return klines
-	}
 	e.bumpKLineSrc("失败")
-	return nil
+	return nil, false
+}
+
+// noteUnadjustedFallback 复权源全挂、落到不复权兜底时留一条按日节流的运维告警（§H3）：
+// 该状态下因子打分暂停吃日K，用户需要知道实时链路仍在但口径降级。
+// English: once-daily opslog alert when both qfq sources failed and the chain fell to unadjusted.
+func (e *Engine) noteUnadjustedFallback(code string) {
+	opslog.DayOnce("dayk-unadjusted-fallback", func() {
+		opslog.Logf("data", "日K复权链降级：东财/腾讯 qfq 全挂，%s 等落到不复权源兜底——日K因子战法本轮拒参与（仅现价类用途），MA/动量口径不可信", code)
+	})
+}
+
+// applyDayKLine 按复权契约写入个股日K（§H3）：复权数据进 md.KLines 参与因子计算；
+// 不复权数据**不进字段**、只置 md.KLineUnadj 标记——各策略的 len 守卫自然拒参与，
+// 前端/回查也能从标记看出该股当前处于降级态。
+// English: §H3 gate — adjusted bars feed md.KLines; unadjusted ones only set the marker, so every
+// strategy's length guard refuses them from factor math without touching 15 consumer sites.
+func applyDayKLine(md *StockMarketData, klines []data.KLine, unadj bool) {
+	if md == nil {
+		return
+	}
+	if unadj {
+		if len(klines) > 0 {
+			md.KLineUnadj = true
+		}
+		return
+	}
+	md.KLines = klines
 }
 
 // fetchMinuteKLine 按 新浪→同花顺→腾讯→东财 降级链获取分钟K线（5分钟，48根）。
