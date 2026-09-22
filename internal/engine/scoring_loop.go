@@ -92,6 +92,7 @@ func (e *Engine) scoreCycle(ctx context.Context) {
 	// recovery).
 	now := time.Now()
 	if e.lastAlertEval.IsZero() || now.Sub(e.lastAlertEval) >= 30*time.Second {
+		e.refreshStalenessGauges() // §UPDLINK：先把新鲜度量规喂满，再评估
 		metrics.RunAlertEvaluation()
 		e.lastAlertEval = now
 	}
@@ -1226,4 +1227,45 @@ func (e *Engine) saveM8Peak(peak float64) {
 		return
 	}
 	_ = os.Rename(tmp, path)
+}
+
+// refreshStalenessGauges §UPDLINK（2026-09-22 · AUDIT_E2E_FULL H-4 / 审计 N-1）：为告警评估器
+// 喂两条"新鲜度"量规（在 RunAlertEvaluation 之前调用）。
+//  1. quote_staleness_sec：此前全仓只有规则没有数据源（没有任何 SetGauge 写过这个键，规则
+//     quote_stale 恒不触发＝死规则）。现按 fetcher 快照陈旧度真实写入，且**只在盘中采集**——
+//     采集器盘后本就停轮、陈旧度必然无限增长，全天候写值会变成每晚一条 p2 噪音。
+//  2. uplink_staleness_sec：距最近一次网关上行回报的秒数。H-4 事故里 SSE 广播锁被一次
+//     double-close panic 永久占用，POST /api/qmt/report 全线挂死 1h45m、实盘账冻结成上午的旧
+//     照片，而引擎自身日志一切正常（打分照常刷）——这条量规就是那 1h45m 静默期的替代品：
+//     网关心跳每 60s 一发且不分盘后盘前，连续几分钟无入账即说明上行被堵（规则 uplink_stale p1）。
+//
+// 统一口径：未知/不适用（未配置采集器、从未采集、未开实盘、从未上报）一律写 0——既不伪造
+// "新鲜"也不伪造"陈旧"；侧全是 gt 阈值，0 恒不触发。
+// English: §UPDLINK — feed the two freshness gauges the alert evaluator consumes (quote snapshot age,
+// sampled only during the session; and gateway uplink report age). Unknown/not-applicable writes 0,
+// which never trips a gt rule.
+func (e *Engine) refreshStalenessGauges() {
+	quoteAge := int64(0)
+	if data.IsActiveSession(time.Now()) {
+		e.mu.RLock()
+		f := e.fetcher
+		e.mu.RUnlock()
+		if f != nil {
+			if s := int64(f.Staleness().Seconds()); s > 0 {
+				quoteAge = s
+			}
+		}
+	}
+	metrics.SetGauge("quote_staleness_sec", quoteAge)
+
+	uplinkAge := int64(0)
+	// QMTController/Snapshot 各自取锁，且本函数在 scoreCycle 顶部调用时 e.mu 已释放，无重入死锁。
+	if c := e.QMTController(); c != nil {
+		if snap := c.Snapshot(); snap.Enabled && !snap.LastReportAt.IsZero() {
+			if s := int64(time.Since(snap.LastReportAt).Seconds()); s > 0 {
+				uplinkAge = s
+			}
+		}
+	}
+	metrics.SetGauge("uplink_staleness_sec", uplinkAge)
 }

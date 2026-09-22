@@ -118,6 +118,10 @@ type SSEBroker struct {
 	drops      map[chan SSEEvent]int // ch -> 连续丢弃计数（写成功清零）
 	totalDrops int64                 // 进程生命周期累计丢弃事件数
 	evictions  int64                 // 因越阈被主动回收的连接数
+	// §UPDLINK（2026-09-22 H-4）：有界广播（BroadcastToWithin）因锁超预算丢推送的累计次数。
+	// 独立于 b.mu——锁真被卡死时绝不能再抢同一把锁计数，否则监控本身也挂住。
+	skipMu sync.Mutex
+	skips  int64
 	// §F-6（20260917 缺陷修复批）real_advice 最后一轮定向广播快照（按账号）：
 	// GET /api/positions/advice 用它做 REST 回填——旧实现恒返空列表，断线超补发窗
 	// （history 200 条）或页面重载后卖出建议无从补齐，只能等下一次 5s 循环广播。
@@ -219,19 +223,59 @@ func (b *SSEBroker) Unsubscribe(ch chan SSEEvent) {
 // §修复 FIX#5（2026-09-04）：close(ch) 移入锁内——旧实现先解锁再关闭，与 Broadcast/BroadcastTo
 // 持锁对每个已注册 channel 非阻塞 send 并发 → `send on closed channel` panic。
 // 现在先删注册再关 channel，注销与广播在锁内互斥，杜绝向已关闭 channel 发送。
-// English: §FIX#5 — close the channel while holding the lock (remove from the registry first), so a
-// concurrent Broadcast holding the same lock can never send on a closed channel (no send-on-closed panic).
+// §UPDLINK（2026-09-22 · AUDIT_E2E_FULL H-4，P0）：close 从「无条件」改为「注册表命中才关」，
+// 并用 defer 解锁兜底。原因是同一个客户端 channel 存在两条关闭路径——§A3 慢客户端回收
+// （evict→UnsubscribeFor）与 handleFixSSE 的 defer UnsubscribeFor：FIX#5 之后先到的路径已把 ch
+// 从注册表删除，后到的路径 delete 是 no-op 但 close 照关 → `close of closed channel` panic，
+// 而 panic 点在持 b.mu 区间内、Unlock 语句被跳过 → **广播锁永久泄漏**，此后任何
+// Broadcast/BroadcastTo 阻塞，而 POST /api/qmt/report 尾部必经 BroadcastTo → 网关上行回报
+// （positions/account）全线挂死、实盘账冻结成旧照片（生产实录：10:02:43 panic → 11:46 仍无恢复）。
+// English: §UPDLINK — make the close conditional on registry membership (idempotent unsubscribe)
+// and defer the unlock so no panic can leak the broadcast lock. Previously the §A3 eviction path and
+// the handler's deferred path could both close the same channel; the second close panicked while
+// holding b.mu, permanently leaking the lock and deadlocking every uplink report.
 func (b *SSEBroker) UnsubscribeFor(userID string, ch chan SSEEvent) {
 	b.mu.Lock()
-	if set := b.clients[userID]; set != nil {
-		delete(set, ch)
-		if len(set) == 0 {
-			delete(b.clients, userID)
+	defer b.mu.Unlock() // 锁内任何一步 panic 也不会把广播锁留在持有态（H-4 根因二）
+	if !b.unregisterLocked(userID, ch) {
+		return // 已被另一条路径注销并关闭：幂等跳过，绝不双关
+	}
+	close(ch)
+}
+
+// unregisterLocked 把 ch 从注册表摘除，并返回它此前是否确实登记在案（= 本次调用拥有关闭权）。
+// 先在调用方声明的分组查；未命中再遍历全分组兜底——否则 userID 传参与订阅不一致时 channel
+// 既不被关闭（写循环 goroutine 永久挂起）也永不注销。调用方须持有 b.mu。
+// English: unregisterLocked removes ch from the registry and reports whether it was registered
+// (i.e. whether this caller owns the close); falls back to scanning all groups.
+func (b *SSEBroker) unregisterLocked(userID string, ch chan SSEEvent) bool {
+	found := b.detachLocked(userID, ch)
+	if !found {
+		for uid := range b.clients {
+			if b.detachLocked(uid, ch) {
+				found = true
+				break
+			}
 		}
 	}
 	delete(b.drops, ch) // §A3 客户端注销即清失能计数
-	close(ch)
-	b.mu.Unlock()
+	return found
+}
+
+// detachLocked 从单个账号分组移除 ch（分组空则删键），返回是否命中。调用方持 b.mu。
+func (b *SSEBroker) detachLocked(userID string, ch chan SSEEvent) bool {
+	set := b.clients[userID]
+	if set == nil {
+		return false
+	}
+	if _, ok := set[ch]; !ok {
+		return false
+	}
+	delete(set, ch)
+	if len(set) == 0 {
+		delete(b.clients, userID)
+	}
+	return true
 }
 
 // evictStalledLocked 在持 b.mu 的广播循环后调用：把连续丢弃越阈的客户端挑出来，
@@ -302,15 +346,38 @@ func (b *SSEBroker) Broadcast(v interface{}) {
 
 // BroadcastTo 向指定账号的所有 SSE 客户端定向推送消息（账号隔离，如止盈/止损/清仓等关键消息）。
 // 同时把事件记入该账号的历史缓冲以支持断线续传。
+// English: targeted push to one account's clients (blocking lock acquisition, legacy semantics).
 func (b *SSEBroker) BroadcastTo(userID string, v interface{}) {
+	b.broadcastTo(userID, v, 0)
+}
+
+// BroadcastToWithin §UPDLINK（2026-09-22 H-4 兜底）：有界等待版定向推送——最多等 budget 取到
+// 广播锁，超预算就放弃本次推送并计数告警（返回 false）。
+// 为什么需要：H-4 事故里广播锁被一次 close panic 永久占用，POST /api/qmt/report 尾部必经的
+// BroadcastTo 于是把**所有上行回报**挂死（实盘账冻结 1h45m 无人知晓）。账本落库先于广播，
+// 前端刷新只是尽力而为，因此上行入口绝不能被 SSE 侧的锁异常拖住——宁可丢一次推送（前端有
+// 轮询/REST 回填兜底），也不能丢整条资金上报链。
+// English: §UPDLINK — bounded-wait targeted push used by the gateway uplink: if the broadcast lock
+// cannot be acquired within the budget the push is skipped (and counted/alerted) instead of hanging
+// the report endpoint. The ledger write already happened; the frontend has REST/polling fallback.
+func (b *SSEBroker) BroadcastToWithin(userID string, v interface{}, budget time.Duration) bool {
+	return b.broadcastTo(userID, v, budget)
+}
+
+// broadcastTo 定向推送实现体。budget<=0 表示无界等待（旧语义）。返回值仅在"锁超预算未推送"
+// 时为 false；空账号/序列化失败属"无事可做"，按 true 返回以免调用方误判为异常。
+func (b *SSEBroker) broadcastTo(userID string, v interface{}, budget time.Duration) bool {
 	if userID == "" {
-		return
+		return true
 	}
 	data, err := json.Marshal(v)
 	if err != nil {
-		return
+		return true
 	}
-	b.mu.Lock()
+	if !b.acquireForBroadcast(budget) {
+		b.noteSkippedBroadcast(userID)
+		return false
+	}
 	id := b.nextID()
 	ev := SSEEvent{ID: id, Data: data}
 	b.record(userID, ev)
@@ -329,6 +396,50 @@ func (b *SSEBroker) BroadcastTo(userID string, v interface{}) {
 		b.lastAdv[userID] = adviceSnapshot{at: time.Now(), data: append([]byte(nil), data...)}
 		b.advMu.Unlock()
 	}
+	return true
+}
+
+// sseLockRetryStep 有界取锁的自旋步长（2ms：广播锁正常持有仅微秒级，无需更细）。
+const sseLockRetryStep = 2 * time.Millisecond
+
+// acquireForBroadcast 取广播写锁：budget<=0 时无界等待；否则 TryLock 自旋到预算耗尽。
+// 调用方成功取锁后必须自行 Unlock。
+// English: acquire the broadcast write lock, waiting at most budget (TryLock spin) when bounded.
+func (b *SSEBroker) acquireForBroadcast(budget time.Duration) bool {
+	if budget <= 0 {
+		b.mu.Lock()
+		return true
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		if b.mu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(sseLockRetryStep)
+	}
+}
+
+// noteSkippedBroadcast 记一次"因广播锁超预算而丢推送"：量规供 Prometheus/告警规则消费，
+// 日志按首次+每 50 次节流，避免锁真死时把 stderr 刷爆。
+func (b *SSEBroker) noteSkippedBroadcast(userID string) {
+	b.skipMu.Lock()
+	b.skips++
+	n := b.skips
+	b.skipMu.Unlock()
+	metrics.SetGauge("sse_broadcast_skipped_total", n)
+	if n == 1 || n%50 == 0 {
+		log.Printf("[sse] §UPDLINK 广播锁超预算，本次定向推送放弃（用户=%s，累计 %d 次）——SSE 侧存在持锁阻塞，需排查", userID, n)
+	}
+}
+
+// SSESkipStats 返回累计"锁超预算丢推送"次数（测试与运维探针读取）。
+func (b *SSEBroker) SSESkipStats() int64 {
+	b.skipMu.Lock()
+	defer b.skipMu.Unlock()
+	return b.skips
 }
 
 // LastRealAdvice 返回某账号最近一轮 real_advice 广播的原始 JSON 与时间戳（无记录返回 ok=false）。

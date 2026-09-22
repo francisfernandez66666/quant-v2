@@ -764,8 +764,12 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 
 	// SSE 推前端：无论事件类型，统一以 qmt_report 事件向归属账号定向广播摘要
 	// （前端实盘页据此即时刷新；完整明细以 DB/各专用事件为准）。
+	// §UPDLINK（2026-09-22 H-4）：这里改用**有界广播**（2s 预算）。账本已经落库、前端刷新只是
+	// 尽力而为（轮询/REST 兜底在位），而 2026-09-22 的生产实录证明无界等待会把整条上行入口
+	// 陪葬：SSE 广播锁被一次 double-close panic 永久占住后，每个回报 POST 都堵在 BroadcastTo 上，
+	// positions/account 冻结 1h45m、资金闸拿着上午的碎钱值把当日买入全拦。宁可丢推送不丢账。
 	if s.sse != nil {
-		s.sse.BroadcastTo(uid, map[string]interface{}{
+		s.sse.BroadcastToWithin(uid, map[string]interface{}{
 			"type":  "qmt_report",
 			"event": ev.Type,
 			"code":  ev.Code,
@@ -773,7 +777,7 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 			"price": ev.Price,
 			"qty":   ev.Qty,
 			"time":  time.Now().Format("15:04:05"),
-		})
+		}, 2*time.Second)
 	}
 	// 回报受理成功，返回 ok 让网关 outbox 标记完成（否则会重推）。
 	writeJSON(w, 200, map[string]string{"ok": "1"})

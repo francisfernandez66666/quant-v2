@@ -34,6 +34,13 @@ func DefaultAlertRules() []AlertRule {
 		{Name: "breaker_open", Metric: "breaker_active", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "实盘网关熔断中"},
 		{Name: "order_fail_rate", Metric: "order_fail_rate_milli", Op: "gt", Threshold: 50, For: "300s", Level: "p1", Message: "下单失败率 >5%（连续5分钟）"},
 		{Name: "quote_stale", Metric: "quote_staleness_sec", Op: "gt", Threshold: 60, For: "60s", Level: "p2", Message: "行情报价陈旧 >60s"},
+		// §UPDLINK（2026-09-22 H-4）：网关→引擎上行回报链停摆。网关心跳 60s 一发，连续 5 个周期
+		// 无入账即为异常（生产实录：SSE 广播锁被 double-close panic 永久占用，回报挂死 1h45m、
+		// 实盘账冻结，而引擎日志看起来完全正常——这条规则就是把那段静默期变成 p1 告警）。
+		{Name: "uplink_stale", Metric: "uplink_staleness_sec", Op: "gt", Threshold: 300, For: "120s", Level: "p1", Message: "网关上行回报停摆 >5 分钟（实盘账不再更新，查 SSE/回报端点）"},
+		// §UPDLINK 兜底自监控：有界广播放弃推送 = SSE 侧存在持锁阻塞（正常持锁仅微秒级，
+		// 一次超预算即异常，不等第二十五次）。
+		{Name: "sse_broadcast_skipped", Metric: "sse_broadcast_skipped_total", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "SSE 广播锁超预算丢推送（上行回报入口曾被堵住的同族形态）"},
 		{Name: "settlement_diff", Metric: "settlement_diff_count", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "交割单对账出现差异"},
 		{Name: "llm_cooldown", Metric: "llm_cooldown_count", Op: "gt", Threshold: 2, For: "60s", Level: "p2", Message: "LLM 冷却数超阈值"},
 		// §AUDIT-PM 2026-09-15 buyCh 深度预警：容量 64，过半仍在排 = 下单风暴或网关变慢（P2）。
