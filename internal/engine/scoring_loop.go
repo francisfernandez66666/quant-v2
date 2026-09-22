@@ -886,9 +886,10 @@ func (e *Engine) sellRealPosition(ctrl *trading.Controller, p store.RealPosition
 	}
 	if res != nil && !res.OK {
 		if strings.Contains(res.Err, "duplicate") {
-			// §GAP2-W1 语义更新：duplicate 现在只可能意味着"当日同类卖单已真实报出"
-			// （发送失败的单会经 MarkRealOrderSendFailed→ResetFailedRealOrder 放行重试，
-			// 不再以 duplicate 形态出现），因此幂等命中=目标已达成，静默返回是正确行为。
+			// §GAP2-W1 语义更新 + §H1-MG 修订：duplicate 现在只可能意味着"当日同类卖单已真实报出、
+			// 或在途/已有成交"（发送失败、**已撤零成交**的单都会经 MarkRealOrderSendFailed /
+			// ResetFailedRealOrder 的同键重放放行，不再以 duplicate 形态出现），
+			// 因此幂等命中=目标已达成，静默返回是正确行为。
 			return nil // 当日已下过同类卖单（幂等命中），静默
 		}
 		// §H4（2026-09-22 修复批）业务拒单不再假成功：网关 200+ok:false（券商拒单等）时

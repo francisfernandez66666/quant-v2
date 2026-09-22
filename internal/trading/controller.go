@@ -200,33 +200,33 @@ func (c *Controller) Mode() string {
 	return c.cfg.Mode
 }
 
-// AvailableCash 返回最近一次网关上报的可用资金；未知/过期/查询失败返回 0（调用方视为"不设限"）。
-// 资产由广州网关每分钟对账上报（real_account 表，§M1）；超过 30 分钟未刷新视为过期——
-// 此时宁可不降档（维持 fixed_amount 行为），让柜台做最终裁决，也不拿陈旧数字误拦订单。
-// English: returns the latest gateway-reported available cash; 0 when unknown/stale(>30min)/error —
-// callers treat 0 as "no cap", keeping the pre-existing fixed_amount behavior instead of gating
-// orders on stale numbers.
-// §D5（2026-09-22 修复批）注释口径统一：0 的唯一含义是**「资金口径不可得 → 调用方不设限」**，
-// 不是「账户一分钱都没有」。旧行内注释写的是后者、与本函数头（及 engine.go 消费端
-// `if cash := ctrl.AvailableCash(); cash > 0` 判空即跳过门控）相反——按实现取「不设限」。
-// **本次只统一注释，不改行为语义**：0 到底 fail-open（现行）还是 fail-close（三态化）属 §M12
-// 资金安全裁决项，由 owner 定调后单独动工。
-// English: §D5 aligns the inner comment with the header wording (0 = "cash basis unknown → no cap",
-// never "zero money"); semantics are untouched — that question is the separate §M12 decision.
-func (c *Controller) AvailableCash() float64 {
+// AvailableCash 返回最近一次网关上报的可用资金与其新鲜度（§M12-A 三态口径，2026-09-22 owner 定调）。
+// 资产由广州网关每分钟对账上报（real_account 表，§M1）；返回值语义：
+//   - (value, true)：账本可查且 30 分钟内有回报——value 是**真值**，0 就是真没钱；
+//   - (value/0, false)：未接账本库/查询失败/回报超过 30 分钟——**资金口径不可得**。
+//
+// 调用方（engine 自动买入腿）对 fresh=false 的处理是 **fail-close：不自动买**（保留手动通道），
+// 并经 /api/qmt/state 的 cash_stale 暴露给前端降级横幅。旧两态口径（未知/过期一律返回 0、
+// 调用方视为「不设限」放行）已废弃——H-4 事故证明冻结/断供的资金值与真零混在一起时，
+// 要么全拦要么全放，两个方向都是事故。
+// English: §M12-A three-state cash basis (owner verdict A, fail-close). fresh=false means the
+// ledger basis is unavailable (store nil / query error / report older than 30min) and the auto-buy
+// leg must NOT fire; manual orders stay available and the state endpoint exposes cash_stale for a
+// frontend banner. The old two-state contract (0 = "no cap") is retired.
+func (c *Controller) AvailableCash() (float64, bool) {
 	if c.store == nil {
-		return 0 // 未接账本库=资金口径不可得 → 返回 0，调用方视为"不设限"（不做上限门控；口径见函数头 §D5）
+		return 0, false // 未接账本库=资金口径不可得（§M12-A：调用方 fail-close，不自动买）
 	}
 	acc, err := c.store.GetRealAccount(c.userID)
-	if err != nil || acc.AvailableCash <= 0 {
-		return 0
+	if err != nil {
+		return 0, false // 查询失败同为口径不可得
 	}
-	// 对账数据超过 30 分钟视为过期：返回 0，不拿陈旧数字当门控依据
-	updated, err := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, time.Local)
-	if err != nil || time.Since(updated) > 30*time.Minute {
-		return 0
+	// 对账数据超过 30 分钟视为过期：带着原值返回 fresh=false，由调用方裁决。
+	updated, perr := time.ParseInLocation("2006-01-02 15:04:05", acc.UpdatedAt, time.Local)
+	if perr != nil || time.Since(updated) > 30*time.Minute {
+		return acc.AvailableCash, false
 	}
-	return acc.AvailableCash
+	return acc.AvailableCash, true // 新鲜真值：0 即真无可用资金
 }
 
 // Tripped 是否处于熔断状态（网关失联/心跳超时）。
@@ -281,6 +281,15 @@ type StateSnapshot struct {
 	LastLatencyMs  int64     `json:"last_latency_ms"`  // 最近一次探测延迟毫秒
 	LastReportAt   time.Time `json:"last_report_at"`   // 最近一次上行回报时间
 	LastReportKind string    `json:"last_report_kind"` // 最近一次上行回报类型
+	// §M12-A（2026-09-22 owner 裁决 A）：资金三态口径随快照暴露——cash_stale=true 表示
+	// 资金口径不可得（未接账本/查询失败/回报超 30 分钟），此时自动买入已被 fail-close 拦下，
+	// 前端据此渲染降级横幅而不是把「没有买入」误读成「没有信号」。cash 是最近一次的原始值
+	// （过期时该值仅供参考，不代表当下真数）。
+	// English: §M12-A — the three-state cash basis is exposed on the snapshot: cash_stale=true
+	// means auto-buy is fail-closed (ledger basis unavailable/stale) and the frontend shows a
+	// degradation banner; cash is the raw last-known value (informational while stale).
+	Cash      float64 `json:"cash"`
+	CashStale bool    `json:"cash_stale"`
 	// PendingEnabled §FIX-2：待生效队列中的 enabled（§QMT-PENDING）。非 nil 表示存在一笔尚未在
 	// 交易时段被 ApplyPendingConfig 消费的开关变更——前端据此显示"已配置，将于下一交易时段生效"，
 	// 而不是把延迟生效误判为"开关没打开"。为 nil 表示当前无待生效变更（已收敛到 c.cfg.Enabled）。
@@ -300,6 +309,8 @@ func (c *Controller) Snapshot() StateSnapshot {
 		v := c.pendingCfg.Enabled
 		pendingEnabled = &v
 	}
+	// §M12-A：资金三态随快照暴露（AvailableCash 不取锁，此处 RLock 内调用安全）。
+	cash, cashFresh := c.AvailableCash()
 	return StateSnapshot{
 		Enabled:        c.cfg.Enabled,
 		Mode:           c.cfg.Mode,
@@ -312,6 +323,8 @@ func (c *Controller) Snapshot() StateSnapshot {
 		LastLatencyMs:  c.lastLatencyMs,
 		LastReportAt:   c.lastReportAt,
 		LastReportKind: c.lastReportKind,
+		Cash:           cash,  // §M12-A 原始最近值（过期时仅供参考）
+		CashStale:      !cashFresh,
 		PendingEnabled: pendingEnabled,
 	}
 }
@@ -529,8 +542,9 @@ func (c *Controller) placeOrder(req OrderRequest) (*OrderResult, error) {
 	// 幂等：同一 signal_id 不重复下单。
 	// §GAP 修复：占位行 order_id 用 "pend:<signal_id>"——此前恒为空串，与 order_id 主键冲突，
 	// 第二笔起的新单被 INSERT OR IGNORE 误判为重复（静默不下单），网关单号回填也永不命中。
-	// §GAP2-W1 重试放行：命中已有行时先尝试把"发送失败"占位行重置为"已报"——只有确认发送失败的
-	// 单才允许同键重发；真正的重复（已报待回报/部分成交/已成/已撤）仍被唯一键拦截，返回 duplicate。
+	// §GAP2-W1 重试放行：命中已有行时先尝试把可重放行重置为"已报"——发送失败（§GAP2-W1）
+	// 与「已撤且零成交」（§H1-MG）同语义放行；真正的重复（已报待回报/部分成交/已成/已撤有成交）
+	// 仍被唯一键拦截，返回 duplicate。
 	existed, err := c.store.UpsertRealOrder(store.RealOrder{
 		OrderID:   "pend:" + req.SignalID,
 		SignalID:  req.SignalID,

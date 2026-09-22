@@ -930,6 +930,15 @@ export default function Quant() {
         {row('网关地址', state.gateway_url || '—')}
         {/* 熔断行：健康探测触发的自动熔断（与 kill-switch 人工紧急停止相互独立） */}
         {row('熔断', breaker)}
+        {/* §M12-A（2026-09-22）资金三态横幅：口径不可得（对账回报超30分钟/未接账本）时自动买入
+            已 fail-close 暂停——不提示的话运维侧只会看到"没有买入"，容易误判成没有信号。
+            English: §M12-A banner — auto-buy is fail-closed while the cash basis is stale/unknown. */}
+        {state.cash_stale ? row('可用资金', <span style={{ fontSize: 12 }}>
+          <Tag theme="warning">口径不可得</Tag>
+          <span style={{ marginLeft: 8, color: 'var(--app-up)' }}>
+            对账回报过期，自动买入已暂停（手动下单不受影响）；最近原始值 {Number(state.cash || 0).toFixed(2)}
+          </span>
+        </span>) : null}
         {/* §U-2 kill-switch（人工紧急停止）状态与入口：置位=拒绝一切新单+撤销在途委托，立即生效 */}
         {row('紧急停止', <>
           {halted ? <Tag theme="danger">已置位</Tag> : <Tag theme="success">未启用</Tag>}

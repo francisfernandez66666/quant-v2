@@ -16,6 +16,7 @@ import (
 
 	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/store"
@@ -28,6 +29,12 @@ func newAsyncEngine(t *testing.T) (*Engine, *store.DB, *httptest.Server, *[]map[
 	db, err := store.Open(filepath.Join(t.TempDir(), "qmt.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
+	}
+	// §M12-A：同 newQMTEngine——异步链路的用例主题是"入队/排空/幂等"，不是资金门控；
+	// 不播种新鲜账户行会被自动买入 fail-close 整腿拦在入口，orders 恒 0 造成假红。
+	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_1", AvailableCash: 10_000_000,
+		UpdatedAt: time.Now().In(cntime.Loc).Format("2006-01-02 15:04:05")}); err != nil {
+		t.Fatalf("seed cash: %v", err)
 	}
 
 	// mock 柜台：/order 收到的每笔委托原样存进 orders 并固定回执 GW1，

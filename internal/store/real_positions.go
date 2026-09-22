@@ -772,39 +772,46 @@ func (d *DB) MarkRealOrderSendFailed(userID, signalID string) error {
 }
 
 // ResetFailedRealOrder §GAP2-W1 失败重试放行：把指定 signal_id 的"发送失败"行重置为"已报"。
-// 仅当行存在且状态恰为"发送失败"时生效并返回 true；其余状态（已报/部分成交/已成/已撤）原样保留
-// 并返回 false——即真正的重复下单仍然被唯一键拦截，只有确认失败过的单才允许再发一次。
+// 仅当行存在且状态恰为"发送失败"、或「**已撤且零成交**」时生效并返回 true；其余状态
+// （已报/部分成交/已成/已撤有成交）原样保留并返回 false——即真正的重复下单仍然被唯一键拦截，
+// 只有确认「从未有效占用过额度」的单才允许再发一次。
+// §H1-MG（2026-09-22 PM 修复批）：放行集合并入「已撤+无成交 fills」——保护性卖单被撤
+// （人工/网关撤单/收盘失效）且一股未卖时，旧口径下同幂等键整天 duplicate，止损卖出当日猝死；
+// 与 §M16「发送失败可重放」同语义：撤单零成交=这笔目标根本没达成，同键重放不是重复下单。
+// 已撤但**有成交**（部撤入账）仍不可重放——那笔的剩余仓位已无当日在途卖单，由下一轮评分
+// 以新幂等键自然接管。秩守卫不打架：重置只发生在下单重试路径（本函数内 WHERE 带状态复核），
+// 不走回报推进（回报按 order_id 反查，行已换新 pend 占位号后旧单号的迟到回报自然 miss）。
+// English: §H1-MG — the replay-eligible set grows from "send-failed" to also include
+// "cancelled with zero fills": a cancelled protective sell that never filled must not kill the
+// same-key retry for the rest of the day. Cancelled-with-fills rows stay non-replayable.
 // §P0-3 userID 限定本账号作用域。
 // §修复 FIX#2（2026-09-04）：重试同时换新占位单号 `pend:<signal_id>:<attempt>`（attempt 自增）。
 // 旧实现只改状态、占位单号保持首次 `pend:<sid>`——一旦重试实际到券商（响应丢失）而网关单号
 // 回填前崩溃，SweepOrders 见 pend: 前缀行即按"从未到达网关"再降级，同 signal_id 反复真报单。
 // 每次重试换唯一占位单号后，真实委托的回填（UpdateRealOrderBySignalID）只会命中本轮单号，
 // 历史 pend 行不再被误判为幽灵单。
-// English: §FIX#2 — a retry now also rotates to a fresh placeholder order_id
-// `pend:<signal_id>:<attempt>` (attempt auto-increments). The old code kept the first attempt's
-// `pend:` order_id, so if a retry actually reached the broker (lost response) and crashed before the
-// gateway id was backfilled, SweepOrders saw the pend: prefix and demoted it again — re-sending the
-// same signal_id for real, repeatedly. With a unique placeholder per attempt, the backfill only ever
-// targets this round's order and stale pend rows are no longer misjudged as ghosts.
 func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
+	// §H1-MG 放行条件的单一事实源（SELECT/UPDATE 两处共用，防语句漂移）：
+	// 发送失败=从未到券商；已撤+零 fills=到过券商但一股未成交——两者都不构成"目标已达成"。
+	const eligibleWhere = `signal_id=? AND user_id=? AND (status='发送失败'
+		OR (status='已撤' AND NOT EXISTS (
+			SELECT 1 FROM fills f WHERE f.user_id=orders.user_id AND f.signal_id LIKE orders.signal_id||'%'))) `
 	var cur string
-	if userID == "" {
-		err = tx.QueryRow(`SELECT order_id FROM orders WHERE signal_id=? AND status='发送失败' AND user_id=''`, signalID).Scan(&cur)
-	} else {
-		err = tx.QueryRow(`SELECT order_id FROM orders WHERE signal_id=? AND status='发送失败' AND user_id=?`, signalID, userID).Scan(&cur)
-	}
+	err = tx.QueryRow(`SELECT order_id FROM orders WHERE `+eligibleWhere, signalID, userID).Scan(&cur)
 	if err == sql.ErrNoRows {
-		return false, nil // 行不存在或状态非"发送失败"：不可重试
+		return false, nil // 行不存在或状态不可重放（含"已撤但有成交"）
 	}
 	if err != nil {
 		return false, err
 	}
 	// 自增 attempt：旧式 pend:<sid> 视为第 1 次；解析失败/非 pend 前缀时从 1 重新计
+	// （§H1-MG：被重置的"已撤"行带的是网关真实单号，非 pend 前缀 → 从 attempt 1 起新占位号，
+	// 真实旧单号被替换后，该旧单号的迟到回报反查不到行，不会污染重放轮次的账）。
 	attempt := 1
 	prefix := "pend:" + signalID + ":"
 	if strings.HasPrefix(cur, prefix) {
@@ -813,13 +820,9 @@ func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
 		}
 	}
 	newID := fmt.Sprintf("pend:%s:%d", signalID, attempt)
-	// 发送失败行重置为"已报"并换新占位单号（供重试队列再次投递）。
-	var res sql.Result
-	if userID == "" {
-		res, err = tx.Exec(`UPDATE orders SET status='已报', order_id=? WHERE signal_id=? AND status='发送失败' AND user_id=''`, newID, signalID)
-	} else {
-		res, err = tx.Exec(`UPDATE orders SET status='已报', order_id=? WHERE signal_id=? AND status='发送失败' AND user_id=?`, newID, signalID, userID)
-	}
+	// 可重放行重置为"已报"并换新占位单号（供重试队列再次投递）。UPDATE 复用同一 WHERE：
+	// 事务窗口内若有回报把行推进（如撤单回报带成交落地），条件不再成立则零行受影响→不可重试。
+	res, err := tx.Exec(`UPDATE orders SET status='已报', order_id=? WHERE `+eligibleWhere, newID, signalID, userID)
 	if err != nil {
 		return false, err
 	}

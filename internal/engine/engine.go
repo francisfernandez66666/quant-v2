@@ -1395,14 +1395,26 @@ func (e *Engine) autoPlace(sig combat_agent.Signal, live map[string]*data.StockI
 		})
 		return
 	}
-	// §UAT-CASH 2026-08-31：按可用资金自动降档——与模拟盘"现金不足时按剩余现金整手买入"
-	// （paper.go FixedAmount 注释）同语义。fixed_amount 是预算上限而非死数：最近上报的可用
-	// 资金（网关每分钟对账）不足以按预算整手买入时，降到现金可负担的最大整手数；连一手都
-	// 买不起才放弃。资金未知/过期时 AvailableCash 返回 0 → 不设限，维持原行为。
-	// English: §UAT-CASH — degrade the lot count to what the latest reported available cash
-	// affords (whole lots) instead of rejecting the order when cash < fixed_amount; skip only
-	// when even one lot is unaffordable. Unknown/stale cash (0) keeps the old behavior.
-	if cash := ctrl.AvailableCash(); cash > 0 && qty > 0 {
+	// §UAT-CASH 2026-08-31 → §M12-A 2026-09-22（owner 裁决 A：三态 fail-close）：
+	// fixed_amount 是预算上限而非死数——最近上报的可用资金（网关每分钟对账）不足以按预算整手
+	// 买入时，降到现金可负担的最大整手数；连一手都买不起才放弃。三态化改的是「口径不可得」的
+	// 处置：未接账本/查询失败/回报超 30 分钟时**不自动买**（手动通道不受影响，前端按
+	// /api/qmt/state 的 cash_stale 显示降级横幅）。旧两态口径把「真 0」与「不可得」混写成同一个 0：
+	// 不可得→调用方视为不设限=毫无资金约束地放行，真 0→cash>0 不成立同样跳过门控——H-4 事故
+	// （账本冻结在碎钱 0.03 把当日买入全拦 / 若冻结值是 0 则完全放行）证明两头都是事故。
+	// 如今新鲜真 0 与真资金不足走同一个「买不起一手」拒单出口，不再被当成"不设限"。
+	// English: §M12-A — three-state cash basis, fail-CLOSED: unknown/stale basis (fresh=false) skips
+	// auto-buy entirely (manual path unaffected); a fresh true 0 now falls into the same
+	// "cannot afford one lot" rejection as real insufficient cash instead of silently bypassing the cap.
+	cash, cashFresh := ctrl.AvailableCash()
+	if !cashFresh {
+		log.Printf("[qmt] %s 资金口径不可得（§M12-A 自动买入 fail-close），本轮跳过", sig.Code)
+		opslog.DayOnce("cashstale:auto-buy", func() {
+			opslog.Logf("quant", "资金口径不可得，自动买入 fail-close 暂停（对账回报超30分钟未更新或账本未接入），最近原始值=%.0f；资金数据回鲜后自动恢复", cash)
+		})
+		return
+	}
+	{
 		// 预留 0.6% 佣金/过户费余量，避免贴着可用资金下单被柜台以"资金不足"废单
 		affordable := int(cash*0.994/price/100) * 100
 		if affordable < qty {

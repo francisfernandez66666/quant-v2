@@ -35,6 +35,16 @@ func newQMTEngine(t *testing.T, mutate func(*config.QMTConfig)) (*Engine, *store
 	}
 	t.Cleanup(func() { db.Close() })
 
+	// §M12-A（2026-09-22 PM 修复批）：自动买入腿对「资金口径不可得」fail-close——harness 若不
+	// 播种账户行，所有 autoPlace 用单都会以"资金不可得"被拦，测不到各自主题（幂等/限次/队列/封板）。
+	// 统一在此注入新鲜充足资金；资金三态的专门场景由 m12_cash_gate_test.go 用 UPSERT 覆写自管。
+	// English: §M12-A — the harness seeds ample fresh cash so auto-buy tests exercise their own
+	// subject; the three-state scenarios overwrite the account row per case.
+	if err := db.UpsertRealAccount(store.RealAccount{UserID: "u_1", AvailableCash: 10_000_000,
+		UpdatedAt: time.Now().In(cntime.Loc).Format("2006-01-02 15:04:05")}); err != nil {
+		t.Fatalf("seed cash: %v", err)
+	}
+
 	// 假网关：记录收到的委托体（orders + mu 供用例断言用了几笔额度），/health 保活。
 	// mu 必不可少：auto 下单走异步 buyCh，回调与用例断言分属不同 goroutine。
 	var mu sync.Mutex
