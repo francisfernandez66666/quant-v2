@@ -1497,6 +1497,22 @@ grep -q 'deploy/qmt-win/register_backup_task.ps1' scripts/deploy_guangzhou.sh \
 # BOM 归一必须做：两份 ps1 含中文注释，PS5.1 读无 BOM 的 UTF-8 会按 GBK 解析直接 ParserError。
 grep -q 'ps1_bom deploy/qmt-win/backup_snapshot.ps1' scripts/deploy_guangzhou.sh \
 	|| { echo "--- FAIL: backup_snapshot.ps1 未走 ps1_bom 归一（PS5.1 GBK 撕裂中文注释）"; exit 1; }
+grep -q 'ps1_bom deploy/qmt-win/register_backup_task.ps1' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: register_backup_task.ps1 未走 ps1_bom 归一"; exit 1; }
+# 仓库**字节**也必须已经是单 BOM：只锁"部署脚本会调 ps1_bom"锁不住本批实际发生的事——
+# Write/Edit 工具重写 ps1 会把 BOM 静默剥掉（register_backup_task.ps1 就复犯过一次），而部署链
+# 上传前会补回来，于是现网正常、仓库里的文件却是坏的：走 RUNBOOK §2 手工安装 = 首跑 ParserError。
+for ps1 in deploy/qmt-win/backup_snapshot.ps1 deploy/qmt-win/register_backup_task.ps1; do
+	python3 - "$ps1" <<'PY' || { echo "--- FAIL: $ps1 仓库字节 BOM 不合规（手工安装路径首跑必炸）"; exit 1; }
+import sys
+d = open(sys.argv[1], 'rb').read()
+n = 0
+while d[n:].startswith(b'\xef\xbb\xbf'):
+	n += 3
+assert n == 3, 'BOM 个数=%d（需恰好 1 个）' % (n // 3)
+d.decode('utf-8')
+PY
+done
 # 落盘目录三方同源：部署上传位 == 任务默认指向 == RUNBOOK 手工安装位（否则"更新一份、执行另一份"）。
 grep -qF 'BACKUP_DIR="${DEPLOY_DIR}/deploy/qmt-win"' scripts/deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 部署侧快照目录不再与任务指向同源（双份脚本漂移风险复活）"; exit 1; }

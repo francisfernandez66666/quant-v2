@@ -1,4 +1,4 @@
-# register_backup_task.ps1 — 注册广州夜间快照计划任务（HARDENING 件1 / §P0-B，运维可重入）
+﻿# register_backup_task.ps1 — 注册广州夜间快照计划任务（HARDENING 件1 / §P0-B，运维可重入）
 # 职责：把 backup_snapshot.ps1 注册为每日 04:00 SYSTEM 任务（与 15:30 夜间研究链错峰；
 #       /RL HIGHEST 保证磁盘/凭据操作不受降权影响）。重复执行安全（先删后建）。
 # 用法（在服务器）：powershell -NoProfile -ExecutionPolicy Bypass -File register_backup_task.ps1
