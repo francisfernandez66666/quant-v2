@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"quant-trading-v2/internal/config"
+	"quant-trading-v2/internal/llm"
 	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/trading"
 )
@@ -63,6 +64,37 @@ func TestUplinkStaleRuleRegistered(t *testing.T) {
 	}
 	if !skipped {
 		t.Fatalf("默认规则缺少 sse_broadcast_skipped")
+	}
+}
+
+// TestRefreshFeedsLLMCooldownGauge §DEADGAUGE（2026-09-23 傍晚批收尾）：规则 llm_cooldown 的
+// 量规 llm_cooldown_count 此前全仓无赋值点（第三次踩中"有规则、无数据源"形态）。现由打分链每轮
+// 喂养，本用例锁两件事：①写的键名与规则读的键名逐字相同（打错键名 = 又一条永不触发的规则）；
+// ②未接 LLM 客户端 / 池内无失败一律 0（不适用不伪造，和上面两条新鲜度量规同一口径）。
+func TestRefreshFeedsLLMCooldownGauge(t *testing.T) {
+	var metric string
+	for _, r := range metrics.DefaultAlertRules() {
+		if r.Name == "llm_cooldown" {
+			metric = r.Metric
+		}
+	}
+	if metric != "llm_cooldown_count" {
+		t.Fatalf("规则 llm_cooldown 读的键名变了：%q（写端在 refreshStalenessGauges）", metric)
+	}
+
+	e := &Engine{}
+	e.refreshStalenessGauges()
+	if v := mustGauge(t, "llm_cooldown_count"); v != 0 {
+		t.Fatalf("未接 LLM 客户端时应写 0, got %d", v)
+	}
+	// 直接置字段而非 e.SetLLMClient：后者会顺带把客户端转交给 newsAgent，裸 &Engine{} 下该字段为 nil
+	// （与本文件上面那条用例给 qmtCtrl 加锁赋值的写法同源）。
+	e.mu.Lock()
+	e.llmClient = llm.New(llm.Config{APIKeys: []string{"A", "B"}})
+	e.mu.Unlock()
+	e.refreshStalenessGauges()
+	if v := mustGauge(t, "llm_cooldown_count"); v != 0 {
+		t.Fatalf("多 key 池无失败时应为 0, got %d", v)
 	}
 }
 

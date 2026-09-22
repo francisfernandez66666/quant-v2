@@ -1426,5 +1426,96 @@ grep -q 'detect_artifact_layout' scripts/restore_drill.sh || { echo "--- FAIL: �
 python3 -m py_compile qmt_gateway/../deploy/qmt-win/backup_snap.py && echo "  ok backup_snap.py 语法通过"
 echo "ok - §LIVEBACKUP 专项守卫通过（等值锁 2 组 + 静态锁 7 道 + 负锁 2 道 + 语法锁 1 道）"
 
+echo "==> 69 §DEADGAUGE 每条告警规则必须有真实赋值点（死规则通用守卫）..."
+# 现象：9 条默认告警规则里有 3 条（order_fail_rate / settlement_diff / llm_cooldown）自 09-15
+#       注册以来全仓找不到一处 SetGauge 赋值 → 评估器每轮读到 0 → gt 规则永不触发。这不是"没出过
+#       事"，是"出了事也不会响"：p1「交割单对账出现差异」「下单失败率>5%」在现网等价于不存在。
+#       同一形态此前已被抓过两次（audit N-1 的 quote_staleness_sec、§CB 的 uplink_staleness_sec），
+#       每次都靠人肉发现——本段把它变成机器锁。
+# 修法：① 三条各接真实源（order_rate.go 用 §R4-9 既有累计计数器做 5 分钟窗增量换算、
+#         settlement.go 用三方对账三类差异条数之和、scoring_loop 用 llm.Client.KeysInCooldown）；
+#       ② 通用守卫：从规则表反解出每条 Metric 名，逐条要求非测试代码里存在 SetGauge("<名>") 赋值点，
+#          以后新增"只有规则没有数据源"直接判红；③ 负锁锁住两个已知假绿形态。
+# 行为锁：三条出口 + 键名一致性 + 窗口换算。
+go test -count=1 ./internal/trading/ -run 'TestSettleDayFeedsDiffGauge|TestSettleDaySkipBranchesWriteZero' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/metrics/ -run 'TestOrderFailRate|TestRunAlertEvaluationRefreshesDerivedGauge' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/llm/ -run 'TestKeysInCooldown' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/engine/ -run 'TestRefreshFeedsLLMCooldownGauge|TestRefreshStalenessGauges' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 静态锁：三条赋值点的具体形态（不只看"有没有"，还看"算得对不对"）。
+grep -q 'SetGauge("settlement_diff_count", int64(len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch)))' internal/trading/settlement.go \
+	|| { echo "--- FAIL: §DEADGAUGE 交割差异量规不再等于三类条数之和（退化成布尔/单类计数会漏报）"; exit 1; }
+grep -q 'func (c \*Client) KeysInCooldown() int' internal/llm/llm.go \
+	|| { echo "--- FAIL: §DEADGAUGE LLM 冷却计数入口丢失（llm_cooldown 又成死规则）"; exit 1; }
+grep -q 'metrics.SetGauge("llm_cooldown_count", llmCool)' internal/engine/scoring_loop.go \
+	|| { echo "--- FAIL: §DEADGAUGE 打分链未再喂 llm_cooldown_count"; exit 1; }
+grep -q 'SetGauge("order_fail_rate_milli", rate)' internal/metrics/order_rate.go \
+	|| { echo "--- FAIL: §DEADGAUGE 下单失败率量规赋值丢失"; exit 1; }
+# 通用守卫：规则表里每条 Metric 都要有赋值点。扫描面排除测试文件（测试直接 SetGauge 造场景，
+# 算赋值点就是假绿）与规则/路由定义本体（alerter.go 里的 Metric: "x" 不是赋值，但防有人把
+# 赋值塞进规则文件糊弄守卫）。
+rule_metrics=$(grep -oE 'Metric: "[a-z0-9_]+"' internal/metrics/alerter.go | sed -E 's/.*"([^"]+)"/\1/')
+[ -n "$rule_metrics" ] || { echo "--- FAIL: §DEADGAUGE 规则表解析为空（规则被搬走 = 守卫失明）"; exit 1; }
+dead_rules=""
+for m in $rule_metrics; do
+	n=$(find internal cmd -name '*.go' ! -name '*_test.go' ! -name 'alerter.go' ! -name 'alert_routing.go' \
+	    -print0 | xargs -0 grep -l "SetGauge(\"$m\"" 2>/dev/null | wc -l | tr -d ' ')
+	[ "$n" -ge 1 ] || dead_rules="$dead_rules $m"
+done
+if [ -n "$dead_rules" ]; then
+	echo "--- FAIL: §DEADGAUGE 以下量规有规则无赋值点（永不触发）：$dead_rules"; exit 1
+fi
+echo "  ok 通用守卫：$(echo "$rule_metrics" | wc -w | tr -d ' ') 条规则量规全部有赋值点"
+# 负锁①：派生量规必须在取快照之前刷新（写在后面 = 每轮读到的都是上一轮值，等于没修）。
+run_body=$(awk '/^func RunAlertEvaluation\(\)/{f=1} f{print} f&&/^}$/{exit}' internal/metrics/alerter.go)
+pos_refresh=$(printf '%s\n' "$run_body" | grep -n 'refreshOrderFailRateGauge()' | head -1 | cut -d: -f1)
+pos_snap=$(printf '%s\n' "$run_body" | grep -n 'gaugeSnapshot()' | head -1 | cut -d: -f1)
+{ [ -n "$pos_refresh" ] && [ -n "$pos_snap" ] && [ "$pos_refresh" -lt "$pos_snap" ]; } \
+	|| { echo "--- FAIL: §DEADGAUGE 刷新未发生在 gaugeSnapshot 之前（读到旧值）"; exit 1; }
+# 负锁②：禁止用「累计值直接相除」冒充窗口失败率（那样一次进程内早期失败会永久挂着 5% 红线）。
+if grep -nE 'ordersRejected\.Load\(\) \* 1000 / \(ordersPlaced\.Load\(\) \+ ordersRejected\.Load\(\)\)' internal/metrics/*.go | grep -q .; then
+	echo "--- FAIL: §DEADGAUGE 又用全生命周期累计比冒充 5 分钟窗口失败率"; exit 1
+fi
+# 负锁③：静默跳过分支不得"什么都不写"（不写 = 保留昨天/上一轮的残值，对账降级日会持续误报）。
+if ! grep -q 'SetGauge("settlement_diff_count", 0)' internal/trading/settlement.go; then
+	echo "--- FAIL: §DEADGAUGE 对账跳过分支不再清零（残值冒充当日差异）"; exit 1
+fi
+echo "ok - §DEADGAUGE 专项守卫通过（行为锁 4 组 + 静态锁 4 道 + 通用死规则守卫 1 条 + 负锁 3 道）"
+
+echo "==> 70 §LIVEBACKUP-DEPLOY 备份链随部署下发 + 第 16 探针（P0-B 收编）..."
+# 现象：§P0-B 把广州夜间快照从「trading.db + 9 个 JSON」扩到「+ live.db + accounts/」，但
+#       backup_snapshot.ps1 / backup_snap.py **从来不在 deploy_guangzhou.sh 的 scp 清单里**
+#       （历史上手工安装）。结果：仓库里改对了，现网 04:00 跑的还是只快照 trading.db 的旧版，
+#       实盘四本账仍然无灾备——而且"任务在跑、每晚有产物、Mac 能拉到"三项全绿。
+# 同族教训：§ENH-5 quote_feed.py 漏列、§A5-DEPLOY trading_calendar.py 漏列（都是"新增部署文件
+#       必须入清单"）。本段把它变成清单正锁 + 内容版本判据，光查"任务存在"不再算通过。
+grep -q 'deploy/qmt-win/backup_snapshot.ps1' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署清单缺 backup_snapshot.ps1（§P0-B 现网不会生效，同 §A5 漏列形态）"; exit 1; }
+grep -q 'deploy/qmt-win/backup_snap.py' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署清单缺 backup_snap.py（缺库快照器=备份脚本上机即 throw）"; exit 1; }
+grep -q 'deploy/qmt-win/register_backup_task.ps1' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署清单缺 register_backup_task.ps1（任务无法随部署注册）"; exit 1; }
+# BOM 归一必须做：两份 ps1 含中文注释，PS5.1 读无 BOM 的 UTF-8 会按 GBK 解析直接 ParserError。
+grep -q 'ps1_bom deploy/qmt-win/backup_snapshot.ps1' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: backup_snapshot.ps1 未走 ps1_bom 归一（PS5.1 GBK 撕裂中文注释）"; exit 1; }
+# 落盘目录三方同源：部署上传位 == 任务默认指向 == RUNBOOK 手工安装位（否则"更新一份、执行另一份"）。
+grep -qF 'BACKUP_DIR="${DEPLOY_DIR}/deploy/qmt-win"' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署侧快照目录不再与任务指向同源（双份脚本漂移风险复活）"; exit 1; }
+grep -qF 'C:\opt\quant\deploy\qmt-win\backup_snapshot.ps1' deploy/qmt-win/register_backup_task.ps1 \
+	|| { echo "--- FAIL: register_backup_task.ps1 默认路径变更（与部署落盘位脱钩）"; exit 1; }
+# 校验面：第 16 探针在位，且带**内容版本判据**（旧版脚本只查文件存在会假绿）。
+grep -qF 'backup:snap task+script(live.db)+artifacts' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 16 灾备探针丢失（§P0-B 现网生效无人复核）"; exit 1; }
+grep -qF 'script 为旧版' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 探针丢失脚本内容版本判据（退化成只查任务在位=假绿）"; exit 1; }
+grep -qF 'quant-backup-snap' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 探针不再核对计划任务名"; exit 1; }
+# 负锁：注册步不得改成"文件不在也照样建任务"（那会把失败推到第二天 04:00 的静默期）。
+grep -qF 'backup snapshot script not found' deploy/qmt-win/register_backup_task.ps1 \
+	|| { echo "--- FAIL: register_backup_task.ps1 丢失脚本在位前置校验"; exit 1; }
+# 负锁②：备份链注册失败必须可见（|| echo 提示可以，但不得静默吞成成功）。
+if ! grep -qE '快照计划任务注册未通过' scripts/deploy_guangzhou.sh; then
+	echo "--- FAIL: 部署步 [2e] 注册失败不再打印可见告警"; exit 1; fi
+echo "ok - §LIVEBACKUP-DEPLOY 专项守卫通过（清单正锁 3 + 同源锁 2 + 探针锁 3 + 负锁 2）"
+
 echo ""
 echo "==> 全部通过"

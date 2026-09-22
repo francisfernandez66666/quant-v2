@@ -81,6 +81,8 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 	f, ok := c.execRef().(SettlementFetcher)
 	if !ok {
 		log.Printf("[settle] 当前执行器不支持交割单（Noop/桩），跳过 %s", day)
+		// 不适用 = 0（§DEADGAUGE 统一口径：未知/不适用一律写 0，既不伪造"有差异"也不留残值）。
+		metrics.SetGauge("settlement_diff_count", 0)
 		return nil, nil
 	}
 	if mode == "" {
@@ -92,6 +94,8 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 	}
 	if !resp.Connected {
 		log.Printf("[settle] 网关未连接，交割单不可信，跳过 %s", day)
+		// 同上：本轮不可判 → 写 0 不适用，不把"没对成"伪装成"对出差"，也不留上一轮的残值。
+		metrics.SetGauge("settlement_diff_count", 0)
 		return nil, nil
 	}
 
@@ -202,6 +206,13 @@ func (c *Controller) SettleDay(day, mode string) (*store.SettlementDiff, error) 
 	if err := c.store.SaveSettlementDiff(c.userID, *diff); err != nil {
 		return nil, err
 	}
+	// §DEADGAUGE（2026-09-23 傍晚批收尾）：告警规则 settlement_diff（量规 settlement_diff_count，
+	// p1「交割单对账出现差异」）自 09-15 注册以来全仓无赋值点 = 永不触发的死规则（audit N-1 同族，
+	// 那次是 settle_fail_streak）。差异条数在这里第一次成为已知量，且本函数同时服务定时链
+	// （MaybeSettleDay）与手工链（POST /api/qmt/settle），在此赋值即两条链同源覆盖。
+	// 注意取「三类条数之和」而非 diff 是否为 nil：sync_fills 补记后会清空 missing，但多余/不符
+	// 仍需按当日实况告警，故必须在落库/日志口径之后统计。
+	metrics.SetGauge("settlement_diff_count", int64(len(diff.MissingInLocal)+len(diff.ExtraInLocal)+len(diff.Mismatch)))
 	log.Printf("[settle] %s 三方对账完成: 缺失=%d 多余=%d 不符=%d 费用差=%.2f 现金差=%.2f (mode=%s)",
 		day, len(diff.MissingInLocal), len(diff.ExtraInLocal), len(diff.Mismatch),
 		diff.FeeDiff, diff.CashDiff, mode)

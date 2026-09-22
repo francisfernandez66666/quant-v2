@@ -104,6 +104,23 @@ func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 // self-check only counted env keys and misreported UI-saved pools.）
 func (c *Client) KeyCount() int { return len(c.apiKeys) }
 
+// KeysInCooldown 返回当前处于冷却窗（401/403、429、5xx 后暂时避开）的密钥只数，供告警量规
+// llm_cooldown_count 消费（§DEADGAUGE 2026-09-23：该规则自 09-15 注册起无赋值点 = 死规则）。
+// 口径与 pickKey 完全一致：槽位 coolUntil 严格大于当下才算冷却中；单 key 池恒为 0
+// （markKeyStatus 对单 key 不标记——没有可回避的备用，标记无意义）。只数数，绝不触碰/返回密钥本身。
+// English: counts key-pool slots currently in cooldown (same predicate as pickKey uses); always 0
+// for single-key pools, since markKeyStatus skips them. Never exposes key material.
+func (c *Client) KeysInCooldown() int {
+	now := time.Now().Unix()
+	n := 0
+	for i := range c.keyCoolUntil {
+		if c.keyCoolUntil[i].Load() > now {
+			n++
+		}
+	}
+	return n
+}
+
 // providerBaseVersionRe 供应商 base URL 的「版本段」形态：v1 / v2 / v1beta / v1.0 …
 var providerBaseVersionRe = regexp.MustCompile(`^v\d+([a-z0-9.\-]*)$`)
 

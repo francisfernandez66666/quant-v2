@@ -1255,6 +1255,8 @@ func (e *Engine) saveM8Peak(peak float64) {
 //
 // 统一口径：未知/不适用（未配置采集器、从未采集、未开实盘、从未上报）一律写 0——既不伪造
 // "新鲜"也不伪造"陈旧"；侧全是 gt 阈值，0 恒不触发。
+// §DEADGAUGE（2026-09-23）追加：本函数是打分链每轮的「喂量规」入口，除两条新鲜度外还喂
+// llm_cooldown_count（LLM 密钥池冷却只数）——函数名沿用历史，语义已扩为"周期量规刷新"。
 // English: §UPDLINK — feed the two freshness gauges the alert evaluator consumes (quote snapshot age,
 // sampled only during the session; and gateway uplink report age). Unknown/not-applicable writes 0,
 // which never trips a gt rule.
@@ -1282,4 +1284,14 @@ func (e *Engine) refreshStalenessGauges() {
 		}
 	}
 	metrics.SetGauge("uplink_staleness_sec", uplinkAge)
+
+	// §DEADGAUGE（2026-09-23 傍晚批收尾）：LLM 密钥池冷却只数喂给规则 llm_cooldown（p2，阈值 >2）。
+	// 该规则 09-15 注册至今没有任何赋值点 = 永不触发（audit N-1 死规则同族第三例）。冷却态取客户端
+	// 内部真值（KeysInCooldown 与 pickKey 同一判据），未配置 LLM / 单 key 池恒 0 —— 与上面
+	// 「未知/不适用写 0」统一口径一致，既不伪造"池子健康"也不伪造"池子在冷却"。
+	llmCool := int64(0)
+	if c := e.LLMClient(); c != nil {
+		llmCool = int64(c.KeysInCooldown())
+	}
+	metrics.SetGauge("llm_cooldown_count", llmCool)
 }

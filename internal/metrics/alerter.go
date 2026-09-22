@@ -33,6 +33,11 @@ type AlertRule struct {
 func DefaultAlertRules() []AlertRule {
 	return []AlertRule{
 		{Name: "breaker_open", Metric: "breaker_active", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "实盘网关熔断中"},
+		// §DEADGAUGE（2026-09-23 傍晚批收尾）：下面三条规则 09-15 注册时都只有规则没有数据源
+		// （全仓无 SetGauge 赋值点 = 永不触发，audit N-1 同族），现各自接上真实来源：
+		//   order_fail_rate_milli ← 本包 order_rate.go（§R4-9 累计计数器做 5 分钟窗增量换算）
+		//   settlement_diff_count ← trading/settlement.go（三方对账三类差异条数之和）
+		//   llm_cooldown_count    ← engine/scoring_loop.go（llm.Client.KeysInCooldown，与 pickKey 同判据）
 		{Name: "order_fail_rate", Metric: "order_fail_rate_milli", Op: "gt", Threshold: 50, For: "300s", Level: "p1", Message: "下单失败率 >5%（连续5分钟）"},
 		{Name: "quote_stale", Metric: "quote_staleness_sec", Op: "gt", Threshold: 60, For: "60s", Level: "p2", Message: "行情报价陈旧 >60s"},
 		// §UPDLINK（2026-09-22 H-4）：网关→引擎上行回报链停摆。网关心跳 60s 一发，连续 5 个周期
@@ -175,6 +180,9 @@ func GlobalAlerter() *Alerter { return globalAlerter }
 // the injected AlertSink with cooldown + paired alert/resolved; the rest are aggregated daily).
 // Signature is unchanged — the engine calls it with no arguments every ~30s.
 func RunAlertEvaluation() {
+	// §DEADGAUGE（2026-09-23）：派生量规先于评估刷新。order_fail_rate_milli 的数据源是本包内的
+	// 累计计数器（§R4-9），由评估节拍换算成窗口失败率——不先刷新一轮，快照里永远是上一轮的值。
+	refreshOrderFailRateGauge()
 	events := globalAlerter.Evaluate(DefaultAlertRules(), gaugeSnapshot())
 	for _, d := range globalAlertRouter.Route(events) {
 		alertOutput.emit(d)

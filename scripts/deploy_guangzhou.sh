@@ -270,6 +270,28 @@ $SCP deploy/qmt-win/register_web_service.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/
 $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/register_web_service.ps1 -DeployDir '${DEPLOY_DIR}' -CaddyConfSrc '${DEPLOY_DIR}/guangzhou.conf.new' -ProbeConfigPath '${DEPLOY_DIR}/qmt-win/service_probe_config.ps1'" \
   || echo "  [!] quant-web 注册/健康确认未通过（退出码非 0）——引擎与网关部署不受影响，但 verify_deploy 的 svc:quant-web / web:/ 探针会红，按上方输出修复后单独重跑本步或 ./scripts/verify_deploy_guangzhou.sh 复核"
 
+# ── 2e. 夜间快照备份链随部署下发（§P0-B 收编，2026-09-23）──
+# 背景：backup_snapshot.ps1 / backup_snap.py 历史上是**手工安装**，一直不在本脚本的 scp 清单里。
+#       于是 §P0-B 把备份对象从「trading.db + 9 个 JSON」扩到「+ live.db + accounts/ 整目录」之后，
+#       改好的脚本仍躺在仓库、现网 04:00 跑的还是只快照 trading.db 的旧版——施工面修好了、部署面
+#       没有通路，结果就是**实盘四本账依旧无灾备**（同族教训：§ENH-5 quote_feed.py 漏列、
+#       §A5-DEPLOY trading_calendar.py 漏列，新增部署文件必须入清单）。
+# 落盘目录刻意取 ${DEPLOY_DIR}/deploy/qmt-win 而非其它 qmt-win：这是 register_backup_task.ps1
+#       的默认路径、RUNBOOK_LIVEBACKUP §2 的手工安装路径、以及现网在跑任务指向三者同源的位置；
+#       换目录等于制造"部署更新一份、任务执行另一份"的双份脚本漂移。
+# 语义：上传 + 幂等重注册（先删后建，任务参数与脚本在位性一并核对；脚本内容随 scp 已更新，
+#       在跑任务下次触发即载入新版）。注册失败**只告警不阻断**——灾备链坏了不该把前后端发布
+#       卡在半态，但 verify 第 16 探针会持续判红直到修好。
+echo "[2e/5] 同步广州夜间快照备份链 (§P0-B) ..."
+BACKUP_DIR="${DEPLOY_DIR}/deploy/qmt-win"
+$SSH "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path $BACKUP_DIR | Out-Null\""
+ps1_bom deploy/qmt-win/backup_snapshot.ps1
+ps1_bom deploy/qmt-win/register_backup_task.ps1
+$SCP deploy/qmt-win/backup_snapshot.ps1 deploy/qmt-win/backup_snap.py deploy/qmt-win/register_backup_task.ps1 \
+     "${GZ_USER}@${GZ_IP}:${BACKUP_DIR}/"
+$SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${BACKUP_DIR}/register_backup_task.ps1 -ScriptPath ${BACKUP_DIR}/backup_snapshot.ps1" \
+  || echo "  [!] 快照计划任务注册未通过（退出码非 0）——前后端发布不受影响，但 §P0-B 灾备尚未生效：按 RUNBOOK_LIVEBACKUP.md §2 处理后重跑本步即可"
+
 # ── 3. 数据目录 + 默认 config.json（影子模式：qmt.enabled=false）──
 # §UAT 20260915 部署加固：原内联 SSH 命令的 bash→PS 双层转义在每个部署日都报 ParserError
 # 噪音，现抽为独立脚本上传后执行（转义链路归零；已有 config 一律保留不覆盖）。

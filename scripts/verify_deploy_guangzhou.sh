@@ -23,6 +23,10 @@
 #      已保存的非空 llm_api_key(s)——§UI-AUTHORITATIVE 下 env 只是 bootstrap，硬要求 env 会造
 #      永久性假红）。注册脚本洗掉密钥后仍会打印"registered"，故必须在部署面独立复核
 #      （只报键名/布尔，绝不报值）
+#   9) §P0-B 收编（2026-09-23，第 16 探针）：夜间快照灾备链生效复核——任务 quant-backup-snap 在位
+#      + 落盘脚本在位且**内容认识 live.db**（旧版只快照 trading.db，光看"任务在跑"会完全假绿）
+#      + 产物 SNAPSHOT_OK.ok=true 且 dbs 同时含 trading.db/live.db（字节>0）、accounts_files>0、
+#      标记新鲜度 ≤30h（任务存在但每晚失败只有时间戳能暴露）
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
@@ -37,6 +41,8 @@ APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 COMMIT="${COMMIT:-$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 DEPLOY_DIR="${DEPLOY_DIR:-C:/opt/quant}"
 DATA_DIR="${DATA_DIR:-C:/var/lib/quant-trading-v2}"   # §N-5 第 15 探针：auth.json（LLM 权威源）所在
+BACKUP_DIR="${BACKUP_DIR:-${DEPLOY_DIR}/deploy/qmt-win}"   # §P0-B 第 16 探针：快照脚本落盘位（= 部署步 [2e]）
+SNAP_DIR="${SNAP_DIR:-C:/var/lib/quant-snapshot}"          # §P0-B 第 16 探针：每晚产物 + SNAPSHOT_OK 所在
 ENGINE_PORT="${ENGINE_PORT:-8081}"
 WEB_PORT="${WEB_PORT:-8080}"
 GW_PORT="${GW_PORT:-8789}"
@@ -58,7 +64,10 @@ param(
     [int]$WebPort = 8080,
     [int]$GwPort = 8789,
     # §N-5 第 15 探针用：运营数据目录（auth.json 落这里，LLM 权威源＝设置页保存）。
-    [string]$DataDir = "C:\var\lib\quant-trading-v2"
+    [string]$DataDir = "C:\var\lib\quant-trading-v2",
+    # §P0-B 第 16 探针用：快照脚本落盘目录 + 每晚产物目录（与部署步 [2e] 同源）。
+    [string]$BackupDir = "C:\opt\quant\deploy\qmt-win",
+    [string]$SnapDir = "C:\var\lib\quant-snapshot"
 )
 $ErrorActionPreference = "Continue"
 
@@ -206,6 +215,53 @@ $envMissing = @($envNeed | Where-Object { $haveKeys -notcontains $_ })
 if ($haveKeys -notcontains 'LLM_API_KEY') { if (-not $llmSaved) { $envMissing += 'LLM-source' } }
 $envDetail = "nssm=" + $(if ($nssmFound) { "ok" } else { "not-found(只按机器级判定)" }) + " 缺项=" + ($envMissing -join ",") + "（只报键名/布尔，未回显值）"
 Probe "engine:quant env HITHINK key + LLM source" ($envMissing.Count -eq 0) $envDetail
+
+# 9) §P0-B 收编（2026-09-23，第 16 探针）：夜间快照灾备链在现网真的生效了吗？
+#
+# 为什么必须有这条：backup_snapshot.ps1 / backup_snap.py 历史上不在部署 scp 清单里（手工安装），
+#   §P0-B 把备份对象扩到 live.db + accounts/ 之后，"仓库改好了 + 任务在跑 + 产物每天在出"三件事
+#   同时成立却仍然只快照 trading.db——现网跑的是旧版脚本。只看"任务存在"会给出完全假绿，
+#   而这条链守的是**实盘四本账的唯一灾备**（盘坏即全损、无补救）。
+# 四段判据（缺项名直接写进 FAIL 明细，不必再上机二查）：
+#   ① 任务 quant-backup-snap 在位；② 落盘脚本在位且**内容认识 live.db**（新版判据）；
+#   ③ 产物标记 SNAPSHOT_OK.ok=true 且 dbs 同时含 trading.db/live.db 且字节数>0、accounts_files>0；
+#   ④ 标记新鲜度 ≤30h（任务存在但每晚失败的形态只有靠时间戳才能暴露）。
+# 全程只读，不触发备份、不碰 restic（首跑由部署侧 schtasks /Run 负责，见 RUNBOOK §2）。
+$bkMissing = @()
+schtasks /Query /TN "quant-backup-snap" 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) { $bkMissing += "task:quant-backup-snap" }
+$bkPs1 = $BackupDir + "\backup_snapshot.ps1"
+$bkPy  = $BackupDir + "\backup_snap.py"
+if (-not (Test-Path $bkPs1)) { $bkMissing += "script:backup_snapshot.ps1" }
+if (-not (Test-Path $bkPy))  { $bkMissing += "script:backup_snap.py" }
+if (Test-Path $bkPs1) {
+    # 内容版本判据取运行期代码行（注释里也会提 live.db，故按 "$DbItems" 数组形态匹配）
+    $bkTxt = ""
+    try { $bkTxt = Get-Content -Path $bkPs1 -Raw -Encoding UTF8 } catch { $bkTxt = "" }
+    if ($bkTxt -notmatch '\$DbItems\s*=\s*@\([^)]*live\.db') { $bkMissing += "script 为旧版（无 live.db 快照项）" }
+}
+$bkMark = $SnapDir + "\SNAPSHOT_OK"
+if (-not (Test-Path $bkMark)) {
+    $bkMissing += "产物:SNAPSHOT_OK 缺失（今晚 04:00 那次没跑成）"
+} else {
+    try {
+        $bj = Get-Content -Path $bkMark -Raw -Encoding ASCII | ConvertFrom-Json
+        if (-not [bool]$bj.ok) { $bkMissing += ("产物:ok=false(" + $bj.err + ")") }
+        $dbs = @()
+        if ($null -ne $bj.dbs) { $dbs = @($bj.dbs.PSObject.Properties.Name) }
+        foreach ($need in @("trading.db", "live.db")) {
+            $bytes = 0
+            if ($null -ne $bj.dbs -and $null -ne $bj.dbs.$need) { $bytes = [int64]$bj.dbs.$need }
+            if (($dbs -notcontains $need) -or ($bytes -le 0)) { $bkMissing += ("产物:dbs." + $need) }
+        }
+        if ([int64]$bj.accounts_files -le 0) { $bkMissing += "产物:accounts_files=0" }
+        $markAgeH = -1.0
+        try { $markAgeH = ([datetime]::Now - [datetime]::ParseExact($bj.ts, "yyyy-MM-ddTHH:mm:ss", $null)).TotalHours } catch { }
+        if ($markAgeH -lt 0) { $bkMissing += "产物:ts 不可解析" }
+        elseif ($markAgeH -gt 30) { $bkMissing += ("产物:标记已 " + [math]::Round($markAgeH) + "h 未更新") }
+    } catch { $bkMissing += "产物:SNAPSHOT_OK 解析失败" }
+}
+Probe "backup:snap task+script(live.db)+artifacts" ($bkMissing.Count -eq 0) ("缺项=" + ($bkMissing -join ","))
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -214,7 +270,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
-out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
+out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
 
 PASS=0
 FAIL=0

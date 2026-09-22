@@ -25,8 +25,9 @@
 # 编码：运行期日志行保持 ASCII（Add-Content 在 PS5.1 走系统 ANSI 码页，中文会变 '?'，
 #   且本文件历史上就是 ASCII-only）；但自本版起含中文注释 ⇒ **文件必须带单个 UTF-8 BOM**，
 #   否则 PS5.1 按 GBK 解析中文注释直接 ParserError（教训见 §ENH-A run_ths_backfill.ps1 锁）。
-#   本文件不在 scripts/deploy_guangzhou.sh 的 scp 清单里（历史上是手工安装），上机按
-#   RUNBOOK_LIVEBACKUP.md 走；若日后收编进部署链，必须走 ps1_bom 归一（UTF-8 单 BOM + CRLF）。
+#   本文件自 2026-09-23（§P0-B 收编）起随 scripts/deploy_guangzhou.sh 步 [2e] 自动下发到
+#   C:\opt\quant\deploy\qmt-win\（与计划任务指向同源），不再依赖手工安装；部署链会先跑
+#   ps1_bom 归一（UTF-8 单 BOM + CRLF）。手工上机口径保留在 RUNBOOK_LIVEBACKUP.md §2 作应急路径。
 $ErrorActionPreference = "Stop"
 
 $DataDir  = "C:\var\lib\quant-trading-v2"

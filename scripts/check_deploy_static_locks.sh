@@ -105,6 +105,15 @@ check("L3.deploy 上传并执行 register_web_service.ps1（M7b）",
 check("L3.deploy 上传并执行 ensure_gateway_config.ps1 + 模板（M7c）",
       "ensure_gateway_config.ps1" in dep and "config.xt.template.json" in dep)
 check("L3.deploy 继续上传 §H8 探针单源（不得回退）", "service_probe_config.ps1" in dep)
+# §P0-B 收编（2026-09-23）：备份链历史上手工安装、不在清单 ⇒ 仓库改到含 live.db 了，现网 04:00
+# 仍跑旧版（实盘四本账无灾备而三项全绿）。三件必须随部署下发，且落盘位与任务指向同源。
+check("L3.deploy 上传夜间快照三件（§P0-B 收编）",
+      "backup_snapshot.ps1" in dep and "backup_snap.py" in dep and "register_backup_task.ps1" in dep)
+check("L3.deploy 快照落盘目录 = 计划任务默认指向（防双份脚本漂移）",
+      'BACKUP_DIR="${DEPLOY_DIR}/deploy/qmt-win"' in dep)
+bkps = rd("deploy/qmt-win/register_backup_task.ps1")
+check("L3.register_backup_task 建任务前先验脚本在位（失败不拖到明晚 04:00 静默）",
+      "Test-Path $script" in bkps and "not found" in bkps)
 webps = rd("deploy/qmt-win/register_web_service.ps1")
 check("L3.register_web_service 引用 ${ProbeCaddyPort}（§H8 同源）", "$ProbeCaddyPort" in webps)
 # §M7b-1（2026-09-22 部署实录，双重根因）：①caddy validate 的 INFO 日志走 stderr，PS 5.1 在
