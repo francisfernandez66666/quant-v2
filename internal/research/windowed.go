@@ -114,7 +114,25 @@ func (p *stageProgress) tick() {
 	log.Printf("发现进度 %d%%", pct)
 }
 
-// discoveryResumeKey 断点键：任何影响结果的参数（区间/前瞻/最小样本/窗口宽/因子池/股票池）
+// AdjBaselineVersion 日K复权取数口径版本号：**改动 store.HfqBars/RawBars 的取数语义时必须 bump**。
+//
+// 为什么必须进断点键（§ADJ-BASIS，2026-09-23）：research_ckpts 的 resume_key 原本只含
+// 区间/前瞻/窗口宽/因子池/股票池，唯独不含"数值口径"。于是 §ADJ(P0-A 复权因子前向填充) 这种
+// **入口不变、数值全变**的修复根本不会让旧断点失效——夜间链当晚照旧逐窗命中改前装配好的面板并
+// 跳过重算，新基线形同没上（本机 A/B 实测代价：5 分位首末层 5 日收益差 HighLow20 3.877%→-0.179%、
+// Volatility20 3.729%→-0.126%、Brk60 3.030%→0.030%，即"高波动/突破类因子有 3~4pp 分层能力"这一
+// 整条历史结论是除权日假跳空造出来的；详见 docs/HFQ_BASELINE_RECOMPUTE_20260923.md）。
+// 断点表自己的注释就写着"一般不调用删除，靠 key 轮换失效"——所以修法是把口径折进 key，
+// 而不是去生产库删行。
+// English: checkpoint keys carried no price-basis version, so a fix that changes values without changing
+// any input parameter would silently resume on stale pre-fix panels. Fold the basis into the key instead
+// of deleting rows. Bump this constant whenever the hfq/raw bar semantics change.
+const AdjBaselineVersion = "hfq-forward-fill-1"
+
+// adjBasisTag 拼进各断点键的口径位（前缀 "|" 由各 key 模板自行决定位置）。
+var adjBasisTag = "|adj=" + AdjBaselineVersion
+
+// discoveryResumeKey 断点键：任何影响结果的参数（区间/前瞻/最小样本/窗口宽/因子池/股票池/**复权口径**）
 // 变更都会生成新 key，旧缓存自动失效。English: checkpoint key — any result-affecting change rolls a fresh key.
 func discoveryResumeKey(start, end string, horizon, minStocks, winDays int, fids []string, codes []string, excl [][]string) string {
 	sorted := append([]string{}, fids...)
@@ -130,9 +148,9 @@ func discoveryResumeKey(start, end string, horizon, minStocks, winDays int, fids
 		ex = append(ex, strings.Join(s, "+"))
 	}
 	sort.Strings(ex)
-	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s|x%s",
+	return fmt.Sprintf("df|%s|%s|h%d|ms%d|w%d|%s|%s|x%s%s",
 		start, end, horizon, minStocks, winDays,
-		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10], strings.Join(ex, ","))
+		strings.Join(sorted, ","), hex.EncodeToString(sum[:])[:10], strings.Join(ex, ","), adjBasisTag)
 }
 
 // windowDays 每个窗口包含的交易日数。越小峰值内存越低、但装配次数越多（越慢）。
@@ -350,7 +368,8 @@ func WindowFactorIC(db *store.DB, codes []string, start, end string, fids []stri
 		return out
 	}
 	chunks := windowChunks(dates, windowDays)
-	ck := &winCkpt{db: db, resumeKey: "pfac-dedup:" + start + ":" + end, stage: "dedup"}
+	// §ADJ-BASIS：去重用的逐因子 IC 同样是从 HfqBars 装配出来的面板，口径位必须在 key 里。
+	ck := &winCkpt{db: db, resumeKey: "pfac-dedup:" + start + ":" + end + adjBasisTag, stage: "dedup"}
 	return windowICByAllFactors(db, codes, fids, h, min, chunks, dates, ck, newStageProgress(0, 1, len(chunks)))
 }
 

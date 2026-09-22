@@ -97,11 +97,15 @@ restore_services_on_exit() {
 }
 trap restore_services_on_exit EXIT
 
-# ps1_bom <file>：上传前把 Windows PowerShell 脚本归一为「UTF-8 单 BOM + CRLF」。
+# ps1_bom <file>：上传前把 Windows PowerShell 脚本归一为「UTF-8 单 BOM」——**只治 BOM，不改行尾**。
 # 为何需要：PS 5.1 读无 BOM 的 UTF-8 按 GBK 解析中文注释会撕裂字面量直接 ParserError（现网实录）；
 # 但历史上 restart_gateway.ps1 等已自带 BOM，若再无条件 cat 拼一个就成双 BOM——PS 报
 # 「无法将「?#」识别为 cmdlet」（本次部署实录：[3b] restart_gateway 首行噪音）。
 # 本函数幂等：先剥掉所有前导 BOM，再补恰好一个；不动已规范的字节序（CRLF 保留）。
+# 行尾为什么不管：仓库 .ps1 混着两种（run_ths_backfill.ps1 是 CRLF 且被锁死，backup_snapshot.ps1
+# 是 LF），现网 PS5.1 两种都实跑通过（09-23 注册步 + 快照脚本首跑）⇒ LF 不是故障源。在这里
+# 顺手转 CRLF 反而会把仓库副本改成与 git 里不一样，制造"现网能跑、仓库那份照着 RUNBOOK 装就
+# ParserError"的双份漂移（§BOM-REPO 同族），所以行尾只在需要的那一个脚本里单独约定。
 ps1_bom() {
   python3 - "$1" <<'PY'
 import sys
@@ -291,6 +295,19 @@ $SCP deploy/qmt-win/backup_snapshot.ps1 deploy/qmt-win/backup_snap.py deploy/qmt
      "${GZ_USER}@${GZ_IP}:${BACKUP_DIR}/"
 $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${BACKUP_DIR}/register_backup_task.ps1 -ScriptPath ${BACKUP_DIR}/backup_snapshot.ps1" \
   || echo "  [!] 快照计划任务注册未通过（退出码非 0）——前后端发布不受影响，但 §P0-B 灾备尚未生效：按 RUNBOOK_LIVEBACKUP.md §2 处理后重跑本步即可"
+# §P0-B 首跑（默认关，LIVEBACKUP_FIRST_RUN=1 打开）：注册成功只证明"任务在、脚本在位"，不证明
+#   备份会成功——09-23 现网实录是任务与脚本俱在、每晚却因中转仓库陈旧锁抛错，文件级快照看起来
+#   一切正常而 restic 增量早已停更。这个开关把"等下一次 04:00 才知道"压成"部署当场知道"。
+#   刻意不做成默认：首跑要整份快照 trading.db（GB 级）并喂 restic 中转仓库，磁盘余量虽由脚本自身
+#   8GB 护栏兜住（不足即 ok:false 退 1），仍是需要运维择窗的动作，不该随每次部署自动发生。
+if [ "${LIVEBACKUP_FIRST_RUN:-0}" = "1" ]; then
+  echo "  [2e] LIVEBACKUP_FIRST_RUN=1 -> 当场首跑快照链 ..."
+  if $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${BACKUP_DIR}/backup_snapshot.ps1"; then
+    echo "  OK 首跑退出码 0（判据：verify_deploy_guangzhou.sh 第 16 探针，或 SNAPSHOT_OK 的 dbs 两库齐）"
+  else
+    echo "  [!] 首跑非零退出——失败原因已写进 SNAPSHOT_OK(ok:false,err=...) 与 _snapshot.log，按 RUNBOOK §2 步骤 4 逐条对判据"
+  fi
+fi
 
 # ── 3. 数据目录 + 默认 config.json（影子模式：qmt.enabled=false）──
 # §UAT 20260915 部署加固：原内联 SSH 命令的 bash→PS 双层转义在每个部署日都报 ParserError

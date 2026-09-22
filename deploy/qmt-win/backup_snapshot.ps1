@@ -63,6 +63,19 @@ if ($PythonCmd) { $Python = $PythonCmd.Source } else { $Python = "C:\Python312\p
 
 function Log($m) { $line = (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " " + $m; Add-Content -Path $Log -Value $line; Write-Host $line }
 
+# Invoke-Native：以「stderr 不再是终止性错误」的语义跑原生命令，返回 @{code; out}。
+# 存在理由见调用点注释（$ErrorActionPreference='Stop' + 原生 stderr 会被 PS5.1 升级成终止错误）。
+# 说明：参数名刻意用 CmdArgs——$Args 是 PS 自动变量，占用会静默改语义。
+function Invoke-Native {
+    param([string]$Exe, [string[]]$CmdArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $o = & $Exe @CmdArgs 2>&1
+    $c = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    return @{ code = $c; out = @($o | ForEach-Object { [string]$_ }) }
+}
+
 New-Item -ItemType Directory -Force -Path $SnapRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
 
@@ -146,10 +159,37 @@ try {
     if (!(Test-Path $Restic)) { throw "restic.exe missing at $Restic" }
     if (!(Test-Path $Pass))   { throw "restic-pass.txt missing at $Pass" }
     $env:RESTIC_PASSWORD_FILE = $Pass
-    & $Restic backup -r $RepoDir $SnapRoot --tag nightly 2>&1 | ForEach-Object { Log ("restic: " + $_) }
-    if ($LASTEXITCODE -ne 0) { throw "restic backup exit=$LASTEXITCODE" }
+    # §RESTIC-LOCK（2026-09-23 §P0-B 现网首跑前置排障，verify 第 16 探针判红锤实）：
+    # 中转仓库会被 **Mac 拉取器**留下的陈旧锁毒化——`restic copy` 会锁源仓库，拉取进程被中断时
+    # 锁文件留在仓库里，且锁内记录的是 Mac 的 PID/主机名（实录：`already locked by PID 25716 on
+    # MafiaMacBook-Air.local by zhangzifei (UID 501, GID 20)`），Windows 端无从自证其失效。后果不是
+    # "当晚少一次增量"这么简单：backup 直接失败 → 走 catch 写 ok:false → Mac 拉取器读到非 ok 就不
+    # 再 copy，异地半边从此**永久停更**，而文件级快照每晚照常刷新（看起来一切正常）。
+    # 处置口径：只在退出码非 0 **且**错误文本命中 `already locked` 时 unlock 一次并重试一次；
+    # 其它错误一律如实抛。绝不无条件 unlock——那等于在有真实并发写入时把互斥拆掉。
+    # 为什么必须包 Invoke-Native 这一层：本文件顶部是 $ErrorActionPreference='Stop'，PS5.1 在该
+    # 语义下把原生命令写出的**每一行 stderr 升级为终止性错误**（同族实录：run_ths_backfill.ps1
+    # 首跑退出码 1 日志 0 字节、caddy validate 的 INFO 日志杀掉 [2d]）。restic 的习惯是把进度和
+    # 提示也写 stderr ⇒ "备份其实成功、脚本判失败"。唯一可信判据是退出码。
+    $bkArgs = @("backup", "-r", $RepoDir, $SnapRoot, "--tag", "nightly")
+    $bk = Invoke-Native $Restic $bkArgs
+    foreach ($l in $bk.out) { Log ("restic: " + $l) }
+    if ($bk.code -ne 0) {
+        $txt = $bk.out -join ' '
+        if ($txt -notmatch 'already locked') { throw ("restic backup exit=" + $bk.code + ": " + $txt) }
+        Log "restic: 检出陈旧锁 -> unlock 后重试一次"
+        $ulArgs = @("unlock", "-r", $RepoDir)
+        $ul = Invoke-Native $Restic $ulArgs
+        foreach ($l in $ul.out) { Log ("restic-unlock: " + $l) }
+        $bk2 = Invoke-Native $Restic $bkArgs
+        foreach ($l in $bk2.out) { Log ("restic-retry: " + $l) }
+        if ($bk2.code -ne 0) { throw ("restic backup retry exit=" + $bk2.code + ": " + ($bk2.out -join ' ')) }
+    }
     # Transient relay retention (Mac keeps the long history): 3 days + 2 weeks.
-    & $Restic forget --repo $RepoDir --keep-daily 3 --keep-weekly 2 --prune 2>&1 | ForEach-Object { Log ("restic-forget: " + $_) }
+    $fgArgs = @("forget", "--repo", $RepoDir, "--keep-daily", "3", "--keep-weekly", "2", "--prune")
+    $fg = Invoke-Native $Restic $fgArgs
+    foreach ($l in $fg.out) { Log ("restic-forget: " + $l) }
+    if ($fg.code -ne 0) { throw ("restic forget/prune exit=" + $fg.code + ": " + ($fg.out -join ' ')) }
     Remove-Item Env:RESTIC_PASSWORD_FILE
 
     # 6) Marker for the Mac puller: freshness + per-db size + integrity + accounts file count.

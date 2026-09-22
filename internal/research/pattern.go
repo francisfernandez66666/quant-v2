@@ -377,12 +377,14 @@ func discoverPatternsWindowedRaw(db *store.DB, codes []string, start, end string
 	}, len(combos))
 	baseSum, baseN := 0.0, 0
 
-	rk := fmt.Sprintf("dp|%s|%s|h%d|mt%d|%.2f|%.0f|%s",
+	// §ADJ-BASIS：形态扫描的面板同样来自 HfqBars，复权口径变更必须使形态断点失效
+	// （口径位与 discoveryResumeKey 同一常量，见 windowed.go）。
+	rk := fmt.Sprintf("dp|%s|%s|h%d|mt%d|%.2f|%.0f|%s%s",
 		start, end, opts.Horizon, opts.MinTrigger, opts.MinExcess, opts.SplitPct*100,
 		func() string {
 			sum := sha256.Sum256([]byte(fmt.Sprintf("%v", codes)))
 			return hex.EncodeToString(sum[:])[:10]
-		}())
+		}(), adjBasisTag)
 	log.Printf("[discover-patterns] 断点key=%s 窗口数=%d", rk, len(chunks))
 	prog := newStageProgress(5, 95, len(chunks))
 

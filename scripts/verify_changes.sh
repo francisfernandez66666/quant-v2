@@ -1531,7 +1531,49 @@ grep -qF 'backup snapshot script not found' deploy/qmt-win/register_backup_task.
 # 负锁②：备份链注册失败必须可见（|| echo 提示可以，但不得静默吞成成功）。
 if ! grep -qE '快照计划任务注册未通过' scripts/deploy_guangzhou.sh; then
 	echo "--- FAIL: 部署步 [2e] 注册失败不再打印可见告警"; exit 1; fi
-echo "ok - §LIVEBACKUP-DEPLOY 专项守卫通过（清单正锁 3 + 同源锁 2 + 探针锁 3 + 负锁 2）"
+# §RESTIC-LOCK（09-23 现网首跑前置排障锤实的两个缺陷，都属"任务在跑、看起来正常、其实早已停更"）：
+# ①陈旧锁只允许"命中 already locked 才 unlock 并重试一次"——无条件 unlock 等于拆掉并发互斥。
+grep -qF 'already locked' deploy/qmt-win/backup_snapshot.ps1 \
+	|| { echo "--- FAIL: 快照脚本丢失 restic 陈旧锁判别（Mac 拉取器崩溃留下的锁会让备份每晚静默停更）"; exit 1; }
+grep -qF 'Invoke-Native' deploy/qmt-win/backup_snapshot.ps1 \
+	|| { echo "--- FAIL: 快照脚本丢失 Invoke-Native（Stop 语义下原生 stderr 会变终止错误）"; exit 1; }
+# 负锁③：不得回到"裸管道把原生命令输出直接喂 Log"的写法——那正是 restic 成功却判失败的成因。
+# （只判非注释行：注释里会原样提到旧形态作为反面说明。）
+if grep -nE '& \$Restic [a-z]+ .*2>&1 \| ForEach-Object' deploy/qmt-win/backup_snapshot.ps1 \
+	| grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: 快照脚本又出现裸管道调用 restic（ErrorActionPreference=Stop 下 stderr 即终止错误）"; exit 1; fi
+# 负锁④：首跑必须是显式开关触发的运维动作，不得变成每次部署自动搬 GB 级快照。
+grep -qF 'LIVEBACKUP_FIRST_RUN:-0' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署步 [2e] 首跑开关失去默认关闭语义（每次部署自动 GB 级快照+restic 写入）"; exit 1; }
+echo "ok - §LIVEBACKUP-DEPLOY 专项守卫通过（清单正锁 3 + 同源锁 2 + 探针锁 3 + 锁面正锁 2 + 负锁 4）"
+
+# ── 71. §ADJ-BASIS 复权口径进断点键（2026-09-23 本机 A/B 锤实的"重算覆盖"前置缺陷）──
+# resume_key 原本只含 区间/参数/股票池，**不含数值口径**。于是 §ADJ（因子前向填充）这种
+# "入口不变、数值全变"的修复不会让任何旧断点失效：夜间链照旧逐窗命中改前装配好的面板并跳过
+# 重算——即"已经修好复权"与"研究结论仍是复权前口径"可以同时为真，且全绿无声。
+# 实测代价（本机同二进制双构建 A/B，604 只抽样 / 20230801~20260922）：
+#   HighLow20 分层首末差 3.877%→-0.179%、Volatility20 3.729%→-0.126%、Brk60 3.030%→0.030%，
+#   即"高波动/突破类因子有 3~4pp 分层能力"整条历史结论是除权日假跳空造出来的。
+# 本段把"口径位必须在键里"钉成静态契约（新增键生成点若漏掉口径位即判红）。
+echo ""
+echo "==> 71 §ADJ-BASIS 复权口径位进断点键（防「修好了但结论没重算」）..."
+for site in internal/research/windowed.go internal/research/pattern.go; do
+	grep -qF 'adjBasisTag' "$site" \
+		|| { echo "--- FAIL: $site 的断点键不再携带复权口径位（复权修复后夜间链会照旧复用改前面板）"; exit 1; }
+done
+# 三处键生成点逐点核对（discoveryResumeKey / pfac-dedup / 形态 dp），漏一处就等于那一路永不重算。
+grep -qE 'return fmt\.Sprintf\("df\|.*%s%s"' internal/research/windowed.go \
+	|| { echo "--- FAIL: 因子发现主键 df| 模板丢失口径位"; exit 1; }
+grep -qE '"pfac-dedup:" \+ start \+ ":" \+ end \+ adjBasisTag' internal/research/windowed.go \
+	|| { echo "--- FAIL: 逐因子去重缓存键 pfac-dedup 丢失口径位"; exit 1; }
+grep -qE 'fmt\.Sprintf\("dp\|.*%s%s"' internal/research/pattern.go \
+	|| { echo "--- FAIL: 形态扫描键 dp| 丢失口径位"; exit 1; }
+# 口径常量必须存在且被测试认识（改口径不 bump＝换键失败＝沿用旧面板）。
+grep -qE 'AdjBaselineVersion = "hfq-forward-fill-1"' internal/research/windowed.go \
+	|| { echo "--- FAIL: AdjBaselineVersion 常量形态变更（请同步本锁与 docs/HFQ_BASELINE_RECOMPUTE_20260923.md）"; exit 1; }
+if ! go test ./internal/research -run 'TestDiscoveryResumeKeyCarriesAdjBasis|TestCkptRotationOnBasisBump' -count=1 >/dev/null 2>&1; then
+	echo "--- FAIL: §ADJ-BASIS 断点键回归测试未通过（旧键复用/新键不稳定）"; exit 1; fi
+echo "ok - §ADJ-BASIS 守卫通过（键位正锁 3 + 常量锁 1 + 回归测试 2）"
 
 echo ""
 echo "==> 全部通过"
