@@ -28,11 +28,20 @@ type SettlementDiff struct {
 }
 
 // ListFillsByDay 返回某账号指定交易日（traded_at 前缀 yyyy-MM-dd）的全部成交，按 traded_at 升序。
-// English: lists a user's fills for one trading day (traded_at prefix), ascending by time.
+// §FILL-AMEND（2026-09-23）：改读 fills_effective 视图。本函数是两处的共同输入——
+//   - TodayRealizedPnl（熔断闸的日内已实现盈亏）：它和 /api/qmt/trades 的已实现盈亏必须是
+//     同一个数，否则"改判后 trades 页有盈亏、熔断闸仍按 0 算"这种自相矛盾比错账更难查；
+//   - 券商交割单三方对账的本地腿：按 代码|方向|数量|价格 事实键与券商成交配对。人工勘误把
+//     方向改对之后，本地腿才应该和券商腿对上（改前它恰好报出"本地缺失+本地多余"一对假差异）。
+//
+// English: lists a user's fills for one trading day (traded_at prefix), ascending by time — read
+// through the amendment view so the realized-P&L breaker and the settlement local leg agree with
+// the discipline gates.
 func (d *DB) ListFillsByDay(userID, day string) ([]RealFill, error) {
 	rows, err := d.db.Query(`SELECT id, order_id, code, side, price, qty, amount, traded_at,
-		COALESCE(signal_id,''), COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(serial,'')
-		FROM fills WHERE user_id=? AND substr(traded_at,1,10)=? ORDER BY traded_at ASC`, userID, day)
+		COALESCE(signal_id,''), COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(serial,''),
+		COALESCE(trade_id,''), COALESCE(orig_side,''), COALESCE(amend_id,0)
+		FROM fills_effective WHERE user_id=? AND substr(traded_at,1,10)=? ORDER BY traded_at ASC`, userID, day)
 	if err != nil {
 		return nil, err
 	}
@@ -41,9 +50,11 @@ func (d *DB) ListFillsByDay(userID, day string) ([]RealFill, error) {
 	for rows.Next() {
 		var f RealFill
 		if err := rows.Scan(&f.ID, &f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount,
-			&f.TradedAt, &f.SignalID, &f.UserID, &f.Fee, &f.StampTax, &f.Serial); err != nil {
+			&f.TradedAt, &f.SignalID, &f.UserID, &f.Fee, &f.StampTax, &f.Serial,
+			&f.TradeID, &f.OrigSide, &f.AmendID); err != nil {
 			return nil, err
 		}
+		f.AmendKey = FillAmendKey(f.TradeID, f.OrderID, f.Code, f.TradedAt, f.Price, f.Qty)
 		out = append(out, f)
 	}
 	return out, rows.Err()

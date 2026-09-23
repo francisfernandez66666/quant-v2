@@ -84,6 +84,20 @@ type RealFill struct {
 	Fee      float64 `json:"fee,omitempty"`       // §WS-B 手续费（交割单回灌）
 	StampTax float64 `json:"stamp_tax,omitempty"` // §WS-B 印花税（交割单回灌）
 	Serial   string  `json:"serial,omitempty"`    // §WS-B 券商交割流水号（三方对账关联键）
+	// §FILL-AMEND（2026-09-23）勘误收敛点回填的元信息：本结构由 fills_effective 视图读出时，
+	// Side = **生效方向**（人工勘误优先），OrigSide = 柜台原始方向，AmendID>0 表示这笔已被勘误。
+	// 为什么必须同时带两者：前端逐笔改判入口要展示"原方向 → 现方向"，审计要能对上原行；
+	// 只回显生效方向会让人无法判断这笔是否已被人工动过（=最容易二次改错的形态）。
+	// 直接从原始 fills 表读的路径（判重/幂等）不填这些字段，零值即"未勘误"。
+	// English: Side is the EFFECTIVE direction (amended when a correction is applied); OrigSide
+	// keeps the raw broker direction, AmendID>0 marks a corrected row.
+	OrigSide      string `json:"orig_side,omitempty"`      // 柜台原始方向（未勘误时与 Side 相同）
+	AmendID       int64  `json:"amend_id,omitempty"`       // 生效勘误行 ID（0=未勘误）
+	AmendReason   string `json:"amend_reason,omitempty"`   // 勘误理由（审计回显）
+	AmendOperator string `json:"amend_operator,omitempty"` // 勘误提交人
+	// AmendKey 本行的勘误匹配键（Go 侧单点计算，见 FillAmendKey）：前端用它把"已提交、
+	// 尚未批准"的影子勘误挂到正确的成交行上。
+	AmendKey string `json:"amend_key,omitempty"`
 }
 
 // realTsCodeRe §F2（2026-09-22 修复批）：持仓对账行 ts_code 的合法格式——
@@ -633,11 +647,15 @@ func buyDateOf(tradedAt string) string {
 // TodayBoughtQty §WS-A T+1 可卖量辅助：统计某账号某代码在指定北京交易日的累计买入量
 // （含部成，不含撤单——fills 只记真实成交）。供卖出侧做 T+1 前置校验：
 // 可卖量 = 持仓量 − 当日买入量（当日买入的份额 T+1 才能卖）。
+// §FILL-AMEND（2026-09-23）：改读 fills_effective——这笔闸口径的语义就是"当日买入了多少股"，
+// 与三本纪律账同源。真实事故形态：09-22 一笔被误记成买入的 900 股卖出，把这 900 股按 T+1
+// 锁死成"当日买入不可卖"，而它本来就是卖出。人工勘误生效后锁必须自动解除。
 // English: WS-A T+1 sell-availability helper — sums a code's today-bought qty per user/day,
-// so sellable = held − todayBought (same-day buys are T+1 locked).
+// so sellable = held − todayBought (same-day buys are T+1 locked). Read through the amendment
+// view so a human re-booked sell stops locking shares it never bought.
 func (d *DB) TodayBoughtQty(userID, tsCode, day string) int {
 	var n int
-	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills_effective
 		WHERE user_id=? AND code=? AND side='买入' AND substr(traded_at,1,10)=?`,
 		userID, tsCode, day).Scan(&n); err != nil {
 		return 0
@@ -1245,11 +1263,16 @@ func (d *DB) UpdateRealOrderStatusMonotonic(userID, orderID, status string) (boo
 // §F1（2026-09-22 修复批）：SELECT 补齐 user_id/fee/stamp_tax 三列——此前读出恒为
 // 零值，导致 ① /api/qmt/trades 的账号归属过滤形同虚设（f.UserID 恒空按遗留全局放行），
 // ② 盈亏重放拿不到费用腿。COALESCE 兜底 ALTER 前的历史 NULL。
-// （RealFills returns all live fills, newest first; now carrying fee/stamp_tax/user legs.）
+// §FILL-AMEND（2026-09-23）：数据源由原始 fills 改为 **fills_effective 视图**——本函数是
+// handleQMTTrades 成交簿重放（已实现盈亏/胜负次数/按战法归因的买卖额）的唯一取数口，
+// 方向必须与三本纪律闸账（CountBuyFilledOrdersByDay 等）同源，否则同一笔改判会在两处给出
+// 互相矛盾的数字。原始柜台证据仍在 fills 表里一字未动（OrigSide 回显）。
+// （RealFills returns all live fills, newest first, with side resolved through the amendment view.）
 func (d *DB) RealFills() ([]RealFill, error) {
 	rows, err := d.db.Query(`SELECT id, order_id, code, side, price, qty, amount, traded_at, signal_id,
-		COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(trade_id,'')
-		FROM fills ORDER BY id DESC`)
+		COALESCE(user_id,''), COALESCE(fee,0), COALESCE(stamp_tax,0), COALESCE(trade_id,''),
+		COALESCE(orig_side,''), COALESCE(amend_id,0), COALESCE(amend_reason,''), COALESCE(amend_operator,'')
+		FROM fills_effective ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1258,9 +1281,11 @@ func (d *DB) RealFills() ([]RealFill, error) {
 	for rows.Next() {
 		var f RealFill
 		if err := rows.Scan(&f.ID, &f.OrderID, &f.Code, &f.Side, &f.Price, &f.Qty, &f.Amount, &f.TradedAt, &f.SignalID,
-			&f.UserID, &f.Fee, &f.StampTax, &f.TradeID); err != nil {
+			&f.UserID, &f.Fee, &f.StampTax, &f.TradeID,
+			&f.OrigSide, &f.AmendID, &f.AmendReason, &f.AmendOperator); err != nil {
 			return nil, err
 		}
+		f.AmendKey = FillAmendKey(f.TradeID, f.OrderID, f.Code, f.TradedAt, f.Price, f.Qty)
 		out = append(out, f)
 	}
 	return out, rows.Err()

@@ -10,6 +10,7 @@
 // 使用 TDesign React 组件（Card / Form / Input / Button / Tag / Table）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import ToggleSw from '../components/ToggleSw'
+import FillAmendPanel from '../components/FillAmendPanel'
 import { Card, Form, Input, Button, Tag, Table, MessagePlugin } from 'tdesign-react'
 import * as api from '../api/index.js'
 import { confirmDialog } from '../ui.jsx'
@@ -124,6 +125,10 @@ export default function Quant() {
   const [saving, setSaving] = useState(false)
   // 交易流水数据（summary 汇总 + by_strategy 分战法 + fills 成交明细），30s 轮询刷新
   const [trades, setTrades] = useState(null)
+  // §FILL-AMEND（2026-09-23）逐笔改判的目标成交行（null=对话框关闭）。
+  // 状态放在本页、面板组件持有提交/台账/守恒的全部动作：流水表要点「改判」才能把行传进对话框，
+  // 而台账与账目重算的刷新又得回过来调 loadTrades——两边都需要一个共同持有者。
+  const [amendTarget, setAmendTarget] = useState(null)
   // §U-2（2026-09-14）运维三件套前端入口：kill-switch 紧急停止 / 当日委托手动撤单 / 交割单对账。
   // 此前这些能力后端端点齐备但页面零入口（撤单尤其因缺 order_id 列表而无从挂按钮）。
   // English: §U-2 frontend entries for the three ops capabilities that previously had backend
@@ -581,17 +586,39 @@ export default function Quant() {
   ]
 
   // 成交流水表列定义：time 去掉 ISO 的 T 并截取至秒；side 买入红/卖出绿
+  // §FILL-AMEND（2026-09-23）两处扩展：
+  //   ① 方向列在已改判的行上额外标「原 X」——不标的话，运维按柜台回单核对时会看到
+  //      "页面卖 / 回单买"却找不到差异来源，最容易二次改错；
+  //   ② 末列「改判」是逐笔勘误入口（只提交待批准影子条目，批准才动账，见 FillAmendPanel）。
   const fillsColumns = [
     { colKey: 'time', title: '时间', width: 130, cell: ({ row }) => (row.traded_at || '').replace('T', ' ').slice(5, 19) },
     { colKey: 'code', title: '代码', width: 90 },
     {
-      colKey: 'side', title: '方向', width: 80,
-      cell: ({ row }) => <span style={{ color: row.side === '买入' ? 'var(--app-up)' : 'var(--app-down)' }}>{row.side}</span>,
+      colKey: 'side', title: '方向', width: 120,
+      cell: ({ row }) => (
+        <span>
+          <span style={{ color: row.side === '买入' ? 'var(--app-up)' : 'var(--app-down)' }}>{row.side}</span>
+          {row.amended && row.orig_side && row.orig_side !== row.side ? (
+            <span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 4 }} title={`勘误理由：${row.amend_reason || '—'}`}>原{row.orig_side}</span>
+          ) : null}
+        </span>
+      ),
     },
     { colKey: 'price', title: '价格', width: 90 },
     { colKey: 'qty', title: '数量', width: 80 },
     { colKey: 'amount', title: '金额', width: 100, cell: ({ row }) => fmtCNY2(row.amount) },
     { colKey: 'strategy', title: '战法', width: 140, cell: ({ row }) => <span style={{ color: 'var(--app-text-2)' }}>{row.strategy}</span> },
+    {
+      colKey: 'amend', title: '操作', width: 90,
+      cell: ({ row }) => (
+        // 无 id 的行不给入口：改判只能按 fills.id 定位，自报锚点会造出匹配不到成交的死勘误
+        row.id ? (
+          <Button size="extra-small" variant="outline" onClick={() => setAmendTarget(row)}>
+            {row.amended ? '已改判' : '改判'}
+          </Button>
+        ) : <span style={{ fontSize: 11, color: 'var(--app-muted-2)' }}>—</span>
+      ),
+    },
   ]
 
   // 渲染"总开关与执行方式"表单内容：总开关、执行模式、委托价格、自动卖出、心跳超时、网关地址、Token
@@ -1185,6 +1212,10 @@ export default function Quant() {
           <div style={{ color: 'var(--app-text-2)', fontSize: 13 }}>加载交易流水…</div>
         )}
       </Card>
+
+      {/* §FILL-AMEND（2026-09-23）成交勘误台账 + 账本守恒自检（均 admin-only，随本页 403 面板一起拦住） */}
+      <FillAmendPanel fills={(trades && trades.fills) || []} target={amendTarget}
+        onCloseTarget={() => setAmendTarget(null)} onChanged={loadTrades} />
 
       {/* §U-2/§WS-B 日终结算对账卡（三方比对 + 差异历史） */}
       {renderSettleCard()}

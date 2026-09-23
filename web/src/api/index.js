@@ -78,6 +78,10 @@
 //                                                       流水 / 委托 / kill-switch / 撤单
 //   qmtSettle() / fetchQMTSettleHistory()
 //                           POST|GET /api/qmt/settle[/history] 交割单三方对账与历史
+//   fetchFillAmendments() / createFillAmendment() / applyFillAmendment() / revokeFillAmendment()
+//                           GET|POST /api/qmt/fill-amendments[/{id}/apply|/revoke]
+//                                                       §FILL-AMEND 成交逐笔人工改判（提交→批准→撤销）
+//   fetchFillConservation() GET  /api/qmt/fills/conservation   账本守恒自检（只读报数）
 //
 // 【模拟盘】
 //   fetchPaperState() / fetchPaperPositions() / fetchPaperTrades() / fetchPaperOrders()
@@ -868,11 +872,18 @@ export async function fetchRealAdvice() {
 
 /** 实盘：执行 manual 下单（手动确认后的真实委托） */
 /** Live: execute a manual order (real ticket after manual confirmation) */
-// 对应 POST /api/positions/execute，body { code, side, action, qty, price, strategy, reason }
+// 对应 POST /api/positions/execute，body { code, side(必填 买入/卖出), action, qty, price, strategy, reason }
 // §P2-15（2026-09-15）：封装层自动补 client_id 幂等键（UUID，后端 regClientID 校验格式）
 // ——双击/网络重试同一次确认会带同一键，后端据此去重，不会重复下单；调用方显式传入时以调用方为准。
+// §SIDE-AUTH-2（2026-09-23 夜间批）：side 必填，只接受 买入/卖出，缺/错在前端就地抛错、
+// 不发请求。为什么前端也要拦：后端已把"空串缺省买入"的残余 fail-open 清零（缺方向 400），
+// 方向是花真钱的字段——请求封装层是最后一处能机械化保证"发出的请求必带方向"的地方，
+// vitest 锁此不变量（Positions.jsx 手动下单本就按用户点击显式传 买入/卖出，零行为影响）。
 export async function executeRealAction(data) {
   const body = { ...data }
+  if (body.side !== '买入' && body.side !== '卖出') {
+    throw new Error('下单方向必填：side 必须显式传 买入/卖出（§SIDE-AUTH-2，缺方向的请求被前端拦截）')
+  }
   if (!body.client_id && typeof crypto !== 'undefined' && crypto.randomUUID) {
     body.client_id = crypto.randomUUID()
   }
@@ -959,6 +970,53 @@ export async function qmtSettle(data = {}) {
 // 对应 GET /api/qmt/settle/history，返回 { ok, diffs:[{day,missing_in_local,extra_in_local,mismatch,...}] }
 export async function fetchQMTSettleHistory() {
   return request('/api/qmt/settle/history')
+}
+
+/** 实盘：成交勘误台账（§FILL-AMEND 2026-09-23，仅 admin） */
+/** Live: fill-amendment ledger (admin only) */
+// 对应 GET /api/qmt/fill-amendments?status=&limit=，返回 { ok, amendments:[{id,fill_id,amend_key,
+//   orig_side,new_side,reason,operator,status,created_at,applied_at}] }
+// status 留空=全部；'pending' 即"已提交、尚未批准"的影子条目（不改任何账目数字）。
+export async function fetchFillAmendments(status = '', limit = 100) {
+  const q = new URLSearchParams()
+  if (status) q.set('status', status)
+  if (limit) q.set('limit', String(limit))
+  const suffix = q.toString() ? `?${q}` : ''
+  return request('/api/qmt/fill-amendments' + suffix)
+}
+
+/** 实盘：提交一笔成交的人工改判（待批准影子态，§FILL-AMEND） */
+/** Live: submit one pending per-fill side correction */
+// 对应 POST /api/qmt/fill-amendments，body { fill_id, new_side, reason }。
+// ⚠ 只带 fill_id：匹配锚点（trade_id / 复合键）由服务端从原始成交行读出，前端不自报锚点，
+// 否则一个写歪的锚就是一条永久匹配不到成交的死勘误。reason 必填（后端 400）。
+export async function createFillAmendment({ fillId, newSide, reason }) {
+  return request('/api/qmt/fill-amendments', {
+    method: 'POST',
+    data: { fill_id: fillId, new_side: newSide, reason },
+  })
+}
+
+/** 实盘：批准一笔勘误生效（唯一让账目数字变动的动作，§FILL-AMEND） */
+/** Live: approve one amendment (the only action that moves the books) */
+export async function applyFillAmendment(id) {
+  return request(`/api/qmt/fill-amendments/${encodeURIComponent(id)}/apply`, { method: 'POST', data: {} })
+}
+
+/** 实盘：撤销一笔勘误（数字立刻回到柜台原始方向，§FILL-AMEND） */
+/** Live: revoke an amendment (books snap back to the raw broker side) */
+export async function revokeFillAmendment(id) {
+  return request(`/api/qmt/fill-amendments/${encodeURIComponent(id)}/revoke`, { method: 'POST', data: {} })
+}
+
+/** 实盘：账本守恒自检（只读、只报数，绝不动账，§FILL-AMEND） */
+/** Live: read-only book conservation self-check */
+// 对应 GET /api/qmt/fills/conservation?day=YYYY-MM-DD，返回 { ok, report:{
+//   user_id, day, applied_amendments, positions_checked, positions_ok, position_lines[],
+//   cash:{checked, skip_reason, expected, actual, diff}, ok } }
+export async function fetchFillConservation(day = '') {
+  const suffix = day ? `?day=${encodeURIComponent(day)}` : ''
+  return request('/api/qmt/fills/conservation' + suffix)
 }
 
 /** 模拟盘：总开关与绩效/信号质量统计 */

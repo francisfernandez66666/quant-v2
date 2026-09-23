@@ -14,6 +14,9 @@
 不再裸 strftime 本地钟面贴假 +08:00。
 §REJECT（2026-09-22）：trade_id 与 order_id 皆空的成交回报在入库入口显式拒收
 （不落库/不上报/error 留痕），与 §F5 缺 order_id 拒 400 同口径（详见 on_trade）。
+§SIDE-AUTH-2（2026-09-23 夜间批）：带 side_unverified 标记（未命中派发行、方向仅为桥/柜台
+推断）的成交走「待核对」通道落库——fills 保留可复核证据行（side 落 UNRESOLVED_STATUS），
+但绝不改动持仓账；上报载荷保留推断方向 + 标记，由首尔侧留痕（详见 on_trade/store.apply_fill）。
 （English: report handling — callbacks only enqueue; a dedicated sender thread drains the outbox
 in order with bounded retries, so slow Seoul never blocks channel callbacks nor loses events.
 Empty position snapshots are ignored (with warning) unless seen twice consecutively.）
@@ -289,8 +292,20 @@ class ReportHandler:
         })
 
     def on_stock_trade(self, trade):
-        """成交回报（xtquant trade 对象）。"""
-        self.on_trade({
+        """成交回报（xtquant trade 对象）。
+
+        §SIDE-AUTH-2 补漏（2026-09-23 夜间批，主代理复核时发现的残余 fail-open）：现网实盘走的
+        就是这条 xtquant 直连回调（broker.XtBroker.register_callback → 本方法），而方向权威化
+        此前只装在 `gateway._apply_trade`（桥/HTTP `/api/trade` 那条入口）里——只补那条等于把
+        603468.SH 那类事故留在主通道上。这里对**同一件事**（派发行＝我们下单时写下的物理事实）
+        做同一套判定：查到且带方向 → 以派发行方向为准（与柜台反推不一致时留 warning）；
+        查不到或派发行为空方向 → 打 `side_unverified`，由 on_trade → store.apply_fill 走
+        「待核对」通道（保留证据行、绝不动持仓账）。
+        xt 通道没有桥的 seq，故回查键为 交易所委托号 → signal_id 两级（与 _apply_trade 同源姿势）。
+        English: the xtquant direct-callback path is the live trade source; it now applies the same
+        dispatch-row vouching as the bridge entry, marking un-vouched fills side_unverified.
+        """
+        ev = {
             "order_id": str(getattr(trade, "order_id", "") or ""),
             "trade_id": str(getattr(trade, "trade_id", "") or getattr(trade, "order_sysid", "") or ""),
             "name": getattr(trade, "stock_name", "") or "",
@@ -304,7 +319,47 @@ class ReportHandler:
             # §P2-FEE 20260918：成交费用腿尽力透传（各 xtquant 构建字段名不一，缺省 0
             # 与旧"费用恒 0"口径字节兼容，绝不臆造费用）。
             "fee": self._fee_of(trade),
-        })
+        }
+        self.on_trade(self._vouch_trade_side(ev))
+
+    def _vouch_trade_side(self, ev):
+        """用派发行给成交方向作保（§SIDE-AUTH-2，xt 直连通道侧的同一道闸）。
+
+        就地修改并返回 ev：
+          - 命中派发行且其 side 非空 → `ev["side"]` 以派行为准（不匹配则 warning 留痕，与
+            `gateway._apply_trade` 同口径），并尽力回填 code（空代码会让 apply_fill 把卖出判成
+            "无底仓 no-op" 而静默漏账）；
+          - 未命中 / 派发行方向为空 → `ev["side_unverified"]=True`。
+        绝不"猜一个方向"充数：柜台枚举跨构建漂移过两次（2026-08-31、2026-09-14 实锤判反），
+        猜错＝主动把卖出说成买入。
+        """
+        drow = None
+        try:
+            oid = str(ev.get("order_id", "") or "")
+            if oid:
+                drow = self.store.dispatch_by_order_id(oid)
+            if drow is None and ev.get("signal_id"):
+                drow = self.store.dispatch_by_signal_id(str(ev.get("signal_id")))
+        except Exception as exc:  # 查库异常＝无从作证，按未证处理（fail-close，绝不当已证放行）
+            log.warning("[handler] §SIDE-AUTH-2 派发行回查失败（本笔按方向未证处理）: %s", exc)
+            drow = None
+        auth = str((drow or {}).get("side", "") or "")
+        if auth:
+            inferred = str(ev.get("side", "") or "")
+            if inferred and inferred != auth:
+                log.warning("[handler] trade side mismatch: dispatch=%s inferred=%s code=%s oid=%s"
+                            " — using dispatch side", auth, inferred,
+                            (drow or {}).get("code", ""), ev.get("order_id", ""))
+            ev["side"] = auth
+            if not ev.get("code"):
+                ev["code"] = str((drow or {}).get("code", "") or "")
+        else:
+            ev["side_unverified"] = True
+            log.warning("[handler] §SIDE-AUTH-2 xt 成交未命中派发行，方向仅为柜台枚举推断（不可采信入库）"
+                        " —— 转「待核对」通道: code=%s order_id=%s trade_id=%s inferred=%s",
+                        ev.get("code"), ev.get("order_id", ""), ev.get("trade_id", ""),
+                        ev.get("side", ""))
+        return ev
 
     @staticmethod
     def _fee_of(obj):
@@ -440,6 +495,18 @@ class ReportHandler:
             # 成交先落库并去重；重复重放不推送，避免持仓翻倍
             # §P1-9 落库携带归属账号 ID（多账号隔离）
             ev["user_id"] = self.user_id
+            # §SIDE-AUTH-2（2026-09-23 夜间批）方向未经派发行证实的成交：本地账走
+            # 「待核对」通道（store.apply_fill 落 fills 但不动 real_positions），
+            # 上报载荷原样带 side_unverified 供首尔侧留痕拒入账本。为什么不能照常落账：
+            # side 此时只是桥/柜台枚举猜测，一旦判反，持仓账/回款口径全线污染（实录事故）。
+            # English: side-unverified fills are journaled to the unresolved (待核对) channel —
+            # kept for reconciliation, never allowed to move the position book.
+            if ev.get("side_unverified"):
+                log.warning("[handler] §SIDE-AUTH-2 trade 方向未证实（side_unverified），"
+                            "落「待核对」不动持仓账: code=%s side=%s price=%s qty=%s "
+                            "order_id=%s trade_id=%s signal_id=%s",
+                            ev.get("code"), ev.get("side"), ev.get("price"), ev.get("qty"),
+                            ev.get("order_id"), ev.get("trade_id"), ev.get("signal_id"))
             pos, is_dup = self.store.apply_fill(ev)
             if is_dup:
                 log.warning("[handler] duplicate trade replay ignored: %s %s %s@%s x%s",

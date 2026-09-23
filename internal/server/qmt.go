@@ -25,6 +25,7 @@ import (
 	"quant-trading-v2/internal/cntime"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
@@ -335,7 +336,8 @@ func ctrlTripped(s *Server, userID string) bool {
 var regClientID = regexp.MustCompile(`^[A-Za-z0-9_\-]{1,64}$`)
 
 // handleExecuteAction 执行 manual 下单（POST /api/positions/execute）。
-// 请求体：{code, side(买入/卖出), action(加仓/减仓/止盈/止损/清仓), qty, price, strategy, reason}
+// 请求体：{code, side(必填，只接受 买入/卖出——§SIDE-AUTH-2 起空串也拒), action(加仓/减仓/止盈/止损/清仓),
+// qty, price, strategy, reason}
 // 熔断中/未启用 → 拒绝；写入 orders 表（signal_id 幂等）。
 // English: manual order execution (POST /api/positions/execute). Rejects while tripped/disabled; persists
 // to the orders table (signal_id idempotency).
@@ -373,16 +375,28 @@ func (s *Server) handleExecuteAction(w http.ResponseWriter, r *http.Request) {
 	// "BUY"，实际落到柜台的是一张**卖单**（方向翻转），同时因 risk.Gate 各闸按精确串匹配而连带
 	// 跳过 T+1/涨停/跌停三道方向闸（该族失效已在 §N-4 于闸内 fail-close 兜底）。
 	// 为何在 HTTP 入口就拒：方向翻转属于资金安全级错误，必须在最外层以 400 明确告知调用方
-	// 「你传的方向我们不认」，而不是猜一个默认值继续往下走；空串仍保留"缺省买入"的既有契约
-	// （前端缺省行为不变），仅非法值拒。
+	// 「你传的方向我们不认」，而不是猜一个默认值继续往下走。（§SIDE-AUTH-2 起空串同样拒，
+	// 方向必填——下面紧邻的缺方向分支。）
 	// English: §SIDEGATE-GO — hard whitelist at the manual-order HTTP entry. Anything other than the
-	// two canonical sides (empty string still defaults to buy for back-compat) is rejected with 400,
-	// because downstream the broker treats "not 买入" as a SELL: a non-canonical side would flip the
-	// direction and simultaneously skip every directional risk gate.
-	side := req.Side // 方向缺省按买入（与前端缺省行为一致）
-	if side == "" {
-		side = trading.SideBuy
+	// two canonical sides is rejected with 400 (since §SIDE-AUTH-2 the empty string too — side is
+	// mandatory), because downstream the broker treats "not 买入" as a SELL: a non-canonical side
+	// would flip the direction and simultaneously skip every directional risk gate.
+	// §SIDE-AUTH-2（2026-09-23 夜间批）残余 fail-open 清零：方向**必填**——空串不再缺省成买入。
+	// 为什么：上一条注释里保留的"空串缺省买入"本身仍是 fail-open——调用方一旦漏传 side
+	// （脚本/旧客户端/序列化丢字段），系统就替用户决定"买"，而这个决定花的是真钱；
+	// 603468.SH 事故链证明方向错的连锁污染极深（回款 0→预算占满→纪律闸当日拒 4793 次），
+	// 入口宁可多一次 400 也不替任何人猜方向。前端调用点已同步显式传方向（Positions.jsx
+	// 手动下单本就按用户点击传 买入/卖出），vitest 锁"发出的请求必带方向"。
+	// English: §SIDE-AUTH-2 — side is now mandatory; the old empty-string default of 买入 was
+	// itself a fail-open (a dropped field silently became a real buy). Entry rejects with 400
+	// instead of guessing, and the audit line keeps the rejected attempt forensible.
+	if req.Side == "" {
+		log.Printf("[security] 手动下单缺方向被拒（§SIDE-AUTH-2 必填）用户=%s code=%s", uid, req.Code)
+		opslog.Audit("live_order_side_missing", uid, req.Code, "side 为空被拒：必须显式传 买入/卖出")
+		writeError(w, 400, "缺少下单方向(side)：必须显式传 买入/卖出")
+		return
 	}
+	side := req.Side
 	if side != trading.SideBuy && side != trading.SideSell {
 		log.Printf("[security] 手动下单方向非法被拒 用户=%s code=%s side=%q", uid, req.Code, req.Side)
 		opslog.Audit("live_order_side_reject", uid, req.Code, fmt.Sprintf("side=%q 只接受 %s/%s", req.Side, trading.SideBuy, trading.SideSell))
@@ -534,17 +548,27 @@ func normalizeReportSide(raw string) (string, error) {
 // asserts emitted ⊆ envelope. The old one-sided lock let trade_id/name fall off the floor because
 // encoding/json drops untagged keys without any error.
 type qmtReportEvent struct {
-	Type     string  `json:"type"`
-	OrderID  string  `json:"order_id"`
-	TradeID  string  `json:"trade_id"` // §M4 券商成交编号（成交判重的精确身份锚）
-	Code     string  `json:"code"`
-	Name     string  `json:"name"` // §M4 证券名称（网关成交回报携带，建仓回填）
-	Side     string  `json:"side"`
-	Status   string  `json:"status"`
-	Price    float64 `json:"price"`
-	Qty      int     `json:"qty"`
-	Amount   float64 `json:"amount"`
-	TradedAt string  `json:"traded_at"`
+	Type    string `json:"type"`
+	OrderID string `json:"order_id"`
+	TradeID string `json:"trade_id"` // §M4 券商成交编号（成交判重的精确身份锚）
+	Code    string `json:"code"`
+	Name    string `json:"name"` // §M4 证券名称（网关成交回报携带，建仓回填）
+	Side    string `json:"side"`
+	// SideUnverified §SIDE-AUTH-2（2026-09-23 夜间批）：网关未查到派发行（或派发行为空方向）
+	// 时置 true——此时 side 只是桥/柜台多枚举空间的**猜测**（本项目已两次踩坑判反，
+	// 2026-09-22 603468.SH 真实卖出记成买入即此链条）。为什么 Go 必须认这个字段：
+	// 猜错的方向一旦入账就污染持仓/回款/已实现盈亏三本账且事后难发现；网关侧已把该笔
+	// 转「待核对」通道，这里对应**不入库不动持仓**，只留痕（opslog+计数）等人工核对。
+	// 命中派发行的回报不带该键（网关已用派发项覆盖），false 路径处理完全不变。
+	// English: §SIDE-AUTH-2 — set by the gateway when no dispatch row vouches for the side
+	// (bridge enum guess only). Such fills are journaled (opslog + counter), never booked:
+	// a wrong guess would silently poison positions/cash-out/realized P&L.
+	SideUnverified bool    `json:"side_unverified"`
+	Status         string  `json:"status"`
+	Price          float64 `json:"price"`
+	Qty            int     `json:"qty"`
+	Amount         float64 `json:"amount"`
+	TradedAt       string  `json:"traded_at"`
 	// CreatedAt §M4：order 回报的委托创建时间。网关 on_stock_order 一直同时发 at 与
 	// created_at（双字段兼容契约），旧信封只有 at → created_at 被静默丢弃，委托行的
 	// created_at 实际记成了回报时刻。现在优先取 created_at，缺失才退回 at。
@@ -736,6 +760,30 @@ func (s *Server) handleQMTReport(w http.ResponseWriter, r *http.Request) {
 		if sErr != nil {
 			// trade 直接拒收（400）：方向不明绝不能默认按卖处理，否则会静默清零持仓。
 			writeError(w, 400, sErr.Error())
+			return
+		}
+		// §SIDE-AUTH-2（2026-09-23 夜间批）方向未获派发行证实的成交：**不入库、不动持仓账**，
+		// 只留痕（opslog 审计行 + 计数指标）并回 200 幂等吞掉。为什么不入账：
+		// 此刻 side 只是桥/柜台枚举猜测（23/24 vs 1101/1102 vs 48/50 多空间反推，
+		// 已两次实锤判反），猜错就是把卖出记成买入——持仓/回款/已实现盈亏三本账当场被污
+		// 且事后无从分辨；网关已把同笔证据落「待核对」通道（/settlement 可见），人工核对
+		// 后再勘误，两侧各管各账、不算双改（比对既有已入库行的处理路径一字未动）。
+		// 为什么回 200 而不是 4xx：4xx 会进网关死信表永久隔离，证据链反而更难凑齐；
+		// 留痕行带全部可复核字段，运维据此走人工勘误通道。
+		// English: §SIDE-AUTH-2 — a side-unverified fill is journaled (opslog + counter) and
+		// NOT booked; the gateway already keeps the 待核对 evidence row. ACK 200 so the durable
+		// outbox does not dead-letter the event.
+		if ev.SideUnverified {
+			metrics.FillsSideUnverified()
+			log.Printf("[trading] ⚠ §SIDE-AUTH-2 成交方向未证实（网关未命中派发行），留痕不入账: "+
+				"用户=%s code=%s inferred_side=%s qty=%d price=%.2f order=%s trade_id=%s signal=%s",
+				uid, ev.Code, tradeSide, ev.Qty, ev.Price, ev.OrderID, ev.TradeID, ev.SignalID)
+			opslog.Audit("live_fill_side_unverified", uid, ev.Code,
+				fmt.Sprintf("方向未获派发行证实-未入账 side=%q qty=%d price=%.2f order=%s trade_id=%s signal=%s amount=%.2f traded_at=%s",
+					tradeSide, ev.Qty, ev.Price, ev.OrderID, ev.TradeID, ev.SignalID, ev.Amount, ev.TradedAt))
+			opslog.Logf("quant", "成交方向待核对（§SIDE-AUTH-2，未入本地账）%s %s qty=%d price=%.2f order=%s trade_id=%s——请到网关「待核对」流水人工核对后勘误",
+				tradeSide, ev.Code, ev.Qty, ev.Price, ev.OrderID, ev.TradeID)
+			writeJSON(w, 200, map[string]string{"ok": "1", "side_unverified": "1"})
 			return
 		}
 		// ApplyRealFill 事务内完成：成交流水插入（signal_id 幂等，重复回报整体回滚）
@@ -1429,6 +1477,16 @@ func qmtStrategyOf(signalID string) string {
 //
 // 飞轮数据面：by_strategy 即「research 出战法 → 信号 → 实盘结果」回流评估的输入源，
 // research 侧可直接读同一 researchDB 的 fills/orders 表或消费本端点。
+//
+// §FILL-AMEND（2026-09-23）：本端点的成交来源 RealFills 已改走 fills_effective 视图，即
+// **按生效方向重放**（人工勘误批准后自动跟着变）。刻意不另写一套"勘误后重放"逻辑：
+// 加权的成本基准、超卖钳制（sellQty 钳到重放量、超出部分按持仓账定价）这两条防线都建立在
+// 同一条按时间升序的成交流上，任何旁路都会让"改判方向"绕过钳制而凭空造出已实现盈亏。
+// 勘误只改方向，金额沿用落库 Amount（§F12 单口径），所以 amt 腿与钳制量都不需要特判。
+// English: §FILL-AMEND — the replay consumes the amendment-resolved direction (via the
+// fills_effective view) through the very same time-ordered stream, so the weighted cost basis and the
+// oversell clamp keep applying to a re-booked fill; only the side changes, the amount stays the
+// stored turnover.
 // English: GET /api/qmt/trades — fill ledger, overall PnL (realized via weighted-cost replay,
 // unrealized from the live book) and per-strategy attribution feeding the research flywheel.
 func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
@@ -1590,12 +1648,24 @@ func (s *Server) handleQMTTrades(w http.ResponseWriter, r *http.Request) {
 			tag = strat.strategy
 		}
 		outFills = append(outFills, map[string]interface{}{
+			// §FILL-AMEND（2026-09-23）id 是勘误入口的定位锚：前端提交勘误只带 fill_id，
+			// 锚点（trade_id/复合键）由服务端从原始行读出——不给 id 就没有逐笔改判入口。
+			"id":       f.ID,
 			"order_id": f.OrderID, "code": f.Code, "side": f.Side, "price": f.Price,
 			"qty": f.Qty, "amount": f.Amount, "traded_at": f.TradedAt,
 			"signal_id": f.SignalID, "strategy": tag,
 			// §F1：费用腿回显——此前 trades 含费重算但流水不展示 fee/stamp_tax，
 			// 前端对不上账时无从核对；RealFills 现已带回两列。
 			"fee": f.Fee, "stamp_tax": f.StampTax,
+			// §FILL-AMEND 勘误回显：side 已是**生效方向**（RealFills 走 fills_effective 视图），
+			// orig_side 保留柜台原始方向；amended=true 时前端把这一行标成"人工改判"，
+			// 避免下一个读账的人按原始方向去核对柜台回单却找不到差异来源。
+			"orig_side":    f.OrigSide,
+			"amended":      f.AmendID > 0,
+			"amend_id":     f.AmendID,
+			"amend_reason": f.AmendReason,
+			"amend_key":    f.AmendKey,
+			"trade_id":     f.TradeID,
 		})
 	}
 

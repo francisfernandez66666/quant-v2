@@ -32,19 +32,28 @@
 #      实录：04:00 那次护栏还过、07:1x 首跑只剩 6.9GB，余量是单调往下走的；只读 SNAPSHOT_OK 的
 #      ok=false 要等人去读 err 才发现根因，本探针判红明细直接带 free/snapshot/relay/datadir 四数。
 #  11) §SNAP-LOCK（2026-09-23，第 18 探针）：快照单写者锁健康度（锁龄 + 按命令行统计在跑进程数）。
-#  12) §QMT-MOCK-DECOM（2026-09-23，第 19 探针）：实盘机残留 UAT qmt-mock 退役复核——
-#      C:\qmt\uat 下无 qmt-mock.exe（改名 .disabled-* 不算在位）且 :8799 无该目标监听。
+#  12) §QMT-MOCK-DECOM（2026-09-23 建，同日 §OPS-ALIGN 改判据，第 19 探针）：实盘机残留 UAT
+#      qmt-mock 退役复核。两条独立判据：①**产物态**——C:\qmt\uat 下无 qmt-mock.exe（改名
+#      .disabled-* 不算在位）且 :8799 无该目标监听；②**安全阀态**——落盘的 decommission_qmt_mock.ps1
+#      确实是"缺省预览 + 显式 -Apply 才动手"。判据 ② 是本次改缺省方向后新增的，理由见探针正文注释。
 #      判据明细全 ASCII：PS→SSH→bash 回传按 GBK 解码，任何中文明细的 grep 都是永久性假绿。
 #  13) §QMT-TOKENROT（2026-09-23，第 20 探针）：网关 token 四源指纹分歧检测（只比 sha256 前
 #      8 位，绝不回显值）。四源=①config.xt.json ②服务 AppEnvironmentExtra 的 QUANT_GATEWAY_*
 #      覆盖（注册表直读）③引擎 config.json rules.qmt.token ④桥进程 --token/cmdline。
+#
+#  14) §FILL-AMEND（2026-09-23 夜批，第 21 探针）：勘误/守恒三条新端点路由在位且受 admin 收权——
+#      未鉴权 GET /api/qmt/fill-amendments、/api/qmt/fills/conservation 必须 401，
+#      且 POST /api/qmt/fill-amendments/1/apply 也必须 401（**判据按运行时真实取值链**：
+#      404=二进制未更新（前端有按钮却全链路不可用）；200/403 都不能算过——200 等于把资金账写端点
+#      裸奔到公网，403 说明鉴权层被跳过而只剩归属校验，同 §M-14 收权面回归形态）。
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
 #   GZ_IP=81.71.69.17 COMMIT=beb5b80 ./scripts/verify_deploy_guangzhou.sh   # 显式指定指纹
 #
 # 参数（环境变量）：GZ_IP（必填）/ GZ_USER / COMMIT（默认本地 HEAD）/ DEPLOY_DIR / 端口三项
-#   / 第 19-20 探针可调项：MOCK_UAT_DIR / MOCK_PORT / GW_CFG / GW_TOKEN_SVC（默认=现网路径）
+#   / 第 19-20 探针可调项：MOCK_UAT_DIR / MOCK_PORT / QMT_WIN_DIR（退役 .ps1 落盘目录，第 19 探针
+#   的安全阀态判据要读它）/ GW_CFG / GW_TOKEN_SVC（默认=现网路径）
 set -uo pipefail
 
 : "${GZ_IP:?请设置 GZ_IP（广州服务器公网 IP）}"
@@ -57,6 +66,9 @@ BACKUP_DIR="${BACKUP_DIR:-${DEPLOY_DIR}/deploy/qmt-win}"   # §P0-B 第 16 探�
 SNAP_DIR="${SNAP_DIR:-C:/var/lib/quant-snapshot}"          # §P0-B 第 16 探针：每晚产物 + SNAPSHOT_OK 所在
 MOCK_UAT_DIR="${MOCK_UAT_DIR:-C:/qmt/uat}"                 # §QMT-MOCK-DECOM 第 19 探针：残留 mock 目录
 MOCK_PORT="${MOCK_PORT:-8799}"                             # §QMT-MOCK-DECOM 第 19 探针：假柜台对外口
+# §OPS-ALIGN：第 19 探针还要复核**落盘的那份退役脚本**的安全阀方向（缺省预览还是缺省动手），
+# 故需知道它现网落在哪——就是部署步上传的 ${DEPLOY_DIR}/qmt-win/（与 deploy_guangzhou.sh [3d] 同路径）。
+QMT_WIN_DIR="${QMT_WIN_DIR:-${DEPLOY_DIR}/qmt-win}"        # §QMT-MOCK-DECOM 第 19 探针：运维 .ps1 落盘目录
 GW_CFG="${GW_CFG:-C:/qmt/quant-trading-v2/qmt_gateway/config.xt.json}"   # §QMT-TOKENROT 第 20 探针：网关配置文件
 GW_TOKEN_SVC="${GW_TOKEN_SVC:-quant}"                      # §QMT-TOKENROT 第 20 探针：QUANT_GATEWAY_TOKEN 所在 NSSM 服务
 ENGINE_PORT="${ENGINE_PORT:-8081}"
@@ -87,6 +99,8 @@ param(
     # §QMT-MOCK-DECOM 第 19 探针 + §QMT-TOKENROT 第 20 探针用（2026-09-23）。
     [string]$MockUatDir = "C:\qmt\uat",
     [int]$MockPort = 8799,
+    # §OPS-ALIGN（2026-09-23）：第 19 探针的安全阀态判据读这份落盘脚本的内容（只读，不执行它）。
+    [string]$MockDecomScript = "C:\opt\quant\qmt-win\decommission_qmt_mock.ps1",
     [string]$GatewayCfg = "C:\qmt\quant-trading-v2\qmt_gateway\config.xt.json",
     [string]$GwTokenService = "quant"
 )
@@ -176,6 +190,21 @@ Probe "engine:/api/positions/execute unauth=401" ($code -eq "401") ("got=" + $co
 # 7) §20260922PM 收口面探针：test-attribution 已收权 admin（未鉴权必须 401，404=旧二进制）
 $code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/news/test-attribution") '{}'
 Probe "engine:/api/news/test-attribution unauth=401" ($code -eq "401") ("got=" + $code + "；404=二进制未更新，200=收权未生效（成员越权面仍在）")
+
+# 7b) §FILL-AMEND（2026-09-23 夜批）第 21 探针：勘误/守恒端点在位且全受鉴权收口。
+#     这三条是**资金账写端点**（批准勘误会直接重算买入笔数/预算/回款/已实现盈亏），
+#     现网必须与 test-attribution 同口径：未鉴权一律 401。
+#     ⚠ 判据取的是"未鉴权时的第一道闸"，不是"归属校验"——adminMiddleware 挂在 authMiddleware 之后，
+#     所以未带 token 的调用必然 401；若回 403 说明鉴权层被跳过、只剩归属判定（收权面回归），
+#     若回 200 说明端点裸奔。404=二进制未更新，此时前端的「改判」按钮点了必然全错。
+$code = HCode "GET" ("http://127.0.0.1:" + $EnginePort + "/api/qmt/fill-amendments")
+Probe "engine:/api/qmt/fill-amendments unauth=401" ($code -eq "401") ("got=" + $code + "；404=二进制未更新（勘误台账不可用），200=资金账读端点裸奔")
+$code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/qmt/fill-amendments") '{"fill_id":1,"new_side":"卖出","reason":"probe"}'
+Probe "engine:POST /api/qmt/fill-amendments unauth=401" ($code -eq "401") ("got=" + $code + "；200=未鉴权即可提交勘误（写端点收权失效）")
+$code = HCode "POST" ("http://127.0.0.1:" + $EnginePort + "/api/qmt/fill-amendments/1/apply") '{}'
+Probe "engine:POST /api/qmt/fill-amendments/apply unauth=401" ($code -eq "401") ("got=" + $code + "；批准动作是唯一让账目变动的入口，必须 401")
+$code = HCode "GET" ("http://127.0.0.1:" + $EnginePort + "/api/qmt/fills/conservation")
+Probe "engine:/api/qmt/fills/conservation unauth=401" ($code -eq "401") ("got=" + $code + "；404=守恒自检未上线（勘误后无法复核差异）")
 
 # 8) §N-5（2026-09-23 晚批）第 15 探针：HITHINK 键名必须在位 + LLM 必须有可用来源。
 #
@@ -367,19 +396,38 @@ if ($writers -ge 2) { $lkMissing += ("writers=" + $writers) }
 if ($writers -eq 1 -and -not (Test-Path $Lk)) { $lkMissing += "writer without lock (unguarded run)" }
 Probe "backup:single-writer lock" ($lkMissing.Count -eq 0) ("lock=" + $lkTxt + " writers=" + $writers + " miss=" + ($lkMissing -join ","))
 
-# 12) §QMT-MOCK-DECOM（2026-09-23，第 19 探针）：实盘机残留 UAT qmt-mock 退役复核。
+# 12) §QMT-MOCK-DECOM（2026-09-23 建，同日 §OPS-ALIGN 改判据，第 19 探针）：实盘机残留 UAT qmt-mock 退役复核。
 # 背景：C:\qmt\uat\qmt-mock.exe 自 09-10 起常驻监听 0.0.0.0:8799（docs/PROGRESS.md 遗留项）。
 #   退役动作在部署侧 [3d]（QMT_MOCK_DECOMMISSION=1，exe 改名 .disabled-* 不删除）；本探针是
 #   校验面独立复核（同 §M7 教训：不能只信施工面自己打的"完成"）。
-# 判据（pass=不在位）：①目录下无**现役名** qmt-mock.exe（改名 .disabled-* 视为已退役）；
-#   ②无 exe 路径落在 $MockUatDir 下的进程；③:8799 的监听里没有属于该目录进程的。
-#   其它进程占用 8799（other_listeners>0）只写明细不判红——本探针守的是"mock 没了"，不是"端口空闲"。
+# ⚠ 判据为什么必须跟着改（owner 裁决 4 / §OPS-ALIGN，2026-09-23 夜批）：退役脚本
+#   decommission_qmt_mock.ps1 的缺省方向已从"跑一次就动手"对齐成"缺省 dry-run、显式 -Apply 才改名"
+#   （与 rotate_qmt_token.ps1 同口径）。旧探针的**隐含前提**是"部署步 [3d] 跑过一次＝退役完成"，
+#   这个前提现在不成立了——一次不带 -Apply 的调用退出码照样是 0、照样打一行 done，却什么都没改。
+#   如果判据继续只查"目录里没有 qmt-mock.exe"，会出现两种互相掩盖的形态：
+#     (a) 施工步忘了带 -Apply → 现网 exe 仍在 → 本探针判红（这种倒不骗人，但明细必须说清根因）；
+#     (b) 真正要防的是**已经退役成功之后**：exe 从此永远不在位，这条探针从此无条件绿，
+#         于是"脚本被回退成缺省即动手""-Apply 门被删掉""[3d] 整步被删"这类回归**再也报不出来**——
+#         一条只在故障发生前有效的探针就是假绿探针（同 §M13/§ENH-5 那族的"前提过期"形状）。
+#   ⇒ 按运行时真实取值链重写成两条**互相独立、都不会过期**的判据：
+#   ①**产物态**（原三条，pass=不在位）：$MockUatDir 下无**现役名** qmt-mock.exe（改名 .disabled-*
+#     视为已退役，且 .disabled-* 个数进明细当"确实动过手"的证据）；无 exe 路径落在 $MockUatDir 下的
+#     进程；:8799 的监听里没有属于该目录进程的。
+#   ②**安全阀态**：落盘的 $MockDecomScript 必须在位，且内容确实是"缺省预览 + 显式 -Apply"——
+#     认四个静态特征：param 里有 [switch]$Apply、有 `if (-not $Apply) { $DryRun = $true }` 的缺省归一
+#     语句、dry-run 早退块排在 Rename-Item 改名原语**之前**、正文没有裸 Remove-Item。
+#     这条查的是"这台机器上的退役脚本还会不会在无人显式确认时改生产文件名"，与 ① 一样是现网事实，
+#     不会因为"早就退役完了"而失去鉴别力。
+#   其它进程占用 8799（other_listeners>0）只写明细不判红——本探针守的是"mock 没了 + 安全阀在位"，
+#   不是"端口空闲"。
 # ⚠ 明细必须全 ASCII：PS→SSH→bash 回传按 GBK 解码，中文明细要么乱码要么让下游 grep 变
 #   永久性假绿（schtasks 状态文案那次就是这么骗过守卫的，见 deploy_guangzhou.sh [6/6] 注释）。
 $mockRootPrefix = $MockUatDir.TrimEnd('\') + '\'
 $mockExePresent = $false
-if (Test-Path $MockUatDir) {
+$mockDisabledN = 0
+if (Test-Path -LiteralPath $MockUatDir) {
     $mockExePresent = (@(Get-ChildItem -LiteralPath $MockUatDir -Filter "qmt-mock.exe" -File -ErrorAction SilentlyContinue).Count -gt 0)
+    $mockDisabledN = @(Get-ChildItem -LiteralPath $MockUatDir -Filter "qmt-mock.exe.disabled-*" -File -ErrorAction SilentlyContinue).Count
 }
 $mockProcN = 0; $mockListenN = 0; $otherListenN = 0
 try {
@@ -395,12 +443,37 @@ try {
         if ($mockPids.ContainsKey([int]$ml.OwningProcess)) { $mockListenN += 1 } else { $otherListenN += 1 }
     }
 } catch { }
+# 判据②：安全阀态（只读落盘 .ps1 的**文本特征**，绝不执行它；这里也没有任何密钥/口令值可打）。
+$mockGate = "unknown"
+$mockGateMiss = @()
+if (Test-Path -LiteralPath $MockDecomScript) {
+    $mds = ""
+    try { $mds = [string](Get-Content -LiteralPath $MockDecomScript -Raw -ErrorAction Stop) } catch { $mockGateMiss += "script-unreadable" }
+    if ($mds) {
+        $gSwitch = ($mds -match '\[switch\]\$Apply')
+        $gDefault = ($mds -match 'if \(-not \$Apply\) \{ \$DryRun = \$true \}')
+        $iPreview = $mds.IndexOf('if ($DryRun)')
+        $iRename = $mds.IndexOf('Rename-Item')
+        $gOrder = (($iPreview -ge 0) -and ($iRename -ge 0) -and ($iPreview -lt $iRename))
+        $gNoDel = -not ($mds -match '(?m)^\s*Remove-Item')
+        if ($gSwitch -and $gDefault -and $gOrder -and $gNoDel) {
+            $mockGate = "preview-by-default"
+        } else {
+            $mockGate = "regressed"
+            if (-not $gSwitch) { $mockGateMiss += "gate-no-apply-switch" }
+            if (-not $gDefault) { $mockGateMiss += "gate-not-preview-by-default" }
+            if (-not $gOrder) { $mockGateMiss += "gate-write-before-preview-exit" }
+            if (-not $gNoDel) { $mockGateMiss += "gate-irreversible-delete" }
+        }
+    } else { $mockGate = "unreadable" }
+} else { $mockGate = "absent"; $mockGateMiss += "script-missing" }
 $mockMiss = @()
 if ($mockExePresent) { $mockMiss += "exe-present" }
 if ($mockProcN -gt 0) { $mockMiss += ("procs=" + $mockProcN) }
 if ($mockListenN -gt 0) { $mockMiss += ("listeners=" + $mockListenN) }
-$mockDetail = "exe=" + $(if ($mockExePresent) { "present" } else { "absent" }) + " procs=" + $mockProcN + " mock_listeners=" + $mockListenN + " other_listeners=" + $otherListenN + " miss=" + $(if ($mockMiss.Count) { ($mockMiss -join ",") } else { "none" })
-Probe ("qmt:mock retired (no uat exe, no :" + $MockPort + " listener)") ($mockMiss.Count -eq 0) $mockDetail
+$mockMiss += $mockGateMiss
+$mockDetail = "exe=" + $(if ($mockExePresent) { "present" } else { "absent" }) + " procs=" + $mockProcN + " mock_listeners=" + $mockListenN + " other_listeners=" + $otherListenN + " disabled_copies=" + $mockDisabledN + " gate=" + $mockGate + " miss=" + $(if ($mockMiss.Count) { ($mockMiss -join ",") } else { "none" })
+Probe ("qmt:mock retired (no uat exe, no :" + $MockPort + " listener, preview gate)") ($mockMiss.Count -eq 0) $mockDetail
 
 # 13) §QMT-TOKENROT（2026-09-23，第 20 探针）：网关 token 四源一致性（只比指纹，绝不回显值）。
 # 四源（详见 rotate_qmt_token.ps1 文件头）：①网关 config.xt.json（token+report_token）；
@@ -478,7 +551,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
-out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC}" 2>&1 | LC_ALL=C tr -d '\r')
+out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -MockDecomScript ${QMT_WIN_DIR}/decommission_qmt_mock.ps1 -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC}" 2>&1 | LC_ALL=C tr -d '\r')
 
 PASS=0
 FAIL=0

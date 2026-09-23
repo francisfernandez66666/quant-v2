@@ -261,7 +261,14 @@ func main() {
 		// 带进程内 TTL 缓存，避免 5s 打分循环反复查库；缓存缺失/过期时读库。
 		finaCache := newFinaCache(researchDB)
 		strategyEngine.SetFinaLookup(finaCache.Lookup)
-		log.Printf("[research] 研究库已接入（含实盘财务因子）: %s", filepath.Join(dataDir, "trading.db"))
+		// §KLINE-CHAIN-3（2026-09-23 夜间批）日K链第三级兜底：腾讯/东财两条网络复权腿同时不通时，
+		// 用夜里同步进研究库的日K顶上来（读库在后、归一与新鲜度守卫在 strategy_engine），
+		// 不再让除龙头外的所有战法整轮零分。当日那一根仍由 attachLiveBar 用实时快照拼接。
+		// English: third daily-bar leg backed by the research DB, wired next to the financial lookup;
+		// normalization onto the live prev close happens inside strategy_engine.
+		dayBarsLookup := engine.NewDayBarsLookup(researchDB)
+		strategyEngine.SetDayBarsLookup(dayBarsLookup.Lookup)
+		log.Printf("[research] 研究库已接入（含实盘财务因子与日K库内兜底腿）: %s", filepath.Join(dataDir, "trading.db"))
 	} else if dbErr != nil {
 		log.Printf("[research] 研究库接入失败: %v", dbErr)
 	}

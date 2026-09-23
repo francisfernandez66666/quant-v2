@@ -585,14 +585,29 @@ class Store:
         """成交应用到持仓（买=加仓加权成本；卖=减仓/清仓删行）。
 
         返回 (position_dict|None, is_duplicate:bool)。重复回报不改动持仓、不重复入 fills。
+
+        §SIDE-AUTH-2（2026-09-23 夜间批）：f 带 side_unverified（成交方向未获派发行证实，
+        只是桥/柜台枚举猜测）时，本笔**绝不改动持仓账**——fills 行仍要落（可复核证据：
+        代码/价格/数量/成交号/信号/时间/费用全保留），但 side 落第三态字面量 UNRESOLVED_STATUS
+        （「待核对」），与 orders.status 的既成姿势同语义：行在、可查、等人工/对账收敛，
+        任何按 side='买入'/'卖出' 聚合的下游账目（回款/盈亏/胜负）都不会把猜测值当真账。
+        为什么不落推断方向入库：猜错=主动把卖出记成买入（2026-09-22 603468.SH 实录事故链），
+        污染是双向且事后难以发现的；待核对行的代价只是一条人工核对项，可逆。
+        English: a side-unverified fill is journaled with side=待核对 and never touches the
+        position book — evidence preserved, aggregation by 买入/卖出 naturally excludes it.
         """
         # 取成交方向，并计算去重时间窗下界（早于该时间的重放允许）
-        fill_side = f.get("side", "")
+        unverified = bool(f.get("side_unverified"))
+        fill_side = UNRESOLVED_STATUS if unverified else f.get("side", "")
         cutoff = (datetime.now(CN_TZ) - timedelta(seconds=FILL_DEDUP_WINDOW_SEC)).strftime(
             "%Y-%m-%dT%H:%M:%S")
+        # 判重口径与落库口径一致：待核对行存的是「待核对」字面量，重放也用同一 side 比对
+        # （trade_id 主键判重不受影响；无 trade_id 的复合键路径若不归一会让重放漏判）。
+        f_dedup = dict(f)
+        f_dedup["side"] = fill_side
         with self._lock:
             # 先判重：窗口内相同 (order_id,side,price,qty) 视为通道重放，直接返回不改动
-            if self._fill_is_duplicate(f, cutoff):
+            if self._fill_is_duplicate(f_dedup, cutoff):
                 row = self._conn.execute(
                     "SELECT * FROM real_positions WHERE ts_code = ?", (f["code"],)
                 ).fetchone()
@@ -600,7 +615,10 @@ class Store:
             row = self._conn.execute(
                 "SELECT * FROM real_positions WHERE ts_code = ?", (f["code"],)
             ).fetchone()
-            if fill_side == "买入":
+            if unverified:
+                # 不动 real_positions：证据行（fills.side=待核对）在下方统一插入
+                pass
+            elif fill_side == "买入":
                 uid = f.get("user_id", "")
                 if row is None:
                     self._conn.execute(

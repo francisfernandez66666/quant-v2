@@ -23,7 +23,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gateway import Gateway  # noqa: E402
-from store import _now_cn  # §TZ 夹具时间串统一显式北京时区  # noqa: E402
+from store import _now_cn, UNRESOLVED_STATUS  # §TZ 夹具时间串统一显式北京时区；§SIDE-AUTH-2 断言「待核对」字面量  # noqa: E402
 
 
 def new_db_path():
@@ -167,13 +167,19 @@ class TestFileBridge(unittest.TestCase):
             gw.stop()
 
     def test_apply_trade_unattributed_keeps_reported_side(self):
-        """未派发过的成交（客户端手工单/对账来源）：无权威方向可依，回报方向原样保留。
+        """未派发过的成交（客户端手工单/对账来源）：无权威方向可依。
 
-        防止上面那条权威化改动扩大到"所有成交一律改写"——只有本端派发过的单才有权威方向。
+        §SIDE-AUTH-2（2026-09-23 夜间批）行为变更：旧语义是"回报方向原样保留照常入账"，
+        但那正是 603468.SH 事故的 fail-open——无派发行可核时 side 只是桥/柜台枚举猜测，
+        猜错即把卖出记成买入。新语义：payload 仍原样携带回报方向（Go 侧留痕要读），
+        但打 side_unverified 标记，本地 fills 落「待核对」证据行、持仓账不动。
+        原用例"不许一律改写"的防扩权语义保持：已派发单走权威覆盖（上一条用例），
+        未派发单不再被当真账，两条路径各归各。
         """
         gw = self._new_gw(tempfile.mkdtemp())
         pushed = []
         self._seed_600580(gw)
+        held_before = {p["ts_code"]: p["qty"] for p in gw.store.list_positions()}
         gw.handler._push = lambda p: pushed.append(p)
         try:
             gw._apply_trade({"order_id": "EXC-CLIENT", "side": "卖出", "code": "600580.SH",
@@ -183,8 +189,14 @@ class TestFileBridge(unittest.TestCase):
                 rows = gw.store._conn.execute(
                     "SELECT side FROM fills WHERE order_id = ?", ("EXC-CLIENT",)).fetchall()
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["side"], "卖出")
+            self.assertEqual(rows[0]["side"], UNRESOLVED_STATUS,
+                             "§SIDE-AUTH-2 未命中派发行的成交必须落「待核对」而非采信推断方向")
+            # 上报腿：方向原样 + side_unverified 标记（Go 侧凭标记留痕拒入账本）
             self.assertEqual(pushed[0]["side"], "卖出")
+            self.assertIs(pushed[0].get("side_unverified"), True)
+            # 持仓账纹丝不动：卖出推断不得清仓、买入推断也不得加仓
+            held_after = {p["ts_code"]: p["qty"] for p in gw.store.list_positions()}
+            self.assertEqual(held_before, held_after, "未证成交绝不许改动持仓账")
         finally:
             gw.stop()
 

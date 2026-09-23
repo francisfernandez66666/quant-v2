@@ -392,11 +392,14 @@ fi
 #   （源码仍服务测试：默认 :8789、uat_bootstrap.sh 用 :18789；仓库对 8799 零代码/配置引用）。
 # 姿势与 LIVEBACKUP_FIRST_RUN 同构：显式开关 + 默认关 + 失败只告警不阻断部署链
 #   （set -e 下半途死会把服务留在停机态）；脚本幂等、只动 C:\qmt\uat、exe 改名不删除（可逆）。
-# 判据不看本步输出、看产物：verify 第 19 探针（mock 不在位/不在听）持续复核直到绿。
+# 判据不看本步输出、看产物 + 看安全阀：verify 第 19 探针双条判据（产物态=exe 不在位/不在听；
+#   安全阀态=脚本仍是"缺省只预览、动手须显式 -Apply"）。§OPS-ALIGN（2026-09-23）把脚本缺省方向
+#   从"缺省即动手"翻成"缺省只预览"，与 rotate_qmt_token.ps1 对齐——所以本步**必须显式带 -Apply**，
+#   否则只会打印预览并退出 0，退役不会发生却看起来成功（那句 OK 就是谎）。
 if [ "${QMT_MOCK_DECOMMISSION:-0}" = "1" ]; then
-  echo "[3d/5] 退役 C:/qmt/uat 残留 qmt-mock（监听 :8799）..."
-  if $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/decommission_qmt_mock.ps1"; then
-    echo "  OK 退役完成（action= 明细见上方输出；复核：verify 第 19 探针）"
+  echo "[3d/5] 退役 C:/qmt/uat 残留 qmt-mock（监听 :8799，显式 -Apply 才动手）..."
+  if $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/decommission_qmt_mock.ps1 -Apply"; then
+    echo "  OK 退役完成（已显式 -Apply；action= 明细见上方输出；复核：verify 第 19 探针）"
   else
     echo "  [!] 退役未通过（仍有目标进程在听/exe 改名失败，详见上方 action= 行）——不阻断部署，verify 第 19 探针将持续判红"
   fi

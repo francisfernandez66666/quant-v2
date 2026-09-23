@@ -1,11 +1,12 @@
 {
   "source": "internal/server/qmt.go qmtReportEvent + internal/store/real_positions.go RealPosition + qmt_gateway/handler.py 实际发出载荷",
-  "updated": "2026-09-22",
-  "notes": "§F2（2026-09-22 修复批）回报方向 golden 契约：与 order_fields.json（下单方向）互补。report_event_fields = 回报信封（qmtReportEvent）反射 JSON tag 集；positions_row_fields = positions 事件行（store.RealPosition）反射集；consumed_by_event = 各事件类型在 handleQMTReport 实际消费的信封字段子集（文档性锁，测试校验其为信封集子集）。§M4（2026-09-22 PM 批）双向化：新增 gateway_emitted_fields = 网关 handler 实际发出的载荷键集（含 _push 补的 user_id/type），Go 侧测试断言『发出集 ⊆ 信封集』——旧契约只反射 Go 一侧，网关常年发的 trade_id/name/created_at 在 Go 没有 tag、被 encoding/json 静默丢弃（丢腿）而测试永远绿。Python 侧 tests/test_report_contract.py 反向断言发出集与 golden 一致。回归测：internal/server/report_contract_test.go（REPORT_CONTRACT_UPDATE=1 重生成信封/持仓行两面）。",
+  "updated": "2026-09-23",
+  "notes": "§F2（2026-09-22 修复批）回报方向 golden 契约：与 order_fields.json（下单方向）互补。report_event_fields = 回报信封（qmtReportEvent）反射 JSON tag 集；positions_row_fields = positions 事件行（store.RealPosition）反射集；consumed_by_event = 各事件类型在 handleQMTReport 实际消费的信封字段子集（文档性锁，测试校验其为信封集子集）。§M4（2026-09-22 PM 批）双向化：新增 gateway_emitted_fields = 网关 handler 实际发出的载荷键集（含 _push 补的 user_id/type），Go 侧测试断言『发出集 ⊆ 信封集』——旧契约只反射 Go 一侧，网关常年发的 trade_id/name/created_at 在 Go 没有 tag、被 encoding/json 静默丢弃（丢腿）而测试永远绿。Python 侧 tests/test_report_contract.py 反向断言发出集与 golden 一致。§SIDE-AUTH-2（2026-09-23 夜间批）：trade 事件新增 side_unverified（布尔，仅未命中派发行的成交携带）——网关据此走「待核对」落库不动持仓账，Go 据此留痕（opslog+计数）且不入账；命中派发行的回报不带该键（发出集为两通道并集，键按事实出现）。回归测：internal/server/report_contract_test.go（REPORT_CONTRACT_UPDATE=1 重生成信封/持仓行两面）。",
   "report_event_fields": [
     "amount", "asset", "at", "broker", "code", "created_at", "fee", "from",
     "name", "order_id", "positions", "price", "qty", "reason", "side",
-    "signal_id", "stamp_tax", "status", "trade_id", "traded_at", "type", "user_id"
+    "side_unverified", "signal_id", "stamp_tax", "status", "trade_id", "traded_at",
+    "type", "user_id"
   ],
   "positions_row_fields": [
     "amount", "buy_date", "cost_price", "cur_price", "highest_price", "name",
@@ -15,7 +16,7 @@
   "gateway_emitted_fields": {
     "trade": [
       "amount", "code", "fee", "name", "order_id", "price", "qty", "side",
-      "signal_id", "stamp_tax", "trade_id", "traded_at", "type", "user_id"
+      "side_unverified", "signal_id", "stamp_tax", "trade_id", "traded_at", "type", "user_id"
     ],
     "order": [
       "at", "code", "created_at", "order_id", "price", "qty", "reason", "side",
@@ -31,7 +32,7 @@
     "amount", "cost_price", "highest_price", "name", "qty", "ts_code", "updated_at", "user_id"
   ],
   "consumed_by_event": {
-    "trade": ["order_id", "trade_id", "name", "code", "side", "price", "qty", "amount", "traded_at", "signal_id", "fee", "stamp_tax"],
+    "trade": ["order_id", "trade_id", "name", "code", "side", "price", "qty", "amount", "traded_at", "signal_id", "fee", "stamp_tax", "side_unverified"],
     "order": ["order_id", "code", "side", "status", "price", "qty", "signal_id", "reason", "at", "created_at"],
     "positions": ["positions"],
     "account": ["asset"],

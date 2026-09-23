@@ -19,6 +19,7 @@ var (
 	llmDegrades     atomic.Int64 // LLM 降级事件次数（评分失败/解析失败占位等）
 	httpPanics      atomic.Int64 // panic 恢复次数（引擎/HTTP 顶层异常保护命中）
 	settleFailures  atomic.Int64 // §H1 交割单三方对账失败次数（旧实现只打一行日志，不可观测）
+	fillsUnverified atomic.Int64 // §SIDE-AUTH-2 方向未证实（网关未命中派发行）被留痕拒入账本的成交笔数
 )
 
 // countersVar expvar 发布用的可序列化快照。
@@ -35,7 +36,8 @@ func publish() {
 		`,"breaker_trips":` + itoa(breakerTrips.Load()) +
 		`,"llm_degrades":` + itoa(llmDegrades.Load()) +
 		`,"panics_recovered":` + itoa(httpPanics.Load()) +
-		`,"settle_failures":` + itoa(settleFailures.Load()) + `}`)
+		`,"settle_failures":` + itoa(settleFailures.Load()) +
+		`,"fills_side_unverified":` + itoa(fillsUnverified.Load()) + `}`)
 }
 
 // itoa 手写 int64→十进制字符串（无符号分支处理），避免为 6 个计数器引入 strconv 别名噪音。
@@ -83,3 +85,11 @@ func PanicRecovered() { httpPanics.Add(1); publish() }
 // SettleFailed §H1（2026-09-22 修复批）三方对账失败 +1——自动调度路的对账失败旧实现只
 // log 一行即吞，网关 400/网络故障均不可观测；现计入指标面并同步 opslog。
 func SettleFailed() { settleFailures.Add(1); publish() }
+
+// FillsSideUnverified §SIDE-AUTH-2（2026-09-23 夜间批）方向未证实的成交 +1——网关回报
+// side_unverified=true（未命中派发行、方向仅为桥/柜台枚举猜测）的成交被留痕拒入账本。
+// 为什么必须可观测：这是"账本可能被动错方向"的唯一实时信号，计数持续增长说明派发落盘或
+// 桥回报归因链路在漏（取证线索），人工核对窗口的压力全看这条指标。
+// English: counts fills the gateway could not vouch for (no dispatch row) — the only live
+// signal that direction may be wrong; growth means the dispatch/attribution chain is leaking.
+func FillsSideUnverified() { fillsUnverified.Add(1); publish() }

@@ -650,6 +650,15 @@ func (d *DB) migrate() error {
 			}
 		}
 	}
+	// §FILL-AMEND（2026-09-23）人工勘误表 + 读取侧收敛视图 fills_effective。
+	// 位置**必须**在上面的列补齐循环之后：视图定义引用 fills.trade_id，该列对旧库是 ALTER 补的，
+	// 建视图早于补列会让 Open 直接失败、服务起不来。
+	// English: human fill-amendment table + the fills_effective view every accounting reader
+	// resolves side through; must run after the column backfill because the view references
+	// fills.trade_id (added by ALTER on legacy DBs).
+	if err := d.migrateFillAmendments(); err != nil {
+		return err
+	}
 	// 一次性迁移：backtest_jobs → research_tasks（子系统统一改造，详见
 	// docs/RESEARCH_TASK_QUEUE_PLAN.md §9）。仅当队列表为空且旧表有数据时执行，
 	// 幂等安全：research_tasks 一旦有行（含新写入）绝不回填。

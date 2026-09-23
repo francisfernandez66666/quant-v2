@@ -92,13 +92,17 @@ func (d *DB) RiskGateDay(tradeDate string, limit int) ([]RiskGateHit, error) {
 // partial fills of one order count once; keyed by order_id, falling back to the broker serial, then
 // to the row id. Filled count (not submitted count) is the ledger-level truth, and it also covers
 // broker-only manual fills backfilled by sync_fills (which have no local orders row).
+//
+// §FILL-AMEND（2026-09-23）数据源 = fills_effective 视图（读取侧唯一收敛点）：`side` 已是
+// **生效方向**（人工勘误优先，无勘误即柜台原始方向）。本闸正是 09-22 那笔误判的直接受害者——
+// 一笔卖出被记成买入后白占一格当日买入笔数，纪律闸当日重复拒 4793 次。
 func (d *DB) CountBuyFilledOrdersByDay(userID, day string) (int, error) {
 	var n int
 	err := d.db.QueryRow(`SELECT COUNT(DISTINCT CASE
 			WHEN COALESCE(order_id,'') <> '' THEN 'o:' || order_id
 			WHEN COALESCE(serial,'')   <> '' THEN 's:' || serial
 			ELSE 'r:' || id END)
-		FROM fills WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
+		FROM fills_effective WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
 		userID, day).Scan(&n)
 	return n, err
 }
@@ -112,10 +116,12 @@ func (d *DB) CountBuyFilledOrdersByDay(userID, day string) (int, error) {
 // English: today's filled buy amount in yuan — the "filled" half of the freeze ledger for the
 // daily-budget gate; Σ amount (falling back to price×qty for legacy rows), same fills table as the
 // count gate. In-flight freeze comes from LocalBuyFrozen (order-status derived).
+// §FILL-AMEND（2026-09-23）：读 fills_effective（生效方向），与笔数闸同源；勘误只改方向，
+// amount 一列原样沿用柜台成交额（OrigAmount 快照存在 fill_amendments 里供审计比对）。
 func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
 	var s float64
 	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
-		FROM fills WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
+		FROM fills_effective WHERE user_id=? AND side='买入' AND substr(traded_at,1,10)=?`,
 		userID, day).Scan(&s)
 	return s, err
 }
@@ -127,10 +133,12 @@ func (d *DB) SumBuyFilledAmountByDay(userID, day string) (float64, error) {
 // English: today's sell proceeds in yuan — the "replenish" half of the freeze ledger; gates offset
 // today's buy occupancy with it (floored at zero so liquidating old inventory never enlarges the
 // daily budget). Fees not deducted; undercounting proceeds only tightens, never loosens.
+// §FILL-AMEND（2026-09-23）：读 fills_effective（生效方向）——这条就是 09-22 那笔错账的
+// 主要受害者：卖出被记成买入 → 回款恒 0 → 当日预算被占满后无法释放。
 func (d *DB) SumSellFilledAmountByDay(userID, day string) (float64, error) {
 	var s float64
 	err := d.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE price*qty END),0)
-		FROM fills WHERE user_id=? AND side='卖出' AND substr(traded_at,1,10)=?`,
+		FROM fills_effective WHERE user_id=? AND side='卖出' AND substr(traded_at,1,10)=?`,
 		userID, day).Scan(&s)
 	return s, err
 }

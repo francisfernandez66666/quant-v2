@@ -1149,6 +1149,18 @@ class Gateway:
         English: §P0 — for any order this gateway actually dispatched, the dispatch row's side is
         authoritative and the bridge's inferred DEAL direction must never override it. The old
         `setdefault` was a no-op whenever the bridge row already carried a (possibly wrong) side.
+
+        §SIDE-AUTH-2（2026-09-23 夜间批）方向权威补漏：上面那条规矩只在**查到派发行**时成立。
+        三级回落（seq→交易所委托号→signal_id）全落空时，旧实现不加任何标记地直接采用桥/柜台
+        推断入库——而桥侧 handler._side_of 是多枚举空间猜测（order_type 23/24 vs 1101/1102、
+        offset_type 48/50），代码自己记着已两次踩坑；猜错＝主动把卖出说成买入，Go 侧照单
+        入库并改持仓账（2026-09-22 603468.SH 事故链的源头）。现在未命中派发行（或命中但
+        派发行为空方向）的成交一律打 `side_unverified=true` + 单独 warning 留痕，
+        由 handler.on_trade → store.apply_fill 走「待核对」通道（与 UNRESOLVED_STATUS 同姿势：
+        落库保证据、绝不动持仓账）；命中派发行则显式剥除该键，既有权威覆盖路径零变化。
+        English: when no dispatch row backs the report, the bridge's guessed side is no longer
+        silently trusted — the fill is flagged side_unverified, warned once, and booked through
+        the unresolved (待核对) channel that leaves positions untouched.
         """
         # 归因回填 + 派发项定位：seq → 交易所委托号 → signal_id 三级回落。
         # FIX 2026-09-14 drill-3: 桥的 DEAL 行 m_strRemark 实测为空（passorder userOrderId
@@ -1186,6 +1198,24 @@ class Gateway:
                         drow.get("code", ""), req.get("order_id", ""), drow.get("seq", ""))
                 # 权威覆盖（非 setdefault）：本端下单方向 > 柜台字段反推。
                 req["side"] = auth
+        # §SIDE-AUTH-2 方向权威补漏：只有「查到派发行且派发行带方向」才算方向已证。
+        # 为什么未命中派发行不能信推断：桥/柜台方向是从多个互不兼容的枚举空间反推出来的
+        # （本项目 2026-08-31、2026-09-14 两次实锤判反），猜错就是把卖出说成买入——这正是
+        # 本批（§SIDE-AUTH-2）要根治的 603468.SH 事故形态（09-22 真实卖出记成买入）；
+        # 而派发行是我们自己下单时写下的物理事实，零推断。
+        # 派发行在但 side 为空属退化数据，方向同样不可证，一并标记（宁可多一条待核对，
+        # 也不许再出现"静默采信猜测"）。命中者显式剥除该键——既有已证路径的字段面零变化。
+        # English: only a dispatch row carrying a side can vouch for the direction; anything
+        # else is marked side_unverified and routed to the unresolved channel (positions untouched).
+        _side_vouched = bool(drow) and bool(str((drow or {}).get("side", "") or ""))
+        if _side_vouched:
+            req.pop("side_unverified", None)
+        else:
+            req["side_unverified"] = True
+            log.warning("[gateway] §SIDE-AUTH-2 成交回报未命中派发行，方向仅为桥/柜台推断（不可采信入库）"
+                        " —— 转「待核对」通道: code=%s order_id=%s seq=%s inferred=%s",
+                        req.get("code"), req.get("order_id", ""), req.get("seq", ""),
+                        req.get("side", ""))
         # §REJECT（2026-09-22 修复批，LOW「trade_id 空且 order_id 空回报拒收」）：
         # 归因回填后仍两把身份锚皆空 → 400 显式拒收（桥回报走 HTTP/文件桥回执语义，
         # 与 §F5 Go 侧 order 回报缺 order_id 拒 400 同口径；网关 handler.on_trade 侧
@@ -1204,7 +1234,7 @@ class Gateway:
             return 400, {"ok": False, "err": "trade report has neither trade_id nor order_id — rejected"}
         # on_trade 返回值（False=重放去重命中/第二道拒收）不改变本端 200 语义：
         # 重放本就该被幂等吞掉，桥据此结算回报不重投。
-        self.handler.on_trade({
+        _ev = {
             "order_id": req.get("order_id", ""), "trade_id": req.get("trade_id", ""),
             "name": req.get("name", ""), "code": req.get("code", ""), "side": req.get("side", ""),
             "price": float(req.get("price", 0) or 0), "qty": int(req.get("qty", 0) or 0),
@@ -1215,7 +1245,13 @@ class Gateway:
             # handler.on_trade → store.apply_fill 落 fills.fee，供 /settlement 费用差对账）。
             "fee": float(req.get("fee", 0) or 0),
             "stamp_tax": float(req.get("stamp_tax", 0) or 0),
-        })
+        }
+        # §SIDE-AUTH-2：方向未获派发行证实的成交带标记入库+上报——落库走「待核对」通道
+        # （fills 行保留全部可复核字段但不动持仓账），上报侧 Go 凭该标记留痕拒入账本。
+        # 命中派发行的回报**不带该键**（保持既有契约字段面，避免无谓的契约噪声）。
+        if req.get("side_unverified"):
+            _ev["side_unverified"] = True
+        self.handler.on_trade(_ev)
         # §QMT-DUAL 委托状态推进：按累计成交量对比申报量判已成/部成（对同一交易所委托号）
         oid = str(req.get("order_id", "") or "")
         prow = self.store.dispatch_by_order_id(oid) if oid else None

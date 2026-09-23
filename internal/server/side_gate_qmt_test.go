@@ -89,16 +89,29 @@ func TestExecuteRejectsNonCanonicalSide(t *testing.T) {
 	if exec.calls != 0 {
 		t.Fatalf("非法方向绝不能触达柜台（方向翻转的落点）, calls=%d", exec.calls)
 	}
-	// 合法契约不得被白名单误伤：显式买入 + 空串缺省买入都照常受理
-	for i, ok := range []string{"买入", ""} {
-		req := adminReq(s, admin, "POST", "/api/positions/execute",
-			`{"code":"600000.SH","qty":100,"price":10,"side":"`+ok+`","client_id":"side-ok-`+string(rune('0'+i))+`"}`)
-		if rr := adminDo(s, req); rr.Code != http.StatusOK {
-			t.Fatalf("方向 %q（合法/空串缺省）应放行, got %d body=%s", ok, rr.Code, rr.Body.String())
-		}
+	// 合法契约不得被白名单误伤：显式买入照常受理
+	req := adminReq(s, admin, "POST", "/api/positions/execute",
+		`{"code":"600000.SH","qty":100,"price":10,"side":"买入","client_id":"side-ok-0"}`)
+	if rr := adminDo(s, req); rr.Code != http.StatusOK {
+		t.Fatalf("显式买入应放行, got %d body=%s", rr.Code, rr.Body.String())
 	}
-	if exec.calls != 2 {
-		t.Fatalf("两笔合法买入应各触达柜台一次, calls=%d", exec.calls)
+	// §SIDE-AUTH-2（2026-09-23 夜间批）行为变更：空串不再缺省成买入——方向必填，缺即 400。
+	// 为什么反过来锁：旧"空串缺省买入"正是残余 fail-open（漏传字段的脚本/旧客户端会被
+	// 替用户决定买入真钱单）；验收要求"缺方向的调用会被拒"由本行钉死。
+	req = adminReq(s, admin, "POST", "/api/positions/execute",
+		`{"code":"600000.SH","qty":100,"price":10,"side":"","client_id":"side-empty-1"}`)
+	if rr := adminDo(s, req); rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "方向") {
+		t.Fatalf("§SIDE-AUTH-2 缺方向应 400+方向文案, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 请求体整体不带 side 键同样拒（json 解码零值即空串）
+	req = adminReq(s, admin, "POST", "/api/positions/execute",
+		`{"code":"600000.SH","qty":100,"price":10,"client_id":"side-absent-2"}`)
+	if rr := adminDo(s, req); rr.Code != http.StatusBadRequest {
+		t.Fatalf("请求体缺 side 键应 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// 上面三笔拒单不得触达柜台：只算过显式买入那一笔
+	if exec.calls != 1 {
+		t.Fatalf("合法买入各触达柜台一次、缺方向零触达, calls=%d", exec.calls)
 	}
 }
 

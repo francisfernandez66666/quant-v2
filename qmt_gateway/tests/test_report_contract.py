@@ -127,7 +127,12 @@ class TestGatewayEmitsMatchGolden(unittest.TestCase):
         # 丢腿本体：这三条必须在载荷里（Go 侧同名 tag 由 ② 与 Go 测试共同保证）
         self.assertEqual(xt["trade_id"], "T-9001")
         self.assertEqual(xt["name"], "贵州茅台")
-        union = set(xt.keys()) | set(_bridge_trade_payload().keys())
+        # §SIDE-AUTH-2：桥路径未命中派发行时带 side_unverified=true（并集来源）；
+        # 命中派发行的回报与旧契约一样**不带该键**。
+        bridge = _bridge_trade_payload()
+        self.assertIs(bridge.get("side_unverified"), True,
+                      "§SIDE-AUTH-2 未命中派发行的桥成交必须带 side_unverified")
+        union = set(xt.keys()) | set(bridge.keys())
         self.assertEqual(sorted(union), sorted(self.golden["gateway_emitted_fields"]["trade"]),
                          "trade 两通道并集与 golden 不一致")
 

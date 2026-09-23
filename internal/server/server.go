@@ -773,6 +773,16 @@ func (s *Server) registerRoutes() {
 	// §WS-B：券商交割单三方对账（触发 + 历史查询，仅 admin）
 	s.mux.HandleFunc("POST /api/qmt/settle", s.adminMiddleware(s.handleQMTSettle))
 	s.mux.HandleFunc("GET /api/qmt/settle/history", s.adminMiddleware(s.handleQMTSettleHistory))
+	// §FILL-AMEND（2026-09-23）历史错账的人工逐笔勘误 + 守恒自检（仅 admin：实盘账本族端点
+	// 本就 admin-only，且勘误是"人工改判账目口径"的资损级动作）。
+	// 提交→批准两步分离，批准前是影子态（不影响任何数字）；apply/revoke 各一条审计留痕。
+	// English: §FILL-AMEND — admin-only human correction channel (submit → approve → optional
+	// revoke) plus the read-only conservation self-check.
+	s.mux.HandleFunc("GET /api/qmt/fill-amendments", s.adminMiddleware(s.handleListFillAmendments))
+	s.mux.HandleFunc("POST /api/qmt/fill-amendments", s.adminMiddleware(s.handleCreateFillAmendment))
+	s.mux.HandleFunc("POST /api/qmt/fill-amendments/{id}/apply", s.adminMiddleware(s.handleApplyFillAmendment))
+	s.mux.HandleFunc("POST /api/qmt/fill-amendments/{id}/revoke", s.adminMiddleware(s.handleRevokeFillAmendment))
+	s.mux.HandleFunc("GET /api/qmt/fills/conservation", s.adminMiddleware(s.handleFillConservation))
 	// §WS-C：风控闸口状态（命中明细 + 开关状态，仅 admin）
 	s.mux.HandleFunc("GET /api/risk/gates", s.adminMiddleware(s.handleRiskGates))
 	// §WS-E 敏感管线隔离：llm-debug / stage-records 含运营账号 LLM 密钥池与全链路日志，

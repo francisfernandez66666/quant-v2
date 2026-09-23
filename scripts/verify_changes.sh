@@ -16,6 +16,7 @@
 #     + §H9/§M16 outbox 错位/网关 inflight 收割（见 34）+ §F2/§M4/§F5/§M5/§F3 回报接入段（见 35）+ §M14/§M15 同因熔断/夜链自愈（见 36）+ §H8/§F6 探针同源/构建指纹（见 37）
 #     + 二波（2026-09-22 当日续）：§M1 golden 源契约单源（见 38）+ §M2/§M3 降级报成功族（见 39）+ §M6/§TZ/§REJECT 数据管道 py 批（见 40）+ §M8 推送三通道内聚/EXPVAR 收权（见 41）+ §M9/§M10/M11 快照与落盘批（见 42）+ §M7 部署清单收编（见 43）+ §M12/§M13 前端与移动壳一致性 + researchd 冒烟（见 44）
 #     + C批（2026-09-22 晚间，owner 裁决清单四件套）：§XCHECK 价格复核闸接线/CrossCheckPrice 收编（见 45）+ §NATIVEAUTH 登录 token 迁原生加密存储（见 46）+ §ROOTQMT 根级死键防回潮 + §APPVER APK 服务端驱动强制更新（见 47））
+#     + 夜间批（2026-09-23，owner 裁决"报警不是修复，兜住才是"四件套）：§KLINE-CHAIN-3 日K三级兜底链+库内腿四道守卫（见 82）+ §SIDE-AUTH-2 方向权威补漏/待核对通道/方向必填（见 83）+ §FILL-AMEND 追加式人工勘误+fills_effective 单点收敛+只读守恒自检+前端逐笔入口（见 84）+ §FILL-AMEND 只读取证脚本纪律（见 85）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1091,8 +1092,9 @@ echo "ok - §CONTRACT 专项守卫通过（行为锁 4 组 + 静态锁 14 道 + 
 echo "==> 54 §H3 打分链日K复权优先 + 不复权拒参与 + 腾讯静默回退拒收（2026-09-22 PM批 H-3）..."
 # 旧链 新浪(不复权)第一、只判 len>0、腾讯 qfqday 缺失静默拿不复权 day 冒充前复权——
 # 除权日 MA/动量/止损价系统性失真（全系统 qfq 契约的漏网链，§D6 收口后剩余那条）。
-# 现：东财(qfq)→腾讯(仅 qfq)优先，每源过 ValidateKLine；新浪/同花顺只作**带标记**的末位兜底，
-# 不复权序列不进 md.KLines（因子战法经 len 守卫自然拒参与）。
+# 现（2026-09-23 §KLINE-CHAIN-3 换序后）：腾讯(仅 qfq)→东财(qfq)→库内日K 三条复权腿依次优先，
+# 每源过 ValidateKLine；新浪/同花顺只作**带标记**的末位兜底，不复权序列不进 md.KLines（因子战法自然拒参与）。
+# 本条只锁"复权优先于不复权"这条底线；链的完整顺序与库内腿守卫由 82 专锁。
 go test -count=1 ./internal/strategy_engine/ -run 'TestFetchDayKLine|TestApplyDayKLine|TestFetchMinuteKLine' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/data/ -run 'TestGetTencentKLineRefusesUnadjustedFallback|TestParseTencent' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 顺序锁（比文本断言可靠）：fetchDayKLine 内东财 qfq 腿必须排在新浪不复权腿之前。
@@ -1862,6 +1864,10 @@ echo "ok - §CKPT-PRUNE 守卫通过（dry-run 锁 2 + 格式/双拒门锁 3 + �
 #       ③APK 签名口令 keystore.pass 只有一份、在仓库工作树里（虽被 gitignore），盘坏了已发布版本
 #         永不可复现。
 # 本段锁"不可逆动作的安全阀"：退役=改名不删除、写操作=显式 -Apply、备份=显式目的地且拒仓库内。
+# §OPS-ALIGN（2026-09-23，owner 裁决 4）：两个运维 .ps1 的**缺省方向**原是一动一静（退役脚本不带
+#   参数就停进程改名，token 轮换不带参数只预览），操作人按另一个脚本的肌肉记忆敲命令就会误改现网。
+#   现已统一成"缺省只预览、显式 -Apply 才动手"。方向翻转带来的新风险是**调用点漏 -Apply**：
+#   退出码照样 0、照样打 done，退役却根本没发生——故本段除脚本自身的顺序锁外，另钉调用点与探针。
 echo ""
 echo "==> 77 §C-OPS 运维安全阀..."
 for ps in decommission_qmt_mock rotate_qmt_token; do
@@ -1885,6 +1891,22 @@ if grep -qE '^[^#]*Remove-Item' deploy/qmt-win/decommission_qmt_mock.ps1; then
 	echo "--- FAIL: 退役脚本出现 Remove-Item（不可逆删除，UAT 资产应改名保留）"; exit 1; fi
 grep -q 'QMT_MOCK_DECOMMISSION=1' scripts/deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 退役步不再由显式开关门控（默认就在实盘机上停进程改名）"; exit 1; }
+# §OPS-ALIGN 正锁①：退役脚本与轮换脚本同一口径——缺省即预览，改名原语必须排在 dry-run 早退之后。
+# （旧实现只有轮换侧有这条顺序锁；缺省方向翻过来后，退役侧一旦被人改回"缺省动手"就无人报警。）
+python3 - deploy/qmt-win/decommission_qmt_mock.ps1 <<'PY' || { echo "--- FAIL: mock 退役脚本的缺省方向不再是「只预览」（不带 -Apply 就会改现网文件名）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+assert re.search(r'\[switch\]\$Apply', t), '-Apply 开关丢失（动手侧再无显式入口）'
+assert re.search(r'if \(-not \$Apply\) \{ \$DryRun = \$true \}', t), '缺省即预览的归一语句丢失'
+early = re.search(r'if \(\$DryRun\) \{.*?exit 0', t, re.S)
+assert early, 'dry-run 早退分支丢失'
+assert 'Rename-Item' in t, '改名原语都不见了（本锁与实现同时失配，请同步）'
+assert early.end() < t.index('Rename-Item'), '改名动作排在 dry-run 早退之前（缺省调用就会动生产文件）'
+PY
+# §OPS-ALIGN 正锁②：**调用点必须显式带 -Apply**。缺省方向一改，部署步 [3d] 若沿用旧命令就只会打印
+# 预览并退出 0——"脚本跑成功了"与"退役发生了"从此是两件事，这是本批最容易复犯的静默假成功形态。
+grep -qE 'decommission_qmt_mock\.ps1 -Apply' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 部署步 [3d] 未显式带 -Apply（退役根本不会发生，却在打 OK）"; exit 1; }
 # 轮换=缺省 dry-run：写盘动作必须排在 $DryRun 早退之后。
 python3 - deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || { echo "--- FAIL: rotate 的 dry-run 早退不再先于写盘（不加 -Apply 也会改配置）"; exit 1; }
 import re, sys
@@ -1913,7 +1935,7 @@ grep -q 'qmt:token fp agree across 4 sources' scripts/verify_deploy_guangzhou.sh
 # 中文 detail 在 grep 判据里恒不命中 = 把假绿写进探针）。
 if grep -nE '\$(mockMiss|tkBad) \+= "[^"]*[^ -~]' scripts/verify_deploy_guangzhou.sh | grep -q .; then
 	echo "--- FAIL: mock/token 探针的 detail 文案含非 ASCII 字符（SSH/GBK 假绿陷阱复犯）"; exit 1; fi
-echo "ok - §C-OPS 守卫通过（清单锁 4 + BOM 锁 1 + 安全阀锁 5 + 明文/删除负锁 2 + 探针锁 3）"
+echo "ok - §C-OPS 守卫通过（清单锁 4 + BOM 锁 1 + 安全阀锁 7（含 §OPS-ALIGN 缺省方向锁 2）+ 明文/删除负锁 2 + 探针锁 3）"
 
 # ── 78. §EXIT-RETAIN 出场覆盖跟随持仓，不跟随启用开关 ──
 # 现象：停用一条战法库规则（人工点停用，或 stale_adj_basis_action=disable 这类**无人值守**自动路径）
@@ -2034,6 +2056,199 @@ if grep -qE "request\.get\('[^']*18789|toContainText\('127\.0\.0\.1:18789" web/e
 if grep -q 'test.skip(!resp' web/e2e/uat_full.spec.mjs; then
 	echo "--- FAIL: 复活了无条件 skip(!resp)"; exit 1; fi
 echo "ok - §UAT-PORTS 守卫通过（单源锁 1 + 口径锁 2 + 导出锁 3 + 负锁 2）"
+
+
+echo "==> 82 §KLINE-CHAIN-3 日K三级兜底链：腾讯主源 + 东财降到复权链末尾 + 库内日K四道守卫（2026-09-23 夜间批，owner 裁决 1/2）..."
+# 现象（09-23 全天）：腾讯与东财两条复权腿同时不通 → fetchDayKLine 只剩"带标记的不复权兜底"，
+#       而 §H3 的守卫正确地拒绝让不复权序列进 md.KLines → 结果是日K为空、
+#       N形/双响炮/因子这批吃日K的战法整轮零分，当日只有不依赖日K的龙头战法出信号。
+# 定性（owner 原话）："报警有啥用啊，又不能解决问题"——所以本条不是加告警，是把兜底做实。
+# 三条前置：① 链序 腾讯(仅qfq) → 东财(qfq，降级但**不摘掉**) → 库内日K → 不复权(带标记)；
+#       ② 库内价是**后复权**，必须按实时昨收定锚归一 + 量纲(手→股) + 新鲜度 + 丢当日行，
+#          四道守卫任一不过即拒用（锚错位的序列比空序列更坏：它整体平移却不报错）；
+#       ③ 库内腿靠引擎注入才有数据——装配漏掉时表现与"根本没有兜底"完全一致（静默跳过）。
+go test -count=1 ./internal/strategy_engine/ -run 'TestFetchDayKLine|TestStoreDayKLine|TestCachedKLine|TestLastCloseSkipsStoreLeg|TestApplyDayKLine' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 链序锁（行号严格递增比文本断言可靠；沿用 54 的滤注释姿势）：腾讯 < 东财 < 库内 < 新浪。
+K3_TC=$(grep -n 'GetTencentKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+K3_EM=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+K3_DB=$(grep -n 'e.storeDayKLine(code, prevClose)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+K3_SINA=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+[ -n "$K3_TC" ] && [ -n "$K3_EM" ] && [ -n "$K3_DB" ] && [ -n "$K3_SINA" ] \
+	|| { echo "--- FAIL: 日K四条腿少了一条（§KLINE-CHAIN-3 链序锁失效）"; exit 1; }
+[ "$K3_TC" -lt "$K3_EM" ] && [ "$K3_EM" -lt "$K3_DB" ] && [ "$K3_DB" -lt "$K3_SINA" ] \
+	|| { echo "--- FAIL: 日K链序回退（必须 腾讯→东财→库内→不复权；东财不得被摘掉，也不得排到库内腿之后）"; exit 1; }
+# 东财降级但仍在场：owner 裁决 1 明确"降到复权链末尾、不摘掉"，摘掉等于少一条独立复权源。
+grep -q 'e.bumpKLineSrc("东财")' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 东财复权腿被摘掉（owner 裁决是降级不是删除）"; exit 1; }
+# 库内腿四道守卫（缺一道即"错锚/错量纲/陈旧K/当日半成品"进因子计算）。
+grep -q 'raw\[len(raw)-1\].Date.Format("20060102") >= today' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫⓪（丢当日及未来日期的行）丢失——实时昨收锚当日半成品K会把今天涨幅摊进整条基准"; exit 1; }
+grep -q 'scale := prevClose / last.Close' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫①（按实时昨收定锚归一）丢失——后复权价会整体抬高 LastClose/止损价"; exit 1; }
+grep -q 'lotsToShares' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫②（库内 Vol 手→股）丢失"; exit 1; }
+grep -q 'const storeBarsMaxStale' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 守卫③（新鲜度上限）常量丢失——夜间同步断了会长期用旧K"; exit 1; }
+grep -q 'if prevClose <= 0 {' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 无锚（昨收取不到）不再拒用库内腿（宁可无兜底也不出错锚）"; exit 1; }
+# 拒用必须留痕：noteStoreBarsRejected 至少覆盖 无历史序列/末根非法/scale 非法/过期 四类分支。
+K3_REJ=$(grep -c 'noteStoreBarsRejected(' internal/strategy_engine/engine.go)
+[ "$K3_REJ" -ge 5 ] || { echo "--- FAIL: 库内腿拒用留痕只剩 $K3_REJ 处（<5）——兜底静默失效不可见（§M-8/§N-6）"; exit 1; }
+# 装配锁：库内腿靠注入取数，装配点漏了就是永久静默跳过（形态同"没有兜底"）。
+grep -q 'strategyEngine.SetDayBarsLookup(dayBarsLookup.Lookup)' cmd/quant/main.go \
+	|| { echo "--- FAIL: 库内日K读取器未注入引擎（兜底腿形同虚设且零报错）"; exit 1; }
+grep -q 'func (l \*DayBarsLookup) Lookup' internal/engine/day_bars_lookup.go \
+	|| { echo "--- FAIL: 库内日K读取器实现丢失"; exit 1; }
+# 缓存锁：命中缓存时必须回查昨收锚（锚一天一换，沿用旧锚=整条基准错位）。
+grep -q 'func (ent \*klineCacheEntry) cacheReusable(prevClose float64) bool' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 日K缓存的锚校验函数丢失"; exit 1; }
+grep -q 'ent.cacheReusable(prevClose)' internal/strategy_engine/engine.go \
+	|| { echo "--- FAIL: 缓存命中路径不再校验昨收锚（跨轮换锚后仍拿旧序列）"; exit 1; }
+# 负锁①：库内腿只读——兜底链里绝不允许出现写库调用（按「到下一个顶层 func」圈定函数体，
+# 比固定行窗口可靠；滤注释行，防打死"为何只准读"的说明）。
+if LC_ALL=C awk '/^func \(e \*Engine\) storeDayKLine/{f=1;next} /^func /{if(f)exit} f' internal/strategy_engine/engine.go \
+	| grep -vE '^[[:space:]]*//' | grep -qE 'UPDATE |DELETE |INSERT |\.Exec\('; then
+	echo "--- FAIL: 库内日K腿里出现写库调用（打分链取数只准读）"; exit 1; fi
+# 负锁②：不复权兜底不得重新进 KLines（§H3 的收口成果不许被本批"加兜底"顺手抵消）。
+if grep -nE 'md\.KLines = .*GetSinaKLine|md\.KLines = .*GetTHSKLine' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: 不复权腿又直写 md.KLines（除权日因子失真复活，§H3）"; exit 1; fi
+echo "ok - §KLINE-CHAIN-3 守卫通过（行为锁 1 组 + 链序锁 2 + 四道守卫锁 5 + 留痕计数锁 1 + 装配锁 2 + 缓存锁 2 + 负锁 2）"
+
+echo "==> 83 §SIDE-AUTH-2 方向权威补漏：xt 直连同源作保 + side_unverified 契约字段 + 「待核对」通道 + 方向必填（2026-09-23 夜间批）..."
+# 现象（09-22 实账 603468.SH）：一笔真实卖出在本地账里记成买入 → 回款不释放、当日预算被自己占满、
+#       已实现盈亏恒 0，三本纪律账同时污染；而 §TRADE_SIDE（09-18）的方向权威只在**查到派发行**时成立。
+# 根因：① 派发行查不到时，桥/xt 两条通道都拿"柜台枚举推断的方向"照常入库（fail-open）；
+#       ② §TRADE_SIDE 只补在桥/HTTP 入口 _apply_trade，现网实盘主通道 xt 回调 on_trade 那条**根本没接**；
+#       ③ Go 侧手动下单缺方向时缺省成买入（同族 fail-open 的第二处）。
+# 前置：未证方向一律不入账本——网关落「待核对」通道（保留全部成交证据、不动持仓），
+#       Go 侧留痕拒入账本并广播 side_unverified，历史错账走 §FILL-AMEND 人工勘误（见 84）。
+go test -count=1 ./internal/server/ -run 'TestExecuteRejectsNonCanonicalSide|TestExecuteSellSideStillAccepted|TestReportSideUnverified|TestReportEnvelopeDecodesSideUnverified' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+python3 -m pytest qmt_gateway/tests/test_side_auth2.py qmt_gateway/tests/test_report_contract.py -q 2>&1 | tail -3
+# 双通道同源锁：桥/HTTP 入口与 xt 直连入口必须各自做一次派发行作保，少一处就留半边 fail-open。
+grep -q 'def _apply_trade' qmt_gateway/gateway.py \
+	&& grep -q 'req\["side_unverified"\] = True' qmt_gateway/gateway.py \
+	|| { echo "--- FAIL: 桥/HTTP 成交入口不再给未证方向打标记（§TRADE_SIDE 半边复活）"; exit 1; }
+grep -q 'def _vouch_trade_side' qmt_gateway/handler.py \
+	|| { echo "--- FAIL: xt 直连通道的派发行作保丢失（现网主通道 = 本批要补的那半边）"; exit 1; }
+grep -q 'self.on_trade(self._vouch_trade_side(ev))' qmt_gateway/handler.py \
+	|| { echo "--- FAIL: _vouch_trade_side 定义了却没接进 on_trade（死代码假修复）"; exit 1; }
+# 「待核对」通道：未证方向的成交在网关本地账走第三态，绝不动持仓（动持仓=按猜的方向改资金账）。
+grep -q 'fill_side = UNRESOLVED_STATUS if unverified else' qmt_gateway/store.py \
+	|| { echo "--- FAIL: 未证方向的成交没有落「待核对」通道"; exit 1; }
+# Go 侧接收：缺方向的回报留痕拒入账本，并按契约回 ok+side_unverified（回 ok=1 而不留痕=假成功）。
+grep -q 'SideUnverified bool' internal/server/qmt.go \
+	|| { echo "--- FAIL: 回报信封不再解析 side_unverified（契约字段单方面消失，网关标记被吞）"; exit 1; }
+grep -q 'writeJSON(w, 200, map\[string\]string{"ok": "1", "side_unverified": "1"})' internal/server/qmt.go \
+	|| { echo "--- FAIL: side_unverified 回报的响应契约回退（网关侧幂等判定会失据）"; exit 1; }
+# 方向必填：空串**不再**缺省成买入，而是 400 拒单 + 安全审计留痕（非规范值 buy/SELL/单字"买"仍走 §SIDEGATE-GO 白名单拒）。
+grep -q 'writeError(w, 400, "缺少下单方向(side)：必须显式传 买入/卖出")' internal/server/qmt.go \
+	|| { echo "--- FAIL: 缺方向的手动下单不再被 400 拒（方向必填复活成缺省买入）"; exit 1; }
+grep -q 'opslog.Audit("live_order_side_missing"' internal/server/qmt.go \
+	|| { echo "--- FAIL: 缺方向拒单不留痕（谁在漏传 side 无从追查）"; exit 1; }
+if grep -nE 'if side == "" \{\s*side = "买入"|side = "买入" // 缺省' internal/server/qmt.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: 手动下单又给空方向缺省成买入（§SIDE-AUTH-2 残余 fail-open 复活）"; exit 1; fi
+# 前端镜像防线：封装层 refuse-to-send（方向非 买入/卖出 一个请求都不发）。
+grep -q "body.side !== '买入' && body.side !== '卖出'" web/src/api/index.js \
+	|| { echo "--- FAIL: 前端 executeRealAction 方向守卫丢失（后端 400 的镜像防线）"; exit 1; }
+echo "ok - §SIDE-AUTH-2 守卫通过（行为锁 2 套件 + 双通道同源锁 3 + 通道锁 1 + 契约锁 2 + 必填正锁 2 + 缺省负锁 1 + 前端锁 1）"
+
+echo "==> 84 §FILL-AMEND 历史错账勘误通道：追加式决定 + fills_effective 单点收敛 + 只读守恒自检 + 前端逐笔入口（2026-09-23 夜间批，owner 裁决 4）..."
+# 现象：84 的前半段（§SIDE-AUTH-2）只挡住"往后不再记错"，09-22 那条已经落错方向的行**不会自动改**——
+#       成交是资金事实，任何"按猜测自动重放历史账本"都可能把对的改成错的。
+# 修法：只追加、不覆写。人工逐笔勘误（提交=待批准影子条目，账不动 → 批准=读取侧方向生效 → 撤销=回原始方向），
+#       所有按方向取数的口径统一走视图 fills_effective；账本守恒自检只报差异线索、绝不平账。
+# 前置（顺序有讲究）：视图定义引用 fills.trade_id，该列对旧库靠 ALTER 补 → 建视图必须排在列补齐之后，
+#       否则 Open 直接失败、服务起不来；一笔成交最多一条活跃勘误 → 靠两个 partial unique index 兜住
+#       （少了它，两条 applied 会让视图把一行扇成两行，买入笔数/金额直接翻倍而原始 fills 一字未动）。
+go test -count=1 ./internal/store/ -run 'TestFillAmendment|TestFillEffectiveNoFanOut|TestConservation' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/server/ -run 'TestFillAmendment' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# 迁移顺序锁：列补齐(trade_id) 必须早于 migrateFillAmendments 调用。
+K4_COL=$(grep -n 'ALTER TABLE fills ADD COLUMN trade_id' internal/store/store.go | head -1 | cut -d: -f1)
+K4_VIEW=$(grep -n 'd.migrateFillAmendments()' internal/store/store.go | head -1 | cut -d: -f1)
+[ -n "$K4_COL" ] && [ -n "$K4_VIEW" ] || { echo "--- FAIL: 找不到 trade_id 补列或建视图调用（§FILL-AMEND 顺序锁失效）"; exit 1; }
+[ "$K4_COL" -lt "$K4_VIEW" ] || { echo "--- FAIL: 建视图排到了补列之前（旧库 Open 失败、服务起不来）"; exit 1; }
+# 视图不扇行的两道保障（active 与 applied 各一对；谓词含 'revoked' 时 SQLite 推不出 JOIN 至多一行）。
+K4_IDX=$(grep -c 'CREATE UNIQUE INDEX IF NOT EXISTS idx_fa_' internal/store/fill_amendments.go)
+[ "$K4_IDX" -ge 4 ] || { echo "--- FAIL: 勘误唯一索引只剩 $K4_IDX 个（<4）——视图可能把一笔成交扇成多行" ; exit 1; }
+grep -q "DROP VIEW IF EXISTS fills_effective" internal/store/fill_amendments.go \
+	|| { echo "--- FAIL: 视图不再是 DROP+CREATE（旧定义会被 IF NOT EXISTS 永久钉死）"; exit 1; }
+# 收敛点锁：按方向取数的六个读取口必须全部读视图（漏一个=同一笔改判在两处给出互相矛盾的数字）。
+K4_VIEWED=$(grep -rc 'FROM fills_effective' internal/store/*.go | LC_ALL=C awk -F: '{s+=$2} END {print s+0}')
+[ "$K4_VIEWED" -ge 6 ] || { echo "--- FAIL: 读视图的口径只有 $K4_VIEWED 处（<6）——纪律闸/成交簿出现分叉" ; exit 1; }
+for f in risk_gates.go real_positions.go settlement.go; do
+	grep -q 'fills_effective' internal/store/$f || { echo "--- FAIL: internal/store/$f 未接生效方向视图"; exit 1; }
+done
+# 反方向保障：幂等判重必须**留在原始 fills**（锚在柜台证据上），改走视图会让勘误生效后的同笔回报判不出重复。
+grep -q "SELECT COUNT(\*) FROM fills WHERE trade_id=?" internal/store/real_positions.go \
+	|| { echo "--- FAIL: ApplyRealFill 的 trade_id 判重不再查原始 fills（双倍记账入口）"; exit 1; }
+grep -q "SELECT COUNT(\*) FROM fills WHERE order_id=? AND traded_at=? AND price=? AND qty=?" internal/store/settlement.go \
+	|| { echo "--- FAIL: FillExists 的事实键判重不再查原始 fills"; exit 1; }
+# 端点收口：五条路由全在 adminMiddleware 下（实盘账本写端点，§M-14 同口径）。
+for r in 'GET /api/qmt/fill-amendments' 'POST /api/qmt/fill-amendments' 'POST /api/qmt/fill-amendments/{id}/apply' 'POST /api/qmt/fill-amendments/{id}/revoke' 'GET /api/qmt/fills/conservation'; do
+	grep -qF "s.mux.HandleFunc(\"$r\", s.adminMiddleware(" internal/server/server.go \
+		|| { echo "--- FAIL: $r 未挂 adminMiddleware（勘误是资金账写端点）"; exit 1; }
+done
+# 锚点单源：提交体只有 fill_id（前端自报锚点=可造匹配不到成交的死勘误）。
+grep -q 'FillID  int64  `json:"fill_id"`' internal/server/fill_amendments.go \
+	|| { echo "--- FAIL: 勘误提交体不再是「只带 fill_id」"; exit 1; }
+grep -q 'db.RawFillForUser(uid, req.FillID)' internal/server/fill_amendments.go \
+	|| { echo "--- FAIL: 未先按归属读原始行（越权面 + 锚点来源不唯一）"; exit 1; }
+# 守恒自检只读：整份实现不许出现写账语句（"顺手让它自动修"是本条要防的那类改动；滤注释行）。
+K4_CONS_FN=$(grep -n 'func (d \*DB) CheckBookConservation' internal/store/fill_conservation.go | head -1 | cut -d: -f1)
+[ -n "$K4_CONS_FN" ] || { echo "--- FAIL: 守恒自检实现丢失"; exit 1; }
+if grep -nE '^\s*(d\.db|tx)\.(Exec|Begin)' internal/store/fill_conservation.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
+	echo "--- FAIL: fill_conservation.go 出现写库调用（守恒自检只准 SELECT）"; exit 1; fi
+# 前端逐笔入口（owner 裁决"连勘误入口一起上"）：面板挂载 + 流水行有改判按钮 + 提交只带三键。
+grep -q '<FillAmendPanel' web/src/pages/Quant.jsx \
+	|| { echo "--- FAIL: 勘误面板未挂进量化交易页（后端有通道而没人能用）"; exit 1; }
+grep -q "onClick={() => setAmendTarget(row)}" web/src/pages/Quant.jsx \
+	|| { echo "--- FAIL: 成交流水行的「改判」入口丢失"; exit 1; }
+grep -q 'data: { fill_id: fillId, new_side: newSide, reason }' web/src/api/index.js \
+	|| { echo "--- FAIL: 前端提交体又带上锚点字段"; exit 1; }
+grep -q 'async function transition(a, action)' web/src/components/FillAmendPanel.jsx \
+	|| { echo "--- FAIL: 批准/撤销共用的处置入口丢失（两态各写一份迟早只改一份）"; exit 1; }
+echo "ok - §FILL-AMEND 守卫通过（行为锁 3 组 + 顺序锁 1 + 视图保障锁 2 + 收敛锁 4 + 判重反向锁 2 + 路由锁 5 + 锚点锁 2 + 只读负锁 1 + 前端锁 4）"
+
+echo "==> 85 §FILL-AMEND 只读取证脚本：现网证据四道只读机制 + 降级不报成功（2026-09-23 夜间批）..."
+# 为什么先取证再改判：09-22 那批错账的"该改成什么方向"只有三方证据能回答——
+#       本地 fills / 网关 fills / 网关日志的 dispatch 方向 / 柜台回报。少了 dispatch 这一方就下判语，
+#       等于把"我猜"写成"人工已核对"，而勘误通道是全权信任人工输入的。
+# 纪律：只走现网已有的 sqlite3 只读查询 + 拷副本，绝不 SSH 手敲、绝不在原库上加锁或写任何东西；
+#       拿不到证据（缺 sqlite3 / 网关库没拷到 / 查询报错）一律降级为 INCONCLUSIVE 或非 0 退出，
+#       绝不"没取到也报成功"（§M-8/§N-6）。
+grep -q 'FORENSIC_FILL_DONE' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 取证脚本的完成锚点丢失（跑没跑完无法判定）"; exit 1; }
+grep -q 'sqlite3 "file:$1?mode=ro"' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 本地副本不再以 mode=ro 打开（只读第一道机制丢失）"; exit 1; }
+grep -q "('-readonly', (Join-Path \$stage \$whichDb)" scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 远端 sqlite3 调用丢了 -readonly（现网库第二道只读机制丢失）"; exit 1; }
+grep -q 'trap cleanup EXIT' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 临时副本清理未挂 trap（现网留残留库文件）"; exit 1; }
+grep -q '^audit_sql() {' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 装配 SQL 的词法复核函数丢失"; exit 1; }
+grep -q 'run_round2_dispatch() {' scripts/forensic_fill.sh \
+	&& grep -q 'run_round2_dispatch || exit $?' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 第二轮 dispatch 取数没有接进主流程（权威方向那一路证据是死代码）"; exit 1; }
+# 方向 token 化必须排在 printable 过滤**之前**（C locale 的 [:print:] 不含 CJK 字节，顺序颠倒会把
+# dispatch=卖出 洗成 dispatch=，制造"日志里没有方向"的假线索）。
+grep -q '| side_tok | LC_ALL=C tr -cd' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 中文方向 token 化没有排在 printable 过滤之前（方向会被洗成空）"; exit 1; }
+# UNKNOWN 不得被当成"存在冲突记录"（判据取不到值时宁可少说，不可把缺数据读成结论）。
+grep -q 'cnt_gt0() { case "${1:-}"' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 计数判据不再区分 UNKNOWN（缺数据会被判成有冲突）"; exit 1; }
+# 五档保守判语齐备（少一档就会用别的档凑答）。
+for w in MISLABEL_SUSPECT NO_DISPATCH_ROW UNDETERMINED INCONCLUSIVE CONSISTENT; do
+	grep -q "$w" scripts/forensic_fill.sh || { echo "--- FAIL: 判语 $w 丢失"; exit 1; }
+done
+# 预检三件套：缺 sqlite3/sha256sum/awk 直接非 0 退出（不静默跳过）。
+grep -q 'need_cmd sqlite3 || exit 3' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 工具闸缺失（没有 sqlite3 会一路降级成"看起来跑完了"）"; exit 1; }
+# 负锁：脚本不得内嵌任何写语句或凭据值（只读 + 零新增凭据）。
+if grep -nE '^[[:space:]]*(INSERT|UPDATE|DELETE|DROP|VACUUM) ' scripts/forensic_fill.sh | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: 取证脚本出现写库语句（本脚本只准 SELECT）"; exit 1; fi
+if grep -qE 'Password|ConvertTo-SecureString' scripts/forensic_fill.sh; then
+	echo "--- FAIL: 取证脚本出现口令原语（纪律：绝不新增凭据，SSH 复用既有 key）"; exit 1; fi
+echo "ok - §FILL-AMEND 取证脚本守卫通过（锚点锁 1 + 只读机制锁 4 + 接线锁 3 + 判语锁 6 + 工具闸锁 1 + 写库/凭据负锁 2）"
 
 echo ""
 echo "==> 全部通过"
