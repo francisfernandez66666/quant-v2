@@ -211,25 +211,30 @@ try {
     # 语义下把原生命令写出的**每一行 stderr 升级为终止性错误**（同族实录：run_ths_backfill.ps1
     # 首跑退出码 1 日志 0 字节、caddy validate 的 INFO 日志杀掉 [2d]）。restic 的习惯是把进度和
     # 提示也写 stderr ⇒ "备份其实成功、脚本判失败"。唯一可信判据是退出码。
-    $bkArgs = @("backup", "-r", $RepoDir, $SnapRoot, "--tag", "nightly")
-    $bk = Invoke-Native $Restic $bkArgs
-    foreach ($l in $bk.out) { Log ("restic: " + $l) }
-    if ($bk.code -ne 0) {
-        $txt = $bk.out -join ' '
-        if ($txt -notmatch 'already locked') { throw ("restic backup exit=" + $bk.code + ": " + $txt) }
-        Log "restic: 检出陈旧锁 -> unlock 后重试一次"
-        $ulArgs = @("unlock", "-r", $RepoDir)
-        $ul = Invoke-Native $Restic $ulArgs
-        foreach ($l in $ul.out) { Log ("restic-unlock: " + $l) }
-        $bk2 = Invoke-Native $Restic $bkArgs
-        foreach ($l in $bk2.out) { Log ("restic-retry: " + $l) }
-        if ($bk2.code -ne 0) { throw ("restic backup retry exit=" + $bk2.code + ": " + ($bk2.out -join ' ')) }
+    # ⚠ 09-23 08:2x 复核：上述自愈**起初只包住了 backup，没包住 forget --prune**，现网第 16 探针
+    #   实录 `restic forget/prune exit=11: repository is already locked ... by PID 25716 on
+    #   MafiaMacBook-Air.local`（182h 前的 Mac 拉取器遗留锁）——同一把锁让备份成功后又在清理环节
+    #   判失败，产物照旧 ok:false、异地半边照旧停更。所以自愈逻辑下沉成 Invoke-Restic 一个函数，
+    #   backup / forget 两条腿共用；**并且 unlock 自身的退出码必须检查**（旧版只看输出不看码：
+    #   unlock 失败时仍会重试，等于把"锁没解开"降级成"再试一次一定成功"的错觉）。
+    function Invoke-Restic([string[]]$raArgs, [string]$label) {
+        $r = Invoke-Native $Restic $raArgs
+        foreach ($l in $r.out) { Log ($label + ": " + $l) }
+        if ($r.code -eq 0) { return $r }
+        $txt = $r.out -join ' '
+        if ($txt -notmatch 'already locked') { throw ($label + " exit=" + $r.code + ": " + $txt) }
+        Log ($label + ": 检出陈旧锁 -> unlock 后重试一次")
+        $ul = Invoke-Native $Restic @("unlock", "-r", $RepoDir)
+        foreach ($l in $ul.out) { Log ($label + "-unlock: " + $l) }
+        if ($ul.code -ne 0) { throw ($label + ": unlock 失败 exit=" + $ul.code + "，原错误=" + $txt) }
+        $r2 = Invoke-Native $Restic $raArgs
+        foreach ($l in $r2.out) { Log ($label + "-retry: " + $l) }
+        if ($r2.code -ne 0) { throw ($label + " retry exit=" + $r2.code + ": " + ($r2.out -join ' ')) }
+        return $r2
     }
+    Invoke-Restic @("backup", "-r", $RepoDir, $SnapRoot, "--tag", "nightly") "restic-backup" | Out-Null
     # Transient relay retention (Mac keeps the long history): 3 days + 2 weeks.
-    $fgArgs = @("forget", "--repo", $RepoDir, "--keep-daily", "3", "--keep-weekly", "2", "--prune")
-    $fg = Invoke-Native $Restic $fgArgs
-    foreach ($l in $fg.out) { Log ("restic-forget: " + $l) }
-    if ($fg.code -ne 0) { throw ("restic forget/prune exit=" + $fg.code + ": " + ($fg.out -join ' ')) }
+    Invoke-Restic @("forget", "--repo", $RepoDir, "--keep-daily", "3", "--keep-weekly", "2", "--prune") "restic-forget" | Out-Null
     Remove-Item Env:RESTIC_PASSWORD_FILE
 
     # 6) Marker for the Mac puller: freshness + per-db size + integrity + accounts file count.

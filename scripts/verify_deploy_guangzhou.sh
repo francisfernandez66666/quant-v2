@@ -179,7 +179,12 @@ Probe "engine:/api/news/test-attribution unauth=401" ($code -eq "401") ("got=" +
 #   进程照样继承机器级 env，而现网 HITHINK_FINANCE_API_KEY 长期只存在于机器级
 #   （RUNBOOK §4.1b.2「顺带核查」+ deploy/qmt-win/run_ths_backfill.ps1:10 的读取口径）。
 #   只查 extra 会造出一条永久性假红，且掩盖不了真缺键——两者取并集才是「进程实际能不能拿到」。
-$envNeed = @("HITHINK_FINANCE_API_KEY")
+# 必需键集合与注册步 `register_engine_services.ps1` 的 `$envRequired["quant"]` **逐项同集**
+#   （§N-5 同源锁，verify_changes.sh §67 钉相等）。09-23 08:2x 实录：注册步写完后自读回，
+#   把刚写进去的 QUANT_DATA_DIR/QUANT_ADDR/HITHINK 全判成"缺键"并 `exit 1` 中断部署（[5/5] 健康
+#   检查与 [6/6] 都没跑到），而本探针判绿——两侧口径不一致就是因为探针只查 1 个键、且 HITHINK
+#   走了机器级兜底，掩盖了解析缺陷。所以这里扩到同集：**解析错必红、注册错也必红**，不再一侧独绿。
+$envNeed = @("TZ", "QUANT_DATA_DIR", "QUANT_ADDR", "HITHINK_FINANCE_API_KEY")
 # nssm.exe 的三个可能安装位（现网 = 第一个；备份任务/手工安装可能落在后两个）。
 $nssmCandidates = @(
     "C:\opt\quant\qmt-win\tools\nssm-2.24\win64\nssm.exe",       # deploy_guangzhou.sh 上传位（现网）
@@ -191,7 +196,12 @@ $nssmFound = $null
 foreach ($np in $nssmCandidates) { if (Test-Path $np) { $nssmFound = $np; break } }
 if ($nssmFound) {
     $raw = & $nssmFound get quant AppEnvironmentExtra 2>$null
-    foreach ($l in (("$raw" | Out-String) -split "`r?`n")) {
+    # 解析铁律：绝不用 `("$raw" | Out-String)`。Out-String ①按控制台宽度（无主机时 120 列）**折行**，
+    #   被折断的续行不以 KEY= 开头 → 该键凭空消失；②REG_MULTI_SZ 只以 NUL 分隔时它不产生换行，
+    #   整串变成一行 → 只有第一个键被认出。nssm 的输出本身还是 UTF-16（日志里 "E\0r\0r\0o\0r" 即证）。
+    #   正确做法：逐元素转串、按 换行 **或 NUL** 双重切分，再按 KEY= 形态过滤。
+    $joined = ($raw | ForEach-Object { [string]$_ }) -join "`n"
+    foreach ($l in ($joined -split "[`r`n`0]+")) {
         $t = $l.Replace([char]0, '').Trim()
         $i = $t.IndexOf("=")
         if ($i -gt 0) { $haveKeys += $t.Substring(0, $i) }      # 只留键名，值就地丢弃

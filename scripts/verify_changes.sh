@@ -1398,7 +1398,30 @@ if grep -qE '^\$envNeed = @\(.*LLM_API_KEY' scripts/verify_deploy_guangzhou.sh; 
 	echo "--- FAIL: §N-5 探针 envNeed 又含 LLM_API_KEY（同上）"; exit 1; fi
 if grep -nE 'Get-BaseEnvExtra|AppEnvironmentExtra' scripts/verify_deploy_guangzhou.sh | grep -qE 'Write-Output.*\$raw|echo.*\$l\b'; then
 	echo "--- FAIL: §N-5 探针疑似回显环境变量值（密钥明文泄露按事故处理）"; exit 1; fi
-echo "ok - §NSSMENV 专项守卫通过（静态锁 4 道 + 负锁 3 道 + 探针锁 3 道，含 §N-5 LLM 来源口径锁）"
+# ── 09-23 08:2x 现网实录补的两道锁（本批自曝：注册步把**自己刚写进去的键**读成不存在）──
+# 现象：全量部署 [4/5] 尾部断言 Warn「quant 缺 QUANT_DATA_DIR / QUANT_ADDR / HITHINK」→ exit 1，
+#       部署在 [5/5] 健康检查之前就中止（[6/6] 更没跑到），而同一天 verify 的第 15 探针判绿。
+# 根因：两侧共用同一个错误解析 `("$raw" | Out-String) -split "\`r?\`n"`——Out-String 会按控制台
+#       宽度折行（无主机 120 列）且 REG_MULTI_SZ 以 NUL 分隔不保证有换行，于是 nssm 的 UTF-16 输出
+#       里只有落在行首的键能被 `^KEY=` 认出（实录只剩 TZ）。探针之所以绿：它只要求 HITHINK 一个键，
+#       而 HITHINK 由**机器级环境变量**兜住了 ⇒ 解析缺陷被完全掩盖，注册步却拿它判红。
+# 前置：①必需键集合两侧同源（否则一侧独绿＝假象），②解析不得经 Out-String（负锁，注释里的反面
+#       说明按 # 起行排除——本仓「负向 grep 命中自曝注释」已复犯多次）。
+regQ=$(grep -E '^[[:space:]]*"quant"[[:space:]]*=' deploy/qmt-win/register_engine_services.ps1 | grep -oE '"[A-Z][A-Z_0-9]*"' | tr -d '"' | LC_ALL=C sort -u | tr '\n' ',')
+verQ=$(grep -E '^\$envNeed = @\(' scripts/verify_deploy_guangzhou.sh | grep -oE '"[A-Z][A-Z_0-9]*"' | tr -d '"' | LC_ALL=C sort -u | tr '\n' ',')
+[ -n "$regQ" ] && [ -n "$verQ" ] \
+	|| { echo "--- FAIL: §N-5 必需键清单写法变更（同源锁取不到数：注册=${regQ:-∅} 探针=${verQ:-∅}）"; exit 1; }
+[ "$regQ" = "$verQ" ] \
+	|| { echo "--- FAIL: §N-5 必需键集合漂移 注册步=[$regQ] 探针=[$verQ]（一侧独绿＝另一侧的解析缺陷无人看见）"; exit 1; }
+if grep -nE '\|[[:space:]]*Out-String' deploy/qmt-win/register_engine_services.ps1 scripts/verify_deploy_guangzhou.sh \
+	| grep -vE ':[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: §N-5 服务 env 解析又经 Out-String（按 120 列折行 + NUL 不换行 ⇒ 键凭空消失）"; exit 1; fi
+# 解析必须双重切分（换行 + NUL）：只 split 换行的写法正是本次判红的形态。
+for f in deploy/qmt-win/register_engine_services.ps1 scripts/verify_deploy_guangzhou.sh; do
+	grep -qE -- '-split "\[`r`n`0\]\+"' "$f" \
+		|| { echo "--- FAIL: $f 的 env 解析丢失 NUL 切分腿（REG_MULTI_SZ 只以 NUL 分隔时整串成一行）"; exit 1; }
+done
+echo "ok - §NSSMENV 专项守卫通过（静态锁 4 道 + 负锁 4 道 + 探针锁 3 道 + 必需键同源等值锁 1 + NUL 切分锁 2，含 §N-5 LLM 来源口径锁）"
 
 echo "==> 68 §LIVEBACKUP 广州灾备纳入 live.db + accounts（跨机集合逐相等，傍晚批 P0-B）..."
 # 现象：live.db（实盘持仓/委托/成交/资产四本账，cmd/quant 独立打开）**此前没有任何一份灾备方案
@@ -1537,6 +1560,23 @@ grep -qF 'already locked' deploy/qmt-win/backup_snapshot.ps1 \
 	|| { echo "--- FAIL: 快照脚本丢失 restic 陈旧锁判别（Mac 拉取器崩溃留下的锁会让备份每晚静默停更）"; exit 1; }
 grep -qF 'Invoke-Native' deploy/qmt-win/backup_snapshot.ps1 \
 	|| { echo "--- FAIL: 快照脚本丢失 Invoke-Native（Stop 语义下原生 stderr 会变终止错误）"; exit 1; }
+# ①b 09-23 08:2x 现网第 16 探针实录：自愈**起初只包住了 backup 这一条腿**，`forget --prune` 拿着
+#    同一把 182h 的 Mac 遗留锁直接 exit=11 抛出 ⇒ 备份成功、产物仍 ok:false、异地半边仍停更。
+#    所以自愈逻辑必须收成一个函数、两条腿共用，且 unlock 自身的退出码必须判（只看输出不看码 =
+#    "锁没解开"被降级成"再试一次应该就好了"）。以下三锁钉住这个形状。
+grep -qF 'function Invoke-Restic' deploy/qmt-win/backup_snapshot.ps1 \
+	|| { echo "--- FAIL: restic 陈旧锁自愈不再是单一函数（backup 修好、forget 复发的成因）"; exit 1; }
+# 计数必须先落到变量再比较：**不能**写成 `[ "$(grep -cE '"pat"' f)" -eq 1 ]` 这种"双引号内嵌命令
+# 替换、模式里再带双引号"的形态——该形态在本机 shell 下模式会被吃掉、实跑得 0，锁把好代码判红。
+ulCnt=$(grep -cE '"unlock", "-r", \$RepoDir' deploy/qmt-win/backup_snapshot.ps1)
+[ "$ulCnt" -eq 1 ] \
+	|| { echo "--- FAIL: unlock 调用点=${ulCnt}（期望 1；两条腿各写一份重试＝必有一条腿漏）"; exit 1; }
+grep -qE 'if \(\$ul\.code -ne 0\) \{ throw' deploy/qmt-win/backup_snapshot.ps1 \
+	|| { echo "--- FAIL: unlock 的退出码不再被判定（陈旧锁未清时重试只是自我安慰）"; exit 1; }
+for leg in backup forget; do
+	grep -qE "Invoke-Restic @\(\"$leg\"" deploy/qmt-win/backup_snapshot.ps1 \
+		|| { echo "--- FAIL: restic $leg 腿绕过 Invoke-Restic（陈旧锁自愈只覆盖一条腿）"; exit 1; }
+done
 # 负锁③：不得回到"裸管道把原生命令输出直接喂 Log"的写法——那正是 restic 成功却判失败的成因。
 # （只判非注释行：注释里会原样提到旧形态作为反面说明。）
 if grep -nE '& \$Restic [a-z]+ .*2>&1 \| ForEach-Object' deploy/qmt-win/backup_snapshot.ps1 \
@@ -1545,7 +1585,7 @@ if grep -nE '& \$Restic [a-z]+ .*2>&1 \| ForEach-Object' deploy/qmt-win/backup_s
 # 负锁④：首跑必须是显式开关触发的运维动作，不得变成每次部署自动搬 GB 级快照。
 grep -qF 'LIVEBACKUP_FIRST_RUN:-0' scripts/deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 部署步 [2e] 首跑开关失去默认关闭语义（每次部署自动 GB 级快照+restic 写入）"; exit 1; }
-echo "ok - §LIVEBACKUP-DEPLOY 专项守卫通过（清单正锁 3 + 同源锁 2 + 探针锁 3 + 锁面正锁 2 + 负锁 4）"
+echo "ok - §LIVEBACKUP-DEPLOY 专项守卫通过（清单正锁 3 + 同源锁 2 + 探针锁 3 + 锁面正锁 2 + restic 自愈形状锁 5 + 负锁 4）"
 
 # ── 71. §ADJ-BASIS 复权口径进断点键（2026-09-23 本机 A/B 锤实的"重算覆盖"前置缺陷）──
 # resume_key 原本只含 区间/参数/股票池，**不含数值口径**。于是 §ADJ（因子前向填充）这种

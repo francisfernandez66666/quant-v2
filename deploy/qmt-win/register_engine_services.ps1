@@ -146,8 +146,17 @@ function Get-ExistingEnvExtra([string]$svc) {
     $code = $LASTEXITCODE
     $ErrorActionPreference = $eapPrev
     if ($code -ne 0 -or -not $raw) { return @() }
+    # 解析铁律（09-23 08:2x 现网实录：本函数把**刚写进去的键**全读成"不存在"，尾部断言据此判红、
+    #   整次部署在 [4/5] 中止，[5/5] 健康检查与 [6/6] 都没跑到）：旧写法
+    #   `("$raw" | Out-String) -split "\`r?\`n"` 有两个致命点——
+    #   ① Out-String 按控制台宽度（SSH 下无主机时 120 列）**折行**，被折断的续行不以 KEY= 开头，
+    #      该键就凭空消失；② AppEnvironmentExtra 是 REG_MULTI_SZ，nssm 输出以 NUL 分隔且 UTF-16
+    #      （日志里 "E\0r\0r\0o\0r" 即证），不保证有换行——整串成"一行"时只有第一个键能被认出
+    #      （实录只剩 TZ，正是这个形态）。
+    #   正确做法：逐元素转串，按 换行 **或 NUL** 双重切分（不经 Out-String），再按 KEY= 形态过滤。
     $list = @()
-    foreach ($line in (("$raw" | Out-String) -split "`r?`n")) {
+    $joined = ($raw | ForEach-Object { [string]$_ }) -join "`n"
+    foreach ($line in ($joined -split "[`r`n`0]+")) {
         $t = $line.Replace([string][char]0, '').Trim()   # REG_MULTI_SZ 尾随 NUL 清洗
         if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $list += $t }
     }
