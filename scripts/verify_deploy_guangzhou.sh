@@ -192,20 +192,33 @@ $nssmCandidates = @(
     "C:\opt\quant\tools\nssm-2.24\win64\nssm.exe"
 )
 $haveKeys = @()
+$envReadVia = "none"
 $nssmFound = $null
 foreach ($np in $nssmCandidates) { if (Test-Path $np) { $nssmFound = $np; break } }
-if ($nssmFound) {
+# 口径与 register_engine_services.ps1 的 Get-ExistingEnvExtra **完全一致**（09-23 现网实录：
+#   两侧都靠解析 `nssm get` 的控制台文本读 AppEnvironmentExtra——①Out-String 按 120 列折行会让
+#   续行丢键、②改按 NUL 切分又更糟：nssm 写的是 UTF-16，PS 按 OEM 码页解码后每个 ASCII 字符后面
+#   都跟一个 NUL，切分等于把字符逐个劈开，结果一个键都认不出，只剩机器级兜底的 HITHINK。
+#   同一份坏解析在施工侧判红、在校验侧判绿，正是"校验面必须独立于施工面"要防的形态。）
+# ⇒ 唯一可靠读法：直读 NSSM 落盘的注册表值（REG_MULTI_SZ 原生 string[]，无编码、无折行、无分隔歧义）。
+try {
+    $svcKey = Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\quant" -ErrorAction Stop
+    $envPairs = @($svcKey.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))
+    $envReadVia = "registry"
+} catch { $envPairs = @(); $envReadVia = "registry-unavailable" }
+$envPairs = @($envPairs | Where-Object { $_ })
+if ($envPairs.Count -eq 0 -and $nssmFound) {
+    # 兜底才回到文本：先把"≥2 连续 NUL"当作条目边界换成换行，再清残留单 NUL（顺序颠倒即重犯 ②）。
     $raw = & $nssmFound get quant AppEnvironmentExtra 2>$null
-    # 解析铁律：绝不用 `("$raw" | Out-String)`。Out-String ①按控制台宽度（无主机时 120 列）**折行**，
-    #   被折断的续行不以 KEY= 开头 → 该键凭空消失；②REG_MULTI_SZ 只以 NUL 分隔时它不产生换行，
-    #   整串变成一行 → 只有第一个键被认出。nssm 的输出本身还是 UTF-16（日志里 "E\0r\0r\0o\0r" 即证）。
-    #   正确做法：逐元素转串、按 换行 **或 NUL** 双重切分，再按 KEY= 形态过滤。
-    $joined = ($raw | ForEach-Object { [string]$_ }) -join "`n"
-    foreach ($l in ($joined -split "[`r`n`0]+")) {
-        $t = $l.Replace([char]0, '').Trim()
-        $i = $t.IndexOf("=")
-        if ($i -gt 0) { $haveKeys += $t.Substring(0, $i) }      # 只留键名，值就地丢弃
-    }
+    $txt = (($raw | ForEach-Object { [string]$_ }) -join "`n") -replace '[\u0000]{2,}', "`n"
+    $txt = $txt -replace '[\u0000]', ''
+    $envPairs = @($txt -split "`r?`n" | Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' })
+    if ($envPairs.Count -gt 0) { $envReadVia = "nssm-text" }
+}
+foreach ($kv in $envPairs) {
+    $t = ("$kv").Trim()
+    $i = $t.IndexOf("=")
+    if ($i -gt 0) { $haveKeys += $t.Substring(0, $i) }          # 只留键名，值就地丢弃（绝不回显）
 }
 foreach ($k in $envNeed + @("LLM_API_KEY")) {
     if ([Environment]::GetEnvironmentVariable($k, 'Machine')) { $haveKeys += $k }   # 机器级同样算拿到
@@ -227,7 +240,7 @@ if (Test-Path $authPath) {
 }
 $envMissing = @($envNeed | Where-Object { $haveKeys -notcontains $_ })
 if ($haveKeys -notcontains 'LLM_API_KEY') { if (-not $llmSaved) { $envMissing += 'LLM-source' } }
-$envDetail = "nssm=" + $(if ($nssmFound) { "ok" } else { "not-found(只按机器级判定)" }) + " 缺项=" + ($envMissing -join ",") + "（只报键名/布尔，未回显值）"
+$envDetail = "read=" + $envReadVia + " keys=" + $haveKeys.Count + " nssm=" + $(if ($nssmFound) { "ok" } else { "not-found(只按机器级判定)" }) + " 缺项=" + ($envMissing -join ",") + "（只报键名/计数，未回显值）"
 Probe "engine:quant env HITHINK key + LLM source" ($envMissing.Count -eq 0) $envDetail
 
 # 9) §P0-B 收编（2026-09-23，第 16 探针）：夜间快照灾备链在现网真的生效了吗？

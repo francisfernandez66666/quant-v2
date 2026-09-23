@@ -135,29 +135,45 @@ function Get-BaseEnvExtra {
     return ,$e
 }
 
-# 读回服务级 AppEnvironmentExtra 现值（REG_MULTI_SZ，逐行）。**这是唯一允许看到密钥值的读取点**：
-# 返回值只进内存变量供并集用，全脚本任何日志/异常路径都不得把它写出去（同上安全铁律）。
+# 读回服务级 AppEnvironmentExtra 现值（并集写入与尾部断言的**同一个**读口径）。
+# 安全铁律：本函数是唯一允许看到密钥值的读取点，返回值只进内存变量供并集/键名判定用，
+#   全脚本任何日志/异常路径都不得把它写出去（日志只拼键名）。
+# ⚠ 09-23 08:2x 现网实录（两次自曝，第二次才被探针抓出）：
+#   ①旧实现 `("$raw" | Out-String) -split "\`r?\`n"`：Out-String 会按控制台宽度（SSH 无主机时
+#     120 列）**折行** ⇒ 被折断的续行不以 KEY= 开头而凭空消失，且 REG_MULTI_SZ 不保证有换行。
+#   ②第一版修复改成"按 换行|NUL 双重切分"，仍然错——nssm 往 stdout 写的是 **UTF-16**（日志里
+#     "E\0r\0r\0o\0r" 即证），PS 按 OEM 码页解码后**每个 ASCII 字符后面都跟一个 NUL**，
+#     按 NUL 切分等于把每个字符劈开 ⇒ 一个键都认不出（探针实测只剩机器级兜底的 HITHINK）。
+#   结论：**不要解析控制台文本**。NSSM 就是把这份配置以 REG_MULTI_SZ 写在
+#     HKLM:\SYSTEM\CurrentControlSet\Services\<svc>\AppEnvironmentExtra，直接读注册表拿到的是
+#     原生 string[]：无编码转换、无折行、无 NUL 歧义，也是**唯一**能保证"读到的就是即将写回的"
+#     口径（本函数的返回值会被 Set-ServiceEnvExtra 并集写回，读漏一个键＝删掉一个键）。
+#   nssm get 仅留作注册表不可用时的兜底，且必须先"≥2 连续 NUL 视作条目分隔"再清单 NUL。
 function Get-ExistingEnvExtra([string]$svc) {
-    # 临时降 EAP：PS 5.1 在 Stop 下会把原生命令的 stderr 行转成 NativeCommandError 直接终止
-    # （§ENH-A run_ths_backfill.ps1 09-20 实录），nssm get 对"未设置该项"恰好会往 stderr 写提示。
+    $list = @()
+    try {
+        $key = Get-Item -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $svc) -ErrorAction Stop
+        # DoNotExpandEnvironmentNames：值里若有 %VAR% 必须原样读回，否则写回时会被展开成固化值（静默改语义）。
+        $vals = $key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        foreach ($v in @($vals)) {
+            $t = ("$v").Trim()
+            if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $list += $t }
+        }
+    } catch { $list = @() }
+    if ($list.Count -gt 0) { return ,$list }
+    # 兜底：注册表读不到（极少见：服务名不符/权限）时才走 nssm 文本。
     $eapPrev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
+    $ErrorActionPreference = 'Continue'      # nssm 对"未设置该项"会往 stderr 写提示（§ENH-A 同族）
     $raw = & $nssm get $svc AppEnvironmentExtra 2>$null
     $code = $LASTEXITCODE
     $ErrorActionPreference = $eapPrev
     if ($code -ne 0 -or -not $raw) { return @() }
-    # 解析铁律（09-23 08:2x 现网实录：本函数把**刚写进去的键**全读成"不存在"，尾部断言据此判红、
-    #   整次部署在 [4/5] 中止，[5/5] 健康检查与 [6/6] 都没跑到）：旧写法
-    #   `("$raw" | Out-String) -split "\`r?\`n"` 有两个致命点——
-    #   ① Out-String 按控制台宽度（SSH 下无主机时 120 列）**折行**，被折断的续行不以 KEY= 开头，
-    #      该键就凭空消失；② AppEnvironmentExtra 是 REG_MULTI_SZ，nssm 输出以 NUL 分隔且 UTF-16
-    #      （日志里 "E\0r\0r\0o\0r" 即证），不保证有换行——整串成"一行"时只有第一个键能被认出
-    #      （实录只剩 TZ，正是这个形态）。
-    #   正确做法：逐元素转串，按 换行 **或 NUL** 双重切分（不经 Out-String），再按 KEY= 形态过滤。
-    $list = @()
     $joined = ($raw | ForEach-Object { [string]$_ }) -join "`n"
-    foreach ($line in ($joined -split "[`r`n`0]+")) {
-        $t = $line.Replace([string][char]0, '').Trim()   # REG_MULTI_SZ 尾随 NUL 清洗
+    # 先按 ≥2 连续 NUL 认定条目边界（UTF-16 解码残留：条目内 NUL 恒为单个、条目间恒为双个），
+    # 再清掉残留单 NUL；顺序颠倒就会重犯上面第 ② 条错误。
+    $joined = ($joined -replace '[\u0000]{2,}', "`n") -replace '[\u0000]', ''
+    foreach ($line in ($joined -split "`r?`n")) {
+        $t = $line.Trim()
         if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { $list += $t }
     }
     return ,$list

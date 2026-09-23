@@ -1416,12 +1416,23 @@ verQ=$(grep -E '^\$envNeed = @\(' scripts/verify_deploy_guangzhou.sh | grep -oE 
 if grep -nE '\|[[:space:]]*Out-String' deploy/qmt-win/register_engine_services.ps1 scripts/verify_deploy_guangzhou.sh \
 	| grep -vE ':[0-9]+:[[:space:]]*#' | grep -q .; then
 	echo "--- FAIL: §N-5 服务 env 解析又经 Out-String（按 120 列折行 + NUL 不换行 ⇒ 键凭空消失）"; exit 1; fi
-# 解析必须双重切分（换行 + NUL）：只 split 换行的写法正是本次判红的形态。
+# 读法必须是**注册表直读**（HKLM Services\<svc> 的 AppEnvironmentExtra，原生 string[]）：
+# 09-23 第一次修复改成"按 换行|NUL 双重切分"仍错——nssm stdout 是 UTF-16，PS 按 OEM 码页解码后
+# 每个 ASCII 字符后都跟一个 NUL，按 NUL 切分＝把每个字符劈开，一个键都认不出（探针实测只剩机器级
+# 兜底的 HITHINK）。凡"解析子进程的控制台文本"都在重犯同一族错误，所以直接钉住注册表口径。
 for f in deploy/qmt-win/register_engine_services.ps1 scripts/verify_deploy_guangzhou.sh; do
-	grep -qE -- '-split "\[`r`n`0\]\+"' "$f" \
-		|| { echo "--- FAIL: $f 的 env 解析丢失 NUL 切分腿（REG_MULTI_SZ 只以 NUL 分隔时整串成一行）"; exit 1; }
+	grep -qE 'GetValue\(.AppEnvironmentExtra' "$f" \
+		|| { echo "--- FAIL: $f 的服务 env 不再是注册表直读（回到解析 nssm 控制台文本＝UTF-16/折行两坑复犯）"; exit 1; }
 done
-echo "ok - §NSSMENV 专项守卫通过（静态锁 4 道 + 负锁 4 道 + 探针锁 3 道 + 必需键同源等值锁 1 + NUL 切分锁 2，含 §N-5 LLM 来源口径锁）"
+# 负锁：按 NUL 切分文本的"第一版修复"形态不得复活（注释里的反面说明按 # 起行排除）。
+if grep -nE -- "-split \"\[\`r\`n\`0\]" deploy/qmt-win/register_engine_services.ps1 scripts/verify_deploy_guangzhou.sh \
+	| grep -vE ':[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: 又用 NUL 当分隔符切分 nssm 文本输出（UTF-16 解码残留会让每字符被劈开，键全丢）"; exit 1; fi
+echo "ok - §NSSMENV 专项守卫通过（静态锁 4 道 + 负锁 5 道 + 探针锁 3 道 + 必需键同源等值锁 1 + 注册表直读锁 2 + 读源披露锁 1，含 §N-5 LLM 来源口径锁）"
+# 探针必须自报"这次是从哪儿读到的"（registry / nssm-text / registry-unavailable）与读到几个键：
+# 判绿但读的是空气（keys=0 且靠机器级兜住）正是本次两侧结论相反的直接成因。
+grep -qF 'read=" + $envReadVia + " keys=" + $haveKeys.Count' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: §N-5 探针不再披露读取来源/键数（判绿与判红同样不可解释）"; exit 1; }
 
 echo "==> 68 §LIVEBACKUP 广州灾备纳入 live.db + accounts（跨机集合逐相等，傍晚批 P0-B）..."
 # 现象：live.db（实盘持仓/委托/成交/资产四本账，cmd/quant 独立打开）**此前没有任何一份灾备方案
