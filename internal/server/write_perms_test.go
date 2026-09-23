@@ -38,6 +38,8 @@ var writeBootstrapAllowlist = map[string]string{
 	"POST /setup":          "一次性初始化（仅未初始化状态可用，处理器内自守）",
 }
 
+// TestWriteEndpointsAllGated 普查式收权锁：扫本包路由注册点，凡写端点（POST/PUT/PATCH/DELETE）
+// 必须落在"挂 admin/member 闸"或"显式免鉴权白名单"两者之一，漏网即整批判红（§M-14 防复犯）。
 func TestWriteEndpointsAllGated(t *testing.T) {
 	files, err := os.ReadDir(".")
 	if err != nil {

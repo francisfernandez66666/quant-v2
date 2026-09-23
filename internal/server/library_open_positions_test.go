@@ -62,6 +62,7 @@ func TestResearchLibraryExposesOpenPositions(t *testing.T) {
 		t.Fatalf("seed real positions: %v", err)
 	}
 
+	// 请求一次库端点即可同时验证两侧：持仓数与出场覆盖留痕都在同一份响应里。
 	rr := httptest.NewRecorder()
 	s.handleResearchLibrary(rr, httptest.NewRequest(http.MethodGet, "/api/research/library", nil))
 	if rr.Code != 200 {

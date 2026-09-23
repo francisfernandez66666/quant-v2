@@ -30,6 +30,7 @@ const { state } = vi.hoisted(() => ({
   },
 }))
 
+// 只替身 api 层（保留 importActual 的真实现），把网络边界掐掉，让断言集中在组件的状态收敛上。
 vi.mock('../api/index.js', async () => {
   const actual = await vi.importActual('../api/index.js')
   return {

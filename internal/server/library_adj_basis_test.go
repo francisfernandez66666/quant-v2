@@ -30,6 +30,7 @@ func TestResearchLibraryExposesStaleAdjBasis(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 直接打载入端点：断言的是"响应里带没带口径字段"，不经中间层，防装配层把标记吞掉。
 	rr := httptest.NewRecorder()
 	s.handleResearchLibrary(rr, httptest.NewRequest(http.MethodGet, "/api/research/library", nil))
 	if rr.Code != 200 {
