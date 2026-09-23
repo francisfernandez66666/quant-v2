@@ -1715,5 +1715,278 @@ if grep -qF 'schtasks /Query /TN quant-backup-snap /FO LIST' scripts/deploy_guan
 	echo "--- FAIL: 部署步重新用 schtasks 状态做触发前守卫（中文状态 grep 恒不命中=假守卫）"; exit 1; fi
 echo "ok - §SNAP-LOCK 守卫通过（同源锁 2 + 探针视野锁 3 + 龄上界等值锁 1 + 释锁锁 2 + 负锁 2）"
 
+# ── 74. §ADJ-BASIS-2/-2P 复权基线失效可见性（因子侧 + 形态侧必须对称）──
+# 现象：§ADJ 把 HfqBars 的复权因子从"等值 JOIN"改成事件日回溯前向填充后，CloseHfq 整体换基线
+#       （实测改前 99.2% 的 股票-交易日 按因子 1 出数）。此前审批落盘的战法权重/buy_threshold 全部
+#       悬在旧口径上，但从库文件本身**完全看不出来**——fac_1 四个成分里三个的分层能力塌到 ≈0，
+#       页面上却仍是一条正常的"已应用战法"。
+# 根因：口径是取数层的隐式约定，条目里没有承载它的字段 ⇒ 任何人（含告警链）都无法判定"依据已失效"。
+# 修法：条目落盘盖口径戳（adj_basis）+ 载入侧算派生标记（StaleAdjBasis）+ 量规/p1 告警 + 前端红标
+#       + 处置开关（缺省 shadow：修口径这件事不该顺带把钱撤了）。
+# 本段锁四件事：①三件套成对（赋值点/规则/路由）——本轮新增的**形态侧**最容易只写规则忘赋值点
+#   （§DEADGAUGE 老坑：规则永不触发）；②因子侧与形态侧对称（半边盲区就是本缺陷的原始形态）；
+# ③缺省与未知值都必须落 shadow（"改口径"顺手变成"停策略"是不可接受的越权）；④Go/JS 口径版本串等值。
+echo ""
+echo "==> 74 §ADJ-BASIS-2/-2P 基线失效可见性（含 pat_* 对称）..."
+for g in applied_factor_stale_basis applied_pattern_stale_basis; do
+	grep -q "metrics.SetGauge(\"${g}_count\"" internal/research/apply.go \
+		|| { echo "--- FAIL: $g 无量规赋值点（§DEADGAUGE：有规则无数据源，永不响）"; exit 1; }
+	grep -q "{Name: \"$g\", Metric: \"${g}_count\", Op: \"gt\", Threshold: 0" internal/metrics/alerter.go \
+		|| { echo "--- FAIL: $g 缺 p1 规则或阈值不是「>0 即报」"; exit 1; }
+	grep -qE "\"$g\": *RoutePush" internal/metrics/alert_routing.go \
+		|| { echo "--- FAIL: $g 未显式 RoutePush（告警只进列表不推送，无人值守看不见）"; exit 1; }
+done
+# ② 对称性：载入侧 fail-close 与端点载荷两侧都必须各命中 2 次（因子 + 形态）。
+nGate=$(grep -c "failClose && e.StaleAdjBasis" internal/research/apply.go)
+[ "$nGate" -eq 2 ] || { echo "--- FAIL: 失效闸只覆盖一侧（fail-close 命中 $nGate 处，应为 2=fac+pat）"; exit 1; }
+nAPI=$(grep -c "StaleAdjBasis: e.StaleAdjBasis" internal/server/library.go)
+[ "$nAPI" -eq 2 ] || { echo "--- FAIL: /api/research/library 载荷只带一侧标记（命中 ${nAPI}，应为 2）"; exit 1; }
+# ③ 缺省处置=shadow；未知值也必须归一为 shadow（不得"猜个更安全的默认"把策略停掉）。
+python3 - internal/research/apply.go <<'PY' || { echo "--- FAIL: §ADJ-BASIS 缺省处置不符（未知值→disable 或静态缺省非 shadow）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+fn = re.search(r'func normalizeStaleAdjBasisAction\(action string\) string \{(.*?)\n\}', t, re.S)
+assert fn, 'normalizeStaleAdjBasisAction 不见了（未知值归一失去落点）'
+body = fn.group(1)
+assert body.rstrip().endswith('return StaleAdjBasisShadow'), '兜底 return 必须是 shadow（未知值不得 fail-close）'
+assert 'StaleAdjBasisDisable' in body, '显式 disable 分支不见了'
+assert re.search(r'staleAdjAction\s*=\s*StaleAdjBasisShadow', t), '包级静态缺省必须=shadow'
+PY
+# ④ 口径版本串 Go/前端等值（前端 CURRENT_ADJ_BASELINE 是后端常量的手工副本，漂开即整页红标失灵）。
+goBasis=$(grep -oE 'AdjBaselineVersion = "[^"]+"' internal/research/windowed.go | sed 's/.*"\(.*\)"/\1/')
+jsBasis=$(grep -oE "CURRENT_ADJ_BASELINE = '[^']+'" web/src/pages/Research.jsx | sed "s/.*'\(.*\)'/\1/")
+[ -n "$goBasis" ] && [ -n "$jsBasis" ] || { echo "--- FAIL: 口径版本串取不到数（写法变更，等值锁失去落点）"; exit 1; }
+[ "$goBasis" = "$jsBasis" ] || { echo "--- FAIL: 口径版本串漂移 Go=$goBasis vs 前端=${jsBasis}（红标判定两边不一）"; exit 1; }
+# ⑤ 负锁：前端不得再按 kind 豁免形态战法（上一版正是这句留了半边盲区）。
+python3 - web/src/pages/Research.jsx <<'PY' || { echo "--- FAIL: 前端 isAdjBasisStale 重新出现按 kind 豁免（pat_* 盲区复犯）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+fn = re.search(r'export function isAdjBasisStale\(s\) \{\n(.*?)\n\}', t, re.S)
+assert fn, 'isAdjBasisStale 不见了（红标判定失去落点）'
+assert "kind === 'pattern'" not in fn.group(1), '按 kind 豁免形态战法的写法复活'
+PY
+echo "ok - §ADJ-BASIS-2/-2P 守卫通过（三件套成对锁 6 + 对称计数锁 2 + 缺省归一锁 1 + 版本等值锁 1 + 负锁 1）"
+
+# ── 75. §ADJ-BASIS-3 事件缓存复权口径位（主键重建 + 降级保守 + 聚合过滤）──
+# 现象：backtest_event_results 是逐事件回测结果的断点缓存，旧主键 (candidate_id, event_date,
+#       industry) 不含口径位 ⇒ §ADJ 换基线后重跑同一候选，会把新口径数值写进旧口径的行，
+#       且旧结果照样命中——"增量续跑"变成"新旧混装还自称已完成"。
+# 根因：口径隐式约定的第二个承载点（第一个是战法库）。光加一列不够：本轮实测四列 UNIQUE 索引存在时
+#       INSERT 仍被旧的表级三列主键拒（SQLite error 1555），必须重建表。
+# 修法：主键重建为四列 + 旧行回填空串哨兵 + 守恒守卫；守卫中止时进降级模式（读恒未命中、写拒绝），
+#       而不是让 store.Open 失败把整个引擎带停。
+echo ""
+echo "==> 75 §ADJ-BASIS-3 事件缓存口径位与降级保守..."
+grep -qE 'PRIMARY KEY \(candidate_id, event_date, industry, adj_basis\)' internal/store/store.go \
+	|| { echo "--- FAIL: 事件缓存主键不再含 adj_basis（新旧口径数值继续互相覆盖）"; exit 1; }
+grep -q 'func (d \*DB) migrateBacktestEventResultsAdjBasis() error' internal/store/store.go \
+	&& grep -q 'd.migrateBacktestEventResultsAdjBasis()' internal/store/store.go \
+	|| { echo "--- FAIL: 旧库主键重建迁移或其调用点丢失（现网旧表升不上去）"; exit 1; }
+# 守恒守卫：重建前后必须核对行数 + 逐三元组的行数与内容长度双向 EXCEPT，缺一即"迁移自己造差异"。
+python3 - internal/store/store.go <<'PY' || { echo "--- FAIL: §ADJ-BASIS-3 守恒守卫被削弱（三守卫缺一）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+fn = re.search(r'func \(d \*DB\) migrateBacktestEventResultsAdjBasis\(\) error \{(.*?)\n\}\n', t, re.S)
+assert fn, '迁移函数体取不到'
+b = fn.group(1)
+assert 'EXCEPT' in b, '缺少逐组双向 EXCEPT 内容守恒核对'
+assert b.count('COUNT(*)') >= 2, '缺少重建前后行数守恒核对'
+assert 'markEventBasisDegraded' in b, '守卫不通过时必须转降级模式（而非硬失败或悄悄继续）'
+assert 'SUM(LENGTH(' in b, '缺少逐组内容长度指纹（只比行数比不出数值被换掉）'
+PY
+# 降级=读未命中/写拒绝：两处都必须先看 EventBasisDegraded，且空串口径一律不当当前口径。
+grep -qE 'if adjBasis == "" \|\| d.EventBasisDegraded\(\)' internal/store/backtest_jobs.go \
+	|| { echo "--- FAIL: 读侧降级判断丢失（表结构不可用时仍查缓存=拿旧口径行当新结论）"; exit 1; }
+grep -q '改前旧证据行的哨兵值' internal/store/backtest_jobs.go \
+	|| { echo "--- FAIL: 写侧空串哨兵拒绝判据丢失（哨兵值可被当作当前口径写入）"; exit 1; }
+# 情绪×战法矩阵跨全表聚合：不过滤口径就把改前/改后两套数值平均进同一格并对外发布。
+grep -qE 'FROM backtest_event_results WHERE adj_basis = \?' internal/store/emotion_matrix.go \
+	|| { echo "--- FAIL: 情绪矩阵聚合未按口径过滤（混桶=假统计）"; exit 1; }
+grep -q 'if adjBasis == ""' internal/store/emotion_matrix.go \
+	&& grep -q 'd.EventBasisDegraded()' internal/store/emotion_matrix.go \
+	|| { echo "--- FAIL: 情绪矩阵缺「口径未装配/降级即拒绝聚合」的保守闸"; exit 1; }
+# 负锁：读侧 SQL 不得出现字面量 adj_basis=''（空串是旧证据行哨兵，永远不能当查询目标口径）。
+# 只用裸 grep 会误伤说明性文字（store.go 的注释与日志里就在描述"旧行落成 adj_basis=''"这件事，
+# 那是正确行为，不是查询条件），故先剔掉 // 行注释与 log.Printf 文案，只查真 SQL 字符串。
+python3 - internal/store/backtest_jobs.go internal/store/store.go internal/store/emotion_matrix.go <<'PY' || { echo "--- FAIL: 出现按空串口径查询（把改前旧行当成可复用的当前口径结果）"; exit 1; }
+import re, sys
+for p in sys.argv[1:]:
+    t = open(p, encoding='utf-8').read()
+    t = re.sub(r'(?m)^\s*//.*$', '', t)          # 剔说明性注释（注释里出现 '' 是在描述旧行哨兵，属正确）
+    t = re.sub(r'(?s)\`.*?\`', lambda m: m.group(0) if re.search(r'(?i)select|where|update|delete', m.group(0)) else '', t)
+    t = re.sub(r'log\.(Printf|Println)\(.*?\)\n', '', t, flags=re.S)   # 剔日志文案（同上，只描述不查询）
+    t = re.sub(r'(?m)^\s*//.*$', '', t)
+    if re.search(r"adj_basis\s*=\s*''", t):
+        print("命中文件:", p, file=sys.stderr)
+        sys.exit(1)
+PY
+echo "ok - §ADJ-BASIS-3 守卫通过（主键锁 1 + 迁移锁 1 + 守恒锁 4 + 降级锁 2 + 聚合锁 3 + 负锁 1）"
+
+# ── 76. §CKPT-PRUNE 死断点清理（缺省 dry-run + 双拒绝门 + 删除只在守卫之后）──
+# 现象：research_ckpts 里绝大多数断点行属于改前口径（resume_key 不含当前口径位），永不再被命中，
+#       却持续占库、持续出现在"已完成候选"的统计里。
+# 根因：断点表按键字符串索引，口径一换键就换，旧行成了孤儿，且没有任何清理入口。
+# 为什么不能直接 DELETE：删断点=删研究进度。新基线还没落过一行时删旧行，等于没有对照地销毁证据；
+#       夜间寻优正在写这张表时删，那一轮跑到一半的进度永久丢失。故四道门缺一不可。
+echo ""
+echo "==> 76 §CKPT-PRUNE 清理闸..."
+grep -q 'apply := fs.Bool("apply", false' cmd/research/prune_checkpoints.go \
+	|| { echo "--- FAIL: --apply 不再是缺省 false（命令变成跑即删）"; exit 1; }
+grep -q 'marker := fs.String("adj-marker", research.AdjBasisMarker' cmd/research/prune_checkpoints.go \
+	|| { echo "--- FAIL: 口径位缺省不再取代码常量（手填历史值=按错误基线删进度）"; exit 1; }
+grep -q 'strings.HasPrefix(marker, "|adj=")' internal/store/research_ckpts.go \
+	|| { echo "--- FAIL: 口径位格式闸丢失（空串/畸形 marker 会让「含口径位」判定退化为全表匹配）"; exit 1; }
+grep -q 'rep.MarkedRows == 0 || rep.CutoffAt == ""' internal/store/research_ckpts.go \
+	|| { echo "--- FAIL: 「无新基线断点即拒删」门丢失"; exit 1; }
+grep -q 'TaskDiscoverFactors, TaskDiscoverPatterns' internal/store/research_ckpts.go \
+	|| { echo "--- FAIL: 在写任务拒绝门不再按寻优任务类型取数（看不见正在跑的写入方）"; exit 1; }
+# 删除语句必须排在 dry-run/无可删/在跑三道门之后（顺序错一位，dry-run 也会真删）。
+python3 - internal/store/research_ckpts.go <<'PY' || { echo "--- FAIL: §CKPT-PRUNE 删除先于守卫（三道门形同虚设）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+fn = re.search(r'func \(d \*DB\) PruneStaleCheckpoints\(marker string, apply bool\) \(\*CkptPruneReport, error\) \{(.*?)\n\}\n', t, re.S)
+assert fn, 'PruneStaleCheckpoints 函数体取不到'
+b = fn.group(1)
+guard = re.search(r'if !apply \|\| rep\.StaleRows == 0 \|\| len\(rep\.Blocked\) > 0 \{\n\s*return rep, nil', b)
+dele = re.search(r'DELETE FROM research_ckpts', b)
+assert guard and dele, '删除前的三合一守卫或 DELETE 语句丢失'
+assert guard.start() < dele.start(), 'DELETE 排在守卫之前'
+assert b.index('rep.Blocked = blocked') < guard.start(), '在跑统计必须先于守卫赋值（否则门永远看不到 blocked）'
+PY
+echo "ok - §CKPT-PRUNE 守卫通过（dry-run 锁 2 + 格式/双拒门锁 3 + 顺序锁 2）"
+
+# ── 77. §C-OPS 运维遗留三件套（mock 退役 / token 轮换 / keystore 口令备份）──
+# 现象：①实盘机仍留着 UAT 期的 qmt-mock 产物与监听端口（与真网关争端口、是误成交的候选来源）；
+#       ②网关 token 自建仓以来未轮换，且值同时存在于 4 处（config 文件 / 服务 env / 桥配置 / 部署参数）
+#         ——手工改一处就会造成"网关起得来但鉴权全 401"；
+#       ③APK 签名口令 keystore.pass 只有一份、在仓库工作树里（虽被 gitignore），盘坏了已发布版本
+#         永不可复现。
+# 本段锁"不可逆动作的安全阀"：退役=改名不删除、写操作=显式 -Apply、备份=显式目的地且拒仓库内。
+echo ""
+echo "==> 77 §C-OPS 运维安全阀..."
+for ps in decommission_qmt_mock rotate_qmt_token; do
+	grep -q "ps1_bom deploy/qmt-win/${ps}.ps1" scripts/deploy_guangzhou.sh \
+		|| { echo "--- FAIL: deploy/qmt-win/${ps}.ps1 不在 ps1_bom 清单（现网 PowerShell 按 ANSI 读，中文注释吞语法）"; exit 1; }
+	grep -qE "^[^#]*\\\$SCP [^|;]*deploy/qmt-win/${ps}\.ps1" scripts/deploy_guangzhou.sh \
+		|| { echo "--- FAIL: ${ps}.ps1 未被上传命令带走（归一好却进不了现网=探针永远红）"; exit 1; }
+done
+# 两个 .ps1 的仓库字节形态：恰好一个 UTF-8 BOM 在文件头（§BOM-REPO：重复归一 = 现网解析炸）。
+python3 - deploy/qmt-win/decommission_qmt_mock.ps1 deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || { echo "--- FAIL: 运维 .ps1 的 BOM 字节不符（必须恰好一个 UTF-8 BOM 在文件头）"; exit 1; }
+import sys
+for p in sys.argv[1:]:
+    raw = open(p, 'rb').read()
+    assert raw[:3] == b'\xef\xbb\xbf', p + ' 缺头部 BOM'
+    assert raw[3:].count(b'\xef\xbb\xbf') == 0, p + ' 正文中再次出现 BOM（重复归一的典型形态）'
+PY
+# 退役=改名不删除（.disabled-<ts> 可回滚）；真删除动词不得出现。
+grep -q 'Rename-Item -LiteralPath $t.Exe -NewName ($t.Name + ".disabled-' deploy/qmt-win/decommission_qmt_mock.ps1 \
+	|| { echo "--- FAIL: mock 退役不再改名（回滚能力丢失）"; exit 1; }
+if grep -qE '^[^#]*Remove-Item' deploy/qmt-win/decommission_qmt_mock.ps1; then
+	echo "--- FAIL: 退役脚本出现 Remove-Item（不可逆删除，UAT 资产应改名保留）"; exit 1; fi
+grep -q 'QMT_MOCK_DECOMMISSION=1' scripts/deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 退役步不再由显式开关门控（默认就在实盘机上停进程改名）"; exit 1; }
+# 轮换=缺省 dry-run：写盘动作必须排在 $DryRun 早退之后。
+python3 - deploy/qmt-win/rotate_qmt_token.ps1 <<'PY' || { echo "--- FAIL: rotate 的 dry-run 早退不再先于写盘（不加 -Apply 也会改配置）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+assert re.search(r'if \(-not \$Apply\) \{ \$DryRun = \$true \}', t), '缺省即 dry-run 的归一语句丢失'
+early = re.search(r'if \(\$DryRun\) \{.*?exit 0', t, re.S)
+assert early, 'dry-run 早退分支丢失'
+writes = [t.index(x) for x in ('Copy-Item -LiteralPath $ConfigFile', '[System.IO.File]::WriteAllText') if x in t]
+assert writes, '写盘原语都不见了（本锁与实现同时失配，请同步）'
+assert early.end() < min(writes), '写盘动作排在 dry-run 早退之前'
+PY
+# 负锁：轮换脚本不得把新 token 明文写进任何输出（本仓库铁律：输出只准键名/计数/指纹）。
+if grep -qE '\+ \$newToken|\$\{newToken\}' deploy/qmt-win/rotate_qmt_token.ps1; then
+	echo "--- FAIL: 轮换脚本出现回显新 token 明文的路径"; exit 1; fi
+# 口令备份：目的地必填、拒凭空目录、拒仓库内。
+grep -q 'BACKUP_TARGET_DIR:-}' scripts/backup_keystore_pass.sh \
+	&& grep -q 'git rev-parse --show-toplevel' scripts/backup_keystore_pass.sh \
+	&& grep -q '拒绝 mkdir' scripts/backup_keystore_pass.sh \
+	|| { echo "--- FAIL: keystore 口令备份的安全阀缺一（必填目的地/仓库内拒写/不自动建目录）"; exit 1; }
+# 现网两条新探针必须在位（第 19 mock 退役、第 20 token 四源指纹一致性）。
+grep -q 'qmt:mock retired' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 19 探针（mock 退役复核）丢失"; exit 1; }
+grep -q 'qmt:token fp agree across 4 sources' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 20 探针（token 四源指纹一致性）丢失"; exit 1; }
+# 负锁：两条新探针的判据数组只准追加 ASCII 明细（本仓库实录：PowerShell→SSH→bash 回传 GBK 字节，
+# 中文 detail 在 grep 判据里恒不命中 = 把假绿写进探针）。
+if grep -nE '\$(mockMiss|tkBad) \+= "[^"]*[^ -~]' scripts/verify_deploy_guangzhou.sh | grep -q .; then
+	echo "--- FAIL: mock/token 探针的 detail 文案含非 ASCII 字符（SSH/GBK 假绿陷阱复犯）"; exit 1; fi
+echo "ok - §C-OPS 守卫通过（清单锁 4 + BOM 锁 1 + 安全阀锁 5 + 明文/删除负锁 2 + 探针锁 3）"
+
+# ── 78. §EXIT-RETAIN 出场覆盖跟随持仓，不跟随启用开关 ──
+# 现象：停用一条战法库规则（人工点停用，或 stale_adj_basis_action=disable 这类**无人值守**自动路径）
+#       时，它名下**已经持有的持仓**的止盈/最长持有会被一并摘掉，回退到全局 8%/15 天。
+# 根因：SetRuleExitOverrides 旧实现按 !Enabled 直接清表——把"停用"理解成"这条战法的一切都不作数"。
+# 为什么是资金安全缺陷：回退方向未知（可能更紧也可能更松），等于未经授权静默改风险参数；而 disable
+#       这条自动路径正是本轮 §ADJ-BASIS 为避免"修口径顺带撤钱"才引入的，两处必须同源。
+# 修法：重建注册表时传入开放持仓策略键计数；停用但仍持仓的条目继续入表并打 WARN；删除仍立即撤销
+#       （条目已不存在，无参数可留）；战法库页面逐条下发 open_positions，确认框如实说明。
+echo ""
+echo "==> 78 §EXIT-RETAIN 持仓感知停用..."
+grep -q 'func SetRuleExitOverrides(factors \[\]research.AppliedFactorEntry, patterns \[\]research.AppliedPatternEntry, held HeldStrategyKeys)' internal/combat_agent/rule_exit_overrides.go \
+	|| { echo "--- FAIL: 出场覆盖重建签名回退成「不带持仓」（停用即摘覆盖复犯）"; exit 1; }
+grep -q 'cAgent.SetExitHeldProvider(r.OpenPositionStrategyCounts)' internal/engine/registry.go \
+	|| { echo "--- FAIL: 热重载持仓回调丢失（后续 Reload 用的是启动那一刻的持仓快照）"; exit 1; }
+grep -q 'func (r \*Registry) OpenPositionStrategyCounts() combat_agent.HeldStrategyKeys' internal/engine/registry.go \
+	|| { echo "--- FAIL: 跨账本持仓计数单一真相源丢失（按账号判持仓会清掉别的账号该保留的覆盖）"; exit 1; }
+# 策略键归一化必须两侧同源（入表键与查询键同一函数），否则"持仓命中"靠运气。
+python3 - internal/combat_agent/rule_exit_overrides.go <<'PY' || { echo "--- FAIL: §EXIT-RETAIN 键归一化不再同源（入表/查询各写一遍 lower+trim）"; exit 1; }
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+assert re.search(r'func normalizeExitKey\(s string\) string \{ return strings\.ToLower\(strings\.TrimSpace\(s\)\) \}', t), 'normalizeExitKey 定义形态变更'
+assert t.count('strings.ToLower(strings.TrimSpace(') == 1, '出现第二处手工归一化（两侧口径迟早漂开）'
+assert 'next[normalizeExitKey(id)] = ov' in t, '入表侧不再走同源归一化'
+PY
+# 停用保留必须留痕（无人值守路径悄悄留一条已停战法的覆盖，也得看得见）。
+grep -q 'WARN 规则 %s(%s) 已停用但仍有 %d 笔开放持仓' internal/combat_agent/rule_exit_overrides.go \
+	|| { echo "--- FAIL: 持仓保留分支不再打 WARN"; exit 1; }
+# 端点逐条下发 open_positions，且与出场覆盖用同一归一化（否则页面"N 笔"与实际不符）。
+grep -q 'combat_agent.NormalizeStrategyKey' internal/server/library.go \
+	|| { echo "--- FAIL: 战法库 open_positions 不再复用同源归一化"; exit 1; }
+# 负锁：不得出现"只要有持仓就一律保留"的全局兜底（那样删除的规则覆盖摘不掉）。
+if grep -qE 'if len\(held\) > 0 \{' internal/combat_agent/rule_exit_overrides.go; then
+	echo "--- FAIL: 出现按持仓存在性的全局兜底（已删除规则的覆盖撤销不掉）"; exit 1; fi
+echo "ok - §EXIT-RETAIN 守卫通过（签名/装配锁 3 + 归一同源锁 1 + 留痕锁 1 + 端点锁 1 + 负锁 1）"
+
+# ── 79. §SURVEY-HORIZON / §SURVEY-COVERAGE 排摸尺子、产物落点与盲区显形 ──
+# 现象（同一轮排摸踩出的三则）：
+#   ① 成分健康度恒用全局 --h 5 度量，而 fac_117/fac_118 落库 horizon=10 ⇒ 表里"1/1、2/2 死成分"
+#      是拿 5 日尺子量 10 日战法的结果，不能作为"该战法已失效"的依据；
+#   ② `research --db … --out …` 的全局 --out 被子命令同名缺省盖回 ./research_out，含战法权重/阈值的
+#      strategy_survey.json 掉进可被 git add 的工作树，而脚本打印 /tmp 路径并报成功
+#      ——本仓库 §M8/§N-6 主题「降级报成功」的又一实例；
+#   ③ momentum 在实盘白名单能下单，却没有回放适配器 ⇒ 排摸表里**根本没有这一行**，
+#      "没排摸"与"排摸过且没问题"在只看表的人眼里长得一样。
+# 修法：按条目自身 horizon 建 report 键并如实标尺；写产物前硬闸拒落工作树 + 脚本复核锚点行；
+#       盲区由代码算出差集并计成非零锚点 survey_unsurveyable。
+echo ""
+echo "==> 79 §SURVEY-HORIZON/§SURVEY-COVERAGE 排摸尺子、产物落点与盲区..."
+grep -q 'func componentHealth(ids \[\]string, horizon int, report map\[string\]\*research.FactorReport, minSpreadPP float64)' cmd/research/survey.go \
+	|| { echo "--- FAIL: 成分健康度不再按传入 horizon 度量（全局尺子复犯=误判战法已死）"; exit 1; }
+grep -qF 'report[reportKey(d.ID, h)] = research.Summarize(panels, d, *start, *end, h,' cmd/research/survey.go \
+	|| { echo "--- FAIL: 面板汇总不再逐档 Summarize（多档位 report 键永远查不到东西）"; exit 1; }
+grep -qF 'entryHorizon(e.Horizon, *horizon)' cmd/research/survey.go \
+	|| { echo "--- FAIL: 因子条目不再按自身 horizon 选尺子"; exit 1; }
+grep -qF 'survey_unsurveyable=' cmd/research/survey.go \
+	&& grep -qF 'art.UnsurveyableIDs = btreplay.UnsurveyedLiveForms()' cmd/research/survey.go \
+	|| { echo "--- FAIL: 盲区锚点行或其取数丢失（momentum 类「量不到」又退回一句 note）"; exit 1; }
+grep -qF 'func UnsurveyedLiveForms() []string' internal/btreplay/replay.go \
+	|| { echo "--- FAIL: 白名单与适配器差集不再由代码算（手写清单迟早与实盘脱节）"; exit 1; }
+grep -qF 'func TestLiveWhitelistFormsMatchSurveyCoverage' internal/server/known_strategy_forms_test.go \
+	|| { echo "--- FAIL: 白名单↔排摸覆盖面等值测试丢失"; exit 1; }
+# 产物不得落仓库工作树：硬闸 + 缺省目录 + 脚本侧锚点复核，三者缺一不可。
+grep -qF 'if root, ok := goModuleRoot(*outDir); ok' cmd/research/survey.go \
+	|| { echo "--- FAIL: 排摸产物落仓库的硬闸丢失"; exit 1; }
+grep -qF 'outDir := fs.String("out", defaultSurveyOutDir()' cmd/research/survey.go \
+	|| { echo "--- FAIL: --out 缺省不再走临时目录（硬闸只拦显式传参，拦不住缺省值）"; exit 1; }
+grep -qF 'for anchor in survey_unhealthy survey_unsurveyable' scripts/survey_live_rules.sh \
+	|| { echo "--- FAIL: 现网排摸脚本不再复核两条锚点行（跑完没产物照样报成功）"; exit 1; }
+# 负锁：--out 缺省不得再写工作树相对路径（research_out 那次就是从这里掉进 git add 候选的）。
+if grep -qE 'fs.String\("out", "\./' cmd/research/survey.go; then
+	echo "--- FAIL: --out 缺省又回到仓库相对路径"; exit 1; fi
+echo "ok - §SURVEY 守卫通过（尺子锁 3 + 盲区锁 3 + 落点锁 3 + 负锁 1）"
+
 echo ""
 echo "==> 全部通过"

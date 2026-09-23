@@ -135,7 +135,7 @@ func (s *Server) handleEmotionStrategyMatrix(w http.ResponseWriter, r *http.Requ
 			phaseByDate[isoCompact(d.TradeDate)] = d.Emotion // 权威标注
 		}
 	}
-	rows, err := s.researchDB.ListEmotionStrategyMatrix(phaseByDate, nil)
+	rows, err := s.researchDB.ListEmotionStrategyMatrix(phaseByDate, nil, research.AdjBaselineVersion)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -143,6 +143,7 @@ func (s *Server) handleEmotionStrategyMatrix(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]any{
 		"phases":     []string{"冰点", "启动", "发酵", "高潮", "退潮", "背离"},
 		"min_events": store.EmotionMatrixRowMinEvents,
+		"adj_basis":  research.AdjBaselineVersion, // §ADJ-BASIS 本矩阵算在哪个复权口径上（前端可标注）
 		"rows":       rows,
 	})
 }

@@ -1,7 +1,7 @@
 // 多因子研究工具（B3/B5）：对一批股票计算 7 大类因子并输出 IC/IR/分层验证报告；
 // B5 提供 optimize（权重优化产出候选）/ list（候选列表）/ approve（审批应用）；
 // scan-depth 实时扫描研究池盘口，识别托单/压单并产出候选。
-// 用法：research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|risk-daily-backfill|list|approve|event-layers
+// 用法：research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|risk-daily-backfill|list|approve|event-layers|prune-stale-checkpoints
 //
 //	flags：--db（默认 ~/.quant-trading-v2/trading.db）、--start（YYYYMMDD，默认 20200101）、
 //	--end（YYYYMMDD，默认今天）、--h（前瞻天数，默认 5）、--quantiles（默认 5）、
@@ -45,7 +45,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|risk-daily-backfill|lifecycle-eval|lifecycle|event-layers")
+		log.Fatalf("用法: research [flags] factor|optimize|scan-depth|discover-factors|discover-patterns|sector-rebuild|paper-research|backtest|backtest-strategy|run-task|list|approve|cluster-failures|emotion-phases|risk-daily-backfill|lifecycle-eval|lifecycle|event-layers|prune-stale-checkpoints")
 	}
 	cmd := args[0]
 
@@ -87,6 +87,10 @@ func main() {
 	case "backtest-strategy":
 		// 战法/规则历史回放（二期并入，原独立二进制 bt_strategy）。
 		cmdBacktestStrategy(db, *dbPath, args[1:])
+	case "strategy-survey":
+		// 复权口径修复后的全战法基线排摸：内置四形态 + 战法库全部条目（含停用）统一回放 +
+		// 成分因子健康度 + verdict 结论，产出 strategy_survey.json（见 survey.go 文件头）。
+		cmdStrategySurvey(db, *dbPath, args[1:])
 	case "run-task":
 		// 队列任务分发器（子系统统一改造一期）：worker 以 run-task --task-id N 拉起。
 		// English: queue-task dispatcher (phase 1) — the worker spawns `run-task --task-id N`.
@@ -120,6 +124,10 @@ func main() {
 		// §ENH-4 事件因子（news_score@stock/@sector）IC/分层/单调性检验，产出 event_factor_report.json。
 		// English: event-factor validation (batch D of ENHANCEMENT_PLAN_20260919).
 		cmdEventLayers(db, *dbPath, *start, *end, *quantiles, *minStocks, *codesFile, args[1:])
+	case "prune-stale-checkpoints":
+		// §ADJ-BASIS 清理改前旧口径断点（缺省 dry-run 只报统计，--apply 才删；见子命令文件头运维口径）。
+		// English: prune pre-basis research checkpoints (dry-run by default, --apply to delete).
+		cmdPruneStaleCheckpoints(db, args[1:])
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}

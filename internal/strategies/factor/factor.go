@@ -436,6 +436,15 @@ func seriesFromKLines(kl []data.KLine, fina *strategy_engine.FinancialData) *fac
 	s.Open, s.High, s.Low, s.CloseHfq = make([]float64, n), make([]float64, n), make([]float64, n), make([]float64, n)
 	s.CloseRaw = make([]float64, n)
 	s.Vol, s.Amount = make([]float64, n), make([]float64, n)
+	// §SURVEY 实盘日K序列没有估值/换手字段：这些切片必须**按 NaN 分配**而非留 nil——
+	// 估值类因子（epTTM/bp…）按下标遍历 s.PeTTM[i]，nil 切片直接 index out of range
+	// （战法库任一规则引用估值因子即打崩打分/回放链路，2026-09-23 排摸测试实踩）。
+	// NaN 与 research.Assemble 的缺失语义一致：因子值全 NaN → scoreRule 自动跳过该成分。
+	// English: valuation/turnover slices must exist as NaN-filled, not nil — value factors index
+	// them per bar (nil ⇒ panic), and NaN matches the research Assemble missing-data semantics.
+	s.Turnover = nanSlice(n)
+	s.PeTTM, s.Pb, s.PsTTM, s.PcfTTM, s.DvTTM = nanSlice(n), nanSlice(n), nanSlice(n), nanSlice(n), nanSlice(n)
+	s.TotalShare = nanSlice(n)
 	// 财务字段为最新报告期常量（时间序列上逐日同值；缺失记 NaN 让因子返回 NaN 不参与复合分）
 	var roe, yoyNP, gp, np, debt, eps []float64
 	if fina != nil {
@@ -470,6 +479,16 @@ func constant(n int, v float64) []float64 {
 	out := make([]float64, n)
 	for i := range out {
 		out[i] = v
+	}
+	return out
+}
+
+// nanSlice 长度 n 的全 NaN 切片（缺失语义，见 seriesFromKLines 注释的防崩说明）。
+// English: an all-NaN length-n slice (missing-data semantics, see seriesFromKLines).
+func nanSlice(n int) []float64 {
+	out := make([]float64, n)
+	for i := range out {
+		out[i] = math.NaN()
 	}
 	return out
 }

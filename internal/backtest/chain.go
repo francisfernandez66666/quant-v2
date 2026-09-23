@@ -239,18 +239,26 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 	}
 	total := len(events)
 	done := 0
+	// adjBasis 断点缓存键的复权口径位（见下方 §GAP/§ADJ-BASIS 注释），全程同一个值。
+	adjBasis := research.AdjBaselineVersion
 	for _, w := range windows {
 		winEvents := filterEvents(events, w[0], w[1])
 		if len(winEvents) == 0 {
 			continue
 		}
 		// 断点续跑：整窗命中缓存则跳过装配（省内存也省时间）。
-		// §GAP 二.3#5：缓存键携带规则参数指纹，改参后旧缓存自动失效。
+		// §GAP 二.3#5：缓存键携带规则参数指纹，改参后旧窗口自动失效。
+		// §ADJ-BASIS（2026-09-23）：缓存键同时携带**复权口径位**——§ADJ(P0-A 复权因子前向填充)
+		// 这类"入口不变、数值全变"的修复不改任何输入参数，只带指纹的键会让离线重放直接命中
+		// 改前的行并报成新结果。口径字符串单点定义在 research.AdjBaselineVersion（store 反向
+		// import 不到 research，故由本包把它传给读写两侧）。
+		// English: the checkpoint key carries both the rule fingerprint and the adjustment-price
+		// basis, so a value-changing fix with identical inputs no longer replays pre-fix rows.
 		ruleFP := opts.Rule.Fingerprint()
-		if opts.CandidateID > 0 && allEventsCached(db, opts.CandidateID, ruleFP, winEvents) {
+		if opts.CandidateID > 0 && allEventsCached(db, opts.CandidateID, ruleFP, adjBasis, winEvents) {
 			for _, e := range winEvents {
 				var er EventResult
-				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP); err == nil && ok {
+				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP, adjBasis); err == nil && ok {
 					if json.Unmarshal([]byte(js), &er) == nil {
 						rep.Events = append(rep.Events, er)
 						rep.TotalEvents++
@@ -288,7 +296,7 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 			var er EventResult
 			cached := false
 			if opts.CandidateID > 0 {
-				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP); err == nil && ok {
+				if js, ok, err := db.GetBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP, adjBasis); err == nil && ok {
 					if json.Unmarshal([]byte(js), &er) == nil {
 						cached = true
 					}
@@ -298,7 +306,7 @@ func Run(db *store.DB, opts Options) (*ChainReport, error) {
 				er = evalEvent(panels, bench, benchIdx, e, opts.Rule, opts.Horizons, opts.Cost)
 				if opts.CandidateID > 0 {
 					if js, err := json.Marshal(er); err == nil {
-						if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP, string(js)); err != nil {
+						if err := db.UpsertBacktestEventResult(opts.CandidateID, e.Date, e.Industry, ruleFP, adjBasis, string(js)); err != nil {
 							log.Printf("backtest: 缓存事件结果失败 cand=%d %s/%s: %v", opts.CandidateID, e.Date, e.Industry, err)
 						}
 					}
@@ -331,9 +339,11 @@ func filterEvents(events []SectorEvent, start, end string) []SectorEvent {
 
 // allEventsCached 判断窗口内全部事件是否都有断点缓存（决定该窗是否可跳过装配）。
 // ruleFP 参与键匹配：规则参数变更后窗口视为未缓存，强制重算（不再复用旧参结果）。
-func allEventsCached(db *store.DB, candID int64, ruleFP string, winEvents []SectorEvent) bool {
+// adjBasis 参与键匹配（§ADJ-BASIS）：复权口径变更后窗口一律视为未缓存——数值口径换了而输入
+// 没换，只有靠键里的口径位才能把"该重算"这件事说清楚。
+func allEventsCached(db *store.DB, candID int64, ruleFP, adjBasis string, winEvents []SectorEvent) bool {
 	for _, e := range winEvents {
-		if _, ok, err := db.GetBacktestEventResult(candID, e.Date, e.Industry, ruleFP); err != nil || !ok {
+		if _, ok, err := db.GetBacktestEventResult(candID, e.Date, e.Industry, ruleFP, adjBasis); err != nil || !ok {
 			return false
 		}
 	}

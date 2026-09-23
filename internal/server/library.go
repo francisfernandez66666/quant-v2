@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 	"quant-trading-v2/internal/strategy"
@@ -55,8 +56,23 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 		BacktestDone bool                   `json:"backtest_done"`        // 全链路回测是否已跑过（avg_excess 已回填）
 		Reason       string                 `json:"reason,omitempty"`     // 候选证据文本（样本内外 IR / 反推超额）
 		Conds        []research.PatternCond `json:"conds,omitempty"`
+		// §ADJ-BASIS-2 复权口径基线戳 + 失效判定（载入侧算出的派生值，非文件字段）。
+		// 前端据此在战法卡片上打「基线口径已失效」红标：这条战法的 weights/buy_threshold 是在
+		// §ADJ 修正前的复权面板上拟合的，参数已无成立的历史依据。
+		// English: adjustment-basis stamp + staleness verdict; the UI badges entries whose fitted
+		// parameters lost their historical basis.
+		AdjBasis      string `json:"adj_basis,omitempty"`
+		StaleAdjBasis bool   `json:"stale_adj_basis,omitempty"`
+		// §EXIT-RETAIN 该战法名下的开放持仓笔数（按持仓 Strategy 匹配规则 ID 或显示名）。
+		// 出场参数跟随持仓而非启用开关，所以"停用"只切断新开仓：前端停用确认文案要有这个数，
+		// 操作员点下去之前就得看见"这条还压着 N 笔仓"。
+		// English: count of open positions owned by this rule (matched by rule id or display name);
+		// disabling cuts new buys only, so the confirm dialog can state how many positions remain.
+		OpenPositions int `json:"open_positions"`
 	}
 	var out []libItem
+	// §EXIT-RETAIN 每次请求取一份持仓计数（实盘账本 ∪ 各账号模拟盘），因子/形态两张卡共用。
+	held := s.openPositionCounts()
 	stats := map[string]research.AppliedFactorEntry{}
 	for _, e := range entries {
 		stats[e.ID] = e
@@ -79,6 +95,8 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 			AppliedAt: e.AppliedAt, SignalCount: e.SignalCount, Win: e.Win, Loss: e.Loss, CumReturn: e.CumReturn,
 			Factors: e.Factors, Weights: e.Weights, Directions: e.Directions,
 			BuyThreshold: e.BuyThreshold, Horizon: e.Horizon, IR: e.IR, Excess: e.Excess,
+			AdjBasis: e.AdjBasis, StaleAdjBasis: e.StaleAdjBasis,
+			OpenPositions: openPositionsFor(held, e.ID, e.Name),
 		}
 		// 关联候选表验证信息：全样本 IC / 全链路回测超额与状态 / 证据文本（样本内外 IR、反推超额），
 		// 让战法库卡片完整展示"这条规律电脑验证过吗"。
@@ -120,9 +138,61 @@ func (s *Server) handleResearchLibrary(w http.ResponseWriter, r *http.Request) {
 			Kind: "pattern", ID: e.ID, Name: e.Name, Enabled: e.Enabled, CandID: e.CandID,
 			AppliedAt: e.AppliedAt, SignalCount: e.SignalCount, Win: e.Win, Loss: e.Loss, CumReturn: e.CumReturn,
 			Conds: e.Conds,
+			// §ADJ-BASIS-2P 形态卡与因子卡共用同一红标（条件因子同样跑在复权价上）。
+			AdjBasis:      e.AdjBasis,
+			StaleAdjBasis: e.StaleAdjBasis,
+			OpenPositions: openPositionsFor(held, e.ID, e.Name),
 		})
 	}
 	writeJSON(w, 200, map[string]any{"library": out})
+}
+
+// openPositionCounts 取"当前开放持仓按策略键计数"（§EXIT-RETAIN）：
+//   - 已接入引擎注册表（生产形态）：注册表是实盘账本 + 全部账号模拟盘账本的单一真相源，直接透传；
+//   - 未接入（独立 server / 单测）：退回只读实盘账本 + server 自身持有的模板模拟盘账本。
+//
+// 两条分支都不写状态；取数失败按"无持仓"计并在调用侧留痕，绝不因读库失败放宽出场参数保留口径。
+// English: open-position counts — delegated to the engine registry (live book ∪ all account paper
+// books) when wired, otherwise read straight from the live book plus the server's template book.
+func (s *Server) openPositionCounts() combat_agent.HeldStrategyKeys {
+	if s.registry != nil {
+		if c := s.registry.OpenPositionStrategyCounts(); c != nil {
+			return c
+		}
+		return combat_agent.HeldStrategyKeys{}
+	}
+	out := combat_agent.HeldStrategyKeys{}
+	if db := s.realDB(); db != nil {
+		ps, err := db.RealPositions()
+		if err != nil {
+			log.Printf("[library] §EXIT-RETAIN 实盘持仓读取失败(open_positions 按 0 计): %v", err)
+		}
+		for _, p := range ps {
+			out.Add(p.Strategy)
+		}
+	}
+	if s.paper != nil {
+		for _, p := range s.paper.Positions() {
+			key := p.Strategy
+			if key == "" {
+				key = p.StrategyType
+			}
+			out.Add(key)
+		}
+	}
+	return out
+}
+
+// openPositionsFor 该条战法的开放持仓数：持仓 Strategy 可能存规则 ID，也可能存显示名（历史形态），
+// 两个键都是同一批持仓的别名，因此归一化后同值时只计一次（否则一笔会被数成两笔）。
+// English: open-position count for a rule — positions are keyed by either its id or its display name;
+// when both normalize to the same string the count is taken once instead of double-added.
+func openPositionsFor(held combat_agent.HeldStrategyKeys, id, name string) int {
+	n := held.CountFor(id)
+	if combat_agent.NormalizeStrategyKey(id) == combat_agent.NormalizeStrategyKey(name) {
+		return n
+	}
+	return n + held.CountFor(name)
 }
 
 // handleResearchLibraryToggle 处理 POST /api/research/library/{id}/enable|disable：

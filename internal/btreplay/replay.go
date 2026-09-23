@@ -440,6 +440,20 @@ type Options struct {
 	// when set, run on the universe listed-and-not-yet-delisted at the backtest start (drops survivorship
 	// bias); requires dataload loaded with --with-delisted.
 	PointInTime bool
+	// Codes 非空时直接作为回放股票池（跳过 StockCodes/质控/时点三条池解析路径）。
+	// strategy-survey 用它把排摸窗口/池与研究面板装配钉在同一份清单上，保证成分因子健康度
+	// 与回放结果口径一致。English: explicit universe, bypassing DB pool resolution (survey uses this).
+	Codes []string
+	// IncludeDisabled 为真时战法库**停用**条目也建适配器参与回放。
+	// 仅供 strategy-survey 排摸全库；生产 backtest-strategy/library_replay 保持默认 false，
+	// 行为与旧版逐字节一致（只回放启用规则）。
+	// English: when true, disabled library rules are replayed too (survey-only; default false keeps
+	// the production behavior unchanged).
+	IncludeDisabled bool
+	// DB 调用方已持有的研究库连接：非 nil 时直接复用、不再按 DBPath 二次 Open，
+	// 避免同进程双连接抢锁（strategy-survey 在 main 里已 Open）。
+	// English: reuse a caller-owned connection instead of opening DBPath again.
+	DB *store.DB
 	// Backtest §回测自动增强 A0：动态滑点/流动性约束/Pareto 寻优配置（payload.backtest 注入）。
 	// nil 或 Enabled=false = 行为与增强前完全一致（固定 5bp、无流动性门控、无 Pareto 段）。
 	// English: backtest enhancement config injected via task payload; nil/disabled keeps the
@@ -605,9 +619,12 @@ func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLin
 	return nil, false
 }
 
-// loadRuleAdapters 从战法库加载全部启用规则，每条规则一个 adapter（kind: factor|pattern）。
-// English: loads every enabled library rule as one adapter (kind: factor|pattern).
-func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
+// loadRuleAdapters 从战法库加载规则，每条规则一个 adapter（kind: factor|pattern）。
+// includeDisabled=true 时停用条目也建适配器（strategy-survey 全库排摸用）；
+// 生产回放路径恒传 false = 只加载启用规则，与旧行为一致。
+// English: loads library rules as adapters; when includeDisabled is set, disabled entries are
+// built too (survey-only). Production callers pass false.
+func loadRuleAdapters(kind, dataDir string, includeDisabled bool) ([]adapter, error) {
 	switch strings.ToLower(kind) {
 	case "factor", "factor_rules", "applied_factors":
 		// §P2-d：直接读库条目以携带规则级出场覆盖（扫参审批后回测立即生效）；
@@ -619,7 +636,7 @@ func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 		out := make([]adapter, 0, len(entries))
 		for i := range entries {
 			e := &entries[i]
-			if !e.Enabled || len(e.Factors) == 0 {
+			if (!e.Enabled && !includeDisabled) || len(e.Factors) == 0 {
 				continue
 			}
 			r := &factor.ActiveRule{
@@ -650,7 +667,7 @@ func loadRuleAdapters(kind, dataDir string) ([]adapter, error) {
 		out := make([]adapter, 0, len(pentries))
 		for i := range pentries {
 			e := &pentries[i]
-			if !e.Enabled || len(e.Conds) == 0 {
+			if (!e.Enabled && !includeDisabled) || len(e.Conds) == 0 {
 				continue
 			}
 			ap := &pattern.ActivePattern{ID: e.ID, Name: e.Name, CandID: e.CandID}
@@ -721,19 +738,20 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 		ads = []adapter{&ruleEvalAdapter{name: rule.Name, ruleID: rule.ID, ps: ps}}
 		log.Printf("候选直读回放：%s 条件=%d", rule.Name, len(rule.Conds))
 	} else if strings.EqualFold(o.Strategy, "all") {
-		fa, ferr := loadRuleAdapters("factor", o.DataDir)
+		fa, ferr := loadRuleAdapters("factor", o.DataDir, o.IncludeDisabled)
 		if ferr != nil {
 			return nil, false, ferr
 		}
-		pa, perr := loadRuleAdapters("pattern", o.DataDir)
+		pa, perr := loadRuleAdapters("pattern", o.DataDir, o.IncludeDisabled)
 		if perr != nil {
 			return nil, false, perr
 		}
 		ads = append(fa, pa...)
 		// 四大手写战法一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape）：
 		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。
-		// English: include the four hand-written strategies in the all-replay as well.
-		builtins := []string{"double_bump", "dragon", "dragon_return", "n_shape"}
+		// 枚举唯一出处 = BuiltinStrategies()（strategy-survey 排摸同一集合，不再各写一份）。
+		// English: the built-in list has exactly one source of truth — BuiltinStrategies().
+		builtins := BuiltinStrategies()
 		needsInd(builtins...)
 		for _, name := range builtins {
 			ad, aerr := newAdapter(name, useIndustry, o.D1Score)
@@ -749,7 +767,7 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 		log.Printf("all 回放：%d 条库规则（factor=%d pattern=%d）+ 四大手写战法",
 			len(fa)+len(pa), len(fa), len(pa))
 	} else if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
-		ra, rerr := loadRuleAdapters(o.Strategy, o.DataDir)
+		ra, rerr := loadRuleAdapters(o.Strategy, o.DataDir, o.IncludeDisabled)
 		if rerr != nil {
 			return nil, false, rerr
 		}
@@ -770,13 +788,131 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 	return ads, useIndustry, nil
 }
 
+// BuiltinStrategies 内置形态战法枚举（有回放适配器的四个）：buildAdapters 的 all 模式与
+// strategy-survey 排摸共用这一份清单——排摸覆盖面必须与生产回测同源，不许两处各写各的。
+// 注意：动量战法（momentum）在实盘白名单（server/qmt.go knownStrategyList）中存在，
+// 但 btreplay 没有它的适配器，因此不在排摸枚举内（survey 的 notes 里会显式说明）。
+// English: the one source of truth for built-in strategies that have a replay adapter.
+func BuiltinStrategies() []string {
+	return []string{"double_bump", "dragon", "dragon_return", "n_shape"}
+}
+
+// LiveFormStrategies 实盘白名单里的**形态战法全集**（内置四形态 + 动量）。
+// 与 internal/server/qmt.go 的 knownStrategyList 同源——那边是带中文显示名的 UI 视图，
+// 这里是"可交易 ID"的机器口径；两边一致性由 internal/server 的等值测试钉住
+// （server 测试引用本包，生产依赖方向不变）。
+// English: the canonical set of form-strategy IDs that may trade live (four builtins + momentum).
+// Kept in step with server's knownStrategyList by an equality test in internal/server.
+func LiveFormStrategies() []string {
+	return []string{"double_bump", "dragon", "dragon_return", "n_shape", "momentum"}
+}
+
+// UnsurveyedLiveForms 返回「实盘白名单里有、但 btreplay 没有回放适配器」的形态战法 ID。
+// 这些战法在排摸表里**永远不会出现**——不显式计数的话，"没查到"会被读成"没问题"，
+// 正是本轮 §ADJ 口径漂移最想要人看见的那类盲区（momentum 即此例）。
+// English: form strategies on the live whitelist that have no replay adapter — surfaced as a
+// non-zero survey anchor so "not measured" can never be read as "not a problem".
+func UnsurveyedLiveForms() []string {
+	covered := map[string]bool{}
+	for _, id := range BuiltinStrategies() {
+		covered[id] = true
+	}
+	var out []string
+	for _, id := range LiveFormStrategies() {
+		if !covered[id] {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// adapterID 返回 adapter 的稳定英文 ID：库规则取 ruleID（fac_*/pat_*），
+// 内置战法按类型映射（double_bump/dragon/dragon_return/n_shape）。
+// English: stable ASCII ID per adapter (rule ID for library entries, registry name for builtins).
+func adapterID(ad adapter) string {
+	if kp, ok := ad.(kindProvider); ok {
+		if k := kp.Kind(); k != "" {
+			return k
+		}
+	}
+	switch ad.(type) {
+	case *doubleBumpAdapter:
+		return "double_bump"
+	case *dragonAdapter:
+		return "dragon"
+	case *dragonReturnAdapter:
+		return "dragon_return"
+	case *nShapeAdapter:
+		return "n_shape"
+	}
+	return ""
+}
+
+// ReplayStat 单策略回放结果（strategy-survey 的对外契约）。字段与内部 summary 同源，
+// 刻意**不含**夏普/年化/卡玛——逐笔采样口径下这些风险调整指标无意义（排摸输出曾因此
+// 出现"年化 -1e14%"级别的噪声列）。
+// English: per-strategy replay stats for the survey; intentionally excludes Sharpe/annual/Calmar,
+// which are meaningless under the sampled-trade basis.
+type ReplayStat struct {
+	ID            string  // 稳定 ASCII ID（内置名 / fac_* / pat_*）
+	Name          string  // 显示名（中文，仅供人看）
+	Signals       int     // 触发信号数
+	Win           int     // 盈利笔数
+	Loss          int     // 亏损笔数
+	WinRate       float64 // 胜率%
+	AvgWinPct     float64 // 平均盈利%
+	AvgLossPct    float64 // 平均亏损%
+	ProfitFactor  float64 // 盈亏比
+	ExpectancyPct float64 // 期望收益%（每笔）
+	AvgHoldDays   float64 // 平均持仓天数
+}
+
+// RunCollect 执行回放但以结构化结果返回（不打印汇总报告）——strategy-survey 专用。
+// 与 Run 共用 collect() 同一执行路径：排摸数字与生产回测逐字同源，杜绝第二套口径。
+// English: runs the same pipeline as Run but returns structured per-adapter stats.
+func (o *Options) RunCollect() ([]ReplayStat, error) {
+	sums, ids, _, err := o.collect()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ReplayStat, 0, len(sums))
+	for i, s := range sums {
+		id := ""
+		if i < len(ids) {
+			id = ids[i]
+		}
+		out = append(out, ReplayStat{
+			ID: id, Name: s.Name, Signals: s.Count, Win: s.Win, Loss: s.Loss,
+			WinRate: s.WinRate, AvgWinPct: s.AvgWinPct, AvgLossPct: s.AvgLossPct,
+			ProfitFactor: s.ProfitFactor, ExpectancyPct: s.Expectancy, AvgHoldDays: s.AvgHold,
+		})
+	}
+	return out, nil
+}
+
 // Run 执行回放回测主流程（汇总报告打印到 stdout，供 worker 解析 result_text）。
 func (o *Options) Run() error {
-	db, err := store.Open(o.DBPath)
+	summaries, _, stockCount, err := o.collect()
 	if err != nil {
-		return fmt.Errorf("打开数据库: %w", err)
+		return err
 	}
-	defer db.Close()
+	printReports(summaries, stockCount)
+	return nil
+}
+
+// collect 回放主流程本体（不含打印）：返回按 adapter 分组的 summary、对应的稳定 ID 列表
+// 与股票池规模。Run 与 RunCollect 都走这里（见 RunCollect 注释：单一口径）。
+func (o *Options) collect() ([]*summary, []string, int, error) {
+	db := o.DB
+	if db == nil {
+		var err error
+		db, err = store.Open(o.DBPath)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("打开数据库: %w", err)
+		}
+		defer db.Close()
+	}
 
 	// §质控筛选：Screen 非空时用质控池（剔 ST/退市/多年亏损/地量股）替代全量 StockCodes()，
 	// 再叠加 MaxStocks 截断——全量回测不再是 maxstocks=300 的字母序傻截。
@@ -785,7 +921,11 @@ func (o *Options) Run() error {
 	// multi-year-loss/illiquid names), then apply the MaxStocks cap on top. §WS-D D-2 — PointInTime
 	// switches to the listed-at-start universe (delisted included) to kill survivorship bias.
 	var codes []string
+	var err error
 	switch {
+	case len(o.Codes) > 0:
+		// 显式池（strategy-survey）：与调用方研究面板用同一份清单。
+		codes = o.Codes
 	case o.Screen != nil:
 		sc := *o.Screen
 		if sc.End == "" && o.End != "" {
@@ -795,14 +935,14 @@ func (o *Options) Run() error {
 	case o.PointInTime:
 		codes, err = db.UniverseAt(o.Start)
 		if err != nil {
-			return fmt.Errorf("时点股票池(%s): %w", o.Start, err)
+			return nil, nil, 0, fmt.Errorf("时点股票池(%s): %w", o.Start, err)
 		}
 		log.Printf("回放股票池：时点口径 %d 只（截至 %s，含退市消除幸存者偏差）", len(codes), o.Start)
 	default:
 		codes, err = db.StockCodes()
 	}
 	if err != nil {
-		return err
+		return nil, nil, 0, err
 	}
 	if o.MaxStocks > 0 && len(codes) > o.MaxStocks {
 		codes = codes[:o.MaxStocks]
@@ -816,7 +956,7 @@ func (o *Options) Run() error {
 	// library_replay step so auto-research regression-tests live strategies nightly.
 	ads, useIndustry, berr := o.buildAdapters(db)
 	if berr != nil {
-		return berr
+		return nil, nil, 0, berr
 	}
 
 	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
@@ -849,7 +989,7 @@ func (o *Options) Run() error {
 	// §P2 参数扫参模式：触发一次性预计算 + 逐组合廉价模拟统一出场（见 sweep.go）。
 	// English: sweep mode — pre-compute triggers once, then cheaply simulate each param combo.
 	if o.Sweep != nil {
-		return o.runSweep(db, codes, ads, industryChg)
+		return nil, nil, len(codes), o.runSweep(db, codes, ads, industryChg)
 	}
 
 	// 逐 adapter 回放（多规则时按规则分组统计；单战法仅一条）。
@@ -857,7 +997,8 @@ func (o *Options) Run() error {
 	// 否则整轮回放只有结尾汇总、进度条全程空窗。
 	// English: emit "回测进度 x%" every 10% of the stock loop so the queue worker can feed the bar.
 	summaries := make([]*summary, 0, len(ads))
-	amountFixed := 0 // Risk-1 千元口径归一的股票计数（收尾日志）
+	ids := make([]string, 0, len(ads)) // 与 summaries 平行：strategy-survey 定位每条结果归属
+	amountFixed := 0                   // Risk-1 千元口径归一的股票计数（收尾日志）
 	for _, ad := range ads {
 		// §回测自动增强：每战法装配一次动态滑点上下文（含 paper_trades 校准合并；
 		// 增强关闭 = nil = 全部旧行为）。
@@ -904,12 +1045,12 @@ func (o *Options) Run() error {
 			sm.Name = ad.Name()
 		}
 		summaries = append(summaries, sm)
+		ids = append(ids, adapterID(ad))
 	}
 	if amountFixed > 0 {
 		log.Printf("Risk-1 单位自校：%d 只股票 amount 按千元口径归一（×1000）", amountFixed)
 	}
-	printReports(summaries, len(codes))
-	return nil
+	return summaries, ids, len(codes), nil
 }
 
 // toDataKLine 把 store.Bar 序列转成 data.KLine（Date 解析为 time.Time）。

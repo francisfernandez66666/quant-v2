@@ -1,5 +1,7 @@
 // ── 自动研究页面 Research.jsx ──
 // 研究候选审批、战法库管理、回测任务中心、参数寻优与资金池纪律配置。
+// §ADJ-BASIS-2：战法库卡片对"复权口径基线已失效"的因子战法打红标（AdjBasisStaleTag）。
+// §EXIT-RETAIN：出场参数覆盖跟着持仓走——停用确认文案与「持仓 N」标记见 libraryDisableConfirmBody。
 // 全量使用 TDesign React 组件（Card / Table / Tag / Button / Dialog / Tabs / Select / Input）。
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import {
@@ -12,6 +14,73 @@ import BacktestConfigPanel from '../components/BacktestConfigPanel'
 import * as api from '../api/index.js'
 import { showToast, confirmDialog } from '../ui.jsx'
 
+
+// §ADJ-BASIS-2（2026-09-23）当前复权口径基线版本，与 Go 侧 internal/research/windowed.go 的
+// AdjBaselineVersion 同源——**改复权取数口径时两边一起 bump**（后端条目带着旧戳就会被判 stale）。
+const CURRENT_ADJ_BASELINE = 'hfq-forward-fill-1'
+
+// 失效判定：以后端载入侧算出的 stale_adj_basis 为准；老后端/缺字段时退到"戳不等于当前基线"。
+// §ADJ-BASIS-2P（2026-09-23）形态战法同样参与——其条件（AtrRatio14/Brk60 一类）取的就是
+// CloseHfq 派生面板，口径一换历史依据一样作废，只标因子战法会留下半边盲区。
+// English: trust the server-computed verdict; fall back to a stamp mismatch when the field is
+// absent. Patterns are covered too — their conditions read the same Hfq-derived panels.
+export function isAdjBasisStale(s) {
+  if (!s) return false
+  if (typeof s.stale_adj_basis === 'boolean') return s.stale_adj_basis
+  return s.adj_basis !== CURRENT_ADJ_BASELINE
+}
+
+// §ADJ-BASIS-2 基线口径失效标记：该战法的 weights/buy_threshold 是在 §ADJ 修正前的
+// 复权口径（HfqBars 未做前向填充 ≈ 不复权价）面板上拟合的，历史依据已失效。
+// 后端字段：GET /api/research/library 每条带 adj_basis（落盘时的口径版本）+ stale_adj_basis（载入侧判定）。
+// 导出供单测直接渲染（整页挂载 Research 需要 mock 十余个端点，与本断言无关）。
+// English: badge for strategies whose fitted parameters were derived on the pre-fix price basis.
+export function AdjBasisStaleTag({ strategy }) {
+  if (!isAdjBasisStale(strategy)) return null
+  return (
+    <Tag theme="danger" title="参数是在修正前的复权口径上拟合的：这条战法的历史依据已失效，需重跑寻优+审批（缺省仅标记告警，不停投）">
+      基线口径已失效
+    </Tag>
+  )
+}
+
+// 把开放持仓数（后端 open_positions）归一成正整数：缺字段/老后端按 0 计。
+function heldPositionsOf(s) {
+  const n = Number(s && s.open_positions)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+}
+
+// §EXIT-RETAIN（2026-09-23）停用确认文案。**出场参数覆盖跟着持仓走，不跟着启停开关走**：
+// 后端 internal/combat_agent/rule_exit_overrides.go 只要还有开放持仓是在这条战法下开的，
+// 它的移动止盈/最长持有就继续对这些持仓生效，停用只切断新的买入信号。
+// 有持仓时文案必须把两件事说明白：①停用只停新买入；②已有持仓仍按本战法的出场参数离场、
+// 不会掉回全局默认（8%/15 天）。open_positions 由 GET /api/research/library 逐条下发
+// （命中本条 ID 或显示名的开放持仓数，实盘全账户 + 全部模拟盘账户）。
+// 导出供单测直接断言（整页挂载 Research 需 mock 十余个端点，与本断言无关）。
+// English: exit-parameter overrides follow the position, not the enable flag — the confirmation
+// must state that disabling cuts new buys only while held positions keep this rule's exit params.
+export function libraryDisableConfirmBody(s) {
+  const held = heldPositionsOf(s)
+  const name = (s && s.name) || ''
+  if (held > 0) {
+    return '确定停用战法 ' + name + ' ？停用只切断新的买入信号；该战法名下仍有 ' + held
+      + ' 笔开放持仓，这些持仓会继续按本战法的出场参数（移动止盈/最长持有）离场，不会改按全局默认。'
+      + '若要立即撤销该出场覆盖，只能平掉这些持仓或删除本战法。'
+  }
+  return '确定停用战法 ' + name + ' ？停用后不再产生新的买入信号（当前没有开放持仓挂在该战法下）。'
+}
+
+// §EXIT-RETAIN 持仓挂靠在标记：>0 时展示，让"停用了但出场覆盖仍在生效"这件事在卡片上可见。
+// 沿用本文件既有 Tag 写法（同 AdjBasisStaleTag），不做额外样式。
+export function LibraryHeldTag({ strategy }) {
+  const held = heldPositionsOf(strategy)
+  if (held <= 0) return null
+  return (
+    <Tag theme="warning" title="有开放持仓按本战法的出场参数（移动止盈/最长持有）离场；即使停用，这些持仓的出场覆盖依然生效">
+      持仓 {held}
+    </Tag>
+  )
+}
 
 // 将小数格式化为带百分号的字符串（如 12.34%）
 function fmtPctGlobal(v) {
@@ -449,7 +518,9 @@ export default function Research() {
     finally { setLoadingLibrary(false) }
   }
   async function toggleLibrary(s) {
-  // 启用/禁用某条战法库记录
+  // 启用/禁用某条战法库记录。§EXIT-RETAIN：停用方向先确认，并说清楚"只断新开仓、
+  // 名下持仓仍按本战法出场参数离场"——避免把「停用」误读成「改按全局默认止盈」。
+    if (s.enabled && !(await confirmDialog(libraryDisableConfirmBody(s)))) return
     try {
       await api.setResearchLibraryEnabled(s.id, !s.enabled)
       s.enabled = !s.enabled
@@ -1339,6 +1410,10 @@ export default function Research() {
                 {canApprove && !editingName[s.id] && <Button size="small" variant="text" theme="primary" onClick={() => startRename(s)}>改名</Button>}
                 <Tag theme={s.kind === 'pattern' ? 'primary' : 'default'}>{s.kind === 'pattern' ? '形态' : '因子'}</Tag>
                 <Tag theme={s.enabled ? 'success' : 'default'}>{s.enabled ? '已启用' : '已停用'}</Tag>
+                {/* §ADJ-BASIS-2 因子战法专属：复权口径基线已失效 → 红标（形态战法不吃复权因子面板，不判） */}
+                <AdjBasisStaleTag strategy={s} />
+                {/* §EXIT-RETAIN 有开放持仓挂靠 → 标记（停用时其出场覆盖仍对这些持仓生效） */}
+                <LibraryHeldTag strategy={s} />
                 <span style={{ fontSize: 11, color: 'var(--app-text-2)', marginLeft: 'auto' }}>{s.id}｜{s.applied_at}</span>
               </div>
               {/* 战法条件/因子标签：形态战法展示扫参条件，因子战法展示多空因子列表 */}

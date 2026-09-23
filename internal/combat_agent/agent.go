@@ -273,6 +273,15 @@ type Agent struct {
 	// Enhance.AuctionSignal is on, nil consumes nothing). Appends an observation field to buy
 	// signals within the open window (9:30-10:00) without changing scores.
 	auctionStrengthFn func(code string) float64
+
+	// exitHeldFn 开放持仓策略键回调（§EXIT-RETAIN；由 engine.Registry 装配时注入，nil 表示未知持仓）。
+	// 重建规则级出场覆盖注册表时用它判断"被停用的规则是否仍有开放持仓"——出场参数跟随持仓而非启用开关，
+	// 所以停用（含 research 自动降级这类无人值守路径）不会改写存量持仓的止盈/超期口径。
+	// 不注入时语义退化为旧的"停用即失效"（held 为空），单测/独立装配零影响。
+	// English: callback supplying the open-position strategy keys (injected by engine.Registry) so a
+	// disabled rule that still owns positions keeps governing their exits; nil falls back to the legacy
+	// "disable = drop immediately" behavior.
+	exitHeldFn func() HeldStrategyKeys
 }
 
 // New 创建战法引擎实例。
@@ -570,6 +579,9 @@ func (a *Agent) ReloadPatternRules(dataDir string) {
 
 // refreshExitOverrides 重建规则级出场覆盖注册表（§P2-d 实盘接线）。
 // 因子+形态两库合并刷新——注册表是全局单份，单库刷新必须双读，否则会清掉另一侧的覆盖。
+// §EXIT-RETAIN：注册表同样是全局单份，故"仍持有"的判定必须来自跨账号的聚合回调
+// （engine.Registry.OpenPositionStrategyCounts 覆盖实盘 + 全部账号模拟盘），不能只看本账号持仓，
+// 否则 A 账号热重载会把 B 账号因持仓而应保留的覆盖清掉。
 // 参数：
 //   - dataDir: 数据目录路径
 func (a *Agent) refreshExitOverrides(dataDir string) {
@@ -585,10 +597,32 @@ func (a *Agent) refreshExitOverrides(dataDir string) {
 	if pe == nil {
 		pe = []research.AppliedPatternEntry{}
 	}
-	SetRuleExitOverrides(fe, pe)
+	SetRuleExitOverrides(fe, pe, a.heldExitStrategyKeys())
 	n := len(fe) + len(pe)
 	log.Printf("[combat_agent] 出场覆盖注册表已同步: 因子 %d 条 / 形态 %d 条", len(fe), len(pe))
 	_ = n
+}
+
+// SetExitHeldProvider 注入开放持仓策略键回调（§EXIT-RETAIN，由 engine.Registry 装配时调用一次）。
+// 传 nil 表示不提供（退回"停用即失效"旧语义）。
+// English: injects the open-position key provider used to retain exit overrides for disabled rules
+// that still own positions (wired once by engine.Registry; nil restores the legacy behavior).
+func (a *Agent) SetExitHeldProvider(fn func() HeldStrategyKeys) {
+	a.mu.Lock()
+	a.exitHeldFn = fn
+	a.mu.Unlock()
+}
+
+// heldExitStrategyKeys 取当前开放持仓的策略键计数（未注入回调时返回 nil = 无持仓）。
+// English: reads the open-position keys, nil when no provider was injected.
+func (a *Agent) heldExitStrategyKeys() HeldStrategyKeys {
+	a.mu.RLock()
+	fn := a.exitHeldFn
+	a.mu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn()
 }
 
 // PatternStats 返回形态 runner 的各规则运行统计（效果监测）。

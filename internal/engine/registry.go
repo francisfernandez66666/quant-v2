@@ -427,15 +427,37 @@ func (r *Registry) dispatchPaperMark(e *Engine, quotes map[string]*data.StockInf
 
 // allPaperHeldCodes 聚合共享引擎服务的全部账号模拟盘持仓代码（含全局模板 opts.Paper 旧回退账本）。
 // 供 5s 监控池 base 重建（engine.syncMonitorBase）把每个账号的纸面持仓永久钉入行情监控。
-// §QUOTE_POOL_SPLIT 预创建：纸面引擎是懒加载的——若只读 r.papers，重启后未触发过 HTTP 的账号
-// 持仓会全部缺失，纸面持仓钉入监控将依赖前端轮询（脆弱）。故先对 auto-paper 账号锁外幂等
-// GetPaper（首轮即从磁盘恢复持仓），再聚合。所有 Positions() 读取在锁外（磁盘恢复 IO 不占全局锁）。
+// 账本集合与懒加载预创建口径由 paperEngineSnapshot 统一提供（§QUOTE_POOL_SPLIT）。
 // English: aggregates the paper-held codes of every account served by the shared engine, including the
 // global template opts.Paper (legacy fallback book), for the base-pool rebuild to pin all paper holdings
-// into perpetual quote monitoring. Eagerly creates (idempotent, outside the lock) the lazy paper engine
-// for each auto-paper account so restart-then-nothing-pinned cannot happen; all Positions() reads stay
-// outside the registry lock (disk-restore IO must not hold it).
+// into perpetual quote monitoring. The book set (with eager creation of lazy per-account engines) comes
+// from paperEngineSnapshot.
 func (r *Registry) allPaperHeldCodes() []string {
+	var out []string
+	for _, pe := range r.paperEngineSnapshot() {
+		for _, p := range pe.Positions() {
+			if p.Code != "" {
+				out = append(out, p.Code)
+			}
+		}
+		// §SHORT-3 融券空头同样永久钉入监控：买回/止损估值不因掉出 hot 池而缺行情。
+		for _, s := range pe.ShortPositions() {
+			if s.Code != "" {
+				out = append(out, s.Code)
+			}
+		}
+	}
+	return out
+}
+
+// paperEngineSnapshot 取"当前全部模拟盘账本"快照：已懒加载的各账号引擎 + 全局模板账本 opts.Paper。
+// §QUOTE_POOL_SPLIT 预创建：纸面引擎是懒加载的——若只读 r.papers，重启后未触发过 HTTP 的账号
+// 持仓会全部缺失（监控钉入与 §EXIT-RETAIN 的持仓判定都会漏账）。故先对 auto-paper 账号锁外幂等
+// GetPaper（首轮即从磁盘恢复持仓），再聚合。所有 Positions() 读取在锁外（磁盘恢复 IO 不占全局锁）。
+// English: snapshot of every paper book — each lazily created per-account engine plus the global
+// template book, eagerly (idempotently, outside the lock) creating auto-paper accounts' engines so a
+// restart without any HTTP traffic cannot hide their holdings.
+func (r *Registry) paperEngineSnapshot() []*paper.Engine {
 	r.mu.Lock()
 	var users []string
 	for _, us := range r.coreUsers {
@@ -455,27 +477,56 @@ func (r *Registry) allPaperHeldCodes() []string {
 	r.mu.Lock()
 	pes := make([]*paper.Engine, 0, len(r.papers)+1)
 	for _, pe := range r.papers {
-		pes = append(pes, pe)
+		if pe != nil {
+			pes = append(pes, pe)
+		}
 	}
 	r.mu.Unlock()
 	if tmpl != nil {
 		pes = append(pes, tmpl)
 	}
-	var out []string
-	for _, pe := range pes {
-		if pe == nil {
-			continue
+	return pes
+}
+
+// OpenPositionStrategyCounts 汇总"当前开放持仓按策略键计数"（§EXIT-RETAIN 的单一真相源）：
+//   - 实盘账本：opts.RealStore 的 real_positions（跨账号全表——出场覆盖注册表是进程内单份，
+//     按账号过滤会让 A 账号的热重载清掉 B 账号本该保留的覆盖）；
+//   - 模拟盘账本：paperEngineSnapshot()（各账号 ∪ 全局模板）。
+//
+// 每笔持仓只入一个键：Strategy 原文（退出引擎正是拿它去匹配覆盖的），Strategy 为空时退回
+// StrategyType（=规则池键=规则 ID）。一笔只记一次是战法库 open_positions 不翻倍的前提——
+// 同一笔持仓既算进 ID 又算进显示名，页面就会显示 2 笔。
+// 融券空头不计：库规则（fac_/pat_）只做多，空头来自四个手写做空战法，其止损链不经出场覆盖注册表。
+//
+// 只读、不改状态。实盘库未接入或查询失败时按"无持仓"计并留一条日志：保守方向是"不额外保留
+// 覆盖"（即旧行为），绝不因读库失败而静默放宽持仓的止盈口径。
+// 本方法同时服务 EngineRegistry（server 侧战法库 open_positions 字段）与 combat_agent 的持仓回调。
+//
+// English: counts open positions by strategy key — the live book (all accounts) plus every paper
+// book — and registers one key per position (Strategy, falling back to StrategyType). Used both to
+// keep a disabled rule's exit overrides alive while it still owns positions and as the
+// open_positions figure in the strategy-library payload.
+func (r *Registry) OpenPositionStrategyCounts() combat_agent.HeldStrategyKeys {
+	out := combat_agent.HeldStrategyKeys{}
+	r.mu.Lock()
+	realDB := r.opts.RealStore
+	r.mu.Unlock()
+	if realDB != nil {
+		ps, err := realDB.RealPositions()
+		if err != nil {
+			log.Printf("[registry] §EXIT-RETAIN 实盘持仓读取失败(按无持仓计，不额外保留覆盖): %v", err)
 		}
+		for _, p := range ps {
+			out.Add(p.Strategy)
+		}
+	}
+	for _, pe := range r.paperEngineSnapshot() {
 		for _, p := range pe.Positions() {
-			if p.Code != "" {
-				out = append(out, p.Code)
+			key := p.Strategy
+			if key == "" {
+				key = p.StrategyType
 			}
-		}
-		// §SHORT-3 融券空头同样永久钉入监控：买回/止损估值不因掉出 hot 池而缺行情。
-		for _, s := range pe.ShortPositions() {
-			if s.Code != "" {
-				out = append(out, s.Code)
-			}
+			out.Add(key)
 		}
 	}
 	return out
@@ -716,7 +767,19 @@ func (r *Registry) build(userID string) *Engine {
 	cAgent.SetPositionDailyDropPct(posCfg.DailyDropAlertPct)
 	cAgent.SetD1Config(opts.CfgMgr.GetD1ConfigFor(userID))
 	cAgent.SetATRStop(posCfg.ATREnabled, posCfg.ATRStopMult)
-	cAgent.SetRunners(newAccountRunners(opts.CfgMgr, opts.Matcher, userID, opts.DataDir))
+	// §EXIT-RETAIN 出场覆盖跟随持仓，不跟随启用开关：给战法代理注入**跨账号**开放持仓策略键回调
+	// （实盘账本 ∪ 全部已建账号模拟盘），启动装配则取同一逻辑的一份即时快照。
+	// 出场覆盖注册表是进程内单份，所以"是否仍持有"的判定必须全局聚合——只看本账号持仓的话，
+	// A 账号热重载会把 B 账号本该因持仓而保留的覆盖清掉。回调形态（而非快照值）保证后续热重载
+	// 读的是当时的持仓，而不是启动那一刻的。
+	// English: exits follow positions, not the enable flag — the agent gets a *global* open-position
+	// provider (live book ∪ every account's paper book), while startup assembly seeds one immediate
+	// snapshot; the registry is process-wide, so per-account data would clear another account's
+	// retained overrides on hot reload.
+	heldExit := r.OpenPositionStrategyCounts()
+	// 快照只喂启动装配这一次；下面的回调供后续每次热重载重算（两者判定逻辑同源）。
+	cAgent.SetExitHeldProvider(r.OpenPositionStrategyCounts)
+	cAgent.SetRunners(newAccountRunners(opts.CfgMgr, opts.Matcher, userID, opts.DataDir, heldExit))
 	// §SHORT-1 注入做空四战法 runner（高位滞涨/放量破位/龙头断板/利好兑现砸盘）。
 	cAgent.SetShortRunners(combat_agent.NewShortRunners(opts.CfgMgr))
 	cAgent.SetShortEnabled(opts.CfgMgr.GetLongShortConfigFor(userID).ShortEnabled)
@@ -894,10 +957,13 @@ func (r *Registry) build(userID string) *Engine {
 
 // newAccountRunners 构建四大战法 runner；runner 设置账号 ID（按账号读取策略配置）。
 // matcher 供 N 形战法 D1 事件匹配使用（可为 nil）。dataDir 用于注入审批通过的因子战法规则（E6）。
+// heldExit 为当前开放持仓策略键（§EXIT-RETAIN）：已停用但仍持有持仓的规则，其出场覆盖在启动装配时
+// 同样保留（详见 combat_agent.SetRuleExitOverrides）。
 // English: builds the four strategy runners; each runner is bound to the account so it reads that
 // account's strategy config. matcher feeds the N-shape D1 event match (may be nil). dataDir is used to
-// inject the approved factor-strategy rule (E6).
-func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userID string, dataDir string) []combat_agent.StrategyRunner {
+// inject the approved factor-strategy rule (E6). heldExit carries the open-position keys that keep a
+// disabled rule's exit overrides alive.
+func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userID string, dataDir string, heldExit combat_agent.HeldStrategyKeys) []combat_agent.StrategyRunner {
 	runners := buildRunners(cfgMgr, matcher)
 	for i := range runners {
 		if setter, ok := runners[i].Strategy.(interface{ SetUserID(string) }); ok {
@@ -945,7 +1011,7 @@ func newAccountRunners(cfgMgr *config.Manager, matcher *data.EventMatcher, userI
 			if pe == nil {
 				pe = []research.AppliedPatternEntry{}
 			}
-			combat_agent.SetRuleExitOverrides(fe, pe)
+			combat_agent.SetRuleExitOverrides(fe, pe, heldExit)
 		}
 	}
 	return runners

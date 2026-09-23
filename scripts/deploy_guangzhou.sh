@@ -30,6 +30,7 @@
 #                    需抄存并同步到引擎 rules.qmt.token；已存在的 config.xt.json 不会被覆盖）
 #   GATEWAY_ACCOUNT  §M7c 东莞证券资金账号（留空 → broker=mock 影子期存活，不接真实柜台）
 #   XT_USERDATA_PATH §M7c QMT userdata_mini 目录（broker=xt 时必需）
+#   QMT_MOCK_DECOMMISSION 置 1 才执行步 [3d]（退役 C:\qmt\uat 残留 qmt-mock.exe / :8799，默认关）
 
 set -euo pipefail
 
@@ -155,6 +156,14 @@ $SCP deploy/qmt-win/service_probe_config.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/
 # 必须入本清单——教训见 §ENH-5 quote_feed.py 漏列导致网关 ImportError 起不来）
 ps1_bom deploy/qmt-win/prune_logs.ps1
 $SCP deploy/qmt-win/prune_logs.ps1 "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
+# §QMT-MOCK-DECOM + §QMT-TOKENROT（2026-09-23）：mock 退役脚本与 token 轮换脚本入清单。
+# 教训同 §ENH-5/§A5/§P0-B：deploy/qmt-win 新增 .ps1 必须随部署下发——否则"仓库里有、现网没有"，
+# RUNBOOK 照着写命令却找不到文件。decommission 由 [3d] 的显式开关执行；rotate 只上传不执行
+# （写 token 是运维择窗动作，绝不随部署自动发生）。
+ps1_bom deploy/qmt-win/decommission_qmt_mock.ps1
+ps1_bom deploy/qmt-win/rotate_qmt_token.ps1
+$SCP deploy/qmt-win/decommission_qmt_mock.ps1 deploy/qmt-win/rotate_qmt_token.ps1 \
+     "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/qmt-win/"
 # baostock sidecar
 $SCP cmd/pydata/server.py cmd/pydata/requirements.txt "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/pydata/"
 
@@ -375,6 +384,22 @@ if [ -f "$APK_LOCAL" ]; then
   fi
 else
   echo "[ ] 本机无 release APK，跳过上传（需先 MOBILE_KEYSTORE_PASS=xxx ./scripts/build_apk.sh release）"
+fi
+
+# ── 3d. 退役实盘机残留 UAT qmt-mock（§QMT-MOCK-DECOM，默认关，QMT_MOCK_DECOMMISSION=1 打开）──
+# 背景（docs/PROGRESS.md 遗留项）：C:\qmt\uat\qmt-mock.exe 自 09-10 起常驻监听 0.0.0.0:8799，
+#   UAT 假柜台裸露在实盘机。退役的是**这台机器上的残留部署**，不是 cmd/qmt-mock 源码
+#   （源码仍服务测试：默认 :8789、uat_bootstrap.sh 用 :18789；仓库对 8799 零代码/配置引用）。
+# 姿势与 LIVEBACKUP_FIRST_RUN 同构：显式开关 + 默认关 + 失败只告警不阻断部署链
+#   （set -e 下半途死会把服务留在停机态）；脚本幂等、只动 C:\qmt\uat、exe 改名不删除（可逆）。
+# 判据不看本步输出、看产物：verify 第 19 探针（mock 不在位/不在听）持续复核直到绿。
+if [ "${QMT_MOCK_DECOMMISSION:-0}" = "1" ]; then
+  echo "[3d/5] 退役 C:/qmt/uat 残留 qmt-mock（监听 :8799）..."
+  if $SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/qmt-win/decommission_qmt_mock.ps1"; then
+    echo "  OK 退役完成（action= 明细见上方输出；复核：verify 第 19 探针）"
+  else
+    echo "  [!] 退役未通过（仍有目标进程在听/exe 改名失败，详见上方 action= 行）——不阻断部署，verify 第 19 探针将持续判红"
+  fi
 fi
 
 # ── 4. 注册 Windows 服务（NSSM）+ qmtctl 任务计划 ──

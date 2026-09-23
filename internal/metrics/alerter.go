@@ -55,6 +55,17 @@ func DefaultAlertRules() []AlertRule {
 		{Name: "llm_cooldown", Metric: "llm_cooldown_count", Op: "gt", Threshold: 2, For: "60s", Level: "p2", Message: "LLM 冷却数超阈值"},
 		// §AUDIT-PM 2026-09-15 buyCh 深度预警：容量 64，过半仍在排 = 下单风暴或网关变慢（P2）。
 		{Name: "buy_queue_high", Metric: "buy_queue_depth", Op: "gt", Threshold: 32, For: "60s", Level: "p2", Message: "自动买入队列积压 >32（网关变慢或信号风暴）"},
+		// §ADJ-BASIS-2（2026-09-23）：已应用因子战法的复权口径基线失效条数 >0 即 p1。
+		// 赋值点：internal/research/apply.go markStaleAdjBasis（每次读战法库都刷新，含"没有库"清零）。
+		// 语义是"这些战法的 weights/buy_threshold 是在 §ADJ 修正前的复权面板上拟合的，历史依据已失效"，
+		// 缺省只告警不停投（处置权在 owner），持续触发由评估器 Firing 态 + 路由冷却窗去重，
+		// 每个轮询节拍不会再刷一条。
+		{Name: "applied_factor_stale_basis", Metric: "applied_factor_stale_basis_count", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "已应用因子战法复权基线已失效（参数缺历史依据，需重跑寻优+审批）"},
+		// §ADJ-BASIS-2P（2026-09-23）：形态战法同一条链的第二侧。刻意**不复用**上面那条指标——
+		// 因子库与形态库由不同调用点各自读库，共用一个 gauge 就会"后读者覆盖前读者"，
+		// 报出来的条数不是任何一侧的真值（§DEADGAUGE 的反面形态：值在、但失真）。
+		// 赋值点：internal/research/apply.go markStaleAdjBasisPatterns（含"没有库"清零）。
+		{Name: "applied_pattern_stale_basis", Metric: "applied_pattern_stale_basis_count", Op: "gt", Threshold: 0, For: "0s", Level: "p1", Message: "已应用形态战法复权基线已失效（条件阈值缺历史依据，需重跑寻优+审批）"},
 	}
 }
 

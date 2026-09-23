@@ -115,7 +115,7 @@ const (
 	defaultResolvedCooldown = 10 * time.Minute
 )
 
-// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部 9 条规则。
+// DefaultAlertRouting 出厂路由表（owner 裁决 4 口径），覆盖 DefaultAlertRules() 全部规则（现 10 条）。
 // English: factory routing table covering all DefaultAlertRules() entries.
 func DefaultAlertRouting() AlertRoutingConfig {
 	return AlertRoutingConfig{
@@ -132,6 +132,9 @@ func DefaultAlertRouting() AlertRoutingConfig {
 			// —— 日汇总：趋势型/容量型，单条不疼、反复才疼 ——
 			"llm_cooldown":   RouteDaily, // LLM 冷却数
 			"buy_queue_high": RouteDaily, // 买入队列积压
+			// —— 必推：§ADJ-BASIS-2 战法参数基线失效（不推就是"owner 永远不知道这批权重的历史依据没了"）——
+			"applied_factor_stale_basis":  RoutePush,
+			"applied_pattern_stale_basis": RoutePush, // §ADJ-BASIS-2P 形态侧同规
 		},
 		DefaultRoute:     RoutePush,
 		FireCooldown:     defaultFireCooldown,

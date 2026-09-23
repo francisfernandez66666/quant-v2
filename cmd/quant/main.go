@@ -55,6 +55,7 @@ import (
 	"quant-trading-v2/internal/opslog"
 	"quant-trading-v2/internal/paper"
 	"quant-trading-v2/internal/report"
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/sector_agent"
 	"quant-trading-v2/internal/server"
 	"quant-trading-v2/internal/store"
@@ -375,7 +376,7 @@ func main() {
 	srv.SetNotifier(notifier) // §C9-清扫：/api/notify-test 升级为逐通道真实探测，需注入全局通知器
 	// §高-3（2026-09-23 修复批）指标型告警出口接线。此前 internal/metrics 的评估器只
 	// `log.Printf` 一条就返回，9 条指标规则**从不出站**（R7 验收单 D1/维5 却打了 ✅，属
-	// 「声称已做」）。路由表与冷却窗在 metrics 包内自持（必推 5 条 / 日汇总 4 条），这里
+	// 「声称已做」）。路由表与冷却窗在 metrics 包内自持（必推 6 条 / 日汇总 4 条），这里
 	// 只提供出口闭包：p1→LevelHigh 走既有高优通道、其余→LevelMedium。
 	// 一律经 Push —— M8 已把 WS/Webhook/推送网关三路内聚在 Push 里，绝不再直调
 	// PushGateway，否则就是当日「双发」事故的同族复犯。
@@ -388,6 +389,21 @@ func main() {
 		}
 		notifier.Push(notify.Message{Level: lvl, Title: d.Title, Content: d.Body})
 	})
+	// §ADJ-BASIS-2（2026-09-23）复权口径基线失效战法的处置策略注入。
+	// §ADJ（HfqBars 前向填充）修好了取数口径，但**改的是数值不是入口**：在此之前审批落盘的
+	// 因子战法（如 fac_1「波动突破」），其 weights/buy_threshold 是在已知错误的面板上拟合的
+	// ——实测四个分量的 5 日分位差从 3~4pp 塌到 ≈0 甚至反号，即参数已无成立的历史依据。
+	// 本键只决定"要不要因此停掉一条正在跑的战法"：缺省 shadow = 只打红标 + p1 告警，照旧实盘。
+	// 默认不 fail-close 的理由（owner 决策未定，我们不替 owner 撤钱）见 config.ResearchConfig 注释。
+	// 用闭包读快照而非值：config 热重载（cfgMgr.Watch 60s）后下一轮读战法库即生效，无需重启。
+	// English: injects the stale-adjustment-basis disposition as a live getter so hot reload reaches
+	// the next library read; the default stays "shadow" (mark + alert only) because silently stopping a
+	// live strategy would change capital behaviour without the owner's decision.
+	research.ConfigureStaleAdjBasisActionFunc(func() string {
+		return cfgMgr.Get().Research.StaleAdjBasisOrDefault()
+	})
+	log.Printf("[main] §ADJ-BASIS-2 基线失效因子战法处置策略=%s（shadow=只标记+告警；disable=剔除不再产生买入信号）",
+		research.StaleAdjBasisAction())
 	log.Printf("[main] 实时行情采集已启动: 监控 %d 只(自选+持仓), 5s 轮询", len(baseStocks))
 
 	// 板块→个股成分股覆盖数（默认20）：扩大同板块强势股进打分池，避免只覆盖龙头前10漏选

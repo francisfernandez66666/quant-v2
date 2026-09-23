@@ -8,14 +8,19 @@
 //
 // 性能护栏：单桶事件数 < minEvents 的格子标记 thin（前端降透明度），防"3 个事件算出
 // 5% 超额"被当成可靠结论（W7 样本纪律在分相回测上的同款问题）。
+// §ADJ-BASIS（2026-09-23）：聚合前先按**复权口径位**过滤 backtest_event_results——本聚合跨
+// 全部候选/全部事件日扫整表，不过滤就会把改前（空串口径）与改后的数值平均进同一格。
 // English: emotion×strategy matrix. Groups cached per-event backtest results (B4 chain cache)
 // by candidate × daily sentiment phase. Phase labels prefer market_risk_daily, falling back to
 // EmotionStatsRange + PhaseFromEmotionStat (same thresholds). Cells under minEvents are flagged
-// "thin" so small-sample buckets don't masquerade as conclusions.
+// "thin" so small-sample buckets don't masquerade as conclusions. Only rows written on the caller's
+// adjustment basis are aggregated.
 package store
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 )
 
 // EmotionCell 矩阵一格：某候选在某情绪相位下的分桶统计。
@@ -57,9 +62,38 @@ type emotionEventRow struct {
 // ListEmotionStrategyMatrix 聚合全部有断点缓存的候选 × 情绪相位矩阵。
 // phaseByDate：market_risk_daily 的 trade_date(YYYY-MM-DD)→emotion 映射（server 层取好传入，
 // 这里做 YYYYMMDD↔YYYY-MM-DD 归一）；fallbackPhase：历史缺失日的情绪现算器（可 nil=跳过该日）。
+// adjBasis §ADJ-BASIS（2026-09-23）：本聚合**跨全部候选、跨全部事件日**扫整张
+// backtest_event_results（旧实现连 WHERE 都没有），所以口径位必须进来当过滤条件——否则改前
+// （空串哨兵）与改后两套数值会被混进同一个桶里平均，发布出去的就是假统计。
+// 保守取向：adjBasis 为空（调用方没装配口径位）或口径位主键迁移被中止（降级，表里无法按口径
+// 过滤）时**直接拒绝聚合**并报错，端点如实报错，而不是拿混装矩阵继续发布。
 // 返回按事件总数降序的候选行。
-func (d *DB) ListEmotionStrategyMatrix(phaseByDate map[string]string, fallbackPhase func(dateStr8 string) string) ([]EmotionStrategyRow, error) {
-	rows, err := d.db.Query(`SELECT candidate_id, event_date, result_json FROM backtest_event_results`)
+//
+// English: aggregates the candidate × sentiment-phase matrix. Because this scan spans every
+// candidate and every event date, it must filter on the adjustment basis: without the filter,
+// pre-fix (empty-basis) and post-fix numbers would be averaged into the same published cell. An unset basis
+// or a degraded table refuses to aggregate instead of publishing mixed statistics.
+func (d *DB) ListEmotionStrategyMatrix(phaseByDate map[string]string, fallbackPhase func(dateStr8 string) string, adjBasis string) ([]EmotionStrategyRow, error) {
+	if adjBasis == "" {
+		return nil, fmt.Errorf("store: 情绪×战法矩阵拒绝聚合——复权口径位未装配（adj_basis 空串是「改前旧证据行」的哨兵值，无法判定哪些行属于当前口径）")
+	}
+	if d.EventBasisDegraded() {
+		return nil, fmt.Errorf("store: 情绪×战法矩阵拒绝聚合——backtest_event_results 口径位主键未生效（%s），该表无法按口径过滤，混装旧口径行发布会产出假统计",
+			d.eventBasisReason)
+	}
+	// 被口径过滤掉的旧证据行数（>0 即说明"过滤改变了发布数值"）：一次性 WARN，讲清楚
+	// 本次是在哪个口径上算的、排除了多少改前行。矩阵是面板端点，每请求都打会刷屏。
+	var excluded int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM backtest_event_results WHERE adj_basis <> ?`, adjBasis).Scan(&excluded); err != nil {
+		return nil, err
+	}
+	if excluded > 0 {
+		d.eventBasisWarnMatrix.Do(func() {
+			log.Printf("[store] WARN §ADJ-BASIS 情绪×战法矩阵已按复权口径过滤：adj_basis=%q，本轮排除 %d 条非当前口径行（含改前旧证据行 ''），矩阵数值相对口径进键前会变化；后续同口径请求不再重复告警",
+				adjBasis, excluded)
+		})
+	}
+	rows, err := d.db.Query(`SELECT candidate_id, event_date, result_json FROM backtest_event_results WHERE adj_basis = ?`, adjBasis)
 	if err != nil {
 		return nil, err
 	}

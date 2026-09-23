@@ -31,12 +31,20 @@
 #      ≥ backup_snapshot.ps1 step 0 的 8GB 护栏（同数由 verify_changes.sh §72 等值锁钉住）。
 #      实录：04:00 那次护栏还过、07:1x 首跑只剩 6.9GB，余量是单调往下走的；只读 SNAPSHOT_OK 的
 #      ok=false 要等人去读 err 才发现根因，本探针判红明细直接带 free/snapshot/relay/datadir 四数。
+#  11) §SNAP-LOCK（2026-09-23，第 18 探针）：快照单写者锁健康度（锁龄 + 按命令行统计在跑进程数）。
+#  12) §QMT-MOCK-DECOM（2026-09-23，第 19 探针）：实盘机残留 UAT qmt-mock 退役复核——
+#      C:\qmt\uat 下无 qmt-mock.exe（改名 .disabled-* 不算在位）且 :8799 无该目标监听。
+#      判据明细全 ASCII：PS→SSH→bash 回传按 GBK 解码，任何中文明细的 grep 都是永久性假绿。
+#  13) §QMT-TOKENROT（2026-09-23，第 20 探针）：网关 token 四源指纹分歧检测（只比 sha256 前
+#      8 位，绝不回显值）。四源=①config.xt.json ②服务 AppEnvironmentExtra 的 QUANT_GATEWAY_*
+#      覆盖（注册表直读）③引擎 config.json rules.qmt.token ④桥进程 --token/cmdline。
 #
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
 #   GZ_IP=81.71.69.17 COMMIT=beb5b80 ./scripts/verify_deploy_guangzhou.sh   # 显式指定指纹
 #
 # 参数（环境变量）：GZ_IP（必填）/ GZ_USER / COMMIT（默认本地 HEAD）/ DEPLOY_DIR / 端口三项
+#   / 第 19-20 探针可调项：MOCK_UAT_DIR / MOCK_PORT / GW_CFG / GW_TOKEN_SVC（默认=现网路径）
 set -uo pipefail
 
 : "${GZ_IP:?请设置 GZ_IP（广州服务器公网 IP）}"
@@ -47,6 +55,10 @@ DEPLOY_DIR="${DEPLOY_DIR:-C:/opt/quant}"
 DATA_DIR="${DATA_DIR:-C:/var/lib/quant-trading-v2}"   # §N-5 第 15 探针：auth.json（LLM 权威源）所在
 BACKUP_DIR="${BACKUP_DIR:-${DEPLOY_DIR}/deploy/qmt-win}"   # §P0-B 第 16 探针：快照脚本落盘位（= 部署步 [2e]）
 SNAP_DIR="${SNAP_DIR:-C:/var/lib/quant-snapshot}"          # §P0-B 第 16 探针：每晚产物 + SNAPSHOT_OK 所在
+MOCK_UAT_DIR="${MOCK_UAT_DIR:-C:/qmt/uat}"                 # §QMT-MOCK-DECOM 第 19 探针：残留 mock 目录
+MOCK_PORT="${MOCK_PORT:-8799}"                             # §QMT-MOCK-DECOM 第 19 探针：假柜台对外口
+GW_CFG="${GW_CFG:-C:/qmt/quant-trading-v2/qmt_gateway/config.xt.json}"   # §QMT-TOKENROT 第 20 探针：网关配置文件
+GW_TOKEN_SVC="${GW_TOKEN_SVC:-quant}"                      # §QMT-TOKENROT 第 20 探针：QUANT_GATEWAY_TOKEN 所在 NSSM 服务
 ENGINE_PORT="${ENGINE_PORT:-8081}"
 WEB_PORT="${WEB_PORT:-8080}"
 GW_PORT="${GW_PORT:-8789}"
@@ -71,7 +83,12 @@ param(
     [string]$DataDir = "C:\var\lib\quant-trading-v2",
     # §P0-B 第 16 探针用：快照脚本落盘目录 + 每晚产物目录（与部署步 [2e] 同源）。
     [string]$BackupDir = "C:\opt\quant\deploy\qmt-win",
-    [string]$SnapDir = "C:\var\lib\quant-snapshot"
+    [string]$SnapDir = "C:\var\lib\quant-snapshot",
+    # §QMT-MOCK-DECOM 第 19 探针 + §QMT-TOKENROT 第 20 探针用（2026-09-23）。
+    [string]$MockUatDir = "C:\qmt\uat",
+    [int]$MockPort = 8799,
+    [string]$GatewayCfg = "C:\qmt\quant-trading-v2\qmt_gateway\config.xt.json",
+    [string]$GwTokenService = "quant"
 )
 $ErrorActionPreference = "Continue"
 
@@ -349,6 +366,110 @@ try {
 if ($writers -ge 2) { $lkMissing += ("writers=" + $writers) }
 if ($writers -eq 1 -and -not (Test-Path $Lk)) { $lkMissing += "writer without lock (unguarded run)" }
 Probe "backup:single-writer lock" ($lkMissing.Count -eq 0) ("lock=" + $lkTxt + " writers=" + $writers + " miss=" + ($lkMissing -join ","))
+
+# 12) §QMT-MOCK-DECOM（2026-09-23，第 19 探针）：实盘机残留 UAT qmt-mock 退役复核。
+# 背景：C:\qmt\uat\qmt-mock.exe 自 09-10 起常驻监听 0.0.0.0:8799（docs/PROGRESS.md 遗留项）。
+#   退役动作在部署侧 [3d]（QMT_MOCK_DECOMMISSION=1，exe 改名 .disabled-* 不删除）；本探针是
+#   校验面独立复核（同 §M7 教训：不能只信施工面自己打的"完成"）。
+# 判据（pass=不在位）：①目录下无**现役名** qmt-mock.exe（改名 .disabled-* 视为已退役）；
+#   ②无 exe 路径落在 $MockUatDir 下的进程；③:8799 的监听里没有属于该目录进程的。
+#   其它进程占用 8799（other_listeners>0）只写明细不判红——本探针守的是"mock 没了"，不是"端口空闲"。
+# ⚠ 明细必须全 ASCII：PS→SSH→bash 回传按 GBK 解码，中文明细要么乱码要么让下游 grep 变
+#   永久性假绿（schtasks 状态文案那次就是这么骗过守卫的，见 deploy_guangzhou.sh [6/6] 注释）。
+$mockRootPrefix = $MockUatDir.TrimEnd('\') + '\'
+$mockExePresent = $false
+if (Test-Path $MockUatDir) {
+    $mockExePresent = (@(Get-ChildItem -LiteralPath $MockUatDir -Filter "qmt-mock.exe" -File -ErrorAction SilentlyContinue).Count -gt 0)
+}
+$mockProcN = 0; $mockListenN = 0; $otherListenN = 0
+try {
+    $mockPids = @{}
+    foreach ($mp in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+        $mep = [string]$mp.ExecutablePath
+        if ($mep -and $mep.StartsWith($mockRootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $mockProcN += 1
+            $mockPids[[int]$mp.ProcessId] = $true
+        }
+    }
+    foreach ($ml in @(Get-NetTCPConnection -LocalPort $MockPort -State Listen -ErrorAction SilentlyContinue)) {
+        if ($mockPids.ContainsKey([int]$ml.OwningProcess)) { $mockListenN += 1 } else { $otherListenN += 1 }
+    }
+} catch { }
+$mockMiss = @()
+if ($mockExePresent) { $mockMiss += "exe-present" }
+if ($mockProcN -gt 0) { $mockMiss += ("procs=" + $mockProcN) }
+if ($mockListenN -gt 0) { $mockMiss += ("listeners=" + $mockListenN) }
+$mockDetail = "exe=" + $(if ($mockExePresent) { "present" } else { "absent" }) + " procs=" + $mockProcN + " mock_listeners=" + $mockListenN + " other_listeners=" + $otherListenN + " miss=" + $(if ($mockMiss.Count) { ($mockMiss -join ",") } else { "none" })
+Probe ("qmt:mock retired (no uat exe, no :" + $MockPort + " listener)") ($mockMiss.Count -eq 0) $mockDetail
+
+# 13) §QMT-TOKENROT（2026-09-23，第 20 探针）：网关 token 四源一致性（只比指纹，绝不回显值）。
+# 四源（详见 rotate_qmt_token.ps1 文件头）：①网关 config.xt.json（token+report_token）；
+#   ②NSSM 服务 AppEnvironmentExtra 的 QUANT_GATEWAY_TOKEN/…_REPORT_TOKEN——进程 env 覆盖文件值
+#   （gateway.py :186/:199），读法=注册表直读（规矩①：绝不解析 nssm 控制台文本）；
+#   ③引擎 config.json rules.qmt.token；④桥进程命令行的 --token。
+# 可达性口径（如实声明，防"探针只能变绿"）：①②③④都经现网唯一 sanctioned 通道（管理员 SSH +
+#   powershell）读取。②若注册表读不到（服务名不对/权限）记 unknown；④桥没在跑时该源**无从读取**，
+#   记 missing（合法运行态，不判红）——但**四源全部读不到**时判红（"no readable source"），
+#   否则这条探针就成了摆设。env 侧未设 QUANT_GATEWAY_TOKEN 也是合法态（网关回退文件值）记 missing。
+# 判定：所有"可读且存在"的源的 sha256 前 8 位指纹必须一致（token 腿 + report 腿分别聚合）；
+#   任何两个可读源指纹不同 → 红。missing/unknown 不算分歧、但如实列进明细。
+function TokFp([string]$v) {
+    if (-not "$v") { return "" }
+    try {
+        $ts = [Security.Cryptography.SHA256]::Create()
+        return ("sha256:" + ((@($ts.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$v))) | ForEach-Object { $_.ToString("x2") }) -join "").Substring(0, 8))
+    } catch { return "sha256:err" }
+}
+$tk1 = "unknown"; $tk1r = ""
+if (Test-Path $GatewayCfg) {
+    try {
+        $tk1j = Get-Content -Path $GatewayCfg -Raw | ConvertFrom-Json
+        $tk1 = TokFp([string]$tk1j.token); if (-not $tk1) { $tk1 = "missing" }
+        $tk1r = TokFp([string]$tk1j.report_token)
+    } catch { $tk1 = "unknown" }
+} else { $tk1 = "missing" }
+$tk2 = "unknown"; $tk2r = ""
+try {
+    $tk2Key = Get-Item -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $GwTokenService) -ErrorAction Stop
+    $tk2Vals = @($tk2Key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))
+    $tk2Tok = ""; $tk2Rep = ""
+    foreach ($kv2 in $tk2Vals) {
+        $t2 = ("$kv2").Trim()
+        if ($t2 -match '^QUANT_GATEWAY_TOKEN=(.+)$') { $tk2Tok = $Matches[1] }
+        elseif ($t2 -match '^QUANT_GATEWAY_REPORT_TOKEN=(.+)$') { $tk2Rep = $Matches[1] }
+    }
+    $tk2 = TokFp $tk2Tok; if (-not $tk2) { $tk2 = "missing" }
+    $tk2r = TokFp $tk2Rep
+} catch { $tk2 = "unknown" }
+$tk3 = "unknown"
+$tk3Path = $DataDir + "\config.json"
+if (Test-Path $tk3Path) {
+    try {
+        $tk3j = Get-Content -Path $tk3Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $tk3 = TokFp([string]$tk3j.rules.qmt.token); if (-not $tk3) { $tk3 = "missing" }
+    } catch { $tk3 = "unknown" }
+} else { $tk3 = "missing" }
+$tk4 = "missing"
+try {
+    foreach ($pr4 in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+        $cl4 = [string]$pr4.CommandLine
+        if ($cl4 -match 'qmt_bridge\.py') {
+            if ($cl4 -match '--token[= ](\S+)') { $tk4 = TokFp $Matches[1]; if (-not $tk4) { $tk4 = "missing" } } else { $tk4 = "no-cmdline-token" }
+            break
+        }
+    }
+} catch { $tk4 = "unknown" }
+$tkPres = @($tk1, $tk2, $tk3, $tk4 | Where-Object { $_ -match '^sha256:' })
+$tkGroups = @($tkPres | Group-Object | Sort-Object -Property Count -Descending)
+$tkAgreeN = 0
+if ($tkGroups.Count -ge 1) { $tkAgreeN = [int]$tkGroups[0].Count }
+$tkBad = @()
+if (($tkGroups | Measure-Object).Count -gt 1) { $tkBad += ("token_diverged distinct=" + ($tkGroups | Measure-Object).Count) }
+$tkRep = @(@($tk1r, $tk2r) | Where-Object { $_ -match '^sha256:' }) | Where-Object { $_ }
+if (($tkRep | Sort-Object -Unique | Measure-Object).Count -gt 1) { $tkBad += "report_token_diverged" }
+if ($tkPres.Count -eq 0) { $tkBad += "no readable source" }
+$tkDetail = "token_fp_agree=" + $tkAgreeN + "/4 file=" + $tk1 + " env=" + $tk2 + " engine=" + $tk3 + " bridge=" + $tk4 + " report_file=" + $(if ($tk1r) { $tk1r } else { "none" }) + " report_env=" + $(if ($tk2r) { $tk2r } else { "none" }) + " miss=" + $(if ($tkBad.Count) { ($tkBad -join ",") } else { "none" })
+Probe "qmt:token fp agree across 4 sources" ($tkBad.Count -eq 0) $tkDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -357,7 +478,7 @@ printf '\357\273\277' | cat - "$PROBES" > "$PROBES.bom" && mv "$PROBES.bom" "$PR
 $SCP "$PROBES" "${GZ_USER}@${GZ_IP}:${DEPLOY_DIR}/verify_probes.ps1" 2>/dev/null
 
 echo "== verify_deploy_guangzhou @ ${GZ_IP}（期望 buildCommit=${COMMIT}）=="
-out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR}" 2>&1 | LC_ALL=C tr -d '\r')
+out=$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -File ${DEPLOY_DIR}/verify_probes.ps1 -Commit ${COMMIT} -EnginePort ${ENGINE_PORT} -WebPort ${WEB_PORT} -GwPort ${GW_PORT} -DataDir ${DATA_DIR} -BackupDir ${BACKUP_DIR} -SnapDir ${SNAP_DIR} -MockUatDir ${MOCK_UAT_DIR} -MockPort ${MOCK_PORT} -GatewayCfg ${GW_CFG} -GwTokenService ${GW_TOKEN_SVC}" 2>&1 | LC_ALL=C tr -d '\r')
 
 PASS=0
 FAIL=0

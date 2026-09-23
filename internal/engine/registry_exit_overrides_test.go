@@ -30,7 +30,7 @@ func TestNewAccountRunnersSeedsExitOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runners := newAccountRunners(config.NewManager(""), nil, "tester", dir)
+	runners := newAccountRunners(config.NewManager(""), nil, "tester", dir, nil)
 	if len(runners) == 0 {
 		t.Fatal("runners 未构建")
 	}

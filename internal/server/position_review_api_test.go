@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/paper"
 )
 
@@ -32,6 +33,10 @@ func (f *fakeReviewRegistry) AllControllers() []EngineController { return nil }
 
 // 桩注册表：不提供 paper 引擎。
 func (f *fakeReviewRegistry) PaperForUser(string) *paper.Engine { return nil }
+
+// OpenPositionStrategyCounts §EXIT-RETAIN 桩：本测试不关心开放持仓计数（战法库 open_positions
+// 由 library_open_positions_test.go 用真实账本覆盖）。
+func (f *fakeReviewRegistry) OpenPositionStrategyCounts() combat_agent.HeldStrategyKeys { return nil }
 
 // 桩注册表：长度恒 0。
 func (f *fakeReviewRegistry) Len() int { return 0 }

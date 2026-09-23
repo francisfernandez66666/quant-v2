@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,6 +108,53 @@ type Rules struct {
 	// English: signal-controller rollout knobs — shadow-observation for newly enforced gates
 	// (blacklists on the signal side); strategy whitelist is always hard, unaffected.
 	SignalCtl SignalCtlConfig `json:"signal_ctl"`
+	// §ADJ-BASIS-2 研究产物（已应用因子战法）配置：复权口径基线失效时的处置策略。
+	// English: research-product knobs — what to do with applied factor strategies whose fitted
+	// parameters were derived on a now-invalid price-adjustment basis.
+	Research ResearchConfig `json:"research"`
+}
+
+// ResearchConfig §ADJ-BASIS-2（2026-09-23）研究战法库相关配置。目前只有一项：
+// 复权口径基线失效后的处置动作。
+// English: research-library config; today only the stale-adjustment-basis action.
+type ResearchConfig struct {
+	// StaleAdjBasisActionConfig 已应用因子战法的复权口径基线失效时怎么办（JSON 键 stale_adj_basis_action）：
+	//   - "shadow"（缺省：nil / 空串 / 未知值都落这里）= 只标记 + 告警，照旧参与实盘；
+	//   - "disable" =  fail-close，把基线失效的战法从 enabled 集合里剔除（不再产生新买入信号）。
+	// 为什么默认是 shadow（**这里刻意不做资本行为变更**）：§ADJ 修复后重算实测，fac_1 的四个
+	// 分量里三个的分层能力从 3~4pp 塌到 ≈0 甚至反号（STOA −2.609%→+0.372%），也就是说它的
+	// weights/buy_threshold 已经没有成立的历史依据——但"停掉一条正在跑的战法"是直接改资金行为，
+	// 必须由 owner 看过重跑结果后拍板，不能由一次口径修复顺带替 owner 决定。故本仓只把失效
+	// 状态显性化（战法库红标 + p1 告警），处置权留在 owner 手里。
+	// English: "shadow" (default for nil/empty/unknown) keeps trading and only marks+alerts; "disable"
+	// fail-closes stale entries out of the enabled set. Default stays shadow on purpose: dropping a
+	// live strategy changes capital behaviour and is the owner's call, not a side effect of a data fix.
+	// 用 *string 而非 string：让"配置里没有这一项"与"显式写了 shadow"可区分（本仓 *bool/*string
+	// 可选位的既有约定，见 SignalCtlConfig.ShadowBlacklist）。
+	// 字段名带 Config 后缀：归一化取值走方法 StaleAdjBasisOrDefault()（Go 不允许字段与方法重名，
+	// 2026-09-23 修编译冲突时定的）；JSON 键仍是 stale_adj_basis_action，配置零变化。
+	// English: the raw pointer field is *Config-suffixed because the normalized accessor keeps the plain
+	// concept name; the JSON key (and thus every existing config file) is unchanged.
+	StaleAdjBasisActionConfig *string `json:"stale_adj_basis_action,omitempty"`
+}
+
+// StaleAdjBasisOrDefault 归一化 rules.research.stale_adj_basis_action 的取值。
+// 任何无法识别的值（含未配置）都回退 "shadow"——未知值绝不能变成停战法。
+// 字面量与 internal/research 的 StaleAdjBasisDisable/StaleAdjBasisShadow 保持一致。
+// English: normalizes the config value; unknown/absent always falls back to "shadow" (an unknown
+// string must never be interpreted as "stop trading").
+func (r ResearchConfig) StaleAdjBasisOrDefault() string {
+	if r.StaleAdjBasisActionConfig == nil {
+		return "shadow"
+	}
+	switch strings.TrimSpace(*r.StaleAdjBasisActionConfig) {
+	case "disable":
+		return "disable"
+	case "shadow":
+		return "shadow"
+	default:
+		return "shadow"
+	}
 }
 
 // AppReleaseConfig §APPVER 2026-09-22 C批：APK 版本发布单，经公开端点

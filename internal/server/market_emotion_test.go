@@ -2,7 +2,8 @@
 // 锁死三件事：
 //  1. trade_date 库内 YYYYMMDD 紧凑格式 → API 输出必须归一化为 YYYY-MM-DD（前端 slice(5) 依赖）；
 //  2. days 参数缺省 30 / 非法回落 / 上限 250（回看页一年跨度）；
-//  3. 矩阵端点结构契约：phases 六相位固定序 + min_events=20 样本纪律 + thin 标记。
+//  3. 矩阵端点结构契约：phases 六相位固定序 + min_events=20 样本纪律 + thin 标记；
+//  4. §ADJ-BASIS：矩阵断点必须写在当前复权口径位上（缓存键含 adj_basis，跨口径混装即假统计）。
 //
 // English: emotion panel endpoint tests — compact-vs-ISO date normalization contract,
 // days clamp, and matrix response shape (phase order, min_events thinning).
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
 
@@ -53,12 +55,12 @@ func newEmotionDB(t *testing.T) *store.DB {
 	// 冰点 2 事件（hit_rate 为 0-1 比例口径——链式回测 er.HitRate = wins/n；
 	// 存储粒度 candidate×date×industry，两条须不同行业否则 upsert 互相覆盖）
 	for i, e := range []string{ev(15, 1.0, 0.5), ev(15, 2.0, 0.7)} {
-		if err := db.UpsertBacktestEventResult(cid, "20260907", "测试行业甲"+string(rune('1'+i)), "fp", e); err != nil {
+		if err := db.UpsertBacktestEventResult(cid, "20260907", "测试行业甲"+string(rune('1'+i)), "fp", research.AdjBaselineVersion, e); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// 高潮 1 事件（薄桶）
-	if err := db.UpsertBacktestEventResult(cid, "20260908", "测试行业", "fp-c", ev(120, 3.0, 0.9)); err != nil {
+	if err := db.UpsertBacktestEventResult(cid, "20260908", "测试行业", "fp-c", research.AdjBaselineVersion, ev(120, 3.0, 0.9)); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -120,6 +122,7 @@ func TestEmotionStrategyMatrixShape(t *testing.T) {
 	var resp struct {
 		Phases    []string `json:"phases"`
 		MinEvents int      `json:"min_events"`
+		AdjBasis  string   `json:"adj_basis"`
 		Rows      []struct {
 			CandidateID int64               `json:"candidate_id"`
 			Name        string              `json:"name"`
@@ -131,6 +134,10 @@ func TestEmotionStrategyMatrixShape(t *testing.T) {
 	}
 	if len(resp.Phases) != 6 || resp.MinEvents != store.EmotionMatrixRowMinEvents {
 		t.Fatalf("契约漂移: phases=%v min_events=%d", resp.Phases, resp.MinEvents)
+	}
+	// §ADJ-BASIS 契约：矩阵必须声明自己算在哪个复权口径上（与 research 的单点定义同源）。
+	if resp.AdjBasis != research.AdjBaselineVersion {
+		t.Fatalf("adj_basis 契约漂移: %q != %q", resp.AdjBasis, research.AdjBaselineVersion)
 	}
 	if len(resp.Rows) != 1 || resp.Rows[0].Name != "测试战法甲" {
 		t.Fatalf("应 1 行且展示名取 reason 首行: %+v", resp.Rows)

@@ -31,8 +31,9 @@ func TestRuleExitOverridesLookupAndExit(t *testing.T) {
 			ID: "pat_9", Name: "形态战法#9", Enabled: true,
 			ExitMaxHoldDays: 3,
 		}},
+		nil, // held=nil：本用例只测启用条目的查询与退出，持仓保留语义见 rule_exit_retention_test.go
 	)
-	t.Cleanup(func() { SetRuleExitOverrides(nil, nil) })
+	t.Cleanup(func() { SetRuleExitOverrides(nil, nil, nil) })
 
 	// 按 ID / 显示名（含大小写与空白）均可命中
 	if ov := ruleExitParamsFor("fac_1"); ov == nil || ov.trailPct != 5 || ov.holdDays != 7 {
@@ -87,22 +88,23 @@ func TestRuleExitOverridesLookupAndExit(t *testing.T) {
 }
 
 // TestSetRuleExitOverridesDisabledCleared 校验 SetRuleExitOverrides 的全量重建语义：
-//   - 未启用（Enabled=false）的条目不进入注册表；
+//   - 未启用（Enabled=false）且**无开放持仓**的条目不进入注册表（held=nil 即"无持仓"）；
 //   - 重新调用后旧键被清除（全量重建而非增量合并），仅新列表中的启用条目生效。
+//   - 有持仓时的保留语义见 rule_exit_retention_test.go（§EXIT-RETAIN）。
 func TestSetRuleExitOverridesDisabledCleared(t *testing.T) {
 	SetRuleExitOverrides([]research.AppliedFactorEntry{{ID: "fac_2", Name: "因子战法#2", Enabled: false,
-		ExitTrailPct: 10}}, nil)
+		ExitTrailPct: 10}}, nil, nil)
 	if ruleExitParamsFor("fac_2") != nil {
-		t.Fatal("停用条目不应入表")
+		t.Fatal("停用且无持仓的条目不应入表")
 	}
 	// 全量重建语义：新列表不含旧键 → 旧覆盖清除
 	SetRuleExitOverrides([]research.AppliedFactorEntry{{ID: "fac_3", Name: "因子战法#3", Enabled: true,
-		ExitMaxHoldDays: 9}}, nil)
+		ExitMaxHoldDays: 9}}, nil, nil)
 	if ruleExitParamsFor("fac_2") != nil {
 		t.Fatal("重建后旧键应被清除")
 	}
 	if ruleExitParamsFor("因子战法#3") == nil {
 		t.Fatal("新键应生效")
 	}
-	SetRuleExitOverrides(nil, nil)
+	SetRuleExitOverrides(nil, nil, nil)
 }

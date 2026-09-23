@@ -20,7 +20,7 @@ func insertEventResult(t *testing.T, d *DB, candID int64, date, industry string,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.UpsertBacktestEventResult(candID, date, industry, "fp-test", string(b)); err != nil {
+	if err := d.UpsertBacktestEventResult(candID, date, industry, "fp-test", testAdjBasis, string(b)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -41,7 +41,7 @@ func TestEmotionStrategyMatrixBuckets(t *testing.T) {
 		"20260106": "高潮", "2026-01-06": "高潮",
 		"20260107": "启动", "2026-01-07": "启动",
 	}
-	rows, err := d.ListEmotionStrategyMatrix(phaseByDate, nil)
+	rows, err := d.ListEmotionStrategyMatrix(phaseByDate, nil, testAdjBasis)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestEmotionMatrixFallbackPhase(t *testing.T) {
 			return "发酵"
 		}
 		return ""
-	})
+	}, testAdjBasis)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,11 +106,11 @@ func TestEmotionMatrixFallbackPhase(t *testing.T) {
 // TestEmotionMatrixBadJSONSkipped 脏 result_json（非 JSON/形状不符）跳过不炸整矩阵。
 func TestEmotionMatrixBadJSONSkipped(t *testing.T) {
 	d := testDB(t)
-	if err := d.UpsertBacktestEventResult(1, "20260301", "半导体", "fp", "not-json{{{"); err != nil {
+	if err := d.UpsertBacktestEventResult(1, "20260301", "半导体", "fp", testAdjBasis, "not-json{{{"); err != nil {
 		t.Fatal(err)
 	}
 	insertEventResult(t, d, 1, "20260302", "半导体", map[string]float64{"5": 2}, nil, 80)
-	rows, err := d.ListEmotionStrategyMatrix(map[string]string{"20260302": "退潮"}, nil)
+	rows, err := d.ListEmotionStrategyMatrix(map[string]string{"20260302": "退潮"}, nil, testAdjBasis)
 	if err != nil {
 		t.Fatal(err)
 	}

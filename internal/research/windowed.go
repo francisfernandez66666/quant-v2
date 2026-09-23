@@ -129,8 +129,15 @@ func (p *stageProgress) tick() {
 // of deleting rows. Bump this constant whenever the hfq/raw bar semantics change.
 const AdjBaselineVersion = "hfq-forward-fill-1"
 
+// AdjBasisMarker 口径位在各断点 resume_key 中的实际字面量（"|adj=" + 版本号）。
+// 导出给库外的清理/审计工具用（如 research CLI 的 prune-stale-checkpoints 判"这行是不是
+// 旧口径"）：口径串的拼装只此一处，工具侧不得自己复制字面量。
+// English: the literal basis tag as it appears inside generated resume keys; exported so offline
+// tooling (prune-stale-checkpoints) can classify legacy rows without duplicating the string.
+const AdjBasisMarker = "|adj=" + AdjBaselineVersion
+
 // adjBasisTag 拼进各断点键的口径位（前缀 "|" 由各 key 模板自行决定位置）。
-var adjBasisTag = "|adj=" + AdjBaselineVersion
+var adjBasisTag = AdjBasisMarker
 
 // discoveryResumeKey 断点键：任何影响结果的参数（区间/前瞻/最小样本/窗口宽/因子池/股票池/**复权口径**）
 // 变更都会生成新 key，旧缓存自动失效。English: checkpoint key — any result-affecting change rolls a fresh key.

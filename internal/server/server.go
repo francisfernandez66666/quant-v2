@@ -253,6 +253,12 @@ type EngineRegistry interface {
 	// TriggerPositionReview §DAILY_REVIEW 手动触发指定账号的盘后持仓 LLM 复盘，返回成功复盘的股票数。
 	// English: force-runs the §DAILY_REVIEW after-hours LLM position review for one account; returns count.
 	TriggerPositionReview(userID string) (int, error)
+	// OpenPositionStrategyCounts §EXIT-RETAIN 当前开放持仓按策略键（持仓 Strategy 原文，=规则 ID
+	// 或显示名）计数：实盘账本 ∪ 全部账号模拟盘账本，一笔持仓只记一个键。战法库端点用它给每条
+	// 战法标 open_positions，让操作员在点「停用」前就看到"这条还有几笔仓"。
+	// English: open positions counted by strategy key (live book ∪ every account's paper book), one key
+	// per position; the library payload surfaces it as open_positions.
+	OpenPositionStrategyCounts() combat_agent.HeldStrategyKeys
 }
 
 // SetEngineRegistry 设置多账号引擎注册表（懒加载/按配置指纹共享）。

@@ -1,4 +1,9 @@
 // 研究候选应用（B5）：审批通过的权重候选写入 applied_rules.json，供战法消费。
+// §ADJ-BASIS-2（2026-09-23）：因子战法条目落盘时盖"复权口径版本"戳，载入时据此判 stale 并喂
+// 指标面（applied_factor_stale_basis_count → p1 告警）；处置动作由 rules.research.stale_adj_basis_action
+// 决定（缺省 shadow = 只标记告警、不停投）。
+// English: stamps the adjustment basis on apply, classifies staleness on load and feeds the alert
+// gauge; disposition is config-driven and defaults to shadow (mark + alert only).
 package research
 
 import (
@@ -7,12 +12,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"quant-trading-v2/internal/metrics"
 	"quant-trading-v2/internal/store"
 	factorstrat "quant-trading-v2/internal/strategies/factor"
 	patternstrat "quant-trading-v2/internal/strategies/pattern"
@@ -95,6 +103,126 @@ type AppliedFactorEntry struct {
 	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`     // 移动止盈比例
 	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"` // 止损比例
 	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"` // 最大持仓天数
+
+	// §ADJ-BASIS-2（2026-09-23）应用时使用的复权取数口径版本（写入即盖章）。
+	// 值 = AdjBaselineVersion（见 windowed.go）。**空串表示本字段上线前写入的旧条目**：
+	// 它是在 §ADJ 修复（HfqBars 前向填充因子）之前的错误面板上拟合出来的，
+	// 因此按 stale 处理（见 StaleAdjBasis）——我们不回填、不改写历史文件，只如实标注。
+	// English: adjustment-basis stamp written at apply time; empty = pre-fix legacy entry, treated as stale.
+	AdjBasis string `json:"adj_basis,omitempty"`
+	// StaleAdjBasis 载入时算出的派生标记（**不落盘**）：AdjBasis != AdjBaselineVersion 即为真。
+	// 只用于战法库展示与告警口径，本身不改变实盘行为（是否停投由 rules.research.stale_adj_basis_action 决定）。
+	// English: derived-at-load flag (never persisted) — true when the stamped basis is not current.
+	StaleAdjBasis bool `json:"-"`
+}
+
+// 复权基线失效战法的两种处置动作（config rules.research.stale_adj_basis_action 的字面量）。
+// English: the two dispositions for strategies whose adjustment basis went stale.
+const (
+	// StaleAdjBasisShadow 只标记 + 告警，照旧参与实盘（缺省）。
+	StaleAdjBasisShadow = "shadow"
+	// StaleAdjBasisDisable fail-close：把失效战法从 enabled 集合剔除，不再产生新买入信号。
+	StaleAdjBasisDisable = "disable"
+)
+
+// staleAdjAction/staleAdjActionFn 进程级处置策略（由启动装配注入，见 cmd/quant/main.go）。
+// 之所以是包级状态而不是把 cfg 一路穿进 LoadEnabledFactorRules：调用链有三处
+// （engine registry / combat_agent.ReloadFactorRules / server 热重载与资金池重建），后两处签名
+// 不带 config，且 ReloadFactorRules 还实现了 server 侧的接口——穿参会波及一整条热重载接口链。
+// 缺省 shadow ⇒ 未注入（单测、独立进程）时行为与修复前完全一致，不存在"忘了接线就停战法"。
+// English: process-wide disposition injected at startup; default shadow keeps behavior identical to
+// pre-change when nobody wires config (tests / standalone processes).
+var (
+	staleAdjMu       sync.RWMutex
+	staleAdjAction   = StaleAdjBasisShadow
+	staleAdjActionFn func() string // 可选活取值回调（config 热重载后，下一轮读库即生效）
+)
+
+// normalizeStaleAdjBasisAction 归一：只有显式 "disable" 才 fail-close，其余（含未知值）一律 shadow。
+// 未知值绝不能被解释成"停战法"——那等于让一个拼写错误改变资本行为。
+// English: only an explicit "disable" fail-closes; anything else (including typos) stays shadow.
+func normalizeStaleAdjBasisAction(action string) string {
+	if strings.TrimSpace(action) == StaleAdjBasisDisable {
+		return StaleAdjBasisDisable
+	}
+	return StaleAdjBasisShadow
+}
+
+// ConfigureStaleAdjBasisAction 注入处置策略（"shadow"/"disable"；未知值归一为 shadow），
+// 并清掉活取值回调。返回归一化后的实际生效值，便于启动日志记录。
+// English: injects the disposition (unknown → shadow) and clears the live getter; returns the
+// effective value for startup logging.
+func ConfigureStaleAdjBasisAction(action string) string {
+	eff := normalizeStaleAdjBasisAction(action)
+	staleAdjMu.Lock()
+	staleAdjAction = eff
+	staleAdjActionFn = nil
+	staleAdjMu.Unlock()
+	return eff
+}
+
+// ConfigureStaleAdjBasisActionFunc 注入**活**取值回调（启动装配用：闭包读 cfgMgr 快照，
+// 使 rules.research.stale_adj_basis_action 在 config 热重载后的下一轮读库自然生效，无需重启）。
+// 传 nil 退回 ConfigureStaleAdjBasisAction 设置的静态值。
+// English: injects a live getter so a hot-reloaded config value takes effect on the next library
+// read without a restart; nil falls back to the statically configured value.
+func ConfigureStaleAdjBasisActionFunc(fn func() string) {
+	staleAdjMu.Lock()
+	staleAdjActionFn = fn
+	staleAdjMu.Unlock()
+}
+
+// StaleAdjBasisAction 当前生效的处置策略（缺省 shadow）。
+// English: current effective disposition (defaults to shadow).
+func StaleAdjBasisAction() string {
+	staleAdjMu.RLock()
+	fn := staleAdjActionFn
+	fallback := staleAdjAction
+	staleAdjMu.RUnlock()
+	if fn == nil {
+		return fallback
+	}
+	return normalizeStaleAdjBasisAction(fn())
+}
+
+// IsAdjBasisStale 单条目口径判定：非当前基线（含空戳的旧条目）一律 stale。
+// English: an entry is stale unless its stamp equals the current basis (empty/legacy counts as stale).
+func IsAdjBasisStale(adjBasis string) bool { return adjBasis != AdjBaselineVersion }
+
+// markStaleAdjBasis 载入后统一打派生标记，并把失效条数写进指标面（量规 + p1 告警的数据源）。
+// 每次读库都是赋值点：启动装配（server.ActivePaperPoolTypes）、引擎按账号装配、审批热重载、
+// 战法库 GET 轮询都会走这里；"没有库"的早退分支同样写 0，不留残值——
+// 不会留下"有规则、无赋值"的死规则形态（§DEADGAUGE）。
+// English: marks each loaded entry stale/fresh and feeds the staleness gauge — startup assembly,
+// per-account engine build, hot reload and the library GET all assign it; the "no library" paths
+// write zero instead of keeping a stale residual.
+func markStaleAdjBasis(entries []AppliedFactorEntry) []AppliedFactorEntry {
+	stale := 0
+	for i := range entries {
+		entries[i].StaleAdjBasis = IsAdjBasisStale(entries[i].AdjBasis)
+		if entries[i].StaleAdjBasis {
+			stale++
+		}
+	}
+	metrics.SetGauge("applied_factor_stale_basis_count", int64(stale))
+	return entries
+}
+
+// markStaleAdjBasisPatterns 形态侧同源处理（§ADJ-BASIS-2P）：打派生标记 + 写**自己的**量规。
+// 刻意与因子侧分列两个 gauge：两侧读库时机不同（引擎按账号装配、审批热重载、战法库 GET 轮询），
+// 合并成一个计数会让"后读的一侧"把另一侧的真值盖掉——那是 §DEADGAUGE 那类"指标在但值失真"的形态。
+// English: pattern-side twin of markStaleAdjBasis, with its OWN gauge — merging the two counters
+// would let whichever library is read last overwrite the other's true value.
+func markStaleAdjBasisPatterns(entries []AppliedPatternEntry) []AppliedPatternEntry {
+	stale := 0
+	for i := range entries {
+		entries[i].StaleAdjBasis = IsAdjBasisStale(entries[i].AdjBasis)
+		if entries[i].StaleAdjBasis {
+			stale++
+		}
+	}
+	metrics.SetGauge("applied_pattern_stale_basis_count", int64(stale))
+	return entries
 }
 
 // ApplyFactorRule 把审批通过的 factor 候选**追加**写入战法库 applied_factors.json（多战法共存），
@@ -127,6 +255,11 @@ func ApplyFactorRule(dataDir string, c *store.Candidate) error {
 		Horizon:      c.Horizon,
 		IR:           c.IR,
 		Excess:       c.AvgExcess,
+		// §ADJ-BASIS-2 落盘盖章：这条战法的 weights/buy_threshold 是在**当前**复权口径的面板上
+		// 拟合出来的。以后 store.HfqBars/RawBars 的取数语义再变（bump AdjBaselineVersion），
+		// 本条目就会被载入侧判为 stale——与断点键的口径位同源，同一个常量兜住两处。
+		// English: stamp the basis this rule was fitted on, so a future basis bump marks it stale.
+		AdjBasis: AdjBaselineVersion,
 	}
 	if entry.BuyThreshold <= 0 {
 		entry.BuyThreshold = 70
@@ -136,30 +269,34 @@ func ApplyFactorRule(dataDir string, c *store.Candidate) error {
 
 // ListAppliedFactorRules 读取战法库 applied_factors.json，返回全部已应用因子战法（含禁用）。
 // 兼容旧版单对象格式（自动迁移为列表）。文件缺失返回空列表。
+// §ADJ-BASIS-2：任何返回路径都会刷新 stale 标记与失效计数（含"没有库"的早退分支——不写零就是
+// 拿上一轮残值冒充当前状态，§DEADGAUGE 负锁③同族）。
 // English: reads the strategy library applied_factors.json and returns all applied factor strategies
 // (including disabled). Migrates the legacy single-object format to a list. Missing file → empty list.
+// Every return path refreshes the stale marks and the staleness gauge (including "no library").
 func ListAppliedFactorRules(dataDir string) ([]AppliedFactorEntry, error) {
 	if dataDir == "" {
-		return nil, nil
+		return markStaleAdjBasis(nil), nil
 	}
 	path := filepath.Join(dataDir, "applied_factors.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return markStaleAdjBasis(nil), nil
 		}
 		return nil, err
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return nil, nil
+		return markStaleAdjBasis(nil), nil
 	}
 	if trimmed[0] == '[' {
 		var entries []AppliedFactorEntry
 		if err := json.Unmarshal(raw, &entries); err != nil {
 			return nil, err
 		}
-		return entries, nil
+		// §ADJ-BASIS-2 载入即打 stale 派生标记（并刷新失效计数指标）。
+		return markStaleAdjBasis(entries), nil
 	}
 	// 旧版单对象 → 迁移为列表
 	var legacy FactorRule
@@ -167,24 +304,27 @@ func ListAppliedFactorRules(dataDir string) ([]AppliedFactorEntry, error) {
 		return nil, err
 	}
 	if len(legacy.Factors) == 0 {
-		return nil, nil
+		return markStaleAdjBasis(nil), nil
 	}
 	entry := AppliedFactorEntry{
 		ID: "fac_legacy", Name: "因子战法(旧)", Enabled: true,
 		Factors: legacy.Factors, Weights: legacy.Weights, Directions: legacy.Directions,
 		BuyThreshold: legacy.BuyThreshold, Horizon: legacy.Horizon, IR: legacy.IR, Excess: legacy.Excess,
 		AppliedAt: time.Now().Format("2006-01-02 15:04:05"),
+		// AdjBasis 故意留空：旧库文件没有任何口径信息，无法证明它是在当前基线上拟合的 ⇒ 判 stale。
 	}
 	if entry.BuyThreshold <= 0 {
 		entry.BuyThreshold = 70
 	}
 	_ = saveAppliedFactors(dataDir, []AppliedFactorEntry{entry}) // 落盘迁移
-	return []AppliedFactorEntry{entry}, nil
+	return markStaleAdjBasis([]AppliedFactorEntry{entry}), nil
 }
 
 // LoadAppliedFactorRule 读取战法库中第一条**启用**的因子战法（兼容旧版单规则调用方）。
+// §ADJ-BASIS-2：stale 条目是否可用与 LoadEnabledFactorRules 同判据（disable 模式下同样跳过），
+// 否则 fail-close 会从这个兼容入口漏出去。
 // English: loads the first **enabled** factor strategy from the library (back-compat for callers
-// expecting a single rule). Returns nil when none enabled.
+// expecting a single rule). Returns nil when none usable under the current stale-basis policy.
 func LoadAppliedFactorRule(dataDir string) (*FactorRule, error) {
 	entries, err := ListAppliedFactorRules(dataDir)
 	if err != nil {
@@ -192,6 +332,9 @@ func LoadAppliedFactorRule(dataDir string) (*FactorRule, error) {
 	}
 	for _, e := range entries {
 		if !e.Enabled || len(e.Factors) == 0 {
+			continue
+		}
+		if StaleAdjBasisAction() == StaleAdjBasisDisable && e.StaleAdjBasis {
 			continue
 		}
 		return &FactorRule{
@@ -204,15 +347,28 @@ func LoadAppliedFactorRule(dataDir string) (*FactorRule, error) {
 
 // LoadEnabledFactorRules 读取战法库中全部**启用**的因子战法规则，转为引擎 ActiveRule 供注入。
 // 依赖 strategies/factor 的 ActiveRule 类型；为避免循环依赖，由调用方包（combat_agent）实现转换，
-// 这里返回通用结构。English: returns all **enabled** factor rules as ActiveRule for engine injection.
+// 这里返回通用结构。
+// §ADJ-BASIS-2 基线失效战法的取舍（**唯一的实盘行为开关点**）：
+//   - shadow（缺省）：stale 条目照常注入，只在战法库红标 + p1 告警——修口径这件事不该顺带把钱撤了；
+//   - disable：fail-close，stale 条目不进 enabled 集合（不再产生新买入信号，已持仓的出场链不受影响）。
+//     注意：owner 重跑寻优+审批后条目会带上新戳（AdjBasis=当前基线），自动回到 enabled 集合。
+//
+// English: returns all **enabled** factor rules for engine injection. Under the default "shadow"
+// policy stale entries keep trading (mark + alert only); "disable" fail-closes them out.
 func LoadEnabledFactorRules(dataDir string) ([]*factorstrat.ActiveRule, error) {
 	entries, err := ListAppliedFactorRules(dataDir)
 	if err != nil {
 		return nil, err
 	}
+	failClose := StaleAdjBasisAction() == StaleAdjBasisDisable
 	var out []*factorstrat.ActiveRule
 	for _, e := range entries {
 		if !e.Enabled || len(e.Factors) == 0 {
+			continue
+		}
+		if failClose && e.StaleAdjBasis {
+			log.Printf("[research] §ADJ-BASIS-2 战法 %s(%s) 复权基线已失效，stale_adj_basis_action=disable → 不注入实盘",
+				e.ID, e.Name)
 			continue
 		}
 		out = append(out, &factorstrat.ActiveRule{
@@ -375,6 +531,15 @@ type AppliedPatternEntry struct {
 	ExitTrailPct    float64 `json:"exit_trail_pct,omitempty"`     // 移动止盈比例
 	ExitStopLossPct float64 `json:"exit_stop_loss_pct,omitempty"` // 止损比例
 	ExitMaxHoldDays int     `json:"exit_max_hold_days,omitempty"` // 最大持仓天数
+
+	// §ADJ-BASIS-2P（2026-09-23）与因子侧对称的复权基线戳：**形态战法同样按 CloseHfq 打分**。
+	// Conds 里的条件因子（动量/波动/价位类）全都跑在复权价上，旧条目一样是"参数缺历史依据"。
+	// 空串=本字段上线前写入的旧条目 → 判 stale（不回填、不改写历史文件，只如实标注）。
+	// English: pattern entries are fitted on the same adjusted-close basis, so they carry the
+	// identical stamp; empty = legacy entry treated as stale.
+	AdjBasis string `json:"adj_basis,omitempty"`
+	// StaleAdjBasis 载入时算出的派生标记（**不落盘**）：AdjBasis != AdjBaselineVersion 即为真。
+	StaleAdjBasis bool `json:"-"`
 }
 
 // ApplyPatternRule 把审批通过的 pattern 候选**追加**写入战法库 applied_patterns.json（多形态共存，按候选 ID 幂等）。
@@ -393,6 +558,8 @@ func ApplyPatternRule(dataDir string, c *store.Candidate) error {
 		Enabled: true, CandID: c.ID,
 		AppliedAt: time.Now().Format("2006-01-02 15:04:05"),
 		Conds:     conds,
+		// §ADJ-BASIS-2P 写入即盖章（与因子侧 ApplyFactorRule 同源）：不盖章的条目一进库就被判 stale。
+		AdjBasis: AdjBaselineVersion,
 	}
 	return appendAppliedPattern(dataDir, entry)
 }
@@ -402,26 +569,27 @@ func ApplyPatternRule(dataDir string, c *store.Candidate) error {
 // single-object format to a list; returns all (including disabled).
 func ListAppliedPatternRules(dataDir string) ([]AppliedPatternEntry, error) {
 	if dataDir == "" {
-		return nil, nil
+		return markStaleAdjBasisPatterns(nil), nil
 	}
 	path := filepath.Join(dataDir, "applied_patterns.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return markStaleAdjBasisPatterns(nil), nil
 		}
 		return nil, err
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return nil, nil
+		return markStaleAdjBasisPatterns(nil), nil
 	}
 	if trimmed[0] == '[' {
 		var entries []AppliedPatternEntry
 		if err := json.Unmarshal(raw, &entries); err != nil {
 			return nil, err
 		}
-		return entries, nil
+		// §ADJ-BASIS-2P 载入即打 stale 派生标记（并刷新形态侧失效计数指标）。
+		return markStaleAdjBasisPatterns(entries), nil
 	}
 	// 旧版单对象 → 迁移
 	var legacy AppliedPatternRule
@@ -429,16 +597,17 @@ func ListAppliedPatternRules(dataDir string) ([]AppliedPatternEntry, error) {
 		return nil, err
 	}
 	if len(legacy.Conds) == 0 {
-		return nil, nil
+		return markStaleAdjBasisPatterns(nil), nil
 	}
 	name := legacy.Name
 	if name == "" {
 		name = "自动形态"
 	}
+	// §ADJ-BASIS-2P 与因子侧同规：旧库文件没有任何口径信息，无法证明它在当前基线上拟合 ⇒ 不写戳（判 stale）。
 	entry := AppliedPatternEntry{ID: "pat_legacy", Name: name, Enabled: true, Conds: legacy.Conds,
 		AppliedAt: time.Now().Format("2006-01-02 15:04:05")}
 	_ = saveAppliedPatterns(dataDir, []AppliedPatternEntry{entry})
-	return []AppliedPatternEntry{entry}, nil
+	return markStaleAdjBasisPatterns([]AppliedPatternEntry{entry}), nil
 }
 
 // LoadAppliedPatternRule 读取战法库第一条**启用**的形态战法（兼容旧版单规则调用方）。
@@ -465,8 +634,17 @@ func LoadEnabledPatternRules(dataDir string) ([]*patternstrat.ActivePattern, err
 		return nil, err
 	}
 	var out []*patternstrat.ActivePattern
+	// §ADJ-BASIS-2P 与因子侧同一处置策略（rules.research.stale_adj_basis_action）：形态条件因子
+	// 全跑在复权价上，旧口径拟合出来的阈值同样"参数缺历史依据"。缺省 shadow 只标不撤；
+	// disable 时只切断**新买入信号**，名下已持仓的出场参数由 §EXIT-RETAIN 按持仓保留。
+	failClose := StaleAdjBasisAction() == StaleAdjBasisDisable
 	for _, e := range entries {
 		if !e.Enabled || len(e.Conds) == 0 {
+			continue
+		}
+		if failClose && e.StaleAdjBasis {
+			log.Printf("[research] §ADJ-BASIS-2P 形态战法 %s(%s) 复权基线已失效，stale_adj_basis_action=disable → 不注入实盘",
+				e.ID, e.Name)
 			continue
 		}
 		conds := make([]patternstrat.Cond, len(e.Conds))

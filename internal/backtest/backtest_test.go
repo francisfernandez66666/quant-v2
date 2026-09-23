@@ -5,6 +5,7 @@ import (
 	"math"
 	"testing"
 
+	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
 
@@ -217,6 +218,65 @@ func TestRunChain(t *testing.T) {
 	}
 	if !bytesContains(html, []byte("全链路回测报告")) {
 		t.Fatal("HTML 缺标题")
+	}
+}
+
+// TestChainCheckpointCarriesAdjBasis §ADJ-BASIS（2026-09-23）候选断点缓存必须带当前复权口径位。
+// 锁的是"链 ↔ 存储层"的接线：store 侧只认调用方传进来的口径串，而串单点定义在
+// research.AdjBaselineVersion（本包能 import research，store 不能）。断三件事：
+//  1. 落库的每一行 adj_basis 都 == 当前口径（既不是改前哨兵 ”，也不是别的口径）；
+//  2. 同参重跑逐事件命中缓存（行数不增、报告一致）——口径进键没把命中路径写坏；
+//  3. 换一个口径串读同一批键全部未命中（数值口径变了就必须重算）。
+func TestChainCheckpointCarriesAdjBasis(t *testing.T) {
+	db := seedBT(t)
+	cid, err := db.SaveCandidate(&store.Candidate{Kind: "factor", Factors: "[]", Weights: "{}", Reason: "口径接线测试"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultOptions()
+	opts.Start, opts.End = "20230103", "20230109"
+	opts.Rule.TopK, opts.Rule.MinStocks = 2, 3
+	opts.CandidateID = cid
+
+	rep1, err := Run(db, opts)
+	if err != nil {
+		t.Fatalf("首轮回测失败: %v", err)
+	}
+	if rep1.TotalEvents == 0 {
+		t.Fatal("期望有事件")
+	}
+	rows, err := db.QueryRows(`SELECT COUNT(*) AS n FROM backtest_event_results WHERE candidate_id=? AND adj_basis=?`,
+		cid, research.AdjBaselineVersion)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("统计当前口径断点失败: err=%v rows=%v", err, rows)
+	}
+	n, _ := rows[0]["n"].(int64)
+	if n == 0 {
+		t.Fatalf("当前口径（%s）下一条断点都没有——链没把口径位传给 store", research.AdjBaselineVersion)
+	}
+	// 除当前口径外一行都不许有（尤其不得再写 adj_basis=''）
+	if other, err := db.QueryRows(`SELECT COUNT(*) AS n FROM backtest_event_results WHERE candidate_id=? AND adj_basis <> ?`,
+		cid, research.AdjBaselineVersion); err != nil || len(other) != 1 {
+		t.Fatalf("统计非当前口径断点失败: err=%v", err)
+	} else if m, _ := other[0]["n"].(int64); m != 0 {
+		t.Fatalf("写了 %d 条非当前口径断点行（口径串漂移）", m)
+	}
+	// 换一个口径串：一条都读不到
+	if _, ok, err := db.GetBacktestEventResult(cid, rep1.Events[0].Date, rep1.Events[0].Industry,
+		opts.Rule.Fingerprint(), "some-other-basis"); err != nil || ok {
+		t.Fatalf("别的口径读到了当前口径的缓存: ok=%v err=%v", ok, err)
+	}
+	// 同参重跑：全部命中缓存，报告一致且不产生重复行
+	rep2, err := Run(db, opts)
+	if err != nil {
+		t.Fatalf("次轮回测失败: %v", err)
+	}
+	if rep2.TotalEvents != rep1.TotalEvents || rep2.TotalPicks != rep1.TotalPicks {
+		t.Fatalf("重跑报告不一致: %d/%d vs %d/%d", rep2.TotalEvents, rep2.TotalPicks, rep1.TotalEvents, rep1.TotalPicks)
+	}
+	rows2, _ := db.QueryRows(`SELECT COUNT(*) AS n FROM backtest_event_results WHERE candidate_id=?`, cid)
+	if n2, _ := rows2[0]["n"].(int64); n2 != n {
+		t.Fatalf("重跑产生重复缓存行: %d → %d", n, n2)
 	}
 }
 
