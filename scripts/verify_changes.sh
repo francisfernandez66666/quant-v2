@@ -1632,6 +1632,14 @@ grep -qE '\$Lk = Join-Path \$SnapDir "\.backup\.lock"' scripts/verify_deploy_gua
 	|| { echo "--- FAIL: 探针端锁文件路径与脚本不再同源"; exit 1; }
 grep -qF 'backup:single-writer lock' scripts/verify_deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 第 18 单写者探针丢失"; exit 1; }
+# 探针必须同时看得见"认锁的跑批"和"不认锁的孤儿进程"——只看锁文件就等于继续看不见 09-23 那类孤儿。
+# （模式不以 - 开头：`grep -qF "-match ..."` 会被 BSD grep 当成选项，报 Invalid argument 直接红。）
+grep -qF 'writers += 1' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 18 探针不再按命令行统计快照进程数（只剩锁文件视野）"; exit 1; }
+grep -qF 'if ($writers -ge 2)' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 18 探针丢失 writers>=2 判据（两份快照互相覆盖看不见）"; exit 1; }
+grep -qF 'writer without lock (unguarded run)' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 18 探针丢失「不认锁的进程」判据（09-23 那类孤儿复犯将无信号）"; exit 1; }
 # ② 接管龄上界等值：脚本用分钟（$LockMaxMin），探针用小时，换算后必须相等。
 lockMin=$(grep -oE '\$LockMaxMin = [0-9]+' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1)
 probeH=$(grep -oE 'if \(\$lkAgeH -ge [0-9]+\)' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1)
@@ -1654,7 +1662,7 @@ if grep -qE '^\s*finally\s*\{' deploy/qmt-win/backup_snapshot.ps1; then
 # ⑤ 负锁：调用方那道"看任务状态再触发"的假守卫不得复活（GBK 回传 + 看不见非任务入口）。
 if grep -qF 'schtasks /Query /TN quant-backup-snap /FO LIST' scripts/deploy_guangzhou.sh; then
 	echo "--- FAIL: 部署步重新用 schtasks 状态做触发前守卫（中文状态 grep 恒不命中=假守卫）"; exit 1; fi
-echo "ok - §SNAP-LOCK 守卫通过（同源锁 2 + 龄上界等值锁 1 + 释锁锁 2 + 负锁 2）"
+echo "ok - §SNAP-LOCK 守卫通过（同源锁 2 + 探针视野锁 3 + 龄上界等值锁 1 + 释锁锁 2 + 负锁 2）"
 
 echo ""
 echo "==> 全部通过"

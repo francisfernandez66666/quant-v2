@@ -312,7 +312,20 @@ if (Test-Path $Lk) {
     if ($lkAgeH -ge 6) { $lkMissing += ("lock age " + $lkAgeH + "h >= 6h (a run died mid-way)") }
     $lkTxt = $lkTxt.Trim() + " age_h=" + $lkAgeH
 }
-Probe "backup:single-writer lock" ($lkMissing.Count -eq 0) ("lock=" + $lkTxt + " miss=" + ($lkMissing -join ","))
+# 数一下"到底有几个快照进程在跑"：锁文件只看得见**认锁**的跑批，看不见旧版脚本/交互直跑留下的
+# 孤儿（09-23 就是它撞掉了 restic）。命令行匹配 backup_snapshot.ps1 才算，verify_probes.ps1 自身
+# 不在其列。writers>=2 = 正在互相覆盖；writers>=1 而无锁 = 有个不认锁的进程在跑（锁保护不到它）。
+$writers = 0
+try {
+    $procList = Get-CimInstance -ClassName Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue
+    foreach ($pr in $procList) {
+        $cl = [string]$pr.CommandLine
+        if ($cl -match 'backup_snapshot\.ps1') { $writers += 1 }
+    }
+} catch { $writers = -1 }
+if ($writers -ge 2) { $lkMissing += ("writers=" + $writers) }
+if ($writers -eq 1 -and -not (Test-Path $Lk)) { $lkMissing += "writer without lock (unguarded run)" }
+Probe "backup:single-writer lock" ($lkMissing.Count -eq 0) ("lock=" + $lkTxt + " writers=" + $writers + " miss=" + ($lkMissing -join ","))
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
