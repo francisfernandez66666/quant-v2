@@ -1988,5 +1988,52 @@ if grep -qE 'fs.String\("out", "\./' cmd/research/survey.go; then
 	echo "--- FAIL: --out 缺省又回到仓库相对路径"; exit 1; fi
 echo "ok - §SURVEY 守卫通过（尺子锁 3 + 盲区锁 3 + 落点锁 3 + 负锁 1）"
 
+# ── 80. §PICKILL-SCOPE UAT 自举的兜底 kill 只圈本项目拉起的进程 ──
+# 现象（2026-09-23 实测误伤）：`uat_bootstrap.sh stop` 的兜底 `pkill -f "quant.*QUANT_ADDR=:18080"`
+#       杀掉了同机另一份 checkout（quant-binance）的 UAT 引擎。
+# 根因：macOS 的 pkill/pgrep -f 把**进程环境变量一并计入匹配串**（`pgrep -fl` 输出里命令行后拖着整段 env 即证），
+#       于是"端口名"成了跨项目的通配；两台机器共用 18080 端口约定 ⇒ 一条 stop 停掉别人的栈，
+#       对方的守护拉起再把本方刚起的引擎踢死 ⇒ 本方表现为"引擎未就绪（/setup 非 200）"的假故障。
+# 前置：kill 判据必须含数据目录绝对路径（$PIDDIR 由 $DATA_DIR 派生，checkout 间天然不同），
+#       且不能再按 env 里的端口名匹配。
+if ! grep -qF 'pkill -f -- "$PIDDIR/quant"' scripts/uat_bootstrap.sh; then
+	echo "--- FAIL: 兜底 kill 不再按本项目二进制绝对路径匹配（跨项目误伤的入口）"; exit 1; fi
+if ! grep -qF 'pkill -f -- "$PIDDIR/qmt-mock"' scripts/uat_bootstrap.sh; then
+	echo "--- FAIL: 假柜台的兜底 kill 缺失（只清引擎会留下占端口的 mock）"; exit 1; fi
+# §VITE-ORPHAN：pid 记的是 npx 外壳，真占端口的 node(.bin/vite) 会活下来让下次 --strictPort 失败。
+if ! grep -qF 'pkill -f -- "$ROOT/web/node_modules/\.bin/vite --port ${FRONT_PORT}' scripts/uat_bootstrap.sh; then
+	echo "--- FAIL: vite 子进程兜底 kill 缺失（stop 后再 up 会卡在端口占用）"; exit 1; fi
+# 负锁：端口名/env 形式的匹配串不得复活。只判**真正执行的 pkill 行**（行首无 #），
+# 否则"描述旧写法为何危险"的注释本身会被这条锁打死（§静态负锁自伤形态）。
+if grep -E '^[[:space:]]*pkill' scripts/uat_bootstrap.sh | grep -q 'QUANT_ADDR'; then
+	echo "--- FAIL: pkill 又按 env 端口名匹配（会在任意 checkout 间互杀）"; exit 1; fi
+echo "ok - §PICKILL-SCOPE 守卫通过（同源路径锁 3 + env 匹配负锁 1）"
+
+# ── 81. §UAT-PORTS e2e 打的是"本次自举的那套栈"，不是同机任意一套 ──
+# 现象（2026-09-23）：同机并存第二份 checkout（quant-binance）已占 18080/18789，本项目自举只能挪端口；
+#       而 spec 里硬编 http://127.0.0.1:18789 + 「连不上 mock 就 skip」⇒ L1-2/QS-2 打到**别人那套 mock**
+#       上拿到 200 照样绿（QS-2 首跑即为此形态）。断言的对象都不是本仓库代码。
+# 前置：mock 地址单一来源 = E2E_MOCK_URL（自举脚本与 CI 各自导出）；且"传了该变量=跑在自举栈上"
+#       时连不上必须判红，软跳过只留给外部部署场景。
+grep -qF 'const MOCK_URL = process.env.E2E_MOCK_URL' web/e2e/uat_full.spec.mjs \
+	|| { echo "--- FAIL: mock 地址不再单源自 E2E_MOCK_URL"; exit 1; }
+grep -qF 'function mockUnavailableOrFail' web/e2e/uat_full.spec.mjs \
+	|| { echo "--- FAIL: mock 不可达的两种口径（自举=红／外部=skip）没有收在一处"; exit 1; }
+grep -qF 'if (!resp) mockUnavailableOrFail(lastErr)' web/e2e/uat_full.spec.mjs \
+	|| { echo "--- FAIL: 至少一处用例未接上 mockUnavailableOrFail"; exit 1; }
+grep -qF 'export E2E_MOCK_URL=http://127.0.0.1:${MOCK_PORT}' scripts/uat_bootstrap.sh \
+	|| { echo "--- FAIL: 自举脚本不再按本次 MOCK_PORT 导出 E2E_MOCK_URL（spec 会退回默认口）"; exit 1; }
+grep -qF 'E2E_MOCK_URL="http://127.0.0.1:${MOCK_PORT}"' scripts/uat_bootstrap.sh \
+	|| { echo "--- FAIL: run 模式未把 E2E_MOCK_URL 传给 playwright"; exit 1; }
+grep -qF 'E2E_MOCK_URL: http://127.0.0.1:18789' .github/workflows/nightly-e2e.yml \
+	|| { echo "--- FAIL: CI 未导出 E2E_MOCK_URL（CI 本来就要求零 skip，软跳过在这里该失效）"; exit 1; }
+# 负锁①：不得再有直连硬编端口的请求/断言字面量（注释里描述历史形态不在此列 ⇒ 只查调用式）。
+if grep -qE "request\.get\('[^']*18789|toContainText\('127\.0\.0\.1:18789" web/e2e/uat_full.spec.mjs; then
+	echo "--- FAIL: spec 里又出现硬编 18789 的调用"; exit 1; fi
+# 负锁②：`test.skip(!resp...)` 的无条件软跳过不得复活（它会连"栈根本没起来"一起洗白）。
+if grep -q 'test.skip(!resp' web/e2e/uat_full.spec.mjs; then
+	echo "--- FAIL: 复活了无条件 skip(!resp)"; exit 1; fi
+echo "ok - §UAT-PORTS 守卫通过（单源锁 1 + 口径锁 2 + 导出锁 3 + 负锁 2）"
+
 echo ""
 echo "==> 全部通过"

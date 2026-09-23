@@ -54,8 +54,17 @@ if [[ "$MODE" == "stop" ]]; then
       rm -f "$pf"
     fi
   done
-  # 兜底：清掉可能残留、占用本脚本端口的实例
-  pkill -f "quant.*QUANT_ADDR=:${BACKEND_PORT}" 2>/dev/null || true
+  # 兜底：清掉可能残留、占用本脚本端口的实例。
+  # §PICKILL-SCOPE（2026-09-23 实测误伤）：macOS 的 `pkill -f` 把**环境变量一并计入匹配串**
+  # （同机 `pgrep -fl` 输出里命令行后面拖着整段 env 即证），旧写法 `-f "quant.*QUANT_ADDR=:${BACKEND_PORT}"`
+  # 会命中**任意一份其它 checkout** 中端口相同的引擎——本机另一项目 quant-binance 的引擎即被这样停掉过。
+  # 现改按"本项目数据目录下的二进制绝对路径"匹配：路径含 DATA_DIR，天然只圈住自己拉起的进程。
+  # §VITE-ORPHAN：记录的 vite.pid 是 `npx` 包装进程，kill 它只杀掉外壳，真正占端口的
+  # node（web/node_modules/.bin/vite）会存活并让下一次 --strictPort 自举直接失败。
+  # 按"本仓库绝对路径 + 本次前端端口"精确匹配补杀，仍然只圈自己拉起的进程（见 §PICKILL-SCOPE）。
+  pkill -f -- "$ROOT/web/node_modules/\.bin/vite --port ${FRONT_PORT}( |$)" 2>/dev/null || true
+  pkill -f -- "$PIDDIR/quant" 2>/dev/null || true
+  pkill -f -- "$PIDDIR/qmt-mock" 2>/dev/null || true
   exit 0
 fi
 
@@ -69,6 +78,11 @@ if [[ "$MODE" == "env" ]]; then
   cat <<EOF
 export E2E_BASE_URL=http://localhost:${FRONT_PORT}
 export E2E_API=${BACKEND}
+# §UAT-PORTS：mock 地址必须随端口覆盖一起下发——e2e 里硬编 18789 时，换端口跑会打到
+# 同机另一份 checkout 的 mock 上并拿到 200（假绿）。传了该变量即表示"跑在自举栈上"，
+# 用例据此把"连不上 mock"从 skip 升级为判红。
+export E2E_MOCK_URL=http://127.0.0.1:${MOCK_PORT}
+export QMT_TOKEN=${QMT_TOKEN}
 export E2E_USER=${E2E_USER}
 export E2E_PASS='${E2E_PASS}'
 export E2E_USER2=${E2E_USER2}
@@ -346,6 +360,7 @@ log "UAT 栈已就绪（admin token 存于 $DATA_DIR/admin.token）："
 "$0" env
 echo
 log "跑 e2e：cd web && E2E_BASE_URL=http://localhost:${FRONT_PORT} E2E_API=${BACKEND} \\"
+log "        E2E_MOCK_URL=http://127.0.0.1:${MOCK_PORT} QMT_TOKEN=${QMT_TOKEN} \\"
 log "        E2E_USER=${E2E_USER} E2E_PASS='${E2E_PASS}' E2E_USER2=${E2E_USER2} E2E_PASS2='${E2E_PASS2}' npx playwright test"
 log "停栈：  ./scripts/uat_bootstrap.sh stop"
 log "日志：  $DATA_DIR/{mock,engine,engine2,vite}.log"
@@ -354,6 +369,7 @@ if [[ "$MODE" == "run" ]]; then
   log "运行 Playwright 全量 spec..."
   ( cd "$ROOT/web" && \
     E2E_BASE_URL="http://localhost:${FRONT_PORT}" E2E_API="$BACKEND" \
+    E2E_MOCK_URL="http://127.0.0.1:${MOCK_PORT}" QMT_TOKEN="$QMT_TOKEN" \
     E2E_USER="$E2E_USER" E2E_PASS="$E2E_PASS" \
     E2E_USER2="$E2E_USER2" E2E_PASS2="$E2E_PASS2" \
     E2E_QUOTE_SOURCE="$QUOTE_SOURCE" \

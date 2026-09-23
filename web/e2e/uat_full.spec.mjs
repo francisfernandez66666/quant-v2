@@ -18,6 +18,26 @@ const ADMIN = { u: process.env.E2E_USER || 'admin', p: process.env.E2E_PASS || '
 const USER = { u: process.env.E2E_USER2 || 'tester', p: process.env.E2E_PASS2 || ADMIN.p }
 const SHOT = 'test-results/uat-pixels'
 
+// §UAT-PORTS（2026-09-23）：假柜台地址/口令一律走环境变量，禁止在用例里硬编 18789。
+// 为什么是缺陷而不只是不便：本机可能同时存在多份 checkout（各拉一套 UAT 栈），默认端口先到先得，
+// 后起的那套只能挪端口；此时硬编 18789 的用例会打到**别人那套栈的 mock** 上并拿到 200——
+// 配合下面的「连不上就 skip」就成了永远绿、但断言的不是本仓库代码的假绿（本次 QS-2/L1-2 实测命中）。
+const MOCK_URL = process.env.E2E_MOCK_URL || 'http://127.0.0.1:18789'
+const MOCK_TOKEN = process.env.QMT_TOKEN || 'uat-secret'
+// 显式传了 E2E_MOCK_URL ⇒ 本次跑在自举栈上，mock 连不上是真故障，必须判红而不是 skip。
+const MOCK_MANDATORY = !!process.env.E2E_MOCK_URL
+
+// 「连不上 mock」的两种口径收在一处：
+//   · 对着外部/手工部署跑（未传 E2E_MOCK_URL）→ skip，不算失败；
+//   · 对着自举栈跑（传了）→ 抛错判红。否则"栈没起来 / 打到了别处的 mock"会被 skip 洗成绿。
+function mockUnavailableOrFail(lastErr) {
+  const why = lastErr ? ': ' + lastErr : ''
+  if (MOCK_MANDATORY) {
+    throw new Error(`自举栈的 qmt-mock 不可达（E2E_MOCK_URL=${MOCK_URL}）${why}——此场景必须判红`)
+  }
+  test.skip(true, 'qmt-mock 未就绪（独立部署场景跳过，不算失败）' + why)
+}
+
 // 挂载全局错误采集器：收集页面未捕获 JS 异常、console error、/api 请求失败与非 2xx 响应，
 // 返回 errs 数组供用例断言（PAGEERROR 视为致命，其余进城 warning annotation）。
 function watch(page) {
@@ -75,7 +95,8 @@ test.describe('交易相关分支', () => {
   test('Quant：链路状态卡显示 mock 网关+熔断正常+执行路径', async ({ page }) => {
     await page.goto('/#/quant')
     const card = page.locator('.t-card', { hasText: '链路状态' })
-    await expect(card).toContainText('127.0.0.1:18789', { timeout: 15000 })
+    // 断言的是"引擎装配的网关地址 = 本次自举拉起的 mock"，故端口随环境变量取（见 §UAT-PORTS）。
+    await expect(card).toContainText(new URL(MOCK_URL).host, { timeout: 15000 })
     await expect(card).toContainText('正常')
     await expect(card).toContainText('miniQMT兼容')
     await expect(card.getByText('QMT桥兜底')).toBeVisible()
@@ -1031,18 +1052,18 @@ test.describe('修复回归 · §ENH-5 L1 行情 feed 回显', () => {
   })
 
   test('L1-2 mock 网关 /quotes 契约：Bearer + ticks 字段齐备', async ({ page }) => {
-    // 直连 qmt-mock（18789，token 与引擎配置同源）：证明 Go feed 的数据面在本地栈可用。
-    // mock 无 Bearer 时 401——浏览器 fetch 无法带 mock token？可以：token 固定 uat-secret。
+    // 直连 qmt-mock（地址/口令取 §UAT-PORTS 的环境变量，与引擎配置同源）：证明 Go feed 的数据面在本地栈可用。
+    // mock 无 Bearer 时 401——浏览器 fetch 可以带自定义头，token 与自举脚本同源。
     let resp = null
     let lastErr = ''
     for (let i = 0; i < 3 && !resp; i++) { // mock 刚重启/瞬时繁忙时重试三轮，仍失败才按"独立部署"跳过
       await page.waitForTimeout(500)
-      resp = await page.request.get('http://127.0.0.1:18789/quotes?codes=600000.SH', {
-        headers: { Authorization: 'Bearer uat-secret' },
+      resp = await page.request.get(`${MOCK_URL}/quotes?codes=600000.SH`, {
+        headers: { Authorization: `Bearer ${MOCK_TOKEN}` },
       }).catch((e) => { lastErr = String(e && e.message || e); return null })
     }
     test.info().annotations.push({ type: 'l1-2-diag', description: 'resp=' + (!!resp) + ' err=' + lastErr })
-    test.skip(!resp, 'qmt-mock 未就绪（独立部署场景跳过，不算失败）' + (lastErr ? ': ' + lastErr : ''))
+    if (!resp) mockUnavailableOrFail(lastErr)
     expect(resp.status()).toBe(200)
     const body = await resp.json()
     expect(body.ok).toBe(true)
@@ -1053,8 +1074,8 @@ test.describe('修复回归 · §ENH-5 L1 行情 feed 回显', () => {
     }
     expect(tk.lastPrice).toBeGreaterThan(0)
     // 缺 codes → 400 契约
-    const bad = await page.request.get('http://127.0.0.1:18789/quotes', {
-      headers: { Authorization: 'Bearer uat-secret' },
+    const bad = await page.request.get(`${MOCK_URL}/quotes`, {
+      headers: { Authorization: `Bearer ${MOCK_TOKEN}` },
     })
     expect(bad.status()).toBe(400)
   })
@@ -1156,8 +1177,8 @@ test.describe('修复回归 · §3.1-1/§M1 quote_source 契约单源化', () =>
   test('QS-2 mock 柜台注入面回显 quote_source 且落在 golden 枚举内', async ({ request }) => {
     const golden = loadQuoteSources()
     const injected = process.env.E2E_QUOTE_SOURCE || ''
-    const base = process.env.E2E_MOCK_URL || 'http://127.0.0.1:18789'
-    const token = process.env.QMT_TOKEN || 'uat-secret'
+    const base = MOCK_URL // §UAT-PORTS：与 L1-2 同一取法，避免两处默认值各写一份
+    const token = MOCK_TOKEN
     let resp = null
     let lastErr = ''
     for (let i = 0; i < 3 && !resp; i++) { // mock 刚重启/瞬时繁忙时重试三轮（与 L1-2 同手法）
@@ -1170,7 +1191,7 @@ test.describe('修复回归 · §3.1-1/§M1 quote_source 契约单源化', () =>
       type: 'qs2-diag',
       description: 'resp=' + (!!resp) + ' err=' + lastErr + ' injected=' + (injected || '(无)'),
     })
-    test.skip(!resp, 'qmt-mock 未就绪（独立部署场景跳过，不算失败）' + (lastErr ? ': ' + lastErr : ''))
+    if (!resp) mockUnavailableOrFail(lastErr)
     expect(resp.status()).toBe(200)
     const body = await resp.json()
     if (!injected) {

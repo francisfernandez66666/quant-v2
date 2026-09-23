@@ -29,6 +29,9 @@ jobs:
       E2E_USER2: tester
       E2E_PASS2: Tester!2026
       QMT_TOKEN: uat-secret
+      # §UAT-PORTS：显式声明 mock 地址 ⇒ spec 里的「连不上 mock 就 skip」在本 job 升级为判红。
+      # CI 本来就要求"零 skip"（FIX-8 黄牌），让外部部署才需要的软跳过在这里失效。
+      E2E_MOCK_URL: http://127.0.0.1:18789
     steps:
       # 检出代码（Playwright spec 与后端二进制同仓构建）
       - uses: actions/checkout@v4
