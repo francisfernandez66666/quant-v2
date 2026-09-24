@@ -27,6 +27,11 @@
 //	· 库里最终 0 行 ⇒ 直接失败退出（"跑完了但没有数据"绝不能算成功）；
 //	· 打印 rows/codes/span/avg_bars_per_code_day：平均根数明显低于 48 就说明窗口被上游截断，
 //	  读者一眼看得见，而不是拿到一个"看起来成功"的数字。
+//	· §MINUTE-OPS：上面那句是给人看的，同一段读数另有一条**纯 ASCII 锚点行**出门
+//	  （`MINUTE-SYNC START ...` / `MINUTE-SYNC SUMMARY ... exit=<0|1> [reason=...]`）。
+//	  运维脚本 scripts/backfill_minute_guangzhou.sh 只认这两行：远端日志经 PowerShell→SSH 回传时
+//	  中文会按 GBK 打乱，拿中文当判据＝把假绿写进脚本；且成功与每条失败出口都必须有 SUMMARY 行，
+//	  脚本把"没有 SUMMARY"当成"没收尾"，而不是猜一个成功。
 //
 // English: minute-bar loader — one bounded last-N window per code (upstreams have no pagination),
 // pool-ranked default universe, self-maintaining incremental list, and an honest exit code.
@@ -78,12 +83,17 @@ func runMinuteSync(db *store.DB, dc minuteFetcher, o minuteSyncOpts, now time.Ti
 	}
 	codes, err := minuteTargetCodes(db, o)
 	if err != nil {
+		// 清单都没解出来也要留锚点行：运维脚本判的是"有没有正常收尾"，缺一行就按失败处理，
+		// 不能让它对着一个跑崩的进程读不到结论。
+		minuteSummary(db, o, 0, 0, 0, 1, "universe_error")
 		return 0, err
 	}
 	if len(codes) == 0 {
+		minuteSummary(db, o, 0, 0, 0, 1, "universe_empty")
 		return 0, fmt.Errorf("minute-sync: 取数清单为空（回填请用 --codes 或先跑池同步；日增模式要求库里已有分钟数据）")
 	}
 	log.Printf("[minute-sync] scale=%d count=%d codes=%d mode=%s", o.Scale, o.Count, len(codes), minuteModeName(o.Incremental))
+	log.Printf("MINUTE-SYNC START mode=%s scale=%d count=%d universe=%d", minuteModeASCII(o.Incremental), o.Scale, o.Count, len(codes))
 	var written, failed int64
 	for i, code := range codes {
 		kls, err := dc.GetUnadjustedMinuteKLine(code, o.Scale, o.Count)
@@ -94,25 +104,68 @@ func runMinuteSync(db *store.DB, dc minuteFetcher, o minuteSyncOpts, now time.Ti
 		}
 		n, err := db.UpsertMinuteBars(toMinuteBars(code, o.Scale, kls))
 		if err != nil {
+			minuteSummary(db, o, written, failed, int64(len(codes)), 1, "upsert_error")
 			return written, fmt.Errorf("minute-sync %s 落库: %w", code, err)
 		}
 		written += n
-		if (i+1)%50 == 0 {
+		if (i+1)%minuteProgressEvery == 0 {
 			log.Printf("[minute-sync] 进度 %d/%d，累计落库 %d 行", i+1, len(codes), written)
+			// 同一件事再打一条**纯 ASCII** 锚点行：长任务改由远端计划任务托管后，运维脚本
+			// 只能 ssh 读日志尾（见 scripts/backfill_minute_guangzhou.sh），而中文经
+			// GBK 码页回传必乱，抓不到进度就误判成"卡死/没跑"。数字对齐即可解析。
+			log.Printf("%s", minuteProgressLine(int64(i+1), int64(len(codes)), written))
 		}
 	}
 	st, err := db.MinuteTableStats(o.Scale)
 	if err != nil {
+		minuteSummary(db, o, written, failed, int64(len(codes)), 1, "stats_error")
 		return written, fmt.Errorf("minute-sync 收尾统计: %w", err)
 	}
 	log.Printf("[minute-sync] 本轮写入 %d 行；失败 %d 只 / %d 只；表内 %s", written, failed, len(codes), st)
 	if st.Rows == 0 {
+		log.Printf("%s", minuteSummaryLine(st, written, failed, int64(len(codes)), 1, "zero_rows"))
 		return 0, fmt.Errorf("minute-sync: 本轮 0 行落库（上游全失败或清单里的代码取不到分钟线），不得算成功")
 	}
 	if pct := float64(failed) * 100 / float64(len(codes)); pct > float64(o.MaxFailPct) {
+		log.Printf("%s fail_pct=%.1f max_fail_pct=%d", minuteSummaryLine(st, written, failed, int64(len(codes)), 1, "fail_rate"), pct, o.MaxFailPct)
 		return written, fmt.Errorf("minute-sync: 失败率 %.1f%% 超过上限 %d%%（多为封 IP/接口改版，不是偶发），本轮判失败", pct, o.MaxFailPct)
 	}
+	log.Printf("%s", minuteSummaryLine(st, written, failed, int64(len(codes)), 0, ""))
 	return written, nil
+}
+
+// minuteProgressEvery 进度锚点行的节拍（只数）：500 只清单 → 10 行进度，日志不被刷爆，
+// 又足够让运维脚本判断"还在动"还是"卡住了"。
+const minuteProgressEvery = 50
+
+// minuteProgressLine 进度锚点行（纯 ASCII，理由同 minuteSummaryLine）。
+// 键名 fixed：done/universe/written，脚本侧按 `done=`/`universe=` 切字段判进度比。
+func minuteProgressLine(done, universe, written int64) string {
+	return fmt.Sprintf("MINUTE-SYNC PROGRESS done=%d universe=%d written=%d", done, universe, written)
+}
+
+// minuteSummary 是"拿不到清单/统计"那几条早退出口上的锚点行：能读到整表读数就带上，
+// 读不到就输出零值 + reason（脚本侧只认 exit= 与 reason=，不会把零值误读成"表是空的"）。
+func minuteSummary(db *store.DB, o minuteSyncOpts, written, failed, universe int64, exit int, reason string) {
+	st, err := db.MinuteTableStats(o.Scale)
+	if err != nil {
+		st = store.MinuteStats{Scale: o.Scale}
+	}
+	log.Printf("%s", minuteSummaryLine(st, written, failed, universe, exit, reason))
+}
+
+// minuteSummaryLine 组装运维脚本判数用的**纯 ASCII 锚点行**（§MINUTE-OPS，2026-09-24）。
+// 两条硬要求：① 一个中文字都没有——远端日志经 PowerShell→SSH 回传时中文会按 GBK 打乱，
+// 拿中文当判据等于把假绿写进脚本（本仓 §GBK 系列教训）；② 成功与每一条失败出口都出现，
+// 脚本因此可以把"没有 SUMMARY 行"当成"没收尾"，而不是猜一个成功。
+// store.MinuteStats.ASCII() 是同一份读数的人读/机读孪生，键名改动会同时被 §93 锁与单测抓到。
+func minuteSummaryLine(st store.MinuteStats, written, failed, universe int64, exit int, reason string) string {
+	line := fmt.Sprintf("MINUTE-SYNC SUMMARY %s written=%d failed=%d universe=%d exit=%d",
+		st.ASCII(), written, failed, universe, exit)
+	if reason != "" {
+		line += " reason=" + reason
+	}
+	return line
 }
 
 // minuteTargetCodes 解出本轮清单：--codes 文件优先；日增模式用库里已有的票（自维护）；
@@ -162,6 +215,14 @@ func minuteModeName(inc bool) string {
 		return "incremental(日增)"
 	}
 	return "backfill(回填)"
+}
+
+// minuteModeASCII 给人看的 minuteModeName 的机读孪生（§MINUTE-OPS）：锚点行里不能有中文。
+func minuteModeASCII(inc bool) string {
+	if inc {
+		return "incremental"
+	}
+	return "backfill"
 }
 
 // parseMinuteFlags 从子命令参数里解析 minute-sync 的入参（独立 flag 集合，

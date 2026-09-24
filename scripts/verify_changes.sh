@@ -46,6 +46,12 @@
 #   §MINUTE-K-CHAIN 分钟链两修（09-24 首次真跑锤出）：链入口把 ts_code 归一成上游认得的裸 6 位
 #       代码（旧行为＝新浪空返回＋腾讯解析错，看着像"三源全坏"其实一条没取到），装载器改绑新增的
 #       严格不复权链（末腿东财 fqt=1 前复权按口径拒用，防除权日假分钟 MACD 跳水）（见 92）
+#   §MINUTE-OPS 生产侧两条"历来只能手敲 ssh"的通道收编成正规脚本（09-24 owner 令「把这两步变成正规脚本」）：
+#       scripts/place_qmt_bridge.sh（桥策略落位到 QMT 实际加载的策略文件 + 三值 SHA 判定）+
+#       scripts/backfill_minute_guangzhou.sh（dataload minute-sync 由一次性计划任务承载，ssh 断开不影响）；
+#       两条同口径：缺省只预览（预览一次网都不碰）、动手须显式 -Apply、BatchMode 预探测不挂起、
+#       判据全走纯 ASCII 锚点行（Go 侧新增 MinuteStats.ASCII() 与 MINUTE-SYNC START/PROGRESS/SUMMARY），
+#       日志"没有 SUMMARY"一律判未收尾——半态（进程没了/GBK 把锚点行吞掉半截）绝不读成成功（见 93）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -2856,6 +2862,141 @@ TN=$(grep -c '^func Test' "$MK_SRC_TEST" || true)
 [ "$TN" = "3" ] \
 	|| { echo "--- FAIL: §MINUTE-K-CHAIN 分钟链用例数不再是 3 条（读到 ${TN}：URL 形态/末腿拒用/逐腿记账 缺一即失效）"; exit 1; }
 echo "ok - §MINUTE-K-CHAIN 守卫通过（链入口代码归一 2 + 两入口一真一假 1 + 拒用文案 1 + 装载器绑严格链 2 + 运行时实证 2）"
+
+echo ""
+echo "==> 93 §MINUTE-OPS 生产侧两条正规通道（桥策略落位 + 分钟 K 回填）：缺省只预览 + 动手须 -Apply + 判据纯 ASCII + 半态不读成成功（2026-09-24 owner 令「把这两步变成正规脚本」）..."
+OPS_SH=scripts/backfill_minute_guangzhou.sh
+BR_SH=scripts/place_qmt_bridge.sh
+OPS_LOAD=cmd/dataload/minute_sync.go
+OPS_STORE=internal/store/minute_klines.go
+# ① 两条通道必须在位、可执行、语法过（历史上这两步只存在于人脑与 RUNBOOK 的手敲命令里）
+for f in "$OPS_SH" "$BR_SH"; do
+	{ [ -f "$f" ] && [ -x "$f" ]; } \
+		|| { echo "--- FAIL: §MINUTE-OPS $f 缺失或没有执行位（缺省预览型脚本也要能直接跑）"; exit 1; }
+	bash -n "$f" || { echo "--- FAIL: §MINUTE-OPS $f 语法不过（bash -n）"; exit 1; }
+done
+# ② 缺省方向＝只预览：APPLY 缺省 0、只认 -Apply、预览分支一条 SSH 都不发
+OPS_A0=$(grep -c '^APPLY=0$' "$OPS_SH" || true)
+OPS_APPLY=$(grep -c -- '-Apply) APPLY=1' "$OPS_SH" || true)
+OPS_GUARD=$(grep -c 'MODE=$MODE 会动生产' "$OPS_SH" || true)
+BR_A0=$(grep -c '^APPLY=0$' "$BR_SH" || true)
+BR_APPLY=$(grep -c -- '-Apply) APPLY=1' "$BR_SH" || true)
+{ [ "$OPS_A0" = "1" ] && [ "$OPS_APPLY" = "1" ] && [ "$BR_A0" = "1" ] && [ "$BR_APPLY" = "1" ]; } \
+	|| { echo "--- FAIL: §MINUTE-OPS 缺省方向不再是「只预览」（回填=${OPS_A0}/${OPS_APPLY} 落位=${BR_A0}/${BR_APPLY}；动手必须显式 -Apply，见 §OPS-ALIGN）"; exit 1; }
+[ "$OPS_GUARD" = "1" ] \
+	|| { echo "--- FAIL: §MINUTE-OPS 回填脚本的「MODE=apply 还差 -Apply」降级守卫不在了（读到 ${OPS_GUARD}：MODE 与 -Apply 两个开关必须同时给才动手）"; exit 1; }
+OPS_MODE_DEF=$(grep -c 'MODE="${MODE:-plan}"' "$OPS_SH" || true)
+[ "$OPS_MODE_DEF" = "1" ] \
+	|| { echo "--- FAIL: §MINUTE-OPS 回填脚本 MODE 缺省不再是 plan（读到 ${OPS_MODE_DEF}：缺省即动手＝安全阀失效）"; exit 1; }
+# ③ 判据必须纯 ASCII：远端脚本体（送进 PowerShell 的那段串）零非 ASCII 字节 + Go 侧机读孪生在位
+#    取法：REMOTE_PS=' 到下一处单独一行的 ' 之间。掺中文＝GBK 回传乱码＝脚本把"读不到"当"跑过了"。
+for f in "$OPS_SH" "$BR_SH"; do
+	BODY=$(sed -n "/^REMOTE_PS='/,/^'$/p" "$f" | LC_ALL=C grep -c '[^ -~]' || true)
+	[ "${BODY:-0}" = "0" ] \
+		|| { echo "--- FAIL: §MINUTE-OPS $f 的远端脚本体掺了 ${BODY} 行非 ASCII（会被 GBK 回传打乱，判据必须走 ASCII 锚点/码位拼名）"; exit 1; }
+done
+grep -q 'func (s MinuteStats) ASCII()' "$OPS_STORE" \
+	|| { echo '--- FAIL: §MINUTE-OPS 分钟统计表读数丢了机读孪生 ASCII()（脚本侧只能按空格切字段，中文读数＝读不到）'; exit 1; }
+OPS_ANCH=$(grep -c 'MINUTE-SYNC \(SUMMARY\|PROGRESS\|START\)' "$OPS_LOAD" || true)
+{ [ "$OPS_ANCH" -ge 3 ]; } \
+	|| { echo "--- FAIL: §MINUTE-OPS 装载器的 ASCII 锚点行少于 3 类（读到 ${OPS_ANCH}：START/PROGRESS/SUMMARY 少了任何一类，运维脚本就只能猜）"; exit 1; }
+# 锚点行在日志里不在行首（dataload 的 log.SetFlags 打时间戳前缀），所以取值一律用**不带 ^** 的 grep
+OPS_CARET=$(grep -c 'grep "\^MINUTE-SYNC' "$OPS_SH" || true)
+[ "$OPS_CARET" = "0" ] \
+	|| { echo '--- FAIL: §MINUTE-OPS 回填脚本又用 ^ 锚定锚点行（读到 ${OPS_CARET}：日志行有时间戳前缀，^ 恒不命中＝永远判「未收尾」，反过来也永远拿不到成功）'; exit 1; }
+# ④ 离线实跑：预览模式一次网络都不碰（bogus IP 也要 0 退出），动手模式对不可达通道必须 fail-closed
+BR_PLAN=$(GZ_IP=127.0.0.1 "$BR_SH" 2>&1 || true)
+printf '%s\n' "$BR_PLAN" | grep -q 'BRIDGE_PLACE_PLAN' \
+	|| { echo '--- FAIL: §MINUTE-OPS 落位脚本预览模式没打 BRIDGE_PLACE_PLAN（缺省方向被改坏，或预览里混进了网络调用）'; exit 1; }
+OPS_PLAN=$(GZ_IP=127.0.0.1 "$OPS_SH" 2>&1 || true)
+printf '%s\n' "$OPS_PLAN" | grep -q 'MINUTE_OPS_PLAN' \
+	|| { echo '--- FAIL: §MINUTE-OPS 回填脚本预览模式没打 MINUTE_OPS_PLAN（同上）'; exit 1; }
+# 动手分支必须"先本机自检、再连生产"，且连不上就判红（绝不落到可能挂起的密码认证）
+BR_ARM=$(GZ_IP=127.0.0.1 "$BR_SH" -Apply 2>&1 || true)
+{ printf '%s\n' "$BR_ARM" | grep -q 'BRIDGE_PLACE_ARMED' && printf '%s\n' "$BR_ARM" | grep -q 'BatchMode'; } \
+	|| { echo '--- FAIL: §MINUTE-OPS 落位脚本的 -Apply 分支不再「先 ASCII 自检后 BatchMode 预探测」（ARMED/预探测判红缺一：要么自检被绕过，要么会挂起）'; exit 1; }
+if GZ_IP=127.0.0.1 "$BR_SH" -Apply >/dev/null 2>&1; then
+	echo '--- FAIL: §MINUTE-OPS 落位脚本在通道不通时居然 0 退出（降级报成功，§M2 族）'; exit 1
+fi
+OPS_ARM=$(GZ_IP=127.0.0.1 MODE=status "$OPS_SH" 2>&1 || true)
+{ printf '%s\n' "$OPS_ARM" | grep -q 'MINUTE_OPS_ARMED' && printf '%s\n' "$OPS_ARM" | grep -q 'BatchMode'; } \
+	|| { echo '--- FAIL: §MINUTE-OPS 回填脚本的状态分支不再「先自检后预探测」（同上）'; exit 1; }
+if GZ_IP=127.0.0.1 MODE=status "$OPS_SH" >/dev/null 2>&1; then
+	echo '--- FAIL: §MINUTE-OPS 回填脚本连不上生产却 0 退出（状态未知当成功）'; exit 1
+fi
+# ⑤ 半态不读成成功：造一个假 ssh 回放远端六种回传，逐态核「退出码 + 状态标记」两值
+#    这是本组唯一能证明"判读逻辑本身不是恒绿"的探针（④ 只证明 fail-closed）。
+OPS_FAKE=$(mktemp -d)
+cat >"$OPS_FAKE/ssh" <<'FAKE'
+#!/usr/bin/env bash
+# 假 ssh：给 §MINUTE-OPS 探针回放远端 PowerShell 的六种回传（不碰网络）。
+# 行首的时间戳前缀是 dataload 的 log.SetFlags 打的，故意留着——它就是"锚点不在行首"的成因。
+if printf '%s' "$*" | grep -q EncodedCommand; then
+	case "${OPS_FAKE_STATE:-done}" in
+		done)
+			echo 'MINOPS STATE task=1 procs=0 log=backfill-minute-x.log bytes=98765 mtime=20260924-224110'
+			echo '2026/09/24 21:59:01.123456 MINUTE-SYNC START mode=backfill scale=5 count=5025 universe=500'
+			echo '2026/09/24 22:03:11.123456 MINUTE-SYNC PROGRESS done=50 universe=500 written=248000'
+			echo '2026/09/24 22:41:10.500000 MINUTE-SYNC SUMMARY scale=5 rows=2480713 codes=500 first=2026-04-08T13:50:00 last=2026-09-24T15:00:00 avg_bars=47.6 written=2480713 failed=0 universe=500 exit=0'
+			;;
+		failed)
+			echo 'MINOPS STATE task=1 procs=0 log=backfill-minute-x.log bytes=1200 mtime=20260924-220000'
+			echo '2026/09/24 22:00:00.500000 MINUTE-SYNC SUMMARY scale=5 rows=0 codes=0 first= last= avg_bars=0.0 written=0 failed=500 universe=500 exit=1 reason=zero_rows'
+			;;
+		running)
+			echo 'MINOPS STATE task=1 procs=1 log=backfill-minute-x.log bytes=4096 mtime=20260924-220500'
+			echo '2026/09/24 22:03:11.123456 MINUTE-SYNC PROGRESS done=50 universe=500 written=248000'
+			;;
+		stalled)
+			echo 'MINOPS STATE task=1 procs=0 log=backfill-minute-x.log bytes=4096 mtime=20260924-220500'
+			echo '2026/09/24 22:03:11.123456 MINUTE-SYNC PROGRESS done=50 universe=500 written=248000'
+			;;
+		pending)
+			echo 'MINOPS STATE task=1 procs=0 log=none dir=C:\var\lib\quant-trading-v2'
+			;;
+		garbled)
+			echo 'MINOPS STATE task=1 procs=0 log=backfill-minute-x.log bytes=4096 mtime=20260924-220500'
+			echo '2026/09/24 22:03:11.123456 MINUTE-SYNC PROGRESS done=50 universe=500 written=248000'
+			echo '2026/09/24 22:41:10.5 MINUTE-SYNC SUMM'
+			;;
+	esac
+	exit 0
+fi
+echo ok
+exit 0
+FAKE
+chmod +x "$OPS_FAKE/ssh"
+for spec in done:done:0 failed:failed:1 running:running:0 stalled:stalled:1 pending:pending:1 garbled:stalled:1; do
+	fstate=${spec%%:*}
+	rest=${spec#*:}
+	want_mark=${rest%%:*}
+	want_code=${rest##*:}
+	if out=$(PATH="$OPS_FAKE:$PATH" GZ_IP=127.0.0.1 MODE=status OPS_FAKE_STATE="$fstate" "$OPS_SH" 2>&1); then got_code=0; else got_code=1; fi
+	got_mark=$(printf '%s\n' "$out" | grep -o "MINUTE_OPS_STATE [a-z]*" | tail -1 || true)
+	{ [ "$got_code" = "$want_code" ] && [ "$got_mark" = "MINUTE_OPS_STATE $want_mark" ]; } \
+		|| { echo "--- FAIL: §MINUTE-OPS 远端回传「${fstate}」被判成 ${got_mark:-无状态标记}/exit=${got_code}（应为 MINUTE_OPS_STATE ${want_mark}/exit=${want_code}：半态/失败态被读成成功，正是本仓 §M2 族最忌的降级报成功）"; rm -rf "$OPS_FAKE"; exit 1; }
+done
+rm -rf "$OPS_FAKE"
+# ⑥ 负锁：不新增凭据、不碰实盘账本、不许出现密码认证兜底
+OPS_NEG=$(grep -c 'live\.db' "$OPS_SH" || true)
+[ "$OPS_NEG" = "0" ] \
+	|| { echo "--- FAIL: §MINUTE-OPS 回填脚本里出现了 live.db（读到 ${OPS_NEG}：回填只准写研究库 trading.db，碰实盘账本即资金链路事故）"; exit 1; }
+if grep -qiE 'sshpass|PreferredAuthentications=password' "$OPS_SH" "$BR_SH"; then
+	echo '--- FAIL: §MINUTE-OPS 两条脚本又引入密码认证兜底（本仓纪律：BatchMode 不通即判红，绝不挂起等人输密码）'; exit 1
+fi
+BR_BOM=$(grep -c 'place_bridges.ps1' "$BR_SH" || true)
+{ [ "$BR_BOM" -ge 2 ]; } \
+	|| { echo "--- FAIL: §MINUTE-OPS 落位脚本不再复用仓库版 place_bridges.ps1（读到 ${BR_BOM}：自造远端拷贝会把 BOM/路径口径散成两套）"; exit 1; }
+# ⑦ 运行时实证：锚点行用例（成功/零行/清单为空/进度节拍 × 纯 ASCII 断言）必须真跑绿
+OT=$(go test -count=1 ./cmd/dataload/ -run 'TestMinuteSyncAnchorLinesMachineReadable' 2>&1 | grep -E '^(--- FAIL|FAIL|ok|no test files)' || true)
+printf '%s\n' "$OT"
+if printf '%s' "$OT" | grep -qE 'FAIL|no test files'; then
+	echo '--- FAIL: §MINUTE-OPS 锚点行用例跑红或没跑到（见上面输出）'; exit 1
+fi
+OSUB=$(grep -c 't.Run(' cmd/dataload/minute_sync_test.go || true)
+[ "$OSUB" = "4" ] \
+	|| { echo "--- FAIL: §MINUTE-OPS 锚点行用例的子用例数不再是 4（读到 ${OSUB}：成功/零行/清单为空/进度节拍 缺一即失效）"; exit 1; }
+echo "ok - §MINUTE-OPS 守卫通过（脚本在位+语法 4 + 缺省只预览 6 + ASCII 判据 5 + 离线实跑 6 + 半态六态联调 12 + 负锁 3 + 运行时实证 2）"
 
 echo ""
 echo "==> 全部通过"

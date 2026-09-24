@@ -176,6 +176,24 @@ func (s MinuteStats) String() string {
 		s.Rows, s.Codes, s.FirstTs, s.LastTs, s.AvgBars)
 }
 
+// ASCII 是给**运维脚本**判数用的同一份读数的机读形态（§MINUTE-OPS，2026-09-24）。
+// 与 String() 的差别只有两处，但每一处都是踩过的坑：
+//  1. 一个空格都没有——ts 里的空格换成 T（"2026-09-24 15:00:00" → "...T15:00:00"），
+//     否则 shell 用 `grep -o 'first=[^ ]*'` 只能取到日期半截；
+//  2. 字段名固定全 ASCII——远端日志经 PowerShell→SSH 回传时中文会按 GBK 打乱
+//     （本仓 §GBK 系列教训），拿中文当判据＝把假绿写进脚本，所以脚本只准认这一行、人看的那行照旧。
+//
+// （ASCII is the machine-readable twin of String(): no spaces, no CJK, stable key names.）
+func (s MinuteStats) ASCII() string {
+	return fmt.Sprintf("scale=%d rows=%d codes=%d first=%s last=%s avg_bars=%.1f",
+		s.Scale, s.Rows, s.Codes, minuteTSField(s.FirstTs), minuteTSField(s.LastTs), s.AvgBars)
+}
+
+// minuteTSField 把北京墙钟串里的空格换成 T（空值原样返回空串，脚本按"无数据"读，不当 0 处理）。
+func minuteTSField(ts string) string {
+	return strings.ReplaceAll(ts, " ", "T")
+}
+
 // MinuteTableStats 按周期统计整表。
 func (d *DB) MinuteTableStats(scale int) (MinuteStats, error) {
 	var st MinuteStats

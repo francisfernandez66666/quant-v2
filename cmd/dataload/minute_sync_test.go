@@ -16,8 +16,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -245,4 +247,125 @@ func TestParseMinuteFlagsDefaultsAndOverrides(t *testing.T) {
 	if _, err := parseMinuteFlags([]string{"--nope"}); err == nil {
 		t.Fatalf("未知参数必须报错（拼错开关不能静默按缺省跑）")
 	}
+}
+
+// captureMinuteLog 把标准库 log 的输出临时接进缓冲区：装载器的机读锚点行走的是 log，
+// 判数用例必须截它（否则只能靠肉眼翻 stderr，红绿无从断言）。
+func captureMinuteLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return &buf
+}
+
+// minuteAnchor 取日志里**最后一条**以 prefix 开头的锚点行（找不到即判红）。
+func minuteAnchor(t *testing.T, body, prefix string) string {
+	t.Helper()
+	found := ""
+	for _, line := range strings.Split(body, "\n") {
+		if i := strings.Index(line, prefix); i >= 0 {
+			found = strings.TrimSpace(line[i:])
+		}
+	}
+	if found == "" {
+		t.Fatalf("日志里没有 %s 锚点行（运维脚本判数只读它，缺行＝失败不可见）\n---- 实际日志 ----\n%s", prefix, body)
+	}
+	return found
+}
+
+// mustPureASCII 钉"锚点行不得掺中文"：非 ASCII 字节数必须为 0。
+func mustPureASCII(t *testing.T, line string) {
+	t.Helper()
+	for i := 0; i < len(line); i++ {
+		if line[i] > 0x7f {
+			t.Fatalf("锚点行掺了非 ASCII 字节（远端回传会按 GBK 打乱，中文进判据＝假绿）：%q 第 %d 字节", line, i)
+		}
+	}
+}
+
+// TestMinuteSyncAnchorLinesMachineReadable（§MINUTE-OPS）钉三条：
+//  1. 成功轮与两条失败轮都出 MINUTE-SYNC SUMMARY，且 exit=/reason= 与实际判语一致——
+//     脚本把"没有 SUMMARY 行"读成"没收尾"，所以失败出口漏行比普通日志缺失更严重；
+//  2. 锚点行一个非 ASCII 字节都没有（人读的那行照旧带中文，两者互不干扰）；
+//  3. ts 字段里没有空格（"2026-04-08T13:50:00"），否则 shell 按空格切词只拿得到日期半截。
+func TestMinuteSyncAnchorLinesMachineReadable(t *testing.T) {
+	t.Run("成功轮 exit=0", func(t *testing.T) {
+		db := newSyncDB(t)
+		o := minuteSyncOpts{Scale: 5, Count: 48, CodesFile: writeCodesFile(t, "600000.SH"), MaxFailPct: 10}
+		buf := captureMinuteLog(t)
+		if _, err := runMinuteSync(db, &stubFetcher{count: 48, missing: map[string]bool{}}, o, time.Now()); err != nil {
+			t.Fatalf("成功轮不应报错: %v", err)
+		}
+		line := minuteAnchor(t, buf.String(), "MINUTE-SYNC SUMMARY")
+		mustPureASCII(t, line)
+		for _, want := range []string{"exit=0", "rows=48", "written=48", "codes=1", "universe=1"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("SUMMARY 行缺字段 %s：%q", want, line)
+			}
+		}
+		if strings.Contains(line, "reason=") {
+			t.Fatalf("成功轮不该带 reason：%q", line)
+		}
+		start := minuteAnchor(t, buf.String(), "MINUTE-SYNC START")
+		mustPureASCII(t, start)
+		if !strings.Contains(start, "mode=backfill") || !strings.Contains(start, "count=48") {
+			t.Fatalf("START 行应与入参一致：%q", start)
+		}
+	})
+
+	t.Run("零行落库 exit=1 reason=zero_rows", func(t *testing.T) {
+		db := newSyncDB(t)
+		o := minuteSyncOpts{Scale: 5, Count: 48, CodesFile: writeCodesFile(t, "600000.SH"), MaxFailPct: 100}
+		buf := captureMinuteLog(t)
+		dc := &stubFetcher{count: 0, missing: map[string]bool{"600000.SH": true}}
+		if _, err := runMinuteSync(db, dc, o, time.Now()); err == nil {
+			t.Fatalf("0 行落库必须报错（跑到但没数据≠成功）")
+		}
+		line := minuteAnchor(t, buf.String(), "MINUTE-SYNC SUMMARY")
+		mustPureASCII(t, line)
+		if !strings.Contains(line, "exit=1") || !strings.Contains(line, "reason=zero_rows") {
+			t.Fatalf("0 行落库必须判失败且点名原因：%q", line)
+		}
+	})
+
+	t.Run("清单为空 exit=1 reason=universe_empty", func(t *testing.T) {
+		db := newSyncDB(t)
+		o := minuteSyncOpts{Scale: 5, Count: 48, CodesFile: writeCodesFile(t), MaxFailPct: 10}
+		buf := captureMinuteLog(t)
+		if _, err := runMinuteSync(db, &stubFetcher{count: 1, missing: map[string]bool{}}, o, time.Now()); err == nil {
+			t.Fatalf("清单为空必须报错")
+		}
+		line := minuteAnchor(t, buf.String(), "MINUTE-SYNC SUMMARY")
+		mustPureASCII(t, line)
+		if !strings.Contains(line, "reason=universe_empty") {
+			t.Fatalf("清单为空也要出锚点行（脚本侧要能区分\"没跑到\"与\"跑到但没数据\"）：%q", line)
+		}
+	})
+
+	// 进度锚点行（§MINUTE-OPS）：回填改由远端计划任务托管后，运维脚本只能 ssh 读日志尾，
+	// 中文进度行经 GBK 回传抓不到 ⇒ 会被读成"卡死"。这里钉节拍与字段的机器可解析性。
+	t.Run("进度锚点行每 50 只一条且纯 ASCII", func(t *testing.T) {
+		db := newSyncDB(t)
+		codes := make([]string, minuteProgressEvery)
+		for i := range codes {
+			codes[i] = fmt.Sprintf("60%04d.SH", i)
+		}
+		o := minuteSyncOpts{Scale: 5, Count: 2, CodesFile: writeCodesFile(t, codes...), MaxFailPct: 10}
+		buf := captureMinuteLog(t)
+		if _, err := runMinuteSync(db, &stubFetcher{count: 2, missing: map[string]bool{}}, o, time.Now()); err != nil {
+			t.Fatalf("50 只满一轮不应报错: %v", err)
+		}
+		line := minuteAnchor(t, buf.String(), "MINUTE-SYNC PROGRESS")
+		mustPureASCII(t, line)
+		for _, want := range []string{"done=50", "universe=50", "written=100"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("PROGRESS 行缺字段 %s：%q", want, line)
+			}
+		}
+		if n := strings.Count(buf.String(), "MINUTE-SYNC PROGRESS"); n != 1 {
+			t.Fatalf("恰好一条（差一就不会在 49 只时提前打点）：%d 条", n)
+		}
+	})
 }
