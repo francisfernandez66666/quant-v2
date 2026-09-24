@@ -29,6 +29,10 @@
 #       §SIGNAL-DIST 部署面加第 22 探针（当日固化信号按战法分布 + leader_only 读数）+ INFO 观测通道
 #       （绿也回显读数、不进 PASS/FAIL 判数）；判红只认解析失败/缺 signals 数组，no-file、跨日桶、
 #       当日零信号一律合法态（见 88）
+#     + 09-24 收尾批（§88 自己把一轮 verify 静默跑死：计数锁的"绿色取值"是 0，`grep -c` 零命中退出码 1，
+#       `set -euo pipefail` 下整条赋值失败 ⇒ 无 FAIL 无 ok 直接中止）：
+#       §GATE-COUNT-LOCK 门禁自查——凡 `v=$(... grep ...)` 必须写 `|| true`（判红交给后面的等值判断），
+#       加固面设下限，且两头钉住 `set -euo pipefail` 本身（见 89）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -1011,8 +1015,8 @@ echo "==> 50 §SETTLE 日终结算失败当日可重试 + §M13 熔断广播载�
 go test -count=1 ./internal/trading/ -run 'TestSettleFailure' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 注意过滤注释行：§D4 注释里引用了「旧实现把 c.lastSettleDay = day 放在调用之前」的缺陷原文，
 # 不过滤会命中注释行造成顺序假红（负向/顺序锁须滤注释——本仓既有教训）。
-SET_ASSIGN=$(grep -n 'c.lastSettleDay = day' internal/trading/settlement.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
-SET_CALL=$(grep -n 'diff, err := c.SettleDay(' internal/trading/settlement.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+SET_ASSIGN=$(grep -n 'c.lastSettleDay = day' internal/trading/settlement.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+SET_CALL=$(grep -n 'diff, err := c.SettleDay(' internal/trading/settlement.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
 [ -n "$SET_ASSIGN" ] && [ -n "$SET_CALL" ] || { echo "--- FAIL: 找不到结算置位/调用行（§D4 静态锁失效）"; exit 1; }
 [ "$SET_ASSIGN" -gt "$SET_CALL" ] || { echo "--- FAIL: lastSettleDay 又回到 SettleDay 之前置位（失败当日永久不再对账，§D4 复活）"; exit 1; }
 grep -q 'settleRetryInterval' internal/trading/settlement.go || { echo "--- FAIL: 失败重试节流窗丢失（§D4 会打爆网关或不再重试）"; exit 1; }
@@ -1110,12 +1114,12 @@ echo "==> 54 §H3 打分链日K复权优先 + 不复权拒参与 + 腾讯静默�
 go test -count=1 ./internal/strategy_engine/ -run 'TestFetchDayKLine|TestApplyDayKLine|TestFetchMinuteKLine' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/data/ -run 'TestGetTencentKLineRefusesUnadjustedFallback|TestParseTencent' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 顺序锁（比文本断言可靠）：fetchDayKLine 内东财 qfq 腿必须排在新浪不复权腿之前。
-H3_QFQ=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
-H3_UNADJ=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+H3_QFQ=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+H3_UNADJ=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
 [ -n "$H3_QFQ" ] && [ -n "$H3_UNADJ" ] || { echo "--- FAIL: 找不到复权/不复权腿（§H3 静态锁失效）"; exit 1; }
 [ "$H3_QFQ" -lt "$H3_UNADJ" ] || { echo "--- FAIL: 日K链又是不复权优先（除权日因子失真复活，§H3）"; exit 1; }
 # 每源校验闸：fetchDayKLine 的四条腿都要过 ValidateKLine（旧实现只判 len>0）。
-H3_VALIDATE=$(grep -c 'err == nil && data.ValidateKLine(klines)' internal/strategy_engine/engine.go)
+H3_VALIDATE=$(grep -c 'err == nil && data.ValidateKLine(klines)' internal/strategy_engine/engine.go || true)
 [ "$H3_VALIDATE" -ge 4 ] || { echo "--- FAIL: ValidateKLine 闸数量 $H3_VALIDATE < 4（有腿退回只判 len>0，§H3/§D8 复活）"; exit 1; }
 grep -q 'KLineUnadj  *bool' internal/strategy_engine/types.go || { echo "--- FAIL: StockMarketData 不复权标记字段丢失（§H3 拒参与不可见）"; exit 1; }
 grep -q 'dayk-unadjusted-fallback' internal/strategy_engine/engine.go || { echo "--- FAIL: 复权链降级的 opslog 告警丢失（§H3 降级不可观测）"; exit 1; }
@@ -1144,22 +1148,22 @@ if grep -n 'YYYY-MM-DD，如 2026-06-30' internal/strategy_engine/types.go | gre
 # M-8/N-6 CLI：两同步函数必须返回 error 且分发点转成非零退出（log.Fatalf）。
 grep -q 'func cmdHithinkSyncValuations(client \*data.HithinkClient, db \*store.DB) error {' cmd/dataload/hithink_sync.go || { echo "--- FAIL: 估值同步又无返回值（批次失败无法非零退出，§M-8 复活）"; exit 1; }
 grep -q 'func cmdHithinkSyncFinIndicators(client \*data.HithinkClient, db \*store.DB, args \[\]string) error {' cmd/dataload/hithink_sync.go || { echo "--- FAIL: 财务指标同步又无返回值（§M-8/N-6 复活）"; exit 1; }
-H_ERR=$(grep -c 'if err := cmdHithinkSync\(Valuations\|FinIndicators\)' cmd/dataload/hithink_sync.go)
+H_ERR=$(grep -c 'if err := cmdHithinkSync\(Valuations\|FinIndicators\)' cmd/dataload/hithink_sync.go || true)
 [ "$H_ERR" -ge 2 ] || { echo "--- FAIL: 分发点吃 err 的非零退出腿 $H_ERR < 2（§M-8 降级错误又被吞）"; exit 1; }
 # M-8/N-6 research：五处逐窗装配失败计数 + 统一降级行；ckpt save 双吞（_ =）必须绝迹。
-R_FAIL=$(grep -c 'failed++' internal/research/windowed.go)
+R_FAIL=$(grep -c 'failed++' internal/research/windowed.go || true)
 [ "$R_FAIL" -ge 5 ] || { echo "--- FAIL: 窗口装配失败计数点 $R_FAIL < 5（有腿又静默 continue，§N-6 复活）"; exit 1; }
 grep -q 'func noteWindowFail' internal/research/windowed.go || { echo "--- FAIL: 缺窗降级留痕函数丢失（§N-6）"; exit 1; }
 if grep -nE '_ = c\.db\.PutWindowCkpt' internal/research/windowed.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
 	echo "--- FAIL: 断点落库又 \`_ =\` 吞错（整晚断点没存上不可见，§N-6 复活）"; exit 1; fi
 # M-8/N-6 sector_agent：成分股验证失败计数 + 降级文案。
-S_FAIL=$(grep -c 'verifyFailed' internal/sector_agent/agent.go)
+S_FAIL=$(grep -c 'verifyFailed' internal/sector_agent/agent.go || true)
 [ "$S_FAIL" -ge 3 ] || { echo "--- FAIL: 板块成分股验证失败计数点 $S_FAIL < 3（又零留痕报「验证 N 个板块」，§M-8 复活）"; exit 1; }
 # N-7：单写者三要素——flushPending 存在、pending 快照最新胜出、saveWG.Add 先于 go o.loop（顺序锁）。
 grep -q 'func (o \*Outbox) flushPending' internal/notify/outbox.go || { echo "--- FAIL: outbox 单写者 flushPending 丢失（§N-7 复活）"; exit 1; }
 grep -q 'o.pending = items' internal/notify/outbox.go || { echo "--- FAIL: 最新快照胜出登记丢失（旧快照可后写覆盖新状态，§N-7）"; exit 1; }
-N7_ADD=$(grep -n 'o\.saveWG\.Add(1)' internal/notify/outbox.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
-N7_GO=$(grep -n 'go o\.loop(stopCh)' internal/notify/outbox.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+N7_ADD=$(grep -n 'o\.saveWG\.Add(1)' internal/notify/outbox.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+N7_GO=$(grep -n 'go o\.loop(stopCh)' internal/notify/outbox.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
 [ -n "$N7_ADD" ] && [ -n "$N7_GO" ] || { echo "--- FAIL: saveWG/go loop 锚点丢失（§N-7 顺序锁失效）"; exit 1; }
 [ "$N7_ADD" -lt "$N7_GO" ] || { echo "--- FAIL: WaitGroup 计数又落在 loop 内（Stop 的 Wait 可在 Add 前返回，§N-7 -race 实录）"; exit 1; }
 # 负锁：每次变更各起一个写协程（并发 rename 互踩的根形）必须绝迹。
@@ -1294,8 +1298,8 @@ if grep -nE "DELETE FROM orders WHERE status[[:space:]]+IN[[:space:]]*\([^)]*待
 # 测试卫生锁（本批真实踩坑）：同目录别的模块在 import 期 logging.disable(CRITICAL)，pytest 单进程
 # 收集后 assertLogs 会假阴性——**凡是断言日志的测试类必须逐个继承 _LogCaptureMixin**，
 # 并按「日志断言处数」核对（只数类数会放过「整类一条断言都没挂 mixin」的形态）。
-LOG_ASSERTS=$(grep -cE 'self\.assertLogs\(' qmt_gateway/tests/test_claim_release.py)
-MIXED_CLASSES=$(grep -cE '^class Test[A-Za-z0-9_]*\(_LogCaptureMixin\)' qmt_gateway/tests/test_claim_release.py)
+LOG_ASSERTS=$(grep -cE 'self\.assertLogs\(' qmt_gateway/tests/test_claim_release.py || true)
+MIXED_CLASSES=$(grep -cE '^class Test[A-Za-z0-9_]*\(_LogCaptureMixin\)' qmt_gateway/tests/test_claim_release.py || true)
 BARE_LOG=$(awk '/^class Test/{inh=($0 ~ /_LogCaptureMixin/)} /self\.assertLogs\(/{if (!inh) n++} END{print n+0}' qmt_gateway/tests/test_claim_release.py)
 [ "$LOG_ASSERTS" -gt 0 ] && [ "$MIXED_CLASSES" -gt 0 ] || { echo "--- FAIL: §N-8 日志卫生 mixin 或断言丢失（$MIXED_CLASSES/${LOG_ASSERTS}）"; exit 1; }
 [ "$BARE_LOG" -eq 0 ] || { echo "--- FAIL: §N-8 有 $BARE_LOG 处 assertLogs 挂在未继承 _LogCaptureMixin 的类里（全局静音下会假绿）"; exit 1; }
@@ -1395,7 +1399,7 @@ grep -q 'function Read-SecretFile' deploy/qmt-win/register_engine_services.ps1 |
 [ "$(grep -cE '^[[:space:]]*Set-ServiceEnvExtra ' deploy/qmt-win/register_engine_services.ps1)" -ge 2 ] || { echo "--- FAIL: Set-ServiceEnvExtra 实调用点 < 2（quant 之外的注册路径绕过并集写入）"; exit 1; }
 # 负锁：AppEnvironmentExtra 的裸 set 必须只剩 Set-ServiceEnvExtra 内部那一条实现点
 # （注释里出现的「旧版裸 nssm set」说明文字按 # 起行排除）。
-RAW_SET=$(grep -nE 'nssm[[:space:]]+(set)[[:space:]]+\$?[a-zA-Z"]*[[:space:]]*AppEnvironmentExtra' deploy/qmt-win/register_engine_services.ps1 | grep -vE '^[0-9]+:[[:space:]]*#' | wc -l | tr -d ' ')
+RAW_SET=$(grep -nE 'nssm[[:space:]]+(set)[[:space:]]+\$?[a-zA-Z"]*[[:space:]]*AppEnvironmentExtra' deploy/qmt-win/register_engine_services.ps1 | grep -vE '^[0-9]+:[[:space:]]*#' | wc -l | tr -d ' ' || true)
 [ "$RAW_SET" -eq 1 ] || { echo "--- FAIL: 裸 nssm set AppEnvironmentExtra 出现 $RAW_SET 处（期望仅函数内 1 处，§N-5）"; exit 1; }
 # 部署面独立复核（校验面不得依附施工面，§M7 同族教训）：第 15 号探针 + 只看键名。
 grep -q 'quant env HITHINK key + LLM source' scripts/verify_deploy_guangzhou.sh || { echo "--- FAIL: §N-5 部署后键名复核探针丢失"; exit 1; }
@@ -1421,8 +1425,8 @@ if grep -nE 'Get-BaseEnvExtra|AppEnvironmentExtra' scripts/verify_deploy_guangzh
 #       而 HITHINK 由**机器级环境变量**兜住了 ⇒ 解析缺陷被完全掩盖，注册步却拿它判红。
 # 前置：①必需键集合两侧同源（否则一侧独绿＝假象），②解析不得经 Out-String（负锁，注释里的反面
 #       说明按 # 起行排除——本仓「负向 grep 命中自曝注释」已复犯多次）。
-regQ=$(grep -E '^[[:space:]]*"quant"[[:space:]]*=' deploy/qmt-win/register_engine_services.ps1 | grep -oE '"[A-Z][A-Z_0-9]*"' | tr -d '"' | LC_ALL=C sort -u | tr '\n' ',')
-verQ=$(grep -E '^\$envNeed = @\(' scripts/verify_deploy_guangzhou.sh | grep -oE '"[A-Z][A-Z_0-9]*"' | tr -d '"' | LC_ALL=C sort -u | tr '\n' ',')
+regQ=$(grep -E '^[[:space:]]*"quant"[[:space:]]*=' deploy/qmt-win/register_engine_services.ps1 | grep -oE '"[A-Z][A-Z_0-9]*"' | tr -d '"' | LC_ALL=C sort -u | tr '\n' ',' || true)
+verQ=$(grep -E '^\$envNeed = @\(' scripts/verify_deploy_guangzhou.sh | grep -oE '"[A-Z][A-Z_0-9]*"' | tr -d '"' | LC_ALL=C sort -u | tr '\n' ',' || true)
 [ -n "$regQ" ] && [ -n "$verQ" ] \
 	|| { echo "--- FAIL: §N-5 必需键清单写法变更（同源锁取不到数：注册=${regQ:-∅} 探针=${verQ:-∅}）"; exit 1; }
 [ "$regQ" = "$verQ" ] \
@@ -1501,12 +1505,12 @@ grep -q 'SetGauge("order_fail_rate_milli", rate)' internal/metrics/order_rate.go
 # 通用守卫：规则表里每条 Metric 都要有赋值点。扫描面排除测试文件（测试直接 SetGauge 造场景，
 # 算赋值点就是假绿）与规则/路由定义本体（alerter.go 里的 Metric: "x" 不是赋值，但防有人把
 # 赋值塞进规则文件糊弄守卫）。
-rule_metrics=$(grep -oE 'Metric: "[a-z0-9_]+"' internal/metrics/alerter.go | sed -E 's/.*"([^"]+)"/\1/')
+rule_metrics=$(grep -oE 'Metric: "[a-z0-9_]+"' internal/metrics/alerter.go | sed -E 's/.*"([^"]+)"/\1/' || true)
 [ -n "$rule_metrics" ] || { echo "--- FAIL: §DEADGAUGE 规则表解析为空（规则被搬走 = 守卫失明）"; exit 1; }
 dead_rules=""
 for m in $rule_metrics; do
 	n=$(find internal cmd -name '*.go' ! -name '*_test.go' ! -name 'alerter.go' ! -name 'alert_routing.go' \
-	    -print0 | xargs -0 grep -l "SetGauge(\"$m\"" 2>/dev/null | wc -l | tr -d ' ')
+	    -print0 | xargs -0 grep -l "SetGauge(\"$m\"" 2>/dev/null | wc -l | tr -d ' ' || true)
 	[ "$n" -ge 1 ] || dead_rules="$dead_rules $m"
 done
 if [ -n "$dead_rules" ]; then
@@ -1515,8 +1519,8 @@ fi
 echo "  ok 通用守卫：$(echo "$rule_metrics" | wc -w | tr -d ' ') 条规则量规全部有赋值点"
 # 负锁①：派生量规必须在取快照之前刷新（写在后面 = 每轮读到的都是上一轮值，等于没修）。
 run_body=$(awk '/^func RunAlertEvaluation\(\)/{f=1} f{print} f&&/^}$/{exit}' internal/metrics/alerter.go)
-pos_refresh=$(printf '%s\n' "$run_body" | grep -n 'refreshOrderFailRateGauge()' | head -1 | cut -d: -f1)
-pos_snap=$(printf '%s\n' "$run_body" | grep -n 'gaugeSnapshot()' | head -1 | cut -d: -f1)
+pos_refresh=$(printf '%s\n' "$run_body" | grep -n 'refreshOrderFailRateGauge()' | head -1 | cut -d: -f1 || true)
+pos_snap=$(printf '%s\n' "$run_body" | grep -n 'gaugeSnapshot()' | head -1 | cut -d: -f1 || true)
 { [ -n "$pos_refresh" ] && [ -n "$pos_snap" ] && [ "$pos_refresh" -lt "$pos_snap" ]; } \
 	|| { echo "--- FAIL: §DEADGAUGE 刷新未发生在 gaugeSnapshot 之前（读到旧值）"; exit 1; }
 # 负锁②：禁止用「累计值直接相除」冒充窗口失败率（那样一次进程内早期失败会永久挂着 5% 红线）。
@@ -1593,7 +1597,7 @@ grep -qF 'function Invoke-Restic' deploy/qmt-win/backup_snapshot.ps1 \
 	|| { echo "--- FAIL: restic 陈旧锁自愈不再是单一函数（backup 修好、forget 复发的成因）"; exit 1; }
 # 计数必须先落到变量再比较：**不能**写成 `[ "$(grep -cE '"pat"' f)" -eq 1 ]` 这种"双引号内嵌命令
 # 替换、模式里再带双引号"的形态——该形态在本机 shell 下模式会被吃掉、实跑得 0，锁把好代码判红。
-ulCnt=$(grep -cE '"unlock", "-r", \$RepoDir' deploy/qmt-win/backup_snapshot.ps1)
+ulCnt=$(grep -cE '"unlock", "-r", \$RepoDir' deploy/qmt-win/backup_snapshot.ps1 || true)
 [ "$ulCnt" -eq 1 ] \
 	|| { echo "--- FAIL: unlock 调用点=${ulCnt}（期望 1；两条腿各写一份重试＝必有一条腿漏）"; exit 1; }
 grep -qE 'if \(\$ul\.code -ne 0\) \{ throw' deploy/qmt-win/backup_snapshot.ps1 \
@@ -1658,8 +1662,8 @@ grep -qF 'backup:disk headroom (guard=8GB)' scripts/verify_deploy_guangzhou.sh \
 grep -qF 'free=" + $freeGB + "GB snapshot="' scripts/verify_deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 余量探针不再输出 free/snapshot/relay/datadir 明细"; exit 1; }
 # 等值锁：脚本护栏与探针阈值必须是同一个 GB 数（各自 grep 出数字再比相等）。
-guardN=$(grep -oE '\$c\.Free -lt [0-9]+GB' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1)
-probeN=$(grep -oE '\$pc\.Free -lt [0-9]+GB' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1)
+guardN=$(grep -oE '\$c\.Free -lt [0-9]+GB' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1 || true)
+probeN=$(grep -oE '\$pc\.Free -lt [0-9]+GB' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1 || true)
 [ -n "$guardN" ] && [ -n "$probeN" ] \
 	|| { echo "--- FAIL: 护栏/探针阈值写法变更（等值锁取不到数，两侧判据失去同源）"; exit 1; }
 [ "$guardN" = "$probeN" ] \
@@ -1706,8 +1710,8 @@ grep -qF 'if ($writers -ge 2)' scripts/verify_deploy_guangzhou.sh \
 grep -qF 'writer without lock (unguarded run)' scripts/verify_deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 第 18 探针丢失「不认锁的进程」判据（09-23 那类孤儿复犯将无信号）"; exit 1; }
 # ② 接管龄上界等值：脚本用分钟（$LockMaxMin），探针用小时，换算后必须相等。
-lockMin=$(grep -oE '\$LockMaxMin = [0-9]+' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1)
-probeH=$(grep -oE 'if \(\$lkAgeH -ge [0-9]+\)' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1)
+lockMin=$(grep -oE '\$LockMaxMin = [0-9]+' deploy/qmt-win/backup_snapshot.ps1 | grep -oE '[0-9]+' | head -1 || true)
+probeH=$(grep -oE 'if \(\$lkAgeH -ge [0-9]+\)' scripts/verify_deploy_guangzhou.sh | grep -oE '[0-9]+' | head -1 || true)
 [ -n "$lockMin" ] && [ -n "$probeH" ] \
 	|| { echo "--- FAIL: 锁龄上界写法变更（等值锁取不到数，两侧判据失去同源）"; exit 1; }
 [ "$lockMin" -eq $((probeH * 60)) ] \
@@ -1751,9 +1755,9 @@ for g in applied_factor_stale_basis applied_pattern_stale_basis; do
 		|| { echo "--- FAIL: $g 未显式 RoutePush（告警只进列表不推送，无人值守看不见）"; exit 1; }
 done
 # ② 对称性：载入侧 fail-close 与端点载荷两侧都必须各命中 2 次（因子 + 形态）。
-nGate=$(grep -c "failClose && e.StaleAdjBasis" internal/research/apply.go)
+nGate=$(grep -c "failClose && e.StaleAdjBasis" internal/research/apply.go || true)
 [ "$nGate" -eq 2 ] || { echo "--- FAIL: 失效闸只覆盖一侧（fail-close 命中 $nGate 处，应为 2=fac+pat）"; exit 1; }
-nAPI=$(grep -c "StaleAdjBasis: e.StaleAdjBasis" internal/server/library.go)
+nAPI=$(grep -c "StaleAdjBasis: e.StaleAdjBasis" internal/server/library.go || true)
 [ "$nAPI" -eq 2 ] || { echo "--- FAIL: /api/research/library 载荷只带一侧标记（命中 ${nAPI}，应为 2）"; exit 1; }
 # ③ 缺省处置=shadow；未知值也必须归一为 shadow（不得"猜个更安全的默认"把策略停掉）。
 python3 - internal/research/apply.go <<'PY' || { echo "--- FAIL: §ADJ-BASIS 缺省处置不符（未知值→disable 或静态缺省非 shadow）"; exit 1; }
@@ -1767,8 +1771,8 @@ assert 'StaleAdjBasisDisable' in body, '显式 disable 分支不见了'
 assert re.search(r'staleAdjAction\s*=\s*StaleAdjBasisShadow', t), '包级静态缺省必须=shadow'
 PY
 # ④ 口径版本串 Go/前端等值（前端 CURRENT_ADJ_BASELINE 是后端常量的手工副本，漂开即整页红标失灵）。
-goBasis=$(grep -oE 'AdjBaselineVersion = "[^"]+"' internal/research/windowed.go | sed 's/.*"\(.*\)"/\1/')
-jsBasis=$(grep -oE "CURRENT_ADJ_BASELINE = '[^']+'" web/src/pages/Research.jsx | sed "s/.*'\(.*\)'/\1/")
+goBasis=$(grep -oE 'AdjBaselineVersion = "[^"]+"' internal/research/windowed.go | sed 's/.*"\(.*\)"/\1/' || true)
+jsBasis=$(grep -oE "CURRENT_ADJ_BASELINE = '[^']+'" web/src/pages/Research.jsx | sed "s/.*'\(.*\)'/\1/" || true)
 [ -n "$goBasis" ] && [ -n "$jsBasis" ] || { echo "--- FAIL: 口径版本串取不到数（写法变更，等值锁失去落点）"; exit 1; }
 [ "$goBasis" = "$jsBasis" ] || { echo "--- FAIL: 口径版本串漂移 Go=$goBasis vs 前端=${jsBasis}（红标判定两边不一）"; exit 1; }
 # ⑤ 负锁：前端不得再按 kind 豁免形态战法（上一版正是这句留了半边盲区）。
@@ -2100,10 +2104,10 @@ echo "==> 82 §KLINE-CHAIN-3 日K三级兜底链：腾讯主源 + 东财降到�
 #       ③ 库内腿靠引擎注入才有数据——装配漏掉时表现与"根本没有兜底"完全一致（静默跳过）。
 go test -count=1 ./internal/strategy_engine/ -run 'TestFetchDayKLine|TestStoreDayKLine|TestCachedKLine|TestLastCloseSkipsStoreLeg|TestApplyDayKLine' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 链序锁（行号严格递增比文本断言可靠；沿用 54 的滤注释姿势）：腾讯 < 东财 < 库内 < 新浪。
-K3_TC=$(grep -n 'GetTencentKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
-K3_EM=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
-K3_DB=$(grep -n 'e.storeDayKLine(code, prevClose)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
-K3_SINA=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1)
+K3_TC=$(grep -n 'GetTencentKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+K3_EM=$(grep -n 'GetKLine(code, "101", 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+K3_DB=$(grep -n 'e.storeDayKLine(code, prevClose)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
+K3_SINA=$(grep -n 'GetSinaKLine(code, 120)' internal/strategy_engine/engine.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | head -1 | cut -d: -f1 || true)
 [ -n "$K3_TC" ] && [ -n "$K3_EM" ] && [ -n "$K3_DB" ] && [ -n "$K3_SINA" ] \
 	|| { echo "--- FAIL: 日K四条腿少了一条（§KLINE-CHAIN-3 链序锁失效）"; exit 1; }
 [ "$K3_TC" -lt "$K3_EM" ] && [ "$K3_EM" -lt "$K3_DB" ] && [ "$K3_DB" -lt "$K3_SINA" ] \
@@ -2123,7 +2127,7 @@ grep -q 'const storeBarsMaxStale' internal/strategy_engine/engine.go \
 grep -q 'if prevClose <= 0 {' internal/strategy_engine/engine.go \
 	|| { echo "--- FAIL: 无锚（昨收取不到）不再拒用库内腿（宁可无兜底也不出错锚）"; exit 1; }
 # 拒用必须留痕：noteStoreBarsRejected 至少覆盖 无历史序列/末根非法/scale 非法/过期 四类分支。
-K3_REJ=$(grep -c 'noteStoreBarsRejected(' internal/strategy_engine/engine.go)
+K3_REJ=$(grep -c 'noteStoreBarsRejected(' internal/strategy_engine/engine.go || true)
 [ "$K3_REJ" -ge 5 ] || { echo "--- FAIL: 库内腿拒用留痕只剩 $K3_REJ 处（<5）——兜底静默失效不可见（§M-8/§N-6）"; exit 1; }
 # 装配锁：库内腿靠注入取数，装配点漏了就是永久静默跳过（形态同"没有兜底"）。
 grep -q 'strategyEngine.SetDayBarsLookup(dayBarsLookup.Lookup)' cmd/quant/main.go \
@@ -2194,17 +2198,17 @@ echo "==> 84 §FILL-AMEND 历史错账勘误通道：追加式决定 + fills_eff
 go test -count=1 ./internal/store/ -run 'TestFillAmendment|TestFillEffectiveNoFanOut|TestConservation' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 go test -count=1 ./internal/server/ -run 'TestFillAmendment' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
 # 迁移顺序锁：列补齐(trade_id) 必须早于 migrateFillAmendments 调用。
-K4_COL=$(grep -n 'ALTER TABLE fills ADD COLUMN trade_id' internal/store/store.go | head -1 | cut -d: -f1)
-K4_VIEW=$(grep -n 'd.migrateFillAmendments()' internal/store/store.go | head -1 | cut -d: -f1)
+K4_COL=$(grep -n 'ALTER TABLE fills ADD COLUMN trade_id' internal/store/store.go | head -1 | cut -d: -f1 || true)
+K4_VIEW=$(grep -n 'd.migrateFillAmendments()' internal/store/store.go | head -1 | cut -d: -f1 || true)
 [ -n "$K4_COL" ] && [ -n "$K4_VIEW" ] || { echo "--- FAIL: 找不到 trade_id 补列或建视图调用（§FILL-AMEND 顺序锁失效）"; exit 1; }
 [ "$K4_COL" -lt "$K4_VIEW" ] || { echo "--- FAIL: 建视图排到了补列之前（旧库 Open 失败、服务起不来）"; exit 1; }
 # 视图不扇行的两道保障（active 与 applied 各一对；谓词含 'revoked' 时 SQLite 推不出 JOIN 至多一行）。
-K4_IDX=$(grep -c 'CREATE UNIQUE INDEX IF NOT EXISTS idx_fa_' internal/store/fill_amendments.go)
+K4_IDX=$(grep -c 'CREATE UNIQUE INDEX IF NOT EXISTS idx_fa_' internal/store/fill_amendments.go || true)
 [ "$K4_IDX" -ge 4 ] || { echo "--- FAIL: 勘误唯一索引只剩 $K4_IDX 个（<4）——视图可能把一笔成交扇成多行" ; exit 1; }
 grep -q "DROP VIEW IF EXISTS fills_effective" internal/store/fill_amendments.go \
 	|| { echo "--- FAIL: 视图不再是 DROP+CREATE（旧定义会被 IF NOT EXISTS 永久钉死）"; exit 1; }
 # 收敛点锁：按方向取数的六个读取口必须全部读视图（漏一个=同一笔改判在两处给出互相矛盾的数字）。
-K4_VIEWED=$(grep -rc 'FROM fills_effective' internal/store/*.go | LC_ALL=C awk -F: '{s+=$2} END {print s+0}')
+K4_VIEWED=$(grep -rc 'FROM fills_effective' internal/store/*.go | LC_ALL=C awk -F: '{s+=$2} END {print s+0}' || true)
 [ "$K4_VIEWED" -ge 6 ] || { echo "--- FAIL: 读视图的口径只有 $K4_VIEWED 处（<6）——纪律闸/成交簿出现分叉" ; exit 1; }
 for f in risk_gates.go real_positions.go settlement.go; do
 	grep -q 'fills_effective' internal/store/$f || { echo "--- FAIL: internal/store/$f 未接生效方向视图"; exit 1; }
@@ -2225,7 +2229,7 @@ grep -q 'FillID  int64  `json:"fill_id"`' internal/server/fill_amendments.go \
 grep -q 'db.RawFillForUser(uid, req.FillID)' internal/server/fill_amendments.go \
 	|| { echo "--- FAIL: 未先按归属读原始行（越权面 + 锚点来源不唯一）"; exit 1; }
 # 守恒自检只读：整份实现不许出现写账语句（"顺手让它自动修"是本条要防的那类改动；滤注释行）。
-K4_CONS_FN=$(grep -n 'func (d \*DB) CheckBookConservation' internal/store/fill_conservation.go | head -1 | cut -d: -f1)
+K4_CONS_FN=$(grep -n 'func (d \*DB) CheckBookConservation' internal/store/fill_conservation.go | head -1 | cut -d: -f1 || true)
 [ -n "$K4_CONS_FN" ] || { echo "--- FAIL: 守恒自检实现丢失"; exit 1; }
 if grep -nE '^\s*(d\.db|tx)\.(Exec|Begin)' internal/store/fill_conservation.go | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep -q .; then
 	echo "--- FAIL: fill_conservation.go 出现写库调用（守恒自检只准 SELECT）"; exit 1; fi
@@ -2358,7 +2362,7 @@ go test -count=1 ./internal/store/ -run 'TestSumFilledQtyMatchesCounterTruncated
 # ① 截断只准有一处：一个常量 + 一个函数（三处截断点各写一份 = 上限变更时必然漏改一处）。
 grep -q 'WIRE_REF_MAX = 24' qmt_gateway/qmt_bridge_strategy.py \
 	|| { echo "--- FAIL: 线上截断上限常量丢失（24 这个事实又散回字面量）"; exit 1; }
-wt=$(grep -c 'return str(signal_id or "")\[:WIRE_REF_MAX\]' qmt_gateway/qmt_bridge_strategy.py)
+wt=$(grep -c 'return str(signal_id or "")\[:WIRE_REF_MAX\]' qmt_gateway/qmt_bridge_strategy.py || true)
 [ "$wt" = "1" ] || { echo "--- FAIL: 截断函数体不是唯一一处（计数=${wt}，出现两处就有第二份口径）"; exit 1; }
 # ② 三个调用点全部过 wire_ref（下单侧截断、归属比对侧同样截断，两侧口径同源）。
 grep -q 'signal_id = wire_ref(req.get("signal_id", ""))' qmt_gateway/qmt_bridge_strategy.py \
@@ -2388,9 +2392,9 @@ grep -qF 'req["signal_id"] = _full or _sig_wire' qmt_gateway/gateway.py \
 # ⑤ Go 读取端两边兼容：谓词单一事实源 + 两处钱查询共用 + 反向腿带交易日闸 + 空编号判 0。
 grep -q "instr(%s, replace(substr(%s,1,10),'-','')) > 0" internal/store/real_positions.go \
 	|| { echo "--- FAIL: 反向腿的交易日闸丢失（跨两日塌成同前缀时会把别日的成交算进这笔）"; exit 1; }
-gm=$(grep -c 'func fillSignalMatchSQL' internal/store/real_positions.go)
+gm=$(grep -c 'func fillSignalMatchSQL' internal/store/real_positions.go || true)
 [ "$gm" = "1" ] || { echo "--- FAIL: 配对谓词构造函数不是唯一一处（计数=${gm}）"; exit 1; }
-gu=$(grep -c 'fillSignalMatchSQL(' internal/store/real_positions.go)
+gu=$(grep -c 'fillSignalMatchSQL(' internal/store/real_positions.go || true)
 # 1 处定义 + 2 处调用（SumFilledQty / ResetFailedRealOrder）：少一处调用就等于两条资金查询又各写一份 SQL。
 [ "$gu" = "3" ] || { echo "--- FAIL: 配对谓词调用点 ≠ 2（计数=$gu 含定义行；两处钱查询必须同源）"; exit 1; }
 grep -q 'eligibleWhere := `signal_id=? AND user_id=? AND (status=' internal/store/real_positions.go \
@@ -2435,11 +2439,11 @@ grep -q 'return a.scoreDay(klines, prevClose)' internal/btreplay/replay.go \
 	|| { echo "--- FAIL: momentumAdapter.Trigger 不再走 scoreDay（恒不触发的停用桩复活）"; exit 1; }
 # ③ 兜底互斥与当日撮合必须**两处同门**：回放主循环与扫参预计算漏任一处，网格就会给一条实盘轮不到
 #    下单的路径寻优，选出的"冠军参数"对应的是一批实盘不存在的单子。
-pbc=$(grep -c 'o.fallbackBlockedByPeer(' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}')
+pbc=$(grep -c 'o.fallbackBlockedByPeer(' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}' || true)
 [ "$pbc" = "2" ] || { echo "--- FAIL: 兜底互斥回查调用点 ≠ 2（回放/扫参各一处，计数=${pbc}）"; exit 1; }
-sdc=$(grep -c 'ad.(sameDayEntryAdapter)' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}')
+sdc=$(grep -c 'ad.(sameDayEntryAdapter)' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}' || true)
 [ "$sdc" = "2" ] || { echo "--- FAIL: 当日撮合分支不是两处都有（两条路径入场口径分叉，计数=${sdc}）"; exit 1; }
-esc=$(grep -c ', i, entryIdx)' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}')
+esc=$(grep -c ', i, entryIdx)' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}' || true)
 [ "$esc" = "2" ] || { echo "--- FAIL: 入场定档没有按 entryIdx 传（滑点/可成交性仍按信号日+1 算，计数=${esc}）"; exit 1; }
 # ③b 单独跑动量时没有兄弟可回查＝这道门整体不存在，数字必须自带口径警告（否则两张同名表差几倍
 #     没人知道警告在哪一步丢了）。
@@ -2483,7 +2487,7 @@ VD=scripts/verify_deploy_guangzhou.sh
 grep -qF 'Probe "engine:today pinned signals spread across strategies" ($sgBad.Count -eq 0)' "$VD" \
 	|| { echo "--- FAIL: §SIGNAL-DIST 探针丢失或判据被换掉（红一旦不等价于「解析/形状失败」，这条眼睛就废了）"; exit 1; }
 # ② 判红来源必须恰好两处（parse-error / shape-error）。多一处＝有人把合法态判成红，这条会每天清晨自找一红。
-sgb=$(grep -c 'sgBad += (' "$VD")
+sgb=$(grep -c 'sgBad += (' "$VD" || true)
 [ "$sgb" = "2" ] || { echo "--- FAIL: §SIGNAL-DIST 判红来源不是 2 处（计数=${sgb}，只允许 parse-error 与 shape-error）"; exit 1; }
 if grep -nE 'sgBad \+= \(' "$VD" | grep -vE ':[0-9]+:[[:space:]]*#' | grep -vE 'parse-error|shape-error' | grep -q .; then
 	echo '--- FAIL: §SIGNAL-DIST 出现第三种判红来源（no-file／跨日残留桶／当日零信号都是合法态，一律不得进 sgBad）'; exit 1; fi
@@ -2502,7 +2506,7 @@ grep -qE '\$sgTodayN -gt 0 -and \$sgTypes\.Count -eq 1 -and \$sgTypes\[0\] -eq .
 	|| { echo '--- FAIL: leader_only 判据被改写（须同时满足 当日 n>0 / 种类==1 / 该类==dragon）'; exit 1; }
 # ⑥ 按文件分行而不是合并计数：DataDir 下 Recurse 会收到根目录 + 每账号各一份（09-24 首跑实测 4 份），
 #    合并＝把昨日残留和别人的账号混进同一个数字。取数路径出现第二处即口径分叉。
-sgf=$(grep -c "Filter 'signals_today.json'" "$VD")
+sgf=$(grep -c "Filter 'signals_today.json'" "$VD" || true)
 [ "$sgf" = "1" ] || { echo "--- FAIL: 固化信号取数路径不是唯一一处（计数=${sgf}，出现第二处就有第二套口径）"; exit 1; }
 # ⑦ 战法桶名必须 ASCII：本仓实录过 PS→SSH→bash 回传时中文 detail 被 GBK 字节打乱 ⇒ grep 判据恒不命中
 #    （＝把假绿写进探针）。中文只允许出现在 -match 的匹配侧，不允许出现在 return 的取值侧。
@@ -2519,13 +2523,52 @@ ordD=$(grep -n 'return "dragon" }' "$VD" | head -1 | cut -d: -f1 || true)
 #    一旦有人把 INFO 接成 PASS，绿的数量就会凭空增长，而红绿语义没变——这是最隐蔽的一种假绿。
 grep -qF 'INFO\|*) echo' "$VD" \
 	|| { echo '--- FAIL: bash 侧 INFO 分支丢失（观测读数会被当成未知行，或被误接进 PASS/FAIL 计数）'; exit 1; }
-infop=$(grep -c 'Write-Output ("INFO|' "$VD")
+infop=$(grep -c 'Write-Output ("INFO|' "$VD" || true)
 [ "$infop" = "3" ] || { echo "--- FAIL: INFO 观测行数不是 3（逐文件空态/逐文件明细/当日聚合，计数=${infop}）"; exit 1; }
 # ⑨ 负锁：本探针不得用 `| Out-String` 读 JSON 字段（PS 控制台按 120 列折行会劈开值，§N-5 的教训本体；
 #    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
 grep -qF '([string]$sgJson.trading_day)' "$VD" \
 	|| { echo '--- FAIL: trading_day 不再用 [string] 直转（退回 | Out-String 即重新引入折行失明）'; exit 1; }
 echo "ok - §SIGNAL-DIST 守卫通过（探针判据锁 1 + 判红来源等值锁 1 + 来源白名单负锁 1 + 合法态明细锁 2 + 聚合读数锁 4 + leader_only 三条件锁 1 + 取数路径唯一锁 1 + 桶名 ASCII 负锁 1 + 桶序锁 1 + INFO 通道锁 2 + Out-String 负锁 1）"
+
+echo "==> 89 §GATE-COUNT-LOCK 门禁自身的地雷：计数锁零命中会把整轮 verify 静默跑死（2026-09-24，§88 自曝同类）..."
+# 为什么给门禁脚本自己设锁：本段是 09-24 用一轮真红换来的——`var=$(... | grep -c 'pat')` 在**零命中**
+# 时退出码 1（计数为 0 恰恰是负锁要的绿色），而本脚本开着 `set -euo pipefail`，命令替换非 0 ⇒ 整条赋值
+# 语句失败 ⇒ 脚本当场中止，日志里**既没有 `--- FAIL` 也没有 `ok -`**，只有末尾一个 `VERIFY_EXIT=1`。
+# 这比"少一条锁"更糟：① 它把该段之后的所有段整体吞掉（第 6 轮就是这么丢掉最后一段的），
+# ② 有人日后**删掉被守护的代码**时，本该报红的锁会以"跑死"的形态出现，读日志的人分不清是环境问题还是缺陷。
+# 规则因此定成一条机械口径：**门禁里凡 `var=$(... grep ...)` 一律在替换末尾写 `|| true`**，
+# 判红只准交给紧随其后的等值/非空判断——加了 `|| true` 不改变任何一次红绿结论，只把"中止"变回"报红"。
+# 本段用 awk 单趟判定（awk 即使零命中也退出码 0 ⇒ 锁自己不会重犯它要防的雷），并且**先把反斜杠续行
+# 拼成一条逻辑行**再判：循环体里的赋值带缩进、`n=$(find … \` 的 `|| true` 落在下一行，逐行扫会漏判。
+GS=scripts/verify_changes.sh
+# 踩雷的形态有三种：
+#   A `v=$(... grep -c ...)`（09-24 §88 实跑锤出的那个）、B `v=$(... grep -l ... | wc -l ...)`、
+#   C `v=$(... grep -n ... | head -1 | cut -d: -f1)`（被守护代码一旦被删，grep 零命中＝该报红，实际跑死）。
+# 尺子取最宽的一条机械口径：**凡赋值替换里出现 grep 都必须写 `|| true`**——因为 grep 的退出码在这三种
+# 形态里都不参与判红（判红交给后面的等值/非空判断），留着它只会把"报红"变成"中止"。
+# 本段自己那两行必然写着 `grep` 字面量，统一以行尾 `GATE-SCAN-SELF` 标记豁免（注释不参与匹配）。
+CL=$(awk '{ b=$0; while (b ~ /\\$/ && (getline x) > 0) b = b " " x; if (b ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*=\$\(/ && b ~ /grep/ && b !~ /\|\| true/ && b !~ /GATE-SCAN-SELF/) printf "%d: %s\n", NR, b }' "$GS") # GATE-SCAN-SELF
+if [ -n "$CL" ]; then
+	echo '--- FAIL: §GATE-COUNT-LOCK 发现未加固的计数赋值（零命中即静默中止整轮 verify；请在替换末尾补 `|| true`，判红交给后面的等值判断）：'
+	printf '%s\n' "$CL"
+	exit 1
+fi
+# 加固面读数：本批（09-24 收尾）一次性把 50 处历史计数赋值补齐 `|| true`（扫描面 52 处，余 2 处是本段
+# 自身），只准这个数**变多**（新写的锁按同一口径加固），变少＝有人把加固删了；总数一起回显，
+# 方便看出"还剩几处裸奔"。
+CN=$(awk '{ b=$0; while (b ~ /\\$/ && (getline x) > 0) b = b " " x; if (b ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*=\$\(/ && b ~ /grep/ && b !~ /GATE-SCAN-SELF/) { t++; if (b ~ /\|\| true/) h++ } } END { printf "%d %d\n", h+0, t+0 }' "$GS") # GATE-SCAN-SELF
+HARD=${CN% *}
+TOTAL=${CN#* }
+[ "${HARD:-0}" -ge 50 ] \
+	|| { echo "--- FAIL: 已加固的 grep 计数赋值不足 50 处（读到 ${HARD}／共 ${TOTAL}，说明历史加固被删）"; exit 1; }
+# 前提锁：本段的整套修法建立在「脚本开着失败即中止」上——一旦有人把 set 放宽，
+# 加固不再必要，但整轮门禁的失败可见性也没了（静默跑绿比静默跑死更坏）。所以两头都钉住。
+grep -q '^set -euo pipefail$' "$GS" \
+	|| { echo '--- FAIL: §GATE-COUNT-LOCK 的前提没了（门禁开头必须仍开着 set -euo pipefail）'; exit 1; }
+if grep -nE '^set \+e|^set -u$|^set \+o pipefail' "$GS" > /dev/null; then
+	echo '--- FAIL: 门禁脚本里出现放宽 set 的写法（不得用「关掉失败即中止」来绕开计数锁的加固）'; exit 1; fi
+echo "ok - §GATE-COUNT-LOCK 守卫通过（未加固计数赋值负锁 1 + 加固面下限锁 1（当前 ${HARD}/${TOTAL}） + set 前提锁 1 + set 放宽负锁 1）"
 
 echo ""
 echo "==> 全部通过"
