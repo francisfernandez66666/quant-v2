@@ -132,8 +132,12 @@ func main() {
 
 	// 配置管理器：读取数据目录下的 config.json（策略/风控/情绪/LLM 等）
 	cfgMgr := config.NewManager(filepath.Join(dataDir, "config.json"))
-	// §启动顺序 1：配置存储挂载。§UI-AUTHORITATIVE 修复：配置存储（trading.db KV）必须在下方 LLM 启动装配【之前】挂好，
+	// §启动顺序 1：配置存储挂载。§UI-AUTHORITATIVE 修复：配置存储（账号规则快照）必须在下方 LLM 启动装配【之前】挂好，
 	// 否则 StoredLLMConfig 恒为 false，设置页保存的运营配置在重启后无法恢复（被 env 顶掉）。
+	// 持久层如实写清楚（§TOKEN-BLIND 复核 2026-09-24 更正：原注释误写成"trading.db KV"）：
+	// auth.Manager 的 configs[] 落在 <DataDir>/auth.json，键为 (userID,"quant_config_json_v1")，
+	// 值是整棵 Rules 的 JSON 串——不是 trading.db 里的表。同一条口径害过部署探针：token 探针只读
+	// config.json 的全局 rules.qmt（三级优先级的最后一级、允许长期为空）就把引擎腿记成缺配。
 	// server.New 内部会再次 SetStore（幂等赋值，无副作用）。
 	cfgMgr.SetStore(authMgr)
 	// 运营数据统一归属管理员：把管理员账号 ID 注入配置管理器，使量化/模拟盘/策略/D1/LLM/

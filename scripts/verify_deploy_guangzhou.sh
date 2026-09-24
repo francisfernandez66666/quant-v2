@@ -475,17 +475,32 @@ $mockMiss += $mockGateMiss
 $mockDetail = "exe=" + $(if ($mockExePresent) { "present" } else { "absent" }) + " procs=" + $mockProcN + " mock_listeners=" + $mockListenN + " other_listeners=" + $otherListenN + " disabled_copies=" + $mockDisabledN + " gate=" + $mockGate + " miss=" + $(if ($mockMiss.Count) { ($mockMiss -join ",") } else { "none" })
 Probe ("qmt:mock retired (no uat exe, no :" + $MockPort + " listener, preview gate)") ($mockMiss.Count -eq 0) $mockDetail
 
-# 13) §QMT-TOKENROT（2026-09-23，第 20 探针）：网关 token 四源一致性（只比指纹，绝不回显值）。
-# 四源（详见 rotate_qmt_token.ps1 文件头）：①网关 config.xt.json（token+report_token）；
+# 13) §QMT-TOKENROT（2026-09-23 建，2026-09-24 §TOKEN-BLIND 修读法，第 20 探针）：
+#     网关 token 指纹一致性（只比指纹，绝不回显值）。
+# 可比对源最多五条（③b 只在"全部账号快照收敛到同一指纹"时才进来）：
+#   ①网关 config.xt.json（token+report_token）；
 #   ②NSSM 服务 AppEnvironmentExtra 的 QUANT_GATEWAY_TOKEN/…_REPORT_TOKEN——进程 env 覆盖文件值
 #   （gateway.py :186/:199），读法=注册表直读（规矩①：绝不解析 nssm 控制台文本）；
-#   ③引擎 config.json rules.qmt.token；④桥进程命令行的 --token。
-# 可达性口径（如实声明，防"探针只能变绿"）：①②③④都经现网唯一 sanctioned 通道（管理员 SSH +
-#   powershell）读取。②若注册表读不到（服务名不对/权限）记 unknown；④桥没在跑时该源**无从读取**，
-#   记 missing（合法运行态，不判红）——但**四源全部读不到**时判红（"no readable source"），
-#   否则这条探针就成了摆设。env 侧未设 QUANT_GATEWAY_TOKEN 也是合法态（网关回退文件值）记 missing。
+#   ③引擎 config.json rules.qmt.token（全局兜底那一级）；③b 账号快照 auth.json configs[] 的
+#     .qmt.token（§TOKEN-BLIND 补，仅在所有快照收敛到同一指纹时参与比对）；④桥进程命令行的 --token。
+# 可达性口径（如实声明，防"探针只能变绿"）：各腿都经现网唯一 sanctioned 通道（管理员 SSH +
+#   powershell）读取。注册表读不到（服务名不对/权限）记 unknown；④桥没在跑时该源**无从读取**，
+#   记 no-bridge-proc（合法运行态，不判红）——但**一个可读源都没有**时判红（"no readable source"），
+#   否则这条探针就成了摆设。env 侧未设 QUANT_GATEWAY_TOKEN 也是合法态（网关回退文件值）记 key-absent。
 # 判定：所有"可读且存在"的源的 sha256 前 8 位指纹必须一致（token 腿 + report 腿分别聚合）；
-#   任何两个可读源指纹不同 → 红。missing/unknown 不算分歧、但如实列进明细。
+#   任何两个可读源指纹不同 → 红。空态/unknown 不算分歧、但如实列进明细（明细自带每条腿的空态字）。
+#
+# §TOKEN-BLIND（2026-09-24）——**只改读法与自证，不改红/绿语义**（方案 docs/FIX_PLAN_20260923NIGHT.md §11）：
+# 09-23 21:40 与 22:46 两次部署后复验，这条都稳定红在 `token_fp_agree=0/4 file=unknown env=missing
+# engine=missing bridge=missing`，而同刻 `gw:/health` 绿 ⇒ **现网确实在用一份口令跑着，是探针读不到**。
+# 四条腿的"读不到"是三件不同的事：① 被自己的解码读法弄瞎（真缺陷）；②③④ 是合法空态被混成了同一个
+# `missing` 字，看起来像"三处都没配"。夜间真正可达的只有 ①，所以 `no readable source` 是**结构性必红**。
+# 三步修的全是"读法/取值链/口径"：① 腿补 `-Encoding UTF8` 并把异常类型回显（下次失明可直接归因）；
+# ③ 腿把"文件不在"与"字段为空"拆成两个字，并补一条**账号级**读法（现网权威 token 在 auth.json 的
+#    configs[].key=quant_config_json_v1 → .qmt.token，全局 rules.qmt 只是三级优先级最后兜底，见
+#    internal/config/config.go:1903 GetQMTConfigFor）；④ 顶部显式声明"本次期望几个源可读"。
+#    判定式（分歧即红 / 全读不到即红 / 单源不成红）一个字没动。
+$tkExpectReadable = 1   # 夜间实测：只有网关 config.xt.json 一条腿真正可读；env/引擎/桥按设计合法为空或不在跑
 function TokFp([string]$v) {
     if (-not "$v") { return "" }
     try {
@@ -493,15 +508,23 @@ function TokFp([string]$v) {
         return ("sha256:" + ((@($ts.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$v))) | ForEach-Object { $_.ToString("x2") }) -join "").Substring(0, 8))
     } catch { return "sha256:err" }
 }
-$tk1 = "unknown"; $tk1r = ""
+$tk1 = "unknown"; $tk1r = ""; $tk1Why = ""
 if (Test-Path $GatewayCfg) {
     try {
-        $tk1j = Get-Content -Path $GatewayCfg -Raw | ConvertFrom-Json
-        $tk1 = TokFp([string]$tk1j.token); if (-not $tk1) { $tk1 = "missing" }
-        $tk1r = TokFp([string]$tk1j.report_token)
-    } catch { $tk1 = "unknown" }
-} else { $tk1 = "missing" }
-$tk2 = "unknown"; $tk2r = ""
+        # 必须显式 -Encoding UTF8：这份文件是 ensure_gateway_config.ps1 刻意以**无 BOM UTF-8**
+        # 落盘的（网关 json.load 见 BOM 直接抛）。PS 5.1 的 Get-Content 缺省按 ANSI(GBK) 解，
+        # 中文字段的最后一个字节会把紧随的 `"` 当 GBK 尾字节吞掉 ⇒ 字符串闭合被劈开 ⇒
+        # ConvertFrom-Json 抛 ⇒ 记 unknown。同段读引擎 config.json 一直带着 -Encoding UTF8，
+        # 两腿读法不一致就是这条探针 09-23 连红两晚的本体。（09-24 待现网复验确认转绿。）
+        $tk1RawTxt = Get-Content -Path $GatewayCfg -Raw -Encoding UTF8
+        if (-not "$tk1RawTxt".Trim()) { $tk1 = "empty-file" } else {
+            $tk1j = "$tk1RawTxt" | ConvertFrom-Json
+            $tk1 = TokFp([string]$tk1j.token); if (-not $tk1) { $tk1 = "empty-field" }
+            $tk1r = TokFp([string]$tk1j.report_token)
+        }
+    } catch { $tk1 = "unknown"; $tk1Why = "(" + $_.Exception.GetType().Name + ")" }
+} else { $tk1 = "no-file" }
+$tk2 = "unknown"; $tk2r = ""; $tk2Why = ""
 try {
     $tk2Key = Get-Item -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $GwTokenService) -ErrorAction Stop
     $tk2Vals = @($tk2Key.GetValue('AppEnvironmentExtra', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))
@@ -511,28 +534,59 @@ try {
         if ($t2 -match '^QUANT_GATEWAY_TOKEN=(.+)$') { $tk2Tok = $Matches[1] }
         elseif ($t2 -match '^QUANT_GATEWAY_REPORT_TOKEN=(.+)$') { $tk2Rep = $Matches[1] }
     }
-    $tk2 = TokFp $tk2Tok; if (-not $tk2) { $tk2 = "missing" }
+    $tk2 = TokFp $tk2Tok; if (-not $tk2) { $tk2 = "key-absent" }   # 注册表读到了、只是没设这个键（合法态，网关回退文件值）
     $tk2r = TokFp $tk2Rep
-} catch { $tk2 = "unknown" }
-$tk3 = "unknown"
+} catch { $tk2 = "unknown"; $tk2Why = "(" + $_.Exception.GetType().Name + ")" }
+$tk3 = "unknown"; $tk3Why = ""
 $tk3Path = $DataDir + "\config.json"
 if (Test-Path $tk3Path) {
     try {
         $tk3j = Get-Content -Path $tk3Path -Raw -Encoding UTF8 | ConvertFrom-Json
-        $tk3 = TokFp([string]$tk3j.rules.qmt.token); if (-not $tk3) { $tk3 = "missing" }
-    } catch { $tk3 = "unknown" }
-} else { $tk3 = "missing" }
-$tk4 = "missing"
+        $tk3 = TokFp([string]$tk3j.rules.qmt.token); if (-not $tk3) { $tk3 = "empty-field" }
+    } catch { $tk3 = "unknown"; $tk3Why = "(" + $_.Exception.GetType().Name + ")" }
+} else { $tk3 = "no-file" }
+# ③b 引擎侧**账号级** token（§TOKEN-BLIND 修法第 2 步）：多账号实盘起，引擎实际用的是账号快照，
+# 全局 rules.qmt 只是三级优先级里的最后兜底（internal/config/config.go:1903 GetQMTConfigFor：
+# 账号自身覆盖 → 运营账号覆盖 → 全局）。快照的持久层是 auth.json 的 configs[]，key
+# =quant_config_json_v1，value 是整棵 Rules 的 JSON 串（token 在 .qmt.token）——所以旧读法只看
+# 全局文件就把引擎腿记成 `missing` 是**前提过期**，不是配置漂移。读 auth.json 的这条路子
+# 在同脚本 §N-5 探针（判 LLM 来源）已有现成实现，属复用；只算 sha256 前缀，值不进任何输出。
+# 诚实边界：多账号本就允许各配各的网关与口令，所以**只有"全部快照恰好收敛到同一个指纹"时**才把它
+# 当成可比对的源；两个以上不同指纹时记 multi-account(N) 参与展示、不参与判红（绝不凭空造红）。
+$tkAuthPath = $DataDir + "\auth.json"
+$tk3Auth = "no-file"; $tkAccFps = @()
+if (Test-Path $tkAuthPath) {
+    try {
+        $tkAj = Get-Content -Path $tkAuthPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $tk3Auth = "absent"      # 文件能读，但没有带 token 的账号快照
+        foreach ($tkC in @($tkAj.configs)) {
+            if ($null -eq $tkC) { continue }
+            if ($tkC.key -ne 'quant_config_json_v1') { continue }
+            if (-not ("$($tkC.value)").Trim()) { continue }
+            try {
+                $tkR = "$($tkC.value)" | ConvertFrom-Json
+                $tkFp = TokFp([string]$tkR.qmt.token)
+                if ($tkFp) { $tkAccFps += $tkFp; $tk3Auth = "readable" }
+            } catch { $tk3Auth = "parse-error" }
+        }
+    } catch { $tk3Auth = "parse-error" }
+}
+$tk3Uniq = @($tkAccFps | Sort-Object -Unique)
+$tk3b = "empty"
+if ($tk3Uniq.Count -eq 1) { $tk3b = [string]$tk3Uniq[0] }
+elseif ($tk3Uniq.Count -gt 1) { $tk3b = "multi-account(" + $tk3Uniq.Count + ")" }
+$tk4 = "no-bridge-proc"   # 收盘后桥不在跑＝合法运行态（原记 missing 与"配了空 token"混成一个字）
 try {
     foreach ($pr4 in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
         $cl4 = [string]$pr4.CommandLine
         if ($cl4 -match 'qmt_bridge\.py') {
-            if ($cl4 -match '--token[= ](\S+)') { $tk4 = TokFp $Matches[1]; if (-not $tk4) { $tk4 = "missing" } } else { $tk4 = "no-cmdline-token" }
+            if ($cl4 -match '--token[= ](\S+)') { $tk4 = TokFp $Matches[1]; if (-not $tk4) { $tk4 = "empty-field" } } else { $tk4 = "no-cmdline-token" }
             break
         }
     }
 } catch { $tk4 = "unknown" }
-$tkPres = @($tk1, $tk2, $tk3, $tk4 | Where-Object { $_ -match '^sha256:' })
+# 可比对的源 = 真的读出指纹的那些（③b 只在单指纹时进来自证，multi-account 不进判据）。
+$tkPres = @($tk1, $tk2, $tk3, $tk3b, $tk4 | Where-Object { $_ -match '^sha256:' })
 $tkGroups = @($tkPres | Group-Object | Sort-Object -Property Count -Descending)
 $tkAgreeN = 0
 if ($tkGroups.Count -ge 1) { $tkAgreeN = [int]$tkGroups[0].Count }
@@ -541,8 +595,11 @@ if (($tkGroups | Measure-Object).Count -gt 1) { $tkBad += ("token_diverged disti
 $tkRep = @(@($tk1r, $tk2r) | Where-Object { $_ -match '^sha256:' }) | Where-Object { $_ }
 if (($tkRep | Sort-Object -Unique | Measure-Object).Count -gt 1) { $tkBad += "report_token_diverged" }
 if ($tkPres.Count -eq 0) { $tkBad += "no readable source" }
-$tkDetail = "token_fp_agree=" + $tkAgreeN + "/4 file=" + $tk1 + " env=" + $tk2 + " engine=" + $tk3 + " bridge=" + $tk4 + " report_file=" + $(if ($tk1r) { $tk1r } else { "none" }) + " report_env=" + $(if ($tk2r) { $tk2r } else { "none" }) + " miss=" + $(if ($tkBad.Count) { ($tkBad -join ",") } else { "none" })
-Probe "qmt:token fp agree across 4 sources" ($tkBad.Count -eq 0) $tkDetail
+# 明细必须能自证"为什么读不到"：每条腿的空态分开写（no-file / empty-file / empty-field /
+# key-absent / no-bridge-proc / unknown(异常类型)），再给出"本次可读源数 / 期望源数"。
+# 09-23 那两次红只留下一串 `missing`，分不清"探针读法瞎"还是"现网真没配"，白付一晚排查。
+$tkDetail = "token_fp_agree=" + $tkAgreeN + "/" + $tkPres.Count + " readable=" + $tkPres.Count + "/expect=" + $tkExpectReadable + " file=" + $tk1 + $tk1Why + " env=" + $tk2 + $tk2Why + " engine=" + $tk3 + $tk3Why + " engineAuth=" + $tk3b + "(auth=" + $tk3Auth + ")" + " bridge=" + $tk4 + " report_file=" + $(if ($tk1r) { $tk1r } else { "none" }) + " report_env=" + $(if ($tk2r) { $tk2r } else { "none" }) + " miss=" + $(if ($tkBad.Count) { ($tkBad -join ",") } else { "none" })
+Probe "qmt:token fp agree across readable sources" ($tkBad.Count -eq 0) $tkDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，

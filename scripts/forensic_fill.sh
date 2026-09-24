@@ -43,7 +43,8 @@
 #       GW_DIR        默认 C:/qmt/quant-trading-v2/qmt_gateway（网关目录）
 #       GW_DB         默认 <GW_DIR>/data.db（config.xt.template.json 的 "db": "data.db"）
 #       GW_LOG_GLOB   默认 <GW_DIR>/gateway-*.log（网关自管 UTF-8 轮转日志，gateway.py 日志段）
-#       SQLITE_GZ     远端 sqlite3 可执行文件，默认 sqlite3
+#       SQLITE_GZ     远端 sqlite3 可执行文件，默认 sqlite3；**找不到就自动改走同机 Python 只读腿**
+#                     （见 write_py_runner：两条腿的只读强度相同，Python 腿不是"降级"）
 #   演练（不连网、不取数，只打印将要执行的 SQL 与远端命令清单）：
 #     ./scripts/forensic_fill.sh --dry-run 2026-09-22 603468.SH
 #
@@ -363,7 +364,9 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "--- 远端动作清单（真跑时；全部只读）---"
   echo "  1) BatchMode 探活（ssh/scp 装配同 survey_live_rules.sh，不新增凭据、不用密码认证）"
   echo "  2) 远端 %TEMP%/forensic_fill_<PID> 建暂存目录，把 ${LIVE_DB_REMOTE}${GW_DB:+ 与 ${GW_DB}} 拷成只读副本"
-  echo "  3) 第一轮：scp 上传 params.txt + forensic_pull.ps1 + sql/*.sql → 远端 ${SQLITE_GZ} -readonly 逐条 .read"
+  echo "  3) 第一轮：scp 上传 params.txt + forensic_pull.ps1 + sqlrunner.py + sql/*.sql → 远端取数腿逐条执行"
+  echo "     （主腿 ${SQLITE_GZ} -readonly .read；该可执行文件不在位时自动改走同机 python/py -3 + sqlrunner.py，"
+  echo "      后者强制 file:...?mode=ro 且只放行单条 select，两腿产物文件名与分隔符完全一致，远端以 EXEC 行自报用了哪条）"
   echo "     → 按显式文件名回传 out_*/err_*（不用通配符）；同时 Select-String 扫 ${GW_LOG_GLOB}，"
   echo "     只回传 本码命中行的 时间戳 + BUY/SELL 方向值 与两类 pattern 的当日条数"
   echo "  4) 第二轮：从第一轮 fills/orders/网关fills 结果里实查锚点（signal_id/order_id），装配 20_dispatch.sql 后"
@@ -387,6 +390,10 @@ GW_COPY="$TMP/gw.db"
 GW_AVAILABLE=0
 REMOTE_STAGE=""
 DETECT_N="UNKNOWN"; MISMATCH_N="UNKNOWN"
+# EXEC_LEG：本轮实际用了哪条只读取数腿（sqlite3 主腿 / Python 兜底腿 / 本地 CLI）。
+# 之所以要显式记下来打印：两条腿的只读强度相同，但**用了哪条**决定了证据可否复现，
+# 汇报里含糊成"取到了数"是不够的（owner 追问"哪台机器用什么取的"必须答得出）。
+EXEC_LEG="UNKNOWN"
 
 audit_sql || { echo "X 第一轮 SQL 只读自检未通过，拒绝取数。" >&2; exit 6; }
 
@@ -447,6 +454,10 @@ remote_pull_round() { # $1=轮次标 $2=logscan(1|0) $3=本轮 SQL 前缀（空=
   local tag="$1" logscan="$2" only="$3"
   write_params "$logscan" "$only"
   local files=("$TMP/params.txt" "$TMP/forensic_pull.ps1") f base
+  # sqlrunner.py 只在兜底腿用得上，但**每轮都一起上传**：让"远端有没有 python"这件事
+  # 由 pull 脚本自报（EXEC 行）决定，而不是靠本地猜——少一个文件就会把"该走兜底腿"
+  # 变成"远端报 SQLITE_MISSING"，看上去像工具没装齐，实际是我们没把腿递过去。
+  [ -f "$TMP/sqlrunner.py" ] && files+=("$TMP/sqlrunner.py")
   local want=()
   for f in "$TMP"/sql/${only}*.sql; do
     [ -f "$f" ] || continue
@@ -466,14 +477,15 @@ remote_pull_round() { # $1=轮次标 $2=logscan(1|0) $3=本轮 SQL 前缀（空=
   PULL_LOG="$TMP/pull_${tag}.log"
   $SSH_BIN "powershell -NoProfile -ExecutionPolicy Bypass -File ${REMOTE_STAGE}/forensic_pull.ps1" 2>&1 \
     | LC_ALL=C tr -d '\r' | LC_ALL=C tee "$PULL_LOG" \
-    | LC_ALL=C grep -E '^(SQLITE_VER |STAGED |REUSED |MISSING |STAGE_FAIL |RAN |SKIP |DETECT_N=|MISMATCH_N=|LOGSCAN_SKIPPED|PULL_DONE)' \
+    | LC_ALL=C grep -E '^(SQLITE_VER |EXEC |STAGED |REUSED |MISSING |STAGE_FAIL |RAN |SKIP |DETECT_N=|MISMATCH_N=|LOGSCAN_SKIPPED|PULL_DONE)' \
     | LC_ALL=C sed 's/^/    /' >&2
   if [ ! -s "$PULL_LOG" ]; then
     echo "X 远端 pull 脚本无任何输出（通道或 powershell 起动失败）——判失败，不出结论。" >&2
     return 1
   fi
   if LC_ALL=C grep -q 'SQLITE_MISSING' "$PULL_LOG"; then
-    echo "X 远端 sqlite3 不可用（SQLITE_GZ=${SQLITE_GZ}）——显式失败；用 SQLITE_GZ=C:/完整路径/sqlite3.exe 重跑。绝不静默跳过取数。" >&2
+    echo "X 远端两条只读取数腿都不可用（sqlite3='${SQLITE_GZ}'，且 python/py -3 都拿不到 Python 3）——显式失败，绝不静默跳过取数。" >&2
+    echo "  可选解法（任一）：① 用 SQLITE_GZ=C:/完整路径/sqlite3.exe 重跑；② 确认现网 Python 在 PATH（qmt_gateway/pydata 用的那个解释器）。" >&2
     return 3
   fi
   if ! LC_ALL=C grep -q 'PULL_DONE' "$PULL_LOG"; then
@@ -485,8 +497,10 @@ remote_pull_round() { # $1=轮次标 $2=logscan(1|0) $3=本轮 SQL 前缀（空=
     return 1
   fi
   local got=0 miss_req=0 miss_opt=0 w
+  local miss_list=""
   for w in "${want[@]}"; do
     if $SCP_BIN "${SCP_TARGET}:${REMOTE_STAGE}/${w}" "$TMP/" >/dev/null 2>&1; then got=$((got+1)); continue; fi
+    miss_list="${miss_list} ${w}"
     case "$w" in
       out_2*|err_2*) miss_opt=$((miss_opt+1)) ;;   # 网关侧缺项：降级为"证据缺席"
       *)             miss_req=$((miss_req+1)) ;;   # live 侧缺项：证据链断了，不能出结论
@@ -494,6 +508,16 @@ remote_pull_round() { # $1=轮次标 $2=logscan(1|0) $3=本轮 SQL 前缀（空=
   done
   if [ "$miss_req" != "0" ]; then
     echo "X live 侧结果文件未取回 ${miss_req} 个（本轮共需 ${#want[@]} 个）——缺项就是断链，绝不当成「查到 0 行」。" >&2
+    # 失败必须自带原因：本轮实测吃过一次"退 5 但只说缺项"的亏——远端取数腿已换 Python 后，
+    # out 缺项既可能是"腿没建文件"，也可能是"腿在词法闸处 die 了"（那时 err 一定有内容）。
+    # 只回显缺哪几个文件 + 已取回 err 的首行（查询报错文本，不含凭据），截断到 200 字节。
+    echo "  缺项:${miss_list}" >&2
+    local ef2
+    for ef2 in "$TMP"/err_*.txt; do
+      [ -s "$ef2" ] || continue
+      echo "  $(LC_ALL=C basename "$ef2")：$(LC_ALL=C head -c 200 "$ef2" | LC_ALL=C tr '\n' ' ')" >&2
+    done
+    echo "  取数腿自报：$(LC_ALL=C sed -n 's/^EXEC //p' "$PULL_LOG" | LC_ALL=C tail -1)" >&2
     return 5
   fi
   if [ "$miss_opt" != "0" ]; then
@@ -502,7 +526,129 @@ remote_pull_round() { # $1=轮次标 $2=logscan(1|0) $3=本轮 SQL 前缀（空=
     echo "[warn] 网关库侧产物未取回（缺 ${miss_opt} 个文件）→ ⑤/⑤b 记为证据缺席，结论按 INCONCLUSIVE 给出。" >&2
   fi
   normalize_local
+  exec_leg_from_log
   return 0
+}
+
+# ── Python 只读取数兜底腿（内嵌生成，随本次取证一起销毁）────────────────────────
+# 为什么要有这条腿：2026-09-23 21:45 现网首跑 `FORENSIC_EXIT=3`，根因不是权限也不是通道，
+# 而是这台广州机器的 PATH 里根本没有 sqlite3.exe（owner 手上才有路径），于是"改判要用的
+# 五方证据"卡在取数工具上。而同一台机器本来就在跑 Python（qmt_gateway 与 pydata 都是 Python
+# 进程），标准库自带 sqlite3 —— 用**同机现成能力**当只读客户端，不装东西、不新增凭据。
+# 只读强度与主腿持平（三道闸，见 sqlrunner.py 内的注释），且产物文件名/分隔符/NULL 口径与
+# sqlite3 CLI 完全对齐，下游 awk/判语不需要为第二条腿分叉。
+write_py_runner() {
+  cat > "$TMP/sqlrunner.py" <<'PYEOF'
+# -*- coding: utf-8 -*-
+# sqlrunner.py — 由 forensic_fill.sh 现场生成的只读取数兜底腿（不是独立工具，勿单独复用）。
+# 只读三闸：
+#   1) 连接串强制 file:...?mode=ro + uri=True —— SQLite 层面拒绝任何写；
+#   2) 词法复核：去掉以 '.' 开头的 dot 行后必须恰好一条语句、必须以 select 开头、分号只允许
+#      一个，写库关键字黑名单再兜一层（防"一条 SELECT 后面偷偷跟一句别的"）；
+#   3) 只用 cursor.execute + fetchall，不 executescript、不 commit；异常一律非 0 退出并把
+#      原文写进 stderr 文件——上游按 has_err 把该方证据降级为 UNKNOWN，绝不当成"查到 0 行"。
+# 输出口径与 sqlite3 CLI 的 `.headers on / .separator "|" / .mode list` 逐字对齐：
+#   有行时首行列名、其后每行以 | 连接、NULL 打成空串；0 行时输出零字节（CLI 同口径，见下）。
+import sys
+import re as _re
+
+# 写库关键字黑名单：整词比对（re 分词），命中即拒。列名 updated_at 是一个词，不会被误伤；
+# 而偷偷跟在 SELECT 后面的 delete/drop 会被单独切成词命中。
+FORBIDDEN = ('insert', 'update', 'delete', 'drop', 'alter', 'replace', 'vacuum', 'attach', 'pragma')
+
+
+def die(msg, errf):
+    try:
+        with open(errf, 'a', encoding='utf-8') as fh:
+            fh.write(msg + '\n')
+    except Exception:
+        sys.stderr.write(msg + '\n')
+    sys.exit(1)
+
+
+def main(argv):
+    if len(argv) != 5:
+        sys.stderr.write('用法: sqlrunner.py <db> <sql文件> <out文件> <err文件>\n')
+        return 1
+    db, sqlf, outf, errf = argv[1:5]
+    # 产物集合必须与主腿逐字相同：CLI 腿是 `-RedirectStandardOutput out -RedirectStandardError err`
+    # / shell `> out 2> err`，**成功与否都会生成两个文件**（成功时 err 是 0 字节）。Python 腿若只在
+    # 出错时建 err，则"查询成功"反而缺 err 文件 —— 上游 want 的 out+err 成对检查会把成功判成断链
+    # （2026-09-24 08:05 现网首跑实测：7 条查询全 RAN、out 全部取回，只因 6+1 个 err 不存在而退 5）。
+    # 所以进 main 就先把两个产物建出来，后续一律"写"而不是"造"。
+    try:
+        open(outf, 'w', encoding='utf-8').close()
+        open(errf, 'w', encoding='utf-8').close()
+    except Exception as e:
+        sys.stderr.write('创建结果/错误文件失败: %r\n' % (e,))
+        return 1
+    try:
+        raw = open(sqlf, encoding='utf-8-sig').read()
+    except Exception as e:
+        die('读 SQL 文件失败: %r' % (e,), errf)
+    body = [ln for ln in raw.splitlines() if not ln.strip().startswith('.')]
+    stmt = ' '.join(body).strip()
+    if not stmt:
+        die('SQL 文件去掉 dot 命令后为空', errf)
+    if stmt.count(';') != 1 or not stmt.endswith(';'):
+        die('只允许恰好一条语句（分号计数=%d）' % stmt.count(';'), errf)
+    stmt = stmt.rstrip(';').strip()
+    if stmt.split(None, 1)[0].lower() != 'select':
+        die('首词不是 select，拒绝执行', errf)
+    low = stmt.lower()
+    # 按"整词"比对而不是子串：本仓库查询里 select 的列名自带 updated_at，子串匹配会把
+    # "update" 当成写关键字拒掉，于是兜底腿把持仓/账户两方证据降级成 UNKNOWN，而主腿正常出数
+    # ——两腿判语不同源比缺一条腿更糟。词边界与上游 audit_sql 的 \b 口径保持一致。
+    for tok in _re.findall(r'[a-z0-9_]+', low):
+        if tok in FORBIDDEN:
+            die('语句含写库关键字 %s，拒绝执行' % tok, errf)
+    import sqlite3
+    # 两个产物已在 main 入口建好（空文件）。这里再截断一次 out 只为防御：万一上面的
+    # open 语义被改动，也不会把旧内容留在本轮结果里。查询报错时 out 保持 0 字节 + err 非空，
+    # 上游 has_err 把这一方降级为 UNKNOWN 继续跑（dispatch 表在旧网关库里可能根本不存在，
+    # 那是 §FILL-AMEND 判语 NO_DISPATCH_ROW 的正常输入），而不是整轮断链。
+    try:
+        open(outf, 'w', encoding='utf-8').close()
+    except Exception as e:
+        die('创建结果文件失败: %r' % (e,), errf)
+    try:
+        con = sqlite3.connect('file:%s?mode=ro' % db, uri=True, timeout=10)
+    except Exception as e:
+        die('以只读方式打开副本失败: %r' % (e,), errf)
+    try:
+        cur = con.cursor()
+        cur.execute(stmt)
+        rows = cur.fetchall()
+        cols = [d[0] for d in (cur.description or [])]
+    except Exception as e:
+        die('查询失败: %r' % (e,), errf)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    def cell(v):
+        return '' if v is None else str(v)
+    # 0 行时 CLI 连表头都不打（实测 sqlite3 3.54 `.headers on` + 空结果集 = 零字节输出）。
+    # 若这条腿坚持写表头，下游 `[ -s out_xxx ]`（该方是否取到数）在两腿间给出不同答案，
+    # 而判语是按"缺项=断链 / 有项=取到数"分支的——口径对齐比好看重要。
+    with open(outf, 'w', encoding='utf-8', newline='') as fh:
+        if rows:
+            fh.write('|'.join(cols) + '\n')
+            for r in rows:
+                fh.write('|'.join(cell(v) for v in r) + '\n')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+PYEOF
+}
+
+exec_leg_from_log() { # 从最近一轮 pull 日志里取 EXEC 行（取不到就保留原值，绝不猜成 sqlite）
+  local v
+  v="$(LC_ALL=C sed -n 's/^EXEC //p' "$PULL_LOG" 2>/dev/null | LC_ALL=C tail -1)"
+  [ -n "$v" ] && EXEC_LEG="$v"
 }
 
 # ── 远端 pull 脚本（内嵌生成）────────────────────────────────────────────────
@@ -529,26 +675,49 @@ function SideTok($v) {
   if ($v -eq $sell) { return 'SELL' }
   return 'OTHER'
 }
+$script:stageMsgs = @()
 function Stage($name, $src) {
   # 两轮共用同一份只读副本：第二轮绝不重新拷贝。重新拷贝等于换一张快照，
   # 两轮的数会对不上，那是自己给自己造"证据冲突"。
+  # 状态行**不能**在这里 Write-Output：调用形如 `$haveLive = Stage ...`，函数里所有管道输出
+  # 都会被吸进那个变量（变成 "STAGED live.db" + $true 的数组），日志里就一行都不剩——
+  # 上游两条判据（grep 'STAGED gw.db' 定 GW_AVAILABLE、grep '^MISSING live.db' 定拷库失败）
+  # 于是恒为假：网关证据被无脑降级成"证据缺席"，而现网真拷不出库时那个守卫又完全失明。
+  # 2026-09-24 08:05 现网首跑实测（日志只有 RAN/EXEC，没有任何 STAGED 行）锤实。
+  # 改成攒进 $script:stageMsgs，由调用点在两次 Stage 之后统一打进行首锚点（可被 grep 白名单命中）。
   $dst = Join-Path $stage $name
-  if (Test-Path -LiteralPath $dst) { Write-Output ('REUSED ' + $name); return $true }
-  if (-not (Test-Path -LiteralPath $src)) { Write-Output ('MISSING ' + $name); return $false }
+  if (Test-Path -LiteralPath $dst) { $script:stageMsgs += ('REUSED ' + $name); return $true }
+  if (-not (Test-Path -LiteralPath $src)) { $script:stageMsgs += ('MISSING ' + $name); return $false }
   try {
     Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop
     Set-ItemProperty -LiteralPath $dst -Name IsReadOnly -Value $true -ErrorAction SilentlyContinue
-    Write-Output ('STAGED ' + $name)
+    $script:stageMsgs += ('STAGED ' + $name)
     return $true
-  } catch { Write-Output ('STAGE_FAIL ' + $name); return $false }
+  } catch { $script:stageMsgs += ('STAGE_FAIL ' + $name); return $false }
 }
 $ver = ''
 try { $ver = (& $p['sqlite'] -version 2>&1 | Select-Object -First 1) } catch { $ver = '' }
 Write-Output ('SQLITE_VER ' + $ver)
-if (-not $ver) { Write-Output 'SQLITE_MISSING'; exit 0 }
+# 取数两腿，顺序固定且**必须自报走了哪条**（EXEC 行）：sqlite3 CLI 主腿 → 同机 Python 兜底腿。
+# 两腿都不在位才打 SQLITE_MISSING 并收尾——上游据此非 0 退出，绝不拿半套证据出结论。
+$execMode = ''; $pyExe = ''; $pyPre = @()
+if ($ver) { $execMode = 'sqlite' } else {
+  foreach ($cand in @('python', 'py')) {
+    $pre = @(); if ($cand -eq 'py') { $pre = @('-3') }
+    $o = ''
+    try { $o = (& $cand ($pre + @('--version')) 2>&1 | Select-Object -First 1) } catch { $o = '' }
+    if ("$o" -match 'Python 3') { $execMode = 'python'; $pyExe = $cand; $pyPre = $pre; break }
+  }
+}
+if (-not $execMode) { Write-Output 'SQLITE_MISSING'; exit 0 }
+if ($execMode -eq 'sqlite') { Write-Output ('EXEC sqlite|' + $ver) } else { Write-Output ('EXEC python|' + $pyExe) }
 $haveLive = Stage 'live.db' $p['livedb']
 $haveGw   = Stage 'gw.db'   $p['gwdb']
-# 只读通道双保险：副本已 chmod/IsReadOnly，查询侧再带 -readonly（sqlite3 CLI 只读模式）。
+# 状态行统一在调用点后打（原因见 Stage 函数头的管道输出被赋值吞掉那条）。锚点白名单已含
+# STAGED/REUSED/MISSING/STAGE_FAIL，所以 bash 侧能看到、grep 判据不再恒假。
+foreach ($m0 in $script:stageMsgs) { Write-Output $m0 }
+# 只读通道双保险：副本已 chmod/IsReadOnly，查询侧再带 -readonly（sqlite3 CLI 只读模式）；
+# Python 腿由 sqlrunner.py 自己强制 mode=ro + 单条 SELECT 词法闸（强度相同，不是降级）。
 # 表名 2* 前缀归网关库，其余归 live 库——两边各有同名 fills（§QMT-DUAL），绝不能混查。
 foreach ($q in (Get-ChildItem -LiteralPath $stage -Filter '*.sql' | Sort-Object Name)) {
   if ($only -and -not $q.BaseName.StartsWith($only)) { continue }
@@ -557,9 +726,18 @@ foreach ($q in (Get-ChildItem -LiteralPath $stage -Filter '*.sql' | Sort-Object 
   if (($whichDb -eq 'gw.db')   -and (-not $haveGw))   { Write-Output ('SKIP ' + $q.BaseName); continue }
   $outf = Join-Path $stage ('out_' + $q.BaseName + '.txt')
   $errf = Join-Path $stage ('err_' + $q.BaseName + '.txt')
-  Start-Process -FilePath $p['sqlite'] `
-    -ArgumentList @('-readonly', (Join-Path $stage $whichDb), ('.read ' + $q.FullName)) `
-    -NoNewWindow -Wait -RedirectStandardOutput $outf -RedirectStandardError $errf
+  $dbPath = Join-Path $stage $whichDb
+  if ($execMode -eq 'sqlite') {
+    Start-Process -FilePath $p['sqlite'] `
+      -ArgumentList @('-readonly', $dbPath, ('.read ' + $q.FullName)) `
+      -NoNewWindow -Wait -RedirectStandardOutput $outf -RedirectStandardError $errf
+  } else {
+    # out/err 由 runner 自己落盘（名字与主腿完全一致）：python 起不来时两个文件都不会出现，
+    # 上游按"结果文件缺项=断链"判失败，而不是"缺文件=查到 0 行"。
+    Start-Process -FilePath $pyExe `
+      -ArgumentList ($pyPre + @((Join-Path $stage 'sqlrunner.py'), $dbPath, $q.FullName, $outf, $errf)) `
+      -NoNewWindow -Wait
+  }
   Write-Output ('RAN ' + $q.BaseName)
 }
 Write-Output ('STAGE_PATH ' + $stage)
@@ -599,6 +777,7 @@ if [ "$LOCAL_MODE" = "1" ]; then
     cp "$GW_DB" "$GW_COPY" && GW_AVAILABLE=1
   fi
   echo "==> 第一轮（本地副本，mode=ro）：live.db 六查 + 网关 fills" >&2
+  EXEC_LEG="local|sqlite3 CLI mode=ro"
   run_local_sql "$LIVE_COPY" '0*.sql'
   if [ "$GW_AVAILABLE" = "1" ]; then run_local_sql "$GW_COPY" '21_*.sql'; else touch_gw_missing '2*_*.sql'; fi
 else
@@ -619,7 +798,8 @@ else
   $SSH_BIN "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path ${REMOTE_STAGE} | Out-Null; exit 0\"" >/dev/null 2>&1 \
     || { echo "X 远端暂存目录创建失败（${REMOTE_STAGE}）" >&2; exit 1; }
   write_pull_ps1
-  echo "==> 第一轮（现网只读副本 + sqlite3 -readonly）：live.db 六查 + 网关 fills + 日志侧计数" >&2
+  write_py_runner
+  echo "==> 第一轮（现网只读副本 + sqlite3 -readonly，缺 sqlite3.exe 时自动走同机 Python 只读腿）：live.db 六查 + 网关 fills + 日志侧计数" >&2
   remote_pull_round 1 1 '' || exit $?
   # 网关库这一方到底可用不可用，只认 pull 脚本自报的暂存结果（STAGED gw.db）：
   # 拿"有没有 out_20_dispatch.txt"当判据必错——第一轮根本还没查 dispatch。
@@ -757,6 +937,7 @@ fi
 echo "  现金侧证：见上面 ④ / ④b / ④c 三段数字（卖出回款是否恒 0、当日买入额是否被占满），本脚本不据数字反推方向。"
 
 section "只读自检"
+echo "  取数腿：${EXEC_LEG}（两腿只读强度相同；用了哪条决定证据可否复现，故必须如实打印）"
 echo "  ok - 全部 SQL 为单条 select（运行前后各复核一次）；副本以 mode=ro 打开；未执行 VACUUM/PRAGMA 写；本地与远端临时文件由 trap 删除"
 echo "FORENSIC_FILL_DONE"
 exit 0

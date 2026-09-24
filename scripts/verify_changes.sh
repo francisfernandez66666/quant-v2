@@ -1926,11 +1926,30 @@ grep -q 'BACKUP_TARGET_DIR:-}' scripts/backup_keystore_pass.sh \
 	&& grep -q 'git rev-parse --show-toplevel' scripts/backup_keystore_pass.sh \
 	&& grep -q '拒绝 mkdir' scripts/backup_keystore_pass.sh \
 	|| { echo "--- FAIL: keystore 口令备份的安全阀缺一（必填目的地/仓库内拒写/不自动建目录）"; exit 1; }
-# 现网两条新探针必须在位（第 19 mock 退役、第 20 token 四源指纹一致性）。
+# 现网两条新探针必须在位（第 19 mock 退役、第 20 token 指纹一致性）。
 grep -q 'qmt:mock retired' scripts/verify_deploy_guangzhou.sh \
 	|| { echo "--- FAIL: 第 19 探针（mock 退役复核）丢失"; exit 1; }
-grep -q 'qmt:token fp agree across 4 sources' scripts/verify_deploy_guangzhou.sh \
-	|| { echo "--- FAIL: 第 20 探针（token 四源指纹一致性）丢失"; exit 1; }
+grep -q 'qmt:token fp agree across readable sources' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: 第 20 探针（token 指纹一致性）丢失或标题回退成"四源"（③b 账号级腿在位时源数是 5）"; exit 1; }
+# §TOKEN-BLIND（2026-09-24）三条读法锁：这条探针 09-23 连红两晚，红的是探针自己读不到、不是口令漂移
+# （同刻 gw:/health 绿）。判据语义一个字不许动，动的只有"怎么读"和"读不到时怎么写"。
+# ① 网关 config.xt.json 是 ensure_gateway_config.ps1 刻意**无 BOM UTF-8** 落盘的（网关 json.load 见 BOM 抛），
+#    PS 5.1 缺省按 GBK 解会把 JSON 字符串闭合劈开 ⇒ 必须显式 -Encoding UTF8，与同段读引擎 config.json 对齐。
+grep -q '\$tk1RawTxt = Get-Content -Path $GatewayCfg -Raw -Encoding UTF8' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: token ① 腿又用缺省码页读无 BOM UTF-8 网关配置（GBK 吞引号 ⇒ unknown 失明复犯）"; exit 1; }
+# ② 引擎侧权威 token 在**账号快照**（auth.json configs[].key=quant_config_json_v1 → .qmt.token，
+#    见 internal/config/config.go GetQMTConfigFor 三级优先级），全局 rules.qmt 只是兜底、允许长期为空。
+grep -q "if (\$tkC.key -ne 'quant_config_json_v1') { continue }" scripts/verify_deploy_guangzhou.sh \
+	&& grep -q '$tkR = "$($tkC.value)" | ConvertFrom-Json' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: token ③b 账号级读法丢失（引擎腿会重新把"合法为空的全局字段"当成缺配）"; exit 1; }
+# ③ 多账号本就各配各的网关/口令：两个以上不同快照指纹时**不参与判红**，只如实写 multi-account(N)。
+grep -q 'multi-account(' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: ③b 的多账号护栏丢失（拿别的账号口令来比 = 凭空造红）"; exit 1; }
+# ④ 空态必须分字（no-file / empty-field / key-absent / no-bridge-proc），且明细带"可读源数/期望源数"——
+#    否则下次失明又只剩一串语义不同的 missing。
+grep -q 'readable=" + \$tkPres.Count + "/expect="' scripts/verify_deploy_guangzhou.sh \
+	&& grep -q '"empty-field"' scripts/verify_deploy_guangzhou.sh \
+	|| { echo "--- FAIL: token 探针明细不再自证读不到的原因（失明只能靠再跑一晚归因）"; exit 1; }
 # 负锁：两条新探针的判据数组只准追加 ASCII 明细（本仓库实录：PowerShell→SSH→bash 回传 GBK 字节，
 # 中文 detail 在 grep 判据里恒不命中 = 把假绿写进探针）。
 if grep -nE '\$(mockMiss|tkBad) \+= "[^"]*[^ -~]' scripts/verify_deploy_guangzhou.sh | grep -q .; then
@@ -2220,7 +2239,7 @@ grep -q 'FORENSIC_FILL_DONE' scripts/forensic_fill.sh \
 	|| { echo "--- FAIL: 取证脚本的完成锚点丢失（跑没跑完无法判定）"; exit 1; }
 grep -q 'sqlite3 "file:$1?mode=ro"' scripts/forensic_fill.sh \
 	|| { echo "--- FAIL: 本地副本不再以 mode=ro 打开（只读第一道机制丢失）"; exit 1; }
-grep -q "('-readonly', (Join-Path \$stage \$whichDb)" scripts/forensic_fill.sh \
+grep -q "('-readonly', \$dbPath" scripts/forensic_fill.sh \
 	|| { echo "--- FAIL: 远端 sqlite3 调用丢了 -readonly（现网库第二道只读机制丢失）"; exit 1; }
 grep -q 'trap cleanup EXIT' scripts/forensic_fill.sh \
 	|| { echo "--- FAIL: 临时副本清理未挂 trap（现网留残留库文件）"; exit 1; }
@@ -2243,12 +2262,66 @@ done
 # 预检三件套：缺 sqlite3/sha256sum/awk 直接非 0 退出（不静默跳过）。
 grep -q 'need_cmd sqlite3 || exit 3' scripts/forensic_fill.sh \
 	|| { echo "--- FAIL: 工具闸缺失（没有 sqlite3 会一路降级成"看起来跑完了"）"; exit 1; }
+# ── 兜底取数腿（2026-09-24 补）：09-23 21:45 现网首跑退 3 的根因是远端 PATH 没有 sqlite3.exe，
+#       不是权限也不是通道。取证要 owner 手给路径 = 改判链条卡在工具上。同一台机器本来就在跑
+#       Python（qmt_gateway/pydata），标准库自带 sqlite3，用现成能力当只读客户端。
+#       这条锁锁的是"兜底腿的只读强度不低于主腿"，不是锁它存在——少了任何一道闸就等于
+#       往现网副本里开了一个可写口。
+grep -q "sqlite3.connect('file:%s?mode=ro' % db, uri=True" scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: Python 兜底腿没有用 mode=ro URI 打开副本（与主腿只读强度不再持平）"; exit 1; }
+grep -q "if stmt.count(';') != 1 or not stmt.endswith(';')" scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: Python 兜底腿的「恰好一条语句」闸丢失（可夹带第二条写语句）"; exit 1; }
+grep -q "if stmt.split(None, 1)\[0\].lower() != 'select'" scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: Python 兜底腿的「首词必须是 select」闸丢失"; exit 1; }
+# 两腿都在位时必须走主腿； SQLITE_MISSING 只能在"两条腿都没有"时打——若回退成按 $ver 判定，
+# 就等于恢复 09-23 那个"缺 sqlite3.exe 就交不出证据"的老死路。
+grep -q "if (-not \$execMode) { Write-Output 'SQLITE_MISSING'" scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: SQLITE_MISSING 不再按「两腿皆不可用」判定（兜底腿失效或又被当成硬前置）"; exit 1; }
+grep -q "Write-Output ('EXEC sqlite|'" scripts/forensic_fill.sh \
+	&& grep -q "Write-Output ('EXEC python|'" scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 取数腿不再自报走了哪条（owner 看日志无法判断证据出自哪条腿）"; exit 1; }
+# 兜底腿脚本要真的上传到远端，否则 EXEC python 只能以"文件不存在"失败收场。
+grep -q 'files+=("$TMP/sqlrunner.py")' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: sqlrunner.py 没有进上传清单（Python 腿是生成出来的死代码）"; exit 1; }
+# 两腿"产物同源/判语同源"三条锁（都是 2026-09-24 实测锤出来的，不是推的）：
+#   a) 写库关键字按整词比对——列名 updated_at 含子串 update，子串匹配会让兜底腿把持仓/账户
+#      两方证据降级成 UNKNOWN，主腿却正常出数（本地夹具实测复现）；
+#   b) out 与 err 两个产物在 main 入口就建出来——CLI 腿靠重定向**成功也生成空 err**，
+#      兜底腿若只在出错时建 err，"查询成功"反倒缺文件，上游 out+err 成对检查直接判断链：
+#      08:05 现网首跑 7 条查询全 RAN、out 全部取回，就因 7 个 err 不存在而退 5；
+#   c) 0 行结果 CLI 连表头都不打（实测零字节），兜底腿若坚持写表头，`[ -s out_xxx ]`
+#      这类"该方是否取到数"的判据在两腿间给出不同答案。
+grep -q 'for tok in _re.findall' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 兜底腿的写库关键字检查退回子串匹配（updated_at 会被误拒）"; exit 1; }
+grep -q "open(outf, 'w', encoding='utf-8').close()" scripts/forensic_fill.sh \
+	&& grep -q "open(errf, 'w', encoding='utf-8').close()" scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 兜底腿不再成对预建 out/err 产物（查询成功会被缺项检查判成断链）"; exit 1; }
+grep -q 'if rows:' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: 兜底腿的 0 行输出不再与 CLI 对齐（空结果也会带表头，下游 -s 判据两腿不同源）"; exit 1; }
+# 副本拷贝状态行必须能进日志（09-24 现网日志实测：整轮没有一行 STAGED/MISSING，因为
+# `$haveLive = Stage ...` 把函数里的 Write-Output 全吸进变量了）。这条锁的不是写法好看，
+# 是两条判据的可信度：grep 'STAGED gw.db' 决定网关证据算不算"有"，grep 'MISSING live.db'
+# 决定"现网库拷不出来"是判失败还是静默继续——两者在旧写法下恒为假（前者永远降级、后者永远失明）。
+grep -q "\$script:stageMsgs += ('STAGED ' + \$name)" scripts/forensic_fill.sh \
+	&& grep -q 'foreach ($m0 in $script:stageMsgs) { Write-Output $m0 }' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: Stage 的状态行又回到函数内 Write-Output（会被赋值吞掉，拷库判据恒假）"; exit 1; }
+if grep -qE "Write-Output \('(STAGED|REUSED|MISSING|STAGE_FAIL) ' \+ \\\$name\)" scripts/forensic_fill.sh; then
+	echo "--- FAIL: Stage 函数体内仍有 Write-Output 状态行（与上一条锁同源，日志会丢拷库证据）"; exit 1; fi
 # 负锁：脚本不得内嵌任何写语句或凭据值（只读 + 零新增凭据）。
 if grep -nE '^[[:space:]]*(INSERT|UPDATE|DELETE|DROP|VACUUM) ' scripts/forensic_fill.sh | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
 	echo "--- FAIL: 取证脚本出现写库语句（本脚本只准 SELECT）"; exit 1; fi
 if grep -qE 'Password|ConvertTo-SecureString' scripts/forensic_fill.sh; then
 	echo "--- FAIL: 取证脚本出现口令原语（纪律：绝不新增凭据，SSH 复用既有 key）"; exit 1; fi
-echo "ok - §FILL-AMEND 取证脚本守卫通过（锚点锁 1 + 只读机制锁 4 + 接线锁 3 + 判语锁 6 + 工具闸锁 1 + 写库/凭据负锁 2）"
+# 失败必须自带原因（09-24 现网第一次退 5 只说"缺 6 个"，靠再跑一遍才看清缺的是 err_*）：
+# 缺项要逐个列名、已取回的 err 要回显首行、取数腿要自报，否则每一轮排查都是一次现网往返。
+grep -q '缺项:${miss_list}' scripts/forensic_fill.sh \
+	&& grep -q '取数腿自报' scripts/forensic_fill.sh \
+	|| { echo "--- FAIL: live 侧缺项失败路径不再回显原因（每轮排查都要重跑一次现网）"; exit 1; }
+# 兜底腿负锁：Python 侧只准 execute/fetchall（注释里"不 executescript、不 commit"的说明会被
+# 字面命中，故先按行号剔注释）。出现 executescript/commit 即等于给只读腿开了写口。
+if grep -nE '\.executescript\(|\.commit\(' scripts/forensic_fill.sh | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: Python 兜底腿出现 executescript/commit（只读三闸之外的写口）"; exit 1; fi
+echo "ok - §FILL-AMEND 取证脚本守卫通过（锚点锁 1 + 只读机制锁 4 + 接线锁 3 + 判语锁 6 + 工具闸锁 1 + 兜底腿锁 9 + 副本状态锁 2 + 写库/凭据/写口负锁 3）"
 
 echo ""
 echo "==> 全部通过"
