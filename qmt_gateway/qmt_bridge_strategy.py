@@ -158,6 +158,31 @@ BUY_CONST_FALLBACK, SELL_CONST_FALLBACK = 23, 24
 # Written as unicode escapes to keep the file pure ASCII (sandbox taboo 3).
 BUY, SELL = "\u4e70\u5165", "\u5356\u51fa"
 
+# SIGID-TRUNC (2026-09-24): the counter's userOrderId slot is a short fixed-width
+# wire field. Everything we submit as a signal reference is cut to WIRE_REF_MAX, and
+# the DEAL/ORDER row we get back carries that SAME cut value in its remark -- so the
+# truncation is not a bug we can delete (the field is the counter's), it is a wire
+# property we must model in exactly one place.
+#
+# Why one constant + one helper: the submit side and the two lookup sides used to
+# disagree. embed_place truncated to 24 while embed_resolve / resolve_order_id
+# compared the counter's (truncated) remark against the FULL signal_id -- an
+# expression that can never be true for our 25-char ids ("buy:603468:fac_1:20260922"
+# is code(6) + rule + 8-digit date), so remark-based attribution silently degraded
+# into fingerprint guessing, and the truncated id then reached the ledger as
+# fills.signal_id. Same-length ids that differ only past char 24 also collapse two
+# trading days into one reference (the "signal_id truncated to 24" defect).
+#
+# Downstream, the gateway resolves the wire ref back to the full dispatch signal_id
+# (prefix lookup, unique-hit only), so the ledger keeps the authoritative id.
+WIRE_REF_MAX = 24
+
+
+def wire_ref(signal_id):
+    """Canonical wire form of a signal reference: what we submit AND what the counter
+    echoes back in remark. Idempotent -- wire_ref(wire_ref(x)) == wire_ref(x)."""
+    return str(signal_id or "")[:WIRE_REF_MAX]
+
 # ---------------------------------------------------------------------------
 # P0 2026-09-18 "buy/sell mixed up" incident: DEAL-row direction resolution.
 #
@@ -547,6 +572,11 @@ class _XtOps:
                 "trade_id": str(getattr(t, "m_strTradeID", "") or getattr(t, "traded_id", "") or
                                 getattr(t, "trade_no", "") or getattr(t, "id", "") or ""),
                 "traded_at": traded,
+                # SIGID-TRUNC: remark is whatever the counter kept of the reference we
+                # submitted -- for the embedded path that is the 24-char wire form, not the
+                # full signal_id. We report the raw counter value (never "repair" it here:
+                # the bridge has no authoritative id table) and the gateway resolves it
+                # back to the dispatch row's full signal_id before booking.
                 "signal_id": remark,
                 # P2-FEE 20260918 best-effort fee leg from the DEAL object (0 when absent).
                 "fee": _fee_of(t),
@@ -573,7 +603,7 @@ class _XtOps:
         ptype = self.pr_limit if is_limit else self.pr_market
         price = float(req.get("price", 0) or 0) if is_limit else -1.0
         qty = int(req.get("qty", 0) or 0)
-        signal_id = str(req.get("signal_id", "") or "")[:24]
+        signal_id = wire_ref(req.get("signal_id", ""))
         _trace("embed place side=%s op=%s limit=%s ptype=%s price=%s qty=%s sid=%s" % (
             ascii(side), op_type, is_limit, ptype, price, qty, signal_id))
         if not po:
@@ -682,7 +712,11 @@ class _XtOps:
                 remark = str(getattr(o, "m_strRemark", "") or getattr(o, "order_remark", "")
                              or getattr(o, "remark", "") or "")
                 c = str(getattr(o, "m_strInstrumentID", "") or getattr(o, "code", "") or "")
-                if sig and remark == sig:
+                # SIGID-TRUNC: compare the WIRE form -- the counter can only ever echo
+                # back what fit in the userOrderId slot, so an exact compare against the
+                # full signal_id was always false and the lookup silently fell through to
+                # the fingerprint branch below.
+                if sig and remark == wire_ref(sig):
                     oid = str(getattr(o, "m_strOrderSysID", "") or getattr(o, "order_id", "") or "")
                     if oid:
                         return oid
@@ -832,7 +866,9 @@ class _XtOps:
                     return pending_ref
                 for o in orders:
                     remark = str(getattr(o, "order_remark", "") or getattr(o, "remark", "") or "")
-                    if remark == signal_id:
+                    # SIGID-TRUNC: same wire-form compare as embed_resolve (the counter
+                    # only ever holds the truncated userOrderId we submitted).
+                    if remark == wire_ref(signal_id):
                         oid = str(getattr(o, "order_id", "") or "")
                         if oid:
                             self.last_resolve_confirmed = True
@@ -964,6 +1000,8 @@ class _XtOps:
                 "side": side, "price": price, "qty": qty, "amount": amount,
                 "trade_id": tid,
                 "traded_at": str(getattr(t, "trd_time", getattr(t, "trade_time", "")) or ""),
+                # SIGID-TRUNC: legacy-path twin of the embed DEAL leg above -- the counter
+                # reports the wire form of our reference, the gateway resolves it back.
                 "signal_id": remark,
                 # P2-FEE 20260918 best-effort fee leg (0 when the build hides it).
                 "fee": _fee_of(t),

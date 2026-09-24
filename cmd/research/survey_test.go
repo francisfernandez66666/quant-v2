@@ -2,11 +2,13 @@
 // （ths 双表路由，纯内存装配，不碰任何真实数据目录）驱动一次完整排摸，校验
 // strategy_survey.json 产物契约：
 //
-//	a) 每条被排摸战法一条记录（内置四形态 + 库内两条 fac_*），verdict 落在枚举集内；
+//	a) 每条被排摸战法一条记录（内置五形态含动量 + 库内两条 fac_*），verdict 落在枚举集内；
 //	c) 分层差为零的成分因子（EP_ttm 在无 daily_basic 的库里全 NaN）判 dead_component；
 //	c2) 成分健康度按**条目自身 horizon** 度量（fac_t2 落库 10 ⇒ 尺子 10，全局 --h 5 不改写它）；
 //	d) 存储 adj_basis ≠ 当前口径（及缺字段）的条目 stale_basis=true；
-//	e) 白名单在跑却无回放适配器的战法以非零 unsurveyable 计数显形，且不出现在 records 里。
+//	e) 白名单与默认回放集合的差集以 unsurveyable 计数显形：2026-09-24 动量判据按实盘语义重写后
+//	   差集为空（计数须等于 UnsurveyedLiveForms 的真实长度），但分类机制仍在测（未实现的 ID 仍报
+//	   no_replay_adapter）；动量必须在表里、enabled=true、notes 带近似口径说明（日线 MACD 代分钟）。
 //
 // English: end-to-end test of the strategy-survey command on a 2-stock temp DB —
 // record-per-strategy contract, dead-component flagging on zero layer spread,
@@ -18,9 +20,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"quant-trading-v2/internal/btreplay"
 	"quant-trading-v2/internal/research"
 	"quant-trading-v2/internal/store"
 )
@@ -143,10 +147,10 @@ func TestStrategySurveyArtifact(t *testing.T) {
 		t.Fatalf("产物非合法 JSON: %v", err)
 	}
 
-	// (a) 一策略一记录：内置四形态 + 库内两条（含停用条目），且 verdict 全在枚举集内。
+	// (a) 一策略一记录：内置五形态（含动量近似回放）+ 库内两条（含停用条目），且 verdict 全在枚举集内。
 	wantIDs := map[string]bool{
 		"double_bump": true, "dragon": true, "dragon_return": true, "n_shape": true,
-		"fac_t1": true, "fac_t2": true,
+		"momentum": true, "fac_t1": true, "fac_t2": true,
 	}
 	seen := map[string]surveyRecord{}
 	enumOK := map[string]bool{"ok": true, "no_edge": true, "flipped_sign": true, "no_trigger": true, "stale_params": true}
@@ -227,7 +231,7 @@ func TestStrategySurveyArtifact(t *testing.T) {
 		t.Errorf("fac_t1 verdict=%q, want stale_params", f1.Verdict)
 	}
 
-	// 锚点一致性：unhealthy = 非 ok 记录数（内置四法在此 fixture 上不可能全 ok）。
+	// 锚点一致性：unhealthy = 非 ok 记录数（内置五法在此 fixture 上不可能全 ok）。
 	nBad := 0
 	for _, r := range art.Records {
 		if r.Verdict != "ok" {
@@ -238,17 +242,67 @@ func TestStrategySurveyArtifact(t *testing.T) {
 		t.Errorf("unhealthy=%d 与非 ok 记录数 %d 不一致", art.Unhealthy, nBad)
 	}
 
-	// 盲区锚点 §SURVEY-COVERAGE：白名单在跑、但没有回放适配器因而不在表里的战法必须被计数，
-	// 且不得混进 records（混进去就是"编了一个没跑过的战法"）。
+	// 盲区锚点 §SURVEY-COVERAGE：白名单在跑、但默认回放集合量不到的形态战法必须被计数。
+	// 期望值取 btreplay.UnsurveyedLiveForms() 的**真实差集**而非硬编码数字：锚点的契约是
+	// "产物里的计数等于差集"，差集内容由 btreplay 侧的三份清单（白名单 / 有适配器 / 默认停用）算出。
+	// 2026-09-24 §MOMENTUM-LIVE-REPLAY 起差集为空（动量判据已按实盘语义重写、真进回放）。
+	realMissing := btreplay.UnsurveyedLiveForms()
+	if art.Unsurveyable != len(realMissing) {
+		t.Errorf("unsurveyable=%d 与真实差集 %d（%v）不一致——产物计数与 UnsurveyedLiveForms 脱钩",
+			art.Unsurveyable, len(realMissing), realMissing)
+	}
 	if art.Unsurveyable != len(art.UnsurveyableIDs) {
 		t.Errorf("unsurveyable=%d 与 ID 清单 %v 不一致", art.Unsurveyable, art.UnsurveyableIDs)
 	}
-	if art.Unsurveyable == 0 {
-		t.Error("momentum 无回放适配器，unsurveyable 不应为 0（为 0 = 盲区又被抹平了）")
+	// 状态必须可分辨："没写适配器"（要补代码）与"写好但默认停用"（要么按实盘语义重写判据、
+	// 要么承认量不了）是两种处置，压成同一个数字就会派错工。差集空了不代表分类器可以烂掉，
+	// 拿一个不存在的 ID 直接敲它（否则这段分支永不自然执行，机制死了也测不出）。
+	if got := btreplay.UnsurveyedLiveFormStatus("form_that_nobody_implemented"); got != "no_replay_adapter" {
+		t.Errorf("未实现战法的状态=%q，期望 no_replay_adapter（盲区分类机制失效）", got)
 	}
+	if got := btreplay.UnsurveyedLiveFormStatus("momentum"); got != "" {
+		t.Errorf("momentum 的缺失状态=%q，期望空串（判据已按实盘语义重写、默认参与回放）", got)
+	}
+	if got := btreplay.UnsurveyedLiveFormStatus("double_bump"); got != "" {
+		t.Errorf("double_bump 默认就在回放集合里，状态应为空串，得到 %q", got)
+	}
+	// 动量必须仍在表里、且这一行是"真跑出来的"（enabled=true）：一行都没有等于盲区换个形态出现，
+	// enabled 说谎则运维把"停用没跑"读成"跑过了"。数字本身随 fixture 的行情走，不在此硬编。
+	mo, ok := seen["momentum"]
+	if !ok {
+		t.Error("records 缺 momentum：动量从排摸表里消失了，盲区会伪装成「没这个战法」")
+	} else if mo.Kind != "builtin" || mo.Name != "动量" {
+		t.Errorf("momentum 记录应为内置战法、显示名「动量」（名称不依赖回放结果），得到 %+v", mo)
+	} else if !mo.Enabled {
+		t.Errorf("momentum 记录 enabled=false，与「判据已按实盘语义重写、默认回放」不符")
+	}
+	// 近似口径仍须随行落产物：动量虽然进了回放，用的仍是**日线 MACD 代替分钟 MACD**、
+	// 每日判一次代替盘中多轮，读数字的人必须看得见这层近似（否则会和 double_bump 那种
+	// 纯日K完整回放的数字直接比大小）。
+	if note := btreplay.ReplayApproxNote("momentum"); note == "" {
+		t.Error("ReplayApproxNote(momentum) 为空，近似口径说明被摘")
+	} else if !strings.Contains(mo.Notes, note) {
+		t.Errorf("momentum 记录 notes 未带近似口径说明\n got: %s\nwant 含: %s", mo.Notes, note)
+	}
+	// 已被实盘语义重写的事实要写在说明里，且不得再留着"默认停用/恒不触发"的旧口径文本
+	// （旧文本会让运维把这一行读回"没量"，而它现在是真的量过了）。
+	if note := btreplay.ReplayApproxNote("momentum"); !strings.Contains(note, "criteria rewritten to live semantics") {
+		t.Error("momentum 近似说明未声明「判据已按实盘语义重写」")
+	} else if strings.Contains(note, "not replayed by default") {
+		t.Error("momentum 近似说明仍带「not replayed by default」旧口径")
+	}
+	// 纯日K完整回放的战法不得被挂上近似/停用说明（否则这类标签失去区分力）。
+	if bb, okBump := seen["double_bump"]; okBump &&
+		(strings.Contains(bb.Notes, "approx replay") || strings.Contains(bb.Notes, "not replayed by default")) {
+		t.Errorf("double_bump 是完整回放，不应带近似/停用说明：%s", bb.Notes)
+	}
+	// 只有"根本没写适配器"的战法才允许缺席 records（它想出现也没数据）；
+	// "有适配器但停用"的必须出现（见上）——两种缺失在表里的形态本就不同，别写成一条判据。
 	for _, id := range art.UnsurveyableIDs {
-		if _, ok := seen[id]; ok {
-			t.Errorf("不可排摸战法 %s 不该出现在排摸表里", id)
+		if btreplay.UnsurveyedLiveFormStatus(id) == "no_replay_adapter" {
+			if _, ok := seen[id]; ok {
+				t.Errorf("无适配器的战法 %s 不该出现在排摸表里（混进去就是编了一个没跑过的战法）", id)
+			}
 		}
 	}
 }

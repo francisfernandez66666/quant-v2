@@ -172,12 +172,37 @@ type slipCtx struct {
 // 涨停开盘但盘中打开（Liquidity 开启时）= 可成交，买滑点加"追入"罚分。
 // English: resolve per-trade buy/sell slippage and fill ratio at entry; false = unfillable
 // one-word limit-up board; an opened limit-up board pays the configured extra slippage.
+// 本函数是 entrySlipAt(code, kls, i, i+1) 的薄壳（缺省"次日开盘"入场），保留原签名是为了
+// 让既有调用点与既有数字逐字节不变；入场时点不同的战法直接调 entrySlipAt。
 func (sc *slipCtx) entrySlip(code string, kls []data.KLine, i int) (buy, sell, fill float64, ok bool) {
-	avg := avgAmountWan(kls, i)
-	prevClose := kls[i].Close
-	bar := kls[i+1]
+	return sc.entrySlipAt(code, kls, i, i+1)
+}
+
+// entrySlipAt 入场定档，入场日与信号日**解耦**：
+//   - entryIdx == sigIdx+1：次日开盘入场（回放缺省口径）——一字/秒板开盘即封死不可成交，
+//     涨停开盘但盘中打开可成交并加"追入"罚分（与重写前逐字节同口径）。
+//   - entryIdx == sigIdx：**触发当日收盘入场**（实盘当日撮合的战法，即动量）。可成交性判定
+//     换问"收盘是否还贴在涨停价上"——收盘那一刻挂涨停买单排队买不到；"盘中打开过"在这里
+//     没有意义（成交价就是当日最终收盘价），故不叠加追入罚分。
+//
+// 流动性滑窗一律截到**入场日前一根**：缺省路径下 entryIdx-1 == sigIdx，与旧写法
+// avgAmountWan(kls, i) 是同一个窗口，所以既有回测输出的滑点档位不变。
+// English: entry slippage/fill resolution with the entry bar decoupled from the signal bar —
+// next-open (legacy, byte-identical) or same-day close (live same-tick strategies such as momentum,
+// where a close pinned at the limit is unfillable).
+func (sc *slipCtx) entrySlipAt(code string, kls []data.KLine, sigIdx, entryIdx int) (buy, sell, fill float64, ok bool) {
+	if entryIdx < 1 || entryIdx >= len(kls) || (entryIdx != sigIdx && entryIdx != sigIdx+1) {
+		return 0, 0, 0, false
+	}
+	avg := avgAmountWan(kls, entryIdx-1)
+	prevClose := kls[entryIdx-1].Close
+	bar := kls[entryIdx]
 	openableExtra := 0.0
-	if costOpenAtLimitUp(code, prevClose, bar.Open) {
+	if entryIdx == sigIdx {
+		if costOpenAtLimitUp(code, prevClose, bar.Close) {
+			return 0, 0, 0, false // 当日收盘即涨停：收盘撮合买不到
+		}
+	} else if costOpenAtLimitUp(code, prevClose, bar.Open) {
 		if sc.liqOn && costLimitUpOpenable(code, prevClose, bar.Open, bar.Low) {
 			openableExtra = sc.liq.LimitUpOpenableExtraBps
 		} else {

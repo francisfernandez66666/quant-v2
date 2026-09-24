@@ -1181,6 +1181,42 @@ class Gateway:
             drow = self.store.dispatch_by_order_id(oid) if oid else None
         if drow is None and req.get("signal_id"):
             drow = self.store.dispatch_by_signal_id(str(req.get("signal_id")))
+        # §SIGID-TRUNC 第四级回落：按**前缀**反查派发项。
+        # 为什么必须有这一级：柜台的 userOrderId 槽是短字段，桥提交的 signal_id（本仓形态
+        # `buy:603468:fac_1:20260922`，25 字符）到柜台只剩前 24 位，成交回报里的 remark 也就
+        # 是这 24 位——于是上面三级（seq→交易所委托号→signal_id 精确查）里最该命中的那一级
+        # 恒不命中（dispatch_by_signal_id 是等值查）。后果不止归因缺失：查不到派发行 ⇒ 方向
+        # 无背书 ⇒ 每一笔这样的成交都被 §SIDE-AUTH-2 打进「待核对」通道（不动持仓账、等人工），
+        # 实盘等于**成交永远入不了账**；而落库的 signal_id 是截断值 ⇒ Go 侧按 signal_id 前缀
+        # 聚合的部成在途净额（SumFilledQty）也永不命中。
+        # 为什么还原放在网关而不是桥里：权威只有派发表（下单时我们亲手写下的物理事实），
+        # 桥没有这张表、只能报柜台给的原始值（桥侧也不该"顺手补全"——补出来的就不是柜台证据了）。
+        # 歧义口径：同前缀＋同代码＋同交易日内候选必须 (signal_id, side, code) 完全一致才认，
+        # 否则 store 返回 ambiguous ⇒ 这里绝不猜，保持"查不到派发行"的原样走待核对，并留一条
+        # warning（真出现说明 signal_id 生成或派发链有更深问题，得让人看见）。
+        # English: 4th-level attribution by prefix, because the counter only echoes the truncated
+        # wire form of our signal id. A unique candidate set (same code/day, agreeing on
+        # signal_id+side+code) is required; ambiguity is left un-repaired and warned.
+        _sig_wire = "" if drow else str(req.get("signal_id", "") or "")
+        if _sig_wire:
+            _drow, _why = self.store.dispatch_by_signal_prefix(
+                _sig_wire, str(req.get("code", "") or ""), str(req.get("traded_at", "") or "")[:10])
+            if _drow is None and _why == "ambiguous":
+                log.warning("[gateway] §SIGID-TRUNC 前缀归因歧义（同前缀多派发项不一致），"
+                            " 不猜、按未证方向处理: signal_prefix=%s code=%s oid=%s traded_at=%s",
+                            _sig_wire, req.get("code", ""), req.get("order_id", ""),
+                            req.get("traded_at", ""))
+            elif _drow:
+                _full = str(_drow.get("signal_id", "") or "")
+                if _full and _full != _sig_wire:
+                    # 还原本身要留痕：账本里从此是完整编号，与柜台回单/历史行的截断值不同，
+                    # 对表时得知道哪个是原始值（orig 值仍完整保存在 fills 原行的勘误语义里）。
+                    log.warning("[gateway] §SIGID-TRUNC 成交回报 signal_id 为柜台截断值，"
+                                " 已按派发项还原: %s -> %s (code=%s oid=%s trade_id=%s)",
+                                _sig_wire, _full, req.get("code", ""), req.get("order_id", ""),
+                                req.get("trade_id", ""))
+                req["signal_id"] = _full or _sig_wire
+                drow = _drow
         if drow:
             # 代码回填（与方向同源的权威性）：带 signal_id 的回报不再走上面的归因分支，
             # 若其 code 缺失，同样以派发项为准——否则 apply_fill 会拿空代码查持仓、

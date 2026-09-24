@@ -777,19 +777,53 @@ func (d *DB) UpdateRealOrderStatus(orderID, status string) error {
 	return err
 }
 
+// fillSignalMatchSQL §SIGID-TRUNC（2026-09-24）成交行与委托行按 signal_id 配对的**单一事实源**
+// 谓词构造器（SumFilledQty 与 ResetFailedRealOrder 两处钱查询共用，避免两条 SQL 各写一份而漂移）。
+//
+// 为什么必须双向：本仓 signal_id 形如 `buy:603468:fac_1:20260922`（25 字符），而柜台的
+// userOrderId 槽是短字段，成交回报回来的 remark 只剩前 24 位（现网实录：fills 两行
+// `buy:603468:fac_1:2026092`，同票 orders 行是完整的 `...:20260922`，见 docs/FIX_PLAN_20260924.md）。
+// 旧口径只有"成交编号以委托编号为前缀"这一个方向（§修复 FIX#1 为卖出 :rN 后缀而设），
+// 于是截断行**永不命中** ⇒ 两处资金判断同时失明：
+//   - SumFilledQty：部成量看成 0 → 补卖对未成交旧挂单叠加发单（卖出敞口超额）；
+//   - ResetFailedRealOrder 的"已撤+零成交可重放"：已部成的撤单被判成零成交 → 同键**再发一次真单**。
+//
+// 反向（委托编号以成交编号为前缀）只可能是"柜台截断"这一种来源，而截断的代价是**跨日会塌成
+// 同一前缀**（`...:20260922` 与 `...:20260923` 截断后相同），所以反向腿必须再钉一条：
+// 成交行自己的交易日（traded_at 前 10 位去掉 `-`）要**字面出现在委托编号里**。同日的委托编号
+// 天然带那一天（我们的编号格式），跨日的那一条则必然不含 ⇒ 判不出匹配，宁可不配也不张冠李戴。
+// 正向腿不加日期约束：它已覆盖 :rN 后缀形态，且历史上前向匹配从未因截断产生歧义。
+// English: bidirectional signal-id match. The reverse leg (ledger id truncated by the counter)
+// is gated by "the fill's own trading day must appear literally in the order id", because two
+// trading days collapse into one 24-char prefix otherwise.
+func fillSignalMatchSQL(fillsID, fillsTradedAt, orderExpr string) string {
+	return fmt.Sprintf("(%s <> '' AND (%s LIKE %s||'%%' OR (%s LIKE %s||'%%' AND instr(%s, replace(substr(%s,1,10),'-','')) > 0)))",
+		fillsID, fillsID, orderExpr, orderExpr, fillsID, orderExpr, fillsTradedAt)
+}
+
 // SumFilledQty 汇总某账号某 signal_id 前缀的累计成交数量（按 (user_id, signal_id) 过滤）。
 // §修复 R6（2026-08-29）：自动卖出为日级幂等键，若首笔卖单仅部成（部分成交），同日同键重试会被
 // 唯一键判 duplicate 而剩余仓位不再卖出。此处累计已成交数量，供补卖逻辑计算剩余可卖量。
 // §修复 FIX#1（2026-09-04）：卖出单 signal_id 是 base（sell:<码>:<类>:<日>）追加 :r<剩余量> 后缀
 // 的完整键——网关回报的 fills 恒带该后缀，按 base 精确匹配恒为 0，导致补卖逻辑把"已成交量"看成 0、
 // 对尚未成交的旧挂单叠加发单（卖出敞口超额）。改为按 base 前缀聚合，base 与所有 :rN 桶的成交都计入。
+// §SIGID-TRUNC（2026-09-24）：前缀口径升级为双向匹配 + 反向腿交易日闸（见 fillSignalMatchSQL）——
+// 柜台把成交回报里的编号截到 24 位时，成交编号是委托编号的**前缀**，旧单向口径恒为 0。
 // English: §FIX#1 — sell fills carry the full signal id (base + ":r<remaining>" suffix), so an exact
 // match on base always returned 0 and re-sells overlapped pending old orders (oversold exposure).
-// Aggregate by signal_id prefix to count fills across the base and every :rN bucket.
+// §SIGID-TRUNC — counters may truncate the id, so the stored fill id can also be a *prefix* of the
+// order id; matching is therefore bidirectional, with the reverse leg gated on the fill's trading day.
 func (d *DB) SumFilledQty(userID, signalID string) int {
+	if strings.TrimSpace(signalID) == "" {
+		// 空编号一律不查：前缀口径下 `LIKE '%%'` 会把该账号**全部**成交都算进来，
+		// 那不是"这笔委托已成交量"，而是一笔凭空的巨量。调用方拿到 0 比拿到全账更诚实。
+		return 0
+	}
 	var total int
-	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills WHERE user_id=? AND signal_id LIKE ?||'%'`,
-		userID, signalID).Scan(&total); err != nil {
+	// 委托编号 ? 出现三次（正向腿 1 次、反向腿 2 次：匹配 + 日期闸），参数顺序必须与谓词一致。
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(qty),0) FROM fills WHERE user_id=? AND `+
+		fillSignalMatchSQL("signal_id", "traded_at", "?"),
+		userID, signalID, signalID, signalID).Scan(&total); err != nil {
 		return 0
 	}
 	return total
@@ -994,9 +1028,19 @@ func (d *DB) ResetFailedRealOrder(userID, signalID string) (bool, error) {
 	defer tx.Rollback()
 	// §H1-MG 放行条件的单一事实源（SELECT/UPDATE 两处共用，防语句漂移）：
 	// 发送失败=从未到券商；已撤+零 fills=到过券商但一股未成交——两者都不构成"目标已达成"。
-	const eligibleWhere = `signal_id=? AND user_id=? AND (status='发送失败'
+	// §SIGID-TRUNC（2026-09-24）："有没有成交"的编号配对改用与本包 SumFilledQty 同源的
+	// fillSignalMatchSQL（双向 + 反向腿交易日闸）。为什么这一处最要命：柜台把成交编号截到
+	// 24 位时，旧单向 LIKE 判不出"这笔撤单其实部成过"，于是把**已成交的撤单**当成零成交放行
+	// 重放——同键再发一次真单就是凭空多一笔敞口（现网 09-22 603468.SH 那笔 800 股"已撤"委托
+	// 就有 200+600 两笔成交挂在截断编号上）。
+	// English: the "cancelled with zero fills" replay gate now pairs ids with the same bidirectional
+	// matcher as SumFilledQty — a counter-truncated fill id used to read as "never filled", which
+	// re-sent a real order that had already partially executed.
+	// （谓词由 fillSignalMatchSQL 现算，不再是编译期常量；仍在本函数内一次求值、两条语句共用。）
+	eligibleWhere := `signal_id=? AND user_id=? AND (status='发送失败'
 		OR (status='已撤' AND NOT EXISTS (
-			SELECT 1 FROM fills f WHERE f.user_id=orders.user_id AND f.signal_id LIKE orders.signal_id||'%'))) `
+			SELECT 1 FROM fills f WHERE f.user_id=orders.user_id AND ` +
+		fillSignalMatchSQL("f.signal_id", "f.traded_at", "orders.signal_id") + "))) "
 	var cur string
 	err = tx.QueryRow(`SELECT order_id FROM orders WHERE `+eligibleWhere, signalID, userID).Scan(&cur)
 	if err == sql.ErrNoRows {

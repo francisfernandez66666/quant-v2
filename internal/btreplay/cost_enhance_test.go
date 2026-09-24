@@ -211,6 +211,85 @@ func TestEntrySlipGating(t *testing.T) {
 	}
 }
 
+// TestEntrySlipAtNextDayEqualsEntrySlip 锁重构回归基线：entrySlip 变成 entrySlipAt(code,kls,i,i+1)
+// 的薄壳之后，缺省"次日开盘"路径的 买/卖滑点、成交比例、可成交性必须逐字节不变——
+// 否则一次签名重构就把历史所有回测/扫参数字挪动，而没人会去复核它们。
+// 三种板态各比一次：一字封死、涨停打开、正常开盘。
+func TestEntrySlipAtNextDayEqualsEntrySlip(t *testing.T) {
+	cfg := &config.BacktestConfig{Enabled: true, OrderValueYuan: 10000, PaperModelSlippageBps: 5}
+	cfg.Slippage = config.SlippageConfig{BaseBps: 3, BuyExtraBps: 1, Asymmetric: true,
+		VolumeTiers: config.DefaultVolumeTiers(), SizeTiers: config.DefaultSizeTiers()}
+	cfg.Liquidity = config.LiquidityConfig{Enabled: true, LimitUpOpenableExtraBps: 10,
+		LimitDownSealedExtraBps: 15, LimitDownSealedEnabled: true, PartialFillEnabled: true, FillRateMin: 0.3}
+	sc := &slipCtx{baseBps: 3, slip: cfg.Slippage, orderValue: 10000, liq: cfg.Liquidity, liqOn: true}
+
+	cases := []struct {
+		name  string
+		entry data.KLine
+	}{
+		{"一字封死", mkBarLine(11, 11, 11, 11, 8e7)},
+		{"涨停打开", mkBarLine(11, 11.05, 10.5, 10.8, 8e7)},
+		{"正常开盘", mkBarLine(10.2, 10.3, 10, 10.1, 8e7)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kls := make([]data.KLine, 32)
+			for i := range kls {
+				kls[i] = mkBarLine(10, 10, 10, 10, 8e7)
+			}
+			kls[31] = tc.entry
+			b1, s1, f1, ok1 := sc.entrySlip("600000.SH", kls, 30)
+			b2, s2, f2, ok2 := sc.entrySlipAt("600000.SH", kls, 30, 31)
+			if ok1 != ok2 || b1 != b2 || s1 != s2 || f1 != f2 {
+				t.Errorf("薄壳不等价：(%v,%.4f,%.4f,%.4f) vs (%v,%.4f,%.4f,%.4f)",
+					ok1, b1, s1, f1, ok2, b2, s2, f2)
+			}
+		})
+	}
+}
+
+// TestEntrySlipAtSameDayCloseEntry 锁当日撮合（动量）的定档口径：
+//   - 收盘仍贴在涨停价上 = 那一刻挂单买不到 → 不可成交；
+//   - 收盘没贴板 → 可成交，且**不叠加**"涨停打开追入"罚分（成交价就是当日最终收盘价，
+//     "盘中打开过"在这个时点没有意义）；
+//   - 流动性滑窗截到入场日**前一根**（入场日=信号日 → 窗口止于 i-1，不把当日量算进自己头上）；
+//   - 越界/倒挂的入场日直接判不可成交（entryIdx 只能是 sigIdx 或 sigIdx+1）。
+func TestEntrySlipAtSameDayCloseEntry(t *testing.T) {
+	sc := &slipCtx{baseBps: 3, slip: config.SlippageConfig{BaseBps: 3, BuyExtraBps: 1, Asymmetric: true},
+		orderValue: 10000, liq: config.LiquidityConfig{Enabled: true, LimitUpOpenableExtraBps: 10}, liqOn: true}
+	kls := make([]data.KLine, 32)
+	for i := range kls {
+		kls[i] = mkBarLine(10, 10, 10, 10, 8e7) // 前收恒 10 → 涨停价 11
+	}
+
+	// 收盘贴在涨停价上：一字/尾盘封板，收盘撮合买不到。
+	kls[30] = mkBarLine(10.9, 11, 10.85, 11, 8e7)
+	if _, _, _, ok := sc.entrySlipAt("600000.SH", kls, 30, 30); ok {
+		t.Error("收盘=涨停价应判不可成交（当日撮合买不到）")
+	}
+	// 同一根 K 线按"次日开盘"判定：开盘 10.9 未触板 → 可成交（两条判据各管各的入场时点）。
+	if _, _, _, ok := sc.entrySlipAt("600000.SH", kls, 29, 30); !ok {
+		t.Error("次日开盘 10.9 未触板应可成交（当日收盘判定不得串到次日路径上）")
+	}
+
+	// 收盘未触板：可成交，滑点=基准 3 + 非对称买差 1（无追开板罚分、无流动性罚）。
+	kls[30] = mkBarLine(11, 11.05, 10.5, 10.9, 8e7)
+	buy, sell, fill, ok := sc.entrySlipAt("600000.SH", kls, 30, 30)
+	if !ok {
+		t.Fatal("收盘 10.9 < 涨停价 11，当日撮合应可成交")
+	}
+	if !nearly(buy, 4) || !nearly(sell, 3) || !nearly(fill, 1) {
+		t.Errorf("当日撮合定档=%f/%f/%f，期望 4/3/1（开盘贴过板不该追罚当日收盘价）", buy, sell, fill)
+	}
+
+	// 入场日越界或倒挂：一律不可成交（不拿不存在的 K 线凑一笔交易）。
+	for _, bad := range [][2]int{{30, 32}, {30, 29}, {0, 0}, {-1, 0}} {
+		if _, _, _, ok := sc.entrySlipAt("600000.SH", kls, bad[0], bad[1]); ok {
+			t.Errorf("entrySlipAt(sig=%d,entry=%d) 应判不可成交", bad[0], bad[1])
+		}
+	}
+}
+
 // TestUniformExitLegacyEquivalence 旧签名与全参数版（5/5/1/0）逐日一致（回归基线）。
 func TestUniformExitLegacyEquivalence(t *testing.T) {
 	kls := make([]data.KLine, 20)
@@ -220,7 +299,8 @@ func TestUniformExitLegacyEquivalence(t *testing.T) {
 	}
 	entry := 10.0
 	j1, p1 := uniformExitV2ATR(kls, 5, entry, 10.2, 8, 5, 0, 10, nil, 0)
-	j2, p2 := uniformExitV2Full(kls, "", 5, entry, 10.2, 8, 5, 0, 10, nil, 0,
+	// 第 3 参数现在是**入场日**（不是信号日）：ATR 版传信号日 5、入场日=6，故全参数版要对齐传 6。
+	j2, p2 := uniformExitV2Full(kls, "", 6, entry, 10.2, 8, 5, 0, 10, nil, 0,
 		costSlippageBps, costSlippageBps, 1, 0)
 	if j1 != j2 || !nearly(p1, p2) {
 		t.Fatalf("出场引擎兼容漂移: (%d,%f) vs (%d,%f)", j1, p1, j2, p2)
@@ -230,7 +310,8 @@ func TestUniformExitLegacyEquivalence(t *testing.T) {
 // TestUniformExitSealedDefers 跌停封死顺延：止损线在封死日触发但不可卖，
 // 打开日成交并追加封死罚分（封死判定按逐日滚动前收计算跌停价）。
 func TestUniformExitSealedDefers(t *testing.T) {
-	// 入场 10（sigIdx=5、入场日 6）；日 7 跌停封死（前收 10 → 板价 9）；日 8 打开收 9.5
+	// 入场 10（入场日=6，即信号日 5 的次日；全参数版第 3 参数收的是入场日下标）；
+	// 日 7 跌停封死（前收 10 → 板价 9）；日 8 打开收 9.5
 	kls := make([]data.KLine, 12)
 	for i := range kls {
 		kls[i] = mkBarLine(10, 10, 10, 10, 5e7)
@@ -238,7 +319,7 @@ func TestUniformExitSealedDefers(t *testing.T) {
 	kls[6] = mkBarLine(10, 10, 10, 10, 5e7)     // 入场日
 	kls[7] = mkBarLine(9.5, 9.6, 9.0, 9.0, 5e7) // 触板收在板上 = 封死，不可卖
 	kls[8] = mkBarLine(9.3, 9.6, 9.2, 9.5, 5e7) // 打开日（前收 9 → 板价 8.1，未触板）
-	j, pnl := uniformExitV2Full(kls, "600000.SH", 5, 10, 10, 20, 5, 0, 6, nil, 0, 5, 5, 1, 15)
+	j, pnl := uniformExitV2Full(kls, "600000.SH", 6, 10, 10, 20, 5, 0, 6, nil, 0, 5, 5, 1, 15)
 	if j < 8 {
 		t.Fatalf("封死期间不得成交: exitJ=%d", j)
 	}
@@ -251,7 +332,7 @@ func TestUniformExitSealedDefers(t *testing.T) {
 		t.Fatalf("打开日滑点未加罚: %f vs %f", pnl, want)
 	}
 	// 对照组：门控关闭（sealedExtra=0）时封死日照常成交（旧行为）
-	j2, _ := uniformExitV2Full(kls, "600000.SH", 5, 10, 10, 20, 5, 0, 6, nil, 0, 5, 5, 1, 0)
+	j2, _ := uniformExitV2Full(kls, "600000.SH", 6, 10, 10, 20, 5, 0, 6, nil, 0, 5, 5, 1, 0)
 	if j2 != 7 {
 		t.Fatalf("门控关闭应在封死日按止损成交: exitJ=%d", j2)
 	}

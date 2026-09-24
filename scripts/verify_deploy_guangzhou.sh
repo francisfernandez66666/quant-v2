@@ -47,6 +47,11 @@
 #      404=二进制未更新（前端有按钮却全链路不可用）；200/403 都不能算过——200 等于把资金账写端点
 #      裸奔到公网，403 说明鉴权层被跳过而只剩归属校验，同 §M-14 收权面回归形态）。
 #
+#  15) §SIGNAL-DIST（2026-09-24，第 22 探针 + INFO 观测通道）：当日固化信号按战法分布的读数。
+#      只观测不判资金：红=文件在但解析失败/没有 signals 数组；文件缺失、日期不是今天、
+#      当日零信号都是合法态（详见 PS 段口径注释）。绿时也要回显读数，故走 INFO 通道
+#      （bash 侧只 echo，不进 PASS/FAIL 计数⇒判数仍是 25）。
+#
 # 用法：
 #   GZ_IP=81.71.69.17 ./scripts/verify_deploy_guangzhou.sh
 #   GZ_IP=81.71.69.17 COMMIT=beb5b80 ./scripts/verify_deploy_guangzhou.sh   # 显式指定指纹
@@ -600,6 +605,115 @@ if ($tkPres.Count -eq 0) { $tkBad += "no readable source" }
 # 09-23 那两次红只留下一串 `missing`，分不清"探针读法瞎"还是"现网真没配"，白付一晚排查。
 $tkDetail = "token_fp_agree=" + $tkAgreeN + "/" + $tkPres.Count + " readable=" + $tkPres.Count + "/expect=" + $tkExpectReadable + " file=" + $tk1 + $tk1Why + " env=" + $tk2 + $tk2Why + " engine=" + $tk3 + $tk3Why + " engineAuth=" + $tk3b + "(auth=" + $tk3Auth + ")" + " bridge=" + $tk4 + " report_file=" + $(if ($tk1r) { $tk1r } else { "none" }) + " report_env=" + $(if ($tk2r) { $tk2r } else { "none" }) + " miss=" + $(if ($tkBad.Count) { ($tkBad -join ",") } else { "none" })
 Probe "qmt:token fp agree across readable sources" ($tkBad.Count -eq 0) $tkDetail
+
+# 14) §SIGNAL-DIST（2026-09-24，第 21 探针）：当日固化信号按战法分布——§KLINE-CHAIN-3 的验收眼睛。
+# 为什么要这条：09-23 那晚「白天只有龙头出信号」是**owner 用肉眼在前端看出来的**，现网 24 条探针
+#   一条都没红（引擎活着、链也在跑，只是拿不到日K 的那批战法整天零产出）。也就是说这条缺陷在
+#   观测面上是**隐形**的：修没修好同样没人知道。所以修完之后必须把「今天有哪些战法出了信号」变成
+#   一条可复跑的读数，而不是再靠人盯。
+# 读法（只读，不新增凭据）：引擎的当日固化信号落 <DataDir>\signals_today.json
+#   （internal/engine/engine.go:558 + signal_store.go，键 code@strategy，跨重启恢复、交易日自动滚动）。
+#   按 Recurse -Depth 2 收（dataDir 为空时该文件根本不落，属合法 no-file）。
+# 口径（2026-09-24 首跑后收紧，见下"为什么按文件分行"）：战法一律取 ASCII 的归一桶——
+#   Signal.StrategyType（runner 类型/规则 ID：dragon/double_bump/n_shape/dragon_return/momentum/
+#   fac_N/pat_N）优先，缺失时按中文展示名查表映射，映射不到记 other（宁可少分类，不猜）。
+#   **不把中文塞进明细**——本仓库实录过 PowerShell→SSH→bash 回传时中文 detail 会被 GBK 字节打乱、
+#   在 grep 判据里恒不命中（＝把假绿写进探针）。
+# 为什么按文件分行（首跑 2026-09-24 实测教训）：DataDir 下 Recurse 能收到 4 份 signals_today.json
+#   （根目录一份 + accounts/<uid>/ 每账号一份，见 engine.go:558 的 per-acctDir 装配），
+#   合并计数会把「昨日/前日的残留桶」和「另一个账号的产出」混进同一个数字里，读出来是 64 却
+#   回答不了 owner 的问题（"今天"有几类战法出了信号）。故：明细逐文件回显 path/day/today/n，
+#   聚合值另算一组**只统计 trading_day==今天**的数（today_signals/today_strategies/
+#   today_leader_only），并回显 today_files。日期的两种历史形态（2026-08-19 与 20260819）
+#   统一去掉非数字后再比，避免"格式不同⇒永远不等"的假失明。
+# 判红边界（刻意收窄，防"这条只能变绿"也防"只能变红"，首跑后未改动）：
+#   红：文件存在但解析失败（parse-error）／JSON 结构里没有 signals 数组（shape-error）。
+#   不红：文件不存在（引擎未出信号、非交易日、dataDir 未配都是合法态）、trading_day 不是今天
+#   （盘前复验必然看到昨日桶，跨日滚动发生在第一次打分轮，拿它判红＝每天清晨自找一红）、
+#   signals=0（当天确实可以一个信号都没有）。这三种都如实把状态写进明细。
+$sgFiles = @()
+try { $sgFiles = @(Get-ChildItem -LiteralPath $DataDir -Filter 'signals_today.json' -Recurse -Depth 2 -ErrorAction SilentlyContinue) } catch { $sgFiles = @() }
+# SgKey：把一条固化信号归一到 ASCII 桶名。判定顺序即优先级，dragon_return 必须排在 dragon 之前
+# （子串包含关系），fac_/pat_ 规则 ID 排在最后兜底。
+function SgKey($o) {
+    $t = [string]$o.strategy_type
+    $s = [string]$o.strategy
+    if (-not $t -and -not $s) { return "unknown" }
+    $u = $t + "|" + $s
+    if ($u -match 'dragon_return|龙回头') { return "dragon_return" }
+    if ($u -match 'double_bump|双响炮') { return "double_bump" }
+    if ($u -match 'n_shape|N形') { return "n_shape" }
+    if ($u -match 'momentum|动量') { return "momentum" }
+    if ($u -match 'dragon|龙头') { return "dragon" }
+    if ($t -match '^fac_' -or $u -match '\bfactor\b') { return "factor" }
+    if ($t -match '^pat_' -or $u -match '\bpattern\b') { return "pattern" }
+    return "other"
+}
+$sgBad = @()
+$sgToday = (Get-Date).ToString("yyyyMMdd")
+$sgTodayN = 0
+$sgTodayFiles = 0
+$sgTodayByType = @{}
+foreach ($sgf in $sgFiles) {
+    $sgJson = $null
+    try {
+        $sgTxt = Get-Content -LiteralPath $sgf.FullName -Raw -Encoding UTF8
+        if ("$sgTxt".Trim()) { $sgJson = "$sgTxt" | ConvertFrom-Json }
+    } catch {
+        $sgBad += ("parse-error(" + $_.Exception.GetType().Name + " file=" + $sgf.Name + ")")
+        continue
+    }
+    $rel = $sgf.FullName
+    # StartsWith 默认区分大小写：DataDir 的盘符大小写与 FullName 不一致时会退化成整条绝对路径
+    # （只是明细变长，不影响判据），显式走忽略大小写比较。
+    if ($rel.StartsWith($DataDir, [StringComparison]::OrdinalIgnoreCase)) { $rel = $rel.Substring($DataDir.Length).TrimStart('\','/') }
+    if ($null -eq $sgJson) {
+        Write-Output ("INFO|signals_file " + $rel + " day=none n=0 empty")
+        continue
+    }
+    if ($null -eq $sgJson.PSObject.Properties['signals']) {
+        $sgBad += ("shape-error(no-signals-array file=" + $rel + ")")
+        continue
+    }
+    # trading_day 是 JSON 标量，直接 [string] 转换即可。不用 `| Out-String`：那条管道在 PS 控制台
+    # 按 120 列折行（§N-5 的教训即在此），本仓 §NSSMENV 负锁对整个脚本禁该写法，这里也不留例外。
+    $sgDay = ([string]$sgJson.trading_day) -replace '[^0-9]', ''
+    if (-not $sgDay) { $sgDay = "none" }
+    $isToday = if ($sgDay -eq $sgToday) { "yes" } else { "no" }
+    $sgByType = @{}
+    $sgN = 0
+    foreach ($sg in @($sgJson.signals)) {
+        if ($null -eq $sg) { continue }
+        $sgN = $sgN + 1
+        $k = SgKey $sg
+        if ($sgByType.ContainsKey($k)) { $sgByType[$k] = [int]$sgByType[$k] + 1 } else { $sgByType[$k] = 1 }
+        if ($isToday -eq "yes") {
+            if ($sgTodayByType.ContainsKey($k)) { $sgTodayByType[$k] = [int]$sgTodayByType[$k] + 1 } else { $sgTodayByType[$k] = 1 }
+        }
+    }
+    $sgTop = ""
+    foreach ($k in @($sgByType.Keys | Sort-Object)) { if ($sgTop) { $sgTop += "," }; $sgTop += ($k + ":" + $sgByType[$k]) }
+    Write-Output ("INFO|signals_file " + $rel + " day=" + $sgDay + " today=" + $isToday + " n=" + $sgN +
+        " kinds=" + $(if ($sgTop) { $sgTop } else { "none" }) +
+        " mtime=" + $sgf.LastWriteTime.ToString("yyyy-MM-dd HH:mm"))
+    if ($isToday -eq "yes") {
+        $sgTodayFiles = $sgTodayFiles + 1
+        $sgTodayN = $sgTodayN + $sgN
+    }
+}
+$sgTypes = @($sgTodayByType.Keys | Sort-Object)
+$sgTop2 = ""
+foreach ($k in $sgTypes) { if ($sgTop2) { $sgTop2 += "," }; $sgTop2 += ($k + ":" + $sgTodayByType[$k]) }
+$sgLeaderOnly = "false"
+if ($sgTodayN -gt 0 -and $sgTypes.Count -eq 1 -and $sgTypes[0] -eq 'dragon') { $sgLeaderOnly = "true" }
+$sgDetail = "today_signals=" + $sgTodayN + " today_strategies=" + $sgTypes.Count + " leader_only=" + $sgLeaderOnly +
+    " today_files=" + $sgTodayFiles + "/" + $sgFiles.Count + " day=" + $sgToday +
+    " top=" + $(if ($sgTop2) { $sgTop2 } else { "none" }) +
+    " miss=" + $(if ($sgBad.Count) { ($sgBad | Sort-Object -Unique) -join "," } else { "none" })
+# 这条探针的**存在理由就是读数本身**，所以绿的时候也必须把明细打出来（其余探针只在红时回显 detail）。
+# 走独立的 INFO 通道：bash 侧只 echo、不进 PASS/FAIL 计数 ⇒ 红绿语义与 25 条判数都不受影响。
+Write-Output ("INFO|signals_today " + $sgDetail)
+Probe "engine:today pinned signals spread across strategies" ($sgBad.Count -eq 0) $sgDetail
 PSEOF
 
 # PS 5.1 无 BOM 的 UTF-8 文件按 GBK 解析——中文注释会撕裂字符串字面量直接 ParserError，
@@ -616,6 +730,9 @@ while IFS= read -r line; do
   case "$line" in
     PASS\|*) PASS=$((PASS+1)); echo "  ✓ ${line#PASS|}" ;;
     FAIL\|*) FAIL=$((FAIL+1)); echo "  ✗ ${line#FAIL|}" ;;
+    # INFO = 观测通道（§SIGNAL-DIST 起）：绿的时候也要把读数打出来，供盘中/盘后直接看数。
+    # 只 echo，不累加 PASS/FAIL，因此不参与 `结果：N 通过 / M 失败` 的计数口径。
+    INFO\|*) echo "  · ${line#INFO|}" ;;
   esac
 done <<< "$out"
 

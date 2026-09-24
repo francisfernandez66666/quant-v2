@@ -1,7 +1,9 @@
 // sweep.go 参数扫参优化引擎（§P2 STRATEGY_OPTIMIZE_PLAN）。
 //
-// 目标：回答"什么战法配什么出场参数在历史上表现最好"——跨全库战法（四大内置 +
-// 库启用因子/形态规则）× 止盈回撤 × 最大持仓 × 入场门槛的网格搜索。
+// 目标：回答"什么战法配什么出场参数在历史上表现最好"——跨全库战法（内置五形态：
+// 双响炮/龙头/龙回头/N形/动量 + 库启用因子/形态规则）× 止盈回撤 × 最大持仓 × 入场门槛的网格搜索。
+// 动量（momentum）自 2026-09-24 判据按实盘语义重写后**参与扫参**：预计算阶段与回放同口径
+// （兜底互斥回查兄弟 + 触发当日收盘入场），否则网格会替一条实盘不会下单的路径寻优。
 //
 // 性能设计：触发判定与出场参数无关 → 全库 K 线一次性载入内存、逐 adapter 预计算
 // 触发事件；每个参数组合只做廉价的统一出场模拟（移动止盈+超期），500 组合秒级完成。
@@ -146,10 +148,14 @@ const sweepMaxCacheStocks = 500
 // §回测自动增强 A：滑点/成交比例在触发预算时一次定档（只依赖成交额与名义额、
 // 不依赖出场参数），逐组合模拟零额外开销；旧路径恒为 5/5/1。
 type sweepTrigger struct {
-	ad       int     // adapter 序号
-	code     string  // 股票代码（裸码）
-	sigIdx   int     // 触发信号日下标（次日开盘入场）
-	entry    float64 // 入场价 = 次日开盘
+	ad     int    // adapter 序号
+	code   string // 股票代码（裸码）
+	sigIdx int    // 触发信号日下标
+	// entryIdx 实际入场日下标：缺省 sigIdx+1（次日开盘）；声明 SameDayEntry 的战法（动量，
+	// 实盘当日撮合）= sigIdx（触发当日收盘）。此前扫参把入场时点写死成"次日"，与重写后的
+	// 回放口径分叉——网格会在一个实盘不会成交的时间点上寻优。
+	entryIdx int
+	entry    float64 // 入场价（entryIdx 那根的开盘或收盘，随 entryIdx 而定）
 	score    float64 // 入场评分（-1=该战法无连续分，如形态区间命中）
 	highest  float64 // 信号日高点基准（移动止盈起点）
 	buySlip  float64 // 买入滑点（bp，动态定档；旧路径=5）
@@ -620,13 +626,17 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KLine,
 	indByDate map[string]float64, sc *slipCtx) []sweepTrigger {
 	var out []sweepTrigger
-	if na, ok := ad.(*nShapeAdapter); ok {
-		na.macdSeries = data.CalcMACDSeries(kls)
+	// 有状态适配器装配（dayScoped）：与 backtestStock 同一套、同一口径——MACD 序列逐股重算
+	// (§RFIX-1)、逐日推进游标。两处若只改一处，网格就会按另一条取数路径选出"最优参数"。
+	applyStockScope(ad, kls)
+	needPeers := isFallbackTier(ad) && len(o.fallbackPeers) > 0
+	if needPeers {
+		for _, p := range o.fallbackPeers {
+			applyStockScope(p, kls)
+		}
 	}
 	for i := 29; i < len(kls)-1; i++ {
-		if na, ok := ad.(*nShapeAdapter); ok {
-			na.curIdx = i
-		}
+		applyDayScope(ad, i)
 		prevClose := 0.0
 		if i > 0 {
 			prevClose = kls[i-1].Close
@@ -639,7 +649,16 @@ func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KL
 		if !ok {
 			continue
 		}
-		entry := kls[i+1].Open
+		// 兜底互斥（与 backtestStock 同一道门，见 fallbackBlockedByPeer）：漏掉这一步，网格就会
+		// 给一条实盘轮不到下单的路径寻优，寻出来的冠军参数在实盘根本没有对应的单子。
+		if needPeers && o.fallbackBlockedByPeer(kls, i, prevClose, indChg) {
+			continue
+		}
+		// 入场时点：缺省次日开盘；SameDayEntry 的战法取触发当日收盘（与回放同口径）。
+		entryIdx, entry := i+1, kls[i+1].Open
+		if sd, ok2 := ad.(sameDayEntryAdapter); ok2 && sd.SameDayEntry() {
+			entryIdx, entry = i, kls[i].Close
+		}
 		if entry <= 0 {
 			continue
 		}
@@ -647,16 +666,18 @@ func (o *Options) sweepTriggersOf(ad adapter, ai int, code string, kls []data.KL
 		buySlip, sellSlip, fill := costSlippageBps, costSlippageBps, 1.0
 		if sc != nil {
 			var can bool
-			buySlip, sellSlip, fill, can = sc.entrySlip(code, kls, i)
+			buySlip, sellSlip, fill, can = sc.entrySlipAt(code, kls, i, entryIdx)
 			if !can {
-				continue // 一字封死：现实中买单排队无望
+				continue // 一字封死（当日收盘撮合则是收盘贴涨停）：现实中买单排队无望
 			}
+		} else if entryIdx == i && i > 0 && costOpenAtLimitUp(code, prevClose, entry) {
+			continue // 旧路径下的当日撮合同样要挡掉收盘涨停（与 backtestStock 的兜底分支同判据）
 		}
 		high := meta["highest_price"]
 		if high <= 0 {
 			high = entry
 		}
-		out = append(out, sweepTrigger{ad: ai, code: code, sigIdx: i,
+		out = append(out, sweepTrigger{ad: ai, code: code, sigIdx: i, entryIdx: entryIdx,
 			entry: entry, score: meta["score"], highest: high,
 			buySlip: buySlip, sellSlip: sellSlip, fillR: fill})
 	}
@@ -749,6 +770,20 @@ func applyComboParams(ad adapter, takeProfitPct, stopLossPct float64, maxHold in
 			a.cfg.MaxHoldDays = maxHold
 		}
 		return func() { a.cfg.TrailingDrawbackPct, a.cfg.HardStopLoss, a.cfg.MaxHoldDays = old1, old2, old3 }
+	case *momentumAdapter:
+		// 动量实盘无专属 CheckExit（走通用移动止盈），扫参只能覆盖通用出场的两个旋钮，
+		// 与 ruleEvalAdapter 同一实现（genericReplayExit），不另开一套出场口径。
+		// 判据 2026-09-24 按实盘语义重写后本分支真的会被调用（预计算能拿到触发了）。
+		old1, old2 := a.trailOverride, a.holdOverride
+		if takeProfitPct > 0 {
+			v := takeProfitPct
+			a.trailOverride = &v
+		}
+		if maxHold > 0 {
+			v := maxHold
+			a.holdOverride = &v
+		}
+		return func() { a.trailOverride, a.holdOverride = old1, old2 }
 	case *ruleEvalAdapter:
 		old1, old2 := a.trailOverride, a.holdOverride
 		if takeProfitPct > 0 {
@@ -793,8 +828,9 @@ func uniformExitV2(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int,
 	atr []float64, atrStopMult float64) (int, float64) {
-	// 旧签名委托全参数版：固定 5/5 滑点、全额成交、无跌停封死门控（行为不变）
-	return uniformExitV2Full(kls, "", sigIdx, entry, sigHigh, takeProfitPct, stopLossPct, trailPct,
+	// 旧签名委托全参数版：固定 5/5 滑点、全额成交、无跌停封死门控（行为不变）。
+	// 本签名沿用"传信号日、入场日=次日"的缺省口径，故委托时补 +1（当日入场的战法走 Full+entryIdx）。
+	return uniformExitV2Full(kls, "", sigIdx+1, entry, sigHigh, takeProfitPct, stopLossPct, trailPct,
 		maxHoldDays, atr, atrStopMult, costSlippageBps, costSlippageBps, 1, 0)
 }
 
@@ -803,13 +839,16 @@ func uniformExitV2ATR(kls []data.KLine, sigIdx int, entry, sigHigh float64,
 // （sealedExtra>0 时启用：封死日跳过出场判定、打开日卖出加罚该滑点）、
 // 部分成交（盈亏 × fillRate，未成交部分留现金属零收益的近似口径 B.5-5）。
 // buySlip=sellSlip=5、fill=1、sealedExtra=0 时与旧 uniformExitV2ATR 数值完全一致。
+// 第 3 参数是**入场日下标**（不是信号日）：入场时点原先在本函数里写死成"信号日+1"，而实盘
+// 当日撮合的战法（动量）入场日就是信号日，所以把 +1 上移到调用方——缺省路径经
+// uniformExitV2/uniformExitV2ATR 传入的仍是 sigIdx+1，数值逐字节不变。
 // English: full-parameter v2 — per-trade asymmetric slippage, limit-down sealed gate (no sell
 // while sealed, extra slippage on the opening day) and partial fills; identical to the legacy
-// variant when slippage is fixed 5/5, fill=1 and the sealed gate is off.
-func uniformExitV2Full(kls []data.KLine, code string, sigIdx int, entry, sigHigh float64,
+// variant when slippage is fixed 5/5, fill=1 and the sealed gate is off. The third argument is
+// now the ENTRY day (callers add the +1), so same-day-entry strategies can reuse this engine.
+func uniformExitV2Full(kls []data.KLine, code string, entryDay int, entry, sigHigh float64,
 	takeProfitPct, stopLossPct, trailPct float64, maxHoldDays int,
 	atr []float64, atrStopMult, buySlip, sellSlip, fill, sealedExtra float64) (int, float64) {
-	entryDay := sigIdx + 1
 	stageHigh := math.Max(entry, sigHigh)
 	lastJ := len(kls) - 1
 
@@ -981,14 +1020,14 @@ func simulateUniform(name, kind string, trigs []sweepTrigger, klines map[string]
 		if t.sigIdx < nextFree[t.code] {
 			continue
 		}
-		exitJ, pnl := uniformExitV2Full(klines[t.code], t.code, t.sigIdx, t.entry, t.highest,
+		exitJ, pnl := uniformExitV2Full(klines[t.code], t.code, t.entryIdx, t.entry, t.highest,
 			takeProfitPct, stopLossPct, 0, maxHold, atrs[t.code], atrStopMult,
 			t.buySlip, t.sellSlip, t.fillR, sealedExtra)
 		nextFree[t.code] = exitJ + 1
 		res.Count++
-		res.AvgHold += float64(exitJ - (t.sigIdx + 1))
+		res.AvgHold += float64(exitJ - t.entryIdx)
 		pnls = append(pnls, pnl)
-		dates = append(dates, klines[t.code][t.sigIdx+1].Date.Format("20060102"))
+		dates = append(dates, klines[t.code][t.entryIdx].Date.Format("20060102"))
 		if pnl > 0 {
 			res.Win++
 			winSum += pnl

@@ -1,12 +1,13 @@
-// Package btreplay 四大手写战法 + 战法库规则的历史回放回测（子系统统一改造二期：
+// Package btreplay 五个手写战法（四形态 + 动量）+ 战法库规则的历史回放回测（子系统统一改造二期：
 // 自 cmd/backtest_strategy 并入 research 二进制，消除子系统内的第二套回测进程代码）。
 // 对外入口：research [--db …] backtest-strategy …（run-task 的 backtest_strategy 类型进程内调用）。
-// English: package btreplay — historical replay backtests for the four hand-written strategies plus
+// English: package btreplay — historical replay backtests for the five hand-written strategies plus
 // applied factor/pattern library rules. Merged from the standalone bt_strategy binary into the
 // research binary (phase 2), leaving one research subsystem with a single entry.
 // 从离线研究库（trading.db）读取历史日K，逐交易日回放 dragon/double_bump/dragon_return/n_shape
-// 四个战法的触发信号，次日开盘入场，用各战法的 CheckExit 逐日模拟平仓并结算盈亏，
-// 输出按战法分组的胜率/平均盈亏/盈亏比，以及 1/5/10 日前瞻收益，用于验证与调参。
+// 四个内置形态战法与 momentum（动量）共五个内置战法的触发信号，模拟入场后逐日跑各战法的
+// CheckExit 平仓并结算盈亏，输出按战法分组的胜率/平均盈亏/盈亏比，以及 1/5/10 日前瞻收益，
+// 用于验证与调参。入场时点按战法各自声明：缺省次日开盘，动量按实盘当日撮合（触发当日收盘）。
 //
 // 说明（近似口径）：板块/日内/LLM 依赖按如下方式近似——
 //   - double_bump：纯日K完整回放，最接近实盘。
@@ -14,6 +15,11 @@
 //   - dragon：板块共振（F2/F3）用所属行业板块当日涨幅近似；无行业数据时降级忽略板块维度。
 //   - n_shape：高度依赖日内快照与 LLM D1，日K近似后准确性打折；D1 用可配置规则分（默认 0，
 //     此时仅统计其他维度，几乎不触发，需配合 -d1 提供规则分才有信号）。
+//   - momentum（动量）：判据按实盘语义重写（2026-09-24 owner 令）——同标的当日被任一兄弟战法
+//     出信号即不入场（实盘 `len(sigs)==0` 兜底档）、触发当日收盘入场（实盘当日撮合）、
+//     只计实盘买入档（观察档不算可交易）。日K粒度仍量不到的三件事（5 分钟 MACD、盘中多轮、
+//     跨轮"动量提升"门）逐条写在 momentumAdapter 注释与 ReplayApproxNote("momentum") 里，
+//     数字出门时带标签。
 package btreplay
 
 import (
@@ -27,6 +33,8 @@ import (
 	"strings"
 	"time"
 
+	"quant-trading-v2/internal/cntime"
+	"quant-trading-v2/internal/combat_agent"
 	"quant-trading-v2/internal/config"
 	"quant-trading-v2/internal/data"
 	"quant-trading-v2/internal/research"
@@ -72,6 +80,47 @@ type adapter interface {
 	Trigger(klines []data.KLine, prevClose float64, industryChg float64) (map[string]float64, bool)
 	// Exit 用当日行情判定是否平仓；返回平仓理由与是否平仓。非 nil 且 Exit==true 时按 CurPrice 结算。
 	Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine) (*strategy.ExitResult, bool)
+}
+
+// fallbackTierAdapter 声明"实盘兜底档"的战法。动量在实盘只在**同标的当日其它战法一个信号都没出**
+// 时才轮到它下单（combat_agent/agent.go 的 `len(sigs) == 0 &&` 分支）。回放框架按战法各自独立跑，
+// 天生没有这个跨战法状态——不补就会把"实盘根本轮不到动量"的那些日子也算成动量交易，
+// 量出来的胜率属于一批实盘不存在的单子。放行这类战法前必须先由 collect() 预扫出
+// "该标的当日已被出手"的日索引（Options.fallbackBlocks），见 backtestStock 的兜底门控段。
+// English: a strategy that only trades in live when no other strategy signaled the same stock/day;
+// replay must therefore consult a pre-scoped set of days occupied by its sibling adapters.
+type fallbackTierAdapter interface{ FallbackTier() bool }
+
+// sameDayEntryAdapter 声明"实盘当日撮合"的战法：信号产生的那一刻就以现价进动量池成交，
+// 而回放缺省口径是"次日开盘入场"——那等于让回测替实盘承担了一个实盘没有的隔夜跳空。
+// 声明为真的适配器入场时点改为**触发当日收盘**：日K粒度下唯一不需要自造日内路径的当日成交价。
+// English: a strategy whose live fills happen the same day the signal is produced, so replay enters
+// at the signal day's close instead of the next day's open (the only same-day price that does not
+// require inventing an intraday path we do not have).
+type sameDayEntryAdapter interface{ SameDayEntry() bool }
+
+// dayScoped 有状态适配器的取数装配点：逐股一次预计算 + 逐日推进游标。
+// §RFIX-1 的教训（MACD 序列按池内第一只股票算一次 → 后续股票跨股污染、更长序列游标越界 panic）
+// 之所以会复发，就是因为这套装配散落在 backtestStock / sweepTriggersOf 两处手写类型分支里。
+// 收敛成一个接口：三处调用点（含兜底互斥预扫）共用，新增有状态适配器只在这里登记一次。
+// English: the single place where stateful adapters get their per-stock precomputation and
+// per-day cursor, shared by replay, sweep and the fallback-exclusivity pre-scan.
+type dayScoped interface {
+	prepareStock(klines []data.KLine)
+	setDay(i int)
+}
+
+// applyStockScope / applyDayScope 对可选接口做装配（非 dayScoped 的适配器零开销跳过）。
+func applyStockScope(ad adapter, klines []data.KLine) {
+	if ds, ok := ad.(dayScoped); ok {
+		ds.prepareStock(klines)
+	}
+}
+
+func applyDayScope(ad adapter, i int) {
+	if ds, ok := ad.(dayScoped); ok {
+		ds.setDay(i)
+	}
 }
 
 // ── double_bump 适配器（纯日K完整回放） ──
@@ -184,6 +233,13 @@ type nShapeAdapter struct {
 
 // Name 战法名（回测报告分组键）。
 func (a *nShapeAdapter) Name() string { return "N形" }
+
+// prepareStock / setDay 实现 dayScoped：逐股重算日线 MACD 序列（§RFIX-1 的口径不变），逐日推进游标。
+func (a *nShapeAdapter) prepareStock(klines []data.KLine) {
+	a.macdSeries = data.CalcMACDSeries(klines)
+}
+
+func (a *nShapeAdapter) setDay(i int) { a.curIdx = i }
 
 // Trigger 用日K近似构造 n_shape 的评分输入：WaveA=前一交易日，IntradayB=当日近似，
 // Ctx 只注入规则 D1 分（无 LLM/板块/事件数据）。仅 full_chain（D1>0 且总分≥60）触发。
@@ -314,6 +370,210 @@ func (a *dragonAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine)
 	return res, true
 }
 
+// ── momentum 适配器（动量分：日K + 日线 MACD 近似盘中量价/分钟 MACD） ──
+
+// momentumAdapter 动量战法适配器：**按实盘语义重写的可回放判据**（2026-09-24 owner 令：
+// "动量判据按实盘语义重写"，此前它是"适配器在位但 Trigger 恒不触发"的排摸盲区）。
+//
+// 重写落地的三条实盘语义（逐条对应 agent.go 的实现，缺一条量出来的就不是"实盘那批单子"）：
+//  1. **兜底互斥**（agent.go:1208 `len(sigs) == 0 &&`）：动量只在**同标的当日四形态战法一个信号都没出**
+//     时才轮到下单。由 FallbackTier() 声明，backtestStock 在动量自身达买入档的那一刻回查兄弟适配器
+//     （fallbackBlockedByPeer），兄弟当日出过信号即丢弃这条动量信号——与实盘同一条 if 的短路顺序一致。
+//  2. **当日撮合**（实盘在分数产生的那一刻就以现价进动量池，md.Price＝当时现价）：由 SameDayEntry()
+//     声明，入场时点从"次日开盘"改成**触发当日收盘**。日K粒度下收盘是唯一不需要自造日内路径的
+//     当日成交价；用次日开盘等于让回测替实盘承担一个实盘没有的隔夜跳空。
+//  3. **买入档才计交易**：实盘 [观察档 60, 买入档 75) 只发 watch 不动单（≥ 买入档才 Action=buy），
+//     故 Trigger 用 buyThreshold()，与实盘 momentumBuySignalThreshold 同一对阈值和同一个
+//     "买入档不低于观察档"的夹子。
+//
+// 四条**数据/粒度差异**（前三条不可重建，只能如实标注、不能编出来；第四条是必须主动抵消的口径差）：
+//  1. 分钟 MACD → 日线 MACD：实盘 macdRatio 读 md.MinuteMACD（5 分钟 K 线算出的 DIF/DEA/Bar），
+//     研究库**没有分钟 K 落库**（只有新浪/腾讯实时接口），历史回放用 data.CalcMACDSeries 的**日线**
+//     MACD 顶上（与 n_shape 的 D4 资金确认同一先例）。方向性偏差：日线 MACD 比 5 分钟 MACD 迟钝，
+//     金叉/水上通常滞后一日，当日刚转弱的票在回放里仍可能被读成多头。
+//  2. 盘中轮次不可重建：实盘一轮一轮用实时行情打分，日内可能多轮跨越阈值；回放每天只判一次
+//     （收盘口径），因此**只会漏掉盘中那一刻的触发**，不会凭空多造触发。
+//  3. "动量提升才提醒"门不可重放：实盘该门（combat_agent/agent.go momentumImproved）是**跨轮盘中
+//     状态**，且 momentumPrev 每日重置——盘后按日粒度既拿不到"上一轮"，也就无从复现。
+//     注意这条门管的是**四形态信号**（N 形豁免），不是动量自己，所以它对动量行的影响是间接的：
+//     回放里兄弟用裸 Trigger（不过提升门/板块二次确认/情绪闸），被占掉的日偏多 →
+//     **动量入场数偏少**，属保守方向的偏差。
+//  4. 盘中量比的时间窗折算：实盘 volumePriceRatio 用 time.Now() 把"当日累计量"折算成全天等值
+//     （§P2#26）。回放喂的是已收盘的全日量，故 momentumQuoteVolume 先按同一系数把它缩小，
+//     让实盘函数内部的折算正好抵消——**触发结果与回测在几点运行无关**（否则上午跑一次会把
+//     全市场量比放大数倍、人人触发）。
+//
+// English: momentum adapter rewritten to live semantics (owner directive 2026-09-24) — same-stock
+// fallback exclusivity, same-day entry at the signal day's close, trade only at the live BUY
+// threshold. What daily bars cannot reproduce (minute MACD, intraday rounds, the round-to-round
+// improvement gate) is declared as a residual approximation, not faked.
+type momentumAdapter struct {
+	cfg config.MomentumConfig // 动量权重与双阈值（出厂默认 40/30/30 + 60/75）
+	// 日线 MACD 序列 + 当前判定日游标：由 dayScoped 装配点逐股 CalcMACDSeries、逐日推进
+	// （§RFIX-1 口径，与 nShapeAdapter 同一手法；逐日重算会退化成 O(n²)）。
+	macdSeries []data.MACD
+	curIdx     int
+	// §P2-d 出场参数扫参覆盖（nil=通用移动止盈缺省 8%/15 天，动量实盘本就无专属 CheckExit）。
+	trailOverride *float64
+	holdOverride  *int
+}
+
+// Name 战法名（回测报告分组键；与实盘 strategy.SignalMomentum 的显示名同一字面）。
+func (a *momentumAdapter) Name() string { return "动量" }
+
+// FallbackTier 声明实盘兜底档身份：回放必须过 backtestStock 的兜底互斥门控（见 fallbackTierAdapter）。
+func (a *momentumAdapter) FallbackTier() bool { return true }
+
+// SameDayEntry 声明实盘当日撮合：入场价取触发当日收盘而非次日开盘（见 sameDayEntryAdapter）。
+func (a *momentumAdapter) SameDayEntry() bool { return true }
+
+// prepareStock / setDay 实现 dayScoped：逐股重算日线 MACD 序列、逐日推进游标（§RFIX-1 口径，
+// 与 nShapeAdapter 同一对方法；游标不在此预置，缺 -1 时 scoreDay 的钳位判据会退化成逐日重算）。
+func (a *momentumAdapter) prepareStock(klines []data.KLine) {
+	a.macdSeries = data.CalcMACDSeries(klines)
+}
+
+func (a *momentumAdapter) setDay(i int) { a.curIdx = i }
+
+// watchThreshold 观察级阈值（实盘 momentumSignalThreshold 同口径：≤0 回退 60）。
+func (a *momentumAdapter) watchThreshold() float64 {
+	if a.cfg.SignalThreshold <= 0 {
+		return 60
+	}
+	return a.cfg.SignalThreshold
+}
+
+// buyThreshold 买入级阈值（实盘 momentumBuySignalThreshold 同口径：≤0 回退 75，且不低于观察阈值）。
+func (a *momentumAdapter) buyThreshold() float64 {
+	buy := a.cfg.BuySignalThreshold
+	if buy <= 0 {
+		buy = 75
+	}
+	if w := a.watchThreshold(); buy < w {
+		buy = w
+	}
+	return buy
+}
+
+// Trigger 当日是否出"可交易的动量信号"：实盘同一打分函数 + 实盘买入档阈值（近似口径与三条
+// 实盘语义见 momentumAdapter 注释）。判据本体在 scoreDay，Trigger 只做委托——**兜底互斥门控
+// 不在这里**：那是跨战法状态，适配器自己看不到兄弟战法，由 backtestStock 的兜底段裁决。
+func (a *momentumAdapter) Trigger(klines []data.KLine, prevClose float64, _ float64) (map[string]float64, bool) {
+	return a.scoreDay(klines, prevClose)
+}
+
+// scoreDay 动量判档本体：用截止当日的日K构造实盘同结构的 StockMarketData，跑
+// combat_agent.MomentumScore，按实盘买入档给结论。
+// 门槛：日K ≥30 根（日线 MACD 的 EMA26+DEA9 预热需要，比实盘的 ≥5 有效数据门槛更严——
+// 近似口径 1 的必然代价：预热不足的 MACD 全是 0，动量分会白丢 30 分权重）。
+// 返回值 meta 带 score（动量分，供扫参 min_score 维度同构复用）；bool=分数是否达买入档
+// （实盘此档才发 buy；[观察档, 买入档) 只发 watch、不下单，故不算可交易信号）。
+func (a *momentumAdapter) scoreDay(klines []data.KLine, prevClose float64) (map[string]float64, bool) {
+	if len(klines) < 30 {
+		return nil, false
+	}
+	last := klines[len(klines)-1]
+	if prevClose <= 0 && len(klines) >= 2 {
+		prevClose = klines[len(klines)-2].Close
+	}
+	chg := chgPct(last.Close, prevClose)
+	// 近似口径 1：日线 MACD 顶替 5 分钟 MACD。序列缺失/游标错位时退化为逐日重算（不越界）。
+	var macd data.MACD
+	if a.macdSeries != nil && a.curIdx >= 0 && a.curIdx < len(a.macdSeries) {
+		macd = a.macdSeries[a.curIdx]
+	} else {
+		macd = data.CalcMACD(klines)
+	}
+	md := &strategy_engine.StockMarketData{
+		Price:     last.Close,
+		ChangePct: chg,
+		KLines:    klines,
+		// 实盘动量分量读 Quote 的当日量价：这里用当日日K + 收盘涨跌幅喂一份等价快照，
+		// 成交量按近似口径 3 折算，抵消 MomentumScore 内部的盘中时间窗放大。
+		Quote: &data.StockInfo{
+			Price:  last.Close,
+			Open:   last.Open,
+			High:   last.High,
+			Low:    last.Low,
+			Close:  last.Close,
+			Volume: momentumQuoteVolume(time.Now(), last.Volume),
+			Amount: last.Amount,
+
+			ChangePct: chg,
+		},
+		MinuteMACD: macd,
+	}
+	// 与实盘 momentumDataValid 同一有效性判定（无有效量价/MACD 时不出信号，避免拿全零序列
+	// 凑出一个"0 分但可交易"的假信号）；这条路径里唯一会挂的是 MACD 预热不足。
+	if last.Close <= 0 || last.Volume <= 0 || (macd.DIF == 0 && macd.DEA == 0 && macd.Bar == 0) {
+		return nil, false
+	}
+	score := combat_agent.MomentumScore(md, a.cfg)
+	meta := map[string]float64{
+		"highest_price": last.Close, // 移动止盈基准（Exit 逐日抬高）
+		"score":         score,
+	}
+	return meta, score >= a.buyThreshold()
+}
+
+// Exit 动量实盘没有专属 CheckExit（持仓走 combat_agent 的通用移动止盈回退，见
+// position_exits.go），回放同口径：8% 移动止盈 + 15 日超期，缺省值与扫参覆盖都由
+// genericReplayExit 统一实现，绝不在这里另写一套出场。
+func (a *momentumAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine) (*strategy.ExitResult, bool) {
+	trailLimit, holdLimit := -8.0, 15
+	if a.trailOverride != nil && *a.trailOverride > 0 {
+		trailLimit = -*a.trailOverride
+	}
+	if a.holdOverride != nil && *a.holdOverride > 0 {
+		holdLimit = *a.holdOverride
+	}
+	return genericReplayExit(ctx, trailLimit, holdLimit)
+}
+
+// replayElapsedTradeMinutes A股当日已流逝交易分钟数（北京时区，240 分钟制＝上午 120 + 下午 120）。
+// 这是 combat_agent.tradingMinutesElapsed 的**本地副本**，唯一用途是让回放喂进去的量在
+// 实盘函数里被同一个系数乘回来（见 momentumQuoteVolume）——两边口径必须同步，实盘若改
+// 折算窗口，这里不改就会让动量回放的量比系统性失真。
+// English: local mirror of the live elapsed-trading-minute proration, used only to pre-compensate
+// the full-day volume so MomentumScore's intraday normalization cancels out exactly.
+func replayElapsedTradeMinutes(now time.Time) float64 {
+	n := cntime.In(now)
+	m := n.Hour()*60 + n.Minute()
+	const (
+		amStart = 9*60 + 30  // 09:30
+		amEnd   = 11*60 + 30 // 11:30
+		pmStart = 13 * 60    // 13:00
+		pmEnd   = 15 * 60    // 15:00
+	)
+	switch {
+	case m < amStart:
+		return 0
+	case m <= amEnd:
+		return float64(m - amStart)
+	case m <= pmStart: // 午休：上午已走完
+		return 120
+	case m <= pmEnd:
+		return 120 + float64(m-pmStart)
+	default: // 盘后：全日 240
+		return 240
+	}
+}
+
+// momentumQuoteVolume 把"当日全日成交量"折算成 now 时刻的盘中累计量等价值（近似口径 3）。
+// 实盘量比 = 累计量 × (240/已流逝分钟) ÷ 前 20 日均量；回放喂全日量会被再放大一次，
+// 这里先按同系数缩小把它还原，运行时刻不再影响触发结果。盘前（流逝 0 分钟）与实盘
+// 同一兜底（按 1 分钟），保证折算系数有限且两侧一致。
+func momentumQuoteVolume(now time.Time, fullDayVol float64) float64 {
+	if fullDayVol <= 0 {
+		return 0
+	}
+	elapsed := replayElapsedTradeMinutes(now)
+	if elapsed <= 0 {
+		elapsed = 1
+	}
+	return fullDayVol * elapsed / 240
+}
+
 // ── 工具函数 ──
 
 // chgPct 计算相对前收盘的涨跌幅（%）；prev<=0 返回 0。
@@ -406,7 +666,7 @@ type Options struct {
 	DBPath    string  // 回放用数据库路径（daily K 等原始数据）
 	Start     string  // 回测开始日期（YYYY-MM-DD）
 	End       string  // 回测结束日期（YYYY-MM-DD）
-	Strategy  string  // double_bump|dragon|dragon_return|n_shape|factor|pattern|all（战法选择）
+	Strategy  string  // double_bump|dragon|dragon_return|n_shape|momentum|factor|pattern|all（战法选择）
 	MaxStocks int     // 最多回测股票数（0=全部）
 	D1Score   float64 // 外部注入的固定 D1 分（≥0 时使用）
 	Industry  bool    // 是否启用行业过滤/分组
@@ -463,6 +723,35 @@ type Options struct {
 	// slip 运行期滑点上下文（Run/runSweep 每战法装配一次，非配置项；nil=旧行为）。
 	// English: runtime slippage context assembled per strategy during a run (not a config field).
 	slip *slipCtx
+	// fallbackPeers 运行期兜底互斥的"兄弟战法"清单（collect/runSweep 各装配一次，非配置项）：
+	// 实盘 agent.go 的 `len(sigs) == 0 &&` 是**同标的同一轮**跨战法状态，逐战法独立跑的回放
+	// 天生看不到它。这里把同批次构建的其它适配器交给兜底档适配器回查，量出的才是"实盘真由
+	// 动量下单的那批票"。清单来自同一份 ads（排摸 IncludeDisabled=true 时停用库规则也算兄弟），
+	// 偏差方向是动量入场数偏少——保守侧，见 momentumAdapter 残余近似 3。
+	fallbackPeers []adapter
+}
+
+// setFallbackPeers 装配兜底互斥的兄弟清单：同一批适配器里**非兜底档**的那些。
+// 兜底档之间不互为兄弟（实盘由同一条 if 分支产出，互不占用名额）。
+func (o *Options) setFallbackPeers(ads []adapter) {
+	peers := make([]adapter, 0, len(ads))
+	for _, ad := range ads {
+		if fb, ok := ad.(fallbackTierAdapter); ok && fb.FallbackTier() {
+			continue
+		}
+		peers = append(peers, ad)
+	}
+	o.fallbackPeers = peers
+}
+
+// hasFallbackTier 本批适配器里是否存在兜底档战法（决定要不要为它装配兄弟清单）。
+func hasFallbackTier(ads []adapter) bool {
+	for _, ad := range ads {
+		if fb, ok := ad.(fallbackTierAdapter); ok && fb.FallbackTier() {
+			return true
+		}
+	}
+	return false
 }
 
 // DefaultDB 研究库默认路径：QUANT_DATA_DIR 优先，否则 ~/.quant-trading-v2/trading.db
@@ -512,6 +801,9 @@ func newAdapter(name string, industry bool, d1 float64) (adapter, error) {
 		return &dragonReturnAdapter{st: dragon_return.New(cfgMgr), cfg: &sc.DragonReturn, forceLeader: industry}, nil
 	case "n_shape":
 		return &nShapeAdapter{st: n_shape.New(cfgMgr, nil), cfg: &sc.NShape, d1Score: d1}, nil
+	case "momentum":
+		// 动量：无策略对象，直接喂实盘打分函数 MomentumScore（近似口径见 momentumAdapter 注释）。
+		return &momentumAdapter{cfg: sc.Momentum, curIdx: -1}, nil
 	default:
 		return nil, fmt.Errorf("未知战法: %s", name)
 	}
@@ -579,10 +871,6 @@ func (a *ruleEvalAdapter) Trigger(klines []data.KLine, prevClose, _ float64) (ma
 // English: generic trailing stop + timeout (same semantics as the live fallback): raises the stage high
 // daily via the shared EntryMeta map, exits on an ≥8% drawdown from a profitable high or a 15-day timeout.
 func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine) (*strategy.ExitResult, bool) {
-	cost, price := ctx.CostPrice, ctx.CurPrice
-	if cost <= 0 || price <= 0 {
-		return nil, false
-	}
 	// §P2-d 规则级出场参数优先（扫参审批），缺省回退全局 8%/15 天。
 	// §GAP2.2 修复：缺省 trailLimit 必须是负号语义（回撤达 -8% 才触发），与实盘
 	// genericTrailingExitWith（combat_agent/position_exits.go: trail <= -trailPct）同口径。
@@ -595,6 +883,19 @@ func (a *ruleEvalAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLin
 	holdLimit := 15
 	if a.holdOverride != nil && *a.holdOverride > 0 {
 		holdLimit = *a.holdOverride
+	}
+	return genericReplayExit(ctx, trailLimit, holdLimit)
+}
+
+// genericReplayExit 通用移动止盈 + 超期离场的**唯一实现**（实盘 combat_agent.genericTrailingExit
+// 同口径），供没有专属 CheckExit 的战法复用：库规则（ruleEvalAdapter）与动量（momentumAdapter）。
+// trailLimit 传**负号语义**（-8 ＝ 从阶段高点回撤 8% 触发），holdLimit 为超期天数。
+// English: the single generic trailing-stop + timeout exit reused by adapters without their own
+// CheckExit; trailLimit keeps the live negative-sign semantics.
+func genericReplayExit(ctx *strategy.ExitContext, trailLimit float64, holdLimit int) (*strategy.ExitResult, bool) {
+	cost, price := ctx.CostPrice, ctx.CurPrice
+	if cost <= 0 || price <= 0 {
+		return nil, false
 	}
 	stageHigh := cost
 	if h, ok := ctx.EntryMeta["highest_price"]; ok && h > stageHigh {
@@ -747,8 +1048,10 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 			return nil, false, perr
 		}
 		ads = append(fa, pa...)
-		// 四大手写战法一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape）：
-		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。
+		// 四大手写战法 + 动量一并纳入 all 回放（dragon/double_bump/dragon_return/n_shape/momentum）：
+		// "几个形态战法不进回测"的另一含义——它们此前只能手动逐个跑。momentum 的判据已按实盘语义
+		// 重写（2026-09-24），在 all 模式下是**真产出数字的第五个战法**：它作为兜底档，兄弟（含此处
+		// 先装载的 fac_*/pat_* 库规则）当日出过信号就不入场，与实盘 sigs 的口径一致。
 		// 枚举唯一出处 = BuiltinStrategies()（strategy-survey 排摸同一集合，不再各写一份）。
 		// English: the built-in list has exactly one source of truth — BuiltinStrategies().
 		builtins := BuiltinStrategies()
@@ -764,7 +1067,7 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 			log.Printf("战法库无启用规则（%s 下 applied_*.json 为空或全部停用）", o.DataDir)
 			return nil, false, nil
 		}
-		log.Printf("all 回放：%d 条库规则（factor=%d pattern=%d）+ 四大手写战法",
+		log.Printf("all 回放：%d 条库规则（factor=%d pattern=%d）+ 五形态内置战法（含动量近似回放）",
 			len(fa)+len(pa), len(fa), len(pa))
 	} else if strings.EqualFold(o.Strategy, "factor") || strings.EqualFold(o.Strategy, "pattern") {
 		ra, rerr := loadRuleAdapters(o.Strategy, o.DataDir, o.IncludeDisabled)
@@ -788,34 +1091,85 @@ func (o *Options) buildAdapters(db *store.DB) ([]adapter, bool, error) {
 	return ads, useIndustry, nil
 }
 
-// BuiltinStrategies 内置形态战法枚举（有回放适配器的四个）：buildAdapters 的 all 模式与
+// BuiltinStrategies 内置形态战法枚举（**写了回放适配器**的五个）：buildAdapters 的 all 模式与
 // strategy-survey 排摸共用这一份清单——排摸覆盖面必须与生产回测同源，不许两处各写各的。
-// 注意：动量战法（momentum）在实盘白名单（server/qmt.go knownStrategyList）中存在，
-// 但 btreplay 没有它的适配器，因此不在排摸枚举内（survey 的 notes 里会显式说明）。
-// English: the one source of truth for built-in strategies that have a replay adapter.
+// 2026-09-24 起五个都真跑数字：动量此前是"适配器在位但 Trigger 恒不触发"的排摸盲区，已按实盘
+// 语义（兜底互斥 + 当日撮合 + 买入档才计交易）重写判据，残余近似由 ReplayApproxNote("momentum")
+// 随数字一起出门。
+// English: built-in strategies that HAVE a replay adapter — all five now produce numbers; momentum's
+// criteria were rewritten to live semantics on 2026-09-24 (see momentumAdapter).
 func BuiltinStrategies() []string {
-	return []string{"double_bump", "dragon", "dragon_return", "n_shape"}
+	return []string{"double_bump", "dragon", "dragon_return", "momentum", "n_shape"}
+}
+
+// DefaultDisabledBuiltins 返回"适配器已实现、但按实盘语义默认不参与回放"的内置战法 ID。
+// **当前为空**（momentum 于 2026-09-24 按实盘语义重写判据后回到默认可回放集合）。
+// 机制必须保留而不是删掉：将来再有"实盘能下单、回放框架对不上"的战法，正确处置是登记进这份
+// 清单并让 UnsurveyedLiveFormStatus 报成 "adapter_disabled_by_default"，而不是从 BuiltinStrategies
+// 里删掉——删掉＝"没有适配器"，会把"写好了但按语义停用"和"根本没写"这两种运维处置完全不同的
+// 状态压成同一个信号。
+// English: built-ins whose adapters exist but do not replay by default. Currently empty — the
+// mechanism stays so a future intraday-only strategy is reported as "implemented but disabled"
+// rather than "not implemented".
+func DefaultDisabledBuiltins() []string {
+	return nil
+}
+
+// UnsurveyedLiveFormStatus 返回"实盘白名单战法未被排摸"的原因状态（ASCII，供锚点行与产物 notes 用）：
+//   - "no_replay_adapter"                 适配器根本不存在（缺代码，要补实现）
+//   - "adapter_disabled_by_default"       适配器已实现但默认停用（缺的是可重放的实盘语义，不是代码）
+//   - ""                                  该战法默认就被排摸覆盖（不该出现在差集里）
+//
+// 两句话的区别很重要：前者要写代码，后者要么按实盘兜底语义重写判据、要么就承认量不了——
+// 混成一个计数会把"已经尽力近似"的战法读成"还没人管"。
+// English: why a live form strategy is not surveyed — missing adapter vs. implemented-but-disabled.
+func UnsurveyedLiveFormStatus(id string) string {
+	isBuiltin := false
+	for _, b := range BuiltinStrategies() {
+		if b == id {
+			isBuiltin = true
+			break
+		}
+	}
+	if !isBuiltin {
+		return "no_replay_adapter"
+	}
+	for _, b := range DefaultDisabledBuiltins() {
+		if b == id {
+			return "adapter_disabled_by_default"
+		}
+	}
+	return ""
 }
 
 // LiveFormStrategies 实盘白名单里的**形态战法全集**（内置四形态 + 动量）。
 // 与 internal/server/qmt.go 的 knownStrategyList 同源——那边是带中文显示名的 UI 视图，
 // 这里是"可交易 ID"的机器口径；两边一致性由 internal/server 的等值测试钉住
 // （server 测试引用本包，生产依赖方向不变）。
+// **两份清单各自保留**：前者是"能不能实盘下单"，后者是"有没有回放适配器"，
+// 谁先动都会由下面的差集锚点行报出来。
 // English: the canonical set of form-strategy IDs that may trade live (four builtins + momentum).
 // Kept in step with server's knownStrategyList by an equality test in internal/server.
 func LiveFormStrategies() []string {
 	return []string{"double_bump", "dragon", "dragon_return", "n_shape", "momentum"}
 }
 
-// UnsurveyedLiveForms 返回「实盘白名单里有、但 btreplay 没有回放适配器」的形态战法 ID。
-// 这些战法在排摸表里**永远不会出现**——不显式计数的话，"没查到"会被读成"没问题"，
-// 正是本轮 §ADJ 口径漂移最想要人看见的那类盲区（momentum 即此例）。
-// English: form strategies on the live whitelist that have no replay adapter — surfaced as a
-// non-zero survey anchor so "not measured" can never be read as "not a problem".
+// UnsurveyedLiveForms 返回「实盘白名单里有、但 btreplay 默认不回放因而量不到」的形态战法 ID：
+// 覆盖集 = BuiltinStrategies 扣掉 DefaultDisabledBuiltins。
+// 这些战法在排摸表里**拿不出可比的数字**——不显式计数的话，"没查到"会被读成"没问题"，
+// 正是本轮 §ADJ 口径漂移最想要人看见的那类盲区。2026-09-24 动量判据按实盘语义重写后本函数
+// 返回空集（**这不是可以删掉它的理由**）：下一个进实盘白名单却没有回放适配器的战法、或适配器
+// 又因语义对不上被停用的战法，仍必须由它显形，本函数与 survey 侧的差集锚点行不得删除。
+// English: live form strategies that btreplay does not replay by default (missing adapter OR
+// adapter disabled) — surfaced as a non-zero survey anchor so "not measured" can never be read
+// as "not a problem"; each id carries its own status via UnsurveyedLiveFormStatus.
 func UnsurveyedLiveForms() []string {
 	covered := map[string]bool{}
 	for _, id := range BuiltinStrategies() {
 		covered[id] = true
+	}
+	for _, id := range DefaultDisabledBuiltins() {
+		delete(covered, id)
 	}
 	var out []string
 	for _, id := range LiveFormStrategies() {
@@ -845,6 +1199,48 @@ func adapterID(ad adapter) string {
 		return "dragon_return"
 	case *nShapeAdapter:
 		return "n_shape"
+	case *momentumAdapter:
+		return "momentum"
+	}
+	return ""
+}
+
+// BuiltinDisplayName 返回内置战法的显示名（"动量"/"双响炮"…），取处就是适配器自己的 Name()——
+// 同一字面，不存在第二份名字清单。
+// 为什么单独导出：排摸记录行的名称不能依赖"这一轮回放跑出了交易"（区间内 0 笔的战法很多，
+// 名字若从交易行反查就会是空串，一行没有名字的记录会被读成坏数据而不是"这轮没机会"）。
+// English: display name straight from the adapter (the single source of the label), so a strategy
+// that replays zero trades still gets a correctly named row.
+func BuiltinDisplayName(id string) string {
+	ad, err := newAdapter(id, false, 0)
+	if err != nil {
+		return ""
+	}
+	return ad.Name()
+}
+
+// ReplayApproxNote 返回某内置战法回放适配器的**近似口径说明**（空串＝无近似/非内置）。
+// 用途：排摸/回测读者必须能看见"这一行是近似量出来的"——纯日K完整回放与靠日内快照的
+// 近似回放混在一张表里不加标注，读出来同名的数字其实不是一回事。
+// survey 产物侧的挂法是把本说明写进 records[].notes（cmd/research/survey.go 内置战法分支），
+// 生产回测报告侧由 printReport 直接打在战法名下。
+// English: per-strategy approximation note so a survey reader can tell a full-daily replay apart
+// from an approximated one (momentum/n_shape/dragon/dragon_return are not exact).
+func ReplayApproxNote(id string) string {
+	switch id {
+	case "momentum":
+		// 动量数字出门时必须带着这四句：判据已按实盘语义重写（兜底互斥/当日收盘撮合/买入档），
+		// 剩下量不了的只有"日K粒度看不到盘中"这一件事。读者若把这一行当成"5 分钟动量的精确回放"
+		// 就会高估它的可比性。
+		return "approx replay (criteria rewritten to live semantics 2026-09-24): fallback exclusivity honored (blocked whenever a sibling strategy signaled the same stock the same day, mirroring agent.go's `len(sigs)==0`) and entry at the SIGNAL DAY CLOSE (live matches the momentum pool the same tick), trade only at the live BUY threshold; still approximated -- 5-minute MACD replaced by daily MACD (no minute bars in the research DB), one judgement per day instead of N intraday rounds (can only miss triggers, not invent them), and the intraday round-to-round momentum-improvement gate is not reproducible (peers are probed with raw triggers, so the blocked-day set is larger than live's -> momentum entries skew LOW)"
+	case "n_shape":
+		return "approx replay: intraday snapshot approximated from daily bars; D1 injected via -d1 rule score (no LLM/event context)"
+	case "dragon":
+		return "approx replay: sector resonance (F2/F3) approximated by the stock's industry change; degraded when industry data is missing"
+	case "dragon_return":
+		return "approx replay: sector leadership (IsSectorTop2/SectorRPS20) relaxed by the -industry switch"
+	case "double_bump":
+		return "" // 纯日K完整回放，与实盘同源，无近似口径
 	}
 	return ""
 }
@@ -857,6 +1253,7 @@ func adapterID(ad adapter) string {
 type ReplayStat struct {
 	ID            string  // 稳定 ASCII ID（内置名 / fac_* / pat_*）
 	Name          string  // 显示名（中文，仅供人看）
+	Approx        string  // 近似回放说明（空＝完整回放；见 ReplayApproxNote）
 	Signals       int     // 触发信号数
 	Win           int     // 盈利笔数
 	Loss          int     // 亏损笔数
@@ -883,7 +1280,7 @@ func (o *Options) RunCollect() ([]ReplayStat, error) {
 			id = ids[i]
 		}
 		out = append(out, ReplayStat{
-			ID: id, Name: s.Name, Signals: s.Count, Win: s.Win, Loss: s.Loss,
+			ID: id, Name: s.Name, Approx: s.Approx, Signals: s.Count, Win: s.Win, Loss: s.Loss,
 			WinRate: s.WinRate, AvgWinPct: s.AvgWinPct, AvgLossPct: s.AvgLossPct,
 			ProfitFactor: s.ProfitFactor, ExpectancyPct: s.Expectancy, AvgHoldDays: s.AvgHold,
 		})
@@ -958,8 +1355,18 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 	if berr != nil {
 		return nil, nil, 0, berr
 	}
+	// 兜底档战法（动量）在场时装配跨战法互斥清单——没有兜底档时保持 nil，
+	// 其余战法的回放路径一次判断都不会多走。
+	if hasFallbackTier(ads) {
+		o.setFallbackPeers(ads)
+		// 只单独跑动量（-strategy momentum）时清单为空：兜底互斥这道门在实盘是"同标的当日
+		// 四形态均未出信号"，没有兄弟适配器可回查就等于没有这道门，量出的会是一批实盘轮不到
+		// 下单的单子。数字仍然出门（比不跑有用），但必须在日志里显式声明口径与 all 不可比。
+		if len(o.fallbackPeers) == 0 {
+			log.Printf("⚠️ 兜底档战法单独回放：本批没有非兜底档兄弟可回查，兜底互斥门未生效（-strategy all 才有）——动量入场数会偏高，与 all/排摸口径不可比")
+		}
+	}
 
-	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
 	// 行业板块数据（仅 dragon 需要）：股票→行业映射，以及每个行业按日期的涨幅
 	indMap := map[string]string{}
 	industryChg := map[string]map[string]float64{} // code -> date -> ChangePct
@@ -1044,8 +1451,12 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 			// English: zero-trigger adapters have no trade row to carry the name; backfill it.
 			sm.Name = ad.Name()
 		}
+		// 近似口径随结果一起带出：报告正文（printReport）与 survey 侧（ReplayStat.Approx）
+		// 都能看到"这一行不是精确回放"，不会只剩代码注释里才知道。
+		adID := adapterID(ad)
+		sm.Approx = ReplayApproxNote(adID)
 		summaries = append(summaries, sm)
-		ids = append(ids, adapterID(ad))
+		ids = append(ids, adID)
 	}
 	if amountFixed > 0 {
 		log.Printf("Risk-1 单位自校：%d 只股票 amount 按千元口径归一（×1000）", amountFixed)
@@ -1066,25 +1477,30 @@ func toDataKLine(bars []store.Bar) []data.KLine {
 	return out
 }
 
-// backtestStock 对单只股票回放指定战法：逐日判定触发，触发后次日开盘入场并逐日模拟平仓。
+// backtestStock 对单只股票回放指定战法：逐日判定触发，缺省在**次日开盘**入场并逐日模拟平仓；
+// 声明 SameDayEntry 的战法（实盘当日撮合的动量）在**触发当日收盘**入场（入场时点见下面的 entryIdx）。
 // o.slip 非空 = 回测增强模式：入场一字板判定升级为 封死跳过/打开加滑点，
 // 滑点按流动性/名义额逐笔定档，出场 walk 集成跌停封死不可卖与部分成交（模块 A/B）。
 // English: per-stock replay. When slip context is set, entry gating upgrades to sealed/openable
 // distinction, slippage is resolved per trade, and the exit walk honors limit-down sealing + partial fills.
 func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, industryChgByDate map[string]float64) []trade {
 	var trades []trade
-	// §RFIX-1 n_shape：MACD 序列必须逐股重算。旧实现 `macdSeries == nil` 守卫使序列
-	// 只按池内第一只股票计算一次——后续股票全部跨股污染 D4 资金确认（结果失真），
-	// 且更长序列股票的 curIdx 直接越界 panic（生产 09-18/19 实录 index out of range）。
-	// CalcMACDSeries 为 O(n) 单遍递推，逐股重算成本可忽略。
-	if na, ok := ad.(*nShapeAdapter); ok {
-		na.macdSeries = data.CalcMACDSeries(klines)
+	// §RFIX-1 有状态适配器的取数装配（见 dayScoped）：MACD 序列必须**逐股**重算。旧实现
+	// `macdSeries == nil` 守卫使序列只按池内第一只股票计算一次——后续股票全部跨股污染 D4 资金
+	// 确认（结果失真），且更长序列股票的 curIdx 直接越界 panic（生产 09-18/19 实录）。
+	// 装配从"这里手写一个 n_shape 分支"收敛到 applyStockScope/applyDayScope 两个装配点，
+	// 兜底互斥回查兄弟时共用同一套（否则兄弟拿不到自己那只股票的序列）。
+	applyStockScope(ad, klines)
+	// 兜底档战法（动量）要回查兄弟：兄弟的逐股预计算同样要装配一次，否则跨股污染兄弟的判据。
+	needPeers := isFallbackTier(ad) && len(o.fallbackPeers) > 0
+	if needPeers {
+		for _, p := range o.fallbackPeers {
+			applyStockScope(p, klines)
+		}
 	}
 	// 从第 30 根起才有足够前视窗（MA/主升段）
 	for i := 29; i < len(klines)-1; i++ {
-		if na, ok := ad.(*nShapeAdapter); ok {
-			na.curIdx = i
-		}
+		applyDayScope(ad, i)
 		// 当日触发判定：用截止当日的 K 线 + 当日相对前收的涨幅
 		prevClose := 0.0
 		if i > 0 {
@@ -1099,8 +1515,17 @@ func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, in
 		if !ok {
 			continue
 		}
-		// 次日开盘入场
-		entry := klines[i+1].Open
+		// 兜底互斥门控（实盘 agent.go 的 `len(sigs) == 0 &&`）：同标的当日只要有任何一个兄弟战法
+		// 出了信号，实盘就轮不到动量下单——**在动量自己达档的那一刻**才回查（短路顺序与实盘一致，
+		// 也让回查开销只落在候选笔数上而不是每个交易日）。
+		if needPeers && o.fallbackBlockedByPeer(klines, i, prevClose, industryChg) {
+			continue
+		}
+		// 入场时点：缺省=次日开盘；声明 SameDayEntry 的战法（实盘当日撮合）=触发当日收盘。
+		entryIdx, entry := i+1, klines[i+1].Open
+		if sd, ok2 := ad.(sameDayEntryAdapter); ok2 && sd.SameDayEntry() {
+			entryIdx, entry = i, klines[i].Close
+		}
 		if entry <= 0 {
 			continue
 		}
@@ -1109,24 +1534,48 @@ func (o *Options) backtestStock(code string, klines []data.KLine, ad adapter, in
 		buySlip, sellSlip, fill := costSlippageBps, costSlippageBps, 1.0
 		if o.slip != nil {
 			var can bool
-			buySlip, sellSlip, fill, can = o.slip.entrySlip(code, klines, i)
+			buySlip, sellSlip, fill, can = o.slip.entrySlipAt(code, klines, i, entryIdx)
 			if !can {
 				continue
 			}
-		} else if costOpenAtLimitUp(code, klines[i].Close, entry) {
+		} else if entryIdx == i+1 && costOpenAtLimitUp(code, klines[i].Close, entry) {
 			// §GAP4.2 开盘即封板不可成交：一字板/秒板买单现实中排队无望，跳过该笔
 			// （打板类战法此前默认必成交，产生系统性乐观偏差）。
+			// 当日收盘入场的战法走下面那条同义判定（收盘贴涨停＝买不到）。
+			continue
+		} else if entryIdx == i && i > 0 && costOpenAtLimitUp(code, prevClose, entry) {
 			continue
 		}
-		// 逐日平仓模拟：从入场次日（i+2）起跑 CheckExit
-		t := o.simulateExit(code, klines, i+1, entry, meta, ad, buySlip, sellSlip, fill)
+		// 逐日平仓模拟：从入场次日（entryIdx+1）起跑 CheckExit
+		t := o.simulateExit(code, klines, entryIdx, entry, meta, ad, buySlip, sellSlip, fill)
 		if t != nil {
 			trades = append(trades, *t)
 			// 入场后跳到该笔交易结束（平仓日）之后，避免同一标的在同一时段重复入场
-			i += t.HoldDays + 1
+			i = entryIdx + t.HoldDays
 		}
 	}
 	return trades
+}
+
+// isFallbackTier 该适配器是否声明"实盘兜底档"。
+func isFallbackTier(ad adapter) bool {
+	fb, ok := ad.(fallbackTierAdapter)
+	return ok && fb.FallbackTier()
+}
+
+// fallbackBlockedByPeer 兜底互斥回查：同标的当日（索引 i）是否已被任一兄弟战法出信号占掉。
+// 用兄弟的**裸 Trigger**（不带入场可成交性判定），因为实盘的 `len(sigs) == 0` 数的是信号、
+// 不是成交——兄弟那天出了信号但回放里买不进（一字板），实盘同样不会轮到动量。
+// English: the live fallback branch counts sibling *signals* (not fills), so peers are probed with
+// their raw trigger at the same day index.
+func (o *Options) fallbackBlockedByPeer(klines []data.KLine, i int, prevClose, industryChg float64) bool {
+	for _, p := range o.fallbackPeers {
+		applyDayScope(p, i)
+		if _, fired := p.Trigger(klines[:i+1], prevClose, industryChg); fired {
+			return true
+		}
+	}
+	return false
 }
 
 // simulateExit 从入场日 index 起逐日跑 CheckExit，返回平仓结果；到序列末尾仍未平仓则按末日收盘强制结算。
@@ -1212,6 +1661,9 @@ type summary struct {
 	ProfitFactor float64 // 盈亏比
 	Expectancy   float64 // 每笔交易期望收益率%（正=正期望策略）
 	AvgHold      float64 // 平均持仓天数
+	// Approx 近似回放口径说明（空=纯日K完整回放）；由 collect() 按 adapterID 查 ReplayApproxNote 填，
+	// printReport 会把它打在战法名下——近似数字必须带着"我是近似"的标签出门。
+	Approx string
 
 	// §GAP4.5 风险调整指标（此前全系统零实现）
 	Sharpe          float64 `json:"sharpe"`            // 年化夏普（逐笔净额收益）
@@ -1277,6 +1729,11 @@ func summarize(trades []trade, rf float64) *summary {
 func printReport(s *summary, name string, stockCount int) {
 	fmt.Println("==============================================")
 	fmt.Printf("战法历史回测: %s（%d 只股票）\n", name, stockCount)
+	// 近似口径先于数字出场：读报告的人（含 worker 的 result_text 消费端）第一眼就知道
+	// 下面的胜率是"日K 近似回放"量出来的，而不是精确回放。
+	if s.Approx != "" {
+		fmt.Printf("近似口径: %s\n", s.Approx)
+	}
 	fmt.Println("----------------------------------------------")
 	if s.Count == 0 {
 		fmt.Println("无触发信号。")

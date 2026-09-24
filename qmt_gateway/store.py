@@ -939,6 +939,47 @@ class Store:
             row = cur.fetchone()
             return dict(row) if row else None
 
+    def dispatch_by_signal_prefix(self, prefix, code, day):
+        """§SIGID-TRUNC 第四级归因：按 signal_id **前缀** 反查派发项（柜台只回 24 字符的
+        线上传值，精确查必落空）。
+
+        为什么前缀查不能像精确查那样"取最新一条"就完事：signal_id 是 25 字符
+        （`buy:603468:fac_1:20260922`），被柜台截到 24 后**跨日会塌成同一个前缀**
+        （`buy:603468:fac_1:2026092`，09-22 与 09-23 相同）。所以比对用 substr 而不是 LIKE
+        （signal_id 里的 `_` 在 LIKE 里是单字符通配，会把 `fac_1` 与 `fail` 混为一谈），
+        并在已知 code/day 时各加一条等值约束把候选面收窄到"同代码同交易日"。
+        即便约束都满足，仍可能多行（同一信号重试换占位单号）：只有当候选行的
+        (signal_id, side, code) 完全一致时才认最新一条——一致即归因无歧义；不一致则返回
+        `ambiguous` 标记（由调用方 log 留痕、不猜），歧义本身也说明归因链有更深的问题。
+        English: prefix lookup that repairs a counter-truncated signal reference. The candidate
+        set is narrowed by code/day when they are known, and attribution is only accepted when all
+        candidates agree on signal_id/side/code — ambiguity is reported, never guessed away.
+        """
+        if not prefix:
+            return None, "empty"
+        # 约束按需拼装：code/day 为空时**不加**该条 WHERE（而不是拿去等值比较——派发项的
+        # code/日期非空，空值等值必落空，等于把一次本可归因的成交白白推回待核对通道）。
+        # 安全性由后面的 (signal_id, side, code) 一致性检查兜住：少了日期约束时，跨日的
+        # 两个真 signal_id 必然不相等 ⇒ 直接判 ambiguous，不猜。
+        sql = ["kind = 'order'", "substr(signal_id, 1, length(?)) = ?"]
+        args = [prefix, prefix]
+        if code:
+            sql.append("code = ?")
+            args.append(str(code))
+        if day:
+            sql.append("substr(created_at, 1, 10) = ?")
+            args.append(str(day))
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM dispatch WHERE " + " AND ".join(sql) + " ORDER BY id DESC LIMIT 5",
+                tuple(args))
+            rows = [dict(r) for r in cur.fetchall()]
+        if not rows:
+            return None, "miss"
+        if len({(r.get("signal_id", ""), r.get("side", ""), r.get("code", "")) for r in rows}) > 1:
+            return None, "ambiguous"
+        return rows[0], "ok"
+
     def dispatch_by_signal_id(self, signal_id):
         """按 signal_id 反查派发项（§P0 2026-09-18 方向权威化用）。
 

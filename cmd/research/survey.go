@@ -20,8 +20,10 @@
 // 输出：stdout ASCII 表（本仓库已知坑：PowerShell→SSH→bash 回传 GBK 字节，中文输出在
 // SSH 链路下的 grep 判据全是假绿——表格文本一律 ASCII，中文显示名只进 JSON）
 //   - <out>/strategy_survey.json 机读产物
-//   - 两条 grep 锚点行：survey_unhealthy=<非 ok 条数>、survey_unsurveyable=<白名单在跑但没有回放
-//     适配器、根本没进表的方法数>（后者属"量不到"，缺省 1=momentum，必须每轮可见）。
+//   - 两条 grep 锚点行：survey_unhealthy=<非 ok 条数>、survey_unsurveyable=<白名单在跑但默认回放
+//     集合量不到的形态战法数>（当前 0：momentum 的判据已于 2026-09-24 按实盘语义重写、真进回放；
+//     此锚点行必须每轮可见——缺适配器与默认停用两种状态由 notes 逐个 ID 标出，新战法进白名单
+//     却没有适配器时它就非零）。
 //
 // 只读性：排摸对研究库只读。经核，btreplay 回放路径不写任何表
 // （backtest_event_results 断点缓存只属于 internal/backtest 候选事件链路，
@@ -120,9 +122,13 @@ type surveyArtifact struct {
 	// Unhealthy = verdict 非 ok 的条数；同步输出为 stdout 的 survey_unhealthy=<count> 锚点行。
 	Unhealthy int      `json:"unhealthy"`
 	Notes     []string `json:"notes"`
-	// Unsurveyable = 实盘白名单在跑、但 btreplay 无回放适配器因而**根本没进排摸**的形态战法数
-	// （momentum 即此类）。必须单独计数并打锚点行：排摸表里"没有这一行"和"这一行没问题"
-	// 在只看表的运维眼里长得一样，而前者是盲区。UnsurveyableIDs 落进产物便于核对。
+	// Unsurveyable = 实盘白名单在跑、但**默认回放集合量不到它**的形态战法数：要么根本没写适配器
+	// （没适配器就没数据，进不了表），要么适配器已实现但默认停用（表里有行，可那一行恒 0 笔，
+	// 读成"0 触发=战法没问题"就是盲区）。两种状态由 UnsurveyedLiveFormStatus 分开报出。
+	// 必须单独计数并打锚点行：排摸表里"没有这一行"和"这一行没问题"在只看表的运维眼里长得一样。
+	// 2026-09-24 §MOMENTUM-LIVE-REPLAY 起当前值为 0（动量判据已按实盘语义重写、真进回放）；
+	// 计数归零 ≠ 机制退役——它是下一个"能下单却量不到"的战法唯一的显形通道。
+	// UnsurveyableIDs 落进产物便于核对。
 	Unsurveyable    int      `json:"unsurveyable"`
 	UnsurveyableIDs []string `json:"unsurveyable_ids,omitempty"`
 }
@@ -281,15 +287,28 @@ func cmdStrategySurvey(db *store.DB, dbPath string, args []string) {
 	records := make([]surveyRecord, 0, len(btreplay.BuiltinStrategies())+len(facEntries)+len(patEntries))
 	for _, id := range btreplay.BuiltinStrategies() {
 		st := statByID[id]
+		// 名称从**战法名来源**取（适配器自己的 Name()），不依赖回放量出了什么：区间内一笔都没有的
+		// 战法名字若从交易行反查就会是空串，那行会被读成坏数据而不是"这轮没机会"。
+		name := btreplay.BuiltinDisplayName(id)
+		if name == "" {
+			name = st.Name // 兜底：适配器构造失败时仍用回放带回的名字，不交空串
+		}
 		// 内置战法参数=出厂配置（回放适配器 NewManager("") 取默认），无落库口径可言：
 		// stale 判恒 false；历史期望无记录（prior=0），flipped_sign 不适用。
-		records = append(records, surveyRecord{
-			ID: id, Kind: "builtin", Name: st.Name, Enabled: true,
+		rec := surveyRecord{
+			ID: id, Kind: "builtin", Name: name, Enabled: !isDisabledBuiltin(id),
 			StaleBasis: false,
 			Replay:     replayFromStat(st, 0),
 			Verdict:    verdict(st.Signals, st.ExpectancyPct, 0, false, true),
 			Notes:      "builtin replay uses factory-default config (config.NewManager(\"\")), not config.json overrides",
-		})
+		}
+		// 近似/停用口径必须跟着这一行进产物：排摸表把"纯日K完整回放"、"靠日内/分钟数据近似"
+		// 和"适配器在位但默认不放行（恒 0 笔）"三类混在同一列里，不加标注则同名数字根本不是一个
+		// 东西。说明文本由 btreplay.ReplayApproxNote 单点维护，这里只做搬运，不在命令侧重写口径。
+		if st.Approx != "" {
+			rec.Notes = joinNote(rec.Notes, st.Approx)
+		}
+		records = append(records, rec)
 	}
 	for _, e := range facEntries {
 		st := statByID[e.ID]
@@ -349,13 +368,15 @@ func cmdStrategySurvey(db *store.DB, dbPath string, args []string) {
 	art.Thresholds.MinSpreadPP = *minSpread
 	art.Records = records
 	sanitizeArtifact(art)
-	// 盲区显式化：白名单在跑却没有回放适配器的形态战法不进 records（momentum）。
-	// 只写成一句 note 的话，锚点行 grep 不到它——"没排摸"必须是一个非零计数，才能被巡检脚本接住。
+	// 盲区显式化：白名单在跑但默认回放集合量不到的形态战法（无适配器的连 records 行都没有；
+	// 有适配器但默认停用的有行、恒 0 笔）。只写成一句 note 的话锚点行 grep 不到它——"没量到"必须
+	// 是一个非零计数才能被巡检脚本接住。当前差集为空（动量判据已于 2026-09-24 按实盘语义重写，
+	// 见 btreplay.momentumAdapter 注释），但空值的来源必须是"没有盲区"而不是"这条链没接上"：
+	// 此段与锚点行**不能删**，它是下一个"能下单却量不到"的战法唯一的显形通道。
 	art.UnsurveyableIDs = btreplay.UnsurveyedLiveForms()
 	art.Unsurveyable = len(art.UnsurveyableIDs)
 	art.Notes = []string{
-		fmt.Sprintf("%d live-whitelist form strategy id(s) have no btreplay replay adapter and are NOT surveyed: %s",
-			art.Unsurveyable, strings.Join(art.UnsurveyableIDs, ",")),
+		unsurveyedNote(art.Unsurveyable, art.UnsurveyableIDs),
 		"sharpe/annual/calmar intentionally omitted: meaningless under sampled per-trade replay basis",
 		"replay path verified read-only: btreplay writes no tables (backtest_event_results belongs to the internal/backtest candidate chain, unused here)",
 	}
@@ -388,9 +409,46 @@ func cmdStrategySurvey(db *store.DB, dbPath string, args []string) {
 	}
 	fmt.Printf("survey_artifact=%s\n", out)
 	// 运维锚点行：探针/巡检脚本 grep 这两行即可判断本轮排摸是否需要人工介入。
-	// unsurveyable>0 不是失败（那是"量不到"），但必须让人每轮都看见它——缺省值为 1（momentum）。
+	// unsurveyable>0 不是失败（那是"量不到"），但必须让人每轮都看见它；2026-09-24 起当前值为 0
+	// （动量判据按实盘语义重写后真进了回放集合，历史值 1 = momentum 默认停用）。
+	// **差集真为空时 0 也照样打这一行**——脚本按 survey_unsurveyable=
+	// 前缀取值，行消失与值为 0 是两回事：前者会被读成"这条链没接"，后者才是"确实没有盲区"。
 	fmt.Printf("survey_unhealthy=%d\n", art.Unhealthy)
 	fmt.Printf("survey_unsurveyable=%d\n", art.Unsurveyable)
+}
+
+// unsurveyedNote 盲区锚点的产物说明文本（两种取值都必须自解释，见调用点注释）。
+// 差集非空：逐个列 ID **并带状态**——"没写适配器"要人补代码，"适配器写好但默认停用"要人裁决
+// 判据怎么按实盘语义重写，两种处置完全不同，压成一个数字就会派错工。
+// 差集为空：明确写出"覆盖面已与白名单对齐、锚点保留"，避免读成"这行统计的是个没接上的空字段"。
+// English: the survey note for the live-whitelist-minus-replayed set; each id carries its status
+// (missing adapter vs. implemented-but-disabled), and the empty case must still read unambiguously.
+func unsurveyedNote(count int, ids []string) string {
+	if count == 0 {
+		return "0 live-whitelist form strategy ids are outside the default replay set: survey coverage == live form whitelist " +
+			"(anchor kept on purpose — a non-zero value here means a new whitelist entry that btreplay does not measure)"
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		status := btreplay.UnsurveyedLiveFormStatus(id)
+		if status == "" {
+			status = "unknown_status" // 差集与状态表脱钩：如实报 unknown，不猜一个原因糊过去
+		}
+		parts = append(parts, id+"="+status)
+	}
+	return fmt.Sprintf("%d live-whitelist form strategy id(s) are NOT measured by the default replay set: %s",
+		count, strings.Join(parts, ","))
+}
+
+// isDisabledBuiltin 该内置战法是否属"适配器已实现但默认停用"名单（btreplay 单点维护，这里只查表）。
+// 用途只有一个：记录行的 enabled 字段如实反映"这轮有没有真跑"，不让运维把"写好但停用"读成"已启用"。
+func isDisabledBuiltin(id string) bool {
+	for _, d := range btreplay.DefaultDisabledBuiltins() {
+		if d == id {
+			return true
+		}
+	}
+	return false
 }
 
 // replayFromStat 把回放统计装进 JSON 记录；priorPct=条目落库时的历史期望（%），无记录传 0。

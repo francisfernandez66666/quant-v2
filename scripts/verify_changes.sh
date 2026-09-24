@@ -17,6 +17,14 @@
 #     + 二波（2026-09-22 当日续）：§M1 golden 源契约单源（见 38）+ §M2/§M3 降级报成功族（见 39）+ §M6/§TZ/§REJECT 数据管道 py 批（见 40）+ §M8 推送三通道内聚/EXPVAR 收权（见 41）+ §M9/§M10/M11 快照与落盘批（见 42）+ §M7 部署清单收编（见 43）+ §M12/§M13 前端与移动壳一致性 + researchd 冒烟（见 44）
 #     + C批（2026-09-22 晚间，owner 裁决清单四件套）：§XCHECK 价格复核闸接线/CrossCheckPrice 收编（见 45）+ §NATIVEAUTH 登录 token 迁原生加密存储（见 46）+ §ROOTQMT 根级死键防回潮 + §APPVER APK 服务端驱动强制更新（见 47））
 #     + 夜间批（2026-09-23，owner 裁决"报警不是修复，兜住才是"四件套）：§KLINE-CHAIN-3 日K三级兜底链+库内腿四道守卫（见 82）+ §SIDE-AUTH-2 方向权威补漏/待核对通道/方向必填（见 83）+ §FILL-AMEND 追加式人工勘误+fills_effective 单点收敛+只读守恒自检+前端逐笔入口（见 84）+ §FILL-AMEND 只读取证脚本纪律（见 85）
+#     + 09-24 批（owner 裁决 1「成交回报 signal_id 被截到 24 字符，要修；先定回填还是读取端兼容」）：
+#       §SIGID-TRUNC 写路径单一截断点 wire_ref + 网关第四级前缀归因（歧义不猜、还原留痕）+
+#       Go 读取端两边兼容（双向前缀 + 反向腿交易日闸，**不回填历史行**——编号是事实主键，
+#       判重索引与勘误台账挂在它上面，改长度即新旧行分裂）（见 86）
+#     + 09-24 批（owner 裁决 2「momentum 战法缺回放适配器」三选一 → 按实盘语义重写判据）：
+#       §MOMENTUM-LIVE-REPLAY 兜底互斥（同标的当日兄弟出过信号即不让动量入场，回查用兄弟裸判据）+
+#       当日撮合（入场=触发当日收盘，缺省战法仍次日开盘）+ 只计实盘买入档（观察档不算交易信号）；
+#       分钟 MACD/盘中多轮/跨轮提升门三条数据不支持，只在注释与出门文本里标为残余近似（见 87）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -2322,6 +2330,144 @@ grep -q '缺项:${miss_list}' scripts/forensic_fill.sh \
 if grep -nE '\.executescript\(|\.commit\(' scripts/forensic_fill.sh | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
 	echo "--- FAIL: Python 兜底腿出现 executescript/commit（只读三闸之外的写口）"; exit 1; fi
 echo "ok - §FILL-AMEND 取证脚本守卫通过（锚点锁 1 + 只读机制锁 4 + 接线锁 3 + 判语锁 6 + 工具闸锁 1 + 兜底腿锁 9 + 副本状态锁 2 + 写库/凭据/写口负锁 3）"
+
+echo "==> 86 §SIGID-TRUNC 成交回报 signal_id 被柜台截到 24 字符：写路径单一截断点 + 读路径第四级归因 + Go 两边兼容（2026-09-24，owner 裁决 1）..."
+# 现象（现网实录，2026-09-24 用 scripts/forensic_fill.sh 2026-09-22 603468.SH 取证锤实）：
+#   fills 两行 signal_id = `buy:603468:fac_1:2026092`（24 字符，末位"2"没了），
+#   同票 orders/dispatch 行 = `buy:603468:fac_1:20260922`（25 字符完整）。
+#   引擎编号 = `buy:<码>:<因子>:<TradingDayDate()` 紧凑 8 位日>`，恰好踩在柜台 userOrderId 槽的
+#   24 字符上限上 ⇒ **凡带日期买入编号的成交，落库即残缺**。
+# 三处静默失效（一条残缺编号同时打断三条链，全都不报错）：
+#   ① 网关三级派发行回查（seq→交易所委托号→signal_id 精确）恒落空 → 方向权威 §SIDE-AUTH-2 判
+#      "未证"，现网每一笔真成交都掉进 side_unverified/待核对（09-22"卖出记成买入"事故的源头解释）；
+#   ② 桥 embed_resolve / resolve_order_id 用 `remark == signal_id` 等值比对归属委托，柜台回的
+#      是截断值 → 比对恒假，静默降级成"价格+数量指纹猜"；
+#   ③ Go 侧 SumFilledQty 与 ResetFailedRealOrder 的"已撤+零成交可重放"按单向前缀 LIKE 配对，
+#      残缺行永不命中 → 部成量算 0（补卖叠加发单、卖出敞口超额）、已部成的撤单被判零成交
+#      （同键**再发一次真单**＝凭空敞口）。
+# 修法取舍（owner 给的约束就是决策依据）：编号是**已写进资金账本的事实主键**，fills 判重索引与
+#   §FILL-AMEND 勘误台账都挂在它上面 → 回填历史（改长度）会让新旧行分裂、可能同一笔双倍记账。
+#   因此：**历史行走读取端两边兼容（不回填、不动 fills 一列）**，**新行在写路径收口**（桥以
+#   wire_ref 为唯一截断点、网关以第四级前缀唯一归因还原成完整编号后入账）。
+python3 -m pytest qmt_gateway/tests/test_sigid_trunc.py -q 2>&1 | tail -3
+go test -count=1 ./internal/store/ -run 'TestSumFilledQtyMatchesCounterTruncatedID|TestSumFilledQtyReverseLegNeedsSameDay|TestSumFilledQtyEmptySignalIDIsZero|TestResetCancelledWithTruncatedFillNotReplayable' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# ① 截断只准有一处：一个常量 + 一个函数（三处截断点各写一份 = 上限变更时必然漏改一处）。
+grep -q 'WIRE_REF_MAX = 24' qmt_gateway/qmt_bridge_strategy.py \
+	|| { echo "--- FAIL: 线上截断上限常量丢失（24 这个事实又散回字面量）"; exit 1; }
+wt=$(grep -c 'return str(signal_id or "")\[:WIRE_REF_MAX\]' qmt_gateway/qmt_bridge_strategy.py)
+[ "$wt" = "1" ] || { echo "--- FAIL: 截断函数体不是唯一一处（计数=${wt}，出现两处就有第二份口径）"; exit 1; }
+# ② 三个调用点全部过 wire_ref（下单侧截断、归属比对侧同样截断，两侧口径同源）。
+grep -q 'signal_id = wire_ref(req.get("signal_id", ""))' qmt_gateway/qmt_bridge_strategy.py \
+	|| { echo "--- FAIL: embed_place 不再用 wire_ref 生成线上传值（下单侧与回查侧口径分叉）"; exit 1; }
+grep -q 'if sig and remark == wire_ref(sig):' qmt_gateway/qmt_bridge_strategy.py \
+	|| { echo "--- FAIL: embed_resolve 的 remark 比对退回原值（截断值 vs 完整值恒假，静默降级指纹猜）"; exit 1; }
+grep -q 'if remark == wire_ref(signal_id):' qmt_gateway/qmt_bridge_strategy.py \
+	|| { echo "--- FAIL: resolve_order_id 的 remark 比对退回原值（同上一条静默失效）"; exit 1; }
+# 负锁：字面 `[:24]` 与裸等值比对都不得在文件里复活（旧写法本身即本批修的三处失效之一）。
+if grep -nE '\[:24\]' qmt_gateway/qmt_bridge_strategy.py | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: 桥里又出现字面 [:24] 截断（绕过 WIRE_REF_MAX 单一截断点）"; exit 1; fi
+if grep -nE 'remark == signal_id' qmt_gateway/qmt_bridge_strategy.py | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo "--- FAIL: 又拿截断前的 signal_id 与柜台 remark 直接等值比对（恒假归属）"; exit 1; fi
+# ③ 第四级归因（store）：必须 substr 逐字前缀而不是 LIKE（编号里有 `_`，LIKE 当通配符 ⇒ 误配），
+#    且候选不一致时返回 ambiguous 而不是"取最新一条"。
+grep -q "sql = \[\"kind = 'order'\", \"substr(signal_id, 1, length(?)) = ?\"\]" qmt_gateway/store.py \
+	|| { echo "--- FAIL: 前缀反查不再用 substr 逐字比对（LIKE 会把 signal_id 里的下划线当通配符）"; exit 1; }
+grep -q 'return None, "ambiguous"' qmt_gateway/store.py \
+	|| { echo "--- FAIL: 前缀候选不一致时不再报歧义（跨日塌成同前缀时取最新=张冠李戴）"; exit 1; }
+# ④ 网关第四级回落：只在前三级落空时才用（不得抢在精确查前面），歧义"不猜"，还原要留痕。
+grep -q '_sig_wire = "" if drow else str(req.get("signal_id", "") or "")' qmt_gateway/gateway.py \
+	|| { echo "--- FAIL: 第四级前缀归因不再让位于精确查（弱归因覆盖强归因）"; exit 1; }
+grep -q 'if _drow is None and _why == "ambiguous":' qmt_gateway/gateway.py \
+	|| { echo "--- FAIL: 歧义分支丢失（歧义时会被当成"查不到"静默继续，或反之当成命中乱改编号）"; exit 1; }
+grep -qF 'req["signal_id"] = _full or _sig_wire' qmt_gateway/gateway.py \
+	|| { echo "--- FAIL: 命中后不再把编号还原成派发项完整值（账本继续落残缺编号，判重键分裂）"; exit 1; }
+# ⑤ Go 读取端两边兼容：谓词单一事实源 + 两处钱查询共用 + 反向腿带交易日闸 + 空编号判 0。
+grep -q "instr(%s, replace(substr(%s,1,10),'-','')) > 0" internal/store/real_positions.go \
+	|| { echo "--- FAIL: 反向腿的交易日闸丢失（跨两日塌成同前缀时会把别日的成交算进这笔）"; exit 1; }
+gm=$(grep -c 'func fillSignalMatchSQL' internal/store/real_positions.go)
+[ "$gm" = "1" ] || { echo "--- FAIL: 配对谓词构造函数不是唯一一处（计数=${gm}）"; exit 1; }
+gu=$(grep -c 'fillSignalMatchSQL(' internal/store/real_positions.go)
+# 1 处定义 + 2 处调用（SumFilledQty / ResetFailedRealOrder）：少一处调用就等于两条资金查询又各写一份 SQL。
+[ "$gu" = "3" ] || { echo "--- FAIL: 配对谓词调用点 ≠ 2（计数=$gu 含定义行；两处钱查询必须同源）"; exit 1; }
+grep -q 'eligibleWhere := `signal_id=? AND user_id=? AND (status=' internal/store/real_positions.go \
+	|| { echo "--- FAIL: "已撤+零成交可重放"的谓词不再现算配对 SQL（退回编译期常量即漏掉反向腿）"; exit 1; }
+if grep -qE 'const eligibleWhere' internal/store/real_positions.go; then
+	echo "--- FAIL: eligibleWhere 又变回 const（常量拼不进运行期双向谓词）"; exit 1; fi
+grep -q 'if strings.TrimSpace(signalID) == "" {' internal/store/real_positions.go \
+	|| { echo "--- FAIL: 空编号不再直接判 0（前缀口径下 LIKE '%%' 会把全账成交算成这一笔）"; exit 1; }
+# 负锁：读取端兼容**不得**演变成写历史行（回填即 owner 明令禁止的双倍记账风险）。
+if grep -nE 'UPDATE fills[[:space:]]+SET[[:space:]]+signal_id' internal/store/*.go | grep -vE ':[[:space:]]*//' | grep -q .; then
+	echo "--- FAIL: 出现回填 fills.signal_id 的写语句（本批裁决=不回填，只读端兼容）"; exit 1; fi
+echo "ok - §SIGID-TRUNC 守卫通过（行为锁 2 套件 + 单一截断点锁 3 + 调用点锁 3 + 歧义锁 2 + 回落锁 3 + Go 兼容锁 6 + 字面量/回填负锁 3）"
+
+echo "==> 87 §MOMENTUM-LIVE-REPLAY 动量判据按实盘语义重写（兜底互斥 + 当日撮合 + 只计买入档）（2026-09-24，owner 三选一拍板「按实盘语义重写判据」）..."
+# 现象（就是 §SURVEY-COVERAGE 立盲区锚点时点名的那一个）：动量在实盘白名单里能下单，但 btreplay 的
+#   momentumAdapter.Trigger 是个恒不触发的停用桩——回放框架的三条前提（收盘判一次 / 次日开盘入场 /
+#   各战法独立跑）与实盘的三条（盘中触发那一刻进池 / 当日撮合 / 「前四战法均未出信号才兜底」）
+#   逐条对不上，硬放行量出来的不是"实盘由动量下单的那批票"的表现。
+# 为什么不能直接改数字：把 Trigger 改活、按次日开盘入场，会得到一批实盘根本轮不到下单的单子，
+#   排摸表和扫参冠军参数同时被污染（owner 因此否掉"放行近似"和"承认量不了"两条路）。
+# 本批落地的三条（可精确重放，不掺近似）：
+#   ① 兜底互斥 FallbackTier()：同标的当日任一兄弟战法出过信号即丢弃这条动量信号；回查用兄弟的
+#      **裸判据** Trigger——实盘 agent.go:1208 数的是 sigs 条数（信号），不是成交量；
+#   ② 当日撮合 SameDayEntry()：entryIdx=i、入场价=触发当日收盘（缺省战法仍 entryIdx=i+1 次日开盘）；
+#   ③ 只计买入档：Trigger 只在 score ≥ 买入档（出厂 75）时为真，落在观察档 60 只观察不算交易信号。
+# 数据不支持、只能标注不能伪造的三条残余近似（研究库无分钟 K 落库）：5 分钟 MACD 用日线 MACD 替代、
+#   盘中 N 轮判成每日 1 轮（只会漏触发，不会凭空多触发）、跨轮"动量提升"门不可重建。偏差方向写进
+#   momentumAdapter 注释与 ReplayApproxNote("momentum") 出门文本：兄弟用裸判据 ⇒ 占用日偏多
+#   ⇒ 动量入场数偏少，是保守方向的偏差。
+# 顺带收口：散在两处的手写类型分支改为 dayScoped 可选接口（prepareStock/setDay），§RFIX-1"MACD 序列
+#   必须逐股重算 + 游标推进"的教训从此由装配点统一保证，不再依赖每处记得写。
+go test -count=1 ./internal/btreplay/ -run 'TestMomentumLiveSemanticsInReplay|TestMomentumFallbackExclusivityInSweepPrecompute|TestMomentumScoreDayBuyThresholdOnly|TestMomentumDeclaresLiveCapabilities|TestMomentumRegisteredAndSurveyable|TestSetFallbackPeersKeepsOnlySiblings|TestEntrySlipAtNextDayEqualsEntrySlip|TestEntrySlipAtSameDayCloseEntry' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./cmd/research/ -run 'TestStrategySurveyArtifact' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+go test -count=1 ./internal/server/ -run 'TestLiveWhitelistFormsMatchSurveyCoverage' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)'
+# ① 两条实盘能力必须由动量自己声明：不声明＝门控根本不启动，动量会被当成与四形态并列的独立战法跑。
+grep -q 'func (a \*momentumAdapter) FallbackTier() bool { return true }' internal/btreplay/replay.go \
+	|| { echo "--- FAIL: 动量不再声明 FallbackTier（兜底互斥失效，会抢走兄弟战法的名额）"; exit 1; }
+grep -q 'func (a \*momentumAdapter) SameDayEntry() bool { return true }' internal/btreplay/replay.go \
+	|| { echo "--- FAIL: 动量不再声明 SameDayEntry（退回次日开盘入场，实盘当日撮合失真）"; exit 1; }
+# ② Trigger 必须真接打分判据（此前它是停用桩）；判据本体 scoreDay 不许被绕过或另起一份。
+grep -q 'return a.scoreDay(klines, prevClose)' internal/btreplay/replay.go \
+	|| { echo "--- FAIL: momentumAdapter.Trigger 不再走 scoreDay（恒不触发的停用桩复活）"; exit 1; }
+# ③ 兜底互斥与当日撮合必须**两处同门**：回放主循环与扫参预计算漏任一处，网格就会给一条实盘轮不到
+#    下单的路径寻优，选出的"冠军参数"对应的是一批实盘不存在的单子。
+pbc=$(grep -c 'o.fallbackBlockedByPeer(' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}')
+[ "$pbc" = "2" ] || { echo "--- FAIL: 兜底互斥回查调用点 ≠ 2（回放/扫参各一处，计数=${pbc}）"; exit 1; }
+sdc=$(grep -c 'ad.(sameDayEntryAdapter)' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}')
+[ "$sdc" = "2" ] || { echo "--- FAIL: 当日撮合分支不是两处都有（两条路径入场口径分叉，计数=${sdc}）"; exit 1; }
+esc=$(grep -c ', i, entryIdx)' internal/btreplay/replay.go internal/btreplay/sweep.go | awk -F: '{s+=$2} END{print s}')
+[ "$esc" = "2" ] || { echo "--- FAIL: 入场定档没有按 entryIdx 传（滑点/可成交性仍按信号日+1 算，计数=${esc}）"; exit 1; }
+# ③b 单独跑动量时没有兄弟可回查＝这道门整体不存在，数字必须自带口径警告（否则两张同名表差几倍
+#     没人知道警告在哪一步丢了）。
+grep -q '兜底档战法单独回放' internal/btreplay/replay.go \
+	|| { echo "--- FAIL: 无兄弟清单时的口径警告丢失（动量单独回放会静默偏高）"; exit 1; }
+# ④ 入场定档必须按**入场日**取流动性滑窗与可成交性；同时 entrySlip 仍是"次日开盘"薄壳——
+#    四形态战法的既有回测数字必须逐字节不变（重写只动动量，不许顺手搬家历史数字）。
+grep -q 'avg := avgAmountWan(kls, entryIdx-1)' internal/btreplay/cost.go \
+	|| { echo "--- FAIL: 流动性滑窗不再按入场日取（当日撮合的票会看错一天的成交额）"; exit 1; }
+grep -q 'return sc.entrySlipAt(code, kls, i, i+1)' internal/btreplay/cost.go \
+	|| { echo "--- FAIL: entrySlip 不再是次日入场薄壳（历史回测数字会被这次重写带跑）"; exit 1; }
+# ⑤ 出场引擎第 3 参数语义已由"信号日"改成"入场日"：旧签名委托须补 +1、扫参模拟须传 entryIdx，
+#    漏一侧就是所有回放的持仓期整体错一天（胜率/平均盈亏全变而无人察觉）。
+grep -q 'uniformExitV2Full(kls, "", sigIdx+1,' internal/btreplay/sweep.go \
+	|| { echo "--- FAIL: 旧签名委托不再补 +1（信号日被当成入场日＝持仓期整体前移一天）"; exit 1; }
+grep -q 'uniformExitV2Full(klines\[t.code\], t.code, t.entryIdx,' internal/btreplay/sweep.go \
+	|| { echo "--- FAIL: 扫参模拟没按 entryIdx 出场（当日撮合的动量仍按次日开盘结算）"; exit 1; }
+# ⑥ 盲区机制必须原样保留：动量这一格归零 ≠ 这条链可以拆。下一个进白名单却没有适配器（或适配器
+#    又因语义对不上须停用）的战法，仍只能靠它显形。
+grep -q '"adapter_disabled_by_default"' internal/btreplay/replay.go \
+	|| { echo "--- FAIL: 未排摸状态分类被摘掉（缺代码与缺语义两种处置重新压成一个信号）"; exit 1; }
+grep -q 'survey_unsurveyable=' cmd/research/survey.go \
+	|| { echo "--- FAIL: 排摸盲区锚点行被删（「没量到」重新长得和「没问题」一样）"; exit 1; }
+awk '/^func DefaultDisabledBuiltins/,/^}/' internal/btreplay/replay.go | grep -q 'return nil' \
+	|| { echo "--- FAIL: DefaultDisabledBuiltins 不再返回空集（动量被重新停用＝盲区回来了）"; exit 1; }
+# 负锁：旧的"默认不回放"出门文本不得复活——这一行现在是真量过的数字，留着旧文本会被运维读回
+#   "没量"，与 §SURVEY-COVERAGE 要防的静默降级同形（只是方向反过来）。
+if grep -q 'not replayed by default' internal/btreplay/replay.go; then
+	echo '--- FAIL: 动量近似说明里又出现「not replayed by default」（与已接入回放的事实矛盾）'; exit 1; fi
+grep -q 'criteria rewritten to live semantics' internal/btreplay/replay.go \
+	|| { echo "--- FAIL: 动量近似说明不再声明「判据已按实盘语义重写」（数字失去口径出处）"; exit 1; }
+echo "ok - §MOMENTUM-LIVE-REPLAY 守卫通过（行为锁 3 套件 + 能力声明锁 2 + 判据锁 1 + 两处同门锁 3 + 口径警告锁 1 + 入场定档锁 2 + 引擎参数锁 2 + 机制保留锁 3 + 旧文本负锁 1）"
 
 echo ""
 echo "==> 全部通过"
