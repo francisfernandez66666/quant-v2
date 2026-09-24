@@ -25,6 +25,10 @@
 #       §MOMENTUM-LIVE-REPLAY 兜底互斥（同标的当日兄弟出过信号即不让动量入场，回查用兄弟裸判据）+
 #       当日撮合（入场=触发当日收盘，缺省战法仍次日开盘）+ 只计实盘买入档（观察档不算交易信号）；
 #       分钟 MACD/盘中多轮/跨轮提升门三条数据不支持，只在注释与出门文本里标为残余近似（见 87）
+#     + 09-24 批（「白天只龙头出信号」是 owner 肉眼看出来的、24 条探针一条都没红 ⇒ 观测面隐形）：
+#       §SIGNAL-DIST 部署面加第 22 探针（当日固化信号按战法分布 + leader_only 读数）+ INFO 观测通道
+#       （绿也回显读数、不进 PASS/FAIL 判数）；判红只认解析失败/缺 signals 数组，no-file、跨日桶、
+#       当日零信号一律合法态（见 88）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -2468,6 +2472,60 @@ if grep -q 'not replayed by default' internal/btreplay/replay.go; then
 grep -q 'criteria rewritten to live semantics' internal/btreplay/replay.go \
 	|| { echo "--- FAIL: 动量近似说明不再声明「判据已按实盘语义重写」（数字失去口径出处）"; exit 1; }
 echo "ok - §MOMENTUM-LIVE-REPLAY 守卫通过（行为锁 3 套件 + 能力声明锁 2 + 判据锁 1 + 两处同门锁 3 + 口径警告锁 1 + 入场定档锁 2 + 引擎参数锁 2 + 机制保留锁 3 + 旧文本负锁 1）"
+
+echo "==> 88 §SIGNAL-DIST 部署面信号分布探针：判红只认解析/形状错 + 当日聚合四读数 + INFO 不进判数（2026-09-24）..."
+# 为什么要给一条**部署面**探针单独设锁：09-23「白天只龙头出信号」是 owner 用肉眼在前端看出来的，
+# 现网 24 条探针一条都没红——缺陷在观测面上是隐形的，修没修好同样没人知道。这条探针就是那双眼睛；
+# 而"眼睛"本身没有守卫，就会在下一次改动里被悄悄换成一只只看不到东西的眼睛（判据被挪去判合法态、
+# 明细被合并回全桶、INFO 混进 PASS/FAIL 计数），且**不会有任何测试变红**。故按取值链逐条钉住。
+VD=scripts/verify_deploy_guangzhou.sh
+# ① 探针本体与判据同源：红 == 「读不出可信内容」，不是「今天没信号」。
+grep -qF 'Probe "engine:today pinned signals spread across strategies" ($sgBad.Count -eq 0)' "$VD" \
+	|| { echo "--- FAIL: §SIGNAL-DIST 探针丢失或判据被换掉（红一旦不等价于「解析/形状失败」，这条眼睛就废了）"; exit 1; }
+# ② 判红来源必须恰好两处（parse-error / shape-error）。多一处＝有人把合法态判成红，这条会每天清晨自找一红。
+sgb=$(grep -c 'sgBad += (' "$VD")
+[ "$sgb" = "2" ] || { echo "--- FAIL: §SIGNAL-DIST 判红来源不是 2 处（计数=${sgb}，只允许 parse-error 与 shape-error）"; exit 1; }
+if grep -nE 'sgBad \+= \(' "$VD" | grep -vE ':[0-9]+:[[:space:]]*#' | grep -vE 'parse-error|shape-error' | grep -q .; then
+	echo '--- FAIL: §SIGNAL-DIST 出现第三种判红来源（no-file／跨日残留桶／当日零信号都是合法态，一律不得进 sgBad）'; exit 1; fi
+# ③ 三种合法态必须各自留下明细（删掉读数＝把"看不到"重新变成隐形）。
+grep -qF 'day=none n=0 empty' "$VD" \
+	|| { echo "--- FAIL: 空 signals 数组的合法态明细丢失（绿但读不出内容＝跟没修一样）"; exit 1; }
+grep -qF 'shape-error(no-signals-array' "$VD" \
+	|| { echo "--- FAIL: 结构缺 signals 数组的判红分支丢失"; exit 1; }
+# ④ 当日聚合四读数：owner 问的"今天有几类战法出了信号"只能由这四个回答，缺一个就退回肉眼盯。
+for k in today_signals today_strategies leader_only today_files; do
+	grep -q "$k=" "$VD" || { echo "--- FAIL: §SIGNAL-DIST 缺聚合读数 ${k}（明细必须直接回答「今天」，不是「所有桶加起来」）"; exit 1; }
+done
+# ⑤ 只龙头判据三条件缺一不可：当日有信号 + 战法种类==1 + 那一类确实是 dragon
+#    （少第一条会在零信号日谎报 leader_only=true，少第三条会把"只出 fac_1"当成只出龙头）。
+grep -qE '\$sgTodayN -gt 0 -and \$sgTypes\.Count -eq 1 -and \$sgTypes\[0\] -eq .dragon.' "$VD" \
+	|| { echo '--- FAIL: leader_only 判据被改写（须同时满足 当日 n>0 / 种类==1 / 该类==dragon）'; exit 1; }
+# ⑥ 按文件分行而不是合并计数：DataDir 下 Recurse 会收到根目录 + 每账号各一份（09-24 首跑实测 4 份），
+#    合并＝把昨日残留和别人的账号混进同一个数字。取数路径出现第二处即口径分叉。
+sgf=$(grep -c "Filter 'signals_today.json'" "$VD")
+[ "$sgf" = "1" ] || { echo "--- FAIL: 固化信号取数路径不是唯一一处（计数=${sgf}，出现第二处就有第二套口径）"; exit 1; }
+# ⑦ 战法桶名必须 ASCII：本仓实录过 PS→SSH→bash 回传时中文 detail 被 GBK 字节打乱 ⇒ grep 判据恒不命中
+#    （＝把假绿写进探针）。中文只允许出现在 -match 的匹配侧，不允许出现在 return 的取值侧。
+#    `|| true` 不能省：grep -c 在**零命中**（正是本锁要 passes 的那个值）时退出码为 1，本脚本开着
+#    `set -euo pipefail`，命令替换的非 0 会让整条赋值语句失败 ⇒ 整轮 verify 无 FAIL 无 ok 直接中止
+#    （09-24 实跑锤出：§88 只打印了标题就 VERIFY_EXIT=1，后面所有段都没跑）。判红仍交给下面那句等值判断。
+badKey=$(LC_ALL=C awk '/^function SgKey/,/^}$/' "$VD" | grep -o 'return "[^"]*"' | LC_ALL=C grep -c '[^ -~]' || true)
+[ "$badKey" = "0" ] || { echo "--- FAIL: SgKey 的 return 值含非 ASCII 桶名（计数=${badKey}，中文桶名会让判据恒不命中）"; exit 1; }
+ordR=$(grep -n 'return "dragon_return"' "$VD" | head -1 | cut -d: -f1 || true)
+ordD=$(grep -n 'return "dragon" }' "$VD" | head -1 | cut -d: -f1 || true)
+{ [ -n "$ordR" ] && [ -n "$ordD" ] && [ "$ordR" -lt "$ordD" ]; } \
+	|| { echo '--- FAIL: dragon_return 不再排在 dragon 之前（子串包含关系，顺序反了龙回头会被并进龙头）'; exit 1; }
+# ⑧ INFO 是观测通道不是判据通道：bash 侧只 echo、不进 PASS/FAIL 计数（判数仍是 25 条）。
+#    一旦有人把 INFO 接成 PASS，绿的数量就会凭空增长，而红绿语义没变——这是最隐蔽的一种假绿。
+grep -qF 'INFO\|*) echo' "$VD" \
+	|| { echo '--- FAIL: bash 侧 INFO 分支丢失（观测读数会被当成未知行，或被误接进 PASS/FAIL 计数）'; exit 1; }
+infop=$(grep -c 'Write-Output ("INFO|' "$VD")
+[ "$infop" = "3" ] || { echo "--- FAIL: INFO 观测行数不是 3（逐文件空态/逐文件明细/当日聚合，计数=${infop}）"; exit 1; }
+# ⑨ 负锁：本探针不得用 `| Out-String` 读 JSON 字段（PS 控制台按 120 列折行会劈开值，§N-5 的教训本体；
+#    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
+grep -qF '([string]$sgJson.trading_day)' "$VD" \
+	|| { echo '--- FAIL: trading_day 不再用 [string] 直转（退回 | Out-String 即重新引入折行失明）'; exit 1; }
+echo "ok - §SIGNAL-DIST 守卫通过（探针判据锁 1 + 判红来源等值锁 1 + 来源白名单负锁 1 + 合法态明细锁 2 + 聚合读数锁 4 + leader_only 三条件锁 1 + 取数路径唯一锁 1 + 桶名 ASCII 负锁 1 + 桶序锁 1 + INFO 通道锁 2 + Out-String 负锁 1）"
 
 echo ""
 echo "==> 全部通过"

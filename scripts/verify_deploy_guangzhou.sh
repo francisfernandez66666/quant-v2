@@ -606,7 +606,8 @@ if ($tkPres.Count -eq 0) { $tkBad += "no readable source" }
 $tkDetail = "token_fp_agree=" + $tkAgreeN + "/" + $tkPres.Count + " readable=" + $tkPres.Count + "/expect=" + $tkExpectReadable + " file=" + $tk1 + $tk1Why + " env=" + $tk2 + $tk2Why + " engine=" + $tk3 + $tk3Why + " engineAuth=" + $tk3b + "(auth=" + $tk3Auth + ")" + " bridge=" + $tk4 + " report_file=" + $(if ($tk1r) { $tk1r } else { "none" }) + " report_env=" + $(if ($tk2r) { $tk2r } else { "none" }) + " miss=" + $(if ($tkBad.Count) { ($tkBad -join ",") } else { "none" })
 Probe "qmt:token fp agree across readable sources" ($tkBad.Count -eq 0) $tkDetail
 
-# 14) §SIGNAL-DIST（2026-09-24，第 21 探针）：当日固化信号按战法分布——§KLINE-CHAIN-3 的验收眼睛。
+# 14)（对应文件头清单第 15 项）§SIGNAL-DIST（2026-09-24，第 22 个 Probe 调用点／展开后第 22 探针）：
+#    当日固化信号按战法分布——§KLINE-CHAIN-3 的验收眼睛。
 # 为什么要这条：09-23 那晚「白天只有龙头出信号」是**owner 用肉眼在前端看出来的**，现网 24 条探针
 #   一条都没红（引擎活着、链也在跑，只是拿不到日K 的那批战法整天零产出）。也就是说这条缺陷在
 #   观测面上是**隐形**的：修没修好同样没人知道。所以修完之后必须把「今天有哪些战法出了信号」变成
