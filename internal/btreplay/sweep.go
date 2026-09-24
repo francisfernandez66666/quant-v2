@@ -231,6 +231,9 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 	bt := o.activeBacktest()
 	amountFixed := 0 // Risk-1 千元口径归一的股票计数
 	klines := make(map[string][]data.KLine, len(codes))
+	// §MINUTE-K 裸代码 → ts_code 反查表：动量适配器的分钟口径按 ts_code 查库，而 klines 按
+	// 裸代码键控（战法判据沿用的历史形状），两者在这里各存一份，注入时还原。
+	tsOfCode := make(map[string]string, len(codes))
 	// §Phase3 ATR 动态止损维：与 K 线同序预计算每只股票 ATR14 序列（网格模拟动态止损复用）
 	// English: Phase-3 ATR dynamic stop — precompute each stock's ATR14 series alongside the bars.
 	atrs := make(map[string][]float64, len(codes))
@@ -241,6 +244,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 			continue
 		}
 		code := strings.Split(tsCode, ".")[0]
+		tsOfCode[code] = tsCode // §MINUTE-K：分钟表主键是 ts_code，动量口径注入时要还原
 		k := toDataKLine(bars)
 		// §Risk-1 单位自校：tushare 口径库 amount=千元，均价带判定后归一（仅增强模式）
 		if bt != nil && fixAmountScale(k) {
@@ -282,6 +286,7 @@ func (o *Options) runSweep(db *store.DB, codes []string, ads []adapter,
 		o.slip = sc // 冠军复核（simulateCombo→backtestStock）同口径
 		var trigs []sweepTrigger
 		for code, kls := range klines {
+			o.applyMinuteScope(ad, tsOfCode[code]) // §MINUTE-K：与 backtestStock 同一口径注入点
 			trigs = append(trigs, o.sweepTriggersOf(ad, ai, code, kls, industryChg[code], sc)...)
 		}
 		sort.Slice(trigs, func(i, j int) bool { return trigs[i].sigIdx < trigs[j].sigIdx })

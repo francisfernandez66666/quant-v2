@@ -387,10 +387,12 @@ func (a *dragonAdapter) Exit(ctx *strategy.ExitContext, dailyK []strategy.KLine)
 //     "买入档不低于观察档"的夹子。
 //
 // 四条**数据/粒度差异**（前三条不可重建，只能如实标注、不能编出来；第四条是必须主动抵消的口径差）：
-//  1. 分钟 MACD → 日线 MACD：实盘 macdRatio 读 md.MinuteMACD（5 分钟 K 线算出的 DIF/DEA/Bar），
-//     研究库**没有分钟 K 落库**（只有新浪/腾讯实时接口），历史回放用 data.CalcMACDSeries 的**日线**
-//     MACD 顶上（与 n_shape 的 D4 资金确认同一先例）。方向性偏差：日线 MACD 比 5 分钟 MACD 迟钝，
-//     金叉/水上通常滞后一日，当日刚转弱的票在回放里仍可能被读成多头。
+//  1. 分钟 MACD → 日线 MACD（**仅在该日没有分钟落库时**）：实盘 macdRatio 读 md.MinuteMACD
+//     （5 分钟 K 线算出的 DIF/DEA/Bar）。§MINUTE-K 起研究库有 minute_klines，判档日优先用真
+//     5 分钟口径（当日最近 48 根，与实盘 fetchMinuteKLine 同尺寸）；只有该股该日没回填或
+//     根数不足 48 时才退回 data.CalcMACDSeries 的**日线** MACD（与 n_shape 的 D4 资金确认同一
+//     先例）。方向性偏差只在退回的那部分日子里成立：日线 MACD 比 5 分钟迟钝，金叉/水上通常
+//     滞后一日。整轮"有多少日子用了真分钟"随近似说明一起出门（approxNote 拼覆盖率读数）。
 //  2. 盘中轮次不可重建：实盘一轮一轮用实时行情打分，日内可能多轮跨越阈值；回放每天只判一次
 //     （收盘口径），因此**只会漏掉盘中那一刻的触发**，不会凭空多造触发。
 //  3. "动量提升才提醒"门不可重放：实盘该门（combat_agent/agent.go momentumImproved）是**跨轮盘中
@@ -413,9 +415,169 @@ type momentumAdapter struct {
 	// （§RFIX-1 口径，与 nShapeAdapter 同一手法；逐日重算会退化成 O(n²)）。
 	macdSeries []data.MACD
 	curIdx     int
+	// §MINUTE-K（2026-09-24）真 5 分钟 MACD 口径：装配点逐股注入 src+code，scoreDay 优先用它，
+	// 取不到（表为空/当日根数不足/该股未回填）才退回上面的日线序列。覆盖率计数在 src 上
+	// （looks/hits，整轮一份），换了口径必须看得见换了多大一部分，否则"升级"和"没数据所以
+	// 还是老数字"在报告上长得一模一样。
+	minuteSrc  MinuteMACDSource
+	minuteCode string
 	// §P2-d 出场参数扫参覆盖（nil=通用移动止盈缺省 8%/15 天，动量实盘本就无专属 CheckExit）。
 	trailOverride *float64
 	holdOverride  *int
+}
+
+// MinuteMACDSource 判定日 → 真 5 分钟 MACD 的取值器（§MINUTE-K）。
+// 实现方负责"当日根数不足即返回 false"，调用方据此退回日线近似口径——这条边界不能含糊：
+// 半天数据算出来的 MACD 与实盘那 48 根不是同一个东西，宁可退回"已声明的日线近似"，
+// 也不要拿一个没声明过的第三种近似冒充升级。
+// （MinuteMACDSource resolves the live-equivalent 5-minute MACD for one judgement day;
+// a day with too few bars must report "not available" rather than a half-day series.）
+type MinuteMACDSource interface {
+	MinuteMACDAt(tsCode, day string) (data.MACD, bool)
+}
+
+// minuteMACDScoped 装配点对动量适配器的可选注入（与 dayScoped 同一手法：能接的接、不能接的跳过）。
+type minuteMACDScoped interface {
+	setMinuteScope(src MinuteMACDSource, tsCode string)
+}
+
+// setMinuteScope 逐股装配分钟口径来源（装配点每次换股都调，src 为 nil 表示本轮没有分钟数据）。
+func (a *momentumAdapter) setMinuteScope(src MinuteMACDSource, tsCode string) {
+	a.minuteSrc = src
+	a.minuteCode = tsCode
+}
+
+// storeMinuteMACD 用研究库 minute_klines 复刻实盘那一刻的分钟 MACD：
+// 取判定日的全部 5 分钟根 → **截最近 windowToBars(48) 根**（与 strategy_engine.fetchMinuteKLine
+// 的 count=48 同尺寸）→ data.CalcMACD（与引擎同一函数、同一 12/26/9 口径）。
+// 逐(股,日)缓存：同一轮回放里兄弟战法回查与主循环可能重复问同一天，缓存顺带把 SQL 次数
+// 从"每股判档日数"压到不重复的量。looks/hits 是观测计数（不参与判红）。
+type storeMinuteMACD struct {
+	db     *store.DB
+	scale  int
+	window int
+	cache  map[string]minuteMACDEntry
+	looks  int
+	hits   int
+	// queries 真正落到 SQL 的次数（looks-queries 就是缓存省掉的查询数）：没有这一项，
+	// "缓存有没有生效"在测试里完全不可观测，只能靠断言计数器的自嗨。
+	queries int
+	// byBare 裸 6 位代码 → 库内 ts_code 的一次性反查表（见 normalizeCode）。
+	// 为什么需要：回放内部到处用裸代码（klines 映射的键、扫参的 code 参数），而分钟表主键是
+	// ts_code；在装配点建一次表（一次 DISTINCT 查询），比在每个调用点透传 ts_code 改动面小。
+	byBare map[string]string
+}
+
+// normalizeCode 把裸代码还原成库内 ts_code；已是 ts_code 形态（带点）则原样返回。
+// 查不到（该股没回填分钟数据）返回原串——后续按日查询自然零行，报"不可用"退回日线近似。
+func (s *storeMinuteMACD) normalizeCode(code string) string {
+	if strings.Contains(code, ".") || s.byBare == nil {
+		return code
+	}
+	if ts, ok := s.byBare[code]; ok {
+		return ts
+	}
+	return code
+}
+
+type minuteMACDEntry struct {
+	macd data.MACD
+	ok   bool
+}
+
+// newStoreMinuteMACD 按周期装配来源（scale 传 5；window 固定 48 根＝实盘一日的尺寸）。
+// codes 是本轮回放股票池的 ts_code 清单，用来建裸代码反查表。
+func newStoreMinuteMACD(db *store.DB, scale int, codes []string) *storeMinuteMACD {
+	if scale <= 0 {
+		scale = 5
+	}
+	s := &storeMinuteMACD{db: db, scale: scale, window: 48, cache: map[string]minuteMACDEntry{},
+		byBare: make(map[string]string, len(codes))}
+	for _, ts := range codes {
+		if i := strings.Index(ts, "."); i > 0 {
+			s.byBare[ts[:i]] = ts
+		}
+	}
+	return s
+}
+
+// MinuteMACDAt 实现 MinuteMACDSource：查该 (股,周期,判定日) 的分钟根 → 不足 window 根即报
+// "不可用"（口径边界，见接口注释）→ 截尾 window 根 → data.CalcMACD。
+// 根数门槛为什么硬卡在 window：实盘那 48 根是"整个交易日"，半日只有 12 根时 EMA26 预热根本
+// 不够，算出来的 DIF/DEA 与实盘不同源，宁可用已声明的日线近似也不能冒充升级。
+func (s *storeMinuteMACD) MinuteMACDAt(tsCode, day string) (data.MACD, bool) {
+	if s == nil || s.db == nil || tsCode == "" || len(day) < 10 {
+		return data.MACD{}, false
+	}
+	s.looks++
+	tsCode = s.normalizeCode(tsCode)
+	key := tsCode + "|" + day
+	if e, ok := s.cache[key]; ok {
+		if e.ok {
+			s.hits++
+		}
+		return e.macd, e.ok
+	}
+	s.queries++
+	bars, err := s.db.MinuteBarsByDay(tsCode, s.scale, day)
+	entry := minuteMACDEntry{}
+	// 查询失败（表不存在/旧库未迁移）与"根数不足"归同一类：报不可用、让调用方退回日线口径。
+	// 不返回 error 是因为回放的判档循环里没有任何一处能处理它，往上抛只会把整轮回测打断。
+	//
+	// 门槛只有**一处**（转换之后的 len(mkl) >= window）：先按窗口截尾、再剔除零价占位根，
+	// 剩下的有效根数才是"能不能算实盘同口径 MACD"的唯一依据。两处判据（截尾前一次、转换后
+	// 一次）会让 47 根被剔除后的序列仍带着"原始行数够 48"的错觉通过，也会让改窗口的人漏改一处。
+	if err == nil {
+		if len(bars) > s.window {
+			bars = bars[len(bars)-s.window:] // 截尾：只留最近 window 根（与实盘 count=48 同尺寸）
+		}
+		mkl := make([]data.KLine, 0, len(bars))
+		for _, b := range bars {
+			if b.Close <= 0 {
+				continue // 零价根＝停牌/半根，喂进 EMA 会把序列拉歪，直接丢弃
+			}
+			mkl = append(mkl, data.KLine{
+				Date:   minuteBarTime(b.Ts),
+				Open:   b.Open,
+				High:   b.High,
+				Low:    b.Low,
+				Close:  b.Close,
+				Volume: b.Vol,
+				Amount: b.Amount,
+			})
+		}
+		if len(mkl) >= s.window {
+			entry = minuteMACDEntry{macd: data.CalcMACD(mkl), ok: true}
+		}
+	}
+	s.cache[key] = entry
+	if entry.ok {
+		s.hits++
+	}
+	return entry.macd, entry.ok
+}
+
+// minuteBarTime 把落库的北京时间墙钟字符串解析成北京时间 time.Time（cntime.Loc，不读本机时区）。
+// 解析失败退到零值——MACD 只用收盘价，日期字段只是结构占位，绝不允许在这里"猜"一个时区把
+// 一根不属于当日的根混进来（ts 已由 MinuteBarsByDay 的日范围过滤过）。
+func minuteBarTime(ts string) time.Time {
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04"} {
+		if t, err := time.ParseInLocation(layout, ts, cntime.Loc); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// coverage 返回整轮观测计数（命中率 = hits/looks），供装配点打日志与近似说明用。
+func (s *storeMinuteMACD) coverage() (looks, hits int, pct float64) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	if s.looks == 0 {
+		return 0, 0, 0
+	}
+	return s.looks, s.hits, float64(s.hits) / float64(s.looks) * 100
 }
 
 // Name 战法名（回测报告分组键；与实盘 strategy.SignalMomentum 的显示名同一字面）。
@@ -477,12 +639,24 @@ func (a *momentumAdapter) scoreDay(klines []data.KLine, prevClose float64) (map[
 		prevClose = klines[len(klines)-2].Close
 	}
 	chg := chgPct(last.Close, prevClose)
-	// 近似口径 1：日线 MACD 顶替 5 分钟 MACD。序列缺失/游标错位时退化为逐日重算（不越界）。
+	// MACD 口径选择（§MINUTE-K）：**优先真 5 分钟 MACD**（研究库 minute_klines 当日最近 48 根，
+	// 与实盘 fetchMinuteKLine(count=48)→CalcMACD 同源）；当日没回填/根数不足才退回日线序列
+	// （近似口径 1，已声明）。覆盖率计数在 src 上，随近似说明一起出门。
 	var macd data.MACD
-	if a.macdSeries != nil && a.curIdx >= 0 && a.curIdx < len(a.macdSeries) {
-		macd = a.macdSeries[a.curIdx]
-	} else {
-		macd = data.CalcMACD(klines)
+	haveMinute := false
+	if a.minuteSrc != nil && a.minuteCode != "" {
+		if m, ok := a.minuteSrc.MinuteMACDAt(a.minuteCode, cntime.DayOf(last.Date)); ok {
+			macd = m
+			haveMinute = true
+		}
+	}
+	if !haveMinute {
+		// 未命中分钟口径 → 日线近似：序列缺失/游标错位时退化为逐日重算（不越界）。
+		if a.macdSeries != nil && a.curIdx >= 0 && a.curIdx < len(a.macdSeries) {
+			macd = a.macdSeries[a.curIdx]
+		} else {
+			macd = data.CalcMACD(klines)
+		}
 	}
 	md := &strategy_engine.StockMarketData{
 		Price:     last.Close,
@@ -729,6 +903,36 @@ type Options struct {
 	// 动量下单的那批票"。清单来自同一份 ads（排摸 IncludeDisabled=true 时停用库规则也算兄弟），
 	// 偏差方向是动量入场数偏少——保守侧，见 momentumAdapter 残余近似 3。
 	fallbackPeers []adapter
+	// minuteSrc §MINUTE-K 运行期真 5 分钟 MACD 来源（collect/runSweep 各装配一次，非配置项）：
+	// nil = 研究库没有 minute_klines（旧库/未回填）⇒ 动量判档整体退回日线近似，输出与升级前
+	// 逐字节一致。装配点见 applyMinuteScope。
+	minuteSrc *storeMinuteMACD
+}
+
+// minuteMACDScale 动量口径使用的分钟周期：与实盘 fetchMinuteKLine 的 scale=5 同一数字。
+const minuteMACDScale = 5
+
+// applyMinuteScope 逐股把分钟口径来源注入动量适配器（非动量适配器静默跳过）。
+// tsCode 空串＝本轮没有分钟来源（src 为 nil 时同样传空），适配器据此判定"只能走日线近似"。
+func (o *Options) applyMinuteScope(ad adapter, tsCode string) {
+	ms, ok := ad.(minuteMACDScoped)
+	if !ok {
+		return
+	}
+	if o.minuteSrc == nil {
+		ms.setMinuteScope(nil, "")
+		return
+	}
+	ms.setMinuteScope(o.minuteSrc, tsCode)
+}
+
+// minuteCoverageNote 装配收尾的覆盖率读数（nil 来源 = 整轮都是日线近似）。
+func (o *Options) minuteCoverageNote() string {
+	if o.minuteSrc == nil {
+		return "动量 MACD 口径：日线近似（研究库无 minute_klines，未回填）"
+	}
+	looks, hits, pct := o.minuteSrc.coverage()
+	return fmt.Sprintf("动量 MACD 口径：真 5 分钟 %d/%d 判档日（%.1f%%），其余退回日线近似", hits, looks, pct)
 }
 
 // setFallbackPeers 装配兜底互斥的兄弟清单：同一批适配器里**非兜底档**的那些。
@@ -1219,6 +1423,23 @@ func BuiltinDisplayName(id string) string {
 	return ad.Name()
 }
 
+// approxNote 出门文本 = 静态近似说明 + 本轮**实测**的分钟口径覆盖率。
+// 为什么必须拼实测值而不是把那句话改写成"已经用真 5 分钟了"：同一句声明在"回填跑完"和
+// "库是空的"两种运行里长得不一样，但报告上看起来一样——本仓反复出事的"降级报成功"形态。
+// 覆盖率读数来自 storeMinuteMACD 的观测计数（不参与判红）。
+func (o *Options) approxNote(id string) string {
+	note := ReplayApproxNote(id)
+	if id != "momentum" || note == "" {
+		return note
+	}
+	if o.minuteSrc == nil {
+		return note + "; minute-basis coverage: NONE (research DB has no minute_klines rows -> every judgement day used the daily MACD approximation above)"
+	}
+	looks, hits, pct := o.minuteSrc.coverage()
+	return fmt.Sprintf("%s; minute-basis coverage: %d/%d judgement days used real 5-minute MACD (%.1f%%), the rest fell back to the daily approximation above",
+		note, hits, looks, pct)
+}
+
 // ReplayApproxNote 返回某内置战法回放适配器的**近似口径说明**（空串＝无近似/非内置）。
 // 用途：排摸/回测读者必须能看见"这一行是近似量出来的"——纯日K完整回放与靠日内快照的
 // 近似回放混在一张表里不加标注，读出来同名的数字其实不是一回事。
@@ -1232,7 +1453,7 @@ func ReplayApproxNote(id string) string {
 		// 动量数字出门时必须带着这四句：判据已按实盘语义重写（兜底互斥/当日收盘撮合/买入档），
 		// 剩下量不了的只有"日K粒度看不到盘中"这一件事。读者若把这一行当成"5 分钟动量的精确回放"
 		// 就会高估它的可比性。
-		return "approx replay (criteria rewritten to live semantics 2026-09-24): fallback exclusivity honored (blocked whenever a sibling strategy signaled the same stock the same day, mirroring agent.go's `len(sigs)==0`) and entry at the SIGNAL DAY CLOSE (live matches the momentum pool the same tick), trade only at the live BUY threshold; still approximated -- 5-minute MACD replaced by daily MACD (no minute bars in the research DB), one judgement per day instead of N intraday rounds (can only miss triggers, not invent them), and the intraday round-to-round momentum-improvement gate is not reproducible (peers are probed with raw triggers, so the blocked-day set is larger than live's -> momentum entries skew LOW)"
+		return "approx replay (criteria rewritten to live semantics 2026-09-24): fallback exclusivity honored (blocked whenever a sibling strategy signaled the same stock the same day, mirroring agent.go's `len(sigs)==0`) and entry at the SIGNAL DAY CLOSE (live matches the momentum pool the same tick), trade only at the live BUY threshold; still approximated -- 5-minute MACD replaced by daily MACD on the days the research DB has no minute bars (see the coverage figure appended at runtime), one judgement per day instead of N intraday rounds (can only miss triggers, not invent them), and the intraday round-to-round momentum-improvement gate is not reproducible (peers are probed with raw triggers, so the blocked-day set is larger than live's -> momentum entries skew LOW)"
 	case "n_shape":
 		return "approx replay: intraday snapshot approximated from daily bars; D1 injected via -d1 rule score (no LLM/event context)"
 	case "dragon":
@@ -1393,6 +1614,15 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 		}
 	}
 
+	// §MINUTE-K 动量 MACD 口径升级的装配点（一次）：研究库有分钟落库就把真 5 分钟来源接上，
+	// 没有（旧库没这张表 / 表是空的）就保持 nil —— 判档整体退回"已声明的日线近似"，
+	// 数字与升级前逐字节一致。这里刻意不把"表存在但零行"当成错误：那正是回填还没跑的态。
+	if st, err := db.MinuteTableStats(minuteMACDScale); err == nil && st.Rows > 0 {
+		o.minuteSrc = newStoreMinuteMACD(db, minuteMACDScale, codes)
+		log.Printf("§MINUTE-K 动量 MACD 用真 5 分钟口径：minute_klines %d 行 / %d 只（%s ~ %s，平均 %.1f 根每票每日）",
+			st.Rows, st.Codes, st.FirstTs, st.LastTs, st.AvgBars)
+	}
+
 	// §P2 参数扫参模式：触发一次性预计算 + 逐组合廉价模拟统一出场（见 sweep.go）。
 	// English: sweep mode — pre-compute triggers once, then cheaply simulate each param combo.
 	if o.Sweep != nil {
@@ -1432,6 +1662,8 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 				continue
 			}
 			klines := toDataKLine(bars)
+			// §MINUTE-K 逐股注入分钟口径来源（动量适配器认它，其它适配器跳过）。
+			o.applyMinuteScope(ad, tsCode)
 			// §Risk-1 单位自校：tushare 口径库 amount=千元，均价带判定后归一（仅增强模式）
 			if o.slip != nil && fixAmountScale(klines) {
 				amountFixed++
@@ -1454,13 +1686,16 @@ func (o *Options) collect() ([]*summary, []string, int, error) {
 		// 近似口径随结果一起带出：报告正文（printReport）与 survey 侧（ReplayStat.Approx）
 		// 都能看到"这一行不是精确回放"，不会只剩代码注释里才知道。
 		adID := adapterID(ad)
-		sm.Approx = ReplayApproxNote(adID)
+		sm.Approx = o.approxNote(adID)
 		summaries = append(summaries, sm)
 		ids = append(ids, adID)
 	}
 	if amountFixed > 0 {
 		log.Printf("Risk-1 单位自校：%d 只股票 amount 按千元口径归一（×1000）", amountFixed)
 	}
+	// §MINUTE-K 收尾读数：队列 worker 抓的就是这里的日志行，报告之外也要看得见"这一轮
+	// 动量到底用了多少真分钟"（只回显、不参与判红）。
+	log.Printf("%s", o.minuteCoverageNote())
 	return summaries, ids, len(codes), nil
 }
 

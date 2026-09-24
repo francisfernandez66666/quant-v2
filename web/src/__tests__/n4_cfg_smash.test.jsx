@@ -10,7 +10,9 @@
 // numbers are validated as required (never folded into 0), and a 409 version conflict
 // re-blocks the form until reload.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
+// §DET-TIME（2026-09-24）：等 UI 一律用 settle()（排空微任务队列）而不是 waitFor/findBy——这些用例的接口都是 resolved promise 的 mock，用真实时钟轮询在邻居负载下必偶发红（见 settle.js 文件头）。
+import { settle } from './settle.js'
 import { MemoryRouter } from 'react-router-dom'
 
 const { state } = vi.hoisted(() => ({ state: {} }))
@@ -92,12 +94,14 @@ describe('§N-4 战法参数保存闸：读取失败禁保存 / 缺失必填 / �
   it('E1 战法加载失败 → 红条 + 保存禁用 + setStrategyConfig 零调用（旧形态：静默落 0 整份 POST）', async () => {
     state.impl.fetchStrategyConfig = () => { throw ERR500('config 拉取失败') }
     render(<MemoryRouter><Settings /></MemoryRouter>)
-    const banner = await screen.findByText(/读取失败，禁止保存/, {}, { timeout: 5000 })
+    await settle()
+    const banner = screen.getByText(/读取失败，禁止保存/)
     expect(banner).toBeInTheDocument()
-    await waitFor(() => expect(getSaveButtonDisabled()).toBe(true))
+    await settle()
+    expect(getSaveButtonDisabled()).toBe(true)
     // 「重载」再失败一次：确认错误态可重入且依旧禁存（防只挡首帧、点一下就解禁的假闸）。
     fireEvent.click(screen.getByRole('button', { name: /重载/ }))
-    await screen.findByText(/读取失败，禁止保存/, {}, { timeout: 5000 })
+    await settle()
     fireEvent.click(getSaveButton())
     const api = await import('../api/index.js')
     expect(api.setStrategyConfig.mock.calls.length, '§N-4：error 态绝不发起保存').toBe(0)
@@ -109,21 +113,25 @@ describe('§N-4 战法参数保存闸：读取失败禁保存 / 缺失必填 / �
     delete partial.n_shape
     state.impl.fetchStrategyConfig = () => partial
     render(<MemoryRouter><Settings /></MemoryRouter>)
-    await waitFor(() => expect(getSaveButtonDisabled()).toBe(false), { timeout: 5000 })
+    await settle()
+    expect(getSaveButtonDisabled()).toBe(false)
     fireEvent.click(getSaveButton())
     const api = await import('../api/index.js')
-    // 等一拍微任务：校验是同步的，若误放行会立刻调用
-    await new Promise((r) => setTimeout(r, 50))
+    // 等一拍：校验是同步的，若误放行会立刻调用。用 settle() 而不是 setTimeout(50) ——
+    // 后者在邻居抢 CPU 时会把"还没轮到跑"读成"跑了且没调用"，方向是假绿不是假红，更该避免。
+    await settle()
     expect(api.setStrategyConfig.mock.calls.length, '§N-4：缺失字段必须被必填校验拦下').toBe(0)
   })
 
   // E3 正常路径 → 保存成功，payload 携带 §中-6 updated_at=v1 基线与完整表单值；成功后基线推进。
   it('E3 正常保存 → payload 带 updated_at 基线（后端稀疏 merge 的另一半判据）', async () => {
     render(<MemoryRouter><Settings /></MemoryRouter>)
-    await waitFor(() => expect(getSaveButtonDisabled()).toBe(false), { timeout: 5000 })
+    await settle()
+    expect(getSaveButtonDisabled()).toBe(false)
     fireEvent.click(getSaveButton())
     const api = await import('../api/index.js')
-    await waitFor(() => expect(api.setStrategyConfig.mock.calls.length).toBe(1))
+    await settle()
+    expect(api.setStrategyConfig.mock.calls.length).toBe(1)
     const payload = api.setStrategyConfig.mock.calls[0][0]
     expect(payload.updated_at).toBe('v1')
     expect(payload.dragon.take_profit_pct).toBe(10)
@@ -134,10 +142,13 @@ describe('§N-4 战法参数保存闸：读取失败禁保存 / 缺失必填 / �
   it('E4 保存遇 409（他人已先写）→ 冲突红条 + 再禁保存，不自动重放', async () => {
     state.impl.setStrategyConfig = () => { throw Object.assign(new Error('version conflict'), { status: 409 }) }
     render(<MemoryRouter><Settings /></MemoryRouter>)
-    await waitFor(() => expect(getSaveButtonDisabled()).toBe(false), { timeout: 5000 })
+    await settle()
+    expect(getSaveButtonDisabled()).toBe(false)
     fireEvent.click(getSaveButton())
-    const banner = await screen.findByText(/版本冲突，禁止保存/, {}, { timeout: 5000 })
+    await settle()
+    const banner = screen.getByText(/版本冲突，禁止保存/)
     expect(banner).toBeInTheDocument()
-    await waitFor(() => expect(getSaveButtonDisabled()).toBe(true))
+    await settle()
+    expect(getSaveButtonDisabled()).toBe(true)
   })
 })

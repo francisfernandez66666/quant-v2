@@ -615,11 +615,12 @@ Probe "qmt:token fp agree across readable sources" ($tkBad.Count -eq 0) $tkDetai
 # 读法（只读，不新增凭据）：引擎的当日固化信号落 <DataDir>\signals_today.json
 #   （internal/engine/engine.go:558 + signal_store.go，键 code@strategy，跨重启恢复、交易日自动滚动）。
 #   按 Recurse -Depth 2 收（dataDir 为空时该文件根本不落，属合法 no-file）。
-# 口径（2026-09-24 首跑后收紧，见下"为什么按文件分行"）：战法一律取 ASCII 的归一桶——
-#   Signal.StrategyType（runner 类型/规则 ID：dragon/double_bump/n_shape/dragon_return/momentum/
-#   fac_N/pat_N）优先，缺失时按中文展示名查表映射，映射不到记 other（宁可少分类，不猜）。
+# 口径（2026-09-24 首跑后收紧，见下"为什么按文件分行"；同日 §88 扩桶后改精确等值）：战法一律取
+#   ASCII 的归一桶——Signal.StrategyType（runner 类型/规则 ID：dragon/double_bump/n_shape/
+#   dragon_return/momentum/高4做空桶/fac_N/pat_N）优先，缺失时按中文展示名**查表精确映射**，
+#   映射不到记 other 并把**原始类型消毒后原样列出**（unmatched=），绝不靠子串猜。
 #   **不把中文塞进明细**——本仓库实录过 PowerShell→SSH→bash 回传时中文 detail 会被 GBK 字节打乱、
-#   在 grep 判据里恒不命中（＝把假绿写进探针）。
+#   在 grep 判据里恒不命中（＝把假绿写进探针）。原始值进明细前一律先剔掉非 ASCII 字符。
 # 为什么按文件分行（首跑 2026-09-24 实测教训）：DataDir 下 Recurse 能收到 4 份 signals_today.json
 #   （根目录一份 + accounts/<uid>/ 每账号一份，见 engine.go:558 的 per-acctDir 装配），
 #   合并计数会把「昨日/前日的残留桶」和「另一个账号的产出」混进同一个数字里，读出来是 64 却
@@ -634,27 +635,104 @@ Probe "qmt:token fp agree across readable sources" ($tkBad.Count -eq 0) $tkDetai
 #   signals=0（当天确实可以一个信号都没有）。这三种都如实把状态写进明细。
 $sgFiles = @()
 try { $sgFiles = @(Get-ChildItem -LiteralPath $DataDir -Filter 'signals_today.json' -Recurse -Depth 2 -ErrorAction SilentlyContinue) } catch { $sgFiles = @() }
-# SgKey：把一条固化信号归一到 ASCII 桶名。判定顺序即优先级，dragon_return 必须排在 dragon 之前
-# （子串包含关系），fac_/pat_ 规则 ID 排在最后兜底。
+# SgKey：把一条固化信号归一到 ASCII 桶名。2026-09-24 扩桶时整体改成**精确等值查表**，理由：
+#   旧实现把 `strategy_type + "|" + strategy` 拼成一串再做子串 -match，于是「龙头断板」（做空战法
+#   leader_decay 的展示名）被 `'dragon|龙头'` 那条规则静默吞进 dragon 桶——09-24 现网读数
+#   `dragon:14 / other:9` 里的 14 就是虚高的（卖出信号混在买入龙头里），而 owner 要的"到底是哪些
+#   战法在买、哪些在卖"当时答不出来。子串匹配在这种"名字互相包含"的领域里没有修复空间：
+#   补一条 if 顺序只是把下一次撞名推迟（高位滞涨/放量破位/利好兑现同理），故一律换成精确等值，
+#   匹配不上就退回 other 并把原始值列出来（宁可少分类，不猜）。
+#   桶名与 internal/strategy/types.go 的 SignalType 常量表逐字对齐，verify_changes.sh §88 有一道
+#   "Go 里有、探针桶里没有"的完整性锁，新增战法不会再静默落进 other。
 function SgKey($o) {
-    $t = [string]$o.strategy_type
-    $s = [string]$o.strategy
+    $t = ([string]$o.strategy_type).Trim()
+    $s = ([string]$o.strategy).Trim()
     if (-not $t -and -not $s) { return "unknown" }
-    $u = $t + "|" + $s
-    if ($u -match 'dragon_return|龙回头') { return "dragon_return" }
-    if ($u -match 'double_bump|双响炮') { return "double_bump" }
-    if ($u -match 'n_shape|N形') { return "n_shape" }
-    if ($u -match 'momentum|动量') { return "momentum" }
-    if ($u -match 'dragon|龙头') { return "dragon" }
-    if ($t -match '^fac_' -or $u -match '\bfactor\b') { return "factor" }
-    if ($t -match '^pat_' -or $u -match '\bpattern\b') { return "pattern" }
+    # ① 权威口径：ASCII strategy_type 精确等值（ToLower 兼容 DragonReturn 这类驼峰历史别名）
+    switch -Exact ($t.ToLower()) {
+        'dragon'         { return "dragon" }
+        'double_bump'    { return "double_bump" }
+        'n_shape'        { return "n_shape" }
+        'dragon_return'  { return "dragon_return" }
+        'momentum'       { return "momentum" }
+        'high_churn'     { return "high_churn" }
+        'break_down'     { return "break_down" }
+        'leader_decay'   { return "leader_decay" }
+        'good_news_fade' { return "good_news_fade" }
+        'short_skeleton' { return "short_skeleton" }
+        'factor'         { return "factor" }
+        'pattern'        { return "pattern" }
+    }
+    # ② 中文展示名精确等值（strategy_type 为空的旧行、以及把中文塞进 strategy_type 的历史行都走这里）
+    #    取值集＝internal/combat_agent/types.go 的 StrategyDisplayName + NormalizeStrategyName 别名表。
+    #    -Exact 保证「龙头」不会命中「龙头断板」，所以卖出桶不需要靠书写顺序保命。
+    foreach ($c in @($t, $s)) {
+        if (-not $c) { continue }
+        switch -Exact ($c) {
+            '龙头'         { return "dragon" }
+            '双响炮'       { return "double_bump" }
+            'N形'          { return "n_shape" }
+            'N形超短'      { return "n_shape" }
+            'N字型'        { return "n_shape" }
+            'N字'          { return "n_shape" }
+            '龙回头'       { return "dragon_return" }
+            '动量'         { return "momentum" }
+            '高位滞涨'     { return "high_churn" }
+            '放量破位'     { return "break_down" }
+            '破位'         { return "break_down" }
+            '龙头断板'     { return "leader_decay" }
+            '断板'         { return "leader_decay" }
+            '利好兑现砸盘' { return "good_news_fade" }
+            '利好兑现'     { return "good_news_fade" }
+            '做空骨架'     { return "short_skeleton" }
+        }
+    }
+    # ③ 多规则战法的规则 ID 前缀（fac_1 / pat_3）：只有 ^ 锚定的前缀，仍然不是子串。
+    if ($t -match '^fac_') { return "factor" }
+    if ($t -match '^pat_') { return "pattern" }
     return "other"
+}
+# SgSide：把一条固化信号归到 buy / sell 档。轴**必须**选 direction，不是 action：
+#   ① 固化存储只收 做多/做空（internal/engine/signal_store.go 的 Upsert 白名单），提醒型（止盈/止损/
+#      减仓）根本进不了 signals_today.json ⇒ 该字段在本文件里恒为二选一，是这里唯一有保障的字段；
+#   ② action 在不同战法里有 buy / sell / 卖出 / 减仓 / 关注 五套写法，拿它分档必错，
+#      所以兜底档显式叫 side_unknown 并回显计数——出现第三种取值时看得见，不会静默并进某一档。
+function SgSide($o) {
+    switch -Exact (([string]$o.direction).Trim()) {
+        '做多' { return "buy" }
+        '做空' { return "sell" }
+    }
+    return "side_unknown"
+}
+# SgRaw：未归类桶（other/unknown）的原始类型消毒——剔掉非 ASCII 字符后原样回显，空了就记 nonascii。
+# 直接打印中文会让明细在 PS→SSH→bash 回传时被 GBK 字节打乱（同 §NSSMENV 那批教训），
+# 但"列出原始值"正是 owner 要的：桶没扩全时他要能看见是哪个战法没进桶。
+function SgRaw($o) {
+    $r = (([string]$o.strategy_type) + "/" + ([string]$o.strategy)) -replace '[^ -~/]', ''
+    $r = $r.Trim('/')
+    if (-not $r) { return "nonascii" }
+    if ($r.Length -gt 40) { $r = $r.Substring(0, 40) }
+    return $r
+}
+# SgInc / SgTop：计数与读数格式化的小工具（哈希表按引用传入，函数内累加对调用方可见）。
+# 抽出来是因为本探针现在要同时维护四张计数表（全桶/当日桶/买入桶/卖出桶），内联写四遍必错一处。
+function SgInc($h, $k) { if ($h.ContainsKey($k)) { $h[$k] = [int]$h[$k] + 1 } else { $h[$k] = 1 } }
+function SgTop($h) {
+    $o = ""
+    foreach ($k in @($h.Keys | Sort-Object)) { if ($o) { $o += "," }; $o += ($k + ":" + $h[$k]) }
+    if ($o) { return $o }
+    return "none"
 }
 $sgBad = @()
 $sgToday = (Get-Date).ToString("yyyyMMdd")
 $sgTodayN = 0
 $sgTodayFiles = 0
 $sgTodayByType = @{}
+# 当日按买/卖档分桶 + 未归类原始值：三者都是 09-24 扩桶批新增的读数（见 SgKey/SgSide 注释）。
+$sgTodayBuy = @{}
+$sgTodaySell = @{}
+$sgTodaySideUnknown = 0
+$sgRawUnmatched = @{}
 foreach ($sgf in $sgFiles) {
     $sgJson = $null
     try {
@@ -687,15 +765,20 @@ foreach ($sgf in $sgFiles) {
         if ($null -eq $sg) { continue }
         $sgN = $sgN + 1
         $k = SgKey $sg
-        if ($sgByType.ContainsKey($k)) { $sgByType[$k] = [int]$sgByType[$k] + 1 } else { $sgByType[$k] = 1 }
+        SgInc $sgByType $k
         if ($isToday -eq "yes") {
-            if ($sgTodayByType.ContainsKey($k)) { $sgTodayByType[$k] = [int]$sgTodayByType[$k] + 1 } else { $sgTodayByType[$k] = 1 }
+            SgInc $sgTodayByType $k
+            # 未归类原始值只看当日文件（跨日残留桶会把"今天到底哪条没进桶"淹掉）。
+            if ($k -eq 'other' -or $k -eq 'unknown') { SgInc $sgRawUnmatched (SgRaw $sg) }
+            # 买/卖档只统计当日（与 today_* 其余读数同口径），跨日残留桶不进聚合。
+            $sd = SgSide $sg
+            if ($sd -eq 'buy') { SgInc $sgTodayBuy $k }
+            elseif ($sd -eq 'sell') { SgInc $sgTodaySell $k }
+            else { $sgTodaySideUnknown = $sgTodaySideUnknown + 1 }
         }
     }
-    $sgTop = ""
-    foreach ($k in @($sgByType.Keys | Sort-Object)) { if ($sgTop) { $sgTop += "," }; $sgTop += ($k + ":" + $sgByType[$k]) }
     Write-Output ("INFO|signals_file " + $rel + " day=" + $sgDay + " today=" + $isToday + " n=" + $sgN +
-        " kinds=" + $(if ($sgTop) { $sgTop } else { "none" }) +
+        " kinds=" + (SgTop $sgByType) +
         " mtime=" + $sgf.LastWriteTime.ToString("yyyy-MM-dd HH:mm"))
     if ($isToday -eq "yes") {
         $sgTodayFiles = $sgTodayFiles + 1
@@ -703,13 +786,20 @@ foreach ($sgf in $sgFiles) {
     }
 }
 $sgTypes = @($sgTodayByType.Keys | Sort-Object)
-$sgTop2 = ""
-foreach ($k in $sgTypes) { if ($sgTop2) { $sgTop2 += "," }; $sgTop2 += ($k + ":" + $sgTodayByType[$k]) }
+# 买入档种类是「白天只龙头出信号」那类缺陷的判据面：卖出/做空桶再热闹，只要买入侧只有 dragon 一类，
+# 打分链的买入覆盖就仍然偏窄（09-24 现网 dragon 虚高的根因正是这两个面被混在了一起）。
+$sgBuyTypes = @($sgTodayBuy.Keys | Sort-Object)
+$sgSellTypes = @($sgTodaySell.Keys | Sort-Object)
 $sgLeaderOnly = "false"
-if ($sgTodayN -gt 0 -and $sgTypes.Count -eq 1 -and $sgTypes[0] -eq 'dragon') { $sgLeaderOnly = "true" }
+if ($sgTodayN -gt 0 -and $sgBuyTypes.Count -eq 1 -and $sgBuyTypes[0] -eq 'dragon') { $sgLeaderOnly = "true" }
+# side_unknown 恒为 0 是本探针口径成立的前提（direction 只有 做多/做空 两种取值，由固化存储白名单保证）；
+# 一旦不为 0，说明上游出现了第三种方向词，买卖两档的读数就此失真，必须能在明细里一眼看到而不是静默漏计。
 $sgDetail = "today_signals=" + $sgTodayN + " today_strategies=" + $sgTypes.Count + " leader_only=" + $sgLeaderOnly +
     " today_files=" + $sgTodayFiles + "/" + $sgFiles.Count + " day=" + $sgToday +
-    " top=" + $(if ($sgTop2) { $sgTop2 } else { "none" }) +
+    " buy_types=" + $sgBuyTypes.Count + " sell_types=" + $sgSellTypes.Count +
+    " kinds_buy=" + (SgTop $sgTodayBuy) + " kinds_sell=" + (SgTop $sgTodaySell) +
+    " unmatched=" + (SgTop $sgRawUnmatched) + " side_unknown=" + $sgTodaySideUnknown +
+    " top=" + (SgTop $sgTodayByType) +
     " miss=" + $(if ($sgBad.Count) { ($sgBad | Sort-Object -Unique) -join "," } else { "none" })
 # 这条探针的**存在理由就是读数本身**，所以绿的时候也必须把明细打出来（其余探针只在红时回显 detail）。
 # 走独立的 INFO 通道：bash 侧只 echo、不进 PASS/FAIL 计数 ⇒ 红绿语义与 25 条判数都不受影响。

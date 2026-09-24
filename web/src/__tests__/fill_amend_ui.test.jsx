@@ -13,7 +13,10 @@
 // states are mutually exclusive in the ledger, an empty reason never leaves the browser, and a
 // skipped conservation leg is surfaced as "not checked" rather than "passed".
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
+// §DET-TIME（2026-09-24）：本文件的等待一律走 settle()（排空微任务队列）而不是 waitFor/findBy，
+// 理由与轮数取值见 settle.js 文件头。被测链路的接口全是 resolved promise 的 mock，不需要任何时钟。
+import { settle } from './settle.js'
 import * as api from '../api/index.js'
 import FillAmendPanel from '../components/FillAmendPanel.jsx'
 
@@ -110,7 +113,8 @@ describe('勘误面板台账与守恒自检（§FILL-AMEND）', () => {
 
   it('三态各给各自的动作：待批准可批准、已生效可撤销、已撤销只归档', async () => {
     render(<FillAmendPanel fills={[]} />)
-    await waitFor(() => expect(api.fetchFillAmendments).toHaveBeenCalled())
+    await settle()
+    expect(api.fetchFillAmendments).toHaveBeenCalled()
     expect(screen.getByText('待批准')).toBeInTheDocument()
     expect(screen.getByText('已生效')).toBeInTheDocument()
     expect(screen.getAllByText('已撤销').length).toBeGreaterThan(0)
@@ -123,10 +127,12 @@ describe('勘误面板台账与守恒自检（§FILL-AMEND）', () => {
   it('批准后回调 onChanged 并刷新台账（账目数字此刻才真的动）', async () => {
     const onChanged = vi.fn()
     render(<FillAmendPanel fills={[]} onChanged={onChanged} />)
-    await waitFor(() => expect(api.fetchFillAmendments).toHaveBeenCalled())
+    await settle()
+    expect(api.fetchFillAmendments).toHaveBeenCalled()
     api.fetchFillAmendments.mockClear()
     fireEvent.click(screen.getByText('批准生效'))
-    await waitFor(() => expect(api.applyFillAmendment).toHaveBeenCalledWith(1))
+    await settle()
+    expect(api.applyFillAmendment).toHaveBeenCalledWith(1)
     expect(onChanged).toHaveBeenCalled()
     expect(api.fetchFillAmendments.mock.calls.length).toBeGreaterThan(0)
   })
@@ -134,7 +140,8 @@ describe('勘误面板台账与守恒自检（§FILL-AMEND）', () => {
   it('台账读取失败（如会话非 admin 的 403）：错误文案透出，不静默渲染成空台账', async () => {
     api.fetchFillAmendments = vi.fn(async () => { const e = new Error('无权限'); e.status = 403; throw e })
     render(<FillAmendPanel fills={[]} />)
-    await waitFor(() => expect(screen.getByText(/无权限/)).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText(/无权限/)).toBeInTheDocument()
     expect(screen.queryByText('暂无勘误记录——只有取证确认柜台方向记错时才需要改判')).not.toBeInTheDocument()
   })
 
@@ -145,7 +152,8 @@ describe('勘误面板台账与守恒自检（§FILL-AMEND）', () => {
     }
     const onClose = vi.fn()
     render(<FillAmendPanel fills={[target]} target={target} onCloseTarget={onClose} />)
-    const dialog = await screen.findByText('改判成交 603468.SH')
+    await settle()
+    const dialog = screen.getByText('改判成交 603468.SH')
     expect(dialog).toBeInTheDocument()
     // 反证：空理由点提交 → 不发请求
     fireEvent.click(screen.getByText('提交待批准勘误'))
@@ -153,9 +161,8 @@ describe('勘误面板台账与守恒自检（§FILL-AMEND）', () => {
     // 正例：填理由后提交，参数按 fill_id/新方向/理由三项出网
     fireEvent.change(screen.getByPlaceholderText('为什么要改这笔的方向'), { target: { value: '柜台回单为卖出' } })
     fireEvent.click(screen.getByText('提交待批准勘误'))
-    await waitFor(() => expect(api.createFillAmendment).toHaveBeenCalledWith({
-      fillId: 42, newSide: '卖出', reason: '柜台回单为卖出',
-    }))
+    await settle()
+    expect(api.createFillAmendment).toHaveBeenCalledWith({ fillId: 42, newSide: '卖出', reason: '柜台回单为卖出' })
   })
 
   it('守恒自检：缺腿如实显示「未检查+原因」，不得渲染成通过', async () => {
@@ -170,9 +177,11 @@ describe('勘误面板台账与守恒自检（§FILL-AMEND）', () => {
       },
     }))
     render(<FillAmendPanel fills={[]} />)
-    await waitFor(() => expect(api.fetchFillAmendments).toHaveBeenCalled())
+    await settle()
+    expect(api.fetchFillAmendments).toHaveBeenCalled()
     fireEvent.click(screen.getByText('只读自检'))
-    await waitFor(() => expect(screen.getByText('存在差异（只报数，未动账）')).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText('存在差异（只报数，未动账）')).toBeInTheDocument()
     // 603468.SH 在本用例出现两处（台账待批准行 + 守恒差异行），按"至少两处"断言而非 getByText
     expect(screen.getAllByText('603468.SH').length).toBeGreaterThanOrEqual(2)
     expect(screen.getByText('账上多：成交簿重放不含该笔买入')).toBeInTheDocument()
@@ -192,9 +201,11 @@ describe('勘误面板台账与守恒自检（§FILL-AMEND）', () => {
       },
     }))
     render(<FillAmendPanel fills={[]} />)
-    await waitFor(() => expect(api.fetchFillAmendments).toHaveBeenCalled())
+    await settle()
+    expect(api.fetchFillAmendments).toHaveBeenCalled()
     fireEvent.click(screen.getByText('只读自检'))
-    await waitFor(() => expect(screen.getByText('守恒通过')).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText('守恒通过')).toBeInTheDocument()
     expect(screen.queryByText(/未检查/)).not.toBeInTheDocument()
   })
 })

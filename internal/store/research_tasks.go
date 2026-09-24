@@ -30,6 +30,9 @@ const (
 	TaskBacktestNightly   = "backtest_nightly"  // 夜间全量回测（ref_id=0 取最近候选）
 	TaskList              = "list"
 	TaskDataload          = "dataload"
+	// TaskMinuteSync §MINUTE-K（2026-09-24）：分钟 K 日增装载（收盘后只补库里已有的票）。
+	// 与 dataload 同走专用二进制，不入 research 分发器。
+	TaskMinuteSync = "minute_sync"
 	// TaskLifecycle §GAP-P1 20260915：策略生命周期评估（灰度晋升 + 实盘衰退自动降级）。
 	TaskLifecycle = "lifecycle"
 )

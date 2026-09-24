@@ -2,7 +2,9 @@
 // 锁定"API 就绪但 UI 未接"的补齐：admin 进入即拉快照列表，回滚走二次确认（取消不调写端点），
 // 成员账号整卡隐藏。后端契约与权限在 Go 侧已有测试，本文件只锁前端半边接线。
 import { describe, it, expect, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, act } from '@testing-library/react'
+// §DET-TIME（2026-09-24）：等 UI 一律用 settle()（排空微任务队列）而不是 waitFor/findBy——这些用例的接口都是 resolved promise 的 mock，用真实时钟轮询在邻居负载下必偶发红（见 settle.js 文件头）。
+import { settle } from './settle.js'
 // §A5：Settings 页接入 useNavigate（首拉 403 跳 /403），渲染需 Router 上下文
 import { MemoryRouter } from 'react-router-dom'
 
@@ -36,8 +38,10 @@ describe('Settings 配置历史卡（§D-3）', () => {
     ROLE = 'admin'
     const api = await import('../api/index.js')
     render(<MemoryRouter><Settings /></MemoryRouter>)
-    expect(await screen.findByText('配置历史与回滚')).toBeInTheDocument()
-    await waitFor(() => expect(api.fetchConfigHistory).toHaveBeenCalled())
+    await settle()
+    expect(screen.getByText('配置历史与回滚')).toBeInTheDocument()
+    await settle()
+    expect(api.fetchConfigHistory).toHaveBeenCalled()
     expect(screen.getByText('2026-09-17T10:00:00Z')).toBeInTheDocument()
     expect(screen.getByText('2026-09-15T08:00:00Z')).toBeInTheDocument()
     expect(screen.getByText(/共 2 个规则快照 \/ 1 个战法参数快照/)).toBeInTheDocument()
@@ -46,23 +50,34 @@ describe('Settings 配置历史卡（§D-3）', () => {
   it('回滚按钮 → 二次确认弹窗；取消不触达写端点', async () => {
     ROLE = 'admin'
     const api = await import('../api/index.js')
-    render(<MemoryRouter><Settings /></MemoryRouter>)
-    await screen.findByText('2026-09-17T10:00:00Z') // 等列表数据落地（按钮在行内）
-    fireEvent.click(screen.getAllByText('回滚')[0])
-    expect(await screen.findByText('确认回滚配置')).toBeInTheDocument()
-    expect(screen.getByText(/原子恢复到快照/)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '取消' }))
-    // jsdom 不触发 CSS transition 的 closed 回调，弹窗元素滞留 DOM——以隐藏为关闭判据
-    await waitFor(() => expect(screen.getByText('确认回滚配置')).not.toBeVisible())
-    expect(api.rollbackConfig).not.toHaveBeenCalled()
-    expect(api.rollbackStrategyParams).not.toHaveBeenCalled()
+    // 弹窗的"关闭"挂在 TDesign 的过渡结束回调上（内部是计时器），jsdom 不跑 CSS 动画也不触发
+    // transition 的 closed 回调 ⇒ 这一段不能靠微任务 flush 到达终态。按 settle.js 的约定改用假时钟：
+    // "过了多久"由测试自己规定（advanceTimersByTime 5s），不再有任何真实时钟预算可被邻居负载撑破。
+    // 先例见 m10_stale_guard.test.jsx（假时钟下不得用 waitFor/findBy，它们自己的超时也挂在假时钟上）。
+    vi.useFakeTimers()
+    try {
+      render(<MemoryRouter><Settings /></MemoryRouter>)
+      await settle() // 等列表数据落地（按钮在行内）
+      fireEvent.click(screen.getAllByText('回滚')[0])
+      await settle()
+      expect(screen.getByText('确认回滚配置')).toBeInTheDocument()
+      expect(screen.getByText(/原子恢复到快照/)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: '取消' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      // 以隐藏为关闭判据（弹窗元素滞留 DOM 是该组件的既有行为，不在本用例范围内）
+      expect(screen.getByText('确认回滚配置')).not.toBeVisible()
+      expect(api.rollbackConfig).not.toHaveBeenCalled()
+      expect(api.rollbackStrategyParams).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('成员账号整卡隐藏（写端点 admin-only）', async () => {
     ROLE = 'user'
     render(<MemoryRouter><Settings /></MemoryRouter>)
     // 等其它卡片渲染完成后仍无历史卡
-    await screen.findByText('服务器连接')
+    await settle()
     expect(screen.queryByText('配置历史与回滚')).not.toBeInTheDocument()
   })
 })

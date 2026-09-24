@@ -587,6 +587,22 @@ func (d *DB) migrate() error {
 		// 免全表扫（夜间逐窗 5000 股装配；置于三池建表之后，fresh DB 顺序安全）。
 		`CREATE INDEX IF NOT EXISTS idx_ths_lu_code ON ths_limit_up_daily(ts_code, trade_date)`,
 		`CREATE INDEX IF NOT EXISTS idx_ths_bk_code ON ths_break_pool_daily(ts_code, trade_date)`,
+		// §MINUTE-K（2026-09-24）分钟 K 落库：动量回放的 5 分钟 MACD 口径终于可比（此前只有日线，
+		// 回放只能拿日线 MACD 顶替实盘的 md.MinuteMACD）。口径三定：不复权（与实盘分钟线同源，
+		// 表里**故意没有复权因子列**，防止与日线 hfq 体系互相换算混用）、ts 为北京时间墙钟字符串
+		// （字典序即时间序，按日切片就是前缀范围查询）、主键 (ts_code,scale,ts) 幂等 upsert
+		// （上游只有"最近 N 根"窗口无分页，回填与日增走同一条写入路径）。建表置于索引语句之前：
+		// 下面的 idx_minute_scale_ts 依赖表存在（fresh DB 顺序安全，同 idx_ths_lu_code 的教训）。
+		`CREATE TABLE IF NOT EXISTS minute_klines (
+			ts_code TEXT NOT NULL,
+			scale INTEGER NOT NULL,
+			ts TEXT NOT NULL,
+			open REAL, high REAL, low REAL, close REAL,
+			vol REAL, amount REAL,
+			PRIMARY KEY (ts_code, scale, ts)
+		)`,
+		// 跨票按周期取数（表总览统计、增量续拉找覆盖到哪天）走 (scale, ts)；逐票按日取数走主键前缀。
+		`CREATE INDEX IF NOT EXISTS idx_minute_scale_ts ON minute_klines(scale, ts)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {
@@ -1316,6 +1332,10 @@ func TableColumns(table string) []string {
 		return []string{"ts_code", "end_date", "n_cashflow_act", "n_cashflow_inv_act", "n_cashflow_fnc_act"}
 	case "sector_history":
 		return []string{"trade_date", "industry", "limitup_cnt", "change_pct", "member_count", "top_stocks"}
+	case "minute_klines":
+		// §MINUTE-K：列名与日线家族保持同一写法（vol/amount 小写），但**没有** trade_date/复权列——
+		// 分钟行的时间身份就是 ts 本身（北京时间墙钟），复权口径则刻意不入表（见建表注释）。
+		return []string{"ts_code", "scale", "ts", "open", "high", "low", "close", "vol", "amount"}
 	}
 	return nil
 }
@@ -1875,7 +1895,9 @@ type LimitRow struct {
 }
 
 // DebugCount 输出各表行数（dataload verify 用）。
-// （DebugCount logs row counts per table for dataload verify.）
+// 分钟表单独走 MinuteTableStats：只报行数看不出"回填是不是被上游窗口截了"，
+// 必须连同 codes/span/平均每票每日根数一起打（avg 远低于 48 = 截断，见 §MINUTE-K 文件头）。
+// （DebugCount logs row counts per table for dataload verify; minute bars print the full summary.）
 func (d *DB) DebugCount() {
 	for _, t := range []string{"stocks", "trade_cal", "daily", "adj_factor", "daily_basic", "stk_limit", "index_daily", "fina_indicator", "income", "cashflow"} {
 		n, err := d.Count(t, "")
@@ -1884,6 +1906,11 @@ func (d *DB) DebugCount() {
 			continue
 		}
 		log.Printf("[store] %s: %d 行", t, n)
+	}
+	if st, err := d.MinuteTableStats(5); err != nil {
+		log.Printf("[store] minute_klines count err: %v", err)
+	} else {
+		log.Printf("[store] minute_klines(scale=%d): %s", st.Scale, st)
 	}
 }
 

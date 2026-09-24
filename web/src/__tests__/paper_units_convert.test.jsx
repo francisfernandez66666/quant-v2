@@ -6,7 +6,9 @@
 // English: §FIX-1 — the modal speaks lots, the API speaks shares; assert the single ×100 conversion
 // point in confirmTrade (add 3 lots → qty 300; trim 2 → 200; close → 0).
 import { describe, it, expect, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
+// §DET-TIME（2026-09-24）：等 UI 一律用 settle()（排空微任务队列）而不是 waitFor/findBy——这些用例的接口都是 resolved promise 的 mock，用真实时钟轮询在邻居负载下必偶发红（见 settle.js 文件头）。
+import { settle } from './settle.js'
 
 const POS = {
   code: '600000.SH', name: '浦发银行', strategy: 'N形', strategy_type: '',
@@ -44,18 +46,21 @@ import * as api from '../api/index.js'
 async function submitTrade(dir, lots) {
   fireEvent.click(screen.getAllByText(dir === 'add' ? '加仓' : dir === 'trim' ? '减仓' : '清仓')[0])
   if (dir !== 'close') {
-    const input = await screen.findByPlaceholderText('手数（1手=100股）')
+    await settle()
+    const input = screen.getByPlaceholderText('手数（1手=100股）')
     fireEvent.change(input, { target: { value: String(lots) } })
   }
-  fireEvent.click(await screen.findByRole('button', { name: '确定' }))
+  await settle()
+  fireEvent.click(screen.getByRole('button', { name: '确定' }))
 }
 
 describe('§FIX-1 Paper 交易弹窗手→股换算', () => {
   it('加仓 3 手 → buyPaperPosition qty=300（股）', async () => {
     render(<Paper />)
-    await screen.findByText('浦发银行')
+    await settle()
     await submitTrade('add', 3)
-    await waitFor(() => expect(api.buyPaperPosition).toHaveBeenCalledOnce())
+    await settle()
+    expect(api.buyPaperPosition).toHaveBeenCalledOnce()
     const args = api.buyPaperPosition.mock.calls[0]
     expect(args[0]).toBe('600000.SH')
     expect(args[5]).toBe(300) // qty 位=股数，非表单里的 3
@@ -64,13 +69,15 @@ describe('§FIX-1 Paper 交易弹窗手→股换算', () => {
 
   it('减仓 2 手 → sellPaperPosition qty=200；清仓 → qty=0', async () => {
     render(<Paper />)
-    await screen.findByText('浦发银行')
+    await settle()
     await submitTrade('trim', 2)
-    await waitFor(() => expect(api.sellPaperPosition).toHaveBeenCalledOnce())
+    await settle()
+    expect(api.sellPaperPosition).toHaveBeenCalledOnce()
     expect(api.sellPaperPosition.mock.calls[0]).toEqual(['600000.SH', 9.8, 200])
 
     await submitTrade('close', 0)
-    await waitFor(() => expect(api.sellPaperPosition).toHaveBeenCalledTimes(2))
+    await settle()
+    expect(api.sellPaperPosition).toHaveBeenCalledTimes(2)
     expect(api.sellPaperPosition.mock.calls[1]).toEqual(['600000.SH', 9.8, 0])
   })
 })

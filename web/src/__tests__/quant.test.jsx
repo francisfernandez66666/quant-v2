@@ -5,7 +5,9 @@
 // English: §F6 regression — mount Quant and assert the link-status card renders; guards the class of
 // undefined-identifier ReferenceError that the bundler can't catch and that previously had no coverage.
 import { describe, it, expect, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
+// §DET-TIME（2026-09-24）：等 UI 一律用 settle()（排空微任务队列）而不是 waitFor/findBy——这些用例的接口都是 resolved promise 的 mock，用真实时钟轮询在邻居负载下必偶发红（见 settle.js 文件头）。
+import { settle } from './settle.js'
 
 // 整页 API mock：挂载态仅走只读拉取，返回合法字段（不触发任何写操作）。
 vi.mock('../api/index.js', () => ({
@@ -43,9 +45,11 @@ describe('Quant 页挂载（§链路状态卡回归）', () => {
     render(<Quant />)
     // 卡片与各行标签存在
     expect(screen.getByText('链路状态')).toBeInTheDocument()
-    await waitFor(() => expect(screen.getByText('熔断')).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText('熔断')).toBeInTheDocument()
     // state 异步到位后：熔断=正常、下行=连通、执行路径 active=miniQMT兼容
-    await waitFor(() => expect(screen.getByText('正常')).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText('正常')).toBeInTheDocument()
     expect(screen.getByText('连通')).toBeInTheDocument()
     expect(screen.getByText(/当前：miniQMT兼容/)).toBeInTheDocument()
     // 网关地址回显
@@ -59,11 +63,14 @@ describe('Quant 页单笔金额绝对帽字段（§AUDIT-PM）', () => {
   it('渲染标签与服务端值回填，保存 payload 携带该字段', async () => {
     const api = await import('../api/index.js')
     render(<Quant />)
-    expect(await screen.findByText('单笔金额绝对帽(元)')).toBeInTheDocument()
-    const input = await screen.findByDisplayValue('150000')
+    await settle()
+    expect(screen.getByText('单笔金额绝对帽(元)')).toBeInTheDocument()
+    await settle()
+    const input = screen.getByDisplayValue('150000')
     fireEvent.change(input, { target: { value: '200000' } })
     fireEvent.click(screen.getByRole('button', { name: '保存仓位纪律' }))
-    await waitFor(() => expect(api.updateQMTConfig).toHaveBeenCalled())
+    await settle()
+    expect(api.updateQMTConfig).toHaveBeenCalled()
     const payload = api.updateQMTConfig.mock.calls.at(-1)[0]
     expect(payload.max_order_amount).toBe(200000)
   })

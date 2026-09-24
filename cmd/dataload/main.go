@@ -8,6 +8,8 @@
 //	  finance 财务类表（baostock 逐(票,年,季)，默认全市场、慢，建议 --codes 研究池）
 //	  bars <ts_code>  回读单只股票的 hfq 日线做校验
 //	  verify 打印各表行数
+//	  minute-sync  §MINUTE-K 分钟 K 落库（--scale/--count/--codes/--since/--limit/
+//	             --incremental/--max-fail-pct；详见 minute_sync.go 文件头）
 //
 // flags：--db（默认 ~/.quant-trading-v2/trading.db）、--provider（baostock|tushare，默认
 // baostock）、--pyurl（baostock sidecar 地址，默认 http://127.0.0.1:8787）、--token
@@ -47,7 +49,7 @@ func main() {
 	token := flag.String("token", "", "Tushare Pro token（仅 tushare 需要）")
 	start := flag.String("start", "20200101", "起始日期 YYYYMMDD")
 	end := flag.String("end", time.Now().Format("20060102"), "结束日期 YYYYMMDD")
-	codesFile := flag.String("codes", "", "finance 研究池文件（每行一个 ts_code）")
+	codesFile := flag.String("codes", "", "研究池清单文件（每行一个 ts_code）：finance / adjfactor / minute-sync 共用")
 	finStart := flag.Int("fin-start", 2020, "财务起始年份")
 	finEnd := flag.Int("fin-end", time.Now().Year(), "财务结束年份")
 	withDelisted := flag.Bool("with-delisted", false, "§WS-D D-2 拉取已退市/暂停上市股票（list_status=L,D,P），消除回测幸存者偏差")
@@ -156,6 +158,27 @@ func main() {
 	case "ths-backfill":
 		// §ENH-A 盘口三池历史回填（涨停微结构因子面板需要 ≥1 年事件历史）。
 		cmdThsBackfill(db, args[1:])
+	case "minute-sync":
+		// §MINUTE-K 分钟 K 落库：回填（池排名清单，每票一次拉上游"最近 N 根"窗口）或
+		// 收盘后日增（--incremental，清单自维护=库里已有的票）。见 minute_sync.go 文件头。
+		o, err := parseMinuteFlags(args[1:])
+		if err != nil {
+			log.Fatalf("minute-sync 参数错误: %v", err)
+		}
+		// 全局 --codes 写在子命令前时 Go 的 flag 包就在那儿停了，子 flag 收不到——
+		// 不接回来的话这份清单会被**静默忽略**并改按池回填（清单比用户给的更大，正好是
+		// 本仓最忌讳的"降级不吭声"）。这里只把同一个文件接上，不改变用户给的口径。
+		if o.CodesFile == "" && *codesFile != "" {
+			o.CodesFile = *codesFile
+		}
+		dc := data.NewDataCoordinator(data.NewMarketAPI(), data.NewTHSClient())
+		written, err := runMinuteSync(db, dc, o, time.Now())
+		if err != nil {
+			// 失败也先把已写行数打出来：半途失败时"写到哪了"是断点续跑的依据，不能只留一行 Fatal。
+			log.Printf("[minute-sync] 已落库 %d 行后失败", written)
+			log.Fatalf("minute-sync 失败: %v", err)
+		}
+		log.Printf("[minute-sync] 完成，本轮写入 %d 行", written)
 	default:
 		log.Fatalf("未知子命令: %s", cmd)
 	}

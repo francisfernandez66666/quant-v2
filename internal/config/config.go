@@ -908,14 +908,16 @@ func DefaultSchedulerConfig() SchedulerConfig {
 		Nightly: NightlyConfig{
 			StartHHMM:        1530,
 			WeekendStartHHMM: 1530,
-			// 默认夜间研究步骤序列：行情装载 → 板块重建 → 因子挖掘 → 形态挖掘 → 模拟盘研究
+			// 默认夜间研究步骤序列：行情装载 → 分钟 K 日增（§MINUTE-K，收盘后只补库里已有的票，
+			// 分钟表为空时该环自动跳过并如实打印）→ 板块重建 → 因子挖掘 → 形态挖掘 → 模拟盘研究
 			// （读取盘后落库的模拟盘成交/净值生成信号质量报告）→ 生命周期评估（§GAP-P1
 			// 20260915：实盘战法衰退自动降级 + 灰度晋升候选生成）→ 候选列表汇总。
 			// backtest 由 BacktestEnabled 开关控制追加。
-			// English: default nightly steps — dataload → sector rebuild → factor discovery → pattern
-			// discovery → paper research → lifecycle (auto-demote declining strategies + promotion
-			// candidates) → candidate listing. The backtest step is appended by BacktestEnabled.
-			Steps:           []string{"dataload", "sector_rebuild", "discover_factors", "discover_patterns", "paper_research", "lifecycle", "list"},
+			// English: default nightly steps — dataload → minute-bar sync (incremental) → sector rebuild
+			// → factor discovery → pattern discovery → paper research → lifecycle (auto-demote declining
+			// strategies + promotion candidates) → candidate listing. The backtest step is appended by
+			// BacktestEnabled.
+			Steps:           []string{"dataload", "minute_sync", "sector_rebuild", "discover_factors", "discover_patterns", "paper_research", "lifecycle", "list"},
 			AbortOnError:    false,
 			BacktestEnabled: false,
 			BacktestEvents:  0,

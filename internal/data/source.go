@@ -406,11 +406,63 @@ func (dc *DataCoordinator) GetKLine(code, period string, count int) ([]KLine, er
 // scale 为分钟数（1/5/15/30/60），返回按时间升序排列的 KLine。
 // 说明：同花顺（新）hithink 当前未提供通用分时接口（不臆造），保持既有顺序，
 // 东财恒为最后兜底项（绝不成为第一/主源）。
-// English: GetMinuteKLine fetches minute K-lines (intraday). Sina → THS → Tencent → EastMoney
-// (EastMoney always last; hithink has no generic intraday method, so the chain is unchanged).
+// §MINUTE-K 降级必须留名：各条腿的失败原因逐条记账，成功腿随日志回显。理由是**落库窗口由供数腿决定**——
+// 新浪 5 分钟实测给满 5025 根（≈5 个月），腾讯/东财只给最近几日；主源静默失效时
+// 旧实现一声不吭地把窗口从 5 个月缩成 3 天（09-24 回填实跑就是这样，只能靠数行数反推）。
+// §MINUTE-K 最后一腿是**东财前复权**（klineFQT=1，全系统日线口径），与分钟线的未复权口径不同，
+// 只在"看当日分时走势"的实盘路径上可接受（当日 bars 前复权＝不复权）；需要落库/跨日回放的历史
+// 序列请走 GetUnadjustedMinuteKLine。
+// English: minute K-line chain (Sina → THS → Tencent → EastMoney, EastMoney always last).
+// Each leg's outcome is recorded so a fallback that shortens the stored window is visible.
 func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLine, error) {
+	return dc.minuteKLineChain(code, scale, count, true)
+}
+
+// GetUnadjustedMinuteKLine 分钟 K 线**严格不复权**链：新浪 → 同花顺 → 腾讯，三条腿之外宁可失败。
+// §MINUTE-K（2026-09-24 回填实跑锤出）：分钟表 minute_klines 的口径承诺是"不复权、与实盘分钟线同源"，
+// 而链尾的东财腿固定 fqt=1（前复权）。落库窗口跨好几个月，一旦前复权根混进来，除权日之前那段
+// 的历史价格就被整体平移，回放算出的分钟 MACD 会在除权日出现一根假跳水——这正是 §H3 在日K链上
+// 拒收过的"跨口径静默兜底"。所以装载器只准走这条腿，末端不供数就按失败计数（可见、可追）。
+// English: strict unadjusted minute chain (Sina → THS → Tencent); the qfq EastMoney leg is
+// refused outright because writing forward-adjusted bars into the unadjusted table would
+// corrupt cross-day minute MACD at ex-rights dates.
+func (dc *DataCoordinator) GetUnadjustedMinuteKLine(code string, scale, count int) ([]KLine, error) {
+	return dc.minuteKLineChain(code, scale, count, false)
+}
+
+// minuteKLineChain 分钟链实现。allowQFQLeg=false 时砍掉末腿（东财前复权）。
+func (dc *DataCoordinator) minuteKLineChain(rawCode string, scale, count int, allowQFQLeg bool) ([]KLine, error) {
+	// §MINUTE-K 代码形态归一：三条分钟腿（新浪/腾讯的 symbol、同花顺的 URL）都要**裸 6 位代码**，
+	// 而 09-24 装载实跑传的是 ts_code（"600000.SH"）——新浪把 "sh600000.SH" 当代码直接回 null
+	// （0 根、无错误），腾讯回数组壳（解到 map 上报 unmarshal 错），**一条都没真请求到数据**，
+	// 日志里却长得像"源失效所以降级"。归一后 ts_code 形态的入参也能取到数，落库主键仍用原值。
+	code := normalizeCode(rawCode)
+	if code != rawCode {
+		log.Printf("[minute] %s 归一为裸代码 %s 后再请求各分钟腿（上游只认裸代码）", rawCode, code)
+	}
+	var legs []string
+	// legFail 记录一条腿为什么没供数（错误 / 空返回 / 有数但被校验判空）。
+	legFail := func(leg string, n int, err error) {
+		switch {
+		case err != nil:
+			legs = append(legs, leg+"="+err.Error())
+		case n == 0:
+			legs = append(legs, leg+"=空返回")
+		default:
+			legs = append(legs, fmt.Sprintf("%s=%d 根但被拒收", leg, n))
+		}
+	}
+	// legServed 非主源供数时打一条降级日志（主源命中不打，回填 500 只不刷屏）。
+	// 日志一律回显**调用方给的形态**（rawCode），否则装载器按 ts_code 建的清单跟日志对不上号。
+	legServed := func(leg string, n int) {
+		log.Printf("[minute] %s scale=%d 主源未供数（%s），本轮由 %s 供给 %d 根——该源窗口更短，落库覆盖率以 dataload 出门打印为准",
+			rawCode, scale, strings.Join(legs, " | "), leg, n)
+	}
+
 	if klines, err := dc.eastMoney.GetSinaMinuteKLine(code, scale, count); err == nil && len(klines) > 0 {
 		return klines, nil
+	} else {
+		legFail("新浪", len(klines), err)
 	}
 
 	if dc.thsAvailable(thsOpMinute) {
@@ -418,6 +470,7 @@ func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLin
 		// 且写死无效的 06 码，该源从未生效）。不支持 15 分钟等周期时同花顺返回错误，此处降级。
 		thsKL, thsErr := dc.ths.GetTHSMinuteKLine(code, scale)
 		if thsErr == nil && len(thsKL) > 0 {
+			legServed("同花顺", len(thsKL))
 			return thsKL, nil
 		} else if thsErr != nil {
 			// §修复 THS-BREAKER(20260920)：周期不受支持是**客户端能力缺失**，不是供应商故障，
@@ -428,17 +481,33 @@ func (dc *DataCoordinator) GetMinuteKLine(code string, scale, count int) ([]KLin
 			} else {
 				log.Printf("同花顺不支持该分钟周期 (%s, %d 分钟)，跳过该源不熔断", code, scale)
 			}
+			legFail("同花顺", len(thsKL), thsErr)
+		} else {
+			legFail("同花顺", len(thsKL), nil)
 		}
+	} else {
+		legFail("同花顺", 0, errors.New("熔断中"))
 	}
 
 	if klines, err := dc.eastMoney.GetTencentMinuteKLine(code, scale, count); err == nil && len(klines) > 0 {
+		legServed("腾讯", len(klines))
 		return klines, nil
+	} else {
+		legFail("腾讯", len(klines), err)
 	}
 
-	if klines, err := dc.eastMoney.GetKLine(code, strconv.Itoa(scale), count); err == nil && len(klines) > 0 {
-		return klines, nil
+	if !allowQFQLeg {
+		// 严格不复权链在此收口：末腿（东财前复权）不请求，失败原因写进逐腿记账，让装载器把它计成失败。
+		return nil, fmt.Errorf("所有不复权分钟K线源均失败 for %s（逐腿：%s | 东财=前复权腿按口径拒用，见 GetUnadjustedMinuteKLine）",
+			rawCode, strings.Join(legs, " | "))
 	}
-	return nil, fmt.Errorf("所有分钟K线源均失败 for %s", code)
+	if klines, err := dc.eastMoney.GetKLine(code, strconv.Itoa(scale), count); err == nil && len(klines) > 0 {
+		legServed("东财", len(klines))
+		return klines, nil
+	} else {
+		legFail("东财", len(klines), err)
+	}
+	return nil, fmt.Errorf("所有分钟K线源均失败 for %s（逐腿：%s）", rawCode, strings.Join(legs, " | "))
 }
 
 // GetSectors 获取板块列表。同花顺(ths) → 东财。

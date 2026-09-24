@@ -24,13 +24,29 @@ import os
 import sys
 import time
 
-BRIDGE_DIR = r"C:\qmt\quant-trading-v2\qmt_gateway"
-TRACE_PATH = BRIDGE_DIR + "\\bridge_boot.log"
-REPORT_PATH = BRIDGE_DIR + "\\bridge_report.jsonl"
+# FIX 2026-09-24 (stray-file root cause, see task #43): the five bridge files live in ONE
+# directory, but that directory was hard-coded as a Windows path AND joined with a literal
+# backslash. Importing this module on macOS/Linux (unit tests!) then called
+# open("C:\\qmt\\...\\bridge_boot.log", "ab") -- which does not fail, it creates ONE file
+# whose name contains backslashes, in the current working directory. Result: a repo-root
+# junk file reappearing after every pytest run, and the trace silently lost.
+# Now: the directory is overridable via QMT_BRIDGE_DIR (unset on the QMT box -> the exact
+# same path as before, so production behaviour is byte-identical), and every join goes
+# through os.path.join (on Windows that yields the very same string as the old literal).
+BRIDGE_DIR = os.environ.get("QMT_BRIDGE_DIR") or r"C:\qmt\quant-trading-v2\qmt_gateway"
+
+
+def _p(name):
+    """Join one bridge filename onto BRIDGE_DIR (ASCII on purpose -- GBK sandbox)."""
+    return os.path.join(BRIDGE_DIR, name)
+
+
+TRACE_PATH = _p("bridge_boot.log")
+REPORT_PATH = _p("bridge_report.jsonl")
 REPORT_MAX = 5 * 1024 * 1024
-CFG_PATH = BRIDGE_DIR + "\\config.bridge.json"
-CMD_PATH = BRIDGE_DIR + "\\bridge_cmd.json"
-SEEN_PATH = BRIDGE_DIR + "\\bridge_seen.jsonl"
+CFG_PATH = _p("config.bridge.json")
+CMD_PATH = _p("bridge_cmd.json")
+SEEN_PATH = _p("bridge_seen.jsonl")
 HEARTBEAT_SEC = 5
 CMD_POLL_SEC = 2
 
@@ -44,9 +60,33 @@ def _now_cn_str(fmt="%Y-%m-%dT%H:%M:%S+08:00"):
     return time.strftime(fmt, time.gmtime(time.time() + 8 * 3600))
 
 
+def _dir_ready(path):
+    """True when path's parent really is a directory on this OS (ASCII -- GBK sandbox).
+
+    Why this exists: BRIDGE_DIR defaults to a Windows path. On a POSIX host (unit tests,
+    tooling, a dev laptop) open("C:\\...\\bridge_boot.log", "ab") does NOT fail -- it
+    succeeds and creates ONE file whose name contains backslashes in the current working
+    directory. That is how the repo root kept growing a junk file after every pytest run
+    (task #43), with the trace/report lost where nobody reads it. Refusing to write is
+    strictly better; on the QMT box the directory exists, so production writes are unchanged.
+
+    Note the backslash test is not redundant with the isdir test: on POSIX a Windows path
+    never gets split at all, so os.path.dirname("C:\\a\\b.log") == "" and os.path.basename
+    returns the WHOLE string -- the CWD "exists", yet writing it would be exactly the bug.
+    On Windows ntpath splits on both separators, so basename is a bare file name there.
+    """
+    base = os.path.basename(path)
+    if "\\" in base or "/" in base:
+        return False
+    d = os.path.dirname(path)
+    return (not d) or os.path.isdir(d)
+
+
 def _trace(msg):
     try:
         line = _now_cn_str("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n"
+        if not _dir_ready(TRACE_PATH):
+            return
         # FIX 2026-09-14: sandbox default text encoding is GBK; the gateway sidecar
         # reads this file back as UTF-8. Always write explicit UTF-8 bytes.
         f = open(TRACE_PATH, "ab")
@@ -61,6 +101,8 @@ def _report(payload):
     import json
     import time as t
     try:
+        if not _dir_ready(REPORT_PATH):
+            raise IOError("bridge dir not a directory on this host: " + repr(REPORT_PATH))
         try:
             sz = os.path.getsize(REPORT_PATH)
         except Exception:
@@ -1062,6 +1104,8 @@ def _record_seen(seq):
     # Now failure returns False and the caller refuses the order (prefer a stuck
     # inflight row for ops over a duplicated real order).
     try:
+        if not _dir_ready(SEEN_PATH):
+            raise IOError("bridge dir not a directory on this host: " + repr(SEEN_PATH))
         f = open(SEEN_PATH, "a")
         f.write(str(seq) + "\n")
         f.close()

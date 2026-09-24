@@ -4,7 +4,9 @@
 // 无法判定 → 采用但未验证），而旧实现在任何 200 下都弹"已保存并热生效"——这正是用户
 // "改了没生效、改不了"体感的直接来源。本文件钉住三种结果在界面上的呈现。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
+// §DET-TIME（2026-09-24）：等 UI 一律用 settle()（排空微任务队列）而不是 waitFor/findBy——这些用例的接口都是 resolved promise 的 mock，用真实时钟轮询在邻居负载下必偶发红（见 settle.js 文件头）。
+import { settle } from './settle.js'
 // §A5：Settings 页接入 useNavigate（首拉 403 跳 /403），渲染需 Router 上下文
 import { MemoryRouter } from 'react-router-dom'
 
@@ -61,8 +63,8 @@ function llmCard() {
 // renderSettings 渲染设置页并等 LLM 表单被回填完成（否则提交的是空表单）。
 async function renderSettings() {
   render(<MemoryRouter><Settings /></MemoryRouter>)
-  await screen.findByText('LLM 配置')
-  await waitFor(() => expect(screen.getByDisplayValue(/api\.siliconflow\.cn/)).toBeInTheDocument())
+  await settle()
+  expect(screen.getByDisplayValue(/api\.siliconflow\.cn/)).toBeInTheDocument()
   return llmCard()
 }
 
@@ -85,7 +87,8 @@ describe('LLM 配置热更新：UI 回报', () => {
       result: { applied: true, persisted: true, verified: true, effective_keys: 1, probes: [{ index: 0, kind: 'ok', status: 200, latency_ms: 120 }] },
     })
     await clickSave()
-    expect(await screen.findByText(/已生效且验证通过/)).toBeInTheDocument()
+    await settle()
+    expect(screen.getByText(/已生效且验证通过/)).toBeInTheDocument()
     // 默认必须走"探测未通过则拒绝"的保护：force 只由用户显式勾选
     expect(setLLMConfig).toHaveBeenCalledWith(expect.objectContaining({ force: false }))
   })
@@ -94,7 +97,8 @@ describe('LLM 配置热更新：UI 回报', () => {
     setLLMConfig.mockRejectedValueOnce(new Error('配置未生效：新配置探测未通过，已保留当前可用配置。\n· key#1 密钥无效/无权限（HTTP 401）：Invalid token'))
     await clickSave()
     // 结论行（`未生效（` 只在结论行出现；后端原文里是"配置未生效："，用更紧的匹配避免歧义）
-    expect(await screen.findByText(/未生效（探测未通过，已保留当前可用配置）/)).toBeInTheDocument()
+    await settle()
+    expect(screen.getByText(/未生效（探测未通过，已保留当前可用配置）/)).toBeInTheDocument()
     // 后端给出的逐把结论必须原样可见：用户要拿着它去判断是哪把 key 的问题
     expect(screen.getByText(/key#1 密钥无效\/无权限（HTTP 401）：Invalid token/)).toBeInTheDocument()
     // 关键：不得再谎报成功
@@ -115,7 +119,8 @@ describe('LLM 配置热更新：UI 回报', () => {
       },
     })
     await clickSave()
-    expect(await screen.findByText(/已生效，但有保留意见/)).toBeInTheDocument()
+    await settle()
+    expect(screen.getByText(/已生效，但有保留意见/)).toBeInTheDocument()
     expect(screen.getByText(/已剔除 1 把未通过探测的密钥/)).toBeInTheDocument()
     // 逐把结论必须可见：用户要按"第几把"去改输入框的对应行
     expect(screen.getByText(/第 1 把：密钥无效\/无权限/)).toBeInTheDocument()
@@ -129,7 +134,8 @@ describe('LLM 配置热更新：UI 回报', () => {
     })
     const card = await renderSettings()
     fireEvent.click(within(card).getByRole('button', { name: '测试连接' }))
-    expect(await screen.findByText(/未通过：当前填写的配置无法确认可用/)).toBeInTheDocument()
+    await settle()
+    expect(screen.getByText(/未通过：当前填写的配置无法确认可用/)).toBeInTheDocument()
     expect(probeLLMConfig).toHaveBeenCalled()
   })
 
@@ -140,10 +146,12 @@ describe('LLM 配置热更新：UI 回报', () => {
     })
     const card = await renderSettings()
     fireEvent.click(within(card).getByRole('button', { name: '回滚到上一个可用配置' }))
-    expect(await screen.findByText(/已回滚到上一个可用配置/)).toBeInTheDocument()
+    await settle()
+    expect(screen.getByText(/已回滚到上一个可用配置/)).toBeInTheDocument()
     expect(rollbackLLMConfig).toHaveBeenCalled()
     // 回读后表单地址应变成回滚目标（fetchLLMConfig 的桩返回原值，故这里断言调用发生过，
     // 真实回读一致性由后端用例 TestHotUpdateRollbackRestoresLastVerified 钉住）
-    await waitFor(() => expect(screen.getByText(/已回滚到上一个可用配置/)).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText(/已回滚到上一个可用配置/)).toBeInTheDocument()
   })
 })

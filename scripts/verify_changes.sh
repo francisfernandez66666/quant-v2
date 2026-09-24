@@ -33,6 +33,19 @@
 #       `set -euo pipefail` 下整条赋值失败 ⇒ 无 FAIL 无 ok 直接中止）：
 #       §GATE-COUNT-LOCK 门禁自查——凡 `v=$(... grep ...)` 必须写 `|| true`（判红交给后面的等值判断），
 #       加固面设下限，且两头钉住 `set -euo pipefail` 本身（见 89）
+#     + 09-24 批（任务 #43 根因半：仓库根反复长出 Windows 路径形态的怪文件，09-23/09-24 各清一次又回来）：
+#       §BRIDGE-PATH 桥目录改由 QMT_BRIDGE_DIR 覆盖、**未设置时默认值逐字不变**（seen 判重账本一搬家
+#       ＝重启可重放同一笔委托），五个常量统一 os.path.join，POSIX 写前 _dir_ready 拒写
+#       （trace 可丢，report/seen 抛错走既有 False 分支 fail-closed），测试会话 conftest 指临时目录（见 90）
+#     + 09-24 批（owner 裁决「分钟 K 落库升级：建表 + 回填 + 动量回放换真 5 分钟」）：
+#       §MINUTE-K minute_klines 建表三定（不复权 / ts 北京墙钟前缀切片 / 主键幂等）+
+#       装载器诚实出门（0 行判失败、失败率闸、平均根数读数；上游只有"最近 N 根"无分页，
+#       所以"回填三年"在数据源层面不成立——不编）+ 回放侧动量优先真分钟 MACD
+#       （根数不足即报不可用，闸门唯一，半日数据不许冒充升级；覆盖率随出门文本回显）+
+#       夜间日增环 minute_sync 紧跟 dataload、分钟表从未回填过时如实跳过并留痕（见 91）
+#   §MINUTE-K-CHAIN 分钟链两修（09-24 首次真跑锤出）：链入口把 ts_code 归一成上游认得的裸 6 位
+#       代码（旧行为＝新浪空返回＋腾讯解析错，看着像"三源全坏"其实一条没取到），装载器改绑新增的
+#       严格不复权链（末腿东财 fqt=1 前复权按口径拒用，防除权日假分钟 MACD 跳水）（见 92）
 # ...
 # §全链路 UAT 修复批（2026-09-18 §UAT_FULLCHAIN_VERIFY）专项（见 11/11）：
 #   费用腿       ：成交回报 fee/stamp_tax 五路径透传（xt 回调/桥行/网关装配/mock/Go 落库），
@@ -2477,11 +2490,16 @@ grep -q 'criteria rewritten to live semantics' internal/btreplay/replay.go \
 	|| { echo "--- FAIL: 动量近似说明不再声明「判据已按实盘语义重写」（数字失去口径出处）"; exit 1; }
 echo "ok - §MOMENTUM-LIVE-REPLAY 守卫通过（行为锁 3 套件 + 能力声明锁 2 + 判据锁 1 + 两处同门锁 3 + 口径警告锁 1 + 入场定档锁 2 + 引擎参数锁 2 + 机制保留锁 3 + 旧文本负锁 1）"
 
-echo "==> 88 §SIGNAL-DIST 部署面信号分布探针：判红只认解析/形状错 + 当日聚合四读数 + INFO 不进判数（2026-09-24）..."
+echo "==> 88 §SIGNAL-DIST 部署面信号分布探针：判红只认解析/形状错 + 当日买卖两档十读数 + 桶完整性跨语言锁 + INFO 不进判数（2026-09-24 扩桶批）..."
 # 为什么要给一条**部署面**探针单独设锁：09-23「白天只龙头出信号」是 owner 用肉眼在前端看出来的，
 # 现网 24 条探针一条都没红——缺陷在观测面上是隐形的，修没修好同样没人知道。这条探针就是那双眼睛；
 # 而"眼睛"本身没有守卫，就会在下一次改动里被悄悄换成一只只看不到东西的眼睛（判据被挪去判合法态、
 # 明细被合并回全桶、INFO 混进 PASS/FAIL 计数），且**不会有任何测试变红**。故按取值链逐条钉住。
+# 同日扩桶批（owner 令「other:9 要么扩桶、要么把原始类型原样列出来，必须和现有桶名守卫同批改」）
+# 把本段锤实了一件事：**桶名守卫守不住桶的正确性**。旧 SgKey 用 `'dragon|龙头'` 子串规则，
+# 于是「龙头断板」（做空战法 leader_decay 的展示名）被静默并进 dragon——09-24 现网 dragon:14 虚高、
+# 买入侧覆盖窄这个真问题被卖出信号的数量盖住。新增的 ⑦-b/⑦-c/⑩/⑪ 四条锁因此守的是
+# "并桶这条通道不存在"＋"Go 里有、桶里没有必红"，而不是"当前这一对的顺序恰好对"。
 VD=scripts/verify_deploy_guangzhou.sh
 # ① 探针本体与判据同源：红 == 「读不出可信内容」，不是「今天没信号」。
 grep -qF 'Probe "engine:today pinned signals spread across strategies" ($sgBad.Count -eq 0)' "$VD" \
@@ -2496,29 +2514,96 @@ grep -qF 'day=none n=0 empty' "$VD" \
 	|| { echo "--- FAIL: 空 signals 数组的合法态明细丢失（绿但读不出内容＝跟没修一样）"; exit 1; }
 grep -qF 'shape-error(no-signals-array' "$VD" \
 	|| { echo "--- FAIL: 结构缺 signals 数组的判红分支丢失"; exit 1; }
-# ④ 当日聚合四读数：owner 问的"今天有几类战法出了信号"只能由这四个回答，缺一个就退回肉眼盯。
-for k in today_signals today_strategies leader_only today_files; do
+# ④ 当日聚合读数：owner 问的"今天有几类战法出了信号、在买还是在卖、没进桶的是谁"只能由这几个回答，
+#    缺一个就退回肉眼盯。扩桶批（09-24 下午）把 kinds 拆成买/卖两档并补 unmatched/side_unknown。
+for k in today_signals today_strategies leader_only today_files buy_types sell_types kinds_buy kinds_sell unmatched side_unknown; do
 	grep -q "$k=" "$VD" || { echo "--- FAIL: §SIGNAL-DIST 缺聚合读数 ${k}（明细必须直接回答「今天」，不是「所有桶加起来」）"; exit 1; }
 done
-# ⑤ 只龙头判据三条件缺一不可：当日有信号 + 战法种类==1 + 那一类确实是 dragon
-#    （少第一条会在零信号日谎报 leader_only=true，少第三条会把"只出 fac_1"当成只出龙头）。
-grep -qE '\$sgTodayN -gt 0 -and \$sgTypes\.Count -eq 1 -and \$sgTypes\[0\] -eq .dragon.' "$VD" \
-	|| { echo '--- FAIL: leader_only 判据被改写（须同时满足 当日 n>0 / 种类==1 / 该类==dragon）'; exit 1; }
+# ⑤ 只龙头判据三条件缺一不可：当日有信号 + **买入侧**种类==1 + 那一类确实是 dragon
+#    （少第一条会在零信号日谎报 leader_only=true，少第三条会把"只出 fac_1"当成只出龙头；
+#     09-24 扩桶后判据域收窄到买入档——卖出/做空桶出得再多也不该把 leader_only 打成 false，
+#     否则这条眼睛又看不见它本来要看的东西了。）
+grep -qE '\$sgTodayN -gt 0 -and \$sgBuyTypes\.Count -eq 1 -and \$sgBuyTypes\[0\] -eq .dragon.' "$VD" \
+	|| { echo '--- FAIL: leader_only 判据被改写（须同时满足 当日 n>0 / 买入侧种类==1 / 该类==dragon）'; exit 1; }
 # ⑥ 按文件分行而不是合并计数：DataDir 下 Recurse 会收到根目录 + 每账号各一份（09-24 首跑实测 4 份），
 #    合并＝把昨日残留和别人的账号混进同一个数字。取数路径出现第二处即口径分叉。
 sgf=$(grep -c "Filter 'signals_today.json'" "$VD" || true)
 [ "$sgf" = "1" ] || { echo "--- FAIL: 固化信号取数路径不是唯一一处（计数=${sgf}，出现第二处就有第二套口径）"; exit 1; }
 # ⑦ 战法桶名必须 ASCII：本仓实录过 PS→SSH→bash 回传时中文 detail 被 GBK 字节打乱 ⇒ grep 判据恒不命中
-#    （＝把假绿写进探针）。中文只允许出现在 -match 的匹配侧，不允许出现在 return 的取值侧。
+#    （＝把假绿写进探针）。中文只允许出现在匹配侧（switch 的 case / -match 的右侧），
+#    不允许出现在 return 的取值侧——扩桶批新增的中文别名表因此也全部映射到 ASCII 桶名。
 #    `|| true` 不能省：grep -c 在**零命中**（正是本锁要 passes 的那个值）时退出码为 1，本脚本开着
 #    `set -euo pipefail`，命令替换的非 0 会让整条赋值语句失败 ⇒ 整轮 verify 无 FAIL 无 ok 直接中止
 #    （09-24 实跑锤出：§88 只打印了标题就 VERIFY_EXIT=1，后面所有段都没跑）。判红仍交给下面那句等值判断。
 badKey=$(LC_ALL=C awk '/^function SgKey/,/^}$/' "$VD" | grep -o 'return "[^"]*"' | LC_ALL=C grep -c '[^ -~]' || true)
 [ "$badKey" = "0" ] || { echo "--- FAIL: SgKey 的 return 值含非 ASCII 桶名（计数=${badKey}，中文桶名会让判据恒不命中）"; exit 1; }
 ordR=$(grep -n 'return "dragon_return"' "$VD" | head -1 | cut -d: -f1 || true)
-ordD=$(grep -n 'return "dragon" }' "$VD" | head -1 | cut -d: -f1 || true)
-{ [ -n "$ordR" ] && [ -n "$ordD" ] && [ "$ordR" -lt "$ordD" ]; } \
-	|| { echo '--- FAIL: dragon_return 不再排在 dragon 之前（子串包含关系，顺序反了龙回头会被并进龙头）'; exit 1; }
+[ -n "$ordR" ] || { echo '--- FAIL: dragon_return 桶从 SgKey 里消失了（Go 侧还在产这个类型，探针会把它算进 other）'; exit 1; }
+# ⑦-b 子串匹配负锁（09-24 扩桶批的根因锁）：SgKey 里只准有 `^fac_` / `^pat_` 这种**行首锚定**的前缀判断，
+#     出现任何非锚定 -match 就是回到旧写法——`'dragon|龙头'` 当年把 leader_decay（展示名「龙头断板」）
+#     静默吞进 dragon 桶，现网读数 dragon:14 因此虚高、owner 要的答案被一个子串规则吃掉。
+#     顺序型守卫（"A 必须写在 B 之前"）在这里救不了：补一条 if 只是把下一次撞名推迟，
+#     所以钉的是"这条通道整体不存在"，而不是"当前这一对的顺序恰好对"。
+sk=$(awk '/^function SgKey/,/^}$/' "$VD" | grep -- '-match' | grep -vE -- "-match '\\^(fac|pat)_" || true)
+if [ -n "$sk" ]; then
+	echo '--- FAIL: SgKey 里出现非锚定的 -match（子串匹配＝下一次战法改名时静默并桶；改成精确等值查表，匹不上就记 other 并回显原始值）'
+	printf '%s\n' "$sk"
+	exit 1
+fi
+# ⑦-c 桶完整性锁（跨语言）：internal/strategy/types.go 的 SignalType 常量表是战法类型的**唯一真源**，
+#     每一个 ASCII 取值都必须在 SgKey 里有对应的 return 桶。新增战法时这里必红，
+#     于是"忘了同步部署探针"从"现网静默落进 other、三个月后才发现"变成"门禁当场点名"。
+got=$(grep -oE 'SignalType = "[a-z_]+"' internal/strategy/types.go | sed -E 's/.*"([a-z_]+)".*/\1/' | sort -u || true)
+ggn=$(printf '%s\n' "$got" | grep -c '[a-z]' || true)
+[ "${ggn:-0}" -ge 12 ] \
+	|| { echo "--- FAIL: 从 internal/strategy/types.go 只读到 ${ggn} 个 SignalType 常量（少于 12 说明常量表形态变了，本锁的取法要跟着改，不能当'全都覆盖了'）"; exit 1; }
+sgmiss=""
+for ty in $got; do
+	grep -qF "return \"$ty\"" "$VD" || sgmiss="$sgmiss $ty"
+done
+[ -z "$sgmiss" ] \
+	|| { echo "--- FAIL: 这些战法类型在 Go 侧存在、在部署探针 SgKey 里没有桶（会被静默算进 other，现网读数答不出是谁）：$sgmiss"; exit 1; }
+# ⑦-d 中文别名映射锁（比 ⑦-c 更狠的一层，专门钉 09-24 那次实际的错法）：
+#     「桶存在」挡不住「桶存在但映射错」——leader_decay 的桶当年就在，是它的展示名「龙头断板」被
+#     `'dragon|龙头'` 抢走了。故这里从 Go 侧机械取出 (ASCII 类型 → 规范中文展示名) 的配对表
+#     （internal/strategy/types.go 常量值 × internal/combat_agent/types.go StrategyDisplayName），
+#     要求 SgKey 里对每一对都存在「'中文名' → return "ASCII"」这一条精确映射；
+#     有人把某个中文名挂到别的桶上（或新增战法只挂 ASCII 不挂别名）即红。
+CNMAP=$(perl -0777 -CSD -ne '
+	if ($ARGV =~ m{internal/strategy/types\.go$}) { while (/Signal([A-Za-z0-9_]+)\s+SignalType\s*=\s*"([a-z_]+)"/g) { $v{$1} = $2 } }
+	else { while (/case\s+strategy\.Signal([A-Za-z0-9_]+):\s*\n\s*return\s*"([^"]+)"/g) { print "$v{$1}\t$2\n" if $v{$1} } }
+' internal/strategy/types.go internal/combat_agent/types.go)
+cnn=$(printf '%s\n' "$CNMAP" | grep -c $'\t' || true)
+[ "${cnn:-0}" -ge 9 ] \
+	|| { echo "--- FAIL: 只从 Go 侧读到 ${cnn} 对 (战法类型→中文展示名)（少于 9 说明取值写法变了，本锁会漏覆盖，必须跟着改而不是当通过）"; exit 1; }
+cnmiss=""
+while IFS=$'\t' read -r ty cn; do
+	[ -n "$ty" ] && [ -n "$cn" ] || continue
+	grep -qE "'${cn}'[[:space:]]*\{[[:space:]]*return \"${ty}\"[[:space:]]*\}" "$VD" || cnmiss="$cnmiss ${cn}->${ty}"
+done <<< "$CNMAP"
+[ -z "$cnmiss" ] \
+	|| { echo "--- FAIL: 这些中文展示名在 SgKey 里没有映射到它在 Go 侧对应的桶（挂错桶＝静默并类，09-24 的 dragon:14 虚高就是这个形状）：$cnmiss"; exit 1; }
+# ⑩ 买/卖档口径锁：分档轴必须是 direction 的**等值**判断（固化存储 Upsert 只收 做多/做空，见
+#     internal/engine/signal_store.go），且必须有显式兜底档 side_unknown——上游出现第三种方向词时
+#     要在明细里数得出来，不能静默并进 buy 或 sell。
+grep -qE '\$sgTodaySideUnknown = \$sgTodaySideUnknown \+ 1' "$VD" \
+	|| { echo '--- FAIL: 买卖档丢了 side_unknown 兜底计数（第三种方向词会被静默漏计，两档读数看着正常其实失真）'; exit 1; }
+grep -qF "switch -Exact (([string]\$o.direction).Trim())" "$VD" \
+	|| { echo '--- FAIL: SgSide 不再按 direction 等值分档（换成 action 就完蛋：它在不同战法里有 buy/sell/卖出/减仓/关注 五套写法）'; exit 1; }
+if awk '/^function SgSide/,/^}$/' "$VD" | grep -qE '\.action'; then
+	echo '--- FAIL: SgSide 里出现 .action（分档轴被换成动作词＝把五套历史写法当成两套，买卖档必然错分）'; exit 1; fi
+# ⑪ 未归类原始值必须消毒后才进明细（中文原始值会让判据恒不命中，同 ⑦ 的理由），
+#     且 unmatched 只在当日文件上统计（跨日残留会把"今天谁没进桶"淹掉）。
+grep -qF -- "-replace '[^ -~/]', ''" "$VD" \
+	|| { echo '--- FAIL: SgRaw 不再剔除非 ASCII 字符（原始战法名直接进 detail＝GBK 打乱判据，探针自己变假绿）'; exit 1; }
+grep -qF "if (\$k -eq 'other' -or \$k -eq 'unknown') { SgInc \$sgRawUnmatched (SgRaw \$sg) }" "$VD" \
+	|| { echo '--- FAIL: 未归类原始值的回显口径被改写（要么不再列原始值，要么把跨日残留也算进来）'; exit 1; }
+# ⑫ 计数与格式化各只有一份实现：本探针维护 5 张计数表（全桶/当日桶/买入桶/卖出桶/未归类原始值），
+#     内联写五遍必错一处，故抽成 SgInc/SgTop；出现第二处实现就是第二套口径（同 ⑥ 的取数路径唯一理由）。
+for fn in SgInc SgTop; do
+	fnc=$(grep -c "^function ${fn}(" "$VD" || true)
+	[ "$fnc" = "1" ] || { echo "--- FAIL: function ${fn} 的定义不是唯一一处（计数=${fnc}，两套计数/格式化实现迟早分叉）"; exit 1; }
+done
 # ⑧ INFO 是观测通道不是判据通道：bash 侧只 echo、不进 PASS/FAIL 计数（判数仍是 25 条）。
 #    一旦有人把 INFO 接成 PASS，绿的数量就会凭空增长，而红绿语义没变——这是最隐蔽的一种假绿。
 grep -qF 'INFO\|*) echo' "$VD" \
@@ -2529,7 +2614,7 @@ infop=$(grep -c 'Write-Output ("INFO|' "$VD" || true)
 #    全局负锁在 §67，这里钉的是"这条腿自己的取值方式"，防止有人日后为省事把它换回去）。
 grep -qF '([string]$sgJson.trading_day)' "$VD" \
 	|| { echo '--- FAIL: trading_day 不再用 [string] 直转（退回 | Out-String 即重新引入折行失明）'; exit 1; }
-echo "ok - §SIGNAL-DIST 守卫通过（探针判据锁 1 + 判红来源等值锁 1 + 来源白名单负锁 1 + 合法态明细锁 2 + 聚合读数锁 4 + leader_only 三条件锁 1 + 取数路径唯一锁 1 + 桶名 ASCII 负锁 1 + 桶序锁 1 + INFO 通道锁 2 + Out-String 负锁 1）"
+echo "ok - §SIGNAL-DIST 守卫通过（探针判据锁 1 + 判红来源等值锁 1 + 来源白名单负锁 1 + 合法态明细锁 2 + 聚合读数锁 10 + leader_only 三条件锁 1 + 取数路径唯一锁 1 + 桶名 ASCII 负锁 1 + 桶存在锁 1 + 子串匹配负锁 1 + 跨语言桶完整性锁 2 + 买卖档口径锁 3 + 原始值消毒锁 2 + 计数实现唯一锁 2 + INFO 通道锁 2 + Out-String 负锁 1）"
 
 echo "==> 89 §GATE-COUNT-LOCK 门禁自身的地雷：计数锁零命中会把整轮 verify 静默跑死（2026-09-24，§88 自曝同类）..."
 # 为什么给门禁脚本自己设锁：本段是 09-24 用一轮真红换来的——`var=$(... | grep -c 'pat')` 在**零命中**
@@ -2569,6 +2654,208 @@ grep -q '^set -euo pipefail$' "$GS" \
 if grep -nE '^set \+e|^set -u$|^set \+o pipefail' "$GS" > /dev/null; then
 	echo '--- FAIL: 门禁脚本里出现放宽 set 的写法（不得用「关掉失败即中止」来绕开计数锁的加固）'; exit 1; fi
 echo "ok - §GATE-COUNT-LOCK 守卫通过（未加固计数赋值负锁 1 + 加固面下限锁 1（当前 ${HARD}/${TOTAL}） + set 前提锁 1 + set 放宽负锁 1）"
+
+echo "==> 90 §BRIDGE-PATH 桥目录跨平台落点：Windows 默认逐字保留 + POSIX 拒写（不长反斜杠垃圾文件）（2026-09-24，任务 #43 根因）..."
+# 这段锁的是"每跑一次 Python 测试，仓库根就长出一个名字里带反斜杠的文件"这个反复回潮的形态
+# （09-23、09-24 各手工清理过一次又回来）。缺陷本体不值一段锁——值钱的是它牵住的**资金通道**：
+# BRIDGE_DIR 里的 bridge_report.jsonl（桥→网关成交/心跳）、bridge_cmd.json（网关→桥指令）、
+# bridge_seen.jsonl（重启判重账本）是真实传输，不是日志。于是两头都必须钉住：
+#   ① 生产侧：目录默认值要和改前**逐字相同**，且换目录只能靠显式设 QMT_BRIDGE_DIR。
+#      一旦有人为了"本机测试方便"把默认值改成相对路径/POSIX 路径，seen 文件跟着搬家
+#      ＝桥重启后可以把同一笔委托再执行一遍（drill-3 重放形态的资金事故）。
+#   ② 本机侧：POSIX 上 `open("C:\\...\\bridge_boot.log","ab")` **不会失败**，它在当前工作目录
+#      创建一个带反斜杠的文件——trace 丢在没人看的地方＝诊断失明，工作树被测试产物污染。
+#      正确形态是写盘前判路径在本机构不成"目录/文件"两段就**拒写**：trace 属可丢的诊断，
+#      report/seen 走既有 False 分支让调用方拒单（fail-closed，宁停一单不重放一笔）。
+# 读法顺序有意为之：先静态写法 → 再看仓库根**此刻**的现场（最直接的证据，不必等 pytest） →
+# 最后真跑一遍路径用例（防"跑完这一轮自己又长出来"）。
+BS=qmt_gateway/qmt_bridge_strategy.py
+# ① 取值链两半：env 覆盖 + 未覆盖时的 Windows 绝对目录，用 -qF 做整串等值（改任一半即红）。
+grep -qF 'BRIDGE_DIR = os.environ.get("QMT_BRIDGE_DIR") or r' "$BS" \
+	|| { echo '--- FAIL: §BRIDGE-PATH 桥目录不再读 QMT_BRIDGE_DIR（测试会话只能靠它指到临时目录）'; exit 1; }
+grep -qF 'or r"C:\qmt\quant-trading-v2\qmt_gateway"' "$BS" \
+	|| { echo '--- FAIL: §BRIDGE-PATH 桥目录默认值被改（广州那台机器没有这个环境变量，靠默认值接线上桥；改默认值＝seen 判重账本搬家）'; exit 1; }
+# ② 五个桥文件常量一律经 _p()（os.path.join）：数量必须正好 5。少一个就是那一处退回字面反斜杠相加，
+#    而"哪一处"正是要命的地方——report/seen 少一处就是资金通道被写到 CWD。
+PC=$(grep -c '= _p(' "$BS" || true)
+[ "$PC" = "5" ] \
+	|| { echo "--- FAIL: 走 _p() 拼路径的桥文件常量不是 5 个（读到 ${PC}；TRACE/REPORT/CFG/CMD/SEEN 必须同源一个目录）"; exit 1; }
+# ③ 负锁：字面反斜杠拼接不得复活（同 §SIGID-TRUNC 的"单一截断点"写法锁口径；注释里的说明文本不算）。
+if grep -n 'BRIDGE_DIR +' "$BS" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+	echo '--- FAIL: 桥路径又出现 BRIDGE_DIR + 字符串相加（POSIX 上反斜杠不是分隔符，会在 CWD 造出带反斜杠的文件）'; exit 1
+fi
+# ④ _dir_ready 的三态实现：分隔符判定必须在。只查 isdir 会漏掉中间那一态——
+#    POSIX 上 os.path.dirname("C:\\a\\b.log") == ""、basename 返回整串，CWD "存在" 却正是 bug 本体
+#    （首版实现就只查了 dirname/isdir，实测仓库根照长文件）。
+grep -qF 'if "\\" in base or "/" in base:' "$BS" \
+	|| { echo '--- FAIL: _dir_ready 丢了分隔符判定（只查 isdir 时，Windows 路径落在 POSIX 上被判成"可写"）'; exit 1; }
+# ⑤ 三个写点各按自己的后果分级：trace 早退丢弃，report/seen 抛错→既有的 False 分支（fail-closed）。
+TC=$(grep -c 'if not _dir_ready(TRACE_PATH):' "$BS" || true)
+[ "$TC" = "1" ] || { echo "--- FAIL: _trace 的拒写早退不唯一（读到 ${TC}，路径不可用时诊断会写进 CWD）"; exit 1; }
+IC=$(grep -c 'raise IOError("bridge dir not a directory on this host: "' "$BS" || true)
+[ "$IC" = "2" ] \
+	|| { echo "--- FAIL: report/seen 的拒写不再是抛错（读到 ${IC}，期望 2）——资金通道写不下去必须返回 False 让调用方拒单，绝不能静默成功"; exit 1; }
+# ⑥ 现场锁：仓库根此刻不得存在"名字里带反斜杠或盘符"的文件（本批要收口的现象本身）。
+#    静态锁只防回潮，这条防"某个新测试模块绕过 conftest 直接 import 桥策略"。
+JF=$(find . -maxdepth 1 -type f \( -name '*\\*' -o -name '*:*' \) | head -5 || true)
+[ -z "$JF" ] \
+	|| { echo '--- FAIL: 仓库根有 Windows 形态的怪文件（桥 trace/report 被写进了 CWD，先查是哪个测试模块绕过 conftest 导入了 qmt_bridge_strategy）：'; printf '%s\n' "$JF"; exit 1; }
+# ⑦ 测试会话前置：conftest 必须在任何 test 模块 import 桥策略之前把目录指走
+#    （模块顶层就重算五个常量，晚设 env 来不及），且会话结束回收临时目录——测试产物不落仓库工作树。
+[ -f qmt_gateway/tests/conftest.py ] \
+	|| { echo '--- FAIL: qmt_gateway/tests/conftest.py 缺失（pytest 没有会话前置，导入桥策略即污染工作树）'; exit 1; }
+grep -qF 'os.environ["QMT_BRIDGE_DIR"] = _TMP' qmt_gateway/tests/conftest.py \
+	|| { echo '--- FAIL: conftest 不再设置 QMT_BRIDGE_DIR'; exit 1; }
+grep -qF 'def pytest_unconfigure' qmt_gateway/tests/conftest.py \
+	|| { echo '--- FAIL: conftest 丢了会话结束回收（临时桥目录留在磁盘上）'; exit 1; }
+# ⑧ 运行时实证（比上面所有静态锁都硬）：路径用例自己在临时 CWD 里试过——被拒的三次写一个文件
+#    都不长、被拒的 seq 不进判重集合、env 未设时默认值逐字等于改前、仓库根导入后依旧干净。
+BP=$(py_tests qmt_gateway/tests/test_bridge_paths.py 2>&1 | tail -6 || true)
+printf '%s\n' "$BP"
+if printf '%s' "$BP" | grep -qE 'FAILED|ERROR|failed|error'; then
+	echo '--- FAIL: §BRIDGE-PATH 路径用例跑红（见上面输出）'; exit 1
+fi
+printf '%s' "$BP" | grep -qE 'passed|^OK|Ran [0-9]+ tests' \
+	|| { echo '--- FAIL: §BRIDGE-PATH 路径用例没跑到（输出里没有 passed/OK——文件被移走或改名？）'; exit 1; }
+echo "ok - §BRIDGE-PATH 守卫通过（取值链两半锁 2 + 拼接唯一锁 1 + 字面反斜杠负锁 1 + _dir_ready 分隔符锁 1 + 三写点分级锁 2 + 仓库根现场锁 1 + conftest 前置锁 3 + 运行时用例实证 2）"
+
+echo "==> 91 §MINUTE-K 分钟 K 落库升级：建表口径 + 装载诚实出门 + 动量换真 5 分钟 MACD + 夜间日增环门控（2026-09-24 owner 裁决「分钟 K 落库升级：建表+回填+换真分钟」）..."
+# 这段锁钉的是"分钟 K 从口头升级变成落库升级"的四个易碎点。背景：动量战法此前按日线 MACD 近似
+# （§87 把它列为残余近似），而实盘引擎用的是 5 分钟 48 根——两边口径不同，回放结论和实盘判断
+# 就不是同一把尺子。09-24 的修法是把 5 分钟线落库（minute_klines）并让回放优先用它。
+# 四个易碎点，每一个都对应一种"看起来升级了、其实没有"的形态：
+#   ① 表口径：主键 (ts_code,scale,ts) 撑幂等；**故意没有复权列**——分钟线全是不复权，
+#      与实盘 md.MinuteMACD 同源。一旦有人加 hfq 列或把分钟和日线 hfq 混用，同一笔判断
+#      在两条链上会得出不同 MACD（复权口径系列缺陷 §ADJ-BASIS-* 就是这么来的）。
+#   ② 半日不许冒充升级：窗口闸门只有一处（>=48 根**有效**根才给真分钟 MACD），
+#      写成两处就会有一处漏；出现第二处即红。
+#   ③ 装载器诚实出门：0 行判失败、失败率超上限判失败、平均根数打印——上游只有"最近 N 根"
+#      窗口（新浪 5 分钟实测封顶 5025 根），所以"回填三年"在数据源层面不成立，不许编。
+#   ④ 夜间日增环门控：分钟表从没回填过时该环**不入队**（否则每晚 0 行判失败淹掉真告警），
+#      且调度侧 scale 必须与回放侧同源（两边不一致＝表里有数据却永远查不到，静默退回日线近似）。
+MK_STORE=internal/store/minute_klines.go
+MK_LOAD=cmd/dataload/minute_sync.go
+MK_REP=internal/btreplay/replay.go
+MK_WRK=internal/scheduler/worker.go
+# ① 建表三件套 + 无复权列（负锁）
+grep -q 'CREATE TABLE IF NOT EXISTS minute_klines' internal/store/store.go \
+	|| { echo '--- FAIL: §MINUTE-K minute_klines 建表语句没了（回放侧永远查不到分钟线）'; exit 1; }
+grep -q 'CREATE INDEX IF NOT EXISTS idx_minute_scale_ts ON minute_klines(scale, ts)' internal/store/store.go \
+	|| { echo '--- FAIL: §MINUTE-K (scale,ts) 索引没了：按日切片与门控探针退化成整表扫描（250 万行级）'; exit 1; }
+grep -q 'PRIMARY KEY (ts_code, scale, ts)' internal/store/store.go \
+	|| { echo '--- FAIL: §MINUTE-K 落库主键不再声明 (ts_code,scale,ts)（幂等靠它，重复写会把一日 48 根变成 96 根）'; exit 1; }
+# 复权列负锁只看**建表列定义那几行**（上面的中文注释里就有"hfq/复权"字样，整段匹配必假红）
+if awk '/CREATE TABLE IF NOT EXISTS minute_klines \(/{f=1} f{print} f && /PRIMARY KEY/{exit}' internal/store/store.go | grep -qiE 'adj|hfq|qfq'; then
+	echo '--- FAIL: §MINUTE-K minute_klines 建表里出现复权列（分钟线口径必须与实盘 MinuteMACD 同为不复权，混用＝两条链两套 MACD）'; exit 1
+fi
+# ② 按日切片只吃 ts 前缀；半日冒充升级的唯一闸门必须只有一处
+QB=$(grep -c 'FROM minute_klines WHERE ts_code=? AND scale=? AND ts>=? AND ts<?' "$MK_STORE" || true)
+[ "$QB" = "1" ] \
+	|| { echo "--- FAIL: §MINUTE-K 按日切片的 SQL 形状变了（匹配到 ${QB} 处；必须是 ts_code+scale+ts 前缀区间 ORDER BY ts，走主键索引——换成 substr() 即全表扫，回放按日取数会退化成几千次扫描）"; exit 1; }
+grep -q 'day+" 24:00:00"' "$MK_STORE" \
+	|| { echo '--- FAIL: §MINUTE-K 日切片右边界不再是 day+" 24:00:00"（改回 23:59:59 会漏掉边界根；"24:" 字典序天然大于任何真实时刻，所以前缀区间等价于"这一天的全部行"）'; exit 1; }
+WG=$(grep -c 'len(mkl) >= s.window' "$MK_REP" || true)
+[ "$WG" = "1" ] \
+	|| { echo "--- FAIL: 分钟 MACD「根数不足即报不可用」的闸门不再是唯一一处（读到 ${WG}：写两处必有一处漏，半日数据就会冒充升级）"; exit 1; }
+# ③ 装载器三条诚实出门 + 上游封顶口径写死在缺省值里
+grep -q 'st.Rows == 0' "$MK_LOAD" \
+	|| { echo '--- FAIL: §MINUTE-K minute-sync 丢了「0 行落库判失败」（跑完没数据绝不能算成功）'; exit 1; }
+grep -q '超过上限' "$MK_LOAD" \
+	|| { echo '--- FAIL: §MINUTE-K minute-sync 丢了失败率闸（整片封 IP/接口改版会被当成"偶发失败"混过去）'; exit 1; }
+grep -q 'fs.IntVar(&o.Count, "count", 5025' "$MK_LOAD" \
+	|| { echo '--- FAIL: §MINUTE-K --count 缺省不再是 5025（上游只有最近 N 根窗口，缺省值就是"能回填多久"的事实）'; exit 1; }
+grep -q 'fs.IntVar(&o.Limit, "limit", 500' "$MK_LOAD" \
+	|| { echo '--- FAIL: §MINUTE-K --limit 缺省不再是 500（清单不设闸＝一次手滑把全市场 2GB 灌进例行回填）'; exit 1; }
+# ④ 回放侧优先分钟 + 注入点两处齐（回放与网格预计算只改一处，网格就会按另一条取数路径选最优）
+grep -q 'minuteMACDScale      = 5\|minuteMACDScale = 5' "$MK_REP" \
+	|| { echo '--- FAIL: §MINUTE-K 回放侧分钟周期常量丢了（窗口尺寸 48 根是 5 分钟口径，周期一改即失配）'; exit 1; }
+AI1=$(grep -c 'o.applyMinuteScope(' "$MK_REP" || true)
+AI2=$(grep -c 'o.applyMinuteScope(' internal/btreplay/sweep.go || true)
+AI=$((AI1 + AI2))
+[ "$AI" = "2" ] \
+	|| { echo "--- FAIL: §MINUTE-K 分钟口径注入点不是 2 处（读到 ${AI}；回放 backtestStock 与网格 sweepTriggersOf 必须同源，缺一处网格就是按另一条取数路径选参数）"; exit 1; }
+# ⑤ 调度侧接线：任务类型 + 步骤映射 + 紧跟 dataload + 门控 + 参数组装
+grep -q 'TaskMinuteSync' internal/store/research_tasks.go \
+	|| { echo '--- FAIL: §MINUTE-K 夜间分钟任务类型常量没了'; exit 1; }
+grep -q 'case "minute_sync":' "$MK_WRK" \
+	|| { echo '--- FAIL: §MINUTE-K 夜间步骤 minute_sync 不再映射（默认链里写了也没人接）'; exit 1; }
+grep -q '"dataload", "minute_sync", "sector_rebuild"' internal/config/config.go \
+	|| { echo '--- FAIL: §MINUTE-K 默认夜间链不再让 minute_sync 紧跟 dataload（先有日线再刷分钟，回放读的是当天刷新的表）'; exit 1; }
+grep -q 'db.MinuteHasBars(minuteSyncScale)' "$MK_WRK" \
+	|| { echo '--- FAIL: §MINUTE-K 夜间日增环的空表门控没了（分钟表从未回填时会每晚 0 行判失败，天天失败＝真告警被淹）'; exit 1; }
+grep -q '"minute-sync"' "$MK_WRK" \
+	|| { echo '--- FAIL: §MINUTE-K taskCommand 不再走 dataload 的 minute-sync 子命令'; exit 1; }
+# ⑥ 跨文件 scale 同源：调度下发 5 分钟、回放查 5 分钟，两边各自写死就要有人改一边
+SS=$(grep -c 'minuteSyncScale      = 5' "$MK_WRK" || true)
+[ "$SS" = "1" ] \
+	|| { echo "--- FAIL: §MINUTE-K 调度侧分钟周期常量不再是 5（读到 ${SS}；与回放侧 minuteMACDScale 必须同值，否则表里有数据却永远查不到，动量静默退回日线近似）"; exit 1; }
+# ⑦ §87 锚点不得被分钟升级顶掉（动量判据仍是实盘语义重写版，且没有退回"默认不回测"）
+grep -q 'criteria rewritten to live semantics' "$MK_REP" \
+	|| { echo '--- FAIL: §MINUTE-K 动量出门文本被改写（§87 的等值锚点：criteria rewritten to live semantics 必须在）'; exit 1; }
+if grep -q 'not replayed by default' "$MK_REP"; then
+	echo '--- FAIL: §MINUTE-K 动量又出现「not replayed by default」（§87 已锤：动量必须进回放，不许缺席）'; exit 1
+fi
+# ⑧ 现场锁：分钟装载/回放的测试数据一律落临时库，仓库工作树不得留下 trading.db 或 codes 清单
+STRAY=$(find . -maxdepth 2 -type f \( -name 'minute_codes*.txt' -o -name 'trading.test.db' \) 2>/dev/null | head -5 || true)
+[ -z "$STRAY" ] \
+	|| { echo '--- FAIL: §MINUTE-K 仓库工作树里留下分钟回填产物（测试数据不许落工作树）：'; printf '%s\n' "$STRAY"; exit 1; }
+# ⑨ 运行时实证：四个包的分钟用例必须真跑到（静态锁只防回潮，用例才是把语义钉住的那一层）
+MT=$(go test -count=1 ./internal/store/ ./cmd/dataload/ ./internal/btreplay/ ./internal/scheduler/ \
+	-run 'Minute|HasBars|ApproxNote|MACD' 2>&1 | grep -E '^(--- FAIL|FAIL|ok)' || true)
+printf '%s\n' "$MT"
+if printf '%s' "$MT" | grep -qE 'FAIL'; then
+	echo '--- FAIL: §MINUTE-K 分钟用例跑红（见上面输出）'; exit 1
+fi
+OKPKG=$(printf '%s' "$MT" | grep -c '^ok' || true)
+[ "$OKPKG" = "4" ] \
+	|| { echo "--- FAIL: §MINUTE-K 分钟用例没有四包全跑（ok 行数 ${OKPKG} != 4：包被改名/用例会话没匹配上，等于这段锁没生效）"; exit 1; }
+echo "ok - §MINUTE-K 守卫通过（建表三件套 3 + 无复权列负锁 1 + 日切片前缀锁 2/负锁 1 + 窗口唯一闸 1 + 装载诚实出门 4 + 回放注入点 1 + 调度接线 5 + 跨文件 scale 同源 1 + §87 锚点 2 + 现场锁 1 + 运行时实证 2）"
+
+echo "==> 92 §MINUTE-K-CHAIN 分钟链两修：代码形态归一 + 装载器只走严格不复权链（2026-09-24 回填实跑锤出）..."
+# 这段锁钉的是 09-24 **第一次真跑** minute-sync 才暴露的两个坑（干跑与单测都测不出来，因为桩上游
+# 不认代码形态、也不区分复权口径）：
+#   ① 代码形态：新浪/腾讯/同花顺三条分钟腿只认裸 6 位代码。装载器传的是 ts_code（"600000.SH"），
+#      于是新浪把 "sh600000.SH" 当代码直接回 null（**0 根、无错误**），腾讯回数组壳（解到 map 上
+#      报 unmarshal 错）。日志长得像"三个源都坏了所以降级到只给 140 根的同花顺"，实际一条都没
+#      真取到数——失败率 66.7% 判红才是唯一线索。归一放在链入口（所有调用方受益），落库主键不动。
+#   ② 复权口径：链尾东财腿固定 fqt=1（前复权，全系统日线口径），而 minute_klines 的承诺是**不复权**
+#      （与实盘 md.MinuteMACD 同源）。落库窗口跨 5 个月，前复权根一旦进来，除权日之前整段价格被
+#      平移，回放会算出一根假跳水——这正是 §H3 在日 K 链上拒收过的"跨口径静默兜底"。所以装载器
+#      改绑新增的 GetUnadjustedMinuteKLine（三腿之外宁可计成失败），实盘看当日分时的 GetMinuteKLine
+#      保留末腿不动（当日 bars 前复权＝不复权，摘掉它等于把实盘兜底也削了）。
+MK_SRC=internal/data/source.go
+MK_SRC_TEST=internal/data/source_minute_chain_test.go
+# ① 归一必须发生在分钟链函数体内（写在别的函数里等于没写）
+awk '/^func \(dc \*DataCoordinator\) minuteKLineChain\(/{f=1} f{print} f && /^}$/{exit}' "$MK_SRC" | grep -q 'code := normalizeCode(rawCode)' \
+	|| { echo '--- FAIL: §MINUTE-K-CHAIN 分钟链入口不再把入参归一成裸代码（ts_code 形态喂进去＝新浪空返回、腾讯解析错，全线假降级）'; exit 1; }
+NC=$(grep -c 'normalizeCode(rawCode)' "$MK_SRC" || true)
+[ "$NC" = "1" ] \
+	|| { echo "--- FAIL: §MINUTE-K-CHAIN 分钟链的代码归一点不再是 1 处（读到 ${NC}：多处各归一必有一处漏）"; exit 1; }
+# 两条链各自唯一：通用链带末腿、严格链不带
+CW1=$(grep -c 'return dc.minuteKLineChain(code, scale, count, true)' "$MK_SRC" || true)
+CW2=$(grep -c 'return dc.minuteKLineChain(code, scale, count, false)' "$MK_SRC" || true)
+{ [ "$CW1" = "1" ] && [ "$CW2" = "1" ]; } \
+	|| { echo "--- FAIL: §MINUTE-K-CHAIN 分钟链两个入口不再是「一真一假」各一处（GetMinuteKLine=${CW1} GetUnadjustedMinuteKLine=${CW2}）"; exit 1; }
+# ② 严格链的失败文案必须点名"前复权腿按口径拒用"——只说"所有源均失败"会把人往"源坏了"方向带
+grep -q '前复权腿按口径拒用' "$MK_SRC" \
+	|| { echo '--- FAIL: §MINUTE-K-CHAIN 严格不复权链的失败原因不再点名东财末腿被口径拒用（排障时会去查源，其实是被主动摘掉的）'; exit 1; }
+# 装载器必须绑严格链，且工作树里不得再出现"装载器调通用链"的活代码
+L1=$(grep -c 'dc.GetUnadjustedMinuteKLine(code, o.Scale, o.Count)' "$MK_LOAD" || true)
+[ "$L1" = "1" ] \
+	|| { echo '--- FAIL: §MINUTE-K-CHAIN minute-sync 不再走严格不复权链（回到通用链＝前复权根能写进不复权表）'; exit 1; }
+if grep -rq '\.GetMinuteKLine(' cmd/dataload/; then
+	echo '--- FAIL: §MINUTE-K-CHAIN cmd/dataload 里又出现通用分钟链调用（前复权末腿会漏进落库路径）'; exit 1
+fi
+# ③ 运行时实证：三条分钟链用例（URL 形态 / 末腿零请求 / 逐腿记账）必须真跑绿
+CT=$(go test -count=1 ./internal/data/ -run 'TestMinuteChain|TestUnadjustedMinuteChain' 2>&1 | grep -E '^(--- FAIL|FAIL|ok|no test files)' || true)
+printf '%s\n' "$CT"
+if printf '%s' "$CT" | grep -qE 'FAIL|no test files'; then
+	echo '--- FAIL: §MINUTE-K-CHAIN 分钟链用例跑红或没跑到（见上面输出）'; exit 1
+fi
+TN=$(grep -c '^func Test' "$MK_SRC_TEST" || true)
+[ "$TN" = "3" ] \
+	|| { echo "--- FAIL: §MINUTE-K-CHAIN 分钟链用例数不再是 3 条（读到 ${TN}：URL 形态/末腿拒用/逐腿记账 缺一即失效）"; exit 1; }
+echo "ok - §MINUTE-K-CHAIN 守卫通过（链入口代码归一 2 + 两入口一真一假 1 + 拒用文案 1 + 装载器绑严格链 2 + 运行时实证 2）"
 
 echo ""
 echo "==> 全部通过"

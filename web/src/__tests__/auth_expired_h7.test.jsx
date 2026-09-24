@@ -7,7 +7,10 @@
 // session really logs out when the event arrives.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import React from 'react'
-import { render, screen, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, act, cleanup } from '@testing-library/react'
+// §DET-TIME（2026-09-24）：等 UI 用 settle()（排空微任务）而不是 waitFor——App 的 checkAuth 链
+// 只 await 已 mock 成 resolved promise 的接口，用真实时钟轮询纯属白等（负载下必偶发红）。
+import { settle } from './settle.js'
 import { MemoryRouter } from 'react-router-dom'
 
 // 每个用例独立控制 isLoggedIn 的返回值（vi.doMock 工厂在动态 import 时才求值，闭包安全）
@@ -68,7 +71,8 @@ describe('App - auth:expired 事件读取最新登录态（§H7）', () => {
   it('loggedIn false→true 后收到 expired 事件：执行登出并回到登录页（旧闭包恒早退→必红）', { timeout: 60000 }, async () => {
     const { api } = await mountApp()
     // checkAuth 异步恢复登录态 → 主布局渲染（顶栏「退出」按钮出现）
-    await waitFor(() => expect(screen.getByText('退出')).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText('退出')).toBeInTheDocument()
     expect(api.connectSSE).toHaveBeenCalled() // 登录态链路已拉起
 
     // 模拟 request() 401 后广播的全局过期事件
@@ -76,14 +80,16 @@ describe('App - auth:expired 事件读取最新登录态（§H7）', () => {
 
     // §H7 断言：事件必须真正走到登出（旧实现首帧 loggedIn=false 早退，永远不会调 logout）
     expect(api.logout).toHaveBeenCalledTimes(1)
-    await waitFor(() => expect(screen.getByText('量化交易辅助工具')).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText('量化交易辅助工具')).toBeInTheDocument()
   })
 
   it('未登录态收到 expired 事件：仍然静默跳过，不误触发登出', { timeout: 60000 }, async () => {
     loggedFlag = false
     const { api } = await mountApp()
     // 登录页渲染（无「退出」按钮）
-    await waitFor(() => expect(screen.getByText('量化交易辅助工具')).toBeInTheDocument())
+    await settle()
+    expect(screen.getByText('量化交易辅助工具')).toBeInTheDocument()
     expect(screen.queryByText('退出')).not.toBeInTheDocument()
 
     await act(async () => { window.dispatchEvent(new Event('auth:expired')) })

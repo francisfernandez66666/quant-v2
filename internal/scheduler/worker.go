@@ -624,6 +624,29 @@ func (s *Scheduler) ensureNightlyEnqueue(db *store.DB, cfg config.SchedulerConfi
 		steps = insertAfter(steps, "library_replay", "optimize")
 		log.Printf("[scheduler] 策略自优化引擎开启：夜间链追加 optimize 任务（全库参数寻优）")
 	}
+	// §MINUTE-K 分钟日增环门控：分钟表还没被一次性回填过时，日增必然"清单为空/0 行落库"而
+	// 每晚判失败（这是装载器的诚实出口，不该改），而天天失败只会把真告警淹掉。所以这里
+	// 如实摘掉该环并打印补救命令——**跳过必须留痕**，不是静默降级。
+	// English: gate the nightly minute step on the table having anything to append to; a never
+	// backfilled minute table would otherwise fail every night and drown real alerts.
+	if containsStep(steps, "minute_sync") {
+		has, err := db.MinuteHasBars(minuteSyncScale)
+		if err != nil {
+			log.Printf("[scheduler] §MINUTE-K 分钟表可读性检查失败，本轮跳过 minute_sync 环: %v", err)
+			steps = removeStep(steps, "minute_sync")
+		} else if !has {
+			steps = removeStep(steps, "minute_sync")
+			dbLabel := cfg.DB
+			if dbLabel == "" {
+				dbLabel = defaultDB()
+			}
+			log.Printf("[scheduler] §MINUTE-K 分钟表(scale=%d)为空：跳过夜间日增环，需先人工跑一次性回填 dataload --db %s minute-sync（--limit 500）",
+				minuteSyncScale, dbLabel)
+			opslog.OncePer("minute-sync-not-backfilled", 24*time.Hour, func() {
+				opslog.Logf("research", "§MINUTE-K 分钟 K 表为空，夜间日增环已跳过（动量回放仍按日线 MACD 近似）：先跑 dataload minute-sync 回填")
+			})
+		}
+	}
 	// §M15 第一步：把步骤表展开为完整计划（不触库，纯计算）——计划下标即 chain_seq。
 	// §多轮发现：expand discover_factors → variants 个变体任务；配对 backtest 仅放置一次，
 	// 之后的显式/auto-inserted "backtest" 步骤跳过，避免重复回测。
@@ -759,6 +782,26 @@ func containsStep(steps []string, step string) bool {
 	return false
 }
 
+// minuteSyncScale / minuteSyncDailyCount §MINUTE-K 夜间日增环的装载口径：5 分钟周期、
+// 每票最近 60 根（当日 48 根 + 集合竞价尾量，留 12 根冗余防上游对齐偏移）。
+// 周期必须与回放侧 internal/btreplay 的 minuteMACDScale 一致——两边不一致时分钟表里有数据
+// 却永远查不到，动量判断会静默退回日线 MACD。
+const (
+	minuteSyncScale      = 5
+	minuteSyncDailyCount = 60
+)
+
+// removeStep 从步骤表里摘掉一个步骤（值语义，不改原切片）。
+func removeStep(steps []string, step string) []string {
+	out := steps[:0:0]
+	for _, s := range steps {
+		if s != step {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // insertAfter 在 steps 中 anchor 之后插入 step；anchor 不存在则追加到末尾。
 func insertAfter(steps []string, anchor, step string) []string {
 	for i, s := range steps {
@@ -784,6 +827,16 @@ func stepTask(step string, cfg config.SchedulerConfig, today string) (string, st
 			pyurl = "http://127.0.0.1:8787"
 		}
 		return store.TaskDataload, mustJSON(map[string]any{"pyurl": pyurl}), true
+	case "minute_sync":
+		// §MINUTE-K 分钟 K 收盘后日增：只补**库里已有**的票（incremental=true，清单自维护），
+		// 每票拉最近 count 根。count 缺省 60 足够覆盖当日 48 根 5 分钟 + 集合竞价尾量；
+		// 一次性回填（池排名 500 只 × 5025 根）是人工动作，不进夜间链——那活儿一晚上只该
+		// 干一次，天天重跑等于把上游"最近 N 根"窗口反复刷。
+		// English: nightly incremental minute-bar sync over already-stored codes only; the one-off
+		// pool backfill stays a manual step because upstreams expose just a last-N window.
+		return store.TaskMinuteSync, mustJSON(map[string]any{
+			"scale": minuteSyncScale, "count": minuteSyncDailyCount, "incremental": true,
+		}), true
 	case "sector_rebuild":
 		return store.TaskSectorRebuild, "{}", true
 	case "discover_factors":
@@ -1024,6 +1077,23 @@ func startWindowYear(today string, years int) string {
 	return fmt.Sprintf("%04d%s", y-years, today[4:])
 }
 
+// payloadInt 从任务 payload 里取整型参数（JSON 数字解出来是 float64），缺键/类型不符回默认值。
+func payloadInt(p map[string]any, key string, def int) int {
+	switch v := p[key].(type) {
+	case float64:
+		if v <= 0 {
+			return def
+		}
+		return int(v)
+	case int:
+		if v <= 0 {
+			return def
+		}
+		return v
+	}
+	return def
+}
+
 // mustJSON 序列化为 JSON；失败兜底返回 "{}"（保证 payload 列永远是合法 JSON）。
 func mustJSON(v any) string {
 	b, err := json.Marshal(v)
@@ -1033,10 +1103,11 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
-// taskCommand 组装任务的二进制与参数：dataload 直连专用二进制；
-// 其余类型统一走 research run-task --task-id（唯一入口，进程名与 verify_nightly.sh 兼容）。
-// English: builds the child command — dataload runs its own binary; everything else funnels through
-// `research run-task --task-id N`, keeping the process name compatible with verify_nightly.sh.
+// taskCommand 组装任务的二进制与参数：dataload 与 minute_sync 直连专用二进制（装载不入
+// research 分发器）；其余类型统一走 research run-task --task-id（唯一入口，进程名与 verify_nightly.sh 兼容）。
+// English: builds the child command — dataload and minute-sync run their own binary; everything else
+// funnels through `research run-task --task-id N`, keeping the process name compatible with
+// verify_nightly.sh.
 func (s *Scheduler) taskCommand(cfg config.SchedulerConfig, tk *store.ResearchTask) (string, []string, error) {
 	dbPath := cfg.DB
 	if dbPath == "" {
@@ -1054,6 +1125,27 @@ func (s *Scheduler) taskCommand(cfg config.SchedulerConfig, tk *store.ResearchTa
 			pyurl = v
 		}
 		return bin, []string{"--db", dbPath, "--pyurl", pyurl, "daily"}, nil
+	}
+	if tk.Type == store.TaskMinuteSync {
+		// §MINUTE-K 分钟日增与 dataload 同一专用二进制（取数在 Go 侧 DataCoordinator，
+		// 不经 Python 网关，所以不传 --pyurl）。payload 缺键时回落到夜间缺省口径。
+		bin, err := s.resolveBin(cfg.DataloadBin)
+		if err != nil {
+			return "", nil, err
+		}
+		var p map[string]any
+		_ = json.Unmarshal([]byte(tk.Payload), &p)
+		args := []string{"--db", dbPath, "minute-sync",
+			"--scale", strconv.Itoa(payloadInt(p, "scale", minuteSyncScale)),
+			"--count", strconv.Itoa(payloadInt(p, "count", minuteSyncDailyCount)),
+		}
+		if inc, ok := p["incremental"].(bool); !ok || inc {
+			args = append(args, "--incremental")
+		}
+		if v := payloadInt(p, "max-fail-pct", 0); v > 0 {
+			args = append(args, "--max-fail-pct", strconv.Itoa(v))
+		}
+		return bin, args, nil
 	}
 	bin, err := s.resolveBin(cfg.ResearchBin)
 	if err != nil {
