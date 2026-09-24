@@ -151,7 +151,11 @@ echo "==> [5/5] 备份 + 落位（远端执行，回传字段全 ASCII）"
 # 整条子命令用 `|| true` 兜住：ssh 非 0（远端 exit 1、断管）在 set -e + pipefail 下会让脚本
 # 静默消失，连"判红原因"都打不出来；结论一律交给下面的 PLACE_ERR / PLACE 判定行裁决。
 OUT="$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $B64" 2>&1 || true)"
+# ★ 先去 CR 再解析（09-24 首次真跑锤出来的假红）：Windows 侧每行是 CRLF，命令替换只吃掉 \n，
+# 于是**行尾最后一个字段**带一个 \r。判定行最后一个字段就是 dst_sha，它和本机 SHA 比较恒不等
+# ——三条 SHA 肉眼全同、脚本却判红。原始日志留一份带 CR 的作取证，解析用去 CR 的这份。
 printf '%s\n' "$OUT" > /tmp/place_qmt_bridge.log
+OUT="$(printf '%s' "$OUT" | tr -d '\r')"
 # 用 case 而不是 `printf|grep -q`：grep -q 命中即退会让 printf 收到 SIGPIPE，在 pipefail 下是假红。
 case "$OUT" in
   *PLACE_ERR=*)

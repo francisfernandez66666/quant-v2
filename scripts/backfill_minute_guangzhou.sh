@@ -195,6 +195,11 @@ echo "==> [3/4] 远端执行 MODE=${MODE}（回传字段全 ASCII）"
 OUT="$($SSH "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $B64" 2>&1 || true)"
 LOGF="/tmp/backfill_minute_guangzhou.$MODE.log"
 printf '%s\n' "$OUT" > "$LOGF"
+# ★ 先去 CR 再解析：Windows 侧回传每行以 CRLF 结尾，命令替换只吃 \n，行尾**最后一个字段**会留一个
+# \r（09-24 桥落位脚本首次真跑就是被它判成假红：三值 SHA 肉眼全同却说不等）。本脚本目前只在行中
+# 匹配锚点（procs=0 / exit=0 都不在行尾）所以没踩到，但 reason=/mtime= 落在行尾，一律先去 CR 更稳。
+# 原始日志（带 CR）留在 $LOGF 作取证。
+OUT="$(printf '%s' "$OUT" | tr -d '\r')"
 # 用 case 而不是 printf|grep -q：grep -q 命中即退会让 printf 收到 SIGPIPE，pipefail 下是假红。
 case "$OUT" in
   *"MINOPS ERR="*)

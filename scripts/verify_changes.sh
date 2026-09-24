@@ -2903,7 +2903,14 @@ OPS_ANCH=$(grep -c 'MINUTE-SYNC \(SUMMARY\|PROGRESS\|START\)' "$OPS_LOAD" || tru
 # 锚点行在日志里不在行首（dataload 的 log.SetFlags 打时间戳前缀），所以取值一律用**不带 ^** 的 grep
 OPS_CARET=$(grep -c 'grep "\^MINUTE-SYNC' "$OPS_SH" || true)
 [ "$OPS_CARET" = "0" ] \
-	|| { echo '--- FAIL: §MINUTE-OPS 回填脚本又用 ^ 锚定锚点行（读到 ${OPS_CARET}：日志行有时间戳前缀，^ 恒不命中＝永远判「未收尾」，反过来也永远拿不到成功）'; exit 1; }
+	|| { echo "--- FAIL: §MINUTE-OPS 回填脚本又用 ^ 锚定锚点行（读到 ${OPS_CARET}：日志行有时间戳前缀，^ 恒不命中＝永远判「未收尾」，反过来也永远拿不到成功）"; exit 1; }
+# ④′ CRLF 判据锁（09-24 首次真跑锤出的假红）：Windows 回传每行 CRLF，命令替换只吃 \n，
+#    行尾最后一个字段必然带 \r——两条脚本都必须在解析前 tr -d '\r'，否则 SHA/字段比较恒不等。
+for crlf in "$BR_SH" "$OPS_SH"; do
+	OPS_CR=$(grep -c "tr -d '\\\\r'" "$crlf" || true)
+	[ "$OPS_CR" -ge 1 ] \
+		|| { echo "--- FAIL: §MINUTE-OPS ${crlf} 解析远端回传前没有去 CR（tr -d '\\r' 计数 ${OPS_CR}：CRLF 会让行尾最后一个字段带 \\r，等值比较假红）"; exit 1; }
+done
 # ④ 离线实跑：预览模式一次网络都不碰（bogus IP 也要 0 退出），动手模式对不可达通道必须 fail-closed
 BR_PLAN=$(GZ_IP=127.0.0.1 "$BR_SH" 2>&1 || true)
 printf '%s\n' "$BR_PLAN" | grep -q 'BRIDGE_PLACE_PLAN' \
@@ -2930,7 +2937,10 @@ OPS_FAKE=$(mktemp -d)
 cat >"$OPS_FAKE/ssh" <<'FAKE'
 #!/usr/bin/env bash
 # 假 ssh：给 §MINUTE-OPS 探针回放远端 PowerShell 的六种回传（不碰网络）。
-# 行首的时间戳前缀是 dataload 的 log.SetFlags 打的，故意留着——它就是"锚点不在行首"的成因。
+# ★ 外面套一层 `{ … } | sed 's/$/\r/'`：Windows 侧回传每行是 **CRLF**，而 bash 命令替换只吃 \n，
+#   于是行尾最后一个字段会留一个 \r——09-24 桥落位首次真跑就是被它判成假红（三条 SHA 肉眼全同、
+#   脚本说 dst_sha != 本机）。回放不带 \r 的"干净"文本等于把这条真实缺陷排除在测试之外。
+{
 if printf '%s' "$*" | grep -q EncodedCommand; then
 	case "${OPS_FAKE_STATE:-done}" in
 		done)
@@ -2964,6 +2974,7 @@ if printf '%s' "$*" | grep -q EncodedCommand; then
 fi
 echo ok
 exit 0
+} | sed 's/$/\r/'
 FAKE
 chmod +x "$OPS_FAKE/ssh"
 for spec in done:done:0 failed:failed:1 running:running:0 stalled:stalled:1 pending:pending:1 garbled:stalled:1; do
