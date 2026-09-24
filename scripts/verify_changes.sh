@@ -2911,6 +2911,28 @@ for crlf in "$BR_SH" "$OPS_SH"; do
 	[ "$OPS_CR" -ge 1 ] \
 		|| { echo "--- FAIL: §MINUTE-OPS ${crlf} 解析远端回传前没有去 CR（tr -d '\\r' 计数 ${OPS_CR}：CRLF 会让行尾最后一个字段带 \\r，等值比较假红）"; exit 1; }
 done
+# ④″ 一次性计划任务的「日期写法 + 真的会自触」锁（09-24 首次真装连踩两次，都是"报了成功但活不会干"）：
+#    ① 日期必须**数值拼装**。写格式串有两条死路：.NET 自定义格式串里 mm 是**分钟**，所以 yyyy/mm/dd 在
+#       09-24 当天写出 /SD 2026-06-24 —— schtasks 照单收下，装了个起始日期在**过去**的一次性任务：
+#       任务存在、永不触发，脚本却回打 MINOPS STARTED；改用 (Get-Culture).ShortDatePattern 又不行，
+#       ssh/EncodedCommand 会话里的文化不是交互文化，给出 MM/dd/yyyy，schtasks 直接判「无效的起始日期」。
+#    ② 装完必须用**文化无关**的 StartBoundary（任务 XML 里是 ISO 8601）证明触发点就在眼前；读不到、
+#       或不在 now-2min ~ now+10min 之间，就删掉任务判红。/FO LIST 的列名是本地化文本，只配当"在不在"检查。
+OPS_SD=$(grep -cF -- '-f $now.Year, $now.Month, $now.Day' "$OPS_SH" || true)
+[ "$OPS_SD" = "1" ] \
+	|| { echo "--- FAIL: §MINUTE-OPS /SD 不再是数值拼装的四位年-月-日（读到 ${OPS_SD}：格式串会把 mm 当月份，或按会话文化给出 schtasks 不收的写法）"; exit 1; }
+OPS_CULT=$(grep -c 'Get-Culture' "$OPS_SH" || true)
+[ "$OPS_CULT" = "0" ] \
+	|| { echo "--- FAIL: §MINUTE-OPS 又回到按会话文化取日期格式（读到 ${OPS_CULT} 处 Get-Culture：远程会话的文化不等于机器文化，schtasks 会拒）"; exit 1; }
+# 只锁「/SD 由格式串算出来」这一件事（HHmm 一类合法时间格式串不误伤）
+OPS_SD_FMT=$(grep -cE '^\$sd = .*ToString' "$OPS_SH" || true)
+[ "$OPS_SD_FMT" = "0" ] \
+	|| { echo "--- FAIL: §MINUTE-OPS 的 /SD 又改回用格式串算（读到 ${OPS_SD_FMT} 处：格式串里 mm 是分钟，09-24 那次「装了个过去日期」的假 STARTED 就这么来的）"; exit 1; }
+for need in '<StartBoundary>' 'trigger-not-upcoming' 'trigger-unreadable'; do
+	OPS_TB=$(grep -cF "$need" "$OPS_SH" || true)
+	[ "$OPS_TB" -ge 1 ] \
+		|| { echo "--- FAIL: §MINUTE-OPS 装任务后不再核 StartBoundary（缺 ${need}：把「建了个任务」当成「回填会在一分钟后自触」，正是首装的误报）"; exit 1; }
+done
 # ④ 离线实跑：预览模式一次网络都不碰（bogus IP 也要 0 退出），动手模式对不可达通道必须 fail-closed
 BR_PLAN=$(GZ_IP=127.0.0.1 "$BR_SH" 2>&1 || true)
 printf '%s\n' "$BR_PLAN" | grep -q 'BRIDGE_PLACE_PLAN' \
@@ -2931,7 +2953,7 @@ OPS_ARM=$(GZ_IP=127.0.0.1 MODE=status "$OPS_SH" 2>&1 || true)
 if GZ_IP=127.0.0.1 MODE=status "$OPS_SH" >/dev/null 2>&1; then
 	echo '--- FAIL: §MINUTE-OPS 回填脚本连不上生产却 0 退出（状态未知当成功）'; exit 1
 fi
-# ⑤ 半态不读成成功：造一个假 ssh 回放远端六种回传，逐态核「退出码 + 状态标记」两值
+# ⑤ 半态不读成成功：造一个假 ssh 回放远端七种回传，逐态核「退出码 + 状态标记」两值
 #    这是本组唯一能证明"判读逻辑本身不是恒绿"的探针（④ 只证明 fail-closed）。
 OPS_FAKE=$(mktemp -d)
 cat >"$OPS_FAKE/ssh" <<'FAKE'
@@ -2964,6 +2986,9 @@ if printf '%s' "$*" | grep -q EncodedCommand; then
 		pending)
 			echo 'MINOPS STATE task=1 procs=0 log=none dir=C:\var\lib\quant-trading-v2'
 			;;
+		notinstalled)
+			echo 'MINOPS STATE task=0 procs=0 log=none dir=C:\var\lib\quant-trading-v2'
+			;;
 		garbled)
 			echo 'MINOPS STATE task=1 procs=0 log=backfill-minute-x.log bytes=4096 mtime=20260924-220500'
 			echo '2026/09/24 22:03:11.123456 MINUTE-SYNC PROGRESS done=50 universe=500 written=248000'
@@ -2977,13 +3002,13 @@ exit 0
 } | sed 's/$/\r/'
 FAKE
 chmod +x "$OPS_FAKE/ssh"
-for spec in done:done:0 failed:failed:1 running:running:0 stalled:stalled:1 pending:pending:1 garbled:stalled:1; do
+for spec in done:done:0 failed:failed:1 running:running:0 stalled:stalled:1 pending:pending:1 notinstalled:not_installed:1 garbled:stalled:1; do
 	fstate=${spec%%:*}
 	rest=${spec#*:}
 	want_mark=${rest%%:*}
 	want_code=${rest##*:}
 	if out=$(PATH="$OPS_FAKE:$PATH" GZ_IP=127.0.0.1 MODE=status OPS_FAKE_STATE="$fstate" "$OPS_SH" 2>&1); then got_code=0; else got_code=1; fi
-	got_mark=$(printf '%s\n' "$out" | grep -o "MINUTE_OPS_STATE [a-z]*" | tail -1 || true)
+	got_mark=$(printf '%s\n' "$out" | grep -o "MINUTE_OPS_STATE [a-z_]*" | tail -1 || true)
 	{ [ "$got_code" = "$want_code" ] && [ "$got_mark" = "MINUTE_OPS_STATE $want_mark" ]; } \
 		|| { echo "--- FAIL: §MINUTE-OPS 远端回传「${fstate}」被判成 ${got_mark:-无状态标记}/exit=${got_code}（应为 MINUTE_OPS_STATE ${want_mark}/exit=${want_code}：半态/失败态被读成成功，正是本仓 §M2 族最忌的降级报成功）"; rm -rf "$OPS_FAKE"; exit 1; }
 done
@@ -3007,7 +3032,7 @@ fi
 OSUB=$(grep -c 't.Run(' cmd/dataload/minute_sync_test.go || true)
 [ "$OSUB" = "4" ] \
 	|| { echo "--- FAIL: §MINUTE-OPS 锚点行用例的子用例数不再是 4（读到 ${OSUB}：成功/零行/清单为空/进度节拍 缺一即失效）"; exit 1; }
-echo "ok - §MINUTE-OPS 守卫通过（脚本在位+语法 4 + 缺省只预览 6 + ASCII 判据 5 + 离线实跑 6 + 半态六态联调 12 + 负锁 3 + 运行时实证 2）"
+echo "ok - §MINUTE-OPS 守卫通过（脚本在位+语法 4 + 缺省只预览 6 + ASCII 判据 5 + 计划任务触发锁 6 + 离线实跑 6 + 半态七态联调 14 + 负锁 3 + 运行时实证 2）"
 
 echo ""
 echo "==> 全部通过"

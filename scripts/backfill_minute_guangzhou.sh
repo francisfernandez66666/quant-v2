@@ -118,8 +118,14 @@ $tn  = "@TN@"
 $glob = "@GLOB@"
 $mode = "@MODE@"
 $now = (Get-Date).AddMinutes(1)
-$sd = $now.ToString("yyyy/mm/dd")
-$st = $now.ToString("HH:mm")
+# Date/time pieces are assembled numerically, never through a .NET format string or a culture lookup.
+# Two live causes of the first production attempt: (a) "mm" is MINUTES in a custom format string, so the
+# old yyyy/mm/dd wrote /SD 2026-06-24 on 2026-09-24 -- schtasks accepted it and created a one-shot dated
+# in the past, which exists but can never fire; (b) the culture seen inside the ssh/EncodedCommand
+# session differs from the interactive one, so ShortDatePattern gave MM/dd/yyyy and schtasks rejected the
+# create outright ("invalid start date, expected yyyy/mm/dd"). 4-digit year + zero-padded month/day sticks.
+$sd = "{0:d4}-{1:d2}-{2:d2}" -f $now.Year, $now.Month, $now.Day
+$st = "{0:d2}:{1:d2}" -f $now.Hour, $now.Minute
 $stamp = (Get-Date).ToString("yyyyMMdd-HHmm")
 $log = Join-Path $dir ("backfill-minute-" + $stamp + ".log")
 # Count by process name only, never by .Path: reading .Path of a SYSTEM-owned process from
@@ -163,7 +169,24 @@ schtasks /Create /F /TN $tn /SC ONCE /SD $sd /ST $st /RU SYSTEM /TR $tr | Out-Nu
 if ($LASTEXITCODE -ne 0) { Write-Output "MINOPS ERR=schtasks-create-failed"; exit 1 }
 schtasks /Query /TN $tn /FO LIST | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Output "MINOPS ERR=task-not-registered"; exit 1 }
-Write-Output ("MINOPS STARTED task=" + $tn + " start=" + $sd + " " + $st + " log=" + $log)
+# Proof the trigger is really upcoming, read from the task XML (StartBoundary is ISO 8601, so this is
+# culture-free -- the /FO LIST columns are localised and cannot be parsed). Without this the very first
+# production run reported "STARTED" for a task whose /SD was a bogus past date: the task existed, never
+# fired, and only the later "log=none" status showed it. A one-shot that cannot fire is not "started".
+$xml = schtasks /Query /TN $tn /XML | Out-String
+$m = [regex]::Match($xml, "<StartBoundary>([^<]+)</StartBoundary>")
+if (-not $m.Success) {
+  schtasks /Delete /TN $tn /F | Out-Null
+  Write-Output "MINOPS ERR=trigger-unreadable"
+  exit 1
+}
+$fire = [datetime]::Parse($m.Groups[1].Value)
+if ($fire -lt (Get-Date).AddMinutes(-2) -or $fire -gt (Get-Date).AddMinutes(10)) {
+  schtasks /Delete /TN $tn /F | Out-Null
+  Write-Output ("MINOPS ERR=trigger-not-upcoming fire=" + $fire.ToString("yyyyMMdd-HHmmss"))
+  exit 1
+}
+Write-Output ("MINOPS STARTED task=" + $tn + " fire=" + $fire.ToString("yyyyMMdd-HHmmss") + " log=" + $log)
 '
 REMOTE_PS="${REMOTE_PS//@EXE@/$EXE}"
 REMOTE_PS="${REMOTE_PS//@DB@/$DB}"
@@ -278,8 +301,18 @@ if [ -n "${PROGRESS:-}" ]; then
   exit 1
 fi
 case "$STATE" in
+  *"task=0 "*)
+    # 与 pending 分家（09-24 首次对生产查状态时踩到）：task=0 是**计划任务根本不存在**＝从没装过回填，
+    # 和"装了但还没到触发时刻"是两件不同的事。混成一类的后果是把人支去"等一分钟再查"，等到天黑也不会变。
+    echo "X 远端没有这个计划任务（task=0）⇒ 回填**从没装过**，不是「卡在某一步」。要动手：MODE=apply -Apply。" >&2
+    echo "MINUTE_OPS_STATE not_installed"
+    exit 1 ;;
+esac
+case "$STATE" in
   *"log=none"*)
-    echo "X 任务已装但远端找不到日志：要么还没到触发时刻（等一分钟再查），要么 cmd 的重定向没成（看 $LOGF 的 PowerShell 报错）。" >&2
+    echo "X 任务在位却没有任何日志（log=none）⇒ 两种成因，别只等：① 真没到触发时刻（等一分钟再查）；" >&2
+    echo "  ② 触发点被 schtasks 按错误日期收下、永不自触（首装就是这么坏的）。分辨口径：apply 那次回打的 fire=" >&2
+    echo "  是不是未来时刻（apply 现在会用任务 XML 的 StartBoundary 断言这点，不满足就当场判红并删任务）。" >&2
     echo "MINUTE_OPS_STATE pending"
     exit 1 ;;
 esac
